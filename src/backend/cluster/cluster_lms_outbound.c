@@ -1304,9 +1304,9 @@ cluster_lms_outbound_drain_send(int worker_id)
 			ClusterICEnvelope env;
 
 			if (cluster_ic_envelope_build(&env, slot.msg_type, (uint32)cluster_node_id,
-										  slot.dest_node_id, send_payload, send_payload_len)
-				&& cluster_ic_dispatch_envelope(&env, send_payload, cluster_node_id))
-				rc = CLUSTER_IC_SEND_DONE;
+										  slot.dest_node_id, send_payload, send_payload_len))
+				rc = cluster_ic_dispatch_send_result(
+					cluster_ic_dispatch_envelope(&env, send_payload, cluster_node_id));
 			else
 				rc = CLUSTER_IC_SEND_HARD_ERROR;
 		} else if (resource_x_slot || requester_slot)

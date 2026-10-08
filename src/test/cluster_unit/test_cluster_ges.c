@@ -336,6 +336,10 @@ int cluster_node_id = 0;
 static uint64 stub_current_epoch = 0;
 static bool stub_authority_managed = false;
 static bool stub_serving_ready = false;
+static bool stub_serving_pending;
+static bool stub_quorum = true;
+static unsigned stub_serving_checks;
+static unsigned stub_ingress_deferred;
 static bool stub_recovery_ready = false;
 static bool stub_recovery_transport_ready = false;
 static bool stub_survivor_protocol_ready = false;
@@ -362,7 +366,7 @@ cluster_sf_peer_capability_family_sample(int32 peer_id pg_attribute_unused(),
 bool
 cluster_qvotec_in_quorum(void)
 {
-	return true; /* default in-quorum so validation step 4 passes */
+	return stub_quorum;
 }
 
 bool
@@ -375,6 +379,29 @@ bool
 cluster_serving_ready_is_current(void)
 {
 	return stub_serving_ready;
+}
+
+static bool stub_overlap_after_admission;
+bool
+cluster_serving_ready_check(bool *pending, const char **predicate)
+{
+	bool ready = stub_serving_ready;
+	stub_serving_checks++;
+	if (pending != NULL)
+		*pending = stub_serving_pending;
+	if (ready && stub_overlap_after_admission) {
+		stub_overlap_after_admission = false;
+		stub_serving_pending = true;
+		stub_serving_ready = false;
+	}
+	return ready;
+}
+
+void
+cluster_ic_dispatch_defer(const ClusterICEnvelope *env)
+{
+	UT_ASSERT_NOT_NULL(env);
+	stub_ingress_deferred++;
 }
 
 bool
@@ -577,6 +604,7 @@ static int stub_exact_release_calls;
 static bool stub_holder_absent;
 static LOCKMODE stub_holder_mode_override = NoLock;
 static bool stub_readiness_lost_on_release;
+static bool stub_pending_on_release;
 static ClusterGrdHolderId stub_exact_release_holder;
 
 int32
@@ -626,6 +654,9 @@ static uint32 stub_lmd_cancel_last_source = 0;
 static uint64 stub_bast_ack = 0;
 static uint64 stub_deadlock_probe_drop = 0;
 static uint64 stub_backend_request_enqueue_count = 0;
+static unsigned stub_deferred_cleanup;
+static GesRequestPayload stub_deferred_cleanup_last;
+static bool stub_pending_on_ready;
 static GesRequestPayload stub_backend_request_last;
 static GesReplyWaitEntry stub_reply_wait_entry;
 static uint64 stub_backend_request_ready_after = 0;
@@ -773,7 +804,11 @@ void
 cluster_grd_outbound_enqueue_cleanup_release(uint32 d pg_attribute_unused(),
 											 const void *p pg_attribute_unused(),
 											 uint16 l pg_attribute_unused())
-{}
+{
+	stub_deferred_cleanup++;
+	if (p != NULL && l == sizeof(stub_deferred_cleanup_last))
+		memcpy(&stub_deferred_cleanup_last, p, l);
+}
 
 /* spec-2.23 D14 R13 stub audit — new symbol surface introduced by
  * Steps 1-9 needs file-local stubs so cluster_ges.o links standalone
@@ -794,6 +829,10 @@ cluster_grd_outbound_enqueue_backend_request(uint32 d pg_attribute_unused(), con
 		stub_reply_wait_entry.reply_opcode = GES_REPLY_OPCODE_GRANT;
 		stub_reply_wait_entry.reject_reason = GES_REJECT_REASON_NONE;
 		stub_reply_wait_entry.ready = true;
+		if (stub_pending_on_ready) {
+			stub_serving_ready = false;
+			stub_serving_pending = true;
+		}
 	}
 	return true;
 }
@@ -987,7 +1026,7 @@ cluster_grd_convert_or_enqueue(
 	int current_mode pg_attribute_unused(), int requested_mode pg_attribute_unused(),
 	uint64 convert_request_id pg_attribute_unused(), int32 source_node_id pg_attribute_unused(),
 	uint64 shard_master_generation pg_attribute_unused(),
-	ClusterGrdConflictHolder *conflict_holders_out pg_attribute_unused(),
+	ClusterGrdConflictHolder **conflict_holders_out pg_attribute_unused(),
 	int *n_conflict_out pg_attribute_unused())
 {
 	return CLUSTER_GRD_CONVERT_NOT_READY;
@@ -1002,7 +1041,7 @@ cluster_grd_convert_or_enqueue_meta(
 	uint64 convert_request_id pg_attribute_unused(), int32 source_node_id pg_attribute_unused(),
 	uint64 shard_master_generation pg_attribute_unused(),
 	ClusterGrdWaiterMeta meta pg_attribute_unused(),
-	ClusterGrdConflictHolder *conflict_holders_out pg_attribute_unused(),
+	ClusterGrdConflictHolder **conflict_holders_out pg_attribute_unused(),
 	int *n_conflict_out pg_attribute_unused())
 {
 	return CLUSTER_GRD_CONVERT_NOT_READY;
@@ -1028,11 +1067,45 @@ cluster_grd_release_and_drain(const struct ClusterResId *resid pg_attribute_unus
 							  ClusterGrdGrantIdentity *granted_out, int max_out)
 {
 	stub_release_and_drain_calls++;
+	if (stub_pending_on_release) {
+		stub_serving_ready = false;
+		stub_serving_pending = true;
+	}
 	if (stub_release_and_drain_result == 1) {
 		Assert(granted_out != NULL && max_out > 0);
 		granted_out[0] = stub_drained_grant;
 	}
 	return stub_release_and_drain_result;
+}
+
+/* The GES boundary fixture retains its old GRD decisions; complete-batch
+ * mutation and allocation are covered with the real GRD capacity fixture. */
+void
+cluster_grd_grant_batch_free(ClusterGrdGrantBatch *batch)
+{
+	Assert(batch->items == NULL || batch->items == batch->inline_items);
+	batch->items = NULL;
+	batch->capacity = 0;
+}
+
+int
+cluster_grd_release_and_drain_all(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+								  ClusterGrdGrantBatch *batch)
+{
+	batch->items = batch->inline_items;
+	batch->capacity = lengthof(batch->inline_items);
+	return cluster_grd_release_and_drain(resid, holder, batch->items, batch->capacity);
+}
+
+int
+cluster_grd_retire_request_and_drain_all(const ClusterResId *resid,
+										 const ClusterGrdHolderId *holder, uint64 previous,
+										 LOCKMODE mode, bool may_drain, ClusterGrdGrantBatch *batch)
+{
+	batch->items = batch->inline_items;
+	batch->capacity = lengthof(batch->inline_items);
+	return cluster_grd_retire_request_and_drain(resid, holder, previous, mode, batch->items,
+												may_drain ? batch->capacity : 0);
 }
 
 ClusterGrdEntryResult
@@ -1131,7 +1204,7 @@ cluster_grd_entry_enqueue_or_grant(const struct ClusterResId *r pg_attribute_unu
 								   uint64 req_id pg_attribute_unused(),
 								   uint64 shard_master_generation pg_attribute_unused(),
 								   uint32 op pg_attribute_unused(), int mode pg_attribute_unused(),
-								   struct ClusterGrdConflictHolder *out pg_attribute_unused(),
+								   struct ClusterGrdConflictHolder **out pg_attribute_unused(),
 								   int *nout pg_attribute_unused())
 {
 	if (nout != NULL)
@@ -1146,7 +1219,7 @@ cluster_grd_entry_grant_conditional(const struct ClusterResId *r pg_attribute_un
 									uint64 req_id pg_attribute_unused(),
 									uint64 shard_master_generation pg_attribute_unused(),
 									uint32 op pg_attribute_unused(), int mode pg_attribute_unused(),
-									struct ClusterGrdConflictHolder *out pg_attribute_unused(),
+									struct ClusterGrdConflictHolder **out pg_attribute_unused(),
 									int *nout pg_attribute_unused())
 {
 	if (nout != NULL)
@@ -1160,7 +1233,7 @@ cluster_grd_entry_enqueue_or_grant_meta(
 	const struct ClusterGrdHolderId *h pg_attribute_unused(), int32 src pg_attribute_unused(),
 	uint64 req_id pg_attribute_unused(), ClusterGrdWaiterMeta meta pg_attribute_unused(),
 	uint64 shard_master_generation pg_attribute_unused(), uint32 op pg_attribute_unused(),
-	int mode pg_attribute_unused(), struct ClusterGrdConflictHolder *out pg_attribute_unused(),
+	int mode pg_attribute_unused(), struct ClusterGrdConflictHolder **out pg_attribute_unused(),
 	int *nout pg_attribute_unused())
 {
 	stub_grant_group = meta.lock_group_procno_plus_one;
@@ -1175,7 +1248,7 @@ cluster_grd_entry_grant_conditional_meta(
 	const struct ClusterGrdHolderId *h pg_attribute_unused(), int32 src pg_attribute_unused(),
 	uint64 req_id pg_attribute_unused(), ClusterGrdWaiterMeta meta pg_attribute_unused(),
 	uint64 shard_master_generation pg_attribute_unused(), uint32 op pg_attribute_unused(),
-	int mode pg_attribute_unused(), struct ClusterGrdConflictHolder *out pg_attribute_unused(),
+	int mode pg_attribute_unused(), struct ClusterGrdConflictHolder **out pg_attribute_unused(),
 	int *nout pg_attribute_unused())
 {
 	stub_grant_group = meta.lock_group_procno_plus_one;
@@ -1326,6 +1399,26 @@ GetCurrentTimestamp(void)
 		stub_now += 1000;
 	return stub_now;
 }
+
+#include "storage/latch.h"
+static Latch stub_latch;
+Latch *MyLatch = &stub_latch;
+static unsigned stub_admission_waits;
+static bool stub_admission_wait_recovers;
+int
+WaitLatch(Latch *latch, int events, long timeout, uint32 wait_event)
+{
+	stub_admission_waits++;
+	stub_now += timeout * 1000;
+	if (stub_admission_wait_recovers) {
+		stub_serving_pending = false;
+		stub_serving_ready = true;
+	}
+	return WL_TIMEOUT;
+}
+void
+ResetLatch(Latch *latch)
+{}
 
 PGPROC *MyProc;
 
@@ -3309,10 +3402,250 @@ UT_TEST(test_startup_shutdown_at_actual_ges_wait_boundaries)
 	MyBackendType = B_BACKEND;
 }
 
+UT_TEST(test_pending_ges_keeps_ingress_and_work_queue_owned)
+{
+	ClusterICEnvelope env;
+	GesRequestPayload req;
+	ClusterResId resid = { 0 };
+	unsigned deferred = stub_ingress_deferred;
+	uint64 enqueued = stub_work_queue_enqueue_count;
+	int mutations = stub_release_and_drain_calls;
+
+	cluster_ges_shmem_init();
+	cluster_node_id = 0;
+	stub_authority_managed = true;
+	stub_serving_ready = false;
+	stub_serving_pending = true;
+	stub_recovery_ready = stub_recovery_transport_ready = false;
+	resid.type = LOCKTAG_OBJECT;
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	init_valid_ges_request(&env, &req, GES_REQ_OPCODE_RELEASE, &resid, ExclusiveLock);
+	req.holder_request_id_lo = 123;
+	req.holder_cluster_epoch_lo = (uint32)stub_current_epoch;
+	req.holder_cluster_epoch_hi = (uint32)(stub_current_epoch >> 32);
+	req.shard_master_generation_lo = (uint32)stub_master_generation;
+	req.shard_master_generation_hi = (uint32)(stub_master_generation >> 32);
+	stub_master_unknown = false;
+	stub_remote_master = -1;
+	stub_remaster_on_second_lookup = false;
+
+	cluster_ges_request_handler(&env, &req);
+	UT_ASSERT_EQ(stub_ingress_deferred, deferred + 1);
+	UT_ASSERT_EQ(stub_work_queue_enqueue_count, enqueued);
+	memset(&stub_work_queue_dequeue_item, 0, sizeof(stub_work_queue_dequeue_item));
+	stub_work_queue_dequeue_item.routing_generation = stub_master_generation;
+	stub_work_queue_dequeue_item.source_node_id = env.source_node_id;
+	stub_work_queue_dequeue_item.payload_len = sizeof(req);
+	memcpy(stub_work_queue_dequeue_item.payload, &req, sizeof(req));
+	stub_work_queue_dequeue_pending = true;
+	UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 0);
+	UT_ASSERT(stub_work_queue_dequeue_pending);
+	UT_ASSERT_EQ(stub_release_and_drain_calls, mutations);
+	/* A later completed observation drains that exact item. */
+	stub_serving_pending = false;
+	stub_serving_ready = true;
+	stub_release_and_drain_result = 0;
+	UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
+	UT_ASSERT(!stub_work_queue_dequeue_pending);
+	UT_ASSERT_EQ(stub_release_and_drain_calls, mutations + 1);
+	/* Known loss is still a refusal, never a grant or a pending loop. */
+	stub_serving_ready = false;
+	cluster_ges_request_handler(&env, &req);
+	UT_ASSERT_EQ(stub_ingress_deferred, deferred + 1);
+	UT_ASSERT_EQ(stub_work_queue_enqueue_count, enqueued);
+	stub_authority_managed = false;
+}
+
+UT_TEST(test_ges_recorded_grant_keeps_its_admitted_reply)
+{
+	ClusterResId resid = { 0 };
+	ClusterGrdHolderId holder = { 0 };
+	unsigned checks;
+	uint64 replies = stub_lmon_reply_enqueue_count;
+
+	cluster_node_id = 0;
+	stub_authority_managed = true;
+	stub_serving_ready = true;
+	stub_serving_pending = false;
+	stub_remote_master = -1;
+	stub_master_unknown = stub_remaster_on_second_lookup = false;
+	resid.type = LOCKTAG_OBJECT;
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	holder.node_id = cluster_node_id;
+	holder.request_id = 456;
+	holder.cluster_epoch = stub_current_epoch;
+	memset(&stub_drained_grant, 0, sizeof(stub_drained_grant));
+	stub_drained_grant.holder.node_id = 1;
+	stub_drained_grant.holder.request_id = 789;
+	stub_drained_grant.holder.cluster_epoch = stub_current_epoch;
+	stub_drained_grant.source_node_id = 1;
+	stub_drained_grant.mode = ExclusiveLock;
+	stub_drained_grant.request_opcode = GES_REQ_OPCODE_REQUEST;
+	stub_release_and_drain_result = 1;
+	stub_pending_on_release = true;
+	checks = stub_serving_checks;
+	UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&resid, &holder), GES_REJECT_REASON_NONE);
+	UT_ASSERT_EQ(stub_serving_checks, checks + 1);
+	UT_ASSERT_EQ(stub_lmon_reply_enqueue_count, replies + 1);
+	stub_pending_on_release = false;
+	stub_serving_pending = false;
+	stub_release_and_drain_result = 0;
+	/* The next independent operation must observe the real loss. */
+	UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&resid, &holder),
+				 GES_REJECT_REASON_SHARD_FROZEN);
+	stub_authority_managed = false;
+}
+
+UT_TEST(test_ges_pending_wait_preserves_original_finite_deadline)
+{
+	ClusterResId resid = { 0 };
+	ClusterGrdHolderId holder = { 0 };
+	uint64 requests = stub_backend_request_enqueue_count;
+
+	resid.type = LOCKTAG_OBJECT;
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	holder.node_id = cluster_node_id;
+	holder.cluster_epoch = stub_current_epoch;
+	holder.request_id = 111;
+	stub_authority_managed = true;
+	stub_serving_ready = false;
+	stub_serving_pending = true;
+	stub_admission_wait_recovers = false;
+	stub_clock_advances = false;
+	stub_now = 1000000;
+	stub_admission_waits = 0;
+	UT_ASSERT_EQ(
+		cluster_ges_send_request_and_wait(&resid, ExclusiveLock, &holder, holder.request_id, 20, 0),
+		GES_REJECT_REASON_TIMEOUT);
+	UT_ASSERT_EQ(stub_admission_waits, 2);
+	UT_ASSERT_EQ(stub_now, 1020000);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, requests);
+	/* Local release has no wire deadline; a next valid publication resumes it. */
+	stub_admission_wait_recovers = true;
+	stub_release_and_drain_result = 0;
+	UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&resid, &holder), GES_REJECT_REASON_NONE);
+	UT_ASSERT_EQ(stub_admission_waits, 3);
+	stub_admission_wait_recovers = false;
+	stub_authority_managed = false;
+	stub_serving_ready = false;
+}
+
+UT_TEST(test_release_ack_during_pending_keeps_original_owner)
+{
+	ClusterResId resid = { 0 };
+	ClusterGrdHolderId holder = { 0 };
+	unsigned waits = stub_admission_waits;
+
+	resid.type = LOCKTAG_OBJECT;
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	holder.node_id = cluster_node_id;
+	holder.procno = 22;
+	holder.cluster_epoch = stub_current_epoch;
+	holder.request_id = 987;
+	stub_authority_managed = true;
+	stub_serving_ready = true;
+	stub_serving_pending = false;
+	stub_remote_master = 7;
+	stub_reply_wait_insert_enabled = true;
+	stub_clock_advances = false;
+	stub_now = 1000000;
+	stub_backend_request_enqueue_count = 0;
+	stub_backend_request_ready_after = 1;
+	stub_pending_on_ready = true;
+	stub_admission_wait_recovers = true;
+	UT_ASSERT_EQ(cluster_ges_send_release_and_wait(&resid, &holder, holder.request_id, 100, 0),
+				 GES_REJECT_REASON_NONE);
+	UT_ASSERT_EQ(stub_admission_waits, waits + 1);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, 1);
+	stub_remote_master = -1;
+	stub_reply_wait_insert_enabled = false;
+	stub_backend_request_ready_after = 0;
+	stub_pending_on_ready = stub_admission_wait_recovers = false;
+	stub_authority_managed = false;
+}
+
+UT_TEST(test_finite_local_release_reuses_its_admitted_observation)
+{
+	ClusterResId resid = { 0 };
+	ClusterGrdHolderId holder = { 0 };
+	unsigned waits = stub_admission_waits, checks = stub_serving_checks;
+	resid.type = LOCKTAG_OBJECT;
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	holder.node_id = cluster_node_id;
+	holder.cluster_epoch = stub_current_epoch;
+	holder.request_id = 876;
+	stub_authority_managed = true;
+	stub_serving_ready = true;
+	stub_serving_pending = false;
+	stub_remote_master = -1;
+	stub_release_and_drain_result = 0;
+	stub_overlap_after_admission = true;
+	stub_admission_wait_recovers = true;
+	UT_ASSERT_EQ(cluster_ges_send_release_and_wait(&resid, &holder, holder.request_id, 20, 0),
+				 GES_REJECT_REASON_NONE);
+	UT_ASSERT_EQ(stub_admission_waits, waits);
+	UT_ASSERT_EQ(stub_serving_checks, checks + 1);
+	stub_overlap_after_admission = stub_admission_wait_recovers = false;
+	stub_serving_pending = false;
+	stub_authority_managed = false;
+}
+
+UT_TEST(test_no_wait_local_cleanup_retains_exact_release)
+{
+	ClusterResId resid = { 0 };
+	ClusterGrdHolderId holder = { 0 };
+	unsigned before = stub_deferred_cleanup, waits = stub_admission_waits;
+	int mutations = stub_release_and_drain_calls;
+
+	resid.type = LOCKTAG_OBJECT;
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	holder.node_id = cluster_node_id;
+	holder.procno = 23;
+	holder.cluster_epoch = stub_current_epoch;
+	holder.request_id = 988;
+	stub_authority_managed = true;
+	stub_serving_ready = false;
+	stub_serving_pending = true;
+	stub_remote_master = -1;
+	cluster_ges_release_and_drain_local_deferred(&resid, &holder);
+	UT_ASSERT_EQ(stub_deferred_cleanup, before + 1);
+	UT_ASSERT_EQ(stub_admission_waits, waits);
+	UT_ASSERT_EQ(stub_release_and_drain_calls, mutations);
+	UT_ASSERT_EQ(stub_deferred_cleanup_last.holder_request_id_lo, holder.request_id);
+	UT_ASSERT_EQ(stub_deferred_cleanup_last.holder_procno, holder.procno);
+	UT_ASSERT_EQ(stub_deferred_cleanup_last.opcode, GES_REQ_OPCODE_RELEASE);
+	UT_ASSERT(memcmp(stub_deferred_cleanup_last.resid, &resid, sizeof(resid)) == 0);
+	stub_serving_pending = false;
+	stub_serving_ready = true;
+	cluster_ges_release_and_drain_local_deferred(&resid, &holder);
+	UT_ASSERT_EQ(stub_release_and_drain_calls, mutations + 1);
+	UT_ASSERT_EQ(stub_deferred_cleanup, before + 1);
+	stub_authority_managed = false;
+}
+
+UT_TEST(test_unmanaged_ges_still_requires_actual_quorum)
+{
+	ClusterICEnvelope env;
+	GesRequestPayload req;
+	ClusterResId resid = { 0 };
+	uint64 enqueued = stub_work_queue_enqueue_count;
+
+	stub_authority_managed = false;
+	stub_quorum = false;
+	resid.type = LOCKTAG_OBJECT;
+	init_valid_ges_request(&env, &req, GES_REQ_OPCODE_REQUEST, &resid, ExclusiveLock);
+	req.holder_cluster_epoch_lo = (uint32)stub_current_epoch;
+	req.holder_cluster_epoch_hi = (uint32)(stub_current_epoch >> 32);
+	req.holder_request_id_lo = 17;
+	cluster_ges_request_handler(&env, &req);
+	UT_ASSERT_EQ(stub_work_queue_enqueue_count, enqueued);
+	stub_quorum = true;
+}
+
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(52);
+	UT_PLAN(59);
 	UT_RUN(test_block0_protected_failure_detail_is_not_elapsed_timeout);
 
 	UT_RUN(test_ges_request_handler_linkable);
@@ -3367,6 +3700,13 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_redeclare_poll_reject_and_post_reply_cut_are_not_ack);
 	UT_RUN(test_startup_shutdown_at_actual_ges_wait_boundaries);
 
+	UT_RUN(test_pending_ges_keeps_ingress_and_work_queue_owned);
+	UT_RUN(test_ges_recorded_grant_keeps_its_admitted_reply);
+	UT_RUN(test_ges_pending_wait_preserves_original_finite_deadline);
+	UT_RUN(test_release_ack_during_pending_keeps_original_owner);
+	UT_RUN(test_finite_local_release_reuses_its_admitted_observation);
+	UT_RUN(test_no_wait_local_cleanup_retains_exact_release);
+	UT_RUN(test_unmanaged_ges_still_requires_actual_quorum);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

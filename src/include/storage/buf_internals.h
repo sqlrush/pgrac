@@ -32,6 +32,8 @@
  *      cluster fields follow PG-original content_lock so bufmgr.c:3275
  *      AssertNotCatalogBufferLock reverse-deref stays correct).
  *
+ *   6. Expose current/CR mappings in the native buffer hash.
+ *
  * Why:
  *   pgrac needs PCM lock state machine + CR chain + PI chain + Cache
  *   Fusion + GRD master cache fields per buffer (Stage 2-3 真值激活).
@@ -61,6 +63,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "access/xlogdefs.h"		 /* PGRAC: XLogRecPtr, InvalidXLogRecPtr */
+#include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_buffer_desc.h" /* PGRAC: BufferType / PcmState / CacheFusionState / BufferFlags / INVALID_BUFFER_ID / INVALID_NODE_ID */
 #include "cluster/cluster_scn.h"	 /* PGRAC: SCN, InvalidScn */
 #include "datatype/timestamp.h"		 /* PGRAC: TimestampTz */
@@ -233,6 +236,35 @@ BufMappingPartitionLockByIndex(uint32 index)
 	return &MainLWLockArray[BUFFER_MAPPING_LWLOCK_OFFSET + index].lock;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* A lookup key for one retained snapshot within one native index-fetch owner.
+ * Neither nonce grants visibility or current-buffer authority. */
+typedef struct BufferCrKey
+{
+	BufferTag	tag;
+	uint32		reserved_zero;
+	uint64		scan_identity;
+	uint64		snapshot_identity;
+	SCN			read_scn;
+	uint64		read_epoch;
+} BufferCrKey;
+
+/* Protected by the tag's mapping lock, with header locking for publication.
+ * CR payloads are immutable; the native owner alone changes these links. */
+typedef struct BufferCrMetadata
+{
+	int			prev_id;
+	int			next_id;
+	SCN			read_scn;
+	uint64		read_epoch;
+	uint64		snapshot_identity;
+	uint64		scan_identity;
+} BufferCrMetadata;
+
+StaticAssertDecl(sizeof(BufferCrKey) == 56, "CR lookup key layout changed");
+StaticAssertDecl(sizeof(BufferCrMetadata) == 40, "CR metadata layout changed");
+#endif
+
 /*
  *	BufferDesc -- shared descriptor/state data for a single shared buffer.
  *
@@ -328,19 +360,30 @@ typedef struct BufferDesc
 	/* end of 64B BufferDesc segment 1 at offset 64 */
 
 	/* === Cache line 2 cold cluster fields ([64, 128), 64B) === */
-	int			cr_chain_head;	/* offset 64; CR chain head buf_id; INVALID_BUFFER_ID at stage 1.6 */
-	int			cr_chain_next;	/* offset 68; next CR in chain; INVALID_BUFFER_ID at stage 1.6 */
-	SCN			cr_scn;			/* offset 72; CR buffer's read SCN; InvalidScn at stage 1.6 */
-	int			pi_buf_id;		/* offset 80; PI buffer's buf_id; INVALID_BUFFER_ID at stage 1.6 */
-	/* offset 84..87: 4B implicit padding for pi_lsn 8-byte alignment */
-	XLogRecPtr	pi_lsn;			/* offset 88; PI buffer's let-go LSN; InvalidXLogRecPtr at stage 1.6 */
-	uint16		grd_master_node;	/* offset 96; GRD master node id; INVALID_NODE_ID at stage 1.6 */
-	uint16		grd_master_seq; /* offset 98; GRD master seq; 0 at stage 1.6 */
-	uint8		cf_state;		/* offset 100; CacheFusionState enum; CF_STATE_NONE at stage 1.6 */
-	uint8		cf_owner_node;	/* offset 101; CF transfer owner node; 0 at stage 1.6 */
-	uint16		cf_request_count;	/* offset 102; CF transfer request count; 0 at stage 1.6 */
+	union
+	{
+		struct
+		{
+			int			cr_chain_head;	/* offset 64; CR chain head buf_id; INVALID_BUFFER_ID at stage 1.6 */
+			int			cr_chain_next;	/* offset 68; next CR in chain; INVALID_BUFFER_ID at stage 1.6 */
+			SCN			cr_scn;			/* offset 72; CR buffer's read SCN; InvalidScn at stage 1.6 */
+			int			pi_buf_id;		/* offset 80; PI buffer's buf_id; INVALID_BUFFER_ID at stage 1.6 */
+			/* offset 84..87: 4B implicit padding for pi_lsn 8-byte alignment */
+			XLogRecPtr	pi_lsn;			/* offset 88; PI buffer's let-go LSN; InvalidXLogRecPtr at stage 1.6 */
+			uint16		grd_master_node;	/* offset 96; GRD master node id; INVALID_NODE_ID at stage 1.6 */
+			uint16		grd_master_seq; /* offset 98; GRD master seq; 0 at stage 1.6 */
+			uint8		cf_state;		/* offset 100; CacheFusionState enum; CF_STATE_NONE at stage 1.6 */
+			uint8		cf_owner_node;	/* offset 101; CF transfer owner node; 0 at stage 1.6 */
+			uint16		cf_request_count;	/* offset 102; CF transfer request count; 0 at stage 1.6 */
+		};
+		BufferCrMetadata cr;		/* only when buffer_type == BUF_TYPE_CR */
+	};
 	LWLock		pcm_lock;		/* offset 104; PCM lock; LWLockInitialize'd at stage 1.6 (not held) */
-	TimestampTz pi_created_at;	/* offset 120; PI creation timestamp; 0 at stage 1.6 */
+	union
+	{
+		TimestampTz pi_created_at;	/* offset 120; current/PI only */
+		uint64		cr_anchor_generation;	/* CR only; never zero while linked */
+	};
 	/* end of 64B BufferDesc segment 2 at offset 128 */
 #endif							/* USE_PGRAC_CLUSTER */
 } BufferDesc;
@@ -425,6 +468,74 @@ StaticAssertDecl(offsetof(BufferDesc, cr_chain_head) >= 64,
 StaticAssertDecl(offsetof(BufferDesc, content_lock) <
 				 offsetof(BufferDesc, buffer_type),
 				 "PGRAC: cluster fields must follow PG-original content_lock so bufmgr.c:3275 reverse-deref stays correct");
+
+StaticAssertDecl(offsetof(BufferDesc, cr) == offsetof(BufferDesc, cr_chain_head),
+				 "CR metadata must reuse the cold current/PI fields");
+StaticAssertDecl(offsetof(BufferDesc, cr) + sizeof(BufferCrMetadata) ==
+				 offsetof(BufferDesc, pcm_lock), "CR metadata must not overlap PCM lock");
+StaticAssertDecl(offsetof(BufferDesc, cr_anchor_generation) == 120,
+				 "CR anchor generation must reuse the final cold word");
+
+/* Mapping/header-locked metadata checks only. Callers separately prove the
+ * actual scan/snapshot, admission, retention and FULL producer result. */
+static inline bool
+BufferCrTagValid(const BufferTag *tag)
+{
+	return tag != NULL && tag->spcOid != InvalidOid &&
+		tag->spcOid != GLOBALTABLESPACE_OID && tag->dbOid != InvalidOid &&
+		tag->relNumber != InvalidRelFileNumber && tag->forkNum == MAIN_FORKNUM &&
+		tag->blockNum != P_NEW;
+}
+
+static inline bool
+BufferCrKeyValid(const BufferCrKey *key)
+{
+	return key != NULL && key->reserved_zero == 0 &&
+		BufferCrTagValid(&key->tag) &&
+		key->scan_identity != 0 && key->snapshot_identity != 0 &&
+		SCN_VALID(key->read_scn) && key->read_epoch != 0;
+}
+
+/* Header-only observers must not inspect links protected by mapping locks. */
+static inline bool
+BufferCrHeaderValid(const BufferDesc *buf, uint32 state)
+{
+	const uint32 forbidden = BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED |
+		BM_IO_IN_PROGRESS | BM_IO_ERROR;
+
+	return buf != NULL && buf->buffer_type == BUF_TYPE_CR &&
+		BufferCrTagValid(&buf->tag) &&
+		buf->pcm_state == PCM_STATE_N && buf->pi_flags == 0 &&
+		buf->cluster_padding_1 == 0 &&
+		(state & (BM_VALID | BM_TAG_VALID)) == (BM_VALID | BM_TAG_VALID) &&
+		(state & forbidden) == 0 && buf->buf_id >= 0 && buf->buf_id < NBuffers &&
+		buf->cr_anchor_generation != 0 && buf->cr.scan_identity != 0 &&
+		buf->cr.snapshot_identity != 0 && SCN_VALID(buf->cr.read_scn) &&
+		buf->cr.read_epoch != 0;
+}
+
+static inline bool
+BufferCrStateValid(const BufferDesc *buf, uint32 state)
+{
+	return BufferCrHeaderValid(buf, state) &&
+		buf->cr.prev_id >= -1 && buf->cr.prev_id < NBuffers &&
+		buf->cr.next_id >= -1 && buf->cr.next_id < NBuffers &&
+		buf->cr.prev_id != buf->buf_id && buf->cr.next_id != buf->buf_id &&
+		(buf->cr.prev_id == -1 || buf->cr.prev_id != buf->cr.next_id);
+}
+
+static inline bool
+BufferCrMatches(const BufferDesc *buf, uint32 state, const BufferCrKey *key,
+				uint64 anchor_generation)
+{
+	return BufferCrKeyValid(key) && BufferCrStateValid(buf, state) &&
+		anchor_generation != 0 && buf->cr_anchor_generation == anchor_generation &&
+		BufferTagsEqual(&buf->tag, &key->tag) &&
+		buf->cr.scan_identity == key->scan_identity &&
+		buf->cr.snapshot_identity == key->snapshot_identity &&
+		/* SCN_CMP_OK: exact cache identity, not visibility ordering. */
+		buf->cr.read_scn == key->read_scn && buf->cr.read_epoch == key->read_epoch;
+}
 
 /*
  * PGRAC: ClusterInitBufferDescFields -- write placeholder values to all
@@ -652,6 +763,24 @@ extern uint32 BufTableHashCode(BufferTag *tagPtr);
 extern int	BufTableLookup(BufferTag *tagPtr, uint32 hashcode);
 extern int	BufTableInsert(BufferTag *tagPtr, uint32 hashcode, int buf_id);
 extern void BufTableDelete(BufferTag *tagPtr, uint32 hashcode);
+#ifdef USE_PGRAC_CLUSTER
+/* Mapping-S for lookup, mapping-X for mutations; CR is never current. */
+extern bool BufTableNewCRScope(uint64 *scope);
+extern bool BufTableCRLookup(BufferTag *tagPtr, uint32 hashcode, int *head,
+							 uint64 *generation);
+extern bool BufTableCRInsert(BufferTag *tagPtr, uint32 hashcode, int cr_id,
+							 int *old_head, uint64 *generation);
+extern bool BufTableCRReplaceHead(BufferTag *tagPtr, uint32 hashcode,
+								  uint64 generation, int expected_head,
+								  int replacement_head);
+/* Original read owner proves image eligibility after reserve and before
+ * publish. Reserve/publish keep the caller's native pin; release it normally.
+ * Copy returns bytes only, never current-buffer or visibility authority. */
+extern Buffer cluster_bufmgr_cr_reserve_v1(void);
+extern bool cluster_bufmgr_cr_publish_v1(Buffer buffer, const BufferCrKey *key,
+										  const void *page);
+extern bool cluster_bufmgr_cr_copy_v1(const BufferCrKey *key, void *page);
+#endif
 
 /* localbuf.c */
 extern bool PinLocalBuffer(BufferDesc *buf_hdr, bool adjust_usagecount);

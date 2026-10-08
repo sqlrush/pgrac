@@ -2088,6 +2088,17 @@ cluster_ic_tier1_pending_outbound(int32 peer)
 	UT_ASSERT_EQ(cl_normal_stop_service_depth, 1);
 	return data_tail;
 }
+/* This stop fixture has socket events, but no retained frame or RDMA lane. */
+void
+cluster_ic_rdma_retry_dispatch(void)
+{}
+
+bool
+cluster_ic_tier1_recv_dispatch_pending(int32 peer)
+{
+	return false;
+}
+
 bool
 cluster_ic_tier1_recv_heartbeat_drain(int32 peer, int fd)
 {

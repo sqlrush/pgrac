@@ -201,7 +201,7 @@ typedef struct ClusterLockAcquireRequest {
 	 */
 	int timeout_ms;
 	uint32 wait_event;
-	/* Zero-initialized inline HW/relation ownership through S5/S7. */
+	/* Zero-initialized inline HW/native-lock/CF ownership through S5/S7. */
 	ClusterGesHwGrant hw_grant;
 	/* Backend-local static typed reason, captured at the failed S5 predicate. */
 	const char *registration_failure_reason;

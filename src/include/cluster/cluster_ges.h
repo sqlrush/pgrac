@@ -64,6 +64,7 @@
 #include "port/atomics.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ges_reply_wait.h"
+#include "storage/lock.h"
 
 /*
  * ClusterGesSharedState -- spec-2.13 D2 skeleton shmem.
@@ -527,7 +528,7 @@ StaticAssertDecl(offsetof(GesRequestPayload, lock_group_procno_plus_one) == 72,
 
 extern uint32 cluster_ges_current_lock_group(const struct ClusterGrdHolderId *holder);
 
-/* Backend-local HW/relation REQUEST handoff.  Historical type name retained;
+/* Backend-local HW/native-lock REQUEST handoff.  Historical type name retained;
  * never a shared entry pointer, a new authority, or a wire payload. */
 typedef struct ClusterGesHwGrant {
 	GesReplyWaitKey key;
@@ -536,6 +537,7 @@ typedef struct ClusterGesHwGrant {
 	uint64 master_generation;
 	bool cleanup_pending;
 	bool grant_observed;
+	/* Exact requester registration, including local-master confirmation. */
 	bool local_promoted;
 	bool consumed;
 } ClusterGesHwGrant;
@@ -580,6 +582,7 @@ typedef enum ClusterGesAcquireResult {
 	CLUSTER_GES_ACQUIRE_INVALID
 } ClusterGesAcquireResult;
 
+struct ClusterResId;
 extern ClusterGesAcquireResult cluster_ges_cf_request_poll(ClusterGesAcquireAttempt *attempt,
 														   const struct ClusterResId *resid,
 														   uint32 mode,
@@ -661,12 +664,26 @@ extern uint32 cluster_ges_send_hw_request_and_wait(const struct ClusterResId *re
 												   const struct ClusterGrdHolderId *holder,
 												   uint64 request_id, int timeout_ms,
 												   uint32 wait_event, ClusterGesHwGrant *grant);
+/* Pending retains the caller's granted owner for another S5 pass. */
+extern bool cluster_ges_retained_grant_check(const ClusterGesHwGrant *grant,
+											 const struct ClusterResId *resid,
+											 const struct ClusterGrdHolderId *holder,
+											 uint64 request_id, uint32 mode, bool dontwait,
+											 bool *pending);
 extern bool cluster_ges_hw_grant_is_current(const ClusterGesHwGrant *grant,
 											const struct ClusterResId *resid,
 											const struct ClusterGrdHolderId *holder,
 											uint64 request_id);
 extern void cluster_ges_hw_grant_abandon(ClusterGesHwGrant *grant);
-extern uint32 cluster_ges_send_relation_request_and_wait(
+/* The four native lock classes already admitted by the cluster lock gate. */
+static inline bool
+cluster_ges_native_lock_type(uint8 type)
+{
+	return type == LOCKTAG_RELATION || type == LOCKTAG_OBJECT || type == LOCKTAG_ADVISORY
+		   || type == LOCKTAG_TRANSACTION;
+}
+
+extern uint32 cluster_ges_send_native_request_and_wait(
 	const struct ClusterResId *resid, uint32 mode, const struct ClusterGrdHolderId *holder,
 	uint64 request_id, int timeout_ms, uint32 wait_event, bool dontwait, ClusterGesHwGrant *grant);
 extern bool cluster_ges_relation_grant_is_current(const ClusterGesHwGrant *grant,
@@ -718,6 +735,9 @@ extern uint32 cluster_ges_send_release_and_wait(const struct ClusterResId *resid
  * confirmed absence. An absent holder drains no waiters; unavailable authority
  * is not absence. Recovery-only release also leaves ordinary waiters frozen.
  */
+/* Transfers pending cleanup to the original reliable local RELEASE owner. */
+extern void cluster_ges_release_and_drain_local_deferred(const struct ClusterResId *resid,
+														 const struct ClusterGrdHolderId *holder);
 extern uint32 cluster_ges_release_and_drain_local(const struct ClusterResId *resid,
 												  const struct ClusterGrdHolderId *holder);
 

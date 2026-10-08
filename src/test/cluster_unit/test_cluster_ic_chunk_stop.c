@@ -91,13 +91,17 @@ cluster_ic_tier1_set_chunk_reassembly_active(int32 peer, uint32 active)
 	diagnostic_active[peer] = active;
 }
 
-bool
+static bool admission_pending;
+
+ClusterICDispatchResult
 cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, int fd)
 {
 	int peer = -1;
 	uint32 sequence = 0;
 	const char *reason = NULL;
 	const uint8 *bytes = payload;
+	if (admission_pending)
+		return CLUSTER_IC_DISPATCH_PENDING;
 	dispatched_count++;
 	dispatch_saw_pending = cluster_ic_chunk_normal_stop_poll(&peer, &sequence, &reason)
 							   == CLUSTER_NORMAL_STOP_PENDING
@@ -110,14 +114,14 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 	return true;
 }
 
-static bool
+static ClusterICDispatchResult
 receive_chunk(int peer, uint32 sequence)
 {
 	ClusterICChunkHeader hdr = { 0 };
 	ClusterICEnvelope env = { 0 };
 	size_t length = sequence == 0 ? PGRAC_IC_CHUNK_BYTES : 1;
 	uint8 *frame = malloc(sizeof(hdr) + length);
-	bool result;
+	ClusterICDispatchResult result;
 	Assert(frame != NULL);
 	hdr.chunk_seq = sequence;
 	hdr.chunk_total = 2;
@@ -193,6 +197,25 @@ UT_TEST(test_actual_two_chunk_ownership_through_dispatch)
 	UT_ASSERT_EQ(poll_chunk(&peer, &sequence), CLUSTER_NORMAL_STOP_READY);
 }
 
+UT_TEST(test_pending_final_chunk_preserves_bytes_and_original_deadline)
+{
+	TimestampTz started;
+	reset_test();
+	UT_ASSERT_EQ(receive_chunk(3, 0), CLUSTER_IC_DISPATCH_DONE);
+	started = cluster_chunk_reassembly_state[3].started_at;
+	admission_pending = true;
+	UT_ASSERT_EQ(receive_chunk(3, 1), CLUSTER_IC_DISPATCH_PENDING);
+	UT_ASSERT_EQ(dispatched_count, 0);
+	UT_ASSERT_EQ(live_contexts, 1);
+	UT_ASSERT_EQ(cluster_chunk_reassembly_state[3].seq_next, 1);
+	UT_ASSERT_EQ(cluster_chunk_reassembly_state[3].started_at, started);
+	admission_pending = false;
+	UT_ASSERT_EQ(receive_chunk(3, 1), CLUSTER_IC_DISPATCH_DONE);
+	UT_ASSERT_EQ(dispatched_count, 1);
+	UT_ASSERT(dispatch_bytes_valid);
+	UT_ASSERT_EQ(live_contexts, 0);
+}
+
 UT_TEST(test_later_malformed_peer_overrides_pending_without_clearing)
 {
 	int peer;
@@ -250,13 +273,14 @@ UT_TEST(test_real_sequence_reject_is_not_completion)
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(6);
 	UT_RUN(test_only_owning_transport_process_can_poll);
 	UT_RUN(test_actual_two_chunk_ownership_through_dispatch);
 	UT_RUN(test_later_malformed_peer_overrides_pending_without_clearing);
 	UT_RUN(test_context_and_state_must_agree);
 	UT_RUN(test_real_sequence_reject_is_not_completion);
 	reset_test();
+	UT_RUN(test_pending_final_chunk_preserves_bytes_and_original_deadline);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

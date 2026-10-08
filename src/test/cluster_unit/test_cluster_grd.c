@@ -58,6 +58,7 @@
 #include "access/transam.h"				 /* spec-5.8 D1c — InvalidTransactionId */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_pi_rebuild.h"
+#include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_hw.h" /* spec-4.6a HW remaster watchdog stubs */
@@ -89,6 +90,7 @@
 #undef strerror_r
 
 #include "unit_test.h"
+#include "test_cluster_grd_pool.inc"
 #include "test_cluster_grd_stop_types.inc"
 
 
@@ -214,6 +216,7 @@ static bool ut_grd_force_reinit = false;
 static void
 ut_reset_grd_shmem(void)
 {
+	ut_grd_pool_reset();
 	ut_grd_force_reinit = true;
 }
 
@@ -223,6 +226,10 @@ ut_reset_grd_shmem(void)
 void *
 ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 {
+	if (name != NULL && strcmp(name, "pgrac cluster grd slots") == 0) {
+		*foundPtr = false;
+		return ut_grd_pool_region.data;
+	}
 	if (name != NULL && strcmp(name, "pgrac cluster grd") == 0) {
 		static union {
 			/* cppcheck-suppress unusedStructMember
@@ -507,11 +514,48 @@ cluster_reconfig_capture_formation_snapshot_v1(uint16 thread, ClusterFormationSn
 		ut_membership_generation += 2;
 	return true;
 }
+static ClusterQvotecAdmissionCheck ut_storage_admission;
+static bool ut_storage_admission_override;
+static unsigned ut_storage_admission_reads;
+static unsigned ut_storage_admission_after;
+static bool ut_storage_count_legacy;
 bool
 cluster_qvotec_in_quorum(void)
 {
+	if (ut_storage_count_legacy) {
+		ut_storage_admission_reads++;
+		if (ut_storage_admission_override
+			&& ut_storage_admission_reads >= ut_storage_admission_after)
+			return ut_storage_admission.result == CLUSTER_QVOTEC_ADMISSION_ALLOWED;
+	}
 	return ut_qvotec_quorum;
 }
+bool
+cluster_qvotec_check_admission(ClusterQvotecAdmissionCheck *out)
+{
+	ut_storage_admission_reads++;
+	if (ut_storage_admission_override && ut_storage_admission_reads >= ut_storage_admission_after) {
+		*out = ut_storage_admission;
+		return out->result == CLUSTER_QVOTEC_ADMISSION_ALLOWED;
+	}
+	memset(out, 0, sizeof(*out));
+	out->result
+		= ut_qvotec_quorum ? CLUSTER_QVOTEC_ADMISSION_ALLOWED : CLUSTER_QVOTEC_ADMISSION_DB_STATE;
+	return ut_qvotec_quorum;
+}
+/* The real managed boot/continuity owner is exercised by authority_storage;
+ * this boundary fixture supplies only the same-sample result to GRD. */
+bool
+cluster_authority_serving_admission_current_v1(const ClusterQvotecAdmissionCheck *check,
+											   bool *pending)
+{
+	*pending = check->result == CLUSTER_QVOTEC_ADMISSION_STORAGE
+			   && check->storage.result == CLUSTER_STORAGE_CHECK_UNSTABLE
+			   && (check->storage.snapshot_stop == CLUSTER_STORAGE_SNAPSHOT_DEADLINE
+				   || check->storage.snapshot_stop == CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT);
+	return check->result == CLUSTER_QVOTEC_ADMISSION_ALLOWED;
+}
+
 uint64
 cluster_qvotec_get_self_incarnation(void)
 {
@@ -2037,7 +2081,7 @@ UT_TEST(test_grd_s5_compatible_reservations_do_not_invalidate_each_other)
 	bool fast_path = false;
 	LOCKMODE mode = NoLock;
 	const int32 nodes[] = { 0 };
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int nconflicts = 0;
 
 	set_mock_declared(1, nodes);
@@ -2057,10 +2101,10 @@ UT_TEST(test_grd_s5_compatible_reservations_do_not_invalidate_each_other)
 				 (int)CLUSTER_GRD_ENTRY_OK);
 	UT_ASSERT(fast_path);
 	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &first, 0, 201, 1, 1, ShareLock,
-													conflicts, &nconflicts),
+													&conflicts, &nconflicts),
 				 CLUSTER_GRD_GRANT_NOW);
 	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &sibling, 0, 202, 1, 1, ShareLock,
-													conflicts, &nconflicts),
+													&conflicts, &nconflicts),
 				 CLUSTER_GRD_GRANT_NOW);
 	UT_ASSERT_EQ((int)cluster_grd_confirm_local_grant_exact(&resid, &first, ShareLock),
 				 (int)CLUSTER_GRD_ENTRY_OK);
@@ -2082,7 +2126,7 @@ UT_TEST(test_grd_exact_registration_needs_grant_identity_and_mode)
 	ClusterGrdHolderId holder, wrong;
 	uint64 snapshot;
 	const int32 nodes[] = { 0 };
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int nconflicts = 0;
 	LOCKMODE mode = NoLock;
 
@@ -2097,7 +2141,7 @@ UT_TEST(test_grd_exact_registration_needs_grant_identity_and_mode)
 				 CLUSTER_GRD_ENTRY_NOT_FOUND);
 	UT_ASSERT(!cluster_grd_holder_mode_by_id(&resid, &holder, &mode));
 	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &holder, 0, 201, 1, 1, ShareLock,
-													conflicts, &nconflicts),
+													&conflicts, &nconflicts),
 				 CLUSTER_GRD_GRANT_NOW);
 	wrong = holder;
 	wrong.procno++;
@@ -3771,7 +3815,7 @@ UT_TEST(test_walr_convert_nowait_requires_exact_old_holder_id)
 {
 	ClusterResId resid;
 	ClusterGrdHolderId holder;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int nconflict = -1;
 
 	convert_reset();
@@ -3779,7 +3823,7 @@ UT_TEST(test_walr_convert_nowait_requires_exact_old_holder_id)
 	holder = bast_holder(1, 100, 41);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
 					 &resid, &holder, 1, 41, (ClusterGrdWaiterMeta){ (TransactionId)0, 0 }, 0,
-					 UT_GES_OPCODE_REQUEST, ShareLock, conflicts, &nconflict),
+					 UT_GES_OPCODE_REQUEST, ShareLock, &conflicts, &nconflict),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 
 	UT_ASSERT_EQ(
@@ -3800,7 +3844,7 @@ UT_TEST(test_walr_completion_master_excludes_remote_readers)
 	ClusterGrdHolderId reader = bast_holder(2, 200, 51);
 	ClusterGrdHolderId late_reader = bast_holder(2, 201, 61);
 	ClusterGrdEntry *entry = NULL;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int nconflict = -1;
 	LOCKMODE mode = NoLock;
 
@@ -3810,11 +3854,11 @@ UT_TEST(test_walr_completion_master_excludes_remote_readers)
 	resid.field1 = 3;
 	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant_meta(
 					 &resid, &completing, 1, 41, (ClusterGrdWaiterMeta){ 0, 0 }, 0,
-					 UT_GES_OPCODE_REQUEST, ShareLock, conflicts, &nconflict),
+					 UT_GES_OPCODE_REQUEST, ShareLock, &conflicts, &nconflict),
 				 CLUSTER_GRD_GRANT_NOW);
 	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant_meta(
 					 &resid, &reader, 2, 51, (ClusterGrdWaiterMeta){ 0, 0 }, 0,
-					 UT_GES_OPCODE_REQUEST, ShareLock, conflicts, &nconflict),
+					 UT_GES_OPCODE_REQUEST, ShareLock, &conflicts, &nconflict),
 				 CLUSTER_GRD_GRANT_NOW);
 	for (unsigned attempt = 0; attempt < 3; attempt++) {
 		UT_ASSERT_EQ(cluster_grd_convert_nowait(&resid, 1, 100, 0, ShareLock, ExclusiveLock,
@@ -3839,13 +3883,13 @@ UT_TEST(test_walr_completion_master_excludes_remote_readers)
 	UT_ASSERT_EQ(mode, ExclusiveLock);
 	UT_ASSERT_EQ(cluster_grd_entry_grant_conditional(&resid, &late_reader, 2, 61, 0,
 													 GES_REQ_OPCODE_REQUEST_NOWAIT, ShareLock,
-													 conflicts, &nconflict),
+													 &conflicts, &nconflict),
 				 CLUSTER_GRD_CONFLICT_NOWAIT);
 	UT_ASSERT(!cluster_grd_holder_mode_by_id(&resid, &late_reader, NULL));
 	UT_ASSERT_EQ(cluster_grd_release_holder_by_id(&resid, &completing), CLUSTER_GRD_ENTRY_OK);
 	UT_ASSERT_EQ(cluster_grd_entry_grant_conditional(&resid, &late_reader, 2, 61, 0,
 													 GES_REQ_OPCODE_REQUEST_NOWAIT, ShareLock,
-													 conflicts, &nconflict),
+													 &conflicts, &nconflict),
 				 CLUSTER_GRD_GRANT_NOW);
 	UT_ASSERT_EQ(cluster_grd_release_holder_by_id(&resid, &late_reader), CLUSTER_GRD_ENTRY_OK);
 	convert_teardown();
@@ -3860,7 +3904,7 @@ UT_TEST(test_5_1c_u9a_self_conflict_excluded)
 	int saved = cluster_node_id;
 	ClusterResId resid;
 	ClusterGrdHolderId h;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int n_conflict = -1;
 
 	cluster_node_id = 0;
@@ -3869,13 +3913,13 @@ UT_TEST(test_5_1c_u9a_self_conflict_excluded)
 
 	h = bast_holder(1, 100, 1); /* same backend grabs ShareLock */
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
-														 ShareLock, conflicts, &n_conflict),
+														 ShareLock, &conflicts, &n_conflict),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 
 	h = bast_holder(1, 100, 2); /* fresh request_id, conflicting ExclusiveLock */
 	n_conflict = -1;
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 2, 0, UT_GES_OPCODE_REQUEST,
-														 ExclusiveLock, conflicts, &n_conflict),
+														 ExclusiveLock, &conflicts, &n_conflict),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 	UT_ASSERT_EQ(n_conflict, 0); /* self excluded -> no conflict holders */
 
@@ -3890,7 +3934,7 @@ UT_TEST(test_5_1c_u9b_self_plus_other_keeps_other)
 	int saved = cluster_node_id;
 	ClusterResId resid;
 	ClusterGrdHolderId h;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int n_conflict = -1;
 
 	cluster_node_id = 0;
@@ -3899,15 +3943,15 @@ UT_TEST(test_5_1c_u9b_self_plus_other_keeps_other)
 
 	h = bast_holder(1, 100, 1); /* self ShareLock */
 	(void)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST, ShareLock,
-											 conflicts, &n_conflict);
+											 &conflicts, &n_conflict);
 	h = bast_holder(2, 200, 2); /* other backend ShareLock (S+S compatible) */
 	(void)cluster_grd_entry_enqueue_or_grant(&resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST, ShareLock,
-											 conflicts, &n_conflict);
+											 &conflicts, &n_conflict);
 
 	h = bast_holder(1, 100, 3); /* self requests ExclusiveLock */
 	n_conflict = -1;
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 3, 0, UT_GES_OPCODE_REQUEST,
-														 ExclusiveLock, conflicts, &n_conflict),
+														 ExclusiveLock, &conflicts, &n_conflict),
 				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
 	UT_ASSERT_EQ(n_conflict, 1); /* only the other backend */
 	UT_ASSERT_EQ((int)conflicts[0].holder.node_id, 2);
@@ -3924,7 +3968,7 @@ UT_TEST(test_5_1c_u9c_different_backend_normal)
 	int saved = cluster_node_id;
 	ClusterResId resid;
 	ClusterGrdHolderId h;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int n_conflict = -1;
 
 	cluster_node_id = 0;
@@ -3933,12 +3977,12 @@ UT_TEST(test_5_1c_u9c_different_backend_normal)
 
 	h = bast_holder(1, 100, 1); /* node 1 ShareLock */
 	(void)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST, ShareLock,
-											 conflicts, &n_conflict);
+											 &conflicts, &n_conflict);
 
 	h = bast_holder(2, 200, 2); /* node 2 requests ExclusiveLock -> conflict */
 	n_conflict = -1;
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST,
-														 ExclusiveLock, conflicts, &n_conflict),
+														 ExclusiveLock, &conflicts, &n_conflict),
 				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
 	UT_ASSERT_EQ(n_conflict, 1);
 	UT_ASSERT_EQ((int)conflicts[0].holder.node_id, 1);
@@ -3961,7 +4005,7 @@ UT_TEST(test_ul_grant_conditional_no_waiter_enqueued)
 	ClusterResId resid;
 	ClusterGrdHolderId h;
 	ClusterGrdEntry *e = NULL;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	ClusterGrdWaiterIdentity granted[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
 	int n_conflict = -1;
 	int popped;
@@ -3973,7 +4017,7 @@ UT_TEST(test_ul_grant_conditional_no_waiter_enqueued)
 	/* node1 holds ExclusiveLock. */
 	h = bast_holder(1, 100, 1);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
-														 ExclusiveLock, conflicts, &n_conflict),
+														 ExclusiveLock, &conflicts, &n_conflict),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 	UT_ASSERT_EQ((int)cluster_grd_entry_lookup_or_create(&resid, false, &e),
 				 (int)CLUSTER_GRD_ENTRY_OK);
@@ -3984,7 +4028,7 @@ UT_TEST(test_ul_grant_conditional_no_waiter_enqueued)
 	n_conflict = -1;
 	UT_ASSERT_EQ((int)cluster_grd_entry_grant_conditional(&resid, &h, 2, 2, 0,
 														  UT_GES_OPCODE_REQUEST, ExclusiveLock,
-														  conflicts, &n_conflict),
+														  &conflicts, &n_conflict),
 				 (int)CLUSTER_GRD_CONFLICT_NOWAIT);
 	UT_ASSERT_EQ(cluster_grd_entry_ngranted(e), 1); /* node2 NOT added as a holder */
 	cluster_grd_entry_release(e);
@@ -4000,7 +4044,7 @@ UT_TEST(test_ul_grant_conditional_no_waiter_enqueued)
 	n_conflict = -1;
 	UT_ASSERT_EQ((int)cluster_grd_entry_grant_conditional(&resid, &h, 2, 3, 0,
 														  UT_GES_OPCODE_REQUEST, ExclusiveLock,
-														  conflicts, &n_conflict),
+														  &conflicts, &n_conflict),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 
 	cluster_node_id = saved;
@@ -4046,7 +4090,7 @@ UT_TEST(test_ul_advisory_mode_matrix_conditional)
 	int saved = cluster_node_id;
 	ClusterResId resid;
 	ClusterGrdHolderId h;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int n_conflict = -1;
 
 	cluster_node_id = 0;
@@ -4055,21 +4099,23 @@ UT_TEST(test_ul_advisory_mode_matrix_conditional)
 
 	/* node1 ShareLock → grant. */
 	h = bast_holder(1, 100, 1);
-	UT_ASSERT_EQ((int)cluster_grd_entry_grant_conditional(
-					 &resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST, ShareLock, conflicts, &n_conflict),
+	UT_ASSERT_EQ((int)cluster_grd_entry_grant_conditional(&resid, &h, 1, 1, 0,
+														  UT_GES_OPCODE_REQUEST, ShareLock,
+														  &conflicts, &n_conflict),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 
 	/* node2 ShareLock — S/S compatible → conditional grant. */
 	h = bast_holder(2, 200, 2);
-	UT_ASSERT_EQ((int)cluster_grd_entry_grant_conditional(
-					 &resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST, ShareLock, conflicts, &n_conflict),
+	UT_ASSERT_EQ((int)cluster_grd_entry_grant_conditional(&resid, &h, 2, 2, 0,
+														  UT_GES_OPCODE_REQUEST, ShareLock,
+														  &conflicts, &n_conflict),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 
 	/* node3 ExclusiveLock — S/X conflict → CONFLICT_NOWAIT (no waiter). */
 	h = bast_holder(3, 300, 3);
 	UT_ASSERT_EQ((int)cluster_grd_entry_grant_conditional(&resid, &h, 3, 3, 0,
 														  UT_GES_OPCODE_REQUEST, ExclusiveLock,
-														  conflicts, &n_conflict),
+														  &conflicts, &n_conflict),
 				 (int)CLUSTER_GRD_CONFLICT_NOWAIT);
 
 	cluster_node_id = saved;
@@ -4167,7 +4213,7 @@ UT_TEST(test_5_1c_u11_release_and_pop_unchanged)
 	int saved = cluster_node_id;
 	ClusterResId resid;
 	ClusterGrdHolderId h, w;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	ClusterGrdWaiterIdentity granted[2];
 	int n_conflict = -1;
 
@@ -4177,14 +4223,14 @@ UT_TEST(test_5_1c_u11_release_and_pop_unchanged)
 
 	h = bast_holder(1, 100, 1); /* node 1 ExclusiveLock */
 	(void)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
-											 ExclusiveLock, conflicts, &n_conflict);
+											 ExclusiveLock, &conflicts, &n_conflict);
 	memset(&w, 0, sizeof(w)); /* node 2 RowShare waits (RS conflicts with X) */
 	w.node_id = 2;
 	w.procno = 200;
 	w.request_id = 2;
 	n_conflict = -1;
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &w, 2, 2, 0, UT_GES_OPCODE_REQUEST,
-														 RowShareLock, conflicts, &n_conflict),
+														 RowShareLock, &conflicts, &n_conflict),
 				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
 
 	/* release the X holder -> exactly one compatible waiter popped. */
@@ -4211,7 +4257,7 @@ UT_TEST(test_5_8_d1b_u2a_enqueue_registers_multi_blocker)
 	int saved = cluster_node_id;
 	ClusterResId resid;
 	ClusterGrdHolderId h;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int nc = -1;
 
 	cluster_node_id = 0;
@@ -4222,17 +4268,17 @@ UT_TEST(test_5_8_d1b_u2a_enqueue_registers_multi_blocker)
 	/* Two compatible S holders on distinct backends. */
 	h = bast_holder(1, 100, 1);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
-														 ShareLock, conflicts, &nc),
+														 ShareLock, &conflicts, &nc),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 	h = bast_holder(2, 200, 2);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST,
-														 ShareLock, conflicts, &nc),
+														 ShareLock, &conflicts, &nc),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 
 	/* An X requester conflicts with BOTH S holders -> enqueued with 2 edges. */
 	h = bast_holder(3, 300, 3);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 3, 3, 0, UT_GES_OPCODE_REQUEST,
-														 ExclusiveLock, conflicts, &nc),
+														 ExclusiveLock, &conflicts, &nc),
 				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
 
 	UT_ASSERT_EQ(ut_wfg_count_waiter(3, 300, 0, 3), 2);
@@ -4253,7 +4299,7 @@ UT_TEST(test_5_8_d1b_u2b_refresh_follows_current_holders)
 	ClusterResId resid;
 	ClusterGrdHolderId h;
 	ClusterGrdGrantIdentity granted[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 2];
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int nc = -1;
 	int n;
 
@@ -4265,15 +4311,15 @@ UT_TEST(test_5_8_d1b_u2b_refresh_follows_current_holders)
 	/* holder1 X; two X waiters both blocked by holder1. */
 	h = bast_holder(1, 100, 1);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
-														 ExclusiveLock, conflicts, &nc),
+														 ExclusiveLock, &conflicts, &nc),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 	h = bast_holder(2, 200, 2);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST,
-														 ExclusiveLock, conflicts, &nc),
+														 ExclusiveLock, &conflicts, &nc),
 				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
 	h = bast_holder(3, 300, 3);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 3, 3, 0, UT_GES_OPCODE_REQUEST,
-														 ExclusiveLock, conflicts, &nc),
+														 ExclusiveLock, &conflicts, &nc),
 				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
 	UT_ASSERT_EQ(ut_wfg_count_waiter(2, 200, 0, 2), 1);
 	UT_ASSERT(ut_wfg_has_edge(2, 200, 0, 2, 1, 100, 0, 1));
@@ -4303,7 +4349,7 @@ UT_TEST(test_5_8_d1b_u2c_convert_enqueue_registers_edge)
 	int saved = cluster_node_id;
 	ClusterResId resid;
 	ClusterGrdHolderId h;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int nc = -1;
 
 	cluster_node_id = 0;
@@ -4313,18 +4359,18 @@ UT_TEST(test_5_8_d1b_u2c_convert_enqueue_registers_edge)
 
 	h = bast_holder(1, 100, 1);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
-														 ShareLock, conflicts, &nc),
+														 ShareLock, &conflicts, &nc),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 	h = bast_holder(2, 200, 2);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST,
-														 ShareLock, conflicts, &nc),
+														 ShareLock, &conflicts, &nc),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 
 	/* node1/procno100 converts S->X (convert_request_id 10); blocked by the
 	 * node2 S holder (the node1 S hold self-excludes). */
 	nc = -1;
 	UT_ASSERT_EQ((int)cluster_grd_convert_or_enqueue(&resid, 1, 100, 0, ShareLock, ExclusiveLock,
-													 10, 1, 0, conflicts, &nc),
+													 10, 1, 0, &conflicts, &nc),
 				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
 
 	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 100, 0, 10), 1);
@@ -4340,7 +4386,7 @@ UT_TEST(test_5_8_d1b_u2d_cancel_removes_waiter_edges)
 	int saved = cluster_node_id;
 	ClusterResId resid;
 	ClusterGrdHolderId h;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int nc = -1;
 
 	cluster_node_id = 0;
@@ -4350,11 +4396,11 @@ UT_TEST(test_5_8_d1b_u2d_cancel_removes_waiter_edges)
 
 	h = bast_holder(1, 100, 1);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
-														 ExclusiveLock, conflicts, &nc),
+														 ExclusiveLock, &conflicts, &nc),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 	h = bast_holder(2, 200, 2);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST,
-														 ExclusiveLock, conflicts, &nc),
+														 ExclusiveLock, &conflicts, &nc),
 				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
 	UT_ASSERT_EQ(ut_wfg_count_waiter(2, 200, 0, 2), 1);
 
@@ -4375,7 +4421,7 @@ UT_TEST(test_5_8_wfg_projection_retries_after_release_wins_snapshot_publish_race
 	int saved = cluster_node_id;
 	ClusterResId resid;
 	ClusterGrdHolderId h;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int nc = -1;
 
 	cluster_node_id = 0;
@@ -4385,7 +4431,7 @@ UT_TEST(test_5_8_wfg_projection_retries_after_release_wins_snapshot_publish_race
 
 	h = bast_holder(3, 482, 305);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(
-					 &resid, &h, 3, 305, 0, UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
+					 &resid, &h, 3, 305, 0, UT_GES_OPCODE_REQUEST, ExclusiveLock, &conflicts, &nc),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 
 	ut_wfg_release_resid = resid;
@@ -4393,7 +4439,7 @@ UT_TEST(test_5_8_wfg_projection_retries_after_release_wins_snapshot_publish_race
 	ut_wfg_release_holder_on_submit_once = true;
 	h = bast_holder(3, 543, 306);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(
-					 &resid, &h, 3, 306, 0, UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
+					 &resid, &h, 3, 306, 0, UT_GES_OPCODE_REQUEST, ExclusiveLock, &conflicts, &nc),
 				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
 
 	UT_ASSERT(!ut_wfg_release_holder_on_submit_once);
@@ -4409,7 +4455,7 @@ static void
 ut_wfg_departure_holders(ClusterResId *resid, int key)
 {
 	ClusterGrdHolderId h;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int nc = -1;
 
 	cluster_node_id = 0;
@@ -4418,11 +4464,11 @@ ut_wfg_departure_holders(ClusterResId *resid, int key)
 	bast_resid(key, resid);
 	h = bast_holder(1, 100, 1);
 	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
-													ShareLock, conflicts, &nc),
+													ShareLock, &conflicts, &nc),
 				 CLUSTER_GRD_GRANT_NOW);
 	h = bast_holder(2, 200, 2);
 	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST,
-													ShareLock, conflicts, &nc),
+													ShareLock, &conflicts, &nc),
 				 CLUSTER_GRD_GRANT_NOW);
 }
 
@@ -4430,11 +4476,11 @@ static void
 ut_wfg_departure_waiter(const ClusterResId *resid)
 {
 	ClusterGrdHolderId h = bast_holder(3, 300, 3);
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int nc = -1;
 
 	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(resid, &h, 3, 3, 0, UT_GES_OPCODE_REQUEST,
-													ExclusiveLock, conflicts, &nc),
+													ExclusiveLock, &conflicts, &nc),
 				 CLUSTER_GRD_ENQUEUED_WAITER);
 	UT_ASSERT_EQ(ut_wfg_count_waiter(3, 300, 0, 3), 2);
 }
@@ -4482,7 +4528,7 @@ UT_TEST(test_wfg_exit_cancels_local_waiter_not_foreign_alias)
 	ClusterResId resid;
 	ClusterGrdHolderId h;
 	ClusterGrdEntry *entry = NULL;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	LOCKMODE mode = NoLock;
 	int nc = -1;
 
@@ -4492,11 +4538,11 @@ UT_TEST(test_wfg_exit_cancels_local_waiter_not_foreign_alias)
 	bast_resid(5822, &resid);
 	h = bast_holder(2, 100, 2);
 	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST,
-													ExclusiveLock, conflicts, &nc),
+													ExclusiveLock, &conflicts, &nc),
 				 CLUSTER_GRD_GRANT_NOW);
 	h = bast_holder(1, 100, 10);
 	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 10, 0, UT_GES_OPCODE_REQUEST,
-													ExclusiveLock, conflicts, &nc),
+													ExclusiveLock, &conflicts, &nc),
 				 CLUSTER_GRD_ENQUEUED_WAITER);
 	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 100, 0, 10), 1);
 	cluster_grd_cleanup_on_backend_exit(100);
@@ -4559,7 +4605,7 @@ UT_TEST(test_wfg_cleanup_retracts_before_empty_reclaim)
 {
 	ClusterResId resid;
 	ClusterGrdHolderId h;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int nc = -1;
 
 	cluster_node_id = 0;
@@ -4568,11 +4614,11 @@ UT_TEST(test_wfg_cleanup_retracts_before_empty_reclaim)
 	bast_resid(5825, &resid);
 	h = bast_holder(1, 100, 1);
 	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
-													ExclusiveLock, conflicts, &nc),
+													ExclusiveLock, &conflicts, &nc),
 				 CLUSTER_GRD_GRANT_NOW);
 	h = bast_holder(1, 200, 2);
 	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 2, 0, UT_GES_OPCODE_REQUEST,
-													ExclusiveLock, conflicts, &nc),
+													ExclusiveLock, &conflicts, &nc),
 				 CLUSTER_GRD_ENQUEUED_WAITER);
 	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 200, 0, 2), 1);
 	cluster_grd_cleanup_on_node_dead(1);
@@ -4650,7 +4696,7 @@ UT_TEST(test_grd_pin_cleanup_on_lmd_submit_error)
 	ClusterResId resid;
 	ClusterGrdHolderId h;
 	ClusterGrdEntry *entry = NULL;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	volatile bool caught = false;
 	int nc = -1;
 
@@ -4663,12 +4709,12 @@ UT_TEST(test_grd_pin_cleanup_on_lmd_submit_error)
 
 	h = bast_holder(1, 100, 1);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
-														 ShareLock, conflicts, &nc),
+														 ShareLock, &conflicts, &nc),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 
 	h = bast_holder(2, 200, 2);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST,
-														 ExclusiveLock, conflicts, &nc),
+														 ExclusiveLock, &conflicts, &nc),
 				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
 
 	ut_wfg_throw_on_submit_once = true;
@@ -4676,7 +4722,7 @@ UT_TEST(test_grd_pin_cleanup_on_lmd_submit_error)
 	PG_TRY();
 	{
 		(void)cluster_grd_entry_enqueue_or_grant(&resid, &h, 3, 3, 0, UT_GES_OPCODE_REQUEST,
-												 ShareLock, conflicts, &nc);
+												 ShareLock, &conflicts, &nc);
 	}
 	PG_CATCH();
 	{
@@ -4717,7 +4763,7 @@ UT_TEST(test_5_8_d1c_u3a_request_waiter_carries_xid)
 	int saved = cluster_node_id;
 	ClusterResId resid;
 	ClusterGrdHolderId h;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int nc = -1;
 
 	cluster_node_id = 0;
@@ -4728,12 +4774,12 @@ UT_TEST(test_5_8_d1c_u3a_request_waiter_carries_xid)
 	h = bast_holder(1, 100, 1);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
 					 &resid, &h, 1, 1, (ClusterGrdWaiterMeta){ (TransactionId)0, 0 }, 0,
-					 UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
+					 UT_GES_OPCODE_REQUEST, ExclusiveLock, &conflicts, &nc),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 	h = bast_holder(2, 200, 2);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
 					 &resid, &h, 2, 2, (ClusterGrdWaiterMeta){ (TransactionId)12345, 0 }, 0,
-					 UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
+					 UT_GES_OPCODE_REQUEST, ExclusiveLock, &conflicts, &nc),
 				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
 
 	UT_ASSERT_EQ(ut_wfg_count_waiter(2, 200, 0, 2), 1);
@@ -4750,7 +4796,7 @@ UT_TEST(test_5_8_d1c_u3b_convert_waiter_carries_xid)
 	int saved = cluster_node_id;
 	ClusterResId resid;
 	ClusterGrdHolderId h;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int nc = -1;
 
 	cluster_node_id = 0;
@@ -4761,18 +4807,18 @@ UT_TEST(test_5_8_d1c_u3b_convert_waiter_carries_xid)
 	h = bast_holder(1, 100, 1);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
 					 &resid, &h, 1, 1, (ClusterGrdWaiterMeta){ (TransactionId)0, 0 }, 0,
-					 UT_GES_OPCODE_REQUEST, ShareLock, conflicts, &nc),
+					 UT_GES_OPCODE_REQUEST, ShareLock, &conflicts, &nc),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 	h = bast_holder(2, 200, 2);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
 					 &resid, &h, 2, 2, (ClusterGrdWaiterMeta){ (TransactionId)0, 0 }, 0,
-					 UT_GES_OPCODE_REQUEST, ShareLock, conflicts, &nc),
+					 UT_GES_OPCODE_REQUEST, ShareLock, &conflicts, &nc),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 
 	nc = -1;
 	UT_ASSERT_EQ((int)cluster_grd_convert_or_enqueue_meta(
 					 &resid, 1, 100, 0, ShareLock, ExclusiveLock, 10, 1, 0,
-					 (ClusterGrdWaiterMeta){ (TransactionId)67890, 0 }, conflicts, &nc),
+					 (ClusterGrdWaiterMeta){ (TransactionId)67890, 0 }, &conflicts, &nc),
 				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
 
 	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 100, 0, 10), 1);
@@ -4789,7 +4835,7 @@ UT_TEST(test_5_8_d1e_u4a_request_waiter_carries_wait_seq)
 	int saved = cluster_node_id;
 	ClusterResId resid;
 	ClusterGrdHolderId h;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int nc = -1;
 	ClusterGrdGrantIdentity cancelled;
 
@@ -4801,12 +4847,12 @@ UT_TEST(test_5_8_d1e_u4a_request_waiter_carries_wait_seq)
 	h = bast_holder(1, 100, 1);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
 					 &resid, &h, 1, 1, (ClusterGrdWaiterMeta){ (TransactionId)0, 0 }, 0,
-					 UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
+					 UT_GES_OPCODE_REQUEST, ExclusiveLock, &conflicts, &nc),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 	h = bast_holder(2, 200, 2);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
 					 &resid, &h, 2, 2, (ClusterGrdWaiterMeta){ (TransactionId)0, 777 }, 71,
-					 UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
+					 UT_GES_OPCODE_REQUEST, ExclusiveLock, &conflicts, &nc),
 				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
 
 	UT_ASSERT_EQ(ut_wfg_count_waiter(2, 200, 0, 2), 1);
@@ -4838,7 +4884,7 @@ UT_TEST(test_5_8_d1e_u4b_convert_waiter_carries_wait_seq)
 	int saved = cluster_node_id;
 	ClusterResId resid;
 	ClusterGrdHolderId h;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int nc = -1;
 	ClusterGrdGrantIdentity cancelled;
 	LOCKMODE held_mode;
@@ -4851,18 +4897,18 @@ UT_TEST(test_5_8_d1e_u4b_convert_waiter_carries_wait_seq)
 	h = bast_holder(1, 100, 1);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
 					 &resid, &h, 1, 1, (ClusterGrdWaiterMeta){ (TransactionId)0, 0 }, 0,
-					 UT_GES_OPCODE_REQUEST, ShareLock, conflicts, &nc),
+					 UT_GES_OPCODE_REQUEST, ShareLock, &conflicts, &nc),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 	h = bast_holder(2, 200, 2);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
 					 &resid, &h, 2, 2, (ClusterGrdWaiterMeta){ (TransactionId)0, 0 }, 0,
-					 UT_GES_OPCODE_REQUEST, ShareLock, conflicts, &nc),
+					 UT_GES_OPCODE_REQUEST, ShareLock, &conflicts, &nc),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 
 	nc = -1;
 	UT_ASSERT_EQ((int)cluster_grd_convert_or_enqueue_meta(
 					 &resid, 1, 100, 0, ShareLock, ExclusiveLock, 10, 1, 73,
-					 (ClusterGrdWaiterMeta){ (TransactionId)0, 888 }, conflicts, &nc),
+					 (ClusterGrdWaiterMeta){ (TransactionId)0, 888 }, &conflicts, &nc),
 				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
 
 	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 100, 0, 10), 1);
@@ -6084,6 +6130,116 @@ pi_ready_finish(void)
 	finish_recovery_control_fixture();
 }
 
+UT_TEST(test_pi_gate_preserves_exact_pending_without_second_sample)
+{
+	ClusterGrdPiRebuildCutV1 cut;
+	BufferTag tag = { 0 };
+	bool pending;
+
+	for (int cached = 0; cached < 2; cached++) {
+		pi_ready_fixture(&cut);
+		if (!cached)
+			ut_membership_generation += 2;
+		for (int stop = CLUSTER_STORAGE_SNAPSHOT_DEADLINE;
+			 stop <= CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT; stop++) {
+			memset(&ut_storage_admission, 0, sizeof(ut_storage_admission));
+			ut_storage_admission.result = CLUSTER_QVOTEC_ADMISSION_STORAGE;
+			ut_storage_admission.storage.result = CLUSTER_STORAGE_CHECK_UNSTABLE;
+			ut_storage_admission.storage.snapshot_stop = stop;
+			ut_storage_admission_override = true;
+			ut_qvotec_quorum = false;
+			ut_storage_admission_reads = 0;
+			UT_ASSERT(cluster_grd_pi_rebuild_blocked_sample_v1(tag, &pending));
+			UT_ASSERT(pending);
+			UT_ASSERT_EQ(ut_storage_admission_reads, 1);
+			/* A bool caller still refuses. Only a new full observation can
+			 * make progress; the pending sample exports no authority. */
+			UT_ASSERT(cluster_grd_pi_rebuild_blocked_v1(tag));
+			ut_storage_admission_override = false;
+			ut_qvotec_quorum = true;
+			UT_ASSERT(!cluster_grd_pi_rebuild_blocked_sample_v1(tag, &pending));
+			UT_ASSERT(!pending);
+		}
+		pi_ready_finish();
+	}
+}
+
+UT_TEST(test_pi_gate_never_retries_known_loss_or_bad_clock_as_storage_wait)
+{
+	ClusterGrdPiRebuildCutV1 cut;
+	BufferTag tag = { 0 };
+	bool pending;
+
+	for (int variant = 0; variant < 6; variant++) {
+		pi_ready_fixture(&cut);
+		memset(&ut_storage_admission, 0, sizeof(ut_storage_admission));
+		ut_storage_admission.result = CLUSTER_QVOTEC_ADMISSION_STORAGE;
+		ut_storage_admission.storage.result = CLUSTER_STORAGE_CHECK_UNSTABLE;
+		ut_storage_admission.storage.snapshot_stop = CLUSTER_STORAGE_SNAPSHOT_DEADLINE;
+		if (variant == 0)
+			ut_storage_admission.storage.snapshot_stop = CLUSTER_STORAGE_SNAPSHOT_CLOCK_UNAVAILABLE;
+		else if (variant == 1)
+			ut_storage_admission.storage.snapshot_stop = CLUSTER_STORAGE_SNAPSHOT_CLOCK_REGRESSED;
+		else if (variant == 2)
+			ut_storage_admission.result = CLUSTER_QVOTEC_ADMISSION_LEASE;
+		else if (variant == 3)
+			ut_storage_admission.result = CLUSTER_QVOTEC_ADMISSION_DB_STATE;
+		else if (variant == 4)
+			ut_storage_admission.result = CLUSTER_QVOTEC_ADMISSION_FROZEN;
+		else
+			ut_storage_admission.storage.result = CLUSTER_STORAGE_CHECK_EXPIRED;
+		ut_storage_admission_override = true;
+		ut_qvotec_quorum = false;
+		pending = true;
+		UT_ASSERT(cluster_grd_pi_rebuild_blocked_sample_v1(tag, &pending));
+		UT_ASSERT(!pending);
+		ut_storage_admission_override = false;
+		ut_qvotec_quorum = true;
+		pi_ready_finish();
+	}
+}
+
+UT_TEST(test_pi_gate_carries_the_first_failed_sample_through_nested_checks)
+{
+	ClusterGrdPiRebuildCutV1 cut;
+	BufferTag tag = { 0 };
+	bool pending;
+	unsigned reads;
+
+	pi_ready_fixture(&cut);
+	ut_membership_generation += 2;
+	ut_storage_count_legacy = true;
+	ut_storage_admission_reads = 0;
+	UT_ASSERT(!cluster_grd_pi_rebuild_blocked_sample_v1(tag, &pending));
+	reads = ut_storage_admission_reads;
+	UT_ASSERT(reads > 1);
+	ut_storage_count_legacy = false;
+	pi_ready_finish();
+	for (unsigned at = 1; at <= reads; at++) {
+		for (int lost = 0; lost < 2; lost++) {
+			pi_ready_fixture(&cut);
+			ut_membership_generation += 2;
+			memset(&ut_storage_admission, 0, sizeof(ut_storage_admission));
+			ut_storage_admission.result = CLUSTER_QVOTEC_ADMISSION_STORAGE;
+			ut_storage_admission.storage.result = CLUSTER_STORAGE_CHECK_UNSTABLE;
+			ut_storage_admission.storage.snapshot_stop
+				= lost ? CLUSTER_STORAGE_SNAPSHOT_CLOCK_REGRESSED
+					   : CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT;
+			ut_storage_admission_override = true;
+			ut_storage_admission_after = at;
+			ut_storage_count_legacy = true;
+			ut_storage_admission_reads = 0;
+			UT_ASSERT(cluster_grd_pi_rebuild_blocked_sample_v1(tag, &pending));
+			UT_ASSERT(pending == !lost);
+			UT_ASSERT_EQ(ut_storage_admission_reads, at);
+			ut_storage_admission_override = false;
+			ut_storage_admission_after = 0;
+			ut_storage_count_legacy = false;
+			pi_ready_finish();
+		}
+	}
+}
+
 UT_TEST(test_completed_join_pi_gate_has_constant_cost)
 {
 	ClusterGrdPiRebuildCutV1 cut;
@@ -6683,6 +6839,76 @@ UT_TEST(test_recovery_authority_done_echo_is_bounded_per_requester)
 	cluster_enabled = false;
 }
 
+static void
+setup_serving_seal_sample_fixture(ClusterQvotecAdmissionCheck *check)
+{
+	ClusterFormationSnapshotV1 formation;
+
+	setup_recovery_authority_singleton_fixture(&formation);
+	ut_drive_authority_lmon_tick = true;
+	cluster_enabled = true;
+	UT_ASSERT(cluster_grd_recovery_authority_barrier_wait(&formation, 11, 7, 10));
+	ut_drive_authority_lmon_tick = false;
+	cluster_enabled = false;
+	memset(check, 0, sizeof(*check));
+	check->result = CLUSTER_QVOTEC_ADMISSION_ALLOWED;
+	check->continuity_valid = true;
+	check->continuity.quorum_generation = 1;
+	check->continuity.storage_generation = 1;
+	ut_storage_admission_reads = 0;
+	ut_storage_count_legacy = true;
+	cluster_shared_config = true;
+}
+
+UT_TEST(test_serving_seal_uses_one_admission_sample)
+{
+	ClusterQvotecAdmissionCheck check;
+	bool pending = true;
+
+	setup_serving_seal_sample_fixture(&check);
+	ut_qvotec_quorum = false; /* The next observation differs; do not take it. */
+	UT_ASSERT(cluster_grd_recovery_authority_for_admission(11, 7, &check, &pending));
+	UT_ASSERT(!pending);
+	UT_ASSERT_EQ(ut_storage_admission_reads, 0);
+	ut_storage_count_legacy = false;
+	ut_qvotec_quorum = true;
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_serving_seal_pending_never_grants_or_hides_drift)
+{
+	ClusterQvotecAdmissionCheck check;
+	bool pending = false;
+
+	setup_serving_seal_sample_fixture(&check);
+	check.result = CLUSTER_QVOTEC_ADMISSION_STORAGE;
+	check.storage.result = CLUSTER_STORAGE_CHECK_UNSTABLE;
+	check.storage.snapshot_stop = CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT;
+	UT_ASSERT(!cluster_grd_recovery_authority_for_admission(11, 7, &check, &pending));
+	UT_ASSERT(pending);
+	UT_ASSERT_EQ(ut_storage_admission_reads, 0);
+	ut_mock_epoch++;
+	UT_ASSERT(!cluster_grd_recovery_authority_for_admission(11, 7, &check, &pending));
+	UT_ASSERT(!pending);
+	UT_ASSERT_EQ(ut_storage_admission_reads, 0);
+	ut_storage_count_legacy = false;
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_serving_seal_cannot_replace_a_refusal_with_ready)
+{
+	ClusterQvotecAdmissionCheck check;
+	bool pending = true;
+
+	setup_serving_seal_sample_fixture(&check);
+	check.result = CLUSTER_QVOTEC_ADMISSION_DB_STATE;
+	UT_ASSERT(!cluster_grd_recovery_authority_for_admission(11, 7, &check, &pending));
+	UT_ASSERT(!pending);
+	UT_ASSERT_EQ(ut_storage_admission_reads, 0);
+	ut_storage_count_legacy = false;
+	cluster_shared_config = false;
+}
+
 UT_TEST(test_recovery_authority_postmaster_cannot_execute_blocking_barrier)
 {
 	ClusterFormationSnapshotV1 formation;
@@ -7210,7 +7436,7 @@ UT_TEST(test_retire_convert_does_not_recreate_an_unproven_previous_holder)
 				 0);
 }
 
-UT_TEST(test_retire_convert_at_holder_capacity_keeps_compatible_waiter_queued)
+UT_TEST(test_retire_convert_uses_reserved_holder_capacity)
 {
 	ClusterResId resid;
 	ClusterGrdEntry *entry = NULL;
@@ -7240,15 +7466,15 @@ UT_TEST(test_retire_convert_at_holder_capacity_keeps_compatible_waiter_queued)
 	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &waiter, 2, 253, 1,
 													GES_REQ_OPCODE_REQUEST, ShareLock, NULL, NULL),
 				 CLUSTER_GRD_ENQUEUED_WAITER);
-	/* Restoring S does not free a holder slot. Do not emit an unregistered
-	 * GRANT or remove the waiter until an actual slot becomes available. */
+	/* Enqueue already reserved destination space. Restoring S must promote
+	 * the compatible waiter even if subsequent pool allocation is refused. */
+	ut_grd_pool_limit = 1;
 	UT_ASSERT_EQ(cluster_grd_retire_request_and_drain(&resid, &upgrading, 251, ShareLock, grants,
 													  lengthof(grants)),
-				 0);
-	UT_ASSERT(!cluster_grd_holder_mode_by_id(&resid, &waiter, NULL));
-	UT_ASSERT_EQ(cluster_grd_release_and_drain(&resid, &peers[0], grants, lengthof(grants)), 1);
+				 1);
 	UT_ASSERT_EQ(grants[0].holder.request_id, 253);
 	UT_ASSERT(cluster_grd_holder_mode_by_id(&resid, &waiter, NULL));
+	UT_ASSERT_EQ(cluster_grd_release_and_drain(&resid, &peers[0], grants, lengthof(grants)), 0);
 	UT_ASSERT_EQ(cluster_grd_release_and_drain(&resid, &waiter, grants, lengthof(grants)), 0);
 	for (i = 1; i < lengthof(peers); i++)
 		UT_ASSERT_EQ(cluster_grd_release_and_drain(&resid, &peers[i], grants, lengthof(grants)), 0);
@@ -7313,11 +7539,11 @@ UT_TEST(test_startup_cf_handoff_rejects_noncanonical_queue)
 					 CLUSTER_GRD_ENQUEUED_WAITER);
 		UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&cf, false, &entry), CLUSTER_GRD_ENTRY_OK);
 		if (bad == 0)
-			entry->waiters[0].mode = AccessExclusiveLock;
+			entry->waiters_inline[0].mode = AccessExclusiveLock;
 		if (bad == 1)
-			entry->waiters[0].request_opcode = GES_REQ_OPCODE_CONVERT;
+			entry->waiters_inline[0].request_opcode = GES_REQ_OPCODE_CONVERT;
 		if (bad == 2)
-			entry->waiters[0].cluster_epoch = 2;
+			entry->waiters_inline[0].cluster_epoch = 2;
 		if (bad == 3)
 			entry->nconverts = 1;
 		cluster_grd_entry_release(entry);
@@ -7595,6 +7821,150 @@ UT_TEST(test_parallel_group_unprotected_request_respects_fairness)
 	convert_teardown();
 }
 
+UT_TEST(test_grd_growth_error_releases_only_lookup_pin)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId holders[17];
+	ClusterGrdEntry *entry = NULL;
+	volatile bool caught = false;
+
+	convert_reset();
+	bast_resid(5999, &resid);
+	for (int i = 0; i < 17; i++)
+		holders[i] = bast_holder(1, 400 + i, 1 + i);
+	for (int i = 0; i < 16; i++)
+		UT_ASSERT_EQ(
+			cluster_grd_entry_enqueue_or_grant(&resid, &holders[i], 1, holders[i].request_id, 0,
+											   UT_GES_OPCODE_REQUEST, RowExclusiveLock, NULL, NULL),
+			CLUSTER_GRD_GRANT_NOW);
+	ut_grd_pool_throw = true;
+	PG_TRY();
+	{
+		(void)cluster_grd_entry_enqueue_or_grant(&resid, &holders[16], 1, holders[16].request_id, 0,
+												 UT_GES_OPCODE_REQUEST, RowExclusiveLock, NULL,
+												 NULL);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	ut_grd_pool_throw = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&resid, false, &entry), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pin), 1);
+	UT_ASSERT_EQ(cluster_grd_entry_ngranted(entry), 16);
+	cluster_grd_entry_release(entry);
+	for (int i = 0; i < 16; i++)
+		UT_ASSERT_EQ(cluster_grd_release_holder_by_id(&resid, &holders[i]), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(ut_grd_pool_used, 0);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+	convert_teardown();
+}
+
+static bool
+fail_grd_projection_allocation(Size size pg_attribute_unused(), int flags pg_attribute_unused())
+{
+	return true;
+}
+
+UT_TEST(test_grd_release_projection_oom_preserves_grant)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId holder = bast_holder(1, 700, 501);
+	ClusterGrdHolderId waiter = bast_holder(2, 701, 502);
+	ClusterGrdGrantIdentity grant;
+	volatile int count = -1;
+	volatile bool caught = false;
+
+	convert_reset();
+	ut_wfg_reset();
+	ut_mock_epoch = 0;
+	bast_resid(5998, &resid);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(
+					 &resid, &holder, 1, 501, 0, UT_GES_OPCODE_REQUEST, ExclusiveLock, NULL, NULL),
+				 CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &waiter, 2, 502, 0,
+													UT_GES_OPCODE_REQUEST, ShareLock, NULL, NULL),
+				 CLUSTER_GRD_ENQUEUED_WAITER);
+	UT_ASSERT_EQ(ut_wfg_n, 1);
+	ut_grd_alloc_fail = fail_grd_projection_allocation;
+	PG_TRY();
+	{
+		count = cluster_grd_release_and_drain(&resid, &holder, &grant, 1);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	ut_grd_alloc_fail = NULL;
+	UT_ASSERT(!caught);
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT_EQ(grant.holder.request_id, waiter.request_id);
+	UT_ASSERT_EQ(ut_wfg_n, 0);
+	UT_ASSERT_EQ(cluster_grd_release_holder_by_id(&resid, &waiter), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+	convert_teardown();
+}
+
+UT_TEST(test_grd_projection_oom_retracts_all_old_wait_edges)
+{
+	/* Exercise failure of each separately grown snapshot. Missing best-effort
+	 * edges cannot form a false cycle; a stale edge to the departed holder can. */
+	for (int shape = 0; shape < 2; shape++) {
+		ClusterResId resid;
+		ClusterGrdHolderId holders[18];
+		ClusterGrdHolderId waiters[32];
+		ClusterGrdGrantIdentity grant;
+		int nholders = shape == 0 ? 18 : 2;
+		int nwaiters = shape == 0 ? 1 : 32;
+		volatile bool caught = false;
+
+		convert_reset();
+		ut_wfg_reset();
+		ut_mock_epoch = 0;
+		bast_resid(5997 - shape, &resid);
+		for (int i = 0; i < nholders; i++) {
+			holders[i] = bast_holder(1, 700 + i, 501 + i);
+			UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(
+							 &resid, &holders[i], 1, holders[i].request_id, 0,
+							 UT_GES_OPCODE_REQUEST, RowExclusiveLock, NULL, NULL),
+						 CLUSTER_GRD_GRANT_NOW);
+		}
+		for (int i = 0; i < nwaiters; i++) {
+			waiters[i] = bast_holder(2, 800 + i, 601 + i);
+			UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(
+							 &resid, &waiters[i], 2, waiters[i].request_id, 0,
+							 UT_GES_OPCODE_REQUEST, AccessExclusiveLock, NULL, NULL),
+						 CLUSTER_GRD_ENQUEUED_WAITER);
+		}
+		UT_ASSERT_EQ(ut_wfg_n, nholders * nwaiters);
+		ut_grd_alloc_fail = fail_grd_projection_allocation;
+		PG_TRY();
+		{
+			UT_ASSERT_EQ(cluster_grd_release_and_drain(&resid, &holders[0], &grant, 1), 0);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		ut_grd_alloc_fail = NULL;
+		UT_ASSERT(!caught);
+		UT_ASSERT_EQ(ut_wfg_n, 0);
+		for (int i = 0; i < nwaiters; i++)
+			UT_ASSERT_EQ(cluster_grd_cancel_waiter_by_id(&resid, &waiters[i]),
+						 CLUSTER_GRD_ENTRY_OK);
+		for (int i = 1; i < nholders; i++)
+			UT_ASSERT_EQ(cluster_grd_release_holder_by_id(&resid, &holders[i]),
+						 CLUSTER_GRD_ENTRY_OK);
+		UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+		UT_ASSERT_EQ(ut_grd_pool_used, 0);
+		convert_teardown();
+	}
+}
+
 int
 /* cppcheck-suppress constParameter
  * Reason: main() keeps the standard test harness signature used by the
@@ -7610,7 +7980,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(162);
+	UT_PLAN(171);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
 	UT_RUN(test_parallel_group_worker_cannot_wait_behind_blocked_ddl);
 	UT_RUN(test_parallel_group_convert_uses_original_holder_group);
@@ -7759,6 +8129,9 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_redeclare_fresh_join_recipient_accepts_only_its_fence);
 	UT_RUN(test_canonical_space_dead_node_returns_grd_to_normal_after_data_recovery);
 	UT_RUN(test_join_protocol_completes_before_local_pi_service_and_new_cut_invalidates);
+	UT_RUN(test_pi_gate_preserves_exact_pending_without_second_sample);
+	UT_RUN(test_pi_gate_never_retries_known_loss_or_bad_clock_as_storage_wait);
+	UT_RUN(test_pi_gate_carries_the_first_failed_sample_through_nested_checks);
 	UT_RUN(test_completed_join_pi_gate_has_constant_cost);
 	UT_RUN(test_completed_join_pi_cache_does_not_acquire_pi_lock);
 	UT_RUN(test_completed_join_pi_cache_invalidates_on_scope_and_original_owners);
@@ -7796,12 +8169,18 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_retire_convert_preserves_original_share_before_and_after_grant);
 	UT_RUN(test_retire_request_never_thaws_frozen_shard_or_proves_missing_directory);
 	UT_RUN(test_retire_convert_does_not_recreate_an_unproven_previous_holder);
-	UT_RUN(test_retire_convert_at_holder_capacity_keeps_compatible_waiter_queued);
+	UT_RUN(test_retire_convert_uses_reserved_holder_capacity);
+	UT_RUN(test_grd_growth_error_releases_only_lookup_pin);
+	UT_RUN(test_grd_release_projection_oom_preserves_grant);
+	UT_RUN(test_grd_projection_oom_retracts_all_old_wait_edges);
 	UT_RUN(test_retire_request_local_shadow_never_grants);
 	UT_RUN(test_startup_cf_handoff_real_queue);
 	UT_RUN(test_startup_cf_handoff_rejects_noncanonical_queue);
 	UT_RUN(test_join_routing_excludes_unadmitted_alive_peers);
 	UT_RUN(test_join_census_covers_dead_home_rerouted_between_survivors);
+	UT_RUN(test_serving_seal_uses_one_admission_sample);
+	UT_RUN(test_serving_seal_pending_never_grants_or_hides_drift);
+	UT_RUN(test_serving_seal_cannot_replace_a_refusal_with_ready);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

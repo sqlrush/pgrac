@@ -300,6 +300,7 @@ extern TimestampTz cluster_cssd_get_ready_at(void);
 extern TimestampTz cluster_cssd_get_last_liveness_tick_at(void);
 extern uint64 cluster_cssd_get_main_loop_iters(void);
 extern ClusterCssdStatus cluster_cssd_get_status(void);
+extern ClusterCssdStatus cluster_cssd_get_status_nowait(bool *busy);
 extern uint64 cluster_cssd_get_total_heartbeat_send_count(void);
 extern uint64 cluster_cssd_get_total_heartbeat_recv_count(void);
 extern int cluster_cssd_get_alive_peer_count(void);

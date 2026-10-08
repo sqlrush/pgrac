@@ -401,7 +401,7 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type pg_attribute_unused(),
 	return true;
 }
 
-bool
+ClusterICDispatchResult
 cluster_ic_dispatch_envelope(const ClusterICEnvelope *env pg_attribute_unused(),
 							 const void *payload pg_attribute_unused(),
 							 int32 peer_id pg_attribute_unused())

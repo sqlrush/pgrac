@@ -8,6 +8,10 @@
  *
  * src/include/utils/snapmgr.h
  *
+ * PGRAC MODIFICATIONS
+ *   Modified by: SqlRush <sqlrush@gmail.com>
+ *   Expose retained snapshot identities for read-only buffer lookup.
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef SNAPMGR_H
@@ -78,6 +82,8 @@ typedef struct ClusterSnapshotReadScopeV1
 
 extern void cluster_snapshot_read_enter_v1(ClusterSnapshotReadScopeV1 *scope,
 										   Snapshot snapshot);
+/* Local cache key, not admission; refusal preserves the output. */
+extern bool cluster_snapshot_cr_identity_v1(Snapshot actual, uint64 *identity);
 extern void cluster_snapshot_read_exit_v1(ClusterSnapshotReadScopeV1 *scope);
 extern bool cluster_snapshot_read_evidence_v1(SCN resolver_read_scn,
 											Snapshot *snapshot, SCN *retained_floor,

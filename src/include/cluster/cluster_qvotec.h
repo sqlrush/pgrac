@@ -150,7 +150,7 @@
 #define CLUSTER_QVOTEC_SHMEM_STORAGE_OFFSET (448 + 8 + 16 + 512 * CLUSTER_MAX_VOTING_DISKS)
 #define CLUSTER_QVOTEC_SHMEM_BYTES                                                                 \
 	(CLUSTER_QVOTEC_SHMEM_STORAGE_OFFSET + CLUSTER_STORAGE_QUORUM_STATE_BYTES                      \
-	 + 4 * sizeof(pg_atomic_uint64))
+	 + 9 * sizeof(pg_atomic_uint64))
 #define CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES 128
 #define CLUSTER_QVOTEC_BALLOT_BYTES 32
 #define CLUSTER_QVOTEC_CONFIGURED_DISK_MASK UINT8_C(0x7f)
@@ -517,6 +517,42 @@ extern const char *cluster_qvotec_get_collision_state_name(void);
  *	survives Q4 lease expiry can pass the commit gate.
  * ---------- */
 extern bool cluster_qvotec_in_quorum(void);
+
+/* Same decision and sampled inputs as in_quorum(), never a second check.
+ * Shared callers also latch stable lease refusals for the QVOTEC owner. */
+typedef enum ClusterQvotecAdmissionResult {
+	CLUSTER_QVOTEC_ADMISSION_UNKNOWN = 0,
+	CLUSTER_QVOTEC_ADMISSION_ALLOWED,
+	CLUSTER_QVOTEC_ADMISSION_NO_SHMEM,
+	CLUSTER_QVOTEC_ADMISSION_FROZEN,
+	CLUSTER_QVOTEC_ADMISSION_DB_STATE,
+	CLUSTER_QVOTEC_ADMISSION_STORAGE,
+	CLUSTER_QVOTEC_ADMISSION_LEASE
+} ClusterQvotecAdmissionResult;
+
+typedef struct ClusterQvotecAdmissionContinuity {
+	/* Same postmaster only; callers still prove the exact boot/formation binding. */
+	uint64 quorum_generation;
+	uint64 storage_generation;
+} ClusterQvotecAdmissionContinuity;
+
+typedef struct ClusterQvotecAdmissionCheck {
+	ClusterQvotecAdmissionResult result;
+	uint32 quorum_state;
+	uint64 lease_expire_us;
+	uint64 now_us;
+	ClusterStorageQuorumCheck storage;
+	ClusterQvotecAdmissionContinuity continuity;
+	/* Only ALLOWED plus stable nonzero/non-MAX generations and a current
+	 * monotonic lease, with no unconsumed lease loss, can establish a baseline.
+	 * False never permits admission. */
+	bool continuity_valid;
+	/* Only an overlapping owner publication is retryable; stable invalid
+	 * continuity must not be mistaken for publication overlap. */
+	bool continuity_pending;
+} ClusterQvotecAdmissionCheck;
+
+extern bool cluster_qvotec_check_admission(ClusterQvotecAdmissionCheck *out);
 /* Shape A (crash-rejoin re-declare barrier): prior-incarnation self-slot
  * carried ALIVE at startup => this boot follows an UNCLEAN death. */
 extern bool cluster_qvotec_prior_unclean_death(void);

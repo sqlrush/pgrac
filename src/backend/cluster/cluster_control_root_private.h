@@ -516,7 +516,9 @@ cluster_control_root_v3_read_thread_locked(const ClusterControlRootIdentity *sel
 										   ControlRootImage *root, ControlFileData *out,
 										   ClusterControlRootFileToken *token);
 
-/* Runtime local owner only. Borrow the caller's CF-S/X; not early startup. */
+/* Runtime local owner only. Borrow the caller's CF-S/X; not early startup.
+ * An incomplete serving observation returns ADMISSION_PENDING with empty
+ * output, not STALE_TOKEN. Release the caller's CF before any retry wait. */
 extern ClusterControlRootResult
 cluster_control_root_v2_read_runtime_local_locked(ControlFileData *out);
 extern ClusterControlRootResult

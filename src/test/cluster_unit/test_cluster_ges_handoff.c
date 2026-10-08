@@ -93,7 +93,7 @@ UT_TEST(test_handoff_legal_single_x_grant)
 {
 	ClusterGesHandoffSnapshot s;
 
-	memset(&s, 0, sizeof(s));
+	cluster_ges_handoff_snapshot_init(&s);
 	/* released X holder (node0), granted next X waiter (node1); no survivors. */
 	s.released_node_id = 0;
 	s.released_procno = 100;
@@ -108,7 +108,7 @@ UT_TEST(test_handoff_legal_two_s_one_at_a_time)
 {
 	ClusterGesHandoffSnapshot s;
 
-	memset(&s, 0, sizeof(s));
+	cluster_ges_handoff_snapshot_init(&s);
 	/* X released; one S waiter popped, a second S waiter legitimately remains
 	 * (one-at-a-time FIFO -- next release serves it). */
 	s.released_node_id = 0;
@@ -126,7 +126,7 @@ UT_TEST(test_handoff_legal_blocked_waiter_remains)
 {
 	ClusterGesHandoffSnapshot s;
 
-	memset(&s, 0, sizeof(s));
+	cluster_ges_handoff_snapshot_init(&s);
 	/* X granted to node1; an X waiter remains but is BLOCKED by the surviving
 	 * X holder -> not a lost waiter. */
 	s.released_node_id = 0;
@@ -144,7 +144,7 @@ UT_TEST(test_handoff_legal_barriered_waiter_remains)
 {
 	ClusterGesHandoffSnapshot s;
 
-	memset(&s, 0, sizeof(s));
+	cluster_ges_handoff_snapshot_init(&s);
 	/* No holders, drain granted nothing, but the only servable waiter is
 	 * barriered behind an earlier boosted waiter -> legitimate. */
 	s.released_node_id = 0;
@@ -161,7 +161,7 @@ UT_TEST(test_handoff_catches_stale_holder)
 {
 	ClusterGesHandoffSnapshot s;
 
-	memset(&s, 0, sizeof(s));
+	cluster_ges_handoff_snapshot_init(&s);
 	/* the released identity is still recorded as a holder */
 	s.released_node_id = 0;
 	s.released_procno = 100;
@@ -174,7 +174,7 @@ UT_TEST(test_handoff_catches_double_grant_pair)
 {
 	ClusterGesHandoffSnapshot s;
 
-	memset(&s, 0, sizeof(s));
+	cluster_ges_handoff_snapshot_init(&s);
 	/* two incompatible grants in one drain (X + X) */
 	s.released_node_id = 0;
 	s.released_procno = 100;
@@ -191,7 +191,7 @@ UT_TEST(test_handoff_catches_grant_vs_holder_conflict)
 {
 	ClusterGesHandoffSnapshot s;
 
-	memset(&s, 0, sizeof(s));
+	cluster_ges_handoff_snapshot_init(&s);
 	/* granted X to node2 while node1 still holds S -> conflict */
 	s.released_node_id = 0;
 	s.released_procno = 100;
@@ -207,7 +207,7 @@ UT_TEST(test_handoff_catches_lost_waiter)
 {
 	ClusterGesHandoffSnapshot s;
 
-	memset(&s, 0, sizeof(s));
+	cluster_ges_handoff_snapshot_init(&s);
 	/* no holders, drain granted NOTHING, yet a servable unbarriered S waiter
 	 * remains -> lost waiter (the drain should have popped it). */
 	s.released_node_id = 0;
@@ -236,7 +236,7 @@ UT_TEST(test_handoff_interleaving_sweep_legal)
 		int extra_waiters = (trial / 4) % 3;
 		int i;
 
-		memset(&s, 0, sizeof(s));
+		cluster_ges_handoff_snapshot_init(&s);
 		s.released_node_id = 0;
 		s.released_procno = 100;
 
@@ -260,12 +260,36 @@ UT_TEST(test_handoff_interleaving_sweep_legal)
 }
 
 
+/* A conflict beyond the former inline boundary must participate in proof. */
+UT_TEST(test_handoff_complete_dynamic_snapshot)
+{
+	ClusterGesHandoffSnapshot s;
+	ClusterGesHandoffParty holders[64];
+
+	cluster_ges_handoff_snapshot_init(&s);
+	s.holders = holders;
+	s.holder_capacity = lengthof(holders);
+	s.nholders = lengthof(holders);
+	s.released_node_id = 127;
+	s.released_procno = 900;
+	for (int i = 0; i < lengthof(holders); i++)
+		holders[i] = party(i % 4, 100 + i, M_S, 0, false);
+	s.granted[0] = party(5, 200, M_S, 0, false);
+	s.ngranted = 1;
+	UT_ASSERT_EQ(cluster_ges_handoff_verify(&s), CLUSTER_GES_HANDOFF_OK);
+	holders[63].mode = M_X;
+	UT_ASSERT_EQ(cluster_ges_handoff_verify(&s), CLUSTER_GES_HANDOFF_DOUBLE_GRANT);
+	holders[63] = party(127, 900, M_S, 0, false);
+	UT_ASSERT_EQ(cluster_ges_handoff_verify(&s), CLUSTER_GES_HANDOFF_STALE_HOLDER);
+}
+
+
 UT_DEFINE_GLOBALS();
 
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 
 	UT_RUN(test_handoff_mode_matrix_assumptions);
 	UT_RUN(test_handoff_legal_single_x_grant);
@@ -277,6 +301,7 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 	UT_RUN(test_handoff_catches_grant_vs_holder_conflict);
 	UT_RUN(test_handoff_catches_lost_waiter);
 	UT_RUN(test_handoff_interleaving_sweep_legal);
+	UT_RUN(test_handoff_complete_dynamic_snapshot);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

@@ -317,6 +317,25 @@ cluster_cssd_get_status(void)
 	return v;
 }
 
+ClusterCssdStatus
+cluster_cssd_get_status_nowait(bool *busy)
+{
+	ClusterCssdStatus status;
+
+	if (busy == NULL)
+		return CLUSTER_CSSD_STARTING;
+	*busy = false;
+	if (CssdShmem == NULL)
+		return CLUSTER_CSSD_STARTING;
+	if (!LWLockConditionalAcquire(&CssdShmem->lwlock, LW_SHARED)) {
+		*busy = true;
+		return CLUSTER_CSSD_STARTING;
+	}
+	status = CssdShmem->status;
+	LWLockRelease(&CssdShmem->lwlock);
+	return status;
+}
+
 uint64
 cluster_cssd_get_total_heartbeat_send_count(void)
 {

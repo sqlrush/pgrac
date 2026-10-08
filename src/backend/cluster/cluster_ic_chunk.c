@@ -229,11 +229,11 @@ cluster_ic_send_envelope_chunked(uint8 inner_msg_type, int32 dest_node_id, const
 								   "does not allow BROADCAST destination",
 								   inner_msg_type, inner_info->name)));
 
-		if ((ClusterICPlane)inner_info->plane == CLUSTER_IC_PLANE_DATA
-			&& cluster_authority_readiness_managed() && !cluster_serving_ready_is_current()) {
-			ereport(ERROR, (errcode(ERRCODE_CLUSTER_LMS_UNAVAILABLE),
-							errmsg("cluster IC chunked data plane is not serving-ready")));
-			return false;
+		if ((ClusterICPlane)inner_info->plane == CLUSTER_IC_PLANE_DATA) {
+			bool pending = false;
+
+			if (!cluster_ic_data_send_admission(&pending))
+				return false; /* Caller retains the entire unadmitted payload. */
 		}
 	}
 
@@ -299,7 +299,7 @@ cluster_ic_send_envelope_chunked(uint8 inner_msg_type, int32 dest_node_id, const
  * Receive path.
  * ============================================================ */
 
-bool
+ClusterICDispatchResult
 cluster_ic_chunk_dispatch_frame(const ClusterICEnvelope *env, const void *payload, int32 peer_id)
 {
 	ClusterICChunkHeader hdr;
@@ -428,7 +428,7 @@ cluster_ic_chunk_dispatch_frame(const ClusterICEnvelope *env, const void *payloa
 		 * does NOT clobber our per-peer reassembly_ctx.
 		 */
 		ClusterICEnvelope inner;
-		bool dispatched;
+		ClusterICDispatchResult dispatched;
 
 		if (!cluster_ic_envelope_build(&inner, st->inner_msg_type, (uint32)st->source_node_id,
 									   (uint32)cluster_node_id, st->buf, st->total_payload_len)) {
@@ -436,6 +436,12 @@ cluster_ic_chunk_dispatch_frame(const ClusterICEnvelope *env, const void *payloa
 			return false;
 		}
 		dispatched = cluster_ic_dispatch_envelope(&inner, st->buf, -1);
+		if (dispatched == CLUSTER_IC_DISPATCH_PENDING) {
+			/* The receive owner retains this last frame. Keep the original
+			 * assembly and deadline; recopying the final chunk is idempotent. */
+			st->seq_next--;
+			return dispatched;
+		}
 		cluster_ic_chunk_reset_peer(peer_id);
 		return dispatched;
 	}

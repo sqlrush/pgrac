@@ -41,6 +41,11 @@
  * IDENTIFICATION
  *	  src/backend/utils/time/snapmgr.c
  *
+ * PGRAC MODIFICATIONS
+ *   Modified by: SqlRush <sqlrush@gmail.com>
+ *   Bind read-only cache identities to retained snapshot lifetimes.
+ *   Spec: spec-8.16-oracle-cache-fusion-buffer-version-and-unified-cache.md
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -73,6 +78,7 @@
 #include "utils/timestamp.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"		/* PGRAC (spec-3.3 D3/D4): cluster_enabled */
 #include "cluster/cluster_catalog_bootstrap.h"	/* PGRAC (spec-6.14 D8): services-ready gate */
 #include "cluster/cluster_visibility_resolve.h" /* PGRAC (spec-6.14 D8): no-recursion guard */
@@ -235,6 +241,7 @@ SnapMgrShmemSize(void)
 
 /*
  * Initialize for managing old snapshot detection.
+ * PGRAC: initialize the read identity allocator only in a new shared region.
  */
 void
 SnapMgrInit(void)
@@ -261,6 +268,9 @@ SnapMgrInit(void)
 		oldSnapshotControl->head_offset = 0;
 		oldSnapshotControl->head_timestamp = 0;
 		oldSnapshotControl->count_used = 0;
+#ifdef USE_PGRAC_CLUSTER
+		pg_atomic_init_u64(&oldSnapshotControl->cr_identity_generation, 0);
+#endif
 	}
 }
 
@@ -587,6 +597,7 @@ InvalidateCatalogSnapshotConditionally(void)
 /*
  * SnapshotSetCommandId
  *		Propagate CommandCounterIncrement into the static snapshots, if set
+ * PGRAC: a changed command ID also retires any read-only cache identity.
  */
 void
 SnapshotSetCommandId(CommandId curcid)
@@ -595,9 +606,21 @@ SnapshotSetCommandId(CommandId curcid)
 		return;
 
 	if (CurrentSnapshot)
+	{
+#ifdef USE_PGRAC_CLUSTER
+		if (CurrentSnapshot->curcid != curcid)
+			CurrentSnapshot->cluster_cr_identity = 0;
+#endif
 		CurrentSnapshot->curcid = curcid;
+	}
 	if (SecondarySnapshot)
+	{
+#ifdef USE_PGRAC_CLUSTER
+		if (SecondarySnapshot->curcid != curcid)
+			SecondarySnapshot->cluster_cr_identity = 0;
+#endif
 		SecondarySnapshot->curcid = curcid;
+	}
 	/* Should we do the same with CatalogSnapshot? */
 }
 
@@ -734,6 +757,7 @@ SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid,
  *
  * The copy is palloc'd in TopTransactionContext and has initial refcounts set
  * to 0.  The returned snapshot has the copied flag set.
+ * PGRAC: the copy starts without a read-only cache identity.
  */
 static Snapshot
 CopySnapshot(Snapshot snapshot)
@@ -757,6 +781,10 @@ CopySnapshot(Snapshot snapshot)
 	newsnap->active_count = 0;
 	newsnap->copied = true;
 	newsnap->snapXactCompletionCount = 0;
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: a copy has its own retained lifetime, even at the same read SCN. */
+	newsnap->cluster_cr_identity = 0;
+#endif
 
 	/* setup XID array */
 	if (snapshot->xcnt > 0)
@@ -876,6 +904,7 @@ PushCopiedSnapshot(Snapshot snapshot)
  *
  * Update the current CID of the active snapshot.  This can only be applied
  * to a snapshot that is not referenced elsewhere.
+ * PGRAC: a changed command ID also retires any read-only cache identity.
  */
 void
 UpdateActiveSnapshotCommandId(void)
@@ -899,6 +928,10 @@ UpdateActiveSnapshotCommandId(void)
 	curcid = GetCurrentCommandId(false);
 	if (IsInParallelMode() && save_curcid != curcid)
 		elog(ERROR, "cannot modify commandid in active snapshot during a parallel operation");
+#ifdef USE_PGRAC_CLUSTER
+	if (save_curcid != curcid)
+		ActiveSnapshot->as_snap->cluster_cr_identity = 0;
+#endif
 	ActiveSnapshot->as_snap->curcid = curcid;
 }
 
@@ -1111,6 +1144,9 @@ cluster_snapshot_read_invalidate(Snapshot snapshot)
 {
 	ClusterSnapshotReadScopeV1 *scope;
 
+	if (snapshot != NULL)
+		snapshot->cluster_cr_identity = 0;
+
 	for (scope = ClusterSnapshotReadScope; scope != NULL; scope = scope->previous)
 		if (snapshot == NULL || scope->snapshot == snapshot)
 			scope->invalidated = true;
@@ -1188,6 +1224,44 @@ cluster_snapshot_read_evidence_v1(SCN resolver_read_scn, Snapshot *snapshot,
 	/* InvalidScn terminal callers retain only their original Active boundary. */
 	*reason = refusal;
 	return refusal == NULL;
+}
+
+/*
+ * Return the local identity of the actual retained evaluator.  This is only a
+ * cache key: every cache consumer must obtain fresh read admission separately.
+ * Refusal preserves the caller's output and cannot revive an old snapshot.
+ */
+bool
+cluster_snapshot_cr_identity_v1(Snapshot expected, uint64 *identity)
+{
+	Snapshot	actual;
+	SCN			retained_floor;
+	const char *reason;
+	uint64		generation;
+
+	/* Container membership must be checked before dereferencing expected. */
+	if (identity == NULL || !cluster_snapshot_is_live(expected))
+		return false;
+	if (!cluster_snapshot_read_evidence_v1(expected->read_scn, &actual,
+										   &retained_floor, &reason) ||
+		actual != expected || actual->read_epoch == 0 ||
+		actual->read_epoch != cluster_epoch_get_current())
+		return false;
+	if (actual->cluster_cr_identity == 0)
+	{
+		if (oldSnapshotControl == NULL)
+			return false;
+		generation = pg_atomic_read_u64(&oldSnapshotControl->cr_identity_generation);
+		do
+		{
+			if (generation == PG_UINT64_MAX)
+				return false;
+		} while (!pg_atomic_compare_exchange_u64(&oldSnapshotControl->cr_identity_generation,
+												 &generation, generation + 1));
+		actual->cluster_cr_identity = generation + 1;
+	}
+	*identity = actual->cluster_cr_identity;
+	return true;
 }
 
 /*
@@ -2635,6 +2709,7 @@ SerializeSnapshot(Snapshot snapshot, char *start_address)
  *
  * The copy is palloc'd in TopTransactionContext and has initial refcounts set
  * to 0.  The returned snapshot has the copied flag set.
+ * PGRAC: the copy starts without a read-only cache identity.
  */
 Snapshot
 RestoreSnapshot(char *start_address)
@@ -2688,6 +2763,7 @@ RestoreSnapshot(char *start_address)
 	 * MemoryContextAlloc'd (not zeroed), so leaving it would let a restored
 	 * snapshot read garbage and wrongly take the no-peer fast path.
 	 */
+	snapshot->cluster_cr_identity = 0;
 	snapshot->cluster_snapshot_session_local = 0;
 	memset(snapshot->_pad, 0, sizeof(snapshot->_pad));
 #endif

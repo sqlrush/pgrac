@@ -2913,7 +2913,7 @@ cluster_cr_lookup_or_construct(Buffer buf, SCN read_scn)
 	 *     the (correct, just-built) image to the caller but skip caching it in
 	 *     L1 (serve-but-skip-cache) so no stale-epoch entry persists.
 	 */
-	ClusterCRCacheKey key = cr_build_cache_key(buf, read_scn);
+	ClusterCRCacheKey key;
 	uint64 start_epoch;
 	uint64 start_rel_gen = 0; /* spec-5.56 D4: per-relation gen captured for ①/②;
 							   * 0 = gen table disabled / locator unregistered */
@@ -2924,6 +2924,14 @@ cluster_cr_lookup_or_construct(Buffer buf, SCN read_scn)
 	bool evicted = false;
 	int miss_reason = CR_CACHE_MISS_NONE;
 
+	/* Shared CR reuse belongs to the native buffer arena and its retained
+	 * scan/snapshot owner. Legacy private caches use a current-page LSN key
+	 * which cannot identify versions from different WAL threads. Keep the
+	 * original uncached constructor for callers outside the native CR scope. */
+	if (cluster_shared_config)
+		return cluster_cr_construct_block(buf, read_scn);
+
+	key = cr_build_cache_key(buf, read_scn);
 	start_epoch = cluster_cr_pool_current_epoch(); /* 0 when L2 disabled */
 	/* spec-5.56 D4: capture the locator's current per-relation generation for the
 	 * composite {pool_epoch, rel_gen} fence (P1-c).  0 when the gen table is

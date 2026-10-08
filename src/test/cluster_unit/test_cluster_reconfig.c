@@ -79,10 +79,14 @@
 UT_DEFINE_GLOBALS();
 
 static uint64 ut_storage_members[2] = { UINT64_MAX, UINT64_MAX };
+static int ut_storage_member_reads;
+static int ut_quorum_reads;
+static uint64 ut_epoch_on_unlock;
 
 bool
 cluster_storage_quorum_allows_members(uint64 lo, uint64 hi)
 {
+	ut_storage_member_reads++;
 	return (lo | hi) != 0 && (lo & ~ut_storage_members[0]) == 0
 		   && (hi & ~ut_storage_members[1]) == 0;
 }
@@ -626,7 +630,13 @@ LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_
 }
 void
 LWLockRelease(LWLock *lock pg_attribute_unused())
-{}
+{
+	if (ut_epoch_on_unlock != 0) {
+		uint64 next = ut_epoch_on_unlock;
+		ut_epoch_on_unlock = 0;
+		(void)cluster_epoch_observe_remote(next);
+	}
+}
 
 #include "cluster/cluster_shmem.h"
 void
@@ -698,6 +708,7 @@ static int ut_self_incarnation_calls = 0;
 bool
 cluster_qvotec_in_quorum(void)
 {
+	ut_quorum_reads++;
 	return ut_in_quorum_value;
 }
 
@@ -1228,6 +1239,8 @@ ut_reset_mocks(void)
 	ut_formation_authority_readable = false;
 	memset(&ut_formation_authority, 0, sizeof(ut_formation_authority));
 	ut_storage_members[0] = ut_storage_members[1] = UINT64_MAX;
+	ut_storage_member_reads = ut_quorum_reads = 0;
+	ut_epoch_on_unlock = 0;
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		ut_peer_state[i] = CLUSTER_CSSD_PEER_ALIVE;
 		ut_declared_set[i] = false;
@@ -7842,6 +7855,405 @@ UT_TEST(test_pre2_cold_control_sparse_and_torn_observation)
 	cluster_shared_config = false;
 }
 
+/* Capture an accepted cohort through the original cold-formation driver.
+ * Only native install/stripe completion are fixture boundary inputs.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterReconfigState *
+ut_serving_formation_fixture(void)
+{
+	ClusterReconfigState *state = pre2_cold_fixture(0);
+
+	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
+	for (int i = 0; i < 3; ++i)
+		pre2_cold_tick();
+	ut_recovery_in_progress = false;
+	ut_startup_writer_installed = true;
+	pre2_cold_tick();
+	return state;
+}
+
+/* A caller-owned original observation, never a replacement producer.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterQvotecAdmissionCheck
+ut_serving_admission(void)
+{
+	ClusterQvotecAdmissionCheck check = { 0 };
+
+	check.result = CLUSTER_QVOTEC_ADMISSION_ALLOWED;
+	check.quorum_state = CLUSTER_QVOTEC_QUORUM_OK;
+	check.continuity_valid = true;
+	check.continuity.quorum_generation = 5;
+	check.continuity.storage_generation = 8;
+	check.storage.result = CLUSTER_STORAGE_CHECK_ALLOWED;
+	check.storage.self_node = cluster_node_id;
+	check.storage.target_node = cluster_node_id;
+	check.storage.stable = true;
+	check.storage.view.reason = CLUSTER_STORAGE_QUORUM_READY;
+	check.storage.view.members[0] = 3;
+	check.storage.view.loss_generation = 8;
+	return check;
+}
+
+/* The RED expectations are unchanged; only the capture entry is migrated to
+ * the serving API that consumes the caller's original observation.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_serving_formation_keeps_identity_when_storage_observation_moves)
+{
+	ClusterReconfigState *state = ut_serving_formation_fixture();
+	ClusterFormationSnapshotV1 snapshot;
+	ClusterQvotecAdmissionCheck check = ut_serving_admission();
+	ClusterServingFormationResult result;
+	const char *predicate;
+	bool valid;
+
+	UT_ASSERT_EQ(state->self_join_admitted, 1);
+	UT_ASSERT(cluster_reconfig_capture_formation_snapshot_v1(2, &snapshot));
+	UT_ASSERT_EQ(snapshot.startup_formation_generation, 4);
+	ut_storage_members[0] = 0;
+	ut_storage_member_reads = ut_quorum_reads = 0;
+	result
+		= cluster_reconfig_capture_serving_formation_v1(2, &check, &snapshot, &valid, &predicate);
+	pre2_initial_restore();
+	UT_ASSERT_EQ(result, CLUSTER_SERVING_FORMATION_CURRENT);
+	UT_ASSERT(valid);
+	UT_ASSERT_EQ(snapshot.startup_formation_generation, 4);
+	UT_ASSERT_EQ(ut_storage_member_reads, 0);
+	UT_ASSERT_EQ(ut_quorum_reads, 0);
+}
+
+UT_TEST(test_serving_formation_keeps_identity_during_quorum_publication)
+{
+	ClusterReconfigState *state = ut_serving_formation_fixture();
+	ClusterFormationSnapshotV1 snapshot;
+	ClusterQvotecAdmissionCheck check = ut_serving_admission();
+	ClusterServingFormationResult result;
+	const char *predicate;
+	bool valid;
+
+	UT_ASSERT_EQ(state->self_join_admitted, 1);
+	UT_ASSERT(cluster_reconfig_capture_formation_snapshot_v1(2, &snapshot));
+	UT_ASSERT_EQ(snapshot.startup_formation_generation, 4);
+	ut_in_quorum_value = false;
+	ut_storage_member_reads = ut_quorum_reads = 0;
+	result
+		= cluster_reconfig_capture_serving_formation_v1(2, &check, &snapshot, &valid, &predicate);
+	pre2_initial_restore();
+	UT_ASSERT_EQ(result, CLUSTER_SERVING_FORMATION_CURRENT);
+	UT_ASSERT(valid);
+	UT_ASSERT_EQ(snapshot.startup_formation_generation, 4);
+	UT_ASSERT_EQ(ut_storage_member_reads, 0);
+	UT_ASSERT_EQ(ut_quorum_reads, 0);
+}
+
+UT_TEST(test_serving_formation_pending_is_not_resampled_as_current)
+{
+	for (int mode = 0; mode < 3; ++mode) {
+		ClusterReconfigState *state = ut_serving_formation_fixture();
+		ClusterFormationSnapshotV1 snapshot;
+		ClusterQvotecAdmissionCheck check = ut_serving_admission();
+		const char *predicate;
+		bool valid;
+
+		UT_ASSERT_EQ(state->self_join_admitted, 1);
+		check.continuity_valid = false;
+		check.continuity_pending = mode == 0;
+		if (mode != 0) {
+			check.result = CLUSTER_QVOTEC_ADMISSION_STORAGE;
+			memset(&check.storage, 0, sizeof(check.storage));
+			check.storage.result = CLUSTER_STORAGE_CHECK_UNSTABLE;
+			check.storage.snapshot_stop = mode == 1 ? CLUSTER_STORAGE_SNAPSHOT_DEADLINE
+													: CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT;
+		}
+		ut_storage_member_reads = ut_quorum_reads = 0;
+		UT_ASSERT_EQ(
+			cluster_reconfig_capture_serving_formation_v1(2, &check, &snapshot, &valid, &predicate),
+			CLUSTER_SERVING_FORMATION_PENDING);
+		pre2_initial_restore();
+		UT_ASSERT(valid);
+		UT_ASSERT_EQ(snapshot.startup_formation_generation, 4);
+		UT_ASSERT_EQ(ut_storage_member_reads, 0);
+		UT_ASSERT_EQ(ut_quorum_reads, 0);
+		UT_ASSERT(strcmp(predicate, mode == 0 ? "admission.publication_pending"
+											  : "storage.observation_pending")
+				  == 0);
+	}
+}
+
+UT_TEST(test_serving_formation_loss_is_not_revived_by_later_readiness)
+{
+	for (int bad = 0; bad < 13; ++bad) {
+		ClusterFormationSnapshotV1 snapshot;
+		ClusterQvotecAdmissionCheck check;
+		const char *predicate;
+		bool valid;
+
+		(void)ut_serving_formation_fixture();
+		check = ut_serving_admission();
+
+		switch (bad) {
+		case 0:
+			check.result = CLUSTER_QVOTEC_ADMISSION_LEASE;
+			break;
+		case 1:
+			check.result = CLUSTER_QVOTEC_ADMISSION_FROZEN;
+			break;
+		case 2:
+			check.result = CLUSTER_QVOTEC_ADMISSION_DB_STATE;
+			break;
+		case 3:
+			check.continuity_valid = false;
+			break;
+		case 4:
+			check.continuity.quorum_generation = 0;
+			break;
+		case 5:
+			check.continuity.quorum_generation = UINT64_MAX;
+			break;
+		case 6:
+			check.continuity.storage_generation++;
+			break;
+		case 7:
+			check.storage.stable = false;
+			break;
+		case 8:
+			check.storage.self_node++;
+			break;
+		case 9:
+			check.storage.result = CLUSTER_STORAGE_CHECK_EXPIRED;
+			break;
+		case 10:
+			check.result = CLUSTER_QVOTEC_ADMISSION_STORAGE;
+			check.storage.result = CLUSTER_STORAGE_CHECK_UNSTABLE;
+			check.storage.snapshot_stop = CLUSTER_STORAGE_SNAPSHOT_CLOCK_REGRESSED;
+			break;
+		case 11:
+			check.quorum_state = CLUSTER_QVOTEC_QUORUM_LOST;
+			break;
+		case 12:
+			check.result = CLUSTER_QVOTEC_ADMISSION_STORAGE;
+			check.storage.result = CLUSTER_STORAGE_CHECK_UNSTABLE;
+			check.storage.snapshot_stop = CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT;
+			check.quorum_state = CLUSTER_QVOTEC_QUORUM_LOST;
+			break;
+		}
+		ut_lwlock_conditional_result = false; /* cannot hide known loss */
+		ut_storage_member_reads = ut_quorum_reads = 0;
+		memset(&snapshot, 0xa5, sizeof(snapshot));
+		UT_ASSERT_EQ(
+			cluster_reconfig_capture_serving_formation_v1(2, &check, &snapshot, &valid, &predicate),
+			CLUSTER_SERVING_FORMATION_REFUSED);
+		pre2_initial_restore();
+		UT_ASSERT(!valid);
+		UT_ASSERT_EQ(snapshot.startup_formation_generation, 0);
+		UT_ASSERT_EQ(ut_storage_member_reads, 0);
+		UT_ASSERT_EQ(ut_quorum_reads, 0);
+	}
+}
+
+UT_TEST(test_serving_formation_pending_cannot_hide_identity_refusal)
+{
+	for (int bad = 0; bad < 17; ++bad) {
+		ClusterReconfigState *state = ut_serving_formation_fixture();
+		ClusterFormationSnapshotV1 snapshot;
+		ClusterQvotecAdmissionCheck check = ut_serving_admission();
+		const char *predicate;
+		bool valid;
+
+		check.continuity_pending = true;
+		check.continuity_valid = false;
+		switch (bad) {
+		case 0:
+			state->startup_formation.formation_epoch++;
+			break;
+		case 1:
+			state->startup_formation.commit_nonce = 0;
+			break;
+		case 2:
+			state->startup_formation.formation_generation = 0;
+			break;
+		case 3:
+			ut_set_self_incarnation_sequence(78, 78, 78);
+			break;
+		case 4:
+			cluster_membership_set_state(0, CLUSTER_MEMBER_DEAD);
+			break;
+		case 5:
+			cluster_membership_record_admitted(0, 67);
+			break;
+		case 6:
+			ut_declared_set[0] = false;
+			break;
+		case 7:
+			state->removed_bitmap[0] = 1;
+			break;
+		case 8:
+			pg_atomic_write_u32(&state->prebump_sync_active, 1);
+			break;
+		case 9:
+			state->pending_join_bitmap[0] = 1;
+			break;
+		case 10:
+			state->last_applied.dead_bitmap[0] = 1;
+			break;
+		case 11:
+			state->last_applied.join_bitmap[0] = 1;
+			break;
+		case 12:
+			state->last_applied.new_epoch++;
+			break;
+		case 13:
+			state->startup_formation.arbiter_incarnation++;
+			break;
+		case 14:
+			state->startup_formation.magic++;
+			break;
+		case 15:
+			state->self_join_admitted = 0;
+			break;
+		case 16:
+			state->self_join_failed = 1;
+			break;
+		}
+		UT_ASSERT_EQ(
+			cluster_reconfig_capture_serving_formation_v1(2, &check, &snapshot, &valid, &predicate),
+			CLUSTER_SERVING_FORMATION_REFUSED);
+		pre2_initial_restore();
+		UT_ASSERT(!valid);
+		UT_ASSERT(strncmp(predicate, "formation.", 10) == 0);
+	}
+}
+
+UT_TEST(test_serving_formation_pending_exposes_changed_identity_to_binding_owner)
+{
+	ClusterReconfigState *state = ut_serving_formation_fixture();
+	ClusterFormationSnapshotV1 before, after;
+	ClusterQvotecAdmissionCheck check = ut_serving_admission();
+	const char *predicate;
+	bool valid;
+
+	UT_ASSERT_EQ(
+		cluster_reconfig_capture_serving_formation_v1(2, &check, &before, &valid, &predicate),
+		CLUSTER_SERVING_FORMATION_CURRENT);
+	state->startup_formation.formation_generation++;
+	check.continuity_pending = true;
+	check.continuity_valid = false;
+	UT_ASSERT_EQ(
+		cluster_reconfig_capture_serving_formation_v1(2, &check, &after, &valid, &predicate),
+		CLUSTER_SERVING_FORMATION_PENDING);
+	pre2_initial_restore();
+	UT_ASSERT(valid);
+	UT_ASSERT_EQ(before.startup_formation_generation, 4);
+	UT_ASSERT_EQ(after.startup_formation_generation, 5);
+	UT_ASSERT(memcmp(&before, &after, sizeof(before)) != 0);
+}
+
+UT_TEST(test_serving_formation_requires_all_cohort_storage_members)
+{
+	for (int pending = 0; pending <= 1; ++pending) {
+		ClusterFormationSnapshotV1 snapshot;
+		ClusterQvotecAdmissionCheck check;
+		const char *predicate;
+		bool valid;
+
+		(void)ut_serving_formation_fixture();
+		check = ut_serving_admission();
+
+		check.continuity_pending = pending != 0;
+		check.continuity_valid = pending == 0;
+		check.storage.view.members[0] = 2; /* self remains; the peer is absent */
+		UT_ASSERT_EQ(
+			cluster_reconfig_capture_serving_formation_v1(2, &check, &snapshot, &valid, &predicate),
+			CLUSTER_SERVING_FORMATION_REFUSED);
+		pre2_initial_restore();
+		UT_ASSERT(valid);
+		UT_ASSERT(strcmp(predicate, "formation.storage_members") == 0);
+	}
+}
+
+UT_TEST(test_serving_formation_lock_busy_has_no_identity_and_never_blocks)
+{
+	ClusterFormationSnapshotV1 snapshot, zero = { 0 };
+	ClusterQvotecAdmissionCheck check;
+	const char *predicate;
+	bool valid;
+
+	(void)ut_serving_formation_fixture();
+	check = ut_serving_admission();
+
+	ut_lwlock_conditional_result = false;
+	ut_lwlock_conditional_calls = ut_lwlock_blocking_calls = 0;
+	memset(&snapshot, 0xa5, sizeof(snapshot));
+	UT_ASSERT_EQ(
+		cluster_reconfig_capture_serving_formation_v1(2, &check, &snapshot, &valid, &predicate),
+		CLUSTER_SERVING_FORMATION_PENDING);
+	pre2_initial_restore();
+	UT_ASSERT(!valid);
+	UT_ASSERT(memcmp(&snapshot, &zero, sizeof(snapshot)) == 0);
+	UT_ASSERT_EQ(ut_lwlock_conditional_calls, 1);
+	UT_ASSERT_EQ(ut_lwlock_blocking_calls, 0);
+	UT_ASSERT(strcmp(predicate, "formation.lock_busy") == 0);
+}
+
+UT_TEST(test_serving_formation_rechecks_epoch_after_owner_unlock)
+{
+	ClusterFormationSnapshotV1 snapshot;
+	ClusterQvotecAdmissionCheck check;
+	const char *predicate;
+	bool valid;
+
+	(void)ut_serving_formation_fixture();
+	check = ut_serving_admission();
+
+	ut_epoch_on_unlock = cluster_epoch_get_current() + 1;
+	UT_ASSERT_EQ(
+		cluster_reconfig_capture_serving_formation_v1(2, &check, &snapshot, &valid, &predicate),
+		CLUSTER_SERVING_FORMATION_REFUSED);
+	pre2_initial_restore();
+	UT_ASSERT(!valid);
+	UT_ASSERT(strcmp(predicate, "formation.epoch_changed") == 0);
+}
+
+UT_TEST(test_serving_formation_invalid_input_and_nonshared_refuse)
+{
+	for (int bad = 0; bad < 7; ++bad) {
+		ClusterFormationSnapshotV1 snapshot;
+		ClusterQvotecAdmissionCheck check;
+		const char *predicate;
+		bool valid;
+
+		(void)ut_serving_formation_fixture();
+		check = ut_serving_admission();
+
+		if (bad == 6)
+			cluster_shared_config = false;
+		UT_ASSERT_EQ(cluster_reconfig_capture_serving_formation_v1(
+						 bad == 0	? 0
+						 : bad == 1 ? CLUSTER_MAX_NODES + 1
+									: 2,
+						 bad == 2 ? NULL : &check, bad == 3 ? NULL : &snapshot,
+						 bad == 4 ? NULL : &valid, bad == 5 ? NULL : &predicate),
+					 CLUSTER_SERVING_FORMATION_REFUSED);
+		pre2_initial_restore();
+	}
+}
+
+UT_TEST(test_serving_formation_legacy_capture_keeps_original_refusal_projection)
+{
+	for (int bad = 0; bad < 2; ++bad) {
+		ClusterFormationSnapshotV1 snapshot;
+
+		(void)ut_serving_formation_fixture();
+
+		if (bad == 0)
+			ut_in_quorum_value = false;
+		else
+			ut_storage_members[0] = 0;
+		UT_ASSERT(cluster_reconfig_capture_formation_snapshot_v1(2, &snapshot));
+		pre2_initial_restore();
+		UT_ASSERT_EQ(snapshot.startup_formation_generation, 0);
+	}
+}
+
 UT_TEST(test_initial_clean_snapshot_requires_exact_four_node_marker_and_empty_replacement)
 {
 	ClusterReconfigState *state;
@@ -8180,7 +8592,7 @@ UT_TEST(test_membership_cut_generation_uses_original_shmem_owner)
 int
 main(void)
 {
-	UT_PLAN(152);
+	UT_PLAN(163);
 	UT_RUN(test_stop_membership_terminal_peer_is_not_online_admission);
 	UT_RUN(test_stop_membership_preserves_all_nonliveness_requirements);
 	UT_RUN(test_stop_reconfig_shared_owners);
@@ -8369,6 +8781,17 @@ main(void)
 	UT_RUN(test_pre2_restart_snapshot_expiry_owner_drift_and_unknown_io_stay_closed);
 	UT_RUN(test_pre2_published_fence_snapshot_is_readonly_and_bound_to_owner);
 	UT_RUN(test_pre2_control_keeps_disk_proof_refresh_until_startup_finishes);
+	UT_RUN(test_serving_formation_keeps_identity_when_storage_observation_moves);
+	UT_RUN(test_serving_formation_keeps_identity_during_quorum_publication);
+	UT_RUN(test_serving_formation_pending_is_not_resampled_as_current);
+	UT_RUN(test_serving_formation_loss_is_not_revived_by_later_readiness);
+	UT_RUN(test_serving_formation_pending_cannot_hide_identity_refusal);
+	UT_RUN(test_serving_formation_pending_exposes_changed_identity_to_binding_owner);
+	UT_RUN(test_serving_formation_requires_all_cohort_storage_members);
+	UT_RUN(test_serving_formation_lock_busy_has_no_identity_and_never_blocks);
+	UT_RUN(test_serving_formation_rechecks_epoch_after_owner_unlock);
+	UT_RUN(test_serving_formation_invalid_input_and_nonshared_refuse);
+	UT_RUN(test_serving_formation_legacy_capture_keeps_original_refusal_projection);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

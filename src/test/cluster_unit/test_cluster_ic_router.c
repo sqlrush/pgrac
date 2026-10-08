@@ -209,7 +209,7 @@ const ClusterICOps *ClusterICOps_Active = NULL;
  * called from cluster_ic_router.c msg_type=255 fast path.  Router
  * unit tests don't invoke chunked frames, but link must resolve.
  */
-bool
+ClusterICDispatchResult
 cluster_ic_chunk_dispatch_frame(const ClusterICEnvelope *env pg_attribute_unused(),
 								const void *payload pg_attribute_unused(),
 								int32 peer_id pg_attribute_unused())
@@ -321,6 +321,7 @@ static ClusterICPlane router_test_my_plane = CLUSTER_IC_PLANE_CONTROL;
 static uint64 router_test_misroute_count = 0;
 static bool router_test_authority_managed = false;
 static bool router_test_serving_ready = false;
+static bool router_test_serving_pending = false;
 
 bool
 cluster_authority_readiness_managed(void)
@@ -331,6 +332,16 @@ cluster_authority_readiness_managed(void)
 bool
 cluster_serving_ready_is_current(void)
 {
+	return router_test_serving_ready;
+}
+
+bool
+cluster_serving_ready_check(bool *pending, const char **predicate)
+{
+	if (pending != NULL)
+		*pending = router_test_serving_pending;
+	if (predicate != NULL)
+		*predicate = "TEST";
 	return router_test_serving_ready;
 }
 
@@ -536,6 +547,10 @@ u22_no_op_handler(const ClusterICEnvelope *env pg_attribute_unused(),
 				  const void *payload pg_attribute_unused())
 {
 	u22_handler_call_count++;
+	if (router_test_my_plane == CLUSTER_IC_PLANE_DATA) {
+		UT_ASSERT(cluster_ic_dispatch_data_admitted(env));
+		UT_ASSERT(!cluster_ic_dispatch_data_admitted(NULL));
+	}
 }
 
 UT_TEST(test_u22_dispatch_rejects_broadcast_when_not_allowed)
@@ -630,15 +645,71 @@ UT_TEST(test_scheme_a_data_plane_requires_serving_ready)
 	UT_ASSERT_EQ(send_result, CLUSTER_IC_SEND_HARD_ERROR);
 	UT_ASSERT_EQ(test_send_bytes_call_count, 0);
 
+	router_test_serving_pending = true;
+	/* Pending retains the original frame and never calls the handler. */
+	UT_ASSERT_EQ(cluster_ic_dispatch_envelope(&env, NULL, 1), CLUSTER_IC_DISPATCH_PENDING);
+	UT_ASSERT_EQ(u22_handler_call_count, 0);
+	UT_ASSERT_EQ(cluster_ic_send_envelope(44, 6, NULL, 0), CLUSTER_IC_SEND_NOT_ADMITTED);
+	UT_ASSERT_EQ(test_send_bytes_call_count, 0);
+	router_test_serving_pending = false;
 	router_test_serving_ready = true;
 	UT_ASSERT(cluster_ic_dispatch_envelope(&env, NULL, 1));
 	UT_ASSERT_EQ(u22_handler_call_count, 1);
+	UT_ASSERT(!cluster_ic_dispatch_data_admitted(&env));
 	send_result = cluster_ic_send_envelope(44, 6, NULL, 0);
 	UT_ASSERT_EQ(send_result, CLUSTER_IC_SEND_DONE);
 	UT_ASSERT_EQ(test_send_bytes_call_count, 1);
 
 	router_test_authority_managed = false;
 	router_test_serving_ready = false;
+	router_test_my_plane = CLUSTER_IC_PLANE_CONTROL;
+}
+
+
+static ClusterICSendResult handler_reply_result;
+static void
+pending_after_admission_handler(const ClusterICEnvelope *env, const void *payload)
+{
+	UT_ASSERT(cluster_ic_dispatch_data_admitted(env));
+	/* The handler has already made its admitted transition. A publication
+	 * lock becomes busy before its correlated reply is sent. */
+	router_test_serving_ready = false;
+	router_test_serving_pending = true;
+	handler_reply_result = cluster_ic_send_envelope(45, 6, NULL, 0);
+}
+
+UT_TEST(test_data_handler_reply_reuses_its_single_admission)
+{
+	const ClusterICMsgTypeInfo info = {
+		.msg_type = 45,
+		.name = "admitted-reply",
+		.allowed_producer_mask = (uint32)1u << B_INVALID,
+		.handler = pending_after_admission_handler,
+		.plane = CLUSTER_IC_PLANE_DATA,
+	};
+	ClusterICEnvelope env = {
+		.magic = PGRAC_IC_ENVELOPE_MAGIC,
+		.version = PGRAC_IC_ENVELOPE_VERSION_V1,
+		.msg_type = 45,
+		.source_node_id = 1,
+		.dest_node_id = 7,
+	};
+
+	cluster_ic_register_msg_type(&info);
+	router_test_my_plane = CLUSTER_IC_PLANE_DATA;
+	router_test_authority_managed = router_test_serving_ready = true;
+	router_test_serving_pending = false;
+	test_send_bytes_call_count = 0;
+	MyBackendType = B_INVALID;
+	UT_ASSERT_EQ(cluster_ic_dispatch_envelope(&env, NULL, 1), CLUSTER_IC_DISPATCH_DONE);
+	UT_ASSERT_EQ(handler_reply_result, CLUSTER_IC_SEND_DONE);
+	UT_ASSERT_EQ(test_send_bytes_call_count, 1);
+	/* The same-call proof cannot authorize a later independent send. */
+	UT_ASSERT_EQ(cluster_ic_send_envelope(45, 6, NULL, 0), CLUSTER_IC_SEND_NOT_ADMITTED);
+	router_test_serving_pending = false;
+	UT_ASSERT_EQ(cluster_ic_send_envelope(45, 6, NULL, 0), CLUSTER_IC_SEND_HARD_ERROR);
+	UT_ASSERT_EQ(test_send_bytes_call_count, 1);
+	router_test_authority_managed = false;
 	router_test_my_plane = CLUSTER_IC_PLANE_CONTROL;
 }
 
@@ -857,10 +928,54 @@ void
 cluster_lms_obs_note_dispatch(void)
 {}
 
+static bool control_defer;
+static unsigned control_consumed;
+static void
+pending_control_handler(const ClusterICEnvelope *env, const void *payload)
+{
+	if (control_defer) {
+		cluster_ic_dispatch_defer(env);
+		return;
+	}
+	control_consumed++;
+}
+
+UT_TEST(test_control_handler_defers_before_transferring_the_frame)
+{
+	const ClusterICMsgTypeInfo info = {
+		.msg_type = 46,
+		.name = "pending-control",
+		.allowed_producer_mask = (uint32)1u << B_INVALID,
+		.handler = pending_control_handler,
+		.plane = CLUSTER_IC_PLANE_CONTROL,
+	};
+	ClusterICEnvelope env = {
+		.magic = PGRAC_IC_ENVELOPE_MAGIC,
+		.version = PGRAC_IC_ENVELOPE_VERSION_V1,
+		.msg_type = 46,
+		.source_node_id = 1,
+		.dest_node_id = 7,
+	};
+
+	cluster_ic_register_msg_type(&info);
+	router_test_my_plane = CLUSTER_IC_PLANE_CONTROL;
+	control_defer = true;
+	control_consumed = 0;
+	UT_ASSERT_EQ(cluster_ic_dispatch_envelope(&env, NULL, 1), CLUSTER_IC_DISPATCH_PENDING);
+	UT_ASSERT_EQ(control_consumed, 0);
+	control_defer = false;
+	UT_ASSERT_EQ(cluster_ic_dispatch_envelope(&env, NULL, 1), CLUSTER_IC_DISPATCH_DONE);
+	UT_ASSERT_EQ(control_consumed, 1);
+	/* A stale pointer outside dispatch cannot defer a later call. */
+	cluster_ic_dispatch_defer(&env);
+	UT_ASSERT_EQ(cluster_ic_dispatch_envelope(&env, NULL, 1), CLUSTER_IC_DISPATCH_DONE);
+	UT_ASSERT_EQ(control_consumed, 2);
+}
+
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(21);
 
 	/* U6 register HEARTBEAT + count */
 	UT_RUN(test_u6_register_heartbeat_lmon_only);
@@ -880,6 +995,7 @@ main(void)
 	UT_RUN(test_u22_dispatch_rejects_broadcast_when_not_allowed);
 	UT_RUN(test_u22_dispatch_accepts_broadcast_when_allowed);
 	UT_RUN(test_scheme_a_data_plane_requires_serving_ready);
+	UT_RUN(test_data_handler_reply_reuses_its_single_admission);
 
 	/* T-fanout 1-8: spec-2.5 D2.5 fanout API */
 	UT_RUN(test_t_fanout_1_all_peers_down_writes_peer_down);
@@ -894,6 +1010,7 @@ main(void)
 	/* unused variable warning suppression for stub instance */
 	(void)test_handler_dummy_calls;
 
+	UT_RUN(test_control_handler_defers_before_transferring_the_frame);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

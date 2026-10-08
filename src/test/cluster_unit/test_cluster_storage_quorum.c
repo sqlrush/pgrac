@@ -20,11 +20,18 @@
  */
 #include "postgres.h"
 #include "utils/timestamp.h"
+#include <errno.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
 #include <time.h>
+#include <unistd.h>
 static uint64 fake_monotonic = 100;
 static int storage_test_clock_gettime(clockid_t clock_id, struct timespec *out);
+static void storage_test_usleep(long microsec);
 #define clock_gettime storage_test_clock_gettime
+#define pg_usleep storage_test_usleep
 #include "../../backend/cluster/cluster_storage_quorum.c"
+#undef pg_usleep
 #undef clock_gettime
 #undef printf
 #include "unit_test.h"
@@ -35,11 +42,71 @@ int cluster_node_id = 0;
 static TimestampTz fake_now = 100;
 static ClusterStorageQuorumState test_state;
 static ClusterStorageQuorumView supplied;
+static int publisher_ready_fd = -1, publisher_go_fd = -1;
+static int reader_release_fd = -1, reader_done_fd = -1;
+static unsigned snapshot_sleeps;
+static uint64 snapshot_sleep_us;
+static unsigned snapshot_sleep_mode;
+static const uint64 *reader_clock_samples;
+static unsigned reader_clock_index;
+static unsigned reader_release_after_sleeps = 1;
+
+typedef struct StorageClockScenario {
+	uint64 samples[4];
+	unsigned release_after_sleeps;
+	ClusterStorageCheckResult expected;
+	uint64 expires_us;
+} StorageClockScenario;
+
+static bool
+pipe_byte(int fd, bool writing, char value)
+{
+	char actual = value;
+	ssize_t n;
+
+	do {
+		n = writing ? write(fd, &actual, 1) : read(fd, &actual, 1);
+	} while (n < 0 && errno == EINTR);
+	return n == 1 && actual == value;
+}
+
+static void
+storage_test_usleep(long microsec)
+{
+	snapshot_sleeps++;
+	snapshot_sleep_us += microsec;
+	fake_monotonic += microsec;
+	if (snapshot_sleep_mode == 1)
+		fake_monotonic += 2000; /* The OS may oversleep the requested delay. */
+	else if (snapshot_sleep_mode == 2)
+		fake_monotonic = 400; /* Before wait start, but after the new sample. */
+	else if (snapshot_sleep_mode == 3)
+		fake_monotonic = 0;
+	/* Release the real concurrent publisher at the first reader yield. */
+	if (reader_release_fd >= 0 && snapshot_sleeps >= reader_release_after_sleeps) {
+		UT_ASSERT(pipe_byte(reader_release_fd, true, 'g'));
+		UT_ASSERT(pipe_byte(reader_done_fd, false, 'd'));
+		reader_release_fd = -1;
+	}
+}
 
 static int
 storage_test_clock_gettime(clockid_t clock_id, struct timespec *out)
 {
 	Assert(clock_id == CLOCK_MONOTONIC);
+	if (publisher_ready_fd >= 0) {
+		/* The real refresh has entered its short, odd publication section. */
+		if (!(pg_atomic_read_u32(&storage_state->sequence) & 1)
+			|| !pipe_byte(publisher_ready_fd, true, 'r') || !pipe_byte(publisher_go_fd, false, 'g'))
+			_exit(3);
+		publisher_ready_fd = -1;
+	}
+	if (reader_clock_samples != NULL) {
+		unsigned index = Min(reader_clock_index, 3);
+
+		reader_clock_index++;
+		fake_monotonic = reader_clock_samples[index];
+	}
 	out->tv_sec = fake_monotonic / 1000000;
 	out->tv_nsec = (fake_monotonic % 1000000) * 1000;
 	return 0;
@@ -66,6 +133,12 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 static void
 ready(void)
 {
+	snapshot_sleeps = 0;
+	snapshot_sleep_us = 0;
+	snapshot_sleep_mode = 0;
+	reader_clock_samples = NULL;
+	reader_clock_index = 0;
+	reader_release_after_sleeps = 1;
 	memset(&supplied, 0, sizeof(supplied));
 	supplied.reason = CLUSTER_STORAGE_QUORUM_READY;
 	supplied.ring_node = 11;
@@ -75,6 +148,244 @@ ready(void)
 	fake_monotonic = 100;
 	cluster_storage_quorum_attach(&test_state, true);
 	cluster_storage_quorum_refresh(100, 50);
+}
+
+/* Two local unit processes share only the real quorum state, not a database.
+ * Pipe handshakes place the read exactly inside the real publisher's odd cut. */
+static void
+concurrent_publication(unsigned scenario, const StorageClockScenario *clock_case, unsigned reader)
+{
+	ClusterStorageQuorumState *shared;
+	ClusterStorageQuorumCheck check;
+	uint64 prior_loss;
+	int to_child[2], from_child[2], status;
+	pid_t child;
+	bool allowed;
+
+	ready();
+	if (clock_case != NULL)
+		reader_release_after_sleeps = clock_case->release_after_sleeps;
+	if (scenario >= 4) {
+		snapshot_sleep_mode = scenario - 3;
+		fake_monotonic = 500;
+	}
+	shared = mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE, MAP_ANON | MAP_SHARED, -1, 0);
+	UT_ASSERT(shared != MAP_FAILED);
+	if (shared == MAP_FAILED)
+		return;
+	memcpy(shared, &test_state, sizeof(*shared));
+	cluster_storage_quorum_attach(shared, false);
+	prior_loss = pg_atomic_read_u64(&shared->loss_generation);
+	if (pipe(to_child) != 0) {
+		UT_ASSERT(false);
+		goto detach;
+	}
+	if (pipe(from_child) != 0) {
+		UT_ASSERT(false);
+		close(to_child[0]);
+		close(to_child[1]);
+		goto detach;
+	}
+	child = fork();
+	if (child == 0) {
+		/* A broken test handshake exits, rather than leaving a stuck child. */
+		alarm(5);
+		close(to_child[1]);
+		close(from_child[0]);
+		fake_monotonic = clock_case != NULL ? 900 : scenario >= 4 ? 501 : 101;
+		supplied.ring_sequence++;
+		supplied.members[0] = scenario == 2 ? 2 : 1;
+		if (scenario == 1)
+			supplied.reason = CLUSTER_STORAGE_QUORUM_NOT_QUORATE;
+		publisher_ready_fd = from_child[1];
+		publisher_go_fd = to_child[0];
+		cluster_storage_quorum_refresh(clock_case != NULL ? 900 : 101,
+									   clock_case != NULL ? clock_case->expires_us - 900
+									   : scenario == 3	  ? 50
+														  : 1000000);
+		_exit(pipe_byte(from_child[1], true, 'd') ? 0 : 4);
+	}
+	close(to_child[0]);
+	close(from_child[1]);
+	UT_ASSERT(child > 0);
+	if (child > 0) {
+		UT_ASSERT(pipe_byte(from_child[0], false, 'r'));
+		reader_release_fd = to_child[1];
+		reader_done_fd = from_child[0];
+		if (clock_case != NULL)
+			reader_clock_samples = clock_case->samples;
+		if (reader == 1)
+			allowed = cluster_storage_quorum_allows_node(0);
+		else if (reader == 2)
+			allowed = cluster_storage_quorum_allows_members(1, 0);
+		else if (reader == 3) {
+			ClusterStorageQuorumView view;
+			ClusterStorageQuorumView zero = { 0 };
+
+			memset(&view, 0xff, sizeof(view));
+			allowed = cluster_storage_quorum_snapshot(&view);
+			if (!allowed)
+				UT_ASSERT_EQ(memcmp(&view, &zero, sizeof(view)), 0);
+		} else
+			allowed = cluster_storage_quorum_check_node(0, &check);
+		UT_ASSERT_EQ(snapshot_sleeps, 1);
+		if (clock_case != NULL) {
+			UT_ASSERT_EQ(allowed, clock_case->expected == CLUSTER_STORAGE_CHECK_ALLOWED);
+			if (reader == 0) {
+				bool stable = clock_case->expected != CLUSTER_STORAGE_CHECK_UNSTABLE;
+				ClusterStorageQuorumView zero = { 0 };
+
+				UT_ASSERT_EQ(check.result, clock_case->expected);
+				UT_ASSERT_EQ(check.stable, stable);
+				UT_ASSERT_EQ(check.view.generation, stable ? 2 : 0);
+				UT_ASSERT_EQ(check.now_us, stable ? clock_case->samples[3] : 0);
+				if (!stable)
+					UT_ASSERT_EQ(memcmp(&check.view, &zero, sizeof(zero)), 0);
+			}
+		} else if (scenario >= 4) {
+			UT_ASSERT(!allowed);
+			UT_ASSERT(!check.stable);
+			UT_ASSERT_EQ(check.result, CLUSTER_STORAGE_CHECK_UNSTABLE);
+			UT_ASSERT_EQ(check.view.generation, 0);
+			UT_ASSERT_EQ(check.now_us, 0);
+			UT_ASSERT_EQ(check.attempts, 4);
+			/* The original 439 tuple cannot distinguish an overslept yield
+			 * from a failed clock. Keep the sampled cause without granting. */
+			UT_ASSERT_EQ(check.wait_count, 1);
+			UT_ASSERT_EQ(check.wait_started_us, 500);
+			UT_ASSERT_EQ(check.wait_sampled_us, scenario == 4 ? 2600 : scenario == 5 ? 400 : 0);
+			UT_ASSERT_EQ(check.snapshot_stop, scenario == 4 ? CLUSTER_STORAGE_SNAPSHOT_DEADLINE
+											  : scenario == 5
+												  ? CLUSTER_STORAGE_SNAPSHOT_CLOCK_REGRESSED
+												  : CLUSTER_STORAGE_SNAPSHOT_CLOCK_UNAVAILABLE);
+		} else {
+			UT_ASSERT_EQ(allowed, scenario == 0);
+			UT_ASSERT(check.stable);
+			UT_ASSERT_EQ(check.result, scenario == 0   ? CLUSTER_STORAGE_CHECK_ALLOWED
+									   : scenario == 1 ? CLUSTER_STORAGE_CHECK_PROVIDER
+									   : scenario == 2 ? CLUSTER_STORAGE_CHECK_SELF_ABSENT
+													   : CLUSTER_STORAGE_CHECK_EXPIRED);
+			UT_ASSERT_EQ(check.view.generation, 2);
+			UT_ASSERT_EQ(check.attempts, 5);
+		}
+		if (scenario == 0 && clock_case == NULL) {
+			UT_ASSERT_EQ(check.view.ring_sequence, 9);
+			UT_ASSERT_EQ(check.view.members[0], 1);
+			UT_ASSERT_EQ(check.view.loss_generation, prior_loss);
+			UT_ASSERT(!cluster_storage_quorum_allows_node(1));
+		}
+		/* RED returns before yielding: release and reap the original writer. */
+		if (reader_release_fd >= 0) {
+			UT_ASSERT(pipe_byte(to_child[1], true, 'g'));
+			UT_ASSERT(pipe_byte(from_child[0], false, 'd'));
+		}
+		UT_ASSERT_EQ(waitpid(child, &status, 0), child);
+		UT_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+		if (clock_case != NULL) {
+			UT_ASSERT_EQ(pg_atomic_read_u64(&shared->expires_us), clock_case->expires_us);
+			UT_ASSERT_EQ(pg_atomic_read_u64(&shared->loss_generation), prior_loss + 1);
+		}
+	}
+	reader_clock_samples = NULL;
+	reader_release_fd = reader_done_fd = -1;
+	close(to_child[1]);
+	close(from_child[0]);
+detach:
+	cluster_storage_quorum_attach(&test_state, false);
+	UT_ASSERT_EQ(munmap(shared, sizeof(*shared)), 0);
+}
+
+UT_TEST(test_concurrent_publication_is_waited_for_not_reported_as_loss)
+{
+	concurrent_publication(0, NULL, 0);
+}
+
+UT_TEST(test_concurrent_loss_or_expiry_never_uses_previous_positive_view)
+{
+	for (unsigned scenario = 1; scenario <= 3; scenario++)
+		concurrent_publication(scenario, NULL, 0);
+}
+
+UT_TEST(test_completed_publisher_does_not_hide_oversleep_or_clock_failure)
+{
+	for (unsigned scenario = 4; scenario <= 6; scenario++)
+		concurrent_publication(scenario, NULL, 0);
+}
+
+UT_TEST(test_mid_wait_clock_regression_above_start_never_qualifies)
+{
+	const StorageClockScenario cases[]
+		= { /* The publisher completes at the first yield; its view has already
+		 * expired at 1600, before the copy's final clock falls to 1500. */
+			{ { 1000, 1600, 1500, 1500 }, 1, CLUSTER_STORAGE_CHECK_UNSTABLE, 1550 },
+			/* Keep the writer odd: the next pre-sleep check must remember the
+		 * previous post-sleep clock, even though the wait began at 1000. */
+			{ { 1000, 1600, 1500, 1500 }, 2, CLUSTER_STORAGE_CHECK_UNSTABLE, 1550 }
+		  };
+
+	for (unsigned c = 0; c < lengthof(cases); c++)
+		for (unsigned reader = 0; reader < 4; reader++)
+			concurrent_publication(0, &cases[c], reader);
+}
+
+UT_TEST(test_final_qualification_cannot_reaccept_an_expired_view_after_clock_regression)
+{
+	const StorageClockScenario clock_case
+		= { { 1000, 1100, 1600, 1500 }, 1, CLUSTER_STORAGE_CHECK_UNSTABLE, 1550 };
+
+	for (unsigned reader = 0; reader < 3; reader++)
+		concurrent_publication(0, &clock_case, reader);
+}
+
+UT_TEST(test_final_qualification_keeps_zero_clock_and_original_wait_deadline)
+{
+	const StorageClockScenario cases[]
+		= { { { 1000, 1100, 1200, 0 }, 1, CLUSTER_STORAGE_CHECK_UNSTABLE, 1550 },
+			/* The lease remains valid, but the original 1ms wait budget does not. */
+			{ { 1000, 1100, 1200, 2000 }, 1, CLUSTER_STORAGE_CHECK_UNSTABLE, 3000 } };
+
+	for (unsigned c = 0; c < lengthof(cases); c++)
+		for (unsigned reader = 0; reader < 3; reader++)
+			concurrent_publication(0, &cases[c], reader);
+}
+
+UT_TEST(test_monotonic_qualification_keeps_success_and_expiry_polarity)
+{
+	const StorageClockScenario cases[]
+		= { { { 1000, 1000, 1000, 1000 }, 1, CLUSTER_STORAGE_CHECK_ALLOWED, 1550 },
+			{ { 1000, 1100, 1500, 1549 }, 1, CLUSTER_STORAGE_CHECK_ALLOWED, 1550 },
+			{ { 1000, 1100, 1500, 1550 }, 1, CLUSTER_STORAGE_CHECK_EXPIRED, 1550 },
+			{ { 1000, 1100, 1600, 1600 }, 1, CLUSTER_STORAGE_CHECK_EXPIRED, 1550 } };
+
+	for (unsigned c = 0; c < lengthof(cases); c++)
+		for (unsigned reader = 0; reader < 3; reader++)
+			concurrent_publication(0, &cases[c], reader);
+}
+
+UT_TEST(test_stuck_publisher_wait_is_bounded_and_does_not_change_loss_history)
+{
+	ClusterStorageQuorumCheck check;
+	uint64 loss;
+
+	ready();
+	loss = pg_atomic_read_u64(&test_state.loss_generation);
+	pg_atomic_fetch_add_u32(&test_state.sequence, 1);
+	UT_ASSERT(!cluster_storage_quorum_check_node(0, &check));
+	UT_ASSERT_EQ(check.result, CLUSTER_STORAGE_CHECK_UNSTABLE);
+	UT_ASSERT(!check.stable);
+	UT_ASSERT_EQ(check.view.generation, 0);
+	UT_ASSERT_EQ(check.now_us, 0);
+	UT_ASSERT_EQ(check.attempts, 13); /* The last sleep reaches the deadline. */
+	UT_ASSERT_EQ(snapshot_sleeps, 10);
+	UT_ASSERT_EQ(snapshot_sleep_us, 1000);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&test_state.loss_generation), loss);
+	ready();
+	supplied.reason = CLUSTER_STORAGE_QUORUM_NOT_QUORATE;
+	cluster_storage_quorum_refresh(100, 50);
+	UT_ASSERT(!cluster_storage_quorum_check_node(0, &check));
+	UT_ASSERT_EQ(check.result, CLUSTER_STORAGE_CHECK_PROVIDER);
+	UT_ASSERT_EQ(check.attempts, 1);
+	UT_ASSERT_EQ(snapshot_sleeps, 0);
 }
 
 UT_TEST(test_mapping_rejects_aliases_missing_slots_and_overflow)
@@ -243,7 +554,7 @@ UT_TEST(test_refusal_capture_distinguishes_unsampled_and_unstable)
 	UT_ASSERT(!cluster_storage_quorum_check_node(0, &check));
 	UT_ASSERT_EQ(check.result, CLUSTER_STORAGE_CHECK_UNSTABLE);
 	UT_ASSERT(!check.stable);
-	UT_ASSERT_EQ(check.attempts, 4);
+	UT_ASSERT_EQ(check.attempts, 13); /* No read after the final sleep reaches 1ms. */
 	UT_ASSERT(check.sequence_before & 1);
 	UT_ASSERT_EQ(check.now_us, 0);
 	UT_ASSERT_EQ(memcmp(&check.view, &zero, sizeof(zero)), 0);
@@ -354,7 +665,15 @@ UT_TEST(test_incomplete_never_retains_invalid_or_expired_evidence)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(21);
+	UT_RUN(test_mid_wait_clock_regression_above_start_never_qualifies);
+	UT_RUN(test_final_qualification_cannot_reaccept_an_expired_view_after_clock_regression);
+	UT_RUN(test_final_qualification_keeps_zero_clock_and_original_wait_deadline);
+	UT_RUN(test_monotonic_qualification_keeps_success_and_expiry_polarity);
+	UT_RUN(test_concurrent_publication_is_waited_for_not_reported_as_loss);
+	UT_RUN(test_concurrent_loss_or_expiry_never_uses_previous_positive_view);
+	UT_RUN(test_completed_publisher_does_not_hide_oversleep_or_clock_failure);
+	UT_RUN(test_stuck_publisher_wait_is_bounded_and_does_not_change_loss_history);
 	UT_RUN(test_incomplete_never_retains_invalid_or_expired_evidence);
 	UT_RUN(test_mapping_rejects_aliases_missing_slots_and_overflow);
 	UT_RUN(test_provider_component_requires_exact_mapping_and_local_identity);

@@ -673,7 +673,7 @@ cluster_grd_entry_enqueue_or_grant(
 	int32 source_node_id pg_attribute_unused(), uint64 request_id pg_attribute_unused(),
 	uint64 shard_master_generation pg_attribute_unused(),
 	uint32 request_opcode pg_attribute_unused(), int lockmode,
-	ClusterGrdConflictHolder *conflict_holders_out pg_attribute_unused(), int *n_conflict_out)
+	ClusterGrdConflictHolder **conflict_holders_out pg_attribute_unused(), int *n_conflict_out)
 {
 	UT_ASSERT(insert_event != 0);
 	UT_ASSERT(lockmode == ShareLock || lockmode == ExclusiveLock);
@@ -725,13 +725,12 @@ cluster_grd_cancel_waiter_by_id_seq(const ClusterResId *resid, const ClusterGrdH
 	return CLUSTER_GRD_ENTRY_OK;
 }
 
-uint32
-cluster_ges_release_and_drain_local(const ClusterResId *resid pg_attribute_unused(),
-									const ClusterGrdHolderId *holder pg_attribute_unused())
+void
+cluster_ges_release_and_drain_local_deferred(const ClusterResId *resid pg_attribute_unused(),
+											 const ClusterGrdHolderId *holder pg_attribute_unused())
 {
 	local_release_calls++;
 	local_release_event = ++event_sequence;
-	return GES_REJECT_REASON_NONE;
 }
 
 ClusterGrdEntryResult

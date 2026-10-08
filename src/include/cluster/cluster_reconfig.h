@@ -61,7 +61,6 @@
 #include "cluster/cluster_formation_marker.h" /* cold-formation marker mailbox */
 #include "cluster/cluster_marker_async.h"
 #include "cluster/cluster_membership.h" /* ClusterMembershipTable (spec-5.15 D2 SSOT) */
-#include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_replacement_episode.h"
 #include "cluster/cluster_replacement_wire.h"
 
@@ -69,6 +68,7 @@ struct Latch; /* spec-5.15 D4 — join-marker qvotec mailbox latch (pointer only
 
 
 struct ClusterFormationSnapshotV1;
+struct ClusterQvotecAdmissionCheck;
 struct ClusterSemanticActivationRecord;
 
 #define CLUSTER_JOIN_MARKER_REQUEST_TARGET_MASK UINT32_C(0x0000007f)
@@ -570,6 +570,24 @@ extern void cluster_reconfig_get_last_event(ReconfigEvent *out);
 extern bool cluster_reconfig_has_pending_prebump_stage(void);
 extern bool cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread,
 														   struct ClusterFormationSnapshotV1 *out);
+
+
+/* Same-call serving observation, not a retained admission token. All outputs
+ * are required and must not alias inputs or each other. PENDING never grants:
+ * snapshot_valid distinguishes a complete identity from lock contention.
+ * The caller must compare a valid identity with its immutable serving binding,
+ * including on PENDING, and keep all original GRD/boot/LMS/epoch gates.
+ * The old snapshot API retains its original qualification semantics.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef enum ClusterServingFormationResult {
+	CLUSTER_SERVING_FORMATION_CURRENT = 0,
+	CLUSTER_SERVING_FORMATION_PENDING,
+	CLUSTER_SERVING_FORMATION_REFUSED
+} ClusterServingFormationResult;
+
+extern ClusterServingFormationResult cluster_reconfig_capture_serving_formation_v1(
+	uint16 origin_thread, const struct ClusterQvotecAdmissionCheck *admission,
+	struct ClusterFormationSnapshotV1 *out, bool *snapshot_valid, const char **predicate);
 
 
 /* ============================================================

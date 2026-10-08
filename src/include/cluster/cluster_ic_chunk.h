@@ -46,6 +46,7 @@
 #include "c.h"
 
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_ic_router.h"
 
 /*
  * Reserved msg_type for chunk-wrap framing.  spec-2.3 enum has
@@ -103,8 +104,8 @@ extern bool cluster_ic_send_envelope_chunked(uint8 inner_msg_type, int32 dest_no
  * Returns true on accepted frame (whether mid-stream or final);
  * false on contract violation (caller -- LMON tier1 -- closes peer).
  */
-extern bool cluster_ic_chunk_dispatch_frame(const ClusterICEnvelope *env, const void *payload,
-											int32 peer_id);
+extern ClusterICDispatchResult cluster_ic_chunk_dispatch_frame(const ClusterICEnvelope *env,
+															   const void *payload, int32 peer_id);
 
 /*
  * Atomic cleanup for a peer's reassembly state.  Single call frees:

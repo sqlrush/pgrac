@@ -3115,6 +3115,7 @@ UT_TEST(test_local_matching_creator_uses_statement_scn_not_native_membership)
 		kind = heap_hot_search_buffer_result(&tid, &relation, UT_HOT_BUFFER, &snapshot, &result,
 											 NULL, true);
 		UT_ASSERT_EQ(kind, leg == 0 ? HEAP_HOT_SEARCH_OWNED_SCRATCH : HEAP_HOT_SEARCH_NOT_FOUND);
+		UT_ASSERT(result.cr_full_page); /* Only after original input revalidation. */
 		UT_ASSERT_EQ(fixture.fetch_calls, 1);
 		UT_ASSERT_EQ(ut_live_visibility_calls, 0);
 		UT_ASSERT_EQ(ut_scratch_exact_resolve_calls, 1);
@@ -3579,6 +3580,7 @@ ut_full_root_absence_case(int scenario)
 		UT_ASSERT_EQ(kind, HEAP_HOT_SEARCH_NOT_FOUND);
 		UT_ASSERT(!all_dead);
 		UT_ASSERT_EQ(fixture.fetch_calls, 2);
+		UT_ASSERT(result.cr_full_page);
 		UT_ASSERT_EQ(ItemPointerGetBlockNumber(&tid), UT_HOT_BLOCK);
 		UT_ASSERT_EQ(ItemPointerGetOffsetNumber(&tid), UT_HOT_ROOT_OFF);
 	}
@@ -3645,6 +3647,7 @@ UT_TEST(test_live_miss_evidence_preserves_result_and_rejects_unreadable_metadata
 					  != NULL);
 		}
 		UT_ASSERT(all_dead); /* Preserve the pre-existing empty-root result. */
+		UT_ASSERT(!result.cr_full_page);
 		UT_ASSERT_EQ(memcmp(before.data, fixture.live_page, BLCKSZ), 0);
 		UT_ASSERT_EQ(ItemPointerGetOffsetNumber(&tid), UT_HOT_ROOT_OFF);
 		UT_ASSERT_EQ(fixture.fetch_calls, 0);

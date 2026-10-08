@@ -231,8 +231,9 @@ extern ClusterICSendResult cluster_ic_send_envelope(uint8 msg_type, int32 dest_n
  *         are NOT caught -- they propagate per PG semantics and
  *         terminate LMON (postmaster crash recovery restarts).
  *
- *   Returns true if handler was invoked (with or without ERROR
- *   caught); false if msg_type unregistered.
+ *   Returns DONE after consuming the frame (including a known refusal),
+ *   REJECTED for peer failure, or PENDING before authority mutation or transfer.
+ *   PENDING leaves ownership with the caller; it must retain the frame.
  */
 /*
  * spec-2.4 hardening v1.0.1 F1 (L76 register-vs-handler-signature-coupling):
@@ -245,8 +246,31 @@ extern ClusterICSendResult cluster_ic_send_envelope(uint8 msg_type, int32 dest_n
  * peer_id == -1 is allowed for pre-handshake / unit-test paths
  * (chunk fast path will reject in that case).
  */
-extern bool cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload,
-										 int32 peer_id);
+typedef enum ClusterICDispatchResult {
+	CLUSTER_IC_DISPATCH_REJECTED = 0,
+	CLUSTER_IC_DISPATCH_DONE = 1,
+	CLUSTER_IC_DISPATCH_PENDING = 2
+} ClusterICDispatchResult;
+
+/* PENDING has not called a handler: the transport/original queue retains the
+ * exact frame and retries on its next pass, without resetting any deadline. */
+static inline ClusterICSendResult
+cluster_ic_dispatch_send_result(ClusterICDispatchResult result)
+{
+	return result == CLUSTER_IC_DISPATCH_PENDING ? CLUSTER_IC_SEND_NOT_ADMITTED
+		   : result == CLUSTER_IC_DISPATCH_DONE	 ? CLUSTER_IC_SEND_DONE
+												 : CLUSTER_IC_SEND_HARD_ERROR;
+}
+
+/* Only the currently executing DATA handler can consume this same-call proof. */
+extern bool cluster_ic_dispatch_data_admitted(const ClusterICEnvelope *env);
+/* Reuse only the active DATA handler observation; outside it, sample normally. */
+extern bool cluster_ic_data_send_admission(bool *pending);
+/* Call only for the current frame, before mutation or ownership transfer. */
+extern void cluster_ic_dispatch_defer(const ClusterICEnvelope *env);
+
+extern ClusterICDispatchResult cluster_ic_dispatch_envelope(const ClusterICEnvelope *env,
+															const void *payload, int32 peer_id);
 
 
 /* ============================================================

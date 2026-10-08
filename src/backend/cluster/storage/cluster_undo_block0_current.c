@@ -539,7 +539,7 @@ current_stage_pending_cleanup(ClusterUndoBlock0CurrentGuardData *data, bool exit
 		current_reply_delete(data, GES_REQ_OPCODE_REQUEST);
 		if (data->request_dispatched) {
 			(void)cluster_grd_cancel_waiter_by_id_seq(&data->resid, &data->holder, 0);
-			cluster_ges_release_and_drain_local(&data->resid, &data->holder);
+			cluster_ges_release_and_drain_local_deferred(&data->resid, &data->holder);
 		}
 	}
 	if (data->reservation_held) {
@@ -566,7 +566,7 @@ current_stage_no_wait_cleanup(ClusterUndoBlock0CurrentGuardData *data, bool exit
 			current_stage_remote_release(data);
 			(void)cluster_grd_release_holder_by_id(&data->resid, &data->holder);
 		} else
-			cluster_ges_release_and_drain_local(&data->resid, &data->holder);
+			cluster_ges_release_and_drain_local_deferred(&data->resid, &data->holder);
 		break;
 	case CLUSTER_UNDO_BLOCK0_CURRENT_RELEASE_WAIT:
 		if (data->remote_master) {
@@ -574,7 +574,7 @@ current_stage_no_wait_cleanup(ClusterUndoBlock0CurrentGuardData *data, bool exit
 			current_stage_remote_release(data);
 			(void)cluster_grd_release_holder_by_id(&data->resid, &data->holder);
 		} else
-			cluster_ges_release_and_drain_local(&data->resid, &data->holder);
+			cluster_ges_release_and_drain_local_deferred(&data->resid, &data->holder);
 		break;
 	case CLUSTER_UNDO_BLOCK0_CURRENT_UNUSED:
 	case CLUSTER_UNDO_BLOCK0_CURRENT_CLEANUP:
@@ -790,7 +790,7 @@ current_acquire_reserve_and_dispatch(ClusterUndoBlock0CurrentGuardData *data,
 {
 	ClusterGrdEntryResult reserve_result;
 	ClusterGrdGrantAction action;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int nconflicts = 0;
 	bool fast_path = false;
 	GesRequestPayload request;
@@ -819,7 +819,11 @@ current_acquire_reserve_and_dispatch(ClusterUndoBlock0CurrentGuardData *data,
 	if (!data->remote_master) {
 		action = cluster_grd_entry_enqueue_or_grant(
 			&data->resid, &data->holder, cluster_node_id, data->holder.request_id,
-			data->routing_generation, GES_REQ_OPCODE_REQUEST, data->mode, conflicts, &nconflicts);
+			data->routing_generation, GES_REQ_OPCODE_REQUEST, data->mode, &conflicts, &nconflicts);
+		if (action != CLUSTER_GRD_ENQUEUED_WAITER && conflicts != NULL) {
+			pfree(conflicts);
+			conflicts = NULL;
+		}
 		if (action == CLUSTER_GRD_GRANT_NOW) {
 			data->request_dispatched = true;
 			data->grant_observed = true;
@@ -834,6 +838,8 @@ current_acquire_reserve_and_dispatch(ClusterUndoBlock0CurrentGuardData *data,
 		data->request_dispatched = true;
 		if (nconflicts > 0)
 			cluster_ges_send_bast_targeted(&data->resid, data->mode, conflicts, nconflicts);
+		if (conflicts != NULL)
+			pfree(conflicts);
 	} else {
 		current_fill_request(data, GES_REQ_OPCODE_REQUEST, &request);
 		if (!cluster_grd_outbound_enqueue_backend_request((uint32)data->master_node, &request,
@@ -1296,7 +1302,7 @@ cluster_undo_block0_current_release_begin(ClusterUndoBlock0CurrentGuard *guard,
 	data->reply_wait_repoll_pending = false;
 	data->reserved[CURRENT_RETRY_REPORTED_INDEX] = 0;
 	if (!data->remote_master) {
-		cluster_ges_release_and_drain_local(&data->resid, &data->holder);
+		cluster_ges_release_and_drain_local_deferred(&data->resid, &data->holder);
 		data->phase = CLUSTER_UNDO_BLOCK0_CURRENT_CLEANUP;
 		current_active_unlink(data);
 		if (data->admission.entered && !current_admission_borrowed(data))

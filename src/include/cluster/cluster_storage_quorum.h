@@ -38,7 +38,7 @@ typedef enum ClusterStorageDiagnosticField {
 } ClusterStorageDiagnosticField;
 
 #define CLUSTER_STORAGE_QUORUM_STATE_BYTES                                                         \
-	(64 + CLUSTER_STORAGE_DIAG_FIELDS * sizeof(pg_atomic_uint64))
+	(72 + CLUSTER_STORAGE_DIAG_FIELDS * sizeof(pg_atomic_uint64))
 
 typedef enum ClusterStorageQuorumReason {
 	CLUSTER_STORAGE_QUORUM_UNAVAILABLE = 0,
@@ -81,6 +81,8 @@ typedef struct ClusterStorageQuorumView {
 	uint64 expires_us;
 	uint64 generation;
 	uint32 provider_diagnostic;
+	/* Monotonic within this postmaster; zero/MAX cannot prove continuity. */
+	uint64 loss_generation;
 } ClusterStorageQuorumView;
 
 /* QVOTEC owns publication. Readers cannot refresh the observation. */
@@ -94,6 +96,7 @@ typedef struct ClusterStorageQuorumState {
 	pg_atomic_uint64 sampled_us;
 	pg_atomic_uint64 expires_us;
 	pg_atomic_uint64 generation;
+	pg_atomic_uint64 loss_generation;
 	pg_atomic_uint64 diagnostic[CLUSTER_STORAGE_DIAG_FIELDS];
 } ClusterStorageQuorumState;
 
@@ -117,7 +120,16 @@ typedef enum ClusterStorageCheckResult {
 
 /* Caller-owned evidence from this check, never an admission token. An odd
  * sequence attempt has no second sample; sequence_after then equals before.
- * If stable is false, view is zero and no current-time sample was taken. */
+ * If stable is false, view and the view-validation time remain zero; retry
+ * timing is not qualification evidence. */
+typedef enum ClusterStorageSnapshotStop {
+	CLUSTER_STORAGE_SNAPSHOT_COMPLETE = 0,
+	CLUSTER_STORAGE_SNAPSHOT_DEADLINE,
+	CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT,
+	CLUSTER_STORAGE_SNAPSHOT_CLOCK_UNAVAILABLE,
+	CLUSTER_STORAGE_SNAPSHOT_CLOCK_REGRESSED
+} ClusterStorageSnapshotStop;
+
 typedef struct ClusterStorageQuorumCheck {
 	ClusterStorageCheckResult result;
 	int target_node;
@@ -128,6 +140,11 @@ typedef struct ClusterStorageQuorumCheck {
 	uint32 sequence_after;
 	uint64 now_us;
 	ClusterStorageQuorumView view;
+	/* Diagnostics of this read only; never an eligibility or continuity proof. */
+	ClusterStorageSnapshotStop snapshot_stop;
+	uint32 wait_count;
+	uint64 wait_started_us;
+	uint64 wait_sampled_us;
 } ClusterStorageQuorumCheck;
 
 extern bool cluster_storage_quorum_parse_nodes(const char *text, const uint64 configured[2],
@@ -143,6 +160,7 @@ extern void cluster_storage_quorum_refresh(uint64 now_us, uint64 duration_us);
 extern bool cluster_storage_quorum_snapshot(ClusterStorageQuorumView *out);
 extern bool cluster_storage_quorum_allows_node(int node_id);
 extern bool cluster_storage_quorum_check_node(int node_id, ClusterStorageQuorumCheck *out);
+extern bool cluster_storage_quorum_check_node_once(int node_id, ClusterStorageQuorumCheck *out);
 extern bool cluster_storage_quorum_allows_members(uint64 members_lo, uint64 members_hi);
 extern void cluster_storage_corosync_sample(ClusterStorageQuorumView *out);
 /* Passive diagnostics never invoke the provider, wait, or supply permission. */

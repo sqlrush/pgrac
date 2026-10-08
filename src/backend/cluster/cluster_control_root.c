@@ -2446,18 +2446,30 @@ done:
  * not the early postmaster sizing read or the recovery owner's read API.
  * Author: SqlRush <sqlrush@gmail.com>
  */
-static bool
-runtime_v2_owner_current(uint64 epoch, uint64 incarnation)
+static ClusterControlRootResult
+runtime_v2_owner_check(uint64 epoch, uint64 incarnation, bool admitted)
 {
-	return cluster_shared_config && cluster_enabled && cluster_controlfile_shared_authority
-		   && cluster_node_id >= 0 && cluster_node_id < CLUSTER_MAX_NODES && epoch != 0
-		   && incarnation != 0 && cluster_qvotec_get_self_incarnation() == incarnation
-		   && cluster_membership_get_state(cluster_node_id) == CLUSTER_MEMBER_MEMBER
-		   && cluster_membership_get_last_admitted_incarnation(cluster_node_id) == incarnation
-		   && cluster_wal_thread_dir_validated()
-		   && cluster_wal_thread_id() == (uint16)(cluster_node_id + 1)
-		   && !cluster_reconfig_has_pending_prebump_stage() && cluster_serving_ready_is_current()
-		   && cluster_write_fence_allowed() && cluster_epoch_get_current() == epoch;
+	bool pending = false;
+	bool serving;
+
+	if (!cluster_shared_config || !cluster_enabled || !cluster_controlfile_shared_authority
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES || epoch == 0
+		|| incarnation == 0 || cluster_qvotec_get_self_incarnation() != incarnation
+		|| cluster_membership_get_state(cluster_node_id) != CLUSTER_MEMBER_MEMBER
+		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id) != incarnation
+		|| !cluster_wal_thread_dir_validated()
+		|| cluster_wal_thread_id() != (uint16)(cluster_node_id + 1)
+		|| cluster_reconfig_has_pending_prebump_stage())
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	serving = cluster_serving_ready_check(&pending, NULL);
+	if ((!serving && !pending) || !cluster_write_fence_allowed()
+		|| cluster_epoch_get_current() != epoch)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	/* A read cannot invent admission. Only the configuration owner that
+	 * already checked its exact cut under CF-X may finish that operation
+	 * across a refresh overlap; known loss above always wins. */
+	return pending && !admitted ? CLUSTER_CONTROL_ROOT_ADMISSION_PENDING
+								: CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
 static ClusterControlRootResult
@@ -2468,6 +2480,7 @@ read_runtime_local_version(ControlFileData *out, uint16 version)
 	ClusterControlRootIdentity self;
 	ClusterControlRootFileToken token;
 	ClusterControlRootResult result;
+	ClusterControlRootResult owner_result;
 	uint8 storage_uuid[16];
 	uint64 epoch, incarnation, sysid;
 	int node;
@@ -2484,8 +2497,9 @@ read_runtime_local_version(ControlFileData *out, uint16 version)
 	node = cluster_node_id;
 	epoch = cluster_epoch_get_current();
 	incarnation = cluster_qvotec_get_self_incarnation();
-	if (!runtime_v2_owner_current(epoch, incarnation))
-		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = runtime_v2_owner_check(epoch, incarnation, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
 	if (!current_storage_uuid(storage_uuid))
 		return CLUSTER_CONTROL_ROOT_STORAGE_CONTRACT_UNVERIFIED;
 	sysid = GetSystemIdentifier();
@@ -2516,8 +2530,9 @@ read_runtime_local_version(ControlFileData *out, uint16 version)
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		goto done;
-	if (!runtime_v2_owner_current(epoch, incarnation)) {
-		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	owner_result = runtime_v2_owner_check(epoch, incarnation, false);
+	if (owner_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		result = owner_result;
 		goto done;
 	}
 	*out = thread;
@@ -2732,6 +2747,7 @@ read_retention_version(const ClusterControlRootIdentity *self, ClusterControlRoo
 	ClusterControlRootFileToken file_token;
 	ClusterControlRootReadToken selected;
 	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	ClusterControlRootResult owner_result;
 	volatile bool held = false;
 	uint64 epoch, incarnation;
 	uint32 index;
@@ -2752,11 +2768,14 @@ read_retention_version(const ClusterControlRootIdentity *self, ClusterControlRoo
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	epoch = cluster_epoch_get_current();
 	incarnation = cluster_qvotec_get_self_incarnation();
-	if (!runtime_v2_owner_current(epoch, incarnation)
-		|| expected.origin_owner_incarnation != incarnation)
+	if (expected.origin_owner_incarnation != incarnation)
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = runtime_v2_owner_check(epoch, incarnation, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
 	index = expected.origin_thread_id - 1;
 	root = palloc(sizeof(*root));
+	result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	PG_TRY();
 	{
 		if (cluster_cf_lock(ShareLock)) {
@@ -2771,11 +2790,14 @@ read_retention_version(const ClusterControlRootIdentity *self, ClusterControlRoo
 						|| (root->header.v2.serving[index / 64] & (UINT64_C(1) << (index % 64)))
 							   == 0)
 						result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
-					else if (!runtime_v2_owner_current(epoch, incarnation))
-						result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-					else
-						make_read_token(root, expected.origin_thread_id,
-										CONTROL_ROOT_SOURCE_PRIMARY, &selected);
+					else {
+						owner_result = runtime_v2_owner_check(epoch, incarnation, false);
+						if (owner_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+							result = owner_result;
+						else
+							make_read_token(root, expected.origin_thread_id,
+											CONTROL_ROOT_SOURCE_PRIMARY, &selected);
+					}
 				}
 			}
 			result = release_cf(ShareLock, result);
@@ -4328,11 +4350,15 @@ file_token_equal(const ClusterControlRootFileToken *left, const ClusterControlRo
  */
 static bool
 checkpoint_v2_owner_current(const ClusterControlRootIdentity *self, uint64 epoch, TimeLineID tli,
-							XLogRecPtr checkpoint_end)
+							XLogRecPtr checkpoint_end, bool admitted, bool *pending)
 {
+	bool observation_pending = false;
+	bool serving;
 	TimeLineID flushed_tli = 0;
 	XLogRecPtr flushed;
 
+	if (pending != NULL)
+		*pending = false;
 	if (!AmCheckpointerProcess() || !cluster_enabled || !cluster_controlfile_shared_authority
 		|| self->origin_node_id != cluster_node_id || cluster_node_id < 0
 		|| cluster_node_id >= CLUSTER_MAX_NODES
@@ -4344,8 +4370,18 @@ checkpoint_v2_owner_current(const ClusterControlRootIdentity *self, uint64 epoch
 			   != self->origin_owner_incarnation
 		|| !cluster_wal_thread_dir_validated() || cluster_wal_thread_id() != self->origin_thread_id
 		|| cluster_epoch_get_current() != epoch || cluster_reconfig_has_pending_prebump_stage()
-		|| !cluster_serving_ready_is_current() || !cluster_write_fence_allowed())
+		|| !cluster_write_fence_allowed())
 		return false;
+	serving = cluster_serving_ready_check(&observation_pending, NULL);
+	if (!serving && !(admitted && observation_pending)) {
+		if (pending != NULL)
+			*pending = observation_pending;
+		return false;
+	}
+	/* Only this already-admitted owner may finish through an incomplete
+	 * refresh. A new call cannot inherit it. Known loss still rejects, and
+	 * every identity, fence, WAL and durable ROOT check remains independent.
+	 * Never wait under CF or restart an already durable publication. */
 	flushed = GetFlushRecPtr(&flushed_tli);
 	return flushed_tli == tli && flushed >= checkpoint_end && cluster_epoch_get_current() == epoch;
 }
@@ -4368,6 +4404,7 @@ typedef struct ConfigPublishWork {
 	uint64 incarnation;
 	uint8 storage_uuid[16];
 	bool changed;
+	bool admitted;
 } ConfigPublishWork;
 
 static void
@@ -4391,8 +4428,9 @@ config_publish_read(ConfigPublishWork *work, ControlRootImage *root,
 	ClusterControlRootIdentity self;
 	int node = cluster_node_id;
 
-	if (!runtime_v2_owner_current(work->epoch, work->incarnation))
-		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = runtime_v2_owner_check(work->epoch, work->incarnation, work->admitted);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
 	result = read_control_version(work->storage_uuid, GetSystemIdentifier(), root, &work->thread,
 								  token, CONTROL_ROOT_HEADER_VERSION_V3);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
@@ -4421,8 +4459,9 @@ config_publish_read(ConfigPublishWork *work, ControlRootImage *root,
 		return result;
 	if (work->thread.state != DB_IN_PRODUCTION)
 		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
-	if (!runtime_v2_owner_current(work->epoch, work->incarnation))
-		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = runtime_v2_owner_check(work->epoch, work->incarnation, work->admitted);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
 	if (initial)
 		work->self = self;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
@@ -5041,8 +5080,9 @@ config_publish_work(ConfigPublishWork *work, const ClusterSharedConfigEntry *cha
 	cluster_shared_config_free(&work->image);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	if (!runtime_v2_owner_current(work->epoch, work->incarnation))
-		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = runtime_v2_owner_check(work->epoch, work->incarnation, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
 	work->cf_mode = ExclusiveLock;
 	if (!acquire_clusterwide_cf(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
@@ -5051,6 +5091,9 @@ config_publish_work(ConfigPublishWork *work, const ClusterSharedConfigEntry *cha
 		return result;
 	if (!file_token_equal(&work->before, &observed))
 		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	/* This exact owner and ROOT are qualified while CF-X remains held.
+	 * A later refresh overlap may not restart a durable publication. */
+	work->admitted = true;
 	if (!work->changed) {
 		work->after = observed;
 		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
@@ -5072,8 +5115,9 @@ config_publish_work(ConfigPublishWork *work, const ClusterSharedConfigEntry *cha
 	result = encode_extended_image(&work->next, CONTROL_ROOT_HEADER_VERSION_V3);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	if (!runtime_v2_owner_current(work->epoch, work->incarnation))
-		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = runtime_v2_owner_check(work->epoch, work->incarnation, work->admitted);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
 	if (!publish_updated_image(&work->base, &work->next))
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
 	/* Post-read, never rollback. A failed write or caller cancellation can
@@ -5088,9 +5132,8 @@ config_publish_work(ConfigPublishWork *work, const ClusterSharedConfigEntry *cha
 		return CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
 	work->ref = installed;
 	result = cluster_cf_control_projection_write_locked(&work->thread);
-	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-		&& !runtime_v2_owner_current(work->epoch, work->incarnation))
-		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result = runtime_v2_owner_check(work->epoch, work->incarnation, work->admitted);
 	return result;
 }
 
@@ -5120,7 +5163,10 @@ cluster_control_root_config_change(const ClusterSharedConfigEntry *change,
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	epoch = cluster_epoch_get_current();
 	incarnation = cluster_qvotec_get_self_incarnation();
-	if (!runtime_v2_owner_current(epoch, incarnation) || !current_storage_uuid(uuid))
+	result = runtime_v2_owner_check(epoch, incarnation, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!current_storage_uuid(uuid))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = storage_contract_check(uuid, true);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -5156,6 +5202,7 @@ typedef enum CheckpointV2Purpose {
 } CheckpointV2Purpose;
 
 typedef struct CheckpointV2Work {
+	bool serving_admitted;
 	CheckpointV2Purpose purpose;
 	uint16 format_version;
 	ControlRootImage base;
@@ -7612,7 +7659,8 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		return result;
 	if (!checkpoint_v2_wal_paths_current(work, self)
-		|| !checkpoint_v2_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end))
+		|| !checkpoint_v2_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end,
+										work->serving_admitted, NULL))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (!file_token_equal(&work->before, &actual))
 		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
@@ -7666,7 +7714,8 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (!checkpoint_v2_wal_paths_current(work, self)
-		|| !checkpoint_v2_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end))
+		|| !checkpoint_v2_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end,
+										work->serving_admitted, NULL))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = checkpoint_v2_input_observe(work, cf, end, crc);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -7692,7 +7741,8 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 			return CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
 	}
 	if (!checkpoint_v2_wal_paths_current(work, self)
-		|| !checkpoint_v2_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end))
+		|| !checkpoint_v2_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end,
+										work->serving_admitted, NULL))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = checkpoint_v2_input_observe(work, cf, end, crc);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -7712,6 +7762,7 @@ checkpoint_v2_publish(CheckpointV2Purpose purpose, const ClusterControlRootIdent
 	CheckpointV2Work *work;
 	ClusterControlRootResult result;
 	uint64 epoch;
+	bool pending = false;
 
 	if (out_control != NULL && out_control == thread_control)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
@@ -7748,9 +7799,11 @@ checkpoint_v2_publish(CheckpointV2Purpose purpose, const ClusterControlRootIdent
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	epoch = cluster_epoch_get_current();
 	if (!checkpoint_v2_owner_current(self, epoch, thread_control->checkPointCopy.ThisTimeLineID,
-									 checkpoint_end))
-		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+									 checkpoint_end, false, &pending))
+		return pending ? CLUSTER_CONTROL_ROOT_ADMISSION_PENDING
+					   : CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	work = palloc0(sizeof(*work));
+	work->serving_admitted = true;
 	work->purpose = purpose;
 	work->format_version = version;
 	for (size_t i = 0; i < lengthof(work->wal_dirs); ++i)
@@ -9263,10 +9316,12 @@ cluster_control_root_v3_self_seal_v1(const ClusterWalSourceRef *restart, uint64 
  * facts. Generic root views deliberately still report IN_PRODUCTION here.
  * Author: SqlRush <sqlrush@gmail.com> */
 static bool
-shutdown_v2_owner_current(const ClusterWalSourceRef *expected, uint64 epoch, XLogRecPtr end)
+shutdown_v2_owner_current(const ClusterWalSourceRef *expected, uint64 epoch, XLogRecPtr end,
+						  bool admitted)
 {
 	return ShutdownRequestPending
-		   && checkpoint_v2_owner_current(&expected->claim.identity, epoch, expected->timeline, end)
+		   && checkpoint_v2_owner_current(&expected->claim.identity, epoch, expected->timeline, end,
+										  admitted, NULL)
 		   /* The next record START skips a page header at an exact boundary;
 			* only the reserved END is comparable with this record's end. */
 		   && GetXLogInsertEndRecPtr() == end;
@@ -9343,7 +9398,7 @@ shutdown_v2_observe_work(CheckpointV2Work *work, const ClusterWalSourceRef *expe
 		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
 	if (work->format_version >= 3)
 		work->retained_lower = record->checkpoint_lower_lsn;
-	if (!shutdown_v2_owner_current(expected, epoch, end))
+	if (!shutdown_v2_owner_current(expected, epoch, end, work->serving_admitted))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (close_plan != NULL && record->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED) {
 		ClusterControlRootStopPhase phase;
@@ -9394,7 +9449,7 @@ shutdown_v2_observe_work(CheckpointV2Work *work, const ClusterWalSourceRef *expe
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (!checkpoint_v2_wal_paths_current(work, self)
-		|| !shutdown_v2_owner_current(expected, epoch, end))
+		|| !shutdown_v2_owner_current(expected, epoch, end, work->serving_admitted))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
@@ -9407,6 +9462,7 @@ shutdown_observe_version(const ClusterWalSourceRef *expected, ClusterControlRoot
 	ClusterWalSourceRef ref;
 	ClusterControlRootResult result;
 	uint64 epoch;
+	bool pending = false;
 	if (expected != NULL)
 		ref = *expected;
 	if (out != NULL)
@@ -9422,9 +9478,10 @@ shutdown_observe_version(const ClusterWalSourceRef *expected, ClusterControlRoot
 	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	epoch = cluster_epoch_get_current();
-	if (!checkpoint_v2_owner_current(&ref.claim.identity, epoch, ref.timeline, 0))
-		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (!checkpoint_v2_owner_current(&ref.claim.identity, epoch, ref.timeline, 0, false, &pending))
+		return pending ? CLUSTER_CONTROL_ROOT_ADMISSION_PENDING : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	work = palloc0(sizeof(*work));
+	work->serving_admitted = true;
 	work->purpose = CHECKPOINT_V2_SHUTDOWN_EVIDENCE;
 	work->format_version = version;
 	for (size_t i = 0; i < lengthof(work->wal_dirs); ++i)
@@ -9551,7 +9608,8 @@ normal_stop_v2_publish_work(CheckpointV2Work *work, const ClusterWalSourceRef *r
 		return result;
 	if (!cluster_normal_stop_durable_close_owned(plan)
 		|| !checkpoint_v2_wal_paths_current(work, self)
-		|| !shutdown_v2_owner_current(ref, plan->epoch, own->validated_tail_lsn_exclusive))
+		|| !shutdown_v2_owner_current(ref, plan->epoch, own->validated_tail_lsn_exclusive,
+									  work->serving_admitted))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = checkpoint_v2_input_observe(work, &work->old_view, own->validated_tail_lsn_exclusive,
 										 work->checkpoint_crc);
@@ -9567,7 +9625,8 @@ normal_stop_v2_publish_work(CheckpointV2Work *work, const ClusterWalSourceRef *r
 	if (memcmp(work->base.bytes, work->next.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
 		return CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
 	if (!cluster_normal_stop_durable_close_owned(plan)
-		|| !shutdown_v2_owner_current(ref, plan->epoch, own->validated_tail_lsn_exclusive))
+		|| !shutdown_v2_owner_current(ref, plan->epoch, own->validated_tail_lsn_exclusive,
+									  work->serving_admitted))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	return cluster_cf_control_projection_write_locked(&work->new_view);
 }
@@ -9580,6 +9639,7 @@ normal_stop_close_version(const ClusterPhase1FullStopPlan *plan, bool *all_close
 	ClusterControlRootResult result;
 	uint64 members = 0;
 	bool complete = false;
+	bool pending = false;
 	int index;
 
 	if (all_closed != NULL)
@@ -9597,12 +9657,14 @@ normal_stop_close_version(const ClusterPhase1FullStopPlan *plan, bool *all_close
 	if (index >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT || ref.claim.identity.origin_node_id != index
 		|| plan->member_incarnations[index] != ref.claim.identity.origin_owner_incarnation
 		|| plan->own_wal_started_at != ref.claim.identity.thread_claim_created_at
-		|| !checkpoint_v2_owner_current(&ref.claim.identity, plan->epoch, ref.timeline, 0))
-		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		|| !checkpoint_v2_owner_current(&ref.claim.identity, plan->epoch, ref.timeline, 0, false,
+										&pending))
+		return pending ? CLUSTER_CONTROL_ROOT_ADMISSION_PENDING : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	for (int node = 0; node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; node++)
 		if (plan->member_incarnations[node] != 0)
 			members |= UINT64_C(1) << node;
 	work = palloc0(sizeof(*work));
+	work->serving_admitted = true;
 	work->purpose = CHECKPOINT_V2_SHUTDOWN_EVIDENCE;
 	work->format_version = version;
 	for (size_t i = 0; i < lengthof(work->wal_dirs); ++i)
@@ -9626,7 +9688,8 @@ normal_stop_close_version(const ClusterPhase1FullStopPlan *plan, bool *all_close
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& (!cluster_normal_stop_durable_close_owned(plan)
 			|| !shutdown_v2_owner_current(&ref, plan->epoch,
-										  work->base.records[index].validated_tail_lsn_exclusive)))
+										  work->base.records[index].validated_tail_lsn_exclusive,
+										  work->serving_admitted)))
 		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		*all_closed = complete;
@@ -9720,7 +9783,8 @@ retained_lower_publish_work(CheckpointV2Work *work, const ClusterControlRootIden
 	if (work->base.header.file_txn_seq == UINT64_MAX || record->root_publish_seq == UINT64_MAX)
 		return CLUSTER_CONTROL_ROOT_SEQUENCE_EXHAUSTED;
 	if (!checkpoint_v2_owner_current(self, epoch, record->checkpoint_tli,
-									 record->validated_tail_lsn_exclusive))
+									 record->validated_tail_lsn_exclusive, work->serving_admitted,
+									 NULL))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	make_read_token(&work->base, self->origin_thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
 					&work->thread_token);
@@ -9744,7 +9808,8 @@ retained_lower_publish_work(CheckpointV2Work *work, const ClusterControlRootIden
 		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
 	record = &work->next.records[index];
 	if (!checkpoint_v2_owner_current(self, epoch, record->checkpoint_tli,
-									 record->validated_tail_lsn_exclusive))
+									 record->validated_tail_lsn_exclusive, work->serving_admitted,
+									 NULL))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	record->checkpoint_lower_lsn = lower;
 	record->root_publish_seq++;
@@ -9779,6 +9844,7 @@ cluster_control_root_v3_retained_lower_publish(const ClusterControlRootIdentity 
 	ClusterControlRootSnapshot published;
 	ClusterControlRootResult result;
 	uint64 epoch;
+	bool pending = false;
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
@@ -9793,7 +9859,10 @@ cluster_control_root_v3_retained_lower_publish(const ClusterControlRootIdentity 
 	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	epoch = cluster_epoch_get_current();
+	if (!cluster_serving_ready_check(&pending, NULL))
+		return pending ? CLUSTER_CONTROL_ROOT_ADMISSION_PENDING : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	work = palloc0(sizeof(*work));
+	work->serving_admitted = true;
 	work->purpose = CHECKPOINT_V2_ONLINE;
 	work->format_version = 3;
 	for (size_t i = 0; i < lengthof(work->wal_dirs); ++i)

@@ -243,7 +243,9 @@ typedef enum ClusterControlRootResult {
 	/* Native group-flush only: no ACK; release WALWriteLock before waiting. */
 	CLUSTER_CONTROL_ROOT_RECONFIG_WAIT = 28,
 	/* Valid historical input that this shared recovery profile cannot consume. */
-	CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED = 29
+	CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED = 29,
+	/* No operation admitted and no ROOT mutation; retry outside all holds. */
+	CLUSTER_CONTROL_ROOT_ADMISSION_PENDING = 30
 } ClusterControlRootResult;
 
 typedef struct ClusterControlRootMigrationImage {

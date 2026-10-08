@@ -374,6 +374,7 @@ extern void cluster_ic_tier1_anon_hello_reset(int anon_slot);
  * CRC OK) bumps heartbeat_recv_count + last_heartbeat_recv_at.
  * Returns false on hard recv error (caller should close_peer).
  */
+extern bool cluster_ic_tier1_recv_dispatch_pending(int32 peer_id);
 extern bool cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd);
 
 /*

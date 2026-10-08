@@ -2840,6 +2840,14 @@ cluster_ic_tier1_hello_send_remaining(int32 peer_id)
  *   Returns true on EAGAIN (drained for now).
  */
 bool
+cluster_ic_tier1_recv_dispatch_pending(int32 peer_id)
+{
+	return peer_id >= 0 && peer_id < CLUSTER_MAX_NODES
+		   && tier1_recv_buf_len[peer_id] == PGRAC_IC_ENVELOPE_BYTES
+		   && tier1_recv_payload_filled[peer_id] == tier1_recv_payload_total[peer_id];
+}
+
+bool
 cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 {
 	uint32 frames_consumed = 0;
@@ -2851,6 +2859,11 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 
 	for (;;) {
 		ssize_t got;
+
+		/* A complete PENDING frame is already owned by these buffers. It
+		 * needs no new socket edge; the DATA loop revisits it every pass. */
+		if (cluster_ic_tier1_recv_dispatch_pending(peer_id))
+			goto verify_and_dispatch;
 
 		/*
 		 * spec-2.4 hardening v1.0.1 F1 (L76 register-vs-handler-signature-coupling):
@@ -3071,15 +3084,22 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 			 * peer_id (signature change) so msg_type=255 chunk fast path
 			 * can route to chunk_dispatch_frame with caller's known peer.
 			 */
-		if (!cluster_ic_dispatch_envelope(&env, payload, peer_id)) {
-			peer_record_error(peer_id, 0, "08P01",
-							  "envelope msg_type %u not registered (sender %u)", env.msg_type,
-							  env.source_node_id);
-			tier1_recv_buf_len[peer_id] = 0;
-			tier1_recv_phase[peer_id] = 0;
-			tier1_recv_payload_filled[peer_id] = 0;
-			tier1_recv_payload_total[peer_id] = 0;
-			return false;
+		{
+			ClusterICDispatchResult dispatched
+				= cluster_ic_dispatch_envelope(&env, payload, peer_id);
+
+			if (dispatched == CLUSTER_IC_DISPATCH_PENDING)
+				return true; /* retain bytes; never report peer failure */
+			if (dispatched == CLUSTER_IC_DISPATCH_REJECTED) {
+				peer_record_error(peer_id, 0, "08P01",
+								  "envelope msg_type %u not registered (sender %u)", env.msg_type,
+								  env.source_node_id);
+				tier1_recv_buf_len[peer_id] = 0;
+				tier1_recv_phase[peer_id] = 0;
+				tier1_recv_payload_filled[peer_id] = 0;
+				tier1_recv_payload_total[peer_id] = 0;
+				return false;
+			}
 		}
 
 		/*

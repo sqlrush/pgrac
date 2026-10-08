@@ -184,6 +184,11 @@ typedef struct ClusterQvotecShmem {
 	ClusterQvotecPriorExitObservation prior_exit;
 	ClusterStorageQuorumState storage_quorum;
 	pg_atomic_uint64 wakeup_latch;
+	pg_atomic_uint64 admission_sequence;
+	pg_atomic_uint64 admission_loss_generation;
+	pg_atomic_uint64 admission_lease_sampled_us;
+	pg_atomic_uint64 admission_lease_expires_us;
+	pg_atomic_uint64 admission_lease_loss_reported;
 	/* Volatile diagnostics, excluded from every permission predicate. */
 	pg_atomic_uint64 diagnostic_cycle_started_mono_us;
 	pg_atomic_uint64 diagnostic_cycle_finished_mono_us;
@@ -500,14 +505,87 @@ qvotec_pgstat_lookup_all(void)
  */
 #define QVOTEC_LEASE_POLL_PERIODS 30
 
+/* One QVOTEC writer owns the counter. Observers can only latch a proven
+ * negative lease observation for that owner to consume, never clear it.
+ * Unknown/overflow is sticky until postmaster reinitialization. */
+static void
+qvotec_admission_note_loss(void)
+{
+	uint64 generation = pg_atomic_read_u64(&QvotecShmem->admission_loss_generation);
+
+	pg_atomic_write_u64(&QvotecShmem->admission_loss_generation,
+						generation == 0 || generation == UINT64_MAX ? UINT64_MAX : generation + 1);
+}
+
+static uint64
+qvotec_admission_publish_begin(bool lost)
+{
+	uint64 sequence = pg_atomic_read_u64(&QvotecShmem->admission_sequence);
+
+	pg_atomic_write_u64(&QvotecShmem->admission_sequence,
+						(sequence & 1) == 0 && sequence < UINT64_MAX - 1 ? sequence + 1
+																		 : UINT64_MAX);
+	pg_write_barrier();
+	if (lost)
+		qvotec_admission_note_loss();
+	return sequence;
+}
+
+static void
+qvotec_admission_publish_end(uint64 sequence)
+{
+	pg_write_barrier();
+	pg_atomic_write_u64(&QvotecShmem->admission_sequence,
+						(sequence & 1) == 0 && sequence < UINT64_MAX - 1 ? sequence + 2
+																		 : UINT64_MAX);
+}
+
+static void
+qvotec_publish_quorum_state(uint32 state)
+{
+	uint64 sequence = qvotec_admission_publish_begin(state != CLUSTER_QVOTEC_QUORUM_OK);
+
+	pg_atomic_write_u32(&QvotecShmem->quorum_state, state);
+	qvotec_admission_publish_end(sequence);
+}
+
 static void
 qvotec_publish_poll_lease(uint64 now_us)
 {
-	uint64 next_lease_expire
-		= now_us + (uint64)cluster_quorum_poll_interval_ms * QVOTEC_LEASE_POLL_PERIODS * 1000ULL;
+	uint64 duration_us
+		= (uint64)cluster_quorum_poll_interval_ms * QVOTEC_LEASE_POLL_PERIODS * 1000ULL;
+	uint64 next_lease_expire = now_us + duration_us;
+	uint64 previous_expiry = pg_atomic_read_u64(&QvotecShmem->lease_expire_at_us);
+	uint64 previous_poll = pg_atomic_read_u64(&QvotecShmem->last_poll_ts_us);
+	uint64 previous_mono = pg_atomic_read_u64(&QvotecShmem->admission_lease_sampled_us);
+	uint64 previous_mono_expiry = pg_atomic_read_u64(&QvotecShmem->admission_lease_expires_us);
+	uint64 sequence = qvotec_admission_publish_begin(false);
+	uint64 monotonic_at = cluster_storage_quorum_now_us();
+	uint64 published_at = (uint64)GetCurrentTimestamp();
+	uint64 remaining
+		= next_lease_expire > published_at ? Min(next_lease_expire - published_at, duration_us) : 0;
+	uint64 monotonic_expiry
+		= monotonic_at != 0 && remaining != 0 && monotonic_at <= UINT64_MAX - remaining
+			  ? monotonic_at + remaining
+			  : 0;
+	/* Exchange only while publication is odd. A later observer report remains
+	 * pending; neither reattachment nor a wall-clock rollback can erase it. */
+	uint64 reported_loss = pg_atomic_exchange_u64(&QvotecShmem->admission_lease_loss_reported, 0);
+
+	/* Evaluate expiry while the old publication is inaccessible. A delayed
+	 * writer cannot erase a gap; wall-clock rollback cannot revive the new
+	 * continuity evidence. The original wall-clock lease is unchanged. */
+	if (reported_loss != 0 || previous_expiry == 0 || published_at >= previous_expiry
+		|| now_us < previous_poll || published_at < previous_poll || next_lease_expire <= now_us
+		|| monotonic_expiry == 0 || previous_mono == 0 || monotonic_at < previous_mono
+		|| monotonic_at >= previous_mono_expiry)
+		qvotec_admission_note_loss();
 
 	pg_atomic_write_u64(&QvotecShmem->last_poll_ts_us, now_us);
 	pg_atomic_write_u64(&QvotecShmem->lease_expire_at_us, next_lease_expire);
+	pg_atomic_write_u64(&QvotecShmem->admission_lease_sampled_us, monotonic_at);
+	pg_atomic_write_u64(&QvotecShmem->admission_lease_expires_us, monotonic_expiry);
+	qvotec_admission_publish_end(sequence);
 }
 
 /*
@@ -864,6 +942,11 @@ cluster_qvotec_shmem_init(void)
 		QvotecShmem->prior_exit_pad = 0;
 		memset(&QvotecShmem->prior_exit, 0, sizeof(QvotecShmem->prior_exit));
 		pg_atomic_init_u64(&QvotecShmem->wakeup_latch, 0);
+		pg_atomic_init_u64(&QvotecShmem->admission_sequence, 0);
+		pg_atomic_init_u64(&QvotecShmem->admission_loss_generation, 1);
+		pg_atomic_init_u64(&QvotecShmem->admission_lease_sampled_us, 0);
+		pg_atomic_init_u64(&QvotecShmem->admission_lease_expires_us, 0);
+		pg_atomic_init_u64(&QvotecShmem->admission_lease_loss_reported, 0);
 		pg_atomic_init_u64(&QvotecShmem->diagnostic_cycle_started_mono_us, 0);
 		pg_atomic_init_u64(&QvotecShmem->diagnostic_cycle_finished_mono_us, 0);
 		pg_atomic_init_u64(&QvotecShmem->diagnostic_phase_started_mono_us, 0);
@@ -888,8 +971,13 @@ qvotec_clear_wakeup_latch(int code pg_attribute_unused(), Datum arg)
 {
 	uint64 expected = (uint64)(uintptr_t)DatumGetPointer(arg);
 
-	if (QvotecShmem != NULL)
-		(void)pg_atomic_compare_exchange_u64(&QvotecShmem->wakeup_latch, &expected, 0);
+	if (QvotecShmem != NULL && pg_atomic_read_u64(&QvotecShmem->wakeup_latch) == expected) {
+		uint64 sequence = qvotec_admission_publish_begin(false);
+
+		if (pg_atomic_compare_exchange_u64(&QvotecShmem->wakeup_latch, &expected, 0))
+			qvotec_admission_note_loss();
+		qvotec_admission_publish_end(sequence);
+	}
 }
 
 static void
@@ -899,7 +987,12 @@ qvotec_register_wakeup_latch(void)
 		return;
 	/* Clear before PGPROC release; a delayed old exit cannot clear a new owner. */
 	before_shmem_exit(qvotec_clear_wakeup_latch, PointerGetDatum(MyLatch));
-	pg_atomic_write_u64(&QvotecShmem->wakeup_latch, (uint64)(uintptr_t)MyLatch);
+	{
+		uint64 sequence = qvotec_admission_publish_begin(true);
+
+		pg_atomic_write_u64(&QvotecShmem->wakeup_latch, (uint64)(uintptr_t)MyLatch);
+		qvotec_admission_publish_end(sequence);
+	}
 }
 
 static const ClusterShmemRegion cluster_qvotec_region = {
@@ -1239,23 +1332,32 @@ qvotec_admission_denied(unsigned int diagnostic_bit, const char *reason, uint32 
 /* Keep the predicate's own inputs. A second snapshot here could hide the
  * rejection after a concurrent QVOTEC publication. This is evidence only. */
 static bool
-qvotec_storage_admission_denied(uint32 state, const ClusterStorageQuorumCheck *check)
+qvotec_storage_admission_denied(uint32 state, const ClusterStorageQuorumCheck *check, bool pending)
 {
 	static pid_t reported_pid;
+	static uint32 reported_categories;
 	pid_t pid = getpid();
+	uint32 category = pending ? 1 : 2;
 
 	if (reported_pid != pid) {
 		reported_pid = pid;
+		reported_categories = 0;
+	}
+	if ((reported_categories & category) == 0) {
+		reported_categories |= category;
 		ereport(
 			LOG,
 			(errmsg_internal(
 				"PGRAC_FAMILY=STORAGE_QUORUM_CAPTURE node=%d target=%d result=%u stable=%d "
 				"attempts=%u sequence_before=%u sequence_after=%u now_us=%llu "
+				"snapshot_stop=%u wait_count=%u wait_started_us=%llu wait_sampled_us=%llu "
 				"reason=%u ring_node=%u ring_sequence=%llu members_lo=%016llx members_hi=%016llx "
 				"generation=%llu sampled_us=%llu expires_us=%llu provider_step=%u provider_rc=%u",
 				check->self_node, check->target_node, (unsigned int)check->result, check->stable,
 				check->attempts, check->sequence_before, check->sequence_after,
-				(unsigned long long)check->now_us, (unsigned int)check->view.reason,
+				(unsigned long long)check->now_us, (unsigned int)check->snapshot_stop,
+				check->wait_count, (unsigned long long)check->wait_started_us,
+				(unsigned long long)check->wait_sampled_us, (unsigned int)check->view.reason,
 				check->view.ring_node, (unsigned long long)check->view.ring_sequence,
 				(unsigned long long)check->view.members[0],
 				(unsigned long long)check->view.members[1],
@@ -1264,16 +1366,23 @@ qvotec_storage_admission_denied(uint32 state, const ClusterStorageQuorumCheck *c
 				(unsigned long long)check->view.expires_us, check->view.provider_diagnostic >> 16,
 				check->view.provider_diagnostic & UINT32_C(0xffff))));
 	}
-	return qvotec_admission_denied(7, "STORAGE_INELIGIBLE", state, 0, 0);
+	return qvotec_admission_denied(pending ? 8 : 7,
+								   pending ? "STORAGE_OBSERVATION_PENDING" : "STORAGE_INELIGIBLE",
+								   state, 0, 0);
 }
 
-bool
-cluster_qvotec_in_quorum(void)
+static bool
+qvotec_admission_sample(ClusterQvotecAdmissionCheck *out, uint64 sequence)
 {
 	uint64 now_us;
 	uint64 lease_expire;
 	uint32 q;
 	ClusterStorageQuorumCheck storage_check;
+	bool storage_allowed;
+	bool storage_pending;
+
+	if (out != NULL)
+		out->result = CLUSTER_QVOTEC_ADMISSION_NO_SHMEM;
 
 	/* Disable-cluster / pre-shmem path: fail-closed. */
 	if (QvotecShmem == NULL)
@@ -1281,10 +1390,16 @@ cluster_qvotec_in_quorum(void)
 
 	/* Process-local frozen flag set by ProcSignal handler — wins
 	 * regardless of lease state (defensive double-gate). */
+	if (out != NULL)
+		out->result = CLUSTER_QVOTEC_ADMISSION_FROZEN;
 	if (cluster_writes_frozen)
 		return qvotec_admission_denied(1, "WRITES_FROZEN", 0, 0, 0);
 
 	q = pg_atomic_read_u32(&QvotecShmem->quorum_state);
+	if (out != NULL) {
+		out->result = CLUSTER_QVOTEC_ADMISSION_DB_STATE;
+		out->quorum_state = q;
+	}
 	if (q != CLUSTER_QVOTEC_QUORUM_OK) {
 		switch (q) {
 		case CLUSTER_QVOTEC_QUORUM_INITIALIZING:
@@ -1299,15 +1414,211 @@ cluster_qvotec_in_quorum(void)
 	}
 
 	/* Storage membership narrows admission without replacing disk evidence. */
-	if (!cluster_storage_quorum_check_node(cluster_node_id, &storage_check))
-		return qvotec_storage_admission_denied(q, &storage_check);
+	storage_allowed = cluster_storage_quorum_check_node_once(cluster_node_id, &storage_check);
+	storage_pending = storage_check.result == CLUSTER_STORAGE_CHECK_UNSTABLE
+					  && (storage_check.snapshot_stop == CLUSTER_STORAGE_SNAPSHOT_DEADLINE
+						  || storage_check.snapshot_stop == CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT);
+	if (out != NULL) {
+		out->result = CLUSTER_QVOTEC_ADMISSION_STORAGE;
+		out->storage = storage_check;
+	}
+	if (!storage_allowed && !storage_pending)
+		return qvotec_storage_admission_denied(q, &storage_check, false);
 
 	lease_expire = pg_atomic_read_u64(&QvotecShmem->lease_expire_at_us);
 	now_us = (uint64)GetCurrentTimestamp();
-	if (now_us >= lease_expire)
-		return qvotec_admission_denied(6, "LEASE_EXPIRED", q, lease_expire, now_us);
+	if (out != NULL) {
+		out->result = CLUSTER_QVOTEC_ADMISSION_LEASE;
+		out->lease_expire_us = lease_expire;
+		out->now_us = now_us;
+	}
+	if (now_us >= lease_expire) {
+		/* Record only a refusal sampled from one stable publication. A timely
+		 * renewal interleaved with this old getter can cause its original bool
+		 * to reject, but is not evidence of a published qualification gap. */
+		uint64 after;
 
+		pg_read_barrier();
+		after = pg_atomic_read_u64(&QvotecShmem->admission_sequence);
+		if ((sequence & 1) == 0 && sequence == after)
+			pg_atomic_write_u64(&QvotecShmem->admission_lease_loss_reported, 1);
+		else if (cluster_shared_config && out != NULL && sequence != UINT64_MAX
+				 && after != UINT64_MAX) {
+			out->result = CLUSTER_QVOTEC_ADMISSION_ALLOWED;
+			out->continuity_pending = true;
+			return false;
+		}
+		return qvotec_admission_denied(6, "LEASE_EXPIRED", q, lease_expire, now_us);
+	}
+	/* An unfinished bounded observation does not establish storage loss, but
+	 * also cannot authorize work. Check the DB lease first so a known loss
+	 * cannot be hidden behind publication overlap. The original owner must
+	 * resample the whole admission; neither old views nor tokens are returned. */
+	if (storage_pending) {
+		if (out != NULL)
+			out->result = CLUSTER_QVOTEC_ADMISSION_STORAGE;
+		return false; /* Only the complete bounded attempt reports pending. */
+	}
+
+	if (out != NULL)
+		out->result = CLUSTER_QVOTEC_ADMISSION_ALLOWED;
 	return true;
+}
+
+
+static bool
+qvotec_check_admission_once(ClusterQvotecAdmissionCheck *out)
+{
+	uint64 sequence = UINT64_MAX;
+	uint64 generation = 0;
+	bool allowed;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	/* The legacy shared bool caller must report a proven lease refusal too:
+	 * a different consumer may next request continuity after wall time rolls back. */
+	if (QvotecShmem != NULL && (out != NULL || cluster_shared_config)) {
+		sequence = pg_atomic_read_u64(&QvotecShmem->admission_sequence);
+		pg_read_barrier();
+		if (out != NULL)
+			generation = pg_atomic_read_u64(&QvotecShmem->admission_loss_generation);
+	}
+	allowed = qvotec_admission_sample(out, sequence);
+	if (out != NULL && QvotecShmem != NULL && allowed) {
+		uint64 sampled_at = pg_atomic_read_u64(&QvotecShmem->admission_lease_sampled_us);
+		uint64 expires_at = pg_atomic_read_u64(&QvotecShmem->admission_lease_expires_us);
+		uint64 now = cluster_storage_quorum_now_us();
+		uint64 reported_loss = pg_atomic_read_u64(&QvotecShmem->admission_lease_loss_reported);
+		uint64 sequence_after;
+		bool stable;
+		bool lease_current = sampled_at != 0 && now >= sampled_at && now < expires_at;
+
+		pg_read_barrier();
+		sequence_after = pg_atomic_read_u64(&QvotecShmem->admission_sequence);
+		stable = (sequence & 1) == 0 && sequence == sequence_after;
+		out->continuity_pending = !stable && sequence != UINT64_MAX && sequence_after != UINT64_MAX;
+		/* A stable failed/reversed clock or elapsed monotonic lease is not
+		 * publication contention. Preserve it until the owner advances loss
+		 * history, even if another reader later observes a working clock. */
+		if (stable && !lease_current)
+			pg_atomic_write_u64(&QvotecShmem->admission_lease_loss_reported, 1);
+		out->continuity_valid
+			= stable && generation != 0 && generation != UINT64_MAX && reported_loss == 0
+			  && sampled_at != 0 && lease_current
+			  && (!cluster_shared_config
+				  || (out->storage.stable && out->storage.view.loss_generation != 0
+					  && out->storage.view.loss_generation != UINT64_MAX));
+		if (out->continuity_valid) {
+			out->continuity.quorum_generation = generation;
+			out->continuity.storage_generation
+				= cluster_shared_config ? out->storage.view.loss_generation : 0;
+		}
+	}
+	return allowed;
+}
+
+/* Match storage's four fast reads and ten 100us yields, with one 1ms
+ * monotonic budget for the entire sample. The inner storage copy never waits.
+ * No lease, request deadline, transport budget or owner state is extended. */
+bool
+cluster_qvotec_check_admission(ClusterQvotecAdmissionCheck *out)
+{
+	ClusterQvotecAdmissionCheck check;
+	uint64 started = 0;
+	uint64 last = 0;
+	uint64 sampled = 0;
+	uint32 attempts = 0;
+	uint32 waits = 0;
+	ClusterStorageSnapshotStop stop = CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT;
+	bool allowed = false;
+	int attempt;
+
+	if (!cluster_shared_config)
+		return qvotec_check_admission_once(out);
+	memset(&check, 0, sizeof(check));
+	for (attempt = 0; attempt < 14; attempt++) {
+		bool pending;
+
+		if (attempt >= 4) {
+			sampled = cluster_storage_quorum_now_us();
+			if (sampled == 0 || sampled < last)
+				goto clock_failure;
+			if (started == 0)
+				started = sampled;
+			last = sampled;
+			if (sampled - started >= 1000)
+				goto deadline;
+			waits++;
+			pg_usleep((long)Min(UINT64_C(100), 1000 - (sampled - started)));
+			sampled = cluster_storage_quorum_now_us();
+			if (sampled == 0 || sampled < last)
+				goto clock_failure;
+			last = sampled;
+			if (sampled - started >= 1000)
+				goto deadline;
+		}
+		attempts++;
+		allowed = qvotec_check_admission_once(&check);
+		pending = check.continuity_pending
+				  || (check.result == CLUSTER_QVOTEC_ADMISSION_STORAGE
+					  && check.storage.result == CLUSTER_STORAGE_CHECK_UNSTABLE
+					  && check.storage.snapshot_stop == CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT);
+		/* A known loss wins even if a publication was unfinished earlier. */
+		if (!pending) {
+			if (started != 0 && allowed) {
+				sampled = cluster_storage_quorum_now_us();
+				if (sampled == 0 || sampled < last || sampled < check.storage.now_us)
+					goto clock_failure;
+				if (sampled - started >= 1000) {
+					check.continuity_pending = true;
+					goto deadline;
+				}
+			}
+			if (out != NULL)
+				*out = check;
+			return allowed;
+		}
+	}
+	goto pending_or_unknown;
+
+deadline:
+	stop = CLUSTER_STORAGE_SNAPSHOT_DEADLINE;
+	goto pending_or_unknown;
+clock_failure:
+	/* A failed or reversed clock is not contention. Keep its loss history
+	 * sticky until the original publisher acknowledges it. */
+	stop = sampled == 0 ? CLUSTER_STORAGE_SNAPSHOT_CLOCK_UNAVAILABLE
+						: CLUSTER_STORAGE_SNAPSHOT_CLOCK_REGRESSED;
+	if (QvotecShmem != NULL)
+		pg_atomic_write_u64(&QvotecShmem->admission_lease_loss_reported, 1);
+	if (check.result != CLUSTER_QVOTEC_ADMISSION_STORAGE)
+		check.result = CLUSTER_QVOTEC_ADMISSION_LEASE;
+	check.continuity_pending = false;
+pending_or_unknown:
+	check.continuity_valid = false;
+	memset(&check.continuity, 0, sizeof(check.continuity));
+	if (check.result == CLUSTER_QVOTEC_ADMISSION_STORAGE
+		&& check.storage.result == CLUSTER_STORAGE_CHECK_UNSTABLE) {
+		/* The outer owner made these single-copy storage attempts. */
+		check.storage.attempts = attempts;
+		check.storage.wait_count = waits;
+		check.storage.wait_started_us = started;
+		check.storage.wait_sampled_us = sampled;
+		check.storage.snapshot_stop = stop;
+	}
+	if (check.result == CLUSTER_QVOTEC_ADMISSION_STORAGE
+		&& (stop == CLUSTER_STORAGE_SNAPSHOT_DEADLINE
+			|| stop == CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT))
+		(void)qvotec_storage_admission_denied(check.quorum_state, &check.storage, true);
+	if (out != NULL)
+		*out = check;
+	return false;
+}
+
+bool
+cluster_qvotec_in_quorum(void)
+{
+	return cluster_qvotec_check_admission(NULL);
 }
 
 
@@ -3799,7 +4110,7 @@ qvotec_poll_once(void)
 	 */
 	if (decision.collision_state == CLUSTER_COLLISION_FATAL_NEWER_SELF) {
 		pg_atomic_write_u32(&QvotecShmem->collision_state, (uint32)decision.collision_state);
-		pg_atomic_write_u32(&QvotecShmem->quorum_state, (uint32)CLUSTER_QVOTEC_QUORUM_LOST);
+		qvotec_publish_quorum_state(CLUSTER_QVOTEC_QUORUM_LOST);
 		cluster_pgstat_inc(qvotec_counter_collision);
 		if (have_apply_lease_request)
 			cluster_mrp_qvotec_complete_apply_lease_request(CLUSTER_MRP_APPLY_LEASE_SUBMIT_INVALID,
@@ -4205,7 +4516,7 @@ qvotec_poll_once(void)
 	{
 		uint32 prev_state = pg_atomic_read_u32(&QvotecShmem->quorum_state);
 
-		pg_atomic_write_u32(&QvotecShmem->quorum_state, (uint32)decision.quorum_state);
+		qvotec_publish_quorum_state((uint32)decision.quorum_state);
 		pg_atomic_write_u32(&QvotecShmem->disks_ok_count, decision.disks_ok_count);
 		pg_atomic_write_u32(&QvotecShmem->disks_total_count, decision.disks_total_count);
 		pg_atomic_write_u32(&QvotecShmem->collision_state, (uint32)decision.collision_state);

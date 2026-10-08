@@ -34,6 +34,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_ges_capacity.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_control_retire.h"
 #include "cluster/cluster_wal_retention.h"
@@ -92,25 +93,37 @@ typedef struct ClusterGrdOutboundShared {
 	uint32 ring_head; /* next free slot index */
 	uint32 ring_tail; /* next consumer slot index */
 	uint32 ring_count;
-	ClusterGrdOutboundSlot ring[PGRAC_GES_OUTBOUND_RING_CAPACITY];
+
 
 	/* Reply dirty-list (bounded ring;  no palloc per I54(c)) */
 	uint32 reply_dirty_head;
 	uint32 reply_dirty_tail;
 	uint32 reply_dirty_count;
-	ClusterGrdOutboundSlot reply_dirty[PGRAC_GES_REPLY_DIRTY_BUDGET];
+
 
 	/* Cleanup dirty-list */
 	uint32 cleanup_dirty_head;
 	uint32 cleanup_dirty_tail;
 	uint32 cleanup_dirty_count;
-	ClusterGrdOutboundSlot cleanup_dirty[PGRAC_GES_CLEANUP_DIRTY_BUDGET];
+
 
 	/* Lifetime LOG-once state + exported threshold-crossing counters. */
 	uint8 cleanup_retry_warned_mask;
 	uint64 cleanup_retry_warn50_count;
 	uint64 cleanup_retry_warn90_count;
+	ClusterGrdOutboundSlot slots[FLEXIBLE_ARRAY_MEMBER];
 } ClusterGrdOutboundShared;
+
+/* Immutable after shared-memory initialization; no handler allocation. */
+static uint32 grd_outbound_capacity = PGRAC_GES_OUTBOUND_RING_CAPACITY;
+static uint32 grd_reply_reserved = PGRAC_GES_OUTBOUND_LMON_REPLY_RESERVED_BUDGET;
+static uint32 grd_reply_capacity = PGRAC_GES_REPLY_DIRTY_BUDGET;
+static uint32 grd_cleanup_capacity = PGRAC_GES_CLEANUP_DIRTY_BUDGET;
+#define grd_outbound_ring(q) ((q)->slots)
+#define grd_outbound_reply(q) ((q)->slots + grd_outbound_capacity)
+#define grd_outbound_cleanup(q) ((q)->slots + grd_outbound_capacity + grd_reply_capacity)
+#define grd_cleanup_warn50 (grd_cleanup_capacity / 2)
+#define grd_cleanup_warn90 (((uint64)grd_cleanup_capacity * 9 + 9) / 10)
 
 static ClusterGrdOutboundShared *cluster_grd_outbound_state = NULL;
 static LWLock *cluster_grd_outbound_lock = NULL;
@@ -140,29 +153,29 @@ cluster_grd_outbound_normal_stop_poll(uint32 *slot_out, const char **reason_out)
 		const char *pending, *geometry, *invalid;
 
 		if (list == 0) {
-			items = q->ring;
+			items = grd_outbound_ring(q);
 			head = q->ring_head;
 			tail = q->ring_tail;
 			count = q->ring_count;
-			capacity = PGRAC_GES_OUTBOUND_RING_CAPACITY;
+			capacity = grd_outbound_capacity;
 			pending = "GRD_OUTBOUND_RING";
 			geometry = "GRD_OUTBOUND_RING_GEOMETRY";
 			invalid = "GRD_OUTBOUND_RING_ITEM_INVALID";
 		} else if (list == 1) {
-			items = q->reply_dirty;
+			items = grd_outbound_reply(q);
 			head = q->reply_dirty_head;
 			tail = q->reply_dirty_tail;
 			count = q->reply_dirty_count;
-			capacity = PGRAC_GES_REPLY_DIRTY_BUDGET;
+			capacity = grd_reply_capacity;
 			pending = "GRD_REPLY_DIRTY";
 			geometry = "GRD_REPLY_DIRTY_GEOMETRY";
 			invalid = "GRD_REPLY_DIRTY_ITEM_INVALID";
 		} else {
-			items = q->cleanup_dirty;
+			items = grd_outbound_cleanup(q);
 			head = q->cleanup_dirty_head;
 			tail = q->cleanup_dirty_tail;
 			count = q->cleanup_dirty_count;
-			capacity = PGRAC_GES_CLEANUP_DIRTY_BUDGET;
+			capacity = grd_cleanup_capacity;
 			pending = "GRD_CLEANUP_DIRTY";
 			geometry = "GRD_CLEANUP_DIRTY_GEOMETRY";
 			invalid = "GRD_CLEANUP_DIRTY_ITEM_INVALID";
@@ -214,7 +227,13 @@ cluster_grd_outbound_normal_stop_poll(uint32 *slot_out, const char **reason_out)
 Size
 cluster_grd_outbound_shmem_size(void)
 {
-	return sizeof(ClusterGrdOutboundShared);
+	Size ring = cluster_ges_configured_capacity(PGRAC_GES_OUTBOUND_RING_CAPACITY, 2);
+	Size replies = cluster_ges_configured_capacity(PGRAC_GES_REPLY_DIRTY_BUDGET, 1);
+	Size cleanup = cluster_ges_configured_capacity(PGRAC_GES_CLEANUP_DIRTY_BUDGET, 2);
+
+	return add_size(
+		offsetof(ClusterGrdOutboundShared, slots),
+		mul_size(add_size(add_size(ring, replies), cleanup), sizeof(ClusterGrdOutboundSlot)));
 }
 
 void
@@ -222,10 +241,15 @@ cluster_grd_outbound_shmem_init(void)
 {
 	bool found;
 
+	grd_outbound_capacity = cluster_ges_configured_capacity(PGRAC_GES_OUTBOUND_RING_CAPACITY, 2);
+	grd_reply_reserved
+		= cluster_ges_configured_capacity(PGRAC_GES_OUTBOUND_LMON_REPLY_RESERVED_BUDGET, 1);
+	grd_reply_capacity = cluster_ges_configured_capacity(PGRAC_GES_REPLY_DIRTY_BUDGET, 1);
+	grd_cleanup_capacity = cluster_ges_configured_capacity(PGRAC_GES_CLEANUP_DIRTY_BUDGET, 2);
 	cluster_grd_outbound_state
 		= ShmemInitStruct("pgrac cluster grd outbound", cluster_grd_outbound_shmem_size(), &found);
 	if (!found) {
-		memset(cluster_grd_outbound_state, 0, sizeof(*cluster_grd_outbound_state));
+		memset(cluster_grd_outbound_state, 0, cluster_grd_outbound_shmem_size());
 	}
 
 	/* Resolve LWLock tranche (registered via cluster_grd_request_lwlocks
@@ -263,12 +287,12 @@ ring_push(uint8 msg_type, uint8 origin, uint32 dest_node_id, const void *payload
 {
 	ClusterGrdOutboundSlot *slot;
 
-	if (cluster_grd_outbound_state->ring_count >= PGRAC_GES_OUTBOUND_RING_CAPACITY)
+	if (cluster_grd_outbound_state->ring_count >= grd_outbound_capacity)
 		return false;
 	if (payload_len > PGRAC_GES_OUTBOUND_PAYLOAD_MAX)
 		return false;
 
-	slot = &cluster_grd_outbound_state->ring[cluster_grd_outbound_state->ring_head];
+	slot = &grd_outbound_ring(cluster_grd_outbound_state)[cluster_grd_outbound_state->ring_head];
 	slot->dest_node_id = dest_node_id;
 	slot->msg_type = msg_type;
 	slot->origin = origin;
@@ -277,7 +301,7 @@ ring_push(uint8 msg_type, uint8 origin, uint32 dest_node_id, const void *payload
 		memcpy(slot->payload, payload, payload_len);
 
 	cluster_grd_outbound_state->ring_head
-		= (cluster_grd_outbound_state->ring_head + 1) % PGRAC_GES_OUTBOUND_RING_CAPACITY;
+		= (cluster_grd_outbound_state->ring_head + 1) % grd_outbound_capacity;
 	cluster_grd_outbound_state->ring_count++;
 	/* PGRAC: spec-7.2 D1 — mark the drain family dirty inside the push
 	 * helper so every producer (current and future) is covered. */
@@ -294,14 +318,15 @@ reply_dirty_push(uint32 dest_node_id, const void *payload, uint16 payload_len)
 		return;
 
 	/* Bounded:  if full → drop oldest (advance tail) + counter (I54(d)). */
-	if (cluster_grd_outbound_state->reply_dirty_count >= PGRAC_GES_REPLY_DIRTY_BUDGET) {
+	if (cluster_grd_outbound_state->reply_dirty_count >= grd_reply_capacity) {
 		cluster_grd_outbound_state->reply_dirty_tail
-			= (cluster_grd_outbound_state->reply_dirty_tail + 1) % PGRAC_GES_REPLY_DIRTY_BUDGET;
+			= (cluster_grd_outbound_state->reply_dirty_tail + 1) % grd_reply_capacity;
 		cluster_grd_outbound_state->reply_dirty_count--;
 		cluster_grd_inc_ges_reply_dropped();
 	}
 
-	slot = &cluster_grd_outbound_state->reply_dirty[cluster_grd_outbound_state->reply_dirty_head];
+	slot = &grd_outbound_reply(
+		cluster_grd_outbound_state)[cluster_grd_outbound_state->reply_dirty_head];
 	slot->dest_node_id = dest_node_id;
 	slot->msg_type = PGRAC_IC_MSG_GES_REPLY;
 	slot->origin = CLUSTER_GRD_OUTBOUND_LMON_REPLY;
@@ -310,7 +335,7 @@ reply_dirty_push(uint32 dest_node_id, const void *payload, uint16 payload_len)
 		memcpy(slot->payload, payload, payload_len);
 
 	cluster_grd_outbound_state->reply_dirty_head
-		= (cluster_grd_outbound_state->reply_dirty_head + 1) % PGRAC_GES_REPLY_DIRTY_BUDGET;
+		= (cluster_grd_outbound_state->reply_dirty_head + 1) % grd_reply_capacity;
 	cluster_grd_outbound_state->reply_dirty_count++;
 	cluster_grd_inc_ges_reply_deferred();
 	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_GRD_OUTBOUND); /* spec-7.2 D1 */
@@ -336,11 +361,11 @@ cleanup_dirty_push(uint8 msg_type, uint8 origin, uint32 dest_node_id, const void
 	 * Never overwrite the oldest entry.  The void producer APIs turn false into
 	 * an explicit fail-closed PANIC after releasing the outbound LWLock.
 	 */
-	if (cluster_grd_outbound_state->cleanup_dirty_count >= PGRAC_GES_CLEANUP_DIRTY_BUDGET)
+	if (cluster_grd_outbound_state->cleanup_dirty_count >= grd_cleanup_capacity)
 		return false;
 
-	slot = &cluster_grd_outbound_state
-				->cleanup_dirty[cluster_grd_outbound_state->cleanup_dirty_head];
+	slot = &grd_outbound_cleanup(
+		cluster_grd_outbound_state)[cluster_grd_outbound_state->cleanup_dirty_head];
 	slot->dest_node_id = dest_node_id;
 	slot->msg_type = msg_type;
 	slot->origin = origin;
@@ -349,16 +374,16 @@ cleanup_dirty_push(uint8 msg_type, uint8 origin, uint32 dest_node_id, const void
 		memcpy(slot->payload, payload, payload_len);
 
 	cluster_grd_outbound_state->cleanup_dirty_head
-		= (cluster_grd_outbound_state->cleanup_dirty_head + 1) % PGRAC_GES_CLEANUP_DIRTY_BUDGET;
+		= (cluster_grd_outbound_state->cleanup_dirty_head + 1) % grd_cleanup_capacity;
 	cluster_grd_outbound_state->cleanup_dirty_count++;
-	if (cluster_grd_outbound_state->cleanup_dirty_count >= PGRAC_GES_CLEANUP_DIRTY_WARN50_DEPTH
+	if (cluster_grd_outbound_state->cleanup_dirty_count >= grd_cleanup_warn50
 		&& (cluster_grd_outbound_state->cleanup_retry_warned_mask & CLEANUP_RETRY_WARN50_BIT)
 			   == 0) {
 		cluster_grd_outbound_state->cleanup_retry_warned_mask |= CLEANUP_RETRY_WARN50_BIT;
 		cluster_grd_outbound_state->cleanup_retry_warn50_count++;
 		warnings |= CLEANUP_RETRY_WARN50_BIT;
 	}
-	if (cluster_grd_outbound_state->cleanup_dirty_count >= PGRAC_GES_CLEANUP_DIRTY_WARN90_DEPTH
+	if (cluster_grd_outbound_state->cleanup_dirty_count >= grd_cleanup_warn90
 		&& (cluster_grd_outbound_state->cleanup_retry_warned_mask & CLEANUP_RETRY_WARN90_BIT)
 			   == 0) {
 		cluster_grd_outbound_state->cleanup_retry_warned_mask |= CLEANUP_RETRY_WARN90_BIT;
@@ -402,14 +427,14 @@ cleanup_retry_log_pressure(uint8 new_warnings, uint32 depth)
 		ereport(LOG, (errmsg_internal("cluster GES reliable cleanup retry queue reached 50%% "
 									  "(depth=%u capacity=%u max_backends=%d lmon_interval_ms=%d); "
 									  "warning is emitted once per postmaster lifetime",
-									  depth, PGRAC_GES_CLEANUP_DIRTY_BUDGET, MaxBackends,
+									  depth, grd_cleanup_capacity, MaxBackends,
 									  cluster_lmon_main_loop_interval)));
 	if ((new_warnings & CLEANUP_RETRY_WARN90_BIT) != 0)
 		ereport(LOG, (errmsg_internal("cluster GES reliable cleanup retry queue reached 90%% "
 									  "(depth=%u capacity=%u max_backends=%d lmon_interval_ms=%d); "
 									  "exhaustion will PANIC fail closed, warning is emitted once "
 									  "per postmaster lifetime",
-									  depth, PGRAC_GES_CLEANUP_DIRTY_BUDGET, MaxBackends,
+									  depth, grd_cleanup_capacity, MaxBackends,
 									  cluster_lmon_main_loop_interval)));
 }
 
@@ -427,7 +452,7 @@ cleanup_retry_exhausted(uint8 origin, uint32 dest_node_id)
 	ereport(PANIC,
 			(errmsg_internal("cluster GES reliable cleanup retry queue exhausted "
 							 "(capacity=%u origin=%u dest=%u); refusing to lose cleanup state",
-							 PGRAC_GES_CLEANUP_DIRTY_BUDGET, (uint32)origin, dest_node_id)));
+							 grd_cleanup_capacity, (uint32)origin, dest_node_id)));
 }
 
 
@@ -484,8 +509,7 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id, co
 	/* Reserved pool: BACKEND_REQUEST may consume ring slots only up to
 	 * CAPACITY - RESERVED_BUDGET (leaves room for LMON_REPLY).  Above
 	 * that boundary, return false → backend wait latch + timeout. */
-	if (cluster_grd_outbound_state->ring_count
-		>= (PGRAC_GES_OUTBOUND_RING_CAPACITY - PGRAC_GES_OUTBOUND_LMON_REPLY_RESERVED_BUDGET)) {
+	if (cluster_grd_outbound_state->ring_count >= (grd_outbound_capacity - grd_reply_reserved)) {
 		LWLockRelease(cluster_grd_outbound_lock);
 		return false;
 	}
@@ -638,9 +662,9 @@ cluster_grd_outbound_dequeue(ClusterGrdOutboundSlot *out)
 
 	LWLockAcquire(cluster_grd_outbound_lock, LW_EXCLUSIVE);
 	if (cluster_grd_outbound_state->ring_count > 0) {
-		*out = cluster_grd_outbound_state->ring[cluster_grd_outbound_state->ring_tail];
+		*out = grd_outbound_ring(cluster_grd_outbound_state)[cluster_grd_outbound_state->ring_tail];
 		cluster_grd_outbound_state->ring_tail
-			= (cluster_grd_outbound_state->ring_tail + 1) % PGRAC_GES_OUTBOUND_RING_CAPACITY;
+			= (cluster_grd_outbound_state->ring_tail + 1) % grd_outbound_capacity;
 		cluster_grd_outbound_state->ring_count--;
 		got = true;
 	}
@@ -659,30 +683,28 @@ cluster_grd_outbound_drain_dirty_lists(void)
 
 	/* Drain reply dirty first (P1.1 priority — REJECT_BUSY must converge). */
 	while (cluster_grd_outbound_state->reply_dirty_count > 0
-		   && cluster_grd_outbound_state->ring_count < PGRAC_GES_OUTBOUND_RING_CAPACITY) {
-		ClusterGrdOutboundSlot *src
-			= &cluster_grd_outbound_state
-				   ->reply_dirty[cluster_grd_outbound_state->reply_dirty_tail];
+		   && cluster_grd_outbound_state->ring_count < grd_outbound_capacity) {
+		ClusterGrdOutboundSlot *src = &grd_outbound_reply(
+			cluster_grd_outbound_state)[cluster_grd_outbound_state->reply_dirty_tail];
 		if (!ring_push(src->msg_type, src->origin, src->dest_node_id, src->payload,
 					   src->payload_len))
 			break;
 		cluster_grd_outbound_state->reply_dirty_tail
-			= (cluster_grd_outbound_state->reply_dirty_tail + 1) % PGRAC_GES_REPLY_DIRTY_BUDGET;
+			= (cluster_grd_outbound_state->reply_dirty_tail + 1) % grd_reply_capacity;
 		cluster_grd_outbound_state->reply_dirty_count--;
 		drained++;
 	}
 
 	/* Drain cleanup dirty after reply. */
 	while (cluster_grd_outbound_state->cleanup_dirty_count > 0
-		   && cluster_grd_outbound_state->ring_count < PGRAC_GES_OUTBOUND_RING_CAPACITY) {
-		ClusterGrdOutboundSlot *src
-			= &cluster_grd_outbound_state
-				   ->cleanup_dirty[cluster_grd_outbound_state->cleanup_dirty_tail];
+		   && cluster_grd_outbound_state->ring_count < grd_outbound_capacity) {
+		ClusterGrdOutboundSlot *src = &grd_outbound_cleanup(
+			cluster_grd_outbound_state)[cluster_grd_outbound_state->cleanup_dirty_tail];
 		if (!ring_push(src->msg_type, src->origin, src->dest_node_id, src->payload,
 					   src->payload_len))
 			break;
 		cluster_grd_outbound_state->cleanup_dirty_tail
-			= (cluster_grd_outbound_state->cleanup_dirty_tail + 1) % PGRAC_GES_CLEANUP_DIRTY_BUDGET;
+			= (cluster_grd_outbound_state->cleanup_dirty_tail + 1) % grd_cleanup_capacity;
 		cluster_grd_outbound_state->cleanup_dirty_count--;
 		drained++;
 	}

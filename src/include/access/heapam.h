@@ -120,12 +120,32 @@ typedef struct HeapScanDescData *HeapScanDesc;
 /*
  * Descriptor for fetches from heap via an index.
  */
+#ifdef USE_PGRAC_CLUSTER
+/* Local identity for one uninterrupted native index-fetch owner; no payload. */
+typedef struct HeapReadOnlyCrScope
+{
+	Relation	relation;
+	struct ResourceOwnerData *owner;
+	RelFileLocator locator;
+	Oid			relation_oid;
+	CommandId	command_id;
+	uint32		reserved;
+	uint64		scan_id;
+	uint64		snapshot_id;
+	SCN			read_scn;
+	uint64		read_epoch;
+} HeapReadOnlyCrScope;
+#endif
+
 typedef struct IndexFetchHeapData
 {
 	IndexFetchTableData xs_base;	/* AM independent part of the descriptor */
 
 	Buffer		xs_cbuf;		/* current heap buffer in scan, if any */
 	/* NB: if xs_cbuf is not InvalidBuffer, we hold a pin on that buffer */
+#ifdef USE_PGRAC_CLUSTER
+	HeapReadOnlyCrScope cr_scope;
+#endif
 } IndexFetchHeapData;
 
 /* Result codes for HeapTupleSatisfiesVacuum */

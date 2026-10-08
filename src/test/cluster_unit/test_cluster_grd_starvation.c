@@ -65,6 +65,7 @@ BackendType MyBackendType = B_LMON;
 #include "cluster/cluster_ges_mode.h"	 /* spec-5.1b — frozen matrix + convert classification */
 #include "access/transam.h"				 /* spec-5.8 D1c — InvalidTransactionId */
 #include "cluster/cluster_grd.h"
+#include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_hw.h"				 /* spec-4.6a HW remaster watchdog stubs */
 #include "cluster/cluster_lmd.h"			 /* spec-5.8 D1b — WFG vertex + submit/cancel edge */
 #include "cluster/cluster_reconfig.h"		 /* spec-4.6 D1 — ReconfigEvent stub type */
@@ -89,6 +90,7 @@ BackendType MyBackendType = B_LMON;
 #undef strerror_r
 
 #include "unit_test.h"
+#include "test_cluster_grd_pool.inc"
 
 
 /* ============================================================
@@ -190,6 +192,7 @@ static bool ut_grd_force_reinit = false;
 static void
 ut_reset_grd_shmem(void)
 {
+	ut_grd_pool_reset();
 	ut_grd_force_reinit = true;
 }
 
@@ -199,6 +202,11 @@ ut_reset_grd_shmem(void)
 void *
 ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 {
+	if (name != NULL && strcmp(name, "pgrac cluster grd slots") == 0) {
+		*foundPtr = false;
+		memset(&ut_grd_pool_region, 0, sizeof(ut_grd_pool_region));
+		return ut_grd_pool_region.data;
+	}
 	if (name != NULL && strcmp(name, "pgrac cluster grd") == 0) {
 		static union {
 			/* cppcheck-suppress unusedStructMember
@@ -917,14 +925,13 @@ SetLatch(Latch *latch)
 void *
 palloc0(Size sz)
 {
-	static char buf[256];
-	(void)sz;
-	memset(buf, 0, sizeof(buf));
-	return buf;
+	return calloc(1, sz);
 }
 void
-pfree(void *p pg_attribute_unused())
-{}
+pfree(void *p)
+{
+	free(p);
+}
 
 /* spec-2.15 D11: shmem add_size stub.  cluster_grd_shmem_size() wraps
  * add_size() for the entry HTAB component; standalone harness never
@@ -1044,6 +1051,20 @@ cluster_qvotec_in_quorum(void)
 {
 	return false;
 }
+bool
+cluster_authority_serving_admission_current_v1(const ClusterQvotecAdmissionCheck *check,
+											   bool *pending)
+{
+	*pending = false;
+	return false;
+}
+bool
+cluster_qvotec_check_admission(ClusterQvotecAdmissionCheck *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->result = CLUSTER_QVOTEC_ADMISSION_NO_SHMEM;
+	return false;
+}
 
 uint64
 cluster_qvotec_get_self_incarnation(void)
@@ -1112,11 +1133,11 @@ static ClusterGrdGrantAction
 starv_request(const ClusterResId *resid, int32 node, uint32 procno, uint64 reqid, LOCKMODE mode)
 {
 	ClusterGrdHolderId h = starv_holder(node, procno, reqid);
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int nc = -1;
 
 	return cluster_grd_entry_enqueue_or_grant(resid, &h, node, reqid, 0, UT_GES_OPCODE_REQUEST,
-											  mode, conflicts, &nc);
+											  mode, &conflicts, &nc);
 }
 
 /* Drive a conditional (NOWAIT) try-lock through the master path. */
@@ -1125,11 +1146,11 @@ starv_request_nowait(const ClusterResId *resid, int32 node, uint32 procno, uint6
 					 LOCKMODE mode)
 {
 	ClusterGrdHolderId h = starv_holder(node, procno, reqid);
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int nc = -1;
 
 	return cluster_grd_entry_grant_conditional(resid, &h, node, reqid, 0, UT_GES_OPCODE_REQUEST,
-											   mode, conflicts, &nc);
+											   mode, &conflicts, &nc);
 }
 
 /* Drive a blocking REQUEST carrying a spec-5.8 canonical wait identity (xid +
@@ -1140,12 +1161,12 @@ starv_request_meta(const ClusterResId *resid, int32 node, uint32 procno, uint64 
 				   LOCKMODE mode, TransactionId xid, uint64 wait_seq)
 {
 	ClusterGrdHolderId h = starv_holder(node, procno, reqid);
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	ClusterGrdWaiterMeta meta = { xid, wait_seq };
 	int nc = -1;
 
 	return cluster_grd_entry_enqueue_or_grant_meta(resid, &h, node, reqid, meta, 0,
-												   UT_GES_OPCODE_REQUEST, mode, conflicts, &nc);
+												   UT_GES_OPCODE_REQUEST, mode, &conflicts, &nc);
 }
 
 /* The xid / wait_seq stamped on the BLOCKER vertex of waiter (wn,wp,we,wr)'s

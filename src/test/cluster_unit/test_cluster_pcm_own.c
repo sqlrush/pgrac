@@ -2828,6 +2828,38 @@ UT_TEST(test_r_a22_real_flush_clears_first_record_after_its_write)
 	}
 }
 
+UT_TEST(test_native_flush_refuses_cr_before_starting_io)
+{
+	static BufferDesc buf;
+	static ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	volatile bool caught = false;
+
+	drop_fixture(&buf, &entry, true);
+	cluster_shared_config = false;
+	buf.buffer_type = BUF_TYPE_CR;
+	buf.pcm_state = PCM_STATE_N;
+	transition_real_flush = true;
+	transition_content_held = true;
+	transition_pin_count = 1;
+	pg_atomic_fetch_add_u32(&buf.state, BUF_REFCOUNT_ONE);
+	PG_TRY();
+	{
+		transition_production_flush(&buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(transition_owned_io + transition_io_wakes + transition_flush_count, 0);
+	UT_ASSERT((pg_atomic_read_u32(&buf.state) & BM_DIRTY) != 0);
+	transition_content_held = false;
+	transition_unpin(&buf);
+	drop_fixture_done(saved);
+}
+
 UT_TEST(test_shared_downgrade_pi_failure_keeps_x_and_releases_original_revoke)
 {
 	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
@@ -3415,7 +3447,11 @@ eviction_legacy_tail(BufferDesc *buf, BufferTag *tag, uint32 state, PcmLockMode 
 #define cluster_pcm_lock_release_saved_tag_for_eviction eviction_legacy_release
 #define InvalidateBufferCommitTailLocked(buf, tag, hash, lock, state, mode, release)               \
 	eviction_legacy_tail(buf, tag, state, mode)
+/* This fixture owns current/PI only. Native CR chains use the real mapping
+ * and invalidation bodies in test_cluster_buffer_cr; crossing here is a bug. */
+#define cluster_bufmgr_cr_invalidate_locked(buf, hash, state) (abort(), CLUSTER_PCM_OWN_INVALID)
 #include "test_cluster_pcm_eviction_gate.inc"
+#undef cluster_bufmgr_cr_invalidate_locked
 #undef InvalidateBufferCommitTailLocked
 #undef cluster_pcm_lock_release_saved_tag_for_eviction
 #undef cluster_pcm_x_buffer_tag_tracked
@@ -8625,9 +8661,13 @@ UT_TEST(test_resource_x_target_cached_x_eviction_uses_native_exact_release)
 	UT_ASSERT_NOT_NULL(helper);
 	UT_ASSERT_NOT_NULL(helper_end);
 	if (helper != NULL && helper_end != NULL) {
+		/* Limit this assertion to the TARGET owner body. Independent native
+		 * CR invalidation helpers may follow it before the next current owner. */
 		const char *late_commit = strstr(helper, "cluster_pcm_own_eviction_commit_locked(");
+		const char *function_end = strstr(helper, "\n}\n");
 
-		UT_ASSERT(late_commit == NULL || late_commit >= helper_end);
+		UT_ASSERT_NOT_NULL(function_end);
+		UT_ASSERT(late_commit == NULL || (function_end != NULL && late_commit >= function_end));
 	}
 	UT_ASSERT_NULL(strstr(source, "cluster_gcs_resource_x_target_evict_release_exact("));
 	free(source);
@@ -10329,7 +10369,8 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(169);
+	UT_PLAN(170);
+	UT_RUN(test_native_flush_refuses_cr_before_starting_io);
 	UT_RUN(test_shared_leave_releases_dirty_and_clean_x_through_exact_owner);
 	UT_RUN(test_shared_leave_write_and_sync_error_keep_x_and_mapping);
 	UT_RUN(test_shared_leave_waits_for_pin_and_revoke_without_skipping_x);

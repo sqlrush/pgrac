@@ -145,10 +145,14 @@ extern bool cluster_cf_bak_checkpoint_recoverable(const ControlFileData *bak);
  * itself ereport.  With cluster.shared_config off this retains the legacy
  * early-read behavior.  With that profile on, it requires an already-held
  * clusterwide CF-S/X and an exact live local thread owner, selects only the
- * root-v2 view and never falls back; it is NOT an early bootstrap reader.
+ * root-v3 view and never falls back; it is NOT an early bootstrap reader.
  * Author: SqlRush <sqlrush@gmail.com>
  */
 extern bool cluster_cf_authority_read(ControlFileData *out);
+/* Same output/lock contract; pending distinguishes an incomplete admission
+ * observation from a refusal. The caller must confirm CF release before
+ * waiting, and recheck its original owner when retrying. */
+extern bool cluster_cf_authority_read_check(ControlFileData *out, bool *pending);
 
 /*
  * Atomically write *cf to the shared authority: copy the current primary to

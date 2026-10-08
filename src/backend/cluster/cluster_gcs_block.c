@@ -3180,12 +3180,25 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
 								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 								  cluster_node_id)));
-	if (cluster_authority_readiness_managed() && !cluster_serving_ready_is_current()) {
-		ereport(ERROR, (errcode(ERRCODE_CLUSTER_LMS_UNAVAILABLE),
-						errmsg("GCS block service is not serving-ready"),
-						errhint("Complete StartupXLOG and publish SERVING_READY before "
-								"requesting cache-fusion data.")));
-		return false;
+	if (cluster_authority_readiness_managed()) {
+		const char *failed_predicate;
+		bool pending;
+
+		if (!cluster_serving_ready_check(&pending, &failed_predicate)) {
+			/* Before any slot/send: the original bufmgr owner aborts its
+			 * exact reservation and waits off content locks, then rechecks
+			 * the complete identity. No later sample relabels this refusal. */
+			if (pending) {
+				*out_retry_denied = true;
+				return false;
+			}
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_LMS_UNAVAILABLE),
+							errmsg("GCS block service is not serving-ready"),
+							errdetail("node=%d predicate=%s", cluster_node_id, failed_predicate),
+							errhint("Complete StartupXLOG and publish SERVING_READY before "
+									"requesting cache-fusion data.")));
+			return false;
+		}
 	}
 
 	/*
@@ -6985,9 +6998,8 @@ gcs_block_send_envelope_or_loopback(uint8 msg_type, int32 dest_node, const void 
 		|| !cluster_ic_envelope_build(&envelope, msg_type, (uint32)cluster_node_id,
 									  (uint32)cluster_node_id, payload, payload_len))
 		return CLUSTER_IC_SEND_HARD_ERROR;
-	return cluster_ic_dispatch_envelope(&envelope, payload, cluster_node_id)
-			   ? CLUSTER_IC_SEND_DONE
-			   : CLUSTER_IC_SEND_HARD_ERROR;
+	return cluster_ic_dispatch_send_result(
+		cluster_ic_dispatch_envelope(&envelope, payload, cluster_node_id));
 }
 
 static bool
@@ -9316,6 +9328,7 @@ gcs_block_resource_x_gate_session_snapshot_result(const BufferTag *tag,
 	PcmXSessionAuthResult session_result;
 	uint64 master_session = 0;
 	int32 master_node;
+	bool storage_pending = false;
 
 	if (gate_out != NULL)
 		memset(gate_out, 0, sizeof(*gate_out));
@@ -9327,13 +9340,15 @@ gcs_block_resource_x_gate_session_snapshot_result(const BufferTag *tag,
 		|| gate.phase != RESOURCE_X_GATE_OPEN)
 		return PCM_X_SESSION_AUTH_INVALID;
 	master_node = cluster_gcs_lookup_master(*tag);
-	if (master_node < 0 || master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
-		|| cluster_grd_pi_rebuild_blocked_v1(*tag))
+	if (master_node < 0 || master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT)
 		return PCM_X_SESSION_AUTH_INVALID;
 	if (gate_out != NULL)
 		*gate_out = gate;
 	if (master_node_out != NULL)
 		*master_node_out = master_node;
+	if (cluster_grd_pi_rebuild_blocked_sample_v1(*tag, &storage_pending))
+		return storage_pending ? PCM_X_SESSION_AUTH_ADMISSION_NOT_READY
+							   : PCM_X_SESSION_AUTH_INVALID;
 	session_result = gcs_block_pcm_x_authenticated_session_result(
 		master_node, cluster_epoch_get_current(), &master_session, NULL);
 	if (session_result != PCM_X_SESSION_AUTH_OK)
@@ -14526,6 +14541,10 @@ gcs_block_resource_x_target_acquire_internal_trace_impl(
 				}
 
 			preflight_membership_wait:
+				if (!cluster_semantic_activation_recheck(&admission)) {
+					result = RESOURCE_X_APPLY_STALE;
+					break;
+				}
 				diagnostic_stage = "preflight-membership-wait";
 				gcs_block_resource_x_requester_wait_note(&wait_diagnostic, PCM_RX_WAIT_PREFLIGHT);
 				now_us = gcs_block_pcm_x_monotonic_us();
@@ -16466,7 +16485,9 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	cluster_sf_dep_vec_reset(&sf_dep_vec);
 	memset(&s_barrier_authority_before, 0, sizeof(s_barrier_authority_before));
 	memset(&s_barrier_authority_after, 0, sizeof(s_barrier_authority_after));
-	if (cluster_authority_readiness_managed() && !cluster_serving_ready_is_current())
+	/* The router sampled serving admission before dispatch and retains the
+	 * frame on PENDING. Do not resample halfway through this same handler. */
+	if (cluster_authority_readiness_managed() && !cluster_ic_dispatch_data_admitted(env))
 		return;
 	if (gcs_block_try_resource_x_frame(env, payload))
 		return;
@@ -16498,7 +16519,9 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	 * steady state (every node is an in-quorum MEMBER, no fence armed).  Reply
 	 * DENIED_RESOURCE_RECOVERING -> sender maps to 53R9L (retry-safe).
 	 */
-	master_gate_in_quorum = cluster_qvotec_in_quorum();
+	master_gate_in_quorum = cluster_authority_readiness_managed()
+								? cluster_ic_dispatch_data_admitted(env)
+								: cluster_qvotec_in_quorum();
 	master_gate_member = cluster_membership_is_member(cluster_node_id);
 	master_gate_join_active = cluster_grd_join_remaster_active_for_shard(req->tag);
 	master_gate_join_rebuilt = !master_gate_join_active || cluster_grd_block_view_rebuilt(req->tag);

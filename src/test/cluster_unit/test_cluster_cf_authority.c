@@ -82,6 +82,8 @@ bool enableFsync = true;
 bool cluster_shared_config = false;
 static bool runtime_guard_error_expected;
 static unsigned runtime_read_calls;
+static ClusterControlRootResult runtime_read_result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+static ControlFileData runtime_view;
 
 /* The root test links the actual adapter; this leaf test only checks routing. */
 ClusterControlRootResult
@@ -89,7 +91,9 @@ cluster_control_root_v3_read_runtime_local_locked(ControlFileData *out)
 {
 	++runtime_read_calls;
 	memset(out, 0, sizeof(*out));
-	return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (runtime_read_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*out = runtime_view;
+	return runtime_read_result;
 }
 
 /* PGRAC: only lock facts and fsync failures are controlled; file operations
@@ -1118,6 +1122,34 @@ UT_TEST(test_shared_config_dispatches_without_legacy_fallback)
 	cluster_shared_config = false;
 }
 
+UT_TEST(test_shared_runtime_pending_preserves_caller_bytes_and_legacy_polarity)
+{
+	ControlFileData before, out;
+	bool pending = true;
+
+	image_input(&before);
+	cluster_shared_config = true;
+	runtime_read_result = CLUSTER_CONTROL_ROOT_ADMISSION_PENDING;
+	out = before;
+	UT_ASSERT(!cluster_cf_authority_read_check(&out, &pending));
+	UT_ASSERT(pending);
+	UT_ASSERT_EQ(memcmp(&out, &before, sizeof(out)), 0);
+	UT_ASSERT(!cluster_cf_authority_read(&out));
+	UT_ASSERT_EQ(memcmp(&out, &before, sizeof(out)), 0);
+	runtime_read_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	UT_ASSERT(!cluster_cf_authority_read_check(&out, &pending));
+	UT_ASSERT(!pending);
+	UT_ASSERT_EQ(memcmp(&out, &before, sizeof(out)), 0);
+	runtime_read_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	runtime_view = before;
+	runtime_view.checkPoint++;
+	UT_ASSERT(cluster_cf_authority_read_check(&out, &pending));
+	UT_ASSERT(!pending);
+	UT_ASSERT_EQ(memcmp(&out, &runtime_view, sizeof(out)), 0);
+	runtime_read_result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	cluster_shared_config = false;
+}
+
 UT_TEST(test_shared_config_untyped_writer_cannot_modify_projection)
 {
 	ControlFileData before, candidate, after;
@@ -1360,7 +1392,7 @@ main(void)
 {
 	setup_shared_root();
 
-	UT_PLAN(33);
+	UT_PLAN(34);
 	UT_RUN(test_paths);
 	UT_RUN(test_classify_buffer);
 	UT_RUN(test_decide_source);
@@ -1387,6 +1419,7 @@ main(void)
 	UT_RUN(test_immutable_missing_exact_object_never_falls_back);
 	UT_RUN(test_immutable_fsync_disabled_cannot_claim_durable_success);
 	UT_RUN(test_shared_config_dispatches_without_legacy_fallback);
+	UT_RUN(test_shared_runtime_pending_preserves_caller_bytes_and_legacy_polarity);
 	UT_RUN(test_shared_config_untyped_writer_cannot_modify_projection);
 	UT_RUN(test_projection_writes_canonical_selected_view);
 	UT_RUN(test_projection_refuses_without_permission_or_valid_input);

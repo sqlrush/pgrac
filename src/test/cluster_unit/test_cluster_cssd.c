@@ -619,10 +619,33 @@ UT_TEST(test_t12_no_pgproc_status_reads_never_block)
 
 UT_DEFINE_GLOBALS();
 
+UT_TEST(test_backend_status_nowait_preserves_busy_and_never_waits)
+{
+	PGPROC fake_proc;
+	bool busy = false;
+
+	shmem_init_done = false;
+	cluster_cssd_shmem_init();
+	memset(&fake_proc, 0, sizeof(fake_proc));
+	MyProc = &fake_proc;
+	ut_lwlock_conditional_result = false;
+	ut_lwlock_blocking_calls = 0;
+	ut_lwlock_conditional_calls = 0;
+	UT_ASSERT_EQ(cluster_cssd_get_status_nowait(&busy), CLUSTER_CSSD_STARTING);
+	UT_ASSERT(busy);
+	UT_ASSERT_EQ(ut_lwlock_blocking_calls, 0);
+	UT_ASSERT_EQ(ut_lwlock_conditional_calls, 1);
+	ut_lwlock_conditional_result = true;
+	UT_ASSERT_EQ(cluster_cssd_get_status_nowait(&busy), CLUSTER_CSSD_STARTING);
+	UT_ASSERT(!busy);
+	UT_ASSERT_EQ(ut_lwlock_blocking_calls, 0);
+	MyProc = NULL;
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 
 	UT_RUN(test_t1_status_to_string_round_trip);
 	UT_RUN(test_t2_peer_state_to_string_round_trip);
@@ -636,6 +659,7 @@ main(void)
 	UT_RUN(test_t10_grace_period_field_exists_static_grep);
 	UT_RUN(test_t11_declared_alive_filter_L86);
 	UT_RUN(test_t12_no_pgproc_status_reads_never_block);
+	UT_RUN(test_backend_status_nowait_preserves_busy_and_never_waits);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

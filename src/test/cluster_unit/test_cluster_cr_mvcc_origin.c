@@ -55,7 +55,6 @@ LockBuffer(Buffer buffer, int mode)
 
 bool cluster_cr_mvcc_gate = true;
 bool cluster_cr_tuple_level_fastpath = false;
-bool cluster_shared_config = false;
 
 /* Same explicit origin-service fixture as the real resolver tests. */
 bool

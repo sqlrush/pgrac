@@ -9,6 +9,10 @@
  * IDENTIFICATION
  *	  src/include/utils/old_snapshot.h
  *
+ * PGRAC MODIFICATIONS
+ *   Modified by: SqlRush <sqlrush@gmail.com>
+ *   Own the shared allocator for local read-only cache identities.
+ *
  *-------------------------------------------------------------------------
  */
 
@@ -16,6 +20,9 @@
 #define OLD_SNAPSHOT_H
 
 #include "datatype/timestamp.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "port/atomics.h"
+#endif
 #include "storage/s_lock.h"
 
 /*
@@ -66,6 +73,9 @@ typedef struct OldSnapshotControlData
 	 */
 	int			head_offset;	/* subscript of oldest tracked time */
 	TimestampTz head_timestamp; /* time corresponding to head xid */
+#ifdef USE_PGRAC_CLUSTER
+	pg_atomic_uint64 cr_identity_generation;
+#endif
 	int			count_used;		/* how many slots are in use */
 	TransactionId xid_by_minute[FLEXIBLE_ARRAY_MEMBER];
 } OldSnapshotControlData;

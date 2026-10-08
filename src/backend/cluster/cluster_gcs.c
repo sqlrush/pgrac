@@ -142,7 +142,8 @@ static bool gcs_slot_get_reply(ClusterGcsOutstandingSlot *slot, GcsReplyPayload 
 static bool gcs_mark_slot_reply(const ClusterICEnvelope *env, const GcsReplyPayload *reply);
 static ClusterICSendResult gcs_send_envelope_or_loopback(uint8 msg_type, int32 dest_node,
 														 const void *payload, uint32 payload_len);
-static bool gcs_dispatch_loopback(uint8 msg_type, const void *payload, uint32 payload_len);
+static ClusterICDispatchResult gcs_dispatch_loopback(uint8 msg_type, const void *payload,
+													 uint32 payload_len);
 static void gcs_send_reply(int32 dest_node, uint64 request_id, uint8 transition_id,
 						   GcsReplyStatus status);
 static void gcs_report_transition_failure(uint8 final_status, uint8 final_transition);
@@ -508,7 +509,7 @@ gcs_mark_slot_reply(const ClusterICEnvelope *env, const GcsReplyPayload *reply)
 	return false;
 }
 
-static bool
+static ClusterICDispatchResult
 gcs_dispatch_loopback(uint8 msg_type, const void *payload, uint32 payload_len)
 {
 	ClusterICEnvelope env;
@@ -529,8 +530,8 @@ gcs_send_envelope_or_loopback(uint8 msg_type, int32 dest_node, const void *paylo
 	ClusterICSendResult rc;
 
 	if (dest_node == cluster_node_id)
-		return gcs_dispatch_loopback(msg_type, payload, payload_len) ? CLUSTER_IC_SEND_DONE
-																	 : CLUSTER_IC_SEND_HARD_ERROR;
+		return cluster_ic_dispatch_send_result(
+			gcs_dispatch_loopback(msg_type, payload, payload_len));
 
 	/*
 	 * GCS requests can be produced from bufmgr/content-lock backend paths.

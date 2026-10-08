@@ -209,6 +209,13 @@ cluster_serving_ready_is_current(void)
 	return true;
 }
 bool
+cluster_serving_ready_check(bool *pending, const char **failed_predicate)
+{
+	*pending = false;
+	*failed_predicate = "CURRENT";
+	return cluster_serving_ready_is_current();
+}
+bool
 cluster_clean_leave_block_serve_gate_allows(void)
 {
 	return true;
@@ -1323,7 +1330,7 @@ cluster_ic_envelope_build(ClusterICEnvelope *out_env, uint8 msg_type, uint32 sou
 	return true;
 }
 
-bool
+ClusterICDispatchResult
 cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, int32 peer_id)
 {
 	typedef struct TestR4Reply8240 {

@@ -172,11 +172,20 @@ typedef struct HeapHotSearchResult
 	HeapTupleData tuple;
 #ifdef USE_PGRAC_CLUSTER
 	bool		remote_xmax_wait;
+	bool		cr_full_page; /* Original FULL, after live-input revalidation. */
+	bool		cr_unsupported; /* Optional cache cannot evaluate this shape. */
 	ClusterTxLocator remote_wait_locator;
 	ClusterR4ScratchTrace visibility_trace;
 #endif
 	char scratch_page[BLCKSZ] pg_attribute_aligned(MAXIMUM_ALIGNOF);
 } HeapHotSearchResult;
+
+#ifdef USE_PGRAC_CLUSTER
+extern bool heap_index_fetch_cr_result(IndexFetchHeapData *hscan, ItemPointer tid,
+									  Snapshot snapshot, HeapHotSearchResult *result);
+extern void heap_index_publish_cr_result(IndexFetchHeapData *hscan, BlockNumber block,
+										 Snapshot snapshot, const HeapHotSearchResult *result);
+#endif
 
 typedef struct ClusterR4HotScratchTestContext
 {

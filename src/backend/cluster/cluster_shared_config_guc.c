@@ -163,6 +163,7 @@ cluster_shared_config_alter_system(const char *name, const char *value)
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			break;
 		if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT
+			&& result != CLUSTER_CONTROL_ROOT_ADMISSION_PENDING
 			&& result != CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE)
 			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 							errmsg("shared configuration publication refused"),

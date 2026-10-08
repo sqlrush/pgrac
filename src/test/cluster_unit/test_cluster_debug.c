@@ -46,6 +46,7 @@
 
 #include "cluster/cluster_catalog_stats.h" /* spec-6.14 D10b catalog counter stubs */
 #include "cluster/cluster_debug.h"
+#include "cluster/cluster_qvotec.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_terminal_ref_census.h"
@@ -108,6 +109,14 @@ cluster_lms_is_ready(void)
 bool
 cluster_qvotec_in_quorum(void)
 {
+	return false;
+}
+
+bool
+cluster_qvotec_check_admission(ClusterQvotecAdmissionCheck *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->result = CLUSTER_QVOTEC_ADMISSION_NO_SHMEM;
 	return false;
 }
 
@@ -3677,7 +3686,6 @@ char *cluster_voting_disks = NULL;
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_membership.h"
-#include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_config_members.h"
@@ -3851,6 +3859,28 @@ cluster_grd_recovery_authority_is_current(uint64 boot_incarnation pg_attribute_u
 										  uint64 lms_generation pg_attribute_unused())
 {
 	return false;
+}
+
+/* The diagnostic fixture owns no serving identity or completed GRD seal. */
+bool
+cluster_grd_recovery_authority_for_admission(
+	uint64 boot_incarnation pg_attribute_unused(), uint64 lms_generation pg_attribute_unused(),
+	const ClusterQvotecAdmissionCheck *check pg_attribute_unused(), bool *pending)
+{
+	*pending = false;
+	return false;
+}
+
+ClusterServingFormationResult
+cluster_reconfig_capture_serving_formation_v1(
+	uint16 origin_thread pg_attribute_unused(),
+	const ClusterQvotecAdmissionCheck *check pg_attribute_unused(), ClusterFormationSnapshotV1 *out,
+	bool *snapshot_valid, const char **predicate)
+{
+	memset(out, 0, sizeof(*out));
+	*snapshot_valid = false;
+	*predicate = "formation.unavailable";
+	return CLUSTER_SERVING_FORMATION_REFUSED;
 }
 
 bool
@@ -4325,6 +4355,12 @@ cluster_stats_main_loop_iters(void)
 ClusterCssdStatus
 cluster_cssd_get_status(void)
 {
+	return CLUSTER_CSSD_STARTING;
+}
+ClusterCssdStatus
+cluster_cssd_get_status_nowait(bool *busy)
+{
+	*busy = false;
 	return CLUSTER_CSSD_STARTING;
 }
 const char *

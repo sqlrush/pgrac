@@ -20,6 +20,7 @@
 #include "access/multixact.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_multixact.h"
 #include "cluster/cluster_r4_observe.h"
@@ -230,7 +231,7 @@ cluster_tx_resolve_exact_with_admission(const ClusterTxLocator *locator, Cluster
 	bool terminal_census = mode == CLUSTER_TX_RESOLVE_TERMINAL_CENSUS;
 	bool partial_visibility = mode == CLUSTER_TX_RESOLVE_VISIBILITY && locator != NULL
 							  && locator->tt_wrap == TT_WRAP_INVALID;
-	bool clean_formation_row_wait = false;
+	bool admitted_row_wait = false;
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
@@ -247,12 +248,13 @@ cluster_tx_resolve_exact_with_admission(const ClusterTxLocator *locator, Cluster
 		goto done;
 
 	formation_epoch = admission->formation_epoch;
-	clean_formation_row_wait = mode == CLUSTER_TX_RESOLVE_ROW_WAIT && formation_epoch == 0;
+	admitted_row_wait
+		= mode == CLUSTER_TX_RESOLVE_ROW_WAIT && (cluster_shared_config || formation_epoch == 0);
 	if (formation_epoch == 0) {
 		bool zero_epoch_admissible
 			= terminal_census ? cluster_tx_zero_epoch_terminal_census_is_admissible(
 									locator, admission, caller_owned_terminal_census)
-							  : (partial_visibility || clean_formation_row_wait)
+							  : (partial_visibility || admitted_row_wait)
 									&& cluster_tx_zero_epoch_partial_visibility_is_admissible(
 										locator, admission);
 
@@ -264,10 +266,12 @@ cluster_tx_resolve_exact_with_admission(const ClusterTxLocator *locator, Cluster
 		reason = CLUSTER_TX_RESOLVE_RF_DEFERRED;
 		goto done;
 	}
-	if (clean_formation_row_wait) {
+	if (admitted_row_wait) {
 		ClusterTxLocator request = *locator;
 
-		/* The existing origin channel accepts a partial request, not a new
+		/* Shared ROW_WAIT uses the same current origin authority as the
+		 * census that selected its blocker, including after formation.
+		 * The existing origin channel accepts a partial request, not a new
 		 * canonical identity. Preserve the complete caller locator and compare
 		 * the returned canonical echo against it below, including TT wrap.
 		 * The input validator above still rejects partial ROW_WAIT callers. */

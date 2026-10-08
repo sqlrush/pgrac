@@ -206,12 +206,21 @@ read_image(const char *path, char *image)
 bool
 cluster_cf_authority_read(ControlFileData *out)
 {
+	return cluster_cf_authority_read_check(out, NULL);
+}
+
+bool
+cluster_cf_authority_read_check(ControlFileData *out, bool *pending)
+{
 	char primary_img[sizeof(ControlFileData)];
 	char bak_img[sizeof(ControlFileData)];
 	ClusterCfValidity pv;
 	ClusterCfValidity bv;
 	bool bak_strict_ok;
 	ClusterCfReadSource src;
+
+	if (pending != NULL)
+		*pending = false;
 
 	/* PGRAC: runtime v3 never reads the compatibility projection or .bak.
 	 * The caller already owns CF-S/X; the adapter checks its exact local
@@ -229,6 +238,8 @@ cluster_cf_authority_read(ControlFileData *out)
 		 * contract; a false return is not authority to use the old contents.
 		 */
 		result = cluster_control_root_v3_read_runtime_local_locked(&verified);
+		if (pending != NULL)
+			*pending = result == CLUSTER_CONTROL_ROOT_ADMISSION_PENDING;
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 			return false;

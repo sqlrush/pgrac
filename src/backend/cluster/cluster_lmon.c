@@ -2065,6 +2065,7 @@ LmonMain(void)
 					wes_dirty = false;
 				}
 
+				cluster_ic_rdma_retry_dispatch();
 				now = GetCurrentTimestamp();
 				wait_ms = (next_heartbeat_at > now) ? (long)((next_heartbeat_at - now) / 1000) : 0;
 				if (wait_ms < 0)
