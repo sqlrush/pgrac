@@ -137,6 +137,9 @@ typedef enum HandoffFault {
 
 static HandoffFault fault;
 static bool relation_case;
+static uint8 relation_type = LOCKTAG_RELATION;
+static LOCKMODE relation_mode = ShareLock;
+static uint64 advisory_counts[CLUSTER_ADVISORY_COUNTER_COUNT];
 static bool relation_nowait_case;
 static bool cf_case;
 static LOCKMODE cf_mode = ShareLock;
@@ -600,8 +603,8 @@ cluster_grd_outbound_enqueue_lmd_cancel(uint32 destination, const void *payload,
 void
 cluster_advisory_counter_inc(ClusterAdvisoryCounter which)
 {
-	(void)which;
-	abort();
+	HW_CHECK(which >= 0 && which < CLUSTER_ADVISORY_COUNTER_COUNT);
+	advisory_counts[which]++;
 }
 
 static void
@@ -864,7 +867,7 @@ cluster_grd_outbound_enqueue_backend_request(uint32 destination, const void *pay
 		HW_CHECK(packet.reply.reject_reason == GES_REJECT_REASON_SHARD_FROZEN);
 	} else
 		HW_CHECK(packet.held_mode
-					 == (cf_case ? cf_mode : (relation_case ? ShareLock : ExclusiveLock))
+					 == (cf_case ? cf_mode : (relation_case ? relation_mode : ExclusiveLock))
 				 && packet.reply.opcode == GES_REPLY_OPCODE_GRANT
 				 && packet.reply.reject_reason == GES_REJECT_REASON_NONE);
 	memset(&env, 0, sizeof(env));
@@ -966,11 +969,17 @@ setup_case(ClusterLockAcquireRequest *req, bool sibling)
 								 .type = CLUSTER_HW_RESID_TYPE,
 								 .lockmethodid = DEFAULT_LOCKMETHOD };
 	if (relation_case) {
-		req->resid.type = LOCKTAG_RELATION;
+		req->resid.type = relation_type;
+		if (relation_type == LOCKTAG_TRANSACTION) {
+			req->resid.field1 = 700;
+			req->resid.field2 = 1;
+			req->resid.field3 = req->resid.field4 = 0;
+		} else if (relation_type == LOCKTAG_ADVISORY)
+			req->resid.lockmethodid = USER_LOCKMETHOD;
 		/* Fixed deterministic search for a resource mastered by node3. */
 		while (cluster_grd_lookup_master(&req->resid) != 3)
-			req->resid.field2++;
-		req->locktag.locktag_type = LOCKTAG_RELATION;
+			req->resid.field1++;
+		req->locktag.locktag_type = relation_type;
 	}
 	if (cf_case) {
 		memset(&req->resid, 0, sizeof(req->resid));
@@ -981,7 +990,7 @@ setup_case(ClusterLockAcquireRequest *req, bool sibling)
 	HW_CHECK(cluster_grd_lookup_master(&req->resid) == 3);
 	req->op = CLUSTER_LOCK_OP_REQUEST;
 	req->dontwait = relation_nowait_case;
-	req->lockmode = cf_case ? cf_mode : (relation_case ? ShareLock : ExclusiveLock);
+	req->lockmode = cf_case ? cf_mode : (relation_case ? relation_mode : ExclusiveLock);
 	req->timeout_ms = 5000;
 	req->holder = grd_lifecycle_holder(1, 21, 201);
 	req->holder.cluster_epoch = 1;
@@ -1078,7 +1087,7 @@ run_case(bool sibling, HandoffFault selected)
 	UT_ASSERT_EQ(cluster_grd_holder_mode_by_id(&original_resid, &original, &mode),
 				 selected == HW_NORMAL);
 	if (selected == HW_NORMAL)
-		UT_ASSERT_EQ(mode, cf_case ? cf_mode : (relation_case ? ShareLock : ExclusiveLock));
+		UT_ASSERT_EQ(mode, cf_case ? cf_mode : (relation_case ? relation_mode : ExclusiveLock));
 	if (sibling)
 		UT_ASSERT_EQ(cluster_grd_cancel_reservation_by_id(&original_resid, &other),
 					 CLUSTER_GRD_ENTRY_OK);
@@ -1095,7 +1104,7 @@ run_case(bool sibling, HandoffFault selected)
 		UT_ASSERT_EQ(invalid_replies_rejected, 5);
 		UT_ASSERT_EQ(post.held_mode,
 					 selected == HW_NORMAL
-						 ? (cf_case ? cf_mode : (relation_case ? ShareLock : ExclusiveLock))
+						 ? (cf_case ? cf_mode : (relation_case ? relation_mode : ExclusiveLock))
 						 : NoLock);
 		UT_ASSERT_EQ(post.successor_mode,
 					 !no_master_grant && selected != HW_NORMAL ? ExclusiveLock : NoLock);
@@ -1175,7 +1184,8 @@ run_local_relation_case(bool abandon, bool nowait_conflict)
 	UT_ASSERT_EQ(cluster_lock_acquire_s4_remote_request_wait(&req),
 				 nowait_conflict ? CLUSTER_LOCK_ACQUIRE_NOT_AVAIL
 								 : CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK);
-	UT_ASSERT_EQ(local_native_probes, cf_case ? 0 : 1);
+	UT_ASSERT_EQ(local_native_probes,
+				 cluster_lms_native_probe_required(&req.resid, req.lockmode) ? 1 : 0);
 	UT_ASSERT_EQ(request_sent, 0);
 	if (nowait_conflict) {
 		(void)cluster_lock_acquire_s7_cleanup(&req);
@@ -1192,7 +1202,7 @@ run_local_relation_case(bool abandon, bool nowait_conflict)
 		(void)cluster_lock_acquire_s7_cleanup(&req);
 		UT_ASSERT_EQ(cleanup_sent, 1);
 		UT_ASSERT(cluster_grd_holder_mode_by_id(&req.resid, &req.holder, &mode));
-		UT_ASSERT_EQ(mode, cf_case ? cf_mode : ShareLock); /* Still owned until its drain. */
+		UT_ASSERT_EQ(mode, cf_case ? cf_mode : relation_mode); /* Still owned until its drain. */
 		UT_ASSERT_EQ(local_cleanup_release.holder_node_id, req.holder.node_id);
 		master_request = local_cleanup_release;
 		stage_master_work();
@@ -1243,6 +1253,46 @@ UT_TEST(relation_local_backout_drains_successor)
 UT_TEST(relation_local_nowait_keeps_conflict_semantics)
 {
 	run_local_relation_case(false, true);
+}
+
+UT_TEST(native_request_local_grant_and_conflict_matrix)
+{
+	const uint8 types[] = { LOCKTAG_OBJECT, LOCKTAG_ADVISORY, LOCKTAG_TRANSACTION };
+
+	for (unsigned i = 0; i < lengthof(types); i++) {
+		relation_type = types[i];
+		relation_mode = types[i] == LOCKTAG_OBJECT ? RowExclusiveLock : ShareLock;
+		run_local_relation_case(false, false);
+		run_local_relation_case(true, false);
+		run_local_relation_case(false, true);
+	}
+	relation_type = LOCKTAG_RELATION;
+	relation_mode = ShareLock;
+}
+
+UT_TEST(native_request_remote_grant_and_cleanup_matrix)
+{
+	const uint8 types[] = { LOCKTAG_OBJECT, LOCKTAG_ADVISORY, LOCKTAG_TRANSACTION };
+	const HandoffFault nowait[]
+		= { HW_NORMAL,		   HW_CANCEL_RESERVATION, HW_PRE_EPOCH, HW_IDENTITY_MISMATCH,
+			HW_S4_ERROR_READY, HW_NON_GRANT_NONE,	  HW_REJECT };
+
+	relation_case = true;
+	for (unsigned i = 0; i < lengthof(types); i++) {
+		relation_type = types[i];
+		relation_mode = types[i] == LOCKTAG_OBJECT ? RowExclusiveLock : ShareLock;
+		for (int selected = HW_NORMAL; selected <= HW_IDENTITY_MISMATCH; selected++)
+			run_case(true, (HandoffFault)selected);
+		relation_nowait_case = true;
+		for (unsigned j = 0; j < lengthof(nowait); j++)
+			run_case(true, nowait[j]);
+		relation_nowait_case = false;
+	}
+	UT_ASSERT(advisory_counts[CLUSTER_ADVISORY_TRY_GRANT] > 0);
+	UT_ASSERT(advisory_counts[CLUSTER_ADVISORY_TRY_NOTAVAIL] > 0);
+	relation_case = false;
+	relation_type = LOCKTAG_RELATION;
+	relation_mode = ShareLock;
 }
 
 /* A scalar CF reply used to lose its original master/key on every S4/S5
@@ -1747,6 +1797,73 @@ UT_TEST(hw_local_two_reservations_survive_exact_grants)
 	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
 	UT_ASSERT_EQ(request_sent, 0);
 	UT_ASSERT_EQ(ut_mock_epoch, 1);
+	MyProc = NULL;
+}
+
+UT_TEST(object_startup_compatible_reservations_survive_registration)
+{
+	ClusterLockAcquireRequest a, b;
+	ClusterLockAcquireResult a3, b3;
+	LOCKMODE mode = NoLock;
+
+	hw_local_competitors(&a, &b);
+	/* The database object taken by InitPostgres, using the actual master map. */
+	a.resid = (ClusterResId){ .field1 = 0,
+							  .field2 = 1262,
+							  .field3 = 5,
+							  .type = LOCKTAG_OBJECT,
+							  .lockmethodid = DEFAULT_LOCKMETHOD };
+	cluster_node_id = cluster_grd_lookup_master(&a.resid);
+	a.locktag.locktag_type = LOCKTAG_OBJECT;
+	a.lockmode = RowExclusiveLock;
+	b.resid = a.resid;
+	b.locktag = a.locktag;
+	b.lockmode = a.lockmode;
+	a3 = cluster_lock_acquire_s3_partition_reservation(&a);
+	MyProc->pgprocno = 22;
+	b3 = cluster_lock_acquire_s3_partition_reservation(&b);
+	/* The second compatible S3 occurs before the first native lock completes. */
+	hw_dispatch_reserved(&a, a3);
+	UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&a), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	hw_dispatch_reserved(&b, b3);
+	UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&b), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT(cluster_grd_holder_mode_by_id(&a.resid, &a.holder, &mode));
+	UT_ASSERT_EQ(mode, RowExclusiveLock);
+	UT_ASSERT(cluster_grd_holder_mode_by_id(&b.resid, &b.holder, &mode));
+	UT_ASSERT_EQ(mode, RowExclusiveLock);
+	UT_ASSERT_EQ(cluster_lock_acquire_s6_release(&a), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(cluster_lock_acquire_s6_release(&b), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+	UT_ASSERT_EQ(request_sent, 0);
+	MyProc = NULL;
+}
+
+UT_TEST(native_request_reservation_capacity_remains_bounded)
+{
+	ClusterLockAcquireRequest base, sibling;
+	ClusterLockAcquireRequest requests[PGRAC_GRD_MAX_HOLDERS_PUBLIC + 1];
+	LOCKMODE mode = NoLock;
+
+	hw_local_competitors(&base, &sibling);
+	base.resid.type = LOCKTAG_OBJECT;
+	cluster_node_id = cluster_grd_lookup_master(&base.resid);
+	base.locktag.locktag_type = LOCKTAG_OBJECT;
+	base.lockmode = RowExclusiveLock;
+	for (unsigned i = 0; i < lengthof(requests); i++) {
+		requests[i] = base;
+		requests[i].request_id = 201 + i;
+		MyProc->pgprocno = i;
+		UT_ASSERT_EQ(cluster_lock_acquire_s3_partition_reservation(&requests[i]),
+					 i < PGRAC_GRD_MAX_HOLDERS_PUBLIC ? CLUSTER_LOCK_ACQUIRE_OK_GRANTED
+													  : CLUSTER_LOCK_ACQUIRE_FAIL_RESERVATION_FULL);
+		UT_ASSERT(!cluster_grd_holder_mode_by_id(&base.resid, &requests[i].holder, &mode));
+	}
+	/* Capacity refusal creates no holder and cannot cancel an older request. */
+	for (unsigned i = 0; i < PGRAC_GRD_MAX_HOLDERS_PUBLIC; i++)
+		UT_ASSERT_EQ(cluster_grd_cancel_reservation_by_id(&base.resid, &requests[i].holder),
+					 CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+	UT_ASSERT_EQ(request_sent, 0);
 	MyProc = NULL;
 }
 
@@ -2303,7 +2420,7 @@ main(void)
 	MyBackendType = B_BACKEND; /* Definition belongs to the embedded GRD fixture. */
 	setvbuf(stdout, NULL, _IONBF, 0);
 	alarm(30); /* Standalone fixture owner, not a database deadline. */
-	UT_PLAN(47);
+	UT_PLAN(51);
 	UT_RUN(no_sibling_control);
 	UT_RUN(real_grant_sibling_promotes);
 	UT_RUN(relation_share_grant_survives_compatible_sibling);
@@ -2312,6 +2429,8 @@ main(void)
 	UT_RUN(relation_local_authoritative_grant);
 	UT_RUN(relation_local_backout_drains_successor);
 	UT_RUN(relation_local_nowait_keeps_conflict_semantics);
+	UT_RUN(native_request_local_grant_and_conflict_matrix);
+	UT_RUN(native_request_remote_grant_and_cleanup_matrix);
 	UT_RUN(cf_remote_grant_and_exact_cleanup);
 	UT_RUN(cf_local_grant_and_owned_backout);
 	UT_RUN(release_sender_unknown_master_cannot_confirm);
@@ -2342,6 +2461,8 @@ main(void)
 	UT_RUN(hw_local_cancel_after_grant_keeps_exact_cleanup_owner);
 	UT_RUN(hw_local_grant_rejects_epoch_change_before_promotion);
 	UT_RUN(hw_local_two_reservations_survive_exact_grants);
+	UT_RUN(object_startup_compatible_reservations_survive_registration);
+	UT_RUN(native_request_reservation_capacity_remains_bounded);
 	UT_RUN(hw_local_release_does_not_invalidate_another_reserved_request);
 	UT_RUN(relation_native_error_has_full_interval_cleanup_owner);
 	UT_RUN(cooperative_redeclare_yields_then_consumes_real_grant);

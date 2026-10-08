@@ -804,13 +804,13 @@ cluster_grd_promote_remote_grant_exact(const ClusterResId *resid pg_attribute_un
 }
 
 uint32
-cluster_ges_send_relation_request_and_wait(const ClusterResId *resid pg_attribute_unused(),
-										   uint32 mode pg_attribute_unused(),
-										   const ClusterGrdHolderId *holder pg_attribute_unused(),
-										   uint64 request_id pg_attribute_unused(),
-										   int timeout_ms pg_attribute_unused(),
-										   uint32 wait_event pg_attribute_unused(), bool dontwait,
-										   ClusterGesHwGrant *grant pg_attribute_unused())
+cluster_ges_send_native_request_and_wait(const ClusterResId *resid pg_attribute_unused(),
+										 uint32 mode pg_attribute_unused(),
+										 const ClusterGrdHolderId *holder pg_attribute_unused(),
+										 uint64 request_id pg_attribute_unused(),
+										 int timeout_ms pg_attribute_unused(),
+										 uint32 wait_event pg_attribute_unused(), bool dontwait,
+										 ClusterGesHwGrant *grant pg_attribute_unused())
 {
 	/* Mapping-only fixture; no retained authority is manufactured here. */
 	if (dontwait)

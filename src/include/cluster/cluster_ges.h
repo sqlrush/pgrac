@@ -64,6 +64,7 @@
 #include "port/atomics.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ges_reply_wait.h"
+#include "storage/lock.h"
 
 /*
  * ClusterGesSharedState -- spec-2.13 D2 skeleton shmem.
@@ -527,7 +528,7 @@ StaticAssertDecl(offsetof(GesRequestPayload, lock_group_procno_plus_one) == 72,
 
 extern uint32 cluster_ges_current_lock_group(const struct ClusterGrdHolderId *holder);
 
-/* Backend-local HW/relation REQUEST handoff.  Historical type name retained;
+/* Backend-local HW/native-lock REQUEST handoff.  Historical type name retained;
  * never a shared entry pointer, a new authority, or a wire payload. */
 typedef struct ClusterGesHwGrant {
 	GesReplyWaitKey key;
@@ -674,7 +675,15 @@ extern bool cluster_ges_hw_grant_is_current(const ClusterGesHwGrant *grant,
 											const struct ClusterGrdHolderId *holder,
 											uint64 request_id);
 extern void cluster_ges_hw_grant_abandon(ClusterGesHwGrant *grant);
-extern uint32 cluster_ges_send_relation_request_and_wait(
+/* The four native lock classes already admitted by the cluster lock gate. */
+static inline bool
+cluster_ges_native_lock_type(uint8 type)
+{
+	return type == LOCKTAG_RELATION || type == LOCKTAG_OBJECT || type == LOCKTAG_ADVISORY
+		   || type == LOCKTAG_TRANSACTION;
+}
+
+extern uint32 cluster_ges_send_native_request_and_wait(
 	const struct ClusterResId *resid, uint32 mode, const struct ClusterGrdHolderId *holder,
 	uint64 request_id, int timeout_ms, uint32 wait_event, bool dontwait, ClusterGesHwGrant *grant);
 extern bool cluster_ges_relation_grant_is_current(const ClusterGesHwGrant *grant,

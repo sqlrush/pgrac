@@ -267,9 +267,9 @@ cluster_lock_acquire_s2_identity(const ClusterLockAcquireRequest *req)
 
 
 static bool
-cluster_lock_acquire_is_relation_request(const ClusterLockAcquireRequest *req)
+cluster_lock_acquire_is_native_request(const ClusterLockAcquireRequest *req)
 {
-	return req->resid.type == LOCKTAG_RELATION && req->op == CLUSTER_LOCK_OP_REQUEST
+	return cluster_ges_native_lock_type(req->resid.type) && req->op == CLUSTER_LOCK_OP_REQUEST
 		   && req->current_mode == NoLock;
 }
 
@@ -335,7 +335,7 @@ cluster_lock_acquire_s3_partition_reservation(const ClusterLockAcquireRequest *r
 	 * as a second grant authority. CF has no PG-native lock; HW acquires its
 	 * native relation-extension lock only after this global handoff, so local
 	 * HW reservations can overlap here too. */
-	if (cluster_lock_acquire_is_relation_request(req) || cluster_lock_acquire_is_cf_request(req)
+	if (cluster_lock_acquire_is_native_request(req) || cluster_lock_acquire_is_cf_request(req)
 		|| cluster_lock_acquire_is_hw_request(req))
 		return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 
@@ -378,7 +378,7 @@ static bool
 cluster_lock_acquire_retained_grant_is_current(const ClusterLockAcquireRequest *req, bool *pending)
 {
 	*pending = false;
-	return (cluster_lock_acquire_is_relation_request(req) || cluster_lock_acquire_is_cf_request(req)
+	return (cluster_lock_acquire_is_native_request(req) || cluster_lock_acquire_is_cf_request(req)
 			|| cluster_lock_acquire_is_hw_request(req))
 		   && cluster_ges_retained_grant_check(&req->hw_grant, &req->resid, &req->holder,
 											   req->request_id, req->lockmode, req->dontwait,
@@ -415,10 +415,10 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 	if (dontwait) {
 		/* NOWAIT never enqueues a waiter (immediate grant-or-reject) — it
 		 * cannot participate in a deadlock, so no wait-state is published. */
-		if (cluster_lock_acquire_is_relation_request(req)) {
+		if (cluster_lock_acquire_is_native_request(req)) {
 			PG_TRY();
 			{
-				reject = cluster_ges_send_relation_request_and_wait(
+				reject = cluster_ges_send_native_request_and_wait(
 					&req->resid, (uint32)req->lockmode, &req->holder, req->request_id,
 					req->timeout_ms, req->wait_event, true,
 					&((ClusterLockAcquireRequest *)req)->hw_grant);
@@ -454,8 +454,8 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 				reject = cluster_ges_send_hw_request_and_wait(
 					&req->resid, &req->holder, req->request_id, req->timeout_ms, req->wait_event,
 					&((ClusterLockAcquireRequest *)req)->hw_grant);
-			else if (cluster_lock_acquire_is_relation_request(req))
-				reject = cluster_ges_send_relation_request_and_wait(
+			else if (cluster_lock_acquire_is_native_request(req))
+				reject = cluster_ges_send_native_request_and_wait(
 					&req->resid, (uint32)req->lockmode, &req->holder, req->request_id,
 					req->timeout_ms, req->wait_event, false,
 					&((ClusterLockAcquireRequest *)req)->hw_grant);
@@ -474,7 +474,7 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 			if (ws != NULL)
 				cluster_lmd_wait_state_clear(ws);
 			if (cluster_lock_acquire_is_hw_request(req)
-				|| cluster_lock_acquire_is_relation_request(req)
+				|| cluster_lock_acquire_is_native_request(req)
 				|| cluster_lock_acquire_is_cf_request(req)) {
 				ConditionVariableCancelSleep();
 				(void)cluster_lock_acquire_s7_cleanup(req);
@@ -666,15 +666,14 @@ cluster_lock_acquire_s5_promote_once(const ClusterLockAcquireRequest *req)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING;
 	mut->registration_failure_reason = NULL;
 
-	/* Retained HW/relation/CF GRANT owns its exact registration, not the S3
-	 * mutation snapshot.  Unmodified legacy classes keep their old path. */
+	/* Retained HW/native-lock/CF GRANT owns its exact registration, not
+	 * the S3 mutation snapshot. Other control classes keep their own path. */
 	if (req->hw_grant.key.request_id != 0) {
 		ClusterGesHwGrant *grant = &((ClusterLockAcquireRequest *)req)->hw_grant;
 		volatile bool promoted = false;
 		bool pending = false;
 		bool mode_aware
-			= cluster_lock_acquire_is_relation_request(req)
-			  || cluster_lock_acquire_is_cf_request(req)
+			= cluster_lock_acquire_is_native_request(req) || cluster_lock_acquire_is_cf_request(req)
 			  || (cluster_lock_acquire_is_hw_request(req) && grant->master == cluster_node_id);
 
 		if (grant->consumed) {
@@ -732,7 +731,7 @@ cluster_lock_acquire_s5_promote_once(const ClusterLockAcquireRequest *req)
 		pg_atomic_fetch_add_u64(&stub_s5_promote_count, 1);
 		return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 	}
-	if (cluster_lock_acquire_is_relation_request(req) || req->resid.type == CLUSTER_CF_RESID_TYPE) {
+	if (cluster_lock_acquire_is_native_request(req) || req->resid.type == CLUSTER_CF_RESID_TYPE) {
 		mut->registration_failure_reason = "NO_RETAINED_MASTER_GRANT";
 		(void)cluster_lock_acquire_s7_cleanup(req);
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;

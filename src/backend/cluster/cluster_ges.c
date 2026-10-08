@@ -2515,7 +2515,7 @@ cluster_ges_retained_grant_check(const ClusterGesHwGrant *grant, const ClusterRe
 	*pending = false;
 	if (resid == NULL)
 		return false;
-	if (resid->type == LOCKTAG_RELATION) {
+	if (cluster_ges_native_lock_type(resid->type)) {
 		if (mode < AccessShareLock || mode > AccessExclusiveLock)
 			return false;
 		opcode = dontwait ? GES_REQ_OPCODE_REQUEST_NOWAIT : GES_REQ_OPCODE_REQUEST;
@@ -2658,7 +2658,8 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 	bool debug1_starvation_fired;
 	bool retained_local_grant
 		= hw_grant != NULL && resid != NULL
-		  && (resid->type == LOCKTAG_RELATION || ges_cf_request_is_canonical(resid, lockmode)
+		  && (cluster_ges_native_lock_type(resid->type)
+			  || ges_cf_request_is_canonical(resid, lockmode)
 			  || (resid->type == CLUSTER_HW_RESID_TYPE && lockmode == ExclusiveLock
 				  && current_mode == NoLock && send_opcode == GES_REQ_OPCODE_REQUEST));
 	/* spec-5.6 Dc4b: caller-supplied wait-event label (0 = GES default). */
@@ -2779,7 +2780,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		}
 		if (retained_local_grant) {
 			/* Same pre-existing PG-native barrier, now shared by every local
-			 * relation request; CF has no PG-native lock and needs no probe. */
+			 * native request; CF has no PG-native lock and needs no probe. */
 			if (cluster_lms_native_probe_required(resid, (LOCKMODE)lockmode)
 				&& !cluster_lms_native_probe_wait_clear(resid, (LOCKMODE)lockmode, holder, 0)) {
 				cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_NATIVE_PROBE_TIMEOUT,
@@ -3334,15 +3335,15 @@ cluster_ges_send_hw_request_and_wait(const ClusterResId *resid, const ClusterGrd
 }
 
 uint32
-cluster_ges_send_relation_request_and_wait(const ClusterResId *resid, uint32 mode,
-										   const ClusterGrdHolderId *holder, uint64 request_id,
-										   int timeout_ms, uint32 wait_event, bool dontwait,
-										   ClusterGesHwGrant *grant)
+cluster_ges_send_native_request_and_wait(const ClusterResId *resid, uint32 mode,
+										 const ClusterGrdHolderId *holder, uint64 request_id,
+										 int timeout_ms, uint32 wait_event, bool dontwait,
+										 ClusterGesHwGrant *grant)
 {
-	if (resid == NULL || resid->type != LOCKTAG_RELATION || holder == NULL || grant == NULL
-		|| mode < AccessShareLock || mode > AccessExclusiveLock || grant->cleanup_pending
-		|| grant->grant_observed || grant->local_promoted || grant->consumed
-		|| holder->node_id != cluster_node_id || holder->request_id != request_id
+	if (resid == NULL || !cluster_ges_native_lock_type(resid->type) || holder == NULL
+		|| grant == NULL || mode < AccessShareLock || mode > AccessExclusiveLock
+		|| grant->cleanup_pending || grant->grant_observed || grant->local_promoted
+		|| grant->consumed || holder->node_id != cluster_node_id || holder->request_id != request_id
 		|| holder->cluster_epoch != cluster_epoch_get_current())
 		return GES_REJECT_REASON_EPOCH_MISMATCH;
 	return ges_send_request_opcode_and_wait(
