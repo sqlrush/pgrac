@@ -158,6 +158,111 @@ capacity_release_present(const ClusterResId *resid, const ClusterGrdHolderId *ho
 	}
 }
 
+static int capacity_attach_cleanup_calls;
+
+static void
+capacity_attach_scope_cleanup(int code, Datum arg)
+{
+	UT_ASSERT_EQ(code, 0);
+	UT_ASSERT_EQ(DatumGetInt32(arg), 501);
+	capacity_attach_cleanup_calls++;
+}
+
+static void
+capacity_first_attach_scope(bool inject_error)
+{
+	ClusterResId resid;
+	sigjmp_buf *saved_exception_stack = PG_exception_stack;
+	ErrorContextCallback *saved_context_stack = error_context_stack;
+	volatile int lookups = 0;
+	volatile bool caught = false;
+	volatile bool returned = false;
+
+	/* Initialize shared storage without a lookup. This process must still be
+	 * cold when the temporary cleanup is pushed, as in current_acquire_begin. */
+	grd_lifecycle_reset(4);
+	grd_lifecycle_resid(501, &resid);
+	UT_ASSERT_EQ(ut_grd_before_count, 0);
+	UT_ASSERT_EQ(ut_grd_on_count, 0);
+	UT_ASSERT_EQ(ut_grd_exit_lifo_errors, 0);
+	capacity_attach_cleanup_calls = 0;
+	PG_TRY();
+	{
+		PG_ENSURE_ERROR_CLEANUP(capacity_attach_scope_cleanup, Int32GetDatum(501));
+		{
+			for (int i = 0; i < 2; i++) {
+				ClusterGrdEntry *entry = NULL;
+
+				UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&resid, false, &entry),
+							 CLUSTER_GRD_ENTRY_NOT_FOUND);
+				UT_ASSERT(entry == NULL);
+				lookups++;
+				UT_ASSERT_EQ(ut_grd_before_count, 1);
+				UT_ASSERT_EQ(ut_grd_on_count, 1);
+				if (ut_grd_before_count > 0
+					&& ut_grd_before_count <= lengthof(ut_grd_before_callbacks)) {
+					UT_ASSERT(ut_grd_before_callbacks[ut_grd_before_count - 1]
+							  == capacity_attach_scope_cleanup);
+					UT_ASSERT_EQ(ut_grd_before_arguments[ut_grd_before_count - 1],
+								 Int32GetDatum(501));
+				}
+			}
+			if (inject_error)
+				ereport(ERROR, (errmsg("injected error after first GRD attachment")));
+		}
+		PG_END_ENSURE_ERROR_CLEANUP(capacity_attach_scope_cleanup, Int32GetDatum(501));
+		returned = true;
+	}
+	PG_CATCH();
+	{
+		caught = true;
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	printf("# cold_attach error=%d lookups=%d before=%d on=%d lifo=%d cleanup=%d caught=%d "
+		   "returned=%d\n",
+		   inject_error, lookups, ut_grd_before_count, ut_grd_on_count, ut_grd_exit_lifo_errors,
+		   capacity_attach_cleanup_calls, caught, returned);
+	UT_ASSERT_EQ(lookups, 2);
+	UT_ASSERT_EQ(caught, inject_error);
+	UT_ASSERT_EQ(returned, !inject_error);
+	UT_ASSERT_EQ(capacity_attach_cleanup_calls, inject_error ? 1 : 0);
+	UT_ASSERT_EQ(ut_grd_before_count, 0);
+	UT_ASSERT_EQ(ut_grd_on_count, 1);
+	UT_ASSERT_EQ(ut_grd_exit_lifo_errors, 0);
+	UT_ASSERT(PG_exception_stack == saved_exception_stack);
+	UT_ASSERT(error_context_stack == saved_context_stack);
+}
+
+UT_TEST(first_grd_attach_preserves_temporary_error_cleanup_scope)
+{
+	/* Run first: neither child may inherit an already attached GRD area. Two
+	 * fresh processes cover normal END cancellation and the ERROR unwind;
+	 * a failing callback stack cannot contaminate the other capacity cases. */
+	for (int inject_error = 0; inject_error < 2; inject_error++) {
+		pid_t child = fork();
+		pid_t waited;
+		int status = 0;
+
+		UT_ASSERT(child >= 0);
+		if (child < 0)
+			continue;
+		if (child == 0) {
+			alarm(30);
+			ut_current_failed = 0;
+			capacity_first_attach_scope(inject_error != 0);
+			_exit(ut_current_failed ? 1 : 0);
+		}
+		do {
+			waited = waitpid(child, &status, 0);
+		} while (waited < 0 && errno == EINTR);
+		UT_ASSERT_EQ(waited, child);
+		UT_ASSERT(WIFEXITED(status));
+		if (waited == child && WIFEXITED(status))
+			UT_ASSERT_EQ(WEXITSTATUS(status), 0);
+	}
+}
+
 /* A compatible owner must not disappear at the old per-resource boundary.
  * Keep scanning and clean actual owners even on RED, so the same run proves
  * both the missing grants and whether exact release leaves residual state. */
@@ -917,7 +1022,8 @@ main(void)
 	MyBackendType = B_BACKEND;
 	setvbuf(stdout, NULL, _IONBF, 0);
 	alarm(30); /* Same standalone watchdog; no product deadline is changed. */
-	UT_PLAN(19);
+	UT_PLAN(20);
+	UT_RUN(first_grd_attach_preserves_temporary_error_cleanup_scope);
 	UT_RUN(compatible_16_control_releases_exact_owners);
 	UT_RUN(compatible_17_owners_are_all_granted);
 	UT_RUN(compatible_32_owners_are_all_granted);
