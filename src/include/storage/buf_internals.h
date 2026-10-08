@@ -496,8 +496,9 @@ BufferCrKeyValid(const BufferCrKey *key)
 		SCN_VALID(key->read_scn) && key->read_epoch != 0;
 }
 
+/* Header-only observers must not inspect links protected by mapping locks. */
 static inline bool
-BufferCrStateValid(const BufferDesc *buf, uint32 state)
+BufferCrHeaderValid(const BufferDesc *buf, uint32 state)
 {
 	const uint32 forbidden = BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED |
 		BM_IO_IN_PROGRESS | BM_IO_ERROR;
@@ -508,13 +509,19 @@ BufferCrStateValid(const BufferDesc *buf, uint32 state)
 		buf->cluster_padding_1 == 0 &&
 		(state & (BM_VALID | BM_TAG_VALID)) == (BM_VALID | BM_TAG_VALID) &&
 		(state & forbidden) == 0 && buf->buf_id >= 0 && buf->buf_id < NBuffers &&
-		buf->cr.prev_id >= -1 && buf->cr.prev_id < NBuffers &&
-		buf->cr.next_id >= -1 && buf->cr.next_id < NBuffers &&
-		buf->cr.prev_id != buf->buf_id && buf->cr.next_id != buf->buf_id &&
-		(buf->cr.prev_id == -1 || buf->cr.prev_id != buf->cr.next_id) &&
 		buf->cr_anchor_generation != 0 && buf->cr.scan_identity != 0 &&
 		buf->cr.snapshot_identity != 0 && SCN_VALID(buf->cr.read_scn) &&
 		buf->cr.read_epoch != 0;
+}
+
+static inline bool
+BufferCrStateValid(const BufferDesc *buf, uint32 state)
+{
+	return BufferCrHeaderValid(buf, state) &&
+		buf->cr.prev_id >= -1 && buf->cr.prev_id < NBuffers &&
+		buf->cr.next_id >= -1 && buf->cr.next_id < NBuffers &&
+		buf->cr.prev_id != buf->buf_id && buf->cr.next_id != buf->buf_id &&
+		(buf->cr.prev_id == -1 || buf->cr.prev_id != buf->cr.next_id);
 }
 
 static inline bool
@@ -766,6 +773,13 @@ extern bool BufTableCRInsert(BufferTag *tagPtr, uint32 hashcode, int cr_id,
 extern bool BufTableCRReplaceHead(BufferTag *tagPtr, uint32 hashcode,
 								  uint64 generation, int expected_head,
 								  int replacement_head);
+/* Original read owner proves image eligibility after reserve and before
+ * publish. Reserve/publish keep the caller's native pin; release it normally.
+ * Copy returns bytes only, never current-buffer or visibility authority. */
+extern Buffer cluster_bufmgr_cr_reserve_v1(void);
+extern bool cluster_bufmgr_cr_publish_v1(Buffer buffer, const BufferCrKey *key,
+										  const void *page);
+extern bool cluster_bufmgr_cr_copy_v1(const BufferCrKey *key, void *page);
 #endif
 
 /* localbuf.c */

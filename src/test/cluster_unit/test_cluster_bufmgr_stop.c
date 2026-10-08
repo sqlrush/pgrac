@@ -530,10 +530,38 @@ test_invalid_uninitialized_residency_is_not_cached_authority(void)
 	}
 }
 
+static void
+test_cr_stop_requires_clean_immutable_metadata(void)
+{
+	BufferDesc *buf;
+	const uint32 forbidden[]
+		= { BM_DIRTY, BM_JUST_DIRTIED, BM_CHECKPOINT_NEEDED, BM_IO_IN_PROGRESS, BM_IO_ERROR };
+	int i;
+
+	reset_fixture();
+	buf = resident(0);
+	buf->buffer_type = BUF_TYPE_CR;
+	buf->pcm_state = PCM_STATE_N;
+	buf->cr_anchor_generation = 1;
+	buf->cr.read_epoch = 1;
+	buf->cr.read_scn = scn_encode(0, 121);
+	buf->cr.snapshot_identity = 2;
+	buf->cr.scan_identity = 3;
+	UT_ASSERT_EQ(poll_stop(true), CLUSTER_NORMAL_STOP_READY);
+	for (i = 0; i < lengthof(forbidden); i++) {
+		pg_atomic_fetch_or_u32(&buf->state, forbidden[i]);
+		UT_ASSERT_EQ(poll_stop(false), CLUSTER_NORMAL_STOP_INVALID);
+		pg_atomic_fetch_and_u32(&buf->state, ~forbidden[i]);
+	}
+	buf->cr.snapshot_identity = 0;
+	UT_ASSERT_EQ(poll_stop(false), CLUSTER_NORMAL_STOP_INVALID);
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
+	UT_RUN(test_cr_stop_requires_clean_immutable_metadata);
 	UT_RUN(test_required_init_and_lock_boundary);
 	UT_RUN(test_original_reservation_activation_delivery_completion);
 	UT_RUN(test_original_pi_convert_preserve_discard);

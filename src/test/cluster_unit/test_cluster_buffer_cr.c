@@ -26,8 +26,11 @@
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "pgstat.h"
 #include "storage/buf_internals.h"
 #include "storage/shmem.h"
+#include "utils/memdebug.h"
+#include "utils/resowner_private.h"
 
 #undef printf
 #undef fprintf
@@ -42,6 +45,7 @@ LWLockPadded *MainLWLockArray;
 bool cluster_shared_config = true;
 bool cluster_shared_catalog = true;
 bool cluster_enabled;
+bool cluster_read_scache = true;
 bool cluster_recmerge_window_active;
 int cluster_pcm_grd_max_entries;
 ClusterConf *ClusterConfShmem;
@@ -59,10 +63,78 @@ static unsigned lock_depth;
 static unsigned lock_acquisitions;
 static unsigned invalidations;
 static int private_pin[64];
+static PGIOAlignedBlock pages[64];
+char *BufferBlocks = (char *)pages;
+ResourceOwner CurrentResourceOwner;
+static unsigned remembered_pins;
+static unsigned pin_waiter_signals;
+static bool copy_error;
+static bool copy_observed_pin;
+static void *copy_destination;
+static unsigned reserve_calls;
+static uint32 clock_hand;
+static unsigned physical_writes;
+WritebackContext BackendWritebackContext;
+
+typedef struct PrivateRefCountEntry PrivateRefCountEntry;
+static PrivateRefCountEntry *GetPrivateRefCountEntry(Buffer buffer, bool do_move);
+static PrivateRefCountEntry *NewPrivateRefCountEntry(Buffer buffer);
+static void ForgetPrivateRefCountEntry(PrivateRefCountEntry *entry);
+static void ReservePrivateRefCountEntry(void);
+static uint32 WaitBufHdrUnlocked(BufferDesc *buf);
+static Buffer GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context);
+#define BufHdrGetBlock(buf) ((Block)(BufferBlocks + (Size)(buf)->buf_id * BLCKSZ))
+#define BufferGetLSN(buf) PageGetLSN((Page)BufHdrGetBlock(buf))
+#define BUF_WRITTEN 0x01
+#define BUF_REUSABLE 0x02
 
 static void InvalidateBufferCommitTailLocked(BufferDesc *, BufferTag *, uint32, LWLock *, uint32,
 											 uint8, bool);
 static void InvalidateBuffer(BufferDesc *buf);
+
+bool
+LWLockHeldByMe(LWLock *lock pg_attribute_unused())
+{
+	return false;
+}
+
+void
+ResourceOwnerEnlargeBuffers(ResourceOwner owner pg_attribute_unused())
+{
+	UT_ASSERT_EQ(lock_depth, 0);
+}
+
+void
+ResourceOwnerRememberBuffer(ResourceOwner owner pg_attribute_unused(), Buffer buffer)
+{
+	private_pin[buffer - 1]++;
+	remembered_pins++;
+}
+
+void
+ResourceOwnerForgetBuffer(ResourceOwner owner pg_attribute_unused(), Buffer buffer)
+{
+	UT_ASSERT(private_pin[buffer - 1] > 0);
+	private_pin[buffer - 1]--;
+	remembered_pins--;
+}
+
+void
+ProcSendSignal(int proc_number pg_attribute_unused())
+{
+	pin_waiter_signals++;
+}
+
+bool
+LWLockHeldByMeInMode(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+{
+	return true;
+}
+
+#define cluster_pcm_own_flags_get(id) owner_flags[id]
+#define cluster_pcm_own_writer_activation_token_get(id) UINT64_C(0)
+#define cluster_pcm_own_resource_x_activation_generation_get(id) UINT64_C(0)
+#define cluster_pcm_own_delivery_attempt_get(id) UINT64_C(0)
 
 bool
 LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
@@ -194,10 +266,131 @@ cluster_bufmgr_resource_x_target_evict_locked(
 void
 pg_re_throw(void)
 {
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
 	longjmp(error_jump, 1);
 }
 
+#include "test_cluster_buffer_cr_pins.inc"
+
+static PrivateRefCountEntry private_refs[64];
+
+static PrivateRefCountEntry *
+GetPrivateRefCountEntry(Buffer buffer, bool do_move pg_attribute_unused())
+{
+	return private_refs[buffer - 1].buffer == buffer ? &private_refs[buffer - 1] : NULL;
+}
+
+static PrivateRefCountEntry *
+NewPrivateRefCountEntry(Buffer buffer)
+{
+	PrivateRefCountEntry *ref = &private_refs[buffer - 1];
+	UT_ASSERT_EQ(ref->buffer, InvalidBuffer);
+	ref->buffer = buffer;
+	return ref;
+}
+
+static void
+ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref)
+{
+	memset(ref, 0, sizeof(*ref));
+}
+
+static void
+ReservePrivateRefCountEntry(void)
+{
+	/* Only private refcount allocation is mocked; pin CAS/owner accounting
+	 * below execute the original PinBuffer/UnpinBuffer functions. */
+}
+
+static uint32
+WaitBufHdrUnlocked(BufferDesc *buf pg_attribute_unused())
+{
+	abort();
+}
+
+/* Execute the native clock loop with only its shared hand and optional
+ * strategy-ring storage replaced. No replacement victim-selection model. */
+#define ClockSweepTick() (clock_hand++ % NBuffers)
+#define AddBufferToRing(strategy, buf) ((void)0)
+BufferDesc *
+StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_ring)
+{
+	BufferDesc *buf;
+	uint32 local_buf_state;
+	int trycounter;
+
+	UT_ASSERT_EQ(lock_depth, 0);
+	reserve_calls++;
+	*from_ring = false;
+#include "test_cluster_pcm_clock_sweep.inc"
+}
+#undef ClockSweepTick
+#undef AddBufferToRing
+
+void
+CheckBufferIsPinnedOnce(Buffer buffer)
+{
+	UT_ASSERT_EQ(private_pin[buffer - 1], 1);
+}
+
+bool
+LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
+{
+	return LWLockAcquire(lock, mode);
+}
+
+bool
+XLogNeedsFlush(XLogRecPtr lsn pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+StrategyRejectBuffer(BufferAccessStrategy strategy pg_attribute_unused(),
+					 BufferDesc *buf pg_attribute_unused(), bool from_ring pg_attribute_unused())
+{
+	return false;
+}
+
+static void
+FlushBuffer(BufferDesc *buf, SMgrRelation reln pg_attribute_unused(),
+			IOObject object pg_attribute_unused(), IOContext context pg_attribute_unused())
+{
+	UT_ASSERT_NE(buf->buffer_type, BUF_TYPE_CR);
+	physical_writes++;
+	pg_atomic_fetch_and_u32(&buf->state, ~(BM_DIRTY | BM_JUST_DIRTIED));
+}
+
+void
+ScheduleBufferTagForWriteback(WritebackContext *wb pg_attribute_unused(),
+							  IOContext context pg_attribute_unused(),
+							  BufferTag *tag pg_attribute_unused())
+{
+	UT_ASSERT_EQ(lock_depth, 0);
+}
+
+void
+pgstat_count_io_op(IOObject object pg_attribute_unused(), IOContext context pg_attribute_unused(),
+				   IOOp op pg_attribute_unused())
+{}
+
+static void *
+copy_bytes(void *dst, const void *src, size_t size)
+{
+	if (dst == copy_destination) {
+		UT_ASSERT_EQ(lock_depth, 0);
+		UT_ASSERT(remembered_pins > 0);
+		copy_observed_pin = true;
+		if (copy_error)
+			pg_re_throw();
+	}
+	return memcpy(dst, src, size);
+}
+
+#define memcpy copy_bytes
 #include "test_cluster_buffer_cr_owner.inc"
+#undef memcpy
 
 /* The relation AEL guarantees that no new version can enter while DROP scans.
  * The fixture preserves the production header-to-mapping lock order. */
@@ -227,6 +420,14 @@ reset_buffers(void)
 	memset(descriptors, 0, sizeof(descriptors));
 	memset(owner_flags, 0, sizeof(owner_flags));
 	memset(private_pin, 0, sizeof(private_pin));
+	memset(private_refs, 0, sizeof(private_refs));
+	memset(pages, 0, sizeof(pages));
+	remembered_pins = pin_waiter_signals = reserve_calls = 0;
+	physical_writes = 0;
+	clock_hand = 6;
+	copy_error = copy_observed_pin = false;
+	copy_destination = NULL;
+	PG_exception_stack = NULL;
 	bumps = frees = wal_resets = lock_depth = invalidations = 0;
 	lock_acquisitions = 0;
 	for (i = 0; i < NBuffers; i++) {
@@ -458,10 +659,341 @@ UT_TEST(test_fast_drop_rejects_a_still_mapped_wrong_tag_without_spinning)
 	UT_ASSERT_EQ(frees, 0);
 }
 
+UT_TEST(test_cr_has_no_mutation_authority_even_without_pcm)
+{
+	BufferTag tag = reset_buffers();
+	BufferDesc *current = GetBufferDescriptor(0);
+	BufferDesc *cr = GetBufferDescriptor(1);
+
+	install_current(&tag, 0);
+	install_cr(&tag, 1);
+	cluster_enabled = false;
+	UT_ASSERT(cluster_bufmgr_pcm_x_content_write_permitted(current));
+	UT_ASSERT(cluster_bufmgr_pcm_x_content_holder_write_permitted(current));
+	UT_ASSERT(cluster_bufmgr_pcm_x_ordinary_content_write_permitted(current));
+	UT_ASSERT(cluster_bufmgr_block_write_permitted(1));
+	UT_ASSERT(!cluster_bufmgr_pcm_x_content_write_permitted(cr));
+	UT_ASSERT(!cluster_bufmgr_pcm_x_content_holder_write_permitted(cr));
+	UT_ASSERT(!cluster_bufmgr_pcm_x_ordinary_content_write_permitted(cr));
+	UT_ASSERT(!cluster_bufmgr_block_write_permitted(2));
+}
+
+static BufferCrKey
+scoped_key(BufferTag tag)
+{
+	BufferCrKey key = { 0 };
+	key.tag = tag;
+	key.scan_identity = 81;
+	key.snapshot_identity = 82;
+	key.read_scn = 100;
+	key.read_epoch = 1;
+	return key;
+}
+
+UT_TEST(test_native_reservation_publishes_clean_cr_and_copies_with_original_pin)
+{
+	BufferTag tag = reset_buffers();
+	BufferCrKey key = scoped_key(tag);
+	PGIOAlignedBlock page;
+	PGIOAlignedBlock output;
+	Buffer buffer = cluster_bufmgr_cr_reserve_v1();
+	BufferDesc *buf;
+
+	UT_ASSERT(buffer > 0);
+	if (buffer <= 0)
+		return;
+	buf = GetBufferDescriptor(buffer - 1);
+	install_current(&tag, 0);
+	memset(page.data, 0x4a, BLCKSZ);
+	UT_ASSERT_EQ(reserve_calls, 1);
+	UT_ASSERT_EQ(remembered_pins, 1);
+	UT_ASSERT(cluster_bufmgr_cr_publish_v1(buffer, &key, page.data));
+	UT_ASSERT(
+		BufferCrMatches(buf, pg_atomic_read_u32(&buf->state), &key, buf->cr_anchor_generation));
+	UT_ASSERT_EQ(BufTableLookup(&tag, BufTableHashCode(&tag)), 0);
+	UnpinBuffer(buf);
+	copy_destination = output.data;
+	UT_ASSERT(cluster_bufmgr_cr_copy_v1(&key, output.data));
+	UT_ASSERT(copy_observed_pin);
+	UT_ASSERT_EQ(memcmp(page.data, output.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(remembered_pins, 0);
+	UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf->state)), 0);
+}
+
+UT_TEST(test_duplicate_publish_preserves_first_image_and_losing_reservation)
+{
+	BufferCrKey key = scoped_key(reset_buffers());
+	PGIOAlignedBlock first, second, output;
+	Buffer a = cluster_bufmgr_cr_reserve_v1();
+	Buffer b;
+	int head;
+	uint64 generation;
+
+	UT_ASSERT(a > 0);
+	if (a <= 0)
+		return;
+	memset(first.data, 0x34, BLCKSZ);
+	memset(second.data, 0x56, BLCKSZ);
+	UT_ASSERT(cluster_bufmgr_cr_publish_v1(a, &key, first.data));
+	b = cluster_bufmgr_cr_reserve_v1();
+	UT_ASSERT(!cluster_bufmgr_cr_publish_v1(b, &key, second.data));
+	UT_ASSERT((pg_atomic_read_u32(&GetBufferDescriptor(b - 1)->state) & BM_TAG_VALID) == 0);
+	UT_ASSERT(BufTableCRLookup(&key.tag, BufTableHashCode(&key.tag), &head, &generation));
+	UT_ASSERT_EQ(head, a - 1);
+	UT_ASSERT_EQ(GetBufferDescriptor(a - 1)->cr.next_id, -1);
+	UnpinBuffer(GetBufferDescriptor(b - 1));
+	UnpinBuffer(GetBufferDescriptor(a - 1));
+	UT_ASSERT(cluster_bufmgr_cr_copy_v1(&key, output.data));
+	UT_ASSERT_EQ(memcmp(first.data, output.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(remembered_pins, 0);
+}
+
+UT_TEST(test_wrong_scope_snapshot_scn_epoch_or_tag_misses_without_touching_output)
+{
+	BufferCrKey key = scoped_key(reset_buffers());
+	PGIOAlignedBlock page, output, sentinel;
+	Buffer buffer = cluster_bufmgr_cr_reserve_v1();
+	int variant;
+
+	UT_ASSERT(buffer > 0);
+	if (buffer <= 0)
+		return;
+	memset(page.data, 0x37, BLCKSZ);
+	memset(sentinel.data, 0xa1, BLCKSZ);
+	UT_ASSERT(cluster_bufmgr_cr_publish_v1(buffer, &key, page.data));
+	UnpinBuffer(GetBufferDescriptor(buffer - 1));
+	for (variant = 0; variant < 7; variant++) {
+		BufferCrKey changed = key;
+		switch (variant) {
+		case 0:
+			changed.scan_identity++;
+			break;
+		case 1:
+			changed.snapshot_identity++;
+			break;
+		case 2:
+			changed.read_scn++;
+			break;
+		case 3:
+			changed.read_epoch++;
+			break;
+		case 4:
+			changed.tag.relNumber++;
+			break;
+		case 5:
+			changed.tag.blockNum++;
+			break;
+		case 6:
+			changed.reserved_zero = 1;
+			break;
+		}
+		memcpy(output.data, sentinel.data, BLCKSZ);
+		UT_ASSERT(!cluster_bufmgr_cr_copy_v1(&changed, output.data));
+		UT_ASSERT_EQ(memcmp(output.data, sentinel.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(remembered_pins, 0);
+	}
+}
+
+UT_TEST(test_publish_refuses_mapped_or_multiply_pinned_or_reserved_descriptor)
+{
+	BufferTag tag = reset_buffers();
+	BufferCrKey key = scoped_key(tag);
+	PGIOAlignedBlock page;
+	Buffer buffer = cluster_bufmgr_cr_reserve_v1();
+	BufferDesc *buf;
+
+	UT_ASSERT(buffer > 0);
+	if (buffer <= 0)
+		return;
+	buf = GetBufferDescriptor(buffer - 1);
+	memset(page.data, 0x77, BLCKSZ);
+	install_current(&tag, 0);
+	(void)PinBuffer(GetBufferDescriptor(0), NULL);
+	UT_ASSERT(!cluster_bufmgr_cr_publish_v1(1, &key, page.data));
+	UnpinBuffer(GetBufferDescriptor(0));
+	(void)PinBuffer(buf, NULL);
+	UT_ASSERT(!cluster_bufmgr_cr_publish_v1(buffer, &key, page.data));
+	UnpinBuffer(buf);
+	owner_flags[buffer - 1] = PCM_OWN_FLAG_REVOKING;
+	UT_ASSERT(!cluster_bufmgr_cr_publish_v1(buffer, &key, page.data));
+	owner_flags[buffer - 1] = 0;
+	UT_ASSERT(cluster_bufmgr_cr_publish_v1(buffer, &key, page.data));
+	UnpinBuffer(buf);
+	UT_ASSERT_EQ(BufTableLookup(&tag, BufTableHashCode(&tag)), 0);
+	UT_ASSERT_EQ(remembered_pins, 0);
+}
+
+UT_TEST(test_hash_capacity_refusal_leaves_reservation_unmapped_and_releasable)
+{
+	BufferCrKey key = scoped_key(reset_buffers());
+	PGIOAlignedBlock page;
+	Buffer buffer = cluster_bufmgr_cr_reserve_v1();
+	BufferDesc *buf;
+
+	UT_ASSERT(buffer > 0);
+	if (buffer <= 0)
+		return;
+	buf = GetBufferDescriptor(buffer - 1);
+	memset(page.data, 0, BLCKSZ);
+	deny_new_entry = true;
+	UT_ASSERT(!cluster_bufmgr_cr_publish_v1(buffer, &key, page.data));
+	UT_ASSERT_EQ(buf->buffer_type, BUF_TYPE_CURRENT);
+	UT_ASSERT((pg_atomic_read_u32(&buf->state) & BM_TAG_VALID) == 0);
+	UnpinBuffer(buf);
+	UT_ASSERT_EQ(remembered_pins, 0);
+	UT_ASSERT_EQ(lock_depth, 0);
+}
+
+UT_TEST(test_copy_error_releases_original_pin_and_keeps_immutable_entry)
+{
+	BufferCrKey key = scoped_key(reset_buffers());
+	PGIOAlignedBlock page, output;
+	Buffer buffer = cluster_bufmgr_cr_reserve_v1();
+	BufferDesc *buf;
+
+	UT_ASSERT(buffer > 0);
+	if (buffer <= 0)
+		return;
+	buf = GetBufferDescriptor(buffer - 1);
+	memset(page.data, 0x36, BLCKSZ);
+	UT_ASSERT(cluster_bufmgr_cr_publish_v1(buffer, &key, page.data));
+	UnpinBuffer(buf);
+	copy_destination = output.data;
+	copy_error = true;
+	if (setjmp(error_jump) == 0) {
+		(void)cluster_bufmgr_cr_copy_v1(&key, output.data);
+		UT_ASSERT(false);
+	}
+	UT_ASSERT(copy_observed_pin);
+	UT_ASSERT_EQ(lock_depth, 0);
+	UT_ASSERT_EQ(remembered_pins, 0);
+	UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf->state)), 0);
+	copy_error = false;
+	UT_ASSERT(cluster_bufmgr_cr_copy_v1(&key, output.data));
+	UT_ASSERT_EQ(memcmp(page.data, output.data, BLCKSZ), 0);
+}
+
+UT_TEST(test_copy_unpin_notifies_original_pin_count_waiter)
+{
+	BufferCrKey key = scoped_key(reset_buffers());
+	PGIOAlignedBlock page, output;
+	Buffer buffer = cluster_bufmgr_cr_reserve_v1();
+	BufferDesc *buf;
+
+	UT_ASSERT(buffer > 0);
+	if (buffer <= 0)
+		return;
+	buf = GetBufferDescriptor(buffer - 1);
+	memset(page.data, 0x2b, BLCKSZ);
+	UT_ASSERT(cluster_bufmgr_cr_publish_v1(buffer, &key, page.data));
+	UnpinBuffer(buf);
+	pg_atomic_fetch_add_u32(&buf->state, BUF_REFCOUNT_ONE);
+	pg_atomic_fetch_or_u32(&buf->state, BM_PIN_COUNT_WAITER);
+	UT_ASSERT(cluster_bufmgr_cr_copy_v1(&key, output.data));
+	UT_ASSERT_EQ(pin_waiter_signals, 1);
+	UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf->state)), 1);
+	UT_ASSERT_EQ(remembered_pins, 0);
+}
+
+UT_TEST(test_native_clock_recycles_clean_cr_and_keeps_current)
+{
+	BufferTag tag = reset_buffers();
+	Buffer victim;
+	int head;
+	uint64 generation;
+
+	install_current(&tag, 0);
+	install_cr(&tag, 6);
+	victim = cluster_bufmgr_cr_reserve_v1();
+	UT_ASSERT_EQ(victim, 7);
+	UT_ASSERT_EQ(bumps, 1);
+	UT_ASSERT_EQ(physical_writes, 0);
+	UT_ASSERT_EQ(BufTableLookup(&tag, BufTableHashCode(&tag)), 0);
+	UT_ASSERT(!BufTableCRLookup(&tag, BufTableHashCode(&tag), &head, &generation));
+	UT_ASSERT_EQ(GetBufferDescriptor(6)->buffer_type, BUF_TYPE_CURRENT);
+	UnpinBuffer(GetBufferDescriptor(6));
+}
+
+UT_TEST(test_native_clock_skips_foreign_pinned_cr)
+{
+	BufferTag tag = reset_buffers();
+	Buffer victim;
+
+	install_current(&tag, 0);
+	install_cr(&tag, 6);
+	pg_atomic_fetch_add_u32(&GetBufferDescriptor(6)->state, BUF_REFCOUNT_ONE);
+	victim = cluster_bufmgr_cr_reserve_v1();
+	UT_ASSERT_EQ(victim, 8);
+	UT_ASSERT_EQ(bumps, 0);
+	UT_ASSERT_EQ(physical_writes, 0);
+	UT_ASSERT_EQ(GetBufferDescriptor(6)->buffer_type, BUF_TYPE_CR);
+	UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&GetBufferDescriptor(6)->state)), 1);
+	UnpinBuffer(GetBufferDescriptor(7));
+}
+
+UT_TEST(test_native_clock_refuses_dirty_cr_before_any_io_or_pin)
+{
+	BufferTag tag = reset_buffers();
+
+	install_cr(&tag, 6);
+	pg_atomic_fetch_or_u32(&GetBufferDescriptor(6)->state, BM_DIRTY);
+	expect_error = true;
+	if (setjmp(error_jump) == 0) {
+		(void)cluster_bufmgr_cr_reserve_v1();
+		UT_ASSERT(false);
+	}
+	UT_ASSERT_EQ(bumps + physical_writes + remembered_pins + lock_depth, 0);
+	UT_ASSERT((pg_atomic_read_u32(&GetBufferDescriptor(6)->state) & BM_LOCKED) == 0);
+	UT_ASSERT_EQ(GetBufferDescriptor(6)->buffer_type, BUF_TYPE_CR);
+}
+
+UT_TEST(test_checkpoint_skips_clean_cr_and_refuses_dirty_cr)
+{
+	BufferTag tag = reset_buffers();
+	BufferDesc *buf = GetBufferDescriptor(6);
+
+	install_cr(&tag, 6);
+	UT_ASSERT_EQ(SyncOneBuffer(6, false, &BackendWritebackContext), BUF_REUSABLE);
+	UT_ASSERT_EQ(physical_writes + remembered_pins, 0);
+	pg_atomic_fetch_or_u32(&buf->state, BM_CHECKPOINT_NEEDED);
+	expect_error = true;
+	if (setjmp(error_jump) == 0) {
+		(void)SyncOneBuffer(6, false, &BackendWritebackContext);
+		UT_ASSERT(false);
+	}
+	UT_ASSERT_EQ(physical_writes + remembered_pins + lock_depth, 0);
+	UT_ASSERT((pg_atomic_read_u32(&buf->state) & BM_LOCKED) == 0);
+}
+
+UT_TEST(test_publish_copy_error_leaves_only_the_original_reservation_pin)
+{
+	BufferCrKey key = scoped_key(reset_buffers());
+	PGIOAlignedBlock page;
+	Buffer buffer = cluster_bufmgr_cr_reserve_v1();
+	BufferDesc *buf = GetBufferDescriptor(buffer - 1);
+	int head;
+	uint64 generation;
+
+	memset(page.data, 0x68, BLCKSZ);
+	copy_destination = BufHdrGetBlock(buf);
+	copy_error = true;
+	if (setjmp(error_jump) == 0) {
+		(void)cluster_bufmgr_cr_publish_v1(buffer, &key, page.data);
+		UT_ASSERT(false);
+	}
+	UT_ASSERT_EQ(remembered_pins, 1);
+	UT_ASSERT_EQ(lock_depth, 0);
+	UT_ASSERT((pg_atomic_read_u32(&buf->state) & BM_TAG_VALID) == 0);
+	UT_ASSERT(!BufTableCRLookup(&key.tag, BufTableHashCode(&key.tag), &head, &generation));
+	/* The original caller/ResourceOwner still owns and releases the pin. */
+	UnpinBuffer(buf);
+	UT_ASSERT_EQ(remembered_pins, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(22);
 	UT_RUN(test_native_current_victim_keeps_original_behavior);
 	UT_RUN(test_cr_victim_preserves_current_and_removes_middle_head_tail);
 	UT_RUN(test_last_cr_only_victim_removes_anchor_without_current);
@@ -471,6 +1003,19 @@ main(void)
 	UT_RUN(test_cr_reuse_clears_overlay_and_preserves_lwlock);
 	UT_RUN(test_fast_truncate_removes_all_versions_including_cr_only_anchors);
 	UT_RUN(test_fast_drop_rejects_a_still_mapped_wrong_tag_without_spinning);
+	UT_RUN(test_cr_has_no_mutation_authority_even_without_pcm);
+	UT_RUN(test_native_reservation_publishes_clean_cr_and_copies_with_original_pin);
+	UT_RUN(test_duplicate_publish_preserves_first_image_and_losing_reservation);
+	UT_RUN(test_wrong_scope_snapshot_scn_epoch_or_tag_misses_without_touching_output);
+	UT_RUN(test_publish_refuses_mapped_or_multiply_pinned_or_reserved_descriptor);
+	UT_RUN(test_hash_capacity_refusal_leaves_reservation_unmapped_and_releasable);
+	UT_RUN(test_copy_error_releases_original_pin_and_keeps_immutable_entry);
+	UT_RUN(test_copy_unpin_notifies_original_pin_count_waiter);
+	UT_RUN(test_native_clock_recycles_clean_cr_and_keeps_current);
+	UT_RUN(test_native_clock_skips_foreign_pinned_cr);
+	UT_RUN(test_native_clock_refuses_dirty_cr_before_any_io_or_pin);
+	UT_RUN(test_checkpoint_skips_clean_cr_and_refuses_dirty_cr);
+	UT_RUN(test_publish_copy_error_leaves_only_the_original_reservation_pin);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

@@ -8044,19 +8044,37 @@ test_cluster_buffer_mapping: test_cluster_buffer_mapping.c unit_test.h \
 # Compile the native invalidation bodies, with mapping/storage dependencies
 # supplied by the same fixtures as the buffer mapping tests.
 test_cluster_buffer_cr_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
-	awk '/^cluster_bufmgr_cr_walk_locked\(/ { print "static bool"; emit=1; walk++ } \
+	awk '/^cluster_bufmgr_should_pcm_track\(/ { print "static inline bool"; emit=1; track++ } \
+	     /^cluster_bufmgr_pcm_aux_pin_admission_locked\(/ { print "static inline bool"; emit=1; aux++ } \
+	     /^cluster_bufmgr_pcm_x_retained_image_locked\(/ { print "static inline bool"; emit=1; retained++ } \
+	     /^cluster_bufmgr_(pcm_x_content_write_permitted|pcm_x_content_holder_write_permitted|pcm_x_ordinary_content_write_permitted|block_write_permitted)\(/ { print "bool"; emit=1; write_gate++ } \
+	     /^cluster_bufmgr_cr_walk_locked\(/ { print "static bool"; emit=1; walk++ } \
 	     /^cluster_bufmgr_cr_invalidate_locked\(/ { print "static ClusterPcmOwnResult"; emit=1; cr++ } \
+	     /^cluster_bufmgr_cr_reserve_v1\(/ { print "Buffer"; emit=1; reserve++ } \
+	     /^cluster_bufmgr_cr_(publish|copy)_v1\(/ { print "bool"; emit=1; cache++ } \
 	     /^cluster_pcm_own_eviction_commit_locked\(/ { print "static ClusterPcmOwnResult"; emit=1; commit++ } \
 	     /^InvalidateBufferCommitLocked\(/ { print "static bool"; emit=1; drop++ } \
 	     /^InvalidateBufferCommitTailLocked\(/ { print "static void"; emit=1; tail++ } \
 	     /^InvalidateVictimBuffer\(/ { print "static bool"; emit=1; victim++ } \
+	     /^GetVictimBuffer\(/ { print "static Buffer"; emit=1; get_victim++ } \
+	     /^SyncOneBuffer\(/ { print "static int"; emit=1; sync_one++ } \
 	     /^FindAndDropRelationBuffers\(/ { print "static void"; emit=1; find++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (walk != 1 || cr != 1 || commit != 1 || drop != 1 || tail != 1 || victim != 1 || find != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (track != 1 || aux != 1 || retained != 1 || write_gate != 4 || walk != 1 || cr != 1 || reserve != 1 || cache != 2 || commit != 1 || drop != 1 || tail != 1 || victim != 1 || get_victim != 1 || sync_one != 1 || find != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_buffer_cr_pins.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^typedef struct PrivateRefCountEntry/ { emit=1; type++ } \
+	     /^PinBuffer\(/ { print "static bool"; emit=1; pin++ } \
+	     /^PinBuffer_Locked\(/ { print "static void"; emit=1; locked_pin++ } \
+	     /^UnpinBuffer\(/ { print "static void"; emit=1; unpin++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (type != 1 || pin != 1 || locked_pin != 1 || unpin != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_buffer_cr: test_cluster_buffer_cr.c unit_test.h \
 		test_cluster_buffer_mapping_fixture.h test_cluster_buffer_cr_owner.inc \
+		test_cluster_buffer_cr_pins.inc test_cluster_pcm_clock_sweep.inc \
 		$(CLUSTER_BUFFER_MAPPING_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_BUFFER_MAPPING_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@

@@ -2828,6 +2828,38 @@ UT_TEST(test_r_a22_real_flush_clears_first_record_after_its_write)
 	}
 }
 
+UT_TEST(test_native_flush_refuses_cr_before_starting_io)
+{
+	static BufferDesc buf;
+	static ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	volatile bool caught = false;
+
+	drop_fixture(&buf, &entry, true);
+	cluster_shared_config = false;
+	buf.buffer_type = BUF_TYPE_CR;
+	buf.pcm_state = PCM_STATE_N;
+	transition_real_flush = true;
+	transition_content_held = true;
+	transition_pin_count = 1;
+	pg_atomic_fetch_add_u32(&buf.state, BUF_REFCOUNT_ONE);
+	PG_TRY();
+	{
+		transition_production_flush(&buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(transition_owned_io + transition_io_wakes + transition_flush_count, 0);
+	UT_ASSERT((pg_atomic_read_u32(&buf.state) & BM_DIRTY) != 0);
+	transition_content_held = false;
+	transition_unpin(&buf);
+	drop_fixture_done(saved);
+}
+
 UT_TEST(test_shared_downgrade_pi_failure_keeps_x_and_releases_original_revoke)
 {
 	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
@@ -10337,7 +10369,8 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(169);
+	UT_PLAN(170);
+	UT_RUN(test_native_flush_refuses_cr_before_starting_io);
 	UT_RUN(test_shared_leave_releases_dirty_and_clean_x_through_exact_owner);
 	UT_RUN(test_shared_leave_write_and_sync_error_keep_x_and_mapping);
 	UT_RUN(test_shared_leave_waits_for_pin_and_revoke_without_skipping_x);

@@ -416,6 +416,7 @@ cluster_bufmgr_stop_poll(bool post_checkpoint, bool require_pi_retired, BufferTa
 			cluster_pcm_own_snapshot_post_state_locked(buf, state, &own);
 			delivery = cluster_pcm_own_delivery_attempt_get(i);
 			if (own.buffer_type > BUF_TYPE_XCUR || own.pcm_state > PCM_STATE_READ_IMAGE
+				|| (own.buffer_type == BUF_TYPE_CR && !BufferCrHeaderValid(buf, state))
 				|| (state & BM_IO_ERROR) != 0
 				|| ((own.pcm_state == PCM_STATE_S || own.pcm_state == PCM_STATE_X)
 					&& (state & (BM_VALID | BM_IO_IN_PROGRESS)) == 0)
@@ -1110,7 +1111,8 @@ cluster_bufmgr_pcm_x_content_write_permitted(BufferDesc *buf)
 	flags = cluster_pcm_own_flags_get(buf->buf_id);
 	writer_activation_token = cluster_pcm_own_writer_activation_token_get(buf->buf_id);
 	resource_x_activation_generation = cluster_pcm_own_resource_x_activation_generation_get(buf->buf_id);
-	permitted = (flags & PCM_OWN_FLAG_REVOKING) == 0
+	permitted = buf->buffer_type != BUF_TYPE_CR
+		&& (flags & PCM_OWN_FLAG_REVOKING) == 0
 		&& cluster_pcm_x_activation_fence_open(
 			writer_activation_token, resource_x_activation_generation)
 		&& (!cluster_bufmgr_pcm_x_retained_image_locked(buf, buf_state)
@@ -1128,7 +1130,8 @@ cluster_bufmgr_pcm_x_content_holder_write_permitted(BufferDesc *buf)
 	if (buf == NULL)
 		return false;
 	buf_state = LockBufHdr(buf);
-	permitted = cluster_pcm_x_content_holder_mutation_allowed(
+	permitted = buf->buffer_type != BUF_TYPE_CR
+		&& cluster_pcm_x_content_holder_mutation_allowed(
 		cluster_pcm_is_active(), cluster_bufmgr_should_pcm_track(buf),
 		cluster_bufmgr_pcm_x_retained_image_locked(buf, buf_state), buf->pcm_state,
 		cluster_pcm_own_flags_get(buf->buf_id),
@@ -1147,7 +1150,8 @@ cluster_bufmgr_pcm_x_ordinary_content_write_permitted(BufferDesc *buf)
 	if (buf == NULL)
 		return false;
 	buf_state = LockBufHdr(buf);
-	permitted = cluster_pcm_x_ordinary_mutation_allowed(
+	permitted = buf->buffer_type != BUF_TYPE_CR
+		&& cluster_pcm_x_ordinary_mutation_allowed(
 		cluster_pcm_is_active(), cluster_bufmgr_should_pcm_track(buf),
 		cluster_bufmgr_pcm_x_retained_image_locked(buf, buf_state), buf->pcm_state,
 		cluster_pcm_own_flags_get(buf->buf_id),
@@ -6461,6 +6465,144 @@ cluster_bufmgr_cr_invalidate_locked(BufferDesc *buf, uint32 hash, uint32 *state)
 	*state &= ~(BUF_FLAG_MASK | BUF_USAGECOUNT_MASK);
 	return CLUSTER_PCM_OWN_OK;
 }
+
+/* Reserve before the producer obtains and finally rechecks its read image.
+ * The returned native pin belongs to CurrentResourceOwner.  The caller must
+ * ReleaseBuffer after publish, refusal or abandonment. */
+Buffer
+cluster_bufmgr_cr_reserve_v1(void)
+{
+	return GetVictimBuffer(NULL, IOCONTEXT_NORMAL);
+}
+
+/* Publish a validated image in an exclusive, unmapped native reservation.
+ * This primitive does not prove the scan, snapshot, retention or producer
+ * result. The original read owner must recheck all of them after reserve.
+ * Neither success nor refusal consumes the caller's reservation pin. */
+bool
+cluster_bufmgr_cr_publish_v1(Buffer buffer, const BufferCrKey *key, const void *page)
+{
+	BufferDesc *buf;
+	BufferTag	tag;
+	uint32		hash;
+	uint32		state;
+	LWLock	   *partition;
+	ClusterPcmOwnEvictionCapture own;
+	int			match;
+	int			head;
+	uint64		generation;
+	bool		reserved;
+
+	if (buffer <= 0 || buffer > NBuffers || page == NULL || !BufferCrKeyValid(key) ||
+		GetPrivateRefCount(buffer) != 1)
+		return false;
+	buf = GetBufferDescriptor(buffer - 1);
+	state = LockBufHdr(buf);
+	cluster_pcm_own_eviction_capture_locked(buf, &own);
+	reserved = BUF_STATE_GET_REFCOUNT(state) == 1 &&
+		(state & (BUF_FLAG_MASK & ~BM_LOCKED)) == 0 &&
+		buf->buffer_type == BUF_TYPE_CURRENT && buf->pcm_state == PCM_STATE_N &&
+		buf->pi_flags == 0 && cluster_pcm_own_eviction_reuse_allowed(&own) &&
+		cluster_pcm_own_delivery_attempt_get(buf->buf_id) == 0;
+	UnlockBufHdr(buf, state);
+	if (!reserved)
+		return false;
+
+	/* No mapping exposes this exclusively pinned reservation. Copy before
+	 * taking mapping/header locks; no current-buffer grant is acquired. */
+	memcpy(BufHdrGetBlock(buf), page, BLCKSZ);
+	tag = key->tag;
+	hash = BufTableHashCode(&tag);
+	partition = BufMappingPartitionLock(hash);
+	LWLockAcquire(partition, LW_EXCLUSIVE);
+	if (!cluster_bufmgr_cr_walk_locked(&tag, hash, key, -1, &match))
+	{
+		LWLockRelease(partition);
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid read-only buffer chain during publication")));
+	}
+	if (match >= 0 || !BufTableCRInsert(&tag, hash, buf->buf_id, &head, &generation))
+	{
+		LWLockRelease(partition);
+		return false;
+	}
+
+	/* As with native BufferAlloc, initialize the descriptor after inserting
+	 * the mapping, before releasing mapping-X. No throwing work follows. */
+	state = LockBufHdr(buf);
+	buf->tag = tag;
+	buf->buffer_type = BUF_TYPE_CR;
+	buf->pcm_state = PCM_STATE_N;
+	buf->pi_flags = 0;
+	buf->cluster_padding_1 = 0;
+	buf->block_scn = ((PageHeader) BufHdrGetBlock(buf))->pd_block_scn;
+	buf->cr.prev_id = -1;
+	buf->cr.next_id = head;
+	buf->cr.read_scn = key->read_scn;
+	buf->cr.read_epoch = key->read_epoch;
+	buf->cr.snapshot_identity = key->snapshot_identity;
+	buf->cr.scan_identity = key->scan_identity;
+	buf->cr_anchor_generation = generation;
+	if (head >= 0)
+		GetBufferDescriptor(head)->cr.prev_id = buf->buf_id;
+	state &= ~BUF_USAGECOUNT_MASK;
+	state |= BM_TAG_VALID | BM_VALID | BUF_USAGECOUNT_ONE;
+	UnlockBufHdr(buf, state);
+	LWLockRelease(partition);
+	return true;
+}
+
+/* Copy an immutable version under the original native pin.  A key match is
+ * not read authority: the scan owner still checks its live snapshot and
+ * admission before consuming bytes. Miss/refusal does not touch the output. */
+bool
+cluster_bufmgr_cr_copy_v1(const BufferCrKey *key, void *page)
+{
+	BufferTag	tag;
+	uint32		hash;
+	LWLock	   *partition;
+	BufferDesc *buf;
+	int			id;
+	bool		valid;
+
+	if (page == NULL || !BufferCrKeyValid(key))
+		return false;
+	ReservePrivateRefCountEntry();
+	ResourceOwnerEnlargeBuffers(CurrentResourceOwner);
+	tag = key->tag;
+	hash = BufTableHashCode(&tag);
+	partition = BufMappingPartitionLock(hash);
+	LWLockAcquire(partition, LW_SHARED);
+	if (!cluster_bufmgr_cr_walk_locked(&tag, hash, key, -1, &id))
+	{
+		LWLockRelease(partition);
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid read-only buffer chain during lookup")));
+	}
+	if (id < 0)
+	{
+		LWLockRelease(partition);
+		return false;
+	}
+	buf = GetBufferDescriptor(id);
+	valid = PinBuffer(buf, NULL);
+	LWLockRelease(partition);
+	PG_TRY();
+	{
+		if (!valid)
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("read-only buffer became invalid while mapped")));
+		/* The published payload is immutable and the pin prevents reuse.
+		 * Never expose a CR BufferID to ordinary current-buffer callers. */
+		memcpy(page, BufHdrGetBlock(buf), BLCKSZ);
+	}
+	PG_FINALLY();
+	{
+		UnpinBuffer(buf);
+	}
+	PG_END_TRY();
+	return true;
+}
 #endif
 
 /*
@@ -6970,6 +7112,12 @@ again:
 	/* A revoking VM/FSM descriptor is not a victim candidate: pinning it here
 	 * would cross the exact zero-refcount drain.  Preserve clock-sweep's native
 	 * choose-another-victim behavior without waiting. */
+	if (buf_hdr->buffer_type == BUF_TYPE_CR && !BufferCrHeaderValid(buf_hdr, buf_state))
+	{
+		UnlockBufHdr(buf_hdr, buf_state);
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid read-only buffer selected for reuse")));
+	}
 	if (!cluster_bufmgr_pcm_aux_pin_admission_locked(buf_hdr))
 	{
 		UnlockBufHdr(buf_hdr, buf_state);
@@ -8943,6 +9091,19 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 	buf_state = LockBufHdr(bufHdr);
 
 #ifdef USE_PGRAC_CLUSTER
+	/* Immutable read-only images never participate in checkpoint output. */
+	if (bufHdr->buffer_type == BUF_TYPE_CR)
+	{
+		bool valid = BufferCrHeaderValid(bufHdr, buf_state);
+
+		if (BUF_STATE_GET_REFCOUNT(buf_state) == 0 && BUF_STATE_GET_USAGECOUNT(buf_state) == 0)
+			result = BUF_REUSABLE;
+		UnlockBufHdr(bufHdr, buf_state);
+		if (!valid)
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("invalid read-only buffer during checkpoint")));
+		return result;
+	}
 
 	/*
 	 * A live retained image is neither reusable nor writable.  Test before
@@ -9392,6 +9553,12 @@ FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	ClusterPageWalFirstResultV1 first_state;
 	bool		first_observed = false;
 	uint64		written_token = 0;
+
+	/* The original pin makes the type stable. CR bytes have no DATA writer,
+	 * including while PCM is inactive or a caller bypasses the shared path. */
+	if (buf->buffer_type == BUF_TYPE_CR)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cannot write a read-only buffer version")));
 
 	/* Cold redo reports dirty-hook violations outside critical sections.
 	 * Observe its shared failure latch under content SHARE, before any I/O;
@@ -13192,6 +13359,12 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 	 * eligible to overwrite newer shared-storage bytes.
 	 */
 	retained_state = LockBufHdr(bufHdr);
+	if (bufHdr->buffer_type == BUF_TYPE_CR)
+	{
+		UnlockBufHdr(bufHdr, retained_state);
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cannot modify a read-only buffer version")));
+	}
 	if (!cluster_pcm_x_content_holder_mutation_allowed(
 			cluster_pcm_is_active(), cluster_bufmgr_should_pcm_track(bufHdr),
 			cluster_bufmgr_pcm_x_retained_image_locked(bufHdr, retained_state),
@@ -13650,6 +13823,9 @@ LockBufferInternal_trace_impl(Buffer buffer, int mode, bool *pcm_barrier_refused
 		elog(ERROR, "unrecognized buffer lock mode: %d", mode);
 
 #ifdef USE_PGRAC_CLUSTER
+	if (buf->buffer_type == BUF_TYPE_CR && mode != BUFFER_LOCK_UNLOCK)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("read-only buffer versions cannot acquire current-buffer locks")));
 	if (mode == BUFFER_LOCK_UNLOCK)
 	{
 		pcm_x_writer = cluster_bufmgr_pcm_x_writer_find(buf);
@@ -14278,7 +14454,7 @@ ConditionalLockBuffer(Buffer buffer)
 		 * GRANT_PENDING must not modify protocol-owned bytes.
 		 */
 		buf_state = LockBufHdr(buf);
-		blocked = !cluster_pcm_x_conditional_lock_allowed(
+		blocked = buf->buffer_type == BUF_TYPE_CR || !cluster_pcm_x_conditional_lock_allowed(
 			cluster_pcm_is_active(), cluster_bufmgr_should_pcm_track(buf),
 			cluster_bufmgr_pcm_x_retained_image_locked(buf, buf_state), buf->pcm_state,
 			cluster_pcm_own_flags_get(buf->buf_id),
@@ -20986,6 +21162,11 @@ cluster_bufmgr_block_write_permitted(Buffer buffer)
 										LW_EXCLUSIVE);
 	buf_state = LockBufHdr(buf);
 	state = (PcmState) buf->pcm_state;
+	if (buf->buffer_type == BUF_TYPE_CR)
+	{
+		UnlockBufHdr(buf, buf_state);
+		return false;
+	}
 	own_flags = cluster_pcm_own_flags_get(buf->buf_id);
 	retained_image = cluster_bufmgr_pcm_x_retained_image_locked(buf, buf_state);
 	revoking_predecessor = content_x_held
