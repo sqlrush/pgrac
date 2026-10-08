@@ -32,6 +32,8 @@
  *      cluster fields follow PG-original content_lock so bufmgr.c:3275
  *      AssertNotCatalogBufferLock reverse-deref stays correct).
  *
+ *   6. Expose current/CR mappings in the native buffer hash.
+ *
  * Why:
  *   pgrac needs PCM lock state machine + CR chain + PI chain + Cache
  *   Fusion + GRD master cache fields per buffer (Stage 2-3 真值激活).
@@ -652,6 +654,16 @@ extern uint32 BufTableHashCode(BufferTag *tagPtr);
 extern int	BufTableLookup(BufferTag *tagPtr, uint32 hashcode);
 extern int	BufTableInsert(BufferTag *tagPtr, uint32 hashcode, int buf_id);
 extern void BufTableDelete(BufferTag *tagPtr, uint32 hashcode);
+#ifdef USE_PGRAC_CLUSTER
+/* Mapping-S for lookup, mapping-X for mutations; CR is never current. */
+extern bool BufTableCRLookup(BufferTag *tagPtr, uint32 hashcode, int *head,
+							 uint64 *generation);
+extern bool BufTableCRInsert(BufferTag *tagPtr, uint32 hashcode, int cr_id,
+							 int *old_head, uint64 *generation);
+extern bool BufTableCRReplaceHead(BufferTag *tagPtr, uint32 hashcode,
+								  uint64 generation, int expected_head,
+								  int replacement_head);
+#endif
 
 /* localbuf.c */
 extern bool PinLocalBuffer(BufferDesc *buf_hdr, bool adjust_usagecount);
