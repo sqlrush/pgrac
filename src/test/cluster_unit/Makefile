@@ -4295,6 +4295,13 @@ test_cluster_serving_sample.inc: $(top_srcdir)/src/backend/cluster/cluster_qvote
 	mv $@.tmp $@
 
 # Exercise the complete original send gates with the real serving sampler.
+test_cluster_serving_root.inc: $(top_srcdir)/src/backend/cluster/cluster_control_root.c \
+		$(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^runtime_v2_owner_check\(/ { print "static ClusterControlRootResult"; emit=1; n++ } \
+	     /^ClusterCheckpointV3Prepare\(/ { print "static void"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 2 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_serving_send.inc: $(top_srcdir)/src/backend/cluster/cluster_ic_router.c \
 		$(top_srcdir)/src/backend/cluster/cluster_ic_rdma.c \
 		$(top_srcdir)/src/backend/cluster/cluster_ic_chunk.c Makefile
@@ -4309,7 +4316,7 @@ test_cluster_serving_send.inc: $(top_srcdir)/src/backend/cluster/cluster_ic_rout
 	mv $@.tmp $@
 
 test_cluster_serving_sample: test_cluster_serving_sample.c test_cluster_serving_sample.inc \
-		test_cluster_serving_send.inc \
+		test_cluster_serving_send.inc test_cluster_serving_root.inc \
 		test_cluster_startup_phase.c unit_test.h test_cluster_config_s1_native.inc \
 		test_cluster_config_ges_native.inc test_cluster_startup_walr_native.inc \
 		test_cluster_startup_snapshot_native.inc \

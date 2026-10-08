@@ -2446,18 +2446,30 @@ done:
  * not the early postmaster sizing read or the recovery owner's read API.
  * Author: SqlRush <sqlrush@gmail.com>
  */
-static bool
-runtime_v2_owner_current(uint64 epoch, uint64 incarnation)
+static ClusterControlRootResult
+runtime_v2_owner_check(uint64 epoch, uint64 incarnation, bool admitted)
 {
-	return cluster_shared_config && cluster_enabled && cluster_controlfile_shared_authority
-		   && cluster_node_id >= 0 && cluster_node_id < CLUSTER_MAX_NODES && epoch != 0
-		   && incarnation != 0 && cluster_qvotec_get_self_incarnation() == incarnation
-		   && cluster_membership_get_state(cluster_node_id) == CLUSTER_MEMBER_MEMBER
-		   && cluster_membership_get_last_admitted_incarnation(cluster_node_id) == incarnation
-		   && cluster_wal_thread_dir_validated()
-		   && cluster_wal_thread_id() == (uint16)(cluster_node_id + 1)
-		   && !cluster_reconfig_has_pending_prebump_stage() && cluster_serving_ready_is_current()
-		   && cluster_write_fence_allowed() && cluster_epoch_get_current() == epoch;
+	bool pending = false;
+	bool serving;
+
+	if (!cluster_shared_config || !cluster_enabled || !cluster_controlfile_shared_authority
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES || epoch == 0
+		|| incarnation == 0 || cluster_qvotec_get_self_incarnation() != incarnation
+		|| cluster_membership_get_state(cluster_node_id) != CLUSTER_MEMBER_MEMBER
+		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id) != incarnation
+		|| !cluster_wal_thread_dir_validated()
+		|| cluster_wal_thread_id() != (uint16)(cluster_node_id + 1)
+		|| cluster_reconfig_has_pending_prebump_stage())
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	serving = cluster_serving_ready_check(&pending, NULL);
+	if ((!serving && !pending) || !cluster_write_fence_allowed()
+		|| cluster_epoch_get_current() != epoch)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	/* A read cannot invent admission. Only the configuration owner that
+	 * already checked its exact cut under CF-X may finish that operation
+	 * across a refresh overlap; known loss above always wins. */
+	return pending && !admitted ? CLUSTER_CONTROL_ROOT_ADMISSION_PENDING
+								: CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
 static ClusterControlRootResult
@@ -2468,6 +2480,7 @@ read_runtime_local_version(ControlFileData *out, uint16 version)
 	ClusterControlRootIdentity self;
 	ClusterControlRootFileToken token;
 	ClusterControlRootResult result;
+	ClusterControlRootResult owner_result;
 	uint8 storage_uuid[16];
 	uint64 epoch, incarnation, sysid;
 	int node;
@@ -2484,8 +2497,9 @@ read_runtime_local_version(ControlFileData *out, uint16 version)
 	node = cluster_node_id;
 	epoch = cluster_epoch_get_current();
 	incarnation = cluster_qvotec_get_self_incarnation();
-	if (!runtime_v2_owner_current(epoch, incarnation))
-		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = runtime_v2_owner_check(epoch, incarnation, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
 	if (!current_storage_uuid(storage_uuid))
 		return CLUSTER_CONTROL_ROOT_STORAGE_CONTRACT_UNVERIFIED;
 	sysid = GetSystemIdentifier();
@@ -2516,8 +2530,9 @@ read_runtime_local_version(ControlFileData *out, uint16 version)
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		goto done;
-	if (!runtime_v2_owner_current(epoch, incarnation)) {
-		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	owner_result = runtime_v2_owner_check(epoch, incarnation, false);
+	if (owner_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		result = owner_result;
 		goto done;
 	}
 	*out = thread;
@@ -2732,6 +2747,7 @@ read_retention_version(const ClusterControlRootIdentity *self, ClusterControlRoo
 	ClusterControlRootFileToken file_token;
 	ClusterControlRootReadToken selected;
 	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	ClusterControlRootResult owner_result;
 	volatile bool held = false;
 	uint64 epoch, incarnation;
 	uint32 index;
@@ -2752,11 +2768,14 @@ read_retention_version(const ClusterControlRootIdentity *self, ClusterControlRoo
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	epoch = cluster_epoch_get_current();
 	incarnation = cluster_qvotec_get_self_incarnation();
-	if (!runtime_v2_owner_current(epoch, incarnation)
-		|| expected.origin_owner_incarnation != incarnation)
+	if (expected.origin_owner_incarnation != incarnation)
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = runtime_v2_owner_check(epoch, incarnation, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
 	index = expected.origin_thread_id - 1;
 	root = palloc(sizeof(*root));
+	result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	PG_TRY();
 	{
 		if (cluster_cf_lock(ShareLock)) {
@@ -2771,11 +2790,14 @@ read_retention_version(const ClusterControlRootIdentity *self, ClusterControlRoo
 						|| (root->header.v2.serving[index / 64] & (UINT64_C(1) << (index % 64)))
 							   == 0)
 						result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
-					else if (!runtime_v2_owner_current(epoch, incarnation))
-						result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-					else
-						make_read_token(root, expected.origin_thread_id,
-										CONTROL_ROOT_SOURCE_PRIMARY, &selected);
+					else {
+						owner_result = runtime_v2_owner_check(epoch, incarnation, false);
+						if (owner_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+							result = owner_result;
+						else
+							make_read_token(root, expected.origin_thread_id,
+											CONTROL_ROOT_SOURCE_PRIMARY, &selected);
+					}
 				}
 			}
 			result = release_cf(ShareLock, result);
@@ -4382,6 +4404,7 @@ typedef struct ConfigPublishWork {
 	uint64 incarnation;
 	uint8 storage_uuid[16];
 	bool changed;
+	bool admitted;
 } ConfigPublishWork;
 
 static void
@@ -4405,8 +4428,9 @@ config_publish_read(ConfigPublishWork *work, ControlRootImage *root,
 	ClusterControlRootIdentity self;
 	int node = cluster_node_id;
 
-	if (!runtime_v2_owner_current(work->epoch, work->incarnation))
-		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = runtime_v2_owner_check(work->epoch, work->incarnation, work->admitted);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
 	result = read_control_version(work->storage_uuid, GetSystemIdentifier(), root, &work->thread,
 								  token, CONTROL_ROOT_HEADER_VERSION_V3);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
@@ -4435,8 +4459,9 @@ config_publish_read(ConfigPublishWork *work, ControlRootImage *root,
 		return result;
 	if (work->thread.state != DB_IN_PRODUCTION)
 		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
-	if (!runtime_v2_owner_current(work->epoch, work->incarnation))
-		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = runtime_v2_owner_check(work->epoch, work->incarnation, work->admitted);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
 	if (initial)
 		work->self = self;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
@@ -5055,8 +5080,9 @@ config_publish_work(ConfigPublishWork *work, const ClusterSharedConfigEntry *cha
 	cluster_shared_config_free(&work->image);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	if (!runtime_v2_owner_current(work->epoch, work->incarnation))
-		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = runtime_v2_owner_check(work->epoch, work->incarnation, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
 	work->cf_mode = ExclusiveLock;
 	if (!acquire_clusterwide_cf(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
@@ -5065,6 +5091,9 @@ config_publish_work(ConfigPublishWork *work, const ClusterSharedConfigEntry *cha
 		return result;
 	if (!file_token_equal(&work->before, &observed))
 		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	/* This exact owner and ROOT are qualified while CF-X remains held.
+	 * A later refresh overlap may not restart a durable publication. */
+	work->admitted = true;
 	if (!work->changed) {
 		work->after = observed;
 		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
@@ -5086,8 +5115,9 @@ config_publish_work(ConfigPublishWork *work, const ClusterSharedConfigEntry *cha
 	result = encode_extended_image(&work->next, CONTROL_ROOT_HEADER_VERSION_V3);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	if (!runtime_v2_owner_current(work->epoch, work->incarnation))
-		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = runtime_v2_owner_check(work->epoch, work->incarnation, work->admitted);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
 	if (!publish_updated_image(&work->base, &work->next))
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
 	/* Post-read, never rollback. A failed write or caller cancellation can
@@ -5102,9 +5132,8 @@ config_publish_work(ConfigPublishWork *work, const ClusterSharedConfigEntry *cha
 		return CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
 	work->ref = installed;
 	result = cluster_cf_control_projection_write_locked(&work->thread);
-	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-		&& !runtime_v2_owner_current(work->epoch, work->incarnation))
-		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result = runtime_v2_owner_check(work->epoch, work->incarnation, work->admitted);
 	return result;
 }
 
@@ -5134,7 +5163,10 @@ cluster_control_root_config_change(const ClusterSharedConfigEntry *change,
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	epoch = cluster_epoch_get_current();
 	incarnation = cluster_qvotec_get_self_incarnation();
-	if (!runtime_v2_owner_current(epoch, incarnation) || !current_storage_uuid(uuid))
+	result = runtime_v2_owner_check(epoch, incarnation, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!current_storage_uuid(uuid))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = storage_contract_check(uuid, true);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)

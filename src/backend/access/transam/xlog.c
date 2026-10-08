@@ -8608,7 +8608,6 @@ static void
 ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 {
 	ClusterWalSourceRef ref;
-	bool readable;
 	uint64 epoch = cluster_epoch_get_current();
 
 	if (MyBackendType == B_STARTUP && (flags & CHECKPOINT_END_OF_RECOVERY) != 0) {
@@ -8632,24 +8631,60 @@ ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 			&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)))
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 						errmsg("root-v3 checkpoint requires its admitted native owner")));
-	if (!cluster_cf_lock(ShareLock))
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-				 errmsg("could not acquire control-root read authority for checkpoint")));
-	PG_TRY();
+	for (;;)
 	{
-		readable = cluster_cf_held_is_clusterwide(ShareLock)
-			&& cluster_cf_authority_read(selected);
-	}
-	PG_CATCH();
-	{
-		(void) cluster_cf_unlock_confirmed(ShareLock);
+		ClusterWalSourceRef observed;
+		bool readable;
+		bool pending = false;
+
+		CHECK_FOR_INTERRUPTS();
+		if (cluster_epoch_get_current() != epoch
+			|| !cluster_wal_thread_current_v2_ref(&observed)
+			|| memcmp(&observed, &ref, sizeof(ref)) != 0
+			|| cluster_reconfig_has_pending_prebump_stage()
+			|| !cluster_write_fence_allowed()
+			|| (!cluster_external_fence_runtime_active()
+				&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch)
+				&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)))
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+					 errmsg("checkpoint authority changed before control-root read")));
+		if (!cluster_cf_lock(ShareLock))
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+					 errmsg("could not acquire control-root read authority for checkpoint")));
+		PG_TRY();
+		{
+			readable = cluster_cf_held_is_clusterwide(ShareLock)
+				&& cluster_cf_authority_read_check(selected, &pending);
+		}
+		PG_CATCH();
+		{
+			(void) cluster_cf_unlock_confirmed(ShareLock);
+			memset(selected, 0, sizeof(*selected));
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		if (cluster_cf_unlock_confirmed(ShareLock) != CLUSTER_CF_RELEASE_CONFIRMED
+			|| (!readable && !pending) || cluster_epoch_get_current() != epoch
+			|| !cluster_wal_thread_current_v2_ref(&observed)
+			|| memcmp(&observed, &ref, sizeof(ref)) != 0) {
+			memset(selected, 0, sizeof(*selected));
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+					 errmsg("root-v3 checkpoint input or read-authority release is unproven")));
+		}
+		if (!pending)
+			break;
 		memset(selected, 0, sizeof(*selected));
-		PG_RE_THROW();
+		/* Same scheduling and cancellation as Publish. CF-S has been
+		 * confirmed released; keep the original epoch/writer and do not
+		 * rearm either phase of the normal-stop owner budget. */
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 20, WAIT_EVENT_CHECKPOINTER_MAIN);
+		ResetLatch(MyLatch);
 	}
-	PG_END_TRY();
-	if (cluster_cf_unlock_confirmed(ShareLock) != CLUSTER_CF_RELEASE_CONFIRMED || !readable
-		|| selected->state != DB_IN_PRODUCTION
+	if (selected->state != DB_IN_PRODUCTION
 		|| selected->system_identifier != ref.claim.identity.system_identifier
 		|| selected->checkPointCopy.ThisTimeLineID != ref.timeline
 		|| selected->minRecoveryPoint != InvalidXLogRecPtr || selected->minRecoveryPointTLI != 0

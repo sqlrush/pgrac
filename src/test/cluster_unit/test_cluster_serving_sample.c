@@ -37,6 +37,16 @@
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_replacement_episode.h"
 #include "utils/hsearch.h"
+#include "access/xlog.h"
+#include "catalog/pg_control.h"
+#include "cluster/cluster_cf_authority.h"
+#include "cluster/cluster_external_fence.h"
+#include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_source.h"
+#include "cluster/cluster_write_fence.h"
+#include "postmaster/interrupt.h"
+#include "postmaster/bgwriter.h"
+#include "utils/elog.h"
 
 static ClusterPhaseSharedState sample_phase;
 static ClusterReconfigState sample_reconfig;
@@ -202,6 +212,132 @@ sample_release(void *arg)
 }
 #include "test_cluster_serving_send.inc"
 
+/* Execute the real Prepare and runtime gate. Only CF ownership, the selected
+ * immutable file contents, WAL ref, and scheduler are fixture boundaries;
+ * test_cluster_control_root covers the actual ROOT/claim/anchor file reads. */
+static ClusterControlRootResult runtime_v2_owner_check(uint64 epoch, uint64 incarnation,
+													   bool admitted);
+static ClusterWalSourceRef sample_ref;
+static unsigned sample_cf_reads, sample_cf_releases, sample_checkpoint_waits;
+static bool sample_loss_on_wait;
+static Latch sample_latch;
+Latch *MyLatch = &sample_latch;
+static LWLockPadded sample_locks[NUM_INDIVIDUAL_LWLOCKS];
+LWLockPadded *MainLWLockArray = sample_locks;
+volatile sig_atomic_t InterruptPending, ShutdownRequestPending;
+volatile uint32 InterruptHoldoffCount, QueryCancelHoldoffCount;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+bool
+cluster_wal_thread_dir_validated(void)
+{
+	return true;
+}
+bool
+cluster_write_fence_allowed(void)
+{
+	return true;
+}
+bool
+cluster_external_fence_runtime_active(void)
+{
+	return true;
+}
+bool
+cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
+{
+	*out = sample_ref;
+	return true;
+}
+bool
+cluster_wal_thread_initialized_writer_matches(const ClusterWalSourceRef *ref, uint64 epoch)
+{
+	return false;
+}
+bool
+cluster_wal_thread_clean_writer_matches(const ClusterWalSourceRef *ref, uint64 epoch)
+{
+	return false;
+}
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	return false;
+}
+bool
+cluster_cf_lock(LOCKMODE mode)
+{
+	UT_ASSERT_EQ(mode, ShareLock);
+	UT_ASSERT(!phase_test_cf_held);
+	phase_test_cf_held = true;
+	return true;
+}
+bool
+cluster_cf_held_is_clusterwide(LOCKMODE mode)
+{
+	return mode == ShareLock && phase_test_cf_held;
+}
+ClusterCfReleaseResult
+cluster_cf_unlock_confirmed(LOCKMODE mode)
+{
+	UT_ASSERT(cluster_cf_held_is_clusterwide(mode));
+	phase_test_cf_held = false;
+	sample_cf_releases++;
+	return CLUSTER_CF_RELEASE_CONFIRMED;
+}
+bool
+cluster_cf_authority_read_check(ControlFileData *out, bool *pending)
+{
+	ClusterControlRootResult result;
+	UT_ASSERT(phase_test_cf_held);
+	sample_cf_reads++;
+	result = runtime_v2_owner_check(phase_test_formation_epoch, phase_test_self_incarnation, false);
+	*pending = result == CLUSTER_CONTROL_ROOT_ADMISSION_PENDING;
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->system_identifier = sample_ref.claim.identity.system_identifier;
+	out->checkPointCopy.ThisTimeLineID = sample_ref.timeline;
+	out->state = DB_IN_PRODUCTION;
+	out->checkPoint = 150;
+	return true;
+}
+static void
+ClusterStartupCheckpointPrepare(int flags, ControlFileData *selected)
+{
+	UT_ASSERT(false);
+}
+void
+ProcessInterrupts(void)
+{
+	UT_ASSERT(false);
+}
+void
+pg_re_throw(void)
+{
+	longjmp(phase4_fatal_jump, 1);
+}
+void
+ResetLatch(Latch *latch)
+{
+	UT_ASSERT(latch == MyLatch);
+}
+int
+WaitLatch(Latch *latch, int events, long timeout, uint32 event)
+{
+	UT_ASSERT(latch == MyLatch && (events & WL_EXIT_ON_PM_DEATH));
+	UT_ASSERT_EQ(timeout, 20);
+	UT_ASSERT_EQ(event, WAIT_EVENT_CHECKPOINTER_MAIN);
+	UT_ASSERT(!phase_test_cf_held && phase_lwlock_depth == 0 && CritSectionCount == 0);
+	sample_checkpoint_waits++;
+	phase_lwlock_conditional_result = true;
+	if (sample_loss_on_wait)
+		pg_atomic_write_u32(&QvotecShmem->quorum_state, CLUSTER_QVOTEC_QUORUM_LOST);
+	return WL_TIMEOUT;
+}
+#include "test_cluster_serving_root.inc"
+
 static void
 sample_setup(void)
 {
@@ -214,6 +350,7 @@ sample_setup(void)
 	int i;
 
 	reset_phase_service_fixture(true);
+	phase_lwlock_conditional_result = true;
 	cluster_phase_shmem_init();
 	cluster_shared_config = true;
 	phase_test_cssd_status = CLUSTER_CSSD_READY;
@@ -457,16 +594,57 @@ UT_TEST(real_loss_still_refuses_transport_sends)
 	}
 }
 
+UT_TEST(checkpoint_prepare_waits_for_real_formation_lock_and_refuses_real_loss)
+{
+	PGPROC checkpointer = { 0 };
+
+	for (int fault = 0; fault < 2; fault++) {
+		for (int shutdown = 0; shutdown < 2; shutdown++) {
+			static ControlFileData selected;
+			volatile bool raised = false;
+			sample_setup();
+			memset(&sample_ref, 0, sizeof(sample_ref));
+			sample_ref.claim.identity.system_identifier = 1234;
+			sample_ref.timeline = 1;
+			sample_cf_reads = sample_cf_releases = sample_checkpoint_waits = 0;
+			sample_loss_on_wait = fault != 0;
+			MyBackendType = B_CHECKPOINTER;
+			MyAuxProcType = CheckpointerProcess;
+			MyProc = &checkpointer;
+			ShutdownRequestPending = shutdown != 0;
+			phase_lwlock_conditional_result = false;
+			phase4_capture_fatal = true;
+			if (setjmp(phase4_fatal_jump) == 0)
+				ClusterCheckpointV3Prepare(shutdown ? CHECKPOINT_IS_SHUTDOWN : CHECKPOINT_FORCE,
+										   &selected);
+			else
+				raised = true;
+			phase4_capture_fatal = false;
+			UT_ASSERT_EQ(raised, fault != 0);
+			UT_ASSERT_EQ(sample_checkpoint_waits, 1);
+			UT_ASSERT_EQ(sample_cf_reads, 2);
+			UT_ASSERT_EQ(sample_cf_releases, 2);
+			UT_ASSERT(!phase_test_cf_held);
+			UT_ASSERT_EQ(selected.checkPoint, fault ? 0 : 150);
+			UT_ASSERT_EQ(cluster_authority_readiness_get(),
+						 fault ? CLUSTER_AUTHORITY_OFF : CLUSTER_AUTHORITY_SERVING_READY);
+			UT_ASSERT_EQ(phase4_quorum_check_calls, 0);
+			MyProc = NULL;
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
 	UT_RUN(deadline_projects_pending_through_real_formation_and_grd);
 	UT_RUN(serving_deadline_preserves_binding_until_proven_loss_or_identity_drift);
 	UT_RUN(lock_entry_keeps_real_serving_deadline_pending);
 	UT_RUN(rdma_send_waits_for_real_formation_lock_without_error);
 	UT_RUN(chunk_send_waits_for_real_formation_lock_without_error);
 	UT_RUN(real_loss_still_refuses_transport_sends);
+	UT_RUN(checkpoint_prepare_waits_for_real_formation_lock_and_refuses_real_loss);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -45,18 +45,22 @@ struct Latch *MyLatch = NULL;
 
 /* Boundaries the extracted code calls. */
 static unsigned cf_checks, publications;
+static unsigned pending_publications, waits;
+static uint64 epoch = 7, incarnation = 3;
+static int wait_fault;
+static bool publication_lost;
 static ClusterSharedConfigEntry published;
 static char published_name[64];
 
 uint64
 cluster_epoch_get_current(void)
 {
-	return 7;
+	return epoch;
 }
 uint64
 cluster_qvotec_get_self_incarnation(void)
 {
-	return 3;
+	return incarnation;
 }
 bool
 cluster_cf_held(LOCKMODE mode pg_attribute_unused())
@@ -70,6 +74,12 @@ cluster_control_root_config_change(const ClusterSharedConfigEntry *change,
 								   ClusterSharedConfigPolicyReport *report pg_attribute_unused())
 {
 	publications++;
+	if (pending_publications > 0) {
+		pending_publications--;
+		return CLUSTER_CONTROL_ROOT_ADMISSION_PENDING;
+	}
+	if (publication_lost)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	published = *change;
 	strlcpy(published_name, change->name, sizeof(published_name));
 	published.name = published_name;
@@ -82,7 +92,9 @@ pg_server_to_any(const char *s, int len pg_attribute_unused(), int encoding pg_a
 }
 void
 ProcessInterrupts(void)
-{}
+{
+	ereport(ERROR, (errmsg("fixture cancelled")));
+}
 void
 ResetLatch(Latch *latch pg_attribute_unused())
 {}
@@ -90,6 +102,14 @@ int
 WaitLatch(Latch *latch pg_attribute_unused(), int wakeEvents pg_attribute_unused(),
 		  long timeout pg_attribute_unused(), uint32 wait_event_info pg_attribute_unused())
 {
+	UT_ASSERT_EQ(timeout, 10);
+	waits++;
+	if (wait_fault == 1)
+		epoch++;
+	else if (wait_fault == 2)
+		incarnation++;
+	else if (wait_fault == 3)
+		InterruptPending = true;
 	return 0;
 }
 
@@ -163,6 +183,11 @@ static void
 reset(void)
 {
 	cf_checks = publications = 0;
+	pending_publications = waits = 0;
+	epoch = 7;
+	incarnation = 3;
+	wait_fault = 0;
+	publication_lost = InterruptPending = false;
 	memset(&published, 0, sizeof(published));
 	report_level = report_code = 0;
 	report_message[0] = report_detail[0] = report_hint[0] = '\0';
@@ -239,14 +264,34 @@ UT_TEST(reset_all_is_still_unsupported)
 	UT_ASSERT_EQ(report_code, ERRCODE_FEATURE_NOT_SUPPORTED);
 	UT_ASSERT_EQ(publications, 0);
 }
+UT_TEST(pending_publication_waits_without_replacing_original_owner)
+{
+	reset();
+	pending_publications = 2;
+	UT_ASSERT(!alter("work_mem", "12MB"));
+	UT_ASSERT_EQ(publications, 3);
+	UT_ASSERT_EQ(waits, 2);
+	UT_ASSERT_EQ(report_level, 0);
+	for (int fault = 0; fault < 4; fault++) {
+		reset();
+		pending_publications = 1;
+		wait_fault = fault;
+		publication_lost = fault == 0;
+		UT_ASSERT(alter("work_mem", "12MB"));
+		UT_ASSERT_EQ(waits, 1);
+		UT_ASSERT_EQ(publications, fault == 0 ? 2 : 1);
+		UT_ASSERT_EQ(report_level, ERROR);
+	}
+}
 
 int
 main(void)
 {
-	UT_PLAN(3);
+	UT_PLAN(4);
 	UT_RUN(recorded_parameters_are_refused_before_any_publication);
 	UT_RUN(other_parameters_keep_the_shared_publication);
 	UT_RUN(reset_all_is_still_unsupported);
+	UT_RUN(pending_publication_waits_without_replacing_original_owner);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

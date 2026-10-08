@@ -123,6 +123,7 @@ static bool test_capture_error_level;
 static int test_last_error_level;
 static bool test_serving, test_fence, test_prebump, test_wal_validated;
 static bool test_serving_pending;
+static unsigned test_runtime_serving_reads, test_runtime_pending_at;
 static ClusterMembershipState test_member_state;
 static XLogRecPtr test_flush;
 static XLogRecPtr test_insert;
@@ -396,6 +397,8 @@ cluster_serving_ready_is_current(void)
 bool
 cluster_serving_ready_check(bool *pending, const char **predicate)
 {
+	if (++test_runtime_serving_reads == test_runtime_pending_at)
+		test_serving_pending = true;
 	if (pending != NULL)
 		*pending = test_serving && test_serving_pending;
 	if (predicate != NULL)
@@ -18349,6 +18352,39 @@ UT_TEST(test_bootstrap_v3_pending_objects_and_reread_remain_exact)
 	UT_ASSERT_EQ(test_cf_lock_calls, 0);
 }
 
+UT_TEST(test_v3_runtime_pending_is_not_stale_or_a_usable_view)
+{
+	uint8 bytes[66048];
+	ClusterControlRootIdentity self;
+	ControlFileData candidate, view;
+
+	v2_runtime_fixture(bytes, &self, &candidate);
+	root_fixture_version3(bytes);
+	v2_write_roots(bytes);
+	test_serving_pending = true;
+	memset(&view, 0xa5, sizeof(view));
+	UT_ASSERT_EQ(cluster_control_root_v3_read_runtime_local_locked(&view),
+				 CLUSTER_CONTROL_ROOT_ADMISSION_PENDING);
+	UT_ASSERT(v2_zero(&view, sizeof(view)));
+	v2_assert_primary_unchanged(bytes);
+	test_serving = false;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_runtime_local_locked(&view),
+				 CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	UT_ASSERT(v2_zero(&view, sizeof(view)));
+	test_serving = true;
+	test_serving_pending = false;
+	test_runtime_serving_reads = 0;
+	test_runtime_pending_at = 2;
+	memset(&view, 0xa5, sizeof(view));
+	UT_ASSERT_EQ(cluster_control_root_v3_read_runtime_local_locked(&view),
+				 CLUSTER_CONTROL_ROOT_ADMISSION_PENDING);
+	UT_ASSERT(v2_zero(&view, sizeof(view)));
+	UT_ASSERT_EQ(test_runtime_serving_reads, 2);
+	test_runtime_pending_at = 0;
+	test_serving_pending = false;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_runtime_local_locked(&view), 0);
+}
+
 UT_TEST(test_v3_runtime_retention_and_canonical_use_exact_new_root)
 {
 	uint8 bytes[66048];
@@ -19798,6 +19834,55 @@ UT_TEST(test_config_publisher_keeps_threads_and_reads_exact_new_object)
 	config_primary_read(after);
 	UT_ASSERT(memcmp(after + 512, before + 512, 66048 - 512) == 0);
 	config_staging_empty();
+}
+
+UT_TEST(test_config_publisher_pending_has_no_new_grant_or_duplicate_publication)
+{
+	for (int point = 0; point < 5; point++) {
+		uint8 before[66048];
+		ClusterSharedConfigEntry change = { -1, "statement_timeout", "250" };
+		ClusterSharedConfigPublication out;
+		ClusterSharedConfigPolicyReport policy;
+		config_publish_fixture(before);
+		if (point == 0)
+			test_serving_pending = true;
+		else if (point == 1)
+			test_checkpoint_x_hook = v2_checkpoint_admission_pending;
+		else if (point == 2)
+			test_checkpoint_published_hook = v2_checkpoint_admission_pending;
+		else if (point == 3)
+			test_checkpoint_x_hook = v2_checkpoint_admission_lost;
+		else
+			test_checkpoint_published_hook = v2_checkpoint_admission_lost;
+		UT_ASSERT_EQ(cluster_control_root_config_change(&change, &out, &policy),
+					 point == 2	  ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+					 : point >= 3 ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
+								  : CLUSTER_CONTROL_ROOT_ADMISSION_PENDING);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		if (point == 2) {
+			UT_ASSERT_EQ(out.ref.identity.generation, 48);
+			UT_ASSERT_EQ(out.root.file_txn_seq, get_u64_le(before + 16) + 1);
+			/* The completed owner does not authorize a second call. */
+			config_primary_read(before);
+			UT_ASSERT_EQ(cluster_control_root_config_change(&change, &out, &policy),
+						 CLUSTER_CONTROL_ROOT_ADMISSION_PENDING);
+			UT_ASSERT(v2_zero(&out, sizeof(out)));
+			v2_assert_primary_unchanged(before);
+		} else if (point == 4) {
+			uint8 after[66048];
+			UT_ASSERT(v2_zero(&out, sizeof(out)));
+			config_primary_read(after);
+			UT_ASSERT_EQ(get_u64_le(after + 16), get_u64_le(before + 16) + 1);
+		} else {
+			UT_ASSERT(v2_zero(&out, sizeof(out)));
+			v2_assert_primary_unchanged(before);
+		}
+		if (point == 0)
+			UT_ASSERT_EQ(test_config_prepares, 0);
+		config_staging_empty();
+		test_serving = true;
+		test_serving_pending = false;
+	}
 }
 
 UT_TEST(test_config_publisher_noop_does_not_advance_root_or_make_object)
@@ -22492,7 +22577,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(444);
+	UT_PLAN(446);
 	UT_RUN(test_clean_restart_without_provider_keeps_collective_exit_and_actual_install);
 	UT_RUN(test_clean_restart_without_provider_refuses_missing_exit_formation_and_fence);
 	UT_RUN(test_serving_clean_restart_keeps_old_open_with_current_epoch);
@@ -22586,6 +22671,7 @@ main(int argc, char **argv)
 	UT_RUN(test_config_selected_error_preserves_borrowed_cf_and_empty_outputs);
 	UT_RUN(test_config_publisher_keeps_threads_and_reads_exact_new_object);
 	UT_RUN(test_config_publisher_noop_does_not_advance_root_or_make_object);
+	UT_RUN(test_config_publisher_pending_has_no_new_grant_or_duplicate_publication);
 	UT_RUN(test_config_publisher_rejects_unowned_or_incomplete_inputs);
 	UT_RUN(test_config_publisher_cas_and_epoch_losers_keep_winner);
 	UT_RUN(test_config_publisher_waits_for_selected_initializer_not_age);
@@ -22677,6 +22763,7 @@ main(int argc, char **argv)
 	UT_RUN(test_v3_normal_close_sparse_pair_preserves_exact_roster);
 	UT_RUN(test_v3_normal_close_cannot_discard_foreign_pending_initialization);
 	UT_RUN(test_v3_runtime_retention_and_canonical_use_exact_new_root);
+	UT_RUN(test_v3_runtime_pending_is_not_stale_or_a_usable_view);
 	UT_RUN(test_shared_runtime_dispatches_only_startup_capable_root);
 	UT_RUN(test_v3_runtime_pending_cannot_be_clean_or_retention_authority);
 	UT_RUN(test_v3_service_cannot_consume_cached_v2_observation);

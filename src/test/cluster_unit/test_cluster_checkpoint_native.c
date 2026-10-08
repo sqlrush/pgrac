@@ -67,6 +67,9 @@ static uint64 initialized_epoch;
 static uint64 epoch;
 static unsigned root_calls, waits, local_updates, reads, releases;
 static unsigned serving_pending_reads, serving_reads;
+static unsigned read_pending;
+static bool change_ref_on_wait;
+static bool change_ref_on_release;
 static unsigned native_writes, shutdown_calls;
 static int native_error_level;
 static ClusterControlRootResult returns[4];
@@ -251,17 +254,30 @@ cluster_cf_unlock_confirmed(LOCKMODE m)
 	releases++;
 	if (lose_initialized_on_release)
 		initialized_ok = clean_ok = false;
+	if (change_ref_on_release)
+		ref.claim.max_config_generation++;
 	return release_ok ? CLUSTER_CF_RELEASE_CONFIRMED : CLUSTER_CF_RELEASE_UNCONFIRMED;
 }
 bool
-cluster_cf_authority_read(ControlFileData *o)
+cluster_cf_authority_read_check(ControlFileData *o, bool *pending)
 {
 	UT_ASSERT(cf_mode == ShareLock && !local_lock);
 	reads++;
+	if (pending)
+		*pending = read_pending > 0;
+	if (read_pending > 0) {
+		read_pending--;
+		return false;
+	}
 	if (read_error)
 		ereport(ERROR, (errmsg("fixture read error")));
 	*o = selected;
 	return read_ok;
+}
+bool
+cluster_cf_authority_read(ControlFileData *o)
+{
+	return cluster_cf_authority_read_check(o, NULL);
 }
 bool
 cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *o)
@@ -349,6 +365,8 @@ WaitLatch(Latch *l, int e, long t, uint32 event)
 	waits++;
 	if (change_epoch_on_wait)
 		epoch++;
+	if (change_ref_on_wait)
+		ref.claim.identity.origin_owner_incarnation++;
 	if (cancel_on_wait)
 		InterruptPending = true;
 	return WL_TIMEOUT;
@@ -620,6 +638,9 @@ reset_fixture(void)
 	MyBackendType = B_CHECKPOINTER;
 	root_calls = waits = local_updates = reads = releases = 0;
 	serving_pending_reads = serving_reads = 0;
+	read_pending = 0;
+	change_ref_on_wait = false;
+	change_ref_on_release = false;
 	native_writes = shutdown_calls = 0;
 	native_error_level = 0;
 	cluster_shared_config = cluster_enabled = cluster_controlfile_shared_authority = true;
@@ -671,6 +692,50 @@ UT_TEST(prepare_uses_short_owned_read)
 	UT_ASSERT_EQ(reads, 1);
 	UT_ASSERT_EQ(releases, 1);
 	UT_ASSERT_EQ(cf_mode, NoLock);
+}
+UT_TEST(prepare_pending_releases_before_normal_and_shutdown_retry)
+{
+	for (int shutdown = 0; shutdown < 2; shutdown++) {
+		reset_fixture();
+		read_pending = 2;
+		ShutdownRequestPending = shutdown != 0;
+		UT_ASSERT(prepare(shutdown ? CHECKPOINT_IS_SHUTDOWN : CHECKPOINT_FORCE));
+		UT_ASSERT_EQ(reads, 3);
+		UT_ASSERT_EQ(releases, 3);
+		UT_ASSERT_EQ(waits, 2);
+		UT_ASSERT_EQ(cf_mode, NoLock);
+		UT_ASSERT_EQ(candidate.checkPoint, 150);
+		UT_ASSERT_EQ(current.checkPoint, 100);
+	}
+}
+UT_TEST(prepare_pending_cannot_hide_release_loss_cancel_or_changed_owner)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		reset_fixture();
+		read_pending = 1;
+		release_ok = fault != 0;
+		cancel_on_wait = fault == 1;
+		change_epoch_on_wait = fault == 2;
+		change_ref_on_wait = fault == 3;
+		read_ok = fault != 4;
+		UT_ASSERT(!prepare(CHECKPOINT_FORCE));
+		UT_ASSERT_EQ(waits, fault == 0 ? 0 : 1);
+		UT_ASSERT_EQ(reads, fault == 4 ? 2 : 1);
+		UT_ASSERT_EQ(reads, releases);
+		UT_ASSERT_EQ(cf_mode, NoLock);
+		UT_ASSERT_EQ(current.checkPoint, 100);
+		UT_ASSERT_EQ(candidate.checkPoint, 0);
+	}
+	for (int pending = 0; pending < 2; pending++) {
+		reset_fixture();
+		read_pending = pending;
+		change_ref_on_release = true;
+		UT_ASSERT(!prepare(CHECKPOINT_FORCE));
+		UT_ASSERT_EQ(waits, 0);
+		UT_ASSERT_EQ(releases, 1);
+		UT_ASSERT_EQ(candidate.checkPoint, 0);
+		UT_ASSERT_EQ(cf_mode, NoLock);
+	}
 }
 UT_TEST(prepare_refuses_unsupported_or_unproven_input)
 {
@@ -1946,7 +2011,7 @@ UT_TEST(native_startup_insert_has_no_link_or_page_from_predecessor)
 int
 main(void)
 {
-	UT_PLAN(51);
+	UT_PLAN(53);
 	UT_RUN(clean_input_observation_preserves_exact_old_and_new_owners);
 	UT_RUN(clean_input_observation_rejects_other_input_kinds);
 	UT_RUN(clean_input_observation_rejects_wrong_owner_phase_and_lock_context);
@@ -1967,6 +2032,8 @@ main(void)
 	UT_RUN(static_common_mismatch_or_cancel_never_writes);
 	UT_RUN(static_common_is_rechecked_before_new_wal_binding);
 	UT_RUN(prepare_uses_short_owned_read);
+	UT_RUN(prepare_pending_releases_before_normal_and_shutdown_retry);
+	UT_RUN(prepare_pending_cannot_hide_release_loss_cancel_or_changed_owner);
 	UT_RUN(prepare_refuses_unsupported_or_unproven_input);
 	UT_RUN(initialized_writer_checkpoint_uses_exact_existing_fence_qualification);
 	UT_RUN(initialized_checkpoint_cannot_borrow_other_input_epoch_or_writer);
