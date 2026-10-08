@@ -3883,6 +3883,9 @@ test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 $(filter-out test_cluster_sync_error test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
 
+# Native CR metadata checks are inline in the shared descriptor definition.
+test_cluster_buffer_desc: $(top_srcdir)/src/include/storage/buf_internals.h
+
 # The wire behavior is inline; an updated decoder must rebuild this binary.
 test_cluster_r4_wire_codec: test_cluster_r4_wire_codec.c \
 		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h

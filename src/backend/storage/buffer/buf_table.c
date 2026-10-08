@@ -49,21 +49,35 @@ StaticAssertDecl(sizeof(BufferLookupEnt) == 40,
 
 static pg_atomic_uint64 *SharedBufAnchorGeneration;
 
-/* Initialize a new, exclusively locked anchor without reusing a generation. */
+/* One native mapping allocator owns non-reusable anchor and read-scope IDs. */
 static bool
-buf_table_init_anchor(BufferLookupEnt *entry)
+buf_table_next_generation(uint64 *out)
 {
-	uint64		generation = pg_atomic_read_u64(SharedBufAnchorGeneration);
+	uint64		generation;
 
+	if (out == NULL || SharedBufAnchorGeneration == NULL)
+		return false;
+	generation = pg_atomic_read_u64(SharedBufAnchorGeneration);
 	do
 	{
 		if (generation == PG_UINT64_MAX)
 			return false;
 	} while (!pg_atomic_compare_exchange_u64(SharedBufAnchorGeneration,
 											 &generation, generation + 1));
+	*out = generation + 1;
+	return true;
+}
 
+/* Initialize a new, exclusively locked anchor without reusing a generation. */
+static bool
+buf_table_init_anchor(BufferLookupEnt *entry)
+{
+	uint64		generation;
+
+	if (!buf_table_next_generation(&generation))
+		return false;
 	entry->id = -1;
-	entry->anchor_generation = generation + 1;
+	entry->anchor_generation = generation;
 	entry->cr_head = -1;
 	entry->reserved_zero = 0;
 	return true;
@@ -277,6 +291,14 @@ BufTableDelete(BufferTag *tagPtr, uint32 hashcode)
 }
 
 #ifdef USE_PGRAC_CLUSTER
+/* A native read owner gets a process-shared, non-reusable scope identity.
+ * Refusal leaves its output unchanged. This is not a visibility proof. */
+bool
+BufTableNewCRScope(uint64 *scope)
+{
+	return buf_table_next_generation(scope);
+}
+
 /*
  * Look up a nonempty CR chain without granting access to the current buffer.
  * Caller holds at least mapping-S.  False leaves both outputs unchanged.

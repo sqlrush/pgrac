@@ -446,10 +446,37 @@ UT_TEST(test_shared_memory_accounts_for_anchors_and_allocator)
 	UT_ASSERT(!BufTableCRLookup(&tag, hash, &head, &generation));
 }
 
+UT_TEST(test_scope_nonce_shares_allocator_without_alias_or_wrap)
+{
+	BufferTag tag = reset_mapping();
+	uint32 hash = BufTableHashCode(&tag);
+	uint64 first = 0, second = 0, anchor = 0, refused = 777;
+	int head = -2;
+
+	UT_ASSERT(!BufTableNewCRScope(NULL));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&generation_storage), 0);
+	UT_ASSERT(BufTableNewCRScope(&first));
+	UT_ASSERT(first != 0);
+	UT_ASSERT(BufTableCRInsert(&tag, hash, 8, &head, &anchor));
+	UT_ASSERT(anchor != first);
+	InitBufTable(NBuffers + NUM_BUFFER_PARTITIONS);
+	UT_ASSERT(BufTableNewCRScope(&second));
+	UT_ASSERT(second > anchor && second != first);
+	pg_atomic_write_u64(&generation_storage, PG_UINT64_MAX - 1);
+	UT_ASSERT(BufTableNewCRScope(&second));
+	UT_ASSERT_EQ(second, PG_UINT64_MAX);
+	UT_ASSERT(!BufTableNewCRScope(&refused));
+	UT_ASSERT_EQ(refused, 777);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&generation_storage), PG_UINT64_MAX);
+	UT_ASSERT(BufTableCRLookup(&tag, hash, &head, &second));
+	UT_ASSERT_EQ(head, 8);
+	UT_ASSERT_EQ(second, anchor);
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_native_current_mapping_is_unchanged);
 	UT_RUN(test_current_and_cr_are_distinct);
 	UT_RUN(test_cr_only_never_grants_current);
@@ -462,6 +489,7 @@ main(void)
 	UT_RUN(test_invalid_arguments_preserve_outputs);
 	UT_RUN(test_cr_only_current_delete_alias_and_duplicate_refuse);
 	UT_RUN(test_shared_memory_accounts_for_anchors_and_allocator);
+	UT_RUN(test_scope_nonce_shares_allocator_without_alias_or_wrap);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
