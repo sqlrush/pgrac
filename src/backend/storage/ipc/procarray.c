@@ -41,6 +41,11 @@
  * IDENTIFICATION
  *	  src/backend/storage/ipc/procarray.c
  *
+ * PGRAC MODIFICATIONS
+ *   Modified by: SqlRush <sqlrush@gmail.com>
+ *   Refresh cluster snapshot fields and retire read-only cache identities.
+ *   Spec: spec-3.3-snapshot-consistency-cross-node.md
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -2142,6 +2147,9 @@ GetSnapshotDataInitOldSnapshot(Snapshot snapshot)
 static inline void
 ClusterSnapshotRefreshFields(Snapshot snapshot)
 {
+	/* A refreshed static snapshot cannot inherit an earlier read identity. */
+	snapshot->cluster_cr_identity = 0;
+
 	/*
 	 * P0 (2026-05-31):  cluster snapshot source + read_scn follow the STORAGE
 	 * gate (cluster.enabled + valid node_id), NOT cluster_conf_has_peers().  A

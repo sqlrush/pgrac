@@ -8278,8 +8278,13 @@ test_cluster_snapshot_admission_horizon.inc: $(top_srcdir)/src/backend/cluster/c
 		emit { print } emit && /^}$$/ { done++; exit } \
 		END { if (done != 2) exit 1 }' $< > $@
 
+test_cluster_snapshot_admission_refresh.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
+	@awk '/^ClusterSnapshotRefreshFields\(Snapshot snapshot\)$$/ { emit=1; print "static inline void" } \
+		emit { print } emit && /^}$$/ { done=1; exit } \
+		END { if (!done) exit 1 }' $< > $@
+
 test_cluster_snapshot_admission: test_cluster_snapshot_admission.c unit_test.h \
-		test_cluster_snapshot_admission_horizon.inc \
+		test_cluster_snapshot_admission_horizon.inc test_cluster_snapshot_admission_refresh.inc \
 		$(top_srcdir)/src/backend/utils/time/snapmgr.c $(top_srcdir)/src/include/utils/snapmgr.h \
 		$(top_builddir)/src/backend/lib/pairingheap.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \

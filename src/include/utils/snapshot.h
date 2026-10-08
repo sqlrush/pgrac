@@ -11,11 +11,15 @@
  *-------------------------------------------------------------------------
  *
  * PGRAC MODIFICATIONS (spec-3.3 D1):
+ *   Modified by: SqlRush <sqlrush@gmail.com>
  *   Added explicit 24-byte cluster tail to SnapshotData: SCN read_scn (8B)
  *   + uint64 read_epoch (8B) + uint8 cluster_source (1B)
  *   + uint8 cluster_snapshot_session_local (1B, spec-3.24 D1) + uint8 _pad[6]
  *   (7B). Explicit layout prevents hidden 4B padding (R4 P1) and avoids
  *   uint32 wrap alias on cluster epoch (R9 P2).
+ *
+ *   A following uint64 identifies the local retained snapshot for read-only
+ *   cache lookup. It is reset on copy/refresh and is never serialized.
  *
  *   New SnapshotSource enum {LOCAL=0, CLUSTER=1}:
  *     LOCAL  - catalog scans, logical decoding, system snapshots; PG-native
@@ -284,6 +288,7 @@ typedef struct SnapshotData
 	uint8		cluster_source;
 	uint8		cluster_snapshot_session_local;
 	uint8		_pad[6];
+	uint64		cluster_cr_identity; /* local read-only cache identity, not serialized */
 #endif
 } SnapshotData;
 
