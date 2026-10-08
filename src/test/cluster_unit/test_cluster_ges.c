@@ -1026,7 +1026,7 @@ cluster_grd_convert_or_enqueue(
 	int current_mode pg_attribute_unused(), int requested_mode pg_attribute_unused(),
 	uint64 convert_request_id pg_attribute_unused(), int32 source_node_id pg_attribute_unused(),
 	uint64 shard_master_generation pg_attribute_unused(),
-	ClusterGrdConflictHolder *conflict_holders_out pg_attribute_unused(),
+	ClusterGrdConflictHolder **conflict_holders_out pg_attribute_unused(),
 	int *n_conflict_out pg_attribute_unused())
 {
 	return CLUSTER_GRD_CONVERT_NOT_READY;
@@ -1041,7 +1041,7 @@ cluster_grd_convert_or_enqueue_meta(
 	uint64 convert_request_id pg_attribute_unused(), int32 source_node_id pg_attribute_unused(),
 	uint64 shard_master_generation pg_attribute_unused(),
 	ClusterGrdWaiterMeta meta pg_attribute_unused(),
-	ClusterGrdConflictHolder *conflict_holders_out pg_attribute_unused(),
+	ClusterGrdConflictHolder **conflict_holders_out pg_attribute_unused(),
 	int *n_conflict_out pg_attribute_unused())
 {
 	return CLUSTER_GRD_CONVERT_NOT_READY;
@@ -1076,6 +1076,36 @@ cluster_grd_release_and_drain(const struct ClusterResId *resid pg_attribute_unus
 		granted_out[0] = stub_drained_grant;
 	}
 	return stub_release_and_drain_result;
+}
+
+/* The GES boundary fixture retains its old GRD decisions; complete-batch
+ * mutation and allocation are covered with the real GRD capacity fixture. */
+void
+cluster_grd_grant_batch_free(ClusterGrdGrantBatch *batch)
+{
+	Assert(batch->items == NULL || batch->items == batch->inline_items);
+	batch->items = NULL;
+	batch->capacity = 0;
+}
+
+int
+cluster_grd_release_and_drain_all(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+								  ClusterGrdGrantBatch *batch)
+{
+	batch->items = batch->inline_items;
+	batch->capacity = lengthof(batch->inline_items);
+	return cluster_grd_release_and_drain(resid, holder, batch->items, batch->capacity);
+}
+
+int
+cluster_grd_retire_request_and_drain_all(const ClusterResId *resid,
+										 const ClusterGrdHolderId *holder, uint64 previous,
+										 LOCKMODE mode, bool may_drain, ClusterGrdGrantBatch *batch)
+{
+	batch->items = batch->inline_items;
+	batch->capacity = lengthof(batch->inline_items);
+	return cluster_grd_retire_request_and_drain(resid, holder, previous, mode, batch->items,
+												may_drain ? batch->capacity : 0);
 }
 
 ClusterGrdEntryResult
@@ -1174,7 +1204,7 @@ cluster_grd_entry_enqueue_or_grant(const struct ClusterResId *r pg_attribute_unu
 								   uint64 req_id pg_attribute_unused(),
 								   uint64 shard_master_generation pg_attribute_unused(),
 								   uint32 op pg_attribute_unused(), int mode pg_attribute_unused(),
-								   struct ClusterGrdConflictHolder *out pg_attribute_unused(),
+								   struct ClusterGrdConflictHolder **out pg_attribute_unused(),
 								   int *nout pg_attribute_unused())
 {
 	if (nout != NULL)
@@ -1189,7 +1219,7 @@ cluster_grd_entry_grant_conditional(const struct ClusterResId *r pg_attribute_un
 									uint64 req_id pg_attribute_unused(),
 									uint64 shard_master_generation pg_attribute_unused(),
 									uint32 op pg_attribute_unused(), int mode pg_attribute_unused(),
-									struct ClusterGrdConflictHolder *out pg_attribute_unused(),
+									struct ClusterGrdConflictHolder **out pg_attribute_unused(),
 									int *nout pg_attribute_unused())
 {
 	if (nout != NULL)
@@ -1203,7 +1233,7 @@ cluster_grd_entry_enqueue_or_grant_meta(
 	const struct ClusterGrdHolderId *h pg_attribute_unused(), int32 src pg_attribute_unused(),
 	uint64 req_id pg_attribute_unused(), ClusterGrdWaiterMeta meta pg_attribute_unused(),
 	uint64 shard_master_generation pg_attribute_unused(), uint32 op pg_attribute_unused(),
-	int mode pg_attribute_unused(), struct ClusterGrdConflictHolder *out pg_attribute_unused(),
+	int mode pg_attribute_unused(), struct ClusterGrdConflictHolder **out pg_attribute_unused(),
 	int *nout pg_attribute_unused())
 {
 	stub_grant_group = meta.lock_group_procno_plus_one;
@@ -1218,7 +1248,7 @@ cluster_grd_entry_grant_conditional_meta(
 	const struct ClusterGrdHolderId *h pg_attribute_unused(), int32 src pg_attribute_unused(),
 	uint64 req_id pg_attribute_unused(), ClusterGrdWaiterMeta meta pg_attribute_unused(),
 	uint64 shard_master_generation pg_attribute_unused(), uint32 op pg_attribute_unused(),
-	int mode pg_attribute_unused(), struct ClusterGrdConflictHolder *out pg_attribute_unused(),
+	int mode pg_attribute_unused(), struct ClusterGrdConflictHolder **out pg_attribute_unused(),
 	int *nout pg_attribute_unused())
 {
 	stub_grant_group = meta.lock_group_procno_plus_one;

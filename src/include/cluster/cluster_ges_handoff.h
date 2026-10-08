@@ -73,18 +73,37 @@ typedef struct ClusterGesHandoffParty {
 
 typedef struct ClusterGesHandoffSnapshot {
 	/* post-drain surviving holders */
-	ClusterGesHandoffParty holders[CLUSTER_GES_HANDOFF_MAX];
+	ClusterGesHandoffParty *holders;
+	int holder_capacity;
 	int nholders;
 	/* still-queued waiters/converts after the drain */
-	ClusterGesHandoffParty waiters[CLUSTER_GES_HANDOFF_MAX];
+	ClusterGesHandoffParty *waiters;
+	int waiter_capacity;
 	int nwaiters;
 	/* identities granted this drain pass */
-	ClusterGesHandoffParty granted[CLUSTER_GES_HANDOFF_MAX];
+	ClusterGesHandoffParty *granted;
+	int grant_capacity;
 	int ngranted;
 	/* the released holder identity (must be absent post-drain) */
 	int32 released_node_id;
 	uint32 released_procno;
+	ClusterGesHandoffParty holders_inline[CLUSTER_GES_HANDOFF_MAX];
+	ClusterGesHandoffParty waiters_inline[CLUSTER_GES_HANDOFF_MAX];
+	ClusterGesHandoffParty granted_inline[CLUSTER_GES_HANDOFF_MAX];
 } ClusterGesHandoffSnapshot;
+
+/* Caller-owned process-local snapshot, never a wire/shared-memory layout.
+ * Runtime grows only outside entry locks and before the observed mutation.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static inline void
+cluster_ges_handoff_snapshot_init(ClusterGesHandoffSnapshot *snap)
+{
+	memset(snap, 0, sizeof(*snap));
+	snap->holders = snap->holders_inline;
+	snap->waiters = snap->waiters_inline;
+	snap->granted = snap->granted_inline;
+	snap->holder_capacity = snap->waiter_capacity = snap->grant_capacity = CLUSTER_GES_HANDOFF_MAX;
+}
 
 typedef enum ClusterGesHandoffVerdict {
 	CLUSTER_GES_HANDOFF_OK = 0,

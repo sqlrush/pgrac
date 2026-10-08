@@ -39,6 +39,7 @@
 #undef printf
 
 #include "unit_test.h"
+#include <setjmp.h>
 
 UT_DEFINE_GLOBALS();
 
@@ -46,6 +47,27 @@ ProcessingMode Mode = NormalProcessing;
 int cluster_lms_workers = 1;
 int cluster_lmon_main_loop_interval = 1000;
 int MaxBackends = 200;
+int max_prepared_xacts = 0;
+
+Size
+add_size(Size a, Size b)
+{
+	if (a > SIZE_MAX - b)
+		abort();
+	return a + b;
+}
+Size
+mul_size(Size a, Size b)
+{
+	if (b != 0 && a > SIZE_MAX / b)
+		abort();
+	return a * b;
+}
+int
+errcode(int code)
+{
+	return code;
+}
 int cluster_node_id = 0;
 bool cluster_shared_config = false;
 
@@ -65,25 +87,33 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 }
 
 static uint64 ut_log_count;
+static sigjmp_buf ut_error_jump;
+static bool ut_error_expected;
+static int ut_error_level;
 
 bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
 	if (elevel == LOG)
 		ut_log_count++;
-	return false;
+	ut_error_level = elevel;
+	return elevel >= ERROR;
 }
 
 bool
-errstart_cold(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+errstart_cold(int elevel, const char *domain)
 {
-	return false;
+	return errstart(elevel, domain);
 }
 
 void
 errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
-{}
+{
+	if (ut_error_expected)
+		siglongjmp(ut_error_jump, 1);
+	abort();
+}
 
 int
 errmsg_internal(const char *fmt pg_attribute_unused(), ...)
@@ -284,9 +314,9 @@ ut_fill_main_ring(void)
 	uint8 payload = 0xA5;
 	int i;
 
-	for (i = 0; i < PGRAC_GES_OUTBOUND_RING_CAPACITY; i++)
+	for (i = 0; i < grd_outbound_capacity; i++)
 		cluster_grd_outbound_enqueue_lmon_reply(1, &payload, sizeof(payload));
-	UT_ASSERT_EQ(cluster_grd_outbound_ring_depth(), (uint32)PGRAC_GES_OUTBOUND_RING_CAPACITY);
+	UT_ASSERT_EQ(cluster_grd_outbound_ring_depth(), (uint32)grd_outbound_capacity);
 }
 
 UT_TEST(test_cleanup_retry_queue_never_overwrites_oldest)
@@ -343,7 +373,7 @@ UT_TEST(test_cleanup_retry_pressure_logs_once_per_postmaster_lifetime)
 	ut_reset_state();
 	ut_fill_main_ring();
 
-	for (i = 1; i < PGRAC_GES_CLEANUP_DIRTY_WARN50_DEPTH; i++) {
+	for (i = 1; i < grd_cleanup_warn50; i++) {
 		GesRequestPayload rel = ut_release((uint64)i);
 
 		cluster_grd_outbound_enqueue_cleanup_release(1, &rel, sizeof(rel));
@@ -353,7 +383,7 @@ UT_TEST(test_cleanup_retry_pressure_logs_once_per_postmaster_lifetime)
 	UT_ASSERT_EQ(ut_log_count, UINT64CONST(0));
 
 	{
-		GesRequestPayload rel = ut_release((uint64)PGRAC_GES_CLEANUP_DIRTY_WARN50_DEPTH);
+		GesRequestPayload rel = ut_release((uint64)grd_cleanup_warn50);
 
 		cluster_grd_outbound_enqueue_cleanup_release(1, &rel, sizeof(rel));
 	}
@@ -361,8 +391,7 @@ UT_TEST(test_cleanup_retry_pressure_logs_once_per_postmaster_lifetime)
 	UT_ASSERT_EQ(cluster_grd_outbound_cleanup_retry_warn90_count(), UINT64CONST(0));
 	UT_ASSERT_EQ(ut_log_count, UINT64CONST(1));
 
-	for (i = PGRAC_GES_CLEANUP_DIRTY_WARN50_DEPTH + 1;
-		 i <= PGRAC_GES_CLEANUP_DIRTY_WARN90_DEPTH + 1; i++) {
+	for (i = grd_cleanup_warn50 + 1; i <= grd_cleanup_warn90 + 1; i++) {
 		GesRequestPayload rel = ut_release((uint64)i);
 
 		cluster_grd_outbound_enqueue_cleanup_release(1, &rel, sizeof(rel));
@@ -375,7 +404,7 @@ UT_TEST(test_cleanup_retry_pressure_logs_once_per_postmaster_lifetime)
 	while (cluster_grd_outbound_ring_depth() > 0 || cluster_grd_outbound_cleanup_dirty_depth() > 0)
 		(void)cluster_grd_outbound_lmon_drain_send();
 	ut_fill_main_ring();
-	for (i = 1; i <= PGRAC_GES_CLEANUP_DIRTY_WARN90_DEPTH; i++) {
+	for (i = 1; i <= grd_cleanup_warn90; i++) {
 		GesRequestPayload rel = ut_release((uint64)i);
 
 		cluster_grd_outbound_enqueue_cleanup_release(1, &rel, sizeof(rel));
@@ -395,13 +424,13 @@ UT_TEST(test_local_cleanup_reaches_work_owner_and_retains_on_full)
 	ut_reset_state();
 	rel = ut_release(201);
 	cluster_grd_outbound_enqueue_cleanup_release(0, &rel, sizeof(rel));
-	for (int i = 0; i < PGRAC_GES_WORK_QUEUE_CAPACITY; i++)
+	for (int i = 0; i < cluster_grd_work_queue_capacity; i++)
 		UT_ASSERT(cluster_grd_work_queue_enqueue(0, &rel, sizeof(rel)));
 	UT_ASSERT_EQ(cluster_grd_outbound_lmon_drain_send(), 0);
 	UT_ASSERT_EQ(ut_send_count, 0); /* IC self-send is a no-op, not ownership. */
 	UT_ASSERT_EQ(cluster_grd_outbound_ring_depth() + cluster_grd_outbound_cleanup_dirty_depth(), 1);
-	UT_ASSERT_EQ(cluster_grd_work_queue_depth(), PGRAC_GES_WORK_QUEUE_CAPACITY);
-	for (int i = 0; i < PGRAC_GES_WORK_QUEUE_CAPACITY; i++)
+	UT_ASSERT_EQ(cluster_grd_work_queue_depth(), cluster_grd_work_queue_capacity);
+	for (int i = 0; i < cluster_grd_work_queue_capacity; i++)
 		UT_ASSERT(cluster_grd_work_queue_dequeue(&item));
 	UT_ASSERT_EQ(cluster_grd_outbound_lmon_drain_send(), 1);
 	UT_ASSERT_EQ(ut_send_count, 0);
@@ -440,19 +469,21 @@ UT_TEST(test_normal_stop_all_three_outbound_queues)
 	cluster_grd_outbound_enqueue_cleanup_release(1, &rel, sizeof(rel));
 	UT_ASSERT_EQ(cluster_grd_outbound_normal_stop_poll(&slot, &reason),
 				 CLUSTER_NORMAL_STOP_PENDING);
-	for (int i = 0; i < PGRAC_GES_OUTBOUND_RING_CAPACITY; i++)
+	for (int i = 0; i < grd_outbound_capacity; i++)
 		UT_ASSERT(cluster_grd_outbound_dequeue(&item));
 	UT_ASSERT_EQ(cluster_grd_outbound_ring_depth(), 0);
 	UT_ASSERT_EQ(cluster_grd_outbound_normal_stop_poll(&slot, &reason),
 				 CLUSTER_NORMAL_STOP_PENDING);
 	UT_ASSERT(strcmp(reason, "GRD_REPLY_DIRTY") == 0);
 	UT_ASSERT_EQ(ut_last_mode, LW_SHARED);
-	cluster_grd_outbound_state->cleanup_dirty[cluster_grd_outbound_state->cleanup_dirty_tail].origin
+	grd_outbound_cleanup(cluster_grd_outbound_state)[cluster_grd_outbound_state->cleanup_dirty_tail]
+		.origin
 		= 0;
 	UT_ASSERT_EQ(cluster_grd_outbound_normal_stop_poll(&slot, &reason),
 				 CLUSTER_NORMAL_STOP_INVALID);
 	UT_ASSERT_EQ(cluster_grd_outbound_cleanup_dirty_depth(), 1);
-	cluster_grd_outbound_state->cleanup_dirty[cluster_grd_outbound_state->cleanup_dirty_tail].origin
+	grd_outbound_cleanup(cluster_grd_outbound_state)[cluster_grd_outbound_state->cleanup_dirty_tail]
+		.origin
 		= CLUSTER_GRD_OUTBOUND_CLEANUP_RELEASE;
 	UT_ASSERT_EQ(cluster_grd_outbound_lmon_drain_send(), 2);
 	UT_ASSERT_EQ(cluster_grd_outbound_normal_stop_poll(&slot, &reason), CLUSTER_NORMAL_STOP_READY);
@@ -488,7 +519,7 @@ UT_TEST(test_normal_stop_work_queue_exact_shape_and_lock)
 				 CLUSTER_NORMAL_STOP_INVALID);
 	UT_ASSERT_EQ(cluster_grd_work_queue_state->items[0].source_node_id, CLUSTER_MAX_NODES);
 	cluster_grd_work_queue_state->items[0].source_node_id = 3;
-	cluster_grd_work_queue_state->head = PGRAC_GES_WORK_QUEUE_CAPACITY;
+	cluster_grd_work_queue_state->head = cluster_grd_work_queue_capacity;
 	UT_ASSERT_EQ(cluster_grd_work_queue_normal_stop_poll(&slot, &reason),
 				 CLUSTER_NORMAL_STOP_INVALID);
 	cluster_grd_work_queue_state->head = 1;
@@ -510,7 +541,7 @@ UT_TEST(test_normal_stop_outbound_geometry_cannot_fake_empty)
 	UT_ASSERT_EQ(cluster_grd_outbound_normal_stop_poll(&slot, &reason),
 				 CLUSTER_NORMAL_STOP_INVALID);
 	cluster_grd_outbound_state->cleanup_dirty_head = 0;
-	cluster_grd_outbound_state->reply_dirty_count = PGRAC_GES_REPLY_DIRTY_BUDGET + 1;
+	cluster_grd_outbound_state->reply_dirty_count = grd_reply_capacity + 1;
 	UT_ASSERT_EQ(cluster_grd_outbound_normal_stop_poll(&slot, &reason),
 				 CLUSTER_NORMAL_STOP_INVALID);
 	cluster_grd_outbound_state->reply_dirty_count = 0;
@@ -621,11 +652,92 @@ UT_TEST(test_forgotten_control_identity_is_not_send_permission)
 	cluster_shared_config = false;
 }
 
+/* The configured four-node burst must not hit a smaller queue than the
+ * resource it feeds. These are transport-boundary tests, not a live workload. */
+int
+cluster_conf_declared_node_count_early(void)
+{
+	return 4;
+}
+
+UT_TEST(test_configured_work_burst)
+{
+	GesRequestPayload rel = ut_release(1);
+	int participants = 4 * MaxBackends;
+
+	ut_reset_state();
+	for (int i = 0; i < participants; i++)
+		UT_ASSERT(cluster_grd_work_queue_enqueue(0, &rel, sizeof(rel)));
+	UT_ASSERT_EQ(cluster_grd_work_queue_depth(), participants);
+}
+
+UT_TEST(test_configured_outbound_burst)
+{
+	GesRequestPayload rel = ut_release(1);
+	int participants = 4 * MaxBackends;
+
+	ut_reset_state();
+	for (int i = 0; i < participants; i++)
+		UT_ASSERT(cluster_grd_outbound_enqueue_backend_request(1, &rel, sizeof(rel)));
+	UT_ASSERT_EQ(cluster_grd_outbound_ring_depth(), participants);
+}
+
+UT_TEST(test_configured_cleanup_exhaustion_preserves_exact_frames)
+{
+	GesRequestPayload rel;
+	ClusterGrdOutboundSlot first, last;
+	volatile bool caught = false;
+
+	ut_reset_state();
+	ut_fill_main_ring();
+	for (uint32 i = 0; i < grd_cleanup_capacity; i++) {
+		rel = ut_release(10000 + i);
+		cluster_grd_outbound_enqueue_cleanup_release(1, &rel, sizeof(rel));
+	}
+	first = grd_outbound_cleanup(cluster_grd_outbound_state)[0];
+	last = grd_outbound_cleanup(cluster_grd_outbound_state)[grd_cleanup_capacity - 1];
+	rel = ut_release(999);
+	ut_error_expected = true;
+	if (sigsetjmp(ut_error_jump, 0) == 0)
+		cluster_grd_outbound_enqueue_cleanup_release(1, &rel, sizeof(rel));
+	else
+		caught = true;
+	ut_error_expected = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(ut_error_level, PANIC);
+	UT_ASSERT(ut_held_lock == NULL);
+	UT_ASSERT_EQ(cluster_grd_outbound_cleanup_dirty_depth(), grd_cleanup_capacity);
+	UT_ASSERT(memcmp(&first, &grd_outbound_cleanup(cluster_grd_outbound_state)[0], sizeof(first))
+			  == 0);
+	UT_ASSERT(memcmp(&last,
+					 &grd_outbound_cleanup(cluster_grd_outbound_state)[grd_cleanup_capacity - 1],
+					 sizeof(last))
+			  == 0);
+}
+
+UT_TEST(test_configured_capacity_overflow_refused_before_allocation)
+{
+	int previous = MaxBackends;
+	volatile bool caught = false;
+
+	MaxBackends = INT_MAX;
+	ut_error_expected = true;
+	if (sigsetjmp(ut_error_jump, 0) == 0)
+		(void)cluster_grd_work_queue_shmem_size();
+	else
+		caught = true;
+	ut_error_expected = false;
+	MaxBackends = previous;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(ut_error_level, ERROR);
+	UT_ASSERT(ut_held_lock == NULL);
+}
+
 int
 main(void)
 {
 	cluster_grd_outbound_shmem_register();
-	UT_PLAN(11);
+	UT_PLAN(15);
 
 	UT_RUN(test_normal_stop_required_queues_uninitialized);
 	UT_RUN(test_cleanup_retry_queue_never_overwrites_oldest);
@@ -638,6 +750,10 @@ main(void)
 	UT_RUN(test_work_queue_retains_receiver_cut_and_original_payload);
 	UT_RUN(test_abandoned_control_request_cannot_escape_retry_ring);
 	UT_RUN(test_forgotten_control_identity_is_not_send_permission);
+	UT_RUN(test_configured_work_burst);
+	UT_RUN(test_configured_outbound_burst);
+	UT_RUN(test_configured_cleanup_exhaustion_preserves_exact_frames);
+	UT_RUN(test_configured_capacity_overflow_refused_before_allocation);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

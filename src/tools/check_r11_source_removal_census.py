@@ -23,8 +23,8 @@ L3_COMMIT = "cc1c5a554276542a05c15f5f1e0e0c7317fba66e"
 L3_TREE = "be71cb8fa6bba4164f8f9b57e54adcc6ef2a34b5"
 CURRENT_PRODUCT_SNAPSHOT = {
     "algorithm": "sha256-canonical-path-blob-v1",
-    "path_count": 2344,
-    "sha256": "a6e96ef782ff52f2c93cfa7cff22e63e6b67bfd2eea3423201314ac728f4605e"
+    "path_count": 2345,
+    "sha256": "96096d5a9bb1cef6bbdb350887831fc2499148ddb8b324ffe7f50cffa8bc04af"
 }
 
 

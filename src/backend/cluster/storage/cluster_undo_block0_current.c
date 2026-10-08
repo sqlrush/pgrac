@@ -790,7 +790,7 @@ current_acquire_reserve_and_dispatch(ClusterUndoBlock0CurrentGuardData *data,
 {
 	ClusterGrdEntryResult reserve_result;
 	ClusterGrdGrantAction action;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int nconflicts = 0;
 	bool fast_path = false;
 	GesRequestPayload request;
@@ -819,7 +819,11 @@ current_acquire_reserve_and_dispatch(ClusterUndoBlock0CurrentGuardData *data,
 	if (!data->remote_master) {
 		action = cluster_grd_entry_enqueue_or_grant(
 			&data->resid, &data->holder, cluster_node_id, data->holder.request_id,
-			data->routing_generation, GES_REQ_OPCODE_REQUEST, data->mode, conflicts, &nconflicts);
+			data->routing_generation, GES_REQ_OPCODE_REQUEST, data->mode, &conflicts, &nconflicts);
+		if (action != CLUSTER_GRD_ENQUEUED_WAITER && conflicts != NULL) {
+			pfree(conflicts);
+			conflicts = NULL;
+		}
 		if (action == CLUSTER_GRD_GRANT_NOW) {
 			data->request_dispatched = true;
 			data->grant_observed = true;
@@ -834,6 +838,8 @@ current_acquire_reserve_and_dispatch(ClusterUndoBlock0CurrentGuardData *data,
 		data->request_dispatched = true;
 		if (nconflicts > 0)
 			cluster_ges_send_bast_targeted(&data->resid, data->mode, conflicts, nconflicts);
+		if (conflicts != NULL)
+			pfree(conflicts);
 	} else {
 		current_fill_request(data, GES_REQ_OPCODE_REQUEST, &request);
 		if (!cluster_grd_outbound_enqueue_backend_request((uint32)data->master_node, &request,

@@ -1275,13 +1275,8 @@ extern ClusterGrdEntryResult cluster_grd_cancel_convert_by_id(const ClusterResId
  *	bump under a single critical section.
  * ============================================================ */
 
-/*
- * Per-entry cap exposed to LMS dispatch so callers can size the
- * conflict-holder snapshot buffer.  The cap mirrors the private
- * cluster_grd.c PGRAC_GRD_MAX_HOLDERS (16);  surfacing the value via
- * the header keeps cluster_lms.c / cluster_ges.c free of cluster_grd.c
- * internal struct layout knowledge.
- */
+/* Legacy inline capacity for fixtures; not a per-resource limit. Runtime
+ * callers consume the complete allocated conflict snapshot below. */
 #define PGRAC_GRD_MAX_HOLDERS_PUBLIC 16
 
 /*
@@ -1339,13 +1334,14 @@ typedef enum ClusterGrdGrantAction {
  *	snapshot when result == ENQUEUED_WAITER; both may be NULL when the
  *	caller doesn't need the snapshot (e.g. GRANT_NOW path).
  *
- *	conflict_holders_out buffer must hold at least PGRAC_GRD_MAX_HOLDERS
- *	entries (16).  *n_conflict_out is 0 on GRANT_NOW.
+ *	The output starts NULL. A non-NULL result is owned by the caller and must
+ *	be pfree'd on any return; its complete count is valid on ENQUEUED_WAITER.
+ *	NOWAIT does not allocate; *n_conflict_out is 0 on GRANT_NOW.
  */
 extern ClusterGrdGrantAction cluster_grd_entry_enqueue_or_grant(
 	const ClusterResId *resid, const ClusterGrdHolderId *holder, int32 source_node_id,
 	uint64 request_id, uint64 shard_master_generation, uint32 request_opcode,
-	int /* LOCKMODE */ lockmode, ClusterGrdConflictHolder *conflict_holders_out,
+	int /* LOCKMODE */ lockmode, ClusterGrdConflictHolder **conflict_holders_out,
 	int *n_conflict_out);
 
 /*
@@ -1359,7 +1355,7 @@ extern ClusterGrdGrantAction cluster_grd_entry_enqueue_or_grant_meta(
 	const ClusterResId *resid, const ClusterGrdHolderId *holder, int32 source_node_id,
 	uint64 request_id, ClusterGrdWaiterMeta meta, uint64 shard_master_generation,
 	uint32 request_opcode, int /* LOCKMODE */ lockmode,
-	ClusterGrdConflictHolder *conflict_holders_out, int *n_conflict_out);
+	ClusterGrdConflictHolder **conflict_holders_out, int *n_conflict_out);
 
 /*
  * spec-5.5 D5 — conditional (NOWAIT) variant of the above for try-locks.
@@ -1373,7 +1369,7 @@ extern ClusterGrdGrantAction cluster_grd_entry_enqueue_or_grant_meta(
 extern ClusterGrdGrantAction cluster_grd_entry_grant_conditional(
 	const ClusterResId *resid, const ClusterGrdHolderId *holder, int32 source_node_id,
 	uint64 request_id, uint64 shard_master_generation, uint32 request_opcode,
-	int /* LOCKMODE */ lockmode, ClusterGrdConflictHolder *conflict_holders_out,
+	int /* LOCKMODE */ lockmode, ClusterGrdConflictHolder **conflict_holders_out,
 	int *n_conflict_out);
 
 /* spec-5.8 D1c/D1e — waiter-metadata variant of the conditional (NOWAIT) grant.
@@ -1383,7 +1379,7 @@ extern ClusterGrdGrantAction cluster_grd_entry_grant_conditional_meta(
 	const ClusterResId *resid, const ClusterGrdHolderId *holder, int32 source_node_id,
 	uint64 request_id, ClusterGrdWaiterMeta meta, uint64 shard_master_generation,
 	uint32 request_opcode, int /* LOCKMODE */ lockmode,
-	ClusterGrdConflictHolder *conflict_holders_out, int *n_conflict_out);
+	ClusterGrdConflictHolder **conflict_holders_out, int *n_conflict_out);
 
 /*
  * spec-5.10 D7 — GES enqueue lock-starvation fairness GUCs.  max_skips is the
@@ -1456,8 +1452,8 @@ extern int cluster_grd_entry_release_and_pop_compatible_waiter(
  *	reply key, distinct from the old grant's id.
  * ============================================================ */
 
-/* Per-entry convert-queue cap exposed for caller buffer sizing (mirrors
- * the private cluster_grd.c PGRAC_GRD_MAX_CONVERTS). */
+/* Legacy inline batch hint only. Production master drains use the complete
+ * ClusterGrdGrantBatch API; this is not the configured convert limit. */
 #define PGRAC_GRD_MAX_CONVERTS_PUBLIC 8
 
 /*
@@ -1541,6 +1537,25 @@ typedef struct ClusterGrdGrantIdentity {
 	LOCKMODE mode;					/* granted mode */
 } ClusterGrdGrantIdentity;
 
+/* Complete process-local reply batch. Growth happens before the entry mutation,
+ * outside its spinlock. The caller frees the batch after routing every identity.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct ClusterGrdGrantBatch {
+	ClusterGrdGrantIdentity *items;
+	int capacity;
+	ClusterGrdGrantIdentity inline_items[9];
+} ClusterGrdGrantBatch;
+extern void cluster_grd_grant_batch_free(ClusterGrdGrantBatch *batch);
+extern int cluster_grd_release_and_drain_all(const ClusterResId *resid,
+											 const ClusterGrdHolderId *holder,
+											 ClusterGrdGrantBatch *batch);
+extern int cluster_grd_retire_request_and_drain_all(const ClusterResId *resid,
+													const ClusterGrdHolderId *holder,
+													uint64 previous_request_id,
+													LOCKMODE previous_mode, bool may_drain,
+													ClusterGrdGrantBatch *batch);
+
+
 /* Exact cancellation copies the removed request's original reply/dedup
  * identity under the same lock. NOT_FOUND clears output and changes no holder. */
 extern ClusterGrdEntryResult
@@ -1570,8 +1585,8 @@ cluster_grd_entry_request_convert_nowait(ClusterGrdEntry *entry, const ClusterGr
  * pending convert that is now compatible with the surviving holders
  * (in-place, FIFO), THEN pops a single FIFO REQUEST waiter compatible
  * with both the holders and every still-pending convert target.  Returns
- * the number of identities written to granted_out (≤ max_out;  buffer
- * should hold PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1).
+ * the number of identities written to granted_out (<= max_out). Bounded callers
+ * may leave compatible converts queued; production uses the complete batch.
  */
 extern int cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 														 ClusterGrdGrantIdentity *granted_out,
@@ -1622,12 +1637,11 @@ extern uint64 cluster_grd_convert_queue_full_count(void);
  * convert_request_id (§3.1a).  On ENQUEUED conflict_holders_out[] is filled
  * (BAST targets).  ILLEGAL → fail-closed (53R74).
  */
-extern ClusterGrdConvertResult
-cluster_grd_convert_or_enqueue(const ClusterResId *resid, int32 node_id, uint32 procno,
-							   uint64 cluster_epoch, LOCKMODE current_mode, LOCKMODE requested_mode,
-							   uint64 convert_request_id, int32 source_node_id,
-							   uint64 shard_master_generation,
-							   ClusterGrdConflictHolder *conflict_holders_out, int *n_conflict_out);
+extern ClusterGrdConvertResult cluster_grd_convert_or_enqueue(
+	const ClusterResId *resid, int32 node_id, uint32 procno, uint64 cluster_epoch,
+	LOCKMODE current_mode, LOCKMODE requested_mode, uint64 convert_request_id, int32 source_node_id,
+	uint64 shard_master_generation, ClusterGrdConflictHolder **conflict_holders_out,
+	int *n_conflict_out);
 
 /* spec-5.8 D1c/D1e — waiter-metadata variant.  Stamps the enqueued convert's
  * xid + wait_seq onto its master-side WFG convert-waiter vertex.  The plain
@@ -1636,7 +1650,7 @@ extern ClusterGrdConvertResult cluster_grd_convert_or_enqueue_meta(
 	const ClusterResId *resid, int32 node_id, uint32 procno, uint64 cluster_epoch,
 	LOCKMODE current_mode, LOCKMODE requested_mode, uint64 convert_request_id, int32 source_node_id,
 	uint64 shard_master_generation, ClusterGrdWaiterMeta meta,
-	ClusterGrdConflictHolder *conflict_holders_out, int *n_conflict_out);
+	ClusterGrdConflictHolder **conflict_holders_out, int *n_conflict_out);
 
 /* RF-ROOT P6 S05-3H -- master-side non-enqueuing same-holder conversion. */
 extern ClusterGrdConvertResult

@@ -39,12 +39,6 @@ LWLockNewTrancheId(void)
 void
 LWLockRegisterTranche(int tranche pg_attribute_unused(), const char *name pg_attribute_unused())
 {}
-void
-before_shmem_exit(pg_on_exit_callback callback pg_attribute_unused(),
-				  Datum arg pg_attribute_unused())
-{
-	/* Process callback registration only; owners below retain real state. */
-}
 bool
 cluster_recovery_transport_components_current(void)
 {

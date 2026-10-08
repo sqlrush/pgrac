@@ -15,7 +15,7 @@
  *
  *	  Hot-path (handler) discipline (I46):
  *	    - No palloc / malloc / ereport ERROR / wait.
- *	    - Bounded capacity (compile-time);  full → REJECT_BUSY reply.
+ *	    - Bounded capacity (startup configuration); full → REJECT_BUSY reply.
  *	    - Single LWLock cluster_grd_work_queue_lock (mostly uncontended).
  *
  *	  Step 2 ship:  queue infrastructure + 3 API + counter.
@@ -43,8 +43,8 @@
 #include "port/atomics.h"
 
 /*
- * Work-queue capacity (compile-time).  Sized for typical NBackends *
- * inflight requests; tunable later via GUC.
+ * Minimum capacity. The running queue is preallocated for the configured
+ * cohort and backend count; it never grows in a handler.
  */
 #define PGRAC_GES_WORK_QUEUE_CAPACITY 256
 

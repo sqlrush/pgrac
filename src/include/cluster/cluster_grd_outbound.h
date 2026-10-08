@@ -30,7 +30,7 @@
  *	                             exhausted retry list fails closed explicitly.
  *
  *	  spec-2.16 v0.6 L1.1 nofail 五检查 (I54):
- *	    (a) shmem 预分配固定容量 (compile-time constant)
+ *	    (a) shmem 启动时按 cohort/backend 配置预分配固定容量
  *	    (b) bounded ring-buffer (no dynamic resize)
  *	    (c) handler path 禁 palloc / malloc / ereport ERROR / wait
  *	    (d) reply full → drop oldest + counter; cleanup full → fail closed
@@ -83,12 +83,12 @@ typedef enum ClusterGrdOutboundOrigin {
 } ClusterGrdOutboundOrigin;
 
 /*
- * Compile-time capacity constants (P1.1 nofail 五检查 (a) (b)).
+ * Minimum capacities (P1.1 nofail 五检查 (a) (b)); startup sizes may be larger.
  *
  *   Ring capacity sized to handle worst-case concurrent backend
  *   request burst + reserved reply slots + cleanup release burst.
  *   Conservative: NBackends ≈ 100 (MaxBackends typical) → 200 + 64 + 64.
- *   Final tuning via Step 5 D12 GUC overrides;  Step 2 fixed compile-time.
+ *   Runtime storage is fixed at initialization from the configured cohort; no handler growth.
  */
 #define PGRAC_GES_OUTBOUND_RING_CAPACITY 256
 #define PGRAC_GES_OUTBOUND_LMON_REPLY_RESERVED_BUDGET 64

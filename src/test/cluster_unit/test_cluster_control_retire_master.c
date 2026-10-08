@@ -59,7 +59,7 @@ UT_TEST(retire_closes_queued_acquisition_not_just_holder)
 	ClusterControlRetireMessage message;
 	ClusterControlRequestCut cut;
 	ClusterGrdHolderId blocker = grd_lifecycle_holder(2, 23, 203);
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int nconflicts = 0;
 
 	retire_master_setup(&request, &message, &cut);
@@ -68,7 +68,7 @@ UT_TEST(retire_closes_queued_acquisition_not_just_holder)
 		cluster_grd_entry_rebind_or_insert_holder(&request.resid, &blocker, 2, ExclusiveLock),
 		CLUSTER_GRD_ENTRY_OK);
 	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&request.resid, &request.holder, 1, 201, 9,
-													GES_REQ_OPCODE_REQUEST, ShareLock, conflicts,
+													GES_REQ_OPCODE_REQUEST, ShareLock, &conflicts,
 													&nconflicts),
 				 CLUSTER_GRD_ENQUEUED_WAITER);
 	UT_ASSERT_EQ(cluster_ges_control_retire_at_master(&message, &cut), CLUSTER_CONTROL_RETIRED);

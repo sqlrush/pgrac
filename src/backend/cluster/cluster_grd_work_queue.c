@@ -28,6 +28,7 @@
 
 #include "cluster/cluster_ges.h" /* GesRequestPayload (spec-5.8 D8 coupling assert) */
 #include "cluster/cluster_grd_work_queue.h"
+#include "cluster/cluster_ges_capacity.h"
 #include "cluster/cluster_lmon.h" /* PGRAC: spec-7.2 D1 enqueue wakeup */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_shmem.h"
@@ -53,9 +54,10 @@ typedef struct ClusterGrdWorkQueueShared {
 	uint32 head;
 	uint32 tail;
 	uint32 count;
-	ClusterGrdWorkItem items[PGRAC_GES_WORK_QUEUE_CAPACITY];
+	ClusterGrdWorkItem items[FLEXIBLE_ARRAY_MEMBER];
 } ClusterGrdWorkQueueShared;
 
+static uint32 cluster_grd_work_queue_capacity = PGRAC_GES_WORK_QUEUE_CAPACITY;
 static ClusterGrdWorkQueueShared *cluster_grd_work_queue_state = NULL;
 static LWLock *cluster_grd_work_queue_lock = NULL;
 
@@ -77,14 +79,14 @@ cluster_grd_work_queue_normal_stop_poll(uint32 *slot_out, const char **reason_ou
 	}
 	LWLockAcquire(cluster_grd_work_queue_lock, LW_SHARED);
 	*reason_out = "NONE";
-	if (q->head >= PGRAC_GES_WORK_QUEUE_CAPACITY || q->tail >= PGRAC_GES_WORK_QUEUE_CAPACITY
-		|| q->count > PGRAC_GES_WORK_QUEUE_CAPACITY
-		|| (q->tail + q->count) % PGRAC_GES_WORK_QUEUE_CAPACITY != q->head) {
+	if (q->head >= cluster_grd_work_queue_capacity || q->tail >= cluster_grd_work_queue_capacity
+		|| q->count > cluster_grd_work_queue_capacity
+		|| (q->tail + q->count) % cluster_grd_work_queue_capacity != q->head) {
 		result = CLUSTER_NORMAL_STOP_INVALID;
 		*reason_out = "GRD_WORK_QUEUE_GEOMETRY";
 	} else {
 		for (uint32 offset = 0; offset < q->count; offset++) {
-			uint32 index = (q->tail + offset) % PGRAC_GES_WORK_QUEUE_CAPACITY;
+			uint32 index = (q->tail + offset) % cluster_grd_work_queue_capacity;
 			const ClusterGrdWorkItem *item = &q->items[index];
 			if (item->source_node_id >= CLUSTER_MAX_NODES || item->payload_len == 0
 				|| item->payload_len > sizeof(item->payload)) {
@@ -109,7 +111,9 @@ cluster_grd_work_queue_normal_stop_poll(uint32 *slot_out, const char **reason_ou
 Size
 cluster_grd_work_queue_shmem_size(void)
 {
-	return sizeof(ClusterGrdWorkQueueShared);
+	return add_size(offsetof(ClusterGrdWorkQueueShared, items),
+					mul_size(cluster_ges_configured_capacity(PGRAC_GES_WORK_QUEUE_CAPACITY, 2),
+							 sizeof(ClusterGrdWorkItem)));
 }
 
 void
@@ -117,10 +121,12 @@ cluster_grd_work_queue_shmem_init(void)
 {
 	bool found;
 
+	cluster_grd_work_queue_capacity
+		= cluster_ges_configured_capacity(PGRAC_GES_WORK_QUEUE_CAPACITY, 2);
 	cluster_grd_work_queue_state = ShmemInitStruct("pgrac cluster grd work queue",
 												   cluster_grd_work_queue_shmem_size(), &found);
 	if (!found)
-		memset(cluster_grd_work_queue_state, 0, sizeof(*cluster_grd_work_queue_state));
+		memset(cluster_grd_work_queue_state, 0, cluster_grd_work_queue_shmem_size());
 
 	/* Same bootstrap-safe gate as cluster_grd_outbound:  bootstrap mode
 	 * skips process_shmem_requests so tranche is not registered. */
@@ -156,7 +162,7 @@ cluster_grd_work_queue_enqueue(uint32 source_node_id, const void *payload, uint1
 		return false;
 
 	LWLockAcquire(cluster_grd_work_queue_lock, LW_EXCLUSIVE);
-	if (cluster_grd_work_queue_state->count >= PGRAC_GES_WORK_QUEUE_CAPACITY) {
+	if (cluster_grd_work_queue_state->count >= cluster_grd_work_queue_capacity) {
 		LWLockRelease(cluster_grd_work_queue_lock);
 		return false;
 	}
@@ -171,7 +177,7 @@ cluster_grd_work_queue_enqueue(uint32 source_node_id, const void *payload, uint1
 		memcpy(slot->payload, payload, payload_len);
 
 	cluster_grd_work_queue_state->head
-		= (cluster_grd_work_queue_state->head + 1) % PGRAC_GES_WORK_QUEUE_CAPACITY;
+		= (cluster_grd_work_queue_state->head + 1) % cluster_grd_work_queue_capacity;
 	cluster_grd_work_queue_state->count++;
 
 	LWLockRelease(cluster_grd_work_queue_lock);
@@ -206,7 +212,7 @@ cluster_grd_work_queue_dequeue(ClusterGrdWorkItem *out)
 	if (cluster_grd_work_queue_state->count > 0) {
 		*out = cluster_grd_work_queue_state->items[cluster_grd_work_queue_state->tail];
 		cluster_grd_work_queue_state->tail
-			= (cluster_grd_work_queue_state->tail + 1) % PGRAC_GES_WORK_QUEUE_CAPACITY;
+			= (cluster_grd_work_queue_state->tail + 1) % cluster_grd_work_queue_capacity;
 		cluster_grd_work_queue_state->count--;
 		got = true;
 	}
