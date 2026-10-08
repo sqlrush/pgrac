@@ -112,6 +112,8 @@ capacity_setup(ClusterLockAcquireRequest *request, ClusterGrdHolderId *lmon_hold
 	queued_cut_case = true;
 	hw_bast_observe = NULL;
 	hw_reply_observe = NULL;
+	hw_dedup_remove_observe = NULL;
+	hw_dedup_record_observe = NULL;
 	queued_cut_prepare(GES_REQ_OPCODE_REQUEST, false, 0, request, lmon_holder);
 	ut_wfg_reset();
 	request->resid = (ClusterResId){ .field1 = 5,
@@ -1024,6 +1026,48 @@ typedef struct CapacityReply {
 
 static CapacityReply capacity_replies[64];
 static int capacity_reply_count;
+static ClusterGesDedupKey capacity_dedup_removals[8];
+static ClusterGesDedupKey capacity_dedup_records[64];
+static int capacity_dedup_remove_count;
+static int capacity_dedup_record_count;
+
+static void
+capacity_observe_dedup_remove(const ClusterGesDedupKey *key)
+{
+	if (capacity_dedup_remove_count < lengthof(capacity_dedup_removals))
+		capacity_dedup_removals[capacity_dedup_remove_count] = *key;
+	capacity_dedup_remove_count++;
+}
+
+static void
+capacity_observe_dedup_record(const ClusterGesDedupKey *key, const GesReplyPayload *reply)
+{
+	if (capacity_dedup_record_count < lengthof(capacity_dedup_records))
+		capacity_dedup_records[capacity_dedup_record_count] = *key;
+	capacity_dedup_record_count++;
+	UT_ASSERT_EQ(reply->opcode, GES_REPLY_OPCODE_GRANT);
+	UT_ASSERT_EQ(reply->reject_reason, GES_REJECT_REASON_NONE);
+}
+
+static void
+capacity_expect_dedup_key(const ClusterGesDedupKey *keys, int count, int capacity,
+						  const ClusterGrdHolderId *holder, uint32 opcode, uint64 generation)
+{
+	int matches = 0;
+
+	for (int i = 0; i < count && i < capacity; i++) {
+		const ClusterGesDedupKey *key = &keys[i];
+
+		if (key->origin_node_id == (uint32)holder->node_id && key->holder_procno == holder->procno
+			&& key->cluster_epoch == holder->cluster_epoch && key->request_id == holder->request_id
+			&& key->opcode == opcode) {
+			matches++;
+			UT_ASSERT_EQ(key->shard_master_generation, generation);
+			UT_ASSERT_EQ(key->_pad0, 0);
+		}
+	}
+	UT_ASSERT_EQ(matches, 1);
+}
 
 static void
 capacity_observe_reply(uint32 destination, const GesReplyPayload *payload)
@@ -1067,6 +1111,8 @@ static void
 capacity_lmon_release_converts(int count)
 {
 	const int32 remote_nodes[] = { 0, 2, 3 };
+	const uint32 acquire_opcodes[] = { GES_REQ_OPCODE_REQUEST, GES_REQ_OPCODE_REQUEST_NOWAIT,
+									   GES_REQ_OPCODE_CONVERT, GES_REQ_OPCODE_REDECLARE };
 	ClusterLockAcquireRequest request;
 	ClusterGrdHolderId blocker, holders[32], converts[32];
 	int queued = 0;
@@ -1113,19 +1159,34 @@ capacity_lmon_release_converts(int count)
 	master_request.holder_request_id_lo = (uint32)blocker.request_id;
 	master_request.holder_request_id_hi = (uint32)(blocker.request_id >> 32);
 	memset(capacity_replies, 0, sizeof(capacity_replies));
+	memset(capacity_dedup_removals, 0, sizeof(capacity_dedup_removals));
+	memset(capacity_dedup_records, 0, sizeof(capacity_dedup_records));
 	capacity_reply_count = 0;
+	capacity_dedup_remove_count = 0;
+	capacity_dedup_record_count = 0;
 	master_reply_count = 0;
 	hw_reply_observe = capacity_observe_reply;
+	hw_dedup_remove_observe = capacity_observe_dedup_remove;
+	hw_dedup_record_observe = capacity_observe_dedup_record;
 	stage_master_work();
 	UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
 	UT_ASSERT_EQ(capacity_reply_count, count + 1);
 	UT_ASSERT_EQ(master_reply_count, count + 1);
+	UT_ASSERT_EQ(capacity_dedup_record_count, count);
+	UT_ASSERT_EQ(capacity_dedup_remove_count, lengthof(acquire_opcodes));
+	for (int i = 0; i < lengthof(acquire_opcodes); i++)
+		capacity_expect_dedup_key(capacity_dedup_removals, capacity_dedup_remove_count,
+								  lengthof(capacity_dedup_removals), &blocker, acquire_opcodes[i],
+								  47);
 	capacity_expect_grant_reply(&request.resid, &blocker, GES_REQ_OPCODE_RELEASE);
 	UT_ASSERT(!cluster_grd_holder_mode_by_id(&request.resid, &blocker, NULL));
 	for (int i = 0; i < count; i++) {
 		LOCKMODE mode = NoLock;
 
 		capacity_expect_grant_reply(&request.resid, &converts[i], GES_REQ_OPCODE_CONVERT);
+		capacity_expect_dedup_key(capacity_dedup_records, capacity_dedup_record_count,
+								  lengthof(capacity_dedup_records), &converts[i],
+								  GES_REQ_OPCODE_CONVERT, 9);
 		UT_ASSERT(!cluster_grd_holder_mode_by_id(&request.resid, &holders[i], NULL));
 		if (cluster_grd_holder_mode_by_id(&request.resid, &converts[i], &mode))
 			promoted++;
@@ -1136,6 +1197,8 @@ capacity_lmon_release_converts(int count)
 	UT_ASSERT_EQ(promoted, count);
 	capacity_expect_queues(1, count, 0, 0);
 	hw_reply_observe = NULL;
+	hw_dedup_remove_observe = NULL;
+	hw_dedup_record_observe = NULL;
 	/* Clean both actual outcomes after RED; an unpromoted original owner or
 	 * pending convert must never be mistaken for a delivered GRANT. */
 	for (int i = 0; i < count; i++) {
