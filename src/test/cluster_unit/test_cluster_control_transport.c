@@ -30,6 +30,30 @@ bool cluster_shared_config = true;
 int cluster_lms_workers = 1;
 int cluster_lmon_main_loop_interval = 1000;
 int MaxBackends = 200;
+int max_prepared_xacts = 0;
+
+int
+cluster_conf_declared_node_count_early(void)
+{
+	return 4;
+}
+
+Size
+add_size(Size left, Size right)
+{
+	if (left > SIZE_MAX - right)
+		abort();
+	return left + right;
+}
+
+Size
+mul_size(Size left, Size right)
+{
+	if (right != 0 && left > SIZE_MAX / right)
+		abort();
+	return left * right;
+}
+
 ProcessingMode Mode = NormalProcessing;
 BackendType MyBackendType = B_LMON;
 PROC_HDR *ProcGlobal;

@@ -195,7 +195,32 @@ ClusterNormalStopPollResult test_real_outbound_stop_poll(uint32 *slot, const cha
 #define cluster_grd_outbound_normal_stop_poll test_real_outbound_stop_poll
 #include "../../backend/cluster/cluster_grd_outbound.c"
 #undef cluster_grd_outbound_normal_stop_poll
-static ClusterGrdOutboundShared test_outbound_region;
+static ClusterGrdOutboundShared *test_outbound_region;
+int MaxBackends = 200;
+int max_prepared_xacts = 0;
+
+int
+cluster_conf_declared_node_count_early(void)
+{
+	return 4;
+}
+
+Size
+add_size(Size left, Size right)
+{
+	if (left > SIZE_MAX - right)
+		abort();
+	return left + right;
+}
+
+Size
+mul_size(Size left, Size right)
+{
+	if (right != 0 && left > SIZE_MAX / right)
+		abort();
+	return left * right;
+}
+
 static LWLockPadded test_outbound_lock;
 static unsigned test_outbound_produced, test_outbound_admitted, test_outbound_attempted;
 static bool test_outbound_transport_pending;
@@ -371,9 +396,13 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_u
 				bool *foundPtr)
 {
 	if (strcmp(name, "pgrac cluster grd outbound") == 0) {
-		UT_ASSERT_EQ(size, sizeof(test_outbound_region));
+		UT_ASSERT_EQ(size, cluster_grd_outbound_shmem_size());
+		free(test_outbound_region);
+		test_outbound_region = calloc(1, size);
+		if (test_outbound_region == NULL)
+			abort();
 		*foundPtr = false;
-		return &test_outbound_region;
+		return test_outbound_region;
 	}
 	if (foundPtr != NULL)
 		*foundPtr = test_lmon_shmem_found;
