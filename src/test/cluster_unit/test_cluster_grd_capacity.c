@@ -11,10 +11,11 @@
  */
 #define PGRAC_HW_HANDOFF_EMBEDDED
 #include "test_cluster_hw_handoff.c"
+#include "cluster/cluster_control_retire.h"
 #include "cluster/cluster_ic_router.h"
 
-/* Retain the standalone fixture's fail-stop control-service boundaries.
- * This suite never sends control retirement messages or uses that authority. */
+/* Retain fail-stop control transport boundaries. Master-side retirement uses
+ * A's dedup storage observer; it does not send or certify a cleanup exchange. */
 Latch *MyLatch;
 
 void
@@ -35,11 +36,10 @@ cluster_recovery_transport_components_current(void)
 }
 
 bool
-cluster_ges_dedup_retire_control_request(uint32 node pg_attribute_unused(),
-										 uint32 procno pg_attribute_unused(),
-										 uint64 epoch pg_attribute_unused(),
-										 uint64 request pg_attribute_unused())
+cluster_ges_dedup_retire_control_request(uint32 node, uint32 procno, uint64 epoch, uint64 request)
 {
+	if (hw_control_retire_observe != NULL)
+		return hw_control_retire_observe(node, procno, epoch, request);
 	abort();
 }
 
@@ -114,6 +114,7 @@ capacity_setup(ClusterLockAcquireRequest *request, ClusterGrdHolderId *lmon_hold
 	hw_reply_observe = NULL;
 	hw_dedup_remove_observe = NULL;
 	hw_dedup_record_observe = NULL;
+	hw_control_retire_observe = NULL;
 	queued_cut_prepare(GES_REQ_OPCODE_REQUEST, false, 0, request, lmon_holder);
 	ut_wfg_reset();
 	request->resid = (ClusterResId){ .field1 = 5,
@@ -1224,13 +1225,265 @@ UT_TEST(real_lmon_release_delivers_all_32_compatible_convert_grants)
 	capacity_lmon_release_converts(32);
 }
 
+typedef enum CapacityControlDrain {
+	CAPACITY_CONTROL_LMON_RELEASE,
+	CAPACITY_CONTROL_LOCAL_RELEASE,
+	CAPACITY_CONTROL_RETIRE
+} CapacityControlDrain;
+
+static ClusterGrdHolderId capacity_last_control_retired;
+static int capacity_control_retired_count;
+
+static bool
+capacity_observe_control_retire(uint32 node, uint32 procno, uint64 epoch, uint64 request)
+{
+	capacity_last_control_retired = (ClusterGrdHolderId){ .node_id = node,
+														  .procno = procno,
+														  .cluster_epoch = epoch,
+														  .request_id = request };
+	capacity_control_retired_count++;
+	return true; /* Dedup storage only; the real master decides retirement. */
+}
+
+static void
+capacity_retire_control(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+						const ClusterGrdHolderId *previous)
+{
+	ClusterControlRetireMessage message = { 0 };
+	ClusterControlRequestCut cut = { 0 };
+	int before = capacity_control_retired_count;
+	bool have_cut = cluster_control_retire_cut(resid, &cut);
+
+	UT_ASSERT(have_cut);
+	if (!have_cut)
+		return;
+	UT_ASSERT_EQ(MyBackendType, B_LMON);
+	message.key.resid = *resid;
+	message.key.holder = *holder;
+	message.cleanup_epoch = cut.epoch;
+	message.exchange_id = 20000 + before;
+	message.verb = CLUSTER_CONTROL_RETIRE;
+	if (previous != NULL) {
+		message.previous_request = previous->request_id;
+		message.previous_mode = AccessShareLock;
+	}
+	UT_ASSERT_EQ(cluster_ges_control_retire_at_master(&message, &cut), CLUSTER_CONTROL_RETIRED);
+	UT_ASSERT_EQ(capacity_control_retired_count, before + 1);
+	UT_ASSERT(capacity_same_holder(&capacity_last_control_retired, holder));
+}
+
+/* The ordered control callback accepts only canonical control namespaces.
+ * Keep the existing RELATION cases separate. This WALR key exercises the
+ * generic PG lock-mode batch and cancellation engine, not a WALR owner or
+ * transport certification. All convert targets are mutually compatible. */
+static void
+capacity_control_convert_batch(int count, CapacityControlDrain path, bool cancel_pending)
+{
+	const int32 remote_nodes[] = { 0, 2, 3 };
+	const uint32 acquire_opcodes[] = { GES_REQ_OPCODE_REQUEST, GES_REQ_OPCODE_REQUEST_NOWAIT,
+									   GES_REQ_OPCODE_CONVERT, GES_REQ_OPCODE_REDECLARE };
+	ClusterLockAcquireRequest request;
+	ClusterGrdHolderId blocker, holders[32], converts[32];
+	ClusterGrdShared *shared;
+	BackendType saved_backend = MyBackendType;
+	bool found;
+	int queued = 0;
+	int promoted = 0;
+	int expected_grants = cancel_pending ? 0 : count;
+	int expected_replies = expected_grants + (path == CAPACITY_CONTROL_LMON_RELEASE ? 1 : 0);
+	int fanout_replies;
+
+	HW_CHECK(count > 0 && count <= lengthof(holders));
+	capacity_setup(&request, &blocker);
+	request.resid = (ClusterResId){ .field1 = 1,
+									.type = CLUSTER_WAL_RETENTION_RESID_TYPE,
+									.lockmethodid = DEFAULT_LOCKMETHOD };
+	UT_ASSERT(cluster_control_request_resid_valid(&request.resid));
+	shared = retained_grd_shmem("pgrac cluster grd", sizeof(*shared), &found);
+	HW_CHECK(found && shared != NULL);
+	pg_atomic_write_u32(&shared->master[cluster_grd_shard_for_resource(&request.resid)], 1);
+	blocker.node_id = 2;
+	blocker.request_id += UINT64CONST(0x300000000);
+	UT_ASSERT_EQ(capacity_acquire(&request.resid, &blocker), CLUSTER_GRD_GRANT_NOW);
+	for (int i = 0; i < count; i++) {
+		holders[i] = capacity_holder(i);
+		holders[i].node_id = remote_nodes[i % lengthof(remote_nodes)];
+		holders[i].request_id += UINT64CONST(0x100000000);
+		UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(
+						 &request.resid, &holders[i], holders[i].node_id, holders[i].request_id, 9,
+						 GES_REQ_OPCODE_REQUEST, AccessShareLock, NULL, NULL),
+					 CLUSTER_GRD_GRANT_NOW);
+	}
+	for (int i = 0; i < count; i++) {
+		ClusterGrdWaiterMeta meta = { 0 };
+
+		converts[i] = holders[i];
+		converts[i].request_id += UINT64CONST(0x100000000);
+		meta.wait_seq = 25000 + i;
+		if (cluster_grd_convert_or_enqueue_meta(&request.resid, converts[i].node_id,
+												converts[i].procno, converts[i].cluster_epoch,
+												AccessShareLock, ShareLock, converts[i].request_id,
+												converts[i].node_id, 9, meta, NULL, NULL)
+			== CLUSTER_GRD_CONVERT_ENQUEUED)
+			queued++;
+		UT_ASSERT(!cluster_grd_holder_mode_by_id(&request.resid, &converts[i], NULL));
+	}
+	UT_ASSERT_EQ(queued, count);
+	capacity_expect_queues(1, count + 1, 0, count);
+	memset(capacity_replies, 0, sizeof(capacity_replies));
+	memset(capacity_dedup_removals, 0, sizeof(capacity_dedup_removals));
+	memset(capacity_dedup_records, 0, sizeof(capacity_dedup_records));
+	memset(&capacity_last_control_retired, 0, sizeof(capacity_last_control_retired));
+	capacity_reply_count = capacity_dedup_remove_count = capacity_dedup_record_count = 0;
+	capacity_control_retired_count = master_reply_count = 0;
+	hw_reply_observe = capacity_observe_reply;
+	hw_dedup_remove_observe = capacity_observe_dedup_remove;
+	hw_dedup_record_observe = capacity_observe_dedup_record;
+	hw_control_retire_observe = capacity_observe_control_retire;
+	MyBackendType = B_LMON;
+	if (cancel_pending) {
+		for (int i = 0; i < count; i++) {
+			LOCKMODE mode = NoLock;
+
+			capacity_retire_control(&request.resid, &converts[i], &holders[i]);
+			capacity_retire_control(&request.resid, &converts[i], &holders[i]);
+			UT_ASSERT(!cluster_grd_holder_mode_by_id(&request.resid, &converts[i], NULL));
+			UT_ASSERT(cluster_grd_holder_mode_by_id(&request.resid, &holders[i], &mode));
+			UT_ASSERT_EQ(mode, AccessShareLock);
+			capacity_expect_queues(1, count + 1, 0, count - i - 1);
+			UT_ASSERT_EQ(capacity_reply_count, 0);
+			UT_ASSERT_EQ(capacity_dedup_record_count, 0);
+		}
+	}
+	if (path == CAPACITY_CONTROL_LMON_RELEASE) {
+		memcpy(master_request.resid, &request.resid, sizeof(request.resid));
+		master_request.opcode = GES_REQ_OPCODE_RELEASE;
+		master_request.lockmode = RowExclusiveLock;
+		master_request.holder_node_id = blocker.node_id;
+		master_request.holder_procno = blocker.procno;
+		master_request.holder_cluster_epoch_lo = (uint32)blocker.cluster_epoch;
+		master_request.holder_cluster_epoch_hi = (uint32)(blocker.cluster_epoch >> 32);
+		master_request.holder_request_id_lo = (uint32)blocker.request_id;
+		master_request.holder_request_id_hi = (uint32)(blocker.request_id >> 32);
+		stage_master_work();
+		UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
+		capacity_expect_grant_reply(&request.resid, &blocker, GES_REQ_OPCODE_RELEASE);
+		UT_ASSERT_EQ(capacity_dedup_remove_count, lengthof(acquire_opcodes));
+		for (int i = 0; i < lengthof(acquire_opcodes); i++)
+			capacity_expect_dedup_key(capacity_dedup_removals, capacity_dedup_remove_count,
+									  lengthof(capacity_dedup_removals), &blocker,
+									  acquire_opcodes[i], 47);
+	} else if (path == CAPACITY_CONTROL_LOCAL_RELEASE) {
+		UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&request.resid, &blocker),
+					 GES_REJECT_REASON_NONE);
+		UT_ASSERT_EQ(capacity_dedup_remove_count, 0);
+	} else {
+		capacity_retire_control(&request.resid, &blocker, NULL);
+		UT_ASSERT_EQ(capacity_dedup_remove_count, 0);
+	}
+	fanout_replies = capacity_reply_count;
+	UT_ASSERT_EQ(capacity_reply_count, expected_replies);
+	UT_ASSERT_EQ(master_reply_count, expected_replies);
+	UT_ASSERT_EQ(capacity_dedup_record_count, expected_grants);
+	UT_ASSERT(!cluster_grd_holder_mode_by_id(&request.resid, &blocker, NULL));
+	for (int i = 0; i < count; i++) {
+		LOCKMODE mode = NoLock;
+
+		if (!cancel_pending) {
+			capacity_expect_grant_reply(&request.resid, &converts[i], GES_REQ_OPCODE_CONVERT);
+			capacity_expect_dedup_key(capacity_dedup_records, capacity_dedup_record_count,
+									  lengthof(capacity_dedup_records), &converts[i],
+									  GES_REQ_OPCODE_CONVERT, 9);
+			UT_ASSERT(!cluster_grd_holder_mode_by_id(&request.resid, &holders[i], NULL));
+			if (cluster_grd_holder_mode_by_id(&request.resid, &converts[i], &mode))
+				promoted++;
+			UT_ASSERT_EQ(mode, ShareLock);
+		} else {
+			UT_ASSERT(!cluster_grd_holder_mode_by_id(&request.resid, &converts[i], NULL));
+			UT_ASSERT(cluster_grd_holder_mode_by_id(&request.resid, &holders[i], &mode));
+			UT_ASSERT_EQ(mode, AccessShareLock);
+		}
+	}
+	printf("# control_batch path=%d converts=%d canceled=%d promoted=%d replies=%d expected=%d\n",
+		   path, count, cancel_pending ? count : 0, promoted, fanout_replies, expected_replies);
+	UT_ASSERT_EQ(promoted, expected_grants);
+	capacity_expect_queues(1, count, 0, 0);
+	for (int i = 0; i < count; i++) {
+		LOCKMODE mode = NoLock;
+
+		if (!cancel_pending) {
+			/* Canceling a delivered upgrade restores its exact original owner.
+			 * Repeated cleanup must neither resurrect the upgrade nor grant anew. */
+			capacity_retire_control(&request.resid, &converts[i], &holders[i]);
+			capacity_retire_control(&request.resid, &converts[i], &holders[i]);
+		}
+		UT_ASSERT(!cluster_grd_holder_mode_by_id(&request.resid, &converts[i], NULL));
+		UT_ASSERT(cluster_grd_holder_mode_by_id(&request.resid, &holders[i], &mode));
+		UT_ASSERT_EQ(mode, AccessShareLock);
+		capacity_retire_control(&request.resid, &holders[i], NULL);
+		capacity_retire_control(&request.resid, &holders[i], NULL);
+		UT_ASSERT(!cluster_grd_holder_mode_by_id(&request.resid, &holders[i], NULL));
+		UT_ASSERT(!cluster_grd_holder_mode_by_id(&request.resid, &converts[i], NULL));
+		UT_ASSERT_EQ(capacity_reply_count, expected_replies);
+		UT_ASSERT_EQ(capacity_dedup_record_count, expected_grants);
+	}
+	capacity_expect_counts(0, 0);
+	capacity_expect_stop(CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(ut_grd_pool_used, 0);
+	UT_ASSERT_EQ(ut_wfg_n, 0);
+	printf("# control_cleanup path=%d converts=%d callbacks=%d entries=%d pool=%zu wfg=%d\n", path,
+		   count, capacity_control_retired_count, cluster_grd_entry_count(),
+		   (size_t)ut_grd_pool_used, ut_wfg_n);
+	hw_reply_observe = NULL;
+	hw_dedup_remove_observe = NULL;
+	hw_dedup_record_observe = NULL;
+	hw_control_retire_observe = NULL;
+	MyBackendType = saved_backend;
+	MyProc = NULL;
+}
+
+UT_TEST(lmon_release_16_control_grants_can_all_be_canceled_and_retired)
+{
+	capacity_control_convert_batch(16, CAPACITY_CONTROL_LMON_RELEASE, false);
+}
+
+UT_TEST(lmon_release_32_control_grants_can_all_be_canceled_and_retired)
+{
+	capacity_control_convert_batch(32, CAPACITY_CONTROL_LMON_RELEASE, false);
+}
+
+UT_TEST(local_release_delivers_and_reclaims_all_16_convert_grants)
+{
+	capacity_control_convert_batch(16, CAPACITY_CONTROL_LOCAL_RELEASE, false);
+}
+
+UT_TEST(local_release_delivers_and_reclaims_all_32_convert_grants)
+{
+	capacity_control_convert_batch(32, CAPACITY_CONTROL_LOCAL_RELEASE, false);
+}
+
+UT_TEST(control_retire_delivers_and_reclaims_all_16_convert_grants)
+{
+	capacity_control_convert_batch(16, CAPACITY_CONTROL_RETIRE, false);
+}
+
+UT_TEST(control_retire_delivers_and_reclaims_all_32_convert_grants)
+{
+	capacity_control_convert_batch(32, CAPACITY_CONTROL_RETIRE, false);
+}
+
+UT_TEST(canceled_32_control_converts_never_grant_after_real_lmon_release)
+{
+	capacity_control_convert_batch(32, CAPACITY_CONTROL_LMON_RELEASE, true);
+}
+
 int
 main(void)
 {
 	MyBackendType = B_BACKEND;
 	setvbuf(stdout, NULL, _IONBF, 0);
 	alarm(30); /* Same standalone watchdog; no product deadline is changed. */
-	UT_PLAN(22);
+	UT_PLAN(29);
 	UT_RUN(first_grd_attach_preserves_temporary_error_cleanup_scope);
 	UT_RUN(compatible_16_control_releases_exact_owners);
 	UT_RUN(compatible_17_owners_are_all_granted);
@@ -1253,6 +1506,13 @@ main(void)
 	UT_RUN(pool_full_never_orphans_reservation_and_release_reuses_bytes);
 	UT_RUN(real_lmon_release_delivers_all_16_compatible_convert_grants);
 	UT_RUN(real_lmon_release_delivers_all_32_compatible_convert_grants);
+	UT_RUN(lmon_release_16_control_grants_can_all_be_canceled_and_retired);
+	UT_RUN(lmon_release_32_control_grants_can_all_be_canceled_and_retired);
+	UT_RUN(local_release_delivers_and_reclaims_all_16_convert_grants);
+	UT_RUN(local_release_delivers_and_reclaims_all_32_convert_grants);
+	UT_RUN(control_retire_delivers_and_reclaims_all_16_convert_grants);
+	UT_RUN(control_retire_delivers_and_reclaims_all_32_convert_grants);
+	UT_RUN(canceled_32_control_converts_never_grant_after_real_lmon_release);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
