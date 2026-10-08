@@ -53,7 +53,7 @@ CLUSTER_UNIT_CRYPTOHASH_O = $(top_builddir)/src/common/cryptohash.o \
 endif
 
 # Test source files (each becomes a standalone executable)
-TESTS = test_cluster_buffer_mapping test_cluster_pi_contribution_stream test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_formation_restart test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
+TESTS = test_cluster_buffer_cr test_cluster_buffer_mapping test_cluster_pi_contribution_stream test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_formation_restart test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
         test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_catalog_manifest test_cluster_catalog_init test_cluster_catalog_startup test_cluster_initdb_tree test_cluster_initdb_cohort \
         test_pgrac_control_binding test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker test_pgrac_fenced_cib \
         test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter \
@@ -424,7 +424,7 @@ SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 		test_pgrac_fenced_coordinator \
 		test_pgrac_fenced_ipmi test_pgrac_fenced_ipmi_exec \
 		test_pgrac_fenced_ctl,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_buffer_mapping test_cluster_page_edge test_cluster_port_runtime,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_buffer_cr test_cluster_buffer_mapping test_cluster_page_edge test_cluster_port_runtime,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_pi_contribution_stream,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_prepare_diagnostic,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_horizon,$(SIMPLE_TESTS))
@@ -8034,11 +8034,32 @@ test_cluster_cr: test_cluster_cr.c unit_test.h \
 # Native current/CR mapping with shared allocation and hash storage stubs.
 CLUSTER_BUFFER_MAPPING_O = $(top_builddir)/src/backend/storage/buffer/buf_table.o
 test_cluster_buffer_mapping: test_cluster_buffer_mapping.c unit_test.h \
+		test_cluster_buffer_mapping_fixture.h \
 		$(CLUSTER_BUFFER_MAPPING_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_BUFFER_MAPPING_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Compile the native invalidation bodies, with mapping/storage dependencies
+# supplied by the same fixtures as the buffer mapping tests.
+test_cluster_buffer_cr_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_bufmgr_cr_walk_locked\(/ { print "static bool"; emit=1; walk++ } \
+	     /^cluster_bufmgr_cr_invalidate_locked\(/ { print "static ClusterPcmOwnResult"; emit=1; cr++ } \
+	     /^cluster_pcm_own_eviction_commit_locked\(/ { print "static ClusterPcmOwnResult"; emit=1; commit++ } \
+	     /^InvalidateBufferCommitLocked\(/ { print "static bool"; emit=1; drop++ } \
+	     /^InvalidateBufferCommitTailLocked\(/ { print "static void"; emit=1; tail++ } \
+	     /^InvalidateVictimBuffer\(/ { print "static bool"; emit=1; victim++ } \
+	     /^FindAndDropRelationBuffers\(/ { print "static void"; emit=1; find++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (walk != 1 || cr != 1 || commit != 1 || drop != 1 || tail != 1 || victim != 1 || find != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_buffer_cr: test_cluster_buffer_cr.c unit_test.h \
+		test_cluster_buffer_mapping_fixture.h test_cluster_buffer_cr_owner.inc \
+		$(CLUSTER_BUFFER_MAPPING_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_BUFFER_MAPPING_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # spec-3.10 D8: test_cluster_cr_cache — backend-local clock CR cache
 # (cluster_cr_cache.o) with malloc-backed MemoryContext stubs.

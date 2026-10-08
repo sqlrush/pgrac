@@ -3415,7 +3415,11 @@ eviction_legacy_tail(BufferDesc *buf, BufferTag *tag, uint32 state, PcmLockMode 
 #define cluster_pcm_lock_release_saved_tag_for_eviction eviction_legacy_release
 #define InvalidateBufferCommitTailLocked(buf, tag, hash, lock, state, mode, release)               \
 	eviction_legacy_tail(buf, tag, state, mode)
+/* This fixture owns current/PI only. Native CR chains use the real mapping
+ * and invalidation bodies in test_cluster_buffer_cr; crossing here is a bug. */
+#define cluster_bufmgr_cr_invalidate_locked(buf, hash, state) (abort(), CLUSTER_PCM_OWN_INVALID)
 #include "test_cluster_pcm_eviction_gate.inc"
+#undef cluster_bufmgr_cr_invalidate_locked
 #undef InvalidateBufferCommitTailLocked
 #undef cluster_pcm_lock_release_saved_tag_for_eviction
 #undef cluster_pcm_x_buffer_tag_tracked
@@ -8625,9 +8629,13 @@ UT_TEST(test_resource_x_target_cached_x_eviction_uses_native_exact_release)
 	UT_ASSERT_NOT_NULL(helper);
 	UT_ASSERT_NOT_NULL(helper_end);
 	if (helper != NULL && helper_end != NULL) {
+		/* Limit this assertion to the TARGET owner body. Independent native
+		 * CR invalidation helpers may follow it before the next current owner. */
 		const char *late_commit = strstr(helper, "cluster_pcm_own_eviction_commit_locked(");
+		const char *function_end = strstr(helper, "\n}\n");
 
-		UT_ASSERT(late_commit == NULL || late_commit >= helper_end);
+		UT_ASSERT_NOT_NULL(function_end);
+		UT_ASSERT(late_commit == NULL || (function_end != NULL && late_commit >= function_end));
 	}
 	UT_ASSERT_NULL(strstr(source, "cluster_gcs_resource_x_target_evict_release_exact("));
 	free(source);

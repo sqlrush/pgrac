@@ -6358,6 +6358,111 @@ cluster_bufmgr_resource_x_target_evict_locked(
 }
 #endif
 
+#ifdef USE_PGRAC_CLUSTER
+/* The tag's mapping lock protects every CR link and immutable key.  Inspect
+ * the complete chain before returning a match, including nodes after it.
+ * A match is still unpinned and conveys no snapshot or read authority. */
+static bool
+cluster_bufmgr_cr_walk_locked(BufferTag *tag, uint32 hash,
+							 const BufferCrKey *key, int target_id, int *match)
+{
+	int			id;
+	int			previous = -1;
+	int			found = -1;
+	int			visited = 0;
+	int			current;
+	uint64		generation;
+
+	if (!BufferCrTagValid(tag) || match == NULL ||
+		(key != NULL && (!BufferCrKeyValid(key) || !BufferTagsEqual(tag, &key->tag))))
+		return false;
+	if (!BufTableCRLookup(tag, hash, &id, &generation))
+	{
+		*match = -1;
+		return target_id < 0;
+	}
+	current = BufTableLookup(tag, hash);
+	while (id >= 0)
+	{
+		BufferDesc *node;
+		uint32		state;
+
+		if (id >= NBuffers || id == current || ++visited > NBuffers)
+			return false;
+		node = GetBufferDescriptor(id);
+		state = pg_atomic_read_u32(&node->state);
+		if (!BufferCrStateValid(node, state) ||
+			!BufferTagsEqual(&node->tag, tag) ||
+			node->cr_anchor_generation != generation || node->cr.prev_id != previous)
+			return false;
+		if (id == target_id ||
+			(key != NULL && BufferCrMatches(node, state, key, generation)))
+		{
+			if (found >= 0)
+				return false;
+			found = id;
+		}
+		previous = id;
+		id = node->cr.next_id;
+	}
+	if (target_id >= 0 && found != target_id)
+		return false;
+	*match = found;
+	return true;
+}
+
+/* Mapping-X and this descriptor's header lock are held.  The original
+ * ownership-generation commit must succeed before any CR link is changed.
+ * Refusal leaves the chain, descriptor and caller's state unchanged. */
+static ClusterPcmOwnResult
+cluster_bufmgr_cr_invalidate_locked(BufferDesc *buf, uint32 hash, uint32 *state)
+{
+	ClusterPcmOwnEvictionCapture capture;
+	ClusterPcmOwnResult result;
+	BufferCrMetadata old;
+	uint64		anchor_generation;
+	uint64		own_generation;
+	uint32		own_flags;
+	int			match;
+
+	if (!BufferCrStateValid(buf, *state) ||
+		!cluster_bufmgr_cr_walk_locked(&buf->tag, hash, NULL, buf->buf_id, &match))
+		return CLUSTER_PCM_OWN_CORRUPT;
+	old = buf->cr;
+	anchor_generation = buf->cr_anchor_generation;
+	cluster_pcm_own_eviction_capture_locked(buf, &capture);
+	result = cluster_pcm_own_eviction_commit_locked(buf, &capture,
+												  &own_generation, &own_flags);
+	if (result != CLUSTER_PCM_OWN_OK)
+		return result;
+
+	/* The full chain was checked under this same uninterrupted mapping-X. */
+	if (old.prev_id < 0)
+	{
+		if (!BufTableCRReplaceHead(&buf->tag, hash, anchor_generation,
+								  buf->buf_id, old.next_id))
+			elog(PANIC, "read-only buffer chain changed under mapping lock");
+	}
+	else
+		GetBufferDescriptor(old.prev_id)->cr.next_id = old.next_id;
+	if (old.next_id >= 0)
+		GetBufferDescriptor(old.next_id)->cr.prev_id = old.prev_id;
+
+	/* Restore the current/PI overlay without reinitializing either LWLock. */
+	memset(&buf->cr, 0, sizeof(buf->cr));
+	buf->cr_chain_head = INVALID_BUFFER_ID;
+	buf->cr_chain_next = INVALID_BUFFER_ID;
+	buf->pi_buf_id = INVALID_BUFFER_ID;
+	buf->grd_master_node = INVALID_NODE_ID;
+	buf->block_scn = InvalidScn;
+	buf->pi_created_at = 0;
+	cluster_page_wal_reset_reuse_locked(buf);
+	ClearBufferTag(&buf->tag);
+	*state &= ~(BUF_FLAG_MASK | BUF_USAGECOUNT_MASK);
+	return CLUSTER_PCM_OWN_OK;
+}
+#endif
+
 /*
  * InvalidateBufferCommitLocked -- shared commit tail of InvalidateBuffer
  * and InvalidateBufferTry.
@@ -6380,6 +6485,22 @@ InvalidateBufferCommitLocked(BufferDesc *buf, BufferTag *oldTag, uint32 oldHash,
 	ResourceXWriterPath current_writer_path;
 	uint32		observed_flags = 0;
 	uint64		observed_generation = 0;
+
+	if (buf->buffer_type == BUF_TYPE_CR)
+	{
+		eviction_result = cluster_bufmgr_cr_invalidate_locked(buf, oldHash, &buf_state);
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(oldPartitionLock);
+		if (eviction_result == CLUSTER_PCM_OWN_OK)
+		{
+			StrategyFreeBuffer(buf);
+			return true;
+		}
+		if (eviction_result == CLUSTER_PCM_OWN_BUSY || eviction_result == CLUSTER_PCM_OWN_STALE)
+			return false;
+		cluster_pcm_own_report_bump_failure(buf, eviction_result, 0, 0,
+										  "read-only buffer invalidation");
+	}
 
 	/*
 	 * D5a: descriptor reuse is an exact ownership-tuple commit.  Refuse to
@@ -6690,6 +6811,19 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 	}
 
 #ifdef USE_PGRAC_CLUSTER
+	if (buf_hdr->buffer_type == BUF_TYPE_CR)
+	{
+		eviction_result = cluster_bufmgr_cr_invalidate_locked(buf_hdr, hash, &buf_state);
+		UnlockBufHdr(buf_hdr, buf_state);
+		LWLockRelease(partition_lock);
+		if (eviction_result == CLUSTER_PCM_OWN_OK)
+			return true;
+		if (eviction_result == CLUSTER_PCM_OWN_BUSY || eviction_result == CLUSTER_PCM_OWN_STALE)
+			return false;
+		cluster_pcm_own_report_bump_failure(buf_hdr, eviction_result, 0, 0,
+											  "read-only clock-sweep eviction");
+	}
+
 	/* The clock sweep owns the same descriptor-generation transition as an
 	 * explicit invalidation.  Freeze the target selector while the old tag and
 	 * ownership tuple are still protected by mapping/header authority. */
@@ -10031,8 +10165,37 @@ FindAndDropRelationBuffers(RelFileLocator rlocator, ForkNumber forkNum,
 		bufPartitionLock = BufMappingPartitionLock(bufHash);
 
 		/* Check that it is in the buffer pool. If not, do nothing. */
+#ifdef USE_PGRAC_CLUSTER
+next_version:
+#endif
 		LWLockAcquire(bufPartitionLock, LW_SHARED);
 		buf_id = BufTableLookup(&bufTag, bufHash);
+#ifdef USE_PGRAC_CLUSTER
+		/* A physical block may have a current descriptor and several clean
+		 * read-only versions, or only read-only versions.  Drain them all. */
+		if (buf_id < 0)
+		{
+			uint64 generation;
+			int		match;
+
+			if (BufTableCRLookup(&bufTag, bufHash, &buf_id, &generation) &&
+				!cluster_bufmgr_cr_walk_locked(&bufTag, bufHash, NULL, buf_id, &match))
+			{
+				LWLockRelease(bufPartitionLock);
+				elog(ERROR, "invalid read-only buffer chain during relation invalidation");
+			}
+		}
+		/* A wrong tag while mapping-S is held is corruption, not the legal
+		 * clock-sweep race after releasing this lock. Do not retry it forever. */
+		if (buf_id >= 0 &&
+			(buf_id >= NBuffers ||
+			 !BufferTagsEqual(&GetBufferDescriptor(buf_id)->tag, &bufTag) ||
+			 !(pg_atomic_read_u32(&GetBufferDescriptor(buf_id)->state) & BM_TAG_VALID)))
+		{
+			LWLockRelease(bufPartitionLock);
+			elog(ERROR, "invalid shared buffer mapping during relation invalidation");
+		}
+#endif
 		LWLockRelease(bufPartitionLock);
 
 		if (buf_id < 0)
@@ -10048,12 +10211,21 @@ FindAndDropRelationBuffers(RelFileLocator rlocator, ForkNumber forkNum,
 		 */
 		buf_state = LockBufHdr(bufHdr);
 
+#ifdef USE_PGRAC_CLUSTER
+		if (BufferTagsEqual(&bufHdr->tag, &bufTag))
+#else
 		if (BufTagMatchesRelFileLocator(&bufHdr->tag, &rlocator) &&
 			BufTagGetForkNum(&bufHdr->tag) == forkNum &&
 			bufHdr->tag.blockNum >= firstDelBlock)
+#endif
 			InvalidateBuffer(bufHdr);	/* releases spinlock */
 		else
 			UnlockBufHdr(bufHdr, buf_state);
+#ifdef USE_PGRAC_CLUSTER
+		/* Recheck the same anchor after invalidation or a clock-sweep race.
+		 * The caller's relation lifecycle lock prevents new matching loads. */
+		goto next_version;
+#endif
 	}
 }
 
