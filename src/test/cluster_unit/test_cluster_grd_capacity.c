@@ -1477,13 +1477,281 @@ UT_TEST(canceled_32_control_converts_never_grant_after_real_lmon_release)
 	capacity_control_convert_batch(32, CAPACITY_CONTROL_LMON_RELEASE, true);
 }
 
+static Size capacity_oom_min_bytes;
+static Size capacity_oom_failed_bytes;
+static int capacity_oom_fail_at;
+static int capacity_oom_allocations;
+static int capacity_oom_matches;
+static int capacity_oom_failures;
+static int capacity_oom_failed_flags;
+
+static bool
+capacity_fail_projection_allocation(Size bytes, int flags)
+{
+	capacity_oom_allocations++;
+	if (bytes < capacity_oom_min_bytes || ++capacity_oom_matches != capacity_oom_fail_at)
+		return false;
+	capacity_oom_failures++;
+	capacity_oom_failed_bytes = bytes;
+	capacity_oom_failed_flags = flags;
+	return true; /* A's allocator decides ERROR versus NO_OOM NULL. */
+}
+
+static void
+capacity_expect_no_pin_leak(const ClusterResId *resid)
+{
+	ClusterGrdEntry *entry = NULL;
+
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(resid, false, &entry), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT(entry != NULL);
+	if (entry != NULL) {
+		/* Only this inspection pin may remain. Never dereference after release. */
+		UT_ASSERT_EQ(cluster_grd_entry_pin_count(entry), 1);
+		cluster_grd_entry_release(entry);
+	}
+}
+
+/* Fail only the allocator boundary, after all real queues and old WFG edges
+ * exist. Both grants and their outbound replies must survive projection OOM.
+ * The large shape grants a convert plus one FIFO waiter and leaves 17 holders
+ * and 32 waiters, so each snapshot vector must exceed its inline capacity. */
+static void
+capacity_projection_oom(CapacityControlDrain path, int snapshot_allocation)
+{
+	const int32 remote_nodes[] = { 0, 2, 3 };
+	const uint32 acquire_opcodes[] = { GES_REQ_OPCODE_REQUEST, GES_REQ_OPCODE_REQUEST_NOWAIT,
+									   GES_REQ_OPCODE_CONVERT, GES_REQ_OPCODE_REDECLARE };
+	bool large = snapshot_allocation != 0;
+	int nholders = large ? 16 : 0;
+	int nwaiters = large ? 33 : 1;
+	int ngrants = large ? 2 : 1;
+	int nreplies = ngrants + (path == CAPACITY_CONTROL_LMON_RELEASE ? 1 : 0);
+	ClusterLockAcquireRequest request;
+	ClusterGrdHolderId blocker, holders[16], waiters[33], convert = { 0 };
+	ClusterGrdShared *shared;
+	BackendType saved_backend = MyBackendType;
+	sigjmp_buf *saved_exception_stack = PG_exception_stack;
+	ErrorContextCallback *saved_context_stack = error_context_stack;
+	volatile bool caught = false;
+	volatile bool returned = false;
+	bool found;
+	LOCKMODE mode = NoLock;
+
+	HW_CHECK(path == CAPACITY_CONTROL_LMON_RELEASE || path == CAPACITY_CONTROL_RETIRE);
+	HW_CHECK(snapshot_allocation >= 0 && snapshot_allocation <= 2);
+	capacity_setup(&request, &blocker);
+	request.resid = (ClusterResId){ .field1 = 1,
+									.type = CLUSTER_WAL_RETENTION_RESID_TYPE,
+									.lockmethodid = DEFAULT_LOCKMETHOD };
+	UT_ASSERT(cluster_control_request_resid_valid(&request.resid));
+	shared = retained_grd_shmem("pgrac cluster grd", sizeof(*shared), &found);
+	HW_CHECK(found && shared != NULL);
+	pg_atomic_write_u32(&shared->master[cluster_grd_shard_for_resource(&request.resid)], 1);
+	blocker.node_id = 2;
+	blocker.request_id += UINT64CONST(0x300000000);
+	UT_ASSERT_EQ(capacity_acquire(&request.resid, &blocker), CLUSTER_GRD_GRANT_NOW);
+	for (int i = 0; i < nholders; i++) {
+		holders[i] = capacity_holder(i);
+		holders[i].node_id = remote_nodes[i % lengthof(remote_nodes)];
+		holders[i].request_id += UINT64CONST(0x100000000);
+		UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(
+						 &request.resid, &holders[i], holders[i].node_id, holders[i].request_id, 9,
+						 GES_REQ_OPCODE_REQUEST, AccessShareLock, NULL, NULL),
+					 CLUSTER_GRD_GRANT_NOW);
+	}
+	if (large) {
+		ClusterGrdWaiterMeta meta = { 0 };
+
+		convert = holders[0];
+		convert.request_id += UINT64CONST(0x100000000);
+		meta.wait_seq = 35000;
+		UT_ASSERT_EQ(cluster_grd_convert_or_enqueue_meta(
+						 &request.resid, convert.node_id, convert.procno, convert.cluster_epoch,
+						 AccessShareLock, ShareLock, convert.request_id, convert.node_id, 9, meta,
+						 NULL, NULL),
+					 CLUSTER_GRD_CONVERT_ENQUEUED);
+	}
+	for (int i = 0; i < nwaiters; i++) {
+		ClusterGrdWaiterMeta meta = { 0 };
+
+		waiters[i] = capacity_holder(100 + i);
+		waiters[i].node_id = remote_nodes[i % lengthof(remote_nodes)];
+		waiters[i].request_id += UINT64CONST(0x400000000);
+		meta.wait_seq = 36000 + i;
+		UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant_meta(
+						 &request.resid, &waiters[i], waiters[i].node_id, waiters[i].request_id,
+						 meta, 9, GES_REQ_OPCODE_REQUEST, ShareLock, NULL, NULL),
+					 CLUSTER_GRD_ENQUEUED_WAITER);
+		UT_ASSERT(ut_wfg_has_edge(waiters[i].node_id, waiters[i].procno, waiters[i].cluster_epoch,
+								  waiters[i].request_id, blocker.node_id, blocker.procno,
+								  blocker.cluster_epoch, blocker.request_id));
+	}
+	UT_ASSERT_EQ(ut_wfg_n, nwaiters + (large ? 1 : 0));
+	capacity_expect_queues(1, nholders + 1, nwaiters, large ? 1 : 0);
+	capacity_expect_no_pin_leak(&request.resid);
+	memset(capacity_replies, 0, sizeof(capacity_replies));
+	memset(capacity_dedup_removals, 0, sizeof(capacity_dedup_removals));
+	memset(capacity_dedup_records, 0, sizeof(capacity_dedup_records));
+	capacity_reply_count = capacity_dedup_remove_count = capacity_dedup_record_count = 0;
+	capacity_control_retired_count = master_reply_count = 0;
+	hw_reply_observe = capacity_observe_reply;
+	hw_dedup_remove_observe = capacity_observe_dedup_remove;
+	hw_dedup_record_observe = capacity_observe_dedup_record;
+	hw_control_retire_observe = capacity_observe_control_retire;
+	MyBackendType = B_LMON;
+	memcpy(master_request.resid, &request.resid, sizeof(request.resid));
+	master_request.opcode = GES_REQ_OPCODE_RELEASE;
+	master_request.lockmode = RowExclusiveLock;
+	master_request.holder_node_id = blocker.node_id;
+	master_request.holder_procno = blocker.procno;
+	master_request.holder_cluster_epoch_lo = (uint32)blocker.cluster_epoch;
+	master_request.holder_cluster_epoch_hi = (uint32)(blocker.cluster_epoch >> 32);
+	master_request.holder_request_id_lo = (uint32)blocker.request_id;
+	master_request.holder_request_id_hi = (uint32)(blocker.request_id >> 32);
+	/* The small case fails any allocation, covering the former departed list.
+	 * For each large snapshot failure, allow that bounded identity list so the
+	 * old product reaches both later projection allocations independently. */
+	capacity_oom_min_bytes = large ? (Size)(ngrants + 1) * sizeof(ClusterGrdHolderId) + 1 : 0;
+	capacity_oom_fail_at = large ? snapshot_allocation : 1;
+	capacity_oom_allocations = capacity_oom_matches = capacity_oom_failures = 0;
+	capacity_oom_failed_bytes = 0;
+	capacity_oom_failed_flags = 0;
+	ut_grd_alloc_fail = capacity_fail_projection_allocation;
+	PG_TRY();
+	{
+		if (path == CAPACITY_CONTROL_LMON_RELEASE) {
+			stage_master_work();
+			UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
+		} else
+			capacity_retire_control(&request.resid, &blocker, NULL);
+		returned = true;
+	}
+	PG_CATCH();
+	{
+		caught = true;
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	ut_grd_alloc_fail = NULL;
+	printf("# projection_oom path=%d snapshot=%d allocs=%d failures=%d bytes=%zu flags=%d "
+		   "caught=%d returned=%d replies=%d expected=%d wfg=%d\n",
+		   path, snapshot_allocation, capacity_oom_allocations, capacity_oom_failures,
+		   (size_t)capacity_oom_failed_bytes, capacity_oom_failed_flags, caught, returned,
+		   capacity_reply_count, nreplies, ut_wfg_n);
+	UT_ASSERT(!caught);
+	UT_ASSERT(returned);
+	UT_ASSERT(PG_exception_stack == saved_exception_stack);
+	UT_ASSERT(error_context_stack == saved_context_stack);
+	if (large) {
+		UT_ASSERT_EQ(capacity_oom_failures, 1);
+		UT_ASSERT_EQ(capacity_oom_matches, snapshot_allocation);
+		UT_ASSERT((capacity_oom_failed_flags & MCXT_ALLOC_NO_OOM) != 0);
+	}
+	UT_ASSERT(!cluster_grd_holder_mode_by_id(&request.resid, &blocker, NULL));
+	UT_ASSERT_EQ(capacity_reply_count, nreplies);
+	UT_ASSERT_EQ(master_reply_count, nreplies);
+	UT_ASSERT_EQ(capacity_dedup_record_count, ngrants);
+	capacity_expect_grant_reply(&request.resid, &waiters[0], GES_REQ_OPCODE_REQUEST);
+	capacity_expect_dedup_key(capacity_dedup_records, capacity_dedup_record_count,
+							  lengthof(capacity_dedup_records), &waiters[0], GES_REQ_OPCODE_REQUEST,
+							  9);
+	UT_ASSERT(cluster_grd_holder_mode_by_id(&request.resid, &waiters[0], &mode));
+	UT_ASSERT_EQ(mode, ShareLock);
+	if (large) {
+		capacity_expect_grant_reply(&request.resid, &convert, GES_REQ_OPCODE_CONVERT);
+		capacity_expect_dedup_key(capacity_dedup_records, capacity_dedup_record_count,
+								  lengthof(capacity_dedup_records), &convert,
+								  GES_REQ_OPCODE_CONVERT, 9);
+		UT_ASSERT(!cluster_grd_holder_mode_by_id(&request.resid, &holders[0], NULL));
+		mode = NoLock;
+		UT_ASSERT(cluster_grd_holder_mode_by_id(&request.resid, &convert, &mode));
+		UT_ASSERT_EQ(mode, ShareLock);
+	}
+	if (path == CAPACITY_CONTROL_LMON_RELEASE) {
+		capacity_expect_grant_reply(&request.resid, &blocker, GES_REQ_OPCODE_RELEASE);
+		UT_ASSERT_EQ(capacity_dedup_remove_count, lengthof(acquire_opcodes));
+		for (int i = 0; i < lengthof(acquire_opcodes); i++)
+			capacity_expect_dedup_key(capacity_dedup_removals, capacity_dedup_remove_count,
+									  lengthof(capacity_dedup_removals), &blocker,
+									  acquire_opcodes[i], 47);
+	} else {
+		UT_ASSERT_EQ(capacity_control_retired_count, 1);
+		UT_ASSERT_EQ(capacity_dedup_remove_count, 0);
+	}
+	capacity_expect_queues(1, nholders + 1, nwaiters - 1, 0);
+	/* All old edges must be gone, including identities beyond the first chunk.
+	 * No GRD cleanup or explicit graph reset has occurred since fault injection. */
+	for (int i = 0; i < nwaiters; i++) {
+		UT_ASSERT_EQ(ut_wfg_count_waiter(waiters[i].node_id, waiters[i].procno,
+										 waiters[i].cluster_epoch, waiters[i].request_id),
+					 0);
+		if (i > 0)
+			UT_ASSERT(!cluster_grd_holder_mode_by_id(&request.resid, &waiters[i], NULL));
+	}
+	UT_ASSERT_EQ(ut_wfg_n, 0);
+	capacity_expect_no_pin_leak(&request.resid);
+	/* Cancel remaining queues before freeing holders, so RED cleanup cannot
+	 * grant additional requests and hide the missing original notification. */
+	for (int i = 1; i < nwaiters; i++)
+		UT_ASSERT_EQ(cluster_grd_cancel_waiter_by_id(&request.resid, &waiters[i]),
+					 CLUSTER_GRD_ENTRY_OK);
+	if (large) {
+		(void)cluster_grd_cancel_convert_by_id(&request.resid, &convert, 35000);
+		capacity_release_present(&request.resid, &convert);
+	}
+	for (int i = 0; i < nholders; i++)
+		capacity_release_present(&request.resid, &holders[i]);
+	capacity_release_present(&request.resid, &waiters[0]);
+	capacity_release_present(&request.resid, &blocker);
+	capacity_expect_counts(0, 0);
+	capacity_expect_stop(CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(ut_grd_pool_used, 0);
+	UT_ASSERT_EQ(ut_wfg_n, 0);
+	hw_reply_observe = NULL;
+	hw_dedup_remove_observe = NULL;
+	hw_dedup_record_observe = NULL;
+	hw_control_retire_observe = NULL;
+	MyBackendType = saved_backend;
+	MyProc = NULL;
+}
+
+UT_TEST(real_lmon_release_oom_never_loses_a_granted_waiter_reply)
+{
+	capacity_projection_oom(CAPACITY_CONTROL_LMON_RELEASE, 0);
+}
+
+UT_TEST(control_retire_oom_never_loses_a_granted_waiter_reply)
+{
+	capacity_projection_oom(CAPACITY_CONTROL_RETIRE, 0);
+}
+
+UT_TEST(real_lmon_release_holder_snapshot_oom_delivers_grants_and_retracts_all_old_edges)
+{
+	capacity_projection_oom(CAPACITY_CONTROL_LMON_RELEASE, 1);
+}
+
+UT_TEST(real_lmon_release_waiter_snapshot_oom_delivers_grants_and_retracts_all_old_edges)
+{
+	capacity_projection_oom(CAPACITY_CONTROL_LMON_RELEASE, 2);
+}
+
+UT_TEST(control_retire_holder_snapshot_oom_delivers_grants_and_retracts_all_old_edges)
+{
+	capacity_projection_oom(CAPACITY_CONTROL_RETIRE, 1);
+}
+
+UT_TEST(control_retire_waiter_snapshot_oom_delivers_grants_and_retracts_all_old_edges)
+{
+	capacity_projection_oom(CAPACITY_CONTROL_RETIRE, 2);
+}
+
 int
 main(void)
 {
 	MyBackendType = B_BACKEND;
 	setvbuf(stdout, NULL, _IONBF, 0);
 	alarm(30); /* Same standalone watchdog; no product deadline is changed. */
-	UT_PLAN(29);
+	UT_PLAN(35);
 	UT_RUN(first_grd_attach_preserves_temporary_error_cleanup_scope);
 	UT_RUN(compatible_16_control_releases_exact_owners);
 	UT_RUN(compatible_17_owners_are_all_granted);
@@ -1513,6 +1781,12 @@ main(void)
 	UT_RUN(control_retire_delivers_and_reclaims_all_16_convert_grants);
 	UT_RUN(control_retire_delivers_and_reclaims_all_32_convert_grants);
 	UT_RUN(canceled_32_control_converts_never_grant_after_real_lmon_release);
+	UT_RUN(real_lmon_release_oom_never_loses_a_granted_waiter_reply);
+	UT_RUN(control_retire_oom_never_loses_a_granted_waiter_reply);
+	UT_RUN(real_lmon_release_holder_snapshot_oom_delivers_grants_and_retracts_all_old_edges);
+	UT_RUN(real_lmon_release_waiter_snapshot_oom_delivers_grants_and_retracts_all_old_edges);
+	UT_RUN(control_retire_holder_snapshot_oom_delivers_grants_and_retracts_all_old_edges);
+	UT_RUN(control_retire_waiter_snapshot_oom_delivers_grants_and_retracts_all_old_edges);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
