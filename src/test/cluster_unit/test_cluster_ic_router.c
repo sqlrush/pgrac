@@ -53,6 +53,7 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES */
 #include "cluster/cluster_ic.h"	  /* ClusterICOps type for stub */
 #include "cluster/cluster_ic_envelope.h"
@@ -972,10 +973,233 @@ UT_TEST(test_control_handler_defers_before_transferring_the_frame)
 	UT_ASSERT_EQ(control_consumed, 2);
 }
 
+#ifndef CLUSTER_IC_PROFILE_QUEUE_API
+#define cluster_ic_dispatch_envelope_profiled(e, p, n, s) cluster_ic_dispatch_envelope(e, p, n)
+#endif
+
+static ClusterXnodeProfileShared queue_profile;
+static ClusterXnodeBucket queue_expected;
+static bool queue_handler_defer;
+
+static void
+queue_profile_handler(const ClusterICEnvelope *env, const void *payload)
+{
+	/* The sample must finish before any handler work or nested dispatch. */
+	if (queue_expected != CLXP_NBUCKETS && cluster_xnode_profile_enabled)
+		UT_ASSERT_EQ(pg_atomic_read_u64(&queue_profile.bucket[queue_expected].n_events), 1);
+	if (queue_handler_defer)
+		cluster_ic_dispatch_defer(env);
+}
+
+UT_TEST(test_lms_tcp_dispatch_profile_classifies_only_requested_families)
+{
+	ClusterICMsgTypeInfo info = { .msg_type = PGRAC_IC_MSG_GCS_BLOCK_REQUEST,
+								  .name = "queue-request",
+								  .handler = queue_profile_handler,
+								  .plane = CLUSTER_IC_PLANE_DATA };
+	ClusterICEnvelope env
+		= { .msg_type = PGRAC_IC_MSG_GCS_BLOCK_REQUEST, .source_node_id = 1, .dest_node_id = 7 };
+	ClusterR4CrForwardPayload forward = { 0 };
+	ClusterR4CrRequestPayload request = { 0 };
+	int i;
+
+	cluster_ic_register_msg_type(&info);
+	info.msg_type = PGRAC_IC_MSG_GCS_BLOCK_FORWARD;
+	info.name = "queue-forward";
+	cluster_ic_register_msg_type(&info);
+	router_test_my_plane = CLUSTER_IC_PLANE_DATA;
+	router_test_authority_managed = false;
+	ClusterXnodeProfileCtl = &queue_profile;
+	cluster_xnode_profile_enabled = true;
+	for (int rdma = 0; rdma <= 1; rdma++) {
+		for (i = 0; i < 21; i++) {
+			const void *payload = &forward;
+			ClusterXpScope scope;
+
+			memset(&queue_profile, 0, sizeof(queue_profile));
+			memset(&forward, 0, sizeof(forward));
+			memset(&request, 0, sizeof(request));
+			forward.base.transition_id = request.base.transition_id = PCM_TRANS_N_TO_S;
+			env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_FORWARD;
+			env.payload_length = sizeof(forward.base);
+			queue_expected = CLXP_NBUCKETS;
+			switch (i) {
+			case 0:
+				env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REQUEST;
+				env.payload_length = sizeof(request.base);
+				payload = &request;
+				queue_expected = CLXP_LMS_TCP_DISPATCH_BLOCK;
+				break;
+			case 1:
+				env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REQUEST;
+				env.payload_length = sizeof(request);
+				request.extension.r4_version = CLUSTER_R4_WIRE_VERSION;
+				request.extension.r4_kind = CLUSTER_R4_WIRE_CR_BUILD;
+				payload = &request;
+				queue_expected = CLXP_LMS_TCP_DISPATCH_R4_CR;
+				break;
+			case 2:
+			case 3:
+			case 8:
+			case 9:
+				env.payload_length = sizeof(forward);
+				forward.extension.r4_version = CLUSTER_R4_WIRE_VERSION;
+				forward.extension.r4_kind = i == 2 ? CLUSTER_R4_WIRE_CR_BUILD
+												   : (i == 3 ? CLUSTER_R4_WIRE_TX_RESOLVE
+															 : CLUSTER_R4_WIRE_UNDO_DATA_FETCH);
+				if (i == 2)
+					queue_expected = CLXP_LMS_TCP_DISPATCH_R4_CR;
+				if (i == 3)
+					queue_expected = CLXP_LMS_TCP_DISPATCH_R4_TX;
+				if (i == 9)
+					forward.extension.r4_version = 0;
+				break;
+			case 4:
+				GcsBlockForwardPayloadSetCrRequest(&forward.base, true);
+				queue_expected = CLXP_LMS_TCP_DISPATCH_R4_SOURCE_CR;
+				break;
+			case 5:
+				forward.base.reserved_0[6] = 2;
+				queue_expected = CLXP_LMS_TCP_DISPATCH_UNDO_VERDICT;
+				break;
+			case 6:
+				GcsBlockForwardPayloadSetUndoAuthorityVerdictRequest(&forward.base);
+				queue_expected = CLXP_LMS_TCP_DISPATCH_UNDO_VERDICT;
+				break;
+			case 7:
+				env.payload_length = 1; /* short input must not be inspected as a struct */
+				break;
+			case 10:
+				GcsBlockForwardPayloadSetUndoMultiVerdictRequest(&forward.base, true);
+				break;
+			case 11:
+				GcsBlockForwardPayloadSetUndoTtFetchRequest(&forward.base, true);
+				break;
+			case 12:
+				GcsBlockForwardPayloadSetUndoFreshRefC1bPairRequest(&forward.base);
+				queue_expected = CLXP_LMS_TCP_DISPATCH_UNDO_VERDICT;
+				break;
+			case 13:
+				forward.base.reserved_0[6] = 255;
+				break;
+			case 14:
+				GcsBlockForwardPayloadSetBastNudge(&forward.base);
+				break;
+			case 15:
+				GcsBlockForwardPayloadSetReadImage(&forward.base, true);
+				queue_expected = CLXP_LMS_TCP_DISPATCH_BLOCK;
+				break;
+			case 16:
+				forward.base.transition_id = 0;
+				break;
+			case 17:
+				env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REQUEST;
+				env.payload_length = sizeof(request.base);
+				request.base.transition_id = 0;
+				payload = &request;
+				break;
+			case 18:
+			case 19:
+				forward.base.reserved_0[6] = i == 18 ? GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE
+													 : GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS;
+				GcsBlockForwardPayloadSetCrRequest(&forward.base, true);
+				break;
+			case 20:
+				GcsBlockForwardPayloadSetUndoAuthorityVerdictRequest(&forward.base);
+				GcsBlockForwardPayloadSetCrRequest(&forward.base, true);
+				/* Mirror the original handler's CR-before-verdict classification. */
+				queue_expected = CLXP_LMS_TCP_DISPATCH_R4_SOURCE_CR;
+				break;
+			}
+			if (rdma && queue_expected != CLXP_NBUCKETS)
+				queue_expected
+					= (ClusterXnodeBucket)(CLXP_LMS_RDMA_QUEUE_BLOCK
+										   + (queue_expected - CLXP_LMS_TCP_DISPATCH_BLOCK));
+			cluster_xp_profile_begin(&scope, rdma ? CLXP_LMS_RDMA_QUEUE_BLOCK
+												  : CLXP_LMS_TCP_DISPATCH_BLOCK);
+			UT_ASSERT_EQ(cluster_ic_dispatch_envelope_profiled(&env, payload, 1, &scope),
+						 CLUSTER_IC_DISPATCH_DONE);
+			UT_ASSERT(!scope.active);
+			for (int b = CLXP_PCM_EXECUTOR_WAIT; b < CLXP_NBUCKETS; b++)
+				UT_ASSERT_EQ(pg_atomic_read_u64(&queue_profile.bucket[b].n_events),
+							 b == queue_expected ? 1 : 0);
+		}
+	}
+	cluster_xnode_profile_enabled = false;
+	ClusterXnodeProfileCtl = NULL;
+	router_test_my_plane = CLUSTER_IC_PLANE_CONTROL;
+}
+
+UT_TEST(test_lms_tcp_dispatch_profile_pending_preserves_first_arrival_and_counts_once)
+{
+	ClusterICEnvelope env = { .msg_type = PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+							  .source_node_id = 1,
+							  .dest_node_id = 7,
+							  .payload_length = sizeof(GcsBlockForwardPayload) };
+	GcsBlockForwardPayload forward = { .transition_id = PCM_TRANS_N_TO_S };
+	ClusterXpScope scope;
+	instr_time arrival;
+
+	memset(&queue_profile, 0, sizeof(queue_profile));
+	ClusterXnodeProfileCtl = &queue_profile;
+	cluster_xnode_profile_enabled = true;
+	router_test_my_plane = CLUSTER_IC_PLANE_DATA;
+	router_test_authority_managed = true;
+	router_test_serving_ready = false;
+	router_test_serving_pending = true;
+	queue_expected = CLXP_LMS_TCP_DISPATCH_BLOCK;
+	cluster_xp_profile_begin(&scope, queue_expected);
+	arrival = scope.start;
+	UT_ASSERT_EQ(cluster_ic_dispatch_envelope_profiled(&env, &forward, 1, &scope),
+				 CLUSTER_IC_DISPATCH_PENDING);
+	UT_ASSERT(scope.active);
+	UT_ASSERT(memcmp(&arrival, &scope.start, sizeof(arrival)) == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&queue_profile.bucket[queue_expected].n_events), 0);
+	router_test_serving_ready = true;
+	router_test_serving_pending = false;
+	queue_handler_defer = true;
+	UT_ASSERT_EQ(cluster_ic_dispatch_envelope_profiled(&env, &forward, 1, &scope),
+				 CLUSTER_IC_DISPATCH_PENDING);
+	UT_ASSERT(!scope.active);
+	queue_handler_defer = false;
+	UT_ASSERT_EQ(cluster_ic_dispatch_envelope_profiled(&env, &forward, 1, &scope),
+				 CLUSTER_IC_DISPATCH_DONE);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&queue_profile.bucket[queue_expected].n_events), 1);
+	/* Turning profiling off after arrival must discard, without new work. */
+	cluster_xp_profile_begin(&scope, queue_expected);
+	cluster_xnode_profile_enabled = false;
+	UT_ASSERT_EQ(cluster_ic_dispatch_envelope_profiled(&env, &forward, 1, &scope),
+				 CLUSTER_IC_DISPATCH_DONE);
+	UT_ASSERT(!scope.active);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&queue_profile.bucket[queue_expected].n_events), 1);
+	/* OFF while admission still waits must discard the prior measurement window. */
+	cluster_xnode_profile_enabled = true;
+	cluster_xp_profile_begin(&scope, queue_expected);
+	router_test_serving_ready = false;
+	router_test_serving_pending = true;
+	UT_ASSERT_EQ(cluster_ic_dispatch_envelope_profiled(&env, &forward, 1, &scope),
+				 CLUSTER_IC_DISPATCH_PENDING);
+	UT_ASSERT(scope.active);
+	cluster_xnode_profile_enabled = false;
+	UT_ASSERT_EQ(cluster_ic_dispatch_envelope_profiled(&env, &forward, 1, &scope),
+				 CLUSTER_IC_DISPATCH_PENDING);
+	UT_ASSERT(!scope.active);
+	cluster_xnode_profile_enabled = true;
+	router_test_serving_ready = true;
+	router_test_serving_pending = false;
+	UT_ASSERT_EQ(cluster_ic_dispatch_envelope_profiled(&env, &forward, 1, &scope),
+				 CLUSTER_IC_DISPATCH_DONE);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&queue_profile.bucket[queue_expected].n_events), 1);
+	cluster_xnode_profile_enabled = false;
+	ClusterXnodeProfileCtl = NULL;
+	router_test_authority_managed = false;
+	router_test_my_plane = CLUSTER_IC_PLANE_CONTROL;
+}
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(23);
 
 	/* U6 register HEARTBEAT + count */
 	UT_RUN(test_u6_register_heartbeat_lmon_only);
@@ -1011,6 +1235,8 @@ main(void)
 	(void)test_handler_dummy_calls;
 
 	UT_RUN(test_control_handler_defers_before_transferring_the_frame);
+	UT_RUN(test_lms_tcp_dispatch_profile_classifies_only_requested_families);
+	UT_RUN(test_lms_tcp_dispatch_profile_pending_preserves_first_arrival_and_counts_once);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

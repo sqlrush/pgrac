@@ -22,6 +22,7 @@
 bool cluster_update_trace_enabled __attribute__((weak)) = false;
 bool cluster_xnode_profile_enabled __attribute__((weak)) = false;
 ClusterXnodeProfileShared *ClusterXnodeProfileCtl __attribute__((weak)) = NULL;
+ClusterXpService cluster_xp_current_service __attribute__((weak)) = CLXP_SERVICE_NONE;
 
 /* PageSetLSN reads the static shared-storage profile. Legacy standalone
  * fixtures default to off; shared-profile tests supply their own value. */

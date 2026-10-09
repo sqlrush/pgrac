@@ -48,6 +48,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_xnode_profile.h"
 #include "cluster/cluster_update_trace.h"
 
 #ifdef USE_PGRAC_CLUSTER
@@ -3676,7 +3677,7 @@ cluster_cr_server_test_multi_verdict_serve(ClusterLmsCrSlot *slot)
 static void cr_serve_slot_impl(ClusterLmsCrSlot *slot);
 
 static void
-cr_serve_slot(ClusterLmsCrSlot *slot)
+cr_serve_slot_traced(ClusterLmsCrSlot *slot)
 {
 	ClusterUpdateTraceEvent event = { 0 };
 
@@ -3698,6 +3699,35 @@ cr_serve_slot(ClusterLmsCrSlot *slot)
 	{
 		event.kind = CLUTRACE_LEGACY_SERVE_END;
 		cluster_update_trace_event(&event);
+	}
+	PG_END_TRY();
+}
+
+static void
+cr_serve_slot(ClusterLmsCrSlot *slot)
+{
+	ClusterXpScope scope;
+	ClusterXpService previous;
+
+	if (likely(!cluster_xnode_profile_enabled)) {
+		cr_serve_slot_traced(slot);
+		return;
+	}
+	previous = cluster_xp_current_service;
+	cluster_xp_current_service = CLXP_SERVICE_NONE;
+	scope.active = false;
+	if (slot->req_kind == (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT) {
+		cluster_xp_current_service = CLXP_SERVICE_UNDO_VERDICT;
+		cluster_xp_profile_begin(&scope, CLXP_UNDO_VERDICT_SERVICE);
+	}
+	PG_TRY();
+	{
+		cr_serve_slot_traced(slot);
+	}
+	PG_FINALLY();
+	{
+		cluster_xp_current_service = previous;
+		cluster_xp_profile_end(&scope);
 	}
 	PG_END_TRY();
 }

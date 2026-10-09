@@ -46,6 +46,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_xnode_profile.h"
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_sf_dep.h"
@@ -158,6 +159,7 @@ typedef struct ClusterICRdmaInboundFrame {
 	int32 peer_id;
 	size_t len;
 	size_t consumed;
+	ClusterXpScope queue_scope;
 	uint8 *data;
 	struct ClusterICRdmaInboundFrame *next;
 } ClusterICRdmaInboundFrame;
@@ -343,6 +345,14 @@ rdma_inbound_enqueue(int32 peer_id, const void *data, size_t len)
 	frame->len = len;
 	frame->consumed = 0;
 	frame->next = NULL;
+	if (unlikely(cluster_xnode_profile_enabled) && len >= sizeof(ClusterICEnvelope)) {
+		ClusterICEnvelope queued;
+
+		memcpy(&queued, data, sizeof(queued));
+		if (queued.msg_type == PGRAC_IC_MSG_GCS_BLOCK_REQUEST
+			|| queued.msg_type == PGRAC_IC_MSG_GCS_BLOCK_FORWARD)
+			cluster_xp_profile_begin(&frame->queue_scope, CLXP_LMS_RDMA_QUEUE_BLOCK);
+	}
 	if (RdmaInboundTail != NULL)
 		RdmaInboundTail->next = frame;
 	else
@@ -1575,7 +1585,10 @@ rdma_dispatch_pending_frames(void)
 		vrc = cluster_ic_envelope_verify(&env, payload, env.payload_length, (uint32)cluster_node_id,
 										 sender);
 		if (vrc == CLUSTER_IC_ENVELOPE_OK) {
-			dispatched = cluster_ic_dispatch_envelope(&env, payload, sender);
+			dispatched = frame->queue_scope.active
+							 ? cluster_ic_dispatch_envelope_profiled(&env, payload, sender,
+																	 &frame->queue_scope)
+							 : cluster_ic_dispatch_envelope(&env, payload, sender);
 			if (dispatched == CLUSTER_IC_DISPATCH_PENDING) {
 				frame->next = NULL;
 				if (RdmaInboundTail != NULL)

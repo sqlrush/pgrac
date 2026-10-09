@@ -29,22 +29,54 @@
  */
 #include "postgres.h"
 
+#include <errno.h>
 #include "portability/instr_time.h"
 
 /* ----------
  * Fake clock: count every INSTR_TIME_SET_CURRENT and serve a settable
- * nanosecond value.  Must be defined before cluster_xnode_profile.h so
- * the inline probe helpers in this TU bind to the fake.
+ * nanosecond value. Clobber errno to exercise the probe's preservation
+ * contract. Define before the header so the real inline helpers use it.
  * ----------
  */
 static int ut_clock_calls = 0;
 static int64 ut_fake_now_ns = 0;
 
 #undef INSTR_TIME_SET_CURRENT
-#define INSTR_TIME_SET_CURRENT(t) (ut_clock_calls++, (t).ticks = ut_fake_now_ns)
+#define INSTR_TIME_SET_CURRENT(t) (ut_clock_calls++, errno = EIO, (t).ticks = ut_fake_now_ns)
 
 #include "cluster/cluster_xnode_profile.h"
 #include "storage/buf_internals.h"
+
+/*
+ * Old-source RED mode uses the original timing helpers only while the
+ * profile-only API is absent. These numeric IDs expose missing names without
+ * an undefined-symbol failure. The feature macro selects the real new API.
+ */
+#ifndef CLUSTER_XP_PROFILE_ONLY_API
+#define CLXP_PCM_EXECUTOR_WAIT ((ClusterXnodeBucket)40)
+#define CLXP_PCM_LOCAL_COMPATIBLE_WAIT ((ClusterXnodeBucket)41)
+#define CLXP_PCM_BOOTSTRAP_WAIT ((ClusterXnodeBucket)42)
+#define CLXP_PCM_PREDECESSOR_WAIT ((ClusterXnodeBucket)43)
+#define CLXP_PCM_TARGET_INSTALL_WAIT ((ClusterXnodeBucket)44)
+#define CLXP_LMS_TCP_DISPATCH_BLOCK ((ClusterXnodeBucket)45)
+#define CLXP_LMS_TCP_DISPATCH_R4_CR ((ClusterXnodeBucket)46)
+#define CLXP_LMS_TCP_DISPATCH_R4_TX ((ClusterXnodeBucket)47)
+#define CLXP_LMS_TCP_DISPATCH_R4_SOURCE_CR ((ClusterXnodeBucket)48)
+#define CLXP_LMS_TCP_DISPATCH_UNDO_VERDICT ((ClusterXnodeBucket)49)
+#define CLXP_UNDO_VERDICT_SERVICE ((ClusterXnodeBucket)50)
+#define CLXP_R4_TX_SERVICE ((ClusterXnodeBucket)51)
+#define CLXP_UNDO_VERDICT_OPEN ((ClusterXnodeBucket)52)
+#define CLXP_UNDO_VERDICT_PREAD ((ClusterXnodeBucket)53)
+#define CLXP_R4_TX_UNDO_OPEN ((ClusterXnodeBucket)54)
+#define CLXP_R4_TX_UNDO_PREAD ((ClusterXnodeBucket)55)
+#define CLXP_LMS_RDMA_QUEUE_BLOCK ((ClusterXnodeBucket)56)
+#define CLXP_LMS_RDMA_QUEUE_R4_CR ((ClusterXnodeBucket)57)
+#define CLXP_LMS_RDMA_QUEUE_R4_TX ((ClusterXnodeBucket)58)
+#define CLXP_LMS_RDMA_QUEUE_R4_SOURCE_CR ((ClusterXnodeBucket)59)
+#define CLXP_LMS_RDMA_QUEUE_UNDO_VERDICT ((ClusterXnodeBucket)60)
+#define cluster_xp_profile_begin cluster_xp_begin
+#define cluster_xp_profile_end cluster_xp_end
+#endif
 
 /*
  * postgres.h transitively pulls in port.h which redirects printf etc.
@@ -80,6 +112,8 @@ UT_DEFINE_GLOBALS();
  */
 bool cluster_xnode_profile_enabled = false;
 bool cluster_update_trace_enabled = false;
+static int ut_trace_begin_calls;
+static int ut_trace_end_calls;
 
 /* The separate update-trace test links its real accounting implementation. */
 uint64
@@ -87,7 +121,8 @@ cluster_update_trace_phase_begin_at(int bucket, uint64 now)
 {
 	(void)bucket;
 	(void)now;
-	return 0;
+	ut_trace_begin_calls++;
+	return 1;
 }
 
 void
@@ -95,6 +130,7 @@ cluster_update_trace_phase_end_at(uint64 token, uint64 now)
 {
 	(void)token;
 	(void)now;
+	ut_trace_end_calls++;
 }
 
 extern void *ShmemInitStruct(const char *name, Size size, bool *foundPtr);
@@ -136,6 +172,11 @@ ut_attach_fresh_shared(void)
 {
 	memset(&ut_shared, 0, sizeof(ut_shared));
 	ClusterXnodeProfileCtl = &ut_shared;
+	cluster_xnode_profile_enabled = false;
+	cluster_update_trace_enabled = false;
+	ut_clock_calls = 0;
+	ut_trace_begin_calls = 0;
+	ut_trace_end_calls = 0;
 }
 
 static uint64
@@ -158,8 +199,8 @@ ut_hist_count(ClusterXpHistComponent c, int bucket)
 
 /* ----------
  * U1 — bucket enum completeness: every bucket has a unique non-NULL
- * name; out-of-range returns NULL; the enum has the spec'd 23 buckets
- * (spec-5.59) + 5 commit-decomposition buckets (spec-7.4 D0) = 28.
+ * name; out-of-range returns NULL. The original 40 buckets retain their
+ * indexes and the measurement extension appends 29 buckets.
  * ----------
  */
 UT_TEST(test_u1_bucket_enum_complete)
@@ -167,14 +208,20 @@ UT_TEST(test_u1_bucket_enum_complete)
 	int i;
 	int j;
 
-	UT_ASSERT_EQ(CLXP_NBUCKETS, 40);
+	UT_ASSERT_EQ(CLXP_NBUCKETS, 61);
 	for (i = 0; i < CLXP_NBUCKETS; i++) {
 		const char *name = cluster_xp_bucket_name((ClusterXnodeBucket)i);
 
 		UT_ASSERT_NOT_NULL((void *)name);
+		if (name == NULL)
+			continue; /* Keep the assertion failure without dereferencing a missing name. */
 		UT_ASSERT(strlen(name) > 0);
-		for (j = 0; j < i; j++)
-			UT_ASSERT(strcmp(name, cluster_xp_bucket_name((ClusterXnodeBucket)j)) != 0);
+		for (j = 0; j < i; j++) {
+			const char *other = cluster_xp_bucket_name((ClusterXnodeBucket)j);
+
+			if (other != NULL)
+				UT_ASSERT(strcmp(name, other) != 0);
+		}
 	}
 	UT_ASSERT_NULL((void *)cluster_xp_bucket_name((ClusterXnodeBucket)CLXP_NBUCKETS));
 	UT_ASSERT_NULL((void *)cluster_xp_bucket_name((ClusterXnodeBucket)-1));
@@ -309,10 +356,10 @@ UT_TEST(test_u4_off_path_zero_syscall)
 }
 
 /* ----------
- * U5 — dump key surface: 28 buckets x {total_nanos, n_events} (56) plus the
+ * U5 — dump key surface: 61 buckets x {total_nanos, n_events}, plus the
  * 5 probe keys (reset_generation, read probe x2, HW locality x2) plus the
  * spec-7.4 D4 commit-latency histogram (5 components x 12 μs buckets = 60)
- * = 145 keys with the twelve appended diagnostic buckets. The SRF emission
+ * = 187 keys. The SRF emission
  * itself is covered end-to-end by cluster_tap
  * (t/017 category list + t/334 legs); the unit level pins the formula and
  * the name tables the emission iterates.
@@ -323,7 +370,7 @@ UT_TEST(test_u5_dump_key_surface)
 	UT_ASSERT_EQ(CLUSTER_XP_N_PROBE_KEYS, 5);
 	UT_ASSERT_EQ(CLXP_NBUCKETS * 2 + CLUSTER_XP_N_PROBE_KEYS
 					 + CLXP_HIST_NCOMPONENTS * CLXP_HIST_NBUCKETS,
-				 145);
+				 187);
 }
 
 /* ----------
@@ -499,10 +546,304 @@ UT_TEST(test_u11_hist_labels)
 		CLXP_HIST_NEDGES);
 }
 
+typedef struct UtBucketContract {
+	ClusterXnodeBucket bucket;
+	int id;
+	const char *name;
+} UtBucketContract;
+
+static const UtBucketContract ut_original_buckets[] = {
+	{ CLXP_W_GCS_X_REQUEST, 0, "w_gcs_x_request" },
+	{ CLXP_W_GCS_X_RECEIVE, 1, "w_gcs_x_receive" },
+	{ CLXP_W_GCS_X_INSTALL, 2, "w_gcs_x_install" },
+	{ CLXP_W_GCS_X_INVALIDATE, 3, "w_gcs_x_invalidate" },
+	{ CLXP_W_GES_ENQUEUE, 4, "w_ges_enqueue" },
+	{ CLXP_W_GES_CONVERT, 5, "w_ges_convert" },
+	{ CLXP_W_GES_WAIT, 6, "w_ges_wait" },
+	{ CLXP_W_GES_WAKE, 7, "w_ges_wake" },
+	{ CLXP_W_HW_EXTEND, 8, "w_hw_extend" },
+	{ CLXP_R_GCS_S_REQUEST, 9, "r_gcs_s_request" },
+	{ CLXP_R_GCS_S_RECEIVE, 10, "r_gcs_s_receive" },
+	{ CLXP_R_READIMAGE_SHIP, 11, "r_readimage_ship" },
+	{ CLXP_R_SHOLDER_CACHE_HIT, 12, "r_sholder_cache_hit" },
+	{ CLXP_R_CR_CONSTRUCT, 13, "r_cr_construct" },
+	{ CLXP_R_CR_CHAIN_WALK, 14, "r_cr_chain_walk" },
+	{ CLXP_R_TT_VISIBILITY_RESOLVE, 15, "r_tt_visibility_resolve" },
+	{ CLXP_I_INDEX_BLOCK_XFER, 16, "i_index_block_xfer" },
+	{ CLXP_I_RIGHTMOST_LEAF_PING, 17, "i_rightmost_leaf_ping" },
+	{ CLXP_C_SCN_COMMIT_ADVANCE, 18, "c_scn_commit_advance" },
+	{ CLXP_C_SCN_BOC_BROADCAST, 19, "c_scn_boc_broadcast" },
+	{ CLXP_IC_SEND_SERVICE, 20, "ic_send_service" },
+	{ CLXP_IC_INBOUND_DISPATCH, 21, "ic_inbound_dispatch" },
+	{ CLXP_LOCAL_UNDO_ITL_WAL, 22, "local_undo_itl_wal" },
+	{ CLXP_C_COMMIT_UNDO_FLUSH, 23, "c_commit_undo_flush" },
+	{ CLXP_C_COMMIT_ITL_STAMP, 24, "c_commit_itl_stamp" },
+	{ CLXP_C_COMMIT_TT_STAMP, 25, "c_commit_tt_stamp" },
+	{ CLXP_C_COMMIT_WAL_FLUSH, 26, "c_commit_wal_flush" },
+	{ CLXP_C_COMMIT_QUORUM_READ, 27, "c_commit_quorum_read" },
+	{ CLXP_I_ITL_WAIT, 28, "i_itl_wait" },
+	{ CLXP_I_TX_WAIT, 29, "i_tx_wait" },
+	{ CLXP_UPDATE_SCAN, 30, "update_scan" },
+	{ CLXP_UPDATE_STORAGE, 31, "update_storage" },
+	{ CLXP_UPDATE_INDEX, 32, "update_index" },
+	{ CLXP_R4_CR_FETCH, 33, "r4_cr_fetch" },
+	{ CLXP_R4_TX_RPC, 34, "r4_tx_rpc" },
+	{ CLXP_R4_SOURCE_CR_RPC, 35, "r4_source_cr_rpc" },
+	{ CLXP_RESOURCE_X_ACQUIRE, 36, "resource_x_acquire" },
+	{ CLXP_BUFFER_LOCK, 37, "buffer_lock" },
+	{ CLXP_UNDO_RECEIPT_PREPARE, 38, "undo_receipt_prepare" },
+	{ CLXP_UNDO_VERDICT_RPC, 39, "undo_verdict_rpc" },
+};
+
+static const UtBucketContract ut_measure_buckets[] = {
+	{ CLXP_PCM_EXECUTOR_WAIT, 40, "pcm_executor_wait" },
+	{ CLXP_PCM_LOCAL_COMPATIBLE_WAIT, 41, "pcm_local_compatible_wait" },
+	{ CLXP_PCM_BOOTSTRAP_WAIT, 42, "pcm_bootstrap_wait" },
+	{ CLXP_PCM_PREDECESSOR_WAIT, 43, "pcm_predecessor_wait" },
+	{ CLXP_PCM_TARGET_INSTALL_WAIT, 44, "pcm_target_install_wait" },
+	{ CLXP_LMS_TCP_DISPATCH_BLOCK, 45, "lms_tcp_dispatch_block" },
+	{ CLXP_LMS_TCP_DISPATCH_R4_CR, 46, "lms_tcp_dispatch_r4_cr" },
+	{ CLXP_LMS_TCP_DISPATCH_R4_TX, 47, "lms_tcp_dispatch_r4_tx" },
+	{ CLXP_LMS_TCP_DISPATCH_R4_SOURCE_CR, 48, "lms_tcp_dispatch_r4_source_cr" },
+	{ CLXP_LMS_TCP_DISPATCH_UNDO_VERDICT, 49, "lms_tcp_dispatch_undo_verdict" },
+	{ CLXP_UNDO_VERDICT_SERVICE, 50, "undo_verdict_service" },
+	{ CLXP_R4_TX_SERVICE, 51, "r4_tx_service" },
+	{ CLXP_UNDO_VERDICT_OPEN, 52, "undo_verdict_open" },
+	{ CLXP_UNDO_VERDICT_PREAD, 53, "undo_verdict_pread" },
+	{ CLXP_R4_TX_UNDO_OPEN, 54, "r4_tx_undo_open" },
+	{ CLXP_R4_TX_UNDO_PREAD, 55, "r4_tx_undo_pread" },
+	{ CLXP_LMS_RDMA_QUEUE_BLOCK, 56, "lms_rdma_queue_block" },
+	{ CLXP_LMS_RDMA_QUEUE_R4_CR, 57, "lms_rdma_queue_r4_cr" },
+	{ CLXP_LMS_RDMA_QUEUE_R4_TX, 58, "lms_rdma_queue_r4_tx" },
+	{ CLXP_LMS_RDMA_QUEUE_R4_SOURCE_CR, 59, "lms_rdma_queue_r4_source_cr" },
+	{ CLXP_LMS_RDMA_QUEUE_UNDO_VERDICT, 60, "lms_rdma_queue_undo_verdict" },
+};
+
+UT_TEST(test_u12_original_bucket_ids_and_names_preserved)
+{
+	UT_ASSERT_EQ(lengthof(ut_original_buckets), 40);
+	for (int i = 0; i < lengthof(ut_original_buckets); i++) {
+		const UtBucketContract *expected = &ut_original_buckets[i];
+
+		UT_ASSERT_EQ(expected->bucket, expected->id);
+		UT_ASSERT_STR_EQ(cluster_xp_bucket_name(expected->bucket), expected->name);
+	}
+}
+
+UT_TEST(test_u13_measure_bucket_ids_and_names_appended)
+{
+	UT_ASSERT_EQ(lengthof(ut_measure_buckets), 21);
+	for (int i = 0; i < lengthof(ut_measure_buckets); i++) {
+		const UtBucketContract *expected = &ut_measure_buckets[i];
+
+		UT_ASSERT_EQ(expected->bucket, expected->id);
+		UT_ASSERT_STR_EQ(cluster_xp_bucket_name(expected->bucket), expected->name);
+	}
+}
+
+UT_TEST(test_u14_profile_off_never_reads_clock_with_trace_on)
+{
+	ClusterXpScope s;
+	ClusterXnodeProfileShared before;
+
+	for (int trace = 0; trace < 2; trace++) {
+		ut_attach_fresh_shared();
+		cluster_update_trace_enabled = trace != 0;
+		memcpy(&before, &ut_shared, sizeof(before));
+		for (int i = 0; i < lengthof(ut_measure_buckets); i++) {
+			memset(&s, 0xa5, sizeof(s));
+			errno = ENOSPC;
+			cluster_xp_profile_begin(&s, ut_measure_buckets[i].bucket);
+			UT_ASSERT(!s.active);
+			UT_ASSERT_EQ(s.trace_token, 0);
+			cluster_xp_profile_end(&s);
+			cluster_xp_abort(&s);
+			cluster_xp_profile_end(&s);
+			UT_ASSERT_EQ(errno, ENOSPC);
+		}
+		UT_ASSERT_EQ(ut_clock_calls, 0);
+		UT_ASSERT_EQ(ut_trace_begin_calls, 0);
+		UT_ASSERT_EQ(ut_trace_end_calls, 0);
+		UT_ASSERT_EQ(memcmp(&ut_shared, &before, sizeof(before)), 0);
+	}
+
+	/* The original trace-enabled helper remains an independent positive control. */
+	ut_attach_fresh_shared();
+	cluster_update_trace_enabled = true;
+	ut_fake_now_ns = 1000;
+	cluster_xp_begin(&s, CLXP_W_GCS_X_REQUEST);
+	UT_ASSERT(s.active);
+	ut_fake_now_ns = 5000;
+	cluster_xp_end(&s);
+	UT_ASSERT_EQ(ut_clock_calls, 2);
+	UT_ASSERT_EQ(ut_trace_begin_calls, 1);
+	UT_ASSERT_EQ(ut_trace_end_calls, 1);
+	UT_ASSERT_EQ(ut_bucket_events(CLXP_W_GCS_X_REQUEST), 0);
+	UT_ASSERT_EQ(ut_bucket_nanos(CLXP_W_GCS_X_REQUEST), 0);
+	cluster_update_trace_enabled = false;
+}
+
+UT_TEST(test_u15_measure_profile_counts_and_nanos_are_isolated)
+{
+	ClusterXpScope s;
+
+	UT_ASSERT_EQ(CLXP_NBUCKETS, 61);
+	/* Record an assertion RED above without indexing the old 40-slot region. */
+	if (CLXP_NBUCKETS != 61)
+		return;
+	for (int trace = 0; trace < 2; trace++) {
+		for (int i = 0; i < lengthof(ut_measure_buckets); i++) {
+			ClusterXnodeBucket bucket = ut_measure_buckets[i].bucket;
+
+			UT_ASSERT((int)bucket >= 0 && (int)bucket < CLXP_NBUCKETS);
+			if ((int)bucket < 0 || (int)bucket >= CLXP_NBUCKETS)
+				continue; /* The failed bounds assertion must not corrupt the fixture. */
+			ut_attach_fresh_shared();
+			cluster_xnode_profile_enabled = true;
+			cluster_update_trace_enabled = trace != 0;
+			memset(&s, 0xa5, sizeof(s));
+			ut_fake_now_ns = 1000;
+			cluster_xp_profile_begin(&s, bucket);
+			UT_ASSERT(s.active);
+			UT_ASSERT_EQ(s.bucket, bucket);
+			UT_ASSERT_EQ(s.trace_token, 0);
+			ut_fake_now_ns = 5000;
+			cluster_xp_profile_end(&s);
+			UT_ASSERT(!s.active);
+			UT_ASSERT_EQ(ut_bucket_events(bucket), 1);
+			UT_ASSERT_EQ(ut_bucket_nanos(bucket), 4000);
+
+			ut_fake_now_ns = 10000;
+			cluster_xp_profile_begin(&s, bucket);
+			ut_fake_now_ns = 16000;
+			cluster_xp_profile_end(&s);
+			cluster_xp_profile_end(&s); /* Already ended: no sample or clock read. */
+			UT_ASSERT_EQ(ut_clock_calls, 4);
+			UT_ASSERT_EQ(ut_trace_begin_calls, 0);
+			UT_ASSERT_EQ(ut_trace_end_calls, 0);
+			for (int b = 0; b < CLXP_NBUCKETS; b++) {
+				UT_ASSERT_EQ(ut_bucket_events((ClusterXnodeBucket)b), b == (int)bucket ? 2 : 0);
+				UT_ASSERT_EQ(ut_bucket_nanos((ClusterXnodeBucket)b), b == (int)bucket ? 10000 : 0);
+			}
+			for (int c = 0; c < CLXP_HIST_NCOMPONENTS; c++)
+				for (int b = 0; b < CLXP_HIST_NBUCKETS; b++)
+					UT_ASSERT_EQ(ut_hist_count((ClusterXpHistComponent)c, b), 0);
+		}
+	}
+	cluster_xnode_profile_enabled = false;
+	cluster_update_trace_enabled = false;
+}
+
+UT_TEST(test_u16_profile_abort_and_unattached_scope_are_noops)
+{
+	ClusterXpScope s;
+	ClusterXnodeProfileShared before;
+
+	ut_attach_fresh_shared();
+	cluster_xnode_profile_enabled = true;
+	cluster_update_trace_enabled = true;
+	memcpy(&before, &ut_shared, sizeof(before));
+	ut_fake_now_ns = 1000;
+	cluster_xp_profile_begin(&s, CLXP_PCM_EXECUTOR_WAIT);
+	UT_ASSERT(s.active);
+	ut_fake_now_ns = 5000;
+	cluster_xp_abort(&s);
+	cluster_xp_profile_end(&s);
+	UT_ASSERT(!s.active);
+	UT_ASSERT_EQ(ut_clock_calls, 1);
+	UT_ASSERT_EQ(ut_trace_begin_calls, 0);
+	UT_ASSERT_EQ(ut_trace_end_calls, 0);
+	UT_ASSERT_EQ(memcmp(&ut_shared, &before, sizeof(before)), 0);
+
+	ClusterXnodeProfileCtl = NULL;
+	memset(&s, 0xa5, sizeof(s));
+	cluster_xp_profile_begin(&s, CLXP_R4_TX_UNDO_PREAD);
+	cluster_xp_profile_end(&s);
+	UT_ASSERT(!s.active);
+	UT_ASSERT_EQ(ut_clock_calls, 1);
+	UT_ASSERT_EQ(ut_trace_begin_calls, 0);
+	UT_ASSERT_EQ(ut_trace_end_calls, 0);
+	UT_ASSERT_EQ(memcmp(&ut_shared, &before, sizeof(before)), 0);
+	ClusterXnodeProfileCtl = &ut_shared;
+	cluster_xnode_profile_enabled = false;
+	cluster_update_trace_enabled = false;
+}
+
+UT_TEST(test_u17_profile_end_after_switch_off_drops_without_clock)
+{
+	ClusterXpScope s;
+
+	for (int trace = 0; trace < 2; trace++) {
+		ut_attach_fresh_shared();
+		cluster_xnode_profile_enabled = true;
+		cluster_update_trace_enabled = trace != 0;
+		ut_fake_now_ns = 1000;
+		/* A pre-existing bucket keeps this behavioral RED independent of the enum. */
+		cluster_xp_profile_begin(&s, CLXP_W_GCS_X_REQUEST);
+		UT_ASSERT(s.active);
+		UT_ASSERT_EQ(ut_clock_calls, 1);
+		cluster_xnode_profile_enabled = false;
+		ut_fake_now_ns = 5000;
+		errno = ENOSPC;
+		cluster_xp_profile_end(&s);
+		UT_ASSERT_EQ(errno, ENOSPC);
+		UT_ASSERT(!s.active);
+		UT_ASSERT_EQ(ut_clock_calls, 1);
+		UT_ASSERT_EQ(ut_bucket_events(CLXP_W_GCS_X_REQUEST), 0);
+		UT_ASSERT_EQ(ut_bucket_nanos(CLXP_W_GCS_X_REQUEST), 0);
+		UT_ASSERT_EQ(ut_trace_begin_calls, 0);
+		UT_ASSERT_EQ(ut_trace_end_calls, 0);
+
+		/* Re-enabling cannot revive the discarded scope. */
+		cluster_xnode_profile_enabled = true;
+		cluster_xp_profile_end(&s);
+		UT_ASSERT_EQ(ut_clock_calls, 1);
+		UT_ASSERT_EQ(ut_bucket_events(CLXP_W_GCS_X_REQUEST), 0);
+		UT_ASSERT_EQ(ut_bucket_nanos(CLXP_W_GCS_X_REQUEST), 0);
+	}
+	cluster_xnode_profile_enabled = false;
+	cluster_update_trace_enabled = false;
+}
+
+UT_TEST(test_u18_profile_begin_and_end_preserve_errno)
+{
+	ClusterXpScope s;
+
+	for (int trace = 0; trace < 2; trace++) {
+		ut_attach_fresh_shared();
+		cluster_xnode_profile_enabled = true;
+		cluster_update_trace_enabled = trace != 0;
+		ut_fake_now_ns = 1000;
+		errno = EINTR;
+		cluster_xp_profile_begin(&s, CLXP_W_GCS_X_REQUEST);
+		UT_ASSERT_EQ(errno, EINTR);
+		UT_ASSERT(s.active);
+		UT_ASSERT_EQ(s.trace_token, 0);
+		UT_ASSERT_EQ(ut_clock_calls, 1);
+		ut_fake_now_ns = 5000;
+		errno = EAGAIN;
+		cluster_xp_profile_end(&s);
+		UT_ASSERT_EQ(errno, EAGAIN);
+		UT_ASSERT(!s.active);
+		UT_ASSERT_EQ(ut_clock_calls, 2);
+		UT_ASSERT_EQ(ut_bucket_events(CLXP_W_GCS_X_REQUEST), 1);
+		UT_ASSERT_EQ(ut_bucket_nanos(CLXP_W_GCS_X_REQUEST), 4000);
+		UT_ASSERT_EQ(ut_trace_begin_calls, 0);
+		UT_ASSERT_EQ(ut_trace_end_calls, 0);
+	}
+	cluster_xnode_profile_enabled = false;
+	cluster_update_trace_enabled = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(18);
+#ifndef CLUSTER_XP_PROFILE_ONLY_API
+	printf("# Profile-only API absent: behavioral RED uses original begin/end.\n");
+#else
+	printf("# Testing production profile-only begin/end.\n");
+#endif
 	UT_RUN(test_u1_bucket_enum_complete);
 	UT_RUN(test_u2_accum_monotonic);
 	UT_RUN(test_u3_reset);
@@ -514,6 +855,13 @@ main(void)
 	UT_RUN(test_u9_hist_bucket_index);
 	UT_RUN(test_u10_hist_observe);
 	UT_RUN(test_u11_hist_labels);
+	UT_RUN(test_u12_original_bucket_ids_and_names_preserved);
+	UT_RUN(test_u13_measure_bucket_ids_and_names_appended);
+	UT_RUN(test_u14_profile_off_never_reads_clock_with_trace_on);
+	UT_RUN(test_u15_measure_profile_counts_and_nanos_are_isolated);
+	UT_RUN(test_u16_profile_abort_and_unattached_scope_are_noops);
+	UT_RUN(test_u17_profile_end_after_switch_off_drops_without_clock);
+	UT_RUN(test_u18_profile_begin_and_end_preserve_errno);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

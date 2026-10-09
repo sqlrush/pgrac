@@ -54,6 +54,7 @@
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D1 — ClusterGcsBlockPhase + phase_for_tag proto */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_xnode_profile.h"
 #include "cluster/cluster_pi_write.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_qvotec.h"
@@ -100,6 +101,13 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_prepared_s_so
 
 
 UT_DEFINE_GLOBALS();
+
+/* Measurement fixture: only counts actual calls to the production CV seams. */
+bool cluster_xnode_profile_enabled = false;
+ClusterXnodeProfileShared *ClusterXnodeProfileCtl = NULL;
+static ClusterXnodeProfileShared wait_profile_shared;
+static bool measure_wait_calls;
+static uint64 measured_wait_calls;
 
 
 /* ============================================================
@@ -929,6 +937,9 @@ ConditionVariablePrepareToSleep(ConditionVariable *cv pg_attribute_unused())
 void
 ConditionVariableSleep(ConditionVariable *cv pg_attribute_unused(), uint32 wait_event_info)
 {
+	if (measure_wait_calls)
+		measured_wait_calls++;
+
 	fake_cv_sleep_count++;
 	fake_cv_sleep_wait_event = wait_event_info;
 	if (fake_cv_wake_release.armed) {
@@ -951,6 +962,9 @@ bool
 ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(), long timeout,
 							uint32 wait_event_info)
 {
+	if (measure_wait_calls)
+		measured_wait_calls++;
+
 	fake_cv_sleep_count++;
 	fake_cv_timed_sleep_timeout = timeout;
 	fake_cv_sleep_wait_event = wait_event_info;
@@ -23173,17 +23187,59 @@ UT_TEST(test_requester_transport_owner_bounds_both_dispatch_roots)
 	UT_ASSERT_EQ(retry.common.assertion_sequence, request.common.assertion_sequence);
 }
 
+/* Exercise each existing real waiter, preserving its original assertions.
+ * These are the appended, frozen profiling ordinals; old builds can run RED
+ * without indexing beyond their shorter shared bucket array. */
+UT_TEST(test_compatible_wait_profile_production_sites)
+{
+	void (*const cases[])(void)
+		= { test_resource_x_executor_t1_t2_t3_is_exact_and_blocks_no_progress,
+			test_pcm_H3_incompatible_x_waits_and_wakes,
+			test_resource_x_round_wait_rechecks_progress_in_finite_slices,
+			test_resource_x_predecessor_cv_observes_settlement_without_a_head,
+			test_resource_x_target_install_wait_uses_receipt_and_fixed_deadline };
+	int enabled;
+	int i;
+	int bucket;
+
+	for (enabled = 0; enabled <= 1; enabled++) {
+		for (i = 0; i < lengthof(cases); i++) {
+			uint64 total = 0;
+
+			memset(&wait_profile_shared, 0, sizeof(wait_profile_shared));
+			ClusterXnodeProfileCtl = &wait_profile_shared;
+			cluster_xnode_profile_enabled = enabled != 0;
+			measure_wait_calls = true;
+			measured_wait_calls = 0;
+			cases[i]();
+			measure_wait_calls = false;
+			for (bucket = 0; bucket < CLXP_NBUCKETS; bucket++) {
+				uint64 count = pg_atomic_read_u64(&wait_profile_shared.bucket[bucket].n_events);
+
+				total += count;
+				if (bucket != 40 + i)
+					UT_ASSERT_EQ(count, 0);
+			}
+			UT_ASSERT(measured_wait_calls > 0);
+			UT_ASSERT_EQ(total, enabled ? measured_wait_calls : 0);
+		}
+	}
+	cluster_xnode_profile_enabled = false;
+	ClusterXnodeProfileCtl = NULL;
+}
+
 int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(355);
+	UT_PLAN(356);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
 	UT_RUN(test_pcm_grd_max_entries_default_is_minus_one);
+	UT_RUN(test_compatible_wait_profile_production_sites);
 	UT_RUN(test_pcm_buffer_desc_invariants_hold_at_stage_2_30);
 	UT_RUN(test_pcm_lock_module_init_symbol_is_callable);
 	UT_RUN(test_pcm_trans_1_n_to_s_validator_accepts);

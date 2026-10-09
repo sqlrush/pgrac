@@ -14,12 +14,28 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "portability/instr_time.h"
+static int io_profile_clock_calls;
+static int64 io_profile_clock_ns;
+#undef INSTR_TIME_SET_CURRENT
+#define INSTR_TIME_SET_CURRENT(t)                                                                  \
+	(io_profile_clock_calls++, errno = ERANGE, (t).ticks = (io_profile_clock_ns += 1000))
+#include "cluster/cluster_xnode_profile.h"
+#ifndef CLUSTER_XP_SERVICE_API
+typedef enum ClusterXpService {
+	CLXP_SERVICE_NONE,
+	CLXP_SERVICE_UNDO_VERDICT,
+	CLXP_SERVICE_R4_TX
+} ClusterXpService;
+#endif
+ClusterXpService cluster_xp_current_service = CLXP_SERVICE_NONE;
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_undo_record_api.h"
 #include "common/file_perm.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "storage/ipc.h"
 
 #undef printf
 #undef fprintf
@@ -28,6 +44,17 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+sigjmp_buf *PG_exception_stack = NULL;
+ErrorContextCallback *error_context_stack = NULL;
+void
+pg_re_throw(void)
+{
+	abort();
+}
+void
+before_shmem_exit(pg_on_exit_callback function, Datum arg)
+{}
+
 
 int MyProcPid = 4321;
 pg_time_t MyStartTime = 0;
@@ -947,6 +974,82 @@ UT_TEST(test_recovery_file_requires_all_durability_barriers_and_preserves_bytes)
 	}
 }
 
+UT_TEST(test_undo_service_io_counts_real_attempts_not_cache_hits)
+{
+	ClusterXnodeProfileShared profile = { 0 };
+	char path[MAXPGPATH], page[BLCKSZ], observed[BLCKSZ];
+	int service;
+
+	resolve_final(path);
+	remove_if_present(path);
+	make_page(page, 0xa5);
+	write_segment_file(path, page, BLCKSZ);
+	ClusterXnodeProfileCtl = &profile;
+	cluster_update_trace_enabled = false;
+	for (service = CLXP_SERVICE_NONE; service <= CLXP_SERVICE_R4_TX; service++) {
+		for (int enabled = 0; enabled <= 1; enabled++) {
+			for (int traced = 0; traced <= 1; traced++) {
+				ClusterXnodeBucket open_bucket
+					= service == CLXP_SERVICE_R4_TX ? CLXP_R4_TX_UNDO_OPEN : CLXP_UNDO_VERDICT_OPEN;
+				ClusterXnodeBucket read_bucket = service == CLXP_SERVICE_R4_TX
+													 ? CLXP_R4_TX_UNDO_PREAD
+													 : CLXP_UNDO_VERDICT_PREAD;
+				bool measured = enabled && service != CLXP_SERVICE_NONE;
+
+				cluster_undo_smgr_fd_cache_reset();
+				memset(&profile, 0, sizeof(profile));
+				io_profile_clock_calls = 0;
+				cluster_xnode_profile_enabled = enabled != 0;
+				/* Separate trace ON must never enable these clocks. */
+				cluster_update_trace_enabled = traced != 0;
+				cluster_xp_current_service = (ClusterXpService)service;
+				UT_ASSERT(cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1, 0,
+													   observed));
+				UT_ASSERT(memcmp(page, observed, BLCKSZ) == 0);
+				UT_ASSERT(cluster_undo_smgr_read_header_bytes(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1,
+															  1, 0, observed, 32));
+				UT_ASSERT_EQ(pg_atomic_read_u64(&profile.bucket[open_bucket].n_events),
+							 measured ? 1 : 0);
+				UT_ASSERT_EQ(pg_atomic_read_u64(&profile.bucket[read_bucket].n_events),
+							 measured ? 2 : 0);
+				UT_ASSERT_EQ(io_profile_clock_calls, measured ? 6 : 0);
+				UT_ASSERT_EQ(pg_atomic_read_u64(&profile.bucket[open_bucket].total_nanos),
+							 measured ? 1000 : 0);
+				UT_ASSERT_EQ(pg_atomic_read_u64(&profile.bucket[read_bucket].total_nanos),
+							 measured ? 2000 : 0);
+				/* EOF is a real short read; the observation does not turn it into success. */
+				UT_ASSERT(!cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1, 1,
+														observed));
+				UT_ASSERT_EQ(pg_atomic_read_u64(&profile.bucket[read_bucket].n_events),
+							 measured ? 3 : 0);
+				pread_forced_error = true;
+				UT_ASSERT(!cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1, 0,
+														observed));
+				UT_ASSERT_EQ(errno, EIO);
+				pread_forced_error = false;
+				cluster_undo_smgr_fd_cache_reset();
+				basic_open_forced_error = true;
+				UT_ASSERT(!cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1, 0,
+														observed));
+				UT_ASSERT_EQ(errno, EACCES);
+				basic_open_forced_error = false;
+				UT_ASSERT_EQ(pg_atomic_read_u64(&profile.bucket[open_bucket].n_events),
+							 measured ? 2 : 0);
+				UT_ASSERT_EQ(pg_atomic_read_u64(&profile.bucket[read_bucket].n_events),
+							 measured ? 4 : 0);
+				UT_ASSERT_EQ(io_profile_clock_calls, measured ? 12 : 0);
+				for (int b = 0; b < CLXP_NBUCKETS; b++)
+					if (b != open_bucket && b != read_bucket)
+						UT_ASSERT_EQ(pg_atomic_read_u64(&profile.bucket[b].n_events), 0);
+			}
+		}
+	}
+	cluster_xp_current_service = CLXP_SERVICE_NONE;
+	cluster_xnode_profile_enabled = cluster_update_trace_enabled = false;
+	ClusterXnodeProfileCtl = NULL;
+	remove_if_present(path);
+}
+
 int
 main(void)
 {
@@ -954,7 +1057,7 @@ main(void)
 
 	UT_ASSERT_NOT_NULL(mkdtemp(template));
 	strlcpy(publication_dir, template, sizeof(publication_dir));
-	UT_PLAN(29);
+	UT_PLAN(30);
 	UT_RUN(test_recovery_file_materializes_absent_without_publishing_header);
 	UT_RUN(test_recovery_file_short_tail_and_errors_are_distinct);
 	UT_RUN(test_recovery_file_requires_all_durability_barriers_and_preserves_bytes);
@@ -984,6 +1087,7 @@ main(void)
 	UT_RUN(test_root_descriptor_mirror_probe_rejects_short_and_symlink);
 	UT_RUN(test_root_descriptor_mirror_probe_rejects_lstat_open_symlink_swap);
 	UT_RUN(test_root_descriptor_mirror_write_failure_cleans_owned_temp);
+	UT_RUN(test_undo_service_io_counts_real_attempts_not_cache_hits);
 	UT_ASSERT_EQ(rmdir(publication_dir), 0);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

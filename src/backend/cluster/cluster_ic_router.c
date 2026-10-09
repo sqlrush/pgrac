@@ -52,7 +52,8 @@
 #include "utils/elog.h"
 #include "utils/memutils.h"
 
-#include "cluster/cluster_conf.h"	  /* cluster_conf_lookup_node (spec-2.5 D2.5 fanout) */
+#include "cluster/cluster_conf.h" /* cluster_conf_lookup_node (spec-2.5 D2.5 fanout) */
+#include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_guc.h"	  /* cluster_node_id */
 #include "cluster/cluster_ic.h"		  /* cluster_ic_send_bytes (vtable) */
 #include "cluster/cluster_ic_chunk.h" /* PGRAC_IC_CHUNK_MSG_TYPE + chunk_dispatch_frame (v1.0.1 F1) */
@@ -335,8 +336,72 @@ cluster_ic_dispatch_data_admitted(const ClusterICEnvelope *env)
 	return env != NULL && env == data_dispatch_envelope;
 }
 
+/* Diagnostic classification only. A length/version mismatch is unclassified;
+ * the existing handler remains solely responsible for protocol validation. */
+static ClusterXnodeBucket
+ic_queue_profile_bucket(const ClusterICEnvelope *env, const void *payload)
+{
+	if (payload == NULL)
+		return CLXP_NBUCKETS;
+	if (env->msg_type == PGRAC_IC_MSG_GCS_BLOCK_REQUEST) {
+		if (env->payload_length == sizeof(GcsBlockRequestPayload)) {
+			GcsBlockRequestPayload request;
+
+			memcpy(&request, payload, sizeof(request));
+			if (request.transition_id >= PCM_TRANS_N_TO_S
+				&& request.transition_id <= PCM_TRANS_S_TO_X_CLEANOUT)
+				return CLXP_LMS_TCP_DISPATCH_BLOCK;
+		}
+		if (env->payload_length == sizeof(ClusterR4CrRequestPayload)) {
+			ClusterR4CrRequestPayload request;
+
+			memcpy(&request, payload, sizeof(request));
+			if (request.extension.r4_version == CLUSTER_R4_WIRE_VERSION
+				&& request.extension.r4_kind == CLUSTER_R4_WIRE_CR_BUILD)
+				return CLXP_LMS_TCP_DISPATCH_R4_CR;
+		}
+	} else if (env->msg_type == PGRAC_IC_MSG_GCS_BLOCK_FORWARD) {
+		if (env->payload_length == sizeof(ClusterR4CrForwardPayload)) {
+			ClusterR4CrForwardPayload forward;
+
+			memcpy(&forward, payload, sizeof(forward));
+			if (forward.extension.r4_version == CLUSTER_R4_WIRE_VERSION) {
+				if (forward.extension.r4_kind == CLUSTER_R4_WIRE_CR_BUILD)
+					return CLXP_LMS_TCP_DISPATCH_R4_CR;
+				if (forward.extension.r4_kind == CLUSTER_R4_WIRE_TX_RESOLVE)
+					return CLXP_LMS_TCP_DISPATCH_R4_TX;
+			}
+		} else if (env->payload_length == sizeof(GcsBlockForwardPayload)) {
+			GcsBlockForwardPayload forward;
+
+			memcpy(&forward, payload, sizeof(forward));
+			/* Mirror the original handler's static demultiplexing only. */
+			if (GcsBlockForwardPayloadIsCurrentMxRuntime(&forward)
+				|| forward.reserved_0[6] == GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS
+				|| forward.transition_id < PCM_TRANS_N_TO_S
+				|| forward.transition_id > PCM_TRANS_S_TO_X_CLEANOUT)
+				return CLXP_NBUCKETS;
+			if (GcsBlockForwardPayloadIsCrRequest(&forward))
+				return CLXP_LMS_TCP_DISPATCH_R4_SOURCE_CR;
+			if (GcsBlockForwardPayloadIsUndoVerdictRequest(&forward)
+				|| GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(&forward))
+				return CLXP_LMS_TCP_DISPATCH_UNDO_VERDICT;
+			if (forward.reserved_0[6] == 0 && !GcsBlockForwardPayloadIsBastNudge(&forward))
+				return CLXP_LMS_TCP_DISPATCH_BLOCK;
+		}
+	}
+	return CLXP_NBUCKETS;
+}
+
 ClusterICDispatchResult
 cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, int32 peer_id)
+{
+	return cluster_ic_dispatch_envelope_profiled(env, payload, peer_id, NULL);
+}
+
+ClusterICDispatchResult
+cluster_ic_dispatch_envelope_profiled(const ClusterICEnvelope *env, const void *payload,
+									  int32 peer_id, ClusterXpScope *queue_scope)
 {
 	const ClusterICMsgTypeInfo *info;
 	MemoryContext old_ctx;
@@ -345,6 +410,10 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 	const ClusterICEnvelope *previous_data_envelope = data_dispatch_envelope;
 	ClusterICDispatchScope scope = { env, false };
 	ClusterICDispatchScope *previous_scope = dispatch_scope;
+
+	/* A retained frame keeps ownership, but never a disabled observation window. */
+	if (queue_scope != NULL && !cluster_xnode_profile_enabled)
+		queue_scope->active = false;
 
 	if (env == NULL)
 		return false;
@@ -448,6 +517,19 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 	{
 		dispatch_scope = &scope;
 		data_dispatch_envelope = (ClusterICPlane)info->plane == CLUSTER_IC_PLANE_DATA ? env : NULL;
+		if (queue_scope != NULL && queue_scope->active) {
+			ClusterXnodeBucket bucket = ic_queue_profile_bucket(env, payload);
+
+			if (bucket != CLXP_NBUCKETS) {
+				/* Only the two receive owners supply these start markers. */
+				if (queue_scope->bucket == CLXP_LMS_RDMA_QUEUE_BLOCK)
+					bucket = (ClusterXnodeBucket)(CLXP_LMS_RDMA_QUEUE_BLOCK
+												  + (bucket - CLXP_LMS_TCP_DISPATCH_BLOCK));
+				queue_scope->bucket = bucket;
+				cluster_xp_profile_end(queue_scope);
+			} else
+				queue_scope->active = false;
+		}
 		info->handler(env, payload);
 		data_dispatch_envelope = previous_data_envelope;
 		dispatch_scope = previous_scope;

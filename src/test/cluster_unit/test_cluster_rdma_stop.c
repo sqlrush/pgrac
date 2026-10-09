@@ -8,6 +8,7 @@
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_xnode_profile.h"
 #include "utils/memutils.h"
 
 /* Only select the extracted observer's real compile-time branch. No provider
@@ -31,6 +32,8 @@ static const char *RdmaUnavailableReason;
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+bool cluster_xnode_profile_enabled;
+ClusterXnodeProfileShared *ClusterXnodeProfileCtl;
 bool IsUnderPostmaster = true;
 AuxProcType MyAuxProcType = LmsProcess;
 MemoryContext TopMemoryContext, CurrentMemoryContext;
@@ -103,6 +106,17 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 	return result;
 }
 
+ClusterICDispatchResult
+cluster_ic_dispatch_envelope_profiled(const ClusterICEnvelope *env, const void *payload, int32 peer,
+									  ClusterXpScope *scope)
+{
+	ClusterICDispatchResult result = cluster_ic_dispatch_envelope(env, payload, peer);
+
+	if (result != CLUSTER_IC_DISPATCH_PENDING)
+		cluster_xp_profile_end(scope);
+	return result;
+}
+
 void
 cluster_ic_rdma_stats_note_error(int32 peer, const char *sqlstate, const char *reason)
 {}
@@ -121,17 +135,27 @@ UT_TEST(test_pending_dispatch_keeps_exact_queue_head_without_completion_event)
 		uint8 payload[4];
 	} frame = { 0 };
 	ClusterICRdmaInboundFrame *original;
+	ClusterXnodeProfileShared profile = { 0 };
+	instr_time arrival;
+
+	ClusterXnodeProfileCtl = &profile;
+	cluster_xnode_profile_enabled = true;
+	frame.env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REQUEST;
 
 	frame.env.payload_length = sizeof(frame.payload);
 	frame.payload[0] = 71;
 	rdma_inbound_enqueue(1, &frame, sizeof(frame));
 	original = RdmaInboundHead;
+	UT_ASSERT(original->queue_scope.active);
+	arrival = original->queue_scope.start;
 	dispatch_result = CLUSTER_IC_DISPATCH_PENDING;
 	rdma_dispatch_pending_frames();
 	UT_ASSERT_EQ(dispatch_calls, 0);
 	UT_ASSERT_EQ(peer_failures, 0);
 	UT_ASSERT(RdmaInboundHead == original && RdmaInboundTail == original);
 	UT_ASSERT_EQ(original->consumed, 0);
+	UT_ASSERT(original->queue_scope.active);
+	UT_ASSERT(memcmp(&arrival, &original->queue_scope.start, sizeof(arrival)) == 0);
 	UT_ASSERT_EQ(memcmp(original->data, &frame, sizeof(frame)), 0);
 	/* No new CQ event: the original loop's next pass retries the same head. */
 	dispatch_result = CLUSTER_IC_DISPATCH_DONE;
@@ -141,6 +165,9 @@ UT_TEST(test_pending_dispatch_keeps_exact_queue_head_without_completion_event)
 	UT_ASSERT(RdmaInboundHead == NULL && RdmaInboundTail == NULL);
 	rdma_dispatch_pending_frames();
 	UT_ASSERT_EQ(dispatch_calls, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&profile.bucket[CLXP_LMS_RDMA_QUEUE_BLOCK].n_events), 1);
+	cluster_xnode_profile_enabled = false;
+	ClusterXnodeProfileCtl = NULL;
 	/* A genuine peer rejection still closes/purges its queued frames. */
 	rdma_inbound_enqueue(1, &frame, sizeof(frame));
 	rdma_inbound_enqueue(1, &frame, sizeof(frame));

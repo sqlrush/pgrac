@@ -41,6 +41,7 @@
 #include "storage/shmem.h"
 
 ClusterXnodeProfileShared *ClusterXnodeProfileCtl = NULL;
+ClusterXpService cluster_xp_current_service = CLXP_SERVICE_NONE;
 
 /*
  * Dump key stems, one per bucket.  Keep in sync with ClusterXnodeBucket
@@ -85,6 +86,27 @@ static const char *const cluster_xp_bucket_names[CLXP_NBUCKETS] = {
 	[CLXP_BUFFER_LOCK] = "buffer_lock",
 	[CLXP_UNDO_RECEIPT_PREPARE] = "undo_receipt_prepare",
 	[CLXP_UNDO_VERDICT_RPC] = "undo_verdict_rpc",
+	[CLXP_PCM_EXECUTOR_WAIT] = "pcm_executor_wait",
+	[CLXP_PCM_LOCAL_COMPATIBLE_WAIT] = "pcm_local_compatible_wait",
+	[CLXP_PCM_BOOTSTRAP_WAIT] = "pcm_bootstrap_wait",
+	[CLXP_PCM_PREDECESSOR_WAIT] = "pcm_predecessor_wait",
+	[CLXP_PCM_TARGET_INSTALL_WAIT] = "pcm_target_install_wait",
+	[CLXP_LMS_TCP_DISPATCH_BLOCK] = "lms_tcp_dispatch_block",
+	[CLXP_LMS_TCP_DISPATCH_R4_CR] = "lms_tcp_dispatch_r4_cr",
+	[CLXP_LMS_TCP_DISPATCH_R4_TX] = "lms_tcp_dispatch_r4_tx",
+	[CLXP_LMS_TCP_DISPATCH_R4_SOURCE_CR] = "lms_tcp_dispatch_r4_source_cr",
+	[CLXP_LMS_TCP_DISPATCH_UNDO_VERDICT] = "lms_tcp_dispatch_undo_verdict",
+	[CLXP_UNDO_VERDICT_SERVICE] = "undo_verdict_service",
+	[CLXP_R4_TX_SERVICE] = "r4_tx_service",
+	[CLXP_UNDO_VERDICT_OPEN] = "undo_verdict_open",
+	[CLXP_UNDO_VERDICT_PREAD] = "undo_verdict_pread",
+	[CLXP_R4_TX_UNDO_OPEN] = "r4_tx_undo_open",
+	[CLXP_R4_TX_UNDO_PREAD] = "r4_tx_undo_pread",
+	[CLXP_LMS_RDMA_QUEUE_BLOCK] = "lms_rdma_queue_block",
+	[CLXP_LMS_RDMA_QUEUE_R4_CR] = "lms_rdma_queue_r4_cr",
+	[CLXP_LMS_RDMA_QUEUE_R4_TX] = "lms_rdma_queue_r4_tx",
+	[CLXP_LMS_RDMA_QUEUE_R4_SOURCE_CR] = "lms_rdma_queue_r4_source_cr",
+	[CLXP_LMS_RDMA_QUEUE_UNDO_VERDICT] = "lms_rdma_queue_undo_verdict",
 	[CLXP_IC_SEND_SERVICE] = "ic_send_service",
 	[CLXP_IC_INBOUND_DISPATCH] = "ic_inbound_dispatch",
 	[CLXP_LOCAL_UNDO_ITL_WAL] = "local_undo_itl_wal",

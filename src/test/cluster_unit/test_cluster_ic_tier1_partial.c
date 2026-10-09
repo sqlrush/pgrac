@@ -425,6 +425,17 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 	return CLUSTER_IC_DISPATCH_DONE;
 }
 
+ClusterICDispatchResult
+cluster_ic_dispatch_envelope_profiled(const ClusterICEnvelope *env, const void *payload,
+									  int32 peer_id, ClusterXpScope *scope)
+{
+	ClusterICDispatchResult result = cluster_ic_dispatch_envelope(env, payload, peer_id);
+
+	if (result != CLUSTER_IC_DISPATCH_PENDING)
+		cluster_xp_profile_end(scope);
+	return result;
+}
+
 ClusterICEnvelopeVerifyResult
 cluster_ic_envelope_accept_and_observe(const ClusterICEnvelope *env, const void *payload,
 									   uint32 payload_len, uint32 self_node_id, int32 peer_id)
@@ -991,9 +1002,18 @@ UT_TEST(test_pending_receive_retains_original_frame_until_next_pass)
 	fd_set rfds;
 	struct timeval tv = { 5, 0 };
 	uint64 before = ut_dispatch_count;
+	ClusterXnodeProfileShared profile = { 0 };
+	instr_time arrival;
+
+	ClusterICPlane saved_plane = tier1_my_plane;
+
+	/* Keep the connected socket and original receive owner. */
+	tier1_my_plane = CLUSTER_IC_PLANE_DATA;
+	ClusterXnodeProfileCtl = &profile;
+	cluster_xnode_profile_enabled = true;
 
 	memset(&frame, 0, sizeof(frame));
-	frame.env.msg_type = 44;
+	frame.env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REQUEST;
 	frame.env.source_node_id = UT_PEER_ID;
 	frame.env.dest_node_id = cluster_node_id;
 	frame.env.payload_length = sizeof(frame.bytes);
@@ -1009,12 +1029,21 @@ UT_TEST(test_pending_receive_retains_original_frame_until_next_pass)
 	UT_ASSERT_EQ(tier1_recv_payload_filled[UT_PEER_ID], sizeof(frame.bytes));
 	UT_ASSERT(memcmp(tier1_recv_payload_buf_dyn[UT_PEER_ID], frame.bytes, sizeof(frame.bytes))
 			  == 0);
+	UT_ASSERT(tier1_recv_queue_scope[UT_PEER_ID].active);
+	arrival = tier1_recv_queue_scope[UT_PEER_ID].start;
+	UT_ASSERT(cluster_ic_tier1_recv_heartbeat_drain(UT_PEER_ID, ut_tx_fd));
+	UT_ASSERT(memcmp(&arrival, &tier1_recv_queue_scope[UT_PEER_ID].start, sizeof(arrival)) == 0);
 	ut_dispatch_pending = false;
 	UT_ASSERT(cluster_ic_tier1_recv_heartbeat_drain(UT_PEER_ID, ut_tx_fd));
 	UT_ASSERT_EQ(ut_dispatch_count, before + 1);
 	UT_ASSERT_EQ(tier1_recv_buf_len[UT_PEER_ID], 0);
 	UT_ASSERT(cluster_ic_tier1_recv_heartbeat_drain(UT_PEER_ID, ut_tx_fd));
 	UT_ASSERT_EQ(ut_dispatch_count, before + 1);
+	UT_ASSERT(!tier1_recv_queue_scope[UT_PEER_ID].active);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&profile.bucket[CLXP_LMS_TCP_DISPATCH_BLOCK].n_events), 1);
+	cluster_xnode_profile_enabled = false;
+	ClusterXnodeProfileCtl = NULL;
+	tier1_my_plane = saved_plane;
 }
 
 UT_TEST(test_stream_reconnect_is_not_same_epoch_or_diagnostic_identity)

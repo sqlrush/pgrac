@@ -8608,6 +8608,30 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 		context->current_failure = failure;
 }
 
+/* Active work only: time between drain passes remains in the phase trace. */
+static void
+gcs_block_r4_tx_origin_step_profiled(GcsBlockR4TxOriginContext *context)
+{
+	ClusterXpScope scope = { 0 };
+	ClusterXpService previous = cluster_xp_current_service;
+
+	cluster_xp_current_service = CLXP_SERVICE_NONE;
+	if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_TX_RESOLVE && !context->undo_data_fetch) {
+		cluster_xp_current_service = CLXP_SERVICE_R4_TX;
+		cluster_xp_profile_begin(&scope, CLXP_R4_TX_SERVICE);
+	}
+	PG_TRY();
+	{
+		gcs_block_r4_tx_origin_step(context);
+	}
+	PG_FINALLY();
+	{
+		cluster_xp_current_service = previous;
+		cluster_xp_profile_end(&scope);
+	}
+	PG_END_TRY();
+}
+
 void
 cluster_gcs_block_r4_tx_resolve_drain(void)
 {
@@ -8650,7 +8674,10 @@ cluster_gcs_block_r4_tx_resolve_drain(void)
 
 			PG_TRY();
 			{
-				gcs_block_r4_tx_origin_step(context);
+				if (unlikely(cluster_xnode_profile_enabled))
+					gcs_block_r4_tx_origin_step_profiled(context);
+				else
+					gcs_block_r4_tx_origin_step(context);
 			}
 			PG_CATCH();
 			{

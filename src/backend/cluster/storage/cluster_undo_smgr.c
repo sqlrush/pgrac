@@ -32,6 +32,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_xnode_profile.h"
 #include "cluster/cluster_undo_recovery.h"
 
 #include <dirent.h>
@@ -77,6 +78,52 @@ static ClusterUndoPathIntent cached_fd_intent = CLUSTER_UNDO_PATH_RUNTIME_SHARED
 static int cached_fd = -1;
 static bool cached_fd_exit_registered = false;
 static uint64 provision_temp_counter = 0;
+
+static int
+undo_profile_open(const char *path, int flags)
+{
+	ClusterXpScope scope;
+	int result;
+
+	if (likely(!cluster_xnode_profile_enabled) || cluster_xp_current_service == CLXP_SERVICE_NONE)
+		return BasicOpenFile(path, flags);
+	cluster_xp_profile_begin(&scope, cluster_xp_current_service == CLXP_SERVICE_R4_TX
+										 ? CLXP_R4_TX_UNDO_OPEN
+										 : CLXP_UNDO_VERDICT_OPEN);
+	PG_TRY();
+	{
+		result = BasicOpenFile(path, flags);
+	}
+	PG_FINALLY();
+	{
+		cluster_xp_profile_end(&scope);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static ssize_t
+undo_profile_pread(int fd, void *buf, size_t count, off_t offset)
+{
+	ClusterXpScope scope;
+	ssize_t result;
+
+	if (likely(!cluster_xnode_profile_enabled) || cluster_xp_current_service == CLXP_SERVICE_NONE)
+		return pg_pread(fd, buf, count, offset);
+	cluster_xp_profile_begin(&scope, cluster_xp_current_service == CLXP_SERVICE_R4_TX
+										 ? CLXP_R4_TX_UNDO_PREAD
+										 : CLXP_UNDO_VERDICT_PREAD);
+	PG_TRY();
+	{
+		result = pg_pread(fd, buf, count, offset);
+	}
+	PG_FINALLY();
+	{
+		cluster_xp_profile_end(&scope);
+	}
+	PG_END_TRY();
+	return result;
+}
 
 static bool provision_fsync_parent(const char *final_path);
 static bool header_write_recorded(int fd, ClusterUndoPathIntent intent, uint32 segment_id,
@@ -223,7 +270,7 @@ get_segment_fd(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_inst
 	if (!resolved
 		&& cluster_undo_path_resolve(intent, owner_instance, segment_id, path, sizeof(path)) != 0)
 		return -1;
-	fd = BasicOpenFile(path, O_RDWR | PG_BINARY);
+	fd = undo_profile_open(path, O_RDWR | PG_BINARY);
 	if (fd < 0)
 		return -1;
 	cluster_undo_record_note_smgr_open();
@@ -431,7 +478,7 @@ cluster_undo_smgr_read_block(ClusterUndoPathIntent intent, uint32 segment_id, ui
 		return false;
 
 	offset = (off_t)block_no * BLCKSZ;
-	nread = pg_pread(fd, buf, BLCKSZ, offset);
+	nread = undo_profile_pread(fd, buf, BLCKSZ, offset);
 	cluster_undo_record_note_smgr_pread();
 	ok = (nread == BLCKSZ);
 	return ok;
@@ -498,7 +545,7 @@ cluster_undo_smgr_read_header_bytes(ClusterUndoPathIntent intent, uint32 segment
 	if (fd < 0)
 		return false;
 
-	nread = pg_pread(fd, buf, len, (off_t)offset);
+	nread = undo_profile_pread(fd, buf, len, (off_t)offset);
 	cluster_undo_record_note_smgr_pread();
 	return (nread == (ssize_t)len);
 }
@@ -601,7 +648,7 @@ cluster_undo_smgr_probe_segment(ClusterUndoPathIntent intent, uint32 segment_id,
 	if (block0 == NULL
 		|| cluster_undo_path_resolve(intent, owner_instance, segment_id, path, sizeof(path)) != 0)
 		return CLUSTER_UNDO_SMGR_FINAL_IO_ERROR;
-	fd = BasicOpenFile(path, O_RDONLY | PG_BINARY);
+	fd = undo_profile_open(path, O_RDONLY | PG_BINARY);
 	if (fd < 0)
 		return errno == ENOENT ? CLUSTER_UNDO_SMGR_FINAL_ABSENT : CLUSTER_UNDO_SMGR_FINAL_IO_ERROR;
 	if (fstat(fd, &st) != 0) {
@@ -615,7 +662,7 @@ cluster_undo_smgr_probe_segment(ClusterUndoPathIntent intent, uint32 segment_id,
 			return CLUSTER_UNDO_SMGR_FINAL_IO_ERROR;
 		return CLUSTER_UNDO_SMGR_FINAL_INVALID;
 	}
-	nread = pg_pread(fd, private_block.data, BLCKSZ, 0);
+	nread = undo_profile_pread(fd, private_block.data, BLCKSZ, 0);
 	cluster_undo_record_note_smgr_pread();
 	if (nread < 0) {
 		save_errno = errno;

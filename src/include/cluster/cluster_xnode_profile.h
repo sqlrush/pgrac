@@ -107,6 +107,29 @@ typedef enum ClusterXnodeBucket {
 	CLXP_BUFFER_LOCK,
 	CLXP_UNDO_RECEIPT_PREPARE,
 	CLXP_UNDO_VERDICT_RPC,
+	/* Optional wait / receiver measurements: append-only, profile GUC only. */
+	CLXP_PCM_EXECUTOR_WAIT,
+	CLXP_PCM_LOCAL_COMPATIBLE_WAIT,
+	CLXP_PCM_BOOTSTRAP_WAIT,
+	CLXP_PCM_PREDECESSOR_WAIT,
+	CLXP_PCM_TARGET_INSTALL_WAIT,
+	CLXP_LMS_TCP_DISPATCH_BLOCK,
+	CLXP_LMS_TCP_DISPATCH_R4_CR,
+	CLXP_LMS_TCP_DISPATCH_R4_TX,
+	CLXP_LMS_TCP_DISPATCH_R4_SOURCE_CR,
+	CLXP_LMS_TCP_DISPATCH_UNDO_VERDICT,
+	CLXP_UNDO_VERDICT_SERVICE,
+	CLXP_R4_TX_SERVICE,
+	CLXP_UNDO_VERDICT_OPEN,
+	CLXP_UNDO_VERDICT_PREAD,
+	CLXP_R4_TX_UNDO_OPEN,
+	CLXP_R4_TX_UNDO_PREAD,
+	/* RDMA enqueue residence is distinct from TCP application dispatch. */
+	CLXP_LMS_RDMA_QUEUE_BLOCK,
+	CLXP_LMS_RDMA_QUEUE_R4_CR,
+	CLXP_LMS_RDMA_QUEUE_R4_TX,
+	CLXP_LMS_RDMA_QUEUE_R4_SOURCE_CR,
+	CLXP_LMS_RDMA_QUEUE_UNDO_VERDICT,
 	CLXP_NBUCKETS
 } ClusterXnodeBucket;
 
@@ -244,6 +267,57 @@ extern const char *cluster_xp_hist_component_name(ClusterXpHistComponent c);
 /* Per-UPDATE diagnostic sink; no-op unless cluster.update_trace is enabled. */
 extern uint64 cluster_update_trace_phase_begin_at(int bucket, uint64 now);
 extern void cluster_update_trace_phase_end_at(uint64 token, uint64 now);
+
+/* These scopes are independent of update_trace. OFF never reads a clock,
+ * including an interval disabled before end. Instrumentation preserves errno
+ * for syscall callers and never creates a trace token or commit histogram. */
+#define CLUSTER_XP_PROFILE_ONLY_API 1
+static inline void
+cluster_xp_profile_begin(ClusterXpScope *s, ClusterXnodeBucket b)
+{
+	int saved_errno;
+
+	s->trace_token = 0;
+	s->active = false;
+	if (likely(!cluster_xnode_profile_enabled) || ClusterXnodeProfileCtl == NULL)
+		return;
+	saved_errno = errno;
+	s->bucket = b;
+	INSTR_TIME_SET_CURRENT(s->start);
+	s->active = true;
+	errno = saved_errno;
+}
+
+static inline void
+cluster_xp_profile_end(ClusterXpScope *s)
+{
+	instr_time now;
+	uint64 nanos;
+	int saved_errno;
+
+	if (!s->active)
+		return;
+	s->active = false;
+	if (!cluster_xnode_profile_enabled || ClusterXnodeProfileCtl == NULL)
+		return;
+	saved_errno = errno;
+	INSTR_TIME_SET_CURRENT(now);
+	INSTR_TIME_SUBTRACT(now, s->start);
+	nanos = (uint64)INSTR_TIME_GET_NANOSEC(now);
+	pg_atomic_fetch_add_u64(&ClusterXnodeProfileCtl->bucket[s->bucket].total_nanos, nanos);
+	pg_atomic_fetch_add_u64(&ClusterXnodeProfileCtl->bucket[s->bucket].n_events, 1);
+	errno = saved_errno;
+}
+
+/* Process-local I/O attribution exists only while a service step executes.
+ * Callers restore the previous value in PG_FINALLY, including nested service. */
+#define CLUSTER_XP_SERVICE_API 1
+typedef enum ClusterXpService {
+	CLXP_SERVICE_NONE,
+	CLXP_SERVICE_UNDO_VERDICT,
+	CLXP_SERVICE_R4_TX
+} ClusterXpService;
+extern PGDLLIMPORT ClusterXpService cluster_xp_current_service;
 
 /*
  * cluster_xp_begin / cluster_xp_end -- wrap a timed interval.

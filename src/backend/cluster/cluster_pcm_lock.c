@@ -42,6 +42,7 @@
 #include "cluster/cluster_pi_write.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_grd.h" /* PGRAC: spec-2.30 D1 — ClusterGrdHolderId 24B */
+#include "cluster/cluster_xnode_profile.h"
 #include "cluster/cluster_guc.h" /* PGRAC: spec-2.30 D3 — cluster_node_id */
 #include "cluster/cluster_gcs.h" /* PGRAC: spec-2.32 D5 — master lookup + send_transition_and_wait */
 #include "cluster/cluster_gcs_block.h" /* PGRAC: spec-2.33 D7 — send_block_request_and_wait */
@@ -5132,6 +5133,27 @@ cluster_pcm_lock_resource_x_executor_probe_exact(const ResourceXAcquisitionRef *
 	return result;
 }
 
+/* Measure only the original sleep call, including error/cancellation exits. */
+static void
+pcm_profile_compatible_wait(ConditionVariable *cv, long timeout_ms, ClusterXnodeBucket bucket)
+{
+	ClusterXpScope scope;
+
+	cluster_xp_profile_begin(&scope, bucket);
+	PG_TRY();
+	{
+		if (timeout_ms < 0)
+			ConditionVariableSleep(cv, WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+		else
+			(void)ConditionVariableTimedSleep(cv, timeout_ms, WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+	}
+	PG_FINALLY();
+	{
+		cluster_xp_profile_end(&scope);
+	}
+	PG_END_TRY();
+}
+
 /* Complete the wait armed by an exact BLOCKED probe.  The pinned
  * {tag,binding_generation} handle keeps this wait_cv alive; the complete
  * logical ref check prevents a successor acquisition from borrowing it. */
@@ -5175,8 +5197,11 @@ cluster_pcm_lock_resource_x_executor_wait_exact(const ResourceXAcquisitionRef *r
 
 	PG_TRY();
 	{
-		(void)ConditionVariableTimedSleep(&entry->wait_cv, timeout_ms,
-										  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+		if (unlikely(cluster_xnode_profile_enabled))
+			pcm_profile_compatible_wait(&entry->wait_cv, timeout_ms, CLXP_PCM_EXECUTOR_WAIT);
+		else
+			(void)ConditionVariableTimedSleep(&entry->wait_cv, timeout_ms,
+											  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
 		if (!pcm_entry_ref_identity_exact(&pcm_resource_x_executor_wait_context.ref)) {
 			pcm_resource_x_reconfig_block();
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
@@ -7705,7 +7730,10 @@ pcm_lock_acquire_local_pinned(BufferTag tag, PcmLockMode mode, PcmAuthoritySnaps
 			wait_context->cv_prepared = true;
 		}
 		LWLockRelease(&entry->entry_lock.lock);
-		ConditionVariableSleep(&entry->wait_cv, WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+		if (unlikely(cluster_xnode_profile_enabled))
+			pcm_profile_compatible_wait(&entry->wait_cv, -1, CLXP_PCM_LOCAL_COMPATIBLE_WAIT);
+		else
+			ConditionVariableSleep(&entry->wait_cv, WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
 		if (!pcm_entry_ref_identity_exact(&wait_context->ref)) {
 			pcm_resource_x_reconfig_block();
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
@@ -14524,8 +14552,11 @@ round_wait_predicate_done:
 
 	PG_TRY();
 	{
-		(void)ConditionVariableTimedSleep(&entry->wait_cv, timeout_ms,
-										  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+		if (unlikely(cluster_xnode_profile_enabled))
+			pcm_profile_compatible_wait(&entry->wait_cv, timeout_ms, CLXP_PCM_BOOTSTRAP_WAIT);
+		else
+			(void)ConditionVariableTimedSleep(&entry->wait_cv, timeout_ms,
+											  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
 		if (!pcm_entry_ref_identity_exact(&wait_context.ref)) {
 			pcm_resource_x_reconfig_block();
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
@@ -14672,8 +14703,11 @@ cluster_pcm_lock_resource_x_predecessor_wait_exact(const BufferTag *tag, int32 c
 	timeout_ms = (long)Min((uint64)LONG_MAX, remaining_us / UINT64_C(1000));
 	PG_TRY();
 	{
-		(void)ConditionVariableTimedSleep(&entry->wait_cv, timeout_ms,
-										  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+		if (unlikely(cluster_xnode_profile_enabled))
+			pcm_profile_compatible_wait(&entry->wait_cv, timeout_ms, CLXP_PCM_PREDECESSOR_WAIT);
+		else
+			(void)ConditionVariableTimedSleep(&entry->wait_cv, timeout_ms,
+											  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
 		if (!pcm_entry_ref_identity_exact(&wait_context.ref)) {
 			pcm_resource_x_reconfig_block();
 			ereport(ERROR,
@@ -15895,8 +15929,11 @@ cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
 
 	PG_TRY();
 	{
-		(void)ConditionVariableTimedSleep(&entry->wait_cv, sleep_ms,
-										  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+		if (unlikely(cluster_xnode_profile_enabled))
+			pcm_profile_compatible_wait(&entry->wait_cv, sleep_ms, CLXP_PCM_TARGET_INSTALL_WAIT);
+		else
+			(void)ConditionVariableTimedSleep(&entry->wait_cv, sleep_ms,
+											  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
 		if (!pcm_entry_ref_identity_exact(&wait_context.ref)) {
 			pcm_resource_x_reconfig_block();
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),

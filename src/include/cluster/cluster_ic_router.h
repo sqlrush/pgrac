@@ -269,6 +269,14 @@ extern bool cluster_ic_data_send_admission(bool *pending);
 /* Call only for the current frame, before mutation or ownership transfer. */
 extern void cluster_ic_dispatch_defer(const ClusterICEnvelope *env);
 
+/* Optional process-local receive measurement, never a wire field. The receive
+ * owner retains the first timestamp across PENDING, until handler entry. */
+#define CLUSTER_IC_PROFILE_QUEUE_API 1
+struct ClusterXpScope;
+extern ClusterICDispatchResult
+cluster_ic_dispatch_envelope_profiled(const ClusterICEnvelope *env, const void *payload,
+									  int32 peer_id, struct ClusterXpScope *queue_scope);
+
 extern ClusterICDispatchResult cluster_ic_dispatch_envelope(const ClusterICEnvelope *env,
 															const void *payload, int32 peer_id);
 

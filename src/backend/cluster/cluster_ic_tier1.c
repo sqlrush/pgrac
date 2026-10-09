@@ -82,6 +82,7 @@
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_xnode_profile.h"
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_lms.h"
@@ -291,6 +292,8 @@ tier1_note_peer_capabilities(int32 peer, uint32 capabilities)
  */
 static uint8 tier1_recv_buf[CLUSTER_MAX_NODES][PGRAC_IC_ENVELOPE_BYTES];
 static int tier1_recv_buf_len[CLUSTER_MAX_NODES];
+/* Full application-frame arrival; excludes kernel / partial-frame time. */
+static ClusterXpScope tier1_recv_queue_scope[CLUSTER_MAX_NODES];
 
 /*
  * Hardening v1.0.1 F1: per-peer HELLO send + recv buffers + state for
@@ -2928,6 +2931,7 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 									  "envelope payload_length %u exceeds 16 MB cap "
 									  "(msg_type=%u sender=%u)",
 									  plen, env_peek.msg_type, env_peek.source_node_id);
+					tier1_recv_queue_scope[peer_id].active = false;
 					tier1_recv_buf_len[peer_id] = 0;
 					return false;
 				}
@@ -2935,7 +2939,7 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 				if (plen == 0) {
 					/* No payload -- proceed directly to verify+dispatch
 					 * with NULL payload + payload_len=0 (HEARTBEAT path). */
-					goto verify_and_dispatch;
+					goto queue_and_dispatch;
 				}
 
 				/* Enter phase 1: lazy palloc payload buf in TopMemoryContext.
@@ -2998,7 +3002,19 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 				continue; /* partial payload, keep reading */
 
 			/* Full envelope + payload assembled.  Verify + dispatch. */
-			goto verify_and_dispatch;
+			goto queue_and_dispatch;
+		}
+
+	queue_and_dispatch:
+		tier1_recv_queue_scope[peer_id].active = false;
+		if (unlikely(cluster_xnode_profile_enabled) && tier1_my_plane == CLUSTER_IC_PLANE_DATA) {
+			ClusterICEnvelope queued;
+
+			memcpy(&queued, tier1_recv_buf[peer_id], sizeof(queued));
+			if (queued.msg_type == PGRAC_IC_MSG_GCS_BLOCK_REQUEST
+				|| queued.msg_type == PGRAC_IC_MSG_GCS_BLOCK_FORWARD)
+				cluster_xp_profile_begin(&tier1_recv_queue_scope[peer_id],
+										 CLXP_LMS_TCP_DISPATCH_BLOCK);
 		}
 
 	verify_and_dispatch: {
@@ -3047,6 +3063,7 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 				 */
 				if (Tier1Shmem != NULL && env.msg_type == PGRAC_IC_MSG_HEARTBEAT)
 					Tier1Shmem->peers[peer_id].last_heartbeat_recv_at = GetCurrentTimestamp();
+				tier1_recv_queue_scope[peer_id].active = false;
 				tier1_recv_buf_len[peer_id] = 0;
 				tier1_recv_phase[peer_id] = 0;
 				tier1_recv_payload_filled[peer_id] = 0;
@@ -3063,6 +3080,7 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 								  env.magic, env.version, env.msg_type, env.source_node_id,
 								  env.dest_node_id, env.payload_length, env.payload_crc32c,
 								  peer_id);
+				tier1_recv_queue_scope[peer_id].active = false;
 				tier1_recv_buf_len[peer_id] = 0;
 				tier1_recv_phase[peer_id] = 0;
 				tier1_recv_payload_filled[peer_id] = 0;
@@ -3086,7 +3104,10 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 			 */
 		{
 			ClusterICDispatchResult dispatched
-				= cluster_ic_dispatch_envelope(&env, payload, peer_id);
+				= tier1_recv_queue_scope[peer_id].active
+					  ? cluster_ic_dispatch_envelope_profiled(&env, payload, peer_id,
+															  &tier1_recv_queue_scope[peer_id])
+					  : cluster_ic_dispatch_envelope(&env, payload, peer_id);
 
 			if (dispatched == CLUSTER_IC_DISPATCH_PENDING)
 				return true; /* retain bytes; never report peer failure */
@@ -3094,6 +3115,7 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 				peer_record_error(peer_id, 0, "08P01",
 								  "envelope msg_type %u not registered (sender %u)", env.msg_type,
 								  env.source_node_id);
+				tier1_recv_queue_scope[peer_id].active = false;
 				tier1_recv_buf_len[peer_id] = 0;
 				tier1_recv_phase[peer_id] = 0;
 				tier1_recv_payload_filled[peer_id] = 0;
@@ -3111,6 +3133,7 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 		tier1_caps_reply_epoch_recheck(peer_id);
 
 		/* Reset phase state for next frame. */
+		tier1_recv_queue_scope[peer_id].active = false;
 		tier1_recv_buf_len[peer_id] = 0;
 		tier1_recv_phase[peer_id] = 0;
 		tier1_recv_payload_filled[peer_id] = 0;
@@ -3223,6 +3246,7 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 	 * Without this, reconnect after close inherits stale half-frame state
 	 * -> frame stream corruption guaranteed.
 	 */
+	tier1_recv_queue_scope[peer_id].active = false;
 	tier1_recv_buf_len[peer_id] = 0;
 	tier1_outbound_remaining[peer_id] = 0;
 	tier1_hello_send_remaining[peer_id] = 0;
