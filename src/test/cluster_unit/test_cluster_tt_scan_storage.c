@@ -597,18 +597,79 @@ UT_TEST(test_inventory_preserves_tt_results_and_output_identity)
 	scan_seed(129, SCAN_XID + 4, TT_SLOT_COMMITTED, SCAN_WRAP + 1, scn_encode(1, 99), false);
 	for (int consumer = SCAN_RESOLVE; consumer <= SCAN_LOCATE; consumer++) {
 		for (int i = 0; i < lengthof(cases); i++) {
+			bool zero_match = consumer == SCAN_RESOLVE
+								  ? cases[i].resolve == CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH
+								  : cases[i].locate == CLUSTER_TT_DURABLE_LOCATE_MISSING;
+
 			cluster_undo_inventory_attach(&scan_inventory, true);
 			for (int pass = 0; pass < 2; pass++) {
 				scan_reset_counts();
 				scan_expect(scan_query(consumer, 0, cases[i].xid, cases[i].wanted_wrap), consumer,
 							consumer == SCAN_RESOLVE ? cases[i].resolve : cases[i].locate,
 							cases[i].segment, cases[i].wrap, cases[i].status, cases[i].scn);
-				UT_ASSERT_EQ(scan_enoent_calls, pass == 0 ? CLUSTER_UNDO_SEGS_PER_INSTANCE - 6 : 0);
-				UT_ASSERT_EQ(scan_pread_calls, 6);
+				UT_ASSERT_EQ(scan_enoent_calls,
+							 pass == 0 || zero_match ? CLUSTER_UNDO_SEGS_PER_INSTANCE - 6 : 0);
+				UT_ASSERT_EQ(scan_pread_calls, pass > 0 && zero_match ? 12 : 6);
 			}
 		}
 	}
 	scan_finish_case();
+}
+
+UT_TEST(test_zero_match_rechecks_whole_range)
+{
+	for (int role = 0; role < lengthof(scan_roles); role++) {
+		for (int consumer = SCAN_RESOLVE; consumer <= SCAN_LOCATE; consumer++) {
+			if (!scan_begin_case(scan_roles[role]))
+				return;
+			scan_seed_three(0);
+			scan_expect_target(scan_query(consumer, 0, SCAN_XID, SCAN_WRAP), consumer, 0);
+			scan_reset_counts();
+			scan_expect(scan_query(consumer, 0, SCAN_XID + 99, SCAN_WRAP), consumer,
+						consumer == SCAN_RESOLVE ? CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH
+												 : CLUSTER_TT_DURABLE_LOCATE_MISSING,
+						0, 0, TT_SLOT_INVALID, InvalidScn);
+			UT_ASSERT_EQ(scan_enoent_calls, CLUSTER_UNDO_SEGS_PER_INSTANCE - 3);
+			UT_ASSERT_EQ(scan_pread_calls, 6);
+			UT_ASSERT_EQ(scan_calls, 1);
+			UT_ASSERT_EQ(scan_wait_starts, 2);
+			scan_finish_case();
+		}
+	}
+}
+
+UT_TEST(test_zero_match_recheck_observes_untracked_file_and_read_errors)
+{
+	for (int role = 0; role < lengthof(scan_roles); role++) {
+		for (int consumer = SCAN_RESOLVE; consumer <= SCAN_LOCATE; consumer++) {
+			for (int failure = 0; failure < 3; failure++) {
+				if (!scan_begin_case(scan_roles[role]))
+					return;
+				scan_seed_three(0);
+				scan_expect_target(scan_query(consumer, 0, SCAN_XID, SCAN_WRAP), consumer, 0);
+				/* Deliberately omit publication to test the zero-match fallback
+				 * independently of the inventory's publication completeness. */
+				scan_seed(2, SCAN_XID + 99, TT_SLOT_COMMITTED, SCAN_WRAP, scn_encode(1, 123),
+						  failure == 2);
+				if (failure == 1)
+					scan_eio_segment = 2;
+				scan_reset_counts();
+				scan_expect(scan_query(consumer, 0, SCAN_XID + 99, SCAN_WRAP), consumer,
+							consumer == SCAN_RESOLVE
+								? (failure ? CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE
+										   : CLUSTER_TT_DURABLE_RESOLVED_SCN)
+								: (failure ? CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE
+										   : CLUSTER_TT_DURABLE_LOCATE_FOUND),
+							2, SCAN_WRAP, TT_SLOT_COMMITTED, scn_encode(1, 123));
+				UT_ASSERT_EQ(scan_enoent_calls, CLUSTER_UNDO_SEGS_PER_INSTANCE - 4);
+				UT_ASSERT_EQ(scan_pread_calls, failure ? 8 : 7);
+				UT_ASSERT_EQ(scan_eio_calls, failure == 1 ? 2 : 0);
+				UT_ASSERT_EQ(scan_calls, 1);
+				UT_ASSERT_EQ(scan_wait_starts, 2);
+				scan_finish_case();
+			}
+		}
+	}
 }
 
 UT_TEST(test_mixed_missing_present_eio_short_file_never_completes)
@@ -737,11 +798,13 @@ UT_TEST(test_foreign_namespace_keeps_original_full_scan)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(10);
 	UT_RUN(test_lms_both_scans_reuse_real_inventory);
 	UT_RUN(test_worker_both_scans_reuse_real_inventory);
 	UT_RUN(test_backend_both_scans_reuse_real_inventory);
 	UT_RUN(test_inventory_preserves_tt_results_and_output_identity);
+	UT_RUN(test_zero_match_rechecks_whole_range);
+	UT_RUN(test_zero_match_recheck_observes_untracked_file_and_read_errors);
 	UT_RUN(test_mixed_missing_present_eio_short_file_never_completes);
 	UT_RUN(test_known_segment_failure_retries_whole_range_and_refuses);
 	UT_RUN(test_publication_during_limited_scan_cannot_hide_second_match);

@@ -2078,9 +2078,9 @@ cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node, TransactionId xid
 	 *
 	 * Distinguishing "segment absent" (sound skip) from "existing but unreadable"
 	 * (incomplete scan): cluster_undo_smgr_read_block returns false for both, so
-	 * on a miss we probe cluster_undo_segment_file_exists().  Cost is O(local
-	 * segments) as before; spec-3.13's xid index is the scan-cost optimization
-	 * (§6 R4), not a correctness change.
+	 * on a miss we probe cluster_undo_segment_file_exists().  A complete local
+	 * inventory limits reads to published segments.  A zero-match result still
+	 * requires the original whole-range scan.
 	 */
 	cluster_undo_inventory_snapshot(cluster_undo_recovery_intent_for_owner(owner), owner,
 									&inventory);
@@ -2142,11 +2142,11 @@ rescan:
 		}
 	}
 	cluster_tt_durable_io_wait_end();
-	if (!cluster_undo_inventory_finish(&inventory, seen, inventory_complete && scan_complete)
+	if ((!cluster_undo_inventory_finish(&inventory, seen, inventory_complete && scan_complete)
+		 || xid_matches == 0)
 		&& inventory.usable) {
-		/* A concurrent publication invalidates a limited scan.  Retry once
-		 * using the original whole range; never turn a stale subset into a
-		 * zero-match proof or wait for publication under a storage lock. */
+		/* Retry an invalidated or zero-match limited scan once using the
+		 * original whole range.  A subset miss is not a recycled-slot proof. */
 		inventory.usable = false;
 		inventory.tracked = false;
 		goto rescan;
@@ -2236,11 +2236,11 @@ rescan:
 		}
 	}
 	cluster_tt_durable_io_wait_end();
-	if (!cluster_undo_inventory_finish(&inventory, seen, inventory_complete && scan_complete)
+	if ((!cluster_undo_inventory_finish(&inventory, seen, inventory_complete && scan_complete)
+		 || matches == 0)
 		&& inventory.usable) {
-		/* A concurrent publication invalidates a limited scan.  Retry once
-		 * using the original whole range; never turn a stale subset into a
-		 * zero-match proof or wait for publication under a storage lock. */
+		/* Retry an invalidated or zero-match limited scan once using the
+		 * original whole range.  A subset miss is not an absence proof. */
 		inventory.usable = false;
 		inventory.tracked = false;
 		goto rescan;
