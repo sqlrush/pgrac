@@ -73,6 +73,7 @@ UT_DEFINE_GLOBALS();
 int cluster_node_id = 0;
 bool IsUnderPostmaster = false;
 BackendType MyBackendType = B_INVALID;
+int max_safe_fds = 192;
 
 bool
 AcquireExternalFD(void)

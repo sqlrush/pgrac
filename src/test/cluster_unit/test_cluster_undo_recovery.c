@@ -35,6 +35,7 @@ pg_re_throw(void)
 
 int cluster_node_id = 0;
 BackendType MyBackendType = B_BACKEND;
+int max_safe_fds = 192;
 bool cluster_enabled = true;
 bool cluster_undo_gcs_coherence = true;
 char *DataDir = "/recoverer/local";

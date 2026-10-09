@@ -53,6 +53,7 @@
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_tt_durable.h"
+#include "cluster/storage/cluster_undo_inventory.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_undo_cleaner.h" /* scan-pass stats (spec-3.13 D2-B) */
@@ -945,6 +946,25 @@ cluster_undo_smgr_read_block(ClusterUndoPathIntent intent pg_attribute_unused(),
  * skip) and the scan stays complete -- matching the legacy by-xid behavior.
  */
 static uint32 g_unreadable_existing_segment = 0;
+
+static bool g_inventory_usable;
+static bool g_inventory_stable = true;
+
+void
+cluster_undo_inventory_snapshot(ClusterUndoPathIntent intent, uint8 owner,
+								ClusterUndoInventorySnapshot *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->usable = out->tracked = g_inventory_usable;
+	out->published[0] = 1;
+}
+
+bool
+cluster_undo_inventory_finish(const ClusterUndoInventorySnapshot *snapshot,
+							  const uint64 seen[CLUSTER_UNDO_INVENTORY_WORDS], bool complete)
+{
+	return g_inventory_stable && complete;
+}
 
 bool
 cluster_undo_segment_file_exists(uint8 owner_instance pg_attribute_unused(), uint32 segment_id)
@@ -3195,6 +3215,59 @@ UT_TEST(test_locate_resamples_a_publication_crossing)
 	}
 }
 
+UT_TEST(test_complete_inventory_skips_unpublished_segments_in_both_scans)
+{
+	SCN got = InvalidScn;
+
+	cluster_node_id = 0;
+	g_read_block_ok = true;
+	g_canned_block_segment = 1;
+	g_unreadable_existing_segment = 0;
+	memset(g_canned_block, 0, sizeof(g_canned_block));
+	{
+		UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)g_canned_block;
+
+		((PageHeader)header)->pd_flags = PD_UNDO_SEG_HEADER;
+		((PageHeader)header)->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
+		header->segment_id = 1;
+		header->segment_size_bytes = UNDO_SEGMENT_SIZE_BYTES;
+		header->owner_instance = 1;
+		header->tt_slots_count = TT_SLOTS_PER_SEGMENT;
+		header->segment_state = SEGMENT_ACTIVE;
+	}
+	seed_block_slot(3, TT_SLOT_COMMITTED, 12345, scn_encode(1, 77));
+	g_inventory_usable = true;
+	g_read_block_calls = 0;
+	UT_ASSERT_EQ(cluster_tt_slot_durable_resolve_by_xid_origin(0, 12345, CLUSTER_TT_WRAP_ANY, &got,
+															   NULL, NULL, NULL),
+				 CLUSTER_TT_DURABLE_RESOLVED_SCN);
+	UT_ASSERT_EQ(g_read_block_calls, 1);
+	g_read_block_calls = 0;
+	UT_ASSERT_EQ(cluster_tt_slot_durable_locate_any_by_xid_origin(0, 12345, NULL, NULL, NULL, NULL),
+				 CLUSTER_TT_DURABLE_LOCATE_FOUND);
+	UT_ASSERT_EQ(g_read_block_calls, 1);
+	g_inventory_usable = false;
+}
+
+UT_TEST(test_inventory_changed_during_read_falls_back_to_full_scan)
+{
+	SCN got = InvalidScn;
+
+	g_inventory_usable = true;
+	g_inventory_stable = false;
+	g_read_block_calls = 0;
+	UT_ASSERT_EQ(cluster_tt_slot_durable_resolve_by_xid_origin(0, 12345, CLUSTER_TT_WRAP_ANY, &got,
+															   NULL, NULL, NULL),
+				 CLUSTER_TT_DURABLE_RESOLVED_SCN);
+	UT_ASSERT_EQ(g_read_block_calls, 1 + CLUSTER_UNDO_SEGS_PER_INSTANCE);
+	g_read_block_calls = 0;
+	UT_ASSERT_EQ(cluster_tt_slot_durable_locate_any_by_xid_origin(0, 12345, NULL, NULL, NULL, NULL),
+				 CLUSTER_TT_DURABLE_LOCATE_FOUND);
+	UT_ASSERT_EQ(g_read_block_calls, 1 + CLUSTER_UNDO_SEGS_PER_INSTANCE);
+	g_inventory_usable = false;
+	g_inventory_stable = true;
+}
+
 
 /* ============================================================
  *	U6: cluster_undo_segment_tt_header_scan_pass (spec-3.13 D2-B,
@@ -3623,7 +3696,7 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(110);
+	UT_PLAN(112);
 
 	UT_RUN(test_layout_sizes);
 
@@ -3711,6 +3784,8 @@ main(int argc, char **argv)
 	UT_RUN(test_locate_any_state_incomplete_scan_fails_closed);
 	UT_RUN(test_resolve_resamples_a_publication_crossing);
 	UT_RUN(test_locate_resamples_a_publication_crossing);
+	UT_RUN(test_complete_inventory_skips_unpublished_segments_in_both_scans);
+	UT_RUN(test_inventory_changed_during_read_falls_back_to_full_scan);
 
 	UT_RUN(test_scan_pass_classifies_inventory);
 	UT_RUN(test_scan_pass_writes_nothing);

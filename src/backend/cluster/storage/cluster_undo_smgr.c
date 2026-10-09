@@ -52,13 +52,159 @@
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_block0.h"
+#include "cluster/storage/cluster_undo_inventory.h"
+
+/* Kept in the original undo-record shared region, not process-local.  Only
+ * final-file publication changes membership.  No I/O is performed with this
+ * spinlock held, and a failed/unknown inventory always means a full scan. */
+static ClusterUndoInventory *undo_inventory;
+
+void
+cluster_undo_inventory_attach(ClusterUndoInventory *state, bool initialize)
+{
+	if (initialize && state != NULL) {
+		memset(state, 0, sizeof(*state));
+		SpinLockInit(&state->lock);
+	}
+	undo_inventory = state;
+}
+
+/* Bind this boot's inventory to one exact own-owner namespace.  A changed
+ * namespace disables the optimization; it cannot reuse an old absence proof. */
+static bool
+inventory_scope(ClusterUndoPathIntent intent, uint8 owner)
+{
+	char path[MAXPGPATH];
+	bool eligible;
+
+	if (undo_inventory == NULL || intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED || cluster_node_id < 0
+		|| cluster_node_id >= UNDO_OWNER_INSTANCE_MAX || owner != (uint8)(cluster_node_id + 1))
+		return false;
+	if (cluster_undo_path_resolve(intent, owner,
+								  (uint32)cluster_node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1,
+								  path, sizeof(path))
+		!= 0)
+		return false;
+	SpinLockAcquire(&undo_inventory->lock);
+	if (undo_inventory->owner == 0) {
+		undo_inventory->owner = owner;
+		strlcpy(undo_inventory->path, path, sizeof(undo_inventory->path));
+	} else if (undo_inventory->owner != owner || strcmp(undo_inventory->path, path) != 0) {
+		undo_inventory->disabled = true;
+		undo_inventory->complete = false;
+	}
+	eligible = !undo_inventory->disabled;
+	SpinLockRelease(&undo_inventory->lock);
+	return eligible;
+}
+
+void
+cluster_undo_inventory_snapshot(ClusterUndoPathIntent intent, uint8 owner,
+								ClusterUndoInventorySnapshot *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!inventory_scope(intent, owner))
+		return;
+	SpinLockAcquire(&undo_inventory->lock);
+	if (!undo_inventory->disabled && undo_inventory->publishers == 0) {
+		out->identity = undo_inventory;
+		out->serial = undo_inventory->serial;
+		memcpy(out->published, undo_inventory->published, sizeof(out->published));
+		out->tracked = true;
+		out->usable = undo_inventory->complete;
+	}
+	SpinLockRelease(&undo_inventory->lock);
+}
+
+bool
+cluster_undo_inventory_finish(const ClusterUndoInventorySnapshot *snapshot,
+							  const uint64 seen[CLUSTER_UNDO_INVENTORY_WORDS], bool complete)
+{
+	bool stable;
+
+	if (!snapshot->tracked || undo_inventory == NULL || snapshot->identity != undo_inventory)
+		return false;
+	SpinLockAcquire(&undo_inventory->lock);
+	stable = !undo_inventory->disabled && undo_inventory->publishers == 0
+			 && undo_inventory->serial == snapshot->serial;
+	if (stable) {
+		/* Never shrink the positive set, including after a read failure. */
+		for (int i = 0; i < CLUSTER_UNDO_INVENTORY_WORDS; i++)
+			if ((undo_inventory->published[i] & ~seen[i]) != 0)
+				complete = false;
+		if (complete)
+			for (int i = 0; i < CLUSTER_UNDO_INVENTORY_WORDS; i++)
+				undo_inventory->published[i] |= seen[i];
+		undo_inventory->complete = complete;
+	}
+	SpinLockRelease(&undo_inventory->lock);
+	return stable && complete;
+}
+
+bool
+cluster_undo_inventory_publish_begin(ClusterUndoPathIntent intent, uint8 owner)
+{
+	bool tracked = false;
+
+	if (!inventory_scope(intent, owner))
+		return false;
+	SpinLockAcquire(&undo_inventory->lock);
+	if (undo_inventory->serial == UINT64_MAX || undo_inventory->publishers == UINT32_MAX)
+		undo_inventory->disabled = true;
+	if (!undo_inventory->disabled) {
+		undo_inventory->serial++;
+		undo_inventory->publishers++;
+		tracked = true;
+	}
+	SpinLockRelease(&undo_inventory->lock);
+	return tracked;
+}
+
+void
+cluster_undo_inventory_publish_end(uint32 segment, bool success)
+{
+	uint32 slot;
+
+	Assert(undo_inventory != NULL);
+	SpinLockAcquire(&undo_inventory->lock);
+	Assert(undo_inventory->publishers > 0);
+	undo_inventory->publishers--;
+	if (undo_inventory->serial == UINT64_MAX)
+		undo_inventory->disabled = true;
+	else
+		undo_inventory->serial++;
+	if (segment == 0
+		|| (segment - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE != (uint32)(undo_inventory->owner - 1))
+		undo_inventory->disabled = true;
+	if (success && !undo_inventory->disabled) {
+		slot = (segment - 1) % CLUSTER_UNDO_SEGS_PER_INSTANCE;
+		undo_inventory->published[slot / 64] |= UINT64CONST(1) << (slot % 64);
+	} else
+		undo_inventory->complete = false;
+	SpinLockRelease(&undo_inventory->lock);
+}
+
+/* Redo/materialization need not participate in the runtime publisher cut.
+ * Before they can create an own-owner file, force the original full scan for
+ * the remainder of this shared-memory lifetime.  Foreign scopes never use
+ * the inventory in the first place. */
+void
+cluster_undo_inventory_disable(uint8 owner)
+{
+	if (undo_inventory == NULL || cluster_node_id < 0 || owner != (uint8)(cluster_node_id + 1))
+		return;
+	SpinLockAcquire(&undo_inventory->lock);
+	undo_inventory->disabled = true;
+	undo_inventory->complete = false;
+	SpinLockRelease(&undo_inventory->lock);
+}
 
 
 /*
  * P0 perf hardening (2026-05-31): per-backend undo segment fd cache.
  *
  *	The hot undo write path called open()+pread/pwrite()+close() per record
- *	(8.5 open + 8.5 close per TPC-B txn).  Cache ONE O_RDWR fd for the
+ *	(8.5 open + 8.5 close per TPC-B txn).  Ordinary backends cache one O_RDWR fd for the
  *	most-recently-used (segment, owner) — O_RDWR serves both read_block and
  *	write_block.  Self-heals on (segment, owner) mismatch (close old + open
  *	new).  Normal COMMIT preserves the cache; PREPARE/ABORT full teardown,
@@ -96,6 +242,7 @@ typedef struct UndoServiceFd {
 
 static UndoServiceFd service_fds[CLUSTER_UNDO_SEGS_PER_INSTANCE];
 static uint32 service_fd_clock;
+static int service_fd_count;
 
 static int
 undo_profile_open(const char *path, int flags)
@@ -247,6 +394,7 @@ service_fd_close(UndoServiceFd *entry)
 		int fd = entry->fd;
 
 		entry->valid = false;
+		service_fd_count--;
 		(void)close(fd);
 		cluster_undo_record_note_smgr_close();
 		ReleaseExternalFD();
@@ -287,12 +435,17 @@ service_fd_get(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_inst
 	char path[MAXPGPATH];
 	int fd;
 	bool evicted = false;
+	int capacity = Min(64, max_safe_fds / 6);
 
 	if ((MyBackendType != B_LMS && MyBackendType != B_LMS_WORKER)
 		|| intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED || cluster_node_id < 0
 		|| cluster_node_id >= UNDO_OWNER_INSTANCE_MAX
 		|| owner_instance != (uint8)(cluster_node_id + 1) || segment_id == 0
 		|| (segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE != (uint32)cluster_node_id)
+		return false;
+	/* Use at most half the external-FD budget, with a separate hard cap.
+	 * Wait-event sets and other process resources still need reservations. */
+	if (capacity <= 0)
 		return false;
 
 	entry = &service_fds[(segment_id - 1) % CLUSTER_UNDO_SEGS_PER_INSTANCE];
@@ -308,7 +461,7 @@ service_fd_get(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_inst
 
 	/* Register cleanup before acquiring a resource that an ERROR could leak. */
 	cluster_undo_smgr_ensure_exit_hook();
-	if (!AcquireExternalFD()) {
+	if (service_fd_count >= capacity || !AcquireExternalFD()) {
 		for (int i = 0; i < lengthof(service_fds); i++) {
 			UndoServiceFd *victim = &service_fds[service_fd_clock];
 
@@ -344,6 +497,7 @@ service_fd_get(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_inst
 	entry->segment_id = segment_id;
 	entry->owner = owner_instance;
 	entry->valid = true;
+	service_fd_count++;
 	*out_fd = fd;
 	return true;
 }
@@ -550,6 +704,7 @@ cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 instance,
 			!= 0
 		|| strcmp(path, checked) != 0)
 		return false;
+	cluster_undo_inventory_disable(instance);
 	fd = BasicOpenFile(path, flags);
 	if (fd < 0)
 		return false;
@@ -1110,10 +1265,9 @@ provision_fsync_parent(const char *final_path)
 }
 
 
-ClusterUndoSmgrPublishResult
-cluster_undo_smgr_provision_temp_publish(ClusterUndoPathIntent intent, uint32 segment_id,
-										 uint8 owner_instance, const char *temp_path,
-										 const char block0[BLCKSZ])
+static ClusterUndoSmgrPublishResult
+provision_temp_publish_impl(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_instance,
+							const char *temp_path, const char block0[BLCKSZ])
 {
 	char final_path[MAXPGPATH];
 	PGAlignedBlock observed;
@@ -1186,6 +1340,37 @@ cluster_undo_smgr_provision_temp_publish(ClusterUndoPathIntent intent, uint32 se
 	if (final_state == CLUSTER_UNDO_SMGR_FINAL_INVALID)
 		return CLUSTER_UNDO_SMGR_PUBLISH_INVALID;
 	return CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR;
+}
+
+
+ClusterUndoSmgrPublishResult
+cluster_undo_smgr_provision_temp_publish(ClusterUndoPathIntent intent, uint32 segment_id,
+										 uint8 owner_instance, const char *temp_path,
+										 const char block0[BLCKSZ])
+{
+	ClusterUndoSmgrPublishResult result = CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR;
+	bool tracked = cluster_undo_inventory_publish_begin(intent, owner_instance);
+	volatile bool readable = false;
+
+	PG_TRY();
+	{
+		PGAlignedBlock observed;
+
+		result = provision_temp_publish_impl(intent, segment_id, owner_instance, temp_path, block0);
+		if (tracked
+			&& (result == CLUSTER_UNDO_SMGR_PUBLISH_PUBLISHED
+				|| result == CLUSTER_UNDO_SMGR_PUBLISH_EXISTS))
+			readable
+				= cluster_undo_smgr_probe_segment(intent, segment_id, owner_instance, observed.data)
+				  == CLUSTER_UNDO_SMGR_FINAL_EXACT;
+	}
+	PG_FINALLY();
+	{
+		if (tracked)
+			cluster_undo_inventory_publish_end(segment_id, readable);
+	}
+	PG_END_TRY();
+	return result;
 }
 
 

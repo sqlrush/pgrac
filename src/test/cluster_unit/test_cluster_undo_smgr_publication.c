@@ -8,6 +8,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/storage/cluster_undo_inventory.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -49,6 +50,8 @@ ErrorContextCallback *error_context_stack = NULL;
 void
 pg_re_throw(void)
 {
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
 	abort();
 }
 void
@@ -58,6 +61,13 @@ before_shmem_exit(pg_on_exit_callback function, Datum arg)
 
 int MyProcPid = 4321;
 BackendType MyBackendType = B_BACKEND;
+int max_safe_fds = 192;
+
+int
+s_lock(volatile slock_t *lock, const char *file, int line, const char *func)
+{
+	abort();
+}
 pg_time_t MyStartTime = 0;
 TimestampTz MyStartTimestamp = INT64CONST(0x102030405060);
 int cluster_node_id = 0;
@@ -66,6 +76,8 @@ int pg_dir_create_mode = 0700;
 
 static char publication_dir[MAXPGPATH];
 static bool basic_open_forced_error = false;
+static bool basic_open_forced_throw = false;
+static bool inspect_publication_inflight = false;
 static int fsync_calls = 0;
 static int fsync_fail_on_call = 0;
 static bool pwrite_forced_error = false;
@@ -137,6 +149,8 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 int
 BasicOpenFile(const char *fileName, int fileFlags)
 {
+	if (basic_open_forced_throw)
+		pg_re_throw();
 	if (basic_open_forced_error) {
 		errno = EACCES;
 		return -1;
@@ -181,6 +195,12 @@ pg_fsync(int fd)
 static ssize_t
 test_product_pwrite(int fd, const void *buf, size_t nbytes, off_t offset)
 {
+	if (inspect_publication_inflight) {
+		ClusterUndoInventorySnapshot snapshot;
+
+		cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &snapshot);
+		UT_ASSERT(!snapshot.usable && !snapshot.tracked);
+	}
 	if (pwrite_forced_error) {
 		errno = EIO;
 		return -1;
@@ -1099,6 +1119,56 @@ UT_TEST(test_undo_lms_repeated_segment_reads_do_not_reopen)
 	remove_if_present(path2);
 }
 
+UT_TEST(test_inventory_tracks_only_readable_real_publication_and_cleans_errors)
+{
+	for (int failure = 0; failure < 4; failure++) {
+		ClusterUndoInventory state;
+		ClusterUndoInventorySnapshot snapshot;
+		uint64 seen[CLUSTER_UNDO_INVENTORY_WORDS] = { 0 };
+		char final[MAXPGPATH], temp[MAXPGPATH], page[BLCKSZ];
+		volatile bool caught = false;
+		volatile ClusterUndoSmgrPublishResult result = CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR;
+
+		resolve_final(final);
+		remove_if_present(final);
+		make_page(page, 0xa5);
+		cluster_undo_inventory_attach(&state, true);
+		cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &snapshot);
+		UT_ASSERT(cluster_undo_inventory_finish(&snapshot, seen, true));
+		UT_ASSERT(
+			cluster_undo_smgr_provision_temp_create(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1, temp));
+		pwrite_forced_error = failure == 1;
+		pread_forced_error = failure == 2;
+		basic_open_forced_throw = failure == 3;
+		inspect_publication_inflight = true;
+		PG_TRY();
+		{
+			result = cluster_undo_smgr_provision_temp_publish(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1,
+															  1, temp, page);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		inspect_publication_inflight = false;
+		basic_open_forced_throw = pread_forced_error = pwrite_forced_error = false;
+		UT_ASSERT_EQ(caught, failure == 3);
+		UT_ASSERT_EQ(state.publishers, 0);
+		cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &snapshot);
+		UT_ASSERT_EQ(snapshot.usable, failure == 0);
+		UT_ASSERT_EQ(state.published[0], failure == 0 ? 1 : 0);
+		if (failure == 0 || failure == 2)
+			UT_ASSERT_EQ(result, CLUSTER_UNDO_SMGR_PUBLISH_PUBLISHED);
+		else
+			UT_ASSERT_EQ(result, CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR);
+		cluster_undo_inventory_attach(NULL, false);
+		remove_if_present(temp);
+		remove_if_present(final);
+	}
+}
+
+
 int
 main(void)
 {
@@ -1106,7 +1176,8 @@ main(void)
 
 	UT_ASSERT_NOT_NULL(mkdtemp(template));
 	strlcpy(publication_dir, template, sizeof(publication_dir));
-	UT_PLAN(31);
+	UT_PLAN(32);
+	UT_RUN(test_inventory_tracks_only_readable_real_publication_and_cleans_errors);
 	UT_RUN(test_recovery_file_materializes_absent_without_publishing_header);
 	UT_RUN(test_recovery_file_short_tail_and_errors_are_distinct);
 	UT_RUN(test_recovery_file_requires_all_durability_barriers_and_preserves_bytes);

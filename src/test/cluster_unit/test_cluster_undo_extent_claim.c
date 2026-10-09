@@ -13,6 +13,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/storage/cluster_undo_inventory.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_undo_extent.h"
 #include "cluster/cluster_undo_record_api.h"

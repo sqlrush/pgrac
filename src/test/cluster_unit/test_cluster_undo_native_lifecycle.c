@@ -60,6 +60,13 @@ fixture_open(const char *path, int flags)
 	return 42;
 }
 
+/* This replay fixture has no live inventory; check the invalidation owner. */
+static void
+cluster_undo_inventory_disable(uint8 owner)
+{
+	UT_ASSERT_EQ(owner, 3);
+}
+
 static int
 fixture_extend(int fd, off_t size)
 {

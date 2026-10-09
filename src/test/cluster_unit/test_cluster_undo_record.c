@@ -34,6 +34,15 @@
 #define USE_PGRAC_CLUSTER 1
 
 #include "postgres.h"
+#include "cluster/storage/cluster_undo_inventory.h"
+
+/* This fixture supplies the storage boundary; its inventory stays unavailable. */
+void
+cluster_undo_inventory_attach(ClusterUndoInventory *state, bool initialize)
+{
+	if (initialize)
+		memset(state, 0, sizeof(*state));
+}
 
 #include <errno.h>
 #include <fcntl.h>

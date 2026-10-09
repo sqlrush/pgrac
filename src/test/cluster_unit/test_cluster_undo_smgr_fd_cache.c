@@ -17,6 +17,9 @@
  * IDENTIFICATION
  *    src/test/cluster_unit/test_cluster_undo_smgr_fd_cache.c
  *
+ * NOTES
+ *    Uses private temporary files; no database or cluster is started.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -30,6 +33,7 @@
 #include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/storage/cluster_undo_inventory.h"
 #include "common/file_perm.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
@@ -48,6 +52,7 @@ int MyProcPid = 4321;
 pg_time_t MyStartTime = 0;
 TimestampTz MyStartTimestamp = INT64CONST(0x102030405060);
 int cluster_node_id = 0;
+int max_safe_fds = 192;
 int pg_file_create_mode = 0600;
 int pg_dir_create_mode = 0700;
 ClusterXpService cluster_xp_current_service = CLXP_SERVICE_NONE;
@@ -77,6 +82,13 @@ static int external_released;
 static pg_on_exit_callback exit_callback;
 static Datum exit_arg;
 static int exit_registrations;
+
+int
+s_lock(volatile slock_t *lock, const char *file, int line, const char *func)
+{
+	/* Single-threaded interleaving fixture: a contended spinlock is a bug. */
+	abort();
+}
 
 void
 pg_re_throw(void)
@@ -308,6 +320,7 @@ begin_case(BackendType role)
 	force_open_throw = false;
 	recovery_admitted = true;
 	external_limit = 32;
+	max_safe_fds = 192;
 	external_used = external_high_water = external_acquired = external_released = 0;
 	MyBackendType = role;
 	cluster_node_id = 0;
@@ -427,7 +440,7 @@ UT_TEST(test_worker_own_runtime_reuses_two_descriptors)
 	exercise_two_local_segments(B_LMS_WORKER);
 }
 
-UT_TEST(test_full_local_segment_range_reopens_nothing_on_second_sweep)
+UT_TEST(test_full_local_segment_range_preserves_descriptor_headroom)
 {
 	const int nodes[] = { 0, UNDO_OWNER_INSTANCE_MAX - 1 };
 
@@ -439,20 +452,48 @@ UT_TEST(test_full_local_segment_range_reopens_nothing_on_second_sweep)
 			return;
 		cluster_node_id = nodes[n];
 		external_limit = CLUSTER_UNDO_SEGS_PER_INSTANCE;
+		max_safe_fds = 3 * external_limit;
 		for (uint32 i = 0; i < CLUSTER_UNDO_SEGS_PER_INSTANCE; i++)
 			seed_segment(CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner, first + i, (unsigned char)i);
 		for (int sweep = 0; sweep < 2; sweep++) {
 			for (uint32 i = 0; i < CLUSTER_UNDO_SEGS_PER_INSTANCE; i++)
 				expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner, first + i, (unsigned char)i,
 							sweep != 0);
-			UT_ASSERT_EQ(open_attempts, CLUSTER_UNDO_SEGS_PER_INSTANCE);
-			UT_ASSERT_EQ(successful_opens, CLUSTER_UNDO_SEGS_PER_INSTANCE);
+			UT_ASSERT_EQ(open_attempts, (sweep + 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE);
+			UT_ASSERT_EQ(successful_opens, (sweep + 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE);
 			UT_ASSERT_EQ(pread_calls, (sweep + 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE);
 		}
-		UT_ASSERT_EQ(external_used, CLUSTER_UNDO_SEGS_PER_INSTANCE);
-		UT_ASSERT_EQ(live_fds(), CLUSTER_UNDO_SEGS_PER_INSTANCE);
+		UT_ASSERT(external_high_water <= 64);
+		UT_ASSERT_EQ(live_fds(), external_used);
+		if (AcquireExternalFD())
+			ReleaseExternalFD();
+		else
+			UT_ASSERT(false);
 		finish_case();
 	}
+}
+
+UT_TEST(test_low_fd_budget_leaves_room_for_wait_event_sets)
+{
+	if (!begin_case(B_LMS))
+		return;
+	max_safe_fds = 48;
+	external_limit = max_safe_fds / 3;
+	/* Existing process resources and a later wait-event set share this budget. */
+	for (int i = 0; i < 4; i++)
+		UT_ASSERT(AcquireExternalFD());
+	for (uint32 segment = 1; segment <= 32; segment++) {
+		seed_segment(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment);
+		expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment, false);
+	}
+	UT_ASSERT(external_high_water <= 4 + max_safe_fds / 6);
+	if (AcquireExternalFD())
+		ReleaseExternalFD();
+	else
+		UT_ASSERT(false);
+	for (int i = 0; i < 4; i++)
+		ReleaseExternalFD();
+	finish_case();
 }
 
 UT_TEST(test_other_roles_owners_and_intents_keep_single_descriptor)
@@ -662,13 +703,134 @@ UT_TEST(test_registered_exit_callback_closes_pool_and_single_descriptor)
 	finish_case();
 }
 
+UT_TEST(test_inventory_requires_complete_unchanged_baseline_and_preserves_gaps)
+{
+	ClusterUndoInventory state;
+	ClusterUndoInventorySnapshot snapshot;
+	uint64 seen[CLUSTER_UNDO_INVENTORY_WORDS] = { UINT64CONST(0x8001), 0, 0, 0 };
+
+	if (!begin_case(B_LMS))
+		return;
+	cluster_undo_inventory_attach(&state, true);
+	cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &snapshot);
+	UT_ASSERT(snapshot.tracked && !snapshot.usable);
+	(void)cluster_undo_inventory_finish(&snapshot, seen, false);
+	cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &snapshot);
+	UT_ASSERT(!snapshot.usable);
+	UT_ASSERT(cluster_undo_inventory_finish(&snapshot, seen, true));
+	cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &snapshot);
+	UT_ASSERT(snapshot.usable);
+	UT_ASSERT_EQ(snapshot.published[0], UINT64CONST(0x8001));
+	/* A later incomplete observation must not remove a known published file. */
+	seen[0] = 1;
+	UT_ASSERT(!cluster_undo_inventory_finish(&snapshot, seen, true));
+	cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &snapshot);
+	UT_ASSERT_EQ(snapshot.published[0], UINT64CONST(0x8001));
+	UT_ASSERT(!snapshot.usable);
+	cluster_undo_inventory_attach(NULL, false);
+	finish_case();
+}
+
+UT_TEST(test_inventory_publication_is_invisible_until_readable_and_all_writers_finish)
+{
+	ClusterUndoInventory state;
+	ClusterUndoInventorySnapshot before, during, after;
+	uint64 seen[CLUSTER_UNDO_INVENTORY_WORDS] = { 1, 0, 0, 0 };
+
+	if (!begin_case(B_LMS))
+		return;
+	cluster_undo_inventory_attach(&state, true);
+	cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &before);
+	UT_ASSERT(cluster_undo_inventory_finish(&before, seen, true));
+	cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &before);
+	UT_ASSERT(cluster_undo_inventory_publish_begin(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1));
+	UT_ASSERT(cluster_undo_inventory_publish_begin(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1));
+	cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &during);
+	UT_ASSERT(!during.usable && !during.tracked);
+	UT_ASSERT_EQ(state.published[0], 1);
+	cluster_undo_inventory_publish_end(16, true);
+	cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &during);
+	UT_ASSERT(!during.usable);
+	cluster_undo_inventory_publish_end(256, true);
+	UT_ASSERT(!cluster_undo_inventory_finish(&before, seen, true));
+	cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &after);
+	UT_ASSERT(after.usable);
+	UT_ASSERT_EQ(after.published[0], UINT64CONST(0x8001));
+	UT_ASSERT_EQ(after.published[3], UINT64CONST(1) << 63);
+	cluster_undo_inventory_attach(NULL, false);
+	finish_case();
+}
+
+UT_TEST(test_inventory_failed_publication_recovery_and_wrong_scope_cannot_skip)
+{
+	ClusterUndoInventory state;
+	ClusterUndoInventorySnapshot snapshot;
+	uint64 seen[CLUSTER_UNDO_INVENTORY_WORDS] = { 1, 0, 0, 0 };
+
+	if (!begin_case(B_LMS))
+		return;
+	cluster_undo_inventory_attach(&state, true);
+	cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &snapshot);
+	UT_ASSERT(cluster_undo_inventory_finish(&snapshot, seen, true));
+	UT_ASSERT(cluster_undo_inventory_publish_begin(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1));
+	cluster_undo_inventory_publish_end(16, false);
+	cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &snapshot);
+	UT_ASSERT(!snapshot.usable);
+	UT_ASSERT_EQ(state.publishers, 0);
+	UT_ASSERT_EQ(state.published[0], 1);
+	UT_ASSERT(cluster_undo_inventory_finish(&snapshot, seen, true));
+	cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RECOVERY_SHARED, 1, &snapshot);
+	UT_ASSERT(!snapshot.tracked && !snapshot.usable);
+	cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 2, &snapshot);
+	UT_ASSERT(!snapshot.tracked && !snapshot.usable);
+	cluster_undo_inventory_disable(1);
+	cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &snapshot);
+	UT_ASSERT(!snapshot.tracked && !snapshot.usable);
+	UT_ASSERT(!cluster_undo_inventory_finish(&snapshot, seen, true));
+	cluster_undo_inventory_attach(&state, true);
+	cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &snapshot);
+	UT_ASSERT(snapshot.tracked && !snapshot.usable);
+	cluster_undo_inventory_attach(NULL, false);
+	finish_case();
+}
+
+UT_TEST(test_inventory_namespace_change_and_generation_exhaustion_fall_back)
+{
+	ClusterUndoInventory state;
+	ClusterUndoInventorySnapshot snapshot;
+	uint64 seen[CLUSTER_UNDO_INVENTORY_WORDS] = { 1, 0, 0, 0 };
+	char saved[MAXPGPATH];
+
+	if (!begin_case(B_LMS))
+		return;
+	cluster_undo_inventory_attach(&state, true);
+	cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &snapshot);
+	UT_ASSERT(cluster_undo_inventory_finish(&snapshot, seen, true));
+	strlcpy(saved, test_dir, sizeof(saved));
+	strlcpy(test_dir, "/other-root", sizeof(test_dir));
+	cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &snapshot);
+	UT_ASSERT(!snapshot.usable && !snapshot.tracked);
+	strlcpy(test_dir, saved, sizeof(test_dir));
+	cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &snapshot);
+	UT_ASSERT(!snapshot.usable && !snapshot.tracked);
+	cluster_undo_inventory_attach(&state, true);
+	state.serial = UINT64_MAX;
+	UT_ASSERT(!cluster_undo_inventory_publish_begin(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1));
+	cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &snapshot);
+	UT_ASSERT(!snapshot.usable && !snapshot.tracked);
+	cluster_undo_inventory_attach(NULL, false);
+	finish_case();
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(17);
 	UT_RUN(test_lms_own_runtime_reuses_two_descriptors);
 	UT_RUN(test_worker_own_runtime_reuses_two_descriptors);
-	UT_RUN(test_full_local_segment_range_reopens_nothing_on_second_sweep);
+	UT_RUN(test_full_local_segment_range_preserves_descriptor_headroom);
+	UT_RUN(test_low_fd_budget_leaves_room_for_wait_event_sets);
 	UT_RUN(test_other_roles_owners_and_intents_keep_single_descriptor);
 	UT_RUN(test_owner_and_intent_namespaces_never_share_file_bytes);
 	UT_RUN(test_recovery_cached_descriptor_never_retains_admission);
@@ -678,6 +840,10 @@ main(void)
 	UT_RUN(test_reset_closes_all_descriptors_and_reopens_replaced_path);
 	UT_RUN(test_external_fd_budget_refusal_preserves_reads_and_balances_cleanup);
 	UT_RUN(test_registered_exit_callback_closes_pool_and_single_descriptor);
+	UT_RUN(test_inventory_requires_complete_unchanged_baseline_and_preserves_gaps);
+	UT_RUN(test_inventory_publication_is_invisible_until_readable_and_all_writers_finish);
+	UT_RUN(test_inventory_failed_publication_recovery_and_wrong_scope_cannot_skip);
+	UT_RUN(test_inventory_namespace_change_and_generation_exhaustion_fall_back);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

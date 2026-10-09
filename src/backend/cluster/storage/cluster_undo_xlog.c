@@ -34,6 +34,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/storage/cluster_undo_inventory.h"
 #include "cluster/cluster_undo_recovery.h"
 
 #include <fcntl.h>
@@ -183,6 +184,7 @@ cluster_undo_redo_open_segment(uint8 instance, uint32 segment_id, const char *pa
 
 	(void)segment_id; /* path already encodes it; arg kept for symmetry */
 	ensure_undo_instance_subdir(instance);
+	cluster_undo_inventory_disable(instance);
 	fd = BasicOpenFile(path, O_CREAT | O_RDWR | PG_BINARY);
 	if (fd < 0)
 		return fd;
@@ -768,6 +770,7 @@ cluster_undo_redo_segment_init(const ClusterUndoDecoded *decoded, const uint8 *p
 	ensure_undo_instance_subdir(decoded->instance);
 
 	/* Step 2: open the segment file, creating if missing. */
+	cluster_undo_inventory_disable(decoded->instance);
 	fd = BasicOpenFile(path, O_CREAT | O_RDWR | PG_BINARY);
 	/* The standalone native-header fixture supplies a fixed valid fd. */
 	// cppcheck-suppress knownConditionTrueFalse
@@ -1400,6 +1403,7 @@ cluster_undo_redo_segment_reuse(const ClusterUndoDecoded *decoded, const uint8 *
 		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u", decoded->instance,
 							   decoded->segment_id)));
 	ensure_undo_instance_subdir(decoded->instance);
+	cluster_undo_inventory_disable(decoded->instance);
 	fd = BasicOpenFile(path, O_RDWR | O_CREAT | PG_BINARY);
 	/* The standalone native-header fixture supplies a fixed valid fd. */
 	// cppcheck-suppress knownConditionTrueFalse

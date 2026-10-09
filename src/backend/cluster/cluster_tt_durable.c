@@ -52,8 +52,9 @@
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_slot.h" /* TTSlot, TT_SLOT_COMMITTED, TT_SLOTS_PER_SEGMENT */
 #include "cluster/cluster_tt_status.h"
-#include "cluster/cluster_undo_segment.h"		/* UndoSegmentHeaderData */
-#include "cluster/cluster_undo_smgr.h"			/* header-bytes + block I/O */
+#include "cluster/cluster_undo_segment.h" /* UndoSegmentHeaderData */
+#include "cluster/cluster_undo_smgr.h"	  /* header-bytes + block I/O */
+#include "cluster/storage/cluster_undo_inventory.h"
 #include "cluster/storage/cluster_undo_alloc.h" /* CLUSTER_UNDO_SEGS_PER_INSTANCE */
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/storage/cluster_undo_xlog.h" /* cluster_undo_emit_tt_slot_commit */
@@ -1988,17 +1989,25 @@ cluster_tt_recovery_classify_revert(bool is_delete_record, bool record_xid_abort
  * before declaring the scan incomplete; never skip an existing unreadable
  * segment or treat the earlier absence as a terminal transaction proof. */
 static bool
-durable_scan_read_header(uint8 owner, uint32 segment_id, char block[BLCKSZ], bool *scan_complete)
+durable_scan_read_header(uint8 owner, uint32 segment_id, char block[BLCKSZ], bool *scan_complete,
+						 bool *inventory_complete)
 {
 	ClusterUndoPathIntent intent = cluster_undo_recovery_intent_for_owner(owner);
 
 	if (cluster_undo_smgr_read_block(intent, segment_id, owner, 0, block))
 		return true;
-	if (!cluster_undo_segment_file_exists(owner, segment_id))
+	errno = 0;
+	if (!cluster_undo_segment_file_exists(owner, segment_id)) {
+		/* Preserve the original verdict path, but do not certify an inventory
+		 * from an ambiguous existence probe (permission, path or I/O error). */
+		if (errno != ENOENT)
+			*inventory_complete = false;
 		return false;
+	}
 	if (cluster_undo_smgr_read_block(intent, segment_id, owner, 0, block))
 		return true;
 	*scan_complete = false;
+	*inventory_complete = false;
 	return false;
 }
 
@@ -2026,6 +2035,9 @@ cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node, TransactionId xid
 	int xid_matches = 0;
 	bool match_has_valid_scn = false;
 	bool scan_complete = true;
+	bool inventory_complete = true;
+	ClusterUndoInventorySnapshot inventory;
+	uint64 seen[CLUSTER_UNDO_INVENTORY_WORDS];
 	SCN found = InvalidScn;
 	/* spec-5.55 D1: identity of the resolved match (only meaningful on RESOLVED_SCN,
 	 * which the classifier guarantees is exactly one valid-scn match). */
@@ -2070,13 +2082,37 @@ cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node, TransactionId xid
 	 * segments) as before; spec-3.13's xid index is the scan-cost optimization
 	 * (§6 R4), not a correctness change.
 	 */
+	cluster_undo_inventory_snapshot(cluster_undo_recovery_intent_for_owner(owner), owner,
+									&inventory);
+rescan:
+	memset(seen, 0, sizeof(seen));
+	inventory_complete = true;
+	scan_complete = true;
+	xid_matches = 0;
+	match_has_valid_scn = false;
+	found = InvalidScn;
 	cluster_tt_durable_io_wait_start();
 	for (segment_id = seg_lo; segment_id <= seg_hi; segment_id++) {
 		UndoSegmentHeaderData *hdr;
 		uint16 i;
 
-		if (!durable_scan_read_header(owner, segment_id, blockbuf.data, &scan_complete))
+		uint32 offset = segment_id - seg_lo;
+		uint64 bit = UINT64CONST(1) << (offset % 64);
+		bool known = (inventory.published[offset / 64] & bit) != 0;
+
+		if (inventory.usable && !known)
 			continue;
+		if (!durable_scan_read_header(owner, segment_id, blockbuf.data, &scan_complete,
+									  &inventory_complete)) {
+			/* A positively known file disappearing is not a recycled TT proof. */
+			if (known)
+				scan_complete = false;
+			continue;
+		}
+		if (UndoSegmentHeader_identity_matches(blockbuf.data, segment_id, owner))
+			seen[offset / 64] |= bit;
+		else
+			inventory_complete = false;
 
 		hdr = (UndoSegmentHeaderData *)blockbuf.data;
 		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
@@ -2106,6 +2142,15 @@ cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node, TransactionId xid
 		}
 	}
 	cluster_tt_durable_io_wait_end();
+	if (!cluster_undo_inventory_finish(&inventory, seen, inventory_complete && scan_complete)
+		&& inventory.usable) {
+		/* A concurrent publication invalidates a limited scan.  Retry once
+		 * using the original whole range; never turn a stale subset into a
+		 * zero-match proof or wait for publication under a storage lock. */
+		inventory.usable = false;
+		inventory.tracked = false;
+		goto rescan;
+	}
 
 	result = cluster_tt_durable_classify(xid_matches, match_has_valid_scn, scan_complete);
 	if (result == CLUSTER_TT_DURABLE_RESOLVED_SCN) {
@@ -2132,6 +2177,9 @@ cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node, TransactionId 
 	PGAlignedBlock blockbuf;
 	uint32 matches = 0;
 	bool scan_complete = true;
+	bool inventory_complete = true;
+	ClusterUndoInventorySnapshot inventory;
+	uint64 seen[CLUSTER_UNDO_INVENTORY_WORDS];
 	uint16 matched_seg = 0;
 	uint16 matched_slot = 0;
 	uint16 matched_wrap = 0;
@@ -2143,13 +2191,35 @@ cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node, TransactionId 
 	seg_lo = (uint32)origin_node * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
 	seg_hi = seg_lo + CLUSTER_UNDO_SEGS_PER_INSTANCE - 1;
 	cluster_tt_durable_count_by_xid_scan();
+	cluster_undo_inventory_snapshot(cluster_undo_recovery_intent_for_owner(owner), owner,
+									&inventory);
+rescan:
+	memset(seen, 0, sizeof(seen));
+	inventory_complete = true;
+	scan_complete = true;
+	matches = 0;
 	cluster_tt_durable_io_wait_start();
 	for (segment_id = seg_lo; segment_id <= seg_hi; segment_id++) {
 		const UndoSegmentHeaderData *header;
 		uint16 i;
 
-		if (!durable_scan_read_header(owner, segment_id, blockbuf.data, &scan_complete))
+		uint32 offset = segment_id - seg_lo;
+		uint64 bit = UINT64CONST(1) << (offset % 64);
+		bool known = (inventory.published[offset / 64] & bit) != 0;
+
+		if (inventory.usable && !known)
 			continue;
+		if (!durable_scan_read_header(owner, segment_id, blockbuf.data, &scan_complete,
+									  &inventory_complete)) {
+			/* A positively known file disappearing is not a recycled TT proof. */
+			if (known)
+				scan_complete = false;
+			continue;
+		}
+		if (UndoSegmentHeader_identity_matches(blockbuf.data, segment_id, owner))
+			seen[offset / 64] |= bit;
+		else
+			inventory_complete = false;
 		header = (const UndoSegmentHeaderData *)blockbuf.data;
 		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
 			const TTSlot *slot = &header->tt_slots[i];
@@ -2166,6 +2236,15 @@ cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node, TransactionId 
 		}
 	}
 	cluster_tt_durable_io_wait_end();
+	if (!cluster_undo_inventory_finish(&inventory, seen, inventory_complete && scan_complete)
+		&& inventory.usable) {
+		/* A concurrent publication invalidates a limited scan.  Retry once
+		 * using the original whole range; never turn a stale subset into a
+		 * zero-match proof or wait for publication under a storage lock. */
+		inventory.usable = false;
+		inventory.tracked = false;
+		goto rescan;
+	}
 	if (matches > 1)
 		return CLUSTER_TT_DURABLE_LOCATE_AMBIGUOUS;
 	if (!scan_complete)
