@@ -101,6 +101,8 @@ static unsigned current_ref_reads, restart_ref_reads;
 static bool reject_current_ref;
 static unsigned shared_identity_locks, maintenance_identity_locks;
 static bool refuse_maintenance_lock;
+static bool maintenance_read_covered;
+static unsigned maintenance_cover_attempts;
 static uint64 next_token;
 static bool reserve_owner, writer_allowed, revoke_on_flush;
 static bool hw_held, fail_hw_lock, throw_reserve_flush;
@@ -718,6 +720,18 @@ ClusterLockBufferExclusiveRetryAware(Buffer buffer)
 	return true;
 }
 
+bool ClusterLockBufferShareIfCovered(Buffer buffer);
+
+bool
+ClusterLockBufferShareIfCovered(Buffer buffer)
+{
+	maintenance_cover_attempts++;
+	if (!maintenance_read_covered)
+		return false;
+	LockBuffer(buffer, BUFFER_LOCK_SHARE);
+	return true;
+}
+
 void
 ReleaseBuffer(Buffer buffer)
 {
@@ -1256,6 +1270,8 @@ reset(void)
 	MyBackendId = 1;
 	shared_identity_locks = maintenance_identity_locks = 0;
 	refuse_maintenance_lock = false;
+	maintenance_read_covered = false;
+	maintenance_cover_attempts = 0;
 	space_readbacks = 0;
 	readback_checksums = false;
 	readback_fail_block = readback_corrupt_block = -1;
@@ -1466,6 +1482,61 @@ UT_TEST(test_recovery_identity_uses_only_restart_namespace)
 	UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
 	UT_ASSERT_EQ(wal_calls, writes);
 	UT_ASSERT(!pinned && !locked);
+}
+
+UT_TEST(test_maintenance_identity_reuses_covered_read_without_writer)
+{
+	ClusterSpaceIdentity out;
+	PGAlignedBlock before[2];
+	unsigned writes, dirties;
+
+	reset();
+	UT_ASSERT(cluster_space_relation_create(locator));
+	memcpy(before, pages, sizeof(before));
+	writes = wal_calls;
+	dirties = dirty_calls;
+	MyBackendId = InvalidBackendId;
+	maintenance_read_covered = true;
+	refuse_maintenance_lock = true;
+	for (unsigned i = 0; i < 8; i++) {
+		UT_ASSERT(cluster_space_relation_read_maintenance_identity(locator, &out));
+		UT_ASSERT_EQ(out.state, CLUSTER_SPACE_IDENTITY_LIVE);
+		UT_ASSERT_EQ(out.incarnation[15], 0x45);
+		UT_ASSERT_EQ(pinned | locked, 0);
+	}
+	UT_ASSERT_EQ(maintenance_cover_attempts, 8);
+	UT_ASSERT_EQ(shared_identity_locks, 8);
+	UT_ASSERT_EQ(maintenance_identity_locks, 0);
+	UT_ASSERT_EQ(MyBackendId, InvalidBackendId);
+	UT_ASSERT_EQ(wal_calls, writes);
+	UT_ASSERT_EQ(dirty_calls, dirties);
+	UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+}
+
+UT_TEST(test_maintenance_covered_read_revalidates_identity_each_time)
+{
+	ClusterSpaceIdentity out, saved, tombstone;
+
+	reset();
+	UT_ASSERT(cluster_space_relation_create(locator));
+	maintenance_read_covered = true;
+	UT_ASSERT(cluster_space_relation_read_maintenance_identity(locator, &tombstone));
+	memset(&out, 0xa5, sizeof(out));
+	saved = out;
+	tombstone.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+	UT_ASSERT(cluster_space_identity_page_encode(&tombstone, 18, page.data, BLCKSZ));
+	UT_ASSERT(!cluster_space_relation_read_maintenance_identity(locator, &out));
+	UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+	tombstone.state = CLUSTER_SPACE_IDENTITY_LIVE;
+	tombstone.incarnation[15]++;
+	UT_ASSERT(cluster_space_identity_page_encode(&tombstone, 19, page.data, BLCKSZ));
+	UT_ASSERT(cluster_space_relation_read_maintenance_identity(locator, &out));
+	UT_ASSERT_EQ(out.incarnation[15], tombstone.incarnation[15]);
+	ref.claim.database_incarnation++;
+	UT_ASSERT(!cluster_space_relation_read_maintenance_identity(locator, &out));
+	UT_ASSERT_EQ(maintenance_identity_locks, 0);
+	UT_ASSERT_EQ(maintenance_cover_attempts, 4);
+	UT_ASSERT_EQ(pinned | locked, 0);
 }
 
 UT_TEST(test_maintenance_identity_uses_current_owner_without_backend_id)
@@ -3400,6 +3471,8 @@ main(void)
 	setvbuf(stdout, NULL, _IONBF, 0);
 	UT_PLAN(66);
 	UT_RUN(test_maintenance_identity_uses_current_owner_without_backend_id);
+	UT_RUN(test_maintenance_identity_reuses_covered_read_without_writer);
+	UT_RUN(test_maintenance_covered_read_revalidates_identity_each_time);
 	UT_RUN(test_maintenance_identity_retry_keeps_work_and_releases_pin);
 	UT_RUN(test_maintenance_identity_preserves_namespace_and_live_page_checks);
 	UT_RUN(test_native_drop_durable_finish_io_failure_keeps_original_owner);
