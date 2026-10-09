@@ -51,6 +51,7 @@
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
+#include "storage/spin.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 
@@ -74,6 +75,12 @@ int cluster_node_id = 0;
 bool IsUnderPostmaster = false;
 BackendType MyBackendType = B_INVALID;
 int max_safe_fds = 192;
+
+int
+s_lock(volatile slock_t *lock, const char *file, int line, const char *func)
+{
+	abort();
+}
 
 bool
 AcquireExternalFD(void)
