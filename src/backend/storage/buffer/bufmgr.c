@@ -2912,7 +2912,8 @@ cluster_bufmgr_resource_x_wait_retry(LWLock *content_lock, int32 buffer_id,
 			RESOURCE_X_APPLY_BAD_STATE, GetBufferDescriptor(buffer_id),
 			"Resource-X retry gate");
 	}
-	delay_ms = 2L << Min(wait_index, UINT32_C(4));
+	/* Measurement-only fixed backoff prototype; do not merge. */
+	delay_ms = 2L;
 	CHECK_FOR_INTERRUPTS();
 	(void) WaitLatch(MyLatch, WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, delay_ms,
 					 WAIT_EVENT_PCM_BLOCK_CONVERT_WAIT);
