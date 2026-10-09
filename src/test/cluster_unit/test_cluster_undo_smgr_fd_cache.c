@@ -823,10 +823,105 @@ UT_TEST(test_inventory_namespace_change_and_generation_exhaustion_fall_back)
 }
 
 
+UT_TEST(test_inventory_disable_counter_counts_each_transition_once)
+{
+	ClusterUndoInventory state;
+	ClusterUndoInventorySnapshot snapshot;
+	ClusterUndoInventoryStats stats;
+	char saved[MAXPGPATH];
+
+	if (!begin_case(B_LMS))
+		return;
+	strlcpy(saved, test_dir, sizeof(saved));
+	for (int reason = 0; reason < 6; reason++) {
+		cluster_undo_inventory_attach(&state, true);
+		cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &snapshot);
+		UT_ASSERT(cluster_undo_inventory_read_stats(&stats));
+		UT_ASSERT_EQ(stats.disable_count, 0);
+		/* A foreign recovery does not disable this node's inventory. */
+		cluster_undo_inventory_disable(2);
+		UT_ASSERT(cluster_undo_inventory_read_stats(&stats));
+		UT_ASSERT_EQ(stats.disable_count, 0);
+		switch (reason) {
+		case 0:
+			cluster_undo_inventory_disable(1);
+			break;
+		case 1:
+			strlcpy(test_dir, "/other-root", sizeof(test_dir));
+			cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &snapshot);
+			strlcpy(test_dir, saved, sizeof(test_dir));
+			break;
+		case 2:
+			state.serial = UINT64_MAX;
+			UT_ASSERT(!cluster_undo_inventory_publish_begin(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1));
+			break;
+		case 3:
+			state.publishers = UINT32_MAX;
+			UT_ASSERT(!cluster_undo_inventory_publish_begin(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1));
+			break;
+		case 4:
+			UT_ASSERT(cluster_undo_inventory_publish_begin(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1));
+			state.serial = UINT64_MAX;
+			/* Both exhausted serial and invalid segment must count only once. */
+			cluster_undo_inventory_publish_end(0, true);
+			break;
+		case 5:
+			UT_ASSERT(cluster_undo_inventory_publish_begin(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1));
+			cluster_undo_inventory_publish_end(CLUSTER_UNDO_SEGS_PER_INSTANCE + 1, true);
+			break;
+		}
+		cluster_undo_inventory_disable(1);
+		cluster_undo_inventory_disable(1);
+		UT_ASSERT(cluster_undo_inventory_read_stats(&stats));
+		UT_ASSERT_EQ(stats.disable_count, 1);
+		UT_ASSERT_EQ(stats.bitmap_hit_count, 0);
+		UT_ASSERT_EQ(stats.full_scan_count, 0);
+		UT_ASSERT(state.disabled);
+	}
+	cluster_undo_inventory_attach(NULL, false);
+	finish_case();
+}
+
+UT_TEST(test_inventory_stats_attach_preserves_counts_and_absence_is_explicit)
+{
+	ClusterUndoInventory state;
+	ClusterUndoInventoryStats stats;
+
+	cluster_undo_inventory_attach(NULL, false);
+	cluster_undo_inventory_count_scan(true);
+	cluster_undo_inventory_count_scan(false);
+	UT_ASSERT(!cluster_undo_inventory_read_stats(NULL));
+	memset(&stats, 0xff, sizeof(stats));
+	UT_ASSERT(!cluster_undo_inventory_read_stats(&stats));
+	UT_ASSERT_EQ(stats.bitmap_hit_count, 0);
+	UT_ASSERT_EQ(stats.full_scan_count, 0);
+	UT_ASSERT_EQ(stats.disable_count, 0);
+	cluster_undo_inventory_attach(&state, true);
+	cluster_undo_inventory_count_scan(true);
+	cluster_undo_inventory_count_scan(false);
+	cluster_undo_inventory_count_scan(false);
+	cluster_undo_inventory_attach(&state, false);
+	for (int read = 0; read < 2; read++) {
+		UT_ASSERT(cluster_undo_inventory_read_stats(&stats));
+		UT_ASSERT_EQ(stats.bitmap_hit_count, 1);
+		UT_ASSERT_EQ(stats.full_scan_count, 2);
+		UT_ASSERT_EQ(stats.disable_count, 0);
+		UT_ASSERT_EQ(state.serial, 0);
+		UT_ASSERT_EQ(state.publishers, 0);
+		UT_ASSERT(!state.complete && !state.disabled);
+	}
+	cluster_undo_inventory_attach(&state, true);
+	UT_ASSERT(cluster_undo_inventory_read_stats(&stats));
+	UT_ASSERT_EQ(stats.bitmap_hit_count, 0);
+	UT_ASSERT_EQ(stats.full_scan_count, 0);
+	UT_ASSERT_EQ(stats.disable_count, 0);
+	cluster_undo_inventory_attach(NULL, false);
+}
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(19);
 	UT_RUN(test_lms_own_runtime_reuses_two_descriptors);
 	UT_RUN(test_worker_own_runtime_reuses_two_descriptors);
 	UT_RUN(test_full_local_segment_range_preserves_descriptor_headroom);
@@ -844,6 +939,8 @@ main(void)
 	UT_RUN(test_inventory_publication_is_invisible_until_readable_and_all_writers_finish);
 	UT_RUN(test_inventory_failed_publication_recovery_and_wrong_scope_cannot_skip);
 	UT_RUN(test_inventory_namespace_change_and_generation_exhaustion_fall_back);
+	UT_RUN(test_inventory_disable_counter_counts_each_transition_once);
+	UT_RUN(test_inventory_stats_attach_preserves_counts_and_absence_is_explicit);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

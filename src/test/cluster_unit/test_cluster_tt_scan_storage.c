@@ -795,10 +795,59 @@ UT_TEST(test_foreign_namespace_keeps_original_full_scan)
 	}
 }
 
+static void
+scan_expect_inventory_counts(uint64 bitmap, uint64 full, uint64 disabled)
+{
+	ClusterUndoInventoryStats stats;
+
+	UT_ASSERT(cluster_undo_inventory_read_stats(&stats));
+	UT_ASSERT_EQ(stats.bitmap_hit_count, bitmap);
+	UT_ASSERT_EQ(stats.full_scan_count, full);
+	UT_ASSERT_EQ(stats.disable_count, disabled);
+}
+
+UT_TEST(test_inventory_counts_actual_passes_through_both_consumers)
+{
+	for (int role = 0; role < lengthof(scan_roles); role++) {
+		for (int consumer = SCAN_RESOLVE; consumer <= SCAN_LOCATE; consumer++) {
+			if (!scan_begin_case(scan_roles[role]))
+				return;
+			scan_seed_three(0);
+			scan_expect_inventory_counts(0, 0, 0);
+			scan_expect_target(scan_query(consumer, 0, SCAN_XID, SCAN_WRAP), consumer, 0);
+			scan_expect_inventory_counts(0, 1, 0);
+			scan_expect_target(scan_query(consumer, 0, SCAN_XID, SCAN_WRAP), consumer, 0);
+			scan_expect_inventory_counts(1, 1, 0);
+
+			/* A zero-match retry is one limited pass and one full pass. */
+			scan_expect(scan_query(consumer, 0, SCAN_XID + 100, SCAN_WRAP), consumer,
+						consumer == SCAN_RESOLVE ? CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH
+												 : CLUSTER_TT_DURABLE_LOCATE_MISSING,
+						0, 0, TT_SLOT_INVALID, InvalidScn);
+			scan_expect_inventory_counts(2, 2, 0);
+
+			/* Failed reads count the attempted passes, never a successful verdict. */
+			scan_eio_segment = 64;
+			scan_expect(scan_query(consumer, 0, SCAN_XID, SCAN_WRAP), consumer,
+						consumer == SCAN_RESOLVE ? CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE
+												 : CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE,
+						0, 0, TT_SLOT_INVALID, InvalidScn);
+			scan_expect_inventory_counts(3, 3, 0);
+			scan_eio_segment = 0;
+			cluster_undo_inventory_disable(1);
+			cluster_undo_inventory_disable(1);
+			scan_expect_inventory_counts(3, 3, 1);
+			scan_expect_target(scan_query(consumer, 0, SCAN_XID, SCAN_WRAP), consumer, 0);
+			scan_expect_inventory_counts(3, 4, 1);
+			scan_finish_case();
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_lms_both_scans_reuse_real_inventory);
 	UT_RUN(test_worker_both_scans_reuse_real_inventory);
 	UT_RUN(test_backend_both_scans_reuse_real_inventory);
@@ -809,6 +858,7 @@ main(void)
 	UT_RUN(test_known_segment_failure_retries_whole_range_and_refuses);
 	UT_RUN(test_publication_during_limited_scan_cannot_hide_second_match);
 	UT_RUN(test_foreign_namespace_keeps_original_full_scan);
+	UT_RUN(test_inventory_counts_actual_passes_through_both_consumers);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

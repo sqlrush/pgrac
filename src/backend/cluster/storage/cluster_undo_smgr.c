@@ -60,13 +60,51 @@
 static ClusterUndoInventory *undo_inventory;
 
 void
+cluster_undo_inventory_count_scan(bool bitmap)
+{
+	if (undo_inventory == NULL)
+		return;
+	if (bitmap)
+		pg_atomic_fetch_add_u64(&undo_inventory->bitmap_hit_count, 1);
+	else
+		pg_atomic_fetch_add_u64(&undo_inventory->full_scan_count, 1);
+}
+
+bool
+cluster_undo_inventory_read_stats(ClusterUndoInventoryStats *out)
+{
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (undo_inventory == NULL)
+		return false;
+	out->bitmap_hit_count = pg_atomic_read_u64(&undo_inventory->bitmap_hit_count);
+	out->full_scan_count = pg_atomic_read_u64(&undo_inventory->full_scan_count);
+	out->disable_count = pg_atomic_read_u64(&undo_inventory->disable_count);
+	return true;
+}
+
+void
 cluster_undo_inventory_attach(ClusterUndoInventory *state, bool initialize)
 {
 	if (initialize && state != NULL) {
 		memset(state, 0, sizeof(*state));
 		SpinLockInit(&state->lock);
+		pg_atomic_init_u64(&state->bitmap_hit_count, 0);
+		pg_atomic_init_u64(&state->full_scan_count, 0);
+		pg_atomic_init_u64(&state->disable_count, 0);
 	}
 	undo_inventory = state;
+}
+
+/* Caller holds the original inventory lock; repeated disable is not an event. */
+static void
+inventory_disable_locked(void)
+{
+	if (!undo_inventory->disabled) {
+		undo_inventory->disabled = true;
+		pg_atomic_fetch_add_u64(&undo_inventory->disable_count, 1);
+	}
 }
 
 /* Bind this boot's inventory to one exact own-owner namespace.  A changed
@@ -90,7 +128,7 @@ inventory_scope(ClusterUndoPathIntent intent, uint8 owner)
 		undo_inventory->owner = owner;
 		strlcpy(undo_inventory->path, path, sizeof(undo_inventory->path));
 	} else if (undo_inventory->owner != owner || strcmp(undo_inventory->path, path) != 0) {
-		undo_inventory->disabled = true;
+		inventory_disable_locked();
 		undo_inventory->complete = false;
 	}
 	eligible = !undo_inventory->disabled;
@@ -150,7 +188,7 @@ cluster_undo_inventory_publish_begin(ClusterUndoPathIntent intent, uint8 owner)
 		return false;
 	SpinLockAcquire(&undo_inventory->lock);
 	if (undo_inventory->serial == UINT64_MAX || undo_inventory->publishers == UINT32_MAX)
-		undo_inventory->disabled = true;
+		inventory_disable_locked();
 	if (!undo_inventory->disabled) {
 		undo_inventory->serial++;
 		undo_inventory->publishers++;
@@ -170,12 +208,12 @@ cluster_undo_inventory_publish_end(uint32 segment, bool success)
 	Assert(undo_inventory->publishers > 0);
 	undo_inventory->publishers--;
 	if (undo_inventory->serial == UINT64_MAX)
-		undo_inventory->disabled = true;
+		inventory_disable_locked();
 	else
 		undo_inventory->serial++;
 	if (segment == 0
 		|| (segment - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE != (uint32)(undo_inventory->owner - 1))
-		undo_inventory->disabled = true;
+		inventory_disable_locked();
 	if (success && !undo_inventory->disabled) {
 		slot = (segment - 1) % CLUSTER_UNDO_SEGS_PER_INSTANCE;
 		undo_inventory->published[slot / 64] |= UINT64CONST(1) << (slot % 64);
@@ -194,7 +232,7 @@ cluster_undo_inventory_disable(uint8 owner)
 	if (undo_inventory == NULL || cluster_node_id < 0 || owner != (uint8)(cluster_node_id + 1))
 		return;
 	SpinLockAcquire(&undo_inventory->lock);
-	undo_inventory->disabled = true;
+	inventory_disable_locked();
 	undo_inventory->complete = false;
 	SpinLockRelease(&undo_inventory->lock);
 }

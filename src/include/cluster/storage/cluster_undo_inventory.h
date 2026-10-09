@@ -22,6 +22,7 @@
 
 #include "cluster/cluster_undo_gcs.h"
 #include "cluster/storage/cluster_undo_alloc.h"
+#include "port/atomics.h"
 #include "storage/spin.h"
 
 #define CLUSTER_UNDO_INVENTORY_WORDS (CLUSTER_UNDO_SEGS_PER_INSTANCE / 64)
@@ -35,6 +36,9 @@ typedef struct ClusterUndoInventory {
 	bool disabled;
 	uint8 owner;
 	char path[MAXPGPATH];
+	pg_atomic_uint64 bitmap_hit_count;
+	pg_atomic_uint64 full_scan_count;
+	pg_atomic_uint64 disable_count;
 } ClusterUndoInventory;
 
 typedef struct ClusterUndoInventorySnapshot {
@@ -44,6 +48,19 @@ typedef struct ClusterUndoInventorySnapshot {
 	bool tracked;
 	bool usable;
 } ClusterUndoInventorySnapshot;
+
+/* Cumulative per-node scan passes, not transaction matches or verdicts.
+ * Full scans include cold/disabled/foreign scans and limited-scan retries.
+ * Disable counts false-to-true transitions, once per shared-memory lifetime. */
+typedef struct ClusterUndoInventoryStats {
+	uint64 bitmap_hit_count;
+	uint64 full_scan_count;
+	uint64 disable_count;
+} ClusterUndoInventoryStats;
+
+extern void cluster_undo_inventory_count_scan(bool bitmap);
+/* Each field is sampled independently.  False means no shared inventory. */
+extern bool cluster_undo_inventory_read_stats(ClusterUndoInventoryStats *out);
 
 extern void cluster_undo_inventory_attach(ClusterUndoInventory *state, bool initialize);
 extern void cluster_undo_inventory_snapshot(ClusterUndoPathIntent intent, uint8 owner,

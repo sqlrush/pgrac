@@ -150,6 +150,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_buffer_desc.h" /* BufferType / PcmState enums (stage 1.6) */
 #include "cluster/cluster_pcm_lock.h"	 /* PCM state-machine API + grd helpers */
 #include "cluster/storage/cluster_undo_block0_current.h"
+#include "cluster/storage/cluster_undo_inventory.h"
 #include "cluster/cluster_semantic_activation.h" /* R4 writer-path snapshot */
 #include "cluster/cluster_resource_x_identity.h" /* Resource-X proof readiness */
 #include "cluster/cluster_gcs.h"				 /* GCS request protocol surface (spec-2.32 D8) */
@@ -3162,6 +3163,8 @@ dump_undo(ReturnSetInfo *rsinfo)
 			"ready_retry_preserved_count" };
 	uint64 receipt_values[CLUSTER_UNDO_RECEIPT_METRIC_COUNT];
 	bool receipt_available = cluster_undo_record_receipt_stats_snapshot(receipt_values);
+	ClusterUndoInventoryStats inventory_stats;
+	bool inventory_available = cluster_undo_inventory_read_stats(&inventory_stats);
 	int receipt_metric;
 
 	StaticAssertStmt(lengthof(receipt_keys) == CLUSTER_UNDO_RECEIPT_METRIC_COUNT,
@@ -3247,6 +3250,12 @@ dump_undo(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_tt_durable_by_xid_scan_count()));
 	emit_row(rsinfo, "undo", "tt_durable_redo_apply_count",
 			 fmt_int64((int64)cluster_tt_durable_redo_apply_count()));
+	emit_row(rsinfo, "undo", "tt_inventory_hit_count",
+			 inventory_available ? fmt_uint64(inventory_stats.bitmap_hit_count) : "unavailable");
+	emit_row(rsinfo, "undo", "tt_inventory_full_scan_count",
+			 inventory_available ? fmt_uint64(inventory_stats.full_scan_count) : "unavailable");
+	emit_row(rsinfo, "undo", "tt_inventory_disabled_count",
+			 inventory_available ? fmt_uint64(inventory_stats.disable_count) : "unavailable");
 
 	/* spec-3.12 D5: own-instance retention horizon observability. */
 	emit_row(rsinfo, "undo", "retention_horizon_scn",

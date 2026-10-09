@@ -48,6 +48,7 @@
 #include "cluster/cluster_debug.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
+#include "cluster/storage/cluster_undo_inventory.h"
 #include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_grd.h" /* ClusterGrdRecoveryCounters */
@@ -2833,6 +2834,20 @@ cluster_tt_durable_redo_apply_count(void)
 {
 	return 0;
 }
+
+static bool inventory_stats_available;
+
+bool
+cluster_undo_inventory_read_stats(ClusterUndoInventoryStats *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!inventory_stats_available)
+		return false;
+	out->bitmap_hit_count = 11;
+	out->full_scan_count = 12;
+	out->disable_count = 13;
+	return true;
+}
 /* spec-6.2: terminal authority counters share the durable-TT stat region in
  * the backend; this standalone dump unit stubs the accessors. */
 uint64
@@ -5487,6 +5502,34 @@ UT_TEST(test_debug_dump_exposes_receipt_lifetime_and_cancel_before_counters)
 	}
 }
 
+UT_TEST(test_debug_dump_exposes_inventory_counts_without_fake_zero)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	static const char *const keys[] = { "tt_inventory_hit_count", "tt_inventory_full_scan_count",
+										"tt_inventory_disabled_count" };
+
+	for (int available = 0; available < 2; available++) {
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = 0;
+		captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		inventory_stats_available = available != 0;
+		(void)cluster_dump_state(fcinfo);
+		for (int i = 0; i < lengthof(keys); i++) {
+			char expected[32];
+
+			snprintf(expected, sizeof(expected), "%d", 11 + i);
+			UT_ASSERT_EQ(captured_dump_count("undo", keys[i]), 1);
+			if (captured_dump_count("undo", keys[i]) == 1)
+				UT_ASSERT_STR_EQ(captured_dump_value("undo", keys[i]),
+								 available ? expected : "unavailable");
+		}
+	}
+	inventory_stats_available = false;
+}
+
 UT_TEST(test_debug_dump_exposes_tt_and_itl_reason_counters_without_fake_zero)
 {
 	LOCAL_FCINFO(fcinfo, 0);
@@ -6123,7 +6166,7 @@ UT_TEST(test_debug_phase_symbol_present)
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(23);
 	UT_RUN(test_debug_dump_normal_completion_never_fabricates_unready_proof);
 	UT_RUN(test_debug_dump_srf_linkable);
 	UT_RUN(test_debug_dump_omits_retired_legacy_pcm_x_compatibility_keys);
@@ -6134,6 +6177,7 @@ main(void)
 	UT_RUN(test_debug_dump_exposes_paired_wait_margins_without_zero_fabrication);
 	UT_RUN(test_debug_dump_exposes_vm_counts_and_histogram_as_separate_cohorts);
 	UT_RUN(test_debug_dump_exposes_receipt_lifetime_and_cancel_before_counters);
+	UT_RUN(test_debug_dump_exposes_inventory_counts_without_fake_zero);
 	UT_RUN(test_debug_dump_exposes_tt_and_itl_reason_counters_without_fake_zero);
 	UT_RUN(test_debug_dump_exposes_closed_ctrc_observability);
 	UT_RUN(test_debug_inject_get_count_callable);

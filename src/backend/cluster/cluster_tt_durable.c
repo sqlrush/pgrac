@@ -2091,6 +2091,7 @@ rescan:
 	xid_matches = 0;
 	match_has_valid_scn = false;
 	found = InvalidScn;
+	cluster_undo_inventory_count_scan(inventory.usable);
 	cluster_tt_durable_io_wait_start();
 	for (segment_id = seg_lo; segment_id <= seg_hi; segment_id++) {
 		UndoSegmentHeaderData *hdr;
@@ -2198,6 +2199,7 @@ rescan:
 	inventory_complete = true;
 	scan_complete = true;
 	matches = 0;
+	cluster_undo_inventory_count_scan(inventory.usable);
 	cluster_tt_durable_io_wait_start();
 	for (segment_id = seg_lo; segment_id <= seg_hi; segment_id++) {
 		const UndoSegmentHeaderData *header;
