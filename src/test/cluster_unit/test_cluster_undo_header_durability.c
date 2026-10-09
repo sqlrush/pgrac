@@ -73,6 +73,16 @@ UT_DEFINE_GLOBALS();
 int cluster_node_id = 0;
 bool IsUnderPostmaster = false;
 BackendType MyBackendType = B_INVALID;
+
+bool
+AcquireExternalFD(void)
+{
+	return true;
+}
+
+void
+ReleaseExternalFD(void)
+{}
 AuxProcType MyAuxProcType = NotAnAuxProcess;
 int MyProcPid = 4321;
 pg_time_t MyStartTime = 0;

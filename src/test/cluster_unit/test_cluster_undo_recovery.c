@@ -15,6 +15,9 @@
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_xnode_profile.h"
 #include "cluster/storage/cluster_shared_fs.h"
+#include "cluster/storage/cluster_undo_alloc.h"
+#include "miscadmin.h"
+#include "storage/fd.h"
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
@@ -31,6 +34,7 @@ pg_re_throw(void)
 }
 
 int cluster_node_id = 0;
+BackendType MyBackendType = B_BACKEND;
 bool cluster_enabled = true;
 bool cluster_undo_gcs_coherence = true;
 char *DataDir = "/recoverer/local";
@@ -155,6 +159,19 @@ fixture_fsync(int fd)
 	else
 		local_syncs++;
 	return 0;
+}
+
+bool
+AcquireExternalFD(void)
+{
+	UT_ASSERT(false); /* The recovery/backend path retains its single-FD cache. */
+	return false;
+}
+
+void
+ReleaseExternalFD(void)
+{
+	UT_ASSERT(false);
 }
 
 static void fd_cache_close(void);

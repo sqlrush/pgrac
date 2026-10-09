@@ -79,6 +79,24 @@ static int cached_fd = -1;
 static bool cached_fd_exit_registered = false;
 static uint64 provision_temp_counter = 0;
 
+/*
+ * A service process repeatedly visits its own TT segments.  Keep their
+ * descriptors, not their contents: published undo files are recycled in
+ * place, never unlinked during runtime (cluster_undo_segment_file_exists).
+ * Foreign/recovery paths retain the original one-descriptor cache below.
+ * Each retained descriptor consumes a PostgreSQL external-FD reservation;
+ * budget pressure evicts a descriptor or falls back to the original cache.
+ */
+typedef struct UndoServiceFd {
+	int fd;
+	uint32 segment_id;
+	uint8 owner;
+	bool valid;
+} UndoServiceFd;
+
+static UndoServiceFd service_fds[CLUSTER_UNDO_SEGS_PER_INSTANCE];
+static uint32 service_fd_clock;
+
 static int
 undo_profile_open(const char *path, int flags)
 {
@@ -211,7 +229,7 @@ provision_temp_name_class(const char *name, uint8 owner_instance)
 }
 
 static void
-fd_cache_close(void)
+fd_cache_close_single(void)
 {
 	if (cached_fd >= 0) {
 		close(cached_fd);
@@ -220,6 +238,28 @@ fd_cache_close(void)
 		cached_fd_segment = 0;
 		cached_fd_owner = 0;
 	}
+}
+
+static void
+service_fd_close(UndoServiceFd *entry)
+{
+	if (entry->valid) {
+		int fd = entry->fd;
+
+		entry->valid = false;
+		(void)close(fd);
+		cluster_undo_record_note_smgr_close();
+		ReleaseExternalFD();
+	}
+}
+
+static void
+fd_cache_close(void)
+{
+	fd_cache_close_single();
+	for (int i = 0; i < lengthof(service_fds); i++)
+		service_fd_close(&service_fds[i]);
+	service_fd_clock = 0;
 }
 
 static void
@@ -237,6 +277,75 @@ cluster_undo_smgr_ensure_exit_hook(void)
 		before_shmem_exit(fd_cache_on_exit, (Datum)0);
 		cached_fd_exit_registered = true;
 	}
+}
+
+/* A false return asks the caller to use its original single-FD path. */
+static bool
+service_fd_get(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_instance, int *out_fd)
+{
+	UndoServiceFd *entry;
+	char path[MAXPGPATH];
+	int fd;
+	bool evicted = false;
+
+	if ((MyBackendType != B_LMS && MyBackendType != B_LMS_WORKER)
+		|| intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED || cluster_node_id < 0
+		|| cluster_node_id >= UNDO_OWNER_INSTANCE_MAX
+		|| owner_instance != (uint8)(cluster_node_id + 1) || segment_id == 0
+		|| (segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE != (uint32)cluster_node_id)
+		return false;
+
+	entry = &service_fds[(segment_id - 1) % CLUSTER_UNDO_SEGS_PER_INSTANCE];
+	if (entry->valid && entry->segment_id == segment_id && entry->owner == owner_instance) {
+		*out_fd = entry->fd;
+		return true;
+	}
+	service_fd_close(entry);
+	if (cluster_undo_path_resolve(intent, owner_instance, segment_id, path, sizeof(path)) != 0) {
+		*out_fd = -1;
+		return true;
+	}
+
+	/* Register cleanup before acquiring a resource that an ERROR could leak. */
+	cluster_undo_smgr_ensure_exit_hook();
+	if (!AcquireExternalFD()) {
+		for (int i = 0; i < lengthof(service_fds); i++) {
+			UndoServiceFd *victim = &service_fds[service_fd_clock];
+
+			service_fd_clock = (service_fd_clock + 1) % lengthof(service_fds);
+			if (victim->valid) {
+				service_fd_close(victim);
+				evicted = true;
+				break;
+			}
+		}
+		if (!evicted || !AcquireExternalFD())
+			return false;
+	}
+
+	PG_TRY();
+	{
+		fd = undo_profile_open(path, O_RDWR | PG_BINARY);
+	}
+	PG_CATCH();
+	{
+		ReleaseExternalFD();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (fd < 0) {
+		/* In particular, never retain an ENOENT result across publication. */
+		ReleaseExternalFD();
+		*out_fd = -1;
+		return true;
+	}
+	cluster_undo_record_note_smgr_open();
+	entry->fd = fd;
+	entry->segment_id = segment_id;
+	entry->owner = owner_instance;
+	entry->valid = true;
+	*out_fd = fd;
+	return true;
 }
 
 /*
@@ -261,11 +370,14 @@ get_segment_fd(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_inst
 		resolved = true;
 	}
 
+	if (service_fd_get(intent, segment_id, owner_instance, &fd))
+		return fd;
+
 	if (cached_fd >= 0 && cached_fd_segment == segment_id && cached_fd_owner == owner_instance
 		&& cached_fd_intent == intent)
 		return cached_fd; /* hit */
 
-	fd_cache_close(); /* miss: drop the stale fd first */
+	fd_cache_close_single(); /* miss: drop the stale single-entry fd first */
 
 	if (!resolved
 		&& cluster_undo_path_resolve(intent, owner_instance, segment_id, path, sizeof(path)) != 0)
@@ -284,7 +396,7 @@ get_segment_fd(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_inst
 }
 
 /*
- * cluster_undo_smgr_fd_cache_reset -- close the cached fd during full local
+ * cluster_undo_smgr_fd_cache_reset -- close all cached fds during full local
  *	teardown or explicit cache invalidation.  Normal COMMIT does not call it.
  */
 void

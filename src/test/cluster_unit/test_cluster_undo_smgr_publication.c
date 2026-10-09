@@ -57,6 +57,7 @@ before_shmem_exit(pg_on_exit_callback function, Datum arg)
 
 
 int MyProcPid = 4321;
+BackendType MyBackendType = B_BACKEND;
 pg_time_t MyStartTime = 0;
 TimestampTz MyStartTimestamp = INT64CONST(0x102030405060);
 int cluster_node_id = 0;
@@ -114,6 +115,16 @@ cluster_undo_record_note_smgr_pread(void)
 {}
 void
 cluster_undo_record_note_smgr_pwrite(void)
+{}
+
+bool
+AcquireExternalFD(void)
+{
+	return true;
+}
+
+void
+ReleaseExternalFD(void)
 {}
 
 void
@@ -1050,6 +1061,44 @@ UT_TEST(test_undo_service_io_counts_real_attempts_not_cache_hits)
 	remove_if_present(path);
 }
 
+UT_TEST(test_undo_lms_repeated_segment_reads_do_not_reopen)
+{
+	ClusterXnodeProfileShared profile = { 0 };
+	char path1[MAXPGPATH], path2[MAXPGPATH];
+	char page[BLCKSZ], observed[BLCKSZ];
+	BackendType roles[] = { B_LMS, B_LMS_WORKER };
+
+	resolve_final(path1);
+	UT_ASSERT_EQ(
+		cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 2, path2, MAXPGPATH), 0);
+	make_page(page, 0xa5);
+	write_segment_file(path1, page, BLCKSZ);
+	write_segment_file(path2, page, BLCKSZ);
+	ClusterXnodeProfileCtl = &profile;
+	cluster_xnode_profile_enabled = true;
+	cluster_xp_current_service = CLXP_SERVICE_UNDO_VERDICT;
+	for (int role = 0; role < lengthof(roles); role++) {
+		cluster_undo_smgr_fd_cache_reset();
+		memset(&profile, 0, sizeof(profile));
+		MyBackendType = roles[role];
+		UT_ASSERT(
+			cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1, 0, observed));
+		UT_ASSERT(
+			cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 2, 1, 0, observed));
+		UT_ASSERT(
+			cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1, 0, observed));
+		UT_ASSERT_EQ(pg_atomic_read_u64(&profile.bucket[CLXP_UNDO_VERDICT_OPEN].n_events), 2);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&profile.bucket[CLXP_UNDO_VERDICT_PREAD].n_events), 3);
+	}
+	cluster_undo_smgr_fd_cache_reset();
+	MyBackendType = B_BACKEND;
+	cluster_xnode_profile_enabled = false;
+	cluster_xp_current_service = CLXP_SERVICE_NONE;
+	ClusterXnodeProfileCtl = NULL;
+	remove_if_present(path1);
+	remove_if_present(path2);
+}
+
 int
 main(void)
 {
@@ -1057,7 +1106,7 @@ main(void)
 
 	UT_ASSERT_NOT_NULL(mkdtemp(template));
 	strlcpy(publication_dir, template, sizeof(publication_dir));
-	UT_PLAN(30);
+	UT_PLAN(31);
 	UT_RUN(test_recovery_file_materializes_absent_without_publishing_header);
 	UT_RUN(test_recovery_file_short_tail_and_errors_are_distinct);
 	UT_RUN(test_recovery_file_requires_all_durability_barriers_and_preserves_bytes);
@@ -1088,6 +1137,7 @@ main(void)
 	UT_RUN(test_root_descriptor_mirror_probe_rejects_lstat_open_symlink_swap);
 	UT_RUN(test_root_descriptor_mirror_write_failure_cleans_owned_temp);
 	UT_RUN(test_undo_service_io_counts_real_attempts_not_cache_hits);
+	UT_RUN(test_undo_lms_repeated_segment_reads_do_not_reopen);
 	UT_ASSERT_EQ(rmdir(publication_dir), 0);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
