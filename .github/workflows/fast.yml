@@ -386,7 +386,7 @@ jobs:
     needs: validate
     if: needs.validate.outputs.code_changed == 'true'
     runs-on: macos-latest
-    timeout-minutes: 12
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
