@@ -13,10 +13,22 @@
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_undo_segment.h"
+#include "cluster/cluster_xnode_profile.h"
 #include "cluster/storage/cluster_shared_fs.h"
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+/* The extracted I/O wrapper retains the production error-cleanup boundary. */
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+void
+pg_re_throw(void)
+{
+	/* These recovery fixtures never inject a backend ERROR into open(). */
+	abort();
+}
 
 int cluster_node_id = 0;
 bool cluster_enabled = true;

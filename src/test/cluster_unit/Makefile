@@ -2678,9 +2678,9 @@ test_cluster_undo_path_native.inc: $(top_srcdir)/src/backend/cluster/storage/clu
 
 test_cluster_undo_fd_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c Makefile
 	awk '/^(fd_cache_close|cluster_undo_smgr_fd_cache_reset)\(/ { print "void"; emit=1; found++ } \
-	     /^get_segment_fd\(/ { print "static int"; emit=1; found++ } \
+	     /^(undo_profile_open|get_segment_fd)\(/ { print "static int"; emit=1; found++ } \
 	     /^cluster_undo_smgr_fsync_segment_file\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 4) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (found != 5) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_undo_dir_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
