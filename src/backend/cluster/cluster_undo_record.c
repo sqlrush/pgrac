@@ -1866,7 +1866,7 @@ cluster_undo_record_alloc_body(uint8 record_type, const ClusterUndoRecordTarget 
 			case CLAIM_OK:
 				break; /* held at a fresh first block;  re-loop confirms space */
 			case CLAIM_HARD_CAP:
-				cluster_undo_cleaner_wakeup(); /* Q8: every recyclable segment counts */
+				cluster_undo_cleaner_pressure_wakeup(); /* Q8: every recyclable segment counts */
 				ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_SEGMENTS_HARD_CAP_REACHED),
 								errmsg("cluster undo segment pool hard cap reached for instance %u",
 									   (unsigned)(cluster_node_id + 1)),
@@ -1876,7 +1876,7 @@ cluster_undo_record_alloc_body(uint8 record_type, const ClusterUndoRecordTarget 
 										"cleaner to reclaim recyclable segments.")));
 				break; /* unreachable (ereport does not return) */
 			case CLAIM_FS_FAIL:
-				cluster_undo_cleaner_wakeup();
+				cluster_undo_cleaner_pressure_wakeup();
 				ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
 								errmsg("cluster undo segment autoextend failed "
 									   "(filesystem error or timeout)"),
@@ -2293,7 +2293,7 @@ cluster_undo_record_prepare_trace_impl(uint8 record_type, uint16 payload_capacit
 		if (claim_result == CLAIM_HARD_CAP) {
 			cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_CAPACITY_REFUSAL);
 			cluster_undo_receipt_reason = "CAPACITY_REFUSAL";
-			cluster_undo_cleaner_wakeup();
+			cluster_undo_cleaner_pressure_wakeup();
 			return CLUSTER_UNDO_RECORD_PREPARE_RETRY_REQUIRED;
 		}
 		if (claim_result == CLAIM_FS_FAIL)
@@ -3684,7 +3684,7 @@ rollover_retry_locked:
 		/* step 1b: a rollover failure is EXACTLY when RECYCLABLE supply is the
 		 * bottleneck — nudge the cleaner now instead of waiting out its tick
 			 * (lifecycle_lock already released; wakeup is a latch set, lock-free). */
-		cluster_undo_cleaner_wakeup();
+		cluster_undo_cleaner_pressure_wakeup();
 		LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 		return 0;
 	}
@@ -3724,7 +3724,7 @@ rollover_retry_locked:
 				   != (uint8)SEGMENT_ALLOCATED) {
 			pg_atomic_fetch_add_u64(&UndoRecordShared->tt_rollover_fail_extend_count, 1);
 			LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
-			cluster_undo_cleaner_wakeup();
+			cluster_undo_cleaner_pressure_wakeup();
 			LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 			return 0;
 		}
@@ -3753,7 +3753,7 @@ rollover_retry_locked:
 		 * extend/hard-cap split above cannot see this failure). */
 		pg_atomic_fetch_add_u64(&UndoRecordShared->tt_rollover_fail_activate_count, 1);
 		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
-		cluster_undo_cleaner_wakeup();
+		cluster_undo_cleaner_pressure_wakeup();
 		LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 		return 0;
 	}
@@ -3800,7 +3800,7 @@ rollover_retry_locked:
 		|| cluster_undo_segment_read_state(new_segment_id, owner_instance) != (uint8)SEGMENT_ACTIVE
 		|| !cluster_undo_block0_current_live_owner_publication_recheck(&publication)) {
 		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
-		cluster_undo_cleaner_wakeup();
+		cluster_undo_cleaner_pressure_wakeup();
 		LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 		return 0;
 	}
@@ -3834,7 +3834,7 @@ rollover_retry_locked:
 
 	/* Q8: a retention-pressure rollover is exactly when RECYCLABLE supply
 	 * matters -- nudge the cleaner instead of waiting out its interval. */
-	cluster_undo_cleaner_wakeup();
+	cluster_undo_cleaner_pressure_wakeup();
 	/*
 	 * spec-3.12 D5: the rolled-away segment's committed slots all have
 	 * commit_scn at or newer than the horizon (that retention is exactly why

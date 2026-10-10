@@ -53,6 +53,7 @@ static LOCALLOCK test_locks[4];
 static unsigned test_lock_count, test_lock_depth, test_scan_ends;
 static bool test_foreign_lwlock, test_floor, test_fence;
 static unsigned prepared, cancelled, slept, signalled, broadcasts;
+static unsigned pressure_wakes;
 static bool subscribed, early_signal, test_cancel, test_pin_after_probe;
 static ClusterCtrcCapacityProbeResult test_proof;
 static TransactionId test_xid = 100;
@@ -80,6 +81,14 @@ cluster_ctrc_cleaner_run_pass(void)
 {
 	test_ctrc_passes++;
 	return test_ctrc_progress;
+}
+
+void
+cluster_ctrc_cleaner_note_pressure(void)
+{
+	if (test_lock_depth != 0 || !subscribed)
+		abort();
+	pressure_wakes++;
 }
 
 ClusterJoinGateVerdict
@@ -437,6 +446,7 @@ reset_wait_fixture(void)
 	cluster_undo_cleaner_enabled = cluster_undo_retention_horizon_enabled = true;
 	subscribed = early_signal = test_cancel = test_pin_after_probe = false;
 	prepared = cancelled = slept = signalled = broadcasts = 0;
+	pressure_wakes = 0;
 	test_proof = CLUSTER_CTRC_CAPACITY_WAIT;
 	test_gc_complete = false;
 	test_inventory_max = 1;
@@ -462,6 +472,7 @@ UT_TEST(test_capacity_wait_retries_signals_and_cadence_without_authorizing_free)
 		UT_ASSERT_EQ(cancelled, 1);
 		UT_ASSERT(!subscribed);
 		UT_ASSERT_EQ(signalled, 8);
+		UT_ASSERT_EQ(pressure_wakes, 1);
 		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_entered, 1);
 		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_repolled, 1);
 		UT_ASSERT_EQ(undo_cleaner_state->shmem_tt_slots_gcd, 0);
@@ -525,6 +536,7 @@ UT_TEST(test_capacity_every_blocking_hold_refuses_without_sleep)
 		UT_ASSERT(!cluster_undo_cleaner_wait_for_capacity(1, &continuation));
 		UT_ASSERT_EQ(slept, 0);
 		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_context, 1);
+		UT_ASSERT_EQ(pressure_wakes, 0);
 		UT_ASSERT(!subscribed);
 	}
 }

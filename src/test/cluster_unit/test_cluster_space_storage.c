@@ -1552,6 +1552,55 @@ UT_TEST(test_maintenance_identity_preserves_namespace_and_live_page_checks)
 	UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
 }
 
+/* The callback is the existing conditional-X boundary. A miss must release
+ * the pin; it cannot silently fall back to the original converting owner. */
+static bool
+maintenance_local_lock(Buffer buffer)
+{
+	if (refuse_maintenance_lock)
+		return false;
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	return true;
+}
+
+UT_TEST(test_maintenance_callback_never_converts_or_bypasses_identity)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		ClusterSpaceIdentity out, before, tombstone;
+		unsigned writes, releases;
+
+		reset();
+		UT_ASSERT(cluster_space_relation_create(locator));
+		UT_ASSERT(cluster_space_relation_read_identity(locator, &tombstone));
+		writes = wal_calls;
+		releases = release_calls;
+		memset(&out, 0xa5, sizeof(out));
+		before = out;
+		MyBackendId = InvalidBackendId;
+		if (fault == 1)
+			refuse_maintenance_lock = true;
+		if (fault == 2)
+			ref.claim.database_incarnation++;
+		if (fault == 3)
+			page.data[160] = 1;
+		if (fault == 4) {
+			tombstone.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+			UT_ASSERT(cluster_space_identity_page_encode(&tombstone, 18, page.data, BLCKSZ));
+		}
+		UT_ASSERT_EQ(cluster_space_relation_read_maintenance_identity_with_lock(
+						 locator, &out, maintenance_local_lock),
+					 fault == 0);
+		if (fault)
+			UT_ASSERT(memcmp(&out, &before, sizeof(out)) == 0);
+		else
+			UT_ASSERT_EQ(out.state, CLUSTER_SPACE_IDENTITY_LIVE);
+		UT_ASSERT_EQ(maintenance_identity_locks, 0);
+		UT_ASSERT_EQ(wal_calls, writes);
+		UT_ASSERT_EQ(release_calls, releases + 1);
+		UT_ASSERT_EQ(pinned | locked, 0);
+	}
+}
+
 UT_TEST(test_real_replay_exact_duplicate_and_preserved_token)
 {
 	DecodedXLogRecord decoded;
@@ -3398,10 +3447,11 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(66);
+	UT_PLAN(67);
 	UT_RUN(test_maintenance_identity_uses_current_owner_without_backend_id);
 	UT_RUN(test_maintenance_identity_retry_keeps_work_and_releases_pin);
 	UT_RUN(test_maintenance_identity_preserves_namespace_and_live_page_checks);
+	UT_RUN(test_maintenance_callback_never_converts_or_bypasses_identity);
 	UT_RUN(test_native_drop_durable_finish_io_failure_keeps_original_owner);
 	UT_RUN(test_native_drop_durable_finish_requires_each_exact_page);
 	UT_RUN(test_native_structure_observation_needs_attribution_and_stable_native_flush);

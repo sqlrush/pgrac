@@ -42,6 +42,8 @@ static unsigned reuse_wal_starts, reuse_wal_finishes, reuse_wal_aborts;
 static unsigned reuse_space_reads;
 static bool reuse_local_x, reuse_stop_requested;
 static unsigned reuse_conditional_locks;
+static unsigned reuse_space_xlocks;
+static unsigned reuse_urgent_after_unlock;
 static bool reuse_space_available = true;
 static unsigned reuse_rechecks, reuse_fail_recheck, reuse_fail_lock;
 static bool reuse_terminal_ok, reuse_tag_ok, reuse_exists;
@@ -223,7 +225,8 @@ reuse_note_itl_retained(const ClusterCtrcReceipt *receipt, const char *stage,
 						int page_origin, ClusterCtrcTerminalStatus terminal_status, SCN commit_scn)
 {
 	Assert(reuse_pins == 0 && reuse_xlocks == 0);
-	Assert(receipt == &reuse_receipt);
+	/* The real selector supplies a locked snapshot, not the fixture address. */
+	Assert(memcmp(receipt, &reuse_receipt, sizeof(*receipt)) == 0);
 	(void)slot;
 	(void)page_lsn;
 	(void)page_scn;
@@ -306,6 +309,11 @@ reuse_read(RelFileLocator locator pg_attribute_unused(), ForkNumber forknum, Blo
 static bool
 reuse_lock(Buffer buffer)
 {
+	if (buffer == 2) {
+		Assert(reuse_xlocks == 0 && reuse_pins == 0 && reuse_space_xlocks == 0);
+		reuse_space_xlocks++;
+		return true;
+	}
 	Assert(buffer == 1 && reuse_pins == 1 && reuse_xlocks == 0);
 	reuse_locks++;
 	if (reuse_locks == reuse_fail_lock)
@@ -342,6 +350,12 @@ reuse_unlock(Buffer buffer, int mode)
 {
 	Assert(buffer == 1 && mode == BUFFER_LOCK_UNLOCK && reuse_xlocks == 1);
 	reuse_xlocks--;
+	if (reuse_locks == 1 && reuse_urgent_after_unlock != 0) {
+		if (reuse_urgent_after_unlock == 1)
+			reuse_stop_requested = true;
+		else
+			cluster_ctrc_cleaner_note_pressure();
+	}
 }
 
 static void
@@ -402,6 +416,17 @@ reuse_space_identity(RelFileLocator locator, ClusterSpaceIdentity *out)
 	return reuse_space_available;
 }
 
+static bool
+reuse_space_identity_with_lock(RelFileLocator locator, ClusterSpaceIdentity *out,
+							   bool (*lock_buffer)(Buffer))
+{
+	if (!lock_buffer(2))
+		return false;
+	UT_ASSERT_EQ(reuse_space_xlocks, 1);
+	reuse_space_xlocks--;
+	return reuse_space_identity(locator, out);
+}
+
 static Page
 reuse_xlog_register(GenericXLogState *state, Buffer buffer, int flags,
 					const ClusterSpaceIdentity *identity)
@@ -446,6 +471,7 @@ reuse_xlog_abort(GenericXLogState *state)
 #define UnlockReleaseBuffer reuse_unlock_release
 #define GenericXLogStartInternal reuse_xlog_start
 #define cluster_space_relation_read_maintenance_identity reuse_space_identity
+#define cluster_space_relation_read_maintenance_identity_with_lock reuse_space_identity_with_lock
 #define GenericXLogRegisterBufferVersioned reuse_xlog_register
 #define GenericXLogFinish reuse_xlog_finish
 #define GenericXLogAbort reuse_xlog_abort
@@ -467,6 +493,7 @@ reuse_xlog_abort(GenericXLogState *state)
 #undef UnlockReleaseBuffer
 #undef GenericXLogStartInternal
 #undef cluster_space_relation_read_maintenance_identity
+#undef cluster_space_relation_read_maintenance_identity_with_lock
 #undef GenericXLogRegisterBufferVersioned
 #undef GenericXLogFinish
 #undef GenericXLogAbort
@@ -474,7 +501,8 @@ reuse_xlog_abort(GenericXLogState *state)
 static bool
 reuse_no_mx(const ClusterCtrcParticipantEntry *participant pg_attribute_unused(),
 			const ClusterCtrcReceipt *receipt pg_attribute_unused(),
-			uint64 participant_index pg_attribute_unused(), uint64 receipt_index pg_attribute_unused())
+			uint64 participant_index pg_attribute_unused(),
+			uint64 receipt_index pg_attribute_unused())
 {
 	return false;
 }
@@ -505,6 +533,8 @@ reuse_setup(bool replaced)
 	reuse_pins = reuse_xlocks = reuse_locks = reuse_enters = reuse_leaves = 0;
 	reuse_local_x = reuse_stop_requested = false;
 	reuse_conditional_locks = 0;
+	reuse_space_xlocks = 0;
+	reuse_urgent_after_unlock = 0;
 	reuse_space_reads = 0;
 	reuse_space_available = true;
 	cluster_shared_config = false;
@@ -642,10 +672,12 @@ UT_TEST(test_reused_lock_slot_absence_discharges_without_page_write)
 	UT_ASSERT_EQ(flush_calls, 0);
 	UT_ASSERT(memcmp(&before, &reuse_page, sizeof(before)) == 0);
 	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_TARGET_ABSENT), 1);
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_CLEANER_RECEIPT_COMPLETED), 1);
 	UT_ASSERT_EQ(wake_count, 1);
 	UT_ASSERT(reuse_run());
 	UT_ASSERT_EQ(reuse_handle.participant->cleaned_count, 1);
 	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_TARGET_ABSENT), 1);
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_CLEANER_RECEIPT_COMPLETED), 1);
 }
 
 UT_TEST(test_changed_slot_is_never_rewritten_as_the_old_incarnation)
@@ -2111,10 +2143,127 @@ UT_TEST(test_stop_does_not_defer_first_receipt)
 	UT_ASSERT_EQ(reuse_conditional_locks, 0);
 }
 
+UT_TEST(test_one_yield_retains_age_and_failed_forced_attempts_do_not_rearm)
+{
+	ClusterCtrcDebugSnapshot snapshot;
+	uint64 wakes, progress;
+
+	reuse_setup(false);
+	cluster_shared_config = true;
+	UT_ASSERT(cluster_ctrc_cleaner_bind_worker(0));
+	wakes = wake_count;
+	progress = cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS);
+	test_now_us += UINT64_C(2500000);
+	UT_ASSERT(!reuse_scheduled_receipt());
+	UT_ASSERT_EQ(wake_count, wakes + 1);
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS), progress);
+	UT_ASSERT_EQ(cluster_ctrc_cleaner_local_progress(), 0);
+	UT_ASSERT(cluster_ctrc_debug_snapshot(&snapshot));
+	UT_ASSERT_EQ(snapshot.receipt_pending, 1);
+	UT_ASSERT_EQ(snapshot.receipt_oldest_pending_age_ms, 2500);
+	UT_ASSERT_EQ(snapshot.receipt_pending_age_unknown, 0);
+	for (unsigned attempt = 0; attempt < 3; attempt++) {
+		reuse_fail_lock = reuse_locks + 1;
+		reuse_space_reads = 0;
+		UT_ASSERT(!reuse_scheduled_receipt());
+		UT_ASSERT_EQ(reuse_handle.receipt->state, CTRC_RECEIPT_APPLIED);
+		UT_ASSERT_EQ(reuse_conditional_locks, 1);
+		UT_ASSERT_EQ(wake_count, wakes + 1);
+		UT_ASSERT_EQ(reuse_pins + reuse_xlocks + held_count, 0);
+	}
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_CLEANER_YIELD), 1);
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_CLEANER_FORCED_RECEIPT), 3);
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_CLEANER_ORIGINAL_X_ATTEMPT), 6);
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_CLEANER_ORIGINAL_X_ACQUIRED), 3);
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_CLEANER_RECEIPT_COMPLETED), 0);
+	reuse_fail_lock = 0;
+	reuse_space_reads = 0;
+	UT_ASSERT(reuse_scheduled_receipt());
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_CLEANER_RECEIPT_COMPLETED), 1);
+	UT_ASSERT(cluster_ctrc_debug_snapshot(&snapshot));
+	UT_ASSERT_EQ(snapshot.receipt_pending, 0);
+	UT_ASSERT_EQ(snapshot.receipt_oldest_pending_age_ms, 0);
+}
+
+UT_TEST(test_local_x_completes_without_conversion_and_keeps_admission_check)
+{
+	for (unsigned refusal = 0; refusal < 2; refusal++) {
+		reuse_setup(false);
+		cluster_shared_config = reuse_local_x = true;
+		UT_ASSERT(cluster_ctrc_cleaner_bind_worker(0));
+		if (refusal)
+			reuse_fail_recheck = 1;
+		UT_ASSERT_EQ(reuse_scheduled_receipt(), refusal == 0);
+		UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_CLEANER_ORIGINAL_X_ATTEMPT), 0);
+		UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_CLEANER_YIELD), 0);
+		UT_ASSERT_EQ(reuse_handle.receipt->state,
+					 refusal ? CTRC_RECEIPT_APPLIED : CTRC_RECEIPT_CLEANED);
+		UT_ASSERT_EQ(reuse_wal_finishes, refusal ? 0 : 1);
+		if (!refusal) {
+			UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_CLEANER_CONDITIONAL_X_ATTEMPT), 3);
+			UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_CLEANER_CONDITIONAL_X_HIT), 3);
+		}
+		UT_ASSERT_EQ(reuse_pins + reuse_xlocks + held_count, 0);
+		UT_ASSERT_EQ(reuse_enters, reuse_leaves);
+	}
+}
+
+UT_TEST(test_pressure_and_stop_arrivals_restore_original_path)
+{
+	for (unsigned arrival = 0; arrival < 3; arrival++) {
+		reuse_setup(false);
+		cluster_shared_config = true;
+		UT_ASSERT(cluster_ctrc_cleaner_bind_worker(0));
+		if (arrival == 0)
+			cluster_ctrc_cleaner_note_pressure();
+		else {
+			reuse_local_x = true;
+			reuse_urgent_after_unlock = arrival;
+		}
+		UT_ASSERT(reuse_scheduled_receipt());
+		UT_ASSERT_EQ(reuse_conditional_locks, arrival ? 2 : 0);
+		UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_CLEANER_ORIGINAL_X_ATTEMPT), arrival ? 1 : 3);
+		UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_CLEANER_YIELD), 0);
+		UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_CLEANER_RECEIPT_COMPLETED), 1);
+		UT_ASSERT_EQ(reuse_pins + reuse_xlocks + held_count, 0);
+	}
+}
+
+UT_TEST(test_scheduler_error_clears_context_without_renewing_quota)
+{
+	volatile bool caught = false;
+
+	reuse_abort_history_setup(1);
+	cluster_shared_config = reuse_local_x = true;
+	reuse_native_throw = true;
+	UT_ASSERT(cluster_ctrc_cleaner_bind_worker(0));
+	PG_TRY();
+	{
+		(void)reuse_scheduled_receipt();
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT(!CtrcTryLocalX && !CtrcLocalXMiss);
+	UT_ASSERT_EQ(reuse_handle.receipt->state, CTRC_RECEIPT_APPLIED);
+	UT_ASSERT_EQ(reuse_pins + reuse_xlocks + held_count, 0);
+	UT_ASSERT_EQ(reuse_enters, reuse_leaves);
+	reuse_native_throw = false;
+	reuse_conditional_locks = 0;
+	reuse_space_reads = 0;
+	UT_ASSERT(reuse_scheduled_receipt());
+	UT_ASSERT_EQ(reuse_conditional_locks, 0);
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_CLEANER_FORCED_RECEIPT), 1);
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_CLEANER_RECEIPT_COMPLETED), 1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(52);
+	UT_PLAN(56);
 	UT_RUN(test_aborted_history_final_guard_rejects_change_after_second_current);
 	UT_RUN(test_aborted_history_retires_only_with_all_three_proofs_without_floor);
 	UT_RUN(test_aborted_history_never_uses_absence_of_live_owner_as_abort_proof);
@@ -2164,6 +2313,10 @@ main(void)
 	UT_RUN(test_receipt_yields_without_writing_or_discharging);
 	UT_RUN(test_yielded_receipt_uses_original_path_on_next_turn);
 	UT_RUN(test_stop_does_not_defer_first_receipt);
+	UT_RUN(test_one_yield_retains_age_and_failed_forced_attempts_do_not_rearm);
+	UT_RUN(test_local_x_completes_without_conversion_and_keeps_admission_check);
+	UT_RUN(test_pressure_and_stop_arrivals_restore_original_path);
+	UT_RUN(test_scheduler_error_clears_context_without_renewing_quota);
 	free(CtrcShared);
 	CtrcShared = NULL;
 	UT_DONE();

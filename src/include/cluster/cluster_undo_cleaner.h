@@ -287,6 +287,8 @@ extern const char *cluster_undo_cleaner_status_to_string(UndoCleanerStatus s);
  * the cleaner is not running.  Never throws.
  */
 extern void cluster_undo_cleaner_wakeup(void);
+/* Capacity/rollover scheduling pressure, distinct from ordinary work arrival. */
+extern void cluster_undo_cleaner_pressure_wakeup(void);
 
 /*
  * Postmaster shutdown request (belt-and-suspenders besides SIGTERM).

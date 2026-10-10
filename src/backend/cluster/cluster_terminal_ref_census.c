@@ -81,7 +81,7 @@
 #endif
 
 #define CLUSTER_CTRC_SHMEM_MAGIC UINT32_C(0x43545243)
-#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(11)
+#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(12)
 #ifndef CLUSTER_CTRC_TEST_TABLE_VISIT
 #define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) ((void)0)
 #endif
@@ -150,6 +150,14 @@ static const char *const ctrc_stat_names[CTRC_STAT_COUNT] = {
 	[CTRC_STAT_OBSERVATION_AGE_MS] = "observation_age_ms",
 	[CTRC_STAT_RECEIPT_PREPARE_REFUSED] = "receipt_prepare_refused_count",
 	[CTRC_STAT_RECEIPT_NAMESPACE_REFUSED] = "receipt_namespace_refused_count",
+	[CTRC_STAT_CLEANER_YIELD] = "cleaner_yield_count",
+	[CTRC_STAT_CLEANER_FORCED_RECEIPT] = "cleaner_forced_receipt_count",
+	[CTRC_STAT_CLEANER_CONDITIONAL_X_ATTEMPT] = "cleaner_conditional_x_attempt_count",
+	[CTRC_STAT_CLEANER_CONDITIONAL_X_HIT] = "cleaner_conditional_x_hit_count",
+	[CTRC_STAT_CLEANER_ORIGINAL_X_ATTEMPT] = "cleaner_original_x_attempt_count",
+	[CTRC_STAT_CLEANER_ORIGINAL_X_ACQUIRED] = "cleaner_original_x_acquired_count",
+	[CTRC_STAT_CLEANER_RECEIPT_COMPLETED] = "cleaner_receipt_completed_count",
+	[CTRC_STAT_CLEANER_PRESSURE_WAKE] = "cleaner_pressure_wake_count",
 };
 
 static const char *const ctrc_cleaner_reason_names[CTRC_CLEANER_REASON_COUNT] = {
@@ -1392,9 +1400,11 @@ typedef struct CtrcReceiptLink {
 	uint64 participant_plus_one;
 	uint64 next_plus_one;
 	uint64 journal_generation;
+	uint64 prepared_at_us;
+	uint64 yielded;
 } CtrcReceiptLink;
 
-StaticAssertDecl(sizeof(CtrcReceiptLink) == 24, "receipt locator size changed");
+StaticAssertDecl(sizeof(CtrcReceiptLink) == 40, "receipt locator size changed");
 
 typedef struct ClusterCtrcSharedHeader {
 	LWLock origin_lock;
@@ -1426,6 +1436,7 @@ typedef struct ClusterCtrcSharedHeader {
 	pg_atomic_uint64 stats[CTRC_STAT_COUNT];
 	pg_atomic_uint64 test_barrier_hit_count;
 	pg_atomic_uint32 test_barrier_phase;
+	pg_atomic_uint64 cleaner_pressure_sequence;
 	CtrcCleanerWorkerObservationShared workers[CLUSTER_CTRC_CLEANER_WORKERS];
 	uint8 reserved[24];
 } ClusterCtrcSharedHeader;
@@ -1575,6 +1586,11 @@ static uint64 CtrcDispatchCursor;
 static int CtrcWorkerId = -1;
 static uint64 CtrcLocalProgress;
 static uint64 CtrcLocalPasses;
+/* Scheduling only. Never survives a physical attempt or proves retirement. */
+static bool CtrcTryLocalX;
+static bool CtrcLocalXMiss;
+static uint64 CtrcPressureSeen;
+static uint64 CtrcPressurePass;
 
 bool
 cluster_ctrc_cleaner_bind_worker(unsigned worker_id)
@@ -2086,6 +2102,8 @@ cluster_ctrc_shmem_init(void)
 		CtrcDispatchCursor = 0;
 		CtrcWorkerId = -1;
 		CtrcLocalProgress = CtrcLocalPasses = 0;
+		CtrcTryLocalX = CtrcLocalXMiss = false;
+		CtrcPressureSeen = CtrcPressurePass = 0;
 		MemSet(CtrcShared, 0, capacity.total_bytes);
 		CtrcShared->magic = CLUSTER_CTRC_SHMEM_MAGIC;
 		CtrcShared->version = CLUSTER_CTRC_SHMEM_VERSION;
@@ -2109,6 +2127,7 @@ cluster_ctrc_shmem_init(void)
 			pg_atomic_init_u64(&CtrcShared->stats[i], 0);
 		pg_atomic_init_u64(&CtrcShared->test_barrier_hit_count, 0);
 		pg_atomic_init_u32(&CtrcShared->test_barrier_phase, CTRC_TEST_BARRIER_NONE);
+		pg_atomic_init_u64(&CtrcShared->cleaner_pressure_sequence, 0);
 		for (unsigned i = 0; i < CLUSTER_CTRC_CLEANER_WORKERS; i++) {
 			pg_atomic_init_u64(&CtrcShared->workers[i].dispatch_backlog, 0);
 			pg_atomic_init_u64(&CtrcShared->workers[i].certificate_backlog, 0);
@@ -2203,10 +2222,12 @@ bool
 cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
 {
 	uint64 i;
+	uint64 now;
 
 	if (snapshot == NULL || !cluster_ctrc_shmem_ready())
 		return false;
 	MemSet(snapshot, 0, sizeof(*snapshot));
+	now = ctrc_monotonic_us();
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	for (i = 0; i < CtrcShared->origin_key_entries; i++) {
 		switch ((ClusterCtrcOriginState)ctrc_origin_entries()[i].state) {
@@ -2259,6 +2280,19 @@ cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
 	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
 	for (i = 0; i < CtrcShared->receipt_entries; i++) {
 		uint32 state = pg_atomic_read_u32((pg_atomic_uint32 *)&ctrc_receipt_entries()[i].state);
+		const CtrcReceiptLink *link = &ctrc_receipt_links()[i];
+
+		if (state == CTRC_RECEIPT_PREPARED || state == CTRC_RECEIPT_APPLIED
+			|| state == CTRC_RECEIPT_RETARGETING || state == CTRC_RECEIPT_BLOCKED) {
+			snapshot->receipt_pending++;
+			if (link->prepared_at_us == 0 || now < link->prepared_at_us
+				|| link->journal_generation
+					   != ctrc_receipt_entries()[i].publication.journal_slot_generation)
+				snapshot->receipt_pending_age_unknown++;
+			else
+				snapshot->receipt_oldest_pending_age_ms = Max(
+					snapshot->receipt_oldest_pending_age_ms, (now - link->prepared_at_us) / 1000);
+		}
 
 		switch ((ClusterCtrcReceiptState)state) {
 		case CTRC_RECEIPT_PREPARED:
@@ -4562,6 +4596,17 @@ ctrc_cleaner_publish_certificate(const ClusterCtrcOriginCertificateSnapshot *sna
 }
 #endif
 
+void
+cluster_ctrc_cleaner_note_pressure(void)
+{
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	if (ctrc_runtime_attached()) {
+		(void)pg_atomic_fetch_add_u64(&CtrcShared->cleaner_pressure_sequence, 1);
+		cluster_ctrc_stat_bump(CTRC_STAT_CLEANER_PRESSURE_WAKE);
+	}
+#endif
+}
+
 bool
 cluster_ctrc_cleaner_run_pass(void)
 {
@@ -4576,6 +4621,7 @@ cluster_ctrc_cleaner_run_pass(void)
 	cluster_ctrc_stat_bump(CTRC_STAT_CLEANER_PASS);
 	cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_NONE);
 	progress_before = CtrcLocalProgress;
+	CtrcPressurePass = pg_atomic_read_u64(&CtrcShared->cleaner_pressure_sequence);
 	CtrcBatch.active = true;
 	CtrcBatch.remaining[CTRC_SCAN_OPEN] = CtrcShared->origin_key_entries;
 	CtrcBatch.remaining[CTRC_SCAN_RECEIPT] = CtrcShared->receipt_entries;
@@ -4646,6 +4692,7 @@ cluster_ctrc_cleaner_run_pass(void)
 		MemSet(&CtrcBatch, 0, sizeof(CtrcBatch));
 	}
 	PG_END_TRY();
+	CtrcPressureSeen = CtrcPressurePass;
 	CtrcLocalPasses++;
 	return CtrcLocalProgress != progress_before;
 #else
@@ -5185,6 +5232,7 @@ cluster_ctrc_receipt_prepare_shared(const ClusterCtrcTxnKeyV1 *key,
 			link->participant_plus_one = participant_index + 1;
 			link->next_plus_one = ctrc_participant_receipt_heads()[participant_index];
 			link->journal_generation = receipts[receipt_index].publication.journal_slot_generation;
+			link->prepared_at_us = ctrc_monotonic_us();
 			ctrc_participant_receipt_heads()[participant_index] = receipt_index + 1;
 		}
 	}
@@ -5633,10 +5681,12 @@ cluster_ctrc_receipt_discharge_itl_shared(const ClusterCtrcReceiptHandle *handle
 	LWLockRelease(&CtrcShared->receipt_lock);
 	ctrc_participant_locks_release(ctrc_participant_lock_mask(handle->participant_index));
 	if (result == CLUSTER_CTRC_DISCHARGE_CLEANED) {
-		if (state_before == CTRC_RECEIPT_APPLIED)
+		if (state_before == CTRC_RECEIPT_APPLIED) {
+			cluster_ctrc_stat_bump(CTRC_STAT_CLEANER_RECEIPT_COMPLETED);
 			cluster_ctrc_stat_bump(projection == CTRC_ITL_TARGET_ABSENT
 									   ? CTRC_STAT_TARGET_ABSENT
 									   : CTRC_STAT_TARGET_REWRITTEN);
+		}
 		cluster_undo_cleaner_wakeup();
 	} else
 		cluster_ctrc_stat_bump(CTRC_STAT_TARGET_RETAINED);
@@ -5735,10 +5785,12 @@ cluster_ctrc_receipt_discharge_current_mx_shared(const ClusterCtrcReceiptHandle 
 	LWLockRelease(&CtrcShared->receipt_lock);
 	ctrc_participant_locks_release(ctrc_participant_lock_mask(handle->participant_index));
 	if (result == CLUSTER_CTRC_DISCHARGE_CLEANED) {
-		if (state_before == CTRC_RECEIPT_APPLIED)
+		if (state_before == CTRC_RECEIPT_APPLIED) {
+			cluster_ctrc_stat_bump(CTRC_STAT_CLEANER_RECEIPT_COMPLETED);
 			cluster_ctrc_stat_bump(clean_result == CTRC_CLEANED_ABSENT
 									   ? CTRC_STAT_TARGET_ABSENT
 									   : CTRC_STAT_TARGET_REWRITTEN);
+		}
 		cluster_undo_cleaner_wakeup();
 	} else
 		cluster_ctrc_stat_bump(CTRC_STAT_TARGET_RETAINED);
@@ -6878,6 +6930,61 @@ cluster_ctrc_participant_ack_from_snapshot(const ClusterCtrcParticipantEntry *pa
 }
 
 #ifndef CLUSTER_CTRC_UNIT_TEST
+/* This changes scheduling only. A pressure wake never proves a terminal
+ * transaction, a reusable slot, an absent reference, or a writable page. */
+static bool
+ctrc_cleaner_pressure_pending(void)
+{
+	return pg_atomic_read_u64(&CtrcShared->cleaner_pressure_sequence) != CtrcPressureSeen;
+}
+
+static bool
+ctrc_cleaner_try_local_once(const ClusterCtrcReceipt *receipt, uint64 index)
+{
+	CtrcReceiptLink *link;
+	bool allowed = false;
+
+	if (CtrcWorkerId < 0 || !cluster_shared_config || cluster_normal_stop_requested()
+		|| ctrc_cleaner_pressure_pending() || index >= CtrcShared->receipt_entries)
+		return false;
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
+	link = &ctrc_receipt_links()[index];
+	if (link->yielded == 0 && link->journal_generation != 0
+		&& link->journal_generation == receipt->publication.journal_slot_generation
+		&& memcmp(&ctrc_receipt_entries()[index], receipt, sizeof(*receipt)) == 0
+		&& receipt->state == CTRC_RECEIPT_APPLIED) {
+		/* Consume the one local attempt before any physical work. An ERROR,
+		 * missing authority, or failed forced attempt cannot renew it. */
+		link->yielded = 1;
+		allowed = true;
+	}
+	LWLockRelease(&CtrcShared->receipt_lock);
+	return allowed;
+}
+
+static bool
+ctrc_cleaner_lock_buffer(Buffer buffer)
+{
+	bool acquired;
+
+	/* A stop/pressure arriving between the two page rounds takes effect
+	 * here, without relaxing any of the original page/admission rechecks. */
+	if (CtrcTryLocalX && !cluster_normal_stop_requested() && !ctrc_cleaner_pressure_pending()) {
+		cluster_ctrc_stat_bump(CTRC_STAT_CLEANER_CONDITIONAL_X_ATTEMPT);
+		acquired = ConditionalLockBuffer(buffer);
+		if (acquired)
+			cluster_ctrc_stat_bump(CTRC_STAT_CLEANER_CONDITIONAL_X_HIT);
+		else
+			CtrcLocalXMiss = true;
+		return acquired;
+	}
+	cluster_ctrc_stat_bump(CTRC_STAT_CLEANER_ORIGINAL_X_ATTEMPT);
+	acquired = ClusterLockBufferExclusiveRetryAware(buffer);
+	if (acquired)
+		cluster_ctrc_stat_bump(CTRC_STAT_CLEANER_ORIGINAL_X_ACQUIRED);
+	return acquired;
+}
+
 static bool
 ctrc_page_version_capture(Page page, uint16 *origin_out, XLogRecPtr *lsn_out, SCN *scn_out)
 {
@@ -7407,6 +7514,7 @@ ctrc_cleaner_companions_discharge_locked(const ClusterCtrcReceiptHandle *handle,
 										 const ClusterCtrcDurability *durability)
 {
 	ClusterCtrcParticipantEntry *participant = handle->participant;
+	ClusterCtrcDischargeResult result;
 
 	if (!ctrc_receipt_handle_exact(handle) || participant->state != CTRC_PARTICIPANT_CLOSED_DRAINING
 		|| participant->seal_generation != proof->participant.seal_generation
@@ -7426,8 +7534,11 @@ ctrc_cleaner_companions_discharge_locked(const ClusterCtrcReceiptHandle *handle,
 					   != 0))
 			return CLUSTER_CTRC_DISCHARGE_RETAIN;
 	}
-	return cluster_ctrc_receipt_discharge_itl(participant, handle->receipt, CTRC_ITL_TARGET_ABSENT,
-											  durability);
+	result = cluster_ctrc_receipt_discharge_itl(participant, handle->receipt,
+												CTRC_ITL_TARGET_ABSENT, durability);
+	if (result == CLUSTER_CTRC_DISCHARGE_CLEANED && proof->original.state == CTRC_RECEIPT_APPLIED)
+		cluster_ctrc_stat_bump(CTRC_STAT_CLEANER_RECEIPT_COMPLETED);
+	return result;
 }
 
 static ClusterCtrcDischargeResult
@@ -8016,7 +8127,8 @@ ctrc_cleaner_clean_current_mx_receipt(const ClusterCtrcParticipantEntry *partici
 	/* No heap content lock is held here. The APPLIED receipt and exact
 	 * target rechecks remain mandatory; SPACE lookup is not an authority. */
 	if (cluster_shared_config
-		&& !cluster_space_relation_read_maintenance_identity(locator, &space_identity)) {
+		&& !cluster_space_relation_read_maintenance_identity_with_lock(locator, &space_identity,
+																	   ctrc_cleaner_lock_buffer)) {
 		cluster_semantic_activation_leave(&admission);
 		return false;
 	}
@@ -8036,7 +8148,7 @@ ctrc_cleaner_clean_current_mx_receipt(const ClusterCtrcParticipantEntry *partici
 	}
 
 	cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_RESOURCE_X);
-	if (!ClusterLockBufferExclusiveRetryAware(buffer)) {
+	if (!ctrc_cleaner_lock_buffer(buffer)) {
 		ReleaseBuffer(buffer);
 		cluster_semantic_activation_leave(&admission);
 		return false;
@@ -8084,7 +8196,7 @@ ctrc_cleaner_clean_current_mx_receipt(const ClusterCtrcParticipantEntry *partici
 			goto current_mx_retain_unlocked;
 		}
 		cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_RESOURCE_X);
-		if (!ClusterLockBufferExclusiveRetryAware(buffer)) {
+		if (!ctrc_cleaner_lock_buffer(buffer)) {
 			ReleaseBuffer(buffer);
 			cluster_semantic_activation_leave(&admission);
 			return false;
@@ -8184,7 +8296,7 @@ ctrc_cleaner_clean_current_mx_receipt(const ClusterCtrcParticipantEntry *partici
 	}
 
 	cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_RESOURCE_X);
-	if (!ClusterLockBufferExclusiveRetryAware(buffer)) {
+	if (!ctrc_cleaner_lock_buffer(buffer)) {
 		ReleaseBuffer(buffer);
 		cluster_semantic_activation_leave(&admission);
 		return false;
@@ -8412,7 +8524,8 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	locator.dbOid = receipt->target.db_oid;
 	locator.relNumber = receipt->target.rel_number;
 	if (cluster_shared_config
-		&& !cluster_space_relation_read_maintenance_identity(locator, &space_identity)) {
+		&& !cluster_space_relation_read_maintenance_identity_with_lock(locator, &space_identity,
+																	   ctrc_cleaner_lock_buffer)) {
 		cluster_semantic_activation_leave(&admission);
 		return false;
 	}
@@ -8434,7 +8547,7 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	/* First Resource-X round captures page dependencies, then releases every
 	 * page lock before sampling foreign durability. */
 	cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_RESOURCE_X);
-	if (!ClusterLockBufferExclusiveRetryAware(buffer)) {
+	if (!ctrc_cleaner_lock_buffer(buffer)) {
 		ReleaseBuffer(buffer);
 		cluster_semantic_activation_leave(&admission);
 		return false;
@@ -8518,7 +8631,7 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	/* Reacquire a fresh exact Resource-X/current page and require the
 	 * dependency vector to be unchanged before the WAL-protected rewrite. */
 	cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_RESOURCE_X);
-	if (!ClusterLockBufferExclusiveRetryAware(buffer)) {
+	if (!ctrc_cleaner_lock_buffer(buffer)) {
 		ReleaseBuffer(buffer);
 		cluster_semantic_activation_leave(&admission);
 		return false;
@@ -8658,17 +8771,37 @@ ctrc_cleaner_clean_next_receipt(void)
 	ClusterCtrcReceipt receipt;
 	uint64 participant_index;
 	uint64 receipt_index;
-	bool cleaned;
+	volatile bool cleaned = false;
+	volatile bool missed = false;
 
 	if (!ctrc_cleaner_next_applied_receipt(&participant, &receipt, &participant_index,
 										   &receipt_index))
 		return false;
-	if (receipt.publication.reference_kind == CTRC_REF_HEAP_ITL_UBA)
-		cleaned = ctrc_cleaner_clean_itl_receipt(&participant, &receipt, participant_index,
-												 receipt_index);
-	else
-		cleaned = ctrc_cleaner_clean_current_mx_receipt(&participant, &receipt, participant_index,
-														receipt_index);
+	Assert(!CtrcTryLocalX && !CtrcLocalXMiss);
+	CtrcTryLocalX = ctrc_cleaner_try_local_once(&receipt, receipt_index);
+	if (!CtrcTryLocalX)
+		cluster_ctrc_stat_bump(CTRC_STAT_CLEANER_FORCED_RECEIPT);
+	PG_TRY();
+	{
+		if (receipt.publication.reference_kind == CTRC_REF_HEAP_ITL_UBA)
+			cleaned = ctrc_cleaner_clean_itl_receipt(&participant, &receipt, participant_index,
+													 receipt_index);
+		else
+			cleaned = ctrc_cleaner_clean_current_mx_receipt(&participant, &receipt,
+															participant_index, receipt_index);
+		missed = CtrcLocalXMiss;
+	}
+	PG_FINALLY();
+	{
+		CtrcTryLocalX = CtrcLocalXMiss = false;
+	}
+	PG_END_TRY();
+	if (missed && !cleaned) {
+		cluster_ctrc_stat_bump(CTRC_STAT_CLEANER_YIELD);
+		/* A one-shot continuation, also in pressure-only interval=0 mode.
+		 * This is deliberately not counted as completed semantic progress. */
+		cluster_undo_cleaner_wakeup();
+	}
 	if (cleaned)
 		cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_NONE);
 	return cleaned;

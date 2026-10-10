@@ -203,6 +203,13 @@ cluster_undo_cleaner_wakeup(void)
 			SetLatch(latches[i]);
 }
 
+void
+cluster_undo_cleaner_pressure_wakeup(void)
+{
+	cluster_ctrc_cleaner_note_pressure();
+	cluster_undo_cleaner_wakeup();
+}
+
 bool
 cluster_undo_cleaner_worker_snapshot(unsigned worker_id, UndoCleanerWorkerState *out)
 {
@@ -343,7 +350,7 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 				undo_cleaner_state->capacity_wait_refused_proof++;
 			LWLockRelease(&undo_cleaner_state->lwlock);
 			if (supplied) {
-				cluster_undo_cleaner_wakeup();
+				cluster_undo_cleaner_pressure_wakeup();
 				/* Timeout is only the existing floor-report recheck cadence,
 				 * not a new failure deadline or a reason to assume FREE. */
 				(void)ConditionVariableTimedSleep(&undo_cleaner_state->capacity_cv,

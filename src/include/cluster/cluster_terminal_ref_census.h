@@ -110,6 +110,14 @@ typedef enum ClusterCtrcStatId {
 	CTRC_STAT_OBSERVATION_AGE_MS,
 	CTRC_STAT_RECEIPT_PREPARE_REFUSED,
 	CTRC_STAT_RECEIPT_NAMESPACE_REFUSED,
+	CTRC_STAT_CLEANER_YIELD,
+	CTRC_STAT_CLEANER_FORCED_RECEIPT,
+	CTRC_STAT_CLEANER_CONDITIONAL_X_ATTEMPT,
+	CTRC_STAT_CLEANER_CONDITIONAL_X_HIT,
+	CTRC_STAT_CLEANER_ORIGINAL_X_ATTEMPT,
+	CTRC_STAT_CLEANER_ORIGINAL_X_ACQUIRED,
+	CTRC_STAT_CLEANER_RECEIPT_COMPLETED,
+	CTRC_STAT_CLEANER_PRESSURE_WAKE,
 	CTRC_STAT_COUNT
 } ClusterCtrcStatId;
 
@@ -735,6 +743,9 @@ typedef struct ClusterCtrcDebugSnapshot {
 	uint64 receipt_cancelled;
 	uint64 receipt_ack_frozen;
 	uint64 receipt_blocked;
+	uint64 receipt_pending;
+	uint64 receipt_oldest_pending_age_ms;
+	uint64 receipt_pending_age_unknown;
 	uint64 full_refusal_count;
 	uint64 test_barrier_hit_count;
 	uint32 test_barrier_phase;
@@ -806,6 +817,7 @@ extern void cluster_ctrc_cleaner_reason_set(ClusterCtrcCleanerReason reason);
 extern bool cluster_ctrc_cleaner_bind_worker(unsigned worker_id);
 extern uint64 cluster_ctrc_cleaner_local_progress(void);
 extern uint64 cluster_ctrc_cleaner_local_passes(void);
+extern void cluster_ctrc_cleaner_note_pressure(void);
 extern ClusterCtrcCleanerReason cluster_ctrc_cleaner_worker_reason(unsigned worker_id);
 extern bool cluster_ctrc_cleaner_worker_observation(unsigned worker_id,
 													ClusterCtrcCleanerWorkerObservation *out);

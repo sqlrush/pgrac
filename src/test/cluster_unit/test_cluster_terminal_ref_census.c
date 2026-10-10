@@ -2496,19 +2496,22 @@ UT_TEST(test_ctrc_cleaner_resource_x_not_ready_is_a_clean_retry)
 								   "ClusterLockBufferExclusiveRetryAware(Buffer buffer)"));
 	UT_ASSERT_EQ(source_file_occurrences("src/backend/cluster/cluster_terminal_ref_census.c",
 										 "ClusterLockBufferExclusiveRetryAware(buffer)"),
+				 1);
+	UT_ASSERT_EQ(source_file_occurrences("src/backend/cluster/cluster_terminal_ref_census.c",
+										 "ctrc_cleaner_lock_buffer(buffer)"),
 				 5);
 	UT_ASSERT_EQ(source_file_occurrences("src/backend/cluster/cluster_terminal_ref_census.c",
 										 "LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);"),
 				 0);
 	UT_ASSERT_EQ(source_file_occurrences("src/backend/cluster/cluster_terminal_ref_census.c",
-										 "if (!ClusterLockBufferExclusiveRetryAware(buffer)) {\n"
+										 "if (!ctrc_cleaner_lock_buffer(buffer)) {\n"
 										 "\t\tReleaseBuffer(buffer);\n"
 										 "\t\tcluster_semantic_activation_leave(&admission);\n"
 										 "\t\treturn false;\n"
 										 "\t}"),
 				 4);
 	UT_ASSERT_EQ(source_file_occurrences("src/backend/cluster/cluster_terminal_ref_census.c",
-										 "if (!ClusterLockBufferExclusiveRetryAware(buffer)) {\n"
+										 "if (!ctrc_cleaner_lock_buffer(buffer)) {\n"
 										 "\t\t\tReleaseBuffer(buffer);\n"
 										 "\t\t\tcluster_semantic_activation_leave(&admission);\n"
 										 "\t\t\treturn false;\n"
@@ -3227,6 +3230,14 @@ UT_TEST(test_ctrc_observability_names_are_closed_and_total)
 		"observation_age_ms",
 		"receipt_prepare_refused_count",
 		"receipt_namespace_refused_count",
+		"cleaner_yield_count",
+		"cleaner_forced_receipt_count",
+		"cleaner_conditional_x_attempt_count",
+		"cleaner_conditional_x_hit_count",
+		"cleaner_original_x_attempt_count",
+		"cleaner_original_x_acquired_count",
+		"cleaner_receipt_completed_count",
+		"cleaner_pressure_wake_count",
 	};
 	static const char *const reason_names[] = {
 		"NONE",			  "PREPARED_DRAIN",	 "RESOURCE_X",		   "PAGE_REVALIDATE",

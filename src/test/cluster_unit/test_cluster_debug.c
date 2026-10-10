@@ -92,6 +92,7 @@ static char captured_formatted_values[CAPTURED_FORMATTED_VALUES_MAX][128];
 static int captured_formatted_value_count;
 static int captured_undo_observation_ensure_calls;
 static int captured_pi_retire_accessor_calls;
+static ClusterCtrcDebugSnapshot test_ctrc_observation;
 
 /* Link-only startup/config stubs.  cluster_startup_phase.o is part of this
  * standalone binary, while the owning GUC/LMS/qvotec objects are not. */
@@ -489,7 +490,7 @@ cluster_multixact_get_mxid_underivable_read_count(void)
 const char *
 cluster_ctrc_stat_name(ClusterCtrcStatId stat)
 {
-	static const char *const names[CTRC_STAT_COUNT] = {
+	static const char *const names[] = {
 		[CTRC_STAT_GRANT_ISSUED] = "grant_issued_count",
 		[CTRC_STAT_GRANT_REFUSED] = "grant_refused_count",
 		[CTRC_STAT_RECEIPT_PREPARED] = "receipt_prepared_count",
@@ -521,7 +522,17 @@ cluster_ctrc_stat_name(ClusterCtrcStatId stat)
 		[CTRC_STAT_OBSERVATION_AGE_MS] = "observation_age_ms",
 		[CTRC_STAT_RECEIPT_PREPARE_REFUSED] = "receipt_prepare_refused_count",
 		[CTRC_STAT_RECEIPT_NAMESPACE_REFUSED] = "receipt_namespace_refused_count",
+		[CTRC_STAT_CLEANER_YIELD] = "cleaner_yield_count",
+		[CTRC_STAT_CLEANER_FORCED_RECEIPT] = "cleaner_forced_receipt_count",
+		[CTRC_STAT_CLEANER_CONDITIONAL_X_ATTEMPT] = "cleaner_conditional_x_attempt_count",
+		[CTRC_STAT_CLEANER_CONDITIONAL_X_HIT] = "cleaner_conditional_x_hit_count",
+		[CTRC_STAT_CLEANER_ORIGINAL_X_ATTEMPT] = "cleaner_original_x_attempt_count",
+		[CTRC_STAT_CLEANER_ORIGINAL_X_ACQUIRED] = "cleaner_original_x_acquired_count",
+		[CTRC_STAT_CLEANER_RECEIPT_COMPLETED] = "cleaner_receipt_completed_count",
+		[CTRC_STAT_CLEANER_PRESSURE_WAKE] = "cleaner_pressure_wake_count",
 	};
+	StaticAssertStmt(lengthof(names) == CTRC_STAT_COUNT,
+					 "CTRC fixture counter names must be complete");
 
 	return stat >= 0 && stat < CTRC_STAT_COUNT ? names[stat] : NULL;
 }
@@ -547,7 +558,7 @@ cluster_ctrc_cleaner_reason_get(void)
 bool
 cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
 {
-	MemSet(snapshot, 0, sizeof(*snapshot));
+	*snapshot = test_ctrc_observation;
 	return true;
 }
 /* spec-6.14 D5 stub: dump_catalog reads the shared relmap authority header;
@@ -5533,6 +5544,9 @@ UT_TEST(test_debug_dump_exposes_closed_ctrc_observability)
 	memset(captured_dump_values, 0, sizeof(captured_dump_values));
 	captured_dump_row_count = 0;
 	captured_formatted_value_count = 0;
+	test_ctrc_observation.receipt_pending = 13;
+	test_ctrc_observation.receipt_oldest_pending_age_ms = 1800;
+	test_ctrc_observation.receipt_pending_age_unknown = 1;
 	fcinfo->resultinfo = (fmNodePtr)&rsinfo;
 	(void)cluster_dump_state(fcinfo);
 
@@ -5545,6 +5559,13 @@ UT_TEST(test_debug_dump_exposes_closed_ctrc_observability)
 	UT_ASSERT_EQ(captured_dump_count("ctrc", "participant_ack_frozen"), 1);
 	UT_ASSERT_EQ(captured_dump_count("ctrc", "receipt_applied"), 1);
 	UT_ASSERT_EQ(captured_dump_count("ctrc", "full_refusal_count"), 1);
+	UT_ASSERT_EQ(captured_dump_count("ctrc", "receipt_pending"), 1);
+	UT_ASSERT_EQ(captured_dump_count("ctrc", "receipt_oldest_pending_age_ms"), 1);
+	UT_ASSERT_EQ(captured_dump_count("ctrc", "receipt_pending_age_unknown"), 1);
+	UT_ASSERT_STR_EQ(captured_dump_value("ctrc", "receipt_pending"), "13");
+	UT_ASSERT_STR_EQ(captured_dump_value("ctrc", "receipt_oldest_pending_age_ms"), "1800");
+	UT_ASSERT_STR_EQ(captured_dump_value("ctrc", "receipt_pending_age_unknown"), "1");
+	MemSet(&test_ctrc_observation, 0, sizeof(test_ctrc_observation));
 }
 
 /* ============================================================

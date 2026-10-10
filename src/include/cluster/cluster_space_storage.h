@@ -40,6 +40,12 @@ extern bool cluster_space_relation_read_identity(RelFileLocator locator, Cluster
 extern bool cluster_space_relation_read_maintenance_identity(RelFileLocator locator,
 															 ClusterSpaceIdentity *out);
 
+/* Same identity proof, with the maintenance owner's native X acquisition.
+ * A successful locker holds content X; false must leave no content lock. */
+extern bool cluster_space_relation_read_maintenance_identity_with_lock(RelFileLocator locator,
+																	   ClusterSpaceIdentity *out,
+																	   bool (*lock_buffer)(Buffer));
+
 /* Recovery executor, under its existing isolation and selected restart input.
  * Uses restart namespace, never current writer/relcache or identity creation.
  * Same output/locking contract as the runtime raw reader; not admission. */

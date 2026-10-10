@@ -964,6 +964,8 @@ UT_TEST(test_shared_pool_capacity_is_not_a_per_shard_quota)
 	UT_ASSERT(ctrc_participant_index(&origin->key, 0, &participant_index));
 	for (uint64 i = 0; i < CtrcShared->receipt_entries; i++) {
 		UT_ASSERT_EQ(prepare_fixture_receipt(origin, i + 1, &handle), CLUSTER_CTRC_PREPARE_READY);
+		/* A consumed local-attempt quota belongs to this exact publication. */
+		ctrc_receipt_links()[handle.receipt_index].yielded = 1;
 		UT_ASSERT_EQ(prepare_fixture_receipt(origin, i + 1, &duplicate),
 					 CLUSTER_CTRC_PREPARE_DUPLICATE);
 		UT_ASSERT_EQ(duplicate.receipt_index, handle.receipt_index);
@@ -1453,6 +1455,8 @@ UT_TEST(test_shared_whole_pool_reclaim_and_old_handle_replay)
 	UT_ASSERT_EQ(replacement.state, CTRC_RECEIPT_PREPARED);
 	UT_ASSERT(replacement.publication.journal_slot_generation
 			  != old_handle.journal_slot_generation);
+	UT_ASSERT_EQ(ctrc_receipt_links()[old_handle.receipt_index].yielded, 0);
+	UT_ASSERT_EQ(ctrc_receipt_links()[old_handle.receipt_index].prepared_at_us, test_now_us);
 	UT_ASSERT(!cluster_ctrc_receipt_cancel_shared(&old_handle));
 	UT_ASSERT_EQ(memcmp(&replacement, old_handle.receipt, sizeof(replacement)), 0);
 	UT_ASSERT_EQ(held_count, 0);
@@ -2155,6 +2159,7 @@ UT_TEST(test_actual_driver_ignores_other_progress_and_clears_error_batch)
 	UT_ASSERT_EQ(cluster_ctrc_cleaner_local_progress(), 1);
 	UT_ASSERT_EQ(cluster_ctrc_cleaner_local_passes(), 2);
 	seed_origin(1, 0);
+	cluster_ctrc_cleaner_note_pressure();
 	driver_interrupt = true;
 	PG_TRY();
 	{
@@ -2170,7 +2175,51 @@ UT_TEST(test_actual_driver_ignores_other_progress_and_clears_error_batch)
 	UT_ASSERT_EQ(cluster_ctrc_cleaner_local_passes(), 2);
 	UT_ASSERT(ctrc_bytes_zero(&CtrcBatch, sizeof(CtrcBatch)));
 	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT_EQ(CtrcPressureSeen, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->cleaner_pressure_sequence), 1);
 	driver_interrupt = driver_other_progress = false;
+	(void)ctrc_fixture_run_pass();
+	UT_ASSERT_EQ(CtrcPressureSeen, 1);
+}
+
+UT_TEST(test_pending_age_keeps_prepare_time_and_reports_unprovable_samples)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcReceiptHandle handle, duplicate;
+	ClusterCtrcDebugSnapshot snapshot;
+	CtrcReceiptLink *link;
+
+	reset_fixture();
+	origin = seed_origin(0, 1);
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 1, &handle), CLUSTER_CTRC_PREPARE_READY);
+	link = &ctrc_receipt_links()[handle.receipt_index];
+	test_now_us += UINT64_C(4200000);
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 1, &duplicate), CLUSTER_CTRC_PREPARE_DUPLICATE);
+	UT_ASSERT_EQ(handle.receipt_index, duplicate.receipt_index);
+	UT_ASSERT(cluster_ctrc_debug_snapshot(&snapshot));
+	UT_ASSERT_EQ(snapshot.receipt_pending, 1);
+	UT_ASSERT_EQ(snapshot.receipt_oldest_pending_age_ms, 4200);
+	UT_ASSERT_EQ(snapshot.receipt_pending_age_unknown, 0);
+	for (unsigned fault = 0; fault < 3; fault++) {
+		CtrcReceiptLink saved = *link;
+
+		if (fault == 0)
+			link->prepared_at_us = 0;
+		else if (fault == 1)
+			link->prepared_at_us = test_now_us + 1;
+		else
+			link->journal_generation++;
+		UT_ASSERT(cluster_ctrc_debug_snapshot(&snapshot));
+		UT_ASSERT_EQ(snapshot.receipt_pending, 1);
+		UT_ASSERT_EQ(snapshot.receipt_pending_age_unknown, 1);
+		UT_ASSERT_EQ(snapshot.receipt_oldest_pending_age_ms, 0);
+		*link = saved;
+	}
+	UT_ASSERT(cluster_ctrc_receipt_cancel_shared(&handle));
+	UT_ASSERT(cluster_ctrc_debug_snapshot(&snapshot));
+	UT_ASSERT_EQ(snapshot.receipt_pending, 0);
+	UT_ASSERT_EQ(snapshot.receipt_oldest_pending_age_ms, 0);
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_CLEANER_RECEIPT_COMPLETED), 0);
 }
 
 UT_TEST(test_normal_stop_uninitialized_and_empty_observation)
@@ -2454,7 +2503,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(55);
+	UT_PLAN(56);
 	printf("# CTRC header_bytes=%zu total_bytes=%zu\n", sizeof(ClusterCtrcSharedHeader),
 		   capacity.total_bytes);
 	UT_RUN(test_new_seals_do_not_starve_old_pending);
@@ -2504,6 +2553,7 @@ main(void)
 	UT_RUN(test_receipt_and_ack_select_only_canonical_worker);
 	UT_RUN(test_foreign_progress_and_observations_cannot_drive_local_work);
 	UT_RUN(test_actual_driver_ignores_other_progress_and_clears_error_batch);
+	UT_RUN(test_pending_age_keeps_prepare_time_and_reports_unprovable_samples);
 	UT_RUN(test_normal_stop_uninitialized_and_empty_observation);
 	UT_RUN(test_normal_stop_reserved_origin_is_not_empty);
 	UT_RUN(test_normal_stop_origin_phases_and_invalid_override_pending);

@@ -4392,6 +4392,11 @@ dump_ctrc(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "ctrc", "receipt_cancelled", fmt_int64((int64)snapshot.receipt_cancelled));
 	emit_row(rsinfo, "ctrc", "receipt_ack_frozen", fmt_int64((int64)snapshot.receipt_ack_frozen));
 	emit_row(rsinfo, "ctrc", "receipt_blocked", fmt_int64((int64)snapshot.receipt_blocked));
+	emit_row(rsinfo, "ctrc", "receipt_pending", fmt_int64((int64)snapshot.receipt_pending));
+	emit_row(rsinfo, "ctrc", "receipt_oldest_pending_age_ms",
+			 fmt_int64((int64)snapshot.receipt_oldest_pending_age_ms));
+	emit_row(rsinfo, "ctrc", "receipt_pending_age_unknown",
+			 fmt_int64((int64)snapshot.receipt_pending_age_unknown));
 	emit_row(rsinfo, "ctrc", "full_refusal_count", fmt_int64((int64)snapshot.full_refusal_count));
 }
 

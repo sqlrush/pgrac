@@ -208,10 +208,19 @@ cluster_space_relation_read_identity(RelFileLocator locator, ClusterSpaceIdentit
 bool
 cluster_space_relation_read_maintenance_identity(RelFileLocator locator, ClusterSpaceIdentity *out)
 {
+	return cluster_space_relation_read_maintenance_identity_with_lock(
+		locator, out, ClusterLockBufferExclusiveRetryAware);
+}
+
+bool
+cluster_space_relation_read_maintenance_identity_with_lock(RelFileLocator locator,
+														   ClusterSpaceIdentity *out,
+														   bool (*lock_buffer)(Buffer))
+{
 	ClusterSpaceIdentityKey expected;
 	Buffer buffer;
 
-	if (out == NULL)
+	if (out == NULL || lock_buffer == NULL)
 		return false;
 	buffer = space_read_identity_buffer(locator, false, &expected);
 	if (!BufferIsValid(buffer))
@@ -219,7 +228,7 @@ cluster_space_relation_read_maintenance_identity(RelFileLocator locator, Cluster
 	/* The legacy shared-read requester is backend-indexed. Maintenance
 	 * already uses this current owner for its target page; use the same
 	 * auxiliary-capable path for the preceding identity read. */
-	if (!ClusterLockBufferExclusiveRetryAware(buffer)) {
+	if (!lock_buffer(buffer)) {
 		ReleaseBuffer(buffer);
 		return false;
 	}
