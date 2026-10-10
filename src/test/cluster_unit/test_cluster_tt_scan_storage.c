@@ -795,10 +795,66 @@ UT_TEST(test_foreign_namespace_keeps_original_full_scan)
 	}
 }
 
+static bool
+exact_storage_clog(TransactionId xid, void *arg)
+{
+	int *calls = arg;
+	UT_ASSERT_EQ(xid, SCAN_XID);
+	(*calls)++;
+	return true;
+}
+
+UT_TEST(test_exact_positive_real_lms_storage_missing_eio_short_and_hit)
+{
+	for (int role = 0; role < lengthof(scan_roles); role++) {
+		for (int state = 0; state < 4; state++) {
+			uint16 wrap = SCAN_SENTINEL;
+			int clog_calls = 0;
+			ClusterTTExactProofResult result;
+			if (!scan_begin_case(scan_roles[role]))
+				return;
+			if (state != 0)
+				scan_seed(1, SCAN_XID, TT_SLOT_COMMITTED, SCAN_WRAP, 42000, state == 2);
+			if (state == 1)
+				scan_eio_segment = 1;
+			result = cluster_tt_slot_durable_prove_committed(
+				1, SCAN_SLOT, SCAN_XID, 42000, exact_storage_clog, &clog_calls, &wrap);
+			UT_ASSERT_EQ(result,
+						 state == 3 ? CLUSTER_TT_EXACT_COMMITTED : CLUSTER_TT_EXACT_READ_FAILED);
+			UT_ASSERT_EQ(wrap, state == 3 ? SCAN_WRAP : 0);
+			UT_ASSERT_EQ(clog_calls, state == 3 ? 1 : 0);
+			UT_ASSERT_EQ(scan_calls, 0);
+			UT_ASSERT_EQ(scan_open_calls, 1);
+			UT_ASSERT_EQ(scan_pread_calls, state == 0 ? 0 : state == 3 ? 2 : 1);
+			scan_finish_case();
+		}
+	}
+}
+
+UT_TEST(test_exact_positive_does_not_wait_for_unrelated_publication)
+{
+	uint16 wrap = SCAN_SENTINEL;
+	int clog_calls = 0;
+	if (!scan_begin_case(B_LMS))
+		return;
+	scan_seed(1, SCAN_XID, TT_SLOT_COMMITTED, SCAN_WRAP, 42000, false);
+	UT_ASSERT(cluster_undo_inventory_publish_begin(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1));
+	UT_ASSERT_EQ(cluster_tt_slot_durable_prove_committed(1, SCAN_SLOT, SCAN_XID, 42000,
+														 exact_storage_clog, &clog_calls, &wrap),
+				 CLUSTER_TT_EXACT_COMMITTED);
+	UT_ASSERT_EQ(wrap, SCAN_WRAP);
+	UT_ASSERT_EQ(scan_calls, 0);
+	UT_ASSERT_EQ(scan_pread_calls, 2);
+	cluster_undo_inventory_publish_end(2, false);
+	scan_finish_case();
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(12);
+	UT_RUN(test_exact_positive_real_lms_storage_missing_eio_short_and_hit);
+	UT_RUN(test_exact_positive_does_not_wait_for_unrelated_publication);
 	UT_RUN(test_lms_both_scans_reuse_real_inventory);
 	UT_RUN(test_worker_both_scans_reuse_real_inventory);
 	UT_RUN(test_backend_both_scans_reuse_real_inventory);

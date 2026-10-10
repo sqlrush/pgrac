@@ -89,6 +89,7 @@ scn_time_cmp(SCN a, SCN b)
 
 UT_DEFINE_GLOBALS();
 
+
 static void (*g_epoch_hook)(void) = NULL;
 static void (*g_modifier_recheck_hook)(void) = NULL;
 
@@ -1263,6 +1264,245 @@ UT_TEST(test_slot_match_invalid_scn)
 /* ============================================================
  *	U4: cluster_tt_slot_durable_lookup (mocked smgr)
  * ============================================================ */
+
+typedef struct ExactCommitProbe {
+	bool committed;
+	int mutation;
+	int calls;
+	int reads_seen;
+} ExactCommitProbe;
+
+static void
+exact_slot_reset(void)
+{
+	UndoSegmentHeaderData *hdr = (UndoSegmentHeaderData *)g_canned_block;
+	reset_current_write_mock();
+	cluster_node_id = 0;
+	g_read_block_absent_once_segment = 0;
+	PageSetPageSizeAndVersion((Page)hdr, BLCKSZ, PG_PAGE_LAYOUT_VERSION);
+	((PageHeader)hdr)->pd_flags |= PD_UNDO_SEG_HEADER;
+	hdr->segment_id = 1;
+	hdr->owner_instance = 1;
+	hdr->segment_size_bytes = UNDO_SEGMENT_SIZE_BYTES;
+	hdr->tt_slots_count = TT_SLOTS_PER_SEGMENT;
+	hdr->segment_state = SEGMENT_ACTIVE;
+	hdr->wrap_count = 4;
+	hdr->tt_slots[0]
+		= (TTSlot){ .xid = 100, .wrap = 5, .status = TT_SLOT_COMMITTED, .commit_scn = 42000 };
+}
+
+static bool
+exact_commit_probe(TransactionId xid, void *arg)
+{
+	ExactCommitProbe *probe = arg;
+	UndoSegmentHeaderData *hdr = (UndoSegmentHeaderData *)g_canned_block;
+	UT_ASSERT_EQ(xid, 100);
+	probe->calls++;
+	probe->reads_seen = g_read_block_calls;
+	switch (probe->mutation) {
+	case 1:
+		hdr->tt_slots[0].xid++;
+		break;
+	case 2:
+		hdr->tt_slots[0].wrap++;
+		break;
+	case 3:
+		hdr->tt_slots[0].commit_scn++;
+		break;
+	case 4:
+		hdr->tt_slots[0].flags++;
+		break;
+	case 5:
+		hdr->wrap_count++;
+		break;
+	case 6:
+		hdr->owner_instance++;
+		break;
+	case 7: /* Other activity is not part of the target slot's identity. */
+		hdr->tt_slots[1].xid++;
+		hdr->total_records_written++;
+		break;
+	case 8:
+		g_read_block_ok = false;
+		break;
+	}
+	return probe->committed;
+}
+
+UT_TEST(test_exact_positive_committed_reads_only_target_twice)
+{
+	ExactCommitProbe probe = { .committed = true };
+	uint16 wrap = 99;
+	exact_slot_reset();
+	UT_ASSERT_EQ(cluster_tt_slot_durable_prove_committed(1, 0, 100, 42000, exact_commit_probe,
+														 &probe, &wrap),
+				 CLUSTER_TT_EXACT_COMMITTED);
+	UT_ASSERT_EQ(wrap, 5);
+	UT_ASSERT_EQ(g_read_block_calls, 2);
+	UT_ASSERT_EQ(probe.calls, 1);
+	UT_ASSERT_EQ(probe.reads_seen, 1);
+}
+
+UT_TEST(test_exact_positive_slot_reuse_is_not_zero_match)
+{
+	ExactCommitProbe probe = { .committed = true };
+	uint16 wrap = 99;
+	exact_slot_reset();
+	((UndoSegmentHeaderData *)g_canned_block)->tt_slots[0].xid++;
+	UT_ASSERT_EQ(cluster_tt_slot_durable_prove_committed(1, 0, 100, 42000, exact_commit_probe,
+														 &probe, &wrap),
+				 CLUSTER_TT_EXACT_SLOT_MISMATCH);
+	UT_ASSERT_EQ(wrap, 0);
+	UT_ASSERT_EQ(probe.calls, 0);
+	UT_ASSERT_EQ(g_read_block_calls, 1);
+}
+
+UT_TEST(test_exact_positive_nonterminal_and_scn_are_not_proofs)
+{
+	const uint8 statuses[]
+		= { TT_SLOT_UNUSED, TT_SLOT_ACTIVE, TT_SLOT_ABORTED, TT_SLOT_RECYCLABLE, 255 };
+	for (int i = 0; i < lengthof(statuses); i++) {
+		ExactCommitProbe probe = { .committed = true };
+		uint16 wrap = 99;
+		exact_slot_reset();
+		((UndoSegmentHeaderData *)g_canned_block)->tt_slots[0].status = statuses[i];
+		UT_ASSERT_EQ(cluster_tt_slot_durable_prove_committed(1, 0, 100, 42000, exact_commit_probe,
+															 &probe, &wrap),
+					 CLUSTER_TT_EXACT_NOT_COMMITTED);
+		UT_ASSERT_EQ(wrap, 0);
+		UT_ASSERT_EQ(probe.calls, 0);
+	}
+	for (int i = 0; i < 2; i++) {
+		ExactCommitProbe probe = { .committed = true };
+		uint16 wrap = 99;
+		exact_slot_reset();
+		((UndoSegmentHeaderData *)g_canned_block)->tt_slots[0].commit_scn = i ? 42001 : InvalidScn;
+		UT_ASSERT_EQ(cluster_tt_slot_durable_prove_committed(1, 0, 100, 42000, exact_commit_probe,
+															 &probe, &wrap),
+					 CLUSTER_TT_EXACT_SCN_MISMATCH);
+		UT_ASSERT_EQ(probe.calls, 0);
+		UT_ASSERT_EQ(wrap, 0);
+	}
+}
+
+UT_TEST(test_exact_positive_requires_literal_clog_commit)
+{
+	ExactCommitProbe probe = { .committed = false };
+	uint16 wrap = 99;
+	exact_slot_reset();
+	UT_ASSERT_EQ(cluster_tt_slot_durable_prove_committed(1, 0, 100, 42000, exact_commit_probe,
+														 &probe, &wrap),
+				 CLUSTER_TT_EXACT_CLOG_UNPROVEN);
+	UT_ASSERT_EQ(wrap, 0);
+	UT_ASSERT_EQ(probe.calls, 1);
+	UT_ASSERT_EQ(g_read_block_calls, 1);
+}
+
+UT_TEST(test_exact_positive_rejects_changed_slot_and_generation)
+{
+	const ClusterTTExactProofResult results[]
+		= { CLUSTER_TT_EXACT_SLOT_MISMATCH,	   CLUSTER_TT_EXACT_SLOT_MISMATCH,
+			CLUSTER_TT_EXACT_SLOT_MISMATCH,	   CLUSTER_TT_EXACT_SLOT_MISMATCH,
+			CLUSTER_TT_EXACT_IDENTITY_CHANGED, CLUSTER_TT_EXACT_IDENTITY_CHANGED };
+	for (int i = 0; i < lengthof(results); i++) {
+		ExactCommitProbe probe = { .committed = true, .mutation = i + 1 };
+		uint16 wrap = 99;
+		exact_slot_reset();
+		UT_ASSERT_EQ(cluster_tt_slot_durable_prove_committed(1, 0, 100, 42000, exact_commit_probe,
+															 &probe, &wrap),
+					 results[i]);
+		UT_ASSERT_EQ(wrap, 0);
+		UT_ASSERT_EQ(g_read_block_calls, 2);
+	}
+}
+
+UT_TEST(test_exact_positive_other_slot_activity_does_not_invalidate)
+{
+	ExactCommitProbe probe = { .committed = true, .mutation = 7 };
+	uint16 wrap = 99;
+	exact_slot_reset();
+	UT_ASSERT_EQ(cluster_tt_slot_durable_prove_committed(1, 0, 100, 42000, exact_commit_probe,
+														 &probe, &wrap),
+				 CLUSTER_TT_EXACT_COMMITTED);
+	UT_ASSERT_EQ(wrap, 5);
+	UT_ASSERT_EQ(g_read_block_calls, 2);
+}
+
+UT_TEST(test_exact_positive_read_failure_never_publishes)
+{
+	for (int i = 0; i < 2; i++) {
+		ExactCommitProbe probe = { .committed = true, .mutation = i ? 8 : 0 };
+		uint16 wrap = 99;
+		exact_slot_reset();
+		if (!i)
+			g_read_block_ok = false;
+		UT_ASSERT_EQ(cluster_tt_slot_durable_prove_committed(1, 0, 100, 42000, exact_commit_probe,
+															 &probe, &wrap),
+					 CLUSTER_TT_EXACT_READ_FAILED);
+		UT_ASSERT_EQ(wrap, 0);
+		UT_ASSERT_EQ(probe.calls, i);
+	}
+}
+
+UT_TEST(test_exact_positive_rejects_header_identity_and_invalid_wrap)
+{
+	for (int i = 0; i < 7; i++) {
+		ExactCommitProbe probe = { .committed = true };
+		uint16 wrap = 99;
+		UndoSegmentHeaderData *hdr;
+		exact_slot_reset();
+		hdr = (UndoSegmentHeaderData *)g_canned_block;
+		switch (i) {
+		case 0:
+			hdr->segment_id++;
+			break;
+		case 1:
+			hdr->owner_instance++;
+			break;
+		case 2:
+			hdr->segment_size_bytes--;
+			break;
+		case 3:
+			hdr->tt_slots_count--;
+			break;
+		case 4:
+			((PageHeader)hdr)->pd_flags &= ~PD_UNDO_SEG_HEADER;
+			break;
+		case 5:
+			hdr->segment_state = SEGMENT_INVALID;
+			break;
+		case 6:
+			hdr->tt_slots[0].wrap = TT_WRAP_INVALID;
+			break;
+		}
+		UT_ASSERT_EQ(cluster_tt_slot_durable_prove_committed(1, 0, 100, 42000, exact_commit_probe,
+															 &probe, &wrap),
+					 i == 6 ? CLUSTER_TT_EXACT_SLOT_MISMATCH : CLUSTER_TT_EXACT_IDENTITY_CHANGED);
+		UT_ASSERT_EQ(wrap, 0);
+		UT_ASSERT_EQ(probe.calls, 0);
+	}
+}
+
+UT_TEST(test_exact_positive_invalid_or_foreign_scope_does_not_read)
+{
+	for (int i = 0; i < 6; i++) {
+		ExactCommitProbe probe = { .committed = true };
+		uint16 wrap = 99;
+		exact_slot_reset();
+		UT_ASSERT_EQ(cluster_tt_slot_durable_prove_committed(
+						 i == 0	  ? 0
+						 : i == 1 ? CLUSTER_UNDO_SEGS_PER_INSTANCE + 1
+								  : 1,
+						 i == 2 ? TT_SLOTS_PER_SEGMENT : 0, i == 3 ? InvalidTransactionId : 100,
+						 i == 4 ? InvalidScn : 42000, i == 5 ? NULL : exact_commit_probe, &probe,
+						 &wrap),
+					 CLUSTER_TT_EXACT_SCOPE_UNPROVEN);
+		UT_ASSERT_EQ(wrap, 0);
+		UT_ASSERT_EQ(probe.calls, 0);
+		UT_ASSERT_EQ(g_read_block_calls, 0);
+	}
+}
+
 UT_TEST(test_lookup_match)
 {
 	SCN got = InvalidScn;
@@ -3696,7 +3936,7 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(112);
+	UT_PLAN(121);
 
 	UT_RUN(test_layout_sizes);
 
@@ -3712,6 +3952,15 @@ main(int argc, char **argv)
 	UT_RUN(test_slot_match_unused);
 	UT_RUN(test_slot_match_invalid_scn);
 
+	UT_RUN(test_exact_positive_committed_reads_only_target_twice);
+	UT_RUN(test_exact_positive_slot_reuse_is_not_zero_match);
+	UT_RUN(test_exact_positive_nonterminal_and_scn_are_not_proofs);
+	UT_RUN(test_exact_positive_requires_literal_clog_commit);
+	UT_RUN(test_exact_positive_rejects_changed_slot_and_generation);
+	UT_RUN(test_exact_positive_other_slot_activity_does_not_invalidate);
+	UT_RUN(test_exact_positive_read_failure_never_publishes);
+	UT_RUN(test_exact_positive_rejects_header_identity_and_invalid_wrap);
+	UT_RUN(test_exact_positive_invalid_or_foreign_scope_does_not_read);
 	UT_RUN(test_lookup_match);
 	UT_RUN(test_lookup_wrong_xid_miss);
 	UT_RUN(test_lookup_unused_miss);

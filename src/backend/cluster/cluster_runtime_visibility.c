@@ -3449,6 +3449,21 @@ rtvis_resolve_own_xid_freshref_c1b_pair(TransactionId raw_xid, uint32 undo_segme
 		= { .kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, .commit_scn = InvalidScn, .wrap = 0 };
 	uint16 wrap = 0;
 
+	{
+		uint64 epoch = cluster_epoch_get_current();
+		bool exact = cluster_cr_server_local_freshref_slot_exact(
+			raw_xid, undo_segment_id, expected_tt_slot_id, retained_commit_scn, &wrap);
+		if (cluster_epoch_get_current() != epoch)
+			return result;
+		if (exact) {
+			result.kind = CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+			result.commit_scn = retained_commit_scn;
+			result.wrap = wrap;
+			cluster_rtvis_resolve_note_committed();
+			return result;
+		}
+	}
+
 	/* A local immutable read can consume an already-proved origin terminal.
 	 * Preserve a same-stamp exact result before a later alias/slot lookup can
 	 * lose it; keep snapshot-relative bounds marked as bounds. The terminal

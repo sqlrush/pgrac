@@ -1559,6 +1559,65 @@ cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, Transactio
 	return true;
 }
 
+ClusterTTExactProofResult
+cluster_tt_slot_durable_prove_committed(uint32 segment_id, uint16 slot_offset, TransactionId xid,
+										SCN proposed_scn, ClusterTTExactCommitCheck check,
+										void *arg, uint16 *out_wrap)
+{
+	PGAlignedBlock first_block;
+	PGAlignedBlock second_block;
+	const UndoSegmentHeaderData *first = (const UndoSegmentHeaderData *)first_block.data;
+	const UndoSegmentHeaderData *second = (const UndoSegmentHeaderData *)second_block.data;
+	const TTSlot *slot;
+	uint8 owner;
+	bool read_ok;
+
+	if (out_wrap == NULL)
+		return CLUSTER_TT_EXACT_SCOPE_UNPROVEN;
+	*out_wrap = 0;
+	if (cluster_node_id < 0 || cluster_node_id > SCN_MAX_VALID_NODE_ID || segment_id == 0
+		|| segment_id > ((uint32)SCN_MAX_VALID_NODE_ID + 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE
+		|| slot_offset >= TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(xid)
+		|| !SCN_VALID(proposed_scn) || check == NULL)
+		return CLUSTER_TT_EXACT_SCOPE_UNPROVEN;
+	owner = tt_owner_instance_for_segment(segment_id);
+	if (owner != (uint8)(cluster_node_id + 1))
+		return CLUSTER_TT_EXACT_SCOPE_UNPROVEN;
+
+	cluster_tt_durable_io_wait_start();
+	read_ok = cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RUNTIME_SHARED, segment_id, owner, 0,
+										   first_block.data);
+	cluster_tt_durable_io_wait_end();
+	if (!read_ok)
+		return CLUSTER_TT_EXACT_READ_FAILED;
+	if (!UndoSegmentHeader_identity_matches(first_block.data, segment_id, owner))
+		return CLUSTER_TT_EXACT_IDENTITY_CHANGED;
+	slot = &first->tt_slots[slot_offset];
+	if (slot->xid != xid || slot->wrap == TT_WRAP_INVALID)
+		return CLUSTER_TT_EXACT_SLOT_MISMATCH;
+	if (slot->status != TT_SLOT_COMMITTED)
+		return CLUSTER_TT_EXACT_NOT_COMMITTED;
+	if (!SCN_VALID(slot->commit_scn) || slot->commit_scn != proposed_scn)
+		return CLUSTER_TT_EXACT_SCN_MISMATCH;
+	if (!check(xid, arg))
+		return CLUSTER_TT_EXACT_CLOG_UNPROVEN;
+
+	cluster_tt_durable_io_wait_start();
+	read_ok = cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RUNTIME_SHARED, segment_id, owner, 0,
+										   second_block.data);
+	cluster_tt_durable_io_wait_end();
+	if (!read_ok)
+		return CLUSTER_TT_EXACT_READ_FAILED;
+	if (!UndoSegmentHeader_identity_matches(second_block.data, segment_id, owner)
+		|| second->wrap_count != first->wrap_count)
+		return CLUSTER_TT_EXACT_IDENTITY_CHANGED;
+	if (memcmp(slot, &second->tt_slots[slot_offset], sizeof(*slot)) != 0)
+		return CLUSTER_TT_EXACT_SLOT_MISMATCH;
+
+	*out_wrap = slot->wrap;
+	return CLUSTER_TT_EXACT_COMMITTED;
+}
+
 bool
 cluster_tt_slot_durable_lookup_committed_stable(uint32 segment_id, uint16 slot_offset,
 												TransactionId xid, uint32 expected_wrap,

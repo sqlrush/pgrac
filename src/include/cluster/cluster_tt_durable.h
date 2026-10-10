@@ -263,6 +263,28 @@ extern void cluster_tt_slot_durable_abort(uint32 segment_id, uint16 slot_offset,
 extern bool cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, TransactionId xid,
 										   uint32 expected_wrap, SCN *commit_scn);
 
+typedef enum ClusterTTExactProofResult {
+	CLUSTER_TT_EXACT_COMMITTED = 0,
+	CLUSTER_TT_EXACT_SLOT_MISMATCH,
+	CLUSTER_TT_EXACT_NOT_COMMITTED,
+	CLUSTER_TT_EXACT_SCN_MISMATCH,
+	CLUSTER_TT_EXACT_READ_FAILED,
+	CLUSTER_TT_EXACT_IDENTITY_CHANGED,
+	CLUSTER_TT_EXACT_CLOG_UNPROVEN,
+	CLUSTER_TT_EXACT_SCOPE_UNPROVEN,
+	CLUSTER_TT_EXACT_RESULT_COUNT
+} ClusterTTExactProofResult;
+typedef bool (*ClusterTTExactCommitCheck)(TransactionId xid, void *arg);
+/* Positive-only own-origin proof. Caller holds the no-raw-xid-reuse fence.
+ * Failure is not a zero-match census and grants no terminal authority. */
+extern ClusterTTExactProofResult
+cluster_tt_slot_durable_prove_committed(uint32 segment_id, uint16 slot_offset, TransactionId xid,
+										SCN proposed_scn, ClusterTTExactCommitCheck check,
+										void *arg, uint16 *out_wrap);
+
+extern void cluster_tt_durable_count_exact(ClusterTTExactProofResult result);
+extern uint64 cluster_tt_durable_exact_count(ClusterTTExactProofResult result);
+
 typedef bool (*ClusterTTDurableXidCommitCheck)(TransactionId xid);
 
 /*

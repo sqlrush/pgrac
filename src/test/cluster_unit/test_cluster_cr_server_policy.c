@@ -16,8 +16,8 @@
  *	  src/test/cluster_unit/test_cluster_cr_server_policy.c
  *
  * NOTES
- *	  This is a pgrac-original file.  Links cluster_cr_server_policy.o
- *	  only; the policy is pure (no shmem / locks / elog).
+ *	  This is a pgrac-original file.  Also links the real sectioned
+ *	  CR-server resolver; storage, CLOG and lock boundaries are fixtures.
  *
  *-------------------------------------------------------------------------
  */
@@ -48,6 +48,30 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+/* Only the pre-interface RED build defines this flag.  Normal builds use
+ * the production header, so an API drift is a compile failure, not a stub
+ * silently accepting a different contract. */
+#ifdef CLUSTER_TT_EXACT_PROOF_RED
+typedef enum ClusterTTExactProofResult {
+	CLUSTER_TT_EXACT_COMMITTED = 0,
+	CLUSTER_TT_EXACT_SLOT_MISMATCH,
+	CLUSTER_TT_EXACT_NOT_COMMITTED,
+	CLUSTER_TT_EXACT_SCN_MISMATCH,
+	CLUSTER_TT_EXACT_READ_FAILED,
+	CLUSTER_TT_EXACT_IDENTITY_CHANGED,
+	CLUSTER_TT_EXACT_CLOG_UNPROVEN,
+	CLUSTER_TT_EXACT_SCOPE_UNPROVEN,
+	CLUSTER_TT_EXACT_RESULT_COUNT
+} ClusterTTExactProofResult;
+typedef bool (*ClusterTTExactCommitCheck)(TransactionId xid, void *arg);
+extern ClusterTTExactProofResult
+cluster_tt_slot_durable_prove_committed(uint32 segment_id, uint16 slot_offset, TransactionId xid,
+										SCN proposed_scn, ClusterTTExactCommitCheck check,
+										void *arg, uint16 *out_wrap);
+extern void cluster_tt_durable_count_exact(ClusterTTExactProofResult result);
+extern uint64 cluster_tt_durable_exact_count(ClusterTTExactProofResult result);
+#endif
 
 sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
@@ -128,10 +152,13 @@ typedef enum C0TestEvent {
 	C0_EV_NATIVE_UNLOCK,
 	C0_EV_RELEASE_ALL,
 	C0_EV_RETENTION,
-	C0_EV_BOUND
+	C0_EV_BOUND,
+	C0_EV_EXACT,
+	C0_EV_EXACT_CHECK,
+	C0_EV_EXACT_RETURN
 } C0TestEvent;
 
-static C0TestEvent c0_events[32];
+static C0TestEvent c0_events[64];
 static int c0_event_count;
 static ClusterTTDurableResolve c0_resolve;
 static SCN c0_resolved_scn;
@@ -170,6 +197,17 @@ static int c0_did_abort_calls;
 static int c0_retention_calls;
 static int c0_bound_calls;
 static int c0_native_provable_calls;
+static ClusterTTExactProofResult c0_exact_result;
+static uint64 c0_exact_counts[CLUSTER_TT_EXACT_RESULT_COUNT];
+static int c0_exact_calls;
+static int c0_exact_check_calls;
+static uint16 c0_exact_slot;
+static bool c0_exact_check_active;
+static bool c0_exact_read_error;
+static int c0_exact_scope_drift;
+static bool c0_exact_armed;
+static bool c0_recovery;
+static uint64 c0_epoch;
 
 static void
 c0_note(C0TestEvent event)
@@ -240,9 +278,91 @@ c0_reset(void)
 	c0_retention_calls = 0;
 	c0_bound_calls = 0;
 	c0_native_provable_calls = 0;
+	c0_exact_result = CLUSTER_TT_EXACT_READ_FAILED;
+	memset(c0_exact_counts, 0, sizeof(c0_exact_counts));
+	c0_exact_calls = 0;
+	c0_exact_check_calls = 0;
+	c0_exact_slot = 0;
+	c0_exact_check_active = false;
+	c0_exact_read_error = false;
+	c0_exact_scope_drift = 0;
+	c0_exact_armed = false;
+	c0_recovery = false;
+	c0_epoch = 7;
 	InterruptHoldoffCount = 0;
 	memset(&c0_variable_cache, 0, sizeof(c0_variable_cache));
 	c0_variable_cache.oldestClogXid = FirstNormalTransactionId;
+}
+
+/* Only the durable slot result is modeled.  The real consumer supplies and
+ * executes the CLOG callback under its native/truncation fences.  Physical
+ * double reads and slot-byte comparisons belong to the TT storage suite. */
+ClusterTTExactProofResult
+cluster_tt_slot_durable_prove_committed(uint32 segment_id, uint16 slot_offset, TransactionId xid,
+										SCN proposed_scn, ClusterTTExactCommitCheck check,
+										void *arg, uint16 *out_wrap)
+{
+	bool committed;
+
+	c0_exact_calls++;
+	c0_note(C0_EV_EXACT);
+	UT_ASSERT_EQ(c0_native_lock_depth, 1);
+	UT_ASSERT_EQ(c0_xact_lock_depth, 0);
+	if (c0_exact_armed) {
+		UT_ASSERT_EQ(segment_id, 7);
+		UT_ASSERT_EQ(slot_offset, c0_exact_slot);
+		UT_ASSERT_EQ(xid, 4195136);
+		UT_ASSERT_EQ(proposed_scn, (SCN)10498);
+	}
+	UT_ASSERT_NOT_NULL(check);
+	UT_ASSERT_NOT_NULL(out_wrap);
+	if (out_wrap != NULL)
+		*out_wrap = 0;
+	if (c0_exact_read_error) {
+		/* A physical read ERROR occurs before entering the CLOG callback. */
+		InterruptHoldoffCount = 0;
+		UT_ASSERT_NOT_NULL(PG_exception_stack);
+		if (PG_exception_stack != NULL)
+			siglongjmp(*PG_exception_stack, 1);
+		abort();
+	}
+	if (c0_exact_result != CLUSTER_TT_EXACT_COMMITTED)
+		return c0_exact_result;
+	if (check == NULL || out_wrap == NULL)
+		return CLUSTER_TT_EXACT_CLOG_UNPROVEN;
+	c0_exact_check_calls++;
+	c0_note(C0_EV_EXACT_CHECK);
+	c0_exact_check_active = true;
+	committed = check(xid, arg);
+	c0_exact_check_active = false;
+	UT_ASSERT_EQ(c0_native_lock_depth, 1);
+	UT_ASSERT_EQ(c0_xact_lock_depth, 0);
+	if (c0_exact_scope_drift == 1)
+		c0_epoch++;
+	if (c0_exact_scope_drift == 2)
+		cluster_node_id++;
+	if (c0_exact_scope_drift == 3)
+		c0_epoch0_origin_provable = false;
+	c0_note(C0_EV_EXACT_RETURN);
+	if (!committed)
+		return CLUSTER_TT_EXACT_CLOG_UNPROVEN;
+	*out_wrap = 11;
+	return CLUSTER_TT_EXACT_COMMITTED;
+}
+
+void
+cluster_tt_durable_count_exact(ClusterTTExactProofResult result)
+{
+	UT_ASSERT(result >= 0 && result < CLUSTER_TT_EXACT_RESULT_COUNT);
+	if (result >= 0 && result < CLUSTER_TT_EXACT_RESULT_COUNT)
+		c0_exact_counts[result]++;
+}
+
+uint64
+cluster_tt_durable_exact_count(ClusterTTExactProofResult result)
+{
+	UT_ASSERT(result >= 0 && result < CLUSTER_TT_EXACT_RESULT_COUNT);
+	return result >= 0 && result < CLUSTER_TT_EXACT_RESULT_COUNT ? c0_exact_counts[result] : 0;
 }
 
 ClusterTTDurableResolve
@@ -290,6 +410,11 @@ TransactionIdIsInProgress(TransactionId xid pg_attribute_unused())
 XidStatus
 TransactionIdGetStatus(TransactionId xid pg_attribute_unused(), XLogRecPtr *lsn)
 {
+	if (c0_exact_check_active) {
+		UT_ASSERT_EQ(xid, 4195136);
+		UT_ASSERT_EQ(c0_native_lock_depth, 1);
+		UT_ASSERT_EQ(c0_xact_lock_depth, 1);
+	}
 	c0_raw_clog_calls++;
 	c0_note(C0_EV_CLOG);
 	if (lsn != NULL)
@@ -349,7 +474,13 @@ cluster_cr_native_origin_epoch0_provable(TransactionId xid pg_attribute_unused()
 uint64
 cluster_epoch_get_current(void)
 {
-	return 7;
+	return c0_epoch;
+}
+
+bool
+RecoveryInProgress(void)
+{
+	return c0_recovery;
 }
 
 XLogRecPtr
@@ -424,6 +555,12 @@ errstart_cold(int elevel, const char *domain)
 
 int
 errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+int
+errdetail(const char *fmt pg_attribute_unused(), ...)
 {
 	return 0;
 }
@@ -546,6 +683,8 @@ bool
 LWLockAcquire(LWLock *lock, LWLockMode mode pg_attribute_unused())
 {
 	UT_ASSERT(lock == XactTruncationLock);
+	if (c0_exact_check_active)
+		UT_ASSERT_EQ(mode, LW_SHARED);
 	c0_note(C0_EV_XACT_LOCK);
 	c0_xact_lock_depth++;
 	InterruptHoldoffCount++;
@@ -569,8 +708,13 @@ LWLockReleaseAll(void)
 	c0_release_all_calls++;
 	c0_note(C0_EV_RELEASE_ALL);
 	UT_ASSERT_EQ(c0_native_lock_depth, 1);
-	UT_ASSERT_EQ(c0_xact_lock_depth, 1);
-	UT_ASSERT_EQ(c0_slru_lock_depth, 1);
+	if (c0_exact_read_error) {
+		UT_ASSERT_EQ(c0_xact_lock_depth, 0);
+		UT_ASSERT_EQ(c0_slru_lock_depth, 0);
+	} else {
+		UT_ASSERT_EQ(c0_xact_lock_depth, 1);
+		UT_ASSERT_EQ(c0_slru_lock_depth, 1);
+	}
 	/* ReleaseAll preserves its caller's interrupt holdoff level. */
 	UT_ASSERT_EQ((int)InterruptHoldoffCount, 1);
 	c0_slru_lock_depth = 0;
@@ -2032,10 +2176,291 @@ UT_TEST(test_normal_ordinary_clog_error_releases_the_complete_lock_stack)
 	UT_ASSERT_EQ(InterruptHoldoffCount, 0);
 }
 
+static void
+c0_exact_prepare(void)
+{
+	c0_reset();
+	c0_exact_armed = true;
+	c0_exact_result = CLUSTER_TT_EXACT_COMMITTED;
+	c0_raw_status = TRANSACTION_STATUS_COMMITTED;
+	/* An unavailable full scan cannot manufacture the expected fast hit. */
+	c0_resolve = CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE;
+}
+
+static int
+c0_event_occurrences(C0TestEvent wanted)
+{
+	int count = 0;
+
+	for (int i = 0; i < c0_event_count; i++)
+		if (c0_events[i] == wanted)
+			count++;
+	return count;
+}
+
+static void
+c0_exact_assert_unlocked(void)
+{
+	UT_ASSERT_EQ(c0_native_lock_depth, 0);
+	UT_ASSERT_EQ(c0_xact_lock_depth, 0);
+	UT_ASSERT_EQ(c0_slru_lock_depth, 0);
+	UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+}
+
+static void
+c0_exact_assert_one_count(ClusterTTExactProofResult wanted)
+{
+	for (int i = 0; i < CLUSTER_TT_EXACT_RESULT_COUNT; i++)
+		UT_ASSERT_EQ(cluster_tt_durable_exact_count((ClusterTTExactProofResult)i), i == wanted);
+}
+
+static void
+c0_exact_assert_no_count(void)
+{
+	for (int i = 0; i < CLUSTER_TT_EXACT_RESULT_COUNT; i++)
+		UT_ASSERT_EQ(cluster_tt_durable_exact_count((ClusterTTExactProofResult)i), 0);
+}
+
+UT_TEST(test_freshref_slot_hit_avoids_scan_and_preserves_exact_identity)
+{
+	for (int i = 0; i < 2; i++) {
+		ClusterUndoVerdictResult result;
+
+		c0_exact_prepare();
+		c0_exact_slot = i == 0 ? 0 : TT_SLOTS_PER_SEGMENT - 1;
+		result = cluster_cr_server_test_own_xid_pair_verdict(4195136, 7, c0_exact_slot + 1, 10498);
+		UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+		UT_ASSERT_EQ(result.commit_scn, (SCN)10498);
+		UT_ASSERT_EQ(result.wrap, 11);
+		UT_ASSERT_EQ(c0_exact_calls, 1);
+		UT_ASSERT_EQ(c0_exact_check_calls, 1);
+		UT_ASSERT_EQ(c0_raw_clog_calls, 1);
+		UT_ASSERT_EQ(c0_event_occurrences(C0_EV_SCAN), 0);
+		UT_ASSERT_EQ(c0_retention_calls, 0);
+		UT_ASSERT_EQ(c0_bound_calls, 0);
+		UT_ASSERT_EQ(c0_did_commit_calls, 0);
+		UT_ASSERT(c0_event_pos(C0_EV_NATIVE_LOCK) < c0_event_pos(C0_EV_EXACT));
+		UT_ASSERT(c0_event_pos(C0_EV_EXACT_CHECK) < c0_event_pos(C0_EV_CLOG));
+		UT_ASSERT(c0_event_pos(C0_EV_CLOG) < c0_event_pos(C0_EV_EXACT_RETURN));
+		UT_ASSERT(c0_event_pos(C0_EV_EXACT_RETURN) < c0_event_pos(C0_EV_NATIVE_UNLOCK));
+		c0_exact_assert_one_count(CLUSTER_TT_EXACT_COMMITTED);
+		c0_exact_assert_unlocked();
+	}
+}
+
+UT_TEST(test_freshref_slot_misses_keep_original_scan_and_retention_fallback)
+{
+	for (int miss = CLUSTER_TT_EXACT_SLOT_MISMATCH; miss < CLUSTER_TT_EXACT_RESULT_COUNT; miss++) {
+		for (int fallback = 0; fallback < 3; fallback++) {
+			ClusterUndoVerdictResult result;
+
+			c0_exact_prepare();
+			c0_exact_result = (ClusterTTExactProofResult)miss;
+			if (fallback == 0) {
+				c0_resolve = CLUSTER_TT_DURABLE_RESOLVED_SCN;
+				c0_matched_segment = 7;
+				c0_matched_slot = 0;
+				c0_resolved_scn = 10498;
+			} else if (fallback == 1) {
+				c0_resolve = CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH;
+				c0_retention_ok = true;
+				c0_horizon_scn = 10499;
+			}
+			result = cluster_cr_server_test_own_xid_pair_verdict(4195136, 7, 1, 10498);
+			UT_ASSERT_EQ(result.kind, fallback < 2 ? CLUSTER_UNDO_VERDICT_COMMITTED_EXACT
+												   : CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+			UT_ASSERT_EQ(result.commit_scn, fallback < 2 ? (SCN)10498 : InvalidScn);
+			UT_ASSERT_EQ(result.wrap, 0); /* never leak the failed fast attempt's wrap */
+			UT_ASSERT_EQ(c0_exact_calls, 1);
+			UT_ASSERT_EQ(c0_exact_check_calls, 0);
+			UT_ASSERT_EQ(c0_event_occurrences(C0_EV_SCAN), 1);
+			UT_ASSERT(c0_event_pos(C0_EV_EXACT) < c0_event_pos(C0_EV_SCAN));
+			UT_ASSERT_EQ(c0_raw_clog_calls, fallback < 2 ? 1 : 0);
+			UT_ASSERT_EQ(c0_bound_calls, fallback == 1 ? 1 : 0);
+			c0_exact_assert_one_count((ClusterTTExactProofResult)miss);
+			c0_exact_assert_unlocked();
+		}
+	}
+}
+
+UT_TEST(test_freshref_slot_requires_literal_untruncated_clog_commit)
+{
+	static const XidStatus statuses[]
+		= { TRANSACTION_STATUS_IN_PROGRESS, TRANSACTION_STATUS_ABORTED,
+			TRANSACTION_STATUS_SUB_COMMITTED, TRANSACTION_STATUS_COMMITTED };
+
+	for (int i = 0; i < lengthof(statuses); i++) {
+		ClusterUndoVerdictResult result;
+
+		c0_exact_prepare();
+		c0_raw_status = statuses[i];
+		c0_did_commit = true; /* recursive CLOG convenience results are not literal proof */
+		c0_did_abort = true;
+		if (i == 3)
+			c0_variable_cache.oldestClogXid = 4195137;
+		result = cluster_cr_server_test_own_xid_pair_verdict(4195136, 7, 1, 10498);
+		UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+		UT_ASSERT_EQ(result.commit_scn, InvalidScn);
+		UT_ASSERT_EQ(result.wrap, 0);
+		UT_ASSERT_EQ(c0_exact_check_calls, 1);
+		UT_ASSERT_EQ(c0_raw_clog_calls, i == 3 ? 0 : 1);
+		UT_ASSERT_EQ(c0_did_commit_calls, 0);
+		UT_ASSERT_EQ(c0_did_abort_calls, 0);
+		UT_ASSERT_EQ(c0_event_occurrences(C0_EV_SCAN), 1);
+		c0_exact_assert_one_count(CLUSTER_TT_EXACT_CLOG_UNPROVEN);
+		c0_exact_assert_unlocked();
+	}
+}
+
+UT_TEST(test_freshref_slot_guard_refusals_never_reach_durable_positive_proof)
+{
+	for (int i = 0; i < 12; i++) {
+		ClusterUndoVerdictResult result;
+		uint32 segment = 7;
+		uint32 slot = 1;
+		TransactionId xid = 4195136;
+		SCN scn = 10498;
+
+		c0_exact_prepare();
+		switch (i) {
+		case 0:
+			c0_disabled = true;
+			break;
+		case 1:
+			c0_disable_before_native_recheck = true;
+			break;
+		case 2:
+			c0_epoch0_origin_provable = false;
+			break;
+		case 3:
+			c0_xid_is_mine = false;
+			break;
+		case 4:
+			cluster_node_id = -1;
+			break;
+		case 5:
+			segment = 257;
+			break; /* foreign owner, although raw xid is local */
+		case 6:
+			slot = 0;
+			break;
+		case 7:
+			slot = TT_SLOTS_PER_SEGMENT + 1;
+			break;
+		case 8:
+			segment = 0;
+			break;
+		case 9:
+			xid = InvalidTransactionId;
+			break;
+		case 10:
+			scn = InvalidScn;
+			break;
+		case 11:
+			c0_recovery = true;
+			break;
+		}
+		result = cluster_cr_server_test_own_xid_pair_verdict(xid, segment, slot, scn);
+		UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+		UT_ASSERT_EQ(result.commit_scn, InvalidScn);
+		UT_ASSERT_EQ(result.wrap, 0);
+		UT_ASSERT_EQ(c0_exact_calls, 0);
+		UT_ASSERT_EQ(c0_raw_clog_calls, 0);
+		UT_ASSERT_EQ(cluster_tt_durable_exact_count(CLUSTER_TT_EXACT_COMMITTED), 0);
+		c0_exact_assert_unlocked();
+	}
+}
+
+UT_TEST(test_freshref_slot_scope_change_cannot_publish_a_hit)
+{
+	for (int drift = 1; drift <= 3; drift++) {
+		ClusterUndoVerdictResult result;
+
+		c0_exact_prepare();
+		c0_exact_scope_drift = drift;
+		result = cluster_cr_server_test_own_xid_pair_verdict(4195136, 7, 1, 10498);
+		UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+		UT_ASSERT_EQ(result.commit_scn, InvalidScn);
+		UT_ASSERT_EQ(result.wrap, 0);
+		UT_ASSERT_EQ(c0_exact_calls, 1);
+		UT_ASSERT_EQ(c0_exact_check_calls, 1);
+		c0_exact_assert_one_count(CLUSTER_TT_EXACT_SCOPE_UNPROVEN);
+		c0_exact_assert_unlocked();
+	}
+}
+
+UT_TEST(test_freshref_slot_clog_error_rethrows_after_complete_lock_cleanup)
+{
+	volatile bool caught = false;
+
+	c0_exact_prepare();
+	c0_throw_on_clog = true;
+	PG_TRY();
+	{
+		(void)cluster_cr_server_test_own_xid_pair_verdict(4195136, 7, 1, 10498);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(c0_exact_calls, 1);
+	UT_ASSERT_EQ(c0_raw_clog_calls, 1);
+	UT_ASSERT_EQ(c0_event_occurrences(C0_EV_SCAN), 0);
+	UT_ASSERT_EQ(c0_release_all_calls, 1);
+	c0_exact_assert_no_count();
+	c0_exact_assert_unlocked();
+}
+
+UT_TEST(test_freshref_slot_read_error_rethrows_without_clog_or_fallback)
+{
+	volatile bool caught = false;
+
+	c0_exact_prepare();
+	c0_exact_read_error = true;
+	PG_TRY();
+	{
+		(void)cluster_cr_server_test_own_xid_pair_verdict(4195136, 7, 1, 10498);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(c0_exact_calls, 1);
+	UT_ASSERT_EQ(c0_raw_clog_calls, 0);
+	UT_ASSERT_EQ(c0_event_occurrences(C0_EV_SCAN), 0);
+	UT_ASSERT_EQ(c0_release_all_calls, 1);
+	c0_exact_assert_no_count();
+	c0_exact_assert_unlocked();
+}
+
+UT_TEST(test_local_pair_fallback_does_not_repeat_slot_positive_attempt)
+{
+	uint16 wrap = 99;
+
+	c0_exact_prepare();
+	UT_ASSERT(!cluster_cr_server_local_freshref_c1b_pair_exact(4195136, 7, 1, 10498, &wrap));
+	UT_ASSERT_EQ(wrap, 0);
+	UT_ASSERT_EQ(c0_exact_calls, 0);
+	UT_ASSERT_EQ(c0_event_occurrences(C0_EV_SCAN), 1);
+	c0_exact_assert_unlocked();
+}
+
 int
 main(void)
 {
-	UT_PLAN(44);
+	UT_PLAN(52);
+	UT_RUN(test_freshref_slot_hit_avoids_scan_and_preserves_exact_identity);
+	UT_RUN(test_freshref_slot_misses_keep_original_scan_and_retention_fallback);
+	UT_RUN(test_freshref_slot_requires_literal_untruncated_clog_commit);
+	UT_RUN(test_freshref_slot_guard_refusals_never_reach_durable_positive_proof);
+	UT_RUN(test_freshref_slot_scope_change_cannot_publish_a_hit);
+	UT_RUN(test_freshref_slot_clog_error_rethrows_after_complete_lock_cleanup);
+	UT_RUN(test_freshref_slot_read_error_rethrows_without_clog_or_fallback);
+	UT_RUN(test_local_pair_fallback_does_not_repeat_slot_positive_attempt);
 	UT_RUN(test_zero_native_history_preserves_ordinary_committed_bound);
 	UT_RUN(test_normal_ordinary_remote_uses_the_same_terminal_proof);
 	UT_RUN(test_normal_ordinary_permission_does_not_widen_other_roles);

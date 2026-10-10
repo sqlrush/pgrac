@@ -933,6 +933,16 @@
 | `tt_durable_lookup_miss_count` | 十进制整数文本 | `tt` / `durable` / `lookup` / `miss`的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |
 | `tt_durable_by_xid_scan_count` | 十进制整数文本 | `tt` / `durable` / `by` / `xid` / `scan`的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |
 | `tt_durable_redo_apply_count` | 十进制整数文本 | `tt` / `durable` / redo / 应用的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |
+| `tt_exact_attempt_count` | 十进制整数文本 | 已返回的精确槽提交证明尝试数。 | 同节点、同一共享内存生命周期取增量；不含抛出 ERROR 的未完成尝试，不等于消息数。 |
+| `tt_exact_hit_count` | 十进制整数文本 | 精确槽、提交状态与保留 SCN 均核验成功。 | 只表示此正向证明成功，后续准入仍可能拒绝。 |
+| `tt_exact_fallback_count` | 十进制整数文本 | 未取得正向证明、返回原判定路径的次数。 | 等于以下七个原因之和；原路径不一定需要扫描。 |
+| `tt_exact_slot_mismatch_count` | 十进制整数文本 | 槽 xid、wrap 不合格或两次槽字节不一致。 | 不能据此认定原事务已回收或已提交。 |
+| `tt_exact_not_committed_count` | 十进制整数文本 | 指定槽状态不是 COMMITTED。 | 不从其他状态推导提交。 |
+| `tt_exact_scn_mismatch_count` | 十进制整数文本 | 槽 SCN 无效或与请求保留 SCN 不同。 | 保持精确值和上界的区别。 |
+| `tt_exact_read_failed_count` | 十进制整数文本 | 精确读取失败，含文件缺失、短读与 I/O 失败。 | 结合原日志定位，不能把它当成不存在。 |
+| `tt_exact_identity_changed_count` | 十进制整数文本 | 段头身份不合格或双读段代次不同。 | 该次读取不提供正向证明。 |
+| `tt_exact_clog_unproven_count` | 十进制整数文本 | CLOG 不可用、已截断或不是 COMMITTED。 | 未证明不等于 ABORTED。 |
+| `tt_exact_scope_unproven_count` | 十进制整数文本 | 输入、owner、防复用窗口或当前代次无法核验。 | 不走精确槽快路，保留原判定路径。 |
 | `retention_horizon_scn` | 十进制整数文本 | 保留 / `horizon`对应的集群 SCN。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `retention_max_recycle_horizon` | 十进制整数文本 | 保留 / 上限 / `recycle` / `horizon`的当前快照值。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `tt_slot_retain_skip_count` | 十进制整数文本 | `tt` / 槽位 / `retain` / `skip`的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |

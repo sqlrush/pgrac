@@ -142,6 +142,10 @@ extern bool cluster_cr_server_freshref_c1b_pair_request_decode(
 	const GcsBlockForwardPayload *fwd, int32 authenticated_source_node, int32 local_node,
 	uint64 current_epoch, int max_backends, uint32 *segment_id, TransactionId *xid,
 	uint32 *expected_tt_slot_id, SCN *proposed_scn);
+/* Positive exact-slot attempt only; false retains the original census path. */
+extern bool cluster_cr_server_local_freshref_slot_exact(TransactionId xid, uint32 segment,
+														uint32 slot, SCN proposed_scn,
+														uint16 *out_wrap);
 extern bool cluster_cr_server_local_freshref_c1b_pair_exact(TransactionId xid,
 															uint32 expected_segment_id,
 															uint32 expected_tt_slot_id,

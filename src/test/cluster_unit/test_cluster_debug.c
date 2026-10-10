@@ -2809,6 +2809,12 @@ cluster_wal_thread_claim_created(void)
 /* spec-3.11 D8: durable TT slot counters (cluster_tt_durable_stat.c) are not
  * linked here; stub the 5 accessors dump_undo reads. */
 uint64
+cluster_tt_durable_exact_count(ClusterTTExactProofResult result)
+{
+	return (uint64)result + 1;
+}
+
+uint64
 cluster_tt_durable_commit_count(void)
 {
 	return 0;
@@ -5520,6 +5526,30 @@ UT_TEST(test_debug_dump_exposes_tt_and_itl_reason_counters_without_fake_zero)
 	}
 }
 
+UT_TEST(test_debug_dump_exact_slot_counters_partition_completed_attempts)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	const char *const keys[] = { "tt_exact_hit_count",			 "tt_exact_slot_mismatch_count",
+								 "tt_exact_not_committed_count", "tt_exact_scn_mismatch_count",
+								 "tt_exact_read_failed_count",	 "tt_exact_identity_changed_count",
+								 "tt_exact_clog_unproven_count", "tt_exact_scope_unproven_count" };
+	memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+	memset(&rsinfo, 0, sizeof(rsinfo));
+	captured_dump_row_count = 0;
+	captured_formatted_value_count = 0;
+	fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+	(void)cluster_dump_state(fcinfo);
+	for (int i = 0; i < lengthof(keys); i++) {
+		char expected[16];
+		snprintf(expected, sizeof(expected), "%d", i + 1);
+		UT_ASSERT_EQ(captured_dump_count("undo", keys[i]), 1);
+		UT_ASSERT_STR_EQ(captured_dump_value("undo", keys[i]), expected);
+	}
+	UT_ASSERT_STR_EQ(captured_dump_value("undo", "tt_exact_attempt_count"), "36");
+	UT_ASSERT_STR_EQ(captured_dump_value("undo", "tt_exact_fallback_count"), "35");
+}
+
 UT_TEST(test_debug_dump_exposes_closed_ctrc_observability)
 {
 	LOCAL_FCINFO(fcinfo, 0);
@@ -6123,7 +6153,8 @@ UT_TEST(test_debug_phase_symbol_present)
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(23);
+	UT_RUN(test_debug_dump_exact_slot_counters_partition_completed_attempts);
 	UT_RUN(test_debug_dump_normal_completion_never_fabricates_unready_proof);
 	UT_RUN(test_debug_dump_srf_linkable);
 	UT_RUN(test_debug_dump_omits_retired_legacy_pcm_x_compatibility_keys);

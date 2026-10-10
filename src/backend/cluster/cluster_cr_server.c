@@ -2356,6 +2356,82 @@ lms_freshref_pair_refusal_predicate(const volatile LmsFreshrefPairDiagnostic *d,
 	return "POLICY_REFUSED";
 }
 
+static bool
+lms_exact_slot_clog_committed(TransactionId xid, void *arg pg_attribute_unused())
+{
+	XLogRecPtr clog_lsn = InvalidXLogRecPtr;
+	bool committed = false;
+
+	LWLockAcquire(XactTruncationLock, LW_SHARED);
+	if (!TransactionIdPrecedes(xid, ShmemVariableCache->oldestClogXid))
+		committed = TransactionIdGetStatus(xid, &clog_lsn) == TRANSACTION_STATUS_COMMITTED;
+	LWLockRelease(XactTruncationLock);
+	return committed;
+}
+
+/* Called only within the original native-prehistory reader window. */
+static ClusterTTExactProofResult
+lms_exact_slot_prove_locked(TransactionId xid, uint32 segment, uint32 slot, SCN proposed_scn,
+							uint16 *out_wrap)
+{
+	ClusterTTExactProofResult result;
+	uint64 epoch = cluster_epoch_get_current();
+	int node = cluster_node_id;
+
+	*out_wrap = 0;
+	if (!TransactionIdIsNormal(xid) || !SCN_VALID(proposed_scn) || node < 0
+		|| node >= CLUSTER_MAX_NODES || segment == 0 || segment > UINT16_MAX
+		|| (segment - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE != (uint32)node || slot < 1
+		|| slot > TT_SLOTS_PER_SEGMENT || RecoveryInProgress()
+		|| !cluster_cr_native_origin_epoch0_provable(xid))
+		return CLUSTER_TT_EXACT_SCOPE_UNPROVEN;
+
+	/* A missing shared guard, a wrapped raw xid or a non-own xid is not an
+	 * exact identity. The predicate also checks the real reader-fenced latch. */
+	result = cluster_tt_slot_durable_prove_committed(segment, (uint16)(slot - 1), xid, proposed_scn,
+													 lms_exact_slot_clog_committed, NULL, out_wrap);
+	if (cluster_epoch_get_current() != epoch || cluster_node_id != node
+		|| !cluster_cr_native_origin_epoch0_provable(xid)) {
+		*out_wrap = 0;
+		result = CLUSTER_TT_EXACT_SCOPE_UNPROVEN;
+	}
+	return result;
+}
+
+bool
+cluster_cr_server_local_freshref_slot_exact(TransactionId xid, uint32 segment, uint32 slot,
+											SCN proposed_scn, uint16 *out_wrap)
+{
+	ClusterTTExactProofResult result = CLUSTER_TT_EXACT_SCOPE_UNPROVEN;
+	uint16 wrap = 0;
+
+	if (out_wrap != NULL)
+		*out_wrap = 0;
+	PG_TRY(exact_slot);
+	{
+		cluster_cr_native_prehistory_reader_lock();
+		result = lms_exact_slot_prove_locked(xid, segment, slot, proposed_scn, &wrap);
+		cluster_cr_native_prehistory_reader_unlock();
+	}
+	PG_CATCH(exact_slot);
+	{
+		HOLD_INTERRUPTS();
+		LWLockReleaseAll();
+		RESUME_INTERRUPTS();
+		PG_RE_THROW();
+	}
+	PG_END_TRY(exact_slot);
+
+	/* Completed attempts only. An ERROR continues through the original owner
+	 * cleanup and is not counted as a returned fallback result. */
+	cluster_tt_durable_count_exact(result);
+	if (result != CLUSTER_TT_EXACT_COMMITTED)
+		return false;
+	if (out_wrap != NULL)
+		*out_wrap = wrap;
+	return true;
+}
+
 /* S8-815PRE-FRESHREF-C1B-01: exact retained-page pairing.  The native
  * prehistory reader fence continuously covers the complete durable scan,
  * literal CLOG C1b sample and (for a zero-match) frozen retention horizon.
@@ -2367,7 +2443,8 @@ lms_resolve_own_xid_freshref_c1b_pair(TransactionId xid, uint32 expected_segment
 									  uint32 expected_tt_slot_id, SCN proposed_scn,
 									  uint8 *out_verdict, SCN *out_commit_scn, SCN *out_horizon_scn,
 									  uint16 *out_wrap,
-									  volatile LmsFreshrefPairDiagnostic *diagnostic)
+									  volatile LmsFreshrefPairDiagnostic *diagnostic,
+									  bool try_exact_slot)
 {
 	volatile LmsFreshrefPairDiagnostic ignored;
 	ClusterUndoVerdictKind pair_verdict = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
@@ -2411,7 +2488,22 @@ lms_resolve_own_xid_freshref_c1b_pair(TransactionId xid, uint32 expected_segment
 		diagnostic->no_raw_reuse = no_raw_reuse_window;
 		diagnostic->own_xid = xid_is_mine;
 
-		if (xid_is_mine) {
+		/* The positive attempt and its fallback share this one reader fence;
+		 * no publication/disable window is opened between them. */
+		if (try_exact_slot) {
+			ClusterTTExactProofResult exact_result = CLUSTER_TT_EXACT_SCOPE_UNPROVEN;
+
+			if (xid_is_mine)
+				exact_result = lms_exact_slot_prove_locked(
+					xid, expected_segment_id, expected_tt_slot_id, proposed_scn, &matched_wrap);
+			cluster_tt_durable_count_exact(exact_result);
+			if (exact_result == CLUSTER_TT_EXACT_COMMITTED) {
+				pair_verdict = CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+				resolve = CLUSTER_TT_DURABLE_RESOLVED_SCN;
+			}
+		}
+
+		if (xid_is_mine && pair_verdict != CLUSTER_UNDO_VERDICT_COMMITTED_EXACT) {
 			resolve = cluster_tt_slot_durable_resolve_by_xid(xid, CLUSTER_TT_WRAP_ANY,
 															 &resolved_scn, &matched_segment,
 															 &matched_slot, &matched_wrap);
@@ -2514,7 +2606,7 @@ cluster_cr_server_local_freshref_c1b_pair_exact(TransactionId xid, uint32 expect
 		*out_wrap = 0;
 	reason = lms_resolve_own_xid_freshref_c1b_pair(xid, expected_segment_id, expected_tt_slot_id,
 												   proposed_scn, &verdict, &commit_scn,
-												   &horizon_scn, &wrap, &diagnostic);
+												   &horizon_scn, &wrap, &diagnostic, false);
 	if (reason != LMS_OWN_XID_PROVEN || verdict != (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT
 		|| commit_scn != proposed_scn || SCN_VALID(horizon_scn)) {
 		/* Report only the sample already made by this proof attempt. The
@@ -3082,7 +3174,7 @@ cluster_cr_server_test_own_xid_pair_verdict(TransactionId xid, uint32 expected_s
 
 	if (lms_resolve_own_xid_freshref_c1b_pair(xid, expected_segment_id, expected_tt_slot_id,
 											  proposed_scn, &verdict, &commit_scn, &horizon_scn,
-											  &wrap, NULL)
+											  &wrap, NULL, true)
 			== LMS_OWN_XID_PROVEN
 		&& verdict == (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT) {
 		result.kind = (uint8)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
@@ -3106,7 +3198,7 @@ cluster_cr_server_test_own_xid_pair_reason(TransactionId xid, uint32 expected_se
 	memset(out, 0, sizeof(*out));
 	(void)lms_resolve_own_xid_freshref_c1b_pair(xid, expected_segment_id, expected_tt_slot_id,
 												proposed_scn, &verdict, &commit_scn, &horizon_scn,
-												&wrap, &diagnostic);
+												&wrap, &diagnostic, true);
 	if (verdict == (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT) {
 		out->kind = CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
 		out->commit_scn = commit_scn;
@@ -3305,7 +3397,7 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 			slot->undo_auth.authority_scn = cluster_scn_current();
 			reason = lms_resolve_own_xid_freshref_c1b_pair(
 				xid, slot->undo_segment_id, slot->undo_block_no, slot->read_scn, &verdict,
-				&commit_scn, &horizon_scn, &wrap, &pair_diagnostic);
+				&commit_scn, &horizon_scn, &wrap, &pair_diagnostic, true);
 			zero_epoch_current = cluster_semantic_activation_recheck(&zero_epoch_admission);
 		}
 		PG_FINALLY();
@@ -3333,7 +3425,7 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 		if (freshref_pair)
 			reason = lms_resolve_own_xid_freshref_c1b_pair(
 				xid, slot->undo_segment_id, slot->undo_block_no, slot->read_scn, &verdict,
-				&commit_scn, &horizon_scn, &wrap, &pair_diagnostic);
+				&commit_scn, &horizon_scn, &wrap, &pair_diagnostic, true);
 		else
 			reason = lms_resolve_own_xid_verdict_observed(
 				xid, slot->undo_segment_id, slot->undo_block_no, slot->undo_authoritative, &verdict,

@@ -173,6 +173,19 @@ static bool test_local_ordinary_abort;
 static bool test_local_last_ordinary_single;
 static int test_local_origin_calls;
 static bool test_local_origin_epoch_drift;
+static bool test_local_slot_exact;
+static bool test_local_slot_epoch_drift;
+static bool test_local_slot_error;
+static int test_local_slot_calls;
+static int test_local_route_sequence;
+static int test_local_slot_order;
+static int test_local_origin_order;
+static int test_local_pair_order;
+
+/* Test-local declaration also builds against the pre-interface RED base. */
+extern bool cluster_cr_server_local_freshref_slot_exact(TransactionId xid, uint32 segment,
+														uint32 slot, SCN proposed_scn,
+														uint16 *out_wrap);
 
 extern ClusterUndoVerdictResult
 cluster_runtime_visibility_test_local_retained_read(TransactionId xid, uint32 segment, uint32 slot,
@@ -257,6 +270,7 @@ cluster_lms_undo_verdict_fill_page(TransactionId xid, bool authoritative, bool o
 								   ClusterGcsUndoVerdictPage *page)
 {
 	test_local_origin_calls++;
+	test_local_origin_order = ++test_local_route_sequence;
 	test_local_last_ordinary_single = ordinary_single;
 	UT_ASSERT_EQ(xid, TEST_ORIGIN_XID);
 	UT_ASSERT(!authoritative);
@@ -761,12 +775,38 @@ cluster_xid_is_mine(TransactionId xid)
 	return test_xid_is_mine;
 }
 
+/* The owner boundary alone is modeled.  The sectioned runtime object runs
+ * the real local consumer, including role, epoch and fallback ordering. */
+bool
+cluster_cr_server_local_freshref_slot_exact(TransactionId xid, uint32 segment, uint32 slot,
+											SCN proposed_scn, uint16 *out_wrap)
+{
+	test_local_slot_calls++;
+	test_local_slot_order = ++test_local_route_sequence;
+	UT_ASSERT_EQ(xid, TEST_ORIGIN_XID);
+	UT_ASSERT_EQ(segment, TEST_RECORD_SEGMENT);
+	UT_ASSERT_EQ(slot, (uint32)TEST_TT_OFFSET + 1);
+	UT_ASSERT_EQ(proposed_scn, test_commit_scn);
+	UT_ASSERT_NOT_NULL(out_wrap);
+	if (out_wrap != NULL)
+		*out_wrap = 0;
+	if (test_local_slot_error)
+		pg_re_throw();
+	if (test_local_slot_epoch_drift)
+		test_formation_epoch++;
+	if (!test_local_slot_exact || out_wrap == NULL)
+		return false;
+	*out_wrap = 23; /* distinct from both ordinary and old-pair fixtures */
+	return true;
+}
+
 bool
 cluster_cr_server_local_freshref_c1b_pair_exact(TransactionId xid, uint32 expected_segment_id,
 												uint32 expected_tt_slot_id, SCN proposed_scn,
 												uint16 *out_wrap)
 {
 	test_local_freshref_pair_calls++;
+	test_local_pair_order = ++test_local_route_sequence;
 	UT_ASSERT_EQ((int)xid, (int)TEST_ORIGIN_XID);
 	UT_ASSERT_EQ(expected_segment_id, TEST_RECORD_SEGMENT);
 	UT_ASSERT_EQ(expected_tt_slot_id, (uint32)TEST_TT_OFFSET + 1);
@@ -1103,6 +1143,14 @@ reset_exact_origin_fixture(void)
 	test_local_last_ordinary_single = false;
 	test_local_origin_calls = 0;
 	test_local_origin_epoch_drift = false;
+	test_local_slot_exact = false;
+	test_local_slot_epoch_drift = false;
+	test_local_slot_error = false;
+	test_local_slot_calls = 0;
+	test_local_route_sequence = 0;
+	test_local_slot_order = 0;
+	test_local_origin_order = 0;
+	test_local_pair_order = 0;
 	test_remote_origin_enabled = false;
 	test_remote_origin_calls = 0;
 	test_remote_origin_generation = 0;
@@ -4523,10 +4571,166 @@ UT_TEST(test_self_fresh_role_does_not_inherit_ordinary_abort_permission)
 	UT_ASSERT(!test_local_last_ordinary_single);
 }
 
+UT_TEST(test_local_retained_slot_hit_precedes_ordinary_bound_and_pair)
+{
+	for (int i = 0; i < 3; i++) {
+		ClusterUndoVerdictResult result;
+		SCN read_scn;
+
+		reset_exact_origin_fixture();
+		test_local_slot_exact = true;
+		test_local_origin_bound = 100;
+		test_local_freshref_pair_exact = true;
+		read_scn = i == 0 ? test_commit_scn + 1 : i == 1 ? test_commit_scn - 1 : InvalidScn;
+		result = cluster_runtime_visibility_test_local_retained_read(
+			TEST_ORIGIN_XID, TEST_RECORD_SEGMENT, TEST_TT_OFFSET + 1, test_commit_scn, read_scn);
+		UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+		UT_ASSERT_EQ(result.commit_scn, test_commit_scn);
+		UT_ASSERT_EQ(result.wrap, 23);
+		UT_ASSERT_EQ(test_local_slot_calls, 1);
+		UT_ASSERT_EQ(test_local_origin_calls, 0);
+		UT_ASSERT_EQ(test_local_freshref_pair_calls, 0);
+		UT_ASSERT_EQ(test_local_slot_order, 1);
+	}
+}
+
+UT_TEST(test_local_retained_slot_miss_preserves_ordinary_exact_and_bound)
+{
+	for (int i = 0; i < 2; i++) {
+		ClusterUndoVerdictResult result;
+
+		reset_exact_origin_fixture();
+		if (i == 0)
+			test_local_origin_exact = test_commit_scn;
+		else
+			test_local_origin_bound = 100;
+		test_local_freshref_pair_exact = true;
+		result = cluster_runtime_visibility_test_local_retained_read(
+			TEST_ORIGIN_XID, TEST_RECORD_SEGMENT, TEST_TT_OFFSET + 1, test_commit_scn,
+			i == 0 ? test_commit_scn + 1 : (SCN)120);
+		UT_ASSERT_EQ(result.kind, i == 0 ? CLUSTER_UNDO_VERDICT_COMMITTED_EXACT
+										 : CLUSTER_UNDO_VERDICT_COMMITTED_BOUND);
+		UT_ASSERT_EQ(result.commit_scn, i == 0 ? test_commit_scn : (SCN)100);
+		UT_ASSERT_EQ(result.wrap, i == 0 ? TEST_ORIGIN_WRAP : 0);
+		UT_ASSERT_EQ(test_local_slot_calls, 1);
+		UT_ASSERT_EQ(test_local_origin_calls, 1);
+		UT_ASSERT_EQ(test_local_freshref_pair_calls, 0);
+		UT_ASSERT_EQ(test_local_slot_order, 1);
+		UT_ASSERT_EQ(test_local_origin_order, 2);
+		UT_ASSERT(!test_local_last_ordinary_single);
+	}
+}
+
+UT_TEST(test_local_retained_slot_miss_keeps_pair_last_and_census_exact_only)
+{
+	for (int i = 0; i < 4; i++) {
+		ClusterUndoVerdictResult result;
+		SCN read_scn;
+
+		reset_exact_origin_fixture();
+		test_local_freshref_pair_exact = true;
+		read_scn = test_commit_scn + 1;
+		if (i == 1)
+			test_local_origin_exact = test_commit_scn + 1;
+		if (i == 2) {
+			test_local_origin_bound = 100;
+			read_scn = 99;
+		}
+		if (i == 3) {
+			test_local_origin_exact = test_commit_scn;
+			read_scn = InvalidScn;
+		}
+		result = cluster_runtime_visibility_test_local_retained_read(
+			TEST_ORIGIN_XID, TEST_RECORD_SEGMENT, TEST_TT_OFFSET + 1, test_commit_scn, read_scn);
+		UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+		UT_ASSERT_EQ(result.commit_scn, test_commit_scn);
+		UT_ASSERT_EQ(result.wrap, TEST_ORIGIN_WRAP);
+		UT_ASSERT_EQ(test_local_slot_calls, 1);
+		UT_ASSERT_EQ(test_local_origin_calls, i == 3 ? 0 : 1);
+		UT_ASSERT_EQ(test_local_freshref_pair_calls, 1);
+		UT_ASSERT_EQ(test_local_slot_order, 1);
+		UT_ASSERT_EQ(test_local_origin_order, i == 3 ? 0 : 2);
+		UT_ASSERT_EQ(test_local_pair_order, i == 3 ? 2 : 3);
+	}
+}
+
+UT_TEST(test_local_retained_failed_proofs_do_not_echo_retained_scn)
+{
+	for (int i = 0; i < 2; i++) {
+		ClusterUndoVerdictResult result;
+
+		reset_exact_origin_fixture();
+		result = cluster_runtime_visibility_test_local_retained_read(
+			TEST_ORIGIN_XID, TEST_RECORD_SEGMENT, TEST_TT_OFFSET + 1, test_commit_scn,
+			i == 0 ? test_commit_scn + 1 : InvalidScn);
+		UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+		UT_ASSERT_EQ(result.commit_scn, InvalidScn);
+		UT_ASSERT_EQ(result.wrap, 0);
+		UT_ASSERT_EQ(test_local_slot_calls, 1);
+		UT_ASSERT_EQ(test_local_origin_calls, i == 0 ? 1 : 0);
+		UT_ASSERT_EQ(test_local_freshref_pair_calls, 1);
+		UT_ASSERT_EQ(test_local_slot_order, 1);
+		UT_ASSERT_EQ(test_local_pair_order, i == 0 ? 3 : 2);
+	}
+}
+
+UT_TEST(test_local_retained_slot_epoch_change_discards_hit_and_miss)
+{
+	for (int i = 0; i < 2; i++) {
+		ClusterUndoVerdictResult result;
+
+		reset_exact_origin_fixture();
+		test_local_slot_exact = i == 0;
+		test_local_slot_epoch_drift = true;
+		test_local_origin_exact = test_commit_scn;
+		test_local_freshref_pair_exact = true;
+		result = cluster_runtime_visibility_test_local_retained_read(
+			TEST_ORIGIN_XID, TEST_RECORD_SEGMENT, TEST_TT_OFFSET + 1, test_commit_scn,
+			test_commit_scn + 1);
+		UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+		UT_ASSERT_EQ(result.commit_scn, InvalidScn);
+		UT_ASSERT_EQ(result.wrap, 0);
+		UT_ASSERT_EQ(test_local_slot_calls, 1);
+		UT_ASSERT_EQ(test_local_origin_calls, 0);
+		UT_ASSERT_EQ(test_local_freshref_pair_calls, 0);
+	}
+}
+
+UT_TEST(test_local_retained_slot_error_propagates_without_fallback)
+{
+	volatile bool caught = false;
+
+	reset_exact_origin_fixture();
+	test_local_slot_error = true;
+	test_local_origin_exact = test_commit_scn;
+	test_local_freshref_pair_exact = true;
+	PG_TRY();
+	{
+		(void)cluster_runtime_visibility_test_local_retained_read(
+			TEST_ORIGIN_XID, TEST_RECORD_SEGMENT, TEST_TT_OFFSET + 1, test_commit_scn,
+			test_commit_scn + 1);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(test_local_slot_calls, 1);
+	UT_ASSERT_EQ(test_local_origin_calls, 0);
+	UT_ASSERT_EQ(test_local_freshref_pair_calls, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(135);
+	UT_PLAN(141);
+	UT_RUN(test_local_retained_slot_hit_precedes_ordinary_bound_and_pair);
+	UT_RUN(test_local_retained_slot_miss_preserves_ordinary_exact_and_bound);
+	UT_RUN(test_local_retained_slot_miss_keeps_pair_last_and_census_exact_only);
+	UT_RUN(test_local_retained_failed_proofs_do_not_echo_retained_scn);
+	UT_RUN(test_local_retained_slot_epoch_change_discards_hit_and_miss);
+	UT_RUN(test_local_retained_slot_error_propagates_without_fallback);
 	UT_RUN(test_local_updater_precommit_retries_only_after_guard_release);
 	UT_RUN(test_local_updater_precommit_release_and_admission_failure_stay_unknown);
 	UT_RUN(test_local_updater_does_not_retry_unproven_samples);

@@ -49,6 +49,7 @@
  *	lock-free by dump_undo / pg_cluster_state.
  */
 typedef struct ClusterTTDurableShared {
+	pg_atomic_uint64 exact_result[CLUSTER_TT_EXACT_RESULT_COUNT];
 	pg_atomic_uint64 durable_commit_count;		/* cluster_tt_slot_durable_commit */
 	pg_atomic_uint64 durable_lookup_hit_count;	/* seg/slot lookup hit (D5) */
 	pg_atomic_uint64 durable_lookup_miss_count; /* seg/slot lookup miss (D5) */
@@ -100,6 +101,8 @@ cluster_tt_durable_shmem_init(void)
 		= ShmemInitStruct("ClusterTTDurableShared", cluster_tt_durable_shmem_size(), &found);
 
 	if (!found) {
+		for (int i = 0; i < CLUSTER_TT_EXACT_RESULT_COUNT; i++)
+			pg_atomic_init_u64(&TTDurableShared->exact_result[i], 0);
 		pg_atomic_init_u64(&TTDurableShared->durable_commit_count, 0);
 		pg_atomic_init_u64(&TTDurableShared->durable_lookup_hit_count, 0);
 		pg_atomic_init_u64(&TTDurableShared->durable_lookup_miss_count, 0);
@@ -160,6 +163,21 @@ cluster_tt_durable_count_lookup(bool hit)
 		pg_atomic_fetch_add_u64(&TTDurableShared->durable_lookup_hit_count, 1);
 	else
 		pg_atomic_fetch_add_u64(&TTDurableShared->durable_lookup_miss_count, 1);
+}
+
+void
+cluster_tt_durable_count_exact(ClusterTTExactProofResult result)
+{
+	if (TTDurableShared != NULL && result >= 0 && result < CLUSTER_TT_EXACT_RESULT_COUNT)
+		pg_atomic_fetch_add_u64(&TTDurableShared->exact_result[result], 1);
+}
+
+uint64
+cluster_tt_durable_exact_count(ClusterTTExactProofResult result)
+{
+	if (TTDurableShared == NULL || result < 0 || result >= CLUSTER_TT_EXACT_RESULT_COUNT)
+		return 0;
+	return pg_atomic_read_u64(&TTDurableShared->exact_result[result]);
 }
 
 void
@@ -326,6 +344,19 @@ void
 cluster_tt_durable_count_lookup(bool hit)
 {
 	(void)hit;
+}
+
+void
+cluster_tt_durable_count_exact(ClusterTTExactProofResult result)
+{
+	(void)result;
+}
+
+uint64
+cluster_tt_durable_exact_count(ClusterTTExactProofResult result)
+{
+	(void)result;
+	return 0;
 }
 
 void

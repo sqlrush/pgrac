@@ -3248,6 +3248,26 @@ dump_undo(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "undo", "tt_durable_redo_apply_count",
 			 fmt_int64((int64)cluster_tt_durable_redo_apply_count()));
 
+	{
+		static const char *const names[CLUSTER_TT_EXACT_RESULT_COUNT]
+			= { "tt_exact_hit_count",			"tt_exact_slot_mismatch_count",
+				"tt_exact_not_committed_count", "tt_exact_scn_mismatch_count",
+				"tt_exact_read_failed_count",	"tt_exact_identity_changed_count",
+				"tt_exact_clog_unproven_count", "tt_exact_scope_unproven_count" };
+		uint64 attempts = 0;
+		uint64 fallback = 0;
+
+		for (int i = 0; i < CLUSTER_TT_EXACT_RESULT_COUNT; i++) {
+			uint64 value = cluster_tt_durable_exact_count((ClusterTTExactProofResult)i);
+			emit_row(rsinfo, "undo", names[i], fmt_int64((int64)value));
+			attempts += value;
+			if (i != CLUSTER_TT_EXACT_COMMITTED)
+				fallback += value;
+		}
+		emit_row(rsinfo, "undo", "tt_exact_attempt_count", fmt_int64((int64)attempts));
+		emit_row(rsinfo, "undo", "tt_exact_fallback_count", fmt_int64((int64)fallback));
+	}
+
 	/* spec-3.12 D5: own-instance retention horizon observability. */
 	emit_row(rsinfo, "undo", "retention_horizon_scn",
 			 fmt_int64((int64)cluster_tt_slot_retention_horizon_scn()));
