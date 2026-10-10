@@ -978,7 +978,10 @@ cluster_undo_inventory_finish(const ClusterUndoInventorySnapshot *snapshot,
 bool
 cluster_undo_segment_file_exists(uint8 owner_instance pg_attribute_unused(), uint32 segment_id)
 {
-	return segment_id == g_unreadable_existing_segment;
+	if (segment_id == g_unreadable_existing_segment)
+		return true;
+	errno = ENOENT;
+	return false;
 }
 
 

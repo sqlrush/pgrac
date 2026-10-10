@@ -1998,10 +1998,12 @@ durable_scan_read_header(uint8 owner, uint32 segment_id, char block[BLCKSZ], boo
 		return true;
 	errno = 0;
 	if (!cluster_undo_segment_file_exists(owner, segment_id)) {
-		/* Preserve the original verdict path, but do not certify an inventory
-		 * from an ambiguous existence probe (permission, path or I/O error). */
-		if (errno != ENOENT)
+		/* An ambiguous probe is not absence, even during an untracked full
+		 * scan (permission, path or I/O error). */
+		if (errno != ENOENT) {
+			*scan_complete = false;
 			*inventory_complete = false;
+		}
 		return false;
 	}
 	if (cluster_undo_smgr_read_block(intent, segment_id, owner, 0, block))

@@ -987,10 +987,48 @@ UT_TEST(test_invalidated_scope_cannot_become_an_unprotected_full_scan)
 	}
 }
 
+UT_TEST(test_full_scan_never_treats_an_unresolvable_entry_as_absent)
+{
+	for (int role = 0; role < lengthof(scan_roles); role++) {
+		for (int consumer = SCAN_RESOLVE; consumer <= SCAN_LOCATE; consumer++) {
+			for (int scenario = 0; scenario < 3; scenario++) {
+				int node = scenario == 2 ? 1 : 0;
+				uint8 owner = (uint8)(node + 1);
+				uint32 segment = node * CLUSTER_UNDO_SEGS_PER_INSTANCE + 2;
+				char path[MAXPGPATH];
+
+				if (!scan_begin_case(scan_roles[role]))
+					return;
+				scan_seed_three(node);
+				if (scenario == 1)
+					cluster_undo_inventory_disable(owner);
+				UT_ASSERT_EQ(
+					cluster_undo_path_resolve(cluster_undo_recovery_intent_for_owner(owner), owner,
+											  segment, path, sizeof(path)),
+					0);
+				/* A real ELOOP is deterministic even for privileged test users.
+				 * Both open and access fail, but neither proves ENOENT. */
+				UT_ASSERT_EQ(symlink(strrchr(path, '/') + 1, path), 0);
+				errno = 0;
+				UT_ASSERT_EQ(access(path, F_OK), -1);
+				UT_ASSERT_EQ(errno, ELOOP);
+				for (int match = 0; match < 2; match++)
+					scan_expect(scan_query(consumer, node, SCAN_XID + (match ? 0 : 99), SCAN_WRAP),
+								consumer,
+								consumer == SCAN_RESOLVE
+									? CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE
+									: CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE,
+								0, 0, TT_SLOT_INVALID, InvalidScn);
+				scan_finish_case();
+			}
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(15);
 	UT_RUN(test_lms_both_scans_reuse_real_inventory);
 	UT_RUN(test_worker_both_scans_reuse_real_inventory);
 	UT_RUN(test_backend_both_scans_reuse_real_inventory);
@@ -1005,6 +1043,7 @@ main(void)
 	UT_RUN(test_inventory_finish_revalidates_namespace_and_attachment);
 	UT_RUN(test_publication_after_cursor_cannot_certify_cold_or_retry_full_scan);
 	UT_RUN(test_invalidated_scope_cannot_become_an_unprotected_full_scan);
+	UT_RUN(test_full_scan_never_treats_an_unresolvable_entry_as_absent);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
