@@ -36,7 +36,7 @@ GROUP BY backend_type, wait_event_type, wait_event
 ORDER BY waiting_processes DESC;
 ```
 
-连续采样可估计等待占用比例；单次查询不能给出累计等待毫秒。性能计时及其采集成本见 [pg_cluster_state](commands.md#pg_cluster_state-的用法)。不能把请求方的整段等待直接当作网络时间，或与对端服务计时直接相加。
+连续采样可估计等待占用比例；单次查询不能给出累计等待毫秒。累计计时字段及采集方法见 [pg_cluster_state](commands.md#pg_cluster_state-的用法)。请求方计时可能包含对端服务时间，两者不能直接相加。
 
 ## 事件目录
 

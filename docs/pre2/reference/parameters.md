@@ -48,14 +48,14 @@ RESET cluster.xnode_profile;
 
 字符串中，`""` 表示空字符串，“未设置”表示未提供默认字符串。时间／容量列给出注册单位；名称带 `_ms` 但无注册单位的参数仍按说明使用整数毫秒，不能假定它接受 `1s` 这样的单位后缀。以下容量上限按本预览 64 位构建填写。
 
-## 必须保留的共享配置与限制
+## 必须保留的共享配置
 
-- `cluster.undo_cleaner_enabled=on`；关闭会停止必要的事务记录清理工作，导致正常停机失败。它与 `autovacuum` 是不同的开关。
-- 必须保持 `cluster.lms_workers=2`。代码范围为 1–8；设置大于 2 时，额外的 LMS worker 无法建立连接，并导致正常停机失败。
-- `cluster.smart_fusion=off`，本预览不启用提前传块；设置 `on` 会报错。
+- `cluster.undo_cleaner_enabled=on`。
+- `cluster.lms_workers=2`。
+- `cluster.smart_fusion=off`。
 - 保持 `cluster.enabled`、`cluster.merged_recovery`、`cluster.smgr_user_relations`、`cluster.controlfile_shared_authority`、`cluster.shared_config`、`cluster.shared_catalog`、`cluster.undo_gcs_coherence` 和 `cluster.crossnode_runtime_visibility` 全部为 `on`；使用创建入口提供的整组配置，不通过单独切换其中一项迁移已有数据目录。
 - 必须使用 `cluster.shared_storage_backend=cluster_fs`，并保留创建时的共享目录、存储身份和路径配置。
-- `autovacuum` 与安装手册一致：实验室模板为 `off`，仅用于短时受控评估，不作为长期关闭的建议。本预览的冻结和旧行版本回收仍有已知限制，不能把开启 `autovacuum` 当作已解决这些限制。
+- `autovacuum=off`，与本预览的安装模板一致。
 - `cluster.storage_quorum_nodes` 使用 `数据库节点号:Corosync节点号` 的逗号分隔映射，例如 `0:1,1:2,2:3,3:4`；实际值必须与固定成员配置一致。不要将示例直接用于不同部署。
 - `cluster.voting_disks`、恢复目标、裸设备路径等未列入共享字符串配置的旧入口仍在参数注册表中，但不能作为本预览共享 `ALTER SYSTEM` 的有效输入。投票盘与存储身份按安装流程提供。
 - 下表未列出的组合限制仍会在配置或启动时检查；收到拒绝时保留错误详情，不通过关掉一致性或隔离开关绕过。
@@ -66,7 +66,7 @@ RESET cluster.xnode_profile;
 
 | 参数 | 使用要求 |
 |---|---|
-| `max_connections` | 创建前确定连接容量并预留管理连接；每节点不超过 16 个业务连接是本预览的已测范围，不表示应把此值设为 16。 |
+| `max_connections` | 创建前确定连接容量并预留管理连接；创建后保持不变。 |
 | `max_worker_processes` | 保留创建时的后台工作进程容量。 |
 | `max_wal_senders` | 保留创建时的 WAL 发送进程容量；本预览不提供复制部署流程。 |
 | `max_prepared_transactions` | 保留创建时的值；设置非零不代表共享模式支持两阶段事务。 |
@@ -104,7 +104,7 @@ RESET cluster.xnode_profile;
 | `cluster.external_fence_acquire_timeout_ms` | 整数 | `120000` | 1–600000 ms | 重启 | 取得外部写入隔离证明的总等待期限，单位毫秒。 | — |
 | `cluster.shared_data_dir` | 字符串 | `""` | 字符串；另受格式／共享配置限制 | 创建时 | 共享数据根目录；非空值必须是绝对路径，cluster_fs 要求配置此目录。 | — |
 | `cluster.controlfile_shared_authority` | 布尔 | `off` | on / off | 创建时 | 使用共享数据目录中的统一控制信息；共享部署必须保持 on。 | — |
-| `cluster.storage_quorum_nodes` | 字符串 | `""` | 字符串；另受格式／共享配置限制 | 创建时 | 数据库节点号到 Corosync 节点号的映射，格式见本页“必须保留的共享配置与限制”。 | 新增 |
+| `cluster.storage_quorum_nodes` | 字符串 | `""` | 字符串；另受格式／共享配置限制 | 创建时 | 数据库节点号到 Corosync 节点号的映射，格式见本页“必须保留的共享配置”。 | 新增 |
 | `cluster.storage_quorum_cluster` | 字符串 | `""` | 字符串；另受格式／共享配置限制 | 创建时 | 预期 Corosync 集群名称，必须与部署中的名称完全一致。 | 新增 |
 | `cluster.shared_config` | 布尔 | `off` | on / off | 创建时 | 启用共享配置；由全新共享建库入口设置，不能把已有普通 PG 数据目录改为共享库。 | 新增 |
 | `cluster.shared_storage_uuid` | 字符串 | `""` | 字符串；另受格式／共享配置限制 | 创建时 | 共享存储的外部身份标识；本预览由创建入口设置并固定。 | — |
@@ -173,7 +173,7 @@ RESET cluster.xnode_profile;
 | `cluster.cluster_stats_main_loop_interval` | 整数 | `1000` | 100–60000 ms | 重启 | 集群统计进程的主循环间隔，单位毫秒。 | — |
 | `cluster.lmd_enabled` | 布尔 | `on` | on / off | 重启 | 启用负责死锁检测的 LMD 后台进程。 | — |
 | `cluster.lms_enabled` | 布尔 | `on` | on / off | 重启 | 启用负责跨节点锁授予服务的 LMS 后台进程。 | — |
-| `cluster.lms_workers` | 整数 | `2` | 1–8 | 重启 | LMS 数据通道进程数（包括 worker 0）。必须保持 2；大于 2 时额外 worker 无法建立连接，并导致正常停机失败。 | — |
+| `cluster.lms_workers` | 整数 | `2` | 1–8 | 重启 | LMS 数据通道进程数（包括 worker 0）；本预览设置为 2。 | — |
 | `cluster.lms_nice` | 整数 | `0` | -20–0 | 重启 | LMS 数据通道进程的调度 nice 值；0 表示不调整。 | — |
 | `cluster.lmd_max_wait_edges` | 整数 | `1024` | 64–65536 | 重启 | 死锁检测保存的锁等待关系数上限。 | — |
 | `cluster.lmd_scan_interval_ms` | 整数 | `1000` | 50–60000 | 重启 | 死锁检测扫描间隔，单位毫秒。 | — |
@@ -211,7 +211,7 @@ RESET cluster.xnode_profile;
 
 | 名称 | 类型 | 默认值 | 范围／单位 | 在线修改 | 作用 | PRE2 |
 |---|---|---|---|---|---|---|
-| `cluster.page_scn_shortcut` | 布尔 | `off` | on / off | SET（管理员） | 启用跨节点可见性终态结果的会话内复用；不是 VACUUM FREEZE。 | — |
+| `cluster.page_scn_shortcut` | 布尔 | `off` | on / off | SET（管理员） | 启用跨节点可见性终态结果的会话内复用。 | — |
 | `cluster.crossnode_runtime_visibility` | 布尔 | `off` | on / off | SET（管理员） | 启用运行中跨实例事务可见性判定；共享部署保持 on。 | — |
 | `cluster.xid_striping` | 布尔 | `off` | on / off | 重启 | 按节点划分事务号分配范围，避免不同节点分配相同事务号。 | — |
 | `cluster.multi_xmax_remote_resolve` | 布尔 | `on` | on / off | 重启 | 通过集群中的成员状态记录，判断其他节点的多事务行锁状态。 | — |
@@ -222,7 +222,7 @@ RESET cluster.xnode_profile;
 | `cluster.undo_buffer_writeback` | 布尔 | `on` | on / off | 重启 | 本地 undo 缓冲写回开关；多节点配置下不生效，使用写穿路径。 | — |
 | `cluster.undo_writeback_boundary_check` | 枚举 | `on` | off, on, strict | 重启 | undo 检查点写回的附加检查级别；不能用于关闭必要的持久性检查。 | — |
 | `cluster.undo_cleaner_interval_ms` | 整数 | `30000` | 0–3600000 | 重启 | undo 清理进程两轮清理之间的间隔，单位毫秒。 | — |
-| `cluster.undo_cleaner_enabled` | 布尔 | `on` | on / off | 重启 | 启用 undo、事务槽及事务引用的清理。共享模式必须保持 on；关闭会导致正常全停失败。 | — |
+| `cluster.undo_cleaner_enabled` | 布尔 | `on` | on / off | 重启 | 启用 undo、事务槽及事务引用的清理；本预览设置为 on。 | — |
 | `cluster.undo_cleaner_batch_segments` | 整数 | `8` | 1–256 | 重启 | 每轮清理最多扫描的本节点 undo 段数。 | — |
 | `cluster.undo_record_segment_commit_on_rollover` | 布尔 | `on` | on / off | 重启 | 切换 undo 记录段时，将已排空段的状态由活动改为已提交。 | — |
 | `cluster.undo_segments_per_instance` | 整数 | `16` | 1–1024 | 重启 | 为每个集群实例预留的 undo 段数。 | — |
@@ -263,7 +263,7 @@ RESET cluster.xnode_profile;
 | `cluster.cr_tuple_level_fastpath` | 布尔 | `off` | on / off | SET | 对只有一条候选版本链的块启用逐行可见性判断快速路径；默认关闭。 | — |
 | `cluster.cf_terminal_authority` | 布尔 | `off` | on / off | 重启 | 启用持久事务状态与 undo 的跨节点终态判定。 | — |
 | `cluster.cf_delayed_cleanout` | 枚举 | `reader` | off, reader, eager | 重启 | 事务槽提交状态清理策略：关闭、读时清理、主动清理。 | — |
-| `cluster.smart_fusion` | 布尔 | `off` | on / off | 重启 | 提前传块功能开关。本预览只接受 off，设置 on 会被拒绝。 | — |
+| `cluster.smart_fusion` | 布尔 | `off` | on / off | 重启 | 提前传块功能开关；本预览设置为 off。 | — |
 | `cluster.smart_fusion_tier_min` | 枚举 | `tier3` | tier3 | 重启 | Minimum interconnect tier that may use Smart Fusion early transfer. | — |
 | `cluster.smart_fusion_commit_brake_timeout_ms` | 整数 | `5000` | 1–600000 ms | 重启 | Timeout for the Smart Fusion pre-commit dependency brake. | — |
 | `cluster.smart_fusion_origin_durable_gossip_ms` | 整数 | `50` | 1–60000 ms | 重启 | Interval for publishing local durable WAL progress to Smart Fusion peers. | — |
@@ -349,7 +349,7 @@ RESET cluster.xnode_profile;
 | `cluster.deadlock_confirm_interval_ms` | 整数 | `500` | 50–60000 | 重启 | 两次死锁确认之间的间隔，单位毫秒。 | — |
 | `cluster.cancel_ack_timeout_ms` | 整数 | `1000` | 50–60000 ms | SET（管理员） | 死锁处理中，等待对端取消确认再重传的时间，单位毫秒。 | — |
 | `cluster.cancel_max_retransmit` | 整数 | `3` | 0–100 | SET（管理员） | 死锁取消请求升级处理前的最大重传次数。 | — |
-| `cluster.victim_repeat_window_ms` | 整数 | `5000` | 0–600000 ms | SET（管理员） | 避免短时间内反复选择同一事务作为死锁取消对象的时间窗口，单位毫秒。 | — |
+| `cluster.victim_repeat_window_ms` | 整数 | `5000` | 0–600000 ms | SET（管理员） | 避免在指定窗口内反复选择同一事务作为死锁取消对象，单位毫秒。 | — |
 
 ### 诊断与测试入口（不用于业务配置）
 

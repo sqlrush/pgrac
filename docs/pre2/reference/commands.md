@@ -244,14 +244,14 @@ ALTER SYSTEM RESET cluster.xnode_profile;
 
 | 工具／选项 | 用法与限制 | PRE2 |
 |---|---|---|
-| `initdb --pgrac-initdb-cohort --pgrac-initdb-shared-config=FILE -D NEW_CACHE_PARENT` | 一次准备固定成员的新共享库及本地缓存目录。`FILE` 必须由安装流程提供；需要数据校验和、完整同步及受支持 locale。只能用于全新目标，不用于修复失败数据。 | 新入口 |
+| `initdb --pgrac-initdb-cohort --pgrac-initdb-shared-config=FILE -D NEW_CACHE_PARENT` | 一次准备固定成员的新共享库及本地缓存目录。`FILE` 必须由安装流程提供；需要数据校验和、完整同步及受支持 locale。只能用于全新目标。 | 新入口 |
 | `postgres --pgrac-observe-writer PGDATA SHARED_ROOT WAL_ROOT NODE` | 离线只读观察指定节点的数据状态，输出 JSON；不启动数据库、不进行恢复。 | 新入口 |
 | `pg_ctl -D PGDATA status` | 查询本地进程是否运行；返回 3 只表示未运行，不证明上次正常停机。 | 原工具，共享操作限制见下文 |
 | `pg_ctl -D PGDATA -m fast -w -t SECONDS stop` | 请求正常快速停机并等待退出。先停止业务，再同时（并行）向四节点发出停机请求；不要等一个节点完全停止后才通知下一个。 | 原工具 |
 | `pg_ctl -D PGDATA -w -t SECONDS start` | 按创建时配置启动本地实例；共享库需全体固定成员的受支持启动流程。 | 原工具 |
 | `psql` | 普通 SQL、上述状态视图及配置命令。 | 原工具 |
 
-`SECONDS` 是客户端等待上限，不改变数据库内部的停机阶段期限。`pg_ctl stop -w` 返回“已停止”也可能是进程异常退出，必须同时核对日志和离线关闭状态；不要用 `-W` 当作停机成功凭证。
+`SECONDS` 是客户端等待上限，不改变数据库内部的停机阶段期限。使用 `pg_ctl stop -w` 等待进程退出，再核对日志和离线关闭状态；`-W` 只发送停机请求，不等待完成。
 
 离线观察示例（路径和节点号取自本次安装，不混用不同库）：
 
@@ -259,7 +259,9 @@ ALTER SYSTEM RESET cluster.xnode_profile;
 postgres --pgrac-observe-writer "$PGDATA" "$SHARED_ROOT" "$WAL_ROOT" "$NODE_ID"
 ```
 
-命令退出码 0 表示观察成功，不等于正常关闭；输出状态可能为 `CLOSED`、`OPEN` 或 `OTHER`。正常全停后应逐节点核对 `CLOSED`、一致的数据身份和日志结果。读失败、`OTHER` 或停机 PANIC 时保留 DATA/WAL，不重新 initdb、不删控制文件、不用 `pg_resetwal` 绕过；按技术预览支持流程处理，不能凭进程已退出承诺安全重启。
+命令退出码 0 表示观察成功，输出状态可能为 `CLOSED`、`OPEN` 或 `OTHER`。正常全停后应逐节点核对 `CLOSED`、一致的数据身份和日志结果。
+
+启动或停机异常时，保留数据、WAL 和日志，联系技术支持。
 
 建库还提供 `--pgrac-initdb-thread`、`--pgrac-initdb-system-identifier`、`--pgrac-initdb-shared-base`、`--pgrac-initdb-storage-uuid`、`--pgrac-initdb-database-incarnation` 等用于初始化单个节点日志写入身份的选项，以及旧的 `--pgrac-wal-state-root`、`--pgrac-hw-snapshot-root`、`--pgrac-hw-snapshot-owner`。这些是部署入口的组成部分，不应单独拼接来接纳旧库或添加成员。
 
