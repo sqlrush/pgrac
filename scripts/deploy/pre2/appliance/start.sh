@@ -1,3 +1,2 @@
 #!/bin/sh
-set -eu
-exec "$(dirname -- "$0")/control.sh" start "$@"
+exec "$(dirname "$0")/control.sh" start "$@"

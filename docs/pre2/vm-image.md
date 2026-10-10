@@ -4,6 +4,8 @@ Author: SqlRush <sqlrush@gmail.com>
 
 本镜像是 `v0.135.0` 功能评估技术预览。在一台 Ubuntu 24.04 ARM64 VM 中运行四个 PGRAC 实例，共享 VM 内的本地文件系统。数据库代码固定为 `2d857abffc76a5cbfbc1b01c7d99b82ab0375f46`，使用 release 构建，未启用 cassert/debug。镜像不需要嵌套虚拟化、iSCSI 或 GFS2；独立部署仍使用[安装手册](install.md)中的 iSCSI + GFS2 方案。
 
+镜像的公开启动、示例、测速和停止工具统一位于 [`scripts/deploy/pre2/appliance/`](../../scripts/deploy/pre2/appliance/)，全部面向这一台 VM 内的四个数据库实例。交付包根目录已放好这些入口脚本。
+
 ## Mac 最低配置
 
 | 项目 | 本镜像要求 |
