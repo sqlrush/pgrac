@@ -7770,13 +7770,18 @@ test_cluster_ctrc_itl_reuse.inc: $(top_srcdir)/src/backend/cluster/cluster_termi
 	     END { if (page != 1 || cleaner != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_ctrc_yield.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	awk '/^ctrc_cleaner_clean_next_receipt\(/ { print "static bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_ctrc_itl_roles_product.o: $(top_srcdir)/src/backend/cluster/cluster_itl.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_ctrc_transam_product.o: $(top_srcdir)/src/backend/access/transam/transam.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_ctrc_itl_reuse: test_cluster_ctrc_itl_reuse.c test_cluster_ctrc_cleaner.c \
+test_cluster_ctrc_itl_reuse: test_cluster_ctrc_itl_reuse.c test_cluster_ctrc_cleaner.c test_cluster_ctrc_yield.inc \
 		test_cluster_ctrc_run_pass.inc test_cluster_ctrc_itl_reuse.inc unit_test.h \
 		test_cluster_ctrc_itl_roles_product.o test_cluster_ctrc_transam_product.o \
 		$(top_srcdir)/src/backend/cluster/cluster_undo_horizon.c \

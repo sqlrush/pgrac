@@ -40,6 +40,8 @@ static ClusterSfDepVec reuse_dependencies;
 static unsigned reuse_pins, reuse_xlocks, reuse_locks, reuse_enters, reuse_leaves;
 static unsigned reuse_wal_starts, reuse_wal_finishes, reuse_wal_aborts;
 static unsigned reuse_space_reads;
+static bool reuse_local_x, reuse_stop_requested;
+static unsigned reuse_conditional_locks;
 static bool reuse_space_available = true;
 static unsigned reuse_rechecks, reuse_fail_recheck, reuse_fail_lock;
 static bool reuse_terminal_ok, reuse_tag_ok, reuse_exists;
@@ -314,6 +316,27 @@ reuse_lock(Buffer buffer)
 	return true;
 }
 
+/* Only native content/PCM acquisition is a fixture. The scheduler, receipt
+ * selector, page proof, rewrite and final shared discharge remain real. */
+bool
+ClusterLockBufferExclusiveRetryAware(Buffer buffer)
+{
+	return reuse_lock(buffer);
+}
+
+bool
+ConditionalLockBuffer(Buffer buffer)
+{
+	reuse_conditional_locks++;
+	return reuse_local_x && reuse_lock(buffer);
+}
+
+bool
+cluster_normal_stop_requested(void)
+{
+	return reuse_stop_requested;
+}
+
 static void
 reuse_unlock(Buffer buffer, int mode)
 {
@@ -448,6 +471,22 @@ reuse_xlog_abort(GenericXLogState *state)
 #undef GenericXLogFinish
 #undef GenericXLogAbort
 
+static bool
+reuse_no_mx(const ClusterCtrcParticipantEntry *participant pg_attribute_unused(),
+			const ClusterCtrcReceipt *receipt pg_attribute_unused(),
+			uint64 participant_index pg_attribute_unused(), uint64 receipt_index pg_attribute_unused())
+{
+	return false;
+}
+
+#define ctrc_cleaner_clean_next_receipt reuse_scheduled_receipt
+#define ctrc_cleaner_clean_itl_receipt reuse_real_cleaner
+#define ctrc_cleaner_clean_current_mx_receipt reuse_no_mx
+#include "test_cluster_ctrc_yield.inc"
+#undef ctrc_cleaner_clean_next_receipt
+#undef ctrc_cleaner_clean_itl_receipt
+#undef ctrc_cleaner_clean_current_mx_receipt
+
 static void
 reuse_setup(bool replaced)
 {
@@ -464,6 +503,11 @@ reuse_setup(bool replaced)
 	MemSet(&reuse_page, 0, sizeof(reuse_page));
 	MemSet(&reuse_dependencies, 0, sizeof(reuse_dependencies));
 	reuse_pins = reuse_xlocks = reuse_locks = reuse_enters = reuse_leaves = 0;
+	reuse_local_x = reuse_stop_requested = false;
+	reuse_conditional_locks = 0;
+	reuse_space_reads = 0;
+	reuse_space_available = true;
+	cluster_shared_config = false;
 	reuse_wal_starts = reuse_wal_finishes = reuse_wal_aborts = 0;
 	reuse_rechecks = reuse_fail_recheck = reuse_fail_lock = 0;
 	reuse_terminal_ok = reuse_tag_ok = reuse_exists = true;
@@ -2027,10 +2071,50 @@ UT_TEST(test_shared_cleaner_missing_identity_retains_receipt_without_mutation)
 	reuse_space_available = true;
 }
 
+UT_TEST(test_receipt_yields_without_writing_or_discharging)
+{
+	PGAlignedBlock before;
+
+	reuse_setup(false);
+	cluster_shared_config = true;
+	UT_ASSERT(cluster_ctrc_cleaner_bind_worker(0));
+	before = reuse_page;
+	UT_ASSERT(!reuse_scheduled_receipt());
+	UT_ASSERT_EQ(reuse_locks, 0);
+	UT_ASSERT_EQ(reuse_wal_finishes, 0);
+	UT_ASSERT_EQ(reuse_handle.receipt->state, CTRC_RECEIPT_APPLIED);
+	UT_ASSERT_EQ(memcmp(&before, &reuse_page, sizeof(before)), 0);
+	UT_ASSERT_EQ(reuse_pins + reuse_xlocks + held_count, 0);
+	UT_ASSERT_EQ(reuse_enters, reuse_leaves);
+}
+
+UT_TEST(test_yielded_receipt_uses_original_path_on_next_turn)
+{
+	reuse_setup(false);
+	cluster_shared_config = true;
+	UT_ASSERT(cluster_ctrc_cleaner_bind_worker(0));
+	UT_ASSERT(!reuse_scheduled_receipt());
+	UT_ASSERT(reuse_scheduled_receipt());
+	UT_ASSERT_EQ(reuse_handle.receipt->state, CTRC_RECEIPT_CLEANED);
+	UT_ASSERT_EQ(reuse_wal_finishes, 1);
+	UT_ASSERT_EQ(reuse_pins + reuse_xlocks + held_count, 0);
+}
+
+UT_TEST(test_stop_does_not_defer_first_receipt)
+{
+	reuse_setup(false);
+	cluster_shared_config = true;
+	reuse_stop_requested = true;
+	UT_ASSERT(cluster_ctrc_cleaner_bind_worker(0));
+	UT_ASSERT(reuse_scheduled_receipt());
+	UT_ASSERT_EQ(reuse_handle.receipt->state, CTRC_RECEIPT_CLEANED);
+	UT_ASSERT_EQ(reuse_conditional_locks, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(49);
+	UT_PLAN(52);
 	UT_RUN(test_aborted_history_final_guard_rejects_change_after_second_current);
 	UT_RUN(test_aborted_history_retires_only_with_all_three_proofs_without_floor);
 	UT_RUN(test_aborted_history_never_uses_absence_of_live_owner_as_abort_proof);
@@ -2077,6 +2161,9 @@ main(void)
 	UT_RUN(test_retained_reason_is_reported_after_page_release);
 	UT_RUN(test_shared_cleaner_gets_identity_before_page_locks);
 	UT_RUN(test_shared_cleaner_missing_identity_retains_receipt_without_mutation);
+	UT_RUN(test_receipt_yields_without_writing_or_discharging);
+	UT_RUN(test_yielded_receipt_uses_original_path_on_next_turn);
+	UT_RUN(test_stop_does_not_defer_first_receipt);
 	free(CtrcShared);
 	CtrcShared = NULL;
 	UT_DONE();
