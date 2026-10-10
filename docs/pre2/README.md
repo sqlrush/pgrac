@@ -13,6 +13,7 @@ Author: SqlRush <sqlrush@gmail.com>
 | [参数参考](reference/parameters.md) | `cluster.*` 参数的默认值、生效方式和共享配置限制 | 按本版本代码核对；参数存在不等于功能已验收 |
 | [等待事件参考](reference/wait-events.md) | 活动等待查询、事件含义和名称目录 | 区分可解码名称与目录收录项，不据名称判断功能已验收 |
 | [视图、SQL 函数与命令参考](reference/commands.md) | 状态查询、管理入口及命令使用边界 | 标注权限、版本与受限入口；部署仍按安装手册执行 |
+| [镜像使用说明](vm-image.md) | ARM64 Mac 运行环境、镜像校验与合并、一键启停及示例查询 | 按镜像清单核对版本和运行环境 |
 
 ## 选择版本
 
