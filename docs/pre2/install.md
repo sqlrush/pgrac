@@ -471,7 +471,7 @@ sudo -u pgrac /opt/pgrac-admin/native_vote --attest "$VOTE0_DEV" 0
 在控制机下载完整工具代码，并设置专用的新工作目录。将 `SRC` 替换为本机保存的实际数据库源码路径；生成的请求和输出留在源码树之外：
 
 ```bash
-DEPLOY_REF=d41f09d17f800b9901e8e3a76675087af425c93b
+DEPLOY_REF=86a31bcad480517a8cbdd7397199bf0a4aa5269e
 git clone https://github.com/sqlrush/pgrac.git pgrac-deploy-tools
 git -C pgrac-deploy-tools checkout --detach "$DEPLOY_REF"
 DEPLOY_SRC=$(realpath pgrac-deploy-tools)
@@ -592,7 +592,7 @@ cluster.voting_disks = '/dev/disk/by-id/scsi-VOTE0_WWID,/dev/disk/by-id/scsi-VOT
 
 共享配置由初始化时的配置请求生成，不是在四个 `postgresql.conf` 中各自追加一份完整参数。不要手改共享配置对象、删除本地 `postgresql.auto.conf` 来绕过冲突，或通过 `postgres -c` 覆盖共享参数。启动命令的 `-c config_file=...` 仅选择正确的本地入口文件。
 
-生成的 HBA 是**隔离实验室策略**：本机 peer、只允许指定控制机 `/32` 的数据库管理连接，另有评估账号的 SCRAM 条目；其中管理连接使用 `trust`。只有控制机和网络完全受信时才可照用，不能扩成 `0.0.0.0/0`。面向其他用户的账号、口令和 TLS 策略需另行配置并验证；本文未将其标为已经实验室验证。
+生成的 HBA 是**隔离评估环境策略**：本机使用 peer；远程仅允许指定控制机 `/32` 以 `pgrac` 连接 `postgres` 数据库，认证方式为 `trust`。只有控制机和网络完全受信时才可照用，不能扩成 `0.0.0.0/0`。面向其他用户的账号、口令和 TLS 策略需另行配置并验证。
 
 ### 6.3 核对关键参数
 
