@@ -29,10 +29,7 @@ case "$ACTION" in
   "$LIMACTL" shell "$PGRAC_VM" -- sudo -n /usr/local/sbin/pgrac-single "$ACTION"
   ;;
  benchmark)
-  SECONDS_PER_POINT=${PGRAC_SECONDS:-60}
-  if [[ ! "$SECONDS_PER_POINT" =~ ^[0-9]+$ ]] || [ "$SECONDS_PER_POINT" -lt 1 ] || [ "$SECONDS_PER_POINT" -gt 180 ]; then
-    echo 'PGRAC_SECONDS must be between 1 and 180.' >&2; exit 2
-  fi
+  SECONDS_PER_POINT=60
   reply=$("$LIMACTL" shell "$PGRAC_VM" -- sudo -n /usr/local/sbin/pgrac-single launch-sweep --seconds "$SECONDS_PER_POINT")
   job=$(printf '%s' "$reply" | /usr/bin/plutil -extract job raw -o - -)
   echo "Benchmark job: $job (continues inside the VM if this terminal disconnects)"

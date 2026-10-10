@@ -98,7 +98,7 @@ WHERE id = :key;
 COMMIT;
 ```
 
-一键顺序测量每实例 `16 → 32 → 48 → 64` clients，四实例同时产生负载，每档默认 60 秒：
+一键顺序测量每实例 `16 → 32 → 48 → 64` clients，四实例同时产生负载，每档 60 秒。每档测试前会自动重置示例数据。
 
 ```bash
 ./benchmark.sh
@@ -112,8 +112,6 @@ COMMIT;
 /opt/homebrew/bin/limactl shell "${PGRAC_VM:-pgrac-pre2-single}" -- \
   sudo /usr/local/sbin/pgrac-single job-status --job <job-ID>
 ```
-
-如需统一改为每档 180 秒，请在新一组测量前设置 `PGRAC_SECONDS=180`。不要把不同时长或不同配置的样本混在同一组比较。
 
 单独运行某一档，例如每实例 32 clients：
 

@@ -6,13 +6,15 @@ import fcntl
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import pwd
 import re
 import shutil
 import signal
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
 import uuid
 
@@ -236,6 +238,95 @@ def example():
     return dict(status='EXAMPLE_PASS', nodes=4, rows=50000, transactions=4)
 
 
+def replace_factory_data(archive, expected_sha256, root):
+    """Replace a stopped example cohort from its immutable cold snapshot."""
+    root, archive = Path(root), Path(archive)
+    if root.is_symlink() or not root.is_dir() or any(root.glob('node*/data/postmaster.pid')):
+        raise RuntimeError('example DATA must be a stopped directory')
+    digest = hashlib.sha256()
+    with archive.open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    if digest.hexdigest() != expected_sha256:
+        raise RuntimeError('factory example snapshot checksum mismatch')
+    with tarfile.open(archive, 'r:gz') as source:
+        members = source.getmembers()
+        links = set()
+        for member in members:
+            name = PurePosixPath(member.name)
+            if name.is_absolute() or '..' in name.parts or not name.parts or name.parts[0] != root.name:
+                raise RuntimeError('factory snapshot contains an invalid path')
+            if not (member.isfile() or member.isdir() or member.issym()):
+                raise RuntimeError('factory snapshot contains an unsupported file type')
+            if member.issym():
+                target = PurePosixPath(member.linkname)
+                if not target.is_absolute() or '..' in target.parts or str(root) not in map(str, target.parents):
+                    raise RuntimeError('factory snapshot link leaves example DATA')
+                links.add(name)
+        if any(parent in links for m in members for parent in PurePosixPath(m.name).parents):
+            raise RuntimeError('factory snapshot writes through a symbolic link')
+    # Fully unpack and check the replacement before touching the previous DATA.
+    staging = Path(tempfile.mkdtemp(prefix='.pgrac-example-', dir=root.parent))
+    previous = staging / 'previous'
+    try:
+        subprocess.run(['tar', '-xzpf', str(archive), '-C', str(staging)], check=True)
+        fresh = staging / root.name
+        required = [fresh / f'node{n}/data/PG_VERSION' for n in range(4)]
+        required += [fresh / f'vote{n}.img' for n in range(3)]
+        directories = {fresh, fresh / 'data', fresh / 'wal'}
+        for path in required:
+            directories.update(p for p in path.parents if p == fresh or fresh in p.parents)
+        if (not all(p.is_file() and not p.is_symlink() for p in required)
+                or not all(p.is_dir() and not p.is_symlink() for p in directories)
+                or any(fresh.glob('node*/data/postmaster.pid'))):
+            raise RuntimeError('factory snapshot is incomplete or was not stopped')
+        root.rename(previous)
+        try:
+            fresh.rename(root)
+        except BaseException:
+            previous.rename(root)
+            raise
+        shutil.rmtree(previous)
+    finally:
+        # Keep a previous DATA tree if a replacement/rollback did not complete.
+        if not previous.exists():
+            shutil.rmtree(staging)
+
+
+def reset_example():
+    manifest = verify()
+    archive = HERE / 'factory-data.tar.gz'
+    expected = manifest['factory_data_sha256']
+    if RUN.exists():
+        result = stop()
+        if result['status'] != 'STOPPED':
+            raise RuntimeError('normal stop failed; example DATA has been preserved')
+    if command(['pgrep', '-x', 'postgres'], 10)['rc'] != 1:
+        raise RuntimeError('a database process remains; example DATA has been preserved')
+    dest = OUT / ('reset-' + uuid.uuid4().hex)
+    dest.mkdir(mode=0o700)
+    for n in range(4):
+        if logfile(n).is_file():
+            shutil.copyfile(logfile(n), dest / f'node{n}-before-reset.log')
+    begin = time.monotonic()
+    replace_factory_data(archive, expected, ROOT)
+    receipt = dict(status='EXAMPLE_RESET', sha256=expected,
+                   seconds=time.monotonic()-begin, output=str(dest))
+    write_json(dest / 'result.json', receipt)
+    return receipt
+
+
+def fresh_bench(clients, seconds):
+    reset = reset_example()
+    start_result = start()
+    if sql(0, 'SELECT count(*),count(DISTINCT id) FROM demo.idx_lookup')['stdout'].strip() != '50000|50000':
+        raise RuntimeError('factory example row count or uniqueness mismatch')
+    result = bench(clients, seconds)
+    result.update(factory_reset=reset, startup_seconds=start_result['seconds'])
+    write_json(Path(result['output']) / 'result.json', result)
+    return result
+
+
 def bench(clients, seconds):
     for n in range(4):
         if sql(n, 'SHOW cluster.crossnode_write_write', 10)['stdout'].strip() != 'on':
@@ -289,7 +380,7 @@ def bench(clients, seconds):
                     except subprocess.TimeoutExpired:
                         os.killpg(p.pid, signal.SIGKILL)
                         p.wait()  # Never release ownership while a client survives.
-                ends[n] = time.monotonic()
+            ends.setdefault(n, time.monotonic())
         for stream in outputs.values():
             stream.close()
     events = [failure] if failure else []
@@ -311,7 +402,7 @@ def bench(clients, seconds):
 def sweep(seconds):
     rows = []
     for clients in (16, 32, 48, 64):
-        value = bench(clients, seconds)
+        value = fresh_bench(clients, seconds)
         rows.append(value)
         print(json.dumps(value), flush=True)
         if not value['valid']:
@@ -393,7 +484,7 @@ def main():
                 parser.error('--query is required')
             result = sql(args.node, args.query)
         elif args.action == 'bench':
-            result = bench(args.clients, args.seconds)
+            result = fresh_bench(args.clients, args.seconds)
         elif args.action == 'sweep':
             result = sweep(args.seconds)
         elif args.action == 'status':
