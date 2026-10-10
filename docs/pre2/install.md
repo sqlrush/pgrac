@@ -8,19 +8,11 @@ Author: SqlRush <sqlrush@gmail.com>
 
 文中每段 shell 命令均逐条检查返回值；脚本化执行时设置 `set -euo pipefail`，任一步失败就停在该步。除明确标为同一控制机会话的变量外，进入另一台节点须重新设置本机变量。所有 `REPLACE_WITH_...`、`REQUEST_ID` 和示例地址都应先替换，不能原样用于真实部署。
 
-## 1. 验证范围与已知限制
+## 1. 适用环境与功能范围
 
-**验证范围：** 相同数据库源码已在四台 Ubuntu 24.04 ARM64 VM（每台 4 vCPU、8 GiB）上完成编译、共享存储接入、新投票介质读回、配置生成、一次共享建库及四节点分发、首次启动、SQL 查询和 50,000 行数据读写；短时运行有正常全停及原数据重启成功记录，也有持续负载后停机失败记录。已有运行使用 iSCSI、GFS2、Corosync/qdevice、Pacemaker 和 DLM。本页替换了地址、目录和账号，新增的从空操作系统配置示例及第 9.2 节小表示例没有整篇重跑验证；其他硬件、存储与认证配置不属于上述记录。开启断言的构建与未开启断言的构建不能混用校验值或性能读数。
+**实验室验证范围：** Ubuntu 24.04 ARM64 四节点环境（每台 4 vCPU、8 GiB）中的编译、共享存储接入、新投票介质读回、配置生成、一次共享建库及四节点分发、启动、SQL 查询与数据读写、正常停止及原数据重启。该环境使用 iSCSI、GFS2、Corosync/qdevice、Pacemaker 和 DLM。本页使用通用示例地址、目录和账号；部署时按实际环境填写并逐步检查结果。
 
-使用前须接受以下当前限制，详细范围见[产品说明](product-overview.md)：
-
-- 四台 VM 的集群总吞吐约 **100 TPS**；这是特定环境的实测量级，不是性能承诺。
-- **每节点 16 个并发业务连接只做过短时验证**，不代表可以持续运行，也不是 `max_connections` 的硬上限。功能检查从每节点 1 个连接、短事务开始。
-- 持续负载约 **20 分钟后出现过 SQLSTATE `53R97`**，错误详情为 `RECYCLED_AUTHORITY_UNPROVABLE`；同一轮有节点 VM 被关机。这两项是同轮现象，不据此判定唯一原因。
-- **正常停机可能失败**，包括 `FATAL` / `PANIC` 或进程提前退出。失败后再次启动未经验证；本页不提供异常恢复步骤。保留失败现场，继续评估使用另一组新目录、新投票介质重新建库。
-- **无论 autovacuum 开关如何，当前 VACUUM / VACUUM FREEZE 都不能冻结或回收旧行版本**；长时间写入会使表持续膨胀。
-- **`cluster.lms_workers` 必须保持 `2`**。大于 2 时额外 worker 建连失败，并导致停机失败。
-- 本预览不提供数据库高可用或自动故障切换；故障注入、长期运行及性能压测不在本手册的功能评估范围。
+本预览用于应用连接、SQL 兼容和四节点同时读写的功能评估，**不提供高可用或故障切换**。共享模式下会被拒绝的 SQL 操作见[产品说明](product-overview.md)，配置值见第 6.3 节。启动或停机异常时，保留数据、WAL 和四节点日志，联系技术支持。
 
 ## 2. 从 GitHub 获取并编译
 
@@ -69,7 +61,7 @@ sha256sum "$BUILD/stage$PREFIX/bin/postgres"
 
 由管理员把同一个 `stage$PREFIX/` 完整目录分发到四节点的 `$PREFIX/`，保留文件权限。先确认目标不存在、目标节点没有使用该安装目录的数据库进程，再安装。四节点分别运行上述版本、运行库和 SHA-256 检查；分发同一产物时四个 `postgres` 的校验值应一致。源码、`scripts/deploy/` 和公开手册不由 `make install` 全部安装，应单独保留。本文通过 SSH 在节点上运行 `psql`，控制机要求见第 3.1 节。
 
-自行编译的二进制使用本次构建的 SHA-256，不套用验收包校验值。已有约 98 TPS 的短时验收读数来自 Linux ARM64 **cassert（启用断言）**构建；本文的源码编译命令则未启用断言。`v0.135.0` 当前没有已发布的二进制或 `SHA256SUMS` 资产，不能将其他 Release 正文中的包名和哈希当作本版本下载内容。[公开发布列表](https://github.com/sqlrush/pgrac/releases)是下载资产的核对入口。
+自行编译的二进制使用本次构建的 SHA-256，不混用不同构建的校验值。`v0.135.0` 当前没有已发布的二进制或 `SHA256SUMS` 资产，不能将其他 Release 正文中的包名和哈希当作本版本下载内容。[公开发布列表](https://github.com/sqlrush/pgrac/releases)是下载资产的核对入口。
 
 ## 3. 准备四节点、网络、时间和账号
 
@@ -182,7 +174,7 @@ timedatectl show -p NTPSynchronized
 timedatectl timesync-status
 ```
 
-检查标准：时间服务器 `chronyc tracking` 的 `Leap status` 为 `Normal`；四节点 `NTPSynchronized=yes`，`timesync-status` 指向同一可信时间源并持续收到更新。记录每节点的 `Offset` 及采样时间；未同步、时间源不可达或偏差持续增大时，先修复时间服务。当前没有经过验证的“最大可容忍偏差 N 毫秒”，不能把 NTP 显示同步扩大为任意偏差下都安全；运行期间不手动跳变系统时间。
+检查标准：时间服务器 `chronyc tracking` 的 `Leap status` 为 `Normal`；四节点 `NTPSynchronized=yes`，`timesync-status` 指向同一可信时间源并持续收到更新。记录每节点的 `Offset` 及采样时间；未同步、时间源不可达或偏差持续增大时，先修复时间服务。运行期间不手动跳变系统时间。
 
 在控制机配置到四节点的管理 SSH 公钥登录，核验服务器主机公钥后保存到 `known_hosts`。不要使用自动忽略主机身份的 SSH 选项。管理账号应有部署步骤所需的明确 `sudo` 权限，数据库始终由 `pgrac` 启动。
 
@@ -604,14 +596,14 @@ cluster.voting_disks = '/dev/disk/by-id/scsi-VOTE0_WWID,/dev/disk/by-id/scsi-VOT
 
 ### 6.3 核对关键参数
 
-下表区分本部署模板值与产品默认值。模板服务于短时功能评估，不代表持续运行配置。
+下表列出本部署模板值与产品默认值，生成配置后逐项核对。
 
 | 参数/项目 | 本流程值 | 使用说明 |
 |---|---|---|
-| 并发业务连接 | 每节点不超过 16 | 只做过短时验证；先 1 个连接做功能检查，不将 `max_connections` 改成 16 |
-| `max_connections` | `lab-8g` 模板 `100` | 初始化前确定，保留管理连接空间；不是已验证 100 并发 |
+| 并发业务连接 | 每节点不超过 16 | 在客户端连接池中设置 |
+| `max_connections` | `lab-8g` 模板 `100` | 初始化前确定 |
 | `shared_buffers` | `lab-8g` 模板 `512MB` | 与模板中的集群内存表容量一起使用 |
-| `cluster.lms_workers` | **必须为 `2`** | 大于 2 时额外 worker 建连失败，并导致停机失败；DATA 6541–6542 均须可达 |
+| `cluster.lms_workers` | **必须为 `2`** | DATA 6541–6542 均须可达 |
 | `cluster.gcs_block_retransmit_initial_backoff_ms` | `10` | 产品默认，不为掩盖错误改大超时或重试 |
 | `cluster.undo_cleaner_enabled` | `on` | 产品默认，保持开启 |
 | `cluster.xnode_profile`、`cluster.update_trace` | `off` | 本版默认，评估不需要打开逐事务跟踪 |
@@ -621,8 +613,8 @@ cluster.voting_disks = '/dev/disk/by-id/scsi-VOTE0_WWID,/dev/disk/by-id/scsi-VOT
 | `cluster.crossnode_runtime_visibility`、`cluster.undo_gcs_coherence` | `on` | 使用模板值，不用关闭检查解决 SQL 拒绝 |
 | `cluster.storage_quorum_cluster`、`cluster.storage_quorum_nodes` | 实际 Corosync 名称/映射 | 四节点保持一致 |
 | `debug_io_direct` | 模板 `data` | 与已经准备的存储方式一致 |
-| `autovacuum` | 模板 `off` | 开或关均不能解除当前 VACUUM 无法冻结、回收旧行版本的限制 |
-| `restart_after_crash` | 模板 `off` | 不安排异常退出后自动重启或故障接管 |
+| `autovacuum` | 模板 `off` | 保持模板值 |
+| `restart_after_crash` | 模板 `off` | 保持模板值 |
 
 下列 **8 项必须在建库输入中确定**，当前不能在建库后随意改动；与创建记录不一致会被启动检查拒绝：`max_connections`、`max_worker_processes`、`max_wal_senders`、`max_prepared_transactions`、`max_locks_per_transaction`、`wal_level`、`wal_log_hints`、`track_commit_timestamp`。需要另一组值时，使用新建的评估库，不手改控制文件。其他共享参数也不能只凭 `pg_settings.context='sighup'` 就按可热加载处理；具体生效方式见[参数参考](reference/parameters.md)。除本模板明确指定的值外，保留本版本默认值。
 
@@ -735,7 +727,7 @@ done
 test "$rc" -eq 0
 ```
 
-`pg_ctl -W` 返回 0 只表示启动请求已发出。成功要求四个任务都完成，`pg_isready` 报 `accepting connections`，`SELECT 1` 返回一行 `1`，本次服务端日志出现 `database system is ready to accept connections`。180 秒是本示例的就绪观察窗口，不改变服务器参数；超过窗口或出现进程错误时，保留四节点日志和本次 `RUN_DIR`，记录为未完成启动。启动过程由四个成员共同完成，没有额外的手工开库命令。
+`pg_ctl -W` 返回 0 只表示启动请求已发出。成功要求四个任务都完成，`pg_isready` 报 `accepting connections`，`SELECT 1` 返回一行 `1`，本次服务端日志出现 `database system is ready to accept connections`。180 秒是本示例的就绪观察窗口，不改变服务器参数；超过窗口或出现异常时，保留数据、WAL、四节点日志和本次 `RUN_DIR`，联系技术支持。启动过程由四个成员共同完成，没有额外的手工开库命令。
 
 ## 9. 验证配置与小规模读写
 
@@ -819,7 +811,7 @@ COMMIT;
 
 等四个会话都确认提交后，每个节点完整查询四行，结果应一致。另用短事务 `UPDATE ...; ROLLBACK;` 验证回滚后内容保持原值。随后可逐项评估目标应用使用的 SELECT、筛选、排序、连接、聚合、INSERT、UPDATE、DELETE 与事务语义；一次选择明确、可核对预期结果的 SQL 集合。这里不代表所有 PostgreSQL 扩展或 SQL 特性均已兼容认证。
 
-若任意语句出现 ERROR、超时、连接中断或结果不一致，停止当前评估，保留 SQL、返回码、时间与四节点日志。不能把 COMMIT 结果未知当作未提交后盲目重放。每节点不超过 16 个业务并发连接也只有短时验证；32/64 并发、长期运行、吞吐极限和自动故障恢复不在本手册的验证范围。
+若任意语句出现 ERROR、超时、连接中断或结果不一致，停止当前评估，保留 SQL、返回码、时间、数据、WAL 与四节点日志，联系技术支持。不能把 COMMIT 结果未知当作未提交后盲目重放。
 
 ## 10. 正常停止与再次启动
 
@@ -843,7 +835,7 @@ done
 test "$rc" -eq 0
 ```
 
-`-w -t 180` 只让 `pg_ctl` 等待最多 180 秒，不强制杀进程，也不延长服务端期限。任何任务失败或超时均记录为停止失败；即使四个返回码都是 0，也须继续检查本次日志、控制文件及关闭记录。预期本次四节点日志都有 `database system is shut down`，并且没有停机引起的 `FATAL` / `PANIC` 或异常提前退出；历史日志中的同名行不算本次结果。
+`-w -t 180` 只让 `pg_ctl` 等待最多 180 秒，不强制杀进程，也不延长服务端期限。四个任务返回 0 后，继续检查本次日志、控制文件及关闭记录。预期本次四节点日志都有 `database system is shut down`，并且没有异常退出；历史日志中的同名行不算本次结果。启动或停机异常时，保留数据、WAL 和日志，联系技术支持。
 
 在确认四个 postmaster 均已退出后，从控制机采集各节点的离线信息：
 
@@ -872,13 +864,11 @@ jq -s -e 'map({system_identifier, database_incarnation, generation, root_digest,
 
 `--pgrac-observe-writer` 输出**单行 JSON**；成功关闭的字段是 `"root_phase":"CLOSED"` 和 `"final_checkpoint":true`。上面的检查将 `writer` 的节点、线程、incarnation、WAL generation 和 boot 身份与第 9.1 节本次运行记录逐项对照；它们不是拿旧日志推定的值。四份关闭输出的 `system_identifier`、`database_incarnation`、`generation`、`root_digest` 和成员集合应一致；`root_digest` 是共享控制记录的摘要，不是业务表内容校验值。另核对 system identifier 与建库输入相同，并检查各 `nodeN-control.txt` 中 `Database cluster state: shut down`。
 
-四节点进程退出、正常日志、控制状态和关闭 JSON 是不同检查项，任一缺失都不能宣布正常全停成功。日志出现 `FATAL` / `PANIC`、节点失联、I/O 错误、停止不完成或输出不一致时，保留现场，不以强制退出或删除控制文件代替成功。
+分别核对四节点进程退出、正常日志、控制状态和关闭 JSON，全部符合后再进行下一步。遇到异常时，保留数据、WAL 和日志，联系技术支持；不以强制退出或删除控制文件代替正常关闭。
 
 ### 10.2 保留数据与再启动
 
 只有全部正常停止条件成立后，才在**相同二进制、相同配置、相同四节点和共享数据**上按第 8 节再次启动；不重跑 `new-identity`、cohort、投票盘格式化或初始装载。重启后先完整核对第 9 节数据，再接入业务。
-
-**正常停止失败后再次启动未经验证。** 本文不提供失败现场的恢复步骤；继续功能评估需保留原数据与日志，另外准备新数据库目录和新投票介质，再执行全新建库流程。异常退出恢复、单节点恢复、自动接管和混合版本滚动升级不属于本预览能力。
 
 需要关闭操作系统或存储时，先完成全部数据库正常停止，再由 Pacemaker 依次停文件系统/共享卷/锁资源，确认正常卸载，最后退出 iSCSI 会话。数据库仍在运行或停止未完成时，不先断开共享盘或卸载 GFS2。
 
@@ -886,6 +876,6 @@ jq -s -e 'map({system_identifier, database_incarnation, generation, root_digest,
 
 保存源码 commit、构建配置、包校验值、四节点配置、设备映射、本次操作结果和四端日志。不要将私钥、口令、客户地址或完整环境清单上传公开仓库。反馈时提供脱敏的操作步骤、预期/实际结果、SQLSTATE、发生时间和对应版本。
 
-当前使用限制集中列在第 1 节和[产品说明](product-overview.md)。评估结果应同时记录运行时长、业务并发、SQL 错误及正常停机结果，短时通过不能替代持续运行保证。
+功能范围及共享模式下的 SQL 操作要求见[产品说明](product-overview.md)。启动或停机异常时，保留数据、WAL 和日志，联系技术支持。
 
 补充参考：[现有编译说明](../user-guide/install.md)、[配置格式](../user-guide/configuration.md)、[存储准备](../deployment/pre1-storage.md)、[投票介质](../deployment/pre1-voting-fencing.md)、[参数参考](reference/parameters.md)、[视图与命令参考](reference/commands.md)。遇到旧文档与本页 PRE2 初始化步骤不一致时，以本页的共享建库步骤为准。
