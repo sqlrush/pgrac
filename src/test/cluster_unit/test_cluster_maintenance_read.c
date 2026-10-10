@@ -38,6 +38,30 @@ static ClusterPcmOwnSnapshot current;
 static ResourceXGateSnapshot gate;
 static ClusterPcmOwnResult snapshot_result;
 static void (*on_acquire)(void);
+static uint64 metric_counts[PCM_RX_METRIC_COUNT];
+static const char *const metric_keys[] = {
+#define MAINTENANCE_METRIC_KEY(id, key) key,
+	PCM_RX_METRICS(MAINTENANCE_METRIC_KEY)
+#undef MAINTENANCE_METRIC_KEY
+};
+
+/* Observe the reader's counter API calls; the shared atomic store is
+ * owned and tested by the existing PCM metrics implementation. */
+void
+cluster_pcm_rx_metric_note(PcmRxMetric metric)
+{
+	UT_ASSERT((unsigned)metric < PCM_RX_METRIC_COUNT);
+	metric_counts[metric]++;
+}
+
+static uint64
+metric_count(const char *key)
+{
+	for (unsigned i = 0; i < lengthof(metric_keys); i++)
+		if (strcmp(metric_keys[i], key) == 0)
+			return metric_counts[i];
+	return 0;
+}
 
 static bool
 fixture_acquire(LWLock *lock, LWLockMode mode)
@@ -98,6 +122,7 @@ reset(void)
 {
 	memset(&current, 0, sizeof(current));
 	memset(&gate, 0, sizeof(gate));
+	memset(metric_counts, 0, sizeof(metric_counts));
 	current.semantic_buf_state = BM_TAG_VALID | BM_VALID;
 	current.generation = 42;
 	current.reservation_token = 9;
@@ -262,16 +287,60 @@ UT_TEST(test_transition_before_content_is_sampled_and_refused)
 	UT_ASSERT(pinned && !held);
 }
 
+UT_TEST(test_covered_reads_count_each_s_and_x_hit_once)
+{
+	reset();
+	UT_ASSERT(ClusterLockBufferShareIfCovered(1));
+	fixture_release(BufferDescriptorGetContentLock(&descriptors[0].bufferdesc));
+	current.pcm_state = PCM_STATE_X;
+	UT_ASSERT(ClusterLockBufferShareIfCovered(1));
+	fixture_release(BufferDescriptorGetContentLock(&descriptors[0].bufferdesc));
+	UT_ASSERT_EQ(metric_count("maintenance_read_share_hit_count"), 2);
+	UT_ASSERT_EQ(metric_count("maintenance_read_x_fallback_count"), 0);
+}
+
+UT_TEST(test_every_refusal_counts_one_fallback_without_claiming_x_success)
+{
+	for (unsigned i = 0; i < 5; i++) {
+		Buffer buffer = 1;
+
+		reset();
+		switch (i) {
+		case 0:
+			buffer = InvalidBuffer;
+			break;
+		case 1:
+			available = false;
+			break;
+		case 2:
+			current.pcm_state = PCM_STATE_N;
+			break;
+		case 3:
+			gate.phase = RESOURCE_X_GATE_FROZEN;
+			break;
+		case 4:
+			gate_available = false;
+			break;
+		}
+		UT_ASSERT(!ClusterLockBufferShareIfCovered(buffer));
+		UT_ASSERT(!held && pinned);
+		UT_ASSERT_EQ(metric_count("maintenance_read_share_hit_count"), 0);
+		UT_ASSERT_EQ(metric_count("maintenance_read_x_fallback_count"), 1);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(8);
 	UT_RUN(test_current_s_and_x_are_read_without_writer_or_reservation);
 	UT_RUN(test_invalid_local_unpinned_and_inactive_do_not_acquire);
 	UT_RUN(test_busy_content_has_no_wait_or_owner);
 	UT_RUN(test_unproven_current_images_release_only_content_lock);
 	UT_RUN(test_unknown_or_closed_gate_retains_original_pin);
 	UT_RUN(test_transition_before_content_is_sampled_and_refused);
+	UT_RUN(test_covered_reads_count_each_s_and_x_hit_once);
+	UT_RUN(test_every_refusal_counts_one_fallback_without_claiming_x_success);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

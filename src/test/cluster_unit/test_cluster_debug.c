@@ -1132,6 +1132,13 @@ cluster_pcm_rx_stats_snapshot(PcmRxStats *out)
 		return false;
 	out->count[PCM_RX_HEAD_CREATE] = 17;
 	out->count[PCM_RX_FOLLOWER_REJECT_MUTATION] = 2;
+#define MAINTENANCE_METRIC_VALUE(id, key)                                                          \
+	if (strcmp(key, "maintenance_read_share_hit_count") == 0)                                      \
+		out->count[id] = UINT64CONST(4294967303);                                                  \
+	else if (strcmp(key, "maintenance_read_x_fallback_count") == 0)                                \
+		out->count[id] = 11;
+	PCM_RX_METRICS(MAINTENANCE_METRIC_VALUE)
+#undef MAINTENANCE_METRIC_VALUE
 	return true;
 }
 
@@ -5358,6 +5365,31 @@ UT_TEST(test_debug_dump_exposes_reply_wait_sites_without_fabricating_zeros)
 	}
 }
 
+UT_TEST(test_debug_dump_exposes_maintenance_read_counters_without_fake_zero)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+
+	for (int available = 0; available < 2; available++) {
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = 0;
+		captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		wait_margin_stats_available = available != 0;
+		(void)cluster_dump_state(fcinfo);
+		UT_ASSERT_STR_EQ(captured_dump_value("pcm", "rx_stats_available"),
+						 available ? "true" : "false");
+		UT_ASSERT_EQ(captured_dump_count("pcm", "maintenance_read_share_hit_count"), available);
+		UT_ASSERT_EQ(captured_dump_count("pcm", "maintenance_read_x_fallback_count"), available);
+		if (available) {
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "maintenance_read_share_hit_count"),
+							 "4294967303");
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "maintenance_read_x_fallback_count"), "11");
+		}
+	}
+}
+
 UT_TEST(test_debug_dump_exposes_paired_wait_margins_without_zero_fabrication)
 {
 	LOCAL_FCINFO(fcinfo, 0);
@@ -6123,7 +6155,7 @@ UT_TEST(test_debug_phase_symbol_present)
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(23);
 	UT_RUN(test_debug_dump_normal_completion_never_fabricates_unready_proof);
 	UT_RUN(test_debug_dump_srf_linkable);
 	UT_RUN(test_debug_dump_omits_retired_legacy_pcm_x_compatibility_keys);
@@ -6131,6 +6163,7 @@ main(void)
 	UT_RUN(test_debug_dump_exposes_native_pcm_grd_lifecycle_stats);
 	UT_RUN(test_debug_dump_exposes_exact_current_protocol_debt_gauges);
 	UT_RUN(test_debug_dump_exposes_reply_wait_sites_without_fabricating_zeros);
+	UT_RUN(test_debug_dump_exposes_maintenance_read_counters_without_fake_zero);
 	UT_RUN(test_debug_dump_exposes_paired_wait_margins_without_zero_fabrication);
 	UT_RUN(test_debug_dump_exposes_vm_counts_and_histogram_as_separate_cohorts);
 	UT_RUN(test_debug_dump_exposes_receipt_lifetime_and_cancel_before_counters);

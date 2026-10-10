@@ -2432,7 +2432,8 @@ test_cluster_maintenance_read.inc: $(top_srcdir)/src/backend/storage/buffer/bufm
 	     END { if (found != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_maintenance_read: test_cluster_maintenance_read.c test_cluster_maintenance_read.inc unit_test.h
+test_cluster_maintenance_read: test_cluster_maintenance_read.c test_cluster_maintenance_read.inc unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_space_storage: test_cluster_space_storage.c test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc unit_test.h test_cluster_space_catalog_product.o test_cluster_space_smgrdesc_product.o test_cluster_side_xact_xactdesc.o \
