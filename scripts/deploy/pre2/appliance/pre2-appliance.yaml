@@ -1,0 +1,28 @@
+minimumLimaVersion: 2.2.0
+vmType: vz
+arch: aarch64
+nestedVirtualization: true
+propagateProxyEnv: false
+cpus: 8
+memory: 40GiB
+disk: 128GiB
+user:
+  name: pgrac
+  comment: PGRAC appliance operator
+  home: /home/pgrac
+  uid: 1000
+images:
+  - location: ./pre2-arm64.qcow2
+    arch: aarch64
+mounts: []
+containerd:
+  system: false
+  user: false
+ssh:
+  loadDotSSHPubKeys: false
+  forwardAgent: false
+portForwards:
+  - guestIP: 0.0.0.0
+    proto: any
+    guestPortRange: [1, 65535]
+    ignore: true
