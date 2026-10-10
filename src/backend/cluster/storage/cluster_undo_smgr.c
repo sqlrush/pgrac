@@ -352,7 +352,8 @@ static uint64 provision_temp_counter = 0;
  * place, never unlinked during runtime (cluster_undo_segment_file_exists).
  * Foreign/recovery paths retain the original one-descriptor cache below.
  * Each retained descriptor consumes a PostgreSQL external-FD reservation;
- * budget pressure evicts a descriptor or falls back to the original cache.
+ * budget pressure preserves retained descriptors and sends overflow reads
+ * through the original one-descriptor cache.
  */
 typedef struct UndoServiceFd {
 	int fd;

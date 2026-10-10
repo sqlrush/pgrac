@@ -37,6 +37,7 @@
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "miscadmin.h"
+#include "portability/instr_time.h"
 #include "storage/proc.h"
 #include "utils/elog.h"
 #include "utils/timestamp.h"
@@ -2013,6 +2014,23 @@ durable_scan_read_header(uint8 owner, uint32 segment_id, char block[BLCKSZ], boo
 	return false;
 }
 
+#define TT_SCAN_PUBLISH_WAIT_US 5000L
+#define TT_SCAN_PUBLISH_SLICE_US 1000L
+
+static long
+durable_scan_publication_wait_remaining(instr_time start)
+{
+	instr_time elapsed;
+	int64 elapsed_us;
+
+	INSTR_TIME_SET_CURRENT(elapsed);
+	INSTR_TIME_SUBTRACT(elapsed, start);
+	elapsed_us = INSTR_TIME_GET_MICROSEC(elapsed);
+	if (elapsed_us < 0 || elapsed_us >= TT_SCAN_PUBLISH_WAIT_US)
+		return 0;
+	return (long)(TT_SCAN_PUBLISH_WAIT_US - elapsed_us);
+}
+
 /* Retry only within the same tracked storage lifetime.  Replacing a failed
  * proof with an untracked snapshot would discard both the scope refusal and
  * the positive set whose missing files must make the scan incomplete. */
@@ -2020,14 +2038,43 @@ static bool
 durable_scan_retry_inventory(ClusterUndoInventorySnapshot *inventory, uint8 owner)
 {
 	ClusterUndoInventorySnapshot current;
+	instr_time start;
+	int sleeps = 0;
 
-	cluster_undo_inventory_snapshot(cluster_undo_recovery_intent_for_owner(owner), owner, &current);
-	if (!current.tracked || current.publishing || current.identity != inventory->identity
-		|| current.attachment != inventory->attachment || current.owner != inventory->owner)
-		return false;
-	for (int i = 0; i < CLUSTER_UNDO_INVENTORY_WORDS; i++)
-		if ((inventory->published[i] & ~current.published[i]) != 0)
+	for (;;) {
+		long remaining;
+
+		if (sleeps != 0 && durable_scan_publication_wait_remaining(start) == 0)
 			return false;
+		cluster_undo_inventory_snapshot(cluster_undo_recovery_intent_for_owner(owner), owner,
+										&current);
+		if (!current.tracked || current.identity != inventory->identity
+			|| current.attachment != inventory->attachment || current.owner != inventory->owner)
+			return false;
+		for (int i = 0; i < CLUSTER_UNDO_INVENTORY_WORDS; i++)
+			if ((inventory->published[i] & ~current.published[i]) != 0)
+				return false;
+		/* Taking the snapshot can itself exhaust the waiting budget. */
+		if (sleeps != 0 && durable_scan_publication_wait_remaining(start) == 0)
+			return false;
+		if (!current.publishing)
+			break;
+		/* File and parent sync can outlast the first scan.  Wait only in
+		 * this same tracked lifetime, outside the inventory lock.  Both
+		 * elapsed time and the sleep count bound the wait; a delayed wake
+		 * must not restart the budget.  The caller still retries once. */
+		if (sleeps >= TT_SCAN_PUBLISH_WAIT_US / TT_SCAN_PUBLISH_SLICE_US)
+			return false;
+		if (sleeps == 0)
+			INSTR_TIME_SET_CURRENT(start);
+		CHECK_FOR_INTERRUPTS();
+		remaining = durable_scan_publication_wait_remaining(start);
+		if (remaining == 0)
+			return false;
+		pg_usleep(Min(TT_SCAN_PUBLISH_SLICE_US, remaining));
+		sleeps++;
+		CHECK_FOR_INTERRUPTS();
+	}
 	if (inventory->usable)
 		cluster_undo_inventory_count_fallback();
 	current.usable = false;

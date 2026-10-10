@@ -44,6 +44,7 @@
 #include "cluster/storage/cluster_undo_inventory.h"
 #include "common/file_perm.h"
 #include "miscadmin.h"
+#include "portability/instr_time.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 
@@ -68,6 +69,7 @@ ClusterXnodeProfileShared *ClusterXnodeProfileCtl = NULL;
 ClusterXpService cluster_xp_current_service = CLXP_SERVICE_NONE;
 sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
+volatile sig_atomic_t InterruptPending = false;
 
 typedef struct ScanFd {
 	int fd;
@@ -113,6 +115,48 @@ static int scan_scope_change;
 static bool scan_path_failure;
 static pg_on_exit_callback scan_exit_callback;
 static Datum scan_exit_arg;
+static uint64 scan_clock_ns;
+static int scan_clock_calls;
+static int scan_sleep_calls;
+static long scan_sleep_us;
+static void (*scan_after_sleep)(long microsec);
+static int scan_interrupt_calls;
+static void (*scan_after_path)(void);
+static void (*scan_during_interrupt)(void);
+
+int
+clock_gettime(clockid_t clock_id, struct timespec *now)
+{
+	UT_ASSERT_EQ(clock_id, PG_INSTR_CLOCK);
+	scan_clock_calls++;
+	now->tv_sec = scan_clock_ns / NS_PER_S;
+	now->tv_nsec = scan_clock_ns % NS_PER_S;
+	return 0;
+}
+
+void
+pg_usleep(long microsec)
+{
+	UT_ASSERT(microsec > 0 && microsec <= 1000);
+	UT_ASSERT_EQ(scan_wait_depth, 0);
+	scan_sleep_calls++;
+	scan_sleep_us += microsec;
+	scan_clock_ns += (uint64)microsec * NS_PER_US;
+	if (scan_after_sleep != NULL)
+		scan_after_sleep(microsec);
+}
+
+void
+ProcessInterrupts(void)
+{
+	scan_interrupt_calls++;
+	InterruptPending = false;
+	if (scan_during_interrupt != NULL) {
+		scan_during_interrupt();
+		return;
+	}
+	pg_re_throw();
+}
 
 int
 s_lock(volatile slock_t *lock, const char *file, int line, const char *func)
@@ -243,6 +287,8 @@ cluster_undo_path_resolve(ClusterUndoPathIntent intent, uint8 owner, uint32 segm
 
 	if (scan_path_failure)
 		return -1;
+	if (scan_after_path != NULL)
+		scan_after_path();
 	written = snprintf(path, size, "%s/i%u-o%u-s%u.dat", scan_dir, (unsigned)intent,
 					   (unsigned)owner, (unsigned)segment);
 
@@ -377,6 +423,9 @@ scan_reset_counts(void)
 	UT_ASSERT_EQ(scan_wait_depth, 0);
 	scan_open_calls = scan_enoent_calls = scan_pread_calls = scan_eio_calls = 0;
 	scan_calls = scan_wait_starts = 0;
+	scan_clock_ns = NS_PER_S;
+	scan_clock_calls = scan_sleep_calls = scan_interrupt_calls = 0;
+	scan_sleep_us = 0;
 }
 
 static bool
@@ -394,6 +443,10 @@ scan_begin_case(BackendType role)
 	scan_publications = 0;
 	scan_publish_remaining = 0;
 	scan_path_failure = false;
+	scan_after_sleep = NULL;
+	scan_after_path = NULL;
+	scan_during_interrupt = NULL;
+	InterruptPending = false;
 	MyBackendType = role;
 	cluster_node_id = 0;
 	created = mkdtemp(pattern);
@@ -1185,10 +1238,204 @@ UT_TEST(test_cut_refusal_counts_only_final_unavailable_results)
 	}
 }
 
+static TransactionId scan_wait_new_xid;
+
+static void
+scan_complete_publisher_after_sleep(long microsec)
+{
+	if (scan_sleep_calls != 2)
+		return;
+	scan_seed(2, scan_wait_new_xid, TT_SLOT_COMMITTED, SCAN_WRAP, scn_encode(1, 123), false);
+	cluster_undo_inventory_publish_end(2, true);
+	scan_after_sleep = NULL;
+}
+
+static void
+scan_start_publisher_during_read(uint32 segment)
+{
+	if (segment != 256)
+		return;
+	scan_after_read = NULL;
+	UT_ASSERT(cluster_undo_inventory_publish_begin(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1));
+}
+
+UT_TEST(test_publisher_finishing_after_first_pass_gets_one_retry)
+{
+	for (int role = 0; role < lengthof(scan_roles); role++) {
+		for (int consumer = SCAN_RESOLVE; consumer <= SCAN_LOCATE; consumer++) {
+			for (int initial = 0; initial < 2; initial++) {
+				for (int matches = 0; matches < 3; matches++) {
+					ClusterUndoInventoryStats stats;
+					ScanAnswer answer;
+
+					if (!scan_begin_case(scan_roles[role]))
+						return;
+					scan_seed_three(0);
+					scan_expect_target(scan_query(consumer, 0, SCAN_XID, SCAN_WRAP), consumer, 0);
+					if (initial)
+						UT_ASSERT(cluster_undo_inventory_publish_begin(
+							CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1));
+					else
+						scan_after_read = scan_start_publisher_during_read;
+					scan_wait_new_xid = matches == 2 ? SCAN_XID : SCAN_XID + 99;
+					scan_after_sleep = scan_complete_publisher_after_sleep;
+					scan_reset_counts();
+					answer = scan_query(consumer, 0, matches == 0 ? SCAN_XID + 999 : SCAN_XID,
+										SCAN_WRAP);
+					if (matches == 1)
+						scan_expect_target(answer, consumer, 0);
+					else
+						scan_expect(answer, consumer,
+									consumer == SCAN_RESOLVE
+										? (matches == 0 ? CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH
+														: CLUSTER_TT_DURABLE_AMBIGUOUS_WRAP)
+										: (matches == 0 ? CLUSTER_TT_DURABLE_LOCATE_MISSING
+														: CLUSTER_TT_DURABLE_LOCATE_AMBIGUOUS),
+									0, 0, TT_SLOT_INVALID, InvalidScn);
+					UT_ASSERT_EQ(scan_sleep_calls, 2);
+					UT_ASSERT_EQ(scan_sleep_us, 2000);
+					UT_ASSERT_EQ(scan_wait_starts, 2);
+					UT_ASSERT(cluster_undo_inventory_read_stats(&stats));
+					UT_ASSERT_EQ(stats.cut_refusal_count, 0);
+					if (scan_inventory.publishers != 0)
+						cluster_undo_inventory_publish_end(2, false);
+					scan_finish_case();
+				}
+			}
+		}
+	}
+}
+
+UT_TEST(test_stable_scan_has_no_wait_clock_cost)
+{
+	for (int consumer = SCAN_RESOLVE; consumer <= SCAN_LOCATE; consumer++) {
+		if (!scan_begin_case(B_LMS))
+			return;
+		scan_seed_three(0);
+		scan_expect_target(scan_query(consumer, 0, SCAN_XID, SCAN_WRAP), consumer, 0);
+		scan_reset_counts();
+		scan_expect_target(scan_query(consumer, 0, SCAN_XID, SCAN_WRAP), consumer, 0);
+		UT_ASSERT_EQ(scan_clock_calls, 0);
+		UT_ASSERT_EQ(scan_sleep_calls, 0);
+		scan_finish_case();
+	}
+}
+
+static void
+scan_cancel_after_sleep(long microsec)
+{
+	InterruptPending = true;
+}
+
+UT_TEST(test_publication_wait_propagates_cancellation)
+{
+	for (int consumer = SCAN_RESOLVE; consumer <= SCAN_LOCATE; consumer++) {
+		volatile bool cancelled = false;
+
+		if (!scan_begin_case(B_LMS))
+			return;
+		scan_seed_three(0);
+		scan_expect_target(scan_query(consumer, 0, SCAN_XID, SCAN_WRAP), consumer, 0);
+		UT_ASSERT(cluster_undo_inventory_publish_begin(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1));
+		scan_after_sleep = scan_cancel_after_sleep;
+		scan_reset_counts();
+		PG_TRY();
+		{
+			(void)scan_query(consumer, 0, SCAN_XID, SCAN_WRAP);
+		}
+		PG_CATCH();
+		{
+			cancelled = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(cancelled);
+		UT_ASSERT_EQ(scan_sleep_calls, 1);
+		UT_ASSERT_EQ(scan_interrupt_calls, 1);
+		UT_ASSERT_EQ(scan_wait_depth, 0);
+		UT_ASSERT_EQ(scan_wait_starts, 1);
+		UT_ASSERT_EQ(scan_inventory.publishers, 1);
+		cluster_undo_inventory_publish_end(2, false);
+		scan_finish_case();
+	}
+}
+
+static bool scan_finish_during_path;
+
+static void
+scan_path_crosses_wait_deadline(void)
+{
+	scan_after_path = NULL;
+	scan_clock_ns += 6000 * NS_PER_US;
+	if (scan_finish_during_path)
+		cluster_undo_inventory_publish_end(2, false);
+}
+
+static void
+scan_arm_path_delay_after_sleep(long microsec)
+{
+	scan_after_path = scan_path_crosses_wait_deadline;
+}
+
+UT_TEST(test_snapshot_delay_cannot_extend_wait_or_admit_late_cut)
+{
+	for (int consumer = SCAN_RESOLVE; consumer <= SCAN_LOCATE; consumer++) {
+		for (int finish = 0; finish < 2; finish++) {
+			if (!scan_begin_case(B_LMS))
+				return;
+			scan_seed_three(0);
+			scan_expect_target(scan_query(consumer, 0, SCAN_XID, SCAN_WRAP), consumer, 0);
+			UT_ASSERT(cluster_undo_inventory_publish_begin(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1));
+			scan_finish_during_path = finish;
+			scan_after_sleep = scan_arm_path_delay_after_sleep;
+			scan_reset_counts();
+			scan_expect(scan_query(consumer, 0, SCAN_XID, SCAN_WRAP), consumer,
+						consumer == SCAN_RESOLVE ? CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE
+												 : CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE,
+						0, 0, TT_SLOT_INVALID, InvalidScn);
+			UT_ASSERT_EQ(scan_sleep_calls, 1);
+			UT_ASSERT_EQ(scan_wait_starts, 1);
+			if (scan_inventory.publishers != 0)
+				cluster_undo_inventory_publish_end(2, false);
+			scan_finish_case();
+		}
+	}
+}
+
+static void
+scan_interrupt_crosses_wait_deadline(void)
+{
+	scan_clock_ns += 6000 * NS_PER_US;
+}
+
+UT_TEST(test_interrupt_processing_cannot_extend_publication_wait)
+{
+	for (int consumer = SCAN_RESOLVE; consumer <= SCAN_LOCATE; consumer++) {
+		if (!scan_begin_case(B_LMS))
+			return;
+		scan_seed_three(0);
+		scan_expect_target(scan_query(consumer, 0, SCAN_XID, SCAN_WRAP), consumer, 0);
+		UT_ASSERT(cluster_undo_inventory_publish_begin(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1));
+		scan_reset_counts();
+		scan_during_interrupt = scan_interrupt_crosses_wait_deadline;
+		InterruptPending = true;
+		scan_expect(scan_query(consumer, 0, SCAN_XID, SCAN_WRAP), consumer,
+					consumer == SCAN_RESOLVE ? CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE
+											 : CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE,
+					0, 0, TT_SLOT_INVALID, InvalidScn);
+		UT_ASSERT_EQ(scan_sleep_calls, 0);
+		UT_ASSERT_EQ(scan_wait_starts, 1);
+		UT_ASSERT_EQ(scan_interrupt_calls, 1);
+		cluster_undo_inventory_publish_end(2, false);
+		scan_finish_case();
+	}
+}
+
+#include "test_cluster_tt_scan_wait_cases.inc"
+
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(30);
 	UT_RUN(test_lms_both_scans_reuse_real_inventory);
 	UT_RUN(test_worker_both_scans_reuse_real_inventory);
 	UT_RUN(test_backend_both_scans_reuse_real_inventory);
@@ -1209,6 +1456,16 @@ main(void)
 	UT_RUN(test_publisher_exit_retires_inflight_without_certifying_inventory);
 	UT_RUN(test_untracked_own_publish_disables_inventory_before_file_appears);
 	UT_RUN(test_cut_refusal_counts_only_final_unavailable_results);
+	UT_RUN(test_publisher_finishing_after_first_pass_gets_one_retry);
+	UT_RUN(test_stable_scan_has_no_wait_clock_cost);
+	UT_RUN(test_publication_wait_propagates_cancellation);
+	UT_RUN(test_snapshot_delay_cannot_extend_wait_or_admit_late_cut);
+	UT_RUN(test_interrupt_processing_cannot_extend_publication_wait);
+	UT_RUN(test_scan_wait_persistent_publisher_stops_after_five_slices);
+	UT_RUN(test_scan_wait_clock_jump_stops_after_one_slice);
+	UT_RUN(test_scan_wait_disable_during_sleep_refuses);
+	UT_RUN(test_scan_wait_attachment_change_during_sleep_refuses);
+	UT_RUN(test_scan_wait_rescan_publication_never_waits_again);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

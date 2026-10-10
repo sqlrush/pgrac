@@ -7098,6 +7098,7 @@ test_cluster_tt_scan_storage_tt.o: $(top_srcdir)/src/backend/cluster/cluster_tt_
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_tt_scan_storage: test_cluster_tt_scan_storage.c unit_test.h \
+		test_cluster_tt_scan_wait_cases.inc \
 		test_cluster_tt_scan_storage_tt.o \
 		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_inventory.h
