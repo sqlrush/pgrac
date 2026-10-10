@@ -1,14 +1,14 @@
 # PRE2 等待事件参考
 
-适用代码版本：`c45bdc5d4392751a33659acf8dcaa2b76254e73a`。本页只列 PGRAC 增加的事件；原生 PostgreSQL 的 `Lock`、`LWLock`、`IO` 等事件仍然适用。
+目标版本：`v0.135.0`（PRE2 功能评估技术预览，尚未发布）。本页已核对的事件定义来自 `v0.133.1-pre2.1`，不代表新版本或安装包已经发布。
 
-交付镜像 `2d857abffc` 的参数注册、等待名称及 SQL 函数／视图定义与本页核对版本一致；动态诊断键与可用功能仍按实际二进制识别。
+本页只列 PGRAC 增加的事件；原生 PostgreSQL 的 `Lock`、`LWLock`、`IO` 等事件仍然适用。
 
 该版本有 **152 个可解码的集群事件名称、13 类**。名称目录 `pg_stat_cluster_wait_events` 当前只列出其中 **123 个**，另有 **29 个**可出现在活动等待中但没有列入该目录。下表明确标出这一差别。目录中有名字并不表示当前配置会执行相应路径；备用库、部分传输模式、测试或未启用功能也保留名称。
 
 ## PRE2 变化
 
-与 `v0.132.0` 相比，这 152 个事件名称没有新增、删除或改名。PRE2 扩大了共享目录和共享启动等操作的使用范围；不能把名称未变理解为发生频率、耗时或所有调用位置未变。旧参考页“118 个事件”的总数不适用于本页版本。
+与 PRE1 稳定版 `v0.132.0` 相比，这 152 个事件名称没有新增、删除或改名。PRE2 扩大了共享目录和共享启动等操作的使用范围；不能把名称未变理解为发生频率、耗时或所有调用位置未变。
 
 ## 查询正在等待的进程
 
@@ -243,7 +243,7 @@ ORDER BY waiting_processes DESC;
 | `ClusterLmdStartup` | LMD startup wait | 是 |
 | `ClusterLmdScan` | LMD wait-for-graph scan wait | 是 |
 | `ClusterLmdIdle` | LMD idle wait | 是 |
-| `ClusterGesS4Wait` | GES S4 caller-side wait | 是 |
+| `ClusterGesS4Wait` | 向远端管理节点发出全局锁请求后等待回复。 | 是 |
 | `ClusterLmdProbe` | LMD deadlock probe handling wait | 是 |
 | `ClusterGesReplyWait` | Cross-node GES reply wait | 是 |
 | `ClusterLmdProbeCollect` | LMD probe result collection wait | 是 |

@@ -1,14 +1,14 @@
 # PRE2 视图、SQL 函数与命令参考
 
-适用代码版本：`c45bdc5d4392751a33659acf8dcaa2b76254e73a`。本页列出相对原生 PostgreSQL 增加的集群入口；`psql`、`pg_ctl`、`pg_stat_activity` 等原生工具和视图继续使用。接口存在不等于对应功能已纳入技术预览。
+目标版本：`v0.135.0`（PRE2 功能评估技术预览，尚未发布）。本页已核对的接口定义来自 `v0.133.1-pre2.1`，不代表新版本或安装包已经发布。
 
-交付镜像 `2d857abffc` 的参数注册、等待名称及 SQL 函数／视图定义与本页核对版本一致；动态诊断键与可用功能仍按实际二进制识别。
+本页列出相对原生 PostgreSQL 增加的集群入口；`psql`、`pg_ctl`、`pg_stat_activity` 等原生工具和视图继续使用。接口存在不等于对应功能已纳入技术预览。
 
 本预览按[安装手册](../install.md)使用固定成员、全新共享建库及正常全停。在线加入／移除／单节点计划退出、ADG、媒体恢复和测试注入不作为客户操作流程。
 
 ## PRE2 新增与变化
 
-与 `v0.132.0` 对照：新增 `pg_cluster_membership_command(text, jsonb)`；28 个集群视图的 SQL 定义没有新增或变更。共享 `ALTER SYSTEM`、全新共享建库和离线状态观察提供了新的使用方式。`pg_cluster_state` 的键集合由二进制版本决定，不能照旧版键清单认定缺少的键值为零。
+与 PRE1 稳定版 `v0.132.0` 对照：新增 `pg_cluster_membership_command(text, jsonb)`；28 个集群视图的 SQL 定义没有新增或变更。共享 `ALTER SYSTEM`、全新共享建库和离线状态观察提供了新的使用方式。`pg_cluster_state` 的键集合由二进制版本决定，不能照旧版键清单认定缺少的键值为零。
 
 权限方面，这些视图默认授予 `PUBLIC SELECT`，具体函数仍可能检查权限、功能开关或运行条件。管理／注入函数不能仅靠视图的查询权限调用。使用 `\df+`、`\d+` 或下面的目录查询查看当前安装的签名与权限：
 
@@ -184,35 +184,35 @@ DROP TABLE pre2_state_sample;
 
 | 函数（输入类型） | 返回类型 | 用途 |
 |---|---|---|
-| `cluster_ic_mock_inject(integer, bytea)` | `void` | inject a fake inbound message into the mock interconnect queue |
-| `cluster_ic_mock_drain_outbound(integer)` | `SETOF record` | drain queued outbound mock messages for a target node |
-| `cluster_ic_mock_clear_all()` | `void` | reset all mock interconnect queues |
-| `cluster_ic_mock_recv_test()` | `SETOF record` | pop one inbound mock message via cluster_ic_recv_bytes |
-| `cluster_inject_fault(text, text, bigint)` | `boolean` | arm or disarm a cluster injection point |
+| `cluster_ic_mock_inject(integer, bytea)` | `void` | 测试用：向模拟互联队列注入一条入站消息。 |
+| `cluster_ic_mock_drain_outbound(integer)` | `SETOF record` | 测试用：取出发往指定节点的模拟出站消息。 |
+| `cluster_ic_mock_clear_all()` | `void` | 测试用：清空全部模拟互联队列。 |
+| `cluster_ic_mock_recv_test()` | `SETOF record` | 测试用：从模拟互联队列接收一条入站消息。 |
+| `cluster_inject_fault(text, text, bigint)` | `boolean` | 测试用：启用或解除指定故障注入。 |
 | `cluster_scn_advance()` | `bigint` | 诊断用：推进 SCN；有状态修改，不用于业务。 |
 | `cluster_scn_observe(bigint)` | `void` | 诊断用：输入外部 SCN；有状态修改，不用于业务。 |
-| `pg_cluster_lmd_inject_wait_edge(integer, integer, bigint, integer, integer, bigint)` | `boolean` | TEST-ONLY: inject synthetic LMD wait edge |
-| `pg_cluster_lmd_remove_wait_edges(integer, integer, bigint)` | `boolean` | TEST-ONLY: remove synthetic LMD wait edges by waiter |
+| `pg_cluster_lmd_inject_wait_edge(integer, integer, bigint, integer, integer, bigint)` | `boolean` | 测试用：注入一条模拟锁等待关系。 |
+| `pg_cluster_lmd_remove_wait_edges(integer, integer, bigint)` | `boolean` | 测试用：按等待者移除模拟锁等待关系。 |
 | `pgrac_r4_bit22_cutover_begin()` | `boolean` | 管理用途的服务激活入口；由部署／启动流程负责，不手工调用。 |
-| `cluster_test_inject_visibility_tt_ref(xid, integer, integer, integer, integer, bigint, boolean)` | `boolean` | TEST-ONLY: inject remote TT ref for MVCC visibility fork |
-| `cluster_test_clear_visibility_injects()` | `integer` | TEST-ONLY: clear MVCC visibility fork inject table |
-| `cluster_test_inject_subtrans_subcommitted(xid, xid, integer, integer, integer, integer)` | `boolean` | TEST-ONLY: inject SUBCOMMITTED parent chain for SUBTRANS visibility |
+| `cluster_test_inject_visibility_tt_ref(xid, integer, integer, integer, integer, bigint, boolean)` | `boolean` | 测试用：为可见性检查注入远端事务状态引用。 |
+| `cluster_test_clear_visibility_injects()` | `integer` | 测试用：清空可见性检查的注入数据。 |
+| `cluster_test_inject_subtrans_subcommitted(xid, xid, integer, integer, integer, integer)` | `boolean` | 测试用：注入子事务提交后的父事务关系，供可见性检查使用。 |
 | `cluster_undo_get_record(bytea)` | `bytea` | 按二进制引用读取 undo 记录的诊断入口，不供应用调用。 |
-| `cluster_undo_test_force_segment_end()` | `boolean` | TEST-ONLY: force undo segment cursor to last block |
-| `cluster_cr_test_construct(regclass, integer, integer, bigint)` | `boolean` | TEST-ONLY: construct own-instance CR block image |
-| `cluster_cr_test_image(regclass, integer, bigint)` | `SETOF record` | TEST-ONLY: CR block image rows as-of read_scn |
-| `cluster_block_apply_redo_test(regclass, integer, bigint, pg_lsn, pg_lsn)` | `bytea` | TEST-ONLY: single-block redo-apply reconstruction over WAL |
-| `cluster_thread_apply_redo_test(regclass, integer, bigint, pg_lsn, pg_lsn, bytea)` | `bytea` | TEST-ONLY: LSN-gated online thread-recovery apply over WAL |
-| `cluster_thread_local_complete_test(integer, pg_lsn)` | `boolean` | TEST-ONLY: online thread-recovery D3 local-complete authority gate |
-| `cluster_thread_gate_unfreeze_test(integer)` | `boolean` | TEST-ONLY: online thread-recovery D3 reconfig unfreeze gate |
-| `cluster_thread_validated_end_test(integer, pg_lsn, pg_lsn)` | `text` | TEST-ONLY: online thread-recovery D4 validated torn-tail boundary |
-| `cluster_thread_replay_slot_state_test(integer)` | `integer` | TEST-ONLY: read online thread-recovery 3b-4b replay-state slot |
-| `cluster_thread_capability_gate_test(integer)` | `text` | TEST-ONLY: drive the online thread-recovery D7 capability gate |
-| `cluster_pi_apply_redo_test(regclass, integer, bigint, integer, pg_lsn, pg_lsn, boolean)` | `text` | TEST-ONLY: PI-base vs zero-base thread-WAL block rebuild |
-| `cluster_block_recovery_reconstruct_test(regclass, integer, bigint, pg_lsn, pg_lsn)` | `bytea` | TEST-ONLY: online single-block recovery reconstruction over WAL |
-| `cluster_ts_acquire_probe(text, text, text, boolean)` | `text` | TEST-ONLY: drive the TT tablespace-DDL GES acquire |
-| `cluster_ts_release_probe()` | `boolean` | TEST-ONLY: release a held TT tablespace-DDL probe claim |
-| `cluster_ko_flush_probe(oid, oid, oid)` | `text` | TEST-ONLY: drive the KO object-reuse flush barrier |
+| `cluster_undo_test_force_segment_end()` | `boolean` | 测试用：将 undo 段写入位置移到最后一块。 |
+| `cluster_cr_test_construct(regclass, integer, integer, bigint)` | `boolean` | 测试用：在本实例构造一致读块镜像。 |
+| `cluster_cr_test_image(regclass, integer, bigint)` | `SETOF record` | 测试用：查看指定读取顺序号对应的一致读块中的行。 |
+| `cluster_block_apply_redo_test(regclass, integer, bigint, pg_lsn, pg_lsn)` | `bytea` | 测试用：利用 WAL 重放重建单个数据块。 |
+| `cluster_thread_apply_redo_test(regclass, integer, bigint, pg_lsn, pg_lsn, bytea)` | `bytea` | 测试用：在指定日志位置范围内执行在线日志线程恢复。 |
+| `cluster_thread_local_complete_test(integer, pg_lsn)` | `boolean` | 测试用：检查在线日志线程恢复是否满足本地完成条件。 |
+| `cluster_thread_gate_unfreeze_test(integer)` | `boolean` | 测试用：检查在线日志线程恢复后是否可以解除暂停。 |
+| `cluster_thread_validated_end_test(integer, pg_lsn, pg_lsn)` | `text` | 测试用：验证在线日志线程恢复所用的不完整日志尾部边界。 |
+| `cluster_thread_replay_slot_state_test(integer)` | `integer` | 测试用：读取在线日志线程恢复的回放状态。 |
+| `cluster_thread_capability_gate_test(integer)` | `text` | 测试用：检查在线日志线程恢复所需能力是否齐备。 |
+| `cluster_pi_apply_redo_test(regclass, integer, bigint, integer, pg_lsn, pg_lsn, boolean)` | `text` | 测试用：以保留的页镜像或空页为起点，通过日志重建数据块。 |
+| `cluster_block_recovery_reconstruct_test(regclass, integer, bigint, pg_lsn, pg_lsn)` | `bytea` | 测试用：通过 WAL 执行在线单块恢复重建。 |
+| `cluster_ts_acquire_probe(text, text, text, boolean)` | `text` | 测试用：申请表空间 DDL 的全局锁并查看结果。 |
+| `cluster_ts_release_probe()` | `boolean` | 测试用：释放表空间 DDL 探测持有的全局锁。 |
+| `cluster_ko_flush_probe(oid, oid, oid)` | `text` | 测试用：检查对象复用前的跨节点缓冲刷新。 |
 
 ### 成员命令的当前行为
 
@@ -236,7 +236,7 @@ ALTER SYSTEM SET cluster.xnode_profile = on;
 ALTER SYSTEM RESET cluster.xnode_profile;
 ```
 
-这不是同时在所有现有会话执行 `SET`。COMMON 启动／协议参数需重启生效，实例参数仅针对执行 SQL 的本实例；创建时参数和 `RESET ALL` 被拒绝。使用管理员账号并逐节点检查当前值；完整规则见[参数参考](parameters.md#查看与修改)。
+这不是同时在所有现有会话执行 `SET`。影响启动或节点间通信的集群公共参数需重启生效，实例参数仅针对执行 SQL 的本实例；创建时参数和 `RESET ALL` 被拒绝。使用管理员账号并逐节点检查当前值；完整规则见[参数参考](parameters.md#查看与修改)。
 
 ## 命令行工具
 
@@ -247,7 +247,7 @@ ALTER SYSTEM RESET cluster.xnode_profile;
 | `initdb --pgrac-initdb-cohort --pgrac-initdb-shared-config=FILE -D NEW_CACHE_PARENT` | 一次准备固定成员的新共享库及本地缓存目录。`FILE` 必须由安装流程提供；需要数据校验和、完整同步及受支持 locale。只能用于全新目标，不用于修复失败数据。 | 新入口 |
 | `postgres --pgrac-observe-writer PGDATA SHARED_ROOT WAL_ROOT NODE` | 离线只读观察指定节点的数据状态，输出 JSON；不启动数据库、不进行恢复。 | 新入口 |
 | `pg_ctl -D PGDATA status` | 查询本地进程是否运行；返回 3 只表示未运行，不证明上次正常停机。 | 原工具，共享操作限制见下文 |
-| `pg_ctl -D PGDATA -m fast -w -t SECONDS stop` | 请求正常快速停机并等待退出。应先停止业务，再按安装流程向全体固定成员发出停机；不得把四节点停机串行拖过内部阶段期限。 | 原工具 |
+| `pg_ctl -D PGDATA -m fast -w -t SECONDS stop` | 请求正常快速停机并等待退出。先停止业务，再同时（并行）向四节点发出停机请求；不要等一个节点完全停止后才通知下一个。 | 原工具 |
 | `pg_ctl -D PGDATA -w -t SECONDS start` | 按创建时配置启动本地实例；共享库需全体固定成员的受支持启动流程。 | 原工具 |
 | `psql` | 普通 SQL、上述状态视图及配置命令。 | 原工具 |
 
@@ -261,13 +261,13 @@ postgres --pgrac-observe-writer "$PGDATA" "$SHARED_ROOT" "$WAL_ROOT" "$NODE_ID"
 
 命令退出码 0 表示观察成功，不等于正常关闭；输出状态可能为 `CLOSED`、`OPEN` 或 `OTHER`。正常全停后应逐节点核对 `CLOSED`、一致的数据身份和日志结果。读失败、`OTHER` 或停机 PANIC 时保留 DATA/WAL，不重新 initdb、不删控制文件、不用 `pg_resetwal` 绕过；按技术预览支持流程处理，不能凭进程已退出承诺安全重启。
 
-建库还提供 `--pgrac-initdb-thread`、`--pgrac-initdb-system-identifier`、`--pgrac-initdb-shared-base`、`--pgrac-initdb-storage-uuid`、`--pgrac-initdb-database-incarnation` 等单 writer 参数，以及旧的 `--pgrac-wal-state-root`、`--pgrac-hw-snapshot-root`、`--pgrac-hw-snapshot-owner`。这些是部署入口的组成部分，不应单独拼接来接纳旧库或添加成员。
+建库还提供 `--pgrac-initdb-thread`、`--pgrac-initdb-system-identifier`、`--pgrac-initdb-shared-base`、`--pgrac-initdb-storage-uuid`、`--pgrac-initdb-database-incarnation` 等用于初始化单个节点日志写入身份的选项，以及旧的 `--pgrac-wal-state-root`、`--pgrac-hw-snapshot-root`、`--pgrac-hw-snapshot-owner`。这些是部署入口的组成部分，不应单独拼接来接纳旧库或添加成员。
 
 ### 已安装的兼容脚本与隔离服务工具
 
 | 工具 | 内容／本预览用法 |
 |---|---|
-| `pgrac-init` | 兼容初始化包装脚本。其 `--cluster-seed`／`--cluster-join` 路径不能替代本预览的完整 cohort 建库流程。 |
+| `pgrac-init` | 兼容初始化包装脚本。其 `--cluster-seed`／`--cluster-join` 路径不能替代本预览固定成员的全新共享建库流程。 |
 | `pgrac-start` | 兼容启动包装脚本；本预览以安装手册生成的路径和配置为准。 |
 | `pgrac-acceptance` | 随源码提供的兼容验收包装脚本；不是共享库恢复或完整性证明工具。 |
 | `pgrac-fenced` | 隔离服务守护进程，按交付的服务配置管理，不由数据库用户手工启动另一份。 |
@@ -283,10 +283,10 @@ postgres --pgrac-observe-writer "$PGDATA" "$SHARED_ROOT" "$WAL_ROOT" "$NODE_ID"
 python3 scripts/deploy/pre2/membership.py status --service pre2_admin
 ```
 
-`pre2_admin` 是事先配置的 libpq service；使用非交互认证。本预览的 `blocked` 结果会使该 CLI 返回 2，通信／结果不明返回 1；不能将返回 2 解释为操作已提交。不要改用旧 clean-leave SQL 来绕过此限制。
+`pre2_admin` 是事先配置的 libpq service；使用非交互认证。本预览的 `blocked` 结果会使该 CLI 返回 2，通信／结果不明返回 1；不能将返回 2 解释为操作已提交。不要改用旧的单节点退出函数来绕过此限制。
 
 ## 与现有手册的关系
 
-旧版[状态键字典](../../reference/cluster-observability/05-pg-cluster-state-key-dictionary.md)和[计数器字典](../../reference/cluster-observability/06-cluster-counter-dictionary.md)可用于查找既有键；新键及可用性以精确安装的二进制为准。旧运维页建议按 `category` 过滤降低采集成本的说法不适用于完整 materialize 的 `pg_cluster_state`：过滤只减少返回给客户端的行。
+既有[状态键字典](../../reference/cluster-observability/05-pg-cluster-state-key-dictionary.md)和[计数器字典](../../reference/cluster-observability/06-cluster-counter-dictionary.md)可用于查找既有键；新键及可用性以实际安装的二进制为准。查询 `pg_cluster_state` 会先收集全部类别；按 `category` 过滤只减少返回行，不减少服务端采集工作。
 
 相关页面：[参数](parameters.md)、[等待事件](wait-events.md)、[安装](../install.md)。
