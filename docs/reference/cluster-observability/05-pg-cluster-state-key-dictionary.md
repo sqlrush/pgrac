@@ -939,6 +939,7 @@
 | `tt_inventory_bitmap_zero_count` | 十进制整数文本或 `unavailable` | 运行时完整性核验通过后，有限扫描完成的零匹配结果数。 | 汇总 resolve 和 locate 两个入口；零匹配不等于事务已提交或已回收。 |
 | `tt_inventory_full_zero_count` | 十进制整数文本或 `unavailable` | 全范围扫描完成的零匹配结果数。 | 不包含扫描不完整、读失败或歧义结果；与有限扫描零匹配分开计数。 |
 | `tt_inventory_fallback_count` | 十进制整数文本或 `unavailable` | 有限扫描失去完整性证明后，改为全范围重扫的次数。 | 每次调用最多重扫一次；不包含直接从全范围开始的扫描。各键独立采样，比较同代次时间窗增量。 |
+| `tt_inventory_cut_refusal_count` | 十进制整数文本或 `unavailable` | 发布切点失效导致最终返回扫描不可用的次数。 | 不包含成功重扫、歧义结果或单独由读错误导致的拒绝；与上层 RPC 次数不是同一口径。 |
 | `retention_horizon_scn` | 十进制整数文本 | 保留 / `horizon`对应的集群 SCN。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `retention_max_recycle_horizon` | 十进制整数文本 | 保留 / 上限 / `recycle` / `horizon`的当前快照值。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `tt_slot_retain_skip_count` | 十进制整数文本 | `tt` / 槽位 / `retain` / `skip`的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |

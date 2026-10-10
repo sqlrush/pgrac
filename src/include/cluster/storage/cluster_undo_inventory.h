@@ -42,6 +42,7 @@ typedef struct ClusterUndoInventory {
 	pg_atomic_uint64 bitmap_zero_count;
 	pg_atomic_uint64 full_zero_count;
 	pg_atomic_uint64 fallback_count;
+	pg_atomic_uint64 cut_refusal_count;
 } ClusterUndoInventory;
 
 typedef struct ClusterUndoInventorySnapshot {
@@ -52,13 +53,16 @@ typedef struct ClusterUndoInventorySnapshot {
 	uint8 owner;
 	bool tracked;
 	bool usable;
+	bool publishing;
 } ClusterUndoInventorySnapshot;
 
 /* Cumulative per-node scan activity; pass counts are not transaction verdicts.
  * Full scans include cold/disabled/foreign scans and limited-scan retries.
  * Disable counts false-to-true transitions, once per shared-memory lifetime.
  * Zero counts are completed zero-match results, not a committed/recycled
- * transaction proof.  Fallback counts limited passes retried in full. */
+ * transaction proof.  Fallback counts limited passes retried in full.
+ * Cut refusals count final unavailable results with an invalid publication
+ * cut, excluding a successful retry and independent I/O-only refusals. */
 typedef struct ClusterUndoInventoryStats {
 	uint64 bitmap_hit_count;
 	uint64 full_scan_count;
@@ -66,11 +70,13 @@ typedef struct ClusterUndoInventoryStats {
 	uint64 bitmap_zero_count;
 	uint64 full_zero_count;
 	uint64 fallback_count;
+	uint64 cut_refusal_count;
 } ClusterUndoInventoryStats;
 
 extern void cluster_undo_inventory_count_scan(bool bitmap);
 extern void cluster_undo_inventory_count_zero(bool bitmap);
 extern void cluster_undo_inventory_count_fallback(void);
+extern void cluster_undo_inventory_count_cut_refusal(void);
 /* Each field is sampled independently.  False means no shared inventory. */
 extern bool cluster_undo_inventory_read_stats(ClusterUndoInventoryStats *out);
 
@@ -80,6 +86,8 @@ extern void cluster_undo_inventory_snapshot(ClusterUndoPathIntent intent, uint8 
 extern bool cluster_undo_inventory_finish(const ClusterUndoInventorySnapshot *snapshot,
 										  const uint64 seen[CLUSTER_UNDO_INVENTORY_WORDS],
 										  bool complete);
+/* Separate the publication cut from the stronger skipped-file certificate. */
+extern bool cluster_undo_inventory_cut_stable(const ClusterUndoInventorySnapshot *snapshot);
 extern bool cluster_undo_inventory_publish_begin(ClusterUndoPathIntent intent, uint8 owner);
 /* Paired with a true begin, including on ERROR.  Success means readable final file. */
 extern void cluster_undo_inventory_publish_end(uint32 segment, bool success);

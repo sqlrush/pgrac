@@ -4400,6 +4400,7 @@ test_cluster_lck: test_cluster_lck.c unit_test.h \
 # Run all tests sequentially
 # ----------
 check: all check_cluster_undo_segment_half_page_oversized \
+	check_undo_inventory_publication_census \
 	check_pcm_x_write_gate_ast check_pcm_x_write_gate_coverage \
 	check_resource_x_send_c1_unit \
 	check_r11_predecessor_product_manifest_unit \
@@ -4460,6 +4461,10 @@ check_r11_predecessor_product_manifest:
 check_r11_legacy_source_removed:
 	PYTHONDONTWRITEBYTECODE=1 python3 \
 		$(top_srcdir)/src/test/cluster_unit/test_r11_legacy_source_removed.py
+
+check_undo_inventory_publication_census:
+	PYTHONDONTWRITEBYTECODE=1 python3 \
+		$(top_srcdir)/src/test/cluster_unit/test_undo_inventory_publication_census.py
 
 check_r11_source_removal_census_unit:
 	PYTHONDONTWRITEBYTECODE=1 python3 \
@@ -4610,6 +4615,7 @@ install installdirs uninstall installcheck:
 	@:
 
 .PHONY: all check check_cluster_undo_segment_half_page_oversized \
+	check_undo_inventory_publication_census \
 	check_pcm_x_write_gate_ast check_pcm_x_write_gate_coverage clean distclean \
 	check_resource_x_send_c1 check_resource_x_send_c1_unit \
 	check_r11_predecessor_product_manifest \

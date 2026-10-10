@@ -2022,12 +2022,14 @@ durable_scan_retry_inventory(ClusterUndoInventorySnapshot *inventory, uint8 owne
 	ClusterUndoInventorySnapshot current;
 
 	cluster_undo_inventory_snapshot(cluster_undo_recovery_intent_for_owner(owner), owner, &current);
-	if (!current.tracked || current.identity != inventory->identity
+	if (!current.tracked || current.publishing || current.identity != inventory->identity
 		|| current.attachment != inventory->attachment || current.owner != inventory->owner)
 		return false;
 	for (int i = 0; i < CLUSTER_UNDO_INVENTORY_WORDS; i++)
 		if ((inventory->published[i] & ~current.published[i]) != 0)
 			return false;
+	if (inventory->usable)
+		cluster_undo_inventory_count_fallback();
 	current.usable = false;
 	*inventory = current;
 	return true;
@@ -2059,6 +2061,8 @@ cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node, TransactionId xid
 	bool scan_complete = true;
 	bool inventory_complete = true;
 	bool inventory_certified;
+	bool cut_stable;
+	bool retried = false;
 	ClusterUndoInventorySnapshot inventory;
 	uint64 seen[CLUSTER_UNDO_INVENTORY_WORDS];
 	SCN found = InvalidScn;
@@ -2170,20 +2174,23 @@ rescan:
 	cluster_tt_durable_io_wait_end();
 	inventory_certified
 		= cluster_undo_inventory_finish(&inventory, seen, inventory_complete && scan_complete);
-	if (!inventory_certified && inventory.usable
+	cut_stable = inventory_certified || cluster_undo_inventory_cut_stable(&inventory);
+	if (!retried && !inventory_certified && (inventory.usable || !cut_stable)
 		&& durable_scan_retry_inventory(&inventory, owner)) {
-		/* An invalidated limited scan has no complete-set proof, even if
-		 * it found a match.  Retry once over the original whole range. */
-		cluster_undo_inventory_count_fallback();
+		/* Retry an invalidated limited scan or a drifting full scan once.
+		 * The replacement must retain the original tracked lifetime. */
+		retried = true;
 		goto rescan;
 	}
 	/* Full scans can also miss a publication behind the cursor.  If the
 	 * runtime inventory was participating, its failed cut is not a complete
 	 * scan, and retrying must not turn an unproven result into a zero match. */
-	if (!inventory_certified && inventory.owner != 0)
+	if ((!cut_stable || (inventory.usable && !inventory_certified)) && inventory.owner != 0)
 		scan_complete = false;
 
 	result = cluster_tt_durable_classify(xid_matches, match_has_valid_scn, scan_complete);
+	if (result == CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE && !cut_stable && inventory.owner != 0)
+		cluster_undo_inventory_count_cut_refusal();
 	if (result == CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH)
 		cluster_undo_inventory_count_zero(inventory.usable);
 	if (result == CLUSTER_TT_DURABLE_RESOLVED_SCN) {
@@ -2213,6 +2220,8 @@ cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node, TransactionId 
 	bool inventory_complete = true;
 	ClusterUndoInventorySnapshot inventory;
 	bool inventory_certified;
+	bool cut_stable;
+	bool retried = false;
 	uint64 seen[CLUSTER_UNDO_INVENTORY_WORDS];
 	uint16 matched_seg = 0;
 	uint16 matched_slot = 0;
@@ -2273,18 +2282,22 @@ rescan:
 	cluster_tt_durable_io_wait_end();
 	inventory_certified
 		= cluster_undo_inventory_finish(&inventory, seen, inventory_complete && scan_complete);
-	if (!inventory_certified && inventory.usable
+	cut_stable = inventory_certified || cluster_undo_inventory_cut_stable(&inventory);
+	if (!retried && !inventory_certified && (inventory.usable || !cut_stable)
 		&& durable_scan_retry_inventory(&inventory, owner)) {
 		/* A subset miss is not an absence proof after invalidation. */
-		cluster_undo_inventory_count_fallback();
+		retried = true;
 		goto rescan;
 	}
-	if (!inventory_certified && inventory.owner != 0)
+	if ((!cut_stable || (inventory.usable && !inventory_certified)) && inventory.owner != 0)
 		scan_complete = false;
 	if (matches > 1)
 		return CLUSTER_TT_DURABLE_LOCATE_AMBIGUOUS;
-	if (!scan_complete)
+	if (!scan_complete) {
+		if (!cut_stable && inventory.owner != 0)
+			cluster_undo_inventory_count_cut_refusal();
 		return CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE;
+	}
 	if (matches == 0) {
 		cluster_undo_inventory_count_zero(inventory.usable);
 		return CLUSTER_TT_DURABLE_LOCATE_MISSING;

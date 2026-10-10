@@ -292,6 +292,23 @@ live_fds(void)
 	return count;
 }
 
+/* Observe the original opens, so closing and reusing the same FD number
+ * cannot masquerade as retaining a pool pin.  No product cache is inspected. */
+static int
+initial_pool_pins_live(int pins)
+{
+	int count = 0;
+
+	UT_ASSERT(opened_count >= pins);
+	for (int i = 0; i < pins && i < opened_count; i++) {
+		if (opened[i].live) {
+			UT_ASSERT(fcntl(opened[i].fd, F_GETFD) >= 0);
+			count++;
+		}
+	}
+	return count;
+}
+
 static void
 require_all_closed(void)
 {
@@ -482,6 +499,57 @@ UT_TEST(test_worker_77_existing_segments_second_sweep_never_reopens)
 	exercise_77_existing_segments(B_LMS_WORKER);
 }
 
+static void
+exercise_77_segments_with_40_pool_pins(BackendType role)
+{
+	if (!begin_case(role))
+		return;
+	/* 40 pool reservations, another 40 for external users, and the original
+	 * single-FD path for the 37 files that cannot enter this pool. */
+	max_safe_fds = 240;
+	external_limit = 80;
+	for (uint32 segment = 1; segment <= 77; segment++)
+		seed_segment(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment);
+	for (int sweep = 0; sweep < 3; sweep++) {
+		int opens_before = open_attempts;
+		int successes_before = successful_opens;
+		int pool_opens;
+
+		for (uint32 segment = 1; segment <= 40; segment++)
+			expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment,
+						sweep != 0);
+		pool_opens = open_attempts - opens_before;
+		for (uint32 segment = 41; segment <= 77; segment++)
+			expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment,
+						sweep != 0);
+		printf("# fd-pins role=%s sweep=%d pool_opens=%d overflow_opens=%d pins=%d external=%d\n",
+			   role == B_LMS ? "lms" : "worker", sweep + 1, pool_opens,
+			   open_attempts - opens_before - pool_opens, initial_pool_pins_live(40),
+			   external_used);
+		UT_ASSERT_EQ(pool_opens, sweep == 0 ? 40 : 0);
+		UT_ASSERT_EQ(open_attempts - opens_before - pool_opens, 37);
+		UT_ASSERT_EQ(successful_opens - successes_before, sweep == 0 ? 77 : 37);
+		UT_ASSERT_EQ(pread_calls, (sweep + 1) * 77);
+		UT_ASSERT_EQ(initial_pool_pins_live(40), 40);
+		UT_ASSERT_EQ(live_fds(), 41);
+		UT_ASSERT_EQ(external_used, 40);
+		UT_ASSERT_EQ(external_high_water, 40);
+		UT_ASSERT_EQ(external_acquired, 40);
+		UT_ASSERT_EQ(external_released, 0);
+	}
+	finish_case();
+}
+
+UT_TEST(test_lms_77_segments_reopen_only_37_overflow_files_per_warm_sweep)
+{
+	exercise_77_segments_with_40_pool_pins(B_LMS);
+}
+
+UT_TEST(test_worker_77_segments_reopen_only_37_overflow_files_per_warm_sweep)
+{
+	exercise_77_segments_with_40_pool_pins(B_LMS_WORKER);
+}
+
 UT_TEST(test_full_local_segment_range_preserves_descriptor_headroom)
 {
 	const int nodes[] = { 0, UNDO_OWNER_INSTANCE_MAX - 1 };
@@ -548,10 +616,13 @@ UT_TEST(test_low_fd_budget_leaves_room_for_wait_event_sets)
 						false);
 		}
 		UT_ASSERT_EQ(external_high_water, 4 + budgets[b].retained);
-		UT_ASSERT_EQ(live_fds(), budgets[b].retained);
-		for (uint32 segment = 33 - budgets[b].retained; segment <= 32; segment++)
+		UT_ASSERT_EQ(live_fds(), budgets[b].retained + 1);
+		UT_ASSERT_EQ(initial_pool_pins_live(budgets[b].retained), budgets[b].retained);
+		for (uint32 segment = 1; segment <= budgets[b].retained; segment++)
 			expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment, true);
 		UT_ASSERT_EQ(open_attempts, 32);
+		UT_ASSERT_EQ(external_acquired, 4 + budgets[b].retained);
+		UT_ASSERT_EQ(external_released, 0);
 		/* Both hand-calculated budgets still admit four wait-event resources. */
 		for (int i = 0; i < 4; i++)
 			UT_ASSERT(AcquireExternalFD());
@@ -577,11 +648,17 @@ UT_TEST(test_existing_external_users_limit_pool_without_losing_reads)
 	expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 5, 5, true);
 	UT_ASSERT_EQ(open_attempts, 5);
 	UT_ASSERT_EQ(pread_calls, 6);
-	UT_ASSERT_EQ(close_calls, 2);
-	UT_ASSERT_EQ(live_fds(), 3);
+	UT_ASSERT_EQ(close_calls, 1);
+	UT_ASSERT_EQ(live_fds(), 4);
+	UT_ASSERT_EQ(initial_pool_pins_live(3), 3);
 	UT_ASSERT_EQ(external_used, 16);
 	UT_ASSERT_EQ(external_high_water, 16);
+	UT_ASSERT_EQ(external_acquired, 16);
+	UT_ASSERT_EQ(external_released, 0);
 	UT_ASSERT(!AcquireExternalFD());
+	for (uint32 segment = 1; segment <= 3; segment++)
+		expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment, true);
+	UT_ASSERT_EQ(open_attempts, 5);
 	cluster_undo_smgr_fd_cache_reset();
 	UT_ASSERT_EQ(live_fds(), 0);
 	UT_ASSERT_EQ(external_used, 13);
@@ -589,6 +666,57 @@ UT_TEST(test_existing_external_users_limit_pool_without_losing_reads)
 	for (int i = 0; i < 13; i++)
 		ReleaseExternalFD();
 	finish_case();
+}
+
+UT_TEST(test_budget_reduction_or_new_external_users_preserve_pool_pins)
+{
+	for (int pressure = 0; pressure < 2; pressure++) {
+		int occupied = pressure == 0 ? 0 : 120;
+		int opens_before;
+
+		if (!begin_case(pressure == 0 ? B_LMS : B_LMS_WORKER))
+			return;
+		max_safe_fds = pressure == 0 ? 240 : 480;
+		external_limit = pressure == 0 ? 80 : 160;
+		for (uint32 segment = 1; segment <= 43; segment++)
+			seed_segment(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment);
+		for (uint32 segment = 1; segment <= 40; segment++)
+			expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment,
+						false);
+		UT_ASSERT_EQ(open_attempts, 40);
+		if (pressure == 0) {
+			/* New pool allowance is 20, but the 40 existing reservations
+			 * still fit the new external limit.  Do not acquire or evict. */
+			max_safe_fds = 120;
+			external_limit = 40;
+		} else {
+			/* Other users take the remaining budget after the pool warms;
+			 * capacity is still 80, so this exercises AcquireExternalFD refusal. */
+			for (int i = 0; i < occupied; i++)
+				UT_ASSERT(AcquireExternalFD());
+		}
+		for (uint32 segment = 41; segment <= 43; segment++)
+			expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment, true);
+		UT_ASSERT_EQ(open_attempts, 43);
+		UT_ASSERT_EQ(initial_pool_pins_live(40), 40);
+		UT_ASSERT_EQ(live_fds(), 41);
+		UT_ASSERT_EQ(external_used, 40 + occupied);
+		UT_ASSERT_EQ(external_high_water, 40 + occupied);
+		UT_ASSERT_EQ(external_acquired, 40 + occupied);
+		UT_ASSERT_EQ(external_released, 0);
+		opens_before = open_attempts;
+		for (uint32 segment = 1; segment <= 40; segment++)
+			expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment, true);
+		UT_ASSERT_EQ(open_attempts, opens_before);
+		UT_ASSERT_EQ(initial_pool_pins_live(40), 40);
+		UT_ASSERT_EQ(external_used, 40 + occupied);
+		cluster_undo_smgr_fd_cache_reset();
+		UT_ASSERT_EQ(live_fds(), 0);
+		UT_ASSERT_EQ(external_used, occupied);
+		for (int i = 0; i < occupied; i++)
+			ReleaseExternalFD();
+		finish_case();
+	}
 }
 
 UT_TEST(test_other_roles_owners_and_intents_keep_single_descriptor)
@@ -701,51 +829,81 @@ UT_TEST(test_open_error_rethrows_and_releases_external_fd_reservation)
 	finish_case();
 }
 
-UT_TEST(test_open_error_after_eviction_preserves_survivors_and_releases_reservation)
+static void
+exercise_overflow_open_failure(bool throw_error)
 {
 	char actual[BLCKSZ];
 	volatile bool caught = false;
+	volatile bool read_ok = false;
+	volatile int read_errno = 0;
 
 	if (!begin_case(B_LMS_WORKER))
 		return;
 	max_safe_fds = 48;
 	external_limit = 16;
-	for (uint32 segment = 1; segment <= 9; segment++)
+	for (uint32 segment = 1; segment <= 10; segment++)
 		seed_segment(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment);
 	for (uint32 segment = 1; segment <= 8; segment++)
 		expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment, false);
-	force_open_throw = true;
+	/* A previous overflow FD must close before a different overflow open
+	 * fails.  None of the eight original pool pins may be affected. */
+	expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 9, 9, true);
+	UT_ASSERT_EQ(live_fds(), 9);
+	UT_ASSERT_EQ(initial_pool_pins_live(8), 8);
+	force_open_throw = throw_error;
+	force_open_error = !throw_error;
 	PG_TRY();
 	{
-		(void)cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 9, 1, 0, actual);
+		read_ok = cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 10, 1, 0, actual);
+		read_errno = errno;
 	}
 	PG_CATCH();
 	{
 		caught = true;
 	}
 	PG_END_TRY();
-	UT_ASSERT(caught);
-	UT_ASSERT_EQ(open_attempts, 9);
-	UT_ASSERT_EQ(successful_opens, 8);
-	UT_ASSERT_EQ(pread_calls, 8);
-	UT_ASSERT_EQ(live_fds(), 7);
-	UT_ASSERT_EQ(external_used, 7);
-	UT_ASSERT_EQ(external_acquired, 9);
-	UT_ASSERT_EQ(external_released, 2);
+	UT_ASSERT_EQ(caught, throw_error);
+	UT_ASSERT(!read_ok);
+	if (!throw_error)
+		UT_ASSERT_EQ(read_errno, EACCES);
+	UT_ASSERT_EQ(open_attempts, 10);
+	UT_ASSERT_EQ(successful_opens, 9);
+	UT_ASSERT_EQ(pread_calls, 9);
+	UT_ASSERT_EQ(live_fds(), 8);
+	UT_ASSERT_EQ(initial_pool_pins_live(8), 8);
+	UT_ASSERT_EQ(external_used, 8);
+	UT_ASSERT_EQ(external_acquired, 8);
+	UT_ASSERT_EQ(external_released, 0);
 	UT_ASSERT_EQ(close_calls, 1);
 	force_open_throw = false;
-	/* Segment 2 survived eviction; the failed segment has no cached error. */
-	expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 2, 2, true);
-	UT_ASSERT_EQ(open_attempts, 9);
-	expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 9, 9, true);
+	force_open_error = false;
+	for (uint32 segment = 1; segment <= 8; segment++)
+		expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment, true);
 	UT_ASSERT_EQ(open_attempts, 10);
-	UT_ASSERT_EQ(live_fds(), 8);
+	/* Failure is not cached; a successful retry then hits the single FD. */
+	expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 10, 10, true);
+	expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 10, 10, false);
+	UT_ASSERT_EQ(open_attempts, 11);
+	UT_ASSERT_EQ(live_fds(), 9);
 	UT_ASSERT_EQ(external_used, 8);
+	UT_ASSERT_EQ(external_acquired, 8);
+	UT_ASSERT_EQ(external_released, 0);
+	UT_ASSERT_EQ(initial_pool_pins_live(8), 8);
 	UT_ASSERT(exit_callback != NULL);
 	if (exit_callback != NULL)
 		exit_callback(0, exit_arg);
 	require_all_closed();
 	finish_case();
+}
+
+UT_TEST(test_overflow_open_error_preserves_pool_reservations)
+{
+	exercise_overflow_open_failure(true);
+}
+
+UT_TEST(test_overflow_open_failure_preserves_pool_reservations)
+{
+	exercise_overflow_open_failure(false);
 }
 
 UT_TEST(test_in_place_recycle_is_visible_through_cached_descriptor)
@@ -831,14 +989,18 @@ UT_TEST(test_external_fd_budget_refusal_preserves_reads_and_balances_cleanup)
 			expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment,
 						(unsigned char)(0x60 + segment), false);
 		expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1, 0x61, true);
-		/* Refusal must reach the original single-FD path, including its hit. */
+		/* With one pool slot, segment 1 stays pooled while 2/3 use the
+		 * single FD.  With no pool slots, all reads use the original path. */
 		expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1, 0x61, false);
-		UT_ASSERT_EQ(open_attempts, 4);
-		UT_ASSERT_EQ(successful_opens, 4);
+		UT_ASSERT_EQ(open_attempts, budgets[b].pool == 0 ? 4 : 3);
+		UT_ASSERT_EQ(successful_opens, budgets[b].pool == 0 ? 4 : 3);
 		UT_ASSERT_EQ(pread_calls, 5);
-		UT_ASSERT_EQ(close_calls, 3);
-		UT_ASSERT_EQ(live_fds(), 1);
+		UT_ASSERT_EQ(close_calls, budgets[b].pool == 0 ? 3 : 1);
+		UT_ASSERT_EQ(live_fds(), 1 + budgets[b].pool);
+		UT_ASSERT_EQ(initial_pool_pins_live(budgets[b].pool), budgets[b].pool);
 		UT_ASSERT_EQ(external_used, budgets[b].occupied + budgets[b].pool);
+		UT_ASSERT_EQ(external_acquired, budgets[b].occupied + budgets[b].pool);
+		UT_ASSERT_EQ(external_released, 0);
 		UT_ASSERT(external_high_water <= budgets[b].limit);
 		cluster_undo_smgr_fd_cache_reset();
 		UT_ASSERT_EQ(external_used, budgets[b].occupied);
@@ -909,7 +1071,7 @@ UT_TEST(test_inventory_publication_is_invisible_until_readable_and_all_writers_f
 	UT_ASSERT(cluster_undo_inventory_publish_begin(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1));
 	UT_ASSERT(cluster_undo_inventory_publish_begin(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1));
 	cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &during);
-	UT_ASSERT(!during.usable && !during.tracked);
+	UT_ASSERT(!during.usable && during.tracked && during.publishing);
 	UT_ASSERT_EQ(state.published[0], 1);
 	cluster_undo_inventory_publish_end(16, true);
 	cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &during);
@@ -1084,20 +1246,24 @@ UT_TEST(test_inventory_stats_attach_preserves_counts_and_absence_is_explicit)
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(27);
 	UT_RUN(test_lms_own_runtime_reuses_two_descriptors);
 	UT_RUN(test_worker_own_runtime_reuses_two_descriptors);
 	UT_RUN(test_lms_77_existing_segments_second_sweep_never_reopens);
 	UT_RUN(test_worker_77_existing_segments_second_sweep_never_reopens);
+	UT_RUN(test_lms_77_segments_reopen_only_37_overflow_files_per_warm_sweep);
+	UT_RUN(test_worker_77_segments_reopen_only_37_overflow_files_per_warm_sweep);
 	UT_RUN(test_full_local_segment_range_preserves_descriptor_headroom);
 	UT_RUN(test_low_fd_budget_leaves_room_for_wait_event_sets);
 	UT_RUN(test_existing_external_users_limit_pool_without_losing_reads);
+	UT_RUN(test_budget_reduction_or_new_external_users_preserve_pool_pins);
 	UT_RUN(test_other_roles_owners_and_intents_keep_single_descriptor);
 	UT_RUN(test_owner_and_intent_namespaces_never_share_file_bytes);
 	UT_RUN(test_recovery_cached_descriptor_never_retains_admission);
 	UT_RUN(test_failed_open_is_not_cached_and_later_creation_is_readable);
 	UT_RUN(test_open_error_rethrows_and_releases_external_fd_reservation);
-	UT_RUN(test_open_error_after_eviction_preserves_survivors_and_releases_reservation);
+	UT_RUN(test_overflow_open_error_preserves_pool_reservations);
+	UT_RUN(test_overflow_open_failure_preserves_pool_reservations);
 	UT_RUN(test_in_place_recycle_is_visible_through_cached_descriptor);
 	UT_RUN(test_reset_closes_all_descriptors_and_reopens_replaced_path);
 	UT_RUN(test_external_fd_budget_refusal_preserves_reads_and_balances_cleanup);

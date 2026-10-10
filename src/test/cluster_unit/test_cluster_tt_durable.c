@@ -810,6 +810,9 @@ void
 cluster_undo_inventory_count_fallback(void)
 {}
 void
+cluster_undo_inventory_count_cut_refusal(void)
+{}
+void
 cluster_tt_durable_count_redo_apply(void)
 {}
 void
@@ -966,6 +969,12 @@ cluster_undo_inventory_snapshot(ClusterUndoPathIntent intent, uint8 owner,
 	memset(out, 0, sizeof(*out));
 	out->usable = out->tracked = g_inventory_usable;
 	out->published[0] = 1;
+}
+
+bool
+cluster_undo_inventory_cut_stable(const ClusterUndoInventorySnapshot *snapshot)
+{
+	return g_inventory_stable;
 }
 
 bool

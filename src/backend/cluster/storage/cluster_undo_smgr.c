@@ -61,6 +61,9 @@ static ClusterUndoInventory *undo_inventory;
 /* Local attachment identity prevents reuse of a snapshot after detach or
  * reinitialization at the same address.  A fresh process has no old snapshots. */
 static uint64 undo_inventory_attachment;
+static ClusterUndoInventory *inventory_publisher_state;
+static uint64 inventory_publisher_attachment;
+static uint32 inventory_local_publishers;
 
 void
 cluster_undo_inventory_count_scan(bool bitmap)
@@ -91,6 +94,13 @@ cluster_undo_inventory_count_fallback(void)
 		pg_atomic_fetch_add_u64(&undo_inventory->fallback_count, 1);
 }
 
+void
+cluster_undo_inventory_count_cut_refusal(void)
+{
+	if (undo_inventory != NULL)
+		pg_atomic_fetch_add_u64(&undo_inventory->cut_refusal_count, 1);
+}
+
 bool
 cluster_undo_inventory_read_stats(ClusterUndoInventoryStats *out)
 {
@@ -105,6 +115,7 @@ cluster_undo_inventory_read_stats(ClusterUndoInventoryStats *out)
 	out->bitmap_zero_count = pg_atomic_read_u64(&undo_inventory->bitmap_zero_count);
 	out->full_zero_count = pg_atomic_read_u64(&undo_inventory->full_zero_count);
 	out->fallback_count = pg_atomic_read_u64(&undo_inventory->fallback_count);
+	out->cut_refusal_count = pg_atomic_read_u64(&undo_inventory->cut_refusal_count);
 	return true;
 }
 
@@ -122,6 +133,7 @@ cluster_undo_inventory_attach(ClusterUndoInventory *state, bool initialize)
 		pg_atomic_init_u64(&state->bitmap_zero_count, 0);
 		pg_atomic_init_u64(&state->full_zero_count, 0);
 		pg_atomic_init_u64(&state->fallback_count, 0);
+		pg_atomic_init_u64(&state->cut_refusal_count, 0);
 	}
 	undo_inventory = state;
 }
@@ -173,18 +185,36 @@ cluster_undo_inventory_snapshot(ClusterUndoPathIntent intent, uint8 owner,
 	if (undo_inventory_attachment == UINT64_MAX || !inventory_scope(intent, owner))
 		return;
 	SpinLockAcquire(&undo_inventory->lock);
-	/* Even a full scan must notice that an own-runtime publisher was active
-	 * at its start.  Such a pass cannot prove absence across that cut. */
+	/* Keep the identity even during publication, so a full scan can retry
+	 * from a later quiescent cut without losing its storage lifetime. */
 	out->owner = owner;
-	if (!undo_inventory->disabled && undo_inventory->publishers == 0) {
+	if (!undo_inventory->disabled) {
 		out->identity = undo_inventory;
 		out->attachment = undo_inventory_attachment;
 		out->serial = undo_inventory->serial;
 		memcpy(out->published, undo_inventory->published, sizeof(out->published));
 		out->tracked = true;
-		out->usable = undo_inventory->complete;
+		out->publishing = undo_inventory->publishers != 0;
+		out->usable = undo_inventory->complete && !out->publishing;
 	}
 	SpinLockRelease(&undo_inventory->lock);
+}
+
+bool
+cluster_undo_inventory_cut_stable(const ClusterUndoInventorySnapshot *snapshot)
+{
+	bool stable;
+
+	if (!snapshot->tracked || snapshot->publishing || undo_inventory == NULL
+		|| snapshot->identity != undo_inventory || snapshot->attachment != undo_inventory_attachment
+		|| undo_inventory_attachment == UINT64_MAX
+		|| !inventory_scope(CLUSTER_UNDO_PATH_RUNTIME_SHARED, snapshot->owner))
+		return false;
+	SpinLockAcquire(&undo_inventory->lock);
+	stable = !undo_inventory->disabled && undo_inventory->publishers == 0
+			 && undo_inventory->serial == snapshot->serial;
+	SpinLockRelease(&undo_inventory->lock);
+	return stable;
 }
 
 bool
@@ -193,8 +223,8 @@ cluster_undo_inventory_finish(const ClusterUndoInventorySnapshot *snapshot,
 {
 	bool stable;
 
-	if (!snapshot->tracked || undo_inventory == NULL || snapshot->identity != undo_inventory
-		|| snapshot->attachment != undo_inventory_attachment
+	if (!snapshot->tracked || snapshot->publishing || undo_inventory == NULL
+		|| snapshot->identity != undo_inventory || snapshot->attachment != undo_inventory_attachment
 		|| undo_inventory_attachment == UINT64_MAX
 		|| !inventory_scope(CLUSTER_UNDO_PATH_RUNTIME_SHARED, snapshot->owner))
 		return false;
@@ -220,14 +250,27 @@ cluster_undo_inventory_publish_begin(ClusterUndoPathIntent intent, uint8 owner)
 {
 	bool tracked = false;
 
-	if (!inventory_scope(intent, owner))
+	if (!inventory_scope(intent, owner)) {
+		/* A final-name publisher must never silently bypass an existing
+		 * own-owner inventory, even if path resolution failed transiently. */
+		cluster_undo_inventory_disable(owner);
 		return false;
+	}
+	/* FATAL uses exit callbacks rather than the publisher's PG_FINALLY. */
+	cluster_undo_smgr_ensure_exit_hook();
 	SpinLockAcquire(&undo_inventory->lock);
 	if (undo_inventory->serial == UINT64_MAX || undo_inventory->publishers == UINT32_MAX)
 		inventory_disable_locked();
 	if (!undo_inventory->disabled) {
 		undo_inventory->serial++;
 		undo_inventory->publishers++;
+		if (inventory_publisher_state != undo_inventory
+			|| inventory_publisher_attachment != undo_inventory_attachment) {
+			inventory_publisher_state = undo_inventory;
+			inventory_publisher_attachment = undo_inventory_attachment;
+			inventory_local_publishers = 0;
+		}
+		inventory_local_publishers++;
 		tracked = true;
 	}
 	SpinLockRelease(&undo_inventory->lock);
@@ -243,6 +286,10 @@ cluster_undo_inventory_publish_end(uint32 segment, bool success)
 	SpinLockAcquire(&undo_inventory->lock);
 	Assert(undo_inventory->publishers > 0);
 	undo_inventory->publishers--;
+	if (inventory_publisher_state == undo_inventory
+		&& inventory_publisher_attachment == undo_inventory_attachment
+		&& inventory_local_publishers > 0)
+		inventory_local_publishers--;
 	if (undo_inventory->serial == UINT64_MAX)
 		inventory_disable_locked();
 	else
@@ -315,7 +362,6 @@ typedef struct UndoServiceFd {
 } UndoServiceFd;
 
 static UndoServiceFd service_fds[CLUSTER_UNDO_SEGS_PER_INSTANCE];
-static uint32 service_fd_clock;
 static int service_fd_count;
 
 static int
@@ -481,7 +527,6 @@ fd_cache_close(void)
 	fd_cache_close_single();
 	for (int i = 0; i < lengthof(service_fds); i++)
 		service_fd_close(&service_fds[i]);
-	service_fd_clock = 0;
 }
 
 static void
@@ -489,6 +534,21 @@ fd_cache_on_exit(int code, Datum arg)
 {
 	(void)code;
 	(void)arg;
+	if (inventory_local_publishers != 0 && undo_inventory != NULL
+		&& inventory_publisher_state == undo_inventory
+		&& inventory_publisher_attachment == undo_inventory_attachment) {
+		SpinLockAcquire(&undo_inventory->lock);
+		/* Do not infer whether the final link or header probe completed.
+		 * Retire only this process's in-flight count and require full scans
+		 * for the rest of this shared-memory lifetime. */
+		inventory_disable_locked();
+		undo_inventory->complete = false;
+		if (undo_inventory->publishers >= inventory_local_publishers)
+			undo_inventory->publishers -= inventory_local_publishers;
+		SpinLockRelease(&undo_inventory->lock);
+	}
+	inventory_local_publishers = 0;
+	inventory_publisher_state = NULL;
 	fd_cache_close();
 }
 
@@ -508,7 +568,6 @@ service_fd_get(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_inst
 	UndoServiceFd *entry;
 	char path[MAXPGPATH];
 	int fd;
-	bool evicted = false;
 	int capacity = Min(CLUSTER_UNDO_SEGS_PER_INSTANCE, max_safe_fds / 6);
 
 	if ((MyBackendType != B_LMS && MyBackendType != B_LMS_WORKER)
@@ -519,15 +578,17 @@ service_fd_get(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_inst
 		return false;
 	/* Use at most half the external-FD budget, with a separate hard cap.
 	 * Wait-event sets and other process resources still need reservations. */
-	if (capacity <= 0)
-		return false;
-
 	entry = &service_fds[(segment_id - 1) % CLUSTER_UNDO_SEGS_PER_INSTANCE];
 	if (entry->valid && entry->segment_id == segment_id && entry->owner == owner_instance) {
 		*out_fd = entry->fd;
 		return true;
 	}
 	service_fd_close(entry);
+	/* Keep the admitted working set under pressure.  A cyclic scan larger
+	 * than the pool must not evict every resident descriptor each pass.
+	 * Overflow retains the original one-descriptor read/error behavior. */
+	if (capacity <= 0 || service_fd_count >= capacity)
+		return false;
 	if (cluster_undo_path_resolve(intent, owner_instance, segment_id, path, sizeof(path)) != 0) {
 		*out_fd = -1;
 		return true;
@@ -535,20 +596,8 @@ service_fd_get(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_inst
 
 	/* Register cleanup before acquiring a resource that an ERROR could leak. */
 	cluster_undo_smgr_ensure_exit_hook();
-	if (service_fd_count >= capacity || !AcquireExternalFD()) {
-		for (int i = 0; i < lengthof(service_fds); i++) {
-			UndoServiceFd *victim = &service_fds[service_fd_clock];
-
-			service_fd_clock = (service_fd_clock + 1) % lengthof(service_fds);
-			if (victim->valid) {
-				service_fd_close(victim);
-				evicted = true;
-				break;
-			}
-		}
-		if (!evicted || !AcquireExternalFD())
-			return false;
-	}
+	if (!AcquireExternalFD())
+		return false;
 
 	PG_TRY();
 	{

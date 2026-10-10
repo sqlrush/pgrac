@@ -199,7 +199,7 @@ test_product_pwrite(int fd, const void *buf, size_t nbytes, off_t offset)
 		ClusterUndoInventorySnapshot snapshot;
 
 		cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &snapshot);
-		UT_ASSERT(!snapshot.usable && !snapshot.tracked);
+		UT_ASSERT(!snapshot.usable && snapshot.tracked && snapshot.publishing);
 	}
 	if (pwrite_forced_error) {
 		errno = EIO;
