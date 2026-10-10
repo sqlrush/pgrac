@@ -353,7 +353,9 @@ extern bool cluster_pcm_rx_requester_wait_snapshot(const BufferTag *tag,
 	X(PCM_RX_REQUESTER_WAIT_ROUND, "requester_wait_round_count")                                   \
 	X(PCM_RX_REQUESTER_WAIT_RETIRED_EMPTY, "requester_reobserve_retired_empty_count")              \
 	X(PCM_RX_REQUESTER_WAIT_RETIRED_SUCCESSOR, "requester_reobserve_retired_successor_count")      \
-	X(PCM_RX_REQUESTER_WAIT_TERMINAL, "requester_wait_terminal_count")
+	X(PCM_RX_REQUESTER_WAIT_TERMINAL, "requester_wait_terminal_count")                             \
+	X(PCM_RX_MAINTENANCE_READ_SHARE_HIT, "maintenance_read_share_hit_count")                       \
+	X(PCM_RX_MAINTENANCE_READ_X_FALLBACK, "maintenance_read_x_fallback_count")
 
 typedef enum PcmRxMetric {
 #define PCM_RX_ENUM(id, key) id,

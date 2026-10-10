@@ -391,8 +391,13 @@
 
 ## category = `pcm`
 
+维护读取的两个计数由本节点所有进程共享，随共享内存重建归零，不受 `cluster.xnode_profile` 开关控制。
+仅在 `rx_stats_available=true` 时输出；不可用时缺失，不能按零处理。前后增量必须来自同一节点、同一共享内存生命周期。
+
 | key | 值形态 | 含义 | 运维解释 |
 |---|---|---|---|
+| `maintenance_read_share_hit_count` | 十进制整数文本 | 本节点维护身份读取取得共享内容锁、命中已有当前读权限的累计次数。 | 取同节点同窗口增量 H；不表示事务数或后续身份校验成功。 |
+| `maintenance_read_x_fallback_count` | 十进制整数文本 | 本节点维护身份读取未命中共享读路径、返回原 X 获取路径的累计次数。 | 取同窗口增量 F；不表示 X 获取成功。H/(H+F) 为该入口的命中比例，分母为零时不可计算。 |
 | `dead_cleanup_entries` | 十进制整数文本 | 失效 / 清理 / `entries`的当前快照值。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `pcm_grd_max_entries` | 十进制整数文本 | `pcm` / `grd` / 上限 / `entries`的当前快照值。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `pcm_grd_allocated_bytes` | 十进制整数文本 | `pcm` / `grd` / `allocated`，单位字节。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |

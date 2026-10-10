@@ -14314,7 +14314,7 @@ ClusterLockBufferShareBarrierAware(Buffer buffer)
 }
 
 /*
- * Measurement-only maintenance read; do not merge as a product change.
+ * PGRAC: measurement-only maintenance read; do not merge as a product change.
  * Reuse current node residency without joining a writer acquisition or
  * allocating a backend-indexed S request.  The caller retains its pin and
  * admission guard; a miss changes no ownership and leaves no content lock.
@@ -14331,11 +14331,17 @@ ClusterLockBufferShareIfCovered(Buffer buffer)
 	if (!BufferIsValid(buffer) || BufferIsLocal(buffer)
 		|| !BufferIsPinned(buffer) || !cluster_shared_config
 		|| !cluster_gcs_block_local_cache || !cluster_pcm_is_active())
+	{
+		cluster_pcm_rx_metric_note(PCM_RX_MAINTENANCE_READ_X_FALLBACK);
 		return false;
+	}
 	buf = GetBufferDescriptor(buffer - 1);
 	if (!cluster_bufmgr_should_pcm_track(buf)
 		|| !LWLockConditionalAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED))
+	{
+		cluster_pcm_rx_metric_note(PCM_RX_MAINTENANCE_READ_X_FALLBACK);
 		return false;
+	}
 
 	/* Re-sample under content authority, exactly as the ordinary cached S
 	 * reader does after taking its content lock.  READ_IMAGE and PI bytes
@@ -14352,8 +14358,10 @@ ClusterLockBufferShareIfCovered(Buffer buffer)
 		|| gate.phase != RESOURCE_X_GATE_OPEN)
 	{
 		LWLockRelease(BufferDescriptorGetContentLock(buf));
+		cluster_pcm_rx_metric_note(PCM_RX_MAINTENANCE_READ_X_FALLBACK);
 		return false;
 	}
+	cluster_pcm_rx_metric_note(PCM_RX_MAINTENANCE_READ_SHARE_HIT);
 	return true;
 #else
 	return false;
