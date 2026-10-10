@@ -1,4 +1,4 @@
-"""Controller commands for cohort candidates: create once, distribute exact PGDATA, bootstrap check.
+"""Controller commands for cohort releases: create once, distribute exact PGDATA, bootstrap check.
 
 Author: SqlRush <sqlrush@gmail.com>
 """
@@ -155,7 +155,7 @@ def cmd_distribute(args, request, plan):
 
 
 def cmd_bootstrap_check(args, request, plan):
-    """Each member's candidate early preparation (postgres -C); ROOT must stay byte-identical."""
+    """Each member's release early preparation (postgres -C); ROOT must stay byte-identical."""
     mode_of(args, plan)
     by_id = {n["node_id"]: n for n in request["nodes"]}
     budget_mb = int(request["guest_memory_gib"] * 1024 * 0.6)

@@ -4,9 +4,9 @@
 Author: SqlRush <sqlrush@gmail.com>
 
 Reads one JSON request on stdin, writes one JSON result on stdout. It runs the
-candidate's own initdb native-writer entry with data checksums enabled; the
+release's own initdb native-writer entry with data checksums enabled; the
 founder (thread 1) also creates the shared DATA base. It verifies the result
-from the candidate's own files and tools, and preserves every partial target
+from the release's own files and tools, and preserves every partial target
 on failure: it never deletes, retries or overwrites.
 
 Modes:
@@ -93,7 +93,7 @@ def as_database_user(node, argv):
 
 
 def native_env(node):
-    """Minimal environment; the candidate's own lib directory for installs built with another prefix."""
+    """Minimal environment; the release's own lib directory for installs built with another prefix."""
     return {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LD_LIBRARY_PATH": node["install_root"] + "/lib"}
 
 

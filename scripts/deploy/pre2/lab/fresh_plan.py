@@ -1,17 +1,14 @@
-"""Build the fresh PRE2 laboratory plan and its explicit wait points.
+"""Build the fresh PRE2 deployment plan and its explicit wait points.
 
 Author: SqlRush <sqlrush@gmail.com>
 
-Stage order for a new shared database:
+The plan records configuration, source capabilities and the native creation
+commands for a new shared database. PRE2 uses one cohort initialization, then
+distributes each member's directory and checks its bootstrap configuration.
+Compatibility commands remain available for older source versions.
 
-  render          configuration and policy check (always available)
-  native_writers  one original native writer per node, founder first
-  then, each guarded by a wait point derived from the candidate source:
-  publish_root, relmap, cohort_side, publish_config, format, open
-
-A wait point is BLOCKED until the candidate source contains the entry that
-performs that step. This tool never performs, emulates or patches around a
-missing entry; it reports the dependency and stops.
+A required capability that is missing from the supplied source is reported as
+BLOCKED. The tool does not create replacement metadata or bypass that check.
 """
 
 import cohort
@@ -24,7 +21,7 @@ def initdb_argv(install_root, username, node_layout, request, system_identifier=
     """Exact native writer creation command for one node.
 
     The founder (thread 1) also creates the shared DATA base and, when the
-    candidate supports it, the generation-1 common configuration object from
+    release supports it, the generation-1 common configuration object from
     config_path. Every thread uses the request's common system identifier.
     -k enables data checksums; native creation refuses to run without them and
     without full sync, so -N/-S are never used.
@@ -52,14 +49,14 @@ def config_request_path(founder_pgdata, sha256):
 
 
 def cohort_mode(contract):
-    """The candidate creates every member through one original cohort initdb."""
+    """The release creates every member through one original cohort initdb."""
     cohort = contract.get("cohort") or {}
     return bool(contract["initdb"].get("cohort_option") and cohort.get("owner")
                 and cohort.get("creation_message"))
 
 
 def cohort_wait_points(request, contract, add):
-    """Cohort candidates: each step is performed by the candidate's own creator or startup route."""
+    """Cohort releases: each step is performed by the release's own creator or startup route."""
     c = contract["cohort"]
     add("COHORT_ENTRY", "native_writers", not cohort_mode(contract),
         {"initdb_cohort_option": contract["initdb"]["cohort_option"], "owner": c["owner"],

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Controller for a fresh PRE2 four-VM laboratory database.
+"""Controller for a fresh PRE2 four-VM deployment database.
 
 Author: SqlRush <sqlrush@gmail.com>
 
@@ -13,11 +13,11 @@ Author: SqlRush <sqlrush@gmail.com>
     fresh_controller.py cohort|distribute|bootstrap-check --plan PLAN --request REQ --source SRC
                                 --transport local|ssh [--tools-root DIR] [--local-validation] --out RESULT
 
-cohort       (cohort candidates) one original creator runs initdb once for all members.
+cohort       runs the native shared initdb once for all members.
 distribute   copies each node_N unchanged to its member's new local PGDATA (manifest-checked).
-bootstrap-check runs the candidate's read-only early preparation on every member.
+bootstrap-check runs the release's read-only early preparation on every member.
 
-plan     validates the request, reads the candidate source contract, renders
+plan     validates the request, reads the release source contract, renders
          and policy-checks the configuration, and records every wait point.
 render   writes the per-node files for review; it does not install them.
 writers  creates one original native writer per node: the founder first,
@@ -26,7 +26,7 @@ writers  creates one original native writer per node: the founder first,
 advance  reports the first blocked stage after the writers. It exits 3 while
          any wait point is BLOCKED and never starts a server.
 
-Evidence documents are published once and never replaced.
+Result files are created once and never overwritten.
 """
 
 import argparse
@@ -255,7 +255,7 @@ def memory_settings(plan, node_id=FOUNDER_NODE):
 
 
 def cmd_memory_check(args):
-    """Shared memory of the rendered profile, computed by the candidate itself."""
+    """Shared memory of the rendered profile, computed by the release itself."""
     request, derived, contract = load_inputs(args)
     plan = require_plan(args, request, contract)
     rendered = render.render(request, derived, contract)

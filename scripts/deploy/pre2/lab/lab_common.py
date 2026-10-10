@@ -1,4 +1,4 @@
-"""Shared constants and helpers for the PRE2 four-VM laboratory tools.
+"""Shared constants and helpers for the PRE2 four-VM deployment tools.
 
 Author: SqlRush <sqlrush@gmail.com>
 

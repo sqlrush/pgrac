@@ -1,4 +1,4 @@
-"""Validate a PRE2 laboratory request and derive its fixed path layout.
+"""Validate a PRE2 deployment request and derive its fixed path layout.
 
 Author: SqlRush <sqlrush@gmail.com>
 
@@ -78,7 +78,7 @@ def layout(request):
 
 
 def validate_storage_quorum(value):
-    """Corosync storage component the candidate admits against: totem.cluster_name and slot->nodeid."""
+    """Corosync storage component the release admits against: totem.cluster_name and slot->nodeid."""
     if (type(value) is not dict or set(value) != {"cluster", "nodes"} or type(value["cluster"]) is not str
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", value["cluster"])):
         raise PreflightError("REQUEST_INVALID", "storage_quorum")
@@ -107,7 +107,7 @@ def validate(request):
             or not re.fullmatch(r"[0-9a-f]{32}", request["storage_uuid"])
             or set(request["storage_uuid"]) == {"0"}):
         raise PreflightError("REQUEST_INVALID", "storage_uuid")
-    # The startup authority identity is an RFC 4122 version-4 UUID (the candidate's ROOT
+    # The startup authority identity is an RFC 4122 version-4 UUID (the release's ROOT
     # encoder refuses anything else): version nibble 4, variant bits 10.
     if (type(request["authority_uuid"]) is not str
             or not re.fullmatch(r"[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}", request["authority_uuid"])

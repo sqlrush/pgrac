@@ -1,4 +1,4 @@
-"""Render PRE2 laboratory configuration, checked against the candidate's policy.
+"""Render PRE2 deployment configuration, checked against the release's policy.
 
 Author: SqlRush <sqlrush@gmail.com>
 
@@ -8,11 +8,11 @@ Two products per node:
   shared startup authority, plus local strings that the shared configuration
   policy does not accept (hba_file, cluster_name, cluster.voting_disks);
 * the shared configuration entry list (COMMON plus per-node INSTANCE). This
-  tool only lists and checks the entries; the candidate's own publisher writes
+  tool only lists and checks the entries; the release's own publisher writes
   the shared object. An entry the policy would refuse is an error here.
 
-The values start from the PRE1 laboratory profile. The overrides below are
-the shared-mode settings; nothing else differs from PRE1.
+The base deployment settings are combined with the selected memory profile
+and shared-mode settings below.
 """
 
 import hashlib
@@ -67,7 +67,7 @@ SHMEM_FRACTION_OF_GUEST = 0.6
 
 # Omitted on purpose: log_min_messages ('warning' in PRE1, which is the PostgreSQL default).
 # `postgres -C <runtime-computed>` raises it internally at the highest priority, so a shared
-# entry for it makes the candidate refuse the read-only shared-memory check.
+# entry for it makes the release refuse the read-only shared-memory check.
 
 # Remote-transaction visibility: both switches must be on for cross-node reads of another
 # instance's transactions (otherwise the TT authority is unavailable). They are pinned here,
@@ -91,7 +91,7 @@ def policy_flags(contract, name):
 
 
 def check_entry(contract, name, value, node_id):
-    """Static subset of the candidate's policy_check(); native value hooks still run later."""
+    """Static subset of the release's policy_check(); native value hooks still run later."""
     if not re.fullmatch(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*", name):
         raise PreflightError("POLICY_FORMAT", name)
     if any(ord(c) < 32 or ord(c) == 127 for c in value):
@@ -133,7 +133,7 @@ def common_values(request, derived, contract):
                 if "INSTANCE" in policy_flags(contract, name) and "COMMON" not in policy_flags(contract, name)}
     if request["direct_io"] == "data":
         values["debug_io_direct"] = "data"
-    # Storage eligibility comes only from the common shared configuration (candidates that know it).
+    # Storage eligibility comes only from the common shared configuration (releases that know it).
     if "cluster.storage_quorum_nodes" in contract["string_gucs"]:
         quorum = request["storage_quorum"]
         values["cluster.storage_quorum_cluster"] = quorum["cluster"]
@@ -153,7 +153,7 @@ def instance_values(node, derived, carried):
 
 
 def shared_entries(request, derived, contract):
-    """Return (entries, refusals). A refusal is a candidate policy that blocks publication."""
+    """Return (entries, refusals). A refusal is a release policy that blocks publication."""
     common, carried = common_values(request, derived, contract)
     entries, refusals = [], []
     for name in sorted(common):
@@ -173,7 +173,7 @@ def shared_entries(request, derived, contract):
 
 # How a member finds its startup authority. The values equal the shared image; a
 # configuration FILE has the same priority as the shared image, while command-line
-# (-c) copies of shared settings are refused by the candidate.
+# (-c) copies of shared settings are refused by the release.
 BOOTSTRAP_DISCOVERY = ("cluster.enabled", "cluster.shared_config", "cluster.controlfile_shared_authority",
                        "cluster.shared_data_dir", "cluster.wal_threads_dir", "cluster.undo_tablespace_path")
 
@@ -185,7 +185,7 @@ def bootstrap_file(request, derived, contract, node):
     if missing:
         raise PreflightError("BOOTSTRAP_ENTRY_UNRENDERED", missing[0])
     paths = derived["nodes"][node["node_id"]]
-    lines = ["# PGRAC: PRE2 laboratory bootstrap discovery for node %d." % node["node_id"],
+    lines = ["# PGRAC PRE2 bootstrap configuration for node %d." % node["node_id"],
              "# Shared startup authority supplies every other setting."]
     for name in BOOTSTRAP_DISCOVERY:
         lines.append("%s = %s" % (name, quote(common[name])))
@@ -206,15 +206,14 @@ def peers_file(request):
 
 
 def hba_file(request):
-    return ("# Isolated trusted laboratory controller only; not a production policy.\n"
+    return ("# Allow the trusted controller only on an isolated evaluation network.\n"
             "local all all peer\n"
             "host postgres pgrac %s/32 trust\n"
-            "host postgres racbench %s/32 scram-sha-256\n"
-            % (request["controller_addr"], request["controller_addr"]))
+            % request["controller_addr"])
 
 
 def config_request_bytes(request, entries):
-    """Canonical generation-1 common configuration request (candidate codec rules).
+    """Canonical generation-1 common configuration request (release codec rules).
 
     Fixed metadata header, then every entry as key='value' with keys strictly
     increasing bytewise: common.<name> before nodeNNN.<name>. The only escape is

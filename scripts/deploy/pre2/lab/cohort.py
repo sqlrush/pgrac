@@ -2,7 +2,7 @@
 
 Author: SqlRush <sqlrush@gmail.com>
 
-When the candidate initdb accepts --pgrac-initdb-cohort, one original creator
+When the release initdb accepts --pgrac-initdb-cohort, one original creator
 runs initdb once with the canonical configuration request. -D names a new
 local cache parent; the creator writes node_0..node_N there and the shared
 DATA, WAL and UNDO roots named in the request. Each node_N is then copied,
@@ -33,7 +33,7 @@ def layout(request, derived):
 
 
 def initdb_argv(install_root, cache_root, config_path):
-    """The candidate's documented cohort command; nothing else is added."""
+    """The release's documented cohort command; nothing else is added."""
     return [install_root + "/bin/initdb", "-D", cache_root, "-k", "-A", "trust", "--no-locale",
             "--pgrac-initdb-cohort", "--pgrac-initdb-shared-config=" + config_path]
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Read the candidate source tree and report what its entries actually support.
+"""Read the release source tree and report what its entries actually support.
 
 Author: SqlRush <sqlrush@gmail.com>
 
-Every capability here is derived from the candidate's own source files: the
+Every capability here is derived from the release's own source files: the
 initdb option table and messages, the shared configuration policy table, the
 WAL thread layout of pgrac-init, the catalog version and the shared-filesystem
 I/O code. Nothing is assumed from a document. A capability that cannot be
@@ -115,7 +115,7 @@ def initdb_capabilities(text, creator_text):
     return {
         "native_options": options,
         "native_writer": all(options.values()),
-        # The candidate's own creator says whether it publishes startup authority.
+        # The release's own creator says whether it publishes startup authority.
         "root_not_published_message": ROOT_NOT_PUBLISHED in text,
         "founder_thread_only_base": "founder thread 1" in text,
         "native_requires_checksums": "requires checksums and full initdb sync" in text,
@@ -178,7 +178,7 @@ def collect(source):
         try:
             texts[optional] = read_text(root, optional)
         except PreflightError:
-            pass                  # older candidates lack these owners
+            pass                  # older releases lack these owners
     xlog = read_text(root, XLOG)
     policy = parse_policy_table(texts[CONFIG_POLICY])
     try:

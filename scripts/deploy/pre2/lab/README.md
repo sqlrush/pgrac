@@ -3,8 +3,9 @@
 Author: SqlRush <sqlrush@gmail.com>
 
 These tools initialize a new four-node ARM64 database on an existing GFS2
-cluster. Keep this directory together with `scripts/deploy/pre1`; the PRE1
-helpers are runtime dependencies. Follow the [installation manual](../../../../docs/pre2/install.md)
+cluster. Keep this directory together with `common.py`, `guest_status.py` and
+`profile.schema.json` from `scripts/deploy/pre1`; these are the required shared
+helpers. Follow the [installation manual](../../../../docs/pre2/install.md)
 to prepare the operating system, storage, voting media and node identities.
 
 The tools use the supplied product source and installed binaries. They do not
@@ -32,12 +33,17 @@ python3 "$LAB/fresh_controller.py" render --plan "$WORK/plan.json" \
 
 The installer sends only its named source dependencies over SSH with a pinned
 host key. It verifies the archive before installing a new directory, and keeps
-partial output on failure. It does not package adjacent request files or keys.
+partial output on failure. It does not package adjacent request files or keys,
+tests, or the older storage/fencing administration programs.
 
 For this PRE2 version, the plan's `creation` must be `cohort`. Check the rendered
 configuration before creating the database. The `lab-8g` memory profile sets
 `shared_buffers=512MB` and `max_connections=100`; other configured values are
 listed in the generated plan. Do not treat this profile as all product defaults.
+The generated HBA uses local peer authentication and permits only the supplied
+controller address to connect remotely as `pgrac` to `postgres`, using `trust`.
+Use it only on an isolated, trusted evaluation network. It adds no benchmark
+accounts. Configure and verify authentication separately for other users.
 
 ## Initialize once and distribute
 
@@ -62,7 +68,7 @@ python3 "$LAB/fresh_controller.py" bootstrap-check --plan "$WORK/plan.json" \
   --tools-root "$GUEST_TOOLS" --out "$WORK/bootstrap-check.json"
 ```
 
-`bootstrap-check` uses the candidate's own `postgres -C shared_memory_size`
+`bootstrap-check` uses the release's own `postgres -C shared_memory_size`
 entry. A successful check does not start the database. Continue with the manual's
 four-node startup commands. Do not use `--local-validation` for this deployment;
 that mode omits the real guest identity and GFS2 checks.

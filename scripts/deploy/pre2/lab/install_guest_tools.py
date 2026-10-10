@@ -5,7 +5,7 @@ Author: SqlRush <sqlrush@gmail.com>
 
     install_guest_tools.py --request REQ --dest /opt/pgrac-pre2-lab-tools-<id> --out RESULT [--dry-run]
 
-Packs scripts/deploy/pre1 and scripts/deploy/pre2/lab (without tests or
+Packs the required PRE1 helpers and scripts/deploy/pre2/lab (without tests or
 bytecode) with a SHA256SUMS manifest, sends it over pinned SSH and unpacks it
 as root into a staging directory next to DEST. The guest verifies every file
 against the manifest before renaming the staging directory to DEST. An
@@ -31,10 +31,7 @@ import request as lab_request
 DEPLOY = Path(__file__).resolve().parents[2]
 PARTS = (("pre1", DEPLOY / "pre1"), ("pre2/lab", DEPLOY / "pre2" / "lab"))
 SOURCE_FILES = {
-    "pre1": ("bootstrap_config.py", "bootstrap_runtime.py", "clean_closure.py", "clean_restart.py",
-             "common.py", "fencing.py", "guest_status.py", "lifecycle.py", "preflight.py",
-             "profile.schema.json", "remote.py", "seed.py", "seed_clone.py", "snapshot.py",
-             "storage_probe.c", "verify.py", "voting.py", "voting_io.c"),
+    "pre1": ("common.py", "guest_status.py", "profile.schema.json"),
     "pre2/lab": ("README.md", "cohort.py", "cohort_controller.py", "cohort_guest.py",
                  "fresh_controller.py", "fresh_guest.py", "fresh_plan.py", "install_guest_tools.py",
                  "lab_common.py", "render.py", "request.py", "source_contract.py"),

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the PRE2 laboratory fresh-database tools.
+"""Tests for the PRE2 deployment fresh-database tools.
 
 Author: SqlRush <sqlrush@gmail.com>
 
@@ -38,36 +38,37 @@ SOURCE = LAB.parents[3]
 
 
 def node(n, root, uid=None, gid=None):
+    # Synthetic inventory follows the public guide; offline tests never contact it.
     return {"node_id": n, "vm_uuid": "0000000%d-0000-4000-8000-000000000000" % n,
             "machine_id": ("%x" % (n + 1)) * 32, "boot_id": "1000000%d-0000-4000-8000-000000000000" % n,
-            "admin_endpoint": {"host": "192.168.122.%d" % (111 + n), "port": 22, "user": "pre1",
-                               "identity_file": "/var/lib/pre2-lab/id_ed25519"},
+            "admin_endpoint": {"host": "10.20.0.%d" % (10 + n), "port": 22, "user": "deploy",
+                               "identity_file": "/var/lib/pgrac-admin/example_ed25519"},
             "ssh_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample",
-            "sql_addr": "192.168.122.%d:5432" % (111 + n),
-            "control_addr": "192.168.122.%d:7001" % (111 + n),
-            "data_base_addr": "192.168.122.%d:7101" % (111 + n), "data_workers": 2,
+            "sql_addr": "10.20.0.%d:5432" % (10 + n),
+            "control_addr": "10.20.0.%d:6540" % (10 + n),
+            "data_base_addr": "10.20.0.%d:6541" % (10 + n), "data_workers": 2,
             "pgdata": "%s/node%d/data" % (root, n), "install_root": "%s/install" % root,
             "log_root": "%s/node%d/log" % (root, n),
-            "uid": uid if uid is not None else 1001, "gid": gid if gid is not None else 1001}
+            "uid": uid if uid is not None else 10001, "gid": gid if gid is not None else 10001}
 
 
-def make_request(root="/var/lib/pre2-lab", direct_io="off", uid=None, gid=None):
-    return {"schema_version": 1, "profile_id": "pre2-gfs2-arm64-lab-v1", "cluster_name": "c_pre2",
-            "dataset_id": "pre2-example", "controller_addr": "192.168.122.1",
-            "shared_mount": root + "/shared", "fs_uuid": "0150da46-bae8-411a-85dd-298358830ac2",
+def make_request(root="/srv/pgrac/eval01", direct_io="off", uid=None, gid=None):
+    return {"schema_version": 1, "profile_id": "pre2-gfs2-arm64-lab-v1", "cluster_name": "pre2eval",
+            "dataset_id": "pre2-example", "controller_addr": "10.20.0.20",
+            "shared_mount": root + "/shared", "fs_uuid": "11111111-2222-4333-8444-555555555555",
             "storage_uuid": "0123456789abcdef0123456789abcdef", "database_incarnation": 1,
-            "authority_uuid": "123456789abc4ef0923456789abcdef0", "system_identifier": "7584383251700000001",
+            "authority_uuid": "123456789abc4ef0923456789abcdef0", "system_identifier": "1234567890123456789",
             "config_dir": root + "/conf", "direct_io": direct_io,
             "storage_write_cache": {"mode": "write-through", "flush_verification": None},
             "memory_profile": "lab-8g", "guest_memory_gib": 8,
-            "storage_quorum": {"cluster": "pre1main", "nodes": {"0": 1, "1": 2, "2": 3, "3": 4}},
+            "storage_quorum": {"cluster": "pre2eval", "nodes": {"0": 1, "1": 2, "2": 3, "3": 4}},
             "voting_wwids": ["36001405aaaaaaaaaaaaaaaaaaaaaaaaa"[:33], "36001405bbbbbbbbbbbbbbbbbbbbbbbbb"[:33],
                              "36001405ccccccccccccccccccccccccc"[:33]],
             "nodes": [node(n, root, uid, gid) for n in range(4)]}
 
 
 CONTRACT = source_contract.collect(SOURCE)
-# The per-node writer path, still used by candidates without the cohort entry.
+# The per-node writer path, still used by releases without the cohort entry.
 LEGACY = copy.deepcopy(CONTRACT)
 LEGACY["initdb"]["cohort_option"] = False
 
@@ -106,7 +107,7 @@ class SourceContract(unittest.TestCase):
 class Request(unittest.TestCase):
     def test_valid_layout(self):
         request, derived = lab_request.validate(make_request())
-        self.assertEqual(derived["shared"]["shared_data_dir"], "/var/lib/pre2-lab/shared/pre2-example/data")
+        self.assertEqual(derived["shared"]["shared_data_dir"], "/srv/pgrac/eval01/shared/pre2-example/data")
         self.assertEqual([derived["nodes"][n]["wal_dir"].rsplit("/", 1)[1] for n in range(4)],
                          ["thread_1", "thread_2", "thread_3", "thread_4"])
         self.assertEqual(derived["storage_uuid_dashed"], "01234567-89ab-cdef-0123-456789abcdef")
@@ -181,7 +182,7 @@ class Render(unittest.TestCase):
             self.assertNotIn((name, None), scoped)
         self.assertNotIn(("log_min_messages", None), scoped)
         self.assertEqual(values[("cluster.storage_quorum_nodes", None)], "0:1,1:2,2:3,3:4")
-        self.assertEqual(values[("cluster.storage_quorum_cluster", None)], "pre1main")
+        self.assertEqual(values[("cluster.storage_quorum_cluster", None)], "pre2eval")
 
     def test_remote_visibility_in_canonical_common_request(self):
         for profile in render.MEMORY_PROFILES:
@@ -201,10 +202,17 @@ class Render(unittest.TestCase):
         _, _, rendered = self.render()
         self.assertIn("\ncommon.max_connections='100'\n", rendered["config_request"]["text"])
 
+    def test_hba_does_not_authorize_benchmark_accounts(self):
+        request, _ = lab_request.validate(make_request())
+        rules = [line.split() for line in render.hba_file(request).splitlines()
+                 if line and not line.startswith("#")]
+        self.assertEqual(rules, [["local", "all", "all", "peer"],
+                                 ["host", "postgres", "pgrac", "10.20.0.20/32", "trust"]])
+
     def test_storage_quorum_request(self):
-        for bad in ({"cluster": "pre1main", "nodes": {"0": 1, "1": 1, "2": 3, "3": 4}},
-                    {"cluster": "pre1main", "nodes": {"0": 1, "1": 2, "2": 3}},
-                    {"cluster": "pre1main", "nodes": {"0": 0, "1": 2, "2": 3, "3": 4}},
+        for bad in ({"cluster": "pre2eval", "nodes": {"0": 1, "1": 1, "2": 3, "3": 4}},
+                    {"cluster": "pre2eval", "nodes": {"0": 1, "1": 2, "2": 3}},
+                    {"cluster": "pre2eval", "nodes": {"0": 0, "1": 2, "2": 3, "3": 4}},
                     {"cluster": "", "nodes": {"0": 1, "1": 2, "2": 3, "3": 4}}):
             req = make_request()
             req["storage_quorum"] = bad
@@ -236,7 +244,7 @@ class Render(unittest.TestCase):
         self.assertEqual(rendered["policy_refusals"], [])
         self.assertIn(("debug_io_direct", None, "data"),
                       {(e["name"], e["node_id"], e["value"]) for e in rendered["shared_entries"]})
-        # This repository's own candidate decides which case applies.
+        # This repository's own release decides which case applies.
         _, _, rendered = self.render("data")
         self.assertEqual(bool(rendered["policy_refusals"]), "debug_io_direct" not in CONTRACT["config_policy"])
 
@@ -261,16 +269,16 @@ class Plan(unittest.TestCase):
 
     def test_cohort_plan(self):
         if not fresh_plan.cohort_mode(CONTRACT):
-            self.skipTest("candidate has no cohort entry")
+            self.skipTest("release has no cohort entry")
         plan = self.plan()
         self.assertEqual(plan["creation"], "cohort")
         c = plan["cohort"]
-        self.assertEqual(c["initdb_argv"][1:], ["-D", "/var/lib/pre2-lab/cohort", "-k", "-A", "trust", "--no-locale",
+        self.assertEqual(c["initdb_argv"][1:], ["-D", "/srv/pgrac/eval01/cohort", "-k", "-A", "trust", "--no-locale",
                                                 "--pgrac-initdb-cohort",
                                                 "--pgrac-initdb-shared-config=" + c["config_request_path"]])
         self.assertEqual([m["source"] for m in c["members"]],
-                         ["/var/lib/pre2-lab/cohort/node_%d" % n for n in range(4)])
-        self.assertEqual(c["shared_roots"]["wal"], "/var/lib/pre2-lab/shared/pre2-example/wal")
+                         ["/srv/pgrac/eval01/cohort/node_%d" % n for n in range(4)])
+        self.assertEqual(c["shared_roots"]["wal"], "/srv/pgrac/eval01/shared/pre2-example/wal")
         blocked = [p["id"] for p in plan["wait_points"] if p["status"] == BLOCKED]
         self.assertEqual(blocked, [])
         self.assertEqual(plan["stages"]["open"]["status"], READY)
@@ -334,7 +342,7 @@ class Plan(unittest.TestCase):
         self.assertTrue(any(a.startswith("--pgrac-initdb-shared-base=") for a in founder))
         self.assertIn("--pgrac-initdb-thread=3", other)
         for argv in (founder, other):
-            self.assertIn("--pgrac-initdb-system-identifier=7584383251700000001", argv)
+            self.assertIn("--pgrac-initdb-system-identifier=1234567890123456789", argv)
         self.assertFalse(any(a.startswith(("--pgrac-initdb-shared-base", "--pgrac-initdb-shared-config"))
                              for a in other))
         if LEGACY["initdb"].get("initial_config_option"):
@@ -401,7 +409,7 @@ class Identity(unittest.TestCase):
 
 
 class ConfigRequest(unittest.TestCase):
-    """Byte-for-byte equal to the request the candidate's own initdb test builds."""
+    """Byte-for-byte equal to the request the release's own initdb test builds."""
 
     def test_matches_candidate_tap_request(self):
         temp, base = "/var/tmp/t", "/var/tmp/t/valid-shared"
@@ -414,7 +422,7 @@ class ConfigRequest(unittest.TestCase):
         expected = ("@authority_uuid=123456789abc4ef0923456789abcdef0\n"
                     "@configured_0=000000000000000f\n@configured_1=0000000000000000\n"
                     "@database_incarnation=1\n@format=1\n@generation=1\n"
-                    "@storage_uuid=0123456789abcdef0123456789abcdef\n@system_identifier=7584383251700000001\n")
+                    "@storage_uuid=0123456789abcdef0123456789abcdef\n@system_identifier=1234567890123456789\n")
         for key in sorted(entries):
             expected += "common.%s='%s'\n" % (key, entries[key].replace("'", "''"))
         for n in range(4):
@@ -470,7 +478,7 @@ class GuestValidation(unittest.TestCase):
         bad = self.payload(1)
         bad["wal_dir"] = bad["wal_dir"].replace("thread_2", "thread_3")
         bad2 = self.payload(1)
-        bad2["shared_base"] = "/var/lib/pre2-lab/shared/x"
+        bad2["shared_base"] = "/srv/pgrac/eval01/shared/x"
         bad3 = self.payload(0)
         bad3["system_identifier"] = None
         bad4 = self.payload(2)
@@ -487,7 +495,7 @@ class GuestValidation(unittest.TestCase):
             with self.assertRaises(PreflightError):
                 fresh_guest.validate(payload)
         result = fresh_guest.create(dict(self.payload(1), node=dict(self.payload(1)["node"],
-                                                                    install_root="/var/lib/pre2-lab/none")))
+                                                                    install_root="/srv/pgrac/eval01/none")))
         self.assertEqual(result["status"], "ERROR")
 
 
@@ -521,6 +529,32 @@ class Installer(unittest.TestCase):
         self.assertFalse(any("/tests/" in n or n.startswith("pre2/lab/tests") or "__pycache__" in n for n in names))
         self.assertEqual(archive, ig.build_archive()[0], "archive must be deterministic")
         self.assertEqual(set(manifest), set(names) - {"SHA256SUMS"})
+
+    def test_archive_contains_only_required_pre1_helpers_and_runs_offline(self):
+        import install_guest_tools as ig
+        import io
+        import tarfile
+        archive, manifest = ig.build_archive()
+        self.assertEqual({name for name in manifest if name.startswith("pre1/")},
+                         {"pre1/common.py", "pre1/guest_status.py", "pre1/profile.schema.json"})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+                tar.extractall(root, filter="data")
+            request = root / "request.json"
+            request.write_text(json.dumps(make_request()))
+            controller = [sys.executable, "-B", str(root / "pre2/lab/fresh_controller.py")]
+            common = ["--request", str(request), "--source", str(SOURCE)]
+            plan = root / "plan.json"
+            commands = [controller + ["plan"] + common + ["--binary-sha256", "e" * 64, "--out", str(plan)],
+                        controller + ["render"] + common + ["--plan", str(plan), "--out-dir", str(root / "rendered")]]
+            for command in commands:
+                result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(json.loads(plan.read_text())["creation"], "cohort")
+            for action in ("cohort", "distribute", "bootstrap-check"):
+                result = subprocess.run(controller + [action, "--help"], capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_dest_and_dry_run(self):
         import install_guest_tools as ig
@@ -596,7 +630,7 @@ class LiveSingleHost(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("PRE2_LAB_COHORT_LIVE"), "live cohort validation not requested")
 class LiveCohort(unittest.TestCase):
-    """The candidate's cohort creator, exact distribution and read-only preparation on this host."""
+    """The release's cohort creator, exact distribution and read-only preparation on this host."""
 
     def test_cohort_distribute_bootstrap(self):
         install = Path(os.environ["PRE2_LAB_COHORT_LIVE"])
