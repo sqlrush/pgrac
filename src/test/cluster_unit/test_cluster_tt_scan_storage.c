@@ -108,6 +108,8 @@ static int scan_calls;
 static uint32 scan_eio_segment;
 static void (*scan_after_read)(uint32 segment);
 static int scan_publications;
+static int scan_publish_remaining;
+static int scan_scope_change;
 static pg_on_exit_callback scan_exit_callback;
 static Datum scan_exit_arg;
 
@@ -385,6 +387,7 @@ scan_begin_case(BackendType role)
 	scan_eio_segment = 0;
 	scan_after_read = NULL;
 	scan_publications = 0;
+	scan_publish_remaining = 0;
 	MyBackendType = role;
 	cluster_node_id = 0;
 	created = mkdtemp(pattern);
@@ -597,26 +600,21 @@ UT_TEST(test_inventory_preserves_tt_results_and_output_identity)
 	scan_seed(129, SCAN_XID + 4, TT_SLOT_COMMITTED, SCAN_WRAP + 1, scn_encode(1, 99), false);
 	for (int consumer = SCAN_RESOLVE; consumer <= SCAN_LOCATE; consumer++) {
 		for (int i = 0; i < lengthof(cases); i++) {
-			bool zero_match = consumer == SCAN_RESOLVE
-								  ? cases[i].resolve == CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH
-								  : cases[i].locate == CLUSTER_TT_DURABLE_LOCATE_MISSING;
-
 			cluster_undo_inventory_attach(&scan_inventory, true);
 			for (int pass = 0; pass < 2; pass++) {
 				scan_reset_counts();
 				scan_expect(scan_query(consumer, 0, cases[i].xid, cases[i].wanted_wrap), consumer,
 							consumer == SCAN_RESOLVE ? cases[i].resolve : cases[i].locate,
 							cases[i].segment, cases[i].wrap, cases[i].status, cases[i].scn);
-				UT_ASSERT_EQ(scan_enoent_calls,
-							 pass == 0 || zero_match ? CLUSTER_UNDO_SEGS_PER_INSTANCE - 6 : 0);
-				UT_ASSERT_EQ(scan_pread_calls, pass > 0 && zero_match ? 12 : 6);
+				UT_ASSERT_EQ(scan_enoent_calls, pass == 0 ? CLUSTER_UNDO_SEGS_PER_INSTANCE - 6 : 0);
+				UT_ASSERT_EQ(scan_pread_calls, 6);
 			}
 		}
 	}
 	scan_finish_case();
 }
 
-UT_TEST(test_zero_match_rechecks_whole_range)
+UT_TEST(test_certified_zero_match_reads_only_published_segments)
 {
 	for (int role = 0; role < lengthof(scan_roles); role++) {
 		for (int consumer = SCAN_RESOLVE; consumer <= SCAN_LOCATE; consumer++) {
@@ -629,16 +627,16 @@ UT_TEST(test_zero_match_rechecks_whole_range)
 						consumer == SCAN_RESOLVE ? CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH
 												 : CLUSTER_TT_DURABLE_LOCATE_MISSING,
 						0, 0, TT_SLOT_INVALID, InvalidScn);
-			UT_ASSERT_EQ(scan_enoent_calls, CLUSTER_UNDO_SEGS_PER_INSTANCE - 3);
-			UT_ASSERT_EQ(scan_pread_calls, 6);
+			UT_ASSERT_EQ(scan_enoent_calls, 0);
+			UT_ASSERT_EQ(scan_pread_calls, 3);
 			UT_ASSERT_EQ(scan_calls, 1);
-			UT_ASSERT_EQ(scan_wait_starts, 2);
+			UT_ASSERT_EQ(scan_wait_starts, 1);
 			scan_finish_case();
 		}
 	}
 }
 
-UT_TEST(test_zero_match_recheck_observes_untracked_file_and_read_errors)
+UT_TEST(test_recovery_disable_observes_untracked_file_and_read_errors)
 {
 	for (int role = 0; role < lengthof(scan_roles); role++) {
 		for (int consumer = SCAN_RESOLVE; consumer <= SCAN_LOCATE; consumer++) {
@@ -647,8 +645,9 @@ UT_TEST(test_zero_match_recheck_observes_untracked_file_and_read_errors)
 					return;
 				scan_seed_three(0);
 				scan_expect_target(scan_query(consumer, 0, SCAN_XID, SCAN_WRAP), consumer, 0);
-				/* Deliberately omit publication to test the zero-match fallback
-				 * independently of the inventory's publication completeness. */
+				/* Recovery/materialization disables the runtime proof before
+				 * it may create an untracked final name.  Use real file bytes. */
+				cluster_undo_inventory_disable(1);
 				scan_seed(2, SCAN_XID + 99, TT_SLOT_COMMITTED, SCAN_WRAP, scn_encode(1, 123),
 						  failure == 2);
 				if (failure == 1)
@@ -662,10 +661,10 @@ UT_TEST(test_zero_match_recheck_observes_untracked_file_and_read_errors)
 										   : CLUSTER_TT_DURABLE_LOCATE_FOUND),
 							2, SCAN_WRAP, TT_SLOT_COMMITTED, scn_encode(1, 123));
 				UT_ASSERT_EQ(scan_enoent_calls, CLUSTER_UNDO_SEGS_PER_INSTANCE - 4);
-				UT_ASSERT_EQ(scan_pread_calls, failure ? 8 : 7);
+				UT_ASSERT_EQ(scan_pread_calls, failure ? 5 : 4);
 				UT_ASSERT_EQ(scan_eio_calls, failure == 1 ? 2 : 0);
 				UT_ASSERT_EQ(scan_calls, 1);
-				UT_ASSERT_EQ(scan_wait_starts, 2);
+				UT_ASSERT_EQ(scan_wait_starts, 1);
 				scan_finish_case();
 			}
 		}
@@ -806,6 +805,17 @@ scan_expect_inventory_counts(uint64 bitmap, uint64 full, uint64 disabled)
 	UT_ASSERT_EQ(stats.disable_count, disabled);
 }
 
+static void
+scan_expect_outcome_counts(uint64 bitmap_zero, uint64 full_zero, uint64 fallback)
+{
+	ClusterUndoInventoryStats stats;
+
+	UT_ASSERT(cluster_undo_inventory_read_stats(&stats));
+	UT_ASSERT_EQ(stats.bitmap_zero_count, bitmap_zero);
+	UT_ASSERT_EQ(stats.full_zero_count, full_zero);
+	UT_ASSERT_EQ(stats.fallback_count, fallback);
+}
+
 UT_TEST(test_inventory_counts_actual_passes_through_both_consumers)
 {
 	for (int role = 0; role < lengthof(scan_roles); role++) {
@@ -819,12 +829,13 @@ UT_TEST(test_inventory_counts_actual_passes_through_both_consumers)
 			scan_expect_target(scan_query(consumer, 0, SCAN_XID, SCAN_WRAP), consumer, 0);
 			scan_expect_inventory_counts(1, 1, 0);
 
-			/* A zero-match retry is one limited pass and one full pass. */
+			/* Certified zero match completes in one limited pass. */
 			scan_expect(scan_query(consumer, 0, SCAN_XID + 100, SCAN_WRAP), consumer,
 						consumer == SCAN_RESOLVE ? CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH
 												 : CLUSTER_TT_DURABLE_LOCATE_MISSING,
 						0, 0, TT_SLOT_INVALID, InvalidScn);
-			scan_expect_inventory_counts(2, 2, 0);
+			scan_expect_inventory_counts(2, 1, 0);
+			scan_expect_outcome_counts(1, 0, 0);
 
 			/* Failed reads count the attempted passes, never a successful verdict. */
 			scan_eio_segment = 64;
@@ -832,14 +843,146 @@ UT_TEST(test_inventory_counts_actual_passes_through_both_consumers)
 						consumer == SCAN_RESOLVE ? CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE
 												 : CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE,
 						0, 0, TT_SLOT_INVALID, InvalidScn);
-			scan_expect_inventory_counts(3, 3, 0);
+			scan_expect_inventory_counts(3, 2, 0);
+			scan_expect_outcome_counts(1, 0, 1);
 			scan_eio_segment = 0;
 			cluster_undo_inventory_disable(1);
 			cluster_undo_inventory_disable(1);
-			scan_expect_inventory_counts(3, 3, 1);
+			scan_expect_inventory_counts(3, 2, 1);
 			scan_expect_target(scan_query(consumer, 0, SCAN_XID, SCAN_WRAP), consumer, 0);
-			scan_expect_inventory_counts(3, 4, 1);
+			scan_expect_inventory_counts(3, 3, 1);
+			scan_expect(scan_query(consumer, 0, SCAN_XID + 100, SCAN_WRAP), consumer,
+						consumer == SCAN_RESOLVE ? CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH
+												 : CLUSTER_TT_DURABLE_LOCATE_MISSING,
+						0, 0, TT_SLOT_INVALID, InvalidScn);
+			scan_expect_outcome_counts(1, 1, 1);
 			scan_finish_case();
+		}
+	}
+}
+
+UT_TEST(test_inventory_finish_revalidates_namespace_and_attachment)
+{
+	for (int change = 0; change < 3; change++) {
+		ClusterUndoInventorySnapshot snapshot;
+		uint64 seen[CLUSTER_UNDO_INVENTORY_WORDS] = { 1, 0, 0, 0 };
+		char saved[MAXPGPATH];
+
+		if (!scan_begin_case(B_LMS))
+			return;
+		cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &snapshot);
+		UT_ASSERT(cluster_undo_inventory_finish(&snapshot, seen, true));
+		cluster_undo_inventory_snapshot(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, &snapshot);
+		UT_ASSERT(snapshot.usable);
+		strlcpy(saved, scan_dir, sizeof(saved));
+		if (change == 0)
+			strlcpy(scan_dir, "/changed-root", sizeof(scan_dir));
+		else if (change == 1)
+			cluster_node_id = 1;
+		else
+			/* Same address and serial are not the same attached lifetime. */
+			cluster_undo_inventory_attach(&scan_inventory, true);
+		UT_ASSERT(!cluster_undo_inventory_finish(&snapshot, seen, true));
+		strlcpy(scan_dir, saved, sizeof(scan_dir));
+		cluster_node_id = 0;
+		scan_finish_case();
+	}
+}
+
+static void
+scan_publish_behind_cursor(uint32 segment)
+{
+	uint32 published;
+
+	if (segment != 256 || scan_publish_remaining == 0)
+		return;
+	UT_ASSERT(cluster_undo_inventory_publish_begin(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1));
+	published = 2 + scan_publications++;
+	scan_seed(published, SCAN_XID + 99, TT_SLOT_COMMITTED, SCAN_WRAP, scn_encode(1, 123), false);
+	cluster_undo_inventory_publish_end(published, true);
+	if (--scan_publish_remaining == 0)
+		scan_after_read = NULL;
+}
+
+UT_TEST(test_publication_after_cursor_cannot_certify_cold_or_retry_full_scan)
+{
+	for (int role = 0; role < lengthof(scan_roles); role++) {
+		for (int consumer = SCAN_RESOLVE; consumer <= SCAN_LOCATE; consumer++) {
+			for (int scenario = 0; scenario < 3; scenario++) {
+				bool refused = scenario != 1;
+
+				if (!scan_begin_case(scan_roles[role]))
+					return;
+				scan_seed_three(0);
+				if (scenario != 0)
+					scan_expect_target(scan_query(consumer, 0, SCAN_XID, SCAN_WRAP), consumer, 0);
+				scan_publish_remaining = scenario == 2 ? 2 : 1;
+				scan_after_read = scan_publish_behind_cursor;
+				scan_reset_counts();
+				scan_expect(scan_query(consumer, 0, SCAN_XID + 99, SCAN_WRAP), consumer,
+							consumer == SCAN_RESOLVE
+								? (refused ? CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE
+										   : CLUSTER_TT_DURABLE_RESOLVED_SCN)
+								: (refused ? CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE
+										   : CLUSTER_TT_DURABLE_LOCATE_FOUND),
+							2, SCAN_WRAP, TT_SLOT_COMMITTED, scn_encode(1, 123));
+				UT_ASSERT_EQ(scan_wait_starts, scenario == 0 ? 1 : 2);
+				UT_ASSERT_EQ(scan_publications, scenario == 2 ? 2 : 1);
+				scan_finish_case();
+			}
+		}
+	}
+}
+
+static void
+scan_invalidate_scope(uint32 segment)
+{
+	if (segment != 256)
+		return;
+	scan_after_read = NULL;
+	switch (scan_scope_change) {
+	case 0:
+		cluster_undo_inventory_disable(1);
+		break;
+	case 1:
+		cluster_undo_inventory_attach(NULL, false);
+		break;
+	case 2:
+		cluster_undo_inventory_attach(&scan_inventory, true);
+		break;
+	case 3:
+		strlcpy(scan_dir, "/changed-root", sizeof(scan_dir));
+		break;
+	case 4:
+		cluster_node_id = 1;
+		break;
+	}
+}
+
+UT_TEST(test_invalidated_scope_cannot_become_an_unprotected_full_scan)
+{
+	for (int role = 0; role < lengthof(scan_roles); role++) {
+		for (int consumer = SCAN_RESOLVE; consumer <= SCAN_LOCATE; consumer++) {
+			for (scan_scope_change = 0; scan_scope_change < 5; scan_scope_change++) {
+				char saved[MAXPGPATH];
+
+				if (!scan_begin_case(scan_roles[role]))
+					return;
+				scan_seed_three(0);
+				scan_expect_target(scan_query(consumer, 0, SCAN_XID, SCAN_WRAP), consumer, 0);
+				strlcpy(saved, scan_dir, sizeof(saved));
+				scan_after_read = scan_invalidate_scope;
+				scan_reset_counts();
+				scan_expect(scan_query(consumer, 0, SCAN_XID + 99, SCAN_WRAP), consumer,
+							consumer == SCAN_RESOLVE ? CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE
+													 : CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE,
+							0, 0, TT_SLOT_INVALID, InvalidScn);
+				/* No retry in a different or untrackable storage lifetime. */
+				UT_ASSERT_EQ(scan_wait_starts, 1);
+				strlcpy(scan_dir, saved, sizeof(scan_dir));
+				cluster_node_id = 0;
+				scan_finish_case();
+			}
 		}
 	}
 }
@@ -847,18 +990,21 @@ UT_TEST(test_inventory_counts_actual_passes_through_both_consumers)
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(14);
 	UT_RUN(test_lms_both_scans_reuse_real_inventory);
 	UT_RUN(test_worker_both_scans_reuse_real_inventory);
 	UT_RUN(test_backend_both_scans_reuse_real_inventory);
 	UT_RUN(test_inventory_preserves_tt_results_and_output_identity);
-	UT_RUN(test_zero_match_rechecks_whole_range);
-	UT_RUN(test_zero_match_recheck_observes_untracked_file_and_read_errors);
+	UT_RUN(test_certified_zero_match_reads_only_published_segments);
+	UT_RUN(test_recovery_disable_observes_untracked_file_and_read_errors);
 	UT_RUN(test_mixed_missing_present_eio_short_file_never_completes);
 	UT_RUN(test_known_segment_failure_retries_whole_range_and_refuses);
 	UT_RUN(test_publication_during_limited_scan_cannot_hide_second_match);
 	UT_RUN(test_foreign_namespace_keeps_original_full_scan);
 	UT_RUN(test_inventory_counts_actual_passes_through_both_consumers);
+	UT_RUN(test_inventory_finish_revalidates_namespace_and_attachment);
+	UT_RUN(test_publication_after_cursor_cannot_certify_cold_or_retry_full_scan);
+	UT_RUN(test_invalidated_scope_cannot_become_an_unprotected_full_scan);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

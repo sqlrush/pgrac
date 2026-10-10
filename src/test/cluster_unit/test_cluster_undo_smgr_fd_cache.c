@@ -440,6 +440,48 @@ UT_TEST(test_worker_own_runtime_reuses_two_descriptors)
 	exercise_two_local_segments(B_LMS_WORKER);
 }
 
+static void
+exercise_77_existing_segments(BackendType role)
+{
+	if (!begin_case(role))
+		return;
+	/* 462 safe FDs allow 154 external reservations: 77 for this pool and
+	 * 77 for other users.  All files exist before either real read sweep. */
+	max_safe_fds = 462;
+	external_limit = 154;
+	for (uint32 segment = 1; segment <= 77; segment++)
+		seed_segment(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment);
+	for (int sweep = 0; sweep < 2; sweep++) {
+		int opens_before = open_attempts;
+		int successes_before = successful_opens;
+
+		for (uint32 segment = 1; segment <= 77; segment++)
+			expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment,
+						sweep != 0);
+		printf("# fd-pool role=%s segments=77 sweep=%d new_opens=%d live=%d external=%d\n",
+			   role == B_LMS ? "lms" : "worker", sweep + 1, open_attempts - opens_before,
+			   live_fds(), external_used);
+		UT_ASSERT_EQ(open_attempts - opens_before, sweep == 0 ? 77 : 0);
+		UT_ASSERT_EQ(successful_opens - successes_before, sweep == 0 ? 77 : 0);
+		UT_ASSERT_EQ(pread_calls, (sweep + 1) * 77);
+		UT_ASSERT_EQ(live_fds(), 77);
+		UT_ASSERT_EQ(external_used, 77);
+		UT_ASSERT_EQ(close_calls, 0);
+	}
+	UT_ASSERT_EQ(external_high_water, 77);
+	finish_case();
+}
+
+UT_TEST(test_lms_77_existing_segments_second_sweep_never_reopens)
+{
+	exercise_77_existing_segments(B_LMS);
+}
+
+UT_TEST(test_worker_77_existing_segments_second_sweep_never_reopens)
+{
+	exercise_77_existing_segments(B_LMS_WORKER);
+}
+
 UT_TEST(test_full_local_segment_range_preserves_descriptor_headroom)
 {
 	const int nodes[] = { 0, UNDO_OWNER_INSTANCE_MAX - 1 };
@@ -451,47 +493,100 @@ UT_TEST(test_full_local_segment_range_preserves_descriptor_headroom)
 		if (!begin_case(n == 0 ? B_LMS : B_LMS_WORKER))
 			return;
 		cluster_node_id = nodes[n];
-		external_limit = CLUSTER_UNDO_SEGS_PER_INSTANCE;
-		max_safe_fds = 3 * external_limit;
+		/* At and above the budget needed for all 256 local segments, the
+		 * pool retains the whole working set, including the last owner. */
+		max_safe_fds = n == 0 ? 1536 : 3072;
+		external_limit = n == 0 ? 512 : 1024;
 		for (uint32 i = 0; i < CLUSTER_UNDO_SEGS_PER_INSTANCE; i++)
 			seed_segment(CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner, first + i, (unsigned char)i);
 		for (int sweep = 0; sweep < 2; sweep++) {
+			int opens_before = open_attempts;
+
 			for (uint32 i = 0; i < CLUSTER_UNDO_SEGS_PER_INSTANCE; i++)
 				expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner, first + i, (unsigned char)i,
 							sweep != 0);
-			UT_ASSERT_EQ(open_attempts, (sweep + 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE);
-			UT_ASSERT_EQ(successful_opens, (sweep + 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE);
-			UT_ASSERT_EQ(pread_calls, (sweep + 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE);
+			printf("# fd-pool owner=%u segments=256 sweep=%d new_opens=%d live=%d external=%d\n",
+				   (unsigned)owner, sweep + 1, open_attempts - opens_before, live_fds(),
+				   external_used);
+			UT_ASSERT_EQ(open_attempts - opens_before, sweep == 0 ? 256 : 0);
+			UT_ASSERT_EQ(open_attempts, 256);
+			UT_ASSERT_EQ(successful_opens, 256);
+			UT_ASSERT_EQ(pread_calls, (sweep + 1) * 256);
+			UT_ASSERT_EQ(live_fds(), 256);
+			UT_ASSERT_EQ(external_used, 256);
+			UT_ASSERT_EQ(close_calls, 0);
 		}
-		UT_ASSERT(external_high_water <= 64);
-		UT_ASSERT_EQ(live_fds(), external_used);
-		if (AcquireExternalFD())
+		UT_ASSERT_EQ(external_high_water, 256);
+		/* The entire other half of the external budget remains reservable. */
+		for (int i = 0; i < external_limit / 2; i++)
+			UT_ASSERT(AcquireExternalFD());
+		for (int i = 0; i < external_limit / 2; i++)
 			ReleaseExternalFD();
-		else
-			UT_ASSERT(false);
 		finish_case();
 	}
 }
 
 UT_TEST(test_low_fd_budget_leaves_room_for_wait_event_sets)
 {
-	if (!begin_case(B_LMS))
+	static const struct {
+		int safe;
+		int external;
+		int retained;
+	} budgets[] = { { 47, 15, 7 }, { 48, 16, 8 } };
+
+	for (int b = 0; b < lengthof(budgets); b++) {
+		if (!begin_case(B_LMS))
+			return;
+		max_safe_fds = budgets[b].safe;
+		external_limit = budgets[b].external;
+		/* Existing resources consume part of the half reserved for others. */
+		for (int i = 0; i < 4; i++)
+			UT_ASSERT(AcquireExternalFD());
+		for (uint32 segment = 1; segment <= 32; segment++) {
+			seed_segment(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment);
+			expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment,
+						false);
+		}
+		UT_ASSERT_EQ(external_high_water, 4 + budgets[b].retained);
+		UT_ASSERT_EQ(live_fds(), budgets[b].retained);
+		for (uint32 segment = 33 - budgets[b].retained; segment <= 32; segment++)
+			expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment, true);
+		UT_ASSERT_EQ(open_attempts, 32);
+		/* Both hand-calculated budgets still admit four wait-event resources. */
+		for (int i = 0; i < 4; i++)
+			UT_ASSERT(AcquireExternalFD());
+		UT_ASSERT(!AcquireExternalFD());
+		for (int i = 0; i < 8; i++)
+			ReleaseExternalFD();
+		finish_case();
+	}
+}
+
+UT_TEST(test_existing_external_users_limit_pool_without_losing_reads)
+{
+	if (!begin_case(B_LMS_WORKER))
 		return;
 	max_safe_fds = 48;
-	external_limit = max_safe_fds / 3;
-	/* Existing process resources and a later wait-event set share this budget. */
-	for (int i = 0; i < 4; i++)
+	external_limit = 16;
+	for (int i = 0; i < 13; i++)
 		UT_ASSERT(AcquireExternalFD());
-	for (uint32 segment = 1; segment <= 32; segment++) {
+	for (uint32 segment = 1; segment <= 5; segment++) {
 		seed_segment(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment);
 		expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment, false);
 	}
-	UT_ASSERT(external_high_water <= 4 + max_safe_fds / 6);
-	if (AcquireExternalFD())
-		ReleaseExternalFD();
-	else
-		UT_ASSERT(false);
-	for (int i = 0; i < 4; i++)
+	expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 5, 5, true);
+	UT_ASSERT_EQ(open_attempts, 5);
+	UT_ASSERT_EQ(pread_calls, 6);
+	UT_ASSERT_EQ(close_calls, 2);
+	UT_ASSERT_EQ(live_fds(), 3);
+	UT_ASSERT_EQ(external_used, 16);
+	UT_ASSERT_EQ(external_high_water, 16);
+	UT_ASSERT(!AcquireExternalFD());
+	cluster_undo_smgr_fd_cache_reset();
+	UT_ASSERT_EQ(live_fds(), 0);
+	UT_ASSERT_EQ(external_used, 13);
+	UT_ASSERT_EQ(external_acquired - external_released, 13);
+	for (int i = 0; i < 13; i++)
 		ReleaseExternalFD();
 	finish_case();
 }
@@ -606,6 +701,53 @@ UT_TEST(test_open_error_rethrows_and_releases_external_fd_reservation)
 	finish_case();
 }
 
+UT_TEST(test_open_error_after_eviction_preserves_survivors_and_releases_reservation)
+{
+	char actual[BLCKSZ];
+	volatile bool caught = false;
+
+	if (!begin_case(B_LMS_WORKER))
+		return;
+	max_safe_fds = 48;
+	external_limit = 16;
+	for (uint32 segment = 1; segment <= 9; segment++)
+		seed_segment(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment);
+	for (uint32 segment = 1; segment <= 8; segment++)
+		expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment, (unsigned char)segment, false);
+	force_open_throw = true;
+	PG_TRY();
+	{
+		(void)cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 9, 1, 0, actual);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(open_attempts, 9);
+	UT_ASSERT_EQ(successful_opens, 8);
+	UT_ASSERT_EQ(pread_calls, 8);
+	UT_ASSERT_EQ(live_fds(), 7);
+	UT_ASSERT_EQ(external_used, 7);
+	UT_ASSERT_EQ(external_acquired, 9);
+	UT_ASSERT_EQ(external_released, 2);
+	UT_ASSERT_EQ(close_calls, 1);
+	force_open_throw = false;
+	/* Segment 2 survived eviction; the failed segment has no cached error. */
+	expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 2, 2, true);
+	UT_ASSERT_EQ(open_attempts, 9);
+	expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 9, 9, true);
+	UT_ASSERT_EQ(open_attempts, 10);
+	UT_ASSERT_EQ(live_fds(), 8);
+	UT_ASSERT_EQ(external_used, 8);
+	UT_ASSERT(exit_callback != NULL);
+	if (exit_callback != NULL)
+		exit_callback(0, exit_arg);
+	require_all_closed();
+	finish_case();
+}
+
 UT_TEST(test_in_place_recycle_is_visible_through_cached_descriptor)
 {
 	char path[MAXPGPATH];
@@ -668,10 +810,20 @@ UT_TEST(test_reset_closes_all_descriptors_and_reopens_replaced_path)
 
 UT_TEST(test_external_fd_budget_refusal_preserves_reads_and_balances_cleanup)
 {
-	for (int limit = 0; limit <= 1; limit++) {
+	static const struct {
+		int safe;
+		int limit;
+		int occupied;
+		int pool;
+	} budgets[] = { { 192, 0, 0, 0 }, { 192, 1, 0, 1 }, { 5, 1, 0, 0 }, { 48, 16, 16, 0 } };
+
+	for (int b = 0; b < lengthof(budgets); b++) {
 		if (!begin_case(B_LMS_WORKER))
 			return;
-		external_limit = limit;
+		max_safe_fds = budgets[b].safe;
+		external_limit = budgets[b].limit;
+		for (int i = 0; i < budgets[b].occupied; i++)
+			UT_ASSERT(AcquireExternalFD());
 		for (uint32 segment = 1; segment <= 3; segment++)
 			seed_segment(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment,
 						 (unsigned char)(0x60 + segment));
@@ -679,8 +831,19 @@ UT_TEST(test_external_fd_budget_refusal_preserves_reads_and_balances_cleanup)
 			expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, segment,
 						(unsigned char)(0x60 + segment), false);
 		expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1, 0x61, true);
-		UT_ASSERT(external_high_water <= limit);
-		UT_ASSERT(external_used <= limit);
+		/* Refusal must reach the original single-FD path, including its hit. */
+		expect_read(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1, 0x61, false);
+		UT_ASSERT_EQ(open_attempts, 4);
+		UT_ASSERT_EQ(successful_opens, 4);
+		UT_ASSERT_EQ(pread_calls, 5);
+		UT_ASSERT_EQ(close_calls, 3);
+		UT_ASSERT_EQ(live_fds(), 1);
+		UT_ASSERT_EQ(external_used, budgets[b].occupied + budgets[b].pool);
+		UT_ASSERT(external_high_water <= budgets[b].limit);
+		cluster_undo_smgr_fd_cache_reset();
+		UT_ASSERT_EQ(external_used, budgets[b].occupied);
+		for (int i = 0; i < budgets[b].occupied; i++)
+			ReleaseExternalFD();
 		finish_case();
 	}
 }
@@ -921,16 +1084,20 @@ UT_TEST(test_inventory_stats_attach_preserves_counts_and_absence_is_explicit)
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(23);
 	UT_RUN(test_lms_own_runtime_reuses_two_descriptors);
 	UT_RUN(test_worker_own_runtime_reuses_two_descriptors);
+	UT_RUN(test_lms_77_existing_segments_second_sweep_never_reopens);
+	UT_RUN(test_worker_77_existing_segments_second_sweep_never_reopens);
 	UT_RUN(test_full_local_segment_range_preserves_descriptor_headroom);
 	UT_RUN(test_low_fd_budget_leaves_room_for_wait_event_sets);
+	UT_RUN(test_existing_external_users_limit_pool_without_losing_reads);
 	UT_RUN(test_other_roles_owners_and_intents_keep_single_descriptor);
 	UT_RUN(test_owner_and_intent_namespaces_never_share_file_bytes);
 	UT_RUN(test_recovery_cached_descriptor_never_retains_admission);
 	UT_RUN(test_failed_open_is_not_cached_and_later_creation_is_readable);
 	UT_RUN(test_open_error_rethrows_and_releases_external_fd_reservation);
+	UT_RUN(test_open_error_after_eviction_preserves_survivors_and_releases_reservation);
 	UT_RUN(test_in_place_recycle_is_visible_through_cached_descriptor);
 	UT_RUN(test_reset_closes_all_descriptors_and_reopens_replaced_path);
 	UT_RUN(test_external_fd_budget_refusal_preserves_reads_and_balances_cleanup);

@@ -2011,6 +2011,26 @@ durable_scan_read_header(uint8 owner, uint32 segment_id, char block[BLCKSZ], boo
 	return false;
 }
 
+/* Retry only within the same tracked storage lifetime.  Replacing a failed
+ * proof with an untracked snapshot would discard both the scope refusal and
+ * the positive set whose missing files must make the scan incomplete. */
+static bool
+durable_scan_retry_inventory(ClusterUndoInventorySnapshot *inventory, uint8 owner)
+{
+	ClusterUndoInventorySnapshot current;
+
+	cluster_undo_inventory_snapshot(cluster_undo_recovery_intent_for_owner(owner), owner, &current);
+	if (!current.tracked || current.identity != inventory->identity
+		|| current.attachment != inventory->attachment || current.owner != inventory->owner)
+		return false;
+	for (int i = 0; i < CLUSTER_UNDO_INVENTORY_WORDS; i++)
+		if ((inventory->published[i] & ~current.published[i]) != 0)
+			return false;
+	current.usable = false;
+	*inventory = current;
+	return true;
+}
+
 /*
  * cluster_tt_slot_durable_resolve_by_xid_origin -- spec-4.5a G6 (P1 #2): the
  * origin-qualified durable by-xid scan.  A materialized foreign read cannot
@@ -2036,6 +2056,7 @@ cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node, TransactionId xid
 	bool match_has_valid_scn = false;
 	bool scan_complete = true;
 	bool inventory_complete = true;
+	bool inventory_certified;
 	ClusterUndoInventorySnapshot inventory;
 	uint64 seen[CLUSTER_UNDO_INVENTORY_WORDS];
 	SCN found = InvalidScn;
@@ -2079,8 +2100,10 @@ cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node, TransactionId xid
 	 * Distinguishing "segment absent" (sound skip) from "existing but unreadable"
 	 * (incomplete scan): cluster_undo_smgr_read_block returns false for both, so
 	 * on a miss we probe cluster_undo_segment_file_exists().  A complete local
-	 * inventory limits reads to published segments.  A zero-match result still
-	 * requires the original whole-range scan.
+	 * inventory limits reads to published segments.  Zero matches have the
+	 * same meaning only when that complete inventory is still certified after
+	 * reading every published header; losing the proof requires a full scan
+	 * in the same storage lifetime, or a refusal.
 	 */
 	cluster_undo_inventory_snapshot(cluster_undo_recovery_intent_for_owner(owner), owner,
 									&inventory);
@@ -2143,17 +2166,24 @@ rescan:
 		}
 	}
 	cluster_tt_durable_io_wait_end();
-	if ((!cluster_undo_inventory_finish(&inventory, seen, inventory_complete && scan_complete)
-		 || xid_matches == 0)
-		&& inventory.usable) {
-		/* Retry an invalidated or zero-match limited scan once using the
-		 * original whole range.  A subset miss is not a recycled-slot proof. */
-		inventory.usable = false;
-		inventory.tracked = false;
+	inventory_certified
+		= cluster_undo_inventory_finish(&inventory, seen, inventory_complete && scan_complete);
+	if (!inventory_certified && inventory.usable
+		&& durable_scan_retry_inventory(&inventory, owner)) {
+		/* An invalidated limited scan has no complete-set proof, even if
+		 * it found a match.  Retry once over the original whole range. */
+		cluster_undo_inventory_count_fallback();
 		goto rescan;
 	}
+	/* Full scans can also miss a publication behind the cursor.  If the
+	 * runtime inventory was participating, its failed cut is not a complete
+	 * scan, and retrying must not turn an unproven result into a zero match. */
+	if (!inventory_certified && inventory.owner != 0)
+		scan_complete = false;
 
 	result = cluster_tt_durable_classify(xid_matches, match_has_valid_scn, scan_complete);
+	if (result == CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH)
+		cluster_undo_inventory_count_zero(inventory.usable);
 	if (result == CLUSTER_TT_DURABLE_RESOLVED_SCN) {
 		*commit_scn = found;
 		if (out_seg != NULL)
@@ -2180,6 +2210,7 @@ cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node, TransactionId 
 	bool scan_complete = true;
 	bool inventory_complete = true;
 	ClusterUndoInventorySnapshot inventory;
+	bool inventory_certified;
 	uint64 seen[CLUSTER_UNDO_INVENTORY_WORDS];
 	uint16 matched_seg = 0;
 	uint16 matched_slot = 0;
@@ -2238,21 +2269,24 @@ rescan:
 		}
 	}
 	cluster_tt_durable_io_wait_end();
-	if ((!cluster_undo_inventory_finish(&inventory, seen, inventory_complete && scan_complete)
-		 || matches == 0)
-		&& inventory.usable) {
-		/* Retry an invalidated or zero-match limited scan once using the
-		 * original whole range.  A subset miss is not an absence proof. */
-		inventory.usable = false;
-		inventory.tracked = false;
+	inventory_certified
+		= cluster_undo_inventory_finish(&inventory, seen, inventory_complete && scan_complete);
+	if (!inventory_certified && inventory.usable
+		&& durable_scan_retry_inventory(&inventory, owner)) {
+		/* A subset miss is not an absence proof after invalidation. */
+		cluster_undo_inventory_count_fallback();
 		goto rescan;
 	}
+	if (!inventory_certified && inventory.owner != 0)
+		scan_complete = false;
 	if (matches > 1)
 		return CLUSTER_TT_DURABLE_LOCATE_AMBIGUOUS;
 	if (!scan_complete)
 		return CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE;
-	if (matches == 0)
+	if (matches == 0) {
+		cluster_undo_inventory_count_zero(inventory.usable);
 		return CLUSTER_TT_DURABLE_LOCATE_MISSING;
+	}
 	if (out_seg != NULL)
 		*out_seg = matched_seg;
 	if (out_slot != NULL)

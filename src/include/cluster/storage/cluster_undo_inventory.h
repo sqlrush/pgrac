@@ -39,26 +39,38 @@ typedef struct ClusterUndoInventory {
 	pg_atomic_uint64 bitmap_hit_count;
 	pg_atomic_uint64 full_scan_count;
 	pg_atomic_uint64 disable_count;
+	pg_atomic_uint64 bitmap_zero_count;
+	pg_atomic_uint64 full_zero_count;
+	pg_atomic_uint64 fallback_count;
 } ClusterUndoInventory;
 
 typedef struct ClusterUndoInventorySnapshot {
 	const ClusterUndoInventory *identity;
+	uint64 attachment;
 	uint64 serial;
 	uint64 published[CLUSTER_UNDO_INVENTORY_WORDS];
+	uint8 owner;
 	bool tracked;
 	bool usable;
 } ClusterUndoInventorySnapshot;
 
-/* Cumulative per-node scan passes, not transaction matches or verdicts.
+/* Cumulative per-node scan activity; pass counts are not transaction verdicts.
  * Full scans include cold/disabled/foreign scans and limited-scan retries.
- * Disable counts false-to-true transitions, once per shared-memory lifetime. */
+ * Disable counts false-to-true transitions, once per shared-memory lifetime.
+ * Zero counts are completed zero-match results, not a committed/recycled
+ * transaction proof.  Fallback counts limited passes retried in full. */
 typedef struct ClusterUndoInventoryStats {
 	uint64 bitmap_hit_count;
 	uint64 full_scan_count;
 	uint64 disable_count;
+	uint64 bitmap_zero_count;
+	uint64 full_zero_count;
+	uint64 fallback_count;
 } ClusterUndoInventoryStats;
 
 extern void cluster_undo_inventory_count_scan(bool bitmap);
+extern void cluster_undo_inventory_count_zero(bool bitmap);
+extern void cluster_undo_inventory_count_fallback(void);
 /* Each field is sampled independently.  False means no shared inventory. */
 extern bool cluster_undo_inventory_read_stats(ClusterUndoInventoryStats *out);
 

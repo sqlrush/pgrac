@@ -933,6 +933,12 @@
 | `tt_durable_lookup_miss_count` | 十进制整数文本 | `tt` / `durable` / `lookup` / `miss`的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |
 | `tt_durable_by_xid_scan_count` | 十进制整数文本 | `tt` / `durable` / `by` / `xid` / `scan`的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |
 | `tt_durable_redo_apply_count` | 十进制整数文本 | `tt` / `durable` / redo / 应用的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |
+| `tt_inventory_hit_count` | 十进制整数文本或 `unavailable` | 实际开始的有限段集合扫描遍数，不表示找到了事务。 | 同窗口 `fallback_count / hit_count` 表示有限扫描回退比例；分母为零时不可计算。 |
+| `tt_inventory_full_scan_count` | 十进制整数文本或 `unavailable` | 实际开始的全范围扫描遍数，包括首次、不可用作用域和有限扫描回退。 | 不能把全扫次数直接当作回退次数；失败扫描也计数。 |
+| `tt_inventory_disabled_count` | 十进制整数文本或 `unavailable` | 本共享内存代次中位图首次进入 disabled 的次数。 | 同一代次重复禁用不重复计数，共享内存重建后归零。 |
+| `tt_inventory_bitmap_zero_count` | 十进制整数文本或 `unavailable` | 运行时完整性核验通过后，有限扫描完成的零匹配结果数。 | 汇总 resolve 和 locate 两个入口；零匹配不等于事务已提交或已回收。 |
+| `tt_inventory_full_zero_count` | 十进制整数文本或 `unavailable` | 全范围扫描完成的零匹配结果数。 | 不包含扫描不完整、读失败或歧义结果；与有限扫描零匹配分开计数。 |
+| `tt_inventory_fallback_count` | 十进制整数文本或 `unavailable` | 有限扫描失去完整性证明后，改为全范围重扫的次数。 | 每次调用最多重扫一次；不包含直接从全范围开始的扫描。各键独立采样，比较同代次时间窗增量。 |
 | `retention_horizon_scn` | 十进制整数文本 | 保留 / `horizon`对应的集群 SCN。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `retention_max_recycle_horizon` | 十进制整数文本 | 保留 / 上限 / `recycle` / `horizon`的当前快照值。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `tt_slot_retain_skip_count` | 十进制整数文本 | `tt` / 槽位 / `retain` / `skip`的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |

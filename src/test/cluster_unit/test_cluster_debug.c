@@ -2846,6 +2846,9 @@ cluster_undo_inventory_read_stats(ClusterUndoInventoryStats *out)
 	out->bitmap_hit_count = 11;
 	out->full_scan_count = 12;
 	out->disable_count = 13;
+	out->bitmap_zero_count = 14;
+	out->full_zero_count = 15;
+	out->fallback_count = 16;
 	return true;
 }
 /* spec-6.2: terminal authority counters share the durable-TT stat region in
@@ -5506,8 +5509,10 @@ UT_TEST(test_debug_dump_exposes_inventory_counts_without_fake_zero)
 {
 	LOCAL_FCINFO(fcinfo, 0);
 	ReturnSetInfo rsinfo;
-	static const char *const keys[] = { "tt_inventory_hit_count", "tt_inventory_full_scan_count",
-										"tt_inventory_disabled_count" };
+	static const char *const keys[]
+		= { "tt_inventory_hit_count",		"tt_inventory_full_scan_count",
+			"tt_inventory_disabled_count",	"tt_inventory_bitmap_zero_count",
+			"tt_inventory_full_zero_count", "tt_inventory_fallback_count" };
 
 	for (int available = 0; available < 2; available++) {
 		memset(fcinfo, 0, SizeForFunctionCallInfo(0));

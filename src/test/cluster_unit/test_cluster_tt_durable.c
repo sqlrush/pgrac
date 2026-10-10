@@ -804,6 +804,12 @@ void
 cluster_undo_inventory_count_scan(bool bitmap pg_attribute_unused())
 {}
 void
+cluster_undo_inventory_count_zero(bool bitmap pg_attribute_unused())
+{}
+void
+cluster_undo_inventory_count_fallback(void)
+{}
+void
 cluster_tt_durable_count_redo_apply(void)
 {}
 void

@@ -56,8 +56,11 @@
 
 /* Kept in the original undo-record shared region, not process-local.  Only
  * final-file publication changes membership.  No I/O is performed with this
- * spinlock held, and a failed/unknown inventory always means a full scan. */
+ * spinlock held, and a failed/unknown inventory cannot authorize skipped files. */
 static ClusterUndoInventory *undo_inventory;
+/* Local attachment identity prevents reuse of a snapshot after detach or
+ * reinitialization at the same address.  A fresh process has no old snapshots. */
+static uint64 undo_inventory_attachment;
 
 void
 cluster_undo_inventory_count_scan(bool bitmap)
@@ -68,6 +71,24 @@ cluster_undo_inventory_count_scan(bool bitmap)
 		pg_atomic_fetch_add_u64(&undo_inventory->bitmap_hit_count, 1);
 	else
 		pg_atomic_fetch_add_u64(&undo_inventory->full_scan_count, 1);
+}
+
+void
+cluster_undo_inventory_count_zero(bool bitmap)
+{
+	if (undo_inventory == NULL)
+		return;
+	if (bitmap)
+		pg_atomic_fetch_add_u64(&undo_inventory->bitmap_zero_count, 1);
+	else
+		pg_atomic_fetch_add_u64(&undo_inventory->full_zero_count, 1);
+}
+
+void
+cluster_undo_inventory_count_fallback(void)
+{
+	if (undo_inventory != NULL)
+		pg_atomic_fetch_add_u64(&undo_inventory->fallback_count, 1);
 }
 
 bool
@@ -81,18 +102,26 @@ cluster_undo_inventory_read_stats(ClusterUndoInventoryStats *out)
 	out->bitmap_hit_count = pg_atomic_read_u64(&undo_inventory->bitmap_hit_count);
 	out->full_scan_count = pg_atomic_read_u64(&undo_inventory->full_scan_count);
 	out->disable_count = pg_atomic_read_u64(&undo_inventory->disable_count);
+	out->bitmap_zero_count = pg_atomic_read_u64(&undo_inventory->bitmap_zero_count);
+	out->full_zero_count = pg_atomic_read_u64(&undo_inventory->full_zero_count);
+	out->fallback_count = pg_atomic_read_u64(&undo_inventory->fallback_count);
 	return true;
 }
 
 void
 cluster_undo_inventory_attach(ClusterUndoInventory *state, bool initialize)
 {
+	if ((state != undo_inventory || initialize) && undo_inventory_attachment < UINT64_MAX)
+		undo_inventory_attachment++;
 	if (initialize && state != NULL) {
 		memset(state, 0, sizeof(*state));
 		SpinLockInit(&state->lock);
 		pg_atomic_init_u64(&state->bitmap_hit_count, 0);
 		pg_atomic_init_u64(&state->full_scan_count, 0);
 		pg_atomic_init_u64(&state->disable_count, 0);
+		pg_atomic_init_u64(&state->bitmap_zero_count, 0);
+		pg_atomic_init_u64(&state->full_zero_count, 0);
+		pg_atomic_init_u64(&state->fallback_count, 0);
 	}
 	undo_inventory = state;
 }
@@ -141,11 +170,15 @@ cluster_undo_inventory_snapshot(ClusterUndoPathIntent intent, uint8 owner,
 								ClusterUndoInventorySnapshot *out)
 {
 	memset(out, 0, sizeof(*out));
-	if (!inventory_scope(intent, owner))
+	if (undo_inventory_attachment == UINT64_MAX || !inventory_scope(intent, owner))
 		return;
 	SpinLockAcquire(&undo_inventory->lock);
+	/* Even a full scan must notice that an own-runtime publisher was active
+	 * at its start.  Such a pass cannot prove absence across that cut. */
+	out->owner = owner;
 	if (!undo_inventory->disabled && undo_inventory->publishers == 0) {
 		out->identity = undo_inventory;
+		out->attachment = undo_inventory_attachment;
 		out->serial = undo_inventory->serial;
 		memcpy(out->published, undo_inventory->published, sizeof(out->published));
 		out->tracked = true;
@@ -160,7 +193,10 @@ cluster_undo_inventory_finish(const ClusterUndoInventorySnapshot *snapshot,
 {
 	bool stable;
 
-	if (!snapshot->tracked || undo_inventory == NULL || snapshot->identity != undo_inventory)
+	if (!snapshot->tracked || undo_inventory == NULL || snapshot->identity != undo_inventory
+		|| snapshot->attachment != undo_inventory_attachment
+		|| undo_inventory_attachment == UINT64_MAX
+		|| !inventory_scope(CLUSTER_UNDO_PATH_RUNTIME_SHARED, snapshot->owner))
 		return false;
 	SpinLockAcquire(&undo_inventory->lock);
 	stable = !undo_inventory->disabled && undo_inventory->publishers == 0
@@ -473,7 +509,7 @@ service_fd_get(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_inst
 	char path[MAXPGPATH];
 	int fd;
 	bool evicted = false;
-	int capacity = Min(64, max_safe_fds / 6);
+	int capacity = Min(CLUSTER_UNDO_SEGS_PER_INSTANCE, max_safe_fds / 6);
 
 	if ((MyBackendType != B_LMS && MyBackendType != B_LMS_WORKER)
 		|| intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED || cluster_node_id < 0

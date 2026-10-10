@@ -3256,6 +3256,12 @@ dump_undo(ReturnSetInfo *rsinfo)
 			 inventory_available ? fmt_uint64(inventory_stats.full_scan_count) : "unavailable");
 	emit_row(rsinfo, "undo", "tt_inventory_disabled_count",
 			 inventory_available ? fmt_uint64(inventory_stats.disable_count) : "unavailable");
+	emit_row(rsinfo, "undo", "tt_inventory_bitmap_zero_count",
+			 inventory_available ? fmt_uint64(inventory_stats.bitmap_zero_count) : "unavailable");
+	emit_row(rsinfo, "undo", "tt_inventory_full_zero_count",
+			 inventory_available ? fmt_uint64(inventory_stats.full_zero_count) : "unavailable");
+	emit_row(rsinfo, "undo", "tt_inventory_fallback_count",
+			 inventory_available ? fmt_uint64(inventory_stats.fallback_count) : "unavailable");
 
 	/* spec-3.12 D5: own-instance retention horizon observability. */
 	emit_row(rsinfo, "undo", "retention_horizon_scn",
