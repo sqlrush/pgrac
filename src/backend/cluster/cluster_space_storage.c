@@ -216,10 +216,12 @@ cluster_space_relation_read_maintenance_identity(RelFileLocator locator, Cluster
 	buffer = space_read_identity_buffer(locator, false, &expected);
 	if (!BufferIsValid(buffer))
 		return false;
-	/* The legacy shared-read requester is backend-indexed. Maintenance
-	 * already uses this current owner for its target page; use the same
-	 * auxiliary-capable path for the preceding identity read. */
-	if (!ClusterLockBufferExclusiveRetryAware(buffer)) {
+	/* Measurement prototype: read a qualified current S/X image under
+	 * content SHARE without a writer acquisition. No identity is memoized;
+	 * namespace, CRC, incarnation and LIVE state are decoded each time.
+	 * An uncovered/busy read still uses the original auxiliary-capable
+	 * owner, preserving its progress and fail-closed contract. */
+	if (!ClusterLockBufferShareIfCovered(buffer) && !ClusterLockBufferExclusiveRetryAware(buffer)) {
 		ReleaseBuffer(buffer);
 		return false;
 	}

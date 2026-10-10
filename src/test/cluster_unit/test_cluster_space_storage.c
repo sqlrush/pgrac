@@ -3469,7 +3469,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(66);
+	UT_PLAN(68);
 	UT_RUN(test_maintenance_identity_uses_current_owner_without_backend_id);
 	UT_RUN(test_maintenance_identity_reuses_covered_read_without_writer);
 	UT_RUN(test_maintenance_covered_read_revalidates_identity_each_time);

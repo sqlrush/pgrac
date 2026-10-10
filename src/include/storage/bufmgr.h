@@ -337,6 +337,7 @@ extern bool ClusterBufferDirectInitObservationUnowned(Buffer buffer);
 extern bool ClusterLockBufferExclusiveRetryAware(Buffer buffer);
 /* PGRAC: SHARE counterpart with the same clean-refusal contract. */
 extern bool ClusterLockBufferShareBarrierAware(Buffer buffer);
+extern bool ClusterLockBufferShareIfCovered(Buffer buffer);
 /* PGRAC: operation-scoped PCM-X direct-init entrances for zero VM/FSM pages. */
 /* Returns InvalidBuffer when the caller's pin was deliberately released for
  * a Resource-X wait and the old descriptor was reused.  The relation-level

@@ -14313,6 +14313,53 @@ ClusterLockBufferShareBarrierAware(Buffer buffer)
 	return !barrier_refused;
 }
 
+/*
+ * Measurement-only maintenance read; do not merge as a product change.
+ * Reuse current node residency without joining a writer acquisition or
+ * allocating a backend-indexed S request.  The caller retains its pin and
+ * admission guard; a miss changes no ownership and leaves no content lock.
+ */
+bool
+ClusterLockBufferShareIfCovered(Buffer buffer)
+{
+#ifdef USE_PGRAC_CLUSTER
+	BufferDesc *buf;
+	ClusterPcmOwnSnapshot live;
+	ResourceXGateSnapshot gate;
+	const uint32 valid_bits = BM_TAG_VALID | BM_VALID;
+
+	if (!BufferIsValid(buffer) || BufferIsLocal(buffer)
+		|| !BufferIsPinned(buffer) || !cluster_shared_config
+		|| !cluster_gcs_block_local_cache || !cluster_pcm_is_active())
+		return false;
+	buf = GetBufferDescriptor(buffer - 1);
+	if (!cluster_bufmgr_should_pcm_track(buf)
+		|| !LWLockConditionalAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED))
+		return false;
+
+	/* Re-sample under content authority, exactly as the ordinary cached S
+	 * reader does after taking its content lock.  READ_IMAGE and PI bytes
+	 * are not current residency, even if their descriptor is still valid. */
+	if (cluster_bufmgr_pcm_own_snapshot(buf, &live) != CLUSTER_PCM_OWN_OK
+		|| live.buffer_type != BUF_TYPE_CURRENT
+		|| (live.semantic_buf_state & valid_bits) != valid_bits
+		|| (live.semantic_buf_state & (BM_IO_IN_PROGRESS | BM_IO_ERROR)) != 0
+		|| !cluster_pcm_x_cached_cover_reverify_accepts(
+			(uint8) PCM_LOCK_MODE_S, live.generation, live.generation,
+			live.pcm_state, live.flags, live.writer_activation_token,
+			live.resource_x_activation_generation)
+		|| !cluster_pcm_lock_resource_x_gate_snapshot(&gate)
+		|| gate.phase != RESOURCE_X_GATE_OPEN)
+	{
+		LWLockRelease(BufferDescriptorGetContentLock(buf));
+		return false;
+	}
+	return true;
+#else
+	return false;
+#endif
+}
+
 /* VM/FSM pages read with RBM_ZERO_ON_ERROR become BM_VALID before their
  * PageIsNew initialization.  Dedicated wrappers are the provenance: a plain
  * LockBuffer(X) on the same N buffer remains queue-only. */
