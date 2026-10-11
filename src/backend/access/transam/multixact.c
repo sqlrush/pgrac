@@ -3213,10 +3213,11 @@ cluster_mxid_local_scope(MultiXactId additional_lower, bool startup)
 				   != (CLUSTER_XID_AUTHORITY_FLAG_SEALED | CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA)
 			|| native.next_multi != FirstMultiXactId)
 			return scope;
-		scope.reason = "NATIVE_EMPTY_BOOT_INPUT_UNPROVEN";
+		/* PGRAC: the boolean input check cannot classify a failed selection. */
+		scope.reason = NULL;
 		if (!ClusterXLogStartupNativeEmptyMultiXactInput())
 			return scope;
-		/* The original lazy latch may have become available during the read. */
+		/* PGRAC: do not carry an empty-boot diagnostic into a real binding. */
 		scope.slot = cluster_mxid_allocation_slot();
 		scope.floor = cluster_mxid_stripe_floor();
 		scope.source = CLUSTER_MXID_SCOPE_STRIPED;
@@ -3939,13 +3940,13 @@ TruncateMultiXact(MultiXactId newOldestMulti, Oid newOldestMultiDB)
 	} else {
 #endif
 		/*
-	 * First, compute the safe truncation point for MultiXactMember. This is
-	 * the starting offset of the oldest multixact.
-	 *
-	 * Hopefully, find_multixact_start will always work here, because we've
-	 * already checked that it doesn't precede the earliest MultiXact on disk.
-	 * But if it fails, don't truncate anything, and log a message.
-	 */
+		 * First, compute the safe truncation point for MultiXactMember. This is
+		 * the starting offset of the oldest multixact.
+		 *
+		 * Hopefully, find_multixact_start will always work here, because we've
+		 * already checked that it doesn't precede the earliest MultiXact on disk.
+		 * But if it fails, don't truncate anything, and log a message.
+		 */
 		if (oldestMulti == nextMulti) {
 			/* there are NO MultiXacts */
 			oldestOffset = nextOffset;
@@ -3959,9 +3960,9 @@ TruncateMultiXact(MultiXactId newOldestMulti, Oid newOldestMultiDB)
 		}
 
 		/*
-	 * Secondly compute up to where to truncate. Lookup the corresponding
-	 * member offset for newOldestMulti for that.
-	 */
+		 * Secondly compute up to where to truncate. Lookup the corresponding
+		 * member offset for newOldestMulti for that.
+		 */
 		if (newOldestMulti == nextMulti) {
 			/* there are NO MultiXacts */
 			newOldestOffset = nextOffset;
@@ -3974,13 +3975,13 @@ TruncateMultiXact(MultiXactId newOldestMulti, Oid newOldestMultiDB)
 		}
 
 		/*
-	 * On crash, MultiXactIdCreateFromMembers() can leave behind multixids
-	 * that were not yet written out and hence have zero offset on disk. If
-	 * such a multixid becomes oldestMulti, we won't be able to look up its
-	 * offset. That should be rare, so we don't try to do anything smart about
-	 * it. Just skip the truncation, and hope that by the next truncation
-	 * attempt, oldestMulti has advanced to a valid multixid.
-	 */
+		 * On crash, MultiXactIdCreateFromMembers() can leave behind multixids
+		 * that were not yet written out and hence have zero offset on disk. If
+		 * such a multixid becomes oldestMulti, we won't be able to look up its
+		 * offset. That should be rare, so we don't try to do anything smart about
+		 * it. Just skip the truncation, and hope that by the next truncation
+		 * attempt, oldestMulti has advanced to a valid multixid.
+		 */
 		if (newOldestOffset == 0) {
 			ereport(LOG,
 					(errmsg("cannot truncate up to MultiXact %u because it has invalid offset, "

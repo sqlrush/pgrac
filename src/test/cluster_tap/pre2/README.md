@@ -94,6 +94,27 @@ This module only belongs in the disposable TAP installation. Native Startup
 and shutdown contention tests additionally require GDB and a debug-symbol
 build so that the fixture can observe and pause the original CF holder.
 
+### MultiXact cold-copy tests
+
+Run TAP447 and TAP448 together in an independent Linux development VM, with
+the same source tree and installed server. The VM needs the LocalQuorum
+dependencies described in BLACKBOX.md and a non-root database account:
+
+```sh
+sudo python3 src/test/cluster_tap/pre2/run_multixact_lifecycle.py \
+  --source /absolute/path/to/source --install /absolute/path/to/install \
+  --vendor / --uid 1000 --gid 1000 --output /new/path/to/mx-results
+```
+
+The controller first completes the positive start/stop/restart test. It then
+copies that test's saved DATA and voting images, clears only the copied
+activation sector, and binds the copies inside its own mount namespaces.
+TAP448 verifies the negative startup, cleared sectors, unchanged saved voting
+images and authority files, and stopped processes. The controller separately
+checks that the original voting devices and host mount view did not change.
+All DATA, before/after images, fault receipts and logs remain in the output
+directory. The expected startup refusal is not reported as a normal stop.
+
 ## Test adapter interface
 
 This is test plumbing, not a database authority or an admission API. The

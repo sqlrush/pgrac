@@ -57,7 +57,7 @@ static bool exists, io_error, expect_error, native_valid;
 static bool change_g_on_unlock, change_g_on_read, change_slot_on_read;
 static bool change_floor_on_read, change_next_on_read, change_scope_on_header;
 static ClusterXidStripeObs observation;
-static bool empty_input, cancel_input_on_recheck;
+static bool empty_input, cancel_input_on_recheck, latch_on_header;
 static unsigned empty_input_calls, proven_logs, unbound_logs;
 static bool need_vacuum;
 static bool latch_on_unlock, poison_on_unlock, move_cursor_on_observe;
@@ -199,6 +199,8 @@ cluster_xid_authority_read(ClusterXidAuthorityHeader *out)
 	*out = native;
 	if (change_scope_on_header)
 		cluster_node_id++;
+	if (latch_on_header)
+		cluster_mxid_stripe_latch_runtime(true, 0, 32);
 	return native_valid;
 }
 
@@ -434,7 +436,7 @@ reset_fixture(int slot, MultiXactId floor, MultiXactId lower, MultiXactId next,
 	memset(&observation, 0, sizeof(observation));
 	observation.disk_state = CLUSTER_XID_STRIPE_DISK_ABSENT;
 	observation.mxid_disk_state = CLUSTER_MXID_DISK_ABSENT;
-	empty_input = cancel_input_on_recheck = false;
+	empty_input = cancel_input_on_recheck = latch_on_header = false;
 	latch_on_unlock = poison_on_unlock = move_cursor_on_observe = false;
 	empty_input_calls = proven_logs = unbound_logs = 0;
 	need_vacuum = true;
@@ -934,6 +936,26 @@ UT_TEST(empty_boot_known_does_not_authorize_unbound_allocation)
 	UT_ASSERT_EQ(last_error, ERRCODE_DATA_CORRUPTED);
 	UT_ASSERT_EQ(zeroes + wal_records, 0);
 }
+UT_TEST(empty_boot_diagnostics_do_not_outlive_the_selected_scope)
+{
+	ClusterMxidLocalScope scope;
+
+	empty_boot_fixture();
+	cancel_input_on_recheck = true;
+	UT_ASSERT(limits_error(true));
+	UT_ASSERT(strstr(last_detail, "LOCAL_ENDPOINT_UNPROVEN") != NULL);
+	UT_ASSERT(strstr(last_detail, "NATIVE_EMPTY_BOOT_INPUT_UNPROVEN") == NULL);
+	UT_ASSERT(!state.oldestOffsetKnown);
+	UT_ASSERT_EQ(writes + zeroes + wal_records + proven_logs, 0);
+
+	empty_boot_fixture();
+	latch_on_header = true;
+	scope = cluster_mxid_local_scope(FirstMultiXactId, true);
+	UT_ASSERT_EQ(scope.source, CLUSTER_MXID_SCOPE_STRIPED);
+	UT_ASSERT(scope.reason == NULL);
+	UT_ASSERT(cluster_mxid_local_scope_current(&scope));
+	UT_ASSERT_EQ(writes + zeroes + wal_records + proven_logs, 0);
+}
 UT_TEST(empty_boot_runtime_cannot_recreate_proof_or_truncate)
 {
 	unsigned before;
@@ -1001,7 +1023,7 @@ UT_TEST(single_shared_dense_mode_retains_native_limits_and_allocation)
 int
 main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(29);
 	UT_RUN(foreign_lower_uses_first_exact_local_id);
 	UT_RUN(local_empty_accepts_zero_and_lower_beyond_next);
 	UT_RUN(native_prefix_requires_qualified_empty_input);
@@ -1027,6 +1049,7 @@ main(void)
 	UT_RUN(empty_boot_rejects_every_unproven_activation_observation);
 	UT_RUN(empty_boot_rechecks_original_input_and_native_cursor);
 	UT_RUN(empty_boot_known_does_not_authorize_unbound_allocation);
+	UT_RUN(empty_boot_diagnostics_do_not_outlive_the_selected_scope);
 	UT_RUN(empty_boot_runtime_cannot_recreate_proof_or_truncate);
 	UT_RUN(empty_boot_striped_members_recalculate_at_segment_boundary);
 	UT_RUN(single_shared_dense_mode_retains_native_limits_and_allocation);

@@ -6,6 +6,7 @@ Author: SqlRush <sqlrush@gmail.com>
 """
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -15,9 +16,55 @@ from mx_cold_copy import sha
 
 IMAGE_NAMES = ('pgrac_control_root', 'pgrac_control_root.bak',
                'pgrac_xid_authority', 'pgrac_xid_authority.bak')
+ACTIVATION_OFFSET = 5 * 128 * 512
+ACTIVATION_BYTES = 512
 
 
-def prepare(capture_path, destination, votes, logdir):
+def copy_cleared_votes(capture_path, destination):
+    """Clear only the activation sector in newly created regular-file copies."""
+    capture_path = Path(capture_path).resolve(strict=True)
+    capture = json.loads(capture_path.read_text())
+    destination = Path(destination).resolve()
+    if destination.exists() or destination.is_relative_to(capture_path.parent):
+        raise ValueError('fault destination must be new and outside the saved capture')
+    votes = capture['votes']
+    if len(votes) != 3 or len({item['path'] for item in votes}) != 3:
+        raise ValueError('three distinct saved voting images are required')
+    sources = []
+    for vote in votes:
+        source = Path(vote['path'])
+        if (source.is_symlink() or not source.is_file()
+                or not source.resolve().is_relative_to(capture_path.parent)
+                or source.stat().st_size != vote['size'] or sha(source) != vote['sha256']):
+            raise ValueError('saved voting image identity changed')
+        with source.open('rb') as stream:
+            stream.seek(ACTIVATION_OFFSET)
+            previous = stream.read(ACTIVATION_BYTES)
+        if len(previous) != ACTIVATION_BYTES or not any(previous):
+            raise ValueError('saved voting image has no activation to clear')
+        sources.append((source, vote, previous))
+    destination.mkdir(mode=0o700)
+    faults = []
+    for index, (source, vote, previous) in enumerate(sources):
+        copied = destination / f'vote{index}.image'
+        with source.open('rb') as original, copied.open('xb') as output:
+            shutil.copyfileobj(original, output)
+        if sha(copied) != vote['sha256']:
+            raise ValueError('saved voting image changed while copying')
+        with copied.open('r+b') as output:
+            output.seek(ACTIVATION_OFFSET)
+            output.write(bytes(ACTIVATION_BYTES))
+            output.flush()
+            os.fsync(output.fileno())
+        faults.append(dict(source=str(source), source_sha256=vote['sha256'],
+                           copy=str(copied), copied_sha256=sha(copied),
+                           offset=ACTIVATION_OFFSET, before=previous.hex(),
+                           after=bytes(ACTIVATION_BYTES).hex()))
+    (destination / 'faults.json').write_text(json.dumps(faults, indent=2) + '\n')
+    return faults
+
+
+def prepare(capture_path, destination, votes, logdir, faults):
     capture = json.loads(Path(capture_path).read_text())
     destination, logdir = Path(destination).resolve(), Path(logdir).resolve()
     original = Path(capture['original_data_root']).resolve(strict=True)
@@ -52,6 +99,7 @@ def prepare(capture_path, destination, votes, logdir):
     layout_path.write_text(json.dumps(layout, indent=2)+'\n')
     (destination/'mount-view.json').write_text(json.dumps(dict(
         bindings=bindings, expected_nodes=expected), indent=2)+'\n')
+    (destination/'vote-faults.json').write_text(json.dumps(faults, indent=2)+'\n')
     return layout_path
 
 
@@ -105,6 +153,21 @@ def verify(result):
     assert result['all_stopped'], 'negative fixture left a live process'
     assert any(node['fatal'] and node['limit_refusal'] for node in result['nodes']), 'no actual MultiXact limit FATAL'
     assert not any(node['proven'] or node['ready'] for node in result['nodes']), 'cold copy admitted'
+    faults = result['vote_faults']
+    assert len(faults) == 3, 'incomplete copied-vote fault evidence'
+    assert len({item['copy'] for item in faults}) == 3, 'copied votes are not distinct'
+    for fault in faults:
+        original = Path(fault['source']).resolve(strict=True)
+        copied = Path(fault['copy']).resolve(strict=True)
+        assert not original.samefile(copied), 'fault device aliases the original'
+        assert sha(original) == fault['source_sha256'], 'saved voting image changed'
+        assert fault['offset'] == ACTIVATION_OFFSET, 'fault targeted a different sector'
+        assert len(bytes.fromhex(fault['before'])) == ACTIVATION_BYTES and any(
+            bytes.fromhex(fault['before'])), 'original activation was absent'
+        with copied.open('rb') as image:
+            image.seek(ACTIVATION_OFFSET)
+            cleared = image.read(ACTIVATION_BYTES)
+        assert cleared == bytes(ACTIVATION_BYTES), 'copied activation is not cleared'
     for phase in ('before', 'after'):
         assert set(result[phase]) == {'global/' + name for name in IMAGE_NAMES}, 'incomplete native images'
     for name in IMAGE_NAMES:
@@ -120,7 +183,8 @@ def reject(layout_path, entry_path, bindir, output):
     output = Path(output)
     driver = CohortEntry(layout, bindir, json.loads(Path(entry_path).read_text()))
     before = images(layout, root/'before')
-    result = dict(before=before, refused=False, cleanup=[], nodes=[])
+    result = dict(before=before, refused=False, cleanup=[], nodes=[],
+                  vote_faults=json.loads((root/'vote-faults.json').read_text()))
     try:
         driver.phase_budget(60)
         try:
