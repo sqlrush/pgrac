@@ -38,8 +38,8 @@ def qualified_status(quorum, device, count):
 
 class LocalQuorum:
     def __init__(self, root, vendor, count, uid, gid):
-        if count not in (2, 4) or os.geteuid() != 0:
-            raise ValueError('local quorum requires Linux root and two or four nodes')
+        if count not in (1, 2, 4) or os.geteuid() != 0:
+            raise ValueError('local quorum requires Linux root and one, two or four nodes')
         self.root, self.vendor = Path(root).resolve(), Path(vendor).resolve(strict=True)
         self.count, self.uid, self.gid = count, uid, gid
         self.tag = 'bq' + hashlib.sha256(str(self.root).encode()).hexdigest()[:8]

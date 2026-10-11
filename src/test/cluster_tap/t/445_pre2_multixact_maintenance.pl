@@ -29,6 +29,14 @@ sub maintenance_counters
 	return \%counts;
 }
 
+sub save_maintenance_result
+{
+	my ($result) = @_;
+	open(my $out, '>', "$ENV{TESTLOGDIR}/mx-vacuum-restart.json") or die $!;
+	print {$out} JSON::PP->new->canonical->pretty->encode($result);
+	close($out) or die $!;
+}
+
 run_scenario('pre2_multixact_maintenance', [], sub {
 	my ($cluster) = @_;
 	my @nodes = $cluster->nodes;
@@ -110,6 +118,7 @@ run_scenario('pre2_multixact_maintenance', [], sub {
 	}
 	sql($nodes[0], 'ALTER DATABASE template0 ALLOW_CONNECTIONS false');
 	my $foreign_lower = 0;
+	my @retained;
 	for my $i (0 .. 3)
 	{
 		my $range = sql($nodes[$i], 'SELECT pre2_mx_range()');
@@ -120,14 +129,23 @@ run_scenario('pre2_multixact_maintenance', [], sub {
 		diag("node$i after VACUUM $range floor=$floor");
 		my $members = sql($nodes[$i], "SELECT count(*) FROM pg_get_multixact_members('$multis[$i]')");
 		require_equal($members, '2', "node$i retained both live members");
+		push @retained, {node => $i, multi => $multis[$i], members => $members,
+			lower => $lower, next => $next, floor => $floor};
 		for my $holder (@{$holders[$i]})
 		{
 			$holder->query_safe('COMMIT');
 			$holder->quit;
 		}
 	}
-	require_true($foreign_lower > 0, 'real VACUUM reached a foreign striped lower bound');
+	# Preserve the lower-bound failure while also observing the independent
+	# clean-restart checks. Any SQL or lifecycle failure still stops the test.
+	my $result = {retained_members => \@retained, foreign_lower_count => $foreign_lower,
+		foreign_lower_passed => $foreign_lower > 0 ? JSON::PP::true : JSON::PP::false};
+	save_maintenance_result($result);
+	diag("VACUUM_FOREIGN_LOWER count=$foreign_lower");
 	$cluster->stop_cluster;
+	$result->{first_normal_stop} = JSON::PP::true;
+	save_maintenance_result($result);
 	my @restart_starts = map { -s $_->logfile // 0 } @nodes;
 	$cluster->restart_cluster;
 	my @restart;
@@ -146,8 +164,10 @@ run_scenario('pre2_multixact_maintenance', [], sub {
 		push @restart, {node => $i, proven => $proven, bound_floor => $floor,
 			log => $node->logfile};
 	}
-	open(my $out, '>', "$ENV{TESTLOGDIR}/mx-vacuum-restart.json") or die $!;
-	print {$out} JSON::PP->new->canonical->pretty->encode({same_data_restart => \@restart});
-	close($out) or die $!;
+	$result->{same_data_restart} = \@restart;
+	save_maintenance_result($result);
 	$cluster->stop_cluster;
+	$result->{second_normal_stop} = JSON::PP::true;
+	save_maintenance_result($result);
+	require_true($foreign_lower > 0, 'real VACUUM reached a foreign striped lower bound');
 });
