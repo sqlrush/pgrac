@@ -246,8 +246,8 @@ ok($hits >= 1,
 # ----------
 is( $node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'123',
-	'pg_stat_cluster_wait_events returns 123 rows (spec-7.2 LMS data-plane waits + spec-5.22b D2-6 undo-block grant-plane waits; merge sum 118+2+3)');
+	'124',
+	'pg_stat_cluster_wait_events returns 124 rows (spec-7.2 LMS data-plane waits + spec-5.22b D2-6 undo-block grant-plane waits; merge sum 118+2+3+1)');
 
 # ----------
 # Test 11 (Hardening v1.0.1 / codex review P2-2): SQL SRF rejects

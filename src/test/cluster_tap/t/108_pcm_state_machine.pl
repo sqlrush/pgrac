@@ -17,7 +17,7 @@
 #	       FIFO, ownership, and runtime gauges
 #	  L4  9 transition counter rows present + non-negative
 #	  L5  ClusterPcmTransitionApply and PcmBlockConvertWait are registered
-#	  L6  wait event baseline is exactly 123
+#	  L6  wait event baseline is exactly 124
 #	  L7  no PCM wire opcode smoke (L107 N+5 严守:no PCM wire enum added)
 #
 # Spec: spec-2.30-pcm-9-state-machine-activation.md (FROZEN v0.3)
@@ -87,8 +87,8 @@ is($convert_wait_event, '1',
 # L6 — wait event count baseline through spec-6.1.
 my $wait_event_count = $node_default->safe_psql(
 	'postgres', "SELECT count(*) FROM pg_stat_cluster_wait_events");
-is($wait_event_count, '123',
-   'L6 wait event baseline is exactly 123');
+is($wait_event_count, '124',
+   'L6 wait event baseline is exactly 124');
 
 # L7 — no PCM wire opcode smoke (no SQL-visible PCM wire opcode enum surface)
 my $pcm_grd_init_event = $node_default->safe_psql(

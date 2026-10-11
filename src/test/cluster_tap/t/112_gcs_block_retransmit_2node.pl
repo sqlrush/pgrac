@@ -148,8 +148,8 @@ for my $we_name (
 is($pair->node0->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-   '123',
-   'L5 pg_stat_cluster_wait_events returns 123 rows (spec-6.13 RDMA + spec-5.22b D2-6 undo grant-plane +3 + spec-7.2 LMS data-plane +2; merge sum 118+3+2)');
+   '124',
+   'L5 pg_stat_cluster_wait_events returns 124 rows (spec-6.13 RDMA + spec-5.22b D2-6 undo grant-plane +3 + spec-7.2 LMS data-plane +2; merge sum 118+3+2+1)');
 
 
 # ============================================================

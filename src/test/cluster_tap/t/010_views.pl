@@ -46,12 +46,12 @@ $node->start;
 
 
 # ----------
-# Total row count: 121 (spec-6.13 RDMA + spec-5.22b D2-6 undo-block grant-plane waits).
+# Total row count: 124, including phase publication wait.
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'123',
-	'pg_stat_cluster_wait_events returns 123 rows (spec-6.13 RDMA + spec-5.22b D2-6 undo grant-plane +3 + spec-7.2 LMS data-plane +2; merge sum 118+3+2)');
+	'124',
+	'pg_stat_cluster_wait_events returns 124 rows (spec-6.13 RDMA + spec-5.22b D2-6 undo grant-plane +3 + spec-7.2 LMS data-plane +2; merge sum 118+3+2+1)');
 
 is($node->safe_psql(
 		'postgres',
