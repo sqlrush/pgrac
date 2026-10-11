@@ -130,6 +130,12 @@ ResetLatch(Latch *latch pg_attribute_unused())
 	abort();
 }
 
+void
+SetLatch(Latch *latch pg_attribute_unused())
+{
+	abort();
+}
+
 int
 WaitLatch(Latch *latch pg_attribute_unused(), int events pg_attribute_unused(),
 		  long timeout pg_attribute_unused(), uint32 event pg_attribute_unused())
