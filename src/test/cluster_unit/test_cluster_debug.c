@@ -42,6 +42,9 @@
  */
 #include "postgres.h"
 #include "miscadmin.h"
+#include "storage/ipc.h"
+#include "storage/latch.h"
+#include "storage/pmsignal.h"
 #include "cluster/cluster_update_trace.h"
 
 #include "cluster/cluster_catalog_stats.h" /* spec-6.14 D10b catalog counter stubs */
@@ -99,6 +102,46 @@ bool cluster_controlfile_shared_authority = false;
 BackendType MyBackendType = B_BACKEND;
 bool cluster_lms_enabled = false;
 char *cluster_wal_threads_dir = NULL;
+
+/* PGRAC: diagnostic snapshots link the phase reader but have no active
+ * publisher in this fixture. Blocking or process exit would be a failure. */
+bool PostmasterLWLockWaitForbidden;
+volatile sig_atomic_t InterruptPending;
+#ifdef USE_POSTMASTER_DEATH_SIGNAL
+volatile sig_atomic_t postmaster_possibly_dead = 1;
+#endif
+Latch *MyLatch;
+
+void
+ProcessInterrupts(void)
+{
+	abort();
+}
+
+bool
+PostmasterIsAliveInternal(void)
+{
+	return true;
+}
+
+void
+ResetLatch(Latch *latch pg_attribute_unused())
+{
+	abort();
+}
+
+int
+WaitLatch(Latch *latch pg_attribute_unused(), int events pg_attribute_unused(),
+		  long timeout pg_attribute_unused(), uint32 event pg_attribute_unused())
+{
+	abort();
+}
+
+void
+proc_exit(int code pg_attribute_unused())
+{
+	abort();
+}
 
 bool
 cluster_lms_is_ready(void)
