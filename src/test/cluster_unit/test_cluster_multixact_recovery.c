@@ -32,6 +32,7 @@ char *cluster_shared_data_dir;
 bool InRecovery = true;
 bool IsUnderPostmaster;
 BackendType MyBackendType;
+AuxProcType MyAuxProcType = StartupProcess;
 volatile uint32 CritSectionCount;
 volatile sig_atomic_t InterruptPending;
 volatile uint32 InterruptHoldoffCount;
@@ -117,6 +118,13 @@ data_sync_elevel(int level)
 }
 void
 ProcessInterrupts(void)
+{
+	abort();
+}
+
+/* PGRAC: native recovery is not the checkpointer queue consumer. */
+void
+AbsorbSyncRequests(void)
 {
 	abort();
 }

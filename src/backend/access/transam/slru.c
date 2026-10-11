@@ -43,6 +43,11 @@
  *
  * src/backend/access/transam/slru.c
  *
+ * PGRAC MODIFICATIONS
+ *   Modified by: SqlRush <sqlrush@gmail.com>
+ *   Absorb queued shared SUBTRANS writes before forgetting a deleted segment.
+ *   spec-3.5-subtrans-cross-node-visibility.md
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -57,6 +62,9 @@
 #include "access/xlogutils.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "postmaster/bgwriter.h"
+#endif
 #include "storage/fd.h"
 #include "storage/shmem.h"
 
@@ -1307,11 +1315,22 @@ restart:
  *
  * NB: This does not touch the SLRU buffers themselves, callers have to ensure
  * they either can't yet contain anything, or have already been cleaned out.
+ *
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: drain queued shared SUBTRANS writes before the local forget.
+ * Why: a completed old write must not reinstate a deleted file's sync request.
  */
 static void
 SlruInternalDeleteSegment(SlruCtl ctl, int segno)
 {
 	char		path[MAXPGPATH];
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: old queued writes must precede the local forget request. */
+	if (ctl->sync_handler == SYNC_HANDLER_CLUSTER_SUBTRANS &&
+		AmCheckpointerProcess())
+		AbsorbSyncRequests();
+#endif
 
 	/* Forget any fsync requests queued for this segment. */
 	if (ctl->sync_handler != SYNC_HANDLER_NONE)
