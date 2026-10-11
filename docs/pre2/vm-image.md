@@ -6,6 +6,8 @@ Author: SqlRush <sqlrush@gmail.com>
 
 镜像的公开启动、示例、测速和停止工具统一位于 [`scripts/deploy/pre2/appliance/`](../../scripts/deploy/pre2/appliance/)，全部面向这一台 VM 内的四个数据库实例。交付包根目录已放好这些入口脚本。
 
+启动镜像后，可按 [VM 镜像测试手册](vm-test-guide.md) 用分步 SQL 体验 Cache Fusion、全局锁、一致读和多节点并发提交等集群功能。
+
 ## Mac 最低配置
 
 | 项目 | 本镜像要求 |
