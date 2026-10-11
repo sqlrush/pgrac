@@ -4007,6 +4007,7 @@ test_cluster_subtrans_sync_elevel.inc: $(top_srcdir)/src/backend/storage/file/fd
 # PGRAC: native queue, pending hash and SLRU with forked file writers.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_subtrans_order: test_cluster_subtrans_order.c unit_test.h test_cluster_subtrans_sync_elevel.inc \
+		test_cluster_subtrans_order_fixture.h \
 		$(top_srcdir)/src/backend/access/transam/slru.c \
 		$(top_srcdir)/src/backend/access/transam/subtrans.c \
 		$(top_srcdir)/src/backend/storage/sync/sync.c \

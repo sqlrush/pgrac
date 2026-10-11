@@ -28,11 +28,27 @@ sub save_segments
 
 sub clean_subtrans_logs
 {
-	my ($nodes) = @_;
-	for my $node (@$nodes)
+	my ($nodes, $summary, $phase) = @_;
+	my @checks;
+	for my $i (0 .. $#$nodes)
 	{
+		my $node = $nodes->[$i];
 		my $log = slurp_file($node->logfile);
-		require_true($log !~ /could not fsync file "pg_subtrans\/|(?:ERROR|FATAL|PANIC):/,
+		my $fsync = () = $log =~ /could not fsync file "pg_subtrans\//g;
+		my $errors = () = $log =~ /ERROR:/g;
+		my $fatals = () = $log =~ /FATAL:/g;
+		my $panics = () = $log =~ /PANIC:/g;
+		push @checks, {node => $i, logfile => $node->logfile,
+			fsync_errors => $fsync, errors => $errors, fatals => $fatals,
+			panics => $panics, clean => ($fsync + $errors + $fatals + $panics == 0
+				? JSON::PP::true : JSON::PP::false)};
+	}
+	# Persist every node before any failed assertion ends the scenario.
+	$summary->{sync_checks}{$phase} = \@checks;
+	save_segments($summary);
+	for my $check (@checks)
+	{
+		require_true($check->{clean},
 			'deletion and later sync leave complete node logs clean');
 	}
 }
@@ -115,7 +131,7 @@ run_scenario('pre2_subtrans_stop', [], sub {
 	}
 	# The shutdown checkpoint consumes any old queued SYNC after deletion.
 	$cluster->stop_cluster;
-	clean_subtrans_logs(\@nodes);
+	clean_subtrans_logs(\@nodes, $summary, 'first_stop');
 	$cluster->restart_cluster;
 	for my $node (@nodes)
 	{
@@ -123,5 +139,5 @@ run_scenario('pre2_subtrans_stop', [], sub {
 			'0:1,1:1,2:1,3:1', 'same DATA preserves committed parentage');
 	}
 	$cluster->stop_cluster;
-	clean_subtrans_logs(\@nodes);
+	clean_subtrans_logs(\@nodes, $summary, 'second_stop');
 });
