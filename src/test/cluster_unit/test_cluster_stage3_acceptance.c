@@ -375,14 +375,15 @@ UT_TEST(test_stage3_sqlstate_mvcc_surface_encodable)
 
 /* ===== L5 — CLUSTER_WAIT_EVENTS_COUNT current snapshot 121 ===== */
 
-UT_TEST(test_stage3_wait_events_count_snapshot_123)
+UT_TEST(test_stage3_wait_events_count_snapshot_124)
 {
 	/* spec-4.2 D5 value (95 + 2 wal-state registry I/O).  Update-required contract:  a future spec
 	 * adding a wait event MUST bump this snapshot (it is current state, not
 	 * "==93 forever").  spec-4.6 D4: 97 → 98;  spec-4.7 D1: 98 → 99
 	 * (+ ClusterGCSBlockRecovering);  spec-4.11 D5: 99 → 100
 	 * (+ ClusterThreadRecovery).  spec-6.13 D8 -> 118; spec-5.22b +3; spec-7.2 +2 -> 123. */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 123);
+	/* PGRAC: includes the local startup phase publication wait. */
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 124);
 }
 
 
@@ -471,9 +472,10 @@ main(void)
 	UT_RUN(test_undo_4_8ab_redo_determinism_converges);
 	UT_RUN(test_stage3_capability_dump_category_names);
 	UT_RUN(test_stage3_sqlstate_mvcc_surface_encodable);
-	UT_RUN(test_stage3_wait_events_count_snapshot_123);
+	UT_RUN(test_stage3_wait_events_count_snapshot_124);
 	UT_RUN(test_stage3_tt_enum_values_locked);
 	UT_RUN(test_stage3_retention_active_retains_invariant);
 	UT_RUN(test_stage3_bind_opcode_reserved);
 	UT_DONE();
+	return ut_failed_count ? 1 : 0;
 }

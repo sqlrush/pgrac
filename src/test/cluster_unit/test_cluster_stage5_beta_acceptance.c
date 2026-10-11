@@ -191,7 +191,8 @@ UT_TEST(test_beta_wait_events_count)
 	/* Current Stage 5 beta surface value.  update-required contract: a future
 	 * spec adding cluster wait events MUST bump this snapshot (and the dump/test
 	 * baselines that count them). */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 123);
+	/* PGRAC: includes the local startup phase publication wait. */
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 124);
 }
 
 
@@ -255,4 +256,5 @@ main(void)
 	UT_RUN(test_beta_wait_events_count);
 	UT_RUN(test_beta_seven_rac_core_present);
 	UT_DONE();
+	return ut_failed_count ? 1 : 0;
 }

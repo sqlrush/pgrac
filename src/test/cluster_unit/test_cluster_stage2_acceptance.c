@@ -210,14 +210,15 @@ UT_TEST(test_stage2_fault_inject_point_names)
 
 /* ===== L5 — CLUSTER_WAIT_EVENTS_COUNT current snapshot 121 ===== */
 
-UT_TEST(test_stage2_wait_events_count_snapshot_123)
+UT_TEST(test_stage2_wait_events_count_snapshot_124)
 {
 	/* spec-2.39 D13 ship value.  Future spec adding wait events MUST
 	 * update this snapshot (update-required contract per spec v0.2 F5
 	 * — current state, not "==93 forever").  spec-4.7 D1: 98 → 99
 	 * (+ ClusterGCSBlockRecovering).  spec-4.11 D5: 99 → 100
 	 * (+ ClusterThreadRecovery).  spec-6.13 D8 -> 118; spec-5.22b D2-6 +3 undo-block waits; spec-7.2 D6 +2 LMS data-plane -> 123. */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 123);
+	/* PGRAC: includes the local startup phase publication wait. */
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 124);
 }
 
 
@@ -277,9 +278,10 @@ main(void)
 	UT_RUN(test_stage2_msg_types_cumulative_registration);
 	UT_RUN(test_stage2_capability_counter_symbols_linkable);
 	UT_RUN(test_stage2_fault_inject_point_names);
-	UT_RUN(test_stage2_wait_events_count_snapshot_123);
+	UT_RUN(test_stage2_wait_events_count_snapshot_124);
 	UT_RUN(test_stage2_sqlstate_53r60_through_95_encodable);
 	UT_RUN(test_stage2_guc_enum_snapshot);
 	UT_RUN(test_stage2_ic_msg_reserved_0_sentinel);
 	UT_DONE();
+	return ut_failed_count ? 1 : 0;
 }

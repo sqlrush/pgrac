@@ -202,7 +202,7 @@ UT_TEST(test_new_wait_events_distinct)
 }
 
 
-UT_TEST(test_cluster_wait_events_count_123)
+UT_TEST(test_cluster_wait_events_count_124)
 {
 	/* spec-2.34 D7: 83 → 85 (+ 2 reliability wait events).
 	 * spec-2.36 D8: 85 → 88 (+ 3 CF 3-way wait events).
@@ -213,7 +213,8 @@ UT_TEST(test_cluster_wait_events_count_123)
 	 * spec-4.7 D1: 98 → 99 (+ 1 GCS block RECOVERING short-wait).
 	 * spec-4.11 D5: 99 → 100 (+ 1 online thread recovery short-wait).
 	 * spec-6.13 D8 -> 118; spec-5.22b D2-6 +3 undo-block waits; spec-7.2 D6 +2 LMS data-plane -> 123. */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 123);
+	/* PGRAC: includes the local startup phase publication wait. */
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 124);
 }
 
 
@@ -319,7 +320,7 @@ main(void)
 	UT_RUN(test_retry_total_backoff_default_1500ms);
 	UT_RUN(test_lwtranche_distinct);
 	UT_RUN(test_new_wait_events_distinct);
-	UT_RUN(test_cluster_wait_events_count_123);
+	UT_RUN(test_cluster_wait_events_count_124);
 	UT_RUN(test_dedup_full_status_distinct_from_master_not_holder);
 	UT_RUN(test_block_data_size_equals_blcksz);
 	UT_RUN(test_dedup_entry_collision_field_layout);

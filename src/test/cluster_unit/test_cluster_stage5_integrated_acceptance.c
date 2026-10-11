@@ -192,7 +192,8 @@ UT_TEST(test_stage5_wait_events_count_and_multinode_set)
 	 * authority waits and spec-6.13 adds 2 RDMA tier3 waits.  update-required
 	 * contract: a future spec adding cluster wait events MUST bump this snapshot
 	 * (and the dump/test baselines that count them). */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 123);
+	/* PGRAC: includes the local startup phase publication wait. */
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 124);
 
 	/* The multi-node write-path wait events MG-B aggregates for the M2 share
 	 * must all be present and pairwise distinct (a reorder/removal would change
@@ -235,4 +236,5 @@ main(void)
 	UT_RUN(test_stage5_wait_events_count_and_multinode_set);
 	UT_RUN(test_stage5_heap_itl_wal_delta_width_invariant);
 	UT_DONE();
+	return ut_failed_count ? 1 : 0;
 }
