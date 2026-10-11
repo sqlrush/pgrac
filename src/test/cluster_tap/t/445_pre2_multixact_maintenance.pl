@@ -64,11 +64,23 @@ run_scenario('pre2_multixact_maintenance', [], sub {
 		{
 			my $node = $nodes[$i];
 			my $before = maintenance_counters($node);
+			my $cutoffs_before = sql($node, q{SELECT relfrozenxid::text || '|' || relminmxid::text
+                FROM pg_class WHERE oid='mx_retained'::regclass})
+				if $database eq 'postgres';
 			my $started = time;
-			$node->safe_psql($database,
+			my ($rc, $stdout, $stderr) = $node->psql($database,
 				"\\set VERBOSITY verbose\nSET backtrace_functions='cluster_undo_horizon_read_admission_enforce';\nVACUUM (FREEZE, VERBOSE)",
-				timeout => 60);
+				timeout => 60, on_error_stop => 1);
 			my $elapsed = time - $started;
+			my $prefix = "$ENV{TESTLOGDIR}/vacuum-node$i-$database";
+			for my $stream (['stdout', $stdout], ['stderr', $stderr])
+			{
+				open(my $raw, '>', "$prefix.$stream->[0]") or die $!;
+				print {$raw} $stream->[1];
+				close($raw) or die $!;
+			}
+			diag("VACUUM_RAW node=$i database=$database rc=$rc seconds=$elapsed prefix=$prefix");
+			require_equal($rc, '0', "node$i/$database maintenance completed");
 			my $after = maintenance_counters($node);
 			my $forks = $after->{'visibility.vis_update_fork_count'} - $before->{'visibility.vis_update_fork_count'};
 			my $refusals = $after->{'undo.horizon_admission_refuse_count'} - $before->{'undo.horizon_admission_refuse_count'};
@@ -78,6 +90,22 @@ run_scenario('pre2_multixact_maintenance', [], sub {
 			require_equal($refusals, '0', "node$i/$database no maintenance admission refusal");
 			require_true($forks > 0, 'foreign maintenance used the update fork')
 				if $database eq 'template0' && $i == 1;
+			if ($database eq 'postgres')
+			{
+				my ($pages, $tuples) = (0, 0);
+				while ($stderr =~ /shared MultiXact references retained: (\d+) pages, (\d+) tuples;/g)
+				{
+					$pages += $1;
+					$tuples += $2;
+				}
+				require_true($pages > 0 && $tuples > 0,
+					"node$i explicitly reported retained shared MX references");
+				my $cutoffs_after = sql($node, q{SELECT relfrozenxid::text || '|' || relminmxid::text
+                    FROM pg_class WHERE oid='mx_retained'::regclass});
+				require_equal($cutoffs_after, $cutoffs_before,
+					"node$i kept both catalog cutoffs for unexamined members");
+				diag("MX_RETAINED node=$i pages=$pages tuples=$tuples cutoffs=$cutoffs_after");
+			}
 		}
 	}
 	sql($nodes[0], 'ALTER DATABASE template0 ALLOW_CONNECTIONS false');

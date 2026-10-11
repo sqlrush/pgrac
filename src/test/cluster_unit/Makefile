@@ -53,7 +53,7 @@ CLUSTER_UNIT_CRYPTOHASH_O = $(top_builddir)/src/common/cryptohash.o \
 endif
 
 # Test source files (each becomes a standalone executable)
-TESTS = test_cluster_heap_cr_reuse test_cluster_buffer_cr test_cluster_buffer_mapping test_cluster_pi_contribution_stream test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_formation_restart test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
+TESTS = test_cluster_vacuum_shared_mx test_cluster_heap_cr_reuse test_cluster_buffer_cr test_cluster_buffer_mapping test_cluster_pi_contribution_stream test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_formation_restart test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
         test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_catalog_manifest test_cluster_catalog_init test_cluster_catalog_startup test_cluster_initdb_tree test_cluster_initdb_cohort \
         test_pgrac_control_binding test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker test_pgrac_fenced_cib \
         test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter \
@@ -565,6 +565,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_thread_replay_pi,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_startup_exit,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_members,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_mount,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_vacuum_shared_mx,$(SIMPLE_TESTS))
 
 # PGRAC: real native-family mount carrier, with process lifecycle boundaries.
 # Author: SqlRush <sqlrush@gmail.com>
@@ -8495,7 +8496,18 @@ test_cluster_snapshot_admission_refresh.inc: $(top_srcdir)/src/backend/storage/i
 		emit { print } emit && /^}$$/ { done=1; exit } \
 		END { if (!done) exit 1 }' $< > $@
 
+# PGRAC: extract the actual maintenance entry and its optional internal body.
+test_cluster_snapshot_admission_vacuum.inc: $(top_srcdir)/src/backend/commands/vacuum.c Makefile
+	@awk '/^vac_update_datfrozenxid(_internal)?\(void\)$$/ { \
+		internal = ($$0 ~ /_internal/); count++; emit=1; \
+		body = body (internal ? "static void\n" : "void\n"); has_internal += internal } \
+		emit { body = body $$0 "\n" } emit && /^}$$/ { emit=0 } \
+		END { if (emit || count < 1 || count > 2) exit 1; \
+		if (has_internal) print "static void vac_update_datfrozenxid_internal(void);"; \
+		printf "%s", body }' $< > $@
+
 test_cluster_snapshot_admission: test_cluster_snapshot_admission.c unit_test.h \
+		$(srcdir)/test_cluster_snapshot_vacuum_fixture.inc test_cluster_snapshot_admission_vacuum.inc \
 		test_cluster_snapshot_admission_horizon.inc test_cluster_snapshot_admission_refresh.inc \
 		$(top_srcdir)/src/backend/utils/time/snapmgr.c $(top_srcdir)/src/include/utils/snapmgr.h \
 		$(top_builddir)/src/backend/lib/pairingheap.o
@@ -8958,3 +8970,11 @@ test_cluster_heap_cr_reuse_scratch.inc: $(top_srcdir)/src/backend/access/heap/he
 	awk '/^(heap_hot_r4_scratch_page_valid|heap_hot_r4_search_scratch)\(/ { print "static bool"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+
+# PGRAC: execute the real two-branch VACUUM scan and cutoff publication.
+test_cluster_vacuum_shared_mx.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c $(srcdir)/extract_vacuum_mx_fixture.py Makefile
+	python3 $(srcdir)/extract_vacuum_mx_fixture.py $< > $@
+
+test_cluster_vacuum_shared_mx: test_cluster_vacuum_shared_mx.c unit_test.h \
+		$(srcdir)/cluster_vacuum_mx_test_stubs.h test_cluster_vacuum_shared_mx.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@

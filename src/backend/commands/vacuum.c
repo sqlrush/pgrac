@@ -19,6 +19,11 @@
  * IDENTIFICATION
  *	  src/backend/commands/vacuum.c
  *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *	  - Validate shared heap freeze boundaries using cluster_heap_horizon.
+ *	  - Retain a transaction snapshot during shared database maintenance.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -63,7 +68,9 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_heap_horizon.h"
+#include "cluster/cluster_mode.h"
 #endif
 
 
@@ -113,6 +120,7 @@ int			VacuumCostBalanceLocal = 0;
 static List *expand_vacuum_rel(VacuumRelation *vrel,
 							   MemoryContext vac_context, int options);
 static List *get_all_vacuum_rels(MemoryContext vac_context, int options);
+static void vac_update_datfrozenxid_internal(void);
 static void vac_truncate_clog(TransactionId frozenXID,
 							  MultiXactId minMulti,
 							  TransactionId lastSaneFrozenXid,
@@ -1624,9 +1632,45 @@ vac_update_relstats(Relation relation,
  *		safe since the new values are correct whether or not this transaction
  *		commits.  As with vac_update_relstats, this avoids leaving dead tuples
  *		behind after a VACUUM.
+ *
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: retain an owned ActiveSnapshot across database maintenance.
+ * Why: shared catalogue in-place updates require live historical-read proof.
  */
 void
 vac_update_datfrozenxid(void)
+{
+#ifdef USE_PGRAC_CLUSTER
+	Snapshot	owned = NULL;
+
+	/* PGRAC: acquire retention before entering the original lock sequence. */
+	if (cluster_storage_mode_enabled() && cluster_shared_catalog &&
+		!ActiveSnapshotSet())
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		owned = GetActiveSnapshot();
+	}
+#endif
+
+	vac_update_datfrozenxid_internal();
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: errors use transaction abort; normal return releases only ours. */
+	if (owned != NULL)
+	{
+		if (!ActiveSnapshotSet() || GetActiveSnapshot() != owned)
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("database maintenance snapshot is not active"),
+					 errhint("Preserve the server log and retry in a new transaction.")));
+		PopActiveSnapshot();
+	}
+#endif
+}
+
+/* PGRAC: retain the original maintenance decisions and conservative returns. */
+static void
+vac_update_datfrozenxid_internal(void)
 {
 	HeapTuple	tuple;
 	Form_pg_database dbform;

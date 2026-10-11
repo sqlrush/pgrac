@@ -28,6 +28,13 @@
  * IDENTIFICATION
  *	  src/backend/access/heap/vacuumlazy.c
  *
+ * PGRAC MODIFICATIONS
+ *    Modified by: SqlRush <sqlrush@gmail.com>
+ *    Retain shared relation version identity during native maintenance and
+ *    preserve peer MultiXact pages and freeze cutoffs until their references
+ *    can be maintained safely. See spec-3.6b-multixact-current-dml.md and
+ *    2026-10-11-pre2-p0-m5-f-multixact-am01.md.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -69,6 +76,7 @@
 /* PGRAC: native maintenance retains pre-lock relation version identity. */
 #include "catalog/pg_control.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_mode.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/storage/cluster_smgr.h"
 #endif
@@ -155,6 +163,8 @@ typedef struct LVRelState
 #ifdef USE_PGRAC_CLUSTER
 	bool		versioned;
 	ClusterSpaceIdentity identity;
+	BlockNumber shared_mx_deferred_pages;
+	int64		shared_mx_deferred_tuples;
 #endif
 
 	/* Buffer access strategy and parallel vacuum state */
@@ -253,6 +263,9 @@ typedef struct LVSavedErrInfo
 
 /* non-export function prototypes */
 static void lazy_scan_heap(LVRelState *vacrel);
+#ifdef USE_PGRAC_CLUSTER
+static bool lazy_scan_shared_mx(LVRelState *vacrel, Page page, BlockNumber blkno);
+#endif
 static BlockNumber lazy_scan_skip(LVRelState *vacrel, Buffer *vmbuffer,
 								  BlockNumber next_block,
 								  bool *next_unskippable_allvis,
@@ -310,6 +323,11 @@ static void restore_vacuum_error_info(LVRelState *vacrel,
  *
  *		At entry, we have already established a transaction and opened
  *		and locked the relation.
+ *
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: Retained peer MX pages suppress both freeze cutoffs and are
+ * reported by the common instrumentation path.
+ * Why: Unexamined references cannot authorize removal of their history.
  */
 void
 heap_vacuum_rel(Relation rel, VacuumParams *params,
@@ -569,6 +587,15 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 		   MultiXactIdPrecedesOrEquals(vacrel->aggressive ? vacrel->cutoffs.MultiXactCutoff :
 									   vacrel->cutoffs.relminmxid,
 									   vacrel->NewRelminMxid));
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: unexamined members cannot authorize either freeze cutoff. */
+	if (vacrel->shared_mx_deferred_pages > 0)
+	{
+		vacrel->NewRelfrozenXid = InvalidTransactionId;
+		vacrel->NewRelminMxid = InvalidMultiXactId;
+	}
+	else
+#endif
 	if (vacrel->skippedallvis)
 	{
 		/*
@@ -689,6 +716,14 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 							 (long long) vacrel->tuples_deleted,
 							 (long long) vacrel->new_rel_tuples,
 							 (long long) vacrel->recently_dead_tuples);
+#ifdef USE_PGRAC_CLUSTER
+			/* PGRAC: report retention in manual and automatic VACUUM logs. */
+			if (vacrel->shared_mx_deferred_pages > 0)
+				appendStringInfo(&buf,
+					_("shared MultiXact references retained: %u pages, %lld tuples; relfrozenxid and relminmxid not advanced\n"),
+					vacrel->shared_mx_deferred_pages,
+					(long long) vacrel->shared_mx_deferred_tuples);
+#endif
 			if (vacrel->missed_dead_tuples > 0)
 				appendStringInfo(&buf,
 								 _("tuples missed: %lld dead from %u pages not removed due to cleanup lock contention\n"),
@@ -879,6 +914,11 @@ lazy_clear_visibility_versioned(Relation rel, const ClusterSpaceIdentity *identi
  *		However, we process indexes in full every time lazy_vacuum is called,
  *		which makes index processing very inefficient when memory is in short
  *		supply.
+ *
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: Both lock branches preserve peer MX pages before native
+ * pruning or member enumeration.
+ * Why: Cleanup locking does not provide remote member authority.
  */
 
 static void
@@ -1032,6 +1072,15 @@ lazy_scan_heap(LVRelState *vacrel)
 				continue;
 			}
 
+#ifdef USE_PGRAC_CLUSTER
+			/* PGRAC: retain references before native member enumeration. */
+			if (lazy_scan_shared_mx(vacrel, page, blkno))
+			{
+				UnlockReleaseBuffer(buf);
+				continue;
+			}
+#endif
+
 			/* Collect LP_DEAD items in dead_items array, count tuples */
 			if (lazy_scan_noprune(vacrel, buf, blkno, page, &hastup,
 								  &recordfreespace))
@@ -1069,6 +1118,15 @@ lazy_scan_heap(LVRelState *vacrel)
 			/* Processed as new/empty page (lock and pin released) */
 			continue;
 		}
+
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: cleanup ownership does not prove peer member state. */
+		if (lazy_scan_shared_mx(vacrel, page, blkno))
+		{
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+#endif
 
 		/*
 		 * Prune, freeze, and count tuples.
@@ -1359,6 +1417,47 @@ lazy_scan_heap(LVRelState *vacrel)
 	if (vacrel->nindexes > 0 && vacrel->do_index_cleanup)
 		lazy_cleanup_all_indexes(vacrel);
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * Preserve a peer MX page while holding its original share or cleanup lock.
+ * The physical tuple count follows the shared maintenance KEEP convention;
+ * it does not assert transaction visibility or release any reference.
+ */
+static bool
+lazy_scan_shared_mx(LVRelState *vacrel, Page page, BlockNumber blkno)
+{
+	OffsetNumber maxoff;
+	int64		tuples = 0;
+	bool		has_multi = false;
+
+	if (!vacrel->versioned || !cluster_peer_mode_enabled())
+		return false;
+
+	maxoff = PageGetMaxOffsetNumber(page);
+	for (OffsetNumber offnum = FirstOffsetNumber; offnum <= maxoff;
+		 offnum = OffsetNumberNext(offnum))
+	{
+		ItemId		item = PageGetItemId(page, offnum);
+		HeapTupleHeader tuple;
+
+		if (!ItemIdIsNormal(item))
+			continue;
+		tuple = (HeapTupleHeader) PageGetItem(page, item);
+		tuples++;
+		if (tuple->t_infomask & HEAP_XMAX_IS_MULTI)
+			has_multi = true;
+	}
+	if (!has_multi)
+		return false;
+
+	vacrel->shared_mx_deferred_pages++;
+	vacrel->shared_mx_deferred_tuples += tuples;
+	vacrel->live_tuples += tuples;
+	vacrel->nonempty_pages = blkno + 1;
+	return true;
+}
+#endif
 
 /*
  *	lazy_scan_skip() -- set up range of skippable blocks using visibility map.

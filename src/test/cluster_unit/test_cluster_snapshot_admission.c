@@ -725,6 +725,9 @@ UT_TEST(cr_identity_restore_and_snapshot_refresh_start_new_lifetimes)
 	UnregisterSnapshot(a);
 }
 
+/* PGRAC: catalogue I/O leaves around the real maintenance entry and snapshots. */
+#include "test_cluster_snapshot_vacuum_fixture.inc"
+
 int
 main(void)
 {
@@ -735,7 +738,7 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(20);
+	UT_PLAN(29);
 	UT_RUN(registered_catalog_is_live_without_becoming_active);
 	UT_RUN(evaluated_registered_snapshot_overrides_an_unrelated_active_snapshot);
 	UT_RUN(forged_reference_counts_do_not_establish_liveness);
@@ -756,6 +759,15 @@ main(void)
 	UT_RUN(cr_identity_exhaustion_does_not_wrap_or_erase_existing_identity);
 	UT_RUN(cr_identity_shmem_attach_preserves_the_allocator);
 	UT_RUN(cr_identity_restore_and_snapshot_refresh_start_new_lifetimes);
+	UT_RUN(vacuum_foreign_terminal_read_has_owned_snapshot);
+	UT_RUN(vacuum_registered_only_is_not_terminal_admission);
+	UT_RUN(vacuum_early_and_clean_returns_balance_ownership);
+	UT_RUN(vacuum_borrowed_snapshot_keeps_identity);
+	UT_RUN(vacuum_errors_use_original_abort_cleanup);
+	UT_RUN(vacuum_misplaced_owned_snapshot_is_runtime_error);
+	UT_RUN(vacuum_nontarget_modes_keep_original_body);
+	UT_RUN(vacuum_direct_worker_entry_needs_no_table_snapshot);
+	UT_RUN(vacuum_stale_borrowed_snapshot_is_not_refreshed);
 	UT_ASSERT_EQ(remembered, 0);
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	UT_ASSERT(!ActiveSnapshotSet());
