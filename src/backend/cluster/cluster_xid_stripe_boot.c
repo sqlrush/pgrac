@@ -59,6 +59,7 @@
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/lwlock.h"
+#include "storage/proc.h"
 #include "storage/condition_variable.h"
 #include "storage/pmsignal.h"
 #include "storage/shmem.h"
@@ -1609,7 +1610,12 @@ cluster_xid_stripe_disk_state(void)
 	if (StripeBootShmem == NULL)
 		return CLUSTER_XID_STRIPE_DISK_UNKNOWN;
 
-	LWLockAcquire(&StripeBootShmem->lock, LW_SHARED);
+	/* PGRAC: a busy publication is unknown to callers without a PGPROC. */
+	if (MyProc == NULL) {
+		if (!LWLockConditionalAcquire(&StripeBootShmem->lock, LW_SHARED))
+			return CLUSTER_XID_STRIPE_DISK_UNKNOWN;
+	} else
+		LWLockAcquire(&StripeBootShmem->lock, LW_SHARED);
 	state = StripeBootShmem->disk_state;
 	LWLockRelease(&StripeBootShmem->lock);
 	return (ClusterXidStripeDiskState)state;

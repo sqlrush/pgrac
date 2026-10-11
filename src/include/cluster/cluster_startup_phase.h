@@ -250,8 +250,8 @@ extern void cluster_phase_history_format(char *buf, size_t size);
  *	cluster_phase_started_at, cluster_phase_elapsed_seconds,
  *	cluster_phase_history_format).
  *
- *	LWLock LWTRANCHE_CLUSTER_STARTUP_PHASE guards the struct.
- *	cluster_advance_phase takes LW_EXCLUSIVE; readers take LW_SHARED.
+ *	PGRAC: the postmaster publishes phase payload under a change counter.
+ *	The LWLock continues to protect the independent authority binding.
  * ============================================================ */
 
 typedef struct PhaseHistoryEntry {
@@ -269,8 +269,9 @@ typedef enum ClusterAuthorityReadiness {
 } ClusterAuthorityReadiness;
 
 typedef struct ClusterPhaseSharedState {
-	LWLock lwlock;					/* LWTRANCHE_CLUSTER_STARTUP_PHASE */
-	pg_atomic_uint32 current_phase; /* AD-023 A1: lock-free reads */
+	LWLock lwlock;						 /* LWTRANCHE_CLUSTER_STARTUP_PHASE */
+	pg_atomic_uint32 current_phase;		 /* single-word lock-free reads */
+	pg_atomic_uint32 phase_change_count; /* PGRAC: sole postmaster writer */
 	TimestampTz phase_start_times[CLUSTER_PHASE_LAST + 1];
 	PhaseHistoryEntry phase_history[CLUSTER_PHASE_HISTORY_RING_SIZE];
 	int phase_history_count; /* total entries ever written (lifetime) */

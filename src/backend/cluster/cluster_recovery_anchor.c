@@ -1208,13 +1208,21 @@ checkpoint_phase4_publisher_is_current(uint64 self_incarnation)
 		|| !cluster_cf_held_is_clusterwide(ExclusiveLock))
 		return false;
 
+	/* PGRAC: a contended snapshot can yield while its sole writer advances.
+	 * Recheck the original publisher before admitting this checkpoint. */
+	phase4_started_at = cluster_phase_started_at(CLUSTER_PHASE_4_NORMAL);
+	if (cluster_current_phase() != CLUSTER_PHASE_4_NORMAL
+		|| cluster_qvotec_get_self_incarnation() != self_incarnation
+		|| cluster_stats_status() != CLUSTER_STATS_SPAWNING
+		|| !cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return false;
+
 	own_thread = cluster_wal_thread_id();
 	if (own_thread < XLP_THREAD_ID_FIRST_REAL || own_thread > CLUSTER_WAL_THREAD_MAX
 		|| !cluster_wal_thread_dir_configured() || !cluster_wal_thread_dir_validated()
 		|| cluster_wal_thread_dump_thread_id() != own_thread || !cluster_wal_state_registry_ready())
 		return false;
 
-	phase4_started_at = cluster_phase_started_at(CLUSTER_PHASE_4_NORMAL);
 	stats_spawned_at = cluster_stats_spawned_at();
 	if (phase4_started_at == 0 || stats_spawned_at == 0 || stats_spawned_at < phase4_started_at)
 		return false;

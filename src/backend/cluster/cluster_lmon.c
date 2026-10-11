@@ -201,6 +201,7 @@ cluster_lmon_shmem_init(void)
 	if (!found) {
 		memset(cluster_lmon_state, 0, sizeof(*cluster_lmon_state));
 		LWLockInitialize(&cluster_lmon_state->lwlock, LWTRANCHE_CLUSTER_LMON);
+		pg_atomic_init_u32(&cluster_lmon_state->reconfig_suppressed, 0);
 		cluster_lmon_state->status = CLUSTER_LMON_NOT_STARTED;
 		pg_atomic_init_u32(&cluster_lmon_state->lazy_duty_dirty, 0);
 		pg_atomic_init_u64(&cluster_lmon_state->diagnostic_duty_started_mono_us, 0);
@@ -620,11 +621,14 @@ cluster_lmon_wait_for_ready(int timeout_ms)
 	 * 100ms granularity is limiting.
 	 */
 	while (waited_ms < timeout_ms) {
-		ClusterLmonStatus status;
+		ClusterLmonStatus status = CLUSTER_LMON_NOT_STARTED;
+		int sleep_ms = Min(poll_interval_ms, timeout_ms - waited_ms);
 
-		LWLockAcquire(&cluster_lmon_state->lwlock, LW_SHARED);
-		status = cluster_lmon_state->status;
-		LWLockRelease(&cluster_lmon_state->lwlock);
+		/* PGRAC: the postmaster cannot join a backend lock queue. */
+		if (LWLockConditionalAcquire(&cluster_lmon_state->lwlock, LW_SHARED)) {
+			status = cluster_lmon_state->status;
+			LWLockRelease(&cluster_lmon_state->lwlock);
+		}
 
 		if (status == CLUSTER_LMON_READY)
 			return true;
@@ -637,30 +641,17 @@ cluster_lmon_wait_for_ready(int timeout_ms)
 		if (status == CLUSTER_LMON_SHUTTING_DOWN || status == CLUSTER_LMON_EXITED)
 			return false;
 
-		pg_usleep(poll_interval_ms * 1000L);
-		waited_ms += poll_interval_ms;
+		pg_usleep(sleep_ms * 1000L);
+		waited_ms += sleep_ms;
 	}
 
 	return false;
 }
 
 
-void
-cluster_lmon_request_shutdown(void)
-{
-	Assert(!IsUnderPostmaster);
-
-	if (cluster_lmon_state == NULL)
-		return;
-
-	LWLockAcquire(&cluster_lmon_state->lwlock, LW_EXCLUSIVE);
-	cluster_lmon_state->shutdown_requested = true;
-	LWLockRelease(&cluster_lmon_state->lwlock);
-}
-
 /*
  * RF-ROOT P6: postmaster-only "stop publishing reconfig, keep serving".
- * Unlike request_shutdown this does NOT make the LMON main loop exit; the
+ * This intent does NOT make the LMON main loop exit; the
  * retained coordination stack must stay live through the shutdown checkpoint
  * so the checkpointer can still take CF X.
  */
@@ -672,16 +663,12 @@ cluster_lmon_suppress_reconfig(void)
 	if (cluster_lmon_state == NULL)
 		return;
 
-	LWLockAcquire(&cluster_lmon_state->lwlock, LW_EXCLUSIVE);
-	cluster_lmon_state->reconfig_suppressed = true;
-	LWLockRelease(&cluster_lmon_state->lwlock);
+	pg_atomic_write_u32(&cluster_lmon_state->reconfig_suppressed, 1);
 }
 
 bool
 cluster_lmon_reconfig_suppressed(void)
 {
-	bool suppressed;
-
 	/* Current normal-stop intent is atomic and does not make postmaster
 	 * take a backend lock. The original LMON owner still validates every
 	 * identity and responsibility before granting a checkpoint cut. */
@@ -689,10 +676,7 @@ cluster_lmon_reconfig_suppressed(void)
 		return true;
 	if (cluster_lmon_state == NULL)
 		return false;
-	LWLockAcquire(&cluster_lmon_state->lwlock, LW_SHARED);
-	suppressed = cluster_lmon_state->reconfig_suppressed;
-	LWLockRelease(&cluster_lmon_state->lwlock);
-	return suppressed;
+	return pg_atomic_read_u32(&cluster_lmon_state->reconfig_suppressed) != 0;
 }
 
 

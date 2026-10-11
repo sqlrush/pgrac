@@ -381,11 +381,6 @@ extern int cluster_lms_start(void);
 extern bool cluster_lms_wait_for_ready(int timeout_ms);
 
 /*
- * Postmaster shutdown signal.  Idempotent.  Asserts !IsUnderPostmaster.
- */
-extern void cluster_lms_request_shutdown(void);
-
-/*
  * LMS main entry — invoked from auxprocess.c dispatch.  Asserts
  * IsUnderPostmaster (reverse defense in depth).  Never returns.
  */

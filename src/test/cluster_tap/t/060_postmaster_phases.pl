@@ -107,6 +107,17 @@ is($node->safe_psql(
 	'L2 pg_cluster_state.phase keys are exactly the 5 spec-1.10 names');
 
 
+# PGRAC: repeated public reads observe one complete six-entry startup history.
+# This also exercises the snapshot reader in real backend processes.
+for my $sample (1 .. 3)
+{
+    is($node->safe_psql('postgres', q{
+        SELECT array_length(string_to_array(value, ','), 1)
+        FROM pg_cluster_state WHERE category = 'phase' AND key = 'phase_history'
+    }), '6', "phase history sample $sample contains each startup transition once");
+}
+
+
 # ----------
 # L3: cluster.phase{1..4}_timeout GUC defaults.
 # ----------
@@ -155,13 +166,13 @@ is( $node->safe_psql(
 
 
 # ----------
-# L6: wait events ClusterStartupPhase{0..4}Wait registered.
+# L6: the five phase waits and the local publication wait are registered.
 # ----------
 is( $node->safe_psql(
 		'postgres',
 		"SELECT count(*) FROM pg_stat_cluster_wait_events WHERE name LIKE 'ClusterStartupPhase%Wait'"
 	),
-	'5', 'L6 5 ClusterStartupPhase wait events registered');
+	'6', 'L6 6 ClusterStartupPhase wait events registered');
 
 
 # ----------

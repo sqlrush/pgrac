@@ -268,10 +268,20 @@ UT_TEST(test_cross_category_jump_is_one_class_step)
 }
 
 
+/* PGRAC: the new local publication wait must keep the original class values. */
+UT_TEST(test_phase_publication_wait_is_appended_to_its_own_class)
+{
+	UT_ASSERT_EQ((uint32)WAIT_EVENT_CLUSTER_STARTUP_PHASE_4, PG_WAIT_CLUSTER_STARTUP_PHASE | 4);
+	UT_ASSERT_EQ((uint32)WAIT_EVENT_CLUSTER_STARTUP_PHASE_PUBLISH,
+				 PG_WAIT_CLUSTER_STARTUP_PHASE | 5);
+	UT_ASSERT_EQ((uint32)WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP, PG_WAIT_CLUSTER_BGPROC);
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
+	UT_RUN(test_phase_publication_wait_is_appended_to_its_own_class);
 	UT_RUN(test_class_ids_match_design_doc);
 	UT_RUN(test_class_ids_pairwise_distinct);
 	UT_RUN(test_no_collision_with_pg_native_classes);

@@ -106,6 +106,15 @@
 #endif
 
 
+#if defined(USE_PGRAC_CLUSTER) && defined(USE_ASSERT_CHECKING)
+/* PGRAC: initialization and exit callbacks retain their original locking. */
+bool PostmasterLWLockWaitForbidden = false;
+#define AssertPostmasterLWLockMayWait() \
+	Assert(!(PostmasterLWLockWaitForbidden && !IsUnderPostmaster && MyProc == NULL))
+#else
+#define AssertPostmasterLWLockMayWait() ((void)0)
+#endif
+
 /* We use the ShmemLock spinlock to protect LWLockCounter */
 extern slock_t *ShmemLock;
 
@@ -1246,6 +1255,8 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 
 	Assert(mode == LW_SHARED || mode == LW_EXCLUSIVE);
 
+	AssertPostmasterLWLockMayWait();
+
 	PRINT_LWDEBUG("LWLockAcquire", lock, mode);
 
 #ifdef LWLOCK_STATS
@@ -1467,6 +1478,8 @@ LWLockAcquireOrWait(LWLock *lock, LWLockMode mode)
 
 	Assert(mode == LW_SHARED || mode == LW_EXCLUSIVE);
 
+	AssertPostmasterLWLockMayWait();
+
 	PRINT_LWDEBUG("LWLockAcquireOrWait", lock, mode);
 
 	/* Ensure we will have room to remember the lock */
@@ -1638,6 +1651,8 @@ LWLockWaitForVar(LWLock *lock, uint64 *valptr, uint64 oldval, uint64 *newval)
 
 	lwstats = get_lwlock_stats_entry(lock);
 #endif
+
+	AssertPostmasterLWLockMayWait();
 
 	PRINT_LWDEBUG("LWLockWaitForVar", lock, LW_WAIT_UNTIL_FREE);
 

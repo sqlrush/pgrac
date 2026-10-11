@@ -116,6 +116,16 @@ is($node->safe_psql('postgres', 'SELECT 1'), '1',
 	'server healthy after pg_stat_activity exercise');
 
 
+# PGRAC: the local phase-publication wait is catalogued without renumbering
+# the existing phase waits or treating it as a checkpointer/network wait.
+is($node->safe_psql('postgres', q{
+    SELECT type || ':' || name
+    FROM pg_stat_cluster_wait_events
+    WHERE name = 'ClusterStartupPhasePublishWait'
+}), 'Cluster: StartupPhase:ClusterStartupPhasePublishWait',
+   'local phase-publication wait is registered with its own class');
+
+
 $node->stop;
 
 done_testing();

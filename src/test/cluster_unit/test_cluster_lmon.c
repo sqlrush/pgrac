@@ -352,6 +352,7 @@ format_elog_string(const char *f pg_attribute_unused(), ...)
 static bool test_lwlock_conditional_result = true;
 static int test_lwlock_blocking_calls = 0;
 static int test_lwlock_conditional_calls = 0;
+static long ready_sleep_us;
 
 void
 LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute_unused())
@@ -1117,8 +1118,10 @@ ProcessInterrupts(void)
 {}
 
 void
-pg_usleep(long microsec pg_attribute_unused())
-{}
+pg_usleep(long microsec)
+{
+	ready_sleep_us += microsec;
+}
 
 /* Sprint B: Latch / WaitLatch / ResetLatch stubs (LmonMain runtime
  * is not invoked at unit-test level). */
@@ -1385,7 +1388,6 @@ UT_TEST(test_lmon_public_symbols_linkable)
 {
 	UT_ASSERT_NOT_NULL((void *)cluster_lmon_start);
 	UT_ASSERT_NOT_NULL((void *)cluster_lmon_wait_for_ready);
-	UT_ASSERT_NOT_NULL((void *)cluster_lmon_request_shutdown);
 	UT_ASSERT_NOT_NULL((void *)cluster_lmon_status);
 	UT_ASSERT_NOT_NULL((void *)cluster_lmon_status_to_string);
 	UT_ASSERT_NOT_NULL((void *)cluster_lmon_shmem_size);
@@ -2285,15 +2287,15 @@ UT_TEST(test_stop_suppression_reads_request_without_pm_lock_or_identity)
 	cl_normal_stop = &test_stop_region.normal_stop;
 	pg_atomic_init_u32(&cl_normal_stop->requested, 1);
 	test_lwlock_blocking_calls = test_lwlock_conditional_calls = 0;
-	test_lmon_state.reconfig_suppressed = false;
+	pg_atomic_write_u32(&test_lmon_state.reconfig_suppressed, 0);
 	MyProc = NULL;
 	UT_ASSERT(cluster_lmon_reconfig_suppressed());
 	UT_ASSERT_EQ(test_lwlock_blocking_calls, 0);
 	UT_ASSERT_EQ(test_lwlock_conditional_calls, 0);
-	UT_ASSERT(!test_lmon_state.reconfig_suppressed);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&test_lmon_state.reconfig_suppressed), 0);
 	pg_atomic_write_u32(&cl_normal_stop->requested, 0);
 	UT_ASSERT(!cluster_lmon_reconfig_suppressed());
-	UT_ASSERT_EQ(test_lwlock_blocking_calls, 1); /* unchanged legacy getter */
+	UT_ASSERT_EQ(test_lwlock_blocking_calls, 0); /* both stop branches remain nonblocking */
 	cl_normal_stop = NULL;
 }
 
@@ -2512,10 +2514,35 @@ UT_TEST(test_normal_stop_control_diagnostic_does_not_change_ready)
 	cl_normal_stop = NULL; /* Do not leak this stop into later non-stop duties. */
 }
 
+/* PGRAC: neither a busy READY observation nor a stop intent queues the PM. */
+UT_TEST(test_postmaster_ready_busy_and_suppression_are_nonblocking)
+{
+	test_lmon_shmem_found = false;
+	cluster_lmon_shmem_init();
+	test_lmon_state.status = CLUSTER_LMON_READY;
+	IsUnderPostmaster = false;
+	test_lwlock_conditional_result = false;
+	test_lwlock_blocking_calls = 0;
+	ready_sleep_us = 0;
+	UT_ASSERT(!cluster_lmon_wait_for_ready(37));
+	UT_ASSERT_EQ(test_lwlock_blocking_calls, 0);
+	UT_ASSERT_EQ(ready_sleep_us, 37000);
+	cluster_lmon_suppress_reconfig();
+	UT_ASSERT(cluster_lmon_reconfig_suppressed());
+	UT_ASSERT_EQ(test_lwlock_blocking_calls, 0);
+	UT_ASSERT_EQ(test_lmon_state.status, CLUSTER_LMON_READY);
+	cluster_lmon_shmem_init(); /* Existing attach cannot clear the one-way intent. */
+	UT_ASSERT(cluster_lmon_reconfig_suppressed());
+	test_lwlock_conditional_result = true;
+	UT_ASSERT(cluster_lmon_wait_for_ready(37));
+	test_lmon_shmem_found = false;
+	cluster_lmon_shmem_init();
+}
+
 int
 main(void)
 {
-	UT_PLAN(44);
+	UT_PLAN(45);
 	UT_RUN(test_lmon_status_enum_values_frozen);
 	UT_RUN(test_lmon_shared_state_size_under_4kb);
 	UT_RUN(test_lmon_status_to_string_lookup);
@@ -2560,6 +2587,7 @@ main(void)
 	UT_RUN(test_online_late_publication_keeps_existing_drain_schedule);
 	UT_RUN(test_stop_drains_dispatch_created_work_before_post_dispatch_idle);
 	UT_RUN(test_stop_control_debt_survives_until_service_completion);
+	UT_RUN(test_postmaster_ready_busy_and_suppression_are_nonblocking);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

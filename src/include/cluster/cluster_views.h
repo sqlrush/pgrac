@@ -50,9 +50,7 @@
  *	Anchored as a compile-time constant so unit tests can verify the
  *	internal table in cluster_views.c stays in sync with the enum.
  */
-#define CLUSTER_WAIT_EVENTS_COUNT                                                                  \
-	123 /* spec-6.13 D8 RDMA included; spec-5.22b D2-6 +3 undo-block grant-plane; \
-		 * spec-7.2 D6 +2 LMS data-plane (merge-window sum: 118 + 3 + 2) */
+#define CLUSTER_WAIT_EVENTS_COUNT 124 /* Includes the local phase-publication wait. */
 
 
 /*

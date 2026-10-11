@@ -6669,7 +6669,17 @@ cluster_postmaster_start_lms(void)
 {
 	Assert(!IsUnderPostmaster);
 
-	LmsPID = StartLms();
+	/* PGRAC: the original roster owns this child until reaped. */
+	if (LmsPID == 0)
+		LmsPID = StartLms();
+	return LmsPID;
+}
+
+/* PGRAC: process-local roster identity, not a service-readiness proof. */
+pid_t
+cluster_postmaster_lms_pid(void)
+{
+	Assert(!IsUnderPostmaster);
 	return LmsPID;
 }
 

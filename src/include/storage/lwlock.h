@@ -132,6 +132,11 @@ extern PGDLLIMPORT bool Trace_lwlocks;
 #endif
 
 extern bool LWLockAcquire(LWLock *lock, LWLockMode mode);
+#if defined(USE_PGRAC_CLUSTER) && defined(USE_ASSERT_CHECKING)
+/* PGRAC: only the postmaster's child-service lifetime forbids waiting entries. */
+extern PGDLLIMPORT bool PostmasterLWLockWaitForbidden;
+#endif
+
 extern bool LWLockConditionalAcquire(LWLock *lock, LWLockMode mode);
 extern bool LWLockAcquireOrWait(LWLock *lock, LWLockMode mode);
 extern void LWLockRelease(LWLock *lock);

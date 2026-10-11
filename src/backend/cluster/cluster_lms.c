@@ -485,11 +485,14 @@ cluster_lms_start(void)
 		 * POSTMASTER GUC is off.  Mark DISABLED so SQL/debug surfaces can
 		 * distinguish intentional opt-out from "not started yet".
 		 */
-		if (cluster_lms_state != NULL) {
-			LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);
+		/* PGRAC: disabled is only a pre-spawn state, never child retirement. */
+		if (cluster_postmaster_lms_pid() != 0
+			|| (cluster_lms_state != NULL && lms_get_state() != CLUSTER_LMS_NOT_STARTED
+				&& lms_get_state() != CLUSTER_LMS_DISABLED))
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_LMS_UNAVAILABLE),
+							errmsg("cannot disable an already active LMS process")));
+		if (cluster_lms_state != NULL)
 			lms_set_state(CLUSTER_LMS_DISABLED);
-			LWLockRelease(&cluster_lms_state->lwlock);
-		}
 		return 0;
 	}
 
@@ -605,23 +608,6 @@ cluster_lms_request_serving(void)
 	return true;
 }
 
-void
-cluster_lms_request_shutdown(void)
-{
-	Assert(!IsUnderPostmaster);
-
-	if (cluster_lms_state == NULL)
-		return;
-
-	LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);
-	cluster_lms_state->shutdown_requested = true;
-	LWLockRelease(&cluster_lms_state->lwlock);
-
-	/* Wake any future CV-based LMS waiter; current skeleton also polls latch. */
-	ConditionVariableBroadcast(&cluster_lms_state->cv);
-}
-
-
 /* ============================================================
  * Read-only accessors (LW_SHARED + atomic reads).
  * ============================================================ */
@@ -637,6 +623,8 @@ cluster_lms_get_pid(void)
 {
 	pid_t pid;
 
+	if (!IsUnderPostmaster && MyProc == NULL)
+		return cluster_postmaster_lms_pid();
 	if (cluster_lms_state == NULL)
 		return 0;
 	LWLockAcquire(&cluster_lms_state->lwlock, LW_SHARED);

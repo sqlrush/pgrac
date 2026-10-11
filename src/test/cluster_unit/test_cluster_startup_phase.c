@@ -44,6 +44,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include <unistd.h>
 
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cssd.h"
@@ -60,6 +61,8 @@
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_wal_retention.h"
 #include "storage/proc.h"
+#include "storage/pmsignal.h"
+#include <sys/wait.h>
 #include "utils/wait_event.h"
 
 #undef printf
@@ -122,13 +125,20 @@ read_startup_phase_source(void)
 #include "cluster/cluster_inject.h"
 int cluster_injection_armed_count = 0;
 char *cluster_injection_points = NULL;
+static void (*phase_injection_hook)(const char *);
 void
-cluster_injection_run(const char *name pg_attribute_unused())
-{}
+cluster_injection_run(const char *name)
+{
+	if (phase_injection_hook != NULL)
+		phase_injection_hook(name);
+}
 
 /* miscadmin: HC1 Assert reads IsUnderPostmaster. */
 bool IsUnderPostmaster = false;
 PGPROC *MyProc = NULL;
+#ifdef USE_ASSERT_CHECKING
+bool PostmasterLWLockWaitForbidden;
+#endif
 BackendType MyBackendType = B_INVALID;
 AuxProcType MyAuxProcType = NotAnAuxProcess;
 volatile uint32 CritSectionCount;
@@ -155,6 +165,7 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 static jmp_buf phase4_fatal_jump;
 static bool phase4_capture_fatal = false;
 static int phase4_last_elevel = 0;
+static int phase4_last_sqlstate;
 static char phase4_last_error[512];
 static bool capture_authority_clear;
 static int authority_clear_logs;
@@ -166,7 +177,7 @@ bool
 errstart(int e, const char *d pg_attribute_unused())
 {
 	phase4_last_elevel = e;
-	return phase4_capture_fatal || capture_authority_clear;
+	return phase4_capture_fatal || capture_authority_clear || e >= ERROR;
 }
 
 /* Runtime boundary: distinguish the HW worker from the native startup owner. */
@@ -181,7 +192,7 @@ bool
 errstart_cold(int e, const char *d pg_attribute_unused())
 {
 	phase4_last_elevel = e;
-	return phase4_capture_fatal || capture_authority_clear;
+	return phase4_capture_fatal || capture_authority_clear || e >= ERROR;
 }
 void
 errfinish(const char *f pg_attribute_unused(), int l pg_attribute_unused(),
@@ -189,16 +200,21 @@ errfinish(const char *f pg_attribute_unused(), int l pg_attribute_unused(),
 {
 	if (phase4_capture_fatal && phase4_last_elevel >= ERROR)
 		longjmp(phase4_fatal_jump, 1);
+	if (phase4_last_elevel >= ERROR) {
+		fprintf(stderr, "unexpected error: %s\n", phase4_last_error);
+		abort();
+	}
 }
 int
-errcode(int s pg_attribute_unused())
+errcode(int s)
 {
+	phase4_last_sqlstate = s;
 	return 0;
 }
 int
 errmsg(const char *f, ...)
 {
-	if (phase4_capture_fatal && phase4_last_elevel >= ERROR) {
+	if (phase4_last_elevel >= ERROR) {
 		va_list ap;
 		va_start(ap, f);
 		vsnprintf(phase4_last_error, sizeof(phase4_last_error), f, ap);
@@ -309,6 +325,88 @@ pg_snprintf(char *str, size_t count, const char *fmt, ...)
 static bool phase_lwlock_conditional_result = true;
 static int phase_lwlock_blocking_calls = 0;
 static int phase_lwlock_conditional_calls = 0;
+static ClusterPhaseSharedState *phase_fixture_state;
+static bool phase_attach_existing;
+static bool phase_pm_alive = true;
+static bool phase_death_on_wait;
+static bool phase_cancel_on_interrupt;
+static unsigned phase_wait_calls;
+static unsigned phase_reset_calls;
+static bool phase_complete_on_wait;
+static Latch phase_test_latch;
+Latch *MyLatch = &phase_test_latch;
+volatile sig_atomic_t InterruptPending;
+#ifdef USE_POSTMASTER_DEATH_SIGNAL
+volatile sig_atomic_t postmaster_possibly_dead = 1;
+#endif
+
+void
+ProcessInterrupts(void)
+{
+	if (phase_cancel_on_interrupt && CritSectionCount == 0)
+		ereport(ERROR, (errcode(ERRCODE_QUERY_CANCELED), errmsg("fixture cancellation")));
+}
+bool
+PostmasterIsAliveInternal(void)
+{
+	return phase_pm_alive;
+}
+void
+ResetLatch(Latch *latch)
+{
+	phase_reset_calls++;
+}
+int
+WaitLatch(Latch *latch, int wake_events, long timeout, uint32 wait_event)
+{
+	UT_ASSERT_EQ(wake_events, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH);
+	UT_ASSERT_EQ(timeout, 1);
+	UT_ASSERT_EQ(wait_event, WAIT_EVENT_CLUSTER_STARTUP_PHASE_PUBLISH);
+	UT_ASSERT_EQ(phase_lwlock_depth, 0);
+	phase_wait_calls++;
+	if (phase_complete_on_wait && phase_wait_calls == 2)
+		pg_atomic_write_u32(&phase_fixture_state->phase_change_count, 2);
+	return phase_pm_alive && !phase_death_on_wait ? WL_TIMEOUT : WL_POSTMASTER_DEATH;
+}
+void
+proc_exit(int code)
+{
+	/* Distinguish callback-bearing exit from the critical-section _exit. */
+	_exit(10 + code);
+}
+static bool phase_exclusive_busy;
+static int phase_binding_drift;
+
+static void
+phase_before_exclusive(LWLockMode mode)
+{
+	if (mode != LW_EXCLUSIVE || phase_binding_drift == 0)
+		return;
+	switch (phase_binding_drift) {
+	case 1:
+		phase_fixture_state->authority_origin_thread++;
+		break;
+	case 2:
+		phase_fixture_state->authority_boot_incarnation++;
+		break;
+	case 3:
+		phase_fixture_state->authority_quorum_generation++;
+		break;
+	case 4:
+		phase_fixture_state->authority_storage_generation++;
+		break;
+	case 5:
+		((unsigned char *)&phase_fixture_state->authority_fence)[0] ^= 1;
+		break;
+	case 6:
+		((unsigned char *)&phase_fixture_state->authority_formation)[0] ^= 1;
+		break;
+	case 7:
+		pg_atomic_write_u32(&phase_fixture_state->authority_managed, 0);
+		break;
+	}
+	phase_binding_drift = 0;
+}
 
 void
 LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute_unused())
@@ -318,6 +416,7 @@ bool
 LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
 	phase_lwlock_blocking_calls++;
+	phase_before_exclusive(mode);
 	phase_lwlock_depth++;
 	return true;
 }
@@ -326,6 +425,9 @@ bool
 LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
 	phase_lwlock_conditional_calls++;
+	if (mode == LW_EXCLUSIVE && phase_exclusive_busy)
+		return false;
+	phase_before_exclusive(mode);
 	if (phase_lwlock_conditional_result)
 		phase_lwlock_depth++;
 	return phase_lwlock_conditional_result;
@@ -347,9 +449,11 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_u
 	 * never touch an under-aligned address (arm64 traps on that). */
 	static char fake_shmem[4096] pg_attribute_aligned(MAXIMUM_ALIGNOF);
 
-	memset(fake_shmem, 0, sizeof(fake_shmem));
+	if (!phase_attach_existing)
+		memset(fake_shmem, 0, sizeof(fake_shmem));
 	if (foundPtr != NULL)
-		*foundPtr = false;
+		*foundPtr = phase_attach_existing;
+	phase_fixture_state = (ClusterPhaseSharedState *)fake_shmem;
 	return fake_shmem;
 }
 
@@ -1315,6 +1419,269 @@ UT_TEST(test_rf_a1_no_pgproc_phase_reads_never_block)
 	MyProc = NULL;
 }
 
+/* PGRAC: phase publication must progress while authority's lock is busy. */
+UT_TEST(test_phase_publication_does_not_wait_for_authority_lock)
+{
+	char history[256];
+
+	cluster_phase_shmem_init();
+	IsUnderPostmaster = false;
+	MyProc = NULL;
+	phase_lwlock_conditional_result = false;
+	phase_lwlock_blocking_calls = 0;
+	phase_lwlock_conditional_calls = 0;
+	phase4_test_now = 1234567;
+	cluster_advance_phase(CLUSTER_PHASE_0_BASE);
+	UT_ASSERT_EQ(cluster_current_phase(), CLUSTER_PHASE_0_BASE);
+	UT_ASSERT_EQ(cluster_phase_started_at(CLUSTER_PHASE_0_BASE), 1234567);
+	cluster_phase_history_format(history, sizeof(history));
+	UT_ASSERT_STR_EQ(history, "phase0_base@(stub)");
+	UT_ASSERT_EQ(phase_lwlock_blocking_calls, 0);
+	UT_ASSERT_EQ(phase_lwlock_conditional_calls, 0);
+	phase_lwlock_conditional_result = true;
+}
+
+UT_TEST(test_phase_snapshot_child_without_pgproc_does_not_wait_on_lwlock)
+{
+	char history[256];
+
+	cluster_phase_shmem_init();
+	IsUnderPostmaster = false;
+	phase4_test_now = 1234567;
+	cluster_advance_phase(CLUSTER_PHASE_0_BASE);
+	IsUnderPostmaster = true;
+	MyProc = NULL;
+	phase_lwlock_blocking_calls = 0;
+	phase_lwlock_conditional_calls = 0;
+	UT_ASSERT_EQ(cluster_phase_started_at(CLUSTER_PHASE_0_BASE), 1234567);
+	UT_ASSERT_EQ(cluster_phase_elapsed_seconds(), 0);
+	cluster_phase_history_format(history, sizeof(history));
+	UT_ASSERT_STR_EQ(history, "phase0_base@(stub)");
+	UT_ASSERT_EQ(phase_lwlock_blocking_calls, 0);
+	UT_ASSERT_EQ(phase_lwlock_conditional_calls, 0);
+	IsUnderPostmaster = false;
+}
+
+
+UT_TEST(test_serving_publish_needs_available_lock_and_unchanged_entire_binding)
+{
+	for (int drift = 0; drift <= 7; drift++) {
+		reset_phase_service_fixture(true);
+		cluster_run_startup_sequence();
+		cluster_advance_phase(CLUSTER_PHASE_4_NORMAL);
+		UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_RECOVERY_READY);
+		phase_exclusive_busy = drift == 0;
+		phase_binding_drift = drift;
+		phase_lwlock_blocking_calls = 0;
+		UT_ASSERT(!cluster_authority_readiness_publish_serving());
+		UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_RECOVERY_READY);
+		UT_ASSERT_EQ(phase_lwlock_blocking_calls, 0);
+		phase_exclusive_busy = false;
+		if (drift == 0) {
+			int checks_before = phase4_quorum_check_calls;
+			UT_ASSERT(cluster_authority_readiness_publish_serving());
+			UT_ASSERT(phase4_quorum_check_calls > checks_before);
+		}
+	}
+	reset_phase_service_fixture(true);
+}
+
+static unsigned phase_enters, phase_exits;
+static bool phase_inject_exit_error;
+
+static void
+check_phase_injection_boundary(const char *name)
+{
+	UT_ASSERT_EQ(pg_atomic_read_u32(&phase_fixture_state->phase_change_count) & 1, 0);
+	if (strstr(name, "-enter") != NULL)
+		phase_enters++;
+	if (strstr(name, "-exit") != NULL) {
+		phase_exits++;
+		if (phase_inject_exit_error)
+			ereport(ERROR, (errcode(ERRCODE_QUERY_CANCELED), errmsg("fixture phase exit")));
+	}
+}
+
+UT_TEST(test_phase_callbacks_and_public_terminal_entries_publish_once)
+{
+	reset_phase_service_fixture(true);
+	cluster_injection_armed_count = 1;
+	phase_injection_hook = check_phase_injection_boundary;
+	phase_enters = phase_exits = 0;
+	cluster_run_startup_sequence();
+	cluster_run_phase4_sequence();
+	cluster_finalize_startup_running();
+	cluster_finalize_startup_running();
+	UT_ASSERT_EQ(phase_fixture_state->phase_history_count, 6);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&phase_fixture_state->phase_change_count), 12);
+	UT_ASSERT_EQ(phase_enters, 5);
+	UT_ASSERT_EQ(phase_exits, 5);
+	cluster_run_shutdown_sequence();
+	cluster_run_shutdown_sequence();
+	UT_ASSERT_EQ(phase_fixture_state->phase_history_count, 7);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&phase_fixture_state->phase_change_count), 14);
+	UT_ASSERT_EQ(phase_enters, 5);
+	UT_ASSERT_EQ(phase_exits, 5);
+	cluster_injection_armed_count = 0;
+	phase_injection_hook = NULL;
+	reset_phase_service_fixture(true);
+}
+
+UT_TEST(test_phase_exit_error_does_not_leave_partial_publication)
+{
+	bool caught = false;
+	cluster_phase_shmem_init();
+	cluster_advance_phase(CLUSTER_PHASE_0_BASE);
+	cluster_injection_armed_count = 1;
+	phase_injection_hook = check_phase_injection_boundary;
+	phase_inject_exit_error = true;
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		cluster_advance_phase(CLUSTER_PHASE_1_CLUSTER);
+	else
+		caught = true;
+	phase4_capture_fatal = false;
+	phase_inject_exit_error = false;
+	cluster_injection_armed_count = 0;
+	phase_injection_hook = NULL;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(phase4_last_sqlstate, ERRCODE_QUERY_CANCELED);
+	UT_ASSERT_EQ(cluster_current_phase(), CLUSTER_PHASE_0_BASE);
+	UT_ASSERT_EQ(phase_fixture_state->phase_history_count, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&phase_fixture_state->phase_change_count), 2);
+	cluster_phase_shmem_init();
+}
+
+UT_TEST(test_phase_busy_keeps_original_child_cancel)
+{
+	bool caught = false;
+	cluster_phase_shmem_init();
+	pg_atomic_write_u32(&phase_fixture_state->phase_change_count, 1);
+	IsUnderPostmaster = true;
+	InterruptPending = true;
+	phase_cancel_on_interrupt = true;
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		(void)cluster_phase_started_at(CLUSTER_PHASE_0_BASE);
+	else
+		caught = true;
+	phase4_capture_fatal = false;
+	phase_cancel_on_interrupt = false;
+	InterruptPending = false;
+	IsUnderPostmaster = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(phase4_last_sqlstate, ERRCODE_QUERY_CANCELED);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&phase_fixture_state->phase_change_count), 1);
+	cluster_phase_shmem_init();
+}
+
+/* PGRAC: BUSY is not invalid authority, including a CF-X critical reader. */
+UT_TEST(test_phase_busy_child_waits_until_complete_even_without_pgproc)
+{
+	for (int critical = 0; critical < 2; critical++) {
+		cluster_phase_shmem_init();
+		phase4_test_now = 1234567;
+		cluster_advance_phase(CLUSTER_PHASE_0_BASE);
+		pg_atomic_write_u32(&phase_fixture_state->phase_change_count, 1);
+		IsUnderPostmaster = true;
+		MyProc = NULL;
+		CritSectionCount = critical;
+		phase_test_cf_held = critical;
+		phase_wait_calls = phase_reset_calls = 0;
+		phase_complete_on_wait = true;
+		UT_ASSERT_EQ(cluster_phase_started_at(CLUSTER_PHASE_0_BASE), 1234567);
+		UT_ASSERT_EQ(phase_wait_calls, 2);
+		UT_ASSERT_EQ(phase_reset_calls, 3);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&phase_fixture_state->phase_change_count), 2);
+		IsUnderPostmaster = false;
+		CritSectionCount = 0;
+		phase_test_cf_held = false;
+	}
+	phase_complete_on_wait = false;
+}
+
+UT_TEST(test_phase_pm_busy_is_bounded_and_invalid_payload_is_rejected)
+{
+	char history[128];
+	cluster_phase_shmem_init();
+	pg_atomic_write_u32(&phase_fixture_state->phase_change_count, 1);
+	phase_wait_calls = phase_reset_calls = 0;
+	UT_ASSERT_EQ(cluster_phase_started_at(CLUSTER_PHASE_0_BASE), 0);
+	UT_ASSERT_EQ(phase_wait_calls, 0);
+	UT_ASSERT_EQ(phase_reset_calls, 0);
+	pg_atomic_write_u32(&phase_fixture_state->phase_change_count, 2);
+	phase_fixture_state->phase_history_head = 8;
+	cluster_phase_history_format(history, sizeof(history));
+	UT_ASSERT_STR_EQ(history, "");
+	UT_ASSERT_EQ(cluster_phase_elapsed_seconds(), 0);
+	phase_fixture_state->phase_history_head = 0;
+	pg_atomic_write_u32(&phase_fixture_state->current_phase, 99);
+	UT_ASSERT_EQ(cluster_phase_elapsed_seconds(), 0);
+	cluster_phase_shmem_init();
+}
+
+UT_TEST(test_phase_writer_rejects_odd_saturation_and_bad_bounds_before_publication)
+{
+	for (int variant = 0; variant < 5; variant++) {
+		bool caught = false;
+		cluster_phase_shmem_init();
+		if (variant < 2)
+			pg_atomic_write_u32(&phase_fixture_state->phase_change_count,
+								variant == 0 ? 1 : UINT32_MAX - 1);
+		else if (variant == 2)
+			phase_fixture_state->phase_history_head = 8;
+		else if (variant == 3)
+			phase_fixture_state->phase_history_count = INT_MAX;
+		else
+			IsUnderPostmaster = true;
+		phase4_capture_fatal = true;
+		if (setjmp(phase4_fatal_jump) == 0)
+			cluster_advance_phase(CLUSTER_PHASE_0_BASE);
+		else
+			caught = true;
+		phase4_capture_fatal = false;
+		IsUnderPostmaster = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(phase4_last_elevel, FATAL);
+		UT_ASSERT_EQ(phase4_last_sqlstate, ERRCODE_CLUSTER_PHASE_PRECONDITION_FAILED);
+		UT_ASSERT_EQ(cluster_current_phase(), CLUSTER_PHASE_PRE_INIT);
+		UT_ASSERT_EQ(phase_fixture_state->phase_start_times[CLUSTER_PHASE_0_BASE], 0);
+	}
+	cluster_phase_shmem_init();
+}
+
+UT_TEST(test_phase_writer_death_uses_original_exit_without_fixing_odd)
+{
+	cluster_phase_shmem_init();
+	pg_atomic_write_u32(&phase_fixture_state->phase_change_count, 1);
+	for (int variant = 0; variant < 4; variant++) {
+		int critical = variant % 2;
+		pid_t pid;
+		int status;
+		fflush(NULL);
+		pid = fork();
+		UT_ASSERT(pid >= 0);
+		if (pid == 0) {
+			IsUnderPostmaster = true;
+			CritSectionCount = critical;
+			phase_pm_alive = variant >= 2;
+			phase_death_on_wait = variant >= 2;
+			(void)cluster_phase_started_at(CLUSTER_PHASE_0_BASE);
+			_exit(99);
+		}
+		if (pid > 0) {
+			UT_ASSERT_EQ(waitpid(pid, &status, 0), pid);
+			UT_ASSERT(WIFEXITED(status));
+			UT_ASSERT_EQ(WEXITSTATUS(status), critical ? 2 : 11);
+		}
+	}
+	phase_attach_existing = true;
+	cluster_phase_shmem_init();
+	UT_ASSERT_EQ(pg_atomic_read_u32(&phase_fixture_state->phase_change_count), 1);
+	phase_attach_existing = false;
+	cluster_phase_shmem_init();
+	UT_ASSERT_EQ(pg_atomic_read_u32(&phase_fixture_state->phase_change_count), 0);
+}
 
 UT_TEST(test_rf_a1_phase3_establishes_formation_and_phase4_does_not_respawn)
 {
@@ -1961,8 +2328,10 @@ UT_TEST(test_config_lmon_can_read_before_startup_and_cannot_write)
 	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ShareLock, false));
 	phase_test_control_acquire_ready = true;
 	IsUnderPostmaster = false;
+	MyProc = NULL;
 	cluster_advance_phase(CLUSTER_PHASE_4_NORMAL);
 	IsUnderPostmaster = true;
+	MyProc = &lmon_proc;
 	UT_ASSERT(cluster_recovery_authority_request_allowed(&cf, ShareLock, false));
 	phase_test_lms_generation++;
 	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ShareLock, false));
@@ -2085,8 +2454,10 @@ UT_TEST(test_slow_startup_control_crosses_remote_master_phase4)
 														cluster_serving_ready_is_current()));
 		UT_ASSERT(ges_readiness_allows_grant(&grant, &resid, cluster_serving_ready_is_current()));
 		IsUnderPostmaster = false;
+		MyProc = NULL;
 		cluster_advance_phase(CLUSTER_PHASE_4_NORMAL);
 		IsUnderPostmaster = true;
+		MyProc = &startup_proc;
 		UT_ASSERT(!cluster_recovery_authority_request_allowed(&resid, mode, true));
 		MyBackendType = B_LMON;
 		MyAuxProcType = NotAnAuxProcess;
@@ -2268,8 +2639,10 @@ UT_TEST(test_config_read_crosses_real_s1_and_ges_admission_before_serving)
 	UT_ASSERT(!ges_readiness_allows_local_origin(GES_REQ_OPCODE_REQUEST, &req.resid, ExclusiveLock,
 												 NoLock, cluster_serving_ready_is_current()));
 	IsUnderPostmaster = false;
+	MyProc = NULL;
 	cluster_advance_phase(CLUSTER_PHASE_4_NORMAL);
 	IsUnderPostmaster = true;
+	MyProc = &lmon_proc;
 	req.lockmode = ShareLock;
 	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&req), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
 	UT_ASSERT(ges_readiness_allows_local_origin(GES_REQ_OPCODE_REQUEST, &req.resid, ShareLock,
@@ -2739,7 +3112,17 @@ UT_TEST(test_nonshared_phase4_keeps_original_activation_entry)
 int
 main(void)
 {
-	UT_PLAN(54);
+	UT_PLAN(64);
+	UT_RUN(test_phase_callbacks_and_public_terminal_entries_publish_once);
+	UT_RUN(test_phase_exit_error_does_not_leave_partial_publication);
+	UT_RUN(test_phase_busy_keeps_original_child_cancel);
+	UT_RUN(test_phase_busy_child_waits_until_complete_even_without_pgproc);
+	UT_RUN(test_phase_pm_busy_is_bounded_and_invalid_payload_is_rejected);
+	UT_RUN(test_phase_writer_rejects_odd_saturation_and_bad_bounds_before_publication);
+	UT_RUN(test_phase_writer_death_uses_original_exit_without_fixing_odd);
+	UT_RUN(test_serving_publish_needs_available_lock_and_unchanged_entire_binding);
+	UT_RUN(test_phase_publication_does_not_wait_for_authority_lock);
+	UT_RUN(test_phase_snapshot_child_without_pgproc_does_not_wait_on_lwlock);
 	UT_RUN(test_authority_clear_reports_original_identity_once_outside_lock);
 	UT_RUN(test_slow_startup_control_crosses_remote_master_phase4);
 	UT_RUN(test_phase4_startup_control_keeps_identity_and_namespace_refusals);

@@ -131,13 +131,23 @@ format_elog_string(const char *f pg_attribute_unused(), ...)
 
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
+static ClusterLckSharedState ready_state;
+static bool ready_lock_available = true;
+static int ready_blocking_calls;
+static long ready_sleep_us;
 void
 LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute_unused())
 {}
 bool
 LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
+	ready_blocking_calls++;
 	return true;
+}
+bool
+LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+{
+	return ready_lock_available;
 }
 void
 LWLockRelease(LWLock *lock pg_attribute_unused())
@@ -148,7 +158,7 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_u
 {
 	if (foundPtr != NULL)
 		*foundPtr = false;
-	return NULL;
+	return &ready_state;
 }
 
 #include "cluster/cluster_shmem.h"
@@ -233,8 +243,10 @@ ProcessInterrupts(void)
 {}
 
 void
-pg_usleep(long microsec pg_attribute_unused())
-{}
+pg_usleep(long microsec)
+{
+	ready_sleep_us += microsec;
+}
 
 /* Sprint B: Latch / WaitLatch / ResetLatch stubs (LckMain runtime
  * is not invoked at unit-test level). */
@@ -317,6 +329,21 @@ UT_TEST(test_lck_public_symbols_linkable)
 }
 
 
+/* PGRAC: unavailable status bytes cannot authorize a postmaster child. */
+UT_TEST(test_ready_busy_never_reads_status_or_exceeds_budget)
+{
+	cluster_lck_shmem_init();
+	ready_state.status = CLUSTER_LCK_READY;
+	ready_lock_available = false;
+	ready_blocking_calls = 0;
+	ready_sleep_us = 0;
+	UT_ASSERT(!cluster_lck_wait_for_ready(37));
+	UT_ASSERT_EQ(ready_blocking_calls, 0);
+	UT_ASSERT_EQ(ready_sleep_us, 37000);
+	ready_lock_available = true;
+	UT_ASSERT(cluster_lck_wait_for_ready(37));
+}
+
 /* ============================================================
  * Test runner
  * ============================================================ */
@@ -324,7 +351,8 @@ UT_TEST(test_lck_public_symbols_linkable)
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(6);
+	UT_RUN(test_ready_busy_never_reads_status_or_exceeds_budget);
 	UT_RUN(test_lck_status_enum_values_frozen);
 	UT_RUN(test_lck_shared_state_size_under_4kb);
 	UT_RUN(test_lck_status_to_string_lookup);

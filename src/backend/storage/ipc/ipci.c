@@ -216,6 +216,12 @@ CreateSharedMemoryAndSemaphores(void)
 {
 	PGShmemHeader *shim = NULL;
 
+#if defined(USE_PGRAC_CLUSTER) && defined(USE_ASSERT_CHECKING)
+	/* PGRAC: a fresh generation must initialize its original shared locks. */
+	if (!IsUnderPostmaster)
+		PostmasterLWLockWaitForbidden = false;
+#endif
+
 	if (!IsUnderPostmaster)
 	{
 		PGShmemHeader *seghdr;

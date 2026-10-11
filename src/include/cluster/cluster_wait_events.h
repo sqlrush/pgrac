@@ -1,14 +1,10 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_wait_events.h
- *	  pgrac cluster wait event class IDs (13 classes for 83 cluster
- *	  wait events: 46 from stage 0.11 + 5 added by stage 1.1 for
- *	  cluster_shared_fs (SharedFs class) + 5 added by stage 1.10 for
- *	  ClusterStartupPhase{0..4}Wait (StartupPhase class) + 4 added by
- *	  stages 1.11-1.14 for LMON/LCK/DIAG/Cluster Stats main loops
- *	  (BgProc class).
+ *	  pgrac cluster wait event class IDs (13 classes, 124 events).
+ *	  StartupPhase includes the postmaster publication wait in addition
+ *	  to the five startup phase waits.
  *
- *	  Updated by spec-2.33 D9 (GCS block-shipping wait-event expansion).
  *
  *	  This header is the single source of truth for the upper-byte
  *	  class identifiers used by the WaitEventCluster enum defined in

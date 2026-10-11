@@ -17,6 +17,12 @@
  *
  *-------------------------------------------------------------------------
  */
+/*
+ * PGRAC MODIFICATIONS
+ * Modified by: SqlRush <sqlrush@gmail.com>
+ * Restore initialization locking before postmaster exit callbacks.
+ */
+
 #include "postgres.h"
 
 #include <signal.h>
@@ -228,6 +234,12 @@ proc_exit_prepare(int code)
 void
 shmem_exit(int code)
 {
+#if defined(USE_PGRAC_CLUSTER) && defined(USE_ASSERT_CHECKING)
+	/* PGRAC: normal exit and crash reinitialization run original callbacks. */
+	if (!IsUnderPostmaster)
+		PostmasterLWLockWaitForbidden = false;
+#endif
+
 	shmem_exit_inprogress = true;
 
 	/*

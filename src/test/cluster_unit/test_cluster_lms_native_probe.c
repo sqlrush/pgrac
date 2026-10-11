@@ -19,6 +19,58 @@ int cluster_ges_request_timeout_ms = 60000;
 int cluster_ges_dedup_max_entries = 256;
 int MyProcPid = 100;
 bool IsUnderPostmaster = true;
+PGPROC *MyProc;
+static pid_t LmsPID;
+static unsigned lms_forks;
+bool cluster_lms_enabled = true;
+static sigjmp_buf lms_error_jump;
+static bool lms_capture_error;
+static int lms_error_level;
+static int lms_error_code;
+
+static pid_t
+StartLms(void)
+{
+	lms_forks++;
+	return 101;
+}
+
+#include "test_cluster_postmaster_lms.inc"
+
+bool
+errstart(int elevel, const char *domain)
+{
+	lms_error_level = elevel;
+	return elevel >= ERROR;
+}
+bool
+errstart_cold(int elevel, const char *domain)
+{
+	return errstart(elevel, domain);
+}
+int
+errcode(int sqlerrcode)
+{
+	lms_error_code = sqlerrcode;
+	return 0;
+}
+int
+errmsg(const char *fmt, ...)
+{
+	return 0;
+}
+int
+errdetail(const char *fmt, ...)
+{
+	return 0;
+}
+void
+errfinish(const char *filename, int lineno, const char *funcname)
+{
+	if (lms_capture_error)
+		siglongjmp(lms_error_jump, 1);
+	abort();
+}
 BackendType MyBackendType = B_LMS;
 Latch *MyLatch;
 sigjmp_buf *PG_exception_stack;
@@ -1170,10 +1222,73 @@ UT_TEST(worker_pid_read_retains_child_locking_and_absence)
 	IsUnderPostmaster = true;
 }
 
+/* PGRAC: the PM-owned PID survives contention on the child's publication. */
+UT_TEST(postmaster_lms_pid_does_not_depend_on_child_lock)
+{
+	reset();
+	IsUnderPostmaster = false;
+	MyProc = NULL;
+	LmsPID = 101;
+	state.pid = 202;
+	worker_pid_lock_busy = true;
+	UT_ASSERT_EQ(cluster_lms_get_pid(), 101);
+	UT_ASSERT_EQ(postmaster_pid_reads, 0);
+	UT_ASSERT_EQ(conditional_pid_reads, 0);
+	IsUnderPostmaster = true;
+	worker_pid_lock_busy = false;
+	UT_ASSERT_EQ(cluster_lms_get_pid(), 202);
+}
+
+UT_TEST(lms_start_reuses_owned_pid_without_second_fork)
+{
+	IsUnderPostmaster = false;
+	LmsPID = 0;
+	lms_forks = 0;
+	UT_ASSERT_EQ(cluster_postmaster_start_lms(), 101);
+	UT_ASSERT_EQ(cluster_postmaster_start_lms(), 101);
+	UT_ASSERT_EQ(lms_forks, 1);
+	IsUnderPostmaster = true;
+}
+
+UT_TEST(lms_disabled_never_waits_or_overwrites_an_active_child)
+{
+	reset();
+	IsUnderPostmaster = false;
+	MyProc = NULL;
+	cluster_lms_enabled = false;
+	LmsPID = 0;
+	pg_atomic_write_u32(&state.lms_state, CLUSTER_LMS_NOT_STARTED);
+	UT_ASSERT_EQ(cluster_lms_start(), 0);
+	UT_ASSERT_EQ(cluster_lms_get_state(), CLUSTER_LMS_DISABLED);
+	UT_ASSERT_EQ(postmaster_pid_reads, 0);
+	for (int active = 0; active < 2; active++) {
+		bool caught = false;
+		ClusterLmsState original = active ? CLUSTER_LMS_READY : CLUSTER_LMS_DISABLED;
+		pg_atomic_write_u32(&state.lms_state, original);
+		LmsPID = active ? 0 : 101;
+		lms_capture_error = true;
+		if (sigsetjmp(lms_error_jump, 1) == 0)
+			(void)cluster_lms_start();
+		else
+			caught = true;
+		lms_capture_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(lms_error_level, FATAL);
+		UT_ASSERT_EQ(lms_error_code, ERRCODE_CLUSTER_LMS_UNAVAILABLE);
+		UT_ASSERT_EQ(cluster_lms_get_state(), original);
+	}
+	cluster_lms_enabled = true;
+	LmsPID = 0;
+	IsUnderPostmaster = true;
+}
+
 int
 main(void)
 {
-	printf("1..37\n");
+	printf("1..40\n");
+	UT_RUN(lms_start_reuses_owned_pid_without_second_fork);
+	UT_RUN(lms_disabled_never_waits_or_overwrites_an_active_child);
+	UT_RUN(postmaster_lms_pid_does_not_depend_on_child_lock);
 	UT_RUN(async_origin_generation_is_not_receiver_authority);
 	UT_RUN(async_changed_receiver_cut_cannot_grant);
 	UT_RUN(async_dispatch_keeps_the_original_admitted_cut);

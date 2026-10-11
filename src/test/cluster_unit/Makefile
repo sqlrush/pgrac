@@ -68,7 +68,7 @@ TESTS = test_cluster_heap_cr_reuse test_cluster_buffer_cr test_cluster_buffer_ma
         test_cluster_bufmgr_stop test_cluster_allocation_stop test_cluster_hw_cold test_cluster_hw_initdb test_cluster_shared_parameters test_cluster_shared_config_alter test_cluster_checkpoint_pi_tick test_cluster_native_wal_stop test_cluster_checkpointer_stop test_cluster_postmaster_stop test_cluster_xnode_profile test_cluster_adg \
         test_cluster_xnode_lever test_cluster_ges_handoff \
         test_cluster_reverse_key test_cluster_hw_lease test_cluster_pi_shadow \
-        test_cluster_wait_events test_cluster_errcodes test_cluster_guc \
+        test_cluster_wait_events test_cluster_postmaster_lwlock test_cluster_phase_publication test_cluster_errcodes test_cluster_guc \
         test_cluster_shmem test_cluster_signal test_cluster_views \
         test_cluster_gviews test_cluster_ic test_cluster_ic_envelope \
         test_cluster_ic_router test_cluster_ic_rdma \
@@ -3882,7 +3882,7 @@ test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-$(filter-out test_cluster_sync_error test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
+$(filter-out test_cluster_postmaster_lwlock test_cluster_phase_publication test_cluster_sync_error test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
 
 # Native CR metadata checks are inline in the shared descriptor definition.
@@ -4256,6 +4256,24 @@ test_cluster_startup_snapshot_native.inc: $(top_srcdir)/src/backend/cluster/clus
 	awk '/^cluster_formation_snapshot_matches_v1\(/ { print "bool"; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+
+# PGRAC: schedule overlapping publication without a product injection point.
+test_cluster_phase_publication.o: $(top_srcdir)/src/backend/cluster/cluster_startup_phase.c test_cluster_phase_barriers.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -include $(srcdir)/test_cluster_phase_barriers.h -c $< -o $@
+
+test_cluster_phase_anchor_native.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_anchor.c Makefile
+	awk '/^checkpoint_(phase4_publisher_is_current|publisher_is_current)\(/ { print "static bool"; emit=1; count++ } \
+	     /^cluster_recovery_anchor_publish_checkpoint\(/ { print "void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_phase_publication: test_cluster_phase_publication.c test_cluster_startup_phase.c unit_test.h \
+		test_cluster_config_s1_native.inc test_cluster_config_ges_native.inc test_cluster_startup_walr_native.inc \
+		test_cluster_startup_snapshot_native.inc test_cluster_phase_anchor_native.inc \
+		test_cluster_phase_publication.o $(CLUSTER_VERSION_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		-DSTARTUP_PHASE_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_startup_phase.c"' \
+		test_cluster_phase_publication.o $(CLUSTER_VERSION_O) -o $@
 
 test_cluster_startup_phase: test_cluster_startup_phase.c unit_test.h test_cluster_config_s1_native.inc test_cluster_config_ges_native.inc test_cluster_startup_walr_native.inc test_cluster_startup_snapshot_native.inc \
 		$(CLUSTER_VERSION_O) $(CLUSTER_STARTUP_PHASE_O)
@@ -5785,7 +5803,18 @@ test_cluster_r4_route_policy: test_cluster_r4_route_policy.c unit_test.h \
 # worker main entries without linking unrelated LMS duties.
 CLUSTER_R4_LMS_CONTROLS_TEST_O = test_cluster_r4_lms_controls_product.o
 
-test_cluster_lms_native_probe: test_cluster_lms_native_probe.c unit_test.h \
+# PGRAC: execute the postmaster-owned PID slot and its fork boundary.
+test_cluster_postmaster_lwlock: test_cluster_postmaster_lwlock.c unit_test.h $(top_srcdir)/src/backend/storage/lmgr/lwlock.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		-DLWLOCK_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/storage/lmgr/lwlock.c"' \
+		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_postmaster_lms.inc: $(top_srcdir)/src/backend/postmaster/postmaster.c Makefile
+	awk '/^cluster_postmaster_(start_lms|lms_pid)\(/ { print "pid_t"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n < 1 || n > 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_lms_native_probe: test_cluster_lms_native_probe.c unit_test.h test_cluster_postmaster_lms.inc \
         $(top_srcdir)/src/backend/cluster/cluster_lms.c \
         $(top_srcdir)/src/backend/cluster/cluster_ges_dedup.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
@@ -8251,13 +8280,14 @@ test_cluster_xid_stripe_boot.inc: $(top_srcdir)/src/backend/cluster/cluster_xid_
 	awk '/^typedef enum StripeMailboxOp/ { emit=1; types++ } \
 	     /^typedef struct ClusterXidStripe(Lease|BootShmem) / { emit=1; types++ } \
 	     /^static ClusterXidStripeBootShmem \*StripeBootShmem / { print; pointers++ } \
+	     /^cluster_xid_stripe_disk_state\(/ { print "ClusterXidStripeDiskState"; emit=1; functions++ } \
 	     /^stripe_stage_op\(/ { print "static uint64"; emit=1; functions++ } \
 	     /^stripe_stage_seed_request\(/ { print "static void"; emit=1; functions++ } \
 	     /^cluster_xid_stripe_join_progress\(/ { print "ClusterXidStripeJoinProgress"; emit=1; functions++ } \
 	     /^cluster_xid_stripe_join_gate\(/ { print "ClusterXidStripeJoinVerdict"; emit=1; functions++ } \
 	     /^cluster_xid_stripe_(get_activation|emit_join_wal)\(/ { print "bool"; emit=1; functions++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (types != 3 || pointers != 1 || functions != 6) exit 1 }' $(filter %.c,$^) > $@.tmp
+	     END { if (types != 3 || pointers != 1 || functions != 7) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_xid_stripe_boot: test_cluster_xid_stripe_boot.c unit_test.h test_cluster_xid_stripe_boot.inc

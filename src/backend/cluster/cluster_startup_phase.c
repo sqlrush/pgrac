@@ -44,12 +44,16 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include <unistd.h>
 
 #ifdef USE_PGRAC_CLUSTER
 
 #include "miscadmin.h" /* IsUnderPostmaster (HC1) */
 #include "port/atomics.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
+#include "storage/pmsignal.h"
+#include "utils/wait_event.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/elog.h"
@@ -108,9 +112,9 @@ static const char *const cluster_phase_strings[] = {
  *	Windows children re-execed and re-ran their static initializers,
  *	so they observed the PRE_INIT seed regardless of postmaster's
  *	actual state.  Migrating to shmem gives every process a coherent
- *	view backed by ShmemInitStruct, with LWLock LWTRANCHE_CLUSTER_
- *	STARTUP_PHASE guarding writes (postmaster, LW_EXCLUSIVE) and
- *	reads (any backend, LW_SHARED).
+	 *	view backed by ShmemInitStruct. The postmaster publishes phase fields
+	 *	through a change counter; readers accept a stable snapshot. The embedded
+	 *	LWLock independently protects the authority fields with multiple writers.
  *
  *	cluster_phase_state is set by cluster_phase_shmem_init() during
  *	postmaster startup and (on EXEC_BACKEND children) during
@@ -205,9 +209,7 @@ cluster_startup_phase_to_string(ClusterStartupPhase phase)
 ClusterStartupPhase
 cluster_current_phase(void)
 {
-	/* AD-023 A1: lock-free atomic read; the phase word is written only under
-	 * the phase-state lwlock, so concurrent readers never block and never see
-	 * a torn value. */
+	/* PGRAC: the sole postmaster writer publishes this word atomically. */
 	if (cluster_phase_state == NULL)
 		return CLUSTER_PHASE_PRE_INIT;
 	return (ClusterStartupPhase)pg_atomic_read_u32(&cluster_phase_state->current_phase);
@@ -1181,10 +1183,23 @@ cluster_authority_readiness_publish_serving(void)
 		cluster_authority_clear_matching_quorum(&binding, "publish_serving_stale", quorum);
 		return false;
 	}
-	LWLockAcquire(&cluster_phase_state->lwlock, LW_EXCLUSIVE);
-	if ((ClusterAuthorityReadiness)pg_atomic_read_u32(&cluster_phase_state->authority_readiness)
-			== CLUSTER_AUTHORITY_RECOVERY_READY
-		&& cluster_phase_state->authority_lms_generation == binding.lms_generation)
+	/* PGRAC: a contended final write requires a fresh complete accept pass. */
+	if (!LWLockConditionalAcquire(&cluster_phase_state->lwlock, LW_EXCLUSIVE))
+		return false;
+	if (pg_atomic_read_u32(&cluster_phase_state->authority_managed) != 0
+		&& (ClusterAuthorityReadiness)pg_atomic_read_u32(&cluster_phase_state->authority_readiness)
+			   == binding.state
+		&& cluster_phase_state->authority_origin_thread == binding.origin_thread
+		&& cluster_phase_state->authority_boot_incarnation == binding.boot_incarnation
+		&& cluster_phase_state->authority_lms_generation == binding.lms_generation
+		&& cluster_phase_state->authority_quorum_generation == binding.quorum_generation
+		&& cluster_phase_state->authority_storage_generation == binding.storage_generation
+		&& memcmp(&cluster_phase_state->authority_fence, &binding.authority,
+				  sizeof(binding.authority))
+			   == 0
+		&& memcmp(&cluster_phase_state->authority_formation, &binding.formation,
+				  sizeof(binding.formation))
+			   == 0)
 		pg_atomic_write_u32(&cluster_phase_state->authority_readiness,
 							CLUSTER_AUTHORITY_SERVING_READY);
 	else
@@ -1559,46 +1574,124 @@ cluster_recovery_authority_request_allowed(const ClusterResId *resid, LOCKMODE m
 }
 
 
+/* PGRAC: phase payload has one writer, independent of authority's LWLock. */
+typedef struct ClusterPhaseSnapshot {
+	ClusterStartupPhase phase;
+	TimestampTz started[CLUSTER_PHASE_LAST + 1];
+	PhaseHistoryEntry history[CLUSTER_PHASE_HISTORY_RING_SIZE];
+	int count;
+	int head;
+} ClusterPhaseSnapshot;
+
+typedef enum ClusterPhaseSnapshotResult {
+	CLUSTER_PHASE_SNAPSHOT_OK,
+	CLUSTER_PHASE_SNAPSHOT_BUSY,
+	CLUSTER_PHASE_SNAPSHOT_INVALID
+} ClusterPhaseSnapshotResult;
+
+static ClusterPhaseSnapshotResult
+cluster_phase_snapshot_try(ClusterPhaseSnapshot *out)
+{
+	volatile ClusterPhaseSharedState *state = cluster_phase_state;
+	uint32 before;
+	uint32 after;
+	int i;
+
+	if (state == NULL)
+		return CLUSTER_PHASE_SNAPSHOT_INVALID;
+	before = pg_atomic_read_u32(&cluster_phase_state->phase_change_count);
+	if (before & 1)
+		return CLUSTER_PHASE_SNAPSHOT_BUSY;
+	pg_read_barrier();
+	out->phase = (ClusterStartupPhase)pg_atomic_read_u32(&cluster_phase_state->current_phase);
+	for (i = 0; i <= CLUSTER_PHASE_LAST; i++)
+		out->started[i] = state->phase_start_times[i];
+	/* Copy fixed bounds before trusting the published ring indices. */
+	for (i = 0; i < CLUSTER_PHASE_HISTORY_RING_SIZE; i++) {
+		out->history[i].phase = state->phase_history[i].phase;
+		out->history[i].entered_at = state->phase_history[i].entered_at;
+	}
+	out->count = state->phase_history_count;
+	out->head = state->phase_history_head;
+	pg_read_barrier();
+	after = pg_atomic_read_u32(&cluster_phase_state->phase_change_count);
+	if (before != after || (after & 1))
+		return CLUSTER_PHASE_SNAPSHOT_BUSY;
+	if ((int)out->phase < 0 || out->phase > CLUSTER_PHASE_LAST || out->count < 0 || out->head < 0
+		|| out->head >= CLUSTER_PHASE_HISTORY_RING_SIZE)
+		return CLUSTER_PHASE_SNAPSHOT_INVALID;
+	for (i = 0; i < Min(out->count, CLUSTER_PHASE_HISTORY_RING_SIZE); i++)
+		if ((int)out->history[i].phase < 0 || out->history[i].phase > CLUSTER_PHASE_LAST)
+			return CLUSTER_PHASE_SNAPSHOT_INVALID;
+	return CLUSTER_PHASE_SNAPSHOT_OK;
+}
+
+static void
+cluster_phase_snapshot_parent_died(void)
+{
+	/* CF-X callers can be critical: never run allocating exit callbacks there. */
+	if (CritSectionCount != 0)
+		_exit(2);
+	proc_exit(1);
+}
+
+static bool
+cluster_phase_snapshot(ClusterPhaseSnapshot *out)
+{
+	int attempts = IsUnderPostmaster ? 16 : 2;
+
+	for (;;) {
+		int i;
+		int events;
+
+		if (IsUnderPostmaster)
+			ResetLatch(MyLatch);
+		for (i = 0; i < attempts; i++) {
+			ClusterPhaseSnapshotResult result = cluster_phase_snapshot_try(out);
+
+			if (result != CLUSTER_PHASE_SNAPSHOT_BUSY)
+				return result == CLUSTER_PHASE_SNAPSHOT_OK;
+		}
+		if (!IsUnderPostmaster)
+			return false;
+		CHECK_FOR_INTERRUPTS();
+		if (!PostmasterIsAlive())
+			cluster_phase_snapshot_parent_died();
+		/* A live sole writer does not need any reader-held lock to finish. */
+		events = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, 1L,
+						   WAIT_EVENT_CLUSTER_STARTUP_PHASE_PUBLISH);
+		if (events & WL_POSTMASTER_DEATH)
+			cluster_phase_snapshot_parent_died();
+	}
+}
+
 TimestampTz
 cluster_phase_started_at(ClusterStartupPhase phase)
 {
-	TimestampTz result;
+	ClusterPhaseSnapshot snapshot;
 
-	if ((int)phase < 0 || (int)phase > CLUSTER_PHASE_LAST)
+	if ((int)phase < 0 || phase > CLUSTER_PHASE_LAST || !cluster_phase_snapshot(&snapshot))
 		return 0;
-	if (cluster_phase_state == NULL)
-		return 0;
-
-	LWLockAcquire(&cluster_phase_state->lwlock, LW_SHARED);
-	result = cluster_phase_state->phase_start_times[(int)phase];
-	LWLockRelease(&cluster_phase_state->lwlock);
-	return result;
+	return snapshot.started[(int)phase];
 }
 
 
 int64
 cluster_phase_elapsed_seconds(void)
 {
-	ClusterStartupPhase phase;
+	ClusterPhaseSnapshot snapshot;
 	TimestampTz started;
 	long secs;
 	int usecs;
 
-	if (cluster_phase_state == NULL)
+	if (!cluster_phase_snapshot(&snapshot))
 		return 0;
-
-	LWLockAcquire(&cluster_phase_state->lwlock, LW_SHARED);
-	phase = (ClusterStartupPhase)pg_atomic_read_u32(&cluster_phase_state->current_phase);
-	started = cluster_phase_state->phase_start_times[(int)phase];
-	LWLockRelease(&cluster_phase_state->lwlock);
-
+	started = snapshot.started[(int)snapshot.phase];
 	if (started == 0)
 		return 0;
-
 	TimestampDifference(started, GetCurrentTimestamp(), &secs, &usecs);
 	return (int64)secs;
 }
-
 
 void
 cluster_phase_history_format(char *buf, size_t size)
@@ -1607,30 +1700,18 @@ cluster_phase_history_format(char *buf, size_t size)
 	int i;
 	int emit_count;
 	size_t offset = 0;
-	int local_count;
-	int local_head;
-	PhaseHistoryEntry local_history[CLUSTER_PHASE_HISTORY_RING_SIZE];
+	ClusterPhaseSnapshot snapshot;
 
 	if (buf == NULL || size == 0)
 		return;
 	buf[0] = '\0';
 
-	if (cluster_phase_state == NULL)
+	if (!cluster_phase_snapshot(&snapshot))
 		return;
 
-	/*
-	 * Snapshot the ring under LW_SHARED so the formatter can iterate
-	 * without holding the lock during the (potentially many) snprintf
-	 * calls.  Eight entries fit comfortably on the stack.
-	 */
-	LWLockAcquire(&cluster_phase_state->lwlock, LW_SHARED);
-	local_count = cluster_phase_state->phase_history_count;
-	local_head = cluster_phase_state->phase_history_head;
-	memcpy(local_history, cluster_phase_state->phase_history, sizeof(local_history));
-	LWLockRelease(&cluster_phase_state->lwlock);
-
-	emit_count = (local_count < CLUSTER_PHASE_HISTORY_RING_SIZE) ? local_count
-																 : CLUSTER_PHASE_HISTORY_RING_SIZE;
+	emit_count = (snapshot.count < CLUSTER_PHASE_HISTORY_RING_SIZE)
+					 ? snapshot.count
+					 : CLUSTER_PHASE_HISTORY_RING_SIZE;
 
 	if (emit_count == 0)
 		return;
@@ -1639,11 +1720,11 @@ cluster_phase_history_format(char *buf, size_t size)
 	 * Walk in chronological order: oldest entry is at head when the
 	 * ring is full, otherwise at slot 0.
 	 */
-	start = (local_count < CLUSTER_PHASE_HISTORY_RING_SIZE) ? 0 : local_head;
+	start = (snapshot.count < CLUSTER_PHASE_HISTORY_RING_SIZE) ? 0 : snapshot.head;
 
 	for (i = 0; i < emit_count; i++) {
 		int idx = (start + i) % CLUSTER_PHASE_HISTORY_RING_SIZE;
-		const PhaseHistoryEntry *entry = &local_history[idx];
+		const PhaseHistoryEntry *entry = &snapshot.history[idx];
 		const char *phase_str = cluster_startup_phase_to_string(entry->phase);
 		const char *ts_str = timestamptz_to_str(entry->entered_at);
 		int n;
@@ -1689,6 +1770,7 @@ cluster_phase_shmem_init(void)
 		pg_atomic_init_u32(&cluster_phase_state->authority_readiness, CLUSTER_AUTHORITY_OFF);
 		pg_atomic_init_u32(&cluster_phase_state->authority_managed, 0);
 		pg_atomic_init_u32(&cluster_phase_state->current_phase, CLUSTER_PHASE_PRE_INIT);
+		pg_atomic_init_u32(&cluster_phase_state->phase_change_count, 0);
 	}
 }
 
@@ -1727,13 +1809,18 @@ cluster_advance_phase(ClusterStartupPhase target)
 	ClusterStartupPhase prev;
 	TimestampTz now;
 	int slot;
+	int next_head;
+	int next_count;
+	uint32 sequence;
 
 	/*
 	 * HC1: postmaster-only.  This is the ONLY function that mutates
 	 * the shmem-backed phase state; calling it from a child backend
 	 * would corrupt the postmaster's view of its own startup.
 	 */
-	Assert(!IsUnderPostmaster);
+	if (IsUnderPostmaster || MyProc != NULL)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_PHASE_PRECONDITION_FAILED),
+						errmsg("only the postmaster may publish a cluster phase")));
 
 	/*
 	 * spec-1.10.1 D1 F1: phase state lives in shmem now.  This guards
@@ -1748,6 +1835,17 @@ cluster_advance_phase(ClusterStartupPhase target)
 						 "CreateSharedMemoryAndSemaphores().")));
 
 	prev = (ClusterStartupPhase)pg_atomic_read_u32(&cluster_phase_state->current_phase);
+	sequence = pg_atomic_read_u32(&cluster_phase_state->phase_change_count);
+	slot = cluster_phase_state->phase_history_head;
+	if ((int)prev < 0 || prev > CLUSTER_PHASE_LAST || (int)target < 0 || target > CLUSTER_PHASE_LAST
+		|| slot < 0 || slot >= CLUSTER_PHASE_HISTORY_RING_SIZE
+		|| cluster_phase_state->phase_history_count < 0
+		|| cluster_phase_state->phase_history_count == INT_MAX || (sequence & 1)
+		|| sequence > UINT32_MAX - 2)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_PHASE_PRECONDITION_FAILED),
+						errmsg("invalid cluster phase publication state")));
+	next_head = (slot + 1) % CLUSTER_PHASE_HISTORY_RING_SIZE;
+	next_count = cluster_phase_state->phase_history_count + 1;
 
 	/*
 	 * Strict transition rules.  The only legitimate transitions are:
@@ -1778,8 +1876,8 @@ cluster_advance_phase(ClusterStartupPhase target)
 	 * sentinel) or into SHUTDOWN (the prev phase may not have a
 	 * meaningful exit -- shutdown is a special transition).
 	 *
-	 * Inject points run outside the LWLock to avoid Assert(!locked)
-	 * paths inside ereport in fault-injected sleep modes.
+	 * Inject points run before publication so errors cannot leave an odd
+	 * sequence behind while the postmaster remains alive.
 	 */
 	if (prev != CLUSTER_PHASE_PRE_INIT && target != CLUSTER_PHASE_SHUTDOWN) {
 		switch (prev) {
@@ -1805,18 +1903,19 @@ cluster_advance_phase(ClusterStartupPhase target)
 
 	now = GetCurrentTimestamp();
 
-	/* Commit the transition under LW_EXCLUSIVE (HC2 SSOT mutate). */
-	LWLockAcquire(&cluster_phase_state->lwlock, LW_EXCLUSIVE);
-	pg_atomic_write_u32(&cluster_phase_state->current_phase, target);
+	/* PGRAC: no fallible work or callbacks within the odd publication window. */
+	pg_atomic_write_u32(&cluster_phase_state->phase_change_count, sequence + 1);
+	pg_write_barrier();
 	cluster_phase_state->phase_start_times[(int)target] = now;
-
-	/* Append to fixed-size history ring (HC5). */
-	slot = cluster_phase_state->phase_history_head;
 	cluster_phase_state->phase_history[slot].phase = target;
 	cluster_phase_state->phase_history[slot].entered_at = now;
-	cluster_phase_state->phase_history_head = (slot + 1) % CLUSTER_PHASE_HISTORY_RING_SIZE;
-	cluster_phase_state->phase_history_count++;
-	LWLockRelease(&cluster_phase_state->lwlock);
+	cluster_phase_state->phase_history_head = next_head;
+	cluster_phase_state->phase_history_count = next_count;
+	pg_write_barrier();
+	pg_atomic_write_u32(&cluster_phase_state->current_phase, target);
+	pg_write_barrier();
+	pg_atomic_write_u32(&cluster_phase_state->phase_change_count, sequence + 2);
+
 
 	/*
 	 * Update the legacy cluster_phase const char * mirror (HC2: this
@@ -3193,6 +3292,11 @@ cluster_run_startup_sequence(void)
 	phase3_join_readonly_deferred = false;
 	phase3_recovery_deadline = 0;
 	cluster_advance_phase(CLUSTER_PHASE_0_BASE);
+#ifdef USE_ASSERT_CHECKING
+	/* PGRAC: validated phase state; the first cluster child may now be forked. */
+	PostmasterLWLockWaitForbidden = true;
+#endif
+
 
 	/*
 	 * Spec-1.13 v0.2 Q2 A': cluster_run_startup_sequence() walks

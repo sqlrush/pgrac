@@ -10,6 +10,12 @@
  *
  *-------------------------------------------------------------------------
  */
+/*
+ * PGRAC MODIFICATIONS
+ * Modified by: SqlRush <sqlrush@gmail.com>
+ * Expose the process-local LMS roster without a backend lock.
+ */
+
 #ifndef _POSTMASTER_H
 #define _POSTMASTER_H
 
@@ -77,5 +83,8 @@ extern void ShmemBackendArrayAllocation(void);
  * relevant GUC check hooks and in RegisterBackgroundWorker().
  */
 #define MAX_BACKENDS	0x3FFFF
+
+/* PGRAC: the postmaster-owned LMS roster slot, never a readiness proof. */
+extern pid_t cluster_postmaster_lms_pid(void);
 
 #endif							/* _POSTMASTER_H */

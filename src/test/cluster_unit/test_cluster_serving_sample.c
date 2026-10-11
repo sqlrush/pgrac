@@ -20,7 +20,16 @@
 #define cluster_grd_recovery_authority_for_admission fixture_grd_admission
 #define cluster_grd_recovery_authority_is_current fixture_grd_current
 #define cluster_lms_get_lms_restart_generation fixture_lms_generation
+#define MyLatch phase_fixture_MyLatch
+#define ProcessInterrupts phase_fixture_ProcessInterrupts
+#define ResetLatch phase_fixture_ResetLatch
+#define WaitLatch phase_fixture_WaitLatch
 #include "test_cluster_startup_phase.c"
+#undef MyLatch
+#undef ProcessInterrupts
+#undef ResetLatch
+#undef WaitLatch
+
 #undef cluster_lms_get_lms_restart_generation
 #undef cluster_grd_recovery_authority_is_current
 #undef cluster_grd_recovery_authority_for_admission

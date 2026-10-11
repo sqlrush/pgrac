@@ -150,7 +150,7 @@ typedef struct ClusterLmonSharedState {
 	 * the RETAINED LMON keeps servicing the coordination stack (CF X for the
 	 * shutdown checkpoint) but stops publishing reconfig events.  The LMON
 	 * main loop does NOT exit on this byte. */
-	bool reconfig_suppressed;
+	pg_atomic_uint32 reconfig_suppressed;
 
 	/*
 	 * PGRAC: spec-7.2 D1 duty-chain on-demand gating.  Dirty bitmask for
@@ -267,15 +267,6 @@ extern int cluster_lmon_start(void);
 extern bool cluster_lmon_wait_for_ready(int timeout_ms);
 
 /*
- * Postmaster shutdown signal (Q3 reverse path).
- *
- *	Sets state->shutdown_requested = true under LW_EXCLUSIVE; LMON
- *	main loop polls this flag every iteration and proc_exit(0)s
- *	cleanly when set.  Idempotent.  Asserts !IsUnderPostmaster.
- */
-extern void cluster_lmon_request_shutdown(void);
-
-/*
  * RF-ROOT P6: read the shutdown_requested byte without exiting.  The postmaster
  * sets it during a formed-registry fast shutdown so the retained LMON stops
  * publishing reconfig events (fail-stop/join) for the rest of the shutdown
@@ -286,7 +277,7 @@ extern bool cluster_lmon_shutdown_requested_public(void);
 
 /*
  * RF-ROOT P6: postmaster-side "stop publishing reconfig, keep serving".  Sets
- * state->reconfig_suppressed = true under LW_EXCLUSIVE.  The LMON main loop
+ * state->reconfig_suppressed atomically, without joining a backend lock queue.  The LMON loop
  * keeps running (so CF X remains grantable through the shutdown checkpoint)
  * but cluster_reconfig_lmon_tick() early-returns while the byte is set.
  * Idempotent; postmaster-only (Assert !IsUnderPostmaster).

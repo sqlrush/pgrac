@@ -1429,6 +1429,9 @@ pgstat_get_wait_cluster_startup_phase(WaitEventCluster w)
 	case WAIT_EVENT_CLUSTER_STARTUP_PHASE_4:
 		event_name = "ClusterStartupPhase4Wait";
 		break;
+	case WAIT_EVENT_CLUSTER_STARTUP_PHASE_PUBLISH:
+		event_name = "ClusterStartupPhasePublishWait";
+		break;
 	default:
 		break;
 	}

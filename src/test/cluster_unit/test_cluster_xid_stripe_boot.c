@@ -21,6 +21,7 @@
 #include "cluster/cluster_mxid_stripe.h"
 #include "storage/condition_variable.h"
 #include "storage/lwlock.h"
+#include "storage/proc.h"
 #undef printf
 #include "unit_test.h"
 UT_DEFINE_GLOBALS();
@@ -30,6 +31,9 @@ bool cluster_xid_striping = true;
 int cluster_node_id = 1;
 int cluster_xid_herding_slack = 4194304;
 static bool recovery, wal_allowed;
+PGPROC *MyProc;
+static bool disk_lock_available = true;
+static unsigned disk_blocking_calls;
 static uint64 next_xid;
 static uint32 next_mxid;
 static unsigned xid_reads, mxid_reads, wal_records, wal_begins;
@@ -60,7 +64,13 @@ ReadNextMultiXactId(void)
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
+	disk_blocking_calls++;
 	return true;
+}
+bool
+LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
+{
+	return disk_lock_available;
 }
 void
 LWLockRelease(LWLock *lock)
@@ -229,10 +239,30 @@ UT_TEST(test_owned_claim_waits_for_original_join_wal_before_proceed)
 	UT_ASSERT_EQ(wal_records, 1);
 }
 
+/* PGRAC: unobservable is UNKNOWN, never ABSENT or a copied busy value. */
+UT_TEST(test_disk_state_no_pgproc_busy_is_unknown)
+{
+	PGPROC proc;
+	reset_boot();
+	MyProc = NULL;
+	boot.disk_state = CLUSTER_XID_STRIPE_DISK_PUBLISHED;
+	disk_lock_available = false;
+	disk_blocking_calls = 0;
+	UT_ASSERT_EQ(cluster_xid_stripe_disk_state(), CLUSTER_XID_STRIPE_DISK_UNKNOWN);
+	UT_ASSERT_EQ(disk_blocking_calls, 0);
+	MyProc = &proc;
+	UT_ASSERT_EQ(cluster_xid_stripe_disk_state(), CLUSTER_XID_STRIPE_DISK_PUBLISHED);
+	UT_ASSERT_EQ(disk_blocking_calls, 1);
+	MyProc = NULL;
+	disk_lock_available = true;
+	UT_ASSERT_EQ(cluster_xid_stripe_disk_state(), CLUSTER_XID_STRIPE_DISK_PUBLISHED);
+}
+
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(6);
+	UT_RUN(test_disk_state_no_pgproc_busy_is_unknown);
 	UT_RUN(test_recovery_holds_every_activation_state_without_side_effects);
 	UT_RUN(test_seed_samples_recovery_end_not_the_pre_recovery_counter);
 	UT_RUN(test_post_recovery_unknown_corrupt_and_retired_stay_closed);

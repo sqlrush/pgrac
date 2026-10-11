@@ -202,11 +202,14 @@ cluster_diag_wait_for_ready(int timeout_ms)
 	 * 100ms granularity is limiting.
 	 */
 	while (waited_ms < timeout_ms) {
-		ClusterDiagStatus status;
+		ClusterDiagStatus status = CLUSTER_DIAG_NOT_STARTED;
+		int sleep_ms = Min(poll_interval_ms, timeout_ms - waited_ms);
 
-		LWLockAcquire(&cluster_diag_state->lwlock, LW_SHARED);
-		status = cluster_diag_state->status;
-		LWLockRelease(&cluster_diag_state->lwlock);
+		/* PGRAC: the postmaster cannot join a backend lock queue. */
+		if (LWLockConditionalAcquire(&cluster_diag_state->lwlock, LW_SHARED)) {
+			status = cluster_diag_state->status;
+			LWLockRelease(&cluster_diag_state->lwlock);
+		}
 
 		if (status == CLUSTER_DIAG_READY)
 			return true;
@@ -219,8 +222,8 @@ cluster_diag_wait_for_ready(int timeout_ms)
 		if (status == CLUSTER_DIAG_SHUTTING_DOWN || status == CLUSTER_DIAG_EXITED)
 			return false;
 
-		pg_usleep(poll_interval_ms * 1000L);
-		waited_ms += poll_interval_ms;
+		pg_usleep(sleep_ms * 1000L);
+		waited_ms += sleep_ms;
 	}
 
 	return false;
