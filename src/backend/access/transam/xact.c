@@ -17,6 +17,7 @@
  * PGRAC MODIFICATIONS (spec-1.16 v0.2 + spec-1.18 v0.2 + spec-2.6 v0.2 D6)
  *
  *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Reconcile prepared undo ownership after abort releases LWLocks.
  *	Spec: spec-1.16-local-scn-maintenance.md (commit/abort SCN advance)
  *	Spec: spec-1.18-wal-record-xl-scn.md (WAL emit + replay observe)
  *
@@ -3748,6 +3749,9 @@ CleanupTransaction(void)
 	AtEOXact_Snapshot(false, true); /* and release the transaction's snapshots */
 
 #ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: preserve the abort record and durable TT publication before
+	 * refusing any uncertain shared effect.  AbortTransaction released locks. */
+	cluster_undo_record_abort_prepared_after_lwlock_release();
 	/* PGRAC: fully tear down backend-local undo state on abort. */
 	cluster_undo_record_xact_reset();
 	/* PGRAC (spec-5.14 D1):  clear the touched_peers bitmap on abort/cleanup. */
@@ -5964,6 +5968,11 @@ AbortSubTransaction(void)
 	 * Buffer locks, for example?  I don't think so but I'm not sure.
 	 */
 	LWLockReleaseAll();
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: retire only this reservation before the parent can resume. */
+	cluster_undo_record_abort_prepared_after_lwlock_release();
+#endif
+
 
 	pgstat_report_wait_end();
 	pgstat_progress_end_command();

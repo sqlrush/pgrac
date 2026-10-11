@@ -35,6 +35,7 @@
  *   Record bounded metadata for shared MVCC selection misses.
  *   Keep cluster-only VM acquisition plans out of non-cluster builds.
  *   Bind inplace WAL private images and visible pages to one exact version.
+ *   Reject unsupported shared-heap subtransactions before creating receipts.
  */
 #include "postgres.h"
 
@@ -136,12 +137,9 @@ static inline bool
 cluster_itl_write_path_enabled(Relation relation)
 {
 	/*
-	 * spec-3.4a activated top-level shared-buffer heap writes; spec-3.5
-	 * (Q4=A) removes the subxact barrier (former
-	 * GetCurrentTransactionNestLevel() <= 1 gate).  Subxact DML now
-	 * exercises the same ITL/TT cluster path as top-level DML;  SUBTRANS
-	 * cross-node visibility (spec-3.5 D7/D8) propagates child SUBCOMMITTED
-	 * + parent_key chain to peers.
+	 * PGRAC: routing describes storage, not transaction eligibility.  A
+	 * subtransaction must ERROR at the mutation entry, never return false
+	 * here and silently mutate shared pages through the native path.
 	 *
 	 * spec-3.4b D9: tighten the node_id range from `>= 0` to the explicit
 	 * valid window [0, SCN_MAX_VALID_NODE_ID].  Multi-instance allocator
@@ -165,6 +163,34 @@ cluster_itl_write_path_enabled(Relation relation)
 	return cluster_heap_itl_relation_route(
 		cluster_storage_mode_enabled(), RelationUsesLocalBuffers(relation),
 		cluster_shared_catalog, relation->rd_locator.relNumber);
+}
+
+/* PGRAC: reject before canonical, undo or CTRC preparation.  A row-lock
+ * operation can enter a subtransaction before it has an assigned child XID. */
+static void
+cluster_heap_itl_require_supported_xact(Relation relation, const char *operation)
+{
+	TransactionId current_xid;
+
+	if (!cluster_itl_write_path_enabled(relation))
+		return;
+	if (IsSubTransaction())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("shared-heap %s on relation \"%s\" does not support subtransactions",
+						operation, RelationGetRelationName(relation)),
+				 errdetail("PGRAC_FAMILY=HEAP_ITL "
+						   "PGRAC_REASON=SHARED_ITL_SUBTRANSACTION_UNSUPPORTED PGRAC_NODE=%d",
+						   cluster_node_id),
+				 errhint("Execute this operation in a top-level transaction. "
+						 "SAVEPOINT, PL/pgSQL EXCEPTION blocks, psql ON_ERROR_ROLLBACK "
+						 "and driver autosave create subtransactions.")));
+	current_xid = GetCurrentTransactionIdIfAny();
+	if (TransactionIdIsValid(current_xid)
+		&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("shared-heap top-level transaction identity mismatch")));
 }
 
 typedef struct ClusterHeapItlTerminalCensus
@@ -6115,6 +6141,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	 * -> LockRelationForExtension.  No-op for a regular insert (bistate == NULL ->
 	 * HW alone) or after the lease is already held.
 	 */
+	cluster_heap_itl_require_supported_xact(relation, "INSERT");
 	cluster_dl_bulk_acquire(relation, bistate);
 #endif
 
@@ -11021,6 +11048,7 @@ heap_delete(Relation relation, ItemPointer tid,
 			elog(ERROR, "shared heap delete requires a live SPACE identity");
 		cluster_page_versioned = true;
 	}
+	cluster_heap_itl_require_supported_xact(relation, "DELETE");
 	canonical_xid = GetTopTransactionId();
 	if (cluster_itl_write_path_enabled(relation)
 		&& !cluster_tt_local_prepare_canonical_active(
@@ -12287,6 +12315,7 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 			elog(ERROR, "shared heap update requires a live SPACE identity");
 		cluster_page_versioned = true;
 	}
+	cluster_heap_itl_require_supported_xact(relation, "UPDATE");
 	canonical_xid = GetTopTransactionId();
 	if (cluster_itl_write_path_enabled(relation)
 		&& !cluster_tt_local_prepare_canonical_active(
@@ -15673,6 +15702,7 @@ heap_lock_tuple_internal(Relation relation, HeapTuple tuple,
 			elog(ERROR, "shared heap tuple lock requires a live SPACE identity");
 		cluster_page_versioned = true;
 	}
+	cluster_heap_itl_require_supported_xact(relation, "LOCK");
 	canonical_xid = GetTopTransactionId();
 	if (cluster_itl_lock_path_enabled(relation)
 		&& !cluster_tt_local_prepare_canonical_active(
@@ -18705,6 +18735,7 @@ heap_lock_updated_tuple(Relation rel,
 		ClusterCanonicalTxnBinding canonical_binding = {0};
 		TransactionId canonical_xid;
 
+		cluster_heap_itl_require_supported_xact(rel, "UPDATE CHAIN LOCK");
 		canonical_xid = GetTopTransactionId();
 		if (cluster_itl_lock_path_enabled(rel)
 			&& !cluster_tt_local_prepare_canonical_active(canonical_xid,
@@ -18776,6 +18807,7 @@ heap_lock_updated_tuple_authoritative(
 
 	if (ItemPointerIndicatesMovedPartitions(&successor->tid))
 		return TM_Ok;
+	cluster_heap_itl_require_supported_xact(rel, "UPDATE CHAIN LOCK");
 	canonical_xid = GetTopTransactionId();
 	if (cluster_itl_lock_path_enabled(rel)
 		&& !cluster_tt_local_prepare_canonical_active(canonical_xid,

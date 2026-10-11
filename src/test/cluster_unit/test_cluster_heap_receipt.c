@@ -87,12 +87,6 @@ errdetail_internal(const char *format, ...)
 	return 0;
 }
 
-int
-errdetail(const char *format pg_attribute_unused(), ...)
-{
-	/* StringInfo's allocation-limit error is outside this bounded fixture. */
-	abort();
-}
 
 static void
 heap_receipt_fixture(Page page, ClusterUndoRecordPrepareReceipt *receipt,

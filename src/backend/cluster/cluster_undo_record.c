@@ -48,6 +48,9 @@
  * IDENTIFICATION
  *	  src/backend/cluster/cluster_undo_record.c
  *
+ * PGRAC MODIFICATIONS
+ *   Reconcile abort cleanup after PG releases LWLocks; retain uncertain APPLY debt.
+ *
  * NOTES
  *	  This is a pgrac-original file (no derivation from PostgreSQL).
  *
@@ -345,6 +348,7 @@ typedef struct ClusterUndoRecordReservation {
 	bool active;
 	bool owns_ref;
 	bool consume_locked;
+	bool apply_attempted;
 	uint64 sequence;
 	int ref_slot;
 	int consume_local_head_idx;
@@ -2364,6 +2368,7 @@ cluster_undo_record_prepare_trace_impl(uint8 record_type, uint16 payload_capacit
 	}
 
 	reservation->sequence = ++cluster_undo_record_reservation_floor;
+	reservation->apply_attempted = false;
 	memset(&reservation->receipt, 0, sizeof(reservation->receipt));
 	reservation->receipt.magic = CLUSTER_UNDO_RECORD_RECEIPT_MAGIC;
 	reservation->receipt.record_type = record_type;
@@ -2668,6 +2673,9 @@ cluster_undo_record_ctrc_apply_prepared(ClusterUndoRecordPrepareReceipt *receipt
 		|| receipt->itl_history[target_ordinal].slot_index != final_target->itl_slot_index
 		|| !cluster_undo_record_receipt_extent_matches(receipt))
 		return CLUSTER_CTRC_APPLY_FAIL_CLOSED;
+	/* PGRAC: even a refusal or failed local mask sync cannot prove that
+	 * an attempted shared APPLY/retarget had no effect. */
+	cluster_undo_record_reservation.apply_attempted = true;
 	result = (receipt->ctrc_reuse_mask & target_bit) != 0
 				 ? cluster_ctrc_receipt_retarget_itl_shared(
 					   &receipt->ctrc_handles[target_ordinal],
@@ -2956,6 +2964,35 @@ cluster_undo_record_cancel_prepared(ClusterUndoRecordPrepareReceipt *receipt)
 	reservation->consume_effective_prev_uba = InvalidUba;
 	memset(&reservation->receipt, 0, sizeof(reservation->receipt));
 	memset(receipt, 0, sizeof(*receipt));
+}
+
+
+/* PGRAC: called only after PG has released all LWLocks during abort.
+ * Reconcile lock-only bookkeeping, never unlock twice or withdraw an
+ * obligation whose shared APPLY may already have taken effect. */
+void
+cluster_undo_record_abort_prepared_after_lwlock_release(void)
+{
+	ClusterUndoRecordReservation *reservation = &cluster_undo_record_reservation;
+
+	if (!reservation->active)
+		return;
+	reservation->consume_locked = false;
+	reservation->consume_local_head_idx = -1;
+	reservation->consume_effective_prev_uba = InvalidUba;
+	if (reservation->apply_attempted || reservation->receipt.ctrc_applied_mask != 0)
+		ereport(PANIC,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("cluster undo abort cannot retire an attempted shared effect"),
+				 errdetail("PGRAC_REASON=UNDO_ABORT_EFFECT_UNCERTAIN "
+						   "sequence=" UINT64_FORMAT " apply_attempted=%d applied=%u reuse=%u",
+						   reservation->sequence, reservation->apply_attempted,
+						   reservation->receipt.ctrc_applied_mask,
+						   reservation->receipt.ctrc_reuse_mask)));
+
+	/* No APPLY was attempted.  Keep the original cancellation policy:
+	 * borrowed handles and failed cancellation CAS retain their shared owner. */
+	cluster_undo_record_cancel_prepared(&reservation->receipt);
 }
 
 

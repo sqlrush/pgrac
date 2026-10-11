@@ -204,6 +204,8 @@ extern ClusterCtrcApplyResult cluster_undo_record_ctrc_apply_prepared(
 	ClusterUndoRecordPrepareReceipt *receipt, uint8 target_ordinal,
 	const ClusterCtrcTargetV1 *final_target, ClusterCtrcApplyToken *token);
 extern void cluster_undo_record_cancel_prepared(ClusterUndoRecordPrepareReceipt *receipt);
+/* PGRAC: abort-only; the caller must have completed LWLockReleaseAll(). */
+extern void cluster_undo_record_abort_prepared_after_lwlock_release(void);
 extern ClusterUndoRecordConsumePreflightResult
 cluster_undo_record_consume_preflight(ClusterUndoRecordPrepareReceipt *receipt, uint16 payload_len);
 extern ClusterUndoRecordConsumeResult
