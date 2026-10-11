@@ -957,25 +957,31 @@ UT_TEST(empty_boot_runtime_cannot_recreate_proof_or_truncate)
 	UT_ASSERT(limits_error(false));
 	UT_ASSERT_EQ(last_error, ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE);
 }
-UT_TEST(empty_boot_first_striped_members_preserve_the_same_stop)
+UT_TEST(empty_boot_striped_members_recalculate_at_segment_boundary)
 {
-	MultiXactOffset stop;
+	const uint32 span = MULTIXACT_MEMBERS_PER_PAGE * SLRU_PAGES_PER_SEGMENT;
+	MultiXactOffset offsets[] = { 1, span - 1, span, span + 1 };
+	MultiXactOffset stops[] = { (MultiXactOffset)(0 - span), (MultiXactOffset)(0 - span), 0, 0 };
 	MultiXactId id = 0;
 	MultiXactMember members[]
 		= { { 100, MultiXactStatusForKeyShare }, { 116, MultiXactStatusForKeyShare } };
 	empty_boot_fixture();
 	UT_ASSERT(!limits_error(true));
-	stop = state.offsetStopLimit;
+	UT_ASSERT_EQ(state.offsetStopLimit, stops[0]);
 	cluster_mxid_stripe_latch_runtime(true, 0, 32);
-	UT_ASSERT(!allocate_error(&id));
-	UT_ASSERT_EQ(id, 32);
-	UT_ASSERT_EQ(state.nextOffset, 3);
-	RecordNewMultiXact(id, 1, 2, members);
-	state.oldestMultiXactId = id;
-	UT_ASSERT(!limits_error(false));
-	UT_ASSERT_EQ(state.oldestOffset, 1);
-	UT_ASSERT_EQ(state.offsetStopLimit, stop);
-	UT_ASSERT_EQ(proven_logs, 1);
+	for (unsigned i = 0; i < lengthof(offsets); i++) {
+		/* Advance the fixture to both sides of the native member segment. */
+		state.nextOffset = offsets[i];
+		UT_ASSERT(!allocate_error(&id));
+		UT_ASSERT_EQ(id, 32 + i * CLUSTER_MXID_STRIDE);
+		UT_ASSERT_EQ(state.nextOffset, offsets[i] + 2);
+		RecordNewMultiXact(id, offsets[i], 2, members);
+		state.oldestMultiXactId = id;
+		UT_ASSERT(!limits_error(false));
+		UT_ASSERT_EQ(state.oldestOffset, offsets[i]);
+		UT_ASSERT_EQ(state.offsetStopLimit, stops[i]);
+		UT_ASSERT_EQ(proven_logs, 1);
+	}
 }
 UT_TEST(single_shared_dense_mode_retains_native_limits_and_allocation)
 {
@@ -1022,7 +1028,7 @@ main(void)
 	UT_RUN(empty_boot_rechecks_original_input_and_native_cursor);
 	UT_RUN(empty_boot_known_does_not_authorize_unbound_allocation);
 	UT_RUN(empty_boot_runtime_cannot_recreate_proof_or_truncate);
-	UT_RUN(empty_boot_first_striped_members_preserve_the_same_stop);
+	UT_RUN(empty_boot_striped_members_recalculate_at_segment_boundary);
 	UT_RUN(single_shared_dense_mode_retains_native_limits_and_allocation);
 	UT_DONE();
 	return ut_failed_count != 0;

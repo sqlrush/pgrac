@@ -1,12 +1,33 @@
 #!/usr/bin/env perl
+# Copyright (c) 2026, pgrac contributors
 # Author: SqlRush <sqlrush@gmail.com>
-# PGRAC: real VACUUM and retained local MultiXact members; lifecycle tests are separate.
+# PGRAC: real VACUUM and retained local MultiXact members across clean restart.
 use strict;
 use warnings;
 use FindBin;
 use lib "$FindBin::RealBin/../../perl", "$FindBin::RealBin/../pre2";
 use Scenario;
 use Test::More;
+use Time::HiRes qw(time);
+use PostgreSQL::Test::Utils qw(slurp_file);
+
+sub maintenance_counters
+{
+	my ($node) = @_;
+	my $value = sql($node, q{SELECT category || '.' || key || '=' || value
+        FROM pg_cluster_state WHERE
+        (category='visibility' AND key='vis_update_fork_count') OR
+        (category='undo' AND key='horizon_admission_refuse_count')
+        ORDER BY category, key});
+	my %counts;
+	for my $line (split /\n/, $value)
+	{
+		die "invalid maintenance counter: $line" unless $line =~ /^([a-z_.]+)=(\d+)$/;
+		$counts{$1} = $2;
+	}
+	require_equal(scalar(keys %counts), '2', 'both maintenance counters available');
+	return \%counts;
+}
 
 run_scenario('pre2_multixact_maintenance', [], sub {
 	my ($cluster) = @_;
@@ -33,11 +54,30 @@ run_scenario('pre2_multixact_maintenance', [], sub {
 	}
 	# Use the existing VACUUM catalog path; no direct cursor or SLRU edits.
 	sql($nodes[0], 'ALTER DATABASE template0 ALLOW_CONNECTIONS true');
+	my $identity = sql($nodes[1], q{SELECT oid, xmin, ctid,
+        xmin::text::bigint % 16 AS origin FROM pg_database WHERE datname='template0'});
+	diag("node1 template0 tuple: $identity");
+	require_true($identity =~ /\|0$/, 'template0 maintenance tuple belongs to node0');
 	for my $database ('template0', 'template1', 'postgres')
 	{
-		for my $node (@nodes)
+		for my $i (0 .. 3)
 		{
-			$node->safe_psql($database, "\\set VERBOSITY verbose\nVACUUM (FREEZE, VERBOSE)", timeout => 60);
+			my $node = $nodes[$i];
+			my $before = maintenance_counters($node);
+			my $started = time;
+			$node->safe_psql($database,
+				"\\set VERBOSITY verbose\nSET backtrace_functions='cluster_undo_horizon_read_admission_enforce';\nVACUUM (FREEZE, VERBOSE)",
+				timeout => 60);
+			my $elapsed = time - $started;
+			my $after = maintenance_counters($node);
+			my $forks = $after->{'visibility.vis_update_fork_count'} - $before->{'visibility.vis_update_fork_count'};
+			my $refusals = $after->{'undo.horizon_admission_refuse_count'} - $before->{'undo.horizon_admission_refuse_count'};
+			diag("VACUUM_STEP node=$i database=$database rc=0 seconds=$elapsed forks=$forks refusals=$refusals before="
+				. JSON::PP->new->canonical->encode($before) . ' after='
+				. JSON::PP->new->canonical->encode($after));
+			require_equal($refusals, '0', "node$i/$database no maintenance admission refusal");
+			require_true($forks > 0, 'foreign maintenance used the update fork')
+				if $database eq 'template0' && $i == 1;
 		}
 	}
 	sql($nodes[0], 'ALTER DATABASE template0 ALLOW_CONNECTIONS false');
@@ -59,5 +99,27 @@ run_scenario('pre2_multixact_maintenance', [], sub {
 		}
 	}
 	require_true($foreign_lower > 0, 'real VACUUM reached a foreign striped lower bound');
+	$cluster->stop_cluster;
+	my @restart_starts = map { -s $_->logfile // 0 } @nodes;
+	$cluster->restart_cluster;
+	my @restart;
+	for my $i (0 .. $#nodes)
+	{
+		my $node = $nodes[$i];
+		my $log = slurp_file($node->logfile, $restart_starts[$i]);
+		my $proven = () = $log =~ /PGRAC_REASON=NATIVE_EMPTY_BOOT_PROVEN/g;
+		my $floor = sql($node, q{SELECT value FROM pg_cluster_state
+            WHERE key='mxid_stripe_activated_floor'});
+		require_equal($proven, '0', "node$i did not recreate first-start proof after VACUUM");
+		require_true($floor =~ /^[1-9][0-9]*$/ && $log !~ /(?:ERROR|FATAL|PANIC):/,
+			"node$i cold restart has a binding and no refusal");
+		require_equal(sql($node, q{SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM mx_retained}),
+			'0:0,1:10,2:20,3:30', 'retained rows after VACUUM and normal restart');
+		push @restart, {node => $i, proven => $proven, bound_floor => $floor,
+			log => $node->logfile};
+	}
+	open(my $out, '>', "$ENV{TESTLOGDIR}/mx-vacuum-restart.json") or die $!;
+	print {$out} JSON::PP->new->canonical->pretty->encode({same_data_restart => \@restart});
+	close($out) or die $!;
 	$cluster->stop_cluster;
 });
