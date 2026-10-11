@@ -655,6 +655,11 @@ cluster_normal_stop_modules_poll(bool post_checkpoint,
 extern ClusterNormalStopPollResult
 cluster_normal_stop_checkpoint_poll(uint32 expected_services, ClusterPhase1FullStopPlan *plan_out,
 									ClusterNormalStopModuleObservation *observation);
+/* PGRAC: once-only tail timing after ShutdownXLOG, before STOPPED readback.
+ * This changes no protocol phase, receipt, or nonce. */
+extern bool
+cluster_normal_stop_checkpoint_tail_begin(ClusterPhase1FullStopPlan *plan,
+										  ClusterNormalStopModuleObservation *observation);
 /* After the actual ShutdownXLOG and own durable STOPPED publication. READY
  * arms only the existing post-STOPPED round, never protocol completion. */
 extern ClusterNormalStopPollResult

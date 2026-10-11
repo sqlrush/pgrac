@@ -55,6 +55,7 @@
 #include "cluster/cluster_write_fence.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/bgwriter.h"
+#include "postmaster/checkpointer.h"
 #include "utils/elog.h"
 
 static ClusterPhaseSharedState sample_phase;
@@ -287,6 +288,11 @@ cluster_cf_held_is_clusterwide(LOCKMODE mode)
 {
 	return mode == ShareLock && phase_test_cf_held;
 }
+bool
+cluster_cf_held_is_usable(LOCKMODE mode)
+{
+	return mode == ShareLock && phase_test_cf_held;
+}
 ClusterCfReleaseResult
 cluster_cf_unlock_confirmed(LOCKMODE mode)
 {
@@ -316,6 +322,62 @@ static void
 ClusterStartupCheckpointPrepare(int flags, ControlFileData *selected)
 {
 	UT_ASSERT(false);
+}
+
+/* PGRAC: this sampler fixture has no outstanding CF owner. Retirement and
+ * budget mechanics are exercised by the native-consumer and budget suites. */
+uint64
+cluster_cf_attempt_sequence(void)
+{
+	return 1;
+}
+bool
+cluster_cf_last_attempt_since(uint64 before, ClusterCfAttemptObservation *out)
+{
+	UT_ASSERT(false); /* The lock boundary above always grants. */
+	return false;
+}
+bool
+cluster_cf_attempt_wait_slice(const ClusterCfAttemptObservation *observed)
+{
+	UT_ASSERT(false);
+	return false;
+}
+void
+cluster_cf_retirement_poll(void)
+{
+	UT_ASSERT(!phase_test_cf_held);
+}
+void
+cluster_lock_owners_service_poll(void)
+{
+	UT_ASSERT(!phase_test_cf_held);
+}
+bool
+cluster_cf_release_completed(LOCKMODE mode, uint64 cookie)
+{
+	UT_ASSERT(false);
+	return false;
+}
+bool
+cluster_normal_stop_requested(void)
+{
+	return ShutdownRequestPending;
+}
+uint64
+cluster_checkpoint_wait_budget_now(void)
+{
+	UT_ASSERT(ShutdownRequestPending);
+	return 1;
+}
+long
+cluster_checkpoint_wait_budget_charge(bool waiting, uint64 started_us,
+									  const ClusterWalSourceRef *ref, uint64 epoch)
+{
+	UT_ASSERT(ShutdownRequestPending && started_us == 1);
+	UT_ASSERT_EQ(memcmp(ref, &sample_ref, sizeof(*ref)), 0);
+	UT_ASSERT_EQ(epoch, phase_test_formation_epoch);
+	return 20;
 }
 void
 ProcessInterrupts(void)

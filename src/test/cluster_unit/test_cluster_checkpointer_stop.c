@@ -4,6 +4,10 @@
 #include "postgres.h"
 #include "access/xlog.h"
 #include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_epoch.h"
+#include "postmaster/checkpointer.h"
+#include "utils/timestamp.h"
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "../../backend/cluster/cluster_control_root_private.h"
@@ -40,6 +44,75 @@ static bool v2_ref_ok, v2_observe_ok;
 static unsigned v2_observe_calls;
 static unsigned v2_cas_left, v2_waits;
 static bool cancel_on_wait;
+static bool stopped_pending_forever;
+static uint64 fixture_now;
+static unsigned budget_begins, budget_ends, tail_begins, retirement_polls;
+static unsigned stop_wait_slices, retire_remaining;
+static bool bad_retirement_ack, tail_ok;
+static LOCKMODE retiring_mode;
+static ClusterCfAttemptObservation cf_attempt;
+#include "test_cluster_cf_observation.inc"
+
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	return (TimestampTz)fixture_now;
+}
+uint64
+cluster_epoch_get_current(void)
+{
+	return 9;
+}
+void
+cluster_checkpoint_wait_budget_begin(const ClusterPhase1FullStopPlan *plan,
+									 const ClusterWalSourceRef *ref)
+{
+	UT_ASSERT_EQ(checkpoint_calls, 0);
+	UT_ASSERT_EQ(plan->attempt_nonce, 101);
+	UT_ASSERT_EQ(ref->claim.identity.origin_thread_id, 1);
+	++budget_begins;
+}
+void
+cluster_checkpoint_wait_budget_end(void)
+{
+	UT_ASSERT_EQ(checkpoint_calls, 1);
+	UT_ASSERT_EQ(budget_begins, 1);
+	++budget_ends;
+}
+bool
+cluster_normal_stop_checkpoint_tail_begin(ClusterPhase1FullStopPlan *plan,
+										  ClusterNormalStopModuleObservation *out)
+{
+	UT_ASSERT_EQ(checkpoint_calls, 1);
+	UT_ASSERT_EQ(plan->attempt_nonce, 101);
+	UT_ASSERT_EQ(plan->absolute_deadline_us, 5000000);
+	++tail_begins;
+	memset(out, 0, sizeof(*out));
+	out->module = "COORDINATOR";
+	out->reason = "TAIL_FIXTURE";
+	return tail_ok;
+}
+void
+cluster_cf_retirement_poll(void)
+{
+	++retirement_polls;
+	if (retiring_mode != NoLock && --retire_remaining == 0)
+		retiring_mode = NoLock;
+}
+void
+cluster_lock_owners_service_poll(void)
+{}
+bool
+cluster_cf_held(LOCKMODE mode)
+{
+	return mode == retiring_mode;
+}
+bool
+cluster_cf_release_completed(LOCKMODE mode, uint64 cookie)
+{
+	return !bad_retirement_ack && retiring_mode != mode && cookie != 0
+		   && cookie == cf_attempt.control_owner_id;
+}
 static Latch fixture_latch;
 Latch *MyLatch = &fixture_latch;
 static ClusterNormalStopFailure failure;
@@ -212,8 +285,26 @@ cluster_control_root_v3_shutdown_observe(const ClusterWalSourceRef *ref,
 	UT_ASSERT_EQ(ref->claim.identity.origin_thread_id, 1);
 	memset(out, 0, sizeof(*out));
 	memset(token, 0, sizeof(*token));
+	UT_ASSERT_EQ(retiring_mode, NoLock);
+	UT_ASSERT_EQ(tail_begins, 1);
 	v2_observe_calls++;
 	record('V');
+	cf_attempt_begin(ShareLock, false, NULL);
+	if (stop_wait_slices != 0) {
+		--stop_wait_slices;
+		cf_attempt.result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+		cf_attempt.source = CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT;
+		cf_attempt.owner_state_at_return = CLUSTER_LOCK_OWNER_RETIRING;
+		cf_attempt.request_id = 100 + cf_attempt.sequence;
+		cf_attempt.request_epoch = 9;
+		cf_attempt.control_owner_id = 200 + cf_attempt.sequence;
+		cf_attempt.classified_wait = true;
+		retiring_mode = ShareLock;
+		retire_remaining = 3;
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	}
+	if (stopped_pending_forever)
+		return CLUSTER_CONTROL_ROOT_ADMISSION_PENDING;
 	if (v2_cas_left != 0) {
 		--v2_cas_left;
 		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
@@ -229,6 +320,13 @@ WaitLatch(Latch *latch, int events, long timeout, uint32 wait_event)
 	UT_ASSERT_EQ(timeout, 20);
 	UT_ASSERT_EQ(wait_event, WAIT_EVENT_CHECKPOINTER_MAIN);
 	v2_waits++;
+	if (stopped_pending_forever) {
+		fixture_now += UINT64_C(2000000);
+		if (v2_waits > 5) {
+			exit_code = 1;
+			longjmp(exit_boundary, 1); /* Bound only this baseline fixture. */
+		}
+	}
 	return WL_TIMEOUT;
 }
 void
@@ -270,9 +368,40 @@ proc_exit(int code)
 	longjmp(exit_boundary, 1);
 }
 
+/* Evaluate the real diagnostic fields, including the module/reason after
+ * pending or release failure; a prior pre-barrier observation is not evidence. */
+static char last_message[256], last_detail[512];
+static unsigned original_wait_logs;
+static int
+fixture_errmsg(const char *format, ...)
+{
+	va_list ap;
+	va_start(ap, format);
+	vsnprintf(last_message, sizeof(last_message), format, ap);
+	va_end(ap);
+	if (strcmp(last_message, "control-file wait continues under its original owner") == 0)
+		++original_wait_logs;
+	return 0;
+}
+static int
+fixture_errdetail(const char *format, ...)
+{
+	va_list ap;
+	va_start(ap, format);
+	vsnprintf(last_detail, sizeof(last_detail), format, ap);
+	va_end(ap);
+	return 0;
+}
+#undef errmsg
+#undef errdetail
+#undef errcode
+#define errmsg fixture_errmsg
+#define errdetail fixture_errdetail
+#define errcode(code) ((void)(code), 0)
 #undef ereport
 #define ereport(level, fields)                                                                     \
 	do {                                                                                           \
+		(void)(fields);                                                                            \
 		if ((level) >= ERROR) {                                                                    \
 			exit_code = 1;                                                                         \
 			record('!');                                                                           \
@@ -297,7 +426,14 @@ reset_fixture(void)
 	v2_ref_ok = v2_observe_ok = true;
 	v2_observe_calls = 0;
 	v2_cas_left = v2_waits = 0;
-	cancel_on_wait = false;
+	cancel_on_wait = stopped_pending_forever = false;
+	fixture_now = UINT64_C(1000000);
+	budget_begins = budget_ends = tail_begins = retirement_polls = 0;
+	stop_wait_slices = retire_remaining = 0;
+	bad_retirement_ack = false;
+	tail_ok = true;
+	retiring_mode = NoLock;
+	memset(&cf_attempt, 0, sizeof(cf_attempt));
 	native_mode = false;
 	native_stopped_ok = true;
 	native_stopped_calls = 0;
@@ -316,7 +452,8 @@ reset_fixture(void)
 	report_calls = config_calls = trace_pos = 0;
 	pi_scope_retained = true;
 	pi_scope_releases = 0;
-	trace[0] = 0;
+	trace[0] = last_message[0] = last_detail[0] = 0;
+	original_wait_logs = 0;
 	exit_code = -1;
 }
 static void
@@ -535,10 +672,77 @@ UT_TEST(v2_peer_root_publication_reobserves_without_fake_failure)
 		assert_no_fallback();
 	}
 }
+UT_TEST(stopped_pending_is_bounded_by_the_original_tail)
+{
+	reset_fixture();
+	cluster_shared_config = true;
+	stopped_pending_forever = true;
+	run_handler();
+	UT_ASSERT_EQ(exit_code, 1);
+	UT_ASSERT_EQ(failure, CLUSTER_NORMAL_STOP_FAILURE_DEADLINE);
+	UT_ASSERT_EQ(checkpoint_calls, 1);
+	UT_ASSERT_EQ(complete_calls, 0);
+	UT_ASSERT(v2_waits <= 2);
+	UT_ASSERT(strstr(last_detail, "module=WAL") != NULL);
+	UT_ASSERT(strstr(last_detail, "NORMAL_STOP_ROOT_STOPPED_DEADLINE") != NULL);
+	UT_ASSERT(strstr(last_detail, "FIXTURE_OWNER") == NULL);
+}
+
+UT_TEST(stopped_wait_retires_exact_owner_before_reobserving)
+{
+	for (unsigned bad_ack = 0; bad_ack < 2; ++bad_ack) {
+		reset_fixture();
+		cluster_shared_config = true;
+		stop_wait_slices = 2;
+		bad_retirement_ack = bad_ack != 0;
+		run_handler();
+		UT_ASSERT_EQ(exit_code, bad_ack ? 1 : 0);
+		UT_ASSERT_EQ(complete_calls, bad_ack ? 0 : 1);
+		UT_ASSERT_EQ(v2_observe_calls, bad_ack ? 1 : 3);
+		UT_ASSERT_EQ(budget_begins, 1);
+		UT_ASSERT_EQ(budget_ends, 1);
+		UT_ASSERT_EQ(tail_begins, 1);
+		UT_ASSERT(retirement_polls >= 4);
+		UT_ASSERT_EQ(original_wait_logs, 1);
+		if (bad_ack) {
+			UT_ASSERT(strstr(last_detail, "module=WAL") != NULL);
+			UT_ASSERT(strstr(last_detail, "NORMAL_STOP_CF_RETIREMENT_UNPROVEN") != NULL);
+		}
+	}
+}
+UT_TEST(failed_checkpoint_never_arms_the_tail)
+{
+	reset_fixture();
+	cluster_shared_config = true;
+	fail_checkpoint = true;
+	run_handler();
+	UT_ASSERT_EQ(budget_begins, 1);
+	UT_ASSERT_EQ(budget_ends, 0);
+	UT_ASSERT_EQ(tail_begins, 0);
+	UT_ASSERT_EQ(v2_observe_calls, 0);
+	reset_fixture();
+	cluster_shared_config = true;
+	tail_ok = false;
+	run_handler();
+	UT_ASSERT_EQ(exit_code, 1);
+	UT_ASSERT_EQ(budget_ends, 1);
+	UT_ASSERT_EQ(tail_begins, 1);
+	UT_ASSERT_EQ(v2_observe_calls, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(16);
+	if (getenv("PGRAC_STOPPED_DEADLINE_ONLY") != NULL) {
+		UT_PLAN(1);
+		UT_RUN(stopped_pending_is_bounded_by_the_original_tail);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	UT_PLAN(19);
+	UT_RUN(stopped_wait_retires_exact_owner_before_reobserving);
+	UT_RUN(failed_checkpoint_never_arms_the_tail);
+	UT_RUN(stopped_pending_is_bounded_by_the_original_tail);
 	UT_RUN(no_shutdown_is_not_a_stop_request);
 	UT_RUN(idle_retry_updates_native_shared_configuration);
 	UT_RUN(original_noncurrent_path_is_unchanged);

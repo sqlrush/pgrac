@@ -37,6 +37,7 @@
 #include <unistd.h>
 
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_epoch.h"
@@ -158,7 +159,7 @@ cluster_clean_leave_node_refuses_writes(void)
 	return false;
 }
 
-int
+ClusterStartupPhase
 cluster_current_phase(void)
 {
 	return 0;
@@ -1776,6 +1777,126 @@ UT_TEST(cf_tagged_caller_cannot_take_legacy_request_and_cut_retires_owner)
 	cluster_shared_config = false;
 }
 
+/* PGRAC: the original owner and release implementation remain linked. These
+ * observations classify waiting only; every refusal still returns false. */
+UT_TEST(cf_attempt_wait_slice_requires_exact_source_and_owner)
+{
+	ClusterCfAttemptObservation observation;
+	for (unsigned retained = 0; retained < 2; ++retained) {
+		uint64 before = cluster_cf_attempt_sequence();
+		g_seven_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+		g_timeout_detail.source = CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT;
+		fail_after_publication = retained != 0;
+		UT_ASSERT(!cluster_cf_lock(ShareLock));
+		fail_after_publication = false;
+		UT_ASSERT(cluster_cf_last_attempt_since(before, &observation));
+		UT_ASSERT(cluster_cf_attempt_wait_slice(&observation));
+		UT_ASSERT_EQ(observation.owner_state_at_return,
+					 retained ? CLUSTER_LOCK_OWNER_RETIRING : CLUSTER_LOCK_OWNER_EMPTY);
+		if (retained) {
+			UT_ASSERT_EQ(observation.request_id, observed_acquire_request.request_id);
+			UT_ASSERT_EQ(observation.request_epoch, observed_acquire_request.holder.cluster_epoch);
+			UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock), CLUSTER_CF_RELEASE_CONFIRMED);
+		}
+		UT_ASSERT(!cluster_cf_last_attempt_since(observation.sequence, &observation));
+	}
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+}
+
+UT_TEST(cf_attempt_s_then_x_and_next_acquire_invalidate_old_observation)
+{
+	ClusterCfAttemptObservation observation;
+	uint64 before = cluster_cf_attempt_sequence();
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	UT_ASSERT(cluster_cf_lock(ShareLock));
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock), CLUSTER_CF_RELEASE_CONFIRMED);
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+	g_timeout_detail.source = CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT;
+	UT_ASSERT(!cluster_cf_lock(ExclusiveLock));
+	UT_ASSERT(cluster_cf_last_attempt_since(before, &observation));
+	UT_ASSERT_EQ(observation.sequence, before + 2);
+	UT_ASSERT(cluster_cf_attempt_wait_slice(&observation));
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	UT_ASSERT(!cluster_cf_lock(ShareLock));
+	UT_ASSERT(!cluster_cf_attempt_wait_slice(&observation));
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+}
+
+UT_TEST(cf_attempt_other_refusals_never_become_waiting)
+{
+	ClusterCfAttemptObservation observation;
+	ClusterLockAcquireResult refusals[]
+		= { CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL, CLUSTER_LOCK_ACQUIRE_NOT_AVAIL,
+			CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK };
+	for (unsigned i = 0; i < lengthof(refusals); ++i) {
+		uint64 before = cluster_cf_attempt_sequence();
+		g_seven_result = refusals[i];
+		g_timeout_detail.source = CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT;
+		UT_ASSERT(!cluster_cf_lock(ShareLock));
+		UT_ASSERT(cluster_cf_last_attempt_since(before, &observation));
+		UT_ASSERT(!cluster_cf_attempt_wait_slice(&observation));
+	}
+	for (unsigned source = 0; source <= CLUSTER_GES_TSRC_BLOCK0_MASTER_REJECT + 1; ++source) {
+		uint64 before = cluster_cf_attempt_sequence();
+		g_seven_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+		g_timeout_detail.source = source;
+		UT_ASSERT(!cluster_cf_lock(ShareLock));
+		UT_ASSERT(cluster_cf_last_attempt_since(before, &observation));
+		UT_ASSERT_EQ(cluster_cf_attempt_wait_slice(&observation),
+					 source == CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT);
+	}
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+}
+
+UT_TEST(cf_attempt_error_and_foreign_duty_cannot_reuse_prior_wait)
+{
+	static const char configuration;
+	ClusterCfAttemptObservation observation;
+	uint64 before, original_cookie;
+	volatile bool caught = false;
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+	g_timeout_detail.source = CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT;
+	UT_ASSERT(!cluster_cf_lock(ShareLock));
+	before = cluster_cf_attempt_sequence();
+	throw_before_publication = true;
+	PG_TRY();
+	{
+		(void)cluster_cf_lock(ShareLock);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	throw_before_publication = false;
+	UT_ASSERT(caught);
+	UT_ASSERT(cluster_cf_last_attempt_since(before, &observation));
+	UT_ASSERT(!cluster_cf_attempt_wait_slice(&observation));
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	cluster_shared_config = true;
+	MyBackendType = B_LMON;
+	cf_poll_result = CLUSTER_GES_ACQUIRE_PENDING;
+	before = cluster_cf_attempt_sequence();
+	UT_ASSERT(!cluster_cf_lock_poll_owned(ShareLock, &configuration));
+	UT_ASSERT(cluster_cf_last_attempt_since(before, &observation));
+	UT_ASSERT(observation.cooperative && observation.caller == &configuration);
+	original_cookie = observation.control_owner_id;
+	UT_ASSERT(!cluster_cf_attempt_wait_slice(&observation));
+	before = cluster_cf_attempt_sequence();
+	UT_ASSERT(!cluster_cf_lock(ShareLock));
+	UT_ASSERT(cluster_cf_last_attempt_since(before, &observation));
+	UT_ASSERT(!cluster_cf_attempt_wait_slice(&observation));
+	UT_ASSERT_EQ(observation.owner_state_at_return, CLUSTER_LOCK_OWNER_ACQUIRING);
+	UT_ASSERT_EQ(observation.control_owner_id, original_cookie);
+	UT_ASSERT_EQ(cluster_cf_unlock_owned(ShareLock, &configuration),
+				 CLUSTER_CF_RELEASE_UNCONFIRMED);
+	UT_ASSERT(acknowledge_retirements());
+	cluster_cf_retirement_poll();
+	UT_ASSERT(!cluster_cf_held(ShareLock));
+	MyBackendType = B_INVALID;
+	cluster_shared_config = false;
+}
+
 int
 main(void)
 {
@@ -1783,7 +1904,7 @@ main(void)
 	pg_atomic_init_u32(&owner_proc.cluster_grd_registered_count, 0);
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked, 0);
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
-	UT_PLAN(40);
+	UT_PLAN(44);
 	UT_RUN(test_cf_resid_encode);
 	UT_RUN(test_lock_grant_then_release);
 	UT_RUN(test_held_and_write_permitted);
@@ -1824,6 +1945,10 @@ main(void)
 	UT_RUN(shared_cf_service_cut_change_retires_without_producing_holder);
 	UT_RUN(cf_local_caller_cannot_steal_pending_or_acquired_request);
 	UT_RUN(cf_tagged_caller_cannot_take_legacy_request_and_cut_retires_owner);
+	UT_RUN(cf_attempt_wait_slice_requires_exact_source_and_owner);
+	UT_RUN(cf_attempt_s_then_x_and_next_acquire_invalidate_old_observation);
+	UT_RUN(cf_attempt_other_refusals_never_become_waiting);
+	UT_RUN(cf_attempt_error_and_foreign_duty_cannot_reuse_prior_wait);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

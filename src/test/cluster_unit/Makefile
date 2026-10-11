@@ -68,7 +68,7 @@ TESTS = test_cluster_heap_cr_reuse test_cluster_buffer_cr test_cluster_buffer_ma
         test_cluster_bufmgr_stop test_cluster_allocation_stop test_cluster_hw_cold test_cluster_hw_initdb test_cluster_shared_parameters test_cluster_shared_config_alter test_cluster_checkpoint_pi_tick test_cluster_native_wal_stop test_cluster_checkpointer_stop test_cluster_postmaster_stop test_cluster_xnode_profile test_cluster_adg \
         test_cluster_xnode_lever test_cluster_ges_handoff \
         test_cluster_reverse_key test_cluster_hw_lease test_cluster_pi_shadow \
-        test_cluster_wait_events test_cluster_postmaster_lwlock test_cluster_phase_publication test_cluster_errcodes test_cluster_guc \
+        test_cluster_wait_events test_cluster_postmaster_lwlock test_cluster_phase_publication test_cluster_checkpoint_cleanup test_cluster_checkpoint_wait_budget test_cluster_checkpoint_error test_cluster_errcodes test_cluster_guc \
         test_cluster_shmem test_cluster_signal test_cluster_views \
         test_cluster_gviews test_cluster_ic test_cluster_ic_envelope \
         test_cluster_ic_router test_cluster_ic_rdma \
@@ -914,16 +914,44 @@ test_cluster_checkpointer_stop.inc: $(top_srcdir)/src/backend/postmaster/checkpo
 	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# PGRAC: execute the actual top-level error block and its two cluster hooks.
+test_cluster_checkpoint_error_state.inc: $(top_srcdir)/src/backend/postmaster/checkpointer.c $(top_srcdir)/src/backend/cluster/cluster_cf_enqueue.c Makefile
+	awk '/^typedef enum StartupSyncState/ || /^typedef struct CheckpointerShmemStruct/ || /^typedef struct CheckpointerRequest/ { emit=1; types++ } \
+	     /^CheckpointerStartupSyncFinish\(/ { print "static void"; emit=1; functions++ } \
+	     /^static CheckpointerShmemStruct \*CheckpointerShmem;/ || /^static uint64 startup_sync_active_request;/ || /^static bool ckpt_active/ { print } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (types != 3 || functions != 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^cluster_cf_owner_eor_abort\(/ { print "void"; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } END { if (functions != 1 || emit) exit 1 }' \
+	     $(top_srcdir)/src/backend/cluster/cluster_cf_enqueue.c >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_checkpoint_error.inc: $(top_srcdir)/src/backend/postmaster/checkpointer.c Makefile
+	awk '/^\tif \(sigsetjmp\(local_sigjmp_buf, 1\) != 0\)/ { print "static void\nCheckpointerErrorFixture(MemoryContext checkpointer_context)"; emit=1; blocks++; next } \
+	     emit { print } emit && /^\t}/ { emit=0 } \
+	     END { if (blocks != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_checkpoint_request.inc: $(top_srcdir)/src/backend/postmaster/checkpointer.c Makefile
+	awk '/^RequestCheckpoint\(/ { print "void"; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } END { if (functions != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_checkpoint_error: test_cluster_checkpoint_error.c test_cluster_checkpointer_stop.c test_cluster_checkpointer_stop.inc test_cluster_cf_observation.inc test_cluster_checkpoint_error_state.inc test_cluster_checkpoint_error.inc test_cluster_checkpoint_request.inc unit_test.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
 # PGRAC: execute the native adapter, not source-string assertions.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_checkpoint_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^Cluster(CheckpointV3|StartupCheckpoint)(Prepare|Publish)\(/ { print "static void"; emit=1; count++ } \
+	     /^ClusterCheckpointYieldForShutdown\(/ { print "static void"; emit=1 } \
 	     /^ClusterStartupFileSync\(/ { print "static bool"; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } END { if (count != 5) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_startup_writer_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^ClusterStartupConfigurationRequire\(/ || /^ClusterStartupWriterSelect\(/ || /^ClusterStartupCrashSeal\(/ { print "static void"; emit=1; count++ } \
+	     /^ClusterCf(ConsumerWaitSlice|RetirementPending)\(/ { print "static bool"; emit=1 } \
 	     /^ClusterStartupWriterBegin\(/ { print "static XLogRecPtr"; emit=1; count++ } \
 	     /^cluster_wal_startup_clean_input_v1\(/ { print "ClusterControlRootResult"; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } END { if (count != 5) exit 1 }' $< > $@.tmp
@@ -1000,8 +1028,47 @@ test_cluster_startup_recovery_control.inc: $(top_srcdir)/src/backend/access/tran
 	     END { if (count != 1 || ended != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_checkpoint_native: test_cluster_checkpoint_native.c test_cluster_checkpoint_native.inc test_cluster_startup_writer_native.inc test_cluster_startup_early_native.inc test_cluster_startup_control_native.inc test_cluster_startup_directory_native.inc test_cluster_startup_recovery_control.inc test_cluster_startup_insert_native.inc test_cluster_startup_lsn_native.inc test_cluster_startup_reserve_native.inc test_cluster_checkpoint_candidate.inc test_cluster_checkpoint_shutdown_begin.inc unit_test.h
+test_cluster_cf_observation.inc: $(top_srcdir)/src/backend/cluster/cluster_cf_enqueue.c Makefile
+	awk '/^cf_attempt_begin\(/ { print "static void"; emit=1; count++ } \
+	     /^cluster_cf_attempt_sequence\(/ { print "uint64"; emit=1; count++ } \
+	     /^cluster_cf_(last_attempt_since|attempt_wait_slice)\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_checkpoint_native: test_cluster_checkpoint_native.c test_cluster_checkpoint_native.inc test_cluster_cf_observation.inc test_cluster_startup_writer_native.inc test_cluster_startup_early_native.inc test_cluster_startup_control_native.inc test_cluster_startup_directory_native.inc test_cluster_startup_recovery_control.inc test_cluster_startup_insert_native.inc test_cluster_startup_lsn_native.inc test_cluster_startup_reserve_native.inc test_cluster_checkpoint_candidate.inc test_cluster_checkpoint_shutdown_begin.inc unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
+# PGRAC: the same cleanup bodies used by return and ERROR unwind, without
+# replacing their ordering or result propagation. Only release boundaries vary.
+test_cluster_checkpoint_cleanup_types.inc: $(top_srcdir)/src/backend/cluster/cluster_control_root.c Makefile
+	awk '/^typedef (enum CheckpointV2Purpose|struct (CheckpointV2Work|StartupCheckpointWork|StartupInstallWork)) / { emit=1; count++ } \
+	     emit { print } /^} (CheckpointV2Purpose|CheckpointV2Work|StartupCheckpointWork|StartupInstallWork);/ { emit=0 } \
+	     END { if (count != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_checkpoint_cleanup.inc: $(top_srcdir)/src/backend/cluster/cluster_control_root.c Makefile
+	awk '/^(release_cf|checkpoint_v2_cleanup|startup_checkpoint_cleanup|startup_install_cleanup)\(/ { print "static ClusterControlRootResult"; emit=1; count++ } \
+	     /^checkpoint_cleanup_result_merge\(/ { print "static ClusterControlRootResult"; emit=1 } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_checkpoint_cleanup: test_cluster_checkpoint_cleanup.c test_cluster_checkpoint_cleanup_types.inc test_cluster_checkpoint_cleanup.inc unit_test.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LDFLAGS) -o $@
+
+# PGRAC: retain the production local budget type and accounting functions.
+test_cluster_checkpoint_wait_budget.inc: $(top_srcdir)/src/backend/postmaster/checkpointer.c $(top_srcdir)/src/backend/cluster/cluster_clean_leave_policy.c Makefile
+	awk '/^typedef struct ClusterCheckpointWaitBudget/ { emit=1; types++ } \
+	     /^static ClusterCheckpointWaitBudget checkpoint_wait_budget/ { print } \
+	     /^(cluster_checkpoint_wait_budget_(now|begin|charge|end)|CheckpointWaitBudgetFail)\(/ { print prev; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (types != 1 || count != 5 || emit) exit 1 }' $< > $@.tmp
+	awk '/^cluster_clean_leave_phase1_full_stop_plan_valid\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' \
+	     $(top_srcdir)/src/backend/cluster/cluster_clean_leave_policy.c >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_checkpoint_wait_budget: test_cluster_checkpoint_wait_budget.c test_cluster_checkpoint_wait_budget.inc unit_test.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LDFLAGS) -o $@
 
 # PGRAC: actual checkpoint scan, pin/refusal consumer and IO-completion bodies.
 # Sorting/native scheduler and I/O are fixture boundaries, not a second owner.
@@ -1043,9 +1110,9 @@ test_cluster_native_wal_stop: test_cluster_native_wal_stop.c test_cluster_native
 		$(top_srcdir)/src/include/access/xlog.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
 
-test_cluster_checkpointer_stop: test_cluster_checkpointer_stop.c test_cluster_checkpointer_stop.inc unit_test.h \
+test_cluster_checkpointer_stop: test_cluster_checkpointer_stop.c test_cluster_checkpointer_stop.inc test_cluster_cf_observation.inc unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_clean_leave.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 test_cluster_normal_stop_cleaner.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
 	awk '/^undo_cleaner_normal_stop_exit\(/ { print "static void"; emit=1 } \
@@ -3882,7 +3949,7 @@ test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-$(filter-out test_cluster_postmaster_lwlock test_cluster_phase_publication test_cluster_sync_error test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
+$(filter-out test_cluster_postmaster_lwlock test_cluster_phase_publication test_cluster_checkpoint_cleanup test_cluster_checkpoint_wait_budget test_cluster_checkpoint_error test_cluster_sync_error test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
 
 # Native CR metadata checks are inline in the shared descriptor definition.
@@ -4323,8 +4390,10 @@ test_cluster_serving_sample.inc: $(top_srcdir)/src/backend/cluster/cluster_qvote
 test_cluster_serving_root.inc: $(top_srcdir)/src/backend/cluster/cluster_control_root.c \
 		$(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^runtime_v2_owner_check\(/ { print "static ClusterControlRootResult"; emit=1; n++ } \
+	     /^(ClusterCfConsumerWaitSlice|ClusterCfRetirementPending)\(/ { print "static bool"; emit=1; n++ } \
+	     /^ClusterCheckpointYieldForShutdown\(/ { print "static void"; emit=1; n++ } \
 	     /^ClusterCheckpointV3Prepare\(/ { print "static void"; emit=1; n++ } \
-	     emit { print } /^}/ { emit=0 } END { if (n != 2 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (n != 5 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_serving_send.inc: $(top_srcdir)/src/backend/cluster/cluster_ic_router.c \

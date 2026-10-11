@@ -31,6 +31,12 @@
  *
  *-------------------------------------------------------------------------
  */
+/* PGRAC MODIFICATIONS
+ * Modified by: SqlRush <sqlrush@gmail.com>
+ * Account original shutdown-owner waits separately from checkpoint I/O,
+ * then begin the existing control tail after checkpoint completion.
+ * spec-5.13-clean-leave-reconfig.md
+ */
 #include "postgres.h"
 
 #include <sys/time.h>
@@ -41,6 +47,8 @@
 #include "access/xlogrecovery.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_epoch.h"
+#include "postmaster/checkpointer.h"
 /* PGRAC: auxiliary control-owner census. Author: SqlRush <sqlrush@gmail.com> */
 #include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_clean_leave.h" /* shutdown handoff drain (RF-ROOT P6) */
@@ -73,6 +81,7 @@
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
+#include "utils/timestamp.h"
 
 
 /*----------
@@ -170,6 +179,125 @@ typedef struct CheckpointerShmemStruct
 static CheckpointerShmemStruct *CheckpointerShmem;
 
 #ifdef USE_PGRAC_CLUSTER
+/* PGRAC: one local accumulator per original normal-stop attempt. It grants
+ * no authority and excludes all checkpoint work outside an admitted wait.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct ClusterCheckpointWaitBudget {
+	uint64 attempt_nonce;
+	uint64 epoch;
+	ClusterWalSourceRef ref;
+	uint64 limit_us;
+	uint64 accumulated_us;
+	uint64 active_since_us;
+	bool active;
+	bool valid;
+} ClusterCheckpointWaitBudget;
+
+static ClusterCheckpointWaitBudget checkpoint_wait_budget;
+
+uint64
+cluster_checkpoint_wait_budget_now(void)
+{
+	struct timespec now;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0
+		|| now.tv_nsec < 0 || now.tv_nsec >= 1000000000L
+		|| (uint64)now.tv_sec > (UINT64_MAX - UINT64_C(999999)) / UINT64_C(1000000))
+		return 0;
+	return (uint64)now.tv_sec * UINT64_C(1000000) + (uint64)now.tv_nsec / UINT64_C(1000);
+}
+
+static void
+CheckpointWaitBudgetFail(ClusterNormalStopFailure failure, const char *reason)
+{
+	checkpoint_wait_budget.valid = false;
+	cluster_normal_stop_fail(failure);
+	ereport(ERROR,
+		(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+		 errmsg("shutdown checkpoint owner wait cannot continue"),
+		 errdetail("PGRAC_FAMILY=CHECKPOINT_WAIT reason=%s attempt=" UINT64_FORMAT
+				   " epoch=" UINT64_FORMAT " accumulated_us=" UINT64_FORMAT " limit_us=" UINT64_FORMAT,
+				   reason, checkpoint_wait_budget.attempt_nonce, checkpoint_wait_budget.epoch,
+				   checkpoint_wait_budget.accumulated_us, checkpoint_wait_budget.limit_us)));
+}
+
+void
+cluster_checkpoint_wait_budget_begin(const ClusterPhase1FullStopPlan *plan,
+									 const ClusterWalSourceRef *ref)
+{
+	uint64 now = cluster_checkpoint_wait_budget_now();
+
+	/* PGRAC: this is the admitted normal-stop plan, not the legacy
+	 * pristine phase-1 plan whose separate contract requires epoch zero. */
+	if (plan == NULL || !plan->valid || plan->epoch == UINT64_MAX
+		|| plan->attempt_nonce == 0 || plan->attempt_nonce == UINT64_MAX
+		|| plan->absolute_deadline_us == 0 || plan->absolute_deadline_us == UINT64_MAX
+		|| plan->own_wal_started_at <= 0 || ref == NULL || checkpoint_wait_budget.valid
+		|| checkpoint_wait_budget.attempt_nonce == plan->attempt_nonce
+		|| cluster_clean_leave_drain_timeout_ms <= 0 || now == 0)
+		CheckpointWaitBudgetFail(CLUSTER_NORMAL_STOP_FAILURE_STATE, "INVALID_BEGIN");
+	memset(&checkpoint_wait_budget, 0, sizeof(checkpoint_wait_budget));
+	checkpoint_wait_budget.attempt_nonce = plan->attempt_nonce;
+	checkpoint_wait_budget.epoch = plan->epoch;
+	checkpoint_wait_budget.ref = *ref;
+	checkpoint_wait_budget.limit_us = (uint64)cluster_clean_leave_drain_timeout_ms * UINT64_C(1000);
+	checkpoint_wait_budget.valid = true;
+	(void)cluster_checkpoint_wait_budget_charge(false, now, ref, plan->epoch);
+}
+
+long
+cluster_checkpoint_wait_budget_charge(bool waiting, uint64 started_us,
+									  const ClusterWalSourceRef *ref, uint64 epoch)
+{
+	ClusterLeaveState state;
+	ClusterWalSourceRef current;
+	uint64 now = cluster_checkpoint_wait_budget_now();
+	uint64 elapsed = 0;
+
+	if (!checkpoint_wait_budget.valid || !AmCheckpointerProcess() || !cluster_shared_config
+		|| !ShutdownRequestPending || !cluster_normal_stop_requested()
+		|| cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE
+		|| ref == NULL || epoch != checkpoint_wait_budget.epoch || cluster_epoch_get_current() != epoch
+		|| memcmp(ref, &checkpoint_wait_budget.ref, sizeof(*ref)) != 0
+		|| !cluster_wal_thread_current_v2_ref(&current) || memcmp(&current, ref, sizeof(current)) != 0)
+		CheckpointWaitBudgetFail(CLUSTER_NORMAL_STOP_FAILURE_IDENTITY, "OWNER_CHANGED");
+	cluster_clean_leave_get_state(&state);
+	/* The normal-stop epoch is checked against the original plan and live
+	 * cluster epoch above; leave_epoch belongs to the single-leave path. */
+	if (state.leaving_node_id != -1 || pg_atomic_read_u32(&state.phase) != CLUSTER_LEAVE_IDLE
+		|| pg_atomic_read_u32(&state.request_in_progress) != 1
+		|| pg_atomic_read_u32(&state.shutdown_driven) != 1
+		|| pg_atomic_read_u64(&state.leave_attempt_nonce) != checkpoint_wait_budget.attempt_nonce)
+		CheckpointWaitBudgetFail(CLUSTER_NORMAL_STOP_FAILURE_IDENTITY, "ATTEMPT_CHANGED");
+	if (now == 0 || started_us == 0 || started_us > now
+		|| (checkpoint_wait_budget.active
+			&& (checkpoint_wait_budget.active_since_us == 0 || checkpoint_wait_budget.active_since_us > now)))
+		CheckpointWaitBudgetFail(CLUSTER_NORMAL_STOP_FAILURE_STATE, "CLOCK_INVALID");
+	if (checkpoint_wait_budget.active)
+		elapsed = now - checkpoint_wait_budget.active_since_us;
+	else if (waiting)
+		elapsed = now - started_us;
+	if (elapsed > UINT64_MAX - checkpoint_wait_budget.accumulated_us)
+		CheckpointWaitBudgetFail(CLUSTER_NORMAL_STOP_FAILURE_DEADLINE, "WAIT_OVERFLOW");
+	checkpoint_wait_budget.accumulated_us += elapsed;
+	if (checkpoint_wait_budget.accumulated_us >= checkpoint_wait_budget.limit_us)
+		CheckpointWaitBudgetFail(CLUSTER_NORMAL_STOP_FAILURE_DEADLINE, "WAIT_EXHAUSTED");
+	checkpoint_wait_budget.active = waiting;
+	checkpoint_wait_budget.active_since_us = waiting ? now : 0;
+	return (long)Min(UINT64_C(20),
+		(checkpoint_wait_budget.limit_us - checkpoint_wait_budget.accumulated_us + 999) / 1000);
+}
+
+void
+cluster_checkpoint_wait_budget_end(void)
+{
+	if (!checkpoint_wait_budget.valid || checkpoint_wait_budget.active)
+		CheckpointWaitBudgetFail(CLUSTER_NORMAL_STOP_FAILURE_STATE, "UNFINISHED_WAIT");
+	(void)cluster_checkpoint_wait_budget_charge(false, cluster_checkpoint_wait_budget_now(),
+		&checkpoint_wait_budget.ref, checkpoint_wait_budget.epoch);
+	checkpoint_wait_budget.valid = false;
+}
+
 static uint64 startup_sync_active_request;
 static void CheckpointerStartupSyncFinish(bool success);
 static void CheckpointerStartupSyncPoll(void);
@@ -723,9 +851,25 @@ HandleCheckpointerInterrupts(void)
 				ereport(PANIC, (errmsg("cluster clean-leave: phase-1 full-stop prepare "
 									   "failed before the shutdown checkpoint")));
 		}
+		if (current_normal_stop && cluster_shared_config) {
+			ClusterWalSourceRef ref;
+			if (!cluster_wal_thread_current_v2_ref(&ref))
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+								errmsg("shutdown checkpoint has no original WAL reference")));
+			cluster_checkpoint_wait_budget_begin(&phase1_full_stop_plan, &ref);
+		}
 #endif
 		ShutdownXLOG(0, 0);
 #ifdef USE_PGRAC_CLUSTER
+		if (current_normal_stop) {
+			if (cluster_shared_config)
+				cluster_checkpoint_wait_budget_end();
+			if (!cluster_normal_stop_checkpoint_tail_begin(&phase1_full_stop_plan, &normal_stop_observation))
+				ereport(PANIC, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+								errmsg("cluster normal-stop: checkpoint tail could not start"),
+								errdetail("failure=%u reason=%s", (unsigned)cluster_normal_stop_failure(),
+										  normal_stop_observation.reason)));
+		}
 		/*
 		 * RF A1 W3: only a checkpointer that completed ShutdownXLOG may
 		 * publish the clean-close state.  The coordination stack is still
@@ -751,18 +895,83 @@ HandleCheckpointerInterrupts(void)
 			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 			/* The checkpoint already published the sole durable evidence.
 			 * Do not write or infer STOPPED in the old flat WAL registry. */
+			memset(&normal_stop_observation, 0, sizeof(normal_stop_observation));
+			normal_stop_observation.module = "WAL";
+			normal_stop_observation.reason = "NORMAL_STOP_CURRENT_WAL_REF_UNPROVEN";
 			if (cluster_wal_thread_current_v2_ref(&ref)) {
+				ClusterCfAttemptObservation waiting = { 0 };
+				bool wait_logged = false;
 				for (;;) {
-					CHECK_FOR_INTERRUPTS();
-					result = cluster_control_root_v3_shutdown_observe(&ref, &stopped, &token);
-					if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT
-						&& result != CLUSTER_CONTROL_ROOT_ADMISSION_PENDING)
-						break;
-					/* Same owner retry as native checkpoint publication. The
-					 * observer released all CF/WALR holds before this wait. */
-					(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
-									WAIT_EVENT_CHECKPOINTER_MAIN);
+					ClusterWalSourceRef current;
+					ClusterCfAttemptObservation observed;
+					uint64 before, now, remaining;
+					bool retiring;
+
 					ResetLatch(MyLatch);
+					CHECK_FOR_INTERRUPTS();
+					normal_stop_observation.reason = "NORMAL_STOP_ROOT_STOPPED_PENDING";
+					cluster_cf_retirement_poll();
+					cluster_lock_owners_service_poll();
+					retiring = cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock);
+					if (cluster_epoch_get_current() != phase1_full_stop_plan.epoch
+						|| !cluster_wal_thread_current_v2_ref(&current)
+						|| memcmp(&current, &ref, sizeof(ref)) != 0) {
+						result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+						normal_stop_observation.reason = "NORMAL_STOP_CURRENT_WAL_REF_CHANGED";
+						break;
+					}
+					now = (uint64)GetCurrentTimestamp();
+					if (phase1_full_stop_plan.absolute_deadline_us == 0 || now == 0
+						|| phase1_full_stop_plan.absolute_deadline_us == UINT64_MAX
+						|| now >= phase1_full_stop_plan.absolute_deadline_us) {
+						cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_DEADLINE);
+						normal_stop_observation.reason = "NORMAL_STOP_ROOT_STOPPED_DEADLINE";
+						break;
+					}
+					if (cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE)
+						break;
+					remaining = phase1_full_stop_plan.absolute_deadline_us - now;
+					if (!retiring) {
+						if (waiting.owner_state_at_return == CLUSTER_LOCK_OWNER_RETIRING
+							&& waiting.control_owner_id != 0
+							&& !cluster_cf_release_completed(waiting.mode, waiting.control_owner_id)) {
+							result = CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN;
+							normal_stop_observation.reason = "NORMAL_STOP_CF_RETIREMENT_UNPROVEN";
+							break;
+						}
+						memset(&waiting, 0, sizeof(waiting));
+						before = cluster_cf_attempt_sequence();
+						result = cluster_control_root_v3_shutdown_observe(&ref, &stopped, &token);
+						if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+							&& cluster_cf_last_attempt_since(before, &observed)
+							&& cluster_cf_attempt_wait_slice(&observed)) {
+							waiting = observed;
+							if (!wait_logged) {
+								wait_logged = true;
+								ereport(LOG,
+									(errmsg("control-file wait continues under its original owner"),
+									 errdetail("PGRAC_FAMILY=CF_OWNER_WAIT consumer=checkpointer operation=stopped "
+											   "mode=%d request=" UINT64_FORMAT " epoch=" UINT64_FORMAT
+											   " caller_cookie=" UINT64_FORMAT " owner_state=%d result=%d "
+											   "timeout_source=%d remaining_us=" UINT64_FORMAT,
+											   (int)observed.mode, observed.request_id, observed.request_epoch,
+											   observed.control_owner_id, (int)observed.owner_state_at_return,
+											   (int)observed.result, (int)observed.source, remaining)));
+							}
+						} else if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT
+								   && result != CLUSTER_CONTROL_ROOT_ADMISSION_PENDING) {
+							normal_stop_observation.reason = result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+								? "NORMAL_STOP_ROOT_STOPPED_CONFIRMED" : "NORMAL_STOP_ROOT_STOPPED_REFUSED";
+							snprintf(normal_stop_observation.object, sizeof(normal_stop_observation.object),
+									 "result=%d epoch=" UINT64_FORMAT, (int)result, phase1_full_stop_plan.epoch);
+							break;
+						}
+					}
+					snprintf(normal_stop_observation.object, sizeof(normal_stop_observation.object),
+							 "result=%d mode=%d caller_cookie=" UINT64_FORMAT " remaining_us=" UINT64_FORMAT,
+							 (int)result, (int)waiting.mode, waiting.control_owner_id, remaining);
+					(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+									(long)Min(UINT64_C(20), (remaining + 999) / 1000), WAIT_EVENT_CHECKPOINTER_MAIN);
 				}
 			}
 			wal_stopped_ok = result == CLUSTER_CONTROL_ROOT_OK_PRIMARY;

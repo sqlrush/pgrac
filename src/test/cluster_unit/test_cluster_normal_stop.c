@@ -76,6 +76,7 @@ static ClusterNormalStopPollResult lmon_local_observation;
 static bool lmon_late_actor;
 static void (*checkpoint_wait_action)(void);
 static unsigned checkpoint_waits, checkpoint_resets, checkpoint_wakes;
+static unsigned checkpoint_cf_retirement_pending;
 static long checkpoint_previous_timeout;
 
 /* The extracted LMS loop retains its control-owner scheduling edge. Its
@@ -92,6 +93,8 @@ cluster_cf_retirement_poll(void)
 {
 	if (lock_holds != 0)
 		abort();
+	if (checkpoint_cf_retirement_pending != 0 && --checkpoint_cf_retirement_pending == 0)
+		module_results[13] = CLUSTER_NORMAL_STOP_READY;
 }
 
 bool IsUnderPostmaster;
@@ -3264,6 +3267,35 @@ UT_TEST(test_front_fixed_deadline_and_role_failure_cannot_requalify)
 	UT_ASSERT(!out.valid);
 }
 
+UT_TEST(test_online_error_delay_does_not_create_or_renew_the_pre_deadline)
+{
+	ClusterPhase1FullStopPlan out;
+	uint64 deadline, nonce;
+
+	reset_identity();
+	front_local_postmaster_cut(true);
+	UT_ASSERT_EQ(cl_state->barrier_deadline_us, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->request_in_progress), 0);
+	/* PGRAC: the real error-block fixture measures the original one-second
+	 * delay. Before the first pre poll, no pre budget has been armed. */
+	fixture_now += UINT64_C(1000000);
+	UT_ASSERT_EQ(cluster_normal_stop_fronts_poll(&out, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	deadline = cl_state->barrier_deadline_us;
+	nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
+	UT_ASSERT_EQ(deadline, fixture_now + UINT64_C(30000000));
+	/* A previously armed attempt does consume that elapsed second. It must
+	 * keep its original deadline and nonce, never obtain another budget. */
+	fixture_now += UINT64_C(1000000);
+	UT_ASSERT_EQ(cluster_normal_stop_fronts_poll(&out, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(cl_state->barrier_deadline_us, deadline);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&cl_state->leave_attempt_nonce), nonce);
+	UT_ASSERT_EQ(deadline - fixture_now, UINT64_C(29000000));
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+	fixture_now = deadline;
+	UT_ASSERT_EQ(cluster_normal_stop_fronts_poll(&out, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_DEADLINE);
+}
+
 UT_TEST(test_front_source_wal_and_root_recheck_precede_publication)
 {
 	int fault;
@@ -3917,6 +3949,64 @@ seed_at_checkpoint(ClusterPhase1FullStopPlan *plan)
 		abort();
 }
 
+/* The native WAL checkpoint is a boundary in this controller fixture.
+ * Model its new timer call before executing the unchanged protocol assertions. */
+static ClusterNormalStopPollResult
+arm_after_checkpoint(ClusterPhase1FullStopPlan *plan,
+					 ClusterNormalStopModuleObservation *observation)
+{
+	if (cl_normal_stop->post_checkpoint_deadline_us == 0
+		&& !cluster_normal_stop_checkpoint_tail_begin(plan, observation))
+		return CLUSTER_NORMAL_STOP_INVALID;
+	return cluster_normal_stop_post_checkpoint_arm(plan, observation);
+}
+
+static bool
+complete_after_checkpoint(ClusterPhase1FullStopPlan *plan,
+						  ClusterNormalStopModuleObservation *observation)
+{
+	if (cl_normal_stop->post_checkpoint_deadline_us == 0
+		&& !cluster_normal_stop_checkpoint_tail_begin(plan, observation))
+		return false;
+	return cluster_normal_stop_checkpoint_complete(plan, observation);
+}
+
+UT_TEST(test_tail_timer_never_consumes_stopped_or_early_peer_acks)
+{
+	ClusterPhase1FullStopPlan plan;
+	uint64 nonce, deadline;
+	uint8 ack;
+	seed_at_checkpoint(&plan);
+	nonce = plan.attempt_nonce;
+	ack = cl_state->ack_bitmap[0];
+	fixture_now = plan.absolute_deadline_us + 100;
+	UT_ASSERT(cluster_normal_stop_checkpoint_tail_begin(&plan, NULL));
+	deadline = plan.absolute_deadline_us;
+	UT_ASSERT_EQ(deadline, fixture_now + (uint64)cluster_clean_leave_drain_timeout_ms * 1000);
+	UT_ASSERT_EQ(cl_normal_stop->post_checkpoint_deadline_us, deadline);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), CLUSTER_NORMAL_STOP_CHECKPOINT);
+	UT_ASSERT_EQ(plan.attempt_nonce, nonce);
+	UT_ASSERT_EQ(cl_state->ack_bitmap[0], ack);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->preflight_pending), 0);
+	fixture_now += 500;
+	UT_ASSERT(cluster_normal_stop_checkpoint_tail_begin(&plan, NULL));
+	UT_ASSERT_EQ(plan.absolute_deadline_us, deadline);
+	UT_ASSERT(!cluster_normal_stop_protocol_closed());
+	fixture_now = deadline;
+	UT_ASSERT(!cluster_normal_stop_checkpoint_tail_begin(&plan, NULL));
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_DEADLINE);
+}
+
+UT_TEST(test_post_arm_cannot_start_or_reset_the_checkpoint_tail)
+{
+	ClusterPhase1FullStopPlan plan;
+	seed_at_checkpoint(&plan);
+	identity_wal.state = CLUSTER_WAL_SLOT_STATE_STOPPED;
+	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(cl_normal_stop->post_checkpoint_deadline_us, 0);
+	UT_ASSERT(!cluster_normal_stop_protocol_closed());
+}
+
 UT_TEST(test_post_checkpoint_arm_uses_exact_stop_identity_and_one_fresh_nonce)
 {
 	ClusterPhase1FullStopPlan plan, before, armed;
@@ -3925,8 +4015,7 @@ UT_TEST(test_post_checkpoint_arm_uses_exact_stop_identity_and_one_fresh_nonce)
 	before = plan;
 	/* The actual WAL producer is outside this unit's native boundary. */
 	identity_wal.state = CLUSTER_WAL_SLOT_STATE_STOPPED;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, &observation),
-				 CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, &observation), CLUSTER_NORMAL_STOP_READY);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), CLUSTER_NORMAL_STOP_POST_STOPPED);
 	UT_ASSERT_EQ(plan.epoch, before.epoch);
 	UT_ASSERT(plan.attempt_nonce != before.attempt_nonce);
@@ -3939,8 +4028,7 @@ UT_TEST(test_post_checkpoint_arm_uses_exact_stop_identity_and_one_fresh_nonce)
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->phase1_release_pending), 0);
 	armed = plan;
 	fixture_now += 100;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, &observation),
-				 CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, &observation), CLUSTER_NORMAL_STOP_READY);
 	UT_ASSERT_EQ(memcmp(&plan, &armed, sizeof(plan)), 0);
 	UT_ASSERT(!cluster_normal_stop_protocol_closed());
 }
@@ -3953,16 +4041,14 @@ UT_TEST(test_post_checkpoint_arm_pending_preserves_predecessor_and_peer_ownershi
 	before = plan;
 	identity_wal.state = CLUSTER_WAL_SLOT_STATE_STOPPED;
 	module_results[9] = CLUSTER_NORMAL_STOP_PENDING;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, &observation),
-				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, &observation), CLUSTER_NORMAL_STOP_PENDING);
 	UT_ASSERT_EQ(memcmp(&plan, &before, sizeof(plan)), 0);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), CLUSTER_NORMAL_STOP_CHECKPOINT);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->preflight_pending), 0);
 	UT_ASSERT_EQ(cl_state->ack_bitmap[0], 11);
 	module_results[9] = CLUSTER_NORMAL_STOP_READY;
 	module_late_active = 2;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, &observation),
-				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, &observation), CLUSTER_NORMAL_STOP_PENDING);
 	UT_ASSERT_EQ(memcmp(&plan, &before, sizeof(plan)), 0);
 	/* An absent arm body did not enter the fixture actor. */
 	if (cl_normal_stop_service_depth == 0)
@@ -3972,8 +4058,7 @@ UT_TEST(test_post_checkpoint_arm_pending_preserves_predecessor_and_peer_ownershi
 	UT_ASSERT_EQ(cluster_normal_stop_service_idle(CLUSTER_NORMAL_STOP_READY),
 				 CLUSTER_NORMAL_STOP_READY);
 	MyAuxProcType = CheckpointerProcess;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, &observation),
-				 CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, &observation), CLUSTER_NORMAL_STOP_READY);
 }
 
 UT_TEST(test_pi_waits_for_all_checkpoints_not_before_checkpoint_exchange)
@@ -3985,7 +4070,7 @@ UT_TEST(test_pi_waits_for_all_checkpoints_not_before_checkpoint_exchange)
 	/* The real coordinator used to require PI discard before it could
 	 * exchange the very durability proof needed to authorize that discard. */
 	UT_ASSERT_EQ(cluster_normal_stop_modules_poll(true, NULL), CLUSTER_NORMAL_STOP_PENDING);
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), CLUSTER_NORMAL_STOP_POST_STOPPED);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->phase1_release_pending), 0);
 	UT_ASSERT(module_pi_pending);
@@ -4012,8 +4097,7 @@ UT_TEST(test_post_checkpoint_arm_never_substitutes_active_wal_or_changed_plan)
 			plan.attempt_nonce++;
 		if (fault == 4)
 			plan.absolute_deadline_us++;
-		UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, &observation),
-					 CLUSTER_NORMAL_STOP_INVALID);
+		UT_ASSERT_EQ(arm_after_checkpoint(&plan, &observation), CLUSTER_NORMAL_STOP_INVALID);
 		UT_ASSERT(cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE);
 		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), CLUSTER_NORMAL_STOP_CHECKPOINT);
 		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->preflight_pending), 0);
@@ -4046,7 +4130,7 @@ UT_TEST(test_post_control_retains_early_successor_until_own_stopped_and_armed)
 	UT_ASSERT_EQ(front_ack_sends, 3);
 	identity_wal.state = CLUSTER_WAL_SLOT_STATE_STOPPED;
 	MyAuxProcType = CheckpointerProcess;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
 	MyAuxProcType = LmonProcess;
 	cl_normal_stop_post_lmon_tick();
 	UT_ASSERT(!cl_normal_stop_front_inbox[1].pending);
@@ -4067,7 +4151,7 @@ UT_TEST(test_pre2_post_tick_retains_one_observation_through_owner_census)
 	unsigned calls;
 	seed_at_checkpoint(&plan);
 	identity_wal.state = CLUSTER_WAL_SLOT_STATE_STOPPED;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
 	/* Switch only the I/O boundary: real post-stop scheduler/owners/send
 	 * execute below. Every new CF observation needs a later poll. */
 	cluster_shared_config = true;
@@ -4093,7 +4177,7 @@ UT_TEST(test_post_control_retries_only_unadmitted_send_before_reply_permission)
 	ClusterPhase1FullStopPlan plan;
 	seed_at_checkpoint(&plan);
 	identity_wal.state = CLUSTER_WAL_SLOT_STATE_STOPPED;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
 	identity_peer_wal[1].state = CLUSTER_WAL_SLOT_STATE_STOPPED;
 	front_peer_request(1, 2302);
 	front_send_result[1] = CLUSTER_IC_SEND_NOT_ADMITTED;
@@ -4129,7 +4213,7 @@ UT_TEST(test_post_control_ack_waits_for_peer_stopped_request_and_original_identi
 	ClusterPhase1FullStopPlan plan;
 	seed_at_checkpoint(&plan);
 	identity_wal.state = CLUSTER_WAL_SLOT_STATE_STOPPED;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
 	identity_peer_wal[1].state = CLUSTER_WAL_SLOT_STATE_STOPPED;
 	front_peer_ack(1, plan.attempt_nonce, false);
 	cl_normal_stop_post_lmon_tick();
@@ -4151,7 +4235,7 @@ UT_TEST(test_post_control_request_cannot_use_prior_arm_over_current_actor)
 	ClusterPhase1FullStopPlan plan;
 	seed_at_checkpoint(&plan);
 	identity_wal.state = CLUSTER_WAL_SLOT_STATE_STOPPED;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
 	MyAuxProcType = LmsProcess;
 	UT_ASSERT(cluster_normal_stop_service_enter());
 	MyAuxProcType = LmonProcess;
@@ -4173,7 +4257,7 @@ UT_TEST(test_post_control_reply_requires_current_lmon_private_census)
 	ClusterPhase1FullStopPlan plan;
 	seed_at_checkpoint(&plan);
 	identity_wal.state = CLUSTER_WAL_SLOT_STATE_STOPPED;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
 	MyAuxProcType = LmonProcess;
 	cl_normal_stop_post_lmon_tick();
 	identity_peer_wal[1].state = CLUSTER_WAL_SLOT_STATE_STOPPED;
@@ -4196,7 +4280,7 @@ UT_TEST(test_post_control_send_cut_rechecks_actor_after_local_census)
 	ClusterPhase1FullStopPlan plan;
 	seed_at_checkpoint(&plan);
 	identity_wal.state = CLUSTER_WAL_SLOT_STATE_STOPPED;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
 	MyAuxProcType = LmonProcess;
 	lmon_late_actor = true;
 	cl_normal_stop_post_lmon_tick();
@@ -4210,7 +4294,7 @@ seed_post_barrier(ClusterPhase1FullStopPlan *plan)
 {
 	seed_at_checkpoint(plan);
 	identity_wal.state = CLUSTER_WAL_SLOT_STATE_STOPPED;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(arm_after_checkpoint(plan, NULL), CLUSTER_NORMAL_STOP_READY);
 	for (int peer = 0; peer < 4; peer++)
 		if (peer != cluster_node_id) {
 			identity_peer_wal[peer].state = CLUSTER_WAL_SLOT_STATE_STOPPED;
@@ -4409,7 +4493,7 @@ UT_TEST(test_release_arm_waits_for_barrier_and_preserves_early_request)
 	ClusterPhase1FullStopPlan plan, before;
 	seed_at_checkpoint(&plan);
 	identity_wal.state = CLUSTER_WAL_SLOT_STATE_STOPPED;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
 	UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->phase1_release_pending), 0);
 	seed_post_barrier(&plan);
@@ -4753,7 +4837,7 @@ UT_TEST(test_actual_complete_wait_drives_original_post_stop_and_release)
 	nonce = plan.attempt_nonce;
 	identity_wal.state = CLUSTER_WAL_SLOT_STATE_STOPPED;
 	start_checkpoint_wait(checkpoint_post_wait);
-	UT_ASSERT(cluster_normal_stop_checkpoint_complete(&plan, NULL));
+	UT_ASSERT(complete_after_checkpoint(&plan, NULL));
 	checkpoint_wait_action = NULL;
 	UT_ASSERT_EQ(checkpoint_waits, 2);
 	UT_ASSERT_EQ(plan.absolute_deadline_us, deadline);
@@ -4770,7 +4854,7 @@ UT_TEST(test_completed_checkpoint_gets_once_only_post_budget)
 	post_start = fixture_now;
 	identity_wal.state = CLUSTER_WAL_SLOT_STATE_STOPPED;
 	start_checkpoint_wait(checkpoint_post_wait);
-	UT_ASSERT(cluster_normal_stop_checkpoint_complete(&plan, NULL));
+	UT_ASSERT(complete_after_checkpoint(&plan, NULL));
 	checkpoint_wait_action = NULL;
 	UT_ASSERT_EQ(plan.absolute_deadline_us,
 				 post_start + (uint64)cluster_clean_leave_drain_timeout_ms * 1000);
@@ -4786,15 +4870,15 @@ UT_TEST(test_post_budget_starts_before_pending_owners_and_never_renews)
 	post_start = fixture_now;
 	identity_wal.state = CLUSTER_WAL_SLOT_STATE_STOPPED;
 	module_results[9] = CLUSTER_NORMAL_STOP_PENDING;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
 	deadline = post_start + (uint64)cluster_clean_leave_drain_timeout_ms * 1000;
 	UT_ASSERT_EQ(plan.absolute_deadline_us, deadline);
 	fixture_now += 500;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
 	UT_ASSERT_EQ(plan.absolute_deadline_us, deadline);
 	fixture_now = deadline;
 	module_results[9] = CLUSTER_NORMAL_STOP_READY;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, NULL), CLUSTER_NORMAL_STOP_INVALID);
 	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_DEADLINE);
 	UT_ASSERT_EQ(plan.absolute_deadline_us, deadline);
 	UT_ASSERT(!cluster_normal_stop_protocol_closed());
@@ -4837,7 +4921,7 @@ UT_TEST(test_actual_wait_wrong_actor_cannot_touch_close_state)
 	before = lock_acquisitions;
 	IsUnderPostmaster = false;
 	UT_ASSERT(!cluster_normal_stop_checkpoint_prepare(&plan, NULL));
-	UT_ASSERT(!cluster_normal_stop_checkpoint_complete(&plan, NULL));
+	UT_ASSERT(!complete_after_checkpoint(&plan, NULL));
 	UT_ASSERT_EQ(lock_acquisitions, before);
 	IsUnderPostmaster = true;
 }
@@ -4931,13 +5015,13 @@ UT_TEST(test_native_post_checkpoint_requires_actual_own_stopped_control)
 	ClusterPhase1FullStopPlan plan;
 	seed_at_checkpoint(&plan);
 	use_native_wal_topology();
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, NULL), CLUSTER_NORMAL_STOP_INVALID);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), CLUSTER_NORMAL_STOP_CHECKPOINT);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->preflight_pending), 0);
 	seed_at_checkpoint(&plan);
 	use_native_wal_topology();
 	native_control_stopped = true;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
 	UT_ASSERT(!cluster_normal_stop_protocol_closed());
 }
 
@@ -4947,7 +5031,7 @@ UT_TEST(test_native_post_successor_requires_nonce_lineage_and_retains_early_ack)
 	seed_at_checkpoint(&plan);
 	use_native_wal_topology();
 	native_control_stopped = true;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
 	front_peer_ack(1, plan.attempt_nonce, false);
 	cl_normal_stop_post_lmon_tick();
 	UT_ASSERT(cl_normal_stop_front_inbox[1].ack_pending);
@@ -5335,7 +5419,7 @@ pre2_declared_to_post_messages(uint32 members, int self, uint32 acknowledgers,
 		return false;
 	for (int peer = 0; peer < 4; peer++)
 		identity_pre2_phase[peer] = CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(arm_after_checkpoint(plan, NULL), CLUSTER_NORMAL_STOP_READY);
 	for (int peer = 0; peer < 4; peer++)
 		if (peer != self && (members & (UINT32_C(1) << peer)))
 			front_peer_request(peer, 3000 + peer);
@@ -5473,7 +5557,7 @@ UT_TEST(test_pre2_early_stopped_frame_waits_without_blocking_own_checkpoint)
 	idle_original_actors();
 	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, NULL), CLUSTER_NORMAL_STOP_READY);
 	identity_pre2_phase[2] = CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
 	MyAuxProcType = LmonProcess;
 	reads = identity_pre2_reads;
 	cl_normal_stop_post_lmon_tick();
@@ -5490,7 +5574,7 @@ UT_TEST(test_pre2_post_waits_for_peer_without_reopening_cf)
 	unsigned reads;
 	UT_ASSERT(pre2_declared_to_checkpoint(15, 2, &plan));
 	identity_pre2_phase[2] = CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
 	MyAuxProcType = LmonProcess;
 	cl_normal_stop_post_lmon_tick();
 	UT_ASSERT_EQ(cl_phase1_post_stopped_request_sent[0], 11);
@@ -5527,7 +5611,7 @@ UT_TEST(test_pre2_post_identity_read_is_owned_through_completion)
 	const char *reason = NULL;
 	UT_ASSERT(pre2_declared_to_checkpoint(15, 2, &plan));
 	identity_pre2_phase[2] = CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
 	MyAuxProcType = LmonProcess;
 	identity_pre2_pending_reads = 2;
 	for (unsigned tick = 0; tick < 2; tick++) {
@@ -5558,7 +5642,7 @@ UT_TEST(test_pre2_deferred_stopped_frame_is_not_cached_authority)
 	MyAuxProcType = CheckpointerProcess;
 	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, NULL), CLUSTER_NORMAL_STOP_READY);
 	identity_pre2_phase[2] = CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
-	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(arm_after_checkpoint(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
 	MyAuxProcType = LmonProcess;
 	reads = identity_pre2_reads;
 	identity_pre2_phase[1] = CLUSTER_CONTROL_ROOT_STOP_ACTIVE;
@@ -5767,7 +5851,7 @@ UT_TEST(test_pre2_actual_complete_keeps_observation_until_census_completes)
 	identity_pre2_checkpoint_reads = 0;
 	identity_pre2_checkpoint_debt = true;
 	start_checkpoint_wait(checkpoint_observation_debt_wait);
-	UT_ASSERT(cluster_normal_stop_checkpoint_complete(&plan, NULL));
+	UT_ASSERT(complete_after_checkpoint(&plan, NULL));
 	checkpoint_wait_action = NULL;
 	UT_ASSERT_EQ(identity_pre2_checkpoint_reads, 1);
 	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
@@ -5826,7 +5910,7 @@ UT_TEST(test_pre2_actual_closed_waits_for_release_then_drains_publication_once)
 	durable_close_all = false;
 	durable_close_calls = identity_pre2_checkpoint_reads = 0;
 	start_checkpoint_wait(checkpoint_closed_release_wait);
-	UT_ASSERT(cluster_normal_stop_checkpoint_complete(&plan, NULL));
+	UT_ASSERT(complete_after_checkpoint(&plan, NULL));
 	checkpoint_wait_action = NULL;
 	UT_ASSERT_EQ(durable_close_calls, 2);
 	UT_ASSERT_EQ(identity_pre2_checkpoint_reads, 1);
@@ -5868,7 +5952,7 @@ UT_TEST(test_pre2_actual_close_does_not_lose_release_during_publication)
 	durable_close_calls = 0;
 	durable_close_hook = checkpoint_release_during_publication;
 	start_checkpoint_wait(checkpoint_release_before_wait);
-	UT_ASSERT(cluster_normal_stop_checkpoint_complete(&plan, NULL));
+	UT_ASSERT(complete_after_checkpoint(&plan, NULL));
 	checkpoint_wait_action = NULL;
 	UT_ASSERT_EQ(durable_close_calls, 2);
 	UT_ASSERT(cluster_normal_stop_protocol_closed());
@@ -5924,7 +6008,7 @@ UT_TEST(test_pre2_actual_release_cannot_replace_global_close_proof)
 	durable_close_all = false;
 	durable_close_calls = 0;
 	start_checkpoint_wait(checkpoint_release_without_global_close);
-	UT_ASSERT(!cluster_normal_stop_checkpoint_complete(&plan, NULL));
+	UT_ASSERT(!complete_after_checkpoint(&plan, NULL));
 	checkpoint_wait_action = NULL;
 	UT_ASSERT_EQ(durable_close_calls, 2);
 	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_DEADLINE);
@@ -5956,7 +6040,7 @@ UT_TEST(test_pre2_actual_completed_publication_keeps_nonce_deadline_and_owner_ch
 		durable_close_calls = 0;
 		durable_close_post_fault = 1;
 		start_checkpoint_wait(checkpoint_completed_publication_fault);
-		UT_ASSERT(!cluster_normal_stop_checkpoint_complete(&plan, NULL));
+		UT_ASSERT(!complete_after_checkpoint(&plan, NULL));
 		checkpoint_wait_action = NULL;
 		UT_ASSERT_EQ(checkpoint_waits, 1);
 		UT_ASSERT_EQ(durable_close_calls, 1);
@@ -6103,10 +6187,45 @@ UT_TEST(test_pre2_pair_rejects_nondeclared_release_reply_even_after_seal)
 	cluster_shared_config = false;
 }
 
+static void
+checkpoint_retire_wait(void)
+{
+	if (checkpoint_cf_retirement_pending != 0) {
+		if (checkpoint_waits >= 3)
+			fixture_now = cl_state->barrier_deadline_us;
+		return;
+	}
+	checkpoint_pre_wait();
+}
+
+UT_TEST(test_precheckpoint_wait_drives_its_own_cf_retirement)
+{
+	ClusterPhase1FullStopPlan plan = { 0 };
+	seed_module_drain();
+	idle_original_actors();
+	module_results[13] = CLUSTER_NORMAL_STOP_PENDING;
+	checkpoint_cf_retirement_pending = 2;
+	start_checkpoint_wait(checkpoint_retire_wait);
+	UT_ASSERT(cluster_normal_stop_checkpoint_prepare(&plan, NULL));
+	checkpoint_wait_action = NULL;
+	UT_ASSERT_EQ(checkpoint_cf_retirement_pending, 0);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+	checkpoint_cf_retirement_pending = 0;
+}
+
 int
 main(void)
 {
-	UT_PLAN(152);
+	if (getenv("PGRAC_CF_RETIRE_ONLY") != NULL) {
+		UT_PLAN(1);
+		UT_RUN(test_precheckpoint_wait_drives_its_own_cf_retirement);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	UT_PLAN(156);
+	UT_RUN(test_tail_timer_never_consumes_stopped_or_early_peer_acks);
+	UT_RUN(test_post_arm_cannot_start_or_reset_the_checkpoint_tail);
+	UT_RUN(test_precheckpoint_wait_drives_its_own_cf_retirement);
 	UT_RUN(test_actual_cleaner_pending_stop_retries_before_recycle_interval);
 	UT_RUN(test_actual_cleaner_without_stop_preserves_idle_cadence);
 	UT_RUN(test_pre2_stop_clean_restart_binds_current_epoch_and_original_record);
@@ -6174,6 +6293,7 @@ main(void)
 	UT_RUN(test_front_transport_refusal_retries_only_unadmitted_peer);
 	UT_RUN(test_front_conflicting_nonce_never_replaces_pending_or_bound_request);
 	UT_RUN(test_front_fixed_deadline_and_role_failure_cannot_requalify);
+	UT_RUN(test_online_error_delay_does_not_create_or_renew_the_pre_deadline);
 	UT_RUN(test_front_source_wal_and_root_recheck_precede_publication);
 	UT_RUN(test_front_ack_retained_until_identity_and_peer_request_without_local_drain);
 	UT_RUN(test_front_stale_ack_and_exact_nak_do_not_manufacture_clean);

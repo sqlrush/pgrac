@@ -8053,6 +8053,35 @@ UT_TEST(test_v2_stop_observation_error_releases_file_and_walr_ownership)
 	v2_assert_primary_unchanged(before);
 }
 
+static void
+checkpoint_cf_refusal_with_discard_failure(void)
+{
+	test_cf_grant = false;
+	test_history_sync_count = 0;
+	test_history_fail_sync = 1;
+}
+
+UT_TEST(test_checkpoint_cf_refusal_cannot_hide_staging_discard_failure)
+{
+	uint8 before[66048];
+	ClusterControlRootIdentity self;
+	ClusterControlRootSnapshot out;
+	ClusterControlRootFileToken token;
+	ControlFileData candidate;
+	ClusterControlRootResult result;
+
+	v2_checkpoint_fixture(before, &self, &candidate);
+	test_checkpoint_x_hook = checkpoint_cf_refusal_with_discard_failure;
+	result = v2_checkpoint_publish(&self, &candidate, &out, &token);
+	test_checkpoint_x_hook = NULL;
+	test_cf_grant = true;
+	test_history_fail_sync = 0;
+	UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_IO_ERROR);
+	UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+	UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&token, sizeof(token)));
+	v2_assert_primary_unchanged(before);
+}
+
 UT_TEST(test_v2_checkpoint_error_unwind_releases_owned_work)
 {
 	uint8 before[66048];
@@ -22577,7 +22606,14 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(446);
+	if (getenv("PGRAC_CHECKPOINT_CLEANUP_ONLY") != NULL) {
+		UT_PLAN(1);
+		UT_RUN(test_checkpoint_cf_refusal_cannot_hide_staging_discard_failure);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
+	UT_PLAN(447);
+	UT_RUN(test_checkpoint_cf_refusal_cannot_hide_staging_discard_failure);
 	UT_RUN(test_clean_restart_without_provider_keeps_collective_exit_and_actual_install);
 	UT_RUN(test_clean_restart_without_provider_refuses_missing_exit_formation_and_fence);
 	UT_RUN(test_serving_clean_restart_keeps_old_open_with_current_epoch);

@@ -254,7 +254,8 @@
 #include "cluster/cluster_recovery_merge.h" /* PGRAC: spec-6.14 D9 amend recovery-claim release */
 #include "cluster/cluster_page_cold_redo.h"
 #include "cluster/cluster_relmap_arb.h" /* PGRAC: spec-6.14 D5 relmap pending arbitration */
-#include "cluster/cluster_cf_enqueue.h" /* PGRAC: spec-5.6 CF X write-permission gate */
+#include "cluster/cluster_cf_enqueue.h"
+#include "postmaster/checkpointer.h" /* PGRAC: spec-5.6 CF X write-permission gate */
 #include "cluster/cluster_cf_phase2.h" /* PGRAC: spec-5.6 T6 cross-node verify */
 #include "cluster/cluster_cf_storage.h" /* PGRAC: spec-5.6 bootstrap authority window */
 #include "cluster/cluster_conf.h" /* PGRAC: RF-B exact one-node gate */
@@ -6179,6 +6180,53 @@ CheckRequiredParameterValues(void)
 }
 
 #ifdef USE_PGRAC_CLUSTER
+/* PGRAC: consume only the immediately preceding acquire observation. The
+ * copied cookie tracks retirement, never permission for another ROOT call.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+ClusterCfConsumerWaitSlice(uint64 before, const char *consumer, const char *operation,
+						   bool *logged, ClusterCfAttemptObservation *waiting)
+{
+	ClusterCfAttemptObservation observed;
+
+	if (!cluster_cf_last_attempt_since(before, &observed)
+		|| !cluster_cf_attempt_wait_slice(&observed))
+		return false;
+	*waiting = observed;
+	if (!*logged) {
+		*logged = true;
+		ereport(LOG,
+			(errmsg("control-file wait continues under its original owner"),
+			 errdetail("PGRAC_FAMILY=CF_OWNER_WAIT consumer=%s operation=%s mode=%d "
+					   "request=" UINT64_FORMAT " epoch=" UINT64_FORMAT
+					   " caller_cookie=" UINT64_FORMAT " owner_state=%d result=%d timeout_source=%d",
+					   consumer, operation, (int)observed.mode, observed.request_id,
+					   observed.request_epoch, observed.control_owner_id,
+					   (int)observed.owner_state_at_return, (int)observed.result,
+					   (int)observed.source)));
+	}
+	return true;
+}
+
+static bool
+ClusterCfRetirementPending(ClusterCfAttemptObservation *waiting)
+{
+	cluster_cf_retirement_poll();
+	cluster_lock_owners_service_poll();
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return true;
+	if (waiting != NULL) {
+		if (waiting->owner_state_at_return == CLUSTER_LOCK_OWNER_RETIRING
+			&& waiting->control_owner_id != 0
+			&& !cluster_cf_release_completed(waiting->mode, waiting->control_owner_id))
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+							errmsg("control-file retirement has no matching completion")));
+		/* Do not reuse a wait classification across a poll or another API. */
+		memset(waiting, 0, sizeof(*waiting));
+	}
+	return false;
+}
+
 /* PGRAC: wait outside native WAL/CF critical sections for the original LMON
  * to compare actual static parent values. An object merely being published
  * proves neither application nor compatibility. No age can grant admission.
@@ -6194,6 +6242,11 @@ ClusterStartupConfigurationRequire(void)
 		HandleStartupProcInterrupts();
 		CHECK_FOR_INTERRUPTS();
 		ResetLatch(MyLatch);
+		if (ClusterCfRetirementPending(NULL)) {
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+							WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+			continue;
+		}
 		/* The finite phase-3 witness may expire before configuration or native
 		 * writer installation finishes. Renew it here under the actual startup
 		 * owner, outside CF/WAL critical sections; LMON performs no disk read. */
@@ -6405,7 +6458,10 @@ ClusterStartupWriterBegin(const EndOfWalRecoveryInfo *input)
 	ClusterWalStartupImage selected, routed;
 	ClusterControlRootResult result;
 	XLogRecPtr first = InvalidXLogRecPtr;
-	const char *operation = "route";
+	const char *operation = "read";
+	unsigned step = 0;
+	bool wait_logged = false;
+	ClusterCfAttemptObservation waiting = { 0 };
 
 	if (input == NULL || MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
 		|| !cluster_controlfile_shared_authority || !clusterStartupWriterSelected
@@ -6418,7 +6474,6 @@ ClusterStartupWriterBegin(const EndOfWalRecoveryInfo *input)
 		|| cluster_cf_held(ExclusiveLock))
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 						errmsg("native clean startup has no selected initialization owner")));
-	ClusterStartupConfigurationRequire();
 	selected = clusterStartupWriter;
 	if (input->endOfLog != selected.sealed_input_end || input->endOfLog != selected.input_record_end
 		|| input->lastRec != selected.input_record_start
@@ -6430,21 +6485,51 @@ ClusterStartupWriterBegin(const EndOfWalRecoveryInfo *input)
 		|| ControlFile->checkPointCopy.ThisTimeLineID != selected.timeline)
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 						errmsg("native recovery result contradicts its selected clean input")));
-	result = cluster_control_root_v3_startup_read_writer(&selected.claim.identity,
-														 selected.operation_uuid, &routed);
-	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
-		|| memcmp(&routed, &selected, sizeof(selected)) != 0)
-		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-						errmsg("native initialization owner changed before WAL binding")));
-	result = cluster_control_root_v3_startup_route_writer(&selected.claim.identity,
-														  selected.operation_uuid, &routed);
-	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-		&& memcmp(&routed, &selected, sizeof(selected)) != 0)
-		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
-		operation = "prepare";
-		result = cluster_wal_writer_startup_prepare(&selected.claim.identity,
+	for (;;) {
+		uint64 before;
+
+		HandleStartupProcInterrupts();
+		CHECK_FOR_INTERRUPTS();
+		ResetLatch(MyLatch);
+		if (ClusterCfRetirementPending(&waiting))
+			goto wait_for_owner;
+		ClusterStartupConfigurationRequire();
+		if (memcmp(&selected, &clusterStartupWriter, sizeof(selected)) != 0
+			|| !clusterStartupWriterSelected || clusterStartupWriterBound
+			|| clusterStartupWriterInstalled || ControlFile->state != DB_SHUTDOWNED
+			|| ControlFile->checkPoint != selected.predecessor.snapshot.tail_last_record_lsn
+			|| ControlFile->checkPointCopy.ThisTimeLineID != selected.timeline
+			|| input->endOfLog != selected.sealed_input_end
+			|| input->endOfLog != selected.input_record_end || input->lastRec != selected.input_record_start
+			|| input->lastRecTLI != selected.input_timeline || input->endOfLogTLI != selected.input_timeline)
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+							errmsg("native initialization owner changed before WAL binding")));
+		before = cluster_cf_attempt_sequence();
+		if (step == 0)
+			result = cluster_control_root_v3_startup_read_writer(&selected.claim.identity,
+															 selected.operation_uuid, &routed);
+		else if (step == 1)
+			result = cluster_control_root_v3_startup_route_writer(&selected.claim.identity,
+															  selected.operation_uuid, &routed);
+		else
+			result = cluster_wal_writer_startup_prepare(&selected.claim.identity,
 													 selected.operation_uuid, &first);
+		if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+			&& ClusterCfConsumerWaitSlice(before, "startup_writer", operation, &wait_logged, &waiting))
+			goto wait_for_owner;
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			break;
+		if (step < 2 && memcmp(&routed, &selected, sizeof(selected)) != 0) {
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			break;
+		}
+		if (++step == 3)
+			break;
+		operation = step == 1 ? "route" : "prepare";
+		continue;
+wait_for_owner:
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+						WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
 	}
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || first != selected.first_segment_lsn)
 		ereport(FATAL,
@@ -8501,7 +8586,8 @@ ClusterStartupCheckpointPublish(const ControlFileData *candidate, XLogRecPtr end
 	ControlRootImage *root;
 	ClusterControlRootFileToken token;
 	ControlFileData selected;
-	bool durable_selected = false;
+	bool durable_selected = false, install_selected = false, wait_logged = false;
+	ClusterCfAttemptObservation waiting = { 0 };
 	uint32 node = clusterStartupWriter.claim.identity.origin_node_id;
 
 	if (MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
@@ -8513,50 +8599,63 @@ ClusterStartupCheckpointPublish(const ControlFileData *candidate, XLogRecPtr end
 		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 						errmsg("native successor publication requires its bound initializer")));
-	/* CAS competition alone is retryable. Each API drops its CF/WALR holds;
-	 * uncertain I/O/release and changed identity never become an owned wait. */
 	for (;;) {
+		uint64 before;
+		const char *operation = !durable_selected ? "durable" : !install_selected ? "install" : "readback";
+
 		HandleStartupProcInterrupts();
 		CHECK_FOR_INTERRUPTS();
+		ResetLatch(MyLatch);
+		if (ClusterCfRetirementPending(&waiting))
+			goto wait_for_owner;
 		if (ShutdownRequestPending
 			|| !cluster_wal_writer_startup_matches(&clusterStartupWriter.claim.identity,
 													clusterStartupWriter.operation_uuid,
 													clusterStartupWriter.first_segment_lsn))
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 							errmsg("native successor publication lost its initialization owner")));
+		before = cluster_cf_attempt_sequence();
 		if (!durable_selected) {
 			result = cluster_control_root_v3_startup_checkpoint(
 				&clusterStartupWriter.claim.identity, clusterStartupWriter.operation_uuid,
 				candidate, end, &durable);
-			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-				durable_selected = true; /* Actual DURABLE selected; INSTALL still required. */
-		} else
-			result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
-		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+				durable_selected = true;
+				continue;
+			}
+		} else if (!install_selected) {
 			result = cluster_wal_thread_install_startup(&durable);
-		if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT)
-			break;
-		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
-						WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
-		ResetLatch(MyLatch);
-	}
-	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-		ereport(ERROR,
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+				install_selected = true;
+				continue;
+			}
+		} else {
+			/* CF01 has no ROOT result to classify. Do not synthesize one. */
+			root = palloc(sizeof(*root));
+			if (cluster_cf_lock(ShareLock))
+				break;
+			pfree(root);
+			if (ClusterCfConsumerWaitSlice(before, "startup_checkpoint", operation,
+										  &wait_logged, &waiting))
+				goto wait_for_owner;
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+							errmsg("could not read the installed native successor")));
+		}
+		if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT
+			&& !(result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+				 && ClusterCfConsumerWaitSlice(before, "startup_checkpoint", operation,
+											  &wait_logged, &waiting)))
+			ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 				 errmsg("could not install the native successor checkpoint"),
-				 errdetail(
-					 "PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=STARTUP_CHECKPOINT_UNPROVEN result=%d",
-					 (int)result)));
-	/* Runtime CF reads require serving and cannot be used here. Read the exact
-	 * installed thread through the private non-serving projection, then release
-	 * CF before changing native memory. Root installation remains durable even
-	 * if this final observation fails; a replacement must use recovery. */
-	root = palloc(sizeof(*root));
-	if (!cluster_cf_lock(ShareLock)) {
-		pfree(root);
-		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-						errmsg("could not read the installed native successor")));
+				 errdetail("PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=STARTUP_CHECKPOINT_UNPROVEN result=%d",
+						   (int)result)));
+wait_for_owner:
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+						WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
 	}
+	/* Read only the installed projection. A readback wait did not repeat
+	 * either durable phase; no native memory changes precede confirmed S6. */
 	PG_TRY();
 	{
 		result = cluster_cf_held_is_clusterwide(ShareLock)
@@ -8604,11 +8703,27 @@ ClusterStartupCheckpointPublish(const ControlFileData *candidate, XLogRecPtr end
 	clusterStartupWriterInstalled = true;
 }
 
+/* PGRAC: an online wait yields to the original shutdown handler. This is
+ * reached outside usable CF/WALR ownership; hard cleanup errors never enter
+ * a retry branch and cannot be replaced by this cancellation.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+ClusterCheckpointYieldForShutdown(bool online)
+{
+	if (online && (ShutdownRequestPending || cluster_normal_stop_requested())
+		&& !cluster_cf_held_is_usable(ShareLock) && !cluster_cf_held_is_usable(ExclusiveLock))
+		ereport(ERROR, (errcode(ERRCODE_QUERY_CANCELED),
+						errmsg("checkpoint interrupted to service normal shutdown")));
+}
+
 static void
 ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 {
 	ClusterWalSourceRef ref;
 	uint64 epoch = cluster_epoch_get_current();
+	bool shutdown = (flags & CHECKPOINT_IS_SHUTDOWN) != 0;
+	bool wait_logged = false;
+	ClusterCfAttemptObservation waiting = { 0 };
 
 	if (MyBackendType == B_STARTUP && (flags & CHECKPOINT_END_OF_RECOVERY) != 0) {
 		ClusterStartupCheckpointPrepare(flags, selected);
@@ -8636,8 +8751,16 @@ ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 		ClusterWalSourceRef observed;
 		bool readable;
 		bool pending = false;
+		bool retiring;
+		uint64 started_us = shutdown ? cluster_checkpoint_wait_budget_now() : 0;
+		uint64 before;
+		long timeout_ms = 20;
 
 		CHECK_FOR_INTERRUPTS();
+		ResetLatch(MyLatch);
+		ClusterCheckpointYieldForShutdown(!shutdown);
+		retiring = ClusterCfRetirementPending(&waiting);
+		ClusterCheckpointYieldForShutdown(!shutdown);
 		if (cluster_epoch_get_current() != epoch
 			|| !cluster_wal_thread_current_v2_ref(&observed)
 			|| memcmp(&observed, &ref, sizeof(ref)) != 0
@@ -8649,10 +8772,16 @@ ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 					 errmsg("checkpoint authority changed before control-root read")));
-		if (!cluster_cf_lock(ShareLock))
+		if (retiring)
+			goto wait_for_owner;
+		before = cluster_cf_attempt_sequence();
+		if (!cluster_cf_lock(ShareLock)) {
+			if (ClusterCfConsumerWaitSlice(before, "checkpoint", "prepare", &wait_logged, &waiting))
+				goto wait_for_owner;
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 					 errmsg("could not acquire control-root read authority for checkpoint")));
+		}
 		PG_TRY();
 		{
 			readable = cluster_cf_held_is_clusterwide(ShareLock)
@@ -8674,15 +8803,18 @@ ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 					 errmsg("root-v3 checkpoint input or read-authority release is unproven")));
 		}
-		if (!pending)
+		if (!pending) {
+			if (shutdown)
+				(void)cluster_checkpoint_wait_budget_charge(false, started_us, &ref, epoch);
 			break;
+		}
 		memset(selected, 0, sizeof(*selected));
-		/* Same scheduling and cancellation as Publish. CF-S has been
-		 * confirmed released; keep the original epoch/writer and do not
-		 * rearm either phase of the normal-stop owner budget. */
-		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-						 20, WAIT_EVENT_CHECKPOINTER_MAIN);
-		ResetLatch(MyLatch);
+wait_for_owner:
+		ClusterCheckpointYieldForShutdown(!shutdown);
+		if (shutdown)
+			timeout_ms = cluster_checkpoint_wait_budget_charge(true, started_us, &ref, epoch);
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						timeout_ms, WAIT_EVENT_CHECKPOINTER_MAIN);
 	}
 	if (selected->state != DB_IN_PRODUCTION
 		|| selected->system_identifier != ref.claim.identity.system_identifier
@@ -8709,6 +8841,9 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 	ClusterControlRootFileToken token;
 	ClusterControlRootResult result;
 	uint64 epoch = cluster_epoch_get_current();
+	bool shutdown = candidate->state == DB_SHUTDOWNED;
+	bool wait_logged = false;
+	ClusterCfAttemptObservation waiting = { 0 };
 
 	if (MyBackendType == B_STARTUP) {
 		ClusterStartupCheckpointPublish(candidate, end);
@@ -8729,10 +8864,20 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 	{
 		bool pending = false;
 		bool serving;
+		bool retiring;
+		ClusterWalSourceRef observed;
+		uint64 started_us = shutdown ? cluster_checkpoint_wait_budget_now() : 0;
+		uint64 before;
+		long timeout_ms = 20;
 
 		CHECK_FOR_INTERRUPTS();
+		ResetLatch(MyLatch);
+		ClusterCheckpointYieldForShutdown(!shutdown);
+		retiring = ClusterCfRetirementPending(&waiting);
+		ClusterCheckpointYieldForShutdown(!shutdown);
 		serving = cluster_serving_ready_check(&pending, NULL);
 		if (cluster_epoch_get_current() != epoch || cluster_reconfig_has_pending_prebump_stage()
+			|| !cluster_wal_thread_current_v2_ref(&observed) || memcmp(&observed, &ref, sizeof(ref)) != 0
 			|| (!cluster_external_fence_runtime_active()
 				&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch)
 				&& !cluster_wal_thread_clean_writer_matches(&ref, epoch))
@@ -8744,6 +8889,9 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 		 * This publishes evidence only, not CLOSED or a serving-set change.
 		 * A pending shutdown signal alone cannot reclassify an online candidate.
 		 * Author: SqlRush <sqlrush@gmail.com> */
+		if (retiring)
+			goto wait_for_owner;
+		before = cluster_cf_attempt_sequence();
 		if (pending)
 			result = CLUSTER_CONTROL_ROOT_ADMISSION_PENDING;
 		else if (candidate->state == DB_SHUTDOWNED)
@@ -8752,15 +8900,22 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 		else
 			result = cluster_control_root_v3_checkpoint_publish(&ref.claim.identity, candidate, end,
 																&published, &token, &selected);
-		if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT
-			&& result != CLUSTER_CONTROL_ROOT_ADMISSION_PENDING)
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			if (shutdown)
+				(void)cluster_checkpoint_wait_budget_charge(false, started_us, &ref, epoch);
 			break;
-		/* A peer won the CAS, or initial admission is pending. All holds and staging
-		 * are released before this interruptible owner wait and reobservation.
-		 * STALE identity/namespace and uncertain I/O are not this retry class. */
-		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-						 20, WAIT_EVENT_CHECKPOINTER_MAIN);
-		ResetLatch(MyLatch);
+		}
+		if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT
+			&& result != CLUSTER_CONTROL_ROOT_ADMISSION_PENDING
+			&& !(result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+				 && ClusterCfConsumerWaitSlice(before, "checkpoint", "publish", &wait_logged, &waiting)))
+			break;
+wait_for_owner:
+		ClusterCheckpointYieldForShutdown(!shutdown);
+		if (shutdown)
+			timeout_ms = cluster_checkpoint_wait_budget_charge(true, started_us, &ref, epoch);
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						timeout_ms, WAIT_EVENT_CHECKPOINTER_MAIN);
 	}
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		ereport(ERROR,

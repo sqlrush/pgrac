@@ -38,7 +38,8 @@
 #ifndef CLUSTER_CF_ENQUEUE_H
 #define CLUSTER_CF_ENQUEUE_H
 
-#include "cluster/cluster_grd.h"	  /* ClusterResId */
+#include "cluster/cluster_grd.h" /* ClusterResId */
+#include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_sequence.h" /* CLUSTER_SQ_RESID_TYPE (collision check) */
 #include "storage/lock.h"			  /* LOCKTAG_LAST_TYPE, LOCKMODE */
 
@@ -82,6 +83,28 @@ extern void cluster_cf_resid_encode(ClusterResId *dst);
  *	Use cluster_cf_unlock_confirmed when the caller must consume the verdict.
  */
 extern bool cluster_cf_lock(LOCKMODE mode);
+
+/* PGRAC: an observation of one process-local attempt, never lock authority.
+ * Capture the sequence immediately around one synchronous consumer call.
+ * A subsequent acquire invalidates the copied observation.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct ClusterCfAttemptObservation {
+	uint64 sequence;
+	LOCKMODE mode;
+	bool cooperative;
+	const void *caller;
+	ClusterLockAcquireResult result;
+	ClusterGesTimeoutSrc source;
+	ClusterLockOwnerState owner_state_at_return;
+	uint64 request_id;
+	uint64 request_epoch;
+	uint64 control_owner_id;
+	bool classified_wait;
+} ClusterCfAttemptObservation;
+
+extern uint64 cluster_cf_attempt_sequence(void);
+extern bool cluster_cf_last_attempt_since(uint64 before, ClusterCfAttemptObservation *out);
+extern bool cluster_cf_attempt_wait_slice(const ClusterCfAttemptObservation *observation);
 extern bool cluster_cf_lock_poll(LOCKMODE mode);
 extern bool cluster_cf_acquire_pending(LOCKMODE mode);
 extern uint64 cluster_cf_owner_cookie(LOCKMODE mode);

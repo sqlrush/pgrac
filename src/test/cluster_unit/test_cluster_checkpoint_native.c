@@ -12,6 +12,7 @@
 #include "catalog/pg_control.h"
 #include "cluster/cluster_cf_authority.h"
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_source.h"
 #include "cluster/cluster_wal_writer.h"
@@ -24,6 +25,7 @@
 #include "miscadmin.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/bgwriter.h"
+#include "postmaster/checkpointer.h"
 #include "postmaster/startup.h"
 #include "storage/latch.h"
 #include "cluster/cluster_config_members.h"
@@ -52,6 +54,7 @@ sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 static sigjmp_buf error_boundary;
 static ControlFileData current, selected, candidate;
+static XLogRecPtr expected_control_checkpoint;
 static ControlFileData *ControlFile = &current;
 static ClusterWalSourceRef ref;
 static LWLockPadded locks[NUM_INDIVIDUAL_LWLOCKS];
@@ -79,11 +82,105 @@ static bool clusterStartupWriterSelected;
 static bool startup_sync_ok = true, startup_sync_change_epoch;
 static unsigned startup_sync_calls;
 
+/* PGRAC: ROOT and transport are fixture boundaries. The observation API and
+ * all consumer control flow below are the unmodified production functions. */
+static ClusterCfAttemptObservation cf_attempt;
+#include "test_cluster_cf_observation.inc"
+static unsigned retirement_polls, retire_remaining, required_retire_polls;
+static unsigned direct_wait_slices, writer_wait_step;
+static bool typed_wait, shutdown_on_wait, normal_stop_requested, shutdown_after_publish;
+static unsigned wait_log_count, budget_charges, exhaust_after_charge;
+static int native_sqlstate;
+static LOCKMODE retiring_mode;
+
+static void
+fixture_wait_slice(LOCKMODE mode)
+{
+	UT_ASSERT_EQ(retiring_mode, NoLock);
+	cf_attempt_begin(mode, false, NULL);
+	cf_attempt.result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+	cf_attempt.source = CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT;
+	cf_attempt.owner_state_at_return = CLUSTER_LOCK_OWNER_RETIRING;
+	cf_attempt.request_id = 100 + cf_attempt.sequence;
+	cf_attempt.request_epoch = 9;
+	cf_attempt.control_owner_id = 200 + cf_attempt.sequence;
+	cf_attempt.classified_wait = true;
+	retiring_mode = mode;
+	retire_remaining = required_retire_polls;
+}
+
+static ClusterControlRootResult
+fixture_root_result(ClusterControlRootResult result)
+{
+	UT_ASSERT_EQ(retiring_mode, NoLock);
+	if (typed_wait && result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE)
+		fixture_wait_slice(ExclusiveLock);
+	return result;
+}
+
+void
+cluster_cf_retirement_poll(void)
+{
+	++retirement_polls;
+	if (retiring_mode != NoLock && --retire_remaining == 0)
+		retiring_mode = NoLock;
+}
+
+void
+cluster_lock_owners_service_poll(void)
+{}
+
+uint64
+cluster_cf_owner_cookie(LOCKMODE mode)
+{
+	return retiring_mode == mode ? cf_attempt.control_owner_id : 0;
+}
+
+bool
+cluster_cf_release_completed(LOCKMODE mode, uint64 cookie)
+{
+	return cookie != 0 && mode != retiring_mode && cookie == cf_attempt.control_owner_id;
+}
+
+bool
+cluster_normal_stop_requested(void)
+{
+	return normal_stop_requested;
+}
+
+uint64
+cluster_checkpoint_wait_budget_now(void)
+{
+	return UINT64_C(1000000) + waits * UINT64_C(20000);
+}
+
+long
+cluster_checkpoint_wait_budget_charge(bool waiting, uint64 started_us,
+									  const ClusterWalSourceRef *original, uint64 original_epoch)
+{
+	UT_ASSERT(ShutdownRequestPending && started_us != 0);
+	UT_ASSERT_EQ(original_epoch, epoch);
+	UT_ASSERT_EQ(memcmp(original, &ref, sizeof(ref)), 0);
+	UT_ASSERT_EQ(cf_mode, NoLock);
+	++budget_charges;
+	if (exhaust_after_charge && budget_charges >= exhaust_after_charge)
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("fixture original wait budget exhausted")));
+	return 20;
+}
+
+bool
+cluster_cf_held_is_usable(LOCKMODE mode)
+{
+	return cf_mode == mode;
+}
+
 ClusterFormationWitnessResult
 cluster_authority_startup_refresh_recovery(int timeout_ms)
 {
 	UT_ASSERT_EQ(timeout_ms, 100);
-	return CLUSTER_FORMATION_WITNESS_READY;
+	return retiring_mode == NoLock ? CLUSTER_FORMATION_WITNESS_READY
+								   : CLUSTER_FORMATION_WITNESS_UNSTABLE;
 }
 static unsigned startup_directory_calls;
 static bool directory_before_selection;
@@ -167,6 +264,8 @@ errstart(int l, const char *d pg_attribute_unused())
 {
 	if (l >= ERROR)
 		native_error_level = l;
+	if (l == LOG)
+		++wait_log_count;
 	/* Native ARM CRC dispatch may emit DEBUG1 during its first invocation. */
 	return l >= ERROR;
 }
@@ -191,8 +290,9 @@ errhint(const char *f pg_attribute_unused(), ...)
 	return 0;
 }
 int
-errcode(int e pg_attribute_unused())
+errcode(int e)
 {
+	native_sqlstate = e;
 	return 0;
 }
 void
@@ -231,12 +331,19 @@ LWLockRelease(LWLock *l)
 bool
 cluster_cf_held(LOCKMODE m)
 {
-	return cf_mode == m;
+	return cf_mode == m || retiring_mode == m;
 }
 bool
 cluster_cf_lock(LOCKMODE m)
 {
 	UT_ASSERT(m == ShareLock && cf_mode == NoLock && !local_lock && CritSectionCount == 0);
+	UT_ASSERT_EQ(retiring_mode, NoLock);
+	if (direct_wait_slices > 0) {
+		--direct_wait_slices;
+		fixture_wait_slice(m);
+		return false;
+	}
+	cf_attempt_begin(m, false, NULL);
 	if (lock_ok)
 		cf_mode = m;
 	return lock_ok;
@@ -361,8 +468,12 @@ WaitLatch(Latch *l, int e, long t, uint32 event)
 												   : WAIT_EVENT_CHECKPOINTER_MAIN);
 	UT_ASSERT_EQ(cf_mode, NoLock);
 	UT_ASSERT(!local_lock && CritSectionCount == 0);
-	UT_ASSERT_EQ(current.checkPoint, 100);
+	UT_ASSERT_EQ(current.checkPoint, expected_control_checkpoint);
 	waits++;
+	if (waits > 32)
+		siglongjmp(error_boundary, 1); /* Bound the fixture, never the product wait. */
+	if (shutdown_on_wait)
+		ShutdownRequestPending = true;
 	if (change_epoch_on_wait)
 		epoch++;
 	if (change_ref_on_wait)
@@ -382,13 +493,15 @@ cluster_control_root_v3_checkpoint_publish(const ClusterControlRootIdentity *sel
 	UT_ASSERT(c == &candidate && end == 220);
 	UT_ASSERT_EQ(cf_mode, NoLock);
 	UT_ASSERT(!local_lock && CritSectionCount == 0);
-	UT_ASSERT_EQ(current.checkPoint, 100);
+	UT_ASSERT_EQ(current.checkPoint, expected_control_checkpoint);
 	memset(out, 0, sizeof(*out));
 	memset(token, 0, sizeof(*token));
 	*control = *c;
 	control->checkPointCopy.nextOid = 60001;
 	UT_ASSERT(root_calls < lengthof(returns));
-	return returns[root_calls++];
+	if (shutdown_after_publish)
+		ShutdownRequestPending = true;
+	return fixture_root_result(returns[root_calls++]);
 }
 
 ClusterControlRootResult
@@ -458,11 +571,11 @@ cluster_control_root_v3_startup_checkpoint(const ClusterControlRootIdentity *sel
 	UT_ASSERT(
 		cluster_wal_writer_startup_matches(self, uuid, clusterStartupWriter.first_segment_lsn));
 	UT_ASSERT(c == &candidate && c->state == DB_SHUTDOWNED && end == 220);
-	UT_ASSERT_EQ(current.checkPoint, 100);
+	UT_ASSERT_EQ(current.checkPoint, expected_control_checkpoint);
 	*out = clusterStartupWriter;
 	out->phase = CLUSTER_WAL_STARTUP_DURABLE;
 	UT_ASSERT(startup_calls < lengthof(returns));
-	return returns[startup_calls++];
+	return fixture_root_result(returns[startup_calls++]);
 }
 
 ClusterControlRootResult
@@ -471,9 +584,9 @@ cluster_wal_thread_install_startup(const ClusterWalStartupImage *durable)
 	UT_ASSERT_EQ(cf_mode, NoLock);
 	UT_ASSERT(!local_lock && CritSectionCount == 0 && startup_calls > 0);
 	UT_ASSERT_EQ(durable->phase, CLUSTER_WAL_STARTUP_DURABLE);
-	UT_ASSERT_EQ(current.checkPoint, 100);
+	UT_ASSERT_EQ(current.checkPoint, expected_control_checkpoint);
 	UT_ASSERT(install_calls < lengthof(install_returns));
-	return install_returns[install_calls++];
+	return fixture_root_result(install_returns[install_calls++]);
 }
 
 ClusterControlRootResult
@@ -514,10 +627,10 @@ cluster_control_root_v3_startup_advance_clean(const ClusterWalSourceRef *restart
 {
 	UT_ASSERT(cf_mode == NoLock && !local_lock && CritSectionCount == 0);
 	UT_ASSERT(memcmp(restart, &ref, sizeof(ref)) == 0);
-	UT_ASSERT_EQ(current.checkPoint, 100);
+	UT_ASSERT_EQ(current.checkPoint, expected_control_checkpoint);
 	UT_ASSERT(advance_calls < lengthof(advance_returns));
 	*out = offered;
-	return advance_returns[advance_calls++];
+	return fixture_root_result(advance_returns[advance_calls++]);
 }
 
 ClusterControlRootResult
@@ -529,6 +642,10 @@ cluster_control_root_v3_startup_read_writer(const ClusterControlRootIdentity *se
 	UT_ASSERT(memcmp(self, &clusterStartupWriter.claim.identity, sizeof(*self)) == 0);
 	UT_ASSERT(memcmp(uuid, clusterStartupWriter.operation_uuid, 16) == 0);
 	writer_read_calls++;
+	if (writer_wait_step == 1) {
+		writer_wait_step = 0;
+		return fixture_root_result(CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	}
 	*out = offered;
 	if (writer_read_changed)
 		out->formation_epoch++;
@@ -544,6 +661,10 @@ cluster_control_root_v3_startup_route_writer(const ClusterControlRootIdentity *s
 	UT_ASSERT(memcmp(self, &offered.claim.identity, sizeof(*self)) == 0);
 	UT_ASSERT(memcmp(uuid, offered.operation_uuid, 16) == 0);
 	route_calls++;
+	if (writer_wait_step == 2) {
+		writer_wait_step = 0;
+		return fixture_root_result(CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	}
 	*out = offered;
 	return route_ok ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_IO_ERROR;
 }
@@ -553,10 +674,17 @@ cluster_wal_writer_startup_prepare(const ClusterControlRootIdentity *self, const
 								   XLogRecPtr *first)
 {
 	UT_ASSERT(cf_mode == NoLock && !local_lock && CritSectionCount == 0);
-	UT_ASSERT(!clusterStartupWriterBound && route_calls == 1);
+	UT_ASSERT(!clusterStartupWriterBound && route_calls >= 1);
 	UT_ASSERT(memcmp(self, &offered.claim.identity, sizeof(*self)) == 0);
 	UT_ASSERT(memcmp(uuid, offered.operation_uuid, 16) == 0);
 	bind_calls++;
+	if (writer_wait_step >= 3) {
+		if (writer_wait_step == 4)
+			cf_attempt_begin(ExclusiveLock, false, NULL);
+		writer_wait_step = 0;
+		*first = 0;
+		return fixture_root_result(CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	}
 	*first = offered.first_segment_lsn;
 	return bind_ok ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 }
@@ -609,8 +737,15 @@ native_candidate(bool shutdown)
 static void
 reset_fixture(void)
 {
+	memset(&cf_attempt, 0, sizeof(cf_attempt));
+	retirement_polls = retire_remaining = direct_wait_slices = writer_wait_step = 0;
+	required_retire_polls = 3;
+	typed_wait = shutdown_on_wait = normal_stop_requested = shutdown_after_publish = false;
+	retiring_mode = NoLock;
+	wait_log_count = budget_charges = exhaust_after_charge = 0;
+	native_sqlstate = 0;
 	memset(&current, 0, sizeof(current));
-	current.checkPoint = 100;
+	current.checkPoint = expected_control_checkpoint = 100;
 	current.system_identifier = 1234;
 	current.state = DB_IN_PRODUCTION;
 	selected = current;
@@ -1008,6 +1143,11 @@ UT_TEST(online_checkpoint_during_shutdown_signal_stays_online)
 {
 	reset_fixture();
 	ShutdownRequestPending = true;
+	UT_ASSERT(!publish());
+	UT_ASSERT_EQ(root_calls, 0);
+	UT_ASSERT_EQ(native_error_level, ERROR);
+	reset_fixture();
+	shutdown_after_publish = true;
 	UT_ASSERT(publish());
 	UT_ASSERT_EQ(shutdown_calls, 0);
 	UT_ASSERT_EQ(root_calls, 1);
@@ -2008,10 +2148,213 @@ UT_TEST(native_startup_insert_has_no_link_or_page_from_predecessor)
 		UT_ASSERT_EQ(ctl.LogwrtRqst.Flush, EndOfLog);
 	}
 }
+UT_TEST(startup_configuration_and_selection_retire_before_reobserving)
+{
+	writer_begin_fixture();
+	typed_wait = true;
+	advance_returns[0] = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	UT_ASSERT_EQ(writer_begin(), wal_segment_size);
+	UT_ASSERT(retirement_polls >= 3);
+	UT_ASSERT_EQ(advance_calls, 2);
+	UT_ASSERT_EQ(retiring_mode, NoLock);
+}
+
+UT_TEST(writer_begin_retries_only_its_unfinished_step)
+{
+	for (unsigned step = 1; step <= 4; ++step) {
+		writer_begin_fixture();
+		typed_wait = true;
+		writer_wait_step = step;
+		UT_ASSERT_EQ(writer_begin(), wal_segment_size);
+		UT_ASSERT(clusterStartupWriterBound);
+		UT_ASSERT_EQ(writer_read_calls, step == 1 ? 2 : 1);
+		UT_ASSERT_EQ(route_calls, step == 2 ? 2 : 1);
+		UT_ASSERT_EQ(bind_calls, step >= 3 ? 2 : 1);
+		UT_ASSERT_EQ(advance_calls, 1);
+		UT_ASSERT(retirement_polls >= 3);
+	}
+}
+
+UT_TEST(startup_checkpoint_retries_durable_install_and_readback_separately)
+{
+	for (unsigned step = 0; step < 3; ++step) {
+		startup_fixture();
+		typed_wait = true;
+		if (step == 0)
+			returns[0] = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		else if (step == 1)
+			install_returns[0] = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		else
+			direct_wait_slices = 1;
+		UT_ASSERT(startup_publish());
+		UT_ASSERT(clusterStartupWriterInstalled);
+		UT_ASSERT_EQ(startup_calls, step == 0 ? 2 : 1);
+		UT_ASSERT_EQ(install_calls, step == 1 ? 2 : 1);
+		UT_ASSERT_EQ(reads, 1);
+		UT_ASSERT(retirement_polls >= 3);
+	}
+}
+
+UT_TEST(checkpoint_prepare_publish_retire_before_new_attempt)
+{
+	reset_fixture();
+	direct_wait_slices = 1;
+	UT_ASSERT(prepare(CHECKPOINT_FORCE));
+	UT_ASSERT_EQ(reads, 1);
+	UT_ASSERT(retirement_polls >= 3);
+	reset_fixture();
+	typed_wait = true;
+	returns[0] = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	UT_ASSERT(publish());
+	UT_ASSERT_EQ(root_calls, 2);
+	UT_ASSERT(retirement_polls >= 3);
+}
+
+UT_TEST(online_checkpoint_wait_yields_to_normal_shutdown)
+{
+	for (unsigned branch = 0; branch < 5; ++branch) {
+		reset_fixture();
+		shutdown_on_wait = true;
+		if (branch < 2) {
+			if (branch == 0)
+				read_pending = 1;
+			else
+				direct_wait_slices = 1;
+			UT_ASSERT(!prepare(CHECKPOINT_FORCE));
+			UT_ASSERT_EQ(reads, branch == 0 ? 1 : 0);
+		} else {
+			returns[0] = branch == 2   ? CLUSTER_CONTROL_ROOT_CAS_CONFLICT
+						 : branch == 3 ? CLUSTER_CONTROL_ROOT_ADMISSION_PENDING
+									   : CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+			typed_wait = branch == 4;
+			UT_ASSERT(!publish());
+			UT_ASSERT_EQ(root_calls, 1);
+		}
+		UT_ASSERT_EQ(current.checkPoint, 100);
+		UT_ASSERT_EQ(native_error_level, ERROR);
+		UT_ASSERT_EQ(native_sqlstate, ERRCODE_QUERY_CANCELED);
+		UT_ASSERT_EQ(budget_charges, 0);
+		UT_ASSERT(ShutdownRequestPending);
+	}
+}
+
+UT_TEST(startup_wait_preserves_retirement_when_original_phase_terminates)
+{
+	writer_begin_fixture();
+	typed_wait = true;
+	advance_returns[0] = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	required_retire_polls = 100;
+	shutdown_on_wait = true;
+	UT_ASSERT(!startup_first_native_site());
+	UT_ASSERT_EQ(waits, 1);
+	UT_ASSERT_EQ(advance_calls, 1);
+	UT_ASSERT_EQ(retiring_mode, ExclusiveLock);
+	UT_ASSERT(ShutdownRequestPending);
+}
+
+UT_TEST(shutdown_both_consumers_charge_while_original_retirement_remains)
+{
+	for (unsigned stage = 0; stage < 2; ++stage) {
+		reset_fixture();
+		ShutdownRequestPending = true;
+		required_retire_polls = 100;
+		exhaust_after_charge = 4;
+		if (stage == 0) {
+			direct_wait_slices = 1;
+			UT_ASSERT(!prepare(CHECKPOINT_IS_SHUTDOWN));
+			UT_ASSERT_EQ(reads, 0);
+		} else {
+			candidate.state = DB_SHUTDOWNED;
+			typed_wait = true;
+			returns[0] = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+			UT_ASSERT(!publish());
+			UT_ASSERT_EQ(root_calls, 1);
+		}
+		UT_ASSERT_EQ(budget_charges, 4);
+		UT_ASSERT_EQ(waits, 3);
+		UT_ASSERT_EQ(native_error_level, ERROR);
+		UT_ASSERT_EQ(native_sqlstate, ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE);
+		UT_ASSERT_NE(retiring_mode, NoLock);
+		UT_ASSERT_EQ(current.checkPoint, 100);
+	}
+}
+
+UT_TEST(wait_diagnostic_once_per_original_operation_not_request)
+{
+	reset_fixture();
+	typed_wait = true;
+	returns[0] = returns[1] = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	UT_ASSERT(publish());
+	UT_ASSERT_EQ(root_calls, 3);
+	UT_ASSERT_EQ(wait_log_count, 1);
+	/* A new invocation is a new operation; transport requests alone were not. */
+	root_calls = 0;
+	expected_control_checkpoint = current.checkPoint;
+	candidate.checkPoint = 300;
+	UT_ASSERT(publish());
+	UT_ASSERT_EQ(wait_log_count, 2);
+}
+
+UT_TEST(checkpoint_hard_results_and_untyped_lock_never_consume_wait_observation)
+{
+	const ClusterControlRootResult failures[]
+		= { CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE, CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN,
+			CLUSTER_CONTROL_ROOT_IO_ERROR, CLUSTER_CONTROL_ROOT_STALE_TOKEN };
+	for (unsigned i = 0; i < lengthof(failures); ++i) {
+		reset_fixture();
+		returns[0] = failures[i];
+		UT_ASSERT(!publish());
+		UT_ASSERT_EQ(root_calls, 1);
+		UT_ASSERT_EQ(waits, 0);
+		UT_ASSERT_EQ(wait_log_count, 0);
+		UT_ASSERT_EQ(current.checkPoint, 100);
+	}
+	reset_fixture();
+	lock_ok = false;
+	UT_ASSERT(!prepare(CHECKPOINT_FORCE));
+	UT_ASSERT_EQ(waits, 0);
+}
+
+UT_TEST(cf_observation_saturation_never_wraps_or_reuses_an_old_receipt)
+{
+	ClusterCfAttemptObservation observation;
+	reset_fixture();
+	cf_attempt.sequence = UINT64_MAX - 1;
+	fixture_wait_slice(ShareLock);
+	UT_ASSERT_EQ(cluster_cf_attempt_sequence(), UINT64_MAX);
+	UT_ASSERT(!cluster_cf_last_attempt_since(UINT64_MAX - 1, &observation));
+	observation = cf_attempt;
+	UT_ASSERT(!cluster_cf_attempt_wait_slice(&observation));
+	cf_attempt_begin(ExclusiveLock, false, NULL);
+	UT_ASSERT_EQ(cluster_cf_attempt_sequence(), UINT64_MAX);
+	UT_ASSERT(!cluster_cf_last_attempt_since(0, &observation));
+}
+
 int
 main(void)
 {
-	UT_PLAN(53);
+	if (getenv("PGRAC_CF_CONSUMERS_ONLY") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(startup_configuration_and_selection_retire_before_reobserving);
+		UT_RUN(writer_begin_retries_only_its_unfinished_step);
+		UT_RUN(startup_checkpoint_retries_durable_install_and_readback_separately);
+		UT_RUN(checkpoint_prepare_publish_retire_before_new_attempt);
+		UT_RUN(online_checkpoint_wait_yields_to_normal_shutdown);
+		UT_RUN(cf_observation_saturation_never_wraps_or_reuses_an_old_receipt);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	UT_PLAN(63);
+	UT_RUN(startup_wait_preserves_retirement_when_original_phase_terminates);
+	UT_RUN(shutdown_both_consumers_charge_while_original_retirement_remains);
+	UT_RUN(wait_diagnostic_once_per_original_operation_not_request);
+	UT_RUN(checkpoint_hard_results_and_untyped_lock_never_consume_wait_observation);
+	UT_RUN(startup_configuration_and_selection_retire_before_reobserving);
+	UT_RUN(writer_begin_retries_only_its_unfinished_step);
+	UT_RUN(startup_checkpoint_retries_durable_install_and_readback_separately);
+	UT_RUN(checkpoint_prepare_publish_retire_before_new_attempt);
+	UT_RUN(online_checkpoint_wait_yields_to_normal_shutdown);
+	UT_RUN(cf_observation_saturation_never_wraps_or_reuses_an_old_receipt);
 	UT_RUN(clean_input_observation_preserves_exact_old_and_new_owners);
 	UT_RUN(clean_input_observation_rejects_other_input_kinds);
 	UT_RUN(clean_input_observation_rejects_wrong_owner_phase_and_lock_context);

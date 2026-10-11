@@ -55,6 +55,8 @@
 #include "utils/wait_event.h" /* RF-ROOT P6: WAIT_EVENT_RECONFIG_BARRIER_WAIT */
 
 #include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_cssd.h"
 #include "cluster/cluster_epoch.h"	   /* cluster_epoch_get_current (version-coherent) */
@@ -2111,6 +2113,60 @@ cl_normal_stop_post_arm_state_locked(const ClusterPhase1FullStopPlan *plan, uint
 	return cl_normal_stop_post_state_locked(plan, phase, now, expected_services, false);
 }
 
+/* PGRAC: called by the original checkpointer only after ShutdownXLOG.
+ * Start the tail timer without consuming STOPPED, peer ACKs, or a new nonce.
+ * Author: SqlRush <sqlrush@gmail.com> */
+bool
+cluster_normal_stop_checkpoint_tail_begin(ClusterPhase1FullStopPlan *plan,
+										  ClusterNormalStopModuleObservation *observation)
+{
+	ClusterNormalStopModuleObservation ignored;
+	ClusterNormalStopPollResult result;
+	uint32 phase;
+	uint64 now;
+
+	if (observation == NULL)
+		observation = &ignored;
+	memset(observation, 0, sizeof(*observation));
+	observation->module = "COORDINATOR";
+	observation->reason = "NORMAL_STOP_CHECKPOINT_TAIL_CONTEXT_INVALID";
+	if (!IsUnderPostmaster || !AmCheckpointerProcess() || plan == NULL || cl_state == NULL
+		|| cl_normal_stop == NULL || !cluster_enabled || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
+		|| cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE)
+		return false;
+	now = (uint64)GetCurrentTimestamp();
+	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+	phase = pg_atomic_read_u32(&cl_normal_stop->phase);
+	result
+		= cl_normal_stop_post_arm_state_locked(plan, phase, now, cl_normal_stop_expected_services)
+			  ? CLUSTER_NORMAL_STOP_READY
+			  : CLUSTER_NORMAL_STOP_INVALID;
+	if (result == CLUSTER_NORMAL_STOP_READY && phase != CLUSTER_NORMAL_STOP_CHECKPOINT) {
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
+		result = CLUSTER_NORMAL_STOP_INVALID;
+	}
+	if (result == CLUSTER_NORMAL_STOP_READY && cl_normal_stop->post_checkpoint_deadline_us == 0) {
+		uint64 budget = cluster_clean_leave_drain_timeout_ms > 0
+							? (uint64)cluster_clean_leave_drain_timeout_ms * UINT64_C(1000)
+							: 0;
+
+		if (phase != CLUSTER_NORMAL_STOP_CHECKPOINT || now == 0 || budget == 0
+			|| now >= UINT64_MAX - budget) {
+			cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
+			result = CLUSTER_NORMAL_STOP_INVALID;
+		} else {
+			cl_normal_stop->post_checkpoint_deadline_us = now + budget;
+			cl_state->barrier_deadline_us = now + budget;
+			plan->absolute_deadline_us = now + budget;
+		}
+	}
+	LWLockRelease(&cl_state->lock);
+	if (result == CLUSTER_NORMAL_STOP_READY)
+		observation->reason = "NORMAL_STOP_CHECKPOINT_TAIL_STARTED";
+	return result == CLUSTER_NORMAL_STOP_READY;
+}
+
 static ClusterNormalStopPollResult
 cl_normal_stop_post_checkpoint_arm(ClusterPhase1FullStopPlan *plan,
 								   ClusterNormalStopModuleObservation *observation,
@@ -2141,19 +2197,8 @@ cl_normal_stop_post_checkpoint_arm(ClusterPhase1FullStopPlan *plan,
 			  ? CLUSTER_NORMAL_STOP_READY
 			  : CLUSTER_NORMAL_STOP_INVALID;
 	if (result == CLUSTER_NORMAL_STOP_READY && cl_normal_stop->post_checkpoint_deadline_us == 0) {
-		uint64 budget = cluster_clean_leave_drain_timeout_ms > 0
-							? (uint64)cluster_clean_leave_drain_timeout_ms * UINT64_C(1000)
-							: 0;
-
-		if (phase != CLUSTER_NORMAL_STOP_CHECKPOINT || now == 0 || budget == 0
-			|| now >= UINT64_MAX - budget) {
-			cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
-			result = CLUSTER_NORMAL_STOP_INVALID;
-		} else {
-			cl_normal_stop->post_checkpoint_deadline_us = now + budget;
-			cl_state->barrier_deadline_us = now + budget;
-			plan->absolute_deadline_us = now + budget;
-		}
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
+		result = CLUSTER_NORMAL_STOP_INVALID;
 	}
 	LWLockRelease(&cl_state->lock);
 	if (result != CLUSTER_NORMAL_STOP_READY)
@@ -3641,6 +3686,8 @@ cl_normal_stop_checkpoint_run(ClusterPhase1FullStopPlan *plan,
 		 * remains visible. READY is consumed once, never repolled as a new
 		 * checkpoint or a new post-STOPPED nonce. */
 		ResetLatch(MyLatch);
+		cluster_cf_retirement_poll();
+		cluster_lock_owners_service_poll();
 		if (step == 0)
 			result = cl_normal_stop_checkpoint_poll(expected, plan, observation, &progress);
 		else if (step == 1)

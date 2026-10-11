@@ -137,6 +137,10 @@ static bool fake_terminal_history_blocked;
 static bool fake_extra_configured_thread;
 static PgracExternalFenceNeedSetResult fake_need_build_result = PGRAC_EXTERNAL_FENCE_NEED_SET_OK;
 static ClusterRecoverySerialRevalidateResult fake_serial_result = CLUSTER_RECOVERY_SERIAL_CURRENT;
+static bool capture_release_log;
+static unsigned release_log_count;
+static char release_log_detail[1024];
+static ClusterLockAcquireRequest released_request;
 
 void
 RegisterResourceReleaseCallback(ResourceReleaseCallback callback, void *arg)
@@ -146,9 +150,12 @@ RegisterResourceReleaseCallback(ResourceReleaseCallback callback, void *arg)
 }
 
 bool
-errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+errstart(int elevel, const char *domain pg_attribute_unused())
 {
-	return false;
+	if (!capture_release_log || elevel != LOG)
+		return false;
+	release_log_count++;
+	return true;
 }
 
 bool
@@ -165,6 +172,28 @@ errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_un
 int
 errmsg_internal(const char *fmt pg_attribute_unused(), ...)
 {
+	return 0;
+}
+
+int
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+int
+errcode(int sqlerrcode pg_attribute_unused())
+{
+	return 0;
+}
+
+int
+errdetail(const char *fmt, ...)
+{
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(release_log_detail, sizeof(release_log_detail), fmt, args);
+	va_end(args);
 	return 0;
 }
 
@@ -258,6 +287,7 @@ LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode pg_attribute_unused(),
 ClusterLockAcquireResult
 cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *request)
 {
+	released_request = *request;
 	if (fake_release_call_count < lengthof(fake_release_threads))
 		fake_release_threads[fake_release_call_count] = (uint16)request->resid.field1;
 	fake_release_call_count++;
@@ -485,6 +515,10 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 static void
 reset_pin_fakes(void)
 {
+	capture_release_log = false;
+	release_log_count = 0;
+	memset(release_log_detail, 0, sizeof(release_log_detail));
+	memset(&released_request, 0, sizeof(released_request));
 	cluster_shared_config = false;
 	fake_control_owner_current = true;
 	fake_control_owner_mode = NoLock;
@@ -1560,6 +1594,73 @@ UT_TEST(test_root_publisher_requires_resource_owner)
 	UT_ASSERT_NULL(publisher);
 }
 
+/* PGRAC: uncertain cleanup must name its actual original WALR owner; an
+ * unvalidated guard must not invent that identity or be dereferenced. */
+UT_TEST(test_root_release_diagnostic_preserves_original_identity)
+{
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+	ClusterWalRootPublishGuard *publisher = NULL;
+	ClusterWalRootPublishGuard *foreign = (ClusterWalRootPublishGuard *)(uintptr_t)1;
+	char expected[80];
+
+	reset_pin_fakes();
+	UT_ASSERT_EQ(
+		cluster_wal_retention_root_publish_begin_exact(&request.root_read, false, &publisher),
+		CLUSTER_WAL_PIN_OK);
+	fake_release_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+	capture_release_log = true;
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
+				 CLUSTER_WALR_RELEASE_UNCONFIRMED);
+	UT_ASSERT_NOT_NULL(publisher);
+	UT_ASSERT_EQ(release_log_count, 1);
+	UT_ASSERT(strstr(release_log_detail, "action=release_walr") != NULL);
+	snprintf(expected, sizeof(expected), "request=" UINT64_FORMAT, released_request.request_id);
+	UT_ASSERT(strstr(release_log_detail, expected) != NULL);
+	snprintf(expected, sizeof(expected), "epoch=" UINT64_FORMAT,
+			 released_request.holder.cluster_epoch);
+	UT_ASSERT(strstr(release_log_detail, expected) != NULL);
+	snprintf(expected, sizeof(expected), "control_owner_id=" UINT64_FORMAT,
+			 released_request.control_owner_id);
+	UT_ASSERT(strstr(release_log_detail, expected) != NULL);
+	snprintf(expected, sizeof(expected), "result=%u", CLUSTER_WALR_RELEASE_UNCONFIRMED);
+	UT_ASSERT(strstr(release_log_detail, expected) != NULL);
+	UT_ASSERT_EQ(fake_release_call_count, 1);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
+				 CLUSTER_WALR_RELEASE_UNCONFIRMED);
+	UT_ASSERT_EQ(release_log_count, 1);
+	UT_ASSERT_EQ(fake_release_call_count, 2);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&foreign), CLUSTER_WALR_RELEASE_INVALID);
+	UT_ASSERT_EQ(release_log_count, 2);
+	UT_ASSERT(strstr(release_log_detail, "identity=unavailable") != NULL);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&foreign), CLUSTER_WALR_RELEASE_INVALID);
+	UT_ASSERT_EQ(release_log_count, 2);
+	UT_ASSERT_EQ(fake_release_call_count, 2);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
+				 CLUSTER_WALR_RELEASE_UNCONFIRMED);
+	UT_ASSERT_EQ(release_log_count, 2);
+	UT_ASSERT_EQ(fake_release_call_count, 3);
+	fake_release_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
+				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_NULL(publisher);
+	UT_ASSERT_EQ(release_log_count, 2);
+	UT_ASSERT_EQ(
+		cluster_wal_retention_root_publish_begin_exact(&request.root_read, false, &publisher),
+		CLUSTER_WAL_PIN_OK);
+	fake_release_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
+				 CLUSTER_WALR_RELEASE_UNCONFIRMED);
+	UT_ASSERT_EQ(release_log_count, 3);
+	fake_release_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
+				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	capture_release_log = false;
+}
+
 UT_TEST(test_pin_one_thread_acquire_and_confirmed_release)
 {
 	ClusterWalRetentionInterval interval = { .thread_id = 1,
@@ -2112,9 +2213,16 @@ UT_TEST(test_sealed_publish_uncertain_downgrade_is_cleanup_only)
 		cluster_wal_retention_root_publish_begin_exact(&request.root_read, true, &publisher),
 		CLUSTER_WAL_PIN_OK);
 	fake_native_acquire_result = LOCKACQUIRE_NOT_AVAIL;
+	capture_release_log = true;
 	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
 				 CLUSTER_WALR_RELEASE_UNCONFIRMED);
 	UT_ASSERT_NOT_NULL(publisher);
+	UT_ASSERT_EQ(release_log_count, 1);
+	UT_ASSERT(strstr(release_log_detail, "action=downgrade_walr") != NULL);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
+				 CLUSTER_WALR_RELEASE_UNCONFIRMED);
+	UT_ASSERT_EQ(release_log_count, 1);
+	capture_release_log = false;
 	UT_ASSERT_FALSE(
 		cluster_wal_retention_root_publish_sealed_current(publisher, &request.root_read));
 	fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
@@ -3554,7 +3662,7 @@ main(int argc, char **argv)
 		return write_fixture_wal_segment(argc, argv);
 	if (argc != 1)
 		return 2;
-	UT_PLAN(73);
+	UT_PLAN(74);
 	UT_RUN(test_cold_borrow_returns_original_complete_set_without_acquiring);
 	UT_RUN(test_cold_borrow_never_exports_a_partial_or_stale_set);
 	UT_RUN(test_cold_borrow_preserves_the_original_owner_and_closed_phase);
@@ -3588,6 +3696,7 @@ main(int argc, char **argv)
 	UT_RUN(test_reuse_guard_preflight_stamps_folds_and_builds_needset);
 	UT_RUN(test_pin_one_thread_acquire_and_confirmed_release);
 	UT_RUN(test_root_publisher_requires_resource_owner);
+	UT_RUN(test_root_release_diagnostic_preserves_original_identity);
 	UT_RUN(test_v2_pin_key_preserves_root_revalidation);
 	UT_RUN(test_v2_pin_and_borrowed_publisher_refuse_rebuilding_walr);
 	UT_RUN(test_v2_physical_reuse_requires_current_walr_not_held_boolean);

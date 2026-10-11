@@ -1323,24 +1323,37 @@ cluster_wal_retention_root_publish_begin_exact(const ClusterControlRootReadToken
 ClusterWalrReleaseResult
 cluster_wal_retention_root_publish_end(ClusterWalRootPublishGuard **guard)
 {
+	/* PGRAC: diagnostic-only identity; never use it to decide a release. */
+	static bool logged_owner;
+	static uint64 logged_request;
+	static uint64 logged_epoch;
+	static uint64 logged_control_owner;
+	static bool logged_invalid;
 	ClusterWalrReleaseResult result = CLUSTER_WALR_RELEASE_CONFIRMED;
+	const ClusterLockAcquireRequest *request;
+	const char *action = "release_walr";
 
 	if (guard == NULL)
-		return CLUSTER_WALR_RELEASE_INVALID;
+		goto invalid;
 	if (*guard == NULL)
 		return CLUSTER_WALR_RELEASE_NOT_HELD;
 	if (*guard != active_root_publish_guard || (*guard)->magic != CLUSTER_WAL_ROOT_PUBLISH_MAGIC
 		|| (*guard)->owner_pid != MyProcPid || (*guard)->owner != CurrentResourceOwner)
-		return CLUSTER_WALR_RELEASE_INVALID;
+		goto invalid;
 	if ((*guard)->converted_from_pin) {
 		ClusterWalPinThread *thread = pin_find_thread((*guard)->pin, (*guard)->thread_id);
 		ClusterLockAcquireRequest down = (*guard)->walr.request;
 		bool cleanup_required = false;
+		action = "downgrade_walr";
 		if ((*guard)->pin != active_pin || thread == NULL || !thread->walr.held
-			|| !(*guard)->walr.held || down.lockmode != ExclusiveLock)
-			return CLUSTER_WALR_RELEASE_INVALID;
-		if ((*guard)->walr.release_uncertain)
-			return CLUSTER_WALR_RELEASE_UNCONFIRMED;
+			|| !(*guard)->walr.held || down.lockmode != ExclusiveLock) {
+			result = CLUSTER_WALR_RELEASE_INVALID;
+			goto diagnostic;
+		}
+		if ((*guard)->walr.release_uncertain) {
+			result = CLUSTER_WALR_RELEASE_UNCONFIRMED;
+			goto diagnostic;
+		}
 		down.lockmode = ShareLock;
 		down.op = CLUSTER_LOCK_OP_CONVERT;
 		down.current_mode = ExclusiveLock;
@@ -1350,7 +1363,8 @@ cluster_wal_retention_root_publish_end(ClusterWalRootPublishGuard **guard)
 			!= CLUSTER_LOCK_ACQUIRE_OK_CONVERTED) {
 			(*guard)->walr.release_uncertain = true;
 			(*guard)->pin->poisoned = true;
-			return CLUSTER_WALR_RELEASE_UNCONFIRMED;
+			result = CLUSTER_WALR_RELEASE_UNCONFIRMED;
+			goto diagnostic;
 		}
 		/* Same native accounting as the existing reuse-guard consumer:
 		 * retain the original S ref, remove temporary X and extra S refs. */
@@ -1373,8 +1387,40 @@ cluster_wal_retention_root_publish_end(ClusterWalRootPublishGuard **guard)
 		explicit_bzero(*guard, sizeof(**guard));
 		pfree(*guard);
 		*guard = NULL;
+		logged_owner = false;
+		logged_invalid = false;
+		return result;
+	}
+
+diagnostic:
+	/* PGRAC: log the retained original owner once, including repeated cleanup. */
+	request = &(*guard)->walr.request;
+	if (!logged_owner || logged_request != request->request_id
+		|| logged_epoch != request->holder.cluster_epoch
+		|| logged_control_owner != request->control_owner_id) {
+		logged_owner = true;
+		logged_request = request->request_id;
+		logged_epoch = request->holder.cluster_epoch;
+		logged_control_owner = request->control_owner_id;
+		ereport(LOG,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("cluster WAL retention root publication release was not confirmed"),
+				 errdetail("action=%s request=" UINT64_FORMAT " epoch=" UINT64_FORMAT
+						   " control_owner_id=" UINT64_FORMAT " result=%u",
+						   action, logged_request, logged_epoch, logged_control_owner, result)));
 	}
 	return result;
+
+invalid:
+	/* PGRAC: an unvalidated guard has no readable original owner identity. */
+	if (!logged_invalid) {
+		logged_invalid = true;
+		ereport(LOG, (errcode(ERRCODE_INTERNAL_ERROR),
+					  errmsg("cluster WAL retention root publication release guard is invalid"),
+					  errdetail("action=release_walr identity=unavailable result=%u",
+								CLUSTER_WALR_RELEASE_INVALID)));
+	}
+	return CLUSTER_WALR_RELEASE_INVALID;
 }
 
 /* PGRAC: no root I/O here. Publication owns CF itself and must compare the

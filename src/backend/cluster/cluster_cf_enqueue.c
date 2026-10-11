@@ -65,8 +65,55 @@ typedef struct CfHoldState {
 static CfHoldState cf_hold_x;
 static CfHoldState cf_hold_s;
 static uint64 cf_retired_x, cf_retired_s;
+static ClusterCfAttemptObservation cf_attempt;
 
 static ClusterCfReleaseResult cf_unlock(LOCKMODE mode, const void *caller);
+
+/* PGRAC: publication is local to this synchronous caller. Even an early
+ * refusal invalidates its predecessor; saturation permanently fails closed.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+cf_attempt_begin(LOCKMODE mode, bool cooperative, const void *caller)
+{
+	uint64 sequence = cf_attempt.sequence;
+
+	memset(&cf_attempt, 0, sizeof(cf_attempt));
+	cf_attempt.sequence = sequence == UINT64_MAX ? sequence : sequence + 1;
+	cf_attempt.mode = mode;
+	cf_attempt.cooperative = cooperative;
+	cf_attempt.caller = caller;
+	cf_attempt.result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+}
+
+uint64
+cluster_cf_attempt_sequence(void)
+{
+	return cf_attempt.sequence;
+}
+
+bool
+cluster_cf_last_attempt_since(uint64 before, ClusterCfAttemptObservation *out)
+{
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (cf_attempt.sequence == UINT64_MAX || before >= cf_attempt.sequence)
+		return false;
+	*out = cf_attempt;
+	return true;
+}
+
+bool
+cluster_cf_attempt_wait_slice(const ClusterCfAttemptObservation *observation)
+{
+	return observation != NULL && observation->sequence != 0 && observation->sequence != UINT64_MAX
+		   && observation->sequence == cf_attempt.sequence && observation->classified_wait
+		   && !observation->cooperative && observation->caller == NULL
+		   && observation->result == CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT
+		   && observation->source == CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT
+		   && (observation->owner_state_at_return == CLUSTER_LOCK_OWNER_EMPTY
+			   || observation->owner_state_at_return == CLUSTER_LOCK_OWNER_RETIRING);
+}
 
 /*
  * spec-5.6: set while this process is the bootstrap single-node authority
@@ -121,6 +168,16 @@ cluster_cf_resid_encode(ClusterResId *dst)
 	dst->lockmethodid = DEFAULT_LOCKMETHOD;
 }
 
+/* Preserve the original request even when an early refusal cannot be retried. */
+static void
+cf_attempt_owner(const CfHoldState *slot)
+{
+	cf_attempt.owner_state_at_return = slot->owner.state;
+	cf_attempt.request_id = slot->owner.request.request_id;
+	cf_attempt.request_epoch = slot->owner.request.holder.cluster_epoch;
+	cf_attempt.control_owner_id = slot->owner.request.control_owner_id;
+}
+
 /*
  * cluster_cf_lock -- acquire the singleton CF lock in `mode` via GES.
  */
@@ -133,6 +190,8 @@ cf_lock(LOCKMODE mode, bool cooperative, const void *caller)
 	const ClusterGesTimeoutDetail *timeout;
 	bool resume;
 
+	cf_attempt_begin(mode, cooperative, caller);
+	cf_attempt_owner(slot);
 	/* Several duties share an auxiliary process. Only the initiating duty
 	 * may resume its pending request or drain its old hold. This check must
 	 * precede every poll/release, including the legacy stale-hold cleanup. */
@@ -178,6 +237,7 @@ cf_lock(LOCKMODE mode, bool cooperative, const void *caller)
 		ClusterCfReleaseResult drain = cf_unlock(mode, caller);
 
 		if (drain == CLUSTER_CF_RELEASE_UNCONFIRMED) {
+			cf_attempt_owner(slot);
 			ereport(LOG, (errmsg("cluster CF acquire refused: stale held slot could "
 								 "not be drained (mode %d)",
 								 (int)mode)));
@@ -214,11 +274,22 @@ acquire:
 	}
 	PG_CATCH();
 	{
+		cf_attempt_owner(slot);
 		if (slot->owner.state == CLUSTER_LOCK_OWNER_EMPTY)
 			memset(slot, 0, sizeof(*slot));
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	/* Capture before EMPTY-slot cleanup erases the just-completed request. */
+	timeout = r == CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT ? cluster_ges_timeout_detail_get() : NULL;
+	cf_attempt.result = r;
+	cf_attempt.source = timeout != NULL ? timeout->source : CLUSTER_GES_TSRC_NONE;
+	cf_attempt_owner(slot);
+	cf_attempt.classified_wait = !cooperative && caller == NULL && cf_attempt.sequence != UINT64_MAX
+								 && r == CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT
+								 && cf_attempt.source == CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT
+								 && (slot->owner.state == CLUSTER_LOCK_OWNER_EMPTY
+									 || slot->owner.state == CLUSTER_LOCK_OWNER_RETIRING);
 
 	switch (r) {
 	case CLUSTER_LOCK_ACQUIRE_OK_NATIVE:
@@ -262,10 +333,7 @@ acquire:
 			 * could not be proven held: fail closed.  The caller raises the
 			 * appropriate FATAL/ERROR (CF correctness).
 			 */
-		if (slot->owner.state == CLUSTER_LOCK_OWNER_EMPTY)
-			memset(slot, 0, sizeof(*slot));
 		cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
-		timeout = r == CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT ? cluster_ges_timeout_detail_get() : NULL;
 		ereport(
 			LOG,
 			(errmsg("cluster CF acquire failed (mode %d, result %d)", (int)mode, (int)r),
@@ -283,6 +351,8 @@ acquire:
 					   timeout != NULL ? timeout->attempts : 0,
 					   timeout != NULL ? timeout->conflict_holders : -1,
 					   timeout != NULL ? timeout->timeout_ms : 0)));
+		if (slot->owner.state == CLUSTER_LOCK_OWNER_EMPTY)
+			memset(slot, 0, sizeof(*slot));
 		return false;
 	}
 }

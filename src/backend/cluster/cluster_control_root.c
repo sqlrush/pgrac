@@ -5515,63 +5515,107 @@ checkpoint_v2_input_observe(CheckpointV2Work *work, const ControlFileData *contr
 									   : CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
 }
 
+/* PGRAC: cleanup uncertainty must not become another publication attempt.
+ * Preserve the first hard result and report every later failed action.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterControlRootResult
+checkpoint_cleanup_result_merge(ClusterControlRootResult primary, ClusterControlRootResult cleanup,
+								const char *action)
+{
+	ClusterControlRootResult hard = cleanup;
+
+	if (cleanup == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return primary;
+	if (cleanup == CLUSTER_CONTROL_ROOT_CAS_CONFLICT
+		|| cleanup == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+		|| cleanup == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+		|| cleanup == CLUSTER_CONTROL_ROOT_ADMISSION_PENDING)
+		hard = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	ereport(LOG,
+			(errmsg("checkpoint cleanup could not confirm resource release"),
+			 errdetail("PGRAC_FAMILY=CHECKPOINT_CLEANUP action=%s primary=%d result=%d hard=%d",
+					   action, (int)primary, (int)cleanup, (int)hard)));
+	if (primary == CLUSTER_CONTROL_ROOT_OK_PRIMARY || primary == CLUSTER_CONTROL_ROOT_CAS_CONFLICT
+		|| primary == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+		|| primary == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+		|| primary == CLUSTER_CONTROL_ROOT_ADMISSION_PENDING)
+		return hard;
+	return primary;
+}
+
 static ClusterControlRootResult
 checkpoint_v2_cleanup(CheckpointV2Work *work, ClusterControlRootResult result)
 {
-	ClusterControlRootResult discarded;
-
 	if (work->close_history != NULL) {
-		pfree(work->close_history);
+		ClusterWalHistoryImage *history = work->close_history;
 		work->close_history = NULL;
+		pfree(history);
 	}
 	if (work->checkpoint_history != NULL) {
-		pfree(work->checkpoint_history);
+		ClusterWalHistoryImage *history = work->checkpoint_history;
 		work->checkpoint_history = NULL;
+		pfree(history);
 	}
 	if (work->checkpoint_history_check != NULL) {
-		pfree(work->checkpoint_history_check);
+		ClusterWalHistoryImage *history = work->checkpoint_history_check;
 		work->checkpoint_history_check = NULL;
+		pfree(history);
 	}
 	cluster_wal_prefix_identity_free(&work->prefix_identity);
 	if (work->wal_reader != NULL) {
-		XLogReaderFree(work->wal_reader);
+		XLogReaderState *reader = work->wal_reader;
 		work->wal_reader = NULL;
+		XLogReaderFree(reader);
 	}
 	for (size_t i = 0; i < lengthof(work->wal_segments); ++i) {
 		int fd = work->wal_segments[i];
 		work->wal_segments[i] = -1;
 		if (fd >= 0 && close(fd) != 0)
-			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			result = checkpoint_cleanup_result_merge(result, CLUSTER_CONTROL_ROOT_IO_ERROR,
+													 "close_wal_segment");
 	}
 	for (size_t i = 0; i < lengthof(work->wal_dirs); ++i) {
 		int fd = work->wal_dirs[i];
 		work->wal_dirs[i] = -1;
 		if (fd >= 0 && close(fd) != 0)
-			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			result = checkpoint_cleanup_result_merge(result, CLUSTER_CONTROL_ROOT_IO_ERROR,
+													 "close_wal_directory");
 	}
 	if (work->cf_mode != NoLock) {
 		LOCKMODE mode = work->cf_mode;
+		uint64 cookie = cluster_cf_owner_cookie(mode);
+		ClusterControlRootResult released;
 
 		work->cf_mode = NoLock;
-		result = release_cf(mode, result);
+		released = release_cf(mode, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		if (released != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			ereport(LOG, (errmsg("checkpoint control-file release remains unconfirmed"),
+						  errdetail("PGRAC_FAMILY=CHECKPOINT_CLEANUP action=release_cf mode=%d "
+									"caller_cookie=" UINT64_FORMAT,
+									(int)mode, cookie)));
+		result = checkpoint_cleanup_result_merge(result, released, "release_cf");
 	}
-	if (work->walr != NULL
-		&& cluster_wal_retention_root_publish_end(&work->walr) != CLUSTER_WALR_RELEASE_CONFIRMED)
-		result = CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN;
+	if (work->walr != NULL) {
+		ClusterWalRootPublishGuard *guard = work->walr;
+		work->walr = NULL;
+		/* The retention owner keeps an unconfirmed guard in stable storage. */
+		if (cluster_wal_retention_root_publish_end(&guard) != CLUSTER_WALR_RELEASE_CONFIRMED)
+			result = checkpoint_cleanup_result_merge(result, CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN,
+													 "release_walr");
+	}
 	/* Discard only the operation's own temporary entry, never a formal object.
 	 * This is also safe after root publication or ERROR during CF acquisition. */
 	if (work->checkpoint_history_stage.owner_pid != 0) {
-		discarded = cluster_wal_history_discard(&work->checkpoint_history_stage);
-		if (discarded != CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			&& result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			result = discarded;
+		ClusterWalHistoryStage stage = work->checkpoint_history_stage;
+		memset(&work->checkpoint_history_stage, 0, sizeof(work->checkpoint_history_stage));
+		result = checkpoint_cleanup_result_merge(result, cluster_wal_history_discard(&stage),
+												 "discard_checkpoint_history");
 	}
 	if (work->stage.owner_pid != 0) {
-		discarded = cluster_recovery_anchor_v2_discard(&work->stage);
-		if (discarded != CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			&& (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-				|| result == CLUSTER_CONTROL_ROOT_CAS_CONFLICT))
-			result = discarded;
+		ClusterRecoveryAnchorStageV2 stage = work->stage;
+		memset(&work->stage, 0, sizeof(work->stage));
+		result = checkpoint_cleanup_result_merge(result, cluster_recovery_anchor_v2_discard(&stage),
+												 "discard_recovery_anchor");
 	}
 	return result;
 }
@@ -7047,10 +7091,10 @@ static ClusterControlRootResult
 startup_checkpoint_cleanup(StartupCheckpointWork *work, ClusterControlRootResult result)
 {
 	if (work->operation_stage.owner_pid != 0) {
-		ClusterControlRootResult discarded = cluster_wal_startup_discard(&work->operation_stage);
-		if (discarded != CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			&& result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			result = discarded;
+		ClusterWalStartupStage stage = work->operation_stage;
+		memset(&work->operation_stage, 0, sizeof(work->operation_stage));
+		result = checkpoint_cleanup_result_merge(result, cluster_wal_startup_discard(&stage),
+												 "discard_startup_operation");
 	}
 	return checkpoint_v2_cleanup(&work->scan, result);
 }
@@ -7418,10 +7462,10 @@ static ClusterControlRootResult
 startup_install_cleanup(StartupInstallWork *work, ClusterControlRootResult result)
 {
 	if (work->history_stage.owner_pid != 0) {
-		ClusterControlRootResult discarded = cluster_wal_history_discard(&work->history_stage);
-		if (discarded != CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			&& result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			result = discarded;
+		ClusterWalHistoryStage stage = work->history_stage;
+		memset(&work->history_stage, 0, sizeof(work->history_stage));
+		result = checkpoint_cleanup_result_merge(result, cluster_wal_history_discard(&stage),
+												 "discard_installed_history");
 	}
 	return startup_checkpoint_cleanup(&work->checkpoint, result);
 }
