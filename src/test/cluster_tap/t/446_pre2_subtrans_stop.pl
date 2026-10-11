@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 # Copyright (c) 2026, pgrac contributors
 # Author: SqlRush <sqlrush@gmail.com>
-# PGRAC: retained subtransaction parentage across checkpoint and clean restart.
+# PGRAC: native temporary child parentage and shared top-level commit durability.
 use strict;
 use warnings;
 use FindBin;
@@ -62,7 +62,8 @@ run_scenario('pre2_subtrans_stop', [], sub {
 		'valid native SUBTRANS page size');
 	# Native SUBTRANS stores 4-byte XIDs, with 32 pages per SLRU segment.
 	my $xids_per_segment = ($block_size / 4) * 32;
-	my $summary = {xids_per_segment => $xids_per_segment, nodes => []};
+	my $summary = {xids_per_segment => $xids_per_segment,
+		child_source => 'native temporary row xmin', nodes => []};
 	for my $i (0 .. 3)
 	{
 		push @{$summary->{nodes}}, {node => $i, initial => subtrans_segments($nodes[$i])};
@@ -73,11 +74,18 @@ run_scenario('pre2_subtrans_stop', [], sub {
 	for my $i (0 .. 3)
 	{
 		my $parent = $nodes[$i]->background_psql('postgres', timeout => 30);
-		$parent->query_safe("BEGIN; SAVEPOINT keep; UPDATE subtrans_retained SET v=1 WHERE id=$i;
-            SAVEPOINT discard; UPDATE subtrans_retained SET v=999 WHERE id=$i;
-            ROLLBACK TO discard; RELEASE discard; RELEASE keep");
+		# Create the temporary relation outside the retained transaction. Its
+		# implicit child writes only local buffers, while the shared row is
+		# updated by the parent before entering the exception block.
+		$parent->query_safe('CREATE TEMP TABLE subtrans_local (v int) ON COMMIT PRESERVE ROWS');
+		$parent->query_safe("BEGIN; UPDATE subtrans_retained SET v=1 WHERE id=$i");
+		$parent->query_safe(q{DO $$ BEGIN
+            INSERT INTO subtrans_local VALUES (1);
+        EXCEPTION WHEN division_by_zero THEN
+            RAISE;
+        END $$});
 		my $identity = $parent->query_safe("SELECT pg_current_xact_id_if_assigned()::text,
-            xmin::text FROM subtrans_retained WHERE id=$i");
+            xmin::text FROM subtrans_local WHERE v=1");
 		my ($top, $child) = split /\|/, $identity;
 		require_true(defined($child) && $top =~ /^[1-9][0-9]*$/
 			&& $child =~ /^[1-9][0-9]*$/ && $top <= 4294967295
@@ -127,7 +135,7 @@ run_scenario('pre2_subtrans_stop', [], sub {
 	for my $node (@nodes)
 	{
 		require_equal(sql($node, q{SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM subtrans_retained}),
-			'0:1,1:1,2:1,3:1', 'committed children survive inner rollback');
+			'0:1,1:1,2:1,3:1', 'top-level shared writes commit with native children');
 	}
 	# The shutdown checkpoint consumes any old queued SYNC after deletion.
 	$cluster->stop_cluster;
@@ -136,7 +144,7 @@ run_scenario('pre2_subtrans_stop', [], sub {
 	for my $node (@nodes)
 	{
 		require_equal(sql($node, q{SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM subtrans_retained}),
-			'0:1,1:1,2:1,3:1', 'same DATA preserves committed parentage');
+			'0:1,1:1,2:1,3:1', 'same DATA preserves top-level shared writes');
 	}
 	$cluster->stop_cluster;
 	clean_subtrans_logs(\@nodes, $summary, 'second_stop');
