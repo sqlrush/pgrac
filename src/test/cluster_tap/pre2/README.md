@@ -77,6 +77,23 @@ The Perl fixture also requires `open_observation` and `shutdown_observation`
 as described in BLACKBOX.md; a transport that only supports start/stop is
 insufficient to prove OPEN or a normal shutdown.
 
+The Linux native CF contention test also needs a module built against the
+exact installed server headers. Use the same source tree and installation:
+
+```sh
+PG_CONFIG=/absolute/path/to/install/bin/pg_config
+SOURCE=/absolute/path/to/source
+CF_MODULE=/absolute/path/to/test-output/cf_wait.so
+cc -shared -fPIC -I "$("$PG_CONFIG" --includedir-server)" \
+  -I "$SOURCE/src/include" "$SOURCE/src/test/cluster_tap/pre2/cf_wait.c" \
+  -o "$CF_MODULE"
+export PGRAC_PRE2_CF_WAIT_MODULE="$CF_MODULE"
+```
+
+This module only belongs in the disposable TAP installation. Native Startup
+and shutdown contention tests additionally require GDB and a debug-symbol
+build so that the fixture can observe and pause the original CF holder.
+
 ## Test adapter interface
 
 This is test plumbing, not a database authority or an admission API. The
