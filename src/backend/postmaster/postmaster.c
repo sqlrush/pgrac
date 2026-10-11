@@ -47,6 +47,8 @@
  *
  *	  Arm the runtime wait guard after initialization and use the local
  *	  LMS child roster to prevent duplicate startup dispatch.
+ *	  Publish EXEC_BACKEND child parameters before early cluster children.
+ *	  Refuse unsupported EXEC_BACKEND cluster startup before shared writes.
  *
  *	  Added a comment in PostmasterMain explaining where pgrac cluster
  *	  initialization happens.  Call sites live in miscinit.c because PG
@@ -1371,6 +1373,20 @@ PostmasterMain(int argc, char *argv[])
 	process_shared_preload_libraries();
 
 #ifdef USE_PGRAC_CLUSTER
+#ifdef EXEC_BACKEND
+	/*
+	 * PGRAC: inspect registered effective GUCs before shared startup writes.
+	 * Read-only parameter queries do not start a cluster.
+	 * Spec: 2026-10-11-pre2-p0-m5-design.md
+	 */
+	if (output_config_variable == NULL &&
+		(cluster_enabled || cluster_shared_config))
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cluster mode is not supported in an EXEC_BACKEND build"),
+				 errdetail("reason=CLUSTER_EXEC_BACKEND_UNSUPPORTED"),
+				 errhint("Use a build without EXEC_BACKEND to start this cluster.")));
+#endif
 
 	/*
 	 * PGRAC: spec-5.6 Da3.  Now that the cluster GUCs are registered (the
@@ -1495,6 +1511,22 @@ PostmasterMain(int argc, char *argv[])
 	 */
 	InitPostmasterDeathWatchHandle();
 
+#ifdef EXEC_BACKEND
+	/* PGRAC: early cluster children need the same GUCs as later children. */
+	/* Write out nondefault GUC settings for child processes to use */
+	write_nondefault_variables(PGC_POSTMASTER);
+
+	/*
+	 * Clean out the temp directory used to transmit parameters to child
+	 * processes (see internal_forkexec, below).  We must do this before
+	 * launching any child processes, else we have a race condition: we could
+	 * remove a parameter file before the child can read it.  It should be
+	 * safe to do so now, because we verified earlier that there are no
+	 * conflicting Postgres processes in this data directory.
+	 */
+	RemovePgTempFilesInDir(PG_TEMP_FILES_DIR, true, false);
+#endif
+
 #ifdef USE_PGRAC_CLUSTER
 	/* Cluster phase 1 forks LMON before the native auxiliary start point.
 	 * Publish the same postmaster boot time to early and late children; a
@@ -1540,21 +1572,6 @@ PostmasterMain(int argc, char *argv[])
 	win32ChildQueue = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
 	if (win32ChildQueue == NULL)
 		ereport(FATAL, (errmsg("could not create I/O completion port for child queue")));
-#endif
-
-#ifdef EXEC_BACKEND
-	/* Write out nondefault GUC settings for child processes to use */
-	write_nondefault_variables(PGC_POSTMASTER);
-
-	/*
-	 * Clean out the temp directory used to transmit parameters to child
-	 * processes (see internal_forkexec, below).  We must do this before
-	 * launching any child processes, else we have a race condition: we could
-	 * remove a parameter file before the child can read it.  It should be
-	 * safe to do so now, because we verified earlier that there are no
-	 * conflicting Postgres processes in this data directory.
-	 */
-	RemovePgTempFilesInDir(PG_TEMP_FILES_DIR, true, false);
 #endif
 
 	/*
