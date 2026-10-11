@@ -159,9 +159,9 @@ cluster_mxid_is_mine(MultiXactId mxid)
 /*
  * Allocation-side slot gate (see header).  Unlike the xid gate this
  * also requires the latched mxid floor: without a floor the allocator
- * cannot clamp candidates above it nor police the half-space boundary,
- * so allocation stays vanilla dense (below-floor ids remain
- * underivable -- honest degrade, never a misattribution).
+ * cannot clamp candidates above it nor police the half-space boundary.
+ * PGRAC: shared-config allocation rejects an unbound stripe; only the
+ * original nonshared/dense mode may keep its native allocation behavior.
  */
 int
 cluster_mxid_allocation_slot(void)

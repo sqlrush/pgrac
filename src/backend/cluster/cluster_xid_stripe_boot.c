@@ -1531,9 +1531,9 @@ cluster_xid_stripe_lazy_latch(void)
  * Companion one-way lazy latch for the mxid stripe face (spec-7.1
  * D3-a).  Latches only when the published activation carried a valid
  * "PGXM" extension floor; a pre-extension activation (mxid_floor 0)
- * leaves the mxid face unlatched for the life of the process --
- * allocation stays vanilla dense and readers keep failing closed on
- * foreign multis (honest degrade, never a misattribution).
+ * leaves the mxid face unlatched for the life of the process. PGRAC:
+ * shared-config allocation then refuses; this observer does not grant
+ * permission for dense allocation. Foreign reads still fail closed.
  */
 void
 cluster_mxid_stripe_lazy_latch(void)

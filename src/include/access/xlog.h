@@ -7,6 +7,10 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/xlog.h
+ *
+ * PGRAC MODIFICATIONS
+ * Modified by: SqlRush <sqlrush@gmail.com>
+ * Read-only native-empty startup qualification for MultiXact retention.
  */
 #ifndef XLOG_H
 #define XLOG_H
@@ -245,6 +249,10 @@ extern void ClusterRequireRecordedParameters(void);
 #endif
 extern WalLevel GetActiveWalLevelOnStandby(void);
 extern void StartupXLOG(void);
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: the original bound creation input, never SQL admission. */
+extern bool ClusterXLogStartupNativeEmptyMultiXactInput(void);
+#endif
 extern void ShutdownXLOG(int code, Datum arg);
 #ifdef USE_PGRAC_CLUSTER
 /* Read own native control state; never publish a clean state or grant recovery. */

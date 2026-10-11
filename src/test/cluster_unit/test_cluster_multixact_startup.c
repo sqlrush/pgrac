@@ -17,12 +17,16 @@
 #include "postgres.h"
 #include <setjmp.h>
 #include "../../backend/access/transam/multixact.c"
+#include "../../backend/cluster/cluster_mxid_stripe.c"
 #undef printf
 #undef fprintf
 #include "unit_test.h"
 UT_DEFINE_GLOBALS();
 
 bool cluster_shared_config;
+bool cluster_enabled = true;
+bool cluster_xid_striping = true;
+int cluster_node_id;
 bool InRecovery;
 bool IsUnderPostmaster;
 BackendType MyBackendType;
@@ -40,6 +44,36 @@ static unsigned reads, zeroes, writes;
 static bool physical_exists, expect_error, read_error;
 static int held[128];
 static jmp_buf error_boundary;
+
+void
+cluster_mxid_stripe_lazy_latch(void)
+{}
+bool ClusterXLogStartupNativeEmptyMultiXactInput(void);
+bool
+ClusterXLogStartupNativeEmptyMultiXactInput(void)
+{
+	return false;
+}
+void
+cluster_xid_stripe_observe(ClusterXidStripeObs *out)
+{
+	memset(out, 0, sizeof(*out));
+}
+
+bool
+cluster_xid_authority_read_checked(ClusterXidAuthorityHeader *out, bool *from_bak)
+{
+	if (from_bak)
+		*from_bak = false;
+	return cluster_xid_authority_read(out);
+}
+
+bool
+cluster_xid_authority_read(ClusterXidAuthorityHeader *out pg_attribute_unused())
+{
+	/* These retained fixtures start at their existing cluster floor. */
+	abort();
+}
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -184,6 +218,9 @@ reset_fixture(MultiXactId next, MultiXactOffset offset, bool clustered)
 	member_shared.page_dirty = member_dirty;
 	offset_dirty[0] = member_dirty[0] = false;
 	cluster_shared_config = clustered;
+	cluster_node_id = next == 0 ? 14 : 1;
+	cluster_mxid_stripe_latch_runtime(true, cluster_node_id,
+									  next == 0 ? UINT32_MAX - 31 : FirstMultiXactId);
 	InRecovery = IsUnderPostmaster = false;
 	MyBackendType = B_STARTUP;
 	reads = zeroes = writes = 0;

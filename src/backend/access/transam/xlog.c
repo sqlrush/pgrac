@@ -166,6 +166,12 @@
  *	  - Continue only the original retiring CF owner, reject inconsistent
  *	    cookies or startup bindings, and report the remaining wait budget.
  *
+ * PGRAC MODIFICATIONS (native MultiXact startup input)
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Spec: spec-7.1-cross-instance-positive-interread.md
+ *	What changed:
+ *	  - Expose the bound native-empty creation input without changing
+ *	    startup ownership or admission.
  */
 
 #include "postgres.h"
@@ -6565,6 +6571,54 @@ wait_for_owner:
 	clusterStartupWriterBound = true;
 	return first;
 }
+/*
+ * PGRAC: pure qualification of the selected native creation input.
+ * Caller identity and live binding checks belong to the wrapper below.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static bool
+ClusterXLogNativeEmptyMultiXactInputMatches(const ClusterWalStartupImage *input, bool selected,
+											bool bound, bool installed,
+											const ControlFileData *control)
+{
+	return selected && bound && !installed && input->input_kind == CLUSTER_WAL_STARTUP_INITIALIZED
+		   && input->phase == CLUSTER_WAL_STARTUP_INITIALIZING && control->state == DB_SHUTDOWNED
+		   && control->system_identifier == input->claim.identity.system_identifier
+		   && control->checkPoint == input->predecessor.snapshot.tail_last_record_lsn
+		   && input->predecessor.snapshot.checkpoint_lower_lsn != InvalidXLogRecPtr
+		   && input->predecessor.snapshot.checkpoint_lower_lsn <= control->checkPoint
+		   && control->checkPointCopy.ThisTimeLineID == input->timeline
+		   && control->checkPointCopy.oldestMulti == FirstMultiXactId
+		   && control->checkPointCopy.nextMulti == FirstMultiXactId
+		   && control->checkPointCopy.nextMultiOffset == 0 && control->minRecoveryPoint == 0
+		   && control->minRecoveryPointTLI == 0 && control->backupStartPoint == 0
+		   && control->backupEndPoint == 0 && !control->backupEndRequired;
+}
+
+/* PGRAC: copy only the original Startup state; never issue admission or binding. */
+bool
+ClusterXLogStartupNativeEmptyMultiXactInput(void)
+{
+	ClusterWalStartupImage input;
+	ControlFileData control;
+	bool selected, bound, installed;
+
+	if (MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_shared_catalog
+		|| !cluster_enabled || !cluster_xid_striping || !cluster_controlfile_shared_authority
+		|| ShutdownRequestPending || InRecovery || ArchiveRecoveryRequested || CritSectionCount != 0
+		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock)
+		|| cluster_cf_held(ExclusiveLock))
+		return false;
+	input = clusterStartupWriter;
+	control = *ControlFile;
+	selected = clusterStartupWriterSelected;
+	bound = clusterStartupWriterBound;
+	installed = clusterStartupWriterInstalled;
+	return ClusterXLogNativeEmptyMultiXactInputMatches(&input, selected, bound, installed, &control)
+		   && cluster_wal_writer_startup_matches(&input.claim.identity, input.operation_uuid,
+												 input.first_segment_lsn);
+}
+
 #endif
 
 /*

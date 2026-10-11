@@ -2,6 +2,7 @@
 /* Actual native adapter; root/filesystem behavior is separately tested by
  * test_cluster_control_root. Only runtime/lock/root-return facts are replaced. */
 #include "postgres.h"
+#include "access/multixact.h"
 #include <time.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -42,6 +43,7 @@
 UT_DEFINE_GLOBALS();
 
 bool cluster_shared_config = true, cluster_enabled = true;
+bool cluster_shared_catalog = true, cluster_xid_striping = true;
 bool enableFsync = true;
 bool cluster_controlfile_shared_authority = true;
 char *DataDir = "/unused-native-adapter";
@@ -2427,6 +2429,97 @@ UT_TEST(retirement_rejects_usable_holds_and_missing_original_cookie)
 	}
 }
 
+UT_TEST(native_empty_input_requires_the_original_bound_initializer)
+{
+	for (unsigned fault = 0; fault < 22; ++fault) {
+		ControlFileData before;
+		ClusterWalStartupImage original;
+		writer_begin_fixture();
+		cluster_shared_catalog = cluster_xid_striping = true;
+		offered.input_kind = CLUSTER_WAL_STARTUP_INITIALIZED;
+		current.checkPointCopy.nextMulti = current.checkPointCopy.oldestMulti = FirstMultiXactId;
+		current.checkPointCopy.nextMultiOffset = 0;
+		UT_ASSERT_EQ(writer_begin(), wal_segment_size);
+		switch (fault) {
+		case 1:
+			clusterStartupWriter.input_kind = CLUSTER_WAL_STARTUP_CLEAN;
+			break;
+		case 2:
+			clusterStartupWriter.input_kind = CLUSTER_WAL_STARTUP_RECOVERED;
+			break;
+		case 3:
+			clusterStartupWriterSelected = false;
+			break;
+		case 4:
+			clusterStartupWriterBound = false;
+			break;
+		case 5:
+			clusterStartupWriterInstalled = true;
+			break;
+		case 6:
+			startup_binding_ok = false;
+			break;
+		case 7:
+			current.system_identifier++;
+			break;
+		case 8:
+			current.checkPoint++;
+			break;
+		case 9:
+			current.checkPointCopy.ThisTimeLineID++;
+			break;
+		case 10:
+			current.checkPointCopy.nextMulti++;
+			break;
+		case 11:
+			current.checkPointCopy.oldestMulti++;
+			break;
+		case 12:
+			current.checkPointCopy.nextMultiOffset++;
+			break;
+		case 13:
+			ShutdownRequestPending = true;
+			break;
+		case 14:
+			ArchiveRecoveryRequested = true;
+			break;
+		case 15:
+			clusterStartupWriter.phase = CLUSTER_WAL_STARTUP_DURABLE;
+			break;
+		case 16:
+			MyBackendType = B_BACKEND;
+			break;
+		case 17:
+			current.state = DB_IN_PRODUCTION;
+			break;
+		case 18:
+			current.backupStartPoint = 1;
+			break;
+		case 19:
+			cluster_shared_catalog = false;
+			break;
+		case 20:
+			cluster_xid_striping = false;
+			break;
+		case 21:
+			provider_ok = false;
+			break;
+		}
+		before = current;
+		original = clusterStartupWriter;
+		/* PGRAC: runtime caller/admission facts are separate from input bytes. */
+		UT_ASSERT_EQ(ClusterXLogNativeEmptyMultiXactInputMatches(
+						 &original, clusterStartupWriterSelected, clusterStartupWriterBound,
+						 clusterStartupWriterInstalled, &before),
+					 fault == 0 || fault == 6 || fault == 13 || fault == 14 || fault == 16
+						 || fault == 19 || fault == 20 || fault == 21);
+		UT_ASSERT_EQ(ClusterXLogStartupNativeEmptyMultiXactInput(), fault == 0);
+		UT_ASSERT_EQ(memcmp(&before, &current, sizeof(current)), 0);
+		UT_ASSERT_EQ(memcmp(&original, &clusterStartupWriter, sizeof(original)), 0);
+		UT_ASSERT_EQ(native_writes | install_calls, 0);
+	}
+	cluster_shared_catalog = cluster_xid_striping = true;
+}
 
 int
 main(void)
@@ -2442,7 +2535,8 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(66);
+	UT_PLAN(67);
+	UT_RUN(native_empty_input_requires_the_original_bound_initializer);
 	UT_RUN(shutdown_wait_log_carries_the_remaining_wait_budget);
 	UT_RUN(writer_prepare_nonok_with_binding_is_not_retried_or_cleared);
 	UT_RUN(retirement_rejects_usable_holds_and_missing_original_cookie);

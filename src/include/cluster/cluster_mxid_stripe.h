@@ -106,10 +106,10 @@ extern bool cluster_mxid_is_mine(MultiXactId mxid);
  * Allocation-side slot gate consumed by GetNewMultiXactId under
  * MultiXactGenLock: this node's stripe slot when striping is enabled,
  * the declared node identity fits the stripe width AND the mxid floor
- * has been latched (the mxid face can trail the xid face: a cluster
- * activated before the mxid extension record existed keeps allocating
- * vanilla dense ids, which stay below-floor underivable -- honest
- * degrade, never a misattribution).  -1 = allocation stays vanilla.
+ * has been latched (the mxid face can trail the xid face). PGRAC: -1
+ * means no allocation binding, not permission to allocate dense IDs
+ * in shared-config mode. Only the original nonshared/dense path keeps
+ * native allocation behavior.
  */
 extern int cluster_mxid_allocation_slot(void);
 
@@ -137,8 +137,8 @@ extern void cluster_mxid_stripe_latch_runtime(bool active, int my_slot, MultiXac
  * resolver below folds the per-copy evidence into ONE verdict:
  *
  *   ABSENT    no copy anywhere carries a valid extension: the mxid
- *             face was never activated -- vanilla dense allocation and
- *             fail-closed foreign reads are consistent cluster-wide.
+ *             face was never activated. PGRAC: shared-config allocation
+ *             refuses until bound; foreign reads remain fail closed.
  *   VALID     a single coherent floor: adopt it.
  *   POISONED  the evidence conflicts: two valid extensions disagree on
  *             the floor, a valid extension exists but the newest-

@@ -81,7 +81,7 @@ TESTS = test_cluster_heap_cr_reuse test_cluster_buffer_cr test_cluster_buffer_ma
         test_cluster_space_fork test_cluster_space_identity test_cluster_space_page_verify test_cluster_space_table_size test_cluster_space_wal test_cluster_space_storage test_cluster_space_recovery test_cluster_space_cache test_cluster_space_recovery_route test_cluster_space_copy test_cluster_space_copy_version test_cluster_heap_insert_version test_cluster_vm_version test_cluster_vm_redo \
         test_cluster_buffer_desc test_cluster_pcm_lock test_cluster_pcm_own test_cluster_pcm_direct_init test_cluster_resource_x_identity test_cluster_resource_x_node_wire test_cluster_resource_x_retry test_cluster_resource_x_handoff test_cluster_share_barrier test_cluster_heap_barrier test_cluster_bufmgr_pcm_hook test_cluster_gcs_dispatch test_cluster_gcs_block test_cluster_gcs_block_retransmit test_cluster_gcs_block_2way test_cluster_gcs_block_3way test_cluster_gcs_block_lost_write test_cluster_gcs_block_dedup_reclaim test_cluster_gcs_block_dedup_htab test_cluster_sinval test_cluster_sinval_ack test_cluster_stage2_acceptance test_cluster_tt_status test_cluster_tt_status_hint test_cluster_visibility_fork test_cluster_visibility_decide_scn test_cluster_snapshot_source test_cluster_itl_touch test_cluster_active_itl_transfer test_cluster_itl_wal test_cluster_uba \
         test_cluster_startup_phase test_cluster_authority_storage test_cluster_serving_sample test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision \
-        test_cluster_xlog test_cluster_xlog_insert_end test_cluster_subtrans_startup test_cluster_subtrans_durability test_cluster_clog_startup test_cluster_multixact_startup test_cluster_commit_ts_startup test_cluster_tt_slot test_cluster_undo_segment \
+        test_cluster_xlog test_cluster_xlog_insert_end test_cluster_subtrans_startup test_cluster_subtrans_durability test_cluster_clog_startup test_cluster_multixact_startup test_cluster_multixact_limits test_cluster_multixact_limits_io test_cluster_commit_ts_startup test_cluster_tt_slot test_cluster_undo_segment \
         test_cluster_epoch test_cluster_epoch_ballot_codec test_cluster_fence test_cluster_reconfig test_cluster_replacement_episode test_cluster_replacement_request test_cluster_replacement_wire test_cluster_undo_root_descriptor test_cluster_marker_async \
         test_cluster_ges test_cluster_ges_reply_wait test_cluster_grd_outbound test_cluster_grd test_cluster_grd_capacity test_cluster_grd_dsa test_cluster_grd_starvation test_cluster_lmd test_cluster_lmd_groups test_cluster_lmd_graph test_cluster_lmd_wait_state test_cluster_cancel_token test_cluster_lmd_probe_collector test_cluster_lock_acquire test_cluster_advisory \
         test_cluster_tt_slot_allocator test_cluster_itl_reader_real_triple \
@@ -403,7 +403,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_heap_cr_reuse test_cluster_snapshot_ad
 		test_cluster_replacement_episode \
 		test_cluster_replacement_request \
 		test_cluster_undo_root_descriptor \
-		test_cluster_xlog_insert_end test_cluster_subtrans_startup test_cluster_subtrans_durability test_cluster_clog_startup test_cluster_multixact_startup test_cluster_commit_ts_startup \
+		test_cluster_xlog_insert_end test_cluster_subtrans_startup test_cluster_subtrans_durability test_cluster_clog_startup test_cluster_multixact_startup test_cluster_multixact_limits test_cluster_multixact_limits_io test_cluster_commit_ts_startup \
 		test_cluster_undo_block0_current \
 		test_cluster_gcs_block_dedup_r4_route test_cluster_r4_route_policy \
 		test_cluster_r4_lms_controls test_cluster_r4_slot_reservation \
@@ -954,7 +954,9 @@ test_cluster_startup_writer_native.inc: $(top_srcdir)/src/backend/access/transam
 	     /^ClusterCf(ConsumerWaitSlice|RetirementPending)\(/ { print "static bool"; emit=1 } \
 	     /^ClusterStartupWriterBegin\(/ { print "static XLogRecPtr"; emit=1; count++ } \
 	     /^cluster_wal_startup_clean_input_v1\(/ { print "ClusterControlRootResult"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 5) exit 1 }' $< > $@.tmp
+	     /^ClusterXLogNativeEmptyMultiXactInputMatches\(/ { print "static bool"; emit=1; count++ } \
+	     /^ClusterXLogStartupNativeEmptyMultiXactInput\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 7) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # PGRAC: execute the real earliest startup-directory mutation call site.
@@ -4006,15 +4008,26 @@ test_cluster_clog_startup: test_cluster_clog_startup.c unit_test.h \
 # PGRAC: retained native side startup; memory SLRU/lock boundaries only.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_multixact_startup: test_cluster_multixact_startup.c unit_test.h \
-		$(top_srcdir)/src/backend/access/transam/multixact.c
+		$(top_srcdir)/src/backend/access/transam/multixact.c \
+		$(top_srcdir)/src/backend/cluster/cluster_mxid_stripe.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
+# PGRAC: actual allocation/maintenance bodies with explicit I/O boundaries.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_multixact_limits: test_cluster_multixact_limits.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/multixact.c \
+		$(top_srcdir)/src/backend/cluster/cluster_mxid_stripe.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
 # PGRAC: actual MultiXact and SLRU recovery against disposable origin files.
 # Author: SqlRush <sqlrush@gmail.com>
-test_cluster_multixact_recovery: test_cluster_multixact_recovery.c unit_test.h \
+test_cluster_multixact_recovery test_cluster_multixact_limits_io: %: %.c unit_test.h \
 		$(top_srcdir)/src/backend/access/transam/multixact.c \
-		$(top_srcdir)/src/backend/access/transam/slru.c
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/backend/cluster/cluster_mxid_stripe.c \
+		$(top_srcdir)/src/backend/cluster/cluster_xid_authority.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 

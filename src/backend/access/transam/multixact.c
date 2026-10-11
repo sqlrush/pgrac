@@ -73,6 +73,9 @@
  * Modified by: SqlRush <sqlrush@gmail.com>
  *
  * What changed:
+ *	 - Compute shared member limits from exact local endpoints; qualify the
+ *	   original empty startup input without granting striped allocation.
+ *	   Disabled striping retains native dense maintenance.
  *	 - MultiXactIdCreateFromMembers emits a cluster member overlay +
  *	   V4 sidecar wire for local-all-member composes so peers can
  *	   resolve this node's multixacts without decoding a foreign SLRU.
@@ -138,6 +141,8 @@
 #include "cluster/cluster_inject.h"			/* PGRAC: spec-7.1 D3-a half-space limit leg */
 #include "cluster/cluster_multixact.h"		/* overlay install + types */
 #include "cluster/cluster_multixact_current.h" /* requester-local proven create cap */
+#include "cluster/cluster_xid_stripe_boot.h"   /* PGRAC: existing activation observation */
+#include "cluster/cluster_xid_authority.h"	   /* PGRAC: retained native-empty input */
 #include "cluster/cluster_mxid_stripe.h"	/* PGRAC: spec-7.1 D3-a striped candidate */
 #include "cluster/cluster_side_projection.h"
 #include "cluster/cluster_undo_recovery.h"
@@ -1264,6 +1269,7 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 	MultiXactOffset nextOffset;
 #ifdef USE_PGRAC_CLUSTER
 	int mxid_stripe_slot;
+	MultiXactId mxid_floor_snapshot;
 #endif
 
 	debug_elog3(DEBUG2, "GetNew: for %d xids", nmembers);
@@ -1299,11 +1305,20 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 	LWLockAcquire(MultiXactGenLock, LW_EXCLUSIVE);
 
 	/* Handle wraparound of the nextMXact counter */
-	if (MultiXactState->nextMXact < FirstMultiXactId)
+	if (MultiXactState->nextMXact < FirstMultiXactId
+#ifdef USE_PGRAC_CLUSTER
+		&& !cluster_shared_config
+#endif
+	)
 		MultiXactState->nextMXact = FirstMultiXactId;
 
 	/* Assign the MXID */
 	result = MultiXactState->nextMXact;
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: a rejected shared allocation must not normalize shared state. */
+	if (result < FirstMultiXactId)
+		result = FirstMultiXactId;
+#endif
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -1321,11 +1336,12 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 	 * value above the floor is self-describing (its origin slot is
 	 * value mod 16) and readers never decode a foreign multixact
 	 * against the local SLRU (the spec-7.1 probe-F alias).  Candidate
-	 * arithmetic is pure and lives in cluster_mxid_stripe.c; with
-	 * striping off / unlatched the slot is -1 and this block is a
-	 * no-op (byte-identical vanilla behaviour).
+	 * arithmetic is pure and lives in cluster_mxid_stripe.c. Striping
+	 * disabled keeps the dense path; shared striped allocation without
+	 * a binding is rejected below, before any reservation or extension.
 	 */
 	mxid_stripe_slot = cluster_mxid_allocation_slot();
+	mxid_floor_snapshot = cluster_mxid_stripe_floor();
 	if (mxid_stripe_slot >= 0) {
 		MultiXactId floor_mxid = cluster_mxid_stripe_floor();
 
@@ -1354,7 +1370,7 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 			ClusterMultiXactSourceResult source_result;
 
 			(void)cluster_multixact_source_dispatch(CLUSTER_MULTI_SOURCE_NOTE_HALFSPACE_REFUSE,
-											 NULL, &source_result);
+													NULL, &source_result);
 			ereport(
 				ERROR,
 				(errcode(ERRCODE_CLUSTER_MXID_HALFSPACE_LIMIT),
@@ -1485,8 +1501,8 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 			if (cluster_mxid_halfspace_exceeded(result, floor_mxid)) {
 				ClusterMultiXactSourceResult source_result;
 
-				(void)cluster_multixact_source_dispatch(
-					CLUSTER_MULTI_SOURCE_NOTE_HALFSPACE_REFUSE, NULL, &source_result);
+				(void)cluster_multixact_source_dispatch(CLUSTER_MULTI_SOURCE_NOTE_HALFSPACE_REFUSE,
+														NULL, &source_result);
 				ereport(
 					ERROR,
 					(errcode(ERRCODE_CLUSTER_MXID_HALFSPACE_LIMIT),
@@ -1503,6 +1519,36 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 	}
 
 #ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC: check the final candidate under the same lock as the retained
+	 * lower bound, including the warning path's release/re-acquire window.
+	 * No gap extension, member reservation or cursor update precedes this.
+	 */
+	if (cluster_shared_config) {
+		MultiXactId lower = MultiXactState->oldestMultiXactId;
+		bool known = MultiXactState->oldestOffsetKnown;
+		bool stripe_current = !cluster_xid_striping
+							  || (mxid_stripe_slot >= 0 && mxid_stripe_slot < CLUSTER_MXID_STRIDE
+								  && MultiXactIdIsValid(mxid_floor_snapshot)
+								  && mxid_stripe_slot == cluster_mxid_allocation_slot()
+								  && mxid_floor_snapshot == cluster_mxid_stripe_floor()
+								  && !cluster_mxid_stripe_poisoned());
+
+		if (!stripe_current || !known || MultiXactIdPrecedes(result, lower)) {
+			LWLockRelease(MultiXactGenLock);
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg(!stripe_current ? "shared MultiXact allocation stripe is not proven"
+							: !known ? "shared MultiXact member retention limit is not proven"
+									 : "shared MultiXact allocation frontier is behind the "
+									   "retained lower bound"),
+					 errdetail("candidate=%u oldest=%u slot=%d", result, lower, mxid_stripe_slot),
+					 errhint("Restore a qualified allocation frontier and member retention limit "
+							 "before retrying. Preserve the data and WAL; do not reset the stripe "
+							 "floor.")));
+		}
+	}
 
 	/*
 	 * PGRAC: spec-7.1 D3-a -- a striped candidate skips multixact
@@ -3101,6 +3147,267 @@ GetOldestMultiXactId(void)
 	return oldestMXact;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: one local endpoint, never a search through unproven offset slots. */
+typedef enum ClusterMxidLocalKind {
+	CLUSTER_MXID_LOCAL_INVALID,
+	CLUSTER_MXID_LOCAL_EMPTY,
+	CLUSTER_MXID_LOCAL_EXACT
+} ClusterMxidLocalKind;
+
+typedef enum ClusterMxidScopeSource {
+	CLUSTER_MXID_SCOPE_INVALID,
+	CLUSTER_MXID_SCOPE_STRIPED,
+	CLUSTER_MXID_SCOPE_NATIVE_EMPTY_BOOT
+} ClusterMxidScopeSource;
+
+typedef struct ClusterMxidLocalScope {
+	ClusterMxidScopeSource source;
+	const char *reason;
+	int slot;
+	MultiXactId floor;
+	bool native_empty;
+} ClusterMxidLocalScope;
+
+static bool
+cluster_mxid_local_scope_current(const ClusterMxidLocalScope *scope)
+{
+	return scope->source == CLUSTER_MXID_SCOPE_STRIPED && scope->slot >= 0
+		   && scope->slot < CLUSTER_MXID_STRIDE && MultiXactIdIsValid(scope->floor)
+		   && !cluster_mxid_stripe_poisoned() && scope->slot == cluster_mxid_allocation_slot()
+		   && scope->floor == cluster_mxid_stripe_floor();
+}
+
+/* PGRAC: consume the existing completed observation; never rescan or seed. */
+static bool
+cluster_mxid_native_empty_activation(void)
+{
+	ClusterXidStripeObs obs;
+
+	cluster_xid_stripe_observe(&obs);
+	return obs.disk_state == CLUSTER_XID_STRIPE_DISK_ABSENT
+		   && obs.mxid_disk_state == CLUSTER_MXID_DISK_ABSENT && obs.activated_floor_full == 0
+		   && obs.activated_mxid_floor == 0 && !cluster_mxid_stripe_poisoned();
+}
+
+/* PGRAC: retain the existing origin/floor binding across an unlocked header read. */
+static ClusterMxidLocalScope
+cluster_mxid_local_scope(MultiXactId additional_lower, bool startup)
+{
+	ClusterMxidLocalScope scope = { 0 };
+	MultiXactId lower, next;
+	ClusterXidAuthorityHeader native;
+
+	scope.source = CLUSTER_MXID_SCOPE_STRIPED;
+	scope.slot = cluster_mxid_allocation_slot();
+	scope.floor = cluster_mxid_stripe_floor();
+	if (!cluster_mxid_local_scope_current(&scope)) {
+		scope.source = CLUSTER_MXID_SCOPE_INVALID;
+		if (!startup || !ClusterXLogStartupNativeEmptyMultiXactInput())
+			return scope;
+		scope.reason = "NATIVE_EMPTY_BOOT_AUTHORITY_UNPROVEN";
+		if (!cluster_xid_authority_read_checked(&native, NULL)
+			|| native.magic != CLUSTER_XID_AUTHORITY_MAGIC
+			|| native.version != CLUSTER_XID_AUTHORITY_VERSION || native.reserved != 0
+			|| native.flags
+				   != (CLUSTER_XID_AUTHORITY_FLAG_SEALED | CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA)
+			|| native.next_multi != FirstMultiXactId)
+			return scope;
+		scope.reason = "NATIVE_EMPTY_BOOT_INPUT_UNPROVEN";
+		if (!ClusterXLogStartupNativeEmptyMultiXactInput())
+			return scope;
+		/* The original lazy latch may have become available during the read. */
+		scope.slot = cluster_mxid_allocation_slot();
+		scope.floor = cluster_mxid_stripe_floor();
+		scope.source = CLUSTER_MXID_SCOPE_STRIPED;
+		scope.native_empty = true;
+		if (cluster_mxid_local_scope_current(&scope))
+			return scope;
+		scope.source = CLUSTER_MXID_SCOPE_INVALID;
+		scope.reason = "NATIVE_EMPTY_BOOT_ACTIVATION_UNPROVEN";
+		if (cluster_mxid_native_empty_activation()) {
+			scope.source = CLUSTER_MXID_SCOPE_NATIVE_EMPTY_BOOT;
+			scope.reason = NULL;
+		}
+		return scope;
+	}
+	LWLockAcquire(MultiXactGenLock, LW_SHARED);
+	lower = MultiXactState->oldestMultiXactId;
+	next = MultiXactState->nextMXact;
+	LWLockRelease(MultiXactGenLock);
+	if ((lower == FirstMultiXactId || next == FirstMultiXactId
+		 || additional_lower == FirstMultiXactId)
+		&& (uint32)(FirstMultiXactId - scope.floor) >= CLUSTER_MXID_HALFSPACE) {
+		scope.native_empty = cluster_xid_authority_read(&native)
+							 && native.version == CLUSTER_XID_AUTHORITY_VERSION
+							 && (native.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED) != 0
+							 && native.next_multi == FirstMultiXactId;
+	}
+	return scope;
+}
+
+/* PGRAC: ID half-space arithmetic does not constrain the member-offset ring. */
+static ClusterMxidLocalKind
+cluster_mxid_local_endpoint(MultiXactId lower, MultiXactId next, const ClusterMxidLocalScope *scope,
+							MultiXactId *local)
+{
+	uint32 lower_distance = (uint32)(lower - scope->floor);
+	uint32 next_distance = (uint32)(next - scope->floor);
+
+	*local = InvalidMultiXactId;
+	if (scope->slot < 0 || scope->slot >= CLUSTER_MXID_STRIDE || !MultiXactIdIsValid(scope->floor)
+		|| !MultiXactIdIsValid(lower))
+		return CLUSTER_MXID_LOCAL_INVALID;
+	if (lower_distance >= CLUSTER_MXID_HALFSPACE) {
+		if (lower != FirstMultiXactId || !scope->native_empty)
+			return CLUSTER_MXID_LOCAL_INVALID;
+		lower = scope->floor;
+		lower_distance = 0;
+	}
+	if (next_distance >= CLUSTER_MXID_HALFSPACE) {
+		if (next != FirstMultiXactId || !scope->native_empty)
+			return CLUSTER_MXID_LOCAL_INVALID;
+		next_distance = 0;
+	}
+	if (lower_distance >= next_distance)
+		return CLUSTER_MXID_LOCAL_EMPTY;
+	*local = cluster_mxid_next_striped(lower, scope->slot);
+	if ((uint32)(*local - scope->floor) >= next_distance)
+		return CLUSTER_MXID_LOCAL_EMPTY;
+	return CLUSTER_MXID_LOCAL_EXACT;
+}
+
+static bool
+cluster_mxid_local_offset(ClusterMxidLocalKind kind, MultiXactId local, MultiXactOffset next_offset,
+						  bool read_only, MultiXactOffset *offset)
+{
+	if (kind == CLUSTER_MXID_LOCAL_EMPTY) {
+		*offset = next_offset;
+		return true;
+	}
+	return kind == CLUSTER_MXID_LOCAL_EXACT && find_multixact_start(local, offset, read_only)
+		   && *offset != 0;
+}
+
+/* PGRAC: allocation may advance during I/O, but cannot move to another era. */
+static bool
+cluster_mxid_local_next_current(const ClusterMxidLocalScope *scope, MultiXactId sampled)
+{
+	MultiXactId current = MultiXactState->nextMXact;
+	uint32 distance = (uint32)(current - scope->floor);
+	uint32 before = (uint32)(sampled - scope->floor);
+
+	if (!cluster_mxid_local_scope_current(scope))
+		return false;
+	if (current == sampled)
+		return true;
+	if (sampled == FirstMultiXactId && scope->native_empty && before >= CLUSTER_MXID_HALFSPACE)
+		before = 0;
+	return distance < CLUSTER_MXID_HALFSPACE && distance >= before;
+}
+
+static void
+cluster_mxid_local_limit_error(bool startup, MultiXactId lower, MultiXactId next,
+							   const char *reason)
+{
+	ereport(
+		startup ? FATAL : ERROR,
+		(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+		 errmsg("shared MultiXact member retention limit is not proven"),
+		 errdetail("PGRAC_FAMILY=MULTIXACT_LIMIT PGRAC_REASON=%s oldest=%u next=%u",
+				   reason ? reason : "LOCAL_ENDPOINT_UNPROVEN", lower, next),
+		 errhint("Preserve the data directory and WAL, and verify the original native input "
+				 "and stripe binding. Do not reset the retention limit or create missing files.")));
+}
+
+/*
+ * PGRAC: serialize local retention updates with truncation. An unrecorded
+ * reservation is UNKNOWN; it never replaces a previously proven bound.
+ */
+static bool
+cluster_mxid_set_local_limit(bool startup)
+{
+	static bool unbound_logged;
+	ClusterMxidLocalScope scope = cluster_mxid_local_scope(InvalidMultiXactId, startup);
+	MultiXactId lower, next, local;
+	MultiXactOffset offset, next_offset, stop;
+	bool known, current, native_empty_known;
+	bool empty_boot = scope.source == CLUSTER_MXID_SCOPE_NATIVE_EMPTY_BOOT;
+	ClusterMxidLocalKind kind;
+
+	LWLockAcquire(MultiXactTruncationLock, LW_EXCLUSIVE);
+	LWLockAcquire(MultiXactGenLock, LW_SHARED);
+	lower = MultiXactState->oldestMultiXactId;
+	next = MultiXactState->nextMXact;
+	next_offset = MultiXactState->nextOffset;
+	known = MultiXactState->oldestOffsetKnown;
+	native_empty_known
+		= known && lower == FirstMultiXactId && next == FirstMultiXactId && next_offset == 0
+		  && MultiXactState->oldestOffset == 0
+		  && MultiXactState->offsetStopLimit
+				 == (MultiXactOffset)(0 - MULTIXACT_MEMBERS_PER_PAGE * SLRU_PAGES_PER_SEGMENT);
+	Assert(MultiXactState->finishedStartup);
+	LWLockRelease(MultiXactGenLock);
+	if (!startup && !known) {
+		LWLockRelease(MultiXactTruncationLock);
+		cluster_mxid_local_limit_error(false, lower, next, NULL);
+	}
+	if (empty_boot) {
+		/* Same value as the bound EMPTY endpoint; this does not authorize IDs. */
+		if (lower != FirstMultiXactId || next != FirstMultiXactId || next_offset != 0) {
+			LWLockRelease(MultiXactTruncationLock);
+			cluster_mxid_local_limit_error(true, lower, next, "NATIVE_EMPTY_BOOT_CURSOR_CHANGED");
+		}
+		offset = 0;
+	} else {
+		kind = cluster_mxid_local_endpoint(lower, next, &scope, &local);
+		if (!cluster_mxid_local_scope_current(&scope)
+			|| !cluster_mxid_local_offset(kind, local, next_offset, startup, &offset)) {
+			LWLockRelease(MultiXactTruncationLock);
+			if (startup)
+				cluster_mxid_local_limit_error(true, lower, next, scope.reason);
+			/* Retaining the proven empty bound cannot request member vacuum. */
+			if (native_empty_known && scope.slot < 0 && scope.floor == InvalidMultiXactId
+				&& !cluster_mxid_stripe_poisoned()) {
+				if (!unbound_logged) {
+					ereport(
+						LOG,
+						(errmsg("shared MultiXact retention awaits its original stripe binding"),
+						 errdetail(
+							 "PGRAC_FAMILY=MULTIXACT_LIMIT PGRAC_REASON=STRIPE_BINDING_PENDING")));
+					unbound_logged = true;
+				}
+				return false;
+			}
+			return true;
+		}
+	}
+	stop = offset - offset % (MULTIXACT_MEMBERS_PER_PAGE * SLRU_PAGES_PER_SEGMENT);
+	stop -= MULTIXACT_MEMBERS_PER_PAGE * SLRU_PAGES_PER_SEGMENT;
+	LWLockAcquire(MultiXactGenLock, LW_EXCLUSIVE);
+	current = MultiXactState->oldestMultiXactId == lower
+			  && (empty_boot ? (MultiXactState->nextMXact == FirstMultiXactId
+								&& MultiXactState->nextOffset == 0)
+							 : cluster_mxid_local_next_current(&scope, next));
+	if (current) {
+		MultiXactState->oldestOffset = offset;
+		MultiXactState->oldestOffsetKnown = true;
+		MultiXactState->offsetStopLimit = stop;
+	}
+	LWLockRelease(MultiXactGenLock);
+	LWLockRelease(MultiXactTruncationLock);
+	if (!current && startup)
+		cluster_mxid_local_limit_error(true, lower, next,
+									   empty_boot ? "NATIVE_EMPTY_BOOT_CURSOR_CHANGED" : NULL);
+	if (empty_boot && current)
+		ereport(LOG,
+				(errmsg("native empty MultiXact retention limit established"),
+				 errdetail("PGRAC_FAMILY=MULTIXACT_LIMIT PGRAC_REASON=NATIVE_EMPTY_BOOT_PROVEN "
+						   "oldest=1 next=1 next_offset=0")));
+	return !current || next_offset - offset > MULTIXACT_MEMBER_SAFE_THRESHOLD;
+}
+#endif
+
 /*
  * Determine how aggressively we need to vacuum in order to prevent member
  * wraparound.
@@ -3127,6 +3434,9 @@ SetOffsetVacuumLimit(bool is_startup)
 	bool read_only = false;
 
 #ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: shared offsets have holes belonging to the other origins. */
+	if (cluster_shared_config && cluster_xid_striping)
+		return cluster_mxid_set_local_limit(is_startup);
 	/* PGRAC: limit discovery is not authority to flush retained startup input. */
 	read_only = cluster_shared_config && is_startup;
 #endif
@@ -3509,9 +3819,23 @@ TruncateMultiXact(MultiXactId newOldestMulti, Oid newOldestMultiDB)
 	MultiXactOffset nextOffset;
 	mxtruncinfo trunc;
 	MultiXactId earliest;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterMxidLocalScope scope;
+	ClusterMxidLocalKind old_kind = CLUSTER_MXID_LOCAL_INVALID;
+	ClusterMxidLocalKind new_kind = CLUSTER_MXID_LOCAL_INVALID;
+	MultiXactId old_local = InvalidMultiXactId;
+	MultiXactId new_local = InvalidMultiXactId;
+	bool local_endpoints = cluster_shared_config && cluster_xid_striping;
+#endif
 
 	Assert(!RecoveryInProgress());
 	Assert(MultiXactState->finishedStartup);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: native prefix evidence is read before taking retention locks. */
+	if (local_endpoints)
+		scope = cluster_mxid_local_scope(newOldestMulti, false);
+#endif
 
 	/*
 	 * We can only allow one truncation to happen at once. Otherwise parts of
@@ -3538,6 +3862,32 @@ TruncateMultiXact(MultiXactId newOldestMulti, Oid newOldestMultiDB)
 		return;
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	if (local_endpoints) {
+		uint32 cut_distance = (uint32)(newOldestMulti - scope.floor);
+		uint32 next_distance = (uint32)(nextMulti - scope.floor);
+
+		old_kind = cluster_mxid_local_endpoint(oldestMulti, nextMulti, &scope, &old_local);
+		new_kind = cluster_mxid_local_endpoint(newOldestMulti, nextMulti, &scope, &new_local);
+		if (scope.native_empty && nextMulti == FirstMultiXactId
+			&& next_distance >= CLUSTER_MXID_HALFSPACE)
+			next_distance = 0;
+		if (scope.native_empty && newOldestMulti == FirstMultiXactId
+			&& cut_distance >= CLUSTER_MXID_HALFSPACE)
+			cut_distance = 0;
+		if (!cluster_mxid_local_scope_current(&scope) || old_kind == CLUSTER_MXID_LOCAL_INVALID
+			|| new_kind == CLUSTER_MXID_LOCAL_INVALID || cut_distance > next_distance) {
+			ereport(
+				LOG,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("skipping shared MultiXact truncation: local interval is not proven"),
+				 errdetail("oldest=%u cutoff=%u next=%u", oldestMulti, newOldestMulti, nextMulti)));
+			LWLockRelease(MultiXactTruncationLock);
+			return;
+		}
+	}
+#endif
+
 	/*
 	 * Note we can't just plow ahead with the truncation; it's possible that
 	 * there are no segments to truncate, which is a problem because we are
@@ -3563,12 +3913,32 @@ TruncateMultiXact(MultiXactId newOldestMulti, Oid newOldestMultiDB)
 		earliest = FirstMultiXactId;
 
 	/* If there's nothing to remove, we can bail out early. */
-	if (MultiXactIdPrecedes(oldestMulti, earliest)) {
+	if (MultiXactIdPrecedes(
+#ifdef USE_PGRAC_CLUSTER
+			local_endpoints ? (old_kind == CLUSTER_MXID_LOCAL_EMPTY ? nextMulti : old_local) :
+#endif
+							oldestMulti,
+			earliest)) {
 		LWLockRelease(MultiXactTruncationLock);
 		return;
 	}
 
-	/*
+#ifdef USE_PGRAC_CLUSTER
+	if (local_endpoints) {
+		/* PGRAC: both offsets belong to the same local member allocation ring. */
+		if (!cluster_mxid_local_offset(old_kind, old_local, nextOffset, false, &oldestOffset)
+			|| !cluster_mxid_local_offset(new_kind, new_local, nextOffset, false,
+										  &newOldestOffset)) {
+			ereport(LOG, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						  errmsg("skipping shared MultiXact truncation: local endpoint is unknown"),
+						  errdetail("oldest=%u local_oldest=%u cutoff=%u local_cutoff=%u",
+									oldestMulti, old_local, newOldestMulti, new_local)));
+			LWLockRelease(MultiXactTruncationLock);
+			return;
+		}
+	} else {
+#endif
+		/*
 	 * First, compute the safe truncation point for MultiXactMember. This is
 	 * the starting offset of the oldest multixact.
 	 *
@@ -3576,33 +3946,34 @@ TruncateMultiXact(MultiXactId newOldestMulti, Oid newOldestMultiDB)
 	 * already checked that it doesn't precede the earliest MultiXact on disk.
 	 * But if it fails, don't truncate anything, and log a message.
 	 */
-	if (oldestMulti == nextMulti) {
-		/* there are NO MultiXacts */
-		oldestOffset = nextOffset;
-	} else if (!find_multixact_start(oldestMulti, &oldestOffset, false)) {
-		ereport(LOG,
+		if (oldestMulti == nextMulti) {
+			/* there are NO MultiXacts */
+			oldestOffset = nextOffset;
+		} else if (!find_multixact_start(oldestMulti, &oldestOffset, false)) {
+			ereport(
+				LOG,
 				(errmsg("oldest MultiXact %u not found, earliest MultiXact %u, skipping truncation",
 						oldestMulti, earliest)));
-		LWLockRelease(MultiXactTruncationLock);
-		return;
-	}
+			LWLockRelease(MultiXactTruncationLock);
+			return;
+		}
 
-	/*
+		/*
 	 * Secondly compute up to where to truncate. Lookup the corresponding
 	 * member offset for newOldestMulti for that.
 	 */
-	if (newOldestMulti == nextMulti) {
-		/* there are NO MultiXacts */
-		newOldestOffset = nextOffset;
-	} else if (!find_multixact_start(newOldestMulti, &newOldestOffset, false)) {
-		ereport(LOG, (errmsg("cannot truncate up to MultiXact %u because it does not exist on "
-							 "disk, skipping truncation",
-							 newOldestMulti)));
-		LWLockRelease(MultiXactTruncationLock);
-		return;
-	}
+		if (newOldestMulti == nextMulti) {
+			/* there are NO MultiXacts */
+			newOldestOffset = nextOffset;
+		} else if (!find_multixact_start(newOldestMulti, &newOldestOffset, false)) {
+			ereport(LOG, (errmsg("cannot truncate up to MultiXact %u because it does not exist on "
+								 "disk, skipping truncation",
+								 newOldestMulti)));
+			LWLockRelease(MultiXactTruncationLock);
+			return;
+		}
 
-	/*
+		/*
 	 * On crash, MultiXactIdCreateFromMembers() can leave behind multixids
 	 * that were not yet written out and hence have zero offset on disk. If
 	 * such a multixid becomes oldestMulti, we won't be able to look up its
@@ -3610,13 +3981,35 @@ TruncateMultiXact(MultiXactId newOldestMulti, Oid newOldestMultiDB)
 	 * it. Just skip the truncation, and hope that by the next truncation
 	 * attempt, oldestMulti has advanced to a valid multixid.
 	 */
-	if (newOldestOffset == 0) {
-		ereport(LOG, (errmsg("cannot truncate up to MultiXact %u because it has invalid offset, "
-							 "skipping truncation",
-							 newOldestMulti)));
-		LWLockRelease(MultiXactTruncationLock);
-		return;
+		if (newOldestOffset == 0) {
+			ereport(LOG,
+					(errmsg("cannot truncate up to MultiXact %u because it has invalid offset, "
+							"skipping truncation",
+							newOldestMulti)));
+			LWLockRelease(MultiXactTruncationLock);
+			return;
+		}
+#ifdef USE_PGRAC_CLUSTER
 	}
+
+	/* PGRAC: an unlocked SLRU read cannot authorize deletion for a new cut. */
+	if (local_endpoints) {
+		bool current;
+
+		LWLockAcquire(MultiXactGenLock, LW_SHARED);
+		current = MultiXactState->oldestMultiXactId == oldestMulti
+				  && cluster_mxid_local_next_current(&scope, nextMulti);
+		LWLockRelease(MultiXactGenLock);
+		if (!current) {
+			ereport(LOG, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						  errmsg("skipping shared MultiXact truncation: sampled identity changed"),
+						  errdetail("oldest=%u cutoff=%u next=%u", oldestMulti, newOldestMulti,
+									nextMulti)));
+			LWLockRelease(MultiXactTruncationLock);
+			return;
+		}
+	}
+#endif
 
 	elog(DEBUG1,
 		 "performing multixact truncation: "
