@@ -270,10 +270,10 @@ UT_TEST(test_real_writer_pause_and_other_notification_without_pgproc)
 			pipe_byte(writer_pipe[0], false);
 			UT_ASSERT_EQ(cluster_phase_started_at(CLUSTER_PHASE_1_CLUSTER), 7000);
 			UT_ASSERT_EQ(phase_wait_calls, 1);
-			UT_ASSERT_EQ(phase_reset_calls, 2);
-			UT_ASSERT(!MyLatch->is_set);
+			UT_ASSERT_EQ(phase_reset_calls, 1);
+			UT_ASSERT(MyLatch->is_set);
 			UT_ASSERT(other_work_pending);
-			/* The owning loop consumes persistent state, not the cleared latch. */
+			/* The owning loop keeps its wakeup as well as its persistent work. */
 			if (other_work_pending)
 				other_work_pending = false;
 			UT_ASSERT(!other_work_pending);
@@ -290,6 +290,22 @@ UT_TEST(test_real_writer_pause_and_other_notification_without_pgproc)
 		UT_ASSERT_EQ(WEXITSTATUS(status), 0);
 		close(reader_pipe[0]);
 		close(writer_pipe[1]);
+	}
+	reset_publication();
+}
+
+UT_TEST(test_uncontended_snapshot_preserves_callers_latch)
+{
+	for (int signaled = 0; signaled <= 1; signaled++) {
+		reset_publication();
+		phase4_test_now = 7000;
+		cluster_advance_phase(CLUSTER_PHASE_0_BASE);
+		IsUnderPostmaster = true;
+		MyLatch->is_set = signaled;
+		UT_ASSERT_EQ(cluster_phase_started_at(CLUSTER_PHASE_0_BASE), 7000);
+		UT_ASSERT_EQ(phase_reset_calls, 0);
+		UT_ASSERT_EQ(phase_wait_calls, 0);
+		UT_ASSERT_EQ(MyLatch->is_set, signaled);
 	}
 	reset_publication();
 }
@@ -381,7 +397,8 @@ int
 main(void)
 {
 	alarm(15);
-	UT_PLAN(4);
+	UT_PLAN(5);
+	UT_RUN(test_uncontended_snapshot_preserves_callers_latch);
 	UT_RUN(test_changed_cut_is_retried_before_timestamp_or_history_returns);
 	UT_RUN(test_real_writer_pause_and_other_notification_without_pgproc);
 	UT_RUN(test_anchor_waits_for_original_writer_while_holding_cf_x);

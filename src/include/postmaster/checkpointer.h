@@ -22,6 +22,8 @@ extern void cluster_checkpoint_wait_budget_begin(const ClusterPhase1FullStopPlan
 												 const ClusterWalSourceRef *ref);
 extern long cluster_checkpoint_wait_budget_charge(bool waiting, uint64 started_us,
 												  const ClusterWalSourceRef *ref, uint64 epoch);
+/* Diagnostic only; UINT64_MAX denotes an unavailable balance. */
+extern uint64 cluster_checkpoint_wait_budget_remaining_us(uint64 started_us);
 extern void cluster_checkpoint_wait_budget_end(void);
 #endif
 

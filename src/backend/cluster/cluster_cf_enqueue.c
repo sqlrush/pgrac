@@ -112,7 +112,8 @@ cluster_cf_attempt_wait_slice(const ClusterCfAttemptObservation *observation)
 		   && observation->result == CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT
 		   && observation->source == CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT
 		   && (observation->owner_state_at_return == CLUSTER_LOCK_OWNER_EMPTY
-			   || observation->owner_state_at_return == CLUSTER_LOCK_OWNER_RETIRING);
+			   || (observation->owner_state_at_return == CLUSTER_LOCK_OWNER_RETIRING
+				   && observation->control_owner_id != 0));
 }
 
 /*

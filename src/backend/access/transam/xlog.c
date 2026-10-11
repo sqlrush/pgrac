@@ -158,6 +158,14 @@
  *	  No typed purpose can update the shared control file after creation,
  *	  and a start refused after writer selection would leave a new writer
  *	  generation behind.
+ *
+ * PGRAC MODIFICATIONS (native CF wait continuation)
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md
+ *	What changed:
+ *	  - Continue only the original retiring CF owner, reject inconsistent
+ *	    cookies or startup bindings, and report the remaining wait budget.
+ *
  */
 
 #include "postgres.h"
@@ -254,8 +262,8 @@
 #include "cluster/cluster_recovery_merge.h" /* PGRAC: spec-6.14 D9 amend recovery-claim release */
 #include "cluster/cluster_page_cold_redo.h"
 #include "cluster/cluster_relmap_arb.h" /* PGRAC: spec-6.14 D5 relmap pending arbitration */
-#include "cluster/cluster_cf_enqueue.h"
-#include "postmaster/checkpointer.h" /* PGRAC: spec-5.6 CF X write-permission gate */
+#include "cluster/cluster_cf_enqueue.h" /* PGRAC: spec-5.6 CF X write-permission gate */
+#include "postmaster/checkpointer.h"	/* PGRAC: shutdown checkpoint wait accounting */
 #include "cluster/cluster_cf_phase2.h" /* PGRAC: spec-5.6 T6 cross-node verify */
 #include "cluster/cluster_cf_storage.h" /* PGRAC: spec-5.6 bootstrap authority window */
 #include "cluster/cluster_conf.h" /* PGRAC: RF-B exact one-node gate */
@@ -6185,7 +6193,7 @@ CheckRequiredParameterValues(void)
  * Author: SqlRush <sqlrush@gmail.com> */
 static bool
 ClusterCfConsumerWaitSlice(uint64 before, const char *consumer, const char *operation,
-						   bool *logged, ClusterCfAttemptObservation *waiting)
+						   uint64 started_us, bool *logged, ClusterCfAttemptObservation *waiting)
 {
 	ClusterCfAttemptObservation observed;
 
@@ -6194,31 +6202,41 @@ ClusterCfConsumerWaitSlice(uint64 before, const char *consumer, const char *oper
 		return false;
 	*waiting = observed;
 	if (!*logged) {
+		uint64 remaining = started_us != 0 ? cluster_checkpoint_wait_budget_remaining_us(started_us)
+										   : UINT64_MAX;
+
 		*logged = true;
-		ereport(LOG,
-			(errmsg("control-file wait continues under its original owner"),
-			 errdetail("PGRAC_FAMILY=CF_OWNER_WAIT consumer=%s operation=%s mode=%d "
-					   "request=" UINT64_FORMAT " epoch=" UINT64_FORMAT
-					   " caller_cookie=" UINT64_FORMAT " owner_state=%d result=%d timeout_source=%d",
-					   consumer, operation, (int)observed.mode, observed.request_id,
-					   observed.request_epoch, observed.control_owner_id,
-					   (int)observed.owner_state_at_return, (int)observed.result,
-					   (int)observed.source)));
+		ereport(LOG, (errmsg("control-file wait continues under its original owner"),
+					  errdetail("PGRAC_FAMILY=CF_OWNER_WAIT consumer=%s operation=%s mode=%d "
+								"request=" UINT64_FORMAT " epoch=" UINT64_FORMAT
+								" caller_cookie=" UINT64_FORMAT
+								" owner_state=%d result=%d timeout_source=%d "
+								"remaining_known=%d remaining_us=" UINT64_FORMAT,
+								consumer, operation, (int)observed.mode, observed.request_id,
+								observed.request_epoch, observed.control_owner_id,
+								(int)observed.owner_state_at_return, (int)observed.result,
+								(int)observed.source, remaining != UINT64_MAX,
+								remaining == UINT64_MAX ? (uint64)0 : remaining)));
 	}
 	return true;
 }
 
+/* PGRAC: retire the original cookie; usable holds are a caller contradiction. */
 static bool
 ClusterCfRetirementPending(ClusterCfAttemptObservation *waiting)
 {
 	cluster_cf_retirement_poll();
 	cluster_lock_owners_service_poll();
-	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+	if (cluster_cf_held_is_usable(ShareLock) || cluster_cf_held_is_usable(ExclusiveLock))
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("control-file retirement encountered a usable hold")));
+	if ((cluster_cf_held(ShareLock) && !cluster_cf_held_is_usable(ShareLock))
+		|| (cluster_cf_held(ExclusiveLock) && !cluster_cf_held_is_usable(ExclusiveLock)))
 		return true;
 	if (waiting != NULL) {
 		if (waiting->owner_state_at_return == CLUSTER_LOCK_OWNER_RETIRING
-			&& waiting->control_owner_id != 0
-			&& !cluster_cf_release_completed(waiting->mode, waiting->control_owner_id))
+			&& (waiting->control_owner_id == 0
+				|| !cluster_cf_release_completed(waiting->mode, waiting->control_owner_id)))
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 							errmsg("control-file retirement has no matching completion")));
 		/* Do not reuse a wait classification across a poll or another API. */
@@ -6514,8 +6532,13 @@ ClusterStartupWriterBegin(const EndOfWalRecoveryInfo *input)
 		else
 			result = cluster_wal_writer_startup_prepare(&selected.claim.identity,
 													 selected.operation_uuid, &first);
+		if (step == 2 && result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& cluster_wal_writer_startup_binding_present())
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+							errmsg("failed native WAL preparation retained a local binding")));
 		if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
-			&& ClusterCfConsumerWaitSlice(before, "startup_writer", operation, &wait_logged, &waiting))
+			&& ClusterCfConsumerWaitSlice(before, "startup_writer", operation, 0, &wait_logged,
+										  &waiting))
 			goto wait_for_owner;
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			break;
@@ -8635,16 +8658,16 @@ ClusterStartupCheckpointPublish(const ControlFileData *candidate, XLogRecPtr end
 			if (cluster_cf_lock(ShareLock))
 				break;
 			pfree(root);
-			if (ClusterCfConsumerWaitSlice(before, "startup_checkpoint", operation,
-										  &wait_logged, &waiting))
+			if (ClusterCfConsumerWaitSlice(before, "startup_checkpoint", operation, 0, &wait_logged,
+										   &waiting))
 				goto wait_for_owner;
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 							errmsg("could not read the installed native successor")));
 		}
 		if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT
 			&& !(result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
-				 && ClusterCfConsumerWaitSlice(before, "startup_checkpoint", operation,
-											  &wait_logged, &waiting)))
+				 && ClusterCfConsumerWaitSlice(before, "startup_checkpoint", operation, 0,
+											   &wait_logged, &waiting)))
 			ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 				 errmsg("could not install the native successor checkpoint"),
@@ -8776,7 +8799,8 @@ ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 			goto wait_for_owner;
 		before = cluster_cf_attempt_sequence();
 		if (!cluster_cf_lock(ShareLock)) {
-			if (ClusterCfConsumerWaitSlice(before, "checkpoint", "prepare", &wait_logged, &waiting))
+			if (ClusterCfConsumerWaitSlice(before, "checkpoint", "prepare", started_us,
+										   &wait_logged, &waiting))
 				goto wait_for_owner;
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
@@ -8908,7 +8932,8 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 		if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT
 			&& result != CLUSTER_CONTROL_ROOT_ADMISSION_PENDING
 			&& !(result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
-				 && ClusterCfConsumerWaitSlice(before, "checkpoint", "publish", &wait_logged, &waiting)))
+				 && ClusterCfConsumerWaitSlice(before, "checkpoint", "publish", started_us,
+											   &wait_logged, &waiting)))
 			break;
 wait_for_owner:
 		ClusterCheckpointYieldForShutdown(!shutdown);

@@ -1639,24 +1639,29 @@ static bool
 cluster_phase_snapshot(ClusterPhaseSnapshot *out)
 {
 	int attempts = IsUnderPostmaster ? 16 : 2;
+	bool reset_latch = false;
 
 	for (;;) {
 		int i;
 		int events;
 
-		if (IsUnderPostmaster)
-			ResetLatch(MyLatch);
 		for (i = 0; i < attempts; i++) {
 			ClusterPhaseSnapshotResult result = cluster_phase_snapshot_try(out);
 
-			if (result != CLUSTER_PHASE_SNAPSHOT_BUSY)
+			if (result != CLUSTER_PHASE_SNAPSHOT_BUSY) {
+				/* PGRAC: this reader cannot consume its caller's notification. */
+				if (reset_latch)
+					SetLatch(MyLatch);
 				return result == CLUSTER_PHASE_SNAPSHOT_OK;
+			}
 		}
 		if (!IsUnderPostmaster)
 			return false;
 		CHECK_FOR_INTERRUPTS();
 		if (!PostmasterIsAlive())
 			cluster_phase_snapshot_parent_died();
+		ResetLatch(MyLatch);
+		reset_latch = true;
 		/* A live sole writer does not need any reader-held lock to finish. */
 		events = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, 1L,
 						   WAIT_EVENT_CLUSTER_STARTUP_PHASE_PUBLISH);

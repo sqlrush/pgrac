@@ -311,10 +311,45 @@ UT_TEST(wait_timeout_is_clipped_to_the_remaining_balance)
 	UT_ASSERT_EQ(checkpoint_wait_budget.accumulated_us, UINT64_C(29999500));
 }
 
+UT_TEST(wait_balance_diagnostic_is_read_only_and_excludes_flush_work)
+{
+	ClusterCheckpointWaitBudget saved;
+	uint64 started;
+	reset_fixture();
+	UT_ASSERT_EQ(cluster_checkpoint_wait_budget_remaining_us(now_us), UINT64_MAX);
+	if (sigsetjmp(error_boundary, 1)) {
+		UT_ASSERT(false);
+		return;
+	}
+	cluster_checkpoint_wait_budget_begin(&plan, &current_ref);
+	started = now_us;
+	now_us += UINT64_C(5000000);
+	saved = checkpoint_wait_budget;
+	UT_ASSERT_EQ(cluster_checkpoint_wait_budget_remaining_us(started), UINT64_C(25000000));
+	UT_ASSERT_EQ(memcmp(&saved, &checkpoint_wait_budget, sizeof(saved)), 0);
+	(void)cluster_checkpoint_wait_budget_charge(true, started, &current_ref, 9);
+	now_us += UINT64_C(8000000);
+	saved = checkpoint_wait_budget;
+	UT_ASSERT_EQ(cluster_checkpoint_wait_budget_remaining_us(now_us), UINT64_C(17000000));
+	UT_ASSERT_EQ(memcmp(&saved, &checkpoint_wait_budget, sizeof(saved)), 0);
+	(void)cluster_checkpoint_wait_budget_charge(false, now_us, &current_ref, 9);
+	now_us += UINT64_C(90000000); /* Actual flush interval is not a wait. */
+	started = now_us;
+	UT_ASSERT_EQ(cluster_checkpoint_wait_budget_remaining_us(started), UINT64_C(17000000));
+	now_us += UINT64_C(17000000);
+	saved = checkpoint_wait_budget;
+	UT_ASSERT_EQ(cluster_checkpoint_wait_budget_remaining_us(started), 0);
+	UT_ASSERT_EQ(cluster_checkpoint_wait_budget_remaining_us(0), UINT64_MAX);
+	UT_ASSERT_EQ(cluster_checkpoint_wait_budget_remaining_us(now_us + 1), UINT64_MAX);
+	UT_ASSERT_EQ(memcmp(&saved, &checkpoint_wait_budget, sizeof(saved)), 0);
+	UT_ASSERT_EQ(failure, CLUSTER_NORMAL_STOP_FAILURE_NONE);
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
+	UT_RUN(wait_balance_diagnostic_is_read_only_and_excludes_flush_work);
 	UT_RUN(shared_stop_budget_accepts_the_original_nonzero_epoch_plan);
 	UT_RUN(flush_work_does_not_consume_the_wait_budget);
 	UT_RUN(prepare_and_publish_waits_share_one_accumulator);

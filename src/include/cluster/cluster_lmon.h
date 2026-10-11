@@ -149,7 +149,7 @@ typedef struct ClusterLmonSharedState {
 	/* RF-ROOT P6: postmaster sets during a formed-registry fast shutdown so
 	 * the RETAINED LMON keeps servicing the coordination stack (CF X for the
 	 * shutdown checkpoint) but stops publishing reconfig events.  The LMON
-	 * main loop does NOT exit on this byte. */
+	 * main loop does NOT exit on this atomic flag. */
 	pg_atomic_uint32 reconfig_suppressed;
 
 	/*

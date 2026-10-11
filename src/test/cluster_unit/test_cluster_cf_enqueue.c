@@ -1790,10 +1790,16 @@ UT_TEST(cf_attempt_wait_slice_requires_exact_source_and_owner)
 		UT_ASSERT(!cluster_cf_lock(ShareLock));
 		fail_after_publication = false;
 		UT_ASSERT(cluster_cf_last_attempt_since(before, &observation));
-		UT_ASSERT(cluster_cf_attempt_wait_slice(&observation));
+		/* PGRAC: the legacy retained fixture has no exact shared-owner cookie. */
+		UT_ASSERT_EQ(cluster_cf_attempt_wait_slice(&observation), retained == 0);
 		UT_ASSERT_EQ(observation.owner_state_at_return,
 					 retained ? CLUSTER_LOCK_OWNER_RETIRING : CLUSTER_LOCK_OWNER_EMPTY);
 		if (retained) {
+			ClusterCfAttemptObservation missing_cookie = observation;
+
+			UT_ASSERT_EQ(observation.control_owner_id, 0);
+			missing_cookie.control_owner_id = 0;
+			UT_ASSERT(!cluster_cf_attempt_wait_slice(&missing_cookie));
 			UT_ASSERT_EQ(observation.request_id, observed_acquire_request.request_id);
 			UT_ASSERT_EQ(observation.request_epoch, observed_acquire_request.holder.cluster_epoch);
 			UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock), CLUSTER_CF_RELEASE_CONFIRMED);
@@ -1897,6 +1903,61 @@ UT_TEST(cf_attempt_error_and_foreign_duty_cannot_reuse_prior_wait)
 	cluster_shared_config = false;
 }
 
+/* PGRAC: deliver actual terminal receipts to the production request table;
+ * an earlier operation cannot retire the next stable owner. */
+UT_TEST(shared_cf_late_and_duplicate_ack_keep_the_new_owner)
+{
+	ClusterControlRetireMessage old_ack = { 0 };
+	ClusterControlRequestCut current;
+	uint64 old_cookie = 0;
+
+	cluster_shared_config = true;
+	MyBackendType = B_LMON;
+	cf_poll_result = CLUSTER_GES_ACQUIRE_GRANTED;
+	control_cut(&current);
+	for (unsigned operation = 0; operation < 2; ++operation) {
+		ClusterControlRequestView view;
+		ClusterControlRetireMessage ack;
+		uint32 cursor = 0;
+		uint64 cookie;
+		unsigned prepares;
+
+		g_next_request_id++;
+		UT_ASSERT(cluster_cf_lock_poll(ShareLock));
+		cookie = cluster_cf_owner_cookie(ShareLock);
+		UT_ASSERT(cookie != 0 && cookie != old_cookie);
+		if (operation != 0) {
+			UT_ASSERT(!cluster_control_request_ack(&old_ack, 0, retire_driver, &current));
+			UT_ASSERT(cluster_cf_held_is_usable(ShareLock));
+			UT_ASSERT_EQ(cluster_cf_owner_cookie(ShareLock), cookie);
+		}
+		UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock), CLUSTER_CF_RELEASE_UNCONFIRMED);
+		UT_ASSERT(cluster_control_request_next(&cursor, &view));
+		UT_ASSERT_EQ(view.state, CLUSTER_CONTROL_REQUEST_ABANDONED);
+		UT_ASSERT(cluster_control_request_claim(&view.handle, retire_driver, &current, &ack));
+		ack.verb = CLUSTER_CONTROL_RETIRED;
+		prepares = g_seven_count;
+		UT_ASSERT(!cluster_cf_lock_poll(ShareLock));
+		UT_ASSERT_EQ(g_seven_count, prepares);
+		if (operation != 0)
+			UT_ASSERT(!cluster_control_request_ack(&old_ack, 0, retire_driver, &current));
+		cluster_cf_retirement_poll();
+		UT_ASSERT_EQ(cluster_cf_owner_cookie(ShareLock), cookie);
+		UT_ASSERT(!cluster_cf_release_completed(ShareLock, cookie));
+		UT_ASSERT(cluster_control_request_ack(&ack, 0, retire_driver, &current));
+		UT_ASSERT(!cluster_control_request_ack(&ack, 0, retire_driver, &current));
+		cluster_cf_retirement_poll();
+		UT_ASSERT(!cluster_cf_held(ShareLock));
+		UT_ASSERT(cluster_cf_release_completed(ShareLock, cookie));
+		if (operation != 0)
+			UT_ASSERT(!cluster_cf_release_completed(ShareLock, old_cookie));
+		old_cookie = cookie;
+		old_ack = ack;
+	}
+	MyBackendType = B_INVALID;
+	cluster_shared_config = false;
+}
+
 int
 main(void)
 {
@@ -1904,7 +1965,7 @@ main(void)
 	pg_atomic_init_u32(&owner_proc.cluster_grd_registered_count, 0);
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked, 0);
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
-	UT_PLAN(44);
+	UT_PLAN(45);
 	UT_RUN(test_cf_resid_encode);
 	UT_RUN(test_lock_grant_then_release);
 	UT_RUN(test_held_and_write_permitted);
@@ -1949,6 +2010,7 @@ main(void)
 	UT_RUN(cf_attempt_s_then_x_and_next_acquire_invalidate_old_observation);
 	UT_RUN(cf_attempt_other_refusals_never_become_waiting);
 	UT_RUN(cf_attempt_error_and_foreign_duty_cannot_reuse_prior_wait);
+	UT_RUN(shared_cf_late_and_duplicate_ack_keep_the_new_owner);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

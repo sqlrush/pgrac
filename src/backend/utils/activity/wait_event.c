@@ -24,6 +24,8 @@
  *	  Modified by: SqlRush <sqlrush@gmail.com>
  *	  Stage:        0.11
  *
+ *	  Register the local startup-phase publication snapshot wait.
+ *
  *	  Wired the 10 cluster wait classes (PG_WAIT_CLUSTER_* defined in
  *	  cluster_wait_events.h) into pgstat_get_wait_event_type() and
  *	  pgstat_get_wait_event(), and added 10 sub-helpers

@@ -45,6 +45,9 @@
  *	  Modified by: SqlRush <sqlrush@gmail.com>
  *	  Stages:       0.13, 0.14, 1.10, 5.6
  *
+ *	  Arm the runtime wait guard after initialization and use the local
+ *	  LMS child roster to prevent duplicate startup dispatch.
+ *
  *	  Added a comment in PostmasterMain explaining where pgrac cluster
  *	  initialization happens.  Call sites live in miscinit.c because PG
  *	  has phase-specific gates that must be respected:

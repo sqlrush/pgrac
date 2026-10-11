@@ -263,6 +263,7 @@ format_elog_string(const char *f pg_attribute_unused(), ...)
 
 /* Test clock: pg_usleep advances it without wall-clock delay. */
 static TimestampTz phase4_test_now = 0;
+static void (*phase_sleep_hook)(void);
 
 TimestampTz
 GetCurrentTimestamp(void)
@@ -294,6 +295,8 @@ void
 pg_usleep(long microsec)
 {
 	phase4_test_now += microsec;
+	if (phase_sleep_hook != NULL)
+		phase_sleep_hook();
 }
 
 /* pg_snprintf: cluster_startup_phase.c uses snprintf (macro'd to
@@ -355,6 +358,11 @@ void
 ResetLatch(Latch *latch)
 {
 	phase_reset_calls++;
+}
+void
+SetLatch(Latch *latch)
+{
+	latch->is_set = true;
 }
 int
 WaitLatch(Latch *latch, int wake_events, long timeout, uint32 wait_event)
@@ -1165,6 +1173,7 @@ cluster_lms_is_ready(void)
 static void
 reset_phase_service_fixture(bool formed_registry)
 {
+	phase_sleep_hook = NULL;
 	phase_test_semantic_poll_calls = 0;
 	phase_test_semantic_ready_after = 1;
 	MyBackendType = B_INVALID;
@@ -1591,7 +1600,8 @@ UT_TEST(test_phase_busy_child_waits_until_complete_even_without_pgproc)
 		phase_complete_on_wait = true;
 		UT_ASSERT_EQ(cluster_phase_started_at(CLUSTER_PHASE_0_BASE), 1234567);
 		UT_ASSERT_EQ(phase_wait_calls, 2);
-		UT_ASSERT_EQ(phase_reset_calls, 3);
+		UT_ASSERT_EQ(phase_reset_calls, 2);
+		UT_ASSERT(MyLatch->is_set);
 		UT_ASSERT_EQ(pg_atomic_read_u32(&phase_fixture_state->phase_change_count), 2);
 		IsUnderPostmaster = false;
 		CritSectionCount = 0;
@@ -1746,6 +1756,48 @@ UT_TEST(test_phase3_join_readonly_defers_authority_until_post_startup_admission)
 	UT_ASSERT_EQ(phase_test_recovery_control_formation_calls, 1);
 	UT_ASSERT_EQ(phase_test_lms_start_calls, 1);
 	UT_ASSERT_EQ((int)cluster_authority_readiness_get(), (int)CLUSTER_AUTHORITY_SERVING_READY);
+}
+
+static unsigned join_admission_polls;
+static TimestampTz join_original_phase_started;
+
+static void
+admit_join_after_observing_the_original_phase(void)
+{
+	UT_ASSERT_EQ(cluster_current_phase(), CLUSTER_PHASE_3_RECOVERY);
+	UT_ASSERT_EQ(cluster_phase_started_at(CLUSTER_PHASE_3_RECOVERY), join_original_phase_started);
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_OFF);
+	UT_ASSERT_EQ(phase_test_lms_start_calls, 0);
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqV");
+	if (++join_admission_polls == 5) {
+		/* The external JOIN owner changes admission; a phase read cannot. */
+		phase_test_membership_member = true;
+		phase_test_self_join_admitted = true;
+		phase_sleep_hook = NULL;
+	}
+}
+
+UT_TEST(test_join_readonly_wait_does_not_publish_or_repeat_startup)
+{
+	reset_phase_service_fixture(true);
+	cluster_allow_single_node = false;
+	cluster_voting_disks = "disk1,disk2,disk3";
+	phase_test_cf_peer_verified = true;
+	phase_test_membership_member = false;
+	phase_test_self_join_admitted = false;
+	phase_test_epoch0_late_founder_evidence = true;
+	cluster_run_startup_sequence();
+	join_original_phase_started = cluster_phase_started_at(CLUSTER_PHASE_3_RECOVERY);
+	join_admission_polls = 0;
+	phase_sleep_hook = admit_join_after_observing_the_original_phase;
+	cluster_run_phase4_sequence();
+	UT_ASSERT_EQ(join_admission_polls, 5);
+	UT_ASSERT_EQ(cluster_phase_started_at(CLUSTER_PHASE_3_RECOVERY), join_original_phase_started);
+	UT_ASSERT_EQ(cluster_phase_started_at(CLUSTER_PHASE_4_NORMAL), INT64CONST(100000));
+	UT_ASSERT_EQ(phase_test_lms_start_calls, 1);
+	UT_ASSERT_EQ(phase_test_recovery_control_formation_calls, 1);
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqVFXLrGDdFXWlEESs");
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_SERVING_READY);
 }
 
 /* A transient bootstrap HOLD may expose JOINING before any peer from the
@@ -3112,7 +3164,8 @@ UT_TEST(test_nonshared_phase4_keeps_original_activation_entry)
 int
 main(void)
 {
-	UT_PLAN(64);
+	UT_PLAN(65);
+	UT_RUN(test_join_readonly_wait_does_not_publish_or_repeat_startup);
 	UT_RUN(test_phase_callbacks_and_public_terminal_entries_publish_once);
 	UT_RUN(test_phase_exit_error_does_not_leave_partial_publication);
 	UT_RUN(test_phase_busy_keeps_original_child_cancel);

@@ -79,6 +79,9 @@
  * PGRAC MODIFICATIONS
  *	  Modified by: SqlRush <sqlrush@gmail.com>
  *
+ *	  Guard runtime postmaster wait-queue entry while allowing original
+ *	  initialization and shared-memory exit locking.
+ *
  *	  Use the held-LWLock ceiling exported by storage/lwlock.h so cluster
  *	  shared-memory sizing and the lock manager share one definition.
  *

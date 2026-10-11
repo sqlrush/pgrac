@@ -16,11 +16,12 @@
  *	  src/backend/storage/ipc/ipc.c
  *
  *-------------------------------------------------------------------------
- */
-/*
+ *
  * PGRAC MODIFICATIONS
  * Modified by: SqlRush <sqlrush@gmail.com>
  * Restore initialization locking before postmaster exit callbacks.
+ *
+ *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"

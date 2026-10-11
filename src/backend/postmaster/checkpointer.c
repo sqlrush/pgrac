@@ -30,12 +30,14 @@
  *	  src/backend/postmaster/checkpointer.c
  *
  *-------------------------------------------------------------------------
- */
-/* PGRAC MODIFICATIONS
+ *
+ * PGRAC MODIFICATIONS
  * Modified by: SqlRush <sqlrush@gmail.com>
  * Account original shutdown-owner waits separately from checkpoint I/O,
  * then begin the existing control tail after checkpoint completion.
  * spec-5.13-clean-leave-reconfig.md
+ *
+ *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
@@ -286,6 +288,25 @@ cluster_checkpoint_wait_budget_charge(bool waiting, uint64 started_us,
 	checkpoint_wait_budget.active_since_us = waiting ? now : 0;
 	return (long)Min(UINT64_C(20),
 		(checkpoint_wait_budget.limit_us - checkpoint_wait_budget.accumulated_us + 999) / 1000);
+}
+
+/* PGRAC: diagnostic projection only; charge remains the sole wait-accounting
+ * consumer. UINT64_MAX means no valid local balance is available. */
+uint64
+cluster_checkpoint_wait_budget_remaining_us(uint64 started_us)
+{
+	uint64 now = cluster_checkpoint_wait_budget_now();
+	uint64 since
+		= checkpoint_wait_budget.active ? checkpoint_wait_budget.active_since_us : started_us;
+	uint64 remaining;
+
+	if (!checkpoint_wait_budget.valid || now == 0 || started_us == 0 || started_us > now
+		|| since == 0 || since > now)
+		return UINT64_MAX;
+	if (checkpoint_wait_budget.accumulated_us >= checkpoint_wait_budget.limit_us)
+		return 0;
+	remaining = checkpoint_wait_budget.limit_us - checkpoint_wait_budget.accumulated_us;
+	return now - since >= remaining ? 0 : remaining - (now - since);
 }
 
 void
@@ -912,7 +933,15 @@ HandleCheckpointerInterrupts(void)
 					normal_stop_observation.reason = "NORMAL_STOP_ROOT_STOPPED_PENDING";
 					cluster_cf_retirement_poll();
 					cluster_lock_owners_service_poll();
-					retiring = cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock);
+					if (cluster_cf_held_is_usable(ShareLock)
+						|| cluster_cf_held_is_usable(ExclusiveLock)) {
+						result = CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN;
+						normal_stop_observation.reason = "NORMAL_STOP_CF_USABLE_HOLD";
+						break;
+					}
+					retiring = (cluster_cf_held(ShareLock) && !cluster_cf_held_is_usable(ShareLock))
+							   || (cluster_cf_held(ExclusiveLock)
+								   && !cluster_cf_held_is_usable(ExclusiveLock));
 					if (cluster_epoch_get_current() != phase1_full_stop_plan.epoch
 						|| !cluster_wal_thread_current_v2_ref(&current)
 						|| memcmp(&current, &ref, sizeof(ref)) != 0) {
@@ -933,8 +962,9 @@ HandleCheckpointerInterrupts(void)
 					remaining = phase1_full_stop_plan.absolute_deadline_us - now;
 					if (!retiring) {
 						if (waiting.owner_state_at_return == CLUSTER_LOCK_OWNER_RETIRING
-							&& waiting.control_owner_id != 0
-							&& !cluster_cf_release_completed(waiting.mode, waiting.control_owner_id)) {
+							&& (waiting.control_owner_id == 0
+								|| !cluster_cf_release_completed(waiting.mode,
+																 waiting.control_owner_id))) {
 							result = CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN;
 							normal_stop_observation.reason = "NORMAL_STOP_CF_RETIREMENT_UNPROVEN";
 							break;

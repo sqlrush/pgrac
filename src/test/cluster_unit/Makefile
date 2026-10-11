@@ -1059,9 +1059,9 @@ test_cluster_checkpoint_cleanup: test_cluster_checkpoint_cleanup.c test_cluster_
 test_cluster_checkpoint_wait_budget.inc: $(top_srcdir)/src/backend/postmaster/checkpointer.c $(top_srcdir)/src/backend/cluster/cluster_clean_leave_policy.c Makefile
 	awk '/^typedef struct ClusterCheckpointWaitBudget/ { emit=1; types++ } \
 	     /^static ClusterCheckpointWaitBudget checkpoint_wait_budget/ { print } \
-	     /^(cluster_checkpoint_wait_budget_(now|begin|charge|end)|CheckpointWaitBudgetFail)\(/ { print prev; emit=1; count++ } \
+	     /^(cluster_checkpoint_wait_budget_(now|begin|charge|remaining_us|end)|CheckpointWaitBudgetFail)\(/ { print prev; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
-	     END { if (types != 1 || count != 5 || emit) exit 1 }' $< > $@.tmp
+	     END { if (types != 1 || count != 6 || emit) exit 1 }' $< > $@.tmp
 	awk '/^cluster_clean_leave_phase1_full_stop_plan_valid\(/ { print "bool"; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' \
 	     $(top_srcdir)/src/backend/cluster/cluster_clean_leave_policy.c >> $@.tmp
@@ -4492,6 +4492,12 @@ check: all check_cluster_undo_segment_half_page_oversized \
 	else \
 		echo "# All $$total binaries passed"; \
 	fi
+
+check: check_cf_consumer_census
+
+check_cf_consumer_census:
+	PYTHONDONTWRITEBYTECODE=1 python3 \
+		$(top_srcdir)/src/test/cluster_unit/test_cluster_cf_consumer_census.py
 
 check_pcm_x_write_gate_ast:
 	PYTHONDONTWRITEBYTECODE=1 python3 \

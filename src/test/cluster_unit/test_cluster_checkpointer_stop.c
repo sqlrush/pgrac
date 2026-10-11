@@ -49,6 +49,7 @@ static uint64 fixture_now;
 static unsigned budget_begins, budget_ends, tail_begins, retirement_polls;
 static unsigned stop_wait_slices, retire_remaining;
 static bool bad_retirement_ack, tail_ok;
+static bool unexpected_usable_after_checkpoint;
 static LOCKMODE retiring_mode;
 static ClusterCfAttemptObservation cf_attempt;
 #include "test_cluster_cf_observation.inc"
@@ -105,7 +106,12 @@ cluster_lock_owners_service_poll(void)
 bool
 cluster_cf_held(LOCKMODE mode)
 {
-	return mode == retiring_mode;
+	return mode == retiring_mode || cluster_cf_held_is_usable(mode);
+}
+bool
+cluster_cf_held_is_usable(LOCKMODE mode)
+{
+	return unexpected_usable_after_checkpoint && checkpoint_calls > 0 && mode == ExclusiveLock;
 }
 bool
 cluster_cf_release_completed(LOCKMODE mode, uint64 cookie)
@@ -431,6 +437,7 @@ reset_fixture(void)
 	budget_begins = budget_ends = tail_begins = retirement_polls = 0;
 	stop_wait_slices = retire_remaining = 0;
 	bad_retirement_ack = false;
+	unexpected_usable_after_checkpoint = false;
 	tail_ok = true;
 	retiring_mode = NoLock;
 	memset(&cf_attempt, 0, sizeof(cf_attempt));
@@ -730,6 +737,19 @@ UT_TEST(failed_checkpoint_never_arms_the_tail)
 	UT_ASSERT_EQ(v2_observe_calls, 0);
 }
 
+UT_TEST(stopped_rejects_usable_hold_without_spending_tail)
+{
+	reset_fixture();
+	cluster_shared_config = true;
+	unexpected_usable_after_checkpoint = true;
+	stopped_pending_forever = true;
+	run_handler();
+	UT_ASSERT_EQ(exit_code, 1);
+	UT_ASSERT_EQ(v2_waits, 0);
+	UT_ASSERT_EQ(v2_observe_calls | complete_calls, 0);
+	UT_ASSERT(strstr(last_detail, "NORMAL_STOP_CF_USABLE_HOLD") != NULL);
+}
+
 int
 main(void)
 {
@@ -739,7 +759,8 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(19);
+	UT_PLAN(20);
+	UT_RUN(stopped_rejects_usable_hold_without_spending_tail);
 	UT_RUN(stopped_wait_retires_exact_owner_before_reobserving);
 	UT_RUN(failed_checkpoint_never_arms_the_tail);
 	UT_RUN(stopped_pending_is_bounded_by_the_original_tail);

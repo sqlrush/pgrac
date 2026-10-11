@@ -9,11 +9,12 @@
  * src/include/postmaster/postmaster.h
  *
  *-------------------------------------------------------------------------
- */
-/*
+ *
  * PGRAC MODIFICATIONS
  * Modified by: SqlRush <sqlrush@gmail.com>
  * Expose the process-local LMS roster without a backend lock.
+ *
+ *-------------------------------------------------------------------------
  */
 
 #ifndef _POSTMASTER_H

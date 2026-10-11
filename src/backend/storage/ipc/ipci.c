@@ -16,6 +16,9 @@
  *	  Modified by: SqlRush <sqlrush@gmail.com>
  *	  Stage:        0.14 / 1.1
  *
+ *	  Reset the process-local postmaster wait guard before each shared
+ *	  memory initialization or child attachment.
+ *
  *	  Wired cluster_init_shmem() into CreateSharedMemoryAndSemaphores()
  *	  so that the pgrac cluster control block (and future GRD / PCM /
  *	  GES / Undo / etc. shmem regions registered through cluster_shmem.c)

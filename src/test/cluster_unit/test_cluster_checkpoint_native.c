@@ -91,6 +91,8 @@ static unsigned direct_wait_slices, writer_wait_step;
 static bool typed_wait, shutdown_on_wait, normal_stop_requested, shutdown_after_publish;
 static unsigned wait_log_count, budget_charges, exhaust_after_charge;
 static int native_sqlstate;
+static int native_report_level;
+static char wait_detail[768];
 static LOCKMODE retiring_mode;
 
 static void
@@ -154,6 +156,14 @@ cluster_checkpoint_wait_budget_now(void)
 	return UINT64_C(1000000) + waits * UINT64_C(20000);
 }
 
+uint64 cluster_checkpoint_wait_budget_remaining_us(uint64 started_us);
+uint64
+cluster_checkpoint_wait_budget_remaining_us(uint64 started_us)
+{
+	UT_ASSERT(ShutdownRequestPending && started_us != 0);
+	return UINT64_C(23999000);
+}
+
 long
 cluster_checkpoint_wait_budget_charge(bool waiting, uint64 started_us,
 									  const ClusterWalSourceRef *original, uint64 original_epoch)
@@ -175,6 +185,13 @@ cluster_cf_held_is_usable(LOCKMODE mode)
 	return cf_mode == mode;
 }
 
+/* PGRAC: readiness is diagnostic-only at this adapter boundary. */
+ClusterAuthorityReadiness
+cluster_authority_readiness_get(void)
+{
+	return CLUSTER_AUTHORITY_RECOVERY_READY;
+}
+
 ClusterFormationWitnessResult
 cluster_authority_startup_refresh_recovery(int timeout_ms)
 {
@@ -186,6 +203,7 @@ static unsigned startup_directory_calls;
 static bool directory_before_selection;
 BackendType MyBackendType = B_INVALID;
 static bool startup_binding_ok, startup_view_ok;
+static bool startup_binding_present, fail_prepare_with_binding;
 static unsigned startup_calls, install_calls;
 static ClusterControlRootResult install_returns[4];
 bool InRecovery, ArchiveRecoveryRequested;
@@ -262,12 +280,13 @@ ExceptionalCondition(const char *c, const char *f, int l)
 bool
 errstart(int l, const char *d pg_attribute_unused())
 {
+	native_report_level = l;
 	if (l >= ERROR)
 		native_error_level = l;
 	if (l == LOG)
 		++wait_log_count;
 	/* Native ARM CRC dispatch may emit DEBUG1 during its first invocation. */
-	return l >= ERROR;
+	return l >= ERROR || l == LOG;
 }
 bool
 errstart_cold(int l, const char *d)
@@ -280,8 +299,14 @@ errmsg(const char *f pg_attribute_unused(), ...)
 	return 0;
 }
 int
-errdetail(const char *f pg_attribute_unused(), ...)
+errdetail(const char *f, ...)
 {
+	if (native_report_level == LOG) {
+		va_list args;
+		va_start(args, f);
+		vsnprintf(wait_detail, sizeof(wait_detail), f, args);
+		va_end(args);
+	}
 	return 0;
 }
 int
@@ -299,6 +324,8 @@ void
 errfinish(const char *f pg_attribute_unused(), int l pg_attribute_unused(),
 		  const char *fn pg_attribute_unused())
 {
+	if (native_report_level < ERROR)
+		return;
 	if (PG_exception_stack)
 		siglongjmp(*PG_exception_stack, 1);
 	siglongjmp(error_boundary, 1);
@@ -531,6 +558,13 @@ cluster_wal_writer_startup_matches(const ClusterControlRootIdentity *self, const
 		   && first == clusterStartupWriter.first_segment_lsn;
 }
 
+bool cluster_wal_writer_startup_binding_present(void);
+bool
+cluster_wal_writer_startup_binding_present(void)
+{
+	return startup_binding_present;
+}
+
 ClusterControlRootResult
 cluster_wal_writer_begin(TimeLineID timeline, ClusterWalWriterToken *writer)
 {
@@ -679,6 +713,7 @@ cluster_wal_writer_startup_prepare(const ClusterControlRootIdentity *self, const
 	UT_ASSERT(memcmp(uuid, offered.operation_uuid, 16) == 0);
 	bind_calls++;
 	if (writer_wait_step >= 3) {
+		startup_binding_present = fail_prepare_with_binding;
 		if (writer_wait_step == 4)
 			cf_attempt_begin(ExclusiveLock, false, NULL);
 		writer_wait_step = 0;
@@ -742,8 +777,11 @@ reset_fixture(void)
 	required_retire_polls = 3;
 	typed_wait = shutdown_on_wait = normal_stop_requested = shutdown_after_publish = false;
 	retiring_mode = NoLock;
+	startup_binding_present = fail_prepare_with_binding = false;
 	wait_log_count = budget_charges = exhaust_after_charge = 0;
 	native_sqlstate = 0;
+	native_report_level = 0;
+	wait_detail[0] = '\0';
 	memset(&current, 0, sizeof(current));
 	current.checkPoint = expected_control_checkpoint = 100;
 	current.system_identifier = 1234;
@@ -2175,6 +2213,21 @@ UT_TEST(writer_begin_retries_only_its_unfinished_step)
 	}
 }
 
+UT_TEST(writer_prepare_nonok_with_binding_is_not_retried_or_cleared)
+{
+	writer_begin_fixture();
+	typed_wait = true;
+	writer_wait_step = 3;
+	fail_prepare_with_binding = true;
+	UT_ASSERT_EQ(writer_begin(), InvalidXLogRecPtr);
+	UT_ASSERT_EQ(native_error_level, FATAL);
+	UT_ASSERT_EQ(native_sqlstate, ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE);
+	UT_ASSERT_EQ(bind_calls, 1);
+	UT_ASSERT_EQ(waits, 0);
+	UT_ASSERT(startup_binding_present);
+	UT_ASSERT(!clusterStartupWriterBound);
+}
+
 UT_TEST(startup_checkpoint_retries_durable_install_and_readback_separately)
 {
 	for (unsigned step = 0; step < 3; ++step) {
@@ -2295,6 +2348,25 @@ UT_TEST(wait_diagnostic_once_per_original_operation_not_request)
 	UT_ASSERT_EQ(wait_log_count, 2);
 }
 
+UT_TEST(shutdown_wait_log_carries_the_remaining_wait_budget)
+{
+	for (unsigned stage = 0; stage < 2; ++stage) {
+		reset_fixture();
+		ShutdownRequestPending = true;
+		if (stage == 0) {
+			direct_wait_slices = 1;
+			UT_ASSERT(prepare(CHECKPOINT_IS_SHUTDOWN));
+		} else {
+			candidate.state = DB_SHUTDOWNED;
+			typed_wait = true;
+			returns[0] = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+			UT_ASSERT(publish());
+		}
+		UT_ASSERT_EQ(wait_log_count, 1);
+		UT_ASSERT(strstr(wait_detail, "remaining_us=23999000") != NULL);
+	}
+}
+
 UT_TEST(checkpoint_hard_results_and_untyped_lock_never_consume_wait_observation)
 {
 	const ClusterControlRootResult failures[]
@@ -2330,6 +2402,32 @@ UT_TEST(cf_observation_saturation_never_wraps_or_reuses_an_old_receipt)
 	UT_ASSERT(!cluster_cf_last_attempt_since(0, &observation));
 }
 
+UT_TEST(retirement_rejects_usable_holds_and_missing_original_cookie)
+{
+	for (unsigned fault = 0; fault < 3; ++fault) {
+		ClusterCfAttemptObservation waiting = { 0 };
+		bool caught = false;
+		reset_fixture();
+		if (fault < 2)
+			cf_mode = fault == 0 ? ShareLock : ExclusiveLock;
+		else {
+			waiting.mode = ShareLock;
+			waiting.owner_state_at_return = CLUSTER_LOCK_OWNER_RETIRING;
+		}
+		if (sigsetjmp(error_boundary, 1) == 0)
+			(void)ClusterCfRetirementPending(&waiting);
+		else
+			caught = true;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(native_error_level, ERROR);
+		UT_ASSERT_EQ(native_sqlstate, ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE);
+		UT_ASSERT_EQ(waits | root_calls | native_writes, 0);
+		if (fault < 2)
+			UT_ASSERT_EQ(cf_mode, fault == 0 ? ShareLock : ExclusiveLock);
+	}
+}
+
+
 int
 main(void)
 {
@@ -2344,7 +2442,10 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(63);
+	UT_PLAN(66);
+	UT_RUN(shutdown_wait_log_carries_the_remaining_wait_budget);
+	UT_RUN(writer_prepare_nonok_with_binding_is_not_retried_or_cleared);
+	UT_RUN(retirement_rejects_usable_holds_and_missing_original_cookie);
 	UT_RUN(startup_wait_preserves_retirement_when_original_phase_terminates);
 	UT_RUN(shutdown_both_consumers_charge_while_original_retirement_remains);
 	UT_RUN(wait_diagnostic_once_per_original_operation_not_request);

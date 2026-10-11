@@ -1,6 +1,6 @@
 # Cluster wait events
 
-linkdb registers 118 cluster-specific wait events distributed across
+linkdb registers 124 cluster-specific wait events distributed across
 13 classes.  Each row in `pg_stat_cluster_wait_events` corresponds
 to one entry in this table.
 
@@ -122,7 +122,7 @@ Cross-node shared invalidation broadcast.
 | `SinvalAckSend` | Waiting while sending a sinval ACK |
 | `SinvalAckReceive` | Waiting while receiving a sinval ACK |
 
-## Cluster: Interconnect (9 events)
+## Cluster: Interconnect (11 events)
 
 Network transport layer.
 
@@ -137,8 +137,10 @@ Network transport layer.
 | `ClusterICRdmaFallback` | Waiting on the TCP fallback transport selected by the RDMA mux |
 | `InterconnectTierSwitch` | Waiting for transport tier switch (e.g. RDMA → TCP fallback) |
 | `InterconnectConnectRetry` | Waiting for an interconnect reconnection attempt |
+| `ClusterLmsDataRecv` | Waiting to receive an LMS data-plane frame |
+| `ClusterLmsDataSend` | Waiting to send an LMS data-plane frame |
 
-## Cluster: Undo (4 events)
+## Cluster: Undo (7 events)
 
 Undo segment access, durable transaction-table I/O, and the local undo buffer pool.
 
@@ -148,6 +150,9 @@ Undo segment access, durable transaction-table I/O, and the local undo buffer po
 | `UndoTtLookupRemote` | Waiting for a remote transaction-table lookup |
 | `UndoSegmentFetch` | Waiting for an undo segment fetch |
 | `UndoRetentionWait` | Waiting on undo retention to expire |
+| `UndoBlockGrantWait` | Waiting for an undo-block grant |
+| `UndoBlockInvalidateWait` | Waiting for undo-block invalidation to complete |
+| `UndoBlockRemasterWait` | Waiting for undo-block remastering |
 
 ## Cluster: ADG (4 events)
 
@@ -179,7 +184,7 @@ Shared-storage provider and raw block-device I/O.
 | `ClusterBlockDevicePrProbe` | Waiting for SCSI-3 PR capability probe |
 | `ClusterBlockDevicePrRegister` | Waiting for SCSI-3 PR own-key registration |
 
-## Cluster: StartupPhase (5 events)
+## Cluster: StartupPhase (6 events)
 
 Cluster startup phase barriers.
 
@@ -190,6 +195,7 @@ Cluster startup phase barriers.
 | `ClusterStartupPhase2Wait` | Waiting in startup phase 2 |
 | `ClusterStartupPhase3Wait` | Waiting in startup phase 3 |
 | `ClusterStartupPhase4Wait` | Waiting in startup phase 4 |
+| `ClusterStartupPhasePublishWait` | Waiting for a complete local startup-phase snapshot |
 
 ## Cluster: BgProc (25 events)
 
@@ -227,7 +233,7 @@ waits.
 ## Querying
 
 ```sql
--- Total registered (118):
+-- Total registered (124):
 SELECT count(*) FROM pg_stat_cluster_wait_events;
 
 -- Per-class counts:

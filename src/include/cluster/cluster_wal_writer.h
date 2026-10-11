@@ -63,6 +63,8 @@ extern ClusterControlRootResult cluster_wal_writer_ready(TimeLineID timeline);
 extern ClusterControlRootResult
 cluster_wal_writer_startup_prepare(const ClusterControlRootIdentity *self,
 								   const uint8 operation_uuid[16], XLogRecPtr *first_segment);
+/* PGRAC: raw process-local binding presence, never positive I/O authority. */
+extern bool cluster_wal_writer_startup_binding_present(void);
 extern bool cluster_wal_writer_startup_matches(const ClusterControlRootIdentity *self,
 											   const uint8 operation_uuid[16],
 											   XLogRecPtr first_segment);

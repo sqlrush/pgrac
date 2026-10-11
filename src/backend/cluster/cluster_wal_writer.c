@@ -353,6 +353,13 @@ cluster_wal_writer_startup_prepare(const ClusterControlRootIdentity *self,
 }
 
 bool
+cluster_wal_writer_startup_binding_present(void)
+{
+	/* PGRAC: diagnostic state only; this does not prove usable authority. */
+	return writer_startup.valid;
+}
+
+bool
 cluster_wal_writer_startup_matches(const ClusterControlRootIdentity *self,
 								   const uint8 operation_uuid[16], XLogRecPtr first_segment)
 {
