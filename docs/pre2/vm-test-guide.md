@@ -100,7 +100,7 @@ flowchart LR
     subgraph LOCAL["每个实例独立：/srv/pgrac/demo/nodeN/"]
         direction TB
         CONF["data/postgresql.conf、pgrac.conf<br/>本实例启动配置"]
-        RUN["data/postmaster.pid、sockets<br/>运行文件"]
+        RUN["data/postmaster.pid<br/>运行文件"]
         LOG["postgres.log<br/>本实例数据库日志"]
         PGWAL["data/pg_wal<br/>指向本实例 WAL 线程的链接"]
     end
@@ -194,7 +194,7 @@ GCS 用块锁（类似 Oracle RAC 中的 PCM 锁）描述每个节点对一个�
 | `S` | 共享模式，多个节点可以同时读 |
 | `X` | 独占模式，只有一个节点可以修改 |
 
-一个节点让出 `X` 权限时，可以保留该块修改前后的一份旧副本，称为**过去镜像（PI，Past Image）**，供恢复时使用；master 记录哪些节点持有 PI。PI 不是一种锁模式，而是持有方缓冲区中的一类副本。
+一个节点让出 `X` 权限后，可以把自己缓冲区中该块的那份副本保留下来，称为**过去镜像（PI，Past Image）**，供恢复时使用；master 记录哪些节点持有 PI。PI 不是一种锁模式，而是缓冲区中的一类副本。
 
 ```mermaid
 stateDiagram-v2
@@ -224,10 +224,10 @@ done
 示例输出（数值随运行时间变化）：
 
 ```text
-0|312|49|20
-1|313|36|0
-2|323|39|5
-3|288|45|9
+0|312|49|19
+1|312|36|0
+2|321|39|5
+3|286|45|7
 ```
 
 各列依次为节点号、本节点作为 master 记录为 `S` 的块数、记录为 `X` 的块数、记录的 PI 持有者数。块锁状态转换的增量（`to_s`、`to_x`、`x_down`）见[实验 3](#实验-3-cache-fusion-块传递)。
@@ -315,7 +315,7 @@ SELECT cluster_ges_mode_compat('RowExclusiveLock', 'RowExclusiveLock')   AS rx_v
 
 ### 2.5 跨节点死锁检测 LMD
 
-每个实例的 `lmd` 进程收集本实例会话之间以及跨实例的等待关系。协调节点（四个节点都在线时为节点 0）定期在全局等待图里查找环路，连续两轮确认后选择一个事务作为牺牲者并取消它的等待，该事务收到 `ERROR: deadlock detected`（SQLSTATE `40P01`），另一个事务继续执行。
+各实例的 `lmd` 进程汇总跨实例的锁等待关系。协调节点（四个节点都在线时为节点 0）定期在全局等待图里查找环路，连续两轮确认后选择一个事务作为牺牲者并取消它的等待，该事务收到 `ERROR: deadlock detected`（SQLSTATE `40P01`），另一个事务继续执行。
 
 ```mermaid
 sequenceDiagram
@@ -350,7 +350,8 @@ SCN（System Change Number）是集群的逻辑时钟，各实例用它为写入
 
 - 本实例写入数据、提交事务时，SCN 前进。
 - 实例之间的每条消息（包括心跳、块传输、锁消息）都带上发送方当前的 SCN；接收方发现对方的 SCN 不小于自己时，把自己的 SCN 推进到对方的值加一。
-- 事务提交时记录**提交 SCN**；会话取快照时记录**快照 SCN**。读取一行时比较两者：提交 SCN 不大于快照 SCN 的修改才可见。因为消息不断同步各实例的 SCN，在一个实例上提交后，其他实例新取的快照都能看到这次提交。
+- 事务提交时记录**提交 SCN**；会话取快照时记录**快照 SCN**。读取一行时比较两者：提交 SCN 不大于快照 SCN 的修改才可见。
+- 提交时，本实例还会把新的 SCN 广播给其他实例。因此在一个实例上提交后，其他实例随后开始的查询可以看到这次提交（[实验 2](#实验-2-跨节点读写一致性)演示了这一点）。
 
 SCN 是 64 位整数：高 8 位是产生它的节点号，低 56 位是计数。比较先后时只比较计数部分。
 
@@ -411,11 +412,11 @@ flowchart TB
 pgnode 1 -c "SELECT key, value FROM pg_cluster_state WHERE category = 'undo' AND key IN ('segment_allocated_count', 'record_alloc_count') ORDER BY key" -c "BEGIN" -c "UPDATE lab.accounts SET balance = balance + 1 WHERE id BETWEEN 100 AND 109" -c "COMMIT" -c "SELECT key, value FROM pg_cluster_state WHERE category = 'undo' AND key IN ('segment_allocated_count', 'record_alloc_count') ORDER BY key"
 ```
 
-修改 10 行之后，`record_alloc_count` 增加 20 左右（行和索引的修改各有 undo 记录），`segment_allocated_count` 是本实例已分配的 undo 段数。`pg_waldump` 显示的提交记录中，`tt_commit` 部分就是事务表槽位和提交 SCN，见[实验 8](#实验-8-全局-scnwal-线程与共享文件)。
+修改 10 行之后，`record_alloc_count` 至少增加 10（每修改一行至少写一条 undo 记录，实测增加 16–20）；`segment_allocated_count` 是本实例已分配的 undo 段数。`pg_waldump` 显示的提交记录中，`tt_commit` 部分就是事务表槽位和提交 SCN，见[实验 8](#实验-8-全局-scnwal-线程与共享文件)。
 
 ### 2.8 多节点并发提交与一致读
 
-四个实例都可以同时执行写事务并各自提交。提交在本实例的 WAL 线程中持久化，提交 SCN 经集群消息传播；任何实例新开始的语句或事务都能读到已提交的结果。
+四个实例都可以同时执行写事务并各自提交。提交在本实例的 WAL 线程中持久化，提交 SCN 经集群消息传播；其他实例随后开始的语句或事务可以读到已提交的结果。
 
 一个查询在整个执行期间看到的是它开始时的快照：
 
@@ -440,7 +441,7 @@ sequenceDiagram
 
 ### 2.9 每实例独立的 WAL 线程与统一的数据文件
 
-每个实例只写自己的一条 WAL 线程，线程号为节点号加一：节点 0 写 `thread_1`，节点 3 写 `thread_4`。各线程放在共享目录 `/srv/pgrac/demo/wal/` 下，本实例 `PGDATA` 中的 `pg_wal` 是指向它的链接。表和索引的数据文件只有一份，位于共享数据目录。WAL 记录头中带有线程号和 SCN。
+每个实例只写自己的一条 WAL 线程，线程号为节点号加一：节点 0 写 `thread_1`，节点 3 写 `thread_4`。各线程放在共享目录 `/srv/pgrac/demo/wal/` 下，本实例 `PGDATA` 中的 `pg_wal` 是指向它的链接。表和索引的数据文件只有一份，位于共享数据目录。每条 WAL 记录带有线程号和 SCN，`pg_waldump` 输出中的 `thread`、`scn` 字段就是这两项。
 
 **在镜像上观察：**
 
@@ -455,7 +456,7 @@ ORDER BY key;
 
 ### 2.10 集群成员管理与 quorum
 
-集群成员由两层机制共同维护：
+集群成员状态由以下机制共同维护：
 
 - `cssd` 进程在数据库实例之间发送心跳，把每个对端标为 `alive`、`suspected` 或 `dead`。
 - `qvotec` 进程周期性读写投票盘；可用投票盘达到多数（本镜像 3 个投票盘中至少 2 个）时，本实例处于 quorum 中。
@@ -578,8 +579,8 @@ pre2-single-arm64.qcow2: OK
 ```json
 {
   "status": "STARTED",
-  "seconds": 22.25,
-  "pid": 1494,
+  "seconds": 21.376367467999998,
+  "pid": 1489,
   "nodes": [
     0,
     1,
@@ -595,6 +596,8 @@ pre2-single-arm64.qcow2: OK
 ./control.sh status
 ./test.sh
 ```
+
+如果 `./start.sh` 没有输出 `STARTED`，按[第 9 章](#9-遇到异常时)处理。
 
 `./control.sh status` 中四个 `instances` 的 `rc` 都为 `0`，`stdout` 显示 `server is running`。`./test.sh` 检查四个实例读到的示例表行数、主键唯一性和更新结果，成功时输出：
 
@@ -807,9 +810,9 @@ done
     node_id | state | heartbeat_send_count | heartbeat_recv_count
    ---------+-------+----------------------+----------------------
           0 | alive |                    0 |                    0
-          1 | alive |                   20 |                   21
-          2 | alive |                   21 |                   22
-          3 | alive |                   20 |                   21
+          1 | alive |                   21 |                   22
+          2 | alive |                   22 |                   23
+          3 | alive |                   22 |                   23
    (4 rows)
    ```
 
@@ -828,8 +831,8 @@ done
     node_id |   state   | heartbeat_recv_count | has_traffic
    ---------+-----------+----------------------+-------------
           1 | connected |                   43 | t
-          2 | connected |                   43 | t
-          3 | connected |                   42 | t
+          2 | connected |                   44 | t
+          3 | connected |                   44 | t
    (3 rows)
    ```
 
@@ -921,7 +924,7 @@ done
    (2 rows)
    ```
 
-3. **终端 C（节点 2）** 修改并删除这两行的变化：
+3. **终端 C（节点 2）** 把 `id = 1` 改回原值，并删除新行：
 
    ```sql
    BEGIN;
@@ -1054,13 +1057,13 @@ done
     0    |   0 |    4 |       6 |  10 |           6 |    0 |    7 |      7
     1    |   6 |   10 |       5 |   0 |           5 |    0 |    0 |      0
     2    |   5 |    9 |       6 |   1 |           5 |    0 |    0 |      0
-    3    |   5 |   10 |       2 |   3 |           2 |    0 |    7 |      7
+    3    |   5 |    9 |       2 |   3 |           2 |    0 |    6 |      6
    ```
 
 **预期结果**：
 
 - 读共享（第 3 步）：读取的节点（1、2、3）`req`、`recv` 增加，说明块从其他节点传来；某个节点的 `fwd` 增加（上例为节点 1），它是这个块的资源 master，把请求转给了持有方；写入该行的节点 0 作为持有方，`shipped`、`holder_ship` 增加，直接把块发给请求方。这就是 3-way 传输。
-- 写权限轮转（第 5 步）：四个节点的 `recv` 都增加；管理相关块的 master 节点上 `to_x` 和 `x_down` 成对增加（上例为节点 0 和 3，分别管理表块和索引块），每次写权限从一个节点转到下一个节点都记一次。最终 `v = 9`（第 2 步 1 次加上第 4 步 8 次）。
+- 写权限轮转（第 5 步）：四个节点的 `recv` 都增加；相关块的 master 节点上 `to_x` 和 `x_down` 成对增加（上例为节点 0 和 3），每次写权限从一个节点转到下一个节点都记一次。最终 `v = 9`（第 2 步 1 次加上第 4 步 8 次）。
 - 后台进程也会产生少量块传输，计数不必与操作次数一一对应；哪个节点充当 master 取决于块标识的哈希，你的环境中可能是其他节点。
 
 **你看到了什么 RAC 特性**：Cache Fusion 的 3-way 块传输（请求方 → master → 持有方 → 请求方）、master 上的 GCS 对块锁状态 `N`/`S`/`X` 的管理，以及写权限在实例间的转移。
@@ -1152,7 +1155,7 @@ done
 
    ```text
    UPDATE 1
-   Time: 3863.824 ms (00:03.864)
+   Time: 3860.615 ms (00:03.861)
    ```
 
 6. 终端 B（节点 1）提交并读取，再查看等待计数：
@@ -1369,7 +1372,7 @@ done
    ```text
               committed           |  total
    -------------------------------+----------
-    2026-10-11 19:26:14.941434+08 | 10001501
+    2026-10-11 19:49:16.384537+08 | 10001501
    (1 row)
    ```
 
@@ -1378,7 +1381,7 @@ done
    ```text
               finished            |  total
    -------------------------------+----------
-    2026-10-11 19:26:22.847794+08 | 10001500
+    2026-10-11 19:49:24.296404+08 | 10001500
    (1 row)
    ```
 
@@ -1396,7 +1399,7 @@ done
    done
    ```
 
-   实测中，修改了数据的节点 1、2、3 两列都有增加（例如节点 2 从 `23|21` 变为 `29|27`）。
+   实测中，修改了数据的节点 1、2、3 两列都有增加（例如节点 2 从 `22|20` 变为 `28|26`）。
 
 **预期结果**：`REPEATABLE READ` 事务内两次读取结果相同，看不到其他节点在事务期间提交的修改；事务结束后的新语句看到全部修改（总额增加 1500）。长语句返回它开始时的总额 `10001500`，虽然节点 1 在它结束前已提交了修改。
 
@@ -1440,7 +1443,7 @@ done
    输出格式如下（`<N0>` 等为各节点成功提交的事务数，`<T>` 为总额，`<SUM>` 为四个节点之和）：
 
    ```text
-   before=10001512
+   before=10001501
    /home/pgrac/pgbench-node0.log:number of transactions actually processed: <N0>
    /home/pgrac/pgbench-node0.log:number of failed transactions: 0 (0.000%)
    /home/pgrac/pgbench-node1.log:number of transactions actually processed: <N1>
@@ -1567,19 +1570,19 @@ done
    ```
 
    ```text
-   0|0|420018
-   1|1|420049
-   2|2|420081
-   3|3|420106
+   0|0|1181487
+   1|1|1181520
+   2|2|1181552
+   3|3|1181577
    ```
 
    第二次：
 
    ```text
-   0|0|420143
-   1|1|420168
-   2|2|420191
-   3|3|420212
+   0|0|1181720
+   1|1|1181745
+   2|2|1181768
+   3|3|1181790
    ```
 
    节点 2 从其他节点的消息中推进本地 SCN 的累计次数：
@@ -1591,9 +1594,9 @@ done
    ```text
     node_id | lamport_observe_advance_count
    ---------+-------------------------------
-          0 |                           928
-          1 |                           613
-          3 |                           320
+          0 |                          6117
+          1 |                          6533
+          3 |                          7204
    (3 rows)
    ```
 
@@ -1610,14 +1613,14 @@ done
    UPDATE 1
       xid
    ---------
-    5244000
+    5300976
    (1 row)
 
    COMMIT
-   rmgr: Transaction len (rec/tot):     86/    86, tx:    5244000, lsn: 0/06660850, prev 0/066607C8, thread: 1, scn: 420313, desc: COMMIT 2026-10-11 19:26:26.004539 CST; scn: 420312; tt_commit: seg 2 gen 0 slot 0 wrap 6 inst 1 scn 420312
+   rmgr: Transaction len (rec/tot):     86/    86, tx:    5300976, lsn: 0/0B1910D0, prev 0/0B191048, thread: 1, scn: 1181904, desc: COMMIT 2026-10-11 19:51:13.445191 CST; scn: 1181903; tt_commit: seg 4 gen 4 slot 1 wrap 1 inst 1 scn 1181903
    ```
 
-   `thread: 1` 是这条记录所在的 WAL 线程；`desc` 中的 `scn: 420312` 是事务的提交 SCN；`tt_commit` 是该事务在事务表中的槽位（undo 段号、槽号）和同一个提交 SCN。节点 0 的 SCN 高 8 位为 0，所以这里显示的数值就是计数部分；其他节点的 SCN 显示为包含节点号的 64 位值。
+   `thread: 1` 是这条记录所在的 WAL 线程；`desc` 中的 `scn: 1181903` 是事务的提交 SCN；`tt_commit` 是该事务在事务表中的槽位（undo 段号、槽号）和同一个提交 SCN。节点 0 的 SCN 高 8 位为 0，所以这里显示的数值就是计数部分；其他节点的 SCN 显示为包含节点号的 64 位值。
 
 3. 本节点的 WAL 线程身份，以及四个实例的 WAL 目录：
 
@@ -1634,10 +1637,10 @@ done
     writer_node_id | 0
    (2 rows)
 
-   /srv/pgrac/demo/wal/thread_1/generation_845033121874112
-   /srv/pgrac/demo/wal/thread_2/generation_845033121874022
-   /srv/pgrac/demo/wal/thread_3/generation_845033121874110
-   /srv/pgrac/demo/wal/thread_4/generation_845033121874465
+   /srv/pgrac/demo/wal/thread_1/generation_845034502590911
+   /srv/pgrac/demo/wal/thread_2/generation_845034502678400
+   /srv/pgrac/demo/wal/thread_3/generation_845034502590478
+   /srv/pgrac/demo/wal/thread_4/generation_845034502590835
    thread_1
    thread_2
    thread_3
@@ -1691,11 +1694,11 @@ done
 ```json
 {
   "status": "STOPPED",
-  "seconds": 9.55,
+  "seconds": 7.546705669999994,
   "nodes": [
     {
       "rc": 0,
-      "stdout": "waiting for server to shut down............. done\nserver stopped\n",
+      "stdout": "waiting for server to shut down........... done\nserver stopped\n",
       ...
       "node": 0,
       "stopped": true
@@ -1722,8 +1725,13 @@ done
 
 按下面的顺序处理：
 
-1. **先正常停止，再启动。** 在 Mac 上执行 `./stop.sh`，确认输出 `STOPPED` 后执行 `./start.sh`，再运行 `./test.sh` 确认 `EXAMPLE_PASS`。
-2. **仍不能恢复时，重新导入镜像。** 镜像没有单独的恢复出厂数据命令；用原始交付件导入一个新副本即可得到全新的预装数据：
+1. **先正常停止，再启动。** 在 Mac 上的解压目录执行 `./stop.sh`；输出 `STOPPED` 后执行 `./start.sh`，再运行 `./test.sh` 确认 `EXAMPLE_PASS`。
+2. **重新导入镜像。** 遇到下列任一情况时，用原始交付件导入一个新副本：
+   - `./start.sh` 没有输出 `STARTED`；
+   - `./stop.sh` 没有输出 `STOPPED`；
+   - `./start.sh` 提示 `previous services were not cleanly stopped; preserve their state`，或 `./stop.sh` 提示 `runtime is not in STARTED state; retain data and logs`。
+
+   镜像没有单独的恢复出厂数据命令，导入新副本即可得到全新的预装数据：
 
    ```bash
    cd ~/pgrac-pre2/pre2-single-v0.135.0-arm64
@@ -1732,8 +1740,8 @@ done
    ./test.sh
    ```
 
-   新副本有自己独立的数据，之后这个副本的所有命令（包括 `./stop.sh`）都在设置了同一个 `PGRAC_VM` 的终端中执行。新副本需要重新执行[第 6 章](#6-连接四个节点)的 psql 环境设置和 [7.0](#70-准备实验数据) 的数据准备。
-3. **保留原副本和日志。** 原副本不要删除。先按[附录 C](#附录-c-获取帮助) 收集日志并联系技术支持；在 `./stop.sh` 没有返回 `STOPPED` 的情况下，Mac 内存不足以同时运行两个副本时，可在日志收集完成后执行 `limactl stop <原副本名>` 关闭原副本的 VM（副本的数据保留在磁盘上）。
+   新副本有自己独立的数据。之后这个副本的所有命令（包括 `./stop.sh`）都在设置了同一个 `PGRAC_VM` 的终端中执行；新副本需要重新完成[第 6 章](#6-连接四个节点)的 psql 环境设置和 [7.0](#70-准备实验数据) 的数据准备。
+3. **保留原副本和日志。** 原副本不要删除。先按[附录 C](#附录-c-获取帮助) 收集日志并联系技术支持。原副本的 `./stop.sh` 没有输出 `STOPPED`、而 Mac 内存不足以同时运行两个副本时，可在日志收集完成后执行 `limactl stop <原副本名>` 关闭原副本的 VM，副本的数据保留在磁盘上。
 
 ---
 
