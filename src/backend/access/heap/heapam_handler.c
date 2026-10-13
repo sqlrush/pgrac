@@ -28,6 +28,7 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/heaptoast.h"
+#include "access/visibilitymap.h"
 #include "access/multixact.h"
 #include "access/rewriteheap.h"
 #include "access/syncscan.h"
@@ -2825,7 +2826,9 @@ heapam_scan_sample_next_tuple(TableScanDesc scan, SampleScanState *scanstate,
 #else
 	page = (Page) BufferGetPage(hscan->rs_cbuf);
 #endif
-	all_visible = PageIsAllVisible(page) &&
+	/* PGRAC: TABLESAMPLE cannot trust shared PD_ALL_VISIBLE. */
+	all_visible = !cluster_heap_maintenance_restricted(scan->rs_rd) &&
+		PageIsAllVisible(page) &&
 		!scan->rs_snapshot->takenDuringRecovery;
 	maxoffset = PageGetMaxOffsetNumber(page);
 

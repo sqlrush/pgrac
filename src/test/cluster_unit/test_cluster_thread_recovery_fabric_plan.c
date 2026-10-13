@@ -29,8 +29,11 @@ static int page_seal_step;
 static int side_seal_step;
 static bool fail_page_feed;
 static bool fail_side_feed;
+static bool fail_lifecycle;
+static unsigned lifecycle_calls;
 static bool census_mode, census_refuse;
 static unsigned census_calls;
+static RfSidePlanPurposeV1 requested_purpose, observed_side_purpose;
 static RfPageOnlineRecordIdentityV1 observed_identity;
 
 RfPageProofDetailV1
@@ -50,6 +53,7 @@ rf_side_online_plan_create_v1(const RfSideOnlinePlanRequestV1 *request,
 	UT_ASSERT(request != NULL && request->system_identifier == 99
 			  && request->participant_count == 1);
 	*out_plan = (RfSideOnlinePlanV1 *)&side_plan_object;
+	observed_side_purpose = request->purpose;
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
@@ -197,6 +201,7 @@ create_plan(void)
 	request.physical_cuts = &cut;
 	request.participant_count = 1;
 	request.retention_binding_cookie = 41;
+	request.purpose = requested_purpose;
 	UT_ASSERT_EQ(cluster_thread_recovery_fabric_plan_create_v1(&request, &plan),
 				 RF_PAGE_PROOF_DETAIL_OK);
 	return plan;
@@ -384,10 +389,65 @@ UT_TEST(test_census_binds_original_source_and_validates_global_pages)
 	free(decoded);
 }
 
+UT_TEST(test_pi_purpose_is_bound_to_the_side_child_at_creation)
+{
+	ClusterThreadRecoveryFabricPlanV1 *plan;
+	reset_steps();
+	requested_purpose = RF_SIDE_PLAN_PI_CONTRIBUTIONS;
+	plan = create_plan();
+	UT_ASSERT_EQ(observed_side_purpose, RF_SIDE_PLAN_PI_CONTRIBUTIONS);
+	requested_purpose = RF_SIDE_PLAN_RECOVERY;
+	cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
+}
+
+uint32
+rf_page_online_plan_target_count_v1(const RfPageOnlinePlanV1 *plan)
+{
+	return 1;
+}
+
+bool
+rf_page_online_plan_target_v1(const RfPageOnlinePlanV1 *plan, uint32 index,
+							RfPageOnlineTargetViewV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	return index == 0;
+}
+
+bool rf_side_online_plan_page_lifecycle_v1(const RfSideOnlinePlanV1 *plan,
+										const RfPageOnlineTargetViewV1 *target);
+bool
+rf_side_online_plan_page_lifecycle_v1(const RfSideOnlinePlanV1 *plan,
+									const RfPageOnlineTargetViewV1 *target)
+{
+	UT_ASSERT(page_seal_step > 0 && side_seal_step > page_seal_step);
+	lifecycle_calls++;
+	return !fail_lifecycle;
+}
+
+UT_TEST(test_pi_creation_boundary_must_close_before_exposing_page_graph)
+{
+	ClusterThreadRecoveryFabricPlanV1 *plan;
+	reset_steps();
+	requested_purpose = RF_SIDE_PLAN_PI_CONTRIBUTIONS;
+	plan = create_plan();
+	requested_purpose = RF_SIDE_PLAN_RECOVERY;
+	fail_lifecycle = true;
+	lifecycle_calls = 0;
+	UT_ASSERT_NE(cluster_thread_recovery_fabric_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_NULL(cluster_thread_recovery_fabric_page_plan_v1(plan));
+	UT_ASSERT(!cluster_thread_recovery_fabric_replay_allowed_v1(plan));
+	UT_ASSERT_EQ(lifecycle_calls, 1);
+	cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
+	fail_lifecycle = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(7);
+	UT_RUN(test_pi_purpose_is_bound_to_the_side_child_at_creation);
+	UT_RUN(test_pi_creation_boundary_must_close_before_exposing_page_graph);
 	UT_RUN(test_record_is_preflighted_then_fed_to_page_and_side);
 	UT_RUN(test_page_failure_prevents_side_and_poisons_plan);
 	UT_RUN(test_side_failure_poisons_whole_plan);

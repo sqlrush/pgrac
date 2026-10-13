@@ -141,6 +141,11 @@ static ClusterPiWritebackJobV1 *wb_active;
 static ClusterPiWritebackNoticeV1 *wb_notice;
 static WritebackBatch *wb_batch;
 static uint32 wb_scan_cursor;
+/* A nonempty scan round may have left new PI behind its cursor. This is
+ * only a scheduling hint, scoped to the original checkpointer owner. */
+static ResourceOwner wb_scan_owner;
+static ClusterWalSourceRef wb_scan_local;
+static uint64 wb_scan_epoch;
 static uint32 wb_offer_scan[RESOURCE_X_PROTOCOL_NODE_LIMIT], wb_offer_peer;
 static uint32 wb_batch_turn = WB_BATCH_STRUCTURE;
 static uint32 wb_structure_scan;
@@ -1021,6 +1026,8 @@ wb_resource_release(ResourceReleasePhase phase, bool commit pg_attribute_unused(
 {
 	if (phase != RESOURCE_RELEASE_BEFORE_LOCKS)
 		return;
+	if (wb_scan_owner == CurrentResourceOwner)
+		wb_scan_owner = NULL;
 	if (wb_active != NULL && wb_active->owner == CurrentResourceOwner)
 		wb_cancel(wb_active);
 	/* Native ROOT/WALR callbacks own their handles during ERROR. Do not try
@@ -1034,6 +1041,7 @@ wb_resource_release(ResourceReleasePhase phase, bool commit pg_attribute_unused(
 static void
 wb_exit(int code pg_attribute_unused(), Datum arg pg_attribute_unused())
 {
+	wb_scan_owner = NULL;
 	wb_cancel(wb_active);
 	wb_forget_server();
 	wb_forget_batch();
@@ -1854,8 +1862,8 @@ invalid:
 	return true;
 }
 
-void
-cluster_pi_writeback_checkpointer_release_v1(void)
+static void
+wb_batch_release(void)
 {
 	WritebackBatch *batch = wb_batch;
 	if (batch == NULL || batch->pid != getpid() || batch->owner != CurrentResourceOwner)
@@ -1874,6 +1882,15 @@ cluster_pi_writeback_checkpointer_release_v1(void)
 	cluster_wal_inputs_release_v1(&batch->inputs);
 	wb_forget_batch();
 	pfree(batch);
+}
+
+void
+cluster_pi_writeback_checkpointer_release_v1(void)
+{
+	/* Native checkpoint/stop or explicit cancellation ends this scan hint,
+	 * including the interval after a batch has already been released. */
+	wb_scan_owner = NULL;
+	wb_batch_release();
 }
 
 static bool
@@ -1993,12 +2010,24 @@ wb_batch_structure_start(const ClusterWalSourceRef *local)
 }
 
 static bool
-wb_batch_data_start(const ClusterWalSourceRef *local)
+wb_batch_data_start(const ClusterWalSourceRef *local, bool *scan_pending)
 {
 	BufferTag tags[CLUSTER_PI_WRITEBACK_MAX];
 	uint32 count;
+	uint32 before = wb_scan_cursor;
 	count = cluster_pcm_lock_pi_candidates_v1(&wb_scan_cursor, 128, tags, CLUSTER_PI_WRITEBACK_MAX);
-	if (count == 0 || count > CLUSTER_PI_WRITEBACK_MAX)
+	*scan_pending = wb_scan_cursor != before
+		&& (wb_scan_cursor != 0 || wb_scan_owner != NULL);
+	/* Consume a nonempty round at its tail. No progress (including a
+	 * registry gate refusal) also invalidates the old continuation hint. */
+	if (wb_scan_cursor == 0 || wb_scan_cursor == before)
+		wb_scan_owner = NULL;
+	if (count > CLUSTER_PI_WRITEBACK_MAX) {
+		wb_scan_owner = NULL;
+		*scan_pending = false;
+		return false;
+	}
+	if (count == 0)
 		return false;
 	wb_batch_allocate(local);
 	for (uint32 i = 0; i < count; i++) {
@@ -2014,11 +2043,16 @@ wb_batch_data_start(const ClusterWalSourceRef *local)
 		wb_batch = NULL;
 		return false;
 	}
+	if (wb_scan_cursor != 0 && wb_scan_cursor != before) {
+		wb_scan_owner = CurrentResourceOwner;
+		wb_scan_local = *local;
+		wb_scan_epoch = wb_batch->epoch;
+	}
 	return true;
 }
 
 static bool
-wb_batch_start(void)
+wb_batch_start(bool *scan_pending)
 {
 	ClusterWalSourceRef local;
 	if (RecoveryInProgress() || cluster_normal_stop_requested() || !cluster_qvotec_in_quorum()
@@ -2026,14 +2060,19 @@ wb_batch_start(void)
 		|| !cluster_wal_thread_current_v2_ref(&local)
 		|| !cluster_wal_claim_v2_ref_valid(&local.claim) || local.timeline == 0
 		|| local.claim.identity.origin_node_id != cluster_node_id
-		|| local.claim.identity.origin_owner_incarnation != cluster_qvotec_get_self_incarnation())
+		|| local.claim.identity.origin_owner_incarnation != cluster_qvotec_get_self_incarnation()) {
+		wb_scan_owner = NULL;
 		return false;
+	}
+	if (wb_scan_owner != CurrentResourceOwner || wb_scan_epoch != cluster_epoch_get_current()
+		|| memcmp(&wb_scan_local, &local, sizeof(local)) != 0)
+		wb_scan_owner = NULL;
 	for (uint32 n = 0; n < WB_BATCH_KINDS; n++) {
 		uint32 kind = wb_batch_turn;
 		wb_batch_turn = (wb_batch_turn + 1) % WB_BATCH_KINDS;
 		if (kind == WB_BATCH_OFFER		 ? wb_batch_offer_start(&local)
 			: kind == WB_BATCH_STRUCTURE ? wb_batch_structure_start(&local)
-										 : wb_batch_data_start(&local))
+										 : wb_batch_data_start(&local, scan_pending))
 			break;
 	}
 	if (wb_batch == NULL)
@@ -2259,15 +2298,22 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 {
 	const RfPageOnlinePlanV1 *page;
 	ClusterControlRootResult result;
+	bool scan_pending = false;
 	if (MyBackendType != B_CHECKPOINTER || wb_shared == NULL || !wb_background() || !cluster_enabled
-		|| !cluster_shared_config)
+		|| !cluster_shared_config) {
+		wb_scan_owner = NULL;
 		return false;
+	}
 	wb_cleanup_register();
 	wb_structure_progress = false;
-	if (wb_batch == NULL && !wb_batch_start())
-		return wb_structure_progress;
-	if (!wb_batch_current())
+	if (wb_batch == NULL && !wb_batch_start(&scan_pending))
+		/* Partial slices and a just-completed nonempty round continue at the
+		 * original active interval. A complete empty round becomes idle. */
+		return wb_structure_progress || scan_pending;
+	if (!wb_batch_current()) {
+		wb_scan_owner = NULL;
 		goto done;
+	}
 	if (!wb_batch->structure_pages && !wb_batch_data())
 		return true;
 	/* Poll a peer's in-memory reply before resuming any WAL input. A silent
@@ -2465,7 +2511,7 @@ wait:
 			/* Yield only this attempt. The original KO slot remains pending,
 			 * and the next batch scans DATA before retrying relation offers. */
 			wb_batch_turn = WB_BATCH_DATA;
-			cluster_pi_writeback_checkpointer_release_v1();
+			wb_batch_release();
 			return true;
 		}
 	}
@@ -2479,7 +2525,7 @@ done:
 	if (wb_batch->structure_offer && !wb_batch->offer_completed)
 		wb_rejected(CLUSTER_PI_WRITEBACK_STRUCTURE_OWNER, &wb_batch->tags[0], wb_batch->offer_peer,
 					wb_batch->epoch, wb_batch->local.claim.identity.origin_owner_incarnation);
-	cluster_pi_writeback_checkpointer_release_v1();
+	wb_batch_release();
 	return true;
 }
 

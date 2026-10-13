@@ -29,6 +29,7 @@
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h"
+#include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_control_retire.h"
@@ -199,6 +200,12 @@ static uint64 ut_cleanup_deferred;
 static uint64 ut_reply_deferred;
 static uint64 ut_reply_dropped;
 static uint64 ut_lmon_wakeup;
+static uint32 ut_lmon_dirty;
+static Latch ut_lmon_latch;
+static pid_t ut_lmon_pid = 2000;
+int MyProcPid = 1000;
+BackendType MyBackendType = B_BACKEND;
+Latch *MyLatch = &ut_lmon_latch;
 
 void
 cluster_grd_inc_ges_cleanup_deferred(void)
@@ -219,14 +226,37 @@ cluster_grd_inc_ges_reply_dropped(void)
 }
 
 void
-cluster_lmon_duty_mark_dirty(ClusterLmonDuty duty pg_attribute_unused())
-{}
+cluster_lmon_duty_mark_dirty(ClusterLmonDuty duty)
+{
+	ut_lmon_dirty |= 1u << (duty - CLUSTER_LMON_DUTY_LAZY_FIRST);
+}
 
-void
-cluster_lmon_wakeup(void)
+pid_t
+cluster_lmon_pid(void)
+{
+	return ut_lmon_pid;
+}
+
+static int
+ut_lmon_signal(pid_t pid, int signal)
 {
 	Assert(ut_held_lock == NULL);
+	UT_ASSERT_EQ(pid, ut_lmon_pid);
+	UT_ASSERT_EQ(signal, SIGUSR1);
 	ut_lmon_wakeup++;
+	return 0;
+}
+
+#define kill ut_lmon_signal
+#include "test_cluster_grd_work_wakeup.inc"
+#undef kill
+
+void
+SetLatch(Latch *latch)
+{
+	Assert(ut_held_lock == NULL);
+	UT_ASSERT(latch == MyLatch);
+	latch->is_set = true;
 }
 
 const ClusterICMsgTypeInfo *
@@ -291,6 +321,10 @@ ut_reset_state(void)
 	ut_send_count = 0;
 	ut_release_seen_count = 0;
 	ut_log_count = 0;
+	MyProcPid = 1000;
+	MyBackendType = B_BACKEND;
+	ut_lmon_wakeup = ut_lmon_dirty = 0;
+	ut_lmon_latch.is_set = false;
 	memset(ut_release_seen, 0, sizeof(ut_release_seen));
 }
 
@@ -572,6 +606,59 @@ UT_TEST(test_work_queue_retains_receiver_cut_and_original_payload)
 	UT_ASSERT(memcmp(item.payload, &request, sizeof(request)) == 0);
 }
 
+/* A local retirement producer runs after this iteration's bounded drain.
+ * Its original FIFO item must arrange another iteration without a caller
+ * timeout, another message, or the heartbeat supplying the missing wake. */
+UT_TEST(test_work_queue_self_enqueue_continues_original_owner)
+{
+	ClusterGrdWorkItem item;
+	GesRequestPayload first = ut_release(801);
+	GesRequestPayload second = ut_release(802);
+
+	ut_reset_state();
+	MyProcPid = ut_lmon_pid;
+	MyBackendType = B_LMON;
+	UT_ASSERT(!cluster_grd_work_queue_dequeue(&item));
+	UT_ASSERT(!MyLatch->is_set);
+	UT_ASSERT(cluster_grd_work_queue_enqueue(0, &first, sizeof(first)));
+	UT_ASSERT(MyLatch->is_set);
+	UT_ASSERT_EQ(ut_lmon_wakeup, 0);
+	UT_ASSERT(ut_lmon_dirty & (1u << (CLUSTER_LMON_DUTY_GES_WORK_QUEUE
+									- CLUSTER_LMON_DUTY_LAZY_FIRST)));
+	UT_ASSERT(cluster_grd_work_queue_enqueue(0, &second, sizeof(second)));
+	MyLatch->is_set = false; /* Next ordinary iteration consumes the hint. */
+	UT_ASSERT(cluster_grd_work_queue_dequeue(&item));
+	UT_ASSERT(memcmp(item.payload, &first, sizeof(first)) == 0);
+	UT_ASSERT(cluster_grd_work_queue_dequeue(&item));
+	UT_ASSERT(memcmp(item.payload, &second, sizeof(second)) == 0);
+	UT_ASSERT(!cluster_grd_work_queue_dequeue(&item));
+	UT_ASSERT(!MyLatch->is_set);
+	UT_ASSERT_EQ(cluster_grd_work_queue_depth(), 0);
+}
+
+UT_TEST(test_work_queue_refused_and_external_producers_keep_wake_contract)
+{
+	GesRequestPayload request = ut_release(803);
+
+	ut_reset_state();
+	UT_ASSERT(cluster_grd_work_queue_enqueue(0, &request, sizeof(request)));
+	UT_ASSERT_EQ(ut_lmon_wakeup, 1);
+	UT_ASSERT(!MyLatch->is_set);
+	MyProcPid = ut_lmon_pid;
+	MyBackendType = B_LMON;
+	for (uint32 i = 1; i < cluster_grd_work_queue_capacity; i++)
+		UT_ASSERT(cluster_grd_work_queue_enqueue(0, &request, sizeof(request)));
+	MyLatch->is_set = false;
+	ut_lmon_dirty = 0;
+	UT_ASSERT(!cluster_grd_work_queue_enqueue(0, &request, sizeof(request)));
+	UT_ASSERT(!cluster_grd_work_queue_enqueue(
+		0, &request, sizeof(((ClusterGrdWorkItem *)0)->payload) + 1));
+	UT_ASSERT(!MyLatch->is_set);
+	UT_ASSERT_EQ(ut_lmon_dirty, 0);
+	UT_ASSERT_EQ(ut_lmon_wakeup, 1);
+	UT_ASSERT_EQ(cluster_grd_work_queue_depth(), cluster_grd_work_queue_capacity);
+}
+
 /* Real shared registry + actual final-send loop. The transport return code
  * models admission only, never a terminal request acknowledgement.
  * Author: SqlRush <sqlrush@gmail.com> */
@@ -737,7 +824,7 @@ int
 main(void)
 {
 	cluster_grd_outbound_shmem_register();
-	UT_PLAN(15);
+	UT_PLAN(17);
 
 	UT_RUN(test_normal_stop_required_queues_uninitialized);
 	UT_RUN(test_cleanup_retry_queue_never_overwrites_oldest);
@@ -748,6 +835,8 @@ main(void)
 	UT_RUN(test_normal_stop_work_queue_exact_shape_and_lock);
 	UT_RUN(test_normal_stop_outbound_geometry_cannot_fake_empty);
 	UT_RUN(test_work_queue_retains_receiver_cut_and_original_payload);
+	UT_RUN(test_work_queue_self_enqueue_continues_original_owner);
+	UT_RUN(test_work_queue_refused_and_external_producers_keep_wake_contract);
 	UT_RUN(test_abandoned_control_request_cannot_escape_retry_ring);
 	UT_RUN(test_forgotten_control_identity_is_not_send_permission);
 	UT_RUN(test_configured_work_burst);

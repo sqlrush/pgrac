@@ -110,6 +110,7 @@ static bool cluster_pcm_x_finish_retain_flush_fault_active;
 #define cluster_injection_should_skip(name) false
 #endif
 static const ClusterThreadRecoveryFabricPlanV1 *fabric = (void *)1;
+static bool pi_read_only;
 static RfSideOnlinePlanV1 *side;
 static ResourceOwner source_owner = (void *)6;
 
@@ -290,6 +291,12 @@ fault(int at)
 		InterruptHoldoffCount = 0;
 		pg_re_throw();
 	}
+}
+
+bool
+cluster_thread_recovery_fabric_replay_allowed_v1(const ClusterThreadRecoveryFabricPlanV1 *p)
+{
+	return p == fabric && !pi_read_only;
 }
 
 const RfSideOnlinePlanV1 *
@@ -894,6 +901,20 @@ static void
 space_end(void *arg, bool complete)
 {
 	UT_ASSERT(arg != NULL);
+}
+
+UT_TEST(test_pi_plan_never_acquires_a_space_apply_batch)
+{
+	ClusterSpaceRecoveryBatchV1 *batch = NULL;
+	reset();
+	pi_read_only = true;
+	UT_ASSERT(!cluster_space_recovery_preflight_v1(fabric, sources, 2, &batch));
+	UT_ASSERT_NULL(batch);
+	UT_ASSERT_EQ(writes, 0);
+	UT_ASSERT_EQ(syncs, 0);
+	UT_ASSERT(!pins && !locks && !hw_held);
+	cluster_space_recovery_destroy_v1(&batch);
+	pi_read_only = false;
 }
 
 UT_TEST(test_actual_reservation_install_and_repeat)
@@ -2366,7 +2387,7 @@ UT_TEST(test_compact_cold_physical_refusal_precedes_all_prefix_mutations)
 int
 main(void)
 {
-	UT_PLAN(47);
+	UT_PLAN(48);
 	UT_RUN(test_compact_cold_vm_shrink_does_not_shrink_main);
 	UT_RUN(test_compact_cold_named_shrink_runs_even_when_space_is_already_durable);
 	UT_RUN(test_compact_cold_unrequested_shrink_does_not_inspect_or_modify_data);
@@ -2406,6 +2427,7 @@ main(void)
 	UT_RUN(test_install_then_survivor_extend_then_retry);
 	UT_RUN(test_successor_cache_without_physical_proof_refuses);
 	UT_RUN(test_actual_reservation_install_and_repeat);
+	UT_RUN(test_pi_plan_never_acquires_a_space_apply_batch);
 	UT_RUN(test_sources_and_structure_refuse_before_mutation);
 	UT_RUN(test_target_and_late_authority_refuse);
 	UT_RUN(test_disk_failure_never_completes);

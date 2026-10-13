@@ -335,6 +335,11 @@ BackgroundWriterMain(void)
 		 * down with latch events that are likely to happen frequently during
 		 * normal operation.
 		 */
+#ifdef USE_PGRAC_CLUSTER
+		/* A confirmed WALR release may have consumed an earlier cut wake. */
+		if (cluster_wal_cut_consume_completion_v1())
+			SetLatch(MyLatch);
+#endif
 		rc = WaitLatch(MyLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 					   BgWriterDelay /* ms */ , WAIT_EVENT_BGWRITER_MAIN);

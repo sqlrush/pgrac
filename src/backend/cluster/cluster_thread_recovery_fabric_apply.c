@@ -176,6 +176,8 @@ cluster_thread_recovery_fabric_apply_sources_v1(const ClusterThreadRecoveryFabri
 	if (result == NULL)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	memset(result, 0, sizeof(*result));
+	if (!cluster_thread_recovery_fabric_replay_allowed_v1(plan))
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	if (authority == NULL || count == 0 || count > RF_PAGE_STABLE_MAX_PARTICIPANTS)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	page_plan = cluster_thread_recovery_fabric_page_plan_v1(plan);

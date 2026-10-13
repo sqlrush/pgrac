@@ -442,6 +442,14 @@ cluster_gcs_block_resource_x_source_settlement_tick(const ResourceXAcquisitionRe
 }
 
 ResourceXApplyResult
+cluster_gcs_block_resource_x_master_durable_tick(const ResourceXMasterDurableWork *work)
+{
+	(void)work;
+	UT_ASSERT(false); /* The native PCM fixture exercises this local callback. */
+	return RESOURCE_X_APPLY_BAD_STATE;
+}
+
+ResourceXApplyResult
 cluster_gcs_block_resource_x_source_finish_tick(const ResourceXAcquisitionRef *ref)
 {
 	UT_ASSERT_EQ(ref->formation, UINT64_C(17));

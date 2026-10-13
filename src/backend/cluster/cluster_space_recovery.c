@@ -696,6 +696,10 @@ cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *pla
 									const ClusterThreadRecoveryAuthorityV1 *sources, uint32 count,
 									ClusterSpaceRecoveryBatchV1 **out)
 {
+	if (out != NULL)
+		*out = NULL;
+	if (!cluster_thread_recovery_fabric_replay_allowed_v1(plan))
+		return false;
 	return space_recovery_preflight(
 		plan, plan != NULL ? cluster_thread_recovery_fabric_side_plan_v1(plan) : NULL, NULL,
 		sources, count, out);

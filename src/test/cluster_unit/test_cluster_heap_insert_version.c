@@ -34,6 +34,9 @@
 #include "storage/buf_internals.h"
 #include "utils/rel.h"
 #include "unit_test.h"
+#include "cluster/cluster_mode.h"
+#include "access/visibilitymap.h"
+#include "test_cluster_heap_maintenance_policy.inc"
 
 UT_DEFINE_GLOBALS();
 
@@ -553,6 +556,7 @@ reset(bool versioned, bool vm, bool bit_set)
 	begun = false;
 	want_vm = vm;
 	CritSectionCount = 0;
+	cluster_enabled = versioned;
 	cluster_shared_config = versioned;
 	if (!versioned)
 		return;
@@ -1389,12 +1393,12 @@ run_multi(bool versioned, bool frozen)
 #include "test_cluster_heap_multi_version.inc"
 }
 
-UT_TEST(test_native_multi_versions_actual_batch_and_frozen_option)
+UT_TEST(test_native_multi_versions_actual_batch)
 {
-	for (int mode = 0; mode < 3; mode++) {
+	for (int mode = 0; mode < 2; mode++) {
 		bool vm = mode == 1;
 		reset(true, vm, vm);
-		run_multi(true, mode == 2);
+		run_multi(true, false);
 		UT_ASSERT_EQ(edge_count, vm ? 2 : 1);
 		UT_ASSERT_EQ(edge_token, 100);
 		UT_ASSERT_EQ(edges[0].before.mutation_token, 17);
@@ -1409,21 +1413,24 @@ UT_TEST(test_native_multi_versions_actual_batch_and_frozen_option)
 			UT_ASSERT_EQ(PageGetLSN(pages[1].data), 200);
 			UT_ASSERT_EQ(register_flags[1], REGBUF_FORCE_IMAGE);
 			UT_ASSERT((heap_flags & XLH_INSERT_ALL_VISIBLE_CLEARED) != 0);
-		} else if (mode == 2) {
-			UT_ASSERT(PageIsAllVisible(pages[0].data));
-			UT_ASSERT((heap_flags & XLH_INSERT_ALL_FROZEN_SET) != 0);
 		}
 	}
 }
 UT_TEST(test_nonshared_multi_keeps_native_wal_shape)
 {
-	reset(false, true, true);
-	run_multi(false, false);
-	UT_ASSERT_EQ(edge_count, 0);
-	UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 17);
-	UT_ASSERT_EQ(PageGetMaxOffsetNumber(pages[0].data), 2);
-	UT_ASSERT(!registered[1]);
-	UT_ASSERT_EQ(inserts, 1);
+	for (int frozen = 0; frozen <= 1; frozen++) {
+		reset(false, !frozen, !frozen);
+		run_multi(false, frozen != 0);
+		UT_ASSERT_EQ(edge_count, 0);
+		UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 17);
+		UT_ASSERT_EQ(PageGetMaxOffsetNumber(pages[0].data), 2);
+		UT_ASSERT(!registered[1]);
+		UT_ASSERT_EQ(inserts, 1);
+		if (frozen) {
+			UT_ASSERT(PageIsAllVisible(pages[0].data));
+			UT_ASSERT((heap_flags & XLH_INSERT_ALL_FROZEN_SET) != 0);
+		}
+	}
 }
 UT_TEST(test_actual_multi_capture_leaves_both_pages_unchanged)
 {
@@ -1453,7 +1460,7 @@ int
 main(void)
 {
 	UT_PLAN(26);
-	UT_RUN(test_native_multi_versions_actual_batch_and_frozen_option);
+	UT_RUN(test_native_multi_versions_actual_batch);
 	UT_RUN(test_nonshared_multi_keeps_native_wal_shape);
 	UT_RUN(test_actual_multi_capture_leaves_both_pages_unchanged);
 	UT_RUN(test_native_insert_publishes_heap_edge_with_itl_delta);

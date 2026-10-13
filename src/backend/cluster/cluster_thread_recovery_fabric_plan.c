@@ -26,6 +26,7 @@ struct ClusterThreadRecoveryFabricPlanV1 {
 	bool failed;
 	bool space_active;
 	uint8 reserved1;
+	RfSidePlanPurposeV1 purpose;
 	uint64 system_identifier;
 	uint8 storage_uuid[16];
 	uint32 participant_count;
@@ -186,6 +187,9 @@ cluster_thread_recovery_fabric_plan_create_v1(
 	*out_plan = NULL;
 	if (request == NULL || request->physical_cuts == NULL || request->participant_count == 0
 		|| request->participant_count > RF_PAGE_STABLE_MAX_PARTICIPANTS
+		|| (request->purpose != RF_SIDE_PLAN_RECOVERY
+			&& request->purpose != RF_SIDE_PLAN_PI_CONTRIBUTIONS)
+		|| (request->purpose == RF_SIDE_PLAN_PI_CONTRIBUTIONS && request->redo_starts != NULL)
 		|| memcmp(request->reserved_zero, zero_reserved, sizeof(zero_reserved)) != 0)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	plan = (ClusterThreadRecoveryFabricPlanV1 *)fabric_alloc0(sizeof(*plan));
@@ -223,6 +227,7 @@ cluster_thread_recovery_fabric_plan_create_v1(
 	side_request.participant_count = request->participant_count;
 	side_request.memory_budget = request->side_memory_budget;
 	side_request.redo_starts = request->redo_starts;
+	side_request.purpose = request->purpose;
 	detail = rf_side_online_plan_create_v1(&side_request, &plan->side_plan);
 	if (detail != RF_PAGE_PROOF_DETAIL_OK) {
 		fabric_plan_free(plan);
@@ -230,6 +235,7 @@ cluster_thread_recovery_fabric_plan_create_v1(
 	}
 	plan->magic = CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_MAGIC;
 	plan->space_active = request->space_active;
+	plan->purpose = request->purpose;
 	plan->system_identifier = request->system_identifier;
 	memcpy(plan->storage_uuid, request->storage_uuid, 16);
 	plan->participant_count = request->participant_count;
@@ -315,6 +321,17 @@ cluster_thread_recovery_fabric_plan_seal_v1(ClusterThreadRecoveryFabricPlanV1 *p
 		plan->failed = true;
 		return detail;
 	}
+	if (plan->purpose == RF_SIDE_PLAN_PI_CONTRIBUTIONS) {
+		uint32 count = rf_page_online_plan_target_count_v1(plan->page_plan);
+		for (uint32 i = 0; i < count; i++) {
+			RfPageOnlineTargetViewV1 target;
+			if (!rf_page_online_plan_target_v1(plan->page_plan, i, &target)
+				|| !rf_side_online_plan_page_lifecycle_v1(plan->side_plan, &target)) {
+				plan->failed = true;
+				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			}
+		}
+	}
 	plan->sealed = true;
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
@@ -335,6 +352,13 @@ cluster_thread_recovery_fabric_side_plan_v1(const ClusterThreadRecoveryFabricPla
 				   && !plan->failed
 			   ? plan->side_plan
 			   : NULL;
+}
+
+bool
+cluster_thread_recovery_fabric_replay_allowed_v1(const ClusterThreadRecoveryFabricPlanV1 *plan)
+{
+	return plan != NULL && plan->magic == CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_MAGIC
+		&& plan->sealed && !plan->failed && plan->purpose == RF_SIDE_PLAN_RECOVERY;
 }
 
 uint32

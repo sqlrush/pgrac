@@ -39,6 +39,13 @@ ExceptionalCondition(const char *condition_name, const char *file_name, int line
 static char fabric_object;
 static char page_plan_object;
 static char side_plan_object;
+static bool pi_read_only;
+
+bool
+cluster_thread_recovery_fabric_replay_allowed_v1(const ClusterThreadRecoveryFabricPlanV1 *plan)
+{
+	return !pi_read_only && plan != NULL;
+}
 static char proof_objects[2];
 static char preflight_object;
 static char preopen_object;
@@ -774,10 +781,28 @@ UT_TEST(test_space_owner_precedes_page_install_and_unwinds)
 	}
 }
 
+UT_TEST(test_pi_fabric_cannot_acquire_apply_authority_or_publish_completion)
+{
+	ClusterThreadRecoveryAuthorityV1 authority;
+	ClusterThreadRecoveryFabricApplyResultV1 result;
+	init_case(&authority);
+	pi_read_only = true;
+	memset(&result, 0xff, sizeof(result));
+	UT_ASSERT_NE(cluster_thread_recovery_fabric_apply_v1(
+		(const ClusterThreadRecoveryFabricPlanV1 *)&fabric_object, &authority, &result),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(page_preflight_step, 0);
+	UT_ASSERT_EQ(page_install_step, 0);
+	UT_ASSERT_EQ(side_apply_step, 0);
+	UT_ASSERT(!result.side_apply_complete && !result.page_durability_complete);
+	pi_read_only = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
+	UT_RUN(test_pi_fabric_cannot_acquire_apply_authority_or_publish_completion);
 	UT_RUN(test_shared_fabric_rejects_unspecified_writer_generation);
 	UT_RUN(test_space_owner_precedes_page_install_and_unwinds);
 	UT_RUN(test_error_at_every_owned_stage_releases_all_fabric_state);

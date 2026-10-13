@@ -52,7 +52,7 @@ UT_DEFINE_GLOBALS();
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
 	UT_RUN(test_records_commit_tombstone_pins_its_source);
 	UT_RUN(test_records_commit_with_invalidations_is_classified);
 	UT_RUN(test_records_abort_with_relations_pins_its_source);
@@ -61,6 +61,7 @@ main(void)
 	UT_RUN(test_records_unknown_native_record_still_refuses);
 	UT_RUN(test_records_short_abort_does_not_advance_retention);
 	UT_RUN(test_records_tt_slot_stamps_are_keyed);
+	UT_RUN(test_pi_pin_removal_keeps_independent_side_and_structure);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

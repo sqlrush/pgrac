@@ -17,6 +17,11 @@
 
 typedef struct RfSideOnlinePlanV1 RfSideOnlinePlanV1;
 
+typedef enum RfSidePlanPurposeV1 {
+	RF_SIDE_PLAN_RECOVERY = 0,
+	RF_SIDE_PLAN_PI_CONTRIBUTIONS = 1
+} RfSidePlanPurposeV1;
+
 typedef enum RfSideOnlineOperationKindV1 {
 	RF_SIDE_ONLINE_OPERATION_INVALID = 0,
 	RF_SIDE_ONLINE_OPERATION_XACT = 1,
@@ -26,7 +31,10 @@ typedef enum RfSideOnlineOperationKindV1 {
 	/* Original RM_XLOG / RM_STANDBY / RM_CLUSTER_XID_STRIPE payload. Retained as an obligation,
 	 * never inferred to be a no-op or projection. Execution (including
 	 * standby invalidation/reset) needs the original native control owner. */
-	RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL = 5
+	RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL = 5,
+	/* Native structural WAL retained for its original owner, never applied
+	 * by a PI plan or substituted for a typed SPACE version. */
+	RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE = 6
 } RfSideOnlineOperationKindV1;
 
 typedef struct RfSideOnlinePlanRequestV1 {
@@ -37,6 +45,8 @@ typedef struct RfSideOnlinePlanRequestV1 {
 	Size memory_budget;
 	/* Bound before feed by the original source owner; NULL means full cut. */
 	const XLogRecPtr *redo_starts;
+	/* Fixed at creation; a PI contribution plan never authorizes execution. */
+	RfSidePlanPurposeV1 purpose;
 } RfSideOnlinePlanRequestV1;
 
 typedef struct RfSideOnlineOperationV1 {
@@ -54,6 +64,8 @@ typedef struct RfSideOnlineOperationV1 {
 	bool history_only;
 	/* Original header SCN, not a page version or control-file authority. */
 	SCN control_scn;
+	RfSidePlanPurposeV1 purpose;
+	TransactionId source_xid;
 } RfSideOnlineOperationV1;
 
 typedef bool (*RfSideOnlineApplyXactV1)(void *arg, const RfSideOnlineOperationV1 *operation);
@@ -105,6 +117,10 @@ extern RfPageProofDetailV1
 rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 								   const RfDetachedRecordPlanV1 *record_plan,
 								   const RfPageOnlineRecordIdentityV1 *identity);
+/* Check retained native creation boundaries against an exact PAGE graph.
+ * This is a read-only dependency check, never replay eligibility. */
+extern bool rf_side_online_plan_page_lifecycle_v1(const RfSideOnlinePlanV1 *plan,
+												const RfPageOnlineTargetViewV1 *target);
 extern RfPageProofDetailV1 rf_side_online_plan_seal_v1(RfSideOnlinePlanV1 *plan);
 /* The physical source owner supplies this after the entire scan and root
  * revalidation, never by copying a provisional SPACE payload's namespace. */
@@ -186,7 +202,10 @@ typedef enum RfSideContributionOwnerV1 {
 	RF_SIDE_CONTRIBUTION_CLOG = 1u << 5,
 	RF_SIDE_CONTRIBUTION_MULTIXACT = 1u << 6,
 	RF_SIDE_CONTRIBUTION_COMMIT_TS = 1u << 7,
-	RF_SIDE_CONTRIBUTION_NATIVE_CONTROL = 1u << 8
+	RF_SIDE_CONTRIBUTION_NATIVE_CONTROL = 1u << 8,
+	RF_SIDE_CONTRIBUTION_INVALIDATION = 1u << 9,
+	RF_SIDE_CONTRIBUTION_NATIVE_STRUCTURE = 1u << 10,
+	RF_SIDE_CONTRIBUTION_COMPLETION = 1u << 11
 } RfSideContributionOwnerV1;
 
 typedef struct RfSideContributionOwnersV1 {

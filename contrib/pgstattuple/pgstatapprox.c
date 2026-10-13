@@ -10,6 +10,11 @@
  *
  *-------------------------------------------------------------------------
  */
+/*
+ * PGRAC MODIFICATIONS
+ *   Modified by: SqlRush <sqlrush@gmail.com>
+ *   Keep shared heap visibility and freeze operations within supported paths.
+ */
 #include "postgres.h"
 
 #include "access/heapam.h"
@@ -91,7 +96,9 @@ statapprox_heap(Relation rel, output_type *stat)
 		 * If the page has only visible tuples, then we can find out the free
 		 * space from the FSM and move on.
 		 */
-		if (VM_ALL_VISIBLE(rel, blkno, &vmbuffer))
+		/* PGRAC: raw VM positives cannot skip shared heap inspection. */
+		if (!cluster_heap_maintenance_restricted(rel) &&
+			VM_ALL_VISIBLE(rel, blkno, &vmbuffer))
 		{
 			freespace = GetRecordedFreeSpace(rel, blkno);
 			stat->tuple_len += BLCKSZ - freespace;

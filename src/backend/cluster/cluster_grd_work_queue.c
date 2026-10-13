@@ -33,6 +33,7 @@
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h" /* IsBootstrapProcessingMode */
+#include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/elog.h"
@@ -193,7 +194,13 @@ cluster_grd_work_queue_enqueue(uint32 source_node_id, const void *payload, uint1
 	 * Spec: spec-7.2-ic-data-plane-decoupling.md
 	 */
 	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_GES_WORK_QUEUE);
-	cluster_lmon_wakeup();
+	/* Local retirement can enqueue after this iteration's work drain. The
+	 * cross-process wake helper intentionally skips itself; retain a local
+	 * wake for this newly published item so the next bounded drain runs. */
+	if (MyBackendType == B_LMON)
+		SetLatch(MyLatch);
+	else
+		cluster_lmon_wakeup();
 
 	return true;
 }

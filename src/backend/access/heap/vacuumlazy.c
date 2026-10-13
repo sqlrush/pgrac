@@ -158,6 +158,7 @@ typedef struct LVRelState
 {
 	/* Target heap relation and its indexes */
 	Relation	rel;
+	bool		shared_maintenance_restricted;
 	Relation   *indrels;
 	int			nindexes;
 #ifdef USE_PGRAC_CLUSTER
@@ -394,6 +395,7 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 
 	/* Set up high level stuff about rel and its indexes */
 	vacrel->rel = rel;
+	vacrel->shared_maintenance_restricted = cluster_heap_maintenance_restricted(rel);
 #ifdef USE_PGRAC_CLUSTER
 	/* Copy before any heap content lock; the relation lifecycle lock stays held. */
 	vacrel->versioned = cluster_shared_config
@@ -406,6 +408,13 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 	vac_open_indexes(vacrel->rel, RowExclusiveLock, &vacrel->nindexes,
 					 &vacrel->indrels);
 	vacrel->bstrategy = bstrategy;
+	/* PGRAC: an explicit request must not report deferred freezing as done. */
+	if (vacrel->shared_maintenance_restricted && (params->options & VACOPT_FREEZE))
+		ereport(WARNING,
+				(errcode(ERRCODE_WARNING),
+				 errmsg("freezing of shared heap %s is deferred", vacrel->relname),
+				 errhint("VACUUM scans the relation but does not advance relfrozenxid or relminmxid.")));
+
 	if (instrument && vacrel->nindexes > 0)
 	{
 		/* Copy index names used by instrumentation (not error reporting) */
@@ -579,17 +588,19 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 	 * value >= FreezeLimit, and relminmxid to a value >= MultiXactCutoff.
 	 * Non-aggressive VACUUMs may advance them by any amount, or not at all.
 	 */
-	Assert(vacrel->NewRelfrozenXid == vacrel->cutoffs.OldestXmin ||
+	Assert(vacrel->shared_maintenance_restricted ||
+		   vacrel->NewRelfrozenXid == vacrel->cutoffs.OldestXmin ||
 		   TransactionIdPrecedesOrEquals(vacrel->aggressive ? vacrel->cutoffs.FreezeLimit :
 										 vacrel->cutoffs.relfrozenxid,
 										 vacrel->NewRelfrozenXid));
-	Assert(vacrel->NewRelminMxid == vacrel->cutoffs.OldestMxact ||
+	Assert(vacrel->shared_maintenance_restricted ||
+		   vacrel->NewRelminMxid == vacrel->cutoffs.OldestMxact ||
 		   MultiXactIdPrecedesOrEquals(vacrel->aggressive ? vacrel->cutoffs.MultiXactCutoff :
 									   vacrel->cutoffs.relminmxid,
 									   vacrel->NewRelminMxid));
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC: unexamined members cannot authorize either freeze cutoff. */
-	if (vacrel->shared_mx_deferred_pages > 0)
+	if (vacrel->shared_maintenance_restricted || vacrel->shared_mx_deferred_pages > 0)
 	{
 		vacrel->NewRelfrozenXid = InvalidTransactionId;
 		vacrel->NewRelminMxid = InvalidMultiXactId;
@@ -613,7 +624,15 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 	 * pg_class.relpages to
 	 */
 	new_rel_pages = vacrel->rel_pages;	/* After possible rel truncation */
-	visibilitymap_count(rel, &new_rel_allvisible, NULL);
+	/* PGRAC: raw positive bits cannot authorize shared visibility statistics. */
+	if (vacrel->shared_maintenance_restricted)
+	{
+		Assert(vacrel->NewRelfrozenXid == InvalidTransactionId &&
+			   vacrel->NewRelminMxid == InvalidMultiXactId && vacrel->frozen_pages == 0);
+		new_rel_allvisible = 0;
+	}
+	else
+		visibilitymap_count(rel, &new_rel_allvisible, NULL);
 	if (new_rel_allvisible > new_rel_pages)
 		new_rel_allvisible = new_rel_pages;
 
@@ -718,6 +737,9 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 							 (long long) vacrel->recently_dead_tuples);
 #ifdef USE_PGRAC_CLUSTER
 			/* PGRAC: report retention in manual and automatic VACUUM logs. */
+			if (vacrel->shared_maintenance_restricted)
+				appendStringInfoString(&buf,
+					_("shared freeze deferred; relfrozenxid and relminmxid not advanced\n"));
 			if (vacrel->shared_mx_deferred_pages > 0)
 				appendStringInfo(&buf,
 					_("shared MultiXact references retained: %u pages, %lld tuples; relfrozenxid and relminmxid not advanced\n"),
@@ -1206,7 +1228,8 @@ lazy_scan_heap(LVRelState *vacrel)
 		 * Handle setting visibility map bit based on information from the VM
 		 * (as of last lazy_scan_skip() call), and from prunestate
 		 */
-		if (!all_visible_according_to_vm && prunestate.all_visible)
+		if (!vacrel->shared_maintenance_restricted &&
+			!all_visible_according_to_vm && prunestate.all_visible)
 		{
 			uint8		flags = VISIBILITYMAP_ALL_VISIBLE;
 
@@ -1303,7 +1326,8 @@ lazy_scan_heap(LVRelState *vacrel)
 		 * mark it as all-frozen.  Note that all_frozen is only valid if
 		 * all_visible is true, so we must check both prunestate fields.
 		 */
-		else if (all_visible_according_to_vm && prunestate.all_visible &&
+		else if (!vacrel->shared_maintenance_restricted &&
+				 all_visible_according_to_vm && prunestate.all_visible &&
 				 prunestate.all_frozen &&
 				 !VM_ALL_FROZEN(vacrel->rel, blkno, &vmbuffer))
 		{
@@ -1490,6 +1514,13 @@ lazy_scan_skip(LVRelState *vacrel, Buffer *vmbuffer, BlockNumber next_block,
 				nskippable_blocks = 0;
 	bool		skipsallvis = false;
 
+	/* PGRAC: do not even consult raw VM bits to skip shared heap work. */
+	if (vacrel->shared_maintenance_restricted)
+	{
+		*next_unskippable_allvis = false;
+		*skipping_current_range = false;
+		return next_block;
+	}
 	*next_unskippable_allvis = true;
 	while (next_unskippable_block < rel_pages)
 	{
@@ -1659,7 +1690,7 @@ lazy_scan_new_or_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
 		 * Unlike new pages, empty pages are always set all-visible and
 		 * all-frozen.
 		 */
-		if (!PageIsAllVisible(page))
+		if (!vacrel->shared_maintenance_restricted && !PageIsAllVisible(page))
 		{
 #ifdef USE_PGRAC_CLUSTER
 			/* PGRAC: shared initialization already has its own version/WAL.
@@ -1804,8 +1835,8 @@ retry:
 	 */
 	prunestate->hastup = false;
 	prunestate->has_lpdead_items = false;
-	prunestate->all_visible = true;
-	prunestate->all_frozen = true;
+	prunestate->all_visible = !vacrel->shared_maintenance_restricted;
+	prunestate->all_frozen = !vacrel->shared_maintenance_restricted;
 	prunestate->visibility_cutoff_xid = InvalidTransactionId;
 
 	for (offnum = FirstOffsetNumber;
@@ -1975,6 +2006,10 @@ retry:
 
 		prunestate->hastup = true;	/* page makes rel truncation unsafe */
 
+		/* PGRAC: retention must not become a freeze plan or cutoff proof. */
+		if (vacrel->shared_maintenance_restricted)
+			continue;
+
 		/* Tuple with storage -- consider need to freeze */
 		if (heap_prepare_freeze_tuple(tuple.t_data, &vacrel->cutoffs, &pagefrz,
 									  &frozen[tuples_frozen], &totally_frozen))
@@ -2006,7 +2041,11 @@ retry:
 	 * freeze when pruning generated an FPI, if doing so means that we set the
 	 * page all-frozen afterwards (might not happen until final heap pass).
 	 */
-	if (pagefrz.freeze_required || tuples_frozen == 0 ||
+	if (vacrel->shared_maintenance_restricted)
+	{
+		Assert(tuples_frozen == 0 && !prunestate->all_visible && !prunestate->all_frozen);
+	}
+	else if (pagefrz.freeze_required || tuples_frozen == 0 ||
 		(prunestate->all_visible && prunestate->all_frozen &&
 		 fpi_before != pgWalUsage.wal_fpi))
 	{
@@ -2227,7 +2266,8 @@ lazy_scan_noprune(LVRelState *vacrel,
 
 		*hastup = true;			/* page prevents rel truncation */
 		tupleheader = (HeapTupleHeader) PageGetItem(page, itemid);
-		if (heap_tuple_should_freeze(tupleheader, &vacrel->cutoffs,
+		if (!vacrel->shared_maintenance_restricted &&
+			heap_tuple_should_freeze(tupleheader, &vacrel->cutoffs,
 									 &NoFreezePageRelfrozenXid,
 									 &NoFreezePageRelminMxid))
 		{
@@ -2310,8 +2350,11 @@ lazy_scan_noprune(LVRelState *vacrel,
 	 * this particular page until the next VACUUM.  Remember its details now.
 	 * (lazy_scan_prune expects a clean slate, so we have to do this last.)
 	 */
-	vacrel->NewRelfrozenXid = NoFreezePageRelfrozenXid;
-	vacrel->NewRelminMxid = NoFreezePageRelminMxid;
+	if (!vacrel->shared_maintenance_restricted)
+	{
+		vacrel->NewRelfrozenXid = NoFreezePageRelfrozenXid;
+		vacrel->NewRelminMxid = NoFreezePageRelminMxid;
+	}
 
 	/* Save any LP_DEAD items found on the page in dead_items array */
 	if (vacrel->nindexes == 0)
@@ -2817,7 +2860,8 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
 	 * emitted.
 	 */
 	Assert(!PageIsAllVisible(page));
-	if (heap_page_is_all_visible(vacrel, buffer, &visibility_cutoff_xid,
+	if (!vacrel->shared_maintenance_restricted &&
+		heap_page_is_all_visible(vacrel, buffer, &visibility_cutoff_xid,
 								 &all_frozen))
 	{
 		uint8		flags = VISIBILITYMAP_ALL_VISIBLE;
@@ -3488,6 +3532,9 @@ heap_page_is_all_visible(LVRelState *vacrel, Buffer buf,
 	bool		all_visible = true;
 
 	*visibility_cutoff_xid = InvalidTransactionId;
+	*all_frozen = false;
+	if (vacrel->shared_maintenance_restricted)
+		return false;
 	*all_frozen = true;
 
 	maxoff = PageGetMaxOffsetNumber(page);

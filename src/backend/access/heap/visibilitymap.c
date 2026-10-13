@@ -122,12 +122,30 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "catalog/pg_control.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_mode.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_page_cold_redo.h"
 #include "cluster/storage/cluster_smgr.h"
 #endif
 
 
+
+/*
+ * cluster_heap_maintenance_restricted -- Shared heaps need exact visibility.
+ *
+ * Inputs: the relation whose maintenance or scan is being considered.
+ * Returns: whether positive visibility and freeze shortcuts are restricted.
+ * Side effects: none; storage mode is independent of the number of peers.
+ */
+bool
+cluster_heap_maintenance_restricted(Relation rel)
+{
+#ifdef USE_PGRAC_CLUSTER
+	return cluster_storage_mode_enabled() && !RelationUsesLocalBuffers(rel);
+#else
+	return false;
+#endif
+}
 
 /*#define TRACE_VISIBILITYMAP */
 
@@ -581,6 +599,13 @@ visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 #endif
 				  )
 {
+	/* PGRAC: only a real WAL redo call may reproduce an old positive bit. */
+	if (cluster_heap_maintenance_restricted(rel) &&
+		!(InRecovery && !XLogRecPtrIsInvalid(recptr)))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("all-visible publication for shared heaps is not supported"),
+				 errhint("Use ordinary heap visibility checks for shared relations.")));
 	if (!BufferIsValid(vmBuf) || !visibilitymap_pin_ok(heapBlk, vmBuf))
 		elog(ERROR, "wrong VM buffer passed to visibilitymap_set");
 	LockBuffer(vmBuf, BUFFER_LOCK_EXCLUSIVE);
@@ -601,6 +626,13 @@ visibilitymap_set_retry_aware(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 #endif
 							  )
 {
+	/* PGRAC: only a real WAL redo call may reproduce an old positive bit. */
+	if (cluster_heap_maintenance_restricted(rel) &&
+		!(InRecovery && !XLogRecPtrIsInvalid(recptr)))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("all-visible publication for shared heaps is not supported"),
+				 errhint("Use ordinary heap visibility checks for shared relations.")));
 	Assert(vmbuf != NULL && context != NULL);
 	if (!BufferIsValid(*vmbuf) || !visibilitymap_pin_ok(heapBlk, *vmbuf))
 		elog(ERROR, "wrong VM buffer passed to visibilitymap_set_retry_aware");

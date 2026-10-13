@@ -11620,15 +11620,36 @@ gcs_block_pcm_x_resource_x_join_terminal_owned_try(const ResourceXAcquisitionRef
 	return result;
 }
 
+static bool
+gcs_block_resource_x_master_durable_read(const ResourceXMasterSnapshot *captured,
+										  ResourceXDurableProof *durable)
+{
+	PGAlignedBlock aligned_image;
+	XLogRecPtr page_lsn = InvalidXLogRecPtr;
+	uint64 page_scn = 0;
+
+	if (!cluster_bufmgr_read_storage_image_for_resource_x(
+			captured->assertion.resource, aligned_image.data, &page_lsn, &page_scn))
+		return false;
+	memset(durable, 0, sizeof(*durable));
+	durable->assertion = captured->assertion;
+	durable->base_authority_generation = captured->base_authority_generation;
+	durable->resource_formation = captured->resource_formation;
+	durable->master_session_incarnation = captured->master_session_incarnation;
+	durable->assertion_sequence = captured->assertion_sequence;
+	durable->requester_target_generation = captured->assertion_sequence;
+	durable->page_scn_lsn = page_scn;
+	durable->page_checksum = cluster_gcs_block_compute_checksum(aligned_image.data);
+	durable->source_proof_crc32c = gcs_block_pcm_x_resource_x_durable_proof_crc(durable);
+	return durable->source_proof_crc32c != 0;
+}
+
 static ResourceXApplyResult
 gcs_block_pcm_x_resource_x_master_durable_try(const ResourceXDecodedFrame *assertion,
 											  const ResourceXMasterSnapshot *captured,
 											  ResourceXMasterSnapshot *out)
 {
-	PGAlignedBlock aligned_image;
 	ResourceXDurableProof durable;
-	XLogRecPtr page_lsn = InvalidXLogRecPtr;
-	uint64 page_scn = 0;
 
 	if (assertion == NULL || captured == NULL || out == NULL
 		|| assertion->kind != RESOURCE_X_WIRE_ASSERT_X
@@ -11642,23 +11663,61 @@ gcs_block_pcm_x_resource_x_master_durable_try(const ResourceXDecodedFrame *asser
 		|| captured->master_session_incarnation != assertion->common.master_session_incarnation
 		|| captured->assertion_sequence != assertion->common.assertion_sequence)
 		return RESOURCE_X_APPLY_BAD_STATE;
-	if (!cluster_bufmgr_read_storage_image_for_resource_x(
-			assertion->common.logical_assertion.resource, aligned_image.data, &page_lsn, &page_scn))
-		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-
-	memset(&durable, 0, sizeof(durable));
-	durable.assertion = captured->assertion;
-	durable.base_authority_generation = captured->base_authority_generation;
-	durable.resource_formation = captured->resource_formation;
-	durable.master_session_incarnation = captured->master_session_incarnation;
-	durable.assertion_sequence = captured->assertion_sequence;
-	durable.requester_target_generation = captured->assertion_sequence;
-	durable.page_scn_lsn = page_scn;
-	durable.page_checksum = cluster_gcs_block_compute_checksum(aligned_image.data);
-	durable.source_proof_crc32c = gcs_block_pcm_x_resource_x_durable_proof_crc(&durable);
-	if (durable.source_proof_crc32c == 0)
+	if (!gcs_block_resource_x_master_durable_read(captured, &durable))
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	return cluster_pcm_lock_resource_x_durable_proof_exact(&durable, out);
+}
+
+static bool
+gcs_block_resource_x_master_durable_admitted(const ResourceXMasterDurableWork *work,
+												const ClusterSemanticAdmissionToken *admission)
+{
+	ResourceXGateSnapshot gate;
+	uint64 session = 0;
+	int32 master = -1;
+
+	return cluster_semantic_activation_recheck(admission)
+		   && admission->record_generation == work->r4_record_generation
+		   && gcs_block_resource_x_gate_session_snapshot_result(
+				  &work->head.assertion.resource, &gate, &master, &session) == PCM_X_SESSION_AUTH_OK
+		   && gate.formation == work->head.resource_formation
+		   && master == work->master_node && master == cluster_node_id
+		   && session == work->head.master_session_incarnation;
+}
+
+ResourceXApplyResult
+cluster_gcs_block_resource_x_master_durable_tick(const ResourceXMasterDurableWork *work)
+{
+	ClusterSemanticAdmissionToken admission = { 0 };
+	ResourceXDurableProof durable;
+	ResourceXMasterSnapshot snapshot;
+	volatile ResourceXApplyResult result = RESOURCE_X_APPLY_STALE;
+
+	if (MyBackendType != B_LMS || work == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+										  CLUSTER_SEMANTIC_TARGET_SIDE, &admission)
+		!= CLUSTER_SEMANTIC_ADMISSION_OK)
+		return RESOURCE_X_APPLY_STALE;
+	PG_TRY();
+	{
+		if (gcs_block_resource_x_master_durable_admitted(work, &admission)
+			&& cluster_pcm_lock_resource_x_master_durable_work_matches_exact(work)) {
+			/* No registry/entry lock or retained running claim crosses I/O.
+			 * ERROR leaves only the original canonical request to resume. */
+			if (!gcs_block_resource_x_master_durable_read(&work->head, &durable))
+				result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+			else if (gcs_block_resource_x_master_durable_admitted(work, &admission))
+				result = cluster_pcm_lock_resource_x_master_durable_work_proof_exact(
+					work, &durable, &snapshot);
+		}
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
+	return result;
 }
 
 static ResourceXApplyResult

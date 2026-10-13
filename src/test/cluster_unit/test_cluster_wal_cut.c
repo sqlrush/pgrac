@@ -36,6 +36,9 @@ static bool flush_ready = true, stop_requested, flush_error;
 static unsigned force_flushes;
 PGPROC *MyProc;
 PROC_HDR *ProcGlobal;
+static PGPROC test_procs[2];
+static PROC_HDR test_proc_header;
+static unsigned latch_sets[2];
 volatile uint32 CritSectionCount;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
@@ -64,6 +67,11 @@ void
 SetLatch(Latch *latch)
 {
 	wakeups++;
+	for (unsigned i = 0; i < lengthof(test_procs); i++)
+		if (latch == &test_procs[i].procLatch) {
+			latch_sets[i]++;
+			latch->is_set = true;
+		}
 }
 
 bool
@@ -241,6 +249,8 @@ select_node(int node)
 {
 	cluster_node_id = node;
 	cut_shared = (WalCutShared *)shared_bytes[node];
+	MyProc = &test_procs[node];
+	MyProcPid = 100 + node;
 }
 
 static void
@@ -262,6 +272,17 @@ reset(void)
 	reserved = 0x1200;
 	flushed = 0x1100;
 	samples = confirms = sends = wakeups = 0;
+	memset(test_procs, 0, sizeof(test_procs));
+	memset(latch_sets, 0, sizeof(latch_sets));
+	memset(&test_proc_header, 0, sizeof(test_proc_header));
+	test_proc_header.allProcs = test_procs;
+	test_proc_header.allProcCount = lengthof(test_procs);
+	ProcGlobal = &test_proc_header;
+	for (unsigned i = 0; i < lengthof(test_procs); i++) {
+		test_procs[i].pgprocno = i;
+		test_procs[i].pid = 100 + i;
+	}
+	select_node(0);
 	now_us += 1000000;
 	for (int i = 0; i < 2; i++) {
 		ClusterControlRootIdentity *id;
@@ -564,10 +585,203 @@ UT_TEST(source_error_and_stop_preserve_pending_without_success)
 	cluster_wal_cut_release_v1(&cut);
 }
 
+static void
+deliver_reply(ClusterWalCutMessageV1 *reply)
+{
+	uint8 wire[CLUSTER_WAL_CUT_BYTES];
+	UT_ASSERT(cluster_wal_cut_encode_v1(reply, wire));
+	deliver(1, 0, wire);
+	MyBackendType = B_BG_WRITER;
+}
+
+UT_TEST(completed_sample_and_confirmation_wake_exact_collector_once)
+{
+	for (int confirm = 0; confirm < 2; confirm++) {
+		ClusterWalCutV1 *cut = NULL;
+		ClusterWalWriterFlushV1 out;
+		ClusterWalCutMessageV1 reply;
+		reset();
+		UT_ASSERT_EQ(cluster_wal_cut_begin_v1(&sources[1], &cut), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		reply = cut->requested;
+		reply.verb = CLUSTER_WAL_CUT_SAMPLED;
+		reply.native_config_generation = 4;
+		reply.reserved_end = reserved;
+		if (confirm) {
+			deliver_reply(&reply);
+			UT_ASSERT_EQ(latch_sets[0], 0);
+			UT_ASSERT_EQ(cluster_wal_cut_poll_v1(cut, &out), CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+			reply.verb = CLUSTER_WAL_CUT_CONFIRMED;
+		}
+		reply.flushed_end = reserved;
+		deliver_reply(&reply);
+		UT_ASSERT_EQ(latch_sets[0], 1);
+		UT_ASSERT(MyProc->procLatch.is_set);
+		UT_ASSERT_EQ(latch_sets[1], 0);
+		deliver_reply(&reply);
+		UT_ASSERT_EQ(latch_sets[0], 1);
+		UT_ASSERT_EQ(cluster_wal_cut_poll_v1(cut, &out), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(out.complete_end, reserved);
+		cluster_wal_cut_release_v1(&cut);
+		deliver_reply(&reply);
+		UT_ASSERT_EQ(latch_sets[0], 1);
+	}
+}
+
+UT_TEST(refused_or_cancelled_reply_cannot_wake_replacement_collector)
+{
+	for (int change = 0; change < 12; change++) {
+		ClusterWalCutV1 *cut = NULL, *replacement = NULL;
+		ClusterWalWriterFlushV1 out;
+		ClusterWalCutMessageV1 reply;
+		reset();
+		UT_ASSERT_EQ(cluster_wal_cut_begin_v1(&sources[1], &cut), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		reply = cut->requested;
+		reply.verb = CLUSTER_WAL_CUT_SAMPLED;
+		reply.native_config_generation = 4;
+		reply.reserved_end = reply.flushed_end = reserved;
+		switch (change) {
+		case 0:
+			reply.nonce++;
+			break;
+		case 1:
+			reply.source.timeline++;
+			break;
+		case 2:
+			reply.source.claim.identity.origin_owner_incarnation++;
+			break;
+		case 3:
+			epoch++;
+			break;
+		case 4:
+			quorum = false;
+			break;
+		case 5:
+			stop_requested = true;
+			break;
+		case 6:
+			test_procs[0].pid++;
+			break;
+		case 7:
+			release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false, NULL);
+			break;
+		case 8:
+			exit_callback(0, (Datum)0);
+			break;
+		case 9:
+			ProcGlobal = NULL;
+			break;
+		case 10:
+			test_proc_header.allProcs = NULL;
+			break;
+		case 11:
+			test_procs[0].pgprocno = test_proc_header.allProcCount;
+			break;
+		}
+		if (change == 7 || change == 8)
+			UT_ASSERT_EQ(cluster_wal_cut_begin_v1(&sources[1], &replacement),
+						 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		deliver_reply(&reply);
+		UT_ASSERT_EQ(latch_sets[0], 0);
+		UT_ASSERT_EQ(latch_sets[1], 0);
+		if (change == 7 || change == 8)
+			UT_ASSERT_EQ(cluster_wal_cut_poll_v1(replacement, &out),
+						 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+		else if (change < 6)
+			UT_ASSERT_NE(cluster_wal_cut_poll_v1(cut, &out), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		cluster_wal_cut_release_v1(&cut);
+		cluster_wal_cut_release_v1(&replacement);
+	}
+}
+
+UT_TEST(completed_cut_survives_internal_latch_reset_for_one_poll_retry)
+{
+	ClusterWalCutV1 *cut = NULL;
+	ClusterWalWriterFlushV1 out;
+	reset();
+	UT_ASSERT(!cluster_wal_cut_consume_completion_v1());
+	UT_ASSERT_EQ(cluster_wal_cut_begin_v1(&sources[1], &cut), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT(!cluster_wal_cut_consume_completion_v1());
+	roundtrip();
+	UT_ASSERT(MyProc->procLatch.is_set);
+	/* Model the intervening WALR confirmed-release wait consuming its latch.
+	 * The actual mailbox consumer must preserve one bounded retry afterward. */
+	MyProc->procLatch.is_set = false;
+	UT_ASSERT(cluster_wal_cut_consume_completion_v1());
+	for (unsigned i = 0; i < 3; i++)
+		UT_ASSERT(!cluster_wal_cut_consume_completion_v1());
+	/* The hint neither consumes nor replaces the original full poll checks. */
+	UT_ASSERT_EQ(cluster_wal_cut_poll_v1(cut, &out), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(out.flushed_end, reserved);
+	UT_ASSERT(!cluster_wal_cut_consume_completion_v1());
+	cluster_wal_cut_release_v1(&cut);
+}
+
+UT_TEST(completion_retry_respects_owner_gates_and_cancellation)
+{
+	for (int change = 0; change < 9; change++) {
+		ClusterWalCutV1 *cut = NULL, *replacement = NULL;
+		ClusterWalWriterFlushV1 out;
+		reset();
+		UT_ASSERT_EQ(cluster_wal_cut_begin_v1(&sources[1], &cut), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		roundtrip();
+		MyProc->procLatch.is_set = false;
+		switch (change) {
+		case 0:
+			quorum = false;
+			break;
+		case 1:
+			stop_requested = true;
+			break;
+		case 2:
+			epoch++;
+			break;
+		case 3:
+			incarnations[1]++;
+			break;
+		case 4:
+			pending = true;
+			break;
+		case 5:
+			CurrentResourceOwner = (void *)2;
+			break;
+		case 6:
+			MyBackendType = B_LMON;
+			break;
+		case 7:
+			release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false, NULL);
+			break;
+		case 8:
+			exit_callback(0, (Datum)0);
+			break;
+		}
+		if (change >= 7)
+			UT_ASSERT_EQ(cluster_wal_cut_begin_v1(&sources[1], &replacement),
+						 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(!cluster_wal_cut_consume_completion_v1());
+		UT_ASSERT(!MyProc->procLatch.is_set);
+		if (change < 5) {
+			/* Restoring eligibility cannot revive an already consumed old hint. */
+			quorum = true;
+			stop_requested = pending = false;
+			epoch = 17;
+			incarnations[1] = 41;
+			UT_ASSERT(!cluster_wal_cut_consume_completion_v1());
+		}
+		if (change >= 7)
+			UT_ASSERT_EQ(cluster_wal_cut_poll_v1(replacement, &out),
+						 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+		CurrentResourceOwner = (void *)1;
+		MyBackendType = B_BG_WRITER;
+		cluster_wal_cut_release_v1(&cut);
+		cluster_wal_cut_release_v1(&replacement);
+		UT_ASSERT(!cluster_wal_cut_consume_completion_v1());
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(12);
 	UT_RUN(fixed_remote_cut_actively_flushes_idle_original_writer);
 	UT_RUN(old_reply_and_other_owner_cannot_complete_new_job);
 	UT_RUN(cancellation_releases_mailbox_without_inventing_completion);
@@ -576,6 +790,10 @@ main(void)
 	UT_RUN(reordered_samples_and_wrong_sender_do_not_replace_fixed_minimum);
 	UT_RUN(native_writer_refusal_and_later_selected_ceiling);
 	UT_RUN(source_error_and_stop_preserve_pending_without_success);
+	UT_RUN(completed_sample_and_confirmation_wake_exact_collector_once);
+	UT_RUN(refused_or_cancelled_reply_cannot_wake_replacement_collector);
+	UT_RUN(completed_cut_survives_internal_latch_reset_for_one_poll_retry);
+	UT_RUN(completion_retry_respects_owner_gates_and_cancellation);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

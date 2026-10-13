@@ -6305,7 +6305,9 @@ get_actual_variable_endpoint(Relation heapRel,
 	{
 		BlockNumber block = ItemPointerGetBlockNumber(tid);
 
-		if (!VM_ALL_VISIBLE(heapRel,
+		/* PGRAC: planner probes need the same exact shared visibility. */
+		if (cluster_heap_maintenance_restricted(heapRel) ||
+			!VM_ALL_VISIBLE(heapRel,
 							block,
 							&vmbuffer))
 		{

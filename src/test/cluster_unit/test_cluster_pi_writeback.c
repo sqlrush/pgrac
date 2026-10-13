@@ -41,6 +41,7 @@ static unsigned wb_offer_complete_calls;
 static ClusterPiWritebackFactV2 wb_offer_observed;
 static int wb_cap_samples, wb_cap_drift, wb_route;
 static bool wb_quorum = true, wb_stop, wb_input_current = true, wb_input_wait;
+static bool wb_reconfig, wb_scan_paused;
 static ClusterWalSourceRef wb_sources[3];
 static ClusterPcmPiStorageCutV1 wb_storage_cut;
 static ClusterPcmPiStorageCutV1 wb_vm_cut;
@@ -175,6 +176,7 @@ static TimestampTz wb_now = 1000000;
 static ResourceReleaseCallback wb_release_callback;
 static ClusterICSendResult wb_send_result = CLUSTER_IC_SEND_DONE;
 static bool wb_candidates;
+static uint32 wb_scan_limit, wb_candidate_slot, wb_scan_calls;
 static unsigned wb_master_completions;
 static ClusterWalInputV1 wb_inputs[3];
 static bool wb_inputs_pinned[3], wb_resume_wait;
@@ -289,6 +291,17 @@ cluster_pcm_lock_pi_candidates_v1(uint32 *cursor, uint32 budget, BufferTag *tags
 {
 	UT_ASSERT_EQ(MyBackendType, B_CHECKPOINTER);
 	UT_ASSERT(capacity > 0 && budget >= capacity);
+	if (wb_scan_paused)
+		return 0;
+	if (wb_scan_limit != 0) {
+		uint32 start = *cursor;
+		uint32 end = Min(start + budget, wb_scan_limit);
+		UT_ASSERT_EQ(budget, 128);
+		wb_scan_calls++;
+		*cursor = end == wb_scan_limit ? 0 : end;
+		if (wb_candidate_slot < start || wb_candidate_slot >= end)
+			return 0;
+	}
 	if (!wb_candidates)
 		return 0;
 	wb_candidates = false;
@@ -382,7 +395,7 @@ cluster_normal_stop_requested(void)
 bool
 cluster_reconfig_has_pending_prebump_stage(void)
 {
-	return false;
+	return wb_reconfig;
 }
 TimestampTz
 GetCurrentTimestamp(void)
@@ -992,6 +1005,7 @@ wb_setup(void)
 	wb_recovered_boot = 9;
 	wb_quorum = wb_input_current = true;
 	wb_stop = wb_input_wait = false;
+	wb_reconfig = wb_scan_paused = false;
 	wb_plan_failure_wait = false;
 	rebuild_plan_failure = RF_PAGE_PROOF_DETAIL_OK;
 	wb_send_result = CLUSTER_IC_SEND_DONE;
@@ -1004,6 +1018,7 @@ wb_setup(void)
 	wb_master_completions = 0;
 	wb_candidates = false;
 	wb_offer_present = false;
+	wb_scan_limit = wb_candidate_slot = wb_scan_calls = wb_scan_cursor = 0;
 	wb_offer_accepted = 0;
 	wb_offer_complete_calls = 0;
 	wb_structure_schedule = false;
@@ -1296,6 +1311,138 @@ UT_TEST(writeback_reply_is_retired_and_retries_only_transport_refusal)
 	cluster_page_data_receipt_free_v1(&data);
 	rf_page_online_plan_destroy_v1(&wb_page_plan);
 	clean();
+}
+
+UT_TEST(checkpointer_partial_registry_scan_keeps_original_owner_active)
+{
+	ClusterPageDataReceiptV1 *previous = wb_setup();
+	unsigned elapsed_ms = 0;
+
+	/* The original D07 tag lives in slot 530 of 2048. Start just beyond
+	 * it, so reaching the same responsibility requires wrapping the bounded
+	 * directory cursor. A partial empty slice is not an idle owner. */
+	wb_scan_limit = 2048;
+	wb_candidate_slot = 530;
+	wb_scan_cursor = 640;
+	wb_candidates = true;
+	wb_storage_cut.pi_holders_bitmap = 1;
+	physical_pi_from_source(&wb_sources[0], 80);
+	for (unsigned slice = 0; wb_master_completions == 0 && slice < 16; slice++) {
+		bool pending = cluster_pi_writeback_checkpointer_tick_v1();
+		UT_ASSERT_EQ(wb_scan_calls, slice + 1);
+		if (wb_master_completions == 0) {
+			UT_ASSERT_EQ(wb_plan_builds, 0);
+			UT_ASSERT_EQ(pi_discards, 0);
+			UT_ASSERT(!wb_inputs_pinned[0]);
+			/* CheckpointerMain's existing active and idle intervals. */
+			elapsed_ms += pending ? 100 : 1000;
+		}
+	}
+	UT_ASSERT_EQ(wb_master_completions, 1);
+	UT_ASSERT_EQ(pi_discards, 1);
+	UT_ASSERT(elapsed_ms < 5000);
+	UT_ASSERT_EQ(wb_sends, 0);
+	/* Work in this round can create another PI behind the cursor. Its tail
+	 * stays active once; the following complete empty round becomes idle. */
+	while (wb_scan_cursor != 0)
+		UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+	for (unsigned slice = 0; slice < 16; slice++)
+		UT_ASSERT_EQ(cluster_pi_writeback_checkpointer_tick_v1(), slice < 15);
+	UT_ASSERT_EQ(wb_scan_cursor, 0);
+	/* An unscanned cursor is not permission to bypass any stop/quorum gate. */
+	wb_scan_cursor = 128;
+	wb_scan_calls = 0;
+	wb_stop = true;
+	UT_ASSERT(!cluster_pi_writeback_checkpointer_tick_v1());
+	UT_ASSERT_EQ(wb_scan_cursor, 128);
+	wb_stop = false;
+	wb_quorum = false;
+	UT_ASSERT(!cluster_pi_writeback_checkpointer_tick_v1());
+	UT_ASSERT_EQ(wb_scan_calls, 0);
+	wb_quorum = true;
+	cluster_page_data_receipt_free_v1(&previous);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+UT_TEST(checkpointer_nonempty_round_hint_is_consumed_at_wrap)
+{
+	ClusterPageDataReceiptV1 *previous = wb_setup();
+	wb_scan_limit = 512;
+	wb_candidate_slot = 0;
+	wb_candidates = true;
+	wb_storage_cut.pi_holders_bitmap = 1;
+	physical_pi_from_source(&wb_sources[0], 80);
+	UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+	UT_ASSERT_EQ(wb_master_completions, 1);
+	UT_ASSERT(wb_batch == NULL);
+	for (unsigned slice = 1; slice < 4; slice++)
+		UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+	UT_ASSERT_EQ(wb_scan_cursor, 0);
+	UT_ASSERT_EQ(wb_scan_calls, 4);
+	for (unsigned slice = 0; slice < 4; slice++)
+		UT_ASSERT_EQ(cluster_pi_writeback_checkpointer_tick_v1(), slice < 3);
+	UT_ASSERT_EQ(wb_scan_cursor, 0);
+	UT_ASSERT_EQ(wb_scan_calls, 8);
+	UT_ASSERT_EQ(wb_master_completions, 1);
+	UT_ASSERT_EQ(wb_plan_builds, 1);
+	UT_ASSERT_EQ(wb_sends, 0);
+	cluster_page_data_receipt_free_v1(&previous);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+UT_TEST(checkpointer_scan_hint_cannot_outlive_gate_or_owner)
+{
+	/* Each case first completes real local DATA/ACK work in the first
+	 * half of a scan. No old hint may activate the empty tail after a
+	 * rejected tick, no scan progress, or the original lifecycle exits. */
+	for (unsigned fault = 0; fault < 13; fault++) {
+		ClusterPageDataReceiptV1 *previous = wb_setup();
+		wb_scan_limit = 256;
+		wb_candidate_slot = 0;
+		wb_candidates = true;
+		wb_storage_cut.pi_holders_bitmap = 1;
+		physical_pi_from_source(&wb_sources[0], 80);
+		UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+		UT_ASSERT_EQ(wb_master_completions, 1);
+		UT_ASSERT_EQ(wb_scan_cursor, 128);
+		UT_ASSERT(wb_batch == NULL);
+		switch (fault) {
+			case 0: wb_stop = true; break;
+			case 1: wb_quorum = false; break;
+			case 2: wb_reconfig = true; break;
+			case 3: wb_scan_paused = true; break;
+			case 4: selected = false; break;
+			case 5: CritSectionCount = 1; break;
+			case 6: CurrentResourceOwner = (void *)3; break;
+			case 7: wb_epoch++; break;
+			case 8: writer.timeline++; break;
+			case 9:
+				wb_resource_release(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+				break;
+			case 10: cluster_pi_writeback_checkpointer_release_v1(); break;
+			case 11: wb_exit(0, (Datum)0); break;
+			case 12: cluster_enabled = false; break;
+		}
+		UT_ASSERT(!cluster_pi_writeback_checkpointer_tick_v1());
+		if (fault < 6 || fault == 12) {
+			UT_ASSERT_EQ(wb_scan_cursor, 128);
+			UT_ASSERT_EQ(wb_scan_calls, 1);
+			wb_stop = wb_reconfig = wb_scan_paused = false;
+			wb_quorum = selected = cluster_enabled = true;
+			CritSectionCount = 0;
+			UT_ASSERT(!cluster_pi_writeback_checkpointer_tick_v1());
+		}
+		UT_ASSERT_EQ(wb_scan_cursor, 0);
+		UT_ASSERT_EQ(wb_scan_calls, 2);
+		UT_ASSERT_EQ(wb_master_completions, 1);
+		UT_ASSERT(!wb_inputs_pinned[0]);
+		cluster_pi_writeback_checkpointer_release_v1();
+		cluster_page_data_receipt_free_v1(&previous);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
 }
 
 UT_TEST(checkpointer_batch_reaches_actual_local_and_remote_physical_owners)
@@ -2115,7 +2262,7 @@ int
 main(void)
 {
 	printf("# sizeof_WritebackShared=%zu\n", sizeof(WritebackShared));
-	UT_PLAN(75);
+	UT_PLAN(78);
 	UT_RUN(writeback_v2_structure_scheduler_checks_local_work_without_wal_pins);
 	UT_RUN(writeback_v2_structure_scheduler_counts_invalid_completion_and_continues);
 	UT_RUN(writeback_v2_structure_scheduler_collects_all_original_page_acks);
@@ -2167,6 +2314,9 @@ main(void)
 	UT_RUN(writeback_wait_keeps_one_scope_and_stop_cancels_actual_owner);
 	UT_RUN(writeback_never_acknowledges_missing_ancestry_or_busy_physical_pi);
 	UT_RUN(writeback_reply_is_retired_and_retries_only_transport_refusal);
+	UT_RUN(checkpointer_partial_registry_scan_keeps_original_owner_active);
+	UT_RUN(checkpointer_nonempty_round_hint_is_consumed_at_wrap);
+	UT_RUN(checkpointer_scan_hint_cannot_outlive_gate_or_owner);
 	UT_RUN(checkpointer_batch_reaches_actual_local_and_remote_physical_owners);
 	UT_RUN(checkpointer_releases_pending_batch_before_native_checkpoint);
 	UT_RUN(checkpointer_discharges_recovered_writer_without_remote_physical_ack);

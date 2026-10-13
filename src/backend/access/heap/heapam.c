@@ -2868,7 +2868,9 @@ heapgetpage(TableScanDesc sscan, BlockNumber block)
 	 * full page write. Until we can prove that beyond doubt, let's check each
 	 * tuple for visibility the hard way.
 	 */
-	all_visible = PageIsAllVisible(page) && !snapshot->takenDuringRecovery;
+	/* PGRAC: shared pages always use the original precise tuple check. */
+	all_visible = !cluster_heap_maintenance_restricted(scan->rs_base.rs_rd) &&
+		PageIsAllVisible(page) && !snapshot->takenDuringRecovery;
 
 	for (lineoff = FirstOffsetNumber; lineoff <= lines; lineoff++)
 	{
@@ -6100,7 +6102,7 @@ void
 heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 			int options, BulkInsertState bistate)
 {
-	TransactionId xid = GetCurrentTransactionId();
+	TransactionId xid;
 	HeapTuple	heaptup;
 	Buffer		buffer;
 	Buffer		vmbuffer = InvalidBuffer;
@@ -6126,6 +6128,14 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	uint64		undo_prepare_deadline_us = 0;
 	TransactionId canonical_xid = InvalidTransactionId;
 #endif
+
+	/* PGRAC: reject before acquiring a bulk lease or preparing tuple bytes. */
+	if ((options & HEAP_INSERT_FROZEN) && cluster_heap_maintenance_restricted(relation))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("frozen insertion is not supported for shared heaps"),
+				 errhint("Use COPY or INSERT without freezing tuples.")));
+	xid = GetCurrentTransactionId();
 
 	/* Cheap, simplistic check that the tuple matches the rel's rowtype. */
 	Assert(HeapTupleHeaderGetNatts(tup->t_data) <=
@@ -6857,7 +6867,7 @@ void
 heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 				  CommandId cid, int options, BulkInsertState bistate)
 {
-	TransactionId xid = GetCurrentTransactionId();
+	TransactionId xid;
 	HeapTuple  *heaptuples;
 	int			i;
 	int			ndone;
@@ -6877,6 +6887,14 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	ClusterSpaceIdentity cluster_page_identity;
 	RfPageProducerBatchV1 cluster_page_versions;
 #endif
+
+	/* PGRAC: reject before acquiring a bulk lease or preparing tuple bytes. */
+	if ((options & HEAP_INSERT_FROZEN) && cluster_heap_maintenance_restricted(relation))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("frozen insertion is not supported for shared heaps"),
+				 errhint("Use COPY or INSERT without freezing tuples.")));
+	xid = GetCurrentTransactionId();
 
 	/* currently not needed (thus unsupported) for heap_multi_insert() */
 	Assert(!(options & HEAP_INSERT_NO_LOGICAL));
@@ -7092,7 +7110,10 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 									   vmbuffer, VISIBILITYMAP_VALID_BITS);
 		}
 		else if (all_frozen_set)
+		{
+			Assert(!cluster_heap_maintenance_restricted(relation));
 			PageSetAllVisible(page);
+		}
 
 		/*
 		 * XXX Should we set PageSetPrunable on this page ? See heap_insert()
@@ -7239,6 +7260,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		 */
 		if (all_frozen_set)
 		{
+			Assert(!cluster_heap_maintenance_restricted(relation));
 			Assert(PageIsAllVisible(page));
 			Assert(visibilitymap_pin_ok(BufferGetBlockNumber(buffer), vmbuffer));
 
@@ -20499,6 +20521,13 @@ heap_freeze_execute_prepared(Relation rel, Buffer buffer,
 		&& rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
 		&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1;
 #endif
+
+	/* PGRAC: reject before transaction checks or tuple changes. */
+	if (cluster_heap_maintenance_restricted(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("freezing shared heap tuples is not supported"),
+				 errhint("Run VACUUM for supported maintenance without advancing freeze cutoffs.")));
 
 	Assert(ntuples > 0);
 

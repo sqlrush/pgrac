@@ -249,6 +249,14 @@ rf_side_online_plan_seal_v1(RfSideOnlinePlanV1 *plan)
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
+bool
+rf_side_online_plan_page_lifecycle_v1(const RfSideOnlinePlanV1 *plan,
+									const RfPageOnlineTargetViewV1 *target)
+{
+	/* This fixture creates recovery plans only. */
+	abort();
+}
+
 void
 rf_side_online_plan_destroy_v1(RfSideOnlinePlanV1 **plan)
 {

@@ -796,6 +796,13 @@ cluster_lms_outbound_resource_x_intent_pump(void)
 			break;
 		if (probe_result == RESOURCE_X_INTENT_PROBE_MORE)
 			continue;
+		if (probe_result == RESOURCE_X_INTENT_PROBE_MASTER_DURABLE) {
+			ResourceXMasterDurableWork work;
+
+			memcpy(&work, payload, sizeof(work));
+			(void)cluster_gcs_block_resource_x_master_durable_tick(&work);
+			continue;
+		}
 		if (probe_result == RESOURCE_X_INTENT_PROBE_DELIVERY) {
 			/* A local callback is not a packet and consumes the same bounded
 			 * call budget. BUSY waits for the existing event-loop tick. */

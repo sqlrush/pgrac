@@ -6339,6 +6339,7 @@ static WalTestRecord test_checkpoint_prefix;
 static char test_checkpoint_prefix_path[MAXPGPATH];
 static ClusterWalSourceRef test_restart_ref;
 static bool test_restart_ref_valid;
+static uint64 test_initialized_writer_epoch;
 static unsigned checkpoint_observations;
 static ClusterControlRootSnapshot checkpoint_observed;
 static XLogRecPtr checkpoint_observed_redo;
@@ -6367,6 +6368,17 @@ cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 {
 	*out = test_checkpoint_prefix_ref;
 	return test_wal_validated;
+}
+
+bool
+cluster_wal_thread_initialized_writer_matches(const ClusterWalSourceRef *expected, uint64 epoch)
+{
+	ClusterWalSourceRef current;
+	/* The shared-memory publication boundary; the fixture below consumes real
+	 * INITIALIZED inputs and performs the original native checkpoint/INSTALL. */
+	return expected != NULL && epoch != 0 && test_initialized_writer_epoch == epoch
+		   && cluster_wal_thread_current_v2_ref(&current)
+		   && memcmp(expected, &current, sizeof(current)) == 0;
 }
 
 static void v2_checkpoint_append_noop(void);
@@ -21876,6 +21888,89 @@ UT_TEST(test_wal_inputs_missing_peer_or_pending_never_partial)
 	MyBackendType = B_INVALID;
 }
 
+UT_TEST(test_wal_inputs_initialized_predecessor_needs_exact_installed_origin)
+{
+	ClusterWalInputsV1 *inputs = NULL;
+	ClusterWalSourceRef current = { 0 }, prior = { 0 }, saved, bad;
+	uint64 epoch;
+
+	/* Real creation ROOT, immutable INITIALIZED inputs, native checkpoints and
+	 * INSTALL for the complete sparse cohort; no prior admitted exit exists. */
+	test_first_start_binds_original_inputs_without_clean_exit();
+	if (ut_current_failed)
+		return;
+	cluster_node_id = 0;
+	MyBackendType = B_BG_WRITER;
+	inputs_pin_held = inputs_pin_refuse = inputs_pin_race = inputs_pin_throw = false;
+	inputs_pin_current = true;
+	inputs_exit_valid = false;
+	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs), 0);
+	if (inputs == NULL)
+		return;
+	for (uint32 i = 0; i < cluster_wal_inputs_count_v1(inputs); i++) {
+		const ClusterWalInputV1 *item = cluster_wal_inputs_at_v1(inputs, i);
+		if (item->source.claim.identity.origin_node_id == 0) {
+			if (item->current)
+				current = item->source;
+			else
+				prior = item->source;
+		}
+	}
+	UT_ASSERT_EQ(prior.claim.identity.root_lineage_seq, 1);
+	UT_ASSERT_EQ(current.claim.identity.root_lineage_seq, 2);
+	test_self_incarnation = current.claim.identity.origin_owner_incarnation;
+	test_checkpoint_prefix_ref = current;
+	test_restart_ref = prior;
+	test_restart_ref_valid = test_wal_validated = true;
+	epoch = test_epoch;
+	test_initialized_writer_epoch = epoch;
+	UT_ASSERT(cluster_wal_inputs_local_predecessor_retired_v1(inputs, &prior, &current));
+	/* CLOSED/lineage alone, CLEAN INSTALL, another epoch or an unavailable
+	 * publication cannot qualify a never-served predecessor. */
+	test_initialized_writer_epoch = 0;
+	UT_ASSERT(!cluster_wal_inputs_local_predecessor_retired_v1(inputs, &prior, &current));
+	test_initialized_writer_epoch = epoch + 1;
+	UT_ASSERT(!cluster_wal_inputs_local_predecessor_retired_v1(inputs, &prior, &current));
+	test_initialized_writer_epoch = epoch;
+	test_wal_validated = false;
+	UT_ASSERT(!cluster_wal_inputs_local_predecessor_retired_v1(inputs, &prior, &current));
+	test_wal_validated = true;
+	test_restart_ref_valid = false;
+	UT_ASSERT(!cluster_wal_inputs_local_predecessor_retired_v1(inputs, &prior, &current));
+	test_restart_ref_valid = true;
+	saved = test_restart_ref;
+	test_restart_ref.claim.claim_sha256[0] ^= 1;
+	UT_ASSERT(!cluster_wal_inputs_local_predecessor_retired_v1(inputs, &prior, &current));
+	test_restart_ref = saved;
+	test_restart_ref.claim.identity.origin_owner_incarnation++;
+	UT_ASSERT(!cluster_wal_inputs_local_predecessor_retired_v1(inputs, &prior, &current));
+	test_restart_ref = saved;
+	bad = prior;
+	bad.claim.claim_sha256[0] ^= 1;
+	UT_ASSERT(!cluster_wal_inputs_local_predecessor_retired_v1(inputs, &bad, &current));
+	bad = current;
+	bad.claim.identity.origin_node_id++;
+	UT_ASSERT(!cluster_wal_inputs_local_predecessor_retired_v1(inputs, &prior, &bad));
+	test_checkpoint_prefix_ref.claim.claim_sha256[0] ^= 1;
+	UT_ASSERT(!cluster_wal_inputs_local_predecessor_retired_v1(inputs, &prior, &current));
+	test_checkpoint_prefix_ref = current;
+	/* A changed epoch during the qualification cannot escape as success. */
+	test_change_epoch_read = test_epoch_reads + 2;
+	UT_ASSERT(!cluster_wal_inputs_local_predecessor_retired_v1(inputs, &prior, &current));
+	test_change_epoch_read = 0;
+	test_epoch = epoch;
+	UT_ASSERT_EQ(cluster_wal_inputs_suspend_v1(inputs), 0);
+	UT_ASSERT(!cluster_wal_inputs_local_predecessor_retired_v1(inputs, &prior, &current));
+	UT_ASSERT_EQ(cluster_wal_inputs_resume_v1(inputs), 0);
+	UT_ASSERT(cluster_wal_inputs_local_predecessor_retired_v1(inputs, &prior, &current));
+	inputs_pin_current = false;
+	UT_ASSERT(!cluster_wal_inputs_local_predecessor_retired_v1(inputs, &prior, &current));
+	inputs_pin_current = true;
+	cluster_wal_inputs_release_v1(&inputs);
+	test_initialized_writer_epoch = 0;
+	MyBackendType = B_INVALID;
+}
+
 UT_TEST(test_wal_inputs_installed_predecessor_needs_exact_original_exit)
 {
 	ClusterWalInputsV1 *inputs = NULL;
@@ -22560,7 +22655,7 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_WAL_INPUTS") != NULL) {
-		UT_PLAN(35);
+		UT_PLAN(36);
 		UT_RUN(test_wal_inputs_cold_all_origins_exact_native_anchor);
 		UT_RUN(test_wal_inputs_cold_retained_generations_remain_distinct);
 		UT_RUN(test_wal_inputs_cold_terminal_and_pending_are_not_checkpoint_sources);
@@ -22587,6 +22682,7 @@ main(int argc, char **argv)
 		UT_RUN(test_wal_inputs_all_origins_exact_native_anchor);
 		UT_RUN(test_wal_inputs_missing_peer_or_pending_never_partial);
 		UT_RUN(test_wal_inputs_installed_predecessor_needs_exact_original_exit);
+		UT_RUN(test_wal_inputs_initialized_predecessor_needs_exact_installed_origin);
 		UT_RUN(test_wal_inputs_recovered_prefix_requires_exact_terminal_and_source);
 		UT_RUN(test_wal_inputs_recovered_prefix_never_outlives_original_scope);
 		UT_RUN(test_wal_inputs_recovered_owner_requires_installed_contiguous_history);
@@ -22612,7 +22708,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(447);
+	UT_PLAN(448);
 	UT_RUN(test_checkpoint_cf_refusal_cannot_hide_staging_discard_failure);
 	UT_RUN(test_clean_restart_without_provider_keeps_collective_exit_and_actual_install);
 	UT_RUN(test_clean_restart_without_provider_refuses_missing_exit_formation_and_fence);
@@ -22683,6 +22779,7 @@ main(int argc, char **argv)
 	UT_RUN(test_wal_inputs_all_origins_exact_native_anchor);
 	UT_RUN(test_wal_inputs_missing_peer_or_pending_never_partial);
 	UT_RUN(test_wal_inputs_installed_predecessor_needs_exact_original_exit);
+	UT_RUN(test_wal_inputs_initialized_predecessor_needs_exact_installed_origin);
 	UT_RUN(test_wal_inputs_recovered_prefix_requires_exact_terminal_and_source);
 	UT_RUN(test_wal_inputs_recovered_prefix_never_outlives_original_scope);
 	UT_RUN(test_wal_inputs_recovered_owner_requires_installed_contiguous_history);

@@ -312,4 +312,32 @@ UT_TEST(test_records_tt_slot_stamps_are_keyed)
 	}
 }
 
+
+/* Retiring the directory's PI first-record pin must not retire the original
+ * TT or structure owner. The actual census recomputes both source cuts. */
+UT_TEST(test_pi_pin_removal_keeps_independent_side_and_structure)
+{
+	for (int structure = 0; structure < 2; structure++) {
+		uint32 self, peer;
+		ClusterWalRetainedCutV1 before, after;
+		RfPageProofDetailV1 detail;
+		static const RelFileNumber drops[] = { 16384 };
+		rec_two_writers(&self, &peer);
+		rec_commit(self, 0x1800, 0x1900, 801, structure ? drops : NULL, structure ? 1 : 0,
+				   structure, structure ? 0 : 3);
+		if (!structure)
+			rec_commit(self, 0x3200, 0x3300, 802, NULL, 0, false, 0);
+		record_pi_floor.floor = 0x1400;
+		record_pi_floor.bounded = 1;
+		UT_ASSERT_EQ(compute_for(self, &before, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(before.lower, 0x1400);
+		memset(&record_pi_floor, 0, sizeof(record_pi_floor));
+		UT_ASSERT_EQ(compute_for(self, &after, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(after.local_pi_bounded, 0);
+		UT_ASSERT_EQ(after.lower, 0x1800);
+		UT_ASSERT_EQ(after.pin, structure ? CLUSTER_WAL_RETAINED_PIN_STRUCTURE : CLUSTER_WAL_RETAINED_PIN_SIDE);
+		UT_ASSERT(after.lower < after.native_redo);
+	}
+}
+
 #endif /* TEST_CLUSTER_WAL_RETAINED_CUT_RECORDS_CASES_H */

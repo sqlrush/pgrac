@@ -526,9 +526,17 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 	UT_ASSERT(lock == &mapping);
 	if (mode == LW_EXCLUSIVE && pi_discard_race != 0) {
 		if (pi_discard_race == 1)
-			pg_atomic_fetch_add_u64(&own[1].generation, 1);
+			pg_atomic_fetch_add_u64(&own[data_slot].generation, 1);
 		else if (pi_discard_race == 2)
-			pg_atomic_fetch_add_u32(&descriptors[1].bufferdesc.state, 1);
+			pg_atomic_fetch_add_u32(&descriptors[data_slot].bufferdesc.state, 1);
+		else if (pi_discard_race == 4)
+			pg_atomic_fetch_or_u32(&descriptors[data_slot].bufferdesc.state, BM_DIRTY);
+		else if (pi_discard_race == 5)
+			pg_atomic_write_u32(&own[data_slot].flags, PCM_OWN_FLAG_REVOKING);
+		else if (pi_discard_race == 6)
+			descriptors[data_slot].bufferdesc.pcm_state = PCM_STATE_X;
+		else if (pi_discard_race == 7)
+			descriptors[data_slot].bufferdesc.tag.relNumber++;
 		else
 			((PageHeader)pages[1].data)->pd_block_scn++;
 		pi_discard_race = 0;
@@ -2429,7 +2437,7 @@ physical_pi_newer_than_actual_data_is_not_discarded(void)
 static void
 missing_pi_cannot_confirm_nonterminal_data(void)
 {
-	for (int current = 0; current < 3; current++) {
+	for (int current = 0; current < 4; current++) {
 		ClusterWalSourceRef sources[3];
 		ClusterPcmPiStorageCutV1 storage_cut;
 		ClusterPcmPiWriteCutV1 cut, verified;
@@ -2451,6 +2459,10 @@ missing_pi_cannot_confirm_nonterminal_data(void)
 		else if (current == 2) {
 			descriptors[1].bufferdesc.pcm_state = PCM_STATE_S;
 			descriptors[1].bufferdesc.buffer_type = BUF_TYPE_SCUR;
+		} else if (current == 3) {
+			/* A released mirror requires the same complete terminal proof. */
+			physical_pi_from_source(&sources[0], 80);
+			pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_VALID);
 		}
 		UT_ASSERT_EQ(cluster_bufmgr_discard_pi_at_data_v1(receipt, plan, sources, 3),
 					 CLUSTER_PI_PHYSICAL_RETRY);
@@ -4875,6 +4887,78 @@ space_data_qualifies_original_physical_and_logical_pi(void)
 }
 
 static void
+space_released_mirror_requires_terminal_data_and_exact_eviction(void)
+{
+	for (int block = 0; block < 2; block++)
+		for (int fault = 0; fault < 19; fault++) {
+			ClusterWalSourceRef sources[2];
+			ClusterPageWalBindingV1 ancestor, ordinary;
+			ClusterPageDataReceiptV1 *receipt = NULL;
+			ClusterPcmPiWriteCutV1 cut;
+			ClusterThreadRecoveryFabricPlanV1 *fabric;
+			const RfPageOnlinePlanV1 *page;
+			BufferDesc *buf;
+			uint32 state;
+			unsigned prior_writes, prior_syncs;
+
+			space_receipt_setup(block, sources, &ancestor);
+			fabric = space_contribution_plan(sources, fault == 18, false, true);
+			page = cluster_thread_recovery_fabric_page_plan_v1(fabric);
+			cut = data_pi_cut();
+			UT_ASSERT(cluster_bufmgr_write_page_data_at_cut_v1(&target, &cut, &receipt));
+			UT_ASSERT(cluster_page_data_bind_plan_v1(receipt, fabric));
+			space_physical_pi(&ancestor, 0);
+			buf = &descriptors[data_slot].bufferdesc;
+			/* Original release keeps a frozen VALID N+PI mirror under a prior
+			 * pin. That pin then drains; it does not retag or rewrite the image. */
+			state = pg_atomic_read_u32(&buf->state) | BM_VALID | 1;
+			UT_ASSERT(!cluster_pcm_x_retained_release_retag(&buf->buffer_type, &state));
+			pg_atomic_write_u32(&buf->state, state - 1);
+			/* This is still not the ordinary !VALID PI projection. */
+			state = LockBufHdr(buf);
+			UT_ASSERT(!cluster_page_wal_pi_snapshot_locked_v1(buf, &ordinary));
+			UnlockBufHdr(buf, state);
+			if (fault == 1) pg_atomic_fetch_add_u32(&buf->state, 1);
+			if (fault == 2) pg_atomic_fetch_or_u32(&buf->state, BM_DIRTY);
+			if (fault == 3) pg_atomic_fetch_or_u32(&buf->state, BM_JUST_DIRTIED);
+			if (fault == 4) pg_atomic_fetch_or_u32(&buf->state, BM_CHECKPOINT_NEEDED);
+			if (fault == 5) pg_atomic_fetch_or_u32(&buf->state, BM_IO_IN_PROGRESS);
+			if (fault == 6) pg_atomic_fetch_or_u32(&buf->state, BM_IO_ERROR);
+			if (fault == 7) pg_atomic_write_u32(&own[data_slot].flags, PCM_OWN_FLAG_REVOKING);
+			if (fault == 8) pg_atomic_write_u64(&own[data_slot].writer_activation_token, 17);
+			if (fault == 9) pg_atomic_write_u64(&own[data_slot].resource_x_activation_generation, 17);
+			if (fault == 10) pg_atomic_write_u64(&own[data_slot].delivery_attempt, 17);
+			if (fault == 11) pi_discard_race = 1;
+			if (fault == 12) pi_discard_race = 2;
+			if (fault == 13) pi_discard_race = 4;
+			if (fault == 14) pi_discard_race = 5;
+			if (fault == 15) pi_discard_race = 6;
+			if (fault == 16) pi_discard_race = 7;
+			if (fault == 17) buf->buffer_type = BUF_TYPE_CURRENT;
+			/* The extra SPACE1 operation affects only that block's terminal. */
+			prior_writes = writes;
+			prior_syncs = syncs;
+			UT_ASSERT_EQ(cluster_bufmgr_discard_pi_at_data_v1(receipt, page, sources, 2),
+				(fault == 0 || (fault == 18 && block == 0))
+					? CLUSTER_PI_PHYSICAL_DISCARDED : CLUSTER_PI_PHYSICAL_RETRY);
+			UT_ASSERT_EQ(pi_discards, fault == 0 || (fault == 18 && block == 0) ? 1 : 0);
+			UT_ASSERT_EQ(resident[data_slot], pi_discards == 0);
+			UT_ASSERT_EQ(writes, prior_writes);
+			UT_ASSERT_EQ(syncs, prior_syncs);
+			UT_ASSERT_EQ(logical_pi_retire_calls, 0);
+			if (fault == 5) {
+				UT_ASSERT(pg_atomic_read_u32(&buf->state) & BM_IO_IN_PROGRESS);
+				/* Finish only the fixture's simulated external I/O before its
+				 * usual cleanup; the physical consumer left it untouched. */
+				pg_atomic_fetch_and_u32(&buf->state, ~BM_IO_IN_PROGRESS);
+			}
+			cluster_page_data_receipt_free_v1(&receipt);
+			cluster_thread_recovery_fabric_plan_destroy_v1(&fabric);
+			clean();
+		}
+}
+
+static void
 space_data_rejects_missing_or_substituted_original_contribution(void)
 {
 	for (int fault = 0; fault < 9; fault++) {
@@ -5169,7 +5253,7 @@ int
 main(void)
 {
 #ifndef PGRAC_TEST_REAL_PI_WRITEBACK
-	UT_PLAN(76);
+	UT_PLAN(77);
 	UT_RUN(structural_remote_ack_import_binds_original_inputs_and_cut);
 	UT_RUN(structural_remote_ack_refuses_transport_input_and_collector_drift);
 	UT_RUN(structural_remote_notice_uses_actual_plan_and_peer_physical_owner);
@@ -5196,6 +5280,7 @@ main(void)
 	UT_RUN(space_storage_requires_exact_terminal_and_unchanged_master_cut);
 	UT_RUN(space_storage_io_errors_never_export_or_leak_identity);
 	UT_RUN(space_data_qualifies_original_physical_and_logical_pi);
+	UT_RUN(space_released_mirror_requires_terminal_data_and_exact_eviction);
 	UT_RUN(space_data_rejects_missing_or_substituted_original_contribution);
 	UT_RUN(space_absent_replaced_and_successor_pi_require_per_block_terminal);
 	UT_RUN(remote_space_receipt_rebinds_receiver_plan_before_physical_ack);

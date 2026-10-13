@@ -85,6 +85,8 @@
  * No wire ownership or foreground success is implied by this result. */
 extern ResourceXApplyResult
 cluster_gcs_block_resource_x_delivery_tick(const ResourceXAcquisitionRef *ref);
+extern ResourceXApplyResult
+cluster_gcs_block_resource_x_master_durable_tick(const ResourceXMasterDurableWork *work);
 
 /* One bounded source-side callback; claims the existing continuous pin. */
 extern ResourceXApplyResult

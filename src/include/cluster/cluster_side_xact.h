@@ -46,6 +46,12 @@ typedef struct RfSideXactOperationV1 {
 	uint32 completion_payload_length;
 	uint32 space_drop_count;
 	uint32 space_drop_offset;
+	/* Read-only classification retains the complete native payload. These
+	 * fields never certify delivery, a terminal projection, or retirement. */
+	bool pi_read_only;
+	uint32 invalidation_kinds;
+	uint32 invalidation_count;
+	uint32 relation_count;
 	uint8 prepare_binding[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES];
 	char prepare_gid[GIDSIZE];
 	uint16 prepared_record_version;
@@ -59,6 +65,9 @@ typedef struct RfSideXactOperationV1 {
 extern bool rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier,
 								   uint16 origin_thread, RfSideXactOperationV1 *out);
 extern bool rf_side_xact_structural_preflight_v1(const RfSideXactOperationV1 *operation);
+extern bool rf_side_xact_inspect_pi_v1(XLogReaderState *record, uint64 system_identifier,
+									uint16 origin_thread, RfSideXactOperationV1 *out);
+extern bool rf_side_xact_inspection_preflight_v1(const RfSideXactOperationV1 *operation);
 /* Every xinfo section of a COMMIT/ABORT lies within its main data and no
  * unknown or misplaced section is present. */
 extern bool rf_side_xact_completion_shape_v1(XLogReaderState *record, bool commit);

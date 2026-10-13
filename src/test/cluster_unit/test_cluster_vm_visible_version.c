@@ -36,6 +36,9 @@
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
 #include "unit_test.h"
+#include "cluster/cluster_mode.h"
+#include "access/visibilitymap.h"
+#include "test_cluster_heap_maintenance_policy.inc"
 
 UT_DEFINE_GLOBALS();
 
@@ -108,6 +111,13 @@ errmsg(const char *format, ...)
 	(void)format;
 	return 0;
 }
+int
+errhint(const char *format, ...)
+{
+	(void)format;
+	return 0;
+}
+
 int
 errcode(int code)
 {
@@ -369,20 +379,22 @@ UT_TEST(test_versioned_visible_keeps_heap_full_page_protection)
 		}
 	}
 }
-UT_TEST(test_visible_heap_flag_changes_only_after_capture)
+UT_TEST(test_shared_visible_refuses_before_locks_or_capture)
 {
 	for (int bits = 0; bits <= VISIBILITYMAP_VALID_BITS; bits++) {
 		reset(true, false, bits);
-		visibilitymap_set(&relation, 0, 1, InvalidXLogRecPtr, 2, 70, VISIBILITYMAP_VALID_BITS,
-						  &identity);
-		UT_ASSERT(PageIsAllVisible(pages[0].data));
-		UT_ASSERT_EQ(edge_count, 2);
-		UT_ASSERT_EQ(lock_calls, 2);
-		UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 101);
-		UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, 101);
-		UT_ASSERT_EQ(CritSectionCount, 0);
+		expecting_error = true;
+		if (setjmp(error_jump) == 0) {
+			visibilitymap_set(&relation, 0, 1, InvalidXLogRecPtr, 2, 70,
+							  VISIBILITYMAP_VALID_BITS, &identity);
+			UT_ASSERT(false);
+		}
+		expecting_error = false;
+		UT_ASSERT_EQ(edge_count + lock_calls + inserts + CritSectionCount, 0);
+		UT_ASSERT_EQ(memcmp(pages, before, sizeof(pages)), 0);
 	}
 }
+
 UT_TEST(test_bad_component_refuses_before_either_page_changes)
 {
 	for (int variant = 0; variant < 10; variant++) {
@@ -452,6 +464,7 @@ run_actual_visibility_repair(bool lpdead)
 		Relation rel;
 		const char *relname;
 		bool versioned;
+		bool shared_maintenance_restricted;
 		ClusterSpaceIdentity identity;
 	} state, *vacrel = &state;
 	Buffer buf pg_attribute_unused() = 1, vmbuffer = 2;
@@ -536,6 +549,7 @@ UT_TEST(test_actual_empty_vacuum_does_not_acquire_vm_in_critical)
 	struct {
 		Relation rel;
 		bool versioned;
+		bool shared_maintenance_restricted;
 		ClusterSpaceIdentity identity;
 	} state, *vacrel = &state;
 	/* Native caller locals bind the extracted branch, not a new fixture scope. */
@@ -550,13 +564,14 @@ UT_TEST(test_actual_empty_vacuum_does_not_acquire_vm_in_critical)
 	reset(true, false, 0);
 	vacrel->rel = &relation;
 	vacrel->versioned = true;
+	vacrel->shared_maintenance_restricted = true;
 	vacrel->identity = identity;
 	expected_cutoff = InvalidTransactionId;
 #include "test_cluster_vm_visible_empty.inc"
-	UT_ASSERT_EQ(lock_calls, 2);
-	UT_ASSERT_EQ(edge_count, 2);
-	UT_ASSERT_EQ(inserts, 1);
-	UT_ASSERT(PageIsAllVisible(page));
+	UT_ASSERT_EQ(lock_calls, 0);
+	UT_ASSERT_EQ(edge_count, 0);
+	UT_ASSERT_EQ(inserts, 0);
+	UT_ASSERT(!PageIsAllVisible(page));
 	UT_ASSERT_EQ(CritSectionCount, 0);
 }
 
@@ -568,7 +583,7 @@ main(void)
 	UT_RUN(test_no_change_allocates_no_version);
 	UT_RUN(test_nonshared_preserves_native_hint_lsn_rules);
 	UT_RUN(test_versioned_visible_keeps_heap_full_page_protection);
-	UT_RUN(test_visible_heap_flag_changes_only_after_capture);
+	UT_RUN(test_shared_visible_refuses_before_locks_or_capture);
 	UT_RUN(test_bad_component_refuses_before_either_page_changes);
 	UT_RUN(test_recovery_uses_record_lsn_without_runtime_identity_or_wal);
 	UT_RUN(test_actual_empty_vacuum_does_not_acquire_vm_in_critical);

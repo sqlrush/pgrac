@@ -58,6 +58,7 @@
 #include "cluster/cluster_recovery_duty.h" /* thread clean-close publish (RF-ROOT P6) */
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_cut.h"
 #include "cluster/cluster_shared_config.h" /* PGRAC: idle common-value retry */
 #include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_ko.h"
@@ -767,6 +768,11 @@ CheckpointerMain(void)
 			cur_timeout = Min(cur_timeout, XLogArchiveTimeout - elapsed_secs);
 		}
 
+#ifdef USE_PGRAC_CLUSTER
+		/* A confirmed WALR release may have consumed an earlier cut wake. */
+		if (cluster_wal_cut_consume_completion_v1())
+			SetLatch(MyLatch);
+#endif
 		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 #ifdef USE_PGRAC_CLUSTER
 						cluster_enabled && cluster_shared_config

@@ -339,8 +339,8 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 	return true;
 }
 
-bool
-cluster_undo_preflight(const ClusterUndoDecoded *decoded)
+static bool
+cluster_undo_preflight_for_use(const ClusterUndoDecoded *decoded, bool pi_inspection)
 {
 	ClusterSideRouteRow route;
 	uint16 opcode;
@@ -408,7 +408,9 @@ cluster_undo_preflight(const ClusterUndoDecoded *decoded)
 		break;
 	case CLUSTER_UNDO_KIND_TT_CTRC_RELEASE:
 		if (decoded->slot_offset >= TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(decoded->xid)
-			|| decoded->expected_generation == 0 || decoded->wrap == TT_WRAP_INVALID
+			|| (pi_inspection ? decoded->expected_generation == UINT32_MAX
+							  : decoded->expected_generation == 0)
+			|| decoded->wrap == TT_WRAP_INVALID
 			|| decoded->cluster_epoch == 0 || decoded->root_id == 0 || decoded->root_generation == 0
 			|| decoded->formation_epoch == 0 || decoded->admission_record_generation == 0
 			|| decoded->seal_generation == 0 || decoded->touched_nodes_high != 0
@@ -442,6 +444,28 @@ cluster_undo_preflight(const ClusterUndoDecoded *decoded)
 		break;
 	}
 	return true;
+}
+
+bool
+cluster_undo_preflight(const ClusterUndoDecoded *decoded)
+{
+	return cluster_undo_preflight_for_use(decoded, false);
+}
+
+bool
+cluster_undo_inspect_pi(const ClusterUndoDecoded *decoded)
+{
+	/* Initial segment generation zero is an exact historical identity.
+	 * Execution still crosses the unchanged stricter transition gate. */
+	uint8 digest = 0;
+
+	if (!cluster_undo_preflight_for_use(decoded, true))
+		return false;
+	if (decoded->kind != CLUSTER_UNDO_KIND_TT_CTRC_RELEASE)
+		return true;
+	for (Size i = 0; i < sizeof(decoded->ack_set_digest); i++)
+		digest |= decoded->ack_set_digest[i];
+	return digest != 0;
 }
 
 /* Byte preparation only. The caller supplies the exact origin's retained WAL,

@@ -8,10 +8,12 @@
 
 #include "access/xlog.h"
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_wal_retention.h"
+#include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_wal_cut.h"
 #include "common/cryptohash.h"
@@ -249,6 +251,22 @@ cluster_wal_inputs_local_predecessor_retired_v1(ClusterWalInputsV1 *inputs,
 	lower = old->source.claim.identity.root_lineage_seq;
 	if (lower == 0 || lower >= lineage || lineage - lower > inputs->count)
 		return false;
+	/* The original creation input was never an admitted writer and therefore
+	 * has no prior-exit vote. Its actual INITIALIZED INSTALL publishes a
+	 * separate, epoch-bound qualification; bind it to the immutable restart
+	 * source and the complete selected inputs. CLOSED/lineage alone cannot
+	 * establish this alternative, and CLEAN INSTALL never qualifies here. */
+	if (lower == 1 && lineage == 2 && old->kind == CLUSTER_WAL_INPUT_CHECKPOINT
+		&& old->checkpoint.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
+		&& old->checkpoint.checkpoint_source_kind == CLUSTER_CONTROL_ROOT_CHECKPOINT_NATIVE_V1) {
+		ClusterWalSourceRef restart;
+		uint64 epoch = cluster_epoch_get_current();
+
+		if (cluster_wal_thread_initialized_writer_matches(writer, epoch)
+			&& cluster_wal_thread_restart_v2_ref(&restart)
+			&& memcmp(&restart, predecessor, sizeof(restart)) == 0)
+			return inputs_current(inputs) && cluster_epoch_get_current() == epoch;
+	}
 	/* Native INSTALL atomically selects the successor and retains the full
 	 * CLOSED predecessor union after consuming the original clean exit.
 	 * Anchor that chain at the actual prior-exit witness for this boot; no
@@ -951,6 +969,7 @@ inputs_contribution_build(ClusterWalInputsV1 *inputs, bool space_active, WalCont
 	request.participant_count = work->count;
 	request.retention_binding_cookie = (uint64)(uintptr_t)inputs;
 	request.space_active = space_active;
+	request.purpose = RF_SIDE_PLAN_PI_CONTRIBUTIONS;
 	/* NULL redo_starts deliberately keeps every retained contribution.
 	 * This graph cannot authorize replay; native recovery has a different
 	 * owner and must select its same-anchor actual redo start. */

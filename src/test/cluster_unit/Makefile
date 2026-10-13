@@ -53,7 +53,7 @@ CLUSTER_UNIT_CRYPTOHASH_O = $(top_builddir)/src/common/cryptohash.o \
 endif
 
 # Test source files (each becomes a standalone executable)
-TESTS = test_cluster_vacuum_shared_mx test_cluster_heap_cr_reuse test_cluster_buffer_cr test_cluster_buffer_mapping test_cluster_pi_contribution_stream test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_formation_restart test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
+TESTS = test_cluster_vm_read_visibility test_cluster_heap_maintenance test_cluster_vacuum_shared_mx test_cluster_heap_cr_reuse test_cluster_buffer_cr test_cluster_buffer_mapping test_cluster_pi_contribution_stream test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_formation_restart test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
         test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_catalog_manifest test_cluster_catalog_init test_cluster_catalog_startup test_cluster_initdb_tree test_cluster_initdb_cohort \
         test_pgrac_control_binding test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker test_pgrac_fenced_cib \
         test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter \
@@ -180,6 +180,7 @@ TESTS = test_cluster_vacuum_shared_mx test_cluster_heap_cr_reuse test_cluster_bu
 		test_cluster_page_anchor_cache \
 		test_cluster_page_stable_base \
 		test_cluster_side_xact \
+		test_cluster_pi_contribution \
 		test_cluster_side_online_owner \
         test_cluster_cf_storage \
         test_cluster_cf_enqueue \
@@ -477,7 +478,7 @@ CLUSTER_BLOCK_APPLY_O = $(top_builddir)/src/backend/cluster/cluster_block_apply.
 		test_cluster_block_apply_btree_product.o
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_stable_base,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_side_xact,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_side_xact test_cluster_pi_contribution,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_side_online_owner test_cluster_remote_xact_writer,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_enqueue,$(SIMPLE_TESTS))
 # PGRAC: real configuration object tests have their own link rule.
@@ -566,6 +567,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_startup_exit,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_members,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_mount,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_vacuum_shared_mx,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_heap_maintenance test_cluster_vm_read_visibility,$(SIMPLE_TESTS))
 
 # PGRAC: real native-family mount carrier, with process lifecycle boundaries.
 # Author: SqlRush <sqlrush@gmail.com>
@@ -1833,7 +1835,7 @@ test_cluster_vm_visible_wrapper.inc: $(top_srcdir)/src/backend/access/heap/visib
 
 test_cluster_vm_visible_empty.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
 	awk '/Unlike new pages, empty pages/ { inside=1; found++ } \
-	     inside && /if \(!PageIsAllVisible\(page\)\)/ { emit=1 } \
+	     inside && /if \(!vacrel->shared_maintenance_restricted/ { emit=1 } \
 	     emit && /freespace = PageGetHeapFreeSpace/ { emit=inside=0; done++ } \
 	     emit { print } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
@@ -1860,7 +1862,7 @@ test_cluster_vm_repair_lpdead.inc: $(top_srcdir)/src/backend/access/heap/vacuuml
 	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_vm_visible_version: test_cluster_vm_visible_version.c unit_test.h \
+test_cluster_vm_visible_version: test_cluster_vm_visible_version.c test_cluster_heap_maintenance_policy.inc unit_test.h \
 		test_cluster_vm_repair_versioned.inc \
 		test_cluster_vm_repair_clear.inc test_cluster_vm_repair_missing_heap.inc \
 		test_cluster_vm_repair_lpdead.inc \
@@ -1914,7 +1916,7 @@ test_cluster_heap_maintenance_identity.inc: $(top_srcdir)/src/backend/access/hea
 	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c unit_test.h \
+test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c test_cluster_heap_maintenance_policy.inc unit_test.h \
 		test_cluster_heap_maintenance_identity.inc \
 		test_cluster_heap_prune_version.inc test_cluster_heap_prune_helpers.inc \
 		test_cluster_heap_freeze_body.inc test_cluster_heap_freeze_helpers.inc \
@@ -2135,7 +2137,7 @@ test_cluster_vm_redo: test_cluster_vm_redo.c test_cluster_vm_redo_consumers.inc 
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
-test_cluster_heap_insert_version: test_cluster_heap_insert_version.c unit_test.h \
+test_cluster_heap_insert_version: test_cluster_heap_insert_version.c test_cluster_heap_maintenance_policy.inc unit_test.h \
 		test_cluster_heap_multi_version.inc test_cluster_heap_multi_capture.inc \
 		test_cluster_heap_insert_version.inc test_cluster_heap_put_tuple.inc \
 		test_cluster_heap_confirm_version.inc test_cluster_heap_spec_abort_version.inc \
@@ -2273,9 +2275,11 @@ test_cluster_space_recovery_flush.inc: $(top_srcdir)/src/backend/storage/buffer/
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2) exit 1 }' $< > $@
 
 test_cluster_page_data.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
-	awk '/^\/\* PGRAC DATA receipt implementation/ { emit=1; n++ } \
+	awk '/^cluster_bufmgr_pcm_x_retained_image_reuse_blocked_locked\(/ { print "static inline bool"; helper=1; h++ } \
+	     helper { print; if ($$0 ~ /^}/) helper=0; next } \
+	     /^\/\* PGRAC DATA receipt implementation/ { emit=1; n++ } \
 	     emit && /^#endif/ { print; emit=0 } emit { print } \
-	     END { if (n != 1 || emit) exit 1 }' $< > $@
+	     END { if (n != 1 || h != 1 || emit || helper) exit 1 }' $< > $@
 
 # PGRAC: FlushBuffer wraps FlushBufferWithAttempt; declare and extract both.
 test_cluster_page_flush.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
@@ -2844,7 +2848,9 @@ test_cluster_wal_checkpoint_sample: test_cluster_wal_checkpoint_sample.c unit_te
 		test_cluster_wal_checkpoint_sample.inc test_cluster_wal_checkpoint_dump.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
-test_cluster_side_xact: test_cluster_side_xact.c unit_test.h test_cluster_undo_header_identity.inc \
+test_cluster_pi_contribution: test_cluster_page_data_stable.o
+
+test_cluster_side_xact test_cluster_pi_contribution: %: %.c unit_test.h test_cluster_side_xact.c test_cluster_undo_header_identity.inc \
 		test_cluster_side_online_owner_product.o \
 		$(CLUSTER_SIDE_XACT_O) $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
@@ -2856,6 +2862,7 @@ test_cluster_side_xact: test_cluster_side_xact.c unit_test.h test_cluster_undo_h
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
 		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
+		$(filter test_cluster_page_data_stable.o,$^) \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) -lssl -lcrypto -o $@
@@ -4961,8 +4968,14 @@ test_cluster_ges_reply_wait: test_cluster_ges_reply_wait.c unit_test.h \
 		$(CLUSTER_GES_REPLY_WAIT_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+# Use the original cross-process wake contract, including its self-PID guard.
+test_cluster_grd_work_wakeup.inc: $(top_srcdir)/src/backend/cluster/cluster_lmon.c Makefile
+	awk '/^cluster_lmon_wakeup\(/ { print "void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 # P0#3: fixed-capacity, no-overwrite GES cleanup deferred-retry queue.
-test_cluster_grd_outbound: test_cluster_grd_outbound.c unit_test.h \
+test_cluster_grd_outbound: test_cluster_grd_outbound.c unit_test.h test_cluster_grd_work_wakeup.inc \
 		$(CLUSTER_VERSION_O) $(top_srcdir)/src/backend/cluster/cluster_grd_outbound.c \
 		$(top_srcdir)/src/backend/cluster/cluster_grd_work_queue.c \
 		hw_handoff_cluster_control_request.o hw_handoff_cluster_control_retire.o
@@ -5248,6 +5261,17 @@ test_cluster_pcm_lms_intent_pump.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     END { if (probe != 1 || calls != 1 || pump != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_pcm_master_durable.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_resource_x_put_u(32|64)\(/ { print "static void"; emit=1; count++ } \
+	     /^gcs_block_(compute_checksum|pcm_x_resource_x_durable_proof_crc)\(/ { print "static uint32"; emit=1; count++ } \
+	     /^cluster_gcs_block_compute_checksum\(/ { print "uint32"; emit=1; count++ } \
+	     /^gcs_block_resource_x_master_durable_(read|admitted)\(/ { print "static bool"; emit=1; count++ } \
+	     /^gcs_block_pcm_x_resource_x_master_durable_try\(/ { print "static ResourceXApplyResult"; emit=1; count++ } \
+	     /^cluster_gcs_block_resource_x_master_durable_tick\(/ { print "ResourceXApplyResult"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (count != 9 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 # Exercise the actual final LMS0 wait adjustment with the real PCM fixture.
 test_cluster_pcm_lms_intent_wait.inc: $(top_srcdir)/src/backend/cluster/cluster_lms.c Makefile
 	awk '/DATA tick owns separate management\/dispatch brackets/ { emit=1; begin++ } \
@@ -5264,6 +5288,7 @@ test_cluster_pcm_settlement_ingress.inc: $(top_srcdir)/src/backend/cluster/clust
 	mv $@.tmp $@
 
 test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+		test_cluster_pcm_master_durable.inc \
 		test_cluster_pcm_settlement_ingress.inc \
 		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
 		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \
@@ -5673,7 +5698,7 @@ test_cluster_heap_vm_pretoast.inc: $(top_srcdir)/src/backend/access/heap/heapam.
 	     /^}/ { in_update=0 } END { if (found != 1 || complete != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_pcm_aux_mutation: test_cluster_pcm_aux_mutation.c unit_test.h \
+test_cluster_pcm_aux_mutation: test_cluster_pcm_aux_mutation.c test_cluster_heap_maintenance_policy.inc unit_test.h \
 		test_cluster_heap_hio_vm.h test_cluster_heap_hio_vm.inc \
 		test_cluster_heap_lock_vm_needed.inc \
 		test_cluster_heap_hio_allocate.inc \
@@ -6290,7 +6315,7 @@ test_cluster_ko_writeback_codec.o: $(top_srcdir)/src/backend/cluster/cluster_pi_
 		$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_ko_stop: test_cluster_ko_stop.c test_cluster_ko_abandon.h test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
+test_cluster_ko_stop: test_cluster_ko_stop.c test_cluster_ko_space.inc test_cluster_ko_abandon.h test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
 		test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_ko_lock.c \
 		$(top_srcdir)/src/include/cluster/cluster_ko.h
@@ -6301,7 +6326,7 @@ test_cluster_ko_stop: test_cluster_ko_stop.c test_cluster_ko_abandon.h test_clus
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Actual original KO owner and storage consumer; syscall faults use real files.
-test_cluster_drop_work: test_cluster_drop_work.c test_cluster_ko_abandon.h test_cluster_ko_stop.c test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h \
+test_cluster_drop_work: test_cluster_drop_work.c test_cluster_ko_space.inc test_cluster_ko_abandon.h test_cluster_ko_stop.c test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h \
 		$(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_ko_lock.c \
 		$(top_srcdir)/src/backend/cluster/storage/cluster_smgr.c \
@@ -8975,6 +9000,40 @@ test_cluster_heap_cr_reuse_scratch.inc: $(top_srcdir)/src/backend/access/heap/he
 test_cluster_vacuum_shared_mx.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c $(srcdir)/extract_vacuum_mx_fixture.py Makefile
 	python3 $(srcdir)/extract_vacuum_mx_fixture.py $< > $@
 
-test_cluster_vacuum_shared_mx: test_cluster_vacuum_shared_mx.c unit_test.h \
+test_cluster_vacuum_shared_mx: test_cluster_vacuum_shared_mx.c test_cluster_heap_maintenance_policy.inc unit_test.h \
 		$(srcdir)/cluster_vacuum_mx_test_stubs.h test_cluster_vacuum_shared_mx.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_heap_maintenance.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c \
+		$(top_srcdir)/src/backend/access/heap/heapam_visibility.c \
+		$(top_srcdir)/src/backend/access/heap/visibilitymap.c \
+		$(top_srcdir)/src/backend/cluster/cluster_visibility_verdict.c \
+		$(srcdir)/extract_heap_maintenance_fixture.py $(srcdir)/extract_vacuum_mx_fixture.py
+	python3 $(srcdir)/extract_heap_maintenance_fixture.py $(top_srcdir)/src/backend > $@
+
+test_cluster_heap_maintenance: test_cluster_heap_maintenance.c unit_test.h test_cluster_heap_maintenance.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_vm_read_visibility.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c \
+		$(top_srcdir)/src/backend/executor/nodeIndexonlyscan.c \
+		$(top_srcdir)/src/backend/executor/nodeBitmapHeapscan.c \
+		$(top_srcdir)/src/backend/access/heap/heapam.c \
+		$(top_srcdir)/src/backend/access/heap/heapam_handler.c \
+		$(top_srcdir)/src/backend/utils/adt/selfuncs.c \
+		$(top_srcdir)/contrib/pgstattuple/pgstatapprox.c \
+		$(srcdir)/extract_vm_read_fixture.py $(srcdir)/extract_vacuum_mx_fixture.py
+	python3 $(srcdir)/extract_vm_read_fixture.py $(top_srcdir)/src/backend > $@
+
+test_cluster_vm_read_visibility: test_cluster_vm_read_visibility.c unit_test.h test_cluster_vm_read_visibility.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# PGRAC: reuse the actual pure relation policy in existing native fixtures.
+test_cluster_heap_maintenance_policy.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
+	awk '/^cluster_heap_maintenance_restricted\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@
+
+# Real peer reader dispatch and the unchanged backend-only S rejection.
+test_cluster_ko_space.inc: $(top_srcdir)/src/backend/cluster/cluster_space_storage.c \
+        $(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c \
+        $(srcdir)/extract_ko_space_fixture.py $(srcdir)/extract_vacuum_mx_fixture.py
+	python3 $(srcdir)/extract_ko_space_fixture.py $(top_srcdir)/src/backend > $@

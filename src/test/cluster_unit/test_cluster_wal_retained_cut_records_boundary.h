@@ -117,12 +117,13 @@ cluster_page_wal_dirty_floor_v1(const ClusterWalSourceRef *source pg_attribute_u
 	return true;
 }
 
-/* No local PI responsibility: every source completes at its native redo. */
+/* Directory boundary only; census and independent owner retention are real. */
+static ClusterPcmLocalPiFloorV1 record_pi_floor;
 bool
 cluster_pcm_local_pi_floor_v1(const ClusterWalSourceRef *source pg_attribute_unused(),
 							  ClusterPcmLocalPiFloorV1 *out)
 {
-	memset(out, 0, sizeof(*out));
+	*out = record_pi_floor;
 	return true;
 }
 
@@ -278,6 +279,7 @@ records_reset(void)
 	memset(items, 0, sizeof(items));
 	memset(records, 0, sizeof(records));
 	nitems = nrecords = 0;
+	memset(&record_pi_floor, 0, sizeof(record_pi_floor));
 	rec_drop_dbinc = REC_DBINC;
 }
 

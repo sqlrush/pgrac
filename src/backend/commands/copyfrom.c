@@ -18,7 +18,14 @@
  *
  *-------------------------------------------------------------------------
  */
+/*
+ * PGRAC MODIFICATIONS
+ *   Modified by: SqlRush <sqlrush@gmail.com>
+ *   Keep shared heap visibility and freeze operations within supported paths.
+ */
 #include "postgres.h"
+
+#include "access/visibilitymap.h"
 
 #include <ctype.h>
 #include <unistd.h>
@@ -713,6 +720,13 @@ CopyFrom(CopyFromState cstate)
 	 */
 	if (cstate->opts.freeze)
 	{
+		/* PGRAC: reject before reading rows or creating insertion receipts. */
+		if (cluster_heap_maintenance_restricted(cstate->rel))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("COPY FREEZE is not supported for shared heaps"),
+					 errhint("Use COPY without FREEZE.")));
+
 		/*
 		 * We currently disallow COPY FREEZE on partitioned tables.  The
 		 * reason for this is that we've simply not yet opened the partitions

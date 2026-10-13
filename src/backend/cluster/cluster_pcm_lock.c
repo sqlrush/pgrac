@@ -86,7 +86,7 @@
 
 #define PGRAC_RESOURCE_X_RETAINED_SENDER_GENERATION UINT32_C(1)
 #define PGRAC_RESOURCE_X_OUTBOUND_OWNER_SLOTS (RESOURCE_X_PROTOCOL_NODE_LIMIT + 5)
-#define PGRAC_RESOURCE_X_WORK_OWNER_SLOTS (PGRAC_RESOURCE_X_OUTBOUND_OWNER_SLOTS + 3)
+#define PGRAC_RESOURCE_X_WORK_OWNER_SLOTS (PGRAC_RESOURCE_X_OUTBOUND_OWNER_SLOTS + 4)
 #define PGRAC_RESOURCE_X_PROOF_DIGEST_OFFSET UINT64_C(1469598103934665603)
 #define PGRAC_RESOURCE_X_PROOF_DIGEST_PRIME UINT64_C(1099511628211)
 #define PGRAC_RESOURCE_X_NATIVE_INITIAL_FORMATION UINT64_C(1)
@@ -519,6 +519,8 @@ typedef struct ClusterPcmResourceXMasterRequest {
 	 * becomes the canonical FIFO head.  It is freshness evidence only, never
 	 * Resource-X authority and never a wire field. */
 	uint64 head_transition_generation;
+	/* Physical lineage sealed by the exact grant, independent of wire authority. */
+	uint64 grant_transition_generation;
 	uint64 source_carrier_generation;
 	uint64 requester_target_generation;
 	uint64 page_scn_lsn;
@@ -716,10 +718,10 @@ typedef struct ClusterPcmResourceXMasterState {
 	ResourceXIntentSlot holder_image_intent;
 } ClusterPcmResourceXMasterState;
 
-StaticAssertDecl(sizeof(ClusterPcmResourceXMasterRequest) == 344,
-				 "Resource-X master request layout must remain 344 bytes");
-StaticAssertDecl(sizeof(ClusterPcmResourceXTerminalTombstone) == 352,
-				 "Resource-X terminal tombstone layout must remain 352 bytes");
+StaticAssertDecl(sizeof(ClusterPcmResourceXMasterRequest) == 352,
+				 "Resource-X master request must retain exact grant physical lineage");
+StaticAssertDecl(sizeof(ClusterPcmResourceXTerminalTombstone) == 360,
+				 "Resource-X terminal tombstone must retain the complete grant");
 StaticAssertDecl(sizeof(ClusterPcmResourceXBootstrapPriority) == 120,
 				 "Resource-X bootstrap priority layout must remain 120 bytes");
 StaticAssertDecl(sizeof(ClusterPcmResourceXBootstrapReceipt) == 224,
@@ -738,7 +740,7 @@ StaticAssertDecl(sizeof(ClusterPcmResourceXRequesterJoin) == 9120,
 				 "Resource-X requester join layout must remain 9120 bytes");
 StaticAssertDecl(sizeof(ClusterPcmResourceXDeferredSettlement) == 160,
 				 "Resource-X deferred settlement must remain bounded");
-StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 45720,
+StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 45984,
 				 "D4 Resource-X master state must bind object generation");
 
 typedef struct ClusterPcmShared {
@@ -10079,6 +10081,9 @@ pcm_resource_x_start_head_locked(struct GrdEntry *entry, ClusterPcmResourceXMast
 		if (incompatible != 0
 			&& !pcm_resource_x_arm_block_intents_locked(entry, state, request, requester_node))
 			request->phase = RESOURCE_X_MASTER_RECOVERY_BLOCKED;
+		if (request->phase == RESOURCE_X_MASTER_WAIT_PROOF
+			&& !pcm_resource_x_intent_mark_dirty())
+			request->phase = RESOURCE_X_MASTER_RECOVERY_BLOCKED;
 	}
 done:
 	if (requester_node_out != NULL)
@@ -10596,6 +10601,81 @@ cluster_pcm_local_pi_floor_v1(const ClusterWalSourceRef *source, ClusterPcmLocal
 	return true;
 }
 
+/* The admitted request owns this work. PI absence only makes a fresh
+ * storage proof possible; it never creates a request or an authority edge. */
+static bool
+pcm_resource_x_master_durable_work_locked(struct GrdEntry *entry,
+										 ResourceXMasterDurableWork *out)
+{
+	ResourceXMasterDurableWork work = { 0 };
+	ClusterPcmResourceXMasterState *state = pcm_resource_x_master_state_for_entry(entry);
+	ClusterPcmResourceXMasterRequest *head;
+	const ClusterPcmResourceXBootstrapReceipt *receipt;
+	int32 requester = -1;
+	uint32 lifecycle = pg_atomic_read_u32(&entry->lifecycle);
+
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED)
+		   || LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	if (state == NULL || (lifecycle != PCM_ENTRY_LIVE && lifecycle != PCM_ENTRY_QUIESCING)
+		|| cluster_gcs_lookup_master(entry->tag) != cluster_node_id
+		|| cluster_grd_pi_rebuild_blocked_v1(entry->tag)
+		|| (head = pcm_resource_x_master_head(state, &requester)) == NULL
+		|| head->phase != RESOURCE_X_MASTER_WAIT_PROOF || head->proof_kind != 0
+		|| head->final_authority_generation != 0 || head->delegated_authority_generation != 0
+		|| head->incompatible_holders_bitmap != head->blocked_holders_bitmap
+		|| !cluster_pcm_lock_resource_x_gate_open_exact(head->resource_formation)
+		|| (entry->resource_x_formation != 0
+			&& entry->resource_x_formation != head->resource_formation)
+		|| head->master_session_incarnation != cluster_qvotec_get_self_incarnation()
+		|| state->authority_generation != head->base_authority_generation
+		|| (PcmState)pg_atomic_read_u32(&entry->master_state) != PCM_STATE_N
+		|| entry->x_holder_node != -1 || pg_atomic_read_u32(&entry->s_holders_bitmap) != 0
+		|| pg_atomic_read_u32(&entry->pi_holders_bitmap) != 0)
+		return false;
+	receipt = &state->bootstrap_receipts[requester];
+	if (!pcm_resource_x_bootstrap_receipt_valid(receipt)
+		|| receipt->state != RESOURCE_X_BOOTSTRAP_RECEIPT_CONSUMED_BY_ASSERT
+		|| !BufferTagsEqual(&receipt->request.logical_assertion.resource, &entry->tag)
+		|| receipt->request.logical_assertion.requester_node != requester
+		|| receipt->request.observed_mode != PCM_STATE_N || head->ordered_lane != 0
+		|| receipt->request.resource_formation != head->resource_formation
+		|| receipt->request.master_session_incarnation != head->master_session_incarnation
+		|| receipt->request.assertion_sequence != head->assertion_sequence
+		|| receipt->sampled_base != head->base_authority_generation)
+		return false;
+	pcm_resource_x_master_snapshot(&entry->tag, requester, state, head, &work.head);
+	work.binding_generation = entry->binding_generation;
+	work.master_generation = cluster_lms_get_shard_master_generation();
+	work.transition_generation = pg_atomic_read_u64(&entry->transition_count_local);
+	work.r4_record_generation = receipt->r4_record_generation;
+	work.master_node = cluster_node_id;
+	if (work.binding_generation == 0 || work.binding_generation == UINT64_MAX
+		|| work.master_generation == 0 || work.master_generation == UINT64_MAX
+		|| work.transition_generation == UINT64_MAX)
+		return false;
+	*out = work;
+	return true;
+}
+
+bool
+cluster_pcm_lock_resource_x_master_durable_work_matches_exact(const ResourceXMasterDurableWork *work)
+{
+	ResourceXMasterDurableWork current;
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	bool matches;
+
+	if (work == NULL || !resource_x_assertion_valid(&work->head.assertion)
+		|| !pcm_entry_ref_acquire(&work->head.assertion.resource, false, &ref, &acquired))
+		return false;
+	LWLockAcquire(&ref.entry->entry_lock.lock, LW_SHARED);
+	matches = pcm_resource_x_master_durable_work_locked(ref.entry, &current)
+			  && memcmp(&current, work, sizeof(current)) == 0;
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return matches;
+}
+
 static bool
 pcm_pi_storage_snapshot_locked(struct GrdEntry *entry, ClusterPcmPiStorageCutV1 *out)
 {
@@ -11003,6 +11083,10 @@ cluster_pcm_lock_pi_storage_complete_v1(const ClusterPageDataReceiptV1 *receipt,
 		LWLockRelease(&entry->entry_lock.lock);
 	}
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
+	/* Wake the original LMS only after the exact complete cut was consumed.
+	 * A request admitted after this point arms the same bounded scanner. */
+	if (complete && cut.waiting.is_head)
+		(void)pcm_resource_x_intent_mark_dirty();
 	return complete;
 }
 
@@ -18483,6 +18567,9 @@ pcm_resource_x_assert_locked(struct GrdEntry *entry, const ResourceXDecodedFrame
 		}
 	assertion_head_done:;
 	}
+	if (request->phase == RESOURCE_X_MASTER_WAIT_PROOF
+		&& !pcm_resource_x_intent_mark_dirty())
+		request->phase = RESOURCE_X_MASTER_RECOVERY_BLOCKED;
 	pcm_resource_x_master_snapshot(&entry->tag, requester_node, state, request, out);
 	result = request->phase == RESOURCE_X_MASTER_RECOVERY_BLOCKED
 				 ? RESOURCE_X_APPLY_RECOVERY_BLOCKED
@@ -23306,6 +23393,7 @@ commit_directory:
 	entry->pending_x_since_lsn = 0;
 	state->authority_generation = final_authority_generation;
 	request->final_authority_generation = final_authority_generation;
+	request->grant_transition_generation = pg_atomic_read_u64(&entry->transition_count_local);
 	request->phase = RESOURCE_X_MASTER_GRANT_COMMITTED;
 	return RESOURCE_X_APPLY_APPLIED;
 }
@@ -23715,9 +23803,10 @@ cluster_pcm_lock_resource_x_local_proof_exact(const ResourceXDecodedFrame *local
 	return result;
 }
 
-ResourceXApplyResult
-cluster_pcm_lock_resource_x_durable_proof_exact(const ResourceXDurableProof *durable_proof,
-												ResourceXMasterSnapshot *out)
+static ResourceXApplyResult
+pcm_resource_x_durable_proof_exact_internal(const ResourceXDurableProof *durable_proof,
+											const ResourceXMasterDurableWork *work,
+											ResourceXMasterSnapshot *out)
 {
 	ClusterPcmResourceXMasterState *state;
 	ClusterPcmResourceXMasterRequest *request;
@@ -23753,6 +23842,17 @@ cluster_pcm_lock_resource_x_durable_proof_exact(const ResourceXDurableProof *dur
 	}
 	request = &state->requests[requester_node];
 	(void)pcm_resource_x_master_head(state, &head_node);
+	if (work != NULL) {
+		ResourceXMasterDurableWork current;
+
+		if (!pcm_resource_x_master_durable_work_locked(entry, &current)
+			|| memcmp(&current, work, sizeof(current)) != 0) {
+			pcm_resource_x_master_snapshot(&entry->tag, requester_node, state, request, out);
+			LWLockRelease(&entry->entry_lock.lock);
+			pcm_entry_ref_release(&entry_ref);
+			return RESOURCE_X_APPLY_STALE;
+		}
+	}
 	if (request->phase == RESOURCE_X_MASTER_NONE) {
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
@@ -23807,6 +23907,23 @@ cluster_pcm_lock_resource_x_durable_proof_exact(const ResourceXDurableProof *dur
 		ConditionVariableBroadcast(&entry->wait_cv);
 	pcm_entry_ref_release(&entry_ref);
 	return result;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_durable_proof_exact(const ResourceXDurableProof *proof,
+												ResourceXMasterSnapshot *out)
+{
+	return pcm_resource_x_durable_proof_exact_internal(proof, NULL, out);
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_master_durable_work_proof_exact(const ResourceXMasterDurableWork *work,
+															 const ResourceXDurableProof *proof,
+															 ResourceXMasterSnapshot *out)
+{
+	if (work == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	return pcm_resource_x_durable_proof_exact_internal(proof, work, out);
 }
 
 ResourceXApplyResult
@@ -24925,6 +25042,26 @@ cluster_pcm_lock_resource_x_outbound_work_probe_exact(uint32 probe_budget,
 			ResourceXIntentSlot *slot;
 			uint8 *payload;
 
+			if (owner_index == PGRAC_RESOURCE_X_OUTBOUND_OWNER_SLOTS + 3) {
+				ResourceXMasterDurableWork work;
+
+				if (!pcm_resource_x_master_durable_work_locked(entry, &work))
+					continue;
+				/* A refused I/O/admission attempt leaves the original head
+				 * eligible for the existing idle tick, without a self-wake. */
+				if (!pcm_resource_x_intent_mark_pending(false)) {
+					LWLockRelease(&entry->entry_lock.lock);
+					pcm_entry_ref_release(&entry_ref);
+					return RESOURCE_X_INTENT_PROBE_CORRUPT;
+				}
+				memcpy(payload_out, &work, sizeof(work));
+				LWLockRelease(&entry->entry_lock.lock);
+				pcm_entry_ref_release(&entry_ref);
+				pg_atomic_write_u64(&ClusterPcm->resource_x_intent_next_state_index, cursor + 1);
+				pg_atomic_write_u32(&ClusterPcm->resource_x_intent_next_owner_index, 0);
+				*examined_out = examined;
+				return RESOURCE_X_INTENT_PROBE_MASTER_DURABLE;
+			}
 			if (owner_index == PGRAC_RESOURCE_X_OUTBOUND_OWNER_SLOTS + 2) {
 				ResourceXDecodedFrame request;
 				if (!pcm_resource_x_settlement_retry_decode_locked(entry, state, &request)) {
@@ -25856,20 +25993,16 @@ cluster_pcm_lock_resource_x_release_x_exact(const ResourceXDecodedFrame *release
 	successor = pcm_resource_x_start_head_locked(entry, state, NULL);
 	if (successor == NULL) {
 		/* No FIFO successor consumes the current X carrier, so RELEASE_X owns
-		 * the physical X->N transition.  Keep the adapter's canonical base in
-		 * the same entry-lock critical section: the preceding grant either
-		 * advanced legacy authority with a physical transition (equal), or was
-		 * an already-X logical grant (legacy trails by exactly one).  Any other
-		 * relation is not current-holder lineage and must stop before release.
-		 * This is the A' RETURN_MAINLINE lifecycle repair, not PI promotion or
-		 * an expansion of the FIFO-successor late-bind contract. */
+		 * the physical X->N transition.  Prior S traffic and already-X grants
+		 * make physical transition and canonical authority independent axes.
+		 * Require the exact physical lineage sealed at this grant, not an
+		 * assumed offset between the axes.  The retained request/tombstone is
+		 * evidence of that grant; sampling a new seal here would hide drift. */
 		legacy_generation = pg_atomic_read_u64(&entry->transition_count_local);
-		if (state->authority_generation == 0 || state->authority_generation == UINT64_MAX
-			|| legacy_generation == UINT64_MAX
-			|| (legacy_generation != state->authority_generation
-				&& legacy_generation + 1 != state->authority_generation)
-			|| (legacy_generation == state->authority_generation
-				&& legacy_generation == UINT64_MAX - 1)) {
+		if (state->authority_generation == 0 || state->authority_generation >= UINT64_MAX - 1
+			|| state->authority_generation != request->final_authority_generation
+			|| request->grant_transition_generation == 0 || legacy_generation >= UINT64_MAX - 1
+			|| legacy_generation != request->grant_transition_generation) {
 			/* A terminal tombstone is immutable replay history.  A delayed
 			 * RELEASE_X whose physical lineage has drifted still fails closed,
 			 * but must not turn that terminal record back into live recovery
@@ -25893,7 +26026,7 @@ cluster_pcm_lock_resource_x_release_x_exact(const ResourceXDecodedFrame *release
 		 * release itself is not a durable DATA receipt. */
 		if (cluster_shared_config)
 			pg_atomic_fetch_or_u32(&entry->pi_holders_bitmap, requester_bit);
-		state->authority_generation = legacy_generation + 1;
+		state->authority_generation++;
 		released_without_successor = true;
 	} else if (successor->phase != RESOURCE_X_MASTER_WAIT_BLOCKERS
 			   || (successor->incompatible_holders_bitmap & requester_bit) == 0

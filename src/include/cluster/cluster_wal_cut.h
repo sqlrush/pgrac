@@ -47,6 +47,11 @@ extern ClusterControlRootResult cluster_wal_cut_poll_v1(ClusterWalCutV1 *cut,
 														ClusterWalWriterFlushV1 *out);
 extern void cluster_wal_cut_release_v1(ClusterWalCutV1 **cut);
 
+/* Once per completed local job, let the original loop retry poll before
+ * sleeping, even if an intervening confirmed lock release consumed its latch.
+ * This is only a scheduling hint, with no change to poll's proof obligations. */
+extern bool cluster_wal_cut_consume_completion_v1(void);
+
 /* Existing CONTROL owner only; no CF, WAL I/O, native LWLock wait or SQL. */
 extern void cluster_wal_cut_ingress_v1(const ClusterICEnvelope *env, const void *payload);
 extern void cluster_wal_cut_lmon_tick_v1(void);

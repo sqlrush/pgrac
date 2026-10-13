@@ -33,6 +33,11 @@
  *		ExecReScanBitmapHeapScan	prepares to rescan the plan.
  *		ExecEndBitmapHeapScan		releases all storage.
  */
+/*
+ * PGRAC MODIFICATIONS
+ *   Modified by: SqlRush <sqlrush@gmail.com>
+ *   Keep shared heap visibility and freeze operations within supported paths.
+ */
 #include "postgres.h"
 
 #include <math.h>
@@ -220,7 +225,8 @@ BitmapHeapNext(BitmapHeapScanState *node)
 			 * XXX: It's a layering violation that we do these checks above
 			 * tableam, they should probably moved below it at some point.
 			 */
-			skip_fetch = (node->can_skip_fetch &&
+			skip_fetch = (!cluster_heap_maintenance_restricted(node->ss.ss_currentRelation) &&
+						  node->can_skip_fetch &&
 						  !tbmres->recheck &&
 						  VM_ALL_VISIBLE(node->ss.ss_currentRelation,
 										 tbmres->blockno,
@@ -497,7 +503,8 @@ BitmapPrefetch(BitmapHeapScanState *node, TableScanDesc scan)
 				 * it did for the current heap page; which is not a certainty
 				 * but is true in many cases.
 				 */
-				skip_fetch = (node->can_skip_fetch &&
+				skip_fetch = (!cluster_heap_maintenance_restricted(node->ss.ss_currentRelation) &&
+						  node->can_skip_fetch &&
 							  (node->tbmres ? !node->tbmres->recheck : false) &&
 							  VM_ALL_VISIBLE(node->ss.ss_currentRelation,
 											 tbmpre->blockno,
@@ -548,7 +555,8 @@ BitmapPrefetch(BitmapHeapScanState *node, TableScanDesc scan)
 				}
 
 				/* As above, skip prefetch if we expect not to need page */
-				skip_fetch = (node->can_skip_fetch &&
+				skip_fetch = (!cluster_heap_maintenance_restricted(node->ss.ss_currentRelation) &&
+						  node->can_skip_fetch &&
 							  (node->tbmres ? !node->tbmres->recheck : false) &&
 							  VM_ALL_VISIBLE(node->ss.ss_currentRelation,
 											 tbmpre->blockno,

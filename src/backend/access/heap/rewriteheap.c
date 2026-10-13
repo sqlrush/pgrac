@@ -108,6 +108,8 @@
  */
 #include "postgres.h"
 
+#include "access/visibilitymap.h"
+
 #include <unistd.h>
 
 #include "access/heapam.h"
@@ -250,6 +252,14 @@ begin_heap_rewrite(Relation old_heap, Relation new_heap, TransactionId oldest_xm
 	MemoryContext rw_cxt;
 	MemoryContext old_cxt;
 	HASHCTL		hash_ctl;
+
+	/* PGRAC: reject before creating rewrite state or retiring references. */
+	if (cluster_heap_maintenance_restricted(old_heap) ||
+		cluster_heap_maintenance_restricted(new_heap))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("heap rewrite with freezing is not supported for shared heaps"),
+				 errhint("Use ordinary VACUUM for supported shared heap maintenance.")));
 
 #ifdef USE_PGRAC_CLUSTER
 	/* A rewrite changes every physical TID.  Under the caller's

@@ -784,7 +784,8 @@ typedef enum ResourceXIntentProbeResult {
 	/* Local work only: never encoded as a wire intent. */
 	RESOURCE_X_INTENT_PROBE_DELIVERY = 5,
 	RESOURCE_X_INTENT_PROBE_SOURCE_FINISH = 6,
-	RESOURCE_X_INTENT_PROBE_SOURCE_SETTLEMENT = 7
+	RESOURCE_X_INTENT_PROBE_SOURCE_SETTLEMENT = 7,
+	RESOURCE_X_INTENT_PROBE_MASTER_DURABLE = 8
 } ResourceXIntentProbeResult;
 
 typedef enum ResourceXIntentState {
@@ -873,6 +874,20 @@ typedef struct ResourceXMasterSnapshot {
 
 StaticAssertDecl(sizeof(ResourceXMasterSnapshot) == 96,
 				 "ResourceXMasterSnapshot layout must remain 96 bytes");
+
+/* Local LMS work reference, never a wire frame or a durable proof. */
+typedef struct ResourceXMasterDurableWork {
+	ResourceXMasterSnapshot head;
+	uint64 binding_generation;
+	uint64 master_generation;
+	uint64 transition_generation;
+	uint64 r4_record_generation;
+	int32 master_node;
+	uint32 reserved;
+} ResourceXMasterDurableWork;
+
+StaticAssertDecl(sizeof(ResourceXMasterDurableWork) <= RESOURCE_X_PROOF_V1_BYTES,
+				 "local master work must fit the existing probe payload");
 
 #define RESOURCE_X_REQUESTER_JOIN_HAS_IMAGE UINT32_C(0x00000001)
 #define RESOURCE_X_REQUESTER_JOIN_HAS_GRANT UINT32_C(0x00000002)
@@ -1884,6 +1899,11 @@ cluster_pcm_lock_resource_x_local_proof_exact(const ResourceXDecodedFrame *local
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_durable_proof_exact(const ResourceXDurableProof *durable_proof,
 												ResourceXMasterSnapshot *out);
+extern bool
+cluster_pcm_lock_resource_x_master_durable_work_matches_exact(const ResourceXMasterDurableWork *work);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_master_durable_work_proof_exact(
+	const ResourceXMasterDurableWork *work, const ResourceXDurableProof *proof,
+	ResourceXMasterSnapshot *out);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_master_snapshot_exact(const ResourceXAssertion *assertion,
 												  ResourceXMasterSnapshot *out);

@@ -33,7 +33,7 @@ def extract(source):
     print(function(source, "lazy_scan_heap", "static void"))
 
     # Keep both native assertions and the real publication decision intact.
-    start = source.index("\tAssert(vacrel->NewRelfrozenXid ==")
+    start = source.index("\tAssert(", source.index("* Prepare to update rel's pg_class entry."))
     end = source.index("\n\t/*\n\t * For safety, clamp relallvisible", start)
     print("static void\nfixture_publish_cutoffs(LVRelState *vacrel)\n{")
     print(source[start:end])

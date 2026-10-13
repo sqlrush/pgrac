@@ -34,6 +34,8 @@ typedef enum WalCutSourceState {
 typedef struct WalCutShared {
 	slock_t lock;
 	int32 owner_pid;
+	int32 owner_procno;
+	bool completion_pending;
 	uint64 revision;
 	ClusterControlRootResult result;
 	ClusterWalCutMessageV1 request;
@@ -52,6 +54,7 @@ typedef struct WalCutShared {
 struct ClusterWalCutV1 {
 	ResourceOwner owner;
 	pid_t pid;
+	int32 procno;
 	uint64 revision;
 	bool stale;
 	bool complete;
@@ -244,6 +247,8 @@ cut_cancel(ClusterWalCutV1 *cut)
 		SpinLockAcquire(&cut_shared->lock);
 		if (cut_shared->owner_pid == MyProcPid && cut_shared->revision == cut->revision) {
 			cut_shared->owner_pid = 0;
+			cut_shared->owner_procno = -1;
+			cut_shared->completion_pending = false;
 			cut_shared->result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		}
 		SpinLockRelease(&cut_shared->lock);
@@ -297,14 +302,26 @@ cut_background(void)
 		   || MyBackendType == B_CHECKPOINTER;
 }
 
+static int32
+cut_collector_procno(void)
+{
+	if (MyProc == NULL || ProcGlobal == NULL || ProcGlobal->allProcs == NULL || MyProcPid <= 0
+		|| MyProc->pid != MyProcPid || MyProc->pgprocno < 0
+		|| (uint32)MyProc->pgprocno >= ProcGlobal->allProcCount
+		|| MyProc != &ProcGlobal->allProcs[MyProc->pgprocno])
+		return -1;
+	return MyProc->pgprocno;
+}
+
 ClusterControlRootResult
 cluster_wal_cut_begin_v1(const ClusterWalSourceRef *source, ClusterWalCutV1 **out)
 {
 	ClusterWalCutMessageV1 request = { 0 };
 	ClusterWalCutV1 *cut;
+	int32 procno = cut_collector_procno();
 	bool acquired = false;
 	if (source == NULL || out == NULL || *out != NULL || !cut_background()
-		|| CurrentResourceOwner == NULL || cut_shared == NULL || MyProcPid <= 0)
+		|| CurrentResourceOwner == NULL || cut_shared == NULL || procno < 0)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	if (active_cut != NULL)
 		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
@@ -319,6 +336,7 @@ cluster_wal_cut_begin_v1(const ClusterWalSourceRef *source, ClusterWalCutV1 **ou
 	 * Native ERROR cleanup releases that owner before resetting its context. */
 	cut = palloc0(sizeof(*cut));
 	cut->pid = getpid();
+	cut->procno = procno;
 	cut->owner = CurrentResourceOwner;
 	cut->requested = request;
 	cut_register_cleanup();
@@ -326,6 +344,8 @@ cluster_wal_cut_begin_v1(const ClusterWalSourceRef *source, ClusterWalCutV1 **ou
 	if (cut_shared->owner_pid == 0 && cut_shared->revision != UINT64_MAX) {
 		cut->revision = ++cut_shared->revision;
 		cut_shared->owner_pid = MyProcPid;
+		cut_shared->owner_procno = procno;
+		cut_shared->completion_pending = false;
 		cut_shared->request = request;
 		memset(&cut_shared->reply, 0, sizeof(cut_shared->reply));
 		cut_shared->result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
@@ -390,6 +410,28 @@ cluster_wal_cut_poll_v1(ClusterWalCutV1 *cut, ClusterWalWriterFlushV1 *out)
 	} else if (result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
 		cut_cancel(cut);
 	return result;
+}
+
+bool
+cluster_wal_cut_consume_completion_v1(void)
+{
+	ClusterWalCutV1 *cut = active_cut;
+	bool current, ready = false;
+	if (cut == NULL || cut_shared == NULL || cut->pid != getpid() || cut->stale || cut->complete
+		|| cut->owner != CurrentResourceOwner || !cut_background()
+		|| cut_collector_procno() != cut->procno)
+		return false;
+	current = cut_current(&cut->requested, true);
+	SpinLockAcquire(&cut_shared->lock);
+	if (cut_shared->owner_pid == MyProcPid && cut_shared->owner_procno == cut->procno
+		&& cut_shared->revision == cut->revision && cut_shared->completion_pending) {
+		/* Even a refused retry consumes this hint. Only a new job completion
+		 * can request another immediate pass; poll retains every proof gate. */
+		cut_shared->completion_pending = false;
+		ready = current && cut_shared->result == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	}
+	SpinLockRelease(&cut_shared->lock);
+	return ready;
 }
 
 void
@@ -473,6 +515,7 @@ void
 cluster_wal_cut_ingress_v1(const ClusterICEnvelope *env, const void *payload)
 {
 	ClusterWalCutMessageV1 m;
+	int32 procno = -1, pid = 0;
 	if (MyBackendType != B_LMON || env == NULL || env->msg_type != PGRAC_IC_MSG_WAL_CUT
 		|| env->dest_node_id != (uint32)cluster_node_id
 		|| !cluster_wal_cut_decode_v1(payload, env->payload_length, &m) || env->epoch != m.epoch)
@@ -503,9 +546,18 @@ cluster_wal_cut_ingress_v1(const ClusterICEnvelope *env, const void *payload)
 		} else {
 			cut_shared->reply = m;
 			cut_shared->result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+			cut_shared->completion_pending = true;
+			procno = cut_shared->owner_procno;
+			pid = cut_shared->owner_pid;
 		}
 	}
 	SpinLockRelease(&cut_shared->lock);
+	/* Publication precedes the hint. Only the original collector's poll can
+	 * accept the cut; a latch never grants a flush or physical ACK. */
+	if (ProcGlobal != NULL && ProcGlobal->allProcs != NULL && procno >= 0 && pid > 0
+		&& (uint32)procno < ProcGlobal->allProcCount && ProcGlobal->allProcs[procno].pid == pid
+		&& ProcGlobal->allProcs[procno].pgprocno == procno)
+		SetLatch(&ProcGlobal->allProcs[procno].procLatch);
 }
 
 bool
@@ -593,6 +645,8 @@ cluster_wal_cut_lmon_tick_v1(void)
 	SpinLockAcquire(&cut_shared->lock);
 	if (stopping) {
 		cut_shared->owner_pid = 0;
+		cut_shared->owner_procno = -1;
+		cut_shared->completion_pending = false;
 		cut_shared->result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		if (cut_shared->source_state != WAL_CUT_SOURCE_RUNNING) {
 			cut_shared->source_state = WAL_CUT_SOURCE_EMPTY;
@@ -627,8 +681,11 @@ cluster_wal_cut_lmon_tick_v1(void)
 		return;
 	if (!cut_current(&request, true)) {
 		SpinLockAcquire(&cut_shared->lock);
-		if (cut_shared->owner_pid == owner && cut_shared->revision == revision)
+		if (cut_shared->owner_pid == owner && cut_shared->revision == revision) {
 			cut_shared->result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			cut_shared->owner_procno = -1;
+			cut_shared->completion_pending = false;
+		}
 		SpinLockRelease(&cut_shared->lock);
 		return;
 	}
@@ -693,6 +750,7 @@ cut_shmem_init(void)
 	if (!found) {
 		memset(cut_shared, 0, sizeof(*cut_shared));
 		SpinLockInit(&cut_shared->lock);
+		cut_shared->owner_procno = -1;
 		cut_shared->bgwriter_procno = -1;
 	}
 }

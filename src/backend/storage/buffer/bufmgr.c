@@ -12739,7 +12739,7 @@ cluster_bufmgr_discard_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
 	uint64 generation;
 	uint32 hash, state;
 	int id;
-	bool valid;
+	bool valid, released_mirror;
 	ClusterPiPhysicalResultV1 result = CLUSTER_PI_PHYSICAL_RETRY;
 
 	if (!cluster_enabled || !cluster_shared_config || RecoveryInProgress()
@@ -12770,10 +12770,18 @@ cluster_bufmgr_discard_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
 				   ? CLUSTER_PI_PHYSICAL_REPLACED
 				   : result;
 	}
-	valid = valid && cluster_page_wal_pi_snapshot_locked_v1(buf, &pi);
+	/* DRAIN can preserve a VALID N+PI mirror for an earlier pin. Once that
+	 * pin and every fence have drained, the original eviction owner may
+	 * remove this clean remnant. It is not the ordinary !VALID PI shape:
+	 * require the complete terminal DATA proof used for an absent image. */
+	released_mirror = valid && cluster_bufmgr_pcm_x_retained_image_locked(buf, state)
+		&& !cluster_bufmgr_pcm_x_retained_image_reuse_blocked_locked(buf, state);
+	valid = valid && (released_mirror || cluster_page_wal_pi_snapshot_locked_v1(buf, &pi));
 	UnlockBufHdr(buf, state);
 	LWLockRelease(partition);
-	if (!valid || !cluster_page_data_covers_pi(receipt, plan, sources, source_count, &pi))
+	if (!valid || (released_mirror
+		? !cluster_page_data_covers_missing_pi(receipt, plan, sources, source_count)
+		: !cluster_page_data_covers_pi(receipt, plan, sources, source_count, &pi)))
 		return result;
 
 	/* The ordinary InvalidateBuffer wrapper drops the header while taking
@@ -12783,8 +12791,11 @@ cluster_bufmgr_discard_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
 	state = LockBufHdr(buf);
 	if (!BufferTagsEqual(&buf->tag, &tag) || cluster_pcm_own_gen_get(id) != generation
 		|| !cluster_pi_physical_unfenced_locked(buf, state)
-		|| !cluster_page_wal_pi_snapshot_locked_v1(buf, &reobserved)
-		|| memcmp(&pi, &reobserved, sizeof(pi)) != 0) {
+		|| (released_mirror
+			? (!cluster_bufmgr_pcm_x_retained_image_locked(buf, state)
+				|| cluster_bufmgr_pcm_x_retained_image_reuse_blocked_locked(buf, state))
+			: (!cluster_page_wal_pi_snapshot_locked_v1(buf, &reobserved)
+				|| memcmp(&pi, &reobserved, sizeof(pi)) != 0))) {
 		UnlockBufHdr(buf, state);
 		LWLockRelease(partition);
 		return result;

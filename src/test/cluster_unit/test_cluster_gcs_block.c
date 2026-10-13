@@ -2874,9 +2874,11 @@ UT_TEST(test_resource_x_direct_n_uses_exact_durable_storage_proof)
 {
 	static const char *const master_proof_contract[]
 		= { "captured->incompatible_holders_bitmap != captured->blocked_holders_bitmap",
-			"cluster_bufmgr_read_storage_image_for_resource_x(",
-			"gcs_block_pcm_x_resource_x_durable_proof_crc(",
+			"gcs_block_resource_x_master_durable_read(",
 			"cluster_pcm_lock_resource_x_durable_proof_exact(" };
+	static const char *const master_read_contract[]
+		= { "cluster_bufmgr_read_storage_image_for_resource_x(",
+			"gcs_block_pcm_x_resource_x_durable_proof_crc(" };
 	static const char *const requester_join_contract[]
 		= { "cluster_pcm_lock_resource_x_t1_grant_delivery_exact(",
 			"cluster_bufmgr_read_storage_image_for_resource_x(",
@@ -2902,6 +2904,10 @@ UT_TEST(test_resource_x_direct_n_uses_exact_durable_storage_proof)
 			"cluster_bufmgr_pcm_own_direct_init_clear_x_by_tag_exact(" };
 	char *source = read_gcs_block_source();
 
+	assert_ordered_in_function(source, "\ngcs_block_resource_x_master_durable_read(",
+							   "\nstatic ResourceXApplyResult\n"
+							   "gcs_block_pcm_x_resource_x_master_durable_try(",
+							   master_read_contract, lengthof(master_read_contract));
 	assert_ordered_in_function(source, "\ngcs_block_pcm_x_resource_x_master_durable_try(",
 							   "\nstatic ResourceXApplyResult\n"
 							   "gcs_block_pcm_x_resource_x_remote_s_own_result(",

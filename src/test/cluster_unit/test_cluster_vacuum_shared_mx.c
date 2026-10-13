@@ -54,6 +54,9 @@ bool cluster_shared_config = true;
 int wal_level = WAL_LEVEL_REPLICA;
 static PGAlignedBlock fixture_pages[3];
 static bool fixture_peer, fixture_cleanup, fixture_identity, fixture_read_error;
+static bool fixture_storage;
+#define cluster_storage_mode_enabled() fixture_storage
+#include "test_cluster_heap_maintenance_policy.inc"
 static int fixture_smgr, fixture_pins, fixture_locks;
 static unsigned fixture_prune, fixture_noprune, fixture_fsm_writes;
 static unsigned fixture_vm_writes, fixture_dirties, fixture_consumed_dead;
@@ -141,7 +144,7 @@ setup(bool cleanup)
 	memset(&relation, 0, sizeof(relation));
 	memset(&form, 0, sizeof(form));
 	memset(&dead_storage, 0, sizeof(dead_storage));
-	fixture_peer = fixture_identity = cluster_shared_config = true;
+	fixture_storage = fixture_peer = fixture_identity = cluster_shared_config = true;
 	fixture_smgr = 1;
 	fixture_cleanup = cleanup;
 	fixture_read_error = false;
@@ -241,7 +244,7 @@ UT_TEST(both_cutoffs_remain_unpublished_after_a_preserved_page)
 
 UT_TEST(nontarget_modes_retain_the_original_native_path)
 {
-	for (unsigned mode = 0; mode < 4; mode++)
+	for (unsigned mode = 0; mode < 5; mode++)
 		for (unsigned cleanup = 0; cleanup < 2; cleanup++) {
 			setup(cleanup);
 			if (mode == 0)
@@ -252,13 +255,15 @@ UT_TEST(nontarget_modes_retain_the_original_native_path)
 				fixture_smgr = 0;
 			if (mode == 3)
 				form.relpersistence = RELPERSISTENCE_TEMP;
+			if (mode == 4)
+				fixture_storage = fixture_peer = false;
 			fixture_bind_relation(&state, &relation);
 			lazy_scan_heap(&state);
 			fixture_publish_cutoffs(&state);
 			UT_ASSERT_EQ(fixture_prune + fixture_noprune, 1);
 			UT_ASSERT_EQ(deferred_pages(), 0);
-			UT_ASSERT_EQ(state.NewRelfrozenXid, 100);
-			UT_ASSERT_EQ(state.NewRelminMxid, 100);
+			UT_ASSERT_EQ(state.NewRelfrozenXid, state.shared_maintenance_restricted ? InvalidTransactionId : 100);
+			UT_ASSERT_EQ(state.NewRelminMxid, state.shared_maintenance_restricted ? InvalidMultiXactId : 100);
 		}
 }
 
@@ -270,7 +275,7 @@ UT_TEST(no_multi_and_empty_pages_do_not_acquire_a_preservation_claim)
 	fixture_publish_cutoffs(&state);
 	UT_ASSERT_EQ(fixture_prune, 1);
 	UT_ASSERT_EQ(deferred_pages(), 0);
-	UT_ASSERT_EQ(state.NewRelfrozenXid, 100);
+	UT_ASSERT_EQ(state.NewRelfrozenXid, state.shared_maintenance_restricted ? InvalidTransactionId : 100);
 	setup(false);
 	((PageHeader)fixture_pages[0].data)->pd_lower = SizeOfPageHeaderData;
 	lazy_scan_heap(&state);

@@ -28,6 +28,11 @@
  *		ExecIndexOnlyScanReInitializeDSM	reinitialize DSM for fresh scan
  *		ExecIndexOnlyScanInitializeWorker attach to DSM info in parallel worker
  */
+/*
+ * PGRAC MODIFICATIONS
+ *   Modified by: SqlRush <sqlrush@gmail.com>
+ *   Keep shared heap visibility and freeze operations within supported paths.
+ */
 #include "postgres.h"
 
 #include "access/genam.h"
@@ -158,7 +163,9 @@ IndexOnlyNext(IndexOnlyScanState *node)
 		 * It's worth going through this complexity to avoid needing to lock
 		 * the VM buffer, which could cause significant contention.
 		 */
-		if (!VM_ALL_VISIBLE(scandesc->heapRelation,
+		/* PGRAC: a shared raw VM positive is not a visibility proof. */
+		if (cluster_heap_maintenance_restricted(scandesc->heapRelation) ||
+			!VM_ALL_VISIBLE(scandesc->heapRelation,
 							ItemPointerGetBlockNumber(tid),
 							&node->ioss_VMBuffer))
 		{

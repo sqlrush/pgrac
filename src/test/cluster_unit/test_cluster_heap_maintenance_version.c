@@ -39,6 +39,9 @@
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
 #include "unit_test.h"
+#include "cluster/cluster_mode.h"
+#include "access/visibilitymap.h"
+#include "test_cluster_heap_maintenance_policy.inc"
 
 UT_DEFINE_GLOBALS();
 bool cluster_enabled = true, cluster_shared_config = true;
@@ -89,6 +92,13 @@ errmsg(const char *format, ...)
 	(void)format;
 	return 0;
 }
+int
+errhint(const char *format, ...)
+{
+	(void)format;
+	return 0;
+}
+
 int
 errcode(int code)
 {
@@ -283,6 +293,7 @@ run_vacuum(const ClusterSpaceIdentity *identity)
 	struct {
 		Relation rel;
 		bool versioned;
+		bool shared_maintenance_restricted;
 		ClusterSpaceIdentity identity;
 	} state = { 0 }, *vacrel = &state;
 	Buffer buffer = 1;
@@ -315,6 +326,7 @@ reset(uint8 opcode, bool shared)
 	memset(tuple_bytes.data, 0, BLCKSZ);
 	BufferBlocks = current_page.data;
 	cluster_shared_config = shared;
+	cluster_enabled = shared;
 	CritSectionCount = 0;
 	edges = inserts = dirties = hints = 0;
 	begun = expecting_error = false;
@@ -403,13 +415,19 @@ UT_TEST(test_prune_native_plan_and_version)
 	UT_ASSERT(!ItemIdIsUsed(PageGetItemId(current_page.data, 2)));
 	UT_ASSERT(ItemIdIsNormal(PageGetItemId(current_page.data, 3)));
 }
-UT_TEST(test_freeze_native_tuple_and_version)
+UT_TEST(test_shared_freeze_refuses_before_tuple_or_wal)
 {
 	reset(XLOG_HEAP2_FREEZE_PAGE, true);
-	execute(XLOG_HEAP2_FREEZE_PAGE, &space_identity);
-	check_publication(true);
+	expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		execute(XLOG_HEAP2_FREEZE_PAGE, &space_identity);
+		UT_ASSERT(false);
+	}
+	expecting_error = false;
+	UT_ASSERT_EQ(inserts + dirties + edges + CritSectionCount, 0);
+	UT_ASSERT_EQ(memcmp(before_page.data, current_page.data, BLCKSZ), 0);
 	for (int i = 1; i <= 2; i++)
-		UT_ASSERT(HeapTupleHeaderXminFrozen(
+		UT_ASSERT(!HeapTupleHeaderXminFrozen(
 			(HeapTupleHeader)PageGetItem(current_page.data, PageGetItemId(current_page.data, i))));
 }
 UT_TEST(test_vacuum_native_unused_and_version)
@@ -515,7 +533,7 @@ UT_TEST(test_invalid_identity_refuses_before_mutation)
 
 UT_TEST(test_freeze_preserves_native_transaction_sanity_gate)
 {
-	reset(XLOG_HEAP2_FREEZE_PAGE, true);
+	reset(XLOG_HEAP2_FREEZE_PAGE, false);
 	tx_committed = false;
 	expecting_error = true;
 	if (setjmp(error_jump) == 0) {
@@ -546,6 +564,7 @@ UT_TEST(test_vacuum_native_entry_copies_prelock_identity)
 	struct {
 		Relation rel;
 		bool versioned;
+		bool shared_maintenance_restricted;
 		ClusterSpaceIdentity identity;
 	} state = { 0 }, *vacrel = &state;
 	Relation rel = &relation_data;
@@ -567,6 +586,7 @@ UT_TEST(test_vacuum_native_entry_refuses_missing_identity)
 	struct {
 		Relation rel;
 		bool versioned;
+		bool shared_maintenance_restricted;
 		ClusterSpaceIdentity identity;
 	} state = { 0 }, *vacrel = &state;
 	Relation rel = &relation_data;
@@ -591,7 +611,7 @@ main(void)
 {
 	UT_PLAN(12);
 	UT_RUN(test_prune_native_plan_and_version);
-	UT_RUN(test_freeze_native_tuple_and_version);
+	UT_RUN(test_shared_freeze_refuses_before_tuple_or_wal);
 	UT_RUN(test_vacuum_native_unused_and_version);
 	UT_RUN(test_nonshared_native_maintenance);
 	UT_RUN(test_prune_hint_only_versions_actual_change);

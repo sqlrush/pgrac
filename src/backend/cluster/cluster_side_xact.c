@@ -23,6 +23,7 @@
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_xlog.h"
+#include "utils/syscache.h"
 
 #define RF_SIDE_XACT_KNOWN_XINFO                                                                   \
 	(XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_SUBXACTS | XACT_XINFO_HAS_RELFILELOCATORS              \
@@ -30,6 +31,9 @@
 	 | XACT_XINFO_HAS_AE_LOCKS | XACT_XINFO_HAS_GID | XACT_XINFO_HAS_DROPPED_STATS                 \
 	 | XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_TT_COMMIT | XACT_XINFO_HAS_SPACE_DROP)
 #define RF_SIDE_XACT_TWOPHASE_MAGIC UINT32_C(0x57F94534)
+#define RF_SIDE_XACT_COMPLETION_FLAGS \
+	(XACT_COMPLETION_APPLY_FEEDBACK | XACT_COMPLETION_UPDATE_RELCACHE_FILE \
+	 | XACT_COMPLETION_FORCE_SYNC_COMMIT)
 
 typedef struct RfSideXactCursorV1 {
 	const char *position;
@@ -192,7 +196,7 @@ side_xact_prepare_shape_valid(XLogReaderState *record, RfSideXactOperationV1 *ca
 }
 
 static bool
-side_xact_completion_shape_valid(XLogReaderState *record, bool commit)
+side_xact_completion_shape_for_use(XLogReaderState *record, bool commit, bool pi_read_only)
 {
 	RfSideXactCursorV1 cursor;
 	const char *xinfo_bytes;
@@ -213,7 +217,8 @@ side_xact_completion_shape_valid(XLogReaderState *record, bool commit)
 			return false;
 		memcpy(&xinfo, xinfo_bytes, sizeof(xinfo));
 	}
-	if ((xinfo & ~RF_SIDE_XACT_KNOWN_XINFO) != 0
+	if ((xinfo & ~(RF_SIDE_XACT_KNOWN_XINFO
+				   | (commit && pi_read_only ? RF_SIDE_XACT_COMPLETION_FLAGS : 0))) != 0
 		|| ((xinfo & XACT_XINFO_HAS_GID) != 0 && (xinfo & XACT_XINFO_HAS_TWOPHASE) == 0)
 		|| (!commit && (xinfo & (XACT_XINFO_HAS_TT_COMMIT | XACT_XINFO_HAS_SPACE_DROP)) != 0))
 		return false;
@@ -255,6 +260,12 @@ side_xact_completion_shape_valid(XLogReaderState *record, bool commit)
 		&& !side_xact_take_counted(&cursor, CLUSTER_SPACE_STRUCTURE_WAL_BYTES))
 		return false;
 	return cursor.position == cursor.end;
+}
+
+static bool
+side_xact_completion_shape_valid(XLogReaderState *record, bool commit)
+{
+	return side_xact_completion_shape_for_use(record, commit, false);
 }
 
 static bool
@@ -313,6 +324,59 @@ static bool
 side_xact_no_abort_effects(const xl_xact_parsed_abort *parsed)
 {
 	return parsed->nsubxacts == 0 && parsed->nrels == 0 && parsed->nstats == 0;
+}
+
+/* Transactional invalidations affect logical caches, not a physical PAGE or
+ * SPACE version. Preserve every message and its scope; inspection never
+ * asserts that the original cache owner delivered it. SMGR/RELMAP messages
+ * are nontransactional and need a separate dependency classification. */
+static bool
+side_xact_pi_effects_valid(const xl_xact_parsed_commit *parsed, uint64 system_identifier,
+						   RfSideXactOperationV1 *out)
+{
+	uint32 kinds = 0;
+
+	/* These additional transaction owners are not proved by this consumer. */
+	if (parsed->nsubxacts != 0 || parsed->nstats != 0
+		|| (parsed->xinfo & XACT_XINFO_HAS_ORIGIN) != 0)
+		return false;
+	/* Every physical deletion must have its typed identity and version pair;
+	 * a prefix of the locator array cannot discharge the rest. */
+	if (parsed->nrels != 0 || parsed->nspace_drops != 0) {
+		if (parsed->nrels <= 0 || parsed->nspace_drops != (uint32)parsed->nrels
+			|| !side_xact_space_drops_valid(parsed, system_identifier))
+			return false;
+	}
+	if ((parsed->nmsgs != 0 || XactCompletionRelcacheInitFileInval(parsed->xinfo))
+		&& ((parsed->xinfo & XACT_XINFO_HAS_DBINFO) == 0 || !OidIsValid(parsed->dbId)
+			|| !OidIsValid(parsed->tsId)))
+		return false;
+	for (int i = 0; i < parsed->nmsgs; i++) {
+		SharedInvalidationMessage message;
+		Oid database;
+
+		memcpy(&message, &parsed->msgs[i], sizeof(message));
+		if (message.id >= 0 && message.id < SysCacheSize) {
+			kinds |= UINT32_C(1) << 0;
+			database = message.cc.dbId;
+		} else if (message.id == SHAREDINVALCATALOG_ID && OidIsValid(message.cat.catId)) {
+			kinds |= UINT32_C(1) << 1;
+			database = message.cat.dbId;
+		} else if (message.id == SHAREDINVALRELCACHE_ID) {
+			kinds |= UINT32_C(1) << 2;
+			database = message.rc.dbId;
+		} else if (message.id == SHAREDINVALSNAPSHOT_ID) {
+			kinds |= UINT32_C(1) << 3;
+			database = message.sn.dbId;
+		} else
+			return false;
+		if (database != InvalidOid && database != parsed->dbId)
+			return false;
+	}
+	out->invalidation_kinds = kinds;
+	out->invalidation_count = parsed->nmsgs;
+	out->relation_count = parsed->nrels;
+	return true;
 }
 
 static bool
@@ -450,14 +514,17 @@ side_xact_commit_timestamp(const xl_xact_parsed_commit *parsed)
 														: parsed->xact_time;
 }
 
-bool
-rf_side_xact_structural_preflight_v1(const RfSideXactOperationV1 *operation)
+static bool
+side_xact_structural_preflight(const RfSideXactOperationV1 *operation, bool pi_read_only)
 {
 	uint8 binding_seen = 0;
 	const char *gid_end;
 	Size i;
 
-	if (operation == NULL || operation->system_identifier == 0
+	if (operation == NULL || operation->pi_read_only != pi_read_only
+		|| (!pi_read_only && (operation->invalidation_kinds != 0
+			|| operation->invalidation_count != 0 || operation->relation_count != 0))
+		|| operation->system_identifier == 0
 		|| operation->kind == RF_SIDE_XACT_INVALID || operation->origin_thread == 0
 		|| operation->origin_thread > 128 || operation->reserved_zero != 0
 		|| !TransactionIdIsNormal(operation->xid))
@@ -474,7 +541,9 @@ rf_side_xact_structural_preflight_v1(const RfSideXactOperationV1 *operation)
 			|| (uint64)operation->space_drop_count * CLUSTER_SPACE_STRUCTURE_WAL_BYTES
 				   != operation->completion_payload_length - operation->space_drop_offset)
 			return false;
-	} else if (operation->completion_payload_length != 0 || operation->space_drop_offset != 0
+	} else if ((operation->completion_payload_length != 0
+				&& !(pi_read_only && operation->kind == RF_SIDE_XACT_COMMIT))
+			   || operation->space_drop_offset != 0
 			   || (operation->xinfo & XACT_XINFO_HAS_SPACE_DROP) != 0)
 		return false;
 	for (i = 0; i < sizeof(operation->prepare_binding); i++)
@@ -518,6 +587,18 @@ rf_side_xact_structural_preflight_v1(const RfSideXactOperationV1 *operation)
 	}
 }
 
+bool
+rf_side_xact_structural_preflight_v1(const RfSideXactOperationV1 *operation)
+{
+	return side_xact_structural_preflight(operation, false);
+}
+
+bool
+rf_side_xact_inspection_preflight_v1(const RfSideXactOperationV1 *operation)
+{
+	return side_xact_structural_preflight(operation, true);
+}
+
 /* D S09 (A request, S07 integration): the bounded completion shape for
  * readers that classify a transaction end the typed decoder does not own.
  * A record it refuses is damaged, not merely unsupported. */
@@ -527,9 +608,9 @@ rf_side_xact_completion_shape_v1(XLogReaderState *record, bool commit)
 	return record != NULL && side_xact_completion_shape_valid(record, commit);
 }
 
-bool
-rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier, uint16 origin_thread,
-					   RfSideXactOperationV1 *out)
+static bool
+side_xact_decode(XLogReaderState *record, uint64 system_identifier, uint16 origin_thread,
+				 bool pi_read_only, RfSideXactOperationV1 *out)
 {
 	RfSideXactOperationV1 candidate;
 	uint8 opcode;
@@ -544,6 +625,7 @@ rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier, uint16
 	memset(&candidate, 0, sizeof(candidate));
 	candidate.system_identifier = system_identifier;
 	candidate.origin_thread = origin_thread;
+	candidate.pi_read_only = pi_read_only;
 	opcode = XLogRecGetInfo(record) & XLOG_XACT_OPMASK;
 	xid = XLogRecGetXid(record);
 
@@ -551,13 +633,16 @@ rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier, uint16
 	case XLOG_XACT_COMMIT: {
 		xl_xact_parsed_commit parsed;
 
-		if (!side_xact_completion_shape_valid(record, true) || !TransactionIdIsNormal(xid))
+		if (!side_xact_completion_shape_for_use(record, true, pi_read_only)
+			|| !TransactionIdIsNormal(xid))
 			return false;
 		if (!ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)XLogRecGetData(record),
 							   XLogRecGetDataLen(record), &parsed))
 			return false;
-		if ((!side_xact_no_commit_effects(&parsed)
-			 && !side_xact_space_drops_valid(&parsed, system_identifier))
+		if ((pi_read_only
+			 ? !side_xact_pi_effects_valid(&parsed, system_identifier, &candidate)
+			 : (!side_xact_no_commit_effects(&parsed)
+				&& !side_xact_space_drops_valid(&parsed, system_identifier)))
 			|| (parsed.xinfo & XACT_XINFO_HAS_TWOPHASE) != 0 || !SCN_VALID(parsed.scn)
 			|| side_xact_commit_timestamp(&parsed) == 0 || !parsed.has_tt_commit
 			|| !side_xact_tt_delta_valid(&parsed.tt_commit, origin_thread, xid, parsed.scn))
@@ -570,12 +655,13 @@ rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier, uint16
 		candidate.terminal_timestamp = side_xact_commit_timestamp(&parsed);
 		candidate.has_tt_delta = true;
 		candidate.tt_delta = parsed.tt_commit;
-		if (parsed.nspace_drops != 0) {
+		if (pi_read_only || parsed.nspace_drops != 0) {
 			if (XLogRecHasAnyBlockRefs(record))
 				return false;
 			candidate.completion_payload_length = XLogRecGetDataLen(record);
 			candidate.space_drop_count = parsed.nspace_drops;
-			candidate.space_drop_offset = (uint32)(parsed.space_drops - XLogRecGetData(record));
+			if (parsed.nspace_drops != 0)
+				candidate.space_drop_offset = (uint32)(parsed.space_drops - XLogRecGetData(record));
 		}
 		break;
 	}
@@ -671,10 +757,24 @@ rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier, uint16
 	default:
 		return false;
 	}
-	if (!rf_side_xact_structural_preflight_v1(&candidate))
+	if (!side_xact_structural_preflight(&candidate, pi_read_only))
 		return false;
 	*out = candidate;
 	return true;
+}
+
+bool
+rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier, uint16 origin_thread,
+					   RfSideXactOperationV1 *out)
+{
+	return side_xact_decode(record, system_identifier, origin_thread, false, out);
+}
+
+bool
+rf_side_xact_inspect_pi_v1(XLogReaderState *record, uint64 system_identifier, uint16 origin_thread,
+						   RfSideXactOperationV1 *out)
+{
+	return side_xact_decode(record, system_identifier, origin_thread, true, out);
 }
 
 static RfSideXactApplyResultV1

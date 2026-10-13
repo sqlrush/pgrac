@@ -37,6 +37,7 @@ AuxProcType MyAuxProcType = SinvalBcastProcess;
 int cluster_node_id = 0;
 int MyProcPid = 199;
 BackendType MyBackendType = B_BACKEND;
+BackendId MyBackendId = 1;
 volatile sig_atomic_t InterruptPending;
 volatile uint32 InterruptHoldoffCount;
 volatile uint32 CritSectionCount;
@@ -85,6 +86,12 @@ static int cap_missing_peer = -1, cap_zero_peer = -1, cap_change_cut_peer = -1;
 static int cut_writer_samples, cut_writer_change_at, cut_cap_samples[CLUSTER_KO_SHARED_NODE_LIMIT];
 static int cut_cap_change_peer = -1;
 static int space_reads, send_calls, lock_calls;
+static bool real_space_reader, space_current_refused, space_locked, space_pinned;
+static int ordinary_space_locks, maintenance_space_locks, space_current_refuse_at;
+static PGAlignedBlock space_page;
+static bool fixture_space_read_identity(RelFileLocator, ClusterSpaceIdentity *);
+static bool fixture_space_read_maintenance_identity(RelFileLocator, ClusterSpaceIdentity *);
+static void fixture_pcm_backend_gate(void);
 static int boot_change_phase;
 static bool cancel_wait;
 static bool drive_shared_ack;
@@ -364,9 +371,91 @@ cluster_space_relation_read_identity(RelFileLocator locator, ClusterSpaceIdentit
 	Assert(SpinLockFree(&storage.shared_lock));
 	Assert(RelFileLocatorEquals(locator, space_identity.key.locator));
 	space_reads++;
+	if (real_space_reader)
+		return fixture_space_read_identity(locator, out);
 	*out = space_identity;
 	return space_ok;
 }
+bool
+cluster_space_relation_read_maintenance_identity(RelFileLocator locator, ClusterSpaceIdentity *out)
+{
+	if (!real_space_reader)
+		return cluster_space_relation_read_identity(locator, out);
+	space_reads++;
+	return fixture_space_read_maintenance_identity(locator, out);
+}
+
+/* The buffer/current boundary is deterministic; the SPACE namespace, CRC,
+ * LIVE validation, reader dispatch, and ordinary S identity gate are real. */
+Buffer
+ReadBufferWithoutRelcache(RelFileLocator locator, ForkNumber fork, BlockNumber block,
+						 ReadBufferMode mode, BufferAccessStrategy strategy, bool permanent)
+{
+	Assert(fork == SPACE_FORKNUM && block == 0 && mode == RBM_NORMAL);
+	Assert(!space_pinned && !space_locked);
+	if (!space_ok)
+		return InvalidBuffer;
+	if (!cluster_space_identity_page_encode(&space_identity, 17, space_page.data, BLCKSZ))
+		abort();
+	space_pinned = true;
+	return 1;
+}
+BlockNumber
+smgrnblocks(SMgrRelation rel, ForkNumber fork)
+{
+	Assert(rel == &relation && fork == SPACE_FORKNUM);
+	return 2;
+}
+void
+LockBuffer(Buffer buffer, int mode)
+{
+	Assert(buffer == 1 && space_pinned && mode == BUFFER_LOCK_SHARE);
+	ordinary_space_locks++;
+	fixture_pcm_backend_gate();
+	space_locked = true;
+}
+bool
+ClusterLockBufferExclusiveRetryAware(Buffer buffer)
+{
+	Assert(buffer == 1 && space_pinned && !space_locked);
+	maintenance_space_locks++;
+	if (space_current_refused || maintenance_space_locks == space_current_refuse_at)
+		return false;
+	space_locked = true;
+	return true;
+}
+void
+ReleaseBuffer(Buffer buffer)
+{
+	Assert(buffer == 1 && space_pinned && !space_locked);
+	space_pinned = false;
+}
+void
+UnlockReleaseBuffer(Buffer buffer)
+{
+	Assert(buffer == 1 && space_pinned && space_locked);
+	space_locked = false;
+	ReleaseBuffer(buffer);
+}
+bool
+cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
+{
+	abort();
+}
+#undef BufferGetPage
+#define BufferGetPage(buffer) ((void)(buffer), (Page)space_page.data)
+#define BufferGetBlockNumber(buffer) ((void)(buffer), 0)
+#undef BufferIsValid
+#define BufferIsValid(buffer) ((buffer) != InvalidBuffer)
+#define cluster_space_relation_read_identity fixture_space_read_identity
+#define cluster_space_relation_read_maintenance_identity fixture_space_read_maintenance_identity
+#include "test_cluster_ko_space.inc"
+#undef cluster_space_relation_read_identity
+#undef cluster_space_relation_read_maintenance_identity
+#undef BufferGetPage
+#undef BufferGetBlockNumber
+#undef BufferIsValid
+
 bool
 cluster_sf_peer_capability_word_sample(int32 peer_id, uint32 required, uint32 *word,
 									   uint32 *generation)
@@ -395,7 +484,8 @@ cluster_ic_send_envelope(uint8 type, int32 dest, const void *bytes, uint32 lengt
 	ClusterKoSharedMessageV2 m;
 	Assert(SpinLockFree(&storage.shared_lock));
 	Assert(dest == 1 && length == CLUSTER_KO_SHARED_V2_BYTES);
-	Assert(cluster_ko_shared_decode_v2(bytes, length, &m));
+	if (!cluster_ko_shared_decode_v2(bytes, length, &m))
+		abort();
 	send_calls++;
 	if (type == PGRAC_IC_MSG_KO_FLUSH) {
 		last_shared_request = m;
@@ -446,6 +536,11 @@ pg_re_throw(void)
 }
 int
 errhint(const char *format, ...)
+{
+	return 0;
+}
+int
+errdetail(const char *format, ...)
 {
 	return 0;
 }
@@ -545,7 +640,8 @@ cluster_sinval_ack_wait_is_complete(uint64 batch)
 		ack = last_shared_request;
 		ack.verb = CLUSTER_KO_SHARED_ACK;
 		ack.status = CLUSTER_KO_SHARED_DONE;
-		Assert(cluster_ko_shared_encode_v2(&ack, bytes, sizeof(bytes)));
+		if (!cluster_ko_shared_encode_v2(&ack, bytes, sizeof(bytes)))
+			abort();
 		env.source_node_id = 1;
 		env.payload_length = sizeof(bytes);
 		cluster_ko_flush_ack_handler(&env, bytes);
@@ -765,6 +861,9 @@ reset_test(void)
 	cluster_enabled = true;
 	cluster_node_id = 0;
 	MyBackendType = B_BACKEND;
+	MyBackendId = 1;
+	real_space_reader = space_current_refused = space_locked = space_pinned = false;
+	ordinary_space_locks = maintenance_space_locks = space_current_refuse_at = 0;
 	CurrentResourceOwner = (ResourceOwner)1;
 	CurTransactionResourceOwner = (ResourceOwner)1;
 	TopTransactionContext = (MemoryContext)1;
@@ -862,7 +961,8 @@ shared_request(uint64 id, uint64 epoch)
 {
 	ClusterKoSharedMessageV2 m = { 0 };
 	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], generation;
-	Assert(ko_shared_members(&m, boots, &generation));
+	if (!ko_shared_members(&m, boots, &generation))
+		abort();
 	m.verb = CLUSTER_KO_SHARED_REQUEST;
 	m.batch_id = id;
 	m.epoch = epoch;
@@ -879,7 +979,8 @@ enqueue_shared(const ClusterKoSharedMessageV2 *m)
 {
 	ClusterICEnvelope env = { 0 };
 	uint8 bytes[CLUSTER_KO_SHARED_V2_BYTES];
-	Assert(cluster_ko_shared_encode_v2(m, bytes, sizeof(bytes)));
+	if (!cluster_ko_shared_encode_v2(m, bytes, sizeof(bytes)))
+		abort();
 	env.source_node_id = 1;
 	env.payload_length = sizeof(bytes);
 	cluster_ko_flush_request_handler(&env, bytes);
@@ -894,9 +995,28 @@ enqueue_epoch(uint64 id, uint64 epoch)
 		enqueue_legacy_epoch(id, epoch);
 }
 static void
+fixture_peer_drain(void)
+{
+	BackendType saved_type = MyBackendType;
+	BackendId saved_id = MyBackendId;
+	MyBackendType = B_SINVAL_BCAST;
+	MyBackendId = InvalidBackendId;
+	PG_TRY();
+	{
+		cluster_ko_drain_inbound_and_apply();
+	}
+	PG_FINALLY();
+	{
+		MyBackendType = saved_type;
+		MyBackendId = saved_id;
+	}
+	PG_END_TRY();
+}
+
+static void
 drain_and_send(void)
 {
-	cluster_ko_drain_inbound_and_apply();
+	fixture_peer_drain();
 	if (cluster_shared_config)
 		shared_send_tick();
 }
@@ -1384,7 +1504,7 @@ UT_TEST(test_shared_ack_send_revalidates_boot_and_normal_stop_owner)
 	reset_test();
 	cluster_shared_config = true;
 	enqueue(126);
-	cluster_ko_drain_inbound_and_apply();
+	fixture_peer_drain();
 	UT_ASSERT_EQ(flush_count, 1);
 	UT_ASSERT_EQ(drop_count, 1);
 	UT_ASSERT_EQ(space_reads, 2); /* No read recreates SPACE after invalidation. */
@@ -5023,12 +5143,137 @@ UT_TEST(test_drop_work_bounded_scan_continues_after_a_retained_storage_failure)
 
 #include "test_cluster_ko_abandon.h"
 
+UT_TEST(test_real_aux_space_dispatch_never_uses_backend_only_s)
+{
+	ClusterKoSharedMessageV2 message;
+	volatile bool threw = false;
+	reset_test();
+	cluster_shared_config = real_space_reader = true;
+	space_identity.sequence = space_identity.operation = 1;
+	space_identity.key.locator.dbOid = 5;
+	message = shared_request(123, current_epoch);
+	enqueue_shared(&message);
+	expecting_error = true;
+	PG_TRY();
+	{
+		drain_and_send();
+	}
+	PG_CATCH();
+	{
+		threw = true;
+		/* The fixture's buffer owner releases the failed ordinary acquisition. */
+		space_locked = space_pinned = false;
+	}
+	PG_END_TRY();
+	expecting_error = false;
+	if (threw)
+		printf("# actual SPACE dispatch refused SQLSTATE=%d level=%d ordinary_S=%d\n",
+			   reported_sqlstate, fixture_error_level, ordinary_space_locks);
+	UT_ASSERT(!threw);
+	UT_ASSERT_EQ(ordinary_space_locks, 0);
+	UT_ASSERT_EQ(maintenance_space_locks, 2);
+	UT_ASSERT_EQ(space_reads, 2);
+	UT_ASSERT_EQ(drop_count, 1);
+	UT_ASSERT_EQ(ack_count, 1);
+	UT_ASSERT(!space_pinned && !space_locked);
+}
+
+UT_TEST(test_peer_space_entry_checks_precede_io)
+{
+	for (int fault = 0; fault < 7; fault++) {
+		ClusterKoSharedMessageV2 m;
+		reset_test();
+		cluster_shared_config = real_space_reader = true;
+		MyBackendType = B_SINVAL_BCAST;
+		MyBackendId = InvalidBackendId;
+		m = shared_request(123, current_epoch);
+		switch (fault) {
+		case 0: cluster_shared_config = false; break;
+		case 1: m.verb = CLUSTER_KO_SHARED_ACK; break;
+		case 2: m.peer_node = 1; break;
+		case 3: MyBackendType = B_BACKEND; break;
+		case 4: CurrentResourceOwner = NULL; break;
+		case 5: CritSectionCount = 1; break;
+		}
+		UT_ASSERT(!ko_shared_peer_space_current(fault == 6 ? NULL : &m));
+		UT_ASSERT_EQ(space_reads, 0);
+		UT_ASSERT_EQ(maintenance_space_locks + ordinary_space_locks, 0);
+		CritSectionCount = 0;
+	}
+}
+
+UT_TEST(test_peer_space_checks_every_identity_field_and_keeps_origin_s)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		ClusterKoSharedMessageV2 m;
+		reset_test();
+		cluster_shared_config = real_space_reader = true;
+		space_identity.key.locator.dbOid = 5;
+		space_identity.sequence = space_identity.operation = 1;
+		MyBackendType = B_SINVAL_BCAST;
+		MyBackendId = InvalidBackendId;
+		m = shared_request(123, current_epoch);
+		switch (fault) {
+		case 0: space_identity.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED; break;
+		case 1: space_identity.key.system_identifier++; break;
+		case 2: space_identity.key.database_incarnation++; break;
+		case 3: space_identity.key.locator.relNumber++; break;
+		case 4: space_identity.key.storage_uuid[1]++; break;
+		case 5: space_identity.incarnation[1]++; break;
+		}
+		UT_ASSERT(!ko_shared_peer_space_current(&m));
+		UT_ASSERT_EQ(maintenance_space_locks, 1);
+		UT_ASSERT_EQ(ordinary_space_locks, 0);
+		UT_ASSERT(!space_pinned && !space_locked);
+	}
+	reset_test();
+	cluster_shared_config = real_space_reader = true;
+	space_identity.key.locator.dbOid = 5;
+	space_identity.sequence = space_identity.operation = 1;
+	{
+		ClusterKoSharedMessageV2 m = shared_request(123, current_epoch);
+		UT_ASSERT(ko_shared_space_current(&m));
+		UT_ASSERT_EQ(ordinary_space_locks, 1);
+		UT_ASSERT_EQ(maintenance_space_locks, 0);
+		UT_ASSERT_EQ(MyBackendId, 1);
+		UT_ASSERT(!space_pinned && !space_locked);
+	}
+}
+
+UT_TEST(test_peer_current_refusal_at_either_read_releases_pin_without_ack)
+{
+	for (int at = 1; at <= 2; at++) {
+		ClusterKoSharedMessageV2 m;
+		reset_test();
+		cluster_shared_config = real_space_reader = true;
+		space_identity.key.locator.dbOid = 5;
+		space_identity.sequence = space_identity.operation = 1;
+		space_current_refuse_at = at;
+		m = shared_request(123, current_epoch);
+		enqueue_shared(&m);
+		drain_and_send();
+		UT_ASSERT_EQ(maintenance_space_locks, at);
+		UT_ASSERT_EQ(ordinary_space_locks, 0);
+		UT_ASSERT_EQ(flush_count, at - 1);
+		UT_ASSERT_EQ(drop_count, 0);
+		UT_ASSERT_EQ(ack_count, 0);
+		UT_ASSERT(!space_pinned && !space_locked);
+		drain_and_send();
+		UT_ASSERT_EQ(maintenance_space_locks, at);
+		UT_ASSERT_EQ(ack_count, 0);
+	}
+}
+
 int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(110);
+	UT_PLAN(114);
 	UT_RUN(test_only_actual_consumer_can_observe);
+	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
+	UT_RUN(test_peer_space_entry_checks_precede_io);
+	UT_RUN(test_peer_space_checks_every_identity_field_and_keeps_origin_s);
+	UT_RUN(test_peer_current_refusal_at_either_read_releases_pin_without_ack);
 	UT_RUN(test_real_admission_flush_drop_ack_order);
 	UT_RUN(test_origin_barrier_discards_lease_even_without_remote_work);
 	UT_RUN(test_full_ring_wrap_and_retained_stale_bytes);

@@ -652,17 +652,38 @@ ko_shared_control_current(const ClusterKoSharedMessageV2 *message)
 }
 
 static bool
+ko_shared_space_matches(const ClusterKoSharedMessageV2 *message,
+						const ClusterSpaceIdentity *identity)
+{
+	return identity->state == CLUSTER_SPACE_IDENTITY_LIVE
+		   && identity->key.system_identifier == message->key.system_identifier
+		   && identity->key.database_incarnation == message->key.database_incarnation
+		   && RelFileLocatorEquals(identity->key.locator, message->key.locator)
+		   && memcmp(identity->key.storage_uuid, message->key.storage_uuid, 16) == 0
+		   && memcmp(identity->incarnation, message->incarnation, 16) == 0;
+}
+
+static bool
 ko_shared_space_current(const ClusterKoSharedMessageV2 *message)
 {
 	ClusterSpaceIdentity identity;
 
 	return cluster_space_relation_read_identity(message->key.locator, &identity)
-		   && identity.state == CLUSTER_SPACE_IDENTITY_LIVE
-		   && identity.key.system_identifier == message->key.system_identifier
-		   && identity.key.database_incarnation == message->key.database_incarnation
-		   && RelFileLocatorEquals(identity.key.locator, message->key.locator)
-		   && memcmp(identity.key.storage_uuid, message->key.storage_uuid, 16) == 0
-		   && memcmp(identity.incarnation, message->incarnation, 16) == 0;
+		   && ko_shared_space_matches(message, &identity);
+}
+
+/* The SI peer owns auxiliary maintenance work, not a backend-indexed S slot. */
+static bool
+ko_shared_peer_space_current(const ClusterKoSharedMessageV2 *message)
+{
+	ClusterSpaceIdentity identity;
+
+	if (message == NULL || !cluster_shared_config
+		|| message->verb != CLUSTER_KO_SHARED_REQUEST || message->peer_node != cluster_node_id
+		|| MyBackendType != B_SINVAL_BCAST || CurrentResourceOwner == NULL || CritSectionCount != 0)
+		return false;
+	return cluster_space_relation_read_maintenance_identity(message->key.locator, &identity)
+		   && ko_shared_space_matches(message, &identity);
 }
 
 bool
@@ -2856,7 +2877,7 @@ cluster_ko_drain_inbound_and_apply(void)
 			|| slot.shared != cluster_shared_config
 			|| (slot.shared
 				&& (!ko_shared_control_current(&slot.qualified)
-					|| !ko_shared_space_current(&slot.qualified))))
+					|| !ko_shared_peer_space_current(&slot.qualified))))
 			goto next;
 		/* A peer may publish DONE only after its own bounded CTRC journal is
 		 * drained.  No ACK makes the enqueuer fail closed without extending
@@ -2893,7 +2914,7 @@ cluster_ko_drain_inbound_and_apply(void)
 		}
 		/* Check SPACE before invalidation; rereading it afterwards would
 		 * recreate precisely the buffer the barrier has just discarded. */
-		if (slot.shared && !ko_shared_space_current(&slot.qualified))
+		if (slot.shared && !ko_shared_peer_space_current(&slot.qualified))
 			goto next;
 		DropRelationsAllBuffers(&smgr, 1);
 		cluster_hw_lease_discard(rloc, MAIN_FORKNUM);

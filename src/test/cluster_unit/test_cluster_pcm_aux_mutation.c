@@ -21,6 +21,9 @@
 #include "storage/fsm_internals.h"
 #include "storage/smgr.h"
 #include "unit_test.h"
+#include "cluster/cluster_mode.h"
+#include "access/visibilitymap.h"
+#include "test_cluster_heap_maintenance_policy.inc"
 
 UT_DEFINE_GLOBALS();
 int NBuffers = 3;
@@ -31,6 +34,7 @@ bool cluster_recmerge_apply_foreign = false;
 uint64 cluster_recmerge_window_scn = 0;
 uint64 cluster_recmerge_window_own_lsn = 0;
 int cluster_node_id = 0;
+bool cluster_enabled = false;
 bool cluster_shared_config = false;
 
 /* This fixture exercises the native VM/FSM mutation and auxiliary-X retry

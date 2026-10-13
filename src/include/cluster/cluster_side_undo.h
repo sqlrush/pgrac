@@ -119,6 +119,8 @@ extern bool cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out
  * STOP-RF-SIDE-SPACE-ABI is active.
  */
 extern bool cluster_undo_preflight(const ClusterUndoDecoded *decoded);
+/* Historical record classification only; never permits a TT transition. */
+extern bool cluster_undo_inspect_pi(const ClusterUndoDecoded *decoded);
 
 /* Prepare one typed data block from owned immutable payload. Caller proves
  * source/target generation, isolation and durability; this is not authority.

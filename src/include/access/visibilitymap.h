@@ -21,6 +21,9 @@
 #include "storage/relfilelocator.h"
 #include "utils/relcache.h"
 
+/* PGRAC: policy only; raw VM bits retain their original diagnostic meaning. */
+extern bool cluster_heap_maintenance_restricted(Relation rel);
+
 /* Macros for visibilitymap test */
 #define VM_ALL_VISIBLE(r, b, v) \
 	((visibilitymap_get_status((r), (b), (v)) & VISIBILITYMAP_ALL_VISIBLE) != 0)
