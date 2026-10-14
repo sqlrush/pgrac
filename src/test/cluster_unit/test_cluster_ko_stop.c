@@ -5703,6 +5703,168 @@ UT_TEST(test_peer_ack_refusal_keeps_original_route_cut)
 	}
 }
 
+/* The exact CTRC owner is covered by test_cluster_ctrc_cleaner. This
+ * boundary supplies one process-local attempt to the real KO registry. */
+static ClusterCtrcCleanerReadScopeV3 cleaner_scope;
+static RelFileLocator cleaner_locator;
+static bool cleaner_scope_live;
+
+bool
+cluster_ctrc_cleaner_read_scope_current_v3(const ClusterCtrcCleanerReadScopeV3 *scope,
+										   RelFileLocator locator, ForkNumber fork,
+										   BlockNumber block)
+{
+	return cleaner_scope_live && scope != NULL && MyBackendType == B_UNDO_CLEANER
+		   && MyAuxProcType == UndoCleanerProcess && scope->pid == MyProcPid
+		   && memcmp(scope, &cleaner_scope, sizeof(*scope)) == 0
+		   && RelFileLocatorEquals(locator, cleaner_locator)
+		   && ((fork == MAIN_FORKNUM && block == 44) || (fork == SPACE_FORKNUM && block == 0));
+}
+
+bool
+cluster_ctrc_cleaner_read_scope_snapshot_v3(RelFileLocator locator, ForkNumber fork,
+											BlockNumber block, ClusterCtrcCleanerReadScopeV3 *out)
+{
+	if (!cluster_ctrc_cleaner_read_scope_current_v3(&cleaner_scope, locator, fork, block))
+		return false;
+	*out = cleaner_scope;
+	return true;
+}
+
+static void
+cleaner_scope_fixture(const ClusterKoSharedMessageV3 *request)
+{
+	memset(&cleaner_scope, 0, sizeof(cleaner_scope));
+	cleaner_scope.serial = 18;
+	cleaner_scope.pid = MyProcPid;
+	cleaner_scope.system_identifier = request->base.key.system_identifier;
+	cleaner_scope.formation_epoch = request->base.epoch;
+	cleaner_scope.boot_incarnation = request->base.peer_boot;
+	cleaner_locator = request->base.key.locator;
+	cleaner_scope_live = true;
+	MyBackendType = B_UNDO_CLEANER;
+	MyAuxProcType = UndoCleanerProcess;
+}
+
+UT_TEST(test_cleaner_attempt_is_counted_before_fence_and_blocks_ready_until_finally)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(910);
+	ClusterKoPeerFenceHandleV3 handle;
+	ClusterKoPeerFenceStateV3 state;
+	ClusterKoPeerAdmissionV3 read, ordinary;
+
+	cleaner_scope_fixture(&request);
+	UT_ASSERT(cluster_ko_cleaner_enter_v3(cleaner_locator, &cleaner_scope));
+	UT_ASSERT(!cluster_ko_cleaner_enter_v3(cleaner_locator, &cleaner_scope));
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(NULL), CLUSTER_NORMAL_STOP_PENDING);
+	MyAuxProcType = SinvalBcastProcess;
+	MyBackendType = B_SINVAL_BCAST;
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+	UT_ASSERT(!cluster_ko_peer_fence_ready_v3(&request, &handle));
+	MyAuxProcType = UndoCleanerProcess;
+	MyBackendType = B_UNDO_CLEANER;
+	UT_ASSERT(!cluster_ko_peer_admission_begin_v3(cleaner_locator, &ordinary));
+	UT_ASSERT(cluster_ko_peer_read_begin_v3(cleaner_locator, MAIN_FORKNUM, 44, &read));
+	UT_ASSERT(!cluster_ko_peer_admission_current_v3(&read, cleaner_locator));
+	SpinLockAcquire(&storage.shared_lock);
+	UT_ASSERT(cluster_ko_peer_read_current_v3(&read, cleaner_locator, MAIN_FORKNUM, 44));
+	UT_ASSERT(!cluster_ko_peer_read_current_v3(&read, cleaner_locator, MAIN_FORKNUM, 45));
+	SpinLockRelease(&storage.shared_lock);
+	UT_ASSERT(!cluster_ko_peer_read_begin_v3(cleaner_locator, FSM_FORKNUM, 44, &ordinary));
+	UT_ASSERT(cluster_ko_peer_read_begin_v3(cleaner_locator, SPACE_FORKNUM, 0, &ordinary));
+	/* Concurrent receipt completion is not the end of the already running
+	 * attempt. Only its exact finally exit releases this reference. */
+	cleaner_scope_live = false;
+	MyProcPid++;
+	cluster_ko_cleaner_leave_v3(cleaner_locator, &cleaner_scope);
+	MyProcPid--;
+	MyAuxProcType = SinvalBcastProcess;
+	MyBackendType = B_SINVAL_BCAST;
+	UT_ASSERT(!cluster_ko_peer_fence_ready_v3(&request, &handle));
+	MyAuxProcType = UndoCleanerProcess;
+	MyBackendType = B_UNDO_CLEANER;
+	cluster_ko_cleaner_leave_v3(cleaner_locator, &cleaner_scope);
+	UT_ASSERT(!cluster_ko_peer_read_current_v3(&read, cleaner_locator, MAIN_FORKNUM, 44));
+	MyAuxProcType = SinvalBcastProcess;
+	MyBackendType = B_SINVAL_BCAST;
+	UT_ASSERT(cluster_ko_peer_fence_ready_v3(&request, &handle));
+	cleaner_scope_fixture(&request);
+	UT_ASSERT(!cluster_ko_cleaner_enter_v3(cleaner_locator, &cleaner_scope));
+	UT_ASSERT(!cluster_ko_peer_read_begin_v3(cleaner_locator, SPACE_FORKNUM, 0, &ordinary));
+	cleaner_scope_live = false;
+}
+
+UT_TEST(test_cleaner_attempt_admission_rejects_source_owner_and_terminal_drift)
+{
+	for (unsigned fault = 0; fault < 8; fault++) {
+		ClusterKoSharedMessageV3 request = peer_fence_fixture(920 + fault);
+		ClusterKoPeerFenceHandleV3 handle;
+		ClusterKoPeerFenceStateV3 state;
+		UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+		if (fault == 6 || fault == 7) {
+			UT_ASSERT(cluster_ko_peer_fence_ready_v3(&request, &handle));
+			if (fault == 7)
+				UT_ASSERT(cluster_ko_peer_commit_v3(request.base.origin_node, request.base.epoch,
+													request.base.origin_boot,
+													request.base.peer_boot, request.base.batch_id));
+		}
+		cleaner_scope_fixture(&request);
+		switch (fault) {
+		case 0:
+			cleaner_scope.system_identifier++;
+			break;
+		case 1:
+			cleaner_scope.formation_epoch++;
+			break;
+		case 2:
+			cleaner_scope.boot_incarnation++;
+			break;
+		case 3:
+			cleaner_scope.worker = CLUSTER_CTRC_CLEANER_WORKERS;
+			break;
+		case 4:
+			cleaner_scope.serial = 0;
+			break;
+		case 5:
+			MyBackendType = B_BACKEND;
+			break;
+		}
+		UT_ASSERT(!cluster_ko_cleaner_enter_v3(cleaner_locator, &cleaner_scope));
+		UT_ASSERT(!storage.cleaner_work[0].used);
+		cleaner_scope_live = false;
+	}
+}
+
+UT_TEST(test_cleaner_entry_exit_invalidates_drain_scan_generation_without_wrapping)
+{
+	for (unsigned overflow = 0; overflow < 3; overflow++) {
+		ClusterKoSharedMessageV3 request = peer_fence_fixture(930 + overflow);
+		ClusterKoPeerFenceHandleV3 handle;
+		ClusterKoPeerFenceStateV3 state;
+		uint64 revision;
+		UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+		cleaner_scope_fixture(&request);
+		if (overflow == 1)
+			pg_atomic_write_u64(&storage.peer_admission_revision, UINT64_MAX - 1);
+		revision = pg_atomic_read_u64(&storage.peer_admission_revision);
+		UT_ASSERT_EQ(cluster_ko_cleaner_enter_v3(cleaner_locator, &cleaner_scope), overflow != 1);
+		if (overflow == 1) {
+			UT_ASSERT_EQ(pg_atomic_read_u64(&storage.peer_admission_revision), revision);
+			continue;
+		}
+		UT_ASSERT_EQ(pg_atomic_read_u64(&storage.peer_admission_revision), revision + 1);
+		if (overflow == 2)
+			pg_atomic_write_u64(&storage.peer_admission_revision, UINT64_MAX - 1);
+		cluster_ko_cleaner_leave_v3(cleaner_locator, &cleaner_scope);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&storage.peer_admission_revision),
+					 overflow == 2 ? UINT64_MAX : revision + 2);
+		MyAuxProcType = SinvalBcastProcess;
+		MyBackendType = B_SINVAL_BCAST;
+		UT_ASSERT_EQ(cluster_ko_peer_fence_ready_v3(&request, &handle), overflow == 0);
+	}
+	cleaner_scope_live = false;
+}
+
 UT_TEST(test_peer_fence_closes_new_admission_and_invalidates_prior_sample)
 {
 	ClusterKoSharedMessageV3 request = peer_fence_fixture(904);
@@ -6250,7 +6412,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(141);
+	UT_PLAN(144);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
 	UT_RUN(test_peer_space_entry_checks_precede_io);
@@ -6372,6 +6534,9 @@ main(void)
 	UT_RUN(test_v3_receive_requires_exact_tcp_owner_before_queue);
 	UT_RUN(test_v3_inbound_retains_peer_route_without_rewriting_origin);
 	UT_RUN(test_peer_ack_refusal_keeps_original_route_cut);
+	UT_RUN(test_cleaner_attempt_is_counted_before_fence_and_blocks_ready_until_finally);
+	UT_RUN(test_cleaner_attempt_admission_rejects_source_owner_and_terminal_drift);
+	UT_RUN(test_cleaner_entry_exit_invalidates_drain_scan_generation_without_wrapping);
 	UT_RUN(test_peer_fence_closes_new_admission_and_invalidates_prior_sample);
 	UT_RUN(test_peer_admission_current_never_takes_object_lock_or_renews_identity);
 	UT_RUN(test_peer_fence_revision_never_uses_zero_or_wraps);

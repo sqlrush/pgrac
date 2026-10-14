@@ -164,6 +164,12 @@ typedef struct ClusterKoPeerFenceV3 {
 	TimestampTz holder_sent_at;
 } ClusterKoPeerFenceV3;
 
+typedef struct ClusterKoCleanerWorkV3 {
+	bool used;
+	RelFileLocator locator;
+	ClusterCtrcCleanerReadScopeV3 scope;
+} ClusterKoCleanerWorkV3;
+
 typedef struct ClusterKoShared {
 	pg_atomic_uint64 flush_count;		 /* barriers initiated (enqueuer) */
 	pg_atomic_uint64 ack_received_count; /* peer DONE ACKs recorded (enqueuer) */
@@ -191,6 +197,7 @@ typedef struct ClusterKoShared {
 	uint64 holder_probe_nonce;
 	uint32 holder_probe_cursor;
 	ClusterKoPeerFenceV3 peer_fences[CLUSTER_KO_SHARED_CAPACITY];
+	ClusterKoCleanerWorkV3 cleaner_work[CLUSTER_CTRC_CLEANER_WORKERS];
 	/* Preallocated native continuations belong to this same KO owner.
 	 * One finite ready batch is drained before adopting newly committed work. */
 	int native_dsa_tranche;
@@ -830,8 +837,168 @@ cluster_ko_peer_admission_current_v3(const ClusterKoPeerAdmissionV3 *admission,
 	 * reversing the object-lock order. The caller publishes its reference
 	 * before releasing that original lock; the later drain must observe it. */
 	return ko_state != NULL && admission != NULL && cluster_shared_config
+		   && cluster_interconnect_tier == CLUSTER_IC_TIER_1 && admission->cleaner.serial == 0
+		   && admission->revision != 0 && admission->revision != UINT64_MAX
+		   && RelFileLocatorEquals(admission->locator, locator)
+		   && pg_atomic_read_u64(&ko_state->peer_admission_revision) == admission->revision;
+}
+
+static bool
+ko_cleaner_scope_equal(const ClusterCtrcCleanerReadScopeV3 *a,
+					   const ClusterCtrcCleanerReadScopeV3 *b)
+{
+	return a->serial == b->serial && a->pid == b->pid && a->worker == b->worker
+		   && a->system_identifier == b->system_identifier
+		   && a->formation_epoch == b->formation_epoch
+		   && a->boot_incarnation == b->boot_incarnation;
+}
+
+/* Under the original object lock. A passive/terminal fence never grants
+ * fresh cleanup work, even if the caller presents an old receipt. */
+static bool
+ko_cleaner_fences_allow_locked(RelFileLocator locator, const ClusterCtrcCleanerReadScopeV3 *scope,
+							   bool *fenced)
+{
+	if (fenced != NULL)
+		*fenced = false;
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		const ClusterKoPeerFenceV3 *entry = &ko_state->peer_fences[i];
+		if (entry->state == CLUSTER_KO_PEER_FENCE_EMPTY
+			|| !RelFileLocatorEquals(entry->request.base.key.locator, locator))
+			continue;
+		if (fenced != NULL)
+			*fenced = true;
+		if (entry->state != CLUSTER_KO_PEER_FENCE_ACTIVE
+			|| entry->request.base.key.system_identifier != scope->system_identifier
+			|| entry->request.base.epoch != scope->formation_epoch
+			|| entry->request.base.peer_boot != scope->boot_incarnation)
+			return false;
+	}
+	return true;
+}
+
+static bool
+ko_cleaner_pending_locked(RelFileLocator locator)
+{
+	for (unsigned i = 0; i < CLUSTER_CTRC_CLEANER_WORKERS; i++)
+		if (ko_state->cleaner_work[i].used
+			&& RelFileLocatorEquals(ko_state->cleaner_work[i].locator, locator))
+			return true;
+	return false;
+}
+
+bool
+cluster_ko_cleaner_enter_v3(RelFileLocator locator, const ClusterCtrcCleanerReadScopeV3 *scope)
+{
+	ClusterKoCleanerWorkV3 *work;
+	bool allowed = false, fenced = false;
+	uint64 revision;
+
+	/* Private and non-v3 configurations retain the original cleaner. */
+	if (!cluster_enabled || !cluster_shared_config
+		|| cluster_interconnect_tier != CLUSTER_IC_TIER_1)
+		return true;
+	if (ko_state == NULL || scope == NULL || scope->serial == 0 || scope->pid <= 0
+		|| scope->worker >= CLUSTER_CTRC_CLEANER_WORKERS
+		|| !cluster_ctrc_cleaner_read_scope_current_v3(scope, locator, SPACE_FORKNUM, 0))
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	work = &ko_state->cleaner_work[scope->worker];
+	/* No takeover by PID reuse, duplicate begin, or a replacement worker.
+	 * An unexpected exit retains this exact obligation for original recovery. */
+	revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+	if (!work->used && revision != 0 && revision < UINT64_MAX - 1
+		&& ko_cleaner_fences_allow_locked(locator, scope, &fenced)) {
+		work->locator = locator;
+		work->scope = *scope;
+		work->used = true;
+		/* A scan started before this finite producer must be retried. */
+		if (fenced)
+			(void)pg_atomic_fetch_add_u64(&ko_state->peer_admission_revision, 1);
+		allowed = true;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	return allowed;
+}
+
+void
+cluster_ko_cleaner_leave_v3(RelFileLocator locator, const ClusterCtrcCleanerReadScopeV3 *scope)
+{
+	ClusterKoCleanerWorkV3 *work;
+	bool wake = false, fenced = false;
+
+	if (ko_state == NULL || scope == NULL || scope->serial == 0 || scope->pid != MyProcPid
+		|| scope->worker >= CLUSTER_CTRC_CLEANER_WORKERS || MyBackendType != B_UNDO_CLEANER
+		|| ClusterUndoCleanerWorkerIdForType(MyAuxProcType) != scope->worker)
+		return;
+	SpinLockAcquire(&ko_state->shared_lock);
+	work = &ko_state->cleaner_work[scope->worker];
+	if (work->used && RelFileLocatorEquals(work->locator, locator)
+		&& ko_cleaner_scope_equal(&work->scope, scope)) {
+		(void)ko_cleaner_fences_allow_locked(locator, scope, &fenced);
+		if (fenced) {
+			uint64 revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+			/* Saturation refuses further admission/READY; never wrap to an
+			 * old scan generation. Ending the attempt cannot clear receipts. */
+			pg_atomic_write_u64(&ko_state->peer_admission_revision,
+								revision == 0 || revision == UINT64_MAX ? UINT64_MAX
+																		: revision + 1);
+		}
+		memset(work, 0, sizeof(*work));
+		wake = true;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	if (wake)
+		cluster_sinval_set_proc_latch();
+}
+
+bool
+cluster_ko_peer_read_begin_v3(RelFileLocator locator, ForkNumber fork, BlockNumber block,
+							  ClusterKoPeerAdmissionV3 *out)
+{
+	ClusterCtrcCleanerReadScopeV3 scope;
+	ClusterKoCleanerWorkV3 *work;
+	uint64 revision;
+	bool allowed = false;
+
+	if (cluster_ko_peer_admission_begin_v3(locator, out))
+		return true;
+	if (out == NULL || ko_state == NULL || !cluster_shared_config
+		|| cluster_interconnect_tier != CLUSTER_IC_TIER_1
+		|| !cluster_ctrc_cleaner_read_scope_snapshot_v3(locator, fork, block, &scope)
+		|| scope.worker >= CLUSTER_CTRC_CLEANER_WORKERS)
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	work = &ko_state->cleaner_work[scope.worker];
+	revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+	if (revision != 0 && revision != UINT64_MAX && work->used
+		&& RelFileLocatorEquals(work->locator, locator)
+		&& ko_cleaner_scope_equal(&work->scope, &scope)
+		&& ko_cleaner_fences_allow_locked(locator, &scope, NULL)) {
+		out->locator = locator;
+		out->revision = revision;
+		out->fork = fork;
+		out->block = block;
+		out->cleaner = scope;
+		allowed = true;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	return allowed;
+}
+
+bool
+cluster_ko_peer_read_current_v3(const ClusterKoPeerAdmissionV3 *admission, RelFileLocator locator,
+								ForkNumber fork, BlockNumber block)
+{
+	if (admission == NULL || admission->cleaner.serial == 0)
+		return cluster_ko_peer_admission_current_v3(admission, locator);
+	/* The registered attempt prevents READY while this process-local scope
+	 * is live. No object or CTRC lock is acquired under a buffer header. */
+	return ko_state != NULL && cluster_shared_config
 		   && cluster_interconnect_tier == CLUSTER_IC_TIER_1 && admission->revision != 0
-		   && admission->revision != UINT64_MAX && RelFileLocatorEquals(admission->locator, locator)
+		   && admission->revision != UINT64_MAX && admission->fork == fork
+		   && admission->block == block && RelFileLocatorEquals(admission->locator, locator)
+		   && cluster_ctrc_cleaner_read_scope_current_v3(&admission->cleaner, locator, fork, block)
 		   && pg_atomic_read_u64(&ko_state->peer_admission_revision) == admission->revision;
 }
 
@@ -1098,7 +1265,10 @@ cluster_ko_peer_fence_ready_v3(const ClusterKoSharedMessageV3 *request,
 	if (entry->serial == handle->serial && entry->peer_route_generation == peer_route_generation
 		&& (entry->state == CLUSTER_KO_PEER_FENCE_ACTIVE
 			|| entry->state == CLUSTER_KO_PEER_FENCE_READY)
-		&& memcmp(entry->encoded, encoded, sizeof(encoded)) == 0) {
+		&& memcmp(entry->encoded, encoded, sizeof(encoded)) == 0
+		&& !ko_cleaner_pending_locked(request->base.key.locator)
+		&& pg_atomic_read_u64(&ko_state->peer_admission_revision) != 0
+		&& pg_atomic_read_u64(&ko_state->peer_admission_revision) != UINT64_MAX) {
 		entry->state = CLUSTER_KO_PEER_FENCE_READY;
 		ok = true;
 	}
@@ -2954,6 +3124,13 @@ cluster_ko_shared_normal_stop_poll_v2(const char **reason)
 			why = "KO_PEER_DRAIN_OWNED";
 		}
 	}
+	for (unsigned i = 0; i < CLUSTER_CTRC_CLEANER_WORKERS; i++) {
+		if (ko_state->cleaner_work[i].used && result == CLUSTER_NORMAL_STOP_READY) {
+			result = CLUSTER_NORMAL_STOP_PENDING;
+			why = "KO_CLEANER_ATTEMPT_OWNED";
+		}
+	}
+
 	SpinLockRelease(&ko_state->shared_lock);
 	if (reason != NULL)
 		*reason = why;

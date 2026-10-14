@@ -4758,6 +4758,7 @@ clean distclean maintainer-clean:
 		test_cluster_pcm_aux_consumer.inc test_cluster_pcm_aux_ledger.inc \
 		test_cluster_ctrc_dispatch.inc \
 		test_cluster_ctrc_run_pass.inc \
+		test_cluster_ctrc_read_scope.inc \
 		test_cluster_undo_cleaner_holds.inc \
 		test_cluster_undo_extent_types.inc test_cluster_undo_extent_claim.inc \
 		$(CLUSTER_UNDO_RECORD_TEST_O) $(CLUSTER_UNDO_ALLOC_TEST_O) \
@@ -7914,6 +7915,14 @@ test_cluster_ctrc_run_pass.inc: $(top_srcdir)/src/backend/cluster/cluster_termin
 	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_ctrc_read_scope.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	awk '/^ctrc_cleaner_clean_next_receipt\(/ { print "static bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_ctrc_cleaner test_cluster_ctrc_capacity test_cluster_ctrc_dispatch \
+test_cluster_ctrc_itl_reuse: test_cluster_ctrc_read_scope.inc
+
 test_cluster_ctrc_capacity: test_cluster_ctrc_capacity.c test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h unit_test.h
@@ -7924,10 +7933,10 @@ test_cluster_ctrc_capacity: test_cluster_ctrc_capacity.c test_cluster_ctrc_clean
 test_cluster_undo_cleaner: $(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
 	$(top_srcdir)/src/include/miscadmin.h
 
-test_cluster_ctrc_cleaner: test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc unit_test.h \
+test_cluster_ctrc_cleaner: test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc unit_test.h $(CLUSTER_SCN_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_SCN_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
@@ -8275,6 +8284,7 @@ test_cluster_buffer_mapping: test_cluster_buffer_mapping.c unit_test.h \
 # supplied by the same fixtures as the buffer mapping tests.
 test_cluster_buffer_cr_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^cluster_bufmgr_ko_read_sample\(/ { print "static bool"; emit=1; ko_sample++ } \
+	     /^cluster_bufmgr_ko_native_read_sample\(/ { print "static bool"; emit=1; ko_native_sample++ } \
 	     /^cluster_bufmgr_should_pcm_track\(/ { print "static inline bool"; emit=1; track++ } \
 	     /^cluster_bufmgr_pcm_aux_pin_admission_locked\(/ { print "static inline bool"; emit=1; aux++ } \
 	     /^cluster_bufmgr_pcm_x_retained_image_locked\(/ { print "static inline bool"; emit=1; retained++ } \
@@ -8293,7 +8303,7 @@ test_cluster_buffer_cr_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmg
 	     /^SyncOneBuffer\(/ { print "static int"; emit=1; sync_one++ } \
 	     /^FindAndDropRelationBuffers\(/ { print "static void"; emit=1; find++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (recent != 1 || alloc != 1 || ko_sample != 1 || track != 1 || aux != 1 || retained != 1 || write_gate != 4 || walk != 1 || cr != 1 || reserve != 1 || cache != 2 || commit != 1 || drop != 1 || tail != 1 || victim != 1 || get_victim != 1 || sync_one != 1 || find != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (recent != 1 || alloc != 1 || ko_sample != 1 || ko_native_sample != 1 || track != 1 || aux != 1 || retained != 1 || write_gate != 4 || walk != 1 || cr != 1 || reserve != 1 || cache != 2 || commit != 1 || drop != 1 || tail != 1 || victim != 1 || get_victim != 1 || sync_one != 1 || find != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_buffer_cr_pins.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile

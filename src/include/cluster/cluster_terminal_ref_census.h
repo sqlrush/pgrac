@@ -33,6 +33,7 @@
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_undo_format.h"
 #include "storage/block.h"
+#include "storage/relfilelocator.h"
 
 #define CLUSTER_CTRC_FORMAT_VERSION UINT8_C(1)
 #define CLUSTER_CTRC_TXN_KEY_BYTES 96
@@ -398,6 +399,25 @@ typedef struct ClusterCtrcReceipt {
 	XLogRecPtr highest_local_wal_lsn;
 	XLogRecPtr required_lsn[CLUSTER_SF_DEP_MAX_ORIGINS];
 } ClusterCtrcReceipt;
+
+/* A process-local observation of the original cleaner's one APPLIED
+ * receipt. It neither completes the receipt nor grants page/current access. */
+typedef struct ClusterCtrcCleanerReadScopeV3 {
+	uint64 serial;
+	int32 pid;
+	uint32 worker;
+	uint64 system_identifier;
+	uint64 formation_epoch;
+	uint64 boot_incarnation;
+} ClusterCtrcCleanerReadScopeV3;
+
+extern bool cluster_ctrc_cleaner_read_scope_snapshot_v3(RelFileLocator locator, ForkNumber fork,
+														BlockNumber block,
+														ClusterCtrcCleanerReadScopeV3 *out);
+/* Lock-free: usable inside the original buffer header publication lock. */
+extern bool cluster_ctrc_cleaner_read_scope_current_v3(const ClusterCtrcCleanerReadScopeV3 *scope,
+													   RelFileLocator locator, ForkNumber fork,
+													   BlockNumber block);
 
 typedef struct ClusterCtrcApplyToken {
 	bool valid;

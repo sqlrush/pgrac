@@ -81,6 +81,8 @@ int NBuffers = 16;
 int MaxBackends = 8;
 int cluster_node_id = 0;
 BackendType MyBackendType = B_BACKEND;
+AuxProcType MyAuxProcType = NotAnAuxProcess;
+int MyProcPid = 2901;
 static bool allow_new_service_participant = true;
 static unsigned new_service_participant_calls;
 static unsigned wake_count;
@@ -104,6 +106,27 @@ static void (*wakeup_hook)(void);
 /* Optional boundary for a caller's native/truncation guards; shared CTRC
  * lock ordering is still checked by the original fixture below. */
 static bool (*external_lock_hook)(LWLock *lock, LWLockMode mode, bool acquire);
+static bool read_scope_enter_refused;
+static unsigned read_scope_entered, read_scope_left;
+
+bool
+cluster_ko_cleaner_enter_v3(RelFileLocator locator, const ClusterCtrcCleanerReadScopeV3 *scope)
+{
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT(cluster_ctrc_cleaner_read_scope_current_v3(scope, locator, SPACE_FORKNUM, 0));
+	if (read_scope_enter_refused)
+		return false;
+	read_scope_entered++;
+	return true;
+}
+
+void
+cluster_ko_cleaner_leave_v3(RelFileLocator locator pg_attribute_unused(),
+							const ClusterCtrcCleanerReadScopeV3 *scope pg_attribute_unused())
+{
+	UT_ASSERT_EQ(held_count, 0);
+	read_scope_left++;
+}
 
 bool
 cluster_normal_stop_service_new_work(bool modifies_data)
@@ -384,6 +407,11 @@ reset_fixture(void)
 	wakeup_hook = NULL;
 	paused_actor_count = 0;
 	InterruptPending = 0;
+	MyAuxProcType = NotAnAuxProcess;
+	memset(&CtrcReadScope, 0, sizeof(CtrcReadScope));
+	CtrcReadSerial = 0;
+	read_scope_enter_refused = false;
+	read_scope_entered = read_scope_left = 0;
 }
 
 static ClusterCtrcOriginEntry *
@@ -856,6 +884,249 @@ prepare_fixture_receipt(ClusterCtrcOriginEntry *origin, uint64 operation_id,
 	target.page_operation_kind = 1;
 	return cluster_ctrc_receipt_prepare_shared(
 		&origin->key, &origin->touched[0], origin->grant_generation, &publication, &target, handle);
+}
+
+static bool
+seed_applied_read_scope(ClusterCtrcParticipantEntry *participant, ClusterCtrcReceipt *receipt,
+						uint64 *participant_index, uint64 *receipt_index)
+{
+	ClusterCtrcOriginEntry *origin = seed_origin(0, 1);
+	ClusterCtrcReceiptHandle handle;
+	ClusterCtrcApplyToken token;
+	ClusterCtrcTargetV1 target;
+
+	if (prepare_fixture_receipt(origin, 81, &handle) != CLUSTER_CTRC_PREPARE_READY)
+		return false;
+	target = handle.receipt->target;
+	target.kind = CTRC_TARGET_EXACT_ITL_SLOT;
+	target.itl_xid = origin->key.xid;
+	target.itl_class = 1;
+	target.itl_slot_wrap = 1;
+	target.uba[0] = 1;
+	target.planned_predecessor_sha256[0] = 1;
+	target.planned_successor_sha256[0] = 2;
+	if (cluster_ctrc_receipt_apply_shared(&handle, &target, &token) != CLUSTER_CTRC_APPLY_APPLIED
+		|| cluster_ctrc_participant_close(handle.participant, &origin->touched[0],
+										  origin->grant_generation, origin->seal_generation)
+			   != CLUSTER_CTRC_CLOSE_PENDING_DRAIN)
+		return false;
+	*participant = *handle.participant;
+	*receipt = *handle.receipt;
+	*participant_index = handle.participant_index;
+	*receipt_index = handle.receipt_index;
+	CtrcWorkerId = 0;
+	MyBackendType = B_UNDO_CLEANER;
+	MyAuxProcType = UndoCleanerProcess;
+	return true;
+}
+
+UT_TEST(test_original_cleaner_scope_binds_one_receipt_and_its_space_read)
+{
+	ClusterCtrcParticipantEntry participant;
+	ClusterCtrcReceipt receipt;
+	ClusterCtrcCleanerReadScopeV3 proof;
+	uint64 pi, ri, serial = 0;
+	RelFileLocator locator;
+
+	reset_fixture();
+	UT_ASSERT(seed_applied_read_scope(&participant, &receipt, &pi, &ri));
+	locator = (RelFileLocator){ receipt.target.spc_oid, receipt.target.db_oid,
+								receipt.target.rel_number };
+	UT_ASSERT(!cluster_ctrc_cleaner_read_scope_snapshot_v3(locator, MAIN_FORKNUM, 44, &proof));
+	UT_ASSERT(ctrc_cleaner_read_scope_begin(&participant, &receipt, pi, ri, &serial));
+	UT_ASSERT(serial > 0);
+	UT_ASSERT(cluster_ctrc_cleaner_read_scope_snapshot_v3(locator, MAIN_FORKNUM, 44, &proof));
+	UT_ASSERT_EQ(proof.pid, MyProcPid);
+	UT_ASSERT_EQ(proof.serial, serial);
+	UT_ASSERT_EQ(proof.formation_epoch, participant.identity.formation_epoch);
+	UT_ASSERT(cluster_ctrc_cleaner_read_scope_current_v3(&proof, locator, MAIN_FORKNUM, 44));
+	UT_ASSERT(cluster_ctrc_cleaner_read_scope_snapshot_v3(locator, SPACE_FORKNUM, 0, &proof));
+	UT_ASSERT(!cluster_ctrc_cleaner_read_scope_snapshot_v3(locator, SPACE_FORKNUM, 1, &proof));
+	UT_ASSERT(!cluster_ctrc_cleaner_read_scope_snapshot_v3(locator, MAIN_FORKNUM, 45, &proof));
+	UT_ASSERT(!cluster_ctrc_cleaner_read_scope_snapshot_v3(locator, FSM_FORKNUM, 44, &proof));
+	locator.relNumber++;
+	UT_ASSERT(!cluster_ctrc_cleaner_read_scope_snapshot_v3(locator, MAIN_FORKNUM, 44, &proof));
+	locator.relNumber--;
+	UT_ASSERT(!ctrc_cleaner_read_scope_end(serial + 1));
+	UT_ASSERT(ctrc_cleaner_read_scope_end(serial));
+	UT_ASSERT(!cluster_ctrc_cleaner_read_scope_current_v3(&proof, locator, SPACE_FORKNUM, 0));
+	UT_ASSERT_EQ(ctrc_receipt_entries()[ri].state, CTRC_RECEIPT_APPLIED);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_cleaner_scope_rejects_wrong_owner_and_receipt_drift)
+{
+	for (unsigned kind = 0; kind < 12; kind++) {
+		ClusterCtrcParticipantEntry participant;
+		ClusterCtrcReceipt receipt;
+		uint64 pi, ri, serial = 0;
+		reset_fixture();
+		UT_ASSERT(seed_applied_read_scope(&participant, &receipt, &pi, &ri));
+		switch (kind) {
+		case 0:
+			MyBackendType = B_BACKEND;
+			break;
+		case 1:
+			MyAuxProcType = CheckpointerProcess;
+			break;
+		case 2:
+			CtrcWorkerId = 1;
+			break;
+		case 3:
+			participant.seal_generation++;
+			break;
+		case 4:
+			participant.identity.boot_incarnation++;
+			break;
+		case 5:
+			receipt.publication.journal_slot_generation++;
+			break;
+		case 6:
+			receipt.target.block_number++;
+			break;
+		case 7:
+			ctrc_receipt_entries()[ri].state = CTRC_RECEIPT_CLEANED;
+			break;
+		case 8:
+			ctrc_participant_entries()[pi].state = CTRC_PARTICIPANT_OPEN;
+			break;
+		case 9:
+			ctrc_receipt_links()[ri].participant_plus_one = pi + 2;
+			break;
+		case 10:
+			CtrcReadSerial = UINT64_MAX;
+			break;
+		case 11:
+			MyProcPid = 0;
+			break;
+		}
+		UT_ASSERT(!ctrc_cleaner_read_scope_begin(&participant, &receipt, pi, ri, &serial));
+		UT_ASSERT_EQ(serial, 0);
+		UT_ASSERT(!CtrcReadScope.active);
+		UT_ASSERT_EQ(held_count, 0);
+		MyProcPid = 2901;
+		CtrcReadSerial = 0;
+	}
+}
+
+UT_TEST(test_cleaner_scope_current_is_local_and_expires_with_original_attempt)
+{
+	ClusterCtrcParticipantEntry participant;
+	ClusterCtrcReceipt receipt;
+	ClusterCtrcCleanerReadScopeV3 proof;
+	uint64 pi, ri, serial = 0, second = 0;
+	RelFileLocator locator;
+	unsigned before;
+
+	reset_fixture();
+	UT_ASSERT(seed_applied_read_scope(&participant, &receipt, &pi, &ri));
+	locator = (RelFileLocator){ receipt.target.spc_oid, receipt.target.db_oid,
+								receipt.target.rel_number };
+	UT_ASSERT(ctrc_cleaner_read_scope_begin(&participant, &receipt, pi, ri, &serial));
+	UT_ASSERT(!ctrc_cleaner_read_scope_begin(&participant, &receipt, pi, ri, &second));
+	UT_ASSERT(cluster_ctrc_cleaner_read_scope_snapshot_v3(locator, MAIN_FORKNUM, 44, &proof));
+	before = sleepable_acquisitions;
+	UT_ASSERT(cluster_ctrc_cleaner_read_scope_current_v3(&proof, locator, MAIN_FORKNUM, 44));
+	UT_ASSERT_EQ(sleepable_acquisitions, before);
+	MyProcPid++;
+	UT_ASSERT(!cluster_ctrc_cleaner_read_scope_current_v3(&proof, locator, MAIN_FORKNUM, 44));
+	MyProcPid--;
+	UT_ASSERT(ctrc_cleaner_read_scope_end(serial));
+	UT_ASSERT(ctrc_cleaner_read_scope_begin(&participant, &receipt, pi, ri, &second));
+	UT_ASSERT(second > serial);
+	UT_ASSERT(!cluster_ctrc_cleaner_read_scope_current_v3(&proof, locator, MAIN_FORKNUM, 44));
+	UT_ASSERT(ctrc_cleaner_read_scope_end(second));
+}
+
+UT_TEST(test_concurrent_original_discharge_does_not_end_running_cleaner_attempt)
+{
+	ClusterCtrcParticipantEntry participant;
+	ClusterCtrcReceipt receipt;
+	ClusterCtrcCleanerReadScopeV3 proof;
+	ClusterCtrcDurability durability = { 0 };
+	uint64 pi, ri, serial = 0;
+	RelFileLocator locator;
+
+	reset_fixture();
+	UT_ASSERT(seed_applied_read_scope(&participant, &receipt, &pi, &ri));
+	locator = (RelFileLocator){ receipt.target.spc_oid, receipt.target.db_oid,
+								receipt.target.rel_number };
+	UT_ASSERT(ctrc_cleaner_read_scope_begin(&participant, &receipt, pi, ri, &serial));
+	durability.highest_local_lsn = durability.local_flush_lsn = 100;
+	UT_ASSERT_EQ(cluster_ctrc_receipt_discharge_itl(&ctrc_participant_entries()[pi],
+													&ctrc_receipt_entries()[ri],
+													CTRC_ITL_TERMINAL_INDEPENDENT, &durability),
+				 CLUSTER_CTRC_DISCHARGE_CLEANED);
+	UT_ASSERT_EQ(ctrc_receipt_entries()[ri].state, CTRC_RECEIPT_CLEANED);
+	UT_ASSERT(cluster_ctrc_cleaner_read_scope_snapshot_v3(locator, MAIN_FORKNUM, 44, &proof));
+	UT_ASSERT_EQ(read_scope_entered, 1);
+	UT_ASSERT_EQ(read_scope_left, 0);
+	UT_ASSERT(ctrc_cleaner_read_scope_end(serial));
+	UT_ASSERT_EQ(read_scope_left, 1);
+	UT_ASSERT(!cluster_ctrc_cleaner_read_scope_current_v3(&proof, locator, MAIN_FORKNUM, 44));
+	UT_ASSERT(!ctrc_cleaner_read_scope_begin(&participant, &receipt, pi, ri, &serial));
+}
+
+static unsigned read_driver_mode, read_driver_calls;
+
+static bool
+read_driver_physical(const ClusterCtrcParticipantEntry *participant pg_attribute_unused(),
+					 const ClusterCtrcReceipt *receipt, uint64 pi pg_attribute_unused(),
+					 uint64 ri pg_attribute_unused())
+{
+	ClusterCtrcCleanerReadScopeV3 proof;
+	RelFileLocator locator
+		= { receipt->target.spc_oid, receipt->target.db_oid, receipt->target.rel_number };
+
+	read_driver_calls++;
+	UT_ASSERT_EQ(read_scope_entered, 1);
+	UT_ASSERT(cluster_ctrc_cleaner_read_scope_snapshot_v3(locator, receipt->target.fork_number,
+														  receipt->target.block_number, &proof));
+	if (read_driver_mode == 2)
+		pg_re_throw();
+	return read_driver_mode == 1;
+}
+
+#define ctrc_cleaner_clean_next_receipt read_driver_next
+#define ctrc_cleaner_clean_itl_receipt read_driver_physical
+#define ctrc_cleaner_clean_current_mx_receipt read_driver_physical
+#include "test_cluster_ctrc_read_scope.inc"
+#undef ctrc_cleaner_clean_next_receipt
+#undef ctrc_cleaner_clean_itl_receipt
+#undef ctrc_cleaner_clean_current_mx_receipt
+
+UT_TEST(test_original_cleaner_driver_expires_read_scope_on_return_error_and_refusal)
+{
+	for (unsigned mode = 0; mode < 4; mode++) {
+		ClusterCtrcParticipantEntry participant;
+		ClusterCtrcReceipt receipt;
+		uint64 pi, ri;
+		volatile bool caught = false;
+		volatile bool result = false;
+
+		reset_fixture();
+		UT_ASSERT(seed_applied_read_scope(&participant, &receipt, &pi, &ri));
+		read_driver_mode = mode;
+		read_driver_calls = 0;
+		read_scope_enter_refused = mode == 3;
+		PG_TRY();
+		{
+			result = read_driver_next();
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, mode == 2);
+		UT_ASSERT_EQ(result, mode == 1);
+		UT_ASSERT_EQ(read_driver_calls, mode == 3 ? 0 : 1);
+		UT_ASSERT_EQ(read_scope_entered, mode == 3 ? 0 : 1);
+		UT_ASSERT_EQ(read_scope_left, read_scope_entered);
+		UT_ASSERT(!CtrcReadScope.active);
+		UT_ASSERT_EQ(ctrc_receipt_entries()[ri].state, CTRC_RECEIPT_APPLIED);
+		UT_ASSERT_EQ(held_count, 0);
+	}
 }
 
 static bool
@@ -2454,7 +2725,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(55);
+	UT_PLAN(60);
 	printf("# CTRC header_bytes=%zu total_bytes=%zu\n", sizeof(ClusterCtrcSharedHeader),
 		   capacity.total_bytes);
 	UT_RUN(test_new_seals_do_not_starve_old_pending);
@@ -2512,6 +2783,11 @@ main(void)
 	UT_RUN(test_normal_stop_cleaner_idle_is_local_ownership_not_progress);
 	UT_RUN(test_normal_stop_new_close_tombstone_is_not_retained_completion);
 	UT_RUN(test_normal_stop_close_validation_and_local_caller_are_not_service_admission);
+	UT_RUN(test_original_cleaner_scope_binds_one_receipt_and_its_space_read);
+	UT_RUN(test_cleaner_scope_rejects_wrong_owner_and_receipt_drift);
+	UT_RUN(test_cleaner_scope_current_is_local_and_expires_with_original_attempt);
+	UT_RUN(test_original_cleaner_driver_expires_read_scope_on_return_error_and_refusal);
+	UT_RUN(test_concurrent_original_discharge_does_not_end_running_cleaner_attempt);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

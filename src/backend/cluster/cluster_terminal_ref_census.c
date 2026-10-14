@@ -49,6 +49,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_itl.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_mxid_stripe.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
@@ -8651,6 +8652,183 @@ itl_retain_locked:
 	return false;
 }
 
+/* Bound by the original receipt selector; never a caller-supplied role
+ * bypass or a second shared work queue. */
+typedef struct CtrcCleanerReadScope {
+	bool active;
+	uint64 serial;
+	int32 pid;
+	uint32 worker;
+	uint64 participant_index;
+	uint64 receipt_index;
+	ClusterCtrcParticipantEntry participant;
+	ClusterCtrcReceipt receipt;
+} CtrcCleanerReadScope;
+
+static CtrcCleanerReadScope CtrcReadScope;
+static uint64 CtrcReadSerial;
+
+static bool
+ctrc_cleaner_read_scope_owner(void)
+{
+	return MyProcPid > 0 && MyBackendType == B_UNDO_CLEANER && CtrcWorkerId >= 0
+		   && CtrcWorkerId < CLUSTER_CTRC_CLEANER_WORKERS
+		   && ClusterUndoCleanerWorkerIdForType(MyAuxProcType) == CtrcWorkerId;
+}
+
+/* Original participant -> receipt lock order, never under a buffer lock. */
+static bool
+ctrc_cleaner_read_scope_exact(const ClusterCtrcParticipantEntry *participant,
+							  const ClusterCtrcReceipt *receipt, uint64 participant_index,
+							  uint64 receipt_index)
+{
+	uint64 expected_index;
+	uint32 mask;
+	bool exact;
+
+	if (!ctrc_cleaner_read_scope_owner() || participant == NULL || receipt == NULL
+		|| !cluster_ctrc_shmem_ready() || !ctrc_txn_key_valid(&receipt->key)
+		|| !ctrc_cleaner_owns_key(&receipt->key)
+		|| !ctrc_participant_identity_valid(&receipt->key, &participant->identity)
+		|| participant->identity.node_id != cluster_node_id
+		|| participant->state != CTRC_PARTICIPANT_CLOSED_DRAINING
+		|| participant->seal_generation == 0 || participant->applied_count == 0
+		|| receipt->state != CTRC_RECEIPT_APPLIED
+		|| receipt->publication.grant_generation != participant->grant_generation
+		|| receipt->publication.journal_slot_generation == 0
+		|| memcmp(&receipt->key, &participant->key, sizeof(receipt->key)) != 0
+		|| receipt->target.fork_number < 0 || receipt->target.fork_number > MAX_FORKNUM
+		|| (receipt->publication.reference_kind == CTRC_REF_HEAP_ITL_UBA
+				? !ctrc_target_exact_itl_valid(&receipt->key, &receipt->target)
+				: !ctrc_target_exact_tid_valid(&receipt->publication, &receipt->target))
+		|| !ctrc_participant_index(&receipt->key, participant->identity.node_id, &expected_index)
+		|| expected_index != participant_index || receipt_index >= CtrcShared->receipt_entries)
+		return false;
+	mask = ctrc_participant_lock_mask(participant_index);
+	ctrc_participant_locks_acquire(mask);
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
+	exact
+		= memcmp(&ctrc_participant_entries()[participant_index], participant, sizeof(*participant))
+			  == 0
+		  && memcmp(&ctrc_receipt_entries()[receipt_index], receipt, sizeof(*receipt)) == 0
+		  && ctrc_receipt_probe_states()[receipt_index] == CTRC_RECEIPT_PROBE_OCCUPIED
+		  && ctrc_receipt_links()[receipt_index].participant_plus_one == participant_index + 1
+		  && ctrc_receipt_links()[receipt_index].journal_generation
+				 == receipt->publication.journal_slot_generation;
+	LWLockRelease(&CtrcShared->receipt_lock);
+	ctrc_participant_locks_release(mask);
+	return exact;
+}
+
+static ClusterCtrcCleanerReadScopeV3
+ctrc_cleaner_read_scope_identity(void)
+{
+	ClusterCtrcCleanerReadScopeV3 proof = { 0 };
+
+	proof.serial = CtrcReadScope.serial;
+	proof.pid = CtrcReadScope.pid;
+	proof.worker = CtrcReadScope.worker;
+	proof.system_identifier = CtrcReadScope.receipt.key.system_identifier;
+	proof.formation_epoch = CtrcReadScope.participant.identity.formation_epoch;
+	proof.boot_incarnation = CtrcReadScope.participant.identity.boot_incarnation;
+	return proof;
+}
+
+static bool
+ctrc_cleaner_read_scope_target(RelFileLocator locator, ForkNumber fork, BlockNumber block)
+{
+	const ClusterCtrcTargetV1 *target = &CtrcReadScope.receipt.target;
+
+	return CtrcReadScope.active && ctrc_cleaner_read_scope_owner() && CtrcReadScope.pid == MyProcPid
+		   && CtrcReadScope.worker == (unsigned)CtrcWorkerId && locator.spcOid == target->spc_oid
+		   && locator.dbOid == target->db_oid && locator.relNumber == target->rel_number
+		   && ((fork == target->fork_number && block == target->block_number)
+			   || (fork == SPACE_FORKNUM && block == 0));
+}
+
+static bool
+ctrc_cleaner_read_scope_begin(const ClusterCtrcParticipantEntry *participant,
+							  const ClusterCtrcReceipt *receipt, uint64 participant_index,
+							  uint64 receipt_index, volatile uint64 *serial)
+{
+	ClusterCtrcCleanerReadScopeV3 proof;
+	RelFileLocator locator;
+
+	if (serial == NULL || CtrcReadScope.active || CtrcReadSerial == UINT64_MAX
+		|| !ctrc_cleaner_read_scope_exact(participant, receipt, participant_index, receipt_index))
+		return false;
+	CtrcReadScope.participant = *participant;
+	CtrcReadScope.receipt = *receipt;
+	CtrcReadScope.participant_index = participant_index;
+	CtrcReadScope.receipt_index = receipt_index;
+	CtrcReadScope.pid = MyProcPid;
+	CtrcReadScope.worker = CtrcWorkerId;
+	CtrcReadScope.serial = ++CtrcReadSerial;
+	CtrcReadScope.active = true;
+	*serial = CtrcReadScope.serial;
+	proof = ctrc_cleaner_read_scope_identity();
+	locator = (RelFileLocator){ receipt->target.spc_oid, receipt->target.db_oid,
+								receipt->target.rel_number };
+	/* Keep the finite attempt visible even if a concurrent original abort
+	 * cleanout discharges its receipt. No CTRC lock crosses this call. */
+	if (!cluster_ko_cleaner_enter_v3(locator, &proof)) {
+		CtrcReadScope.active = false;
+		*serial = 0;
+		return false;
+	}
+	return true;
+}
+
+static bool
+ctrc_cleaner_read_scope_end(uint64 serial)
+{
+	ClusterCtrcCleanerReadScopeV3 proof;
+	RelFileLocator locator;
+
+	if (!CtrcReadScope.active || serial == 0 || serial != CtrcReadScope.serial
+		|| CtrcReadScope.pid != MyProcPid)
+		return false;
+	proof = ctrc_cleaner_read_scope_identity();
+	locator = (RelFileLocator){ CtrcReadScope.receipt.target.spc_oid,
+								CtrcReadScope.receipt.target.db_oid,
+								CtrcReadScope.receipt.target.rel_number };
+	CtrcReadScope.active = false;
+	cluster_ko_cleaner_leave_v3(locator, &proof);
+	return true;
+}
+
+bool
+cluster_ctrc_cleaner_read_scope_snapshot_v3(RelFileLocator locator, ForkNumber fork,
+											BlockNumber block, ClusterCtrcCleanerReadScopeV3 *out)
+{
+	if (out != NULL)
+		MemSet(out, 0, sizeof(*out));
+	/* This is the selected finite attempt, not a second APPLIED claim. The
+	 * original physical consumer still rechecks target/receipt at discharge.
+	 * Concurrent cleanout cannot strand this registered attempt behind the
+	 * very fence whose READY must wait for its finally exit. */
+	if (out == NULL || !ctrc_cleaner_read_scope_target(locator, fork, block))
+		return false;
+	*out = ctrc_cleaner_read_scope_identity();
+	return true;
+}
+
+bool
+cluster_ctrc_cleaner_read_scope_current_v3(const ClusterCtrcCleanerReadScopeV3 *scope,
+										   RelFileLocator locator, ForkNumber fork,
+										   BlockNumber block)
+{
+	/* No shared-table read or lock here. The original attempt stays registered
+	 * with the drain owner until finally, independently of concurrent receipt
+	 * discharge. This is finite read admission, not page/current authority. */
+	return scope != NULL && ctrc_cleaner_read_scope_target(locator, fork, block)
+		   && scope->serial == CtrcReadScope.serial && scope->pid == CtrcReadScope.pid
+		   && scope->worker == CtrcReadScope.worker
+		   && scope->system_identifier == CtrcReadScope.receipt.key.system_identifier
+		   && scope->formation_epoch == CtrcReadScope.participant.identity.formation_epoch
+		   && scope->boot_incarnation == CtrcReadScope.participant.identity.boot_incarnation;
+}
+
 static bool
 ctrc_cleaner_clean_next_receipt(void)
 {
@@ -8658,17 +8836,29 @@ ctrc_cleaner_clean_next_receipt(void)
 	ClusterCtrcReceipt receipt;
 	uint64 participant_index;
 	uint64 receipt_index;
-	bool cleaned;
+	volatile uint64 serial = 0;
+	bool cleaned = false;
 
 	if (!ctrc_cleaner_next_applied_receipt(&participant, &receipt, &participant_index,
 										   &receipt_index))
 		return false;
-	if (receipt.publication.reference_kind == CTRC_REF_HEAP_ITL_UBA)
-		cleaned = ctrc_cleaner_clean_itl_receipt(&participant, &receipt, participant_index,
-												 receipt_index);
-	else
-		cleaned = ctrc_cleaner_clean_current_mx_receipt(&participant, &receipt, participant_index,
-														receipt_index);
+	PG_TRY();
+	{
+		if (ctrc_cleaner_read_scope_begin(&participant, &receipt, participant_index, receipt_index,
+										  &serial)) {
+			if (receipt.publication.reference_kind == CTRC_REF_HEAP_ITL_UBA)
+				cleaned = ctrc_cleaner_clean_itl_receipt(&participant, &receipt, participant_index,
+														 receipt_index);
+			else
+				cleaned = ctrc_cleaner_clean_current_mx_receipt(&participant, &receipt,
+																participant_index, receipt_index);
+		}
+	}
+	PG_FINALLY();
+	{
+		(void)ctrc_cleaner_read_scope_end(serial);
+	}
+	PG_END_TRY();
 	if (cleaned)
 		cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_NONE);
 	return cleaned;

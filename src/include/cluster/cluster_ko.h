@@ -53,6 +53,7 @@
 
 #include "cluster/cluster_grd.h"	/* ClusterResId */
 #include "cluster/cluster_dl.h"		/* CLUSTER_DL_RESID_TYPE (collision check) */
+#include "cluster/cluster_terminal_ref_census.h"
 #include "storage/relfilelocator.h" /* RelFileLocator */
 #include "storage/lock.h"			/* LOCKTAG_LAST_TYPE */
 
@@ -153,12 +154,29 @@ typedef struct ClusterKoPeerFenceHandleV3 {
 typedef struct ClusterKoPeerAdmissionV3 {
 	RelFileLocator locator;
 	uint64 revision;
+	ForkNumber fork;
+	BlockNumber block;
+	ClusterCtrcCleanerReadScopeV3 cleaner;
 } ClusterKoPeerAdmissionV3;
 
 extern bool cluster_ko_peer_admission_begin_v3(RelFileLocator locator,
 											   ClusterKoPeerAdmissionV3 *out);
 extern bool cluster_ko_peer_admission_current_v3(const ClusterKoPeerAdmissionV3 *admission,
 												 RelFileLocator locator);
+/* Exact native read only. A cleaner sample cannot be consumed by the
+ * generic publication predicate above (including CR installation). */
+extern bool cluster_ko_peer_read_begin_v3(RelFileLocator locator, ForkNumber fork,
+										  BlockNumber block, ClusterKoPeerAdmissionV3 *out);
+extern bool cluster_ko_peer_read_current_v3(const ClusterKoPeerAdmissionV3 *admission,
+											RelFileLocator locator, ForkNumber fork,
+											BlockNumber block);
+
+/* One finite attempt per original cleaner worker, never a new work queue.
+ * These calls run outside buffer/PCM/CTRC locks. */
+extern bool cluster_ko_cleaner_enter_v3(RelFileLocator locator,
+										const struct ClusterCtrcCleanerReadScopeV3 *scope);
+extern void cluster_ko_cleaner_leave_v3(RelFileLocator locator,
+										const struct ClusterCtrcCleanerReadScopeV3 *scope);
 
 extern bool cluster_ko_peer_holder_begin_v3(const ClusterKoPeerFenceHandleV3 *handle);
 extern bool cluster_ko_peer_holder_result_v3(const ClusterKoPeerFenceHandleV3 *handle,

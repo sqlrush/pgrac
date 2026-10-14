@@ -163,6 +163,19 @@ cluster_bufmgr_ko_read_sample(RelFileLocator locator, ClusterKoPeerAdmissionV3 *
 	return true;
 }
 
+/* Only native reads may borrow the original cleaner's exact finite attempt.
+ * CR publication/copy keep the ordinary predicate and cannot use this scope. */
+static bool
+cluster_bufmgr_ko_native_read_sample(RelFileLocator locator, ForkNumber fork, BlockNumber block,
+									 ClusterKoPeerAdmissionV3 *sample)
+{
+	if (!cluster_enabled || !cluster_shared_config || cluster_interconnect_tier != CLUSTER_IC_TIER_1
+		|| cluster_smgr_which_for(locator, InvalidBackendId) != 1)
+		return false;
+	(void)cluster_ko_peer_read_begin_v3(locator, fork, block, sample);
+	return true;
+}
+
 /* No mapping/header/content lock or new pin may survive this local wait.
  * The bounded latch poll is a fallback; only the next admission sample can
  * authorize publication. Waiting alone never becomes a transaction error. */
@@ -5093,7 +5106,8 @@ ReadRecentBuffer(RelFileLocator rlocator, ForkNumber forkNum, BlockNumber blockN
 		have_private_ref = GetPrivateRefCount(recent_buffer) > 0;
 #ifdef USE_PGRAC_CLUSTER
 		if (!have_private_ref)
-			check_ko = cluster_bufmgr_ko_read_sample(rlocator, &ko_sample);
+			check_ko
+				= cluster_bufmgr_ko_native_read_sample(rlocator, forkNum, blockNum, &ko_sample);
 #endif
 
 		/*
@@ -5114,7 +5128,8 @@ ReadRecentBuffer(RelFileLocator rlocator, ForkNumber forkNum, BlockNumber blockN
 			 * InvalidateBuffer() if we pinned a random non-matching buffer.
 			 */
 #ifdef USE_PGRAC_CLUSTER
-			if (check_ko && !cluster_ko_peer_admission_current_v3(&ko_sample, rlocator)) {
+			if (check_ko
+				&& !cluster_ko_peer_read_current_v3(&ko_sample, rlocator, forkNum, blockNum)) {
 				UnlockBufHdr(bufHdr, buf_state);
 				return false;
 			}
@@ -5808,7 +5823,8 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	/* see if the block is in the buffer pool already */
 retry_lookup:
 #ifdef USE_PGRAC_CLUSTER
-	check_ko = cluster_bufmgr_ko_read_sample(smgr->smgr_rlocator.locator, &ko_sample);
+	check_ko = cluster_bufmgr_ko_native_read_sample(smgr->smgr_rlocator.locator, forkNum, blockNum,
+													&ko_sample);
 #endif
 	LWLockAcquire(newPartitionLock, LW_SHARED);
 	existing_buf_id = BufTableLookup(&newTag, newHash);
@@ -5992,7 +6008,8 @@ retry_lookup:
 
 #ifdef USE_PGRAC_CLUSTER
 	if (check_ko
-		&& !cluster_ko_peer_admission_current_v3(&ko_sample, smgr->smgr_rlocator.locator)) {
+		&& !cluster_ko_peer_read_current_v3(&ko_sample, smgr->smgr_rlocator.locator, forkNum,
+											blockNum)) {
 		/* The mapping is still private to mapping-X. Undo it before
 		 * releasing the unused reservation or waiting; no target IO began. */
 		UnlockBufHdr(victim_buf_hdr, victim_buf_state);
@@ -8285,7 +8302,8 @@ PinBufferForObjectRead(BufferDesc *buf, BufferAccessStrategy strategy,
 		return PinBuffer(buf, strategy) ? PIN_BUFFER_LOOKUP_VALID : PIN_BUFFER_LOOKUP_INVALID;
 	ReservePrivateRefCountEntry();
 	state = LockBufHdr(buf);
-	if (!cluster_ko_peer_admission_current_v3(sample, BufTagGetRelFileLocator(&buf->tag))) {
+	if (!cluster_ko_peer_read_current_v3(sample, BufTagGetRelFileLocator(&buf->tag),
+										 buf->tag.forkNum, buf->tag.blockNum)) {
 		UnlockBufHdr(buf, state);
 		return PIN_BUFFER_LOOKUP_OBJECT_RETRY;
 	}

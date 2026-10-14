@@ -121,6 +121,8 @@ static uint32 clock_hand;
 static unsigned physical_writes;
 int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 static bool ko_closed;
+static bool ko_cleaner_allowed;
+static BufferTag ko_cleaner_target;
 static uint64 ko_revision = 1;
 static unsigned ko_close_at_header;
 static unsigned header_calls;
@@ -176,8 +178,37 @@ cluster_ko_peer_admission_current_v3(const ClusterKoPeerAdmissionV3 *sample, Rel
 	for (int i = 0; i < NBuffers; i++)
 		header_locked |= (pg_atomic_read_u32(&GetBufferDescriptor(i)->state) & BM_LOCKED) != 0;
 	UT_ASSERT(header_locked);
-	return sample != NULL && sample->revision != 0 && sample->revision == ko_revision
-		   && RelFileLocatorEquals(locator, sample->locator);
+	return sample != NULL && sample->cleaner.serial == 0 && sample->revision != 0
+		   && sample->revision == ko_revision && RelFileLocatorEquals(locator, sample->locator);
+}
+
+bool
+cluster_ko_peer_read_begin_v3(RelFileLocator locator, ForkNumber fork, BlockNumber block,
+							  ClusterKoPeerAdmissionV3 *out)
+{
+	if (cluster_ko_peer_admission_begin_v3(locator, out))
+		return true;
+	if (!ko_cleaner_allowed
+		|| !RelFileLocatorEquals(locator, BufTagGetRelFileLocator(&ko_cleaner_target))
+		|| fork != ko_cleaner_target.forkNum || block != ko_cleaner_target.blockNum)
+		return false;
+	out->locator = locator;
+	out->revision = ko_revision;
+	out->fork = fork;
+	out->block = block;
+	out->cleaner.serial = 1;
+	return true;
+}
+
+bool
+cluster_ko_peer_read_current_v3(const ClusterKoPeerAdmissionV3 *sample, RelFileLocator locator,
+								ForkNumber fork, BlockNumber block)
+{
+	ClusterKoPeerAdmissionV3 ordinary = *sample;
+	ordinary.cleaner.serial = 0;
+	return cluster_ko_peer_admission_current_v3(&ordinary, locator)
+		   && (sample->cleaner.serial == 0
+			   || (ko_cleaner_allowed && sample->fork == fork && sample->block == block));
 }
 
 WritebackContext BackendWritebackContext;
@@ -557,6 +588,7 @@ reset_buffers(void)
 	cluster_enabled = false;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 	storage_route = 1;
+	ko_cleaner_allowed = false;
 	ko_revision = 1;
 	ko_closed = false;
 	ko_close_at_header = header_calls = 0;
@@ -1291,10 +1323,60 @@ UT_TEST(test_object_fence_does_not_enter_local_buffer_path)
 	UT_ASSERT_EQ(header_calls, 0);
 }
 
+UT_TEST(test_exact_cleaner_read_reaches_native_pin_but_never_cr_publication)
+{
+	for (unsigned kind = 0; kind < 6; kind++) {
+		BufferTag tag = reset_buffers();
+		SMgrRelationData smgr = { 0 };
+		BufferDesc *buf;
+		bool found;
+		if (kind >= 3) {
+			tag.forkNum = SPACE_FORKNUM;
+			tag.blockNum = 0;
+		}
+		ko_cleaner_target = tag;
+		ko_cleaner_allowed = true;
+		if (kind % 3 != 2)
+			install_current(&tag, 0);
+		cluster_enabled = true;
+		ko_closed = true;
+		waiting_tag = tag;
+		if (kind % 3 == 0) {
+			UT_ASSERT(
+				ReadRecentBuffer(BufTagGetRelFileLocator(&tag), tag.forkNum, tag.blockNum, 1));
+			buf = GetBufferDescriptor(0);
+			if (remembered_pins != 0)
+				UnpinBuffer(buf);
+		} else {
+			smgr.smgr_rlocator.locator = BufTagGetRelFileLocator(&tag);
+			smgr.smgr_rlocator.backend = InvalidBackendId;
+			buf = BufferAlloc(&smgr, RELPERSISTENCE_PERMANENT, tag.forkNum, tag.blockNum, NULL,
+							  &found, IOCONTEXT_NORMAL);
+			UT_ASSERT_EQ(found, kind % 3 == 1);
+			UT_ASSERT(BufferTagsEqual(&buf->tag, &tag));
+			UnpinBuffer(buf);
+		}
+		UT_ASSERT_EQ(object_waits, 0);
+		UT_ASSERT_EQ(remembered_pins, 0);
+	}
+	{
+		BufferCrKey key = scoped_key(reset_buffers());
+		PGIOAlignedBlock page;
+		Buffer buffer = cluster_bufmgr_cr_reserve_v1();
+		ko_cleaner_target = key.tag;
+		ko_cleaner_allowed = true;
+		cluster_enabled = true;
+		ko_closed = true;
+		memset(page.data, 0x31, BLCKSZ);
+		UT_ASSERT(!cluster_bufmgr_cr_publish_v1(buffer, &key, page.data));
+		UnpinBuffer(GetBufferDescriptor(buffer - 1));
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(29);
+	UT_PLAN(30);
 	UT_RUN(test_native_current_victim_keeps_original_behavior);
 	UT_RUN(test_cr_victim_preserves_current_and_removes_middle_head_tail);
 	UT_RUN(test_last_cr_only_victim_removes_anchor_without_current);
@@ -1324,6 +1406,7 @@ main(void)
 	UT_RUN(test_object_fence_preserves_recent_existing_pin_and_private_route);
 	UT_RUN(test_object_fence_buffer_alloc_waits_off_locks_without_publication);
 	UT_RUN(test_object_fence_does_not_enter_local_buffer_path);
+	UT_RUN(test_exact_cleaner_read_reaches_native_pin_but_never_cr_publication);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
