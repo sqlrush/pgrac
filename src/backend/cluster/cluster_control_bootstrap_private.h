@@ -145,7 +145,9 @@ typedef struct ClusterNativeSideObservation {
 	uint8 sha256[32];
 	uint64 effective_next_xid;
 	uint32 page_reads;
-	uint32 family_mask; /* all six native SLRU/cursor families were opened */
+	uint32 family_mask;		  /* all six native SLRU/cursor families were opened */
+	uint32 native_file_count; /* regular segment files fully read and rechecked */
+	uint32 family_file_counts[6];
 } ClusterNativeSideObservation;
 extern ClusterControlRootResult
 cluster_control_native_side_observe(const char *shared_root, uint32 node_id,

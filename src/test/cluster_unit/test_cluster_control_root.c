@@ -12043,7 +12043,8 @@ UT_TEST(test_runtime_pending_native_inspection_uses_selected_origin_and_sealed_h
 							 &serial, (ClusterWalRetentionPin *)(uintptr_t)4, &out),
 						 0);
 			UT_ASSERT(out.native_observed);
-			UT_ASSERT_EQ(out.native.page_reads, 3);
+			/* Full native segment census plus the sealed cursor rechecks. */
+			UT_ASSERT_EQ(out.native.page_reads, 6);
 			UT_ASSERT_EQ(out.native.effective_next_xid, 105);
 			UT_ASSERT_EQ(U64FromFullTransactionId(out.native_input.checkPointCopy.nextXid), 101);
 			UT_ASSERT_EQ(out.observation.tail.records, 0);
@@ -14673,8 +14674,15 @@ UT_TEST(test_native_side_observation_reads_origin_and_preserves_bytes)
 		write_all_or_abort(path, page, sizeof(page));
 	}
 	UT_ASSERT_EQ(cluster_control_native_side_observe(f.shared, 3, &control, &first), 0);
-	UT_ASSERT_EQ(first.page_reads, 3);
+	UT_ASSERT_EQ(first.page_reads, 6);
 	UT_ASSERT_EQ(first.family_mask, CLUSTER_NATIVE_SIDE_FAMILY_ALL);
+	UT_ASSERT_EQ(first.native_file_count, 3);
+	UT_ASSERT_EQ(first.family_file_counts[0], 1);
+	UT_ASSERT_EQ(first.family_file_counts[1], 1);
+	UT_ASSERT_EQ(first.family_file_counts[2], 0);
+	UT_ASSERT_EQ(first.family_file_counts[3], 0);
+	UT_ASSERT_EQ(first.family_file_counts[4], 1);
+	UT_ASSERT_EQ(first.family_file_counts[5], 0);
 	UT_ASSERT(!v2_zero(first.sha256, 32));
 	UT_ASSERT_EQ(cluster_control_native_side_observe(f.shared, 3, &control, &second), 0);
 	UT_ASSERT(memcmp(&first, &second, sizeof(first)) == 0);
@@ -14688,6 +14696,18 @@ UT_TEST(test_native_side_observation_reads_origin_and_preserves_bytes)
 		if (i == 2)
 			UT_ASSERT(memcmp(stored, page, sizeof(stored)) == 0);
 		UT_ASSERT_EQ(unlink(path), 0);
+	}
+	/* A non-SLRU entry is not silently ignored by the full native census. */
+	{
+		char unknown[MAXPGPATH];
+
+		snprintf(unknown, sizeof(unknown), "%s/pg_xact/retained.tmp", f.origin);
+		write_all_or_abort(unknown, page, sizeof(page));
+		memset(&second, 0xa5, sizeof(second));
+		UT_ASSERT_EQ(cluster_control_native_side_observe(f.shared, 3, &control, &second),
+					 CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID);
+		UT_ASSERT(v2_zero(&second, sizeof(second)));
+		UT_ASSERT_EQ(unlink(unknown), 0);
 	}
 	native_side_authority_cleanup(&f);
 	bootstrap_side_cleanup(&f);

@@ -618,6 +618,156 @@ done:
 	return result;
 }
 
+/*
+ * D1 native-side coverage is a physical observation, not a promise that the
+ * observed bytes are safe to apply.  Enumerate every regular segment in each
+ * native family, in a deterministic order, and read every page through the
+ * same identity/short-read/revalidation path used by the cursor checks.  A
+ * second directory pass prevents a concurrent add/remove from looking like a
+ * complete snapshot.  The bound is deliberately finite: exhaustion is a
+ * refusal, never a truncated positive observation.
+ */
+#define CLUSTER_NATIVE_SIDE_MAX_SEGMENTS 4096U
+
+typedef struct ClusterNativeSegmentList {
+	uint32 values[CLUSTER_NATIVE_SIDE_MAX_SEGMENTS];
+	size_t count;
+} ClusterNativeSegmentList;
+
+static bool
+parse_native_segment_name(const char *name, uint32 *segment)
+{
+	uint32 value = 0;
+	char canonical[5];
+
+	if (name == NULL || strlen(name) != 4)
+		return false;
+	for (unsigned i = 0; i < 4; i++) {
+		unsigned digit;
+
+		if (name[i] >= '0' && name[i] <= '9')
+			digit = (unsigned)(name[i] - '0');
+		else if (name[i] >= 'A' && name[i] <= 'F')
+			digit = (unsigned)(name[i] - 'A') + 10;
+		else
+			return false;
+		value = (value << 4) | digit;
+	}
+	snprintf(canonical, sizeof(canonical), "%04X", value);
+	if (memcmp(canonical, name, sizeof(canonical) - 1) != 0)
+		return false;
+	*segment = value;
+	return true;
+}
+
+static int
+native_segment_compare(const void *left, const void *right)
+{
+	const uint32 a = *(const uint32 *)left;
+	const uint32 b = *(const uint32 *)right;
+
+	return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+static ClusterControlRootResult
+collect_native_segments(int dir, ClusterNativeSegmentList *out)
+{
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	int scan_fd;
+	DIR *scan;
+	struct dirent *entry;
+
+	memset(out, 0, sizeof(*out));
+	/* Do not dup(dir): directory offsets belong to the shared open file
+	 * description, so a first census would leave the second pass at EOF.
+	 * Open a fresh descriptor for each snapshot instead. */
+	scan_fd = openat(dir, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (scan_fd < 0)
+		return result;
+	scan = fdopendir(scan_fd);
+	if (scan == NULL) {
+		read_close(scan_fd, &result);
+		return result;
+	}
+	for (;;) {
+		uint32 segment;
+
+		errno = 0;
+		entry = readdir(scan);
+		if (entry == NULL) {
+			result = errno == 0 ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_IO_ERROR;
+			break;
+		}
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+			continue;
+		if (!parse_native_segment_name(entry->d_name, &segment)) {
+			result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+			break;
+		}
+		if (out->count >= lengthof(out->values)) {
+			result = CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+			break;
+		}
+		out->values[out->count++] = segment;
+	}
+	if (closedir(scan) != 0)
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		qsort(out->values, out->count, sizeof(out->values[0]), native_segment_compare);
+	return result;
+}
+
+static ClusterControlRootResult
+read_native_family_files(int dir, uint32 family, pg_cryptohash_ctx *hash, uint32 *reads,
+						 uint32 *file_count, bool sync)
+{
+	ClusterNativeSegmentList before, after;
+	ClusterControlRootResult result;
+
+	*file_count = 0;
+	result = collect_native_segments(dir, &before);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	for (size_t i = 0; i < before.count; i++) {
+		char name[16];
+		struct stat st;
+		uint64 first_page;
+		uint64 pages;
+
+		snprintf(name, sizeof(name), "%04X", before.values[i]);
+		if (fstatat(dir, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+			return read_error();
+		if (!read_owned(&st, false) || st.st_nlink != 1)
+			return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		if (st.st_size <= 0 || st.st_size % BLCKSZ != 0
+			|| st.st_size > (off_t)SLRU_PAGES_PER_SEGMENT * BLCKSZ)
+			return CLUSTER_CONTROL_ROOT_BAD_SIZE;
+		first_page = (uint64)before.values[i] * SLRU_PAGES_PER_SEGMENT;
+		pages = (uint64)st.st_size / BLCKSZ;
+		for (uint64 page = 0; page < pages; page++) {
+			uint64 page_no = first_page + page;
+
+			if (page_no > PG_UINT32_MAX)
+				return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+			{
+				uint8 bytes[BLCKSZ];
+
+				result = read_native_page(dir, family, (uint32)page_no, bytes, hash, reads, sync);
+			}
+			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+				return result;
+		}
+		(*file_count)++;
+	}
+	result = collect_native_segments(dir, &after);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (before.count != after.count
+		|| memcmp(before.values, after.values, before.count * sizeof(before.values[0])) != 0)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
 static ClusterControlRootResult
 read_native_horizon(int root, const ControlFileData *input, ControlFileData *effective,
 					pg_cryptohash_ctx *hash, bool sync)
@@ -771,6 +921,10 @@ native_side_inspect(const char *shared_root, uint32 node_id, const ControlFileDa
 	static const char *const families[]
 		= { "pg_xact", "pg_subtrans", "pg_multixact", "pg_commit_ts", "offsets", "members" };
 	static const unsigned parents[] = { 2, 2, 2, 2, 5, 5 };
+	/* pg_multixact is the parent of the two physical segment families; it is
+	 * validated as a directory above, but its offsets/members children are
+	 * the only entries that may be enumerated as native segments. */
+	static const int segment_dirs[] = { 3, 4, -1, 6, 7, 8 };
 	int dirs[9] = { -1, -1, -1, -1, -1, -1, -1, -1, -1 };
 	ClusterNativeSideObservation observed = { 0 };
 	ControlFileData effective;
@@ -808,6 +962,19 @@ native_side_inspect(const char *shared_root, uint32 node_id, const ControlFileDa
 		result = read_native_horizon(dirs[0], input, &effective, hash, sync);
 	if (result == 0) {
 		observed.effective_next_xid = U64FromFullTransactionId(effective.checkPointCopy.nextXid);
+		for (unsigned i = 0; result == 0 && i < lengthof(families); i++) {
+			if (segment_dirs[i] < 0)
+				continue;
+			result
+				= read_native_family_files(dirs[segment_dirs[i]], i + 1, hash, &observed.page_reads,
+										   &observed.family_file_counts[i], sync);
+		}
+		if (result == 0)
+			observed.native_file_count = 0;
+		for (unsigned i = 0; result == 0 && i < lengthof(families); i++)
+			observed.native_file_count += observed.family_file_counts[i];
+	}
+	if (result == 0) {
 		result = read_native_cursors(dirs, &effective, hash, &observed.page_reads, sync);
 	}
 	/* Before-checkpoint native startup performs no writes outside these
