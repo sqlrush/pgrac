@@ -14668,6 +14668,10 @@ UT_TEST(test_native_side_observation_reads_origin_and_preserves_bytes)
 		memset(page, 0, sizeof(page));
 		if (i == 0)
 			page[0] = 0x55;
+		if (i == 1) {
+			TransactionId parent = 100;
+			memcpy(page + 7 * sizeof(parent), &parent, sizeof(parent));
+		}
 		if (i == 2)
 			memcpy(page + 3 * sizeof(value), &value, sizeof(value));
 		snprintf(path, sizeof(path), "%s/%s", f.origin, files[i]);
@@ -14689,6 +14693,7 @@ UT_TEST(test_native_side_observation_reads_origin_and_preserves_bytes)
 	UT_ASSERT_EQ(first.family_page_counts[3], 0);
 	UT_ASSERT_EQ(first.family_page_counts[4], 1);
 	UT_ASSERT_EQ(first.family_page_counts[5], 0);
+	UT_ASSERT_EQ(first.subtrans_parent_entries, 1);
 	UT_ASSERT(!v2_zero(first.sha256, 32));
 	UT_ASSERT_EQ(cluster_control_native_side_observe(f.shared, 3, &control, &second), 0);
 	UT_ASSERT(memcmp(&first, &second, sizeof(first)) == 0);

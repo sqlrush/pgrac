@@ -149,6 +149,7 @@ typedef struct ClusterNativeSideObservation {
 	uint32 native_file_count; /* regular segment files fully read and rechecked */
 	uint32 family_file_counts[6];
 	uint32 family_page_counts[6];
+	uint32 subtrans_parent_entries; /* non-zero pg_subtrans parent slots observed */
 } ClusterNativeSideObservation;
 extern ClusterControlRootResult
 cluster_control_native_side_observe(const char *shared_root, uint32 node_id,
