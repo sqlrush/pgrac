@@ -7,6 +7,9 @@
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_hw_lease.h"
+#include "cluster/cluster_grd.h"
+#include "cluster/cluster_ko.h"
+#include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_space_reservation.h"
@@ -15,6 +18,41 @@
 #include "utils/resowner.h"
 #include "utils/inval.h"
 #include "utils/relcache.h"
+
+/* The stop fixture exercises the legacy v2 path. Keep the newly linked v3
+ * route/LOCALLOCK probes fail-closed without pulling the full GRD/lock
+ * runtime into this standalone binary. Dedicated v3 tests provide the wire
+ * coverage; these stubs ensure the old stop contract remains linkable. */
+int32
+cluster_grd_lookup_master_gen(const ClusterResId *resid, uint64 *generation)
+{
+	(void)resid;
+	if (generation != NULL)
+		*generation = 0;
+	return -1;
+}
+
+void
+cluster_grd_resid_decode(const ClusterResId *resid, LOCKTAG *locktag)
+{
+	(void)resid;
+	if (locktag != NULL)
+		MemSet(locktag, 0, sizeof(*locktag));
+}
+
+bool
+cluster_lock_current_ax_binding(const LOCKTAG *locktag, ClusterGrdHolderId *holder,
+										uint64 *request_id, int32 *master_node,
+										uint64 *master_generation)
+{
+	(void)locktag;
+	(void)holder;
+	(void)request_id;
+	(void)master_node;
+	(void)master_generation;
+	return false;
+}
+
 static bool ko_offer_notice_fixture(const ClusterPiWritebackNoticeV1 *, uint32, uint64 *,
 									ClusterPiWritebackFactV2 *);
 static bool ko_offer_ack_fixture(const ClusterPiWritebackJobV1 *, uint32, uint64,
