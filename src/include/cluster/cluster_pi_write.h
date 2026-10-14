@@ -325,6 +325,20 @@ extern ClusterPcmPiRelationScanV2 cluster_pcm_lock_ko_relation_scan_v3(RelFileLo
 																	   uint32 budget,
 																	   uint32 *cursor);
 
+/* AM01 F04 role projections.  Both are read-only bounded observations and
+ * retain the same gate, formation, registry and 128-entry budget as the
+ * combined observer above.  The local projection admits only work which can
+ * still produce a local buffer/current/install or local PI effect; the
+ * directory projection observes canonical master/head/grant/PI responsibility
+ * independently.  Unknown aggregate references remain PENDING in both. */
+extern ClusterPcmPiRelationScanV2 cluster_pcm_lock_ko_local_relation_scan_v3(RelFileLocator locator,
+																			 uint64 formation,
+																			 uint32 budget,
+																			 uint32 *cursor);
+extern ClusterPcmPiRelationScanV2
+cluster_pcm_lock_ko_directory_relation_scan_v3(RelFileLocator locator, uint64 formation,
+											   uint32 budget, uint32 *cursor);
+
 /* Actual holder DATA write. The cut is captured before this call; it must
  * match the installed current-X buffer generation. No ownership acquisition.
  * A receipt from the ordinary endpoint cannot retire master PI obligations. */

@@ -10855,13 +10855,132 @@ cluster_pcm_lock_pi_candidates_v1(uint32 *cursor, uint32 probe_budget, BufferTag
 	return count;
 }
 
+typedef enum PcmRelationScanRole {
+	PCM_RELATION_SCAN_COMBINED = 0,
+	PCM_RELATION_SCAN_LOCAL,
+	PCM_RELATION_SCAN_DIRECTORY
+} PcmRelationScanRole;
+
+/* AM01 F04: state which lives in MasterState is not automatically directory
+ * work.  A requester/round which names this node remains local physical work;
+ * a request owned by another node is directory work.  Anything for which the
+ * owner cannot be proved from the retained identity stays pending. */
+static bool
+pcm_resource_x_role_pending_locked(struct GrdEntry *entry,
+								   const ClusterPcmResourceXMasterState *state,
+								   PcmRelationScanRole role)
+{
+	const ClusterPcmResourceXBootstrapRound *round = &entry->resource_x_bootstrap_round;
+	bool local = false;
+	bool directory = false;
+	uint32 mode = pg_atomic_read_u32(&entry->master_state);
+	uint32 s_holders = pg_atomic_read_u32(&entry->s_holders_bitmap);
+	uint32 pi_holders = pg_atomic_read_u32(&entry->pi_holders_bitmap);
+	int node;
+
+	/* Local executor, round, owner and local holder/cached-X state. */
+	if (!pcm_resource_x_active_empty_locked(entry)
+		|| entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY
+		|| round->send.pending != 0 || round->phase != RESOURCE_X_BOOTSTRAP_ROUND_EMPTY)
+		local = true;
+	if ((mode == PCM_STATE_X && entry->x_holder_node == cluster_node_id)
+		|| (mode == PCM_STATE_S && cluster_node_id >= 0
+			&& cluster_node_id < RESOURCE_X_PROTOCOL_NODE_LIMIT
+			&& (s_holders & (UINT32_C(1) << (uint32)cluster_node_id)) != 0)
+		|| (cluster_node_id >= 0 && cluster_node_id < RESOURCE_X_PROTOCOL_NODE_LIMIT
+			&& (pi_holders & (UINT32_C(1) << (uint32)cluster_node_id)) != 0))
+		local = true;
+	if (entry->s_holder_refcount_local != 0 || entry->local_pi_first.source_flags != 0
+		|| entry->local_pi_last.source_flags != 0
+		|| entry->pending_x_requester_node == cluster_node_id)
+		local = true;
+
+	/* Aggregate refs and conversion queues have no exact role identity.  They
+	 * therefore cannot be subtracted from either projection. */
+	if (entry->convert_queue != NULL || pg_atomic_read_u32(&entry->pin_count) != 0
+		|| pg_atomic_read_u32(&entry->wait_refcount) != 0
+		|| pg_atomic_read_u32(&entry->transport_refcount) != 0 || entry->pi_watermark_lsn != 0
+		|| entry->pi_watermark_scn != 0)
+		local = directory = true;
+
+	if (state != NULL) {
+		for (node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
+			const ClusterPcmResourceXMasterRequest *request = &state->requests[node];
+			const ClusterPcmResourceXBootstrapReceipt *receipt = &state->bootstrap_receipts[node];
+
+			if (request->phase != RESOURCE_X_MASTER_NONE
+				&& request->phase != RESOURCE_X_MASTER_RELEASED) {
+				directory = true;
+				if (node == cluster_node_id)
+					local = true;
+			}
+			if (receipt->state != RESOURCE_X_BOOTSTRAP_RECEIPT_EMPTY)
+				directory = true;
+			if (state->block_intents[node].slot.state != RESOURCE_X_INTENT_SLOT_EMPTY)
+				directory = true;
+		}
+		if (state->bootstrap_priority.state != RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY
+			|| state->grant_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
+			|| state->requester_settlement_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
+			|| state->deferred_settlement.present != 0)
+			directory = true;
+		if (!pcm_resource_x_requester_join_empty_locked(&state->requester_join)) {
+			ResourceXDecodedFrame grant, image;
+			if (!pcm_resource_x_requester_join_decode_locked(&state->requester_join, &grant,
+															 &image))
+				local = directory = true;
+			else {
+				directory = true;
+				if (grant.common.logical_assertion.requester_node == cluster_node_id
+					|| image.common.logical_assertion.requester_node == cluster_node_id)
+					local = true;
+			}
+		}
+		if (state->settlement_retry.pending || state->settlement_retry.running
+			|| state->source_settlement.state == RESOURCE_X_SOURCE_SETTLEMENT_PENDING)
+			directory = true;
+		if (state->holder_status.valid != 0 || state->holder_image.valid != 0
+			|| state->holder_status_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
+			|| state->holder_image_intent.state != RESOURCE_X_INTENT_SLOT_EMPTY) {
+			if (!pcm_resource_x_holder_pair_drained_history_locked(entry, state, NULL, NULL))
+				directory = true;
+		}
+		if (state->holder_pi_first.source_flags != 0)
+			local = directory = true;
+	}
+
+	/* Master mode/holder and pending conversion are directory service state;
+	 * local bits were already attributed above. */
+	if ((mode == PCM_STATE_X && entry->x_holder_node != -1) || mode == PCM_STATE_S
+		|| pi_holders != 0 || entry->pending_x_requester_node != -1
+		|| entry->master_holder.node_id != INVALID_PCM_MASTER_HOLDER_NODE)
+		directory = true;
+
+	return role == PCM_RELATION_SCAN_LOCAL		 ? local
+		   : role == PCM_RELATION_SCAN_DIRECTORY ? directory
+												 : false;
+}
+
 /* The KO owner has already excluded old-incarnation producers. Observe
  * every registry slot, including entries which cannot become writeback
  * candidates. Neither stable residency nor terminal history is permission
  * to ignore a real PI, reference, or in-flight protocol owner. */
+static ClusterPcmPiRelationScanV2 pcm_pi_relation_scan_role(RelFileLocator locator,
+															uint64 formation, uint32 budget,
+															uint32 *cursor, bool object_drain,
+															PcmRelationScanRole role);
+
 static ClusterPcmPiRelationScanV2
 pcm_pi_relation_scan(RelFileLocator locator, uint64 formation, uint32 budget, uint32 *cursor,
 					 bool object_drain)
+{
+	return pcm_pi_relation_scan_role(locator, formation, budget, cursor, object_drain,
+									 PCM_RELATION_SCAN_COMBINED);
+}
+
+static ClusterPcmPiRelationScanV2
+pcm_pi_relation_scan_role(RelFileLocator locator, uint64 formation, uint32 budget, uint32 *cursor,
+						  bool object_drain, PcmRelationScanRole role)
 {
 	static const ClusterPcmResourceXSlot empty_slot;
 	static const ClusterPcmResourceXMasterState empty_state;
@@ -10951,15 +11070,17 @@ pcm_pi_relation_scan(RelFileLocator locator, uint64 formation, uint32 budget, ui
 			|| entry->pending_x_requester_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 			|| (entry->pending_x_requester_node == -1 && entry->pending_x_since_lsn != 0))
 			result = CLUSTER_PCM_PI_RELATION_INVALID;
-		else if (active || retained || (object_drain && mode != PCM_STATE_N)
-				 || entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY
-				 || pg_atomic_read_u32(&entry->pin_count) != 0
-				 || pg_atomic_read_u32(&entry->wait_refcount) != 0
-				 || pg_atomic_read_u32(&entry->transport_refcount) != 0
-				 || entry->pending_x_requester_node != -1 || entry->convert_queue != NULL
-				 || pi_holders != 0 || entry->pi_watermark_lsn != 0 || entry->pi_watermark_scn != 0
-				 || entry->local_pi_first.source_flags != 0
-				 || entry->local_pi_last.source_flags != 0)
+		else if (role == PCM_RELATION_SCAN_COMBINED
+					 ? (active || retained || (object_drain && mode != PCM_STATE_N)
+						|| entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY
+						|| pg_atomic_read_u32(&entry->pin_count) != 0
+						|| pg_atomic_read_u32(&entry->wait_refcount) != 0
+						|| pg_atomic_read_u32(&entry->transport_refcount) != 0
+						|| entry->pending_x_requester_node != -1 || entry->convert_queue != NULL
+						|| pi_holders != 0 || entry->pi_watermark_lsn != 0
+						|| entry->pi_watermark_scn != 0 || entry->local_pi_first.source_flags != 0
+						|| entry->local_pi_last.source_flags != 0)
+					 : pcm_resource_x_role_pending_locked(entry, state, role))
 			result = CLUSTER_PCM_PI_RELATION_PENDING;
 		LWLockRelease(&entry->entry_lock.lock);
 		if (result != CLUSTER_PCM_PI_RELATION_MORE)
@@ -10993,6 +11114,22 @@ cluster_pcm_lock_ko_relation_scan_v3(RelFileLocator locator, uint64 formation, u
 									 uint32 *cursor)
 {
 	return pcm_pi_relation_scan(locator, formation, budget, cursor, true);
+}
+
+ClusterPcmPiRelationScanV2
+cluster_pcm_lock_ko_local_relation_scan_v3(RelFileLocator locator, uint64 formation, uint32 budget,
+										   uint32 *cursor)
+{
+	return pcm_pi_relation_scan_role(locator, formation, budget, cursor, true,
+									 PCM_RELATION_SCAN_LOCAL);
+}
+
+ClusterPcmPiRelationScanV2
+cluster_pcm_lock_ko_directory_relation_scan_v3(RelFileLocator locator, uint64 formation,
+											   uint32 budget, uint32 *cursor)
+{
+	return pcm_pi_relation_scan_role(locator, formation, budget, cursor, true,
+									 PCM_RELATION_SCAN_DIRECTORY);
 }
 
 /* All potentially allocating proof work precedes directory locks. Only the
