@@ -445,6 +445,19 @@ UT_TEST(shared_v3_codec_allows_remote_ges_holder_identity)
 	UT_ASSERT(cluster_ko_shared_decode_v3(bytes, sizeof(bytes), &out));
 	UT_ASSERT_EQ(out.ax_holder.node_id, request.base.peer_node);
 	UT_ASSERT_EQ(out.ax_master_node, request.base.peer_node);
+
+	/* The relation/formation suffix is exact, even though the holder may be
+	 * remote. Cross-database, cross-epoch and non-member identities are not
+	 * alternate GES shapes; they are stale or misrouted and must fail closed. */
+	request.ax_resid.field1++;
+	UT_ASSERT(!cluster_ko_shared_encode_v3(&request, bytes, sizeof(bytes)));
+	request.ax_resid.field1--;
+	request.ax_holder.cluster_epoch++;
+	UT_ASSERT(!cluster_ko_shared_encode_v3(&request, bytes, sizeof(bytes)));
+	request.ax_holder.cluster_epoch--;
+	request.base.members[request.ax_holder.node_id / 8] &=
+		(uint8) ~(1u << (request.ax_holder.node_id % 8));
+	UT_ASSERT(!cluster_ko_shared_encode_v3(&request, bytes, sizeof(bytes)));
 }
 
 int
