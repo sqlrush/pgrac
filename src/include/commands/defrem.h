@@ -22,6 +22,7 @@
 
 /* commands/dropcmds.c */
 extern void RemoveObjects(DropStmt *stmt);
+extern void CheckObjectsStorageDrop(DropStmt *stmt);
 
 /* commands/indexcmds.c */
 #ifdef USE_PGRAC_CLUSTER

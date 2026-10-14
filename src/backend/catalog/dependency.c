@@ -15,6 +15,7 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/relation.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
@@ -65,6 +66,12 @@
 #include "catalog/pg_ts_template.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_user_mapping.h"
+#include "catalog/storage.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_ic.h"
+#include "cluster/cluster_mode.h"
+#endif
 #include "commands/comment.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
@@ -242,6 +249,29 @@ deleteObjectsInList(ObjectAddresses *targetObjects, Relation *depRel,
 					int flags)
 {
 	int			i;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Check the complete dependency closure before deleting even its first
+	 * object. Dependency discovery already owns each deletion lock. */
+	if (cluster_storage_mode_enabled() && cluster_interconnect_tier != CLUSTER_IC_TIER_1) {
+		for (i = 0; i < targetObjects->numrefs; i++) {
+			const ObjectAddress *obj = &targetObjects->refs[i];
+			Relation rel;
+
+			if (((flags & PERFORM_DELETION_SKIP_ORIGINAL)
+				 && (targetObjects->extras[i].flags & DEPFLAG_ORIGINAL))
+				|| obj->classId != RelationRelationId || obj->objectSubId != 0)
+				continue;
+			rel = relation_open(obj->objectId, NoLock);
+			if (RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
+				RelationCheckStorageDrain(rel->rd_locator, rel->rd_rel->relpersistence, "deletion");
+			relation_close(rel, NoLock);
+		}
+	}
+#endif
+
+	if (flags & PERFORM_DELETION_CHECK_STORAGE_ONLY)
+		return;
 
 	/*
 	 * Keep track of objects for event triggers, if necessary.
@@ -437,10 +467,9 @@ performMultipleDeletions(const ObjectAddresses *objects,
 	 * If there's exactly one object being deleted, report it the same way as
 	 * in performDeletion(), else we have to be vaguer.
 	 */
-	reportDependentObjects(targetObjects,
-						   behavior,
-						   flags,
-						   (objects->numrefs == 1 ? objects->refs : NULL));
+	if ((flags & PERFORM_DELETION_CHECK_STORAGE_ONLY) == 0)
+		reportDependentObjects(targetObjects, behavior, flags,
+							   (objects->numrefs == 1 ? objects->refs : NULL));
 
 	/* do the deed */
 	deleteObjectsInList(targetObjects, &depRel, flags);

@@ -1834,6 +1834,9 @@ heap_drop_with_catalog(Oid relid)
 	 */
 	rel = relation_open(relid, AccessExclusiveLock);
 
+	if (RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
+		RelationCheckStorageDrain(rel->rd_locator, rel->rd_rel->relpersistence, "deletion");
+
 	/*
 	 * There can no longer be anyone *else* touching the relation, but we
 	 * might still have open queries or cursors, or pending trigger events, in
@@ -3142,6 +3145,8 @@ heap_truncate_one_rel(Relation rel)
 	 */
 	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
 		return;
+
+	RelationCheckStorageDrain(rel->rd_locator, rel->rd_rel->relpersistence, "truncation");
 
 	/* Truncate the underlying relation */
 	table_relation_nontransactional_truncate(rel);

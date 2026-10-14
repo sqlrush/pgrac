@@ -244,6 +244,28 @@ CheckClusterSharedUtilitySupport(Node *statement)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("%s is not supported in shared mode", unsupported),
 				 errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+	/* Resolve the original roots and complete dependency closure before
+	 * ddl_command_start can run. The final deletion pass rechecks its own
+	 * closure because a trigger may change dependencies in this transaction. */
+	if (cluster_interconnect_tier != CLUSTER_IC_TIER_1 && IsA(statement, DropStmt)) {
+		DropStmt *drop = (DropStmt *)statement;
+
+		switch (drop->removeType) {
+		case OBJECT_TABLE:
+		case OBJECT_INDEX:
+		case OBJECT_SEQUENCE:
+		case OBJECT_VIEW:
+		case OBJECT_MATVIEW:
+		case OBJECT_FOREIGN_TABLE:
+			CheckRelationsStorageDrop(drop);
+			break;
+		default:
+			CheckObjectsStorageDrop(drop);
+			break;
+		}
+	}
+	if (cluster_interconnect_tier != CLUSTER_IC_TIER_1 && IsA(statement, DropOwnedStmt))
+		CheckOwnedObjectsStorageDrop((DropOwnedStmt *)statement);
 }
 #endif
 

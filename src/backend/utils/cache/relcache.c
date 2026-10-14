@@ -3737,6 +3737,7 @@ RelationSetNewRelfilenumber(Relation relation, char persistence)
 
 	RelationCheckStorageTransaction(relation->rd_locator,
 									relation->rd_rel->relpersistence, "rewrite");
+	RelationCheckStorageDrain(relation->rd_locator, relation->rd_rel->relpersistence, "rewrite");
 
 	if (!IsBinaryUpgrade)
 	{

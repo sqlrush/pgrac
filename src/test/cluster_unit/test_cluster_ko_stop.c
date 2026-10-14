@@ -105,6 +105,7 @@ UT_DEFINE_GLOBALS();
 bool IsUnderPostmaster = true;
 AuxProcType MyAuxProcType = SinvalBcastProcess;
 int cluster_node_id = 0;
+int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 int MyProcPid = 199;
 BackendType MyBackendType = B_BACKEND;
 BackendId MyBackendId = 1;
@@ -5546,6 +5547,22 @@ peer_fence_fixture(uint64 batch)
 	return shared_v3_request(batch);
 }
 
+UT_TEST(test_v3_control_refuses_non_tier1_even_with_peer_caps)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(300);
+	ClusterKoPeerFenceHandleV3 handle;
+	ClusterKoPeerFenceStateV3 state;
+	UT_ASSERT(ko_shared_v3_control_current(&request));
+	for (int tier = CLUSTER_IC_TIER_2; tier <= CLUSTER_IC_TIER_3; tier++) {
+		cluster_interconnect_tier = tier;
+		UT_ASSERT(!ko_shared_v3_control_current(&request));
+		UT_ASSERT(!cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+		UT_ASSERT_EQ(storage.peer_fence_serial, 0);
+	}
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+}
+
 UT_TEST(test_peer_fence_commit_needs_exact_ready_operation)
 {
 	ClusterKoSharedMessageV3 request = peer_fence_fixture(301);
@@ -6032,7 +6049,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(134);
+	UT_PLAN(135);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
 	UT_RUN(test_peer_space_entry_checks_precede_io);
@@ -6150,6 +6167,7 @@ main(void)
 	UT_RUN(test_drop_abandon_scan_keeps_transient_wait_retryable);
 	UT_RUN(test_drop_abandon_scan_requires_original_executor_of_replaced_context);
 	UT_RUN(test_drop_abandon_requires_recovery_at_normal_stop_even_with_pending_work);
+	UT_RUN(test_v3_control_refuses_non_tier1_even_with_peer_caps);
 	UT_RUN(test_peer_fence_commit_needs_exact_ready_operation);
 	UT_RUN(test_peer_fence_replay_retains_full_identity_and_revision);
 	UT_RUN(test_peer_fence_terminal_is_not_a_maximum_batch_watermark);

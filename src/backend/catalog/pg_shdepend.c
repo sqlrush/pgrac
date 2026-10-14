@@ -56,6 +56,11 @@
 #include "commands/extension.h"
 #include "commands/policy.h"
 #include "commands/proclang.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_ic.h"
+#include "cluster/cluster_mode.h"
+#endif
 #include "commands/publicationcmds.h"
 #include "commands/schemacmds.h"
 #include "commands/subscriptioncmds.h"
@@ -1291,8 +1296,8 @@ storeObjectDescription(StringInfo descs,
  * is necessary so that we don't get failures from trying to delete
  * interdependent objects in the wrong order.
  */
-void
-shdepDropOwned(List *roleids, DropBehavior behavior)
+static void
+shdepDropOwnedInternal(List *roleids, DropBehavior behavior, bool check_storage_only)
 {
 	Relation	sdepRel;
 	ListCell   *cell;
@@ -1371,10 +1376,9 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
 					 * Try to remove role from policy; if unable to, remove
 					 * policy.
 					 */
-					if (!RemoveRoleFromObjectPolicy(roleid,
-													sdepForm->classid,
-													sdepForm->objid))
-					{
+					if (check_storage_only
+						|| !RemoveRoleFromObjectPolicy(roleid, sdepForm->classid,
+													   sdepForm->objid)) {
 						obj.classId = sdepForm->classid;
 						obj.objectId = sdepForm->objid;
 						obj.objectSubId = sdepForm->objsubid;
@@ -1406,9 +1410,8 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
 					 */
 					if (sdepForm->classid != AuthMemRelationId)
 					{
-						RemoveRoleFromObjectACL(roleid,
-												sdepForm->classid,
-												sdepForm->objid);
+						if (!check_storage_only)
+							RemoveRoleFromObjectACL(roleid, sdepForm->classid, sdepForm->objid);
 						break;
 					}
 					/* FALLTHROUGH */
@@ -1451,12 +1454,31 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
 	sort_object_addresses(deleteobjs);
 
 	/* the dependency mechanism does the actual work */
-	performMultipleDeletions(deleteobjs, behavior, 0);
+	performMultipleDeletions(
+		deleteobjs, behavior,
+		check_storage_only ? PERFORM_DELETION_CHECK_STORAGE_ONLY | PERFORM_DELETION_QUIETLY : 0);
 
 	table_close(sdepRel, RowExclusiveLock);
 
 	free_object_addresses(deleteobjs);
 }
+
+void
+shdepCheckOwnedStorageDrop(List *roleids, DropBehavior behavior)
+{
+	shdepDropOwnedInternal(roleids, behavior, true);
+}
+
+void
+shdepDropOwned(List *roleids, DropBehavior behavior)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_storage_mode_enabled() && cluster_interconnect_tier != CLUSTER_IC_TIER_1)
+		shdepCheckOwnedStorageDrop(roleids, behavior);
+#endif
+	shdepDropOwnedInternal(roleids, behavior, false);
+}
+
 
 /*
  * shdepReassignOwned

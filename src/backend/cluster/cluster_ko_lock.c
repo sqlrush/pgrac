@@ -703,7 +703,8 @@ ko_shared_v3_control_at_generation(const ClusterKoSharedMessageV3 *message, uint
 	uint8 expected[CLUSTER_KO_SHARED_V3_BYTES], observed[sizeof(expected)];
 	int32 current_master, other;
 
-	if (message == NULL || local_generation == 0 || local_generation == UINT64_MAX)
+	if (message == NULL || local_generation == 0 || local_generation == UINT64_MAX
+		|| cluster_interconnect_tier != CLUSTER_IC_TIER_1)
 		return false;
 	current = *message;
 	/* The AX wire token belongs to the origin. Each consumer retains and

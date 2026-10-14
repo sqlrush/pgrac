@@ -24,6 +24,8 @@ extern PGDLLIMPORT int wal_skip_threshold;
 
 extern void RelationCheckStorageTransaction(RelFileLocator rlocator, char relpersistence,
 											const char *operation);
+extern void RelationCheckStorageDrain(RelFileLocator rlocator, char relpersistence,
+									  const char *operation);
 
 extern SMgrRelation RelationCreateStorage(RelFileLocator rlocator,
 										  char relpersistence,

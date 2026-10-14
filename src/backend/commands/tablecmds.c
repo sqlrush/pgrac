@@ -1370,13 +1370,14 @@ DropErrorMsgWrongType(const char *relname, char wrongkind, char rightkind)
  *		Implements DROP TABLE, DROP INDEX, DROP SEQUENCE, DROP VIEW,
  *		DROP MATERIALIZED VIEW, DROP FOREIGN TABLE
  */
-void
-RemoveRelations(DropStmt *drop)
+static void
+RemoveRelationsInternal(DropStmt *drop, bool check_storage_only)
 {
 	ObjectAddresses *objects;
 	char		relkind;
 	ListCell   *cell;
-	int			flags = 0;
+	int flags
+		= check_storage_only ? PERFORM_DELETION_CHECK_STORAGE_ONLY | PERFORM_DELETION_QUIETLY : 0;
 	LOCKMODE	lockmode = AccessExclusiveLock;
 
 	/* DROP CONCURRENTLY uses a weaker lock, and has some restrictions */
@@ -1476,7 +1477,8 @@ RemoveRelations(DropStmt *drop)
 		/* Not there? */
 		if (!OidIsValid(relOid))
 		{
-			DropErrorMsgNonExistent(rel, relkind, drop->missing_ok);
+			if (!check_storage_only || !drop->missing_ok)
+				DropErrorMsgNonExistent(rel, relkind, drop->missing_ok);
 			continue;
 		}
 
@@ -1526,6 +1528,18 @@ RemoveRelations(DropStmt *drop)
 	performMultipleDeletions(objects, drop->behavior, flags);
 
 	free_object_addresses(objects);
+}
+
+void
+RemoveRelations(DropStmt *drop)
+{
+	RemoveRelationsInternal(drop, false);
+}
+
+void
+CheckRelationsStorageDrop(DropStmt *drop)
+{
+	RemoveRelationsInternal(drop, true);
 }
 
 /*
@@ -1877,6 +1891,16 @@ ExecuteTruncateGuts(List *explicit_rels,
 		}
 	}
 
+	/* Preflight the entire expanded target set before triggers or any
+	 * truncation/rewrite; a later shared relation cannot refuse after an
+	 * earlier target has already changed. */
+	foreach (cell, rels) {
+		Relation rel = lfirst(cell);
+
+		if (RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
+			RelationCheckStorageDrain(rel->rd_locator, rel->rd_rel->relpersistence, "truncation");
+	}
+
 	/*
 	 * Check foreign key references.  In CASCADE mode, this should be
 	 * unnecessary since we just pulled in all the references; but as a
@@ -1909,6 +1933,9 @@ ExecuteTruncateGuts(List *explicit_rels,
 				Relation	seq_rel;
 
 				seq_rel = relation_open(seq_relid, AccessExclusiveLock);
+
+				RelationCheckStorageDrain(seq_rel->rd_locator, seq_rel->rd_rel->relpersistence,
+										  "truncation");
 
 				/* This check must match AlterSequence! */
 				if (!object_ownercheck(RelationRelationId, seq_relid, GetUserId()))

@@ -1580,8 +1580,8 @@ GrantRole(ParseState *pstate, GrantRoleStmt *stmt)
  *
  * Drop the objects owned by a given list of roles.
  */
-void
-DropOwnedObjects(DropOwnedStmt *stmt)
+static void
+DropOwnedObjectsInternal(DropOwnedStmt *stmt, bool check_storage_only)
 {
 	List	   *role_ids = roleSpecsToIds(stmt->roles);
 	ListCell   *cell;
@@ -1600,8 +1600,24 @@ DropOwnedObjects(DropOwnedStmt *stmt)
 	}
 
 	/* Ok, do it */
-	shdepDropOwned(role_ids, stmt->behavior);
+	if (check_storage_only)
+		shdepCheckOwnedStorageDrop(role_ids, stmt->behavior);
+	else
+		shdepDropOwned(role_ids, stmt->behavior);
 }
+
+void
+DropOwnedObjects(DropOwnedStmt *stmt)
+{
+	DropOwnedObjectsInternal(stmt, false);
+}
+
+void
+CheckOwnedObjectsStorageDrop(DropOwnedStmt *stmt)
+{
+	DropOwnedObjectsInternal(stmt, true);
+}
+
 
 /*
  * ReassignOwnedObjects

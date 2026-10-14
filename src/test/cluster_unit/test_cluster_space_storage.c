@@ -53,6 +53,7 @@ UT_DEFINE_GLOBALS();
 
 bool cluster_shared_config = true, cluster_enabled = true, cluster_shared_catalog;
 int cluster_node_id = 0;
+int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 int NBuffers = 2, NLocBuffer;
 char *BufferBlocks;
 Block *LocalBufferBlockPointers;
@@ -1015,6 +1016,16 @@ cluster_ko_flush_and_wait_ack(RelFileLocator tag, char persistence)
 	}
 }
 
+/* KO is an explicit boundary of this native storage fixture. */
+void
+cluster_ko_flush_and_wait_ack_relation(Relation rel, char persistence, uint16 operation)
+{
+	UT_ASSERT(operation == CLUSTER_KO_SHARED_V3_OPERATION_DROP
+			  || operation == CLUSTER_KO_SHARED_V3_OPERATION_TRUNCATE
+			  || operation == CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD);
+	cluster_ko_flush_and_wait_ack(rel->rd_locator, persistence);
+}
+
 bool
 cluster_ko_shared_claim_v2(const ClusterSpaceIdentityKey *key, const uint8 incarnation[16],
 						   ClusterKoCompletionV2 **out)
@@ -1307,6 +1318,7 @@ reset(void)
 	ref.claim.identity.origin_node_id = 0;
 	ref.claim.identity.origin_thread_id = 1;
 	cluster_shared_config = cluster_enabled = have_ref = shared = true;
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 	exists = recovering = pinned = locked = false;
 	cluster_recmerge_window_active = cluster_recmerge_apply_foreign = false;
 	native_owner = delete_registered = false;

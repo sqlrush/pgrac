@@ -54,8 +54,8 @@ static bool type_in_list_does_not_exist_skipping(List *typenames,
  * performMultipleDeletions() call.  This avoids unnecessary DROP RESTRICT
  * errors if there are dependencies between them.
  */
-void
-RemoveObjects(DropStmt *stmt)
+static void
+RemoveObjectsInternal(DropStmt *stmt, bool check_storage_only)
 {
 	ObjectAddresses *objects;
 	ListCell   *cell1;
@@ -84,7 +84,8 @@ RemoveObjects(DropStmt *stmt)
 		if (!OidIsValid(address.objectId))
 		{
 			Assert(stmt->missing_ok);
-			does_not_exist_skipping(stmt->removeType, object);
+			if (!check_storage_only)
+				does_not_exist_skipping(stmt->removeType, object);
 			continue;
 		}
 
@@ -125,10 +126,25 @@ RemoveObjects(DropStmt *stmt)
 	}
 
 	/* Here we really delete them. */
-	performMultipleDeletions(objects, stmt->behavior, 0);
+	performMultipleDeletions(
+		objects, stmt->behavior,
+		check_storage_only ? PERFORM_DELETION_CHECK_STORAGE_ONLY | PERFORM_DELETION_QUIETLY : 0);
 
 	free_object_addresses(objects);
 }
+
+void
+RemoveObjects(DropStmt *stmt)
+{
+	RemoveObjectsInternal(stmt, false);
+}
+
+void
+CheckObjectsStorageDrop(DropStmt *stmt)
+{
+	RemoveObjectsInternal(stmt, true);
+}
+
 
 /*
  * owningrel_does_not_exist_skipping

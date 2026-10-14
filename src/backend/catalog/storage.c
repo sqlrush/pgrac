@@ -156,6 +156,24 @@ RelationCheckStorageTransaction(RelFileLocator rlocator, char relpersistence,
 #endif
 }
 
+/* Check the configured transport, never the mux's current fallback choice.
+ * Both catalog preflight and internal storage producers use this predicate. */
+void
+RelationCheckStorageDrain(RelFileLocator rlocator, char relpersistence, const char *operation)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (relpersistence != RELPERSISTENCE_TEMP && cluster_storage_mode_enabled()
+		&& cluster_interconnect_tier != CLUSTER_IC_TIER_1
+		&& cluster_smgr_which_for(rlocator, InvalidBackendId) == 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("shared relation storage %s requires the tier1 interconnect", operation),
+				 errdetail("Object drain is not supported by the configured interconnect tier."),
+				 errhint("Set cluster.interconnect_tier=tier1 and restart before retrying this "
+						 "operation.")));
+#endif
+}
+
 /*
  * RelationCreateStorage
  *		Create physical storage for a relation.
@@ -271,6 +289,7 @@ RelationDropStorage(Relation rel)
 	PendingRelDelete *pending;
 
 	RelationCheckStorageTransaction(rel->rd_locator, rel->rd_rel->relpersistence, "deletion");
+	RelationCheckStorageDrain(rel->rd_locator, rel->rd_rel->relpersistence, "deletion");
 
 #ifdef USE_PGRAC_CLUSTER
 	/*
@@ -379,6 +398,7 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	ClusterSpaceTruncateState *space_truncate = NULL;
 
 	RelationCheckStorageTransaction(rel->rd_locator, rel->rd_rel->relpersistence, "truncation");
+	RelationCheckStorageDrain(rel->rd_locator, rel->rd_rel->relpersistence, "truncation");
 
 	/*
 	 * PGRAC: spec-5.7 D6 (KO).  Before shrinking the relfilenode's file, make
@@ -580,6 +600,7 @@ RelationPreTruncate(Relation rel)
 	PendingRelSync *pending;
 
 	RelationCheckStorageTransaction(rel->rd_locator, rel->rd_rel->relpersistence, "truncation");
+	RelationCheckStorageDrain(rel->rd_locator, rel->rd_rel->relpersistence, "truncation");
 
 	if (!pendingSyncHash)
 		return;
