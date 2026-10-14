@@ -61,7 +61,9 @@ cluster_recovery_root_set_begin(int root_fd, uint64 system_identifier, uint64 da
 extern ClusterRecoveryRootsResult
 cluster_recovery_root_set_add_target(ClusterRecoveryRootSet *roots, const RfPageIdentityV1 *page);
 
-/* At most one BLCKSZ read or 128 metadata/sort operations per call. Observe
+/* At most one BLCKSZ read or 128 metadata/sort operations per call; each
+ * path lookup separately permits at most 128 bucket probes, then CAPACITY.
+ * Hash exhaustion never removes a candidate or completes an observation. Observe
  * all files twice, not only WAL targets. Unknown files remain UNCLASSIFIED.
  * Directory/name/file identity and complete bytes must agree. OBSERVED is
  * only a stable candidate root set: missing/unknown/undecoded obligations
@@ -71,6 +73,19 @@ extern ClusterRecoveryRootsResult cluster_recovery_root_set_step(ClusterRecovery
 extern uint32 cluster_recovery_root_set_count(const ClusterRecoveryRootSet *roots);
 extern const ClusterRecoveryRootEntry *
 cluster_recovery_root_set_entry(const ClusterRecoveryRootSet *roots, uint32 index);
+/* Compare the observed namespace binding only; this is not ROOT authority. */
+extern bool cluster_recovery_root_set_namespace_matches(const ClusterRecoveryRootSet *roots,
+														uint64 system_identifier,
+														uint64 database_incarnation);
+/* Read one chunk of a physical file already in OBSERVED. Every path component
+ * is reopened without symlink traversal and compared with its saved object;
+ * file and path are rechecked after the exact read. Missing WAL-only objects,
+ * short reads and namespace changes poison the observation. This is still a
+ * candidate read: the cold owner retains isolation/cuts and performs its full
+ * final graph revalidation. No terminal authority follows from stat equality. */
+extern ClusterRecoveryRootsResult cluster_recovery_root_set_read(ClusterRecoveryRootSet *roots,
+																 uint32 index, uint64 offset,
+																 void *buffer, size_t length);
 /* Full SHA-256 of a domain-separated, canonical path-ordered encoding.
  * No stat padding, truncated hash or CRC. Only available after OBSERVED;
  * digest equality is an index, never a substitute for the original proofs. */

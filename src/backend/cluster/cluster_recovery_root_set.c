@@ -7,6 +7,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include <fcntl.h>
 #include <unistd.h>
 #include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_recovery_root_set.h"
@@ -77,14 +78,22 @@ static bool
 roots_lookup(ClusterRecoveryRootSet *roots, const char *path, bool create, uint32 *index)
 {
 	uint64 hash = UINT64CONST(14695981039346656037);
-	uint32 bucket;
+	uint32 bucket, probes = 0;
 
 	for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
 		hash ^= *p;
 		hash *= UINT64CONST(1099511628211);
 	}
 	bucket = (uint32)hash & (roots->bucket_count - 1);
-	while (roots->buckets[bucket] != 0) {
+	for (;;) {
+		/* Hash collision exhaustion is a resource refusal, never absence.
+		 * This also bounds lookups during a single namespace step. */
+		if (probes++ == ROOTS_TICK) {
+			roots_fail(roots, CLUSTER_RECOVERY_ROOTS_CAPACITY);
+			return false;
+		}
+		if (roots->buckets[bucket] == 0)
+			break;
 		*index = roots->buckets[bucket] - 1;
 		if (strcmp(roots->entries[*index].file.path, path) == 0)
 			return true;
@@ -460,6 +469,131 @@ cluster_recovery_root_set_entry(const ClusterRecoveryRootSet *roots, uint32 inde
 				   || index >= roots->count
 			   ? NULL
 			   : &roots->entries[roots->order[index]];
+}
+
+bool
+cluster_recovery_root_set_namespace_matches(const ClusterRecoveryRootSet *roots,
+											uint64 system_identifier, uint64 database_incarnation)
+{
+	return roots != NULL && roots->status == CLUSTER_RECOVERY_ROOTS_OBSERVED
+		   && roots->system_identifier == system_identifier
+		   && roots->database_incarnation == database_incarnation;
+}
+
+static ClusterRecoveryRootsResult
+roots_open_error(ClusterRecoveryRootSet *roots)
+{
+	return roots_fail(roots, errno == ENOENT || errno == ELOOP || errno == ENOTDIR
+								 ? CLUSTER_RECOVERY_ROOTS_CHANGED
+								 : CLUSTER_RECOVERY_ROOTS_IO);
+}
+
+/* No caller-supplied path: every component must be an observed member of
+ * this set. At most one newly opened parent is retained while descending. */
+static int
+roots_open_observed(ClusterRecoveryRootSet *roots, const ClusterRecoveryRootEntry *entry)
+{
+	char path[MAXPGPATH];
+	char *part;
+	int parent = roots->root_fd;
+	struct stat held;
+
+	if (fstat(parent, &held) != 0) {
+		roots_fail(roots, CLUSTER_RECOVERY_ROOTS_IO);
+		return -1;
+	}
+	if (!cluster_recovery_namespace_stat_same(&roots->root_stat, &held)) {
+		roots_fail(roots, CLUSTER_RECOVERY_ROOTS_CHANGED);
+		return -1;
+	}
+	strlcpy(path, entry->file.path, sizeof(path));
+	part = path;
+	for (;;) {
+		char *slash = strchr(part, '/');
+		uint32 at;
+		int fd;
+		const ClusterRecoveryRootEntry *expected;
+
+		if (slash != NULL)
+			*slash = '\0';
+		if (!roots_lookup(roots, path, false, &at)) {
+			if (roots->status == CLUSTER_RECOVERY_ROOTS_OBSERVED)
+				roots_fail(roots, CLUSTER_RECOVERY_ROOTS_CHANGED);
+			break;
+		}
+		expected = &roots->entries[at];
+		if ((expected->origins & CLUSTER_RECOVERY_ROOT_PHYSICAL) == 0
+			|| (slash != NULL && expected->file.kind != CLUSTER_RECOVERY_FILE_DIRECTORY)) {
+			roots_fail(roots, CLUSTER_RECOVERY_ROOTS_CHANGED);
+			break;
+		}
+		fd = openat(parent, part,
+					O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK
+						| (slash != NULL ? O_DIRECTORY : 0));
+		if (fd < 0) {
+			roots_open_error(roots);
+			break;
+		}
+		if (fstat(fd, &held) != 0)
+			roots_fail(roots, CLUSTER_RECOVERY_ROOTS_IO);
+		else if (!cluster_recovery_namespace_stat_same(&expected->file.observed, &held))
+			roots_fail(roots, CLUSTER_RECOVERY_ROOTS_CHANGED);
+		if (parent != roots->root_fd && close(parent) != 0)
+			roots_fail(roots, CLUSTER_RECOVERY_ROOTS_IO);
+		parent = roots->root_fd;
+		if (roots->status != CLUSTER_RECOVERY_ROOTS_OBSERVED) {
+			close(fd);
+			return -1;
+		}
+		if (slash == NULL)
+			return fd;
+		parent = fd;
+		*slash = '/';
+		part = slash + 1;
+	}
+	if (parent != roots->root_fd)
+		close(parent);
+	return -1;
+}
+
+ClusterRecoveryRootsResult
+cluster_recovery_root_set_read(ClusterRecoveryRootSet *roots, uint32 index, uint64 offset,
+							   void *buffer, size_t length)
+{
+	const ClusterRecoveryRootEntry *entry;
+	int fd, recheck = -1;
+	struct stat held;
+
+	if (buffer != NULL && length > 0 && length <= BLCKSZ)
+		memset(buffer, 0, length);
+	if (roots == NULL)
+		return CLUSTER_RECOVERY_ROOTS_INVALID;
+	if (roots->status > CLUSTER_RECOVERY_ROOTS_OBSERVED)
+		return roots->status;
+	entry = cluster_recovery_root_set_entry(roots, index);
+	if (entry == NULL || buffer == NULL || length == 0 || length > BLCKSZ
+		|| (entry->origins & CLUSTER_RECOVERY_ROOT_PHYSICAL) == 0
+		|| !S_ISREG(entry->file.observed.st_mode) || offset > entry->file.size
+		|| length > entry->file.size - offset)
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	fd = roots_open_observed(roots, entry);
+	if (fd < 0)
+		return roots->status;
+	if (pread(fd, buffer, length, (off_t)offset) != (ssize_t)length || fstat(fd, &held) != 0)
+		roots_fail(roots, CLUSTER_RECOVERY_ROOTS_IO);
+	else if (!cluster_recovery_namespace_stat_same(&entry->file.observed, &held))
+		roots_fail(roots, CLUSTER_RECOVERY_ROOTS_CHANGED);
+	else
+		recheck = roots_open_observed(roots, entry);
+	if (recheck >= 0 && close(recheck) != 0)
+		roots_fail(roots, CLUSTER_RECOVERY_ROOTS_IO);
+	if (close(fd) != 0)
+		roots_fail(roots, CLUSTER_RECOVERY_ROOTS_IO);
+	if (roots->status != CLUSTER_RECOVERY_ROOTS_OBSERVED) {
+		memset(buffer, 0, length);
+		return roots->status;
+	}
+	return CLUSTER_RECOVERY_ROOTS_BYTES;
 }
 
 bool

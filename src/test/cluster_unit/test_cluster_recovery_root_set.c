@@ -4,7 +4,9 @@
 #define main namespace_fixture_main
 #include "test_cluster_recovery_namespace.c"
 #undef main
+#define pread namespace_test_pread
 #include "../../backend/cluster/cluster_recovery_root_set.c"
+#undef pread
 
 static const uint8 root_uuid[16] = { 9, 3, 7 };
 
@@ -450,10 +452,135 @@ UT_TEST(test_directory_budget_is_returned_after_each_subtree)
 	remove_root(fd);
 }
 
+UT_TEST(test_graph_reader_uses_the_observed_file_and_range)
+{
+	int fd = new_root();
+	ClusterRecoveryRootSet *roots;
+	uint8 data[BLCKSZ + 9], output[9];
+
+	memset(data, 0xa5, sizeof(data));
+	UT_ASSERT_EQ(mkdirat(fd, "d", 0700), 0);
+	root_file(fd, "d/data", data, sizeof(data));
+	roots = begin_roots(fd, 1024 * 1024);
+	if (roots != NULL) {
+		UT_ASSERT_EQ(finish_roots(roots, NULL), CLUSTER_RECOVERY_ROOTS_OBSERVED);
+		UT_ASSERT_EQ(cluster_recovery_root_set_read(roots, 1, BLCKSZ, output, sizeof(output)),
+					 CLUSTER_RECOVERY_ROOTS_BYTES);
+		UT_ASSERT_EQ(memcmp(output, data + BLCKSZ, sizeof(output)), 0);
+		/* Neither the root fd nor the logical observation is consumed. */
+		UT_ASSERT(fcntl(fd, F_GETFD) >= 0);
+		UT_ASSERT(cluster_recovery_root_set_entry(roots, 1) != NULL);
+		cluster_recovery_root_set_destroy(roots);
+	}
+	remove_root(fd);
+}
+
+UT_TEST(test_graph_read_refuses_changed_parent_or_file)
+{
+	for (unsigned mode = 0; mode < 3; mode++) {
+		int fd = new_root();
+		ClusterRecoveryRootSet *roots;
+		uint8 output[4], digest[32];
+
+		UT_ASSERT_EQ(mkdirat(fd, "d", 0700), 0);
+		write_file(fd, "d/data");
+		roots = begin_roots(fd, 1024 * 1024);
+		if (roots == NULL) {
+			remove_root(fd);
+			continue;
+		}
+		UT_ASSERT_EQ(finish_roots(roots, NULL), CLUSTER_RECOVERY_ROOTS_OBSERVED);
+		if (mode == 0) {
+			UT_ASSERT_EQ(renameat(fd, "d", fd, "old"), 0);
+			UT_ASSERT_EQ(mkdirat(fd, "d", 0700), 0);
+			write_file(fd, "d/data");
+		} else if (mode == 1)
+			root_file(fd, "d/data", "warm", 4);
+		else {
+			UT_ASSERT_EQ(unlinkat(fd, "d/data", 0), 0);
+			UT_ASSERT_EQ(symlinkat("../outside", fd, "d/data"), 0);
+		}
+		memset(output, 0xcc, sizeof(output));
+		UT_ASSERT_EQ(cluster_recovery_root_set_read(roots, 1, 0, output, sizeof(output)),
+					 CLUSTER_RECOVERY_ROOTS_CHANGED);
+		UT_ASSERT_EQ(output[0] | output[1] | output[2] | output[3], 0);
+		UT_ASSERT(!cluster_recovery_root_set_digest(roots, digest));
+		cluster_recovery_root_set_destroy(roots);
+		remove_root(fd);
+	}
+}
+
+UT_TEST(test_graph_read_never_turns_io_or_short_read_into_an_empty_edge)
+{
+	for (unsigned fault = 1; fault <= 3; fault++) {
+		int fd = new_root();
+		ClusterRecoveryRootSet *roots;
+		uint8 output[4], digest[32];
+
+		write_file(fd, "data");
+		roots = begin_roots(fd, 1024 * 1024);
+		if (roots == NULL) {
+			remove_root(fd);
+			continue;
+		}
+		UT_ASSERT_EQ(finish_roots(roots, NULL), CLUSTER_RECOVERY_ROOTS_OBSERVED);
+		if (fault < 3)
+			inject_pread_fault = fault;
+		else
+			modify_during_read = openat(fd, "data", O_WRONLY);
+		UT_ASSERT_EQ(cluster_recovery_root_set_read(roots, 0, 0, output, sizeof(output)),
+					 fault < 3 ? CLUSTER_RECOVERY_ROOTS_IO : CLUSTER_RECOVERY_ROOTS_CHANGED);
+		inject_pread_fault = 0;
+		if (modify_during_read >= 0)
+			close(modify_during_read);
+		modify_during_read = -1;
+		UT_ASSERT_EQ(output[0] | output[1] | output[2] | output[3], 0);
+		UT_ASSERT(!cluster_recovery_root_set_digest(roots, digest));
+		cluster_recovery_root_set_destroy(roots);
+		remove_root(fd);
+	}
+}
+
+UT_TEST(test_long_collision_chain_exhausts_budget_without_omitting_a_root)
+{
+	int fd = new_root();
+	ClusterRecoveryRootSet *roots = begin_roots(fd, 1024 * 1024);
+	unsigned colliding = 0;
+	uint8 digest[32];
+	ClusterRecoveryRootsEvent event;
+
+	if (roots != NULL) {
+		for (uint32 number = 1; number < 2000000 && colliding < 129; number++) {
+			char path[64];
+			uint64 hash = UINT64CONST(14695981039346656037);
+			RfPageIdentityV1 page = target(number, MAIN_FORKNUM, 0);
+
+			snprintf(path, sizeof(path), "base/5/%u", number);
+			for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
+				hash ^= *p;
+				hash *= UINT64CONST(1099511628211);
+			}
+			if ((hash & (roots->bucket_count - 1)) != 0)
+				continue;
+			colliding++;
+			UT_ASSERT_EQ(cluster_recovery_root_set_add_target(roots, &page),
+						 colliding <= 128 ? CLUSTER_RECOVERY_ROOTS_MORE
+										  : CLUSTER_RECOVERY_ROOTS_CAPACITY);
+		}
+		UT_ASSERT_EQ(colliding, 129);
+		UT_ASSERT_EQ(cluster_recovery_root_set_step(roots, &event),
+					 CLUSTER_RECOVERY_ROOTS_CAPACITY);
+		UT_ASSERT(!cluster_recovery_root_set_digest(roots, digest));
+		UT_ASSERT_EQ(roots->count, 128);
+	}
+	cluster_recovery_root_set_destroy(roots);
+	remove_root(fd);
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(17);
 	UT_RUN(test_unreferenced_physical_files_and_missing_wal_targets_are_preserved);
 	UT_RUN(test_all_file_bytes_are_read_twice_in_bounded_chunks);
 	UT_RUN(test_digest_is_path_ordered_and_bound_to_the_namespace);
@@ -467,6 +594,10 @@ main(void)
 	UT_RUN(test_large_root_union_sorts_across_ticks_without_dropping_targets);
 	UT_RUN(test_directory_buffers_share_the_root_memory_budget);
 	UT_RUN(test_directory_budget_is_returned_after_each_subtree);
+	UT_RUN(test_graph_reader_uses_the_observed_file_and_range);
+	UT_RUN(test_graph_read_refuses_changed_parent_or_file);
+	UT_RUN(test_graph_read_never_turns_io_or_short_read_into_an_empty_edge);
+	UT_RUN(test_long_collision_chain_exhausts_budget_without_omitting_a_root);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
