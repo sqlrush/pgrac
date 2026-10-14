@@ -5459,11 +5459,203 @@ UT_TEST(test_peer_current_refusal_at_either_read_releases_pin_without_ack)
 	}
 }
 
+/* These exercise the peer operation owner, not a simulated physical drain. */
+static ClusterKoSharedMessageV3
+peer_fence_fixture(uint64 batch)
+{
+	reset_test();
+	cluster_shared_config = true;
+	MyBackendType = B_SINVAL_BCAST;
+	v3_route_live = true;
+	v3_route_master_node = 1;
+	v3_route_generation = 9;
+	return shared_v3_request(batch);
+}
+
+UT_TEST(test_peer_fence_commit_needs_exact_ready_operation)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(301);
+	ClusterKoPeerFenceHandleV3 handle;
+	ClusterKoPeerFenceStateV3 state;
+	const char *reason;
+
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+	UT_ASSERT_EQ(state, CLUSTER_KO_PEER_FENCE_ACTIVE);
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(!cluster_ko_peer_commit_v3(request.base.origin_node, request.base.epoch,
+		request.base.origin_boot, request.base.peer_boot, request.base.batch_id));
+	UT_ASSERT(cluster_ko_peer_fence_ready_v3(&request, &handle));
+	/* Wrong boot/batch does not match this operation. Wrong epoch or target
+	 * boot for its exact key cannot silently terminate the retained fence. */
+	UT_ASSERT(!cluster_ko_peer_commit_v3(request.base.origin_node, request.base.epoch + 1,
+		request.base.origin_boot, request.base.peer_boot, request.base.batch_id));
+	UT_ASSERT(!cluster_ko_peer_commit_v3(request.base.origin_node, request.base.epoch,
+		request.base.origin_boot, request.base.peer_boot + 1, request.base.batch_id));
+	UT_ASSERT(cluster_ko_peer_commit_v3(request.base.origin_node, request.base.epoch,
+		request.base.origin_boot + 1, request.base.peer_boot, request.base.batch_id));
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+	UT_ASSERT_EQ(state, CLUSTER_KO_PEER_FENCE_READY);
+	UT_ASSERT(cluster_ko_peer_commit_v3(request.base.origin_node, request.base.epoch,
+		request.base.origin_boot, request.base.peer_boot, request.base.batch_id));
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+	UT_ASSERT_EQ(state, CLUSTER_KO_PEER_FENCE_COMMITTED);
+	UT_ASSERT(!cluster_ko_peer_fence_ready_v3(&request, &handle));
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(flush_count, 0);
+	UT_ASSERT_EQ(drop_count, 0);
+	UT_ASSERT_EQ(ack_count, 0);
+}
+
+UT_TEST(test_peer_fence_replay_retains_full_identity_and_revision)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(302);
+	ClusterKoSharedMessageV3 changed;
+	ClusterKoPeerFenceHandleV3 first, next, stale;
+	ClusterKoPeerFenceStateV3 state;
+
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &first, &state));
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &next, &state));
+	UT_ASSERT_EQ(first.slot, next.slot);
+	UT_ASSERT_EQ(first.serial, next.serial);
+	changed = request;
+	changed.space_mutation_token++;
+	UT_ASSERT(!cluster_ko_peer_fence_begin_v3(&changed, &next, &state));
+	UT_ASSERT(!cluster_ko_peer_fence_ready_v3(&changed, &first));
+	stale = first;
+	stale.serial++;
+	UT_ASSERT(!cluster_ko_peer_fence_ready_v3(&request, &stale));
+	UT_ASSERT(cluster_ko_peer_fence_ready_v3(&request, &first));
+	UT_ASSERT(cluster_ko_peer_commit_v3(request.base.origin_node, request.base.epoch,
+		request.base.origin_boot, request.base.peer_boot, request.base.batch_id));
+	/* A delayed duplicate must observe the original terminal, not reserve
+	 * fresh work, even while the originating AX would still be held. */
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &next, &state));
+	UT_ASSERT_EQ(state, CLUSTER_KO_PEER_FENCE_COMMITTED);
+	UT_ASSERT_EQ(first.serial, next.serial);
+	UT_ASSERT(cluster_ko_peer_commit_v3(request.base.origin_node, request.base.epoch,
+		request.base.origin_boot, request.base.peer_boot, request.base.batch_id));
+}
+
+UT_TEST(test_peer_fence_terminal_is_not_a_maximum_batch_watermark)
+{
+	ClusterKoSharedMessageV3 lower = peer_fence_fixture(303), higher = lower;
+	ClusterKoPeerFenceHandleV3 lh, hh;
+	ClusterKoPeerFenceStateV3 state;
+
+	higher.base.batch_id++;
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&lower, &lh, &state));
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&higher, &hh, &state));
+	UT_ASSERT(cluster_ko_peer_fence_ready_v3(&higher, &hh));
+	UT_ASSERT(cluster_ko_peer_commit_v3(higher.base.origin_node, higher.base.epoch,
+		higher.base.origin_boot, higher.base.peer_boot, higher.base.batch_id));
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&lower, &lh, &state));
+	UT_ASSERT_EQ(state, CLUSTER_KO_PEER_FENCE_ACTIVE);
+	ko_shared_backend_exit(0, (Datum)0);
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&higher, &hh, &state));
+	UT_ASSERT_EQ(state, CLUSTER_KO_PEER_FENCE_COMMITTED);
+}
+
+UT_TEST(test_peer_fence_capacity_does_not_delete_old_terminal)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(400);
+	ClusterKoPeerFenceHandleV3 handle;
+	ClusterKoPeerFenceStateV3 state;
+
+	for (int i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		request.base.batch_id = 400 + i;
+		UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+		UT_ASSERT(cluster_ko_peer_fence_ready_v3(&request, &handle));
+		UT_ASSERT(cluster_ko_peer_commit_v3(request.base.origin_node, request.base.epoch,
+			request.base.origin_boot, request.base.peer_boot, request.base.batch_id));
+	}
+	request.base.batch_id++;
+	UT_ASSERT(!cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+	request.base.batch_id = 400;
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+	UT_ASSERT_EQ(state, CLUSTER_KO_PEER_FENCE_COMMITTED);
+}
+
+UT_TEST(test_peer_committed_request_cannot_reenter_ingress_or_physical_owner)
+{
+	for (int before = 0; before <= 1; before++) {
+		ClusterKoSharedMessageV3 request = peer_fence_fixture(500);
+		ClusterKoPeerFenceHandleV3 handle;
+		ClusterKoPeerFenceStateV3 state;
+
+		real_space_reader = true;
+		space_identity.key.locator.dbOid = 5;
+		space_identity.sequence = 1;
+		space_identity.operation = 88;
+		UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+		UT_ASSERT(cluster_ko_peer_fence_ready_v3(&request, &handle));
+		if (before)
+			enqueue_shared_v3(&request);
+		UT_ASSERT(cluster_ko_peer_commit_v3(request.base.origin_node, request.base.epoch,
+			request.base.origin_boot, request.base.peer_boot, request.base.batch_id));
+		if (!before) {
+			enqueue_shared_v3(&request);
+			UT_ASSERT_EQ(pg_atomic_read_u32(&ko_state->inbound_head),
+				pg_atomic_read_u32(&ko_state->inbound_tail));
+		}
+		fixture_peer_drain();
+		UT_ASSERT_EQ(flush_count, 0);
+		UT_ASSERT_EQ(drop_count, 0);
+		UT_ASSERT_EQ(maintenance_space_locks, 0);
+		UT_ASSERT_EQ(ko_state->send_v3_count, 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&ko_state->inbound_head),
+			pg_atomic_read_u32(&ko_state->inbound_tail));
+		UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+		UT_ASSERT_EQ(state, CLUSTER_KO_PEER_FENCE_COMMITTED);
+	}
+}
+
+UT_TEST(test_peer_terminal_binds_operation_across_authenticated_publication_retarget)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(600);
+	ClusterKoPeerFenceHandleV3 handle;
+	ClusterKoPeerFenceStateV3 state;
+
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+	UT_ASSERT(cluster_ko_peer_fence_ready_v3(&request, &handle));
+	/* The original publication retry can retarget the same committed
+	 * payload to a new admitted epoch. Operation source/boot/batch is
+	 * unchanged, and this survivor still has the same local boot. */
+	current_epoch++;
+	UT_ASSERT(!cluster_ko_peer_commit_v3(request.base.origin_node, request.base.epoch,
+		request.base.origin_boot, request.base.peer_boot, request.base.batch_id));
+	UT_ASSERT(cluster_ko_peer_commit_v3(request.base.origin_node, current_epoch,
+		request.base.origin_boot, request.base.peer_boot, request.base.batch_id));
+	UT_ASSERT_EQ(ko_state->peer_fences[handle.slot].state, CLUSTER_KO_PEER_FENCE_COMMITTED);
+	/* Terminal consumption does not renew the old KO formation or READY. */
+	UT_ASSERT_EQ(ko_state->peer_fences[handle.slot].request.base.epoch, request.base.epoch);
+	UT_ASSERT(!cluster_ko_peer_fence_ready_v3(&request, &handle));
+}
+
+UT_TEST(test_peer_fence_shmem_creation_initializes_but_attachment_retains)
+{
+	reset_test();
+	memset(ko_state->peer_fences, 0xa5, sizeof(ko_state->peer_fences));
+	ko_state->peer_fence_serial = UINT64_MAX;
+	IsUnderPostmaster = false;
+	cluster_ko_shmem_init();
+	IsUnderPostmaster = true;
+	UT_ASSERT_EQ(ko_state->peer_fence_serial, 0);
+	for (int i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		UT_ASSERT_EQ(ko_state->peer_fences[i].state, CLUSTER_KO_PEER_FENCE_EMPTY);
+		UT_ASSERT_EQ(ko_state->peer_fences[i].serial, 0);
+	}
+	ko_state->peer_fences[0].state = CLUSTER_KO_PEER_FENCE_COMMITTED;
+	ko_state->peer_fences[0].serial = ko_state->peer_fence_serial = 9;
+	cluster_ko_shmem_init();
+	UT_ASSERT_EQ(ko_state->peer_fences[0].state, CLUSTER_KO_PEER_FENCE_COMMITTED);
+	UT_ASSERT_EQ(ko_state->peer_fence_serial, 9);
+}
+
 int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(117);
+	UT_PLAN(124);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
 	UT_RUN(test_peer_space_entry_checks_precede_io);
@@ -5581,6 +5773,13 @@ main(void)
 	UT_RUN(test_drop_abandon_scan_keeps_transient_wait_retryable);
 	UT_RUN(test_drop_abandon_scan_requires_original_executor_of_replaced_context);
 	UT_RUN(test_drop_abandon_requires_recovery_at_normal_stop_even_with_pending_work);
+	UT_RUN(test_peer_fence_commit_needs_exact_ready_operation);
+	UT_RUN(test_peer_fence_replay_retains_full_identity_and_revision);
+	UT_RUN(test_peer_fence_terminal_is_not_a_maximum_batch_watermark);
+	UT_RUN(test_peer_fence_capacity_does_not_delete_old_terminal);
+	UT_RUN(test_peer_committed_request_cannot_reenter_ingress_or_physical_owner);
+	UT_RUN(test_peer_terminal_binds_operation_across_authenticated_publication_retarget);
+	UT_RUN(test_peer_fence_shmem_creation_initializes_but_attachment_retains);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

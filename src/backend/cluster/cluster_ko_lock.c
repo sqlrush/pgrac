@@ -148,6 +148,13 @@ typedef struct ClusterKoInboundSlot {
 	uint64 epoch;
 } ClusterKoInboundSlot;
 
+typedef struct ClusterKoPeerFenceV3 {
+	ClusterKoPeerFenceStateV3 state;
+	uint64 serial;
+	ClusterKoSharedMessageV3 request;
+	uint8 encoded[CLUSTER_KO_SHARED_V3_BYTES];
+} ClusterKoPeerFenceV3;
+
 typedef struct ClusterKoShared {
 	pg_atomic_uint64 flush_count;		 /* barriers initiated (enqueuer) */
 	pg_atomic_uint64 ack_received_count; /* peer DONE ACKs recorded (enqueuer) */
@@ -167,6 +174,10 @@ typedef struct ClusterKoShared {
 	ClusterKoSharedMessageV3 send_v3[CLUSTER_KO_SHARED_CAPACITY];
 	uint64 context_serial;
 	ClusterKoSharedContext contexts[CLUSTER_KO_SHARED_CAPACITY];
+	/* Peer operations are not owned by an origin backend ResourceOwner.
+	 * Passive READY/terminal identities survive its context cleanup. */
+	uint64 peer_fence_serial;
+	ClusterKoPeerFenceV3 peer_fences[CLUSTER_KO_SHARED_CAPACITY];
 	/* Preallocated native continuations belong to this same KO owner.
 	 * One finite ready batch is drained before adopting newly committed work. */
 	int native_dsa_tranche;
@@ -339,6 +350,8 @@ cluster_ko_shmem_init(void)
 		ko_state->send_v3_head = ko_state->send_v3_count = 0;
 		ko_state->context_serial = 0;
 		memset(ko_state->contexts, 0, sizeof(ko_state->contexts));
+		ko_state->peer_fence_serial = 0;
+		memset(ko_state->peer_fences, 0, sizeof(ko_state->peer_fences));
 	}
 }
 
@@ -712,6 +725,160 @@ ko_shared_v3_control_current(const ClusterKoSharedMessageV3 *message)
 		|| !cluster_ko_shared_encode_v3(&current, observed, sizeof(observed)))
 		return false;
 	return memcmp(expected, observed, sizeof(expected)) == 0;
+}
+
+/* All operation-state transitions use the existing short KO lock. No
+ * storage, membership, lock-master or transport operation runs under it. */
+static bool
+ko_peer_fence_key_matches(const ClusterKoPeerFenceV3 *entry, int32 source,
+						  uint64 boot, uint64 batch)
+{
+	return entry->state != CLUSTER_KO_PEER_FENCE_EMPTY
+		&& entry->request.base.origin_node == source
+		&& entry->request.base.origin_boot == boot
+		&& entry->request.base.batch_id == batch;
+}
+
+/* Recheck both at admission and at the original physical consumer. A
+ * REQUEST already in the other inbound ring can outlive its COMMIT marker. */
+static bool
+ko_peer_request_ended_or_conflicts_v3(const ClusterKoSharedMessageV3 *request)
+{
+	uint8 encoded[CLUSTER_KO_SHARED_V3_BYTES];
+	bool refused = false;
+
+	if (!cluster_ko_shared_encode_v3(request, encoded, sizeof(encoded)))
+		return true;
+	SpinLockAcquire(&ko_state->shared_lock);
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		const ClusterKoPeerFenceV3 *entry = &ko_state->peer_fences[i];
+
+		if (!ko_peer_fence_key_matches(entry, request->base.origin_node,
+									 request->base.origin_boot, request->base.batch_id))
+			continue;
+		refused = entry->state == CLUSTER_KO_PEER_FENCE_COMMITTED
+			|| memcmp(entry->encoded, encoded, sizeof(encoded)) != 0;
+		break;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	return refused;
+}
+
+bool
+cluster_ko_peer_fence_begin_v3(const ClusterKoSharedMessageV3 *request,
+							 ClusterKoPeerFenceHandleV3 *handle,
+							 ClusterKoPeerFenceStateV3 *state)
+{
+	uint8 encoded[CLUSTER_KO_SHARED_V3_BYTES];
+	int empty = -1;
+	bool ok = false;
+
+	if (ko_state == NULL || request == NULL || handle == NULL || state == NULL
+		|| !cluster_shared_config || request->base.verb != CLUSTER_KO_SHARED_REQUEST
+		|| (!AmLmonProcess() && !AmSinvalBcastProcess())
+		|| request->base.peer_node != cluster_node_id
+		|| !ko_shared_v3_control_current(request)
+		|| !cluster_ko_shared_encode_v3(request, encoded, sizeof(encoded)))
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		ClusterKoPeerFenceV3 *entry = &ko_state->peer_fences[i];
+
+		if (entry->state == CLUSTER_KO_PEER_FENCE_EMPTY && empty < 0)
+			empty = i;
+		if (!ko_peer_fence_key_matches(entry, request->base.origin_node,
+									 request->base.origin_boot, request->base.batch_id))
+			continue;
+		/* Same operation key with different target/AX/cut is a conflict,
+		 * including a new epoch stamped onto an old operation identity. */
+		if (memcmp(entry->encoded, encoded, sizeof(encoded)) == 0) {
+			handle->slot = i;
+			handle->serial = entry->serial;
+			*state = entry->state;
+			ok = true;
+		}
+		goto done;
+	}
+	if (empty >= 0 && ko_state->peer_fence_serial != UINT64_MAX) {
+		ClusterKoPeerFenceV3 *entry = &ko_state->peer_fences[empty];
+
+		entry->request = *request;
+		memcpy(entry->encoded, encoded, sizeof(encoded));
+		entry->serial = ++ko_state->peer_fence_serial;
+		entry->state = CLUSTER_KO_PEER_FENCE_ACTIVE;
+		handle->slot = empty;
+		handle->serial = entry->serial;
+		*state = entry->state;
+		ok = true;
+	}
+ done:
+	SpinLockRelease(&ko_state->shared_lock);
+	return ok;
+}
+
+/* Called by the original drain owner only after its complete READY
+ * conjunction. This state transition itself performs no drain or ACK. */
+bool
+cluster_ko_peer_fence_ready_v3(const ClusterKoSharedMessageV3 *request,
+							 const ClusterKoPeerFenceHandleV3 *handle)
+{
+	uint8 encoded[CLUSTER_KO_SHARED_V3_BYTES];
+	ClusterKoPeerFenceV3 *entry;
+	bool ok = false;
+
+	if (ko_state == NULL || request == NULL || handle == NULL
+		|| !AmSinvalBcastProcess() || handle->slot >= CLUSTER_KO_SHARED_CAPACITY
+		|| handle->serial == 0 || !ko_shared_v3_control_current(request)
+		|| !cluster_ko_shared_encode_v3(request, encoded, sizeof(encoded)))
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	entry = &ko_state->peer_fences[handle->slot];
+	if (entry->serial == handle->serial
+		&& (entry->state == CLUSTER_KO_PEER_FENCE_ACTIVE
+			|| entry->state == CLUSTER_KO_PEER_FENCE_READY)
+		&& memcmp(entry->encoded, encoded, sizeof(encoded)) == 0) {
+		entry->state = CLUSTER_KO_PEER_FENCE_READY;
+		ok = true;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	return ok;
+}
+
+bool
+cluster_ko_peer_commit_v3(int32 source_node, uint64 epoch, uint64 origin_boot,
+						 uint64 peer_boot, uint64 batch_id)
+{
+	bool ok = true;
+
+	if (ko_state == NULL || !AmSinvalBcastProcess() || !cluster_shared_config
+		|| source_node < 0 || source_node >= CLUSTER_KO_SHARED_NODE_LIMIT
+		|| source_node == cluster_node_id || epoch == 0 || origin_boot == 0
+		|| epoch != cluster_epoch_get_current()
+		|| peer_boot == 0 || batch_id == 0 || batch_id == UINT64_MAX)
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		ClusterKoPeerFenceV3 *entry = &ko_state->peer_fences[i];
+
+		if (!ko_peer_fence_key_matches(entry, source_node, origin_boot, batch_id))
+			continue;
+		/* The immutable operation key is source/boot/batch. Publication
+		 * retry may authenticate that same committed payload in a later
+		 * epoch for surviving boots; it must never renew the old READY. */
+		ok = entry->request.base.epoch <= epoch
+			&& entry->request.base.peer_node == cluster_node_id
+			&& entry->request.base.peer_boot == peer_boot
+			&& (entry->state == CLUSTER_KO_PEER_FENCE_READY
+				|| entry->state == CLUSTER_KO_PEER_FENCE_COMMITTED);
+		if (ok)
+			entry->state = CLUSTER_KO_PEER_FENCE_COMMITTED;
+		break;
+	}
+	/* No new allocation, no PI/native completion, and no terminal GC here.
+	 * Missing keys (e.g. duplicate publication after proven reclamation)
+	 * cannot affect any other operation or manufacture a READY. */
+	SpinLockRelease(&ko_state->shared_lock);
+	return ok;
 }
 
 static bool
@@ -2432,6 +2599,17 @@ cluster_ko_shared_normal_stop_poll_v2(const char **reason)
 														: "KO_SHARED_BARRIER_PENDING";
 		}
 	}
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		ClusterKoPeerFenceStateV3 state = ko_state->peer_fences[i].state;
+
+		if (state < CLUSTER_KO_PEER_FENCE_EMPTY || state > CLUSTER_KO_PEER_FENCE_COMMITTED) {
+			result = CLUSTER_NORMAL_STOP_INVALID;
+			why = "KO_PEER_FENCE_INVALID";
+		} else if (state == CLUSTER_KO_PEER_FENCE_ACTIVE && result == CLUSTER_NORMAL_STOP_READY) {
+			result = CLUSTER_NORMAL_STOP_PENDING;
+			why = "KO_PEER_DRAIN_OWNED";
+		}
+	}
 	SpinLockRelease(&ko_state->shared_lock);
 	if (reason != NULL)
 		*reason = why;
@@ -3304,6 +3482,8 @@ cluster_ko_flush_request_handler(const ClusterICEnvelope *env, const void *paylo
 	 * Existing ACK completion still follows its original exact wait entry. */
 	if (!cluster_normal_stop_service_new_work(true))
 		return;
+	if (v3 && ko_peer_request_ended_or_conflicts_v3(&qualified_v3))
+		return;
 	/* SPSC enqueue (LMON is the only producer). */
 	tail = pg_atomic_read_u32(&ko_state->inbound_tail);
 	head = pg_atomic_read_u32(&ko_state->inbound_head);
@@ -3464,6 +3644,12 @@ cluster_ko_drain_inbound_and_apply(void)
 
 		pg_read_barrier();
 		slot = ko_state->inbound[head]; /* copy before publishing consumer progress */
+		if (slot.shared && slot.v3
+			&& ko_peer_request_ended_or_conflicts_v3(&slot.qualified_v3)) {
+			head = (head + 1) % CLUSTER_KO_INBOUND_CAPACITY;
+			pg_atomic_write_u32(&ko_state->inbound_head, head);
+			goto next;
+		}
 		/* R2 v3 keeps an accepted request at the ring head while its bounded
 		 * terminal-reference proof is still pending. This is the existing ring's
 		 * REQUEST -> READY continuation: later requests are not acknowledged out

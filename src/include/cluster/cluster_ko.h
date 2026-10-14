@@ -133,6 +133,30 @@ typedef struct ClusterKoSharedMessageV3 {
 	uint64 space_mutation_token;
 } ClusterKoSharedMessageV3;
 
+/* The original peer owner retains this exact operation through publication.
+ * A handle is process-independent, but is neither a READY nor an AX proof. */
+typedef enum ClusterKoPeerFenceStateV3 {
+	CLUSTER_KO_PEER_FENCE_EMPTY = 0,
+	CLUSTER_KO_PEER_FENCE_ACTIVE,
+	CLUSTER_KO_PEER_FENCE_READY,
+	CLUSTER_KO_PEER_FENCE_COMMITTED
+} ClusterKoPeerFenceStateV3;
+
+typedef struct ClusterKoPeerFenceHandleV3 {
+	uint32 slot;
+	uint64 serial;
+} ClusterKoPeerFenceHandleV3;
+
+extern bool cluster_ko_peer_fence_begin_v3(const ClusterKoSharedMessageV3 *request,
+										 ClusterKoPeerFenceHandleV3 *handle,
+										 ClusterKoPeerFenceStateV3 *state);
+extern bool cluster_ko_peer_fence_ready_v3(const ClusterKoSharedMessageV3 *request,
+										 const ClusterKoPeerFenceHandleV3 *handle);
+/* Only the authenticated transaction-publication consumer may call this.
+ * No matching operation is an idempotent no-op, never a new READY proof. */
+extern bool cluster_ko_peer_commit_v3(int32 source_node, uint64 epoch, uint64 origin_boot,
+									uint64 peer_boot, uint64 batch_id);
+
 #define CLUSTER_KO_SHARED_V3_OPERATION_DROP 1
 #define CLUSTER_KO_SHARED_V3_OPERATION_TRUNCATE 2
 #define CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD 3

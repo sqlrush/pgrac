@@ -53,6 +53,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
@@ -492,7 +493,9 @@ sinval_receive_publication(const ClusterICEnvelope *env, const void *payload)
 	}
 	msgs = (const SharedInvalidationMessage *)((const char *)payload + sizeof(*pub));
 	for (int i = 0; i < hdr->nmsgs; i++) {
-		if (msgs[i].id < SHAREDINVALSNAPSHOT_ID || msgs[i].id >= SysCacheSize) {
+		if (msgs[i].id == SHAREDINVALKO_COMMIT_ID
+			? !SharedInvalKoCommitIsValid(&msgs[i].ko)
+			: (msgs[i].id < SHAREDINVALSNAPSHOT_ID || msgs[i].id >= SysCacheSize)) {
 			pg_atomic_fetch_add_u64(&ClusterSinval->validation_drop_count, 1);
 			return;
 		}
@@ -621,6 +624,13 @@ cluster_sinval_handle_envelope(const ClusterICEnvelope *env, const void *payload
 	if (!cluster_normal_stop_service_new_work(false))
 		return;
 	msgs = (const SharedInvalidationMessage *)((const char *)hdr + sizeof(*hdr));
+	for (int i = 0; i < hdr->nmsgs; i++) {
+		/* A native/nontransactional message has no commit provenance. */
+		if (msgs[i].id == SHAREDINVALKO_COMMIT_ID) {
+			pg_atomic_fetch_add_u64(&ClusterSinval->validation_drop_count, 1);
+			return;
+		}
+	}
 
 	/* HC133 nonblocking try-enqueue;  failure → fail-safe SIResetAll
 	 * by aux process (set flag,  no silent stale).
@@ -744,6 +754,44 @@ cluster_sinval_drain_outbound_and_broadcast(void)
 	}
 }
 
+/* The original SI auxiliary owns commit effects before publication ACK.
+ * Native insertion/overflow RESET cannot stand in for this exact consumer. */
+static bool
+sinval_apply_ko_commits(const ClusterSinvalQueueEntry *entry)
+{
+	bool contains_ko = false;
+
+	for (int i = 0; i < entry->nmsgs; i++) {
+		if (entry->msgs[i].id != SHAREDINVALKO_COMMIT_ID)
+			continue;
+		if (!SharedInvalKoCommitIsValid(&entry->msgs[i].ko))
+			return false;
+		contains_ko = true;
+	}
+	if (!contains_ko)
+		return true;
+	/* Revalidate after the queue handoff. A stale boot or a testing/native
+	 * enqueue without the authenticated header cannot retire any operation. */
+	if (entry->flags != (SINVAL_PUBLICATION | SINVAL_REQUIRES_ACK)
+		|| entry->epoch == 0 || entry->epoch != cluster_epoch_get_current()
+		|| entry->source_node < 0 || entry->source_node >= CLUSTER_MAX_NODES
+		|| entry->source_node == cluster_node_id
+		|| entry->origin_incarnation == 0 || entry->target_incarnation == 0
+		|| entry->target_incarnation != cluster_qvotec_get_self_incarnation()
+		|| cluster_membership_get_state(entry->source_node) != CLUSTER_MEMBER_MEMBER
+		|| entry->origin_incarnation
+			!= cluster_membership_get_last_admitted_incarnation(entry->source_node))
+		return false;
+	for (int i = 0; i < entry->nmsgs; i++) {
+		if (entry->msgs[i].id == SHAREDINVALKO_COMMIT_ID
+			&& !cluster_ko_peer_commit_v3(entry->source_node, entry->epoch,
+										entry->origin_incarnation, entry->target_incarnation,
+										SharedInvalKoCommitBatchId(&entry->msgs[i].ko)))
+			return false;
+	}
+	return true;
+}
+
 void
 cluster_sinval_drain_inbound_and_apply(void)
 {
@@ -773,6 +821,12 @@ cluster_sinval_drain_inbound_and_apply(void)
 		 * Keep the sender's obligation alive; its retry supplies the batch. */
 		if ((local.flags & SINVAL_PUBLICATION) != 0
 			&& !cluster_sinval_reconfig_reset_ready(local.epoch)) {
+			drained++;
+			continue;
+		}
+		if (!sinval_apply_ko_commits(&local)) {
+			/* Keep the sender's retained publication unacknowledged. Retry
+			 * replays the exact marker; earlier members are idempotent. */
 			drained++;
 			continue;
 		}
