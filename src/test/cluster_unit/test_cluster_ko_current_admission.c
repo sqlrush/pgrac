@@ -174,10 +174,30 @@ UT_TEST(open_object_accepts_once_and_keeps_failed_history)
 	UT_ASSERT_EQ(memcmp(&before, &caller, sizeof(before)), 0);
 }
 
+UT_TEST(finite_current_owner_uses_original_requester_without_ordinary_bypass)
+{
+	ResourceXAssertion assertion = current_setup();
+	ResourceXCallerWitness caller = { 0 }, later = { 0 };
+	ResourceXAcquisitionRef terminal;
+	cluster_shared_config = true;
+	close_object();
+	object_current_continuation = true;
+	UT_ASSERT_EQ(current_step(&assertion, &caller, false, &terminal),
+				 RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_caller_observe_exact(&assertion, 17, 31, 77, &later),
+				 RESOURCE_X_APPLY_APPLIED);
+	memset(&later, 0, sizeof(later));
+	object_current_continuation = false;
+	UT_ASSERT_EQ(current_step(&assertion, &later, false, &terminal),
+				 RESOURCE_X_BOOTSTRAP_ROUND_BACKPRESSURE);
+	UT_ASSERT_EQ(later.joined_request.assertion_sequence, 0);
+	UT_ASSERT_EQ(caller.joined_request.assertion_sequence, 1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(new_round_is_not_published_behind_fence);
 	UT_RUN(observer_cannot_admit_new_caller_to_old_round);
 	UT_RUN(step_preserves_old_round_but_refuses_new_follower);
@@ -185,6 +205,7 @@ main(void)
 	UT_RUN(cached_cover_is_not_new_caller_admission);
 	UT_RUN(original_rejections_and_unshared_paths_remain);
 	UT_RUN(open_object_accepts_once_and_keeps_failed_history);
+	UT_RUN(finite_current_owner_uses_original_requester_without_ordinary_bypass);
 	UT_RUN(test_resource_x_failed_caller_cannot_join_later_head);
 	UT_RUN(test_resource_x_caller_retirement_is_not_current_success);
 	UT_RUN(test_resource_x_node_fanin_ignores_caller_deadline_and_retry_slice);

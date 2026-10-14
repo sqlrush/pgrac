@@ -1017,8 +1017,9 @@ ko_extend_pending_locked(RelFileLocator locator)
 	return false;
 }
 
-/* The scope permits only the two SPACE reads needed by its original
- * extension. It cannot grant a target-page read, CR publication, or current. */
+/* The scope identifies only the two SPACE targets needed by its original
+ * extension. A read sample cannot publish a target page or grant current;
+ * the separate current admission consumer retains the original PCM proof. */
 static bool
 ko_extend_read_begin(RelFileLocator locator, ForkNumber fork, BlockNumber block,
 					 ClusterKoPeerAdmissionV3 *out)
@@ -1110,6 +1111,34 @@ cluster_ko_peer_read_current_v3(const ClusterKoPeerAdmissionV3 *admission, RelFi
 		   && admission->block == block && RelFileLocatorEquals(admission->locator, locator)
 		   && cluster_ctrc_cleaner_read_scope_current_v3(&admission->cleaner, locator, fork, block)
 		   && pg_atomic_read_u64(&ko_state->peer_admission_revision) == admission->revision;
+}
+
+/* The finite cleaner/extension owner already protects the exact target
+ * through its original cleanup. Reuse that owner qualification, not a role
+ * exemption. Acquiring current still requires every original PCM/GCS proof;
+ * these samples confer only permission to enter that protocol. */
+bool
+cluster_ko_peer_current_begin_v3(RelFileLocator locator, ForkNumber fork, BlockNumber block,
+								 ClusterKoCurrentAdmissionV3 *out)
+{
+	ClusterKoPeerAdmissionV3 sample;
+	if (out == NULL || fork < MAIN_FORKNUM || fork > MAX_FORKNUM || block == InvalidBlockNumber
+		|| !cluster_ko_peer_read_begin_v3(locator, fork, block, &sample))
+		return false;
+	sample.fork = fork;
+	sample.block = block;
+	out->target = sample;
+	return true;
+}
+
+bool
+cluster_ko_peer_current_valid_v3(const ClusterKoCurrentAdmissionV3 *admission,
+								 RelFileLocator locator, ForkNumber fork, BlockNumber block)
+{
+	return admission != NULL && fork >= MAIN_FORKNUM && fork <= MAX_FORKNUM
+		   && block != InvalidBlockNumber && admission->target.fork == fork
+		   && admission->target.block == block
+		   && cluster_ko_peer_read_current_v3(&admission->target, locator, fork, block);
 }
 
 bool

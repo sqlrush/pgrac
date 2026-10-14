@@ -160,6 +160,7 @@ static int fake_lwlock_depth = 0;
  * remain the real product object. Tests may race the original entry lock. */
 int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 static bool object_admission_allowed = true;
+static bool object_current_continuation;
 static uint64 object_admission_revision = 1;
 static int object_admission_samples;
 static int object_smgr_route = 1;
@@ -189,6 +190,34 @@ cluster_ko_peer_admission_current_v3(const ClusterKoPeerAdmissionV3 *sample, Rel
 	return sample != NULL && sample->revision != 0 && sample->revision == object_admission_revision
 		   && RelFileLocatorEquals(sample->locator, locator);
 }
+bool
+cluster_ko_peer_current_begin_v3(RelFileLocator locator, ForkNumber fork, BlockNumber block,
+								 ClusterKoCurrentAdmissionV3 *out)
+{
+	bool allowed;
+	if (object_current_continuation) {
+		Assert(fake_lwlock_depth == 0);
+		object_admission_samples++;
+		memset(out, 0, sizeof(*out));
+		out->target.locator = locator;
+		out->target.revision = object_admission_revision;
+		out->target.cleaner.serial = 1;
+		allowed = true;
+	} else
+		allowed = cluster_ko_peer_admission_begin_v3(locator, &out->target);
+	out->target.fork = fork;
+	out->target.block = block;
+	return allowed;
+}
+bool
+cluster_ko_peer_current_valid_v3(const ClusterKoCurrentAdmissionV3 *sample, RelFileLocator locator,
+								 ForkNumber fork, BlockNumber block)
+{
+	return sample != NULL && sample->target.fork == fork && sample->target.block == block
+		   && (sample->target.cleaner.serial == 0 || object_current_continuation)
+		   && cluster_ko_peer_admission_current_v3(&sample->target, locator);
+}
+
 static ClusterWalSourceRef local_pi_writer;
 static union {
 	uint64 align;
@@ -578,6 +607,7 @@ reset_fake_pcm_runtime(int max_entries)
 {
 	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 	object_admission_allowed = true;
+	object_current_continuation = false;
 	object_admission_revision = 1;
 	object_admission_samples = 0;
 	object_smgr_route = 1;

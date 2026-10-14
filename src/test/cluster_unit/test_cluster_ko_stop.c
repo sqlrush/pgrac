@@ -5906,6 +5906,86 @@ UT_TEST(test_extension_attempt_blocks_ready_and_only_reads_its_original_space)
 	UT_ASSERT(!cluster_ko_extend_begin_v3(locator, MAIN_FORKNUM, &serial, NULL));
 }
 
+UT_TEST(test_exact_cleaner_current_admission_preserves_finite_owner)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(994);
+	ClusterKoPeerFenceHandleV3 handle;
+	ClusterKoPeerFenceStateV3 state;
+	ClusterKoCurrentAdmissionV3 current = { 0 }, rejected = { 0 };
+	RelFileLocator other = request.base.key.locator;
+	cleaner_scope_fixture(&request);
+	UT_ASSERT(cluster_ko_cleaner_enter_v3(cleaner_locator, &cleaner_scope));
+	MyAuxProcType = SinvalBcastProcess;
+	MyBackendType = B_SINVAL_BCAST;
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+	MyAuxProcType = UndoCleanerProcess;
+	MyBackendType = B_UNDO_CLEANER;
+	UT_ASSERT(cluster_ko_peer_current_begin_v3(cleaner_locator, MAIN_FORKNUM, 44, &current));
+	SpinLockAcquire(&storage.shared_lock);
+	UT_ASSERT(cluster_ko_peer_current_valid_v3(&current, cleaner_locator, MAIN_FORKNUM, 44));
+	SpinLockRelease(&storage.shared_lock);
+	UT_ASSERT(!cluster_ko_peer_admission_current_v3(&current.target, cleaner_locator));
+	UT_ASSERT(!cluster_ko_peer_current_valid_v3(&current, cleaner_locator, MAIN_FORKNUM, 45));
+	UT_ASSERT(!cluster_ko_peer_current_begin_v3(cleaner_locator, MAIN_FORKNUM, 45, &rejected));
+	UT_ASSERT(!cluster_ko_peer_current_begin_v3(cleaner_locator, FSM_FORKNUM, 44, &rejected));
+	UT_ASSERT(cluster_ko_peer_current_begin_v3(cleaner_locator, SPACE_FORKNUM, 0, &rejected));
+	other.relNumber++;
+	UT_ASSERT(!cluster_ko_peer_current_valid_v3(&current, other, MAIN_FORKNUM, 44));
+	MyProcPid++;
+	UT_ASSERT(!cluster_ko_peer_current_valid_v3(&current, cleaner_locator, MAIN_FORKNUM, 44));
+	MyProcPid--;
+	MyAuxProcType = SinvalBcastProcess;
+	MyBackendType = B_SINVAL_BCAST;
+	UT_ASSERT(!cluster_ko_peer_current_valid_v3(&current, cleaner_locator, MAIN_FORKNUM, 44));
+	UT_ASSERT(!cluster_ko_peer_fence_ready_v3(&request, &handle));
+	MyAuxProcType = UndoCleanerProcess;
+	MyBackendType = B_UNDO_CLEANER;
+	cluster_ko_cleaner_leave_v3(cleaner_locator, &cleaner_scope);
+	cleaner_scope_live = false;
+	UT_ASSERT(!cluster_ko_peer_current_valid_v3(&current, cleaner_locator, MAIN_FORKNUM, 44));
+}
+
+UT_TEST(test_exact_extension_current_admission_expires_with_original_attempt)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(995);
+	ClusterKoPeerFenceHandleV3 handle;
+	ClusterKoPeerFenceStateV3 state;
+	ClusterKoCurrentAdmissionV3 current = { 0 }, rejected = { 0 };
+	RelFileLocator locator = request.base.key.locator;
+	uint64 serial;
+	UT_ASSERT(cluster_ko_extend_begin_v3(locator, MAIN_FORKNUM, &serial, NULL));
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+	UT_ASSERT(cluster_ko_peer_current_begin_v3(locator, SPACE_FORKNUM, 1, &current));
+	SpinLockAcquire(&storage.shared_lock);
+	UT_ASSERT(cluster_ko_peer_current_valid_v3(&current, locator, SPACE_FORKNUM, 1));
+	SpinLockRelease(&storage.shared_lock);
+	UT_ASSERT(!cluster_ko_peer_current_valid_v3(&current, locator, SPACE_FORKNUM, 0));
+	UT_ASSERT(!cluster_ko_peer_current_begin_v3(locator, MAIN_FORKNUM, 44, &rejected));
+	UT_ASSERT(!cluster_ko_peer_current_begin_v3(locator, SPACE_FORKNUM, 2, &rejected));
+	UT_ASSERT(cluster_ko_peer_current_begin_v3(locator, SPACE_FORKNUM, 0, &rejected));
+	UT_ASSERT(!cluster_ko_peer_admission_current_v3(&current.target, locator));
+	UT_ASSERT(!cluster_ko_peer_fence_ready_v3(&request, &handle));
+	cluster_ko_extend_abort_v3(serial);
+	UT_ASSERT(!cluster_ko_peer_current_valid_v3(&current, locator, SPACE_FORKNUM, 1));
+	UT_ASSERT(cluster_ko_extend_end_v3(serial));
+}
+
+UT_TEST(test_current_sample_is_exact_target_not_generic_read_permission)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(996);
+	ClusterKoCurrentAdmissionV3 current = { 0 };
+	RelFileLocator locator = request.base.key.locator;
+	UT_ASSERT(cluster_ko_peer_current_begin_v3(locator, MAIN_FORKNUM, 44, &current));
+	UT_ASSERT(cluster_ko_peer_current_valid_v3(&current, locator, MAIN_FORKNUM, 44));
+	UT_ASSERT(!cluster_ko_peer_current_valid_v3(&current, locator, MAIN_FORKNUM, 45));
+	UT_ASSERT(!cluster_ko_peer_current_valid_v3(&current, locator, FSM_FORKNUM, 44));
+	UT_ASSERT(!cluster_ko_peer_current_begin_v3(locator, InvalidForkNumber, 44, &current));
+	UT_ASSERT(
+		!cluster_ko_peer_current_begin_v3(locator, MAIN_FORKNUM, InvalidBlockNumber, &current));
+	pg_atomic_fetch_add_u64(&storage.peer_admission_revision, 1);
+	UT_ASSERT(!cluster_ko_peer_current_valid_v3(&current, locator, MAIN_FORKNUM, 44));
+}
+
 UT_TEST(test_extension_error_cannot_retire_an_unmaterialized_reservation)
 {
 	for (int armed = 0; armed < 2; armed++) {
@@ -6620,7 +6700,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(150);
+	UT_PLAN(153);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
 	UT_RUN(test_peer_space_entry_checks_precede_io);
@@ -6746,6 +6826,9 @@ main(void)
 	UT_RUN(test_cleaner_attempt_admission_rejects_source_owner_and_terminal_drift);
 	UT_RUN(test_cleaner_entry_exit_invalidates_drain_scan_generation_without_wrapping);
 	UT_RUN(test_extension_attempt_blocks_ready_and_only_reads_its_original_space);
+	UT_RUN(test_exact_cleaner_current_admission_preserves_finite_owner);
+	UT_RUN(test_exact_extension_current_admission_expires_with_original_attempt);
+	UT_RUN(test_current_sample_is_exact_target_not_generic_read_permission);
 	UT_RUN(test_extension_error_cannot_retire_an_unmaterialized_reservation);
 	UT_RUN(test_extension_scope_refuses_source_owner_and_registry_drift);
 	UT_RUN(test_extension_capacity_and_serial_never_recycle_running_work);

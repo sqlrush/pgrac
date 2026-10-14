@@ -13039,7 +13039,7 @@ cluster_pcm_lock_resource_x_caller_observe_exact(const ResourceXAssertion *asser
 	PcmEntryAcquireResult acquire_result;
 	ClusterPcmResourceXBootstrapRound *round;
 	ResourceXApplyResult result;
-	ClusterKoPeerAdmissionV3 object_admission;
+	ClusterKoCurrentAdmissionV3 object_admission;
 	RelFileLocator locator;
 	bool check_object;
 	bool sampled = false;
@@ -13062,7 +13062,8 @@ cluster_pcm_lock_resource_x_caller_observe_exact(const ResourceXAssertion *asser
 				   && cluster_interconnect_tier == CLUSTER_IC_TIER_1
 				   && cluster_smgr_which_for(locator, InvalidBackendId) == 1;
 	if (check_object)
-		sampled = cluster_ko_peer_admission_begin_v3(locator, &object_admission);
+		sampled = cluster_ko_peer_current_begin_v3(locator, BufTagGetForkNum(&assertion->resource),
+												   assertion->resource.blockNum, &object_admission);
 	if (check_object && !sampled)
 		return RESOURCE_X_APPLY_BAD_STATE;
 	if (!pcm_entry_ref_acquire(&assertion->resource, false, &entry_ref, &acquire_result))
@@ -13076,7 +13077,10 @@ cluster_pcm_lock_resource_x_caller_observe_exact(const ResourceXAssertion *asser
 			|| round->master_session_incarnation != master_session_incarnation
 			|| round->r4_record_generation != r4_record_generation))
 		result = RESOURCE_X_APPLY_STALE;
-	else if (check_object && !cluster_ko_peer_admission_current_v3(&object_admission, locator))
+	else if (check_object
+			 && !cluster_ko_peer_current_valid_v3(&object_admission, locator,
+												  BufTagGetForkNum(&assertion->resource),
+												  assertion->resource.blockNum))
 		result = RESOURCE_X_APPLY_BAD_STATE;
 	else
 		result = pcm_resource_x_caller_observe_locked(entry_ref.entry, caller);
@@ -13764,7 +13768,7 @@ pcm_resource_x_bootstrap_round_step_internal(
 	bool broadcast = false;
 	bool diagnostic_identity_match = false;
 	ResourceXApplyResult caller_history;
-	ClusterKoPeerAdmissionV3 object_admission;
+	ClusterKoCurrentAdmissionV3 object_admission;
 	RelFileLocator locator;
 	bool check_object;
 	bool sampled = false;
@@ -13808,7 +13812,8 @@ pcm_resource_x_bootstrap_round_step_internal(
 	check_object = cluster_shared_config && cluster_interconnect_tier == CLUSTER_IC_TIER_1
 				   && cluster_smgr_which_for(locator, InvalidBackendId) == 1;
 	if (check_object)
-		sampled = cluster_ko_peer_admission_begin_v3(locator, &object_admission);
+		sampled = cluster_ko_peer_current_begin_v3(locator, BufTagGetForkNum(&assertion->resource),
+												   assertion->resource.blockNum, &object_admission);
 
 	if (!pcm_entry_ref_acquire(&assertion->resource, allow_create, &entry_ref, &acquire_result)) {
 		if (allow_create && acquire_result == PCM_ENTRY_ACQUIRE_NO_CAPACITY)
@@ -13865,7 +13870,10 @@ pcm_resource_x_bootstrap_round_step_internal(
 			|| round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
 			|| round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
 			|| round->phase == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED)
-		&& (!sampled || !cluster_ko_peer_admission_current_v3(&object_admission, locator))) {
+		&& (!sampled
+			|| !cluster_ko_peer_current_valid_v3(&object_admission, locator,
+												 BufTagGetForkNum(&assertion->resource),
+												 assertion->resource.blockNum))) {
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
 		return RESOURCE_X_BOOTSTRAP_ROUND_BACKPRESSURE;

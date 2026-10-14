@@ -172,6 +172,18 @@ extern bool cluster_ko_peer_read_current_v3(const ClusterKoPeerAdmissionV3 *admi
 											RelFileLocator locator, ForkNumber fork,
 											BlockNumber block);
 
+/* Object admission for an exact current acquisition. This is separate from
+ * a read sample and never substitutes for the original PCM/grant checks.
+ * Only an already registered finite owner can continue behind a fence. */
+typedef struct ClusterKoCurrentAdmissionV3 {
+	ClusterKoPeerAdmissionV3 target;
+} ClusterKoCurrentAdmissionV3;
+extern bool cluster_ko_peer_current_begin_v3(RelFileLocator locator, ForkNumber fork,
+											 BlockNumber block, ClusterKoCurrentAdmissionV3 *out);
+extern bool cluster_ko_peer_current_valid_v3(const ClusterKoCurrentAdmissionV3 *admission,
+											 RelFileLocator locator, ForkNumber fork,
+											 BlockNumber block);
+
 /* One finite attempt per original cleaner worker, never a new work queue.
  * These calls run outside buffer/PCM/CTRC locks. */
 extern bool cluster_ko_cleaner_enter_v3(RelFileLocator locator,
