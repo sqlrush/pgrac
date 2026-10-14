@@ -483,6 +483,7 @@ TESTS += test_cluster_recovery_root_set
 TESTS += test_cluster_recovery_undo_store
 TESTS += test_cluster_recovery_relation_scan
 TESTS += test_cluster_recovery_native_scan
+TESTS += test_cluster_recovery_native_roots
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_namespace,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_heap_scan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_undo_scan,$(SIMPLE_TESTS))
@@ -492,6 +493,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_recovery_root_set,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_undo_store,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_relation_scan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_native_scan,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_recovery_native_roots,$(SIMPLE_TESTS))
 CLUSTER_BLOCK_APPLY_O = $(top_builddir)/src/backend/cluster/cluster_block_apply.o \
 		test_cluster_block_apply_btree_product.o
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
@@ -8990,7 +8992,7 @@ test_cluster_recovery_heap_scan: test_cluster_recovery_heap_scan.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_heap_scan.h cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-test_cluster_recovery_root_set: test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c unit_test.h \
+test_cluster_recovery_root_set: test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c test_cluster_recovery_crypto_boundary.h unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
@@ -9004,7 +9006,8 @@ test_cluster_recovery_namespace: test_cluster_recovery_namespace.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-test_cluster_recovery_undo_store: test_cluster_recovery_undo_store.c test_cluster_recovery_namespace.c unit_test.h \
+test_cluster_recovery_undo_store: test_cluster_recovery_undo_store.c test_cluster_recovery_namespace.c \
+		test_cluster_recovery_crypto_boundary.h unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_undo_store.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_undo_store.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
@@ -9022,7 +9025,7 @@ test_cluster_recovery_undo_store: test_cluster_recovery_undo_store.c test_cluste
 		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 test_cluster_recovery_relation_scan: test_cluster_recovery_relation_scan.c test_cluster_recovery_root_set.c \
-		test_cluster_recovery_namespace.c unit_test.h \
+		test_cluster_recovery_namespace.c test_cluster_recovery_crypto_boundary.h unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_relation_scan.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_relation_scan.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
@@ -9041,6 +9044,22 @@ test_cluster_recovery_native_scan: test_cluster_recovery_native_scan.c unit_test
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+test_cluster_recovery_native_roots: test_cluster_recovery_native_roots.c \
+		test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c \
+		test_cluster_recovery_crypto_boundary.h unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_native_scan.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_native_scan.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h \
+		$(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) $(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 test_cluster_initdb_tree: test_cluster_initdb_tree.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_tree.c \

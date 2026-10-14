@@ -1,6 +1,7 @@
 /* Real filesystem root union, two-pass observation and full SHA-256.
  * Author: SqlRush <sqlrush@gmail.com>
  * Copyright (c) 2026, pgrac contributors. */
+int namespace_fixture_main(void);
 #define main namespace_fixture_main
 #include "test_cluster_recovery_namespace.c"
 #undef main
@@ -9,38 +10,7 @@
 #include "../../backend/cluster/cluster_recovery_root_set.c"
 #undef pread
 
-/* The standalone root-set fixture links the production OpenSSL cryptohash
- * object, which normally receives these ResourceOwner/MemoryContext hooks
- * from the backend.  Keep this fixture self-contained so its physical-root
- * assertions execute instead of stopping at link time. */
-ResourceOwner CurrentResourceOwner = NULL;
-MemoryContext TopMemoryContext = NULL;
-
-void *
-MemoryContextAlloc(MemoryContext context pg_attribute_unused(), Size size)
-{
-	return malloc(size);
-}
-
-void
-pfree(void *pointer)
-{
-	free(pointer);
-}
-
-void
-ResourceOwnerEnlargeCryptoHash(ResourceOwner owner pg_attribute_unused())
-{}
-
-void
-ResourceOwnerRememberCryptoHash(ResourceOwner owner pg_attribute_unused(),
-								Datum handle pg_attribute_unused())
-{}
-
-void
-ResourceOwnerForgetCryptoHash(ResourceOwner owner pg_attribute_unused(),
-							  Datum handle pg_attribute_unused())
-{}
+#include "test_cluster_recovery_crypto_boundary.h"
 
 static const uint8 root_uuid[16] = { 9, 3, 7 };
 

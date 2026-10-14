@@ -1,9 +1,11 @@
 /* Actual namespace/segment files through the original TT/UBA graph readers.
  * Author: SqlRush <sqlrush@gmail.com>
  * Copyright (c) 2026, pgrac contributors. */
+int namespace_fixture_main(void);
 #define main namespace_fixture_main
 #include "test_cluster_recovery_namespace.c"
 #undef main
+#include "test_cluster_recovery_crypto_boundary.h"
 #include "cluster/cluster_recovery_undo_store.h"
 #include "../../common/cluster_undo_segment_init.c"
 #include "../../backend/cluster/cluster_uba.c"

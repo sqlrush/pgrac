@@ -10,7 +10,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include "catalog/pg_tablespace_d.h"
+#include "catalog/storage_xlog.h"
 #include "cluster/cluster_recovery_root_set.h"
+#include "cluster/cluster_recovery_native_scan.h"
 #include "common/cryptohash.h"
 
 #ifdef USE_PGRAC_CLUSTER
@@ -195,8 +197,9 @@ cluster_recovery_root_set_begin(int root_fd, uint64 system_identifier, uint64 da
 	return CLUSTER_RECOVERY_ROOTS_MORE;
 }
 
-ClusterRecoveryRootsResult
-cluster_recovery_root_set_add_target(ClusterRecoveryRootSet *roots, const RfPageIdentityV1 *page)
+static ClusterRecoveryRootsResult
+roots_add_relation(ClusterRecoveryRootSet *roots, const RelFileLocator *locator, ForkNumber forknum,
+				   uint64 required_blocks)
 {
 	char path[MAXPGPATH];
 	const char *suffix;
@@ -207,15 +210,12 @@ cluster_recovery_root_set_add_target(ClusterRecoveryRootSet *roots, const RfPage
 		return CLUSTER_RECOVERY_ROOTS_INVALID;
 	if (roots->status > CLUSTER_RECOVERY_ROOTS_OBSERVED)
 		return roots->status;
-	if (roots->started || page == NULL || page->system_identifier != roots->system_identifier
-		|| memcmp(page->storage_uuid, roots->storage_uuid, 16) != 0 || page->reserved_zero != 0
-		|| page->locator.relNumber == 0 || page->blockno == InvalidBlockNumber
-		|| (page->locator.spcOid == GLOBALTABLESPACE_OID
-				? page->locator.dbOid != InvalidOid
-				: page->locator.spcOid != DEFAULTTABLESPACE_OID
-					  || page->locator.dbOid == InvalidOid))
+	if (roots->started || locator == NULL || locator->relNumber == 0
+		|| (locator->spcOid == GLOBALTABLESPACE_OID
+				? locator->dbOid != InvalidOid
+				: locator->spcOid != DEFAULTTABLESPACE_OID || locator->dbOid == InvalidOid))
 		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
-	switch (page->forknum) {
+	switch (forknum) {
 	case MAIN_FORKNUM:
 		suffix = "";
 		break;
@@ -231,20 +231,80 @@ cluster_recovery_root_set_add_target(ClusterRecoveryRootSet *roots, const RfPage
 	default:
 		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
 	}
-	if (page->locator.spcOid == GLOBALTABLESPACE_OID)
-		snprintf(path, sizeof(path), "global/%u%s", page->locator.relNumber, suffix);
+	if (locator->spcOid == GLOBALTABLESPACE_OID)
+		snprintf(path, sizeof(path), "global/%u%s", locator->relNumber, suffix);
 	else
-		snprintf(path, sizeof(path), "base/%u/%u%s", page->locator.dbOid, page->locator.relNumber,
-				 suffix);
+		snprintf(path, sizeof(path), "base/%u/%u%s", locator->dbOid, locator->relNumber, suffix);
 	if (!roots_lookup(roots, path, true, &index))
 		return roots->status;
 	entry = &roots->entries[index];
 	entry->file.kind = CLUSTER_RECOVERY_FILE_RELATION;
-	entry->file.locator = page->locator;
-	entry->file.forknum = page->forknum;
+	entry->file.locator = *locator;
+	entry->file.forknum = forknum;
 	entry->origins |= CLUSTER_RECOVERY_ROOT_FROM_WAL;
-	entry->required_blocks = Max(entry->required_blocks, (uint64)page->blockno + 1);
+	entry->required_blocks = Max(entry->required_blocks, required_blocks);
 	return CLUSTER_RECOVERY_ROOTS_MORE;
+}
+
+ClusterRecoveryRootsResult
+cluster_recovery_root_set_add_target(ClusterRecoveryRootSet *roots, const RfPageIdentityV1 *page)
+{
+	if (roots == NULL)
+		return CLUSTER_RECOVERY_ROOTS_INVALID;
+	if (roots->status > CLUSTER_RECOVERY_ROOTS_OBSERVED)
+		return roots->status;
+	if (page == NULL || page->system_identifier != roots->system_identifier
+		|| memcmp(page->storage_uuid, roots->storage_uuid, 16) != 0 || page->reserved_zero != 0
+		|| page->blockno == InvalidBlockNumber)
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	return roots_add_relation(roots, &page->locator, page->forknum, (uint64)page->blockno + 1);
+}
+
+ClusterRecoveryRootsResult
+cluster_recovery_root_set_add_native(ClusterRecoveryRootSet *roots,
+									 const ClusterRecoveryNativeEffect *effect)
+{
+	const ClusterRecoveryNativeRecord *record;
+	uint8 opcode;
+
+	if (roots == NULL)
+		return CLUSTER_RECOVERY_ROOTS_INVALID;
+	if (roots->status > CLUSTER_RECOVERY_ROOTS_OBSERVED)
+		return roots->status;
+	if (roots->started || effect == NULL || effect->record == NULL || effect->bytes == NULL)
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	record = effect->record;
+	if (record->source.claim.identity.system_identifier != roots->system_identifier
+		|| record->source.claim.database_incarnation != roots->database_incarnation
+		|| memcmp(record->source.claim.identity.storage_uuid, roots->storage_uuid, 16) != 0)
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	opcode = record->header.xl_info & ~XLR_INFO_MASK;
+	if (effect->kind == CLUSTER_RECOVERY_NATIVE_CREATE && record->header.xl_rmid == RM_SMGR_ID
+		&& opcode == XLOG_SMGR_CREATE && effect->length == sizeof(xl_smgr_create)) {
+		xl_smgr_create create;
+
+		memcpy(&create, effect->bytes, sizeof(create));
+		return roots_add_relation(roots, &create.rlocator, create.forkNum, 0);
+	}
+	if (effect->kind == CLUSTER_RECOVERY_NATIVE_RELATION_DROP
+		&& record->header.xl_rmid == RM_XACT_ID
+		&& ((opcode & XLOG_XACT_OPMASK) == XLOG_XACT_COMMIT
+			|| (opcode & XLOG_XACT_OPMASK) == XLOG_XACT_ABORT)
+		&& effect->length == sizeof(RelFileLocator)) {
+		const ForkNumber forks[]
+			= { MAIN_FORKNUM, FSM_FORKNUM, VISIBILITYMAP_FORKNUM, SPACE_FORKNUM };
+		RelFileLocator locator;
+
+		memcpy(&locator, effect->bytes, sizeof(locator));
+		for (unsigned i = 0; i < lengthof(forks); i++) {
+			ClusterRecoveryRootsResult result = roots_add_relation(roots, &locator, forks[i], 0);
+
+			if (result != CLUSTER_RECOVERY_ROOTS_MORE)
+				return result;
+		}
+		return CLUSTER_RECOVERY_ROOTS_MORE;
+	}
+	return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
 }
 
 static ClusterRecoveryRootsResult

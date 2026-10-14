@@ -69,6 +69,17 @@ cluster_recovery_root_set_begin(int root_fd, uint64 system_identifier, uint64 da
 extern ClusterRecoveryRootsResult
 cluster_recovery_root_set_add_target(ClusterRecoveryRootSet *roots, const RfPageIdentityV1 *page);
 
+struct ClusterRecoveryNativeEffect;
+/* Add one native CREATE fork or a terminal's relation deletion (all shared
+ * forks) to the same physical union. These target whole files, so they do
+ * not invent a block-zero reference or a size promise. Only CREATE and
+ * RELATION_DROP effects are accepted; all other effects need their own
+ * consumers. Source/record and lifecycle proofs remain in the cold graph.
+ * A missing file is retained, never treated as an already-completed drop. */
+extern ClusterRecoveryRootsResult
+cluster_recovery_root_set_add_native(ClusterRecoveryRootSet *roots,
+									 const struct ClusterRecoveryNativeEffect *effect);
+
 /* At most one BLCKSZ read or 128 metadata/sort operations per call; each
  * path lookup separately permits at most 128 bucket probes, then CAPACITY.
  * Hash exhaustion never removes a candidate or completes an observation. Observe
