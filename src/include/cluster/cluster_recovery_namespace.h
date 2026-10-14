@@ -34,6 +34,10 @@ typedef enum ClusterRecoveryFileKind {
 	CLUSTER_RECOVERY_FILE_RELMAP_AUTHORITY,
 	CLUSTER_RECOVERY_FILE_RELMAP_AUTHORITY_BACKUP,
 	CLUSTER_RECOVERY_FILE_UNDO_SEGMENT,
+	/* A PostgreSQL two-phase state file is a durable recovery obligation.
+	 * Its xid is only a physical key; this kind does not prove PREPARED or
+	 * authorize COMMIT/ROLLBACK PREPARED. */
+	CLUSTER_RECOVERY_FILE_TWOPHASE,
 	/* A native SLRU segment is an explicit D1 physical obligation.  Its
 	 * bytes still need the native page census before any recovery consumer may
 	 * use them. */
@@ -60,6 +64,7 @@ typedef struct ClusterRecoveryNamespaceEntry {
 	uint64 size;
 	uint32 undo_segment;
 	uint8 undo_owner_instance;
+	uint32 twophase_xid;   /* canonical pg_twophase/<8 uppercase hex> key */
 	uint8 native_family;   /* ClusterRecoveryNativeFamily, for native SLRU files */
 	uint32 native_segment; /* canonical four-digit native segment number */
 	/* Local observation only, never serialized or used as storage authority. */

@@ -138,6 +138,41 @@ namespace_native_key(const char *path, uint8 *family, uint32 *segment)
 	return false;
 }
 
+/* PostgreSQL's durable two-phase state files are named by one canonical
+ * eight-digit uppercase xid.  A name match is only a physical obligation;
+ * the file contents and its matching PREPARE/terminal WAL still need the
+ * recovery owner's exact proof before any state is consumed. */
+static bool
+namespace_twophase_key(const char *path, uint32 *xid)
+{
+	const char *prefix = "pg_twophase/";
+	const char *name;
+	uint32 value = 0;
+	char canonical[9];
+
+	if (path == NULL || xid == NULL || strncmp(path, prefix, strlen(prefix)) != 0)
+		return false;
+	name = path + strlen(prefix);
+	if (strlen(name) != 8)
+		return false;
+	for (unsigned digit = 0; digit < 8; digit++) {
+		unsigned nibble;
+
+		if (name[digit] >= '0' && name[digit] <= '9')
+			nibble = (unsigned)(name[digit] - '0');
+		else if (name[digit] >= 'A' && name[digit] <= 'F')
+			nibble = (unsigned)(name[digit] - 'A') + 10;
+		else
+			return false;
+		value = (value << 4) | nibble;
+	}
+	snprintf(canonical, sizeof(canonical), "%08X", value);
+	if (memcmp(canonical, name, sizeof(canonical) - 1) != 0)
+		return false;
+	*xid = value;
+	return true;
+}
+
 ClusterRecoveryFileKind
 cluster_recovery_namespace_classify_ex(const char *path, RelFileLocator *locator,
 									   ForkNumber *forknum, uint8 *native_family,
@@ -152,6 +187,7 @@ cluster_recovery_namespace_classify_ex(const char *path, RelFileLocator *locator
 	uint8 undo_owner;
 	uint8 observed_native_family = CLUSTER_RECOVERY_NATIVE_FAMILY_NONE;
 	uint32 observed_native_segment = UINT32_MAX;
+	uint32 observed_twophase_xid = 0;
 
 	if (locator != NULL)
 		memset(locator, 0, sizeof(*locator));
@@ -172,6 +208,8 @@ cluster_recovery_namespace_classify_ex(const char *path, RelFileLocator *locator
 	}
 	if (namespace_undo_key(path, &undo_segment, &undo_owner))
 		return CLUSTER_RECOVERY_FILE_UNDO_SEGMENT;
+	if (namespace_twophase_key(path, &observed_twophase_xid))
+		return CLUSTER_RECOVERY_FILE_TWOPHASE;
 	if (strncmp(path, "global/", 7) == 0) {
 		result.spcOid = GLOBALTABLESPACE_OID;
 		name = path + 7;
@@ -543,6 +581,8 @@ cluster_recovery_namespace_next(ClusterRecoveryNamespace *scan, ClusterRecoveryN
 			if (entry.kind == CLUSTER_RECOVERY_FILE_UNDO_SEGMENT)
 				(void)namespace_undo_key(entry.path, &entry.undo_segment,
 										 &entry.undo_owner_instance);
+			else if (entry.kind == CLUSTER_RECOVERY_FILE_TWOPHASE)
+				(void)namespace_twophase_key(entry.path, &entry.twophase_xid);
 			entry.size = held.st_size;
 			*file_fd = fd;
 		}

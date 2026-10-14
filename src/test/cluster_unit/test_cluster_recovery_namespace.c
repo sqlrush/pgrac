@@ -187,6 +187,68 @@ UT_TEST(test_native_slru_segment_names_are_explicit_obligations)
 	}
 }
 
+UT_TEST(test_twophase_state_names_are_explicit_obligations)
+{
+	static const char *const valid[] = {
+		"pg_twophase/00000001",
+		"pg_twophase/7FFFFFFF",
+		"pg_twophase/FFFFFFFF",
+	};
+	static const char *const invalid[] = {
+		"pg_twophase/0000001",		  "pg_twophase/0000000a",  "pg_twophase/00000001.crc",
+		"pg_twophase/00000001/extra", "pg_twophase/000000000", "pg_twophase/FFFFFFFF.tmp",
+	};
+
+	for (unsigned i = 0; i < lengthof(valid); i++) {
+		RelFileLocator locator;
+		ForkNumber forknum;
+
+		UT_ASSERT_EQ(cluster_recovery_namespace_classify(valid[i], &locator, &forknum),
+					 CLUSTER_RECOVERY_FILE_TWOPHASE);
+		UT_ASSERT_EQ(locator.spcOid, InvalidOid);
+		UT_ASSERT_EQ(forknum, InvalidForkNumber);
+	}
+	for (unsigned i = 0; i < lengthof(invalid); i++) {
+		RelFileLocator locator;
+		ForkNumber forknum;
+
+		UT_ASSERT_EQ(cluster_recovery_namespace_classify(invalid[i], &locator, &forknum),
+					 CLUSTER_RECOVERY_FILE_UNCLASSIFIED);
+	}
+}
+
+UT_TEST(test_real_twophase_entries_carry_xid)
+{
+	int root = new_root();
+	ClusterRecoveryNamespace *scan = NULL;
+	ClusterRecoveryNamespaceEntry entry;
+	ClusterRecoveryNamespaceResult result;
+	int borrowed = -1;
+	bool found = false;
+
+	UT_ASSERT(root >= 0);
+	UT_ASSERT_EQ(mkdirat(root, "pg_twophase", 0700), 0);
+	write_file(root, "pg_twophase/00ABCDEF");
+	UT_ASSERT_EQ(cluster_recovery_namespace_begin(root, 16, &scan),
+				 CLUSTER_RECOVERY_NAMESPACE_MORE);
+	while ((result = cluster_recovery_namespace_next(scan, &entry, &borrowed))
+		   <= CLUSTER_RECOVERY_NAMESPACE_MORE) {
+		if (result == CLUSTER_RECOVERY_NAMESPACE_MORE
+			|| entry.kind == CLUSTER_RECOVERY_FILE_DIRECTORY)
+			continue;
+		if (strcmp(entry.path, "pg_twophase/00ABCDEF") == 0) {
+			UT_ASSERT_EQ(entry.kind, CLUSTER_RECOVERY_FILE_TWOPHASE);
+			UT_ASSERT_EQ(entry.twophase_xid, UINT32_C(0x00ABCDEF));
+			found = true;
+		}
+	}
+	UT_ASSERT_EQ(result, CLUSTER_RECOVERY_NAMESPACE_END);
+	UT_ASSERT(found);
+	cluster_recovery_namespace_destroy(scan);
+	remove_root(root);
+	rmdir(test_path);
+}
+
 UT_TEST(test_real_native_slru_entries_carry_family_and_segment)
 {
 	int root = new_root();
@@ -647,10 +709,12 @@ UT_TEST(test_current_read_rejects_out_of_range_without_sealing)
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(20);
 	UT_RUN(test_shared_relation_names);
 	UT_RUN(test_native_slru_segment_names_are_explicit_obligations);
 	UT_RUN(test_real_native_slru_entries_carry_family_and_segment);
+	UT_RUN(test_twophase_state_names_are_explicit_obligations);
+	UT_RUN(test_real_twophase_entries_carry_xid);
 	UT_RUN(test_relmap_and_both_authority_copies);
 	UT_RUN(test_undo_names_keep_origin_and_reject_aliases);
 	UT_RUN(test_real_undo_files_export_physical_keys_without_a_live_bitmap);
