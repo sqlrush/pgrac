@@ -719,12 +719,13 @@ collect_native_segments(int dir, ClusterNativeSegmentList *out)
 
 static ClusterControlRootResult
 read_native_family_files(int dir, uint32 family, pg_cryptohash_ctx *hash, uint32 *reads,
-						 uint32 *file_count, bool sync)
+						 uint32 *file_count, uint32 *page_count, bool sync)
 {
 	ClusterNativeSegmentList before, after;
 	ClusterControlRootResult result;
 
 	*file_count = 0;
+	*page_count = 0;
 	result = collect_native_segments(dir, &before);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
@@ -756,6 +757,7 @@ read_native_family_files(int dir, uint32 family, pg_cryptohash_ctx *hash, uint32
 			}
 			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 				return result;
+			(*page_count)++;
 		}
 		(*file_count)++;
 	}
@@ -965,9 +967,9 @@ native_side_inspect(const char *shared_root, uint32 node_id, const ControlFileDa
 		for (unsigned i = 0; result == 0 && i < lengthof(families); i++) {
 			if (segment_dirs[i] < 0)
 				continue;
-			result
-				= read_native_family_files(dirs[segment_dirs[i]], i + 1, hash, &observed.page_reads,
-										   &observed.family_file_counts[i], sync);
+			result = read_native_family_files(dirs[segment_dirs[i]], i + 1, hash,
+											  &observed.page_reads, &observed.family_file_counts[i],
+											  &observed.family_page_counts[i], sync);
 		}
 		if (result == 0)
 			observed.native_file_count = 0;

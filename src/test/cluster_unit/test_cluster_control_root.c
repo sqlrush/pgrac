@@ -14683,6 +14683,12 @@ UT_TEST(test_native_side_observation_reads_origin_and_preserves_bytes)
 	UT_ASSERT_EQ(first.family_file_counts[3], 0);
 	UT_ASSERT_EQ(first.family_file_counts[4], 1);
 	UT_ASSERT_EQ(first.family_file_counts[5], 0);
+	UT_ASSERT_EQ(first.family_page_counts[0], 1);
+	UT_ASSERT_EQ(first.family_page_counts[1], 1);
+	UT_ASSERT_EQ(first.family_page_counts[2], 0);
+	UT_ASSERT_EQ(first.family_page_counts[3], 0);
+	UT_ASSERT_EQ(first.family_page_counts[4], 1);
+	UT_ASSERT_EQ(first.family_page_counts[5], 0);
 	UT_ASSERT(!v2_zero(first.sha256, 32));
 	UT_ASSERT_EQ(cluster_control_native_side_observe(f.shared, 3, &control, &second), 0);
 	UT_ASSERT(memcmp(&first, &second, sizeof(first)) == 0);
