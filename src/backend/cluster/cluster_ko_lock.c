@@ -375,6 +375,7 @@ cluster_ko_shmem_init(void)
 		ko_state->holder_probe_nonce = 0;
 		ko_state->holder_probe_cursor = 0;
 		memset(ko_state->peer_fences, 0, sizeof(ko_state->peer_fences));
+		memset(ko_state->cleaner_work, 0, sizeof(ko_state->cleaner_work));
 	}
 }
 

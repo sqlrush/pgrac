@@ -6089,20 +6089,29 @@ UT_TEST(test_peer_fence_shmem_creation_initializes_but_attachment_retains)
 {
 	reset_test();
 	memset(ko_state->peer_fences, 0xa5, sizeof(ko_state->peer_fences));
+	memset(ko_state->cleaner_work, 0xa5, sizeof(ko_state->cleaner_work));
 	ko_state->peer_fence_serial = UINT64_MAX;
 	IsUnderPostmaster = false;
 	cluster_ko_shmem_init();
 	IsUnderPostmaster = true;
 	UT_ASSERT_EQ(ko_state->peer_fence_serial, 0);
+	for (unsigned i = 0; i < CLUSTER_CTRC_CLEANER_WORKERS; i++) {
+		UT_ASSERT(!ko_state->cleaner_work[i].used);
+		UT_ASSERT_EQ(ko_state->cleaner_work[i].scope.serial, 0);
+	}
 	for (int i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
 		UT_ASSERT_EQ(ko_state->peer_fences[i].state, CLUSTER_KO_PEER_FENCE_EMPTY);
 		UT_ASSERT_EQ(ko_state->peer_fences[i].serial, 0);
 	}
 	ko_state->peer_fences[0].state = CLUSTER_KO_PEER_FENCE_COMMITTED;
 	ko_state->peer_fences[0].serial = ko_state->peer_fence_serial = 9;
+	ko_state->cleaner_work[0].used = true;
+	ko_state->cleaner_work[0].scope.serial = 12;
 	cluster_ko_shmem_init();
 	UT_ASSERT_EQ(ko_state->peer_fences[0].state, CLUSTER_KO_PEER_FENCE_COMMITTED);
 	UT_ASSERT_EQ(ko_state->peer_fence_serial, 9);
+	UT_ASSERT(ko_state->cleaner_work[0].used);
+	UT_ASSERT_EQ(ko_state->cleaner_work[0].scope.serial, 12);
 }
 
 UT_TEST(test_peer_holder_probe_exact_reply_is_observation_only)
