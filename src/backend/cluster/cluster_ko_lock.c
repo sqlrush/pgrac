@@ -89,6 +89,7 @@
 #include "datatype/timestamp.h"
 #include "utils/timestamp.h"
 #include "utils/memutils.h"
+#include "utils/inval.h"
 #include "utils/resowner.h"
 #include "utils/rel.h"
 #include "utils/dsa.h"
@@ -691,6 +692,8 @@ ko_shared_control_current(const ClusterKoSharedMessageV2 *message)
 static bool
 ko_shared_v3_control_at_generation(const ClusterKoSharedMessageV3 *message, uint64 local_generation)
 {
+	const uint32 required_capabilities
+		= PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3 | PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1;
 	ClusterKoSharedMessageV3 current;
 	ClusterWalSourceRef ref;
 	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], generation;
@@ -724,9 +727,10 @@ ko_shared_v3_control_at_generation(const ClusterKoSharedMessageV3 *message, uint
 	current.base.peer_boot = boots[message->base.peer_node];
 	other = cluster_node_id == message->base.origin_node ? message->base.peer_node
 																		 : message->base.origin_node;
-	if (!cluster_sf_peer_capability_word_sample(other, PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3,
-																&capabilities, &capability_generation)
-		|| capability_generation == 0 || (capabilities & PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3) == 0
+	if (!cluster_sf_peer_capability_word_sample(other, required_capabilities, &capabilities,
+												&capability_generation)
+		|| capability_generation == 0
+		|| (capabilities & required_capabilities) != required_capabilities
 		|| !cluster_membership_cut_generation_current(generation)
 		|| !cluster_ko_shared_encode_v3(&current, observed, sizeof(observed)))
 		return false;
@@ -3226,6 +3230,11 @@ ko_run_shared_barrier_impl_v3(RelFileLocator locator, uint16 operation,
 	deadline = GetCurrentTimestamp() + (int64)cluster_sinval_ack_timeout_ms * USECS_PER_MSEC;
 	PG_TRY();
 	{
+		/* Reserve transaction-owned publication before any peer REQUEST can
+		 * escape. Abort discards it through the original invalidation owner;
+		 * registration failure unwinds only this still-unsent reservation. */
+		if (mask != 0)
+			CacheInvalidateKoCommit(batch_id);
 		if (mask == 0) {
 			ClusterKoSharedContext scope = { 0 };
 			scope.v3 = true;

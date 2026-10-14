@@ -39,6 +39,11 @@ cluster_ges_holder_probe_send(int32 master, const ClusterGesHolderProbe *probe)
 
 static int32 v3_route_master_node;
 static uint64 v3_route_generation;
+static bool marker_capable = true, v3_local_ax, drive_v3_ack, marker_error;
+static ClusterGrdHolderId v3_local_holder;
+static int marker_registrations;
+static uint64 marker_batch;
+static ClusterKoSharedMessageV3 sent_v3_request;
 
 int32
 cluster_grd_lookup_master_gen(const ClusterResId *resid, uint64 *generation)
@@ -68,11 +73,13 @@ cluster_lock_current_ax_binding(const LOCKTAG *locktag, ClusterGrdHolderId *hold
 										uint64 *master_generation)
 {
 	(void)locktag;
-	(void)holder;
-	(void)request_id;
-	(void)master_node;
-	(void)master_generation;
-	return false;
+	if (!v3_local_ax)
+		return false;
+	*holder = v3_local_holder;
+	*request_id = holder->request_id;
+	*master_node = v3_route_master_node;
+	*master_generation = v3_route_generation;
+	return true;
 }
 
 static bool ko_offer_notice_fixture(const ClusterPiWritebackNoticeV1 *, uint32, uint64 *,
@@ -525,9 +532,12 @@ cluster_sf_peer_capability_word_sample(int32 peer_id, uint32 required, uint32 *w
 {
 	Assert(peer_id >= 0 && peer_id < CLUSTER_KO_SHARED_NODE_LIMIT && peer_id != cluster_node_id
 		   && (required == PGRAC_IC_HELLO_CAP_KO_SHARED_V2
-				|| required == PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3));
-	if (required == PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3) {
-		*word = required;
+			   || required == PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3
+			   || required
+					  == (PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3
+						  | PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1)));
+	if ((required & PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3) != 0) {
+		*word = marker_capable ? required : required & ~PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1;
 		*generation = v3_route_live ? 19 : 0;
 		return v3_route_live;
 	}
@@ -538,6 +548,21 @@ cluster_sf_peer_capability_word_sample(int32 peer_id, uint32 required, uint32 *w
 	if (peer_id == cap_change_cut_peer)
 		member_generation++;
 	return cap_ok && peer_id != cap_missing_peer;
+}
+/* The separate catalog_inval fixture executes actual transaction ownership.
+ * Here this boundary checks the original KO producer's exact registration
+ * ordering and error cleanup before any request escapes. */
+void
+CacheInvalidateKoCommit(uint64 batch)
+{
+	UT_ASSERT(SpinLockFree(&storage.shared_lock));
+	UT_ASSERT_EQ(barrier_requests, 0);
+	UT_ASSERT_EQ(ko_state->send_v3_count, 0);
+	UT_ASSERT(!barrier_active);
+	marker_registrations++;
+	marker_batch = batch;
+	if (marker_error)
+		pg_re_throw();
 }
 static void
 shared_send_tick(void)
@@ -552,6 +577,13 @@ cluster_ic_send_envelope(uint8 type, int32 dest, const void *bytes, uint32 lengt
 {
 	ClusterKoSharedMessageV2 m;
 	Assert(SpinLockFree(&storage.shared_lock));
+	if (drive_v3_ack && length == CLUSTER_KO_SHARED_V3_BYTES) {
+		Assert(dest == 1 && type == PGRAC_IC_MSG_KO_FLUSH);
+		UT_ASSERT(cluster_ko_shared_decode_v3(bytes, length, &sent_v3_request));
+		send_calls++;
+		barrier_requests++;
+		return CLUSTER_IC_SEND_DONE;
+	}
 	Assert(dest == 1 && length == CLUSTER_KO_SHARED_V2_BYTES);
 	if (!cluster_ko_shared_decode_v2(bytes, length, &m))
 		abort();
@@ -701,6 +733,20 @@ bool
 cluster_sinval_ack_wait_is_complete(uint64 batch)
 {
 	Assert(barrier_active && batch == active_batch);
+	if (drive_v3_ack) {
+		ClusterICEnvelope env = { 0 };
+		uint8 wire[CLUSTER_KO_SHARED_V3_BYTES];
+		ClusterKoSharedMessageV3 ack;
+		shared_send_tick();
+		ack = sent_v3_request;
+		ack.base.verb = CLUSTER_KO_SHARED_ACK;
+		ack.base.status = CLUSTER_KO_SHARED_DONE;
+		UT_ASSERT(cluster_ko_shared_encode_v3(&ack, wire, sizeof(wire)));
+		env.source_node_id = 1;
+		env.payload_length = sizeof(wire);
+		cluster_ko_flush_ack_handler(&env, wire);
+		barrier_complete = record_count == barrier_record_base + 1;
+	}
 	if (drive_shared_ack) {
 		ClusterICEnvelope env = { 0 };
 		uint8 bytes[CLUSTER_KO_SHARED_V2_BYTES];
@@ -964,6 +1010,10 @@ reset_test(void)
 	memset(cut_cap_samples, 0, sizeof(cut_cap_samples));
 	cut_cap_change_peer = -1;
 	v3_route_live = false;
+	marker_capable = true;
+	v3_local_ax = drive_v3_ack = marker_error = false;
+	marker_registrations = 0;
+	marker_batch = 0;
 	v3_route_master_node = -1;
 	v3_route_generation = 0;
 	generation_race = cancel_wait = drive_shared_ack = false;
@@ -5792,11 +5842,77 @@ UT_TEST(test_peer_holder_probe_refresh_retry_and_late_reply_keep_owner)
 	holder_probe_clock = 1;
 }
 
+static KoAxBinding
+origin_marker_setup(void)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(912);
+	KoAxBinding binding = { 0 };
+	MyBackendType = B_BACKEND;
+	MyAuxProcType = NotAnAuxProcess;
+	space_identity.key.locator.dbOid = 5;
+	space_identity.operation = 88;
+	v3_local_ax = drive_v3_ack = true;
+	binding.resid = request.ax_resid;
+	binding.holder = request.ax_holder;
+	binding.holder.node_id = cluster_node_id;
+	v3_local_holder = binding.holder;
+	binding.request_id = request.ax_request_id;
+	binding.master_node = request.ax_master_node;
+	binding.master_generation = request.ax_master_generation;
+	return binding;
+}
+UT_TEST(test_v3_origin_registers_exact_marker_before_first_request)
+{
+	KoAxBinding binding = origin_marker_setup();
+	UT_ASSERT(ko_run_shared_barrier_impl_v3(space_identity.key.locator,
+											CLUSTER_KO_SHARED_V3_OPERATION_DROP, &binding, NULL));
+	UT_ASSERT_EQ(marker_registrations, 1);
+	UT_ASSERT_EQ(marker_batch, sent_v3_request.base.batch_id);
+	UT_ASSERT_EQ(marker_batch, 912);
+	UT_ASSERT_EQ(barrier_requests, 1);
+	UT_ASSERT_EQ(record_count, 1);
+	UT_ASSERT(!barrier_active);
+}
+UT_TEST(test_v3_origin_refuses_missing_marker_capability_before_publication)
+{
+	KoAxBinding binding = origin_marker_setup();
+	marker_capable = false;
+	UT_ASSERT(!ko_run_shared_barrier_impl_v3(space_identity.key.locator,
+											 CLUSTER_KO_SHARED_V3_OPERATION_DROP, &binding, NULL));
+	UT_ASSERT_EQ(marker_registrations, 0);
+	UT_ASSERT_EQ(barrier_requests, 0);
+	UT_ASSERT_EQ(ko_state->send_v3_count, 0);
+	UT_ASSERT(!barrier_active);
+}
+UT_TEST(test_v3_origin_marker_error_releases_only_unsent_context)
+{
+	KoAxBinding binding = origin_marker_setup();
+	volatile bool caught = false;
+	marker_error = true;
+	PG_TRY();
+	{
+		(void)ko_run_shared_barrier_impl_v3(space_identity.key.locator,
+											CLUSTER_KO_SHARED_V3_OPERATION_DROP, &binding, NULL);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(marker_registrations, 1);
+	UT_ASSERT_EQ(barrier_requests, 0);
+	UT_ASSERT_EQ(ko_state->send_v3_count, 0);
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
+		UT_ASSERT(!ko_state->contexts[i].used);
+	UT_ASSERT(!barrier_active);
+}
+
 int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(126);
+	UT_PLAN(129);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
 	UT_RUN(test_peer_space_entry_checks_precede_io);
@@ -5923,6 +6039,9 @@ main(void)
 	UT_RUN(test_peer_fence_shmem_creation_initializes_but_attachment_retains);
 	UT_RUN(test_peer_holder_probe_exact_reply_is_observation_only);
 	UT_RUN(test_peer_holder_probe_refresh_retry_and_late_reply_keep_owner);
+	UT_RUN(test_v3_origin_registers_exact_marker_before_first_request);
+	UT_RUN(test_v3_origin_refuses_missing_marker_capability_before_publication);
+	UT_RUN(test_v3_origin_marker_error_releases_only_unsent_context);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
