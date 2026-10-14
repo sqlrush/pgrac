@@ -144,6 +144,28 @@ open_store(ClusterRecoveryRootSet *roots)
 	return store;
 }
 
+static void
+assert_store_begin_is_bounded(ClusterRecoveryRootSet *roots)
+{
+	ClusterRecoveryUndoStore *store = NULL;
+	unsigned calls = 0;
+	ClusterRecoveryUndoEntry entry;
+	ClusterRecoveryGraphResult result;
+
+	UT_ASSERT_EQ(cluster_recovery_undo_store_begin(roots, 1024 * 1024, &store),
+				 CLUSTER_RECOVERY_GRAPH_MORE);
+	while (store != NULL && calls++ < 1000
+		   && (result = cluster_recovery_undo_store_next(store, &entry))
+				  == CLUSTER_RECOVERY_GRAPH_MORE)
+		;
+	UT_ASSERT(store != NULL);
+	UT_ASSERT(calls >= 1);
+	/* The fixture has two undo files; indexing and file-array assembly are
+	 * deliberately returned as MORE before the first TT slot. */
+	UT_ASSERT_EQ(result, CLUSTER_RECOVERY_GRAPH_RECORD);
+	cluster_recovery_undo_store_destroy(store);
+}
+
 static ClusterRecoveryGraphResult
 inventory(ClusterRecoveryUndoStore *store, ClusterRecoveryReferenceGraph *graph, unsigned *slots)
 {
@@ -183,6 +205,9 @@ UT_TEST(test_real_untouched_segment_files_feed_all_slots_and_the_full_transactio
 
 	if (store == NULL)
 		goto done;
+	cluster_recovery_undo_store_destroy(store);
+	assert_store_begin_is_bounded(roots);
+	store = open_store(roots);
 	UT_ASSERT_EQ(cluster_recovery_reference_graph_begin(
 					 1024 * 1024, cluster_recovery_undo_store_read, store, &graph),
 				 CLUSTER_RECOVERY_GRAPH_MORE);

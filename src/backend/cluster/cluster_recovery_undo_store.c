@@ -11,6 +11,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #define UNDO_STORE_SEGMENTS (UNDO_OWNER_INSTANCE_MAX * CLUSTER_UNDO_SEGS_PER_INSTANCE)
+#define UNDO_STORE_TICK 128
 
 typedef struct RecoveryUndoFile {
 	uint32 root_index;
@@ -23,6 +24,9 @@ struct ClusterRecoveryUndoStore {
 	RecoveryUndoFile *files;
 	uint32 by_segment[UNDO_STORE_SEGMENTS + 1]; /* file index + 1 */
 	uint32 count, current, rechecked;
+	uint32 root_cursor, fill_cursor, files_filled;
+	bool indexed, files_ready;
+	size_t memory_budget;
 	uint16 slot;
 	ClusterRecoveryGraphResult status;
 	char page[BLCKSZ];
@@ -57,7 +61,6 @@ cluster_recovery_undo_store_begin(ClusterRecoveryRootSet *roots, size_t memory_b
 								  ClusterRecoveryUndoStore **out)
 {
 	ClusterRecoveryUndoStore *store;
-	uint32 count = 0, total = cluster_recovery_root_set_count(roots);
 	uint8 digest[32];
 	size_t fixed = sizeof(*store) + 16 * 1024; /* transient original header parser */
 
@@ -65,41 +68,13 @@ cluster_recovery_undo_store_begin(ClusterRecoveryRootSet *roots, size_t memory_b
 		*out = NULL;
 	if (out == NULL || !cluster_recovery_root_set_digest(roots, digest))
 		return CLUSTER_RECOVERY_GRAPH_INVALID;
-	for (uint32 i = 0; i < total; i++) {
-		const ClusterRecoveryRootEntry *entry = cluster_recovery_root_set_entry(roots, i);
-
-		if (entry == NULL)
-			return CLUSTER_RECOVERY_GRAPH_CHANGED;
-		if (entry->file.kind == CLUSTER_RECOVERY_FILE_UNDO_SEGMENT)
-			count++;
-	}
-	if (count > UNDO_STORE_SEGMENTS || memory_budget < fixed
-		|| count > (memory_budget - fixed) / sizeof(RecoveryUndoFile))
+	if (memory_budget < fixed)
 		return CLUSTER_RECOVERY_GRAPH_CAPACITY;
 	store = calloc(1, sizeof(*store));
 	if (store == NULL)
 		return CLUSTER_RECOVERY_GRAPH_CAPACITY;
-	store->files = count == 0 ? NULL : calloc(count, sizeof(*store->files));
-	if (count > 0 && store->files == NULL) {
-		free(store);
-		return CLUSTER_RECOVERY_GRAPH_CAPACITY;
-	}
 	store->roots = roots;
-	for (uint32 i = 0; i < total; i++) {
-		const ClusterRecoveryRootEntry *entry = cluster_recovery_root_set_entry(roots, i);
-		uint32 segment = entry->file.undo_segment;
-
-		if (entry->file.kind != CLUSTER_RECOVERY_FILE_UNDO_SEGMENT)
-			continue;
-		if ((entry->origins & CLUSTER_RECOVERY_ROOT_PHYSICAL) == 0 || segment == 0
-			|| segment > UNDO_STORE_SEGMENTS || store->by_segment[segment] != 0
-			|| entry->file.size < BLCKSZ || entry->file.size % BLCKSZ != 0) {
-			cluster_recovery_undo_store_destroy(store);
-			return CLUSTER_RECOVERY_GRAPH_CORRUPT;
-		}
-		store->files[store->count].root_index = i;
-		store->by_segment[segment] = ++store->count;
-	}
+	store->memory_budget = memory_budget;
 	*out = store;
 	return CLUSTER_RECOVERY_GRAPH_MORE;
 }
@@ -118,6 +93,67 @@ cluster_recovery_undo_store_next(ClusterRecoveryUndoStore *store, ClusterRecover
 		return store->status;
 	if (!cluster_recovery_root_set_digest(store->roots, digest))
 		return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_CHANGED);
+	if (!store->indexed) {
+		uint32 total = cluster_recovery_root_set_count(store->roots);
+		unsigned work = 0;
+
+		for (; store->root_cursor < total && work++ < UNDO_STORE_TICK; store->root_cursor++) {
+			const ClusterRecoveryRootEntry *entry
+				= cluster_recovery_root_set_entry(store->roots, store->root_cursor);
+			uint32 segment;
+
+			if (entry == NULL)
+				return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_CHANGED);
+			if (entry->file.kind != CLUSTER_RECOVERY_FILE_UNDO_SEGMENT)
+				continue;
+			segment = entry->file.undo_segment;
+			if ((entry->origins & CLUSTER_RECOVERY_ROOT_PHYSICAL) == 0 || segment == 0
+				|| segment > UNDO_STORE_SEGMENTS || store->by_segment[segment] != 0
+				|| entry->file.size < BLCKSZ || entry->file.size % BLCKSZ != 0)
+				return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_CORRUPT);
+			store->by_segment[segment] = store->root_cursor + 1;
+			store->count++;
+		}
+		if (store->root_cursor < total)
+			return CLUSTER_RECOVERY_GRAPH_MORE;
+		if (store->count > UNDO_STORE_SEGMENTS || store->memory_budget < sizeof(*store) + 16 * 1024
+			|| store->count
+				   > (store->memory_budget - sizeof(*store) - 16 * 1024) / sizeof(RecoveryUndoFile))
+			return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_CAPACITY);
+		if (store->count > 0) {
+			store->files = calloc(store->count, sizeof(*store->files));
+			if (store->files == NULL)
+				return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_CAPACITY);
+		}
+		store->indexed = true;
+	}
+	if (!store->files_ready) {
+		unsigned work = 0;
+		uint32 total = cluster_recovery_root_set_count(store->roots);
+
+		for (; store->fill_cursor < total && work++ < UNDO_STORE_TICK; store->fill_cursor++) {
+			const ClusterRecoveryRootEntry *entry
+				= cluster_recovery_root_set_entry(store->roots, store->fill_cursor);
+			uint32 segment;
+
+			if (entry == NULL)
+				return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_CHANGED);
+			if (entry->file.kind != CLUSTER_RECOVERY_FILE_UNDO_SEGMENT)
+				continue;
+			segment = entry->file.undo_segment;
+			/* by_segment still contains root index + 1; convert it while
+			 * preserving the canonical sorted root order. */
+			if (store->by_segment[segment] == 0)
+				return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_CHANGED);
+			store->files[store->files_filled].root_index = store->by_segment[segment] - 1;
+			store->by_segment[segment] = ++store->files_filled;
+		}
+		if (store->fill_cursor < total)
+			return CLUSTER_RECOVERY_GRAPH_MORE;
+		if (store->files_filled != store->count)
+			return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_CHANGED);
+		store->files_ready = true;
+	}
 	if (store->slot == TT_SLOTS_PER_SEGMENT) {
 		store->slot = 0;
 		store->current++;
