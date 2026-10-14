@@ -115,6 +115,7 @@ OBJS = \
 	cluster_recovery_heap_scan.o \
 	cluster_recovery_undo_scan.o \
 	cluster_recovery_reference_graph.o \
+	cluster_recovery_page_history.o \
 	cluster_cold_recovery_space.o \
 	cluster_cold_recovery_startup.o \
 	cluster_cold_recovery_replay.o \

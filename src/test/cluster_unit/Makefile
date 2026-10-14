@@ -478,10 +478,12 @@ TESTS += test_cluster_recovery_namespace
 TESTS += test_cluster_recovery_heap_scan
 TESTS += test_cluster_recovery_undo_scan
 TESTS += test_cluster_recovery_reference_graph
+TESTS += test_cluster_recovery_page_history
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_namespace,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_heap_scan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_undo_scan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_reference_graph,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_recovery_page_history,$(SIMPLE_TESTS))
 CLUSTER_BLOCK_APPLY_O = $(top_builddir)/src/backend/cluster/cluster_block_apply.o \
 		test_cluster_block_apply_btree_product.o
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
@@ -6009,7 +6011,8 @@ CLUSTER_R4_CONTINUATION_PAGE_O = test_cluster_r4_continuation_page_product.o
 $(CLUSTER_R4_CONTINUATION_PAGE_O): $(top_srcdir)/src/backend/storage/page/bufpage.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 $(CLUSTER_R4_CONTINUATION_CR_O): $(top_srcdir)/src/backend/cluster/cluster_cr.c \
-		$(top_srcdir)/src/include/cluster/cluster_cr.h
+		$(top_srcdir)/src/include/cluster/cluster_cr.h \
+		$(top_srcdir)/src/include/cluster/cluster_cr_history.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		-Dcluster_cr_build_on_holder_step=continuation_real_step \
 		-Dcluster_cr_build_on_holder_forget=continuation_real_forget \
@@ -6083,6 +6086,7 @@ CLUSTER_R4_CR_WALK_TEST_O = test_cluster_r4_cr_walk_product.o
 $(CLUSTER_R4_CR_WALK_TEST_O): test_cluster_r4_cr_walk_product.c \
 		$(top_srcdir)/src/backend/cluster/cluster_cr.c \
 		$(top_srcdir)/src/include/cluster/cluster_cr.h \
+		$(top_srcdir)/src/include/cluster/cluster_cr_history.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_record.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
@@ -8937,6 +8941,22 @@ test_cluster_catalog_manifest: test_cluster_catalog_manifest.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # Bounded original-tree observation with real filesystem identities.
+test_cluster_recovery_page_history: test_cluster_recovery_page_history.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_page_history.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_page_history.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_reference_graph.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_reference_graph.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_heap_scan.c \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_undo_scan.c \
+		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
+		$(top_srcdir)/src/backend/cluster/cluster_uba.c \
+		$(top_srcdir)/src/include/cluster/cluster_cr_history.h \
+		$(CLUSTER_CR_APPLY_O) $(CLUSTER_R4_CONTINUATION_PAGE_O) \
+		test_cluster_heap_small_scn.inc cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CR_APPLY_O) $(CLUSTER_R4_CONTINUATION_PAGE_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
 test_cluster_recovery_reference_graph: test_cluster_recovery_reference_graph.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_reference_graph.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_reference_graph.h \

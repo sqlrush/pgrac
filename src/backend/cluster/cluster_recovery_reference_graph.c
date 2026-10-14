@@ -141,17 +141,19 @@ recovery_graph_node(ClusterRecoveryReferenceGraph *graph, const ClusterRecoveryT
 	return CLUSTER_RECOVERY_GRAPH_MORE;
 }
 
-static ClusterRecoveryGraphResult
-recovery_graph_record_valid(const RecoveryRecordNode *node, const ClusterRecoveryUndoRecord *record,
-							uint32 record_generation)
+ClusterRecoveryGraphResult
+cluster_recovery_tx_record_check(const ClusterRecoveryTxnKey *key, UBA address,
+								 const ClusterRecoveryUndoRecord *record, uint32 record_generation)
 {
-	const ClusterRecoveryTxnKey *key = &node->transaction;
-	const UndoRecordHeader *header = &record->header;
+	const UndoRecordHeader *header;
 	uint32 segment, block;
 	uint16 slot, row, body_length;
 	UndoItlHistoryTrailer history;
 
-	if (!cluster_undo_record_uba_equal(node->address, record->address)
+	if (!recovery_graph_key_valid(key) || record == NULL)
+		return CLUSTER_RECOVERY_GRAPH_INVALID;
+	header = &record->header;
+	if (!cluster_undo_record_uba_equal(address, record->address)
 		|| !uba_decode_record(record->address, &segment, &block, &slot, &row)
 		|| !recovery_graph_address_matches(key, record->address)
 		|| header->origin_node_id != key->origin_node_id
@@ -267,7 +269,8 @@ recovery_graph_read_node(ClusterRecoveryReferenceGraph *graph, RecoveryRecordNod
 			result = CLUSTER_RECOVERY_GRAPH_CORRUPT;
 		return recovery_graph_fail(graph, result);
 	}
-	result = recovery_graph_record_valid(node, &graph->scratch, *generation);
+	result = cluster_recovery_tx_record_check(&node->transaction, node->address, &graph->scratch,
+											  *generation);
 	return result == CLUSTER_RECOVERY_GRAPH_MORE ? result : recovery_graph_fail(graph, result);
 }
 

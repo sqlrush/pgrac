@@ -58,6 +58,13 @@ typedef struct ClusterRecoveryGraphRecord {
 
 typedef struct ClusterRecoveryReferenceGraph ClusterRecoveryReferenceGraph;
 
+/* Pure byte/identity validation shared with PAGE_VERSION. It neither reads
+ * storage nor establishes the caller's generation/namespace authority. */
+extern ClusterRecoveryGraphResult
+cluster_recovery_tx_record_check(const ClusterRecoveryTxnKey *transaction, UBA address,
+								 const ClusterRecoveryUndoRecord *record,
+								 uint32 record_segment_generation);
+
 extern ClusterRecoveryGraphResult
 cluster_recovery_reference_graph_begin(size_t memory_budget, ClusterRecoveryGraphRead read,
 									   void *arg, ClusterRecoveryReferenceGraph **out);
