@@ -13,6 +13,8 @@
 #include <unistd.h>
 #include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_recovery_namespace.h"
+#include "cluster/cluster_undo_segment.h"
+#include "cluster/storage/cluster_undo_alloc.h"
 
 #define RECOVERY_NAMESPACE_DEPTH 64
 #define RECOVERY_NAMESPACE_ENTRIES 65536
@@ -56,6 +58,30 @@ namespace_number(const char **cursor, uint32 *out)
 	return true;
 }
 
+static bool
+namespace_undo_key(const char *path, uint32 *segment, uint8 *owner)
+{
+	const char *name;
+	uint32 node = 0, id;
+
+	if (strncmp(path, "pg_undo/instance_", 17) != 0)
+		return false;
+	name = path + 17;
+	if (*name == '0')
+		name++;
+	else if (!namespace_number(&name, &node))
+		return false;
+	if (node >= UNDO_OWNER_INSTANCE_MAX || strncmp(name, "/seg_", 5) != 0)
+		return false;
+	name += 5;
+	if (!namespace_number(&name, &id) || strcmp(name, ".dat") != 0
+		|| (id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE != node)
+		return false;
+	*segment = id;
+	*owner = node + 1;
+	return true;
+}
+
 ClusterRecoveryFileKind
 cluster_recovery_namespace_classify(const char *path, RelFileLocator *locator, ForkNumber *forknum)
 {
@@ -64,6 +90,8 @@ cluster_recovery_namespace_classify(const char *path, RelFileLocator *locator, F
 	ForkNumber fork = InvalidForkNumber;
 	const char *name;
 	const char *suffix;
+	uint32 undo_segment;
+	uint8 undo_owner;
 
 	if (locator != NULL)
 		memset(locator, 0, sizeof(*locator));
@@ -71,6 +99,8 @@ cluster_recovery_namespace_classify(const char *path, RelFileLocator *locator, F
 		*forknum = InvalidForkNumber;
 	if (path == NULL || locator == NULL || forknum == NULL || strnlen(path, MAXPGPATH) == MAXPGPATH)
 		return kind;
+	if (namespace_undo_key(path, &undo_segment, &undo_owner))
+		return CLUSTER_RECOVERY_FILE_UNDO_SEGMENT;
 	if (strncmp(path, "global/", 7) == 0) {
 		result.spcOid = GLOBALTABLESPACE_OID;
 		name = path + 7;
@@ -341,6 +371,9 @@ cluster_recovery_namespace_next(ClusterRecoveryNamespace *scan, ClusterRecoveryN
 			strlcpy(scan->current_name, item->d_name, sizeof(scan->current_name));
 			entry.kind
 				= cluster_recovery_namespace_classify(entry.path, &entry.locator, &entry.forknum);
+			if (entry.kind == CLUSTER_RECOVERY_FILE_UNDO_SEGMENT)
+				(void)namespace_undo_key(entry.path, &entry.undo_segment,
+										 &entry.undo_owner_instance);
 			entry.size = held.st_size;
 			*file_fd = fd;
 		}

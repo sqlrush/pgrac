@@ -476,8 +476,10 @@ TESTS += test_cluster_multixact_recovery
 TESTS += test_cluster_space_reservation
 TESTS += test_cluster_recovery_namespace
 TESTS += test_cluster_recovery_heap_scan
+TESTS += test_cluster_recovery_undo_scan
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_namespace,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_heap_scan,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_recovery_undo_scan,$(SIMPLE_TESTS))
 CLUSTER_BLOCK_APPLY_O = $(top_builddir)/src/backend/cluster/cluster_block_apply.o \
 		test_cluster_block_apply_btree_product.o
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
@@ -8933,6 +8935,12 @@ test_cluster_catalog_manifest: test_cluster_catalog_manifest.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # Bounded original-tree observation with real filesystem identities.
+test_cluster_recovery_undo_scan: test_cluster_recovery_undo_scan.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_undo_scan.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_undo_scan.h \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
 test_cluster_recovery_heap_scan: test_cluster_recovery_heap_scan.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_heap_scan.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_heap_scan.h cluster_unit_port_stubs.o

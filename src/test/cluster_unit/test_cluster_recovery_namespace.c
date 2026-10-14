@@ -191,6 +191,67 @@ UT_TEST(test_unknown_and_aliases_cannot_be_empty_coverage)
 	}
 }
 
+UT_TEST(test_undo_names_keep_origin_and_reject_aliases)
+{
+	const char *valid[]
+		= { "pg_undo/instance_0/seg_1.dat", "pg_undo/instance_0/seg_256.dat",
+			"pg_undo/instance_1/seg_257.dat", "pg_undo/instance_127/seg_32768.dat" };
+	const char *unknown[]
+		= { "pg_undo/instance_00/seg_1.dat",		  "pg_undo/instance_0/seg_01.dat",
+			"pg_undo/instance_0/seg_0.dat",			  "pg_undo/instance_0/seg_257.dat",
+			"pg_undo/instance_1/seg_256.dat",		  "pg_undo/instance_128/seg_32769.dat",
+			"pg_undo/instance_42949672960/seg_1.dat", "pg_undo/instance_0/seg_42949672960.dat",
+			"pg_undo/instance_0/seg_1.dat.bak",		  "pg_undo/instance_0/seg_1.dat/extra",
+			"pg_undo/instance_-1/seg_1.dat",		  "other/instance_0/seg_1.dat" };
+	RelFileLocator locator;
+	ForkNumber forknum;
+
+	for (unsigned i = 0; i < lengthof(valid); i++) {
+		UT_ASSERT_EQ(cluster_recovery_namespace_classify(valid[i], &locator, &forknum),
+					 CLUSTER_RECOVERY_FILE_UNDO_SEGMENT);
+		UT_ASSERT_EQ(locator.spcOid, 0);
+		UT_ASSERT_EQ(forknum, InvalidForkNumber);
+	}
+	for (unsigned i = 0; i < lengthof(unknown); i++)
+		UT_ASSERT_EQ(cluster_recovery_namespace_classify(unknown[i], &locator, &forknum),
+					 CLUSTER_RECOVERY_FILE_UNCLASSIFIED);
+}
+
+UT_TEST(test_real_undo_files_export_physical_keys_without_a_live_bitmap)
+{
+	int root = new_root();
+	ClusterRecoveryNamespace *scan = NULL;
+	ClusterRecoveryNamespaceEntry entry;
+	ClusterRecoveryNamespaceResult result;
+	unsigned files = 0;
+	int borrowed = -1;
+
+	UT_ASSERT(root >= 0);
+	UT_ASSERT_EQ(mkdirat(root, "pg_undo", 0700), 0);
+	UT_ASSERT_EQ(mkdirat(root, "pg_undo/instance_1", 0700), 0);
+	write_file(root, "pg_undo/instance_1/seg_257.dat");
+	write_file(root, "pg_undo/instance_1/seg_512.dat");
+	UT_ASSERT_EQ(cluster_recovery_namespace_begin(root, 16, &scan),
+				 CLUSTER_RECOVERY_NAMESPACE_MORE);
+	while ((result = cluster_recovery_namespace_next(scan, &entry, &borrowed))
+		   <= CLUSTER_RECOVERY_NAMESPACE_MORE) {
+		if (result == CLUSTER_RECOVERY_NAMESPACE_MORE
+			|| entry.kind == CLUSTER_RECOVERY_FILE_DIRECTORY)
+			continue;
+		UT_ASSERT_EQ(entry.kind, CLUSTER_RECOVERY_FILE_UNDO_SEGMENT);
+		UT_ASSERT_EQ(entry.undo_owner_instance, 2);
+		UT_ASSERT_EQ(entry.undo_segment,
+					 strcmp(entry.path, "pg_undo/instance_1/seg_257.dat") == 0 ? 257 : 512);
+		UT_ASSERT(borrowed >= 0);
+		files++;
+	}
+	UT_ASSERT_EQ(result, CLUSTER_RECOVERY_NAMESPACE_END);
+	UT_ASSERT_EQ(files, 2);
+	cluster_recovery_namespace_destroy(scan);
+	remove_root(root);
+	rmdir(test_path);
+}
+
 UT_TEST(test_real_tree_includes_untouched_and_unknown_files)
 {
 	int root = new_root();
@@ -499,9 +560,11 @@ UT_TEST(test_current_read_rejects_out_of_range_without_sealing)
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(16);
 	UT_RUN(test_shared_relation_names);
 	UT_RUN(test_relmap_and_both_authority_copies);
+	UT_RUN(test_undo_names_keep_origin_and_reject_aliases);
+	UT_RUN(test_real_undo_files_export_physical_keys_without_a_live_bitmap);
 	UT_RUN(test_unknown_and_aliases_cannot_be_empty_coverage);
 	UT_RUN(test_real_tree_includes_untouched_and_unknown_files);
 	UT_RUN(test_symlink_and_hardlink_are_not_candidates);

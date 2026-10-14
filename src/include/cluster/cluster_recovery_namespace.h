@@ -31,7 +31,8 @@ typedef enum ClusterRecoveryFileKind {
 	CLUSTER_RECOVERY_FILE_RELMAP,
 	CLUSTER_RECOVERY_FILE_RELMAP_BACKUP,
 	CLUSTER_RECOVERY_FILE_RELMAP_AUTHORITY,
-	CLUSTER_RECOVERY_FILE_RELMAP_AUTHORITY_BACKUP
+	CLUSTER_RECOVERY_FILE_RELMAP_AUTHORITY_BACKUP,
+	CLUSTER_RECOVERY_FILE_UNDO_SEGMENT
 } ClusterRecoveryFileKind;
 
 typedef struct ClusterRecoveryNamespaceEntry {
@@ -40,6 +41,8 @@ typedef struct ClusterRecoveryNamespaceEntry {
 	RelFileLocator locator;
 	ForkNumber forknum;
 	uint64 size;
+	uint32 undo_segment;
+	uint8 undo_owner_instance;
 } ClusterRecoveryNamespaceEntry;
 
 typedef struct ClusterRecoveryNamespace ClusterRecoveryNamespace;
