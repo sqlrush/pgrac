@@ -10915,7 +10915,7 @@ pcm_pi_relation_scan(RelFileLocator locator, uint64 formation, uint32 budget, ui
 		if (!BufTagMatchesRelFileLocator(&slot->tag, &locator))
 			continue;
 		if (object_drain) {
-			if (slot->tag.forkNum > MAX_FORKNUM)
+			if (slot->tag.forkNum < MAIN_FORKNUM || slot->tag.forkNum > MAX_FORKNUM)
 				goto invalid;
 		} else if (slot->tag.forkNum != MAIN_FORKNUM && slot->tag.forkNum != VISIBILITYMAP_FORKNUM)
 			continue;

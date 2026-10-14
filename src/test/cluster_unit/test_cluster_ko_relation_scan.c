@@ -111,10 +111,31 @@ UT_TEST(object_scan_preserves_budget_and_gate_rejection)
 				 CLUSTER_PCM_PI_RELATION_INVALID);
 	cluster_shared_config = false;
 }
+UT_TEST(object_scan_rejects_unknown_fork_on_either_side)
+{
+	ForkNumber invalid[] = { InvalidForkNumber, MAX_FORKNUM + 1 };
+	for (unsigned n = 0; n < lengthof(invalid); n++) {
+		BufferTag tag = make_tag(6906);
+		PcmEntryRef ref;
+		PcmEntryAcquireResult acquired;
+		uint32 cursor = 0;
+		pi_relation_scan_setup();
+		tag.forkNum = invalid[n];
+		UT_ASSERT(pcm_entry_ref_acquire(&tag, true, &ref, &acquired));
+		pcm_entry_ref_release(&ref);
+		UT_ASSERT_EQ(
+			cluster_pcm_lock_ko_relation_scan_v3(BufTagGetRelFileLocator(&tag), 17, 4, &cursor),
+			CLUSTER_PCM_PI_RELATION_INVALID);
+		UT_ASSERT_EQ(cursor, 0);
+		UT_ASSERT_EQ(fake_lwlock_depth, 0);
+		cluster_shared_config = false;
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
 	UT_RUN(test_pi_relation_empty_requires_complete_bounded_scan);
 	UT_RUN(test_pi_relation_scan_checks_main_vm_and_original_references);
 	UT_RUN(test_pi_relation_scan_never_retires_master_or_local_pi);
@@ -124,6 +145,7 @@ main(void)
 	UT_RUN(object_scan_never_retires_any_fork_pi);
 	UT_RUN(object_scan_cannot_call_settled_current_empty);
 	UT_RUN(object_scan_preserves_budget_and_gate_rejection);
+	UT_RUN(object_scan_rejects_unknown_fork_on_either_side);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
