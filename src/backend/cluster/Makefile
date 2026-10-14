@@ -139,6 +139,7 @@ OBJS = \
 	cluster_fence_authority.o \
 	cluster_write_fence.o \
 	cluster_ges.o \
+	cluster_ges_holder.o \
 	cluster_ges_dedup.o \
 	cluster_ges_handoff.o \
 	cluster_ges_handoff_policy.o \

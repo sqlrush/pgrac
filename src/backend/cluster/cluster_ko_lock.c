@@ -53,6 +53,7 @@
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_extend_gate.h"
 #include "cluster/cluster_grd.h"
+#include "cluster/cluster_ges_holder.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_hw_lease.h"
@@ -153,6 +154,8 @@ typedef struct ClusterKoPeerFenceV3 {
 	uint64 serial;
 	ClusterKoSharedMessageV3 request;
 	uint8 encoded[CLUSTER_KO_SHARED_V3_BYTES];
+	ClusterGesHolderProbe holder_probe;
+	TimestampTz holder_sent_at;
 } ClusterKoPeerFenceV3;
 
 typedef struct ClusterKoShared {
@@ -177,6 +180,8 @@ typedef struct ClusterKoShared {
 	/* Peer operations are not owned by an origin backend ResourceOwner.
 	 * Passive READY/terminal identities survive its context cleanup. */
 	uint64 peer_fence_serial;
+	uint64 holder_probe_nonce;
+	uint32 holder_probe_cursor;
 	ClusterKoPeerFenceV3 peer_fences[CLUSTER_KO_SHARED_CAPACITY];
 	/* Preallocated native continuations belong to this same KO owner.
 	 * One finite ready batch is drained before adopting newly committed work. */
@@ -351,6 +356,8 @@ cluster_ko_shmem_init(void)
 		ko_state->context_serial = 0;
 		memset(ko_state->contexts, 0, sizeof(ko_state->contexts));
 		ko_state->peer_fence_serial = 0;
+		ko_state->holder_probe_nonce = 0;
+		ko_state->holder_probe_cursor = 0;
 		memset(ko_state->peer_fences, 0, sizeof(ko_state->peer_fences));
 	}
 }
@@ -802,6 +809,7 @@ cluster_ko_peer_fence_begin_v3(const ClusterKoSharedMessageV3 *request,
 	if (empty >= 0 && ko_state->peer_fence_serial != UINT64_MAX) {
 		ClusterKoPeerFenceV3 *entry = &ko_state->peer_fences[empty];
 
+		memset(entry, 0, sizeof(*entry));
 		entry->request = *request;
 		memcpy(entry->encoded, encoded, sizeof(encoded));
 		entry->serial = ++ko_state->peer_fence_serial;
@@ -814,6 +822,175 @@ cluster_ko_peer_fence_begin_v3(const ClusterKoSharedMessageV3 *request,
  done:
 	SpinLockRelease(&ko_state->shared_lock);
 	return ok;
+}
+
+/* Query state shares the exact peer slot, but cannot advance its drain or
+ * terminal state. The LMON sends and the SI owner consumes the observation. */
+static bool
+ko_holder_probe_same_query(const ClusterGesHolderProbe *a, const ClusterGesHolderProbe *b)
+{
+	return a->nonce != 0 && a->nonce == b->nonce
+		   && memcmp(&a->resid, &b->resid, sizeof(a->resid)) == 0
+		   && memcmp(&a->holder, &b->holder, sizeof(a->holder)) == 0
+		   && a->master_generation == b->master_generation && a->collector_boot == b->collector_boot
+		   && a->master_boot == b->master_boot;
+}
+
+static bool
+ko_peer_holder_cut(const ClusterKoSharedMessageV3 *request, uint64 *master_boot)
+{
+	ClusterKoSharedMessageV2 current = request->base;
+	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], generation;
+
+	if (!ko_shared_v3_control_current(request) || !ko_shared_members(&current, boots, &generation)
+		|| request->ax_master_node < 0 || request->ax_master_node >= CLUSTER_KO_SHARED_NODE_LIMIT
+		|| !cluster_membership_cut_generation_current(generation))
+		return false;
+	*master_boot = boots[request->ax_master_node];
+	return *master_boot != 0 && boots[cluster_node_id] == request->base.peer_boot;
+}
+
+bool
+cluster_ko_peer_holder_begin_v3(const ClusterKoPeerFenceHandleV3 *handle)
+{
+	ClusterKoSharedMessageV3 request;
+	ClusterKoPeerFenceV3 *entry;
+	ClusterGesHolderProbe probe;
+	bool ok = false;
+
+	if (ko_state == NULL || !AmSinvalBcastProcess() || handle == NULL
+		|| handle->slot >= CLUSTER_KO_SHARED_CAPACITY || handle->serial == 0)
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	entry = &ko_state->peer_fences[handle->slot];
+	if (entry->serial != handle->serial || entry->state == CLUSTER_KO_PEER_FENCE_EMPTY) {
+		SpinLockRelease(&ko_state->shared_lock);
+		return false;
+	}
+	request = entry->request;
+	SpinLockRelease(&ko_state->shared_lock);
+	memset(&probe, 0, sizeof(probe));
+	if (!ko_peer_holder_cut(&request, &probe.master_boot))
+		return false;
+	probe.resid = request.ax_resid;
+	probe.holder = request.ax_holder;
+	probe.master_generation = request.ax_master_generation;
+	probe.collector_boot = request.base.peer_boot;
+	SpinLockAcquire(&ko_state->shared_lock);
+	entry = &ko_state->peer_fences[handle->slot];
+	if (entry->serial == handle->serial && entry->state != CLUSTER_KO_PEER_FENCE_EMPTY
+		&& ko_state->holder_probe_nonce < UINT64_MAX - 1) {
+		probe.nonce = ++ko_state->holder_probe_nonce;
+		entry->holder_probe = probe;
+		entry->holder_sent_at = 0;
+		ok = true;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	if (ok)
+		cluster_lmon_wakeup();
+	return ok;
+}
+
+void
+cluster_ko_peer_holder_observed(int32 master, const ClusterGesHolderProbe *probe)
+{
+	bool wake = false;
+
+	if (ko_state == NULL || !AmLmonProcess() || probe == NULL || !probe->reply
+		|| (probe->observation == CLUSTER_GRD_HOLDER_PRESENT
+				? probe->mode < AccessShareLock || probe->mode > AccessExclusiveLock
+				: (probe->observation != CLUSTER_GRD_HOLDER_ABSENT
+				   && probe->observation != CLUSTER_GRD_HOLDER_UNKNOWN)
+					  || probe->mode != NoLock))
+		return;
+	SpinLockAcquire(&ko_state->shared_lock);
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		ClusterKoPeerFenceV3 *entry = &ko_state->peer_fences[i];
+
+		if (entry->state != CLUSTER_KO_PEER_FENCE_EMPTY && entry->request.ax_master_node == master
+			&& !entry->holder_probe.reply
+			&& ko_holder_probe_same_query(&entry->holder_probe, probe)) {
+			entry->holder_probe = *probe;
+			wake = true;
+			break;
+		}
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	if (wake)
+		cluster_sinval_set_proc_latch();
+}
+
+bool
+cluster_ko_peer_holder_result_v3(const ClusterKoPeerFenceHandleV3 *handle,
+								 ClusterGrdHolderObservation *observation, LOCKMODE *mode)
+{
+	ClusterKoPeerFenceV3 saved;
+	uint64 master_boot;
+	bool current;
+
+	if (observation != NULL)
+		*observation = CLUSTER_GRD_HOLDER_UNKNOWN;
+	if (mode != NULL)
+		*mode = NoLock;
+	if (ko_state == NULL || !AmSinvalBcastProcess() || handle == NULL
+		|| handle->slot >= CLUSTER_KO_SHARED_CAPACITY || handle->serial == 0 || observation == NULL
+		|| mode == NULL)
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	saved = ko_state->peer_fences[handle->slot];
+	SpinLockRelease(&ko_state->shared_lock);
+	if (saved.serial != handle->serial || saved.state == CLUSTER_KO_PEER_FENCE_EMPTY
+		|| !saved.holder_probe.reply || !ko_peer_holder_cut(&saved.request, &master_boot)
+		|| master_boot != saved.holder_probe.master_boot)
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	current = ko_state->peer_fences[handle->slot].serial == handle->serial
+			  && ko_state->peer_fences[handle->slot].state != CLUSTER_KO_PEER_FENCE_EMPTY
+			  && ko_holder_probe_same_query(&ko_state->peer_fences[handle->slot].holder_probe,
+											&saved.holder_probe);
+	SpinLockRelease(&ko_state->shared_lock);
+	if (!current)
+		return false;
+	*observation = saved.holder_probe.observation;
+	*mode = saved.holder_probe.mode;
+	return true;
+}
+
+static void
+ko_peer_holder_lmon_tick(void)
+{
+	TimestampTz now = GetCurrentTimestamp();
+	unsigned sent = 0;
+
+	for (unsigned scanned = 0; scanned < CLUSTER_KO_SHARED_CAPACITY && sent < 8; scanned++) {
+		ClusterGesHolderProbe probe;
+		ClusterKoSharedMessageV3 request;
+		ClusterKoPeerFenceV3 *entry;
+		uint64 master_boot;
+		bool pending;
+
+		SpinLockAcquire(&ko_state->shared_lock);
+		entry = &ko_state->peer_fences[ko_state->holder_probe_cursor];
+		ko_state->holder_probe_cursor
+			= (ko_state->holder_probe_cursor + 1) % CLUSTER_KO_SHARED_CAPACITY;
+		pending = entry->state != CLUSTER_KO_PEER_FENCE_EMPTY && entry->holder_probe.nonce != 0
+				  && !entry->holder_probe.reply
+				  && (entry->holder_sent_at == 0 || now < entry->holder_sent_at
+					  || now - entry->holder_sent_at >= INT64CONST(100000));
+		if (pending) {
+			probe = entry->holder_probe;
+			request = entry->request;
+			entry->holder_sent_at = now;
+		}
+		SpinLockRelease(&ko_state->shared_lock);
+		if (!pending)
+			continue;
+		if (!cluster_normal_stop_service_new_work(false))
+			return;
+		sent++;
+		if (ko_peer_holder_cut(&request, &master_boot) && master_boot == probe.master_boot)
+			(void)cluster_ges_holder_probe_send(request.ax_master_node, &probe);
+	}
 }
 
 /* Called by the original drain owner only after its complete READY
@@ -2505,6 +2682,7 @@ cluster_ko_lmon_tick_v2(void)
 {
 	if (ko_state == NULL || !cluster_shared_config || !AmLmonProcess())
 		return;
+	ko_peer_holder_lmon_tick();
 	for (unsigned n = 0; n < CLUSTER_KO_SHARED_CAPACITY; n++) {
 		ClusterKoSharedMessageV2 message;
 		uint8 bytes[CLUSTER_KO_SHARED_V2_BYTES];

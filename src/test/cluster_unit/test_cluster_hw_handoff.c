@@ -45,6 +45,7 @@
 #include "access/xact.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_ges.h"
+#include "cluster/cluster_ges_holder.h"
 #include "cluster/cluster_ges_dedup.h"
 #include "cluster/cluster_ges_reply_wait.h"
 #include "cluster/cluster_grd_work_queue.h"
@@ -63,6 +64,31 @@
 #include "storage/latch.h"
 
 /* Storage/transport observers retain complete keys; the GRD is always real. */
+/* Legacy control fixtures deliberately do not execute object queries. */
+#ifndef PGRAC_REAL_HOLDER_PROBE
+bool
+cluster_ges_holder_probe_is_frame(const void *payload, Size length)
+{
+	(void)payload;
+	(void)length;
+	return false;
+}
+void
+cluster_ges_holder_probe_ingress(const ClusterICEnvelope *env, const void *payload)
+{
+	(void)env;
+	(void)payload;
+	abort();
+}
+void
+cluster_ges_holder_probe_drain(const ClusterGrdWorkItem *item)
+{
+	(void)item;
+	abort();
+}
+#endif
+static bool (*hw_probe_work_enqueue)(uint32, const void *, uint16);
+static bool (*hw_probe_work_dequeue)(ClusterGrdWorkItem *);
 static void (*hw_dedup_remove_observe)(const ClusterGesDedupKey *key);
 static void (*hw_dedup_record_observe)(const ClusterGesDedupKey *key, const GesReplyPayload *reply);
 static bool (*hw_control_retire_observe)(uint32 node, uint32 proc, uint64 epoch, uint64 request);
@@ -605,6 +631,8 @@ ProcessInterrupts(void)
 bool
 cluster_grd_work_queue_enqueue(uint32 source, const void *payload, uint16 length)
 {
+	if (hw_probe_work_enqueue != NULL)
+		return hw_probe_work_enqueue(source, payload, length);
 	(void)source;
 	(void)payload;
 	(void)length;
@@ -668,6 +696,8 @@ fixture_cf_master(const ClusterResId *resid)
 bool
 cluster_grd_work_queue_dequeue(ClusterGrdWorkItem *out)
 {
+	if (hw_probe_work_dequeue != NULL)
+		return hw_probe_work_dequeue(out);
 	if (!master_work_pending)
 		return false;
 	memset(out, 0, sizeof(*out));

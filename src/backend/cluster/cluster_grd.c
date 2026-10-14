@@ -10177,6 +10177,94 @@ cluster_grd_holder_mode_by_id(const ClusterResId *resid, const ClusterGrdHolderI
 	return found;
 }
 
+/* Only the current, normal master can report a point-in-time absence. This
+ * observer neither allocates an entry nor cancels an existing obligation.
+ * The protocol caller still authenticates boots and its complete query key.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterGrdHolderObservation
+cluster_grd_holder_observe(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+						   uint64 master_generation, LOCKMODE *mode_out)
+{
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdEntryResult er;
+	ClusterGrdHolderObservation result = CLUSTER_GRD_HOLDER_UNKNOWN;
+	LOCKMODE mode = NoLock;
+	uint64 generation;
+	uint32 shard;
+	uint32 shard_generation;
+
+	if (mode_out != NULL)
+		*mode_out = NoLock;
+	if (resid == NULL || holder == NULL || cluster_grd_state == NULL
+		|| resid->type != LOCKTAG_RELATION || resid->lockmethodid != DEFAULT_LOCKMETHOD
+		|| resid->field2 == InvalidOid || resid->field3 != 0 || resid->field4 != 0
+		|| holder->node_id >= CLUSTER_MAX_NODES || holder->procno > INT_MAX
+		|| holder->request_id == 0 || holder->request_id == PG_UINT64_MAX
+		|| holder->cluster_epoch == 0 || holder->cluster_epoch != cluster_epoch_get_current()
+		|| master_generation == 0
+		|| cluster_grd_lookup_master_gen(resid, &generation) != cluster_node_id
+		|| generation != master_generation)
+		return CLUSTER_GRD_HOLDER_UNKNOWN;
+	shard = cluster_grd_shard_for_resource(resid);
+	shard_generation = cluster_grd_shard_master_generation(shard);
+	if (cluster_grd_shard_phase(shard) != GRD_SHARD_NORMAL)
+		return CLUSTER_GRD_HOLDER_UNKNOWN;
+
+	er = cluster_grd_entry_lookup_or_create(resid, false, &entry);
+	if (er == CLUSTER_GRD_ENTRY_NOT_FOUND)
+		result = CLUSTER_GRD_HOLDER_ABSENT;
+	else if (er == CLUSTER_GRD_ENTRY_OK && entry != NULL) {
+		SpinLockAcquire(&entry->lock);
+		result = CLUSTER_GRD_HOLDER_ABSENT;
+		for (int i = 0; i < entry->ngranted; i++) {
+			const ClusterGrdHolder *h = &grd_holders(entry)[i];
+
+			if (h->node_id == holder->node_id && h->procno == holder->procno
+				&& h->cluster_epoch == holder->cluster_epoch
+				&& h->request_id == holder->request_id) {
+				mode = h->mode;
+				result = mode >= AccessShareLock && mode <= AccessExclusiveLock
+							 ? CLUSTER_GRD_HOLDER_PRESENT
+							 : CLUSTER_GRD_HOLDER_UNKNOWN;
+				break;
+			}
+		}
+		for (int i = 0; result == CLUSTER_GRD_HOLDER_ABSENT && i < entry->nwaiters; i++) {
+			const ClusterGrdWaiter *w = &grd_waiters(entry)[i];
+
+			if (w->node_id == holder->node_id && w->procno == holder->procno
+				&& w->cluster_epoch == holder->cluster_epoch && w->request_id == holder->request_id)
+				result = CLUSTER_GRD_HOLDER_UNKNOWN;
+		}
+		for (int i = 0; result == CLUSTER_GRD_HOLDER_ABSENT && i < entry->nconverts; i++) {
+			const ClusterGrdConvert *c = &grd_converts(entry)[i];
+
+			if (c->node_id == holder->node_id && c->procno == holder->procno
+				&& c->cluster_epoch == holder->cluster_epoch
+				&& c->convert_request_id == holder->request_id)
+				result = CLUSTER_GRD_HOLDER_UNKNOWN;
+		}
+		for (int i = 0; result == CLUSTER_GRD_HOLDER_ABSENT && i < entry->nreservations; i++) {
+			const ClusterGrdHolderId *r = &grd_reservations(entry)[i].id;
+
+			if (r->node_id == holder->node_id && r->procno == holder->procno
+				&& r->cluster_epoch == holder->cluster_epoch && r->request_id == holder->request_id)
+				result = CLUSTER_GRD_HOLDER_UNKNOWN;
+		}
+		SpinLockRelease(&entry->lock);
+		cluster_grd_entry_release(entry);
+	}
+	if (holder->cluster_epoch != cluster_epoch_get_current()
+		|| cluster_grd_lookup_master_gen(resid, &generation) != cluster_node_id
+		|| generation != master_generation
+		|| cluster_grd_shard_master_generation(shard) != shard_generation
+		|| cluster_grd_shard_phase(shard) != GRD_SHARD_NORMAL)
+		return CLUSTER_GRD_HOLDER_UNKNOWN;
+	if (mode_out != NULL && result == CLUSTER_GRD_HOLDER_PRESENT)
+		*mode_out = mode;
+	return result;
+}
+
 ClusterGrdEntryResult
 cluster_grd_cancel_reservation_by_id(const ClusterResId *resid, const ClusterGrdHolderId *holder)
 {

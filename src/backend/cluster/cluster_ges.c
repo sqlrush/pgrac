@@ -39,6 +39,7 @@
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ges.h"
+#include "cluster/cluster_ges_holder.h"
 #include "cluster/cluster_ges_mode.h"		/* spec-5.1b D1: ges_modes_compatible (frozen matrix) */
 #include "cluster/cluster_ges_reply_wait.h" /* spec-2.23 D1 5-tuple wait HTAB */
 #include "cluster/cluster_grd.h"
@@ -612,6 +613,11 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 	 * Ordinary request validation below is deliberately unchanged. */
 	if (cluster_shared_config && cluster_control_retire_is_frame(payload, env->payload_length)) {
 		cluster_control_retire_ingress(env, payload);
+		return;
+	}
+
+	if (cluster_shared_config && cluster_ges_holder_probe_is_frame(payload, env->payload_length)) {
+		cluster_ges_holder_probe_ingress(env, payload);
 		return;
 	}
 
@@ -1626,6 +1632,11 @@ cluster_ges_lmon_drain_work_queue(void)
 		if (cluster_shared_config
 			&& cluster_control_retire_is_frame(item.payload, item.payload_len)) {
 			cluster_control_retire_drain(&item);
+			continue;
+		}
+		if (cluster_shared_config
+			&& cluster_ges_holder_probe_is_frame(item.payload, item.payload_len)) {
+			cluster_ges_holder_probe_drain(&item);
 			continue;
 		}
 		if (item.payload_len != sizeof(GesRequestPayload)) {

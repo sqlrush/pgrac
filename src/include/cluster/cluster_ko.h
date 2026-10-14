@@ -147,6 +147,10 @@ typedef struct ClusterKoPeerFenceHandleV3 {
 	uint64 serial;
 } ClusterKoPeerFenceHandleV3;
 
+extern bool cluster_ko_peer_holder_begin_v3(const ClusterKoPeerFenceHandleV3 *handle);
+extern bool cluster_ko_peer_holder_result_v3(const ClusterKoPeerFenceHandleV3 *handle,
+											 ClusterGrdHolderObservation *observation,
+											 LOCKMODE *mode);
 extern bool cluster_ko_peer_fence_begin_v3(const ClusterKoSharedMessageV3 *request,
 										 ClusterKoPeerFenceHandleV3 *handle,
 										 ClusterKoPeerFenceStateV3 *state);

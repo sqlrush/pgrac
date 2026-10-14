@@ -9,10 +9,12 @@
  * Author: SqlRush <sqlrush@gmail.com>
  *-------------------------------------------------------------------------
  */
+#define PGRAC_REAL_HOLDER_PROBE
 #define PGRAC_HW_HANDOFF_EMBEDDED
 #include "test_cluster_hw_handoff.c"
 #include "cluster/cluster_control_retire.h"
 #include "cluster/cluster_ic_router.h"
+#include "../../backend/cluster/cluster_ges_holder.c"
 
 /* Retain fail-stop control transport boundaries. Master-side retirement uses
  * A's dedup storage observer; it does not send or certify a cleanup exchange. */
@@ -43,12 +45,71 @@ cluster_ges_dedup_retire_control_request(uint32 node, uint32 procno, uint64 epoc
 	abort();
 }
 
+static bool holder_protocol_active;
+static uint8 holder_protocol_wire[80];
+static int holder_protocol_sends, holder_protocol_deliveries;
+static ClusterGesHolderProbe holder_protocol_result;
+static ClusterGrdWorkItem holder_protocol_work;
+static bool holder_protocol_pending;
+
+ClusterMembershipState
+cluster_membership_get_state(int32 node)
+{
+	return node >= 0 && node < 4 ? CLUSTER_MEMBER_MEMBER : CLUSTER_MEMBER_DEAD;
+}
+bool
+cluster_sf_peer_capability_word_sample(int32 peer, uint32 required, uint32 *word,
+									   uint32 *generation)
+{
+	UT_ASSERT(peer >= 0 && peer < 4);
+	UT_ASSERT_EQ(required, PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1);
+	*word = required;
+	*generation = 1;
+	return true;
+}
+void
+cluster_ko_peer_holder_observed(int32 master, const ClusterGesHolderProbe *probe)
+{
+	UT_ASSERT(holder_protocol_active);
+	UT_ASSERT_EQ(master, 1);
+	holder_protocol_result = *probe;
+	holder_protocol_deliveries++;
+}
+static bool
+holder_protocol_enqueue(uint32 source, const void *payload, uint16 length)
+{
+	UT_ASSERT(!holder_protocol_pending);
+	UT_ASSERT_EQ(length, 80);
+	memset(&holder_protocol_work, 0, sizeof(holder_protocol_work));
+	holder_protocol_work.source_node_id = source;
+	holder_protocol_work.routing_generation = cluster_lms_get_shard_master_generation();
+	holder_protocol_work.payload_len = length;
+	memcpy(holder_protocol_work.payload, payload, length);
+	holder_protocol_pending = true;
+	return true;
+}
+static bool
+holder_protocol_dequeue(ClusterGrdWorkItem *out)
+{
+	if (!holder_protocol_pending)
+		return false;
+	*out = holder_protocol_work;
+	holder_protocol_pending = false;
+	return true;
+}
+
 ClusterICSendResult
 cluster_ic_send_envelope(uint8 type pg_attribute_unused(), int32 dest pg_attribute_unused(),
 						 const void *payload pg_attribute_unused(),
 						 uint32 len pg_attribute_unused())
 {
-	abort();
+	UT_ASSERT(holder_protocol_active);
+	UT_ASSERT_EQ(type, PGRAC_IC_MSG_GES_REQUEST);
+	UT_ASSERT_EQ(dest, 2);
+	UT_ASSERT_EQ(len, 80);
+	memcpy(holder_protocol_wire, payload, len);
+	holder_protocol_sends++;
+	return CLUSTER_IC_SEND_DONE;
 }
 
 typedef struct CapacityCounts {
@@ -1745,13 +1806,207 @@ UT_TEST(control_retire_waiter_snapshot_oom_delivers_grants_and_retracts_all_old_
 	capacity_projection_oom(CAPACITY_CONTROL_RETIRE, 2);
 }
 
+/* A negative lookup is not enough to retire an object fence. The master
+ * observation must distinguish missing service and still-pending identities. */
+UT_TEST(exact_holder_observation_never_creates_or_mutates_grants)
+{
+	ClusterLockAcquireRequest request;
+	ClusterGrdHolderId holder, other;
+	uint64 generation;
+	LOCKMODE mode = AccessExclusiveLock;
+	uint64 creates;
+
+	capacity_setup(&request, &holder);
+	UT_ASSERT_EQ(cluster_grd_lookup_master_gen(&request.resid, &generation), 1);
+	creates = cluster_grd_entry_create_count();
+	UT_ASSERT_EQ(cluster_grd_holder_observe(&request.resid, &holder, generation, &mode),
+				 CLUSTER_GRD_HOLDER_ABSENT);
+	UT_ASSERT_EQ(mode, NoLock);
+	UT_ASSERT_EQ(cluster_grd_entry_create_count(), creates);
+	UT_ASSERT_EQ(
+		cluster_grd_entry_rebind_or_insert_holder(&request.resid, &holder, 1, AccessExclusiveLock),
+		CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_holder_observe(&request.resid, &holder, generation, &mode),
+				 CLUSTER_GRD_HOLDER_PRESENT);
+	UT_ASSERT_EQ(mode, AccessExclusiveLock);
+	for (int field = 0; field < 3; field++) {
+		other = holder;
+		if (field == 0)
+			other.node_id = 2;
+		else if (field == 1)
+			other.procno++;
+		else
+			other.request_id++;
+		UT_ASSERT_EQ(cluster_grd_holder_observe(&request.resid, &other, generation, &mode),
+					 CLUSTER_GRD_HOLDER_ABSENT);
+		UT_ASSERT_EQ(mode, NoLock);
+	}
+	capacity_expect_counts(1, 1);
+	capacity_release_present(&request.resid, &holder);
+	UT_ASSERT_EQ(cluster_grd_holder_observe(&request.resid, &holder, generation, &mode),
+				 CLUSTER_GRD_HOLDER_ABSENT);
+	capacity_expect_counts(0, 0);
+	MyProc = NULL;
+}
+
+UT_TEST(exact_holder_observation_unknown_on_wrong_cut_or_missing_service)
+{
+	ClusterLockAcquireRequest request;
+	ClusterGrdHolderId holder;
+	uint64 generation;
+	uint32 shard;
+	LOCKMODE mode = AccessExclusiveLock;
+
+	capacity_setup(&request, &holder);
+	UT_ASSERT_EQ(cluster_grd_lookup_master_gen(&request.resid, &generation), 1);
+	shard = cluster_grd_shard_for_resource(&request.resid);
+	UT_ASSERT_EQ(cluster_grd_holder_observe(&request.resid, &holder, generation + 1, &mode),
+				 CLUSTER_GRD_HOLDER_UNKNOWN);
+	UT_ASSERT_EQ(mode, NoLock);
+	cluster_node_id = 2;
+	UT_ASSERT_EQ(cluster_grd_holder_observe(&request.resid, &holder, generation, &mode),
+				 CLUSTER_GRD_HOLDER_UNKNOWN);
+	cluster_node_id = 1;
+	holder.cluster_epoch++;
+	UT_ASSERT_EQ(cluster_grd_holder_observe(&request.resid, &holder, generation, &mode),
+				 CLUSTER_GRD_HOLDER_UNKNOWN);
+	holder.cluster_epoch--;
+	cluster_grd_shard_set_phase(shard, GRD_SHARD_FROZEN);
+	UT_ASSERT_EQ(cluster_grd_holder_observe(&request.resid, &holder, generation, &mode),
+				 CLUSTER_GRD_HOLDER_UNKNOWN);
+	cluster_grd_shard_set_phase(shard, GRD_SHARD_NORMAL);
+	grd_lifecycle_reset(0);
+	UT_ASSERT_EQ(cluster_grd_holder_observe(&request.resid, &holder, generation, &mode),
+				 CLUSTER_GRD_HOLDER_UNKNOWN);
+	UT_ASSERT_EQ(mode, NoLock);
+	MyProc = NULL;
+}
+
+UT_TEST(exact_holder_observation_retains_queued_request_and_conversion)
+{
+	ClusterLockAcquireRequest request;
+	ClusterGrdHolderId first, waiter;
+	uint64 generation;
+	LOCKMODE mode;
+
+	capacity_setup(&request, &first);
+	waiter = capacity_holder(5);
+	UT_ASSERT_EQ(cluster_grd_lookup_master_gen(&request.resid, &generation), 1);
+	UT_ASSERT_EQ(capacity_acquire(&request.resid, &first), CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(
+					 &request.resid, &waiter, waiter.node_id, waiter.request_id, generation,
+					 GES_REQ_OPCODE_REQUEST, AccessExclusiveLock, NULL, NULL),
+				 CLUSTER_GRD_ENQUEUED_WAITER);
+	UT_ASSERT_EQ(cluster_grd_holder_observe(&request.resid, &waiter, generation, &mode),
+				 CLUSTER_GRD_HOLDER_UNKNOWN);
+	capacity_expect_queues(1, 1, 1, 0);
+	UT_ASSERT_EQ(cluster_grd_cancel_waiter_by_id(&request.resid, &waiter), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(capacity_acquire(&request.resid, &waiter), CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ(cluster_grd_convert_or_enqueue(&request.resid, waiter.node_id, waiter.procno,
+												waiter.cluster_epoch, RowExclusiveLock,
+												AccessExclusiveLock, waiter.request_id + 1,
+												waiter.node_id, generation, NULL, NULL),
+				 CLUSTER_GRD_CONVERT_ENQUEUED);
+	waiter.request_id++;
+	UT_ASSERT_EQ(cluster_grd_holder_observe(&request.resid, &waiter, generation, &mode),
+				 CLUSTER_GRD_HOLDER_UNKNOWN);
+	capacity_expect_queues(1, 2, 0, 1);
+	MyProc = NULL;
+}
+
+UT_TEST(exact_holder_observation_retains_unpromoted_reservation)
+{
+	ClusterLockAcquireRequest request;
+	ClusterGrdHolderId holder;
+	uint64 generation;
+	LOCKMODE mode;
+
+	capacity_setup(&request, &holder);
+	request.locktag.locktag_type = LOCKTAG_RELATION;
+	request.lockmode = RowExclusiveLock;
+	request.request_id = 3001;
+	UT_ASSERT_EQ(cluster_lock_acquire_s3_partition_reservation(&request),
+				 CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(cluster_grd_lookup_master_gen(&request.resid, &generation), 1);
+	UT_ASSERT_EQ(cluster_grd_holder_observe(&request.resid, &request.holder, generation, &mode),
+				 CLUSTER_GRD_HOLDER_UNKNOWN);
+	UT_ASSERT_EQ(mode, NoLock);
+	UT_ASSERT_EQ(cluster_lock_acquire_s7_cleanup(&request), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(cluster_grd_holder_observe(&request.resid, &request.holder, generation, &mode),
+				 CLUSTER_GRD_HOLDER_ABSENT);
+	MyProc = NULL;
+}
+
+UT_TEST(exact_holder_protocol_uses_real_ingress_ges_work_and_grd)
+{
+	ClusterLockAcquireRequest request;
+	ClusterGrdHolderId holder;
+	ClusterGesHolderProbe query = { 0 };
+	ClusterICEnvelope env = { 0 };
+	uint8 bytes[80];
+	bool saved_enabled = cluster_enabled;
+	bool saved_shared = cluster_shared_config;
+
+	capacity_setup(&request, &holder);
+	cluster_enabled = cluster_shared_config = true;
+	ut_admitted_incarnation = 11;
+	ut_remote_boot = 0;
+	ut_qvotec_quorum = true;
+	ut_member_mask = 15;
+	MyBackendType = B_LMON;
+	holder_protocol_active = true;
+	holder_protocol_pending = false;
+	holder_protocol_sends = holder_protocol_deliveries = 0;
+	hw_probe_work_enqueue = holder_protocol_enqueue;
+	hw_probe_work_dequeue = holder_protocol_dequeue;
+	query.resid = request.resid;
+	query.holder = holder;
+	query.nonce = 2001;
+	UT_ASSERT_EQ(cluster_grd_lookup_master_gen(&query.resid, &query.master_generation), 1);
+	query.collector_boot = cluster_membership_get_last_admitted_incarnation(2);
+	query.master_boot = cluster_qvotec_get_self_incarnation();
+	UT_ASSERT_EQ(
+		cluster_grd_entry_rebind_or_insert_holder(&query.resid, &holder, 1, AccessExclusiveLock),
+		CLUSTER_GRD_ENTRY_OK);
+	for (int pass = 0; pass < 2; pass++) {
+		cluster_node_id = 1;
+		if (pass == 1)
+			capacity_release_present(&query.resid, &holder);
+		UT_ASSERT(cluster_ges_holder_probe_encode(&query, bytes, sizeof(bytes)));
+		env.source_node_id = 2;
+		env.epoch = holder.cluster_epoch;
+		env.payload_length = sizeof(bytes);
+		cluster_ges_holder_probe_ingress(&env, bytes);
+		UT_ASSERT(holder_protocol_pending);
+		UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
+		UT_ASSERT_EQ(holder_protocol_sends, pass + 1);
+		capacity_expect_counts(pass == 0 ? 1 : 0, pass == 0 ? 1 : 0);
+		cluster_node_id = 2;
+		env.source_node_id = 1;
+		cluster_ges_holder_probe_ingress(&env, holder_protocol_wire);
+		UT_ASSERT_EQ(holder_protocol_deliveries, pass + 1);
+		UT_ASSERT_EQ(holder_protocol_result.observation,
+					 pass == 0 ? CLUSTER_GRD_HOLDER_PRESENT : CLUSTER_GRD_HOLDER_ABSENT);
+		UT_ASSERT_EQ(holder_protocol_result.mode, pass == 0 ? AccessExclusiveLock : NoLock);
+		UT_ASSERT_EQ(holder_protocol_result.nonce, query.nonce);
+		query.nonce++;
+	}
+	hw_probe_work_enqueue = NULL;
+	hw_probe_work_dequeue = NULL;
+	holder_protocol_active = false;
+	cluster_enabled = saved_enabled;
+	cluster_shared_config = saved_shared;
+	MyBackendType = B_BACKEND;
+	MyProc = NULL;
+}
+
 int
 main(void)
 {
 	MyBackendType = B_BACKEND;
 	setvbuf(stdout, NULL, _IONBF, 0);
 	alarm(30); /* Same standalone watchdog; no product deadline is changed. */
-	UT_PLAN(35);
+	UT_PLAN(40);
 	UT_RUN(first_grd_attach_preserves_temporary_error_cleanup_scope);
 	UT_RUN(compatible_16_control_releases_exact_owners);
 	UT_RUN(compatible_17_owners_are_all_granted);
@@ -1787,6 +2042,11 @@ main(void)
 	UT_RUN(real_lmon_release_waiter_snapshot_oom_delivers_grants_and_retracts_all_old_edges);
 	UT_RUN(control_retire_holder_snapshot_oom_delivers_grants_and_retracts_all_old_edges);
 	UT_RUN(control_retire_waiter_snapshot_oom_delivers_grants_and_retracts_all_old_edges);
+	UT_RUN(exact_holder_observation_never_creates_or_mutates_grants);
+	UT_RUN(exact_holder_observation_unknown_on_wrong_cut_or_missing_service);
+	UT_RUN(exact_holder_observation_retains_queued_request_and_conversion);
+	UT_RUN(exact_holder_observation_retains_unpromoted_reservation);
+	UT_RUN(exact_holder_protocol_uses_real_ingress_ges_work_and_grd);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

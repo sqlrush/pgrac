@@ -419,11 +419,13 @@ typedef enum ClusterICPlane {
 /* P0-14 R2: versioned object-drain PKO3/READY contract.  This is deliberately
  * independent from the legacy structural receipt capability above. */
 #define PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3 UINT32_C(0x04000000)
+/* Versioned transactional fence markers and exact holder observations. */
+#define PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1 UINT32_C(0x08000000)
 
 /* Stage 8 R10 D10-03: complete capability allocation census.  Sum equals OR
  * iff no separately named single-bit allocation collides.  Keep the two
  * intentionally reserved holes (0x00004000 and 0x00040000) outside the mask. */
-#define PGRAC_IC_HELLO_CAP_DEFINED_COUNT 25
+#define PGRAC_IC_HELLO_CAP_DEFINED_COUNT 26
 #define PGRAC_IC_HELLO_CAP_DEFINED_MASK                                                            \
 	(PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2 | PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1         \
 	 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1 | PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1                       \
@@ -436,8 +438,8 @@ typedef enum ClusterICPlane {
 	 | PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1 | PGRAC_IC_HELLO_CAP_CONTROL_ROOT_V1           \
 	 | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1 | PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1  \
 	 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1 | PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V3                 \
-	 | PGRAC_IC_HELLO_CAP_KO_SHARED_V2 | PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2                  \
-	 | PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3)
+	 | PGRAC_IC_HELLO_CAP_KO_SHARED_V2 | PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2                       \
+	 | PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3 | PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1)
 #define PGRAC_IC_HELLO_CAP_DEFINED_SUM                                                             \
 	(PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2 + PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1         \
 	 + PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1 + PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1                       \
@@ -450,8 +452,8 @@ typedef enum ClusterICPlane {
 	 + PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1 + PGRAC_IC_HELLO_CAP_CONTROL_ROOT_V1           \
 	 + PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1 + PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1  \
 	 + PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1 + PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V3                 \
-	 + PGRAC_IC_HELLO_CAP_KO_SHARED_V2 + PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2                  \
-	 + PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3)
+	 + PGRAC_IC_HELLO_CAP_KO_SHARED_V2 + PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2                       \
+	 + PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3 + PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1)
 #define PGRAC_IC_HELLO_CAP_IS_SINGLE_BIT(cap) ((cap) != 0 && (((cap) & ((cap) - 1)) == 0))
 StaticAssertDecl(PGRAC_IC_HELLO_CAP_DEFINED_SUM == PGRAC_IC_HELLO_CAP_DEFINED_MASK,
 				 "PGRAC HELLO capability allocations collide");

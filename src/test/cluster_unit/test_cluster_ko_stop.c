@@ -8,6 +8,7 @@
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_hw_lease.h"
 #include "cluster/cluster_grd.h"
+#include "cluster/cluster_ges_holder.h"
 #include "cluster/cluster_ko.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_page_wal.h"
@@ -24,6 +25,18 @@
  * runtime into this standalone binary. Dedicated v3 tests provide the wire
  * coverage; these stubs ensure the old stop contract remains linkable. */
 static bool v3_route_live;
+static int holder_probe_sends;
+static bool holder_probe_send_ok = true;
+static TimestampTz holder_probe_clock = 1;
+static ClusterGesHolderProbe holder_probe_sent;
+bool
+cluster_ges_holder_probe_send(int32 master, const ClusterGesHolderProbe *probe)
+{
+	holder_probe_sends++;
+	holder_probe_sent = *probe;
+	return holder_probe_send_ok;
+}
+
 static int32 v3_route_master_node;
 static uint64 v3_route_generation;
 
@@ -566,7 +579,7 @@ RecoveryInProgress(void)
 TimestampTz
 GetCurrentTimestamp(void)
 {
-	return 1;
+	return holder_probe_clock;
 }
 void
 ResetLatch(Latch *latch)
@@ -744,8 +757,8 @@ cluster_shmem_register_region(const ClusterShmemRegion *region)
 bool
 cluster_normal_stop_service_new_work(bool modifies_data)
 {
-	Assert(modifies_data);
-	gate_calls++;
+	if (modifies_data)
+		gate_calls++;
 	return gate_admit;
 }
 
@@ -5651,11 +5664,130 @@ UT_TEST(test_peer_fence_shmem_creation_initializes_but_attachment_retains)
 	UT_ASSERT_EQ(ko_state->peer_fence_serial, 9);
 }
 
+UT_TEST(test_peer_holder_probe_exact_reply_is_observation_only)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(701);
+	ClusterKoPeerFenceHandleV3 h;
+	ClusterKoPeerFenceStateV3 state;
+	ClusterGesHolderProbe reply;
+	ClusterGrdHolderObservation observation;
+	LOCKMODE mode;
+
+	holder_probe_sends = 0;
+	holder_probe_send_ok = true;
+	holder_probe_clock = 1;
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &h, &state));
+	UT_ASSERT(cluster_ko_peer_holder_begin_v3(&h));
+	UT_ASSERT(!cluster_ko_peer_holder_result_v3(&h, &observation, &mode));
+	MyBackendType = B_LMON;
+	MyAuxProcType = LmonProcess;
+	cluster_ko_lmon_tick_v2();
+	UT_ASSERT_EQ(holder_probe_sends, 1);
+	cluster_ko_lmon_tick_v2();
+	UT_ASSERT_EQ(holder_probe_sends, 1);
+	reply = holder_probe_sent;
+	reply.reply = true;
+	reply.observation = CLUSTER_GRD_HOLDER_PRESENT;
+	reply.mode = AccessExclusiveLock;
+	for (int field = 0; field < 6; field++) {
+		ClusterGesHolderProbe bad = reply;
+		if (field == 0)
+			bad.nonce++;
+		if (field == 1)
+			bad.holder.request_id++;
+		if (field == 2)
+			bad.resid.field2++;
+		if (field == 3)
+			bad.collector_boot++;
+		if (field == 4)
+			bad.master_boot++;
+		if (field == 5)
+			bad.master_generation++;
+		cluster_ko_peer_holder_observed(request.ax_master_node, &bad);
+		MyBackendType = B_SINVAL_BCAST;
+		MyAuxProcType = SinvalBcastProcess;
+		UT_ASSERT(!cluster_ko_peer_holder_result_v3(&h, &observation, &mode));
+		MyBackendType = B_LMON;
+		MyAuxProcType = LmonProcess;
+	}
+	cluster_ko_peer_holder_observed(request.ax_master_node + 1, &reply);
+	MyBackendType = B_SINVAL_BCAST;
+	MyAuxProcType = SinvalBcastProcess;
+	UT_ASSERT(!cluster_ko_peer_holder_result_v3(&h, &observation, &mode));
+	MyBackendType = B_LMON;
+	MyAuxProcType = LmonProcess;
+	cluster_ko_peer_holder_observed(request.ax_master_node, &reply);
+	MyBackendType = B_SINVAL_BCAST;
+	MyAuxProcType = SinvalBcastProcess;
+	UT_ASSERT(cluster_ko_peer_holder_result_v3(&h, &observation, &mode));
+	UT_ASSERT_EQ(observation, CLUSTER_GRD_HOLDER_PRESENT);
+	UT_ASSERT_EQ(mode, AccessExclusiveLock);
+	UT_ASSERT_EQ(ko_state->peer_fences[h.slot].state, CLUSTER_KO_PEER_FENCE_ACTIVE);
+	UT_ASSERT_EQ(flush_count, 0);
+	UT_ASSERT_EQ(drop_count, 0);
+	UT_ASSERT_EQ(ko_state->send_v3_count, 0);
+}
+
+UT_TEST(test_peer_holder_probe_refresh_retry_and_late_reply_keep_owner)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(702);
+	ClusterKoPeerFenceHandleV3 h, stale;
+	ClusterKoPeerFenceStateV3 state;
+	ClusterGesHolderProbe old_reply, reply;
+	ClusterGrdHolderObservation observation;
+	LOCKMODE mode;
+
+	holder_probe_sends = 0;
+	holder_probe_send_ok = false;
+	holder_probe_clock = 1;
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &h, &state));
+	UT_ASSERT(cluster_ko_peer_holder_begin_v3(&h));
+	MyBackendType = B_LMON;
+	MyAuxProcType = LmonProcess;
+	cluster_ko_lmon_tick_v2();
+	UT_ASSERT_EQ(holder_probe_sends, 1);
+	old_reply = holder_probe_sent;
+	holder_probe_clock += 100000;
+	cluster_ko_lmon_tick_v2();
+	UT_ASSERT_EQ(holder_probe_sends, 2);
+	UT_ASSERT_EQ(holder_probe_sent.nonce, old_reply.nonce);
+	MyBackendType = B_SINVAL_BCAST;
+	MyAuxProcType = SinvalBcastProcess;
+	UT_ASSERT(cluster_ko_peer_holder_begin_v3(&h));
+	MyBackendType = B_LMON;
+	MyAuxProcType = LmonProcess;
+	holder_probe_send_ok = true;
+	cluster_ko_lmon_tick_v2();
+	UT_ASSERT_EQ(holder_probe_sends, 3);
+	UT_ASSERT_NE(holder_probe_sent.nonce, old_reply.nonce);
+	reply = holder_probe_sent;
+	old_reply.reply = reply.reply = true;
+	old_reply.observation = reply.observation = CLUSTER_GRD_HOLDER_ABSENT;
+	cluster_ko_peer_holder_observed(request.ax_master_node, &old_reply);
+	MyBackendType = B_SINVAL_BCAST;
+	MyAuxProcType = SinvalBcastProcess;
+	UT_ASSERT(!cluster_ko_peer_holder_result_v3(&h, &observation, &mode));
+	MyBackendType = B_LMON;
+	MyAuxProcType = LmonProcess;
+	cluster_ko_peer_holder_observed(request.ax_master_node, &reply);
+	MyBackendType = B_SINVAL_BCAST;
+	MyAuxProcType = SinvalBcastProcess;
+	UT_ASSERT(cluster_ko_peer_holder_result_v3(&h, &observation, &mode));
+	UT_ASSERT_EQ(observation, CLUSTER_GRD_HOLDER_ABSENT);
+	UT_ASSERT_EQ(ko_state->peer_fences[h.slot].state, CLUSTER_KO_PEER_FENCE_ACTIVE);
+	stale = h;
+	stale.serial++;
+	UT_ASSERT(!cluster_ko_peer_holder_result_v3(&stale, &observation, &mode));
+	v3_route_generation++;
+	UT_ASSERT(!cluster_ko_peer_holder_result_v3(&h, &observation, &mode));
+	holder_probe_clock = 1;
+}
+
 int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(124);
+	UT_PLAN(126);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
 	UT_RUN(test_peer_space_entry_checks_precede_io);
@@ -5780,6 +5912,8 @@ main(void)
 	UT_RUN(test_peer_committed_request_cannot_reenter_ingress_or_physical_owner);
 	UT_RUN(test_peer_terminal_binds_operation_across_authenticated_publication_retarget);
 	UT_RUN(test_peer_fence_shmem_creation_initializes_but_attachment_retains);
+	UT_RUN(test_peer_holder_probe_exact_reply_is_observation_only);
+	UT_RUN(test_peer_holder_probe_refresh_retry_and_late_reply_keep_owner);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

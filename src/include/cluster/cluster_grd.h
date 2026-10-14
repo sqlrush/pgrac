@@ -1052,6 +1052,21 @@ typedef struct ClusterGrdHolderId {
 
 StaticAssertDecl(sizeof(ClusterGrdHolderId) == 24, "ClusterGrdHolderId 4-tuple ABI 24-byte lock");
 
+/* A read-only current-master observation, never a release or replay barrier.
+ * UNKNOWN includes queued acquisition/conversion/reservation of this identity.
+ * Even ABSENT does not exclude future arrivals on an unordered transport. */
+typedef enum ClusterGrdHolderObservation {
+	CLUSTER_GRD_HOLDER_UNKNOWN = 0,
+	CLUSTER_GRD_HOLDER_PRESENT = 1,
+	CLUSTER_GRD_HOLDER_ABSENT = 2
+} ClusterGrdHolderObservation;
+
+extern ClusterGrdHolderObservation cluster_grd_holder_observe(const ClusterResId *resid,
+															  const ClusterGrdHolderId *holder,
+															  uint64 master_generation,
+															  LOCKMODE *mode_out);
+
+
 /*
  * spec-5.8 D1c/D1e — waiter deadlock metadata threaded from the waiting
  * backend's D1d wait-state into the master-side WFG vertex.  Neither field is
