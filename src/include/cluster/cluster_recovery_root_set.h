@@ -11,6 +11,7 @@
 
 #include "cluster/cluster_recovery_namespace.h"
 #include "cluster/cluster_page_stable_base.h"
+#include "cluster/cluster_space_identity.h"
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -73,6 +74,13 @@ extern ClusterRecoveryRootsResult cluster_recovery_root_set_step(ClusterRecovery
 extern uint32 cluster_recovery_root_set_count(const ClusterRecoveryRootSet *roots);
 extern const ClusterRecoveryRootEntry *
 cluster_recovery_root_set_entry(const ClusterRecoveryRootSet *roots, uint32 index);
+/* Bind one canonical relation candidate to this observed namespace and find
+ * its SPACE candidate. UINT32_MAX means no SPACE candidate, never permission
+ * to ignore the relation. No I/O or authority acquisition. */
+extern ClusterRecoveryRootsResult cluster_recovery_root_set_relation(ClusterRecoveryRootSet *roots,
+																	 uint32 index,
+																	 ClusterSpaceIdentityKey *key,
+																	 uint32 *space_index);
 /* Compare the observed namespace binding only; this is not ROOT authority. */
 extern bool cluster_recovery_root_set_namespace_matches(const ClusterRecoveryRootSet *roots,
 														uint64 system_identifier,

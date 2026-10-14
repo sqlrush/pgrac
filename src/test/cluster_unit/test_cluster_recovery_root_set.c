@@ -577,6 +577,7 @@ UT_TEST(test_long_collision_chain_exhausts_budget_without_omitting_a_root)
 	remove_root(fd);
 }
 
+#ifndef RECOVERY_ROOT_SET_FIXTURE_ONLY
 int
 main(void)
 {
@@ -601,3 +602,4 @@ main(void)
 	UT_DONE();
 	return ut_failed_count != 0;
 }
+#endif

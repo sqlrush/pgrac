@@ -325,6 +325,10 @@ roots_digest_step(ClusterRecoveryRootSet *roots)
 		const ClusterRecoveryRootEntry *entry = &roots->entries[roots->order[roots->hash_at++]];
 		size_t length = strlen(entry->file.path);
 
+		/* Merge scratch is no longer needed: keep the sorted rank for exact
+		 * bounded lookup after OBSERVED, without a second linear scan. */
+		roots->merge[roots->order[roots->hash_at - 1]] = roots->hash_at - 1;
+
 		if (!roots_hash_number(roots->set_hash, length, 4)
 			|| pg_cryptohash_update(roots->set_hash, (const uint8 *)entry->file.path, length) < 0
 			|| !roots_hash_number(roots->set_hash, entry->file.kind, 4)
@@ -478,6 +482,42 @@ cluster_recovery_root_set_namespace_matches(const ClusterRecoveryRootSet *roots,
 	return roots != NULL && roots->status == CLUSTER_RECOVERY_ROOTS_OBSERVED
 		   && roots->system_identifier == system_identifier
 		   && roots->database_incarnation == database_incarnation;
+}
+
+ClusterRecoveryRootsResult
+cluster_recovery_root_set_relation(ClusterRecoveryRootSet *roots, uint32 index,
+								   ClusterSpaceIdentityKey *key, uint32 *space_index)
+{
+	const ClusterRecoveryRootEntry *entry;
+	char path[MAXPGPATH];
+	uint32 at;
+
+	if (key != NULL)
+		memset(key, 0, sizeof(*key));
+	if (space_index != NULL)
+		*space_index = UINT32_MAX;
+	if (roots == NULL)
+		return CLUSTER_RECOVERY_ROOTS_INVALID;
+	if (roots->status > CLUSTER_RECOVERY_ROOTS_OBSERVED)
+		return roots->status;
+	entry = cluster_recovery_root_set_entry(roots, index);
+	if (key == NULL || space_index == NULL || entry == NULL
+		|| entry->file.kind != CLUSTER_RECOVERY_FILE_RELATION)
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	if (entry->file.locator.spcOid == GLOBALTABLESPACE_OID)
+		snprintf(path, sizeof(path), "global/%u_space", entry->file.locator.relNumber);
+	else
+		snprintf(path, sizeof(path), "base/%u/%u_space", entry->file.locator.dbOid,
+				 entry->file.locator.relNumber);
+	if (roots_lookup(roots, path, false, &at))
+		*space_index = roots->merge[at];
+	if (roots->status != CLUSTER_RECOVERY_ROOTS_OBSERVED)
+		return roots->status;
+	key->system_identifier = roots->system_identifier;
+	key->database_incarnation = roots->database_incarnation;
+	memcpy(key->storage_uuid, roots->storage_uuid, 16);
+	key->locator = entry->file.locator;
+	return CLUSTER_RECOVERY_ROOTS_OBSERVED;
 }
 
 static ClusterRecoveryRootsResult

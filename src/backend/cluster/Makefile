@@ -114,6 +114,7 @@ OBJS = \
 	cluster_recovery_namespace.o \
 	cluster_recovery_root_set.o \
 	cluster_recovery_undo_store.o \
+	cluster_recovery_relation_scan.o \
 	cluster_recovery_heap_scan.o \
 	cluster_recovery_undo_scan.o \
 	cluster_recovery_reference_graph.o \
