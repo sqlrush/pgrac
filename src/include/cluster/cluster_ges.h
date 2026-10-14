@@ -540,6 +540,9 @@ typedef struct ClusterGesHwGrant {
 	/* Exact requester registration, including local-master confirmation. */
 	bool local_promoted;
 	bool consumed;
+	/* P0-14 R2: S5 captured an exact relation grant before consuming it.
+	 * Process-local provenance only; never a wire or permission by itself. */
+	bool registration_proof;
 } ClusterGesHwGrant;
 
 /* Process-owned reconstruction exchange, never a fresh lock grant. Keep the

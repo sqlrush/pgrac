@@ -454,6 +454,12 @@ typedef struct LOCALLOCK
 	bool		cluster_registered;	/* PGRAC: true iff S5 promote success */
 	uint64		cluster_request_id;	/* PGRAC: from req.request_id */
 	uint8		cluster_holder_raw[24];	/* PGRAC: ClusterGrdHolderId byte-image */
+	/* P0-14 R2: exact AX registration evidence retained with this
+	 * LOCALLOCK. These fields are backend-local only; they are not a
+	 * substitute for a fresh grant and never enter a wire or WAL record. */
+	bool		cluster_ax_binding_valid;
+	int32		cluster_ax_master_node;
+	uint64		cluster_ax_master_generation;
 	/*
 	 * PGRAC: spec-5.3 §3.1a convert release-ownership markers.  Set on the
 	 * NEW (stronger-mode) LOCALLOCK when it became the cluster owner via a

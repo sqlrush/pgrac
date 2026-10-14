@@ -710,6 +710,7 @@ cluster_lock_acquire_s5_promote_once(const ClusterLockAcquireRequest *req)
 					promoted = cluster_lock_acquire_retained_grant_is_current(req, &pending);
 				}
 				if (promoted) {
+					grant->registration_proof = true;
 					grant->consumed = true;
 					grant->cleanup_pending = false;
 					mut->registration_failure_reason = NULL;

@@ -249,6 +249,15 @@ typedef struct ClusterLockReleaseRequest {
 extern ClusterLockAcquireResult
 cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req);
 
+/* P0-14 R2: return exact AX registration evidence retained by LOCALLOCK for
+ * a relation lock still held by this backend. The lookup does not recreate an
+ * already-consumed grant; callers still bind the result to their operation. */
+extern bool cluster_lock_current_ax_binding(const LOCKTAG *locktag,
+												ClusterGrdHolderId *holder_out,
+												uint64 *request_id_out,
+												int32 *master_node_out,
+												uint64 *master_generation_out);
+
 
 /*
  * spec-5.3 D1 — decide REQUEST vs CONVERT for the cluster acquire path.

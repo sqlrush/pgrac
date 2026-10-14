@@ -56,6 +56,8 @@
 #include "storage/relfilelocator.h" /* RelFileLocator */
 #include "storage/lock.h"			/* LOCKTAG_LAST_TYPE */
 
+struct RelationData;
+
 /*
  * CLUSTER_KO_RESID_TYPE -- KO resource-id namespace marker.  Above every PG
  * LockTagType, distinct from SQ (0xF0) / CF (0xF1) / HW (0xF2) / DL (0xF3) /
@@ -235,6 +237,9 @@ StaticAssertDecl(sizeof(KoFlushAckHeader) == 24, "spec-5.7 D6 KoFlushAckHeader w
  * no data.
  */
 extern void cluster_ko_flush_and_wait_ack(RelFileLocator rlocator, char relpersistence);
+/* R2 relation entry: bind the v3 barrier to the caller's registered AX grant. */
+extern void cluster_ko_flush_and_wait_ack_relation(struct RelationData *rel,
+																	char relpersistence, uint16 operation);
 
 #ifdef USE_PGRAC_CLUSTER
 /* Original barrier's process/ResourceOwner-local completion. The caller still

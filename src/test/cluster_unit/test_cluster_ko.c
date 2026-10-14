@@ -430,10 +430,26 @@ UT_TEST(shared_v3_wire_binds_ax_and_rejects_v2_or_reserved)
 	UT_ASSERT(!cluster_ko_shared_ack_matches_v3(&request, &ack));
 }
 
+UT_TEST(shared_v3_codec_allows_remote_ges_holder_identity)
+{
+	ClusterKoSharedMessageV3 request = shared_v3_fixture(), out;
+	uint8 bytes[CLUSTER_KO_SHARED_V3_BYTES];
+
+	/* Codec validation carries the holder identity and membership proof. The
+	 * GES holder may be a peer; the producer binds local origin ownership in
+	 * ko_shared_prepare_request_v3 before this wire is admitted. */
+	request.ax_holder.node_id = request.base.peer_node;
+	request.ax_master_node = request.base.peer_node;
+	UT_ASSERT(cluster_ko_shared_encode_v3(&request, bytes, sizeof(bytes)));
+	UT_ASSERT(cluster_ko_shared_decode_v3(bytes, sizeof(bytes), &out));
+	UT_ASSERT_EQ(out.ax_holder.node_id, request.base.peer_node);
+	UT_ASSERT_EQ(out.ax_master_node, request.base.peer_node);
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_ko_resid_encode);
 	UT_RUN(test_ko_resid_namespace_distinct);
 	UT_RUN(test_ko_vs_dl_resid_distinct);
@@ -446,6 +462,7 @@ main(void)
 	UT_RUN(shared_codecs_refuse_alias_and_null_without_output_mutation);
 	UT_RUN(shared_wire_accepts_highest_node_without_truncating_bitmap);
 	UT_RUN(shared_v3_wire_binds_ax_and_rejects_v2_or_reserved);
+	UT_RUN(shared_v3_codec_allows_remote_ges_holder_identity);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

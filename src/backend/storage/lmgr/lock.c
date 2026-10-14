@@ -623,6 +623,37 @@ GetLockMethodLocalHash(void)
 {
 	return LockMethodLocalHash;
 }
+
+#ifdef USE_PGRAC_CLUSTER
+bool
+cluster_lock_current_ax_binding(const LOCKTAG *locktag, ClusterGrdHolderId *holder_out,
+								uint64 *request_id_out, int32 *master_node_out,
+								uint64 *master_generation_out)
+{
+	LOCALLOCKTAG localtag;
+	LOCALLOCK *locallock;
+
+	if (locktag == NULL || locktag->locktag_type != LOCKTAG_RELATION
+		|| holder_out == NULL || request_id_out == NULL || master_node_out == NULL
+		|| master_generation_out == NULL || LockMethodLocalHash == NULL)
+		return false;
+	MemSet(&localtag, 0, sizeof(localtag));
+	localtag.lock = *locktag;
+	localtag.mode = AccessExclusiveLock;
+	locallock = (LOCALLOCK *)hash_search(LockMethodLocalHash, &localtag, HASH_FIND, NULL);
+	if (locallock == NULL || locallock->nLocks <= 0 || !locallock->cluster_registered
+		|| !locallock->cluster_ax_binding_valid || locallock->cluster_request_id == 0
+		|| locallock->cluster_ax_master_node < 0
+		|| locallock->cluster_ax_master_generation == 0)
+		return false;
+	memcpy(holder_out, locallock->cluster_holder_raw, sizeof(*holder_out));
+	*request_id_out = locallock->cluster_request_id;
+	*master_node_out = locallock->cluster_ax_master_node;
+	*master_generation_out = locallock->cluster_ax_master_generation;
+	return holder_out->node_id < (uint32)CLUSTER_MAX_NODES
+		   && holder_out->cluster_epoch != 0 && holder_out->request_id == *request_id_out;
+}
+#endif
 #endif
 
 /*
@@ -851,6 +882,21 @@ pgrac_cluster_post_native_register(LOCALLOCK *locallock, ClusterLockAcquireReque
 	locallock->cluster_request_id = cluster_req->request_id;
 	memcpy(locallock->cluster_holder_raw, &cluster_req->holder,
 		   sizeof(locallock->cluster_holder_raw));
+	locallock->cluster_ax_binding_valid = false;
+	locallock->cluster_ax_master_node = -1;
+	locallock->cluster_ax_master_generation = 0;
+	if (locktag->locktag_type == LOCKTAG_RELATION && lockmode == AccessExclusiveLock
+		&& cluster_req->hw_grant.registration_proof
+		&& cluster_req->hw_grant.master >= 0
+		&& cluster_req->hw_grant.master_generation != 0
+		&& cluster_ges_relation_grant_is_current(&cluster_req->hw_grant,
+																&cluster_req->resid, &cluster_req->holder,
+																cluster_req->request_id,
+																AccessExclusiveLock, false)) {
+		locallock->cluster_ax_binding_valid = true;
+		locallock->cluster_ax_master_node = cluster_req->hw_grant.master;
+		locallock->cluster_ax_master_generation = cluster_req->hw_grant.master_generation;
+	}
 
 	if (cluster_req->op == CLUSTER_LOCK_OP_CONVERT && cluster_lold != NULL) {
 		/* §3.1a T3 — ownership transfer L_old -> L_new (net-zero count). */
@@ -859,6 +905,9 @@ pgrac_cluster_post_native_register(LOCALLOCK *locallock, ClusterLockAcquireReque
 		cluster_lold->cluster_registered = false;
 		cluster_lold->cluster_request_id = 0;
 		memset(cluster_lold->cluster_holder_raw, 0, sizeof(cluster_lold->cluster_holder_raw));
+		cluster_lold->cluster_ax_binding_valid = false;
+		cluster_lold->cluster_ax_master_node = -1;
+		cluster_lold->cluster_ax_master_generation = 0;
 	} else {
 		/* PGRAC: spec-4.6 D3 — rebind-barrier scope count (fresh grant). */
 		pg_atomic_fetch_add_u32(&MyProc->cluster_grd_registered_count, 1);
@@ -1009,6 +1058,9 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 		locallock->cluster_registered = false;
 		locallock->cluster_request_id = 0;
 		memset(locallock->cluster_holder_raw, 0, sizeof(locallock->cluster_holder_raw));
+		locallock->cluster_ax_binding_valid = false;
+		locallock->cluster_ax_master_node = -1;
+		locallock->cluster_ax_master_generation = 0;
 		/* PGRAC: spec-5.3 §3.1a convert release-ownership markers. */
 		locallock->cluster_convert_old_request_id = 0;
 		locallock->cluster_convert_old_mode = 0;
@@ -2402,6 +2454,9 @@ LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 				lold->cluster_registered = true;
 				lold->cluster_request_id = locallock->cluster_convert_old_request_id;
 				memcpy(lold->cluster_holder_raw, &rb, sizeof(lold->cluster_holder_raw));
+				lold->cluster_ax_binding_valid = false;
+				lold->cluster_ax_master_node = -1;
+				lold->cluster_ax_master_generation = 0;
 				did_backout = true;
 			}
 		}
@@ -2421,6 +2476,9 @@ LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 			pg_atomic_fetch_sub_u32(&MyProc->cluster_grd_registered_count, 1);
 		}
 		locallock->cluster_registered = false;
+		locallock->cluster_ax_binding_valid = false;
+		locallock->cluster_ax_master_node = -1;
+		locallock->cluster_ax_master_generation = 0;
 		locallock->cluster_convert_old_request_id = 0;
 		locallock->cluster_convert_old_mode = 0;
 	}
@@ -2633,6 +2691,9 @@ LockReleaseAll(LOCKMETHODID lockmethodid, bool allLocks)
 			crel.cluster_registered = true;
 			cluster_lock_release(&crel);
 			locallock->cluster_registered = false;
+			locallock->cluster_ax_binding_valid = false;
+			locallock->cluster_ax_master_node = -1;
+			locallock->cluster_ax_master_generation = 0;
 			/* PGRAC: spec-4.6 D3 — rebind-barrier scope count. */
 			pg_atomic_fetch_sub_u32(&MyProc->cluster_grd_registered_count, 1);
 		}

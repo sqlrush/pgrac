@@ -282,7 +282,8 @@ RelationDropStorage(Relation rel)
 	 * barrier failure aborts the statement (the relfilenode survives intact).
 	 * No-op for temp relations / single-node / when the barrier is disabled.
 	 */
-	cluster_ko_flush_and_wait_ack(rel->rd_locator, rel->rd_rel->relpersistence);
+	cluster_ko_flush_and_wait_ack_relation(rel, rel->rd_rel->relpersistence,
+												CLUSTER_KO_SHARED_V3_OPERATION_DROP);
 #endif
 
 	/* Add the relation to the list of stuff to delete at commit */
@@ -389,7 +390,8 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	 * cross-node AccessExclusiveLock; ereport(ERROR 53RAA) on failure aborts the
 	 * truncation.  No-op for temp relations / single-node / when disabled.
 	 */
-	cluster_ko_flush_and_wait_ack(rel->rd_locator, rel->rd_rel->relpersistence);
+	cluster_ko_flush_and_wait_ack_relation(rel, rel->rd_rel->relpersistence,
+												CLUSTER_KO_SHARED_V3_OPERATION_TRUNCATE);
 #endif
 
 	/*
