@@ -23,10 +23,19 @@
  * route/LOCALLOCK probes fail-closed without pulling the full GRD/lock
  * runtime into this standalone binary. Dedicated v3 tests provide the wire
  * coverage; these stubs ensure the old stop contract remains linkable. */
+static bool v3_route_live;
+static int32 v3_route_master_node;
+static uint64 v3_route_generation;
+
 int32
 cluster_grd_lookup_master_gen(const ClusterResId *resid, uint64 *generation)
 {
 	(void)resid;
+	if (v3_route_live) {
+		if (generation != NULL)
+			*generation = v3_route_generation;
+		return v3_route_master_node;
+	}
 	if (generation != NULL)
 		*generation = 0;
 	return -1;
@@ -96,6 +105,7 @@ static uint64 current_epoch;
 static uint32 existing_forks, synced_forks;
 static int sync_count, sync_fail_fork, epoch_change_sync_fork;
 static bool epoch_change_flush, epoch_change_drop;
+static int v3_space_drift_sync;
 static bool shared_relation;
 static uint64 recorded_batch;
 static int record_count;
@@ -501,7 +511,13 @@ cluster_sf_peer_capability_word_sample(int32 peer_id, uint32 required, uint32 *w
 									   uint32 *generation)
 {
 	Assert(peer_id >= 0 && peer_id < CLUSTER_KO_SHARED_NODE_LIMIT && peer_id != cluster_node_id
-		   && required == PGRAC_IC_HELLO_CAP_KO_SHARED_V2);
+		   && (required == PGRAC_IC_HELLO_CAP_KO_SHARED_V2
+				|| required == PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3));
+	if (required == PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3) {
+		*word = required;
+		*generation = v3_route_live ? 19 : 0;
+		return v3_route_live;
+	}
 	*word = required;
 	*generation = peer_id == cap_zero_peer ? 0 : 19;
 	if (++cut_cap_samples[peer_id] > 1 && peer_id == cut_cap_change_peer)
@@ -855,6 +871,8 @@ smgrimmedsync(SMgrRelation smgr, ForkNumber fork)
 	if (fork == sync_fail_fork)
 		pg_re_throw();
 	synced_forks |= 1u << fork;
+	if (sync_count == v3_space_drift_sync)
+		space_identity.operation++;
 	if (fork == epoch_change_sync_fork)
 		current_epoch++;
 	if (boot_change_phase == 2)
@@ -932,6 +950,9 @@ reset_test(void)
 	cut_writer_samples = cut_writer_change_at = 0;
 	memset(cut_cap_samples, 0, sizeof(cut_cap_samples));
 	cut_cap_change_peer = -1;
+	v3_route_live = false;
+	v3_route_master_node = -1;
+	v3_route_generation = 0;
 	generation_race = cancel_wait = drive_shared_ack = false;
 	expecting_error = false;
 	reported_sqlstate = 0;
@@ -966,6 +987,7 @@ reset_test(void)
 	synced_forks = 0;
 	sync_count = 0;
 	sync_fail_fork = epoch_change_sync_fork = -1;
+	v3_space_drift_sync = -1;
 	epoch_change_flush = epoch_change_drop = false;
 	recorded_batch = 0;
 	record_count = 0;
@@ -1018,6 +1040,32 @@ shared_request(uint64 id, uint64 epoch)
 	m.peer_boot = boots[0];
 	return m;
 }
+
+static ClusterKoSharedMessageV3
+shared_v3_request(uint64 id)
+{
+	ClusterKoSharedMessageV3 m = { 0 };
+
+	m.base = shared_request(id, current_epoch);
+	m.base.key.locator.dbOid = 5;
+	m.ax_resid.field1 = 5;
+	m.ax_resid.field2 = 4242;
+	m.ax_resid.type = LOCKTAG_RELATION;
+	m.ax_resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	m.ax_holder.node_id = m.base.origin_node;
+	m.ax_holder.procno = 77;
+	m.ax_holder.cluster_epoch = m.base.epoch;
+	m.ax_holder.request_id = UINT64CONST(0x7172737475767778);
+	m.ax_request_id = m.ax_holder.request_id;
+	m.ax_master_generation = v3_route_generation;
+	m.ax_master_node = v3_route_master_node;
+	m.ax_mode = AccessExclusiveLock;
+	m.operation = CLUSTER_KO_SHARED_V3_OPERATION_DROP;
+	m.full_fork_mask = CLUSTER_KO_SHARED_V3_FULL_FORK_MASK;
+	m.space_mutation_token = 88;
+	return m;
+}
+
 static void
 enqueue_shared(const ClusterKoSharedMessageV2 *m)
 {
@@ -1026,6 +1074,19 @@ enqueue_shared(const ClusterKoSharedMessageV2 *m)
 	if (!cluster_ko_shared_encode_v2(m, bytes, sizeof(bytes)))
 		abort();
 	env.source_node_id = 1;
+	env.payload_length = sizeof(bytes);
+	cluster_ko_flush_request_handler(&env, bytes);
+}
+
+static void
+enqueue_shared_v3(const ClusterKoSharedMessageV3 *m)
+{
+	ClusterICEnvelope env = { 0 };
+	uint8 bytes[CLUSTER_KO_SHARED_V3_BYTES];
+
+	if (!cluster_ko_shared_encode_v3(m, bytes, sizeof(bytes)))
+		abort();
+	env.source_node_id = m->base.origin_node;
 	env.payload_length = sizeof(bytes);
 	cluster_ko_flush_request_handler(&env, bytes);
 }
@@ -5349,6 +5410,31 @@ UT_TEST(test_v3_peer_space_gate_uses_maintenance_identity)
 	UT_ASSERT_EQ(ordinary_space_locks, 0);
 }
 
+UT_TEST(test_v3_peer_rechecks_space_after_each_sync)
+{
+	ClusterKoSharedMessageV3 message;
+
+	reset_test();
+	cluster_shared_config = real_space_reader = true;
+	v3_route_live = true;
+	v3_route_master_node = 1;
+	v3_route_generation = 9;
+	space_identity.key.locator.dbOid = 5;
+	space_identity.sequence = 1;
+	space_identity.operation = 88;
+	v3_space_drift_sync = 1;
+	message = shared_v3_request(125);
+	enqueue_shared_v3(&message);
+	fixture_peer_drain();
+
+	/* The first fork sync mutates the retained SPACE token. The new per-fork
+	 * maintenance recheck must stop before the second sync or Drop. */
+	UT_ASSERT_EQ(sync_count, 1);
+	UT_ASSERT_EQ(drop_count, 0);
+	UT_ASSERT_EQ(ack_count, 0);
+	UT_ASSERT_EQ(ko_state->send_v3_count, 0);
+}
+
 UT_TEST(test_peer_current_refusal_at_either_read_releases_pin_without_ack)
 {
 	for (int at = 1; at <= 2; at++) {
@@ -5377,13 +5463,14 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(116);
+	UT_PLAN(117);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
 	UT_RUN(test_peer_space_entry_checks_precede_io);
 	UT_RUN(test_peer_space_checks_every_identity_field_and_keeps_origin_s);
 	UT_RUN(test_v3_space_gate_requires_exact_identity_and_mutation_token);
 	UT_RUN(test_v3_peer_space_gate_uses_maintenance_identity);
+	UT_RUN(test_v3_peer_rechecks_space_after_each_sync);
 	UT_RUN(test_peer_current_refusal_at_either_read_releases_pin_without_ack);
 	UT_RUN(test_real_admission_flush_drop_ack_order);
 	UT_RUN(test_origin_barrier_discards_lease_even_without_remote_work);

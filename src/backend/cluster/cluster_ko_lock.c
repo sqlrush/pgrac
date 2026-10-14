@@ -3529,8 +3529,10 @@ cluster_ko_drain_inbound_and_apply(void)
 				if (smgrexists(smgr, fork))
 					smgrimmedsync(smgr, fork);
 				if (slot.epoch != cluster_epoch_get_current()
-					|| (slot.shared && (slot.v3 ? !ko_shared_v3_control_current(&slot.qualified_v3)
-																					 : !ko_shared_control_current(&slot.qualified))))
+					|| (slot.shared
+						&& (slot.v3 ? (!ko_shared_v3_control_current(&slot.qualified_v3)
+																																						 || !ko_shared_v3_peer_space_current(&slot.qualified_v3))
+												 : !ko_shared_control_current(&slot.qualified))))
 					goto next;
 			}
 		}
