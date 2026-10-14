@@ -30,6 +30,9 @@
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "pgstat.h"
+#include "catalog/pg_class.h"
+#include "executor/instrument.h"
+#include "storage/smgr.h"
 #include "storage/buf_internals.h"
 #include "storage/shmem.h"
 #include "utils/memdebug.h"
@@ -69,6 +72,45 @@ static int private_pin[64];
 static PGIOAlignedBlock pages[64];
 char *BufferBlocks = (char *)pages;
 ResourceOwner CurrentResourceOwner;
+BufferUsage pgBufferUsage;
+BufferDesc *LocalBufferDescriptors;
+int NLocBuffer = 0;
+static unsigned read_io_calls;
+static unsigned object_waits;
+static bool close_at_mapping;
+static bool collision_at_mapping;
+static unsigned ko_samples, local_pins;
+static BufferDesc local_descriptor;
+static BufferTag waiting_tag;
+
+bool
+PinLocalBuffer(BufferDesc *buf, bool adjust pg_attribute_unused())
+{
+	UT_ASSERT(buf == &local_descriptor);
+	local_pins++;
+	return true;
+}
+
+static bool
+StartBufferIO(BufferDesc *buf, bool for_input)
+{
+	UT_ASSERT_EQ(lock_depth, 0);
+	UT_ASSERT(for_input);
+	UT_ASSERT(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf->state)) > 0);
+	UT_ASSERT((pg_atomic_read_u32(&buf->state) & BM_LOCKED) == 0);
+	read_io_calls++;
+	return true;
+}
+
+static bool
+cluster_bufmgr_resource_x_wait_retry(LWLock *content pg_attribute_unused(),
+									 int32 id pg_attribute_unused(),
+									 uint32 index pg_attribute_unused(),
+									 bool *refused pg_attribute_unused())
+{
+	abort();
+}
+
 static unsigned remembered_pins;
 static unsigned pin_waiter_signals;
 static bool copy_error;
@@ -85,6 +127,26 @@ static unsigned header_calls;
 static int storage_route = 1;
 static RelFileLocator ko_locator;
 
+/* Waiting is an explicit fixture boundary. The real caller must arrive
+ * here with neither a target reference nor any buffer/mapping lock retained. */
+static void
+cluster_bufmgr_ko_read_wait(void)
+{
+	int id = BufTableLookup(&waiting_tag, BufTableHashCode(&waiting_tag));
+	UT_ASSERT_EQ(lock_depth, 0);
+	UT_ASSERT_EQ(remembered_pins, 0);
+	UT_ASSERT_EQ(read_io_calls, 0);
+	for (int i = 0; i < NBuffers; i++)
+		UT_ASSERT((pg_atomic_read_u32(&GetBufferDescriptor(i)->state) & BM_LOCKED) == 0);
+	if (id >= 0)
+		UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&GetBufferDescriptor(id)->state)),
+					 0);
+	if (++object_waits > 2)
+		abort();
+	ko_closed = false;
+	ko_revision++;
+}
+
 int
 cluster_smgr_which_for(RelFileLocator locator pg_attribute_unused(),
 					   BackendId backend pg_attribute_unused())
@@ -95,6 +157,7 @@ cluster_smgr_which_for(RelFileLocator locator pg_attribute_unused(),
 bool
 cluster_ko_peer_admission_begin_v3(RelFileLocator locator, ClusterKoPeerAdmissionV3 *out)
 {
+	ko_samples++;
 	UT_ASSERT_EQ(lock_depth, 0);
 	for (int i = 0; i < NBuffers; i++)
 		UT_ASSERT((pg_atomic_read_u32(&GetBufferDescriptor(i)->state) & BM_LOCKED) == 0);
@@ -187,6 +250,20 @@ LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_u
 {
 	if (++lock_acquisitions > 128)
 		longjmp(error_jump, 1);
+	if (collision_at_mapping && mode == LW_EXCLUSIVE) {
+		BufferDesc *other = GetBufferDescriptor(0);
+		other->tag = waiting_tag;
+		pg_atomic_write_u32(&other->state, BM_TAG_VALID | BM_VALID);
+		UT_ASSERT_EQ(BufTableInsert(&waiting_tag, BufTableHashCode(&waiting_tag), 0), -1);
+		ko_closed = true;
+		ko_revision++;
+		collision_at_mapping = false;
+	}
+	if (close_at_mapping) {
+		ko_closed = true;
+		ko_revision++;
+		close_at_mapping = false;
+	}
 	lock_depth++;
 	return true;
 }
@@ -214,7 +291,9 @@ LockBufHdr(BufferDesc *buf)
 void
 StrategyFreeBuffer(BufferDesc *buf)
 {
-	UT_ASSERT_EQ(lock_depth, 0);
+	/* Native BufferAlloc also frees an unused collision victim while it
+	 * still holds the new mapping lock; the descriptor header is unlocked. */
+	UT_ASSERT((pg_atomic_read_u32(&buf->state) & BM_LOCKED) == 0);
 	UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf->state)), 0);
 	frees++;
 }
@@ -481,6 +560,12 @@ reset_buffers(void)
 	ko_revision = 1;
 	ko_closed = false;
 	ko_close_at_header = header_calls = 0;
+	read_io_calls = object_waits = 0;
+	close_at_mapping = collision_at_mapping = false;
+	ko_samples = local_pins = 0;
+	NLocBuffer = 0;
+	memset(&local_descriptor, 0, sizeof(local_descriptor));
+	LocalBufferDescriptors = &local_descriptor;
 	ko_locator = BufTagGetRelFileLocator(&tag);
 	copy_error = copy_observed_pin = false;
 	copy_destination = NULL;
@@ -1125,10 +1210,91 @@ UT_TEST(test_object_fence_preserves_finite_cr_pin_and_unrelated_storage)
 	}
 }
 
+UT_TEST(test_object_fence_closes_recent_buffer_before_first_pin)
+{
+	for (ForkNumber fork = MAIN_FORKNUM; fork <= MAX_FORKNUM; fork++) {
+		for (unsigned race = 0; race < 2; race++) {
+			BufferTag tag = reset_buffers();
+			tag.forkNum = fork;
+			install_current(&tag, 0);
+			cluster_enabled = true;
+			ko_closed = race == 0;
+			header_calls = 0;
+			ko_close_at_header = race == 1 ? 1 : 0;
+			UT_ASSERT(!ReadRecentBuffer(BufTagGetRelFileLocator(&tag), fork, tag.blockNum, 1));
+			UT_ASSERT_EQ(remembered_pins, 0);
+			UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&GetBufferDescriptor(0)->state)),
+						 0);
+		}
+	}
+}
+
+UT_TEST(test_object_fence_preserves_recent_existing_pin_and_private_route)
+{
+	for (unsigned kind = 0; kind < 3; kind++) {
+		BufferTag tag = reset_buffers();
+		BufferDesc *buf = GetBufferDescriptor(0);
+		install_current(&tag, 0);
+		if (kind == 0)
+			(void)PinBuffer(buf, NULL);
+		cluster_enabled = kind != 2;
+		storage_route = kind == 1 ? 0 : 1;
+		ko_closed = true;
+		UT_ASSERT(ReadRecentBuffer(BufTagGetRelFileLocator(&tag), tag.forkNum, tag.blockNum, 1));
+		UT_ASSERT_EQ(remembered_pins, kind == 0 ? 2 : 1);
+		UnpinBuffer(buf);
+		if (kind == 0)
+			UnpinBuffer(buf);
+	}
+}
+
+UT_TEST(test_object_fence_buffer_alloc_waits_off_locks_without_publication)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		bool hit = kind == 1 || kind == 2;
+		BufferTag tag = reset_buffers();
+		SMgrRelationData smgr;
+		BufferDesc *buf;
+		bool found;
+		memset(&smgr, 0, sizeof(smgr));
+		smgr.smgr_rlocator.locator = BufTagGetRelFileLocator(&tag);
+		smgr.smgr_rlocator.backend = InvalidBackendId;
+		if (kind == 1)
+			install_current(&tag, 0);
+		cluster_enabled = true;
+		waiting_tag = tag;
+		close_at_mapping = kind < 2;
+		collision_at_mapping = kind == 2;
+		ko_closed = kind == 3;
+		buf = BufferAlloc(&smgr, RELPERSISTENCE_PERMANENT, tag.forkNum, tag.blockNum, NULL, &found,
+						  IOCONTEXT_NORMAL);
+		UT_ASSERT_EQ(object_waits, 1);
+		UT_ASSERT_EQ(read_io_calls, hit ? 0 : 1);
+		UT_ASSERT_EQ(found, hit != 0);
+		UT_ASSERT_EQ(remembered_pins, 1);
+		UT_ASSERT(BufferTagsEqual(&buf->tag, &tag));
+		UnpinBuffer(buf);
+	}
+}
+
+UT_TEST(test_object_fence_does_not_enter_local_buffer_path)
+{
+	BufferTag tag = reset_buffers();
+	local_descriptor.tag = tag;
+	pg_atomic_write_u32(&local_descriptor.state, BM_TAG_VALID | BM_VALID);
+	NLocBuffer = 1;
+	cluster_enabled = true;
+	ko_closed = true;
+	UT_ASSERT(ReadRecentBuffer(BufTagGetRelFileLocator(&tag), tag.forkNum, tag.blockNum, -1));
+	UT_ASSERT_EQ(local_pins, 1);
+	UT_ASSERT_EQ(ko_samples, 0);
+	UT_ASSERT_EQ(header_calls, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(29);
 	UT_RUN(test_native_current_victim_keeps_original_behavior);
 	UT_RUN(test_cr_victim_preserves_current_and_removes_middle_head_tail);
 	UT_RUN(test_last_cr_only_victim_removes_anchor_without_current);
@@ -1154,6 +1320,10 @@ main(void)
 	UT_RUN(test_object_fence_refuses_cr_publication_before_and_at_header);
 	UT_RUN(test_object_fence_refuses_new_cr_pin_without_touching_output);
 	UT_RUN(test_object_fence_preserves_finite_cr_pin_and_unrelated_storage);
+	UT_RUN(test_object_fence_closes_recent_buffer_before_first_pin);
+	UT_RUN(test_object_fence_preserves_recent_existing_pin_and_private_route);
+	UT_RUN(test_object_fence_buffer_alloc_waits_off_locks_without_publication);
+	UT_RUN(test_object_fence_does_not_enter_local_buffer_path);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

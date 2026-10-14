@@ -163,6 +163,19 @@ cluster_bufmgr_ko_read_sample(RelFileLocator locator, ClusterKoPeerAdmissionV3 *
 	return true;
 }
 
+/* No mapping/header/content lock or new pin may survive this local wait.
+ * The bounded latch poll is a fallback; only the next admission sample can
+ * authorize publication. Waiting alone never becomes a transaction error. */
+static void
+cluster_bufmgr_ko_read_wait(void)
+{
+	CHECK_FOR_INTERRUPTS();
+	(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 100L,
+					WAIT_EVENT_PCM_BLOCK_CONVERT_WAIT);
+	ResetLatch(MyLatch);
+	CHECK_FOR_INTERRUPTS();
+}
+
 static inline bool
 cluster_bufmgr_should_pcm_track(BufferDesc *buf)
 {
@@ -4841,11 +4854,11 @@ static BlockNumber ExtendBufferedRelShared(BufferManagerRelation bmr,
 										   BlockNumber extend_upto,
 										   Buffer *buffers,
 										   uint32 *extended_by);
-typedef enum PinBufferLookupResult
-{
+typedef enum PinBufferLookupResult {
 	PIN_BUFFER_LOOKUP_RETRY = 0,
 	PIN_BUFFER_LOOKUP_INVALID,
-	PIN_BUFFER_LOOKUP_VALID
+	PIN_BUFFER_LOOKUP_VALID,
+	PIN_BUFFER_LOOKUP_OBJECT_RETRY
 } PinBufferLookupResult;
 
 static PinBufferLookupResult PinBufferForLookup(
@@ -5046,6 +5059,10 @@ ReadRecentBuffer(RelFileLocator rlocator, ForkNumber forkNum, BlockNumber blockN
 	BufferTag	tag;
 	uint32		buf_state;
 	bool		have_private_ref;
+#ifdef USE_PGRAC_CLUSTER
+	bool check_ko = false;
+	ClusterKoPeerAdmissionV3 ko_sample;
+#endif
 
 	Assert(BufferIsValid(recent_buffer));
 
@@ -5074,6 +5091,10 @@ ReadRecentBuffer(RelFileLocator rlocator, ForkNumber forkNum, BlockNumber blockN
 	{
 		bufHdr = GetBufferDescriptor(recent_buffer - 1);
 		have_private_ref = GetPrivateRefCount(recent_buffer) > 0;
+#ifdef USE_PGRAC_CLUSTER
+		if (!have_private_ref)
+			check_ko = cluster_bufmgr_ko_read_sample(rlocator, &ko_sample);
+#endif
 
 		/*
 		 * Do we already have this buffer pinned with a private reference?  If
@@ -5093,6 +5114,10 @@ ReadRecentBuffer(RelFileLocator rlocator, ForkNumber forkNum, BlockNumber blockN
 			 * InvalidateBuffer() if we pinned a random non-matching buffer.
 			 */
 #ifdef USE_PGRAC_CLUSTER
+			if (check_ko && !cluster_ko_peer_admission_current_v3(&ko_sample, rlocator)) {
+				UnlockBufHdr(bufHdr, buf_state);
+				return false;
+			}
 			if (!have_private_ref
 				&& !cluster_pcm_x_aux_pin_admission_allowed(
 					cluster_pcm_is_active(),
@@ -5768,6 +5793,10 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	BufferDesc *victim_buf_hdr;
 	uint32		victim_buf_state;
 	uint32		aux_pin_waits = 0;
+#ifdef USE_PGRAC_CLUSTER
+	bool check_ko;
+	ClusterKoPeerAdmissionV3 ko_sample;
+#endif
 
 	/* create a tag so we can lookup the buffer */
 	InitBufferTag(&newTag, &smgr->smgr_rlocator.locator, forkNum, blockNum);
@@ -5778,6 +5807,9 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 
 	/* see if the block is in the buffer pool already */
 retry_lookup:
+#ifdef USE_PGRAC_CLUSTER
+	check_ko = cluster_bufmgr_ko_read_sample(smgr->smgr_rlocator.locator, &ko_sample);
+#endif
 	LWLockAcquire(newPartitionLock, LW_SHARED);
 	existing_buf_id = BufTableLookup(&newTag, newHash);
 	if (existing_buf_id >= 0)
@@ -5793,11 +5825,20 @@ retry_lookup:
 		 */
 		buf = GetBufferDescriptor(existing_buf_id);
 
-		pin_result = PinBufferForLookup(buf, strategy);
+#ifdef USE_PGRAC_CLUSTER
+		if (check_ko)
+			pin_result = PinBufferForObjectRead(buf, strategy, &ko_sample);
+		else
+#endif
+			pin_result = PinBufferForLookup(buf, strategy);
 
 		/* Can release the mapping lock as soon as we've pinned it */
 		LWLockRelease(newPartitionLock);
 #ifdef USE_PGRAC_CLUSTER
+		if (pin_result == PIN_BUFFER_LOOKUP_OBJECT_RETRY) {
+			cluster_bufmgr_ko_read_wait();
+			goto retry_lookup;
+		}
 		if (pin_result == PIN_BUFFER_LOOKUP_RETRY)
 		{
 			(void) cluster_bufmgr_resource_x_wait_retry(
@@ -5839,6 +5880,12 @@ retry_lookup:
 	 * buffer.  Remember to unlock the mapping lock while doing the work.
 	 */
 	LWLockRelease(newPartitionLock);
+#ifdef USE_PGRAC_CLUSTER
+	if (check_ko && ko_sample.revision == 0) {
+		cluster_bufmgr_ko_read_wait();
+		goto retry_lookup;
+	}
+#endif
 
 	/*
 	 * Acquire a victim buffer. Somebody else might try to do the same, we
@@ -5884,11 +5931,20 @@ retry_lookup:
 
 		existing_buf_hdr = GetBufferDescriptor(existing_buf_id);
 
-		pin_result = PinBufferForLookup(existing_buf_hdr, strategy);
+#ifdef USE_PGRAC_CLUSTER
+		if (check_ko)
+			pin_result = PinBufferForObjectRead(existing_buf_hdr, strategy, &ko_sample);
+		else
+#endif
+			pin_result = PinBufferForLookup(existing_buf_hdr, strategy);
 
 		/* Can release the mapping lock as soon as we've pinned it */
 		LWLockRelease(newPartitionLock);
 #ifdef USE_PGRAC_CLUSTER
+		if (pin_result == PIN_BUFFER_LOOKUP_OBJECT_RETRY) {
+			cluster_bufmgr_ko_read_wait();
+			goto retry_lookup;
+		}
 		if (pin_result == PIN_BUFFER_LOOKUP_RETRY)
 		{
 			(void) cluster_bufmgr_resource_x_wait_retry(
@@ -5934,6 +5990,20 @@ retry_lookup:
 	Assert(BUF_STATE_GET_REFCOUNT(victim_buf_state) == 1);
 	Assert(!(victim_buf_state & (BM_TAG_VALID | BM_VALID | BM_DIRTY | BM_IO_IN_PROGRESS)));
 
+#ifdef USE_PGRAC_CLUSTER
+	if (check_ko
+		&& !cluster_ko_peer_admission_current_v3(&ko_sample, smgr->smgr_rlocator.locator)) {
+		/* The mapping is still private to mapping-X. Undo it before
+		 * releasing the unused reservation or waiting; no target IO began. */
+		UnlockBufHdr(victim_buf_hdr, victim_buf_state);
+		BufTableDelete(&newTag, newHash);
+		LWLockRelease(newPartitionLock);
+		UnpinBuffer(victim_buf_hdr);
+		StrategyFreeBuffer(victim_buf_hdr);
+		cluster_bufmgr_ko_read_wait();
+		goto retry_lookup;
+	}
+#endif
 	victim_buf_hdr->tag = newTag;
 
 	/*
@@ -6620,7 +6690,7 @@ cluster_bufmgr_cr_copy_v1(const BufferCrKey *key, void *page)
 	buf = GetBufferDescriptor(id);
 	if (check_ko) {
 		PinBufferLookupResult pin = PinBufferForObjectRead(buf, NULL, &ko_sample);
-		if (pin == PIN_BUFFER_LOOKUP_RETRY) {
+		if (pin == PIN_BUFFER_LOOKUP_RETRY || pin == PIN_BUFFER_LOOKUP_OBJECT_RETRY) {
 			LWLockRelease(partition);
 			return false;
 		}
@@ -8215,8 +8285,11 @@ PinBufferForObjectRead(BufferDesc *buf, BufferAccessStrategy strategy,
 		return PinBuffer(buf, strategy) ? PIN_BUFFER_LOOKUP_VALID : PIN_BUFFER_LOOKUP_INVALID;
 	ReservePrivateRefCountEntry();
 	state = LockBufHdr(buf);
-	if (!cluster_ko_peer_admission_current_v3(sample, BufTagGetRelFileLocator(&buf->tag))
-		|| !cluster_pcm_x_aux_pin_admission_allowed(
+	if (!cluster_ko_peer_admission_current_v3(sample, BufTagGetRelFileLocator(&buf->tag))) {
+		UnlockBufHdr(buf, state);
+		return PIN_BUFFER_LOOKUP_OBJECT_RETRY;
+	}
+	if (!cluster_pcm_x_aux_pin_admission_allowed(
 			cluster_pcm_is_active(), cluster_bufmgr_should_pcm_track(buf), buf->tag.forkNum,
 			cluster_pcm_own_flags_get(buf->buf_id))) {
 		UnlockBufHdr(buf, state);
