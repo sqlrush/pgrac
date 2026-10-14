@@ -228,6 +228,8 @@ static uint32 relation_scan_calls, relation_scan_advance;
 static bool relation_scan_epoch_drift, relation_scan_slot_drift, relation_scan_freeze_drift;
 static uint64 relation_gate_freeze;
 static bool relation_gate_ok;
+static ClusterPcmPiRelationScanV2 local_relation_scan_result;
+static uint32 local_relation_scan_calls, local_relation_scan_advance;
 bool
 cluster_pcm_lock_resource_x_gate_snapshot(ResourceXGateSnapshot *out)
 {
@@ -255,6 +257,18 @@ cluster_pcm_lock_pi_relation_scan_v2(RelFileLocator locator, uint64 epoch, uint3
 	if (relation_scan_freeze_drift)
 		relation_gate_freeze++;
 	return relation_scan_result;
+}
+
+ClusterPcmPiRelationScanV2
+cluster_pcm_lock_ko_local_relation_scan_v3(RelFileLocator locator, uint64 epoch, uint32 budget,
+										   uint32 *cursor)
+{
+	UT_ASSERT_EQ(locator.relNumber, 99);
+	UT_ASSERT_EQ(epoch, current_epoch);
+	UT_ASSERT_EQ(budget, 128);
+	local_relation_scan_calls++;
+	*cursor += local_relation_scan_advance;
+	return local_relation_scan_result;
 }
 
 static void (*exit_callback)(int, Datum);
@@ -1027,6 +1041,8 @@ reset_test(void)
 	relation_scan_result = CLUSTER_PCM_PI_RELATION_PENDING;
 	relation_scan_calls = relation_scan_advance = 0;
 	relation_scan_epoch_drift = relation_scan_slot_drift = relation_scan_freeze_drift = false;
+	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_EMPTY;
+	local_relation_scan_calls = local_relation_scan_advance = 0;
 	relation_gate_freeze = 3;
 	relation_gate_ok = true;
 	IsUnderPostmaster = false;
@@ -5634,7 +5650,7 @@ UT_TEST(test_v3_receive_requires_exact_tcp_owner_before_queue)
 		enqueue_shared_v3(&request);
 		UT_ASSERT_EQ(pg_atomic_read_u32(&storage.inbound_tail), fault == 0 ? 1 : 0);
 		UT_ASSERT_EQ(flush_count + drop_count + ack_count + maintenance_space_locks, 0);
-		UT_ASSERT_EQ(storage.peer_fence_serial, 0);
+		UT_ASSERT_EQ(storage.peer_fence_serial, fault == 0 ? 1 : 0);
 		if (fault == 0) {
 			UT_ASSERT_EQ(storage.inbound[0].ingress.serial, 77);
 			UT_ASSERT_EQ(storage.inbound[0].ingress.owner_pid, MyProcPid);
@@ -5674,6 +5690,34 @@ UT_TEST(test_v3_inbound_retains_peer_route_without_rewriting_origin)
 		if (drift == 0)
 			UT_ASSERT_EQ(sent_v3_ack.ax_master_generation, 31);
 	}
+}
+
+UT_TEST(test_v3_fence_registers_before_apply_and_delays_ack_until_local_ready)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(907);
+
+	real_space_reader = true;
+	space_identity.key.locator.dbOid = 5;
+	space_identity.sequence = 1;
+	space_identity.operation = 88;
+	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_PENDING;
+	enqueue_shared_v3(&request);
+	UT_ASSERT_EQ(storage.peer_fence_serial, 1);
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_ACTIVE);
+	fixture_peer_drain();
+	UT_ASSERT_EQ(flush_count, 1);
+	UT_ASSERT_EQ(drop_count, 1);
+	UT_ASSERT_EQ(local_relation_scan_calls, 1);
+	UT_ASSERT_EQ(storage.send_v3_count, 0);
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_ACTIVE);
+
+	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_EMPTY;
+	fixture_peer_drain();
+	UT_ASSERT_EQ(local_relation_scan_calls, 2);
+	UT_ASSERT_EQ(storage.send_v3_count, 1);
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
+	shared_send_tick();
+	UT_ASSERT_EQ(ack_count, 1);
 }
 
 UT_TEST(test_peer_ack_refusal_keeps_original_route_cut)
@@ -6700,7 +6744,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(153);
+	UT_PLAN(154);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
 	UT_RUN(test_peer_space_entry_checks_precede_io);
@@ -6821,6 +6865,7 @@ main(void)
 	UT_RUN(test_v3_control_refuses_non_tier1_even_with_peer_caps);
 	UT_RUN(test_v3_receive_requires_exact_tcp_owner_before_queue);
 	UT_RUN(test_v3_inbound_retains_peer_route_without_rewriting_origin);
+	UT_RUN(test_v3_fence_registers_before_apply_and_delays_ack_until_local_ready);
 	UT_RUN(test_peer_ack_refusal_keeps_original_route_cut);
 	UT_RUN(test_cleaner_attempt_is_counted_before_fence_and_blocks_ready_until_finally);
 	UT_RUN(test_cleaner_attempt_admission_rejects_source_owner_and_terminal_drift);
