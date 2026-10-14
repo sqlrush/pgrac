@@ -64,7 +64,7 @@ TESTS = test_cluster_vm_read_visibility test_cluster_heap_maintenance test_clust
         test_cluster_heap_prepare_diagnostic test_cluster_generic_version test_cluster_generic_redo \
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
         test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_ctrc_dispatch test_cluster_heap_receipt \
-        test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_ctrc_itl_reuse test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_ges_holder test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop \
+        test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_ctrc_itl_reuse test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_ges_holder test_cluster_ko_relation_scan test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop \
         test_cluster_bufmgr_stop test_cluster_allocation_stop test_cluster_hw_cold test_cluster_hw_initdb test_cluster_shared_parameters test_cluster_shared_config_alter test_cluster_checkpoint_pi_tick test_cluster_native_wal_stop test_cluster_checkpointer_stop test_cluster_postmaster_stop test_cluster_xnode_profile test_cluster_adg \
         test_cluster_xnode_lever test_cluster_ges_handoff \
         test_cluster_reverse_key test_cluster_hw_lease test_cluster_pi_shadow \
@@ -413,7 +413,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_heap_cr_reuse test_cluster_snapshot_ad
 SIMPLE_TESTS := $(filter-out test_cluster_native_wal_stop test_cluster_hw_initdb test_cluster_hw_cold test_cluster_cr_inline_stop test_cluster_mrp_stop test_cluster_backup_stop test_cluster_recovery_stop test_cluster_node_remove_stop test_cluster_postmaster_stop test_cluster_checkpointer_stop test_cluster_allocation_stop test_cluster_raw_device_capacity test_cluster_replacement_wire \
 		test_cluster_external_fence test_pgrac_external_fence_protocol \
 		test_cluster_wal_retention test_cluster_terminal_ref_census test_cluster_ctrc_cleaner test_cluster_ctrc_dispatch test_cluster_heap_receipt \
-		test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_ges_holder test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop,$(SIMPLE_TESTS))
+		test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_ges_holder test_cluster_ko_relation_scan test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop,$(SIMPLE_TESTS))
 
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 		test_pgrac_fenced_journal test_pgrac_fenced_provider \
@@ -9064,3 +9064,30 @@ test_cluster_ges_holder: test_cluster_ges_holder.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_ges_holder.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Focused object-drain registry observation, preserving the legacy structural tests.
+test_cluster_ko_relation_scan: test_cluster_ko_relation_scan.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+		test_cluster_pcm_master_durable.inc \
+		test_cluster_pcm_settlement_ingress.inc \
+		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \
+		test_cluster_pcm_stop_fields.inc \
+		test_cluster_pcm_predecessor_consumer.inc \
+		test_cluster_pcm_source_owner_layout.inc \
+		test_cluster_pcm_source_replay.inc \
+		test_cluster_pcm_source_replay_consumer.inc \
+		test_cluster_pcm_ready_scheduler.inc \
+		test_cluster_pcm_lms_intent_pump.inc \
+		test_cluster_pcm_lms_intent_wait.inc \
+		$(CLUSTER_VERSION_O) test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< \
+		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(CLUSTER_VERSION_O) test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@

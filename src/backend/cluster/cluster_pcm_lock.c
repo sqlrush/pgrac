@@ -10857,9 +10857,9 @@ cluster_pcm_lock_pi_candidates_v1(uint32 *cursor, uint32 probe_budget, BufferTag
  * every registry slot, including entries which cannot become writeback
  * candidates. Neither stable residency nor terminal history is permission
  * to ignore a real PI, reference, or in-flight protocol owner. */
-ClusterPcmPiRelationScanV2
-cluster_pcm_lock_pi_relation_scan_v2(RelFileLocator locator, uint64 formation, uint32 budget,
-									 uint32 *cursor)
+static ClusterPcmPiRelationScanV2
+pcm_pi_relation_scan(RelFileLocator locator, uint64 formation, uint32 budget, uint32 *cursor,
+					 bool object_drain)
 {
 	static const ClusterPcmResourceXSlot empty_slot;
 	static const ClusterPcmResourceXMasterState empty_state;
@@ -10912,8 +10912,12 @@ cluster_pcm_lock_pi_relation_scan_v2(RelFileLocator locator, uint64 formation, u
 		if (entry == NULL || entry->registry_slot != position
 			|| entry->binding_generation != slot->binding_generation)
 			goto invalid;
-		if (!BufTagMatchesRelFileLocator(&slot->tag, &locator)
-			|| (slot->tag.forkNum != MAIN_FORKNUM && slot->tag.forkNum != VISIBILITYMAP_FORKNUM))
+		if (!BufTagMatchesRelFileLocator(&slot->tag, &locator))
+			continue;
+		if (object_drain) {
+			if (slot->tag.forkNum > MAX_FORKNUM)
+				goto invalid;
+		} else if (slot->tag.forkNum != MAIN_FORKNUM && slot->tag.forkNum != VISIBILITYMAP_FORKNUM)
 			continue;
 		LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
 		/* True only admits a terminal N history after its PI has already
@@ -10945,7 +10949,7 @@ cluster_pcm_lock_pi_relation_scan_v2(RelFileLocator locator, uint64 formation, u
 			|| entry->pending_x_requester_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 			|| (entry->pending_x_requester_node == -1 && entry->pending_x_since_lsn != 0))
 			result = CLUSTER_PCM_PI_RELATION_INVALID;
-		else if (active || retained
+		else if (active || retained || (object_drain && mode != PCM_STATE_N)
 				 || entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY
 				 || pg_atomic_read_u32(&entry->pin_count) != 0
 				 || pg_atomic_read_u32(&entry->wait_refcount) != 0
@@ -10973,6 +10977,20 @@ done:
 	if (result != CLUSTER_PCM_PI_RELATION_INVALID)
 		*cursor = position;
 	return result;
+}
+
+ClusterPcmPiRelationScanV2
+cluster_pcm_lock_pi_relation_scan_v2(RelFileLocator locator, uint64 formation, uint32 budget,
+									 uint32 *cursor)
+{
+	return pcm_pi_relation_scan(locator, formation, budget, cursor, false);
+}
+
+ClusterPcmPiRelationScanV2
+cluster_pcm_lock_ko_relation_scan_v3(RelFileLocator locator, uint64 formation, uint32 budget,
+									 uint32 *cursor)
+{
+	return pcm_pi_relation_scan(locator, formation, budget, cursor, true);
 }
 
 /* All potentially allocating proof work precedes directory locks. Only the

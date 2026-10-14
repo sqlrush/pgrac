@@ -316,6 +316,15 @@ extern ClusterPcmPiRelationScanV2 cluster_pcm_lock_pi_relation_scan_v2(RelFileLo
 																	   uint32 budget,
 																	   uint32 *cursor);
 
+/* Object-drain observation covers every supported fork and current holder.
+ * EMPTY is only a bounded directory observation, never the complete READY
+ * conjunction. The caller must exclude new producers and bind the scan to
+ * its unchanged object operation and gate/freeze generation. */
+extern ClusterPcmPiRelationScanV2 cluster_pcm_lock_ko_relation_scan_v3(RelFileLocator locator,
+																	   uint64 formation,
+																	   uint32 budget,
+																	   uint32 *cursor);
+
 /* Actual holder DATA write. The cut is captured before this call; it must
  * match the installed current-X buffer generation. No ownership acquisition.
  * A receipt from the ordinary endpoint cannot retire master PI obligations. */
