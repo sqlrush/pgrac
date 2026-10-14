@@ -209,6 +209,8 @@ extern bool cluster_ko_peer_holder_result_v3(const ClusterKoPeerFenceHandleV3 *h
 extern bool cluster_ko_peer_fence_begin_v3(const ClusterKoSharedMessageV3 *request,
 										 ClusterKoPeerFenceHandleV3 *handle,
 										 ClusterKoPeerFenceStateV3 *state);
+/* Consumes the original SI owner's recorded physical completion and stable
+ * complete local scan. Neither a handle nor an empty queue can create READY. */
 extern bool cluster_ko_peer_fence_ready_v3(const ClusterKoSharedMessageV3 *request,
 										 const ClusterKoPeerFenceHandleV3 *handle);
 /* SI-owner pressure tick.  It may reclaim only a fully quiesced COMMITTED
