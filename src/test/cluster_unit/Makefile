@@ -2557,21 +2557,44 @@ test_cluster_space_storage test_cluster_storage_subtransaction: %: %.c test_clus
 # Execute the real extension caller through its allocation decision; physical
 # extension after this point remains the native buffer/I/O implementation.
 test_cluster_space_extend.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
-	awk '/^ExtendBufferedRelShared\(/ { print "static BlockNumber"; emit=1; found++ } \
+	awk '/^ExtendBufferedRelSharedInternal\(/ { print "static BlockNumber"; emit=1; found++ } \
 	     emit { print } emit && /^\tfirst_block = smgrnblocks\(bmr.smgr, fork\);/ \
 	     { print "\t*extended_by = extend_by; return first_block; }"; emit=0; done++ } \
 	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	awk '/^ExtendBufferedRelShared\(/ { print "static BlockNumber"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
 
 test_cluster_space_extend_finish.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
-	awk '/^ExtendBufferedRelShared\(/ { inside=1 } \
+	awk '/^ExtendBufferedRelSharedInternal\(/ { inside=1 } \
 	     inside && /^\t\/\* Set BM_VALID, terminate IO, and wake up any waiters \*\// { emit=1; found++ } \
 	     emit && /^\tpgBufferUsage.shared_blks_written/ { emit=0; done++ } \
 	     emit { print } /^}/ { inside=0 } \
 	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_space_extend: test_cluster_space_extend.c test_cluster_space_extend.inc test_cluster_space_extend_finish.inc unit_test.h $(CLUSTER_HW_O) $(CLUSTER_UNIT_PORT_LIBS)
+test_cluster_space_extend_resize.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^ExtendBufferedRelShared(Internal)?\(/ { inside=1 } \
+	     inside && /^\tif \(extend_upto != InvalidBlockNumber\)/ { emit=1; found++ } \
+	     emit { print } emit && /^\t}/ { emit=0; done++ } /^}/ { inside=0 } \
+	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_space_extend_zero.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^ExtendBufferedRelSharedInternal\(/ { inside=1 } \
+	     inside && /^\tsmgrzeroextend\(bmr.smgr, fork, first_block, extend_by, false\);/ { emit=1; found++ } \
+	     emit { print } emit && /^#endif/ { emit=0; done++ } /^}/ { inside=0 } \
+	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_space_extend_handoff.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^ExtendBufferedRelSharedInternal\(/ { inside=1 } \
+	     inside && /^\tif \(ko_scoped\)( \{)?$$/ { emit=1; found++ } \
+	     emit { print } emit && /^\t}/ { emit=0; done++ } /^}/ { inside=0 } \
+	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_space_extend: test_cluster_space_extend.c test_cluster_space_extend.inc test_cluster_space_extend_finish.inc test_cluster_space_extend_resize.inc test_cluster_space_extend_zero.inc test_cluster_space_extend_handoff.inc unit_test.h $(CLUSTER_HW_O) $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_HW_O) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
@@ -4662,7 +4685,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_pcm_page_identity.inc test_cluster_pcm_page_identity.inc.tmp
 	rm -f test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc
 	rm -f test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc
-	rm -f test_cluster_space_extend.inc test_cluster_space_extend_finish.inc
+	rm -f test_cluster_space_extend.inc test_cluster_space_extend_finish.inc test_cluster_space_extend_resize.inc test_cluster_space_extend_zero.inc test_cluster_space_extend_handoff.inc
 	rm -f test_cluster_undo_producer_owner.inc test_cluster_undo_block_native.inc
 	rm -f test_cluster_undo_lifecycle_native.inc test_cluster_undo_header_identity.inc
 	rm -f test_cluster_undo_bind_native.inc test_cluster_undo_tt_transition.inc

@@ -157,6 +157,7 @@ typedef struct ClusterKoPeerAdmissionV3 {
 	ForkNumber fork;
 	BlockNumber block;
 	ClusterCtrcCleanerReadScopeV3 cleaner;
+	uint64 extension_serial;
 } ClusterKoPeerAdmissionV3;
 
 extern bool cluster_ko_peer_admission_begin_v3(RelFileLocator locator,
@@ -177,6 +178,17 @@ extern bool cluster_ko_cleaner_enter_v3(RelFileLocator locator,
 										const struct ClusterCtrcCleanerReadScopeV3 *scope);
 extern void cluster_ko_cleaner_leave_v3(RelFileLocator locator,
 										const struct ClusterCtrcCleanerReadScopeV3 *scope);
+
+/* One original extension call, from before its first SPACE read until the
+ * physical range is materialized. No IO or current permission is implied.
+ * A false begin is waitable only when retry is explicitly true. */
+extern bool cluster_ko_extend_active_v3(void);
+extern bool cluster_ko_extend_begin_v3(RelFileLocator locator, ForkNumber fork, uint64 *serial,
+									   bool *retry);
+extern bool cluster_ko_extend_write_begin_v3(RelFileLocator locator, ForkNumber fork);
+extern bool cluster_ko_extend_write_done_v3(RelFileLocator locator, ForkNumber fork);
+extern bool cluster_ko_extend_end_v3(uint64 serial);
+extern void cluster_ko_extend_abort_v3(uint64 serial);
 
 extern bool cluster_ko_peer_holder_begin_v3(const ClusterKoPeerFenceHandleV3 *handle);
 extern bool cluster_ko_peer_holder_result_v3(const ClusterKoPeerFenceHandleV3 *handle,

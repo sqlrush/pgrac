@@ -7468,14 +7468,10 @@ ExtendBufferedRelCommon(BufferManagerRelation bmr,
  * shared buffers.
  */
 static BlockNumber
-ExtendBufferedRelShared(BufferManagerRelation bmr,
-						ForkNumber fork,
-						BufferAccessStrategy strategy,
-						uint32 flags,
-						uint32 extend_by,
-						BlockNumber extend_upto,
-						Buffer *buffers,
-						uint32 *extended_by)
+ExtendBufferedRelSharedInternal(BufferManagerRelation bmr, ForkNumber fork,
+								BufferAccessStrategy strategy, uint32 flags, uint32 extend_by,
+								BlockNumber extend_upto, Buffer *buffers, uint32 *extended_by,
+								volatile uint64 *ko_serial)
 {
 	BlockNumber first_block;
 	IOContext	io_context = IOContextForStrategy(strategy);
@@ -7518,6 +7514,7 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	uint32		aux_pin_waits = 0;
 	ClusterSpaceIdentity space_identity;
 	bool		space_reservation = false;
+	bool ko_scoped = ko_serial != NULL;
 
 	if (cluster_relation_extend_lock_enabled && bmr.rel != NULL && cluster_node_id >= 0
 		&& fork == MAIN_FORKNUM && !RecoveryInProgress()
@@ -7722,6 +7719,9 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 
 			PG_TRY();
 			{
+				if (ko_scoped
+					&& !cluster_ko_extend_write_begin_v3(bmr.smgr->smgr_rlocator.locator, fork))
+					elog(ERROR, "shared extension lost its original object owner");
 				if (space_reservation)
 					first_block = cluster_space_reserve(&space_identity, &hwlk, hw_want, &hw_granted);
 				else
@@ -7800,6 +7800,13 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 		else if ((uint64) first_block + extend_by > extend_upto)
 			extend_by = extend_upto - first_block;
 
+#ifdef USE_PGRAC_CLUSTER
+		/* The grant already covers the original request and any parked tail.
+		 * Reducing returned buffers cannot discard its durable reservation. */
+		if (ko_scoped && hwc == CLUSTER_HW_GLOBALIZE)
+			hw_lease_tail += orig_extend_by - extend_by;
+#endif
+
 		for (uint32 i = extend_by; i < orig_extend_by; i++)
 		{
 			BufferDesc *buf_hdr = GetBufferDescriptor(buffers[i] - 1);
@@ -7814,6 +7821,18 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 
 		if (extend_by == 0)
 		{
+#ifdef USE_PGRAC_CLUSTER
+			if (ko_scoped && hw_lease_tail > 0) {
+				/* Materialize this exact newly granted range even when the
+				 * requested end was already satisfied. No buffer is returned. */
+				smgrzeroextend(bmr.smgr, fork, first_block, (int)hw_lease_tail, false);
+				if (ko_scoped
+					&& !cluster_ko_extend_write_done_v3(bmr.smgr->smgr_rlocator.locator, fork))
+					elog(ERROR, "shared extension lost its materialized range owner");
+				cluster_hw_lease_install(bmr.smgr->smgr_rlocator.locator, fork, first_block,
+										 hw_lease_tail);
+			}
+#endif
 			if (!(flags & EB_SKIP_EXTENSION_LOCK))
 				UnlockRelationForExtension(bmr.rel, ExclusiveLock);
 			*extended_by = extend_by;
@@ -7828,6 +7847,13 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 				 errmsg("cannot extend relation %s beyond %u blocks",
 						relpath(bmr.smgr->smgr_rlocator, fork),
 						MaxBlockNumber)));
+
+#ifdef USE_PGRAC_CLUSTER
+	/* The original finite call holds the object reference through every
+	 * mapping/IO publication below, including positional auxiliary extends. */
+	if (ko_scoped && !cluster_ko_extend_write_begin_v3(bmr.smgr->smgr_rlocator.locator, fork))
+		elog(ERROR, "shared extension lost its original object owner");
+#endif
 
 	/*
 	 * Insert buffers into buffer table, mark as IO_IN_PROGRESS.
@@ -8017,6 +8043,8 @@ retry_extend_collision:
 		cluster_hw_lease_install(bmr.smgr->smgr_rlocator.locator, fork,
 								 first_block + extend_by, hw_lease_tail);
 	}
+	if (ko_scoped && !cluster_ko_extend_write_done_v3(bmr.smgr->smgr_rlocator.locator, fork))
+		elog(ERROR, "shared extension lost its materialized range owner");
 #endif
 
 	/*
@@ -8031,6 +8059,18 @@ retry_extend_collision:
 
 	pgstat_count_io_op_time(IOOBJECT_RELATION, io_context, IOOP_EXTEND,
 							io_start, extend_by);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Transfer only after materialization: every returned range buffer now
+	 * has its real tag, pin and IO reference, which the original drain sees.
+	 * Retire the call reference before taking returned content locks; never
+	 * acquire the object lock beneath a buffer header/content lock. */
+	if (ko_scoped) {
+		if (!cluster_ko_extend_end_v3(*ko_serial))
+			elog(ERROR, "shared extension could not hand off its materialized range");
+		*ko_serial = 0;
+	}
+#endif
 
 	/* Set BM_VALID, terminate IO, and wake up any waiters */
 #ifdef USE_PGRAC_CLUSTER
@@ -8101,6 +8141,63 @@ retry_extend_collision:
 	*extended_by = extend_by;
 
 	return first_block;
+}
+
+/* The reference precedes the first target identity read/reservation. Once
+ * the whole range is materialized, the original tagged pins/IO take over
+ * before returned content locks are acquired. No object lock spans current,
+ * WAL or IO. An unmaterialized reservation survives local ERROR for recovery. */
+static BlockNumber
+ExtendBufferedRelShared(BufferManagerRelation bmr, ForkNumber fork, BufferAccessStrategy strategy,
+						uint32 flags, uint32 extend_by, BlockNumber extend_upto, Buffer *buffers,
+						uint32 *extended_by)
+{
+#ifdef USE_PGRAC_CLUSTER
+	RelFileLocator locator = bmr.smgr->smgr_rlocator.locator;
+	BackendId backend = bmr.smgr->smgr_rlocator.backend;
+	BlockNumber first_block;
+	volatile uint64 serial = 0;
+	bool scoped = cluster_enabled && cluster_shared_config
+				  && cluster_interconnect_tier == CLUSTER_IC_TIER_1 && !RecoveryInProgress()
+				  && bmr.relpersistence != RELPERSISTENCE_TEMP
+				  && cluster_smgr_which_for(locator, backend) == 1;
+
+	if (!scoped)
+		return ExtendBufferedRelSharedInternal(bmr, fork, strategy, flags, extend_by, extend_upto,
+											   buffers, extended_by, NULL);
+	if (cluster_ko_extend_active_v3())
+		elog(ERROR, "cannot nest shared extension object owners");
+	for (;;) {
+		bool retry;
+		if (cluster_ko_extend_begin_v3(locator, fork, (uint64 *)&serial, &retry))
+			break;
+		if (!retry)
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+							errmsg("cannot qualify the shared extension object owner")));
+		cluster_bufmgr_ko_read_wait();
+	}
+	PG_TRY();
+	{
+		/* An admission wait may process invalidations. Retain the exact
+		 * locator/backend, never a possibly retired native SMgr pointer. */
+		bmr.smgr = smgropen(locator, backend);
+		first_block = ExtendBufferedRelSharedInternal(bmr, fork, strategy, flags, extend_by,
+													  extend_upto, buffers, extended_by, &serial);
+	}
+	PG_CATCH();
+	{
+		cluster_ko_extend_abort_v3(serial);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (serial != 0 && !cluster_ko_extend_end_v3(serial))
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+						errmsg("shared extension requires its original range recovery")));
+	return first_block;
+#else
+	return ExtendBufferedRelSharedInternal(bmr, fork, strategy, flags, extend_by, extend_upto,
+										   buffers, extended_by, NULL);
+#endif
 }
 
 /*
