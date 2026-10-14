@@ -21,6 +21,23 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 
 static bool inject_readdir_error;
 static bool inject_fstat_error;
+static unsigned inject_pread_fault;
+static int modify_during_read = -1;
+
+static ssize_t
+namespace_test_pread(int fd, void *buffer, size_t length, off_t offset)
+{
+	ssize_t result;
+
+	if (inject_pread_fault == 1) {
+		errno = EIO;
+		return -1;
+	}
+	result = pread(fd, buffer, inject_pread_fault == 2 ? length - 1 : length, offset);
+	if (modify_during_read >= 0 && ftruncate(modify_during_read, 1) != 0)
+		abort();
+	return result;
+}
 
 static int
 namespace_test_fstat(int fd, struct stat *st)
@@ -44,9 +61,11 @@ namespace_test_readdir(DIR *dir)
 
 #define readdir namespace_test_readdir
 #define fstat namespace_test_fstat
+#define pread namespace_test_pread
 #include "../../backend/cluster/cluster_recovery_namespace.c"
 #undef readdir
 #undef fstat
+#undef pread
 
 static char test_path[MAXPGPATH];
 
@@ -376,10 +395,111 @@ UT_TEST(test_borrowed_directory_cursor_does_not_skip_files)
 	rmdir(test_path);
 }
 
+UT_TEST(test_current_file_reads_all_pages_without_moving_fd_cursor)
+{
+	int root = new_root(), fd, writer;
+	ClusterRecoveryNamespace *scan = NULL;
+	ClusterRecoveryNamespaceEntry entry;
+	char expected[BLCKSZ], observed[BLCKSZ];
+
+	writer = openat(root, "untouched", O_CREAT | O_EXCL | O_WRONLY, 0600);
+	UT_ASSERT(writer >= 0);
+	for (unsigned page = 0; page < 2; page++) {
+		memset(expected, page + 17, sizeof(expected));
+		UT_ASSERT_EQ(write(writer, expected, sizeof(expected)), sizeof(expected));
+	}
+	close(writer);
+	UT_ASSERT_EQ(cluster_recovery_namespace_begin(root, 8, &scan), CLUSTER_RECOVERY_NAMESPACE_MORE);
+	UT_ASSERT_EQ(cluster_recovery_namespace_next(scan, &entry, &fd),
+				 CLUSTER_RECOVERY_NAMESPACE_ENTRY);
+	UT_ASSERT_EQ(entry.size, 2 * BLCKSZ);
+	UT_ASSERT_EQ(lseek(fd, 3, SEEK_SET), 3);
+	for (unsigned page = 0; page < 2; page++) {
+		memset(expected, page + 17, sizeof(expected));
+		UT_ASSERT_EQ(cluster_recovery_namespace_read_current(scan, (uint64)page * BLCKSZ, observed,
+															 sizeof(observed)),
+					 CLUSTER_RECOVERY_NAMESPACE_ENTRY);
+		UT_ASSERT_EQ(memcmp(expected, observed, sizeof(expected)), 0);
+		UT_ASSERT_EQ(lseek(fd, 0, SEEK_CUR), 3);
+	}
+	UT_ASSERT_EQ(cluster_recovery_namespace_next(scan, &entry, &fd),
+				 CLUSTER_RECOVERY_NAMESPACE_END);
+	cluster_recovery_namespace_destroy(scan);
+	remove_root(root);
+	rmdir(test_path);
+}
+
+UT_TEST(test_current_read_short_io_and_changed_are_not_empty_pages)
+{
+	for (unsigned fault = 1; fault <= 4; fault++) {
+		int root = new_root(), fd, writer = -1;
+		ClusterRecoveryNamespace *scan = NULL;
+		ClusterRecoveryNamespaceEntry entry;
+		char observed[4] = { 0x5a, 0x5a, 0x5a, 0x5a };
+		char zero[4] = { 0 };
+		ClusterRecoveryNamespaceResult expected
+			= fault <= 2 ? CLUSTER_RECOVERY_NAMESPACE_IO : CLUSTER_RECOVERY_NAMESPACE_CHANGED;
+
+		write_file(root, "candidate");
+		UT_ASSERT_EQ(cluster_recovery_namespace_begin(root, 8, &scan),
+					 CLUSTER_RECOVERY_NAMESPACE_MORE);
+		UT_ASSERT_EQ(cluster_recovery_namespace_next(scan, &entry, &fd),
+					 CLUSTER_RECOVERY_NAMESPACE_ENTRY);
+		if (fault <= 2)
+			inject_pread_fault = fault;
+		else if (fault == 3) {
+			writer = openat(root, "candidate", O_WRONLY);
+			UT_ASSERT(writer >= 0);
+			modify_during_read = writer;
+		} else {
+			UT_ASSERT_EQ(renameat(root, "candidate", root, "replaced"), 0);
+			write_file(root, "candidate");
+		}
+		UT_ASSERT_EQ(cluster_recovery_namespace_read_current(scan, 0, observed, sizeof(observed)),
+					 expected);
+		UT_ASSERT_EQ(memcmp(observed, zero, sizeof(zero)), 0);
+		inject_pread_fault = 0;
+		modify_during_read = -1;
+		if (writer >= 0)
+			close(writer);
+		UT_ASSERT_EQ(cluster_recovery_namespace_next(scan, &entry, &fd), expected);
+		cluster_recovery_namespace_destroy(scan);
+		remove_root(root);
+		rmdir(test_path);
+	}
+}
+
+UT_TEST(test_current_read_rejects_out_of_range_without_sealing)
+{
+	const uint64 offsets[] = { 1, UINT64_MAX };
+
+	for (unsigned i = 0; i < lengthof(offsets); i++) {
+		int root = new_root(), fd;
+		ClusterRecoveryNamespace *scan = NULL;
+		ClusterRecoveryNamespaceEntry entry;
+		char observed[4] = { 1, 1, 1, 1 }, zero[4] = { 0 };
+
+		write_file(root, "candidate");
+		UT_ASSERT_EQ(cluster_recovery_namespace_begin(root, 8, &scan),
+					 CLUSTER_RECOVERY_NAMESPACE_MORE);
+		UT_ASSERT_EQ(cluster_recovery_namespace_next(scan, &entry, &fd),
+					 CLUSTER_RECOVERY_NAMESPACE_ENTRY);
+		UT_ASSERT_EQ(
+			cluster_recovery_namespace_read_current(scan, offsets[i], observed, sizeof(observed)),
+			CLUSTER_RECOVERY_NAMESPACE_INVALID);
+		UT_ASSERT_EQ(memcmp(observed, zero, sizeof(zero)), 0);
+		UT_ASSERT_EQ(cluster_recovery_namespace_next(scan, &entry, &fd),
+					 CLUSTER_RECOVERY_NAMESPACE_INVALID);
+		cluster_recovery_namespace_destroy(scan);
+		remove_root(root);
+		rmdir(test_path);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(14);
 	UT_RUN(test_shared_relation_names);
 	UT_RUN(test_relmap_and_both_authority_copies);
 	UT_RUN(test_unknown_and_aliases_cannot_be_empty_coverage);
@@ -391,6 +511,9 @@ main(void)
 	UT_RUN(test_new_directory_entry_invalidates_finished_set);
 	UT_RUN(test_stat_io_failure_keeps_its_cause);
 	UT_RUN(test_borrowed_directory_cursor_does_not_skip_files);
+	UT_RUN(test_current_file_reads_all_pages_without_moving_fd_cursor);
+	UT_RUN(test_current_read_short_io_and_changed_are_not_empty_pages);
+	UT_RUN(test_current_read_rejects_out_of_range_without_sealing);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

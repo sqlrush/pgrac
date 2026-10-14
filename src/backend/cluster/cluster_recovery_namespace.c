@@ -205,18 +205,24 @@ cluster_recovery_namespace_begin(int root_fd, uint32 max_entries, ClusterRecover
 }
 
 static ClusterRecoveryNamespaceResult
-namespace_finish_file(ClusterRecoveryNamespace *scan)
+namespace_recheck_file(ClusterRecoveryNamespace *scan)
 {
 	struct stat held, named;
-	ClusterRecoveryNamespaceResult result = CLUSTER_RECOVERY_NAMESPACE_MORE;
 	int parent = dirfd(scan->dirs[scan->depth - 1].stream);
 
 	if (fstat(scan->current_fd, &held) != 0
 		|| fstatat(parent, scan->current_name, &named, AT_SYMLINK_NOFOLLOW) != 0)
-		result = namespace_io_result();
-	else if (!namespace_same(&scan->current_stat, &held)
-			 || !namespace_same(&scan->current_stat, &named))
-		result = CLUSTER_RECOVERY_NAMESPACE_CHANGED;
+		return namespace_io_result();
+	if (!namespace_same(&scan->current_stat, &held) || !namespace_same(&scan->current_stat, &named))
+		return CLUSTER_RECOVERY_NAMESPACE_CHANGED;
+	return CLUSTER_RECOVERY_NAMESPACE_MORE;
+}
+
+static ClusterRecoveryNamespaceResult
+namespace_finish_file(ClusterRecoveryNamespace *scan)
+{
+	ClusterRecoveryNamespaceResult result = namespace_recheck_file(scan);
+
 	if (close(scan->current_fd) != 0 && result == CLUSTER_RECOVERY_NAMESPACE_MORE)
 		result = CLUSTER_RECOVERY_NAMESPACE_IO;
 	scan->current_fd = -1;
@@ -343,6 +349,39 @@ cluster_recovery_namespace_next(ClusterRecoveryNamespace *scan, ClusterRecoveryN
 		return CLUSTER_RECOVERY_NAMESPACE_ENTRY;
 	}
 	return scan->state = CLUSTER_RECOVERY_NAMESPACE_MORE;
+}
+
+ClusterRecoveryNamespaceResult
+cluster_recovery_namespace_read_current(ClusterRecoveryNamespace *scan, uint64 offset, void *buffer,
+										size_t length)
+{
+	ClusterRecoveryNamespaceResult result;
+
+	if (buffer != NULL && length > 0 && length <= BLCKSZ)
+		memset(buffer, 0, length);
+	if (scan == NULL)
+		return CLUSTER_RECOVERY_NAMESPACE_INVALID;
+	if (scan->state > CLUSTER_RECOVERY_NAMESPACE_END)
+		return scan->state;
+	if (buffer == NULL || length == 0 || length > BLCKSZ || scan->current_fd < 0 || scan->depth == 0
+		|| offset > (uint64)scan->current_stat.st_size
+		|| length > (uint64)scan->current_stat.st_size - offset)
+		return scan->state = CLUSTER_RECOVERY_NAMESPACE_INVALID;
+
+	result = namespace_recheck_file(scan);
+	if (result != CLUSTER_RECOVERY_NAMESPACE_MORE)
+		return scan->state = result;
+	/* The range already fits the original nonnegative off_t file size.
+	 * A short read, including EOF, cannot discharge any page obligation. */
+	if (pread(scan->current_fd, buffer, length, (off_t)offset) != (ssize_t)length)
+		result = CLUSTER_RECOVERY_NAMESPACE_IO;
+	else
+		result = namespace_recheck_file(scan);
+	if (result != CLUSTER_RECOVERY_NAMESPACE_MORE) {
+		memset(buffer, 0, length);
+		return scan->state = result;
+	}
+	return CLUSTER_RECOVERY_NAMESPACE_ENTRY;
 }
 
 void

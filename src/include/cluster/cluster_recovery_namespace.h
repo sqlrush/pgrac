@@ -66,6 +66,17 @@ cluster_recovery_namespace_begin(int root_fd, uint32 max_entries, ClusterRecover
 extern ClusterRecoveryNamespaceResult
 cluster_recovery_namespace_next(ClusterRecoveryNamespace *scan, ClusterRecoveryNamespaceEntry *out,
 								int *file_fd);
+
+/* Read one bounded chunk of the currently held file, without advancing its
+ * descriptor position. ENTRY means exactly length bytes, with the descriptor
+ * and original directory name unchanged before and after the read. Length is
+ * 1..BLCKSZ and the range must fit the enumerated size. Other results poison
+ * the scan; a short read is IO, never EOF or an empty page. For a valid output
+ * buffer/length, failure clears the output. This does not validate page bytes,
+ * SPACE identity, authority, WAL coverage or recovery completeness. */
+extern ClusterRecoveryNamespaceResult
+cluster_recovery_namespace_read_current(ClusterRecoveryNamespace *scan, uint64 offset, void *buffer,
+										size_t length);
 extern void cluster_recovery_namespace_destroy(ClusterRecoveryNamespace *scan);
 
 #endif
