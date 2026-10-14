@@ -3289,6 +3289,23 @@ cluster_ko_flush_request_handler(const ClusterICEnvelope *env, const void *paylo
 		KO_BUMP(inbound_full_count);
 		return;
 	}
+	/* REQUEST retransmit is idempotent while the original frame is still
+	 * resident. Do not create a second physical attempt for the same PKO3
+	 * identity; the first slot remains the sole owner of the eventual ACK or
+	 * fail-closed timeout. A post-consumption retry still follows the existing
+	 * physical owner and must not be turned into synthetic success here. */
+	if (v3) {
+		uint32 scan = head;
+
+		while (scan != tail) {
+			const ClusterKoInboundSlot *queued = &ko_state->inbound[scan];
+
+			if (queued->shared && queued->v3
+				&& memcmp(&queued->qualified_v3, &qualified_v3, sizeof(qualified_v3)) == 0)
+				return;
+			scan = (scan + 1) % CLUSTER_KO_INBOUND_CAPACITY;
+		}
+	}
 	ko_state->inbound[tail].shared = shared;
 	ko_state->inbound[tail].v3 = v3;
 	ko_state->inbound[tail].qualified = qualified;
