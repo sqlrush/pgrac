@@ -40,6 +40,7 @@
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_ges_holder.h"
+#include "cluster/cluster_ko.h"				/* F14 exact successor-grant fence retirement */
 #include "cluster/cluster_ges_mode.h"		/* spec-5.1b D1: ges_modes_compatible (frozen matrix) */
 #include "cluster/cluster_ges_reply_wait.h" /* spec-2.23 D1 5-tuple wait HTAB */
 #include "cluster/cluster_grd.h"
@@ -1358,6 +1359,11 @@ ges_dispatch_grant_identity(const ClusterGrdGrantIdentity *g, const ClusterResId
 {
 	if (!ges_readiness_allows_grant(g, resid, serving))
 		return;
+	/* A successor grant is an authenticated terminal edge for a local v3 KO
+	 * fence.  The KO helper accepts it only when the holder tuple differs and
+	 * the exact current master generation matches; ordinary grants therefore
+	 * remain observational no-ops. */
+	(void)cluster_ko_peer_fence_fresh_grant_v3(resid, &g->holder, g->shard_master_generation);
 	if (g->source_node_id == cluster_node_id) {
 		ges_local_wake_reply(g->source_node_id, g->holder.request_id, g->holder.cluster_epoch,
 							 g->request_opcode, GES_REPLY_OPCODE_GRANT, GES_REJECT_REASON_NONE);

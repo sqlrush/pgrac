@@ -6341,6 +6341,113 @@ UT_TEST(test_peer_fence_capacity_does_not_delete_old_terminal)
 	UT_ASSERT_EQ(state, CLUSTER_KO_PEER_FENCE_COMMITTED);
 }
 
+UT_TEST(test_peer_fence_terminal_gc_requires_local_quiescence)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(1100);
+	ClusterKoPeerFenceHandleV3 handle;
+	ClusterKoPeerFenceStateV3 state;
+
+	for (int i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		request.base.batch_id = 1100 + i;
+		UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+		UT_ASSERT(cluster_ko_peer_fence_ready_v3(&request, &handle));
+		UT_ASSERT(cluster_ko_peer_commit_v3(request.base.origin_node, request.base.epoch,
+											request.base.origin_boot, request.base.peer_boot,
+											request.base.batch_id));
+		storage.peer_fences[handle.slot].physical_applied = true;
+		storage.peer_fences[handle.slot].ack_queued = true;
+	}
+	request.base.batch_id = 1100;
+	UT_ASSERT(storage.peer_fences[0].state == CLUSTER_KO_PEER_FENCE_COMMITTED);
+	UT_ASSERT(cluster_ko_peer_fence_gc_tick_v3());
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_EMPTY);
+	UT_ASSERT_EQ(storage.peer_fence_serial, CLUSTER_KO_SHARED_CAPACITY);
+}
+
+UT_TEST(test_peer_fence_rollback_gc_requires_exact_absent_holder)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(1200);
+	ClusterKoPeerFenceHandleV3 handle;
+	ClusterKoPeerFenceStateV3 state;
+	ClusterGesHolderProbe reply;
+
+	for (int i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		request.base.batch_id = 1200 + i;
+		UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+		UT_ASSERT(cluster_ko_peer_fence_ready_v3(&request, &handle));
+		storage.peer_fences[handle.slot].physical_applied = true;
+		storage.peer_fences[handle.slot].ack_queued = true;
+		if (i != 0) {
+			UT_ASSERT(cluster_ko_peer_commit_v3(request.base.origin_node, request.base.epoch,
+												request.base.origin_boot, request.base.peer_boot,
+												request.base.batch_id));
+			storage.peer_fences[handle.slot].physical_applied = false;
+			storage.peer_fences[handle.slot].ack_queued = false;
+		}
+	}
+	request.base.batch_id = 1200;
+	handle.slot = 0;
+	handle.serial = storage.peer_fences[0].serial;
+	holder_probe_sends = 0;
+	holder_probe_send_ok = true;
+	holder_probe_clock = 1;
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
+	UT_ASSERT(cluster_ko_peer_fence_gc_tick_v3());
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
+
+	MyBackendType = B_LMON;
+	MyAuxProcType = LmonProcess;
+	cluster_ko_lmon_tick_v2();
+	UT_ASSERT_EQ(holder_probe_sends, 1);
+	reply = holder_probe_sent;
+	reply.reply = true;
+	reply.observation = CLUSTER_GRD_HOLDER_PRESENT;
+	reply.mode = AccessExclusiveLock;
+	cluster_ko_peer_holder_observed(request.ax_master_node, &reply);
+	MyBackendType = B_SINVAL_BCAST;
+	MyAuxProcType = SinvalBcastProcess;
+	UT_ASSERT(cluster_ko_peer_fence_gc_tick_v3());
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
+
+	MyBackendType = B_SINVAL_BCAST;
+	MyAuxProcType = SinvalBcastProcess;
+	UT_ASSERT(cluster_ko_peer_holder_begin_v3(&handle));
+	MyBackendType = B_LMON;
+	MyAuxProcType = LmonProcess;
+	cluster_ko_lmon_tick_v2();
+	reply = holder_probe_sent;
+	reply.reply = true;
+	reply.observation = CLUSTER_GRD_HOLDER_ABSENT;
+	reply.mode = NoLock;
+	cluster_ko_peer_holder_observed(request.ax_master_node, &reply);
+	MyBackendType = B_SINVAL_BCAST;
+	MyAuxProcType = SinvalBcastProcess;
+	UT_ASSERT(cluster_ko_peer_fence_gc_tick_v3());
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_EMPTY);
+}
+
+UT_TEST(test_peer_fence_fresh_grant_retires_only_different_holder)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(1300);
+	ClusterKoPeerFenceHandleV3 handle;
+	ClusterKoPeerFenceStateV3 state;
+	ClusterGrdHolderId successor;
+
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+	UT_ASSERT(cluster_ko_peer_fence_ready_v3(&request, &handle));
+	storage.peer_fences[handle.slot].physical_applied = true;
+	storage.peer_fences[handle.slot].ack_queued = true;
+	v3_route_master_node = cluster_node_id;
+	request.ax_master_node = cluster_node_id;
+	UT_ASSERT(!cluster_ko_peer_fence_fresh_grant_v3(&request.ax_resid, &request.ax_holder,
+													request.ax_master_generation));
+	successor = request.ax_holder;
+	successor.request_id++;
+	UT_ASSERT(cluster_ko_peer_fence_fresh_grant_v3(&request.ax_resid, &successor,
+												   request.ax_master_generation));
+	UT_ASSERT_EQ(storage.peer_fences[handle.slot].state, CLUSTER_KO_PEER_FENCE_EMPTY);
+}
+
 UT_TEST(test_peer_committed_request_cannot_reenter_ingress_or_physical_owner)
 {
 	for (int before = 0; before <= 1; before++) {
@@ -6886,6 +6993,9 @@ main(void)
 	UT_RUN(test_peer_fence_replay_retains_full_identity_and_revision);
 	UT_RUN(test_peer_fence_terminal_is_not_a_maximum_batch_watermark);
 	UT_RUN(test_peer_fence_capacity_does_not_delete_old_terminal);
+	UT_RUN(test_peer_fence_terminal_gc_requires_local_quiescence);
+	UT_RUN(test_peer_fence_rollback_gc_requires_exact_absent_holder);
+	UT_RUN(test_peer_fence_fresh_grant_retires_only_different_holder);
 	UT_RUN(test_peer_committed_request_cannot_reenter_ingress_or_physical_owner);
 	UT_RUN(test_peer_terminal_binds_operation_across_authenticated_publication_retarget);
 	UT_RUN(test_peer_fence_shmem_creation_initializes_but_attachment_retains);

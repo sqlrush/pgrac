@@ -211,6 +211,16 @@ extern bool cluster_ko_peer_fence_begin_v3(const ClusterKoSharedMessageV3 *reque
 										 ClusterKoPeerFenceStateV3 *state);
 extern bool cluster_ko_peer_fence_ready_v3(const ClusterKoSharedMessageV3 *request,
 										 const ClusterKoPeerFenceHandleV3 *handle);
+/* SI-owner pressure tick.  It may reclaim only a fully quiesced COMMITTED
+ * fence or a READY fence whose exact AX holder query proves ABSENT; a single
+ * absent observation is never sufficient without the complete local cut. */
+extern bool cluster_ko_peer_fence_gc_tick_v3(void);
+/* Called by the GES grant dispatcher after an exact successor grant has been
+ * installed for this relation.  The grant must be a different holder and
+ * match the current master generation; no old fence is cleared otherwise. */
+extern bool cluster_ko_peer_fence_fresh_grant_v3(const ClusterResId *resid,
+												 const ClusterGrdHolderId *successor,
+												 uint64 master_generation);
 /* Only the authenticated transaction-publication consumer may call this.
  * No matching operation is an idempotent no-op, never a new READY proof. */
 extern bool cluster_ko_peer_commit_v3(int32 source_node, uint64 epoch, uint64 origin_boot,
