@@ -838,8 +838,7 @@ space_structure_prepare(const ClusterSpaceIdentityKey *expected, ClusterSpaceWal
 	/* Take the original barrier while the exact old identity is still
 	 * locked. Its ResourceOwner retains the completion through transaction
 	 * exit; preparing a replacement page does not prove durable completion. */
-	if (!cluster_ko_shared_claim_v2(expected, identity->expected.incarnation,
-									&state->ko_completion))
+	if (!cluster_ko_shared_claim_structure(&identity->expected, action, &state->ko_completion))
 		goto refused;
 	identity->action = action;
 	identity->nblocks = nblocks;

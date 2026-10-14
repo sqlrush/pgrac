@@ -280,6 +280,9 @@ static void ko_shared_backend_exit(int code, Datum arg);
 static void ko_shared_resource_release(ResourceReleasePhase phase, bool commit, bool top,
 									   void *arg);
 static void ko_shared_xact_event(XactEvent event, void *arg);
+static bool ko_shared_v3_local_binding_current(const ClusterKoSharedMessageV3 *request);
+static bool ko_shared_v3_space_matches(const ClusterKoSharedMessageV3 *message,
+									   const ClusterSpaceIdentity *identity);
 
 /* Process-local storage state belongs to the original active KO context.
  * It survives a checkpointer ERROR, but can never migrate to another process. */
@@ -2304,17 +2307,54 @@ ko_native_barrier_to_owner(ClusterKoCompletionV2 *completion)
 	return moved;
 }
 
+static bool
+ko_shared_context_covers(const ClusterKoSharedContext *context, const ClusterSpaceIdentityKey *key,
+						 const uint8 incarnation[16])
+{
+	return key != NULL && incarnation != NULL
+		   && context->request.key.system_identifier == key->system_identifier
+		   && context->request.key.database_incarnation == key->database_incarnation
+		   && memcmp(context->request.key.storage_uuid, key->storage_uuid, 16) == 0
+		   && RelFileLocatorEquals(context->request.key.locator, key->locator)
+		   && memcmp(context->request.incarnation, incarnation, 16) == 0;
+}
+
 bool
 cluster_ko_shared_covers_v2(const ClusterKoCompletionV2 *completion,
 							const ClusterSpaceIdentityKey *key, const uint8 incarnation[16])
 {
 	ClusterKoSharedContext context;
-	return key != NULL && incarnation != NULL && ko_completion_snapshot(completion, &context)
-		   && context.request.key.system_identifier == key->system_identifier
-		   && context.request.key.database_incarnation == key->database_incarnation
-		   && memcmp(context.request.key.storage_uuid, key->storage_uuid, 16) == 0
-		   && RelFileLocatorEquals(context.request.key.locator, key->locator)
-		   && memcmp(context.request.incarnation, incarnation, 16) == 0;
+	return ko_completion_snapshot(completion, &context)
+		   && ko_shared_context_covers(&context, key, incarnation);
+}
+
+/* This predicate is for the original native structural writer only. The
+ * caller supplies the old identity while holding the SPACE content locks;
+ * reusing a completed drain cannot authorize another operation or version.
+ * LOCALLOCK is backend-local and read-only: no GES wait or extra page read.
+ * Saved observations and post-commit owners do not acquire this permission. */
+static bool
+ko_shared_structure_current(const ClusterKoCompletionV2 *completion,
+							const ClusterSpaceIdentity *identity, ClusterSpaceWalAction action)
+{
+	ClusterKoSharedContext context;
+	uint16 operation;
+
+	if (identity == NULL
+		|| (action != CLUSTER_SPACE_WAL_TRUNCATE && action != CLUSTER_SPACE_WAL_TOMBSTONE)
+		|| !ko_completion_snapshot(completion, &context)
+		|| !ko_shared_context_covers(&context, &identity->key, identity->incarnation))
+		return false;
+	if (!context.v3)
+		return true;
+	operation = context.request_v3.operation;
+	return ko_shared_v3_space_matches(&context.request_v3, identity)
+		   && ((action == CLUSTER_SPACE_WAL_TRUNCATE
+				&& operation == CLUSTER_KO_SHARED_V3_OPERATION_TRUNCATE)
+			   || (action == CLUSTER_SPACE_WAL_TOMBSTONE
+				   && (operation == CLUSTER_KO_SHARED_V3_OPERATION_DROP
+					   || operation == CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD)))
+		   && ko_shared_v3_local_binding_current(&context.request_v3);
 }
 
 bool
@@ -2353,8 +2393,7 @@ cluster_ko_shared_observe_space_v2(ClusterKoCompletionV2 *completion,
 			return false;
 	} else
 		return false;
-	if (!cluster_ko_shared_covers_v2(owned, &change.identity.expected.key,
-									 change.identity.expected.incarnation))
+	if (!ko_shared_structure_current(owned, &change.identity.expected, change.identity.action))
 		return false;
 	owned->terminal = *terminal;
 	memcpy(owned->structure, wal, sizeof(owned->structure));
@@ -3379,9 +3418,10 @@ cluster_ko_shared_postcommit_cleanup_v2(void)
 /* Only the original native wrapper offers a completion for SPACE to take.
  * Keep the ResourceOwner throughout; taking it does not complete the DDL or
  * convey COMMIT/durability. Ambiguous repeated barriers are not authority. */
-bool
-cluster_ko_shared_claim_v2(const ClusterSpaceIdentityKey *key, const uint8 incarnation[16],
-						   ClusterKoCompletionV2 **out)
+static bool
+ko_shared_claim(const ClusterSpaceIdentityKey *key, const uint8 incarnation[16],
+				const ClusterSpaceIdentity *identity, ClusterSpaceWalAction action,
+				ClusterKoCompletionV2 **out)
 {
 	ClusterKoCompletionV2 *candidate = NULL;
 	if (out == NULL || *out != NULL || key == NULL || incarnation == NULL)
@@ -3395,11 +3435,31 @@ cluster_ko_shared_claim_v2(const ClusterSpaceIdentityKey *key, const uint8 incar
 			return false;
 		candidate = completion;
 	}
-	if (candidate == NULL || !cluster_ko_shared_covers_v2(candidate, key, incarnation))
+	if (candidate == NULL)
+		return false;
+	if (identity != NULL) {
+		if (!ko_shared_structure_current(candidate, identity, action))
+			return false;
+	} else if (candidate->barrier_v3 || !cluster_ko_shared_covers_v2(candidate, key, incarnation))
 		return false;
 	candidate->native_pending = false;
 	*out = candidate;
 	return true;
+}
+
+bool
+cluster_ko_shared_claim_v2(const ClusterSpaceIdentityKey *key, const uint8 incarnation[16],
+						   ClusterKoCompletionV2 **out)
+{
+	return ko_shared_claim(key, incarnation, NULL, 0, out);
+}
+
+bool
+cluster_ko_shared_claim_structure(const ClusterSpaceIdentity *identity,
+								  ClusterSpaceWalAction action, ClusterKoCompletionV2 **out)
+{
+	return identity != NULL
+		   && ko_shared_claim(&identity->key, identity->incarnation, identity, action, out);
 }
 
 bool

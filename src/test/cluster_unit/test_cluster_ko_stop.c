@@ -57,6 +57,7 @@ cluster_ic_dispatch_control_ingress(const ClusterICEnvelope *env, ClusterICContr
 
 static bool marker_capable = true, v3_local_ax, drive_v3_ack, marker_error;
 static ClusterGrdHolderId v3_local_holder;
+Oid MyDatabaseId;
 static int marker_registrations;
 static uint64 marker_batch;
 static ClusterKoSharedMessageV3 sent_v3_request, sent_v3_ack;
@@ -84,6 +85,17 @@ cluster_grd_resid_decode(const ClusterResId *resid, LOCKTAG *locktag)
 	(void)resid;
 	if (locktag != NULL)
 		MemSet(locktag, 0, sizeof(*locktag));
+}
+
+/* Exact relation key at the GRD boundary of this native-wrapper fixture. */
+void
+cluster_grd_resid_encode(const LOCKTAG *tag, ClusterResId *resid)
+{
+	MemSet(resid, 0, sizeof(*resid));
+	resid->field1 = tag->locktag_field1;
+	resid->field2 = tag->locktag_field2;
+	resid->type = tag->locktag_type;
+	resid->lockmethodid = tag->locktag_lockmethodid;
 }
 
 bool
@@ -6771,6 +6783,219 @@ origin_marker_setup(void)
 	binding.master_generation = request.ax_master_generation;
 	return binding;
 }
+
+static ClusterKoCompletionV2 *
+v3_native_structure_owner(uint16 operation)
+{
+	RelationData relation = { 0 };
+	Oid old_database = MyDatabaseId;
+	ClusterKoCompletionV2 *completion;
+
+	(void)origin_marker_setup();
+	space_identity.sequence = 1;
+	writer.claim.identity.origin_thread_id = 1;
+	writer.claim.identity.thread_claim_created_at = 123;
+	writer.claim.identity.root_lineage_seq = 1;
+	writer.claim.identity.authority_uuid[0] = 17;
+	writer.claim.max_config_generation = 1;
+	writer.claim.claim_sha256[0] = 19;
+	writer.timeline = 1;
+	relation.rd_id = 4242;
+	relation.rd_locator = space_identity.key.locator;
+	MyDatabaseId = relation.rd_locator.dbOid;
+	/* Run the native producer; GES, SPACE read and transport remain explicit
+	 * fixture boundaries. No test manufactures the opaque completion. */
+	cluster_ko_flush_and_wait_ack_relation(&relation, RELPERSISTENCE_PERMANENT, operation);
+	MyDatabaseId = old_database;
+	completion = ko_completions;
+	if (completion == NULL)
+		abort();
+	UT_ASSERT(completion->native_pending && completion->barrier_v3 && completion->native_transaction
+			  && completion->barrier_private);
+	return completion;
+}
+
+UT_TEST(test_v3_native_completion_cannot_use_identity_only_claim)
+{
+	ClusterKoCompletionV2 *completion
+		= v3_native_structure_owner(CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+	ClusterKoCompletionV2 *claimed = NULL;
+
+	UT_ASSERT(
+		!cluster_ko_shared_claim_v2(&space_identity.key, space_identity.incarnation, &claimed));
+	UT_ASSERT(claimed == NULL && completion->native_pending);
+	cluster_ko_shared_release_v2(&completion);
+}
+
+UT_TEST(test_v3_native_structure_claim_is_exact_and_once)
+{
+	for (uint16 op = CLUSTER_KO_SHARED_V3_OPERATION_DROP;
+		 op <= CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD; op++) {
+		ClusterKoCompletionV2 *owner = v3_native_structure_owner(op), *claimed = NULL;
+		ClusterKoCompletionV2 *again = NULL;
+		ClusterSpaceWalAction action = op == CLUSTER_KO_SHARED_V3_OPERATION_TRUNCATE
+										   ? CLUSTER_SPACE_WAL_TRUNCATE
+										   : CLUSTER_SPACE_WAL_TOMBSTONE;
+		int reads = space_reads, requests = barrier_requests;
+
+		UT_ASSERT(cluster_ko_shared_claim_structure(&space_identity, action, &claimed));
+		UT_ASSERT(claimed == owner && !owner->native_pending);
+		UT_ASSERT(!cluster_ko_shared_claim_structure(&space_identity, action, &again));
+		UT_ASSERT(again == NULL);
+		UT_ASSERT_EQ(space_reads, reads);
+		UT_ASSERT_EQ(barrier_requests, requests);
+		cluster_ko_shared_release_v2(&owner);
+	}
+}
+
+UT_TEST(test_v3_native_structure_claim_refuses_drift_before_consumption)
+{
+	for (unsigned fault = 0; fault < 18; fault++) {
+		ClusterKoCompletionV2 *owner
+			= v3_native_structure_owner(CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+		ClusterKoCompletionV2 *claimed = NULL;
+		ClusterSpaceIdentity identity = space_identity;
+		ClusterSpaceWalAction action = CLUSTER_SPACE_WAL_TOMBSTONE;
+
+		switch (fault) {
+		case 0:
+			identity.operation++;
+			break;
+		case 1:
+			identity.incarnation[0]++;
+			break;
+		case 2:
+			identity.key.locator.relNumber++;
+			break;
+		case 3:
+			identity.key.storage_uuid[0]++;
+			break;
+		case 4:
+			identity.key.database_incarnation++;
+			break;
+		case 5:
+			identity.key.system_identifier++;
+			break;
+		case 6:
+			identity.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+			break;
+		case 7:
+			action = CLUSTER_SPACE_WAL_TRUNCATE;
+			break;
+		case 8:
+			action = CLUSTER_SPACE_WAL_CREATE;
+			break;
+		case 9:
+			v3_local_ax = false;
+			break;
+		case 10:
+			v3_local_holder.procno++;
+			break;
+		case 11:
+			v3_local_holder.request_id++;
+			break;
+		case 12:
+			v3_route_generation++;
+			break;
+		case 13:
+			v3_route_master_node = 0;
+			break;
+		case 14:
+			current_epoch++;
+			break;
+		case 15:
+			formation.membership.last_admitted_incarnation[1]++;
+			break;
+		case 16:
+			CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)2;
+			break;
+		case 17:
+			CritSectionCount = 1;
+			break;
+		}
+		UT_ASSERT(!cluster_ko_shared_claim_structure(&identity, action, &claimed));
+		UT_ASSERT(claimed == NULL && owner->native_pending);
+		CritSectionCount = 0;
+		CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)1;
+		cluster_ko_shared_release_v2(&owner);
+	}
+}
+
+static void
+v3_structure_record(bool drop, uint64 old_token, ClusterPageWalBindingV1 *binding, uint8 *wal)
+{
+	ClusterSpaceStructureChange change = { 0 };
+	change.identity.expected = space_identity;
+	change.identity.expected.operation = change.identity.before_token = old_token;
+	change.identity.result = change.identity.expected;
+	change.identity.result.sequence++;
+	change.identity.result.operation = change.identity.result_token = old_token + 1;
+	change.identity.action = drop ? CLUSTER_SPACE_WAL_TOMBSTONE : CLUSTER_SPACE_WAL_TRUNCATE;
+	change.identity.nblocks = drop ? InvalidBlockNumber : 4;
+	if (drop)
+		change.identity.result.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+	else
+		change.identity.result.incarnation[0]++;
+	change.reservation.action
+		= drop ? CLUSTER_SPACE_RESERVATION_TOMBSTONE : CLUSTER_SPACE_RESERVATION_RESET;
+	change.reservation.before.identity = change.identity.expected;
+	change.reservation.before.next_block = 8;
+	change.reservation.before_token = old_token;
+	change.reservation.result.identity = change.identity.result;
+	change.reservation.result.next_block = drop ? 8 : 4;
+	change.reservation.first_block = drop ? 0 : 4;
+	change.reservation.result_token = old_token + 1;
+	UT_ASSERT(cluster_space_structure_wal_encode(&change, wal, CLUSTER_SPACE_STRUCTURE_WAL_BYTES));
+	memset(binding, 0, sizeof(*binding));
+	binding->source = writer;
+	binding->identity.system_identifier = space_identity.key.system_identifier;
+	memcpy(binding->identity.storage_uuid, space_identity.key.storage_uuid, 16);
+	binding->identity.locator = space_identity.key.locator;
+	binding->identity.forknum = SPACE_FORKNUM;
+	memcpy(binding->version.segment_incarnation, change.identity.result.incarnation, 16);
+	binding->version.mutation_token = old_token + 1;
+	binding->record_start = 0x100;
+	binding->record_end = 0x180;
+	binding->record_crc = 7;
+	binding->rmid = drop ? RM_XACT_ID : RM_SMGR_ID;
+	binding->info = drop ? XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO : XLOG_SMGR_SPACE_IDENTITY;
+	binding->flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
+	UT_ASSERT(cluster_page_wal_binding_shape_v1(binding));
+}
+
+UT_TEST(test_v3_observation_requires_original_operation_token_and_live_ax)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ClusterKoCompletionV2 *owner
+			= v3_native_structure_owner(CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+		ClusterKoCompletionV2 *claimed = NULL;
+		ClusterPageWalBindingV1 binding, copied;
+		uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], observed[sizeof(wal)];
+
+		UT_ASSERT(cluster_ko_shared_claim_structure(&space_identity, CLUSTER_SPACE_WAL_TOMBSTONE,
+													&claimed));
+		v3_structure_record(fault != 0, space_identity.operation + (fault == 1), &binding, wal);
+		if (fault == 2)
+			v3_local_ax = false;
+		if (fault == 3)
+			v3_local_holder.procno++;
+		UT_ASSERT(!cluster_ko_shared_observe_space_v2(claimed, &binding, wal, sizeof(wal)));
+		UT_ASSERT(!owner->space_observed);
+		v3_local_ax = true;
+		v3_local_holder = owner->barrier_request_v3.ax_holder;
+		v3_structure_record(true, space_identity.operation, &binding, wal);
+		UT_ASSERT(cluster_ko_shared_observe_space_v2(claimed, &binding, wal, sizeof(wal)));
+		UT_ASSERT(!cluster_ko_shared_observe_space_v2(claimed, &binding, wal, sizeof(wal)));
+		/* Consuming the stored durable observation is not a new structural
+		 * writer. It remains readable after the original AX is released. */
+		v3_local_ax = false;
+		UT_ASSERT(
+			cluster_ko_shared_space_observation_v2(claimed, &copied, observed, sizeof(observed)));
+		UT_ASSERT(memcmp(wal, observed, sizeof(wal)) == 0);
+		cluster_ko_shared_release_v2(&owner);
+	}
+}
+
 UT_TEST(test_v3_origin_registers_exact_marker_before_first_request)
 {
 	KoAxBinding binding = origin_marker_setup();
@@ -6931,7 +7156,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(159);
+	UT_PLAN(163);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
 	UT_RUN(test_peer_space_entry_checks_precede_io);
@@ -7084,6 +7309,10 @@ main(void)
 	UT_RUN(test_peer_holder_probe_exact_reply_is_observation_only);
 	UT_RUN(test_peer_holder_probe_refresh_retry_and_late_reply_keep_owner);
 	UT_RUN(test_v3_origin_registers_exact_marker_before_first_request);
+	UT_RUN(test_v3_native_completion_cannot_use_identity_only_claim);
+	UT_RUN(test_v3_native_structure_claim_is_exact_and_once);
+	UT_RUN(test_v3_native_structure_claim_refuses_drift_before_consumption);
+	UT_RUN(test_v3_observation_requires_original_operation_token_and_live_ax);
 	UT_RUN(test_v3_origin_refuses_missing_marker_capability_before_publication);
 	UT_RUN(test_v3_origin_marker_error_releases_only_unsent_context);
 	UT_RUN(test_v3_sender_retries_only_caller_owned_frame);

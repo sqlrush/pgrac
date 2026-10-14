@@ -91,6 +91,7 @@ static unsigned fake_allocations, fake_frees;
 static int nest_level;
 static unsigned ko_calls;
 static unsigned ko_claims;
+static unsigned ko_structure_claims;
 static bool ko_pending, ko_claim_unavailable;
 static ClusterSpaceIdentityKey ko_key;
 static uint8 ko_incarnation[16];
@@ -1044,6 +1045,24 @@ cluster_ko_shared_claim_v2(const ClusterSpaceIdentityKey *key, const uint8 incar
 	*out = (ClusterKoCompletionV2 *)&ko_handle;
 	return true;
 }
+
+/* Test the real SPACE producer's argument projection independently of the
+ * KO implementation, which is exercised by test_cluster_ko_stop. */
+bool
+cluster_ko_shared_claim_structure(const ClusterSpaceIdentity *identity,
+								  ClusterSpaceWalAction action, ClusterKoCompletionV2 **out)
+{
+	ClusterSpaceIdentity current;
+	uint64 token;
+
+	ko_structure_claims++;
+	UT_ASSERT(identity != NULL);
+	UT_ASSERT_EQ(action, drop_owner ? CLUSTER_SPACE_WAL_TOMBSTONE : CLUSTER_SPACE_WAL_TRUNCATE);
+	UT_ASSERT(cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0,
+												 &identity->key, &current, &token));
+	UT_ASSERT(memcmp(identity, &current, sizeof(current)) == 0);
+	return cluster_ko_shared_claim_v2(&identity->key, identity->incarnation, out);
+}
 int
 errmsg(const char *fmt, ...)
 {
@@ -1329,6 +1348,7 @@ reset(void)
 	nest_level = 1;
 	ko_calls = 0;
 	ko_claims = 0;
+	ko_structure_claims = 0;
 	ko_pending = ko_claim_unavailable = false;
 	space_observe_calls = space_observations = observation_reads = observation_fault = 0;
 	truncate_observations = 0;
@@ -3423,11 +3443,31 @@ UT_TEST(test_drop_missing_or_replaced_original_ko_refuses_before_structural_chan
 	}
 }
 
+UT_TEST(test_native_structure_claim_passes_locked_identity_and_action)
+{
+	Relation rel = native_truncate_relation();
+	ClusterSpaceDropState *state;
+
+	RelationTruncate(rel, 4);
+	UT_ASSERT_EQ(ko_structure_claims, 1);
+	FreeFakeRelcacheEntry(rel);
+	rel = native_truncate_relation();
+	drop_owner = true;
+	cluster_ko_flush_and_wait_ack(locator, RELPERSISTENCE_PERMANENT);
+	state = cluster_space_drop_prepare(&locator, 1);
+	UT_ASSERT(state != NULL);
+	UT_ASSERT_EQ(ko_structure_claims, 1);
+	if (state != NULL)
+		cluster_space_drop_finish(state);
+	FreeFakeRelcacheEntry(rel);
+}
+
 int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(66);
+	UT_PLAN(67);
+	UT_RUN(test_native_structure_claim_passes_locked_identity_and_action);
 	UT_RUN(test_maintenance_identity_uses_current_owner_without_backend_id);
 	UT_RUN(test_maintenance_identity_retry_keeps_work_and_releases_pin);
 	UT_RUN(test_maintenance_identity_preserves_namespace_and_live_page_checks);

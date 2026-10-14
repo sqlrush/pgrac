@@ -355,6 +355,12 @@ extern bool cluster_ko_shared_begin_v2(RelFileLocator rlocator, char relpersiste
  * second barrier. Refusal leaves out unchanged. */
 extern bool cluster_ko_shared_claim_v2(const ClusterSpaceIdentityKey *key,
 									   const uint8 incarnation[16], ClusterKoCompletionV2 **out);
+/* Native structural writer: the locked old SPACE identity and action must
+ * match the completed operation. V3 also requires its exact original local
+ * AX binding. The identity-only v2 entry cannot consume a v3 completion. */
+extern bool cluster_ko_shared_claim_structure(const ClusterSpaceIdentity *identity,
+											  ClusterSpaceWalAction action,
+											  ClusterKoCompletionV2 **out);
 struct ClusterPageWalBindingV1;
 /* Original SPACE finish, after both pages have an exact durable observation.
  * Saves only that observation in the already reserved native handle. This is
