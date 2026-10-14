@@ -1,0 +1,81 @@
+/*-------------------------------------------------------------------------
+ * cluster_recovery_root_set.h
+ *   Union of physical namespace observations and retained WAL targets.
+ *
+ * Portions Copyright (c) 2026, pgrac contributors
+ * Author: SqlRush <sqlrush@gmail.com>
+ *-------------------------------------------------------------------------
+ */
+#ifndef CLUSTER_RECOVERY_ROOT_SET_H
+#define CLUSTER_RECOVERY_ROOT_SET_H
+
+#include "cluster/cluster_recovery_namespace.h"
+#include "cluster/cluster_page_stable_base.h"
+
+#ifdef USE_PGRAC_CLUSTER
+
+typedef enum ClusterRecoveryRootsResult {
+	CLUSTER_RECOVERY_ROOTS_MORE = 0,
+	CLUSTER_RECOVERY_ROOTS_ENTRY,
+	CLUSTER_RECOVERY_ROOTS_BYTES,
+	CLUSTER_RECOVERY_ROOTS_OBSERVED,
+	CLUSTER_RECOVERY_ROOTS_INVALID,
+	CLUSTER_RECOVERY_ROOTS_IO,
+	CLUSTER_RECOVERY_ROOTS_CHANGED,
+	CLUSTER_RECOVERY_ROOTS_UNSAFE,
+	CLUSTER_RECOVERY_ROOTS_CAPACITY
+} ClusterRecoveryRootsResult;
+
+#define CLUSTER_RECOVERY_ROOT_FROM_WAL 1
+#define CLUSTER_RECOVERY_ROOT_PHYSICAL 2
+
+typedef struct ClusterRecoveryRootEntry {
+	ClusterRecoveryNamespaceEntry file;
+	uint32 origins;			  /* FROM_WAL and/or PHYSICAL; neither discharges an obligation */
+	uint64 required_blocks;	  /* maximum referenced block + 1, NOT a file-size promise */
+	uint8 content_sha256[32]; /* entire regular file; zero for a directory/missing file */
+} ClusterRecoveryRootEntry;
+
+typedef struct ClusterRecoveryRootsEvent {
+	const ClusterRecoveryRootEntry *entry;
+	const uint8 *bytes; /* current chunk, valid until next step/destroy */
+	uint64 offset;
+	size_t length;
+	unsigned pass; /* 0 = discovery, 1 = full re-observation */
+} ClusterRecoveryRootsEvent;
+
+typedef struct ClusterRecoveryRootSet ClusterRecoveryRootSet;
+
+/* The original cold owner supplies its retained, isolated ROOT-selected fd
+ * and namespace. This component borrows the fd and establishes no authority.
+ * Destroy on every exit, including PG_FINALLY. No target I/O or sync occurs. */
+extern ClusterRecoveryRootsResult
+cluster_recovery_root_set_begin(int root_fd, uint64 system_identifier, uint64 database_incarnation,
+								const uint8 storage_uuid[16], size_t memory_budget,
+								ClusterRecoveryRootSet **out);
+
+/* Before the first step only. Preserve every typed PAGE target, including a
+ * currently missing fork or blocks beyond EOF; the typed owner must explain
+ * CREATE/DROP/TRUNCATE. Original record/source/incarnation proofs stay in the
+ * cold plan, not in this physical-path index. Other producers are not implied. */
+extern ClusterRecoveryRootsResult
+cluster_recovery_root_set_add_target(ClusterRecoveryRootSet *roots, const RfPageIdentityV1 *page);
+
+/* At most one BLCKSZ read or 128 metadata/sort operations per call. Observe
+ * all files twice, not only WAL targets. Unknown files remain UNCLASSIFIED.
+ * Directory/name/file identity and complete bytes must agree. OBSERVED is
+ * only a stable candidate root set: missing/unknown/undecoded obligations
+ * still prevent D1 completion. No terminal, apply, OPEN or GC permission. */
+extern ClusterRecoveryRootsResult cluster_recovery_root_set_step(ClusterRecoveryRootSet *roots,
+																 ClusterRecoveryRootsEvent *out);
+extern uint32 cluster_recovery_root_set_count(const ClusterRecoveryRootSet *roots);
+extern const ClusterRecoveryRootEntry *
+cluster_recovery_root_set_entry(const ClusterRecoveryRootSet *roots, uint32 index);
+/* Full SHA-256 of a domain-separated, canonical path-ordered encoding.
+ * No stat padding, truncated hash or CRC. Only available after OBSERVED;
+ * digest equality is an index, never a substitute for the original proofs. */
+extern bool cluster_recovery_root_set_digest(const ClusterRecoveryRootSet *roots, uint8 out[32]);
+extern void cluster_recovery_root_set_destroy(ClusterRecoveryRootSet *roots);
+
+#endif
+#endif

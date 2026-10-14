@@ -10,6 +10,7 @@
 #define CLUSTER_RECOVERY_NAMESPACE_H
 
 #include "c.h"
+#include <sys/stat.h>
 #include "common/relpath.h"
 #include "storage/relfilelocator.h"
 
@@ -43,6 +44,8 @@ typedef struct ClusterRecoveryNamespaceEntry {
 	uint64 size;
 	uint32 undo_segment;
 	uint8 undo_owner_instance;
+	/* Local observation only, never serialized or used as storage authority. */
+	struct stat observed;
 } ClusterRecoveryNamespaceEntry;
 
 typedef struct ClusterRecoveryNamespace ClusterRecoveryNamespace;
@@ -59,6 +62,13 @@ cluster_recovery_namespace_classify(const char *path, RelFileLocator *locator, F
  * The caller destroys the scanner on every exit, including PG_FINALLY. */
 extern ClusterRecoveryNamespaceResult
 cluster_recovery_namespace_begin(int root_fd, uint32 max_entries, ClusterRecoveryNamespace **out);
+
+/* Includes the directory stack and libc stream buffers. Stream reservations
+ * are returned on close; an unsupported/unbounded libc/filesystem shape or
+ * exhausted budget is CAPACITY, never END. No recovery authority is added. */
+extern ClusterRecoveryNamespaceResult
+cluster_recovery_namespace_begin_bounded(int root_fd, uint32 max_entries, size_t memory_budget,
+										 ClusterRecoveryNamespace **out);
 
 /* At most 128 directory items per call. ENTRY returns a borrowed file fd for
  * regular files, valid until next/destroy; directories return -1. Do not close
@@ -81,5 +91,7 @@ extern ClusterRecoveryNamespaceResult
 cluster_recovery_namespace_read_current(ClusterRecoveryNamespace *scan, uint64 offset, void *buffer,
 										size_t length);
 extern void cluster_recovery_namespace_destroy(ClusterRecoveryNamespace *scan);
+extern bool cluster_recovery_namespace_stat_same(const struct stat *before,
+												 const struct stat *after);
 
 #endif

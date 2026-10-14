@@ -11,6 +11,12 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+#include <sys/mount.h>
+#elif defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_recovery_namespace.h"
 #include "cluster/cluster_undo_segment.h"
@@ -22,6 +28,7 @@
 
 typedef struct RecoveryDirectory {
 	DIR *stream;
+	size_t reservation;
 	struct stat observed;
 	char path[MAXPGPATH];
 } RecoveryDirectory;
@@ -31,6 +38,7 @@ struct ClusterRecoveryNamespace {
 	unsigned depth;
 	uint32 entries;
 	uint32 max_entries;
+	size_t memory_budget, memory_reserved;
 	ClusterRecoveryNamespaceResult state;
 	int current_fd;
 	struct stat current_stat;
@@ -142,9 +150,11 @@ cluster_recovery_namespace_classify(const char *path, RelFileLocator *locator, F
 	return kind;
 }
 
-static bool
-namespace_same(const struct stat *before, const struct stat *after)
+bool
+cluster_recovery_namespace_stat_same(const struct stat *before, const struct stat *after)
 {
+	if (before == NULL || after == NULL)
+		return false;
 	if (before->st_dev != after->st_dev || before->st_ino != after->st_ino
 		|| before->st_mode != after->st_mode || before->st_uid != after->st_uid
 		|| before->st_gid != after->st_gid || before->st_nlink != after->st_nlink
@@ -163,13 +173,61 @@ namespace_same(const struct stat *before, const struct stat *after)
 #endif
 }
 
+/* Reserve libc's directory storage before opening it, including a possible
+ * readdir buffer enlargement. Darwin union directories may cache all entries
+ * in fdopendir, so cannot enter a bounded scan. Neither scanner uses telldir.
+ * Check the actual allocations too, rather than trusting a libc size guess. */
+static size_t
+namespace_directory_reservation(int fd, const struct stat *held)
+{
+#ifdef __APPLE__
+	struct statfs filesystem;
+
+	if (fstatfs(fd, &filesystem) != 0)
+		return 0;
+	if ((filesystem.f_flags & MNT_UNION) != 0) {
+		errno = ENOTSUP;
+		return 0;
+	}
+	/* DIR/telldir plus 2 KiB initial and 8 KiB enlarged buffer, including
+	 * the brief overlap during readdir's replacement allocation. */
+	return 16 * 1024;
+#elif defined(__GLIBC__)
+	/* glibc allocates DIR and a 32 KiB..1 MiB stat-hinted buffer together.
+	 * The extra page covers DIR and allocator rounding. */
+	return Min(Max((size_t)held->st_blksize, (size_t)32768), (size_t)1048576) + 4096;
+#else
+	errno = ENOTSUP;
+	return 0;
+#endif
+}
+
+static size_t
+namespace_directory_allocated(DIR *stream)
+{
+#ifdef __APPLE__
+	size_t object = malloc_size(stream);
+	size_t buffer = malloc_size(stream->__dd_buf);
+
+	return object == 0 || buffer == 0 || object > SIZE_MAX - buffer ? SIZE_MAX : object + buffer;
+#elif defined(__GLIBC__)
+	size_t size = malloc_usable_size(stream);
+
+	return size == 0 ? SIZE_MAX : size;
+#else
+	return SIZE_MAX;
+#endif
+}
+
 /* Open a new directory description: dup alone shares the caller's cursor. */
 static DIR *
-namespace_directory(int parent, const char *name, const struct stat *expected)
+namespace_directory(ClusterRecoveryNamespace *scan, int parent, const char *name,
+					const struct stat *expected, size_t *reservation)
 {
 	int fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
 	struct stat held;
 	DIR *stream;
+	size_t charge;
 
 	if (fd < 0)
 		return NULL;
@@ -180,20 +238,42 @@ namespace_directory(int parent, const char *name, const struct stat *expected)
 		errno = saved_errno;
 		return NULL;
 	}
-	if (!namespace_same(expected, &held)) {
+	if (!cluster_recovery_namespace_stat_same(expected, &held)) {
 		close(fd);
 		errno = ESTALE;
 		return NULL;
 	}
-	stream = fdopendir(fd);
-	if (stream == NULL)
+	charge = namespace_directory_reservation(fd, &held);
+	if (charge == 0 || charge > scan->memory_budget - scan->memory_reserved) {
+		int saved_errno = charge == 0 ? errno : ENOMEM;
+
 		close(fd);
+		errno = saved_errno;
+		return NULL;
+	}
+	stream = fdopendir(fd);
+	if (stream == NULL) {
+		int saved_errno = errno;
+
+		close(fd);
+		errno = saved_errno;
+		return NULL;
+	}
+	if (namespace_directory_allocated(stream) > charge) {
+		closedir(stream);
+		errno = ENOMEM;
+		return NULL;
+	}
+	scan->memory_reserved += charge;
+	*reservation = charge;
 	return stream;
 }
 
 static ClusterRecoveryNamespaceResult
 namespace_io_result(void)
 {
+	if (errno == ENOMEM || errno == ENOTSUP)
+		return CLUSTER_RECOVERY_NAMESPACE_CAPACITY;
 	return errno == ENOENT || errno == ESTALE || errno == ELOOP || errno == ENOTDIR
 			   ? CLUSTER_RECOVERY_NAMESPACE_CHANGED
 			   : CLUSTER_RECOVERY_NAMESPACE_IO;
@@ -201,6 +281,13 @@ namespace_io_result(void)
 
 ClusterRecoveryNamespaceResult
 cluster_recovery_namespace_begin(int root_fd, uint32 max_entries, ClusterRecoveryNamespace **out)
+{
+	return cluster_recovery_namespace_begin_bounded(root_fd, max_entries, SIZE_MAX, out);
+}
+
+ClusterRecoveryNamespaceResult
+cluster_recovery_namespace_begin_bounded(int root_fd, uint32 max_entries, size_t memory_budget,
+										 ClusterRecoveryNamespace **out)
 {
 	struct stat root;
 	ClusterRecoveryNamespace *scan;
@@ -214,10 +301,14 @@ cluster_recovery_namespace_begin(int root_fd, uint32 max_entries, ClusterRecover
 		return CLUSTER_RECOVERY_NAMESPACE_IO;
 	if (!S_ISDIR(root.st_mode))
 		return CLUSTER_RECOVERY_NAMESPACE_UNSAFE;
+	if (memory_budget < sizeof(*scan))
+		return CLUSTER_RECOVERY_NAMESPACE_CAPACITY;
 	scan = calloc(1, sizeof(*scan));
 	if (scan == NULL)
 		return CLUSTER_RECOVERY_NAMESPACE_CAPACITY;
-	dir = namespace_directory(root_fd, ".", &root);
+	scan->memory_budget = memory_budget;
+	scan->memory_reserved = sizeof(*scan);
+	dir = namespace_directory(scan, root_fd, ".", &root, &scan->dirs[0].reservation);
 	if (dir == NULL) {
 		ClusterRecoveryNamespaceResult result = namespace_io_result();
 
@@ -243,7 +334,8 @@ namespace_recheck_file(ClusterRecoveryNamespace *scan)
 	if (fstat(scan->current_fd, &held) != 0
 		|| fstatat(parent, scan->current_name, &named, AT_SYMLINK_NOFOLLOW) != 0)
 		return namespace_io_result();
-	if (!namespace_same(&scan->current_stat, &held) || !namespace_same(&scan->current_stat, &named))
+	if (!cluster_recovery_namespace_stat_same(&scan->current_stat, &held)
+		|| !cluster_recovery_namespace_stat_same(&scan->current_stat, &named))
 		return CLUSTER_RECOVERY_NAMESPACE_CHANGED;
 	return CLUSTER_RECOVERY_NAMESPACE_MORE;
 }
@@ -267,7 +359,7 @@ namespace_finish_directory(ClusterRecoveryNamespace *scan)
 
 	if (fstat(dirfd(dir->stream), &held) != 0)
 		return CLUSTER_RECOVERY_NAMESPACE_IO;
-	if (!namespace_same(&dir->observed, &held))
+	if (!cluster_recovery_namespace_stat_same(&dir->observed, &held))
 		return CLUSTER_RECOVERY_NAMESPACE_CHANGED;
 	if (scan->depth > 1) {
 		const char *name = strrchr(dir->path, '/');
@@ -276,14 +368,16 @@ namespace_finish_directory(ClusterRecoveryNamespace *scan)
 		name = name == NULL ? dir->path : name + 1;
 		if (fstatat(parent, name, &named, AT_SYMLINK_NOFOLLOW) != 0)
 			return namespace_io_result();
-		if (!namespace_same(&dir->observed, &named))
+		if (!cluster_recovery_namespace_stat_same(&dir->observed, &named))
 			return CLUSTER_RECOVERY_NAMESPACE_CHANGED;
 	}
 	if (closedir(dir->stream) != 0) {
+		scan->memory_reserved -= dir->reservation;
 		dir->stream = NULL;
 		scan->depth--;
 		return CLUSTER_RECOVERY_NAMESPACE_IO;
 	}
+	scan->memory_reserved -= dir->reservation;
 	dir->stream = NULL;
 	scan->depth--;
 	return scan->depth == 0 ? CLUSTER_RECOVERY_NAMESPACE_END : CLUSTER_RECOVERY_NAMESPACE_MORE;
@@ -314,11 +408,15 @@ cluster_recovery_namespace_next(ClusterRecoveryNamespace *scan, ClusterRecoveryN
 		struct stat named, held;
 		int parent = dirfd(dir->stream);
 		int written;
+		int read_errno;
 
 		errno = 0;
 		item = readdir(dir->stream);
+		read_errno = errno;
+		if (namespace_directory_allocated(dir->stream) > dir->reservation)
+			return scan->state = CLUSTER_RECOVERY_NAMESPACE_CAPACITY;
 		if (item == NULL) {
-			if (errno != 0)
+			if (read_errno != 0)
 				return scan->state = CLUSTER_RECOVERY_NAMESPACE_IO;
 			scan->state = namespace_finish_directory(scan);
 			if (scan->state != CLUSTER_RECOVERY_NAMESPACE_MORE)
@@ -342,7 +440,8 @@ cluster_recovery_namespace_next(ClusterRecoveryNamespace *scan, ClusterRecoveryN
 			if (scan->depth == RECOVERY_NAMESPACE_DEPTH)
 				return scan->state = CLUSTER_RECOVERY_NAMESPACE_CAPACITY;
 			child = &scan->dirs[scan->depth];
-			child->stream = namespace_directory(parent, item->d_name, &named);
+			child->stream
+				= namespace_directory(scan, parent, item->d_name, &named, &child->reservation);
 			if (child->stream == NULL)
 				return scan->state = namespace_io_result();
 			child->observed = named;
@@ -362,7 +461,7 @@ cluster_recovery_namespace_next(ClusterRecoveryNamespace *scan, ClusterRecoveryN
 				close(fd);
 				return scan->state = CLUSTER_RECOVERY_NAMESPACE_IO;
 			}
-			if (!namespace_same(&named, &held)) {
+			if (!cluster_recovery_namespace_stat_same(&named, &held)) {
 				close(fd);
 				return scan->state = CLUSTER_RECOVERY_NAMESPACE_CHANGED;
 			}
@@ -378,6 +477,7 @@ cluster_recovery_namespace_next(ClusterRecoveryNamespace *scan, ClusterRecoveryN
 			*file_fd = fd;
 		}
 		scan->entries++;
+		entry.observed = named;
 		*out = entry;
 		return CLUSTER_RECOVERY_NAMESPACE_ENTRY;
 	}
