@@ -675,11 +675,19 @@ ko_shared_v3_control_current(const ClusterKoSharedMessageV3 *message)
 	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], generation;
 	uint32 capabilities, capability_generation;
 	uint8 expected[CLUSTER_KO_SHARED_V3_BYTES], observed[sizeof(expected)];
-	int other;
+	int32 current_master, other;
 
 	if (message == NULL)
 		return false;
 	current = *message;
+	/* The wire carries the GES route token as provenance, not as an
+	 * authority claim.  Re-read the current route before either origin or
+	 * peer dispatch; a stale master generation must not be allowed to
+	 * consume the request or produce an ACK. */
+	current_master = cluster_grd_lookup_master_gen(&message->ax_resid, &generation);
+	if (current_master < 0 || current_master != message->ax_master_node
+		|| generation != message->ax_master_generation)
+		return false;
 	if (message->base.origin_node >= CLUSTER_KO_SHARED_NODE_LIMIT
 		|| message->base.peer_node >= CLUSTER_KO_SHARED_NODE_LIMIT
 		|| (cluster_node_id != message->base.origin_node
@@ -2491,6 +2499,27 @@ ko_capture_relation_ax_binding(Relation rel, KoAxBinding *out)
 		   && out->master_generation != 0;
 }
 
+/* The origin backend owns the LOCALLOCK that produced a v3 request. Keep
+ * this check outside ko_shared_v3_control_current(): that predicate also runs
+ * in LMON and on peers, where there is no backend-local LOCALLOCK to inspect. */
+static bool
+ko_shared_v3_local_binding_current(const ClusterKoSharedMessageV3 *request)
+{
+	LOCKTAG locktag;
+	ClusterGrdHolderId holder;
+	uint64 request_id, master_generation;
+	int32 master_node;
+
+	if (request == NULL || request->base.origin_node != cluster_node_id)
+		return false;
+	cluster_grd_resid_decode(&request->ax_resid, &locktag);
+	return cluster_lock_current_ax_binding(&locktag, &holder, &request_id, &master_node,
+																					&master_generation)
+			&& memcmp(&holder, &request->ax_holder, sizeof(holder)) == 0
+			&& request_id == request->ax_request_id && master_node == request->ax_master_node
+			&& master_generation == request->ax_master_generation;
+}
+
 static bool
 ko_shared_prepare_request_v3(RelFileLocator locator, uint16 operation,
 							 const KoAxBinding *binding, ClusterKoSharedMessageV3 *request,
@@ -2771,6 +2800,8 @@ ko_run_shared_barrier_impl_v3(RelFileLocator locator, uint16 operation,
 	TimestampTz deadline;
 
 	if (!ko_shared_prepare_request_v3(locator, operation, binding, &request, boots, &mask))
+		return false;
+	if (!ko_shared_v3_local_binding_current(&request))
 		return false;
 	if (mask == 0 && completion == NULL) {
 		KO_BUMP(native_count);
