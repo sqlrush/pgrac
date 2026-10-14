@@ -4120,20 +4120,47 @@ ko_shared_v3_space_current(const ClusterKoSharedMessageV3 *message)
 			   && ko_shared_v3_space_matches(message, &identity);
 }
 
-/* SI auxiliary peers must use the maintenance/current owner path. A regular
- * relation reader is backend-indexed and cannot prove the peer's SPACE token. */
+/* The origin captured the exact SPACE incarnation/token under its bound AX.
+ * The authenticated ingress retained that complete identity in this fence.
+ * Consuming it must not acquire current merely to observe SPACE: doing so can
+ * create another old-incarnation carrier while this peer is draining it. */
 static bool
-ko_shared_v3_peer_space_current(const ClusterKoSharedMessageV3 *message)
+ko_shared_v3_peer_identity_current(const ClusterKoSharedMessageV3 *message)
 {
-	ClusterSpaceIdentity identity;
+	uint8 encoded[CLUSTER_KO_SHARED_V3_BYTES];
+	uint64 serial = 0, peer_route_generation = 0;
+	unsigned slot = CLUSTER_KO_SHARED_CAPACITY;
+	bool current = false;
 
-	if (message == NULL || !cluster_shared_config
+	if (ko_state == NULL || message == NULL || !cluster_shared_config
 		|| message->base.verb != CLUSTER_KO_SHARED_REQUEST
 		|| message->base.peer_node != cluster_node_id || MyBackendType != B_SINVAL_BCAST
-		|| CurrentResourceOwner == NULL || CritSectionCount != 0)
+		|| CurrentResourceOwner == NULL || CritSectionCount != 0
+		|| !cluster_ko_shared_encode_v3(message, encoded, sizeof(encoded)))
 		return false;
-	return cluster_space_relation_read_maintenance_identity(message->base.key.locator, &identity)
-		   && ko_shared_v3_space_matches(message, &identity);
+	SpinLockAcquire(&ko_state->shared_lock);
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		const ClusterKoPeerFenceV3 *entry = &ko_state->peer_fences[i];
+
+		if (entry->state == CLUSTER_KO_PEER_FENCE_ACTIVE && entry->serial != 0
+			&& memcmp(entry->encoded, encoded, sizeof(encoded)) == 0) {
+			slot = i;
+			serial = entry->serial;
+			peer_route_generation = entry->peer_route_generation;
+			break;
+		}
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	if (slot == CLUSTER_KO_SHARED_CAPACITY
+		|| !ko_shared_v3_control_at_generation(message, peer_route_generation))
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	current = ko_state->peer_fences[slot].state == CLUSTER_KO_PEER_FENCE_ACTIVE
+			  && ko_state->peer_fences[slot].serial == serial
+			  && ko_state->peer_fences[slot].peer_route_generation == peer_route_generation
+			  && memcmp(ko_state->peer_fences[slot].encoded, encoded, sizeof(encoded)) == 0;
+	SpinLockRelease(&ko_state->shared_lock);
+	return current;
 }
 
 static bool
@@ -4887,7 +4914,7 @@ cluster_ko_drain_inbound_and_apply(void)
 			|| (slot.shared
 				&& (slot.v3 ? (!ko_shared_v3_control_at_generation(&slot.qualified_v3,
 																   slot.peer_route_generation)
-							   || !ko_shared_v3_peer_space_current(&slot.qualified_v3))
+							   || !ko_shared_v3_peer_identity_current(&slot.qualified_v3))
 							: (!ko_shared_control_current(&slot.qualified)
 							   || !ko_shared_peer_space_current(&slot.qualified)))))
 			goto next;
@@ -4903,7 +4930,7 @@ cluster_ko_drain_inbound_and_apply(void)
 			|| (slot.shared
 				&& (slot.v3 ? (!ko_shared_v3_control_at_generation(&slot.qualified_v3,
 																   slot.peer_route_generation)
-							   || !ko_shared_v3_peer_space_current(&slot.qualified_v3))
+							   || !ko_shared_v3_peer_identity_current(&slot.qualified_v3))
 							: !ko_shared_control_current(&slot.qualified))))
 			goto next;
 
@@ -4918,7 +4945,7 @@ cluster_ko_drain_inbound_and_apply(void)
 			|| (slot.shared
 				&& (slot.v3 ? (!ko_shared_v3_control_at_generation(&slot.qualified_v3,
 																   slot.peer_route_generation)
-							   || !ko_shared_v3_peer_space_current(&slot.qualified_v3))
+							   || !ko_shared_v3_peer_identity_current(&slot.qualified_v3))
 							: !ko_shared_control_current(&slot.qualified))))
 			goto next;
 		if (cluster_shared_config && cluster_smgr_which_for(rloc, InvalidBackendId) == 1) {
@@ -4931,15 +4958,15 @@ cluster_ko_drain_inbound_and_apply(void)
 					|| (slot.shared
 						&& (slot.v3 ? (!ko_shared_v3_control_at_generation(
 										   &slot.qualified_v3, slot.peer_route_generation)
-									   || !ko_shared_v3_peer_space_current(&slot.qualified_v3))
+									   || !ko_shared_v3_peer_identity_current(&slot.qualified_v3))
 									: !ko_shared_control_current(&slot.qualified))))
 					goto next;
 			}
 		}
-		/* Check SPACE before invalidation; rereading it afterwards would
-		 * recreate precisely the buffer the barrier has just discarded. */
+		/* v3 consumes the AX-bound identity without creating a SPACE carrier.
+		 * The legacy reader stays before invalidation, never after it. */
 		if (slot.shared
-			&& (slot.v3 ? !ko_shared_v3_peer_space_current(&slot.qualified_v3)
+			&& (slot.v3 ? !ko_shared_v3_peer_identity_current(&slot.qualified_v3)
 						: !ko_shared_peer_space_current(&slot.qualified)))
 			goto next;
 		DropRelationsAllBuffers(&smgr, 1);

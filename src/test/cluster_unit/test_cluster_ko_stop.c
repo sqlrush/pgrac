@@ -145,7 +145,7 @@ static uint64 current_epoch;
 static uint32 existing_forks, synced_forks;
 static int sync_count, sync_fail_fork, epoch_change_sync_fork;
 static bool epoch_change_flush, epoch_change_drop;
-static int v3_space_drift_sync;
+static int v3_fence_drift_sync;
 static bool shared_relation;
 static uint64 recorded_batch;
 static int record_count;
@@ -979,8 +979,13 @@ smgrimmedsync(SMgrRelation smgr, ForkNumber fork)
 	if (fork == sync_fail_fork)
 		pg_re_throw();
 	synced_forks |= 1u << fork;
-	if (sync_count == v3_space_drift_sync)
-		space_identity.operation++;
+	if (sync_count == v3_fence_drift_sync) {
+		/* Another identity must never inherit this accepted physical attempt. */
+		ClusterKoPeerFenceV3 *entry = &storage.peer_fences[0];
+		entry->request.space_mutation_token++;
+		UT_ASSERT(cluster_ko_shared_encode_v3(&entry->request, entry->encoded,
+											 sizeof(entry->encoded)));
+	}
 	if (fork == epoch_change_sync_fork)
 		current_epoch++;
 	if (boot_change_phase == 2)
@@ -1107,7 +1112,7 @@ reset_test(void)
 	synced_forks = 0;
 	sync_count = 0;
 	sync_fail_fork = epoch_change_sync_fork = -1;
-	v3_space_drift_sync = -1;
+	v3_fence_drift_sync = -1;
 	epoch_change_flush = epoch_change_drop = false;
 	recorded_batch = 0;
 	record_count = 0;
@@ -5512,7 +5517,7 @@ UT_TEST(test_v3_space_gate_requires_exact_identity_and_mutation_token)
 	UT_ASSERT(ko_shared_v3_space_current(&message));
 
 	/* A reused relfilenode, incarnation, or storage identity cannot satisfy
-	 * the v3 peer-side DROP gate even when the wire token is unchanged. */
+	 * the origin SPACE gate even when the wire token is unchanged. */
 	allow_space_locator_mismatch = true;
 	message.base.key.locator.relNumber++;
 	UT_ASSERT(!ko_shared_v3_space_current(&message));
@@ -5531,7 +5536,7 @@ UT_TEST(test_v3_space_gate_requires_exact_identity_and_mutation_token)
 	UT_ASSERT(!ko_shared_v3_space_current(&message));
 }
 
-UT_TEST(test_v3_peer_space_gate_uses_maintenance_identity)
+UT_TEST(test_v3_peer_identity_consumes_registered_ax_without_current)
 {
 	ClusterKoSharedMessageV3 message;
 
@@ -5539,32 +5544,77 @@ UT_TEST(test_v3_peer_space_gate_uses_maintenance_identity)
 	cluster_shared_config = real_space_reader = true;
 	MyBackendType = B_SINVAL_BCAST;
 	MyBackendId = InvalidBackendId;
+	v3_route_live = true;
+	v3_route_master_node = 1;
+	v3_route_generation = 9;
 	space_identity.key.locator.dbOid = 5;
 	space_identity.sequence = 1;
 	space_identity.operation = 88;
-	message.base = shared_request(124, current_epoch);
-	message.space_mutation_token = 88;
-	UT_ASSERT(ko_shared_v3_peer_space_current(&message));
-	UT_ASSERT_EQ(maintenance_space_locks, 1);
-	UT_ASSERT_EQ(ordinary_space_locks, 0);
+	message = shared_v3_request(124);
+	/* An otherwise valid payload alone is not the accepted owner. */
+	UT_ASSERT(!ko_shared_v3_peer_identity_current(&message));
+	UT_ASSERT_EQ(space_reads, 0);
+	enqueue_shared_v3(&message);
+	UT_ASSERT_EQ(storage.peer_fence_serial, 1);
+	/* The peer consumes the original authenticated AX/SPACE binding. Even
+	 * unavailable current must not cause an observational current request. */
+	space_current_refused = true;
+	UT_ASSERT(ko_shared_v3_peer_identity_current(&message));
+	UT_ASSERT_EQ(space_reads + maintenance_space_locks + ordinary_space_locks, 0);
 	UT_ASSERT(!space_pinned && !space_locked);
-
-	/* The maintenance reader observes the same current identity but rejects
-	 * a reused locator, incarnation, or token before the peer can Drop. */
-	allow_space_locator_mismatch = true;
-	message.base.key.locator.relNumber++;
-	UT_ASSERT(!ko_shared_v3_peer_space_current(&message));
-	message.base.key.locator.relNumber--;
-	allow_space_locator_mismatch = false;
-	message.base.incarnation[0]++;
-	UT_ASSERT(!ko_shared_v3_peer_space_current(&message));
-	message.base.incarnation[0]--;
-	message.space_mutation_token++;
-	UT_ASSERT(!ko_shared_v3_peer_space_current(&message));
-	UT_ASSERT_EQ(ordinary_space_locks, 0);
+	fixture_peer_drain();
+	UT_ASSERT_EQ(flush_count, 1);
+	UT_ASSERT_EQ(drop_count, 1);
+	UT_ASSERT_EQ(storage.send_v3_count, 1);
+	UT_ASSERT_EQ(space_reads + maintenance_space_locks + ordinary_space_locks, 0);
 }
 
-UT_TEST(test_v3_peer_rechecks_space_after_each_sync)
+UT_TEST(test_v3_peer_identity_rejects_changed_binding_without_io)
+{
+	for (int fault = 0; fault < 18; fault++) {
+		ClusterKoSharedMessageV3 message;
+
+		reset_test();
+		cluster_shared_config = real_space_reader = true;
+		MyBackendType = B_SINVAL_BCAST;
+		MyBackendId = InvalidBackendId;
+		v3_route_live = true;
+		v3_route_master_node = 1;
+		v3_route_generation = 9;
+		space_identity.key.locator.dbOid = 5;
+		space_identity.sequence = 1;
+		space_identity.operation = 88;
+		message = shared_v3_request(126);
+		enqueue_shared_v3(&message);
+		allow_space_locator_mismatch = true;
+		switch (fault) {
+		case 0: message.base.key.locator.relNumber++; break;
+		case 1: message.base.incarnation[0]++; break;
+		case 2: message.space_mutation_token++; break;
+		case 3: message.base.key.storage_uuid[0]++; break;
+		case 4: message.base.key.database_incarnation++; break;
+		case 5: message.base.key.system_identifier++; break;
+		case 6: message.ax_resid.field2++; break;
+		case 7: message.ax_holder.procno++; break;
+		case 8: message.ax_holder.request_id++; message.ax_request_id++; break;
+		case 9: message.operation = CLUSTER_KO_SHARED_V3_OPERATION_TRUNCATE; break;
+		case 10: message.base.batch_id++; break;
+		case 11: message.full_fork_mask ^= 1; break;
+		case 12: v3_route_generation++; break;
+		case 13: storage.peer_fences[0].state = CLUSTER_KO_PEER_FENCE_COMMITTED; break;
+		case 14: MyBackendType = B_BACKEND; break;
+		case 15: CurrentResourceOwner = NULL; break;
+		case 16: CritSectionCount = 1; break;
+		case 17: current_epoch++; break;
+		}
+		UT_ASSERT(!ko_shared_v3_peer_identity_current(&message));
+		UT_ASSERT_EQ(space_reads + maintenance_space_locks + ordinary_space_locks, 0);
+		UT_ASSERT_EQ(flush_count + sync_count + drop_count, 0);
+		CritSectionCount = 0;
+	}
+}
+
+UT_TEST(test_v3_peer_rechecks_registered_identity_after_each_sync)
 {
 	ClusterKoSharedMessageV3 message;
 
@@ -5576,17 +5626,16 @@ UT_TEST(test_v3_peer_rechecks_space_after_each_sync)
 	space_identity.key.locator.dbOid = 5;
 	space_identity.sequence = 1;
 	space_identity.operation = 88;
-	v3_space_drift_sync = 1;
+	v3_fence_drift_sync = 1;
 	message = shared_v3_request(125);
 	enqueue_shared_v3(&message);
 	fixture_peer_drain();
 
-	/* The first fork sync mutates the retained SPACE token. The new per-fork
-	 * maintenance recheck must stop before the second sync or Drop. */
 	UT_ASSERT_EQ(sync_count, 1);
 	UT_ASSERT_EQ(drop_count, 0);
 	UT_ASSERT_EQ(ack_count, 0);
 	UT_ASSERT_EQ(ko_state->send_v3_count, 0);
+	UT_ASSERT_EQ(space_reads + maintenance_space_locks + ordinary_space_locks, 0);
 }
 
 UT_TEST(test_peer_current_refusal_at_either_read_releases_pin_without_ack)
@@ -6882,14 +6931,15 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(158);
+	UT_PLAN(159);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
 	UT_RUN(test_peer_space_entry_checks_precede_io);
 	UT_RUN(test_peer_space_checks_every_identity_field_and_keeps_origin_s);
 	UT_RUN(test_v3_space_gate_requires_exact_identity_and_mutation_token);
-	UT_RUN(test_v3_peer_space_gate_uses_maintenance_identity);
-	UT_RUN(test_v3_peer_rechecks_space_after_each_sync);
+	UT_RUN(test_v3_peer_identity_consumes_registered_ax_without_current);
+	UT_RUN(test_v3_peer_identity_rejects_changed_binding_without_io);
+	UT_RUN(test_v3_peer_rechecks_registered_identity_after_each_sync);
 	UT_RUN(test_peer_current_refusal_at_either_read_releases_pin_without_ack);
 	UT_RUN(test_real_admission_flush_drop_ack_order);
 	UT_RUN(test_origin_barrier_discards_lease_even_without_remote_work);
