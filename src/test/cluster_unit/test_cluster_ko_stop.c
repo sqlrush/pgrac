@@ -786,15 +786,17 @@ cluster_injection_should_skip(const char *name)
 bool
 cluster_ctrc_relation_removal_ready_shared(uint32 spc, uint32 db, uint32 rel)
 {
-	Assert(spc == 1663 && rel == (multiple_barriers ? space_identity.key.locator.relNumber : 99));
+	if (!allow_space_locator_mismatch)
+		Assert(spc == 1663 && rel == (multiple_barriers ? space_identity.key.locator.relNumber : 99));
 	return removal_ready;
 }
 SMgrRelation
 smgropen(RelFileLocator locator, BackendId backend)
 {
-	Assert(locator.spcOid == 1663
-		   && locator.relNumber == (multiple_barriers ? space_identity.key.locator.relNumber : 99)
-		   && backend == InvalidBackendId);
+	if (!allow_space_locator_mismatch)
+		Assert(locator.spcOid == 1663
+			   && locator.relNumber == (multiple_barriers ? space_identity.key.locator.relNumber : 99)
+			   && backend == InvalidBackendId);
 	return &relation;
 }
 void
@@ -830,9 +832,10 @@ DropRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 int
 cluster_smgr_which_for(RelFileLocator locator, BackendId backend)
 {
-	Assert(locator.spcOid == 1663
-		   && locator.relNumber == (multiple_barriers ? space_identity.key.locator.relNumber : 99)
-		   && backend == InvalidBackendId);
+	if (!allow_space_locator_mismatch)
+		Assert(locator.spcOid == 1663
+			   && locator.relNumber == (multiple_barriers ? space_identity.key.locator.relNumber : 99)
+			   && backend == InvalidBackendId);
 	return shared_relation ? 1 : 0;
 }
 bool
@@ -5313,6 +5316,39 @@ UT_TEST(test_v3_space_gate_requires_exact_identity_and_mutation_token)
 	UT_ASSERT(!ko_shared_v3_space_current(&message));
 }
 
+UT_TEST(test_v3_peer_space_gate_uses_maintenance_identity)
+{
+	ClusterKoSharedMessageV3 message;
+
+	reset_test();
+	cluster_shared_config = real_space_reader = true;
+	MyBackendType = B_SINVAL_BCAST;
+	MyBackendId = InvalidBackendId;
+	space_identity.key.locator.dbOid = 5;
+	space_identity.sequence = 1;
+	space_identity.operation = 88;
+	message.base = shared_request(124, current_epoch);
+	message.space_mutation_token = 88;
+	UT_ASSERT(ko_shared_v3_peer_space_current(&message));
+	UT_ASSERT_EQ(maintenance_space_locks, 1);
+	UT_ASSERT_EQ(ordinary_space_locks, 0);
+	UT_ASSERT(!space_pinned && !space_locked);
+
+	/* The maintenance reader observes the same current identity but rejects
+	 * a reused locator, incarnation, or token before the peer can Drop. */
+	allow_space_locator_mismatch = true;
+	message.base.key.locator.relNumber++;
+	UT_ASSERT(!ko_shared_v3_peer_space_current(&message));
+	message.base.key.locator.relNumber--;
+	allow_space_locator_mismatch = false;
+	message.base.incarnation[0]++;
+	UT_ASSERT(!ko_shared_v3_peer_space_current(&message));
+	message.base.incarnation[0]--;
+	message.space_mutation_token++;
+	UT_ASSERT(!ko_shared_v3_peer_space_current(&message));
+	UT_ASSERT_EQ(ordinary_space_locks, 0);
+}
+
 UT_TEST(test_peer_current_refusal_at_either_read_releases_pin_without_ack)
 {
 	for (int at = 1; at <= 2; at++) {
@@ -5341,12 +5377,13 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(115);
+	UT_PLAN(116);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
 	UT_RUN(test_peer_space_entry_checks_precede_io);
 	UT_RUN(test_peer_space_checks_every_identity_field_and_keeps_origin_s);
 	UT_RUN(test_v3_space_gate_requires_exact_identity_and_mutation_token);
+	UT_RUN(test_v3_peer_space_gate_uses_maintenance_identity);
 	UT_RUN(test_peer_current_refusal_at_either_read_releases_pin_without_ack);
 	UT_RUN(test_real_admission_flush_drop_ack_order);
 	UT_RUN(test_origin_barrier_discards_lease_even_without_remote_work);

@@ -2745,20 +2745,44 @@ ko_run_shared_barrier_impl(RelFileLocator locator, ClusterKoCompletionV2 *comple
 }
 
 static bool
+ko_shared_v3_space_matches(const ClusterKoSharedMessageV3 *message,
+							const ClusterSpaceIdentity *identity)
+{
+	return message != NULL && identity != NULL
+			   && identity->state == CLUSTER_SPACE_IDENTITY_LIVE
+			   && identity->key.system_identifier == message->base.key.system_identifier
+			   && identity->key.database_incarnation == message->base.key.database_incarnation
+			   && RelFileLocatorEquals(identity->key.locator, message->base.key.locator)
+			   && memcmp(identity->key.storage_uuid, message->base.key.storage_uuid, 16) == 0
+			   && memcmp(identity->incarnation, message->base.incarnation,
+																 sizeof(identity->incarnation)) == 0
+			   && identity->operation == message->space_mutation_token;
+}
+
+static bool
 ko_shared_v3_space_current(const ClusterKoSharedMessageV3 *message)
 {
 	ClusterSpaceIdentity identity;
 
 	return message != NULL && cluster_space_relation_read_identity(message->base.key.locator,
-																			 &identity)
-			   && identity.state == CLUSTER_SPACE_IDENTITY_LIVE
-			   && identity.key.system_identifier == message->base.key.system_identifier
-			   && identity.key.database_incarnation == message->base.key.database_incarnation
-		   && RelFileLocatorEquals(identity.key.locator, message->base.key.locator)
-		   && memcmp(identity.key.storage_uuid, message->base.key.storage_uuid, 16) == 0
-		   && memcmp(identity.incarnation, message->base.incarnation,
-																		 sizeof(identity.incarnation)) == 0
-		   && identity.operation == message->space_mutation_token;
+														 &identity)
+			   && ko_shared_v3_space_matches(message, &identity);
+}
+
+/* SI auxiliary peers must use the maintenance/current owner path. A regular
+ * relation reader is backend-indexed and cannot prove the peer's SPACE token. */
+static bool
+ko_shared_v3_peer_space_current(const ClusterKoSharedMessageV3 *message)
+{
+	ClusterSpaceIdentity identity;
+
+	if (message == NULL || !cluster_shared_config
+		|| message->base.verb != CLUSTER_KO_SHARED_REQUEST
+		|| message->base.peer_node != cluster_node_id || MyBackendType != B_SINVAL_BCAST
+		|| CurrentResourceOwner == NULL || CritSectionCount != 0)
+		return false;
+	return cluster_space_relation_read_maintenance_identity(message->base.key.locator, &identity)
+		   && ko_shared_v3_space_matches(message, &identity);
 }
 
 static bool
@@ -3468,7 +3492,7 @@ cluster_ko_drain_inbound_and_apply(void)
 			|| slot.shared != cluster_shared_config
 			|| (slot.shared
 				&& (slot.v3 ? (!ko_shared_v3_control_current(&slot.qualified_v3)
-												|| !ko_shared_v3_space_current(&slot.qualified_v3))
+																		|| !ko_shared_v3_peer_space_current(&slot.qualified_v3))
 								 : (!ko_shared_control_current(&slot.qualified)
 									|| !ko_shared_peer_space_current(&slot.qualified)))))
 			goto next;
@@ -3482,7 +3506,7 @@ cluster_ko_drain_inbound_and_apply(void)
 		smgr = smgropen(rloc, InvalidBackendId);
 		if (slot.epoch != cluster_epoch_get_current()
 			|| (slot.shared && (slot.v3 ? (!ko_shared_v3_control_current(&slot.qualified_v3)
-																				 || !ko_shared_v3_space_current(&slot.qualified_v3))
+																		 || !ko_shared_v3_peer_space_current(&slot.qualified_v3))
 													 : !ko_shared_control_current(&slot.qualified))))
 			goto next;
 
@@ -3495,8 +3519,8 @@ cluster_ko_drain_inbound_and_apply(void)
 		FlushRelationsAllBuffers(&smgr, 1);
 		if (slot.epoch != cluster_epoch_get_current()
 			|| (slot.shared && (slot.v3 ? (!ko_shared_v3_control_current(&slot.qualified_v3)
-																				 || !ko_shared_v3_space_current(&slot.qualified_v3))
-													 : !ko_shared_control_current(&slot.qualified))))
+																		 || !ko_shared_v3_peer_space_current(&slot.qualified_v3))
+																		: !ko_shared_control_current(&slot.qualified))))
 			goto next;
 		if (cluster_shared_config && cluster_smgr_which_for(rloc, InvalidBackendId) == 1) {
 			/* Buffer writeout alone does not make shared DATA durable.  An
@@ -3513,7 +3537,7 @@ cluster_ko_drain_inbound_and_apply(void)
 		/* Check SPACE before invalidation; rereading it afterwards would
 		 * recreate precisely the buffer the barrier has just discarded. */
 		if (slot.shared
-			&& (slot.v3 ? !ko_shared_v3_space_current(&slot.qualified_v3)
+			&& (slot.v3 ? !ko_shared_v3_peer_space_current(&slot.qualified_v3)
 						: !ko_shared_peer_space_current(&slot.qualified)))
 			goto next;
 		DropRelationsAllBuffers(&smgr, 1);
