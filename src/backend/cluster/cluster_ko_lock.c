@@ -122,6 +122,8 @@ typedef struct ClusterKoSharedContext {
 	bool structure_drop_pending;
 	bool structure_drop_failed; /* Original executor requires retained-WAL recovery. */
 	uint16 structure_peers_accepted;
+	uint16 request_sent_peers;
+	uint16 request_uncertain_peers;
 	uint32 structure_scan;
 	uint64 structure_scan_freeze;
 	int32 pid;
@@ -2652,7 +2654,10 @@ ko_shared_v3_request_owned(const ClusterKoSharedMessageV3 *message)
 		ClusterKoSharedMessageV3 expected;
 		if (!entry->used || !entry->v3 || entry->complete
 			|| entry->request_v3.base.batch_id != message->base.batch_id
-			|| message->base.peer_node >= CLUSTER_KO_SHARED_NODE_LIMIT)
+			|| message->base.peer_node >= CLUSTER_KO_SHARED_NODE_LIMIT
+			|| ((entry->request_sent_peers | entry->request_uncertain_peers)
+				& (1u << message->base.peer_node))
+				   != 0)
 			continue;
 		expected = entry->request_v3;
 		expected.base.peer_node = message->base.peer_node;
@@ -2662,6 +2667,50 @@ ko_shared_v3_request_owned(const ClusterKoSharedMessageV3 *message)
 	}
 	SpinLockRelease(&ko_state->shared_lock);
 	return owned;
+}
+
+/* DONE and WOULD_BLOCK transfer the exact frame to transport. An ambiguous
+ * hard error must not retry it on another carrier. Neither result is READY. */
+typedef enum KoSendOwnership {
+	KO_SEND_CALLER_OWNED,
+	KO_SEND_TRANSPORT_OWNED,
+	KO_SEND_UNKNOWN
+} KoSendOwnership;
+
+static void
+ko_shared_v3_record_ownership(const ClusterKoSharedMessageV3 *message, KoSendOwnership ownership)
+{
+	ClusterKoSharedMessageV3 ack = *message;
+
+	if (message->base.verb != CLUSTER_KO_SHARED_REQUEST
+		|| message->base.peer_node >= CLUSTER_KO_SHARED_NODE_LIMIT)
+		return;
+	ack.base.verb = CLUSTER_KO_SHARED_ACK;
+	ack.base.status = CLUSTER_KO_SHARED_DONE;
+	SpinLockAcquire(&ko_state->shared_lock);
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		ClusterKoSharedContext *entry = &ko_state->contexts[i];
+		ClusterKoSharedMessageV3 expected;
+
+		if (!entry->used || !entry->v3 || entry->complete
+			|| entry->request_v3.base.batch_id != message->base.batch_id)
+			continue;
+		expected = entry->request_v3;
+		expected.base.peer_node = message->base.peer_node;
+		expected.base.peer_boot = entry->peer_boots[message->base.peer_node];
+		if (cluster_ko_shared_ack_matches_v3(&expected, &ack)) {
+			uint16 peer = (uint16)(1u << message->base.peer_node);
+			if (ownership == KO_SEND_TRANSPORT_OWNED) {
+				entry->request_sent_peers |= peer;
+				entry->request_uncertain_peers &= ~peer;
+			} else if (ownership == KO_SEND_CALLER_OWNED)
+				entry->request_uncertain_peers &= ~peer;
+			else
+				entry->request_uncertain_peers |= peer;
+		}
+		break;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
 }
 
 static void
@@ -2708,6 +2757,8 @@ ko_shared_backend_exit(int code, Datum arg)
 void
 cluster_ko_lmon_tick_v2(void)
 {
+	uint32 attempts;
+
 	if (ko_state == NULL || !cluster_shared_config || !AmLmonProcess())
 		return;
 	ko_peer_holder_lmon_tick();
@@ -2736,29 +2787,53 @@ cluster_ko_lmon_tick_v2(void)
 				message.verb == CLUSTER_KO_SHARED_REQUEST ? message.peer_node : message.origin_node,
 				bytes, sizeof(bytes));
 	}
-	for (unsigned n = 0; n < CLUSTER_KO_SHARED_CAPACITY; n++) {
+	SpinLockAcquire(&ko_state->shared_lock);
+	attempts = Min(ko_state->send_v3_count, CLUSTER_KO_SHARED_CAPACITY);
+	SpinLockRelease(&ko_state->shared_lock);
+	for (unsigned n = 0; n < attempts; n++) {
 		ClusterKoSharedMessageV3 message;
 		uint8 bytes[CLUSTER_KO_SHARED_V3_BYTES];
+		ClusterICSendResult result = CLUSTER_IC_SEND_HARD_ERROR;
 		bool pending;
 
 		SpinLockAcquire(&ko_state->shared_lock);
 		pending = ko_state->send_v3_count != 0;
-		if (pending) {
+		if (pending)
 			message = ko_state->send_v3[ko_state->send_v3_head];
-			ko_state->send_v3_head = (ko_state->send_v3_head + 1) % CLUSTER_KO_SHARED_CAPACITY;
-			ko_state->send_v3_count--;
-		}
 		SpinLockRelease(&ko_state->shared_lock);
 		if (!pending)
 			return;
 		if (ko_shared_v3_request_owned(&message) && ko_shared_v3_control_current(&message)
-			&& cluster_ko_shared_encode_v3(&message, bytes, sizeof(bytes)))
-			(void)cluster_ic_send_envelope(
+			&& cluster_ko_shared_encode_v3(&message, bytes, sizeof(bytes))) {
+			/* ERROR may leave transport acceptance unknown. Arm the original
+			 * operation before entering transport; only its explicit return
+			 * can prove refusal or admission. A later tick cannot resend it. */
+			ko_shared_v3_record_ownership(&message, KO_SEND_UNKNOWN);
+			result = cluster_ic_send_envelope(
 				message.base.verb == CLUSTER_KO_SHARED_REQUEST ? PGRAC_IC_MSG_KO_FLUSH
-																	  : PGRAC_IC_MSG_KO_FLUSH_ACK,
+															   : PGRAC_IC_MSG_KO_FLUSH_ACK,
 				message.base.verb == CLUSTER_KO_SHARED_REQUEST ? message.base.peer_node
-																	 : message.base.origin_node,
+															   : message.base.origin_node,
 				bytes, sizeof(bytes));
+			ko_shared_v3_record_ownership(&message, result == CLUSTER_IC_SEND_NOT_ADMITTED
+														? KO_SEND_CALLER_OWNED
+													: (result == CLUSTER_IC_SEND_DONE
+													   || result == CLUSTER_IC_SEND_WOULD_BLOCK)
+														? KO_SEND_TRANSPORT_OWNED
+														: KO_SEND_UNKNOWN);
+		}
+		/* The original queue keeps the slot across the send. Only a refused
+		 * frame rotates to its tail; process at most the captured count so a
+		 * blocked peer does not busy-spin or prevent other peers' progress. */
+		SpinLockAcquire(&ko_state->shared_lock);
+		ko_state->send_v3_head = (ko_state->send_v3_head + 1) % CLUSTER_KO_SHARED_CAPACITY;
+		ko_state->send_v3_count--;
+		if (result == CLUSTER_IC_SEND_NOT_ADMITTED) {
+			ko_state->send_v3[(ko_state->send_v3_head + ko_state->send_v3_count)
+							  % CLUSTER_KO_SHARED_CAPACITY] = message;
+			ko_state->send_v3_count++;
+		}
+		SpinLockRelease(&ko_state->shared_lock);
 	}
 }
 
@@ -3025,6 +3100,7 @@ ko_shared_reserve_v3(const ClusterKoSharedMessageV3 *request,
 			entry->used = true;
 			entry->v3 = true;
 			entry->complete = false;
+			entry->request_sent_peers = entry->request_uncertain_peers = 0;
 			entry->pid = MyProcPid;
 			entry->serial = ++ko_state->context_serial;
 			entry->request = request->base;
@@ -3770,7 +3846,9 @@ cluster_ko_flush_ack_handler(const ClusterICEnvelope *env, const void *payload)
 				const ClusterKoSharedContext *entry = &ko_state->contexts[i];
 				ClusterKoSharedMessageV3 expected;
 				if (!entry->used || !entry->v3 || entry->complete
-					|| entry->request_v3.base.batch_id != ack.base.batch_id)
+					|| entry->request_v3.base.batch_id != ack.base.batch_id
+					|| (entry->request_sent_peers & (1u << ack.base.peer_node)) == 0
+					|| (entry->request_uncertain_peers & (1u << ack.base.peer_node)) != 0)
 					continue;
 				expected = entry->request_v3;
 				expected.base.peer_node = ack.base.peer_node;

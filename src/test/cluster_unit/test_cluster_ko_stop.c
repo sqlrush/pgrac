@@ -44,6 +44,9 @@ static ClusterGrdHolderId v3_local_holder;
 static int marker_registrations;
 static uint64 marker_batch;
 static ClusterKoSharedMessageV3 sent_v3_request;
+static ClusterICSendResult v3_send_result = CLUSTER_IC_SEND_DONE;
+static uint64 v3_refuse_batch;
+static bool v3_send_throw;
 
 int32
 cluster_grd_lookup_master_gen(const ClusterResId *resid, uint64 *generation)
@@ -582,7 +585,12 @@ cluster_ic_send_envelope(uint8 type, int32 dest, const void *bytes, uint32 lengt
 		UT_ASSERT(cluster_ko_shared_decode_v3(bytes, length, &sent_v3_request));
 		send_calls++;
 		barrier_requests++;
-		return CLUSTER_IC_SEND_DONE;
+		if (v3_send_throw) {
+			v3_send_throw = false;
+			pg_re_throw();
+		}
+		return sent_v3_request.base.batch_id == v3_refuse_batch ? CLUSTER_IC_SEND_NOT_ADMITTED
+																: v3_send_result;
 	}
 	Assert(dest == 1 && length == CLUSTER_KO_SHARED_V2_BYTES);
 	if (!cluster_ko_shared_decode_v2(bytes, length, &m))
@@ -1014,6 +1022,9 @@ reset_test(void)
 	v3_local_ax = drive_v3_ack = marker_error = false;
 	marker_registrations = 0;
 	marker_batch = 0;
+	v3_send_result = CLUSTER_IC_SEND_DONE;
+	v3_refuse_batch = 0;
+	v3_send_throw = false;
 	v3_route_master_node = -1;
 	v3_route_generation = 0;
 	generation_race = cancel_wait = drive_shared_ack = false;
@@ -5908,11 +5919,120 @@ UT_TEST(test_v3_origin_marker_error_releases_only_unsent_context)
 	UT_ASSERT(!barrier_active);
 }
 
+static ClusterKoSharedMessageV3
+origin_retained_send_setup(void)
+{
+	KoAxBinding binding = origin_marker_setup();
+	ClusterKoSharedMessageV3 request = { 0 };
+	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT];
+	uint32 mask;
+	UT_ASSERT(ko_shared_prepare_request_v3(space_identity.key.locator,
+										   CLUSTER_KO_SHARED_V3_OPERATION_DROP, &binding, &request,
+										   boots, &mask));
+	UT_ASSERT(ko_shared_reserve_v3(&request, boots, NULL) >= 0);
+	return request;
+}
+UT_TEST(test_v3_sender_retries_only_caller_owned_frame)
+{
+	ClusterKoSharedMessageV3 request = origin_retained_send_setup();
+	UT_ASSERT(ko_shared_enqueue_v3(&request));
+	v3_send_result = CLUSTER_IC_SEND_NOT_ADMITTED;
+	shared_send_tick();
+	UT_ASSERT_EQ(send_calls, 1);
+	UT_ASSERT_EQ(ko_state->send_v3_count, 1);
+	v3_send_result = CLUSTER_IC_SEND_WOULD_BLOCK;
+	shared_send_tick();
+	UT_ASSERT_EQ(send_calls, 2);
+	UT_ASSERT_EQ(ko_state->send_v3_count, 0);
+	/* An accepted tail is transport-owned even if an upper queue repeats. */
+	UT_ASSERT(ko_shared_enqueue_v3(&request));
+	shared_send_tick();
+	UT_ASSERT_EQ(send_calls, 2);
+	UT_ASSERT_EQ(ko_state->send_v3_count, 0);
+	UT_ASSERT_EQ(record_count, 0);
+}
+UT_TEST(test_v3_sender_does_not_resend_after_acceptance_or_ambiguous_error)
+{
+	for (int n = 0; n < 2; n++) {
+		ClusterKoSharedMessageV3 request = origin_retained_send_setup();
+		v3_send_result = n == 0 ? CLUSTER_IC_SEND_DONE : CLUSTER_IC_SEND_HARD_ERROR;
+		UT_ASSERT(ko_shared_enqueue_v3(&request));
+		UT_ASSERT(ko_shared_enqueue_v3(&request));
+		shared_send_tick();
+		UT_ASSERT_EQ(send_calls, 1);
+		UT_ASSERT_EQ(ko_state->send_v3_count, 0);
+		UT_ASSERT_EQ(record_count, 0);
+	}
+}
+
+UT_TEST(test_v3_sender_bounds_retry_without_hiding_other_work)
+{
+	ClusterKoSharedMessageV3 first = origin_retained_send_setup(), next = first;
+	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT] = { 11, 22 };
+	next.base.batch_id++;
+	UT_ASSERT(ko_shared_reserve_v3(&next, boots, NULL) >= 0);
+	UT_ASSERT(ko_shared_enqueue_v3(&first));
+	UT_ASSERT(ko_shared_enqueue_v3(&next));
+	v3_refuse_batch = first.base.batch_id;
+	shared_send_tick();
+	UT_ASSERT_EQ(send_calls, 2);
+	UT_ASSERT_EQ(ko_state->send_v3_count, 1);
+	UT_ASSERT_EQ(ko_state->send_v3[ko_state->send_v3_head].base.batch_id, first.base.batch_id);
+	v3_refuse_batch = 0;
+	shared_send_tick();
+	UT_ASSERT_EQ(send_calls, 3);
+	UT_ASSERT_EQ(ko_state->send_v3_count, 0);
+}
+UT_TEST(test_v3_ack_needs_actual_transport_admission_without_hard_error)
+{
+	for (int n = 0; n < 3; n++) {
+		ClusterKoSharedMessageV3 ack = origin_retained_send_setup();
+		ClusterICEnvelope env = { 0 };
+		uint8 wire[CLUSTER_KO_SHARED_V3_BYTES];
+		if (n != 0) {
+			v3_send_result = n == 1 ? CLUSTER_IC_SEND_HARD_ERROR : CLUSTER_IC_SEND_DONE;
+			UT_ASSERT(ko_shared_enqueue_v3(&ack));
+			shared_send_tick();
+		}
+		ack.base.verb = CLUSTER_KO_SHARED_ACK;
+		ack.base.status = CLUSTER_KO_SHARED_DONE;
+		UT_ASSERT(cluster_ko_shared_encode_v3(&ack, wire, sizeof(wire)));
+		env.source_node_id = 1;
+		env.payload_length = sizeof(wire);
+		cluster_ko_flush_ack_handler(&env, wire);
+		UT_ASSERT_EQ(record_count, n == 2 ? 1 : 0);
+	}
+}
+
+UT_TEST(test_v3_sender_error_cannot_restart_uncertain_send)
+{
+	ClusterKoSharedMessageV3 request = origin_retained_send_setup();
+	volatile bool caught = false;
+	UT_ASSERT(ko_shared_enqueue_v3(&request));
+	v3_send_throw = true;
+	PG_TRY();
+	{
+		shared_send_tick();
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(send_calls, 1);
+	UT_ASSERT_EQ(ko_state->send_v3_count, 1);
+	shared_send_tick();
+	UT_ASSERT_EQ(send_calls, 1);
+	UT_ASSERT_EQ(ko_state->send_v3_count, 0);
+	UT_ASSERT_EQ(record_count, 0);
+}
+
 int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(129);
+	UT_PLAN(134);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
 	UT_RUN(test_peer_space_entry_checks_precede_io);
@@ -6042,6 +6162,11 @@ main(void)
 	UT_RUN(test_v3_origin_registers_exact_marker_before_first_request);
 	UT_RUN(test_v3_origin_refuses_missing_marker_capability_before_publication);
 	UT_RUN(test_v3_origin_marker_error_releases_only_unsent_context);
+	UT_RUN(test_v3_sender_retries_only_caller_owned_frame);
+	UT_RUN(test_v3_sender_does_not_resend_after_acceptance_or_ambiguous_error);
+	UT_RUN(test_v3_sender_bounds_retry_without_hiding_other_work);
+	UT_RUN(test_v3_ack_needs_actual_transport_admission_without_hard_error);
+	UT_RUN(test_v3_sender_error_cannot_restart_uncertain_send);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
