@@ -369,10 +369,71 @@ UT_TEST(shared_wire_accepts_highest_node_without_truncating_bitmap)
 	UT_ASSERT_EQ(sizeof(KoFlushAckHeader), 24);
 }
 
+static ClusterKoSharedMessageV3
+shared_v3_fixture(void)
+{
+	ClusterKoSharedMessageV3 m = { 0 };
+
+	m.base = shared_fixture();
+	m.ax_resid.field1 = 5;
+	m.ax_resid.field2 = 4242; /* relation OID, not the relfilenode */
+	m.ax_resid.field3 = 0;
+	m.ax_resid.field4 = 0;
+	m.ax_resid.type = LOCKTAG_RELATION;
+	m.ax_resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	m.ax_holder.node_id = m.base.origin_node;
+	m.ax_holder.procno = 77;
+	m.ax_holder.cluster_epoch = m.base.epoch;
+	m.ax_holder.request_id = UINT64CONST(0x7172737475767778);
+	m.ax_request_id = m.ax_holder.request_id;
+	m.ax_master_generation = UINT64CONST(0x8182838485868788);
+	m.ax_master_node = m.base.origin_node;
+	m.ax_mode = AccessExclusiveLock;
+	m.operation = CLUSTER_KO_SHARED_V3_OPERATION_DROP;
+	m.full_fork_mask = CLUSTER_KO_SHARED_V3_FULL_FORK_MASK;
+	m.space_mutation_token = UINT64CONST(0x9192939495969798);
+	return m;
+}
+
+UT_TEST(shared_v3_wire_binds_ax_and_rejects_v2_or_reserved)
+{
+	ClusterKoSharedMessageV3 request = shared_v3_fixture(), ack = request, out, before;
+	uint8 bytes[CLUSTER_KO_SHARED_V3_BYTES], legacy[CLUSTER_KO_SHARED_V2_BYTES];
+
+	memset(bytes, 0xee, sizeof(bytes));
+	UT_ASSERT(cluster_ko_shared_encode_v3(&request, bytes, sizeof(bytes)));
+	UT_ASSERT_EQ(memcmp(bytes, "PKO3", 4), 0);
+	UT_ASSERT_EQ(bytes[4], CLUSTER_KO_SHARED_V3_VERSION);
+	UT_ASSERT_EQ(bytes[6], CLUSTER_KO_SHARED_V3_BYTES);
+	UT_ASSERT_EQ(bytes[7], 0);
+	UT_ASSERT_EQ(bytes[160], 5);
+	UT_ASSERT_EQ(bytes[164], 0x92); /* relation OID 4242, little endian */
+	UT_ASSERT_EQ(bytes[220], (uint8)AccessExclusiveLock);
+	UT_ASSERT(cluster_ko_shared_decode_v3(bytes, sizeof(bytes), &out));
+	UT_ASSERT_EQ(out.ax_resid.field2, 4242);
+	UT_ASSERT_EQ(out.ax_holder.procno, 77);
+	UT_ASSERT_EQ(out.full_fork_mask, CLUSTER_KO_SHARED_V3_FULL_FORK_MASK);
+	UT_ASSERT_EQ(out.space_mutation_token, request.space_mutation_token);
+
+	before = out;
+	bytes[12] = 1; /* reserved in the inherited v2 prefix */
+	UT_ASSERT(!cluster_ko_shared_decode_v3(bytes, sizeof(bytes), &out));
+	UT_ASSERT_EQ(memcmp(&out, &before, sizeof(out)), 0);
+	bytes[12] = 0;
+	UT_ASSERT(cluster_ko_shared_encode_v2(&request.base, legacy, sizeof(legacy)));
+	UT_ASSERT(!cluster_ko_shared_decode_v3(legacy, sizeof(legacy), &out));
+
+	ack.base.verb = CLUSTER_KO_SHARED_ACK;
+	ack.base.status = CLUSTER_KO_SHARED_DONE;
+	UT_ASSERT(cluster_ko_shared_ack_matches_v3(&request, &ack));
+	ack.space_mutation_token++;
+	UT_ASSERT(!cluster_ko_shared_ack_matches_v3(&request, &ack));
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
 	UT_RUN(test_ko_resid_encode);
 	UT_RUN(test_ko_resid_namespace_distinct);
 	UT_RUN(test_ko_vs_dl_resid_distinct);
@@ -384,6 +445,7 @@ main(void)
 	UT_RUN(shared_ack_requires_done_and_every_original_cut_byte);
 	UT_RUN(shared_codecs_refuse_alias_and_null_without_output_mutation);
 	UT_RUN(shared_wire_accepts_highest_node_without_truncating_bitmap);
+	UT_RUN(shared_v3_wire_binds_ax_and_rejects_v2_or_reserved);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

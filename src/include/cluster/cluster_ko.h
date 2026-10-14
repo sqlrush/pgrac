@@ -84,6 +84,8 @@ extern void cluster_ko_resid_encode(RelFileLocator rloc, ClusterResId *dst);
 #include "cluster/cluster_space_identity.h"
 
 #define CLUSTER_KO_SHARED_V2_BYTES 160
+#define CLUSTER_KO_SHARED_V3_BYTES 240
+#define CLUSTER_KO_SHARED_V3_VERSION 3
 #define CLUSTER_KO_SHARED_CONTEXT_LIMIT_V2 64
 #define CLUSTER_KO_SHARED_MEMBER_BYTES 16
 #define CLUSTER_KO_SHARED_REQUEST 1
@@ -110,6 +112,31 @@ typedef struct ClusterKoSharedMessageV2 {
 	uint8 member_digest[32];
 } ClusterKoSharedMessageV2;
 
+/*
+ * Object-drain v3 identity.  The v2 structural receipt remains a separate
+ * legacy contract; it has no relation lock/OID or consumed-grant identity and
+ * therefore cannot be accepted as a v3 READY.  Values are encoded explicitly
+ * by the v3 codec below; this C layout is not a wire ABI.
+ */
+typedef struct ClusterKoSharedMessageV3 {
+	ClusterKoSharedMessageV2 base;
+	ClusterResId ax_resid;
+	ClusterGrdHolderId ax_holder;
+	uint64 ax_request_id;
+	uint64 ax_master_generation;
+	int32 ax_master_node;
+	uint32 ax_mode;
+	uint16 operation;
+	uint16 full_fork_mask;
+	uint64 space_mutation_token;
+} ClusterKoSharedMessageV3;
+
+#define CLUSTER_KO_SHARED_V3_OPERATION_DROP 1
+#define CLUSTER_KO_SHARED_V3_OPERATION_TRUNCATE 2
+#define CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD 3
+#define CLUSTER_KO_SHARED_V3_FULL_FORK_MASK \
+	((uint16)((UINT32_C(1) << (MAX_FORKNUM + 1)) - UINT32_C(1)))
+
 /* Exact length, little-endian, unaligned buffers accepted. Refusal preserves
  * output; overlapping input and output is refused. Nonshared legacy payloads
  * below remain separate and are never accepted by these shared codecs. */
@@ -119,6 +146,12 @@ extern bool cluster_ko_shared_decode_v2(const void *bytes, size_t length,
 										ClusterKoSharedMessageV2 *out);
 extern bool cluster_ko_shared_ack_matches_v2(const ClusterKoSharedMessageV2 *request,
 											 const ClusterKoSharedMessageV2 *ack);
+extern bool cluster_ko_shared_encode_v3(const ClusterKoSharedMessageV3 *message, void *bytes,
+										size_t length);
+extern bool cluster_ko_shared_decode_v3(const void *bytes, size_t length,
+										ClusterKoSharedMessageV3 *out);
+extern bool cluster_ko_shared_ack_matches_v3(const ClusterKoSharedMessageV3 *request,
+											 const ClusterKoSharedMessageV3 *ack);
 #endif
 
 #ifndef FRONTEND
