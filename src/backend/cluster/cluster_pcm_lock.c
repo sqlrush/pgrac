@@ -48,6 +48,8 @@
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_cssd.h" /* PGRAC: spec-4.7a D4 — peer liveness for other-holder check */
 #include "cluster/cluster_lms.h"
+#include "cluster/cluster_ko.h"
+#include "cluster/storage/cluster_smgr.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_sf_dep.h"
@@ -13037,6 +13039,10 @@ cluster_pcm_lock_resource_x_caller_observe_exact(const ResourceXAssertion *asser
 	PcmEntryAcquireResult acquire_result;
 	ClusterPcmResourceXBootstrapRound *round;
 	ResourceXApplyResult result;
+	ClusterKoPeerAdmissionV3 object_admission;
+	RelFileLocator locator;
+	bool check_object;
+	bool sampled = false;
 
 	if (caller == NULL || !resource_x_assertion_valid(assertion)
 		|| assertion->requester_node != cluster_node_id || resource_formation == 0
@@ -13049,6 +13055,16 @@ cluster_pcm_lock_resource_x_caller_observe_exact(const ResourceXAssertion *asser
 	if (!pcm_resource_x_caller_namespace_matches(caller, assertion, resource_formation,
 												 master_session_incarnation, r4_record_generation))
 		return RESOURCE_X_APPLY_STALE;
+	/* This observer can perform the first caller binding, before the
+	 * exclusive step. History alone is not an object-admission receipt. */
+	locator = BufTagGetRelFileLocator(&assertion->resource);
+	check_object = caller->joined_request.assertion_sequence == 0 && cluster_shared_config
+				   && cluster_interconnect_tier == CLUSTER_IC_TIER_1
+				   && cluster_smgr_which_for(locator, InvalidBackendId) == 1;
+	if (check_object)
+		sampled = cluster_ko_peer_admission_begin_v3(locator, &object_admission);
+	if (check_object && !sampled)
+		return RESOURCE_X_APPLY_BAD_STATE;
 	if (!pcm_entry_ref_acquire(&assertion->resource, false, &entry_ref, &acquire_result))
 		return caller->joined_request.assertion_sequence == 0 ? RESOURCE_X_APPLY_APPLIED
 															  : RESOURCE_X_APPLY_STALE;
@@ -13060,6 +13076,8 @@ cluster_pcm_lock_resource_x_caller_observe_exact(const ResourceXAssertion *asser
 			|| round->master_session_incarnation != master_session_incarnation
 			|| round->r4_record_generation != r4_record_generation))
 		result = RESOURCE_X_APPLY_STALE;
+	else if (check_object && !cluster_ko_peer_admission_current_v3(&object_admission, locator))
+		result = RESOURCE_X_APPLY_BAD_STATE;
 	else
 		result = pcm_resource_x_caller_observe_locked(entry_ref.entry, caller);
 	LWLockRelease(&entry_ref.entry->entry_lock.lock);
@@ -13746,6 +13764,10 @@ pcm_resource_x_bootstrap_round_step_internal(
 	bool broadcast = false;
 	bool diagnostic_identity_match = false;
 	ResourceXApplyResult caller_history;
+	ClusterKoPeerAdmissionV3 object_admission;
+	RelFileLocator locator;
+	bool check_object;
+	bool sampled = false;
 
 	pcm_rx_last_step_head_failure = RESOURCE_X_HEAD_FAILURE_NONE;
 	if (dispatch_out == NULL || terminal_ref_out == NULL)
@@ -13781,6 +13803,12 @@ pcm_resource_x_bootstrap_round_step_internal(
 				|| caller->master_ingress_connection_generation
 					   != master_ingress_connection_generation)))
 		return RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
+
+	locator = BufTagGetRelFileLocator(&assertion->resource);
+	check_object = cluster_shared_config && cluster_interconnect_tier == CLUSTER_IC_TIER_1
+				   && cluster_smgr_which_for(locator, InvalidBackendId) == 1;
+	if (check_object)
+		sampled = cluster_ko_peer_admission_begin_v3(locator, &object_admission);
 
 	if (!pcm_entry_ref_acquire(&assertion->resource, allow_create, &entry_ref, &acquire_result)) {
 		if (allow_create && acquire_result == PCM_ENTRY_ACQUIRE_NO_CAPACITY)
@@ -13826,6 +13854,21 @@ pcm_resource_x_bootstrap_round_step_internal(
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
 		return RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
+	}
+	/* Serialize new caller/round acceptance with the existing entry, not
+	 * merely EMPTY->REQUEST. In particular, a cached terminal cover cannot
+	 * admit a new writer. Exact already-joined in-flight work retains its
+	 * original continuation/retirement owner; do not fail or cancel its head.
+	 * A later writer-use check is still required before content mutation. */
+	if (check_object
+		&& (caller == NULL || caller->joined_request.assertion_sequence == 0
+			|| round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
+			|| round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
+			|| round->phase == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED)
+		&& (!sampled || !cluster_ko_peer_admission_current_v3(&object_admission, locator))) {
+		LWLockRelease(&entry->entry_lock.lock);
+		pcm_entry_ref_release(&entry_ref);
+		return RESOURCE_X_BOOTSTRAP_ROUND_BACKPRESSURE;
 	}
 	if (pcm_resource_x_caller_observe_locked(entry, caller) != RESOURCE_X_APPLY_APPLIED) {
 		LWLockRelease(&entry->entry_lock.lock);

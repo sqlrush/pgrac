@@ -59,6 +59,8 @@
 #include "cluster/cluster_qvotec.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
+#include "cluster/cluster_ko.h"
+#include "cluster/storage/cluster_smgr.h"
 #include "cluster/cluster_resource_x_identity.h"
 #include "cluster/cluster_resource_x_node_wire.h"
 #include "cluster/cluster_shmem.h"
@@ -154,6 +156,39 @@ static ClusterPcmPiWriteCutV1 structural_master_write_cut;
 static ClusterPcmPiStorageCutV1 structural_master_storage_cut;
 static void (*structural_master_ack_hook)(void);
 static int fake_lwlock_depth = 0;
+/* Object admission is a boundary fixture; PCM round/caller transitions below
+ * remain the real product object. Tests may race the original entry lock. */
+int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+static bool object_admission_allowed = true;
+static uint64 object_admission_revision = 1;
+static int object_admission_samples;
+static int object_smgr_route = 1;
+static void (*object_entry_lock_hook)(void);
+int
+cluster_smgr_which_for(RelFileLocator locator pg_attribute_unused(),
+					   BackendId backend pg_attribute_unused())
+{
+	return object_smgr_route;
+}
+bool
+cluster_ko_peer_admission_begin_v3(RelFileLocator locator, ClusterKoPeerAdmissionV3 *out)
+{
+	Assert(fake_lwlock_depth == 0);
+	object_admission_samples++;
+	memset(out, 0, sizeof(*out));
+	if (!object_admission_allowed)
+		return false;
+	out->locator = locator;
+	out->revision = object_admission_revision;
+	return true;
+}
+bool
+cluster_ko_peer_admission_current_v3(const ClusterKoPeerAdmissionV3 *sample, RelFileLocator locator)
+{
+	Assert(fake_lwlock_depth > 0);
+	return sample != NULL && sample->revision != 0 && sample->revision == object_admission_revision
+		   && RelFileLocatorEquals(sample->locator, locator);
+}
 static ClusterWalSourceRef local_pi_writer;
 static union {
 	uint64 align;
@@ -541,6 +576,12 @@ s_lock(volatile slock_t *lock, const char *file pg_attribute_unused(),
 static void
 reset_fake_pcm_runtime(int max_entries)
 {
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+	object_admission_allowed = true;
+	object_admission_revision = 1;
+	object_admission_samples = 0;
+	object_smgr_route = 1;
+	object_entry_lock_hook = NULL;
 	cluster_shared_config = false;
 	pi_service_blocked = false;
 	stop_new_work_allowed = true;
@@ -811,8 +852,14 @@ bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
 	if ((uintptr_t)lock >= (uintptr_t)&fake_pcm_entries
-		&& (uintptr_t)lock < (uintptr_t)&fake_pcm_entries + sizeof(fake_pcm_entries))
+		&& (uintptr_t)lock < (uintptr_t)&fake_pcm_entries + sizeof(fake_pcm_entries)) {
 		fake_last_entry_lock = lock;
+		if (object_entry_lock_hook != NULL) {
+			void (*hook)(void) = object_entry_lock_hook;
+			object_entry_lock_hook = NULL;
+			hook();
+		}
+	}
 	Assert(fake_lwlock_depth < (int)lengthof(fake_lwlock_stack));
 	fake_lwlock_stack[fake_lwlock_depth] = lock;
 	fake_lwlock_mode_stack[fake_lwlock_depth] = mode;
