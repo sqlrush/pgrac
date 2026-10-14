@@ -56,9 +56,14 @@ cluster_ic_dispatch_control_ingress(const ClusterICEnvelope *env, ClusterICContr
 }
 
 static bool marker_capable = true, v3_local_ax, drive_v3_ack, marker_error;
+static bool drive_v3_failure;
+static int failed_reply_count;
 static ClusterGrdHolderId v3_local_holder;
 Oid MyDatabaseId;
 static int marker_registrations;
+static int failure_records;
+static int32 failed_peer;
+static uint64 failed_batch;
 static uint64 marker_batch;
 static ClusterKoSharedMessageV3 sent_v3_request, sent_v3_ack;
 static ClusterICSendResult v3_send_result = CLUSTER_IC_SEND_DONE;
@@ -650,8 +655,13 @@ cluster_ic_send_envelope(uint8 type, int32 dest, const void *bytes, uint32 lengt
 		UT_ASSERT(cluster_ko_shared_decode_v3(bytes, length, &sent_v3_ack));
 		UT_ASSERT_EQ(dest, sent_v3_ack.base.origin_node);
 		send_calls++;
-		if (v3_send_result == CLUSTER_IC_SEND_DONE || v3_send_result == CLUSTER_IC_SEND_WOULD_BLOCK)
-			ack_count++;
+		if (v3_send_result == CLUSTER_IC_SEND_DONE
+			|| v3_send_result == CLUSTER_IC_SEND_WOULD_BLOCK) {
+			if (sent_v3_ack.base.status == CLUSTER_KO_SHARED_FAILED)
+				failed_reply_count++;
+			else
+				ack_count++;
+		}
 		return v3_send_result;
 	}
 	Assert(dest == 1 && length == CLUSTER_KO_SHARED_V2_BYTES);
@@ -695,6 +705,8 @@ WaitLatch(Latch *latch, int events, long timeout, uint32 wait_event)
 	barrier_waits++;
 	if (cancel_wait)
 		pg_re_throw();
+	if (failure_records != 0)
+		return WL_LATCH_SET;
 	current_epoch++;
 	barrier_complete = true;
 	return WL_LATCH_SET;
@@ -810,7 +822,7 @@ cluster_sinval_ack_wait_is_complete(uint64 batch)
 		shared_send_tick();
 		ack = sent_v3_request;
 		ack.base.verb = CLUSTER_KO_SHARED_ACK;
-		ack.base.status = CLUSTER_KO_SHARED_DONE;
+		ack.base.status = drive_v3_failure ? CLUSTER_KO_SHARED_FAILED : CLUSTER_KO_SHARED_DONE;
 		UT_ASSERT(cluster_ko_shared_encode_v3(&ack, wire, sizeof(wire)));
 		env.source_node_id = 1;
 		env.payload_length = sizeof(wire);
@@ -849,6 +861,24 @@ cluster_sinval_ack_wait_record(uint64 batch, int32 acker)
 	Assert(acker == 1 - cluster_node_id);
 	recorded_batch = batch;
 	record_count++;
+}
+
+void
+cluster_sinval_ack_wait_record_failure(uint64 batch, int32 peer)
+{
+	failure_records++;
+	failed_batch = batch;
+	failed_peer = peer;
+}
+
+bool
+cluster_sinval_ack_wait_read_failure(uint64 batch, int32 *peer)
+{
+	if (failure_records == 0 || batch != failed_batch)
+		return false;
+	if (peer != NULL)
+		*peer = failed_peer;
+	return true;
 }
 
 bool
@@ -1046,6 +1076,9 @@ reset_test(void)
 {
 	Assert(completion_allocations == 0);
 	Assert(native_allocated == 0);
+	Assert(!ko_peer_attempt_active);
+	drive_v3_failure = false;
+	failed_reply_count = 0;
 	native_allocate_calls = 0;
 	native_alloc_fail = false;
 	native_commit_active = false;
@@ -1148,6 +1181,9 @@ reset_test(void)
 	barrier_record_base = 0;
 	epoch_change_complete = false;
 	barrier_requests = barrier_waits = barrier_removes = 0;
+	failure_records = 0;
+	failed_peer = -1;
+	failed_batch = 0;
 	memset(&last_ack, 0, sizeof(last_ack));
 	memset(&last_request, 0, sizeof(last_request));
 	memset(&leases, 0, sizeof(leases));
@@ -5710,7 +5746,7 @@ fixture_completed_fence_ready(const ClusterKoSharedMessageV3 *request,
 
 	if (handle->slot < CLUSTER_KO_SHARED_CAPACITY
 		&& storage.peer_fences[handle->slot].serial == handle->serial) {
-		(void)ko_peer_fence_mark_physical_started_v3(request);
+		(void)ko_peer_fence_mark_physical_started_v3(request, NULL);
 		(void)ko_peer_fence_mark_physical_applied_v3(request);
 		before = storage.peer_fences[handle->slot];
 		if (before.physical_applied && before.state == CLUSTER_KO_PEER_FENCE_ACTIVE)
@@ -5831,7 +5867,7 @@ UT_TEST(test_v3_blocked_head_does_not_starve_completed_fence_continuation)
 	UT_ASSERT_EQ(pg_atomic_read_u32(&storage.inbound_tail), 2);
 	/* The second fence has already completed its physical consumer; only its
 	 * bounded local READY/ACK continuation remains. */
-	UT_ASSERT(ko_peer_fence_mark_physical_started_v3(&completed));
+	UT_ASSERT(ko_peer_fence_mark_physical_started_v3(&completed, NULL));
 	UT_ASSERT(ko_peer_fence_mark_physical_applied_v3(&completed));
 	fixture_peer_drain();
 	UT_ASSERT_EQ(pg_atomic_read_u32(&storage.inbound_head), 0);
@@ -5918,7 +5954,7 @@ UT_TEST(test_v3_ready_transition_requires_original_physical_completion)
 	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
 	UT_ASSERT(!cluster_ko_peer_fence_ready_v3(&request, &handle));
 	UT_ASSERT_EQ(storage.peer_fences[handle.slot].state, CLUSTER_KO_PEER_FENCE_ACTIVE);
-	UT_ASSERT(ko_peer_fence_mark_physical_started_v3(&request));
+	UT_ASSERT(ko_peer_fence_mark_physical_started_v3(&request, NULL));
 	UT_ASSERT(!cluster_ko_peer_fence_ready_v3(&request, &handle));
 	UT_ASSERT(ko_peer_fence_mark_physical_applied_v3(&request));
 	UT_ASSERT(!cluster_ko_peer_fence_ready_v3(&request, &handle));
@@ -5948,9 +5984,15 @@ UT_TEST(test_v3_ready_scan_error_cannot_reuse_pre_error_prefix)
 	UT_ASSERT(storage.peer_fences[0].physical_applied);
 	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_ACTIVE);
 	UT_ASSERT_EQ(storage.send_v3_count, 0);
+	/* The real SI cleanup invokes this after releasing the original locks
+	 * and pins. Its negative operation remains retained, not resumable as
+	 * though the failed proof had completed. */
+	cluster_ko_peer_apply_error_v3(ERRCODE_IO_ERROR);
 	local_relation_scan_drift = 0;
 	fixture_peer_drain();
-	UT_ASSERT_EQ(local_relation_scan_input, 0);
+	UT_ASSERT_EQ(local_relation_scan_calls, 2);
+	UT_ASSERT_EQ(storage.peer_fences[0].local_scan_cursor, 0);
+	UT_ASSERT_EQ(storage.peer_fences[0].failure_sqlerrcode, ERRCODE_IO_ERROR);
 	UT_ASSERT_EQ(flush_count, 1);
 	UT_ASSERT_EQ(drop_count, 1);
 }
@@ -5964,7 +6006,7 @@ UT_TEST(test_v3_ready_transition_rechecks_saved_scan_cut)
 		ClusterKoPeerFenceV3 before;
 
 		UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
-		UT_ASSERT(ko_peer_fence_mark_physical_started_v3(&request));
+		UT_ASSERT(ko_peer_fence_mark_physical_started_v3(&request, NULL));
 		UT_ASSERT(ko_peer_fence_mark_physical_applied_v3(&request));
 		before = storage.peer_fences[handle.slot];
 		UT_ASSERT(ko_peer_fence_local_scan_v3(&before, &handle));
@@ -7243,6 +7285,138 @@ UT_TEST(test_v3_sender_retries_only_caller_owned_frame)
 	UT_ASSERT_EQ(ko_state->send_v3_count, 0);
 	UT_ASSERT_EQ(record_count, 0);
 }
+
+UT_TEST(test_v3_failed_reply_reaches_original_wait_without_done)
+{
+	ClusterKoSharedMessageV3 request = origin_retained_send_setup();
+	ClusterKoSharedMessageV3 failure = request;
+	ClusterICEnvelope env = { 0 };
+	uint8 wire[CLUSTER_KO_SHARED_V3_BYTES];
+	UT_ASSERT(ko_shared_enqueue_v3(&request, request.ax_master_generation));
+	shared_send_tick();
+	UT_ASSERT_EQ(storage.contexts[0].request_sent_peers, 1u << request.base.peer_node);
+	failure.base.verb = CLUSTER_KO_SHARED_ACK;
+	failure.base.status = CLUSTER_KO_SHARED_FAILED;
+	UT_ASSERT(cluster_ko_shared_encode_v3(&failure, wire, sizeof(wire)));
+	env.source_node_id = failure.base.peer_node;
+	env.payload_length = sizeof(wire);
+	cluster_ko_flush_ack_handler(&env, wire);
+	UT_ASSERT_EQ(failure_records, 1);
+	UT_ASSERT_EQ(failed_batch, request.base.batch_id);
+	UT_ASSERT_EQ(failed_peer, request.base.peer_node);
+	UT_ASSERT_EQ(record_count, 0);
+	UT_ASSERT(!storage.contexts[0].complete);
+}
+
+UT_TEST(test_v3_peer_io_error_retains_exact_work_and_publishes_only_failure)
+{
+	for (int fork = MAIN_FORKNUM; fork <= MAX_FORKNUM; fork++) {
+		ClusterKoSharedMessageV3 request = peer_fence_fixture(930 + fork);
+		ClusterKoPeerAdmissionV3 sample;
+		const char *reason = NULL;
+		volatile bool caught = false;
+		existing_forks = (1u << (MAX_FORKNUM + 1)) - 1;
+		sync_fail_fork = fork;
+		enqueue_shared_v3(&request);
+		PG_TRY();
+		{
+			fixture_peer_drain();
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught && ko_peer_attempt_active);
+		/* Explicit boundary: the production SI caller releases all locks/pins
+		 * before this hook. Actual KO attempt binding and cleanup run here. */
+		cluster_ko_peer_apply_error_v3(ERRCODE_IO_ERROR);
+		UT_ASSERT(!ko_peer_attempt_active);
+		UT_ASSERT_EQ(storage.peer_fences[0].failure_sqlerrcode, ERRCODE_IO_ERROR);
+		UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_INVALID);
+		UT_ASSERT(strcmp(reason, "KO_PEER_APPLY_FAILED") == 0);
+		UT_ASSERT(!storage.peer_fences[0].physical_applied);
+		UT_ASSERT(!cluster_ko_peer_admission_begin_v3(request.base.key.locator, &sample));
+		fixture_peer_drain();
+		shared_send_tick();
+		UT_ASSERT_EQ(failed_reply_count, 1);
+		UT_ASSERT_EQ(ack_count + drop_count, 0);
+		UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_ACTIVE);
+		UT_ASSERT(!storage.peer_fences[0].ack_queued);
+		UT_ASSERT(cluster_ko_shared_result_matches_v3(&request, &sent_v3_ack));
+		UT_ASSERT(!cluster_ko_shared_ack_matches_v3(&request, &sent_v3_ack));
+		sync_fail_fork = -1;
+		enqueue_shared_v3(&request);
+		fixture_peer_drain();
+		shared_send_tick();
+		UT_ASSERT_EQ(flush_count, 1);
+		UT_ASSERT_EQ(failed_reply_count, 1);
+		UT_ASSERT_EQ(ack_count + drop_count, 0);
+	}
+}
+
+UT_TEST(test_v3_failure_reply_waits_for_existing_queue_capacity)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(937);
+	ClusterKoPeerFenceHandleV3 handle;
+	ClusterKoPeerFenceStateV3 state;
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+	UT_ASSERT(ko_peer_fence_mark_physical_started_v3(&request, &ko_peer_attempt));
+	ko_peer_attempt_active = true;
+	cluster_ko_peer_apply_error_v3(ERRCODE_IO_ERROR);
+	storage.send_v3_count = CLUSTER_KO_SHARED_CAPACITY; /* queue capacity boundary */
+	fixture_peer_drain();
+	UT_ASSERT(!storage.peer_fences[handle.slot].failure_queued);
+	UT_ASSERT_EQ(storage.peer_fences[handle.slot].failure_sqlerrcode, ERRCODE_IO_ERROR);
+	storage.send_v3_count = 0;
+	fixture_peer_drain();
+	UT_ASSERT(storage.peer_fences[handle.slot].failure_queued);
+	shared_send_tick();
+	UT_ASSERT_EQ(failed_reply_count, 1);
+	UT_ASSERT_EQ(ack_count, 0);
+}
+
+UT_TEST(test_v3_failure_cleanup_cannot_poison_reused_owner)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(938);
+	ClusterKoPeerFenceHandleV3 handle;
+	ClusterKoPeerFenceStateV3 state;
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+	UT_ASSERT(ko_peer_fence_mark_physical_started_v3(&request, &ko_peer_attempt));
+	ko_peer_attempt_active = true;
+	storage.peer_fences[handle.slot].serial++;
+	cluster_ko_peer_apply_error_v3(ERRCODE_IO_ERROR);
+	UT_ASSERT(!ko_peer_attempt_active);
+	UT_ASSERT_EQ(storage.peer_fences[handle.slot].failure_sqlerrcode, 0);
+	UT_ASSERT_EQ(storage.send_v3_count, 0);
+}
+
+UT_TEST(test_v3_origin_consumes_failure_before_an_ack_deadline)
+{
+	KoAxBinding binding = origin_marker_setup();
+	volatile bool caught = false;
+	drive_v3_failure = true;
+	expecting_error = true;
+	PG_TRY();
+	{
+		(void)ko_run_shared_barrier_impl_v3(space_identity.key.locator,
+											CLUSTER_KO_SHARED_V3_OPERATION_DROP, &binding, NULL);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	expecting_error = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(reported_sqlstate, ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE);
+	UT_ASSERT_EQ(failure_records, 1);
+	UT_ASSERT_EQ(record_count, 0);
+	UT_ASSERT_EQ(barrier_waits, 1); /* fixture delivery wakes this same owner */
+	UT_ASSERT_EQ(barrier_removes, 1);
+	UT_ASSERT(!barrier_active);
+	UT_ASSERT_EQ(current_epoch, 1);
+}
 UT_TEST(test_v3_sender_does_not_resend_after_acceptance_or_ambiguous_error)
 {
 	for (int n = 0; n < 2; n++) {
@@ -7324,7 +7498,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(169);
+	UT_PLAN(174);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
 	UT_RUN(test_peer_space_entry_checks_precede_io);
@@ -7490,6 +7664,11 @@ main(void)
 	UT_RUN(test_v3_origin_refuses_missing_marker_capability_before_publication);
 	UT_RUN(test_v3_origin_marker_error_releases_only_unsent_context);
 	UT_RUN(test_v3_sender_retries_only_caller_owned_frame);
+	UT_RUN(test_v3_failed_reply_reaches_original_wait_without_done);
+	UT_RUN(test_v3_peer_io_error_retains_exact_work_and_publishes_only_failure);
+	UT_RUN(test_v3_failure_reply_waits_for_existing_queue_capacity);
+	UT_RUN(test_v3_failure_cleanup_cannot_poison_reused_owner);
+	UT_RUN(test_v3_origin_consumes_failure_before_an_ack_deadline);
 	UT_RUN(test_v3_sender_does_not_resend_after_acceptance_or_ambiguous_error);
 	UT_RUN(test_v3_sender_bounds_retry_without_hiding_other_work);
 	UT_RUN(test_v3_ack_needs_actual_transport_admission_without_hard_error);

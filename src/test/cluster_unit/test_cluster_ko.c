@@ -460,10 +460,23 @@ UT_TEST(shared_v3_codec_allows_remote_ges_holder_identity)
 	UT_ASSERT(!cluster_ko_shared_encode_v3(&request, bytes, sizeof(bytes)));
 }
 
+UT_TEST(shared_v3_failure_matches_identity_but_never_done)
+{
+	ClusterKoSharedMessageV3 request = shared_v3_fixture(), result = request;
+	result.base.verb = CLUSTER_KO_SHARED_ACK;
+	result.base.status = CLUSTER_KO_SHARED_FAILED;
+	UT_ASSERT(cluster_ko_shared_result_matches_v3(&request, &result));
+	UT_ASSERT(!cluster_ko_shared_ack_matches_v3(&request, &result));
+	result.space_mutation_token++;
+	UT_ASSERT(!cluster_ko_shared_result_matches_v3(&request, &result));
+	result = request;
+	UT_ASSERT(!cluster_ko_shared_result_matches_v3(&request, &result));
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
 	UT_RUN(test_ko_resid_encode);
 	UT_RUN(test_ko_resid_namespace_distinct);
 	UT_RUN(test_ko_vs_dl_resid_distinct);
@@ -477,6 +490,7 @@ main(void)
 	UT_RUN(shared_wire_accepts_highest_node_without_truncating_bitmap);
 	UT_RUN(shared_v3_wire_binds_ax_and_rejects_v2_or_reserved);
 	UT_RUN(shared_v3_codec_allows_remote_ges_holder_identity);
+	UT_RUN(shared_v3_failure_matches_identity_but_never_done);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

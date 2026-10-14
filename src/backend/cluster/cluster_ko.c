@@ -307,8 +307,8 @@ cluster_ko_shared_decode_v3(const void *data, size_t length, ClusterKoSharedMess
 }
 
 bool
-cluster_ko_shared_ack_matches_v3(const ClusterKoSharedMessageV3 *request,
-								 const ClusterKoSharedMessageV3 *ack)
+cluster_ko_shared_result_matches_v3(const ClusterKoSharedMessageV3 *request,
+									const ClusterKoSharedMessageV3 *ack)
 {
 	ClusterKoSharedMessageV3 normalized;
 	uint8 expected[CLUSTER_KO_SHARED_V3_BYTES], observed[sizeof(expected)];
@@ -316,7 +316,8 @@ cluster_ko_shared_ack_matches_v3(const ClusterKoSharedMessageV3 *request,
 	if (!ko_shared_v3_valid(request) || !ko_shared_v3_valid(ack)
 		|| request->base.verb != CLUSTER_KO_SHARED_REQUEST
 		|| ack->base.verb != CLUSTER_KO_SHARED_ACK
-		|| ack->base.status != CLUSTER_KO_SHARED_DONE)
+		|| (ack->base.status != CLUSTER_KO_SHARED_DONE
+			&& ack->base.status != CLUSTER_KO_SHARED_FAILED))
 		return false;
 	normalized = *ack;
 	normalized.base.verb = CLUSTER_KO_SHARED_REQUEST;
@@ -324,5 +325,13 @@ cluster_ko_shared_ack_matches_v3(const ClusterKoSharedMessageV3 *request,
 	return cluster_ko_shared_encode_v3(request, expected, sizeof(expected))
 		   && cluster_ko_shared_encode_v3(&normalized, observed, sizeof(observed))
 		   && memcmp(expected, observed, sizeof(expected)) == 0;
+}
+
+bool
+cluster_ko_shared_ack_matches_v3(const ClusterKoSharedMessageV3 *request,
+								 const ClusterKoSharedMessageV3 *ack)
+{
+	return ack != NULL && ack->base.status == CLUSTER_KO_SHARED_DONE
+		   && cluster_ko_shared_result_matches_v3(request, ack);
 }
 #endif

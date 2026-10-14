@@ -155,10 +155,12 @@ SinvalBcastMain(void)
 	 * touches the buffer pool (FlushRelationsAllBuffers / DropRelationsAllBuffers),
 	 * so a failed flush can leave buffer pins / LWLocks held; release them with the
 	 * bgwriter-style aux cleanup subset rather than the original skeleton's
-	 * log-only handler.  A dropped KO request leaves the dropping node to time out
-	 * and fail closed (53RAA), which is the correct fail-closed behavior.
+	 * log-only handler. The exact v3 attempt retains its failure after cleanup
+	 * and notifies the origin through the original reply queue. Legacy requests
+	 * retain their original missing-ACK behavior.
 	 */
 	if (sigsetjmp(local_sigjmp_buf, 1) != 0) {
+		int sqlerrcode = geterrcode();
 		/* Since not using PG_TRY, must reset error stack by hand */
 		error_context_stack = NULL;
 		if (cluster_normal_stop_requested())
@@ -181,6 +183,9 @@ SinvalBcastMain(void)
 		AtEOXact_SMgr();
 		AtEOXact_Files(false);
 		AtEOXact_HashTables(false);
+		/* No KO lock is taken while unwinding buffer/PCM locks. Preserve the
+		 * exact v3 operation and original error before resetting ErrorData. */
+		cluster_ko_peer_apply_error_v3(sqlerrcode);
 
 		MemoryContextSwitchTo(sinval_bcast_context);
 		FlushErrorState();

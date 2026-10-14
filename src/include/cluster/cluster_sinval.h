@@ -410,6 +410,10 @@ extern uint64 cluster_sinval_ack_wait_alloc_batch_id(void);
 extern bool cluster_sinval_ack_wait_begin(uint64 batch_id, uint32 alive_mask,
 										  TimestampTz deadline_us);
 extern void cluster_sinval_ack_wait_record(uint64 batch_id, int32 acker_node);
+/* KO-only negative result. It wakes the original owner without setting an
+ * ACK bit, completing the wait, or affecting catalog publications. */
+extern void cluster_sinval_ack_wait_record_failure(uint64 batch_id, int32 peer);
+extern bool cluster_sinval_ack_wait_read_failure(uint64 batch_id, int32 *peer_out);
 extern bool cluster_sinval_ack_wait_is_complete(uint64 batch_id);
 extern void cluster_sinval_ack_wait_remove(uint64 batch_id);
 

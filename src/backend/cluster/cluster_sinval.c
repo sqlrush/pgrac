@@ -1239,6 +1239,8 @@ cluster_sinval_request_reset_all_broadcast(void)
 typedef struct ClusterSinvalAckWaitEntry {
 	uint64 batch_id; /* HTAB key */
 	int32 enqueuer_pgprocno;
+	int32 ko_enqueuer_pid;
+	uint32 ko_failed_peer_mask;
 	uint32 alive_peer_mask;
 	uint32 ack_received_mask;
 	TimestampTz deadline_us;
@@ -1728,6 +1730,7 @@ cluster_sinval_normal_stop_poll(const char **domain_out, uint64 *key_out, const 
 		if (entry->batch_id == 0 || entry->enqueuer_pgprocno < 0
 			|| (uint32)entry->enqueuer_pgprocno >= ProcGlobal->allProcCount
 			|| (entry->ack_received_mask & ~entry->alive_peer_mask) != 0
+			|| (entry->ko_failed_peer_mask & ~entry->alive_peer_mask) != 0
 			|| entry->status > SINVAL_ACK_RESET_PENDING || entry->completion_signaled > 1
 			|| (entry->completion_signaled && entry->ack_received_mask != entry->alive_peer_mask))
 			SINVAL_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, "ack_wait", entry->batch_id,
@@ -2124,6 +2127,7 @@ cluster_sinval_ack_wait_begin(uint64 batch_id, uint32 alive_mask, TimestampTz de
 	memset(entry, 0, sizeof(*entry));
 	entry->batch_id = batch_id;
 	entry->enqueuer_pgprocno = MyProc->pgprocno;
+	entry->ko_enqueuer_pid = MyProc->pid;
 	entry->alive_peer_mask = alive_mask;
 	entry->ack_received_mask = 0;
 	entry->deadline_us = deadline_us;
@@ -2157,7 +2161,8 @@ cluster_sinval_ack_wait_record(uint64 batch_id, int32 acker_node)
 	LWLockAcquire(ClusterSinvalAckWaitLock, LW_EXCLUSIVE);
 	entry = (ClusterSinvalAckWaitEntry *)hash_search(ClusterSinvalAckWaitHTAB, &batch_id, HASH_FIND,
 													 &found);
-	if (found && !entry->publication && (entry->alive_peer_mask & acker_bit) != 0) {
+	if (found && !entry->publication && entry->ko_failed_peer_mask == 0
+		&& (entry->alive_peer_mask & acker_bit) != 0) {
 		entry->ack_received_mask |= acker_bit;
 		if ((entry->ack_received_mask & entry->alive_peer_mask) == entry->alive_peer_mask
 			&& entry->completion_signaled == 0) {
@@ -2169,6 +2174,59 @@ cluster_sinval_ack_wait_record(uint64 batch_id, int32 acker_node)
 
 	if (enqueuer_pgprocno >= 0)
 		SetLatch(&GetPGProcByNumber(enqueuer_pgprocno)->procLatch);
+}
+
+/* The KO handler has authenticated the complete operation. Record only its
+ * negative result here; generic catalog publication and DONE masks are not
+ * a carrier for a failed physical operation. */
+void
+cluster_sinval_ack_wait_record_failure(uint64 batch_id, int32 peer)
+{
+	ClusterSinvalAckWaitEntry *entry;
+	uint32 bit;
+	int32 procno = -1, pid = 0;
+	bool found;
+
+	if (ClusterSinval == NULL || ClusterSinvalAckWaitHTAB == NULL || peer < 0 || peer >= 32)
+		return;
+	bit = UINT32_C(1) << peer;
+	LWLockAcquire(ClusterSinvalAckWaitLock, LW_EXCLUSIVE);
+	entry = hash_search(ClusterSinvalAckWaitHTAB, &batch_id, HASH_FIND, &found);
+	if (found && !entry->publication && (entry->alive_peer_mask & bit) != 0
+		&& (entry->ko_failed_peer_mask & bit) == 0) {
+		entry->ko_failed_peer_mask |= bit;
+		procno = entry->enqueuer_pgprocno;
+		pid = entry->ko_enqueuer_pid;
+	}
+	LWLockRelease(ClusterSinvalAckWaitLock);
+	if (ProcGlobal != NULL && procno >= 0 && (uint32)procno < ProcGlobal->allProcCount && pid > 0
+		&& GetPGProcByNumber(procno)->pid == pid)
+		SetLatch(&GetPGProcByNumber(procno)->procLatch);
+}
+
+bool
+cluster_sinval_ack_wait_read_failure(uint64 batch_id, int32 *peer_out)
+{
+	ClusterSinvalAckWaitEntry *entry;
+	uint32 failed = 0;
+	bool found;
+
+	if (ClusterSinval == NULL || ClusterSinvalAckWaitHTAB == NULL)
+		return false;
+	LWLockAcquire(ClusterSinvalAckWaitLock, LW_SHARED);
+	entry = hash_search(ClusterSinvalAckWaitHTAB, &batch_id, HASH_FIND, &found);
+	if (found && !entry->publication)
+		failed = entry->ko_failed_peer_mask;
+	LWLockRelease(ClusterSinvalAckWaitLock);
+	if (failed == 0)
+		return false;
+	if (peer_out != NULL)
+		for (int32 peer = 0; peer < 32; peer++)
+			if ((failed & (UINT32_C(1) << peer)) != 0) {
+				*peer_out = peer;
+				break;
+			}
+	return true;
 }
 
 /* True when every alive peer has ACK'd for batch_id. */
@@ -2187,8 +2245,9 @@ cluster_sinval_ack_wait_is_complete(uint64 batch_id)
 													 &found);
 	if (found)
 		complete = entry->publication ? sinval_publication_complete(entry)
-									  : (entry->ack_received_mask & entry->alive_peer_mask)
-											== entry->alive_peer_mask;
+									  : entry->ko_failed_peer_mask == 0
+											&& (entry->ack_received_mask & entry->alive_peer_mask)
+												   == entry->alive_peer_mask;
 	LWLockRelease(ClusterSinvalAckWaitLock);
 	return complete;
 }

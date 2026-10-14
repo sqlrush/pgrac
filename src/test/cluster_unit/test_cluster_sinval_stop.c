@@ -1182,13 +1182,75 @@ UT_TEST(test_ko_publication_rechecks_boot_after_enqueue)
 	UT_ASSERT_EQ(send_count, 0);
 }
 
+UT_TEST(test_ko_failure_wakes_owner_without_ack_or_completion)
+{
+	int32 peer = -1;
+	reset_test();
+	MyProc->pid = 123;
+	UT_ASSERT(cluster_sinval_ack_wait_begin(901, 6, 9000000));
+	cluster_sinval_ack_wait_record_failure(901, 1);
+	UT_ASSERT(cluster_sinval_ack_wait_read_failure(901, &peer));
+	UT_ASSERT_EQ(peer, 1);
+	UT_ASSERT_EQ(wake_count, 1);
+	UT_ASSERT_EQ(hash_entries[0].ack_received_mask, 0);
+	UT_ASSERT_EQ(hash_entries[0].completion_signaled, 0);
+	UT_ASSERT(!cluster_sinval_ack_wait_is_complete(901));
+	cluster_sinval_ack_wait_record_failure(901, 1);
+	UT_ASSERT_EQ(wake_count, 1);
+	cluster_sinval_ack_wait_record(901, 1);
+	cluster_sinval_ack_wait_record(901, 2);
+	UT_ASSERT(!cluster_sinval_ack_wait_is_complete(901));
+	UT_ASSERT_EQ(hash_entries[0].ack_received_mask, 0);
+	UT_ASSERT_EQ(poll_all(), CLUSTER_NORMAL_STOP_PENDING);
+	cluster_sinval_ack_wait_remove(901);
+	UT_ASSERT(!cluster_sinval_ack_wait_read_failure(901, NULL));
+	UT_ASSERT_EQ(poll_all(), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_ko_failure_cannot_poison_publication_or_other_wait)
+{
+	int32 peer = 77;
+	reset_test();
+	begin_publication(902);
+	cluster_sinval_ack_wait_record_failure(902, 1);
+	UT_ASSERT(!cluster_sinval_ack_wait_read_failure(902, &peer));
+	UT_ASSERT_EQ(peer, 77);
+	UT_ASSERT_EQ(wake_count, 0);
+	reset_test();
+	UT_ASSERT(cluster_sinval_ack_wait_begin(903, 2, 9000000));
+	cluster_sinval_ack_wait_record_failure(904, 1);
+	cluster_sinval_ack_wait_record_failure(903, 2);
+	cluster_sinval_ack_wait_record_failure(903, -1);
+	cluster_sinval_ack_wait_record_failure(903, 32);
+	UT_ASSERT(!cluster_sinval_ack_wait_read_failure(903, &peer));
+	UT_ASSERT_EQ(peer, 77);
+	UT_ASSERT_EQ(wake_count, 0);
+	cluster_sinval_ack_wait_record(903, 1);
+	UT_ASSERT(cluster_sinval_ack_wait_is_complete(903));
+}
+
+UT_TEST(test_ko_failure_does_not_notify_reused_proc_slot)
+{
+	reset_test();
+	MyProc->pid = 123;
+	UT_ASSERT(cluster_sinval_ack_wait_begin(905, 2, 9000000));
+	MyProc->pid = 124;
+	cluster_sinval_ack_wait_record_failure(905, 1);
+	UT_ASSERT_EQ(wake_count, 0);
+	UT_ASSERT(cluster_sinval_ack_wait_read_failure(905, NULL));
+	UT_ASSERT(!cluster_sinval_ack_wait_is_complete(905));
+}
+
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(33);
 	UT_RUN(test_required_state_and_nonzero_empty_cursors);
 	UT_RUN(test_actual_inbound_outbound_and_ack_handoffs);
 	UT_RUN(test_all_acknowledged_still_needs_original_remove);
+	UT_RUN(test_ko_failure_wakes_owner_without_ack_or_completion);
+	UT_RUN(test_ko_failure_cannot_poison_publication_or_other_wait);
+	UT_RUN(test_ko_failure_does_not_notify_reused_proc_slot);
 	UT_RUN(test_reset_flags_need_original_consumers);
 	UT_RUN(test_later_malformed_ack_overrides_pending);
 	UT_RUN(test_geometry_live_identity_and_original_lock);

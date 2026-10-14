@@ -159,6 +159,8 @@ typedef struct ClusterKoPeerFenceV3 {
 	bool physical_started;
 	bool physical_applied;
 	bool ack_queued;
+	bool failure_queued;
+	int failure_sqlerrcode;
 	bool local_scan_complete;
 	uint32 local_scan_cursor;
 	uint64 local_scan_revision;
@@ -231,6 +233,8 @@ typedef struct ClusterKoShared {
 } ClusterKoShared;
 
 static ClusterKoShared *ko_state = NULL;
+static ClusterKoPeerFenceHandleV3 ko_peer_attempt;
+static bool ko_peer_attempt_active;
 static ClusterKoExtendWorkV3 ko_extend_local;
 static uint32 ko_extend_slot;
 static bool ko_extend_write_armed, ko_extend_materialized, ko_extend_aborting;
@@ -870,7 +874,8 @@ ko_peer_fence_physical_owned_v3(const ClusterKoSharedMessageV3 *request)
 }
 
 static bool
-ko_peer_fence_mark_physical_started_v3(const ClusterKoSharedMessageV3 *request)
+ko_peer_fence_mark_physical_started_v3(const ClusterKoSharedMessageV3 *request,
+									   ClusterKoPeerFenceHandleV3 *handle)
 {
 	uint8 encoded[CLUSTER_KO_SHARED_V3_BYTES];
 	bool marked = false;
@@ -882,12 +887,16 @@ ko_peer_fence_mark_physical_started_v3(const ClusterKoSharedMessageV3 *request)
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
 		ClusterKoPeerFenceV3 *entry = &ko_state->peer_fences[i];
 
-		if (entry->state == CLUSTER_KO_PEER_FENCE_ACTIVE
+		if (entry->state == CLUSTER_KO_PEER_FENCE_ACTIVE && entry->failure_sqlerrcode == 0
 			&& entry->request.base.origin_node == request->base.origin_node
 			&& entry->request.base.origin_boot == request->base.origin_boot
 			&& entry->request.base.batch_id == request->base.batch_id
 			&& memcmp(entry->encoded, encoded, sizeof(encoded)) == 0) {
 			entry->physical_started = true;
+			if (handle != NULL) {
+				handle->slot = i;
+				handle->serial = entry->serial;
+			}
 			marked = true;
 			break;
 		}
@@ -910,6 +919,7 @@ ko_peer_fence_mark_physical_applied_v3(const ClusterKoSharedMessageV3 *request)
 		ClusterKoPeerFenceV3 *entry = &ko_state->peer_fences[i];
 
 		if (entry->state == CLUSTER_KO_PEER_FENCE_ACTIVE && entry->physical_started
+			&& entry->failure_sqlerrcode == 0
 			&& entry->request.base.origin_node == request->base.origin_node
 			&& entry->request.base.origin_boot == request->base.origin_boot
 			&& entry->request.base.batch_id == request->base.batch_id
@@ -925,6 +935,40 @@ ko_peer_fence_mark_physical_applied_v3(const ClusterKoSharedMessageV3 *request)
 	}
 	SpinLockRelease(&ko_state->shared_lock);
 	return marked;
+}
+
+void
+cluster_ko_peer_apply_error_v3(int sqlerrcode)
+{
+	ClusterKoSharedMessageV3 request;
+	bool recorded = false;
+
+	if (ko_state == NULL || !AmSinvalBcastProcess() || !ko_peer_attempt_active
+		|| ko_peer_attempt.slot >= CLUSTER_KO_SHARED_CAPACITY || sqlerrcode == 0)
+		return;
+	SpinLockAcquire(&ko_state->shared_lock);
+	{
+		ClusterKoPeerFenceV3 *entry = &ko_state->peer_fences[ko_peer_attempt.slot];
+		if (entry->serial == ko_peer_attempt.serial && entry->state == CLUSTER_KO_PEER_FENCE_ACTIVE
+			&& entry->physical_started && entry->failure_sqlerrcode == 0) {
+			entry->failure_sqlerrcode = sqlerrcode;
+			entry->local_scan_complete = false;
+			request = entry->request;
+			recorded = true;
+		}
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	ko_peer_attempt_active = false;
+	if (recorded)
+		ereport(LOG,
+				(errcode(sqlerrcode),
+				 errmsg("KO v3 peer operation failed; original work is retained"),
+				 errdetail("origin=%u peer=%u epoch=" UINT64_FORMAT " batch=" UINT64_FORMAT
+						   " locator=%u/%u/%u operation=%u sqlerrcode=%d",
+						   request.base.origin_node, request.base.peer_node, request.base.epoch,
+						   request.base.batch_id, request.base.key.locator.spcOid,
+						   request.base.key.locator.dbOid, request.base.key.locator.relNumber,
+						   request.operation, sqlerrcode)));
 }
 
 bool
@@ -1651,7 +1695,8 @@ cluster_ko_peer_fence_ready_v3(const ClusterKoSharedMessageV3 *request,
 		&& (entry->state == CLUSTER_KO_PEER_FENCE_ACTIVE
 			|| entry->state == CLUSTER_KO_PEER_FENCE_READY)
 		&& memcmp(entry->encoded, encoded, sizeof(encoded)) == 0 && entry->physical_applied
-		&& entry->local_scan_complete && !ko_cleaner_pending_locked(request->base.key.locator)
+		&& entry->local_scan_complete && entry->failure_sqlerrcode == 0
+		&& !ko_cleaner_pending_locked(request->base.key.locator)
 		&& !ko_extend_pending_locked(request->base.key.locator) && entry->local_scan_revision != 0
 		&& entry->local_scan_revision != UINT64_MAX
 		&& pg_atomic_read_u64(&ko_state->peer_admission_revision) == entry->local_scan_revision
@@ -1754,14 +1799,16 @@ ko_peer_fence_local_ready_tick_v3(void)
 		ClusterKoPeerFenceHandleV3 handle;
 		uint64 route_generation;
 		ClusterKoPeerFenceStateV3 state;
-		bool physical_applied, ack_queued;
+		bool physical_applied, ack_queued, failed;
 
 		SpinLockAcquire(&ko_state->shared_lock);
 		state = ko_state->peer_fences[i].state;
 		physical_applied = ko_state->peer_fences[i].physical_applied;
 		ack_queued = ko_state->peer_fences[i].ack_queued;
+		failed = ko_state->peer_fences[i].failure_sqlerrcode != 0;
 		if ((state != CLUSTER_KO_PEER_FENCE_ACTIVE && state != CLUSTER_KO_PEER_FENCE_READY)
-			|| !physical_applied || ack_queued) {
+			|| (failed ? ko_state->peer_fences[i].failure_queued
+					   : (!physical_applied || ack_queued))) {
 			SpinLockRelease(&ko_state->shared_lock);
 			continue;
 		}
@@ -1771,24 +1818,40 @@ ko_peer_fence_local_ready_tick_v3(void)
 		handle.slot = i;
 		handle.serial = ko_state->peer_fences[i].serial;
 		SpinLockRelease(&ko_state->shared_lock);
+		if (failed) {
+			request.base.verb = CLUSTER_KO_SHARED_ACK;
+			request.base.status = CLUSTER_KO_SHARED_FAILED;
+			if (ko_shared_enqueue_v3(&request, route_generation)) {
+				SpinLockAcquire(&ko_state->shared_lock);
+				if (ko_state->peer_fences[i].serial == handle.serial
+					&& ko_state->peer_fences[i].failure_sqlerrcode != 0)
+					ko_state->peer_fences[i].failure_queued = true;
+				SpinLockRelease(&ko_state->shared_lock);
+			}
+			continue;
+		}
+		ko_peer_attempt = handle;
+		ko_peer_attempt_active = true;
 
 		if (state == CLUSTER_KO_PEER_FENCE_ACTIVE) {
 			if (!ko_peer_fence_local_scan_v3(&before, &handle))
-				continue;
+				goto next_owner;
 			if (!cluster_ko_peer_fence_ready_v3(&request, &handle))
-				continue;
+				goto next_owner;
 		}
 
 		request.base.verb = CLUSTER_KO_SHARED_ACK;
 		request.base.status = CLUSTER_KO_SHARED_DONE;
 		if (!ko_shared_enqueue_v3(&request, route_generation))
-			continue;
+			goto next_owner;
 		SpinLockAcquire(&ko_state->shared_lock);
 		if (ko_state->peer_fences[i].serial == handle.serial
 			&& ko_state->peer_fences[i].state == CLUSTER_KO_PEER_FENCE_READY
 			&& ko_state->peer_fences[i].physical_applied)
 			ko_state->peer_fences[i].ack_queued = true;
 		SpinLockRelease(&ko_state->shared_lock);
+	next_owner:
+		ko_peer_attempt_active = false;
 	}
 	(void)cluster_ko_peer_fence_gc_tick_v3();
 }
@@ -3882,6 +3945,9 @@ cluster_ko_shared_normal_stop_poll_v2(const char **reason)
 		if (state < CLUSTER_KO_PEER_FENCE_EMPTY || state > CLUSTER_KO_PEER_FENCE_COMMITTED) {
 			result = CLUSTER_NORMAL_STOP_INVALID;
 			why = "KO_PEER_FENCE_INVALID";
+		} else if (ko_state->peer_fences[i].failure_sqlerrcode != 0) {
+			result = CLUSTER_NORMAL_STOP_INVALID;
+			why = "KO_PEER_APPLY_FAILED";
 		} else if ((state == CLUSTER_KO_PEER_FENCE_ACTIVE
 					|| (state == CLUSTER_KO_PEER_FENCE_READY
 						&& ko_state->peer_fences[i].physical_applied
@@ -4309,7 +4375,22 @@ ko_shared_wait_for_acks_v3(ClusterKoSharedMessageV3 *request, uint32 mask,
 	while (ko_shared_v3_control_current(request)) {
 		TimestampTz now;
 		int events;
+		int32 failed_peer;
 		CHECK_FOR_INTERRUPTS();
+		if (cluster_sinval_ack_wait_read_failure(request->base.batch_id, &failed_peer)) {
+			KO_BUMP(failclosed_count);
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE),
+					 errmsg("KO v3 peer could not complete the object drain"),
+					 errdetail("origin=%u epoch=" UINT64_FORMAT " batch=" UINT64_FORMAT
+							   " peer=%d locator=%u/%u/%u operation=%u",
+							   request->base.origin_node, request->base.epoch,
+							   request->base.batch_id, failed_peer,
+							   request->base.key.locator.spcOid, request->base.key.locator.dbOid,
+							   request->base.key.locator.relNumber, request->operation),
+					 errhint("Check the peer log for this operation's original error; "
+							 "the object drain has not completed.")));
+		}
 		if (cluster_sinval_ack_wait_is_complete(request->base.batch_id))
 			return ko_shared_v3_control_current(request) && ko_shared_v3_space_current(request);
 		now = GetCurrentTimestamp();
@@ -4884,9 +4965,10 @@ cluster_ko_flush_request_handler(const ClusterICEnvelope *env, const void *paylo
 /*
  * cluster_ko_flush_ack_handler -- enqueuer-side IC inbound handler (runs in
  * LMON).  Records a peer's apply-after-drop ACK against the ack_wait entry.
- * KO-M6: ONLY status DONE counts as fulfilled -- a FAILED ACK (or no ACK at all)
- * leaves the enqueuer to time out and fail closed; there is no RESET_PENDING
- * shortcut (SIResetAll does not drop buffer-pool dirty pages).
+ * KO-M6: ONLY status DONE counts as fulfilled. An exact v3 FAILED wakes the
+ * original waiter with a negative result; legacy missing ACKs retain their
+ * original timeout. There is no RESET_PENDING shortcut (SIResetAll does not
+ * drop buffer-pool dirty pages).
  */
 void
 cluster_ko_flush_ack_handler(const ClusterICEnvelope *env, const void *payload)
@@ -4904,10 +4986,10 @@ cluster_ko_flush_ack_handler(const ClusterICEnvelope *env, const void *payload)
 
 			if (!cluster_ko_shared_decode_v3(payload, env->payload_length, &ack)
 				|| ack.base.verb != CLUSTER_KO_SHARED_ACK
-				|| ack.base.status != CLUSTER_KO_SHARED_DONE
+				|| (ack.base.status != CLUSTER_KO_SHARED_DONE
+					&& ack.base.status != CLUSTER_KO_SHARED_FAILED)
 				|| ack.base.origin_node != cluster_node_id
-				|| ack.base.peer_node != env->source_node_id
-				|| !ko_shared_v3_control_current(&ack))
+				|| ack.base.peer_node != env->source_node_id || !ko_shared_v3_control_current(&ack))
 				return;
 			SpinLockAcquire(&ko_state->shared_lock);
 			for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
@@ -4921,13 +5003,17 @@ cluster_ko_flush_ack_handler(const ClusterICEnvelope *env, const void *payload)
 				expected = entry->request_v3;
 				expected.base.peer_node = ack.base.peer_node;
 				expected.base.peer_boot = entry->peer_boots[ack.base.peer_node];
-				matched = cluster_ko_shared_ack_matches_v3(&expected, &ack);
+				matched = cluster_ko_shared_result_matches_v3(&expected, &ack);
 				break;
 			}
 			SpinLockRelease(&ko_state->shared_lock);
 			if (matched) {
-				cluster_sinval_ack_wait_record(ack.base.batch_id, ack.base.peer_node);
-				KO_BUMP(ack_received_count);
+				if (ack.base.status == CLUSTER_KO_SHARED_FAILED)
+					cluster_sinval_ack_wait_record_failure(ack.base.batch_id, ack.base.peer_node);
+				else {
+					cluster_sinval_ack_wait_record(ack.base.batch_id, ack.base.peer_node);
+					KO_BUMP(ack_received_count);
+				}
 			}
 			return;
 		}
@@ -4987,7 +5073,7 @@ cluster_ko_drain_inbound_and_apply(void)
 {
 	uint32 head, tail;
 
-	if (ko_state == NULL)
+	if (ko_state == NULL || ko_peer_attempt_active)
 		return;
 
 	head = pg_atomic_read_u32(&ko_state->inbound_head);
@@ -5022,13 +5108,19 @@ cluster_ko_drain_inbound_and_apply(void)
 			ko_peer_fence_local_ready_tick_v3();
 			return;
 		}
-		if (slot.shared && slot.v3 && !ko_peer_fence_mark_physical_started_v3(&slot.qualified_v3))
-			goto next;
+		if (slot.shared && slot.v3) {
+			if (!ko_peer_fence_mark_physical_started_v3(&slot.qualified_v3, &ko_peer_attempt)) {
+				head = (head + 1) % CLUSTER_KO_INBOUND_CAPACITY;
+				pg_atomic_write_u32(&ko_state->inbound_head, head);
+				goto next;
+			}
+			ko_peer_attempt_active = true;
+		}
 		/*
-		 * Advance the head BEFORE applying: a failed flush (longjmp to the aux
-		 * error handler) must not re-process the same request forever -- the
-		 * dropped request leaves the enqueuer to time out (53RAA), which is the
-		 * correct fail-closed behavior rather than an infinite retry loop.
+		 * Advance the head BEFORE applying. The exact v3 attempt is now owned
+		 * by its shared fence; SI error cleanup records FAILED there without
+		 * retrying a partially applied operation or losing its responsibility.
+		 * Legacy requests retain the original no-ACK failure behavior.
 		 */
 		head = (head + 1) % CLUSTER_KO_INBOUND_CAPACITY;
 		pg_atomic_write_u32(&ko_state->inbound_head, head);
@@ -5142,6 +5234,7 @@ cluster_ko_drain_inbound_and_apply(void)
 		cluster_lmon_wakeup(); /* wake LMON to send the ACK */
 
 	next:
+		ko_peer_attempt_active = false;
 		head = pg_atomic_read_u32(&ko_state->inbound_head);
 		tail = pg_atomic_read_u32(&ko_state->inbound_tail);
 	}

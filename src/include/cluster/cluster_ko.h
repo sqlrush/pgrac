@@ -249,6 +249,10 @@ extern bool cluster_ko_shared_decode_v3(const void *bytes, size_t length,
 										ClusterKoSharedMessageV3 *out);
 extern bool cluster_ko_shared_ack_matches_v3(const ClusterKoSharedMessageV3 *request,
 											 const ClusterKoSharedMessageV3 *ack);
+/* Full operation identity for DONE or FAILED; matching FAILED is never a
+ * successful ACK. Consumers must retain its negative polarity. */
+extern bool cluster_ko_shared_result_matches_v3(const ClusterKoSharedMessageV3 *request,
+												const ClusterKoSharedMessageV3 *result);
 #endif
 
 #ifndef FRONTEND
@@ -559,6 +563,9 @@ extern void cluster_ko_flush_ack_handler(const ClusterICEnvelope *env, const voi
  * full buffer-pool scan.
  */
 extern void cluster_ko_drain_inbound_and_apply(void);
+/* Original SI error owner, after its LWLocks/pins have been released and
+ * before FlushErrorState. Records only the exact active v3 attempt. */
+extern void cluster_ko_peer_apply_error_v3(int sqlerrcode);
 /* Original LMON drains the shared-only fixed frame queue, outside locks. */
 extern void cluster_ko_lmon_tick_v2(void);
 
