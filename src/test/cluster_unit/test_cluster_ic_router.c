@@ -972,10 +972,118 @@ UT_TEST(test_control_handler_defers_before_transferring_the_frame)
 	UT_ASSERT_EQ(control_consumed, 2);
 }
 
+int MyProcPid = 12001;
+static ClusterICControlIngress expected_ingress[2];
+static int ingress_depth;
+static bool ingress_present, ingress_nested, ingress_error;
+static void
+control_ingress_handler(const ClusterICEnvelope *env, const void *payload)
+{
+	ClusterICControlIngress seen;
+	ClusterICEnvelope wrong = *env;
+	UT_ASSERT_EQ(cluster_ic_dispatch_control_ingress(env, &seen), ingress_present);
+	if (ingress_present)
+		UT_ASSERT_EQ(memcmp(&seen, &expected_ingress[ingress_depth], sizeof(seen)), 0);
+	else
+		UT_ASSERT_EQ(seen.serial, 0);
+	UT_ASSERT(!cluster_ic_dispatch_control_ingress(&wrong, &seen));
+	if (ingress_nested && ingress_depth == 0) {
+		ClusterICEnvelope inner = *env;
+		inner.msg_type = 48;
+		ingress_depth++;
+		UT_ASSERT_EQ(cluster_ic_dispatch_control_envelope(&inner, NULL, 1, &expected_ingress[1]),
+					 CLUSTER_IC_DISPATCH_DONE);
+		ingress_depth--;
+		UT_ASSERT(cluster_ic_dispatch_control_ingress(env, &seen));
+		UT_ASSERT_EQ(memcmp(&seen, &expected_ingress[0], sizeof(seen)), 0);
+	}
+	if (ingress_error && ingress_depth == 1)
+		siglongjmp(*PG_exception_stack, 1);
+}
+static ClusterICEnvelope
+control_ingress_setup(void)
+{
+	ClusterICMsgTypeInfo info = {
+		.msg_type = 47,
+		.name = "control-ingress",
+		.handler = control_ingress_handler,
+		.allowed_producer_mask = (uint32)1u << B_LMON,
+		.plane = CLUSTER_IC_PLANE_CONTROL,
+	};
+	ClusterICEnvelope env = { .msg_type = 47, .source_node_id = 1, .dest_node_id = 7, .epoch = 7 };
+	if (cluster_ic_get_msg_type_info(47) == NULL) {
+		cluster_ic_register_msg_type(&info);
+		info.msg_type = 48;
+		cluster_ic_register_msg_type(&info);
+	}
+	MyBackendType = B_LMON;
+	router_test_my_plane = CLUSTER_IC_PLANE_CONTROL;
+	ingress_depth = 0;
+	ingress_nested = ingress_error = false;
+	ingress_present = true;
+	memset(expected_ingress, 0, sizeof(expected_ingress));
+	expected_ingress[0].serial = 41;
+	expected_ingress[0].epoch = 7;
+	expected_ingress[0].owner_pid = MyProcPid;
+	expected_ingress[0].source_node = 1;
+	expected_ingress[0].carrier = CLUSTER_IC_CONTROL_TCP;
+	expected_ingress[1] = expected_ingress[0];
+	expected_ingress[1].serial = 52;
+	expected_ingress[1].carrier = CLUSTER_IC_CONTROL_TCP;
+	return env;
+}
+UT_TEST(test_control_ingress_is_exact_call_metadata)
+{
+	ClusterICEnvelope env = control_ingress_setup();
+	ClusterICControlIngress seen;
+	UT_ASSERT(!cluster_ic_dispatch_control_ingress(&env, &seen));
+	UT_ASSERT_EQ(cluster_ic_dispatch_control_envelope(&env, NULL, 1, &expected_ingress[0]),
+				 CLUSTER_IC_DISPATCH_DONE);
+	UT_ASSERT(!cluster_ic_dispatch_control_ingress(&env, &seen));
+	ingress_present = false;
+	UT_ASSERT_EQ(cluster_ic_dispatch_envelope(&env, NULL, 1), CLUSTER_IC_DISPATCH_DONE);
+}
+UT_TEST(test_control_ingress_nested_error_restores_parent)
+{
+	ClusterICEnvelope env = control_ingress_setup();
+	ClusterICControlIngress seen;
+	ingress_nested = true;
+	UT_ASSERT_EQ(cluster_ic_dispatch_control_envelope(&env, NULL, 1, &expected_ingress[0]),
+				 CLUSTER_IC_DISPATCH_DONE);
+	ingress_error = true;
+	UT_ASSERT_EQ(cluster_ic_dispatch_control_envelope(&env, NULL, 1, &expected_ingress[0]),
+				 CLUSTER_IC_DISPATCH_DONE);
+	UT_ASSERT(!cluster_ic_dispatch_control_ingress(&env, &seen));
+}
+UT_TEST(test_control_ingress_unknown_or_mismatched_source_stays_unknown)
+{
+	for (int fault = 0; fault < 7; fault++) {
+		ClusterICEnvelope env = control_ingress_setup();
+		ClusterICControlIngress bad = expected_ingress[0];
+		ingress_present = false;
+		if (fault == 0)
+			bad.serial = 0;
+		if (fault == 1)
+			bad.serial = UINT64_MAX;
+		if (fault == 2)
+			bad.owner_pid++;
+		if (fault == 3)
+			bad.epoch++;
+		if (fault == 4)
+			bad.source_node++;
+		if (fault == 5)
+			bad.carrier = 0;
+		if (fault == 6)
+			bad.carrier = 2;
+		UT_ASSERT_EQ(cluster_ic_dispatch_control_envelope(&env, NULL, 1, &bad),
+					 CLUSTER_IC_DISPATCH_DONE);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(24);
 
 	/* U6 register HEARTBEAT + count */
 	UT_RUN(test_u6_register_heartbeat_lmon_only);
@@ -1011,6 +1119,9 @@ main(void)
 	(void)test_handler_dummy_calls;
 
 	UT_RUN(test_control_handler_defers_before_transferring_the_frame);
+	UT_RUN(test_control_ingress_is_exact_call_metadata);
+	UT_RUN(test_control_ingress_nested_error_restores_parent);
+	UT_RUN(test_control_ingress_unknown_or_mismatched_source_stays_unknown);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
