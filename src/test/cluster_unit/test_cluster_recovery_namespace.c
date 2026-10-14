@@ -134,6 +134,93 @@ UT_TEST(test_shared_relation_names)
 	}
 }
 
+UT_TEST(test_native_slru_segment_names_are_explicit_obligations)
+{
+	struct NativeName {
+		const char *path;
+		uint8 family;
+		uint32 segment;
+	};
+	static const struct NativeName valid[] = {
+		{ "pg_xact/0000", CLUSTER_RECOVERY_NATIVE_FAMILY_XACT, 0 },
+		{ "pg_subtrans/00AF", CLUSTER_RECOVERY_NATIVE_FAMILY_SUBTRANS, 0xAF },
+		{ "pg_commit_ts/FFFF", CLUSTER_RECOVERY_NATIVE_FAMILY_COMMIT_TS, 0xFFFF },
+		{ "pg_multixact/offsets/0001", CLUSTER_RECOVERY_NATIVE_FAMILY_MX_OFFSETS, 1 },
+		{ "pg_multixact/members/00F0", CLUSTER_RECOVERY_NATIVE_FAMILY_MX_MEMBERS, 0xF0 },
+	};
+	static const char *const invalid[] = {
+		"pg_xact/000",
+		"pg_xact/000a",
+		"pg_xact/0000.bak",
+		"pg_subtrans/00000",
+		"pg_commit_ts/0fff",
+		"pg_multixact/0000",
+		"pg_multixact/offsets/0000/extra",
+		"native_side/origin_0/pg_xact/0000",
+	};
+
+	for (unsigned i = 0; i < lengthof(valid); i++) {
+		RelFileLocator locator;
+		ForkNumber forknum;
+		uint8 family = 0;
+		uint32 segment = 0;
+
+		UT_ASSERT_EQ(cluster_recovery_namespace_classify_ex(valid[i].path, &locator, &forknum,
+															&family, &segment),
+					 CLUSTER_RECOVERY_FILE_NATIVE_SLRU);
+		UT_ASSERT_EQ(family, valid[i].family);
+		UT_ASSERT_EQ(segment, valid[i].segment);
+		UT_ASSERT_EQ(locator.spcOid, InvalidOid);
+		UT_ASSERT_EQ(forknum, InvalidForkNumber);
+	}
+	for (unsigned i = 0; i < lengthof(invalid); i++) {
+		RelFileLocator locator;
+		ForkNumber forknum;
+		uint8 family = 0xa5;
+		uint32 segment = UINT32_MAX;
+
+		UT_ASSERT_EQ(cluster_recovery_namespace_classify_ex(invalid[i], &locator, &forknum, &family,
+															&segment),
+					 CLUSTER_RECOVERY_FILE_UNCLASSIFIED);
+		UT_ASSERT_EQ(family, 0);
+		UT_ASSERT_EQ(segment, UINT32_MAX);
+	}
+}
+
+UT_TEST(test_real_native_slru_entries_carry_family_and_segment)
+{
+	int root = new_root();
+	ClusterRecoveryNamespace *scan = NULL;
+	ClusterRecoveryNamespaceEntry entry;
+	ClusterRecoveryNamespaceResult result;
+	int borrowed = -1;
+	bool found = false;
+
+	UT_ASSERT(root >= 0);
+	UT_ASSERT_EQ(mkdirat(root, "pg_multixact", 0700), 0);
+	UT_ASSERT_EQ(mkdirat(root, "pg_multixact/offsets", 0700), 0);
+	write_file(root, "pg_multixact/offsets/00F0");
+	UT_ASSERT_EQ(cluster_recovery_namespace_begin(root, 16, &scan),
+				 CLUSTER_RECOVERY_NAMESPACE_MORE);
+	while ((result = cluster_recovery_namespace_next(scan, &entry, &borrowed))
+		   <= CLUSTER_RECOVERY_NAMESPACE_MORE) {
+		if (result == CLUSTER_RECOVERY_NAMESPACE_MORE
+			|| entry.kind == CLUSTER_RECOVERY_FILE_DIRECTORY)
+			continue;
+		if (strcmp(entry.path, "pg_multixact/offsets/00F0") == 0) {
+			UT_ASSERT_EQ(entry.kind, CLUSTER_RECOVERY_FILE_NATIVE_SLRU);
+			UT_ASSERT_EQ(entry.native_family, CLUSTER_RECOVERY_NATIVE_FAMILY_MX_OFFSETS);
+			UT_ASSERT_EQ(entry.native_segment, 0xF0);
+			found = true;
+		}
+	}
+	UT_ASSERT_EQ(result, CLUSTER_RECOVERY_NAMESPACE_END);
+	UT_ASSERT(found);
+	cluster_recovery_namespace_destroy(scan);
+	remove_root(root);
+	rmdir(test_path);
+}
+
 UT_TEST(test_relmap_and_both_authority_copies)
 {
 	const char *names[] = { "pg_filenode.map", "pg_filenode.map.bak", "pgrac_relmap_authority",
@@ -560,8 +647,10 @@ UT_TEST(test_current_read_rejects_out_of_range_without_sealing)
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(18);
 	UT_RUN(test_shared_relation_names);
+	UT_RUN(test_native_slru_segment_names_are_explicit_obligations);
+	UT_RUN(test_real_native_slru_entries_carry_family_and_segment);
 	UT_RUN(test_relmap_and_both_authority_copies);
 	UT_RUN(test_undo_names_keep_origin_and_reject_aliases);
 	UT_RUN(test_real_undo_files_export_physical_keys_without_a_live_bitmap);

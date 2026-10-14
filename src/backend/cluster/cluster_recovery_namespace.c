@@ -90,8 +90,58 @@ namespace_undo_key(const char *path, uint32 *segment, uint8 *owner)
 	return true;
 }
 
+/* Native SLRU names are deliberately stricter than ordinary filenames:
+ * exactly four uppercase hexadecimal digits and only the five local physical
+ * families below.  Foreign/native_side paths stay unclassified and therefore
+ * cannot be adopted by the local root census. */
+static bool
+namespace_native_key(const char *path, uint8 *family, uint32 *segment)
+{
+	static const struct {
+		const char *prefix;
+		uint8 family;
+	} prefixes[] = {
+		{ "pg_xact/", CLUSTER_RECOVERY_NATIVE_FAMILY_XACT },
+		{ "pg_subtrans/", CLUSTER_RECOVERY_NATIVE_FAMILY_SUBTRANS },
+		{ "pg_commit_ts/", CLUSTER_RECOVERY_NATIVE_FAMILY_COMMIT_TS },
+		{ "pg_multixact/offsets/", CLUSTER_RECOVERY_NATIVE_FAMILY_MX_OFFSETS },
+		{ "pg_multixact/members/", CLUSTER_RECOVERY_NATIVE_FAMILY_MX_MEMBERS },
+	};
+
+	if (path == NULL || family == NULL || segment == NULL)
+		return false;
+	for (unsigned i = 0; i < lengthof(prefixes); i++) {
+		const char *name = path + strlen(prefixes[i].prefix);
+		uint32 value = 0;
+		char canonical[5];
+
+		if (strncmp(path, prefixes[i].prefix, strlen(prefixes[i].prefix)) != 0 || strlen(name) != 4)
+			continue;
+		for (unsigned digit = 0; digit < 4; digit++) {
+			unsigned nibble;
+
+			if (name[digit] >= '0' && name[digit] <= '9')
+				nibble = (unsigned)(name[digit] - '0');
+			else if (name[digit] >= 'A' && name[digit] <= 'F')
+				nibble = (unsigned)(name[digit] - 'A') + 10;
+			else
+				return false;
+			value = (value << 4) | nibble;
+		}
+		snprintf(canonical, sizeof(canonical), "%04X", value);
+		if (memcmp(canonical, name, sizeof(canonical) - 1) != 0)
+			return false;
+		*family = prefixes[i].family;
+		*segment = value;
+		return true;
+	}
+	return false;
+}
+
 ClusterRecoveryFileKind
-cluster_recovery_namespace_classify(const char *path, RelFileLocator *locator, ForkNumber *forknum)
+cluster_recovery_namespace_classify_ex(const char *path, RelFileLocator *locator,
+									   ForkNumber *forknum, uint8 *native_family,
+									   uint32 *native_segment)
 {
 	RelFileLocator result = { 0 };
 	ClusterRecoveryFileKind kind = CLUSTER_RECOVERY_FILE_UNCLASSIFIED;
@@ -100,13 +150,26 @@ cluster_recovery_namespace_classify(const char *path, RelFileLocator *locator, F
 	const char *suffix;
 	uint32 undo_segment;
 	uint8 undo_owner;
+	uint8 observed_native_family = CLUSTER_RECOVERY_NATIVE_FAMILY_NONE;
+	uint32 observed_native_segment = UINT32_MAX;
 
 	if (locator != NULL)
 		memset(locator, 0, sizeof(*locator));
 	if (forknum != NULL)
 		*forknum = InvalidForkNumber;
+	if (native_family != NULL)
+		*native_family = CLUSTER_RECOVERY_NATIVE_FAMILY_NONE;
+	if (native_segment != NULL)
+		*native_segment = UINT32_MAX;
 	if (path == NULL || locator == NULL || forknum == NULL || strnlen(path, MAXPGPATH) == MAXPGPATH)
 		return kind;
+	if (namespace_native_key(path, &observed_native_family, &observed_native_segment)) {
+		if (native_family != NULL)
+			*native_family = observed_native_family;
+		if (native_segment != NULL)
+			*native_segment = observed_native_segment;
+		return CLUSTER_RECOVERY_FILE_NATIVE_SLRU;
+	}
 	if (namespace_undo_key(path, &undo_segment, &undo_owner))
 		return CLUSTER_RECOVERY_FILE_UNDO_SEGMENT;
 	if (strncmp(path, "global/", 7) == 0) {
@@ -148,6 +211,12 @@ cluster_recovery_namespace_classify(const char *path, RelFileLocator *locator, F
 	*locator = result;
 	*forknum = fork;
 	return kind;
+}
+
+ClusterRecoveryFileKind
+cluster_recovery_namespace_classify(const char *path, RelFileLocator *locator, ForkNumber *forknum)
+{
+	return cluster_recovery_namespace_classify_ex(path, locator, forknum, NULL, NULL);
 }
 
 bool
@@ -468,8 +537,9 @@ cluster_recovery_namespace_next(ClusterRecoveryNamespace *scan, ClusterRecoveryN
 			scan->current_fd = fd;
 			scan->current_stat = held;
 			strlcpy(scan->current_name, item->d_name, sizeof(scan->current_name));
-			entry.kind
-				= cluster_recovery_namespace_classify(entry.path, &entry.locator, &entry.forknum);
+			entry.kind = cluster_recovery_namespace_classify_ex(
+				entry.path, &entry.locator, &entry.forknum, &entry.native_family,
+				&entry.native_segment);
 			if (entry.kind == CLUSTER_RECOVERY_FILE_UNDO_SEGMENT)
 				(void)namespace_undo_key(entry.path, &entry.undo_segment,
 										 &entry.undo_owner_instance);
