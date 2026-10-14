@@ -1815,18 +1815,26 @@ ko_shared_import_current(const ClusterKoSharedContext *context)
 	ClusterKoSharedMessageV2 current;
 	const ClusterWalSourceRef *source;
 	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], generation;
+	bool cut_current;
 
 	if (context == NULL)
 		return false;
 	current = context->request;
 	source = &context->terminal.source;
-	if (context->v3 && !ko_shared_v3_control_current(&context->request_v3))
-		return false;
+	if (context->v3) {
+		if (!ko_shared_v3_control_current(&context->request_v3))
+			return false;
+		/* v3 has its own negotiated capability and AX suffix. Do not fall
+		 * through to the legacy v2 cut predicate, which would re-admit the
+		 * old capability family on the peer import path. */
+		cut_current = true;
+	} else
+		cut_current = cluster_ko_shared_cut_current_v2(&current);
 
 	return cluster_node_id == current.peer_node && cluster_node_id != current.origin_node
 		   && source->claim.identity.origin_node_id == current.origin_node
 		   && source->claim.identity.origin_owner_incarnation == current.origin_boot
-		   && cluster_ko_shared_cut_current_v2(&current)
+		   && cut_current
 		   && ko_shared_members(&current, boots, &generation)
 		   && memcmp(boots, context->peer_boots, sizeof(boots)) == 0
 		   && cluster_membership_cut_generation_current(generation);
