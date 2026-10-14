@@ -368,6 +368,12 @@ side_xact_pi_effects_valid(const xl_xact_parsed_commit *parsed, uint64 system_id
 		} else if (message.id == SHAREDINVALSNAPSHOT_ID) {
 			kinds |= UINT32_C(1) << 3;
 			database = message.sn.dbId;
+		} else if (message.id == SHAREDINVALKO_COMMIT_ID
+				   && SharedInvalKoCommitIsValid(&message.ko)) {
+			/* Retain the complete payload for its original live owner.
+			 * Inspection cannot retire a fence or synthesize a delivery. */
+			kinds |= UINT32_C(1) << 4;
+			database = InvalidOid;
 		} else
 			return false;
 		if (database != InvalidOid && database != parsed->dbId)

@@ -433,10 +433,58 @@ UT_TEST(test_pi_commit_keeps_all_drop_locators_and_exact_namespace)
 	}
 }
 
+UT_TEST(test_pi_ko_commit_marker_preserves_owner_without_execution)
+{
+	for (int variant = 0; variant < 5; variant++) {
+		SharedInvalidationMessage msg = { 0 };
+		FakeXactRecord fake;
+		RfPageOnlineRecordIdentityV1 identity;
+		RfDetachedRecordPlanV1 record;
+		RfSideOnlinePlanV1 *plan, *recovery;
+		RfSideOnlineOperationV1 op;
+		RfSideContributionOwnersV1 owners;
+		RfPageProofDetailV1 detail;
+
+		msg.ko.id = SHAREDINVALKO_COMMIT_ID;
+		msg.ko.version = SHAREDINVALKO_COMMIT_VERSION;
+		msg.ko.batch_lo = 17;
+		if (variant == 1) msg.ko.version++;
+		if (variant == 2) msg.ko.flags = 1;
+		if (variant == 3) msg.ko.reserved = 1;
+		if (variant == 4) msg.ko.batch_lo = 0;
+		pi_commit(&fake, XACT_COMPLETION_FORCE_SYNC_COMMIT, &msg, 1);
+		identity = pi_identity(&fake);
+		record = make_record_plan(&fake);
+		plan = pi_side_plan(&identity, true);
+		detail = rf_side_online_plan_feed_record_v1(plan, &record, &identity);
+		if (variant != 0)
+			UT_ASSERT_NE(detail, RF_PAGE_PROOF_DETAIL_OK);
+		else {
+			UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_OK);
+			if (detail == RF_PAGE_PROOF_DETAIL_OK) {
+				UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+				UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &op));
+				UT_ASSERT_EQ(op.xact.invalidation_count, 1);
+				UT_ASSERT_EQ(op.owned_payload_length, fake.u.decoded.main_data_len);
+				UT_ASSERT(memcmp(op.owned_payload, fake.data, op.owned_payload_length) == 0);
+				UT_ASSERT(rf_side_online_plan_contribution_owners_v1(plan, 0, &owners));
+				UT_ASSERT((owners.owners & RF_SIDE_CONTRIBUTION_INVALIDATION) != 0);
+				UT_ASSERT_EQ(rf_side_xact_apply_owned_v1(&op.xact, op.owned_payload,
+													   op.owned_payload_length), RF_SIDE_XACT_APPLY_BLOCKED);
+			}
+		}
+		recovery = pi_side_plan(&identity, false);
+		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(recovery, &record, &identity),
+					 RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+		rf_side_online_plan_destroy_v1(&recovery);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
 	UT_RUN(test_pi_commit_keeps_complete_flags_and_invalidation_payload);
 	UT_RUN(test_pi_side_plan_rejects_execution_before_callbacks);
 	UT_RUN(test_pi_commit_unknown_or_damaged_effects_still_refuse);
@@ -446,6 +494,7 @@ main(void)
 	UT_RUN(test_pi_ctrc_other_fields_still_refuse);
 	UT_RUN(test_pi_create_namespace_modifier_and_page_reuse_boundaries);
 	UT_RUN(test_pi_commit_keeps_all_drop_locators_and_exact_namespace);
+	UT_RUN(test_pi_ko_commit_marker_preserves_owner_without_execution);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

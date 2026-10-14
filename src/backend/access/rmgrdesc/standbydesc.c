@@ -136,6 +136,9 @@ standby_desc_invalidations(StringInfo buf,
 			appendStringInfo(buf, " relmap db %u", msg->rm.dbId);
 		else if (msg->id == SHAREDINVALSNAPSHOT_ID)
 			appendStringInfo(buf, " snapshot %u", msg->sn.relId);
+		else if (msg->id == SHAREDINVALKO_COMMIT_ID)
+			appendStringInfo(buf, " ko commit v%u batch " UINT64_FORMAT,
+							 msg->ko.version, SharedInvalKoCommitBatchId(&msg->ko));
 		else
 			appendStringInfo(buf, " unrecognized id %d", msg->id);
 	}

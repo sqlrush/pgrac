@@ -110,6 +110,40 @@ typedef struct
 	Oid			relId;			/* relation ID */
 } SharedInvalSnapshotMsg;
 
+/* A transaction outcome for a volatile object operation. Native cache and
+ * WAL replay consumers validate it but do not act on the operation. */
+#define SHAREDINVALKO_COMMIT_ID (-6)
+#define SHAREDINVALKO_COMMIT_VERSION 1
+
+typedef struct
+{
+	int8		id;
+	uint8		version;
+	uint16		flags;
+	uint32		reserved;
+	uint32		batch_lo;
+	uint32		batch_hi;
+} SharedInvalKoCommitMsg;
+
+StaticAssertDecl(sizeof(SharedInvalKoCommitMsg) == 16,
+				 "KO commit invalidation must fit the native SI message");
+
+static inline uint64
+SharedInvalKoCommitBatchId(const SharedInvalKoCommitMsg *msg)
+{
+	return ((uint64)msg->batch_hi << 32) | msg->batch_lo;
+}
+
+static inline bool
+SharedInvalKoCommitIsValid(const SharedInvalKoCommitMsg *msg)
+{
+	return msg->id == SHAREDINVALKO_COMMIT_ID
+		&& msg->version == SHAREDINVALKO_COMMIT_VERSION
+		&& msg->flags == 0 && msg->reserved == 0
+		&& SharedInvalKoCommitBatchId(msg) != 0
+		&& SharedInvalKoCommitBatchId(msg) != UINT64_MAX;
+}
+
 typedef union
 {
 	int8		id;				/* type field --- must be first */
@@ -119,8 +153,15 @@ typedef union
 	SharedInvalSmgrMsg sm;
 	SharedInvalRelmapMsg rm;
 	SharedInvalSnapshotMsg sn;
+	SharedInvalKoCommitMsg ko;
 } SharedInvalidationMessage;
 
+/* Invalidation arrays also appear inside WAL records. A uint64 member here
+ * would move their first element from a four-byte to an eight-byte boundary. */
+StaticAssertDecl(sizeof(SharedInvalidationMessage) == 16,
+				 "native SI messages must remain 16 bytes");
+StaticAssertDecl(offsetof(struct { char pad; SharedInvalidationMessage msg; }, msg) == 4,
+				 "native SI messages must retain four-byte alignment");
 
 /* Counter of messages processed; don't worry about overflow. */
 extern PGDLLIMPORT uint64 SharedInvalidMessageCounter;

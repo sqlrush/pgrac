@@ -31,6 +31,7 @@ extern void AtEOXact_Inval(bool isCommit);
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: freeze the invalidation cohort while commit can still abort. */
 extern void PreCommit_ClusterInval(void);
+extern void CacheInvalidateKoCommit(uint64 batch_id);
 #endif
 
 extern void PreInplace_Inval(void);
