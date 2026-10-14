@@ -22506,6 +22506,7 @@ UT_TEST(test_wal_inputs_cold_selection_and_pin_lifetime_are_exact)
 	cluster_node_id = saved_node;
 }
 
+#include "test_cluster_control_cold_census.inc"
 #include "test_cluster_control_catalog.inc"
 #include "test_cluster_control_root_serving.inc"
 
@@ -22686,8 +22687,23 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
+	if (getenv("PGRAC_PRE2_TEST_COLD_CENSUS") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_cold_census_visits_all_selected_sources_twice);
+		UT_RUN(test_cold_census_open_source_waits_without_partial_callbacks);
+		UT_RUN(test_cold_census_refusal_error_and_final_drift_never_complete);
+		UT_RUN(test_cold_census_keeps_original_scope_and_purpose);
+		UT_RUN(test_cold_census_preserves_empty_initializer_source);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_WAL_INPUTS") != NULL) {
-		UT_PLAN(36);
+		UT_PLAN(41);
+		UT_RUN(test_cold_census_visits_all_selected_sources_twice);
+		UT_RUN(test_cold_census_open_source_waits_without_partial_callbacks);
+		UT_RUN(test_cold_census_refusal_error_and_final_drift_never_complete);
+		UT_RUN(test_cold_census_keeps_original_scope_and_purpose);
+		UT_RUN(test_cold_census_preserves_empty_initializer_source);
 		UT_RUN(test_wal_inputs_cold_all_origins_exact_native_anchor);
 		UT_RUN(test_wal_inputs_cold_retained_generations_remain_distinct);
 		UT_RUN(test_wal_inputs_cold_terminal_and_pending_are_not_checkpoint_sources);
@@ -22740,7 +22756,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(448);
+	UT_PLAN(453);
 	UT_RUN(test_checkpoint_cf_refusal_cannot_hide_staging_discard_failure);
 	UT_RUN(test_clean_restart_without_provider_keeps_collective_exit_and_actual_install);
 	UT_RUN(test_clean_restart_without_provider_refuses_missing_exit_formation_and_fence);
@@ -22781,6 +22797,11 @@ main(int argc, char **argv)
 	UT_RUN(test_initialized_bound_source_cannot_be_a_served_generation);
 	UT_RUN(test_initialized_digest_binds_original_common_objects_and_cut);
 	UT_RUN(test_initialized_does_not_make_clean_or_import_legal);
+	UT_RUN(test_cold_census_visits_all_selected_sources_twice);
+	UT_RUN(test_cold_census_open_source_waits_without_partial_callbacks);
+	UT_RUN(test_cold_census_refusal_error_and_final_drift_never_complete);
+	UT_RUN(test_cold_census_keeps_original_scope_and_purpose);
+	UT_RUN(test_cold_census_preserves_empty_initializer_source);
 	UT_RUN(test_wal_inputs_cold_all_origins_exact_native_anchor);
 	UT_RUN(test_wal_inputs_cold_retained_generations_remain_distinct);
 	UT_RUN(test_wal_inputs_cold_terminal_and_pending_are_not_checkpoint_sources);

@@ -859,6 +859,7 @@ cluster_wal_inputs_visit_live_v1(ClusterWalInputsV1 *inputs, uint32 index,
 typedef struct WalContributionWork {
 	ClusterThreadRecoveryFabricPlanV1 *plan;
 	ClusterWalCensusVisitorV1 census;
+	ClusterWalCensusSourceVisitorV1 source_census;
 	void *census_arg;
 	RfContributorStreamCutV1 cuts[CLUSTER_WAL_INPUTS_MAX];
 	ClusterWalSourceRef sources[CLUSTER_WAL_INPUTS_MAX];
@@ -876,6 +877,25 @@ inputs_contribution_cuts(ClusterWalInputsV1 *inputs, WalContributionWork *work)
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	work->count = inputs->count;
+	/* A cold reader cannot request a live writer's cut. Check the entire
+	 * selected set first: no callback may observe a prefix while a later
+	 * source is still OPEN. This preserves the original retained-reader
+	 * WAIT polarity without borrowing its online sampling path. */
+	if (inputs->cold) {
+		for (uint32 i = 0; i < work->count; i++) {
+			const ClusterWalInputV1 *item = &inputs->items[i];
+			if (item->kind == CLUSTER_WAL_INPUT_CHECKPOINT) {
+				uint32 lifecycle = item->checkpoint.lifecycle;
+				if (lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN)
+					return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+				if (lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
+					&& lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+					&& lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE)
+					return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+			} else if (item->kind != CLUSTER_WAL_INPUT_INITIALIZER_TERMINAL)
+				return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		}
+	}
 	for (uint32 i = 0; i < work->count; i++) {
 		const ClusterWalInputV1 *item = &inputs->items[i];
 		RfContributorStreamCutV1 cut = { 0 };
@@ -990,6 +1010,12 @@ inputs_contribution_build(ClusterWalInputsV1 *inputs, bool space_active, WalCont
 		uint64 previous = work->records;
 		bool empty = (work->cuts[i].flags & RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY) != 0;
 		work->participant = i;
+		if (work->source_census != NULL) {
+			work->detail
+				= work->source_census(&work->sources[i], &work->cuts[i], NULL, work->census_arg);
+			if (work->detail != RF_PAGE_PROOF_DETAIL_OK)
+				return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+		}
 		if (item->kind == CLUSTER_WAL_INPUT_CHECKPOINT
 			&& item->checkpoint.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN)
 			result = cluster_wal_inputs_visit_live_v1(inputs, index, inputs_contribution_record,
@@ -1007,6 +1033,12 @@ inputs_contribution_build(ClusterWalInputsV1 *inputs, bool space_active, WalCont
 				&& observed.database_incarnation != work->sources[i].claim.database_incarnation)) {
 			work->detail = RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
 			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+		}
+		if (work->source_census != NULL) {
+			work->detail = work->source_census(&work->sources[i], &work->cuts[i], &observed,
+											   work->census_arg);
+			if (work->detail != RF_PAGE_PROOF_DETAIL_OK)
+				return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 		}
 	}
 	result = cluster_wal_inputs_revalidate_v1(inputs);
@@ -1032,9 +1064,10 @@ inputs_contribution_build(ClusterWalInputsV1 *inputs, bool space_active, WalCont
 
 static ClusterControlRootResult
 inputs_scan_contributions(ClusterWalInputsV1 *inputs, bool space_active,
-						  ClusterWalCensusVisitorV1 census, void *census_arg,
-						  ClusterThreadRecoveryFabricPlanV1 **out_plan, uint64 *out_record_count,
-						  RfPageProofDetailV1 *out_detail)
+						  ClusterWalCensusVisitorV1 census,
+						  ClusterWalCensusSourceVisitorV1 source_census, bool cold,
+						  void *census_arg, ClusterThreadRecoveryFabricPlanV1 **out_plan,
+						  uint64 *out_record_count, RfPageProofDetailV1 *out_detail)
 {
 	WalContributionWork *work;
 	ClusterControlRootResult result;
@@ -1043,10 +1076,12 @@ inputs_scan_contributions(ClusterWalInputsV1 *inputs, bool space_active,
 	*out_plan = NULL;
 	*out_record_count = 0;
 	*out_detail = RF_PAGE_PROOF_DETAIL_OK;
-	if (!inputs_current(inputs) || inputs->cold || CritSectionCount != 0 || ShutdownRequestPending)
+	if (!inputs_current(inputs) || inputs->cold != cold || CritSectionCount != 0
+		|| ShutdownRequestPending || (cold && (census == NULL || source_census == NULL)))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	work = palloc0(sizeof(*work));
 	work->census = census;
+	work->source_census = source_census;
 	work->census_arg = census_arg;
 	PG_TRY();
 	{
@@ -1078,8 +1113,8 @@ cluster_wal_inputs_contributions_v1(ClusterWalInputsV1 *inputs, bool space_activ
 									ClusterThreadRecoveryFabricPlanV1 **out_plan,
 									uint64 *out_record_count, RfPageProofDetailV1 *out_detail)
 {
-	return inputs_scan_contributions(inputs, space_active, NULL, NULL, out_plan, out_record_count,
-									 out_detail);
+	return inputs_scan_contributions(inputs, space_active, NULL, NULL, false, NULL, out_plan,
+									 out_record_count, out_detail);
 }
 
 ClusterControlRootResult
@@ -1089,8 +1124,18 @@ cluster_wal_inputs_census_v1(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitor
 	ClusterThreadRecoveryFabricPlanV1 *unused = NULL;
 	if (visitor == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	return inputs_scan_contributions(inputs, true, visitor, arg, &unused, out_record_count,
-									 out_detail);
+	return inputs_scan_contributions(inputs, true, visitor, NULL, false, arg, &unused,
+									 out_record_count, out_detail);
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_cold_census_v1(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitorV1 visitor,
+								  ClusterWalCensusSourceVisitorV1 source_visitor, void *arg,
+								  uint64 *out_record_count, RfPageProofDetailV1 *out_detail)
+{
+	ClusterThreadRecoveryFabricPlanV1 *unused = NULL;
+	return inputs_scan_contributions(inputs, true, visitor, source_visitor, true, arg, &unused,
+									 out_record_count, out_detail);
 }
 
 static ClusterControlRootResult

@@ -165,6 +165,26 @@ extern ClusterControlRootResult cluster_wal_inputs_census_v1(ClusterWalInputsV1 
 															 ClusterWalCensusVisitorV1 visitor,
 															 void *arg, uint64 *out_record_count,
 															 RfPageProofDetailV1 *out_detail);
+
+/* Cold-only, read-only enumeration of every selected source. completed is
+ * NULL before its physical visit and non-NULL after the original reader has
+ * verified its entire cut. Explicit empty initializer terminals also receive
+ * both callbacks; they are not missing participants. Each event is provisional
+ * until the complete census returns OK and the caller revalidates its scope.
+ * No callback may release or mutate the scope, apply effects or publish a
+ * completion. The caller must discard all additions on failure/ERROR. */
+typedef RfPageProofDetailV1 (*ClusterWalCensusSourceVisitorV1)(
+	const ClusterWalSourceRef *source, const RfContributorStreamCutV1 *cut,
+	const ClusterWalTailObservation *completed, void *arg);
+/* Requires the original startup cold scope. OPEN sources return WAIT before
+ * any callbacks; this does not request live writer sampling or borrow online
+ * PI/replay authority. The original physical, claim, ROOT, pin and final
+ * all-source checks remain mandatory. An empty callback list alone proves
+ * nothing about namespace coverage or recovery completion. */
+extern ClusterControlRootResult
+cluster_wal_inputs_cold_census_v1(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitorV1 visitor,
+								  ClusterWalCensusSourceVisitorV1 source_visitor, void *arg,
+								  uint64 *out_record_count, RfPageProofDetailV1 *out_detail);
 /* Local prior-executor retirement only. Consume original prior-exit evidence
  * and the ROOT-selected native INSTALL predecessor chain under this scope.
  * This does not prove DATA coverage, remove PI, or permit WAL reclamation. */

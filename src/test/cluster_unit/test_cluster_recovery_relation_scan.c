@@ -151,6 +151,37 @@ UT_TEST(test_missing_space_or_wal_target_requires_structural_recovery)
 	}
 }
 
+UT_TEST(test_main_scan_checks_companion_space_wal_extent)
+{
+	const BlockNumber blocks[] = { 1, 2, 99 };
+
+	for (unsigned i = 0; i < lengthof(blocks); i++) {
+		int fd = relation_files(0, false);
+		ClusterRecoveryRootSet *roots = begin_roots(fd, 1024 * 1024);
+		ClusterRecoveryRelationScan *scan = NULL;
+		RfPageIdentityV1 page = target(16385, SPACE_FORKNUM, blocks[i]);
+		unsigned pages = 0;
+
+		UT_ASSERT_EQ(cluster_recovery_root_set_add_target(roots, &page),
+					 CLUSTER_RECOVERY_ROOTS_MORE);
+		UT_ASSERT_EQ(finish_roots(roots, NULL), CLUSTER_RECOVERY_ROOTS_OBSERVED);
+		/* MAIN is deliberately the only fork scanned. Its own extent is
+		 * valid; the associated SPACE obligation must not depend on order. */
+		UT_ASSERT_EQ(cluster_recovery_relation_begin(roots, relation_index(roots, MAIN_FORKNUM),
+													 64 * 1024, &scan),
+					 i == 0 ? CLUSTER_RECOVERY_RELATION_MORE
+							: CLUSTER_RECOVERY_RELATION_STRUCTURE_REQUIRED);
+		if (i == 0 && scan != NULL) {
+			UT_ASSERT_EQ(relation_finish(scan, &pages), CLUSTER_RECOVERY_RELATION_DRAINED);
+			UT_ASSERT_EQ(pages, 3);
+		} else
+			UT_ASSERT(scan == NULL);
+		cluster_recovery_relation_destroy(scan);
+		cluster_recovery_root_set_destroy(roots);
+		remove_root(fd);
+	}
+}
+
 UT_TEST(test_foreign_corrupt_and_partial_space_never_exports_relation_pages)
 {
 	for (unsigned fault = 1; fault <= 3; fault++) {
@@ -322,9 +353,10 @@ UT_TEST(test_partial_fork_and_late_invalid_root_cannot_finish)
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
 	UT_RUN(test_untouched_main_and_all_auxiliary_forks_are_enumerated);
 	UT_RUN(test_missing_space_or_wal_target_requires_structural_recovery);
+	UT_RUN(test_main_scan_checks_companion_space_wal_extent);
 	UT_RUN(test_foreign_corrupt_and_partial_space_never_exports_relation_pages);
 	UT_RUN(test_zero_length_main_keeps_tombstone_and_unfinished_drop_obligation);
 	UT_RUN(test_io_and_final_space_change_invalidate_the_fork_inventory);

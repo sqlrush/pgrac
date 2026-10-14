@@ -66,6 +66,7 @@ cluster_recovery_relation_begin(ClusterRecoveryRootSet *roots, uint32 root_index
 	space = cluster_recovery_root_set_entry(roots, space_index);
 	if ((entry->origins & CLUSTER_RECOVERY_ROOT_PHYSICAL) == 0 || space == NULL
 		|| (space->origins & CLUSTER_RECOVERY_ROOT_PHYSICAL) == 0 || space->file.size != 2 * BLCKSZ
+		|| space->required_blocks > space->file.size / BLCKSZ
 		|| entry->required_blocks > entry->file.size / BLCKSZ)
 		return CLUSTER_RECOVERY_RELATION_STRUCTURE_REQUIRED;
 	if (entry->file.size % BLCKSZ != 0 || entry->file.size / BLCKSZ > InvalidBlockNumber)
