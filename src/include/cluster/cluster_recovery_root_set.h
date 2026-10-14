@@ -47,6 +47,13 @@ typedef struct ClusterRecoveryRootsEvent {
 
 typedef struct ClusterRecoveryRootSet ClusterRecoveryRootSet;
 
+/* Counts of canonical native SLRU segment files present in the stable
+ * physical root union.  This is an observation only: page-level native
+ * census, horizon checks, and the recovery owner must still prove every
+ * family before any consumer may use it. */
+extern bool cluster_recovery_root_set_native_counts(const ClusterRecoveryRootSet *roots,
+													uint32 counts[6], uint32 *total);
+
 /* The original cold owner supplies its retained, isolated ROOT-selected fd
  * and namespace. This component borrows the fd and establishes no authority.
  * Destroy on every exit, including PG_FINALLY. No target I/O or sync occurs. */

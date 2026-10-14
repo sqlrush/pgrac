@@ -4,9 +4,43 @@
 #define main namespace_fixture_main
 #include "test_cluster_recovery_namespace.c"
 #undef main
+#include "utils/resowner.h"
 #define pread namespace_test_pread
 #include "../../backend/cluster/cluster_recovery_root_set.c"
 #undef pread
+
+/* The standalone root-set fixture links the production OpenSSL cryptohash
+ * object, which normally receives these ResourceOwner/MemoryContext hooks
+ * from the backend.  Keep this fixture self-contained so its physical-root
+ * assertions execute instead of stopping at link time. */
+ResourceOwner CurrentResourceOwner = NULL;
+MemoryContext TopMemoryContext = NULL;
+
+void *
+MemoryContextAlloc(MemoryContext context pg_attribute_unused(), Size size)
+{
+	return malloc(size);
+}
+
+void
+pfree(void *pointer)
+{
+	free(pointer);
+}
+
+void
+ResourceOwnerEnlargeCryptoHash(ResourceOwner owner pg_attribute_unused())
+{}
+
+void
+ResourceOwnerRememberCryptoHash(ResourceOwner owner pg_attribute_unused(),
+								Datum handle pg_attribute_unused())
+{}
+
+void
+ResourceOwnerForgetCryptoHash(ResourceOwner owner pg_attribute_unused(),
+							  Datum handle pg_attribute_unused())
+{}
 
 static const uint8 root_uuid[16] = { 9, 3, 7 };
 
@@ -116,6 +150,61 @@ UT_TEST(test_unreferenced_physical_files_and_missing_wal_targets_are_preserved)
 	UT_ASSERT_EQ(unknown, 1);
 	UT_ASSERT_EQ(untouched, 1);
 	UT_ASSERT(cluster_recovery_root_set_digest(roots, digest));
+	cluster_recovery_root_set_destroy(roots);
+	remove_root(fd);
+}
+
+UT_TEST(test_native_slru_root_counts_are_exposed_only_after_observation)
+{
+	int fd = new_root();
+	int xact, subtrans, offsets;
+	uint32 counts[6] = { 0 };
+	uint32 total = 0;
+	ClusterRecoveryRootSet *roots;
+
+	UT_ASSERT(fd >= 0);
+	if (fd < 0)
+		return;
+	UT_ASSERT(!cluster_recovery_root_set_native_counts(NULL, counts, &total));
+	UT_ASSERT_EQ(mkdirat(fd, "pg_xact", 0700), 0);
+	UT_ASSERT_EQ(mkdirat(fd, "pg_subtrans", 0700), 0);
+	UT_ASSERT_EQ(mkdirat(fd, "pg_multixact", 0700), 0);
+	UT_ASSERT_EQ(mkdirat(fd, "pg_multixact/offsets", 0700), 0);
+	xact = openat(fd, "pg_xact", O_RDONLY | O_DIRECTORY);
+	subtrans = openat(fd, "pg_subtrans", O_RDONLY | O_DIRECTORY);
+	offsets = openat(fd, "pg_multixact/offsets", O_RDONLY | O_DIRECTORY);
+	UT_ASSERT(xact >= 0 && subtrans >= 0 && offsets >= 0);
+	if (xact < 0 || subtrans < 0 || offsets < 0) {
+		if (xact >= 0)
+			close(xact);
+		if (subtrans >= 0)
+			close(subtrans);
+		if (offsets >= 0)
+			close(offsets);
+		remove_root(fd);
+		return;
+	}
+	root_file(xact, "0000", "xact", 4);
+	root_file(xact, "0001", "xact", 4);
+	root_file(subtrans, "000A", "subtrans", 8);
+	root_file(offsets, "00FF", "offsets", 7);
+	close(xact);
+	close(subtrans);
+	close(offsets);
+	roots = begin_roots(fd, 1024 * 1024);
+	if (roots == NULL) {
+		remove_root(fd);
+		return;
+	}
+	UT_ASSERT(!cluster_recovery_root_set_native_counts(roots, counts, &total));
+	UT_ASSERT_EQ(finish_roots(roots, NULL), CLUSTER_RECOVERY_ROOTS_OBSERVED);
+	UT_ASSERT(cluster_recovery_root_set_native_counts(roots, counts, &total));
+	UT_ASSERT_EQ(total, 4);
+	UT_ASSERT_EQ(counts[CLUSTER_RECOVERY_NATIVE_FAMILY_XACT - 1], 2);
+	UT_ASSERT_EQ(counts[CLUSTER_RECOVERY_NATIVE_FAMILY_SUBTRANS - 1], 1);
+	UT_ASSERT_EQ(counts[CLUSTER_RECOVERY_NATIVE_FAMILY_MX_OFFSETS - 1], 1);
+	UT_ASSERT_EQ(counts[CLUSTER_RECOVERY_NATIVE_FAMILY_COMMIT_TS - 1], 0);
+	UT_ASSERT_EQ(counts[CLUSTER_RECOVERY_NATIVE_FAMILY_MX_MEMBERS - 1], 0);
 	cluster_recovery_root_set_destroy(roots);
 	remove_root(fd);
 }
@@ -581,8 +670,9 @@ UT_TEST(test_long_collision_chain_exhausts_budget_without_omitting_a_root)
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(18);
 	UT_RUN(test_unreferenced_physical_files_and_missing_wal_targets_are_preserved);
+	UT_RUN(test_native_slru_root_counts_are_exposed_only_after_observation);
 	UT_RUN(test_all_file_bytes_are_read_twice_in_bounded_chunks);
 	UT_RUN(test_digest_is_path_ordered_and_bound_to_the_namespace);
 	UT_RUN(test_file_digest_uses_all_sha256_bits);

@@ -476,6 +476,36 @@ cluster_recovery_root_set_entry(const ClusterRecoveryRootSet *roots, uint32 inde
 }
 
 bool
+cluster_recovery_root_set_native_counts(const ClusterRecoveryRootSet *roots, uint32 counts[6],
+										uint32 *total)
+{
+	uint32 sum = 0;
+
+	if (counts != NULL)
+		memset(counts, 0, sizeof(uint32) * 6);
+	if (total != NULL)
+		*total = 0;
+	if (roots == NULL || counts == NULL || total == NULL
+		|| roots->status != CLUSTER_RECOVERY_ROOTS_OBSERVED)
+		return false;
+	for (uint32 i = 0; i < roots->count; i++) {
+		const ClusterRecoveryNamespaceEntry *file = &roots->entries[i].file;
+
+		if (file->kind != CLUSTER_RECOVERY_FILE_NATIVE_SLRU)
+			continue;
+		if (file->native_family < CLUSTER_RECOVERY_NATIVE_FAMILY_XACT
+			|| file->native_family > CLUSTER_RECOVERY_NATIVE_FAMILY_MX_MEMBERS)
+			return false;
+		counts[file->native_family - 1]++;
+		if (sum == UINT32_MAX)
+			return false;
+		sum++;
+	}
+	*total = sum;
+	return true;
+}
+
+bool
 cluster_recovery_root_set_namespace_matches(const ClusterRecoveryRootSet *roots,
 											uint64 system_identifier, uint64 database_incarnation)
 {
