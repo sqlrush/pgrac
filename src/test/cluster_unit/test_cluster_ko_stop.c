@@ -10,6 +10,7 @@
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_ges_holder.h"
 #include "cluster/cluster_ko.h"
+#include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_pi_writeback.h"
@@ -39,6 +40,21 @@ cluster_ges_holder_probe_send(int32 master, const ClusterGesHolderProbe *probe)
 
 static int32 v3_route_master_node;
 static uint64 v3_route_generation;
+static const ClusterICEnvelope *v3_ingress_env;
+static ClusterICControlIngress v3_ingress;
+static int v3_ingress_fault;
+static bool v3_route_drift_flush;
+
+bool
+cluster_ic_dispatch_control_ingress(const ClusterICEnvelope *env, ClusterICControlIngress *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (env != v3_ingress_env || v3_ingress_fault == 1)
+		return false;
+	*out = v3_ingress;
+	return true;
+}
+
 static bool marker_capable = true, v3_local_ax, drive_v3_ack, marker_error;
 static ClusterGrdHolderId v3_local_holder;
 static int marker_registrations;
@@ -896,6 +912,8 @@ FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 		UT_ASSERT_EQ(cluster_ko_normal_stop_poll(&slot, &reason), CLUSTER_NORMAL_STOP_READY);
 	flush_count++;
 	flushing = false;
+	if (v3_route_drift_flush)
+		v3_route_generation++;
 	if (epoch_change_flush)
 		current_epoch++;
 	if (boot_change_phase == 1)
@@ -1028,6 +1046,9 @@ reset_test(void)
 	v3_send_throw = false;
 	v3_route_master_node = -1;
 	v3_route_generation = 0;
+	v3_ingress_fault = 0;
+	v3_route_drift_flush = false;
+	v3_ingress_env = NULL;
 	generation_race = cancel_wait = drive_shared_ack = false;
 	expecting_error = false;
 	reported_sqlstate = 0;
@@ -1158,12 +1179,46 @@ enqueue_shared_v3(const ClusterKoSharedMessageV3 *m)
 {
 	ClusterICEnvelope env = { 0 };
 	uint8 bytes[CLUSTER_KO_SHARED_V3_BYTES];
+	BackendType saved_type = MyBackendType;
+	AuxProcType saved_aux = MyAuxProcType;
 
 	if (!cluster_ko_shared_encode_v3(m, bytes, sizeof(bytes)))
 		abort();
 	env.source_node_id = m->base.origin_node;
 	env.payload_length = sizeof(bytes);
+	env.epoch = m->base.epoch;
+	v3_ingress = (ClusterICControlIngress){ .serial = 77,
+											.epoch = m->base.epoch,
+											.owner_pid = MyProcPid,
+											.source_node = m->base.origin_node,
+											.carrier = CLUSTER_IC_CONTROL_TCP };
+	switch (v3_ingress_fault) {
+	case 2:
+		v3_ingress.serial = 0;
+		break;
+	case 3:
+		v3_ingress.serial = UINT64_MAX;
+		break;
+	case 4:
+		v3_ingress.epoch++;
+		break;
+	case 5:
+		v3_ingress.owner_pid++;
+		break;
+	case 6:
+		v3_ingress.source_node++;
+		break;
+	case 7:
+		v3_ingress.carrier = CLUSTER_IC_CONTROL_UNKNOWN;
+		break;
+	}
+	MyBackendType = v3_ingress_fault == 8 ? B_SINVAL_BCAST : B_LMON;
+	MyAuxProcType = v3_ingress_fault == 8 ? SinvalBcastProcess : LmonProcess;
+	v3_ingress_env = &env;
 	cluster_ko_flush_request_handler(&env, bytes);
+	v3_ingress_env = NULL;
+	MyBackendType = saved_type;
+	MyAuxProcType = saved_aux;
 }
 static void
 enqueue_epoch(uint64 id, uint64 epoch)
@@ -5563,6 +5618,49 @@ UT_TEST(test_v3_control_refuses_non_tier1_even_with_peer_caps)
 	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
 }
 
+UT_TEST(test_v3_receive_requires_exact_tcp_owner_before_queue)
+{
+	for (int fault = 0; fault <= 8; fault++) {
+		ClusterKoSharedMessageV3 request = peer_fence_fixture(901);
+		v3_ingress_fault = fault;
+		enqueue_shared_v3(&request);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&storage.inbound_tail), fault == 0 ? 1 : 0);
+		UT_ASSERT_EQ(flush_count + drop_count + ack_count + maintenance_space_locks, 0);
+		UT_ASSERT_EQ(storage.peer_fence_serial, 0);
+		if (fault == 0) {
+			UT_ASSERT_EQ(storage.inbound[0].ingress.serial, 77);
+			UT_ASSERT_EQ(storage.inbound[0].ingress.owner_pid, MyProcPid);
+			UT_ASSERT_EQ(storage.inbound[0].ingress.source_node, request.base.origin_node);
+			UT_ASSERT_EQ(storage.inbound[0].ingress.epoch, request.base.epoch);
+			UT_ASSERT_EQ(storage.inbound[0].peer_route_generation, v3_route_generation);
+		}
+	}
+}
+
+UT_TEST(test_v3_inbound_retains_peer_route_without_rewriting_origin)
+{
+	for (int drift = 0; drift < 3; drift++) {
+		ClusterKoSharedMessageV3 request = peer_fence_fixture(902);
+		real_space_reader = true;
+		space_identity.key.locator.dbOid = 5;
+		space_identity.sequence = 1;
+		space_identity.operation = 88;
+		request.ax_master_generation = 31; /* Origin's local routing token. */
+		enqueue_shared_v3(&request);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&storage.inbound_tail), 1);
+		UT_ASSERT_EQ(storage.inbound[0].qualified_v3.ax_master_generation, 31);
+		UT_ASSERT_EQ(storage.inbound[0].peer_route_generation, 9);
+		if (drift == 1)
+			v3_route_generation++;
+		if (drift == 2)
+			v3_route_drift_flush = true;
+		fixture_peer_drain();
+		UT_ASSERT_EQ(flush_count, drift == 1 ? 0 : 1);
+		UT_ASSERT_EQ(drop_count, drift == 0 ? 1 : 0);
+		UT_ASSERT_EQ(storage.send_v3_count, drift == 0 ? 1 : 0);
+	}
+}
+
 UT_TEST(test_peer_fence_commit_needs_exact_ready_operation)
 {
 	ClusterKoSharedMessageV3 request = peer_fence_fixture(301);
@@ -6049,7 +6147,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(135);
+	UT_PLAN(137);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
 	UT_RUN(test_peer_space_entry_checks_precede_io);
@@ -6168,6 +6266,8 @@ main(void)
 	UT_RUN(test_drop_abandon_scan_requires_original_executor_of_replaced_context);
 	UT_RUN(test_drop_abandon_requires_recovery_at_normal_stop_even_with_pending_work);
 	UT_RUN(test_v3_control_refuses_non_tier1_even_with_peer_caps);
+	UT_RUN(test_v3_receive_requires_exact_tcp_owner_before_queue);
+	UT_RUN(test_v3_inbound_retains_peer_route_without_rewriting_origin);
 	UT_RUN(test_peer_fence_commit_needs_exact_ready_operation);
 	UT_RUN(test_peer_fence_replay_retains_full_identity_and_revision);
 	UT_RUN(test_peer_fence_terminal_is_not_a_maximum_batch_watermark);

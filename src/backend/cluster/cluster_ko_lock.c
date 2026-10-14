@@ -144,6 +144,8 @@ typedef struct ClusterKoInboundSlot {
 	bool v3;
 	ClusterKoSharedMessageV2 qualified;
 	ClusterKoSharedMessageV3 qualified_v3;
+	ClusterICControlIngress ingress;
+	uint64 peer_route_generation;
 	uint32 db_oid;
 	uint32 rel_number;
 	uint32 spc_oid;
@@ -3722,6 +3724,8 @@ cluster_ko_flush_request_handler(const ClusterICEnvelope *env, const void *paylo
 	KoFlushHeader legacy = { 0 };
 	ClusterKoSharedMessageV2 qualified = { 0 };
 	ClusterKoSharedMessageV3 qualified_v3 = { 0 };
+	ClusterICControlIngress ingress = { 0 };
+	uint64 peer_route_generation = 0;
 	uint32 head, tail, next;
 	bool shared = cluster_shared_config;
 	bool v3 = false;
@@ -3733,8 +3737,15 @@ cluster_ko_flush_request_handler(const ClusterICEnvelope *env, const void *paylo
 			if (!cluster_ko_shared_decode_v3(payload, env->payload_length, &qualified_v3)
 				|| qualified_v3.base.verb != CLUSTER_KO_SHARED_REQUEST
 				|| qualified_v3.base.peer_node != cluster_node_id
-				|| qualified_v3.base.origin_node != env->source_node_id
-				|| !ko_shared_v3_control_current(&qualified_v3))
+				|| qualified_v3.base.origin_node != env->source_node_id || !AmLmonProcess()
+				|| MyBackendType != B_LMON || !cluster_ic_dispatch_control_ingress(env, &ingress)
+				|| ingress.carrier != CLUSTER_IC_CONTROL_TCP || ingress.serial == 0
+				|| ingress.serial == UINT64_MAX || ingress.owner_pid != MyProcPid
+				|| ingress.owner_pid <= 0 || ingress.epoch != qualified_v3.base.epoch
+				|| ingress.source_node != qualified_v3.base.origin_node
+				|| cluster_grd_lookup_master_gen(&qualified_v3.ax_resid, &peer_route_generation)
+					   != qualified_v3.ax_master_node
+				|| !ko_shared_v3_control_at_generation(&qualified_v3, peer_route_generation))
 				return;
 			v3 = true;
 			legacy.batch_id = qualified_v3.base.batch_id;
@@ -3802,6 +3813,8 @@ cluster_ko_flush_request_handler(const ClusterICEnvelope *env, const void *paylo
 	ko_state->inbound[tail].v3 = v3;
 	ko_state->inbound[tail].qualified = qualified;
 	ko_state->inbound[tail].qualified_v3 = qualified_v3;
+	ko_state->inbound[tail].ingress = ingress;
+	ko_state->inbound[tail].peer_route_generation = peer_route_generation;
 	ko_state->inbound[tail].db_oid = hdr->db_oid;
 	ko_state->inbound[tail].rel_number = hdr->rel_number;
 	ko_state->inbound[tail].spc_oid = hdr->spc_oid;
@@ -3944,13 +3957,11 @@ cluster_ko_drain_inbound_and_apply(void)
 		 * terminal-reference proof is still pending. This is the existing ring's
 		 * REQUEST -> READY continuation: later requests are not acknowledged out
 		 * of order, and no identity read or synthetic ACK is introduced. */
-		if (slot.shared && slot.v3
-			&& slot.epoch == cluster_epoch_get_current()
+		if (slot.shared && slot.v3 && slot.epoch == cluster_epoch_get_current()
 			&& slot.shared == cluster_shared_config
-			&& ko_shared_v3_control_current(&slot.qualified_v3)
-			&& !cluster_ctrc_relation_removal_ready_shared((uint32)slot.spc_oid,
-																(uint32)slot.db_oid,
-																(uint32)slot.rel_number))
+			&& ko_shared_v3_control_at_generation(&slot.qualified_v3, slot.peer_route_generation)
+			&& !cluster_ctrc_relation_removal_ready_shared(
+				(uint32)slot.spc_oid, (uint32)slot.db_oid, (uint32)slot.rel_number))
 			return;
 		/*
 		 * Advance the head BEFORE applying: a failed flush (longjmp to the aux
@@ -3967,10 +3978,11 @@ cluster_ko_drain_inbound_and_apply(void)
 		if ((slot.shared && slot.epoch == 0) || slot.epoch != cluster_epoch_get_current()
 			|| slot.shared != cluster_shared_config
 			|| (slot.shared
-				&& (slot.v3 ? (!ko_shared_v3_control_current(&slot.qualified_v3)
-																		|| !ko_shared_v3_peer_space_current(&slot.qualified_v3))
-								 : (!ko_shared_control_current(&slot.qualified)
-									|| !ko_shared_peer_space_current(&slot.qualified)))))
+				&& (slot.v3 ? (!ko_shared_v3_control_at_generation(&slot.qualified_v3,
+																   slot.peer_route_generation)
+							   || !ko_shared_v3_peer_space_current(&slot.qualified_v3))
+							: (!ko_shared_control_current(&slot.qualified)
+							   || !ko_shared_peer_space_current(&slot.qualified)))))
 			goto next;
 		/* A peer may publish DONE only after its own bounded CTRC journal is
 		 * drained.  No ACK makes the enqueuer fail closed without extending
@@ -3981,9 +3993,11 @@ cluster_ko_drain_inbound_and_apply(void)
 		}
 		smgr = smgropen(rloc, InvalidBackendId);
 		if (slot.epoch != cluster_epoch_get_current()
-			|| (slot.shared && (slot.v3 ? (!ko_shared_v3_control_current(&slot.qualified_v3)
-																		 || !ko_shared_v3_peer_space_current(&slot.qualified_v3))
-													 : !ko_shared_control_current(&slot.qualified))))
+			|| (slot.shared
+				&& (slot.v3 ? (!ko_shared_v3_control_at_generation(&slot.qualified_v3,
+																   slot.peer_route_generation)
+							   || !ko_shared_v3_peer_space_current(&slot.qualified_v3))
+							: !ko_shared_control_current(&slot.qualified))))
 			goto next;
 
 		/*
@@ -3994,9 +4008,11 @@ cluster_ko_drain_inbound_and_apply(void)
 		 */
 		FlushRelationsAllBuffers(&smgr, 1);
 		if (slot.epoch != cluster_epoch_get_current()
-			|| (slot.shared && (slot.v3 ? (!ko_shared_v3_control_current(&slot.qualified_v3)
-																		 || !ko_shared_v3_peer_space_current(&slot.qualified_v3))
-																		: !ko_shared_control_current(&slot.qualified))))
+			|| (slot.shared
+				&& (slot.v3 ? (!ko_shared_v3_control_at_generation(&slot.qualified_v3,
+																   slot.peer_route_generation)
+							   || !ko_shared_v3_peer_space_current(&slot.qualified_v3))
+							: !ko_shared_control_current(&slot.qualified))))
 			goto next;
 		if (cluster_shared_config && cluster_smgr_which_for(rloc, InvalidBackendId) == 1) {
 			/* Buffer writeout alone does not make shared DATA durable.  An
@@ -4006,9 +4022,10 @@ cluster_ko_drain_inbound_and_apply(void)
 					smgrimmedsync(smgr, fork);
 				if (slot.epoch != cluster_epoch_get_current()
 					|| (slot.shared
-						&& (slot.v3 ? (!ko_shared_v3_control_current(&slot.qualified_v3)
-																																						 || !ko_shared_v3_peer_space_current(&slot.qualified_v3))
-												 : !ko_shared_control_current(&slot.qualified))))
+						&& (slot.v3 ? (!ko_shared_v3_control_at_generation(
+										   &slot.qualified_v3, slot.peer_route_generation)
+									   || !ko_shared_v3_peer_space_current(&slot.qualified_v3))
+									: !ko_shared_control_current(&slot.qualified))))
 					goto next;
 			}
 		}
@@ -4031,8 +4048,10 @@ cluster_ko_drain_inbound_and_apply(void)
 		CLUSTER_INJECTION_POINT("cluster-ko-peer-skip-ack");
 		if (cluster_injection_should_skip("cluster-ko-peer-skip-ack")
 			|| slot.epoch != cluster_epoch_get_current()
-			|| (slot.shared && (slot.v3 ? !ko_shared_v3_control_current(&slot.qualified_v3)
-													 : !ko_shared_control_current(&slot.qualified))))
+			|| (slot.shared
+				&& (slot.v3 ? !ko_shared_v3_control_at_generation(&slot.qualified_v3,
+																  slot.peer_route_generation)
+							: !ko_shared_control_current(&slot.qualified))))
 			goto next;
 
 		if (slot.shared) {
