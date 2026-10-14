@@ -187,6 +187,7 @@ typedef struct ClusterKoShared {
 	/* Peer operations are not owned by an origin backend ResourceOwner.
 	 * Passive READY/terminal identities survive its context cleanup. */
 	uint64 peer_fence_serial;
+	pg_atomic_uint64 peer_admission_revision;
 	uint64 holder_probe_nonce;
 	uint32 holder_probe_cursor;
 	ClusterKoPeerFenceV3 peer_fences[CLUSTER_KO_SHARED_CAPACITY];
@@ -363,6 +364,7 @@ cluster_ko_shmem_init(void)
 		ko_state->context_serial = 0;
 		memset(ko_state->contexts, 0, sizeof(ko_state->contexts));
 		ko_state->peer_fence_serial = 0;
+		pg_atomic_init_u64(&ko_state->peer_admission_revision, 1);
 		ko_state->holder_probe_nonce = 0;
 		ko_state->holder_probe_cursor = 0;
 		memset(ko_state->peer_fences, 0, sizeof(ko_state->peer_fences));
@@ -790,6 +792,50 @@ ko_peer_request_ended_or_conflicts_v3(const ClusterKoSharedMessageV3 *request)
 }
 
 bool
+cluster_ko_peer_admission_begin_v3(RelFileLocator locator, ClusterKoPeerAdmissionV3 *out)
+{
+	uint64 revision;
+	bool allowed = true;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (ko_state == NULL || out == NULL || !cluster_shared_config
+		|| cluster_interconnect_tier != CLUSTER_IC_TIER_1)
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+	if (revision == 0 || revision == UINT64_MAX)
+		allowed = false;
+	for (unsigned i = 0; allowed && i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		const ClusterKoPeerFenceV3 *entry = &ko_state->peer_fences[i];
+		/* READY/COMMITTED do not reopen admission. Only a separately proven
+		 * lifecycle retirement may remove this old-locator exclusion. */
+		if (entry->state != CLUSTER_KO_PEER_FENCE_EMPTY
+			&& RelFileLocatorEquals(entry->request.base.key.locator, locator))
+			allowed = false;
+	}
+	if (allowed) {
+		out->locator = locator;
+		out->revision = revision;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	return allowed;
+}
+
+bool
+cluster_ko_peer_admission_current_v3(const ClusterKoPeerAdmissionV3 *admission,
+									 RelFileLocator locator)
+{
+	/* Lock-free revalidation under a producer's header/entry lock avoids
+	 * reversing the object-lock order. The caller publishes its reference
+	 * before releasing that original lock; the later drain must observe it. */
+	return ko_state != NULL && admission != NULL && cluster_shared_config
+		   && cluster_interconnect_tier == CLUSTER_IC_TIER_1 && admission->revision != 0
+		   && admission->revision != UINT64_MAX && RelFileLocatorEquals(admission->locator, locator)
+		   && pg_atomic_read_u64(&ko_state->peer_admission_revision) == admission->revision;
+}
+
+bool
 cluster_ko_peer_fence_begin_v3(const ClusterKoSharedMessageV3 *request,
 							 ClusterKoPeerFenceHandleV3 *handle,
 							 ClusterKoPeerFenceStateV3 *state)
@@ -828,7 +874,9 @@ cluster_ko_peer_fence_begin_v3(const ClusterKoSharedMessageV3 *request,
 		}
 		goto done;
 	}
-	if (empty >= 0 && ko_state->peer_fence_serial != UINT64_MAX) {
+	if (empty >= 0 && ko_state->peer_fence_serial != UINT64_MAX
+		&& pg_atomic_read_u64(&ko_state->peer_admission_revision) != 0
+		&& pg_atomic_read_u64(&ko_state->peer_admission_revision) < UINT64_MAX - 1) {
 		ClusterKoPeerFenceV3 *entry = &ko_state->peer_fences[empty];
 
 		memset(entry, 0, sizeof(*entry));
@@ -837,6 +885,9 @@ cluster_ko_peer_fence_begin_v3(const ClusterKoSharedMessageV3 *request,
 		memcpy(entry->encoded, encoded, sizeof(encoded));
 		entry->serial = ++ko_state->peer_fence_serial;
 		entry->state = CLUSTER_KO_PEER_FENCE_ACTIVE;
+		/* Invalidate samples taken before this publication. No buffer or
+		 * PCM lock is acquired while holding the KO lock. */
+		(void)pg_atomic_fetch_add_u64(&ko_state->peer_admission_revision, 1);
 		handle->slot = empty;
 		handle->serial = entry->serial;
 		*state = entry->state;

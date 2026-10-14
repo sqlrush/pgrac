@@ -74,6 +74,7 @@
 #include "cluster/cluster_extend_gate.h" /* spec-5.7 §3.1d — liveness engage gate */
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ic.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_sf_dep.h"		/* spec-6.2 Smart Fusion DBWR brake */
 #include "cluster/cluster_xnode_profile.h"	/* spec-5.59 D3/D4 — read probe + relkind hint */
 #include "cluster/cluster_itl.h"	/* spec-6.12a — quiescent check for X->S downgrade */
@@ -149,6 +150,19 @@ static void FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject
 									volatile bool *write_attempted);
 
 #ifdef USE_PGRAC_CLUSTER
+/* Sample the object exclusion before taking a mapping/header/PCM lock.
+ * The returned bool selects the shared tier1 path, not successful admission.
+ * A refused sample remains zero and fails the later locked revalidation. */
+static bool
+cluster_bufmgr_ko_read_sample(RelFileLocator locator, ClusterKoPeerAdmissionV3 *sample)
+{
+	if (!cluster_enabled || !cluster_shared_config || cluster_interconnect_tier != CLUSTER_IC_TIER_1
+		|| cluster_smgr_which_for(locator, InvalidBackendId) != 1)
+		return false;
+	(void)cluster_ko_peer_admission_begin_v3(locator, sample);
+	return true;
+}
+
 static inline bool
 cluster_bufmgr_should_pcm_track(BufferDesc *buf)
 {
@@ -4839,6 +4853,10 @@ static PinBufferLookupResult PinBufferForLookup(
 static bool PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy);
 static void PinBuffer_Locked(BufferDesc *buf);
 static void UnpinBuffer(BufferDesc *buf);
+#ifdef USE_PGRAC_CLUSTER
+static PinBufferLookupResult PinBufferForObjectRead(BufferDesc *buf, BufferAccessStrategy strategy,
+													const ClusterKoPeerAdmissionV3 *sample);
+#endif
 static void BufferSync(int flags);
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: spec-6.12h D-h1 — Past Image conversion (definition below). */
@@ -6492,10 +6510,13 @@ cluster_bufmgr_cr_publish_v1(Buffer buffer, const BufferCrKey *key, const void *
 	int			head;
 	uint64		generation;
 	bool		reserved;
+	bool check_ko;
+	ClusterKoPeerAdmissionV3 ko_sample;
 
 	if (buffer <= 0 || buffer > NBuffers || page == NULL || !BufferCrKeyValid(key) ||
 		GetPrivateRefCount(buffer) != 1)
 		return false;
+	check_ko = cluster_bufmgr_ko_read_sample(BufTagGetRelFileLocator(&key->tag), &ko_sample);
 	buf = GetBufferDescriptor(buffer - 1);
 	state = LockBufHdr(buf);
 	cluster_pcm_own_eviction_capture_locked(buf, &own);
@@ -6530,6 +6551,15 @@ cluster_bufmgr_cr_publish_v1(Buffer buffer, const BufferCrKey *key, const void *
 	/* As with native BufferAlloc, initialize the descriptor after inserting
 	 * the mapping, before releasing mapping-X. No throwing work follows. */
 	state = LockBufHdr(buf);
+	if (check_ko
+		&& !cluster_ko_peer_admission_current_v3(&ko_sample, BufTagGetRelFileLocator(&tag))) {
+		bool restored = BufTableCRReplaceHead(&tag, hash, generation, buf->buf_id, head);
+		UnlockBufHdr(buf, state);
+		LWLockRelease(partition);
+		if (!restored)
+			elog(PANIC, "read-only buffer chain changed under mapping lock");
+		return false;
+	}
 	buf->tag = tag;
 	buf->buffer_type = BUF_TYPE_CR;
 	buf->pcm_state = PCM_STATE_N;
@@ -6564,12 +6594,15 @@ cluster_bufmgr_cr_copy_v1(const BufferCrKey *key, void *page)
 	BufferDesc *buf;
 	int			id;
 	bool		valid;
+	bool check_ko;
+	ClusterKoPeerAdmissionV3 ko_sample;
 
 	if (page == NULL || !BufferCrKeyValid(key))
 		return false;
 	ReservePrivateRefCountEntry();
 	ResourceOwnerEnlargeBuffers(CurrentResourceOwner);
 	tag = key->tag;
+	check_ko = cluster_bufmgr_ko_read_sample(BufTagGetRelFileLocator(&tag), &ko_sample);
 	hash = BufTableHashCode(&tag);
 	partition = BufMappingPartitionLock(hash);
 	LWLockAcquire(partition, LW_SHARED);
@@ -6585,7 +6618,15 @@ cluster_bufmgr_cr_copy_v1(const BufferCrKey *key, void *page)
 		return false;
 	}
 	buf = GetBufferDescriptor(id);
-	valid = PinBuffer(buf, NULL);
+	if (check_ko) {
+		PinBufferLookupResult pin = PinBufferForObjectRead(buf, NULL, &ko_sample);
+		if (pin == PIN_BUFFER_LOOKUP_RETRY) {
+			LWLockRelease(partition);
+			return false;
+		}
+		valid = pin == PIN_BUFFER_LOOKUP_VALID;
+	} else
+		valid = PinBuffer(buf, NULL);
 	LWLockRelease(partition);
 	PG_TRY();
 	{
@@ -8157,6 +8198,41 @@ PinBufferForLookup(BufferDesc *buf, BufferAccessStrategy strategy)
 	return PinBuffer(buf, strategy)
 		? PIN_BUFFER_LOOKUP_VALID : PIN_BUFFER_LOOKUP_INVALID;
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/* A new read reference is published under the same header lock used by the
+ * object drain. An existing private reference already pins this descriptor;
+ * its original owner must release it before the drain can finish. */
+static PinBufferLookupResult
+PinBufferForObjectRead(BufferDesc *buf, BufferAccessStrategy strategy,
+					   const ClusterKoPeerAdmissionV3 *sample)
+{
+	Buffer b = BufferDescriptorGetBuffer(buf);
+	uint32 state;
+	bool valid;
+
+	if (GetPrivateRefCountEntry(b, true) != NULL)
+		return PinBuffer(buf, strategy) ? PIN_BUFFER_LOOKUP_VALID : PIN_BUFFER_LOOKUP_INVALID;
+	ReservePrivateRefCountEntry();
+	state = LockBufHdr(buf);
+	if (!cluster_ko_peer_admission_current_v3(sample, BufTagGetRelFileLocator(&buf->tag))
+		|| !cluster_pcm_x_aux_pin_admission_allowed(
+			cluster_pcm_is_active(), cluster_bufmgr_should_pcm_track(buf), buf->tag.forkNum,
+			cluster_pcm_own_flags_get(buf->buf_id))) {
+		UnlockBufHdr(buf, state);
+		return PIN_BUFFER_LOOKUP_RETRY;
+	}
+	if (strategy == NULL) {
+		if (BUF_STATE_GET_USAGECOUNT(state) < BM_MAX_USAGE_COUNT)
+			state += BUF_USAGECOUNT_ONE;
+	} else if (BUF_STATE_GET_USAGECOUNT(state) == 0)
+		state += BUF_USAGECOUNT_ONE;
+	valid = (state & BM_VALID) != 0;
+	pg_atomic_write_u32(&buf->state, state);
+	PinBuffer_Locked(buf);
+	return valid ? PIN_BUFFER_LOOKUP_VALID : PIN_BUFFER_LOOKUP_INVALID;
+}
+#endif
 
 /*
  * PinBuffer -- make buffer unavailable for replacement.

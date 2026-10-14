@@ -147,6 +147,19 @@ typedef struct ClusterKoPeerFenceHandleV3 {
 	uint64 serial;
 } ClusterKoPeerFenceHandleV3;
 
+/* A local admission sample for one locator, not an AX or completion proof.
+ * Sample outside mapping/header/PCM locks. Revalidate under the original
+ * producer lock immediately before publishing its reference or image. */
+typedef struct ClusterKoPeerAdmissionV3 {
+	RelFileLocator locator;
+	uint64 revision;
+} ClusterKoPeerAdmissionV3;
+
+extern bool cluster_ko_peer_admission_begin_v3(RelFileLocator locator,
+											   ClusterKoPeerAdmissionV3 *out);
+extern bool cluster_ko_peer_admission_current_v3(const ClusterKoPeerAdmissionV3 *admission,
+												 RelFileLocator locator);
+
 extern bool cluster_ko_peer_holder_begin_v3(const ClusterKoPeerFenceHandleV3 *handle);
 extern bool cluster_ko_peer_holder_result_v3(const ClusterKoPeerFenceHandleV3 *handle,
 											 ClusterGrdHolderObservation *observation,

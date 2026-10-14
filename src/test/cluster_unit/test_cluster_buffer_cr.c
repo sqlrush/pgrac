@@ -24,6 +24,9 @@
 #include <stdlib.h>
 
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_ko.h"
+#include "cluster/cluster_ic.h"
+#include "cluster/storage/cluster_smgr.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "pgstat.h"
@@ -74,6 +77,46 @@ static void *copy_destination;
 static unsigned reserve_calls;
 static uint32 clock_hand;
 static unsigned physical_writes;
+int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+static bool ko_closed;
+static uint64 ko_revision = 1;
+static unsigned ko_close_at_header;
+static unsigned header_calls;
+static int storage_route = 1;
+static RelFileLocator ko_locator;
+
+int
+cluster_smgr_which_for(RelFileLocator locator pg_attribute_unused(),
+					   BackendId backend pg_attribute_unused())
+{
+	return storage_route;
+}
+
+bool
+cluster_ko_peer_admission_begin_v3(RelFileLocator locator, ClusterKoPeerAdmissionV3 *out)
+{
+	UT_ASSERT_EQ(lock_depth, 0);
+	for (int i = 0; i < NBuffers; i++)
+		UT_ASSERT((pg_atomic_read_u32(&GetBufferDescriptor(i)->state) & BM_LOCKED) == 0);
+	memset(out, 0, sizeof(*out));
+	if (ko_closed && RelFileLocatorEquals(locator, ko_locator))
+		return false;
+	out->locator = locator;
+	out->revision = ko_revision;
+	return true;
+}
+
+bool
+cluster_ko_peer_admission_current_v3(const ClusterKoPeerAdmissionV3 *sample, RelFileLocator locator)
+{
+	bool header_locked = false;
+	for (int i = 0; i < NBuffers; i++)
+		header_locked |= (pg_atomic_read_u32(&GetBufferDescriptor(i)->state) & BM_LOCKED) != 0;
+	UT_ASSERT(header_locked);
+	return sample != NULL && sample->revision != 0 && sample->revision == ko_revision
+		   && RelFileLocatorEquals(locator, sample->locator);
+}
+
 WritebackContext BackendWritebackContext;
 
 typedef struct PrivateRefCountEntry PrivateRefCountEntry;
@@ -81,6 +124,9 @@ static PrivateRefCountEntry *GetPrivateRefCountEntry(Buffer buffer, bool do_move
 static PrivateRefCountEntry *NewPrivateRefCountEntry(Buffer buffer);
 static void ForgetPrivateRefCountEntry(PrivateRefCountEntry *entry);
 static void ReservePrivateRefCountEntry(void);
+static bool PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy);
+static void PinBuffer_Locked(BufferDesc *buf);
+static inline bool cluster_bufmgr_should_pcm_track(BufferDesc *buf);
 static uint32 WaitBufHdrUnlocked(BufferDesc *buf);
 static Buffer GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context);
 #define BufHdrGetBlock(buf) ((Block)(BufferBlocks + (Size)(buf)->buf_id * BLCKSZ))
@@ -156,6 +202,10 @@ uint32
 LockBufHdr(BufferDesc *buf)
 {
 	uint32 state = pg_atomic_read_u32(&buf->state);
+	if (++header_calls == ko_close_at_header) {
+		ko_closed = true;
+		ko_revision++;
+	}
 	UT_ASSERT((state & BM_LOCKED) == 0);
 	pg_atomic_write_u32(&buf->state, state | BM_LOCKED);
 	return state | BM_LOCKED;
@@ -425,6 +475,13 @@ reset_buffers(void)
 	remembered_pins = pin_waiter_signals = reserve_calls = 0;
 	physical_writes = 0;
 	clock_hand = 6;
+	cluster_enabled = false;
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+	storage_route = 1;
+	ko_revision = 1;
+	ko_closed = false;
+	ko_close_at_header = header_calls = 0;
+	ko_locator = BufTagGetRelFileLocator(&tag);
 	copy_error = copy_observed_pin = false;
 	copy_destination = NULL;
 	PG_exception_stack = NULL;
@@ -990,10 +1047,88 @@ UT_TEST(test_publish_copy_error_leaves_only_the_original_reservation_pin)
 	UT_ASSERT_EQ(remembered_pins, 0);
 }
 
+/* KO registry and lock scheduling are fixture boundaries. These cases
+ * execute the actual CR publication/copy bodies and native pin accounting. */
+UT_TEST(test_object_fence_refuses_cr_publication_before_and_at_header)
+{
+	for (unsigned race = 0; race < 2; race++) {
+		BufferCrKey key = scoped_key(reset_buffers());
+		PGIOAlignedBlock page;
+		Buffer buffer = cluster_bufmgr_cr_reserve_v1();
+		BufferDesc *buf = GetBufferDescriptor(buffer - 1);
+		int head;
+		uint64 generation;
+		memset(page.data, 0x4d, BLCKSZ);
+		cluster_enabled = true;
+		ko_closed = race == 0;
+		header_calls = 0;
+		ko_close_at_header = race == 1 ? 2 : 0;
+		UT_ASSERT(!cluster_bufmgr_cr_publish_v1(buffer, &key, page.data));
+		UT_ASSERT(!BufTableCRLookup(&key.tag, BufTableHashCode(&key.tag), &head, &generation));
+		UT_ASSERT((pg_atomic_read_u32(&buf->state) & (BM_TAG_VALID | BM_VALID)) == 0);
+		UT_ASSERT_EQ(remembered_pins, 1);
+		UT_ASSERT_EQ(lock_depth, 0);
+		UnpinBuffer(buf);
+	}
+}
+
+UT_TEST(test_object_fence_refuses_new_cr_pin_without_touching_output)
+{
+	for (unsigned race = 0; race < 2; race++) {
+		BufferCrKey key = scoped_key(reset_buffers());
+		PGIOAlignedBlock page, output;
+		Buffer buffer = cluster_bufmgr_cr_reserve_v1();
+		BufferDesc *buf = GetBufferDescriptor(buffer - 1);
+		bool untouched = true;
+		memset(page.data, 0x4d, BLCKSZ);
+		memset(output.data, 0x71, BLCKSZ);
+		UT_ASSERT(cluster_bufmgr_cr_publish_v1(buffer, &key, page.data));
+		UnpinBuffer(buf);
+		cluster_enabled = true;
+		ko_closed = race == 0;
+		header_calls = 0;
+		ko_close_at_header = race == 1 ? 1 : 0;
+		UT_ASSERT(!cluster_bufmgr_cr_copy_v1(&key, output.data));
+		for (unsigned i = 0; i < BLCKSZ; i++)
+			untouched &= (unsigned char)output.data[i] == 0x71;
+		UT_ASSERT(untouched);
+		UT_ASSERT_EQ(remembered_pins, 0);
+		UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf->state)), 0);
+		UT_ASSERT_EQ(lock_depth, 0);
+	}
+}
+
+UT_TEST(test_object_fence_preserves_finite_cr_pin_and_unrelated_storage)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		BufferCrKey key = scoped_key(reset_buffers());
+		PGIOAlignedBlock page, output;
+		Buffer buffer = cluster_bufmgr_cr_reserve_v1();
+		BufferDesc *buf = GetBufferDescriptor(buffer - 1);
+		memset(page.data, 0x4d, BLCKSZ);
+		UT_ASSERT(cluster_bufmgr_cr_publish_v1(buffer, &key, page.data));
+		if (kind != 0)
+			UnpinBuffer(buf);
+		cluster_enabled = true;
+		ko_closed = true;
+		if (kind == 1)
+			ko_locator.relNumber++;
+		if (kind == 2)
+			storage_route = 0;
+		if (kind == 3)
+			cluster_enabled = false;
+		UT_ASSERT(cluster_bufmgr_cr_copy_v1(&key, output.data));
+		UT_ASSERT_EQ(memcmp(page.data, output.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(remembered_pins, kind == 0 ? 1 : 0);
+		if (kind == 0)
+			UnpinBuffer(buf);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(25);
 	UT_RUN(test_native_current_victim_keeps_original_behavior);
 	UT_RUN(test_cr_victim_preserves_current_and_removes_middle_head_tail);
 	UT_RUN(test_last_cr_only_victim_removes_anchor_without_current);
@@ -1016,6 +1151,9 @@ main(void)
 	UT_RUN(test_native_clock_refuses_dirty_cr_before_any_io_or_pin);
 	UT_RUN(test_checkpoint_skips_clean_cr_and_refuses_dirty_cr);
 	UT_RUN(test_publish_copy_error_leaves_only_the_original_reservation_pin);
+	UT_RUN(test_object_fence_refuses_cr_publication_before_and_at_header);
+	UT_RUN(test_object_fence_refuses_new_cr_pin_without_touching_output);
+	UT_RUN(test_object_fence_preserves_finite_cr_pin_and_unrelated_storage);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
