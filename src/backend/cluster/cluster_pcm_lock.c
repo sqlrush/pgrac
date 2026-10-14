@@ -10911,7 +10911,10 @@ pcm_resource_x_role_pending_locked(struct GrdEntry *entry,
 			if (request->phase != RESOURCE_X_MASTER_NONE
 				&& request->phase != RESOURCE_X_MASTER_RELEASED) {
 				directory = true;
-				if (node == cluster_node_id)
+				/* SETTLED is terminal directory history.  It remains visible to
+				 * the directory projection, but cannot reopen local physical work
+				 * after the local owner and PI have already drained. */
+				if (node == cluster_node_id && request->phase != RESOURCE_X_MASTER_SETTLED)
 					local = true;
 			}
 			if (receipt->state != RESOURCE_X_BOOTSTRAP_RECEIPT_EMPTY)

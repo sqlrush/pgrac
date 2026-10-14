@@ -188,6 +188,17 @@ UT_TEST(object_roles_settled_remote_holder_and_pi_remain_directory_debt)
 	cluster_shared_config = false;
 }
 
+UT_TEST(object_roles_local_settled_terminal_is_directory_only)
+{
+	BufferTag tag = make_tag(6917);
+
+	/* A valid local SETTLED record with physical N state is directory history;
+	 * it must not reopen local work after its local owner and PI are gone. */
+	setup_local_settled_terminal_without_physical(tag);
+	expect_roles(tag, CLUSTER_PCM_PI_RELATION_EMPTY, CLUSTER_PCM_PI_RELATION_PENDING);
+	cluster_shared_config = false;
+}
+
 UT_TEST(object_roles_local_master_request_is_not_remote_directory_only)
 {
 	BufferTag tag = make_tag(6912);
@@ -298,7 +309,7 @@ UT_TEST(object_roles_preserve_bounded_gate_and_reference_contract)
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(18);
 	UT_RUN(test_pi_relation_empty_requires_complete_bounded_scan);
 	UT_RUN(test_pi_relation_scan_checks_main_vm_and_original_references);
 	UT_RUN(test_pi_relation_scan_never_retires_master_or_local_pi);
@@ -311,6 +322,7 @@ main(void)
 	UT_RUN(object_scan_rejects_unknown_fork_on_either_side);
 	UT_RUN(object_roles_remote_head_does_not_reopen_local_physical_work);
 	UT_RUN(object_roles_settled_remote_holder_and_pi_remain_directory_debt);
+	UT_RUN(object_roles_local_settled_terminal_is_directory_only);
 	UT_RUN(object_roles_local_master_request_is_not_remote_directory_only);
 	UT_RUN(object_roles_local_pi_and_unknown_references_never_filter_out);
 	UT_RUN(object_roles_local_round_is_physical_even_on_nonmaster);
