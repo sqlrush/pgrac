@@ -10,6 +10,7 @@
 #define CLUSTER_RECOVERY_UNDO_SCAN_H
 
 #include "cluster/cluster_undo_segment.h"
+#include "cluster/cluster_undo_record.h"
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -54,6 +55,29 @@ cluster_recovery_undo_scan_header(const ClusterRecoveryUndoScan *scan);
 extern ClusterRecoveryUndoResult cluster_recovery_undo_scan_next(ClusterRecoveryUndoScan *scan,
 																 ClusterRecoveryUndoEntry *out);
 extern void cluster_recovery_undo_scan_destroy(ClusterRecoveryUndoScan *scan);
+
+typedef struct ClusterRecoveryUndoRecord {
+	UBA address;
+	UndoBlockHeader block_header;
+	UndoSlotDirEntry directory;
+	UndoRecordHeader header;
+	uint16 body_length;
+	UndoItlHistoryTrailer history;
+	uint8 payload[BLCKSZ - sizeof(UndoBlockHeader) - sizeof(UndoSlotDirEntry)
+				  - sizeof(UndoRecordHeader)];
+} ClusterRecoveryUndoRecord;
+
+/* Read one candidate from an immutable whole block. expected_* identify the
+ * independently read file/block, not fields inferred from the record. Output
+ * owns the original bytes, including the transaction-wide predecessor and
+ * separate page history. No terminal, checksum or generation authority is
+ * inferred here: the cold owner must bind the retained source and segment
+ * generation before graph traversal, and revalidate them before completion.
+ * page and out must not overlap. Any refusal clears out in full. */
+extern ClusterRecoveryUndoResult
+cluster_recovery_undo_record_read(const void *page, size_t length, uint32 expected_segment,
+								  uint32 expected_block, uint8 expected_owner, UBA address,
+								  ClusterRecoveryUndoRecord *out);
 
 #endif
 #endif

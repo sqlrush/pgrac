@@ -94,4 +94,100 @@ cluster_recovery_undo_scan_destroy(ClusterRecoveryUndoScan *scan)
 	free(scan);
 }
 
+ClusterRecoveryUndoResult
+cluster_recovery_undo_record_read(const void *page, size_t length, uint32 expected_segment,
+								  uint32 expected_block, uint8 expected_owner, UBA address,
+								  ClusterRecoveryUndoRecord *out)
+{
+	UndoBlockHeader block;
+	UndoSlotDirEntry selected = { 0 };
+	UndoRecordHeader selected_header = { 0 };
+	UndoItlHistoryTrailer selected_history = { 0 };
+	uint16 selected_body = 0;
+	uint32 segment, blockno;
+	uint16 tt_slot, row;
+	uint8 occupied[BLCKSZ / 8] = { 0 };
+	const char *bytes = page;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (page == NULL || length != BLCKSZ || out == NULL || expected_owner == 0
+		|| expected_owner > UNDO_OWNER_INSTANCE_MAX
+		|| !uba_decode_record(address, &segment, &blockno, &tt_slot, &row))
+		return CLUSTER_RECOVERY_UNDO_INVALID;
+	if (segment != expected_segment || blockno != expected_block
+		|| (segment - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE != expected_owner - 1)
+		return CLUSTER_RECOVERY_UNDO_IDENTITY;
+
+	memcpy(&block, page, sizeof(block));
+	if (block.magic != PGRAC_UNDO_BLOCK_MAGIC || block.block_version != UNDO_BLOCK_VERSION_1)
+		return CLUSTER_RECOVERY_UNDO_UNSUPPORTED;
+	if (!cluster_undo_record_slot_index_valid(block.slot_count, row)
+		|| block.free_offset < sizeof(block)
+		|| block.free_offset > BLCKSZ - (uint32)block.slot_count * sizeof(UndoSlotDirEntry))
+		return CLUSTER_RECOVERY_UNDO_CORRUPT;
+
+	/* Validate the complete block before exporting any record. Directory and
+	 * record structs may be unaligned; never dereference the caller's bytes.
+	 * Each occupied byte is visited at most once, or overlap refuses the block. */
+	for (uint16 i = 0; i < block.slot_count; i++) {
+		UndoSlotDirEntry slot;
+		UndoRecordHeader header;
+		UndoItlHistoryTrailer history;
+		uint16 body_length;
+		uint32 end;
+
+		memcpy(&slot, bytes + UNDO_SLOT_DIR_OFFSET(i), sizeof(slot));
+		if (!cluster_undo_record_slot_range_valid(block.slot_count, i, slot.record_offset,
+												  slot.record_length)
+			|| slot.record_length < sizeof(header))
+			return CLUSTER_RECOVERY_UNDO_CORRUPT;
+		end = slot.record_offset + slot.record_length; /* bounded by the helper */
+		if (end > block.free_offset)
+			return CLUSTER_RECOVERY_UNDO_CORRUPT;
+		for (uint32 offset = slot.record_offset; offset < end; offset++) {
+			uint8 mask = (uint8)(1U << (offset & 7));
+
+			if ((occupied[offset >> 3] & mask) != 0)
+				return CLUSTER_RECOVERY_UNDO_CORRUPT;
+			occupied[offset >> 3] |= mask;
+		}
+		memcpy(&header, bytes + slot.record_offset, sizeof(header));
+		if (header.record_type < UNDO_RECORD_INSERT || header.record_type > UNDO_RECORD_ITL
+			|| (header.flags & ~(UNDO_REC_FLAG_FIRST_IN_TX | UNDO_REC_FLAG_HAS_ITL_HISTORY)) != 0)
+			return CLUSTER_RECOVERY_UNDO_UNSUPPORTED;
+		if (header.payload_length != slot.record_length - sizeof(header)
+			|| slot.record_type != header.record_type || slot.flags != header.flags)
+			return CLUSTER_RECOVERY_UNDO_CORRUPT;
+		if (header.origin_node_id != expected_owner - 1 || header.tt_slot_segment_id == 0
+			|| (header.tt_slot_segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE
+				   != expected_owner - 1
+			|| header.tt_slot_id == 0 || header.tt_slot_id > TT_SLOTS_PER_SEGMENT
+			|| (i == row && header.tt_slot_id != (uint32)tt_slot + 1))
+			return CLUSTER_RECOVERY_UNDO_IDENTITY;
+		if (!cluster_undo_record_decode_payload(&header,
+												bytes + slot.record_offset + sizeof(header),
+												header.payload_length, &body_length, &history))
+			return CLUSTER_RECOVERY_UNDO_CORRUPT;
+		if (i == row) {
+			selected = slot;
+			selected_header = header;
+			selected_history = history;
+			selected_body = body_length;
+		}
+	}
+
+	/* Generation and terminal authority are deliberately absent. In particular,
+	 * the original producer's crc64=0 and an unknown tt_wrap_plus1 stay raw. */
+	out->address = address;
+	out->block_header = block;
+	out->directory = selected;
+	out->header = selected_header;
+	out->history = selected_history;
+	out->body_length = selected_body;
+	memcpy(out->payload, bytes + selected.record_offset + sizeof(selected_header),
+		   selected_header.payload_length);
+	return CLUSTER_RECOVERY_UNDO_ENTRY;
+}
+
 #endif
