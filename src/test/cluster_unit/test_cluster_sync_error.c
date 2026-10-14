@@ -34,6 +34,8 @@ static bool queue_accepts, fail_sync, fail_write;
 static int writeback_calls;
 static int writeback_fence_calls;
 static int writeback_mrp_calls;
+static int immedsync_fence_calls;
+static int immedsync_mrp_calls;
 static bool writeback_order_ok;
 static int reported_level;
 static ClusterPageWalRefV1 first_before;
@@ -153,6 +155,8 @@ cluster_write_fence_reject_if_fenced(const char *op)
 		if (writeback_calls != 0)
 			writeback_order_ok = false;
 	}
+	else if (strcmp(op, "immedsync") == 0)
+		immedsync_fence_calls++;
 }
 void
 cluster_mrp_standby_shared_write_gate(const char *op)
@@ -162,6 +166,8 @@ cluster_mrp_standby_shared_write_gate(const char *op)
 		if (writeback_calls != 0)
 			writeback_order_ok = false;
 	}
+	else if (strcmp(op, "immedsync") == 0)
+		immedsync_mrp_calls++;
 }
 static ClusterSmgrRelationState *
 cluster_smgr_state_lookup(SMgrRelation r, bool create)
@@ -205,6 +211,8 @@ setup(int provider)
 	writeback_calls = 0;
 	writeback_fence_calls = 0;
 	writeback_mrp_calls = 0;
+	immedsync_fence_calls = 0;
+	immedsync_mrp_calls = 0;
 	writeback_order_ok = true;
 	relation.smgr_rlocator.backend = InvalidBackendId;
 	native_handle.vfd = cluster_raw_device_fd = fileno(file);
@@ -318,17 +326,26 @@ UT_TEST(writeback_checks_existing_gates_before_provider)
 	UT_ASSERT(writeback_order_ok);
 }
 
+UT_TEST(immedsync_checks_existing_gates_before_provider)
+{
+	setup(0);
+	cluster_smgr_immedsync(&relation, MAIN_FORKNUM);
+	UT_ASSERT_EQ(immedsync_fence_calls, 1);
+	UT_ASSERT_EQ(immedsync_mrp_calls, 1);
+}
+
 int
 main(void)
 {
 	observed = mmap(NULL, sizeof(*observed), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
 	if (observed == MAP_FAILED)
 		return 2;
-	UT_PLAN(4);
+	UT_PLAN(5);
 	UT_RUN(sync_error_bypasses_retry_and_retains_first);
 	UT_RUN(registration_or_sync_precedes_clean_and_first_retirement);
 	UT_RUN(write_error_remains_error_and_sync_retry_uses_native_policy);
 	UT_RUN(writeback_checks_existing_gates_before_provider);
+	UT_RUN(immedsync_checks_existing_gates_before_provider);
 	munmap(observed, sizeof(*observed));
 	if (file)
 		fclose(file);

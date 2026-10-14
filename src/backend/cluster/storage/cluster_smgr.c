@@ -917,6 +917,13 @@ cluster_smgr_immedsync(SMgrRelation reln, ForkNumber forknum)
 	ClusterSmgrRelationState *state;
 	ClusterSharedFsHandle *handle;
 
+	/* An immediate sync is the completion edge of a shared-storage write,
+	 * not an authority bypass.  Keep the same pre-provider ownership gates as
+	 * direct writeback so a fenced or standby process cannot open a handle and
+	 * publish a durability result for an object it no longer owns. */
+	cluster_write_fence_reject_if_fenced("immedsync");
+	cluster_mrp_standby_shared_write_gate("immedsync");
+
 	state = cluster_smgr_state_lookup(reln, true);
 	handle = cluster_smgr_ensure_handle(state, forknum);
 
