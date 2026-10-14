@@ -111,6 +111,7 @@ OBJS = \
 	cluster_cold_recovery_plan_schedule.o \
 	cluster_cold_recovery_decode.o \
 	cluster_cold_recovery_io.o \
+	cluster_recovery_namespace.o \
 	cluster_cold_recovery_space.o \
 	cluster_cold_recovery_startup.o \
 	cluster_cold_recovery_replay.o \
@@ -416,6 +417,7 @@ cluster_control_bootstrap.o cluster_control_bootstrap_read.o cluster_control_roo
 cluster_wal_tail.o: $(top_srcdir)/src/include/cluster/cluster_wal_tail.h
 cluster_wal_inputs.o: $(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
 	$(srcdir)/cluster_control_root_private.h $(srcdir)/cluster_recovery_anchor_private.h
+cluster_recovery_namespace.o: $(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h
 cluster_wal_cut.o: $(top_srcdir)/src/include/cluster/cluster_wal_cut.h \
 	$(top_srcdir)/src/include/cluster/cluster_wal_writer.h
 cluster_pi_data.o cluster_pi_writeback.o: $(srcdir)/cluster_pi_data_wire.h \

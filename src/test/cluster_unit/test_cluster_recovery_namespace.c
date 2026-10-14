@@ -1,0 +1,396 @@
+/* Cold recovery namespace discovery through real directory/file descriptors.
+ * Author: SqlRush <sqlrush@gmail.com>
+ * Copyright (c) 2026, pgrac contributors. */
+#include "postgres.h"
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include "catalog/pg_tablespace_d.h"
+#include "cluster/cluster_recovery_namespace.h"
+#include "unit_test.h"
+
+UT_DEFINE_GLOBALS();
+
+void
+ExceptionalCondition(const char *condition, const char *file, int line)
+{
+	fprintf(stderr, "%s at %s:%d\n", condition, file, line);
+	abort();
+}
+
+static bool inject_readdir_error;
+static bool inject_fstat_error;
+
+static int
+namespace_test_fstat(int fd, struct stat *st)
+{
+	if (inject_fstat_error) {
+		errno = EIO;
+		return -1;
+	}
+	return fstat(fd, st);
+}
+
+static struct dirent *
+namespace_test_readdir(DIR *dir)
+{
+	if (inject_readdir_error) {
+		errno = EIO;
+		return NULL;
+	}
+	return readdir(dir);
+}
+
+#define readdir namespace_test_readdir
+#define fstat namespace_test_fstat
+#include "../../backend/cluster/cluster_recovery_namespace.c"
+#undef readdir
+#undef fstat
+
+static char test_path[MAXPGPATH];
+
+static int
+new_root(void)
+{
+	char *dir;
+
+	snprintf(test_path, sizeof(test_path), "/tmp/pgrac-recovery-ns-XXXXXX");
+	dir = mkdtemp(test_path);
+	return dir == NULL ? -1 : open(dir, O_RDONLY | O_DIRECTORY);
+}
+
+static void
+write_file(int root, const char *name)
+{
+	int fd = openat(root, name, O_CREAT | O_EXCL | O_WRONLY, 0600);
+
+	if (fd < 0 || write(fd, "cold", 4) != 4 || close(fd) != 0)
+		abort();
+}
+
+static void
+remove_root(int root)
+{
+	DIR *dir = fdopendir(openat(root, ".", O_RDONLY | O_DIRECTORY));
+	struct dirent *entry;
+
+	while ((entry = readdir(dir)) != NULL) {
+		struct stat st;
+
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+			continue;
+		if (fstatat(root, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+			abort();
+		if (S_ISDIR(st.st_mode)) {
+			int child = openat(root, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+
+			remove_root(child);
+			if (unlinkat(root, entry->d_name, AT_REMOVEDIR) != 0)
+				abort();
+		} else if (unlinkat(root, entry->d_name, 0) != 0)
+			abort();
+	}
+	closedir(dir);
+	close(root);
+}
+
+UT_TEST(test_shared_relation_names)
+{
+	const char *paths[] = { "global/1260", "base/5/16385", "base/5/16385_fsm", "base/5/16385_vm",
+							"base/5/16385_space" };
+	ForkNumber forks[]
+		= { MAIN_FORKNUM, MAIN_FORKNUM, FSM_FORKNUM, VISIBILITYMAP_FORKNUM, SPACE_FORKNUM };
+
+	for (unsigned i = 0; i < lengthof(paths); i++) {
+		RelFileLocator locator;
+		ForkNumber forknum;
+
+		UT_ASSERT_EQ(cluster_recovery_namespace_classify(paths[i], &locator, &forknum),
+					 CLUSTER_RECOVERY_FILE_RELATION);
+		UT_ASSERT_EQ(locator.spcOid, i == 0 ? GLOBALTABLESPACE_OID : DEFAULTTABLESPACE_OID);
+		UT_ASSERT_EQ(locator.dbOid, i == 0 ? InvalidOid : 5);
+		UT_ASSERT_EQ(locator.relNumber, i == 0 ? 1260 : 16385);
+		UT_ASSERT_EQ(forknum, forks[i]);
+	}
+}
+
+UT_TEST(test_relmap_and_both_authority_copies)
+{
+	const char *names[] = { "pg_filenode.map", "pg_filenode.map.bak", "pgrac_relmap_authority",
+							"pgrac_relmap_authority.bak" };
+	ClusterRecoveryFileKind kinds[]
+		= { CLUSTER_RECOVERY_FILE_RELMAP, CLUSTER_RECOVERY_FILE_RELMAP_BACKUP,
+			CLUSTER_RECOVERY_FILE_RELMAP_AUTHORITY, CLUSTER_RECOVERY_FILE_RELMAP_AUTHORITY_BACKUP };
+
+	for (unsigned i = 0; i < lengthof(names); i++) {
+		char path[128];
+		RelFileLocator locator;
+		ForkNumber forknum;
+
+		snprintf(path, sizeof(path), "base/5/%s", names[i]);
+		UT_ASSERT_EQ(cluster_recovery_namespace_classify(path, &locator, &forknum), kinds[i]);
+		UT_ASSERT_EQ(locator.dbOid, 5);
+		UT_ASSERT_EQ(locator.relNumber, InvalidOid);
+		UT_ASSERT_EQ(forknum, InvalidForkNumber);
+	}
+}
+
+UT_TEST(test_unknown_and_aliases_cannot_be_empty_coverage)
+{
+	const char *paths[] = { "base/05/100",
+							"base/0/100",
+							"base/5/0100",
+							"base/5/0",
+							"base/4294967296/100",
+							"base/5/4294967296",
+							"base/5/100.1",
+							"base/5/100_init",
+							"base/5/100_space.1",
+							"base/5/100_vm.bak",
+							"base/5/t1_100",
+							"global/1/100",
+							"pg_tblspc/1/PG_16/5/100",
+							"/base/5/100",
+							"base/5/../100",
+							"base/5//100",
+							"base/5/pgrac_relmap_authority.tmp",
+							"base/5/pg_filenode.map.bak.tmp",
+							"unknown" };
+
+	for (unsigned i = 0; i < lengthof(paths); i++) {
+		RelFileLocator locator;
+		ForkNumber forknum;
+
+		memset(&locator, 0x5a, sizeof(locator));
+		UT_ASSERT_EQ(cluster_recovery_namespace_classify(paths[i], &locator, &forknum),
+					 CLUSTER_RECOVERY_FILE_UNCLASSIFIED);
+		UT_ASSERT_EQ(locator.spcOid, InvalidOid);
+		UT_ASSERT_EQ(locator.dbOid, InvalidOid);
+		UT_ASSERT_EQ(locator.relNumber, InvalidOid);
+		UT_ASSERT_EQ(forknum, InvalidForkNumber);
+	}
+}
+
+UT_TEST(test_real_tree_includes_untouched_and_unknown_files)
+{
+	int root = new_root();
+	ClusterRecoveryNamespace *scan = NULL;
+	ClusterRecoveryNamespaceEntry entry;
+	ClusterRecoveryNamespaceResult result;
+	unsigned files = 0, directories = 0, unknown = 0;
+	int borrowed = -1;
+	char bytes[4];
+
+	UT_ASSERT(root >= 0);
+	UT_ASSERT_EQ(mkdirat(root, "global", 0700), 0);
+	write_file(root, "global/1260");
+	write_file(root, "global/1260_vm");
+	write_file(root, "global/pgrac_relmap_authority.bak");
+	write_file(root, "unclassified-owner");
+	UT_ASSERT_EQ(cluster_recovery_namespace_begin(root, 16, &scan),
+				 CLUSTER_RECOVERY_NAMESPACE_MORE);
+	while ((result = cluster_recovery_namespace_next(scan, &entry, &borrowed))
+		   <= CLUSTER_RECOVERY_NAMESPACE_MORE) {
+		if (result == CLUSTER_RECOVERY_NAMESPACE_MORE)
+			continue;
+		if (entry.kind == CLUSTER_RECOVERY_FILE_DIRECTORY) {
+			directories++;
+			UT_ASSERT_EQ(borrowed, -1);
+		} else {
+			files++;
+			unknown += entry.kind == CLUSTER_RECOVERY_FILE_UNCLASSIFIED;
+			UT_ASSERT_EQ(pread(borrowed, bytes, sizeof(bytes), 0), 4);
+			UT_ASSERT_EQ(memcmp(bytes, "cold", 4), 0);
+		}
+	}
+	UT_ASSERT_EQ(result, CLUSTER_RECOVERY_NAMESPACE_END);
+	UT_ASSERT_EQ(files, 4);
+	UT_ASSERT_EQ(directories, 1);
+	UT_ASSERT_EQ(unknown, 1);
+	cluster_recovery_namespace_destroy(scan);
+	UT_ASSERT(fcntl(root, F_GETFD) >= 0); /* Borrowed root stays with its owner. */
+	remove_root(root);
+	rmdir(test_path);
+}
+
+UT_TEST(test_symlink_and_hardlink_are_not_candidates)
+{
+	for (unsigned hard = 0; hard < 2; hard++) {
+		int root = new_root();
+		ClusterRecoveryNamespace *scan = NULL;
+		ClusterRecoveryNamespaceEntry entry;
+		ClusterRecoveryNamespaceResult result;
+		int fd;
+
+		UT_ASSERT(root >= 0);
+		if (hard) {
+			write_file(root, "original");
+			UT_ASSERT_EQ(linkat(root, "original", root, "alias", 0), 0);
+		} else
+			UT_ASSERT_EQ(symlinkat("/tmp", root, "escape"), 0);
+		UT_ASSERT_EQ(cluster_recovery_namespace_begin(root, 8, &scan),
+					 CLUSTER_RECOVERY_NAMESPACE_MORE);
+		do {
+			result = cluster_recovery_namespace_next(scan, &entry, &fd);
+		} while (result <= CLUSTER_RECOVERY_NAMESPACE_MORE);
+		UT_ASSERT_EQ(result, CLUSTER_RECOVERY_NAMESPACE_UNSAFE);
+		UT_ASSERT_EQ(cluster_recovery_namespace_next(scan, &entry, &fd), result);
+		cluster_recovery_namespace_destroy(scan);
+		remove_root(root);
+		rmdir(test_path);
+	}
+}
+
+UT_TEST(test_read_error_is_not_eof)
+{
+	int root = new_root(), fd;
+	ClusterRecoveryNamespace *scan = NULL;
+	ClusterRecoveryNamespaceEntry entry;
+
+	UT_ASSERT_EQ(cluster_recovery_namespace_begin(root, 8, &scan), CLUSTER_RECOVERY_NAMESPACE_MORE);
+	inject_readdir_error = true;
+	UT_ASSERT_EQ(cluster_recovery_namespace_next(scan, &entry, &fd), CLUSTER_RECOVERY_NAMESPACE_IO);
+	inject_readdir_error = false;
+	UT_ASSERT_EQ(cluster_recovery_namespace_next(scan, &entry, &fd), CLUSTER_RECOVERY_NAMESPACE_IO);
+	cluster_recovery_namespace_destroy(scan);
+	remove_root(root);
+	rmdir(test_path);
+}
+
+UT_TEST(test_disappeared_or_modified_file_invalidates_observation)
+{
+	for (unsigned modified = 0; modified < 2; modified++) {
+		int root = new_root(), fd;
+		ClusterRecoveryNamespace *scan = NULL;
+		ClusterRecoveryNamespaceEntry entry;
+
+		write_file(root, "candidate");
+		UT_ASSERT_EQ(cluster_recovery_namespace_begin(root, 8, &scan),
+					 CLUSTER_RECOVERY_NAMESPACE_MORE);
+		UT_ASSERT_EQ(cluster_recovery_namespace_next(scan, &entry, &fd),
+					 CLUSTER_RECOVERY_NAMESPACE_ENTRY);
+		if (modified) {
+			int writer = openat(root, "candidate", O_WRONLY);
+			UT_ASSERT_EQ(ftruncate(writer, 3), 0);
+			close(writer);
+		} else
+			UT_ASSERT_EQ(unlinkat(root, "candidate", 0), 0);
+		UT_ASSERT_EQ(cluster_recovery_namespace_next(scan, &entry, &fd),
+					 CLUSTER_RECOVERY_NAMESPACE_CHANGED);
+		UT_ASSERT_EQ(fd, -1);
+		UT_ASSERT_EQ(entry.path[0], 0);
+		cluster_recovery_namespace_destroy(scan);
+		remove_root(root);
+		rmdir(test_path);
+	}
+}
+
+UT_TEST(test_capacity_never_seals_a_prefix)
+{
+	int root = new_root(), fd;
+	ClusterRecoveryNamespace *scan = NULL;
+	ClusterRecoveryNamespaceEntry entry;
+
+	write_file(root, "one");
+	write_file(root, "two");
+	UT_ASSERT_EQ(cluster_recovery_namespace_begin(root, 1, &scan), CLUSTER_RECOVERY_NAMESPACE_MORE);
+	UT_ASSERT_EQ(cluster_recovery_namespace_next(scan, &entry, &fd),
+				 CLUSTER_RECOVERY_NAMESPACE_ENTRY);
+	UT_ASSERT_EQ(cluster_recovery_namespace_next(scan, &entry, &fd),
+				 CLUSTER_RECOVERY_NAMESPACE_CAPACITY);
+	cluster_recovery_namespace_destroy(scan);
+	remove_root(root);
+	rmdir(test_path);
+}
+
+UT_TEST(test_new_directory_entry_invalidates_finished_set)
+{
+	int root = new_root(), fd;
+	ClusterRecoveryNamespace *scan = NULL;
+	ClusterRecoveryNamespaceEntry entry;
+	ClusterRecoveryNamespaceResult result;
+
+	write_file(root, "one");
+	UT_ASSERT_EQ(cluster_recovery_namespace_begin(root, 8, &scan), CLUSTER_RECOVERY_NAMESPACE_MORE);
+	UT_ASSERT_EQ(cluster_recovery_namespace_next(scan, &entry, &fd),
+				 CLUSTER_RECOVERY_NAMESPACE_ENTRY);
+	write_file(root, "two");
+	do {
+		result = cluster_recovery_namespace_next(scan, &entry, &fd);
+	} while (result <= CLUSTER_RECOVERY_NAMESPACE_MORE);
+	UT_ASSERT_EQ(result, CLUSTER_RECOVERY_NAMESPACE_CHANGED);
+	cluster_recovery_namespace_destroy(scan);
+	remove_root(root);
+	rmdir(test_path);
+}
+
+UT_TEST(test_stat_io_failure_keeps_its_cause)
+{
+	for (unsigned directory = 0; directory < 2; directory++) {
+		int root = new_root(), fd;
+		ClusterRecoveryNamespace *scan = NULL;
+		ClusterRecoveryNamespaceEntry entry;
+
+		if (directory)
+			UT_ASSERT_EQ(mkdirat(root, "candidate", 0700), 0);
+		else
+			write_file(root, "candidate");
+		UT_ASSERT_EQ(cluster_recovery_namespace_begin(root, 8, &scan),
+					 CLUSTER_RECOVERY_NAMESPACE_MORE);
+		inject_fstat_error = true;
+		UT_ASSERT_EQ(cluster_recovery_namespace_next(scan, &entry, &fd),
+					 CLUSTER_RECOVERY_NAMESPACE_IO);
+		inject_fstat_error = false;
+		UT_ASSERT_EQ(cluster_recovery_namespace_next(scan, &entry, &fd),
+					 CLUSTER_RECOVERY_NAMESPACE_IO);
+		cluster_recovery_namespace_destroy(scan);
+		remove_root(root);
+		rmdir(test_path);
+	}
+}
+
+UT_TEST(test_borrowed_directory_cursor_does_not_skip_files)
+{
+	int root = new_root(), fd;
+	DIR *prior;
+	ClusterRecoveryNamespace *scan = NULL;
+	ClusterRecoveryNamespaceEntry entry;
+
+	write_file(root, "candidate");
+	prior = fdopendir(dup(root));
+	UT_ASSERT(prior != NULL);
+	while (readdir(prior) != NULL)
+		;
+	closedir(prior);
+	UT_ASSERT_EQ(cluster_recovery_namespace_begin(root, 8, &scan), CLUSTER_RECOVERY_NAMESPACE_MORE);
+	UT_ASSERT_EQ(cluster_recovery_namespace_next(scan, &entry, &fd),
+				 CLUSTER_RECOVERY_NAMESPACE_ENTRY);
+	UT_ASSERT_EQ(strcmp(entry.path, "candidate"), 0);
+	UT_ASSERT_EQ(cluster_recovery_namespace_next(scan, &entry, &fd),
+				 CLUSTER_RECOVERY_NAMESPACE_END);
+	UT_ASSERT_EQ(cluster_recovery_namespace_next(scan, &entry, &fd),
+				 CLUSTER_RECOVERY_NAMESPACE_END);
+	cluster_recovery_namespace_destroy(scan);
+	remove_root(root);
+	rmdir(test_path);
+}
+
+int
+main(void)
+{
+	UT_PLAN(11);
+	UT_RUN(test_shared_relation_names);
+	UT_RUN(test_relmap_and_both_authority_copies);
+	UT_RUN(test_unknown_and_aliases_cannot_be_empty_coverage);
+	UT_RUN(test_real_tree_includes_untouched_and_unknown_files);
+	UT_RUN(test_symlink_and_hardlink_are_not_candidates);
+	UT_RUN(test_read_error_is_not_eof);
+	UT_RUN(test_disappeared_or_modified_file_invalidates_observation);
+	UT_RUN(test_capacity_never_seals_a_prefix);
+	UT_RUN(test_new_directory_entry_invalidates_finished_set);
+	UT_RUN(test_stat_io_failure_keeps_its_cause);
+	UT_RUN(test_borrowed_directory_cursor_does_not_skip_files);
+	UT_DONE();
+	return ut_failed_count != 0;
+}
