@@ -14674,6 +14674,7 @@ UT_TEST(test_native_side_observation_reads_origin_and_preserves_bytes)
 	}
 	UT_ASSERT_EQ(cluster_control_native_side_observe(f.shared, 3, &control, &first), 0);
 	UT_ASSERT_EQ(first.page_reads, 3);
+	UT_ASSERT_EQ(first.family_mask, CLUSTER_NATIVE_SIDE_FAMILY_ALL);
 	UT_ASSERT(!v2_zero(first.sha256, 32));
 	UT_ASSERT_EQ(cluster_control_native_side_observe(f.shared, 3, &control, &second), 0);
 	UT_ASSERT(memcmp(&first, &second, sizeof(first)) == 0);

@@ -799,8 +799,11 @@ native_side_inspect(const char *shared_root, uint32 node_id, const ControlFileDa
 		result = read_dir(dirs[0], "native_side", &dirs[1]);
 	if (result == 0)
 		result = read_dir(dirs[1], origin, &dirs[2]);
-	for (unsigned i = 0; result == 0 && i < lengthof(families); ++i)
+	for (unsigned i = 0; result == 0 && i < lengthof(families); ++i) {
 		result = read_dir(dirs[parents[i]], families[i], &dirs[3 + i]);
+		if (result == 0)
+			observed.family_mask |= UINT32_C(1) << i;
+	}
 	if (result == 0)
 		result = read_native_horizon(dirs[0], input, &effective, hash, sync);
 	if (result == 0) {

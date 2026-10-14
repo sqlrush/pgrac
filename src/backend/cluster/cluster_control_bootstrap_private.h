@@ -130,10 +130,22 @@ cluster_control_bootstrap_side_route(const char *pgdata, const char *shared_root
  * must bind the input to the selected anchor and revalidate its root/IR/WALR.
  * No recoverer-local SLRU state, missing-page fabrication or file mutation.
  * Author: SqlRush <sqlrush@gmail.com> */
+#define CLUSTER_NATIVE_SIDE_FAMILY_XACT (UINT32_C(1) << 0)
+#define CLUSTER_NATIVE_SIDE_FAMILY_SUBTRANS (UINT32_C(1) << 1)
+#define CLUSTER_NATIVE_SIDE_FAMILY_MULTIXACT (UINT32_C(1) << 2)
+#define CLUSTER_NATIVE_SIDE_FAMILY_COMMIT_TS (UINT32_C(1) << 3)
+#define CLUSTER_NATIVE_SIDE_FAMILY_MX_OFFSETS (UINT32_C(1) << 4)
+#define CLUSTER_NATIVE_SIDE_FAMILY_MX_MEMBERS (UINT32_C(1) << 5)
+#define CLUSTER_NATIVE_SIDE_FAMILY_ALL                                                             \
+	(CLUSTER_NATIVE_SIDE_FAMILY_XACT | CLUSTER_NATIVE_SIDE_FAMILY_SUBTRANS                         \
+	 | CLUSTER_NATIVE_SIDE_FAMILY_MULTIXACT | CLUSTER_NATIVE_SIDE_FAMILY_COMMIT_TS                 \
+	 | CLUSTER_NATIVE_SIDE_FAMILY_MX_OFFSETS | CLUSTER_NATIVE_SIDE_FAMILY_MX_MEMBERS)
+
 typedef struct ClusterNativeSideObservation {
 	uint8 sha256[32];
 	uint64 effective_next_xid;
 	uint32 page_reads;
+	uint32 family_mask; /* all six native SLRU/cursor families were opened */
 } ClusterNativeSideObservation;
 extern ClusterControlRootResult
 cluster_control_native_side_observe(const char *shared_root, uint32 node_id,
