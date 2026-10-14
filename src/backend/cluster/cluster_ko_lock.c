@@ -4861,8 +4861,13 @@ cluster_ko_drain_inbound_and_apply(void)
 			&& slot.shared == cluster_shared_config
 			&& ko_shared_v3_control_at_generation(&slot.qualified_v3, slot.peer_route_generation)
 			&& !cluster_ctrc_relation_removal_ready_shared(
-				(uint32)slot.spc_oid, (uint32)slot.db_oid, (uint32)slot.rel_number))
+				(uint32)slot.spc_oid, (uint32)slot.db_oid, (uint32)slot.rel_number)) {
+			/* Preserve FIFO ownership of the blocked head, but do not starve
+			 * already-applied fences behind it.  Their local READY/ACK
+			 * continuation is independent of this head's CTRC proof. */
+			ko_peer_fence_local_ready_tick_v3();
 			return;
+		}
 		if (slot.shared && slot.v3 && !ko_peer_fence_mark_physical_started_v3(&slot.qualified_v3))
 			goto next;
 		/*

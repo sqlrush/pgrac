@@ -5720,6 +5720,37 @@ UT_TEST(test_v3_fence_registers_before_apply_and_delays_ack_until_local_ready)
 	UT_ASSERT_EQ(ack_count, 1);
 }
 
+UT_TEST(test_v3_blocked_head_does_not_starve_completed_fence_continuation)
+{
+	ClusterKoSharedMessageV3 head = peer_fence_fixture(908);
+	ClusterKoSharedMessageV3 completed = head;
+
+	completed.base.batch_id++;
+	real_space_reader = true;
+	space_identity.key.locator.dbOid = 5;
+	space_identity.sequence = 1;
+	space_identity.operation = 88;
+	removal_ready = false;
+	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_EMPTY;
+	enqueue_shared_v3(&head);
+	enqueue_shared_v3(&completed);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&storage.inbound_head), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&storage.inbound_tail), 2);
+	/* The second fence has already completed its physical consumer; only its
+	 * bounded local READY/ACK continuation remains. */
+	UT_ASSERT(ko_peer_fence_mark_physical_started_v3(&completed));
+	UT_ASSERT(ko_peer_fence_mark_physical_applied_v3(&completed));
+	fixture_peer_drain();
+	UT_ASSERT_EQ(pg_atomic_read_u32(&storage.inbound_head), 0);
+	UT_ASSERT_EQ(flush_count, 0);
+	UT_ASSERT_EQ(drop_count, 0);
+	UT_ASSERT_EQ(local_relation_scan_calls, 1);
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_ACTIVE);
+	UT_ASSERT_EQ(storage.peer_fences[1].state, CLUSTER_KO_PEER_FENCE_READY);
+	UT_ASSERT(storage.peer_fences[1].ack_queued);
+	UT_ASSERT_EQ(storage.send_v3_count, 1);
+}
+
 UT_TEST(test_peer_ack_refusal_keeps_original_route_cut)
 {
 	for (int drift = 0; drift < 2; drift++) {
@@ -6851,7 +6882,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(154);
+	UT_PLAN(158);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
 	UT_RUN(test_peer_space_entry_checks_precede_io);
@@ -6973,6 +7004,7 @@ main(void)
 	UT_RUN(test_v3_receive_requires_exact_tcp_owner_before_queue);
 	UT_RUN(test_v3_inbound_retains_peer_route_without_rewriting_origin);
 	UT_RUN(test_v3_fence_registers_before_apply_and_delays_ack_until_local_ready);
+	UT_RUN(test_v3_blocked_head_does_not_starve_completed_fence_continuation);
 	UT_RUN(test_peer_ack_refusal_keeps_original_route_cut);
 	UT_RUN(test_cleaner_attempt_is_counted_before_fence_and_blocks_ready_until_finally);
 	UT_RUN(test_cleaner_attempt_admission_rejects_source_owner_and_terminal_drift);
