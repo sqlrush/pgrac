@@ -63,7 +63,7 @@ TESTS = test_cluster_vm_read_visibility test_cluster_heap_maintenance test_clust
         test_cluster_update_trace test_cluster_cr_dependency test_cluster_startup_exit test_cluster_config_members test_cluster_config_mount \
         test_cluster_heap_prepare_diagnostic test_cluster_generic_version test_cluster_generic_redo \
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
-        test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_ctrc_dispatch test_cluster_heap_receipt \
+        test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_ctrc_successor_fence test_cluster_ctrc_dispatch test_cluster_heap_receipt \
         test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_ctrc_itl_reuse test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_ges_holder test_cluster_ko_relation_scan test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop \
         test_cluster_bufmgr_stop test_cluster_allocation_stop test_cluster_hw_cold test_cluster_hw_initdb test_cluster_shared_parameters test_cluster_shared_config_alter test_cluster_checkpoint_pi_tick test_cluster_native_wal_stop test_cluster_checkpointer_stop test_cluster_postmaster_stop test_cluster_xnode_profile test_cluster_adg \
         test_cluster_xnode_lever test_cluster_ges_handoff \
@@ -412,7 +412,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_heap_cr_reuse test_cluster_snapshot_ad
 		test_cluster_r4_scratch_resolver,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_native_wal_stop test_cluster_hw_initdb test_cluster_hw_cold test_cluster_cr_inline_stop test_cluster_mrp_stop test_cluster_backup_stop test_cluster_recovery_stop test_cluster_node_remove_stop test_cluster_postmaster_stop test_cluster_checkpointer_stop test_cluster_allocation_stop test_cluster_raw_device_capacity test_cluster_replacement_wire \
 		test_cluster_external_fence test_pgrac_external_fence_protocol \
-		test_cluster_wal_retention test_cluster_terminal_ref_census test_cluster_ctrc_cleaner test_cluster_ctrc_dispatch test_cluster_heap_receipt \
+		test_cluster_wal_retention test_cluster_terminal_ref_census test_cluster_ctrc_cleaner test_cluster_ctrc_successor_fence test_cluster_ctrc_dispatch test_cluster_heap_receipt \
 		test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_ges_holder test_cluster_ko_relation_scan test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop,$(SIMPLE_TESTS))
 
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
@@ -7944,7 +7944,7 @@ test_cluster_ctrc_read_scope.inc: $(top_srcdir)/src/backend/cluster/cluster_term
 	mv $@.tmp $@
 
 test_cluster_ctrc_cleaner test_cluster_ctrc_capacity test_cluster_ctrc_dispatch \
-test_cluster_ctrc_itl_reuse: test_cluster_ctrc_read_scope.inc
+test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: test_cluster_ctrc_read_scope.inc
 
 test_cluster_ctrc_capacity: test_cluster_ctrc_capacity.c test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
@@ -7962,6 +7962,14 @@ test_cluster_ctrc_cleaner: test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pas
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_SCN_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+
+test_cluster_ctrc_successor_fence: test_cluster_ctrc_successor_fence.c test_cluster_ctrc_cleaner.c \
+		test_cluster_ctrc_run_pass.inc unit_test.h $(CLUSTER_SCN_O) \
+		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_SCN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
 
 # Whole production cleaner and exact-page guard, not a reconstructed predicate.

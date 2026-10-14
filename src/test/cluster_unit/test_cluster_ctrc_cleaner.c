@@ -108,6 +108,67 @@ static void (*wakeup_hook)(void);
 static bool (*external_lock_hook)(LWLock *lock, LWLockMode mode, bool acquire);
 static bool read_scope_enter_refused;
 static unsigned read_scope_entered, read_scope_left;
+bool cluster_shared_config;
+int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+static bool publication_fenced, fence_at_receipt_lock;
+static uint64 publication_revision = 1;
+static int publication_smgr = 1;
+
+int
+cluster_smgr_which_for(RelFileLocator locator pg_attribute_unused(),
+					   BackendId backend pg_attribute_unused())
+{
+	return publication_smgr;
+}
+
+/* KO is a boundary here: the actual shared PREPARE and its lock order,
+ * participant, receipt, locator and handle publication are under test. */
+bool
+cluster_ko_peer_admission_begin_v3(RelFileLocator locator, ClusterKoPeerAdmissionV3 *out)
+{
+	UT_ASSERT_EQ(held_count, 0);
+	MemSet(out, 0, sizeof(*out));
+	if (publication_fenced && locator.relNumber == 9001)
+		return false;
+	out->locator = locator;
+	out->revision = publication_revision;
+	return true;
+}
+
+bool
+cluster_ko_peer_admission_current_v3(const ClusterKoPeerAdmissionV3 *sample, RelFileLocator locator)
+{
+	return sample != NULL && sample->revision != 0 && sample->revision == publication_revision
+		   && sample->cleaner.serial == 0 && sample->extension_serial == 0
+		   && RelFileLocatorEquals(sample->locator, locator);
+}
+
+bool
+cluster_ko_peer_read_begin_v3(RelFileLocator locator, ForkNumber fork, BlockNumber block,
+							  ClusterKoPeerAdmissionV3 *out)
+{
+	if (cluster_ko_peer_admission_begin_v3(locator, out))
+		return true;
+	if (!cluster_ctrc_cleaner_read_scope_snapshot_v3(locator, fork, block, &out->cleaner))
+		return false;
+	out->locator = locator;
+	out->revision = publication_revision;
+	out->fork = fork;
+	out->block = block;
+	return true;
+}
+
+bool
+cluster_ko_peer_read_current_v3(const ClusterKoPeerAdmissionV3 *sample, RelFileLocator locator,
+								ForkNumber fork, BlockNumber block)
+{
+	if (sample->cleaner.serial == 0)
+		return cluster_ko_peer_admission_current_v3(sample, locator);
+	return sample->revision == publication_revision && sample->extension_serial == 0
+		   && sample->fork == fork && sample->block == block
+		   && RelFileLocatorEquals(sample->locator, locator)
+		   && cluster_ctrc_cleaner_read_scope_current_v3(&sample->cleaner, locator, fork, block);
+}
 
 bool
 cluster_ko_cleaner_enter_v3(RelFileLocator locator, const ClusterCtrcCleanerReadScopeV3 *scope)
@@ -289,6 +350,11 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 	if (lock == &CtrcShared->receipt_lock)
 		last_pool_mode = mode;
 	test_lock_enter(lock, true);
+	if (lock == &CtrcShared->receipt_lock && fence_at_receipt_lock) {
+		fence_at_receipt_lock = false;
+		publication_fenced = true;
+		publication_revision++;
+	}
 	return true;
 }
 
@@ -412,6 +478,11 @@ reset_fixture(void)
 	CtrcReadSerial = 0;
 	read_scope_enter_refused = false;
 	read_scope_entered = read_scope_left = 0;
+	cluster_shared_config = false;
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+	publication_fenced = fence_at_receipt_lock = false;
+	publication_revision = 1;
+	publication_smgr = 1;
 }
 
 static ClusterCtrcOriginEntry *
@@ -884,6 +955,101 @@ prepare_fixture_receipt(ClusterCtrcOriginEntry *origin, uint64 operation_id,
 	target.page_operation_kind = 1;
 	return cluster_ctrc_receipt_prepare_shared(
 		&origin->key, &origin->touched[0], origin->grant_generation, &publication, &target, handle);
+}
+
+/* A closed object cannot acquire a new CTRC producer, including a caller
+ * whose admission sample became stale while taking the original locks. */
+UT_TEST(test_object_fence_refuses_new_receipt_without_publishing_participant)
+{
+	for (unsigned race = 0; race < 2; race++) {
+		ClusterCtrcOriginEntry *origin;
+		ClusterCtrcReceiptHandle handle;
+		ClusterCtrcParticipantEntry before;
+		uint64 pi, journal;
+
+		reset_fixture();
+		origin = seed_origin(0, 1);
+		UT_ASSERT(ctrc_participant_index(&origin->key, 0, &pi));
+		before = ctrc_participant_entries()[pi];
+		journal = CtrcShared->global_journal_generation;
+		cluster_shared_config = true;
+		publication_fenced = race == 0;
+		fence_at_receipt_lock = race != 0;
+		UT_ASSERT_EQ(prepare_fixture_receipt(origin, 201, &handle), CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT(!handle.valid);
+		UT_ASSERT_EQ(memcmp(&before, &ctrc_participant_entries()[pi], sizeof(before)), 0);
+		UT_ASSERT_EQ(ctrc_participant_receipt_heads()[pi], 0);
+		for (uint64 i = 0; i < CtrcShared->receipt_entries; i++)
+			UT_ASSERT_EQ(ctrc_receipt_entries()[i].state, CTRC_RECEIPT_FREE);
+		if (!race)
+			UT_ASSERT_EQ(CtrcShared->global_journal_generation, journal);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_object_fence_retains_exact_duplicate_and_original_cancel)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcReceiptHandle first, duplicate, refused;
+	ClusterCtrcParticipantEntry before;
+	ClusterCtrcReceipt receipt;
+
+	reset_fixture();
+	origin = seed_origin(0, 1);
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 201, &first), CLUSTER_CTRC_PREPARE_READY);
+	before = *first.participant;
+	receipt = *first.receipt;
+	publication_fenced = true;
+	publication_revision++;
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 201, &duplicate), CLUSTER_CTRC_PREPARE_DUPLICATE);
+	UT_ASSERT_EQ(duplicate.receipt_index, first.receipt_index);
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 202, &refused), CLUSTER_CTRC_PREPARE_REFUSED);
+	UT_ASSERT(!refused.valid);
+	UT_ASSERT_EQ(memcmp(&before, first.participant, sizeof(before)), 0);
+	UT_ASSERT_EQ(memcmp(&receipt, first.receipt, sizeof(receipt)), 0);
+	for (unsigned kind = 0; kind < 4; kind++) {
+		ClusterCtrcParticipantIdentity identity = origin->touched[0];
+		ClusterCtrcPublicationIdV1 publication = receipt.publication;
+		ClusterCtrcTargetV1 target = receipt.target;
+		uint32 grant = origin->grant_generation;
+
+		publication.journal_sequence = publication.key_sequence
+			= publication.journal_slot_generation = 0;
+		if (kind == 0)
+			identity.boot_incarnation++;
+		if (kind == 1)
+			grant++;
+		if (kind == 2)
+			target.block_number++;
+		if (kind == 3)
+			publication.descriptor_hash++;
+		UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_shared(&origin->key, &identity, grant,
+														 &publication, &target, &refused),
+					 CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT(!refused.valid);
+		UT_ASSERT_EQ(memcmp(&before, first.participant, sizeof(before)), 0);
+		UT_ASSERT_EQ(memcmp(&receipt, first.receipt, sizeof(receipt)), 0);
+	}
+	UT_ASSERT(cluster_ctrc_receipt_cancel_shared(&first));
+	UT_ASSERT_EQ(first.receipt->state, CTRC_RECEIPT_CANCELLED);
+}
+
+UT_TEST(test_object_receipt_gate_does_not_change_private_or_other_tier)
+{
+	for (unsigned kind = 0; kind < 3; kind++) {
+		ClusterCtrcOriginEntry *origin;
+		ClusterCtrcReceiptHandle handle;
+
+		reset_fixture();
+		origin = seed_origin(0, 1);
+		publication_fenced = true;
+		cluster_shared_config = kind != 0;
+		publication_smgr = kind == 1 ? 0 : 1;
+		cluster_interconnect_tier = kind == 2 ? CLUSTER_IC_TIER_2 : CLUSTER_IC_TIER_1;
+		UT_ASSERT_EQ(prepare_fixture_receipt(origin, 201, &handle), CLUSTER_CTRC_PREPARE_READY);
+		UT_ASSERT(handle.valid);
+	}
 }
 
 static bool
@@ -2725,7 +2891,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(60);
+	UT_PLAN(63);
 	printf("# CTRC header_bytes=%zu total_bytes=%zu\n", sizeof(ClusterCtrcSharedHeader),
 		   capacity.total_bytes);
 	UT_RUN(test_new_seals_do_not_starve_old_pending);
@@ -2788,6 +2954,9 @@ main(void)
 	UT_RUN(test_cleaner_scope_current_is_local_and_expires_with_original_attempt);
 	UT_RUN(test_original_cleaner_driver_expires_read_scope_on_return_error_and_refusal);
 	UT_RUN(test_concurrent_original_discharge_does_not_end_running_cleaner_attempt);
+	UT_RUN(test_object_fence_refuses_new_receipt_without_publishing_participant);
+	UT_RUN(test_object_fence_retains_exact_duplicate_and_original_cancel);
+	UT_RUN(test_object_receipt_gate_does_not_change_private_or_other_tier);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

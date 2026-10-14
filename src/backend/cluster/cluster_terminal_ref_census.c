@@ -66,6 +66,7 @@
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/storage/cluster_undo_xlog.h"
+#include "cluster/storage/cluster_smgr.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_xid_stripe.h"
@@ -5122,6 +5123,40 @@ ctrc_receipt_prepare_locators_valid_locked(const ClusterCtrcTxnKeyV1 *key,
 	}
 	return true;
 }
+
+/* A fenced retry may retrieve an already accepted exact receipt, but it
+ * cannot open a participant or allocate another row. The caller has checked
+ * the original chain under participant -> receipt locks. */
+static ClusterCtrcPrepareResult
+ctrc_receipt_prepare_existing_locked(ClusterCtrcParticipantEntry *participant,
+									 uint64 participant_index, const ClusterCtrcTxnKeyV1 *key,
+									 const ClusterCtrcParticipantIdentity *identity,
+									 uint32 grant_generation,
+									 const ClusterCtrcPublicationIdV1 *publication,
+									 const ClusterCtrcTargetV1 *target, uint64 *receipt_index)
+{
+	uint64 cursor;
+
+	if (participant->state != CTRC_PARTICIPANT_OPEN
+		|| participant->grant_generation != grant_generation
+		|| memcmp(&participant->key, key, sizeof(*key)) != 0
+		|| memcmp(&participant->identity, identity, sizeof(*identity)) != 0
+		|| !ctrc_publication_prepare_valid(participant, publication, target))
+		return CLUSTER_CTRC_PREPARE_REFUSED;
+	for (cursor = ctrc_participant_receipt_heads()[participant_index]; cursor != 0;
+		 cursor = ctrc_receipt_links()[cursor - 1].next_plus_one) {
+		const ClusterCtrcReceipt *receipt = &ctrc_receipt_entries()[cursor - 1];
+
+		if (ctrc_receipt_publication_matches(receipt, key, publication)
+			&& memcmp(&receipt->target, target, sizeof(*target)) == 0
+			&& receipt->publication.journal_sequence != 0 && receipt->publication.key_sequence != 0
+			&& receipt->publication.journal_slot_generation != 0) {
+			*receipt_index = cursor - 1;
+			return CLUSTER_CTRC_PREPARE_DUPLICATE;
+		}
+	}
+	return CLUSTER_CTRC_PREPARE_REFUSED;
+}
 #endif
 
 static ClusterCtrcPrepareResult
@@ -5133,22 +5168,26 @@ ctrc_receipt_prepare_refused(bool invalid_namespace)
 	return CLUSTER_CTRC_PREPARE_REFUSED;
 }
 
-ClusterCtrcPrepareResult
-cluster_ctrc_receipt_prepare_shared(const ClusterCtrcTxnKeyV1 *key,
-									const ClusterCtrcParticipantIdentity *identity,
-									uint32 grant_generation,
-									const ClusterCtrcPublicationIdV1 *publication,
-									const ClusterCtrcTargetV1 *target,
-									ClusterCtrcReceiptHandle *handle)
-{
 #ifndef CLUSTER_CTRC_UNIT_TEST
+static ClusterCtrcPrepareResult
+ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
+									 const ClusterCtrcParticipantIdentity *identity,
+									 uint32 grant_generation,
+									 const ClusterCtrcPublicationIdV1 *publication,
+									 const ClusterCtrcTargetV1 *target,
+									 ClusterCtrcReceiptHandle *handle,
+									 const ClusterKoPeerAdmissionV3 *continuation)
+{
 	ClusterCtrcParticipantEntry *participant;
 	ClusterCtrcReceipt *receipts;
 	ClusterCtrcPrepareResult result;
 	uint64 participant_index;
 	uint64 receipt_index = UINT64_MAX;
-	uint64 journal_sequence;
-#endif
+	uint64 journal_sequence = 0;
+	ClusterKoPeerAdmissionV3 admission;
+	RelFileLocator locator;
+	bool check_object;
+	bool sampled = false;
 
 	if (handle != NULL)
 		MemSet(handle, 0, sizeof(*handle));
@@ -5157,12 +5196,24 @@ cluster_ctrc_receipt_prepare_shared(const ClusterCtrcTxnKeyV1 *key,
 	if (target != NULL
 		&& !ctrc_relation_namespace_valid(target->spc_oid, target->db_oid, target->rel_number))
 		return ctrc_receipt_prepare_refused(true);
-#ifndef CLUSTER_CTRC_UNIT_TEST
 	if (handle == NULL || identity == NULL || publication == NULL || target == NULL
 		|| cluster_node_id < 0 || identity->node_id != (uint16)cluster_node_id
 		|| !cluster_ctrc_shmem_ready()
-		|| !ctrc_participant_index(key, identity->node_id, &participant_index)
-		|| !ctrc_allocate_journal_sequence(&journal_sequence))
+		|| !ctrc_participant_index(key, identity->node_id, &participant_index))
+		return ctrc_receipt_prepare_refused(false);
+	locator = (RelFileLocator){ target->spc_oid, target->db_oid, target->rel_number };
+	check_object = cluster_shared_config && cluster_interconnect_tier == CLUSTER_IC_TIER_1
+				   && cluster_smgr_which_for(locator, InvalidBackendId) == 1;
+	if (check_object) {
+		if (continuation != NULL) {
+			admission = *continuation;
+			sampled = true;
+		} else
+			sampled = cluster_ko_peer_admission_begin_v3(locator, &admission);
+	}
+	/* No object lock may be acquired under the original CTRC locks. A
+	 * refused sample only looks for an exact already accepted duplicate. */
+	if ((!check_object || sampled) && !ctrc_allocate_journal_sequence(&journal_sequence))
 		return ctrc_receipt_prepare_refused(false);
 
 	participant = &ctrc_participant_entries()[participant_index];
@@ -5173,6 +5224,17 @@ cluster_ctrc_receipt_prepare_shared(const ClusterCtrcTxnKeyV1 *key,
 		|| !ctrc_receipt_prepare_locators_valid_locked(key, publication)) {
 		participant->state = CTRC_PARTICIPANT_BLOCKED;
 		result = CLUSTER_CTRC_PREPARE_REFUSED;
+	} else if (check_object
+			   && (!sampled
+				   || (continuation != NULL
+						   ? admission.extension_serial != 0
+								 || !cluster_ko_peer_read_current_v3(
+									 &admission, locator, (ForkNumber)target->fork_number,
+									 target->block_number)
+						   : !cluster_ko_peer_admission_current_v3(&admission, locator)))) {
+		result = ctrc_receipt_prepare_existing_locked(participant, participant_index, key, identity,
+													  grant_generation, publication, target,
+													  &receipt_index);
 	} else {
 		result = cluster_ctrc_receipt_prepare_table_locked(
 			participant, key, identity, grant_generation, publication, target, receipts,
@@ -5205,12 +5267,30 @@ cluster_ctrc_receipt_prepare_shared(const ClusterCtrcTxnKeyV1 *key,
 	else if (result == CLUSTER_CTRC_PREPARE_REFUSED)
 		return ctrc_receipt_prepare_refused(false);
 	return result;
+}
+#endif
+
+ClusterCtrcPrepareResult
+cluster_ctrc_receipt_prepare_shared(const ClusterCtrcTxnKeyV1 *key,
+									const ClusterCtrcParticipantIdentity *identity,
+									uint32 grant_generation,
+									const ClusterCtrcPublicationIdV1 *publication,
+									const ClusterCtrcTargetV1 *target,
+									ClusterCtrcReceiptHandle *handle)
+{
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	return ctrc_receipt_prepare_shared_internal(key, identity, grant_generation, publication,
+												target, handle, NULL);
 #else
+	if (handle != NULL)
+		MemSet(handle, 0, sizeof(*handle));
+	if (target != NULL
+		&& !ctrc_relation_namespace_valid(target->spc_oid, target->db_oid, target->rel_number))
+		return ctrc_receipt_prepare_refused(true);
 	(void)key;
 	(void)identity;
 	(void)grant_generation;
 	(void)publication;
-	(void)target;
 	return ctrc_receipt_prepare_refused(false);
 #endif
 }
@@ -7789,6 +7869,10 @@ ctrc_cleaner_cancel_successor_receipts(ClusterCtrcReceiptHandle *handles, const 
 			(void)cluster_ctrc_receipt_cancel_shared(&handles[i]);
 }
 
+/* A private call site, not an admission API for arbitrary publishers. */
+static bool ctrc_cleaner_successor_admission(const ClusterCtrcReceipt *predecessor,
+											 ClusterKoPeerAdmissionV3 *sample);
+
 static bool
 ctrc_cleaner_prepare_current_mx_successor(
 	const ClusterCtrcReceipt *predecessor, const CtrcCleanerCurrentMxCapture *capture,
@@ -7809,12 +7893,22 @@ ctrc_cleaner_prepare_current_mx_successor(
 	uint16 prepared_count = 0;
 	uint16 i;
 	int successor_origin;
+	ClusterKoPeerAdmissionV3 admission;
+	bool check_object;
 
 	if (predecessor == NULL || capture == NULL || members == NULL || proofs == NULL
 		|| proof_capability_generations == NULL || plan == NULL || planned_header == NULL
 		|| successor_target == NULL || transfer == NULL
 		|| plan->kind != CTRC_CURRENT_MX_REWRITE_SUCCESSOR || plan->survivor_count == 0
-		|| plan->survivor_count > nmembers
+		|| plan->survivor_count > nmembers)
+		return false;
+	check_object = cluster_shared_config && cluster_interconnect_tier == CLUSTER_IC_TIER_1
+				   && cluster_smgr_which_for((RelFileLocator){ predecessor->target.spc_oid,
+															   predecessor->target.db_oid,
+															   predecessor->target.rel_number },
+											 InvalidBackendId)
+						  == 1;
+	if ((check_object && !ctrc_cleaner_successor_admission(predecessor, &admission))
 		|| !ctrc_allocate_journal_sequence(&successor_operation_id))
 		return false;
 	MemSet(handles, 0, sizeof(handles));
@@ -7917,8 +8011,9 @@ ctrc_cleaner_prepare_current_mx_successor(
 		publication.reference_kind = CTRC_REF_RECOMPOSED_SURVIVOR;
 		publication.target_kind = CTRC_TARGET_PAGE_PENDING_OFFNUM;
 		publication.grant_generation = grant;
-		prepare_result = cluster_ctrc_receipt_prepare_shared(
-			&key, &participant, grant, &publication, &pending_target, &handles[prepared_count]);
+		prepare_result = ctrc_receipt_prepare_shared_internal(
+			&key, &participant, grant, &publication, &pending_target, &handles[prepared_count],
+			check_object ? &admission : NULL);
 		if (prepare_result != CLUSTER_CTRC_PREPARE_READY
 			&& prepare_result != CLUSTER_CTRC_PREPARE_DUPLICATE)
 			goto successor_failed;
@@ -8744,6 +8839,33 @@ ctrc_cleaner_read_scope_target(RelFileLocator locator, ForkNumber fork, BlockNum
 		   && locator.dbOid == target->db_oid && locator.relNumber == target->rel_number
 		   && ((fork == target->fork_number && block == target->block_number)
 			   || (fork == SPACE_FORKNUM && block == 0));
+}
+
+/* Only the original validated current-MX successor producer can use this
+ * sample. It is bound to the entire selected APPLIED receipt and the finite
+ * registered attempt, not merely the cleaner role or a reference-kind bit.
+ * Original member/TT proof, PREPARE/APPLY, descriptor flush and final page
+ * recheck remain mandatory. No object/CTRC lock crosses the sample. */
+static bool
+ctrc_cleaner_successor_admission(const ClusterCtrcReceipt *predecessor,
+								 ClusterKoPeerAdmissionV3 *sample)
+{
+	RelFileLocator locator;
+
+	if (predecessor == NULL || !CtrcReadScope.active
+		|| memcmp(predecessor, &CtrcReadScope.receipt, sizeof(*predecessor)) != 0
+		|| predecessor->target.kind != CTRC_TARGET_EXACT_TID
+		|| predecessor->state != CTRC_RECEIPT_APPLIED)
+		return false;
+	locator = (RelFileLocator){ predecessor->target.spc_oid, predecessor->target.db_oid,
+								predecessor->target.rel_number };
+	if (!ctrc_cleaner_read_scope_target(locator, (ForkNumber)predecessor->target.fork_number,
+										predecessor->target.block_number)
+		|| !cluster_ko_peer_read_begin_v3(locator, (ForkNumber)predecessor->target.fork_number,
+										  predecessor->target.block_number, sample)
+		|| sample->extension_serial != 0)
+		return false;
+	return true;
 }
 
 static bool

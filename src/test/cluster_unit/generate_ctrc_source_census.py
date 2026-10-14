@@ -114,7 +114,7 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/cluster/cluster_ko_lock.c",
             "src/backend/storage/smgr/smgr.c",
         ),
-        r"\b(?:cluster_ko_flush_and_wait_ack|ko_flush_and_wait_ack|cluster_ko_shared_begin_v2|RelationDropStorage|RelationTruncate|smgrdounlinkall|smgrtruncate2|KO_FLUSH_ACK_DONE)\b",
+        r"\b(?:cluster_ko_flush_and_wait_ack(?:_relation)?|ko_flush_and_wait_ack|cluster_ko_shared_begin_v2|ko_shared_begin_v3|RelationDropStorage|RelationTruncate|smgrdounlinkall|smgrtruncate2|KO_FLUSH_ACK_DONE)\b",
     ),
     ScanRule(
         "ITL_TERMINAL_DISCHARGE",
@@ -210,7 +210,7 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/cluster/cluster_terminal_ref_census.c",
             "src/backend/cluster/cluster_undo_record.c",
         ),
-        r"\bcluster_ctrc_receipt_(?:prepare_shared|apply_shared|retarget_itl_shared|cancel_shared|discharge_itl_shared)\s*\(",
+        r"\b(?:cluster_ctrc_receipt_(?:prepare_shared|apply_shared|retarget_itl_shared|cancel_shared|discharge_itl_shared)|ctrc_receipt_prepare_shared_internal)\s*\(",
     ),
     ScanRule(
         "CTRC_CLOSE_WIRE",
@@ -352,7 +352,11 @@ _classify_owners(
 _classify_owners(
     "CTRC_RECEIPT_LIFECYCLE",
     "src/backend/cluster/cluster_terminal_ref_census.c",
-    ("cluster_ctrc_receipt_apply_shared", "cluster_ctrc_receipt_prepare_shared"),
+    (
+        "cluster_ctrc_receipt_apply_shared",
+        "cluster_ctrc_receipt_prepare_shared",
+        "ctrc_receipt_prepare_shared_internal",
+    ),
     "REGISTERED_REFERENCE",
     "ALL_CTRC_REFERENCE_KINDS",
     "ALL_CTRC_TARGET_KINDS",
@@ -1049,8 +1053,10 @@ _classify_owners(
         "cluster_ko_drain_inbound_and_apply",
         "cluster_ko_flush_ack_handler",
         "cluster_ko_flush_and_wait_ack",
+        "cluster_ko_flush_and_wait_ack_relation",
         "ko_flush_and_wait_ack",
         "cluster_ko_shared_begin_v2",
+        "ko_shared_begin_v3",
     ),
     "SUCCESSOR_BEFORE_PREDECESSOR",
     "ALL_CTRC_REFERENCE_KINDS",
