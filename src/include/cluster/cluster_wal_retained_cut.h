@@ -84,6 +84,15 @@ typedef struct ClusterWalRetainedCutV1 {
 	 * running or restarted instance still refers to them. */
 	uint32 unneeded_generations;
 	ClusterControlRootIdentity unneeded[CLUSTER_WAL_RETAINED_UNNEEDED_MAX];
+	/* Read-only D1 coverage observations.  These counters never authorize a
+	 * cut, replay, or service state; zero means only that this input had no
+	 * observed record of that shape. */
+	uint64 native_smgr_create_records;
+	uint64 native_xact_invalidation_records;
+	uint64 native_xact_assignment_records;
+	uint64 native_dropped_stats_records;
+	uint64 native_dropped_stats_items;
+	uint32 native_effects_incomplete;
 } ClusterWalRetainedCutV1;
 
 /*

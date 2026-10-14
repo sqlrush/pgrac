@@ -52,11 +52,12 @@ UT_DEFINE_GLOBALS();
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
 	UT_RUN(test_records_commit_tombstone_pins_its_source);
 	UT_RUN(test_records_commit_with_invalidations_is_classified);
 	UT_RUN(test_records_abort_with_relations_pins_its_source);
 	UT_RUN(test_records_native_smgr_create_and_truncate);
+	UT_RUN(test_records_native_effect_coverage_is_read_only);
 	UT_RUN(test_records_foreign_source_pins_only_itself);
 	UT_RUN(test_records_unknown_native_record_still_refuses);
 	UT_RUN(test_records_short_abort_does_not_advance_retention);

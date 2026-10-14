@@ -165,6 +165,50 @@ UT_TEST(test_records_native_smgr_create_and_truncate)
 	}
 }
 
+/* D1 coverage is observable without turning a native record into a proof:
+ * CREATE, standalone invalidation/assignment and dropped-stats items are
+ * counted independently of the retention bound. */
+UT_TEST(test_records_native_effect_coverage_is_read_only)
+{
+	uint32 self, peer;
+	ClusterWalRetainedCutV1 cut;
+	RfPageProofDetailV1 detail;
+	RealRecord *r;
+	xl_xact_commit commit = { 0 };
+	xl_xact_xinfo xinfo = { 0 };
+	xl_xact_stats_item stat = { 1, 5, 6 };
+	int nstats = 1;
+
+	rec_two_writers(&self, &peer);
+	rec_smgr(self, 0x1400, 0x1440, false, 16501);
+	r = record_new(self, RM_XACT_ID, XLOG_XACT_INVALIDATIONS, 801, 0x1500, 0x1540);
+	record_append(r, &(int){ 0 }, sizeof(int));
+	r = record_new(self, RM_XACT_ID, XLOG_XACT_ASSIGNMENT, 801, 0x1600, 0x1640);
+	{
+		xl_xact_assignment assignment = { 801, 1 };
+		TransactionId sub = 802;
+		record_append(r, &assignment, MinSizeOfXactAssignment);
+		record_append(r, &sub, sizeof(sub));
+	}
+	r = record_new(self, RM_XACT_ID, XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO, 803, 0x1700, 0x1740);
+	commit.xact_time = 1;
+	xinfo.xinfo = XACT_XINFO_HAS_DROPPED_STATS;
+	record_append(r, &commit, sizeof(commit));
+	record_append(r, &xinfo, sizeof(xinfo));
+	record_append(r, &nstats, sizeof(nstats));
+	record_append(r, &stat, sizeof(stat));
+	UT_ASSERT_EQ(compute_for(self, &cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(cut.native_smgr_create_records, 1);
+	UT_ASSERT_EQ(cut.native_xact_invalidation_records, 1);
+	UT_ASSERT_EQ(cut.native_xact_assignment_records, 1);
+	UT_ASSERT_EQ(cut.native_dropped_stats_records, 1);
+	UT_ASSERT_EQ(cut.native_dropped_stats_items, 1);
+	UT_ASSERT_EQ(cut.native_effects_incomplete, 0);
+	if (ut_current_failed)
+		printf("# native effect coverage must remain observational\n");
+}
+
 /* A record of another node's source is classified the same way and bounds
  * that source only. */
 UT_TEST(test_records_foreign_source_pins_only_itself)
@@ -335,7 +379,8 @@ UT_TEST(test_pi_pin_removal_keeps_independent_side_and_structure)
 		UT_ASSERT_EQ(compute_for(self, &after, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 		UT_ASSERT_EQ(after.local_pi_bounded, 0);
 		UT_ASSERT_EQ(after.lower, 0x1800);
-		UT_ASSERT_EQ(after.pin, structure ? CLUSTER_WAL_RETAINED_PIN_STRUCTURE : CLUSTER_WAL_RETAINED_PIN_SIDE);
+		UT_ASSERT_EQ(after.pin, structure ? CLUSTER_WAL_RETAINED_PIN_STRUCTURE
+										  : CLUSTER_WAL_RETAINED_PIN_SIDE);
 		UT_ASSERT(after.lower < after.native_redo);
 	}
 }
