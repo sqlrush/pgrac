@@ -121,6 +121,8 @@ static char last_error[256];
 static int last_error_level;
 static unsigned reservations;
 static bool reservation_refused, invalidate_on_reserve;
+static unsigned copy_storage_checks;
+static bool refuse_copy_storage;
 
 bool fixture_copy_reserve(const ClusterSpaceIdentity *id, BlockNumber first, uint32 count);
 
@@ -572,9 +574,22 @@ errdetail(const char *fmt, ...)
 }
 
 /* Exact original buffer-copy body, not a fixture reimplementation. */
+static void
+fixture_copy_storage_check(RelFileLocator locator, char persistence, const char *operation)
+{
+	UT_ASSERT(RelFileLocatorEquals(locator, destination.smgr_rlocator.locator));
+	UT_ASSERT_EQ(persistence, RELPERSISTENCE_PERMANENT);
+	UT_ASSERT(strcmp(operation, "copy") == 0);
+	copy_storage_checks++;
+	if (refuse_copy_storage)
+		longjmp(error_jump, 1);
+}
+
+#define RelationCheckStorageTransaction fixture_copy_storage_check
 #define cluster_space_reserve_exact fixture_copy_reserve
 #include "test_cluster_space_copy_buffer.inc"
 #undef cluster_space_reserve_exact
+#undef RelationCheckStorageTransaction
 
 static void
 reset(ForkNumber forknum)
@@ -628,6 +643,8 @@ reset(ForkNumber forknum)
 	old_wal = new_wal = edges = writes = syncs = flushes = space_reads = 0;
 	reservations = 0;
 	reservation_refused = invalidate_on_reserve = false;
+	copy_storage_checks = 0;
+	refuse_copy_storage = false;
 	cluster_shared_config = true;
 	test_fork = forknum;
 	token = 99;
@@ -770,6 +787,37 @@ UT_TEST(test_buffer_copy_records_real_unformatted_predecessor)
 	UT_ASSERT_EQ(syncs, 0);
 	UT_ASSERT_EQ(strategies, 0);
 	UT_ASSERT(!data_pins[0] && !data_pins[1] && !pinned && !locked);
+}
+
+UT_TEST(test_buffer_copy_checks_storage_eligibility_before_io)
+{
+	reset(MAIN_FORKNUM);
+	buffered = true;
+	RelationCopyStorageUsingBuffer(source.smgr_rlocator.locator, destination.smgr_rlocator.locator,
+								   test_fork, true);
+	UT_ASSERT_EQ(copy_storage_checks, 1);
+	UT_ASSERT_EQ(space_reads, 1);
+	UT_ASSERT_EQ(writes, 1);
+}
+
+UT_TEST(test_buffer_copy_refusal_has_no_storage_effect)
+{
+	volatile bool caught = false;
+
+	reset(MAIN_FORKNUM);
+	buffered = true;
+	refuse_copy_storage = expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		RelationCopyStorageUsingBuffer(source.smgr_rlocator.locator,
+									   destination.smgr_rlocator.locator, test_fork, true);
+		UT_ASSERT(false);
+	} else
+		caught = true;
+	expecting_error = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(copy_storage_checks, 1);
+	UT_ASSERT_EQ(space_reads, 0);
+	UT_ASSERT_EQ(writes + new_wal + dirties + reservations, 0);
 }
 
 UT_TEST(test_nonshared_buffer_copy_keeps_native_path)
@@ -1115,7 +1163,7 @@ UT_TEST(test_resident_broken_owner_panics_before_unlock)
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(23);
 	UT_RUN(test_resident_init_and_copy_bind_the_first_record);
 	UT_RUN(test_resident_capture_loss_keeps_unknown_first);
 	UT_RUN(test_resident_broken_owner_panics_before_unlock);
@@ -1130,6 +1178,8 @@ main(void)
 	UT_RUN(test_copy_refusal_leaves_page_and_output_unchanged);
 	UT_RUN(test_native_copy_reopens_handles_after_identity_buffer_read);
 	UT_RUN(test_buffer_copy_records_real_unformatted_predecessor);
+	UT_RUN(test_buffer_copy_checks_storage_eligibility_before_io);
+	UT_RUN(test_buffer_copy_refusal_has_no_storage_effect);
 	UT_RUN(test_nonshared_buffer_copy_keeps_native_path);
 	UT_RUN(test_buffer_copy_vm_and_fsm_classes);
 	UT_RUN(test_buffer_refusal_never_changes_target_or_emits_wal);

@@ -11054,6 +11054,17 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 #endif
 
 	/*
+	 * The buffered builder is an independent physical producer.  Apply the
+	 * same transaction/object eligibility gate as RelationCopyStorage before
+	 * reading the source size or extending the destination.  In particular,
+	 * an internal DDL subtransaction must not create a destination fork and
+	 * only fail later in its SPACE/WAL owner.  The gate is a no-op for private,
+	 * temporary, and disabled storage, preserving their native semantics.
+	 */
+	RelationCheckStorageTransaction(
+		dstlocator, permanent ? RELPERSISTENCE_PERMANENT : RELPERSISTENCE_UNLOGGED, "copy");
+
+	/*
 	 * In general, we want to write WAL whenever wal_level > 'minimal', but we
 	 * can skip it when copying any fork of an unlogged relation other than
 	 * the init fork.
