@@ -476,10 +476,15 @@ UT_TEST(test_rdma_truncate_preflights_explicit_and_cascade_before_triggers)
 static PGAlignedBlock owned_rows[3];
 static HeapTupleData owned_tuples[3];
 static unsigned owned_next, owned_acl_effects, owned_policy_effects;
+static unsigned owned_visible_rows = 3;
+static bool owned_publish_on_close;
 
 void
 table_close(Relation rel, LOCKMODE lockmode)
-{}
+{
+	if (owned_publish_on_close)
+		owned_visible_rows = 3;
+}
 bool
 IsPinnedObject(Oid classid, Oid objectid)
 {
@@ -502,7 +507,7 @@ systable_beginscan(Relation rel, Oid index, bool indexok, Snapshot snap, int nke
 HeapTuple
 systable_getnext(SysScanDesc scan)
 {
-	return owned_next < lengthof(owned_tuples) ? &owned_tuples[owned_next++] : NULL;
+	return owned_next < owned_visible_rows ? &owned_tuples[owned_next++] : NULL;
 }
 bool
 systable_recheck_tuple(SysScanDesc scan, HeapTuple tuple)
@@ -562,6 +567,32 @@ performMultipleDeletions(const ObjectAddresses *objects, DropBehavior behavior, 
 }
 #include "test_cluster_storage_owned_gate.inc"
 
+static void
+reset_owned_rows(void)
+{
+	memset(owned_rows, 0, sizeof(owned_rows));
+	for (int i = 0; i < 3; i++) {
+		Form_pg_shdepend row;
+		owned_tuples[i].t_data = (HeapTupleHeader)owned_rows[i].data;
+		owned_tuples[i].t_data->t_hoff = MAXALIGN(SizeofHeapTupleHeader);
+		row = (Form_pg_shdepend)GETSTRUCT(&owned_tuples[i]);
+		row->dbid = MyDatabaseId;
+		row->classid = i == 1 ? PolicyRelationId : RelationRelationId;
+		row->objid = 9101;
+		row->deptype = i == 0	? SHARED_DEPENDENCY_ACL
+					   : i == 1 ? SHARED_DEPENDENCY_POLICY
+								: SHARED_DEPENDENCY_OWNER;
+	}
+	memset(deletion_relations, 0, sizeof(deletion_relations));
+	memset(deletion_forms, 0, sizeof(deletion_forms));
+	deletion_relations[1].rd_locator = locator;
+	deletion_relations[1].rd_rel = &deletion_forms[1];
+	deletion_forms[1].relkind = RELKIND_RELATION;
+	deletion_forms[1].relpersistence = RELPERSISTENCE_PERMANENT;
+	owned_visible_rows = 3;
+	owned_publish_on_close = false;
+}
+
 UT_TEST(test_rdma_drop_owned_refuses_before_acl_or_policy_changes)
 {
 	for (int tier = CLUSTER_IC_TIER_2; tier <= CLUSTER_IC_TIER_3; tier++) {
@@ -570,25 +601,7 @@ UT_TEST(test_rdma_drop_owned_refuses_before_acl_or_policy_changes)
 		reset();
 		cluster_interconnect_tier = tier;
 		owned_acl_effects = owned_policy_effects = deletion_effects = deletion_events = 0;
-		memset(owned_rows, 0, sizeof(owned_rows));
-		for (int i = 0; i < 3; i++) {
-			Form_pg_shdepend row;
-			owned_tuples[i].t_data = (HeapTupleHeader)owned_rows[i].data;
-			owned_tuples[i].t_data->t_hoff = MAXALIGN(SizeofHeapTupleHeader);
-			row = (Form_pg_shdepend)GETSTRUCT(&owned_tuples[i]);
-			row->dbid = MyDatabaseId;
-			row->classid = i == 1 ? PolicyRelationId : RelationRelationId;
-			row->objid = 9101;
-			row->deptype = i == 0	? SHARED_DEPENDENCY_ACL
-						   : i == 1 ? SHARED_DEPENDENCY_POLICY
-									: SHARED_DEPENDENCY_OWNER;
-		}
-		memset(deletion_relations, 0, sizeof(deletion_relations));
-		memset(deletion_forms, 0, sizeof(deletion_forms));
-		deletion_relations[1].rd_locator = locator;
-		deletion_relations[1].rd_rel = &deletion_forms[1];
-		deletion_forms[1].relkind = RELKIND_RELATION;
-		deletion_forms[1].relpersistence = RELPERSISTENCE_PERMANENT;
+		reset_owned_rows();
 		expecting_error = true;
 		PG_TRY();
 		{
@@ -614,6 +627,34 @@ UT_TEST(test_rdma_drop_owned_refuses_before_acl_or_policy_changes)
 	}
 }
 
+UT_TEST(test_drop_owned_executes_only_its_checked_workset)
+{
+	List *roles = list_make1_oid(9200);
+	volatile bool caught = false;
+	reset();
+	cluster_interconnect_tier = CLUSTER_IC_TIER_2;
+	owned_acl_effects = owned_policy_effects = deletion_effects = deletion_events = 0;
+	reset_owned_rows();
+	owned_visible_rows = 1;		   /* ACL only at the first catalog snapshot. */
+	owned_publish_on_close = true; /* New policy + shared table commit after it. */
+	expecting_error = true;
+	PG_TRY();
+	{
+		shdepDropOwned(roles, DROP_CASCADE);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(!caught);
+	UT_ASSERT_EQ(owned_acl_effects, 1);
+	UT_ASSERT_EQ(owned_policy_effects + deletion_effects + deletion_events, 0);
+	owned_publish_on_close = false;
+	owned_visible_rows = 3;
+	list_free(roles);
+}
+
 UT_TEST(test_storage_drain_tier_gate_preserves_temp_private_and_disabled)
 {
 	for (int tier = CLUSTER_IC_TIER_2; tier <= CLUSTER_IC_TIER_3; tier++) {
@@ -636,7 +677,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(13);
+	UT_PLAN(14);
 	UT_RUN(test_child_create_refuses_before_storage_or_abort_owner);
 	UT_RUN(test_child_drop_refuses_before_ko_or_pending_delete);
 	UT_RUN(test_child_truncate_refuses_before_flush_or_structure);
@@ -649,6 +690,7 @@ main(void)
 	UT_RUN(test_rdma_drop_preflights_whole_dependency_list_before_first_deletion);
 	UT_RUN(test_rdma_truncate_preflights_explicit_and_cascade_before_triggers);
 	UT_RUN(test_rdma_drop_owned_refuses_before_acl_or_policy_changes);
+	UT_RUN(test_drop_owned_executes_only_its_checked_workset);
 	UT_RUN(test_storage_drain_tier_gate_preserves_temp_private_and_disabled);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;

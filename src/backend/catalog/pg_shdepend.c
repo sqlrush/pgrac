@@ -1302,8 +1302,22 @@ shdepDropOwnedInternal(List *roleids, DropBehavior behavior, bool check_storage_
 	Relation	sdepRel;
 	ListCell   *cell;
 	ObjectAddresses *deleteobjs;
+	ObjectAddresses *checkobjs = NULL;
+	List *effects = NIL;
+	bool check_storage = check_storage_only;
+	typedef struct DropOwnedEffect {
+		Oid roleid;
+		ObjectAddress object;
+		bool policy;
+	} DropOwnedEffect;
 
+#ifdef USE_PGRAC_CLUSTER
+	check_storage
+		|= cluster_storage_mode_enabled() && cluster_interconnect_tier != CLUSTER_IC_TIER_1;
+#endif
 	deleteobjs = new_object_addresses();
+	if (check_storage)
+		checkobjs = new_object_addresses();
 
 	/*
 	 * We don't need this strong a lock here, but we'll call routines that
@@ -1376,7 +1390,7 @@ shdepDropOwnedInternal(List *roleids, DropBehavior behavior, bool check_storage_
 					 * Try to remove role from policy; if unable to, remove
 					 * policy.
 					 */
-					if (check_storage_only
+					if (check_storage
 						|| !RemoveRoleFromObjectPolicy(roleid, sdepForm->classid,
 													   sdepForm->objid)) {
 						obj.classId = sdepForm->classid;
@@ -1395,7 +1409,15 @@ shdepDropOwnedInternal(List *roleids, DropBehavior behavior, bool check_storage_
 							ReleaseDeletionLock(&obj);
 							break;
 						}
-						add_exact_object_address(&obj, deleteobjs);
+						if (check_storage) {
+							DropOwnedEffect *effect = palloc(sizeof(*effect));
+							effect->roleid = roleid;
+							effect->object = obj;
+							effect->policy = true;
+							effects = lappend(effects, effect);
+							add_exact_object_address(&obj, checkobjs);
+						} else
+							add_exact_object_address(&obj, deleteobjs);
 					}
 					break;
 				case SHARED_DEPENDENCY_ACL:
@@ -1410,7 +1432,14 @@ shdepDropOwnedInternal(List *roleids, DropBehavior behavior, bool check_storage_
 					 */
 					if (sdepForm->classid != AuthMemRelationId)
 					{
-						if (!check_storage_only)
+						if (check_storage) {
+							DropOwnedEffect *effect = palloc(sizeof(*effect));
+							effect->roleid = roleid;
+							effect->object = (ObjectAddress){ sdepForm->classid, sdepForm->objid,
+															  sdepForm->objsubid };
+							effect->policy = false;
+							effects = lappend(effects, effect);
+						} else
 							RemoveRoleFromObjectACL(roleid, sdepForm->classid, sdepForm->objid);
 						break;
 					}
@@ -1437,12 +1466,38 @@ shdepDropOwnedInternal(List *roleids, DropBehavior behavior, bool check_storage_
 							break;
 						}
 						add_exact_object_address(&obj, deleteobjs);
+						if (check_storage)
+							add_exact_object_address(&obj, checkobjs);
 					}
 					break;
 			}
 		}
 
 		systable_endscan(scan);
+	}
+
+	/* Execute exactly this scan's work. A separate pre-scan cannot freeze
+	 * the role's dependency set: another transaction may publish new rows
+	 * before the execution scan. Keep ACL/policy effects deferred until all
+	 * candidate deletions and their locked dependency closure have passed. */
+	if (check_storage) {
+		sort_object_addresses(checkobjs);
+		performMultipleDeletions(checkobjs, behavior,
+								 PERFORM_DELETION_CHECK_STORAGE_ONLY | PERFORM_DELETION_QUIETLY);
+		if (!check_storage_only) {
+			foreach (cell, effects) {
+				DropOwnedEffect *effect = lfirst(cell);
+				if (effect->policy) {
+					if (!RemoveRoleFromObjectPolicy(effect->roleid, effect->object.classId,
+													effect->object.objectId))
+						add_exact_object_address(&effect->object, deleteobjs);
+				} else
+					RemoveRoleFromObjectACL(effect->roleid, effect->object.classId,
+											effect->object.objectId);
+			}
+		}
+		list_free_deep(effects);
+		free_object_addresses(checkobjs);
 	}
 
 	/*
@@ -1454,9 +1509,8 @@ shdepDropOwnedInternal(List *roleids, DropBehavior behavior, bool check_storage_
 	sort_object_addresses(deleteobjs);
 
 	/* the dependency mechanism does the actual work */
-	performMultipleDeletions(
-		deleteobjs, behavior,
-		check_storage_only ? PERFORM_DELETION_CHECK_STORAGE_ONLY | PERFORM_DELETION_QUIETLY : 0);
+	if (!check_storage_only)
+		performMultipleDeletions(deleteobjs, behavior, 0);
 
 	table_close(sdepRel, RowExclusiveLock);
 
@@ -1472,10 +1526,6 @@ shdepCheckOwnedStorageDrop(List *roleids, DropBehavior behavior)
 void
 shdepDropOwned(List *roleids, DropBehavior behavior)
 {
-#ifdef USE_PGRAC_CLUSTER
-	if (cluster_storage_mode_enabled() && cluster_interconnect_tier != CLUSTER_IC_TIER_1)
-		shdepCheckOwnedStorageDrop(roleids, behavior);
-#endif
 	shdepDropOwnedInternal(roleids, behavior, false);
 }
 
