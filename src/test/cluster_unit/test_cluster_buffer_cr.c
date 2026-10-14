@@ -55,6 +55,7 @@ bool cluster_read_scache = true;
 bool cluster_recmerge_window_active;
 int cluster_pcm_grd_max_entries;
 ClusterConf *ClusterConfShmem;
+static ClusterConf pcm_conf;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 
@@ -81,6 +82,8 @@ static bool close_at_mapping;
 static bool collision_at_mapping;
 static unsigned ko_samples, local_pins;
 static BufferDesc local_descriptor;
+static int32 local_refcounts[1];
+int32 *LocalRefCount = local_refcounts;
 static BufferTag waiting_tag;
 
 bool
@@ -211,6 +214,14 @@ cluster_ko_peer_read_current_v3(const ClusterKoPeerAdmissionV3 *sample, RelFileL
 			   || (ko_cleaner_allowed && sample->fork == fork && sample->block == block));
 }
 
+bool
+cluster_ko_peer_current_valid_v3(const ClusterKoCurrentAdmissionV3 *sample, RelFileLocator locator,
+								 ForkNumber fork, BlockNumber block)
+{
+	return sample != NULL && sample->target.fork == fork && sample->target.block == block
+		   && cluster_ko_peer_read_current_v3(&sample->target, locator, fork, block);
+}
+
 WritebackContext BackendWritebackContext;
 
 typedef struct PrivateRefCountEntry PrivateRefCountEntry;
@@ -221,6 +232,7 @@ static void ReservePrivateRefCountEntry(void);
 static bool PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy);
 static void PinBuffer_Locked(BufferDesc *buf);
 static inline bool cluster_bufmgr_should_pcm_track(BufferDesc *buf);
+static void cluster_bufmgr_ko_remember_pin(BufferDesc *buf, const ClusterKoPeerAdmissionV3 *sample);
 static uint32 WaitBufHdrUnlocked(BufferDesc *buf);
 static Buffer GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context);
 #define BufHdrGetBlock(buf) ((Block)(BufferBlocks + (Size)(buf)->buf_id * BLCKSZ))
@@ -329,6 +341,11 @@ StrategyFreeBuffer(BufferDesc *buf)
 	frees++;
 }
 
+#define BufferIsPinned(buffer)                                                                     \
+	(!BufferIsValid(buffer)	 ? false                                                               \
+	 : BufferIsLocal(buffer) ? LocalRefCount[-(buffer) - 1] > 0                                    \
+							 : GetPrivateRefCount(buffer) > 0)
+
 static int32
 GetPrivateRefCount(Buffer buffer)
 {
@@ -433,35 +450,36 @@ pg_re_throw(void)
 
 #include "test_cluster_buffer_cr_pins.inc"
 
-static PrivateRefCountEntry private_refs[64];
+#define REFCOUNT_ARRAY_ENTRIES 8
+static PrivateRefCountEntry PrivateRefCountArray[REFCOUNT_ARRAY_ENTRIES];
+static PrivateRefCountEntry private_hash[64];
+static bool private_hash_used[64];
+static HTAB *PrivateRefCountHash = (HTAB *)private_hash;
+static PrivateRefCountEntry *ReservedRefCountEntry;
+static int32 PrivateRefCountOverflowed;
+static uint32 PrivateRefCountClock;
 
-static PrivateRefCountEntry *
-GetPrivateRefCountEntry(Buffer buffer, bool do_move pg_attribute_unused())
+/* Storage only: refcount spill, restore, reservation and retirement execute
+ * the original private-reference implementation below. */
+void *
+hash_search(HTAB *table, const void *key, HASHACTION action, bool *found)
 {
-	return private_refs[buffer - 1].buffer == buffer ? &private_refs[buffer - 1] : NULL;
+	Buffer buffer = *(const Buffer *)key;
+	unsigned i = buffer - 1;
+	UT_ASSERT(table == PrivateRefCountHash && buffer > 0 && i < lengthof(private_hash));
+	if (found != NULL)
+		*found = private_hash_used[i];
+	if (!private_hash_used[i] && action != HASH_ENTER)
+		return NULL;
+	if (!private_hash_used[i]) {
+		memset(&private_hash[i], 0, sizeof(private_hash[i]));
+		private_hash[i].buffer = buffer;
+	}
+	private_hash_used[i] = action != HASH_REMOVE;
+	return &private_hash[i];
 }
 
-static PrivateRefCountEntry *
-NewPrivateRefCountEntry(Buffer buffer)
-{
-	PrivateRefCountEntry *ref = &private_refs[buffer - 1];
-	UT_ASSERT_EQ(ref->buffer, InvalidBuffer);
-	ref->buffer = buffer;
-	return ref;
-}
-
-static void
-ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref)
-{
-	memset(ref, 0, sizeof(*ref));
-}
-
-static void
-ReservePrivateRefCountEntry(void)
-{
-	/* Only private refcount allocation is mocked; pin CAS/owner accounting
-	 * below execute the original PinBuffer/UnpinBuffer functions. */
-}
+#include "test_cluster_buffer_cr_refs.inc"
 
 static uint32
 WaitBufHdrUnlocked(BufferDesc *buf pg_attribute_unused())
@@ -492,6 +510,13 @@ void
 CheckBufferIsPinnedOnce(Buffer buffer)
 {
 	UT_ASSERT_EQ(private_pin[buffer - 1], 1);
+}
+
+void
+LockBuffer(Buffer buffer, int mode)
+{
+	UT_ASSERT(mode == BUFFER_LOCK_UNLOCK);
+	LWLockRelease(BufferDescriptorGetContentLock(GetBufferDescriptor(buffer - 1)));
 }
 
 bool
@@ -580,12 +605,19 @@ reset_buffers(void)
 	memset(descriptors, 0, sizeof(descriptors));
 	memset(owner_flags, 0, sizeof(owner_flags));
 	memset(private_pin, 0, sizeof(private_pin));
-	memset(private_refs, 0, sizeof(private_refs));
+	memset(PrivateRefCountArray, 0, sizeof(PrivateRefCountArray));
+	memset(private_hash, 0, sizeof(private_hash));
+	memset(private_hash_used, 0, sizeof(private_hash_used));
+	ReservedRefCountEntry = NULL;
+	PrivateRefCountOverflowed = PrivateRefCountClock = 0;
+	memset(local_refcounts, 0, sizeof(local_refcounts));
 	memset(pages, 0, sizeof(pages));
 	remembered_pins = pin_waiter_signals = reserve_calls = 0;
 	physical_writes = 0;
 	clock_hand = 6;
 	cluster_enabled = false;
+	ClusterConfShmem = NULL;
+	cluster_pcm_grd_max_entries = 0;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 	storage_route = 1;
 	ko_cleaner_allowed = false;
@@ -1373,10 +1405,219 @@ UT_TEST(test_exact_cleaner_read_reaches_native_pin_but_never_cr_publication)
 	}
 }
 
+static BufferDesc *
+conditional_read_pin(unsigned path, BufferTag *tag)
+{
+	BufferDesc *buf;
+	SMgrRelationData smgr = { 0 };
+	bool found;
+	cluster_enabled = true;
+	if (path != 2)
+		install_current(tag, 0);
+	if (path == 0) {
+		UT_ASSERT(ReadRecentBuffer(BufTagGetRelFileLocator(tag), tag->forkNum, tag->blockNum, 1));
+		buf = GetBufferDescriptor(0);
+	} else {
+		smgr.smgr_rlocator.locator = BufTagGetRelFileLocator(tag);
+		smgr.smgr_rlocator.backend = InvalidBackendId;
+		buf = BufferAlloc(&smgr, RELPERSISTENCE_PERMANENT, tag->forkNum, tag->blockNum, NULL,
+						  &found, IOCONTEXT_NORMAL);
+		UT_ASSERT_EQ(found, path == 1);
+		pg_atomic_fetch_or_u32(&buf->state, BM_VALID);
+	}
+	buf->pcm_state = (uint8)PCM_STATE_X;
+	return buf;
+}
+
+UT_TEST(test_conditional_writer_revalidates_first_pin_admission)
+{
+	for (unsigned path = 0; path < 3; path++) {
+		for (unsigned race = 0; race < 2; race++) {
+			BufferTag tag = reset_buffers();
+			BufferDesc *buf = conditional_read_pin(path, &tag);
+			Buffer buffer = BufferDescriptorGetBuffer(buf);
+			unsigned samples;
+			bool granted;
+			UT_ASSERT(ConditionalLockBuffer(buffer));
+			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+			if (race == 0) {
+				ko_closed = true;
+				ko_revision++;
+			} else
+				ko_close_at_header = header_calls + 1;
+			samples = ko_samples;
+			/* Simulate an outer content lock: no KO sampling is legal here. */
+			lock_depth = 1;
+			granted = ConditionalLockBuffer(buffer);
+			UT_ASSERT(!granted);
+			if (granted)
+				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+			UT_ASSERT_EQ(lock_depth, 1);
+			UT_ASSERT_EQ(ko_samples, samples);
+			UT_ASSERT_EQ(remembered_pins, 1);
+			UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf->state)), 1);
+			lock_depth = 0;
+			UnpinBuffer(buf);
+		}
+	}
+}
+
+UT_TEST(test_conditional_finite_owner_must_remain_exact_and_live)
+{
+	for (unsigned path = 0; path < 3; path++) {
+		BufferTag tag = reset_buffers();
+		BufferDesc *buf;
+		Buffer buffer;
+		bool granted;
+		ko_closed = true;
+		ko_cleaner_allowed = true;
+		ko_cleaner_target = tag;
+		buf = conditional_read_pin(path, &tag);
+		buffer = BufferDescriptorGetBuffer(buf);
+		UT_ASSERT(ConditionalLockBuffer(buffer));
+		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+		ko_cleaner_allowed = false;
+		granted = ConditionalLockBuffer(buffer);
+		UT_ASSERT(!granted);
+		if (granted)
+			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+		UT_ASSERT_EQ(remembered_pins, 1);
+		UnpinBuffer(buf);
+	}
+}
+
+UT_TEST(test_conditional_reused_pin_has_no_previous_admission)
+{
+	BufferTag tag = reset_buffers();
+	BufferDesc *buf = conditional_read_pin(0, &tag);
+	bool granted;
+	UT_ASSERT(ConditionalLockBuffer(1));
+	LockBuffer(1, BUFFER_LOCK_UNLOCK);
+	UnpinBuffer(buf);
+	(void)PinBuffer(buf, NULL); /* original non-reader flush pin, no use permission */
+	granted = ConditionalLockBuffer(1);
+	UT_ASSERT(!granted);
+	if (granted)
+		LockBuffer(1, BUFFER_LOCK_UNLOCK);
+	UnpinBuffer(buf);
+}
+
+UT_TEST(test_conditional_admission_survives_private_pin_spill_and_restore)
+{
+	BufferTag tag = reset_buffers();
+	BufferDesc *buf = conditional_read_pin(0, &tag);
+	bool granted;
+	for (int i = 1; i <= REFCOUNT_ARRAY_ENTRIES; i++) {
+		BufferTag other = tag;
+		other.blockNum += i;
+		install_current(&other, i);
+		UT_ASSERT(ReadRecentBuffer(BufTagGetRelFileLocator(&other), other.forkNum, other.blockNum,
+								   i + 1));
+	}
+	UT_ASSERT_EQ(PrivateRefCountOverflowed, 1);
+	UT_ASSERT(ConditionalLockBuffer(1)); /* sample lives in native overflow storage */
+	LockBuffer(1, BUFFER_LOCK_UNLOCK);
+	(void)GetPrivateRefCountEntry(1, true); /* original move back into hot array */
+	UT_ASSERT(ConditionalLockBuffer(1));
+	LockBuffer(1, BUFFER_LOCK_UNLOCK);
+	ko_closed = true;
+	ko_revision++;
+	granted = ConditionalLockBuffer(1);
+	UT_ASSERT(!granted);
+	if (granted)
+		LockBuffer(1, BUFFER_LOCK_UNLOCK);
+	UnpinBuffer(buf);
+	for (int i = 1; i <= REFCOUNT_ARRAY_ENTRIES; i++)
+		UnpinBuffer(GetBufferDescriptor(i));
+	UT_ASSERT_EQ(remembered_pins, 0);
+	UT_ASSERT_EQ(PrivateRefCountOverflowed, 0);
+}
+
+UT_TEST(test_cleanup_lock_keeps_original_pin_when_object_is_fenced)
+{
+	BufferTag tag = reset_buffers();
+	BufferDesc *buf = conditional_read_pin(0, &tag);
+	bool granted;
+	UT_ASSERT(ConditionalLockBufferForCleanup(1));
+	LockBuffer(1, BUFFER_LOCK_UNLOCK);
+	ko_closed = true;
+	ko_revision++;
+	granted = ConditionalLockBufferForCleanup(1);
+	UT_ASSERT(!granted);
+	if (granted)
+		LockBuffer(1, BUFFER_LOCK_UNLOCK);
+	UT_ASSERT_EQ(remembered_pins, 1);
+	UT_ASSERT_EQ(lock_depth, 0);
+	UnpinBuffer(buf);
+}
+
+UT_TEST(test_conditional_object_sample_never_replaces_pcm_proof)
+{
+	for (unsigned refusal = 0; refusal < 5; refusal++) {
+		BufferTag tag = reset_buffers();
+		BufferDesc *buf = conditional_read_pin(0, &tag);
+		bool granted;
+		memset(&pcm_conf, 0, sizeof(pcm_conf));
+		pcm_conf.node_count = 2;
+		ClusterConfShmem = &pcm_conf;
+		cluster_node_id = 0;
+		cluster_pcm_grd_max_entries = 64;
+		UT_ASSERT(cluster_pcm_is_active());
+		UT_ASSERT(cluster_bufmgr_should_pcm_track(buf));
+		if (refusal == 0)
+			buf->pcm_state = (uint8)PCM_STATE_N;
+		else if (refusal == 1)
+			buf->pcm_state = (uint8)PCM_STATE_S;
+		else if (refusal == 2)
+			buf->buffer_type = BUF_TYPE_PI;
+		else if (refusal == 3)
+			owner_flags[0] = PCM_OWN_FLAG_REVOKING;
+		else
+			buf->buffer_type = BUF_TYPE_CR;
+		granted = ConditionalLockBuffer(1);
+		UT_ASSERT(!granted);
+		if (granted)
+			LockBuffer(1, BUFFER_LOCK_UNLOCK);
+		UT_ASSERT_EQ(lock_depth, 0);
+		UnpinBuffer(buf);
+	}
+}
+
+UT_TEST(test_conditional_nonshared_paths_keep_native_behavior)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		BufferTag tag = reset_buffers();
+		BufferDesc *buf = GetBufferDescriptor(0);
+		install_current(&tag, 0);
+		buf->pcm_state = (uint8)PCM_STATE_X;
+		(void)PinBuffer(buf, NULL);
+		cluster_enabled = kind != 0;
+		if (kind == 1)
+			storage_route = 0;
+		if (kind == 2)
+			cluster_interconnect_tier = CLUSTER_IC_TIER_2;
+		if (kind == 3)
+			cluster_interconnect_tier = CLUSTER_IC_TIER_3;
+		ko_closed = true;
+		UT_ASSERT(ConditionalLockBuffer(1));
+		LockBuffer(1, BUFFER_LOCK_UNLOCK);
+		UT_ASSERT_EQ(ko_samples, 0);
+		UnpinBuffer(buf);
+	}
+	reset_buffers();
+	NLocBuffer = 1;
+	local_refcounts[0] = 1;
+	UT_ASSERT(ConditionalLockBuffer(-1));
+	UT_ASSERT(ConditionalLockBufferForCleanup(-1));
+	UT_ASSERT_EQ(lock_depth, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(37);
+	printf("# private pin entry: %zu bytes; current admission: %zu bytes\n",
+		   sizeof(PrivateRefCountEntry), sizeof(ClusterKoCurrentAdmissionV3));
 	UT_RUN(test_native_current_victim_keeps_original_behavior);
 	UT_RUN(test_cr_victim_preserves_current_and_removes_middle_head_tail);
 	UT_RUN(test_last_cr_only_victim_removes_anchor_without_current);
@@ -1407,6 +1648,13 @@ main(void)
 	UT_RUN(test_object_fence_buffer_alloc_waits_off_locks_without_publication);
 	UT_RUN(test_object_fence_does_not_enter_local_buffer_path);
 	UT_RUN(test_exact_cleaner_read_reaches_native_pin_but_never_cr_publication);
+	UT_RUN(test_conditional_writer_revalidates_first_pin_admission);
+	UT_RUN(test_conditional_finite_owner_must_remain_exact_and_live);
+	UT_RUN(test_conditional_reused_pin_has_no_previous_admission);
+	UT_RUN(test_conditional_admission_survives_private_pin_spill_and_restore);
+	UT_RUN(test_cleanup_lock_keeps_original_pin_when_object_is_fenced);
+	UT_RUN(test_conditional_object_sample_never_replaces_pcm_proof);
+	UT_RUN(test_conditional_nonshared_paths_keep_native_behavior);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

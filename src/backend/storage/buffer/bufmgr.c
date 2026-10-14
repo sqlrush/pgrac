@@ -4473,9 +4473,14 @@ typedef struct PrivateRefCountEntry
 {
 	Buffer		buffer;
 	int32		refcount;
+#ifdef USE_PGRAC_CLUSTER
+	/* A read pin is not current authority. Keep its exact object admission
+	 * only for lock-free revalidation by the conditional cached-X entrance. */
+	ClusterKoCurrentAdmissionV3 ko_current;
+#endif
 } PrivateRefCountEntry;
 
-/* 64 bytes, about the size of a cache line on common systems */
+/* Eight hot entries; cluster entries also retain their pin admission. */
 #define REFCOUNT_ARRAY_ENTRIES 8
 
 /*
@@ -4670,6 +4675,9 @@ ReservePrivateRefCountEntry(void)
 							  &found);
 		Assert(!found);
 		hashent->refcount = ReservedRefCountEntry->refcount;
+#ifdef USE_PGRAC_CLUSTER
+		hashent->ko_current = ReservedRefCountEntry->ko_current;
+#endif
 
 		/* clear the now free array slot */
 		ReservedRefCountEntry->buffer = InvalidBuffer;
@@ -4697,6 +4705,9 @@ NewPrivateRefCountEntry(Buffer buffer)
 	/* and fill it */
 	res->buffer = buffer;
 	res->refcount = 0;
+#ifdef USE_PGRAC_CLUSTER
+	memset(&res->ko_current, 0, sizeof(res->ko_current));
+#endif
 
 	return res;
 }
@@ -4766,6 +4777,9 @@ GetPrivateRefCountEntry(Buffer buffer, bool do_move)
 		/* and fill it */
 		free->buffer = buffer;
 		free->refcount = res->refcount;
+#ifdef USE_PGRAC_CLUSTER
+		free->ko_current = res->ko_current;
+#endif
 
 		/* delete from hashtable */
 		hash_search(PrivateRefCountHash, &buffer, HASH_REMOVE, &found);
@@ -4809,6 +4823,9 @@ static void
 ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref)
 {
 	Assert(ref->refcount == 0);
+#ifdef USE_PGRAC_CLUSTER
+	memset(&ref->ko_current, 0, sizeof(ref->ko_current));
+#endif
 
 	if (ref >= &PrivateRefCountArray[0] &&
 		ref < &PrivateRefCountArray[REFCOUNT_ARRAY_ENTRIES])
@@ -4833,6 +4850,23 @@ ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref)
 		PrivateRefCountOverflowed--;
 	}
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/* Called only after native first-pin/mapping admission validated the sample.
+ * No new object lock or permission is acquired. The original private pin
+ * keeps this tag stable, including while its refcount entry moves to hash. */
+static void
+cluster_bufmgr_ko_remember_pin(BufferDesc *buf, const ClusterKoPeerAdmissionV3 *sample)
+{
+	PrivateRefCountEntry *ref = GetPrivateRefCountEntry(BufferDescriptorGetBuffer(buf), false);
+
+	if (ref == NULL || ref->refcount <= 0 || sample == NULL)
+		return;
+	ref->ko_current.target = *sample;
+	ref->ko_current.target.fork = buf->tag.forkNum;
+	ref->ko_current.target.block = buf->tag.blockNum;
+}
+#endif
 
 /*
  * BufferIsPinned
@@ -5148,6 +5182,10 @@ ReadRecentBuffer(RelFileLocator rlocator, ForkNumber forkNum, BlockNumber blockN
 				PinBuffer(bufHdr, NULL);	/* bump pin count */
 			else
 				PinBuffer_Locked(bufHdr);	/* pin for first time */
+#ifdef USE_PGRAC_CLUSTER
+			if (check_ko && !have_private_ref)
+				cluster_bufmgr_ko_remember_pin(bufHdr, &ko_sample);
+#endif
 
 			pgBufferUsage.shared_blks_hit++;
 
@@ -6036,6 +6074,10 @@ retry_lookup:
 	UnlockBufHdr(victim_buf_hdr, victim_buf_state);
 
 	LWLockRelease(newPartitionLock);
+#ifdef USE_PGRAC_CLUSTER
+	if (check_ko)
+		cluster_bufmgr_ko_remember_pin(victim_buf_hdr, &ko_sample);
+#endif
 
 	/*
 	 * Buffer contents are currently invalid.  Try to obtain the right to
@@ -8418,6 +8460,7 @@ PinBufferForObjectRead(BufferDesc *buf, BufferAccessStrategy strategy,
 	valid = (state & BM_VALID) != 0;
 	pg_atomic_write_u32(&buf->state, state);
 	PinBuffer_Locked(buf);
+	cluster_bufmgr_ko_remember_pin(buf, sample);
 	return valid ? PIN_BUFFER_LOOKUP_VALID : PIN_BUFFER_LOOKUP_INVALID;
 }
 #endif
@@ -14735,6 +14778,18 @@ ConditionalLockBuffer(Buffer buffer)
 			cluster_pcm_own_flags_get(buf->buf_id),
 			cluster_pcm_own_writer_activation_token_get(buf->buf_id),
 			cluster_pcm_own_resource_x_activation_generation_get(buf->buf_id));
+		if (!blocked && cluster_enabled && cluster_shared_config
+			&& cluster_interconnect_tier == CLUSTER_IC_TIER_1
+			&& cluster_smgr_which_for(BufTagGetRelFileLocator(&buf->tag), InvalidBackendId) == 1) {
+			PrivateRefCountEntry *ref = GetPrivateRefCountEntry(buffer, false);
+
+			/* Other content locks may already be held. Consume the original
+			 * pin's exact sample; never take the KO lock or refresh it here. */
+			blocked = ref == NULL || ref->refcount <= 0
+					  || !cluster_ko_peer_current_valid_v3(&ref->ko_current,
+														   BufTagGetRelFileLocator(&buf->tag),
+														   buf->tag.forkNum, buf->tag.blockNum);
+		}
 		UnlockBufHdr(buf, buf_state);
 		if (blocked)
 		{
