@@ -43,6 +43,8 @@
 #include <string.h>
 
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_ko.h"
+#include "cluster/storage/cluster_smgr.h"
 #include "cluster/cluster_hw_lease.h"
 #include "cluster/cluster_shmem.h"
 
@@ -76,10 +78,46 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 
 /* GUC storage (cluster_guc.o not linked). */
 bool cluster_enabled = true;
+bool cluster_shared_config;
+int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+static bool lease_locked, admission_closed, close_on_lock, private_route;
+static uint64 admission_revision = 1;
+static unsigned admission_samples, admission_checks;
 int cluster_space_affinity = CLUSTER_SPACE_AFFINITY_STATIC;
 int cluster_space_lease_blocks = 64;
 
-/* Single-threaded harness: LWLock ops are no-ops. */
+/* Exact object registry is the fixture boundary; the original lease object
+ * and its real lock/publication order execute below. */
+int
+cluster_smgr_which_for(RelFileLocator locator, BackendId backend)
+{
+	UT_ASSERT(!lease_locked);
+	UT_ASSERT_EQ(backend, InvalidBackendId);
+	return private_route ? 0 : 1;
+}
+bool
+cluster_ko_peer_admission_begin_v3(RelFileLocator locator, ClusterKoPeerAdmissionV3 *out)
+{
+	UT_ASSERT(!lease_locked);
+	admission_samples++;
+	memset(out, 0, sizeof(*out));
+	if (admission_closed)
+		return false;
+	out->locator = locator;
+	out->revision = admission_revision;
+	return true;
+}
+bool
+cluster_ko_peer_admission_current_v3(const ClusterKoPeerAdmissionV3 *sample, RelFileLocator locator)
+{
+	UT_ASSERT(lease_locked);
+	admission_checks++;
+	return !admission_closed && sample->revision == admission_revision
+		   && RelFileLocatorEquals(sample->locator, locator);
+}
+
+/* Single-threaded fixture; the acquire hook models fence publication after
+ * the off-lock sample but before the original lease mutation. */
 void
 LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute_unused())
 {}
@@ -87,12 +125,22 @@ LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute
 bool
 LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
+	UT_ASSERT(!lease_locked);
+	lease_locked = true;
+	if (close_on_lock) {
+		close_on_lock = false;
+		admission_closed = true;
+		admission_revision++;
+	}
 	return true;
 }
 
 void
 LWLockRelease(LWLock *lock pg_attribute_unused())
-{}
+{
+	UT_ASSERT(lease_locked);
+	lease_locked = false;
+}
 
 /* Shmem: back the region with plain malloc. */
 void *
@@ -223,13 +271,75 @@ UT_TEST(test_counters_add_up)
 	UT_ASSERT(leased >= consumed + orphan);
 }
 
+UT_TEST(test_object_fence_refuses_lease_publication_before_slot_mutation)
+{
+	RelFileLocator r = rloc_of(93001);
+	ClusterHwLeaseShared before;
+
+	cluster_shared_config = true;
+	for (int race = 0; race < 2; race++) {
+		admission_closed = false;
+		cluster_hw_lease_install(r, MAIN_FORKNUM, 600, 4);
+		memcpy(&before, ClusterHwLeaseCtl, sizeof(before));
+		admission_closed = race == 0;
+		close_on_lock = race != 0;
+		cluster_hw_lease_install(r, MAIN_FORKNUM, 700, 5);
+		UT_ASSERT(memcmp(&before, ClusterHwLeaseCtl, sizeof(before)) == 0);
+		UT_ASSERT(!lease_locked);
+	}
+	admission_closed = close_on_lock = false;
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_object_fence_refuses_lease_consumption_without_orphaning_old_work)
+{
+	RelFileLocator r = rloc_of(93002);
+	ClusterHwLeaseShared before;
+
+	cluster_shared_config = true;
+	for (int race = 0; race < 2; race++) {
+		admission_closed = false;
+		cluster_hw_lease_install(r, MAIN_FORKNUM, 800, 3);
+		memcpy(&before, ClusterHwLeaseCtl, sizeof(before));
+		admission_closed = race == 0;
+		close_on_lock = race != 0;
+		UT_ASSERT_EQ(cluster_hw_lease_next_block(r, MAIN_FORKNUM), InvalidBlockNumber);
+		UT_ASSERT(memcmp(&before, ClusterHwLeaseCtl, sizeof(before)) == 0);
+		/* The original drain/discard owner remains callable under a fence. */
+		cluster_hw_lease_discard(r, MAIN_FORKNUM);
+		admission_closed = close_on_lock = false;
+		UT_ASSERT_EQ(cluster_hw_lease_next_block(r, MAIN_FORKNUM), InvalidBlockNumber);
+	}
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_object_admission_preserves_private_and_non_v3_lease_paths)
+{
+	for (int variant = 0; variant < 3; variant++) {
+		RelFileLocator r = rloc_of(93010 + variant);
+		unsigned samples = admission_samples;
+		unsigned checks = admission_checks;
+
+		cluster_shared_config = variant != 0;
+		private_route = variant == 1;
+		cluster_interconnect_tier = variant == 2 ? CLUSTER_IC_TIER_2 : CLUSTER_IC_TIER_1;
+		admission_closed = true;
+		cluster_hw_lease_install(r, MAIN_FORKNUM, 900, 2);
+		UT_ASSERT_EQ(cluster_hw_lease_next_block(r, MAIN_FORKNUM), 900);
+		UT_ASSERT_EQ(admission_samples, samples);
+		UT_ASSERT_EQ(admission_checks, checks);
+	}
+	cluster_shared_config = private_route = admission_closed = false;
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+}
+
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
 	/* stand-in for cluster_hw_lease_shmem_init over malloc-backed memory */
 	cluster_hw_lease_shmem_init();
 
-	UT_PLAN(6);
+	UT_PLAN(9);
 
 	UT_RUN(test_inactive_gate);
 	UT_RUN(test_install_consume_roundtrip);
@@ -237,6 +347,9 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 	UT_RUN(test_replacement_orphans_remainder);
 	UT_RUN(test_lru_recycle_under_pressure);
 	UT_RUN(test_counters_add_up);
+	UT_RUN(test_object_fence_refuses_lease_publication_before_slot_mutation);
+	UT_RUN(test_object_fence_refuses_lease_consumption_without_orphaning_old_work);
+	UT_RUN(test_object_admission_preserves_private_and_non_v3_lease_paths);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
