@@ -59,7 +59,7 @@ static bool marker_capable = true, v3_local_ax, drive_v3_ack, marker_error;
 static ClusterGrdHolderId v3_local_holder;
 static int marker_registrations;
 static uint64 marker_batch;
-static ClusterKoSharedMessageV3 sent_v3_request;
+static ClusterKoSharedMessageV3 sent_v3_request, sent_v3_ack;
 static ClusterICSendResult v3_send_result = CLUSTER_IC_SEND_DONE;
 static uint64 v3_refuse_batch;
 static bool v3_send_throw;
@@ -608,6 +608,14 @@ cluster_ic_send_envelope(uint8 type, int32 dest, const void *bytes, uint32 lengt
 		}
 		return sent_v3_request.base.batch_id == v3_refuse_batch ? CLUSTER_IC_SEND_NOT_ADMITTED
 																: v3_send_result;
+	}
+	if (length == CLUSTER_KO_SHARED_V3_BYTES && type == PGRAC_IC_MSG_KO_FLUSH_ACK) {
+		UT_ASSERT(cluster_ko_shared_decode_v3(bytes, length, &sent_v3_ack));
+		UT_ASSERT_EQ(dest, sent_v3_ack.base.origin_node);
+		send_calls++;
+		if (v3_send_result == CLUSTER_IC_SEND_DONE || v3_send_result == CLUSTER_IC_SEND_WOULD_BLOCK)
+			ack_count++;
+		return v3_send_result;
 	}
 	Assert(dest == 1 && length == CLUSTER_KO_SHARED_V2_BYTES);
 	if (!cluster_ko_shared_decode_v2(bytes, length, &m))
@@ -5639,7 +5647,7 @@ UT_TEST(test_v3_receive_requires_exact_tcp_owner_before_queue)
 
 UT_TEST(test_v3_inbound_retains_peer_route_without_rewriting_origin)
 {
-	for (int drift = 0; drift < 3; drift++) {
+	for (int drift = 0; drift < 4; drift++) {
 		ClusterKoSharedMessageV3 request = peer_fence_fixture(902);
 		real_space_reader = true;
 		space_identity.key.locator.dbOid = 5;
@@ -5656,8 +5664,42 @@ UT_TEST(test_v3_inbound_retains_peer_route_without_rewriting_origin)
 			v3_route_drift_flush = true;
 		fixture_peer_drain();
 		UT_ASSERT_EQ(flush_count, drift == 1 ? 0 : 1);
-		UT_ASSERT_EQ(drop_count, drift == 0 ? 1 : 0);
-		UT_ASSERT_EQ(storage.send_v3_count, drift == 0 ? 1 : 0);
+		UT_ASSERT_EQ(drop_count, drift == 0 || drift == 3 ? 1 : 0);
+		UT_ASSERT_EQ(storage.send_v3_count, drift == 0 || drift == 3 ? 1 : 0);
+		if (drift == 3)
+			v3_route_generation++; /* Drift only after ACK is queued. */
+		shared_send_tick();
+		UT_ASSERT_EQ(send_calls, drift == 0 ? 1 : 0);
+		UT_ASSERT_EQ(ack_count, drift == 0 ? 1 : 0);
+		if (drift == 0)
+			UT_ASSERT_EQ(sent_v3_ack.ax_master_generation, 31);
+	}
+}
+
+UT_TEST(test_peer_ack_refusal_keeps_original_route_cut)
+{
+	for (int drift = 0; drift < 2; drift++) {
+		ClusterKoSharedMessageV3 request = peer_fence_fixture(903);
+		real_space_reader = true;
+		space_identity.key.locator.dbOid = 5;
+		space_identity.sequence = 1;
+		space_identity.operation = 88;
+		request.ax_master_generation = 31;
+		enqueue_shared_v3(&request);
+		fixture_peer_drain();
+		v3_send_result = CLUSTER_IC_SEND_NOT_ADMITTED;
+		shared_send_tick();
+		UT_ASSERT_EQ(send_calls, 1);
+		UT_ASSERT_EQ(storage.send_v3_count, 1);
+		UT_ASSERT_EQ(ack_count, 0);
+		if (drift)
+			v3_route_generation++;
+		v3_send_result = CLUSTER_IC_SEND_DONE;
+		shared_send_tick();
+		UT_ASSERT_EQ(send_calls, drift ? 1 : 2);
+		UT_ASSERT_EQ(ack_count, drift ? 0 : 1);
+		UT_ASSERT_EQ(storage.send_v3_count, 0);
+		UT_ASSERT_EQ(sent_v3_ack.ax_master_generation, 31);
 	}
 }
 
@@ -6050,7 +6092,7 @@ origin_retained_send_setup(void)
 UT_TEST(test_v3_sender_retries_only_caller_owned_frame)
 {
 	ClusterKoSharedMessageV3 request = origin_retained_send_setup();
-	UT_ASSERT(ko_shared_enqueue_v3(&request));
+	UT_ASSERT(ko_shared_enqueue_v3(&request, request.ax_master_generation));
 	v3_send_result = CLUSTER_IC_SEND_NOT_ADMITTED;
 	shared_send_tick();
 	UT_ASSERT_EQ(send_calls, 1);
@@ -6060,7 +6102,7 @@ UT_TEST(test_v3_sender_retries_only_caller_owned_frame)
 	UT_ASSERT_EQ(send_calls, 2);
 	UT_ASSERT_EQ(ko_state->send_v3_count, 0);
 	/* An accepted tail is transport-owned even if an upper queue repeats. */
-	UT_ASSERT(ko_shared_enqueue_v3(&request));
+	UT_ASSERT(ko_shared_enqueue_v3(&request, request.ax_master_generation));
 	shared_send_tick();
 	UT_ASSERT_EQ(send_calls, 2);
 	UT_ASSERT_EQ(ko_state->send_v3_count, 0);
@@ -6071,8 +6113,8 @@ UT_TEST(test_v3_sender_does_not_resend_after_acceptance_or_ambiguous_error)
 	for (int n = 0; n < 2; n++) {
 		ClusterKoSharedMessageV3 request = origin_retained_send_setup();
 		v3_send_result = n == 0 ? CLUSTER_IC_SEND_DONE : CLUSTER_IC_SEND_HARD_ERROR;
-		UT_ASSERT(ko_shared_enqueue_v3(&request));
-		UT_ASSERT(ko_shared_enqueue_v3(&request));
+		UT_ASSERT(ko_shared_enqueue_v3(&request, request.ax_master_generation));
+		UT_ASSERT(ko_shared_enqueue_v3(&request, request.ax_master_generation));
 		shared_send_tick();
 		UT_ASSERT_EQ(send_calls, 1);
 		UT_ASSERT_EQ(ko_state->send_v3_count, 0);
@@ -6086,8 +6128,8 @@ UT_TEST(test_v3_sender_bounds_retry_without_hiding_other_work)
 	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT] = { 11, 22 };
 	next.base.batch_id++;
 	UT_ASSERT(ko_shared_reserve_v3(&next, boots, NULL) >= 0);
-	UT_ASSERT(ko_shared_enqueue_v3(&first));
-	UT_ASSERT(ko_shared_enqueue_v3(&next));
+	UT_ASSERT(ko_shared_enqueue_v3(&first, first.ax_master_generation));
+	UT_ASSERT(ko_shared_enqueue_v3(&next, next.ax_master_generation));
 	v3_refuse_batch = first.base.batch_id;
 	shared_send_tick();
 	UT_ASSERT_EQ(send_calls, 2);
@@ -6106,7 +6148,7 @@ UT_TEST(test_v3_ack_needs_actual_transport_admission_without_hard_error)
 		uint8 wire[CLUSTER_KO_SHARED_V3_BYTES];
 		if (n != 0) {
 			v3_send_result = n == 1 ? CLUSTER_IC_SEND_HARD_ERROR : CLUSTER_IC_SEND_DONE;
-			UT_ASSERT(ko_shared_enqueue_v3(&ack));
+			UT_ASSERT(ko_shared_enqueue_v3(&ack, ack.ax_master_generation));
 			shared_send_tick();
 		}
 		ack.base.verb = CLUSTER_KO_SHARED_ACK;
@@ -6123,7 +6165,7 @@ UT_TEST(test_v3_sender_error_cannot_restart_uncertain_send)
 {
 	ClusterKoSharedMessageV3 request = origin_retained_send_setup();
 	volatile bool caught = false;
-	UT_ASSERT(ko_shared_enqueue_v3(&request));
+	UT_ASSERT(ko_shared_enqueue_v3(&request, request.ax_master_generation));
 	v3_send_throw = true;
 	PG_TRY();
 	{
@@ -6147,7 +6189,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(137);
+	UT_PLAN(138);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
 	UT_RUN(test_peer_space_entry_checks_precede_io);
@@ -6268,6 +6310,7 @@ main(void)
 	UT_RUN(test_v3_control_refuses_non_tier1_even_with_peer_caps);
 	UT_RUN(test_v3_receive_requires_exact_tcp_owner_before_queue);
 	UT_RUN(test_v3_inbound_retains_peer_route_without_rewriting_origin);
+	UT_RUN(test_peer_ack_refusal_keeps_original_route_cut);
 	UT_RUN(test_peer_fence_commit_needs_exact_ready_operation);
 	UT_RUN(test_peer_fence_replay_retains_full_identity_and_revision);
 	UT_RUN(test_peer_fence_terminal_is_not_a_maximum_batch_watermark);

@@ -181,6 +181,7 @@ typedef struct ClusterKoShared {
 	ClusterKoSharedMessageV2 send[CLUSTER_KO_SHARED_CAPACITY];
 	uint32 send_v3_head, send_v3_count;
 	ClusterKoSharedMessageV3 send_v3[CLUSTER_KO_SHARED_CAPACITY];
+	uint64 send_v3_route_generation[CLUSTER_KO_SHARED_CAPACITY];
 	uint64 context_serial;
 	ClusterKoSharedContext contexts[CLUSTER_KO_SHARED_CAPACITY];
 	/* Peer operations are not owned by an origin backend ResourceOwner.
@@ -2590,18 +2591,20 @@ ko_shared_enqueue(const ClusterKoSharedMessageV2 *message)
 }
 
 static bool
-ko_shared_enqueue_v3(const ClusterKoSharedMessageV3 *message)
+ko_shared_enqueue_v3(const ClusterKoSharedMessageV3 *message, uint64 local_generation)
 {
 	bool accepted = false;
 	uint8 bytes[CLUSTER_KO_SHARED_V3_BYTES];
 
-	if (ko_state == NULL || !cluster_ko_shared_encode_v3(message, bytes, sizeof(bytes)))
+	if (ko_state == NULL || local_generation == 0 || local_generation == UINT64_MAX
+		|| !cluster_ko_shared_encode_v3(message, bytes, sizeof(bytes)))
 		return false;
 	SpinLockAcquire(&ko_state->shared_lock);
 	if (ko_state->send_v3_count < CLUSTER_KO_SHARED_CAPACITY) {
-		ko_state->send_v3[(ko_state->send_v3_head + ko_state->send_v3_count)
-																		% CLUSTER_KO_SHARED_CAPACITY]
-			= *message;
+		uint32 tail
+			= (ko_state->send_v3_head + ko_state->send_v3_count) % CLUSTER_KO_SHARED_CAPACITY;
+		ko_state->send_v3[tail] = *message;
+		ko_state->send_v3_route_generation[tail] = local_generation;
 		ko_state->send_v3_count++;
 		accepted = true;
 	}
@@ -2795,18 +2798,22 @@ cluster_ko_lmon_tick_v2(void)
 	SpinLockRelease(&ko_state->shared_lock);
 	for (unsigned n = 0; n < attempts; n++) {
 		ClusterKoSharedMessageV3 message;
+		uint64 local_generation;
 		uint8 bytes[CLUSTER_KO_SHARED_V3_BYTES];
 		ClusterICSendResult result = CLUSTER_IC_SEND_HARD_ERROR;
 		bool pending;
 
 		SpinLockAcquire(&ko_state->shared_lock);
 		pending = ko_state->send_v3_count != 0;
-		if (pending)
+		if (pending) {
 			message = ko_state->send_v3[ko_state->send_v3_head];
+			local_generation = ko_state->send_v3_route_generation[ko_state->send_v3_head];
+		}
 		SpinLockRelease(&ko_state->shared_lock);
 		if (!pending)
 			return;
-		if (ko_shared_v3_request_owned(&message) && ko_shared_v3_control_current(&message)
+		if (ko_shared_v3_request_owned(&message)
+			&& ko_shared_v3_control_at_generation(&message, local_generation)
 			&& cluster_ko_shared_encode_v3(&message, bytes, sizeof(bytes))) {
 			/* ERROR may leave transport acceptance unknown. Arm the original
 			 * operation before entering transport; only its explicit return
@@ -2832,8 +2839,10 @@ cluster_ko_lmon_tick_v2(void)
 		ko_state->send_v3_head = (ko_state->send_v3_head + 1) % CLUSTER_KO_SHARED_CAPACITY;
 		ko_state->send_v3_count--;
 		if (result == CLUSTER_IC_SEND_NOT_ADMITTED) {
-			ko_state->send_v3[(ko_state->send_v3_head + ko_state->send_v3_count)
-							  % CLUSTER_KO_SHARED_CAPACITY] = message;
+			uint32 tail
+				= (ko_state->send_v3_head + ko_state->send_v3_count) % CLUSTER_KO_SHARED_CAPACITY;
+			ko_state->send_v3[tail] = message;
+			ko_state->send_v3_route_generation[tail] = local_generation;
 			ko_state->send_v3_count++;
 		}
 		SpinLockRelease(&ko_state->shared_lock);
@@ -3260,7 +3269,8 @@ ko_shared_wait_for_acks_v3(ClusterKoSharedMessageV3 *request, uint32 mask,
 			continue;
 		request->base.peer_node = n;
 		request->base.peer_boot = boots[n];
-		if (!ko_shared_v3_control_current(request) || !ko_shared_enqueue_v3(request))
+		if (!ko_shared_v3_control_current(request)
+			|| !ko_shared_enqueue_v3(request, request->ax_master_generation))
 			return false;
 	}
 	while (ko_shared_v3_control_current(request)) {
@@ -4058,7 +4068,7 @@ cluster_ko_drain_inbound_and_apply(void)
 			if (slot.v3) {
 				slot.qualified_v3.base.verb = CLUSTER_KO_SHARED_ACK;
 				slot.qualified_v3.base.status = CLUSTER_KO_SHARED_DONE;
-				(void)ko_shared_enqueue_v3(&slot.qualified_v3);
+				(void)ko_shared_enqueue_v3(&slot.qualified_v3, slot.peer_route_generation);
 			} else {
 				slot.qualified.verb = CLUSTER_KO_SHARED_ACK;
 				slot.qualified.status = CLUSTER_KO_SHARED_DONE;
