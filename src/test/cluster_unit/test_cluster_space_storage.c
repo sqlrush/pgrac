@@ -51,7 +51,7 @@
 
 UT_DEFINE_GLOBALS();
 
-bool cluster_shared_config = true, cluster_enabled = true;
+bool cluster_shared_config = true, cluster_enabled = true, cluster_shared_catalog;
 int cluster_node_id = 0;
 int NBuffers = 2, NLocBuffer;
 char *BufferBlocks;
@@ -887,6 +887,11 @@ bool
 IsInParallelMode(void)
 {
 	return false;
+}
+bool
+IsSubTransaction(void)
+{
+	return nest_level > 1;
 }
 int
 GetCurrentTransactionNestLevel(void)
@@ -1811,7 +1816,19 @@ UT_TEST(test_subabort_forgets_drop_without_tombstoning)
 	rel.rd_rel = &form;
 	form.relpersistence = RELPERSISTENCE_PERMANENT;
 	storage.smgr_owner = &rel.rd_smgr;
-	RelationDropStorage(&rel);
+	expecting_error = true;
+	PG_TRY();
+	{
+		RelationDropStorage(&rel);
+		UT_ASSERT(false);
+	}
+	PG_CATCH();
+	{
+		UT_ASSERT_EQ(reported_level, ERROR);
+	}
+	PG_END_TRY();
+	UT_ASSERT_EQ(ko_calls, 0);
+	UT_ASSERT(!delete_registered);
 	AtSubAbort_smgr();
 	nest_level = 1;
 	smgrDoPendingDeletes(true);

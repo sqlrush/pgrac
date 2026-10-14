@@ -40,6 +40,8 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_ko.h" /* PGRAC: spec-5.7 D6 object-reuse flush barrier */
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_space_recovery.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -129,6 +131,32 @@ AddPendingSync(const RelFileLocator *rlocator)
 }
 
 /*
+ * Match the storage-mode/relation-class eligibility of shared heap writes.
+ * Internal DDL must also reject before files, SPACE identity or abort-delete
+ * ownership are created. A child need not have assigned an XID yet.
+ */
+void
+RelationCheckStorageTransaction(RelFileLocator rlocator, char relpersistence,
+								const char *operation)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (relpersistence != RELPERSISTENCE_TEMP
+		&& cluster_storage_mode_enabled()
+		&& cluster_pcm_x_relation_number_tracked(rlocator.relNumber, cluster_shared_catalog)
+		&& IsSubTransaction())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("shared relation storage %s does not support subtransactions", operation),
+				 errdetail("PGRAC_FAMILY=HEAP_ITL "
+						   "PGRAC_REASON=SHARED_ITL_SUBTRANSACTION_UNSUPPORTED PGRAC_NODE=%d",
+						   cluster_node_id),
+				 errhint("Execute this operation in a top-level transaction. "
+						 "SAVEPOINT, PL/pgSQL EXCEPTION blocks, psql ON_ERROR_ROLLBACK "
+						 "and driver autosave create subtransactions.")));
+#endif
+}
+
+/*
  * RelationCreateStorage
  *		Create physical storage for a relation.
  *
@@ -150,6 +178,7 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 	bool		needs_wal;
 
 	Assert(!IsInParallelMode());	/* couldn't update pendingSyncHash */
+	RelationCheckStorageTransaction(rlocator, relpersistence, "creation");
 
 	switch (relpersistence)
 	{
@@ -240,6 +269,8 @@ void
 RelationDropStorage(Relation rel)
 {
 	PendingRelDelete *pending;
+
+	RelationCheckStorageTransaction(rel->rd_locator, rel->rd_rel->relpersistence, "deletion");
 
 #ifdef USE_PGRAC_CLUSTER
 	/*
@@ -345,6 +376,8 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 
 #ifdef USE_PGRAC_CLUSTER
 	ClusterSpaceTruncateState *space_truncate = NULL;
+
+	RelationCheckStorageTransaction(rel->rd_locator, rel->rd_rel->relpersistence, "truncation");
 
 	/*
 	 * PGRAC: spec-5.7 D6 (KO).  Before shrinking the relfilenode's file, make
@@ -544,6 +577,8 @@ RelationPreTruncate(Relation rel)
 {
 	PendingRelSync *pending;
 
+	RelationCheckStorageTransaction(rel->rd_locator, rel->rd_rel->relpersistence, "truncation");
+
 	if (!pendingSyncHash)
 		return;
 
@@ -582,6 +617,8 @@ RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
 	bool		versioned_copy = false;
 	ClusterSpaceIdentity copy_identity;
 #endif
+
+	RelationCheckStorageTransaction(dst->smgr_rlocator.locator, relpersistence, "copy");
 
 	page = (Page) buf.data;
 

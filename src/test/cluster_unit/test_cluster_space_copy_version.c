@@ -15,6 +15,7 @@
 
 #include <setjmp.h>
 
+#include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "catalog/pg_class.h"
@@ -36,7 +37,7 @@
 
 UT_DEFINE_GLOBALS();
 
-bool cluster_enabled = true, cluster_shared_config = true;
+bool cluster_enabled = true, cluster_shared_config = true, cluster_shared_catalog;
 int cluster_node_id = 0, wal_level = WAL_LEVEL_REPLICA;
 static bool minimal_wal_copy;
 int NBuffers = 3, NLocBuffer;
@@ -60,6 +61,13 @@ static void *binding_memory;
 static bool source_available, lose_source_on_insert, capture_permitted;
 static uint32 wait_event;
 uint32 *my_wait_event_info = &wait_event;
+
+/* The file-copy fixture invokes the native producer in a top-level xact. */
+bool
+IsSubTransaction(void)
+{
+	return false;
+}
 
 Size
 add_size(Size a, Size b)
@@ -551,6 +559,13 @@ errcode(int code)
 
 int
 errhint(const char *fmt, ...)
+{
+	(void)fmt;
+	abort();
+}
+
+int
+errdetail(const char *fmt, ...)
 {
 	(void)fmt;
 	abort();

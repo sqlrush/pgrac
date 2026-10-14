@@ -3735,6 +3735,9 @@ RelationSetNewRelfilenumber(Relation relation, char persistence)
 	TransactionId freezeXid = InvalidTransactionId;
 	RelFileLocator newrlocator;
 
+	RelationCheckStorageTransaction(relation->rd_locator,
+									relation->rd_rel->relpersistence, "rewrite");
+
 	if (!IsBinaryUpgrade)
 	{
 		/* Allocate a new relfilenumber */
@@ -3765,6 +3768,10 @@ RelationSetNewRelfilenumber(Relation relation, char persistence)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("unexpected request for new relfilenumber in binary upgrade mode")));
+
+	newrlocator = relation->rd_locator;
+	newrlocator.relNumber = newrelfilenumber;
+	RelationCheckStorageTransaction(newrlocator, persistence, "rewrite");
 
 	/*
 	 * Get a writable copy of the pg_class tuple for the given relation.
@@ -3820,9 +3827,6 @@ RelationSetNewRelfilenumber(Relation relation, char persistence)
 	 * NOTE: If relevant for the AM, any conflict in relfilenumber value will
 	 * be caught here, if GetNewRelFileNumber messes up for any reason.
 	 */
-	newrlocator = relation->rd_locator;
-	newrlocator.relNumber = newrelfilenumber;
-
 	if (RELKIND_HAS_TABLE_AM(relation->rd_rel->relkind))
 	{
 		table_relation_set_new_filelocator(relation, &newrlocator,

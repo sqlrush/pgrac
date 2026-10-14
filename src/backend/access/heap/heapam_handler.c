@@ -1015,6 +1015,8 @@ heapam_relation_copy_data(Relation rel, const RelFileLocator *newrlocator)
 {
 	SMgrRelation dstrel;
 
+	RelationCheckStorageTransaction(*newrlocator, rel->rd_rel->relpersistence, "copy");
+
 	dstrel = smgropen(*newrlocator, rel->rd_backend);
 
 	/*

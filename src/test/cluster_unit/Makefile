@@ -463,7 +463,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_btree_build_version,$(SIMPLE_TESTS))
 TESTS += test_cluster_space_extend
 SIMPLE_TESTS := $(filter-out test_cluster_btree_leaf_version,$(SIMPLE_TESTS))
 TESTS += test_cluster_btree_structure_version
-TESTS += test_cluster_sequence_version
+TESTS += test_cluster_sequence_version test_cluster_sequence_ddl
 TESTS += test_cluster_relation_wal_policy
 TESTS += test_cluster_heap_small_redo
 TESTS += test_cluster_btree_redo test_cluster_cold_init_redo
@@ -502,6 +502,7 @@ test_cluster_relmap_init: test_cluster_relmap_init.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a -o $@
 
 # PGRAC: execute original entry-point prologues before any native mutation.
+TESTS += test_cluster_storage_subtransaction
 TESTS += test_cluster_fresh_scope
 
 # Include tests registered after the initial all prerequisite expansion.
@@ -1629,7 +1630,24 @@ test_cluster_sequence_version_native.inc: $(top_srcdir)/src/backend/commands/seq
 	     emit { print } /^}/ { emit=0 } END { if (found != 8) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_sequence_version: test_cluster_sequence_version.c unit_test.h \
+test_cluster_sequence_ddl_reset.inc: $(top_srcdir)/src/backend/commands/sequence.c Makefile
+	awk '/^ResetSequence\(/ { inside=1 } inside && /^\tinit_sequence\(/ { emit=1; found++ } \
+	     emit { print } emit && /read_seq_tuple\(/ { emit=0; inside=0; done++ } \
+	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_sequence_ddl_alter.inc: $(top_srcdir)/src/backend/commands/sequence.c Makefile
+	awk '/^AlterSequence\(/ { inside=1 } inside && /^\tinit_sequence\(/ { emit=1; found++ } \
+	     emit { print } emit && /read_seq_tuple\(/ { emit=0; inside=0; done++ } \
+	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_sequence_ddl_persistence.inc: $(top_srcdir)/src/backend/commands/sequence.c Makefile
+	awk '/^SequenceChangePersistence\(/ { inside=1 } inside && /^\tinit_sequence\(/ { emit=1; found++ } \
+	     emit { print } emit && /read_seq_tuple\(/ { emit=0; inside=0; done++ } \
+	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_sequence_ddl: test_cluster_sequence_ddl_reset.inc test_cluster_sequence_ddl_alter.inc test_cluster_sequence_ddl_persistence.inc
+
+test_cluster_sequence_version test_cluster_sequence_ddl: %: %.c test_cluster_sequence_version.c unit_test.h \
 		test_cluster_sequence_hint.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_sequence_shmem.c \
 		test_cluster_sequence_version_helpers.inc test_cluster_sequence_version_native.inc \
@@ -2498,7 +2516,7 @@ test_cluster_space_commit_emit.inc: $(top_srcdir)/src/backend/access/transam/xac
 	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_space_storage: test_cluster_space_storage.c test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc unit_test.h test_cluster_space_catalog_product.o test_cluster_space_smgrdesc_product.o test_cluster_side_xact_xactdesc.o \
+test_cluster_space_storage test_cluster_storage_subtransaction: %: %.c test_cluster_space_storage.c test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc unit_test.h test_cluster_space_catalog_product.o test_cluster_space_smgrdesc_product.o test_cluster_side_xact_xactdesc.o \
 		$(top_builddir)/src/backend/storage/page/checksum.o \
 		test_cluster_space_xlogutils_product.o \
 		test_cluster_space_storage_product.o $(CLUSTER_HW_O) \

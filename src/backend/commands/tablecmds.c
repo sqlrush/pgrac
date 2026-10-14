@@ -15316,6 +15316,8 @@ index_copy_data(Relation rel, RelFileLocator newrlocator)
 {
 	SMgrRelation dstrel;
 
+	RelationCheckStorageTransaction(newrlocator, rel->rd_rel->relpersistence, "copy");
+
 	dstrel = smgropen(newrlocator, rel->rd_backend);
 
 	/*
