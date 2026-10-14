@@ -22,6 +22,7 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 static XLogReaderState reader;
 static DecodedXLogRecord decoded;
 static ClusterWalSourceRef source;
+static RfContributorStreamCutV1 cut;
 static union {
 	uint64 align;
 	char bytes[8192];
@@ -35,6 +36,7 @@ append(const void *bytes, size_t length)
 	decoded.header.xl_tot_len = SizeOfXLogRecord + decoded.main_data_len;
 	decoded.next_lsn = decoded.lsn + MAXALIGN(decoded.header.xl_tot_len);
 	reader.EndRecPtr = decoded.next_lsn;
+	cut.scan_end_exclusive = decoded.next_lsn;
 }
 
 static void
@@ -56,6 +58,13 @@ fixture(uint8 rmid, uint8 info)
 	source.claim.max_config_generation = 2;
 	source.claim.claim_sha256[0] = 18;
 	source.timeline = 7;
+	cut = (RfContributorStreamCutV1){ 0 };
+	cut.failed_thread = 2;
+	cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+	cut.timeline_id = 7;
+	cut.origin_owner_incarnation = 71;
+	cut.scan_begin_inclusive = 0x3000;
+	cut.contributor_count = 1;
 	reader.system_identifier = 817;
 	reader.ReadRecPtr = decoded.lsn = 0x3000;
 	reader.record = &decoded;
@@ -133,7 +142,7 @@ full_commit(void)
 static ClusterRecoveryNativeResult
 begin(ClusterRecoveryNativeScan **scan)
 {
-	return cluster_recovery_native_scan_begin(&reader, &source, 65536, scan);
+	return cluster_recovery_native_scan_begin(&reader, &source, &cut, 65536, scan);
 }
 
 UT_TEST(test_commit_keeps_every_effect_and_owned_source)
@@ -406,7 +415,7 @@ UT_TEST(test_capacity_and_block_components_never_drop_work)
 	ClusterRecoveryNativeEffect effect;
 
 	full_commit();
-	UT_ASSERT_EQ(cluster_recovery_native_scan_begin(&reader, &source, 1, &scan),
+	UT_ASSERT_EQ(cluster_recovery_native_scan_begin(&reader, &source, &cut, 1, &scan),
 				 CLUSTER_RECOVERY_NATIVE_CAPACITY);
 	UT_ASSERT(scan == NULL);
 	decoded.max_block_id = 0;
@@ -453,10 +462,127 @@ UT_TEST(test_invalid_native_boolean_is_not_a_relcache_proof)
 	cluster_recovery_native_scan_destroy(scan);
 }
 
+UT_TEST(test_record_must_belong_to_the_same_complete_cut)
+{
+	for (unsigned variant = 0; variant < 8; variant++) {
+		ClusterRecoveryNativeScan *scan = NULL;
+
+		full_commit();
+		switch (variant) {
+		case 0:
+			cut.flags = 0;
+			break;
+		case 1:
+			cut.flags |= RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY;
+			break;
+		case 2:
+			cut.failed_thread++;
+			break;
+		case 3:
+			cut.timeline_id++;
+			break;
+		case 4:
+			cut.origin_owner_incarnation = 0;
+			break;
+		case 5:
+			cut.origin_owner_incarnation++;
+			break;
+		case 6:
+			cut.scan_begin_inclusive++;
+			break;
+		case 7:
+			cut.scan_end_exclusive--;
+			break;
+		}
+		UT_ASSERT_EQ(begin(&scan), CLUSTER_RECOVERY_NATIVE_INVALID);
+		UT_ASSERT(scan == NULL);
+		cluster_recovery_native_scan_destroy(scan);
+	}
+}
+
+UT_TEST(test_second_pass_binds_all_source_and_record_bytes)
+{
+	for (unsigned variant = 0; variant < 16; variant++) {
+		ClusterRecoveryNativeScan *scan = NULL;
+		ClusterRecoveryNativeEffect effect;
+		ClusterRecoveryNativeResult result;
+
+		full_commit();
+		UT_ASSERT_EQ(begin(&scan), CLUSTER_RECOVERY_NATIVE_MORE);
+		if (scan == NULL)
+			return;
+		UT_ASSERT_EQ(cluster_recovery_native_scan_recheck(scan, &reader, &source, &cut),
+					 CLUSTER_RECOVERY_NATIVE_UNCHANGED);
+		UT_ASSERT_EQ(cluster_recovery_native_scan_next(scan, &effect),
+					 CLUSTER_RECOVERY_NATIVE_EFFECT);
+		UT_ASSERT_EQ(effect.record->cut.scan_end_exclusive, cut.scan_end_exclusive);
+		switch (variant) {
+		case 0:
+			source.claim.claim_sha256[31]++;
+			break;
+		case 1:
+			source.claim.identity.origin_owner_incarnation++;
+			break;
+		case 2:
+			source.claim.identity.authority_uuid[15]++;
+			break;
+		case 3:
+			source.claim.database_incarnation++;
+			break;
+		case 4:
+			source.claim.identity.root_lineage_seq++;
+			break;
+		case 5:
+			source.claim.max_config_generation++;
+			break;
+		case 6:
+			cut.scan_end_exclusive++;
+			break;
+		case 7:
+			cut.contributor_count++;
+			break;
+		case 8:
+			decoded.header.xl_scn++;
+			break;
+		case 9:
+			decoded.header.xl_crc++;
+			break;
+		case 10:
+			decoded.record_origin++;
+			break;
+		case 11:
+			decoded.toplevel_xid++;
+			break;
+		case 12:
+			decoded.main_data[decoded.main_data_len - 1]++;
+			break;
+		case 13:
+			decoded.max_block_id = 0;
+			break;
+		case 14:
+			decoded.main_data_len--;
+			break;
+		case 15:
+			decoded.header.xl_prev++;
+			break;
+		}
+		result = cluster_recovery_native_scan_recheck(scan, &reader, &source, &cut);
+		UT_ASSERT_EQ(result, CLUSTER_RECOVERY_NATIVE_CHANGED);
+		UT_ASSERT_EQ(cluster_recovery_native_scan_next(scan, &effect),
+					 CLUSTER_RECOVERY_NATIVE_CHANGED);
+		UT_ASSERT(effect.record == NULL && effect.bytes == NULL);
+		/* Restoring the original bytes cannot resurrect a failed observation. */
+		full_commit();
+		UT_ASSERT_EQ(cluster_recovery_native_scan_recheck(scan, &reader, &source, &cut),
+					 CLUSTER_RECOVERY_NATIVE_CHANGED);
+		cluster_recovery_native_scan_destroy(scan);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(15);
 	UT_RUN(test_commit_keeps_every_effect_and_owned_source);
 	UT_RUN(test_abort_keeps_deletions_stats_and_subxact_membership);
 	UT_RUN(test_assignment_retains_real_top_membership);
@@ -470,6 +596,8 @@ main(void)
 	UT_RUN(test_capacity_and_block_components_never_drop_work);
 	UT_RUN(test_unknown_message_bytes_are_not_interpreted_or_discarded);
 	UT_RUN(test_invalid_native_boolean_is_not_a_relcache_proof);
+	UT_RUN(test_record_must_belong_to_the_same_complete_cut);
+	UT_RUN(test_second_pass_binds_all_source_and_record_bytes);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

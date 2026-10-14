@@ -16,6 +16,7 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "access/xact.h"
 #include "access/xlogreader.h"
+#include "cluster/cluster_page_stable_base.h"
 #include "cluster/cluster_wal_source.h"
 
 typedef enum ClusterRecoveryNativeResult {
@@ -25,7 +26,9 @@ typedef enum ClusterRecoveryNativeResult {
 	CLUSTER_RECOVERY_NATIVE_INVALID,
 	CLUSTER_RECOVERY_NATIVE_SHAPE,
 	CLUSTER_RECOVERY_NATIVE_UNSUPPORTED,
-	CLUSTER_RECOVERY_NATIVE_CAPACITY
+	CLUSTER_RECOVERY_NATIVE_CAPACITY,
+	CLUSTER_RECOVERY_NATIVE_UNCHANGED,
+	CLUSTER_RECOVERY_NATIVE_CHANGED
 } ClusterRecoveryNativeResult;
 
 typedef enum ClusterRecoveryNativeKind {
@@ -50,6 +53,7 @@ typedef enum ClusterRecoveryNativeKind {
  * acceptance does not authorize applying them or interpreting a terminal. */
 typedef struct ClusterRecoveryNativeRecord {
 	ClusterWalSourceRef source;
+	RfContributorStreamCutV1 cut;
 	XLogRecPtr read_lsn;
 	XLogRecPtr end_lsn;
 	XLogRecord header;
@@ -84,7 +88,17 @@ typedef struct ClusterRecoveryNativeScan ClusterRecoveryNativeScan;
  * they require their own complete consumers, never an empty effect list. */
 extern ClusterRecoveryNativeResult
 cluster_recovery_native_scan_begin(XLogReaderState *reader, const ClusterWalSourceRef *source,
-								   size_t memory_budget, ClusterRecoveryNativeScan **out);
+								   const RfContributorStreamCutV1 *cut, size_t memory_budget,
+								   ClusterRecoveryNativeScan **out);
+/* Re-observe the same complete source/cut/header/main bytes from a second
+ * original reader pass. Any mismatch poisons the scan and blocks subsequent
+ * effect export. UNCHANGED is byte/identity equality only: the caller must
+ * also revalidate the complete ROOT/retention scope and every other graph
+ * participant. It confers no new authority and does not rewind iteration. */
+extern ClusterRecoveryNativeResult
+cluster_recovery_native_scan_recheck(ClusterRecoveryNativeScan *scan, XLogReaderState *reader,
+									 const ClusterWalSourceRef *source,
+									 const RfContributorStreamCutV1 *cut);
 /* One item per call, including a primary terminal/batch/create item when
  * its arrays are empty. END only drains this record, not the whole graph,
  * producer namespace, replay, ROOT completion, OPEN or GC. */

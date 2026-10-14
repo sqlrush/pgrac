@@ -9,6 +9,7 @@
 static XLogReaderState native_reader;
 static DecodedXLogRecord native_decoded;
 static ClusterWalSourceRef native_source;
+static RfContributorStreamCutV1 native_cut;
 static union {
 	uint64 align;
 	char bytes[256];
@@ -33,6 +34,14 @@ native_fixture(uint8 rmid, uint8 info, uint32 length)
 	native_source.claim.max_config_generation = 2;
 	native_source.claim.claim_sha256[0] = 18;
 	native_source.timeline = 7;
+	native_cut = (RfContributorStreamCutV1){ 0 };
+	native_cut.failed_thread = 2;
+	native_cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+	native_cut.timeline_id = 7;
+	native_cut.origin_owner_incarnation = 71;
+	native_cut.scan_begin_inclusive = 0x3000;
+	native_cut.scan_end_exclusive = 0x3100;
+	native_cut.contributor_count = 1;
 	native_reader.system_identifier = 817;
 	native_reader.ReadRecPtr = native_decoded.lsn = 0x3000;
 	native_reader.EndRecPtr = native_decoded.next_lsn = 0x3100;
@@ -54,7 +63,8 @@ native_create(RelFileLocator locator, ForkNumber forknum)
 
 	native_fixture(RM_SMGR_ID, XLOG_SMGR_CREATE, sizeof(create));
 	memcpy(native_payload.bytes, &create, sizeof(create));
-	UT_ASSERT_EQ(cluster_recovery_native_scan_begin(&native_reader, &native_source, 65536, &scan),
+	UT_ASSERT_EQ(cluster_recovery_native_scan_begin(&native_reader, &native_source, &native_cut,
+													65536, &scan),
 				 CLUSTER_RECOVERY_NATIVE_MORE);
 	return scan;
 }
@@ -133,7 +143,8 @@ UT_TEST(test_terminal_deletion_adds_every_shared_fork_and_keeps_page_requirement
 	memcpy(native_payload.bytes + offset, &count, sizeof(count));
 	offset += sizeof(count);
 	memcpy(native_payload.bytes + offset, &locator, sizeof(locator));
-	UT_ASSERT_EQ(cluster_recovery_native_scan_begin(&native_reader, &native_source, 65536, &scan),
+	UT_ASSERT_EQ(cluster_recovery_native_scan_begin(&native_reader, &native_source, &native_cut,
+													65536, &scan),
 				 CLUSTER_RECOVERY_NATIVE_MORE);
 	UT_ASSERT_EQ(cluster_recovery_native_scan_next(scan, &effect), CLUSTER_RECOVERY_NATIVE_EFFECT);
 	UT_ASSERT_EQ(cluster_recovery_native_scan_next(scan, &effect), CLUSTER_RECOVERY_NATIVE_EFFECT);
