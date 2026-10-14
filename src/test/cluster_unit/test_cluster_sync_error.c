@@ -31,6 +31,10 @@ static const ClusterSharedFsOps *cluster_shared_fs_active_ops = &ops;
 static int cluster_raw_device_fd;
 int io_direct_flags;
 static bool queue_accepts, fail_sync, fail_write;
+static int writeback_calls;
+static int writeback_fence_calls;
+static int writeback_mrp_calls;
+static bool writeback_order_ok;
 static int reported_level;
 static ClusterPageWalRefV1 first_before;
 static struct {
@@ -142,11 +146,23 @@ RegisterSyncRequest(const FileTag *tag, SyncRequestType type, bool retry)
 	return queue_accepts;
 }
 void
-cluster_write_fence_reject_if_fenced(const char *op pg_attribute_unused())
-{}
+cluster_write_fence_reject_if_fenced(const char *op)
+{
+	if (strcmp(op, "writeback") == 0) {
+		writeback_fence_calls++;
+		if (writeback_calls != 0)
+			writeback_order_ok = false;
+	}
+}
 void
-cluster_mrp_standby_shared_write_gate(const char *op pg_attribute_unused())
-{}
+cluster_mrp_standby_shared_write_gate(const char *op)
+{
+	if (strcmp(op, "writeback") == 0) {
+		writeback_mrp_calls++;
+		if (writeback_calls != 0)
+			writeback_order_ok = false;
+	}
+}
 static ClusterSmgrRelationState *
 cluster_smgr_state_lookup(SMgrRelation r, bool create)
 {
@@ -158,6 +174,17 @@ cluster_smgr_ensure_handle(ClusterSmgrRelationState *state, ForkNumber fork)
 {
 	UT_ASSERT(state == &relation_state && fork == MAIN_FORKNUM);
 	return &native_handle;
+}
+
+void
+cluster_shared_fs_writeback(ClusterSharedFsHandle *handle,
+							BlockNumber blocknum pg_attribute_unused(),
+							BlockNumber nblocks pg_attribute_unused())
+{
+	UT_ASSERT(handle == &native_handle);
+	if (writeback_fence_calls != 1 || writeback_mrp_calls != 1)
+		writeback_order_ok = false;
+	writeback_calls++;
 }
 
 #include "test_cluster_data_sync_policy.inc"
@@ -175,6 +202,10 @@ setup(int provider)
 	reset();
 	memset(observed, 0, sizeof(*observed));
 	memset(&first_before, 0, sizeof(first_before));
+	writeback_calls = 0;
+	writeback_fence_calls = 0;
+	writeback_mrp_calls = 0;
+	writeback_order_ok = true;
 	relation.smgr_rlocator.backend = InvalidBackendId;
 	native_handle.vfd = cluster_raw_device_fd = fileno(file);
 	native_handle.opened = true;
@@ -277,16 +308,27 @@ UT_TEST(write_error_remains_error_and_sync_retry_uses_native_policy)
 		}
 }
 
+UT_TEST(writeback_checks_existing_gates_before_provider)
+{
+	setup(0);
+	cluster_smgr_writeback(&relation, MAIN_FORKNUM, 0, 1);
+	UT_ASSERT_EQ(writeback_fence_calls, 1);
+	UT_ASSERT_EQ(writeback_mrp_calls, 1);
+	UT_ASSERT_EQ(writeback_calls, 1);
+	UT_ASSERT(writeback_order_ok);
+}
+
 int
 main(void)
 {
 	observed = mmap(NULL, sizeof(*observed), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
 	if (observed == MAP_FAILED)
 		return 2;
-	UT_PLAN(3);
+	UT_PLAN(4);
 	UT_RUN(sync_error_bypasses_retry_and_retains_first);
 	UT_RUN(registration_or_sync_precedes_clean_and_first_retirement);
 	UT_RUN(write_error_remains_error_and_sync_retry_uses_native_policy);
+	UT_RUN(writeback_checks_existing_gates_before_provider);
 	munmap(observed, sizeof(*observed));
 	if (file)
 		fclose(file);

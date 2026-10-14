@@ -853,6 +853,14 @@ cluster_smgr_writeback(SMgrRelation reln, ForkNumber forknum, BlockNumber blockn
 	ClusterSmgrRelationState *state;
 	ClusterSharedFsHandle *handle;
 
+	/* spec-4.12 D5 (L240): writeback is still a shared-storage write path;
+	 * reject before opening the handle or issuing provider I/O on a fenced
+	 * instance. */
+	cluster_write_fence_reject_if_fenced("writeback");
+	/* spec-6.4 INV-ADG5 (P0-1): the standby must retain the apply-master
+	 * lease for every provider write path, including direct writeback. */
+	cluster_mrp_standby_shared_write_gate("writeback");
+
 	state = cluster_smgr_state_lookup(reln, true);
 	handle = cluster_smgr_ensure_handle(state, forknum);
 

@@ -2404,7 +2404,8 @@ test_cluster_sync_dispatch.inc: $(top_srcdir)/src/backend/cluster/storage/cluste
 test_cluster_sync_smgr.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_smgr.c Makefile
 	awk '/^cluster_smgr_(init_filetag|register_dirty)\(/ { print "static void"; emit=1; n++ } \
 	     /^cluster_smgr_write\(/ { print "void"; emit=1; n++ } \
-	     emit { print } emit && /^}/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< > $@
+	     /^cluster_smgr_writeback\(/ { print "void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 4 || emit) exit 1 }' $< > $@
 
 test_cluster_sync_error: test_cluster_sync_error.c test_cluster_page_data.c \
 		test_cluster_data_sync_policy.inc test_cluster_sync_providers.inc test_cluster_sync_dispatch.inc test_cluster_sync_smgr.inc
@@ -4373,13 +4374,12 @@ test_cluster_raw_device_capacity: test_cluster_raw_device_capacity.c unit_test.h
 
 # test_cluster_smgr links cluster_smgr.o + the three cluster_shared_fs
 # objects standalone.  cluster_smgr.c references HTAB / md.c / fd.c /
-# TablespaceCreateDbspace / ereport; the test stubs each one because
-# the unit test only address-takes the sixteen f_smgr callback
-# prototypes and exercises the four short-circuit branches of
-# cluster_smgr_which_for() via direct function call (no smgrsw
-# dispatch).  End-to-end runtime behaviour (PG 219 GUC=on) is
-# verified by cluster_tap t/019_smgr_cluster.pl + make check
-# --temp-config.
+# TablespaceCreateDbspace / ereport; the test stubs each one.  Besides
+# address-taking the f_smgr callback surface and exercising the four
+# short-circuit branches of cluster_smgr_which_for(), the sync fixture
+# executes the raw writeback gate before its provider callback.  End-to-end
+# runtime behaviour (PG 219 GUC=on) is verified by cluster_tap
+# t/019_smgr_cluster.pl + make check --temp-config.
 test_cluster_smgr: test_cluster_smgr.c test_cluster_drop_work_unavailable.h unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_SMGR_O) \
 		$(CLUSTER_SHARED_FS_O) $(CLUSTER_SHARED_FS_STUB_O) \
