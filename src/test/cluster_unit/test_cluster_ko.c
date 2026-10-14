@@ -375,6 +375,7 @@ shared_v3_fixture(void)
 	ClusterKoSharedMessageV3 m = { 0 };
 
 	m.base = shared_fixture();
+	m.base.key.locator.dbOid = 5;
 	m.ax_resid.field1 = 5;
 	m.ax_resid.field2 = 4242; /* relation OID, not the relfilenode */
 	m.ax_resid.field3 = 0;

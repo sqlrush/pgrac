@@ -204,13 +204,16 @@ ko_shared_v3_valid(const ClusterKoSharedMessageV3 *m)
 	if (m->ax_resid.type != LOCKTAG_RELATION
 		|| m->ax_resid.lockmethodid != DEFAULT_LOCKMETHOD
 		|| m->ax_resid.field3 != 0 || m->ax_resid.field4 != 0
+		|| m->ax_resid.field1 != base->key.locator.dbOid
 		|| m->ax_resid.field2 == InvalidOid
 		|| m->ax_holder.node_id >= CLUSTER_KO_SHARED_MEMBER_BYTES * 8
 		|| m->ax_holder.cluster_epoch == 0 || m->ax_holder.cluster_epoch == UINT64_MAX
+		|| m->ax_holder.cluster_epoch != base->epoch
 		|| m->ax_holder.request_id == 0 || m->ax_holder.request_id == UINT64_MAX
 		|| m->ax_request_id != m->ax_holder.request_id
 		|| m->ax_master_generation == 0 || m->ax_master_generation == UINT64_MAX
 		|| m->ax_master_node < 0 || master >= CLUSTER_KO_SHARED_MEMBER_BYTES * 8
+		|| (base->members[m->ax_holder.node_id / 8] & (1u << (m->ax_holder.node_id % 8))) == 0
 		|| (base->members[master / 8] & (1u << (master % 8))) == 0
 		|| m->ax_mode != AccessExclusiveLock
 		|| m->full_fork_mask != CLUSTER_KO_SHARED_V3_FULL_FORK_MASK
