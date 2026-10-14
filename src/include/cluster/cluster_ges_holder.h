@@ -19,7 +19,8 @@ typedef struct ClusterGesHolderProbe {
 	ClusterResId resid;
 	ClusterGrdHolderId holder;
 	uint64 nonce;
-	uint64 master_generation;
+	/* Collector-local route provenance, echoed unchanged by the master. */
+	uint64 collector_generation;
 	uint64 collector_boot;
 	uint64 master_boot;
 	bool reply;

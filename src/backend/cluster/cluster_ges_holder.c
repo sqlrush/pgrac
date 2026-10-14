@@ -42,7 +42,7 @@ holder_probe_valid(const ClusterGesHolderProbe *q)
 		|| q->holder.procno > INT_MAX || q->holder.cluster_epoch == 0
 		|| q->holder.cluster_epoch == PG_UINT64_MAX || q->holder.request_id == 0
 		|| q->holder.request_id == PG_UINT64_MAX || q->nonce == 0 || q->nonce == PG_UINT64_MAX
-		|| q->master_generation == 0 || q->master_generation == PG_UINT64_MAX
+		|| q->collector_generation == 0 || q->collector_generation == PG_UINT64_MAX
 		|| q->collector_boot == 0 || q->collector_boot == PG_UINT64_MAX || q->master_boot == 0
 		|| q->master_boot == PG_UINT64_MAX)
 		return false;
@@ -86,7 +86,7 @@ cluster_ges_holder_probe_encode(const ClusterGesHolderProbe *q, void *payload, S
 	holder_put(p + 32, q->holder.cluster_epoch, 8);
 	holder_put(p + 40, q->holder.request_id, 8);
 	holder_put(p + 48, q->nonce, 8);
-	holder_put(p + 56, q->master_generation, 8);
+	holder_put(p + 56, q->collector_generation, 8);
 	holder_put(p + 64, q->collector_boot, 8);
 	holder_put(p + 72, q->master_boot, 8);
 	return true;
@@ -115,7 +115,7 @@ cluster_ges_holder_probe_decode(const void *payload, Size length, ClusterGesHold
 	q.holder.cluster_epoch = holder_get(p + 32, 8);
 	q.holder.request_id = holder_get(p + 40, 8);
 	q.nonce = holder_get(p + 48, 8);
-	q.master_generation = holder_get(p + 56, 8);
+	q.collector_generation = holder_get(p + 56, 8);
 	q.collector_boot = holder_get(p + 64, 8);
 	q.master_boot = holder_get(p + 72, 8);
 	if (!holder_probe_valid(&q))
@@ -140,7 +140,8 @@ holder_probe_endpoint_current(int32 node, uint64 boot)
 }
 
 static bool
-holder_probe_current(const ClusterGesHolderProbe *q, int32 collector, int32 master)
+holder_probe_current(const ClusterGesHolderProbe *q, int32 collector, int32 master,
+					 uint64 local_generation)
 {
 	uint64 generation;
 	return cluster_enabled && cluster_shared_config && MyBackendType == B_LMON
@@ -149,8 +150,9 @@ holder_probe_current(const ClusterGesHolderProbe *q, int32 collector, int32 mast
 		   && holder_probe_valid(q) && q->holder.cluster_epoch == cluster_epoch_get_current()
 		   && holder_probe_endpoint_current(collector, q->collector_boot)
 		   && holder_probe_endpoint_current(master, q->master_boot)
-		   && cluster_grd_lookup_master_gen(&q->resid, &generation) == master
-		   && generation == q->master_generation
+		   && cluster_grd_lookup_master_gen(&q->resid, &generation) == master && generation != 0
+		   && generation != PG_UINT64_MAX
+		   && (local_generation == 0 || generation == local_generation)
 		   && q->holder.cluster_epoch == cluster_epoch_get_current();
 }
 
@@ -158,7 +160,8 @@ bool
 cluster_ges_holder_probe_send(int32 master, const ClusterGesHolderProbe *q)
 {
 	uint8 wire[CLUSTER_GES_HOLDER_PROBE_BYTES];
-	if (q == NULL || q->reply || !holder_probe_current(q, cluster_node_id, master)
+	if (q == NULL || q->reply
+		|| !holder_probe_current(q, cluster_node_id, master, q->collector_generation)
 		|| !cluster_ges_holder_probe_encode(q, wire, sizeof(wire)))
 		return false;
 	if (master == cluster_node_id)
@@ -176,9 +179,9 @@ cluster_ges_holder_probe_ingress(const ClusterICEnvelope *env, const void *paylo
 		|| env->epoch != q.holder.cluster_epoch)
 		return;
 	if (q.reply) {
-		if (holder_probe_current(&q, cluster_node_id, env->source_node_id))
+		if (holder_probe_current(&q, cluster_node_id, env->source_node_id, q.collector_generation))
 			cluster_ko_peer_holder_observed(env->source_node_id, &q);
-	} else if (holder_probe_current(&q, env->source_node_id, cluster_node_id))
+	} else if (holder_probe_current(&q, env->source_node_id, cluster_node_id, 0))
 		(void)cluster_grd_work_queue_enqueue(env->source_node_id, payload, env->payload_length);
 }
 
@@ -188,16 +191,21 @@ cluster_ges_holder_probe_drain(const ClusterGrdWorkItem *item)
 	ClusterGesHolderProbe q;
 	uint8 wire[CLUSTER_GES_HOLDER_PROBE_BYTES];
 	if (item == NULL || !cluster_ges_holder_probe_decode(item->payload, item->payload_len, &q)
-		|| q.reply || item->routing_generation != q.master_generation
-		|| !holder_probe_current(&q, item->source_node_id, cluster_node_id))
+		|| q.reply || item->routing_generation == 0
+		|| !holder_probe_current(&q, item->source_node_id, cluster_node_id,
+								 item->routing_generation))
 		return;
-	q.observation = cluster_grd_holder_observe(&q.resid, &q.holder, q.master_generation, &q.mode);
+	/* The queue cut belongs to this receiver. The collector's wire token
+	 * is immutable correlation data, not this node's LMS generation. */
+	q.observation
+		= cluster_grd_holder_observe(&q.resid, &q.holder, item->routing_generation, &q.mode);
 	q.reply = true;
-	if (!holder_probe_current(&q, item->source_node_id, cluster_node_id))
+	if (!holder_probe_current(&q, item->source_node_id, cluster_node_id, item->routing_generation))
 		return;
-	if (item->source_node_id == (uint32)cluster_node_id)
-		cluster_ko_peer_holder_observed(cluster_node_id, &q);
-	else if (cluster_ges_holder_probe_encode(&q, wire, sizeof(wire)))
+	if (item->source_node_id == (uint32)cluster_node_id) {
+		if (holder_probe_current(&q, cluster_node_id, cluster_node_id, q.collector_generation))
+			cluster_ko_peer_holder_observed(cluster_node_id, &q);
+	} else if (cluster_ges_holder_probe_encode(&q, wire, sizeof(wire)))
 		(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GES_REQUEST, item->source_node_id, wire,
 									   sizeof(wire));
 	/* No reply or a full transport leaves the collector's query pending.

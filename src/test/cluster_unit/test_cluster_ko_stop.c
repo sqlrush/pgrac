@@ -5673,6 +5673,7 @@ UT_TEST(test_peer_holder_probe_exact_reply_is_observation_only)
 	ClusterGrdHolderObservation observation;
 	LOCKMODE mode;
 
+	v3_route_generation = request.ax_master_generation + 10;
 	holder_probe_sends = 0;
 	holder_probe_send_ok = true;
 	holder_probe_clock = 1;
@@ -5685,6 +5686,9 @@ UT_TEST(test_peer_holder_probe_exact_reply_is_observation_only)
 	UT_ASSERT_EQ(holder_probe_sends, 1);
 	cluster_ko_lmon_tick_v2();
 	UT_ASSERT_EQ(holder_probe_sends, 1);
+	UT_ASSERT_EQ(holder_probe_sent.collector_generation, v3_route_generation);
+	UT_ASSERT_EQ(ko_state->peer_fences[h.slot].request.ax_master_generation,
+				 request.ax_master_generation);
 	reply = holder_probe_sent;
 	reply.reply = true;
 	reply.observation = CLUSTER_GRD_HOLDER_PRESENT;
@@ -5702,7 +5706,7 @@ UT_TEST(test_peer_holder_probe_exact_reply_is_observation_only)
 		if (field == 4)
 			bad.master_boot++;
 		if (field == 5)
-			bad.master_generation++;
+			bad.collector_generation++;
 		cluster_ko_peer_holder_observed(request.ax_master_node, &bad);
 		MyBackendType = B_SINVAL_BCAST;
 		MyAuxProcType = SinvalBcastProcess;
@@ -5726,6 +5730,11 @@ UT_TEST(test_peer_holder_probe_exact_reply_is_observation_only)
 	UT_ASSERT_EQ(flush_count, 0);
 	UT_ASSERT_EQ(drop_count, 0);
 	UT_ASSERT_EQ(ko_state->send_v3_count, 0);
+	UT_ASSERT(cluster_ko_peer_fence_ready_v3(&request, &h));
+	v3_route_generation++;
+	UT_ASSERT(!cluster_ko_peer_fence_begin_v3(&request, &h, &state));
+	UT_ASSERT(!cluster_ko_peer_fence_ready_v3(&request, &h));
+	UT_ASSERT(!cluster_ko_peer_holder_result_v3(&h, &observation, &mode));
 }
 
 UT_TEST(test_peer_holder_probe_refresh_retry_and_late_reply_keep_owner)

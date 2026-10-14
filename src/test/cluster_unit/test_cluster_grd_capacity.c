@@ -1962,7 +1962,7 @@ UT_TEST(exact_holder_protocol_uses_real_ingress_ges_work_and_grd)
 	query.resid = request.resid;
 	query.holder = holder;
 	query.nonce = 2001;
-	UT_ASSERT_EQ(cluster_grd_lookup_master_gen(&query.resid, &query.master_generation), 1);
+	UT_ASSERT_EQ(cluster_grd_lookup_master_gen(&query.resid, &query.collector_generation), 1);
 	query.collector_boot = cluster_membership_get_last_admitted_incarnation(2);
 	query.master_boot = cluster_qvotec_get_self_incarnation();
 	UT_ASSERT_EQ(

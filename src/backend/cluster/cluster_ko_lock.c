@@ -152,6 +152,7 @@ typedef struct ClusterKoInboundSlot {
 typedef struct ClusterKoPeerFenceV3 {
 	ClusterKoPeerFenceStateV3 state;
 	uint64 serial;
+	uint64 peer_route_generation;
 	ClusterKoSharedMessageV3 request;
 	uint8 encoded[CLUSTER_KO_SHARED_V3_BYTES];
 	ClusterGesHolderProbe holder_probe;
@@ -688,7 +689,7 @@ ko_shared_control_current(const ClusterKoSharedMessageV2 *message)
  * the independently negotiated object-drain capability and the immutable AX
  * suffix. No maintenance identity read is part of this control predicate. */
 static bool
-ko_shared_v3_control_current(const ClusterKoSharedMessageV3 *message)
+ko_shared_v3_control_at_generation(const ClusterKoSharedMessageV3 *message, uint64 local_generation)
 {
 	ClusterKoSharedMessageV3 current;
 	ClusterWalSourceRef ref;
@@ -697,16 +698,14 @@ ko_shared_v3_control_current(const ClusterKoSharedMessageV3 *message)
 	uint8 expected[CLUSTER_KO_SHARED_V3_BYTES], observed[sizeof(expected)];
 	int32 current_master, other;
 
-	if (message == NULL)
+	if (message == NULL || local_generation == 0 || local_generation == UINT64_MAX)
 		return false;
 	current = *message;
-	/* The wire carries the GES route token as provenance, not as an
-	 * authority claim.  Re-read the current route before either origin or
-	 * peer dispatch; a stale master generation must not be allowed to
-	 * consume the request or produce an ACK. */
+	/* The AX wire token belongs to the origin. Each consumer retains and
+	 * checks its own local route cut without rewriting that provenance. */
 	current_master = cluster_grd_lookup_master_gen(&message->ax_resid, &generation);
 	if (current_master < 0 || current_master != message->ax_master_node
-		|| generation != message->ax_master_generation)
+		|| generation != local_generation)
 		return false;
 	if (message->base.origin_node >= CLUSTER_KO_SHARED_NODE_LIMIT
 		|| message->base.peer_node >= CLUSTER_KO_SHARED_NODE_LIMIT
@@ -731,7 +730,16 @@ ko_shared_v3_control_current(const ClusterKoSharedMessageV3 *message)
 		|| !cluster_membership_cut_generation_current(generation)
 		|| !cluster_ko_shared_encode_v3(&current, observed, sizeof(observed)))
 		return false;
-	return memcmp(expected, observed, sizeof(expected)) == 0;
+	return memcmp(expected, observed, sizeof(expected)) == 0
+		   && cluster_grd_lookup_master_gen(&message->ax_resid, &generation) == current_master
+		   && generation == local_generation;
+}
+
+static bool
+ko_shared_v3_control_current(const ClusterKoSharedMessageV3 *message)
+{
+	return message != NULL
+		   && ko_shared_v3_control_at_generation(message, message->ax_master_generation);
 }
 
 /* All operation-state transitions use the existing short KO lock. No
@@ -777,6 +785,7 @@ cluster_ko_peer_fence_begin_v3(const ClusterKoSharedMessageV3 *request,
 							 ClusterKoPeerFenceStateV3 *state)
 {
 	uint8 encoded[CLUSTER_KO_SHARED_V3_BYTES];
+	uint64 peer_route_generation;
 	int empty = -1;
 	bool ok = false;
 
@@ -784,7 +793,9 @@ cluster_ko_peer_fence_begin_v3(const ClusterKoSharedMessageV3 *request,
 		|| !cluster_shared_config || request->base.verb != CLUSTER_KO_SHARED_REQUEST
 		|| (!AmLmonProcess() && !AmSinvalBcastProcess())
 		|| request->base.peer_node != cluster_node_id
-		|| !ko_shared_v3_control_current(request)
+		|| cluster_grd_lookup_master_gen(&request->ax_resid, &peer_route_generation)
+			   != request->ax_master_node
+		|| !ko_shared_v3_control_at_generation(request, peer_route_generation)
 		|| !cluster_ko_shared_encode_v3(request, encoded, sizeof(encoded)))
 		return false;
 	SpinLockAcquire(&ko_state->shared_lock);
@@ -798,7 +809,8 @@ cluster_ko_peer_fence_begin_v3(const ClusterKoSharedMessageV3 *request,
 			continue;
 		/* Same operation key with different target/AX/cut is a conflict,
 		 * including a new epoch stamped onto an old operation identity. */
-		if (memcmp(entry->encoded, encoded, sizeof(encoded)) == 0) {
+		if (entry->peer_route_generation == peer_route_generation
+			&& memcmp(entry->encoded, encoded, sizeof(encoded)) == 0) {
 			handle->slot = i;
 			handle->serial = entry->serial;
 			*state = entry->state;
@@ -811,6 +823,7 @@ cluster_ko_peer_fence_begin_v3(const ClusterKoSharedMessageV3 *request,
 
 		memset(entry, 0, sizeof(*entry));
 		entry->request = *request;
+		entry->peer_route_generation = peer_route_generation;
 		memcpy(entry->encoded, encoded, sizeof(encoded));
 		entry->serial = ++ko_state->peer_fence_serial;
 		entry->state = CLUSTER_KO_PEER_FENCE_ACTIVE;
@@ -832,18 +845,20 @@ ko_holder_probe_same_query(const ClusterGesHolderProbe *a, const ClusterGesHolde
 	return a->nonce != 0 && a->nonce == b->nonce
 		   && memcmp(&a->resid, &b->resid, sizeof(a->resid)) == 0
 		   && memcmp(&a->holder, &b->holder, sizeof(a->holder)) == 0
-		   && a->master_generation == b->master_generation && a->collector_boot == b->collector_boot
-		   && a->master_boot == b->master_boot;
+		   && a->collector_generation == b->collector_generation
+		   && a->collector_boot == b->collector_boot && a->master_boot == b->master_boot;
 }
 
 static bool
-ko_peer_holder_cut(const ClusterKoSharedMessageV3 *request, uint64 *master_boot)
+ko_peer_holder_cut(const ClusterKoSharedMessageV3 *request, uint64 peer_route_generation,
+				   uint64 *master_boot)
 {
 	ClusterKoSharedMessageV2 current = request->base;
 	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], generation;
 
-	if (!ko_shared_v3_control_current(request) || !ko_shared_members(&current, boots, &generation)
-		|| request->ax_master_node < 0 || request->ax_master_node >= CLUSTER_KO_SHARED_NODE_LIMIT
+	if (!ko_shared_v3_control_at_generation(request, peer_route_generation)
+		|| !ko_shared_members(&current, boots, &generation) || request->ax_master_node < 0
+		|| request->ax_master_node >= CLUSTER_KO_SHARED_NODE_LIMIT
 		|| !cluster_membership_cut_generation_current(generation))
 		return false;
 	*master_boot = boots[request->ax_master_node];
@@ -856,6 +871,7 @@ cluster_ko_peer_holder_begin_v3(const ClusterKoPeerFenceHandleV3 *handle)
 	ClusterKoSharedMessageV3 request;
 	ClusterKoPeerFenceV3 *entry;
 	ClusterGesHolderProbe probe;
+	uint64 peer_route_generation;
 	bool ok = false;
 
 	if (ko_state == NULL || !AmSinvalBcastProcess() || handle == NULL
@@ -868,13 +884,14 @@ cluster_ko_peer_holder_begin_v3(const ClusterKoPeerFenceHandleV3 *handle)
 		return false;
 	}
 	request = entry->request;
+	peer_route_generation = entry->peer_route_generation;
 	SpinLockRelease(&ko_state->shared_lock);
 	memset(&probe, 0, sizeof(probe));
-	if (!ko_peer_holder_cut(&request, &probe.master_boot))
+	if (!ko_peer_holder_cut(&request, peer_route_generation, &probe.master_boot))
 		return false;
 	probe.resid = request.ax_resid;
 	probe.holder = request.ax_holder;
-	probe.master_generation = request.ax_master_generation;
+	probe.collector_generation = peer_route_generation;
 	probe.collector_boot = request.base.peer_boot;
 	SpinLockAcquire(&ko_state->shared_lock);
 	entry = &ko_state->peer_fences[handle->slot];
@@ -940,7 +957,8 @@ cluster_ko_peer_holder_result_v3(const ClusterKoPeerFenceHandleV3 *handle,
 	saved = ko_state->peer_fences[handle->slot];
 	SpinLockRelease(&ko_state->shared_lock);
 	if (saved.serial != handle->serial || saved.state == CLUSTER_KO_PEER_FENCE_EMPTY
-		|| !saved.holder_probe.reply || !ko_peer_holder_cut(&saved.request, &master_boot)
+		|| !saved.holder_probe.reply
+		|| !ko_peer_holder_cut(&saved.request, saved.peer_route_generation, &master_boot)
 		|| master_boot != saved.holder_probe.master_boot)
 		return false;
 	SpinLockAcquire(&ko_state->shared_lock);
@@ -988,7 +1006,8 @@ ko_peer_holder_lmon_tick(void)
 		if (!cluster_normal_stop_service_new_work(false))
 			return;
 		sent++;
-		if (ko_peer_holder_cut(&request, &master_boot) && master_boot == probe.master_boot)
+		if (ko_peer_holder_cut(&request, probe.collector_generation, &master_boot)
+			&& master_boot == probe.master_boot)
 			(void)cluster_ges_holder_probe_send(request.ax_master_node, &probe);
 	}
 }
@@ -1001,16 +1020,21 @@ cluster_ko_peer_fence_ready_v3(const ClusterKoSharedMessageV3 *request,
 {
 	uint8 encoded[CLUSTER_KO_SHARED_V3_BYTES];
 	ClusterKoPeerFenceV3 *entry;
+	uint64 peer_route_generation;
 	bool ok = false;
 
-	if (ko_state == NULL || request == NULL || handle == NULL
-		|| !AmSinvalBcastProcess() || handle->slot >= CLUSTER_KO_SHARED_CAPACITY
-		|| handle->serial == 0 || !ko_shared_v3_control_current(request)
+	if (ko_state == NULL || request == NULL || handle == NULL || !AmSinvalBcastProcess()
+		|| handle->slot >= CLUSTER_KO_SHARED_CAPACITY || handle->serial == 0
 		|| !cluster_ko_shared_encode_v3(request, encoded, sizeof(encoded)))
 		return false;
 	SpinLockAcquire(&ko_state->shared_lock);
+	peer_route_generation = ko_state->peer_fences[handle->slot].peer_route_generation;
+	SpinLockRelease(&ko_state->shared_lock);
+	if (!ko_shared_v3_control_at_generation(request, peer_route_generation))
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
 	entry = &ko_state->peer_fences[handle->slot];
-	if (entry->serial == handle->serial
+	if (entry->serial == handle->serial && entry->peer_route_generation == peer_route_generation
 		&& (entry->state == CLUSTER_KO_PEER_FENCE_ACTIVE
 			|| entry->state == CLUSTER_KO_PEER_FENCE_READY)
 		&& memcmp(entry->encoded, encoded, sizeof(encoded)) == 0) {

@@ -18,6 +18,8 @@ int cluster_node_id = 1;
 BackendType MyBackendType = B_LMON;
 static uint64 epoch = 7, generation = 47, boots[4] = { 100, 101, 102, 103 };
 static int32 master = 2;
+static uint64 receiver_generation;
+static bool change_generation_after_read;
 static bool service = true, member = true, queue_room = true, capability = true;
 static bool change_after_read;
 static ClusterGrdHolderObservation observed = CLUSTER_GRD_HOLDER_ABSENT;
@@ -66,7 +68,7 @@ int32
 cluster_grd_lookup_master_gen(const ClusterResId *r, uint64 *g)
 {
 	UT_ASSERT(memcmp(r, &expected_resid, sizeof(*r)) == 0);
-	*g = generation;
+	*g = cluster_node_id == master && receiver_generation != 0 ? receiver_generation : generation;
 	return master;
 }
 ClusterMembershipState
@@ -95,7 +97,7 @@ cluster_grd_work_queue_enqueue(uint32 source, const void *p, uint16 n)
 		return false;
 	memset(&queued, 0, sizeof(queued));
 	queued.source_node_id = source;
-	queued.routing_generation = generation;
+	queued.routing_generation = receiver_generation != 0 ? receiver_generation : generation;
 	queued.payload_len = n;
 	memcpy(queued.payload, p, n);
 	enqueued++;
@@ -116,13 +118,15 @@ cluster_grd_holder_observe(const ClusterResId *r, const ClusterGrdHolderId *h, u
 						   LOCKMODE *mode)
 {
 	UT_ASSERT_EQ(cluster_node_id, master);
-	UT_ASSERT_EQ(gen, generation);
+	UT_ASSERT_EQ(gen, receiver_generation != 0 ? receiver_generation : generation);
 	UT_ASSERT(memcmp(r, &expected_resid, sizeof(*r)) == 0);
 	UT_ASSERT(memcmp(h, &expected_holder, sizeof(*h)) == 0);
 	reads++;
 	*mode = observed == CLUSTER_GRD_HOLDER_PRESENT ? AccessExclusiveLock : NoLock;
 	if (change_after_read)
 		boots[1]++;
+	if (change_generation_after_read)
+		receiver_generation++;
 	return observed;
 }
 void
@@ -145,13 +149,15 @@ setup(void)
 		boots[i] = 100 + i;
 	service = member = queue_room = capability = true;
 	change_after_read = false;
+	receiver_generation = 0;
+	change_generation_after_read = false;
 	reads = enqueued = sent = delivered = 0;
 	MyBackendType = B_LMON;
 	observed = CLUSTER_GRD_HOLDER_ABSENT;
 	q.resid = expected_resid;
 	q.holder = expected_holder;
 	q.nonce = 1001;
-	q.master_generation = 47;
+	q.collector_generation = 47;
 	q.collector_boot = 101;
 	q.master_boot = 102;
 	return q;
@@ -339,16 +345,51 @@ UT_TEST(query_codec_rejects_bad_shape_and_preserves_full_identity)
 	UT_ASSERT_EQ(out.observation, CLUSTER_GRD_HOLDER_PRESENT);
 	UT_ASSERT_EQ(out.mode, AccessExclusiveLock);
 }
+UT_TEST(query_keeps_sender_provenance_separate_from_receiver_cut)
+{
+	for (int fault = 0; fault < 4; fault++) {
+		ClusterGesHolderProbe q = setup();
+		ClusterICEnvelope env;
+		receiver_generation = 59;
+		UT_ASSERT(cluster_ges_holder_probe_send(master, &q));
+		cluster_node_id = 2;
+		env = env_for(1);
+		cluster_ges_holder_probe_ingress(&env, wire_sent);
+		UT_ASSERT_EQ(enqueued, 1);
+		UT_ASSERT_EQ(queued.routing_generation, 59);
+		if (fault == 1)
+			receiver_generation++; /* after ingress, before read */
+		if (fault == 2)
+			change_generation_after_read = true;
+		cluster_ges_holder_probe_drain(&queued);
+		UT_ASSERT_EQ(reads, fault == 1 ? 0 : 1);
+		UT_ASSERT_EQ(sent, fault == 1 || fault == 2 ? 1 : 2);
+		if (fault == 1 || fault == 2)
+			continue;
+		cluster_node_id = 1;
+		env = env_for(2);
+		if (fault == 3)
+			generation++; /* collector's own cut changes */
+		cluster_ges_holder_probe_ingress(&env, wire_sent);
+		UT_ASSERT_EQ(delivered, fault == 3 ? 0 : 1);
+		if (fault == 0) {
+			UT_ASSERT_EQ(accepted.collector_generation, 47);
+			UT_ASSERT_EQ(accepted.observation, CLUSTER_GRD_HOLDER_ABSENT);
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
 	UT_RUN(query_round_trip_is_read_only_and_correlated);
 	UT_RUN(query_local_master_uses_same_work_owner);
 	UT_RUN(query_never_turns_failed_lookup_or_refusal_into_absence);
 	UT_RUN(query_rejects_boot_epoch_master_and_generation_drift);
 	UT_RUN(query_reply_rechecks_consumer_cut);
 	UT_RUN(query_codec_rejects_bad_shape_and_preserves_full_identity);
+	UT_RUN(query_keeps_sender_provenance_separate_from_receiver_cut);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
