@@ -125,6 +125,7 @@ static int cut_writer_samples, cut_writer_change_at, cut_cap_samples[CLUSTER_KO_
 static int cut_cap_change_peer = -1;
 static int space_reads, send_calls, lock_calls;
 static bool real_space_reader, space_current_refused, space_locked, space_pinned;
+static bool allow_space_locator_mismatch;
 static int ordinary_space_locks, maintenance_space_locks, space_current_refuse_at;
 static PGAlignedBlock space_page;
 static bool fixture_space_read_identity(RelFileLocator, ClusterSpaceIdentity *);
@@ -407,7 +408,8 @@ bool
 cluster_space_relation_read_identity(RelFileLocator locator, ClusterSpaceIdentity *out)
 {
 	Assert(SpinLockFree(&storage.shared_lock));
-	Assert(RelFileLocatorEquals(locator, space_identity.key.locator));
+	if (!allow_space_locator_mismatch)
+		Assert(RelFileLocatorEquals(locator, space_identity.key.locator));
 	space_reads++;
 	if (real_space_reader)
 		return fixture_space_read_identity(locator, out);
@@ -901,6 +903,7 @@ reset_test(void)
 	MyBackendType = B_BACKEND;
 	MyBackendId = 1;
 	real_space_reader = space_current_refused = space_locked = space_pinned = false;
+	allow_space_locator_mismatch = false;
 	ordinary_space_locks = maintenance_space_locks = space_current_refuse_at = 0;
 	CurrentResourceOwner = (ResourceOwner)1;
 	CurTransactionResourceOwner = (ResourceOwner)1;
@@ -5278,6 +5281,38 @@ UT_TEST(test_peer_space_checks_every_identity_field_and_keeps_origin_s)
 	}
 }
 
+UT_TEST(test_v3_space_gate_requires_exact_identity_and_mutation_token)
+{
+	ClusterKoSharedMessageV3 message;
+
+	reset_test();
+	space_identity.key.locator.dbOid = 5;
+	space_identity.sequence = 1;
+	space_identity.operation = 77;
+	message.base = shared_request(123, current_epoch);
+	message.space_mutation_token = 77;
+	UT_ASSERT(ko_shared_v3_space_current(&message));
+
+	/* A reused relfilenode, incarnation, or storage identity cannot satisfy
+	 * the v3 peer-side DROP gate even when the wire token is unchanged. */
+	allow_space_locator_mismatch = true;
+	message.base.key.locator.relNumber++;
+	UT_ASSERT(!ko_shared_v3_space_current(&message));
+	message.base.key.locator.relNumber--;
+	allow_space_locator_mismatch = false;
+	message.base.incarnation[0]++;
+	UT_ASSERT(!ko_shared_v3_space_current(&message));
+	message.base.incarnation[0]--;
+	message.base.key.storage_uuid[1]++;
+	UT_ASSERT(!ko_shared_v3_space_current(&message));
+	message.base.key.storage_uuid[1]--;
+	space_identity.operation++;
+	UT_ASSERT(!ko_shared_v3_space_current(&message));
+	space_identity.operation--;
+	message.space_mutation_token++;
+	UT_ASSERT(!ko_shared_v3_space_current(&message));
+}
+
 UT_TEST(test_peer_current_refusal_at_either_read_releases_pin_without_ack)
 {
 	for (int at = 1; at <= 2; at++) {
@@ -5306,11 +5341,12 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(114);
+	UT_PLAN(115);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
 	UT_RUN(test_peer_space_entry_checks_precede_io);
 	UT_RUN(test_peer_space_checks_every_identity_field_and_keeps_origin_s);
+	UT_RUN(test_v3_space_gate_requires_exact_identity_and_mutation_token);
 	UT_RUN(test_peer_current_refusal_at_either_read_releases_pin_without_ack);
 	UT_RUN(test_real_admission_flush_drop_ack_order);
 	UT_RUN(test_origin_barrier_discards_lease_even_without_remote_work);

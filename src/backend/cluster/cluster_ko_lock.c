@@ -3467,7 +3467,8 @@ cluster_ko_drain_inbound_and_apply(void)
 		if ((slot.shared && slot.epoch == 0) || slot.epoch != cluster_epoch_get_current()
 			|| slot.shared != cluster_shared_config
 			|| (slot.shared
-				&& (slot.v3 ? !ko_shared_v3_control_current(&slot.qualified_v3)
+				&& (slot.v3 ? (!ko_shared_v3_control_current(&slot.qualified_v3)
+												|| !ko_shared_v3_space_current(&slot.qualified_v3))
 								 : (!ko_shared_control_current(&slot.qualified)
 									|| !ko_shared_peer_space_current(&slot.qualified)))))
 			goto next;
@@ -3480,7 +3481,8 @@ cluster_ko_drain_inbound_and_apply(void)
 		}
 		smgr = smgropen(rloc, InvalidBackendId);
 		if (slot.epoch != cluster_epoch_get_current()
-			|| (slot.shared && (slot.v3 ? !ko_shared_v3_control_current(&slot.qualified_v3)
+			|| (slot.shared && (slot.v3 ? (!ko_shared_v3_control_current(&slot.qualified_v3)
+																				 || !ko_shared_v3_space_current(&slot.qualified_v3))
 													 : !ko_shared_control_current(&slot.qualified))))
 			goto next;
 
@@ -3492,7 +3494,8 @@ cluster_ko_drain_inbound_and_apply(void)
 		 */
 		FlushRelationsAllBuffers(&smgr, 1);
 		if (slot.epoch != cluster_epoch_get_current()
-			|| (slot.shared && (slot.v3 ? !ko_shared_v3_control_current(&slot.qualified_v3)
+			|| (slot.shared && (slot.v3 ? (!ko_shared_v3_control_current(&slot.qualified_v3)
+																				 || !ko_shared_v3_space_current(&slot.qualified_v3))
 													 : !ko_shared_control_current(&slot.qualified))))
 			goto next;
 		if (cluster_shared_config && cluster_smgr_which_for(rloc, InvalidBackendId) == 1) {
@@ -3502,13 +3505,16 @@ cluster_ko_drain_inbound_and_apply(void)
 				if (smgrexists(smgr, fork))
 					smgrimmedsync(smgr, fork);
 				if (slot.epoch != cluster_epoch_get_current()
-					|| (slot.shared && !ko_shared_control_current(&slot.qualified)))
+					|| (slot.shared && (slot.v3 ? !ko_shared_v3_control_current(&slot.qualified_v3)
+																					 : !ko_shared_control_current(&slot.qualified))))
 					goto next;
 			}
 		}
 		/* Check SPACE before invalidation; rereading it afterwards would
 		 * recreate precisely the buffer the barrier has just discarded. */
-		if (slot.shared && !slot.v3 && !ko_shared_peer_space_current(&slot.qualified))
+		if (slot.shared
+			&& (slot.v3 ? !ko_shared_v3_space_current(&slot.qualified_v3)
+						: !ko_shared_peer_space_current(&slot.qualified)))
 			goto next;
 		DropRelationsAllBuffers(&smgr, 1);
 		cluster_hw_lease_discard(rloc, MAIN_FORKNUM);
