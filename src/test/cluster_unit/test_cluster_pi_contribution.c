@@ -260,6 +260,8 @@ UT_TEST(test_pi_ctrc_generation_zero_is_retained_without_apply_eligibility)
 	RfSideOnlinePlanV1 *plan, *recovery;
 	RfSideOnlineOperationV1 op;
 	RfPageProofDetailV1 detail;
+	RfSideOnlineApplyOpsV1 ops = { 0 };
+	ApplyCapture capture = { 0 };
 
 	release.segment_id = 513;
 	release.segment_generation = 0;
@@ -292,7 +294,21 @@ UT_TEST(test_pi_ctrc_generation_zero_is_retained_without_apply_eligibility)
 	}
 	recovery = pi_side_plan(&identity, false);
 	UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(recovery, &record, &identity),
-				 RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(recovery), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_side_online_plan_operation_v1(recovery, 0, &op));
+	UT_ASSERT_EQ(op.undo.expected_generation, 0);
+	/* A valid generation is not execution authority. The PI plan still
+	 * rejects before any original apply callback can start. */
+	ops.arg = &capture;
+	ops.begin_protected_set = capture_begin;
+	ops.end_protected_set = capture_end;
+	ops.preflight_undo = accept_preflight;
+	ops.apply_undo = capture_apply;
+	UT_ASSERT_NE(rf_side_online_plan_preflight_v1(plan, &ops), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_NE(rf_side_online_plan_apply_v1(plan, &ops), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(capture.begin_count, 0);
+	UT_ASSERT_EQ(capture.count, 0);
 	rf_side_online_plan_destroy_v1(&recovery);
 	rf_side_online_plan_destroy_v1(&plan);
 }
@@ -331,7 +347,7 @@ UT_TEST(test_pi_ctrc_other_fields_still_refuse)
 		d.flags = CLUSTER_UNDO_TT_CTRC_RELEASE_ALL_TOUCHED_ACKED;
 		memset(d.ack_set_digest, 0x42, sizeof(d.ack_set_digest));
 		UT_ASSERT(cluster_undo_inspect_pi(&d));
-		UT_ASSERT(!cluster_undo_preflight(&d));
+		UT_ASSERT(cluster_undo_preflight(&d));
 		switch (variant) {
 		case 0: memset(d.ack_set_digest, 0, sizeof(d.ack_set_digest)); break;
 		case 1: d.instance = 2; break;
