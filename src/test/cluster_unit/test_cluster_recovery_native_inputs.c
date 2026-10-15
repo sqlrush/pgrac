@@ -9,6 +9,7 @@ int control_fixture_main(int argc, char **argv);
 #undef main
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_recovery_native_inventory.h"
+#include "cluster/cluster_recovery_record_hash.h"
 
 static unsigned inventory_census_calls;
 static void (*inventory_between_passes)(void);
@@ -36,6 +37,8 @@ inventory_test_census(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitorV1 visi
 static ClusterWalSourceRef inventory_fault_source;
 static XLogRecPtr inventory_commit_start, inventory_commit_previous;
 static unsigned inventory_fault;
+static unsigned inventory_extra;
+static XLogRecPtr inventory_extra_start, inventory_extra_previous;
 
 /* These small records stay within the original checkpoint's first WAL page.
  * Header, main-data framing and CRC are actual native-reader inputs. */
@@ -69,6 +72,51 @@ inventory_write_record(const ClusterWalSourceRef *source, XLogRecPtr at, XLogRec
 	UT_ASSERT_EQ(pwrite(fd, bytes, record.xl_tot_len, at % wal_segment_size), record.xl_tot_len);
 	UT_ASSERT_EQ(close(fd), 0);
 	return (WalTestRecord){ 1, MAXALIGN(at + record.xl_tot_len), at, record.xl_crc };
+}
+
+/* A real FSM record, including the original fixed PageVersion wire edge. */
+static WalTestRecord
+inventory_write_fsm(const ClusterWalSourceRef *source, XLogRecPtr at, XLogRecPtr previous,
+					BlockNumber block)
+{
+	uint8 bytes[256] = { 0 };
+	uint8 *edge = bytes + SizeOfXLogRecord;
+	XLogRecord record = { 0 };
+	XLogRecordBlockHeader header = { .id = 0, .fork_flags = FSM_FORKNUM, .data_length = 0 };
+	RelFileLocator locator = { 1663, 5, 16386 };
+	size_t used = SizeOfXLogRecord + 64;
+	char path[MAXPGPATH];
+	int fd;
+
+	edge[0] = XLR_BLOCK_ID_PAGE_VERSION_EDGE;
+	edge[1] = XLR_PAGE_VERSION_EDGE_FORMAT_V1;
+	edge[2] = 1;
+	edge[3] = XLR_PAGE_VERSION_EDGE_ENTRY_SIZE;
+	edge[8] = 31; /* LE result_token */
+	edge[17] = RF_PAGE_CLASS_REBUILDABLE_FSM;
+	edge[18] = edge[19] = RF_PAGE_STATE_REBUILDABLE;
+	memcpy(bytes + used, &header, SizeOfXLogRecordBlockHeader);
+	used += SizeOfXLogRecordBlockHeader;
+	memcpy(bytes + used, &locator, sizeof(locator));
+	used += sizeof(locator);
+	memcpy(bytes + used, &block, sizeof(block));
+	used += sizeof(block);
+	record.xl_tot_len = used;
+	record.xl_prev = previous;
+	record.xl_rmid = RM_GENERIC_ID;
+	record.xl_scn = 5906;
+	INIT_CRC32C(record.xl_crc);
+	COMP_CRC32C(record.xl_crc, bytes + SizeOfXLogRecord, used - SizeOfXLogRecord);
+	COMP_CRC32C(record.xl_crc, &record, offsetof(XLogRecord, xl_crc));
+	FIN_CRC32C(record.xl_crc);
+	memcpy(bytes, &record, SizeOfXLogRecord);
+	v2_checkpoint_wal_path(&source->claim.identity, at, source->timeline, path);
+	UT_ASSERT(at % XLOG_BLCKSZ + used < XLOG_BLCKSZ);
+	fd = open(path, O_WRONLY);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(pwrite(fd, bytes, used, at % wal_segment_size), used);
+	UT_ASSERT_EQ(close(fd), 0);
+	return (WalTestRecord){ 1, MAXALIGN(at + used), at, record.xl_crc };
 }
 
 static WalTestRecord
@@ -116,18 +164,26 @@ inventory_fixture(bool unsupported, bool open_source)
 		unsigned node = i == 0 ? 0 : 127;
 		ClusterWalSourceRef source = { 0 };
 		ClusterControlRootSnapshot *snapshot = &root.records[node];
-		WalTestRecord commit, create;
+		WalTestRecord commit, extra, create;
 		xl_smgr_create payload = { .rlocator = { 1663, 5, 16385 }, .forkNum = MAIN_FORKNUM };
 
 		source.claim.identity = snapshot->identity;
 		source.timeline = snapshot->tail_tli;
 		commit = inventory_write_commit(&source, snapshot->validated_tail_lsn_exclusive,
 										snapshot->tail_last_record_lsn, 8765, unsupported);
-		create = inventory_write_record(&source, commit.exclusive_end, commit.record_start,
+		extra = commit;
+		if (inventory_extra == 1)
+			extra = inventory_write_record(&source, commit.exclusive_end, commit.record_start,
+										   RM_XLOG_ID, XLOG_NOOP, "abc", 3);
+		else if (inventory_extra == 2)
+			extra = inventory_write_fsm(&source, commit.exclusive_end, commit.record_start, 31);
+		create = inventory_write_record(&source, extra.exclusive_end, extra.record_start,
 										RM_SMGR_ID, XLOG_SMGR_CREATE, &payload, sizeof(payload));
 		if (i == 0) {
 			inventory_fault_source = source;
 			inventory_commit_start = commit.record_start;
+			inventory_extra_start = extra.record_start;
+			inventory_extra_previous = commit.record_start;
 			inventory_commit_previous = snapshot->tail_last_record_lsn;
 		}
 		snapshot->tail_last_record_lsn = create.record_start;
@@ -170,6 +226,14 @@ inventory_drift(void)
 		break;
 	case 4:
 		pg_re_throw();
+		break;
+	case 6:
+		(void)inventory_write_record(&inventory_fault_source, inventory_extra_start,
+									 inventory_extra_previous, RM_XLOG_ID, XLOG_NOOP, "abd", 3);
+		break;
+	case 7:
+		(void)inventory_write_fsm(&inventory_fault_source, inventory_extra_start,
+								  inventory_extra_previous, 32);
 		break;
 	case 5: {
 		/* Same ordinal and byte length, but no longer this native family.
@@ -322,6 +386,10 @@ UT_TEST(test_native_inventory_open_unknown_and_online_never_observed)
 	}
 }
 
+static ClusterRecoveryRootSet *inventory_roots(ClusterWalInputsV1 *inputs, char path[MAXPGPATH],
+											   int *fd, bool mismatch);
+static void inventory_roots_done(ClusterRecoveryRootSet *roots, int fd, const char *path);
+
 UT_TEST(test_native_inventory_keeps_real_empty_sources_and_other_obligations)
 {
 	int saved_node = cluster_node_id;
@@ -332,6 +400,9 @@ UT_TEST(test_native_inventory_keeps_real_empty_sources_and_other_obligations)
 	ClusterRecoveryNativeInventory *inventory = NULL;
 	ClusterRecoveryNativeInventoryDiag diag;
 	ClusterRecoveryNativeEffect effect;
+	ClusterRecoveryRootSet *roots = NULL;
+	char root_path[MAXPGPATH];
+	int root_fd = -1;
 	ControlRootImage root;
 	ControlFileData control;
 	ClusterControlRootFileToken token;
@@ -360,7 +431,9 @@ UT_TEST(test_native_inventory_keeps_real_empty_sources_and_other_obligations)
 	selected = cluster_wal_inputs_count_v1(inputs);
 	inventory_census_calls = 0;
 	inventory_between_passes = NULL;
-	UT_ASSERT_EQ(cluster_recovery_native_inventory_build(inputs, 1024 * 1024, &inventory, &diag),
+	roots = inventory_roots(inputs, root_path, &root_fd, false);
+	UT_ASSERT_EQ(cluster_recovery_native_inventory_collect_roots(inputs, roots, 1024 * 1024,
+																 &inventory, &diag),
 				 CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED);
 	UT_ASSERT_EQ(inventory_census_calls, 2);
 	UT_ASSERT_EQ(diag.sources, selected);
@@ -378,12 +451,16 @@ UT_TEST(test_native_inventory_keeps_real_empty_sources_and_other_obligations)
 		UT_ASSERT_EQ(empty, 1);
 	}
 cleanup:
+	if (roots != NULL)
+		inventory_roots_done(roots, root_fd, root_path);
 	cluster_recovery_native_inventory_destroy(inventory);
 	cold_census_done(&inputs);
 	test_reserve_mode = false;
 	cluster_node_id = saved_node;
 	test_self_incarnation = saved_incarnation;
 }
+
+#include "test_cluster_recovery_native_transcript.inc"
 
 int
 main(int argc, char **argv)
@@ -392,12 +469,17 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(5);
+	UT_PLAN(10);
 	UT_RUN(test_native_inventory_uses_two_real_cold_passes);
 	UT_RUN(test_native_inventory_never_returns_partial_on_drift_io_or_error);
 	UT_RUN(test_native_inventory_capacity_is_not_partial_success);
 	UT_RUN(test_native_inventory_open_unknown_and_online_never_observed);
 	UT_RUN(test_native_inventory_keeps_real_empty_sources_and_other_obligations);
+	UT_RUN(test_native_inventory_detects_non_native_rewrite);
+	UT_RUN(test_native_inventory_collects_real_fsm_and_all_physical_roots);
+	UT_RUN(test_native_inventory_poison_targets_on_error_and_drift);
+	UT_RUN(test_record_transcript_full_fields_and_storage_independence);
+	UT_RUN(test_record_transcript_rejects_unsafe_bounds);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -10,11 +10,14 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_recovery_native_inventory.h"
+#include "cluster/cluster_recovery_record_hash.h"
+#include "cluster/cluster_recovery_wal_targets.h"
 
 typedef struct NativeInventorySource {
 	ClusterWalSourceRef source;
 	RfContributorStreamCutV1 cut;
 	ClusterWalTailObservation observed;
+	uint8 transcript[32];
 } NativeInventorySource;
 
 typedef struct NativeInventoryRecord {
@@ -29,6 +32,8 @@ struct ClusterRecoveryNativeInventory {
 	NativeInventoryRecord *head;
 	NativeInventoryRecord *tail;
 	NativeInventoryRecord *cursor;
+	ClusterRecoveryRootSet *roots; /* borrowed; no further access after collection */
+	pg_cryptohash_ctx *hash;
 	ClusterRecoveryNativeInventoryDiag diag;
 	ClusterRecoveryNativeInventoryResult status;
 	size_t budget;
@@ -81,8 +86,10 @@ static RfPageProofDetailV1
 inventory_source(const ClusterWalSourceRef *source, const RfContributorStreamCutV1 *cut,
 				 const ClusterWalTailObservation *completed, void *arg)
 {
+	static const uint8 domain[] = "PGRAC-E1-WAL-SOURCE-V1";
 	ClusterRecoveryNativeInventory *work = arg;
 	NativeInventorySource *saved;
+	uint8 transcript[32];
 
 	if (work->source_cursor >= work->source_count || source == NULL || cut == NULL)
 		return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
@@ -93,12 +100,23 @@ inventory_source(const ClusterWalSourceRef *source, const RfContributorStreamCut
 			return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
 									RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
 		if (work->pass == 0) {
+			/* Empty terminals have no record callback. Bind them here too. */
+			if (work->roots != NULL
+				&& !cluster_recovery_root_set_targets_match(
+					work->roots, source->claim.identity.system_identifier,
+					source->claim.database_incarnation, source->claim.identity.storage_uuid))
+				return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
+										RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
 			saved->source = *source;
 			saved->cut = *cut;
 		} else if (!inventory_source_equal(&saved->source, source)
 				   || !inventory_cut_equal(&saved->cut, cut))
 			return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
 									RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
+		if (pg_cryptohash_init(work->hash) != 0
+			|| pg_cryptohash_update(work->hash, domain, sizeof(domain)) != 0)
+			return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID,
+									RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
 		work->active = true;
 		work->source_records = 0;
 	} else {
@@ -107,10 +125,15 @@ inventory_source(const ClusterWalSourceRef *source, const RfContributorStreamCut
 			|| !inventory_cut_equal(&saved->cut, cut))
 			return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
 									RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
-		if (work->pass == 0)
+		if (pg_cryptohash_final(work->hash, transcript, sizeof(transcript)) != 0)
+			return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID,
+									RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+		if (work->pass == 0) {
 			saved->observed = *completed;
-		else if (!inventory_tail_equal(&saved->observed, completed)
-				 || (work->cursor != NULL && work->cursor->source_index == work->source_cursor))
+			memcpy(saved->transcript, transcript, sizeof(transcript));
+		} else if (!inventory_tail_equal(&saved->observed, completed)
+				   || memcmp(saved->transcript, transcript, sizeof(transcript)) != 0
+				   || (work->cursor != NULL && work->cursor->source_index == work->source_cursor))
 			return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
 									RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
 		work->source_cursor++;
@@ -136,6 +159,39 @@ inventory_record(XLogReaderState *reader, const ClusterWalSourceRef *source,
 		return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY,
 								RF_PAGE_PROOF_DETAIL_CAPACITY);
 	ordinal = work->source_records++;
+	if (!cluster_recovery_record_hash_update(work->hash, reader))
+		return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID,
+								RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+	if (work->pass == 0 && work->roots != NULL) {
+		ClusterRecoveryWalTargetsDiag targets;
+
+		/* Scratch native parsing is freed before retaining the native record
+		 * below; both use the same remaining owned-allocation budget. */
+		if (!cluster_recovery_wal_targets_collect(work->roots, reader, source, cut,
+												  work->budget - work->diag.owned_bytes,
+												  &targets)) {
+			bool capacity = targets.native_result == CLUSTER_RECOVERY_NATIVE_CAPACITY
+							|| targets.roots_result == CLUSTER_RECOVERY_ROOTS_CAPACITY
+							|| targets.route_detail == RF_PAGE_PROOF_DETAIL_CAPACITY;
+
+			work->diag.native_result = targets.native_result;
+			return inventory_refuse(work,
+									capacity ? CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY
+											 : CLUSTER_RECOVERY_NATIVE_INVENTORY_UNSUPPORTED,
+									capacity ? RF_PAGE_PROOF_DETAIL_CAPACITY
+											 : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+		}
+		if (UINT64_MAX - work->diag.page_targets < targets.page_targets
+			|| UINT64_MAX - work->diag.rebuildable_targets < targets.rebuildable_targets
+			|| UINT64_MAX - work->diag.structural_effects < targets.structural_effects
+			|| UINT64_MAX - work->diag.unowned_target_records < targets.unowned_records)
+			return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY,
+									RF_PAGE_PROOF_DETAIL_CAPACITY);
+		work->diag.page_targets += targets.page_targets;
+		work->diag.rebuildable_targets += targets.rebuildable_targets;
+		work->diag.structural_effects += targets.structural_effects;
+		work->diag.unowned_target_records += targets.unowned_records;
+	}
 	/* This inventory owns XACT, plus native CREATE. Other records are
 	 * explicitly counted and still require their original typed owners. */
 	owns = XLogRecGetRmid(reader) == RM_XACT_ID
@@ -200,10 +256,9 @@ inventory_record(XLogReaderState *reader, const ClusterWalSourceRef *source,
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
-ClusterRecoveryNativeInventoryResult
-cluster_recovery_native_inventory_build(ClusterWalInputsV1 *inputs, size_t memory_budget,
-										ClusterRecoveryNativeInventory **out,
-										ClusterRecoveryNativeInventoryDiag *diag)
+static ClusterRecoveryNativeInventoryResult
+inventory_build(ClusterWalInputsV1 *inputs, ClusterRecoveryRootSet *roots, size_t memory_budget,
+				ClusterRecoveryNativeInventory **out, ClusterRecoveryNativeInventoryDiag *diag)
 {
 	ClusterRecoveryNativeInventory *work;
 	ClusterRecoveryNativeInventoryResult result;
@@ -226,13 +281,19 @@ cluster_recovery_native_inventory_build(ClusterWalInputsV1 *inputs, size_t memor
 	if (work == NULL)
 		return CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY;
 	work->sources = (NativeInventorySource *)((char *)work + prefix);
+	work->roots = roots;
 	work->budget = memory_budget;
 	work->source_count = work->diag.sources = count;
 	work->diag.owned_bytes = size;
 	work->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED;
 	PG_TRY();
 	{
-		for (work->pass = 0; work->pass < 2; work->pass++) {
+		work->hash = pg_cryptohash_create(PG_SHA256);
+		if (work->hash == NULL)
+			work->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY;
+		for (work->pass = 0;
+			 work->pass < 2 && work->status == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED;
+			 work->pass++) {
 			uint64 records = 0;
 
 			work->source_cursor = 0;
@@ -254,6 +315,7 @@ cluster_recovery_native_inventory_build(ClusterWalInputsV1 *inputs, size_t memor
 	}
 	PG_CATCH();
 	{
+		cluster_recovery_root_set_invalidate(roots);
 		cluster_recovery_native_inventory_destroy(work);
 		PG_RE_THROW();
 	}
@@ -265,9 +327,41 @@ cluster_recovery_native_inventory_build(ClusterWalInputsV1 *inputs, size_t memor
 		return result;
 	}
 	work->complete = true;
+	work->roots = NULL;
+	pg_cryptohash_free(work->hash);
+	work->hash = NULL;
 	work->cursor = work->head;
 	*out = work;
 	return CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED;
+}
+
+ClusterRecoveryNativeInventoryResult
+cluster_recovery_native_inventory_build(ClusterWalInputsV1 *inputs, size_t memory_budget,
+										ClusterRecoveryNativeInventory **out,
+										ClusterRecoveryNativeInventoryDiag *diag)
+{
+	return inventory_build(inputs, NULL, memory_budget, out, diag);
+}
+
+ClusterRecoveryNativeInventoryResult
+cluster_recovery_native_inventory_collect_roots(ClusterWalInputsV1 *inputs,
+												ClusterRecoveryRootSet *roots, size_t memory_budget,
+												ClusterRecoveryNativeInventory **out,
+												ClusterRecoveryNativeInventoryDiag *diag)
+{
+	ClusterRecoveryNativeInventoryResult result;
+
+	if (roots == NULL) {
+		if (out != NULL)
+			*out = NULL;
+		if (diag != NULL)
+			memset(diag, 0, sizeof(*diag));
+		return CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID;
+	}
+	result = inventory_build(inputs, roots, memory_budget, out, diag);
+	if (result != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED)
+		cluster_recovery_root_set_invalidate(roots);
+	return result;
 }
 
 ClusterRecoveryNativeInventoryResult
@@ -305,6 +399,7 @@ cluster_recovery_native_inventory_destroy(ClusterRecoveryNativeInventory *invent
 
 	if (inventory == NULL)
 		return;
+	pg_cryptohash_free(inventory->hash);
 	record = inventory->head;
 	while (record != NULL) {
 		NativeInventoryRecord *next = record->next;

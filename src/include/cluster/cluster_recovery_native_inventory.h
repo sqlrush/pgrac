@@ -11,6 +11,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_recovery_native_scan.h"
+#include "cluster/cluster_recovery_root_set.h"
 #include "cluster/cluster_wal_inputs.h"
 
 typedef enum ClusterRecoveryNativeInventoryResult {
@@ -32,15 +33,19 @@ typedef struct ClusterRecoveryNativeInventoryDiag {
 	uint64 records;
 	uint64 native_records;
 	uint64 other_records; /* not owned or proven by this native inventory */
+	uint64 page_targets;
+	uint64 rebuildable_targets;
+	uint64 structural_effects;
+	uint64 unowned_target_records;
 	size_t owned_bytes;
 } ClusterRecoveryNativeInventoryDiag;
 
 typedef struct ClusterRecoveryNativeInventory ClusterRecoveryNativeInventory;
 
 /* Borrow the original startup cold scope for two complete physical passes.
- * Every source (including explicit empty terminals), exact cut, native
- * record position and full native bytes must agree. The original census
- * validates ROOT/claim/WALR and the physical stream at the end of each pass.
+ * Every source (including explicit empty terminals), exact cut, record
+ * position and full decoded bytes of every family must agree. The original
+ * census validates ROOT/claim/WALR and the physical stream after each pass.
  * Failure/ERROR exposes no partial inventory. Destroy on every caller exit.
  *
  * These are owned observations, not a replay plan or terminal/OPEN/GC
@@ -52,6 +57,15 @@ extern ClusterRecoveryNativeInventoryResult
 cluster_recovery_native_inventory_build(ClusterWalInputsV1 *inputs, size_t memory_budget,
 										ClusterRecoveryNativeInventory **out,
 										ClusterRecoveryNativeInventoryDiag *diag);
+/* Same two cold passes, also collecting PAGE/FSM/native storage/SPACE
+ * targets into an unstarted root set. Both outputs remain provisional
+ * until all source records (including non-native bytes) agree. Failure
+ * or ERROR invalidates roots. Root storage has its own caller-set budget;
+ * the original reader and one cryptohash context are not inventory storage.
+ * Other owners and the full physical/graph re-observation remain required. */
+extern ClusterRecoveryNativeInventoryResult cluster_recovery_native_inventory_collect_roots(
+	ClusterWalInputsV1 *inputs, ClusterRecoveryRootSet *roots, size_t memory_budget,
+	ClusterRecoveryNativeInventory **out, ClusterRecoveryNativeInventoryDiag *diag);
 /* At most one native effect per call after both passes. END drains this
  * native subset only; it never discharges other_records or physical roots. */
 extern ClusterRecoveryNativeInventoryResult
