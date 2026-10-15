@@ -463,11 +463,12 @@ UT_TEST(test_bad_edge_mixed_side_and_unclassified_opcode_do_not_finish_roots)
 #include "test_cluster_recovery_multixact_physical.inc"
 #include "test_cluster_recovery_multixact_join.inc"
 #include "test_cluster_recovery_xact_join.inc"
+#include "test_cluster_recovery_relmap_targets.inc"
 
 int
 main(void)
 {
-	UT_PLAN(52);
+	UT_PLAN(56);
 	UT_RUN(test_page_and_rebuildable_fsm_keep_all_file_targets);
 	UT_RUN(test_typed_structure_keeps_all_forks_and_space_pages);
 	UT_RUN(test_native_create_and_truncate_do_not_invent_page_requirements);
@@ -520,6 +521,10 @@ main(void)
 	UT_RUN(test_xact_join_scope_capacity_and_special_requested_xid_refuse);
 	UT_RUN(test_xact_join_drained_revoked_by_original_owner);
 	UT_RUN(test_xact_join_metadata_has_bounded_progress);
+	UT_RUN(test_relmap_targets_include_all_copies_and_referenced_forks);
+	UT_RUN(test_relmap_empty_keeps_missing_short_and_untouched_copies);
+	UT_RUN(test_relmap_target_failures_revoke_entire_union);
+	UT_RUN(test_relmap_mapping_requires_exact_original_array_and_ordinal);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

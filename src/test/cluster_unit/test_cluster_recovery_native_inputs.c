@@ -19,6 +19,7 @@ int control_fixture_main(int argc, char **argv);
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "../../backend/cluster/cluster_uba.c"
 #include "test_cluster_heap_small_scn.inc"
+#include "test_cluster_recovery_relmap_fixture.h"
 
 static unsigned inventory_census_calls;
 static void (*inventory_between_passes)(void);
@@ -53,29 +54,36 @@ static XLogRecPtr inventory_extra_start, inventory_extra_previous;
 static XLogRecPtr inventory_mx_start, inventory_mx_previous;
 static XLogRecPtr inventory_slru_start[4], inventory_slru_previous[4];
 static unsigned inventory_slru_fault;
+static unsigned inventory_relmap_fault;
 
 /* These small records stay within the original checkpoint's first WAL page.
  * Header, main-data framing and CRC are actual native-reader inputs. */
 static WalTestRecord
 inventory_write_record(const ClusterWalSourceRef *source, XLogRecPtr at, XLogRecPtr previous,
-					   RmgrId rmid, uint8 info, const void *payload, uint8 length)
+					   RmgrId rmid, uint8 info, const void *payload, uint32 length)
 {
-	uint8 bytes[512] = { 0 };
+	uint8 bytes[2048] = { 0 };
+	size_t framing = length <= UINT8_MAX ? 2 : 5;
 	XLogRecord record = { 0 };
 	char path[MAXPGPATH];
 	int fd;
 
-	record.xl_tot_len = SizeOfXLogRecord + 2 + length;
+	UT_ASSERT(length <= sizeof(bytes) - SizeOfXLogRecord - framing);
+	record.xl_tot_len = SizeOfXLogRecord + framing + length;
 	record.xl_prev = previous;
 	record.xl_rmid = rmid;
 	record.xl_info = info;
 	record.xl_xid = 4195136;
 	record.xl_scn = 5906;
-	bytes[SizeOfXLogRecord] = XLR_BLOCK_ID_DATA_SHORT;
-	bytes[SizeOfXLogRecord + 1] = length;
-	memcpy(bytes + SizeOfXLogRecord + 2, payload, length);
+	bytes[SizeOfXLogRecord]
+		= length <= UINT8_MAX ? XLR_BLOCK_ID_DATA_SHORT : XLR_BLOCK_ID_DATA_LONG;
+	if (length <= UINT8_MAX)
+		bytes[SizeOfXLogRecord + 1] = length;
+	else
+		memcpy(bytes + SizeOfXLogRecord + 1, &length, sizeof(length));
+	memcpy(bytes + SizeOfXLogRecord + framing, payload, length);
 	INIT_CRC32C(record.xl_crc);
-	COMP_CRC32C(record.xl_crc, bytes + SizeOfXLogRecord, 2 + length);
+	COMP_CRC32C(record.xl_crc, bytes + SizeOfXLogRecord, framing + length);
 	COMP_CRC32C(record.xl_crc, &record, offsetof(XLogRecord, xl_crc));
 	FIN_CRC32C(record.xl_crc);
 	memcpy(bytes, &record, SizeOfXLogRecord);
@@ -354,6 +362,15 @@ inventory_fixture(bool unsupported, bool open_source)
 			memcpy(bytes + MinSizeOfXactAssignment, children, sizeof(children));
 			extra = inventory_write_record(&source, extra.exclusive_end, extra.record_start,
 										   RM_XACT_ID, XLOG_XACT_ASSIGNMENT, bytes, sizeof(bytes));
+		}
+		if (inventory_extra == 14) {
+			char bytes[TEST_RELMAP_LENGTH];
+			uint8 opcode = inventory_relmap_fault == 1 ? 0x10 : XLOG_RELMAP_UPDATE;
+			test_relmap_payload(bytes, node == 0, 2);
+			if (inventory_relmap_fault == 2)
+				bytes[TEST_RELMAP_LENGTH - 1] ^= 1;
+			extra = inventory_write_record(&source, extra.exclusive_end, extra.record_start,
+										   RM_RELMAP_ID, opcode, bytes, sizeof(bytes));
 		}
 		create = inventory_write_record(&source, extra.exclusive_end, extra.record_start,
 										RM_SMGR_ID, XLOG_SMGR_CREATE, &payload, sizeof(payload));
@@ -646,6 +663,7 @@ cleanup:
 #include "test_cluster_recovery_multixact_join_inputs.inc"
 #include "test_cluster_recovery_census_inputs.inc"
 #include "test_cluster_recovery_xact_join_inputs.inc"
+#include "test_cluster_recovery_relmap_inputs.inc"
 
 int
 main(int argc, char **argv)
@@ -654,7 +672,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(48);
+	UT_PLAN(51);
 	UT_RUN(test_native_inventory_uses_two_real_cold_passes);
 	UT_RUN(test_native_inventory_never_returns_partial_on_drift_io_or_error);
 	UT_RUN(test_native_inventory_capacity_is_not_partial_success);
@@ -703,6 +721,9 @@ main(int argc, char **argv)
 	UT_RUN(test_cold_xact_join_keeps_every_source_and_raw_effect);
 	UT_RUN(test_cold_xact_join_final_wal_roots_destroy_revoke_outputs);
 	UT_RUN(test_owned_xact_join_still_requires_final_whole_inputs);
+	UT_RUN(test_cold_relmap_owns_images_entries_and_all_target_paths);
+	UT_RUN(test_cold_relmap_second_and_final_reads_revoke_observations);
+	UT_RUN(test_cold_relmap_malformed_or_unknown_never_becomes_other);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

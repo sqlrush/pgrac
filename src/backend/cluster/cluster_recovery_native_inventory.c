@@ -237,7 +237,7 @@ inventory_record(XLogReaderState *reader, const ClusterWalSourceRef *source,
 	 * source/cut/payload re-observation. Enumeration discharges no effects. */
 	owns = XLogRecGetRmid(reader) == RM_XACT_ID || XLogRecGetRmid(reader) == RM_CLUSTER_UNDO_ID
 		   || XLogRecGetRmid(reader) == RM_MULTIXACT_ID || XLogRecGetRmid(reader) == RM_CLOG_ID
-		   || XLogRecGetRmid(reader) == RM_COMMIT_TS_ID
+		   || XLogRecGetRmid(reader) == RM_COMMIT_TS_ID || XLogRecGetRmid(reader) == RM_RELMAP_ID
 		   || (XLogRecGetRmid(reader) == RM_SMGR_ID
 			   && (XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_SMGR_CREATE);
 	if (work->pass == 1) {
@@ -298,6 +298,8 @@ inventory_record(XLogReaderState *reader, const ClusterWalSourceRef *source,
 		work->diag.clog_records++;
 	if (XLogRecGetRmid(reader) == RM_COMMIT_TS_ID)
 		work->diag.commit_ts_records++;
+	if (XLogRecGetRmid(reader) == RM_RELMAP_ID)
+		work->diag.relmap_records++;
 	record->source_index = work->source_cursor;
 	record->ordinal = ordinal;
 	if (work->tail == NULL)

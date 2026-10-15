@@ -51,7 +51,9 @@ typedef enum ClusterRecoveryNativeKind {
 	CLUSTER_RECOVERY_NATIVE_CLOG_ZERO,
 	CLUSTER_RECOVERY_NATIVE_CLOG_TRUNCATE,
 	CLUSTER_RECOVERY_NATIVE_COMMIT_TS_ZERO,
-	CLUSTER_RECOVERY_NATIVE_COMMIT_TS_TRUNCATE
+	CLUSTER_RECOVERY_NATIVE_COMMIT_TS_TRUNCATE,
+	CLUSTER_RECOVERY_NATIVE_RELMAP_UPDATE,
+	CLUSTER_RECOVERY_NATIVE_RELMAP_ENTRY
 } ClusterRecoveryNativeKind;
 
 /* Exact observed source and bytes, not a claim/cut authentication. Keep this
@@ -73,8 +75,9 @@ typedef struct ClusterRecoveryNativeRecord {
 	uint32 payload_length;
 	uint32 xinfo;
 	TransactionId top_xid;
-	uint32 subxacts_offset; /* bounded original array within owned payload */
-	uint32 nsubxacts;		/* membership, not the immediate parent chain */
+	uint32 subxacts_offset;			   /* bounded original array within owned payload */
+	uint32 nsubxacts;				   /* membership, not the immediate parent chain */
+	uint32 mappings_offset, nmappings; /* bounded original relmap entries */
 	Oid database;
 	Oid tablespace;
 	TimestampTz xact_time;
@@ -115,6 +118,11 @@ typedef struct ClusterRecoveryNativeScan ClusterRecoveryNativeScan;
  * ZERO targets only the original source's physical namespace; TRUNCATE
  * retains a separate lifecycle obligation. No shared commit_ts replay is
  * enabled by this inspector, and no SUBTRANS parent relationship is inferred. */
+
+/* RELMAP_UPDATE retains the entire native image (including inactive slots);
+ * RELMAP_ENTRY exposes each active original mapping with its exact ordinal.
+ * Image CRC/shape acceptance is not authority-format compatibility, pending
+ * publication, invalidation completion or RESET proof. */
 
 /* Borrow an already verified reader only during begin; copy the entire main
  * payload under the explicit budget. No I/O, apply, authority or completion

@@ -21,6 +21,8 @@
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "common/cryptohash.h"
+#include "common/relmap.h"
+#include "utils/relmapper.h"
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -553,6 +555,88 @@ roots_add_xact_slru(ClusterRecoveryRootSet *roots, const ClusterRecoveryNativeEf
 							   xid / per_page);
 }
 
+/* Every map copy and referenced filenumber remains a candidate, including
+ * absent files. Native image syntax does not identify an authority version
+ * or prove that a pending map was published. Mapping addresses do not supply
+ * a SPACE incarnation, generation or a promise that block zero exists. */
+static ClusterRecoveryRootsResult
+roots_add_relmap(ClusterRecoveryRootSet *roots, const ClusterRecoveryNativeEffect *effect)
+{
+	const ClusterRecoveryNativeRecord *record = effect->record;
+	xl_relmap_update update;
+	RelMapFile map;
+	pg_crc32c crc;
+
+	if (!cluster_wal_claim_v2_ref_valid(&record->source.claim)
+		|| record->header.xl_rmid != RM_RELMAP_ID
+		|| (record->header.xl_info & ~XLR_INFO_MASK) != XLOG_RELMAP_UPDATE
+		|| record->payload == NULL || record->payload_length != MinSizeOfRelmapUpdate + sizeof(map))
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	memcpy(&update, record->payload, MinSizeOfRelmapUpdate);
+	memcpy(&map, record->payload + MinSizeOfRelmapUpdate, sizeof(map));
+	if (update.nbytes != sizeof(map) || map.magic != RELMAPPER_FILEMAGIC || map.num_mappings < 0
+		|| map.num_mappings > MAX_MAPPINGS || record->nmappings != (uint32)map.num_mappings
+		|| record->mappings_offset != MinSizeOfRelmapUpdate + offsetof(RelMapFile, mappings)
+		|| record->database != update.dbid || record->tablespace != update.tsid
+		|| (update.tsid == GLOBALTABLESPACE_OID
+				? update.dbid != InvalidOid
+				: update.tsid != DEFAULTTABLESPACE_OID || update.dbid == InvalidOid))
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, &map, offsetof(RelMapFile, crc));
+	FIN_CRC32C(crc);
+	if (!EQ_CRC32C(crc, map.crc))
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	if (effect->kind == CLUSTER_RECOVERY_NATIVE_RELMAP_ENTRY) {
+		const ForkNumber forks[]
+			= { MAIN_FORKNUM, FSM_FORKNUM, VISIBILITYMAP_FORKNUM, SPACE_FORKNUM };
+		RelMapping mapping;
+		RelFileLocator locator = { update.tsid, update.dbid, 0 };
+
+		/* Exact original entry, after proving the entire owned array span. */
+		if (effect->ordinal >= record->nmappings || effect->length != sizeof(mapping)
+			|| effect->bytes
+				   != record->payload + record->mappings_offset
+						  + (size_t)effect->ordinal * sizeof(mapping))
+			return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+		memcpy(&mapping, effect->bytes, sizeof(mapping));
+		locator.relNumber = mapping.mapfilenumber;
+		for (unsigned i = 0; i < lengthof(forks); ++i) {
+			ClusterRecoveryRootsResult result = roots_add_relation(roots, &locator, forks[i], 0);
+			if (result != CLUSTER_RECOVERY_ROOTS_MORE)
+				return result;
+		}
+	} else {
+		const char *names[] = { "pg_filenode.map", "pg_filenode.map.bak", "pgrac_relmap_authority",
+								"pgrac_relmap_authority.bak" };
+		const ClusterRecoveryFileKind kinds[]
+			= { CLUSTER_RECOVERY_FILE_RELMAP, CLUSTER_RECOVERY_FILE_RELMAP_BACKUP,
+				CLUSTER_RECOVERY_FILE_RELMAP_AUTHORITY,
+				CLUSTER_RECOVERY_FILE_RELMAP_AUTHORITY_BACKUP };
+
+		if (effect->kind != CLUSTER_RECOVERY_NATIVE_RELMAP_UPDATE || effect->ordinal != 0
+			|| effect->bytes != record->payload || effect->length != record->payload_length)
+			return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+		for (unsigned i = 0; i < lengthof(names); ++i) {
+			char path[MAXPGPATH];
+			uint32 index;
+			ClusterRecoveryRootEntry *entry;
+			if (update.tsid == GLOBALTABLESPACE_OID)
+				snprintf(path, sizeof(path), "global/%s", names[i]);
+			else
+				snprintf(path, sizeof(path), "base/%u/%s", update.dbid, names[i]);
+			if (!roots_lookup(roots, path, true, &index))
+				return roots->status;
+			entry = &roots->entries[index];
+			entry->file.kind = kinds[i];
+			entry->file.locator = (RelFileLocator){ update.tsid, update.dbid, 0 };
+			entry->file.forknum = InvalidForkNumber;
+			entry->origins |= CLUSTER_RECOVERY_ROOT_FROM_WAL;
+		}
+	}
+	return CLUSTER_RECOVERY_ROOTS_MORE;
+}
+
 ClusterRecoveryRootsResult
 cluster_recovery_root_set_add_native(ClusterRecoveryRootSet *roots,
 									 const ClusterRecoveryNativeEffect *effect)
@@ -572,6 +656,9 @@ cluster_recovery_root_set_add_native(ClusterRecoveryRootSet *roots,
 		|| memcmp(record->source.claim.identity.storage_uuid, roots->storage_uuid, 16) != 0)
 		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
 	opcode = record->header.xl_info & ~XLR_INFO_MASK;
+	if (effect->kind == CLUSTER_RECOVERY_NATIVE_RELMAP_UPDATE
+		|| effect->kind == CLUSTER_RECOVERY_NATIVE_RELMAP_ENTRY)
+		return roots_add_relmap(roots, effect);
 	if (effect->kind == CLUSTER_RECOVERY_NATIVE_TERMINAL
 		|| effect->kind == CLUSTER_RECOVERY_NATIVE_ASSIGNMENT
 		|| effect->kind == CLUSTER_RECOVERY_NATIVE_SUBXACT)

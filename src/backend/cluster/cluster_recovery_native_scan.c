@@ -16,12 +16,15 @@
 #include "access/commit_ts.h"
 #include "access/multixact.h"
 #include "catalog/storage_xlog.h"
+#include "catalog/pg_tablespace_d.h"
+#include "common/relmap.h"
 #include "cluster/cluster_native_startup.h"
 #include "cluster/cluster_recovery_native_scan.h"
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_undo_segment.h"
 #include "storage/standbydefs.h"
+#include "utils/relmapper.h"
 
 typedef struct NativeRegion {
 	ClusterRecoveryNativeKind kind;
@@ -133,6 +136,44 @@ native_array_size(uint32 length, size_t base, int count, size_t item_size)
 {
 	return length >= base && count >= 0 && (size_t)count <= (length - base) / item_size
 		   && base + (size_t)count * item_size == length;
+}
+
+/* The native image includes unused slots in its CRC and in the owned WAL
+ * bytes. Only active entries are emitted separately. This validates the
+ * original representation, not authority generations, publish or RESET. */
+static ClusterRecoveryNativeResult
+native_relmap(ClusterRecoveryNativeScan *scan, uint8 opcode)
+{
+	xl_relmap_update update;
+	RelMapFile map;
+	pg_crc32c crc;
+
+	if (opcode != XLOG_RELMAP_UPDATE)
+		return CLUSTER_RECOVERY_NATIVE_UNSUPPORTED;
+	if (scan->record.payload_length != MinSizeOfRelmapUpdate + sizeof(map))
+		return CLUSTER_RECOVERY_NATIVE_SHAPE;
+	memcpy(&update, scan->payload, MinSizeOfRelmapUpdate);
+	memcpy(&map, scan->payload + MinSizeOfRelmapUpdate, sizeof(map));
+	if (update.nbytes != sizeof(map) || map.magic != RELMAPPER_FILEMAGIC || map.num_mappings < 0
+		|| map.num_mappings > MAX_MAPPINGS
+		|| (update.tsid == GLOBALTABLESPACE_OID
+				? update.dbid != InvalidOid
+				: update.tsid != DEFAULTTABLESPACE_OID || update.dbid == InvalidOid))
+		return CLUSTER_RECOVERY_NATIVE_SHAPE;
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, &map, offsetof(RelMapFile, crc));
+	FIN_CRC32C(crc);
+	if (!EQ_CRC32C(crc, map.crc))
+		return CLUSTER_RECOVERY_NATIVE_SHAPE;
+	scan->primary = CLUSTER_RECOVERY_NATIVE_RELMAP_UPDATE;
+	scan->record.database = update.dbid;
+	scan->record.tablespace = update.tsid;
+	scan->record.mappings_offset = MinSizeOfRelmapUpdate + offsetof(RelMapFile, mappings);
+	scan->record.nmappings = map.num_mappings;
+	scan->regions[0] = (NativeRegion){ CLUSTER_RECOVERY_NATIVE_RELMAP_ENTRY,
+									   scan->payload + scan->record.mappings_offset,
+									   map.num_mappings, sizeof(RelMapping) };
+	return CLUSTER_RECOVERY_NATIVE_MORE;
 }
 
 /* The original native producers log a page number for ZERO, and the page
@@ -316,6 +357,8 @@ native_parse(ClusterRecoveryNativeScan *scan, XLogReaderState *reader)
 
 	if (record->header.xl_rmid == RM_CLOG_ID || record->header.xl_rmid == RM_COMMIT_TS_ID)
 		return native_slru(scan, opcode, record->header.xl_rmid == RM_COMMIT_TS_ID);
+	if (record->header.xl_rmid == RM_RELMAP_ID)
+		return native_relmap(scan, opcode);
 	if (record->header.xl_rmid == RM_MULTIXACT_ID)
 		return native_multixact(scan, opcode);
 	if (record->header.xl_rmid == RM_CLUSTER_UNDO_ID) {

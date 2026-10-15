@@ -171,6 +171,8 @@ targets_native(ClusterRecoveryRootSet *roots, XLogReaderState *reader,
 		} else if (effect.kind == CLUSTER_RECOVERY_NATIVE_TERMINAL
 				   || effect.kind == CLUSTER_RECOVERY_NATIVE_ASSIGNMENT
 				   || effect.kind == CLUSTER_RECOVERY_NATIVE_SUBXACT
+				   || effect.kind == CLUSTER_RECOVERY_NATIVE_RELMAP_UPDATE
+				   || effect.kind == CLUSTER_RECOVERY_NATIVE_RELMAP_ENTRY
 				   || effect.kind == CLUSTER_RECOVERY_NATIVE_MULTIXACT_CREATE
 				   || effect.kind == CLUSTER_RECOVERY_NATIVE_MULTIXACT_ZERO_OFFSETS
 				   || effect.kind == CLUSTER_RECOVERY_NATIVE_MULTIXACT_ZERO_MEMBERS
@@ -222,8 +224,10 @@ cluster_recovery_wal_targets_collect(ClusterRecoveryRootSet *roots, XLogReaderSt
 	rmid = XLogRecGetRmid(reader);
 	opcode = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
 	if (rmid == RM_XACT_ID || rmid == RM_MULTIXACT_ID || rmid == RM_CLOG_ID
-		|| rmid == RM_COMMIT_TS_ID || (rmid == RM_SMGR_ID && opcode == XLOG_SMGR_CREATE)) {
-		if (rmid == RM_MULTIXACT_ID || rmid == RM_CLOG_ID || rmid == RM_COMMIT_TS_ID)
+		|| rmid == RM_COMMIT_TS_ID || rmid == RM_RELMAP_ID
+		|| (rmid == RM_SMGR_ID && opcode == XLOG_SMGR_CREATE)) {
+		if (rmid == RM_MULTIXACT_ID || rmid == RM_CLOG_ID || rmid == RM_COMMIT_TS_ID
+			|| rmid == RM_RELMAP_ID)
 			diag->unowned_records = 1;
 		if (!targets_native(roots, reader, source, cut, memory_budget, diag))
 			goto fail;
