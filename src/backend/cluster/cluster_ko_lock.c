@@ -4119,23 +4119,33 @@ ko_drop_work_context_current(const ClusterKoDropWorkV2 *work)
 }
 
 static bool
-ko_drop_work_local_sample_current(const ClusterKoDropWorkV2 *work)
+ko_drop_work_local_sample_current_locked(const ClusterKoDropWorkV2 *work)
 {
 	ResourceXGateSnapshot gate;
-	bool current;
 
 	if (work->local_scan_revision == 0 || work->local_scan_revision == UINT64_MAX
 		|| !cluster_pcm_lock_resource_x_gate_snapshot(&gate)
 		|| gate.phase != RESOURCE_X_GATE_OPEN || gate.formation != work->context.request.epoch
 		|| memcmp(&gate, &work->local_scan_gate, sizeof(gate)) != 0)
 		return false;
-	SpinLockAcquire(&ko_state->shared_lock);
-	current = pg_atomic_read_u64(&ko_state->peer_admission_revision) == work->local_scan_revision
+	return pg_atomic_read_u64(&ko_state->peer_admission_revision) == work->local_scan_revision
 		&& !ko_cleaner_pending_locked(work->context.request.key.locator)
-		&& !ko_extend_pending_locked(work->context.request.key.locator);
+		&& !ko_extend_pending_locked(work->context.request.key.locator)
+		&& (!work->local_scan_complete
+			|| cluster_pi_writeback_local_revision_current_v3(work->local_writeback_revision));
+}
+
+static bool
+ko_drop_work_local_sample_current(const ClusterKoDropWorkV2 *work)
+{
+	bool current;
+
+	/* These existing gate/revision readers are bounded atomic observations;
+	 * no PCM, CF, writeback lock or I/O is taken under the KO lock. */
+	SpinLockAcquire(&ko_state->shared_lock);
+	current = ko_drop_work_local_sample_current_locked(work);
 	SpinLockRelease(&ko_state->shared_lock);
-	return current && (!work->local_scan_complete
-		|| cluster_pi_writeback_local_revision_current_v3(work->local_writeback_revision));
+	return current;
 }
 
 /* The native producer already persisted the final SPACE and retired its
@@ -4357,18 +4367,40 @@ bool
 cluster_ko_shared_drop_work_finish_v2(ClusterKoDropWorkV2 **work)
 {
 	ClusterKoDropWorkV2 *owned;
+	bool retired_drop;
 	bool finished = false;
 
 	if (work == NULL || !cluster_ko_shared_drop_work_revalidate_v2(*work))
 		return false;
 	owned = *work;
+	retired_drop = owned->context.v3
+		&& owned->context.request_v3.operation == CLUSTER_KO_SHARED_V3_OPERATION_DROP;
 	SpinLockAcquire(&ko_state->shared_lock);
+	if (retired_drop) {
+		KoDropIdentity *identity = ko_origin_drop_identity_locked(&owned->context);
+
+		/* Consume the same local proof with the exact context. The physical
+		 * caller has synced the namespace and closed every original FD. A
+		 * changed proof retains that durable work for its original next tick. */
+		if (identity == NULL || identity->state != KO_DROP_IDENTITY_RETIRED
+			|| ko_directory_io_pending_locked(owned->context.request.key.locator)
+			|| !owned->local_scan_complete || !ko_drop_work_local_sample_current_locked(owned))
+			goto done;
+	}
 	if (memcmp(&ko_state->contexts[owned->slot], &owned->context, sizeof(owned->context)) == 0) {
-		ko_state->contexts[owned->slot].structure_drop_pending = false;
-		ko_state->contexts[owned->slot].drop_executor_pid = 0;
+		if (retired_drop) {
+			/* Only this native file responsibility is terminal. Keep the
+			 * immutable negative identity, separate AX owner and master debt;
+			 * do not manufacture legacy structural acceptance or a receipt. */
+			memset(&ko_state->contexts[owned->slot], 0, sizeof(owned->context));
+		} else {
+			ko_state->contexts[owned->slot].structure_drop_pending = false;
+			ko_state->contexts[owned->slot].drop_executor_pid = 0;
+		}
 		ko_drop_work[owned->slot] = NULL;
 		finished = true;
 	}
+done:
 	SpinLockRelease(&ko_state->shared_lock);
 	if (!finished)
 		return false;

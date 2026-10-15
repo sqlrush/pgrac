@@ -136,6 +136,7 @@ enum WorkFault {
 	WORK_NFS,
 	WORK_CLOSE,
 	WORK_FINISH,
+	WORK_FINISH_SAMPLE,
 	WORK_CUT_AFTER_TRUNCATE,
 	WORK_CUT_AFTER_SYNC,
 	WORK_CUT_AFTER_UNLINK,
@@ -148,6 +149,18 @@ static unsigned per_fork_unlinks[MAX_FORKNUM + 1];
 static char work_root[MAXPGPATH], work_parent[MAXPGPATH];
 static char work_paths[MAX_FORKNUM + 1][MAXPGPATH];
 static uint32 work_slot;
+static bool work_native_v3;
+static unsigned finish_local_drift;
+
+static void
+work_finish_sample_drift(void)
+{
+	local_writeback_sample_hook = NULL;
+	if (finish_local_drift == 1)
+		local_writeback_revision++;
+	else
+		relation_gate_freeze++;
+}
 
 static int
 work_open(const char *path, int flags, ...)
@@ -266,6 +279,8 @@ work_close(int fd)
 	work_fds[fd] = false;
 	if (work_fault == WORK_FINISH && S_ISDIR(st.st_mode))
 		generation_race = true;
+	if (work_fault == WORK_FINISH_SAMPLE && S_ISDIR(st.st_mode))
+		local_writeback_sample_hook = work_finish_sample_drift;
 	if (work_fault == WORK_CLOSE) {
 		if (work_unknown_on_failure)
 			capture_ok = false;
@@ -385,6 +400,8 @@ work_setup_impl(const char *name, unsigned native, bool stale)
 		exit_callback(0, (Datum)0);
 	external_fds = 0;
 	external_fd_limit = 1024;
+	work_native_v3 = native == 2;
+	finish_local_drift = 0;
 	if (native) {
 		if (native == 2)
 			prepare_v3_postcommit();
@@ -494,7 +511,11 @@ assert_finished(void)
 	for (ForkNumber f = 1; f <= MAX_FORKNUM; f++)
 		UT_ASSERT(access(work_paths[f], F_OK) < 0 && errno == ENOENT);
 	UT_ASSERT(!storage.contexts[work_slot].structure_drop_pending);
-	UT_ASSERT(storage.contexts[work_slot].structure_owned && storage.contexts[work_slot].used);
+	if (work_native_v3) {
+		ClusterKoSharedContext empty = { 0 };
+		UT_ASSERT(memcmp(&storage.contexts[work_slot], &empty, sizeof(empty)) == 0);
+	} else
+		UT_ASSERT(storage.contexts[work_slot].structure_owned && storage.contexts[work_slot].used);
 	UT_ASSERT_EQ(forgets, MAX_FORKNUM);
 	UT_ASSERT_EQ(closes, MAX_FORKNUM + 2);
 	UT_ASSERT_EQ(external_fds, 0);
@@ -1404,10 +1425,115 @@ UT_TEST(test_work_executor_process_exit_does_not_redo_partial_io)
 	munmap(shared, sizeof(*shared));
 }
 
+UT_TEST(test_v3_native_finish_releases_only_file_context_without_legacy_offer)
+{
+	ClusterKoSharedContext native, origin;
+	KoDropIdentity identity;
+	ClusterPageWalBindingV1 terminal;
+	ClusterPiWritebackFactV2 offer;
+	ClusterKoDirectoryIoV3 io;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	uint32 cursor, origin_slot;
+	uint64 serial;
+	LOCKTAG tag;
+
+	if (!work_setup_v3("v3_native_terminal"))
+		return;
+	native = storage.contexts[work_slot];
+	identity = storage.drop_identities[native.drop_identity - 1];
+	for (origin_slot = 0; origin_slot < CLUSTER_KO_SHARED_CAPACITY; origin_slot++)
+		if (storage.contexts[origin_slot].used && !storage.contexts[origin_slot].structure_owned)
+			break;
+	UT_ASSERT(origin_slot < CLUSTER_KO_SHARED_CAPACITY);
+	if (origin_slot == CLUSTER_KO_SHARED_CAPACITY)
+		return;
+	origin = storage.contexts[origin_slot];
+	UT_ASSERT_EQ(native.structure_peers_accepted, 0);
+	UT_ASSERT(poll_work());
+	assert_finished();
+	UT_ASSERT(ko_drop_work[work_slot] == NULL);
+	UT_ASSERT(memcmp(&storage.contexts[origin_slot], &origin, sizeof(origin)) == 0);
+	UT_ASSERT(memcmp(&storage.drop_identities[native.drop_identity - 1], &identity,
+					sizeof(identity)) == 0);
+	UT_ASSERT(!cluster_ko_shared_structure_observation_v2(work_slot, native.serial,
+		&terminal, wal, sizeof(wal)));
+	cursor = 0;
+	UT_ASSERT(!cluster_ko_shared_structure_next_v2(&cursor, &serial, &terminal));
+	for (int peer = 1; peer <= 3; peer++) {
+		cursor = 0;
+		UT_ASSERT(!cluster_ko_shared_structure_offer_next_v2(&cursor, peer, &serial, &offer));
+	}
+	/* Native completion cannot stand in for S6. Only the original exact AX
+	 * owner may consume its real result; the negative identity outlives both. */
+	SET_LOCKTAG_RELATION(tag, origin.request_v3.ax_resid.field1,
+						origin.request_v3.ax_resid.field2);
+	UT_ASSERT(cluster_ko_ax_release_handoff_v3(&tag, AccessExclusiveLock,
+										 &origin.request_v3.ax_holder));
+	release_poll_result = CLUSTER_GES_REDECLARE_CONFIRMED;
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY / 8; i++)
+		shared_send_tick();
+	UT_ASSERT_EQ(release_poll_calls, 1);
+	UT_ASSERT(!storage.contexts[origin_slot].used);
+	UT_ASSERT(cluster_ko_directory_drop_retired_v3(native.request.key.locator));
+	UT_ASSERT(!cluster_ko_directory_io_begin_v3(native.request.key.locator, &io));
+	UT_ASSERT_EQ(native_allocated + completion_allocations, 0);
+}
+
+UT_TEST(test_v3_native_finish_rechecks_local_cut_before_releasing_context)
+{
+	for (unsigned drift = 1; drift <= 2; drift++) {
+		char name[64];
+		unsigned io;
+		snprintf(name, sizeof(name), "v3_finish_drift_%u", drift);
+		if (!work_setup_v3(name))
+			return;
+		work_fault = WORK_FINISH_SAMPLE;
+		finish_local_drift = drift;
+		UT_ASSERT(!poll_work());
+		UT_ASSERT(local_writeback_sample_hook == NULL);
+		UT_ASSERT(storage.contexts[work_slot].used);
+		UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
+		UT_ASSERT(ko_drop_work[work_slot] != NULL);
+		UT_ASSERT_EQ(external_fds, 0);
+		io = opens + truncates + main_syncs + dir_syncs + unlinks + closes;
+		work_fault = WORK_OK;
+		UT_ASSERT(poll_work());
+		assert_finished();
+		UT_ASSERT_EQ(opens + truncates + main_syncs + dir_syncs + unlinks + closes, io);
+		UT_ASSERT_EQ(main_syncs, 1);
+		UT_ASSERT_EQ(dir_syncs, 1);
+	}
+}
+
+UT_TEST(test_v3_native_failed_io_keeps_original_recovery_obligation)
+{
+	const enum WorkFault faults[] = { WORK_MAIN_SYNC, WORK_DIR_SYNC, WORK_CLOSE };
+	for (unsigned i = 0; i < lengthof(faults); i++) {
+		char name[64];
+		unsigned io;
+		snprintf(name, sizeof(name), "v3_failed_io_%u", i);
+		if (!work_setup_v3(name))
+			return;
+		work_fault = faults[i];
+		UT_ASSERT(!poll_work());
+		assert_recovery_required();
+		UT_ASSERT(storage.contexts[work_slot].structure_drop_failed);
+		UT_ASSERT(cluster_ko_directory_drop_retired_v3(postcommit_binding.identity.locator));
+		io = opens + truncates + main_syncs + dir_syncs + unlinks + closes;
+		work_fault = WORK_OK;
+		assert_work_not_selected();
+		UT_ASSERT_EQ(opens + truncates + main_syncs + dir_syncs + unlinks + closes, io);
+		UT_ASSERT(storage.contexts[work_slot].used);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(35);
+	UT_PLAN(38);
+	UT_RUN(test_v3_native_finish_releases_only_file_context_without_legacy_offer);
+	UT_RUN(test_v3_native_finish_rechecks_local_cut_before_releasing_context);
+	UT_RUN(test_v3_native_failed_io_keeps_original_recovery_obligation);
 	UT_RUN(test_v3_origin_local_pending_invalid_or_partial_never_opens_files);
 	UT_RUN(test_v3_origin_scan_retains_prefix_only_for_same_cut);
 	UT_RUN(test_v3_origin_unaccepted_physical_ack_blocks_deletion);

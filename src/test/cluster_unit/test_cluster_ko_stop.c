@@ -296,6 +296,7 @@ static uint64 local_writeback_revision;
 static uint32 local_relation_scan_input;
 static unsigned local_relation_scan_drift;
 static void (*relation_gate_sample_hook)(void);
+static void (*local_writeback_sample_hook)(void);
 bool
 cluster_pcm_lock_resource_x_gate_snapshot(ResourceXGateSnapshot *out)
 {
@@ -361,7 +362,13 @@ cluster_pi_writeback_local_relation_closed_v3(RelFileLocator locator, uint64 for
 bool
 cluster_pi_writeback_local_revision_current_v3(uint64 revision)
 {
-	return revision != 0 && revision != UINT64_MAX && revision == local_writeback_revision;
+	bool current = revision != 0 && revision != UINT64_MAX && revision == local_writeback_revision;
+
+	/* A WB/gate revision can change after this atomic observation, before
+	 * the KO owner consumes it. No KO-protected state is changed here. */
+	if (local_writeback_sample_hook != NULL)
+		local_writeback_sample_hook();
+	return current;
 }
 #undef cluster_pi_writeback_local_relation_closed_v3
 #undef cluster_pi_writeback_local_revision_current_v3
@@ -1273,6 +1280,7 @@ reset_test(void)
 	local_relation_scan_calls = local_relation_scan_advance = 0;
 	local_relation_scan_input = local_relation_scan_drift = 0;
 	relation_gate_sample_hook = NULL;
+	local_writeback_sample_hook = NULL;
 	relation_gate_freeze = 3;
 	relation_gate_ok = true;
 	IsUnderPostmaster = false;
