@@ -1586,7 +1586,7 @@ cluster_ko_peer_holder_begin_v3(const ClusterKoPeerFenceHandleV3 *handle)
 {
 	ClusterKoSharedMessageV3 request;
 	ClusterKoPeerFenceV3 *entry;
-	ClusterGesHolderProbe probe;
+	ClusterGesHolderProbe probe, previous;
 	uint64 peer_route_generation;
 	bool ok = false;
 
@@ -1600,8 +1600,13 @@ cluster_ko_peer_holder_begin_v3(const ClusterKoPeerFenceHandleV3 *handle)
 		return false;
 	}
 	request = entry->request;
+	previous = entry->holder_probe;
 	peer_route_generation = entry->peer_route_generation;
 	SpinLockRelease(&ko_state->shared_lock);
+	/* Only a completed observation may be replaced. An unanswered query
+	 * remains owned by the original LMON retry, including after COMMIT. */
+	if (previous.nonce != 0 && !previous.reply)
+		return false;
 	memset(&probe, 0, sizeof(probe));
 	if (!ko_peer_holder_cut(&request, peer_route_generation, &probe.master_boot))
 		return false;
@@ -1612,6 +1617,9 @@ cluster_ko_peer_holder_begin_v3(const ClusterKoPeerFenceHandleV3 *handle)
 	SpinLockAcquire(&ko_state->shared_lock);
 	entry = &ko_state->peer_fences[handle->slot];
 	if (entry->serial == handle->serial && entry->state != CLUSTER_KO_PEER_FENCE_EMPTY
+		&& entry->peer_route_generation == peer_route_generation
+		&& memcmp(&entry->request, &request, sizeof(request)) == 0
+		&& memcmp(&entry->holder_probe, &previous, sizeof(previous)) == 0
 		&& ko_state->holder_probe_nonce < UINT64_MAX - 1) {
 		probe.nonce = ++ko_state->holder_probe_nonce;
 		entry->holder_probe = probe;
@@ -2169,7 +2177,8 @@ bool
 cluster_ko_peer_fence_gc_tick_v3(void)
 {
 	bool pressure = false;
-	bool scanned = false;
+	bool progress = false, retired = false;
+	TimestampTz now;
 
 	if (ko_state == NULL || !AmSinvalBcastProcess() || !cluster_shared_config
 		|| cluster_interconnect_tier != CLUSTER_IC_TIER_1)
@@ -2184,75 +2193,76 @@ cluster_ko_peer_fence_gc_tick_v3(void)
 	SpinLockRelease(&ko_state->shared_lock);
 	if (!pressure)
 		return false;
+	now = GetCurrentTimestamp();
 
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
 		ClusterKoPeerFenceHandleV3 handle;
-		ClusterKoPeerFenceStateV3 state;
-		ClusterKoSharedMessageV3 request;
+		ClusterKoPeerFenceV3 saved, *entry;
 		ClusterGrdHolderObservation observation;
 		LOCKMODE mode;
-		bool physical_applied, ack_queued, probe_reply;
-		uint64 probe_nonce;
-		uint64 serial;
 
 		SpinLockAcquire(&ko_state->shared_lock);
-		state = ko_state->peer_fences[i].state;
-		physical_applied = ko_state->peer_fences[i].physical_applied;
-		ack_queued = ko_state->peer_fences[i].ack_queued;
-		probe_reply = ko_state->peer_fences[i].holder_probe.reply;
-		probe_nonce = ko_state->peer_fences[i].holder_probe.nonce;
+		entry = &ko_state->peer_fences[i];
+		saved = *entry;
 		handle.slot = i;
-		handle.serial = serial = ko_state->peer_fences[i].serial;
-		request = ko_state->peer_fences[i].request;
-		if (state == CLUSTER_KO_PEER_FENCE_EMPTY || !physical_applied || !ack_queued
-			|| ko_cleaner_pending_locked(request.base.key.locator)
-			|| ko_extend_pending_locked(request.base.key.locator)
-			|| ko_peer_fence_has_queued_work_locked(&ko_state->peer_fences[i])) {
+		handle.serial = saved.serial;
+		if ((saved.state != CLUSTER_KO_PEER_FENCE_READY
+			 && saved.state != CLUSTER_KO_PEER_FENCE_COMMITTED)
+			|| !saved.physical_applied || !saved.ack_queued
+			|| ko_cleaner_pending_locked(saved.request.base.key.locator)
+			|| ko_extend_pending_locked(saved.request.base.key.locator)
+			|| ko_peer_fence_has_queued_work_locked(entry)) {
 			SpinLockRelease(&ko_state->shared_lock);
 			continue;
 		}
-		scanned = true;
 		SpinLockRelease(&ko_state->shared_lock);
 
-		if (state == CLUSTER_KO_PEER_FENCE_COMMITTED) {
-			/* A committed entry has no rollback probe.  Do not clear it while
-			 * any holder probe is still in flight; a stale reply must never
-			 * turn an unresolved terminal owner into an empty slot. */
-			if (probe_nonce != 0 || probe_reply)
+		if (saved.state == CLUSTER_KO_PEER_FENCE_COMMITTED) {
+			/* COMMIT supersedes the observation, not the query's owner.
+			 * Wait for its exact reply before retiring the terminal record;
+			 * PRESENT/UNKNOWN here finish only the query, never prove abort. */
+			if (saved.holder_probe.nonce != 0 ? !saved.holder_probe.reply
+												: saved.holder_probe.reply)
 				continue;
-			SpinLockAcquire(&ko_state->shared_lock);
-			if (ko_state->peer_fences[i].serial == serial
-				&& ko_state->peer_fences[i].state == CLUSTER_KO_PEER_FENCE_COMMITTED
-				&& ko_state->peer_fences[i].physical_applied && ko_state->peer_fences[i].ack_queued
-				&& !ko_peer_fence_has_queued_work_locked(&ko_state->peer_fences[i]))
-				(void)ko_peer_fence_clear_locked(&ko_state->peer_fences[i]);
-			SpinLockRelease(&ko_state->shared_lock);
-			continue;
+		} else {
+			if (saved.holder_probe.nonce == 0) {
+				if (cluster_ko_peer_holder_begin_v3(&handle))
+					progress = true;
+				continue;
+			}
+			if (!cluster_ko_peer_holder_result_v3(&handle, &observation, &mode))
+				continue;
+			if (observation != CLUSTER_GRD_HOLDER_ABSENT) {
+				/* Renew a completed PRESENT/UNKNOWN observation at the
+				 * existing retry cadence. No local wake is needed while
+				 * waiting for time, a reply, or the original holder to exit. */
+				if ((saved.holder_sent_at == 0 || now < saved.holder_sent_at
+					 || now - saved.holder_sent_at >= INT64CONST(100000))
+					&& cluster_ko_peer_holder_begin_v3(&handle))
+					progress = true;
+				continue;
+			}
 		}
-		if (state != CLUSTER_KO_PEER_FENCE_READY)
-			continue;
 
-		/* READY with no publication marker is the rollback candidate.  The
-		 * exact GES query is only started under full-slot pressure; UNKNOWN,
-		 * PRESENT, a stale reply, or any queued frame leaves the fence intact. */
-		if (probe_nonce == 0) {
-			(void)cluster_ko_peer_holder_begin_v3(&handle);
-			continue;
-		}
-		if (!cluster_ko_peer_holder_result_v3(&handle, &observation, &mode)
-			|| observation != CLUSTER_GRD_HOLDER_ABSENT)
-			continue;
 		SpinLockAcquire(&ko_state->shared_lock);
-		if (ko_state->peer_fences[i].serial == serial
-			&& ko_state->peer_fences[i].state == CLUSTER_KO_PEER_FENCE_READY
-			&& ko_state->peer_fences[i].physical_applied && ko_state->peer_fences[i].ack_queued
-			&& !ko_peer_fence_has_queued_work_locked(&ko_state->peer_fences[i]))
-			(void)ko_peer_fence_clear_locked(&ko_state->peer_fences[i]);
+		entry = &ko_state->peer_fences[i];
+		if (entry->serial == saved.serial && entry->state == saved.state
+			&& entry->peer_route_generation == saved.peer_route_generation
+			&& memcmp(entry->encoded, saved.encoded, sizeof(saved.encoded)) == 0
+			&& memcmp(&entry->holder_probe, &saved.holder_probe, sizeof(saved.holder_probe)) == 0
+			&& entry->physical_applied && entry->ack_queued
+			&& !ko_cleaner_pending_locked(entry->request.base.key.locator)
+			&& !ko_extend_pending_locked(entry->request.base.key.locator)
+			&& !ko_peer_fence_has_queued_work_locked(entry)
+			&& ko_peer_fence_clear_locked(entry))
+			retired = progress = true;
 		SpinLockRelease(&ko_state->shared_lock);
 	}
-	if (scanned)
+	/* A reclaimed slot may unblock the inbound head. Query publication
+	 * wakes LMON and an accepted reply wakes SI through their own owners. */
+	if (retired)
 		cluster_sinval_set_proc_latch();
-	return scanned;
+	return progress;
 }
 
 bool

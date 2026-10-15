@@ -27,6 +27,7 @@
  * coverage; these stubs ensure the old stop contract remains linkable. */
 static bool v3_route_live;
 static int holder_probe_sends;
+static int holder_si_wakes;
 static bool holder_probe_send_ok = true;
 static TimestampTz holder_probe_clock = 1;
 static ClusterGesHolderProbe holder_probe_sent;
@@ -960,6 +961,7 @@ cluster_epoch_get_current(void)
 void
 cluster_sinval_set_proc_latch(void)
 {
+	holder_si_wakes++;
 	wake_count++;
 }
 void
@@ -6989,12 +6991,13 @@ UT_TEST(test_peer_fence_rollback_gc_requires_exact_absent_holder)
 	cluster_ko_peer_holder_observed(request.ax_master_node, &reply);
 	MyBackendType = B_SINVAL_BCAST;
 	MyAuxProcType = SinvalBcastProcess;
-	UT_ASSERT(cluster_ko_peer_fence_gc_tick_v3());
+	UT_ASSERT(!cluster_ko_peer_fence_gc_tick_v3());
 	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
 
 	MyBackendType = B_SINVAL_BCAST;
 	MyAuxProcType = SinvalBcastProcess;
-	UT_ASSERT(cluster_ko_peer_holder_begin_v3(&handle));
+	holder_probe_clock += 100000;
+	UT_ASSERT(cluster_ko_peer_fence_gc_tick_v3());
 	MyBackendType = B_LMON;
 	MyAuxProcType = LmonProcess;
 	cluster_ko_lmon_tick_v2();
@@ -7007,6 +7010,202 @@ UT_TEST(test_peer_fence_rollback_gc_requires_exact_absent_holder)
 	MyAuxProcType = SinvalBcastProcess;
 	UT_ASSERT(cluster_ko_peer_fence_gc_tick_v3());
 	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_EMPTY);
+}
+
+/* Keep the other accepted operations ACTIVE so pressure persists while the
+ * real SI/LMON query state machine drives the one completed physical owner. */
+static ClusterKoSharedMessageV3
+fixture_holder_gc_pressure(uint64 batch, bool all_ready)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(batch);
+	ClusterKoPeerFenceHandleV3 handle;
+	ClusterKoPeerFenceStateV3 state;
+
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		request.base.batch_id = batch + i;
+		UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+		if (i == 0 || all_ready) {
+			UT_ASSERT(fixture_completed_fence_ready(&request, &handle));
+			storage.peer_fences[handle.slot].ack_queued = true;
+		}
+	}
+	request.base.batch_id = batch;
+	holder_probe_sends = holder_si_wakes = 0;
+	holder_probe_send_ok = true;
+	holder_probe_clock = 1;
+	return request;
+}
+
+static void
+fixture_holder_lmon_tick(void)
+{
+	MyBackendType = B_LMON;
+	MyAuxProcType = LmonProcess;
+	cluster_ko_lmon_tick_v2();
+	MyBackendType = B_SINVAL_BCAST;
+	MyAuxProcType = SinvalBcastProcess;
+}
+
+static void
+fixture_holder_reply(int32 master, ClusterGesHolderProbe reply,
+					 ClusterGrdHolderObservation observation)
+{
+	reply.reply = true;
+	reply.observation = observation;
+	reply.mode = observation == CLUSTER_GRD_HOLDER_PRESENT ? AccessExclusiveLock : NoLock;
+	MyBackendType = B_LMON;
+	MyAuxProcType = LmonProcess;
+	cluster_ko_peer_holder_observed(master, &reply);
+	MyBackendType = B_SINVAL_BCAST;
+	MyAuxProcType = SinvalBcastProcess;
+}
+
+UT_TEST(test_holder_begin_does_not_replace_inflight_query)
+{
+	ClusterKoPeerFenceHandleV3 h;
+	ClusterGesHolderProbe pending;
+
+	(void)fixture_holder_gc_pressure(1450, false);
+	h.slot = 0;
+	h.serial = storage.peer_fences[0].serial;
+	UT_ASSERT(cluster_ko_peer_fence_gc_tick_v3());
+	fixture_holder_lmon_tick();
+	pending = holder_probe_sent;
+	holder_probe_clock += 100000;
+	UT_ASSERT(!cluster_ko_peer_holder_begin_v3(&h));
+	UT_ASSERT_EQ(storage.peer_fences[0].holder_probe.nonce, pending.nonce);
+}
+
+UT_TEST(test_holder_gc_unknown_requeries_in_original_owner)
+{
+	ClusterKoSharedMessageV3 request = fixture_holder_gc_pressure(1400, false);
+	ClusterGesHolderProbe first, second;
+
+	UT_ASSERT(cluster_ko_peer_fence_gc_tick_v3());
+	fixture_holder_lmon_tick();
+	UT_ASSERT_EQ(holder_probe_sends, 1);
+	first = holder_probe_sent;
+	fixture_holder_reply(request.ax_master_node, first, CLUSTER_GRD_HOLDER_UNKNOWN);
+	holder_probe_clock += 100000;
+	UT_ASSERT(cluster_ko_peer_fence_gc_tick_v3());
+	fixture_holder_lmon_tick();
+	UT_ASSERT_EQ(holder_probe_sends, 2);
+	second = holder_probe_sent;
+	UT_ASSERT_NE(first.nonce, second.nonce);
+	/* A completed query's late duplicate cannot finish the new attempt. */
+	holder_si_wakes = 0;
+	fixture_holder_reply(request.ax_master_node, first, CLUSTER_GRD_HOLDER_ABSENT);
+	UT_ASSERT_EQ(holder_si_wakes, 0);
+	UT_ASSERT(!storage.peer_fences[0].holder_probe.reply);
+	UT_ASSERT(!cluster_ko_peer_fence_gc_tick_v3());
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
+	fixture_holder_reply(request.ax_master_node, second, CLUSTER_GRD_HOLDER_ABSENT);
+	UT_ASSERT_EQ(holder_si_wakes, 1);
+	UT_ASSERT(cluster_ko_peer_fence_gc_tick_v3());
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_EMPTY);
+}
+
+UT_TEST(test_holder_gc_commit_consumes_exact_completed_query)
+{
+	for (unsigned before = 0; before < 2; before++)
+		for (unsigned result = 0; result < 3; result++) {
+			ClusterKoSharedMessageV3 request = fixture_holder_gc_pressure(1500, false);
+			ClusterGesHolderProbe probe, stale;
+			ClusterGrdHolderObservation observation = result == 0 ? CLUSTER_GRD_HOLDER_PRESENT
+				: result == 1 ? CLUSTER_GRD_HOLDER_UNKNOWN : CLUSTER_GRD_HOLDER_ABSENT;
+
+			UT_ASSERT(cluster_ko_peer_fence_gc_tick_v3());
+			fixture_holder_lmon_tick();
+			probe = holder_probe_sent;
+			if (before)
+				fixture_holder_reply(request.ax_master_node, probe, observation);
+			UT_ASSERT(cluster_ko_peer_commit_v3(request.base.origin_node, request.base.epoch,
+				request.base.origin_boot, request.base.peer_boot, request.base.batch_id));
+			if (!before) {
+				holder_si_wakes = 0;
+				for (unsigned i = 0; i < 4; i++) {
+					UT_ASSERT(!cluster_ko_peer_fence_gc_tick_v3());
+					UT_ASSERT_EQ(storage.peer_fences[0].holder_probe.nonce, probe.nonce);
+					UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_COMMITTED);
+				}
+				UT_ASSERT_EQ(holder_si_wakes, 0);
+				stale = probe;
+				stale.nonce++;
+				fixture_holder_reply(request.ax_master_node, stale, observation);
+				UT_ASSERT(!storage.peer_fences[0].holder_probe.reply);
+				fixture_holder_reply(request.ax_master_node, probe, observation);
+			}
+			UT_ASSERT(cluster_ko_peer_fence_gc_tick_v3());
+			UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_EMPTY);
+			/* Recycling a slot does not let the old query bind to its new serial. */
+			{
+				ClusterKoPeerFenceHandleV3 h;
+				ClusterKoPeerFenceStateV3 state;
+				request.base.batch_id += 100;
+				UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &h, &state));
+				UT_ASSERT_EQ(h.slot, 0);
+				UT_ASSERT(fixture_completed_fence_ready(&request, &h));
+				storage.peer_fences[h.slot].ack_queued = true;
+				UT_ASSERT(cluster_ko_peer_fence_gc_tick_v3());
+				holder_si_wakes = 0;
+				fixture_holder_reply(request.ax_master_node, probe, observation);
+				UT_ASSERT_EQ(holder_si_wakes, 0);
+				UT_ASSERT(!storage.peer_fences[h.slot].holder_probe.reply);
+			}
+		}
+}
+
+UT_TEST(test_holder_gc_full_pending_has_no_self_wakeup)
+{
+	(void)fixture_holder_gc_pressure(1700, true);
+	UT_ASSERT(cluster_ko_peer_fence_gc_tick_v3());
+	holder_si_wakes = 0;
+	for (unsigned i = 0; i < 8; i++) {
+		fixture_holder_lmon_tick();
+		UT_ASSERT_EQ(holder_probe_sends, (i + 1) * 8);
+		UT_ASSERT(!cluster_ko_peer_fence_gc_tick_v3());
+	}
+	UT_ASSERT_EQ(holder_si_wakes, 0);
+	/* The existing retry remains bounded and does not replace any nonce. */
+	fixture_holder_lmon_tick();
+	UT_ASSERT_EQ(holder_probe_sends, 64);
+	UT_ASSERT_EQ(storage.holder_probe_nonce, 64);
+}
+
+UT_TEST(test_holder_gc_completed_nonabsent_is_throttled_without_self_wakeup)
+{
+	for (unsigned unknown = 0; unknown < 2; unknown++) {
+		ClusterKoSharedMessageV3 request = fixture_holder_gc_pressure(1800, true);
+		ClusterGesHolderProbe replies[CLUSTER_KO_SHARED_CAPACITY];
+
+		UT_ASSERT(cluster_ko_peer_fence_gc_tick_v3());
+		for (unsigned i = 0; i < 8; i++)
+			fixture_holder_lmon_tick();
+		for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+			replies[i] = storage.peer_fences[i].holder_probe;
+			UT_ASSERT_NE(storage.peer_fences[i].holder_sent_at, 0);
+			fixture_holder_reply(request.ax_master_node, replies[i], unknown
+				? CLUSTER_GRD_HOLDER_UNKNOWN : CLUSTER_GRD_HOLDER_PRESENT);
+		}
+		UT_ASSERT_EQ(holder_si_wakes, 64);
+		holder_si_wakes = 0;
+		for (unsigned i = 0; i < 4; i++) {
+			UT_ASSERT(!cluster_ko_peer_fence_gc_tick_v3());
+			fixture_holder_lmon_tick();
+		}
+		UT_ASSERT_EQ(holder_si_wakes, 0);
+		UT_ASSERT_EQ(holder_probe_sends, 64);
+		holder_probe_clock += 100000;
+		UT_ASSERT(cluster_ko_peer_fence_gc_tick_v3());
+		UT_ASSERT_EQ(holder_si_wakes, 0); /* Only the LMON has new work. */
+		UT_ASSERT(!cluster_ko_peer_fence_gc_tick_v3());
+		fixture_holder_lmon_tick();
+		UT_ASSERT_EQ(holder_probe_sends, 72);
+		for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+			UT_ASSERT_EQ(storage.peer_fences[i].state, CLUSTER_KO_PEER_FENCE_READY);
+			UT_ASSERT_NE(storage.peer_fences[i].holder_probe.nonce, replies[i].nonce);
+		}
+	}
 }
 
 UT_TEST(test_peer_fence_fresh_grant_retires_only_different_holder)
@@ -7223,6 +7422,9 @@ UT_TEST(test_peer_holder_probe_refresh_retry_and_late_reply_keep_owner)
 	cluster_ko_lmon_tick_v2();
 	UT_ASSERT_EQ(holder_probe_sends, 2);
 	UT_ASSERT_EQ(holder_probe_sent.nonce, old_reply.nonce);
+	/* Complete the old observation before requesting a new nonce. */
+	fixture_holder_reply(request.ax_master_node, old_reply, CLUSTER_GRD_HOLDER_PRESENT);
+	holder_probe_clock += 100000;
 	MyBackendType = B_SINVAL_BCAST;
 	MyAuxProcType = SinvalBcastProcess;
 	UT_ASSERT(cluster_ko_peer_holder_begin_v3(&h));
@@ -7779,7 +7981,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(186);
+	UT_PLAN(191);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
 	UT_RUN(test_peer_space_entry_checks_precede_io);
@@ -7943,6 +8145,11 @@ main(void)
 	UT_RUN(test_peer_fence_capacity_does_not_delete_old_terminal);
 	UT_RUN(test_peer_fence_terminal_gc_requires_local_quiescence);
 	UT_RUN(test_peer_fence_rollback_gc_requires_exact_absent_holder);
+	UT_RUN(test_holder_begin_does_not_replace_inflight_query);
+	UT_RUN(test_holder_gc_unknown_requeries_in_original_owner);
+	UT_RUN(test_holder_gc_commit_consumes_exact_completed_query);
+	UT_RUN(test_holder_gc_full_pending_has_no_self_wakeup);
+	UT_RUN(test_holder_gc_completed_nonabsent_is_throttled_without_self_wakeup);
 	UT_RUN(test_peer_fence_fresh_grant_retires_only_different_holder);
 	UT_RUN(test_peer_committed_request_cannot_reenter_ingress_or_physical_owner);
 	UT_RUN(test_peer_terminal_binds_operation_across_authenticated_publication_retarget);
