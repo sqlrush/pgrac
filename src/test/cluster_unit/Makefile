@@ -487,6 +487,7 @@ TESTS += test_cluster_recovery_native_roots
 TESTS += test_cluster_recovery_native_inputs
 TESTS += test_cluster_recovery_wal_targets
 TESTS += test_cluster_recovery_slru_scan
+TESTS += test_cluster_recovery_relmap_scan
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_namespace,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_heap_scan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_undo_scan,$(SIMPLE_TESTS))
@@ -498,7 +499,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_recovery_relation_scan,$(SIMPLE_TESTS)
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_native_scan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_native_roots,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_native_inputs,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_recovery_slru_scan test_cluster_recovery_wal_targets,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_recovery_slru_scan test_cluster_recovery_relmap_scan test_cluster_recovery_wal_targets,$(SIMPLE_TESTS))
 CLUSTER_BLOCK_APPLY_O = $(top_builddir)/src/backend/cluster/cluster_block_apply.o \
 		test_cluster_block_apply_btree_product.o
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
@@ -3122,10 +3123,11 @@ RECOVERY_CENSUS_TEST_OBJS = \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_heap_scan.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_multixact_scan.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_slru_scan.o \
+		$(top_builddir)/src/backend/cluster/cluster_recovery_relmap_scan.o \
 		$(top_builddir)/src/backend/cluster/cluster_cr_apply.o
 
 test_cluster_recovery_native_inputs: $(RECOVERY_CENSUS_TEST_OBJS)
-test_cluster_recovery_native_inputs: test_cluster_recovery_xact_join_inputs.inc test_cluster_recovery_relmap_inputs.inc test_cluster_recovery_relmap_fixture.h
+test_cluster_recovery_native_inputs: test_cluster_recovery_xact_join_inputs.inc test_cluster_recovery_relmap_physical_inputs.inc test_cluster_recovery_relmap_inputs.inc test_cluster_recovery_relmap_fixture.h
 
 test_cluster_control_root test_cluster_recovery_native_inputs: %: %.c test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc test_cluster_control_root_serving.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_census.c \
@@ -9045,6 +9047,17 @@ test_cluster_recovery_root_set: test_cluster_recovery_root_set.c test_cluster_re
 test_cluster_recovery_slru_scan: test_cluster_recovery_slru_scan.c test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c test_cluster_recovery_crypto_boundary.h unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_slru_scan.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_slru_scan.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/backend/cluster/cluster_wal_claim.o cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(LDFLAGS) $(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+test_cluster_recovery_relmap_scan: test_cluster_recovery_relmap_scan.c test_cluster_recovery_root_set.c test_cluster_recovery_relmap_fixture.h test_cluster_recovery_namespace.c test_cluster_recovery_crypto_boundary.h unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_relmap_scan.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_relmap_scan.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \

@@ -14,6 +14,7 @@
 #include "cluster/cluster_recovery_relation_census.h"
 #include "cluster/cluster_recovery_multixact_scan.h"
 #include "cluster/cluster_recovery_slru_scan.h"
+#include "cluster/cluster_recovery_relmap_scan.h"
 
 #ifdef USE_PGRAC_CLUSTER
 typedef struct ClusterRecoveryCensus ClusterRecoveryCensus;
@@ -39,6 +40,7 @@ typedef enum ClusterRecoveryCensusPhase {
 	CLUSTER_RECOVERY_CENSUS_MX_PHYSICAL,
 	CLUSTER_RECOVERY_CENSUS_MX_COMPARE,
 	CLUSTER_RECOVERY_CENSUS_XACT_COMPARE,
+	CLUSTER_RECOVERY_CENSUS_RELMAP_PHYSICAL,
 	CLUSTER_RECOVERY_CENSUS_EFFECTS,
 	CLUSTER_RECOVERY_CENSUS_FINAL_TT,
 	CLUSTER_RECOVERY_CENSUS_FINAL_ROOTS,
@@ -55,7 +57,8 @@ typedef enum ClusterRecoveryCensusKind {
 	CLUSTER_RECOVERY_CENSUS_NATIVE_EFFECT,
 	CLUSTER_RECOVERY_CENSUS_TX_TARGET,
 	CLUSTER_RECOVERY_CENSUS_SLRU_SLOT,
-	CLUSTER_RECOVERY_CENSUS_XACT_MATCH
+	CLUSTER_RECOVERY_CENSUS_XACT_MATCH,
+	CLUSTER_RECOVERY_CENSUS_RELMAP
 } ClusterRecoveryCensusKind;
 
 /* An edge from an observed TX record to the original physical/WAL union.
@@ -84,6 +87,7 @@ typedef struct ClusterRecoveryCensusEntry {
 		ClusterRecoveryCensusTarget target;
 		ClusterRecoverySlruEntry slru;
 		ClusterRecoveryXactJoinEntry xact_compare;
+		ClusterRecoveryRelmapEntry relmap;
 	} value;
 } ClusterRecoveryCensusEntry;
 
@@ -97,6 +101,7 @@ typedef struct ClusterRecoveryCensusDiag {
 	ClusterRecoveryRelationCensusResult relation_result;
 	ClusterRecoveryMultixactResult mx_result;
 	ClusterRecoverySlruResult slru_result;
+	ClusterRecoveryRelmapResult relmap_result;
 	ClusterRecoveryMultixactJoinResult join_result;
 	ClusterRecoveryXactJoinResult xact_result;
 	ClusterRecoveryNativeInventoryResult inventory_result;
@@ -104,6 +109,7 @@ typedef struct ClusterRecoveryCensusDiag {
 	uint64 tt_slots, tx_records, relation_entries, mx_entries, mx_comparisons, effects;
 	uint64 slru_entries;
 	uint64 xact_comparisons;
+	uint64 relmap_entries;
 	uint64 tx_targets, tx_target_missing, tx_target_short, tx_space_missing;
 } ClusterRecoveryCensusDiag;
 
@@ -121,9 +127,12 @@ extern ClusterRecoveryCensusResult cluster_recovery_census_begin(ClusterWalInput
 
 /* Run the existing ROOT/WAL union, all TT slots and seeded TX records,
  * all TX record target/SPACE candidates, relation/page/history, raw physical
- * CLOG/SUBTRANS/commit_ts/MX, retained MX/terminal/assignment comparisons
- * and native effects. Transaction comparisons retain raw status/parent
- * differences and grant no era, terminal or complete parent-chain proof.
+ * CLOG/SUBTRANS/commit_ts/MX, retained MX/terminal/assignment comparisons,
+ * physical native relmap copies and every mapped fork edge, and native
+ * effects. Primary/backup map observations never choose an authority or
+ * complete publication; missing fork edges remain explicit obligations.
+ * Transaction comparisons retain raw status/parent differences and grant
+ * no era, terminal or complete parent-chain proof.
  * Then repeat saved TT headers, the entire physical ROOT and
  * original cold WAL census. Each entry is borrowed until next/destroy and
  * provisional until all final rereads; later refusal revokes every child.

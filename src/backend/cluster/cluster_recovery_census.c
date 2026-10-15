@@ -18,6 +18,7 @@ struct ClusterRecoveryCensus {
 	ClusterRecoveryRelationCensus *relations;
 	ClusterRecoveryMultixactScan *mx;
 	ClusterRecoverySlruScan *slru;
+	ClusterRecoveryRelmapScan *relmap;
 	ClusterRecoveryCensusDiag diag;
 	ClusterRecoveryCensusResult status;
 	uint32 source_count, target_at;
@@ -37,6 +38,8 @@ census_release(ClusterRecoveryCensus *census)
 	census->mx = NULL;
 	cluster_recovery_slru_scan_destroy(census->slru);
 	census->slru = NULL;
+	cluster_recovery_relmap_scan_destroy(census->relmap);
+	census->relmap = NULL;
 	cluster_recovery_native_inventory_destroy(census->inventory);
 	census->inventory = NULL;
 	cluster_recovery_undo_store_destroy(census->undo);
@@ -331,9 +334,30 @@ census_step(ClusterRecoveryCensus *census, ClusterRecoveryCensusEntry *out)
 			return census_entry(out, CLUSTER_RECOVERY_CENSUS_XACT_MATCH);
 		}
 		if (d->xact_result == CLUSTER_RECOVERY_XACT_JOIN_DRAINED)
-			d->phase = CLUSTER_RECOVERY_CENSUS_EFFECTS;
+			d->phase = CLUSTER_RECOVERY_CENSUS_RELMAP_PHYSICAL;
 		if (d->xact_result == CLUSTER_RECOVERY_XACT_JOIN_MORE
 			|| d->xact_result == CLUSTER_RECOVERY_XACT_JOIN_DRAINED)
+			return CLUSTER_RECOVERY_CENSUS_MORE;
+		break;
+	case CLUSTER_RECOVERY_CENSUS_RELMAP_PHYSICAL:
+		if (census->relmap == NULL)
+			d->relmap_result = cluster_recovery_relmap_scan_begin(
+				census->roots, census->system_identifier, census->database_incarnation,
+				census->storage_uuid, census->child_budget, &census->relmap);
+		else
+			d->relmap_result
+				= cluster_recovery_relmap_scan_next(census->relmap, &out->value.relmap);
+		if (d->relmap_result == CLUSTER_RECOVERY_RELMAP_ENTRY) {
+			d->relmap_entries++;
+			return census_entry(out, CLUSTER_RECOVERY_CENSUS_RELMAP);
+		}
+		if (d->relmap_result == CLUSTER_RECOVERY_RELMAP_DRAINED) {
+			cluster_recovery_relmap_scan_destroy(census->relmap);
+			census->relmap = NULL;
+			d->phase = CLUSTER_RECOVERY_CENSUS_EFFECTS;
+		}
+		if (d->relmap_result == CLUSTER_RECOVERY_RELMAP_MORE
+			|| d->relmap_result == CLUSTER_RECOVERY_RELMAP_DRAINED)
 			return CLUSTER_RECOVERY_CENSUS_MORE;
 		break;
 	case CLUSTER_RECOVERY_CENSUS_EFFECTS:

@@ -117,6 +117,7 @@ OBJS = \
 	cluster_recovery_native_inventory.o \
 	cluster_recovery_multixact_scan.o \
 	cluster_recovery_slru_scan.o \
+	cluster_recovery_relmap_scan.o \
 	cluster_recovery_multixact_join.o \
 	cluster_recovery_xact_join.o \
 	cluster_recovery_wal_targets.o \

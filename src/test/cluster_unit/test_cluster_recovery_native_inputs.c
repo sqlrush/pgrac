@@ -664,6 +664,7 @@ cleanup:
 #include "test_cluster_recovery_census_inputs.inc"
 #include "test_cluster_recovery_xact_join_inputs.inc"
 #include "test_cluster_recovery_relmap_inputs.inc"
+#include "test_cluster_recovery_relmap_physical_inputs.inc"
 
 int
 main(int argc, char **argv)
@@ -672,7 +673,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(51);
+	UT_PLAN(54);
 	UT_RUN(test_native_inventory_uses_two_real_cold_passes);
 	UT_RUN(test_native_inventory_never_returns_partial_on_drift_io_or_error);
 	UT_RUN(test_native_inventory_capacity_is_not_partial_success);
@@ -724,6 +725,9 @@ main(int argc, char **argv)
 	UT_RUN(test_cold_relmap_owns_images_entries_and_all_target_paths);
 	UT_RUN(test_cold_relmap_second_and_final_reads_revoke_observations);
 	UT_RUN(test_cold_relmap_malformed_or_unknown_never_becomes_other);
+	UT_RUN(test_owned_census_maps_keep_all_copy_edges);
+	UT_RUN(test_owned_census_maps_final_root_and_wal_rechecks);
+	UT_RUN(test_owned_census_bad_map_revokes_all_children);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
