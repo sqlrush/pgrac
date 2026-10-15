@@ -440,10 +440,182 @@ UT_TEST(test_invalid_keys_and_late_roots_cannot_change_a_walk)
 	cluster_recovery_reference_graph_destroy(graph);
 }
 
+
+static ClusterTxLocator
+lookup_locator(UBA address)
+{
+	ClusterTxLocator locator = { 0 };
+	locator.uba = address;
+	locator.xid = transaction().xid;
+	locator.tt_wrap = TT_WRAP_INVALID;
+	locator.itl_kind = ITL_FLAG_COMMITTED;
+	locator.itl_slot_index = 0;
+	return locator;
+}
+
+UT_TEST(test_page_locator_waits_for_whole_observed_forest_and_is_bounded)
+{
+	ClusterRecoveryTxnKey key = transaction();
+	ClusterRecoveryReferenceGraph *graph;
+	ClusterRecoveryGraphLookup *lookup = NULL;
+	ClusterRecoveryGraphRecord record;
+	ClusterTxLocator locator;
+	unsigned records = 0;
+	uint64 sum = 0;
+
+	memset(&input, 0, sizeof(input));
+	for (unsigned i = 0; i < 257; i++)
+		add_record(257, i + 1, 16385 + i,
+				   i == 0 ? (UBA){ { 0, 0 } } : input.records[i - 1].address);
+	graph = begin_graph(4 * 1024 * 1024);
+	if (graph == NULL)
+		return;
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_add(graph, &key, input.records[256].address), 0);
+	locator = lookup_locator(input.records[256].address); /* first saved node, not first return */
+	UT_ASSERT_EQ(cluster_recovery_reference_lookup_begin(graph, 817, 91, &locator, BLCKSZ, &lookup),
+				 CLUSTER_RECOVERY_LOOKUP_INVALID);
+	UT_ASSERT(lookup == NULL);
+	UT_ASSERT_EQ(drain(graph, &records, &sum), CLUSTER_RECOVERY_GRAPH_DRAINED);
+	UT_ASSERT(cluster_recovery_reference_graph_observed(graph));
+	UT_ASSERT_EQ(cluster_recovery_reference_lookup_begin(graph, 817, 91, &locator, BLCKSZ, &lookup),
+				 CLUSTER_RECOVERY_LOOKUP_MORE);
+	if (lookup != NULL) {
+		for (unsigned i = 0; i < 2; i++) {
+			memset(&record, 0x77, sizeof(record));
+			UT_ASSERT_EQ(cluster_recovery_reference_lookup_next(lookup, &record),
+						 CLUSTER_RECOVERY_LOOKUP_MORE);
+			UT_ASSERT(record.record == NULL);
+		}
+		UT_ASSERT_EQ(cluster_recovery_reference_lookup_next(lookup, &record),
+					 CLUSTER_RECOVERY_LOOKUP_RECORD);
+		UT_ASSERT_EQ(record.transaction.slot_wrap, 1);
+		UT_ASSERT_EQ(record.transaction.segment_generation, 0);
+		UT_ASSERT(record.record != NULL);
+		UT_ASSERT_EQ(input.calls, 514); /* matching the saved forest causes no new disk read */
+		cluster_recovery_reference_graph_invalidate(graph);
+		UT_ASSERT_EQ(cluster_recovery_reference_lookup_next(lookup, &record),
+					 CLUSTER_RECOVERY_LOOKUP_CHANGED);
+		UT_ASSERT(record.record == NULL);
+	}
+	cluster_recovery_reference_lookup_destroy(lookup);
+	cluster_recovery_reference_graph_destroy(graph);
+}
+
+UT_TEST(test_unknown_locator_is_not_current_slot_or_terminal_proof)
+{
+	ClusterRecoveryTxnKey key = transaction();
+	ClusterRecoveryReferenceGraph *graph;
+	unsigned records = 0;
+	uint64 sum = 0;
+	memset(&input, 0, sizeof(input));
+	add_record(258, 1, 16385, (UBA){ { 0, 0 } });
+	graph = begin_graph(1024 * 1024);
+	if (graph == NULL)
+		return;
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_add(graph, &key, input.records[0].address), 0);
+	UT_ASSERT_EQ(drain(graph, &records, &sum), CLUSTER_RECOVERY_GRAPH_DRAINED);
+	for (unsigned mode = 0; mode < 6; mode++) {
+		ClusterTxLocator locator = lookup_locator(input.records[0].address);
+		ClusterRecoveryGraphLookup *lookup = NULL;
+		ClusterRecoveryGraphRecord record;
+		uint64 system = 817, database = 91;
+		if (mode == 0)
+			locator.xid++;
+		if (mode == 1)
+			locator.tt_wrap = 2;
+		if (mode == 2)
+			locator.uba = uba_encode(258, 2, 6, 0);
+		if (mode == 3)
+			system++;
+		if (mode == 4)
+			database++;
+		UT_ASSERT_EQ(cluster_recovery_reference_lookup_begin(graph, system, database, &locator,
+															 BLCKSZ, &lookup),
+					 CLUSTER_RECOVERY_LOOKUP_MORE);
+		if (lookup != NULL) {
+			UT_ASSERT_EQ(cluster_recovery_reference_lookup_next(lookup, &record),
+						 mode == 5 ? CLUSTER_RECOVERY_LOOKUP_RECORD
+								   : CLUSTER_RECOVERY_LOOKUP_MISSING);
+			if (mode < 5)
+				UT_ASSERT(record.record == NULL);
+			else {
+				UT_ASSERT_EQ(record.transaction.segment_id, 257);
+				UT_ASSERT_EQ(record.transaction.segment_generation, 0);
+				UT_ASSERT_EQ(record.record_segment_generation, 7);
+			}
+		}
+		cluster_recovery_reference_lookup_destroy(lookup);
+	}
+	cluster_recovery_reference_graph_destroy(graph);
+}
+
+UT_TEST(test_ambiguous_canonical_generation_is_not_first_match_wins)
+{
+	ClusterRecoveryTxnKey key = transaction();
+	ClusterRecoveryReferenceGraph *graph;
+	ClusterRecoveryGraphLookup *lookup = NULL;
+	ClusterRecoveryGraphRecord record;
+	ClusterTxLocator locator;
+	unsigned records = 0;
+	uint64 sum = 0;
+	memset(&input, 0, sizeof(input));
+	add_record(258, 1, 16385, (UBA){ { 0, 0 } });
+	graph = begin_graph(1024 * 1024);
+	if (graph == NULL)
+		return;
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_add(graph, &key, input.records[0].address), 0);
+	key.segment_generation++;
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_add(graph, &key, input.records[0].address), 0);
+	UT_ASSERT_EQ(drain(graph, &records, &sum), CLUSTER_RECOVERY_GRAPH_DRAINED);
+	locator = lookup_locator(input.records[0].address);
+	UT_ASSERT_EQ(cluster_recovery_reference_lookup_begin(graph, 817, 91, &locator, BLCKSZ, &lookup),
+				 CLUSTER_RECOVERY_LOOKUP_MORE);
+	if (lookup != NULL) {
+		UT_ASSERT_EQ(cluster_recovery_reference_lookup_next(lookup, &record),
+					 CLUSTER_RECOVERY_LOOKUP_IDENTITY);
+		UT_ASSERT(record.record == NULL);
+		UT_ASSERT_EQ(cluster_recovery_reference_lookup_next(lookup, &record),
+					 CLUSTER_RECOVERY_LOOKUP_IDENTITY);
+	}
+	cluster_recovery_reference_lookup_destroy(lookup);
+	cluster_recovery_reference_graph_destroy(graph);
+}
+
+UT_TEST(test_locator_validation_and_memory_limit_precede_allocation)
+{
+	ClusterRecoveryReferenceGraph *graph = begin_graph(1024 * 1024);
+	ClusterRecoveryGraphLookup *lookup = NULL;
+	ClusterRecoveryGraphRecord record;
+	ClusterTxLocator locator = lookup_locator(uba_encode(257, 1, 6, 0));
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_step(graph, &record),
+				 CLUSTER_RECOVERY_GRAPH_DRAINED);
+	for (unsigned mode = 0; mode < 6; mode++) {
+		ClusterTxLocator invalid = locator;
+		if (mode == 0)
+			invalid.xid = InvalidTransactionId;
+		if (mode == 1)
+			invalid.itl_kind = ITL_FLAG_FREE;
+		if (mode == 2)
+			invalid.itl_slot_index = CLUSTER_ITL_INITRANS_DEFAULT;
+		if (mode == 3)
+			invalid.uba = (UBA){ { 0, 0 } };
+		if (mode == 4)
+			invalid.uba = uba_encode(257, 0, 6, 0);
+		UT_ASSERT_EQ(cluster_recovery_reference_lookup_begin(graph, mode == 5 ? 0 : 817, 91,
+															 &invalid, BLCKSZ, &lookup),
+					 CLUSTER_RECOVERY_LOOKUP_INVALID);
+		UT_ASSERT(lookup == NULL);
+	}
+	UT_ASSERT_EQ(cluster_recovery_reference_lookup_begin(graph, 817, 91, &locator, 1, &lookup),
+				 CLUSTER_RECOVERY_LOOKUP_CAPACITY);
+	UT_ASSERT(lookup == NULL);
+	cluster_recovery_reference_graph_destroy(graph);
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(15);
 	UT_RUN(test_cross_relation_and_segment_chain_is_not_page_history);
 	UT_RUN(test_multiple_roots_share_a_tail_without_a_false_cycle);
 	UT_RUN(test_active_path_cycle_and_self_edge_are_refused);
@@ -455,6 +627,10 @@ main(void)
 	UT_RUN(test_capacity_is_not_a_truncated_success);
 	UT_RUN(test_long_chain_resumes_without_a_history_depth_cutoff);
 	UT_RUN(test_invalid_keys_and_late_roots_cannot_change_a_walk);
+	UT_RUN(test_page_locator_waits_for_whole_observed_forest_and_is_bounded);
+	UT_RUN(test_unknown_locator_is_not_current_slot_or_terminal_proof);
+	UT_RUN(test_ambiguous_canonical_generation_is_not_first_match_wins);
+	UT_RUN(test_locator_validation_and_memory_limit_precede_allocation);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

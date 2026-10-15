@@ -7,6 +7,8 @@ int namespace_fixture_main(void);
 #undef main
 #include "test_cluster_recovery_crypto_boundary.h"
 #include "cluster/cluster_recovery_undo_store.h"
+#include "cluster/cluster_recovery_page_census.h"
+#include "access/htup_details.h"
 #include "../../common/cluster_undo_segment_init.c"
 #include "../../backend/cluster/cluster_uba.c"
 #include "test_cluster_heap_small_scn.inc"
@@ -16,6 +18,10 @@ int namespace_fixture_main(void);
 #include "../../backend/cluster/cluster_recovery_root_set.c"
 #undef pread
 #include "../../backend/cluster/cluster_recovery_undo_store.c"
+#include "../../backend/cluster/cluster_recovery_relation_scan.c"
+#include "../../backend/cluster/cluster_recovery_heap_scan.c"
+#include "../../backend/cluster/cluster_recovery_page_history.c"
+#include "../../backend/cluster/cluster_recovery_page_census.c"
 
 static const uint8 store_uuid[16] = { 9, 3, 7 };
 
@@ -629,10 +635,12 @@ UT_TEST(test_read_and_final_recheck_failures_poison_already_borrowed_graph)
 	}
 }
 
+#include "test_cluster_recovery_page_census.inc"
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(17);
 	UT_RUN(test_real_untouched_segment_files_feed_all_slots_and_the_full_transaction_chain);
 	UT_RUN(test_missing_segment_or_short_or_failed_read_is_not_an_empty_chain);
 	UT_RUN(test_foreign_database_or_tt_identity_never_selects_a_local_record);
@@ -644,6 +652,12 @@ main(void)
 	UT_RUN(test_graph_binding_is_early_exact_single_use_and_budgeted);
 	UT_RUN(test_graph_capacity_after_one_root_does_not_export_a_prefix);
 	UT_RUN(test_read_and_final_recheck_failures_poison_already_borrowed_graph);
+	UT_RUN(test_physical_relation_page_joins_the_original_tt_forest_and_history);
+	UT_RUN(test_page_reference_cannot_borrow_a_new_slot_generation);
+	UT_RUN(test_each_itl_is_checked_before_page_inverse);
+	UT_RUN(test_history_without_a_record_or_prior_base_never_drains);
+	UT_RUN(test_page_census_rejects_partial_changed_or_invalid_inputs);
+	UT_RUN(test_final_whole_namespace_change_revokes_completed_page_census);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

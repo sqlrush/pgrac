@@ -22,6 +22,9 @@ struct ClusterRecoveryHeapScan {
 	uint8 itl_next;
 };
 
+StaticAssertDecl(sizeof(ClusterRecoveryHeapScan) <= 2 * BLCKSZ,
+				 "cold page census reserves two blocks for its heap scanner");
+
 static ClusterRecoveryHeapResult
 recovery_heap_layout(ClusterRecoveryHeapScan *scan)
 {

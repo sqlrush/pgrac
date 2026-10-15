@@ -394,4 +394,109 @@ cluster_recovery_reference_graph_destroy(ClusterRecoveryReferenceGraph *graph)
 		free(graph);
 	}
 }
+
+struct ClusterRecoveryGraphLookup {
+	const ClusterRecoveryReferenceGraph *graph;
+	uint64 system_identifier, database_incarnation;
+	ClusterTxLocator locator;
+	uint32 next, match;
+	ClusterRecoveryGraphLookupResult status;
+};
+
+bool
+cluster_recovery_reference_graph_observed(const ClusterRecoveryReferenceGraph *graph)
+{
+	return graph != NULL && graph->status == CLUSTER_RECOVERY_GRAPH_DRAINED;
+}
+
+ClusterRecoveryGraphLookupResult
+cluster_recovery_reference_lookup_begin(const ClusterRecoveryReferenceGraph *graph,
+										uint64 system_identifier, uint64 database_incarnation,
+										const ClusterTxLocator *locator, size_t memory_budget,
+										ClusterRecoveryGraphLookup **out)
+{
+	ClusterRecoveryGraphLookup *lookup;
+	uint32 segment, block;
+	uint16 slot, row;
+
+	if (out != NULL)
+		*out = NULL;
+	if (out == NULL || !cluster_recovery_reference_graph_observed(graph) || system_identifier == 0
+		|| database_incarnation == 0 || locator == NULL || !TransactionIdIsNormal(locator->xid)
+		|| locator->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT
+		|| locator->itl_kind == ITL_FLAG_FREE
+		|| locator->itl_kind > ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI
+		|| !uba_decode_record(locator->uba, &segment, &block, &slot, &row))
+		return CLUSTER_RECOVERY_LOOKUP_INVALID;
+	if (memory_budget < sizeof(*lookup))
+		return CLUSTER_RECOVERY_LOOKUP_CAPACITY;
+	lookup = calloc(1, sizeof(*lookup));
+	if (lookup == NULL)
+		return CLUSTER_RECOVERY_LOOKUP_CAPACITY;
+	lookup->graph = graph;
+	lookup->system_identifier = system_identifier;
+	lookup->database_incarnation = database_incarnation;
+	lookup->locator = *locator;
+	lookup->match = RECOVERY_GRAPH_NONE;
+	*out = lookup;
+	return CLUSTER_RECOVERY_LOOKUP_MORE;
+}
+
+ClusterRecoveryGraphLookupResult
+cluster_recovery_reference_lookup_next(ClusterRecoveryGraphLookup *lookup,
+									   ClusterRecoveryGraphRecord *out)
+{
+	const ClusterRecoveryReferenceGraph *graph;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (lookup == NULL)
+		return CLUSTER_RECOVERY_LOOKUP_INVALID;
+	if (out == NULL)
+		return lookup->status = CLUSTER_RECOVERY_LOOKUP_INVALID;
+	if (lookup->status >= CLUSTER_RECOVERY_LOOKUP_INVALID)
+		return lookup->status;
+	graph = lookup->graph;
+	if (!cluster_recovery_reference_graph_observed(graph))
+		return lookup->status = CLUSTER_RECOVERY_LOOKUP_CHANGED;
+	for (unsigned work = 0; lookup->next < graph->count && work < RECOVERY_GRAPH_TICK; work++) {
+		uint32 index = lookup->next++;
+		const RecoveryRecordNode *node = &graph->nodes[index];
+		const ClusterRecoveryTxnKey *key = &node->transaction;
+		ClusterTxLocator locator;
+		ClusterTxResolveReason reason;
+
+		if (key->system_identifier != lookup->system_identifier
+			|| key->database_incarnation != lookup->database_incarnation
+			|| key->xid != lookup->locator.xid
+			|| !cluster_undo_record_uba_equal(node->address, lookup->locator.uba)
+			|| (lookup->locator.tt_wrap != TT_WRAP_INVALID
+				&& key->slot_wrap != lookup->locator.tt_wrap))
+			continue;
+		locator = lookup->locator;
+		locator.tt_wrap = key->slot_wrap;
+		/* Reuse the original member contract, including canonical-vs-physical
+		 * segment identity. The page's own slot wrap is never the TT wrap. */
+		if (node->state != RECOVERY_NODE_DONE
+			|| !cluster_undo_record_validate_identity(&locator, node->address, &node->record.header,
+													  &reason)
+			|| lookup->match != RECOVERY_GRAPH_NONE)
+			return lookup->status = CLUSTER_RECOVERY_LOOKUP_IDENTITY;
+		lookup->match = index;
+	}
+	if (lookup->next < graph->count)
+		return CLUSTER_RECOVERY_LOOKUP_MORE;
+	if (lookup->match == RECOVERY_GRAPH_NONE)
+		return lookup->status = CLUSTER_RECOVERY_LOOKUP_MISSING;
+	out->transaction = graph->nodes[lookup->match].transaction;
+	out->record_segment_generation = graph->nodes[lookup->match].record_generation;
+	out->record = &graph->nodes[lookup->match].record;
+	return lookup->status = CLUSTER_RECOVERY_LOOKUP_RECORD;
+}
+
+void
+cluster_recovery_reference_lookup_destroy(ClusterRecoveryGraphLookup *lookup)
+{
+	free(lookup);
+}
 #endif

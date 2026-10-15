@@ -57,6 +57,17 @@ typedef struct ClusterRecoveryGraphRecord {
 } ClusterRecoveryGraphRecord;
 
 typedef struct ClusterRecoveryReferenceGraph ClusterRecoveryReferenceGraph;
+typedef struct ClusterRecoveryGraphLookup ClusterRecoveryGraphLookup;
+
+typedef enum ClusterRecoveryGraphLookupResult {
+	CLUSTER_RECOVERY_LOOKUP_MORE = 0,
+	CLUSTER_RECOVERY_LOOKUP_RECORD,
+	CLUSTER_RECOVERY_LOOKUP_MISSING,
+	CLUSTER_RECOVERY_LOOKUP_INVALID,
+	CLUSTER_RECOVERY_LOOKUP_CHANGED,
+	CLUSTER_RECOVERY_LOOKUP_IDENTITY,
+	CLUSTER_RECOVERY_LOOKUP_CAPACITY
+} ClusterRecoveryGraphLookupResult;
 
 /* Pure byte/identity validation shared with PAGE_VERSION. It neither reads
  * storage nor establishes the caller's generation/namespace authority. */
@@ -87,6 +98,26 @@ extern ClusterRecoveryGraphResult
 cluster_recovery_reference_graph_step(ClusterRecoveryReferenceGraph *graph,
 									  ClusterRecoveryGraphRecord *out);
 extern uint32 cluster_recovery_reference_graph_count(const ClusterRecoveryReferenceGraph *graph);
+/* Only the supplied TX forest has completed its second record reads. This
+ * does not assert that all page/native/structural producers were supplied. */
+extern bool cluster_recovery_reference_graph_observed(const ClusterRecoveryReferenceGraph *graph);
+
+/* Match a page locator against saved, fully re-read records, never against
+ * the current TT slot generation guessed from the UBA. The forest must be
+ * observed and outlive this lookup and all returned borrowed records.
+ * At most 128 nodes per next(); a match is exported only after the whole
+ * forest rules out ambiguous canonical identities. MISSING is an unresolved
+ * dependency, not an empty history or terminal verdict. Unknown page wrap
+ * is permitted; the original record provides it. No online lookup or I/O. */
+extern ClusterRecoveryGraphLookupResult
+cluster_recovery_reference_lookup_begin(const ClusterRecoveryReferenceGraph *graph,
+										uint64 system_identifier, uint64 database_incarnation,
+										const ClusterTxLocator *locator, size_t memory_budget,
+										ClusterRecoveryGraphLookup **out);
+extern ClusterRecoveryGraphLookupResult
+cluster_recovery_reference_lookup_next(ClusterRecoveryGraphLookup *lookup,
+									   ClusterRecoveryGraphRecord *out);
+extern void cluster_recovery_reference_lookup_destroy(ClusterRecoveryGraphLookup *lookup);
 /* A producer's later observation failed. Revoke even a drained TX forest;
  * this never reopens it for new roots or turns an earlier refusal into MORE. */
 extern void cluster_recovery_reference_graph_invalidate(ClusterRecoveryReferenceGraph *graph);
