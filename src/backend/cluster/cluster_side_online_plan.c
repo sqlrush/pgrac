@@ -348,8 +348,11 @@ side_operation_space_input(const RfSideOnlinePlanV1 *plan, const RfSideOnlineOpe
 
 		if (op->owned_payload_length != op->xact.completion_payload_length
 			|| (plan->purpose == RF_SIDE_PLAN_PI_CONTRIBUTIONS
-				? !rf_side_xact_inspection_preflight_v1(&op->xact)
-				: !rf_side_xact_structural_preflight_v1(&op->xact)))
+					? !rf_side_xact_inspection_preflight_v1(&op->xact)
+				: op->xact.cold_completion_effects
+					? !rf_side_xact_cold_completion_payload_v1(&op->xact, candidate.data,
+															   candidate.length)
+					: !rf_side_xact_structural_preflight_v1(&op->xact)))
 			return false;
 		candidate.data = (const uint8 *)candidate.data + op->xact.space_drop_offset
 						 + (Size)item * CLUSTER_SPACE_STRUCTURE_WAL_BYTES;

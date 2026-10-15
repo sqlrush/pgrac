@@ -910,16 +910,18 @@ rf_side_xact_decode_recovery_v1(XLogReaderState *record, uint64 system_identifie
 	const uint32 supported = XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_TT_COMMIT
 							 | XACT_XINFO_HAS_INVALS | XACT_COMPLETION_UPDATE_RELCACHE_FILE
 							 | XACT_XINFO_HAS_DROPPED_STATS | XACT_COMPLETION_FORCE_SYNC_COMMIT
-							 | XACT_XINFO_HAS_AE_LOCKS;
+							 | XACT_XINFO_HAS_AE_LOCKS | XACT_XINFO_HAS_RELFILELOCATORS
+							 | XACT_XINFO_HAS_SPACE_DROP;
 
 	if (out == NULL)
 		return false;
 	if (rf_side_xact_decode_v1(record, system_identifier, origin_thread, out)) {
 		if ((out->kind != RF_SIDE_XACT_COMMIT && out->kind != RF_SIDE_XACT_ABORT)
-			|| (out->xinfo & XACT_XINFO_HAS_AE_LOCKS) == 0)
+			|| ((out->xinfo & XACT_XINFO_HAS_AE_LOCKS) == 0 && out->space_drop_count == 0))
 			return true;
-		/* A lock flag has no array, but still requires the original native
-		 * completion owner and the full source record, not generic projection. */
+		/* Reclassify every effect of structural COMMITs, including those
+		 * accepted by the strict structural decoder. A valid DROP suffix
+		 * cannot hide unsupported native owners in the same record. */
 		memset(out, 0, sizeof(*out));
 	}
 	if (record != NULL && record->record != NULL
@@ -927,12 +929,11 @@ rf_side_xact_decode_recovery_v1(XLogReaderState *record, uint64 system_identifie
 		return side_xact_decode_cold_abort(record, system_identifier, origin_thread, out);
 	if (!side_xact_decode(record, system_identifier, origin_thread, true, true, &candidate)
 		|| candidate.kind != RF_SIDE_XACT_COMMIT || (candidate.xinfo & ~supported) != 0
-		|| (candidate.invalidation_count == 0
+		|| (candidate.invalidation_count == 0 && candidate.space_drop_count == 0
 			&& (candidate.xinfo
 				& (XACT_XINFO_HAS_DROPPED_STATS | XACT_COMPLETION_FORCE_SYNC_COMMIT
 				   | XACT_XINFO_HAS_AE_LOCKS))
-				   == 0)
-		|| candidate.relation_count != 0 || candidate.space_drop_count != 0)
+				   == 0))
 		return false;
 	candidate.pi_read_only = false;
 	candidate.cold_completion_effects = true;
@@ -940,11 +941,11 @@ rf_side_xact_decode_recovery_v1(XLogReaderState *record, uint64 system_identifie
 	return true;
 }
 
-/* Re-parse the complete owned bytes before any target in the protected set
- * is changed. The plan's source/cut binding remains an independent gate. */
+/* Re-parse the complete owned bytes using their immutable source identity.
+ * This shape check neither borrows an execution scope nor grants one. */
 bool
-rf_side_xact_cold_completion_preflight_v1(const RfSideXactOperationV1 *operation,
-										  const uint8 *payload, uint32 length)
+rf_side_xact_cold_completion_payload_v1(const RfSideXactOperationV1 *operation,
+										const uint8 *payload, uint32 length)
 {
 	XLogReaderState record = { 0 };
 	DecodedXLogRecord decoded = { 0 };
@@ -954,11 +955,7 @@ rf_side_xact_cold_completion_preflight_v1(const RfSideXactOperationV1 *operation
 
 	if (operation == NULL || !operation->cold_completion_effects || operation->pi_read_only
 		|| (operation->kind != RF_SIDE_XACT_COMMIT && operation->kind != RF_SIDE_XACT_ABORT)
-		|| payload == NULL || length == 0 || length != operation->completion_payload_length
-		|| operation->system_identifier != GetSystemIdentifier()
-		|| cluster_xid_origin_slot(operation->xid) != (int)operation->origin_thread - 1
-		|| ((operation->xinfo & XACT_XINFO_HAS_AE_LOCKS) != 0
-			&& (unsigned)standbyState > STANDBY_SNAPSHOT_READY))
+		|| payload == NULL || length == 0 || length != operation->completion_payload_length)
 		return false;
 	/* Packed plan payloads need not have native structure alignment. */
 	copy = side_xact_payload_copy(payload, length);
@@ -978,6 +975,23 @@ rf_side_xact_cold_completion_preflight_v1(const RfSideXactOperationV1 *operation
 			&& memcmp(&candidate, operation, sizeof(candidate)) == 0;
 	side_xact_payload_free(copy);
 	return valid;
+}
+
+/* Runtime preflight keeps the original local identity/state gates. Complete
+ * payload classification alone is not permission to mutate any target. */
+bool
+rf_side_xact_cold_completion_preflight_v1(const RfSideXactOperationV1 *operation,
+										  const uint8 *payload, uint32 length)
+{
+	if (operation == NULL || !operation->cold_completion_effects || operation->pi_read_only
+		|| (operation->kind != RF_SIDE_XACT_COMMIT && operation->kind != RF_SIDE_XACT_ABORT)
+		|| payload == NULL || length == 0 || length != operation->completion_payload_length)
+		return false;
+	return operation->system_identifier == GetSystemIdentifier()
+		   && cluster_xid_origin_slot(operation->xid) == (int)operation->origin_thread - 1
+		   && ((operation->xinfo & XACT_XINFO_HAS_AE_LOCKS) == 0
+			   || (unsigned)standbyState <= STANDBY_SNAPSHOT_READY)
+		   && rf_side_xact_cold_completion_payload_v1(operation, payload, length);
 }
 
 static RfSideXactApplyResultV1
@@ -1073,7 +1087,11 @@ rf_side_xact_apply_cold_completion_v1(const RfSideXactOperationV1 *operation, co
 	/* The native cache replay owner temporarily uses DatabasePath. An
 	 * existing backend database context cannot be borrowed or destroyed. */
 	if (!rf_side_xact_cold_completion_preflight_v1(operation, payload, length)
-		|| operation->kind != RF_SIDE_XACT_COMMIT || DatabasePath != NULL || verify == NULL
+		|| operation->kind != RF_SIDE_XACT_COMMIT || DatabasePath != NULL
+		|| verify == NULL
+		/* TT/cache completion cannot discharge physical deletion. The
+		 * structural owner must preserve the original record replay order. */
+		|| operation->relation_count != 0 || operation->space_drop_count != 0
 		|| !cluster_undo_recovery_cold_origin_authorized_v1(operation->origin_thread - 1)
 		|| ((operation->xinfo & (XACT_XINFO_HAS_DROPPED_STATS | XACT_COMPLETION_FORCE_SYNC_COMMIT))
 				!= 0

@@ -69,6 +69,10 @@ extern bool rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identi
 								   uint16 origin_thread, RfSideXactOperationV1 *out);
 extern bool rf_side_xact_decode_recovery_v1(XLogReaderState *record, uint64 system_identifier,
 											uint16 origin_thread, RfSideXactOperationV1 *out);
+/* Complete immutable carrier validation only; execution still requires the
+ * original runtime preflight and the consumer for every retained effect. */
+extern bool rf_side_xact_cold_completion_payload_v1(const RfSideXactOperationV1 *operation,
+													const uint8 *payload, uint32 length);
 extern bool rf_side_xact_cold_completion_preflight_v1(const RfSideXactOperationV1 *operation,
 													  const uint8 *payload, uint32 length);
 /* Native standalone invalidations use the same message/scope rules as
