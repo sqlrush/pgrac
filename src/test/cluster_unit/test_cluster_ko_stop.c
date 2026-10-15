@@ -332,6 +332,8 @@ MemoryContext CurrentMemoryContext = (MemoryContext)1;
  * queue cut and active-slot consumers execute from the product source. */
 static void *native_allocations[512];
 static unsigned native_allocated, native_allocate_calls, native_detaches, native_releases;
+static unsigned native_free_calls;
+static dsa_pointer marker_native_allocation;
 static bool native_alloc_fail;
 size_t
 dsa_minimum_size(void)
@@ -418,6 +420,7 @@ dsa_free(dsa_area *area, dsa_pointer dp)
 	free(address);
 	native_allocations[dp] = NULL;
 	native_allocated--;
+	native_free_calls++;
 }
 
 ResourceOwner
@@ -643,6 +646,8 @@ CacheInvalidateKoCommit(uint64 batch)
 	UT_ASSERT(!barrier_active);
 	marker_registrations++;
 	marker_batch = batch;
+	marker_native_allocation
+		= ko_completions == NULL ? InvalidDsaPointer : ko_completions->native_allocation;
 	if (marker_error)
 		pg_re_throw();
 }
@@ -1136,6 +1141,8 @@ reset_test(void)
 	fixture_recovering = false;
 	failed_reply_count = 0;
 	native_allocate_calls = 0;
+	native_free_calls = 0;
+	marker_native_allocation = InvalidDsaPointer;
 	native_alloc_fail = false;
 	native_commit_active = false;
 	ko_drop_poll_boundary = NULL;
@@ -7672,13 +7679,11 @@ origin_marker_setup(void)
 	return binding;
 }
 
-static ClusterKoCompletionV2 *
-v3_native_structure_owner(uint16 operation)
+/* Prepare the native producer without consuming it, so faults can be placed
+ * at its original allocator and publication boundaries. */
+static void
+v3_native_structure_setup(RelationData *relation)
 {
-	RelationData relation = { 0 };
-	Oid old_database = MyDatabaseId;
-	ClusterKoCompletionV2 *completion;
-
 	(void)origin_marker_setup();
 	space_identity.sequence = 1;
 	writer.claim.identity.origin_thread_id = 1;
@@ -7688,8 +7693,19 @@ v3_native_structure_owner(uint16 operation)
 	writer.claim.max_config_generation = 1;
 	writer.claim.claim_sha256[0] = 19;
 	writer.timeline = 1;
-	relation.rd_id = 4242;
-	relation.rd_locator = space_identity.key.locator;
+	memset(relation, 0, sizeof(*relation));
+	relation->rd_id = 4242;
+	relation->rd_locator = space_identity.key.locator;
+}
+
+static ClusterKoCompletionV2 *
+v3_native_structure_owner(uint16 operation)
+{
+	RelationData relation;
+	Oid old_database = MyDatabaseId;
+	ClusterKoCompletionV2 *completion;
+
+	v3_native_structure_setup(&relation);
 	MyDatabaseId = relation.rd_locator.dbOid;
 	/* Run the native producer; GES, SPACE read and transport remain explicit
 	 * fixture boundaries. No test manufactures the opaque completion. */
@@ -7701,6 +7717,146 @@ v3_native_structure_owner(uint16 operation)
 	UT_ASSERT(completion->native_pending && completion->barrier_v3 && completion->native_transaction
 			  && completion->barrier_private);
 	return completion;
+}
+
+UT_TEST(test_v3_native_reservation_precedes_publication_and_is_reused)
+{
+	for (uint16 op = CLUSTER_KO_SHARED_V3_OPERATION_DROP;
+		 op <= CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD; op++) {
+		ClusterKoCompletionV2 *completion = v3_native_structure_owner(op);
+
+		UT_ASSERT_EQ(marker_registrations, 1);
+		UT_ASSERT(DsaPointerIsValid(marker_native_allocation));
+		UT_ASSERT_EQ(marker_native_allocation, completion->native_allocation);
+		UT_ASSERT_EQ(native_allocate_calls, 1);
+		UT_ASSERT_EQ(native_allocated, 1);
+		UT_ASSERT_EQ(native_free_calls, 0);
+		UT_ASSERT_EQ(barrier_requests, 1);
+		UT_ASSERT_EQ(record_count, 1);
+		cluster_ko_shared_release_v2(&completion);
+		UT_ASSERT_EQ(native_allocated, 0);
+		UT_ASSERT_EQ(native_free_calls, 1);
+		UT_ASSERT_EQ(completion_allocations, 0);
+	}
+}
+
+UT_TEST(test_v3_native_allocation_failure_precedes_object_effects)
+{
+	RelationData relation;
+	Oid old_database = MyDatabaseId;
+	volatile bool caught = false;
+
+	v3_native_structure_setup(&relation);
+	MyDatabaseId = relation.rd_locator.dbOid;
+	cluster_hw_lease_install(relation.rd_locator, MAIN_FORKNUM, 4, 4);
+	native_alloc_fail = expecting_error = true;
+	PG_TRY();
+	{
+		cluster_ko_flush_and_wait_ack_relation(&relation, RELPERSISTENCE_PERMANENT,
+												 CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	expecting_error = false;
+	MyDatabaseId = old_database;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(reported_sqlstate, ERRCODE_OUT_OF_MEMORY);
+	UT_ASSERT_EQ(native_allocate_calls, 1);
+	UT_ASSERT_EQ(native_allocated, 0);
+	UT_ASSERT_EQ(native_free_calls, 0);
+	UT_ASSERT_EQ(marker_registrations, 0);
+	UT_ASSERT_EQ(space_reads, 0);
+	UT_ASSERT_EQ(lock_calls, 0);
+	UT_ASSERT_EQ(barrier_requests, 0);
+	UT_ASSERT_EQ(send_calls, 0);
+	UT_ASSERT_EQ(record_count, 0);
+	UT_ASSERT_EQ(storage.send_v3_count, 0);
+	UT_ASSERT(!barrier_active);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&leases.d_orphan_zero), 0);
+	UT_ASSERT_EQ(cluster_hw_lease_next_block(relation.rd_locator, MAIN_FORKNUM), 4);
+	UT_ASSERT(ko_completions == NULL);
+	UT_ASSERT_EQ(completion_allocations, 0);
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
+		UT_ASSERT(!storage.contexts[i].used);
+	/* Keep a failing baseline from leaking its late-created owner into the
+	 * following cases; the assertions above still report that lifetime bug. */
+	if (ko_completions != NULL)
+		resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+}
+
+UT_TEST(test_v3_native_presend_failure_releases_reserved_carrier)
+{
+	for (unsigned fault = 0; fault < 2; fault++) {
+		RelationData relation;
+		Oid old_database = MyDatabaseId;
+		volatile bool caught = false;
+
+		v3_native_structure_setup(&relation);
+		MyDatabaseId = relation.rd_locator.dbOid;
+		marker_capable = fault != 0;
+		marker_error = fault == 1;
+		expecting_error = true;
+		PG_TRY();
+		{
+			cluster_ko_flush_and_wait_ack_relation(&relation, RELPERSISTENCE_PERMANENT,
+													 CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		expecting_error = false;
+		MyDatabaseId = old_database;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(native_allocate_calls, 1);
+		UT_ASSERT_EQ(native_allocated, 0);
+		UT_ASSERT_EQ(native_free_calls, 1);
+		UT_ASSERT_EQ(marker_registrations, fault);
+		UT_ASSERT_EQ(barrier_requests, 0);
+		UT_ASSERT_EQ(send_calls, 0);
+		UT_ASSERT_EQ(record_count, 0);
+		UT_ASSERT_EQ(storage.send_v3_count, 0);
+		UT_ASSERT(!barrier_active);
+		UT_ASSERT(ko_completions == NULL);
+		UT_ASSERT_EQ(completion_allocations, 0);
+		for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
+			UT_ASSERT(!storage.contexts[i].used);
+	}
+}
+
+UT_TEST(test_v3_native_begin_requires_shared_state_before_reservation)
+{
+	KoAxBinding binding = origin_marker_setup();
+	ClusterKoCompletionV2 *completion = NULL;
+	volatile bool caught = false, begun = false;
+
+	ko_state = NULL;
+	expecting_error = true;
+	PG_TRY();
+	{
+		begun = ko_shared_begin_v3(space_identity.key.locator, RELPERSISTENCE_PERMANENT,
+								  CLUSTER_KO_SHARED_V3_OPERATION_DROP, &binding, &completion);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	expecting_error = false;
+	ko_state = &storage;
+	UT_ASSERT(!caught && !begun);
+	UT_ASSERT(completion == NULL && ko_completions == NULL);
+	UT_ASSERT_EQ(completion_allocations, 0);
+	UT_ASSERT_EQ(native_allocate_calls, 0);
+	UT_ASSERT_EQ(native_allocated, 0);
+	UT_ASSERT_EQ(space_reads, 0);
+	UT_ASSERT_EQ(lock_calls, 0);
+	UT_ASSERT_EQ(marker_registrations, 0);
+	UT_ASSERT_EQ(barrier_requests, 0);
 }
 
 UT_TEST(test_v3_native_completion_cannot_use_identity_only_claim)
@@ -8176,7 +8332,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(197);
+	UT_PLAN(201);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_create_reference_outlives_exact_space_children_and_blocks_ready);
 	UT_RUN(test_create_capacity_reserves_progress_for_every_accepted_constructor);
@@ -8358,6 +8514,10 @@ main(void)
 	UT_RUN(test_peer_holder_probe_exact_reply_is_observation_only);
 	UT_RUN(test_peer_holder_probe_refresh_retry_and_late_reply_keep_owner);
 	UT_RUN(test_v3_origin_registers_exact_marker_before_first_request);
+	UT_RUN(test_v3_native_reservation_precedes_publication_and_is_reused);
+	UT_RUN(test_v3_native_allocation_failure_precedes_object_effects);
+	UT_RUN(test_v3_native_presend_failure_releases_reserved_carrier);
+	UT_RUN(test_v3_native_begin_requires_shared_state_before_reservation);
 	UT_RUN(test_v3_native_completion_cannot_use_identity_only_claim);
 	UT_RUN(test_v3_native_structure_claim_is_exact_and_once);
 	UT_RUN(test_v3_native_structure_claim_refuses_drift_before_consumption);

@@ -5164,7 +5164,7 @@ ko_shared_begin_v3(RelFileLocator rloc, char relpersistence, uint16 operation,
 	ClusterKoCompletionV2 *completion;
 
 	if (out == NULL || *out != NULL || binding == NULL || !cluster_enabled
-		|| !cluster_shared_config || relpersistence == RELPERSISTENCE_TEMP
+		|| !cluster_shared_config || ko_state == NULL || relpersistence == RELPERSISTENCE_TEMP
 		|| RecoveryInProgress() || cluster_node_id < 0 || CurrentResourceOwner == NULL
 		|| TopTransactionContext == NULL || CritSectionCount != 0 || MyProcPid <= 0)
 		return false;
@@ -5181,6 +5181,13 @@ ko_shared_begin_v3(RelFileLocator rloc, char relpersistence, uint16 operation,
 	ko_completions = completion;
 	PG_TRY();
 	{
+		/* Reserve the original native carrier before any object work or
+		 * REQUEST can escape. Unpublished reservations use the same ERROR
+		 * cleanup as the local handle; allocation is not a completion proof. */
+		if (!ko_native_reserve(completion))
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("could not reserve the KO v3 completion owner")));
 		ko_flush_and_wait_ack(rloc, relpersistence, completion, operation, binding);
 	}
 	PG_CATCH();
@@ -5223,10 +5230,6 @@ cluster_ko_flush_and_wait_ack_relation(Relation rel, char relpersistence, uint16
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE),
 					 errmsg("could not preserve the KO v3 completion proof")));
-		if (!ko_native_reserve(completion))
-			ereport(ERROR,
-					(errcode(ERRCODE_OUT_OF_MEMORY),
-					 errmsg("could not reserve the KO v3 completion owner")));
 		completion->native_pending = true;
 		return;
 	}
