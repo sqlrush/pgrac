@@ -809,6 +809,17 @@ cluster_recovery_root_set_namespace_matches(const ClusterRecoveryRootSet *roots,
 		   && roots->database_incarnation == database_incarnation;
 }
 
+bool
+cluster_recovery_root_set_storage_matches(const ClusterRecoveryRootSet *roots,
+										  uint64 system_identifier, uint64 database_incarnation,
+										  const uint8 storage_uuid[16])
+{
+	return storage_uuid != NULL
+		   && cluster_recovery_root_set_namespace_matches(roots, system_identifier,
+														  database_incarnation)
+		   && memcmp(roots->storage_uuid, storage_uuid, 16) == 0;
+}
+
 ClusterRecoveryRootsResult
 cluster_recovery_root_set_relation(ClusterRecoveryRootSet *roots, uint32 index,
 								   ClusterSpaceIdentityKey *key, uint32 *space_index)

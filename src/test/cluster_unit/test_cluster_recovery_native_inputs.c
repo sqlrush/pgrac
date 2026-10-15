@@ -579,6 +579,7 @@ cleanup:
 #include "test_cluster_recovery_native_transcript.inc"
 #include "test_cluster_recovery_wal_tt_roots.inc"
 #include "test_cluster_recovery_multixact_inputs.inc"
+#include "test_cluster_recovery_multixact_join_inputs.inc"
 
 int
 main(int argc, char **argv)
@@ -587,7 +588,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(24);
+	UT_PLAN(27);
 	UT_RUN(test_native_inventory_uses_two_real_cold_passes);
 	UT_RUN(test_native_inventory_never_returns_partial_on_drift_io_or_error);
 	UT_RUN(test_native_inventory_capacity_is_not_partial_success);
@@ -612,6 +613,9 @@ main(int argc, char **argv)
 	UT_RUN(test_cold_multixact_records_keep_all_shapes_and_origin_sources);
 	UT_RUN(test_cold_multixact_second_and_final_reads_revoke_observations);
 	UT_RUN(test_cold_multixact_unknown_and_bad_shapes_never_become_other);
+	UT_RUN(test_cold_mx_join_visits_all_saved_creates_and_preserves_effects);
+	UT_RUN(test_cold_mx_join_final_wal_drift_and_destroy_revoke_roots);
+	UT_RUN(test_cold_mx_join_refusal_poisons_inventory_and_partial_roots);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

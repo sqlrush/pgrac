@@ -459,11 +459,12 @@ UT_TEST(test_bad_edge_mixed_side_and_unclassified_opcode_do_not_finish_roots)
 #include "test_cluster_recovery_undo_targets.inc"
 #include "test_cluster_recovery_multixact_targets.inc"
 #include "test_cluster_recovery_multixact_physical.inc"
+#include "test_cluster_recovery_multixact_join.inc"
 
 int
 main(void)
 {
-	UT_PLAN(29);
+	UT_PLAN(36);
 	UT_RUN(test_page_and_rebuildable_fsm_keep_all_file_targets);
 	UT_RUN(test_typed_structure_keeps_all_forks_and_space_pages);
 	UT_RUN(test_native_create_and_truncate_do_not_invent_page_requirements);
@@ -493,6 +494,13 @@ main(void)
 	UT_RUN(test_mx_physical_mutation_and_final_recheck_revoke_observations);
 	UT_RUN(test_mx_physical_budget_and_invalid_arguments_fail_closed);
 	UT_RUN(test_mx_physical_metadata_budget_preserves_untouched_files);
+	UT_RUN(test_mx_join_keeps_origin_record_and_independent_cursor);
+	UT_RUN(test_mx_join_crosses_pages_segments_wrap_and_online_size_limit);
+	UT_RUN(test_mx_join_retains_physical_zero_unknown_and_mismatch);
+	UT_RUN(test_mx_join_missing_short_io_and_page_reread_fail_sticky);
+	UT_RUN(test_mx_join_rejects_scope_capacity_and_non_create);
+	UT_RUN(test_mx_join_final_wal_or_roots_drift_revokes_drained);
+	UT_RUN(test_mx_join_metadata_search_has_a_bounded_step);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

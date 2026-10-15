@@ -3121,10 +3121,11 @@ test_cluster_control_root test_cluster_recovery_native_inputs: %: %.c test_clust
 		$(top_builddir)/src/backend/cluster/cluster_recovery_wal_targets.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_record_hash.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_native_scan.o \
+		$(top_builddir)/src/backend/cluster/cluster_recovery_multixact_join.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_undo_store.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_undo_scan.o \
-		test_cluster_control_cold_census.inc test_cluster_recovery_native_transcript.inc test_cluster_recovery_wal_tt_roots.inc test_cluster_recovery_multixact_inputs.inc test_cluster_heap_small_scn.inc \
+		test_cluster_control_cold_census.inc test_cluster_recovery_native_transcript.inc test_cluster_recovery_wal_tt_roots.inc test_cluster_recovery_multixact_inputs.inc test_cluster_recovery_multixact_join_inputs.inc test_cluster_heap_small_scn.inc \
 		test_cluster_control_root_initialized.inc test_cluster_control_root_first_start.inc test_cluster_control_catalog.inc \
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		test_cluster_control_native_xid.inc \
@@ -3149,6 +3150,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs: %: %.c test_clust
 		$(top_builddir)/src/backend/cluster/cluster_recovery_wal_targets.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_record_hash.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_native_scan.o \
+		$(top_builddir)/src/backend/cluster/cluster_recovery_multixact_join.o \
 		$(if $(filter test_cluster_recovery_native_inputs,$@),$(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_store.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_scan.o) \
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
@@ -9099,7 +9101,9 @@ test_cluster_recovery_native_roots: test_cluster_recovery_native_roots.c \
 
 test_cluster_recovery_wal_targets: test_cluster_recovery_wal_targets.c \
 		test_cluster_recovery_undo_targets.inc test_cluster_recovery_multixact_targets.inc \
-		test_cluster_recovery_multixact_physical.inc \
+		test_cluster_recovery_multixact_physical.inc test_cluster_recovery_multixact_join.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_multixact_join.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_multixact_join.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_multixact_scan.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_multixact_scan.h \
 		test_cluster_recovery_native_roots.c test_cluster_recovery_root_set.c \

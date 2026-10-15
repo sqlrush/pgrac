@@ -11,6 +11,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_recovery_native_scan.h"
+#include "cluster/cluster_recovery_multixact_join.h"
 #include "cluster/cluster_recovery_reference_graph.h"
 #include "cluster/cluster_recovery_root_set.h"
 #include "cluster/cluster_wal_inputs.h"
@@ -44,6 +45,7 @@ typedef struct ClusterRecoveryNativeInventoryDiag {
 	uint64 tt_roots_added; /* successful root additions, before graph deduplication */
 	uint64 tt_binding_records_examined;
 	uint64 tt_head_binding_missing;
+	uint64 mx_compared_offsets, mx_compared_members, mx_physical_mismatches;
 	ClusterRecoveryGraphResult graph_result;
 	size_t owned_bytes;
 } ClusterRecoveryNativeInventoryDiag;
@@ -103,6 +105,16 @@ extern ClusterRecoveryGraphResult
 cluster_recovery_native_inventory_seed_graph_step(ClusterRecoveryNativeInventory *inventory,
 												  ClusterRecoveryReferenceGraph *graph,
 												  ClusterRecoveryNativeInventoryDiag *diag);
+/* Compare every saved MX CREATE to its original-origin physical candidates.
+ * Independent of both effect and TT-seed cursors; no member/range/era proof.
+ * Roots must outlive this inventory. Failure/final input drift/destruction
+ * revoke them. At most 128 saved records, or one join step, per call. The
+ * fixed join budget is separate from the inventory's owned allocation.
+ * Physical mismatch is emitted and counted, never silently discharged. */
+extern ClusterRecoveryMultixactJoinResult cluster_recovery_native_inventory_multixact_step(
+	ClusterRecoveryNativeInventory *inventory, ClusterRecoveryRootSet *roots,
+	size_t join_memory_budget, ClusterRecoveryMultixactJoinEntry *out,
+	ClusterRecoveryNativeInventoryDiag *diag);
 extern void cluster_recovery_native_inventory_destroy(ClusterRecoveryNativeInventory *inventory);
 #endif
 #endif

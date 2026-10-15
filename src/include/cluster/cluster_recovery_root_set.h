@@ -136,6 +136,12 @@ extern ClusterRecoveryRootsResult cluster_recovery_root_set_relation(ClusterReco
 extern bool cluster_recovery_root_set_namespace_matches(const ClusterRecoveryRootSet *roots,
 														uint64 system_identifier,
 														uint64 database_incarnation);
+/* Include the original storage UUID when joining an owned WAL source to
+ * physical candidates. OBSERVED namespace equality is not ROOT authority. */
+extern bool cluster_recovery_root_set_storage_matches(const ClusterRecoveryRootSet *roots,
+													  uint64 system_identifier,
+													  uint64 database_incarnation,
+													  const uint8 storage_uuid[16]);
 /* Read one chunk of a physical file already in OBSERVED. Every path component
  * is reopened without symlink traversal and compared with its saved object;
  * file and path are rechecked after the exact read. Missing WAL-only objects,
