@@ -161,6 +161,52 @@ cold_space_drops(const xl_xact_parsed_commit *parsed, uint64 system_identifier,
 	return CLUSTER_COLD_OK;
 }
 
+/* All elements belong to the native consumer. Validate the full array
+ * before exporting even its family: a short record is never an empty batch. */
+static bool
+cold_counted_shape(XLogReaderState *reader, Size base, Size count_offset, Size item_size)
+{
+	uint32 len = XLogRecGetDataLen(reader);
+	const char *data = XLogRecGetData(reader);
+	int count;
+
+	if (data == NULL || len < base || base < sizeof(count) || count_offset > base - sizeof(count))
+		return false;
+	memcpy(&count, data + count_offset, sizeof(count));
+	return count >= 0 && (Size)count <= (len - base) / item_size
+		   && base + (Size)count * item_size == len;
+}
+
+static uint32
+cold_completion_effects(uint32 xinfo, int children, int relations, int stats, int messages)
+{
+	uint32 effects = CLUSTER_COLD_EFFECT_TERMINAL;
+
+	if (children > 0)
+		effects |= CLUSTER_COLD_EFFECT_CHILDREN;
+	if (relations > 0)
+		effects |= CLUSTER_COLD_EFFECT_RELATIONS;
+	if (stats > 0)
+		effects |= CLUSTER_COLD_EFFECT_STATS;
+	if (messages > 0)
+		effects |= CLUSTER_COLD_EFFECT_INVALIDATIONS;
+	if (xinfo & XACT_XINFO_HAS_TT_COMMIT)
+		effects |= CLUSTER_COLD_EFFECT_TT;
+	if (xinfo & XACT_XINFO_HAS_SCN)
+		effects |= CLUSTER_COLD_EFFECT_SCN;
+	if (xinfo & XACT_XINFO_HAS_ORIGIN)
+		effects |= CLUSTER_COLD_EFFECT_ORIGIN;
+	if (xinfo & XACT_XINFO_HAS_AE_LOCKS)
+		effects |= CLUSTER_COLD_EFFECT_LOCKS;
+	if (xinfo & XACT_COMPLETION_UPDATE_RELCACHE_FILE)
+		effects |= CLUSTER_COLD_EFFECT_RELCACHE;
+	if (xinfo & XACT_COMPLETION_FORCE_SYNC_COMMIT)
+		effects |= CLUSTER_COLD_EFFECT_SYNC;
+	if (xinfo & XACT_COMPLETION_APPLY_FEEDBACK)
+		effects |= CLUSTER_COLD_EFFECT_FEEDBACK;
+	return effects;
+}
+
 /*
  * A commit's relation drops become SPACE effects; the native commit redo
  * still owns the files.  Relations dropped by an abort have no SPACE
@@ -169,7 +215,7 @@ cold_space_drops(const xl_xact_parsed_commit *parsed, uint64 system_identifier,
  */
 static ClusterColdDetailV1
 cold_xact_flags(XLogReaderState *reader, uint64 system_identifier, const uint8 storage_uuid[16],
-				ClusterColdDecodedV1 *out, uint8 *flags)
+				ClusterColdDecodedV1 *out, uint8 *flags, uint32 *effects)
 {
 	uint8 info = XLogRecGetInfo(reader);
 
@@ -180,7 +226,18 @@ cold_xact_flags(XLogReaderState *reader, uint64 system_identifier, const uint8 s
 		if (!ParseCommitRecord(info, (xl_xact_commit *)XLogRecGetData(reader),
 							   XLogRecGetDataLen(reader), &parsed))
 			return CLUSTER_COLD_COMPONENT_INVALID;
+		/* Native parsing bounds the delta but does not validate its version.
+		 * An unknown delta must not reach the original exact-slot writer. */
+		if (parsed.has_tt_commit
+			&& (parsed.tt_commit.format_version != CLUSTER_XACT_TT_COMMIT_VERSION
+				|| parsed.tt_commit.flags != 0 || parsed.tt_commit.reserved != 0))
+			return CLUSTER_COLD_OPCODE_UNSUPPORTED;
 		*flags = 0;
+		*effects |= cold_completion_effects(parsed.xinfo, parsed.nsubxacts, parsed.nrels,
+											parsed.nstats, parsed.nmsgs);
+		/* The opcode alone cannot hide a prepared transaction subrecord. */
+		if (parsed.xinfo & XACT_XINFO_HAS_TWOPHASE)
+			*flags |= CLUSTER_COLD_RECORD_UNSUPPORTED;
 		return parsed.nspace_drops > 0
 				   ? cold_space_drops(&parsed, system_identifier, storage_uuid, out)
 				   : CLUSTER_COLD_OK;
@@ -194,8 +251,24 @@ cold_xact_flags(XLogReaderState *reader, uint64 system_identifier, const uint8 s
 			return CLUSTER_COLD_COMPONENT_INVALID;
 		ParseAbortRecord(info, (xl_xact_abort *)XLogRecGetData(reader), &parsed);
 		*flags = parsed.nrels > 0 ? CLUSTER_COLD_RECORD_STRUCTURAL : 0;
+		*effects |= cold_completion_effects(parsed.xinfo, parsed.nsubxacts, parsed.nrels,
+											parsed.nstats, 0);
+		if (parsed.xinfo & XACT_XINFO_HAS_TWOPHASE)
+			*flags |= CLUSTER_COLD_RECORD_UNSUPPORTED;
 		return CLUSTER_COLD_OK;
 	}
+	case XLOG_XACT_ASSIGNMENT:
+		if (!cold_counted_shape(reader, MinSizeOfXactAssignment,
+								offsetof(xl_xact_assignment, nsubxacts), sizeof(TransactionId)))
+			return CLUSTER_COLD_COMPONENT_INVALID;
+		*effects |= CLUSTER_COLD_EFFECT_CHILDREN;
+		return CLUSTER_COLD_OK;
+	case XLOG_XACT_INVALIDATIONS:
+		if (!cold_counted_shape(reader, MinSizeOfXactInvals, offsetof(xl_xact_invals, nmsgs),
+								sizeof(SharedInvalidationMessage)))
+			return CLUSTER_COLD_COMPONENT_INVALID;
+		*effects |= CLUSTER_COLD_EFFECT_INVALIDATIONS;
+		return CLUSTER_COLD_OK;
 	case XLOG_XACT_PREPARE:
 	case XLOG_XACT_COMMIT_PREPARED:
 	case XLOG_XACT_ABORT_PREPARED:
@@ -265,14 +338,32 @@ cold_space_reservation(XLogReaderState *reader, uint64 system_identifier,
 
 static ClusterColdDetailV1
 cold_record_flags(XLogReaderState *reader, uint64 system_identifier, const uint8 storage_uuid[16],
-				  ClusterColdDecodedV1 *out, uint8 *flags)
+				  ClusterColdDecodedV1 *out, uint8 *flags, uint32 *effects)
 {
 	uint8 info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
 
 	*flags = 0;
 	switch (XLogRecGetRmid(reader)) {
 	case RM_XACT_ID:
-		return cold_xact_flags(reader, system_identifier, storage_uuid, out, flags);
+		return cold_xact_flags(reader, system_identifier, storage_uuid, out, flags, effects);
+	case RM_COMMIT_TS_ID:
+		/* Shared commit_ts has no recovery consumer, including own history. */
+		*flags = CLUSTER_COLD_RECORD_UNSUPPORTED;
+		return CLUSTER_COLD_OK;
+	case RM_STANDBY_ID:
+		if (info == XLOG_INVALIDATIONS) {
+			xl_invalidations invalidations;
+
+			if (!cold_counted_shape(reader, MinSizeOfInvalidations,
+									offsetof(xl_invalidations, nmsgs),
+									sizeof(SharedInvalidationMessage)))
+				return CLUSTER_COLD_COMPONENT_INVALID;
+			memcpy(&invalidations, XLogRecGetData(reader), MinSizeOfInvalidations);
+			*effects |= CLUSTER_COLD_EFFECT_INVALIDATIONS;
+			if (invalidations.relcacheInitFileInval)
+				*effects |= CLUSTER_COLD_EFFECT_RELCACHE;
+		}
+		return CLUSTER_COLD_OK;
 	case RM_SMGR_ID:
 		if (info == XLOG_SMGR_SPACE_IDENTITY)
 			return cold_space_identity(reader, system_identifier, storage_uuid, out);
@@ -323,8 +414,9 @@ cold_foreign_control(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan
 	if (plan->route.record_owner != RF_ROUTE_OWNER_SIDE_TYPED)
 		return false;
 	if (XLogRecGetRmid(reader) == RM_STANDBY_ID)
-		return info == XLOG_STANDBY_LOCK || info == XLOG_RUNNING_XACTS
-			   || info == XLOG_INVALIDATIONS;
+		/* INVALIDATIONS includes persistent relcache-init work. A foreign
+		 * adapter must perform it; a fresh process is not its completion. */
+		return info == XLOG_STANDBY_LOCK || info == XLOG_RUNNING_XACTS;
 	if (XLogRecGetRmid(reader) != RM_XLOG_ID)
 		return false;
 	switch (info) {
@@ -400,6 +492,44 @@ cold_map_components(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan,
 	return CLUSTER_COLD_OK;
 }
 
+/* Export the original per-record policy in both cold decoder passes.
+ * Native XACT families are expanded above; other native records remain one
+ * whole-record obligation. This summary does not run consumers or replace
+ * the original record_flags gate or global side-owner readiness handshake. */
+static void
+cold_effect_routes(const RfDetachedRecordPlanV1 *plan, uint32 required, ClusterColdDecodedV1 *out)
+{
+	ClusterColdEffectRoutesV1 *routes = &out->effects;
+	uint8 flags = out->record.record_flags;
+	uint32 remaining;
+
+	for (uint32 i = 0; i < plan->component_count; i++)
+		required |= plan->components[i].owner == RF_DETACHED_COMPONENT_REBUILDABLE
+						? CLUSTER_COLD_EFFECT_FSM
+						: CLUSTER_COLD_EFFECT_PAGE;
+	if (out->record.space_count > 0)
+		required |= CLUSTER_COLD_EFFECT_SPACE;
+	routes->required = required;
+	if (flags & (CLUSTER_COLD_RECORD_STRUCTURAL | CLUSTER_COLD_RECORD_UNSUPPORTED)) {
+		routes->refused = required;
+		return;
+	}
+	routes->space_apply = required & CLUSTER_COLD_EFFECT_SPACE;
+	/* A standalone SPACE record is entirely consumed by SPACE, never by
+	 * native redo. A compound COMMIT still has its native terminal owner. */
+	if (routes->space_apply != 0 && plan->route.rmid == RM_SMGR_ID)
+		routes->space_apply |= CLUSTER_COLD_EFFECT_RECORD;
+	remaining = required & ~routes->space_apply;
+	if (flags & CLUSTER_COLD_RECORD_SIDE_UNOWNED)
+		routes->refused = remaining;
+	else if (flags & CLUSTER_COLD_RECORD_FOREIGN_CONTROL)
+		routes->no_effect = remaining;
+	else if (plan->route.record_owner == RF_ROUTE_OWNER_PAGE_CODEC)
+		routes->page_apply = remaining;
+	else
+		routes->native_apply = remaining;
+}
+
 ClusterColdDetailV1
 cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_identifier,
 								const uint8 storage_uuid[16], bool space_active, bool foreign,
@@ -412,6 +542,7 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 	ClusterColdDetailV1 detail;
 	ClusterColdSpaceOpV1 *space_ops;
 	uint32 space_capacity;
+	uint32 effects = CLUSTER_COLD_EFFECT_RECORD;
 	bool has_owner;
 
 	if (out == NULL)
@@ -444,7 +575,7 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 	}
 	out->route_owner = plan.route.record_owner;
 	detail = cold_record_flags(reader, system_identifier, storage_uuid, out,
-							   &out->record.record_flags);
+							   &out->record.record_flags, &effects);
 	if (detail != CLUSTER_COLD_OK)
 		return detail;
 
@@ -461,7 +592,10 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 		out->record.record_flags |= cold_foreign_control(reader, &plan)
 										? CLUSTER_COLD_RECORD_FOREIGN_CONTROL
 										: CLUSTER_COLD_RECORD_SIDE_UNOWNED;
-	return cold_map_components(reader, &plan, system_identifier, storage_uuid, out);
+	detail = cold_map_components(reader, &plan, system_identifier, storage_uuid, out);
+	if (detail == CLUSTER_COLD_OK)
+		cold_effect_routes(&plan, effects, out);
+	return detail;
 }
 
 void

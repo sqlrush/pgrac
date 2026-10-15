@@ -219,6 +219,9 @@ UT_TEST(test_page_record_maps_ordinary_components)
 	UT_ASSERT_EQ(out.components[1].page.locator.relNumber, 101);
 	UT_ASSERT_EQ(out.components[1].result.mutation_token, 9);
 	UT_ASSERT_EQ(out.components[1].page_class, RF_PAGE_CLASS_ORDINARY);
+	UT_ASSERT_EQ(out.effects.page_apply,
+				 CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_PAGE | CLUSTER_COLD_EFFECT_FSM);
+	UT_ASSERT_EQ(out.effects.required, out.effects.page_apply);
 }
 
 UT_TEST(test_registry_refusal_is_opcode_unsupported)
@@ -461,8 +464,7 @@ UT_TEST(test_foreign_native_control_is_typed_noop)
 				  { RM_XLOG_ID, XLOG_END_OF_RECOVERY, sizeof(xl_end_of_recovery) },
 				  { RM_XLOG_ID, XLOG_OVERWRITE_CONTRECORD, sizeof(xl_overwrite_contrecord) },
 				  { RM_STANDBY_ID, XLOG_STANDBY_LOCK, 0 },
-				  { RM_STANDBY_ID, XLOG_RUNNING_XACTS, 0 },
-				  { RM_STANDBY_ID, XLOG_INVALIDATIONS, 0 } };
+				  { RM_STANDBY_ID, XLOG_RUNNING_XACTS, 0 } };
 	Size i;
 
 	for (i = 0; i < lengthof(cases); i++) {
@@ -598,6 +600,8 @@ UT_TEST(test_space_identity_changes_are_typed)
 				 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.record.record_flags, 0);
 	UT_ASSERT_EQ(out.record.space_count, 1);
+	UT_ASSERT_EQ(out.effects.space_apply, CLUSTER_COLD_EFFECT_SPACE | CLUSTER_COLD_EFFECT_RECORD);
+	UT_ASSERT_EQ(out.effects.native_apply, 0);
 	UT_ASSERT(out.record.space_ops == out.space_ops);
 	UT_ASSERT_EQ(out.space_ops[0].kind, CLUSTER_COLD_SPACE_CREATE);
 	UT_ASSERT_EQ(out.space_ops[0].locator.relNumber, 16384);

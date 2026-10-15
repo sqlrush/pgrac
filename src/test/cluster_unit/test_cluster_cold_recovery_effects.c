@@ -1,0 +1,390 @@
+/*-------------------------------------------------------------------------
+ * test_cluster_cold_recovery_effects.c
+ *    Cold effect routing through the real registry and native WAL parsers.
+ *
+ * Copyright (c) 2026, pgrac contributors
+ * Author: SqlRush <sqlrush@gmail.com>
+ * IDENTIFICATION
+ *    src/test/cluster_unit/test_cluster_cold_recovery_effects.c
+ * NOTES
+ *    PGRAC-original. Spec: spec-s9p2-05-instance-and-cluster-recovery.md
+ *-------------------------------------------------------------------------
+ */
+#define USE_PGRAC_CLUSTER 1
+#include "postgres.h"
+#include "access/commit_ts.h"
+#include "access/xact.h"
+#include "access/xlogreader.h"
+#include "catalog/pg_control.h"
+#include "cluster/cluster_block_apply.h"
+#include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_page_detached.h"
+#include "storage/standbydefs.h"
+#include "unit_test.h"
+
+UT_DEFINE_GLOBALS();
+
+void
+ExceptionalCondition(const char *condition, const char *file, int line)
+{
+	printf("# unexpected Assert: %s at %s:%d\n", condition, file, line);
+	abort();
+}
+
+/* This test never applies a page. Registry, detached preflight, native
+ * commit/abort parsing and bounded SIDE shape validation are product code. */
+ClusterBlkApplyResult
+cluster_block_apply_one(XLogReaderState *r pg_attribute_unused(), uint8 id pg_attribute_unused(),
+						char *page pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+rf_page_version_present_v1(const RfPageVersionV1 *version)
+{
+	const uint8 zero[16] = { 0 };
+	return version != NULL && version->mutation_token != 0
+		   && memcmp(version->segment_incarnation, zero, sizeof(zero)) != 0;
+}
+
+typedef struct EffectRecord {
+	XLogReaderState reader;
+	union {
+		uint64 aligned;
+		char bytes[2048];
+	} data;
+	DecodedXLogRecord decoded;
+} EffectRecord;
+
+static const uint8 uuid[16] = { 1 };
+
+static void
+record_init(EffectRecord *r, uint8 rmid, uint8 info)
+{
+	memset(r, 0, sizeof(*r));
+	r->reader.record = &r->decoded;
+	r->reader.ReadRecPtr = 0x1000;
+	r->reader.EndRecPtr = 0x1800;
+	r->decoded.header.xl_rmid = rmid;
+	r->decoded.header.xl_info = info;
+	r->decoded.header.xl_xid = 100;
+	r->decoded.header.xl_scn = 23;
+	r->decoded.max_block_id = -1;
+	r->decoded.main_data = r->data.bytes;
+}
+
+static void
+append(EffectRecord *r, const void *bytes, Size len)
+{
+	Assert(r->decoded.main_data_len + len <= sizeof(r->data.bytes));
+	memcpy(r->data.bytes + r->decoded.main_data_len, bytes, len);
+	r->decoded.main_data_len += len;
+}
+
+static void
+counted(EffectRecord *r, const void *bytes, int count, Size size)
+{
+	append(r, &count, sizeof(count));
+	append(r, bytes, count * size);
+}
+
+static void
+completion(EffectRecord *r, bool commit, uint32 xinfo)
+{
+	TimestampTz timestamp = 1;
+	TransactionId children[2] = { 101, 102 };
+	RelFileLocator relations[2] = { { 1663, 5, 123 }, { 1663, 5, 124 } };
+	xl_xact_stats_item stats[2] = { { 0 } };
+	SharedInvalidationMessage msgs[2] = { { 0 } };
+	xl_xact_origin origin = { 0 };
+	xl_xact_scn scn = { .scn = 23 };
+	xl_xact_twophase prepared = { .xid = 100 };
+	xl_xact_tt_commit tt = { .segment_id = 1,
+							 .segment_generation = 0,
+							 .xid = 100,
+							 .slot_offset = 1,
+							 .wrap = 1,
+							 .instance = 1,
+							 .format_version = CLUSTER_XACT_TT_COMMIT_VERSION,
+							 .commit_scn = 23 };
+
+	record_init(r, RM_XACT_ID, (commit ? XLOG_XACT_COMMIT : XLOG_XACT_ABORT) | XLOG_XACT_HAS_INFO);
+	append(r, &timestamp, sizeof(timestamp));
+	append(r, &xinfo, sizeof(xinfo));
+	if (xinfo & XACT_XINFO_HAS_SUBXACTS)
+		counted(r, children, 2, sizeof(children[0]));
+	if (xinfo & XACT_XINFO_HAS_RELFILELOCATORS)
+		counted(r, relations, 2, sizeof(relations[0]));
+	if (xinfo & XACT_XINFO_HAS_DROPPED_STATS)
+		counted(r, stats, 2, sizeof(stats[0]));
+	if (xinfo & XACT_XINFO_HAS_INVALS)
+		counted(r, msgs, 2, sizeof(msgs[0]));
+	if (xinfo & XACT_XINFO_HAS_TWOPHASE)
+		append(r, &prepared, sizeof(prepared));
+	if (xinfo & XACT_XINFO_HAS_ORIGIN)
+		append(r, &origin, sizeof(origin));
+	if (xinfo & XACT_XINFO_HAS_SCN)
+		append(r, &scn, sizeof(scn));
+	if (xinfo & XACT_XINFO_HAS_TT_COMMIT)
+		append(r, &tt, sizeof(tt));
+}
+
+static bool
+partitioned(const ClusterColdEffectRoutesV1 *e)
+{
+	uint32 routes[] = { e->native_apply, e->page_apply, e->space_apply, e->no_effect, e->refused };
+	uint32 seen = 0;
+
+	for (Size i = 0; i < lengthof(routes); i++) {
+		if (seen & routes[i])
+			return false;
+		seen |= routes[i];
+	}
+	return seen != 0 && seen == e->required;
+}
+
+#define ALL_XINFO                                                                                  \
+	(XACT_XINFO_HAS_SUBXACTS | XACT_XINFO_HAS_RELFILELOCATORS | XACT_XINFO_HAS_DROPPED_STATS       \
+	 | XACT_XINFO_HAS_INVALS | XACT_XINFO_HAS_ORIGIN | XACT_XINFO_HAS_SCN                          \
+	 | XACT_XINFO_HAS_TT_COMMIT | XACT_XINFO_HAS_AE_LOCKS | XACT_COMPLETION_APPLY_FEEDBACK         \
+	 | XACT_COMPLETION_FORCE_SYNC_COMMIT | XACT_COMPLETION_UPDATE_RELCACHE_FILE)
+#define ALL_EFFECTS                                                                                \
+	(CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_TERMINAL | CLUSTER_COLD_EFFECT_CHILDREN      \
+	 | CLUSTER_COLD_EFFECT_RELATIONS | CLUSTER_COLD_EFFECT_STATS                                   \
+	 | CLUSTER_COLD_EFFECT_INVALIDATIONS | CLUSTER_COLD_EFFECT_ORIGIN | CLUSTER_COLD_EFFECT_SCN    \
+	 | CLUSTER_COLD_EFFECT_TT | CLUSTER_COLD_EFFECT_LOCKS | CLUSTER_COLD_EFFECT_FEEDBACK           \
+	 | CLUSTER_COLD_EFFECT_SYNC | CLUSTER_COLD_EFFECT_RELCACHE)
+
+UT_TEST(test_whole_commit_effects_keep_native_owner)
+{
+	EffectRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	completion(&r, true, ALL_XINFO);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.effects.required, ALL_EFFECTS);
+	UT_ASSERT_EQ(out.effects.native_apply, ALL_EFFECTS);
+	UT_ASSERT(partitioned(&out.effects));
+}
+
+UT_TEST(test_foreign_compound_cannot_drop_unowned_effects)
+{
+	EffectRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	completion(&r, true, ALL_XINFO);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.effects.refused, ALL_EFFECTS);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+	UT_ASSERT(partitioned(&out.effects));
+}
+
+UT_TEST(test_relcache_work_exists_with_zero_messages)
+{
+	EffectRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	completion(&r, true, XACT_COMPLETION_UPDATE_RELCACHE_FILE);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.effects.native_apply, CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_TERMINAL
+											   | CLUSTER_COLD_EFFECT_RELCACHE);
+	UT_ASSERT(partitioned(&out.effects));
+}
+
+UT_TEST(test_embedded_twophase_is_not_ordinary_commit)
+{
+	EffectRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	completion(&r, true, XACT_XINFO_HAS_TWOPHASE);
+	for (int foreign = 0; foreign <= 1; foreign++) {
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, foreign, &out),
+					 CLUSTER_COLD_OK);
+		UT_ASSERT(out.record.record_flags & CLUSTER_COLD_RECORD_UNSUPPORTED);
+		UT_ASSERT_EQ(out.effects.refused, out.effects.required);
+		UT_ASSERT(partitioned(&out.effects));
+	}
+}
+
+UT_TEST(test_commit_ts_is_unsupported_even_for_own_source)
+{
+	EffectRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	int64 page = 0;
+	record_init(&r, RM_COMMIT_TS_ID, COMMIT_TS_ZEROPAGE);
+	append(&r, &page, sizeof(page));
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT(out.record.record_flags & CLUSTER_COLD_RECORD_UNSUPPORTED);
+	UT_ASSERT(partitioned(&out.effects));
+}
+
+UT_TEST(test_foreign_invalidation_is_not_no_effect)
+{
+	EffectRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	xl_invalidations inval = { 0 };
+	inval.relcacheInitFileInval = true;
+	record_init(&r, RM_STANDBY_ID, XLOG_INVALIDATIONS);
+	append(&r, &inval, MinSizeOfInvalidations);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+	UT_ASSERT_EQ(out.effects.no_effect, 0);
+	UT_ASSERT(out.effects.refused & CLUSTER_COLD_EFFECT_RELCACHE);
+	UT_ASSERT(partitioned(&out.effects));
+}
+
+UT_TEST(test_assignment_requires_complete_counted_payload)
+{
+	EffectRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	xl_xact_assignment assignment = { .xtop = 100, .nsubxacts = 1 };
+	TransactionId child = 101;
+	record_init(&r, RM_XACT_ID, XLOG_XACT_ASSIGNMENT);
+	append(&r, &assignment, MinSizeOfXactAssignment);
+	append(&r, &child, sizeof(child));
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.effects.native_apply,
+				 CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_CHILDREN);
+	r.decoded.main_data_len--;
+	UT_ASSERT(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out)
+			  != CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.effects.required, 0);
+}
+
+UT_TEST(test_invalidations_require_complete_counted_payload)
+{
+	EffectRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	SharedInvalidationMessage msg = { 0 };
+	record_init(&r, RM_XACT_ID, XLOG_XACT_INVALIDATIONS);
+	counted(&r, &msg, 1, sizeof(msg));
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.effects.native_apply,
+				 CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_INVALIDATIONS);
+	r.decoded.main_data_len--;
+	UT_ASSERT(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out)
+			  != CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.effects.required, 0);
+}
+
+UT_TEST(test_abort_routes_all_native_effects)
+{
+	EffectRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	completion(&r, false,
+			   XACT_XINFO_HAS_SUBXACTS | XACT_XINFO_HAS_DROPPED_STATS | XACT_XINFO_HAS_SCN);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.effects.native_apply, CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_TERMINAL
+											   | CLUSTER_COLD_EFFECT_CHILDREN
+											   | CLUSTER_COLD_EFFECT_STATS
+											   | CLUSTER_COLD_EFFECT_SCN);
+	UT_ASSERT(partitioned(&out.effects));
+}
+
+UT_TEST(test_unknown_or_truncated_commit_clears_routes)
+{
+	EffectRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	completion(&r, true, ALL_XINFO);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+				 CLUSTER_COLD_OK);
+	r.decoded.main_data_len--;
+	UT_ASSERT(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out)
+			  != CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.effects.required, 0);
+	completion(&r, true, 1U << 28);
+	UT_ASSERT(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out)
+			  != CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.effects.native_apply, 0);
+}
+
+UT_TEST(test_exact_foreign_noop_stays_no_effect)
+{
+	EffectRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	record_init(&r, RM_XLOG_ID, XLOG_NOOP);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.effects.no_effect, CLUSTER_COLD_EFFECT_RECORD);
+	UT_ASSERT(partitioned(&out.effects));
+}
+
+UT_TEST(test_registry_unknown_and_blocks_still_refuse)
+{
+	EffectRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	record_init(&r, RM_XACT_ID, 0x70);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+				 CLUSTER_COLD_OPCODE_UNSUPPORTED);
+	UT_ASSERT_EQ(out.effects.required, 0);
+	record_init(&r, RM_MIN_CUSTOM_ID, 0);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+				 CLUSTER_COLD_OPCODE_UNSUPPORTED);
+}
+
+UT_TEST(test_folded_tt_unknown_format_is_not_native_apply)
+{
+	EffectRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	xl_xact_tt_commit tt;
+	Size offset = MinSizeOfXactCommit + sizeof(xl_xact_xinfo) + sizeof(xl_xact_scn);
+
+	for (int field = 0; field < 4; field++) {
+		completion(&r, true, XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_TT_COMMIT);
+		memcpy(&tt, r.data.bytes + offset, sizeof(tt));
+		if (field == 0)
+			tt.format_version = 0;
+		else if (field == 1)
+			tt.format_version++;
+		else if (field == 2)
+			tt.flags = 1;
+		else
+			tt.reserved = 1;
+		memcpy(r.data.bytes + offset, &tt, sizeof(tt));
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+					 CLUSTER_COLD_OPCODE_UNSUPPORTED);
+		UT_ASSERT_EQ(out.effects.required, 0);
+	}
+}
+
+UT_TEST(test_truncation_at_every_compound_boundary_refuses)
+{
+	EffectRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	uint32 full_len;
+	completion(&r, true, ALL_XINFO);
+	full_len = r.decoded.main_data_len;
+	for (uint32 len = 0; len < full_len; len++) {
+		r.decoded.main_data_len = len;
+		UT_ASSERT(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out)
+				  != CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.effects.required, 0);
+	}
+}
+
+int
+main(void)
+{
+	UT_PLAN(14);
+	UT_RUN(test_whole_commit_effects_keep_native_owner);
+	UT_RUN(test_foreign_compound_cannot_drop_unowned_effects);
+	UT_RUN(test_relcache_work_exists_with_zero_messages);
+	UT_RUN(test_embedded_twophase_is_not_ordinary_commit);
+	UT_RUN(test_commit_ts_is_unsupported_even_for_own_source);
+	UT_RUN(test_foreign_invalidation_is_not_no_effect);
+	UT_RUN(test_assignment_requires_complete_counted_payload);
+	UT_RUN(test_invalidations_require_complete_counted_payload);
+	UT_RUN(test_abort_routes_all_native_effects);
+	UT_RUN(test_unknown_or_truncated_commit_clears_routes);
+	UT_RUN(test_exact_foreign_noop_stays_no_effect);
+	UT_RUN(test_registry_unknown_and_blocks_still_refuse);
+	UT_RUN(test_folded_tt_unknown_format_is_not_native_apply);
+	UT_RUN(test_truncation_at_every_compound_boundary_refuses);
+	UT_DONE();
+	return ut_failed_count != 0;
+}

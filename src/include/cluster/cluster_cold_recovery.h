@@ -475,6 +475,42 @@ extern PGDLLIMPORT int cluster_cold_recovery_plan_memory;
 
 struct XLogReaderState;
 
+/* Per-record effect families, including every item of a native counted
+ * array. Native redo consumes the entire array, never only its first item.
+ * These are in-memory routes, not a WAL format or completion certificate. */
+typedef enum ClusterColdEffectV1 {
+	CLUSTER_COLD_EFFECT_RECORD = 1U << 0,
+	CLUSTER_COLD_EFFECT_PAGE = 1U << 1,
+	CLUSTER_COLD_EFFECT_FSM = 1U << 2,
+	CLUSTER_COLD_EFFECT_SPACE = 1U << 3,
+	CLUSTER_COLD_EFFECT_TERMINAL = 1U << 4,
+	CLUSTER_COLD_EFFECT_TT = 1U << 5,
+	CLUSTER_COLD_EFFECT_CHILDREN = 1U << 6,
+	CLUSTER_COLD_EFFECT_RELATIONS = 1U << 7,
+	CLUSTER_COLD_EFFECT_STATS = 1U << 8,
+	CLUSTER_COLD_EFFECT_INVALIDATIONS = 1U << 9,
+	CLUSTER_COLD_EFFECT_RELCACHE = 1U << 10,
+	CLUSTER_COLD_EFFECT_ORIGIN = 1U << 11,
+	CLUSTER_COLD_EFFECT_LOCKS = 1U << 12,
+	CLUSTER_COLD_EFFECT_SYNC = 1U << 13,
+	CLUSTER_COLD_EFFECT_FEEDBACK = 1U << 14,
+	CLUSTER_COLD_EFFECT_SCN = 1U << 15
+} ClusterColdEffectV1;
+
+/* Disjoint routes must cover required exactly. APPLY names an existing
+ * consumer, not permission to invoke it: the original cold readiness,
+ * source/base, full-record and mutation gates still apply. In particular
+ * foreign terminal/SLRU effects remain refused until their cold adapter is
+ * wired. A compound record with any refused effect cannot replay partially. */
+typedef struct ClusterColdEffectRoutesV1 {
+	uint32 required;
+	uint32 native_apply;
+	uint32 page_apply;
+	uint32 space_apply;
+	uint32 no_effect;
+	uint32 refused;
+} ClusterColdEffectRoutesV1;
+
 /*
  * One native record mapped to plan input by the shared closed route
  * registry.  record.components points into components[] and
@@ -486,6 +522,7 @@ struct XLogReaderState;
 typedef struct ClusterColdDecodedV1 {
 	ClusterColdRecordV1 record;
 	ClusterColdComponentV1 components[CLUSTER_COLD_MAX_COMPONENTS];
+	ClusterColdEffectRoutesV1 effects;
 	uint8 route_owner;	/* RfRecordRouteOwnerV1 */
 	uint8 route_detail; /* RfPageProofDetailV1 of a refused record */
 	ClusterColdSpaceOpV1 *space_ops;
