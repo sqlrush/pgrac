@@ -24,6 +24,9 @@
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "utils/syscache.h"
+#include "utils/inval.h"
+#include "miscadmin.h"
+#include "cluster/cluster_undo_recovery.h"
 
 #define RF_SIDE_XACT_KNOWN_XINFO                                                                   \
 	(XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_SUBXACTS | XACT_XINFO_HAS_RELFILELOCATORS              \
@@ -57,6 +60,23 @@ side_xact_payload_free(void *payload)
 #else
 	pfree(payload);
 #endif
+}
+
+static uint8 *
+side_xact_payload_copy(const uint8 *payload, uint32 length)
+{
+	uint8 *copy;
+
+	if (payload == NULL || length == 0 || length > RF_SIDE_ONLINE_PLAN_MAX_BYTES)
+		return NULL;
+#ifdef RF_SIDE_XACT_TESTING
+	copy = malloc(length);
+#else
+	copy = palloc(length);
+#endif
+	if (copy != NULL)
+		memcpy(copy, payload, length);
+	return copy;
 }
 
 static bool
@@ -521,13 +541,14 @@ side_xact_structural_preflight(const RfSideXactOperationV1 *operation, bool pi_r
 	const char *gid_end;
 	Size i;
 
-	if (operation == NULL || operation->pi_read_only != pi_read_only
-		|| (!pi_read_only && (operation->invalidation_kinds != 0
-			|| operation->invalidation_count != 0 || operation->relation_count != 0))
-		|| operation->system_identifier == 0
-		|| operation->kind == RF_SIDE_XACT_INVALID || operation->origin_thread == 0
-		|| operation->origin_thread > 128 || operation->reserved_zero != 0
-		|| !TransactionIdIsNormal(operation->xid))
+	if (operation == NULL || operation->cold_cache_effects
+		|| operation->pi_read_only != pi_read_only
+		|| (!pi_read_only
+			&& (operation->invalidation_kinds != 0 || operation->invalidation_count != 0
+				|| operation->relation_count != 0))
+		|| operation->system_identifier == 0 || operation->kind == RF_SIDE_XACT_INVALID
+		|| operation->origin_thread == 0 || operation->origin_thread > 128
+		|| operation->reserved_zero != 0 || !TransactionIdIsNormal(operation->xid))
 		return false;
 	for (i = 0; i < sizeof(operation->reserved49); i++)
 		if (operation->reserved49[i] != 0)
@@ -777,6 +798,68 @@ rf_side_xact_inspect_pi_v1(XLogReaderState *record, uint64 system_identifier, ui
 	return side_xact_decode(record, system_identifier, origin_thread, true, out);
 }
 
+/* A recovery plan may retain native cache work that generic apply refuses.
+ * Use the same bounded parser and message validation as inspection, but
+ * produce a distinct operation that requires the executable cold owner. */
+bool
+rf_side_xact_decode_recovery_v1(XLogReaderState *record, uint64 system_identifier,
+								uint16 origin_thread, RfSideXactOperationV1 *out)
+{
+	RfSideXactOperationV1 candidate;
+	const uint32 supported = XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_TT_COMMIT
+							 | XACT_XINFO_HAS_INVALS | XACT_COMPLETION_UPDATE_RELCACHE_FILE;
+
+	if (out == NULL)
+		return false;
+	if (rf_side_xact_decode_v1(record, system_identifier, origin_thread, out))
+		return true;
+	if (!side_xact_decode(record, system_identifier, origin_thread, true, &candidate)
+		|| candidate.kind != RF_SIDE_XACT_COMMIT || (candidate.xinfo & ~supported) != 0
+		|| candidate.invalidation_count == 0 || candidate.relation_count != 0
+		|| candidate.space_drop_count != 0)
+		return false;
+	candidate.pi_read_only = false;
+	candidate.cold_cache_effects = true;
+	*out = candidate;
+	return true;
+}
+
+/* Re-parse the complete owned bytes before any target in the protected set
+ * is changed. The plan's source/cut binding remains an independent gate. */
+bool
+rf_side_xact_cold_cache_preflight_v1(const RfSideXactOperationV1 *operation, const uint8 *payload,
+									 uint32 length)
+{
+	XLogReaderState record = { 0 };
+	DecodedXLogRecord decoded = { 0 };
+	RfSideXactOperationV1 candidate;
+	uint8 *copy;
+	bool valid;
+
+	if (operation == NULL || !operation->cold_cache_effects || operation->pi_read_only
+		|| operation->kind != RF_SIDE_XACT_COMMIT || payload == NULL || length == 0
+		|| length != operation->completion_payload_length
+		|| operation->system_identifier != GetSystemIdentifier()
+		|| cluster_xid_origin_slot(operation->xid) != (int)operation->origin_thread - 1)
+		return false;
+	/* Packed plan payloads need not have native structure alignment. */
+	copy = side_xact_payload_copy(payload, length);
+	if (copy == NULL)
+		return false;
+	decoded.header.xl_rmid = RM_XACT_ID;
+	decoded.header.xl_info = XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO;
+	decoded.header.xl_xid = operation->xid;
+	decoded.max_block_id = -1;
+	decoded.main_data = (char *)copy;
+	decoded.main_data_len = length;
+	record.record = &decoded;
+	valid = rf_side_xact_decode_recovery_v1(&record, operation->system_identifier,
+											operation->origin_thread, &candidate)
+			&& memcmp(&candidate, operation, sizeof(candidate)) == 0;
+	side_xact_payload_free(copy);
+	return valid;
+}
+
 static RfSideXactApplyResultV1
 side_xact_project_commit_v1(const RfSideXactOperationV1 *operation)
 {
@@ -839,6 +922,53 @@ rf_side_xact_apply_covered_commit_v1(const RfSideXactOperationV1 *operation, voi
 		|| !verify(arg, operation))
 		return RF_SIDE_XACT_APPLY_BLOCKED;
 	return side_xact_project_commit_v1(operation);
+}
+
+RfSideXactApplyResultV1
+rf_side_xact_apply_cold_cache_commit_v1(const RfSideXactOperationV1 *operation,
+										const uint8 *payload, uint32 length, void *arg,
+										RfSideXactVerifyCommitCoverageV1 verify)
+{
+	xl_xact_parsed_commit parsed;
+	uint8 *copy;
+	volatile RfSideXactApplyResultV1 result = RF_SIDE_XACT_APPLY_BLOCKED;
+
+	/* The native cache replay owner temporarily uses DatabasePath. An
+	 * existing backend database context cannot be borrowed or destroyed. */
+	if (!rf_side_xact_cold_cache_preflight_v1(operation, payload, length) || DatabasePath != NULL
+		|| verify == NULL
+		|| !cluster_undo_recovery_cold_origin_authorized_v1(operation->origin_thread - 1))
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+	copy = side_xact_payload_copy(payload, length);
+	if (copy == NULL)
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+	PG_TRY();
+	{
+		if (ParseCommitRecord(XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO, (xl_xact_commit *)copy, length,
+							  &parsed)
+			&& verify(arg, operation)
+			&& cluster_undo_recovery_cold_origin_authorized_v1(operation->origin_thread - 1)) {
+			/* Native CLOG and the canonical TT are already durable. Replay
+			 * every local message and init-file effect before the derived
+			 * terminal entry. This does not certify all-cohort RESET or OPEN. */
+			ProcessCommittedInvalidationMessages(parsed.msgs, parsed.nmsgs,
+												 XactCompletionRelcacheInitFileInval(parsed.xinfo),
+												 parsed.dbId, parsed.tsId);
+			if (cluster_undo_recovery_cold_origin_authorized_v1(operation->origin_thread - 1))
+				result = side_xact_project_commit_v1(operation);
+		}
+	}
+	PG_FINALLY();
+	{
+		/* Pre-invalidate can ERROR before the native owner frees its path. */
+		if (DatabasePath != NULL) {
+			side_xact_payload_free(DatabasePath);
+			DatabasePath = NULL;
+		}
+		side_xact_payload_free(copy);
+	}
+	PG_END_TRY();
+	return result;
 }
 
 bool

@@ -114,8 +114,26 @@ UT_TEST(test_pi_commit_keeps_complete_flags_and_invalidation_payload)
 												   op.owned_payload_length), RF_SIDE_XACT_APPLY_BLOCKED);
 		}
 		recovery = pi_side_plan(&identity, false);
+		/* Cache-only records now have a separate cold consumer. The strict
+		 * decoder and every generic/PI apply entry remain unavailable. */
+		{
+			RfSideXactOperationV1 strict;
+			UT_ASSERT(!rf_side_xact_decode_v1(&fake.reader, identity.record.system_identifier,
+											  identity.record.origin_thread, &strict));
+		}
 		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(recovery, &record, &identity),
-					 RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+					 variant == 1 ? RF_PAGE_PROOF_DETAIL_OK : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+		if (variant == 1) {
+			UT_ASSERT_EQ(rf_side_online_plan_seal_v1(recovery), RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT(rf_side_online_plan_operation_v1(recovery, 0, &op));
+			UT_ASSERT(op.xact.cold_cache_effects && !op.xact.pi_read_only);
+			UT_ASSERT_EQ(
+				rf_side_xact_apply_owned_v1(&op.xact, op.owned_payload, op.owned_payload_length),
+				RF_SIDE_XACT_APPLY_BLOCKED);
+			UT_ASSERT_EQ(rf_side_xact_apply_cold_cache_commit_v1(
+							 &op.xact, op.owned_payload, op.owned_payload_length, NULL, NULL),
+						 RF_SIDE_XACT_APPLY_BLOCKED);
+		}
 		rf_side_online_plan_destroy_v1(&recovery);
 		rf_side_online_plan_destroy_v1(&plan);
 	}

@@ -47,6 +47,8 @@ struct RfSideOnlinePlanV1 {
 	uint8 storage_uuid[16];
 	Size memory_budget;
 	Size memory_used;
+	/* Charged in memory_used: serial preflight/apply needs one aligned copy. */
+	Size cold_cache_scratch_bytes;
 	uint32 participant_count;
 	RfContributorStreamCutV1 *physical_cuts;
 	XLogRecPtr *redo_starts;
@@ -863,10 +865,12 @@ side_decode_record(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *recor
 		} else if (record_plan->route.rmid == RM_XACT_ID
 				   && record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_STANDARD) {
 			if (!(plan->purpose == RF_SIDE_PLAN_PI_CONTRIBUTIONS
-				  ? rf_side_xact_inspect_pi_v1(record_plan->source_record, plan->system_identifier,
-											 identity->record.origin_thread, &candidate->xact)
-				  : rf_side_xact_decode_v1(record_plan->source_record, plan->system_identifier,
-										  identity->record.origin_thread, &candidate->xact)))
+					  ? rf_side_xact_inspect_pi_v1(record_plan->source_record,
+												   plan->system_identifier,
+												   identity->record.origin_thread, &candidate->xact)
+					  : rf_side_xact_decode_recovery_v1(
+							record_plan->source_record, plan->system_identifier,
+							identity->record.origin_thread, &candidate->xact)))
 				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 			candidate->kind = RF_SIDE_ONLINE_OPERATION_XACT;
 			if (candidate->xact.kind == RF_SIDE_XACT_PREPARE
@@ -979,6 +983,18 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 			if (plan->purpose == RF_SIDE_PLAN_PI_CONTRIBUTIONS)
 				plan->failed = true;
 			return RF_PAGE_PROOF_DETAIL_CAPACITY;
+		}
+		if (candidate.kind == RF_SIDE_ONLINE_OPERATION_XACT && candidate.xact.cold_cache_effects
+			&& candidate.owned_payload_length > plan->cold_cache_scratch_bytes) {
+			Size extra = candidate.owned_payload_length - plan->cold_cache_scratch_bytes;
+
+			/* Keep the largest simultaneous native copy separate from both
+			 * owned payload storage and the original page/header scratch. */
+			if (!side_plan_reserve(plan, extra)) {
+				plan->failed = true;
+				return RF_PAGE_PROOF_DETAIL_CAPACITY;
+			}
+			plan->cold_cache_scratch_bytes = candidate.owned_payload_length;
 		}
 		candidate.owned_payload_offset = plan->owned_payload_bytes;
 		if (candidate.owned_payload_length > 0) {
@@ -1306,9 +1322,16 @@ rf_side_online_plan_abort_target_v1(const RfSideOnlinePlanV1 *plan,
 }
 
 static ClusterUndoHeaderPrepareResultV1
-side_plan_slot_step(const RfSideOnlineOperationV1 *op, const char *base, char *out)
+side_plan_slot_step(const RfSideOnlinePlanV1 *plan, const RfSideOnlineOperationV1 *op,
+					const char *base, char *out)
 {
-	if (op->owned_payload_length != 0)
+	if (op->owned_payload_length != 0
+		&& (op->kind != RF_SIDE_ONLINE_OPERATION_XACT
+			|| op->owned_payload_offset > plan->owned_payload_bytes
+			|| op->owned_payload_length > plan->owned_payload_bytes - op->owned_payload_offset
+			|| !rf_side_xact_cold_cache_preflight_v1(&op->xact,
+													 plan->owned_payload + op->owned_payload_offset,
+													 op->owned_payload_length)))
 		return CLUSTER_UNDO_HEADER_BLOCKED;
 	if (op->kind == RF_SIDE_ONLINE_OPERATION_XACT) {
 		const xl_xact_tt_commit *d = &op->xact.tt_delta;
@@ -1383,7 +1406,7 @@ side_plan_prepare_slots(const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 s
 			if (!started) {
 				if (!full_image) {
 					if (original != NULL) {
-						result = side_plan_slot_step(op, observed, scratch.data);
+						result = side_plan_slot_step(plan, op, observed, scratch.data);
 						proved = result == CLUSTER_UNDO_HEADER_APPLY
 								 || result == CLUSTER_UNDO_HEADER_ALREADY;
 					}
@@ -1411,7 +1434,7 @@ side_plan_prepare_slots(const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 s
 				}
 				started = true;
 			}
-			result = side_plan_slot_step(op, scratch.data, scratch.data);
+			result = side_plan_slot_step(plan, op, scratch.data, scratch.data);
 			/* Stale source is not evidence of a target's membership. */
 			if (result == CLUSTER_UNDO_HEADER_BLOCKED || result == CLUSTER_UNDO_HEADER_SKIP_STALE)
 				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
@@ -1894,7 +1917,7 @@ rf_side_online_plan_contribution_owners_v1(const RfSideOnlinePlanV1 *plan, uint3
 		switch (op->xact.kind) {
 		case RF_SIDE_XACT_COMMIT:
 			result.owners = RF_SIDE_CONTRIBUTION_UNDO_HEADER | RF_SIDE_CONTRIBUTION_TERMINAL;
-			if (op->xact.pi_read_only) {
+			if (op->xact.pi_read_only || op->xact.cold_cache_effects) {
 				if (op->xact.invalidation_count != 0
 					|| XactCompletionRelcacheInitFileInval(op->xact.xinfo))
 					result.owners |= RF_SIDE_CONTRIBUTION_INVALIDATION;

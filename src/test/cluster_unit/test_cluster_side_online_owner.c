@@ -72,6 +72,27 @@ cluster_undo_recovery_origin_authorized_v1(int origin_node pg_attribute_unused()
 	return false;
 }
 
+char *DatabasePath;
+
+bool
+rf_side_xact_cold_cache_preflight_v1(const RfSideXactOperationV1 *operation pg_attribute_unused(),
+									 const uint8 *payload pg_attribute_unused(),
+									 uint32 length pg_attribute_unused())
+{
+	UT_ASSERT(false); /* Full cache integration is in test_cluster_side_xact. */
+	return false;
+}
+
+RfSideXactApplyResultV1
+rf_side_xact_apply_cold_cache_commit_v1(
+	const RfSideXactOperationV1 *operation pg_attribute_unused(),
+	const uint8 *payload pg_attribute_unused(), uint32 length pg_attribute_unused(),
+	void *arg pg_attribute_unused(), RfSideXactVerifyCommitCoverageV1 verify pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return RF_SIDE_XACT_APPLY_BLOCKED;
+}
+
 bool
 cluster_undo_recovery_cold_origin_authorized_v1(int origin_node pg_attribute_unused())
 {

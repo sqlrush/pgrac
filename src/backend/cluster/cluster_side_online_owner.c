@@ -8,6 +8,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "access/clog.h"
+#include "miscadmin.h"
 #include "access/xlog_internal.h"
 #include "catalog/pg_control.h"
 #include "cluster/cluster_native_startup.h"
@@ -169,9 +170,9 @@ side_owner_cold_formed(const RfSideOnlineProductionOwnerV1 *owner)
 		   && owner->undo_authority->serial_guard->mode == CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
 }
 
-/* The strict original decoder owns only this complete top-only COMMIT.
- * Compound effects still need their actual cold consumers; no flag is masked
- * away, and a PI inspection operation cannot authorize native storage. */
+/* Accept either the original complete top-only COMMIT or the separately
+ * bounded cache payload. Other effects still need their actual consumers;
+ * no PI inspection operation can authorize native storage. */
 static bool
 side_owner_cold_commit_ready(RfSideOnlineProductionOwnerV1 *owner,
 							 const RfSideXactOperationV1 *operation)
@@ -179,8 +180,11 @@ side_owner_cold_commit_ready(RfSideOnlineProductionOwnerV1 *owner,
 	const uint32 supported = XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_TT_COMMIT;
 
 	return operation->kind == RF_SIDE_XACT_COMMIT && !operation->pi_read_only
-		   && operation->has_tt_delta && (operation->xinfo & ~supported) == 0
-		   && operation->completion_payload_length == 0 && operation->space_drop_count == 0
+		   && operation->has_tt_delta
+		   && (operation->cold_cache_effects
+			   || ((operation->xinfo & ~supported) == 0
+				   && operation->completion_payload_length == 0))
+		   && operation->space_drop_count == 0
 		   && operation->origin_thread == owner->undo_authority->duty->origin_thread_id
 		   && rf_side_online_plan_contains_commit_v1(owner->protected_plan, operation)
 		   && cluster_undo_recovery_cold_origin_authorized_v1(operation->origin_thread - 1);
@@ -315,6 +319,14 @@ side_owner_preflight_xact(void *arg, const RfSideOnlineOperationV1 *operation)
 		return side_owner_cold_abort_ready(owner, operation, &target)
 			   && side_owner_undo_target(owner, target.instance, target.segment_id, 0) != NULL;
 	}
+	if (operation->xact.cold_cache_effects)
+		return side_owner_cold_formed(owner) && DatabasePath == NULL
+			   && side_owner_cold_commit_ready(owner, &operation->xact)
+			   && rf_side_xact_cold_cache_preflight_v1(&operation->xact, operation->owned_payload,
+													   operation->owned_payload_length)
+			   && side_owner_undo_target(owner, operation->xact.tt_delta.instance,
+										 operation->xact.tt_delta.segment_id, 0)
+					  != NULL;
 	if (rf_side_xact_target_preflight_owned_v1(&operation->xact, operation->owned_payload,
 											   operation->owned_payload_length)
 		!= RF_SIDE_XACT_APPLY_OK)
@@ -455,6 +467,12 @@ side_owner_apply_xact(void *arg, const RfSideOnlineOperationV1 *operation)
 			|| !side_owner_install_target(
 				owner, side_owner_undo_target(owner, d->instance, d->segment_id, 0)))
 			return false;
+		if (operation->xact.cold_cache_effects)
+			return side_owner_cold_formed(owner)
+				   && rf_side_xact_apply_cold_cache_commit_v1(
+						  &operation->xact, operation->owned_payload,
+						  operation->owned_payload_length, owner, side_owner_commit_covered)
+						  == RF_SIDE_XACT_APPLY_OK;
 		return rf_side_xact_apply_covered_commit_v1(&operation->xact, owner,
 													side_owner_commit_covered)
 			   == RF_SIDE_XACT_APPLY_OK;

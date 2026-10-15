@@ -49,6 +49,8 @@ typedef struct RfSideXactOperationV1 {
 	/* Read-only classification retains the complete native payload. These
 	 * fields never certify delivery, a terminal projection, or retirement. */
 	bool pi_read_only;
+	/* Retained cache effects require the cold owner, never generic apply. */
+	bool cold_cache_effects;
 	uint32 invalidation_kinds;
 	uint32 invalidation_count;
 	uint32 relation_count;
@@ -64,6 +66,10 @@ typedef struct RfSideXactOperationV1 {
 
 extern bool rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier,
 								   uint16 origin_thread, RfSideXactOperationV1 *out);
+extern bool rf_side_xact_decode_recovery_v1(XLogReaderState *record, uint64 system_identifier,
+											uint16 origin_thread, RfSideXactOperationV1 *out);
+extern bool rf_side_xact_cold_cache_preflight_v1(const RfSideXactOperationV1 *operation,
+												 const uint8 *payload, uint32 length);
 extern bool rf_side_xact_structural_preflight_v1(const RfSideXactOperationV1 *operation);
 extern bool rf_side_xact_inspect_pi_v1(XLogReaderState *record, uint64 system_identifier,
 									uint16 origin_thread, RfSideXactOperationV1 *out);
@@ -120,6 +126,10 @@ typedef bool (*RfSideXactVerifyCommitCoverageV1)(void *arg, const RfSideXactOper
 extern RfSideXactApplyResultV1
 rf_side_xact_apply_covered_commit_v1(const RfSideXactOperationV1 *operation, void *arg,
 									 RfSideXactVerifyCommitCoverageV1 verify);
+extern RfSideXactApplyResultV1
+rf_side_xact_apply_cold_cache_commit_v1(const RfSideXactOperationV1 *operation,
+										const uint8 *payload, uint32 length, void *arg,
+										RfSideXactVerifyCommitCoverageV1 verify);
 /* Ordinary ABORT has no native TT locator. Only an original cold owner that
  * proved its exact preceding carrier and native CLOG may publish this result. */
 extern bool rf_side_xact_preflight_covered_abort_v1(const RfSideXactOperationV1 *operation);
