@@ -60,6 +60,13 @@ struct ClusterRecoveryNativeInventory {
 	uint8 mx_digest[32];
 	ClusterRecoveryMultixactJoinResult mx_status;
 	bool mx_done;
+	ClusterRecoveryRootSet *xact_roots; /* borrowed; outlives this inventory */
+	ClusterRecoveryXactJoin *xact_join;
+	NativeInventoryRecord *xact_cursor;
+	size_t xact_budget;
+	uint8 xact_digest[32];
+	ClusterRecoveryXactJoinResult xact_status;
+	bool xact_done;
 };
 
 static void
@@ -67,6 +74,8 @@ inventory_revoke_dependents(ClusterRecoveryNativeInventory *work)
 {
 	if (work != NULL && work->mx_roots != NULL)
 		cluster_recovery_root_set_invalidate(work->mx_roots);
+	if (work != NULL && work->xact_roots != NULL)
+		cluster_recovery_root_set_invalidate(work->xact_roots);
 	if (work != NULL && work->seed_graph != NULL) {
 		cluster_recovery_reference_graph_invalidate(work->seed_graph);
 		if (work->diag.graph_result < CLUSTER_RECOVERY_GRAPH_INVALID)
@@ -771,6 +780,141 @@ cluster_recovery_native_inventory_multixact_step(ClusterRecoveryNativeInventory 
 	return result;
 }
 
+static ClusterRecoveryXactJoinResult
+inventory_xact_fail(ClusterRecoveryNativeInventory *inventory, ClusterRecoveryXactJoinResult result)
+{
+	inventory->xact_status = result;
+	inventory->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID;
+	inventory->complete = false;
+	inventory_revoke_dependents(inventory);
+	return result;
+}
+
+static ClusterRecoveryXactJoinResult
+inventory_xact_step(ClusterRecoveryNativeInventory *inventory, ClusterRecoveryXactJoinEntry *out)
+{
+	unsigned visited = 0;
+
+	if (inventory->xact_done)
+		return CLUSTER_RECOVERY_XACT_JOIN_DRAINED;
+	if (inventory->xact_join != NULL) {
+		ClusterRecoveryXactJoinResult result
+			= cluster_recovery_xact_join_next(inventory->xact_join, out);
+
+		if (result == CLUSTER_RECOVERY_XACT_JOIN_ENTRY) {
+			uint64 *count = out->is_parent ? &inventory->diag.xact_parents_compared
+										   : &inventory->diag.xact_clog_compared;
+			if (*count == UINT64_MAX
+				|| (!out->equal && inventory->diag.xact_physical_mismatches == UINT64_MAX)) {
+				memset(out, 0, sizeof(*out));
+				return inventory_xact_fail(inventory, CLUSTER_RECOVERY_XACT_JOIN_CAPACITY);
+			}
+			(*count)++;
+			if (!out->equal)
+				inventory->diag.xact_physical_mismatches++;
+		} else if (result == CLUSTER_RECOVERY_XACT_JOIN_DRAINED) {
+			cluster_recovery_xact_join_destroy(inventory->xact_join);
+			inventory->xact_join = NULL;
+			inventory->xact_cursor = inventory->xact_cursor->next;
+			return CLUSTER_RECOVERY_XACT_JOIN_MORE;
+		} else if (result > CLUSTER_RECOVERY_XACT_JOIN_DRAINED)
+			return inventory_xact_fail(inventory, result);
+		return result;
+	}
+	while (inventory->xact_cursor != NULL && visited++ < INVENTORY_SEED_TICK) {
+		ClusterRecoveryNativeEffect primary;
+		ClusterRecoveryXactJoinResult result;
+
+		if (cluster_recovery_native_scan_primary(inventory->xact_cursor->scan, &primary)
+			!= CLUSTER_RECOVERY_NATIVE_EFFECT)
+			return inventory_xact_fail(inventory, CLUSTER_RECOVERY_XACT_JOIN_CHANGED);
+		if (primary.kind != CLUSTER_RECOVERY_NATIVE_TERMINAL
+			&& primary.kind != CLUSTER_RECOVERY_NATIVE_ASSIGNMENT) {
+			inventory->xact_cursor = inventory->xact_cursor->next;
+			continue;
+		}
+		result
+			= cluster_recovery_xact_join_begin(inventory->xact_roots, inventory->xact_cursor->scan,
+											   inventory->xact_budget, &inventory->xact_join);
+		if (result != CLUSTER_RECOVERY_XACT_JOIN_MORE)
+			return inventory_xact_fail(inventory, result);
+		return result;
+	}
+	if (inventory->xact_cursor == NULL) {
+		inventory->xact_done = true;
+		return CLUSTER_RECOVERY_XACT_JOIN_DRAINED;
+	}
+	return CLUSTER_RECOVERY_XACT_JOIN_MORE;
+}
+
+ClusterRecoveryXactJoinResult
+cluster_recovery_native_inventory_xact_step(ClusterRecoveryNativeInventory *inventory,
+											ClusterRecoveryRootSet *roots,
+											size_t join_memory_budget,
+											ClusterRecoveryXactJoinEntry *out,
+											ClusterRecoveryNativeInventoryDiag *diag)
+{
+	ClusterRecoveryXactJoinResult result;
+	uint8 digest[32];
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (diag != NULL)
+		memset(diag, 0, sizeof(*diag));
+	if (inventory == NULL || roots == NULL || out == NULL || diag == NULL) {
+		cluster_recovery_root_set_invalidate(roots);
+		if (inventory != NULL)
+			inventory_xact_fail(inventory, CLUSTER_RECOVERY_XACT_JOIN_INVALID);
+		return CLUSTER_RECOVERY_XACT_JOIN_INVALID;
+	}
+	if (!inventory->complete || inventory->status != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED) {
+		cluster_recovery_root_set_invalidate(roots);
+		result = inventory_xact_fail(inventory,
+									 inventory->xact_status > CLUSTER_RECOVERY_XACT_JOIN_DRAINED
+										 ? inventory->xact_status
+										 : CLUSTER_RECOVERY_XACT_JOIN_CHANGED);
+	} else if (!cluster_recovery_root_set_digest(roots, digest)) {
+		/* This can precede binding xact_roots (e.g. during a ROOT reread). */
+		cluster_recovery_root_set_invalidate(roots);
+		result = inventory_xact_fail(inventory, CLUSTER_RECOVERY_XACT_JOIN_CHANGED);
+	} else if (inventory->xact_roots != NULL
+			   && (inventory->xact_roots != roots || inventory->xact_budget != join_memory_budget
+				   || memcmp(inventory->xact_digest, digest, sizeof(digest)) != 0)) {
+		cluster_recovery_root_set_invalidate(roots);
+		result = inventory_xact_fail(inventory, CLUSTER_RECOVERY_XACT_JOIN_CHANGED);
+	} else {
+		if (inventory->xact_roots == NULL) {
+			const ClusterWalSourceRef *source = &inventory->sources[0].source;
+
+			inventory->xact_roots = roots;
+			inventory->xact_budget = join_memory_budget;
+			inventory->xact_cursor = inventory->head;
+			memcpy(inventory->xact_digest, digest, sizeof(digest));
+			if (!cluster_recovery_root_set_storage_matches(
+					roots, source->claim.identity.system_identifier,
+					source->claim.database_incarnation, source->claim.identity.storage_uuid)) {
+				result = inventory_xact_fail(inventory, CLUSTER_RECOVERY_XACT_JOIN_CHANGED);
+				*diag = inventory->diag;
+				return result;
+			}
+		}
+		PG_TRY();
+		{
+			result = inventory_xact_step(inventory, out);
+		}
+		PG_CATCH();
+		{
+			inventory_xact_fail(inventory, CLUSTER_RECOVERY_XACT_JOIN_INVALID);
+			memset(out, 0, sizeof(*out));
+			*diag = inventory->diag;
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+	}
+	*diag = inventory->diag;
+	return result;
+}
+
 void
 cluster_recovery_native_inventory_destroy(ClusterRecoveryNativeInventory *inventory)
 {
@@ -780,6 +924,7 @@ cluster_recovery_native_inventory_destroy(ClusterRecoveryNativeInventory *invent
 		return;
 	inventory_revoke_dependents(inventory);
 	cluster_recovery_multixact_join_destroy(inventory->mx_join);
+	cluster_recovery_xact_join_destroy(inventory->xact_join);
 	pg_cryptohash_free(inventory->hash);
 	record = inventory->head;
 	while (record != NULL) {

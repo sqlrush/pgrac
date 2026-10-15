@@ -3125,6 +3125,7 @@ RECOVERY_CENSUS_TEST_OBJS = \
 		$(top_builddir)/src/backend/cluster/cluster_cr_apply.o
 
 test_cluster_recovery_native_inputs: $(RECOVERY_CENSUS_TEST_OBJS)
+test_cluster_recovery_native_inputs: test_cluster_recovery_xact_join_inputs.inc
 
 test_cluster_control_root test_cluster_recovery_native_inputs: %: %.c test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc test_cluster_control_root_serving.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_census.c \
@@ -3137,6 +3138,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs: %: %.c test_clust
 		$(top_builddir)/src/backend/cluster/cluster_recovery_record_hash.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_native_scan.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_multixact_join.o \
+		$(top_builddir)/src/backend/cluster/cluster_recovery_xact_join.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_undo_store.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_undo_scan.o \
@@ -3166,6 +3168,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs: %: %.c test_clust
 		$(top_builddir)/src/backend/cluster/cluster_recovery_record_hash.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_native_scan.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_multixact_join.o \
+		$(top_builddir)/src/backend/cluster/cluster_recovery_xact_join.o \
 		$(if $(filter test_cluster_recovery_native_inputs,$@),$(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_store.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_scan.o $(RECOVERY_CENSUS_TEST_OBJS)) \
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
@@ -9132,6 +9135,9 @@ test_cluster_recovery_wal_targets: test_cluster_recovery_wal_targets.c \
 		test_cluster_recovery_undo_targets.inc test_cluster_recovery_multixact_targets.inc \
 		test_cluster_recovery_slru_targets.inc test_cluster_recovery_xact_slru_targets.inc \
 		test_cluster_recovery_multixact_physical.inc test_cluster_recovery_multixact_join.inc \
+		test_cluster_recovery_xact_join.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_xact_join.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_xact_join.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_multixact_join.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_multixact_join.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_multixact_scan.c \

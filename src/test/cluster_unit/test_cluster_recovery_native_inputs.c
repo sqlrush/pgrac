@@ -645,6 +645,7 @@ cleanup:
 #include "test_cluster_recovery_xact_slru_inputs.inc"
 #include "test_cluster_recovery_multixact_join_inputs.inc"
 #include "test_cluster_recovery_census_inputs.inc"
+#include "test_cluster_recovery_xact_join_inputs.inc"
 
 int
 main(int argc, char **argv)
@@ -653,7 +654,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(45);
+	UT_PLAN(48);
 	UT_RUN(test_native_inventory_uses_two_real_cold_passes);
 	UT_RUN(test_native_inventory_never_returns_partial_on_drift_io_or_error);
 	UT_RUN(test_native_inventory_capacity_is_not_partial_success);
@@ -699,6 +700,9 @@ main(int argc, char **argv)
 	UT_RUN(test_cold_child_record_drift_revokes_all_targets);
 	UT_RUN(test_owned_census_missing_or_short_terminal_clog_refuses);
 	UT_RUN(test_cold_commit_ts_keeps_original_profile_refusal);
+	UT_RUN(test_cold_xact_join_keeps_every_source_and_raw_effect);
+	UT_RUN(test_cold_xact_join_final_wal_roots_destroy_revoke_outputs);
+	UT_RUN(test_owned_xact_join_still_requires_final_whole_inputs);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

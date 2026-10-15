@@ -212,14 +212,14 @@ UT_TEST(test_owned_census_real_inputs_all_observation_families)
 	ClusterRecoveryCensusEntry entry;
 	ClusterRecoveryCensusDiag diag = { 0 };
 	ClusterRecoveryCensusResult result = CLUSTER_RECOVERY_CENSUS_MORE;
-	unsigned unknown = 0, raw_pages = 0, mismatches = 0, kinds[9] = { 0 };
+	unsigned unknown = 0, raw_pages = 0, mismatches = 0, kinds[10] = { 0 };
 	for (unsigned steps = 0; steps < 200000; steps++) {
 		result = cluster_recovery_census_next(census, &entry);
 		if (result >= CLUSTER_RECOVERY_CENSUS_DRAINED)
 			break;
 		if (result != CLUSTER_RECOVERY_CENSUS_ENTRY)
 			continue;
-		UT_ASSERT(entry.kind >= 1 && entry.kind <= 8);
+		UT_ASSERT(entry.kind >= 1 && entry.kind <= 9);
 		kinds[entry.kind]++;
 		if (entry.kind == CLUSTER_RECOVERY_CENSUS_RELATION) {
 			const ClusterRecoveryRelationCensusEntry *r = &entry.value.relation;
@@ -240,6 +240,14 @@ UT_TEST(test_owned_census_real_inputs_all_observation_families)
 		}
 		if (entry.kind == CLUSTER_RECOVERY_CENSUS_MX_MATCH)
 			mismatches += !entry.value.compare.equal;
+		if (entry.kind == CLUSTER_RECOVERY_CENSUS_XACT_MATCH) {
+			const ClusterRecoveryXactJoinEntry *x = &entry.value.xact_compare;
+			UT_ASSERT(x->record != NULL && x->is_top && !x->is_parent);
+			UT_ASSERT_EQ(x->xid, 4195136);
+			UT_ASSERT_EQ(x->expected_value, TRANSACTION_STATUS_COMMITTED);
+			UT_ASSERT_EQ(x->observed_value, TRANSACTION_STATUS_IN_PROGRESS);
+			UT_ASSERT(!x->equal);
+		}
 	}
 	UT_ASSERT_EQ(result, CLUSTER_RECOVERY_CENSUS_DRAINED);
 	UT_ASSERT_EQ(kinds[CLUSTER_RECOVERY_CENSUS_TT_SLOT], 96);
@@ -247,6 +255,7 @@ UT_TEST(test_owned_census_real_inputs_all_observation_families)
 	UT_ASSERT_EQ(kinds[CLUSTER_RECOVERY_CENSUS_TX_TARGET], 2);
 	UT_ASSERT(kinds[CLUSTER_RECOVERY_CENSUS_MX_SLOT] > 4096);
 	UT_ASSERT_EQ(kinds[CLUSTER_RECOVERY_CENSUS_MX_MATCH], 6);
+	UT_ASSERT_EQ(kinds[CLUSTER_RECOVERY_CENSUS_XACT_MATCH], 2);
 	UT_ASSERT(kinds[CLUSTER_RECOVERY_CENSUS_NATIVE_EFFECT] > 10);
 	UT_ASSERT_EQ(unknown, 1);
 	UT_ASSERT(raw_pages > 0);
@@ -258,6 +267,10 @@ UT_TEST(test_owned_census_real_inputs_all_observation_families)
 	UT_ASSERT_EQ(diag.inventory.sources, 2);
 	UT_ASSERT_EQ(diag.inventory.tt_roots_added, 2);
 	UT_ASSERT_EQ(diag.inventory.mx_physical_mismatches, 2);
+	UT_ASSERT_EQ(diag.xact_comparisons, 2);
+	UT_ASSERT_EQ(diag.inventory.xact_clog_compared, 2);
+	UT_ASSERT_EQ(diag.inventory.xact_parents_compared, 0);
+	UT_ASSERT_EQ(diag.inventory.xact_physical_mismatches, 2);
 	UT_ASSERT_EQ(inventory_census_calls, 3); /* two initial passes, original final reread */
 	owned_census_sticky(census, CLUSTER_RECOVERY_CENSUS_DRAINED);
 	owned_census_done(census, &inputs, fd, path);

@@ -12,6 +12,7 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_recovery_native_scan.h"
 #include "cluster/cluster_recovery_multixact_join.h"
+#include "cluster/cluster_recovery_xact_join.h"
 #include "cluster/cluster_recovery_reference_graph.h"
 #include "cluster/cluster_recovery_root_set.h"
 #include "cluster/cluster_wal_inputs.h"
@@ -47,6 +48,7 @@ typedef struct ClusterRecoveryNativeInventoryDiag {
 	uint64 tt_binding_records_examined;
 	uint64 tt_head_binding_missing;
 	uint64 mx_compared_offsets, mx_compared_members, mx_physical_mismatches;
+	uint64 xact_clog_compared, xact_parents_compared, xact_physical_mismatches;
 	ClusterRecoveryGraphResult graph_result;
 	size_t owned_bytes;
 } ClusterRecoveryNativeInventoryDiag;
@@ -117,5 +119,13 @@ extern ClusterRecoveryMultixactJoinResult cluster_recovery_native_inventory_mult
 	size_t join_memory_budget, ClusterRecoveryMultixactJoinEntry *out,
 	ClusterRecoveryNativeInventoryDiag *diag);
 extern void cluster_recovery_native_inventory_destroy(ClusterRecoveryNativeInventory *inventory);
+/* Independent retained terminal/assignment cursor, under the same borrowed
+ * ROOT lifetime and failure rules as MX. At most128 saved records or one
+ * bounded physical join step. Mismatches are observations, not permission
+ * to overwrite a status or parent. The fixed scratch budget is separate. */
+extern ClusterRecoveryXactJoinResult cluster_recovery_native_inventory_xact_step(
+	ClusterRecoveryNativeInventory *inventory, ClusterRecoveryRootSet *roots,
+	size_t join_memory_budget, ClusterRecoveryXactJoinEntry *out,
+	ClusterRecoveryNativeInventoryDiag *diag);
 #endif
 #endif

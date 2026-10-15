@@ -317,9 +317,23 @@ census_step(ClusterRecoveryCensus *census, ClusterRecoveryCensusEntry *out)
 			return census_entry(out, CLUSTER_RECOVERY_CENSUS_MX_MATCH);
 		}
 		if (d->join_result == CLUSTER_RECOVERY_MX_JOIN_DRAINED)
-			d->phase = CLUSTER_RECOVERY_CENSUS_EFFECTS;
+			d->phase = CLUSTER_RECOVERY_CENSUS_XACT_COMPARE;
 		if (d->join_result == CLUSTER_RECOVERY_MX_JOIN_MORE
 			|| d->join_result == CLUSTER_RECOVERY_MX_JOIN_DRAINED)
+			return CLUSTER_RECOVERY_CENSUS_MORE;
+		break;
+	case CLUSTER_RECOVERY_CENSUS_XACT_COMPARE:
+		d->xact_result = cluster_recovery_native_inventory_xact_step(
+			census->inventory, census->roots, census->child_budget, &out->value.xact_compare,
+			&d->inventory);
+		if (d->xact_result == CLUSTER_RECOVERY_XACT_JOIN_ENTRY) {
+			d->xact_comparisons++;
+			return census_entry(out, CLUSTER_RECOVERY_CENSUS_XACT_MATCH);
+		}
+		if (d->xact_result == CLUSTER_RECOVERY_XACT_JOIN_DRAINED)
+			d->phase = CLUSTER_RECOVERY_CENSUS_EFFECTS;
+		if (d->xact_result == CLUSTER_RECOVERY_XACT_JOIN_MORE
+			|| d->xact_result == CLUSTER_RECOVERY_XACT_JOIN_DRAINED)
 			return CLUSTER_RECOVERY_CENSUS_MORE;
 		break;
 	case CLUSTER_RECOVERY_CENSUS_EFFECTS:
