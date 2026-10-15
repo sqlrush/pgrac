@@ -15864,6 +15864,7 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 {
 	instr_time	io_start;
 	int			i;
+	int			issued = 0;
 
 	if (wb_context->nr_pending == 0)
 		return;
@@ -15891,6 +15892,9 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 		BufferTag	tag;
 		RelFileLocator currlocator;
 		Size		nblocks = 1;
+#ifdef USE_PGRAC_CLUSTER
+		ClusterKoDirectoryIoV3 io;
+#endif
 
 		cur = &wb_context->pending_writebacks[i];
 		tag = cur->tag;
@@ -15925,17 +15929,41 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 
 		i += ahead;
 
+#ifdef USE_PGRAC_CLUSTER
+		/* This context outlives the buffer's content lock and may outlive
+		 * its mapping. Serialize the actual call with object COMMIT before
+		 * opening even a cached relation handle. All native callers reach
+		 * here outside buffer content/header locks.
+		 *
+		 * This is an optional scheduling hint, not queued fsync or DATA
+		 * responsibility. Any refused hint can be dropped without proving
+		 * object retirement; the original sync/receipt owners remain. */
+		if (!cluster_ko_directory_io_begin_v3(currlocator, &io))
+			continue;
+		PG_TRY();
+		{
+#endif
 		/* and finally tell the kernel to write the data to storage */
 		reln = smgropen(currlocator, InvalidBackendId);
 		smgrwriteback(reln, BufTagGetForkNum(&tag), tag.blockNum, nblocks);
+#ifdef USE_PGRAC_CLUSTER
+		}
+		PG_FINALLY();
+		{
+			(void) cluster_ko_directory_io_end_v3(&io);
+		}
+		PG_END_TRY();
+#endif
+		issued += ahead + 1;
 	}
 
 	/*
 	 * Assume that writeback requests are only issued for buffers containing
 	 * blocks of permanent relations.
 	 */
-	pgstat_count_io_op_time(IOOBJECT_RELATION, io_context,
-							IOOP_WRITEBACK, io_start, wb_context->nr_pending);
+	if (issued > 0)
+		pgstat_count_io_op_time(IOOBJECT_RELATION, io_context,
+								IOOP_WRITEBACK, io_start, issued);
 
 	wb_context->nr_pending = 0;
 }
