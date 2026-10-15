@@ -115,6 +115,11 @@ cluster_recovery_native_scan_recheck(ClusterRecoveryNativeScan *scan, XLogReader
 extern ClusterRecoveryNativeResult
 cluster_recovery_native_scan_next(ClusterRecoveryNativeScan *scan,
 								  ClusterRecoveryNativeEffect *out);
+/* Read the owned primary observation without changing either effect cursor.
+ * Valid after iteration ends, but never after a failed record recheck. */
+extern ClusterRecoveryNativeResult
+cluster_recovery_native_scan_primary(const ClusterRecoveryNativeScan *scan,
+									 ClusterRecoveryNativeEffect *out);
 /* Exact owned allocation size for the containing recovery inventory's
  * budget. This excludes allocator-internal/RSS overhead and grants no proof. */
 extern size_t cluster_recovery_native_scan_bytes(const ClusterRecoveryNativeScan *scan);

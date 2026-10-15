@@ -85,6 +85,9 @@ cluster_recovery_reference_graph_begin(size_t memory_budget, ClusterRecoveryGrap
 extern ClusterRecoveryGraphResult
 cluster_recovery_reference_graph_add(ClusterRecoveryReferenceGraph *graph,
 									 const ClusterRecoveryTxnKey *transaction, UBA head);
+/* Root-producer lifecycle check only, never proof of producer coverage. */
+extern bool
+cluster_recovery_reference_graph_accepts_roots(const ClusterRecoveryReferenceGraph *graph);
 
 /* At most one record read and 128 graph transitions per call. Every record
  * is exposed once with all payload/history bytes and its actual target;

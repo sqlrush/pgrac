@@ -342,6 +342,28 @@ cluster_recovery_native_scan_recheck(ClusterRecoveryNativeScan *scan, XLogReader
 }
 
 ClusterRecoveryNativeResult
+cluster_recovery_native_scan_primary(const ClusterRecoveryNativeScan *scan,
+									 ClusterRecoveryNativeEffect *out)
+{
+	if (out == NULL)
+		return CLUSTER_RECOVERY_NATIVE_INVALID;
+	memset(out, 0, sizeof(*out));
+	if (scan == NULL)
+		return CLUSTER_RECOVERY_NATIVE_INVALID;
+	if (scan->status != CLUSTER_RECOVERY_NATIVE_MORE)
+		return scan->status;
+	out->kind = scan->primary;
+	out->record = &scan->record;
+	out->bytes = scan->payload;
+	out->length = scan->record.payload_length;
+	if (scan->primary == CLUSTER_RECOVERY_NATIVE_UNDO) {
+		out->bytes = &scan->undo;
+		out->length = sizeof(scan->undo);
+	}
+	return CLUSTER_RECOVERY_NATIVE_EFFECT;
+}
+
+ClusterRecoveryNativeResult
 cluster_recovery_native_scan_next(ClusterRecoveryNativeScan *scan, ClusterRecoveryNativeEffect *out)
 {
 	if (out == NULL)
@@ -353,15 +375,7 @@ cluster_recovery_native_scan_next(ClusterRecoveryNativeScan *scan, ClusterRecove
 		return scan->status;
 	if (!scan->primary_returned) {
 		scan->primary_returned = true;
-		out->kind = scan->primary;
-		out->record = &scan->record;
-		out->bytes = scan->payload;
-		out->length = scan->record.payload_length;
-		if (scan->primary == CLUSTER_RECOVERY_NATIVE_UNDO) {
-			out->bytes = &scan->undo;
-			out->length = sizeof(scan->undo);
-		}
-		return CLUSTER_RECOVERY_NATIVE_EFFECT;
+		return cluster_recovery_native_scan_primary(scan, out);
 	}
 	while (scan->region < lengthof(scan->regions)) {
 		const NativeRegion *region = &scan->regions[scan->region];

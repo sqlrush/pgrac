@@ -12,6 +12,9 @@
 #include "cluster/cluster_recovery_native_inventory.h"
 #include "cluster/cluster_recovery_record_hash.h"
 #include "cluster/cluster_recovery_wal_targets.h"
+#include "cluster/cluster_side_undo.h"
+
+#define INVENTORY_SEED_TICK 128
 
 typedef struct NativeInventorySource {
 	ClusterWalSourceRef source;
@@ -43,7 +46,24 @@ struct ClusterRecoveryNativeInventory {
 	unsigned pass;
 	bool active;
 	bool complete;
+	ClusterRecoveryReferenceGraph *seed_graph; /* borrowed; outlives this inventory */
+	NativeInventoryRecord *seed_cursor;
+	NativeInventoryRecord *seed_source_first;
+	NativeInventoryRecord *seed_search;
+	const ClusterUndoDecoded *seed_binding; /* original immutable TT_BIND */
+	bool seed_searching;
+	bool seed_done;
 };
+
+static void
+inventory_revoke_graph(ClusterRecoveryNativeInventory *work)
+{
+	if (work != NULL && work->seed_graph != NULL) {
+		cluster_recovery_reference_graph_invalidate(work->seed_graph);
+		if (work->diag.graph_result < CLUSTER_RECOVERY_GRAPH_INVALID)
+			work->diag.graph_result = CLUSTER_RECOVERY_GRAPH_CHANGED;
+	}
+}
 
 static bool
 inventory_source_equal(const ClusterWalSourceRef *a, const ClusterWalSourceRef *b)
@@ -79,6 +99,7 @@ inventory_refuse(ClusterRecoveryNativeInventory *work, ClusterRecoveryNativeInve
 				 RfPageProofDetailV1 detail)
 {
 	work->status = result;
+	inventory_revoke_graph(work);
 	return detail;
 }
 
@@ -389,6 +410,7 @@ cluster_recovery_native_inventory_recheck(ClusterWalInputsV1 *inputs,
 	if (!inventory->complete || inputs == NULL || diag == NULL) {
 		inventory->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID;
 		inventory->complete = false;
+		inventory_revoke_graph(inventory);
 		return inventory->status;
 	}
 	inventory->complete = false;
@@ -409,6 +431,7 @@ cluster_recovery_native_inventory_recheck(ClusterWalInputsV1 *inputs,
 	PG_CATCH();
 	{
 		inventory->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_INPUT;
+		inventory_revoke_graph(inventory);
 		pg_cryptohash_free(inventory->hash);
 		inventory->hash = NULL;
 		*diag = inventory->diag;
@@ -419,6 +442,8 @@ cluster_recovery_native_inventory_recheck(ClusterWalInputsV1 *inputs,
 	inventory->hash = NULL;
 	inventory->cursor = saved_cursor;
 	inventory->complete = inventory->status == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED;
+	if (!inventory->complete)
+		inventory_revoke_graph(inventory);
 	*diag = inventory->diag;
 	return inventory->status;
 }
@@ -448,7 +473,150 @@ cluster_recovery_native_inventory_next(ClusterRecoveryNativeInventory *inventory
 	if (native == CLUSTER_RECOVERY_NATIVE_EFFECT)
 		return CLUSTER_RECOVERY_NATIVE_INVENTORY_EFFECT;
 	inventory->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED;
+	inventory_revoke_graph(inventory);
 	return inventory->status;
+}
+
+static ClusterRecoveryGraphResult
+inventory_seed_fail(ClusterRecoveryNativeInventory *inventory, ClusterRecoveryGraphResult result)
+{
+	inventory->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID;
+	inventory->complete = false;
+	inventory->diag.graph_result = result;
+	inventory_revoke_graph(inventory);
+	return result;
+}
+
+static ClusterRecoveryGraphResult
+inventory_seed_step(ClusterRecoveryNativeInventory *inventory)
+{
+	unsigned work = 0;
+
+	if (inventory->seed_done)
+		return CLUSTER_RECOVERY_GRAPH_DRAINED;
+	if (!cluster_recovery_reference_graph_accepts_roots(inventory->seed_graph))
+		return inventory_seed_fail(inventory, CLUSTER_RECOVERY_GRAPH_INVALID);
+	while (work < INVENTORY_SEED_TICK) {
+		NativeInventoryRecord *current = inventory->seed_cursor;
+		ClusterRecoveryNativeEffect effect;
+		const ClusterUndoDecoded *head;
+
+		if (current == NULL) {
+			inventory->seed_done = true;
+			return CLUSTER_RECOVERY_GRAPH_DRAINED;
+		}
+		if (cluster_recovery_native_scan_primary(current->scan, &effect)
+			!= CLUSTER_RECOVERY_NATIVE_EFFECT)
+			return inventory_seed_fail(inventory, CLUSTER_RECOVERY_GRAPH_CHANGED);
+		work++;
+		if (current->source_index != inventory->seed_source_first->source_index)
+			inventory->seed_source_first = current;
+		head = effect.kind == CLUSTER_RECOVERY_NATIVE_UNDO ? effect.bytes : NULL;
+		if (head == NULL || head->kind != CLUSTER_UNDO_KIND_TT_SET_HEAD) {
+			inventory->seed_cursor = current->next;
+			continue;
+		}
+		if (!inventory->seed_searching) {
+			inventory->seed_search = inventory->seed_source_first;
+			inventory->seed_binding = NULL;
+			inventory->seed_searching = true;
+		}
+		while (inventory->seed_search != current && work < INVENTORY_SEED_TICK) {
+			NativeInventoryRecord *candidate = inventory->seed_search;
+			ClusterRecoveryNativeEffect prior;
+			const ClusterUndoDecoded *undo;
+
+			if (candidate == NULL || candidate->source_index != current->source_index
+				|| cluster_recovery_native_scan_primary(candidate->scan, &prior)
+					   != CLUSTER_RECOVERY_NATIVE_EFFECT)
+				return inventory_seed_fail(inventory, CLUSTER_RECOVERY_GRAPH_CHANGED);
+			if (inventory->diag.tt_binding_records_examined == UINT64_MAX)
+				return inventory_seed_fail(inventory, CLUSTER_RECOVERY_GRAPH_CAPACITY);
+			inventory->diag.tt_binding_records_examined++;
+			work++;
+			inventory->seed_search = candidate->next;
+			if (prior.kind != CLUSTER_RECOVERY_NATIVE_UNDO)
+				continue;
+			undo = prior.bytes;
+			if (undo->segment_id != head->segment_id)
+				continue;
+			if (undo->kind == CLUSTER_UNDO_KIND_SEGMENT_INIT
+				|| undo->kind == CLUSTER_UNDO_KIND_SEGMENT_RECYCLE
+				|| undo->kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE)
+				inventory->seed_binding = NULL;
+			else if (undo->kind == CLUSTER_UNDO_KIND_TT_BIND
+					 && undo->slot_offset == head->slot_offset)
+				/* Do not search past the latest binding across xid/wrap reuse. */
+				inventory->seed_binding = undo;
+		}
+		if (inventory->seed_search != current)
+			return CLUSTER_RECOVERY_GRAPH_MORE;
+		{
+			const ClusterUndoDecoded *binding = inventory->seed_binding;
+			ClusterRecoveryTxnKey key = { 0 };
+			ClusterRecoveryGraphResult added;
+
+			if (binding == NULL || binding->instance != head->instance || binding->xid != head->xid
+				|| binding->wrap != head->wrap) {
+				inventory->diag.tt_head_binding_missing++;
+				return inventory_seed_fail(inventory, CLUSTER_RECOVERY_GRAPH_IDENTITY);
+			}
+			key.system_identifier = effect.record->source.claim.identity.system_identifier;
+			key.database_incarnation = effect.record->source.claim.database_incarnation;
+			key.origin_node_id = binding->instance - 1;
+			key.segment_id = binding->segment_id;
+			key.segment_generation = binding->expected_generation;
+			key.slot_offset = binding->slot_offset;
+			key.slot_wrap = binding->wrap;
+			key.xid = binding->xid;
+			if (inventory->diag.tt_roots_added == UINT64_MAX)
+				return inventory_seed_fail(inventory, CLUSTER_RECOVERY_GRAPH_CAPACITY);
+			added = cluster_recovery_reference_graph_add(inventory->seed_graph, &key,
+														 head->first_undo_block);
+			if (added != CLUSTER_RECOVERY_GRAPH_MORE)
+				return inventory_seed_fail(inventory, added);
+			inventory->diag.tt_roots_added++;
+		}
+		inventory->seed_searching = false;
+		inventory->seed_binding = NULL;
+		inventory->seed_cursor = current->next;
+	}
+	return CLUSTER_RECOVERY_GRAPH_MORE;
+}
+
+ClusterRecoveryGraphResult
+cluster_recovery_native_inventory_seed_graph_step(ClusterRecoveryNativeInventory *inventory,
+												  ClusterRecoveryReferenceGraph *graph,
+												  ClusterRecoveryNativeInventoryDiag *diag)
+{
+	ClusterRecoveryGraphResult result;
+
+	if (diag != NULL)
+		memset(diag, 0, sizeof(*diag));
+	if (inventory == NULL || graph == NULL || diag == NULL) {
+		cluster_recovery_reference_graph_invalidate(graph);
+		if (inventory != NULL)
+			inventory_seed_fail(inventory, CLUSTER_RECOVERY_GRAPH_INVALID);
+		return CLUSTER_RECOVERY_GRAPH_INVALID;
+	}
+	if (inventory->seed_graph != NULL && inventory->seed_graph != graph)
+		result = inventory_seed_fail(inventory, CLUSTER_RECOVERY_GRAPH_INVALID);
+	else if (inventory->status != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED
+			 || !inventory->complete) {
+		cluster_recovery_reference_graph_invalidate(graph);
+		result = inventory->diag.graph_result >= CLUSTER_RECOVERY_GRAPH_INVALID
+					 ? inventory->diag.graph_result
+					 : CLUSTER_RECOVERY_GRAPH_CHANGED;
+	} else {
+		if (inventory->seed_graph == NULL) {
+			inventory->seed_graph = graph;
+			inventory->seed_cursor = inventory->seed_source_first = inventory->head;
+		}
+		result = inventory_seed_step(inventory);
+	}
+	inventory->diag.graph_result = result;
+	*diag = inventory->diag;
+	return result;
 }
 
 void
@@ -458,6 +626,7 @@ cluster_recovery_native_inventory_destroy(ClusterRecoveryNativeInventory *invent
 
 	if (inventory == NULL)
 		return;
+	inventory_revoke_graph(inventory);
 	pg_cryptohash_free(inventory->hash);
 	record = inventory->head;
 	while (record != NULL) {

@@ -13,6 +13,8 @@ int control_fixture_main(int argc, char **argv);
 #include "cluster/cluster_recovery_record_hash.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "cluster/storage/cluster_undo_alloc.h"
+#include "../../backend/cluster/cluster_uba.c"
+#include "test_cluster_heap_small_scn.inc"
 
 static unsigned inventory_census_calls;
 static void (*inventory_between_passes)(void);
@@ -41,6 +43,7 @@ static ClusterWalSourceRef inventory_fault_source;
 static XLogRecPtr inventory_commit_start, inventory_commit_previous;
 static unsigned inventory_fault;
 static unsigned inventory_extra;
+static unsigned inventory_binding_case;
 static XLogRecPtr inventory_extra_start, inventory_extra_previous;
 
 /* These small records stay within the original checkpoint's first WAL page.
@@ -152,6 +155,55 @@ inventory_write_commit(const ClusterWalSourceRef *source, XLogRecPtr at, XLogRec
 		unsupported ? XLOG_XACT_PREPARE : XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO, payload, used);
 }
 
+static WalTestRecord
+inventory_write_bound_head(const ClusterWalSourceRef *source, WalTestRecord previous, unsigned node)
+{
+	xl_undo_tt_slot_bind binding = { 0 };
+	xl_undo_tt_slot_set_head head = { 0 };
+	WalTestRecord next = previous;
+	bool missing = inventory_binding_case == 1 || (inventory_binding_case == 8 && node == 127);
+
+	binding.segment_id = node * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	binding.instance = node + 1;
+	binding.xid = 4195136;
+	binding.wrap = 1;
+	binding.format_version = CLUSTER_UNDO_TT_BIND_VERSION;
+	head.segment_id = binding.segment_id;
+	head.instance = binding.instance;
+	head.xid = binding.xid;
+	head.wrap = binding.wrap;
+	head.first_undo_block = uba_encode(binding.segment_id, 1, 0, 0);
+	if (inventory_binding_case == 7)
+		next = inventory_write_record(source, next.exclusive_end, next.record_start,
+									  RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_SET_HEAD, &head,
+									  sizeof(head));
+	if (!missing)
+		next = inventory_write_record(source, next.exclusive_end, next.record_start,
+									  RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND, &binding,
+									  sizeof(binding));
+	if (inventory_binding_case == 2 || inventory_binding_case == 3) {
+		if (inventory_binding_case == 2)
+			binding.xid++;
+		else
+			binding.wrap++;
+		next = inventory_write_record(source, next.exclusive_end, next.record_start,
+									  RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND, &binding,
+									  sizeof(binding));
+	}
+	if (inventory_binding_case == 4) {
+		xl_undo_segment_recycle recycle = { 0 };
+		recycle.segment_id = binding.segment_id;
+		recycle.instance = binding.instance;
+		recycle.old_state = SEGMENT_COMMITTED;
+		recycle.new_state = SEGMENT_RECYCLABLE;
+		next = inventory_write_record(source, next.exclusive_end, next.record_start,
+									  RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_RECYCLE, &recycle,
+									  sizeof(recycle));
+	}
+	return inventory_write_record(source, next.exclusive_end, next.record_start, RM_CLUSTER_UNDO_ID,
+								  XLOG_UNDO_TT_SLOT_SET_HEAD, &head, sizeof(head));
+}
+
 static ClusterWalInputsV1 *
 inventory_fixture(bool unsupported, bool open_source)
 {
@@ -196,6 +248,8 @@ inventory_fixture(bool unsupported, bool open_source)
 										   RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND, &binding,
 										   sizeof(binding));
 		}
+		if (inventory_extra == 5)
+			extra = inventory_write_bound_head(&source, commit, node);
 		create = inventory_write_record(&source, extra.exclusive_end, extra.record_start,
 										RM_SMGR_ID, XLOG_SMGR_CREATE, &payload, sizeof(payload));
 		if (i == 0) {
@@ -480,6 +534,7 @@ cleanup:
 }
 
 #include "test_cluster_recovery_native_transcript.inc"
+#include "test_cluster_recovery_wal_tt_roots.inc"
 
 int
 main(int argc, char **argv)
@@ -488,7 +543,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(15);
+	UT_PLAN(21);
 	UT_RUN(test_native_inventory_uses_two_real_cold_passes);
 	UT_RUN(test_native_inventory_never_returns_partial_on_drift_io_or_error);
 	UT_RUN(test_native_inventory_capacity_is_not_partial_success);
@@ -504,6 +559,12 @@ main(int argc, char **argv)
 	UT_RUN(test_native_inventory_collects_undo_targets_from_real_retained_wal);
 	UT_RUN(test_cold_inventory_owns_undo_records_and_rechecks_after_export);
 	UT_RUN(test_cold_inventory_does_not_hide_invalid_undo_in_other_records);
+	UT_RUN(test_wal_heads_seed_reused_slots_through_real_files);
+	UT_RUN(test_wal_heads_require_prior_same_source_identity);
+	UT_RUN(test_wal_head_seeding_preserves_effect_cursor);
+	UT_RUN(test_wal_head_final_recheck_and_destroy_revoke_graph);
+	UT_RUN(test_wal_heads_reject_late_graph_and_partial_capacity);
+	UT_RUN(test_wal_head_bounded_search_and_lifecycle_barriers);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

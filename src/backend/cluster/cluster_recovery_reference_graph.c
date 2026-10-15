@@ -235,6 +235,12 @@ cluster_recovery_reference_graph_begin(size_t memory_budget, ClusterRecoveryGrap
 	return CLUSTER_RECOVERY_GRAPH_MORE;
 }
 
+bool
+cluster_recovery_reference_graph_accepts_roots(const ClusterRecoveryReferenceGraph *graph)
+{
+	return graph != NULL && !graph->started && graph->status == CLUSTER_RECOVERY_GRAPH_MORE;
+}
+
 ClusterRecoveryGraphResult
 cluster_recovery_reference_graph_add(ClusterRecoveryReferenceGraph *graph,
 									 const ClusterRecoveryTxnKey *transaction, UBA head)

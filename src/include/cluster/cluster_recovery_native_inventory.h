@@ -11,6 +11,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_recovery_native_scan.h"
+#include "cluster/cluster_recovery_reference_graph.h"
 #include "cluster/cluster_recovery_root_set.h"
 #include "cluster/cluster_wal_inputs.h"
 
@@ -39,6 +40,10 @@ typedef struct ClusterRecoveryNativeInventoryDiag {
 	uint64 structural_effects;
 	uint64 undo_targets;
 	uint64 unowned_target_records;
+	uint64 tt_roots_added; /* successful root additions, before graph deduplication */
+	uint64 tt_binding_records_examined;
+	uint64 tt_head_binding_missing;
+	ClusterRecoveryGraphResult graph_result;
 	size_t owned_bytes;
 } ClusterRecoveryNativeInventoryDiag;
 
@@ -84,6 +89,19 @@ cluster_recovery_native_inventory_recheck(ClusterWalInputsV1 *inputs,
 extern ClusterRecoveryNativeInventoryResult
 cluster_recovery_native_inventory_next(ClusterRecoveryNativeInventory *inventory,
 									   ClusterRecoveryNativeEffect *out);
+/* Join each retained SET_HEAD with its last preceding TT_BIND in the same
+ * source/cut, with no intervening segment lifecycle change. Missing or
+ * overwritten identity refuses; current TT generations are never guessed.
+ * At most 128 saved records per call, without consuming the effect cursor.
+ * The graph must be unstarted and outlive this inventory. Failure, failed
+ * input recheck or inventory destruction invalidates it. DRAINED only means
+ * these heads were added: physical TT/page/native producers, rereads and
+ * lifecycle/terminal proofs remain separate, with no apply/OPEN/GC authority.
+ * Original graph memory is budgeted separately; no per-record allocation. */
+extern ClusterRecoveryGraphResult
+cluster_recovery_native_inventory_seed_graph_step(ClusterRecoveryNativeInventory *inventory,
+												  ClusterRecoveryReferenceGraph *graph,
+												  ClusterRecoveryNativeInventoryDiag *diag);
 extern void cluster_recovery_native_inventory_destroy(ClusterRecoveryNativeInventory *inventory);
 #endif
 #endif
