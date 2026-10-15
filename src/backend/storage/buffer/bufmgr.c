@@ -12063,6 +12063,7 @@ cluster_page_data_from_remote_v1(const ClusterPiDataV1 *job, ClusterPageDataRece
 	ClusterPageWalBindingV1 binding;
 	ClusterPcmPiWriteCutV1 cut;
 	ClusterPageDataReceiptV1 *receipt;
+	ClusterKoDirectoryIoV3 io;
 	BufferTag tag;
 	if (out == NULL || *out != NULL || !cluster_pi_data_read_v1(job, &binding, &cut)
 		|| !cluster_page_wal_binding_shape_v1(&binding)
@@ -12075,14 +12076,24 @@ cluster_page_data_from_remote_v1(const ClusterPiDataV1 *job, ClusterPageDataRece
 				  binding.identity.blockno);
 	if (!BufferTagsEqual(&tag, &cut.holder.assertion.resource))
 		return false;
-	receipt = palloc0(sizeof(*receipt));
-	receipt->magic = UINT64_C(0x5047444154413031);
-	receipt->target.database_incarnation = binding.source.claim.database_incarnation;
-	receipt->target.identity = binding.identity;
-	receipt->target.version = binding.version;
-	receipt->wal = binding;
-	receipt->pi_cut = cut;
-	*out = receipt;
+	if (!cluster_ko_directory_io_begin_v3(binding.identity.locator, &io))
+		return false;
+	PG_TRY();
+	{
+		receipt = palloc0(sizeof(*receipt));
+		receipt->magic = UINT64_C(0x5047444154413031);
+		receipt->target.database_incarnation = binding.source.claim.database_incarnation;
+		receipt->target.identity = binding.identity;
+		receipt->target.version = binding.version;
+		receipt->wal = binding;
+		receipt->pi_cut = cut;
+		*out = receipt;
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
 	return true;
 }
 
@@ -12136,18 +12147,29 @@ cluster_page_data_from_notice_v1(const ClusterPiWritebackNoticeV1 *notice, uint3
 {
 	ClusterPiDataFactV1 fact;
 	ClusterPageDataReceiptV1 *receipt;
+	ClusterKoDirectoryIoV3 io;
 	if (out == NULL || *out != NULL || !cluster_pi_writeback_notice_read_v1(notice, index, &fact)
 		|| !cluster_page_data_fact_shape(&fact))
 		return false;
-	receipt = palloc0(sizeof(*receipt));
-	receipt->magic = UINT64_C(0x5047444154413031);
-	receipt->target.database_incarnation = fact.binding.source.claim.database_incarnation;
-	receipt->target.identity = fact.binding.identity;
-	receipt->target.version = fact.binding.version;
-	receipt->wal = fact.binding;
-	receipt->pi_cut = fact.write_cut;
-	receipt->storage_cut = fact.storage_cut;
-	*out = receipt;
+	if (!cluster_ko_directory_io_begin_v3(fact.binding.identity.locator, &io))
+		return false;
+	PG_TRY();
+	{
+		receipt = palloc0(sizeof(*receipt));
+		receipt->magic = UINT64_C(0x5047444154413031);
+		receipt->target.database_incarnation = fact.binding.source.claim.database_incarnation;
+		receipt->target.identity = fact.binding.identity;
+		receipt->target.version = fact.binding.version;
+		receipt->wal = fact.binding;
+		receipt->pi_cut = fact.write_cut;
+		receipt->storage_cut = fact.storage_cut;
+		*out = receipt;
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
 	return true;
 }
 
@@ -12580,35 +12602,52 @@ cluster_page_structural_from_ko_v2(uint32 slot, uint64 serial,
 	ClusterSpaceStructureChange decoded;
 	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], actual[sizeof(wal)];
 	BufferTag tag;
+	ClusterKoDirectoryIoV3 io;
+	volatile bool complete = false;
 	if (out == NULL || *out != NULL || !rf_page_identity_valid_v1(page)
-		|| (page->forknum != MAIN_FORKNUM && page->forknum != VISIBILITYMAP_FORKNUM)
-		|| !cluster_ko_shared_structure_observation_v2(slot, serial, &value.terminal, wal, sizeof(wal))
-		|| !cluster_space_structure_wal_decode(wal, sizeof(wal), &decoded)
-		|| (decoded.identity.action != CLUSTER_SPACE_WAL_TRUNCATE
-			&& decoded.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE)
-		|| !cluster_page_structural_record_v1(&value.terminal, decoded.identity.expected.incarnation,
-			plan, &value.change)
-		|| !cluster_space_structure_wal_encode(&value.change, actual, sizeof(actual))
-		|| memcmp(wal, actual, sizeof(wal)) != 0
-		|| !cluster_page_structural_page_covered(&value.terminal, &value.change, page, plan))
+		|| (page->forknum != MAIN_FORKNUM && page->forknum != VISIBILITYMAP_FORKNUM))
 		return false;
-	value.magic = UINT64_C(0x5047535452454332);
-	value.owner = CurrentResourceOwner;
-	value.pid = getpid();
-	value.slot = slot;
-	value.serial = serial;
-	value.page = *page;
-	value.plan = plan;
-	InitBufferTag(&tag, &page->locator, page->forknum, page->blockno);
-	if (!cluster_pcm_lock_pi_write_snapshot_v1(tag, &value.write_cut)
-		&& !cluster_pcm_lock_pi_storage_snapshot_v1(tag, &value.storage_cut))
+	if (!cluster_ko_directory_io_begin_v3(page->locator, &io))
 		return false;
-	if (!cluster_page_structural_pi_proof_v2(&value, &x, &s))
-		return false;
-	receipt = palloc(sizeof(*receipt));
-	*receipt = value;
-	*out = receipt;
-	return true;
+	/* Observation, proof and publication belong to this same finite call. */
+	PG_TRY();
+	{
+		do {
+			if (!cluster_ko_shared_structure_observation_v2(slot, serial, &value.terminal, wal, sizeof(wal))
+				|| !cluster_space_structure_wal_decode(wal, sizeof(wal), &decoded)
+				|| (decoded.identity.action != CLUSTER_SPACE_WAL_TRUNCATE
+					&& decoded.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE)
+				|| !cluster_page_structural_record_v1(&value.terminal, decoded.identity.expected.incarnation,
+					plan, &value.change)
+				|| !cluster_space_structure_wal_encode(&value.change, actual, sizeof(actual))
+				|| memcmp(wal, actual, sizeof(wal)) != 0
+				|| !cluster_page_structural_page_covered(&value.terminal, &value.change, page, plan))
+				break;
+			value.magic = UINT64_C(0x5047535452454332);
+			value.owner = CurrentResourceOwner;
+			value.pid = getpid();
+			value.slot = slot;
+			value.serial = serial;
+			value.page = *page;
+			value.plan = plan;
+			InitBufferTag(&tag, &page->locator, page->forknum, page->blockno);
+			if (!cluster_pcm_lock_pi_write_snapshot_v1(tag, &value.write_cut)
+				&& !cluster_pcm_lock_pi_storage_snapshot_v1(tag, &value.storage_cut))
+				break;
+			if (!cluster_page_structural_pi_proof_v2(&value, &x, &s))
+				break;
+			receipt = palloc(sizeof(*receipt));
+			*receipt = value;
+			*out = receipt;
+			complete = true;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
+	return complete;
 }
 
 bool
@@ -12623,41 +12662,58 @@ cluster_page_structural_from_notice_v2(const ClusterPiWritebackNoticeV1 *notice,
 	ClusterPcmPiWriteCutV1 x;
 	ClusterPcmPiStorageCutV1 storage;
 	uint8 expected[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], actual[sizeof(expected)];
+	ClusterKoDirectoryIoV3 io;
+	volatile bool complete = false;
 	if (out == NULL || *out != NULL || plan == NULL || MyBackendType != B_BG_WRITER
 		|| CurrentResourceOwner == NULL || CritSectionCount != 0
 		|| !cluster_pi_writeback_structural_notice_read_v2(notice, index, &value.notice_revision,
 														   &fact)
-		|| fact.kind != CLUSTER_PI_WRITEBACK_STRUCTURAL_V2
-		|| !cluster_space_structure_wal_encode(&s->change, expected, sizeof(expected))
-		|| !cluster_page_structural_record_v1(
-			&s->terminal.binding, s->change.identity.expected.incarnation, plan, &value.change)
-		|| !cluster_space_structure_wal_encode(&value.change, actual, sizeof(actual))
-		|| memcmp(expected, actual, sizeof(expected)) != 0)
+		|| fact.kind != CLUSTER_PI_WRITEBACK_STRUCTURAL_V2)
 		return false;
-	value.magic = UINT64_C(0x5047535452454332);
-	value.owner = CurrentResourceOwner;
-	value.pid = getpid();
-	value.plan = plan;
-	value.notice = notice;
-	value.notice_index = index;
-	value.durability_flags = s->durability_flags;
-	value.ko = s->ko;
-	value.terminal = s->terminal.binding;
-	value.write_cut = s->terminal.write_cut;
-	value.storage_cut = s->terminal.storage_cut;
-	tag = value.write_cut.binding_generation != 0 ? &value.write_cut.holder.assertion.resource
-												  : &value.storage_cut.resource;
-	value.page = value.terminal.identity;
-	value.page.locator = BufTagGetRelFileLocator(tag);
-	value.page.forknum = tag->forkNum;
-	value.page.blockno = tag->blockNum;
-	if (!cluster_page_structural_page_covered(&value.terminal, &value.change, &value.page, plan)
-		|| !cluster_page_structural_pi_proof_v2(&value, &x, &storage))
+	if (!cluster_ko_directory_io_begin_v3(s->terminal.binding.identity.locator, &io))
 		return false;
-	receipt = palloc(sizeof(*receipt));
-	*receipt = value;
-	*out = receipt;
-	return true;
+	/* Observation, proof and publication belong to this same finite call. */
+	PG_TRY();
+	{
+		do {
+			if (!cluster_space_structure_wal_encode(&s->change, expected, sizeof(expected))
+				|| !cluster_page_structural_record_v1(
+					&s->terminal.binding, s->change.identity.expected.incarnation, plan, &value.change)
+				|| !cluster_space_structure_wal_encode(&value.change, actual, sizeof(actual))
+				|| memcmp(expected, actual, sizeof(expected)) != 0)
+				break;
+			value.magic = UINT64_C(0x5047535452454332);
+			value.owner = CurrentResourceOwner;
+			value.pid = getpid();
+			value.plan = plan;
+			value.notice = notice;
+			value.notice_index = index;
+			value.durability_flags = s->durability_flags;
+			value.ko = s->ko;
+			value.terminal = s->terminal.binding;
+			value.write_cut = s->terminal.write_cut;
+			value.storage_cut = s->terminal.storage_cut;
+			tag = value.write_cut.binding_generation != 0 ? &value.write_cut.holder.assertion.resource
+														  : &value.storage_cut.resource;
+			value.page = value.terminal.identity;
+			value.page.locator = BufTagGetRelFileLocator(tag);
+			value.page.forknum = tag->forkNum;
+			value.page.blockno = tag->blockNum;
+			if (!cluster_page_structural_page_covered(&value.terminal, &value.change, &value.page, plan)
+				|| !cluster_page_structural_pi_proof_v2(&value, &x, &storage))
+				break;
+			receipt = palloc(sizeof(*receipt));
+			*receipt = value;
+			*out = receipt;
+			complete = true;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
+	return complete;
 }
 
 bool
