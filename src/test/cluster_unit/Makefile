@@ -2470,8 +2470,13 @@ test_cluster_space_copy_buffer.inc: $(top_srcdir)/src/backend/storage/buffer/buf
 	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_space_copy_create.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^CreateAndCopyRelationData\(/ { print "void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_space_copy_version: test_cluster_space_copy_version.c test_cluster_space_copy_buffer.inc \
-		test_cluster_heap_extend_page.inc unit_test.h \
+		test_cluster_space_copy_create.inc test_cluster_heap_extend_page.inc unit_test.h \
 		test_cluster_page_wal_product.o test_cluster_page_data_stable.o $(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		test_cluster_space_copy_catalog_product.o test_cluster_space_storage_product.o test_cluster_space_producer_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
@@ -4671,6 +4676,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_space_copy_create.inc test_cluster_space_copy_create.inc.tmp
 	rm -f test_cluster_data_sync_policy.inc test_cluster_sync_providers.inc \
 		test_cluster_sync_dispatch.inc test_cluster_sync_smgr.inc
 	rm -f test_cluster_tt_rollback_entry.inc

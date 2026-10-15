@@ -11356,14 +11356,49 @@ CreateAndCopyRelationData(RelFileLocator src_rlocator,
 #endif
 		if (smgrexists(smgropen(src_rlocator, InvalidBackendId), forkNum))
 		{
-			smgrcreate(smgropen(dst_rlocator, InvalidBackendId), forkNum, false);
+#ifdef USE_PGRAC_CLUSTER
+			uint64 fork_serial = 0;
+			bool fork_scoped = cluster_enabled && cluster_shared_config
+							   && cluster_interconnect_tier == CLUSTER_IC_TIER_1
+							   && !RecoveryInProgress()
+							   && cluster_smgr_which_for(dst_rlocator, InvalidBackendId) == 1;
 
-			/*
+			/* MAIN creation and the data copy have separate finite owners.
+			 * Keep this native fork constructor visible between those calls. */
+			if (fork_scoped && !cluster_ko_create_begin_v3(dst_rlocator, &fork_serial))
+				elog(ERROR, "auxiliary fork creation conflicts with object drain");
+			PG_TRY();
+			{
+				if (fork_serial != 0
+					&& !cluster_ko_create_write_begin_v3(dst_rlocator, fork_serial))
+					elog(ERROR, "auxiliary fork creation lost its original owner");
+#endif
+				smgrcreate(smgropen(dst_rlocator, InvalidBackendId), forkNum, false);
+
+				/*
 			 * WAL log creation if the relation is persistent, or this is the
 			 * init fork of an unlogged relation.
 			 */
-			if (permanent || forkNum == INIT_FORKNUM)
-				log_smgrcreate(&dst_rlocator, forkNum);
+#ifdef USE_PGRAC_CLUSTER
+				if (fork_serial != 0 && (permanent || forkNum == INIT_FORKNUM)
+					&& !cluster_ko_create_write_begin_v3(dst_rlocator, fork_serial))
+					elog(ERROR, "auxiliary fork creation lost its owner before WAL");
+#endif
+				if (permanent || forkNum == INIT_FORKNUM)
+					log_smgrcreate(&dst_rlocator, forkNum);
+#ifdef USE_PGRAC_CLUSTER
+			}
+			PG_CATCH();
+			{
+				cluster_ko_create_abort_v3(fork_serial);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+			/* File/WAL obligations remain with their original owners. The
+			 * following data-copy call must qualify its own finite scope. */
+			if (fork_serial != 0 && !cluster_ko_create_end_v3(fork_serial, true))
+				elog(ERROR, "auxiliary fork creation cannot retire its original owner");
+#endif
 
 			/* Copy a fork's data, block by block. */
 			RelationCopyStorageUsingBuffer(src_rlocator, dst_rlocator, forkNum,
