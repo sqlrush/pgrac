@@ -128,9 +128,13 @@ static bool ko_offer_ack_fixture(const ClusterPiWritebackJobV1 *, uint32, uint64
 								 ClusterWalWriterToken *);
 static bool ko_drop_poll_fixture(uint32 *, bool *);
 static bool (*ko_drop_poll_boundary)(uint32 *, bool *);
+static bool ko_local_closed_fixture(RelFileLocator, uint64, uint64 *);
+static bool ko_local_revision_fixture(uint64);
 #define cluster_smgr_drop_work_poll ko_drop_poll_fixture
 #define cluster_pi_writeback_structure_offer_read_v2 ko_offer_notice_fixture
 #define cluster_pi_writeback_structure_offer_ack_v2 ko_offer_ack_fixture
+#define cluster_pi_writeback_local_relation_closed_v3 ko_local_closed_fixture
+#define cluster_pi_writeback_local_revision_current_v3 ko_local_revision_fixture
 #include "../../backend/cluster/cluster_ko_lock.c"
 #undef cluster_smgr_drop_work_poll
 #undef cluster_pi_writeback_structure_offer_read_v2
@@ -291,9 +295,12 @@ static bool local_writeback_closed;
 static uint64 local_writeback_revision;
 static uint32 local_relation_scan_input;
 static unsigned local_relation_scan_drift;
+static void (*relation_gate_sample_hook)(void);
 bool
 cluster_pcm_lock_resource_x_gate_snapshot(ResourceXGateSnapshot *out)
 {
+	if (relation_gate_sample_hook != NULL)
+		relation_gate_sample_hook();
 	if (!relation_gate_ok)
 		return false;
 	memset(out, 0, sizeof(*out));
@@ -356,6 +363,8 @@ cluster_pi_writeback_local_revision_current_v3(uint64 revision)
 {
 	return revision != 0 && revision != UINT64_MAX && revision == local_writeback_revision;
 }
+#undef cluster_pi_writeback_local_relation_closed_v3
+#undef cluster_pi_writeback_local_revision_current_v3
 
 static void (*exit_callback)(int, Datum);
 static ResourceReleaseCallback resource_callback;
@@ -1263,6 +1272,7 @@ reset_test(void)
 	local_writeback_revision = 1;
 	local_relation_scan_calls = local_relation_scan_advance = 0;
 	local_relation_scan_input = local_relation_scan_drift = 0;
+	relation_gate_sample_hook = NULL;
 	relation_gate_freeze = 3;
 	relation_gate_ok = true;
 	IsUnderPostmaster = false;

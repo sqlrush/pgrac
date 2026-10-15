@@ -138,7 +138,8 @@ enum WorkFault {
 	WORK_FINISH,
 	WORK_CUT_AFTER_TRUNCATE,
 	WORK_CUT_AFTER_SYNC,
-	WORK_CUT_AFTER_UNLINK
+	WORK_CUT_AFTER_UNLINK,
+	WORK_LOCAL_ACK_AFTER_OPEN
 };
 static enum WorkFault work_fault;
 static bool work_unknown_on_failure;
@@ -153,6 +154,10 @@ work_open(const char *path, int flags, ...)
 {
 	int fd = open(path, flags, 0600);
 	opens++;
+	if (work_fault == WORK_LOCAL_ACK_AFTER_OPEN) {
+		local_writeback_revision++;
+		local_writeback_closed = false;
+	}
 	if (fd >= 0) {
 		if (fd >= lengthof(work_fds))
 			abort();
@@ -337,8 +342,29 @@ prepare_files(const ClusterSpaceStructureChange *change)
 	}
 }
 
+static void
+prepare_v3_postcommit(void)
+{
+	ClusterKoCompletionV2 *claimed = NULL;
+
+	postcommit_owner = v3_native_structure_owner(CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+	UT_ASSERT(cluster_ko_shared_claim_structure(&space_identity, CLUSTER_SPACE_WAL_TOMBSTONE,
+											  &claimed));
+	UT_ASSERT(claimed == postcommit_owner);
+	v3_structure_record(true, space_identity.operation, &postcommit_binding, postcommit_wal);
+	UT_ASSERT(cluster_ko_shared_observe_space_v2(postcommit_owner, &postcommit_binding,
+												 postcommit_wal, sizeof(postcommit_wal)));
+	postcommit_drop = true;
+	postcommit_error = postcommit_scope_changed = false;
+	postcommit_callback_error = postcommit_buffer_error = false;
+	postcommit_native_count = 1;
+	postcommit_storage_consumer = NULL;
+	postcommit_deletes = postcommit_phases = 0;
+	native_fork_unlinks = native_fork_closes = native_smgr_invalidations = 0;
+}
+
 static bool
-work_setup_impl(const char *name, bool native, bool stale)
+work_setup_impl(const char *name, unsigned native, bool stale)
 {
 	ClusterPageWalBindingV1 binding;
 	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
@@ -360,7 +386,10 @@ work_setup_impl(const char *name, bool native, bool stale)
 	external_fds = 0;
 	external_fd_limit = 1024;
 	if (native) {
-		prepare_postcommit(true);
+		if (native == 2)
+			prepare_v3_postcommit();
+		else
+			prepare_postcommit(true);
 		binding = postcommit_binding;
 		memcpy(wal, postcommit_wal, sizeof(wal));
 	} else
@@ -404,6 +433,31 @@ work_setup_impl(const char *name, bool native, bool stale)
 	return true;
 }
 
+/* Real native v3 owner/marker and retained file executor. PCM/WB census,
+ * GES, SPACE durability and native buffer cleanup remain explicit fixtures. */
+static bool
+work_setup_v3(const char *name)
+{
+	if (!work_setup_impl(name, 2, false))
+		return false;
+	/* v3 retains its AX context independently. Select the promoted native
+	 * continuation, not the earlier origin transport slot. */
+	for (work_slot = 0; work_slot < CLUSTER_KO_SHARED_CAPACITY; work_slot++)
+		if (storage.contexts[work_slot].structure_owned
+			&& storage.contexts[work_slot].structure_drop_pending)
+			break;
+	if (work_slot == CLUSTER_KO_SHARED_CAPACITY) {
+		UT_ASSERT(false);
+		return false;
+	}
+	UT_ASSERT(storage.contexts[work_slot].v3);
+	UT_ASSERT(cluster_ko_directory_drop_retired_v3(postcommit_binding.identity.locator));
+	local_scan_rel_number = postcommit_binding.identity.locator.relNumber;
+	local_relation_scan_calls = 0;
+	local_relation_scan_advance = 128;
+	return true;
+}
+
 static bool
 work_setup(const char *name)
 {
@@ -444,6 +498,164 @@ assert_finished(void)
 	UT_ASSERT_EQ(forgets, MAX_FORKNUM);
 	UT_ASSERT_EQ(closes, MAX_FORKNUM + 2);
 	UT_ASSERT_EQ(external_fds, 0);
+}
+
+static void
+assert_no_drop_io(void)
+{
+	UT_ASSERT_EQ(forgets + opens + truncates + main_syncs + dir_syncs + unlinks + closes, 0);
+	UT_ASSERT_EQ(external_fds, 0);
+	UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
+}
+
+UT_TEST(test_v3_origin_local_pending_invalid_or_partial_never_opens_files)
+{
+	const ClusterPcmPiRelationScanV2 results[] = {
+		CLUSTER_PCM_PI_RELATION_PENDING, CLUSTER_PCM_PI_RELATION_INVALID,
+		CLUSTER_PCM_PI_RELATION_MORE
+	};
+	for (unsigned i = 0; i < lengthof(results); i++) {
+		char name[64];
+		snprintf(name, sizeof(name), "v3_local_%u", i);
+		if (!work_setup_v3(name))
+			return;
+		local_relation_scan_result = results[i];
+		UT_ASSERT(!poll_work());
+		assert_no_drop_io();
+		UT_ASSERT_EQ(local_relation_scan_calls, 1);
+		UT_ASSERT_EQ(local_relation_scan_input, 0);
+		UT_ASSERT(ko_drop_work[work_slot] != NULL);
+		local_relation_scan_result = CLUSTER_PCM_PI_RELATION_EMPTY;
+		UT_ASSERT(poll_work());
+		assert_finished();
+		UT_ASSERT_EQ(local_relation_scan_calls, 2);
+	}
+}
+
+UT_TEST(test_v3_origin_scan_retains_prefix_only_for_same_cut)
+{
+	if (!work_setup_v3("v3_prefix"))
+		return;
+	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_MORE;
+	UT_ASSERT(!poll_work());
+	UT_ASSERT_EQ(local_relation_scan_input, 0);
+	UT_ASSERT(!poll_work());
+	UT_ASSERT_EQ(local_relation_scan_input, 128);
+	relation_gate_freeze++;
+	UT_ASSERT(!poll_work());
+	UT_ASSERT_EQ(local_relation_scan_input, 0);
+	(void)pg_atomic_fetch_add_u64(&storage.peer_admission_revision, 1);
+	UT_ASSERT(!poll_work());
+	UT_ASSERT_EQ(local_relation_scan_input, 0);
+	assert_no_drop_io();
+	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_EMPTY;
+	UT_ASSERT(poll_work());
+	UT_ASSERT_EQ(local_relation_scan_input, 128);
+	UT_ASSERT_EQ(local_relation_scan_calls, 5);
+	assert_finished();
+}
+
+UT_TEST(test_v3_origin_unaccepted_physical_ack_blocks_deletion)
+{
+	if (!work_setup_v3("v3_ack"))
+		return;
+	local_writeback_closed = false;
+	UT_ASSERT(!poll_work());
+	assert_no_drop_io();
+	local_writeback_closed = true;
+	local_writeback_revision++;
+	UT_ASSERT(poll_work());
+	UT_ASSERT_EQ(local_relation_scan_input, 0);
+	assert_finished();
+}
+
+static unsigned origin_gate_samples;
+static void
+origin_gate_changes_at_new_scan(void)
+{
+	/* The old prefix sample can be current, then change before a new scan
+	 * captures its cut. It must not relabel that prefix with the new cut. */
+	if (++origin_gate_samples == 2)
+		relation_gate_freeze++;
+}
+
+UT_TEST(test_v3_origin_cannot_carry_old_prefix_into_new_sample)
+{
+	if (!work_setup_v3("v3_prefix_race"))
+		return;
+	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_MORE;
+	UT_ASSERT(!poll_work());
+	origin_gate_samples = 0;
+	relation_gate_sample_hook = origin_gate_changes_at_new_scan;
+	UT_ASSERT(!poll_work());
+	relation_gate_sample_hook = NULL;
+	UT_ASSERT_EQ(origin_gate_samples, 3);
+	UT_ASSERT_EQ(local_relation_scan_input, 0);
+	assert_no_drop_io();
+	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_EMPTY;
+	UT_ASSERT(poll_work());
+	assert_finished();
+}
+
+UT_TEST(test_v3_origin_census_drift_error_and_bad_progress_expire_hint)
+{
+	for (unsigned drift = 1; drift <= 6; drift++) {
+		char name[64];
+		volatile bool caught = false;
+		snprintf(name, sizeof(name), "v3_scan_drift_%u", drift);
+		if (!work_setup_v3(name))
+			return;
+		local_relation_scan_result = CLUSTER_PCM_PI_RELATION_MORE;
+		UT_ASSERT(!poll_work());
+		local_relation_scan_result = CLUSTER_PCM_PI_RELATION_EMPTY;
+		local_relation_scan_drift = drift <= 4 ? drift : 0;
+		if (drift > 4)
+			local_relation_scan_advance = drift == 5 ? 0 : 129;
+		PG_TRY(); { UT_ASSERT(!poll_work()); }
+		PG_CATCH(); { caught = true; }
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, drift == 4);
+		assert_no_drop_io();
+		local_relation_scan_drift = 0;
+		local_relation_scan_advance = 128;
+		relation_gate_ok = true;
+		UT_ASSERT(poll_work());
+		UT_ASSERT_EQ(local_relation_scan_input, 0);
+		assert_finished();
+	}
+}
+
+UT_TEST(test_v3_origin_rechecks_local_ack_with_retained_directory_fd)
+{
+	if (!work_setup_v3("v3_ack_after_open"))
+		return;
+	work_fault = WORK_LOCAL_ACK_AFTER_OPEN;
+	UT_ASSERT(!poll_work());
+	UT_ASSERT_EQ(opens, 1);
+	UT_ASSERT_EQ(external_fds, 1);
+	UT_ASSERT_EQ(truncates + main_syncs + dir_syncs + unlinks + closes, 0);
+	UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
+	UT_ASSERT(!poll_work());
+	UT_ASSERT_EQ(opens, 1);
+	UT_ASSERT_EQ(local_relation_scan_input, 0);
+	work_fault = WORK_OK;
+	local_writeback_closed = true;
+	UT_ASSERT(poll_work());
+	UT_ASSERT_EQ(opens, MAX_FORKNUM + 2);
+	assert_finished();
+}
+
+UT_TEST(test_v3_origin_finite_local_owner_still_blocks_empty_census)
+{
+	if (!work_setup_v3("v3_finite"))
+		return;
+	storage.cleaner_work[0].used = true;
+	storage.cleaner_work[0].locator = postcommit_binding.identity.locator;
+	UT_ASSERT(!poll_work());
+	assert_no_drop_io();
+	storage.cleaner_work[0].used = false;
+	UT_ASSERT(poll_work());
+	assert_finished();
 }
 
 UT_TEST(test_work_success_keeps_main_and_structure_obligation)
@@ -1195,7 +1407,14 @@ UT_TEST(test_work_executor_process_exit_does_not_redo_partial_io)
 int
 main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(35);
+	UT_RUN(test_v3_origin_local_pending_invalid_or_partial_never_opens_files);
+	UT_RUN(test_v3_origin_scan_retains_prefix_only_for_same_cut);
+	UT_RUN(test_v3_origin_unaccepted_physical_ack_blocks_deletion);
+	UT_RUN(test_v3_origin_cannot_carry_old_prefix_into_new_sample);
+	UT_RUN(test_v3_origin_census_drift_error_and_bad_progress_expire_hint);
+	UT_RUN(test_v3_origin_rechecks_local_ack_with_retained_directory_fd);
+	UT_RUN(test_v3_origin_finite_local_owner_still_blocks_empty_census);
 	UT_RUN(test_failed_sync_abandons_original_fds_and_requires_recovery);
 	UT_RUN(test_replaced_cut_cleanup_closes_each_original_fd_once);
 	UT_RUN(test_known_failure_is_not_hidden_by_unavailable_formation);

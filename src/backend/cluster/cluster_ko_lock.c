@@ -378,6 +378,12 @@ struct ClusterKoDropWorkV2 {
 	uint32 slot;
 	Size storage_bytes;
 	bool abandoned;
+	/* Only a hint for this original CP work, never a new physical result. */
+	bool local_scan_complete;
+	uint32 local_scan_cursor;
+	uint64 local_scan_revision;
+	uint64 local_writeback_revision;
+	ResourceXGateSnapshot local_scan_gate;
 	ClusterKoSharedContext context;
 };
 static ClusterKoDropWorkV2 *ko_drop_work[CLUSTER_KO_SHARED_CAPACITY];
@@ -4089,8 +4095,8 @@ ko_drop_work_owned(const ClusterKoDropWorkV2 *work)
 		   && work->owner == CurrentResourceOwner;
 }
 
-bool
-cluster_ko_shared_drop_work_revalidate_v2(const ClusterKoDropWorkV2 *work)
+static bool
+ko_drop_work_context_current(const ClusterKoDropWorkV2 *work)
 {
 	ClusterKoSharedContext current;
 	bool exact;
@@ -4110,6 +4116,100 @@ cluster_ko_shared_drop_work_revalidate_v2(const ClusterKoDropWorkV2 *work)
 	exact = memcmp(&current, &ko_state->contexts[slot], sizeof(current)) == 0;
 	SpinLockRelease(&ko_state->shared_lock);
 	return exact;
+}
+
+static bool
+ko_drop_work_local_sample_current(const ClusterKoDropWorkV2 *work)
+{
+	ResourceXGateSnapshot gate;
+	bool current;
+
+	if (work->local_scan_revision == 0 || work->local_scan_revision == UINT64_MAX
+		|| !cluster_pcm_lock_resource_x_gate_snapshot(&gate)
+		|| gate.phase != RESOURCE_X_GATE_OPEN || gate.formation != work->context.request.epoch
+		|| memcmp(&gate, &work->local_scan_gate, sizeof(gate)) != 0)
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	current = pg_atomic_read_u64(&ko_state->peer_admission_revision) == work->local_scan_revision
+		&& !ko_cleaner_pending_locked(work->context.request.key.locator)
+		&& !ko_extend_pending_locked(work->context.request.key.locator);
+	SpinLockRelease(&ko_state->shared_lock);
+	return current && (!work->local_scan_complete
+		|| cluster_pi_writeback_local_revision_current_v3(work->local_writeback_revision));
+}
+
+/* The native producer already persisted the final SPACE and retired its
+ * buffers. That alone does not retire local PI/protocol or ACK-send owners.
+ * Resume their existing local-only census without waiting for remote master
+ * directory completion. No KO lock spans PCM, and ERROR consumes the hint. */
+static void
+ko_drop_work_local_scan(ClusterKoDropWorkV2 *work)
+{
+	ResourceXGateSnapshot gate, after;
+	ResourceXGateSnapshot previous_gate = work->local_scan_gate;
+	ClusterPcmPiRelationScanV2 scan;
+	uint64 revision, writeback_revision = 0;
+	uint64 previous_revision = work->local_scan_revision;
+	uint32 start = 0, cursor;
+	bool same;
+
+	if (!work->context.v3)
+		return;
+	same = ko_drop_work_local_sample_current(work);
+	if (same && work->local_scan_complete)
+		return;
+	if (same)
+		start = work->local_scan_cursor;
+	work->local_scan_complete = false;
+	work->local_scan_cursor = 0;
+	work->local_scan_revision = 0;
+	work->local_writeback_revision = 0;
+	memset(&work->local_scan_gate, 0, sizeof(work->local_scan_gate));
+	revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+	if (revision == 0 || revision == UINT64_MAX
+		|| !cluster_pcm_lock_resource_x_gate_snapshot(&gate)
+		|| gate.phase != RESOURCE_X_GATE_OPEN || gate.formation != work->context.request.epoch)
+		return;
+	/* The cut may change between validating the old prefix and sampling
+	 * this attempt. Never relabel that prefix with the replacement cut. */
+	if (revision != previous_revision || memcmp(&gate, &previous_gate, sizeof(gate)) != 0)
+		start = 0;
+	cursor = start;
+	scan = cluster_pcm_lock_ko_local_relation_scan_v3(work->context.request.key.locator,
+													  work->context.request.epoch, 128, &cursor);
+	if ((scan != CLUSTER_PCM_PI_RELATION_MORE && scan != CLUSTER_PCM_PI_RELATION_EMPTY)
+		|| cursor <= start || cursor - start > 128)
+		return;
+	if (scan == CLUSTER_PCM_PI_RELATION_EMPTY
+		&& !cluster_pi_writeback_local_relation_closed_v3(work->context.request.key.locator,
+															 work->context.request.epoch,
+															 &writeback_revision))
+		return;
+	if (!ko_drop_work_context_current(work)
+		|| !cluster_pcm_lock_resource_x_gate_snapshot(&after)
+		|| memcmp(&gate, &after, sizeof(gate)) != 0)
+		return;
+	SpinLockAcquire(&ko_state->shared_lock);
+	if (pg_atomic_read_u64(&ko_state->peer_admission_revision) == revision
+		&& !ko_cleaner_pending_locked(work->context.request.key.locator)
+		&& !ko_extend_pending_locked(work->context.request.key.locator)
+		&& (scan != CLUSTER_PCM_PI_RELATION_EMPTY
+			|| cluster_pi_writeback_local_revision_current_v3(writeback_revision))) {
+		work->local_scan_cursor = cursor;
+		work->local_scan_revision = revision;
+		work->local_scan_gate = gate;
+		work->local_writeback_revision = writeback_revision;
+		work->local_scan_complete = scan == CLUSTER_PCM_PI_RELATION_EMPTY;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+}
+
+bool
+cluster_ko_shared_drop_work_revalidate_v2(const ClusterKoDropWorkV2 *work)
+{
+	return ko_drop_work_context_current(work)
+		&& (!work->context.v3
+			|| (work->local_scan_complete && ko_drop_work_local_sample_current(work)));
 }
 
 void *
@@ -4183,7 +4283,7 @@ cluster_ko_shared_drop_work_begin_v2(uint32 *cursor, Size storage_bytes, Cluster
 
 		if (work != NULL) {
 			if (work->storage_bytes != storage_bytes
-				|| !cluster_ko_shared_drop_work_revalidate_v2(work)) {
+				|| !ko_drop_work_context_current(work)) {
 				ko_native_deferred(&work->context, &ko_drop_report_serial[slot],
 								   work->abandoned ? "DROP_RECOVERY_REQUIRED" : "DROP_CUT");
 				continue;
@@ -4221,6 +4321,10 @@ cluster_ko_shared_drop_work_begin_v2(uint32 *cursor, Size storage_bytes, Cluster
 				continue;
 			}
 		}
+		/* One selected work and at most 128 slots per original poll. Pending
+		 * local closure advances the outer cursor, but state/read/revalidate
+		 * still refuse all provider effects. A later tick resumes this owner. */
+		ko_drop_work_local_scan(work);
 		*out = work;
 		*cursor = slot + 1;
 		return true;
