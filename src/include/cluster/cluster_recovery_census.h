@@ -40,6 +40,7 @@ typedef enum ClusterRecoveryCensusPhase {
 	CLUSTER_RECOVERY_CENSUS_MX_PHYSICAL,
 	CLUSTER_RECOVERY_CENSUS_MX_COMPARE,
 	CLUSTER_RECOVERY_CENSUS_XACT_COMPARE,
+	CLUSTER_RECOVERY_CENSUS_TERMINALS,
 	CLUSTER_RECOVERY_CENSUS_RELMAP_PHYSICAL,
 	CLUSTER_RECOVERY_CENSUS_EFFECTS,
 	CLUSTER_RECOVERY_CENSUS_FINAL_TT,
@@ -58,7 +59,8 @@ typedef enum ClusterRecoveryCensusKind {
 	CLUSTER_RECOVERY_CENSUS_TX_TARGET,
 	CLUSTER_RECOVERY_CENSUS_SLRU_SLOT,
 	CLUSTER_RECOVERY_CENSUS_XACT_MATCH,
-	CLUSTER_RECOVERY_CENSUS_RELMAP
+	CLUSTER_RECOVERY_CENSUS_RELMAP,
+	CLUSTER_RECOVERY_CENSUS_TERMINAL
 } ClusterRecoveryCensusKind;
 
 /* An edge from an observed TX record to the original physical/WAL union.
@@ -75,6 +77,15 @@ typedef struct ClusterRecoveryCensusTarget {
 	bool target_physical, target_extent_present, space_physical;
 } ClusterRecoveryCensusTarget;
 
+/* Raw join to the original physical TT. A reused/missing slot and unequal
+ * terminal bytes remain obligations; even equality grants no apply/OPEN. */
+typedef struct ClusterRecoveryCensusTerminal {
+	ClusterRecoveryTerminalEntry terminal;
+	TTSlot physical;
+	uint32 physical_generation;
+	bool physical_present, identity_matches, raw_terminal_matches;
+} ClusterRecoveryCensusTerminal;
+
 typedef struct ClusterRecoveryCensusEntry {
 	ClusterRecoveryCensusKind kind;
 	union {
@@ -88,6 +99,7 @@ typedef struct ClusterRecoveryCensusEntry {
 		ClusterRecoverySlruEntry slru;
 		ClusterRecoveryXactJoinEntry xact_compare;
 		ClusterRecoveryRelmapEntry relmap;
+		ClusterRecoveryCensusTerminal terminal;
 	} value;
 } ClusterRecoveryCensusEntry;
 
@@ -105,11 +117,14 @@ typedef struct ClusterRecoveryCensusDiag {
 	ClusterRecoveryMultixactJoinResult join_result;
 	ClusterRecoveryXactJoinResult xact_result;
 	ClusterRecoveryNativeInventoryResult inventory_result;
+	ClusterRecoveryTerminalResult terminal_result;
 	ClusterRecoveryNativeInventoryDiag inventory;
 	uint64 tt_slots, tx_records, relation_entries, mx_entries, mx_comparisons, effects;
 	uint64 slru_entries;
 	uint64 xact_comparisons;
 	uint64 relmap_entries;
+	uint64 terminal_entries, terminal_missing, terminal_identity_mismatches,
+		terminal_state_mismatches;
 	uint64 tx_targets, tx_target_missing, tx_target_short, tx_space_missing;
 } ClusterRecoveryCensusDiag;
 
@@ -142,6 +157,9 @@ extern ClusterRecoveryCensusResult cluster_recovery_census_begin(ClusterWalInput
  * physical native relmap copies and every mapped fork edge, and native
  * effects. Primary/backup map observations never choose an authority or
  * complete publication; missing fork edges remain explicit obligations.
+ * Every retained terminal also joins its exact or same-source BIND identity
+ * to the original physical TT; unresolved identities and reused/status/SCN
+ * differences remain explicit. No terminal record overrides another.
  * Transaction comparisons retain raw status/parent differences and grant
  * no era, terminal or complete parent-chain proof.
  * Then repeat saved TT headers, the entire physical ROOT and

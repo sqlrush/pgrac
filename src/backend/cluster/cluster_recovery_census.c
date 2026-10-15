@@ -393,11 +393,60 @@ census_step(ClusterRecoveryCensus *census, ClusterRecoveryCensusEntry *out)
 			return census_entry(out, CLUSTER_RECOVERY_CENSUS_XACT_MATCH);
 		}
 		if (d->xact_result == CLUSTER_RECOVERY_XACT_JOIN_DRAINED)
-			d->phase = CLUSTER_RECOVERY_CENSUS_RELMAP_PHYSICAL;
+			d->phase = CLUSTER_RECOVERY_CENSUS_TERMINALS;
 		if (d->xact_result == CLUSTER_RECOVERY_XACT_JOIN_MORE
 			|| d->xact_result == CLUSTER_RECOVERY_XACT_JOIN_DRAINED)
 			return CLUSTER_RECOVERY_CENSUS_MORE;
 		break;
+	case CLUSTER_RECOVERY_CENSUS_TERMINALS: {
+		ClusterRecoveryCensusTerminal *terminal = &out->value.terminal;
+		ClusterRecoveryTxnKey *key = &terminal->terminal.transaction;
+		d->terminal_result = cluster_recovery_native_inventory_terminal_step(
+			census->inventory, &terminal->terminal, &d->inventory);
+		if (d->terminal_result == CLUSTER_RECOVERY_TERMINAL_ENTRY) {
+			uint8 digest[32];
+			if (!cluster_recovery_root_set_digest(census->roots, digest))
+				break;
+			if (terminal->terminal.identity == CLUSTER_RECOVERY_TERMINAL_EXACT
+				|| terminal->terminal.identity == CLUSTER_RECOVERY_TERMINAL_BOUND) {
+				const UndoSegmentHeaderData *header;
+				if (key->system_identifier != census->system_identifier
+					|| key->database_incarnation != census->database_incarnation
+					|| key->slot_offset >= TT_SLOTS_PER_SEGMENT)
+					break;
+				header = cluster_recovery_undo_store_header(census->undo, key->segment_id);
+				if (header == NULL)
+					d->terminal_missing++;
+				else {
+					terminal->physical_present = true;
+					terminal->physical_generation = header->wrap_count;
+					terminal->physical = header->tt_slots[key->slot_offset];
+					terminal->identity_matches = header->owner_instance == key->origin_node_id + 1
+												 && header->segment_id == key->segment_id
+												 && header->wrap_count == key->segment_generation
+												 && terminal->physical.xid == key->xid
+												 && terminal->physical.wrap == key->slot_wrap;
+					terminal->raw_terminal_matches
+						= terminal->identity_matches
+						  && terminal->physical.status == terminal->terminal.status
+						  && terminal->physical.commit_scn == terminal->terminal.scn;
+					if (!terminal->identity_matches)
+						d->terminal_identity_mismatches++;
+					else if (!terminal->raw_terminal_matches)
+						d->terminal_state_mismatches++;
+				}
+			}
+			/* Equality does not discharge the record's effects or lifecycle. */
+			d->terminal_entries++;
+			return census_entry(out, CLUSTER_RECOVERY_CENSUS_TERMINAL);
+		}
+		if (d->terminal_result == CLUSTER_RECOVERY_TERMINAL_DRAINED)
+			d->phase = CLUSTER_RECOVERY_CENSUS_RELMAP_PHYSICAL;
+		if (d->terminal_result == CLUSTER_RECOVERY_TERMINAL_MORE
+			|| d->terminal_result == CLUSTER_RECOVERY_TERMINAL_DRAINED)
+			return CLUSTER_RECOVERY_CENSUS_MORE;
+		break;
+	}
 	case CLUSTER_RECOVERY_CENSUS_RELMAP_PHYSICAL:
 		if (census->relmap == NULL)
 			d->relmap_result = cluster_recovery_relmap_scan_begin(

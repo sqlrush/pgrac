@@ -7,6 +7,7 @@
 static unsigned owned_target_mode;
 static unsigned owned_clog_fault;
 static bool owned_native_slru;
+static bool owned_terminals;
 static void owned_slru_files(int fd, bool create);
 
 /* Both retained terminal records name xid4195136, CLOG page128/segment4.
@@ -74,7 +75,7 @@ owned_census_fixture(ClusterWalInputsV1 **inputs, int *fd, char path[MAXPGPATH],
 	ClusterRecoveryRootSet *roots;
 	ClusterRecoveryCensus *census = NULL;
 	int file;
-	inventory_extra = 9;
+	inventory_extra = owned_terminals ? 16 : 9;
 	inventory_binding_case = 0;
 	*inputs = inventory_fixture(false, open_source);
 	roots = inventory_roots(*inputs, path, fd, false);
@@ -212,14 +213,14 @@ UT_TEST(test_owned_census_real_inputs_all_observation_families)
 	ClusterRecoveryCensusEntry entry;
 	ClusterRecoveryCensusDiag diag = { 0 };
 	ClusterRecoveryCensusResult result = CLUSTER_RECOVERY_CENSUS_MORE;
-	unsigned unknown = 0, raw_pages = 0, mismatches = 0, kinds[10] = { 0 };
+	unsigned unknown = 0, raw_pages = 0, mismatches = 0, kinds[12] = { 0 };
 	for (unsigned steps = 0; steps < 200000; steps++) {
 		result = cluster_recovery_census_next(census, &entry);
 		if (result >= CLUSTER_RECOVERY_CENSUS_DRAINED)
 			break;
 		if (result != CLUSTER_RECOVERY_CENSUS_ENTRY)
 			continue;
-		UT_ASSERT(entry.kind >= 1 && entry.kind <= 9);
+		UT_ASSERT(entry.kind >= 1 && entry.kind <= CLUSTER_RECOVERY_CENSUS_TERMINAL);
 		kinds[entry.kind]++;
 		if (entry.kind == CLUSTER_RECOVERY_CENSUS_RELATION) {
 			const ClusterRecoveryRelationCensusEntry *r = &entry.value.relation;

@@ -28,6 +28,34 @@ typedef enum ClusterRecoveryNativeInventoryResult {
 	CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY
 } ClusterRecoveryNativeInventoryResult;
 
+/* Provisional terminal edges retain their exact producer, not a visibility
+ * or completion verdict. Legacy identities need a prior same-source BIND. */
+typedef enum ClusterRecoveryTerminalIdentity {
+	CLUSTER_RECOVERY_TERMINAL_NATIVE_ONLY = 1,
+	CLUSTER_RECOVERY_TERMINAL_EXACT,
+	CLUSTER_RECOVERY_TERMINAL_BOUND,
+	CLUSTER_RECOVERY_TERMINAL_BINDING_MISSING,
+	CLUSTER_RECOVERY_TERMINAL_BINDING_MISMATCH
+} ClusterRecoveryTerminalIdentity;
+
+typedef enum ClusterRecoveryTerminalResult {
+	CLUSTER_RECOVERY_TERMINAL_MORE = 0,
+	CLUSTER_RECOVERY_TERMINAL_ENTRY,
+	CLUSTER_RECOVERY_TERMINAL_DRAINED,
+	CLUSTER_RECOVERY_TERMINAL_INVALID,
+	CLUSTER_RECOVERY_TERMINAL_CHANGED,
+	CLUSTER_RECOVERY_TERMINAL_CAPACITY
+} ClusterRecoveryTerminalResult;
+
+typedef struct ClusterRecoveryTerminalEntry {
+	const ClusterRecoveryNativeRecord *record;
+	const ClusterRecoveryNativeRecord *binding_record;
+	ClusterRecoveryTxnKey transaction; /* generation UINT32_MAX unless EXACT/BOUND */
+	SCN scn;
+	uint8 status; /* terminal value recorded by this producer, not applied */
+	ClusterRecoveryTerminalIdentity identity;
+} ClusterRecoveryTerminalEntry;
+
 typedef struct ClusterRecoveryNativeInventoryDiag {
 	ClusterControlRootResult input_result;
 	RfPageProofDetailV1 input_detail;
@@ -49,6 +77,7 @@ typedef struct ClusterRecoveryNativeInventoryDiag {
 	uint64 tt_roots_added; /* successful root additions, before graph deduplication */
 	uint64 tt_binding_records_examined;
 	uint64 tt_head_binding_missing;
+	uint64 terminal_records, terminal_bound, terminal_unbound, terminal_binding_examined;
 	uint64 mx_compared_offsets, mx_compared_members, mx_physical_mismatches;
 	uint64 xact_clog_compared, xact_parents_compared, xact_physical_mismatches;
 	ClusterRecoveryGraphResult graph_result;
@@ -128,9 +157,21 @@ extern ClusterRecoveryMultixactJoinResult cluster_recovery_native_inventory_mult
 extern bool
 cluster_recovery_native_inventory_digest(const ClusterRecoveryNativeInventory *inventory,
 										 uint8 out[32]);
+/* Independent complete terminal cursor. At most 128 saved-record inspections
+ * per step, with no I/O or new allocation. Exact records retain their full
+ * key; legacy COMMIT/ABORT use only the last prior same-source BIND, with
+ * INIT/RECYCLE/REUSE barriers. Missing/mismatched bindings and native-only
+ * terminals remain explicit unresolved obligations. Every effect and full
+ * payload stays owned; none is applied, discarded or deemed completed.
+ * Output borrows this inventory and is provisional until the original final
+ * scope/TT/ROOT/WAL checks. Refusal is sticky and revokes dependents. */
+extern ClusterRecoveryTerminalResult
+cluster_recovery_native_inventory_terminal_step(ClusterRecoveryNativeInventory *inventory,
+												ClusterRecoveryTerminalEntry *out,
+												ClusterRecoveryNativeInventoryDiag *diag);
 extern void cluster_recovery_native_inventory_destroy(ClusterRecoveryNativeInventory *inventory);
 /* Independent retained terminal/assignment cursor, under the same borrowed
- * ROOT lifetime and failure rules as MX. At most128 saved records or one
+ * ROOT lifetime and failure rules as MX. At most 128 saved records or one
  * bounded physical join step. Mismatches are observations, not permission
  * to overwrite a status or parent. The fixed scratch budget is separate. */
 extern ClusterRecoveryXactJoinResult cluster_recovery_native_inventory_xact_step(

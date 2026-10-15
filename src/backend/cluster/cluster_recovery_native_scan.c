@@ -39,7 +39,6 @@ struct ClusterRecoveryNativeScan {
 	ClusterRecoveryNativeResult status;
 	ClusterRecoveryNativeKind primary;
 	NativeRegion regions[6];
-	xl_xact_tt_commit tt;
 	ClusterUndoDecoded undo;
 	unsigned region;
 	uint32 ordinal;
@@ -407,9 +406,10 @@ native_commit(ClusterRecoveryNativeScan *scan)
 	native_regions(scan, parsed.nsubxacts, parsed.subxacts, parsed.nrels, parsed.xlocators,
 				   parsed.nstats, parsed.stats, parsed.nmsgs, parsed.msgs);
 	if (parsed.has_tt_commit) {
-		scan->tt = parsed.tt_commit;
+		scan->record.tt_commit = parsed.tt_commit;
 		scan->regions[4] = (NativeRegion){ CLUSTER_RECOVERY_NATIVE_TT_COMMIT,
-										   (const char *)&scan->tt, 1, sizeof(scan->tt) };
+										   (const char *)&scan->record.tt_commit, 1,
+										   sizeof(scan->record.tt_commit) };
 	}
 	scan->regions[5] = (NativeRegion){ CLUSTER_RECOVERY_NATIVE_SPACE_DROP, parsed.space_drops,
 									   parsed.nspace_drops, XACT_SPACE_DROP_RECORD_BYTES };

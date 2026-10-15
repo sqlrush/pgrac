@@ -93,6 +93,7 @@ typedef struct ClusterRecoveryNativeRecord {
 	Oid tablespace;
 	TimestampTz xact_time;
 	SCN terminal_scn;
+	xl_xact_tt_commit tt_commit; /* original parsed delta iff HAS_TT_COMMIT */
 	xl_xact_origin origin;
 	bool relcache_init_file;
 } ClusterRecoveryNativeRecord;

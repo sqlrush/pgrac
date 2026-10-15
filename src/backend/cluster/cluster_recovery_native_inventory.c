@@ -13,6 +13,7 @@
 #include "cluster/cluster_recovery_record_hash.h"
 #include "cluster/cluster_recovery_wal_targets.h"
 #include "cluster/cluster_side_undo.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 
 #define INVENTORY_SEED_TICK 128
 
@@ -67,6 +68,12 @@ struct ClusterRecoveryNativeInventory {
 	uint8 xact_digest[32];
 	ClusterRecoveryXactJoinResult xact_status;
 	bool xact_done;
+	NativeInventoryRecord *terminal_cursor, *terminal_first, *terminal_search;
+	const ClusterUndoDecoded *terminal_binding;
+	const ClusterRecoveryNativeRecord *terminal_binding_record;
+	ClusterRecoveryTerminalEntry terminal_pending;
+	bool terminal_started, terminal_searching;
+	ClusterRecoveryTerminalResult terminal_status;
 };
 
 static void
@@ -506,6 +513,207 @@ cluster_recovery_native_inventory_next(ClusterRecoveryNativeInventory *inventory
 	inventory->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED;
 	inventory_revoke_dependents(inventory);
 	return inventory->status;
+}
+
+static ClusterRecoveryTerminalResult
+inventory_terminal_fail(ClusterRecoveryNativeInventory *inventory,
+						ClusterRecoveryTerminalResult result)
+{
+	inventory->terminal_status = result;
+	inventory->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID;
+	inventory->complete = false;
+	inventory_revoke_dependents(inventory);
+	return result;
+}
+
+/* Normalize the original parsed carriers, never a visibility decision. */
+static bool
+inventory_terminal_prepare(const ClusterRecoveryNativeEffect *effect,
+						   ClusterRecoveryTerminalEntry *out)
+{
+	const ClusterRecoveryNativeRecord *record = effect->record;
+	ClusterRecoveryTxnKey *key = &out->transaction;
+	uint16 origin = record->source.claim.identity.origin_thread_id;
+
+	memset(out, 0, sizeof(*out));
+	out->record = record;
+	key->system_identifier = record->source.claim.identity.system_identifier;
+	key->database_incarnation = record->source.claim.database_incarnation;
+	key->origin_node_id = origin - 1;
+	key->segment_generation = UINT32_MAX; /* absent is never generation zero */
+	if (effect->kind == CLUSTER_RECOVERY_NATIVE_TERMINAL) {
+		uint8 opcode = record->header.xl_info & XLOG_XACT_OPMASK;
+		key->xid = record->top_xid;
+		out->status = opcode == XLOG_XACT_COMMIT ? TT_SLOT_COMMITTED : TT_SLOT_ABORTED;
+		out->scn = record->terminal_scn;
+		out->identity = CLUSTER_RECOVERY_TERMINAL_NATIVE_ONLY;
+		if (opcode != XLOG_XACT_COMMIT && opcode != XLOG_XACT_ABORT)
+			return false;
+		if (record->xinfo & XACT_XINFO_HAS_TT_COMMIT) {
+			const xl_xact_tt_commit *tt = &record->tt_commit;
+			/* Same exact producer fields as the original folded TT owner. */
+			if (opcode != XLOG_XACT_COMMIT || tt->instance != origin || tt->segment_id == 0
+				|| ((tt->segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1 != origin
+				|| tt->segment_generation == UINT32_MAX || tt->slot_offset >= TT_SLOTS_PER_SEGMENT
+				|| tt->wrap == TT_WRAP_INVALID || tt->xid != key->xid
+				|| !TransactionIdIsNormal(tt->xid) || !SCN_VALID(tt->commit_scn)
+				|| tt->format_version != CLUSTER_XACT_TT_COMMIT_VERSION || tt->flags != 0
+				|| tt->reserved != 0 || tt->commit_scn != out->scn)
+				return false;
+			key->segment_id = tt->segment_id;
+			key->segment_generation = tt->segment_generation;
+			key->slot_offset = tt->slot_offset;
+			key->slot_wrap = tt->wrap;
+			out->identity = CLUSTER_RECOVERY_TERMINAL_EXACT;
+		}
+	} else {
+		const ClusterUndoDecoded *tt = effect->bytes;
+		if (tt->instance != origin)
+			return false;
+		key->segment_id = tt->segment_id;
+		key->slot_offset = tt->slot_offset;
+		key->slot_wrap = tt->wrap;
+		key->xid = tt->xid;
+		out->status = tt->kind == CLUSTER_UNDO_KIND_TT_COMMIT ? TT_SLOT_COMMITTED : TT_SLOT_ABORTED;
+		out->scn = tt->commit_scn;
+		out->identity = CLUSTER_RECOVERY_TERMINAL_BINDING_MISSING;
+		if (tt->kind == CLUSTER_UNDO_KIND_TT_ABORT
+			&& tt->format_version == CLUSTER_UNDO_TT_ABORT_EXACT_VERSION) {
+			key->segment_generation = tt->expected_generation;
+			out->identity = CLUSTER_RECOVERY_TERMINAL_EXACT;
+		}
+	}
+	return true;
+}
+
+static ClusterRecoveryTerminalResult
+inventory_terminal_step(ClusterRecoveryNativeInventory *inventory,
+						ClusterRecoveryTerminalEntry *out)
+{
+	unsigned work = 0;
+
+	if (inventory->terminal_status == CLUSTER_RECOVERY_TERMINAL_DRAINED)
+		return inventory->terminal_status;
+	if (!inventory->terminal_started) {
+		inventory->terminal_first = inventory->terminal_cursor = inventory->head;
+		inventory->terminal_started = true;
+	}
+	while (work < INVENTORY_SEED_TICK) {
+		NativeInventoryRecord *current = inventory->terminal_cursor;
+		ClusterRecoveryTerminalEntry *pending = &inventory->terminal_pending;
+		if (current == NULL)
+			return inventory->terminal_status = CLUSTER_RECOVERY_TERMINAL_DRAINED;
+		if (!inventory->terminal_searching) {
+			ClusterRecoveryNativeEffect effect;
+			const ClusterUndoDecoded *undo;
+			if (cluster_recovery_native_scan_primary(current->scan, &effect)
+				!= CLUSTER_RECOVERY_NATIVE_EFFECT)
+				return inventory_terminal_fail(inventory, CLUSTER_RECOVERY_TERMINAL_CHANGED);
+			work++;
+			if (current->source_index != inventory->terminal_first->source_index)
+				inventory->terminal_first = current;
+			undo = effect.kind == CLUSTER_RECOVERY_NATIVE_UNDO ? effect.bytes : NULL;
+			if (effect.kind != CLUSTER_RECOVERY_NATIVE_TERMINAL
+				&& (undo == NULL
+					|| (undo->kind != CLUSTER_UNDO_KIND_TT_COMMIT
+						&& undo->kind != CLUSTER_UNDO_KIND_TT_ABORT))) {
+				inventory->terminal_cursor = current->next;
+				continue;
+			}
+			if (!inventory_terminal_prepare(&effect, pending))
+				return inventory_terminal_fail(inventory, CLUSTER_RECOVERY_TERMINAL_INVALID);
+			if (pending->identity == CLUSTER_RECOVERY_TERMINAL_BINDING_MISSING) {
+				inventory->terminal_search = inventory->terminal_first;
+				inventory->terminal_binding = NULL;
+				inventory->terminal_binding_record = NULL;
+				inventory->terminal_searching = true;
+			}
+		}
+		if (inventory->terminal_searching) {
+			while (inventory->terminal_search != current && work < INVENTORY_SEED_TICK) {
+				NativeInventoryRecord *candidate = inventory->terminal_search;
+				ClusterRecoveryNativeEffect effect;
+				const ClusterUndoDecoded *undo;
+				if (candidate == NULL || candidate->source_index != current->source_index
+					|| cluster_recovery_native_scan_primary(candidate->scan, &effect)
+						   != CLUSTER_RECOVERY_NATIVE_EFFECT
+					|| !inventory_source_equal(&effect.record->source, &pending->record->source)
+					|| !inventory_cut_equal(&effect.record->cut, &pending->record->cut))
+					return inventory_terminal_fail(inventory, CLUSTER_RECOVERY_TERMINAL_CHANGED);
+				if (inventory->diag.terminal_binding_examined == UINT64_MAX)
+					return inventory_terminal_fail(inventory, CLUSTER_RECOVERY_TERMINAL_CAPACITY);
+				inventory->diag.terminal_binding_examined++;
+				work++;
+				inventory->terminal_search = candidate->next;
+				if (effect.kind != CLUSTER_RECOVERY_NATIVE_UNDO)
+					continue;
+				undo = effect.bytes;
+				if (undo->segment_id != pending->transaction.segment_id)
+					continue;
+				if (undo->kind == CLUSTER_UNDO_KIND_SEGMENT_INIT
+					|| undo->kind == CLUSTER_UNDO_KIND_SEGMENT_RECYCLE
+					|| undo->kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE) {
+					inventory->terminal_binding = NULL;
+					inventory->terminal_binding_record = NULL;
+				} else if (undo->kind == CLUSTER_UNDO_KIND_TT_BIND
+						   && undo->slot_offset == pending->transaction.slot_offset) {
+					inventory->terminal_binding = undo;
+					inventory->terminal_binding_record = effect.record;
+				}
+			}
+			if (inventory->terminal_search != current)
+				return CLUSTER_RECOVERY_TERMINAL_MORE;
+			if (inventory->terminal_binding != NULL) {
+				const ClusterUndoDecoded *binding = inventory->terminal_binding;
+				if (binding->instance != pending->transaction.origin_node_id + 1
+					|| binding->xid != pending->transaction.xid
+					|| binding->wrap != pending->transaction.slot_wrap)
+					pending->identity = CLUSTER_RECOVERY_TERMINAL_BINDING_MISMATCH;
+				else {
+					pending->identity = CLUSTER_RECOVERY_TERMINAL_BOUND;
+					pending->transaction.segment_generation = binding->expected_generation;
+					pending->binding_record = inventory->terminal_binding_record;
+				}
+			}
+		}
+		if (inventory->diag.terminal_records == UINT64_MAX)
+			return inventory_terminal_fail(inventory, CLUSTER_RECOVERY_TERMINAL_CAPACITY);
+		inventory->diag.terminal_records++;
+		if (pending->identity == CLUSTER_RECOVERY_TERMINAL_EXACT
+			|| pending->identity == CLUSTER_RECOVERY_TERMINAL_BOUND)
+			inventory->diag.terminal_bound++;
+		else
+			inventory->diag.terminal_unbound++;
+		*out = *pending;
+		inventory->terminal_cursor = current->next;
+		inventory->terminal_searching = false;
+		return CLUSTER_RECOVERY_TERMINAL_ENTRY;
+	}
+	return CLUSTER_RECOVERY_TERMINAL_MORE;
+}
+
+ClusterRecoveryTerminalResult
+cluster_recovery_native_inventory_terminal_step(ClusterRecoveryNativeInventory *inventory,
+												ClusterRecoveryTerminalEntry *out,
+												ClusterRecoveryNativeInventoryDiag *diag)
+{
+	ClusterRecoveryTerminalResult result;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (diag != NULL)
+		memset(diag, 0, sizeof(*diag));
+	if (inventory == NULL)
+		return CLUSTER_RECOVERY_TERMINAL_INVALID;
+	if (out == NULL)
+		result = inventory_terminal_fail(inventory, CLUSTER_RECOVERY_TERMINAL_INVALID);
+	else if (!inventory->complete
+			 || inventory->status != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED)
+		result = inventory_terminal_fail(inventory, CLUSTER_RECOVERY_TERMINAL_CHANGED);
+	else
+		result = inventory_terminal_step(inventory, out);
+	if (diag != NULL)
+		*diag = inventory->diag;
+	return result;
 }
 
 static ClusterRecoveryGraphResult

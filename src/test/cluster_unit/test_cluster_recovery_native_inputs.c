@@ -57,6 +57,7 @@ static XLogRecPtr inventory_slru_start[4], inventory_slru_previous[4];
 static unsigned inventory_slru_fault;
 static unsigned inventory_relmap_fault;
 static unsigned inventory_prepare_fault;
+static unsigned inventory_terminal_mode;
 
 /* These small records stay within the original checkpoint's first WAL page.
  * Header, main-data framing and CRC are actual native-reader inputs. */
@@ -222,6 +223,117 @@ inventory_write_bound_head(const ClusterWalSourceRef *source, WalTestRecord prev
 								  XLOG_UNDO_TT_SLOT_SET_HEAD, &head, sizeof(head));
 }
 
+/* Four original TT terminal carriers plus native-only ABORT. Conflicting
+ * endpoints intentionally coexist: observation must never choose a winner. */
+static WalTestRecord
+inventory_write_terminal_sequence(const ClusterWalSourceRef *source, WalTestRecord next,
+								  unsigned node)
+{
+	uint32 segment = node * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	uint8 payload[128] = { 0 };
+	TimestampTz time = 8765;
+	uint32 xinfo = XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_TT_COMMIT;
+	xl_xact_scn scn = { 5906 };
+	xl_xact_tt_commit folded = { 0 };
+	xl_undo_tt_slot_bind bind = { 0 };
+	xl_undo_tt_slot_commit commit = { 0 };
+	xl_undo_tt_slot_abort abort_record = { 0 };
+	xl_undo_tt_slot_abort_exact exact = { 0 };
+	size_t used = 0;
+	folded.segment_id = segment;
+	folded.xid = 4195136;
+	folded.wrap = 1;
+	folded.instance = node + 1;
+	folded.format_version = CLUSTER_XACT_TT_COMMIT_VERSION;
+	folded.commit_scn = scn.scn;
+	switch (inventory_terminal_mode) {
+	case 6:
+		folded.instance = node == 0 ? 2 : 1;
+		break;
+	case 7:
+		folded.segment_id = node == 0 ? 257 : 1;
+		break;
+	case 8:
+		folded.segment_generation = UINT32_MAX;
+		break;
+	case 9:
+		folded.slot_offset = TT_SLOTS_PER_SEGMENT;
+		break;
+	case 10:
+		folded.wrap = TT_WRAP_INVALID;
+		break;
+	case 11:
+		folded.xid++;
+		break;
+	case 12:
+		folded.format_version++;
+		break;
+	case 13:
+		folded.flags = 1;
+		break;
+	case 14:
+		folded.reserved = 1;
+		break;
+	case 15:
+		folded.commit_scn++;
+		break;
+	default:
+		break;
+	}
+	memcpy(payload + used, &time, sizeof(time));
+	used += sizeof(time);
+	memcpy(payload + used, &xinfo, sizeof(xinfo));
+	used += sizeof(xinfo);
+	memcpy(payload + used, &scn, sizeof(scn));
+	used += sizeof(scn);
+	memcpy(payload + used, &folded, sizeof(folded));
+	used += sizeof(folded);
+	next = inventory_write_record(source, next.exclusive_end, next.record_start, RM_XACT_ID,
+								  XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO, payload, used);
+	if (inventory_terminal_mode == 2 || (inventory_terminal_mode == 5 && node == 127)) {
+		xl_undo_segment_recycle recycle = { 0 };
+		recycle.segment_id = segment;
+		recycle.instance = node + 1;
+		recycle.old_state = SEGMENT_COMMITTED;
+		recycle.new_state = SEGMENT_RECYCLABLE;
+		next = inventory_write_record(source, next.exclusive_end, next.record_start,
+									  RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_RECYCLE, &recycle,
+									  sizeof(recycle));
+	}
+	if (inventory_terminal_mode == 3 || inventory_terminal_mode == 4) {
+		bind.segment_id = segment;
+		bind.instance = node + 1;
+		bind.xid = 4195136 + (inventory_terminal_mode == 3);
+		bind.wrap = 1 + (inventory_terminal_mode == 4);
+		bind.format_version = CLUSTER_UNDO_TT_BIND_VERSION;
+		next = inventory_write_record(source, next.exclusive_end, next.record_start,
+									  RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND, &bind,
+									  sizeof(bind));
+	}
+	commit.segment_id = segment;
+	commit.instance = node + 1;
+	commit.xid = 4195136;
+	commit.wrap = 1;
+	commit.commit_scn = 5906;
+	next = inventory_write_record(source, next.exclusive_end, next.record_start, RM_CLUSTER_UNDO_ID,
+								  XLOG_UNDO_TT_SLOT_COMMIT, &commit, sizeof(commit));
+	abort_record.segment_id = segment;
+	abort_record.instance = node + 1;
+	abort_record.xid = 4195136;
+	abort_record.wrap = 1;
+	next = inventory_write_record(source, next.exclusive_end, next.record_start, RM_CLUSTER_UNDO_ID,
+								  XLOG_UNDO_TT_SLOT_ABORT, &abort_record, sizeof(abort_record));
+	exact.segment_id = segment;
+	exact.instance = node + 1;
+	exact.xid = 4195136;
+	exact.wrap = 1;
+	exact.format_version = CLUSTER_UNDO_TT_ABORT_EXACT_VERSION;
+	next = inventory_write_record(source, next.exclusive_end, next.record_start, RM_CLUSTER_UNDO_ID,
+								  XLOG_UNDO_TT_SLOT_ABORT, &exact, sizeof(exact));
+	return inventory_write_record(source, next.exclusive_end, next.record_start, RM_XACT_ID,
+								  XLOG_XACT_ABORT, &time, sizeof(time));
+}
+
 static void
 inventory_mx_payload(char *bytes, bool invalid, bool changed)
 {
@@ -348,9 +460,9 @@ inventory_fixture(bool unsupported, bool open_source)
 										   RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND, &binding,
 										   sizeof(binding));
 		}
-		if (inventory_extra == 5 || inventory_extra == 9)
+		if (inventory_extra == 5 || inventory_extra == 9 || inventory_extra == 16)
 			extra = inventory_write_bound_head(&source, commit, node);
-		if (inventory_extra >= 6 && inventory_extra <= 9)
+		if ((inventory_extra >= 6 && inventory_extra <= 9) || inventory_extra == 16)
 			extra = inventory_write_mx_sequence(&source, extra, node);
 		if (inventory_extra >= 10 && inventory_extra <= 12)
 			extra = inventory_write_slru_sequence(&source, extra, node);
@@ -390,6 +502,8 @@ inventory_fixture(bool unsupported, bool open_source)
 			extra = inventory_write_record(&source, extra.exclusive_end, extra.record_start,
 										   RM_XACT_ID, opcode, bytes, length);
 		}
+		if (inventory_extra == 16)
+			extra = inventory_write_terminal_sequence(&source, extra, node);
 		create = inventory_write_record(&source, extra.exclusive_end, extra.record_start,
 										RM_SMGR_ID, XLOG_SMGR_CREATE, &payload, sizeof(payload));
 		if (i == 0) {
@@ -685,6 +799,7 @@ cleanup:
 #include "test_cluster_recovery_relmap_physical_inputs.inc"
 #include "test_cluster_recovery_prepare_inputs.inc"
 #include "test_cluster_recovery_manifest_inputs.inc"
+#include "test_cluster_recovery_terminal_inputs.inc"
 
 int
 main(int argc, char **argv)
@@ -693,7 +808,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(62);
+	UT_PLAN(69);
 	UT_RUN(test_native_inventory_uses_two_real_cold_passes);
 	UT_RUN(test_native_inventory_never_returns_partial_on_drift_io_or_error);
 	UT_RUN(test_native_inventory_capacity_is_not_partial_success);
@@ -756,6 +871,13 @@ main(int argc, char **argv)
 	UT_RUN(test_census_manifest_revokes_after_scope_or_dependency_loss);
 	UT_RUN(test_census_manifest_final_changes_never_export_partial);
 	UT_RUN(test_inventory_digest_canonical_sha256_and_failed_output);
+	UT_RUN(test_terminal_edges_keep_every_exact_and_native_carrier);
+	UT_RUN(test_terminal_edges_never_guess_missing_or_reused_bindings);
+	UT_RUN(test_terminal_edges_preserve_effects_and_final_revocation);
+	UT_RUN(test_terminal_binding_search_is_bounded);
+	UT_RUN(test_terminal_census_compares_original_physical_slots);
+	UT_RUN(test_terminal_census_final_changes_revoke_output);
+	UT_RUN(test_terminal_bad_exact_fields_refuse_and_revoke);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
