@@ -576,6 +576,36 @@ UT_TEST(test_v3_origin_scan_retains_prefix_only_for_same_cut)
 	assert_finished();
 }
 
+UT_TEST(test_v3_origin_closed_uses_resource_formation_and_membership_epoch)
+{
+	if (!work_setup_v3("v3_distinct_formation"))
+		return;
+	relation_gate_formation = 2;
+	UT_ASSERT_EQ(storage.contexts[work_slot].request.epoch, 1);
+	UT_ASSERT(poll_work());
+	assert_finished();
+	UT_ASSERT_EQ(local_relation_scan_calls, 1);
+}
+
+UT_TEST(test_v3_origin_resource_formation_change_restarts_local_prefix)
+{
+	if (!work_setup_v3("v3_formation_prefix"))
+		return;
+	relation_gate_formation = 2;
+	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_MORE;
+	UT_ASSERT(!poll_work());
+	UT_ASSERT(!poll_work());
+	UT_ASSERT_EQ(local_relation_scan_input, 128);
+	relation_gate_formation = 3;
+	UT_ASSERT(!poll_work());
+	UT_ASSERT_EQ(local_relation_scan_input, 0);
+	assert_no_drop_io();
+	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_EMPTY;
+	UT_ASSERT(poll_work());
+	UT_ASSERT_EQ(local_relation_scan_input, 128);
+	assert_finished();
+}
+
 UT_TEST(test_v3_origin_unaccepted_physical_ack_blocks_deletion)
 {
 	if (!work_setup_v3("v3_ack"))
@@ -1530,7 +1560,9 @@ UT_TEST(test_v3_native_failed_io_keeps_original_recovery_obligation)
 int
 main(void)
 {
-	UT_PLAN(38);
+	UT_PLAN(40);
+	UT_RUN(test_v3_origin_closed_uses_resource_formation_and_membership_epoch);
+	UT_RUN(test_v3_origin_resource_formation_change_restarts_local_prefix);
 	UT_RUN(test_v3_native_finish_releases_only_file_context_without_legacy_offer);
 	UT_RUN(test_v3_native_finish_rechecks_local_cut_before_releasing_context);
 	UT_RUN(test_v3_native_failed_io_keeps_original_recovery_obligation);

@@ -287,6 +287,7 @@ static ClusterPcmPiRelationScanV2 relation_scan_result;
 static uint32 relation_scan_calls, relation_scan_advance;
 static bool relation_scan_epoch_drift, relation_scan_slot_drift, relation_scan_freeze_drift;
 static uint64 relation_gate_freeze;
+static uint64 relation_gate_formation;
 static bool relation_gate_ok;
 static ClusterPcmPiRelationScanV2 local_relation_scan_result;
 static uint32 local_relation_scan_calls, local_relation_scan_advance;
@@ -306,7 +307,7 @@ cluster_pcm_lock_resource_x_gate_snapshot(ResourceXGateSnapshot *out)
 		return false;
 	memset(out, 0, sizeof(*out));
 	out->phase = RESOURCE_X_GATE_OPEN;
-	out->formation = current_epoch;
+	out->formation = relation_gate_formation != 0 ? relation_gate_formation : current_epoch;
 	out->freeze_generation = relation_gate_freeze;
 	return true;
 }
@@ -333,7 +334,8 @@ cluster_pcm_lock_ko_local_relation_scan_v3(RelFileLocator locator, uint64 epoch,
 										   uint32 *cursor)
 {
 	UT_ASSERT_EQ(locator.relNumber, local_scan_rel_number);
-	UT_ASSERT_EQ(epoch, current_epoch);
+	if (epoch != (relation_gate_formation != 0 ? relation_gate_formation : current_epoch))
+		return CLUSTER_PCM_PI_RELATION_INVALID;
 	UT_ASSERT_EQ(budget, 128);
 	local_relation_scan_calls++;
 	local_relation_scan_input = *cursor;
@@ -346,6 +348,8 @@ cluster_pcm_lock_ko_local_relation_scan_v3(RelFileLocator locator, uint64 epoch,
 		relation_gate_ok = false;
 	if (local_relation_scan_drift == 4)
 		pg_re_throw();
+	if (local_relation_scan_drift == 5)
+		relation_gate_formation++;
 	return local_relation_scan_result;
 }
 
@@ -1282,6 +1286,7 @@ reset_test(void)
 	relation_gate_sample_hook = NULL;
 	local_writeback_sample_hook = NULL;
 	relation_gate_freeze = 3;
+	relation_gate_formation = 0;
 	relation_gate_ok = true;
 	IsUnderPostmaster = false;
 	cluster_ko_shmem_init();
@@ -6086,6 +6091,59 @@ UT_TEST(test_v3_physical_pending_is_owned_and_resumed_before_ready)
 	UT_ASSERT_EQ(storage.send_v3_count, 1);
 }
 
+UT_TEST(test_v3_ready_keeps_membership_and_resource_formation_separate)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(938);
+
+	/* Native Resource-X cutover advances its own formation. The KO wire
+	 * still authenticates the unchanged membership epoch. */
+	relation_gate_formation = 2;
+	UT_ASSERT_EQ(request.base.epoch, 1);
+	enqueue_shared_v3(&request);
+	fixture_peer_drain();
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
+	UT_ASSERT_EQ(storage.peer_fences[0].physical_gate.formation, 2);
+	UT_ASSERT_EQ(storage.peer_fences[0].local_scan_gate.formation, 2);
+	UT_ASSERT_EQ(storage.peer_fences[0].request.base.epoch, 1);
+	UT_ASSERT_EQ(flush_count, 1);
+	UT_ASSERT_EQ(drop_count, 1);
+	shared_send_tick();
+	UT_ASSERT_EQ(ack_count, 1);
+	UT_ASSERT_EQ(sent_v3_ack.base.epoch, 1);
+}
+
+UT_TEST(test_v3_distinct_resource_formation_does_not_admit_stale_membership)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(939);
+
+	relation_gate_formation = 2;
+	enqueue_shared_v3(&request);
+	formation.local_epoch = current_epoch = 2;
+	fixture_peer_drain();
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_ACTIVE);
+	UT_ASSERT_EQ(flush_count + drop_count + storage.send_v3_count, 0);
+}
+
+UT_TEST(test_v3_resource_formation_drift_discards_physical_and_local_prefix)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(940);
+
+	relation_gate_formation = 2;
+	enqueue_shared_v3(&request);
+	local_relation_scan_drift = 5;
+	fixture_peer_drain();
+	UT_ASSERT_EQ(local_relation_scan_calls, 1);
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_ACTIVE);
+	UT_ASSERT_EQ(storage.send_v3_count, 0);
+	UT_ASSERT(!storage.peer_fences[0].local_scan_complete);
+	local_relation_scan_drift = 0;
+	fixture_peer_drain();
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
+	UT_ASSERT_EQ(storage.peer_fences[0].physical_gate.formation, 3);
+	UT_ASSERT_EQ(drop_count, 2);
+	UT_ASSERT_EQ(storage.send_v3_count, 1);
+}
+
 UT_TEST(test_v3_physical_cursor_resumes_and_drift_restarts_original_pass)
 {
 	for (unsigned drift = 0; drift < 3; drift++) {
@@ -9366,7 +9424,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(226);
+	UT_PLAN(229);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_create_reference_outlives_exact_space_children_and_blocks_ready);
 	UT_RUN(test_create_capacity_reserves_progress_for_every_accepted_constructor);
@@ -9593,6 +9651,9 @@ main(void)
 	UT_RUN(test_buffer_copy_range_and_purpose_cannot_be_rebound);
 	UT_RUN(test_buffer_copy_exact_owner_and_failed_scope_retain_obligation);
 	UT_RUN(test_buffer_copy_samples_expire_across_revision_and_new_lifetime);
+	UT_RUN(test_v3_ready_keeps_membership_and_resource_formation_separate);
+	UT_RUN(test_v3_distinct_resource_formation_does_not_admit_stale_membership);
+	UT_RUN(test_v3_resource_formation_drift_discards_physical_and_local_prefix);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

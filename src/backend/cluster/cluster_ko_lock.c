@@ -1276,7 +1276,7 @@ ko_peer_fence_mark_physical_applied_v3(const ClusterKoSharedMessageV3 *request)
 		return false;
 	revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
 	if (revision == 0 || revision == UINT64_MAX || !cluster_pcm_lock_resource_x_gate_snapshot(&gate)
-		|| gate.phase != RESOURCE_X_GATE_OPEN || gate.formation != request->base.epoch)
+		|| gate.phase != RESOURCE_X_GATE_OPEN)
 		return false;
 	SpinLockAcquire(&ko_state->shared_lock);
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
@@ -2411,7 +2411,7 @@ cluster_ko_peer_fence_ready_v3(const ClusterKoSharedMessageV3 *request,
 		 * lock acquisition. No directory lock is taken under the KO lock. */
 		&& cluster_pcm_lock_resource_x_gate_snapshot(&gate)
 		&& memcmp(&gate, &entry->local_scan_gate, sizeof(gate)) == 0
-		&& gate.phase == RESOURCE_X_GATE_OPEN && gate.formation == request->base.epoch
+		&& gate.phase == RESOURCE_X_GATE_OPEN
 		&& ko_drop_reserve_locked(&entry->request, entry->serial, &entry->drop_identity)) {
 		if (entry->state == CLUSTER_KO_PEER_FENCE_ACTIVE) {
 			uint64 sealed_revision = entry->local_scan_revision + 1;
@@ -2491,8 +2491,10 @@ ko_peer_fence_physical_tick_v3(ClusterKoPeerFenceV3 *before,
 	uint8 phase = 0;
 	bool applied = false;
 
+	/* CONTROL authenticates the KO membership epoch. Resource-X cutover
+	 * advances a separate formation; retain and recheck its complete gate. */
 	if (revision == 0 || revision == UINT64_MAX || !cluster_pcm_lock_resource_x_gate_snapshot(&gate)
-		|| gate.phase != RESOURCE_X_GATE_OPEN || gate.formation != before->request.base.epoch
+		|| gate.phase != RESOURCE_X_GATE_OPEN
 		|| !ko_peer_physical_cut_current_v3(before, revision, &gate)
 		|| !cluster_ctrc_relation_removal_ready_shared(before->request.base.key.locator.spcOid,
 													   before->request.base.key.locator.dbOid,
@@ -2594,7 +2596,7 @@ ko_peer_fence_local_scan_v3(const ClusterKoPeerFenceV3 *before,
 
 	revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
 	if (revision == 0 || revision == UINT64_MAX || !cluster_pcm_lock_resource_x_gate_snapshot(&gate)
-		|| gate.phase != RESOURCE_X_GATE_OPEN || gate.formation != before->request.base.epoch) {
+		|| gate.phase != RESOURCE_X_GATE_OPEN) {
 		ko_peer_fence_scan_reset_v3(handle);
 		return false;
 	}
@@ -2608,7 +2610,7 @@ ko_peer_fence_local_scan_v3(const ClusterKoPeerFenceV3 *before,
 	 * Only the fully revalidated return below publishes a new hint. */
 	ko_peer_fence_scan_reset_v3(handle);
 	scan = cluster_pcm_lock_ko_local_relation_scan_v3(before->request.base.key.locator,
-													  before->request.base.epoch, 128, &cursor);
+													  gate.formation, 128, &cursor);
 	if (scan == CLUSTER_PCM_PI_RELATION_EMPTY
 		&& !cluster_pi_writeback_local_relation_closed_v3(
 			before->request.base.key.locator, before->request.base.epoch, &writeback_revision))
@@ -4125,7 +4127,7 @@ ko_drop_work_local_sample_current_locked(const ClusterKoDropWorkV2 *work)
 
 	if (work->local_scan_revision == 0 || work->local_scan_revision == UINT64_MAX
 		|| !cluster_pcm_lock_resource_x_gate_snapshot(&gate)
-		|| gate.phase != RESOURCE_X_GATE_OPEN || gate.formation != work->context.request.epoch
+		|| gate.phase != RESOURCE_X_GATE_OPEN
 		|| memcmp(&gate, &work->local_scan_gate, sizeof(gate)) != 0)
 		return false;
 	return pg_atomic_read_u64(&ko_state->peer_admission_revision) == work->local_scan_revision
@@ -4178,15 +4180,17 @@ ko_drop_work_local_scan(ClusterKoDropWorkV2 *work)
 	revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
 	if (revision == 0 || revision == UINT64_MAX
 		|| !cluster_pcm_lock_resource_x_gate_snapshot(&gate)
-		|| gate.phase != RESOURCE_X_GATE_OPEN || gate.formation != work->context.request.epoch)
+		|| gate.phase != RESOURCE_X_GATE_OPEN)
 		return;
 	/* The cut may change between validating the old prefix and sampling
 	 * this attempt. Never relabel that prefix with the replacement cut. */
 	if (revision != previous_revision || memcmp(&gate, &previous_gate, sizeof(gate)) != 0)
 		start = 0;
 	cursor = start;
+	/* PCM consumes its Resource-X formation; the writeback transport below
+	 * still consumes the independently authenticated membership epoch. */
 	scan = cluster_pcm_lock_ko_local_relation_scan_v3(work->context.request.key.locator,
-													  work->context.request.epoch, 128, &cursor);
+													  gate.formation, 128, &cursor);
 	if ((scan != CLUSTER_PCM_PI_RELATION_MORE && scan != CLUSTER_PCM_PI_RELATION_EMPTY)
 		|| cursor <= start || cursor - start > 128)
 		return;
