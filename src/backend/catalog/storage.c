@@ -670,9 +670,34 @@ RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
 #ifdef USE_PGRAC_CLUSTER
 	bool		versioned_copy = false;
 	ClusterSpaceIdentity copy_identity;
+	RelFileLocator copy_locator = dst->smgr_rlocator.locator;
+	uint64		copy_serial = 0;
+	bool		copy_scoped;
 #endif
 
 	RelationCheckStorageTransaction(dst->smgr_rlocator.locator, relpersistence, "copy");
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: keep the original constructor reference across raw copy IO.
+	 * Save the locator before any SPACE read can retire SMgr handles.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	copy_scoped = cluster_enabled && cluster_shared_config
+		&& cluster_interconnect_tier == CLUSTER_IC_TIER_1 && !RecoveryInProgress()
+		&& relpersistence != RELPERSISTENCE_TEMP
+		&& cluster_smgr_which_for(copy_locator, dst->smgr_rlocator.backend) == 1;
+	if (copy_scoped && !cluster_ko_copy_begin_v3(copy_locator, &copy_serial))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot qualify shared relation copy for %u", copy_locator.relNumber)));
+	PG_TRY();
+	{
+		/* A SPACE read can itself leave current/PI work. Register its
+		 * original error owner before it, not just before the first DATA. */
+		if (copy_scoped && !cluster_ko_create_write_begin_v3(copy_locator, copy_serial))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("shared relation copy lost its original owner")));
+#endif
 
 	page = (Page) buf.data;
 
@@ -761,6 +786,12 @@ RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
 							blkno, relpath)));
 		}
 
+#ifdef USE_PGRAC_CLUSTER
+		if (copy_scoped && !cluster_ko_create_write_begin_v3(copy_locator, copy_serial))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("shared relation copy lost its original owner before WAL")));
+#endif
 		/*
 		 * WAL-log the copied page. Unfortunately we don't know what kind of a
 		 * page this is, so we have to log the full page including any unused
@@ -786,6 +817,13 @@ RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
 
 		PageSetChecksumInplace(page, blkno);
 
+#ifdef USE_PGRAC_CLUSTER
+		/* WAL flush may have waited; retain the same owner for DATA. */
+		if (copy_scoped && !cluster_ko_create_write_begin_v3(copy_locator, copy_serial))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("shared relation copy lost its original owner before DATA")));
+#endif
 		/*
 		 * Now write the page.  We say skipFsync = true because there's no
 		 * need for smgr to schedule an fsync for this write; we'll do it
@@ -804,7 +842,30 @@ RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
 	 * they might still not be on disk when the crash occurs.
 	 */
 	if (use_wal || copying_initfork)
+	{
+#ifdef USE_PGRAC_CLUSTER
+		if (copy_scoped && !cluster_ko_create_write_begin_v3(copy_locator, copy_serial))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("shared relation copy lost its original owner before sync")));
+#endif
 		smgrimmedsync(dst, forkNum);
+	}
+#ifdef USE_PGRAC_CLUSTER
+	}
+	PG_CATCH();
+	{
+		/* Expire permission now; buffer/lock cleanup retains uncertain work
+		 * through the original ResourceOwner and backend-exit callbacks. */
+		cluster_ko_create_abort_v3(copy_serial);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (copy_scoped && !cluster_ko_create_end_v3(copy_serial, true))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("shared relation copy requires its original recovery owner")));
+#endif
 }
 
 /*

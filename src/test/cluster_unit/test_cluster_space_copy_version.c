@@ -24,6 +24,7 @@
 #include "catalog/storage.h"
 #include "cluster/cluster_itl_slot.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_space_storage.h"
@@ -39,6 +40,9 @@ UT_DEFINE_GLOBALS();
 
 bool cluster_enabled = true, cluster_shared_config = true, cluster_shared_catalog;
 int cluster_node_id = 0, wal_level = WAL_LEVEL_REPLICA;
+int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
 static bool minimal_wal_copy;
 int NBuffers = 3, NLocBuffer;
 char *BufferBlocks;
@@ -124,11 +128,92 @@ static bool reservation_refused, invalidate_on_reserve;
 static unsigned copy_storage_checks;
 static bool refuse_copy_storage;
 
+/* The real catalog/WAL producers run below. Only the existing bounded KO
+ * owner and external IO are fixtures; errors follow the product PG_CATCH.
+ * Author: SqlRush <sqlrush@gmail.com> */
+enum CopySite {
+	COPY_SPACE = 1,
+	COPY_RESERVE,
+	COPY_READ,
+	COPY_WAL,
+	COPY_FLUSH,
+	COPY_WRITE,
+	COPY_SYNC
+};
+static bool copy_begin_allowed, copy_permission, copy_live, copy_aborting;
+static bool copy_armed, private_storage, temporary_copy;
+static bool copy_failed_retained;
+static unsigned copy_begins, copy_ends, copy_aborts, copy_observed;
+static unsigned copy_fail_site, copy_lose_site;
+static BlockNumber source_blocks;
+
+static void
+copy_observe(enum CopySite site)
+{
+	if (copy_live && copy_armed && !copy_aborting)
+		copy_observed |= 1U << (site - 1);
+	if (copy_lose_site == site)
+		copy_permission = false;
+	if (copy_fail_site == site)
+		elog(ERROR, "fixture raw copy IO failure");
+}
+
+bool
+cluster_ko_copy_begin_v3(RelFileLocator locator, uint64 *serial)
+{
+	UT_ASSERT(RelFileLocatorEquals(locator, identity.key.locator));
+	UT_ASSERT(!copy_live);
+	*serial = 0;
+	copy_begins++;
+	if (!copy_begin_allowed)
+		return false;
+	copy_live = true;
+	*serial = 77;
+	return true;
+}
+
+bool
+cluster_ko_create_write_begin_v3(RelFileLocator locator, uint64 serial)
+{
+	UT_ASSERT(RelFileLocatorEquals(locator, identity.key.locator));
+	UT_ASSERT_EQ(serial, 77);
+	if (!copy_live || copy_aborting || !copy_permission)
+		return false;
+	copy_armed = true;
+	return true;
+}
+
+void
+cluster_ko_create_abort_v3(uint64 serial)
+{
+	if (serial != 0) {
+		UT_ASSERT_EQ(serial, 77);
+		UT_ASSERT(copy_live);
+		copy_aborting = true;
+		copy_aborts++;
+	}
+}
+
+bool
+cluster_ko_create_end_v3(uint64 serial, bool complete)
+{
+	UT_ASSERT_EQ(serial, 77);
+	UT_ASSERT(copy_live && complete && !copy_aborting);
+	copy_ends++;
+	copy_live = false;
+	if (!copy_permission) {
+		copy_failed_retained = copy_armed;
+		return false;
+	}
+	return true;
+}
+
 bool fixture_copy_reserve(const ClusterSpaceIdentity *id, BlockNumber first, uint32 count);
 
 bool
 fixture_copy_reserve(const ClusterSpaceIdentity *id, BlockNumber first, uint32 count)
 {
+	copy_observe(COPY_RESERVE);
 	UT_ASSERT(!pinned && !locked && !data_pins[0] && !data_pins[1]);
 	UT_ASSERT_EQ(first, 0);
 	UT_ASSERT_EQ(count, 1);
@@ -158,6 +243,8 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 void
 ProcessInterrupts(void)
 {
+	if (expecting_error)
+		elog(ERROR, "fixture copy cancel");
 	abort();
 }
 
@@ -206,7 +293,7 @@ cluster_smgr_which_for(RelFileLocator tag, BackendId backend)
 {
 	if (!RelFileLocatorEquals(tag, identity.key.locator) || backend != InvalidBackendId)
 		abort();
-	return 1;
+	return private_storage ? 0 : 1;
 }
 
 SMgrRelation
@@ -247,7 +334,7 @@ smgrnblocks(SMgrRelation rel, ForkNumber forknum)
 		return 2;
 	if (forknum != test_fork)
 		abort();
-	return rel == current_src ? 1 : writes;
+	return rel == current_src ? source_blocks : writes;
 }
 
 void
@@ -255,6 +342,7 @@ smgrread(SMgrRelation rel, ForkNumber forknum, BlockNumber block, void *out)
 {
 	if (rel != (handles_retired ? &reopened_source : &source) || forknum != test_fork || block != 0)
 		abort();
+	copy_observe(COPY_READ);
 	memcpy(out, source_page.data, BLCKSZ);
 }
 
@@ -279,7 +367,7 @@ smgrextend(SMgrRelation rel, ForkNumber forknum, BlockNumber block, const void *
 	if (rel != (handles_retired ? &reopened_destination : &destination) || forknum != test_fork
 		|| block != 0 || !skip)
 		abort();
-	if (cluster_shared_config && forknum == MAIN_FORKNUM)
+	if (cluster_shared_config && !private_storage && !temporary_copy && forknum == MAIN_FORKNUM)
 		UT_ASSERT_EQ(reservations, 1);
 	if (buffered) {
 		PGAlignedBlock zero;
@@ -288,8 +376,9 @@ smgrextend(SMgrRelation rel, ForkNumber forknum, BlockNumber block, const void *
 		UT_ASSERT(memcmp(bytes, zero.data, BLCKSZ) == 0);
 		UT_ASSERT_EQ(new_wal, 0);
 		memcpy(target_page.data, bytes, BLCKSZ);
-	} else if (cluster_shared_config)
+	} else if (cluster_shared_config && !private_storage && !temporary_copy)
 		UT_ASSERT_EQ(flushes, 1);
+	copy_observe(COPY_WRITE);
 	memcpy(written.data, bytes, BLCKSZ);
 	writes++;
 }
@@ -298,8 +387,9 @@ void
 smgrimmedsync(SMgrRelation rel, ForkNumber forknum)
 {
 	if (rel != (handles_retired ? &reopened_destination : &destination) || forknum != test_fork
-		|| writes != 1)
+		|| writes != source_blocks)
 		abort();
+	copy_observe(COPY_SYNC);
 	syncs++;
 }
 
@@ -333,6 +423,7 @@ ReadBufferWithoutRelcache(RelFileLocator tag, ForkNumber forknum, BlockNumber bl
 	if (!RelFileLocatorEquals(tag, identity.key.locator) || forknum != SPACE_FORKNUM || block != 0
 		|| mode != RBM_NORMAL || strategy != NULL || !permanent || pinned)
 		abort();
+	copy_observe(COPY_SPACE);
 	pinned = true;
 	space_reads++;
 	if (invalidate_on_read) {
@@ -475,6 +566,7 @@ XLogInsert(RmgrId rmid, uint8 info)
 {
 	if (!begun || rmid != RM_XLOG_ID || info != XLOG_FPI || edges != 1)
 		abort();
+	copy_observe(COPY_WAL);
 	if (buffered) {
 		PGAlignedBlock zero;
 
@@ -514,16 +606,21 @@ XLogFlush(XLogRecPtr lsn)
 {
 	if (lsn != 200 || new_wal != 1 || writes != 0)
 		abort();
+	copy_observe(COPY_FLUSH);
 	flushes++;
 }
 
 int
 errmsg(const char *fmt, ...)
 {
-	(void)fmt;
-	if (expecting_error)
-		longjmp(error_jump, 1);
-	abort();
+	va_list args;
+
+	if (!expecting_error)
+		abort();
+	va_start(args, fmt);
+	vsnprintf(last_error, sizeof(last_error), fmt, args);
+	va_end(args);
+	return 0;
 }
 
 bool
@@ -549,14 +646,33 @@ errmsg_internal(const char *fmt, ...)
 	va_start(args, fmt);
 	vsnprintf(last_error, sizeof(last_error), fmt, args);
 	va_end(args);
+	return 0;
+}
+
+void
+pg_re_throw(void)
+{
+	if (!expecting_error)
+		abort();
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
 	longjmp(error_jump, 1);
+}
+
+void
+errfinish(const char *file, int line, const char *function)
+{
+	(void)file;
+	(void)line;
+	(void)function;
+	pg_re_throw();
 }
 
 int
 errcode(int code)
 {
 	(void)code;
-	abort();
+	return 0;
 }
 
 int
@@ -595,6 +711,7 @@ static void
 reset(ForkNumber forknum)
 {
 	PageHeader header;
+	UT_ASSERT(PG_exception_stack == NULL);
 
 	wal_level = minimal_wal_copy ? WAL_LEVEL_MINIMAL : WAL_LEVEL_REPLICA;
 	memset(&source, 0, sizeof(source));
@@ -645,6 +762,13 @@ reset(ForkNumber forknum)
 	reservation_refused = invalidate_on_reserve = false;
 	copy_storage_checks = 0;
 	refuse_copy_storage = false;
+	copy_begin_allowed = copy_permission = true;
+	copy_live = copy_aborting = copy_armed = private_storage = temporary_copy = false;
+	copy_failed_retained = false;
+	copy_begins = copy_ends = copy_aborts = copy_observed = 0;
+	copy_fail_site = copy_lose_site = 0;
+	source_blocks = 1;
+	InterruptPending = false;
 	cluster_shared_config = true;
 	test_fork = forknum;
 	token = 99;
@@ -1160,10 +1284,168 @@ UT_TEST(test_resident_broken_owner_panics_before_unlock)
 	CritSectionCount = 0;
 }
 
+UT_TEST(test_raw_copy_fence_refusal_precedes_target_effects)
+{
+	volatile bool caught = false;
+
+	reset(MAIN_FORKNUM);
+	copy_begin_allowed = false;
+	expecting_error = true;
+	if (setjmp(error_jump) == 0)
+		RelationCopyStorage(&source, &destination, test_fork, RELPERSISTENCE_PERMANENT);
+	else
+		caught = true;
+	expecting_error = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(space_reads + reservations + new_wal + writes + syncs, 0);
+	UT_ASSERT_EQ(copy_begins, 1);
+	UT_ASSERT(!copy_live);
+	UT_ASSERT_EQ(copy_aborts + copy_ends, 0);
+}
+
+UT_TEST(test_raw_copy_owner_covers_space_wal_data_and_final_sync)
+{
+	const ForkNumber forks[] = { MAIN_FORKNUM, FSM_FORKNUM, VISIBILITYMAP_FORKNUM };
+
+	for (unsigned i = 0; i < lengthof(forks); i++) {
+		reset(forks[i]);
+		RelationCopyStorage(&source, &destination, test_fork, RELPERSISTENCE_PERMANENT);
+		UT_ASSERT_EQ(copy_begins, 1);
+		UT_ASSERT_EQ(copy_ends, 1);
+		UT_ASSERT_EQ(copy_aborts, 0);
+		UT_ASSERT_EQ(copy_observed, i == 0 ? 127 : 125);
+		UT_ASSERT(!copy_live && !copy_failed_retained);
+		UT_ASSERT_EQ(writes, 1);
+		UT_ASSERT_EQ(syncs, 1);
+	}
+	reset(MAIN_FORKNUM);
+	source_blocks = 0;
+	RelationCopyStorage(&source, &destination, test_fork, RELPERSISTENCE_PERMANENT);
+	UT_ASSERT_EQ(copy_observed, 65); /* SPACE read and final sync even when empty. */
+	UT_ASSERT_EQ(copy_ends, 1);
+	UT_ASSERT_EQ(reservations + writes + new_wal, 0);
+	UT_ASSERT_EQ(syncs, 1);
+}
+
+UT_TEST(test_raw_copy_rechecks_before_wal_data_and_sync)
+{
+	const unsigned sites[] = { COPY_READ, COPY_FLUSH, COPY_WRITE };
+	const unsigned wal_expected[] = { 0, 1, 1 };
+	const unsigned writes_expected[] = { 0, 0, 1 };
+
+	for (unsigned i = 0; i < lengthof(sites); i++) {
+		volatile bool caught = false;
+
+		reset(MAIN_FORKNUM);
+		copy_lose_site = sites[i];
+		expecting_error = true;
+		if (setjmp(error_jump) == 0)
+			RelationCopyStorage(&source, &destination, test_fork, RELPERSISTENCE_PERMANENT);
+		else
+			caught = true;
+		expecting_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(new_wal, wal_expected[i]);
+		UT_ASSERT_EQ(writes, writes_expected[i]);
+		UT_ASSERT_EQ(syncs, 0);
+		UT_ASSERT_EQ(copy_ends, 0);
+		UT_ASSERT_EQ(copy_aborts, 1);
+		UT_ASSERT(copy_live && copy_aborting);
+	}
+}
+
+UT_TEST(test_raw_copy_lost_owner_after_sync_cannot_report_completion)
+{
+	volatile bool caught = false;
+
+	reset(MAIN_FORKNUM);
+	copy_lose_site = COPY_SYNC;
+	expecting_error = true;
+	if (setjmp(error_jump) == 0)
+		RelationCopyStorage(&source, &destination, test_fork, RELPERSISTENCE_PERMANENT);
+	else
+		caught = true;
+	expecting_error = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(writes, 1);
+	UT_ASSERT_EQ(syncs, 1);
+	UT_ASSERT_EQ(copy_ends, 1);
+	UT_ASSERT(copy_failed_retained);
+}
+
+UT_TEST(test_raw_copy_error_and_cancel_transfer_the_same_owner)
+{
+	for (unsigned site = COPY_SPACE; site <= COPY_SYNC + 1; site++) {
+		volatile bool caught = false;
+
+		reset(MAIN_FORKNUM);
+		if (site <= COPY_SYNC)
+			copy_fail_site = site;
+		else
+			InterruptPending = true;
+		expecting_error = true;
+		if (setjmp(error_jump) == 0)
+			RelationCopyStorage(&source, &destination, test_fork, RELPERSISTENCE_PERMANENT);
+		else
+			caught = true;
+		expecting_error = false;
+		InterruptPending = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(copy_aborts, 1);
+		UT_ASSERT_EQ(copy_ends, 0);
+		UT_ASSERT(copy_live && copy_aborting);
+		UT_ASSERT(PG_exception_stack == NULL);
+	}
+}
+
+UT_TEST(test_raw_copy_private_and_temp_keep_native_lifetime)
+{
+	for (unsigned variant = 0; variant < 3; variant++) {
+		reset(MAIN_FORKNUM);
+		private_storage = variant == 0;
+		cluster_shared_config = variant != 1;
+		temporary_copy = variant == 2;
+		copy_begin_allowed = false;
+		RelationCopyStorage(&source, &destination, test_fork,
+							temporary_copy ? RELPERSISTENCE_TEMP : RELPERSISTENCE_PERMANENT);
+		UT_ASSERT_EQ(copy_begins + copy_ends + copy_aborts, 0);
+		UT_ASSERT_EQ(space_reads + reservations + new_wal, 0);
+		UT_ASSERT_EQ(old_wal, temporary_copy ? 0 : 1);
+		UT_ASSERT_EQ(syncs, temporary_copy ? 0 : 1);
+		UT_ASSERT_EQ(writes, 1);
+	}
+}
+
+UT_TEST(test_raw_copy_initial_owner_loss_precedes_space_read)
+{
+	volatile bool caught = false;
+
+	reset(MAIN_FORKNUM);
+	copy_permission = false;
+	expecting_error = true;
+	if (setjmp(error_jump) == 0)
+		RelationCopyStorage(&source, &destination, test_fork, RELPERSISTENCE_PERMANENT);
+	else
+		caught = true;
+	expecting_error = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(copy_begins, 1);
+	UT_ASSERT_EQ(copy_aborts, 1);
+	UT_ASSERT_EQ(copy_ends, 0);
+	UT_ASSERT_EQ(space_reads + reservations + new_wal + writes + syncs, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(30);
+	UT_RUN(test_raw_copy_fence_refusal_precedes_target_effects);
+	UT_RUN(test_raw_copy_owner_covers_space_wal_data_and_final_sync);
+	UT_RUN(test_raw_copy_rechecks_before_wal_data_and_sync);
+	UT_RUN(test_raw_copy_lost_owner_after_sync_cannot_report_completion);
+	UT_RUN(test_raw_copy_error_and_cancel_transfer_the_same_owner);
+	UT_RUN(test_raw_copy_private_and_temp_keep_native_lifetime);
+	UT_RUN(test_raw_copy_initial_owner_loss_precedes_space_read);
 	UT_RUN(test_resident_init_and_copy_bind_the_first_record);
 	UT_RUN(test_resident_capture_loss_keeps_unknown_first);
 	UT_RUN(test_resident_broken_owner_panics_before_unlock);
