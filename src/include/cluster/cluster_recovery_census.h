@@ -113,6 +113,17 @@ typedef struct ClusterRecoveryCensusDiag {
 	uint64 tx_targets, tx_target_missing, tx_target_short, tx_space_missing;
 } ClusterRecoveryCensusDiag;
 
+/* Value-owned identity of the complete observation, not a semantic seal.
+ * Full digests bind the original ordered inputs and physical ROOT union.
+ * Unowned effects remain obligations even when all counts/digests agree. */
+typedef struct ClusterRecoveryCensusManifest {
+	uint32 encoding_version;
+	uint32 source_count, root_count, tx_record_count;
+	uint64 wal_record_count, native_effect_count;
+	uint64 other_wal_record_count, unowned_target_record_count;
+	uint8 inputs_sha256[32], roots_sha256[32], observation_sha256[32];
+} ClusterRecoveryCensusManifest;
+
 /* Borrow the original live cold inputs and their ROOT-selected isolated
  * namespace fd. The caller holds isolation, retention and these owners for
  * the entire cursor lifetime; this API establishes none of those premises.
@@ -153,6 +164,13 @@ extern ClusterRecoveryCensusResult cluster_recovery_census_begin(ClusterWalInput
  */
 extern ClusterRecoveryCensusResult cluster_recovery_census_next(ClusterRecoveryCensus *census,
 																ClusterRecoveryCensusEntry *out);
+/* Available only after the original final TT/whole ROOT/full WAL rereads.
+ * Revalidate the live original scope and dependent owners before copying.
+ * False clears out; failures remain sticky. This does not repeat the DATA
+ * or WAL census; caller isolation/retention must last through every use.
+ * The value grants no recovery-completion/apply/terminal/OPEN/GC authority. */
+extern bool cluster_recovery_census_manifest(ClusterRecoveryCensus *census,
+											 ClusterRecoveryCensusManifest *out);
 extern bool cluster_recovery_census_diag(const ClusterRecoveryCensus *census,
 										 ClusterRecoveryCensusDiag *out);
 extern void cluster_recovery_census_destroy(ClusterRecoveryCensus *census);

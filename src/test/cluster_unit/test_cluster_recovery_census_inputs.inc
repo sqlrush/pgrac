@@ -392,6 +392,12 @@ UT_TEST(test_owned_census_error_releases_children)
 		PG_END_TRY();
 		UT_ASSERT(threw);
 		UT_ASSERT_EQ(memcmp(&entry, &zero, sizeof(entry)), 0);
+		{
+			ClusterRecoveryCensusManifest manifest, empty = { 0 };
+			memset(&manifest, 0x77, sizeof(manifest));
+			UT_ASSERT(!cluster_recovery_census_manifest(census, &manifest));
+			UT_ASSERT_EQ(memcmp(&manifest, &empty, sizeof(empty)), 0);
+		}
 		owned_census_sticky(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
 		owned_census_done(census, &inputs, fd, path);
 	}

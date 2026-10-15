@@ -8,6 +8,7 @@
  */
 #include "postgres.h"
 #include "cluster/cluster_recovery_census.h"
+#include "common/cryptohash.h"
 #ifdef USE_PGRAC_CLUSTER
 struct ClusterRecoveryCensus {
 	ClusterWalInputsV1 *inputs;
@@ -20,6 +21,7 @@ struct ClusterRecoveryCensus {
 	ClusterRecoverySlruScan *slru;
 	ClusterRecoveryRelmapScan *relmap;
 	ClusterRecoveryCensusDiag diag;
+	ClusterRecoveryCensusManifest manifest;
 	ClusterRecoveryCensusResult status;
 	uint32 source_count, target_at;
 	uint8 storage_uuid[16];
@@ -45,6 +47,7 @@ census_release(ClusterRecoveryCensus *census)
 	cluster_recovery_undo_store_destroy(census->undo);
 	census->undo = NULL;
 	census->graph = NULL;
+	memset(&census->manifest, 0, sizeof(census->manifest));
 	cluster_recovery_root_set_destroy(census->roots);
 	census->roots = NULL;
 }
@@ -174,6 +177,62 @@ census_target(ClusterRecoveryCensus *census, ClusterRecoveryCensusEntry *out)
 	d->tx_space_missing += !target->space_physical;
 	census->target_at++;
 	return census_entry(out, CLUSTER_RECOVERY_CENSUS_TX_TARGET);
+}
+
+static bool
+census_hash_number(pg_cryptohash_ctx *hash, uint64 value)
+{
+	uint8 bytes[8];
+	for (unsigned i = 0; i < sizeof(bytes); ++i)
+		bytes[i] = (uint8)(value >> (8 * i));
+	return pg_cryptohash_update(hash, bytes, sizeof(bytes)) == 0;
+}
+
+static bool
+census_build_manifest(ClusterRecoveryCensus *census)
+{
+	static const uint8 domain[] = "PGRAC-E1-CENSUS-OBSERVATION-V1";
+	ClusterRecoveryCensusManifest value = { 0 };
+	pg_cryptohash_ctx *volatile hash = NULL;
+	volatile bool ok = false;
+
+	if (!cluster_recovery_reference_graph_observed(census->graph)
+		|| !cluster_recovery_root_set_digest(census->roots, value.roots_sha256)
+		|| !cluster_recovery_native_inventory_digest(census->inventory, value.inputs_sha256))
+		return false;
+	value.encoding_version = 1;
+	value.source_count = census->source_count;
+	value.root_count = cluster_recovery_root_set_count(census->roots);
+	value.tx_record_count = cluster_recovery_reference_graph_count(census->graph);
+	value.wal_record_count = census->diag.inventory.records;
+	value.native_effect_count = census->diag.effects;
+	value.other_wal_record_count = census->diag.inventory.other_records;
+	value.unowned_target_record_count = census->diag.inventory.unowned_target_records;
+	PG_TRY();
+	{
+		hash = pg_cryptohash_create(PG_SHA256);
+		ok = hash != NULL && pg_cryptohash_init(hash) == 0
+			 && pg_cryptohash_update(hash, domain, sizeof(domain)) == 0
+			 && census_hash_number(hash, value.encoding_version)
+			 && census_hash_number(hash, value.source_count)
+			 && census_hash_number(hash, value.root_count)
+			 && census_hash_number(hash, value.tx_record_count)
+			 && census_hash_number(hash, value.wal_record_count)
+			 && census_hash_number(hash, value.native_effect_count)
+			 && census_hash_number(hash, value.other_wal_record_count)
+			 && census_hash_number(hash, value.unowned_target_record_count)
+			 && pg_cryptohash_update(hash, value.inputs_sha256, 32) == 0
+			 && pg_cryptohash_update(hash, value.roots_sha256, 32) == 0
+			 && pg_cryptohash_final(hash, value.observation_sha256, 32) == 0;
+	}
+	PG_FINALLY();
+	{
+		pg_cryptohash_free(hash);
+	}
+	PG_END_TRY();
+	if (ok)
+		census->manifest = value;
+	return ok;
 }
 
 static ClusterRecoveryCensusResult
@@ -396,17 +455,26 @@ census_step(ClusterRecoveryCensus *census, ClusterRecoveryCensusEntry *out)
 	case CLUSTER_RECOVERY_CENSUS_FINAL_WAL:
 		d->inventory_result = cluster_recovery_native_inventory_recheck(
 			census->inputs, census->inventory, &d->inventory);
-		if (d->inventory_result != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED)
+		if (d->inventory_result != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED
+			|| !census_build_manifest(census))
 			break;
 		d->phase = CLUSTER_RECOVERY_CENSUS_DONE;
 		census->status = CLUSTER_RECOVERY_CENSUS_DRAINED;
 		return census->status;
 	case CLUSTER_RECOVERY_CENSUS_DONE: {
-		uint8 digest[32];
+		uint8 digest[32], inputs_digest[32];
 		d->input_result = cluster_wal_inputs_revalidate_v1(census->inputs);
 		if (d->input_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			|| !cluster_recovery_root_set_digest(census->roots, digest)
-			|| !cluster_recovery_reference_graph_observed(census->graph))
+			|| !cluster_recovery_reference_graph_observed(census->graph)
+			|| !cluster_recovery_native_inventory_digest(census->inventory, inputs_digest)
+			|| census->manifest.encoding_version != 1
+			|| census->manifest.source_count != census->source_count
+			|| census->manifest.root_count != cluster_recovery_root_set_count(census->roots)
+			|| census->manifest.tx_record_count
+				   != cluster_recovery_reference_graph_count(census->graph)
+			|| memcmp(digest, census->manifest.roots_sha256, 32) != 0
+			|| memcmp(inputs_digest, census->manifest.inputs_sha256, 32) != 0)
 			break;
 		return CLUSTER_RECOVERY_CENSUS_DRAINED;
 	}
@@ -441,6 +509,23 @@ cluster_recovery_census_next(ClusterRecoveryCensus *census, ClusterRecoveryCensu
 	if (result != CLUSTER_RECOVERY_CENSUS_ENTRY)
 		memset(out, 0, sizeof(*out));
 	return result;
+}
+
+bool
+cluster_recovery_census_manifest(ClusterRecoveryCensus *census, ClusterRecoveryCensusManifest *out)
+{
+	ClusterRecoveryCensusEntry entry;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || census == NULL || census->status != CLUSTER_RECOVERY_CENSUS_DRAINED)
+		return false;
+	/* Use the original DONE path and its ERROR cleanup. Do not turn an
+	 * accessor call into implicit progress through a partial observation. */
+	if (cluster_recovery_census_next(census, &entry) != CLUSTER_RECOVERY_CENSUS_DRAINED)
+		return false;
+	*out = census->manifest;
+	return true;
 }
 
 bool

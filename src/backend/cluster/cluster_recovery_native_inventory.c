@@ -920,6 +920,82 @@ cluster_recovery_native_inventory_xact_step(ClusterRecoveryNativeInventory *inve
 	return result;
 }
 
+static bool
+inventory_digest_number(pg_cryptohash_ctx *hash, uint64 value)
+{
+	uint8 bytes[8];
+	for (unsigned i = 0; i < sizeof(bytes); ++i)
+		bytes[i] = (uint8)(value >> (8 * i));
+	return pg_cryptohash_update(hash, bytes, sizeof(bytes)) == 0;
+}
+
+static bool
+inventory_digest_source(pg_cryptohash_ctx *hash, const NativeInventorySource *saved)
+{
+	const ClusterWalSourceRef *s = &saved->source;
+	const ClusterControlRootIdentity *id = &s->claim.identity;
+	const RfContributorStreamCutV1 *cut = &saved->cut;
+	const ClusterWalTailObservation *tail = &saved->observed;
+
+#define INVENTORY_HASH(value_) inventory_digest_number(hash, (uint64)(value_))
+#define INVENTORY_BYTES(value_)                                                                    \
+	(pg_cryptohash_update(hash, (const uint8 *)(value_), sizeof(value_)) == 0)
+	return INVENTORY_HASH(id->system_identifier) && INVENTORY_BYTES(id->storage_uuid)
+		   && INVENTORY_BYTES(id->authority_uuid) && INVENTORY_HASH(id->origin_thread_id)
+		   && INVENTORY_HASH(id->reserved42) && INVENTORY_HASH((uint32)id->origin_node_id)
+		   && INVENTORY_HASH(id->thread_claim_created_at) && INVENTORY_HASH(id->thread_claim_crc32c)
+		   && INVENTORY_HASH(id->reserved60) && INVENTORY_HASH(id->origin_owner_incarnation)
+		   && INVENTORY_HASH(id->root_lineage_seq) && INVENTORY_HASH(s->claim.database_incarnation)
+		   && INVENTORY_HASH(s->claim.max_config_generation)
+		   && INVENTORY_BYTES(s->claim.claim_sha256) && INVENTORY_HASH(s->timeline)
+		   && INVENTORY_HASH(cut->failed_thread) && INVENTORY_HASH(cut->flags)
+		   && INVENTORY_HASH(cut->timeline_id) && INVENTORY_HASH(cut->scan_begin_inclusive)
+		   && INVENTORY_HASH(cut->scan_end_exclusive) && INVENTORY_HASH(cut->contributor_count)
+		   && INVENTORY_HASH(cut->component_count) && INVENTORY_HASH(cut->origin_owner_incarnation)
+		   && INVENTORY_HASH(tail->complete_end) && INVENTORY_HASH(tail->last_record_start)
+		   && INVENTORY_HASH(tail->last_record_crc) && INVENTORY_HASH(tail->records)
+		   && INVENTORY_HASH(tail->database_incarnation) && INVENTORY_BYTES(saved->transcript);
+#undef INVENTORY_HASH
+#undef INVENTORY_BYTES
+}
+
+bool
+cluster_recovery_native_inventory_digest(const ClusterRecoveryNativeInventory *inventory,
+										 uint8 out[32])
+{
+	static const uint8 domain[] = "PGRAC-E1-INPUT-OBSERVATION-V1";
+	pg_cryptohash_ctx *volatile hash = NULL;
+	volatile bool ok = false;
+	uint8 digest[32];
+
+	if (out != NULL)
+		memset(out, 0, 32);
+	if (out == NULL || inventory == NULL || !inventory->complete
+		|| inventory->status != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED
+		|| inventory->sources == NULL || inventory->source_count == 0
+		|| inventory->source_count > CLUSTER_WAL_INPUTS_MAX)
+		return false;
+	PG_TRY();
+	{
+		hash = pg_cryptohash_create(PG_SHA256);
+		ok = hash != NULL && pg_cryptohash_init(hash) == 0
+			 && pg_cryptohash_update(hash, domain, sizeof(domain)) == 0
+			 && inventory_digest_number(hash, inventory->source_count);
+		for (uint32 i = 0; ok && i < inventory->source_count; ++i)
+			ok = inventory_digest_number(hash, i)
+				 && inventory_digest_source(hash, &inventory->sources[i]);
+		ok = ok && pg_cryptohash_final(hash, digest, sizeof(digest)) == 0;
+	}
+	PG_FINALLY();
+	{
+		pg_cryptohash_free(hash);
+	}
+	PG_END_TRY();
+	if (ok)
+		memcpy(out, digest, sizeof(digest));
+	return ok;
+}
+
 void
 cluster_recovery_native_inventory_destroy(ClusterRecoveryNativeInventory *inventory)
 {

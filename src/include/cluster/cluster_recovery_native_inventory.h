@@ -120,6 +120,14 @@ extern ClusterRecoveryMultixactJoinResult cluster_recovery_native_inventory_mult
 	ClusterRecoveryNativeInventory *inventory, ClusterRecoveryRootSet *roots,
 	size_t join_memory_budget, ClusterRecoveryMultixactJoinEntry *out,
 	ClusterRecoveryNativeInventoryDiag *diag);
+/* Full SHA-256 of every original ordered source, cut, completed tail and
+ * all-record transcript (including empty sources/non-native records).
+ * Scalars are LE64; fixed arrays are whole; domains include their NUL.
+ * Available only on a complete, non-refused inventory. No I/O, cursor reset
+ * or authority: the original cold owner must perform its final recheck. */
+extern bool
+cluster_recovery_native_inventory_digest(const ClusterRecoveryNativeInventory *inventory,
+										 uint8 out[32]);
 extern void cluster_recovery_native_inventory_destroy(ClusterRecoveryNativeInventory *inventory);
 /* Independent retained terminal/assignment cursor, under the same borrowed
  * ROOT lifetime and failure rules as MX. At most128 saved records or one

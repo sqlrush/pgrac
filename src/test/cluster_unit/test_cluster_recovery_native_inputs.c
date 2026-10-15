@@ -684,6 +684,7 @@ cleanup:
 #include "test_cluster_recovery_relmap_inputs.inc"
 #include "test_cluster_recovery_relmap_physical_inputs.inc"
 #include "test_cluster_recovery_prepare_inputs.inc"
+#include "test_cluster_recovery_manifest_inputs.inc"
 
 int
 main(int argc, char **argv)
@@ -692,7 +693,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(57);
+	UT_PLAN(62);
 	UT_RUN(test_native_inventory_uses_two_real_cold_passes);
 	UT_RUN(test_native_inventory_never_returns_partial_on_drift_io_or_error);
 	UT_RUN(test_native_inventory_capacity_is_not_partial_success);
@@ -750,6 +751,11 @@ main(int argc, char **argv)
 	UT_RUN(test_cold_prepare_full_payload_and_polarities_remain_unowned);
 	UT_RUN(test_cold_prepare_two_pass_and_final_drift_revoke_roots);
 	UT_RUN(test_cold_prepare_invalid_or_completion_records_never_become_other);
+	UT_RUN(test_census_manifest_requires_original_final_reads);
+	UT_RUN(test_inventory_digest_binds_every_source_cut_tail_and_transcript);
+	UT_RUN(test_census_manifest_revokes_after_scope_or_dependency_loss);
+	UT_RUN(test_census_manifest_final_changes_never_export_partial);
+	UT_RUN(test_inventory_digest_canonical_sha256_and_failed_output);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
