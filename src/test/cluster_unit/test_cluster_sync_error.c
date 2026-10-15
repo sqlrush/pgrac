@@ -31,6 +31,8 @@ static const ClusterSharedFsOps *cluster_shared_fs_active_ops = &ops;
 static int cluster_raw_device_fd;
 int io_direct_flags;
 static bool queue_accepts, fail_sync, fail_write;
+static bool file_exists;
+static int reject_gate;
 static int writeback_calls;
 static int writeback_fence_calls;
 static int writeback_mrp_calls;
@@ -41,6 +43,7 @@ static int reported_level;
 static ClusterPageWalRefV1 first_before;
 static struct {
 	int level, caught, completed, queued, synced, first_unchanged, dirty;
+	int exists_calls, open_calls, close_calls;
 } *observed;
 
 static bool
@@ -150,6 +153,8 @@ RegisterSyncRequest(const FileTag *tag, SyncRequestType type, bool retry)
 void
 cluster_write_fence_reject_if_fenced(const char *op)
 {
+	if (reject_gate == 1)
+		ereport(ERROR, (errmsg("fixture write-fence refusal")));
 	if (strcmp(op, "writeback") == 0) {
 		writeback_fence_calls++;
 		if (writeback_calls != 0)
@@ -161,6 +166,8 @@ cluster_write_fence_reject_if_fenced(const char *op)
 void
 cluster_mrp_standby_shared_write_gate(const char *op)
 {
+	if (reject_gate == 2)
+		ereport(PANIC, (errmsg("fixture apply-master refusal")));
 	if (strcmp(op, "writeback") == 0) {
 		writeback_mrp_calls++;
 		if (writeback_calls != 0)
@@ -193,6 +200,33 @@ cluster_shared_fs_writeback(ClusterSharedFsHandle *handle,
 	writeback_calls++;
 }
 
+bool
+cluster_shared_fs_exists(RelFileLocator locator, ForkNumber fork)
+{
+	UT_ASSERT(RelFileLocatorEquals(locator, relation.smgr_rlocator.locator));
+	UT_ASSERT_EQ(fork, MAIN_FORKNUM);
+	observed->exists_calls++;
+	return file_exists;
+}
+
+void
+cluster_shared_fs_open_existing(RelFileLocator locator, ForkNumber fork,
+								ClusterSharedFsHandle **out)
+{
+	UT_ASSERT(RelFileLocatorEquals(locator, relation.smgr_rlocator.locator));
+	UT_ASSERT_EQ(fork, MAIN_FORKNUM);
+	UT_ASSERT(file_exists && out != NULL);
+	observed->open_calls++;
+	*out = &native_handle;
+}
+
+void
+cluster_shared_fs_close(ClusterSharedFsHandle *handle)
+{
+	UT_ASSERT(handle == &native_handle);
+	observed->close_calls++;
+}
+
 #include "test_cluster_data_sync_policy.inc"
 #include "test_cluster_sync_providers.inc"
 #define ENSURE_ACTIVE() Assert(cluster_shared_fs_active_ops != NULL)
@@ -214,6 +248,8 @@ setup(int provider)
 	immedsync_fence_calls = 0;
 	immedsync_mrp_calls = 0;
 	writeback_order_ok = true;
+	file_exists = true;
+	reject_gate = 0;
 	relation.smgr_rlocator.backend = InvalidBackendId;
 	native_handle.vfd = cluster_raw_device_fd = fileno(file);
 	native_handle.opened = true;
@@ -334,18 +370,138 @@ UT_TEST(immedsync_checks_existing_gates_before_provider)
 	UT_ASSERT_EQ(immedsync_mrp_calls, 1);
 }
 
+/* This calls the real checkpoint callback; filesystem lookup/open and the
+ * authority predicates are explicit boundaries. Provider sync remains real. */
+static int
+sync_filetag(void)
+{
+	FileTag tag;
+	char path[MAXPGPATH];
+	int result;
+
+	cluster_smgr_init_filetag(&tag, relation.smgr_rlocator.locator, MAIN_FORKNUM);
+	result = cluster_smgr_syncfiletag(&tag, path);
+	if (result == 0)
+		observed->completed++;
+	return result;
+}
+
+UT_TEST(sync_filetag_refuses_fenced_node_before_filesystem)
+{
+	setup(0);
+	reject_gate = 1;
+	PG_TRY();
+	{
+		(void)sync_filetag();
+	}
+	PG_CATCH();
+	{
+		observed->caught++;
+	}
+	PG_END_TRY();
+	UT_ASSERT_EQ(observed->level, ERROR);
+	UT_ASSERT_EQ(observed->caught, 1);
+	UT_ASSERT_EQ(observed->completed, 0);
+	UT_ASSERT_EQ(observed->exists_calls + observed->open_calls + observed->synced
+				 + observed->close_calls, 0);
+}
+
+UT_TEST(sync_filetag_refuses_standby_without_owner_before_filesystem)
+{
+	pid_t child;
+	int status;
+
+	setup(0);
+	reject_gate = 2;
+	fflush(NULL);
+	child = fork();
+	UT_ASSERT(child >= 0);
+	if (child == 0) {
+		(void)sync_filetag();
+		_exit(0);
+	}
+	UT_ASSERT_EQ(waitpid(child, &status, 0), child);
+	UT_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 86);
+	UT_ASSERT_EQ(observed->level, PANIC);
+	UT_ASSERT_EQ(observed->completed, 0);
+	UT_ASSERT_EQ(observed->exists_calls + observed->open_calls + observed->synced
+				 + observed->close_calls, 0);
+}
+
+UT_TEST(sync_filetag_preserves_provider_sync_and_missing_file)
+{
+	for (int provider = 0; provider < 3; provider++) {
+		setup(provider);
+		UT_ASSERT_EQ(sync_filetag(), 0);
+		UT_ASSERT_EQ(observed->exists_calls, 1);
+		UT_ASSERT_EQ(observed->open_calls, 1);
+		UT_ASSERT_EQ(observed->synced, 1);
+		UT_ASSERT_EQ(observed->close_calls, 1);
+		UT_ASSERT_EQ(observed->completed, 1);
+
+		setup(provider);
+		file_exists = false;
+		errno = 0;
+		UT_ASSERT_EQ(sync_filetag(), -1);
+		UT_ASSERT_EQ(errno, ENOENT);
+		UT_ASSERT_EQ(observed->exists_calls, 1);
+		UT_ASSERT_EQ(observed->open_calls + observed->synced + observed->close_calls
+					 + observed->completed, 0);
+	}
+}
+
+UT_TEST(sync_filetag_preserves_sync_error_policy)
+{
+	for (int provider = 0; provider < 3; provider++)
+		for (int retry = 0; retry < 2; retry++) {
+			pid_t child;
+			int status;
+
+			setup(provider);
+			fail_sync = true;
+			data_sync_retry = retry;
+			fflush(NULL);
+			child = fork();
+			UT_ASSERT(child >= 0);
+			if (child == 0) {
+				PG_TRY();
+				{
+					(void)sync_filetag();
+				}
+				PG_CATCH();
+				{
+					observed->caught++;
+				}
+				PG_END_TRY();
+				_exit(0);
+			}
+			UT_ASSERT_EQ(waitpid(child, &status, 0), child);
+			UT_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == (retry ? 0 : 86));
+			UT_ASSERT_EQ(observed->level, retry ? ERROR : PANIC);
+			UT_ASSERT_EQ(observed->caught, retry);
+			UT_ASSERT_EQ(observed->exists_calls, 1);
+			UT_ASSERT_EQ(observed->open_calls, 1);
+			UT_ASSERT_EQ(observed->synced, 1);
+			UT_ASSERT_EQ(observed->completed, 0);
+		}
+}
+
 int
 main(void)
 {
 	observed = mmap(NULL, sizeof(*observed), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
 	if (observed == MAP_FAILED)
 		return 2;
-	UT_PLAN(5);
+	UT_PLAN(9);
 	UT_RUN(sync_error_bypasses_retry_and_retains_first);
 	UT_RUN(registration_or_sync_precedes_clean_and_first_retirement);
 	UT_RUN(write_error_remains_error_and_sync_retry_uses_native_policy);
 	UT_RUN(writeback_checks_existing_gates_before_provider);
 	UT_RUN(immedsync_checks_existing_gates_before_provider);
+	UT_RUN(sync_filetag_refuses_fenced_node_before_filesystem);
+	UT_RUN(sync_filetag_refuses_standby_without_owner_before_filesystem);
+	UT_RUN(sync_filetag_preserves_provider_sync_and_missing_file);
+	UT_RUN(sync_filetag_preserves_sync_error_policy);
 	munmap(observed, sizeof(*observed));
 	if (file)
 		fclose(file);

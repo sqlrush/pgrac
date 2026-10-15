@@ -935,6 +935,12 @@ cluster_smgr_syncfiletag(const FileTag *ftag, char *path)
 {
 	ClusterSharedFsHandle *handle = NULL;
 
+	/* Checkpointer consumes queued syncs here without entering immedsync.
+	 * Recheck its original write authority before any filesystem access;
+	 * refusal must not return a successful completion to the sync owner. */
+	cluster_write_fence_reject_if_fenced("syncfiletag");
+	cluster_mrp_standby_shared_write_gate("syncfiletag");
+
 	snprintf(path, MAXPGPATH, "cluster_shared:%u/%u/%u fork %d", ftag->rlocator.spcOid,
 			 ftag->rlocator.dbOid, ftag->rlocator.relNumber, ftag->forknum);
 

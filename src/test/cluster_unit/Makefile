@@ -2406,7 +2406,8 @@ test_cluster_sync_smgr.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_sm
 	     /^cluster_smgr_write\(/ { print "void"; emit=1; n++ } \
 	     /^cluster_smgr_writeback\(/ { print "void"; emit=1; n++ } \
 	     /^cluster_smgr_immedsync\(/ { print "void"; emit=1; n++ } \
-	     emit { print } emit && /^}/ { emit=0 } END { if (n != 5 || emit) exit 1 }' $< > $@
+	     /^cluster_smgr_syncfiletag\(/ { print "int"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 6 || emit) exit 1 }' $< > $@
 
 test_cluster_sync_error: test_cluster_sync_error.c test_cluster_page_data.c \
 		test_cluster_data_sync_policy.inc test_cluster_sync_providers.inc test_cluster_sync_dispatch.inc test_cluster_sync_smgr.inc
