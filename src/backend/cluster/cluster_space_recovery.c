@@ -45,6 +45,7 @@ typedef struct SpaceRecoveryTarget {
 	ClusterSpaceIdentityKey key;
 	bool has_create;
 	bool has_structure;
+	bool native_create;
 	uint32 operation_count;
 	PGAlignedBlock before[2];
 	ClusterSpaceRecoveryImage final;
@@ -325,6 +326,41 @@ space_cold_shrink(ClusterSpaceRecoveryBatchV1 *batch, uint32 through, bool apply
 	return ok;
 }
 
+/* The paired native CREATE owns MAIN, the typed record owns SPACE. Keep
+ * their effects separate and never turn a missing nonempty MAIN into an
+ * empty relation. Existing MAIN is adopted by native redo, not truncated. */
+static bool
+space_native_create(ClusterSpaceRecoveryBatchV1 *batch, SpaceRecoveryTarget *target,
+					SMgrRelation rel, bool apply)
+{
+	ClusterSpaceReservation before;
+	uint64 token;
+	BlockNumber blocks;
+	bool present;
+
+	if (!target->native_create)
+		return true;
+	if (batch->cold_fence == NULL || !space_sources_fresh(batch))
+		return false;
+	present = smgrexists(rel, MAIN_FORKNUM);
+	if (!present && !PageIsNew(target->before[1].data)
+		&& (!cluster_space_reservation_page_decode(target->before[1].data, BLCKSZ, SPACE_FORKNUM, 1,
+												   &target->key, &before, &token)
+			|| before.next_block != 0))
+		return false;
+	if (!apply)
+		return space_sources_fresh(batch);
+	blocks = present ? smgrnblocks(rel, MAIN_FORKNUM) : 0;
+	if (!space_sources_fresh(batch))
+		return false;
+	smgrcreate(rel, MAIN_FORKNUM, true);
+	if (!space_sources_fresh(batch))
+		return false;
+	smgrimmedsync(rel, MAIN_FORKNUM);
+	return space_sources_fresh(batch) && smgrexists(rel, MAIN_FORKNUM)
+		   && smgrnblocks(rel, MAIN_FORKNUM) == blocks && space_sources_fresh(batch);
+}
+
 static bool
 space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, uint32 through)
 {
@@ -462,11 +498,13 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, u
 					&& !space_disk_matches(rel, i, target->before[i].data))
 					goto done;
 			if (prepared.source_index[0] == UINT32_MAX && prepared.source_index[1] == UINT32_MAX) {
-				ok = true;
+				ok = space_native_create(batch, target, rel, true);
 				goto done;
 			}
 		}
 		if (!space_sources_fresh(batch))
+			goto done;
+		if (!space_native_create(batch, target, rel, apply))
 			goto done;
 		if (!apply) {
 			ok = true;
@@ -595,6 +633,10 @@ space_recovery_preflight(const ClusterThreadRecoveryFabricPlanV1 *plan,
 
 		if (!rf_side_online_plan_operation_v1(side, i, &op))
 			return false;
+		if (op.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE) {
+			if (cold_fence == NULL || !rf_side_online_plan_native_creation_v1(side, i, &structure))
+				return false;
+		}
 		if (op.history_only)
 			continue;
 		if (op.kind == RF_SIDE_ONLINE_OPERATION_XACT && op.xact.space_drop_count != 0)
@@ -669,6 +711,13 @@ space_recovery_preflight(const ClusterThreadRecoveryFabricPlanV1 *plan,
 				RfSideOnlineOperationV1 op;
 				if (!rf_side_online_plan_operation_v1(side, j, &op))
 					goto done;
+				if (!op.history_only && op.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE) {
+					ClusterSpaceStructureChange paired;
+					if (!rf_side_online_plan_native_creation_v1(side, j, &paired))
+						goto done;
+					if (memcmp(&paired.identity.result.key, &target->key, sizeof(target->key)) == 0)
+						target->native_create = true;
+				}
 				if (!op.history_only && op.kind == RF_SIDE_ONLINE_OPERATION_SPACE
 					&& (op.identity.record.info & ~XLR_INFO_MASK) == XLOG_SMGR_SPACE_IDENTITY
 					&& RelFileLocatorEquals(op.space_key.locator, target->key.locator))
@@ -885,6 +934,8 @@ cluster_space_recovery_cold_preflight_v1(const RfSideOnlinePlanV1 *side,
 		fence != NULL ? cluster_recovery_merge_fence_plan_origin_count(fence) : 0, out);
 }
 
+static bool space_native_create_sources_sync(ClusterSpaceRecoveryBatchV1 *batch);
+
 bool
 cluster_space_recovery_apply_through_v1(ClusterSpaceRecoveryBatchV1 *batch, uint32 target,
 										uint32 through)
@@ -893,7 +944,42 @@ cluster_space_recovery_apply_through_v1(ClusterSpaceRecoveryBatchV1 *batch, uint
 		|| target >= batch->target_count || through >= batch->targets[target].operation_count
 		|| !space_sources_fresh(batch))
 		return false;
-	return space_target_run(batch, target, true, through);
+	return space_native_create_sources_sync(batch)
+		   && space_target_run(batch, target, true, through);
+}
+
+static bool
+space_native_create_sources_sync(ClusterSpaceRecoveryBatchV1 *batch)
+{
+	for (uint32 i = 0; batch->side != NULL && i < batch->operation_count; i++) {
+		RfSideOnlineOperationV1 op;
+		bool found = false;
+		if (!rf_side_online_plan_operation_v1(batch->side, i, &op))
+			return false;
+		if (op.history_only || op.kind != RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE)
+			continue;
+		if (batch->cold_fence == NULL || !space_sources_fresh(batch))
+			return false;
+		for (uint32 j = 0; j < batch->source_count; j++) {
+			const ClusterThreadRecoveryAuthorityV1 *a = &batch->sources[j];
+			ClusterWalTailObservation observed;
+			if (a->duty->origin_thread_id != op.identity.record.origin_thread)
+				continue;
+			/* Original ROOT owner syncs this exact retained source outside CF
+			 * and target locks; no local numerical-LSN flush can replace it. */
+			if (cluster_control_root_recovery_sync_v1(a->root_snapshot, a->root_token, &observed)
+					!= CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				|| !space_sources_fresh(batch)
+				|| observed.complete_end != a->root_snapshot->validated_tail_lsn_exclusive
+				|| observed.last_record_start != a->root_snapshot->tail_last_record_lsn
+				|| observed.last_record_crc != a->root_snapshot->tail_last_record_crc32c)
+				return false;
+			found = true;
+		}
+		if (!found)
+			return false;
+	}
+	return true;
 }
 
 bool
@@ -901,6 +987,8 @@ cluster_space_recovery_apply_v1(ClusterSpaceRecoveryBatchV1 *batch)
 {
 	if (batch == NULL || !batch->preflight_complete || batch->installed
 		|| !space_sources_fresh(batch))
+		return false;
+	if (!space_native_create_sources_sync(batch))
 		return false;
 	for (uint32 i = 0; i < batch->target_count; i++)
 		if (!space_target_run(batch, i, true, UINT32_MAX))
@@ -1007,7 +1095,10 @@ cluster_space_recovery_preflight_operation_v1(void *arg, const RfSideOnlineOpera
 	const ClusterSpaceRecoveryBatchV1 *batch = arg;
 
 	if (batch == NULL || !batch->preflight_complete || operation == NULL || operation->history_only
-		|| operation->kind != RF_SIDE_ONLINE_OPERATION_SPACE || !space_sources_fresh(batch))
+		|| (operation->kind != RF_SIDE_ONLINE_OPERATION_SPACE
+			&& (operation->kind != RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE
+				|| batch->cold_fence == NULL))
+		|| !space_sources_fresh(batch))
 		return false;
 	for (uint32 i = 0; i < batch->operation_count; i++) {
 		RfSideOnlineOperationV1 expected;
@@ -1015,7 +1106,13 @@ cluster_space_recovery_preflight_operation_v1(void *arg, const RfSideOnlineOpera
 		if (!rf_side_online_plan_operation_v1(batch->side, i, &expected))
 			return false;
 		if (memcmp(&operation->identity, &expected.identity, sizeof(expected.identity)) == 0)
-			return !expected.history_only && expected.kind == RF_SIDE_ONLINE_OPERATION_SPACE
+			return !expected.history_only && expected.kind == operation->kind
+				   && expected.purpose == RF_SIDE_PLAN_RECOVERY
+				   && operation->purpose == expected.purpose
+				   && (operation->kind != RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE
+					   || (operation->source_xid == expected.source_xid
+						   && memcmp(&operation->route, &expected.route, sizeof(expected.route))
+								  == 0))
 				   && operation->owned_payload_length == expected.owned_payload_length
 				   && operation->owned_payload != NULL && expected.owned_payload != NULL
 				   && memcmp(operation->owned_payload, expected.owned_payload,

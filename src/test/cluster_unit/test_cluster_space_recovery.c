@@ -83,6 +83,11 @@ static bool source_unavailable;
 static unsigned pins, locks, writes, syncs, reads, lock_calls;
 static bool hw_held, permitted, stale, exists, corrupt_disk, structural, wrong_cut;
 static bool creating;
+static FILE *main_file;
+static bool main_exists, stale_after_main_create, stale_after_main_sync, hide_main_after_sync;
+static unsigned main_creates, main_syncs, create_source_syncs;
+static bool fail_create_source_sync, wrong_create_source_sync;
+
 static BlockNumber existing_blocks;
 static unsigned creates, extensions, x_locks;
 static int fail_write_block;
@@ -178,6 +183,27 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *root,
 			*redo = source_redo[i];
 			return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 		}
+	return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+
+ClusterControlRootResult
+cluster_control_root_recovery_sync_v1(const ClusterControlRootSnapshot *root,
+									  const ClusterControlRootReadToken *token,
+									  ClusterWalTailObservation *out)
+{
+	UT_ASSERT(CurrentResourceOwner == source_owner && !pins && !locks && !hw_held);
+	UT_ASSERT(cold_protected());
+	for (int i = 0; i < 2; i++) {
+		if (root != sources[i].root_snapshot || token != sources[i].root_token)
+			continue;
+		create_source_syncs++;
+		memset(out, 0, sizeof(*out));
+		out->complete_end = root->validated_tail_lsn_exclusive + wrong_create_source_sync;
+		out->last_record_start = root->tail_last_record_lsn;
+		out->last_record_crc = root->tail_last_record_crc32c;
+		return fail_create_source_sync ? CLUSTER_CONTROL_ROOT_IO_ERROR
+									   : CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	}
 	return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 }
 
@@ -383,17 +409,37 @@ smgropen(RelFileLocator r, BackendId b)
 bool
 smgrexists(SMgrRelation r, ForkNumber f)
 {
-	return exists;
+	return f == MAIN_FORKNUM ? main_exists : exists;
 }
 BlockNumber
 smgrnblocks(SMgrRelation r, ForkNumber f)
 {
+	if (f == MAIN_FORKNUM) {
+		long length;
+		UT_ASSERT(main_exists && main_file != NULL);
+		UT_ASSERT_EQ(fseek(main_file, 0, SEEK_END), 0);
+		length = ftell(main_file);
+		UT_ASSERT(length >= 0 && length % BLCKSZ == 0);
+		return length / BLCKSZ;
+	}
 	return existing_blocks;
 }
 void
 smgrcreate(SMgrRelation r, ForkNumber fork, bool is_redo)
 {
 	UT_ASSERT((hw_held || cold_protected()) && CurrentResourceOwner == child_owner);
+	if (fork == MAIN_FORKNUM) {
+		UT_ASSERT(cold_protected() && is_redo);
+		fault(7);
+		if (!main_exists) {
+			UT_ASSERT_EQ(ftruncate(fileno(main_file), 0), 0);
+			main_exists = true;
+		}
+		main_creates++;
+		if (stale_after_main_create)
+			stale = true;
+		return;
+	}
 	UT_ASSERT_EQ(fork, SPACE_FORKNUM);
 	UT_ASSERT(is_redo && !exists && existing_blocks == 0);
 	exists = true;
@@ -515,6 +561,17 @@ void
 smgrimmedsync(SMgrRelation r, ForkNumber f)
 {
 	UT_ASSERT(CurrentResourceOwner == child_owner);
+	if (f == MAIN_FORKNUM) {
+		UT_ASSERT(cold_protected() && main_exists);
+		fault(8);
+		UT_ASSERT_EQ(fsync(fileno(main_file)), 0);
+		main_syncs++;
+		if (stale_after_main_sync)
+			stale = true;
+		if (hide_main_after_sync)
+			main_exists = false;
+		return;
+	}
 	UT_ASSERT(locks == 3 && (hw_held || cold_protected()));
 	fault(5);
 	UT_ASSERT_EQ(fsync(fileno(file)), 0);
@@ -795,6 +852,15 @@ reset(void)
 	cluster_smart_fusion = false;
 	hw_held = stale = corrupt_disk = structural = wrong_cut = false;
 	creating = false;
+	main_exists = true;
+	main_creates = main_syncs = create_source_syncs = 0;
+	fail_create_source_sync = wrong_create_source_sync = false;
+	stale_after_main_create = stale_after_main_sync = hide_main_after_sync = false;
+	if (main_file)
+		fclose(main_file);
+	main_file = tmpfile();
+	if (main_file == NULL)
+		abort();
 	existing_blocks = 2;
 	creates = extensions = x_locks = 0;
 	fail_write_block = -1;
@@ -1522,6 +1588,272 @@ create_preflight(bool cold, ClusterSpaceRecoveryBatchV1 **batch)
 		return cluster_space_recovery_cold_preflight_v1(side, cold_fence, batch);
 	}
 	return cluster_space_recovery_preflight_v1(fabric, sources, 2, batch);
+}
+
+/* Original bounded SIDE parser, exact typed codec and cold SPACE owner.
+ * Only the native smgr/ROOT environment is supplied by this fixture. */
+static bool
+native_create_plan(int variant)
+{
+	RfSideOnlinePlanRequestV1 request = { .system_identifier = 17,
+										  .physical_cuts = cuts,
+										  .participant_count = 2,
+										  .redo_starts = native_redo };
+	ClusterSpaceStructureChange create = { 0 };
+	uint8 typed[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	xl_smgr_create native = { key.locator, MAIN_FORKNUM };
+
+	rf_side_online_plan_destroy_v1(&side);
+	memcpy(request.storage_uuid, key.storage_uuid, 16);
+	if (variant == 8) {
+		request.purpose = RF_SIDE_PLAN_PI_CONTRIBUTIONS;
+		request.redo_starts = NULL;
+	}
+	if (variant == 9)
+		native_redo[0] = source_redo[0] = 120;
+	UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &side), RF_PAGE_PROOF_DETAIL_OK);
+	create.identity.action = CLUSTER_SPACE_WAL_CREATE;
+	create.identity.nblocks = InvalidBlockNumber;
+	create.identity.result = changes[0].before.identity;
+	create.identity.result_token = changes[0].before_token;
+	create.reservation.action = CLUSTER_SPACE_RESERVATION_INIT;
+	create.reservation.result = changes[0].before;
+	create.reservation.result_token = changes[0].before_token;
+	UT_ASSERT(cluster_space_structure_wal_encode(&create, typed, sizeof(typed)));
+	if (variant == 1)
+		native.rlocator.relNumber++;
+	if (variant == 2)
+		native.forkNum = FSM_FORKNUM;
+	for (int i = 0; i < 3; i++) {
+		XLogReaderState reader = { 0 };
+		DecodedXLogRecord decoded = { 0 };
+		RfDetachedRecordPlanV1 record = { 0 };
+		RfPageOnlineRecordIdentityV1 identity = operations[i == 2 ? 1 : 0].identity;
+		RfPageProofDetailV1 detail;
+
+		identity.record.read_rec_ptr = i == 1 ? 120 : 100;
+		identity.record.end_rec_ptr = i == 0 ? 120 : 200;
+		identity.record.info = (i == 0	 ? XLOG_SMGR_CREATE
+								: i == 1 ? XLOG_SMGR_SPACE_IDENTITY
+										 : XLOG_SMGR_SPACE_RESERVATION)
+							   | XLR_SPECIAL_REL_UPDATE;
+		if (variant == 3 && i == 0)
+			identity.record.info &= ~XLR_SPECIAL_REL_UPDATE;
+		decoded.main_data = i == 0 ? (char *)&native : i == 1 ? (char *)typed : (char *)payload[1];
+		decoded.main_data_len = i == 0	 ? sizeof(native)
+								: i == 1 ? sizeof(typed)
+										 : sizeof(payload[1]);
+		if (variant == 4 && i == 0)
+			decoded.main_data_len--;
+		decoded.max_block_id = variant == 5 && i == 0 ? 0 : -1;
+		decoded.header.xl_xid = variant == 6 && i == 1 ? 810 : 809;
+		decoded.header.xl_rmid = identity.record.rmid;
+		decoded.header.xl_info = identity.record.info;
+		decoded.header.xl_crc = identity.record.record_crc;
+		decoded.lsn = identity.record.read_rec_ptr;
+		decoded.next_lsn = identity.record.end_rec_ptr;
+		reader.record = &decoded;
+		reader.system_identifier = identity.record.system_identifier;
+		reader.ReadRecPtr = decoded.lsn;
+		reader.EndRecPtr = decoded.next_lsn;
+		record.source_record = &reader;
+		record.preflight_complete = true;
+		record.route.rmid = identity.record.rmid;
+		record.route.normalized_info = identity.record.info & ~XLR_INFO_MASK;
+		record.route.record_owner = RF_ROUTE_OWNER_SIDE_TYPED;
+		record.route.block_policy = RF_ROUTE_BLOCKS_FORBIDDEN;
+		record.route.codec_id = RF_ROUTE_CODEC_SIDE_STANDARD;
+		if (variant == 7 && i == 1)
+			continue;
+		if (variant == 10 && i == 1) {
+			decoded.header.xl_info = identity.record.info
+				= XLOG_SMGR_CREATE | XLR_SPECIAL_REL_UPDATE;
+			record.route.normalized_info = XLOG_SMGR_CREATE;
+			decoded.main_data = (char *)&native;
+			decoded.main_data_len = sizeof(native);
+		}
+		detail = rf_side_online_plan_feed_record_v1(side, &record, &identity);
+		if (detail != RF_PAGE_PROOF_DETAIL_OK)
+			return false;
+	}
+	return rf_side_online_plan_bind_database_v1(side, 42)
+		   && rf_side_online_plan_seal_v1(side) == RF_PAGE_PROOF_DETAIL_OK;
+}
+
+UT_TEST(test_cold_native_create_pairs_and_precedes_space_install)
+{
+	for (int shape = 0; shape < 7; shape++) {
+		ClusterSpaceRecoveryBatchV1 *batch = NULL;
+		RfSideOnlineOperationV1 op;
+		RfSideOnlineApplyOpsV1 ops
+			= { .begin_protected_set = space_begin,
+				.end_protected_set = space_end,
+				.preflight_space = cluster_space_recovery_preflight_operation_v1,
+				.apply_space = cluster_space_recovery_applied_operation_v1 };
+		char sentinel[BLCKSZ], readback[BLCKSZ];
+
+		create_input(shape);
+		memset(sentinel, 0x5a, sizeof(sentinel));
+		UT_ASSERT_EQ(pwrite(fileno(main_file), sentinel, sizeof(sentinel), 0), sizeof(sentinel));
+		UT_ASSERT(native_create_plan(0));
+		if (rf_side_online_plan_operation_count_v1(side) != 3)
+			continue;
+		UT_ASSERT(create_preflight(true, &batch));
+		if (batch == NULL)
+			continue;
+		ops.arg = batch;
+		/* Native structure cannot fall through to a projection callback. */
+		{
+			RfSideOnlineApplyOpsV1 bad = ops;
+			bad.preflight_projection = cluster_space_recovery_preflight_operation_v1;
+			bad.apply_projection = cluster_space_recovery_applied_operation_v1;
+			bad.preflight_space = NULL;
+			bad.apply_space = NULL;
+			UT_ASSERT_EQ(rf_side_online_plan_preflight_v1(side, &bad),
+						 RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT);
+			UT_ASSERT_EQ(rf_side_online_plan_apply_v1(side, &bad),
+						 RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT);
+		}
+		UT_ASSERT_EQ(main_creates + main_syncs + writes, 0);
+		UT_ASSERT_EQ(rf_side_online_plan_preflight_v1(side, &ops), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_NE(rf_side_online_plan_apply_v1(side, &ops), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(cluster_space_recovery_apply_v1(batch));
+		UT_ASSERT_EQ(main_creates, 1);
+		UT_ASSERT_EQ(main_syncs, 1);
+		UT_ASSERT_EQ(pread(fileno(main_file), readback, sizeof(readback), 0), sizeof(readback));
+		UT_ASSERT(memcmp(readback, sentinel, sizeof(readback)) == 0);
+		UT_ASSERT_EQ(rf_side_online_plan_apply_v1(side, &ops), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(rf_side_online_plan_operation_v1(side, 0, &op));
+		op.source_xid++;
+		UT_ASSERT(!cluster_space_recovery_applied_operation_v1(batch, &op));
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+		cluster_space_recovery_destroy_v1(&batch);
+	}
+}
+
+UT_TEST(test_cold_native_create_missing_main_and_pair_refusals)
+{
+	for (int variant = 0; variant < 11; variant++) {
+		ClusterSpaceRecoveryBatchV1 *batch = NULL;
+		bool sealed;
+		create_input(0);
+		main_exists = variant == 9;
+		sealed = native_create_plan(variant);
+		if ((variant > 0 && variant < 8) || variant == 10) {
+			UT_ASSERT(!sealed);
+			continue;
+		}
+		UT_ASSERT(sealed);
+		if (!sealed)
+			continue;
+		if (variant == 8) {
+			UT_ASSERT(!create_preflight(true, &batch));
+			UT_ASSERT_NULL(batch);
+			continue;
+		}
+		UT_ASSERT(create_preflight(true, &batch));
+		if (batch == NULL)
+			continue;
+		UT_ASSERT(cluster_space_recovery_apply_v1(batch));
+		UT_ASSERT_EQ(main_creates, variant == 9 ? 0 : 1);
+		UT_ASSERT_EQ(main_syncs, variant == 9 ? 0 : 1);
+		UT_ASSERT(main_exists);
+		cluster_space_recovery_destroy_v1(&batch);
+	}
+}
+
+UT_TEST(test_cold_native_create_refuses_lost_data_and_wrong_execution_owner)
+{
+	for (int variant = 0; variant < 5; variant++) {
+		ClusterSpaceRecoveryBatchV1 *batch = NULL;
+		create_input(variant == 0 ? 6 : 0);
+		main_exists = variant != 0;
+		UT_ASSERT(native_create_plan(0));
+		MyAuxProcType = StartupProcess;
+		if (variant == 1) {
+			UT_ASSERT(!cluster_space_recovery_preflight_v1(fabric, sources, 2, &batch));
+		} else {
+			if (variant == 2)
+				serials[0].mode = CLUSTER_RECOVERY_SERIAL_ONLINE;
+			if (variant == 3)
+				cold_current = false;
+			if (variant == 4)
+				roots[0].identity.origin_owner_incarnation++;
+			UT_ASSERT(!cluster_space_recovery_cold_preflight_v1(side, cold_fence, &batch));
+		}
+		UT_ASSERT_NULL(batch);
+		UT_ASSERT_EQ(writes + main_creates + main_syncs, 0);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_native_create_failed_sync_or_expiry_keeps_responsibility)
+{
+	for (int variant = 0; variant < 6; variant++) {
+		ClusterSpaceRecoveryBatchV1 *batch = NULL;
+		RfSideOnlineOperationV1 op;
+		create_input(0);
+		main_exists = false;
+		UT_ASSERT(native_create_plan(0));
+		UT_ASSERT(create_preflight(true, &batch));
+		if (batch == NULL)
+			continue;
+		UT_ASSERT(rf_side_online_plan_operation_v1(side, 0, &op));
+		fail_create_source_sync = variant == 0;
+		wrong_create_source_sync = variant == 1;
+		stale_after_main_create = variant == 2;
+		stale_after_main_sync = variant == 3;
+		hide_main_after_sync = variant == 4;
+		if (variant == 5)
+			stale = true;
+		UT_ASSERT(!cluster_space_recovery_apply_v1(batch));
+		UT_ASSERT(!cluster_space_recovery_applied_operation_v1(batch, &op));
+		UT_ASSERT_EQ(writes + creates + extensions, 0);
+		UT_ASSERT_EQ(main_creates, variant >= 2 && variant <= 4);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+		stale = fail_create_source_sync = wrong_create_source_sync = false;
+		stale_after_main_create = stale_after_main_sync = hide_main_after_sync = false;
+		UT_ASSERT(!cluster_space_recovery_applied_operation_v1(batch, &op));
+		UT_ASSERT(cluster_space_recovery_apply_v1(batch));
+		UT_ASSERT(cluster_space_recovery_applied_operation_v1(batch, &op));
+		cluster_space_recovery_destroy_v1(&batch);
+	}
+}
+
+UT_TEST(test_cold_native_create_error_unwinds_and_repeats_without_truncation)
+{
+	for (int at = 7; at <= 8; at++) {
+		ClusterSpaceRecoveryBatchV1 *volatile batch = NULL;
+		RfSideOnlineOperationV1 op;
+		volatile bool caught = false;
+		create_input(0);
+		main_exists = false;
+		UT_ASSERT(native_create_plan(0));
+		UT_ASSERT(create_preflight(true, (ClusterSpaceRecoveryBatchV1 **)&batch));
+		if (batch == NULL)
+			continue;
+		UT_ASSERT(rf_side_online_plan_operation_v1(side, 0, &op));
+		throw_at = at;
+		PG_TRY();
+		{
+			(void)cluster_space_recovery_apply_v1(batch);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT(!cluster_space_recovery_applied_operation_v1(batch, &op));
+		UT_ASSERT_EQ(writes + creates + extensions, 0);
+		UT_ASSERT_EQ(main_creates, at == 8);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+		throw_at = 0;
+		UT_ASSERT(cluster_space_recovery_apply_v1(batch));
+		UT_ASSERT(cluster_space_recovery_applied_operation_v1(batch, &op));
+		UT_ASSERT_EQ(smgrnblocks(&relation, MAIN_FORKNUM), 0);
+		cluster_space_recovery_destroy_v1((ClusterSpaceRecoveryBatchV1 **)&batch);
+	}
 }
 
 UT_TEST(test_create_missing_partial_and_complete_space_then_cross_source_advance)
@@ -2387,7 +2719,12 @@ UT_TEST(test_compact_cold_physical_refusal_precedes_all_prefix_mutations)
 int
 main(void)
 {
-	UT_PLAN(48);
+	UT_PLAN(53);
+	UT_RUN(test_cold_native_create_refuses_lost_data_and_wrong_execution_owner);
+	UT_RUN(test_cold_native_create_failed_sync_or_expiry_keeps_responsibility);
+	UT_RUN(test_cold_native_create_error_unwinds_and_repeats_without_truncation);
+	UT_RUN(test_cold_native_create_pairs_and_precedes_space_install);
+	UT_RUN(test_cold_native_create_missing_main_and_pair_refusals);
 	UT_RUN(test_compact_cold_vm_shrink_does_not_shrink_main);
 	UT_RUN(test_compact_cold_named_shrink_runs_even_when_space_is_already_durable);
 	UT_RUN(test_compact_cold_unrequested_shrink_does_not_inspect_or_modify_data);
@@ -2438,6 +2775,8 @@ main(void)
 	UT_RUN(test_physical_checksum_is_strict);
 	if (file)
 		fclose(file);
+	if (main_file)
+		fclose(main_file);
 	rf_side_online_plan_destroy_v1(&side);
 	UT_DONE();
 	return ut_failed_count != 0;

@@ -117,6 +117,10 @@ extern RfPageProofDetailV1
 rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 								   const RfDetachedRecordPlanV1 *record_plan,
 								   const RfPageOnlineRecordIdentityV1 *identity);
+/* Exact same-source native MAIN CREATE / typed CREATE pair. This is an
+ * immutable dependency lookup, never an execution or file-existence proof. */
+extern bool rf_side_online_plan_native_creation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+												   ClusterSpaceStructureChange *change);
 /* Check retained native creation boundaries against an exact PAGE graph.
  * This is a read-only dependency check, never replay eligibility. */
 extern bool rf_side_online_plan_page_lifecycle_v1(const RfSideOnlinePlanV1 *plan,

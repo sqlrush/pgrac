@@ -916,8 +916,7 @@ side_decode_record(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *recor
 			}
 		} else if (record_plan->route.rmid == RM_SMGR_ID
 				   && record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_STANDARD) {
-			if (plan->purpose == RF_SIDE_PLAN_PI_CONTRIBUTIONS
-				&& record_plan->route.normalized_info == XLOG_SMGR_CREATE) {
+			if (record_plan->route.normalized_info == XLOG_SMGR_CREATE) {
 				xl_smgr_create create;
 				if (XLogRecHasAnyBlockRefs(record_plan->source_record)
 					|| XLogRecGetInfo(record_plan->source_record)
@@ -1762,8 +1761,8 @@ done:
  * to a subsequent typed CREATE; PAGE users must additionally match every
  * version edge to that typed incarnation and respect its creation boundary. */
 static bool
-side_pi_creation(const RfSideOnlinePlanV1 *plan, uint32 index,
-				 ClusterSpaceStructureChange *change, uint32 *typed_index)
+side_native_creation(const RfSideOnlinePlanV1 *plan, uint32 index,
+					 ClusterSpaceStructureChange *change, uint32 *typed_index)
 {
 	const RfSideOnlineOperationV1 *op = &plan->operations[index];
 	xl_smgr_create create;
@@ -1802,15 +1801,34 @@ side_pi_creation(const RfSideOnlinePlanV1 *plan, uint32 index,
 	return false;
 }
 
+bool
+rf_side_online_plan_native_creation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+									   ClusterSpaceStructureChange *change)
+{
+	uint32 typed;
+
+	if (change != NULL)
+		memset(change, 0, sizeof(*change));
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || plan->failed
+		|| plan->purpose != RF_SIDE_PLAN_RECOVERY || change == NULL
+		|| index >= plan->operation_count)
+		return false;
+	if (!side_native_creation(plan, index, change, &typed)) {
+		memset(change, 0, sizeof(*change));
+		return false;
+	}
+	return true;
+}
+
 static bool
-side_pi_structures_covered(const RfSideOnlinePlanV1 *plan)
+side_native_structures_covered(const RfSideOnlinePlanV1 *plan)
 {
 	for (uint32 i = 0; i < plan->operation_count; i++) {
 		ClusterSpaceStructureChange change;
 		uint32 typed;
 
 		if (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE
-			&& !side_pi_creation(plan, i, &change, &typed))
+			&& !side_native_creation(plan, i, &change, &typed))
 			return false;
 	}
 	return true;
@@ -1833,7 +1851,7 @@ rf_side_online_plan_page_lifecycle_v1(const RfSideOnlinePlanV1 *plan,
 
 		if (op->kind != RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE)
 			continue;
-		if (!side_pi_creation(plan, i, &change, &typed))
+		if (!side_native_creation(plan, i, &change, &typed))
 			return false;
 		if (!RelFileLocatorEquals(target->page_identity.locator, change.identity.result.key.locator))
 			continue;
@@ -1878,7 +1896,7 @@ rf_side_online_plan_seal_v1(RfSideOnlinePlanV1 *plan)
 					|| plan->last_record_end[i] != cut->scan_end_exclusive)))
 			return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
 	}
-	if (plan->purpose == RF_SIDE_PLAN_PI_CONTRIBUTIONS && !side_pi_structures_covered(plan))
+	if (!side_native_structures_covered(plan))
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 	detail = side_space_sources_seal(plan);
 	if (detail != RF_PAGE_PROOF_DETAIL_OK)
@@ -2417,7 +2435,8 @@ side_plan_apply_ops_valid(const RfSideOnlinePlanV1 *plan, const RfSideOnlineAppl
 				&& (ops->preflight_undo == NULL || ops->apply_undo == NULL))
 			|| (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_PROJECTION
 				&& (ops->preflight_projection == NULL || ops->apply_projection == NULL))
-			|| (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_SPACE
+			|| ((plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_SPACE
+				 || plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE)
 				&& (ops->preflight_space == NULL || ops->apply_space == NULL))
 			/* No projection/TT callback may stand in for native control. */
 			|| (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
@@ -2461,7 +2480,8 @@ side_plan_preflight_active(const RfSideOnlinePlanV1 *plan, const RfSideOnlineApp
 			accepted = ops->preflight_xact(ops->arg, &operation);
 		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO)
 			accepted = ops->preflight_undo(ops->arg, &operation);
-		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_SPACE)
+		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_SPACE
+				 || operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE)
 			accepted = ops->preflight_space(ops->arg, &operation);
 		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL)
 			accepted = ops->preflight_control(ops->arg, &operation);
@@ -2521,7 +2541,8 @@ side_plan_apply_active(const RfSideOnlinePlanV1 *plan, const RfSideOnlineApplyOp
 			applied = ops->apply_xact(ops->arg, &operation);
 		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO)
 			applied = ops->apply_undo(ops->arg, &operation);
-		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_SPACE)
+		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_SPACE
+				 || operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE)
 			applied = ops->apply_space(ops->arg, &operation);
 		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL)
 			applied = ops->apply_control(ops->arg, &operation);

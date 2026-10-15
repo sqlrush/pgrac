@@ -53,6 +53,9 @@ extern bool cluster_space_recovery_apply_through_v1(ClusterSpaceRecoveryBatchV1 
  * Borrows that plan and the sealed SIDE inputs until batch destruction;
  * neither an origin number nor a caller-provided mode grants mutation.
  * Accepts CREATE plus ADVANCE; ADVANCE alone needs a durable identity page.
+ * A same-source native MAIN CREATE is executed only with its exact typed
+ * CREATE pair. Original source sync precedes all target mutation; MAIN
+ * creation never truncates an existing fork or certifies final ROOT publish.
  * TRUNCATE and DROP need their separate structural retirement owner. */
 extern bool cluster_space_recovery_cold_preflight_v1(const RfSideOnlinePlanV1 *side,
 													 struct ClusterRecoveryFencePlan *fence,
