@@ -48,6 +48,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_ic_tier1.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
@@ -89,6 +90,13 @@ AuxProcType MyAuxProcType = NotAnAuxProcess;
 
 /* No shared reconfiguration or DATA receipt is supplied by this lock-order
  * fixture. Actual receipt/physical owners run in test_cluster_page_data. */
+bool
+cluster_ko_directory_drop_retired_v3(RelFileLocator locator pg_attribute_unused())
+{
+	/* No committed object identity is supplied by this legacy hook fixture. */
+	return false;
+}
+
 bool
 cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 {

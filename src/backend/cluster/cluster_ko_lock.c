@@ -937,8 +937,8 @@ ko_drop_closed_locked(RelFileLocator locator)
 	return false;
 }
 
-bool
-cluster_ko_directory_drop_committed_v3(RelFileLocator locator)
+static bool
+ko_directory_drop_at_least(RelFileLocator locator, uint8 minimum_state)
 {
 	bool committed = false;
 	uint32 link;
@@ -966,13 +966,27 @@ cluster_ko_directory_drop_committed_v3(RelFileLocator locator)
 			committed = false;
 			break;
 		}
-		if (identity->state >= KO_DROP_IDENTITY_CLOSING
+		if (identity->state >= minimum_state
 			&& RelFileLocatorEquals(identity->request.base.key.locator, locator))
 			committed = true;
 		link = identity->next;
 	}
 	SpinLockRelease(&ko_state->shared_lock);
 	return committed;
+}
+
+bool
+cluster_ko_directory_drop_committed_v3(RelFileLocator locator)
+{
+	return ko_directory_drop_at_least(locator, KO_DROP_IDENTITY_CLOSING);
+}
+
+bool
+cluster_ko_directory_drop_retired_v3(RelFileLocator locator)
+{
+	/* Pure directory retirement needs the original entered-call drain too.
+	 * This immutable identity survives active fence/AX slot reclamation. */
+	return ko_directory_drop_at_least(locator, KO_DROP_IDENTITY_RETIRED);
 }
 
 /* The original SI executor reserves before physical work; a native origin

@@ -5393,7 +5393,7 @@ test_cluster_pcm_settlement_ingress.inc: $(top_srcdir)/src/backend/cluster/clust
 	     END { if (count != 4 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+test_cluster_pcm_lock test_cluster_pcm_object_retire: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
 		test_cluster_pcm_master_durable.inc \
 		test_cluster_pcm_settlement_ingress.inc \
 		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
@@ -9292,3 +9292,6 @@ test_cluster_ko_writeback_smgr.inc: $(top_srcdir)/src/backend/cluster/storage/cl
 # Native origin publication with the original KO completion/AX owners.
 TESTS += test_cluster_ko_origin_marker
 all: test_cluster_ko_origin_marker
+
+TESTS += test_cluster_pcm_object_retire
+all: test_cluster_pcm_object_retire

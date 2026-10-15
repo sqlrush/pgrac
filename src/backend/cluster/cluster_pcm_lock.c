@@ -1916,7 +1916,7 @@ pcm_resource_x_source_settlement_debt_decode_locked(struct GrdEntry *entry,
  */
 static bool
 pcm_entry_retire_eligible_locked(struct GrdEntry *entry, uint64 expected_generation,
-								 PcmRetireRefusal *why)
+								 PcmRetireRefusal *why, bool object_retired)
 {
 	static const ClusterPcmResourceXMasterRequest empty_request;
 	static const ClusterPcmResourceXTerminalTombstone empty_tombstone;
@@ -1969,12 +1969,15 @@ pcm_entry_retire_eligible_locked(struct GrdEntry *entry, uint64 expected_generat
 		*why = PCM_RETIRE_REFUSAL_HOLDER_PRESENT;
 		return false;
 	}
-	if (pg_atomic_read_u32(&entry->pi_holders_bitmap) != 0
+	/* A terminal DROP ends only the master directory debt. Local PI and
+	 * every physical/protocol/reference condition below remain mandatory. */
+	if ((!object_retired && pg_atomic_read_u32(&entry->pi_holders_bitmap) != 0)
 		|| entry->local_pi_first.source_flags != 0 || entry->local_pi_last.source_flags != 0) {
 		*why = PCM_RETIRE_REFUSAL_PI_PRESENT;
 		return false;
 	}
-	if (entry->pi_watermark_lsn != InvalidXLogRecPtr || entry->pi_watermark_scn != InvalidScn) {
+	if (!object_retired
+		&& (entry->pi_watermark_lsn != InvalidXLogRecPtr || entry->pi_watermark_scn != InvalidScn)) {
 		*why = PCM_RETIRE_REFUSAL_WATERMARK_PRESENT;
 		return false;
 	}
@@ -2139,7 +2142,7 @@ pcm_entry_retire_classify_exact(const BufferTag *tag, uint64 expected_generation
 		LWLockRelease(&ClusterPcm->htab_lock.lock);
 		return false;
 	}
-	eligible = pcm_entry_retire_eligible_locked(entry, expected_generation, why);
+	eligible = pcm_entry_retire_eligible_locked(entry, expected_generation, why, false);
 	LWLockRelease(&entry->entry_lock.lock);
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
 	return eligible;
@@ -2159,10 +2162,18 @@ pcm_entry_try_retire_exact(const BufferTag *tag, uint64 binding_generation, PcmR
 	uint64 retired_authority_floor;
 	bool found;
 	bool removed;
+	bool object_retired = reason == PCM_RETIRE_REASON_OBJECT_RETIRED;
 
 	if (tag == NULL || binding_generation == 0 || binding_generation == UINT64_MAX
-		|| reason < PCM_RETIRE_REASON_HOLDER_RELEASE || reason > PCM_RETIRE_REASON_BOUNDED_RECLAIM
+		|| reason < PCM_RETIRE_REASON_HOLDER_RELEASE || reason > PCM_RETIRE_REASON_OBJECT_RETIRED
 		|| ClusterPcm == NULL || cluster_pcm_htab == NULL)
+		return false;
+	/* Never take the KO lock under the directory/entry locks. Its terminal
+	 * old-locator identity cannot reopen; native MAIN prevents locator reuse.
+	 * The original exact generation and eligibility table still run below. */
+	if (object_retired
+		&& (!cluster_shared_config
+			|| !cluster_ko_directory_drop_retired_v3(BufTagGetRelFileLocator(tag))))
 		return false;
 	pg_atomic_fetch_add_u64(&ClusterPcm->reclaim_attempt_count, 1);
 
@@ -2184,7 +2195,7 @@ pcm_entry_try_retire_exact(const BufferTag *tag, uint64 binding_generation, PcmR
 		LWLockRelease(&ClusterPcm->htab_lock.lock);
 		return false;
 	}
-	if (!pcm_entry_retire_eligible_locked(entry, binding_generation, &why)) {
+	if (!pcm_entry_retire_eligible_locked(entry, binding_generation, &why, object_retired)) {
 		pcm_entry_retire_refused_mark(why);
 		LWLockRelease(&entry->entry_lock.lock);
 		LWLockRelease(&ClusterPcm->htab_lock.lock);
@@ -2316,7 +2327,8 @@ cluster_pcm_lock_reclaim_bounded(uint32 probe_budget, PcmReclaimBatch *out)
 		if (state != PCM_REGISTRY_LIVE)
 			continue;
 		out->attempted_count++;
-		if (pcm_entry_try_retire_exact(&tag, binding_generation, PCM_RETIRE_REASON_BOUNDED_RECLAIM))
+		if (pcm_entry_try_retire_exact(&tag, binding_generation, PCM_RETIRE_REASON_BOUNDED_RECLAIM)
+			|| pcm_entry_try_retire_exact(&tag, binding_generation, PCM_RETIRE_REASON_OBJECT_RETIRED))
 			out->retired_count++;
 	}
 	if (cursor == capacity) {
@@ -10844,6 +10856,11 @@ cluster_pcm_lock_pi_candidates_v1(uint32 *cursor, uint32 probe_budget, BufferTag
 		LWLockRelease(&ClusterPcm->htab_lock.lock);
 		position++;
 		examined++;
+		/* Reuse this original bounded pass; no receipt or new I/O is needed
+		 * for an exactly retired object with only quiescent directory debt. */
+		if (live && generation != 0 && generation != UINT64_MAX
+			&& pcm_entry_try_retire_exact(&tag, generation, PCM_RETIRE_REASON_OBJECT_RETIRED))
+			continue;
 		if (live && generation != 0 && generation != UINT64_MAX
 			&& ((cluster_pcm_lock_pi_write_snapshot_v1(tag, &x)
 				 && x.binding_generation == generation)

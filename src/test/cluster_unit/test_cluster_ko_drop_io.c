@@ -60,6 +60,7 @@ UT_TEST(test_drop_identity_survives_two_full_active_slot_reclamations)
 	UT_ASSERT(!cluster_ko_peer_admission_begin_v3(first.base.key.locator, &sample));
 	UT_ASSERT(!cluster_ko_peer_delivery_begin_v3(first.base.key.locator, &revision));
 	UT_ASSERT(ko_peer_request_ended_or_conflicts_v3(&first));
+	UT_ASSERT(cluster_ko_directory_drop_retired_v3(first.base.key.locator));
 }
 
 UT_TEST(test_truncate_keeps_original_reclamation_semantics)
@@ -481,10 +482,60 @@ UT_TEST(test_terminal_capacity_refuses_before_physical_work_not_during_commit)
 	UT_ASSERT(!commit_operation(&request));
 }
 
+UT_TEST(test_directory_terminal_requires_entered_calls_to_drain_and_marker_retry)
+{
+	ClusterKoSharedMessageV3 request = ready_operation(peer_fence_fixture(52000));
+	RelFileLocator locator = request.base.key.locator;
+	ClusterKoDirectoryIoV3 io;
+
+	UT_ASSERT(!cluster_ko_directory_drop_committed_v3(locator));
+	UT_ASSERT(!cluster_ko_directory_drop_retired_v3(locator));
+	UT_ASSERT(cluster_ko_directory_io_begin_v3(locator, &io));
+	UT_ASSERT(!commit_operation(&request));
+	UT_ASSERT(cluster_ko_directory_drop_committed_v3(locator));
+	UT_ASSERT(!cluster_ko_directory_drop_retired_v3(locator));
+	UT_ASSERT(cluster_ko_directory_io_end_v3(&io));
+	/* End closes this call only; the original marker consumer certifies it. */
+	UT_ASSERT(!cluster_ko_directory_drop_retired_v3(locator));
+	UT_ASSERT(commit_operation(&request));
+	UT_ASSERT(cluster_ko_directory_drop_retired_v3(locator));
+	UT_ASSERT(!cluster_ko_directory_io_begin_v3(locator, &io));
+}
+
+UT_TEST(test_directory_terminal_refuses_unknown_identity_and_runtime_scope)
+{
+	ClusterKoSharedMessageV3 request = ready_operation(peer_fence_fixture(52001));
+	RelFileLocator locator = request.base.key.locator, other = locator;
+	KoDropIdentity *identity = &storage.drop_identities[0];
+	KoDropIdentity saved;
+
+	UT_ASSERT(commit_operation(&request));
+	UT_ASSERT(cluster_ko_directory_drop_retired_v3(locator));
+	other.relNumber++;
+	UT_ASSERT(!cluster_ko_directory_drop_retired_v3(other));
+	saved = *identity;
+	for (unsigned fault = 0; fault < 4; fault++) {
+		*identity = saved;
+		if (fault == 0) identity->state = KO_DROP_IDENTITY_RESERVED;
+		if (fault == 1) identity->state = KO_DROP_IDENTITY_RETIRED + 1;
+		if (fault == 2) identity->fence_serial = 0;
+		if (fault == 3) identity->request.operation = CLUSTER_KO_SHARED_V3_OPERATION_TRUNCATE;
+		UT_ASSERT(!cluster_ko_directory_drop_retired_v3(locator));
+	}
+	*identity = saved;
+	cluster_interconnect_tier = CLUSTER_IC_TIER_2;
+	UT_ASSERT(!cluster_ko_directory_drop_retired_v3(locator));
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+	cluster_shared_config = false;
+	UT_ASSERT(!cluster_ko_directory_drop_retired_v3(locator));
+	cluster_shared_config = true;
+	UT_ASSERT(cluster_ko_directory_drop_retired_v3(locator));
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(13);
 	printf(
 		"# KO shared=%zu peer_fence=%zu drop_identity=%zu raw_io=%zu; identities=%u raw_calls=%u\n",
 		sizeof(ClusterKoShared), sizeof(ClusterKoPeerFenceV3), sizeof(KoDropIdentity),
@@ -500,6 +551,8 @@ main(void)
 	UT_RUN(test_scn_probe_marker_waits_for_normal_error_and_refusal_exit);
 	UT_RUN(test_refresh_call_covers_storage_and_original_content_copy);
 	UT_RUN(test_extension_metadata_probe_cannot_outlive_committed_drop);
+	UT_RUN(test_directory_terminal_requires_entered_calls_to_drain_and_marker_retry);
+	UT_RUN(test_directory_terminal_refuses_unknown_identity_and_runtime_scope);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
