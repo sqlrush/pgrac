@@ -75,6 +75,23 @@ cluster_undo_recovery_origin_authorized_v1(int origin_node pg_attribute_unused()
 char *DatabasePath;
 
 bool
+rf_side_standby_invalidation_preflight_v1(const uint8 *payload pg_attribute_unused(),
+										  uint32 length pg_attribute_unused())
+{
+	UT_ASSERT(false); /* Full native cache integration is in test_cluster_side_xact. */
+	return false;
+}
+
+void
+ProcessCommittedInvalidationMessages(const SharedInvalidationMessage *msgs pg_attribute_unused(),
+									 int nmsgs pg_attribute_unused(),
+									 bool initfile pg_attribute_unused(),
+									 Oid dbid pg_attribute_unused(), Oid tsid pg_attribute_unused())
+{
+	UT_ASSERT(false);
+}
+
+bool
 rf_side_xact_cold_completion_preflight_v1(
 	const RfSideXactOperationV1 *operation pg_attribute_unused(),
 	const uint8 *payload pg_attribute_unused(), uint32 length pg_attribute_unused())

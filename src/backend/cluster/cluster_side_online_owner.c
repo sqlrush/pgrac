@@ -18,6 +18,7 @@
 #include "cluster/cluster_side_online_owner.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "storage/standbydefs.h"
+#include "utils/inval.h"
 
 #ifdef RF_SIDE_OWNER_TESTING
 #define owner_alloc(bytes_) calloc(1, (bytes_))
@@ -627,7 +628,6 @@ side_owner_preflight_control(void *arg, const RfSideOnlineOperationV1 *operation
 	record = &operation->identity.record;
 	if (scope->authority != owner->undo_authority || scope->plan != owner->protected_plan
 		|| scope->authority->serial_guard == NULL
-		|| scope->authority->serial_guard->mode != CLUSTER_RECOVERY_SERIAL_ONLINE
 		|| record->system_identifier != scope->duty.system_identifier
 		|| memcmp(record->storage_uuid, scope->duty.storage_uuid, 16) != 0
 		|| record->origin_thread == 0 || record->origin_thread != scope->cut.failed_thread
@@ -643,6 +643,13 @@ side_owner_preflight_control(void *arg, const RfSideOnlineOperationV1 *operation
 		|| !cluster_undo_recovery_origin_authorized_v1(record->origin_thread - 1))
 		return false;
 	info = record->info & ~XLR_INFO_MASK;
+	if (side_owner_cold_formed(owner))
+		return record->rmid == RM_STANDBY_ID && info == XLOG_INVALIDATIONS && DatabasePath == NULL
+			   && cluster_undo_recovery_cold_origin_authorized_v1(record->origin_thread - 1)
+			   && rf_side_standby_invalidation_preflight_v1(operation->owned_payload,
+															operation->owned_payload_length);
+	if (scope->authority->serial_guard->mode != CLUSTER_RECOVERY_SERIAL_ONLINE)
+		return false;
 	if (record->rmid == RM_STANDBY_ID)
 		return info == XLOG_STANDBY_LOCK || info == XLOG_RUNNING_XACTS;
 	if (record->rmid != RM_XLOG_ID)
@@ -668,8 +675,37 @@ side_owner_preflight_control(void *arg, const RfSideOnlineOperationV1 *operation
 static bool
 side_owner_apply_control(void *arg, const RfSideOnlineOperationV1 *operation)
 {
+	RfSideOnlineProductionOwnerV1 *owner = arg;
+
 	if (!side_owner_preflight_control(arg, operation))
 		return false;
+	if (side_owner_cold_formed(owner)) {
+		xl_invalidations *copy = owner_alloc(operation->owned_payload_length);
+
+		if (copy == NULL)
+			return false;
+		memcpy(copy, operation->owned_payload, operation->owned_payload_length);
+		PG_TRY();
+		{
+			/* The original native redo consumer, not a no-op or a terminal
+			 * projection. Delivery here does not certify all-cohort RESET. */
+			ProcessCommittedInvalidationMessages(
+				copy->msgs, copy->nmsgs, copy->relcacheInitFileInval, copy->dbId, copy->tsId);
+		}
+		PG_FINALLY();
+		{
+			if (DatabasePath != NULL) {
+				owner_free(DatabasePath);
+				DatabasePath = NULL;
+			}
+			owner_free(copy);
+		}
+		PG_END_TRY();
+		/* Free execution scratch before the full reparse; only one payload
+		 * copy may be live. Never mark a scope lost during native IO complete. */
+		if (!side_owner_preflight_control(arg, operation))
+			return false;
+	}
 	cluster_scn_recovery_replay_observe(operation->control_scn);
 	return true;
 }

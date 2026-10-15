@@ -984,8 +984,12 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 				plan->failed = true;
 			return RF_PAGE_PROOF_DETAIL_CAPACITY;
 		}
-		if (candidate.kind == RF_SIDE_ONLINE_OPERATION_XACT
-			&& candidate.xact.cold_completion_effects
+		if (((candidate.kind == RF_SIDE_ONLINE_OPERATION_XACT
+			  && candidate.xact.cold_completion_effects)
+			 || (candidate.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
+				 && plan->purpose == RF_SIDE_PLAN_RECOVERY
+				 && candidate.identity.record.rmid == RM_STANDBY_ID
+				 && (candidate.identity.record.info & ~XLR_INFO_MASK) == XLOG_INVALIDATIONS))
 			&& candidate.owned_payload_length > plan->cold_completion_scratch_bytes) {
 			Size extra = candidate.owned_payload_length - plan->cold_completion_scratch_bytes;
 

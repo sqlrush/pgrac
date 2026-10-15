@@ -71,6 +71,9 @@ extern bool rf_side_xact_decode_recovery_v1(XLogReaderState *record, uint64 syst
 											uint16 origin_thread, RfSideXactOperationV1 *out);
 extern bool rf_side_xact_cold_completion_preflight_v1(const RfSideXactOperationV1 *operation,
 													  const uint8 *payload, uint32 length);
+/* Native standalone invalidations use the same message/scope rules as
+ * transactional invalidations. Shape validation grants no replay authority. */
+extern bool rf_side_standby_invalidation_preflight_v1(const uint8 *payload, uint32 length);
 extern bool rf_side_xact_structural_preflight_v1(const RfSideXactOperationV1 *operation);
 extern bool rf_side_xact_inspect_pi_v1(XLogReaderState *record, uint64 system_identifier,
 									uint16 origin_thread, RfSideXactOperationV1 *out);

@@ -28,6 +28,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "cluster/cluster_undo_recovery.h"
+#include "storage/standbydefs.h"
 
 #define RF_SIDE_XACT_KNOWN_XINFO                                                                   \
 	(XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_SUBXACTS | XACT_XINFO_HAS_RELFILELOCATORS              \
@@ -424,6 +425,39 @@ side_xact_pi_effects_valid(const xl_xact_parsed_commit *parsed, uint64 system_id
 	out->invalidation_count = parsed->nmsgs;
 	out->relation_count = parsed->nrels;
 	return true;
+}
+
+bool
+rf_side_standby_invalidation_preflight_v1(const uint8 *payload, uint32 length)
+{
+	xl_xact_parsed_commit parsed = { 0 };
+	RfSideXactOperationV1 effects = { 0 };
+	uint8 *copy;
+	xl_invalidations *invals;
+	bool valid = false;
+
+	if (payload == NULL || length < MinSizeOfInvalidations
+		|| payload[offsetof(xl_invalidations, relcacheInitFileInval)] > 1)
+		return false;
+	/* Owned plan records are packed, not guaranteed native alignment. The
+	 * plan reserves this one copy, also used by the native execution owner. */
+	copy = side_xact_payload_copy(payload, length);
+	if (copy == NULL)
+		return false;
+	invals = (xl_invalidations *)copy;
+	if (invals->nmsgs >= 0
+		&& (uint64)invals->nmsgs * sizeof(SharedInvalidationMessage)
+			   == length - MinSizeOfInvalidations) {
+		parsed.xinfo = XACT_XINFO_HAS_DBINFO
+					   | (invals->relcacheInitFileInval ? XACT_COMPLETION_UPDATE_RELCACHE_FILE : 0);
+		parsed.dbId = invals->dbId;
+		parsed.tsId = invals->tsId;
+		parsed.nmsgs = invals->nmsgs;
+		parsed.msgs = invals->msgs;
+		valid = side_xact_pi_effects_valid(&parsed, GetSystemIdentifier(), true, &effects);
+	}
+	side_xact_payload_free(copy);
+	return valid;
 }
 
 static bool
