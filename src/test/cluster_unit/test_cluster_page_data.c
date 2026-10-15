@@ -1373,6 +1373,40 @@ ordinary_clean_write_discharges_first_after_later_capture_loss(void)
 	clean();
 }
 
+#ifndef PGRAC_TEST_REAL_PI_WRITEBACK
+static void
+ordinary_flush_attempt_tracks_actual_data_submission(void)
+{
+	BufferDesc *buf;
+	volatile bool attempted = false;
+
+	reset();
+	buf = &descriptors[1].bufferdesc;
+	pins[1] = 1;
+	locks[0] = locks[1] = true;
+	cluster_smart_fusion = sf_blocked = true;
+	FlushBufferWithAttempt(buf, &relation, IOOBJECT_RELATION, IOCONTEXT_NORMAL, &attempted);
+	UT_ASSERT(!attempted);
+	UT_ASSERT(pg_atomic_read_u32(&buf->state) & BM_DIRTY);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&buf->state) & BM_IO_IN_PROGRESS, 0);
+	UT_ASSERT_EQ(writes + wal_flushes + syncs, 0);
+	sf_blocked = false;
+	FlushBufferWithAttempt(buf, &relation, IOOBJECT_RELATION, IOCONTEXT_NORMAL, &attempted);
+	UT_ASSERT(attempted);
+	UT_ASSERT_EQ(writes, 1);
+	UT_ASSERT_EQ(wal_flushes, 1);
+	UT_ASSERT_EQ(syncs, 0); /* DATA submission is not a durable receipt. */
+	UT_ASSERT_EQ(pg_atomic_read_u32(&buf->state) & (BM_DIRTY | BM_IO_IN_PROGRESS), 0);
+	attempted = false;
+	FlushBufferWithAttempt(buf, &relation, IOOBJECT_RELATION, IOCONTEXT_NORMAL, &attempted);
+	UT_ASSERT(!attempted); /* An already clean page contributes no new write. */
+	UT_ASSERT_EQ(writes, 1);
+	locks[0] = locks[1] = false;
+	pins[1] = 0;
+	clean();
+}
+#endif
+
 /* Decoded WAL is an explicit input boundary; actual preflight, detached FPI
  * apply, dependency sealing, DATA I/O and receipt qualification run together. */
 static RfPageOnlinePlanV1 *
@@ -5253,7 +5287,8 @@ int
 main(void)
 {
 #ifndef PGRAC_TEST_REAL_PI_WRITEBACK
-	UT_PLAN(77);
+	UT_PLAN(78);
+	UT_RUN(ordinary_flush_attempt_tracks_actual_data_submission);
 	UT_RUN(structural_remote_ack_import_binds_original_inputs_and_cut);
 	UT_RUN(structural_remote_ack_refuses_transport_input_and_collector_drift);
 	UT_RUN(structural_remote_notice_uses_actual_plan_and_peer_physical_owner);

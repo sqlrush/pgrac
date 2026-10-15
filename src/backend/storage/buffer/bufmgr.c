@@ -9371,8 +9371,9 @@ BgBufferSync(WritebackContext *wb_context)
  *	BUF_REUSABLE: buffer is available for replacement, ie, it has
  *		pin count 0 and usage count 0.
  *
- * (BUF_WRITTEN could be set in error if FlushBuffer finds the buffer clean
- * after locking it, but we don't care all that much.)
+ * The shared cluster path reports only this call's actual DATA write.
+ * The native path can still set BUF_WRITTEN if another writer cleaned the
+ * buffer before FlushBuffer acquired its I/O ownership.
  *
  * Note: caller must have done ResourceOwnerEnlargeBuffers.
  */
@@ -9383,6 +9384,10 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 	int			result = 0;
 	uint32		buf_state;
 	BufferTag	tag;
+#ifdef USE_PGRAC_CLUSTER
+	volatile bool write_attempted = false;
+	bool		observe_write = cluster_enabled && cluster_shared_config;
+#endif
 
 	ReservePrivateRefCountEntry();
 
@@ -9471,13 +9476,37 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 	UnlockBufHdr(bufHdr, buf_state);
 #endif
 
-	FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+#ifdef USE_PGRAC_CLUSTER
+	if (observe_write)
+	{
+		FlushBufferWithAttempt(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
+							   &write_attempted);
+		if (!write_attempted)
+		{
+			/* A deferred dirty image is not available for replacement yet.
+			 * Keep its original checkpoint/IO obligation and caller retry. */
+			buf_state = LockBufHdr(bufHdr);
+			if (buf_state & (BM_DIRTY | BM_IO_IN_PROGRESS))
+				result &= ~BUF_REUSABLE;
+			UnlockBufHdr(bufHdr, buf_state);
+		}
+	}
+	else
+#endif
+		FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 
 	LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
 
 	tag = bufHdr->tag;
 
 	UnpinBuffer(bufHdr);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* FlushBuffer may defer without submitting DATA I/O. Its void return
+	 * cannot consume write budget or enqueue writeback for such an attempt. */
+	if (observe_write && !write_attempted)
+		return result;
+#endif
 
 	/*
 	 * SyncOneBuffer() is only called by checkpointer and bgwriter, so

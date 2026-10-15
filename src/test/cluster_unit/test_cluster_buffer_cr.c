@@ -564,6 +564,16 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln pg_attribute_unused(),
 	pg_atomic_fetch_and_u32(&buf->state, ~(BM_DIRTY | BM_JUST_DIRTIED));
 }
 
+static void
+FlushBufferWithAttempt(BufferDesc *buf, SMgrRelation reln, IOObject object, IOContext context,
+					   volatile bool *attempted)
+{
+	unsigned before = physical_writes;
+
+	FlushBuffer(buf, reln, object, context);
+	*attempted = physical_writes != before;
+}
+
 void
 ScheduleBufferTagForWriteback(WritebackContext *wb pg_attribute_unused(),
 							  IOContext context pg_attribute_unused(),
