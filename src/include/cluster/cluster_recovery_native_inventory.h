@@ -36,6 +36,7 @@ typedef struct ClusterRecoveryNativeInventoryDiag {
 	uint64 page_targets;
 	uint64 rebuildable_targets;
 	uint64 structural_effects;
+	uint64 undo_targets;
 	uint64 unowned_target_records;
 	size_t owned_bytes;
 } ClusterRecoveryNativeInventoryDiag;

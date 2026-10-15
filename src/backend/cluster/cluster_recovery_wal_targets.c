@@ -11,6 +11,8 @@
 #include "cluster/cluster_page_detached.h"
 #include "cluster/cluster_recovery_wal_targets.h"
 #include "cluster/cluster_space_reservation.h"
+#include "cluster/cluster_side_undo.h"
+#include "cluster/cluster_uba.h"
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -105,6 +107,40 @@ targets_structure(ClusterRecoveryRootSet *roots, const ClusterWalSourceRef *sour
 }
 
 static bool
+targets_undo(ClusterRecoveryRootSet *roots, XLogReaderState *reader,
+			 const ClusterWalSourceRef *source, ClusterRecoveryWalTargetsDiag *diag)
+{
+	ClusterUndoDecoded undo;
+	uint64 required = 1;
+
+	/* The original pure historical classifier accepts generation zero.
+	 * Reusing its syntax checks does not create a PI plan or permit apply.
+	 * Full payload/lifecycle effects remain unowned graph obligations. */
+	if (!cluster_undo_decode(reader, &undo) || !cluster_undo_inspect_pi(&undo))
+		return false;
+	if (undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
+		|| undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI)
+		required = (uint64)undo.block_no + 1;
+	else if (undo.kind == CLUSTER_UNDO_KIND_TT_SET_HEAD) {
+		uint32 segment, block;
+		uint16 slot, row;
+
+		if (!uba_decode_record(undo.first_undo_block, &segment, &block, &slot, &row)
+			|| segment != undo.segment_id || slot != undo.slot_offset)
+			return false;
+		required = (uint64)block + 1;
+	}
+	diag->roots_result = cluster_recovery_root_set_add_undo(
+		roots, source->claim.identity.system_identifier, source->claim.database_incarnation,
+		source->claim.identity.storage_uuid, undo.instance, undo.segment_id, required);
+	if (diag->roots_result != CLUSTER_RECOVERY_ROOTS_MORE)
+		return false;
+	diag->undo_targets++;
+	diag->unowned_records = 1;
+	return true;
+}
+
+static bool
 targets_native(ClusterRecoveryRootSet *roots, XLogReaderState *reader,
 			   const ClusterWalSourceRef *source, const RfContributorStreamCutV1 *cut,
 			   size_t memory_budget, ClusterRecoveryWalTargetsDiag *diag)
@@ -132,6 +168,12 @@ targets_native(ClusterRecoveryRootSet *roots, XLogReaderState *reader,
 			if (diag->roots_result != CLUSTER_RECOVERY_ROOTS_MORE)
 				break;
 			diag->structural_effects++;
+		} else if (effect.kind == CLUSTER_RECOVERY_NATIVE_TT_COMMIT) {
+			diag->roots_result = cluster_recovery_root_set_add_native(roots, &effect);
+			if (diag->roots_result != CLUSTER_RECOVERY_ROOTS_MORE)
+				break;
+			diag->undo_targets++;
+			diag->other_native_effects++;
 		} else if (effect.kind == CLUSTER_RECOVERY_NATIVE_SPACE_DROP) {
 			if (!targets_structure(roots, source, effect.bytes, effect.length, true, diag))
 				break;
@@ -198,6 +240,11 @@ cluster_recovery_wal_targets_collect(ClusterRecoveryRootSet *roots, XLogReaderSt
 	}
 	if (plan.route.record_owner == RF_ROUTE_OWNER_PAGE_CODEC)
 		return true;
+	if (rmid == RM_CLUSTER_UNDO_ID) {
+		if (!targets_undo(roots, reader, source, diag))
+			goto fail;
+		return true;
+	}
 	if (rmid == RM_SMGR_ID && opcode == XLOG_SMGR_SPACE_IDENTITY) {
 		if (!targets_structure(roots, source, XLogRecGetData(reader), XLogRecGetDataLen(reader),
 							   false, diag))

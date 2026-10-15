@@ -119,6 +119,74 @@ UT_TEST(test_native_inventory_collects_real_fsm_and_all_physical_roots)
 	inventory_extra = 0;
 }
 
+static void
+inventory_undo_drift(void)
+{
+	xl_undo_tt_slot_bind binding = { 0 };
+	binding.segment_id = 2;
+	binding.instance = 1;
+	binding.xid = 4195136;
+	binding.wrap = 1;
+	binding.format_version = CLUSTER_UNDO_TT_BIND_VERSION;
+	(void)inventory_write_record(&inventory_fault_source, inventory_extra_start,
+								 inventory_extra_previous, RM_CLUSTER_UNDO_ID,
+								 XLOG_UNDO_TT_SLOT_BIND, &binding, sizeof(binding));
+}
+
+UT_TEST(test_native_inventory_collects_undo_targets_from_real_retained_wal)
+{
+	for (unsigned variant = 0; variant < 2; variant++) {
+		ClusterWalInputsV1 *inputs;
+		ClusterRecoveryNativeInventory *inventory = NULL;
+		ClusterRecoveryNativeInventoryDiag diag;
+		ClusterRecoveryRootSet *roots;
+		ClusterRecoveryRootsEvent event;
+		ClusterRecoveryRootsResult result = CLUSTER_RECOVERY_ROOTS_MORE;
+		uint8 digest[32];
+		char path[MAXPGPATH];
+		int fd;
+		unsigned undo = 0;
+
+		inventory_extra = 3;
+		inputs = inventory_fixture(false, false);
+		roots = inventory_roots(inputs, path, &fd, false);
+		if (variant)
+			inventory_between_passes = inventory_undo_drift;
+		UT_ASSERT_EQ(cluster_recovery_native_inventory_collect_roots(inputs, roots, 1024 * 1024,
+																	 &inventory, &diag),
+					 variant ? CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED
+							 : CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED);
+		UT_ASSERT_EQ(inventory_census_calls, 2);
+		if (variant) {
+			UT_ASSERT(inventory == NULL);
+			UT_ASSERT(!cluster_recovery_root_set_digest(roots, digest));
+			UT_ASSERT(cluster_recovery_root_set_step(roots, &event)
+					  > CLUSTER_RECOVERY_ROOTS_OBSERVED);
+		} else {
+			UT_ASSERT_EQ(diag.undo_targets, 2);
+			UT_ASSERT_EQ(diag.unowned_target_records, 4);
+			for (unsigned i = 0; i < 10000 && result < CLUSTER_RECOVERY_ROOTS_OBSERVED; i++)
+				result = cluster_recovery_root_set_step(roots, &event);
+			UT_ASSERT_EQ(result, CLUSTER_RECOVERY_ROOTS_OBSERVED);
+			for (uint32 i = 0; i < cluster_recovery_root_set_count(roots); i++) {
+				const ClusterRecoveryRootEntry *entry = cluster_recovery_root_set_entry(roots, i);
+				if (entry->file.kind != CLUSTER_RECOVERY_FILE_UNDO_SEGMENT)
+					continue;
+				undo++;
+				UT_ASSERT(entry->file.undo_segment == 1 || entry->file.undo_segment == 32513);
+				UT_ASSERT_EQ(entry->origins, CLUSTER_RECOVERY_ROOT_FROM_WAL);
+				UT_ASSERT_EQ(entry->required_blocks, 1);
+			}
+			UT_ASSERT_EQ(undo, 2);
+		}
+		inventory_between_passes = NULL;
+		inventory_roots_done(roots, fd, path);
+		cluster_recovery_native_inventory_destroy(inventory);
+		cold_census_done(&inputs);
+	}
+	inventory_extra = 0;
+}
+
 UT_TEST(test_native_inventory_poison_targets_on_error_and_drift)
 {
 	for (unsigned mode = 0; mode < 8; mode++) {

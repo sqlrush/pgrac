@@ -184,12 +184,14 @@ inventory_record(XLogReaderState *reader, const ClusterWalSourceRef *source,
 		if (UINT64_MAX - work->diag.page_targets < targets.page_targets
 			|| UINT64_MAX - work->diag.rebuildable_targets < targets.rebuildable_targets
 			|| UINT64_MAX - work->diag.structural_effects < targets.structural_effects
+			|| UINT64_MAX - work->diag.undo_targets < targets.undo_targets
 			|| UINT64_MAX - work->diag.unowned_target_records < targets.unowned_records)
 			return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY,
 									RF_PAGE_PROOF_DETAIL_CAPACITY);
 		work->diag.page_targets += targets.page_targets;
 		work->diag.rebuildable_targets += targets.rebuildable_targets;
 		work->diag.structural_effects += targets.structural_effects;
+		work->diag.undo_targets += targets.undo_targets;
 		work->diag.unowned_target_records += targets.unowned_records;
 	}
 	/* This inventory owns XACT, plus native CREATE. Other records are

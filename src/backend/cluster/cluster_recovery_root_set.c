@@ -13,6 +13,8 @@
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_recovery_root_set.h"
 #include "cluster/cluster_recovery_native_scan.h"
+#include "cluster/cluster_undo_segment.h"
+#include "cluster/storage/cluster_undo_alloc.h"
 #include "common/cryptohash.h"
 
 #ifdef USE_PGRAC_CLUSTER
@@ -287,6 +289,37 @@ cluster_recovery_root_set_add_fork(ClusterRecoveryRootSet *roots,
 	return roots_add_relation(roots, &key->locator, forknum, required_blocks);
 }
 
+ClusterRecoveryRootsResult
+cluster_recovery_root_set_add_undo(ClusterRecoveryRootSet *roots, uint64 system_identifier,
+								   uint64 database_incarnation, const uint8 storage_uuid[16],
+								   uint8 owner_instance, uint32 segment_id, uint64 required_blocks)
+{
+	char path[MAXPGPATH];
+	uint32 index;
+	ClusterRecoveryRootEntry *entry;
+
+	if (roots == NULL)
+		return CLUSTER_RECOVERY_ROOTS_INVALID;
+	if (roots->status > CLUSTER_RECOVERY_ROOTS_OBSERVED)
+		return roots->status;
+	if (!cluster_recovery_root_set_targets_match(roots, system_identifier, database_incarnation,
+												 storage_uuid)
+		|| owner_instance == 0 || owner_instance > UNDO_OWNER_INSTANCE_MAX || segment_id == 0
+		|| (segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 != owner_instance
+		|| required_blocks == 0 || required_blocks > UNDO_BLOCKS_PER_SEGMENT)
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	snprintf(path, sizeof(path), "pg_undo/instance_%u/seg_%u.dat", owner_instance - 1, segment_id);
+	if (!roots_lookup(roots, path, true, &index))
+		return roots->status;
+	entry = &roots->entries[index];
+	entry->file.kind = CLUSTER_RECOVERY_FILE_UNDO_SEGMENT;
+	entry->file.undo_segment = segment_id;
+	entry->file.undo_owner_instance = owner_instance;
+	entry->origins |= CLUSTER_RECOVERY_ROOT_FROM_WAL;
+	entry->required_blocks = Max(entry->required_blocks, required_blocks);
+	return CLUSTER_RECOVERY_ROOTS_MORE;
+}
+
 void
 cluster_recovery_root_set_invalidate(ClusterRecoveryRootSet *roots)
 {
@@ -313,6 +346,24 @@ cluster_recovery_root_set_add_native(ClusterRecoveryRootSet *roots,
 		|| memcmp(record->source.claim.identity.storage_uuid, roots->storage_uuid, 16) != 0)
 		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
 	opcode = record->header.xl_info & ~XLR_INFO_MASK;
+	if (effect->kind == CLUSTER_RECOVERY_NATIVE_TT_COMMIT && record->header.xl_rmid == RM_XACT_ID
+		&& (opcode & XLOG_XACT_OPMASK) == XLOG_XACT_COMMIT
+		&& effect->length == sizeof(xl_xact_tt_commit)) {
+		xl_xact_tt_commit tt;
+
+		memcpy(&tt, effect->bytes, sizeof(tt));
+		if (tt.instance != record->source.claim.identity.origin_thread_id
+			|| tt.format_version != CLUSTER_XACT_TT_COMMIT_VERSION || tt.flags != 0
+			|| tt.reserved != 0 || tt.segment_generation == UINT32_MAX
+			|| tt.slot_offset >= TT_SLOTS_PER_SEGMENT || tt.wrap == TT_WRAP_INVALID
+			|| !TransactionIdIsNormal(tt.xid) || tt.xid != record->top_xid
+			|| !SCN_VALID(tt.commit_scn) || tt.commit_scn != record->terminal_scn)
+			return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+		return cluster_recovery_root_set_add_undo(
+			roots, record->source.claim.identity.system_identifier,
+			record->source.claim.database_incarnation, record->source.claim.identity.storage_uuid,
+			tt.instance, tt.segment_id, 1);
+	}
 	if (effect->kind == CLUSTER_RECOVERY_NATIVE_CREATE && record->header.xl_rmid == RM_SMGR_ID
 		&& opcode == XLOG_SMGR_CREATE && effect->length == sizeof(xl_smgr_create)) {
 		xl_smgr_create create;
@@ -575,7 +626,7 @@ cluster_recovery_root_set_step(ClusterRecoveryRootSet *roots, ClusterRecoveryRoo
 	if (roots->pass == 0) {
 		if ((entry->origins & CLUSTER_RECOVERY_ROOT_PHYSICAL) != 0
 			|| ((entry->origins & CLUSTER_RECOVERY_ROOT_FROM_WAL) != 0
-				&& file.kind != CLUSTER_RECOVERY_FILE_RELATION))
+				&& file.kind != entry->file.kind))
 			return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_CHANGED);
 		entry->file = file;
 		entry->origins |= CLUSTER_RECOVERY_ROOT_PHYSICAL;

@@ -80,14 +80,23 @@ extern ClusterRecoveryRootsResult
 cluster_recovery_root_set_add_fork(ClusterRecoveryRootSet *roots,
 								   const ClusterSpaceIdentityKey *key, ForkNumber forknum,
 								   uint64 required_blocks);
+/* Preserve a WAL-referenced undo file, including a missing file or data
+ * beyond its present EOF. Namespace and canonical owner range must match.
+ * The minimum block extent is only a requirement, never an existence or
+ * segment-generation/TT/lifecycle proof. Before physical scanning only. */
+extern ClusterRecoveryRootsResult
+cluster_recovery_root_set_add_undo(ClusterRecoveryRootSet *roots, uint64 system_identifier,
+								   uint64 database_incarnation, const uint8 storage_uuid[16],
+								   uint8 owner_instance, uint32 segment_id, uint64 required_blocks);
 /* A failed producer must not leave its partial target set usable. */
 extern void cluster_recovery_root_set_invalidate(ClusterRecoveryRootSet *roots);
 
 struct ClusterRecoveryNativeEffect;
-/* Add one native CREATE fork or a terminal's relation deletion (all shared
- * forks) to the same physical union. These target whole files, so they do
- * not invent a block-zero reference or a size promise. Only CREATE and
- * RELATION_DROP effects are accepted; all other effects need their own
+/* Add native CREATE, terminal relation deletion (all shared forks), or a
+ * folded TT commit header target to the same physical union. Relation effects
+ * target whole files without inventing a block-zero reference or size promise;
+ * TT_COMMIT preserves its actual header block requirement. CREATE, RELATION_DROP
+ * and TT_COMMIT effects are accepted; all other effects need their own
  * consumers. Source/record and lifecycle proofs remain in the cold graph.
  * A missing file is retained, never treated as an already-completed drop. */
 extern ClusterRecoveryRootsResult

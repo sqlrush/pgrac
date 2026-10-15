@@ -20,6 +20,7 @@ typedef struct ClusterRecoveryWalTargetsDiag {
 	uint32 page_targets;
 	uint32 rebuildable_targets;
 	uint32 structural_effects;
+	uint32 undo_targets;
 	uint32 native_effects;
 	uint32 other_native_effects;
 	uint32 unowned_records;

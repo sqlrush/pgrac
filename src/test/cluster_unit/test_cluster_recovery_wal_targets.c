@@ -8,6 +8,8 @@
 #include "catalog/pg_control.h"
 #include "cluster/cluster_block_apply.h"
 #include "cluster/cluster_space_reservation.h"
+#include "cluster/storage/cluster_undo_xlog.h"
+#include "cluster/cluster_uba.h"
 #include "../../backend/cluster/cluster_recovery_wal_targets.c"
 
 /* A target census must never invoke a page's mutation owner. */
@@ -23,7 +25,7 @@ static union {
 } wal_record_storage;
 static union {
 	uint64 align;
-	char bytes[4096];
+	char bytes[2 * BLCKSZ];
 } wal_payload;
 static char wal_image[BLCKSZ];
 
@@ -454,10 +456,12 @@ UT_TEST(test_bad_edge_mixed_side_and_unclassified_opcode_do_not_finish_roots)
 	remove_root(fd);
 }
 
+#include "test_cluster_recovery_undo_targets.inc"
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(14);
 	UT_RUN(test_page_and_rebuildable_fsm_keep_all_file_targets);
 	UT_RUN(test_typed_structure_keeps_all_forks_and_space_pages);
 	UT_RUN(test_native_create_and_truncate_do_not_invent_page_requirements);
@@ -466,6 +470,12 @@ main(void)
 	UT_RUN(test_typed_namespace_and_payload_fail_closed);
 	UT_RUN(test_advance_is_not_a_promise_that_reserved_main_blocks_exist);
 	UT_RUN(test_bad_edge_mixed_side_and_unclassified_opcode_do_not_finish_roots);
+	UT_RUN(test_undo_wal_all_shapes_preserve_segment_targets);
+	UT_RUN(test_undo_wal_union_keeps_missing_and_largest_requirement);
+	UT_RUN(test_folded_tt_commit_keeps_undo_target_and_terminal_obligation);
+	UT_RUN(test_undo_wal_malformed_targets_poison_whole_roots);
+	UT_RUN(test_undo_targets_reject_block_and_namespace_boundaries);
+	UT_RUN(test_folded_tt_commit_rejects_wrong_identity_and_shape);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
