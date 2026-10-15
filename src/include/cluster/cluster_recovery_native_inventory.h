@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  * cluster_recovery_native_inventory.h
- *    Native recovery effects observed through the original cold inputs.
+ *    Native and undo effects observed through the original cold inputs.
  *
  * Copyright (c) 2026, pgrac contributors
  * Author: SqlRush <sqlrush@gmail.com>
@@ -32,7 +32,8 @@ typedef struct ClusterRecoveryNativeInventoryDiag {
 	uint32 sources;
 	uint64 records;
 	uint64 native_records;
-	uint64 other_records; /* not owned or proven by this native inventory */
+	uint64 undo_records;  /* retained observations, not executed undo effects */
+	uint64 other_records; /* families not yet enumerated by this inventory */
 	uint64 page_targets;
 	uint64 rebuildable_targets;
 	uint64 structural_effects;
@@ -44,6 +45,7 @@ typedef struct ClusterRecoveryNativeInventoryDiag {
 typedef struct ClusterRecoveryNativeInventory ClusterRecoveryNativeInventory;
 
 /* Borrow the original startup cold scope for two complete physical passes.
+ * Retain native effects and original undo WAL with complete owned payloads.
  * Every source (including explicit empty terminals), exact cut, record
  * position and full decoded bytes of every family must agree. The original
  * census validates ROOT/claim/WALR and the physical stream after each pass.
@@ -58,7 +60,7 @@ extern ClusterRecoveryNativeInventoryResult
 cluster_recovery_native_inventory_build(ClusterWalInputsV1 *inputs, size_t memory_budget,
 										ClusterRecoveryNativeInventory **out,
 										ClusterRecoveryNativeInventoryDiag *diag);
-/* Same two cold passes, also collecting PAGE/FSM/native storage/SPACE
+/* Same two cold passes, also collecting PAGE/FSM/native storage/SPACE/undo
  * targets into an unstarted root set. Both outputs remain provisional
  * until all source records (including non-native bytes) agree. Failure
  * or ERROR invalidates roots. Root storage has its own caller-set budget;
@@ -76,8 +78,9 @@ extern ClusterRecoveryNativeInventoryResult
 cluster_recovery_native_inventory_recheck(ClusterWalInputsV1 *inputs,
 										  ClusterRecoveryNativeInventory *inventory,
 										  ClusterRecoveryNativeInventoryDiag *diag);
-/* At most one native effect per call after both passes. END drains this
- * native subset only; it never discharges other_records or physical roots. */
+/* At most one native or original undo effect per call after both passes.
+ * END drains only this observed subset. It never discharges these effects,
+ * other_records, historical identity binding or physical roots. */
 extern ClusterRecoveryNativeInventoryResult
 cluster_recovery_native_inventory_next(ClusterRecoveryNativeInventory *inventory,
 									   ClusterRecoveryNativeEffect *out);

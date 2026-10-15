@@ -41,7 +41,8 @@ typedef enum ClusterRecoveryNativeKind {
 	CLUSTER_RECOVERY_NATIVE_STATS_DROP,
 	CLUSTER_RECOVERY_NATIVE_INVALIDATION,
 	CLUSTER_RECOVERY_NATIVE_TT_COMMIT,
-	CLUSTER_RECOVERY_NATIVE_SPACE_DROP
+	CLUSTER_RECOVERY_NATIVE_SPACE_DROP,
+	CLUSTER_RECOVERY_NATIVE_UNDO /* original undo WAL; observation only */
 } ClusterRecoveryNativeKind;
 
 /* Exact observed source and bytes, not a claim/cut authentication. Keep this
@@ -79,12 +80,21 @@ typedef struct ClusterRecoveryNativeEffect {
 	size_t length;
 } ClusterRecoveryNativeEffect;
 
+/* UNDO emits one ClusterUndoDecoded in bytes, while record->payload retains
+ * the entire original main data, including images/deltas and certificates.
+ * Field presence follows the original kind/version: zero in an absent
+ * generation field is not evidence of generation zero. Legacy head/terminal
+ * records still need their exact historical binding. No TT transition,
+ * CTRC release, apply or recovery completion follows from this observation. */
+
 typedef struct ClusterRecoveryNativeScan ClusterRecoveryNativeScan;
 
 /* Borrow an already verified reader only during begin; copy the entire main
  * payload under the explicit budget. No I/O, apply, authority or completion
  * is performed. The native parsers validate the complete shape before any
- * effect can escape. Prepared/unknown records and block components refuse;
+ * effect can escape. Original undo WAL uses the same owned record and pure
+ * decoder/historical shape check. Prepared/unknown records and block
+ * components refuse;
  * they require their own complete consumers, never an empty effect list. */
 extern ClusterRecoveryNativeResult
 cluster_recovery_native_scan_begin(XLogReaderState *reader, const ClusterWalSourceRef *source,

@@ -445,3 +445,72 @@ UT_TEST(test_final_input_recheck_is_sticky_on_bytes_scope_io_and_error)
 	}
 	inventory_extra = 0;
 }
+
+
+UT_TEST(test_cold_inventory_owns_undo_records_and_rechecks_after_export)
+{
+	ClusterWalInputsV1 *inputs;
+	ClusterRecoveryNativeInventory *inventory = NULL;
+	ClusterRecoveryNativeInventoryDiag diag;
+	ClusterRecoveryNativeEffect effect;
+	ClusterRecoveryNativeInventoryResult result;
+	unsigned undo_count = 0;
+	inventory_extra = 3;
+	inputs = inventory_fixture(false, false);
+	UT_ASSERT_EQ(cluster_recovery_native_inventory_build(inputs, 1024 * 1024, &inventory, &diag),
+				 CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED);
+	UT_ASSERT_EQ(diag.records, 8);
+	UT_ASSERT_EQ(diag.native_records, 4);
+	UT_ASSERT_EQ(diag.undo_records, 2);
+	UT_ASSERT_EQ(diag.other_records, 2); /* real checkpoint records still need owner */
+	if (inventory != NULL) {
+		while ((result = cluster_recovery_native_inventory_next(inventory, &effect))
+			   == CLUSTER_RECOVERY_NATIVE_INVENTORY_EFFECT) {
+			if (effect.kind == CLUSTER_RECOVERY_NATIVE_UNDO) {
+				ClusterUndoDecoded undo;
+				xl_undo_tt_slot_bind binding;
+				UT_ASSERT_EQ(effect.length, sizeof(undo));
+				memcpy(&undo, effect.bytes, sizeof(undo));
+				memcpy(&binding, effect.record->payload, sizeof(binding));
+				UT_ASSERT_EQ(undo.kind, CLUSTER_UNDO_KIND_TT_BIND);
+				UT_ASSERT_EQ(undo.expected_generation, 0);
+				UT_ASSERT_EQ(undo.instance, effect.record->source.claim.identity.origin_thread_id);
+				UT_ASSERT_EQ(undo.segment_id, binding.segment_id);
+				UT_ASSERT_EQ(undo.xid, binding.xid);
+				UT_ASSERT(effect.record->cut.scan_begin_inclusive <= effect.record->read_lsn);
+				UT_ASSERT(effect.record->cut.scan_end_exclusive >= effect.record->end_lsn);
+				undo_count++;
+			}
+		}
+		UT_ASSERT_EQ(result, CLUSTER_RECOVERY_NATIVE_INVENTORY_END);
+		UT_ASSERT_EQ(undo_count, 2);
+		UT_ASSERT_EQ(cluster_recovery_native_inventory_recheck(inputs, inventory, &diag),
+					 CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED);
+		UT_ASSERT_EQ(cluster_recovery_native_inventory_next(inventory, &effect),
+					 CLUSTER_RECOVERY_NATIVE_INVENTORY_END);
+		inventory_undo_drift();
+		UT_ASSERT_EQ(cluster_recovery_native_inventory_recheck(inputs, inventory, &diag),
+					 CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED);
+		UT_ASSERT_EQ(cluster_recovery_native_inventory_next(inventory, &effect),
+					 CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID);
+		UT_ASSERT(effect.record == NULL && effect.bytes == NULL);
+	}
+	cluster_recovery_native_inventory_destroy(inventory);
+	cold_census_done(&inputs);
+	inventory_extra = 0;
+}
+
+UT_TEST(test_cold_inventory_does_not_hide_invalid_undo_in_other_records)
+{
+	ClusterWalInputsV1 *inputs;
+	ClusterRecoveryNativeInventory *inventory = NULL;
+	ClusterRecoveryNativeInventoryDiag diag;
+	inventory_extra = 4;
+	inputs = inventory_fixture(false, false);
+	UT_ASSERT_EQ(cluster_recovery_native_inventory_build(inputs, 1024 * 1024, &inventory, &diag),
+				 CLUSTER_RECOVERY_NATIVE_INVENTORY_UNSUPPORTED);
+	UT_ASSERT(inventory == NULL);
+	cluster_recovery_native_inventory_destroy(inventory);
+	cold_census_done(&inputs);
+	inventory_extra = 0;
+}

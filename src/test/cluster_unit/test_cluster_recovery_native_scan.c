@@ -5,6 +5,10 @@
 #include <limits.h>
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_recovery_native_scan.h"
+#include "cluster/cluster_side_undo.h"
+#include "cluster/cluster_uba.h"
+#include "cluster/storage/cluster_undo_xlog.h"
+#include "cluster/storage/cluster_undo_alloc.h"
 #include "storage/standbydefs.h"
 #include "unit_test.h"
 
@@ -25,7 +29,7 @@ static ClusterWalSourceRef source;
 static RfContributorStreamCutV1 cut;
 static union {
 	uint64 align;
-	char bytes[8192];
+	char bytes[2 * BLCKSZ];
 } payload;
 
 static void
@@ -579,10 +583,12 @@ UT_TEST(test_second_pass_binds_all_source_and_record_bytes)
 	}
 }
 
+#include "test_cluster_recovery_undo_effects.inc"
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(20);
 	UT_RUN(test_commit_keeps_every_effect_and_owned_source);
 	UT_RUN(test_abort_keeps_deletions_stats_and_subxact_membership);
 	UT_RUN(test_assignment_retains_real_top_membership);
@@ -598,6 +604,11 @@ main(void)
 	UT_RUN(test_invalid_native_boolean_is_not_a_relcache_proof);
 	UT_RUN(test_record_must_belong_to_the_same_complete_cut);
 	UT_RUN(test_second_pass_binds_all_source_and_record_bytes);
+	UT_RUN(test_cold_undo_effects_own_all_original_shapes);
+	UT_RUN(test_cold_undo_effects_reject_truncated_and_mixed_records);
+	UT_RUN(test_cold_undo_effects_require_source_and_bounded_target);
+	UT_RUN(test_cold_undo_effects_budget_and_recheck_are_sticky);
+	UT_RUN(test_cold_undo_effect_keeps_delta_and_unknown_generation);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

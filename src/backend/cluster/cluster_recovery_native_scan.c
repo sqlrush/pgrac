@@ -14,7 +14,9 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_recovery_native_scan.h"
+#include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_side_xact.h"
+#include "cluster/cluster_undo_segment.h"
 #include "storage/standbydefs.h"
 
 typedef struct NativeRegion {
@@ -30,6 +32,7 @@ struct ClusterRecoveryNativeScan {
 	ClusterRecoveryNativeKind primary;
 	NativeRegion regions[6];
 	xl_xact_tt_commit tt;
+	ClusterUndoDecoded undo;
 	unsigned region;
 	uint32 ordinal;
 	bool primary_returned;
@@ -191,6 +194,21 @@ native_parse(ClusterRecoveryNativeScan *scan, XLogReaderState *reader)
 	ClusterRecoveryNativeRecord *record = &scan->record;
 	uint8 opcode = record->header.xl_info & ~XLR_INFO_MASK;
 
+	if (record->header.xl_rmid == RM_CLUSTER_UNDO_ID) {
+		/* Historical shape only. In particular, a valid release certificate
+		 * does not authorize release here; its complete bytes remain owned.
+		 * Legacy kinds without a generation require a separate binding. */
+		if (!cluster_undo_decode(reader, &scan->undo) || !cluster_undo_inspect_pi(&scan->undo)
+			|| scan->undo.instance != record->source.claim.identity.origin_thread_id
+			|| (scan->undo.kind == CLUSTER_UNDO_KIND_TT_BIND
+				&& scan->undo.expected_generation == UINT32_MAX)
+			|| ((scan->undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
+				 || scan->undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI)
+				&& scan->undo.block_no >= UNDO_BLOCKS_PER_SEGMENT))
+			return CLUSTER_RECOVERY_NATIVE_SHAPE;
+		scan->primary = CLUSTER_RECOVERY_NATIVE_UNDO;
+		return CLUSTER_RECOVERY_NATIVE_MORE;
+	}
 	if (record->header.xl_rmid == RM_SMGR_ID) {
 		if (opcode != XLOG_SMGR_CREATE)
 			return CLUSTER_RECOVERY_NATIVE_UNSUPPORTED;
@@ -339,6 +357,10 @@ cluster_recovery_native_scan_next(ClusterRecoveryNativeScan *scan, ClusterRecove
 		out->record = &scan->record;
 		out->bytes = scan->payload;
 		out->length = scan->record.payload_length;
+		if (scan->primary == CLUSTER_RECOVERY_NATIVE_UNDO) {
+			out->bytes = &scan->undo;
+			out->length = sizeof(scan->undo);
+		}
 		return CLUSTER_RECOVERY_NATIVE_EFFECT;
 	}
 	while (scan->region < lengthof(scan->regions)) {

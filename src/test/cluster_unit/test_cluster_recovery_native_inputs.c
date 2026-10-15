@@ -9,6 +9,7 @@ int control_fixture_main(int argc, char **argv);
 #undef main
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_recovery_native_inventory.h"
+#include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_recovery_record_hash.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "cluster/storage/cluster_undo_alloc.h"
@@ -179,11 +180,15 @@ inventory_fixture(bool unsupported, bool open_source)
 										   RM_XLOG_ID, XLOG_NOOP, "abc", 3);
 		else if (inventory_extra == 2)
 			extra = inventory_write_fsm(&source, commit.exclusive_end, commit.record_start, 31);
-		else if (inventory_extra == 3) {
+		else if (inventory_extra == 3 || inventory_extra == 4) {
 			xl_undo_tt_slot_bind binding = { 0 };
 
 			binding.segment_id = node * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
 			binding.instance = node + 1;
+			if (inventory_extra == 4) {
+				binding.instance = node == 0 ? 128 : 1;
+				binding.segment_id = node == 0 ? 32513 : 1;
+			}
 			binding.xid = 4195136;
 			binding.wrap = 1;
 			binding.format_version = CLUSTER_UNDO_TT_BIND_VERSION;
@@ -483,7 +488,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(13);
+	UT_PLAN(15);
 	UT_RUN(test_native_inventory_uses_two_real_cold_passes);
 	UT_RUN(test_native_inventory_never_returns_partial_on_drift_io_or_error);
 	UT_RUN(test_native_inventory_capacity_is_not_partial_success);
@@ -497,6 +502,8 @@ main(int argc, char **argv)
 	UT_RUN(test_final_input_recheck_preserves_effect_cursor_and_all_sources);
 	UT_RUN(test_final_input_recheck_is_sticky_on_bytes_scope_io_and_error);
 	UT_RUN(test_native_inventory_collects_undo_targets_from_real_retained_wal);
+	UT_RUN(test_cold_inventory_owns_undo_records_and_rechecks_after_export);
+	UT_RUN(test_cold_inventory_does_not_hide_invalid_undo_in_other_records);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

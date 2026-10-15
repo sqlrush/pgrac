@@ -9064,12 +9064,14 @@ test_cluster_recovery_relation_scan: test_cluster_recovery_relation_scan.c test_
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LDFLAGS) $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
-test_cluster_recovery_native_scan: test_cluster_recovery_native_scan.c unit_test.h \
+test_cluster_recovery_native_scan: test_cluster_recovery_native_scan.c test_cluster_recovery_undo_effects.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_native_scan.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_native_scan.h \
 		$(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
+		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
+		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
@@ -9082,9 +9084,11 @@ test_cluster_recovery_native_roots: test_cluster_recovery_native_roots.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h \
-		$(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) $(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
+		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) $(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
+		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@

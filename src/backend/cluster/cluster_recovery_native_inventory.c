@@ -194,9 +194,9 @@ inventory_record(XLogReaderState *reader, const ClusterWalSourceRef *source,
 		work->diag.undo_targets += targets.undo_targets;
 		work->diag.unowned_target_records += targets.unowned_records;
 	}
-	/* This inventory owns XACT, plus native CREATE. Other records are
-	 * explicitly counted and still require their original typed owners. */
-	owns = XLogRecGetRmid(reader) == RM_XACT_ID
+	/* Keep undo records as well as native effects, with the same complete
+	 * source/cut/payload re-observation. Enumeration discharges no effects. */
+	owns = XLogRecGetRmid(reader) == RM_XACT_ID || XLogRecGetRmid(reader) == RM_CLUSTER_UNDO_ID
 		   || (XLogRecGetRmid(reader) == RM_SMGR_ID
 			   && (XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_SMGR_CREATE);
 	if (work->pass == 1) {
@@ -247,7 +247,10 @@ inventory_record(XLogReaderState *reader, const ClusterWalSourceRef *source,
 									: RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
 	}
 	work->diag.owned_bytes += sizeof(*record) + cluster_recovery_native_scan_bytes(record->scan);
-	work->diag.native_records++;
+	if (XLogRecGetRmid(reader) == RM_CLUSTER_UNDO_ID)
+		work->diag.undo_records++;
+	else
+		work->diag.native_records++;
 	record->source_index = work->source_cursor;
 	record->ordinal = ordinal;
 	if (work->tail == NULL)
