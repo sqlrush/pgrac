@@ -106,6 +106,9 @@ static TransactionId canonical_expected_xid = 818;
 static uint16 canonical_expected_wrap = 8;
 static bool canonical_check_block, canonical_fail_data_write, canonical_corrupt_data_write;
 static bool canonical_file_io_error, canonical_materialize_failure;
+static bool cold_clog_test, cold_clog_denied, cold_clog_apply_fail, cold_clog_verify_fail;
+static bool cold_clog_throw, cold_clog_stale_after_verify;
+static uint32 cold_clog_applies, cold_clog_verifies, cold_clog_verified_order;
 static XLogRecPtr canonical_expected_block_lsn = 400;
 ClusterUndoTargetPreflightV1 fixture_preflight_tt_target(const ClusterUndoDecoded *d);
 ClusterUndoApplyResultV1 fixture_apply_tt(const ClusterUndoDecoded *d);
@@ -156,6 +159,49 @@ cluster_undo_recovery_origin_authorized_v1(int node)
 {
 	return control_scope_test && !control_scope_denied && canonical_scope != NULL && node == 2
 		   && canonical_scope->duty.origin_thread_id == 3;
+}
+
+bool
+cluster_undo_recovery_cold_origin_authorized_v1(int node)
+{
+	return cold_clog_test && !cold_clog_denied && canonical_scope != NULL && node == 2;
+}
+
+/* Exact native CLOG IO is covered by test_cluster_clog_recovery. This boundary
+ * checks the original real planner/owner's call identity and publication order. */
+bool
+cluster_clog_native_recovery_apply_v1(int origin, TransactionId xid, int count,
+									  const TransactionId *children, XidStatus status)
+{
+	UT_ASSERT(cold_clog_test && canonical_scope != NULL && canonical_syncs > 0);
+	UT_ASSERT_EQ(origin, 2);
+	UT_ASSERT_EQ(xid, 802);
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT(children == NULL);
+	UT_ASSERT_EQ(status, TRANSACTION_STATUS_COMMITTED);
+	UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 0);
+	cold_clog_applies++;
+	if (cold_clog_throw)
+		siglongjmp(*PG_exception_stack, 1);
+	return !cold_clog_apply_fail;
+}
+
+bool
+cluster_clog_native_recovery_verify_v1(int origin, TransactionId xid, int count,
+									   const TransactionId *children, XidStatus status)
+{
+	UT_ASSERT_EQ(cold_clog_applies, 1);
+	UT_ASSERT_EQ(origin, 2);
+	UT_ASSERT_EQ(xid, 802);
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT(children == NULL);
+	UT_ASSERT_EQ(status, TRANSACTION_STATUS_COMMITTED);
+	UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 0);
+	cold_clog_verifies++;
+	cold_clog_verified_order = ++prepare_apply.next_order;
+	if (cold_clog_stale_after_verify)
+		cold_clog_denied = true;
+	return !cold_clog_verify_fail;
 }
 
 void
@@ -3133,6 +3179,91 @@ canonical_authority_fresh(void *arg)
 	return arg != NULL;
 }
 
+UT_TEST(test_cold_owner_persists_native_clog_before_commit_projection)
+{
+	/* Same original source/TT consumer: no alternate decoder or fake commit. */
+	for (int fault = 0; fault < 9; fault++) {
+		RfSideOnlinePlanV1 *plan = space_online_plan(300);
+		ClusterRecoverySerialGuard guard = { 0 };
+		ClusterThreadRecoveryAuthorityV1 authority
+			= { .duty = &canonical_duty, .serial_guard = &guard };
+		RfSideOnlineProductionOwnerV1 *owner = calloc(1, sizeof(*owner));
+		FakeXactRecord fake;
+		PGAlignedBlock initial;
+		volatile bool caught = false;
+		RfPageProofDetailV1 result = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+
+		guard.mode
+			= fault == 7 ? CLUSTER_RECOVERY_SERIAL_ONLINE : CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+		undo_header_bind(&fake, 0);
+		undo_header_feed(plan, &fake, 100);
+		undo_header_commit(&fake, 0, 802);
+		if (fault == 8) {
+			xl_xact_xinfo xinfo;
+
+			/* A valid native flag is not an implemented cold completion effect. */
+			memcpy(&xinfo, fake.data + sizeof(xl_xact_commit), sizeof(xinfo));
+			xinfo.xinfo |= XACT_XINFO_HAS_AE_LOCKS;
+			memcpy(fake.data + sizeof(xl_xact_commit), &xinfo, sizeof(xinfo));
+		}
+		undo_header_feed(plan, &fake, 200);
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		reset_prepare_apply();
+		canonical_file = tmpfile();
+		UT_ASSERT(canonical_file != NULL && owner != NULL);
+		UT_ASSERT_EQ(ftruncate(fileno(canonical_file), UNDO_SEGMENT_SIZE_BYTES), 0);
+		cluster_undo_segment_make_header_bytes(513, 3, initial.data);
+		UT_ASSERT(pwrite(fileno(canonical_file), initial.data, BLCKSZ, 0) == BLCKSZ);
+		UT_ASSERT_EQ(fsync(fileno(canonical_file)), 0);
+		canonical_writes = canonical_syncs = 0;
+		canonical_expected_xid = 802;
+		canonical_expected_wrap = 7;
+		cold_clog_test = true;
+		cold_clog_denied = fault == 1;
+		cold_clog_apply_fail = fault == 2;
+		cold_clog_verify_fail = fault == 3;
+		cold_clog_throw = fault == 4;
+		cold_clog_stale_after_verify = fault == 5;
+		canonical_file_io_error = fault == 6;
+		cold_clog_applies = cold_clog_verifies = cold_clog_verified_order = 0;
+		UT_ASSERT(rf_side_online_production_owner_init_v1(owner, &authority,
+														  canonical_authority_fresh, 19, true));
+		UT_ASSERT(rf_side_online_production_bind_undo_v1(owner, &authority));
+		PG_TRY();
+		{
+			result = rf_side_online_production_apply_v1(plan, owner);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 4);
+		if (!caught)
+			UT_ASSERT_EQ(result, fault == 0 || fault == 7 ? RF_PAGE_PROOF_DETAIL_OK
+														  : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+		UT_ASSERT_EQ(cold_clog_applies, fault == 1 || fault >= 6 ? 0 : 1);
+		UT_ASSERT_EQ(cold_clog_verifies, fault == 0 || fault == 3 || fault == 5 ? 1 : 0);
+		UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, fault == 0 || fault == 7 ? 1 : 0);
+		if (fault == 0)
+			UT_ASSERT(cold_clog_verified_order < prepare_apply.terminal_projection_order);
+		if (fault == 1 || fault == 8)
+			UT_ASSERT_EQ(canonical_writes, 0);
+		UT_ASSERT(canonical_scope == NULL && canonical_writer_depth == 0
+				  && owner->undo_headers == NULL && !owner->protected_set_active);
+		UT_ASSERT_EQ(owner->protected_set_complete, fault == 0 || fault == 7);
+		free(owner);
+		UT_ASSERT_EQ(fclose(canonical_file), 0);
+		canonical_file = NULL;
+		canonical_file_io_error = false;
+		cold_clog_test = cold_clog_denied = cold_clog_apply_fail = cold_clog_verify_fail = false;
+		cold_clog_throw = cold_clog_stale_after_verify = false;
+		canonical_expected_xid = 818;
+		canonical_expected_wrap = 8;
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
 UT_TEST(test_real_plan_owner_and_xact_install_final_header_before_older_commit_projection)
 {
 	for (int scenario = 0; scenario < 4; scenario++) {
@@ -5113,7 +5244,7 @@ UT_TEST(test_space_incarnation_end_rejects_old_uuid_reappearance_and_retained_ga
 int
 main(void)
 {
-	UT_PLAN(71);
+	UT_PLAN(72);
 	UT_RUN(test_space_incarnation_end_requires_an_actual_later_space0_contribution);
 	UT_RUN(test_space_incarnation_end_rejects_old_uuid_reappearance_and_retained_gaps);
 	UT_RUN(test_space_retained_ancestry_create_and_independent_page_terminal);
@@ -5144,6 +5275,7 @@ main(void)
 	UT_RUN(test_recycle_window_repeated_terminal_and_init_unknown_generation);
 	UT_RUN(test_physical_only_cut_and_reuse_anchor_boundary);
 	UT_RUN(test_physical_undo_is_durable_before_canonical_tt_publication);
+	UT_RUN(test_cold_owner_persists_native_clog_before_commit_projection);
 	UT_RUN(test_real_plan_owner_and_xact_install_final_header_before_older_commit_projection);
 	UT_RUN(test_covered_commit_requires_owner_proof_before_projection_without_tt_rewind);
 	UT_RUN(test_undo_header_repeated_slot_exact_source_membership_without_init);

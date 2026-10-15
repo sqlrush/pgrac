@@ -7,6 +7,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "access/clog.h"
 #include "access/xlog_internal.h"
 #include "catalog/pg_control.h"
 #include "cluster/cluster_remote_xact.h"
@@ -157,6 +158,32 @@ side_owner_install_data(RfSideOnlineProductionOwnerV1 *owner)
 	return true;
 }
 
+/* Select by the original serial mode, never by a failed authorization read:
+ * a stale cold scope must refuse, not fall through to the online consumer. */
+static bool
+side_owner_cold_formed(const RfSideOnlineProductionOwnerV1 *owner)
+{
+	return owner->undo_authority != NULL && owner->undo_authority->serial_guard != NULL
+		   && owner->undo_authority->serial_guard->mode == CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+}
+
+/* The strict original decoder owns only this complete top-only COMMIT.
+ * Compound effects still need their actual cold consumers; no flag is masked
+ * away, and a PI inspection operation cannot authorize native storage. */
+static bool
+side_owner_cold_commit_ready(RfSideOnlineProductionOwnerV1 *owner,
+							 const RfSideXactOperationV1 *operation)
+{
+	const uint32 supported = XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_TT_COMMIT;
+
+	return operation->kind == RF_SIDE_XACT_COMMIT && !operation->pi_read_only
+		   && operation->has_tt_delta && (operation->xinfo & ~supported) == 0
+		   && operation->completion_payload_length == 0 && operation->space_drop_count == 0
+		   && operation->origin_thread == owner->undo_authority->duty->origin_thread_id
+		   && rf_side_online_plan_contains_commit_v1(owner->protected_plan, operation)
+		   && cluster_undo_recovery_cold_origin_authorized_v1(operation->origin_thread - 1);
+}
+
 static bool
 side_owner_commit_covered(void *arg, const RfSideXactOperationV1 *operation)
 {
@@ -168,8 +195,23 @@ side_owner_commit_covered(void *arg, const RfSideXactOperationV1 *operation)
 		return false;
 	for (header = owner->undo_headers; header != NULL; header = header->next)
 		if (header->block_no == 0 && header->instance == operation->tt_delta.instance
-			&& header->segment_id == operation->tt_delta.segment_id)
-			return header->installed && side_owner_install_target(owner, header);
+			&& header->segment_id == operation->tt_delta.segment_id) {
+			if (!header->installed || !side_owner_install_target(owner, header))
+				return false;
+			if (!side_owner_cold_formed(owner))
+				return true;
+			/* This original coverage callback runs before the derived terminal
+			 * projection. A durable header alone is not native CLOG completion. */
+			return side_owner_cold_commit_ready(owner, operation)
+				   && cluster_clog_native_recovery_apply_v1(operation->origin_thread - 1,
+															operation->xid, 0, NULL,
+															TRANSACTION_STATUS_COMMITTED)
+				   && cluster_clog_native_recovery_verify_v1(operation->origin_thread - 1,
+															 operation->xid, 0, NULL,
+															 TRANSACTION_STATUS_COMMITTED)
+				   && side_owner_cold_commit_ready(owner, operation)
+				   && side_owner_authority_fresh(owner);
+		}
 	return false;
 }
 
@@ -223,6 +265,8 @@ side_owner_preflight_xact(void *arg, const RfSideOnlineOperationV1 *operation)
 		|| rf_side_xact_target_preflight_owned_v1(&operation->xact, operation->owned_payload,
 												  operation->owned_payload_length)
 			   != RF_SIDE_XACT_APPLY_OK)
+		return false;
+	if (side_owner_cold_formed(owner) && !side_owner_cold_commit_ready(owner, &operation->xact))
 		return false;
 	if (owner->undo_authority != NULL && operation->xact.kind == RF_SIDE_XACT_COMMIT) {
 		const xl_xact_tt_commit *delta = &operation->xact.tt_delta;
