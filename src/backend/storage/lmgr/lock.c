@@ -892,14 +892,16 @@ pgrac_cluster_post_native_register(LOCALLOCK *locallock, ClusterLockAcquireReque
 	locallock->cluster_ko_retained_ax = false;
 	locallock->cluster_ax_master_node = -1;
 	locallock->cluster_ax_master_generation = 0;
+	/* S5 has transferred the exact grant to this registered holder.  Its
+	 * retained-grant predicate deliberately rejects after consumption; use
+	 * the completed, process-local registration receipt at this boundary.
+	 * KO still revalidates the binding against the current control cut. */
 	if (locktag->locktag_type == LOCKTAG_RELATION && lockmode == AccessExclusiveLock
 		&& cluster_req->hw_grant.registration_proof
+		&& cluster_req->hw_grant.local_promoted && cluster_req->hw_grant.consumed
+		&& !cluster_req->hw_grant.cleanup_pending
 		&& cluster_req->hw_grant.master >= 0
-		&& cluster_req->hw_grant.master_generation != 0
-		&& cluster_ges_relation_grant_is_current(&cluster_req->hw_grant,
-																&cluster_req->resid, &cluster_req->holder,
-																cluster_req->request_id,
-																AccessExclusiveLock, false)) {
+		&& cluster_req->hw_grant.master_generation != 0) {
 		locallock->cluster_ax_binding_valid = true;
 		locallock->cluster_ax_master_node = cluster_req->hw_grant.master;
 		locallock->cluster_ax_master_generation = cluster_req->hw_grant.master_generation;

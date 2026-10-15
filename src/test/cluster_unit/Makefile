@@ -5218,7 +5218,7 @@ test_cluster_lmd_probe_collector: test_cluster_lmd_probe_collector.c unit_test.h
 # cluster_lms_enabled / cluster_grd / pg_atomic_*; test stubs all PG
 # backend symbols locally and exercises S1-S7 individual step API + top-
 # level dispatch + HC1 fail-closed + I1 monotonic forward transition.
-test_cluster_lock_acquire test_cluster_acquire_ko_cancel: %: %.c test_cluster_lock_acquire.c unit_test.h \
+test_cluster_lock_acquire test_cluster_acquire_ko_cancel test_cluster_ax_binding: %: %.c test_cluster_lock_acquire.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LOCK_ACQUIRE_O) $(CLUSTER_GES_MODE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LOCK_ACQUIRE_O) $(CLUSTER_GES_MODE_O) $(CLUSTER_LOCK_OWNER_O) \
@@ -9221,6 +9221,22 @@ test_cluster_ko_relation_scan test_cluster_ko_current_admission: %: %.c test_clu
 
 TESTS += test_cluster_ko_cancel test_cluster_ges_release test_cluster_grd_ko_cancel test_cluster_acquire_ko_cancel
 TESTS += test_cluster_ko_ready_owner test_cluster_ko_drop_io
+
+# Original S5 receipt -> LOCALLOCK registration -> KO binding reader.
+TESTS += test_cluster_ax_binding
+all: test_cluster_ax_binding
+test_cluster_ax_binding: test_cluster_ax_binding_native.inc test_cluster_ax_binding_grant.inc
+test_cluster_ax_binding_native.inc: $(top_srcdir)/src/backend/storage/lmgr/lock.c Makefile
+	awk '/^cluster_lock_current_ax_binding\(/ { print "bool"; emit=1; n++ } \
+	     /^pgrac_cluster_post_native_register\(/ { print "static void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_ax_binding_grant.inc: $(top_srcdir)/src/backend/cluster/cluster_ges.c Makefile
+	awk '/^ges_request_(holder_epoch|holder_request_id|shard_master_generation)\(/ { print "static inline uint64"; emit=1; n++ } \
+	     /^(ges_request_grant_is_current|ges_cf_request_is_canonical)\(/ { print "static bool"; emit=1; n++ } \
+	     /^cluster_ges_(relation_grant_is_current|retained_grant_check)\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 7 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 
 # Native lifecycle consumers, copied verbatim; surrounding hash/GES are fixtures.
 test_cluster_ko_native_upgrade.inc: $(top_srcdir)/src/backend/storage/lmgr/lock.c
