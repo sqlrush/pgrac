@@ -8,6 +8,7 @@ int control_fixture_main(int argc, char **argv);
 #include "test_cluster_control_root.c"
 #undef main
 #include "catalog/storage_xlog.h"
+#include "access/multixact.h"
 #include "cluster/cluster_recovery_native_inventory.h"
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_recovery_record_hash.h"
@@ -45,6 +46,7 @@ static unsigned inventory_fault;
 static unsigned inventory_extra;
 static unsigned inventory_binding_case;
 static XLogRecPtr inventory_extra_start, inventory_extra_previous;
+static XLogRecPtr inventory_mx_start, inventory_mx_previous;
 
 /* These small records stay within the original checkpoint's first WAL page.
  * Header, main-data framing and CRC are actual native-reader inputs. */
@@ -204,6 +206,45 @@ inventory_write_bound_head(const ClusterWalSourceRef *source, WalTestRecord prev
 								  XLOG_UNDO_TT_SLOT_SET_HEAD, &head, sizeof(head));
 }
 
+static void
+inventory_mx_payload(char *bytes, bool invalid, bool changed)
+{
+	xl_multixact_create create = { 0 };
+	MultiXactMember members[2]
+		= { { 4195136, MultiXactStatusForShare }, { 4195138, MultiXactStatusUpdate } };
+
+	create.mid = 42;
+	create.moff = invalid ? 0 : 108;
+	create.nmembers = 2;
+	if (changed)
+		members[1].xid++;
+	memcpy(bytes, &create, SizeOfMultiXactCreate);
+	memcpy(bytes + SizeOfMultiXactCreate, members, sizeof(members));
+}
+
+static WalTestRecord
+inventory_write_mx_sequence(const ClusterWalSourceRef *source, WalTestRecord next, unsigned node)
+{
+	char bytes[SizeOfMultiXactCreate + 2 * sizeof(MultiXactMember)];
+	xl_multixact_truncate trunc = { 5, 1, 40, 1, 106 };
+	int page = 0;
+
+	inventory_mx_payload(bytes, inventory_extra == 7, false);
+	if (node == 0) {
+		inventory_mx_start = next.exclusive_end;
+		inventory_mx_previous = next.record_start;
+	}
+	next = inventory_write_record(source, next.exclusive_end, next.record_start, RM_MULTIXACT_ID,
+								  inventory_extra == 8 ? 0x40 : XLOG_MULTIXACT_CREATE_ID, bytes,
+								  sizeof(bytes));
+	next = inventory_write_record(source, next.exclusive_end, next.record_start, RM_MULTIXACT_ID,
+								  XLOG_MULTIXACT_ZERO_OFF_PAGE, &page, sizeof(page));
+	next = inventory_write_record(source, next.exclusive_end, next.record_start, RM_MULTIXACT_ID,
+								  XLOG_MULTIXACT_ZERO_MEM_PAGE, &page, sizeof(page));
+	return inventory_write_record(source, next.exclusive_end, next.record_start, RM_MULTIXACT_ID,
+								  XLOG_MULTIXACT_TRUNCATE_ID, &trunc, sizeof(trunc));
+}
+
 static ClusterWalInputsV1 *
 inventory_fixture(bool unsupported, bool open_source)
 {
@@ -250,6 +291,8 @@ inventory_fixture(bool unsupported, bool open_source)
 		}
 		if (inventory_extra == 5)
 			extra = inventory_write_bound_head(&source, commit, node);
+		if (inventory_extra >= 6 && inventory_extra <= 8)
+			extra = inventory_write_mx_sequence(&source, commit, node);
 		create = inventory_write_record(&source, extra.exclusive_end, extra.record_start,
 										RM_SMGR_ID, XLOG_SMGR_CREATE, &payload, sizeof(payload));
 		if (i == 0) {
@@ -535,6 +578,7 @@ cleanup:
 
 #include "test_cluster_recovery_native_transcript.inc"
 #include "test_cluster_recovery_wal_tt_roots.inc"
+#include "test_cluster_recovery_multixact_inputs.inc"
 
 int
 main(int argc, char **argv)
@@ -543,7 +587,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(21);
+	UT_PLAN(24);
 	UT_RUN(test_native_inventory_uses_two_real_cold_passes);
 	UT_RUN(test_native_inventory_never_returns_partial_on_drift_io_or_error);
 	UT_RUN(test_native_inventory_capacity_is_not_partial_success);
@@ -565,6 +609,9 @@ main(int argc, char **argv)
 	UT_RUN(test_wal_head_final_recheck_and_destroy_revoke_graph);
 	UT_RUN(test_wal_heads_reject_late_graph_and_partial_capacity);
 	UT_RUN(test_wal_head_bounded_search_and_lifecycle_barriers);
+	UT_RUN(test_cold_multixact_records_keep_all_shapes_and_origin_sources);
+	UT_RUN(test_cold_multixact_second_and_final_reads_revoke_observations);
+	UT_RUN(test_cold_multixact_unknown_and_bad_shapes_never_become_other);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

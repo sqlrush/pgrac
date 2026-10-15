@@ -12,7 +12,9 @@
  */
 #include "postgres.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "access/multixact.h"
 #include "catalog/storage_xlog.h"
+#include "cluster/cluster_native_startup.h"
 #include "cluster/cluster_recovery_native_scan.h"
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_side_xact.h"
@@ -129,6 +131,71 @@ native_array_size(uint32 length, size_t base, int count, size_t item_size)
 }
 
 static ClusterRecoveryNativeResult
+native_multixact(ClusterRecoveryNativeScan *scan, uint8 opcode)
+{
+	uint32 length = scan->record.payload_length;
+
+	if (opcode == XLOG_MULTIXACT_ZERO_OFF_PAGE || opcode == XLOG_MULTIXACT_ZERO_MEM_PAGE) {
+		int page;
+		uint32 per_page = opcode == XLOG_MULTIXACT_ZERO_OFF_PAGE
+							  ? CLUSTER_NATIVE_MX_OFFSETS_PER_PAGE
+							  : CLUSTER_NATIVE_MX_MEMBERS_PER_PAGE;
+
+		if (length != sizeof(page))
+			return CLUSTER_RECOVERY_NATIVE_SHAPE;
+		memcpy(&page, scan->payload, sizeof(page));
+		if (page < 0 || (uint64)(uint32)page * per_page > UINT32_MAX)
+			return CLUSTER_RECOVERY_NATIVE_SHAPE;
+		scan->primary = opcode == XLOG_MULTIXACT_ZERO_OFF_PAGE
+							? CLUSTER_RECOVERY_NATIVE_MULTIXACT_ZERO_OFFSETS
+							: CLUSTER_RECOVERY_NATIVE_MULTIXACT_ZERO_MEMBERS;
+		return CLUSTER_RECOVERY_NATIVE_MORE;
+	}
+	if (opcode == XLOG_MULTIXACT_CREATE_ID) {
+		xl_multixact_create create = { 0 };
+
+		if (length < SizeOfMultiXactCreate)
+			return CLUSTER_RECOVERY_NATIVE_SHAPE;
+		memcpy(&create, scan->payload, SizeOfMultiXactCreate);
+		if (!MultiXactIdIsValid(create.mid) || create.moff == 0 || create.nmembers <= 0
+			|| !native_array_size(length, SizeOfMultiXactCreate, create.nmembers,
+								  sizeof(MultiXactMember)))
+			return CLUSTER_RECOVERY_NATIVE_SHAPE;
+		/* Observe the complete native array, not the bounded online projection.
+		 * Offset wrap and member ownership remain raw recovery obligations. */
+		for (int i = 0; i < create.nmembers; i++) {
+			MultiXactMember member;
+
+			memcpy(&member, scan->payload + SizeOfMultiXactCreate + (size_t)i * sizeof(member),
+				   sizeof(member));
+			if (!TransactionIdIsNormal(member.xid) || member.status < MultiXactStatusForKeyShare
+				|| member.status > MaxMultiXactStatus)
+				return CLUSTER_RECOVERY_NATIVE_SHAPE;
+		}
+		scan->primary = CLUSTER_RECOVERY_NATIVE_MULTIXACT_CREATE;
+		scan->regions[0] = (NativeRegion){ CLUSTER_RECOVERY_NATIVE_MULTIXACT_MEMBER,
+										   scan->payload + SizeOfMultiXactCreate,
+										   (uint32)create.nmembers, sizeof(MultiXactMember) };
+		return CLUSTER_RECOVERY_NATIVE_MORE;
+	}
+	if (opcode == XLOG_MULTIXACT_TRUNCATE_ID) {
+		xl_multixact_truncate trunc;
+
+		if (length != SizeOfMultiXactTruncate)
+			return CLUSTER_RECOVERY_NATIVE_SHAPE;
+		memcpy(&trunc, scan->payload, sizeof(trunc));
+		if (!OidIsValid(trunc.oldestMultiDB) || !MultiXactIdIsValid(trunc.startTruncOff)
+			|| !MultiXactIdIsValid(trunc.endTruncOff))
+			return CLUSTER_RECOVERY_NATIVE_SHAPE;
+		/* The native ranges can wrap. Preserve both complete ranges; their
+		 * presence does not authorize truncation or prove retained members. */
+		scan->primary = CLUSTER_RECOVERY_NATIVE_MULTIXACT_TRUNCATE;
+		return CLUSTER_RECOVERY_NATIVE_MORE;
+	}
+	return CLUSTER_RECOVERY_NATIVE_UNSUPPORTED;
+}
+
+static ClusterRecoveryNativeResult
 native_commit(ClusterRecoveryNativeScan *scan)
 {
 	xl_xact_parsed_commit parsed;
@@ -194,6 +261,8 @@ native_parse(ClusterRecoveryNativeScan *scan, XLogReaderState *reader)
 	ClusterRecoveryNativeRecord *record = &scan->record;
 	uint8 opcode = record->header.xl_info & ~XLR_INFO_MASK;
 
+	if (record->header.xl_rmid == RM_MULTIXACT_ID)
+		return native_multixact(scan, opcode);
 	if (record->header.xl_rmid == RM_CLUSTER_UNDO_ID) {
 		/* Historical shape only. In particular, a valid release certificate
 		 * does not authorize release here; its complete bytes remain owned.

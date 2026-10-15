@@ -3,6 +3,7 @@
  * Copyright (c) 2026, pgrac contributors. */
 #include "postgres.h"
 #include <limits.h>
+#include "access/multixact.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_recovery_native_scan.h"
 #include "cluster/cluster_side_undo.h"
@@ -584,11 +585,12 @@ UT_TEST(test_second_pass_binds_all_source_and_record_bytes)
 }
 
 #include "test_cluster_recovery_undo_effects.inc"
+#include "test_cluster_recovery_multixact_effects.inc"
 
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(25);
 	UT_RUN(test_commit_keeps_every_effect_and_owned_source);
 	UT_RUN(test_abort_keeps_deletions_stats_and_subxact_membership);
 	UT_RUN(test_assignment_retains_real_top_membership);
@@ -609,6 +611,11 @@ main(void)
 	UT_RUN(test_cold_undo_effects_require_source_and_bounded_target);
 	UT_RUN(test_cold_undo_effects_budget_and_recheck_are_sticky);
 	UT_RUN(test_cold_undo_effect_keeps_delta_and_unknown_generation);
+	UT_RUN(test_multixact_owns_every_member_and_full_source);
+	UT_RUN(test_multixact_zero_and_truncate_preserve_distinct_raw_obligations);
+	UT_RUN(test_multixact_bad_counts_truncation_and_member_bytes_refuse);
+	UT_RUN(test_multixact_zero_page_bounds_and_truncate_shape_refuse);
+	UT_RUN(test_multixact_cut_budget_and_final_recheck_keep_original_gates);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -42,7 +42,12 @@ typedef enum ClusterRecoveryNativeKind {
 	CLUSTER_RECOVERY_NATIVE_INVALIDATION,
 	CLUSTER_RECOVERY_NATIVE_TT_COMMIT,
 	CLUSTER_RECOVERY_NATIVE_SPACE_DROP,
-	CLUSTER_RECOVERY_NATIVE_UNDO /* original undo WAL; observation only */
+	CLUSTER_RECOVERY_NATIVE_UNDO, /* original undo WAL; observation only */
+	CLUSTER_RECOVERY_NATIVE_MULTIXACT_CREATE,
+	CLUSTER_RECOVERY_NATIVE_MULTIXACT_MEMBER,
+	CLUSTER_RECOVERY_NATIVE_MULTIXACT_ZERO_OFFSETS,
+	CLUSTER_RECOVERY_NATIVE_MULTIXACT_ZERO_MEMBERS,
+	CLUSTER_RECOVERY_NATIVE_MULTIXACT_TRUNCATE
 } ClusterRecoveryNativeKind;
 
 /* Exact observed source and bytes, not a claim/cut authentication. Keep this
@@ -86,6 +91,15 @@ typedef struct ClusterRecoveryNativeEffect {
  * generation field is not evidence of generation zero. Legacy head/terminal
  * records still need their exact historical binding. No TT transition,
  * CTRC release, apply or recovery completion follows from this observation. */
+
+/* MULTIXACT primary effects retain the complete original native payload:
+ * CREATE (mid, member offset/count and array), the distinct offset/member
+ * zero pages, and TRUNCATE (database and both wrapping ranges). Each CREATE
+ * also emits every original MultiXactMember, with no online projection cap.
+ * The source/claim/cut identifies the originating stream, never the local
+ * node's SLRU or current epoch. A member is not a terminal proof. Physical
+ * offsets/members, retention and heap identity joins remain separate; these
+ * observations do not authorize applying, truncating or releasing data. */
 
 typedef struct ClusterRecoveryNativeScan ClusterRecoveryNativeScan;
 
