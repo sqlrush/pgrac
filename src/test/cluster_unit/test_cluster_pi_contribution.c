@@ -4,6 +4,35 @@ int side_xact_fixture_main(void);
 #define main side_xact_fixture_main
 #include "test_cluster_side_xact.c"
 #undef main
+#include "pgstat.h"
+
+/* Insert the native counted array before invalidations/SCN/TT/typed drops. */
+static Size
+pi_commit_add_stats(FakeXactRecord *fake, const xl_xact_stats_item *items, int count)
+{
+	uint32 xinfo;
+	Size offset = MinSizeOfXactCommit + sizeof(xl_xact_xinfo);
+	Size extra = sizeof(count) + count * sizeof(*items);
+
+	memcpy(&xinfo, fake->data + MinSizeOfXactCommit, sizeof(xinfo));
+	UT_ASSERT((xinfo & (XACT_XINFO_HAS_SUBXACTS | XACT_XINFO_HAS_DROPPED_STATS)) == 0);
+	if ((xinfo & XACT_XINFO_HAS_DBINFO) != 0)
+		offset += sizeof(xl_xact_dbinfo);
+	if ((xinfo & XACT_XINFO_HAS_RELFILELOCATORS) != 0) {
+		int nrels;
+		memcpy(&nrels, fake->data + offset, sizeof(nrels));
+		offset += sizeof(nrels) + nrels * sizeof(RelFileLocator);
+	}
+	UT_ASSERT(fake->u.decoded.main_data_len + extra <= sizeof(fake->data));
+	memmove(fake->data + offset + extra, fake->data + offset,
+			fake->u.decoded.main_data_len - offset);
+	memcpy(fake->data + offset, &count, sizeof(count));
+	memcpy(fake->data + offset + sizeof(count), items, count * sizeof(*items));
+	xinfo |= XACT_XINFO_HAS_DROPPED_STATS;
+	memcpy(fake->data + MinSizeOfXactCommit, &xinfo, sizeof(xinfo));
+	fake->u.decoded.main_data_len += extra;
+	return offset;
+}
 
 static void
 pi_commit(FakeXactRecord *fake, uint32 flags, const SharedInvalidationMessage *messages, int count)
@@ -481,10 +510,156 @@ UT_TEST(test_pi_ko_commit_marker_preserves_owner_without_execution)
 	}
 }
 
+UT_TEST(test_pi_relation_stats_keeps_native_owner_without_execution)
+{
+	for (int variant = 0; variant < 3; variant++) {
+		/* Logical relation OIDs need not name any physical locator in the WAL. */
+		xl_xact_stats_item items[2] = {
+			{ PGSTAT_KIND_RELATION, 5, 76543 }, { PGSTAT_KIND_RELATION, InvalidOid, 1260 }
+		};
+		FakeXactRecord fake;
+		RfPageOnlineRecordIdentityV1 identity;
+		RfDetachedRecordPlanV1 record;
+		RfSideOnlinePlanV1 *plan, *recovery;
+		RfSideOnlineOperationV1 op;
+		RfSideContributionOwnersV1 owners;
+		RfPageProofDetailV1 detail;
+		RfSideOnlineApplyOpsV1 ops = { 0 };
+		ApplyCapture capture = { 0 };
+
+		if (variant == 2) {
+			make_commit(&fake, 801, 901, 123456, false);
+			items[0].dboid = InvalidOid;
+		} else
+			pi_commit(&fake, variant == 1 ? XACT_COMPLETION_FORCE_SYNC_COMMIT : 0, NULL, 0);
+		pi_commit_add_stats(&fake, items, lengthof(items));
+		identity = pi_identity(&fake);
+		record = make_record_plan(&fake);
+		plan = pi_side_plan(&identity, true);
+		detail = rf_side_online_plan_feed_record_v1(plan, &record, &identity);
+		UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_OK);
+		if (detail == RF_PAGE_PROOF_DETAIL_OK) {
+			UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &op));
+			UT_ASSERT_EQ(op.owned_payload_length, fake.u.decoded.main_data_len);
+			UT_ASSERT(memcmp(op.owned_payload, fake.data, op.owned_payload_length) == 0);
+			UT_ASSERT(rf_side_online_plan_contribution_owners_v1(plan, 0, &owners));
+			UT_ASSERT_EQ(owners.owners, RF_SIDE_CONTRIBUTION_UNDO_HEADER
+						 | RF_SIDE_CONTRIBUTION_TERMINAL | RF_SIDE_CONTRIBUTION_COMPLETION);
+			UT_ASSERT_EQ(rf_side_online_plan_space_contribution_count_v1(plan, 0), 0);
+			UT_ASSERT_EQ(rf_side_xact_apply_owned_v1(&op.xact, op.owned_payload,
+												   op.owned_payload_length), RF_SIDE_XACT_APPLY_BLOCKED);
+			ops.arg = &capture;
+			ops.begin_protected_set = capture_begin;
+			ops.end_protected_set = capture_end;
+			ops.preflight_xact = accept_preflight;
+			ops.apply_xact = capture_apply;
+			UT_ASSERT_NE(rf_side_online_plan_preflight_v1(plan, &ops), RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT_NE(rf_side_online_plan_apply_v1(plan, &ops), RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT_EQ(capture.begin_count, 0);
+			UT_ASSERT_EQ(capture.count, 0);
+			UT_ASSERT(!capture.end_complete);
+		}
+		recovery = pi_side_plan(&identity, false);
+		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(recovery, &record, &identity),
+					 RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+		rf_side_online_plan_destroy_v1(&recovery);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_pi_relation_stats_checks_every_item_and_bounded_scope)
+{
+	for (int variant = 0; variant < 10; variant++) {
+		xl_xact_stats_item items[2] = {
+			{ PGSTAT_KIND_RELATION, 5, 76543 }, { PGSTAT_KIND_RELATION, 5, 76544 }
+		};
+		FakeXactRecord fake;
+		RfPageOnlineRecordIdentityV1 identity;
+		RfDetachedRecordPlanV1 record;
+		RfSideOnlinePlanV1 *plan;
+		Size offset;
+		int count;
+		Oid database = InvalidOid;
+
+		if (variant == 0) items[1].kind = PGSTAT_KIND_DATABASE;
+		if (variant == 1) items[1].kind = -1;
+		if (variant == 2) items[1].objoid = InvalidOid;
+		if (variant == 3) items[1].dboid = 6;
+		if (variant == 4)
+			make_commit(&fake, 801, 901, 123456, false);
+		else
+			pi_commit(&fake, 0, NULL, 0);
+		if (variant == 5)
+			memcpy(fake.data + MinSizeOfXactCommit + sizeof(xl_xact_xinfo),
+				   &database, sizeof(database));
+		offset = pi_commit_add_stats(&fake, items, lengthof(items));
+		if (variant == 6 || variant == 7) {
+			count = variant == 6 ? -1 : INT_MAX;
+			memcpy(fake.data + offset, &count, sizeof(count));
+		}
+		if (variant == 8)
+			fake.u.decoded.main_data_len = offset + sizeof(count) + sizeof(items) - 1;
+		if (variant == 9)
+			fake.data[fake.u.decoded.main_data_len++] = 0;
+		identity = pi_identity(&fake);
+		record = make_record_plan(&fake);
+		plan = pi_side_plan(&identity, true);
+		UT_ASSERT_NE(rf_side_online_plan_feed_record_v1(plan, &record, &identity), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_NE(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_pi_relation_stats_preserves_other_commit_effect_checks)
+{
+	for (int variant = 0; variant < 5; variant++) {
+		xl_xact_stats_item item = { PGSTAT_KIND_RELATION, 5, 76543 };
+		SharedInvalidationMessage msg = { 0 };
+		FakeXactRecord fake;
+		RfPageOnlineRecordIdentityV1 identity;
+		RfDetachedRecordPlanV1 record;
+		RfSideOnlinePlanV1 *plan;
+		RfPageProofDetailV1 detail;
+
+		msg.ko.id = SHAREDINVALKO_COMMIT_ID;
+		msg.ko.version = SHAREDINVALKO_COMMIT_VERSION;
+		msg.ko.batch_lo = 17;
+		if (variant == 1) msg.ko.version++;
+		if (variant == 2) msg.id = -99;
+		pi_commit(&fake, XACT_COMPLETION_FORCE_SYNC_COMMIT | XACT_XINFO_HAS_AE_LOCKS, &msg, 1);
+		pi_commit_add_stats(&fake, &item, 1);
+		if (variant == 3) fake.u.decoded.header.xl_xid++;
+		identity = pi_identity(&fake);
+		if (variant == 4) identity.record.origin_thread = 2;
+		record = make_record_plan(&fake);
+		plan = pi_side_plan(&identity, true);
+		detail = rf_side_online_plan_feed_record_v1(plan, &record, &identity);
+		if (variant != 0)
+			UT_ASSERT_NE(detail, RF_PAGE_PROOF_DETAIL_OK);
+		else {
+			RfSideOnlineOperationV1 op;
+			RfSideContributionOwnersV1 owners;
+			UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_OK);
+			if (detail == RF_PAGE_PROOF_DETAIL_OK) {
+				UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+				UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &op));
+				UT_ASSERT_EQ(op.xact.invalidation_count, 1);
+				UT_ASSERT_EQ(op.owned_payload_length, fake.u.decoded.main_data_len);
+				UT_ASSERT(memcmp(op.owned_payload, fake.data, op.owned_payload_length) == 0);
+				UT_ASSERT(rf_side_online_plan_contribution_owners_v1(plan, 0, &owners));
+				UT_ASSERT((owners.owners & RF_SIDE_CONTRIBUTION_INVALIDATION) != 0);
+				UT_ASSERT((owners.owners & RF_SIDE_CONTRIBUTION_COMPLETION) != 0);
+			}
+		}
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(13);
 	UT_RUN(test_pi_commit_keeps_complete_flags_and_invalidation_payload);
 	UT_RUN(test_pi_side_plan_rejects_execution_before_callbacks);
 	UT_RUN(test_pi_commit_unknown_or_damaged_effects_still_refuse);
@@ -495,6 +670,9 @@ main(void)
 	UT_RUN(test_pi_create_namespace_modifier_and_page_reuse_boundaries);
 	UT_RUN(test_pi_commit_keeps_all_drop_locators_and_exact_namespace);
 	UT_RUN(test_pi_ko_commit_marker_preserves_owner_without_execution);
+	UT_RUN(test_pi_relation_stats_keeps_native_owner_without_execution);
+	UT_RUN(test_pi_relation_stats_checks_every_item_and_bounded_scope);
+	UT_RUN(test_pi_relation_stats_preserves_other_commit_effect_checks);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

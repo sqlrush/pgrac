@@ -1810,8 +1810,11 @@ rf_side_online_plan_contribution_owners_v1(const RfSideOnlinePlanV1 *plan, uint3
 					result.owners |= RF_SIDE_CONTRIBUTION_INVALIDATION;
 				if (op->xact.relation_count != 0)
 					result.owners |= RF_SIDE_CONTRIBUTION_NATIVE_STRUCTURE;
+				/* Native pgstat deletion remains its original completion
+				 * owner's duty, even without any completion flags. */
 				if ((op->xact.xinfo & (XACT_COMPLETION_FORCE_SYNC_COMMIT
-					| XACT_COMPLETION_APPLY_FEEDBACK | XACT_XINFO_HAS_AE_LOCKS)) != 0)
+					| XACT_COMPLETION_APPLY_FEEDBACK | XACT_XINFO_HAS_AE_LOCKS
+					| XACT_XINFO_HAS_DROPPED_STATS)) != 0)
 					result.owners |= RF_SIDE_CONTRIBUTION_COMPLETION;
 			}
 			break;
