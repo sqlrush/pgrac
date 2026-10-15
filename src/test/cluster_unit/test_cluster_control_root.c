@@ -14334,6 +14334,9 @@ static int bootstrap_root_opens;
 static int bootstrap_race_at;
 static int bootstrap_close_calls;
 static int bootstrap_close_fail_at;
+static unsigned native_segment_race, native_segment_closes;
+static struct stat native_segment_identity;
+static char native_segment_path[MAXPGPATH], native_segment_saved[MAXPGPATH];
 static bool bootstrap_wal_route_race;
 static uint8 bootstrap_replacement[66048];
 static uint8 bootstrap_binding_replacement[256];
@@ -14724,6 +14727,81 @@ UT_TEST(test_native_side_observation_reads_origin_and_preserves_bytes)
 	bootstrap_side_cleanup(&f);
 }
 
+/* Mutate an actual orphan segment after its final page has been read and
+ * revalidated, at close. No native cursor subsequently rereads this segment. */
+static void
+native_side_segment_race(unsigned mutation, unsigned close_at)
+{
+	for (unsigned sync = 0; sync < 2; sync++) {
+		BootstrapSideFixture f;
+		ControlFileData control = { 0 };
+		ClusterNativeSideObservation observed;
+		ClusterControlRootResult result;
+		uint8 bytes[2 * BLCKSZ] = { 0 };
+		char path[MAXPGPATH];
+		const char *files[] = { "pg_xact/0000", "pg_subtrans/0000", "pg_multixact/offsets/0000" };
+
+		bootstrap_side_fixture(&f, 3);
+		native_side_authority(&f, 100, true);
+		control.checkPointCopy.nextXid = FullTransactionIdFromU64(101);
+		control.checkPointCopy.nextMulti = control.checkPointCopy.oldestMulti = FirstMultiXactId;
+		for (unsigned i = 0; i < lengthof(files); i++) {
+			snprintf(path, sizeof(path), "%s/%s", f.origin, files[i]);
+			write_all_or_abort(path, bytes, BLCKSZ);
+		}
+		snprintf(native_segment_path, sizeof(native_segment_path), "%s/pg_xact/0001", f.origin);
+		snprintf(native_segment_saved, sizeof(native_segment_saved), "%s/held-segment", f.root);
+		write_all_or_abort(native_segment_path, bytes, sizeof(bytes));
+		UT_ASSERT_EQ(cluster_control_native_side_observe(f.shared, 3, &control, &observed), 0);
+		UT_ASSERT_EQ(stat(native_segment_path, &native_segment_identity), 0);
+		native_segment_closes = close_at;
+		native_segment_race = mutation;
+		memset(&observed, 0xa5, sizeof(observed));
+		result = sync ? cluster_control_native_side_sync(f.shared, 3, &control, &observed)
+					  : cluster_control_native_side_observe(f.shared, 3, &control, &observed);
+		UT_ASSERT_EQ(native_segment_race, 0);
+		UT_ASSERT_EQ(native_segment_closes, 0);
+		UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+		UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+		/* Cleanup occurs even on the expected pre-fix assertion failures. */
+		native_segment_race = 0;
+		UT_ASSERT_EQ(unlink(native_segment_path), 0);
+		if (mutation == 2 || mutation == 4)
+			UT_ASSERT_EQ(unlink(native_segment_saved), 0);
+		for (unsigned i = 0; i < lengthof(files); i++) {
+			snprintf(path, sizeof(path), "%s/%s", f.origin, files[i]);
+			UT_ASSERT_EQ(unlink(path), 0);
+		}
+		native_side_authority_cleanup(&f);
+		bootstrap_side_cleanup(&f);
+	}
+}
+
+UT_TEST(test_native_side_detects_append_after_last_page)
+{
+	native_side_segment_race(1, 2);
+}
+
+UT_TEST(test_native_side_detects_replace_after_last_page)
+{
+	native_side_segment_race(2, 2);
+}
+
+UT_TEST(test_native_side_detects_truncate_after_last_page)
+{
+	native_side_segment_race(3, 2);
+}
+
+UT_TEST(test_native_side_detects_link_after_last_page)
+{
+	native_side_segment_race(4, 2);
+}
+
+UT_TEST(test_native_side_detects_replace_between_pages)
+{
+	native_side_segment_race(2, 1);
+}
+
 UT_TEST(test_native_side_refuses_valid_commit_ts_history_without_erasing_it)
 {
 	for (unsigned variant = 0; variant < 2; variant++) {
@@ -15036,7 +15114,31 @@ int unit_bootstrap_close(int fd);
 int
 unit_bootstrap_close(int fd)
 {
+	struct stat st;
+	bool mutate = native_segment_race != 0 && fstat(fd, &st) == 0
+				  && st.st_dev == native_segment_identity.st_dev
+				  && st.st_ino == native_segment_identity.st_ino && --native_segment_closes == 0;
 	int result = close(fd);
+
+	if (mutate) {
+		unsigned mutation = native_segment_race;
+		uint8 bytes[2 * BLCKSZ] = { 0 };
+
+		native_segment_race = 0;
+		if (mutation == 1) {
+			int append = open(native_segment_path, O_WRONLY | O_APPEND);
+			if (append < 0 || write(append, bytes, BLCKSZ) != BLCKSZ || close(append) != 0)
+				abort();
+		} else if (mutation == 2) {
+			if (rename(native_segment_path, native_segment_saved) != 0)
+				abort();
+			write_all_or_abort(native_segment_path, bytes, sizeof(bytes));
+		} else if (mutation == 3) {
+			if (truncate(native_segment_path, BLCKSZ) != 0)
+				abort();
+		} else if (link(native_segment_path, native_segment_saved) != 0)
+			abort();
+	}
 
 	if (++bootstrap_close_calls == bootstrap_close_fail_at) {
 		errno = EIO;
@@ -22634,6 +22736,16 @@ main(int argc, char **argv)
 	if (argc > 1)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_NATIVE_SEGMENT_RACE") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_native_side_detects_append_after_last_page);
+		UT_RUN(test_native_side_detects_replace_after_last_page);
+		UT_RUN(test_native_side_detects_truncate_after_last_page);
+		UT_RUN(test_native_side_detects_link_after_last_page);
+		UT_RUN(test_native_side_detects_replace_between_pages);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_BOOTSTRAP_OBSERVE") != NULL) {
 		UT_PLAN(12);
 		UT_RUN(test_bootstrap_read_exact_files_and_owned_config);
@@ -22756,7 +22868,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(453);
+	UT_PLAN(458);
 	UT_RUN(test_checkpoint_cf_refusal_cannot_hide_staging_discard_failure);
 	UT_RUN(test_clean_restart_without_provider_keeps_collective_exit_and_actual_install);
 	UT_RUN(test_clean_restart_without_provider_refuses_missing_exit_formation_and_fence);
@@ -22871,6 +22983,11 @@ main(int argc, char **argv)
 	UT_RUN(test_native_inputs_recheck_namespace_and_release_fds);
 	UT_RUN(test_bootstrap_side_routes_require_exact_origin);
 	UT_RUN(test_native_side_observation_reads_origin_and_preserves_bytes);
+	UT_RUN(test_native_side_detects_append_after_last_page);
+	UT_RUN(test_native_side_detects_replace_after_last_page);
+	UT_RUN(test_native_side_detects_truncate_after_last_page);
+	UT_RUN(test_native_side_detects_link_after_last_page);
+	UT_RUN(test_native_side_detects_replace_between_pages);
 	UT_RUN(test_native_side_refuses_valid_commit_ts_history_without_erasing_it);
 	UT_RUN(test_native_side_observation_refuses_missing_contradictory_or_aliased_pages);
 	UT_RUN(test_native_side_census_requires_sealed_xid_horizon_and_uses_raised_cursor);

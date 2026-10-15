@@ -137,6 +137,38 @@ UT_TEST(test_shared_relation_names)
 	}
 }
 
+/* Each truncated prefix is its own exact-sized allocation, rather than a
+ * pointer into a longer literal whose backing object hides short inputs. */
+UT_TEST(test_native_slru_short_paths_never_form_a_segment_key)
+{
+	const char *prefixes[] = { "pg_xact/", "pg_subtrans/", "pg_commit_ts/", "pg_multixact/offsets/",
+							   "pg_multixact/members/" };
+
+	for (unsigned i = 0; i < lengthof(prefixes); i++) {
+		for (size_t n = 0; n <= strlen(prefixes[i]); n++) {
+			char *path = malloc(n + 1);
+			RelFileLocator locator;
+			ForkNumber forknum;
+			uint8 family = 0xa5;
+			uint32 segment = UINT32_MAX;
+
+			if (path == NULL)
+				abort();
+			memcpy(path, prefixes[i], n);
+			path[n] = '\0';
+			UT_ASSERT(!namespace_native_key(path, &family, &segment));
+			UT_ASSERT_EQ(family, 0xa5);
+			UT_ASSERT_EQ(segment, UINT32_MAX);
+			UT_ASSERT_EQ(
+				cluster_recovery_namespace_classify_ex(path, &locator, &forknum, &family, &segment),
+				CLUSTER_RECOVERY_FILE_UNCLASSIFIED);
+			UT_ASSERT_EQ(family, 0);
+			UT_ASSERT_EQ(segment, UINT32_MAX);
+			free(path);
+		}
+	}
+}
+
 UT_TEST(test_native_slru_segment_names_are_explicit_obligations)
 {
 	struct NativeName {
@@ -712,9 +744,10 @@ UT_TEST(test_current_read_rejects_out_of_range_without_sealing)
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(21);
 	UT_RUN(test_shared_relation_names);
 	UT_RUN(test_native_slru_segment_names_are_explicit_obligations);
+	UT_RUN(test_native_slru_short_paths_never_form_a_segment_key);
 	UT_RUN(test_real_native_slru_entries_carry_family_and_segment);
 	UT_RUN(test_twophase_state_names_are_explicit_obligations);
 	UT_RUN(test_real_twophase_entries_carry_xid);

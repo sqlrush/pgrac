@@ -111,11 +111,15 @@ namespace_native_key(const char *path, uint8 *family, uint32 *segment)
 	if (path == NULL || family == NULL || segment == NULL)
 		return false;
 	for (unsigned i = 0; i < lengthof(prefixes); i++) {
-		const char *name = path + strlen(prefixes[i].prefix);
+		size_t prefix_length = strlen(prefixes[i].prefix);
+		const char *name;
 		uint32 value = 0;
 		char canonical[5];
 
-		if (strncmp(path, prefixes[i].prefix, strlen(prefixes[i].prefix)) != 0 || strlen(name) != 4)
+		if (strncmp(path, prefixes[i].prefix, prefix_length) != 0)
+			continue;
+		name = path + prefix_length;
+		if (strlen(name) != 4)
 			continue;
 		for (unsigned digit = 0; digit < 4; digit++) {
 			unsigned nibble;
