@@ -10,6 +10,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_ic.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "storage/bufmgr.h"
@@ -196,6 +197,12 @@ fixture_open_gate(ResourceXGateSnapshot *gate)
 #define cluster_resource_x_writer_path_snapshot(generation)                                        \
 	(*(generation) = 6, RESOURCE_X_WRITER_TARGET)
 #define cluster_gcs_resource_x_target_context_recheck_exact(context) ((void)(context), false)
+#define cluster_enabled false
+#define cluster_shared_config false
+#define cluster_interconnect_tier CLUSTER_IC_TIER_1
+#define cluster_smgr_which_for(locator, backend) ((void)(locator), (void)(backend), 0)
+#define cluster_ko_peer_delivery_begin_v3(locator, revision)                                       \
+	((void)(locator), (void)(revision), fixture_failure(), false)
 #define cluster_bufmgr_resource_x_fail_closed_exact(gate) ((void)(gate), fixture_failure())
 #undef ereport
 #define ereport(...) fixture_failure()

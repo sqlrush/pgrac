@@ -4809,7 +4809,7 @@ clean distclean maintainer-clean:
 		test_cluster_pcm_eviction_owner.inc test_cluster_pcm_clock_sweep.inc \
 		test_cluster_resource_x_eviction_owner.inc \
 		test_cluster_resource_x_failed_round_observation.inc \
-		test_cluster_pcm_aux_consumer.inc test_cluster_pcm_aux_ledger.inc \
+		test_cluster_pcm_aux_consumer.inc test_cluster_pcm_aux_ledger.inc test_cluster_pcm_writer_prepare.inc \
 		test_cluster_ctrc_dispatch.inc \
 		test_cluster_ctrc_run_pass.inc \
 		test_cluster_ctrc_read_scope.inc \
@@ -5725,8 +5725,9 @@ test_cluster_pcm_aux_reobserve_context.inc: $(top_srcdir)/src/backend/cluster/cl
 
 test_cluster_pcm_aux_prepare.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^cluster_bufmgr_should_pcm_track\(/ { print "static inline bool"; emit=1; tracked++ } \
+	     /^cluster_bufmgr_pcm_x_writer_object_sample\(/ { print "static void"; emit=1; sample++ } \
 	     /^cluster_bufmgr_pcm_x_writer_prepare_target\(/ { print "static ClusterPcmXWriterLedgerEntry *"; emit=1; prepare++ } \
-	     emit { print } /^}/ { emit=0 } END { if (tracked != 1 || prepare != 1) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (tracked != 1 || sample != 1 || prepare != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pcm_aux_vm_mutation.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
@@ -5868,13 +5869,18 @@ test_cluster_pcm_aux_ledger.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr
 	     /^static ClusterPcmXWriterLedgerEntry cluster_bufmgr_pcm_x_writer_ledger\[/ { print; array++ } \
 	     /^cluster_bufmgr_pcm_x_writer_(find|free_entry)\(/ { print "static ClusterPcmXWriterLedgerEntry *"; emit=1; find++ } \
 	     /^cluster_bufmgr_pcm_x_writer_(entry_exact|activate)\(/ { print "static bool"; emit=1; boolean++ } \
-	     /^cluster_bufmgr_pcm_x_writer_(clear|track_target_direct_init|activate_target_direct_init)\(/ { print "static void"; emit=1; action++ } \
+	     /^cluster_bufmgr_pcm_x_writer_(clear|object_sample|track_target_direct_init|activate_target_direct_init)\(/ { print "static void"; emit=1; action++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (types != 2 || array != 1 || find != 2 || boolean != 2 || action != 3) exit 1 }' $< > $@.tmp
+	     END { if (types != 2 || array != 1 || find != 2 || boolean != 2 || action != 4) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pcm_writer_prepare.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_bufmgr_pcm_x_writer_prepare_target\(/ { print "static ClusterPcmXWriterLedgerEntry *"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pcm_aux_consumer: test_cluster_pcm_aux_consumer.c unit_test.h \
-		test_cluster_pcm_aux_consumer.inc test_cluster_pcm_aux_ledger.inc \
+		test_cluster_pcm_aux_consumer.inc test_cluster_pcm_aux_ledger.inc test_cluster_pcm_writer_prepare.inc \
 		$(CLUSTER_PCM_DIRECT_INIT_O) $(CLUSTER_RESOURCE_X_IDENTITY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_PCM_DIRECT_INIT_O) \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) \

@@ -2901,6 +2901,8 @@ typedef struct ClusterPcmXWriterLedgerEntry {
 	ResourceXWriterUseContext authority;
 	ClusterPcmOwnSnapshot granted;
 	ResourceXLocalOwnerHandle recycle_owner;
+	uint64 object_revision;
+	bool object_checked;
 } ClusterPcmXWriterLedgerEntry;
 
 static ClusterPcmXWriterLedgerEntry cluster_bufmgr_pcm_x_writer_ledger[LWLOCK_MAX_HELD_BY_PROC];
@@ -3320,6 +3322,23 @@ cluster_bufmgr_pcm_x_writer_clear(ClusterPcmXWriterLedgerEntry *entry)
 		MemSet(entry, 0, sizeof(*entry));
 }
 
+/* The exact post-T3 target is already retained by its original owner. Bind
+ * its object admission before waiting for content-X; neither this sample nor
+ * its later atomic check grants current authority. ACTIVE may finish that
+ * retained target, while READY/terminal fences cannot reopen it. */
+static void
+cluster_bufmgr_pcm_x_writer_object_sample(ClusterPcmXWriterLedgerEntry *entry)
+{
+	RelFileLocator locator = BufTagGetRelFileLocator(&entry->authority.ref.assertion.resource);
+
+	entry->object_revision = 0;
+	entry->object_checked = cluster_enabled && cluster_shared_config
+							&& cluster_interconnect_tier == CLUSTER_IC_TIER_1
+							&& cluster_smgr_which_for(locator, InvalidBackendId) == 1;
+	if (entry->object_checked)
+		(void)cluster_ko_peer_delivery_begin_v3(locator, &entry->object_revision);
+}
+
 static ClusterPcmXWriterLedgerEntry *
 cluster_bufmgr_pcm_x_writer_prepare_target(BufferDesc *buf, const BufferTag *expected_resource,
 										   PcmLockMode mode, uint64 r4_generation,
@@ -3461,6 +3480,7 @@ cluster_bufmgr_pcm_x_writer_prepare_target(BufferDesc *buf, const BufferTag *exp
 		}
 		entry->authority = context;
 		entry->granted = granted;
+		cluster_bufmgr_pcm_x_writer_object_sample(entry);
 		entry->phase = PCM_X_WRITER_LEDGER_ACQUIRING;
 		return entry;
 	}
@@ -3540,6 +3560,7 @@ cluster_bufmgr_pcm_x_writer_track_target_direct_init(
 	entry->content_lock = BufferDescriptorGetContentLock(buf);
 	entry->authority = *context;
 	entry->granted = granted;
+	cluster_bufmgr_pcm_x_writer_object_sample(entry);
 	entry->phase = PCM_X_WRITER_LEDGER_ACQUIRING;
 	if (!cluster_bufmgr_pcm_x_writer_entry_exact(entry, buf)) {
 		cluster_bufmgr_pcm_x_writer_clear(entry);
@@ -3614,6 +3635,19 @@ cluster_bufmgr_pcm_x_writer_activate(
 			cluster_bufmgr_resource_x_fail_closed_exact(&gate);
 			cluster_bufmgr_resource_x_writer_report_failure(context_result, buf,
 															"Resource-X target activate");
+		}
+		/* Consume the original sample only; taking the object lock or
+		 * refreshing permission under content-X would reverse the lock order.
+		 * A failed sample ends only this use attempt, never the node's target,
+		 * pin, IO or PI responsibility. Direct-init cannot return to a caller
+		 * that would initialize bytes after a false activation. */
+		if (entry->object_checked && !cluster_ko_peer_delivery_current_v3(entry->object_revision)) {
+			if (allow_reprobe) {
+				cluster_bufmgr_pcm_x_writer_clear(entry);
+				return false;
+			}
+			cluster_bufmgr_resource_x_writer_report_failure(RESOURCE_X_APPLY_STALE, buf,
+															"Resource-X target object admission");
 		}
 		break;
 	}
