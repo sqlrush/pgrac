@@ -5050,7 +5050,7 @@ test_cluster_ges_recovery_modes.inc: $(top_srcdir)/src/backend/cluster/cluster_s
 	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_ges: test_cluster_ges.c unit_test.h test_cluster_ges_recovery_modes.inc \
+test_cluster_ges test_cluster_ges_release: %: %.c test_cluster_ges.c unit_test.h test_cluster_ges_recovery_modes.inc \
 		$(CLUSTER_VERSION_O) $(CLUSTER_GES_O) $(CLUSTER_GES_MODE_O) \
 		$(CLUSTER_REPLACEMENT_WIRE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
@@ -5104,7 +5104,7 @@ test_cluster_grd_routing.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs.c $(
 	     END { if (types != 1 || functions != 2 || pointers != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_grd: test_cluster_grd.c test_cluster_grd_pool.inc unit_test.h test_cluster_grd_stop_types.inc \
+test_cluster_grd test_cluster_grd_ko_cancel: %: %.c test_cluster_grd.c test_cluster_grd_pool.inc unit_test.h test_cluster_grd_stop_types.inc \
 		test_cluster_grd_routing.inc \
 		test_cluster_hw_authority_gate.inc \
 		$(CLUSTER_VERSION_O) $(CLUSTER_GRD_O) $(CLUSTER_GES_MODE_O)
@@ -5213,7 +5213,7 @@ test_cluster_lmd_probe_collector: test_cluster_lmd_probe_collector.c unit_test.h
 # cluster_lms_enabled / cluster_grd / pg_atomic_*; test stubs all PG
 # backend symbols locally and exercises S1-S7 individual step API + top-
 # level dispatch + HC1 fail-closed + I1 monotonic forward transition.
-test_cluster_lock_acquire: test_cluster_lock_acquire.c unit_test.h \
+test_cluster_lock_acquire test_cluster_acquire_ko_cancel: %: %.c test_cluster_lock_acquire.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LOCK_ACQUIRE_O) $(CLUSTER_GES_MODE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LOCK_ACQUIRE_O) $(CLUSTER_GES_MODE_O) $(CLUSTER_LOCK_OWNER_O) \
@@ -6422,7 +6422,7 @@ test_cluster_ko_writeback_codec.o: $(top_srcdir)/src/backend/cluster/cluster_pi_
 		$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_ko_stop: test_cluster_ko_stop.c test_cluster_ko_space.inc test_cluster_ko_abandon.h test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
+test_cluster_ko_stop test_cluster_ko_cancel: %: %.c test_cluster_ko_stop.c test_cluster_ko_space.inc test_cluster_ko_abandon.h test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
 		test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_ko_lock.c \
 		$(top_srcdir)/src/include/cluster/cluster_ko.h
@@ -9212,3 +9212,14 @@ test_cluster_ko_relation_scan test_cluster_ko_current_admission: %: %.c test_clu
 		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_ko_cancel test_cluster_ges_release test_cluster_grd_ko_cancel test_cluster_acquire_ko_cancel
+
+# Native lifecycle consumers, copied verbatim; surrounding hash/GES are fixtures.
+test_cluster_ko_native_upgrade.inc: $(top_srcdir)/src/backend/storage/lmgr/lock.c
+	awk '/^pgrac_ko_retain_upgrade\(/ { print "static bool"; emit=1; n++ } emit {print} emit && /^}/ {emit=0} END {if (n != 1 || emit) exit 1}' $< > $@
+test_cluster_ko_native_release_all.inc: $(top_srcdir)/src/backend/storage/lmgr/lock.c
+	awk '/^LockReleaseAll\(/ { inside=1 } inside && /^\t\tif \(locallock->cluster_registered\)/ {emit=1; n++} emit && /^#endif/ {emit=0; inside=0} emit {print} END {if (n != 1 || emit) exit 1}' $< > $@
+test_cluster_ko_native_release.inc: $(top_srcdir)/src/backend/storage/lmgr/lock.c
+	awk '/^LockRelease\(/ { inside=1 } inside && /^\tif \(locallock->cluster_registered\)/ {emit=1; n++} emit && /^#endif/ {emit=0; inside=0} emit {print} END {if (n != 1 || emit) exit 1}' $< > $@
+test_cluster_ko_cancel: test_cluster_ko_native_upgrade.inc test_cluster_ko_native_release_all.inc test_cluster_ko_native_release.inc

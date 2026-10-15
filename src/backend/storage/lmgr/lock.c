@@ -27,6 +27,11 @@
  *
  *-------------------------------------------------------------------------
  */
+/* PGRAC MODIFICATIONS
+ * Modified by: SqlRush <sqlrush@gmail.com>
+ * Cluster acquire/release hooks bind native handles to global holders.
+ * Pending object work retains the exact holder through native cleanup.
+ */
 #include "postgres.h"
 
 #include <signal.h>
@@ -44,6 +49,7 @@
  */
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_lock_acquire.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_ges.h"	  /* spec-5.3 — CONVERT_ROLLBACK send */
@@ -883,6 +889,7 @@ pgrac_cluster_post_native_register(LOCALLOCK *locallock, ClusterLockAcquireReque
 	memcpy(locallock->cluster_holder_raw, &cluster_req->holder,
 		   sizeof(locallock->cluster_holder_raw));
 	locallock->cluster_ax_binding_valid = false;
+	locallock->cluster_ko_retained_ax = false;
 	locallock->cluster_ax_master_node = -1;
 	locallock->cluster_ax_master_generation = 0;
 	if (locktag->locktag_type == LOCKTAG_RELATION && lockmode == AccessExclusiveLock
@@ -986,6 +993,9 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 	LOCALLOCK *cluster_lold = NULL;
 
 	memset(cluster_req, 0, sizeof(*cluster_req));
+	/* PGRAC: includes cached/reentrant locks before same-group shortcuts. */
+	if (!cluster_ko_ax_native_wait_v3(locktag, dontWait))
+		return LOCKACQUIRE_NOT_AVAIL;
 
 #define PGRAC_CLUSTER_CLEANUP_PENDING_ACQUIRE()                                                    \
 	do {                                                                                           \
@@ -1059,6 +1069,7 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 		locallock->cluster_request_id = 0;
 		memset(locallock->cluster_holder_raw, 0, sizeof(locallock->cluster_holder_raw));
 		locallock->cluster_ax_binding_valid = false;
+		locallock->cluster_ko_retained_ax = false;
 		locallock->cluster_ax_master_node = -1;
 		locallock->cluster_ax_master_generation = 0;
 		/* PGRAC: spec-5.3 §3.1a convert release-ownership markers. */
@@ -2291,6 +2302,28 @@ RemoveFromWaitQueue(PGPROC *proc, uint32 hashcode)
 	CleanUpLock(waitLock, proclock, LockMethods[lockmethodid], hashcode, true);
 }
 
+#ifdef USE_PGRAC_CLUSTER
+static bool
+pgrac_ko_retain_upgrade(LOCALLOCK *locallock, LOCALLOCK *lold)
+{
+	ClusterGrdHolderId holder;
+
+	memcpy(&holder, locallock->cluster_holder_raw, sizeof(holder));
+	if (!cluster_ko_ax_retain_native_v3(&locallock->tag.lock, &holder))
+		return false;
+	/* Keep the original AX, not a fictitious weaker master grant. The last
+	 * surviving native hold submits its exact release intent below. */
+	lold->cluster_registered = true;
+	lold->cluster_request_id = locallock->cluster_request_id;
+	memcpy(lold->cluster_holder_raw, &holder, sizeof(holder));
+	lold->cluster_ko_retained_ax = true;
+	lold->cluster_ax_binding_valid = false;
+	lold->cluster_ax_master_node = -1;
+	lold->cluster_ax_master_generation = 0;
+	return true;
+}
+#endif
+
 /*
  * LockRelease -- look up 'locktag' and release one 'lockmode' lock on it.
  *		Release a session lock if 'sessionLock' is true, else release a
@@ -2301,6 +2334,12 @@ RemoveFromWaitQueue(PGPROC *proc, uint32 hashcode)
  *		(We have to grant the lock here to avoid a race between
  *		the waking process and any new process to
  *		come along and request the lock.)
+ */
+
+
+/* PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: retain an operation's exact AX through its cleanup owner.
+ * Why: releasing the local handle cannot finish accepted remote work.
  */
 bool
 LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
@@ -2428,17 +2467,19 @@ LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 				ClusterResId resid;
 				ClusterGrdHolderId rb;
 
-				cluster_grd_resid_encode(locktag, &resid);
-				memcpy(&rb, locallock->cluster_holder_raw, sizeof(rb));
-				rb.request_id = locallock->cluster_convert_old_request_id; /* R_old */
-				/* PGRAC: spec-5.9 Hardening v1.0.1 (P1#2) — the granted convert's
+				if (pgrac_ko_retain_upgrade(locallock, lold)) {
+					did_backout = true;
+				} else {
+					cluster_grd_resid_encode(locktag, &resid);
+					memcpy(&rb, locallock->cluster_holder_raw, sizeof(rb));
+					rb.request_id = locallock->cluster_convert_old_request_id; /* R_old */
+					/* PGRAC: spec-5.9 Hardening v1.0.1 (P1#2) — the granted convert's
 				 * request_id guards the stage-2 slot restore against an ABA
 				 * re-upgrade to the same mode. */
-				cluster_ges_send_convert_rollback(&resid, (uint32)lockmode,
-												  (uint32)locallock->cluster_convert_old_mode, &rb,
-												  locallock->cluster_convert_old_request_id,
-												  locallock->cluster_request_id);
-				/* Re-register L_old as the sole cluster owner (net-zero count:
+					cluster_ges_send_convert_rollback(
+						&resid, (uint32)lockmode, (uint32)locallock->cluster_convert_old_mode, &rb,
+						locallock->cluster_convert_old_request_id, locallock->cluster_request_id);
+					/* Re-register L_old as the sole cluster owner (net-zero count:
 				 * L_new -1 + L_old +1, so no decrement below).
 				 *
 				 * PGRAC: spec-5.3 P0-2 — DO NOT clear L_old's OWN convert
@@ -2451,13 +2492,14 @@ LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 				 * (restore RE) instead of plain-deleting the master slot while
 				 * the weaker hold survives (a false-grant).  For a single-level
 				 * convert L_old's markers are already 0, so this is a no-op. */
-				lold->cluster_registered = true;
-				lold->cluster_request_id = locallock->cluster_convert_old_request_id;
-				memcpy(lold->cluster_holder_raw, &rb, sizeof(lold->cluster_holder_raw));
-				lold->cluster_ax_binding_valid = false;
-				lold->cluster_ax_master_node = -1;
-				lold->cluster_ax_master_generation = 0;
-				did_backout = true;
+					lold->cluster_registered = true;
+					lold->cluster_request_id = locallock->cluster_convert_old_request_id;
+					memcpy(lold->cluster_holder_raw, &rb, sizeof(lold->cluster_holder_raw));
+					lold->cluster_ax_binding_valid = false;
+					lold->cluster_ax_master_node = -1;
+					lold->cluster_ax_master_generation = 0;
+					did_backout = true;
+				}
 			}
 		}
 
@@ -2466,17 +2508,20 @@ LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 
 			memset(&crel, 0, sizeof(crel));
 			crel.locktag = *locktag;
-			crel.lockmode = lockmode;
+			crel.lockmode = locallock->cluster_ko_retained_ax ? AccessExclusiveLock : lockmode;
 			crel.sessionLock = sessionLock;
 			crel.request_id = locallock->cluster_request_id;
 			memcpy(&crel.holder, locallock->cluster_holder_raw, sizeof(crel.holder));
 			crel.cluster_registered = true;
-			cluster_lock_release(&crel);
+			/* PGRAC: unregister can transfer ownership; it does not imply S6 ACK. */
+			if (!cluster_ko_ax_release_handoff_v3(&crel.locktag, crel.lockmode, &crel.holder))
+				cluster_lock_release(&crel);
 			/* PGRAC: spec-4.6 D3 — rebind-barrier scope count. */
 			pg_atomic_fetch_sub_u32(&MyProc->cluster_grd_registered_count, 1);
 		}
 		locallock->cluster_registered = false;
 		locallock->cluster_ax_binding_valid = false;
+		locallock->cluster_ko_retained_ax = false;
 		locallock->cluster_ax_master_node = -1;
 		locallock->cluster_ax_master_generation = 0;
 		locallock->cluster_convert_old_request_id = 0;
@@ -2580,6 +2625,10 @@ LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
  *		allLocks == true: release all locks including session locks.
  *		allLocks == false: release all non-session locks.
  */
+/* PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: preserve surviving session holds and transfer exact releases.
+ * Why: transaction cleanup must neither lose the holder nor release it early.
+ */
 void
 LockReleaseAll(LOCKMETHODID lockmethodid, bool allLocks)
 {
@@ -2671,10 +2720,35 @@ LockReleaseAll(LOCKMETHODID lockmethodid, bool allLocks)
 		 */
 		if (locallock->cluster_registered) {
 			ClusterLockReleaseRequest crel;
+			bool retained = false;
 
+			/* PGRAC: a weaker session hold can outlive this transaction's upgrade.
+			 * The hash scan may already have removed intermediate xact holds;
+			 * find a surviving native anchor by this exact relation tag. */
+			if (!allLocks
+				&& (locallock->tag.mode == AccessExclusiveLock
+					|| locallock->cluster_ko_retained_ax)) {
+				for (LOCKMODE mode = AccessShareLock; mode < locallock->tag.mode; mode++) {
+					LOCALLOCKTAG oldtag = locallock->tag;
+					LOCALLOCK *lold;
+					oldtag.mode = mode;
+					lold = hash_search(LockMethodLocalHash, &oldtag, HASH_FIND, NULL);
+					if (lold == NULL || lold->nLocks <= 0 || lold->cluster_registered)
+						continue;
+					for (int owner = 0; owner < lold->numLockOwners; owner++)
+						if (lold->lockOwners[owner].owner == NULL
+							&& lold->lockOwners[owner].nLocks > 0) {
+							retained = pgrac_ko_retain_upgrade(locallock, lold);
+							break;
+						}
+					if (retained)
+						break;
+				}
+			}
 			memset(&crel, 0, sizeof(crel));
 			crel.locktag = locallock->tag.lock;
-			crel.lockmode = locallock->tag.mode;
+			crel.lockmode
+				= locallock->cluster_ko_retained_ax ? AccessExclusiveLock : locallock->tag.mode;
 			/*
 			 * PGRAC: spec-5.5 D2 — derive the real scope instead of hardcoding
 			 * xact-level.  This path runs for allLocks=true (backend exit /
@@ -2689,13 +2763,18 @@ LockReleaseAll(LOCKMETHODID lockmethodid, bool allLocks)
 			crel.request_id = locallock->cluster_request_id;
 			memcpy(&crel.holder, locallock->cluster_holder_raw, sizeof(crel.holder));
 			crel.cluster_registered = true;
-			cluster_lock_release(&crel);
+			/* PGRAC: unregister can transfer ownership; it does not imply S6 ACK. */
+			if (!retained
+				&& !cluster_ko_ax_release_handoff_v3(&crel.locktag, crel.lockmode, &crel.holder))
+				cluster_lock_release(&crel);
 			locallock->cluster_registered = false;
 			locallock->cluster_ax_binding_valid = false;
+			locallock->cluster_ko_retained_ax = false;
 			locallock->cluster_ax_master_node = -1;
 			locallock->cluster_ax_master_generation = 0;
 			/* PGRAC: spec-4.6 D3 — rebind-barrier scope count. */
-			pg_atomic_fetch_sub_u32(&MyProc->cluster_grd_registered_count, 1);
+			if (!retained)
+				pg_atomic_fetch_sub_u32(&MyProc->cluster_grd_registered_count, 1);
 		}
 #endif
 

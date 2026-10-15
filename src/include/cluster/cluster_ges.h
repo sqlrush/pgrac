@@ -577,6 +577,18 @@ typedef struct ClusterGesAcquireAttempt {
 	ClusterGesRedeclareAttempt exchange;
 } ClusterGesAcquireAttempt;
 
+/* One original RELEASE exchange, retained by its nonblocking cleanup owner. */
+typedef struct ClusterGesReleaseAttempt {
+	ClusterGesRedeclareAttempt exchange;
+	bool registering;
+} ClusterGesReleaseAttempt;
+
+extern ClusterGesRedeclareResult cluster_ges_release_poll(ClusterGesReleaseAttempt *attempt,
+														  const struct ClusterResId *resid,
+														  const struct ClusterGrdHolderId *holder,
+														  int32 master, uint64 route_generation,
+														  uint32 lock_group_procno_plus_one);
+
 typedef enum ClusterGesAcquireResult {
 	CLUSTER_GES_ACQUIRE_PENDING = 0,
 	CLUSTER_GES_ACQUIRE_GRANTED,

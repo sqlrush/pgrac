@@ -87,6 +87,26 @@ extern void cluster_ko_resid_encode(RelFileLocator rloc, ClusterResId *dst);
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_space_identity.h"
 
+/* Native AX cleanup keeps the original holder until its operation completes. */
+extern bool cluster_ko_ax_retain_native_v3(const LOCKTAG *tag, const ClusterGrdHolderId *holder);
+extern bool cluster_ko_ax_release_handoff_v3(const LOCKTAG *tag, LOCKMODE mode,
+											 const ClusterGrdHolderId *holder);
+extern bool cluster_ko_ax_acquire_pending_v3(const ClusterResId *resid, uint32 procno,
+											 uint32 lock_group_procno_plus_one);
+extern bool cluster_ko_ax_native_wait_v3(const LOCKTAG *tag, bool dontwait);
+
+typedef struct ClusterKoAxCleanupV3 {
+	uint64 revision;
+	unsigned count;
+	ClusterGrdHolderId holders[64];
+} ClusterKoAxCleanupV3;
+extern void cluster_ko_ax_cleanup_sample_v3(const ClusterResId *resid, int dead_procno,
+											int32 dead_node, ClusterKoAxCleanupV3 *sample);
+extern bool cluster_ko_ax_cleanup_claim_v3(const ClusterKoAxCleanupV3 *sample);
+extern bool cluster_ko_ax_cleanup_retains_v3(const ClusterKoAxCleanupV3 *sample,
+											 const ClusterGrdHolderId *holder);
+extern void cluster_ko_ax_cleanup_finish_v3(const ClusterKoAxCleanupV3 *sample);
+
 #define CLUSTER_KO_SHARED_V2_BYTES 160
 #define CLUSTER_KO_SHARED_V3_BYTES 240
 #define CLUSTER_KO_SHARED_V3_VERSION 3

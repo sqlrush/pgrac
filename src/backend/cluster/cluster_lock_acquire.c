@@ -318,6 +318,9 @@ cluster_lock_acquire_s3_partition_reservation(const ClusterLockAcquireRequest *r
 
 	mut = (ClusterLockAcquireRequest *)req;
 	fill_request_holder(mut);
+	if (req->resid.type == LOCKTAG_RELATION
+		&& !cluster_ko_ax_native_wait_v3(&req->locktag, req->dontwait))
+		return CLUSTER_LOCK_ACQUIRE_NOT_AVAIL;
 	/* Capture before any reservation or REQUEST can obtain a grant. Retain
 	 * even an empty/refused sample through retries of this same request. */
 	if (req->resid.type == LOCKTAG_RELATION && cluster_lock_acquire_is_native_request(req)
@@ -674,6 +677,12 @@ cluster_lock_acquire_s5_promote_once(const ClusterLockAcquireRequest *req)
 	if (!cluster_grd_control_acquire_allowed(&req->resid, req->lockmode))
 		return CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING;
 	mut->registration_failure_reason = NULL;
+	if (req->resid.type == LOCKTAG_RELATION
+		&& cluster_ko_ax_acquire_pending_v3(&req->resid, req->holder.procno,
+											cluster_ges_current_lock_group(&req->holder))) {
+		mut->registration_failure_reason = "KO_AX_RELEASE_PENDING";
+		return CLUSTER_LOCK_ACQUIRE_PENDING;
+	}
 
 	/* Retained HW/native-lock/CF GRANT owns its exact registration, not
 	 * the S3 mutation snapshot. Other control classes keep their own path. */
@@ -717,6 +726,14 @@ cluster_lock_acquire_s5_promote_once(const ClusterLockAcquireRequest *req)
 				if (er == CLUSTER_GRD_ENTRY_OK) {
 					mut->registration_failure_reason = "GRANT_CHANGED_DURING_REGISTRATION";
 					promoted = cluster_lock_acquire_retained_grant_is_current(req, &pending);
+				}
+				if (promoted && req->resid.type == LOCKTAG_RELATION
+					&& cluster_ko_ax_acquire_pending_v3(
+						&req->resid, req->holder.procno,
+						cluster_ges_current_lock_group(&req->holder))) {
+					pending = true;
+					promoted = false;
+					mut->registration_failure_reason = "KO_AX_RELEASE_PENDING";
 				}
 				if (promoted) {
 					if (req->resid.type == LOCKTAG_RELATION)

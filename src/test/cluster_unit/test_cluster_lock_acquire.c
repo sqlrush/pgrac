@@ -840,6 +840,8 @@ cluster_ges_send_native_request_and_wait(const ClusterResId *resid pg_attribute_
 	return stub_ges_reject_reason;
 }
 
+static bool owner_relation_grant_current;
+
 bool
 cluster_ges_relation_grant_is_current(const ClusterGesHwGrant *grant pg_attribute_unused(),
 									  const ClusterResId *resid pg_attribute_unused(),
@@ -848,7 +850,7 @@ cluster_ges_relation_grant_is_current(const ClusterGesHwGrant *grant pg_attribut
 									  uint32 mode pg_attribute_unused(),
 									  bool dontwait pg_attribute_unused())
 {
-	return false;
+	return owner_relation_grant_current;
 }
 
 uint32
@@ -2054,4 +2056,19 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
+}
+
+/* Local KO owner boundary, before any reservation or native promotion. */
+static bool ko_ax_pending;
+static unsigned ko_ax_reads, ko_ax_pending_after;
+bool
+cluster_ko_ax_native_wait_v3(const LOCKTAG *tag, bool dontwait)
+{
+	return !ko_ax_pending;
+}
+bool
+cluster_ko_ax_acquire_pending_v3(const ClusterResId *resid, uint32 procno, uint32 group)
+{
+	ko_ax_reads++;
+	return ko_ax_pending || (ko_ax_pending_after != 0 && ko_ax_reads >= ko_ax_pending_after);
 }

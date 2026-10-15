@@ -3993,6 +3993,147 @@ ges_release_send_owned(const struct ClusterResId *resid, const struct ClusterGrd
 	return reject_reason;
 }
 
+/* Advance only the original RELEASE result slot and transport attempt. */
+static ClusterGesRedeclareResult
+ges_release_poll_remote(ClusterGesReleaseAttempt *owned, int32 master)
+{
+	ClusterGesRedeclareAttempt *attempt = &owned->exchange;
+	GesReplyWaitVerdict verdict;
+	GesReplyWaitPollResult poll;
+	TimestampTz now;
+
+	/* insert can ERROR after publishing a slot (pressure logging).
+	 * Preserve that window in the original owner before entering it. */
+	if (owned->registering) {
+		poll = cluster_ges_reply_wait_poll_consume(&attempt->key, &verdict);
+		if (poll == GES_REPLY_WAIT_POLL_MISSING)
+			owned->registering = false;
+		else if (poll == GES_REPLY_WAIT_POLL_PENDING) {
+			attempt->wait_registered = true;
+			owned->registering = false;
+		} else {
+			attempt->invalid = true;
+			return CLUSTER_GES_REDECLARE_INVALID;
+		}
+	}
+	if (!attempt->wait_registered) {
+		owned->registering = true;
+		if (cluster_ges_reply_wait_insert(&attempt->key, 0) == NULL) {
+			owned->registering = false;
+			return CLUSTER_GES_REDECLARE_PENDING;
+		}
+		attempt->wait_registered = true;
+		owned->registering = false;
+	}
+	poll = cluster_ges_reply_wait_poll_consume(&attempt->key, &verdict);
+	if (poll == GES_REPLY_WAIT_POLL_DELIVERED) {
+		attempt->wait_registered = false;
+		if (!attempt->sent || verdict.reply_opcode != GES_REPLY_OPCODE_GRANT
+			|| verdict.reject_reason != GES_REJECT_REASON_NONE) {
+			attempt->rejected = true;
+			attempt->reject_reason = verdict.reject_reason;
+			return CLUSTER_GES_REDECLARE_REJECTED;
+		}
+		attempt->confirmed = true;
+	} else if (poll != GES_REPLY_WAIT_POLL_PENDING)
+		return CLUSTER_GES_REDECLARE_PENDING;
+	if (!attempt->confirmed) {
+		now = GetCurrentTimestamp();
+		if (now >= attempt->next_send_at) {
+			bool was_sent = attempt->sent;
+			attempt->next_send_at = TimestampTzPlusMilliseconds(now, attempt->retry_ms);
+			attempt->retry_ms = Min(attempt->retry_ms * 2, 1600);
+			attempt->sent = true;
+			if (!cluster_grd_outbound_enqueue_backend_request((uint32)master, &attempt->request,
+															  sizeof(attempt->request)))
+				attempt->sent = was_sent;
+			else if (cluster_ges_state != NULL)
+				pg_atomic_fetch_add_u64(&cluster_ges_state->reply_defer_count, 1);
+		}
+		return CLUSTER_GES_REDECLARE_PENDING;
+	}
+	return CLUSTER_GES_REDECLARE_CONFIRMED;
+}
+
+/*
+ * cluster_ges_release_poll -- advance an exact holder's nonblocking release.
+ * Inputs: original holder, route cut and persistent-in-owner attempt state.
+ * Returns: confirmed only for the original result and unchanged cut.
+ * Side effects: sends or consumes the original RELEASE; never waits for IO.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+ClusterGesRedeclareResult
+cluster_ges_release_poll(ClusterGesReleaseAttempt *owned, const ClusterResId *resid,
+						 const ClusterGrdHolderId *holder, int32 master, uint64 route_generation,
+						 uint32 group)
+{
+	ClusterGesRedeclareAttempt *attempt;
+	uint64 generation;
+	bool pending, serving;
+
+	if (owned == NULL || resid == NULL || holder == NULL || holder->request_id == 0
+		|| holder->node_id != (uint32)cluster_node_id || master < 0 || route_generation == 0)
+		return CLUSTER_GES_REDECLARE_INVALID;
+	attempt = &owned->exchange;
+	if (holder->cluster_epoch != cluster_epoch_get_current()
+		|| cluster_grd_lookup_master_gen(resid, &generation) != master
+		|| generation != route_generation)
+		return CLUSTER_GES_REDECLARE_CUT_CHANGED;
+	serving = ges_serving_observe(&pending);
+	if (pending)
+		return CLUSTER_GES_REDECLARE_PENDING;
+	if (!ges_readiness_allows_local_release_origin(resid, serving))
+		return CLUSTER_GES_REDECLARE_CUT_CHANGED;
+	if (!attempt->initialized) {
+		if (!ges_attempt_initialize(attempt, resid, NoLock, holder, GES_REQ_OPCODE_RELEASE))
+			return CLUSTER_GES_REDECLARE_PENDING;
+		attempt->request.lock_group_procno_plus_one = group;
+		/* RELEASE's generation is the original sender token, not a second
+		 * query of the remote master's grant. The route cut is checked above. */
+		attempt->master_generation = cluster_lms_get_shard_master_generation();
+		attempt->request.shard_master_generation_lo = (uint32)attempt->master_generation;
+		attempt->request.shard_master_generation_hi = (uint32)(attempt->master_generation >> 32);
+	}
+	if (!ges_attempt_input_matches(attempt, resid, NoLock, holder, GES_REQ_OPCODE_RELEASE)
+		|| attempt->master != master || attempt->request.lock_group_procno_plus_one != group)
+		return CLUSTER_GES_REDECLARE_INVALID;
+	if (attempt->invalid)
+		return CLUSTER_GES_REDECLARE_INVALID;
+	if (attempt->rejected)
+		return CLUSTER_GES_REDECLARE_REJECTED;
+	if (!attempt->confirmed && master == cluster_node_id) {
+		uint32 reason = ges_release_and_drain_local_admitted(resid, holder, serving);
+		if (reason != GES_REJECT_REASON_NONE) {
+			attempt->rejected = true;
+			attempt->reject_reason = reason;
+			return CLUSTER_GES_REDECLARE_REJECTED;
+		}
+		attempt->confirmed = true;
+	}
+	if (!attempt->confirmed && master != cluster_node_id) {
+		ClusterGesRedeclareResult result = ges_release_poll_remote(owned, master);
+		if (result != CLUSTER_GES_REDECLARE_CONFIRMED)
+			return result;
+	}
+	/* A real result must still name the original route/epoch. Local copies
+	 * are removed only after remote confirmation, never as its substitute. */
+	if (holder->cluster_epoch != cluster_epoch_get_current()
+		|| cluster_grd_lookup_master_gen(resid, &generation) != master
+		|| generation != route_generation)
+		return CLUSTER_GES_REDECLARE_CUT_CHANGED;
+	serving = ges_serving_observe(&pending);
+	if (pending)
+		return CLUSTER_GES_REDECLARE_PENDING;
+	if (!ges_readiness_allows_local_release_origin(resid, serving))
+		return CLUSTER_GES_REDECLARE_CUT_CHANGED;
+	if (master != cluster_node_id) {
+		ClusterGrdEntryResult removed = cluster_grd_release_holder_by_id(resid, holder);
+		if (removed != CLUSTER_GRD_ENTRY_OK && removed != CLUSTER_GRD_ENTRY_NOT_FOUND)
+			return CLUSTER_GES_REDECLARE_PENDING;
+	}
+	return CLUSTER_GES_REDECLARE_CONFIRMED;
+}
+
 uint32
 cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 								  const struct ClusterGrdHolderId *holder, uint64 request_id,

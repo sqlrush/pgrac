@@ -41,6 +41,7 @@
 #include "cluster/cluster_ges.h"	  /* GesRequestPayload / RELEASE cleanup payload */
 #include "cluster/cluster_ges_mode.h" /* spec-5.1b D1: ges_modes_compatible (frozen matrix) */
 #include "cluster/cluster_grd.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_pi_rebuild.h"
 #include "cluster/cluster_grd_outbound.h" /* cluster_grd_outbound_enqueue_cleanup_release (D10) */
 #include "cluster/cluster_hw_remaster.h" /* spec-5.7 D3 S5d — HW authority rebuild launch + gate */
@@ -9606,6 +9607,7 @@ cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32
 	ClusterGrdHolderId *departed = NULL;
 	int departed_capacity = 0;
 	int n_departed = 0;
+	ClusterKoAxCleanupV3 ko_sample;
 
 	Assert(entry != NULL);
 
@@ -9613,11 +9615,22 @@ cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32
 		int holders;
 		int waiting;
 
+		cluster_ko_ax_cleanup_sample_v3(&entry->resid, dead_procno, dead_node_id, &ko_sample);
 		SpinLockAcquire(&entry->lock);
 		holders = entry->ngranted;
 		waiting = entry->nwaiters + entry->nconverts;
-		if (holders <= release_capacity && waiting <= departed_capacity)
-			break;
+		if (holders <= release_capacity && waiting <= departed_capacity) {
+			if (cluster_ko_ax_cleanup_claim_v3(&ko_sample))
+				break;
+			/* A concurrent publisher owns this version. The original stale
+			 * process sweep retries; do not spin or remove from a stale sample. */
+			SpinLockRelease(&entry->lock);
+			if (release_payloads != NULL)
+				pfree(release_payloads);
+			if (departed != NULL)
+				pfree(departed);
+			return 0;
+		}
 		SpinLockRelease(&entry->lock);
 		if (holders > release_capacity) {
 			GesRequestPayload *fresh = palloc((Size)holders * sizeof(*fresh));
@@ -9648,6 +9661,17 @@ cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32
 			match = true;
 		if (!match)
 			continue;
+
+		{
+			const ClusterGrdHolder *held = &grd_holders(entry)[i];
+			ClusterGrdHolderId id = { 0 };
+			id.node_id = held->node_id;
+			id.procno = held->procno;
+			id.cluster_epoch = held->cluster_epoch;
+			id.request_id = held->request_id;
+			if (cluster_ko_ax_cleanup_retains_v3(&ko_sample, &id))
+				continue;
+		}
 
 		/* Stash a full GES_RELEASE payload for post-lock enqueue. */
 		{
@@ -9757,6 +9781,7 @@ cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32
 
 	memcpy(&entry_resid, &entry->resid, sizeof(entry_resid));
 
+	cluster_ko_ax_cleanup_finish_v3(&ko_sample);
 	SpinLockRelease(&entry->lock);
 
 	/* Enqueue one full GES_RELEASE per removed real holder.  Route to the

@@ -139,6 +139,33 @@ static bool (*ko_drop_poll_boundary)(uint32 *, bool *);
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+PGPROC *MyProc;
+static ClusterGesRedeclareResult release_poll_result = CLUSTER_GES_REDECLARE_PENDING;
+static int release_poll_calls;
+static bool release_poll_error;
+static uint32 release_group;
+static uint32 fixture_lock_group;
+uint32
+cluster_ges_current_lock_group(const ClusterGrdHolderId *holder)
+{
+	return fixture_lock_group;
+}
+ClusterGesRedeclareResult
+cluster_ges_release_poll(ClusterGesReleaseAttempt *attempt, const ClusterResId *resid,
+						 const ClusterGrdHolderId *holder, int32 master, uint64 generation,
+						 uint32 group)
+{
+	release_poll_calls++;
+	release_group = group;
+	attempt->exchange.initialized = true;
+	attempt->exchange.key.request_id = holder->request_id;
+	if (release_poll_error) {
+		release_poll_error = false;
+		pg_re_throw();
+	}
+	return release_poll_result;
+}
+
 bool IsUnderPostmaster = true;
 AuxProcType MyAuxProcType = SinvalBcastProcess;
 int cluster_node_id = 0;
@@ -178,6 +205,7 @@ static bool barrier_clock_wait, barrier_boot_drift;
 static int barrier_reply_after, barrier_stale_at, barrier_interrupt_at, barrier_identity_at;
 static TimestampTz barrier_registered_deadline;
 static int barrier_interrupt_sqlstate;
+static void (*barrier_before_interrupt)(void);
 static bool multiple_barriers;
 static uint64 allocated_batch, active_batch;
 static int barrier_record_base;
@@ -766,8 +794,11 @@ WaitLatch(Latch *latch, int events, long timeout, uint32 wait_event)
 		if (barrier_waits > 8)
 			abort();
 		holder_probe_clock += (int64)timeout * USECS_PER_MSEC;
-		if (barrier_waits == barrier_interrupt_at)
+		if (barrier_waits == barrier_interrupt_at) {
+			if (barrier_before_interrupt != NULL)
+				barrier_before_interrupt();
 			InterruptPending = true;
+		}
 		if (barrier_waits == barrier_identity_at) {
 			if (barrier_boot_drift)
 				formation.membership.last_admitted_incarnation[1]++;
@@ -779,6 +810,11 @@ WaitLatch(Latch *latch, int events, long timeout, uint32 wait_event)
 	current_epoch++;
 	barrier_complete = true;
 	return WL_LATCH_SET;
+}
+int
+geterrcode(void)
+{
+	return reported_sqlstate;
 }
 void
 pg_re_throw(void)
@@ -1250,6 +1286,11 @@ reset_test(void)
 	v3_send_result = CLUSTER_IC_SEND_DONE;
 	v3_refuse_batch = 0;
 	v3_send_throw = false;
+	release_poll_calls = 0;
+	release_poll_error = false;
+	release_poll_result = CLUSTER_GES_REDECLARE_PENDING;
+	fixture_lock_group = 0;
+	barrier_before_interrupt = NULL;
 	v3_ack_send_hook = lmon_wakeup_hook = NULL;
 	v3_route_master_node = -1;
 	v3_route_generation = 0;
@@ -8569,6 +8610,7 @@ UT_TEST(test_v3_native_presend_failure_releases_reserved_carrier)
 		RelationData relation;
 		Oid old_database = MyDatabaseId;
 		volatile bool caught = false;
+		unsigned retained = 0;
 
 		v3_native_structure_setup(&relation);
 		MyDatabaseId = relation.rd_locator.dbOid;
@@ -8599,8 +8641,18 @@ UT_TEST(test_v3_native_presend_failure_releases_reserved_carrier)
 		UT_ASSERT(!barrier_active);
 		UT_ASSERT(ko_completions == NULL);
 		UT_ASSERT_EQ(completion_allocations, 0);
-		for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
-			UT_ASSERT(!storage.contexts[i].used);
+		/* The unused allocation is freed, but a registered operation now
+		 * remains with its original owner until native S6 really finishes. */
+		for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+			ClusterKoSharedContext *entry = &storage.contexts[i];
+			if (!entry->used)
+				continue;
+			retained++;
+			UT_ASSERT(entry->v3 && entry->origin_detached && !entry->ax_release_requested);
+			UT_ASSERT_EQ(entry->request_sent_peers | entry->request_uncertain_peers, 0);
+			UT_ASSERT_EQ(entry->request_v3.base.batch_id, marker_batch);
+		}
+		UT_ASSERT_EQ(retained, fault);
 	}
 }
 
@@ -8839,10 +8891,11 @@ UT_TEST(test_v3_origin_refuses_missing_marker_capability_before_publication)
 	UT_ASSERT_EQ(ko_state->send_v3_count, 0);
 	UT_ASSERT(!barrier_active);
 }
-UT_TEST(test_v3_origin_marker_error_releases_only_unsent_context)
+UT_TEST(test_v3_origin_marker_error_retains_unsent_native_release)
 {
 	KoAxBinding binding = origin_marker_setup();
 	volatile bool caught = false;
+	unsigned retained = 0;
 	marker_error = true;
 	PG_TRY();
 	{
@@ -8858,8 +8911,16 @@ UT_TEST(test_v3_origin_marker_error_releases_only_unsent_context)
 	UT_ASSERT_EQ(marker_registrations, 1);
 	UT_ASSERT_EQ(barrier_requests, 0);
 	UT_ASSERT_EQ(ko_state->send_v3_count, 0);
-	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
-		UT_ASSERT(!ko_state->contexts[i].used);
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		ClusterKoSharedContext *entry = &ko_state->contexts[i];
+		if (!entry->used)
+			continue;
+		retained++;
+		UT_ASSERT(entry->v3 && entry->origin_detached && !entry->ax_release_requested);
+		UT_ASSERT_EQ(entry->request_v3.base.batch_id, marker_batch);
+		UT_ASSERT_EQ(entry->request_sent_peers | entry->request_uncertain_peers, 0);
+	}
+	UT_ASSERT_EQ(retained, 1);
 	UT_ASSERT(!barrier_active);
 }
 
@@ -9223,7 +9284,7 @@ UT_TEST(test_v3_sender_bounds_retry_without_hiding_other_work)
 	UT_ASSERT_EQ(send_calls, 3);
 	UT_ASSERT_EQ(ko_state->send_v3_count, 0);
 }
-UT_TEST(test_v3_ack_needs_actual_transport_admission_without_hard_error)
+UT_TEST(test_v3_ack_requires_claim_and_resolves_exact_uncertain_send)
 {
 	for (int n = 0; n < 3; n++) {
 		ClusterKoSharedMessageV3 ack = origin_retained_send_setup();
@@ -9240,7 +9301,11 @@ UT_TEST(test_v3_ack_needs_actual_transport_admission_without_hard_error)
 		env.source_node_id = 1;
 		env.payload_length = sizeof(wire);
 		cluster_ko_flush_ack_handler(&env, wire);
-		UT_ASSERT_EQ(record_count, n == 2 ? 1 : 0);
+		/* An exact authenticated reply resolves an armed UNKNOWN send;
+		 * a never-claimed operation still cannot consume an unsolicited ACK. */
+		UT_ASSERT_EQ(record_count, n != 0 ? 1 : 0);
+		UT_ASSERT_EQ(ko_state->contexts[0].request_uncertain_peers, 0);
+		UT_ASSERT_EQ(ko_state->contexts[0].request_done_peers, n != 0 ? 2 : 0);
 	}
 }
 
@@ -9474,7 +9539,7 @@ main(void)
 	UT_RUN(test_v3_native_structure_claim_refuses_drift_before_consumption);
 	UT_RUN(test_v3_observation_requires_original_operation_token_and_live_ax);
 	UT_RUN(test_v3_origin_refuses_missing_marker_capability_before_publication);
-	UT_RUN(test_v3_origin_marker_error_releases_only_unsent_context);
+	UT_RUN(test_v3_origin_marker_error_retains_unsent_native_release);
 	UT_RUN(test_v3_sender_retries_only_caller_owned_frame);
 	UT_RUN(test_v3_failed_reply_reaches_original_wait_without_done);
 	UT_RUN(test_v3_peer_io_error_retains_exact_work_and_publishes_only_failure);
@@ -9490,7 +9555,7 @@ main(void)
 	UT_RUN(test_v3_native_identity_refusal_does_not_report_ack_timeout);
 	UT_RUN(test_v3_sender_does_not_resend_after_acceptance_or_ambiguous_error);
 	UT_RUN(test_v3_sender_bounds_retry_without_hiding_other_work);
-	UT_RUN(test_v3_ack_needs_actual_transport_admission_without_hard_error);
+	UT_RUN(test_v3_ack_requires_claim_and_resolves_exact_uncertain_send);
 	UT_RUN(test_v3_sender_error_cannot_restart_uncertain_send);
 	UT_RUN(test_raw_copy_scope_resumes_only_space_and_blocks_ready);
 	UT_RUN(test_raw_copy_scope_keeps_exact_owner_cut_and_error_responsibility);

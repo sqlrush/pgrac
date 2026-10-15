@@ -65,6 +65,7 @@ BackendType MyBackendType = B_LMON;
 #include "cluster/cluster_ges_mode.h"	 /* spec-5.1b — frozen matrix + convert classification */
 #include "access/transam.h"				 /* spec-5.8 D1c — InvalidTransactionId */
 #include "cluster/cluster_grd.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_hw.h"				 /* spec-4.6a HW remaster watchdog stubs */
 #include "cluster/cluster_lmd.h"			 /* spec-5.8 D1b — WFG vertex + submit/cancel edge */
@@ -2150,3 +2151,26 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 
 	return ut_failed_count == 0 ? 0 : 1;
 }
+
+/* This legacy fairness fixture has no KO runtime. Model only ko_state == NULL;
+ * retained-operation cleanup is covered by the real GRD/KO cancellation tests. */
+void
+cluster_ko_ax_cleanup_sample_v3(const ClusterResId *resid, int dead_procno, int32 dead_node,
+								ClusterKoAxCleanupV3 *sample)
+{
+	memset(sample, 0, sizeof(*sample));
+}
+bool
+cluster_ko_ax_cleanup_claim_v3(const ClusterKoAxCleanupV3 *sample)
+{
+	return sample->revision == 0 && sample->count == 0;
+}
+bool
+cluster_ko_ax_cleanup_retains_v3(const ClusterKoAxCleanupV3 *sample,
+								 const ClusterGrdHolderId *holder)
+{
+	return false;
+}
+void
+cluster_ko_ax_cleanup_finish_v3(const ClusterKoAxCleanupV3 *sample)
+{}

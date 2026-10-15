@@ -53,6 +53,7 @@
 #include "cluster/cluster_gcs.h"	   /* spec-4.7 D2 (L238) — cluster_gcs_lookup_master proto */
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D2 (L238) — block re-declare scan/send protos */
 #include "cluster/cluster_ges.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_ges_handoff.h" /* spec-6.12e1 — verifier stub types */
 #include "cluster/cluster_ges_mode.h"	 /* spec-5.1b — frozen matrix + convert classification */
 #include "access/transam.h"				 /* spec-5.8 D1c — InvalidTransactionId */
@@ -8183,4 +8184,35 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_serving_seal_cannot_replace_a_refusal_with_ready);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
+}
+
+/* KO publication/ownership boundary; actual KO state is tested separately. */
+static bool ko_cleanup_retained, ko_cleanup_drift;
+static int ko_cleanup_finished;
+static ClusterGrdHolderId ko_cleanup_holder;
+void
+cluster_ko_ax_cleanup_sample_v3(const ClusterResId *resid, int dead_procno, int32 dead_node,
+								ClusterKoAxCleanupV3 *sample)
+{
+	memset(sample, 0, sizeof(*sample));
+	if (ko_cleanup_retained) {
+		sample->count = 1;
+		sample->holders[0] = ko_cleanup_holder;
+	}
+}
+bool
+cluster_ko_ax_cleanup_claim_v3(const ClusterKoAxCleanupV3 *sample)
+{
+	return !ko_cleanup_drift;
+}
+bool
+cluster_ko_ax_cleanup_retains_v3(const ClusterKoAxCleanupV3 *sample,
+								 const ClusterGrdHolderId *holder)
+{
+	return sample->count == 1 && memcmp(&sample->holders[0], holder, sizeof(*holder)) == 0;
+}
+void
+cluster_ko_ax_cleanup_finish_v3(const ClusterKoAxCleanupV3 *sample)
+{
+	ko_cleanup_finished++;
 }

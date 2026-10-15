@@ -11,6 +11,10 @@
  *
  *-------------------------------------------------------------------------
  */
+/* PGRAC MODIFICATIONS
+ * Modified by: SqlRush <sqlrush@gmail.com>
+ * Backend-local global-holder fields preserve registration and cleanup identity.
+ */
 #ifndef LOCK_H_
 #define LOCK_H_
 
@@ -458,6 +462,7 @@ typedef struct LOCALLOCK
 	 * LOCALLOCK. These fields are backend-local only; they are not a
 	 * substitute for a fresh grant and never enter a wire or WAL record. */
 	bool		cluster_ax_binding_valid;
+	bool cluster_ko_retained_ax; /* stronger cleanup hold transferred from an upgrade */
 	int32		cluster_ax_master_node;
 	uint64		cluster_ax_master_generation;
 	/*
