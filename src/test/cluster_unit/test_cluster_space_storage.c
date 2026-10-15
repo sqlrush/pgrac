@@ -509,6 +509,12 @@ smgrnblocks(SMgrRelation rel, ForkNumber forknum)
 {
 	if (rel != &storage)
 		abort();
+	if (post_drop_io && forknum == MAIN_FORKNUM) {
+		if (rel->smgr_cached_nblocks[forknum] != InvalidBlockNumber)
+			return rel->smgr_cached_nblocks[forknum];
+		rel->smgr_cached_nblocks[forknum] = main_blocks;
+		return main_blocks;
+	}
 	if ((recovering || truncate_owner) && forknum == MAIN_FORKNUM)
 		return main_blocks;
 	if ((recovering || truncate_owner) && auxiliary_forks && forknum == FSM_FORKNUM)
@@ -998,6 +1004,15 @@ smgrdounlinkall(SMgrRelation *rels, int count, bool redo)
 	}
 	unlink_calls++;
 }
+void
+smgrrelease(SMgrRelation rel)
+{
+	if (rel != &storage)
+		abort();
+	for (ForkNumber fork = MAIN_FORKNUM; fork <= MAX_FORKNUM; fork++)
+		rel->smgr_cached_nblocks[fork] = InvalidBlockNumber;
+}
+
 void
 smgrclose(SMgrRelation rel)
 {
@@ -3058,6 +3073,219 @@ native_commit_redo_drop(XLogReaderState *record, xl_xact_parsed_commit *parsed, 
 #include "test_cluster_space_commit_drop.inc"
 }
 
+/* Original private final callback, with the sealed plan getters supplied
+ * by this fixture. The sequencer's successful-step/drained-source boundary
+ * is covered separately in test_cluster_cold_recovery_replay. */
+typedef struct ClusterColdTypedReplay {
+	ClusterColdTypedV1 *typed;
+} ClusterColdTypedReplay;
+
+static ClusterColdSpaceInputV1 final_input;
+static unsigned final_installs;
+static bool final_plan_valid;
+
+bool
+cluster_cold_plan_space_relation_v1(const ClusterColdPlanV1 *plan, uint32 index,
+									RelFileLocator *out, uint32 *count)
+{
+	if (plan != (ClusterColdPlanV1 *)42 || !final_plan_valid || index != 0)
+		return false;
+	*out = locator;
+	*count = 1;
+	return true;
+}
+
+bool
+cluster_cold_plan_space_input_v1(const ClusterColdPlanV1 *plan, uint32 relation, uint32 input,
+								 ClusterColdSpaceInputV1 *out)
+{
+	if (plan != (ClusterColdPlanV1 *)42 || !final_plan_valid || relation != 0 || input != 0)
+		return false;
+	*out = final_input;
+	return true;
+}
+
+static void
+cluster_typed_replay_space_install(ClusterColdTypedReplay *rep, uint32 relation, uint32 through,
+								   bool step)
+{
+	UT_ASSERT(rep->typed->plan == (ClusterColdPlanV1 *)42 && relation == 0 && through == 0);
+	UT_ASSERT(!step);
+	final_installs++;
+	/* The actual cold installer requires the SPACE pages for TOMBSTONE.
+	 * Native deletion has already removed them in this invocation. */
+	if (post_drop_io && !(post_drop_forks & (1U << SPACE_FORKNUM)))
+		elog(ERROR, "fixture: cannot reinstall deleted SPACE");
+}
+
+#include "test_cluster_space_cold_final.inc"
+
+static void
+final_drop_fixture(ClusterColdTypedV1 *typed, XLogReaderState *reader)
+{
+	xl_xact_parsed_commit parsed;
+
+	memset(typed, 0, sizeof(*typed));
+	typed->plan = (ClusterColdPlanV1 *)42;
+	typed->participant_count = 1;
+	typed->participants[0].thread_id = 1;
+	typed->participants[0].native_redo = reader->ReadRecPtr;
+	typed->participants[0].tail_end = reader->EndRecPtr;
+	typed->observer.system_identifier = ref.claim.identity.system_identifier;
+	typed->observer.database_incarnation = ref.claim.database_incarnation;
+	memcpy(typed->observer.storage_uuid, ref.claim.identity.storage_uuid, 16);
+	memset(&final_input, 0, sizeof(final_input));
+	UT_ASSERT(ParseCommitRecord(wal_info, (xl_xact_commit *)commit_bytes, commit_len, &parsed));
+	final_input.kind = CLUSTER_COLD_SPACE_DROP;
+	final_input.read_rec_ptr = reader->ReadRecPtr;
+	final_input.end_rec_ptr = reader->EndRecPtr;
+	final_input.payload = parsed.space_drops;
+	final_input.payload_length = CLUSTER_SPACE_STRUCTURE_WAL_BYTES;
+	final_plan_valid = true;
+	final_installs = 0;
+	cold_commit_window = cold_drop_proven = drop_verify_fixture = true;
+	native_commit_redo_prefix(reader, &parsed, 501);
+	post_drop_forks = 1U << MAIN_FORKNUM;
+	main_blocks = 0;
+	native_commit_redo_drop(reader, &parsed, 501);
+}
+
+UT_TEST(test_cold_final_drop_checks_deleted_result_without_reinstall)
+{
+	XLogReaderState reader;
+	DecodedXLogRecord decoded;
+	Relation rel = drop_replay_record(&reader, &decoded);
+	ClusterColdTypedV1 typed;
+	ClusterColdTypedReplay rep = { &typed };
+	volatile bool caught = false, ok = false;
+	unsigned reads;
+
+	final_drop_fixture(&typed, &reader);
+	reads = post_drop_reads;
+	expecting_error = true;
+	PG_TRY();
+	{
+		ok = cluster_typed_replay_space_final(&rep, 0);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	expecting_error = false;
+	UT_ASSERT(!caught && ok);
+	UT_ASSERT_EQ(final_installs, 0);
+	UT_ASSERT(post_drop_reads > reads);
+	UT_ASSERT_EQ(post_drop_calls, 1);
+	FreeFakeRelcacheEntry(rel);
+}
+
+UT_TEST(test_cold_final_drop_rejects_incomplete_or_unbound_result)
+{
+	for (unsigned fault = 0; fault < 20; fault++) {
+		XLogReaderState reader;
+		DecodedXLogRecord decoded;
+		Relation rel = drop_replay_record(&reader, &decoded);
+		ClusterColdTypedV1 typed;
+		ClusterColdTypedReplay rep = { &typed };
+		volatile bool caught = false, ok = false;
+
+		final_drop_fixture(&typed, &reader);
+		switch (fault) {
+		case 0:
+			post_drop_forks = 0;
+			break;
+		case 1:
+			main_blocks = 1;
+			break;
+		case 2:
+		case 3:
+		case 4:
+		case 5:
+			post_drop_forks |= 1U << (fault - 1);
+			break;
+		case 6:
+			post_drop_throw = true;
+			break;
+		case 7:
+			have_ref = false;
+			break;
+		case 8:
+			typed.observer.database_incarnation++;
+			break;
+		case 9:
+			typed.observer.system_identifier++;
+			break;
+		case 10:
+			typed.observer.storage_uuid[0] ^= 1;
+			break;
+		case 11:
+			typed.participants[0].thread_id = 2;
+			break;
+		case 12:
+			final_input.participant = 1;
+			break;
+		case 13:
+			final_input.payload_length--;
+			break;
+		case 14:
+			final_input.read_rec_ptr--;
+			break;
+		case 15:
+			final_input.end_rec_ptr++;
+			break;
+		case 16:
+			cold_commit_window = false;
+			break;
+		case 17:
+			cluster_recmerge_apply_foreign = true;
+			break;
+		case 18:
+			recovering = false;
+			break;
+		case 19:
+			final_plan_valid = false;
+			break;
+		}
+		expecting_error = true;
+		PG_TRY();
+		{
+			ok = cluster_typed_replay_space_final(&rep, 0);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		expecting_error = false;
+		UT_ASSERT(caught || !ok);
+		UT_ASSERT_EQ(post_drop_calls, 1);
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
+UT_TEST(test_cold_final_non_drop_keeps_original_install)
+{
+	for (uint8 kind = CLUSTER_COLD_SPACE_CREATE; kind <= CLUSTER_COLD_SPACE_ADVANCE; kind++) {
+		XLogReaderState reader;
+		DecodedXLogRecord decoded;
+		Relation rel = drop_replay_record(&reader, &decoded);
+		ClusterColdTypedV1 typed;
+		ClusterColdTypedReplay rep = { &typed };
+
+		if (kind == CLUSTER_COLD_SPACE_DROP) {
+			FreeFakeRelcacheEntry(rel);
+			continue;
+		}
+		final_drop_fixture(&typed, &reader);
+		final_input.kind = kind;
+		post_drop_io = false;
+		UT_ASSERT(cluster_typed_replay_space_final(&rep, 0));
+		UT_ASSERT_EQ(final_installs, 1);
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
 UT_TEST(test_cold_native_drop_requires_empty_main_and_no_auxiliary_forks)
 {
 	/* -2 = missing MAIN, -1 = nonempty MAIN; other values retain that fork. */
@@ -3532,7 +3760,10 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(69);
+	UT_PLAN(72);
+	UT_RUN(test_cold_final_drop_checks_deleted_result_without_reinstall);
+	UT_RUN(test_cold_final_drop_rejects_incomplete_or_unbound_result);
+	UT_RUN(test_cold_final_non_drop_keeps_original_install);
 	UT_RUN(test_cold_native_drop_requires_empty_main_and_no_auxiliary_forks);
 	UT_RUN(test_cold_native_drop_preserves_post_unlink_io_and_namespace_refusal);
 	UT_RUN(test_native_drop_outside_cold_owner_keeps_original_consumer);

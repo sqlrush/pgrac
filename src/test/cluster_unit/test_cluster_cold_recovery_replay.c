@@ -179,7 +179,7 @@ identity(const FixRecord *r)
 	id.read_rec_ptr = r->read;
 	id.end_rec_ptr = r->end;
 	id.record_crc = (uint32)(r->read ^ r->end);
-	id.rmid = RM_HEAP_ID;
+	id.rmid = r->space && r->op.kind == CLUSTER_COLD_SPACE_DROP ? RM_XACT_ID : RM_HEAP_ID;
 	return id;
 }
 
@@ -611,6 +611,43 @@ UT_TEST(test_replay_space_steps_and_final_installs)
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
+/* A terminal DROP is never finalized merely because its input is present
+ * in the plan: its actual callback and the complete source drains must
+ * have succeeded in this invocation. This runs the original sequencer. */
+UT_TEST(test_replay_drop_final_requires_execution_and_all_source_drains)
+{
+	ClusterColdPlanV1 *plan;
+	ClusterColdReplayResultV1 result;
+	Harness h;
+
+	space_fixture();
+	fix[0][1] = spaced(0x1100, 0x1200, CLUSTER_COLD_SPACE_DROP, 100);
+	memset(fix[0][1].op.before_incarnation, INC, 16);
+	memset(fix[0][1].op.result_incarnation, 0, 16);
+	plan = seal();
+	for (unsigned fault = 0; fault < 4; fault++) {
+		harness_init(&h);
+		if (fault == 0)
+			h.refuse_scheduled = true;
+		else if (fault == 1)
+			h.stream[0].record[1].record_crc ^= 1;
+		else if (fault == 2)
+			h.stream[0].count--;
+		else
+			h.stream[1].count--;
+		UT_ASSERT(run(plan, &h, &result) != CLUSTER_COLD_REPLAY_OK);
+		UT_ASSERT_EQ(result.space_relations_finished, 0);
+		for (int i = 0; i < h.events; i++)
+			UT_ASSERT(h.trace[i].kind != T_SPACE_FINAL);
+	}
+	harness_init(&h);
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_OK);
+	UT_ASSERT_EQ(result.space_relations_finished, 2);
+	UT_ASSERT_EQ(result.steps_done, 2);
+	UT_ASSERT_EQ(h.trace[h.events - 1].kind, T_SPACE_FINAL);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
 UT_TEST(test_replay_argument_checks)
 {
 	ClusterColdPlanV1 *plan;
@@ -714,6 +751,7 @@ UT_TEST(test_unscheduled_record_handling)
 int
 main(void)
 {
+	UT_PLAN(11);
 	UT_RUN(test_replay_follows_schedule_and_drains);
 	UT_RUN(test_replay_page_actions);
 	UT_RUN(test_replay_scheduled_record_must_match);
@@ -721,6 +759,7 @@ main(void)
 	UT_RUN(test_replay_history_only_generation);
 	UT_RUN(test_replay_callback_refusal_stops);
 	UT_RUN(test_replay_space_steps_and_final_installs);
+	UT_RUN(test_replay_drop_final_requires_execution_and_all_source_drains);
 	UT_RUN(test_unscheduled_record_handling);
 	UT_RUN(test_replay_argument_checks);
 	UT_RUN(test_skipped_own_record_advances_next_xid);

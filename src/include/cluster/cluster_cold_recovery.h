@@ -426,8 +426,10 @@ typedef struct ClusterColdReplayOpsV1 {
 	/* Consume the scheduled record just returned with its page action. */
 	bool (*scheduled)(void *arg, uint32 participant, const ClusterColdStepV1 *step,
 					  ClusterColdPageActionV1 action);
-	/* Install all inputs of one SPACE relation, after every participant was
-	 * drained; required when the plan has SPACE relations. */
+	/* Finalize one SPACE relation only after every scheduled callback and
+	 * every source drain succeeded in this invocation. Install remaining
+	 * inputs, or verify the physical result of an already executed DROP;
+	 * required when the plan has SPACE relations. */
 	bool (*space_final)(void *arg, uint32 relation);
 } ClusterColdReplayOpsV1;
 

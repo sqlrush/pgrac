@@ -1335,6 +1335,48 @@ refused:
 	return false;
 }
 
+/* A postcondition only. The caller already executed the qualified native
+ * deletion; this must never be used as permission to replay absent SPACE. */
+static bool
+space_drop_physical_result(const ClusterSpaceIdentityKey *key, uint16 origin_thread)
+{
+	ClusterSpaceIdentityKey expected, after;
+	uint16 thread, after_thread;
+	SMgrRelation smgr;
+
+	if (!space_namespace(key->locator, true, &expected, &thread) || thread == 0
+		|| thread != origin_thread || !space_identity_key_matches(key, &expected))
+		return false;
+	smgr = smgropen(expected.locator, InvalidBackendId);
+	/* The final check can revisit the handle used just after deletion.
+	 * Discard recovery's cached nblocks and old fork handles before reading. */
+	smgrrelease(smgr);
+	if (!smgrexists(smgr, MAIN_FORKNUM) || smgrnblocks(smgr, MAIN_FORKNUM) != 0)
+		return false;
+	for (ForkNumber fork = MAIN_FORKNUM + 1; fork <= MAX_FORKNUM; fork++)
+		if (smgrexists(smgr, fork))
+			return false;
+	return space_namespace(key->locator, true, &after, &after_thread) && after_thread == thread
+		   && space_identity_key_matches(&expected, &after);
+}
+
+bool
+cluster_space_cold_drop_postcondition_v1(const ClusterSpaceIdentityKey *key,
+										 const ClusterSpaceRecoveryInput *input,
+										 const ClusterSpaceColdSourceV1 *source)
+{
+	ClusterSpaceStructureChange change;
+
+	if (!cluster_shared_config || !cluster_cold_replay_window_active_v1()
+		|| cluster_recmerge_apply_foreign || !RecoveryInProgress() || key == NULL || input == NULL
+		|| source == NULL || source->origin_thread == 0 || XLogRecPtrIsInvalid(source->end_rec_ptr)
+		|| !cluster_space_structure_wal_decode(input->data, input->length, &change)
+		|| change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE
+		|| !space_identity_key_matches(key, &change.identity.result.key))
+		return false;
+	return space_drop_physical_result(key, source->origin_thread);
+}
+
 bool
 cluster_space_drop_replay_verify_v1(XLogReaderState *record, TransactionId xid)
 {
@@ -1355,9 +1397,8 @@ cluster_space_drop_replay_verify_v1(XLogReaderState *record, TransactionId xid)
 		|| parsed.nrels <= 0)
 		return false;
 	for (int i = 0; i < parsed.nrels; i++) {
-		ClusterSpaceIdentityKey expected, after;
-		uint16 thread, after_thread;
-		SMgrRelation smgr;
+		ClusterSpaceIdentityKey expected;
+		uint16 thread;
 
 		if (cluster_smgr_which_for(parsed.xlocators[i], InvalidBackendId) != 1)
 			continue;
@@ -1365,17 +1406,10 @@ cluster_space_drop_replay_verify_v1(XLogReaderState *record, TransactionId xid)
 			|| thread != record->cluster_expected_thread_id
 			|| expected.system_identifier != record->system_identifier)
 			return false;
-		smgr = smgropen(expected.locator, InvalidBackendId);
 		/* Shared redo keeps MAIN as an empty relfilenumber placeholder.
 		 * Auxiliary unlink can report WARNING, so returning from the native
 		 * delete is not sufficient to establish this physical postcondition. */
-		if (!smgrexists(smgr, MAIN_FORKNUM) || smgrnblocks(smgr, MAIN_FORKNUM) != 0)
-			return false;
-		for (ForkNumber fork = MAIN_FORKNUM + 1; fork <= MAX_FORKNUM; fork++)
-			if (smgrexists(smgr, fork))
-				return false;
-		if (!space_namespace(parsed.xlocators[i], true, &after, &after_thread)
-			|| after_thread != thread || !space_identity_key_matches(&expected, &after))
+		if (!space_drop_physical_result(&expected, thread))
 			return false;
 	}
 	/* No sync, completion publication or replay-from-absence permission.

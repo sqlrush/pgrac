@@ -200,6 +200,7 @@
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_space_identity.h"
 #include "cluster/cluster_space_reservation.h"
+#include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_recovery_worker.h"
@@ -3407,17 +3408,47 @@ cluster_typed_replay_space_step(ClusterColdTypedReplay *rep, uint32 participant,
 		AdvanceNextFullTransactionIdPastXid(r->record->header.xl_xid);
 }
 
-/* Every SPACE relation's remaining inputs, after all streams are drained. */
+/* Every scheduled record already succeeded and all sources were drained
+ * by the original sequencer. A final DROP's native COMMIT has therefore
+ * deleted SPACE in this invocation: recheck its result, never reinstall
+ * the deleted fork. This does not authorize replay from absent SPACE. */
 static bool
 cluster_typed_replay_space_final(void *arg, uint32 relation)
 {
 	ClusterColdTypedReplay *rep = (ClusterColdTypedReplay *) arg;
 	RelFileLocator locator;
 	uint32		count = 0;
+	ClusterColdSpaceInputV1 last;
 
 	if (!cluster_cold_plan_space_relation_v1(rep->typed->plan, relation, &locator, &count) ||
-		count == 0)
+		count == 0 ||
+		!cluster_cold_plan_space_input_v1(rep->typed->plan, relation, count - 1, &last))
 		return false;
+	if (last.kind == CLUSTER_COLD_SPACE_DROP)
+	{
+		ClusterSpaceIdentityKey key = {0};
+		ClusterSpaceRecoveryInput input = {last.payload, last.payload_length};
+		ClusterSpaceColdSourceV1 source;
+		const ClusterColdParticipantV1 *participant;
+
+		/* Foreign/native DROP remains unsupported. The last input must be
+		 * part of the own stream actually replayed by this invocation. */
+		if (last.participant != rep->typed->own_participant ||
+			last.participant >= rep->typed->participant_count)
+			return false;
+		participant = &rep->typed->participants[last.participant];
+		if (XLogRecPtrIsInvalid(last.read_rec_ptr) ||
+			last.read_rec_ptr < participant->native_redo ||
+			last.end_rec_ptr <= last.read_rec_ptr || last.end_rec_ptr > participant->tail_end)
+			return false;
+		key.system_identifier = rep->typed->observer.system_identifier;
+		key.database_incarnation = rep->typed->observer.database_incarnation;
+		memcpy(key.storage_uuid, rep->typed->observer.storage_uuid, sizeof(key.storage_uuid));
+		key.locator = locator;
+		source.origin_thread = participant->thread_id;
+		source.end_rec_ptr = last.end_rec_ptr;
+		return cluster_space_cold_drop_postcondition_v1(&key, &input, &source);
+	}
 	cluster_typed_replay_space_install(rep, relation, count - 1, false);
 	return true;
 }

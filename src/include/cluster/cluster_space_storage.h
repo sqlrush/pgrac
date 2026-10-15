@@ -197,4 +197,11 @@ extern bool cluster_space_drop_replay_commit(XLogReaderState *record, Transactio
  * Neither replay authority nor a durable completion / missing-SPACE proof. */
 extern bool cluster_space_drop_replay_verify_v1(XLogReaderState *record, TransactionId xid);
 
+/* Same physical postcondition at the original sequencer's final callback,
+ * after all scheduled records executed and every source was fully drained.
+ * The sealed final TOMBSTONE binds the target, not execution authority. */
+extern bool cluster_space_cold_drop_postcondition_v1(const ClusterSpaceIdentityKey *key,
+													 const ClusterSpaceRecoveryInput *input,
+													 const ClusterSpaceColdSourceV1 *source);
+
 #endif /* CLUSTER_SPACE_STORAGE_H */
