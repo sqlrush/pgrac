@@ -201,6 +201,7 @@ typedef struct ClusterKoExtendWorkV3 {
 	bool used;
 	bool failed;
 	bool raw_copy;
+	bool buffer_copy;
 	int32 pid;
 	uint64 serial;
 	uint64 epoch;
@@ -261,6 +262,14 @@ static ClusterKoExtendWorkV3 ko_create_local;
 static uint32 ko_create_slot;
 static bool ko_create_write_armed, ko_create_aborting;
 static ResourceOwner ko_create_owner;
+/* Private cursor of the original serial copy loop, not a work queue. */
+static struct {
+	uint64 serial;
+	ForkNumber fork;
+	BlockNumber nblocks;
+	BlockNumber next;
+	BlockNumber target;
+} ko_buffer_copy;
 static bool ko_exit_registered;
 static dsa_area *ko_native_area;
 
@@ -443,6 +452,7 @@ cluster_ko_shmem_init(void)
 		memset(&ko_create_local, 0, sizeof(ko_create_local));
 		ko_create_write_armed = ko_create_aborting = false;
 		ko_create_owner = NULL;
+		memset(&ko_buffer_copy, 0, sizeof(ko_buffer_copy));
 	}
 }
 
@@ -1222,6 +1232,14 @@ ko_copy_local_exact(RelFileLocator locator)
 }
 
 static bool
+ko_buffer_copy_target_exact(RelFileLocator locator, ForkNumber fork, BlockNumber block)
+{
+	return ko_copy_local_exact(locator) && ko_create_local.buffer_copy
+		   && ko_buffer_copy.serial == ko_create_local.serial && ko_buffer_copy.fork == fork
+		   && block < ko_buffer_copy.nblocks && ko_buffer_copy.target == block;
+}
+
+static bool
 ko_extend_fences_allow_locked(const ClusterKoExtendWorkV3 *work)
 {
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
@@ -1250,9 +1268,9 @@ ko_extend_pending_locked(RelFileLocator locator)
 	return false;
 }
 
-/* The scope identifies only the two SPACE targets needed by its original
- * extension or raw writer. A read sample cannot publish a page or grant current;
- * the separate current admission consumer retains the original PCM proof. */
+/* The scope identifies the two SPACE targets of its original writer, or the
+ * one selected destination of a buffered copy. A read sample cannot publish a
+ * page or grant current; the current consumer retains the original PCM proof. */
 static bool
 ko_storage_read_begin(RelFileLocator locator, ForkNumber fork, BlockNumber block,
 					  ClusterKoPeerAdmissionV3 *out)
@@ -1262,13 +1280,13 @@ ko_storage_read_begin(RelFileLocator locator, ForkNumber fork, BlockNumber block
 	ClusterWalSourceRef writer;
 	bool allowed = false;
 	uint64 revision;
+	bool space = fork == SPACE_FORKNUM && block <= 1;
 
-	if (fork != SPACE_FORKNUM || block > 1)
-		return false;
-	if (ko_extend_local_exact(locator, MAIN_FORKNUM)) {
+	if (space && ko_extend_local_exact(locator, MAIN_FORKNUM)) {
 		work = &ko_extend_local;
 		slot = ko_extend_slot;
-	} else if (ko_copy_local_exact(locator)) {
+	} else if (ko_copy_local_exact(locator)
+			   && (space || ko_buffer_copy_target_exact(locator, fork, block))) {
 		if (!cluster_enabled || !cluster_shared_config || RecoveryInProgress()
 			|| cluster_interconnect_tier != CLUSTER_IC_TIER_1)
 			return false;
@@ -1342,11 +1360,13 @@ cluster_ko_peer_read_current_v3(const ClusterKoPeerAdmissionV3 *admission, RelFi
 	if (admission != NULL && admission->extension_serial != 0)
 		return ko_state != NULL && admission->cleaner.serial == 0
 			   && ((admission->extension_serial == ko_extend_local.serial
-					&& ko_extend_local_exact(locator, MAIN_FORKNUM))
+					&& ko_extend_local_exact(locator, MAIN_FORKNUM) && fork == SPACE_FORKNUM
+					&& block <= 1)
 				   || (admission->extension_serial == ko_create_local.serial
-					   && ko_copy_local_exact(locator)))
-			   && fork == SPACE_FORKNUM
-			   && block <= 1 && admission->fork == fork && admission->block == block
+					   && ko_copy_local_exact(locator)
+					   && ((fork == SPACE_FORKNUM && block <= 1)
+						   || ko_buffer_copy_target_exact(locator, fork, block))))
+			   && admission->fork == fork && admission->block == block
 			   && RelFileLocatorEquals(admission->locator, locator) && admission->revision != 0
 			   && admission->revision != UINT64_MAX
 			   && pg_atomic_read_u64(&ko_state->peer_admission_revision) == admission->revision;
@@ -1411,7 +1431,7 @@ ko_storage_register_callbacks(void)
 }
 
 static bool
-ko_create_begin(RelFileLocator locator, bool raw_copy, uint64 *serial)
+ko_create_begin(RelFileLocator locator, bool raw_copy, bool buffer_copy, uint64 *serial)
 {
 	ClusterKoExtendWorkV3 work = { 0 };
 	int empty = -1;
@@ -1437,6 +1457,7 @@ ko_create_begin(RelFileLocator locator, bool raw_copy, uint64 *serial)
 	work.locator = locator;
 	work.fork = InvalidForkNumber;
 	work.raw_copy = raw_copy;
+	work.buffer_copy = buffer_copy;
 	SpinLockAcquire(&ko_state->shared_lock);
 	revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
 	if (revision == 0 || revision == UINT64_MAX || ko_state->extend_serial == UINT64_MAX)
@@ -1463,6 +1484,7 @@ ko_create_begin(RelFileLocator locator, bool raw_copy, uint64 *serial)
 		ko_create_slot = empty;
 		ko_create_write_armed = ko_create_aborting = false;
 		ko_create_owner = CurrentResourceOwner;
+		memset(&ko_buffer_copy, 0, sizeof(ko_buffer_copy));
 		*serial = work.serial;
 		allowed = true;
 	}
@@ -1474,19 +1496,61 @@ done:
 bool
 cluster_ko_create_begin_v3(RelFileLocator locator, uint64 *serial)
 {
-	return ko_create_begin(locator, false, serial);
+	return ko_create_begin(locator, false, false, serial);
 }
 
 bool
 cluster_ko_copy_begin_v3(RelFileLocator locator, uint64 *serial)
 {
-	return ko_create_begin(locator, true, serial);
+	return ko_create_begin(locator, true, false, serial);
 }
 
 bool
 cluster_ko_build_begin_v3(RelFileLocator locator, uint64 *serial)
 {
-	return ko_create_begin(locator, true, serial);
+	return ko_create_begin(locator, true, false, serial);
+}
+
+bool
+cluster_ko_buffer_copy_begin_v3(RelFileLocator locator, ForkNumber fork, BlockNumber nblocks,
+								uint64 *serial)
+{
+	if (serial != NULL)
+		*serial = 0;
+	if ((fork != MAIN_FORKNUM && fork != FSM_FORKNUM && fork != VISIBILITYMAP_FORKNUM)
+		|| nblocks == 0 || nblocks == InvalidBlockNumber
+		|| !ko_create_begin(locator, true, true, serial))
+		return false;
+	ko_buffer_copy.serial = *serial;
+	ko_buffer_copy.fork = fork;
+	ko_buffer_copy.nblocks = nblocks;
+	ko_buffer_copy.target = InvalidBlockNumber;
+	return true;
+}
+
+bool
+cluster_ko_buffer_copy_target_v3(RelFileLocator locator, uint64 serial, ForkNumber fork,
+								 BlockNumber block, ClusterKoCurrentAdmissionV3 *out)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	/* Expire the prior target even when selecting its successor fails.
+	 * Never revisit a selected block under the same serial (sample ABA). */
+	if (serial != 0 && serial == ko_buffer_copy.serial)
+		ko_buffer_copy.target = InvalidBlockNumber;
+	if (out == NULL || serial == 0 || serial != ko_buffer_copy.serial
+		|| serial != ko_create_local.serial || !ko_create_local.buffer_copy
+		|| !ko_copy_local_exact(locator) || fork != ko_buffer_copy.fork
+		|| block != ko_buffer_copy.next || block >= ko_buffer_copy.nblocks)
+		return false;
+	ko_buffer_copy.target = block;
+	/* Force an owner-bound sample even before a fence has arrived. */
+	if (!ko_storage_read_begin(locator, fork, block, &out->target)) {
+		ko_buffer_copy.target = InvalidBlockNumber;
+		return false;
+	}
+	ko_buffer_copy.next++;
+	return true;
 }
 
 bool
@@ -1574,6 +1638,7 @@ cluster_ko_create_end_v3(uint64 serial, bool complete)
 		}
 	}
 	memset(&ko_create_local, 0, sizeof(ko_create_local));
+	memset(&ko_buffer_copy, 0, sizeof(ko_buffer_copy));
 	ko_create_owner = NULL;
 	ko_create_aborting = false;
 	SpinLockRelease(&ko_state->shared_lock);

@@ -11163,6 +11163,7 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 #ifdef USE_PGRAC_CLUSTER
 	bool		versioned_copy = false;
 	ClusterSpaceIdentity copy_identity;
+	uint64 copy_serial = 0;
 #endif
 
 	/*
@@ -11196,83 +11197,118 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 		return;
 
 #ifdef USE_PGRAC_CLUSTER
-	if (cluster_shared_config && permanent &&
-		cluster_smgr_which_for(dstlocator, InvalidBackendId) == 1)
+	versioned_copy = cluster_shared_config && permanent
+					 && cluster_smgr_which_for(dstlocator, InvalidBackendId) == 1;
+	if (versioned_copy
+		&& !cluster_ko_buffer_copy_begin_v3(dstlocator, forkNum, nblocks, &copy_serial))
+		elog(ERROR, "buffer copy conflicts with object drain");
+	/* The serial is fixed before setjmp. ERROR may still hold native buffer
+	 * locks; only expire permission here, retaining original cleanup ownership. */
+	PG_TRY();
 	{
-		/* PGRAC: SPACE access precedes ordinary content locks. Reopen the
-		 * destination by value afterward; the read may invalidate handles. */
-		if (!use_wal || (forkNum != MAIN_FORKNUM && forkNum != FSM_FORKNUM &&
-						 forkNum != VISIBILITYMAP_FORKNUM) ||
-			!cluster_space_relation_read_identity(dstlocator, &copy_identity))
-			elog(ERROR, "cannot bind new buffer copy to exact SPACE identity");
-		if (smgrnblocks(smgropen(dstlocator, InvalidBackendId), forkNum) != 0)
-			elog(ERROR, "versioned buffer copy requires an empty destination fork");
-		if (forkNum == MAIN_FORKNUM && !cluster_space_reserve_exact(&copy_identity, 0, nblocks))
-			elog(ERROR, "cannot reserve new buffer copy block range");
-		versioned_copy = true;
-	}
+		if (versioned_copy) {
+			/* PGRAC: SPACE access precedes ordinary content locks. Reopen the
+			 * destination by value afterward; the read may invalidate handles. */
+			if (!cluster_ko_create_write_begin_v3(dstlocator, copy_serial) || !use_wal
+				|| (forkNum != MAIN_FORKNUM && forkNum != FSM_FORKNUM
+					&& forkNum != VISIBILITYMAP_FORKNUM)
+				|| !cluster_space_relation_read_identity(dstlocator, &copy_identity))
+				elog(ERROR, "cannot bind new buffer copy to exact SPACE identity");
+			if (smgrnblocks(smgropen(dstlocator, InvalidBackendId), forkNum) != 0)
+				elog(ERROR, "versioned buffer copy requires an empty destination fork");
+			if (!cluster_ko_create_write_begin_v3(dstlocator, copy_serial))
+				elog(ERROR, "buffer copy lost object drain owner before reservation");
+			if (forkNum == MAIN_FORKNUM && !cluster_space_reserve_exact(&copy_identity, 0, nblocks))
+				elog(ERROR, "cannot reserve new buffer copy block range");
+		}
 #endif
 
-	/*
-	 * Bulk extend the destination relation of the same size as the source
-	 * relation before starting to copy block by block.
-	 */
-	memset(buf.data, 0, BLCKSZ);
-	smgrextend(smgropen(dstlocator, InvalidBackendId), forkNum, nblocks - 1,
-			   buf.data, true);
+		/*
+		 * Bulk extend the destination relation of the same size as the source
+		 * relation before starting to copy block by block.
+		 */
+		memset(buf.data, 0, BLCKSZ);
+#ifdef USE_PGRAC_CLUSTER
+		if (copy_serial != 0 && !cluster_ko_create_write_begin_v3(dstlocator, copy_serial))
+			elog(ERROR, "buffer copy lost object drain owner before extension");
+#endif
+		smgrextend(smgropen(dstlocator, InvalidBackendId), forkNum, nblocks - 1, buf.data, true);
 
-	/* This is a bulk operation, so use buffer access strategies. */
-	bstrategy_src = GetAccessStrategy(BAS_BULKREAD);
-	bstrategy_dst = GetAccessStrategy(BAS_BULKWRITE);
+		/* This is a bulk operation, so use buffer access strategies. */
+		bstrategy_src = GetAccessStrategy(BAS_BULKREAD);
+		bstrategy_dst = GetAccessStrategy(BAS_BULKWRITE);
 
-	/* Iterate over each block of the source relation file. */
-	for (blkno = 0; blkno < nblocks; blkno++)
-	{
-		CHECK_FOR_INTERRUPTS();
-
-		/* Read block from source relation. */
-		srcBuf = ReadBufferWithoutRelcache(srclocator, forkNum, blkno,
-										   RBM_NORMAL, bstrategy_src,
-										   permanent);
-		LockBuffer(srcBuf, BUFFER_LOCK_SHARE);
-		srcPage = BufferGetPage(srcBuf);
-
-		dstBuf = ReadBufferWithoutRelcache(dstlocator, forkNum, blkno,
-										   RBM_ZERO_AND_LOCK, bstrategy_dst,
-										   permanent);
-		dstPage = BufferGetPage(dstBuf);
+		/* Iterate over each block of the source relation file. */
+		for (blkno = 0; blkno < nblocks; blkno++) {
+#ifdef USE_PGRAC_CLUSTER
+			ClusterKoCurrentAdmissionV3 copy_admission;
+#endif
+			CHECK_FOR_INTERRUPTS();
 
 #ifdef USE_PGRAC_CLUSTER
-		if (versioned_copy)
-		{
-			/* PGRAC: bulk extension created an actual zero-page predecessor,
-			 * not an absent block. Keep both native content locks until the
-			 * new version/FPI and dirty destination are published together. */
-			if (!cluster_space_copy_buffer_wal(&copy_identity, srcPage, dstBuf))
-				elog(ERROR, "cannot WAL-log new SPACE buffer version");
-		}
-		else
+			/* Select only this original destination before taking either native
+			 * pin/content lock. Current acquisition still uses the original proof. */
+			if (copy_serial != 0
+				&& !cluster_ko_buffer_copy_target_v3(dstlocator, copy_serial, forkNum, blkno,
+													 &copy_admission))
+				elog(ERROR, "buffer copy lost exact object drain target");
 #endif
-		{
-			START_CRIT_SECTION();
 
-			/* Copy page data from the source to the destination. */
-			memcpy(dstPage, srcPage, BLCKSZ);
-			MarkBufferDirty(dstBuf);
+			/* Read block from source relation. */
+			srcBuf = ReadBufferWithoutRelcache(srclocator, forkNum, blkno, RBM_NORMAL,
+											   bstrategy_src, permanent);
+			LockBuffer(srcBuf, BUFFER_LOCK_SHARE);
+			srcPage = BufferGetPage(srcBuf);
 
-			/* WAL-log the copied page. */
-			if (use_wal)
-				log_newpage_buffer(dstBuf, true);
+			dstBuf = ReadBufferWithoutRelcache(dstlocator, forkNum, blkno, RBM_ZERO_AND_LOCK,
+											   bstrategy_dst, permanent);
+			dstPage = BufferGetPage(dstBuf);
 
-			END_CRIT_SECTION();
+#ifdef USE_PGRAC_CLUSTER
+			if (versioned_copy) {
+				/* Atomic/local consumption only: do not take the KO/CONTROL locks
+				 * below content locks after a buffer/current wait. */
+				if (!cluster_ko_peer_current_valid_v3(&copy_admission, dstlocator, forkNum, blkno))
+					elog(ERROR, "buffer copy lost object drain admission before WAL");
+				/* PGRAC: bulk extension created an actual zero-page predecessor,
+				 * not an absent block. Keep both native content locks until the
+				 * new version/FPI and dirty destination are published together. */
+				if (!cluster_space_copy_buffer_wal(&copy_identity, srcPage, dstBuf))
+					elog(ERROR, "cannot WAL-log new SPACE buffer version");
+			} else
+#endif
+			{
+				START_CRIT_SECTION();
+
+				/* Copy page data from the source to the destination. */
+				memcpy(dstPage, srcPage, BLCKSZ);
+				MarkBufferDirty(dstBuf);
+
+				/* WAL-log the copied page. */
+				if (use_wal)
+					log_newpage_buffer(dstBuf, true);
+
+				END_CRIT_SECTION();
+			}
+
+			UnlockReleaseBuffer(dstBuf);
+			UnlockReleaseBuffer(srcBuf);
 		}
 
-		UnlockReleaseBuffer(dstBuf);
-		UnlockReleaseBuffer(srcBuf);
+		FreeAccessStrategy(bstrategy_src);
+		FreeAccessStrategy(bstrategy_dst);
+#ifdef USE_PGRAC_CLUSTER
 	}
-
-	FreeAccessStrategy(bstrategy_src);
-	FreeAccessStrategy(bstrategy_dst);
+	PG_CATCH();
+	{
+		cluster_ko_create_abort_v3(copy_serial);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	/* Dirty/current/IO obligations remain with their original owners. */
+	if (copy_serial != 0 && !cluster_ko_create_end_v3(copy_serial, true))
+		elog(ERROR, "buffer copy cannot retire object drain owner");
+#endif
 }
 
 /* ---------------------------------------------------------------------

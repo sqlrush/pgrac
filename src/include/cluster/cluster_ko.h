@@ -218,6 +218,13 @@ extern bool cluster_ko_create_begin_v3(RelFileLocator locator, uint64 *serial);
  * lifecycle, with SPACE0/1 read admission fixed at registration. */
 extern bool cluster_ko_copy_begin_v3(RelFileLocator locator, uint64 *serial);
 extern bool cluster_ko_build_begin_v3(RelFileLocator locator, uint64 *serial);
+/* Buffered copy additionally selects one original destination block at a
+ * time, in order. Selection is outside content locks; the returned sample
+ * is consumed by peer_current_valid before WAL/dirty under those locks. */
+extern bool cluster_ko_buffer_copy_begin_v3(RelFileLocator locator, ForkNumber fork,
+											BlockNumber nblocks, uint64 *serial);
+extern bool cluster_ko_buffer_copy_target_v3(RelFileLocator locator, uint64 serial, ForkNumber fork,
+											 BlockNumber block, ClusterKoCurrentAdmissionV3 *out);
 extern bool cluster_ko_create_current_v3(RelFileLocator locator, uint64 *serial);
 extern bool cluster_ko_create_write_begin_v3(RelFileLocator locator, uint64 serial);
 extern bool cluster_ko_create_end_v3(uint64 serial, bool complete);

@@ -6829,6 +6829,170 @@ UT_TEST(test_bulk_build_uses_exact_finite_owner_and_original_error_exit)
 	}
 }
 
+UT_TEST(test_buffer_copy_selects_only_next_exact_target_under_active)
+{
+	const ForkNumber forks[] = { MAIN_FORKNUM, FSM_FORKNUM, VISIBILITYMAP_FORKNUM };
+
+	for (unsigned f = 0; f < lengthof(forks); f++) {
+		ClusterKoSharedMessageV3 request = peer_fence_fixture(1500 + f);
+		ClusterKoPeerFenceHandleV3 handle;
+		ClusterKoPeerFenceStateV3 state;
+		ClusterKoCurrentAdmissionV3 sample = { 0 }, old = { 0 }, rejected = { 0 };
+		RelFileLocator locator = request.base.key.locator;
+		uint64 serial;
+
+		UT_ASSERT(cluster_ko_buffer_copy_begin_v3(locator, forks[f], 3, &serial));
+		UT_ASSERT(cluster_ko_create_write_begin_v3(locator, serial));
+		UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+		UT_ASSERT(cluster_ko_peer_current_begin_v3(locator, SPACE_FORKNUM, 0, &sample));
+		UT_ASSERT(!cluster_ko_peer_current_begin_v3(locator, forks[f], 0, &rejected));
+		UT_ASSERT(!cluster_ko_buffer_copy_target_v3(locator, serial, forks[f], 1, &rejected));
+		for (BlockNumber block = 0; block < 3; block++) {
+			UT_ASSERT(cluster_ko_buffer_copy_target_v3(locator, serial, forks[f], block, &sample));
+			UT_ASSERT_EQ(sample.target.extension_serial, serial);
+			UT_ASSERT_EQ(sample.target.block, block);
+			UT_ASSERT(cluster_ko_peer_current_begin_v3(locator, forks[f], block, &rejected));
+			UT_ASSERT(!cluster_ko_peer_current_begin_v3(locator, forks[f], block + 1, &rejected));
+			SpinLockAcquire(&storage.shared_lock);
+			UT_ASSERT(cluster_ko_peer_current_valid_v3(&sample, locator, forks[f], block));
+			if (block > 0)
+				UT_ASSERT(!cluster_ko_peer_current_valid_v3(&old, locator, forks[f], block - 1));
+			SpinLockRelease(&storage.shared_lock);
+			UT_ASSERT(!fixture_completed_fence_ready(&request, &handle));
+			old = sample;
+		}
+		UT_ASSERT(!cluster_ko_buffer_copy_target_v3(locator, serial, forks[f], 0, &rejected));
+		UT_ASSERT(!cluster_ko_buffer_copy_target_v3(locator, serial, forks[f], 3, &rejected));
+		UT_ASSERT(cluster_ko_create_end_v3(serial, true));
+		UT_ASSERT(!cluster_ko_peer_current_valid_v3(&sample, locator, forks[f], 2));
+		UT_ASSERT(fixture_completed_fence_ready(&request, &handle));
+		UT_ASSERT(!cluster_ko_buffer_copy_begin_v3(locator, forks[f], 3, &serial));
+	}
+}
+
+UT_TEST(test_buffer_copy_range_and_purpose_cannot_be_rebound)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(1510);
+	ClusterKoCurrentAdmissionV3 sample;
+	RelFileLocator locator = request.base.key.locator, other = locator;
+	uint64 serial = 99;
+
+	other.relNumber++;
+	UT_ASSERT(!cluster_ko_buffer_copy_begin_v3(locator, SPACE_FORKNUM, 1, &serial));
+	UT_ASSERT_EQ(serial, 0);
+	UT_ASSERT(!cluster_ko_buffer_copy_begin_v3(locator, INIT_FORKNUM, 1, &serial));
+	UT_ASSERT(!cluster_ko_buffer_copy_begin_v3(locator, MAIN_FORKNUM, 0, &serial));
+	UT_ASSERT(!cluster_ko_buffer_copy_begin_v3(locator, MAIN_FORKNUM, InvalidBlockNumber, &serial));
+	UT_ASSERT(!cluster_ko_buffer_copy_begin_v3(locator, MAIN_FORKNUM, 2, NULL));
+	UT_ASSERT(cluster_ko_buffer_copy_begin_v3(locator, MAIN_FORKNUM, 2, &serial));
+	UT_ASSERT(!cluster_ko_buffer_copy_target_v3(locator, serial, MAIN_FORKNUM, 0, &sample));
+	UT_ASSERT(cluster_ko_create_write_begin_v3(locator, serial));
+	UT_ASSERT(!cluster_ko_buffer_copy_target_v3(other, serial, MAIN_FORKNUM, 0, &sample));
+	UT_ASSERT(!cluster_ko_buffer_copy_target_v3(locator, serial + 1, MAIN_FORKNUM, 0, &sample));
+	UT_ASSERT(!cluster_ko_buffer_copy_target_v3(locator, serial, FSM_FORKNUM, 0, &sample));
+	UT_ASSERT(!cluster_ko_buffer_copy_target_v3(locator, serial, MAIN_FORKNUM, 0, NULL));
+	UT_ASSERT(cluster_ko_buffer_copy_target_v3(locator, serial, MAIN_FORKNUM, 0, &sample));
+	UT_ASSERT(cluster_ko_create_end_v3(serial, true));
+	for (unsigned kind = 0; kind < 3; kind++) {
+		(void)peer_fence_fixture(1511 + kind);
+		UT_ASSERT(kind == 0	  ? cluster_ko_create_begin_v3(locator, &serial)
+				  : kind == 1 ? cluster_ko_copy_begin_v3(locator, &serial)
+							  : cluster_ko_build_begin_v3(locator, &serial));
+		UT_ASSERT(cluster_ko_create_write_begin_v3(locator, serial));
+		UT_ASSERT(!cluster_ko_buffer_copy_target_v3(locator, serial, MAIN_FORKNUM, 0, &sample));
+		UT_ASSERT(cluster_ko_create_end_v3(serial, true));
+	}
+}
+
+UT_TEST(test_buffer_copy_exact_owner_and_failed_scope_retain_obligation)
+{
+	for (unsigned fault = 0; fault < 11; fault++) {
+		ClusterKoSharedMessageV3 request = peer_fence_fixture(1520 + fault);
+		ClusterKoPeerFenceHandleV3 handle;
+		ClusterKoPeerFenceStateV3 state;
+		ClusterKoCurrentAdmissionV3 sample, rejected;
+		RelFileLocator locator = request.base.key.locator;
+		uint64 serial;
+
+		UT_ASSERT(cluster_ko_buffer_copy_begin_v3(locator, MAIN_FORKNUM, 2, &serial));
+		UT_ASSERT(cluster_ko_create_write_begin_v3(locator, serial));
+		UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+		UT_ASSERT(cluster_ko_buffer_copy_target_v3(locator, serial, MAIN_FORKNUM, 0, &sample));
+		switch (fault) {
+		case 0:
+			CurrentResourceOwner = (ResourceOwner)2;
+			break;
+		case 1:
+			MyProcPid++;
+			break;
+		case 2:
+			writer.claim.identity.origin_owner_incarnation++;
+			break;
+		case 3:
+			current_epoch++;
+			break;
+		case 4:
+			storage.extend_work[ko_create_slot].serial++;
+			break;
+		case 5:
+			fixture_recovering = true;
+			break;
+		case 6:
+			cluster_interconnect_tier = CLUSTER_IC_TIER_2;
+			break;
+		case 7:
+			storage.peer_fences[handle.slot].state = CLUSTER_KO_PEER_FENCE_READY;
+			break;
+		case 8:
+			cluster_ko_create_abort_v3(serial);
+			break;
+		case 9:
+			ko_shared_backend_exit(1, (Datum)0);
+			break;
+		case 10:
+			pg_atomic_write_u64(&storage.peer_admission_revision, UINT64_MAX);
+			break;
+		}
+		UT_ASSERT(!cluster_ko_buffer_copy_target_v3(locator, serial, MAIN_FORKNUM, 1, &rejected));
+		UT_ASSERT(!cluster_ko_peer_current_valid_v3(&sample, locator, MAIN_FORKNUM, 0));
+		UT_ASSERT(storage.extend_work[ko_create_slot].used);
+		if (fault == 8 || fault == 9) {
+			ko_shared_resource_release(RESOURCE_RELEASE_AFTER_LOCKS, false, false, NULL);
+			UT_ASSERT(storage.extend_work[ko_create_slot].failed);
+			UT_ASSERT(!fixture_completed_fence_ready(&request, &handle));
+		}
+		cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+	}
+}
+
+UT_TEST(test_buffer_copy_samples_expire_across_revision_and_new_lifetime)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(1540);
+	ClusterKoPeerFenceHandleV3 handle;
+	ClusterKoPeerFenceStateV3 state;
+	ClusterKoCurrentAdmissionV3 sample, fresh;
+	RelFileLocator locator = request.base.key.locator;
+	uint64 serial, next;
+
+	UT_ASSERT(cluster_ko_buffer_copy_begin_v3(locator, MAIN_FORKNUM, 1, &serial));
+	UT_ASSERT(cluster_ko_create_write_begin_v3(locator, serial));
+	UT_ASSERT(cluster_ko_buffer_copy_target_v3(locator, serial, MAIN_FORKNUM, 0, &sample));
+	UT_ASSERT_EQ(sample.target.extension_serial, serial); /* Even before a fence exists. */
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+	UT_ASSERT(!cluster_ko_peer_current_valid_v3(&sample, locator, MAIN_FORKNUM, 0));
+	UT_ASSERT(cluster_ko_peer_current_begin_v3(locator, MAIN_FORKNUM, 0, &fresh));
+	UT_ASSERT(cluster_ko_peer_current_valid_v3(&fresh, locator, MAIN_FORKNUM, 0));
+	UT_ASSERT(cluster_ko_create_end_v3(serial, true));
+	UT_ASSERT(!cluster_ko_peer_current_valid_v3(&fresh, locator, MAIN_FORKNUM, 0));
+	memset(&storage.peer_fences[handle.slot], 0, sizeof(storage.peer_fences[handle.slot]));
+	UT_ASSERT(cluster_ko_buffer_copy_begin_v3(locator, MAIN_FORKNUM, 1, &next));
+	UT_ASSERT(next != serial);
+	UT_ASSERT(cluster_ko_create_write_begin_v3(locator, next));
+	UT_ASSERT(cluster_ko_buffer_copy_target_v3(locator, next, MAIN_FORKNUM, 0, &sample));
+	UT_ASSERT(!cluster_ko_peer_current_valid_v3(&fresh, locator, MAIN_FORKNUM, 0));
+	UT_ASSERT(cluster_ko_create_end_v3(next, true));
+}
+
 UT_TEST(test_create_reference_outlives_exact_space_children_and_blocks_ready)
 {
 	ClusterKoSharedMessageV3 request = peer_fence_fixture(1400);
@@ -9108,7 +9272,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(222);
+	UT_PLAN(226);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_create_reference_outlives_exact_space_children_and_blocks_ready);
 	UT_RUN(test_create_capacity_reserves_progress_for_every_accepted_constructor);
@@ -9331,6 +9495,10 @@ main(void)
 	UT_RUN(test_raw_copy_scope_resumes_only_space_and_blocks_ready);
 	UT_RUN(test_raw_copy_scope_keeps_exact_owner_cut_and_error_responsibility);
 	UT_RUN(test_bulk_build_uses_exact_finite_owner_and_original_error_exit);
+	UT_RUN(test_buffer_copy_selects_only_next_exact_target_under_active);
+	UT_RUN(test_buffer_copy_range_and_purpose_cannot_be_rebound);
+	UT_RUN(test_buffer_copy_exact_owner_and_failed_scope_retain_obligation);
+	UT_RUN(test_buffer_copy_samples_expire_across_revision_and_new_lifetime);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

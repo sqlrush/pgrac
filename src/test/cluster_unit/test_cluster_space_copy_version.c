@@ -138,7 +138,10 @@ enum CopySite {
 	COPY_WAL,
 	COPY_FLUSH,
 	COPY_WRITE,
-	COPY_SYNC
+	COPY_SYNC,
+	COPY_SOURCE_BUFFER,
+	COPY_DEST_BUFFER,
+	COPY_RELEASE
 };
 static bool copy_begin_allowed, copy_permission, copy_live, copy_aborting;
 static bool copy_armed, private_storage, temporary_copy;
@@ -146,6 +149,14 @@ static bool copy_failed_retained;
 static unsigned copy_begins, copy_ends, copy_aborts, copy_observed;
 static unsigned copy_fail_site, copy_lose_site;
 static BlockNumber source_blocks;
+static unsigned copy_targets, copy_buffer_reads, copy_target_checks;
+static bool buffer_copy_scope;
+
+/* Prospective typed producer entry; its consumer is tested in ko_stop. */
+bool cluster_ko_buffer_copy_begin_v3(RelFileLocator locator, ForkNumber fork, BlockNumber nblocks,
+									 uint64 *serial);
+bool cluster_ko_buffer_copy_target_v3(RelFileLocator locator, uint64 serial, ForkNumber fork,
+									  BlockNumber block, ClusterKoCurrentAdmissionV3 *out);
 
 static void
 copy_observe(enum CopySite site)
@@ -170,6 +181,48 @@ cluster_ko_copy_begin_v3(RelFileLocator locator, uint64 *serial)
 	copy_live = true;
 	*serial = 77;
 	return true;
+}
+
+bool
+cluster_ko_buffer_copy_begin_v3(RelFileLocator locator, ForkNumber fork, BlockNumber nblocks,
+								uint64 *serial)
+{
+	UT_ASSERT(buffered && fork == test_fork && nblocks == source_blocks && nblocks != 0);
+	/* writes also represents pre-existing destination size in the original
+	 * nonempty-file negative; that is not an effect of this invocation. */
+	UT_ASSERT_EQ(space_reads + reservations + new_wal, 0);
+	buffer_copy_scope = true;
+	return cluster_ko_copy_begin_v3(locator, serial);
+}
+
+bool
+cluster_ko_buffer_copy_target_v3(RelFileLocator locator, uint64 serial, ForkNumber fork,
+								 BlockNumber block, ClusterKoCurrentAdmissionV3 *out)
+{
+	UT_ASSERT(buffer_copy_scope && fork == test_fork && block == 0);
+	UT_ASSERT(!pinned && !data_pins[0] && !data_pins[1]);
+	UT_ASSERT(!locked && !data_locks[0] && !data_locks[1]);
+	copy_targets++;
+	memset(out, 0, sizeof(*out));
+	if (!cluster_ko_create_write_begin_v3(locator, serial))
+		return false;
+	out->target.locator = locator;
+	out->target.fork = fork;
+	out->target.block = block;
+	out->target.extension_serial = serial;
+	return true;
+}
+
+bool
+cluster_ko_peer_current_valid_v3(const ClusterKoCurrentAdmissionV3 *sample, RelFileLocator locator,
+								 ForkNumber fork, BlockNumber block)
+{
+	UT_ASSERT(data_locks[0] && data_locks[1] && data_pins[0] && data_pins[1]);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	copy_target_checks++;
+	return sample != NULL && sample->target.extension_serial == 77 && copy_live && !copy_aborting
+		   && copy_permission && sample->target.fork == fork && sample->target.block == block
+		   && RelFileLocatorEquals(sample->target.locator, locator);
 }
 
 bool
@@ -200,6 +253,9 @@ cluster_ko_create_end_v3(uint64 serial, bool complete)
 	UT_ASSERT_EQ(serial, 77);
 	UT_ASSERT(copy_live && complete && !copy_aborting);
 	copy_ends++;
+	if (buffer_copy_scope)
+		UT_ASSERT(!data_pins[0] && !data_pins[1] && !data_locks[0] && !data_locks[1]
+				  && strategies == 0);
 	copy_live = false;
 	if (!copy_permission) {
 		copy_failed_retained = copy_armed;
@@ -418,6 +474,8 @@ ReadBufferWithoutRelcache(RelFileLocator tag, ForkNumber forknum, BlockNumber bl
 			abort();
 		data_pins[slot] = true;
 		data_locks[slot] = !is_source;
+		copy_buffer_reads++;
+		copy_observe(is_source ? COPY_SOURCE_BUFFER : COPY_DEST_BUFFER);
 		return is_source ? 2 : 3;
 	}
 	if (!RelFileLocatorEquals(tag, identity.key.locator) || forknum != SPACE_FORKNUM || block != 0
@@ -465,6 +523,8 @@ UnlockReleaseBuffer(Buffer buffer)
 		if (!data_pins[slot] || !data_locks[slot] || CritSectionCount != 0)
 			abort();
 		data_pins[slot] = data_locks[slot] = false;
+		if (slot == 0)
+			copy_observe(COPY_RELEASE);
 		return;
 	}
 	if (buffer != 1 || !pinned || !locked)
@@ -767,6 +827,8 @@ reset(ForkNumber forknum)
 	copy_failed_retained = false;
 	copy_begins = copy_ends = copy_aborts = copy_observed = 0;
 	copy_fail_site = copy_lose_site = 0;
+	copy_targets = copy_buffer_reads = copy_target_checks = 0;
+	buffer_copy_scope = false;
 	source_blocks = 1;
 	InterruptPending = false;
 	cluster_shared_config = true;
@@ -1435,10 +1497,185 @@ UT_TEST(test_raw_copy_initial_owner_loss_precedes_space_read)
 	UT_ASSERT_EQ(space_reads + reservations + new_wal + writes + syncs, 0);
 }
 
+UT_TEST(test_buffer_copy_owner_refusal_precedes_destination_effects)
+{
+	volatile bool caught = false;
+
+	reset(MAIN_FORKNUM);
+	buffered = true;
+	copy_begin_allowed = false;
+	expecting_error = true;
+	if (setjmp(error_jump) == 0)
+		RelationCopyStorageUsingBuffer(source.smgr_rlocator.locator,
+									   destination.smgr_rlocator.locator, test_fork, true);
+	else
+		caught = true;
+	expecting_error = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(space_reads + reservations + new_wal + writes + copy_buffer_reads, 0);
+	UT_ASSERT_EQ(copy_begins, 1);
+	UT_ASSERT(!copy_live);
+	UT_ASSERT_EQ(copy_aborts + copy_ends, 0);
+}
+
+UT_TEST(test_buffer_copy_owner_covers_original_forks_and_unpins_before_end)
+{
+	const ForkNumber forks[] = { MAIN_FORKNUM, FSM_FORKNUM, VISIBILITYMAP_FORKNUM };
+
+	for (unsigned i = 0; i < lengthof(forks); i++) {
+		reset(forks[i]);
+		buffered = true;
+		RelationCopyStorageUsingBuffer(source.smgr_rlocator.locator,
+									   destination.smgr_rlocator.locator, test_fork, true);
+		UT_ASSERT_EQ(copy_begins, 1);
+		UT_ASSERT_EQ(copy_ends, 1);
+		UT_ASSERT_EQ(copy_aborts, 0);
+		UT_ASSERT_EQ(copy_targets, 1);
+		UT_ASSERT_EQ(copy_target_checks, 1);
+		UT_ASSERT_EQ(copy_buffer_reads, 2);
+		UT_ASSERT_EQ(copy_observed,
+					 (1U << (COPY_SPACE - 1)) | (1U << (COPY_WAL - 1)) | (1U << (COPY_WRITE - 1))
+						 | (1U << (COPY_SOURCE_BUFFER - 1)) | (1U << (COPY_DEST_BUFFER - 1))
+						 | (1U << (COPY_RELEASE - 1)) | (i == 0 ? 1U << (COPY_RESERVE - 1) : 0));
+		UT_ASSERT(!copy_live && !copy_failed_retained);
+		UT_ASSERT_EQ(new_wal, 1);
+		UT_ASSERT_EQ(dirties, 1);
+		UT_ASSERT_EQ(syncs + flushes + strategies, 0);
+	}
+}
+
+UT_TEST(test_buffer_copy_owner_loss_before_reserve_extend_or_buffer_wal)
+{
+	const unsigned sites[]
+		= { COPY_SPACE, COPY_RESERVE, COPY_WRITE, COPY_SOURCE_BUFFER, COPY_DEST_BUFFER };
+
+	for (unsigned i = 0; i < lengthof(sites); i++) {
+		volatile bool caught = false;
+
+		reset(MAIN_FORKNUM);
+		buffered = true;
+		copy_lose_site = sites[i];
+		expecting_error = true;
+		if (setjmp(error_jump) == 0)
+			RelationCopyStorageUsingBuffer(source.smgr_rlocator.locator,
+										   destination.smgr_rlocator.locator, test_fork, true);
+		else
+			caught = true;
+		expecting_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(new_wal + dirties + flushes + syncs, 0);
+		UT_ASSERT_EQ(reservations, i == 0 ? 0 : 1);
+		UT_ASSERT_EQ(writes, i < 2 ? 0 : 1);
+		UT_ASSERT_EQ(copy_buffer_reads, i < 3 ? 0 : 2);
+		UT_ASSERT_EQ(copy_ends, 0);
+		UT_ASSERT_EQ(copy_aborts, 1);
+		UT_ASSERT(copy_live && copy_aborting);
+		UT_ASSERT(PG_exception_stack == NULL);
+	}
+}
+
+UT_TEST(test_buffer_copy_error_and_cancel_retain_original_owner)
+{
+	const unsigned sites[] = { COPY_SPACE,		 COPY_RESERVE, COPY_WRITE, COPY_SOURCE_BUFFER,
+							   COPY_DEST_BUFFER, COPY_WAL,	   0 };
+
+	for (unsigned i = 0; i < lengthof(sites); i++) {
+		volatile bool caught = false;
+
+		reset(MAIN_FORKNUM);
+		buffered = true;
+		copy_fail_site = sites[i];
+		InterruptPending = sites[i] == 0;
+		expecting_error = true;
+		if (setjmp(error_jump) == 0)
+			RelationCopyStorageUsingBuffer(source.smgr_rlocator.locator,
+										   destination.smgr_rlocator.locator, test_fork, true);
+		else
+			caught = true;
+		expecting_error = InterruptPending = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(copy_aborts, 1);
+		UT_ASSERT_EQ(copy_ends, 0);
+		UT_ASSERT(copy_live && copy_aborting);
+		UT_ASSERT(PG_exception_stack == NULL);
+		/* Original ResourceOwner cleanup is outside this component fixture. */
+		CritSectionCount = 0;
+	}
+}
+
+UT_TEST(test_buffer_copy_lost_owner_after_unlock_is_not_success)
+{
+	volatile bool caught = false;
+
+	reset(MAIN_FORKNUM);
+	buffered = true;
+	copy_lose_site = COPY_RELEASE;
+	expecting_error = true;
+	if (setjmp(error_jump) == 0)
+		RelationCopyStorageUsingBuffer(source.smgr_rlocator.locator,
+									   destination.smgr_rlocator.locator, test_fork, true);
+	else
+		caught = true;
+	expecting_error = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(new_wal, 1);
+	UT_ASSERT_EQ(dirties, 1);
+	UT_ASSERT_EQ(copy_ends, 1);
+	UT_ASSERT(copy_failed_retained);
+	UT_ASSERT_EQ(strategies + syncs + flushes, 0);
+}
+
+UT_TEST(test_buffer_copy_empty_private_and_native_keep_original_lifetime)
+{
+	for (unsigned variant = 0; variant < 3; variant++) {
+		reset(MAIN_FORKNUM);
+		buffered = true;
+		source_blocks = variant == 0 ? 0 : 1;
+		private_storage = variant == 1;
+		cluster_shared_config = variant != 2;
+		copy_begin_allowed = false;
+		RelationCopyStorageUsingBuffer(source.smgr_rlocator.locator,
+									   destination.smgr_rlocator.locator, test_fork, true);
+		UT_ASSERT_EQ(copy_begins + copy_ends + copy_aborts + copy_targets, 0);
+		UT_ASSERT_EQ(space_reads + reservations + new_wal, 0);
+		UT_ASSERT_EQ(writes, variant == 0 ? 0 : 1);
+		UT_ASSERT_EQ(dirties, variant == 0 ? 0 : 1);
+		UT_ASSERT_EQ(old_wal, variant == 0 ? 0 : 1);
+	}
+}
+
+UT_TEST(test_buffer_copy_initial_owner_loss_precedes_identity_read)
+{
+	volatile bool caught = false;
+
+	reset(MAIN_FORKNUM);
+	buffered = true;
+	copy_permission = false;
+	expecting_error = true;
+	if (setjmp(error_jump) == 0)
+		RelationCopyStorageUsingBuffer(source.smgr_rlocator.locator,
+									   destination.smgr_rlocator.locator, test_fork, true);
+	else
+		caught = true;
+	expecting_error = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(copy_begins, 1);
+	UT_ASSERT_EQ(copy_aborts, 1);
+	UT_ASSERT_EQ(copy_ends, 0);
+	UT_ASSERT_EQ(space_reads + reservations + new_wal + writes + copy_buffer_reads, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(37);
+	UT_RUN(test_buffer_copy_owner_refusal_precedes_destination_effects);
+	UT_RUN(test_buffer_copy_owner_covers_original_forks_and_unpins_before_end);
+	UT_RUN(test_buffer_copy_owner_loss_before_reserve_extend_or_buffer_wal);
+	UT_RUN(test_buffer_copy_error_and_cancel_retain_original_owner);
+	UT_RUN(test_buffer_copy_lost_owner_after_unlock_is_not_success);
+	UT_RUN(test_buffer_copy_empty_private_and_native_keep_original_lifetime);
+	UT_RUN(test_buffer_copy_initial_owner_loss_precedes_identity_read);
 	UT_RUN(test_raw_copy_fence_refusal_precedes_target_effects);
 	UT_RUN(test_raw_copy_owner_covers_space_wal_data_and_final_sync);
 	UT_RUN(test_raw_copy_rechecks_before_wal_data_and_sync);
