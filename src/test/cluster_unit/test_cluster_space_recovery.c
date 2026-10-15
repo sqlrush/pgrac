@@ -87,6 +87,9 @@ static FILE *main_file;
 static bool main_exists, stale_after_main_create, stale_after_main_sync, hide_main_after_sync;
 static unsigned main_creates, main_syncs, create_source_syncs;
 static bool fail_create_source_sync, wrong_create_source_sync;
+static unsigned source_sync_mask, required_source_sync_mask;
+static uint16 source_sync_fault_thread;
+static int source_sync_fault;
 
 static BlockNumber existing_blocks;
 static unsigned creates, extensions, x_locks;
@@ -194,13 +197,31 @@ cluster_control_root_recovery_sync_v1(const ClusterControlRootSnapshot *root,
 	UT_ASSERT(CurrentResourceOwner == source_owner && !pins && !locks && !hw_held);
 	UT_ASSERT(cold_protected());
 	for (int i = 0; i < 2; i++) {
-		if (root != sources[i].root_snapshot || token != sources[i].root_token)
+		if (memcmp(root, sources[i].root_snapshot, sizeof(*root)) != 0
+			|| memcmp(token, sources[i].root_token, sizeof(*token)) != 0)
 			continue;
 		create_source_syncs++;
 		memset(out, 0, sizeof(*out));
 		out->complete_end = root->validated_tail_lsn_exclusive + wrong_create_source_sync;
 		out->last_record_start = root->tail_last_record_lsn;
 		out->last_record_crc = root->tail_last_record_crc32c;
+		if (root->identity.origin_thread_id == source_sync_fault_thread) {
+			if (source_sync_fault == 1)
+				return CLUSTER_CONTROL_ROOT_IO_ERROR;
+			if (source_sync_fault == 2)
+				out->complete_end++;
+			if (source_sync_fault == 3)
+				out->last_record_start++;
+			if (source_sync_fault == 4)
+				out->last_record_crc++;
+			if (source_sync_fault == 5)
+				stale = true;
+			if (source_sync_fault == 6)
+				pg_re_throw();
+			if (source_sync_fault == 7)
+				merge_claim = false;
+		}
+		source_sync_mask |= 1u << i;
 		return fail_create_source_sync ? CLUSTER_CONTROL_ROOT_IO_ERROR
 									   : CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 	}
@@ -427,6 +448,7 @@ smgrnblocks(SMgrRelation r, ForkNumber f)
 void
 smgrcreate(SMgrRelation r, ForkNumber fork, bool is_redo)
 {
+	UT_ASSERT((source_sync_mask & required_source_sync_mask) == required_source_sync_mask);
 	UT_ASSERT((hw_held || cold_protected()) && CurrentResourceOwner == child_owner);
 	if (fork == MAIN_FORKNUM) {
 		UT_ASSERT(cold_protected() && is_redo);
@@ -526,6 +548,7 @@ BufferGetTag(Buffer b, RelFileLocator *r, ForkNumber *f, BlockNumber *n)
 void
 MarkBufferDirty(Buffer b)
 {
+	UT_ASSERT((source_sync_mask & required_source_sync_mask) == required_source_sync_mask);
 	UT_ASSERT(b == 2 || ((creating || structural) && b == 1));
 	UT_ASSERT(x_locks & (1 << (b - 1)));
 	UT_ASSERT(CritSectionCount > 0);
@@ -608,6 +631,7 @@ smgr_redo_cold_truncate(const xl_smgr_truncate *truncate, const ClusterSpaceReco
 {
 	xl_smgr_truncate wrong = *truncate;
 
+	UT_ASSERT((source_sync_mask & required_source_sync_mask) == required_source_sync_mask);
 	UT_ASSERT(cluster_space_recovery_truncate_permitted_v1(batch, truncate));
 	wrong.blkno++;
 	UT_ASSERT(!cluster_space_recovery_truncate_permitted_v1(batch, &wrong));
@@ -854,6 +878,9 @@ reset(void)
 	creating = false;
 	main_exists = true;
 	main_creates = main_syncs = create_source_syncs = 0;
+	source_sync_mask = required_source_sync_mask = 0;
+	source_sync_fault_thread = 0;
+	source_sync_fault = 0;
 	fail_create_source_sync = wrong_create_source_sync = false;
 	stale_after_main_create = stale_after_main_sync = hide_main_after_sync = false;
 	if (main_file)
@@ -2716,10 +2743,135 @@ UT_TEST(test_compact_cold_physical_refusal_precedes_all_prefix_mutations)
 	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 3, 2, 0));
 }
 
+UT_TEST(test_compact_cold_syncs_complete_chain_before_prefix_or_shrink)
+{
+	for (int truncate = 0; truncate < 2; truncate++) {
+		ClusterSpaceRecoveryInput inputs[4];
+		ClusterSpaceColdSourceV1 origins[4];
+		uint8 bytes[4][CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+
+		compact_lifecycle(inputs, origins, bytes);
+		required_source_sync_mask = 3;
+		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 4, truncate,
+												truncate ? SMGR_TRUNCATE_ALL : 0));
+		/* Four records, two original sources. Even the later source supports
+		 * the complete history proof used for an earlier prefix. */
+		UT_ASSERT_EQ(create_source_syncs, 2);
+		UT_ASSERT_EQ(source_sync_mask, 3);
+		UT_ASSERT_EQ(cold_truncates, truncate);
+		UT_ASSERT_EQ(wal_flushes, 0);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_compact_cold_sync_refusal_leaves_space_and_data_untouched)
+{
+	for (int failure = 1; failure <= 7; failure++) {
+		ClusterSpaceRecoveryInput inputs[4];
+		ClusterSpaceColdSourceV1 origins[4];
+		uint8 bytes[4][CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+		PGAlignedBlock before[2], disk_before[2], disk[2];
+		volatile bool caught = false;
+		volatile bool installed = false;
+
+		compact_lifecycle(inputs, origins, bytes);
+		source_sync_fault_thread = origins[1].origin_thread;
+		source_sync_fault = failure;
+		memcpy(before, pages, sizeof(before));
+		UT_ASSERT_EQ(pread(fileno(file), disk_before, sizeof(disk_before), 0), sizeof(disk_before));
+		PG_TRY();
+		{
+			installed
+				= cluster_space_cold_install_v1(&key, inputs, origins, 4, 1, SMGR_TRUNCATE_ALL);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, failure == 6);
+		UT_ASSERT(!installed);
+		UT_ASSERT_EQ(create_source_syncs, 2);
+		UT_ASSERT_EQ(writes + creates + extensions + cold_truncates, 0);
+		UT_ASSERT_EQ(cold_main_blocks, 7);
+		UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+		UT_ASSERT_EQ(pread(fileno(file), disk, sizeof(disk), 0), sizeof(disk));
+		UT_ASSERT(memcmp(disk_before, disk, sizeof(disk_before)) == 0);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+		UT_ASSERT_EQ(wal_flushes, 0);
+		/* No sticky target mutation or leaked child prevents the original
+		 * owner from retrying after an ordinary failure or ERROR. */
+		source_sync_fault = 0;
+		stale = false;
+		merge_claim = true;
+		required_source_sync_mask = 3;
+		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 4, 1, SMGR_TRUNCATE_ALL));
+		UT_ASSERT_EQ(cold_truncates, 1);
+	}
+}
+
+UT_TEST(test_compact_cold_sync_before_creating_missing_space)
+{
+	ClusterSpaceRecoveryInput inputs[2];
+	ClusterSpaceColdSourceV1 origins[2];
+
+	create_input(0);
+	MyAuxProcType = StartupProcess;
+	compact_inputs(inputs, origins);
+	required_source_sync_mask = 3;
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 2, 0, 0));
+	UT_ASSERT_EQ(create_source_syncs, 2);
+	UT_ASSERT_EQ(creates, 1);
+	UT_ASSERT_EQ(extensions, 2);
+}
+
+UT_TEST(test_compact_cold_syncs_only_referenced_sources)
+{
+	ClusterSpaceRecoveryInput inputs[2];
+	ClusterSpaceColdSourceV1 origins[2];
+
+	create_input(0);
+	MyAuxProcType = StartupProcess;
+	compact_inputs(inputs, origins);
+	required_source_sync_mask = 1;
+	/* The second owner is still in the qualified cohort, but contributes
+	 * no record to this single-input relation. */
+	source_sync_fault_thread = origins[1].origin_thread;
+	source_sync_fault = 1;
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 1, 0, 0));
+	UT_ASSERT_EQ(create_source_syncs, 1);
+	UT_ASSERT_EQ(source_sync_mask, 1);
+}
+
+UT_TEST(test_cold_drop_already_is_read_only_even_with_source_sync_fault)
+{
+	ClusterSpaceRecoveryInput inputs[4];
+	ClusterSpaceColdSourceV1 origins[4];
+	uint8 bytes[4][CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	unsigned prior_writes, prior_syncs;
+
+	compact_lifecycle(inputs, origins, bytes);
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 4, 3, 0));
+	prior_writes = writes;
+	prior_syncs = create_source_syncs;
+	source_sync_fault_thread = origins[3].origin_thread;
+	source_sync_fault = 1;
+	UT_ASSERT(cluster_space_recovery_cold_drop_already_v1(&key, &inputs[3], &origins[3]));
+	UT_ASSERT_EQ(create_source_syncs, prior_syncs);
+	UT_ASSERT_EQ(writes, prior_writes);
+	UT_ASSERT_EQ(cold_truncates, 0);
+	UT_ASSERT_EQ(wal_flushes, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(53);
+	UT_PLAN(58);
+	UT_RUN(test_compact_cold_syncs_complete_chain_before_prefix_or_shrink);
+	UT_RUN(test_compact_cold_sync_refusal_leaves_space_and_data_untouched);
+	UT_RUN(test_compact_cold_sync_before_creating_missing_space);
+	UT_RUN(test_compact_cold_syncs_only_referenced_sources);
+	UT_RUN(test_cold_drop_already_is_read_only_even_with_source_sync_fault);
 	UT_RUN(test_cold_native_create_refuses_lost_data_and_wrong_execution_owner);
 	UT_RUN(test_cold_native_create_failed_sync_or_expiry_keeps_responsibility);
 	UT_RUN(test_cold_native_create_error_unwinds_and_repeats_without_truncation);

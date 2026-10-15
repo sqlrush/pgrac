@@ -754,6 +754,42 @@ cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *pla
 		sources, count, out);
 }
 
+/* The original ROOT owner syncs this retained stream outside target locks.
+ * A pin or a foreign numeric LSN cannot substitute for the complete source. */
+static bool
+space_source_sync(ClusterSpaceRecoveryBatchV1 *batch, uint32 source)
+{
+	const ClusterThreadRecoveryAuthorityV1 *a;
+	ClusterWalTailObservation observed;
+
+	if (source >= batch->source_count || !space_sources_fresh(batch))
+		return false;
+	a = &batch->sources[source];
+	return cluster_control_root_recovery_sync_v1(a->root_snapshot, a->root_token, &observed)
+			   == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		   && space_sources_fresh(batch)
+		   && observed.complete_end == a->root_snapshot->validated_tail_lsn_exclusive
+		   && observed.last_record_start == a->root_snapshot->tail_last_record_lsn
+		   && observed.last_record_crc == a->root_snapshot->tail_last_record_crc32c;
+}
+
+static bool
+space_cold_relation_sync(ClusterSpaceRecoveryBatchV1 *batch)
+{
+	/* The complete chain, not just the requested prefix, can qualify a
+	 * durable successor. Sync every contributing origin once before any
+	 * creation, dirtying or physical shrink; do not flush unrelated origins. */
+	for (uint32 source = 0; source < batch->source_count; source++)
+		for (uint32 i = 0; i < batch->operation_count; i++)
+			if (batch->cold_origins[i].origin_thread
+				== batch->sources[source].duty->origin_thread_id) {
+				if (!space_source_sync(batch, source))
+					return false;
+				break;
+			}
+	return space_sources_fresh(batch);
+}
+
 static bool
 space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRecoveryInput *inputs,
 						const ClusterSpaceColdSourceV1 *origins, uint32 count, uint32 through,
@@ -890,6 +926,8 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 		 * publish a component. Other steps/forks have no physical action. */
 		if (shrink_forks != 0 && !space_target_run(batch, 0, false, through))
 			goto done;
+		if (!space_cold_relation_sync(batch))
+			goto done;
 		/* Install structural SPACE results in order without replaying an
 		 * intermediate shrink against DATA already covered by history. */
 		for (uint32 i = 0; i < through; i++)
@@ -962,17 +1000,9 @@ space_native_create_sources_sync(ClusterSpaceRecoveryBatchV1 *batch)
 			return false;
 		for (uint32 j = 0; j < batch->source_count; j++) {
 			const ClusterThreadRecoveryAuthorityV1 *a = &batch->sources[j];
-			ClusterWalTailObservation observed;
 			if (a->duty->origin_thread_id != op.identity.record.origin_thread)
 				continue;
-			/* Original ROOT owner syncs this exact retained source outside CF
-			 * and target locks; no local numerical-LSN flush can replace it. */
-			if (cluster_control_root_recovery_sync_v1(a->root_snapshot, a->root_token, &observed)
-					!= CLUSTER_CONTROL_ROOT_OK_PRIMARY
-				|| !space_sources_fresh(batch)
-				|| observed.complete_end != a->root_snapshot->validated_tail_lsn_exclusive
-				|| observed.last_record_start != a->root_snapshot->tail_last_record_lsn
-				|| observed.last_record_crc != a->root_snapshot->tail_last_record_crc32c)
+			if (!space_source_sync(batch, j))
 				return false;
 			found = true;
 		}
