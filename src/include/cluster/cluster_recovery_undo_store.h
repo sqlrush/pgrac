@@ -23,6 +23,20 @@ extern ClusterRecoveryGraphResult cluster_recovery_undo_store_begin(ClusterRecov
 																	size_t memory_budget,
 																	ClusterRecoveryUndoStore **out);
 
+/* Optional owned TX graph. Bind before the first inventory step. Its separate
+ * allocation budget does not include the store's own budget. Every physical
+ * slot with an UBA seeds its exact raw TT key, without terminal filtering.
+ * Slots without an UBA remain raw obligations in the complete TT inventory.
+ * The store owns/destroys the graph; do not destroy the borrowed pointer.
+ * Producer/read/recheck failure invalidates both, never a usable prefix. */
+extern ClusterRecoveryGraphResult
+cluster_recovery_undo_store_graph_begin(ClusterRecoveryUndoStore *store, uint64 system_identifier,
+										uint64 database_incarnation, size_t graph_memory_budget);
+/* NULL until full TT enumeration. Add all other page/history/native roots
+ * before the first graph step; this accessor is not full producer coverage. */
+extern ClusterRecoveryReferenceGraph *
+cluster_recovery_undo_store_graph(ClusterRecoveryUndoStore *store);
+
 /* MORE loads one header; RECORD returns one of its 48 raw TT slots. DRAINED
  * completes only this physical TT inventory, never the recovery graph. */
 extern ClusterRecoveryGraphResult cluster_recovery_undo_store_next(ClusterRecoveryUndoStore *store,

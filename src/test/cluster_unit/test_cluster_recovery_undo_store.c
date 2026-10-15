@@ -169,7 +169,7 @@ assert_store_begin_is_bounded(ClusterRecoveryRootSet *roots)
 }
 
 static ClusterRecoveryGraphResult
-inventory(ClusterRecoveryUndoStore *store, ClusterRecoveryReferenceGraph *graph, unsigned *slots)
+inventory(ClusterRecoveryUndoStore *store, unsigned *slots)
 {
 	for (unsigned i = 0; i < 1000; i++) {
 		ClusterRecoveryUndoEntry entry;
@@ -177,18 +177,6 @@ inventory(ClusterRecoveryUndoStore *store, ClusterRecoveryReferenceGraph *graph,
 
 		if (result == CLUSTER_RECOVERY_GRAPH_RECORD) {
 			(*slots)++;
-			if (graph != NULL && !UBA_is_invalid(entry.slot.first_undo_block)) {
-				ClusterRecoveryTxnKey key = store_key();
-
-				key.segment_id = entry.segment_id;
-				key.segment_generation = entry.segment_generation;
-				key.slot_offset = entry.slot_offset;
-				key.slot_wrap = entry.slot.wrap;
-				key.xid = entry.slot.xid;
-				UT_ASSERT_EQ(
-					cluster_recovery_reference_graph_add(graph, &key, entry.slot.first_undo_block),
-					CLUSTER_RECOVERY_GRAPH_MORE);
-			}
 		} else if (result != CLUSTER_RECOVERY_GRAPH_MORE)
 			return result;
 	}
@@ -210,10 +198,14 @@ UT_TEST(test_real_untouched_segment_files_feed_all_slots_and_the_full_transactio
 	cluster_recovery_undo_store_destroy(store);
 	assert_store_begin_is_bounded(roots);
 	store = open_store(roots);
-	UT_ASSERT_EQ(cluster_recovery_reference_graph_begin(
-					 1024 * 1024, cluster_recovery_undo_store_read, store, &graph),
+	UT_ASSERT_EQ(cluster_recovery_undo_store_graph_begin(store, 817, 91, 1024 * 1024),
 				 CLUSTER_RECOVERY_GRAPH_MORE);
-	UT_ASSERT_EQ(inventory(store, graph, &slots), CLUSTER_RECOVERY_GRAPH_DRAINED);
+	UT_ASSERT(cluster_recovery_undo_store_graph(store) == NULL);
+	UT_ASSERT_EQ(inventory(store, &slots), CLUSTER_RECOVERY_GRAPH_DRAINED);
+	graph = cluster_recovery_undo_store_graph(store);
+	UT_ASSERT(graph != NULL);
+	if (graph == NULL)
+		goto done;
 	UT_ASSERT_EQ(slots, 96);
 	UT_ASSERT(cluster_recovery_undo_store_header(store, 257) != NULL);
 	UT_ASSERT_EQ(cluster_recovery_undo_store_header(store, 258)->wrap_count, 7);
@@ -239,7 +231,6 @@ UT_TEST(test_real_untouched_segment_files_feed_all_slots_and_the_full_transactio
 	UT_ASSERT_EQ(cluster_recovery_undo_store_recheck(store), CLUSTER_RECOVERY_GRAPH_MORE);
 	UT_ASSERT_EQ(cluster_recovery_undo_store_recheck(store), CLUSTER_RECOVERY_GRAPH_DRAINED);
 done:
-	cluster_recovery_reference_graph_destroy(graph);
 	cluster_recovery_undo_store_destroy(store);
 	cluster_recovery_root_set_destroy(roots);
 	remove_root(fd);
@@ -257,7 +248,7 @@ UT_TEST(test_missing_segment_or_short_or_failed_read_is_not_an_empty_chain)
 		unsigned slots = 0;
 
 		if (store != NULL) {
-			UT_ASSERT_EQ(inventory(store, NULL, &slots), CLUSTER_RECOVERY_GRAPH_DRAINED);
+			UT_ASSERT_EQ(inventory(store, &slots), CLUSTER_RECOVERY_GRAPH_DRAINED);
 			inject_pread_fault = mode;
 			UT_ASSERT_EQ(
 				cluster_recovery_undo_store_read(
@@ -285,7 +276,7 @@ UT_TEST(test_foreign_database_or_tt_identity_never_selects_a_local_record)
 		unsigned slots = 0;
 
 		if (store != NULL) {
-			UT_ASSERT_EQ(inventory(store, NULL, &slots), CLUSTER_RECOVERY_GRAPH_DRAINED);
+			UT_ASSERT_EQ(inventory(store, &slots), CLUSTER_RECOVERY_GRAPH_DRAINED);
 			if (mode == 0)
 				key.database_incarnation++;
 			else if (mode == 1)
@@ -316,7 +307,7 @@ UT_TEST(test_segment_header_changed_after_the_graph_invalidates_recheck)
 	int file;
 
 	if (store != NULL) {
-		UT_ASSERT_EQ(inventory(store, NULL, &slots), CLUSTER_RECOVERY_GRAPH_DRAINED);
+		UT_ASSERT_EQ(inventory(store, &slots), CLUSTER_RECOVERY_GRAPH_DRAINED);
 		file = openat(fd, "pg_undo/instance_1/seg_257.dat", O_WRONLY);
 		UT_ASSERT_EQ(pwrite(file, &generation, sizeof(generation),
 							offsetof(UndoSegmentHeaderData, wrap_count)),
@@ -350,15 +341,309 @@ UT_TEST(test_budget_and_unobserved_namespace_refuse_before_exporting_slots)
 	remove_root(fd);
 }
 
+static void
+load_store_header(int fd, uint32 segment, UndoSegmentHeaderData *header)
+{
+	char path[96];
+	int file;
+
+	snprintf(path, sizeof(path), "pg_undo/instance_1/seg_%u.dat", segment);
+	file = openat(fd, path, O_RDONLY);
+	UT_ASSERT(file >= 0);
+	UT_ASSERT_EQ(read(file, header, sizeof(*header)), sizeof(*header));
+	close(file);
+}
+
+static void
+replace_store_header(int fd, uint32 segment, const UndoSegmentHeaderData *header)
+{
+	char path[96];
+	int file;
+
+	snprintf(path, sizeof(path), "pg_undo/instance_1/seg_%u.dat", segment);
+	file = openat(fd, path, O_WRONLY);
+	UT_ASSERT(file >= 0);
+	UT_ASSERT_EQ(pwrite(file, header, sizeof(*header), 0), sizeof(*header));
+	close(file);
+}
+
+static ClusterRecoveryGraphResult
+drain_store_graph(ClusterRecoveryReferenceGraph *graph, unsigned *records)
+{
+	for (unsigned i = 0; i < 1000; i++) {
+		ClusterRecoveryGraphRecord record;
+		ClusterRecoveryGraphResult result = cluster_recovery_reference_graph_step(graph, &record);
+
+		if (result == CLUSTER_RECOVERY_GRAPH_RECORD)
+			(*records)++;
+		else if (result != CLUSTER_RECOVERY_GRAPH_MORE)
+			return result;
+	}
+	return CLUSTER_RECOVERY_GRAPH_MORE;
+}
+
+UT_TEST(test_every_raw_tt_status_and_no_uba_obligation_survives_graph_collection)
+{
+	for (unsigned mode = 0; mode < 10; mode++) {
+		int fd = store_files();
+		UndoSegmentHeaderData header;
+		ClusterRecoveryRootSet *roots;
+		ClusterRecoveryUndoStore *store;
+		ClusterRecoveryReferenceGraph *graph;
+		unsigned slots = 0, records = 0;
+		uint8 status = mode % 5;
+
+		load_store_header(fd, 257, &header);
+		header.tt_slots[6].status = status;
+		header.tt_slots[6].flags = mode < 5 ? 0 : TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+		header.tt_slots[6].commit_scn = InvalidScn;
+		header.tt_slots[47].status = status;
+		header.tt_slots[47].wrap = TT_WRAP_INVALID;
+		replace_store_header(fd, 257, &header);
+		roots = store_roots(fd);
+		store = open_store(roots);
+		UT_ASSERT_EQ(cluster_recovery_undo_store_graph_begin(store, 817, 91, 1024 * 1024),
+					 CLUSTER_RECOVERY_GRAPH_MORE);
+		UT_ASSERT_EQ(inventory(store, &slots), CLUSTER_RECOVERY_GRAPH_DRAINED);
+		UT_ASSERT_EQ(slots, 96);
+		UT_ASSERT(cluster_recovery_undo_store_header(store, 257) != NULL);
+		if (cluster_recovery_undo_store_header(store, 257) != NULL)
+			UT_ASSERT(memcmp(cluster_recovery_undo_store_header(store, 257), &header, BLCKSZ) == 0);
+		graph = cluster_recovery_undo_store_graph(store);
+		UT_ASSERT(graph != NULL);
+		UT_ASSERT_EQ(cluster_recovery_reference_graph_count(graph), 1);
+		if (graph != NULL) {
+			UT_ASSERT_EQ(drain_store_graph(graph, &records), CLUSTER_RECOVERY_GRAPH_DRAINED);
+			UT_ASSERT_EQ(records, 2);
+		}
+		cluster_recovery_undo_store_destroy(store);
+		cluster_recovery_root_set_destroy(roots);
+		remove_root(fd);
+	}
+}
+
+UT_TEST(test_partial_inventory_graph_is_never_exposed)
+{
+	int fd = store_files();
+	ClusterRecoveryRootSet *roots = store_roots(fd);
+	ClusterRecoveryUndoStore *store = open_store(roots);
+	ClusterRecoveryGraphResult result = CLUSTER_RECOVERY_GRAPH_INVALID;
+	unsigned slots = 0;
+
+	UT_ASSERT_EQ(cluster_recovery_undo_store_graph_begin(store, 817, 91, 1024 * 1024),
+				 CLUSTER_RECOVERY_GRAPH_MORE);
+	for (unsigned i = 0; i < 1000; i++) {
+		ClusterRecoveryUndoEntry entry;
+
+		UT_ASSERT(cluster_recovery_undo_store_graph(store) == NULL);
+		result = cluster_recovery_undo_store_next(store, &entry);
+		if (result == CLUSTER_RECOVERY_GRAPH_RECORD)
+			slots++;
+		else if (result != CLUSTER_RECOVERY_GRAPH_MORE)
+			break;
+	}
+	UT_ASSERT_EQ(result, CLUSTER_RECOVERY_GRAPH_DRAINED);
+	UT_ASSERT_EQ(slots, 96);
+	UT_ASSERT(cluster_recovery_undo_store_graph(store) != NULL);
+	cluster_recovery_undo_store_destroy(store);
+	cluster_recovery_root_set_destroy(roots);
+	remove_root(fd);
+}
+
+UT_TEST(test_invalid_tt_key_or_address_refuses_the_complete_inventory)
+{
+	for (unsigned mode = 0; mode < 6; mode++) {
+		int fd = store_files();
+		UndoSegmentHeaderData header;
+		ClusterRecoveryRootSet *roots;
+		ClusterRecoveryUndoStore *store;
+		ClusterRecoveryUndoEntry entry;
+		ClusterRecoveryGraphResult result;
+		unsigned slots = 0;
+
+		load_store_header(fd, 257, &header);
+		if (mode == 0)
+			header.tt_slots[6].xid = InvalidTransactionId;
+		else if (mode == 1)
+			header.tt_slots[6].xid = BootstrapTransactionId;
+		else if (mode == 2)
+			header.tt_slots[6].wrap = TT_WRAP_INVALID;
+		else if (mode == 3)
+			header.tt_slots[6].first_undo_block = uba_encode(1, 1, 6, 0);
+		else if (mode == 4)
+			header.tt_slots[6].first_undo_block = uba_encode(258, 1, 7, 0);
+		else
+			header.tt_slots[6].first_undo_block = uba_encode(258, 0, 6, 0);
+		replace_store_header(fd, 257, &header);
+		roots = store_roots(fd);
+		store = open_store(roots);
+		UT_ASSERT_EQ(cluster_recovery_undo_store_graph_begin(store, 817, 91, 1024 * 1024),
+					 CLUSTER_RECOVERY_GRAPH_MORE);
+		result = inventory(store, &slots);
+		UT_ASSERT_EQ(result,
+					 mode < 3 ? CLUSTER_RECOVERY_GRAPH_INVALID : CLUSTER_RECOVERY_GRAPH_IDENTITY);
+		UT_ASSERT_EQ(slots, 6);
+		UT_ASSERT(cluster_recovery_undo_store_graph(store) == NULL);
+		UT_ASSERT(cluster_recovery_undo_store_header(store, 257) == NULL);
+		memset(&entry, 0x77, sizeof(entry));
+		UT_ASSERT_EQ(cluster_recovery_undo_store_next(store, &entry), result);
+		UT_ASSERT_EQ(entry.segment_id, 0);
+		UT_ASSERT(UBA_is_invalid(entry.slot.first_undo_block));
+		cluster_recovery_undo_store_destroy(store);
+		cluster_recovery_root_set_destroy(roots);
+		remove_root(fd);
+	}
+}
+
+UT_TEST(test_graph_binding_is_early_exact_single_use_and_budgeted)
+{
+	for (unsigned mode = 0; mode < 8; mode++) {
+		int fd = store_files();
+		ClusterRecoveryRootSet *roots = store_roots(fd);
+		ClusterRecoveryUndoStore *store = open_store(roots);
+		ClusterRecoveryUndoEntry entry;
+		ClusterRecoveryGraphResult result;
+		unsigned slots = 0;
+
+		if (mode == 0)
+			UT_ASSERT_EQ(cluster_recovery_undo_store_next(store, &entry),
+						 CLUSTER_RECOVERY_GRAPH_MORE);
+		else if (mode == 1)
+			UT_ASSERT_EQ(inventory(store, &slots), CLUSTER_RECOVERY_GRAPH_DRAINED);
+		else if (mode == 2)
+			UT_ASSERT_EQ(cluster_recovery_undo_store_graph_begin(store, 817, 91, 1024 * 1024),
+						 CLUSTER_RECOVERY_GRAPH_MORE);
+		result = cluster_recovery_undo_store_graph_begin(store,
+														 mode == 3	 ? 818
+														 : mode == 4 ? 0
+																	 : 817,
+														 mode == 5	 ? 92
+														 : mode == 6 ? 0
+																	 : 91,
+														 mode == 7 ? 1 : 1024 * 1024);
+		UT_ASSERT_EQ(result, mode < 3	 ? CLUSTER_RECOVERY_GRAPH_INVALID
+							 : mode == 7 ? CLUSTER_RECOVERY_GRAPH_CAPACITY
+										 : CLUSTER_RECOVERY_GRAPH_IDENTITY);
+		UT_ASSERT(cluster_recovery_undo_store_graph(store) == NULL);
+		UT_ASSERT_EQ(cluster_recovery_undo_store_next(store, &entry), result);
+		UT_ASSERT_EQ(entry.segment_id, 0);
+		UT_ASSERT_EQ(cluster_recovery_undo_store_graph_begin(store, 817, 91, 1024 * 1024), result);
+		cluster_recovery_undo_store_destroy(store);
+		cluster_recovery_root_set_destroy(roots);
+		remove_root(fd);
+	}
+}
+
+UT_TEST(test_graph_capacity_after_one_root_does_not_export_a_prefix)
+{
+	int fd = store_files();
+	UndoSegmentHeaderData header;
+	ClusterRecoveryRootSet *roots;
+	ClusterRecoveryUndoStore *store;
+	ClusterRecoveryUndoEntry entry;
+	unsigned slots = 0;
+	size_t budget
+		= sizeof(ClusterRecoveryReferenceGraph) + sizeof(RecoveryRecordNode) + 5 * sizeof(uint32);
+
+	load_store_header(fd, 258, &header);
+	header.tt_slots[6].xid = store_key().xid;
+	header.tt_slots[6].wrap = store_key().slot_wrap;
+	header.tt_slots[6].first_undo_block = uba_encode(258, 1, 6, 0);
+	replace_store_header(fd, 258, &header);
+	roots = store_roots(fd);
+	store = open_store(roots);
+	UT_ASSERT_EQ(cluster_recovery_undo_store_graph_begin(store, 817, 91, budget),
+				 CLUSTER_RECOVERY_GRAPH_MORE);
+	UT_ASSERT_EQ(inventory(store, &slots), CLUSTER_RECOVERY_GRAPH_CAPACITY);
+	UT_ASSERT_EQ(slots, 48 + 6);
+	UT_ASSERT(cluster_recovery_undo_store_graph(store) == NULL);
+	UT_ASSERT_EQ(cluster_recovery_undo_store_next(store, &entry), CLUSTER_RECOVERY_GRAPH_CAPACITY);
+	cluster_recovery_undo_store_destroy(store);
+	cluster_recovery_root_set_destroy(roots);
+	remove_root(fd);
+}
+
+UT_TEST(test_read_and_final_recheck_failures_poison_already_borrowed_graph)
+{
+	for (unsigned mode = 0; mode < 7; mode++) {
+		int fd = store_files();
+		ClusterRecoveryRootSet *roots = store_roots(fd);
+		ClusterRecoveryUndoStore *store = open_store(roots);
+		ClusterRecoveryReferenceGraph *graph;
+		ClusterRecoveryGraphRecord record;
+		ClusterRecoveryGraphResult result;
+		unsigned slots = 0, records = 0;
+
+		UT_ASSERT_EQ(cluster_recovery_undo_store_graph_begin(store, 817, 91, 1024 * 1024),
+					 CLUSTER_RECOVERY_GRAPH_MORE);
+		UT_ASSERT_EQ(inventory(store, &slots), CLUSTER_RECOVERY_GRAPH_DRAINED);
+		graph = cluster_recovery_undo_store_graph(store);
+		UT_ASSERT(graph != NULL);
+		if (graph == NULL)
+			goto done;
+		UT_ASSERT_EQ(drain_store_graph(graph, &records), CLUSTER_RECOVERY_GRAPH_DRAINED);
+		UT_ASSERT_EQ(records, 2);
+		if (mode < 2) {
+			inject_pread_fault = mode + 1;
+			result = cluster_recovery_undo_store_recheck(store);
+			inject_pread_fault = 0;
+			UT_ASSERT_EQ(result, CLUSTER_RECOVERY_GRAPH_IO);
+		} else if (mode == 2) {
+			UndoSegmentHeaderData header;
+
+			load_store_header(fd, 257, &header);
+			header.tt_slots[47].xid++;
+			replace_store_header(fd, 257, &header);
+			UT_ASSERT_EQ(cluster_recovery_undo_store_recheck(store),
+						 CLUSTER_RECOVERY_GRAPH_CHANGED);
+		} else if (mode == 3) {
+			cluster_recovery_root_set_invalidate(roots);
+			UT_ASSERT(cluster_recovery_undo_store_graph(store) == NULL);
+		} else if (mode == 4) {
+			UT_ASSERT_EQ(unlinkat(fd, "pg_undo/instance_1/seg_257.dat", 0), 0);
+			UT_ASSERT_EQ(cluster_recovery_undo_store_recheck(store),
+						 CLUSTER_RECOVERY_GRAPH_CHANGED);
+		} else if (mode == 5) {
+			UT_ASSERT_EQ(cluster_recovery_undo_store_next(store, NULL),
+						 CLUSTER_RECOVERY_GRAPH_INVALID);
+		} else {
+			ClusterRecoveryUndoRecord undo;
+			ClusterRecoveryTxnKey key = store_key();
+			uint32 generation;
+
+			UT_ASSERT_EQ(cluster_recovery_undo_store_read(store, &key, uba_encode(259, 1, 6, 0),
+														  &undo, &generation),
+						 CLUSTER_RECOVERY_GRAPH_IO);
+		}
+		UT_ASSERT(cluster_recovery_undo_store_graph(store) == NULL);
+		memset(&record, 0x77, sizeof(record));
+		UT_ASSERT(cluster_recovery_reference_graph_step(graph, &record)
+				  >= CLUSTER_RECOVERY_GRAPH_INVALID);
+		UT_ASSERT(record.record == NULL);
+		UT_ASSERT(cluster_recovery_undo_store_recheck(store) >= CLUSTER_RECOVERY_GRAPH_INVALID);
+		UT_ASSERT(cluster_recovery_undo_store_header(store, 257) == NULL);
+	done:
+		cluster_recovery_undo_store_destroy(store);
+		cluster_recovery_root_set_destroy(roots);
+		remove_root(fd);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(11);
 	UT_RUN(test_real_untouched_segment_files_feed_all_slots_and_the_full_transaction_chain);
 	UT_RUN(test_missing_segment_or_short_or_failed_read_is_not_an_empty_chain);
 	UT_RUN(test_foreign_database_or_tt_identity_never_selects_a_local_record);
 	UT_RUN(test_segment_header_changed_after_the_graph_invalidates_recheck);
 	UT_RUN(test_budget_and_unobserved_namespace_refuse_before_exporting_slots);
+	UT_RUN(test_every_raw_tt_status_and_no_uba_obligation_survives_graph_collection);
+	UT_RUN(test_partial_inventory_graph_is_never_exposed);
+	UT_RUN(test_invalid_tt_key_or_address_refuses_the_complete_inventory);
+	UT_RUN(test_graph_binding_is_early_exact_single_use_and_budgeted);
+	UT_RUN(test_graph_capacity_after_one_root_does_not_export_a_prefix);
+	UT_RUN(test_read_and_final_recheck_failures_poison_already_borrowed_graph);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

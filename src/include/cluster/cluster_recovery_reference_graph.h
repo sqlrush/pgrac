@@ -87,6 +87,9 @@ extern ClusterRecoveryGraphResult
 cluster_recovery_reference_graph_step(ClusterRecoveryReferenceGraph *graph,
 									  ClusterRecoveryGraphRecord *out);
 extern uint32 cluster_recovery_reference_graph_count(const ClusterRecoveryReferenceGraph *graph);
+/* A producer's later observation failed. Revoke even a drained TX forest;
+ * this never reopens it for new roots or turns an earlier refusal into MORE. */
+extern void cluster_recovery_reference_graph_invalidate(ClusterRecoveryReferenceGraph *graph);
 extern void cluster_recovery_reference_graph_destroy(ClusterRecoveryReferenceGraph *graph);
 
 #endif

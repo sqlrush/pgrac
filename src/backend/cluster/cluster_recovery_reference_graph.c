@@ -378,6 +378,13 @@ cluster_recovery_reference_graph_count(const ClusterRecoveryReferenceGraph *grap
 }
 
 void
+cluster_recovery_reference_graph_invalidate(ClusterRecoveryReferenceGraph *graph)
+{
+	if (graph != NULL && graph->status <= CLUSTER_RECOVERY_GRAPH_DRAINED)
+		graph->status = CLUSTER_RECOVERY_GRAPH_INVALID;
+}
+
+void
 cluster_recovery_reference_graph_destroy(ClusterRecoveryReferenceGraph *graph)
 {
 	if (graph != NULL) {

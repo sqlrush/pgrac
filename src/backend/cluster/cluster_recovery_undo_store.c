@@ -21,11 +21,13 @@ typedef struct RecoveryUndoFile {
 
 struct ClusterRecoveryUndoStore {
 	ClusterRecoveryRootSet *roots;
+	ClusterRecoveryReferenceGraph *graph;
+	uint64 system_identifier, database_incarnation;
 	RecoveryUndoFile *files;
 	uint32 by_segment[UNDO_STORE_SEGMENTS + 1]; /* file index + 1 */
 	uint32 count, current, rechecked;
 	uint32 root_cursor, fill_cursor, files_filled;
-	bool indexed, files_ready;
+	bool indexed, files_ready, started;
 	size_t memory_budget;
 	uint16 slot;
 	ClusterRecoveryGraphResult status;
@@ -35,8 +37,10 @@ struct ClusterRecoveryUndoStore {
 static ClusterRecoveryGraphResult
 undo_store_fail(ClusterRecoveryUndoStore *store, ClusterRecoveryGraphResult result)
 {
-	if (store != NULL)
+	if (store != NULL) {
 		store->status = result;
+		cluster_recovery_reference_graph_invalidate(store->graph);
+	}
 	return result;
 }
 
@@ -80,6 +84,47 @@ cluster_recovery_undo_store_begin(ClusterRecoveryRootSet *roots, size_t memory_b
 }
 
 ClusterRecoveryGraphResult
+cluster_recovery_undo_store_graph_begin(ClusterRecoveryUndoStore *store, uint64 system_identifier,
+										uint64 database_incarnation, size_t graph_memory_budget)
+{
+	ClusterRecoveryGraphResult result;
+	uint8 digest[32];
+
+	if (store == NULL)
+		return CLUSTER_RECOVERY_GRAPH_INVALID;
+	if (store->status > CLUSTER_RECOVERY_GRAPH_DRAINED)
+		return store->status;
+	if (store->started || store->graph != NULL)
+		return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_INVALID);
+	if (!cluster_recovery_root_set_digest(store->roots, digest))
+		return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_CHANGED);
+	if (!cluster_recovery_root_set_namespace_matches(store->roots, system_identifier,
+													 database_incarnation))
+		return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_IDENTITY);
+	result = cluster_recovery_reference_graph_begin(
+		graph_memory_budget, cluster_recovery_undo_store_read, store, &store->graph);
+	if (result != CLUSTER_RECOVERY_GRAPH_MORE)
+		return undo_store_fail(store, result);
+	store->system_identifier = system_identifier;
+	store->database_incarnation = database_incarnation;
+	return CLUSTER_RECOVERY_GRAPH_MORE;
+}
+
+ClusterRecoveryReferenceGraph *
+cluster_recovery_undo_store_graph(ClusterRecoveryUndoStore *store)
+{
+	uint8 digest[32];
+
+	if (store == NULL || store->status != CLUSTER_RECOVERY_GRAPH_DRAINED)
+		return NULL;
+	if (!cluster_recovery_root_set_digest(store->roots, digest)) {
+		undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_CHANGED);
+		return NULL;
+	}
+	return store->graph;
+}
+
+ClusterRecoveryGraphResult
 cluster_recovery_undo_store_next(ClusterRecoveryUndoStore *store, ClusterRecoveryUndoEntry *out)
 {
 	RecoveryUndoFile *file;
@@ -91,6 +136,7 @@ cluster_recovery_undo_store_next(ClusterRecoveryUndoStore *store, ClusterRecover
 		return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_INVALID);
 	if (store->status > CLUSTER_RECOVERY_GRAPH_DRAINED)
 		return store->status;
+	store->started = true;
 	if (!cluster_recovery_root_set_digest(store->roots, digest))
 		return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_CHANGED);
 	if (!store->indexed) {
@@ -181,6 +227,29 @@ cluster_recovery_undo_store_next(ClusterRecoveryUndoStore *store, ClusterRecover
 		cluster_recovery_undo_scan_destroy(scan);
 		file->loaded = true;
 		return CLUSTER_RECOVERY_GRAPH_MORE;
+	}
+	if (store->graph != NULL) {
+		const TTSlot *slot = &file->header.tt_slots[store->slot];
+
+		/* The legacy first_undo_block field is the transaction-chain head.
+		 * Status/SCN/CTRC flags do not establish that any dependency vanished. */
+		if (!UBA_is_invalid(slot->first_undo_block)) {
+			ClusterRecoveryTxnKey key = { 0 };
+			ClusterRecoveryGraphResult added;
+
+			key.system_identifier = store->system_identifier;
+			key.database_incarnation = store->database_incarnation;
+			key.segment_id = file->header.segment_id;
+			key.segment_generation = file->header.wrap_count;
+			key.origin_node_id = file->header.owner_instance - 1;
+			key.slot_offset = store->slot;
+			key.slot_wrap = slot->wrap;
+			key.xid = slot->xid;
+			added
+				= cluster_recovery_reference_graph_add(store->graph, &key, slot->first_undo_block);
+			if (added != CLUSTER_RECOVERY_GRAPH_MORE)
+				return undo_store_fail(store, added);
+		}
 	}
 	out->segment_id = file->header.segment_id;
 	out->segment_generation = file->header.wrap_count;
@@ -291,6 +360,7 @@ void
 cluster_recovery_undo_store_destroy(ClusterRecoveryUndoStore *store)
 {
 	if (store != NULL) {
+		cluster_recovery_reference_graph_destroy(store->graph);
 		free(store->files);
 		free(store);
 	}
