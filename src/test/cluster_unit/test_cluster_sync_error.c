@@ -379,11 +379,21 @@ sync_filetag(void)
 	char path[MAXPGPATH];
 	int result;
 
+	/* Queued sync runs outside the buffer owner used by flush() above. */
+	locks[0] = locks[1] = false;
+	pins[0] = pins[1] = 0;
 	cluster_smgr_init_filetag(&tag, relation.smgr_rlocator.locator, MAIN_FORKNUM);
 	result = cluster_smgr_syncfiletag(&tag, path);
 	if (result == 0)
 		observed->completed++;
 	return result;
+}
+
+bool
+cluster_ko_directory_drop_committed_v3(RelFileLocator locator pg_attribute_unused())
+{
+	/* Exact runtime DROP identity is exercised in test_cluster_ko_sync_io. */
+	return false;
 }
 
 UT_TEST(sync_filetag_refuses_fenced_node_before_filesystem)

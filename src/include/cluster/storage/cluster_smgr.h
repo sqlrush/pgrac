@@ -154,6 +154,9 @@ extern void cluster_smgr_truncate(SMgrRelation reln, ForkNumber forknum, BlockNu
 extern void cluster_smgr_immedsync(SMgrRelation reln, ForkNumber forknum);
 
 /* spec-6.0a: sync.c handler for cluster shared-storage relation tags. */
+/* Local callback result: cancel the old FileTag, without counting an fsync.
+ * Only ProcessSyncRequests consumes this; it carries no durability proof. */
+#define CLUSTER_SMGR_SYNC_OBJECT_RETIRED 1
 extern int cluster_smgr_syncfiletag(const FileTag *ftag, char *path);
 extern int cluster_smgr_unlinkfiletag(const FileTag *ftag, char *path);
 extern bool cluster_smgr_filetagmatches(const FileTag *ftag, const FileTag *candidate);

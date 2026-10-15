@@ -436,10 +436,22 @@ ProcessSyncRequests(void)
 			for (failures = 0; !entry->canceled; failures++)
 			{
 				char		path[MAXPGPATH];
+				int			sync_result;
 
 				INSTR_TIME_SET_CURRENT(sync_start);
-				if (syncsw[entry->tag.handler].sync_syncfiletag(&entry->tag,
-																path) == 0)
+				sync_result = syncsw[entry->tag.handler].sync_syncfiletag(&entry->tag, path);
+#ifdef USE_PGRAC_CLUSTER
+				if (entry->tag.handler == SYNC_HANDLER_CLUSTER_SHARED &&
+					sync_result == CLUSTER_SMGR_SYNC_OBJECT_RETIRED)
+				{
+					/* The authenticated DROP identity terminates this old
+					 * FileTag only. Use the original cancellation tail; no
+					 * successful fsync timing, count or DATA receipt. */
+					entry->canceled = true;
+					break;
+				}
+#endif
+				if (sync_result == 0)
 				{
 					/* Success; update statistics about sync timing */
 					INSTR_TIME_SET_CURRENT(sync_end);

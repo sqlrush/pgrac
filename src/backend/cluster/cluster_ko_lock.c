@@ -933,6 +933,44 @@ ko_drop_closed_locked(RelFileLocator locator)
 	return false;
 }
 
+bool
+cluster_ko_directory_drop_committed_v3(RelFileLocator locator)
+{
+	bool committed = false;
+	uint32 link;
+
+	if (!cluster_enabled || !cluster_shared_config || cluster_interconnect_tier != CLUSTER_IC_TIER_1
+		|| ko_state == NULL || locator.spcOid == 0 || locator.relNumber == 0
+		|| RecoveryInProgress())
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	link = ko_state->drop_buckets[ko_drop_bucket(locator)];
+	for (unsigned n = 0; link != 0; n++) {
+		const KoDropIdentity *identity;
+
+		/* Unlike the refusal predicate, unknown/corrupt state is never
+		 * positive evidence that the original queued work may be canceled. */
+		if (link > KO_DROP_IDENTITY_CAPACITY || n >= KO_DROP_IDENTITY_CAPACITY) {
+			committed = false;
+			break;
+		}
+		identity = &ko_state->drop_identities[link - 1];
+		if (identity->state < KO_DROP_IDENTITY_RESERVED
+			|| identity->state > KO_DROP_IDENTITY_RETIRED
+			|| identity->fence_serial == 0
+			|| identity->request.operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP) {
+			committed = false;
+			break;
+		}
+		if (identity->state >= KO_DROP_IDENTITY_CLOSING
+			&& RelFileLocatorEquals(identity->request.base.key.locator, locator))
+			committed = true;
+		link = identity->next;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	return committed;
+}
+
 /* The original SI executor reserves before any physical work. COMMIT never
  * allocates; exhaustion keeps the original negative operation owner. */
 static bool

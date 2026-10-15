@@ -178,6 +178,9 @@ typedef struct ClusterKoDirectoryIoV3 {
 } ClusterKoDirectoryIoV3;
 extern bool cluster_ko_directory_io_begin_v3(RelFileLocator locator, ClusterKoDirectoryIoV3 *out);
 extern bool cluster_ko_directory_io_end_v3(const ClusterKoDirectoryIoV3 *call);
+/* Positive runtime COMMIT evidence, only for canceling old-locator work.
+ * Not a DATA receipt, READY, completed marker, or recovery authorization. */
+extern bool cluster_ko_directory_drop_committed_v3(RelFileLocator locator);
 
 /* A local admission sample for one locator, not an AX or completion proof.
  * Sample outside mapping/header/PCM locks. Revalidate under the original

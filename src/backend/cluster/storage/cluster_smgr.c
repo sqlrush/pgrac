@@ -934,6 +934,8 @@ int
 cluster_smgr_syncfiletag(const FileTag *ftag, char *path)
 {
 	ClusterSharedFsHandle *handle = NULL;
+	ClusterKoDirectoryIoV3 io;
+	volatile int result = -1;
 
 	/* Checkpointer consumes queued syncs here without entering immedsync.
 	 * Recheck its original write authority before any filesystem access;
@@ -944,15 +946,35 @@ cluster_smgr_syncfiletag(const FileTag *ftag, char *path)
 	snprintf(path, MAXPGPATH, "cluster_shared:%u/%u/%u fork %d", ftag->rlocator.spcOid,
 			 ftag->rlocator.dbOid, ftag->rlocator.relNumber, ftag->forknum);
 
-	if (!cluster_shared_fs_exists(ftag->rlocator, ftag->forknum)) {
-		errno = ENOENT;
+	if (!cluster_ko_directory_io_begin_v3(ftag->rlocator, &io)) {
+		/* COMMIT is monotone and survives active fence GC. CLOSING may
+		 * cancel a new queued sync, but cannot release an entered call or
+		 * acknowledge the marker. Unknown refusal retains the original debt. */
+		if (cluster_ko_directory_drop_committed_v3(ftag->rlocator))
+			return CLUSTER_SMGR_SYNC_OBJECT_RETIRED;
+		errno = EAGAIN;
 		return -1;
 	}
 
-	cluster_shared_fs_open_existing(ftag->rlocator, ftag->forknum, &handle);
-	cluster_shared_fs_barrier_sync(handle);
-	cluster_shared_fs_close(handle);
-	return 0;
+	PG_TRY();
+	{
+		if (cluster_shared_fs_exists(ftag->rlocator, ftag->forknum)) {
+			cluster_shared_fs_open_existing(ftag->rlocator, ftag->forknum, &handle);
+			cluster_shared_fs_barrier_sync(handle);
+			cluster_shared_fs_close(handle);
+			result = 0;
+		}
+	}
+	PG_FINALLY();
+	{
+		/* Original provider ERROR still propagates to the native sync owner;
+		 * releasing this call does not complete or remove its pendingOps. */
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
+	if (result < 0)
+		errno = ENOENT;
+	return result;
 }
 
 int
