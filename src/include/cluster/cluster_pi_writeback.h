@@ -201,6 +201,13 @@ extern bool cluster_pi_writeback_structure_offer_ack_v2(const ClusterPiWriteback
 extern ClusterControlRootResult cluster_pi_writeback_poll_v1(ClusterPiWritebackJobV1 *job);
 extern void cluster_pi_writeback_release_v1(ClusterPiWritebackJobV1 **job);
 
+/* Local physical/ACK-owner projection only, never a master completion proof.
+ * Sample outside KO/PCM locks; the final READY owner checks only the atomic
+ * revision. An unaccepted reply or an in-flight physical notice is not closed. */
+extern bool cluster_pi_writeback_local_relation_closed_v3(RelFileLocator locator, uint64 formation,
+														  uint64 *revision);
+extern bool cluster_pi_writeback_local_revision_current_v3(uint64 revision);
+
 extern void cluster_pi_writeback_ingress_v1(const ClusterICEnvelope *env, const void *payload);
 extern void cluster_pi_writeback_lmon_tick_v1(void);
 extern bool cluster_pi_writeback_bgwriter_tick_v1(void);

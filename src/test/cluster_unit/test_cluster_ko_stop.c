@@ -248,6 +248,8 @@ static uint64 relation_gate_freeze;
 static bool relation_gate_ok;
 static ClusterPcmPiRelationScanV2 local_relation_scan_result;
 static uint32 local_relation_scan_calls, local_relation_scan_advance;
+static bool local_writeback_closed;
+static uint64 local_writeback_revision;
 static uint32 local_relation_scan_input;
 static unsigned local_relation_scan_drift;
 bool
@@ -298,6 +300,22 @@ cluster_pcm_lock_ko_local_relation_scan_v3(RelFileLocator locator, uint64 epoch,
 	if (local_relation_scan_drift == 4)
 		pg_re_throw();
 	return local_relation_scan_result;
+}
+
+bool
+cluster_pi_writeback_local_relation_closed_v3(RelFileLocator locator, uint64 formation,
+											  uint64 *revision)
+{
+	UT_ASSERT_EQ(locator.relNumber, 99);
+	UT_ASSERT_EQ(formation, current_epoch);
+	*revision = local_writeback_closed ? local_writeback_revision : 0;
+	return local_writeback_closed;
+}
+
+bool
+cluster_pi_writeback_local_revision_current_v3(uint64 revision)
+{
+	return revision != 0 && revision != UINT64_MAX && revision == local_writeback_revision;
 }
 
 static void (*exit_callback)(int, Datum);
@@ -1139,6 +1157,8 @@ reset_test(void)
 	relation_scan_calls = relation_scan_advance = 0;
 	relation_scan_epoch_drift = relation_scan_slot_drift = relation_scan_freeze_drift = false;
 	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_EMPTY;
+	local_writeback_closed = true;
+	local_writeback_revision = 1;
 	local_relation_scan_calls = local_relation_scan_advance = 0;
 	local_relation_scan_input = local_relation_scan_drift = 0;
 	relation_gate_freeze = 3;
@@ -6045,6 +6065,39 @@ UT_TEST(test_v3_blocked_head_does_not_starve_completed_fence_continuation)
 	UT_ASSERT_EQ(storage.send_v3_count, 1);
 }
 
+
+UT_TEST(test_v3_ready_waits_for_actual_physical_ack_handoff)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(941);
+	local_writeback_closed = false;
+	enqueue_shared_v3(&request);
+	fixture_peer_drain();
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_ACTIVE);
+	UT_ASSERT_EQ(storage.send_v3_count, 0);
+	UT_ASSERT(!storage.peer_fences[0].local_scan_complete);
+	local_writeback_closed = true;
+	fixture_peer_drain();
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
+	UT_ASSERT_EQ(storage.send_v3_count, 1);
+}
+
+UT_TEST(test_v3_ready_rechecks_physical_notice_arrival_after_sample)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(942);
+	ClusterKoPeerFenceHandleV3 handle;
+	ClusterKoPeerFenceStateV3 state;
+	ClusterKoPeerFenceV3 before;
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+	UT_ASSERT(ko_peer_fence_mark_physical_started_v3(&request, NULL));
+	UT_ASSERT(ko_peer_fence_mark_physical_applied_v3(&request));
+	before = storage.peer_fences[handle.slot];
+	UT_ASSERT(ko_peer_fence_local_scan_v3(&before, &handle));
+	local_writeback_revision++;
+	UT_ASSERT(!cluster_ko_peer_fence_ready_v3(&request, &handle));
+	UT_ASSERT_EQ(storage.peer_fences[handle.slot].state, CLUSTER_KO_PEER_FENCE_ACTIVE);
+	UT_ASSERT_EQ(storage.send_v3_count, 0);
+}
+
 UT_TEST(test_v3_ready_scan_restarts_prefix_after_gate_or_admission_change)
 {
 	for (unsigned drift = 0; drift < 2; drift++) {
@@ -7726,7 +7779,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(184);
+	UT_PLAN(186);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
 	UT_RUN(test_peer_space_entry_checks_precede_io);
@@ -7857,6 +7910,8 @@ main(void)
 	UT_RUN(test_v3_local_protocol_pending_requires_another_physical_pass);
 	UT_RUN(test_v3_fence_registers_before_apply_and_delays_ack_until_local_ready);
 	UT_RUN(test_v3_blocked_head_does_not_starve_completed_fence_continuation);
+	UT_RUN(test_v3_ready_waits_for_actual_physical_ack_handoff);
+	UT_RUN(test_v3_ready_rechecks_physical_notice_arrival_after_sample);
 	UT_RUN(test_v3_ready_scan_restarts_prefix_after_gate_or_admission_change);
 	UT_RUN(test_v3_ready_scan_discards_result_on_mid_scan_drift);
 	UT_RUN(test_v3_ready_scan_invalid_attempt_discards_partial_prefix);

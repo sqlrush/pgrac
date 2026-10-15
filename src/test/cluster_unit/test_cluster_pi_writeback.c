@@ -26,6 +26,7 @@ extern void *ShmemInitStruct(const char *name, Size size, bool *found);
 #include "utils/timestamp.h"
 
 int MyProcPid = 100;
+int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 PGPROC *MyProc;
 PROC_HDR *ProcGlobal;
 static uint64 wb_epoch = 1, wb_nonce;
@@ -175,6 +176,8 @@ static int32 wb_destination;
 static TimestampTz wb_now = 1000000;
 static ResourceReleaseCallback wb_release_callback;
 static ClusterICSendResult wb_send_result = CLUSTER_IC_SEND_DONE;
+static void (*wb_send_boundary)(void);
+static bool wb_error_after_physical;
 static bool wb_candidates;
 static uint32 wb_scan_limit, wb_candidate_slot, wb_scan_calls;
 static unsigned wb_master_completions;
@@ -527,6 +530,8 @@ cluster_ic_send_envelope(uint8 type, int32 destination, const void *payload, uin
 	wb_length = length;
 	wb_destination = destination;
 	wb_sends++;
+	if (wb_send_boundary != NULL)
+		wb_send_boundary();
 	return wb_send_result;
 }
 ClusterControlRootResult
@@ -550,6 +555,10 @@ cluster_wal_inputs_at_v1(ClusterWalInputsV1 *inputs, uint32 index)
 ClusterControlRootResult
 cluster_wal_inputs_revalidate_v1(ClusterWalInputsV1 *inputs)
 {
+	if (wb_error_after_physical && pi_discards != 0) {
+		wb_error_after_physical = false;
+		pg_re_throw();
+	}
 	return wb_input_current && wb_inputs_pinned[cluster_node_id] ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
 																 : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 }
@@ -1009,6 +1018,9 @@ wb_setup(void)
 	wb_plan_failure_wait = false;
 	rebuild_plan_failure = RF_PAGE_PROOF_DETAIL_OK;
 	wb_send_result = CLUSTER_IC_SEND_DONE;
+	wb_send_boundary = NULL;
+	wb_error_after_physical = false;
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 	wb_plan_builds = wb_input_releases = wb_sends = 0;
 	memset(wb_log_calls, 0, sizeof(wb_log_calls));
 	memset(wb_inputs_pinned, 0, sizeof(wb_inputs_pinned));
@@ -2258,11 +2270,332 @@ UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
 
 #include "test_cluster_pi_writeback_v2.inc"
 
+static void
+wb_ack_still_owned_at_transport(void)
+{
+	UT_ASSERT_EQ(wb_shared->inbound_state, WB_REPLIED);
+	UT_ASSERT(wb_shared->reply_pending);
+}
+
+UT_TEST(writeback_ack_stays_owned_until_transport_returns)
+{
+	for (unsigned version = 1; version <= 2; version++) {
+		ClusterPageDataReceiptV1 *data = wb_setup();
+		ClusterPiWritebackJobV1 *job;
+		if (version == 2)
+			wb_local_caps = wb_peer_caps = PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+		job = wb_start(data);
+		physical_pi_from_source(&wb_sources[1], 19);
+		wb_deliver(0, 1, wb_wire, wb_length);
+		wb_select(1, B_BG_WRITER);
+		UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+		UT_ASSERT_EQ(pi_discards, 1);
+		wb_select(1, B_LMON);
+		wb_send_boundary = wb_ack_still_owned_at_transport;
+		wb_send_result = CLUSTER_IC_SEND_WOULD_BLOCK;
+		cluster_pi_writeback_lmon_tick_v1();
+		UT_ASSERT(!wb_shared->reply_pending);
+		wb_send_boundary = NULL;
+		wb_select(0, B_CHECKPOINTER);
+		cluster_pi_writeback_release_v1(&job);
+		cluster_page_data_receipt_free_v1(&data);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
+UT_TEST(writeback_new_notice_cannot_replace_unaccepted_physical_reply)
+{
+	for (unsigned version = 1; version <= 2; version++) {
+		ClusterPageDataReceiptV1 *data = wb_setup();
+		ClusterPiWritebackJobV1 *job;
+		uint8 bytes[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2];
+		Size length;
+		uint64 revision;
+		if (version == 2)
+			wb_local_caps = wb_peer_caps = PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+		job = wb_start(data);
+		physical_pi_from_source(&wb_sources[1], 19);
+		wb_deliver(0, 1, wb_wire, wb_length);
+		wb_select(1, B_BG_WRITER);
+		UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+		revision = wb_shared->inbound_revision;
+		if (version == 2) {
+			ClusterPiWritebackMessageV2 next = wb_shared->inbound_v2;
+			next.nonce++;
+			UT_ASSERT(cluster_pi_writeback_encode_v2(&next, bytes, sizeof(bytes), &length));
+		} else {
+			ClusterPiWritebackMessageV1 next = wb_shared->inbound;
+			next.nonce++;
+			UT_ASSERT(cluster_pi_writeback_encode_v1(&next, bytes, sizeof(bytes), &length));
+		}
+		wb_deliver(0, 1, bytes, length);
+		UT_ASSERT_EQ(wb_shared->inbound_revision, revision);
+		UT_ASSERT_EQ(wb_shared->inbound_state, WB_REPLIED);
+		UT_ASSERT(wb_shared->reply_pending);
+		cluster_pi_writeback_lmon_tick_v1();
+		UT_ASSERT(!wb_shared->reply_pending);
+		wb_deliver(0, 1, bytes, length);
+		UT_ASSERT_EQ(wb_shared->inbound_revision, revision + 1);
+		UT_ASSERT_EQ(wb_shared->inbound_state, WB_QUEUED);
+		wb_select(1, B_BG_WRITER);
+		UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+		wb_select(0, B_CHECKPOINTER);
+		cluster_pi_writeback_release_v1(&job);
+		cluster_page_data_receipt_free_v1(&data);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
+UT_TEST(writeback_error_after_physical_keeps_original_retry_owner)
+{
+	ClusterPageDataReceiptV1 *data = wb_setup();
+	ClusterPiWritebackJobV1 *job = wb_start(data);
+	volatile bool caught = false;
+	uint64 revision;
+	physical_pi_from_source(&wb_sources[1], 19);
+	wb_deliver(0, 1, wb_wire, wb_length);
+	revision = wb_shared->inbound_revision;
+	wb_select(1, B_BG_WRITER);
+	wb_error_after_physical = true;
+	PG_TRY();
+	{
+		(void)cluster_pi_writeback_bgwriter_tick_v1();
+	}
+	PG_CATCH();
+	{
+		caught = true;
+		wb_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		/* Original ROOT/WALR ResourceOwner callbacks release their own pins. */
+		wb_inputs_pinned[1] = false;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(pi_discards, 1);
+	UT_ASSERT(wb_notice == NULL);
+	UT_ASSERT_EQ(wb_shared->inbound_revision, revision);
+	UT_ASSERT_EQ(wb_shared->inbound_state, WB_QUEUED);
+	UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+	UT_ASSERT_EQ(wb_shared->inbound_state, WB_REPLIED);
+	UT_ASSERT(wb_shared->reply_pending);
+	UT_ASSERT_EQ(pi_discards, 1);
+	wb_select(1, B_LMON);
+	cluster_pi_writeback_lmon_tick_v1();
+	UT_ASSERT(!wb_shared->reply_pending);
+	wb_select(0, B_CHECKPOINTER);
+	cluster_pi_writeback_release_v1(&job);
+	cluster_page_data_receipt_free_v1(&data);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+UT_TEST(writeback_local_closure_tracks_exact_original_notice_and_reply)
+{
+	for (unsigned version = 1; version <= 2; version++) {
+		ClusterPageDataReceiptV1 *data = wb_setup();
+		ClusterPiWritebackJobV1 *job;
+		RelFileLocator locator = target.identity.locator, unrelated = locator;
+		uint64 before = 0, after = 0;
+		uint8 original[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2];
+		uint32 length;
+		unrelated.relNumber++;
+		if (version == 2)
+			wb_local_caps = wb_peer_caps = PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+		job = wb_start(data);
+		/* The master's collector is directory work, not a local installer. */
+		UT_ASSERT(cluster_pi_writeback_local_relation_closed_v3(locator, 1, &before));
+		UT_ASSERT(before != 0);
+		length = wb_length;
+		memcpy(original, wb_wire, length);
+		wb_select(1, B_BG_WRITER);
+		UT_ASSERT(cluster_pi_writeback_local_relation_closed_v3(locator, 1, &before));
+		physical_pi_from_source(&wb_sources[1], 19);
+		wb_deliver(0, 1, original, length);
+		UT_ASSERT(!cluster_pi_writeback_local_revision_current_v3(before));
+		UT_ASSERT(!cluster_pi_writeback_local_relation_closed_v3(locator, 1, &after));
+		UT_ASSERT_EQ(after, 0);
+		UT_ASSERT(cluster_pi_writeback_local_relation_closed_v3(unrelated, 1, &after));
+		wb_select(1, B_BG_WRITER);
+		wb_input_wait = true;
+		UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+		UT_ASSERT(!cluster_pi_writeback_local_relation_closed_v3(locator, 1, &after));
+		wb_input_wait = false;
+		UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+		UT_ASSERT_EQ(pi_discards, 1);
+		UT_ASSERT(!cluster_pi_writeback_local_relation_closed_v3(locator, 1, &after));
+		wb_select(1, B_LMON);
+		cluster_pi_writeback_lmon_tick_v1();
+		UT_ASSERT(cluster_pi_writeback_local_relation_closed_v3(locator, 1, &after));
+		UT_ASSERT(cluster_pi_writeback_local_revision_current_v3(after));
+		UT_ASSERT_EQ(wb_master_completions, 0);
+		wb_deliver(0, 1, original, length);
+		UT_ASSERT(!cluster_pi_writeback_local_revision_current_v3(after));
+		UT_ASSERT(!cluster_pi_writeback_local_relation_closed_v3(locator, 1, &after));
+		/* Duplicate ACKs keep the original retry cadence. */
+		wb_now += WB_RETRY_US;
+		cluster_pi_writeback_lmon_tick_v1();
+		UT_ASSERT(cluster_pi_writeback_local_relation_closed_v3(locator, 1, &after));
+		UT_ASSERT_EQ(pi_discards, 1);
+		wb_select(0, B_CHECKPOINTER);
+		cluster_pi_writeback_release_v1(&job);
+		cluster_page_data_receipt_free_v1(&data);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
+static void
+wb_ack_transport_error(void)
+{
+	uint64 revision = 123;
+	UT_ASSERT(
+		!cluster_pi_writeback_local_relation_closed_v3(target.identity.locator, 1, &revision));
+	UT_ASSERT_EQ(revision, 0);
+	pg_re_throw();
+}
+
+UT_TEST(writeback_unknown_send_and_stop_never_close_local_ack)
+{
+	ClusterPageDataReceiptV1 *data = wb_setup();
+	ClusterPiWritebackJobV1 *job = wb_start(data);
+	volatile bool caught = false;
+	const char *reason = NULL;
+	uint64 revision;
+	physical_pi_from_source(&wb_sources[1], 19);
+	wb_deliver(0, 1, wb_wire, wb_length);
+	wb_select(1, B_BG_WRITER);
+	UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+	wb_select(1, B_LMON);
+	wb_send_boundary = wb_ack_transport_error;
+	PG_TRY();
+	{
+		cluster_pi_writeback_lmon_tick_v1();
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT(wb_shared->reply_pending);
+	wb_send_boundary = NULL;
+	wb_send_result = CLUSTER_IC_SEND_HARD_ERROR;
+	wb_now += WB_RETRY_US;
+	cluster_pi_writeback_lmon_tick_v1();
+	UT_ASSERT(
+		!cluster_pi_writeback_local_relation_closed_v3(target.identity.locator, 1, &revision));
+	wb_stop = true;
+	cluster_pi_writeback_lmon_tick_v1();
+	UT_ASSERT_EQ(cluster_pi_writeback_normal_stop_poll_v1(&reason), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(wb_shared->reply_pending);
+	UT_ASSERT(
+		!cluster_pi_writeback_local_relation_closed_v3(target.identity.locator, 1, &revision));
+	wb_stop = false;
+	wb_send_result = CLUSTER_IC_SEND_DONE;
+	wb_now += WB_RETRY_US;
+	cluster_pi_writeback_lmon_tick_v1();
+	UT_ASSERT(cluster_pi_writeback_local_relation_closed_v3(target.identity.locator, 1, &revision));
+	wb_select(0, B_CHECKPOINTER);
+	cluster_pi_writeback_release_v1(&job);
+	cluster_page_data_receipt_free_v1(&data);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+UT_TEST(writeback_local_closure_rejects_bad_shape_or_exhausted_revision)
+{
+	ClusterPageDataReceiptV1 *data = wb_setup();
+	ClusterPiWritebackJobV1 *job = wb_start(data);
+	RelFileLocator locator = target.identity.locator;
+	uint64 revision = 123;
+	WritebackShared *saved = wb_shared;
+	wb_shared = NULL;
+	UT_ASSERT(!cluster_pi_writeback_local_relation_closed_v3(locator, 1, &revision));
+	UT_ASSERT_EQ(revision, 0);
+	UT_ASSERT(!cluster_pi_writeback_local_revision_current_v3(1));
+	wb_shared = saved;
+	UT_ASSERT(!cluster_pi_writeback_local_relation_closed_v3(locator, 1, NULL));
+	UT_ASSERT(!cluster_pi_writeback_local_relation_closed_v3(locator, 2, &revision));
+	UT_ASSERT(!cluster_pi_writeback_local_revision_current_v3(0));
+	UT_ASSERT(!cluster_pi_writeback_local_revision_current_v3(UINT64_MAX));
+	cluster_interconnect_tier = CLUSTER_IC_TIER_2;
+	UT_ASSERT(!cluster_pi_writeback_local_relation_closed_v3(locator, 1, &revision));
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+	wb_select(1, B_LMON);
+	pg_atomic_write_u64(&wb_shared->local_revision, UINT64_MAX - 1);
+	wb_deliver(0, 1, wb_wire, wb_length);
+	UT_ASSERT_EQ(wb_shared->inbound_state, WB_EMPTY);
+	UT_ASSERT(!cluster_pi_writeback_local_relation_closed_v3(locator, 1, &revision));
+	UT_ASSERT_EQ(revision, 0);
+	UT_ASSERT(!cluster_pi_writeback_local_revision_current_v3(UINT64_MAX - 1));
+	pg_atomic_write_u64(&wb_shared->local_revision, 1);
+	wb_deliver(0, 1, wb_wire, wb_length);
+	wb_shared->inbound.count = CLUSTER_PI_WRITEBACK_MAX + 1;
+	locator.relNumber++;
+	UT_ASSERT(!cluster_pi_writeback_local_relation_closed_v3(locator, 1, &revision));
+	wb_select(0, B_CHECKPOINTER);
+	cluster_pi_writeback_release_v1(&job);
+	cluster_page_data_receipt_free_v1(&data);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+UT_TEST(writeback_local_closure_classifies_all_original_fact_kinds)
+{
+	for (unsigned kind = 0; kind < 3; kind++) {
+		ClusterPageDataReceiptV1 *data = wb_setup();
+		ClusterPiDataFactV1 fact;
+		ClusterPiWritebackMessageV2 request;
+		RelFileLocator other = target.identity.locator;
+		uint64 revision;
+		UT_ASSERT(cluster_page_data_pi_fact_v1(data, &fact));
+		if (kind == 2)
+			wb_v2_offer_fixture(&request, &fact, true);
+		else {
+			wb_v2_fixture(&request, &fact);
+			request.facts[0] = request.facts[kind];
+			request.count = 1;
+		}
+		UT_ASSERT(wb_v2_message_valid(&request));
+		wb_select(1, B_LMON);
+		/* Exact original notice fixture; this test exercises classification,
+		 * not a structural physical receipt or a fabric handoff. */
+		wb_shared->inbound_v2 = request;
+		wb_shared->inbound_version = 2;
+		wb_shared->inbound_revision = 1;
+		wb_shared->inbound_state = WB_QUEUED;
+		other.relNumber++;
+		UT_ASSERT(
+			!cluster_pi_writeback_local_relation_closed_v3(target.identity.locator, 1, &revision));
+		UT_ASSERT(cluster_pi_writeback_local_relation_closed_v3(other, 1, &revision));
+		wb_shared->reply_v2 = request;
+		wb_shared->reply_v2.verb = CLUSTER_PI_WRITEBACK_ACK;
+		wb_shared->inbound_state = WB_REPLIED;
+		wb_shared->reply_pending = false;
+		UT_ASSERT(
+			cluster_pi_writeback_local_relation_closed_v3(target.identity.locator, 1, &revision));
+		wb_shared->reply_v2.nonce++;
+		UT_ASSERT(
+			!cluster_pi_writeback_local_relation_closed_v3(target.identity.locator, 1, &revision));
+		cluster_page_data_receipt_free_v1(&data);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
 int
 main(void)
 {
 	printf("# sizeof_WritebackShared=%zu\n", sizeof(WritebackShared));
-	UT_PLAN(78);
+	UT_PLAN(85);
+	UT_RUN(writeback_local_closure_tracks_exact_original_notice_and_reply);
+	UT_RUN(writeback_unknown_send_and_stop_never_close_local_ack);
+	UT_RUN(writeback_local_closure_rejects_bad_shape_or_exhausted_revision);
+	UT_RUN(writeback_local_closure_classifies_all_original_fact_kinds);
+	UT_RUN(writeback_ack_stays_owned_until_transport_returns);
+	UT_RUN(writeback_new_notice_cannot_replace_unaccepted_physical_reply);
+	UT_RUN(writeback_error_after_physical_keeps_original_retry_owner);
 	UT_RUN(writeback_v2_structure_scheduler_checks_local_work_without_wal_pins);
 	UT_RUN(writeback_v2_structure_scheduler_counts_invalid_completion_and_continues);
 	UT_RUN(writeback_v2_structure_scheduler_collects_all_original_page_acks);
