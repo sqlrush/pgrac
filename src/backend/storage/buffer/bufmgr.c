@@ -19404,8 +19404,8 @@ cluster_bufmgr_pcm_own_copy_source_image_exact(
  * published here.  Ordinary failures remove only this exact reservation;
  * inability to do so is corruption and retains the evidence fail-closed.
  */
-ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_prepare_n_source_image(BufferDesc *buf,
+static ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_prepare_n_source_image_internal(BufferDesc *buf,
 											  const ClusterPcmOwnSnapshot *expected_n,
 											  ClusterPcmOwnSnapshot *out_revoking,
 											  char block_data[BLCKSZ], XLogRecPtr *out_page_lsn,
@@ -19550,6 +19550,48 @@ cluster_bufmgr_pcm_own_prepare_n_source_image(BufferDesc *buf,
 	memset(block_data, 0, BLCKSZ);
 	*out_page_lsn = InvalidXLogRecPtr;
 	*out_page_scn = 0;
+	return result;
+}
+
+/* PGRAC: bind the complete original source call before it can pin, reserve,
+ * flush or read. No KO lock is held inside the source owner. Its ERROR and
+ * ordinary cleanup runs before this reference ends; a successful REVOKING
+ * reservation still belongs to the original retained handoff owner.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_prepare_n_source_image(BufferDesc *buf,
+											  const ClusterPcmOwnSnapshot *expected_n,
+											  ClusterPcmOwnSnapshot *out_revoking,
+											  char block_data[BLCKSZ], XLogRecPtr *out_page_lsn,
+											  uint64 *out_page_scn)
+{
+	ClusterKoDirectoryIoV3 io = {0};
+	ClusterPcmOwnResult result;
+
+	/* Preserve the original invalid-input classification and empty outputs. */
+	if (buf == NULL || expected_n == NULL || out_revoking == NULL || block_data == NULL
+		|| out_page_lsn == NULL || out_page_scn == NULL
+		|| expected_n->pcm_state != (uint8)PCM_STATE_N || expected_n->flags != 0
+		|| ClusterPcmOwnArray == NULL)
+		return cluster_bufmgr_pcm_own_prepare_n_source_image_internal(
+			buf, expected_n, out_revoking, block_data, out_page_lsn, out_page_scn);
+	if (!cluster_ko_directory_io_begin_v3(BufTagGetRelFileLocator(&expected_n->tag), &io)) {
+		memset(out_revoking, 0, sizeof(*out_revoking));
+		memset(block_data, 0, BLCKSZ);
+		*out_page_lsn = InvalidXLogRecPtr;
+		*out_page_scn = 0;
+		return CLUSTER_PCM_OWN_BUSY;
+	}
+	PG_TRY();
+	{
+		result = cluster_bufmgr_pcm_own_prepare_n_source_image_internal(
+			buf, expected_n, out_revoking, block_data, out_page_lsn, out_page_scn);
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
 	return result;
 }
 
@@ -19755,8 +19797,8 @@ cluster_bufmgr_pcm_own_observe_s_source_hard_failure(
  * either its clean resident page or shared storage.  REVOKING prevents local
  * data writes/reuse while the conditional content-lock hold binds the final
  * comparison and optional storage refresh to the same ownership tuple. */
-ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_prepare_s_source_image(
+static ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_prepare_s_source_image_internal(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_s, SCN required_page_scn,
 	ClusterPcmOwnSnapshot *out_revoking, char block_data[BLCKSZ], XLogRecPtr *out_page_lsn,
 	uint64 *out_page_scn, ClusterPcmOwnSourcePrepareRefusal *out_refusal,
@@ -20024,6 +20066,53 @@ cluster_bufmgr_pcm_own_prepare_s_source_image(
 	memset(block_data, 0, BLCKSZ);
 	*out_page_lsn = InvalidXLogRecPtr;
 	*out_page_scn = 0;
+	return result;
+}
+
+/* PGRAC: bind the complete original source call before it can pin, reserve,
+ * flush or read. No KO lock is held inside the source owner. Its ERROR and
+ * ordinary cleanup runs before this reference ends; a successful REVOKING
+ * reservation still belongs to the original retained handoff owner.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_prepare_s_source_image(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_s, SCN required_page_scn,
+	ClusterPcmOwnSnapshot *out_revoking, char block_data[BLCKSZ], XLogRecPtr *out_page_lsn,
+	uint64 *out_page_scn, ClusterPcmOwnSourcePrepareRefusal *out_refusal,
+	ClusterPageWalBindingV1 *out_wal)
+{
+	ClusterKoDirectoryIoV3 io = {0};
+	ClusterPcmOwnResult result;
+
+	/* Preserve the original invalid-input classification and empty outputs. */
+	if (buf == NULL || expected_s == NULL || out_revoking == NULL || block_data == NULL
+		|| out_page_lsn == NULL || out_page_scn == NULL || out_refusal == NULL
+		|| expected_s->pcm_state != (uint8)PCM_STATE_S || expected_s->flags != 0
+		|| ClusterPcmOwnArray == NULL)
+		return cluster_bufmgr_pcm_own_prepare_s_source_image_internal(
+			buf, expected_s, required_page_scn, out_revoking, block_data,
+			out_page_lsn, out_page_scn, out_refusal, out_wal);
+	if (!cluster_ko_directory_io_begin_v3(BufTagGetRelFileLocator(&expected_s->tag), &io)) {
+		memset(out_revoking, 0, sizeof(*out_revoking));
+		memset(block_data, 0, BLCKSZ);
+		*out_page_lsn = InvalidXLogRecPtr;
+		*out_page_scn = 0;
+		*out_refusal = CLUSTER_PCM_OWN_SOURCE_PREPARE_REFUSAL_NONE;
+		if (out_wal != NULL)
+			memset(out_wal, 0, sizeof(*out_wal));
+		return CLUSTER_PCM_OWN_BUSY;
+	}
+	PG_TRY();
+	{
+		result = cluster_bufmgr_pcm_own_prepare_s_source_image_internal(
+			buf, expected_s, required_page_scn, out_revoking, block_data,
+			out_page_lsn, out_page_scn, out_refusal, out_wal);
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
 	return result;
 }
 

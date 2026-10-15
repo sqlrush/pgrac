@@ -4713,6 +4713,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_page_flush.inc
 	rm -f test_cluster_page_identity_equal.c test_cluster_page_identity_equal.o
 	rm -f test_cluster_pcm_s_prepare.inc
+	rm -f test_cluster_ko_source_io.inc
 	rm -f test_cluster_pcm_page_identity.inc test_cluster_pcm_page_identity.inc.tmp
 	rm -f test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc
 	rm -f test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc
@@ -5491,6 +5492,7 @@ test_cluster_pcm_source_finish_consumer.inc: $(top_srcdir)/src/backend/cluster/c
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_pcm_s_prepare.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^typedef enum ClusterPcmOwnSSourceHardFailureReason/ { emit=1; types++ } \
+	     /^cluster_bufmgr_pcm_own_prepare_s_source_image_internal\(/ { print "static ClusterPcmOwnResult"; emit=1 } \
 	     /^cluster_bufmgr_pcm_own_(begin_s_revoke|prepare_s_source_image|abort_s_revoke)\(/ \
 	       { print "ClusterPcmOwnResult"; emit=1; funcs++ } \
 	     emit { print } /^}/ { emit=0 } \
@@ -6423,12 +6425,12 @@ test_cluster_ko_writeback_codec.o: $(top_srcdir)/src/backend/cluster/cluster_pi_
 		$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_ko_stop test_cluster_ko_cancel test_cluster_ko_ready_owner test_cluster_ko_drop_io: %: %.c test_cluster_ko_stop.c test_cluster_ko_space.inc test_cluster_ko_abandon.h test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
+test_cluster_ko_stop test_cluster_ko_cancel test_cluster_ko_ready_owner test_cluster_ko_drop_io test_cluster_ko_source_io: %: %.c test_cluster_ko_stop.c test_cluster_ko_space.inc test_cluster_ko_abandon.h test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
 		test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_ko_lock.c \
 		$(top_srcdir)/src/include/cluster/cluster_ko.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
-		test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) \
+		test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) $(filter $(CLUSTER_PCM_OWN_O),$^) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) \
 		$(top_builddir)/src/common/libpgcommon.a $(filter -lcrypto,$(LIBS)) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
@@ -9236,3 +9238,21 @@ test_cluster_ko_raw_consumers.inc: $(top_srcdir)/src/backend/storage/buffer/bufm
 	awk '/^cluster_bufmgr_(read_storage_scn|refresh_block_from_storage|block_is_extension)_for_gcs\(/ { print "bool"; emit=1; n++ } \
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< > $@
 test_cluster_ko_drop_io: test_cluster_ko_raw_consumers.inc
+
+# Original N/S source preparation and KO COMMIT reference, with physical
+# descriptor/IO boundaries explicit. Author: SqlRush <sqlrush@gmail.com>
+TESTS += test_cluster_ko_source_io
+all: test_cluster_ko_source_io
+
+test_cluster_ko_source_io: test_cluster_ko_source_io.inc $(CLUSTER_PCM_OWN_O)
+
+test_cluster_ko_source_io.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_pcm_own_snapshot_(post_state_)?locked\(/ { print "static inline void"; emit=1; snapshots++ } \
+	     /^(cluster_pcm_own_fence_matches_locked|cluster_bufmgr_pcm_current_image_locked)\(/ { print "static inline bool"; emit=1; predicates++ } \
+	     /^typedef enum ClusterPcmOwnSSourceHardFailureReason/ { emit=1; types++ } \
+	     /^cluster_bufmgr_pcm_own_copy_source_image_exact\(/ { print "static ClusterPcmOwnResult"; emit=1; copies++ } \
+	     /^cluster_bufmgr_pcm_own_prepare_[ns]_source_image_internal\(/ { print "static ClusterPcmOwnResult"; emit=1 } \
+	     /^cluster_bufmgr_pcm_own_(begin_s_revoke|prepare_[ns]_source_image|abort_[ns]_revoke)\(/ { print "ClusterPcmOwnResult"; emit=1; owners++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (snapshots != 2 || predicates != 2 || types != 1 || copies != 1 || owners != 5 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@

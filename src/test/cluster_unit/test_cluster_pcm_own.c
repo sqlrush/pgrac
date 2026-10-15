@@ -17,6 +17,7 @@
 
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_ic.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_scn.h"
 #include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_pcm_own.h"
@@ -826,7 +827,11 @@ downgrade_master_notify(BufferTag tag, PcmLockTransition trans, int node, bool r
 
 #undef FlushBufferWithRecovery
 /* Actual S-source reservation/prepare/abort, with storage and allocation
- * boundaries explicit. The WAL error occurs after the real content release. */
+ * boundaries explicit. The WAL error occurs after the real content release.
+ * This existing ownership fixture has no KO instance. The paired
+ * test_cluster_ko_source_io exercises the same owner with real KO references. */
+#define cluster_ko_directory_io_begin_v3(locator, scope) (memset(scope, 0, sizeof(*(scope))), true)
+#define cluster_ko_directory_io_end_v3(scope) true
 #define ReservePrivateRefCountEntry() ((void)0)
 #define ResourceOwnerEnlargeBuffers(owner) ((void)0)
 #define PinBuffer_Locked(buf) abort()
@@ -836,6 +841,8 @@ downgrade_master_notify(BufferTag tag, PcmLockTransition trans, int node, bool r
 #define PageIsVerifiedForFork(page, fork, block, flags) true
 #define cluster_bufmgr_pcm_own_observe_s_source_hard_failure(...) ((void)0)
 #include "test_cluster_pcm_s_prepare.inc"
+#undef cluster_ko_directory_io_begin_v3
+#undef cluster_ko_directory_io_end_v3
 #undef cluster_bufmgr_pcm_own_observe_s_source_hard_failure
 #undef PageIsVerifiedForFork
 #undef smgrread
@@ -8850,12 +8857,15 @@ UT_TEST(test_queue_n_source_refresh_is_exact_and_publishes_only_complete_image)
 	 * the flush-then-BUSY convergence (reserve/pin under the header lock,
 	 * WAL-first FlushBuffer, unpin) ahead of the reservation, with BM_IO_ERROR
 	 * judged before the dirty branch on both passes. */
-	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_own_prepare_n_source_image(",
+	assert_ordered_in_function(source,
+		strstr(source, "\ncluster_bufmgr_pcm_own_prepare_n_source_image_internal(")
+			? "\ncluster_bufmgr_pcm_own_prepare_n_source_image_internal("
+			: "\ncluster_bufmgr_pcm_own_prepare_n_source_image(",
 							   "\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_begin_s_revoke(",
 							   prepare_contract, lengthof(prepare_contract));
 	assert_ordered_in_function(
 		source, "\ncluster_bufmgr_pcm_own_copy_source_image_exact(",
-		"\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_prepare_n_source_image(", copy_contract,
+		"\n/*\n * Fence a clean N descriptor,", copy_contract,
 		lengthof(copy_contract));
 	free(source);
 }
@@ -8886,7 +8896,10 @@ UT_TEST(test_queue_s_source_dirty_flush_makes_progress_and_reports_exact_refusal
 	 * pin and flush it before opening REVOKING, then retry.  Keep I/O and both
 	 * content-lock refusals separately diagnosed so a native stall cannot be
 	 * collapsed back into an opaque materialize-begin BUSY. */
-	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_own_prepare_s_source_image(",
+	assert_ordered_in_function(source,
+		strstr(source, "\ncluster_bufmgr_pcm_own_prepare_s_source_image_internal(")
+			? "\ncluster_bufmgr_pcm_own_prepare_s_source_image_internal("
+			: "\ncluster_bufmgr_pcm_own_prepare_s_source_image(",
 							   "\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_abort_s_revoke(",
 							   prepare_contract, lengthof(prepare_contract));
 	free(source);
