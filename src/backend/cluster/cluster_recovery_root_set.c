@@ -9,6 +9,9 @@
 #include "postgres.h"
 #include <fcntl.h>
 #include <unistd.h>
+#include "access/multixact.h"
+#include "access/slru.h"
+#include "cluster/cluster_native_startup.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_recovery_root_set.h"
@@ -327,6 +330,106 @@ cluster_recovery_root_set_invalidate(ClusterRecoveryRootSet *roots)
 		roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
 }
 
+/* Record file requirements in the original origin namespace. These are
+ * candidate extents only, including missing files and bytes beyond EOF. */
+static ClusterRecoveryRootsResult
+roots_add_mx_page(ClusterRecoveryRootSet *roots, uint32 node, bool members, uint32 page)
+{
+	char path[MAXPGPATH];
+	uint32 index;
+	uint32 segment = page / SLRU_PAGES_PER_SEGMENT;
+	ClusterRecoveryRootEntry *entry;
+
+	snprintf(path, sizeof(path), "native_side/origin_%u/pg_multixact/%s/%04X", node,
+			 members ? "members" : "offsets", segment);
+	if (!roots_lookup(roots, path, true, &index))
+		return roots->status;
+	entry = &roots->entries[index];
+	entry->file.kind = CLUSTER_RECOVERY_FILE_ORIGIN_SLRU;
+	entry->file.native_family = members ? CLUSTER_RECOVERY_NATIVE_FAMILY_MX_MEMBERS
+										: CLUSTER_RECOVERY_NATIVE_FAMILY_MX_OFFSETS;
+	entry->file.native_segment = segment;
+	entry->file.native_origin_node = node;
+	entry->origins |= CLUSTER_RECOVERY_ROOT_FROM_WAL;
+	entry->required_blocks
+		= Max(entry->required_blocks, (uint64)(page % SLRU_PAGES_PER_SEGMENT) + 1);
+	return CLUSTER_RECOVERY_ROOTS_MORE;
+}
+
+static ClusterRecoveryRootsResult
+roots_add_multixact(ClusterRecoveryRootSet *roots, const ClusterRecoveryNativeEffect *effect)
+{
+	const ClusterRecoveryNativeRecord *record = effect->record;
+	uint32 node = record->source.claim.identity.origin_node_id;
+	uint8 opcode = record->header.xl_info & ~XLR_INFO_MASK;
+	ClusterRecoveryRootsResult result;
+
+	if (!cluster_wal_claim_v2_ref_valid(&record->source.claim)
+		|| record->header.xl_rmid != RM_MULTIXACT_ID || effect->bytes != record->payload
+		|| effect->length != record->payload_length || effect->ordinal != 0)
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	if ((effect->kind == CLUSTER_RECOVERY_NATIVE_MULTIXACT_ZERO_OFFSETS
+		 && opcode == XLOG_MULTIXACT_ZERO_OFF_PAGE)
+		|| (effect->kind == CLUSTER_RECOVERY_NATIVE_MULTIXACT_ZERO_MEMBERS
+			&& opcode == XLOG_MULTIXACT_ZERO_MEM_PAGE)) {
+		int page;
+		bool members = effect->kind == CLUSTER_RECOVERY_NATIVE_MULTIXACT_ZERO_MEMBERS;
+		uint32 per_page
+			= members ? CLUSTER_NATIVE_MX_MEMBERS_PER_PAGE : CLUSTER_NATIVE_MX_OFFSETS_PER_PAGE;
+		if (effect->length != sizeof(page))
+			return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+		memcpy(&page, effect->bytes, sizeof(page));
+		if (page < 0 || (uint64)page > UINT32_MAX / per_page)
+			return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+		return roots_add_mx_page(roots, node, members, (uint32)page);
+	}
+	if (effect->kind == CLUSTER_RECOVERY_NATIVE_MULTIXACT_CREATE
+		&& opcode == XLOG_MULTIXACT_CREATE_ID) {
+		xl_multixact_create create;
+		uint32 next;
+		uint64 position, remaining;
+		if (effect->length < SizeOfMultiXactCreate)
+			return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+		memcpy(&create, effect->bytes, SizeOfMultiXactCreate);
+		if (!MultiXactIdIsValid(create.mid) || create.moff == 0 || create.nmembers <= 0
+			|| (size_t)create.nmembers
+				   > (effect->length - SizeOfMultiXactCreate) / sizeof(MultiXactMember)
+			|| effect->length
+				   != SizeOfMultiXactCreate + (size_t)create.nmembers * sizeof(MultiXactMember))
+			return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+		/* RecordNewMultiXactInto also writes the next-MX offset sentinel. */
+		result = roots_add_mx_page(roots, node, false,
+								   create.mid / CLUSTER_NATIVE_MX_OFFSETS_PER_PAGE);
+		if (result != CLUSTER_RECOVERY_ROOTS_MORE)
+			return result;
+		next = create.mid + 1;
+		if (next < FirstMultiXactId)
+			next = FirstMultiXactId;
+		result = roots_add_mx_page(roots, node, false, next / CLUSTER_NATIVE_MX_OFFSETS_PER_PAGE);
+		if (result != CLUSTER_RECOVERY_ROOTS_MORE)
+			return result;
+		position = create.moff;
+		remaining = create.nmembers;
+		/* One lookup per intersected segment, including both ends of wrap. */
+		/* Capacity exhaustion is sticky; never discard a suffix. */
+		while (remaining != 0) {
+			uint64 per_segment
+				= (uint64)CLUSTER_NATIVE_MX_MEMBERS_PER_PAGE * SLRU_PAGES_PER_SEGMENT;
+			uint64 boundary
+				= Min((position / per_segment + 1) * per_segment, UINT64CONST(0x100000000));
+			uint64 take = Min(remaining, boundary - position);
+			uint32 last_page = (position + take - 1) / CLUSTER_NATIVE_MX_MEMBERS_PER_PAGE;
+			result = roots_add_mx_page(roots, node, true, last_page);
+			if (result != CLUSTER_RECOVERY_ROOTS_MORE)
+				return result;
+			position = (position + take) & UINT32_MAX;
+			remaining -= take;
+		}
+		return CLUSTER_RECOVERY_ROOTS_MORE;
+	}
+	return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+}
+
 ClusterRecoveryRootsResult
 cluster_recovery_root_set_add_native(ClusterRecoveryRootSet *roots,
 									 const ClusterRecoveryNativeEffect *effect)
@@ -346,6 +449,10 @@ cluster_recovery_root_set_add_native(ClusterRecoveryRootSet *roots,
 		|| memcmp(record->source.claim.identity.storage_uuid, roots->storage_uuid, 16) != 0)
 		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
 	opcode = record->header.xl_info & ~XLR_INFO_MASK;
+	if (effect->kind == CLUSTER_RECOVERY_NATIVE_MULTIXACT_CREATE
+		|| effect->kind == CLUSTER_RECOVERY_NATIVE_MULTIXACT_ZERO_OFFSETS
+		|| effect->kind == CLUSTER_RECOVERY_NATIVE_MULTIXACT_ZERO_MEMBERS)
+		return roots_add_multixact(roots, effect);
 	if (effect->kind == CLUSTER_RECOVERY_NATIVE_TT_COMMIT && record->header.xl_rmid == RM_XACT_ID
 		&& (opcode & XLOG_XACT_OPMASK) == XLOG_XACT_COMMIT
 		&& effect->length == sizeof(xl_xact_tt_commit)) {

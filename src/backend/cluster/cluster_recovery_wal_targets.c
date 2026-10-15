@@ -168,6 +168,14 @@ targets_native(ClusterRecoveryRootSet *roots, XLogReaderState *reader,
 			if (diag->roots_result != CLUSTER_RECOVERY_ROOTS_MORE)
 				break;
 			diag->structural_effects++;
+		} else if (effect.kind == CLUSTER_RECOVERY_NATIVE_MULTIXACT_CREATE
+				   || effect.kind == CLUSTER_RECOVERY_NATIVE_MULTIXACT_ZERO_OFFSETS
+				   || effect.kind == CLUSTER_RECOVERY_NATIVE_MULTIXACT_ZERO_MEMBERS) {
+			diag->roots_result = cluster_recovery_root_set_add_native(roots, &effect);
+			if (diag->roots_result != CLUSTER_RECOVERY_ROOTS_MORE)
+				break;
+			/* Physical candidates do not discharge members/horizons/truncate. */
+			diag->other_native_effects++;
 		} else if (effect.kind == CLUSTER_RECOVERY_NATIVE_TT_COMMIT) {
 			diag->roots_result = cluster_recovery_root_set_add_native(roots, &effect);
 			if (diag->roots_result != CLUSTER_RECOVERY_ROOTS_MORE)
@@ -207,7 +215,10 @@ cluster_recovery_wal_targets_collect(ClusterRecoveryRootSet *roots, XLogReaderSt
 	}
 	rmid = XLogRecGetRmid(reader);
 	opcode = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
-	if (rmid == RM_XACT_ID || (rmid == RM_SMGR_ID && opcode == XLOG_SMGR_CREATE)) {
+	if (rmid == RM_XACT_ID || rmid == RM_MULTIXACT_ID
+		|| (rmid == RM_SMGR_ID && opcode == XLOG_SMGR_CREATE)) {
+		if (rmid == RM_MULTIXACT_ID)
+			diag->unowned_records = 1;
 		if (!targets_native(roots, reader, source, cut, memory_budget, diag))
 			goto fail;
 		return true;

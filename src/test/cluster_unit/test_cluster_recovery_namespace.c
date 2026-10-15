@@ -191,7 +191,7 @@ UT_TEST(test_native_slru_segment_names_are_explicit_obligations)
 		"pg_commit_ts/0fff",
 		"pg_multixact/0000",
 		"pg_multixact/offsets/0000/extra",
-		"native_side/origin_0/pg_xact/0000",
+		"native_side/origin_128/pg_xact/0000",
 	};
 
 	for (unsigned i = 0; i < lengthof(valid); i++) {

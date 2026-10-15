@@ -17,7 +17,10 @@
 #elif defined(__GLIBC__)
 #include <malloc.h>
 #endif
+#include "access/slru.h"
 #include "catalog/pg_tablespace_d.h"
+#include "cluster/cluster_control_root.h"
+#include "cluster/cluster_native_startup.h"
 #include "cluster/cluster_recovery_namespace.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/storage/cluster_undo_alloc.h"
@@ -90,22 +93,26 @@ namespace_undo_key(const char *path, uint32 *segment, uint8 *owner)
 	return true;
 }
 
-/* Native SLRU names are deliberately stricter than ordinary filenames:
- * exactly four uppercase hexadecimal digits and only the five local physical
- * families below.  Foreign/native_side paths stay unclassified and therefore
- * cannot be adopted by the local root census. */
+/* Preserve canonical native segment names, including the five hex digits
+ * required by the last members segments. A name is a candidate, never a
+ * source/epoch or horizon proof. Origin-side files get a distinct kind. */
 static bool
 namespace_native_key(const char *path, uint8 *family, uint32 *segment)
 {
 	static const struct {
 		const char *prefix;
 		uint8 family;
+		uint32 per_page;
 	} prefixes[] = {
-		{ "pg_xact/", CLUSTER_RECOVERY_NATIVE_FAMILY_XACT },
-		{ "pg_subtrans/", CLUSTER_RECOVERY_NATIVE_FAMILY_SUBTRANS },
-		{ "pg_commit_ts/", CLUSTER_RECOVERY_NATIVE_FAMILY_COMMIT_TS },
-		{ "pg_multixact/offsets/", CLUSTER_RECOVERY_NATIVE_FAMILY_MX_OFFSETS },
-		{ "pg_multixact/members/", CLUSTER_RECOVERY_NATIVE_FAMILY_MX_MEMBERS },
+		{ "pg_xact/", CLUSTER_RECOVERY_NATIVE_FAMILY_XACT, CLUSTER_NATIVE_CLOG_PER_PAGE },
+		{ "pg_subtrans/", CLUSTER_RECOVERY_NATIVE_FAMILY_SUBTRANS,
+		  CLUSTER_NATIVE_SUBTRANS_PER_PAGE },
+		{ "pg_commit_ts/", CLUSTER_RECOVERY_NATIVE_FAMILY_COMMIT_TS,
+		  CLUSTER_NATIVE_COMMIT_TS_PER_PAGE },
+		{ "pg_multixact/offsets/", CLUSTER_RECOVERY_NATIVE_FAMILY_MX_OFFSETS,
+		  CLUSTER_NATIVE_MX_OFFSETS_PER_PAGE },
+		{ "pg_multixact/members/", CLUSTER_RECOVERY_NATIVE_FAMILY_MX_MEMBERS,
+		  CLUSTER_NATIVE_MX_MEMBERS_PER_PAGE },
 	};
 
 	if (path == NULL || family == NULL || segment == NULL)
@@ -114,14 +121,16 @@ namespace_native_key(const char *path, uint8 *family, uint32 *segment)
 		size_t prefix_length = strlen(prefixes[i].prefix);
 		const char *name;
 		uint32 value = 0;
-		char canonical[5];
+		char canonical[9];
+		size_t digits;
 
 		if (strncmp(path, prefixes[i].prefix, prefix_length) != 0)
 			continue;
 		name = path + prefix_length;
-		if (strlen(name) != 4)
+		digits = strlen(name);
+		if (digits < 4 || digits > 8)
 			continue;
-		for (unsigned digit = 0; digit < 4; digit++) {
+		for (unsigned digit = 0; digit < digits; digit++) {
 			unsigned nibble;
 
 			if (name[digit] >= '0' && name[digit] <= '9')
@@ -133,13 +142,41 @@ namespace_native_key(const char *path, uint8 *family, uint32 *segment)
 			value = (value << 4) | nibble;
 		}
 		snprintf(canonical, sizeof(canonical), "%04X", value);
-		if (memcmp(canonical, name, sizeof(canonical) - 1) != 0)
+		if (strcmp(canonical, name) != 0
+			|| value > UINT32_MAX / prefixes[i].per_page / SLRU_PAGES_PER_SEGMENT)
 			return false;
 		*family = prefixes[i].family;
 		*segment = value;
 		return true;
 	}
 	return false;
+}
+
+/* Use exactly the existing failed-origin native-side directory. Decimal
+ * aliases and out-of-range origins cannot fall back to the local SLRU. */
+static bool
+namespace_origin_native_key(const char *path, uint8 *family, uint32 *segment, uint32 *origin)
+{
+	const char *name;
+	uint32 node = 0;
+	const char *prefix = "native_side/origin_";
+	size_t length = strlen(prefix);
+
+	if (path == NULL || family == NULL || segment == NULL || origin == NULL
+		|| strncmp(path, prefix, length) != 0)
+		return false;
+	name = path + length;
+	if (*name < '0' || *name > '9' || (*name == '0' && name[1] != '/'))
+		return false;
+	while (*name >= '0' && *name <= '9') {
+		node = node * 10 + (unsigned)(*name++ - '0');
+		if (node >= CLUSTER_CONTROL_ROOT_RECORD_COUNT)
+			return false;
+	}
+	if (*name != '/' || !namespace_native_key(name + 1, family, segment))
+		return false;
+	*origin = node;
+	return true;
 }
 
 /* PostgreSQL's durable two-phase state files are named by one canonical
@@ -192,6 +229,7 @@ cluster_recovery_namespace_classify_ex(const char *path, RelFileLocator *locator
 	uint8 observed_native_family = CLUSTER_RECOVERY_NATIVE_FAMILY_NONE;
 	uint32 observed_native_segment = UINT32_MAX;
 	uint32 observed_twophase_xid = 0;
+	uint32 native_origin = 0;
 
 	if (locator != NULL)
 		memset(locator, 0, sizeof(*locator));
@@ -209,6 +247,14 @@ cluster_recovery_namespace_classify_ex(const char *path, RelFileLocator *locator
 		if (native_segment != NULL)
 			*native_segment = observed_native_segment;
 		return CLUSTER_RECOVERY_FILE_NATIVE_SLRU;
+	}
+	if (namespace_origin_native_key(path, &observed_native_family, &observed_native_segment,
+									&native_origin)) {
+		if (native_family != NULL)
+			*native_family = observed_native_family;
+		if (native_segment != NULL)
+			*native_segment = observed_native_segment;
+		return CLUSTER_RECOVERY_FILE_ORIGIN_SLRU;
 	}
 	if (namespace_undo_key(path, &undo_segment, &undo_owner))
 		return CLUSTER_RECOVERY_FILE_UNDO_SEGMENT;
@@ -582,7 +628,10 @@ cluster_recovery_namespace_next(ClusterRecoveryNamespace *scan, ClusterRecoveryN
 			entry.kind = cluster_recovery_namespace_classify_ex(
 				entry.path, &entry.locator, &entry.forknum, &entry.native_family,
 				&entry.native_segment);
-			if (entry.kind == CLUSTER_RECOVERY_FILE_UNDO_SEGMENT)
+			if (entry.kind == CLUSTER_RECOVERY_FILE_ORIGIN_SLRU)
+				(void)namespace_origin_native_key(entry.path, &entry.native_family,
+												  &entry.native_segment, &entry.native_origin_node);
+			else if (entry.kind == CLUSTER_RECOVERY_FILE_UNDO_SEGMENT)
 				(void)namespace_undo_key(entry.path, &entry.undo_segment,
 										 &entry.undo_owner_instance);
 			else if (entry.kind == CLUSTER_RECOVERY_FILE_TWOPHASE)

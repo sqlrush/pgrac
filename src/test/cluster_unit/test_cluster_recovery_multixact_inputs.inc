@@ -42,6 +42,27 @@ UT_TEST(test_cold_multixact_records_keep_all_shapes_and_origin_sources)
 	UT_ASSERT_EQ(diag.other_records, 2);
 	/* Physical MX targets/retention remain separate owner obligations. */
 	UT_ASSERT(diag.unowned_target_records >= 8);
+	{
+		ClusterRecoveryRootsEvent event;
+		ClusterRecoveryRootsResult observed;
+		unsigned origin_files[2] = { 0 };
+		do {
+			observed = cluster_recovery_root_set_step(roots, &event);
+		} while (observed < CLUSTER_RECOVERY_ROOTS_OBSERVED);
+		UT_ASSERT_EQ(observed, CLUSTER_RECOVERY_ROOTS_OBSERVED);
+		for (uint32 i = 0; i < cluster_recovery_root_set_count(roots); ++i) {
+			const ClusterRecoveryRootEntry *entry = cluster_recovery_root_set_entry(roots, i);
+			if (entry == NULL || entry->file.kind != CLUSTER_RECOVERY_FILE_ORIGIN_SLRU)
+				continue;
+			UT_ASSERT(entry->file.native_origin_node == 0 || entry->file.native_origin_node == 127);
+			origin_files[entry->file.native_origin_node == 127]++;
+			UT_ASSERT_EQ(entry->origins, CLUSTER_RECOVERY_ROOT_FROM_WAL);
+			UT_ASSERT_EQ(entry->required_blocks, 1);
+		}
+		UT_ASSERT_EQ(origin_files[0], 2);
+		UT_ASSERT_EQ(origin_files[1], 2);
+	}
+
 	while ((result = cluster_recovery_native_inventory_next(inventory, &effect))
 		   == CLUSTER_RECOVERY_NATIVE_INVENTORY_EFFECT) {
 		UT_ASSERT(effect.kind <= CLUSTER_RECOVERY_NATIVE_MULTIXACT_TRUNCATE);

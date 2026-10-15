@@ -96,7 +96,10 @@ struct ClusterRecoveryNativeEffect;
  * folded TT commit header target to the same physical union. Relation effects
  * target whole files without inventing a block-zero reference or size promise;
  * TT_COMMIT preserves its actual header block requirement. CREATE, RELATION_DROP
- * and TT_COMMIT effects are accepted; all other effects need their own
+ * and TT_COMMIT effects are accepted. Native MX CREATE and both zero-page
+ * effects retain their exact origin-side file extents (including next-offset
+ * sentinel and wrapped members), never local SLRU targets. TRUNCATE/member
+ * state/horizon proofs remain independent; all other effects need their own
  * consumers. Source/record and lifecycle proofs remain in the cold graph.
  * A missing file is retained, never treated as an already-completed drop. */
 extern ClusterRecoveryRootsResult

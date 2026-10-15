@@ -9018,8 +9018,8 @@ test_cluster_recovery_root_set: test_cluster_recovery_root_set.c test_cluster_re
 		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h \
-		$(CLUSTER_UNIT_CRYPTOHASH_O) cluster_unit_port_stubs.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LDFLAGS) $(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/backend/cluster/cluster_wal_claim.o cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(LDFLAGS) $(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 test_cluster_recovery_namespace: test_cluster_recovery_namespace.c unit_test.h \
@@ -9050,8 +9050,8 @@ test_cluster_recovery_undo_store: test_cluster_recovery_undo_store.c test_cluste
 		$(top_srcdir)/src/backend/cluster/cluster_uba.c \
 		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
 		test_cluster_heap_small_scn.inc $(CLUSTER_UNIT_CRYPTOHASH_O) \
-		$(CLUSTER_CR_APPLY_O) $(CLUSTER_R4_CONTINUATION_PAGE_O) cluster_unit_port_stubs.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CR_APPLY_O) $(CLUSTER_R4_CONTINUATION_PAGE_O) \
+		$(CLUSTER_CR_APPLY_O) $(CLUSTER_R4_CONTINUATION_PAGE_O) $(top_builddir)/src/backend/cluster/cluster_wal_claim.o cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(CLUSTER_CR_APPLY_O) $(CLUSTER_R4_CONTINUATION_PAGE_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
@@ -9064,8 +9064,8 @@ test_cluster_recovery_relation_scan: test_cluster_recovery_relation_scan.c test_
 		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h \
-		$(top_builddir)/src/common/libpgcommon.a cluster_unit_port_stubs.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LDFLAGS) $(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/backend/cluster/cluster_wal_claim.o cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(LDFLAGS) $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 test_cluster_recovery_native_scan: test_cluster_recovery_native_scan.c test_cluster_recovery_undo_effects.inc test_cluster_recovery_multixact_effects.inc unit_test.h \
@@ -9098,7 +9098,7 @@ test_cluster_recovery_native_roots: test_cluster_recovery_native_roots.c \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 test_cluster_recovery_wal_targets: test_cluster_recovery_wal_targets.c \
-		test_cluster_recovery_undo_targets.inc \
+		test_cluster_recovery_undo_targets.inc test_cluster_recovery_multixact_targets.inc \
 		test_cluster_recovery_native_roots.c test_cluster_recovery_root_set.c \
 		test_cluster_recovery_namespace.c test_cluster_recovery_crypto_boundary.h unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_wal_targets.c \

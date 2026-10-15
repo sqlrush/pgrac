@@ -41,7 +41,9 @@ typedef enum ClusterRecoveryFileKind {
 	/* A native SLRU segment is an explicit D1 physical obligation.  Its
 	 * bytes still need the native page census before any recovery consumer may
 	 * use them. */
-	CLUSTER_RECOVERY_FILE_NATIVE_SLRU
+	CLUSTER_RECOVERY_FILE_NATIVE_SLRU,
+	/* An original native_side/origin_N file, never local SLRU state. */
+	CLUSTER_RECOVERY_FILE_ORIGIN_SLRU
 } ClusterRecoveryFileKind;
 
 /* One-based family values intentionally match the native-side observer's
@@ -64,9 +66,10 @@ typedef struct ClusterRecoveryNamespaceEntry {
 	uint64 size;
 	uint32 undo_segment;
 	uint8 undo_owner_instance;
-	uint32 twophase_xid;   /* canonical pg_twophase/<8 uppercase hex> key */
-	uint8 native_family;   /* ClusterRecoveryNativeFamily, for native SLRU files */
-	uint32 native_segment; /* canonical four-digit native segment number */
+	uint32 twophase_xid;	   /* canonical pg_twophase/<8 uppercase hex> key */
+	uint8 native_family;	   /* ClusterRecoveryNativeFamily, for native SLRU files */
+	uint32 native_segment;	   /* canonical native segment number */
+	uint32 native_origin_node; /* only for ORIGIN_SLRU; not a boot/epoch proof */
 	/* Local observation only, never serialized or used as storage authority. */
 	struct stat observed;
 } ClusterRecoveryNamespaceEntry;
@@ -74,14 +77,14 @@ typedef struct ClusterRecoveryNamespaceEntry {
 typedef struct ClusterRecoveryNamespace ClusterRecoveryNamespace;
 
 /* A canonical name identifies a candidate, not its SPACE identity or contents.
- * Unknown names are returned explicitly; local native SLRU segments use their
+ * Unknown names are returned explicitly; local and original-origin SLRU segments use their
  * own explicit kind and still require the page-level native census. */
 extern ClusterRecoveryFileKind
 cluster_recovery_namespace_classify(const char *path, RelFileLocator *locator, ForkNumber *forknum);
 
 /* Extended classifier used by the D1 census.  The legacy three-argument
  * classifier remains source-compatible; native outputs are zeroed unless a
- * canonical local SLRU segment path is recognized. */
+ * canonical local or original-origin SLRU segment path is recognized. */
 extern ClusterRecoveryFileKind cluster_recovery_namespace_classify_ex(const char *path,
 																	  RelFileLocator *locator,
 																	  ForkNumber *forknum,

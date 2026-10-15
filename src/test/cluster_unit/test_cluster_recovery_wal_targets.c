@@ -457,11 +457,12 @@ UT_TEST(test_bad_edge_mixed_side_and_unclassified_opcode_do_not_finish_roots)
 }
 
 #include "test_cluster_recovery_undo_targets.inc"
+#include "test_cluster_recovery_multixact_targets.inc"
 
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(21);
 	UT_RUN(test_page_and_rebuildable_fsm_keep_all_file_targets);
 	UT_RUN(test_typed_structure_keeps_all_forks_and_space_pages);
 	UT_RUN(test_native_create_and_truncate_do_not_invent_page_requirements);
@@ -476,6 +477,13 @@ main(void)
 	UT_RUN(test_undo_wal_malformed_targets_poison_whole_roots);
 	UT_RUN(test_undo_targets_reject_block_and_namespace_boundaries);
 	UT_RUN(test_folded_tt_commit_rejects_wrong_identity_and_shape);
+	UT_RUN(test_origin_slru_names_do_not_adopt_local_state);
+	UT_RUN(test_mx_create_keeps_next_sentinel_and_every_member_segment);
+	UT_RUN(test_mx_wrap_preserves_both_ends_without_native_local_substitution);
+	UT_RUN(test_mx_root_union_keeps_short_missing_untouched_and_local_files);
+	UT_RUN(test_mx_zero_page_and_truncate_preserve_distinct_obligations);
+	UT_RUN(test_mx_target_failures_revoke_the_whole_union);
+	UT_RUN(test_mx_target_capacity_never_exports_a_partial_union);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
