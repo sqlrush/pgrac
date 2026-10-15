@@ -79,6 +79,23 @@ cluster_undo_recovery_cold_origin_authorized_v1(int origin_node pg_attribute_unu
 }
 
 bool
+cluster_clog_native_recovery_record_apply_v1(int origin pg_attribute_unused(),
+											 const ClusterSideProjectionOperationV1 *op
+												 pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
+bool
+cluster_clog_native_recovery_record_verify_v1(int origin pg_attribute_unused(),
+											  const ClusterSideProjectionOperationV1 *op
+												  pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+bool
 cluster_clog_native_recovery_apply_v1(int origin pg_attribute_unused(),
 									  TransactionId xid pg_attribute_unused(),
 									  int count pg_attribute_unused(),

@@ -53,6 +53,7 @@
 #include <unistd.h>
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_native_startup.h"
+#include "cluster/cluster_side_projection.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "storage/fd.h"
 #include "storage/shmem.h"
@@ -1035,6 +1036,170 @@ cluster_clog_native_recovery_verify_v1(int origin, TransactionId xid, int nsubxi
 									   const TransactionId *subxids, XidStatus status)
 {
 	return clog_recovery_access(origin, xid, nsubxids, subxids, status, true);
+}
+
+/* Retained ZERO may create a page; terminal replay alone never may. */
+static bool
+clog_recovery_zero(int origin, int page, bool verify)
+{
+	SlruCtl ctl = &ClogRecoveryCtl[origin];
+	char path[MAXPGPATH];
+	struct stat before, after;
+	bool exists, ok;
+	int slot;
+	FileTag tag = { 0 };
+
+	clog_recovery_cache_discard(ctl);
+	if (!clog_recovery_directory_ready(origin))
+		return false;
+	snprintf(path, sizeof(path), "%s/%04X", ctl->Dir, page / SLRU_PAGES_PER_SEGMENT);
+	exists = lstat(path, &before) == 0;
+	if ((!exists && (errno != ENOENT || verify))
+		|| (exists
+			&& (!S_ISREG(before.st_mode) || before.st_nlink != 1 || before.st_uid != geteuid()
+				|| (before.st_mode & (S_IWGRP | S_IWOTH)) != 0))
+		|| (verify && !clog_recovery_page_identity(ctl, page, &before)))
+		return false;
+	LWLockAcquire(ctl->shared->ControlLock, LW_EXCLUSIVE);
+	ok = clog_recovery_permitted(origin);
+	if (ok && verify) {
+		slot = SimpleLruReadPage(ctl, page, true, InvalidTransactionId);
+		for (int i = 0; i < BLCKSZ && ok; i++)
+			ok = ctl->shared->page_buffer[slot][i] == 0;
+	} else if (ok) {
+		slot = SimpleLruZeroPage(ctl, page);
+		SimpleLruWritePage(ctl, slot);
+	}
+	LWLockRelease(ctl->shared->ControlLock);
+	if (!ok || !clog_recovery_page_identity(ctl, page, &after)
+		|| (exists && (before.st_dev != after.st_dev || before.st_ino != after.st_ino))
+		|| after.st_size
+			   != (verify ? before.st_size
+						  : Max(exists ? before.st_size : 0,
+								(off_t)(page % SLRU_PAGES_PER_SEGMENT + 1) * BLCKSZ)))
+		return false;
+	if (verify)
+		return clog_recovery_directory_ready(origin);
+	tag.segno = page / SLRU_PAGES_PER_SEGMENT;
+	if (!clog_recovery_permitted(origin) || SlruSyncFileTag(ctl, &tag, path) != 0)
+		return false;
+	fsync_fname(ctl->Dir, true);
+	return clog_recovery_zero(origin, page, true);
+}
+
+typedef struct ClogRecoveryTruncate {
+	int origin;
+	int cutoff;
+	int phase; /* 0: all eligible files preflight; 1: delete; 2: absence */
+	bool ok;
+} ClogRecoveryTruncate;
+
+static bool
+clog_recovery_truncate_file(SlruCtl ctl, char *filename, int segpage, void *arg)
+{
+	ClogRecoveryTruncate *scan = arg;
+	char canonical[16], path[MAXPGPATH];
+	struct stat st;
+
+	snprintf(canonical, sizeof(canonical), "%04X", segpage / SLRU_PAGES_PER_SEGMENT);
+	if (segpage < 0 || (uint32)segpage > UINT32_MAX / CLOG_XACTS_PER_PAGE
+		|| strcmp(filename, canonical) != 0 || !clog_recovery_permitted(scan->origin)) {
+		scan->ok = false;
+		return true;
+	}
+	/* Use the native whole-segment predicate, including its half-range edge. */
+	if (!SlruScanDirCbReportPresence(ctl, filename, segpage, &scan->cutoff))
+		return false;
+	snprintf(path, sizeof(path), "%s/%s", ctl->Dir, filename);
+	if (scan->phase == 2 || lstat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_nlink != 1
+		|| st.st_uid != geteuid() || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+		scan->ok = false;
+		return true;
+	}
+	if (scan->phase == 1) {
+		SlruDeleteSegment(ctl, segpage / SLRU_PAGES_PER_SEGMENT);
+		/* Native unlink is best effort; it is not recovery completion. */
+		if (lstat(path, &st) == 0 || errno != ENOENT) {
+			scan->ok = false;
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
+clog_recovery_truncate(int origin, int page, bool verify)
+{
+	SlruCtl ctl = &ClogRecoveryCtl[origin];
+	ClogRecoveryTruncate scan = { origin, page, verify ? 2 : 0, true };
+
+	clog_recovery_cache_discard(ctl);
+	for (; scan.phase <= 2; scan.phase++) {
+		if (!clog_recovery_directory_ready(origin))
+			return false;
+		(void)SlruScanDirectory(ctl, clog_recovery_truncate_file, &scan);
+		if (!scan.ok)
+			return false;
+		if (scan.phase == 1)
+			fsync_fname(ctl->Dir, true);
+	}
+	return clog_recovery_directory_ready(origin);
+}
+
+static bool
+clog_recovery_record(int origin, const ClusterSideProjectionOperationV1 *op, bool verify)
+{
+	volatile bool locked = false, ok = false;
+	LWLock *lock;
+
+	if (!clog_recovery_permitted(origin) || op == NULL || op->kind != CLUSTER_SIDE_PROJECTION_CLOG
+		|| op->page_number < 0 || (uint32)op->page_number > UINT32_MAX / CLOG_XACTS_PER_PAGE)
+		return false;
+	if (op->action == CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE) {
+		if (op->normalized_info != CLOG_ZEROPAGE || TransactionIdIsValid(op->oldest_xid)
+			|| OidIsValid(op->oldest_database))
+			return false;
+	} else if (op->action == CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE) {
+		if (op->normalized_info != CLOG_TRUNCATE || !TransactionIdIsNormal(op->oldest_xid)
+			|| !OidIsValid(op->oldest_database)
+			|| TransactionIdToPage(op->oldest_xid) != op->page_number)
+			return false;
+	} else
+		return false;
+	lock = &ClogRecoveryLocks[origin * 2 + 1].lock;
+	PG_TRY();
+	{
+		LWLockAcquire(lock, LW_EXCLUSIVE);
+		locked = true;
+		ok = op->action == CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE
+				 ? clog_recovery_zero(origin, op->page_number, verify)
+				 : clog_recovery_truncate(origin, op->page_number, verify);
+	}
+	PG_FINALLY();
+	{
+		if (locked) {
+			clog_recovery_cache_discard(&ClogRecoveryCtl[origin]);
+			LWLockRelease(lock);
+		}
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+/* Restore the failed origin's native record, never the founder's horizons.
+ * The caller retains complete source/base/era and ordered-record obligations. */
+bool
+cluster_clog_native_recovery_record_apply_v1(int origin,
+											 const ClusterSideProjectionOperationV1 *operation)
+{
+	return clog_recovery_record(origin, operation, false);
+}
+
+bool
+cluster_clog_native_recovery_record_verify_v1(int origin,
+											  const ClusterSideProjectionOperationV1 *operation)
+{
+	return clog_recovery_record(origin, operation, true);
 }
 
 static void

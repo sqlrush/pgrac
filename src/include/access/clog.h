@@ -51,6 +51,12 @@ extern bool cluster_clog_native_recovery_apply_v1(int origin, TransactionId xid,
 												  const TransactionId *subxids, XidStatus status);
 extern bool cluster_clog_native_recovery_verify_v1(int origin, TransactionId xid, int nsubxids,
 												   const TransactionId *subxids, XidStatus status);
+struct ClusterSideProjectionOperationV1;
+/* Exact retained native ZERO/TRUNCATE only, under the same cold scope. */
+extern bool cluster_clog_native_recovery_record_apply_v1(
+	int origin, const struct ClusterSideProjectionOperationV1 *operation);
+extern bool cluster_clog_native_recovery_record_verify_v1(
+	int origin, const struct ClusterSideProjectionOperationV1 *operation);
 #endif
 
 extern Size CLOGShmemBuffers(void);

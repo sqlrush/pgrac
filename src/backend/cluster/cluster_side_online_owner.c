@@ -10,6 +10,7 @@
 #include "access/clog.h"
 #include "access/xlog_internal.h"
 #include "catalog/pg_control.h"
+#include "cluster/cluster_native_startup.h"
 #include "cluster/cluster_remote_xact.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_side_online_owner.h"
@@ -313,12 +314,42 @@ side_owner_preflight_undo(void *arg, const RfSideOnlineOperationV1 *operation)
 }
 
 static bool
+side_owner_cold_clog_ready(RfSideOnlineProductionOwnerV1 *owner,
+						   const RfSideOnlineOperationV1 *operation)
+{
+	const ClusterSideProjectionOperationV1 *clog = &operation->projection;
+	uint16 thread = operation->identity.record.origin_thread;
+
+	if (operation->kind != RF_SIDE_ONLINE_OPERATION_PROJECTION
+		|| clog->kind != CLUSTER_SIDE_PROJECTION_CLOG
+		|| thread != owner->undo_authority->duty->origin_thread_id
+		|| operation->owned_payload_length != 0 || operation->owned_payload != NULL
+		|| clog->page_number < 0
+		|| (uint32)clog->page_number > UINT32_MAX / CLUSTER_NATIVE_CLOG_PER_PAGE
+		|| !cluster_undo_recovery_cold_origin_authorized_v1(thread - 1))
+		return false;
+	if (clog->action == CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE)
+		return clog->normalized_info == CLOG_ZEROPAGE && !TransactionIdIsValid(clog->oldest_xid)
+			   && !OidIsValid(clog->oldest_database);
+	return clog->action == CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE
+		   && clog->normalized_info == CLOG_TRUNCATE && TransactionIdIsNormal(clog->oldest_xid)
+		   && OidIsValid(clog->oldest_database)
+		   && clog->oldest_xid / CLUSTER_NATIVE_CLOG_PER_PAGE == clog->page_number;
+}
+
+static bool
 side_owner_preflight_projection(void *arg, const RfSideOnlineOperationV1 *operation)
 {
 	RfSideOnlineProductionOwnerV1 *owner = (RfSideOnlineProductionOwnerV1 *)arg;
 
-	return owner != NULL && owner->protected_set_active && side_owner_authority_fresh(owner)
-		   && rf_side_online_projection_preflight_owned_v1(&owner->projection, operation);
+	if (owner == NULL || !owner->protected_set_active || !side_owner_authority_fresh(owner)
+		|| operation == NULL || operation->kind != RF_SIDE_ONLINE_OPERATION_PROJECTION)
+		return false;
+	/* Validate the whole protected set before its first storage mutation. */
+	if (side_owner_cold_formed(owner) && operation->projection.kind == CLUSTER_SIDE_PROJECTION_CLOG
+		&& !side_owner_cold_clog_ready(owner, operation))
+		return false;
+	return rf_side_online_projection_preflight_owned_v1(&owner->projection, operation);
 }
 
 static bool
@@ -372,8 +403,22 @@ side_owner_apply_projection(void *arg, const RfSideOnlineOperationV1 *operation)
 {
 	RfSideOnlineProductionOwnerV1 *owner = (RfSideOnlineProductionOwnerV1 *)arg;
 
-	return owner != NULL && owner->protected_set_active && side_owner_authority_fresh(owner)
-		   && rf_side_online_projection_apply_owned_v1(&owner->projection, operation);
+	if (owner == NULL || !owner->protected_set_active || !side_owner_authority_fresh(owner)
+		|| operation == NULL || operation->kind != RF_SIDE_ONLINE_OPERATION_PROJECTION)
+		return false;
+	if (side_owner_cold_formed(owner)
+		&& operation->projection.kind == CLUSTER_SIDE_PROJECTION_CLOG) {
+		int origin = operation->identity.record.origin_thread - 1;
+
+		/* A derived reset/truncation cannot stand in for the native record.
+		 * Keep the original WAL order, sync/readback and cold qualification. */
+		if (!side_owner_cold_clog_ready(owner, operation)
+			|| !cluster_clog_native_recovery_record_apply_v1(origin, &operation->projection)
+			|| !cluster_clog_native_recovery_record_verify_v1(origin, &operation->projection)
+			|| !side_owner_cold_clog_ready(owner, operation) || !side_owner_authority_fresh(owner))
+			return false;
+	}
+	return rf_side_online_projection_apply_owned_v1(&owner->projection, operation);
 }
 
 bool

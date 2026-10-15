@@ -2914,6 +2914,7 @@ SIDE_OWNER_TEST_CPPFLAGS = -DRF_SIDE_OWNER_TESTING \
 	-Dcluster_undo_apply_tt_v1=fixture_apply_tt
 $(CLUSTER_SIDE_ONLINE_OWNER_O): $(top_srcdir)/src/backend/cluster/cluster_side_online_owner.c \
 		$(top_srcdir)/src/include/access/clog.h \
+		$(top_srcdir)/src/include/cluster/cluster_native_startup.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_online_owner.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_xact.h
@@ -4130,6 +4131,7 @@ test_cluster_multixact_recovery test_cluster_multixact_limits_io: %: %.c unit_te
 test_cluster_clog_recovery: test_cluster_clog_recovery.c unit_test.h \
 		$(top_srcdir)/src/backend/access/transam/clog.c \
 		$(top_srcdir)/src/include/access/clog.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_projection.h \
 		$(top_srcdir)/src/backend/access/transam/slru.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@

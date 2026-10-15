@@ -17,9 +17,13 @@
 #include "postgres.h"
 #include <dirent.h>
 #include <sys/wait.h>
+#include <unistd.h>
+static int fixture_unlink(const char *path);
+#define unlink fixture_unlink
 #include "../../backend/access/transam/clog.c"
 #include "../../backend/access/transam/slru.c"
 
+#undef unlink
 #undef printf
 #undef fprintf
 #undef snprintf
@@ -45,7 +49,8 @@ uint32 *my_wait_event_info = &wait_event;
 static char fixture_root[MAXPGPATH];
 static bool authority = true, revoke_on_lock, expect_error, fail_open, fail_sync, fail_dirsync;
 static bool revoke_after_read, revoke_after_sync;
-static bool fail_read;
+static bool fail_read, fail_unlink;
+static unsigned deleted;
 static int transient_fds;
 static unsigned writes, syncs, dirsyncs, reads;
 static bool observe_sync_order;
@@ -323,6 +328,41 @@ fsync_fname(const char *path, bool isdir)
 	UT_ASSERT_EQ(rc, 0);
 }
 
+
+/* Only syscall failure delivery is replaced; the native deletion body runs. */
+static int
+fixture_unlink(const char *path)
+{
+	if (fail_unlink) {
+		errno = EIO;
+		return -1;
+	}
+	deleted++;
+	return unlink(path);
+}
+DIR *
+AllocateDir(const char *path)
+{
+	DIR *dir = opendir(path);
+	if (dir == NULL)
+		(void)errstart(ERROR, NULL);
+	return dir;
+}
+struct dirent *
+ReadDir(DIR *dir, const char *path pg_attribute_unused())
+{
+	struct dirent *entry;
+	errno = 0;
+	entry = readdir(dir);
+	if (entry == NULL && errno != 0)
+		(void)errstart(ERROR, NULL);
+	return entry;
+}
+int
+FreeDir(DIR *dir)
+{
+	return closedir(dir);
+}
 
 static void
 fixture_idle(void)
@@ -671,6 +711,187 @@ UT_TEST(interrupted_subcommit_can_resume_from_original_terminal)
 	fixture_idle();
 }
 
+static ClusterSideProjectionOperationV1
+fixture_clog_record(bool truncate, int page)
+{
+	ClusterSideProjectionOperationV1 op = { 0 };
+	op.kind = CLUSTER_SIDE_PROJECTION_CLOG;
+	op.action = truncate ? CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE
+						 : CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE;
+	op.normalized_info = truncate ? CLOG_TRUNCATE : CLOG_ZEROPAGE;
+	op.page_number = page;
+	if (truncate) {
+		op.oldest_xid = (uint32)page * CLOG_XACTS_PER_PAGE + 1;
+		op.oldest_database = 5;
+	}
+	return op;
+}
+static bool
+fixture_exists(int page)
+{
+	char path[MAXPGPATH];
+	struct stat st;
+	fixture_path(page, path);
+	return lstat(path, &st) == 0;
+}
+UT_TEST(native_zero_record_creates_and_reads_back_only_its_exact_page)
+{
+	ClusterSideProjectionOperationV1 op = fixture_clog_record(false, 97);
+	TransactionId xid = 97 * CLOG_XACTS_PER_PAGE + 1;
+	unsigned before_sync = syncs, before_dirsync = dirsyncs;
+	fixture_zero(96);
+	fixture_bit(96 * CLOG_XACTS_PER_PAGE + 7, TRANSACTION_STATUS_COMMITTED);
+	UT_ASSERT(!cluster_clog_native_recovery_record_verify_v1(1, &op));
+	UT_ASSERT(cluster_clog_native_recovery_record_apply_v1(1, &op));
+	UT_ASSERT(cluster_clog_native_recovery_record_verify_v1(1, &op));
+	UT_ASSERT_EQ(fixture_status(xid), TRANSACTION_STATUS_IN_PROGRESS);
+	UT_ASSERT_EQ(fixture_status(96 * CLOG_XACTS_PER_PAGE + 7), TRANSACTION_STATUS_COMMITTED);
+	fixture_bit(xid, TRANSACTION_STATUS_ABORTED);
+	UT_ASSERT(!cluster_clog_native_recovery_record_verify_v1(1, &op));
+	UT_ASSERT(cluster_clog_native_recovery_record_apply_v1(1, &op));
+	UT_ASSERT_EQ(fixture_status(xid), TRANSACTION_STATUS_IN_PROGRESS);
+	UT_ASSERT(syncs > before_sync && dirsyncs > before_dirsync);
+	op = fixture_clog_record(false, 128);
+	UT_ASSERT(!fixture_exists(128));
+	UT_ASSERT(cluster_clog_native_recovery_record_apply_v1(1, &op));
+	UT_ASSERT(cluster_clog_native_recovery_record_verify_v1(1, &op));
+	fixture_idle();
+}
+UT_TEST(native_truncate_keeps_partial_segment_and_wrap_boundary)
+{
+	ClusterSideProjectionOperationV1 op = fixture_clog_record(true, 97);
+	unsigned before = deleted;
+	fixture_zero(0);
+	fixture_zero(32);
+	fixture_zero(64);
+	fixture_zero(96);
+	fixture_zero(128);
+	UT_ASSERT(!cluster_clog_native_recovery_record_verify_v1(1, &op));
+	UT_ASSERT(cluster_clog_native_recovery_record_apply_v1(1, &op));
+	UT_ASSERT(cluster_clog_native_recovery_record_verify_v1(1, &op));
+	UT_ASSERT(!fixture_exists(0) && !fixture_exists(32) && !fixture_exists(64));
+	UT_ASSERT(fixture_exists(96) && fixture_exists(128));
+	UT_ASSERT(deleted >= before + 3);
+	before = deleted;
+	UT_ASSERT(cluster_clog_native_recovery_record_apply_v1(1, &op));
+	UT_ASSERT_EQ(deleted, before);
+	/* Across uint32 wrap the last segment is old; the half-range is not. */
+	fixture_zero(131040);
+	fixture_zero(0);
+	fixture_zero(32);
+	fixture_zero(65568);
+	op = fixture_clog_record(true, 32);
+	UT_ASSERT(cluster_clog_native_recovery_record_apply_v1(1, &op));
+	UT_ASSERT(!fixture_exists(131040) && !fixture_exists(0));
+	UT_ASSERT(fixture_exists(32) && fixture_exists(65568));
+	fixture_idle();
+}
+UT_TEST(native_clog_record_bad_scope_and_shape_do_not_write_or_delete)
+{
+	unsigned before_writes = writes, before_deleted = deleted;
+	ClusterSideProjectionOperationV1 op;
+	for (int fault = 0; fault < 10; fault++) {
+		op = fixture_clog_record(fault >= 4, 97);
+		if (fault == 0)
+			op.kind = CLUSTER_SIDE_PROJECTION_COMMIT_TS;
+		if (fault == 1)
+			op.action = CLUSTER_SIDE_PROJECTION_ACTION_CREATE;
+		if (fault == 2)
+			op.normalized_info = CLOG_TRUNCATE;
+		if (fault == 3)
+			op.page_number = 131072;
+		if (fault == 4)
+			op.oldest_xid = InvalidTransactionId;
+		if (fault == 5)
+			op.oldest_database = InvalidOid;
+		if (fault == 6)
+			op.page_number++;
+		if (fault == 7)
+			op.page_number = -1;
+		if (fault == 8)
+			authority = false;
+		if (fault == 9)
+			InRecovery = false;
+		UT_ASSERT(!cluster_clog_native_recovery_record_apply_v1(1, &op));
+		UT_ASSERT(!cluster_clog_native_recovery_record_verify_v1(1, &op));
+		authority = InRecovery = true;
+	}
+	op = fixture_clog_record(false, 97);
+	UT_ASSERT(!cluster_clog_native_recovery_record_apply_v1(0, &op));
+	UT_ASSERT(!cluster_clog_native_recovery_record_apply_v1(2, &op));
+	UT_ASSERT(!cluster_clog_native_recovery_record_apply_v1(1, NULL));
+	UT_ASSERT_EQ(writes, before_writes);
+	UT_ASSERT_EQ(deleted, before_deleted);
+	fixture_idle();
+}
+UT_TEST(native_clog_record_alias_and_unlink_failure_remain_incomplete)
+{
+	ClusterSideProjectionOperationV1 op = fixture_clog_record(false, 160);
+	char path[MAXPGPATH], alias[MAXPGPATH];
+	unsigned before = writes;
+	fixture_zero(160);
+	fixture_path(160, path);
+	snprintf(alias, sizeof(alias), "%s.alias", path);
+	UT_ASSERT_EQ(link(path, alias), 0);
+	UT_ASSERT(!cluster_clog_native_recovery_record_apply_v1(1, &op));
+	UT_ASSERT_EQ(writes, before);
+	UT_ASSERT_EQ(unlink(alias), 0);
+	/* All eligible files must preflight before even the first deletion. */
+	fixture_zero(0);
+	fixture_zero(32);
+	fixture_path(32, path);
+	snprintf(alias, sizeof(alias), "%s.alias", path);
+	UT_ASSERT_EQ(link(path, alias), 0);
+	op = fixture_clog_record(true, 97);
+	before = deleted;
+	UT_ASSERT(!cluster_clog_native_recovery_record_apply_v1(1, &op));
+	UT_ASSERT_EQ(deleted, before);
+	UT_ASSERT(fixture_exists(0) && fixture_exists(32));
+	UT_ASSERT_EQ(unlink(alias), 0);
+	fixture_zero(0);
+	op = fixture_clog_record(true, 32);
+	fail_unlink = true;
+	UT_ASSERT(!cluster_clog_native_recovery_record_apply_v1(1, &op));
+	fail_unlink = false;
+	UT_ASSERT(fixture_exists(0));
+	UT_ASSERT(!cluster_clog_native_recovery_record_verify_v1(1, &op));
+	UT_ASSERT(cluster_clog_native_recovery_record_apply_v1(1, &op));
+	UT_ASSERT(!fixture_exists(0));
+	fixture_idle();
+}
+UT_TEST(native_clog_record_io_error_releases_original_locks_and_private_cache)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		ClusterSideProjectionOperationV1 op
+			= fixture_clog_record(fault == 4, fault == 4 ? 32 : 160);
+		volatile bool caught = false;
+		bool result = false;
+		if (fault == 4)
+			fixture_zero(0);
+		fail_open = fault == 0;
+		fail_sync = fault == 1;
+		fail_dirsync = fault == 2 || fault == 4;
+		revoke_after_sync = fault == 3;
+		expect_error = true;
+		PG_TRY();
+		{
+			result = cluster_clog_native_recovery_record_apply_v1(1, &op);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught || !result);
+		UT_ASSERT_EQ(caught, fault == 0 || fault == 2 || fault == 4);
+		expect_error = fail_open = fail_sync = fail_dirsync = revoke_after_sync = false;
+		authority = true;
+		fixture_idle();
+		UT_ASSERT(cluster_clog_native_recovery_record_apply_v1(1, &op));
+		UT_ASSERT(cluster_clog_native_recovery_record_verify_v1(1, &op));
+	}
+}
+
 static void
 fixture_cleanup(void)
 {
@@ -711,7 +932,7 @@ main(void)
 			return 2;
 	}
 	clog_recovery_shmem_init();
-	UT_PLAN(12);
+	UT_PLAN(17);
 	UT_RUN(separate_original_origin_controls);
 	UT_RUN(commit_and_abort_persist_full_tree_without_local_pollution);
 	UT_RUN(conflicting_late_child_refuses_before_any_tree_write);
@@ -724,6 +945,11 @@ main(void)
 	UT_RUN(authority_loss_after_sync_does_not_report_completion);
 	UT_RUN(base_change_after_native_read_refuses_without_writes);
 	UT_RUN(interrupted_subcommit_can_resume_from_original_terminal);
+	UT_RUN(native_zero_record_creates_and_reads_back_only_its_exact_page);
+	UT_RUN(native_truncate_keeps_partial_segment_and_wrap_boundary);
+	UT_RUN(native_clog_record_bad_scope_and_shape_do_not_write_or_delete);
+	UT_RUN(native_clog_record_alias_and_unlink_failure_remain_incomplete);
+	UT_RUN(native_clog_record_io_error_releases_original_locks_and_private_cache);
 	fixture_cleanup();
 	UT_DONE();
 	return ut_failed_count != 0;
