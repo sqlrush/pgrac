@@ -17,6 +17,10 @@
 #include "catalog/pg_class.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
+#include "access/xlog.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_ko.h"
+#include "cluster/storage/cluster_smgr.h"
 #include "storage/bufmgr.h"
 #include "storage/smgr.h"
 #include "utils/rel.h"
@@ -32,6 +36,49 @@ static bool registered, refuse_copy;
 static unsigned opens, qualifications;
 static jmp_buf refusal_jump;
 static uint64 destination_identity;
+
+/* This older fork-selection fixture uses the native/nonshared route. The
+ * finite-owner branches of these exact callers run in copy_version. */
+bool cluster_enabled = false, cluster_shared_config = false;
+int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+bool
+RecoveryInProgress(void)
+{
+	return false;
+}
+
+int
+cluster_smgr_which_for(RelFileLocator locator, BackendId backend)
+{
+	abort();
+}
+
+bool
+cluster_ko_create_begin_v3(RelFileLocator locator, uint64 *serial)
+{
+	abort();
+}
+
+bool
+cluster_ko_create_write_begin_v3(RelFileLocator locator, uint64 serial)
+{
+	abort();
+}
+
+void
+cluster_ko_create_abort_v3(uint64 serial)
+{
+	abort();
+}
+
+bool
+cluster_ko_create_end_v3(uint64 serial, bool complete)
+{
+	abort();
+}
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -162,9 +209,14 @@ smgrcloserellocator(RelFileLocatorBackend locator)
 }
 
 /* Exact production owner bodies, extracted by name with count guards. */
+#undef elog
+#define elog(elevel, ...) abort()
+#define pg_re_throw abort
 #include "test_cluster_space_copy_heap.inc"
 #include "test_cluster_space_copy_index.inc"
 #include "test_cluster_space_copy_database.inc"
+#undef pg_re_throw
+#undef elog
 
 static void
 reset(char persistence)

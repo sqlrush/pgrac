@@ -34,6 +34,7 @@
 #include "storage/bufmgr.h"
 #include "storage/smgr.h"
 #include "storage/shmem.h"
+#include "utils/rel.h"
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
@@ -889,6 +890,112 @@ fixture_copy_fork_close(RelFileLocatorBackend locator)
 #undef log_smgrcreate
 #undef smgrcloserellocator
 
+/* The two tablespace-copy callers execute in full. Their original MAIN,
+ * raw-copy, flush/drop and SMGR operations are explicit fixture boundaries. */
+static RelationData raw_relation;
+static FormData_pg_class raw_relation_class;
+static unsigned raw_opens, raw_flushes, raw_drops, raw_closes;
+
+void
+smgrsetowner(SMgrRelation *owner, SMgrRelation rel)
+{
+	/* Both callers start with the original source handle installed. */
+	abort();
+}
+
+static void
+fixture_raw_check(RelFileLocator locator, char persistence, const char *operation)
+{
+	UT_ASSERT(RelFileLocatorEquals(locator, identity.key.locator));
+	UT_ASSERT_EQ(persistence, raw_relation_class.relpersistence);
+	UT_ASSERT(strcmp(operation, "copy") == 0);
+	copy_storage_checks++;
+	if (refuse_copy_storage)
+		longjmp(error_jump, 1);
+}
+
+static SMgrRelation
+fixture_raw_open(RelFileLocator locator, BackendId backend)
+{
+	UT_ASSERT(RelFileLocatorEquals(locator, identity.key.locator));
+	UT_ASSERT_EQ(backend, raw_relation.rd_backend);
+	UT_ASSERT(!copy_live);
+	raw_opens++;
+	return &destination;
+}
+
+static SMgrRelation
+fixture_raw_main(RelFileLocator locator, char persistence, bool register_delete)
+{
+	UT_ASSERT(RelFileLocatorEquals(locator, identity.key.locator));
+	UT_ASSERT_EQ(persistence, raw_relation_class.relpersistence);
+	UT_ASSERT(register_delete && !copy_live);
+	main_creates++;
+	return &destination;
+}
+
+static void
+fixture_raw_data(SMgrRelation src, SMgrRelation dst, ForkNumber fork, char persistence)
+{
+	UT_ASSERT(src == &source && dst == &destination);
+	UT_ASSERT_EQ(persistence, raw_relation_class.relpersistence);
+	fixture_copy_fork_data(src->smgr_rlocator.locator, dst->smgr_rlocator.locator, fork,
+						   persistence == RELPERSISTENCE_PERMANENT);
+}
+
+static void
+fixture_raw_flush(Relation rel)
+{
+	UT_ASSERT(rel == &raw_relation && !copy_live);
+	raw_flushes++;
+}
+
+static void
+fixture_raw_drop(Relation rel)
+{
+	UT_ASSERT(rel == &raw_relation && !copy_live);
+	raw_drops++;
+}
+
+static void
+fixture_raw_close(SMgrRelation rel)
+{
+	UT_ASSERT(rel == &destination && !copy_live);
+	raw_closes++;
+}
+
+#define RelationCheckStorageTransaction fixture_raw_check
+#define RelationCreateStorage fixture_raw_main
+#define RelationCopyStorage fixture_raw_data
+#define FlushRelationBuffers fixture_raw_flush
+#define RelationDropStorage fixture_raw_drop
+#define smgropen fixture_raw_open
+#define smgrexists fixture_copy_fork_exists
+#define smgrcreate fixture_copy_fork_create
+#define log_smgrcreate fixture_copy_fork_wal
+#define smgrclose fixture_raw_close
+#include "test_cluster_space_copy_index.inc"
+#include "test_cluster_space_copy_heap.inc"
+#undef RelationCheckStorageTransaction
+#undef RelationCreateStorage
+#undef RelationCopyStorage
+#undef FlushRelationBuffers
+#undef RelationDropStorage
+#undef smgropen
+#undef smgrexists
+#undef smgrcreate
+#undef log_smgrcreate
+#undef smgrclose
+
+static void
+run_raw_caller(unsigned caller)
+{
+	if (caller == 0)
+		index_copy_data(&raw_relation, identity.key.locator);
+	else
+		heapam_relation_copy_data(&raw_relation, &identity.key.locator);
+}
+
 static void
 reset(ForkNumber forknum)
 {
@@ -959,6 +1066,14 @@ reset(ForkNumber forknum)
 	fork_last_created = InvalidForkNumber;
 	fork_refuse_next = false;
 	fork_permanent = true;
+	memset(&raw_relation, 0, sizeof(raw_relation));
+	memset(&raw_relation_class, 0, sizeof(raw_relation_class));
+	raw_relation.rd_rel = &raw_relation_class;
+	raw_relation.rd_smgr = &source;
+	raw_relation.rd_locator = source.smgr_rlocator.locator;
+	raw_relation.rd_backend = InvalidBackendId;
+	raw_relation_class.relpersistence = RELPERSISTENCE_PERMANENT;
+	raw_opens = raw_flushes = raw_drops = raw_closes = 0;
 	source_blocks = 1;
 	InterruptPending = false;
 	cluster_enabled = true;
@@ -1962,10 +2077,234 @@ UT_TEST(test_auxiliary_unlogged_forks_keep_init_only_wal_and_finite_owner)
 	UT_ASSERT_EQ(fork_owner_observed, 7);
 }
 
+UT_TEST(test_raw_fork_both_callers_hold_owner_through_create_and_wal)
+{
+	for (unsigned caller = 0; caller < 2; caller++) {
+		reset(MAIN_FORKNUM);
+		extra_forks = (1U << FSM_FORKNUM) | (1U << VISIBILITYMAP_FORKNUM) | (1U << SPACE_FORKNUM);
+		run_raw_caller(caller);
+		UT_ASSERT_EQ(copy_begins, 2);
+		UT_ASSERT_EQ(copy_ends, 2);
+		UT_ASSERT_EQ(copy_aborts, 0);
+		UT_ASSERT_EQ(fork_creates, 2);
+		UT_ASSERT_EQ(fork_wal, 2);
+		UT_ASSERT_EQ(fork_copies, 2);
+		UT_ASSERT_EQ(fork_owner_observed, (1U << (FORK_CREATE - 1)) | (1U << (FORK_WAL - 1)));
+		UT_ASSERT_EQ(main_creates + main_copies, 2);
+		UT_ASSERT_EQ(raw_opens + raw_flushes + raw_drops + raw_closes, 4);
+		UT_ASSERT(!copy_live && !copy_failed_retained && !buffer_copy_scope);
+	}
+}
+
+UT_TEST(test_raw_fork_refusal_precedes_auxiliary_effects)
+{
+	for (unsigned caller = 0; caller < 2; caller++) {
+		volatile bool caught = false;
+		reset(MAIN_FORKNUM);
+		extra_forks = 1U << FSM_FORKNUM;
+		copy_begin_allowed = false;
+		expecting_error = true;
+		if (setjmp(error_jump) == 0)
+			run_raw_caller(caller);
+		else
+			caught = true;
+		expecting_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(copy_begins, 1);
+		UT_ASSERT_EQ(fork_creates + fork_wal + fork_copies + raw_drops + raw_closes, 0);
+		UT_ASSERT_EQ(copy_ends + copy_aborts, 0);
+		UT_ASSERT_EQ(main_creates + main_copies + raw_flushes + raw_opens, 4);
+		UT_ASSERT(!copy_live);
+	}
+}
+
+UT_TEST(test_raw_fork_initial_owner_loss_precedes_create)
+{
+	for (unsigned caller = 0; caller < 2; caller++) {
+		volatile bool caught = false;
+		reset(MAIN_FORKNUM);
+		extra_forks = 1U << FSM_FORKNUM;
+		copy_permission = false;
+		expecting_error = true;
+		if (setjmp(error_jump) == 0)
+			run_raw_caller(caller);
+		else
+			caught = true;
+		expecting_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(copy_begins, 1);
+		UT_ASSERT_EQ(copy_aborts, 1);
+		UT_ASSERT_EQ(fork_creates + fork_wal + fork_copies + copy_ends + raw_drops, 0);
+		UT_ASSERT(copy_live && copy_aborting && !copy_armed);
+	}
+}
+
+UT_TEST(test_raw_fork_loss_after_create_prevents_wal_and_copy)
+{
+	for (unsigned caller = 0; caller < 2; caller++) {
+		volatile bool caught = false;
+		reset(MAIN_FORKNUM);
+		extra_forks = 1U << FSM_FORKNUM;
+		fork_lose_site = FORK_CREATE;
+		expecting_error = true;
+		if (setjmp(error_jump) == 0)
+			run_raw_caller(caller);
+		else
+			caught = true;
+		expecting_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(fork_creates, 1);
+		UT_ASSERT_EQ(copy_aborts, 1);
+		UT_ASSERT_EQ(fork_wal + fork_copies + copy_ends + raw_drops, 0);
+		UT_ASSERT(copy_live && copy_aborting && copy_armed);
+	}
+}
+
+UT_TEST(test_raw_fork_errors_keep_original_owner)
+{
+	for (unsigned caller = 0; caller < 2; caller++)
+		for (unsigned site = FORK_CREATE; site <= FORK_WAL; site++) {
+			volatile bool caught = false;
+			reset(MAIN_FORKNUM);
+			extra_forks = 1U << FSM_FORKNUM;
+			fork_fail_site = site;
+			expecting_error = true;
+			if (setjmp(error_jump) == 0)
+				run_raw_caller(caller);
+			else
+				caught = true;
+			expecting_error = false;
+			UT_ASSERT(caught);
+			UT_ASSERT_EQ(copy_aborts, 1);
+			UT_ASSERT_EQ(copy_ends + fork_copies + raw_drops + raw_closes, 0);
+			UT_ASSERT_EQ(fork_creates, 1);
+			UT_ASSERT_EQ(fork_wal, site == FORK_WAL ? 1 : 0);
+			UT_ASSERT(copy_live && copy_aborting && copy_armed);
+			UT_ASSERT(PG_exception_stack == NULL);
+		}
+}
+
+UT_TEST(test_raw_fork_end_failure_prevents_copy_and_old_drop)
+{
+	for (unsigned caller = 0; caller < 2; caller++) {
+		volatile bool caught = false;
+		reset(MAIN_FORKNUM);
+		extra_forks = 1U << FSM_FORKNUM;
+		fork_lose_site = FORK_WAL;
+		expecting_error = true;
+		if (setjmp(error_jump) == 0)
+			run_raw_caller(caller);
+		else
+			caught = true;
+		expecting_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(fork_creates + fork_wal, 2);
+		UT_ASSERT_EQ(copy_ends, 1);
+		UT_ASSERT_EQ(fork_copies + copy_aborts + raw_drops + raw_closes, 0);
+		UT_ASSERT(copy_failed_retained);
+	}
+}
+
+UT_TEST(test_raw_fork_new_fork_requires_independent_admission)
+{
+	for (unsigned caller = 0; caller < 2; caller++) {
+		volatile bool caught = false;
+		reset(MAIN_FORKNUM);
+		extra_forks = (1U << FSM_FORKNUM) | (1U << VISIBILITYMAP_FORKNUM);
+		fork_refuse_next = true;
+		expecting_error = true;
+		if (setjmp(error_jump) == 0)
+			run_raw_caller(caller);
+		else
+			caught = true;
+		expecting_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(copy_begins, 2);
+		UT_ASSERT_EQ(copy_ends, 1);
+		UT_ASSERT_EQ(fork_creates + fork_wal + fork_copies, 3);
+		UT_ASSERT_EQ(copy_aborts + raw_drops + raw_closes, 0);
+		UT_ASSERT(!copy_live);
+	}
+}
+
+UT_TEST(test_raw_fork_native_private_temp_recovery_and_empty_unchanged)
+{
+	for (unsigned caller = 0; caller < 2; caller++)
+		for (unsigned variant = 0; variant < 6; variant++) {
+			reset(MAIN_FORKNUM);
+			extra_forks = 1U << SPACE_FORKNUM;
+			if (variant != 0)
+				extra_forks |= 1U << FSM_FORKNUM;
+			cluster_shared_config = variant != 1;
+			private_storage = variant == 2;
+			cluster_enabled = variant != 3;
+			fixture_recovering = variant == 4;
+			if (variant == 5) {
+				raw_relation_class.relpersistence = RELPERSISTENCE_TEMP;
+				raw_relation.rd_backend = 9;
+				fork_permanent = false;
+			}
+			copy_begin_allowed = false;
+			run_raw_caller(caller);
+			UT_ASSERT_EQ(copy_begins + copy_ends + copy_aborts, 0);
+			UT_ASSERT_EQ(fork_creates, variant == 0 ? 0 : 1);
+			UT_ASSERT_EQ(fork_wal, variant == 0 || variant == 5 ? 0 : 1);
+			UT_ASSERT_EQ(fork_copies, variant == 0 ? 0 : 1);
+			UT_ASSERT_EQ(raw_drops + raw_closes, 2);
+			UT_ASSERT_EQ(fork_owner_observed, 0);
+		}
+}
+
+UT_TEST(test_raw_fork_unlogged_init_only_wal_unchanged)
+{
+	for (unsigned caller = 0; caller < 2; caller++) {
+		reset(MAIN_FORKNUM);
+		extra_forks = (1U << FSM_FORKNUM) | (1U << VISIBILITYMAP_FORKNUM) | (1U << INIT_FORKNUM);
+		fork_permanent = false;
+		raw_relation_class.relpersistence = RELPERSISTENCE_UNLOGGED;
+		run_raw_caller(caller);
+		UT_ASSERT_EQ(copy_begins, 3);
+		UT_ASSERT_EQ(copy_ends, 3);
+		UT_ASSERT_EQ(fork_creates, 3);
+		UT_ASSERT_EQ(fork_copies, 3);
+		UT_ASSERT_EQ(fork_wal, 1);
+		UT_ASSERT_EQ(copy_aborts, 0);
+	}
+}
+
+UT_TEST(test_raw_fork_r1_refusal_remains_before_any_open_or_effect)
+{
+	for (unsigned caller = 0; caller < 2; caller++) {
+		volatile bool caught = false;
+		reset(MAIN_FORKNUM);
+		extra_forks = 1U << FSM_FORKNUM;
+		refuse_copy_storage = true;
+		if (setjmp(error_jump) == 0)
+			run_raw_caller(caller);
+		else
+			caught = true;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(copy_storage_checks, 1);
+		UT_ASSERT_EQ(raw_opens + raw_flushes + main_creates + main_copies + copy_begins
+						 + fork_creates + fork_wal + fork_copies + raw_drops + raw_closes,
+					 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(45);
+	UT_PLAN(55);
+	UT_RUN(test_raw_fork_both_callers_hold_owner_through_create_and_wal);
+	UT_RUN(test_raw_fork_refusal_precedes_auxiliary_effects);
+	UT_RUN(test_raw_fork_initial_owner_loss_precedes_create);
+	UT_RUN(test_raw_fork_loss_after_create_prevents_wal_and_copy);
+	UT_RUN(test_raw_fork_errors_keep_original_owner);
+	UT_RUN(test_raw_fork_end_failure_prevents_copy_and_old_drop);
+	UT_RUN(test_raw_fork_new_fork_requires_independent_admission);
+	UT_RUN(test_raw_fork_native_private_temp_recovery_and_empty_unchanged);
+	UT_RUN(test_raw_fork_unlogged_init_only_wal_unchanged);
+	UT_RUN(test_raw_fork_r1_refusal_remains_before_any_open_or_effect);
 	UT_RUN(test_auxiliary_fork_create_holds_owner_through_native_wal);
 	UT_RUN(test_auxiliary_fork_refusal_precedes_its_open_create_and_wal);
 	UT_RUN(test_auxiliary_fork_owner_loss_after_create_prevents_wal_and_copy);

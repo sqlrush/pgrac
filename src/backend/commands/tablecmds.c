@@ -48,7 +48,9 @@
 #include "catalog/pg_trigger.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h" /* PGRAC: spec-6.14 Q12 shared-catalog SET UNLOGGED refusal */
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_ts.h" /* PGRAC: spec-5.7 TT (§3.3) placement TT(S) guard */
+#include "cluster/storage/cluster_smgr.h"
 #endif
 #include "catalog/pg_type.h"
 #include "catalog/storage.h"
@@ -15379,16 +15381,52 @@ index_copy_data(Relation rel, RelFileLocator newrlocator)
 #endif
 		if (smgrexists(RelationGetSmgr(rel), forkNum))
 		{
-			smgrcreate(dstrel, forkNum, false);
+#ifdef USE_PGRAC_CLUSTER
+			uint64 fork_serial = 0;
+			bool fork_scoped = cluster_enabled && cluster_shared_config
+							   && cluster_interconnect_tier == CLUSTER_IC_TIER_1
+							   && !RecoveryInProgress()
+							   && rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP
+							   && cluster_smgr_which_for(newrlocator, rel->rd_backend) == 1;
 
-			/*
+			/* This constructor precedes the raw copy's separate finite owner. */
+			if (fork_scoped && !cluster_ko_create_begin_v3(newrlocator, &fork_serial))
+				elog(ERROR, "auxiliary fork creation conflicts with object drain");
+			PG_TRY();
+			{
+				if (fork_serial != 0 && !cluster_ko_create_write_begin_v3(newrlocator, fork_serial))
+					elog(ERROR, "auxiliary fork creation lost its original owner");
+#endif
+				smgrcreate(dstrel, forkNum, false);
+
+				/*
 			 * WAL log creation if the relation is persistent, or this is the
 			 * init fork of an unlogged relation.
 			 */
-			if (RelationIsPermanent(rel) ||
-				(rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED &&
-				 forkNum == INIT_FORKNUM))
-				log_smgrcreate(&newrlocator, forkNum);
+#ifdef USE_PGRAC_CLUSTER
+				if (fork_serial != 0
+					&& (RelationIsPermanent(rel)
+						|| (rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED
+							&& forkNum == INIT_FORKNUM))
+					&& !cluster_ko_create_write_begin_v3(newrlocator, fork_serial))
+					elog(ERROR, "auxiliary fork creation lost its owner before WAL");
+#endif
+				if (RelationIsPermanent(rel)
+					|| (rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED
+						&& forkNum == INIT_FORKNUM))
+					log_smgrcreate(&newrlocator, forkNum);
+#ifdef USE_PGRAC_CLUSTER
+			}
+			PG_CATCH();
+			{
+				cluster_ko_create_abort_v3(fork_serial);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+			/* File/WAL cleanup remains with its original owners. */
+			if (fork_serial != 0 && !cluster_ko_create_end_v3(fork_serial, true))
+				elog(ERROR, "auxiliary fork creation cannot retire its original owner");
+#endif
 			RelationCopyStorage(RelationGetSmgr(rel), dstrel, forkNum,
 								rel->rd_rel->relpersistence);
 		}
