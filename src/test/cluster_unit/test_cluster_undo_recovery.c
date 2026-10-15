@@ -13,6 +13,7 @@
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_undo_segment.h"
+#include "cluster/cluster_wal_tail.h"
 #include "cluster/storage/cluster_shared_fs.h"
 #include "unit_test.h"
 
@@ -38,6 +39,30 @@ static ClusterControlRootReadToken token;
 static ClusterRecoverySerialGuard serial;
 static ClusterThreadRecoveryAuthorityV1 authority;
 static const RfSideOnlinePlanV1 *plan = (const RfSideOnlinePlanV1 *)(uintptr_t)1;
+static unsigned wal_sync_calls;
+static int wal_sync_fault;
+
+ClusterControlRootResult
+cluster_control_root_recovery_sync_v1(const ClusterControlRootSnapshot *expected,
+									  const ClusterControlRootReadToken *selected,
+									  ClusterWalTailObservation *out)
+{
+	UT_ASSERT(expected == &root && selected == &token);
+	wal_sync_calls++;
+	memset(out, 0, sizeof(*out));
+	out->complete_end = root.validated_tail_lsn_exclusive;
+	out->last_record_start = root.tail_last_record_lsn;
+	out->last_record_crc = root.tail_last_record_crc32c;
+	if (wal_sync_fault == 2)
+		authority_result = CLUSTER_THREAD_AUTHORITY_FENCE_STALE;
+	if (wal_sync_fault == 3)
+		root.validated_tail_lsn_exclusive++;
+	if (wal_sync_fault == 4)
+		out->complete_end--;
+	if (wal_sync_fault == 5)
+		out->last_record_crc++;
+	return wal_sync_fault == 1 ? CLUSTER_CONTROL_ROOT_IO_ERROR : CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -216,6 +241,37 @@ reset_authority(void)
 	fd_opens = fd_closes = 0;
 	shared_syncs = local_syncs = 0;
 	directory_creates = 0;
+	wal_sync_calls = 0;
+	wal_sync_fault = 0;
+}
+
+UT_TEST(test_cold_source_durability_is_bound_to_original_scope_and_lifetime)
+{
+	for (int fault = 0; fault < 9; fault++) {
+		ClusterUndoRecoveryScopeV1 scope = { 0 };
+		reset_authority();
+		serial.mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+		UT_ASSERT(!cluster_undo_recovery_cold_source_sync_v1(2));
+		UT_ASSERT(cluster_undo_recovery_scope_enter_v1(&scope, &authority, plan));
+		UT_ASSERT(!cluster_undo_recovery_cold_source_synced_v1(2));
+		wal_sync_fault = fault;
+		if (fault == 6)
+			serial.mode = CLUSTER_RECOVERY_SERIAL_ONLINE;
+		if (fault == 7)
+			recovery_purpose = false;
+		UT_ASSERT_EQ(cluster_undo_recovery_cold_source_sync_v1(fault == 8 ? 1 : 2), fault == 0);
+		UT_ASSERT_EQ(wal_sync_calls, fault >= 6 ? 0 : 1);
+		UT_ASSERT_EQ(cluster_undo_recovery_cold_source_synced_v1(2), fault == 0);
+		if (fault == 0) {
+			UT_ASSERT(cluster_undo_recovery_cold_source_sync_v1(2));
+			UT_ASSERT_EQ(wal_sync_calls, 1);
+			UT_ASSERT(!cluster_undo_recovery_cold_source_synced_v1(1));
+			authority_result = CLUSTER_THREAD_AUTHORITY_FENCE_STALE;
+			UT_ASSERT(!cluster_undo_recovery_cold_source_synced_v1(2));
+		}
+		cluster_undo_recovery_scope_leave_v1(&scope);
+		UT_ASSERT(!cluster_undo_recovery_cold_source_synced_v1(2));
+	}
 }
 
 UT_TEST(test_original_resolver_reaches_only_scoped_canonical_origin)
@@ -432,7 +488,8 @@ UT_TEST(test_cold_native_scope_requires_cold_mode_and_executable_plan)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
+	UT_RUN(test_cold_source_durability_is_bound_to_original_scope_and_lifetime);
 	UT_RUN(test_cold_native_scope_requires_cold_mode_and_executable_plan);
 	UT_RUN(test_native_fsync_closes_only_the_canonical_write_obligation);
 	UT_RUN(test_native_directory_creation_uses_same_qualified_namespace);

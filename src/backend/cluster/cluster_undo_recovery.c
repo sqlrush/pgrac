@@ -12,6 +12,7 @@
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/cluster_wal_tail.h"
 #include "cluster/storage/cluster_shared_fs.h"
 
 static ClusterUndoRecoveryScopeV1 *active_scope;
@@ -111,6 +112,37 @@ cluster_undo_recovery_cold_origin_authorized_v1(int origin_node)
 		   && rf_side_online_plan_recovery_source_matches_v1(
 			   active_scope->plan, active_scope->duty.system_identifier,
 			   active_scope->duty.storage_uuid, &active_scope->cut);
+}
+
+bool
+cluster_undo_recovery_cold_source_sync_v1(int origin_node)
+{
+	ClusterUndoRecoveryScopeV1 *scope = active_scope;
+	ClusterWalTailObservation observed;
+	const ClusterControlRootSnapshot *root;
+
+	if (!cluster_undo_recovery_cold_origin_authorized_v1(origin_node))
+		return false;
+	if (scope->wal_synced)
+		return true;
+	root = scope->authority->root_snapshot;
+	/* No cache survives this scope. ROOT selection, claim/physical files and
+	 * the complete tail are checked by the original owner outside CF. */
+	if (cluster_control_root_recovery_sync_v1(root, scope->authority->root_token, &observed)
+			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| active_scope != scope || !cluster_undo_recovery_cold_origin_authorized_v1(origin_node)
+		|| observed.complete_end != root->validated_tail_lsn_exclusive
+		|| observed.last_record_start != root->tail_last_record_lsn
+		|| observed.last_record_crc != root->tail_last_record_crc32c)
+		return false;
+	scope->wal_synced = true;
+	return true;
+}
+
+bool
+cluster_undo_recovery_cold_source_synced_v1(int origin_node)
+{
+	return cluster_undo_recovery_cold_origin_authorized_v1(origin_node) && active_scope->wal_synced;
 }
 
 int

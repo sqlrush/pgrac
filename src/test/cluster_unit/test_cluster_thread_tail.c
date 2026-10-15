@@ -1460,6 +1460,58 @@ UT_TEST(sealed_reader_needs_native_cut_and_claim)
 	}
 }
 
+UT_TEST(sealed_source_sync_uses_exact_files_and_preserves_failure_cleanup)
+{
+	for (unsigned fault = 0; fault < 10; fault++) {
+		ClusterControlRootSnapshot root = sealed_fixture(false), saved;
+		ClusterWalTailObservation out, zero = { 0 };
+		int fds = fd_count();
+		volatile bool caught = false;
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+
+		local_tli = 88; /* Never flush/rebase to the recoverer's own timeline. */
+		UT_ASSERT_EQ(unlink(prefix_path), 0);
+		tail_sync_count = 0;
+		tail_fail_sync = fault <= 5 ? fault : 0;
+		if (fault == 6)
+			enableFsync = false;
+		if (fault == 7)
+			root.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+		if (fault == 8)
+			root.tail_last_record_crc32c++;
+		if (fault == 9)
+			read_action = 5;
+		saved = root;
+		memset(&out, 0xa5, sizeof(out));
+		PG_TRY();
+		{
+			result = cluster_wal_tail_sync_sealed_v1(scratch, &ref, wal_segment_size, &root,
+													 root.checkpoint_lower_lsn, &out);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 9);
+		if (fault == 0) {
+			UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+			UT_ASSERT_EQ(tail_sync_count, 5); /* segment, claim, three directories */
+			UT_ASSERT_EQ(out.complete_end, root.validated_tail_lsn_exclusive);
+			UT_ASSERT_EQ(out.last_record_crc, root.tail_last_record_crc32c);
+			UT_ASSERT_EQ(out.database_incarnation, ref.claim.database_incarnation);
+		} else {
+			UT_ASSERT(result != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+			UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		}
+		UT_ASSERT_EQ(memcmp(&root, &saved, sizeof(root)), 0);
+		UT_ASSERT_EQ(fd_count(), fds);
+		UT_ASSERT(access(prefix_path, F_OK) != 0 && errno == ENOENT);
+		tail_fail_sync = 0;
+		enableFsync = true;
+	}
+}
+
 UT_TEST(sealed_reader_refuses_changed_cut_and_discards_provisional_output)
 {
 	for (int fault = 0; fault < 9; fault++) {
@@ -1739,7 +1791,8 @@ UT_TEST(prefix_identity_recheck_preserves_cancel_and_close_cleanup)
 int
 main(void)
 {
-	UT_PLAN(58);
+	UT_PLAN(59);
+	UT_RUN(sealed_source_sync_uses_exact_files_and_preserves_failure_cleanup);
 	UT_RUN(prefix_identity_recheck_preserves_cancel_and_close_cleanup);
 	UT_RUN(retained_reader_keeps_lifecycle_and_strict_physical_checks);
 	UT_RUN(retained_input_does_not_open_recovery_or_live_tail);

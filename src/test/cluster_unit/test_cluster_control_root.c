@@ -12566,6 +12566,85 @@ UT_TEST(test_runtime_pending_checkpoint_promotes_without_claiming_recovery_done)
 	}
 }
 
+static int recovery_sync_fault;
+static unsigned recovery_sync_seen;
+
+static void
+recovery_sync_observe(void)
+{
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	recovery_sync_seen++;
+	if (recovery_sync_fault == 3) {
+		test_startup_sync_hook = NULL;
+		v2_checkpoint_root_race();
+	}
+	if (recovery_sync_fault == 4) {
+		test_startup_sync_hook = NULL;
+		pg_re_throw();
+	}
+}
+
+UT_TEST(test_exact_recovery_source_sync_never_publishes_stale_input)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		ClusterRecoverySerialGuard serial;
+		ClusterThreadRecLaunchEligibility eligibility = { 0 };
+		ClusterWalStartupImage op = pending_inspection_fixture(&serial, true);
+		ClusterControlRootSnapshot snapshot;
+		ClusterControlRootReadToken token;
+		ClusterWalTailObservation out, zero = { 0 };
+		volatile bool caught = false;
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		if (ut_current_failed)
+			return;
+		eligibility.origin_thread = 1;
+		eligibility.attempt_stamp = 123;
+		eligibility.subject_kind = CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER;
+		eligibility.duty = op.claim.identity;
+		memcpy(eligibility.selected_root_sha256, serial.pending.file.image_sha256, 32);
+		test_worker_pin_held = false;
+		UT_ASSERT_EQ(thread_recovery_worker_run(&eligibility), CLUSTER_THREADREC_DEFERRED);
+		UT_ASSERT_EQ(
+			cluster_control_root_v3_read_canonical(1, &op.claim.identity, &snapshot, &token), 0);
+		if (ut_current_failed)
+			return;
+		if (fault == 1)
+			token.file_txn_seq++;
+		if (fault == 2)
+			enableFsync = false;
+		test_history_sync_count = 0;
+		test_history_fail_sync = fault == 5 ? 1 : 0;
+		recovery_sync_fault = fault;
+		recovery_sync_seen = 0;
+		test_startup_sync_hook = recovery_sync_observe;
+		memset(&out, 0xa5, sizeof(out));
+		PG_TRY();
+		{
+			result = cluster_control_root_recovery_sync_v1(&snapshot, &token, &out);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		test_startup_sync_hook = NULL;
+		test_history_fail_sync = 0;
+		enableFsync = true;
+		UT_ASSERT_EQ(caught, fault == 4);
+		if (fault == 0) {
+			UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+			UT_ASSERT_EQ(recovery_sync_seen, 5);
+			UT_ASSERT_EQ(out.complete_end, snapshot.validated_tail_lsn_exclusive);
+			UT_ASSERT_EQ(out.last_record_crc, snapshot.tail_last_record_crc32c);
+		} else {
+			UT_ASSERT(result != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+			UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		}
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		test_reserve_mode = false;
+	}
+}
+
 UT_TEST(test_exact_recovery_source_discards_stale_or_cancelled_input)
 {
 	for (int fault = 0; fault < 5; fault++) {
@@ -22736,6 +22815,14 @@ main(int argc, char **argv)
 	if (argc > 1)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_RECOVERY_SYNC") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_exact_recovery_source_sync_never_publishes_stale_input);
+		UT_RUN(test_exact_recovery_source_discards_stale_or_cancelled_input);
+		UT_RUN(test_runtime_pending_checkpoint_promotes_without_claiming_recovery_done);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_NATIVE_SEGMENT_RACE") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(test_native_side_detects_append_after_last_page);
@@ -22868,7 +22955,8 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(458);
+	UT_PLAN(459);
+	UT_RUN(test_exact_recovery_source_sync_never_publishes_stale_input);
 	UT_RUN(test_checkpoint_cf_refusal_cannot_hide_staging_discard_failure);
 	UT_RUN(test_clean_restart_without_provider_keeps_collective_exit_and_actual_install);
 	UT_RUN(test_clean_restart_without_provider_refuses_missing_exit_formation_and_fence);

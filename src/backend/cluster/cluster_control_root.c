@@ -11139,11 +11139,10 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *expect
 	return result;
 }
 
-ClusterControlRootResult
-cluster_control_root_recovery_visit(const ClusterControlRootSnapshot *expected,
-									const ClusterControlRootReadToken *token,
-									ClusterWalRecordVisitor visitor, void *arg,
-									ClusterWalTailObservation *out)
+static ClusterControlRootResult
+recovery_wal_visit(const ClusterControlRootSnapshot *expected,
+				   const ClusterControlRootReadToken *token, ClusterWalRecordVisitor visitor,
+				   void *arg, ClusterWalTailObservation *out, bool sync_inputs)
 {
 	RecoveryWalVisitWork *work;
 	ClusterControlRootResult result;
@@ -11172,9 +11171,14 @@ cluster_control_root_recovery_visit(const ClusterControlRootSnapshot *expected,
 	{
 		result = recovery_wal_visit_root(work);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
-			result = cluster_wal_tail_visit_sealed(
-				cluster_wal_threads_dir, &work->ref, wal_segment_size, &work->expected,
-				work->control.checkPoint, visitor, arg, &work->tail);
+			if (sync_inputs)
+				result = cluster_wal_tail_sync_sealed_v1(cluster_wal_threads_dir, &work->ref,
+														 wal_segment_size, &work->expected,
+														 work->control.checkPoint, &work->tail);
+			else
+				result = cluster_wal_tail_visit_sealed(
+					cluster_wal_threads_dir, &work->ref, wal_segment_size, &work->expected,
+					work->control.checkPoint, visitor, arg, &work->tail);
 		}
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			result = recovery_wal_visit_root(work);
@@ -11191,6 +11195,23 @@ cluster_control_root_recovery_visit(const ClusterControlRootSnapshot *expected,
 		*out = work->tail;
 	pfree(work);
 	return result;
+}
+
+ClusterControlRootResult
+cluster_control_root_recovery_visit(const ClusterControlRootSnapshot *expected,
+									const ClusterControlRootReadToken *token,
+									ClusterWalRecordVisitor visitor, void *arg,
+									ClusterWalTailObservation *out)
+{
+	return recovery_wal_visit(expected, token, visitor, arg, out, false);
+}
+
+ClusterControlRootResult
+cluster_control_root_recovery_sync_v1(const ClusterControlRootSnapshot *expected,
+									  const ClusterControlRootReadToken *token,
+									  ClusterWalTailObservation *out)
+{
+	return recovery_wal_visit(expected, token, NULL, NULL, out, true);
 }
 
 ClusterControlRootResult

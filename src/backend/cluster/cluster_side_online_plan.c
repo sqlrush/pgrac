@@ -48,7 +48,7 @@ struct RfSideOnlinePlanV1 {
 	Size memory_budget;
 	Size memory_used;
 	/* Charged in memory_used: serial preflight/apply needs one aligned copy. */
-	Size cold_cache_scratch_bytes;
+	Size cold_completion_scratch_bytes;
 	uint32 participant_count;
 	RfContributorStreamCutV1 *physical_cuts;
 	XLogRecPtr *redo_starts;
@@ -984,9 +984,10 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 				plan->failed = true;
 			return RF_PAGE_PROOF_DETAIL_CAPACITY;
 		}
-		if (candidate.kind == RF_SIDE_ONLINE_OPERATION_XACT && candidate.xact.cold_cache_effects
-			&& candidate.owned_payload_length > plan->cold_cache_scratch_bytes) {
-			Size extra = candidate.owned_payload_length - plan->cold_cache_scratch_bytes;
+		if (candidate.kind == RF_SIDE_ONLINE_OPERATION_XACT
+			&& candidate.xact.cold_completion_effects
+			&& candidate.owned_payload_length > plan->cold_completion_scratch_bytes) {
+			Size extra = candidate.owned_payload_length - plan->cold_completion_scratch_bytes;
 
 			/* Keep the largest simultaneous native copy separate from both
 			 * owned payload storage and the original page/header scratch. */
@@ -994,7 +995,7 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 				plan->failed = true;
 				return RF_PAGE_PROOF_DETAIL_CAPACITY;
 			}
-			plan->cold_cache_scratch_bytes = candidate.owned_payload_length;
+			plan->cold_completion_scratch_bytes = candidate.owned_payload_length;
 		}
 		candidate.owned_payload_offset = plan->owned_payload_bytes;
 		if (candidate.owned_payload_length > 0) {
@@ -1329,9 +1330,9 @@ side_plan_slot_step(const RfSideOnlinePlanV1 *plan, const RfSideOnlineOperationV
 		&& (op->kind != RF_SIDE_ONLINE_OPERATION_XACT
 			|| op->owned_payload_offset > plan->owned_payload_bytes
 			|| op->owned_payload_length > plan->owned_payload_bytes - op->owned_payload_offset
-			|| !rf_side_xact_cold_cache_preflight_v1(&op->xact,
-													 plan->owned_payload + op->owned_payload_offset,
-													 op->owned_payload_length)))
+			|| !rf_side_xact_cold_completion_preflight_v1(
+				&op->xact, plan->owned_payload + op->owned_payload_offset,
+				op->owned_payload_length)))
 		return CLUSTER_UNDO_HEADER_BLOCKED;
 	if (op->kind == RF_SIDE_ONLINE_OPERATION_XACT) {
 		const xl_xact_tt_commit *d = &op->xact.tt_delta;
@@ -1917,7 +1918,7 @@ rf_side_online_plan_contribution_owners_v1(const RfSideOnlinePlanV1 *plan, uint3
 		switch (op->xact.kind) {
 		case RF_SIDE_XACT_COMMIT:
 			result.owners = RF_SIDE_CONTRIBUTION_UNDO_HEADER | RF_SIDE_CONTRIBUTION_TERMINAL;
-			if (op->xact.pi_read_only || op->xact.cold_cache_effects) {
+			if (op->xact.pi_read_only || op->xact.cold_completion_effects) {
 				if (op->xact.invalidation_count != 0
 					|| XactCompletionRelcacheInitFileInval(op->xact.xinfo))
 					result.owners |= RF_SIDE_CONTRIBUTION_INVALIDATION;

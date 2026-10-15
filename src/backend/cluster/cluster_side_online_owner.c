@@ -171,7 +171,7 @@ side_owner_cold_formed(const RfSideOnlineProductionOwnerV1 *owner)
 }
 
 /* Accept either the original complete top-only COMMIT or the separately
- * bounded cache payload. Other effects still need their actual consumers;
+ * bounded completion payload. Other effects still need their actual consumers;
  * no PI inspection operation can authorize native storage. */
 static bool
 side_owner_cold_commit_ready(RfSideOnlineProductionOwnerV1 *owner,
@@ -181,7 +181,7 @@ side_owner_cold_commit_ready(RfSideOnlineProductionOwnerV1 *owner,
 
 	return operation->kind == RF_SIDE_XACT_COMMIT && !operation->pi_read_only
 		   && operation->has_tt_delta
-		   && (operation->cold_cache_effects
+		   && (operation->cold_completion_effects
 			   || ((operation->xinfo & ~supported) == 0
 				   && operation->completion_payload_length == 0))
 		   && operation->space_drop_count == 0
@@ -319,11 +319,15 @@ side_owner_preflight_xact(void *arg, const RfSideOnlineOperationV1 *operation)
 		return side_owner_cold_abort_ready(owner, operation, &target)
 			   && side_owner_undo_target(owner, target.instance, target.segment_id, 0) != NULL;
 	}
-	if (operation->xact.cold_cache_effects)
+	if (operation->xact.cold_completion_effects)
 		return side_owner_cold_formed(owner) && DatabasePath == NULL
 			   && side_owner_cold_commit_ready(owner, &operation->xact)
-			   && rf_side_xact_cold_cache_preflight_v1(&operation->xact, operation->owned_payload,
-													   operation->owned_payload_length)
+			   && rf_side_xact_cold_completion_preflight_v1(
+				   &operation->xact, operation->owned_payload, operation->owned_payload_length)
+			   && (((operation->xact.xinfo
+					 & (XACT_XINFO_HAS_DROPPED_STATS | XACT_COMPLETION_FORCE_SYNC_COMMIT))
+					== 0)
+				   || cluster_undo_recovery_cold_source_sync_v1(operation->xact.origin_thread - 1))
 			   && side_owner_undo_target(owner, operation->xact.tt_delta.instance,
 										 operation->xact.tt_delta.segment_id, 0)
 					  != NULL;
@@ -467,9 +471,9 @@ side_owner_apply_xact(void *arg, const RfSideOnlineOperationV1 *operation)
 			|| !side_owner_install_target(
 				owner, side_owner_undo_target(owner, d->instance, d->segment_id, 0)))
 			return false;
-		if (operation->xact.cold_cache_effects)
+		if (operation->xact.cold_completion_effects)
 			return side_owner_cold_formed(owner)
-				   && rf_side_xact_apply_cold_cache_commit_v1(
+				   && rf_side_xact_apply_cold_completion_v1(
 						  &operation->xact, operation->owned_payload,
 						  operation->owned_payload_length, owner, side_owner_commit_covered)
 						  == RF_SIDE_XACT_APPLY_OK;

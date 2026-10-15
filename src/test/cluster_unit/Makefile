@@ -2877,7 +2877,12 @@ test_cluster_wal_checkpoint_sample: test_cluster_wal_checkpoint_sample.c unit_te
 
 test_cluster_pi_contribution: test_cluster_page_data_stable.o
 
-test_cluster_side_xact test_cluster_pi_contribution: %: %.c unit_test.h test_cluster_side_xact.c test_cluster_undo_header_identity.inc \
+test_cluster_side_xact_stats.inc: $(top_srcdir)/src/backend/utils/activity/pgstat_xact.c Makefile
+	awk '/^pgstat_execute_transactional_drops\(/ { print "void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_side_xact test_cluster_pi_contribution: %: %.c unit_test.h test_cluster_side_xact.c test_cluster_side_xact_stats.inc test_cluster_undo_header_identity.inc \
 		test_cluster_side_online_owner_product.o \
 		$(CLUSTER_SIDE_XACT_O) $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \

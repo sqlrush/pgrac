@@ -26,6 +26,7 @@
 #include "utils/syscache.h"
 #include "utils/inval.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "cluster/cluster_undo_recovery.h"
 
 #define RF_SIDE_XACT_KNOWN_XINFO                                                                   \
@@ -346,18 +347,40 @@ side_xact_no_abort_effects(const xl_xact_parsed_abort *parsed)
 	return parsed->nsubxacts == 0 && parsed->nrels == 0 && parsed->nstats == 0;
 }
 
+/* Bound native transactional statistics to their original supported owners. */
+static bool
+side_xact_cold_stats_valid(const xl_xact_parsed_commit *parsed)
+{
+	for (int i = 0; i < parsed->nstats; i++) {
+		xl_xact_stats_item item;
+
+		memcpy(&item, &parsed->stats[i], sizeof(item));
+		/* Only the supported native transactional object owners. Fixed stats,
+		 * unknown kinds and unsupported subscription/slot effects cannot reach
+		 * pgstat's unchecked kind table. No catalog read or alternate owner. */
+		if ((item.kind != PGSTAT_KIND_RELATION && item.kind != PGSTAT_KIND_FUNCTION)
+			|| !OidIsValid(item.objoid)
+			|| (item.kind == PGSTAT_KIND_FUNCTION && !OidIsValid(item.dboid))
+			|| ((parsed->xinfo & XACT_XINFO_HAS_DBINFO) != 0 && item.dboid != InvalidOid
+				&& item.dboid != parsed->dbId))
+			return false;
+	}
+	return true;
+}
+
 /* Transactional invalidations affect logical caches, not a physical PAGE or
  * SPACE version. Preserve every message and its scope; inspection never
  * asserts that the original cache owner delivered it. SMGR/RELMAP messages
  * are nontransactional and need a separate dependency classification. */
 static bool
 side_xact_pi_effects_valid(const xl_xact_parsed_commit *parsed, uint64 system_identifier,
-						   RfSideXactOperationV1 *out)
+						   bool cold_completion, RfSideXactOperationV1 *out)
 {
 	uint32 kinds = 0;
 
 	/* These additional transaction owners are not proved by this consumer. */
-	if (parsed->nsubxacts != 0 || parsed->nstats != 0
+	if (parsed->nsubxacts != 0
+		|| (cold_completion ? !side_xact_cold_stats_valid(parsed) : parsed->nstats != 0)
 		|| (parsed->xinfo & XACT_XINFO_HAS_ORIGIN) != 0)
 		return false;
 	/* Every physical deletion must have its typed identity and version pair;
@@ -541,7 +564,7 @@ side_xact_structural_preflight(const RfSideXactOperationV1 *operation, bool pi_r
 	const char *gid_end;
 	Size i;
 
-	if (operation == NULL || operation->cold_cache_effects
+	if (operation == NULL || operation->cold_completion_effects
 		|| operation->pi_read_only != pi_read_only
 		|| (!pi_read_only
 			&& (operation->invalidation_kinds != 0 || operation->invalidation_count != 0
@@ -631,7 +654,7 @@ rf_side_xact_completion_shape_v1(XLogReaderState *record, bool commit)
 
 static bool
 side_xact_decode(XLogReaderState *record, uint64 system_identifier, uint16 origin_thread,
-				 bool pi_read_only, RfSideXactOperationV1 *out)
+				 bool pi_read_only, bool cold_completion, RfSideXactOperationV1 *out)
 {
 	RfSideXactOperationV1 candidate;
 	uint8 opcode;
@@ -660,10 +683,10 @@ side_xact_decode(XLogReaderState *record, uint64 system_identifier, uint16 origi
 		if (!ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)XLogRecGetData(record),
 							   XLogRecGetDataLen(record), &parsed))
 			return false;
-		if ((pi_read_only
-			 ? !side_xact_pi_effects_valid(&parsed, system_identifier, &candidate)
-			 : (!side_xact_no_commit_effects(&parsed)
-				&& !side_xact_space_drops_valid(&parsed, system_identifier)))
+		if ((pi_read_only ? !side_xact_pi_effects_valid(&parsed, system_identifier, cold_completion,
+														&candidate)
+						  : (!side_xact_no_commit_effects(&parsed)
+							 && !side_xact_space_drops_valid(&parsed, system_identifier)))
 			|| (parsed.xinfo & XACT_XINFO_HAS_TWOPHASE) != 0 || !SCN_VALID(parsed.scn)
 			|| side_xact_commit_timestamp(&parsed) == 0 || !parsed.has_tt_commit
 			|| !side_xact_tt_delta_valid(&parsed.tt_commit, origin_thread, xid, parsed.scn))
@@ -788,17 +811,17 @@ bool
 rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier, uint16 origin_thread,
 					   RfSideXactOperationV1 *out)
 {
-	return side_xact_decode(record, system_identifier, origin_thread, false, out);
+	return side_xact_decode(record, system_identifier, origin_thread, false, false, out);
 }
 
 bool
 rf_side_xact_inspect_pi_v1(XLogReaderState *record, uint64 system_identifier, uint16 origin_thread,
 						   RfSideXactOperationV1 *out)
 {
-	return side_xact_decode(record, system_identifier, origin_thread, true, out);
+	return side_xact_decode(record, system_identifier, origin_thread, true, false, out);
 }
 
-/* A recovery plan may retain native cache work that generic apply refuses.
+/* A recovery plan may retain native completion work that generic apply refuses.
  * Use the same bounded parser and message validation as inspection, but
  * produce a distinct operation that requires the executable cold owner. */
 bool
@@ -807,19 +830,23 @@ rf_side_xact_decode_recovery_v1(XLogReaderState *record, uint64 system_identifie
 {
 	RfSideXactOperationV1 candidate;
 	const uint32 supported = XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_TT_COMMIT
-							 | XACT_XINFO_HAS_INVALS | XACT_COMPLETION_UPDATE_RELCACHE_FILE;
+							 | XACT_XINFO_HAS_INVALS | XACT_COMPLETION_UPDATE_RELCACHE_FILE
+							 | XACT_XINFO_HAS_DROPPED_STATS | XACT_COMPLETION_FORCE_SYNC_COMMIT;
 
 	if (out == NULL)
 		return false;
 	if (rf_side_xact_decode_v1(record, system_identifier, origin_thread, out))
 		return true;
-	if (!side_xact_decode(record, system_identifier, origin_thread, true, &candidate)
+	if (!side_xact_decode(record, system_identifier, origin_thread, true, true, &candidate)
 		|| candidate.kind != RF_SIDE_XACT_COMMIT || (candidate.xinfo & ~supported) != 0
-		|| candidate.invalidation_count == 0 || candidate.relation_count != 0
-		|| candidate.space_drop_count != 0)
+		|| (candidate.invalidation_count == 0
+			&& (candidate.xinfo
+				& (XACT_XINFO_HAS_DROPPED_STATS | XACT_COMPLETION_FORCE_SYNC_COMMIT))
+				   == 0)
+		|| candidate.relation_count != 0 || candidate.space_drop_count != 0)
 		return false;
 	candidate.pi_read_only = false;
-	candidate.cold_cache_effects = true;
+	candidate.cold_completion_effects = true;
 	*out = candidate;
 	return true;
 }
@@ -827,8 +854,8 @@ rf_side_xact_decode_recovery_v1(XLogReaderState *record, uint64 system_identifie
 /* Re-parse the complete owned bytes before any target in the protected set
  * is changed. The plan's source/cut binding remains an independent gate. */
 bool
-rf_side_xact_cold_cache_preflight_v1(const RfSideXactOperationV1 *operation, const uint8 *payload,
-									 uint32 length)
+rf_side_xact_cold_completion_preflight_v1(const RfSideXactOperationV1 *operation,
+										  const uint8 *payload, uint32 length)
 {
 	XLogReaderState record = { 0 };
 	DecodedXLogRecord decoded = { 0 };
@@ -836,7 +863,7 @@ rf_side_xact_cold_cache_preflight_v1(const RfSideXactOperationV1 *operation, con
 	uint8 *copy;
 	bool valid;
 
-	if (operation == NULL || !operation->cold_cache_effects || operation->pi_read_only
+	if (operation == NULL || !operation->cold_completion_effects || operation->pi_read_only
 		|| operation->kind != RF_SIDE_XACT_COMMIT || payload == NULL || length == 0
 		|| length != operation->completion_payload_length
 		|| operation->system_identifier != GetSystemIdentifier()
@@ -925,9 +952,9 @@ rf_side_xact_apply_covered_commit_v1(const RfSideXactOperationV1 *operation, voi
 }
 
 RfSideXactApplyResultV1
-rf_side_xact_apply_cold_cache_commit_v1(const RfSideXactOperationV1 *operation,
-										const uint8 *payload, uint32 length, void *arg,
-										RfSideXactVerifyCommitCoverageV1 verify)
+rf_side_xact_apply_cold_completion_v1(const RfSideXactOperationV1 *operation, const uint8 *payload,
+									  uint32 length, void *arg,
+									  RfSideXactVerifyCommitCoverageV1 verify)
 {
 	xl_xact_parsed_commit parsed;
 	uint8 *copy;
@@ -935,9 +962,12 @@ rf_side_xact_apply_cold_cache_commit_v1(const RfSideXactOperationV1 *operation,
 
 	/* The native cache replay owner temporarily uses DatabasePath. An
 	 * existing backend database context cannot be borrowed or destroyed. */
-	if (!rf_side_xact_cold_cache_preflight_v1(operation, payload, length) || DatabasePath != NULL
-		|| verify == NULL
-		|| !cluster_undo_recovery_cold_origin_authorized_v1(operation->origin_thread - 1))
+	if (!rf_side_xact_cold_completion_preflight_v1(operation, payload, length)
+		|| DatabasePath != NULL || verify == NULL
+		|| !cluster_undo_recovery_cold_origin_authorized_v1(operation->origin_thread - 1)
+		|| ((operation->xinfo & (XACT_XINFO_HAS_DROPPED_STATS | XACT_COMPLETION_FORCE_SYNC_COMMIT))
+				!= 0
+			&& !cluster_undo_recovery_cold_source_synced_v1(operation->origin_thread - 1)))
 		return RF_SIDE_XACT_APPLY_BLOCKED;
 	copy = side_xact_payload_copy(payload, length);
 	if (copy == NULL)
@@ -951,11 +981,22 @@ rf_side_xact_apply_cold_cache_commit_v1(const RfSideXactOperationV1 *operation,
 			/* Native CLOG and the canonical TT are already durable. Replay
 			 * every local message and init-file effect before the derived
 			 * terminal entry. This does not certify all-cohort RESET or OPEN. */
-			ProcessCommittedInvalidationMessages(parsed.msgs, parsed.nmsgs,
-												 XactCompletionRelcacheInitFileInval(parsed.xinfo),
-												 parsed.dbId, parsed.tsId);
-			if (cluster_undo_recovery_cold_origin_authorized_v1(operation->origin_thread - 1))
-				result = side_xact_project_commit_v1(operation);
+			if (parsed.nmsgs > 0 || XactCompletionRelcacheInitFileInval(parsed.xinfo))
+				ProcessCommittedInvalidationMessages(
+					parsed.msgs, parsed.nmsgs, XactCompletionRelcacheInitFileInval(parsed.xinfo),
+					parsed.dbId, parsed.tsId);
+			/* The original scope has synced this origin's complete retained
+			 * WAL before any writes. Never XLogFlush a foreign LSN. A repeat
+			 * after interruption uses the original idempotent pgstat owner;
+			 * this does not advance ROOT/recovery completion or retention. */
+			if ((parsed.xinfo & (XACT_XINFO_HAS_DROPPED_STATS | XACT_COMPLETION_FORCE_SYNC_COMMIT))
+					== 0
+				|| cluster_undo_recovery_cold_source_synced_v1(operation->origin_thread - 1)) {
+				if (parsed.nstats > 0)
+					pgstat_execute_transactional_drops(parsed.nstats, parsed.stats, true);
+				if (cluster_undo_recovery_cold_origin_authorized_v1(operation->origin_thread - 1))
+					result = side_xact_project_commit_v1(operation);
+			}
 		}
 	}
 	PG_FINALLY();
