@@ -164,6 +164,31 @@ rf_side_online_plan_contains_commit_v1(const RfSideOnlinePlanV1 *plan,
 	return plan != NULL && operation->kind == RF_SIDE_XACT_COMMIT && operation->has_tt_delta;
 }
 
+/* Cold ordinary ABORT integration uses the real plan/xact/owner fixture. */
+bool
+rf_side_online_plan_abort_target_v1(const RfSideOnlinePlanV1 *plan,
+									const RfSideOnlineOperationV1 *operation,
+									ClusterUndoDecoded *out)
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+bool
+rf_side_xact_preflight_covered_abort_v1(const RfSideXactOperationV1 *operation)
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+RfSideXactApplyResultV1
+rf_side_xact_apply_covered_abort_v1(const RfSideXactOperationV1 *operation, void *arg,
+									RfSideXactVerifyAbortCoverageV1 verify)
+{
+	UT_ASSERT(false);
+	return RF_SIDE_XACT_APPLY_BLOCKED;
+}
+
 Size
 rf_side_online_plan_scratch_available_v1(const RfSideOnlinePlanV1 *plan)
 {

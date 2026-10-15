@@ -841,6 +841,46 @@ rf_side_xact_apply_covered_commit_v1(const RfSideXactOperationV1 *operation, voi
 	return side_xact_project_commit_v1(operation);
 }
 
+bool
+rf_side_xact_preflight_covered_abort_v1(const RfSideXactOperationV1 *operation)
+{
+	const uint32 supported = XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_SCN;
+
+	return rf_side_xact_structural_preflight_v1(operation) && operation->kind == RF_SIDE_XACT_ABORT
+		   && operation->system_identifier == GetSystemIdentifier()
+		   && cluster_xid_origin_slot(operation->xid) == (int)operation->origin_thread - 1
+		   && (operation->xinfo & ~supported) == 0;
+}
+
+RfSideXactApplyResultV1
+rf_side_xact_apply_covered_abort_v1(const RfSideXactOperationV1 *operation, void *arg,
+									RfSideXactVerifyAbortCoverageV1 verify)
+{
+	ClusterRemoteXactMutationV2 mutation;
+	ClusterRemoteXactOutcome outcome;
+	SCN post_scn;
+	uint16 post_wrap;
+	bool post_wrap_valid;
+
+	if (!rf_side_xact_preflight_covered_abort_v1(operation) || verify == NULL
+		|| !verify(arg, operation))
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+	cluster_scn_recovery_replay_observe(operation->terminal_scn);
+	mutation = cluster_remote_xact_store_terminal_v2(operation->origin_thread - 1, operation->xid,
+													 false, NULL, CLUSTER_REMOTE_XACT_ABORTED,
+													 InvalidScn, 0, false, 0);
+	if (mutation == CLUSTER_REMOTE_XACT_MUTATION_CONFLICT)
+		return RF_SIDE_XACT_APPLY_CONFLICT;
+	if (mutation != CLUSTER_REMOTE_XACT_MUTATION_STORED
+		&& mutation != CLUSTER_REMOTE_XACT_MUTATION_UNCHANGED)
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+	outcome = cluster_remote_commit_outcome_ex(operation->origin_thread - 1, operation->xid,
+											   &post_scn, &post_wrap, &post_wrap_valid);
+	return outcome == CLUSTER_REMOTE_XACT_ABORTED && !SCN_VALID(post_scn) && !post_wrap_valid
+			   ? RF_SIDE_XACT_APPLY_OK
+			   : RF_SIDE_XACT_APPLY_POST_READ_FAILED;
+}
+
 static RfSideXactApplyResultV1
 side_xact_map_pending_result(TwoPhaseRecoveryPendingResult result)
 {

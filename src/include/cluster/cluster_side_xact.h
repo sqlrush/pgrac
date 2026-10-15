@@ -120,6 +120,13 @@ typedef bool (*RfSideXactVerifyCommitCoverageV1)(void *arg, const RfSideXactOper
 extern RfSideXactApplyResultV1
 rf_side_xact_apply_covered_commit_v1(const RfSideXactOperationV1 *operation, void *arg,
 									 RfSideXactVerifyCommitCoverageV1 verify);
+/* Ordinary ABORT has no native TT locator. Only an original cold owner that
+ * proved its exact preceding carrier and native CLOG may publish this result. */
+extern bool rf_side_xact_preflight_covered_abort_v1(const RfSideXactOperationV1 *operation);
+typedef bool (*RfSideXactVerifyAbortCoverageV1)(void *arg, const RfSideXactOperationV1 *operation);
+extern RfSideXactApplyResultV1
+rf_side_xact_apply_covered_abort_v1(const RfSideXactOperationV1 *operation, void *arg,
+									RfSideXactVerifyAbortCoverageV1 verify);
 extern RfSideXactApplyResultV1
 rf_side_xact_target_preflight_owned_v1(const RfSideXactOperationV1 *operation,
 									   const uint8 *owned_payload, uint32 owned_payload_length);

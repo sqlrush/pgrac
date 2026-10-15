@@ -22,6 +22,7 @@
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_xid_stripe_xlog.h"
 #include "cluster/storage/cluster_undo_alloc.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 
 #ifdef RF_SIDE_ONLINE_TESTING
 #include <stdlib.h>
@@ -1223,6 +1224,85 @@ rf_side_online_plan_contains_commit_v1(const RfSideOnlinePlanV1 *plan,
 			&& memcmp(&plan->operations[i].xact, operation, sizeof(*operation)) == 0)
 			return true;
 	return false;
+}
+
+bool
+rf_side_online_plan_abort_target_v1(const RfSideOnlinePlanV1 *plan,
+									const RfSideOnlineOperationV1 *operation,
+									ClusterUndoDecoded *out)
+{
+	const RfSideOnlineOperationV1 *abort = NULL;
+	uint32 native_count = 0;
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || plan->failed
+		|| plan->purpose != RF_SIDE_PLAN_RECOVERY || operation == NULL || out == NULL
+		|| operation->purpose != RF_SIDE_PLAN_RECOVERY || operation->history_only
+		|| operation->kind != RF_SIDE_ONLINE_OPERATION_XACT
+		|| operation->xact.kind != RF_SIDE_XACT_ABORT || operation->owned_payload != NULL
+		|| operation->owned_payload_length != 0
+		|| !rf_side_xact_structural_preflight_v1(&operation->xact)
+		|| rf_side_online_plan_origin_operation_count_v1(plan, operation->xact.origin_thread)
+			   == UINT32_MAX)
+		return false;
+
+	/* A raw xid cannot choose among retained incarnations or terminal records.
+	 * Match the complete exported native operation, not a caller-supplied xid. */
+	for (uint32 i = 0; i < plan->operation_count; i++) {
+		const RfSideOnlineOperationV1 *op = &plan->operations[i];
+
+		if (op->identity.record.origin_thread != operation->xact.origin_thread)
+			continue;
+		if (op->kind == RF_SIDE_ONLINE_OPERATION_XACT && op->xact.xid == operation->xact.xid) {
+			if (memcmp(op, operation, sizeof(*op)) != 0 || ++native_count != 1)
+				return false;
+		}
+		if (op->kind != RF_SIDE_ONLINE_OPERATION_UNDO || op->undo.kind != CLUSTER_UNDO_KIND_TT_ABORT
+			|| op->undo.xid != operation->xact.xid)
+			continue;
+		if (abort != NULL || op->identity.participant_index != operation->identity.participant_index
+			|| op->identity.record.end_rec_ptr > operation->identity.record.read_rec_ptr
+			|| op->undo.format_version != CLUSTER_UNDO_TT_ABORT_EXACT_VERSION
+			|| !cluster_undo_preflight(&op->undo))
+			return false;
+		abort = op;
+	}
+	if (native_count != 1 || abort == NULL)
+		return false;
+	for (uint32 i = 0; i < plan->operation_count; i++) {
+		const RfSideOnlineOperationV1 *op = &plan->operations[i];
+		const ClusterUndoDecoded *d = &op->undo;
+		const ClusterUndoDecoded *key = &abort->undo;
+		uint16 slot;
+
+		if (op->identity.record.origin_thread != operation->xact.origin_thread
+			|| op->kind != RF_SIDE_ONLINE_OPERATION_UNDO || op == abort)
+			continue;
+		if (d->xid == key->xid
+			&& (d->kind == CLUSTER_UNDO_KIND_TT_BIND || d->kind == CLUSTER_UNDO_KIND_TT_COMMIT
+				|| d->kind == CLUSTER_UNDO_KIND_TT_SET_HEAD)) {
+			if (d->kind == CLUSTER_UNDO_KIND_TT_COMMIT || d->instance != key->instance
+				|| d->segment_id != key->segment_id || d->slot_offset != key->slot_offset
+				|| d->wrap != key->wrap
+				|| (d->kind == CLUSTER_UNDO_KIND_TT_BIND
+					&& d->expected_generation != key->expected_generation))
+				return false;
+		}
+		/* The producer emits TT_ABORT before native ABORT. A later reuse or
+		 * mutation inside that interval cannot be assigned to the old carrier. */
+		if (op->identity.participant_index != abort->identity.participant_index
+			|| op->identity.record.read_rec_ptr < abort->identity.record.end_rec_ptr
+			|| op->identity.record.read_rec_ptr >= operation->identity.record.read_rec_ptr
+			|| d->instance != key->instance || d->segment_id != key->segment_id)
+			continue;
+		if (d->kind == CLUSTER_UNDO_KIND_SEGMENT_INIT
+			|| d->kind == CLUSTER_UNDO_KIND_SEGMENT_RECYCLE
+			|| d->kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE
+			|| (side_plan_slot_operation(op, key->instance, key->segment_id, &slot)
+				&& slot == key->slot_offset))
+			return false;
+	}
+	*out = abort->undo;
+	return true;
 }
 
 static ClusterUndoHeaderPrepareResultV1

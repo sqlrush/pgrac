@@ -217,6 +217,50 @@ side_owner_commit_covered(void *arg, const RfSideXactOperationV1 *operation)
 }
 
 static bool
+side_owner_cold_abort_ready(RfSideOnlineProductionOwnerV1 *owner,
+							const RfSideOnlineOperationV1 *operation, ClusterUndoDecoded *target)
+{
+	return side_owner_cold_formed(owner) && operation->owned_payload == NULL
+		   && operation->owned_payload_length == 0
+		   && rf_side_xact_preflight_covered_abort_v1(&operation->xact)
+		   && operation->xact.origin_thread == owner->undo_authority->duty->origin_thread_id
+		   && rf_side_online_plan_abort_target_v1(owner->protected_plan, operation, target)
+		   && cluster_undo_recovery_cold_origin_authorized_v1(operation->xact.origin_thread - 1);
+}
+
+typedef struct SideAbortCoverage {
+	RfSideOnlineProductionOwnerV1 *owner;
+	const RfSideOnlineOperationV1 *operation;
+} SideAbortCoverage;
+
+static bool
+side_owner_abort_covered(void *arg, const RfSideXactOperationV1 *operation)
+{
+	SideAbortCoverage *coverage = arg;
+	RfSideOnlineProductionOwnerV1 *owner = coverage->owner;
+	SideUndoHeader *header;
+	ClusterUndoDecoded target;
+
+	if (!owner->protected_set_active || !side_owner_authority_fresh(owner)
+		|| operation != &coverage->operation->xact
+		|| !side_owner_cold_abort_ready(owner, coverage->operation, &target))
+		return false;
+	for (header = owner->undo_headers; header != NULL; header = header->next)
+		if (header->block_no == 0 && header->instance == target.instance
+			&& header->segment_id == target.segment_id)
+			return header->installed && side_owner_install_target(owner, header)
+				   && cluster_clog_native_recovery_apply_v1(operation->origin_thread - 1,
+															operation->xid, 0, NULL,
+															TRANSACTION_STATUS_ABORTED)
+				   && cluster_clog_native_recovery_verify_v1(operation->origin_thread - 1,
+															 operation->xid, 0, NULL,
+															 TRANSACTION_STATUS_ABORTED)
+				   && side_owner_cold_abort_ready(owner, coverage->operation, &target)
+				   && side_owner_authority_fresh(owner);
+	return false;
+}
+
+static bool
 side_owner_begin_protected_set(void *arg)
 {
 	RfSideOnlineProductionOwnerV1 *owner = (RfSideOnlineProductionOwnerV1 *)arg;
@@ -262,10 +306,17 @@ side_owner_preflight_xact(void *arg, const RfSideOnlineOperationV1 *operation)
 	RfSideOnlineProductionOwnerV1 *owner = (RfSideOnlineProductionOwnerV1 *)arg;
 
 	if (owner == NULL || !owner->protected_set_active || !side_owner_authority_fresh(owner)
-		|| operation == NULL || operation->kind != RF_SIDE_ONLINE_OPERATION_XACT
-		|| rf_side_xact_target_preflight_owned_v1(&operation->xact, operation->owned_payload,
-												  operation->owned_payload_length)
-			   != RF_SIDE_XACT_APPLY_OK)
+		|| operation == NULL || operation->kind != RF_SIDE_ONLINE_OPERATION_XACT)
+		return false;
+	if (side_owner_cold_formed(owner) && operation->xact.kind == RF_SIDE_XACT_ABORT) {
+		ClusterUndoDecoded target;
+
+		return side_owner_cold_abort_ready(owner, operation, &target)
+			   && side_owner_undo_target(owner, target.instance, target.segment_id, 0) != NULL;
+	}
+	if (rf_side_xact_target_preflight_owned_v1(&operation->xact, operation->owned_payload,
+											   operation->owned_payload_length)
+		!= RF_SIDE_XACT_APPLY_OK)
 		return false;
 	if (side_owner_cold_formed(owner) && !side_owner_cold_commit_ready(owner, &operation->xact))
 		return false;
@@ -356,6 +407,23 @@ static bool
 side_owner_apply_xact(void *arg, const RfSideOnlineOperationV1 *operation)
 {
 	RfSideOnlineProductionOwnerV1 *owner = (RfSideOnlineProductionOwnerV1 *)arg;
+
+	if (owner != NULL && owner->protected_set_active && operation != NULL
+		&& operation->kind == RF_SIDE_ONLINE_OPERATION_XACT
+		&& operation->xact.kind == RF_SIDE_XACT_ABORT && side_owner_cold_formed(owner)) {
+		ClusterUndoDecoded target;
+		SideAbortCoverage coverage = { .owner = owner, .operation = operation };
+
+		if (!side_owner_authority_fresh(owner)
+			|| !side_owner_cold_abort_ready(owner, operation, &target)
+			|| !side_owner_install_data(owner)
+			|| !side_owner_install_target(
+				owner, side_owner_undo_target(owner, target.instance, target.segment_id, 0)))
+			return false;
+		return rf_side_xact_apply_covered_abort_v1(&operation->xact, &coverage,
+												   side_owner_abort_covered)
+			   == RF_SIDE_XACT_APPLY_OK;
+	}
 
 	if (owner != NULL && owner->protected_set_active && owner->undo_authority != NULL
 		&& operation != NULL && operation->kind == RF_SIDE_ONLINE_OPERATION_XACT
