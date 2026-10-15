@@ -66,6 +66,15 @@ cluster_recovery_native_inventory_build(ClusterWalInputsV1 *inputs, size_t memor
 extern ClusterRecoveryNativeInventoryResult cluster_recovery_native_inventory_collect_roots(
 	ClusterWalInputsV1 *inputs, ClusterRecoveryRootSet *roots, size_t memory_budget,
 	ClusterRecoveryNativeInventory **out, ClusterRecoveryNativeInventoryDiag *diag);
+/* Repeat the original complete cold census after dependent graph traversal.
+ * Compare to the saved source/cut/all-record transcript, never rebase it.
+ * No already-consumed effect is emitted again; failure/ERROR makes this
+ * inventory unusable. Success is only input stability, not graph completion.
+ * This has the same synchronous-reader bound as build(). */
+extern ClusterRecoveryNativeInventoryResult
+cluster_recovery_native_inventory_recheck(ClusterWalInputsV1 *inputs,
+										  ClusterRecoveryNativeInventory *inventory,
+										  ClusterRecoveryNativeInventoryDiag *diag);
 /* At most one native effect per call after both passes. END drains this
  * native subset only; it never discharges other_records or physical roots. */
 extern ClusterRecoveryNativeInventoryResult

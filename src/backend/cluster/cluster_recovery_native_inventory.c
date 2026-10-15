@@ -256,6 +256,24 @@ inventory_record(XLogReaderState *reader, const ClusterWalSourceRef *source,
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
+static void
+inventory_read_pass(ClusterRecoveryNativeInventory *work, ClusterWalInputsV1 *inputs)
+{
+	uint64 records = 0;
+
+	work->source_cursor = 0;
+	work->cursor = work->head;
+	work->active = false;
+	work->diag.input_result = cluster_wal_inputs_cold_census_v1(
+		inputs, inventory_record, inventory_source, work, &records, &work->diag.input_detail);
+	if (work->diag.input_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		if (work->status == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED)
+			work->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_INPUT;
+	} else if (work->active || work->source_cursor != work->source_count
+			   || records != work->diag.records || (work->pass == 1 && work->cursor != NULL))
+		work->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED;
+}
+
 static ClusterRecoveryNativeInventoryResult
 inventory_build(ClusterWalInputsV1 *inputs, ClusterRecoveryRootSet *roots, size_t memory_budget,
 				ClusterRecoveryNativeInventory **out, ClusterRecoveryNativeInventoryDiag *diag)
@@ -293,25 +311,8 @@ inventory_build(ClusterWalInputsV1 *inputs, ClusterRecoveryRootSet *roots, size_
 			work->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY;
 		for (work->pass = 0;
 			 work->pass < 2 && work->status == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED;
-			 work->pass++) {
-			uint64 records = 0;
-
-			work->source_cursor = 0;
-			work->cursor = work->head;
-			work->diag.input_result
-				= cluster_wal_inputs_cold_census_v1(inputs, inventory_record, inventory_source,
-													work, &records, &work->diag.input_detail);
-			if (work->diag.input_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
-				if (work->status == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED)
-					work->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_INPUT;
-				break;
-			}
-			if (work->active || work->source_cursor != count || records != work->diag.records
-				|| (work->pass == 1 && work->cursor != NULL)) {
-				work->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED;
-				break;
-			}
-		}
+			 work->pass++)
+			inventory_read_pass(work, inputs);
 	}
 	PG_CATCH();
 	{
@@ -362,6 +363,59 @@ cluster_recovery_native_inventory_collect_roots(ClusterWalInputsV1 *inputs,
 	if (result != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED)
 		cluster_recovery_root_set_invalidate(roots);
 	return result;
+}
+
+ClusterRecoveryNativeInventoryResult
+cluster_recovery_native_inventory_recheck(ClusterWalInputsV1 *inputs,
+										  ClusterRecoveryNativeInventory *inventory,
+										  ClusterRecoveryNativeInventoryDiag *diag)
+{
+	NativeInventoryRecord *saved_cursor;
+
+	if (diag != NULL)
+		memset(diag, 0, sizeof(*diag));
+	if (inventory == NULL)
+		return CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID;
+	if (inventory->status != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED) {
+		if (diag != NULL)
+			*diag = inventory->diag;
+		return inventory->status;
+	}
+	if (!inventory->complete || inputs == NULL || diag == NULL) {
+		inventory->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID;
+		inventory->complete = false;
+		return inventory->status;
+	}
+	inventory->complete = false;
+	saved_cursor = inventory->cursor;
+	inventory->pass = 1;
+	PG_TRY();
+	{
+		if (cluster_wal_inputs_count_v1(inputs) != inventory->source_count)
+			inventory->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED;
+		else {
+			inventory->hash = pg_cryptohash_create(PG_SHA256);
+			if (inventory->hash == NULL)
+				inventory->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY;
+			else
+				inventory_read_pass(inventory, inputs);
+		}
+	}
+	PG_CATCH();
+	{
+		inventory->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_INPUT;
+		pg_cryptohash_free(inventory->hash);
+		inventory->hash = NULL;
+		*diag = inventory->diag;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	pg_cryptohash_free(inventory->hash);
+	inventory->hash = NULL;
+	inventory->cursor = saved_cursor;
+	inventory->complete = inventory->status == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED;
+	*diag = inventory->diag;
+	return inventory->status;
 }
 
 ClusterRecoveryNativeInventoryResult

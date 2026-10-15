@@ -637,10 +637,110 @@ UT_TEST(test_long_collision_chain_exhausts_budget_without_omitting_a_root)
 }
 
 #ifndef RECOVERY_ROOT_SET_FIXTURE_ONLY
+UT_TEST(test_final_root_observation_reads_all_bytes_without_rebasing)
+{
+	int fd = new_root();
+	char data[2 * BLCKSZ + 13] = { 0 };
+	ClusterRecoveryRootSet *roots;
+	uint8 before[32], after[32];
+	RfPageIdentityV1 missing = target(999, MAIN_FORKNUM, 11);
+
+	root_file(fd, "unreferenced", data, sizeof(data));
+	roots = begin_roots(fd, 1024 * 1024);
+	UT_ASSERT_EQ(cluster_recovery_root_set_add_target(roots, &missing),
+				 CLUSTER_RECOVERY_ROOTS_MORE);
+	UT_ASSERT_EQ(finish_roots(roots, NULL), CLUSTER_RECOVERY_ROOTS_OBSERVED);
+	UT_ASSERT(cluster_recovery_root_set_digest(roots, before));
+	for (unsigned repeat = 0; repeat < 2; repeat++) {
+		size_t bytes[2] = { 0 };
+		UT_ASSERT_EQ(cluster_recovery_root_set_recheck_begin(roots), CLUSTER_RECOVERY_ROOTS_MORE);
+		UT_ASSERT(!cluster_recovery_root_set_digest(roots, after));
+		UT_ASSERT(cluster_recovery_root_set_entry(roots, 0) == NULL);
+		UT_ASSERT_EQ(finish_roots(roots, bytes), CLUSTER_RECOVERY_ROOTS_OBSERVED);
+		UT_ASSERT_EQ(bytes[0], 0);
+		UT_ASSERT_EQ(bytes[1], sizeof(data));
+		UT_ASSERT(cluster_recovery_root_set_digest(roots, after));
+		UT_ASSERT_EQ(memcmp(before, after, 32), 0);
+	}
+	cluster_recovery_root_set_destroy(roots);
+	remove_root(fd);
+}
+
+UT_TEST(test_final_root_observation_refuses_path_content_and_io_changes)
+{
+	for (unsigned mode = 0; mode < 7; mode++) {
+		int fd = new_root();
+		ClusterRecoveryRootSet *roots;
+		ClusterRecoveryRootsResult result;
+		uint8 digest[32];
+
+		root_file(fd, "original", "abc", 3);
+		roots = begin_roots(fd, 1024 * 1024);
+		UT_ASSERT_EQ(finish_roots(roots, NULL), CLUSTER_RECOVERY_ROOTS_OBSERVED);
+		switch (mode) {
+		case 0:
+			root_file(fd, "original", "abd", 3);
+			break;
+		case 1:
+			UT_ASSERT_EQ(unlinkat(fd, "original", 0), 0);
+			break;
+		case 2:
+			UT_ASSERT_EQ(renameat(fd, "original", fd, "replaced"), 0);
+			break;
+		case 3:
+			root_file(fd, "extra", "abc", 3);
+			break;
+		case 4:
+		case 5:
+			inject_pread_fault = mode - 3;
+			break;
+		case 6:
+			/* Same real inode/stat, corrupt only the returned bytes. */
+			inject_read_corruption = true;
+			break;
+		}
+		result = cluster_recovery_root_set_recheck_begin(roots);
+		if (result == CLUSTER_RECOVERY_ROOTS_MORE)
+			result = finish_roots(roots, NULL);
+		UT_ASSERT_EQ(result, mode == 4 || mode == 5 ? CLUSTER_RECOVERY_ROOTS_IO
+													: CLUSTER_RECOVERY_ROOTS_CHANGED);
+		inject_pread_fault = 0;
+		inject_read_corruption = false;
+		UT_ASSERT_EQ(cluster_recovery_root_set_recheck_begin(roots), result);
+		UT_ASSERT(!cluster_recovery_root_set_digest(roots, digest));
+		cluster_recovery_root_set_destroy(roots);
+		remove_root(fd);
+	}
+}
+
+UT_TEST(test_final_root_observation_resets_verification_in_bounded_steps)
+{
+	int fd = new_root();
+	char path[32];
+	ClusterRecoveryRootSet *roots;
+	ClusterRecoveryRootsEvent event;
+	unsigned verified = 0;
+
+	for (unsigned i = 0; i < 260; i++) {
+		snprintf(path, sizeof(path), "unknown-%u", i);
+		root_file(fd, path, "", 0);
+	}
+	roots = begin_roots(fd, 2 * 1024 * 1024);
+	UT_ASSERT_EQ(finish_roots(roots, NULL), CLUSTER_RECOVERY_ROOTS_OBSERVED);
+	UT_ASSERT_EQ(cluster_recovery_root_set_recheck_begin(roots), CLUSTER_RECOVERY_ROOTS_MORE);
+	UT_ASSERT_EQ(cluster_recovery_root_set_step(roots, &event), CLUSTER_RECOVERY_ROOTS_MORE);
+	for (uint32 i = 0; i < roots->count; i++)
+		verified += roots->verified[i];
+	UT_ASSERT_EQ(verified, 260 - 128);
+	UT_ASSERT_EQ(finish_roots(roots, NULL), CLUSTER_RECOVERY_ROOTS_OBSERVED);
+	cluster_recovery_root_set_destroy(roots);
+	remove_root(fd);
+}
+
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(21);
 	UT_RUN(test_unreferenced_physical_files_and_missing_wal_targets_are_preserved);
 	UT_RUN(test_native_slru_root_counts_are_exposed_only_after_observation);
 	UT_RUN(test_all_file_bytes_are_read_twice_in_bounded_chunks);
@@ -659,6 +759,9 @@ main(void)
 	UT_RUN(test_graph_read_refuses_changed_parent_or_file);
 	UT_RUN(test_graph_read_never_turns_io_or_short_read_into_an_empty_edge);
 	UT_RUN(test_long_collision_chain_exhausts_budget_without_omitting_a_root);
+	UT_RUN(test_final_root_observation_reads_all_bytes_without_rebasing);
+	UT_RUN(test_final_root_observation_refuses_path_content_and_io_changes);
+	UT_RUN(test_final_root_observation_resets_verification_in_bounded_steps);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

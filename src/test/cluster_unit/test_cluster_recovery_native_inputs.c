@@ -469,7 +469,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(10);
+	UT_PLAN(12);
 	UT_RUN(test_native_inventory_uses_two_real_cold_passes);
 	UT_RUN(test_native_inventory_never_returns_partial_on_drift_io_or_error);
 	UT_RUN(test_native_inventory_capacity_is_not_partial_success);
@@ -480,6 +480,8 @@ main(int argc, char **argv)
 	UT_RUN(test_native_inventory_poison_targets_on_error_and_drift);
 	UT_RUN(test_record_transcript_full_fields_and_storage_independence);
 	UT_RUN(test_record_transcript_rejects_unsafe_bounds);
+	UT_RUN(test_final_input_recheck_preserves_effect_cursor_and_all_sources);
+	UT_RUN(test_final_input_recheck_is_sticky_on_bytes_scope_io_and_error);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -299,3 +299,81 @@ UT_TEST(test_record_transcript_rejects_unsafe_bounds)
 	UT_ASSERT(!transcript_hash(&reader, digest));
 	UT_ASSERT(!transcript_hash(NULL, digest));
 }
+
+UT_TEST(test_final_input_recheck_preserves_effect_cursor_and_all_sources)
+{
+	ClusterWalInputsV1 *inputs;
+	ClusterRecoveryNativeInventory *inventory = NULL;
+	ClusterRecoveryNativeInventoryDiag diag;
+	ClusterRecoveryNativeEffect effect;
+	unsigned effects = 0;
+
+	inventory_extra = 2;
+	inputs = inventory_fixture(false, false);
+	UT_ASSERT_EQ(cluster_recovery_native_inventory_build(inputs, 1024 * 1024, &inventory, &diag),
+				 CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED);
+	UT_ASSERT_EQ(cluster_recovery_native_inventory_next(inventory, &effect),
+				 CLUSTER_RECOVERY_NATIVE_INVENTORY_EFFECT);
+	UT_ASSERT_EQ(cluster_recovery_native_inventory_recheck(inputs, inventory, &diag),
+				 CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED);
+	UT_ASSERT_EQ(inventory_census_calls, 3);
+	while (cluster_recovery_native_inventory_next(inventory, &effect)
+		   == CLUSTER_RECOVERY_NATIVE_INVENTORY_EFFECT)
+		effects++;
+	UT_ASSERT_EQ(effects, 7); /* not the already-consumed terminal again */
+	UT_ASSERT_EQ(cluster_recovery_native_inventory_recheck(inputs, inventory, &diag),
+				 CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED);
+	UT_ASSERT_EQ(inventory_census_calls, 4);
+	UT_ASSERT_EQ(cluster_recovery_native_inventory_next(inventory, &effect),
+				 CLUSTER_RECOVERY_NATIVE_INVENTORY_END);
+	cluster_recovery_native_inventory_destroy(inventory);
+	cold_census_done(&inputs);
+	inventory_extra = 0;
+}
+
+UT_TEST(test_final_input_recheck_is_sticky_on_bytes_scope_io_and_error)
+{
+	for (unsigned mode = 0; mode < 6; mode++) {
+		ClusterWalInputsV1 *inputs;
+		ClusterRecoveryNativeInventory *inventory = NULL;
+		ClusterRecoveryNativeInventoryDiag diag;
+		ClusterRecoveryNativeEffect effect;
+		bool threw = false;
+
+		inventory_extra = 1;
+		inputs = inventory_fixture(false, false);
+		UT_ASSERT_EQ(
+			cluster_recovery_native_inventory_build(inputs, 1024 * 1024, &inventory, &diag),
+			CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED);
+		inventory_fault = mode == 0 ? 0 : mode == 1 ? 6 : mode == 2 ? 1 : mode == 3 ? 3 : 4;
+		if (mode < 4)
+			inventory_drift();
+		else if (mode == 4) {
+			inventory_census_calls = 0;
+			inventory_between_passes = inventory_drift;
+		}
+		PG_TRY();
+		{
+			UT_ASSERT_NE(cluster_recovery_native_inventory_recheck(mode == 5 ? NULL : inputs,
+																   inventory, &diag),
+						 CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED);
+		}
+		PG_CATCH();
+		{
+			threw = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(threw, mode == 4);
+		inventory_between_passes = NULL;
+		inputs_pin_current = true;
+		UT_ASSERT_NE(cluster_recovery_native_inventory_recheck(inputs, inventory, &diag),
+					 CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED);
+		memset(&effect, 0xa5, sizeof(effect));
+		UT_ASSERT_EQ(cluster_recovery_native_inventory_next(inventory, &effect),
+					 CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID);
+		UT_ASSERT(effect.record == NULL && effect.bytes == NULL);
+		cluster_recovery_native_inventory_destroy(inventory);
+		cold_census_done(&inputs);
+	}
+	inventory_extra = 0;
+}

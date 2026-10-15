@@ -22,6 +22,7 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 static bool inject_readdir_error;
 static bool inject_fstat_error;
 static unsigned inject_pread_fault;
+static bool inject_read_corruption;
 static int modify_during_read = -1;
 
 static ssize_t
@@ -34,6 +35,8 @@ namespace_test_pread(int fd, void *buffer, size_t length, off_t offset)
 		return -1;
 	}
 	result = pread(fd, buffer, inject_pread_fault == 2 ? length - 1 : length, offset);
+	if (inject_read_corruption && result > 0)
+		((uint8 *)buffer)[result - 1] ^= 1;
 	if (modify_during_read >= 0 && ftruncate(modify_during_read, 1) != 0)
 		abort();
 	return result;

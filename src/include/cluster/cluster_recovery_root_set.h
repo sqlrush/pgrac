@@ -103,6 +103,13 @@ cluster_recovery_root_set_add_native(ClusterRecoveryRootSet *roots,
  * still prevent D1 completion. No terminal, apply, OPEN or GC permission. */
 extern ClusterRecoveryRootsResult cluster_recovery_root_set_step(ClusterRecoveryRootSet *roots,
 																 ClusterRecoveryRootsEvent *out);
+/* After dependent graph traversal, re-observe the entire original set.
+ * Follow with step(): at most one block / 128 metadata operations per call.
+ * The saved baseline never changes. Entries/digest/read stay unavailable
+ * until every path and full file agrees again; any failure is sticky.
+ * Caller still holds original isolation/cuts. This grants no graph authority. */
+extern ClusterRecoveryRootsResult
+cluster_recovery_root_set_recheck_begin(ClusterRecoveryRootSet *roots);
 extern uint32 cluster_recovery_root_set_count(const ClusterRecoveryRootSet *roots);
 extern const ClusterRecoveryRootEntry *
 cluster_recovery_root_set_entry(const ClusterRecoveryRootSet *roots, uint32 index);

@@ -36,7 +36,7 @@ struct ClusterRecoveryRootSet {
 	pg_cryptohash_ctx *file_hash, *set_hash;
 	uint8 bytes[BLCKSZ];
 	unsigned pass, stage;
-	bool started, reading, merging;
+	bool started, reading, merging, rechecking;
 	ClusterRecoveryRootsResult status;
 };
 
@@ -405,6 +405,7 @@ roots_digest_step(ClusterRecoveryRootSet *roots)
 {
 	static const uint8 domain[] = "PGRAC-COLD-ROOT-CANDIDATES-V1";
 	struct stat current;
+	uint8 digest[32];
 
 	if (roots->hash_at == 0) {
 		if (pg_cryptohash_init(roots->set_hash) < 0
@@ -438,9 +439,38 @@ roots_digest_step(ClusterRecoveryRootSet *roots)
 		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_IO);
 	if (!cluster_recovery_namespace_stat_same(&roots->root_stat, &current))
 		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_CHANGED);
-	if (pg_cryptohash_final(roots->set_hash, roots->digest, sizeof(roots->digest)) < 0)
+	if (pg_cryptohash_final(roots->set_hash, digest, sizeof(digest)) < 0)
 		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_IO);
+	if (roots->rechecking && memcmp(digest, roots->digest, sizeof(digest)) != 0)
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_CHANGED);
+	memcpy(roots->digest, digest, sizeof(digest));
+	roots->rechecking = false;
 	roots->status = CLUSTER_RECOVERY_ROOTS_OBSERVED;
+	return roots->status;
+}
+
+ClusterRecoveryRootsResult
+cluster_recovery_root_set_recheck_begin(ClusterRecoveryRootSet *roots)
+{
+	struct stat current;
+
+	if (roots == NULL)
+		return CLUSTER_RECOVERY_ROOTS_INVALID;
+	if (roots->status > CLUSTER_RECOVERY_ROOTS_OBSERVED)
+		return roots->status;
+	if (roots->status != CLUSTER_RECOVERY_ROOTS_OBSERVED || roots->scan != NULL)
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	if (fstat(roots->root_fd, &current) != 0)
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_IO);
+	if (!cluster_recovery_namespace_stat_same(&roots->root_stat, &current))
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_CHANGED);
+	/* Verification-only pass; no discovery, rebasing, or unbounded memset. */
+	roots->rechecking = true;
+	roots->pass = 1;
+	roots->stage = 4;
+	roots->verify_at = roots->hash_at = 0;
+	roots->reading = roots->merging = false;
+	roots->status = CLUSTER_RECOVERY_ROOTS_MORE;
 	return roots->status;
 }
 
@@ -462,6 +492,19 @@ cluster_recovery_root_set_step(ClusterRecoveryRootSet *roots, ClusterRecoveryRoo
 		return roots->status;
 	roots->started = true;
 	out->pass = roots->pass;
+	if (roots->stage == 4) {
+		for (unsigned work = 0; work < ROOTS_TICK && roots->verify_at < roots->count; work++)
+			roots->verified[roots->verify_at++] = false;
+		if (roots->verify_at == roots->count) {
+			roots->verify_at = 0;
+			roots->stage = 0;
+			result = cluster_recovery_namespace_begin_bounded(roots->root_fd, roots->capacity,
+															  roots->scan_budget, &roots->scan);
+			if (result != CLUSTER_RECOVERY_NAMESPACE_MORE)
+				return roots_fail(roots, roots_namespace_result(result));
+		}
+		return CLUSTER_RECOVERY_ROOTS_MORE;
+	}
 	if (roots->stage == 1) {
 		for (unsigned work = 0; work < ROOTS_TICK && roots->verify_at < roots->count; work++) {
 			index = roots->verify_at++;
