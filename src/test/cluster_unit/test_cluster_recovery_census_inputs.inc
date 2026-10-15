@@ -3,6 +3,8 @@
  * Copyright (c) 2026, pgrac contributors. */
 
 static unsigned owned_target_mode;
+static bool owned_native_slru;
+static void owned_slru_files(int fd, bool create);
 
 static void
 owned_census_relation(int fd, const ClusterWalSourceRef *source, unsigned rel, bool empty)
@@ -77,6 +79,8 @@ owned_census_fixture(ClusterWalInputsV1 **inputs, int *fd, char path[MAXPGPATH],
 		UT_ASSERT_EQ(pwrite(file, &record, sizeof(record), offset), sizeof(record));
 		UT_ASSERT_EQ(close(file), 0);
 	}
+	if (owned_native_slru)
+		owned_slru_files(*fd, true);
 	UT_ASSERT_EQ(cluster_recovery_census_begin(*inputs, *fd, 8 * 1024 * 1024, &census),
 				 CLUSTER_RECOVERY_CENSUS_MORE);
 	return census;
@@ -143,14 +147,14 @@ UT_TEST(test_owned_census_real_inputs_all_observation_families)
 	ClusterRecoveryCensusEntry entry;
 	ClusterRecoveryCensusDiag diag = { 0 };
 	ClusterRecoveryCensusResult result = CLUSTER_RECOVERY_CENSUS_MORE;
-	unsigned unknown = 0, raw_pages = 0, mismatches = 0, kinds[8] = { 0 };
+	unsigned unknown = 0, raw_pages = 0, mismatches = 0, kinds[9] = { 0 };
 	for (unsigned steps = 0; steps < 100000; steps++) {
 		result = cluster_recovery_census_next(census, &entry);
 		if (result >= CLUSTER_RECOVERY_CENSUS_DRAINED)
 			break;
 		if (result != CLUSTER_RECOVERY_CENSUS_ENTRY)
 			continue;
-		UT_ASSERT(entry.kind >= 1 && entry.kind <= 7);
+		UT_ASSERT(entry.kind >= 1 && entry.kind <= 8);
 		kinds[entry.kind]++;
 		if (entry.kind == CLUSTER_RECOVERY_CENSUS_RELATION) {
 			const ClusterRecoveryRelationCensusEntry *r = &entry.value.relation;
@@ -430,6 +434,126 @@ UT_TEST(test_owned_census_target_join_and_final_observation_revoke_changed_input
 		}
 		UT_ASSERT_EQ(owned_census_until(census, 0), CLUSTER_RECOVERY_CENSUS_REFUSED);
 		owned_census_sticky(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+		owned_census_done(census, &inputs, fd, path);
+	}
+}
+
+static const char *owned_slru_dirs[]
+	= { "pg_xact", "native_side/origin_0/pg_subtrans", "native_side/origin_127/pg_commit_ts" };
+
+static void
+owned_slru_files(int fd, bool create)
+{
+	PGAlignedBlock page;
+	char path[MAXPGPATH];
+	memset(&page, 0xb1, sizeof(page));
+	for (unsigned i = 0; i < lengthof(owned_slru_dirs); ++i) {
+		snprintf(path, sizeof(path), "%s/0000", owned_slru_dirs[i]);
+		if (create) {
+			int file;
+			UT_ASSERT_EQ(mkdirat(fd, owned_slru_dirs[i], 0700), 0);
+			file = openat(fd, path, O_CREAT | O_WRONLY, 0600);
+			UT_ASSERT(file >= 0);
+			UT_ASSERT_EQ(write(file, page.data, BLCKSZ), BLCKSZ);
+			UT_ASSERT_EQ(close(file), 0);
+		} else {
+			UT_ASSERT_EQ(unlinkat(fd, path, 0), 0);
+			UT_ASSERT_EQ(unlinkat(fd, owned_slru_dirs[i], AT_REMOVEDIR), 0);
+		}
+	}
+}
+
+UT_TEST(test_owned_census_enumerates_raw_native_slru_slots)
+{
+	ClusterWalInputsV1 *inputs;
+	char path[MAXPGPATH];
+	int fd;
+	ClusterRecoveryCensus *census;
+	ClusterRecoveryCensusEntry entry;
+	ClusterRecoveryCensusDiag diag;
+	ClusterRecoveryCensusResult result = CLUSTER_RECOVERY_CENSUS_MORE;
+	unsigned clogs = 0, parents = 0, times = 0, files = 0, padding = 0;
+	owned_native_slru = true;
+	census = owned_census_fixture(&inputs, &fd, path, false);
+	owned_native_slru = false;
+	for (unsigned i = 0; i < 100000; ++i) {
+		const ClusterRecoverySlruEntry *s;
+		result = cluster_recovery_census_next(census, &entry);
+		if (result >= CLUSTER_RECOVERY_CENSUS_DRAINED)
+			break;
+		if (result != CLUSTER_RECOVERY_CENSUS_ENTRY
+			|| entry.kind != CLUSTER_RECOVERY_CENSUS_SLRU_SLOT)
+			continue;
+		s = &entry.value.slru;
+		if (s->kind == CLUSTER_RECOVERY_SLRU_FILE)
+			files++;
+		else if (s->kind == CLUSTER_RECOVERY_SLRU_PADDING)
+			padding++;
+		else if (s->kind == CLUSTER_RECOVERY_SLRU_CLOG) {
+			clogs++;
+			UT_ASSERT_EQ(s->origin_node, UINT32_MAX);
+			UT_ASSERT_EQ(s->raw_status, (0xb1 >> (2 * (s->slot % 4))) & 3);
+		} else if (s->kind == CLUSTER_RECOVERY_SLRU_SUBTRANS) {
+			parents++;
+			UT_ASSERT_EQ(s->origin_node, 0);
+			UT_ASSERT_EQ(s->raw_parent, UINT32_C(0xb1b1b1b1));
+		} else {
+			times++;
+			UT_ASSERT_EQ(s->kind, CLUSTER_RECOVERY_SLRU_COMMIT_TS);
+			UT_ASSERT_EQ(s->origin_node, 127);
+			UT_ASSERT_EQ(s->raw_replication_origin, 0xb1b1);
+		}
+	}
+	UT_ASSERT_EQ(result, CLUSTER_RECOVERY_CENSUS_DRAINED);
+	UT_ASSERT_EQ(clogs, BLCKSZ * 4);
+	UT_ASSERT_EQ(parents, BLCKSZ / 4);
+	UT_ASSERT_EQ(times, BLCKSZ / 10);
+	UT_ASSERT_EQ(files, 3);
+	UT_ASSERT_EQ(padding, 1);
+	UT_ASSERT(cluster_recovery_census_diag(census, &diag));
+	UT_ASSERT_EQ(diag.slru_entries, clogs + parents + times + files + padding);
+	UT_ASSERT_EQ(inventory_census_calls, 3);
+	owned_census_sticky(census, CLUSTER_RECOVERY_CENSUS_DRAINED);
+	owned_slru_files(fd, false);
+	owned_census_done(census, &inputs, fd, path);
+}
+
+UT_TEST(test_owned_census_native_slru_drift_and_scope_loss_revoke_outputs)
+{
+	for (unsigned variant = 0; variant < 4; ++variant) {
+		ClusterWalInputsV1 *inputs;
+		char path[MAXPGPATH];
+		int fd, file;
+		ClusterRecoveryCensus *census;
+		owned_native_slru = variant != 3;
+		census = owned_census_fixture(&inputs, &fd, path, false);
+		owned_native_slru = false;
+		if (variant == 3) {
+			/* The original ROOT begin already captured directory identity. */
+			owned_slru_files(fd, true);
+			UT_ASSERT_EQ(owned_census_until(census, 0), CLUSTER_RECOVERY_CENSUS_REFUSED);
+			owned_census_sticky(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+			owned_slru_files(fd, false);
+			owned_census_done(census, &inputs, fd, path);
+			continue;
+		}
+		UT_ASSERT_EQ(owned_census_until(census, variant == 0 ? CLUSTER_RECOVERY_CENSUS_SLRU_PHYSICAL
+															 : CLUSTER_RECOVERY_CENSUS_FINAL_TT),
+					 CLUSTER_RECOVERY_CENSUS_MORE);
+		if (variant == 2)
+			inputs_pin_current = false;
+		else {
+			file = openat(fd, "pg_xact/0000", O_WRONLY);
+			UT_ASSERT(file >= 0);
+			if (variant == 0)
+				UT_ASSERT_EQ(ftruncate(file, 1), 0);
+			else
+				UT_ASSERT_EQ(pwrite(file, "changed", 7, 101), 7);
+			UT_ASSERT_EQ(close(file), 0);
+		}
+		UT_ASSERT_EQ(owned_census_until(census, 0), CLUSTER_RECOVERY_CENSUS_REFUSED);
+		owned_census_sticky(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+		owned_slru_files(fd, false);
 		owned_census_done(census, &inputs, fd, path);
 	}
 }

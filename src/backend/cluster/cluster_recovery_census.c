@@ -17,6 +17,7 @@ struct ClusterRecoveryCensus {
 	ClusterRecoveryReferenceGraph *graph; /* owned by undo */
 	ClusterRecoveryRelationCensus *relations;
 	ClusterRecoveryMultixactScan *mx;
+	ClusterRecoverySlruScan *slru;
 	ClusterRecoveryCensusDiag diag;
 	ClusterRecoveryCensusResult status;
 	uint32 source_count, target_at;
@@ -34,6 +35,8 @@ census_release(ClusterRecoveryCensus *census)
 	census->relations = NULL;
 	cluster_recovery_multixact_scan_destroy(census->mx);
 	census->mx = NULL;
+	cluster_recovery_slru_scan_destroy(census->slru);
+	census->slru = NULL;
 	cluster_recovery_native_inventory_destroy(census->inventory);
 	census->inventory = NULL;
 	cluster_recovery_undo_store_destroy(census->undo);
@@ -69,7 +72,7 @@ cluster_recovery_census_begin(ClusterWalInputsV1 *inputs, int root_fd, size_t me
 	if (count == 0 || count > CLUSTER_WAL_INPUTS_MAX || first == NULL)
 		return CLUSTER_RECOVERY_CENSUS_INVALID;
 	/* Five concurrent reservations: roots, inventory, undo, TX graph, and
-	 * sequential relation/MX scratch. Original consumers enforce each cap.
+	 * sequential relation/SLRU/MX scratch. Original consumers enforce each cap.
 	 * Divide only after subtraction; never overflow a sum of allocations. */
 	if (memory_budget <= sizeof(*census))
 		return CLUSTER_RECOVERY_CENSUS_CAPACITY;
@@ -262,10 +265,29 @@ census_step(ClusterRecoveryCensus *census, ClusterRecoveryCensusEntry *out)
 		if (d->relation_result == CLUSTER_RECOVERY_RELATIONS_DRAINED) {
 			cluster_recovery_relation_census_destroy(census->relations);
 			census->relations = NULL;
-			d->phase = CLUSTER_RECOVERY_CENSUS_MX_PHYSICAL;
+			d->phase = CLUSTER_RECOVERY_CENSUS_SLRU_PHYSICAL;
 		}
 		if (d->relation_result == CLUSTER_RECOVERY_RELATIONS_MORE
 			|| d->relation_result == CLUSTER_RECOVERY_RELATIONS_DRAINED)
+			return CLUSTER_RECOVERY_CENSUS_MORE;
+		break;
+	case CLUSTER_RECOVERY_CENSUS_SLRU_PHYSICAL:
+		if (census->slru == NULL)
+			d->slru_result = cluster_recovery_slru_scan_begin(census->roots, census->child_budget,
+															  &census->slru);
+		else
+			d->slru_result = cluster_recovery_slru_scan_next(census->slru, &out->value.slru);
+		if (d->slru_result == CLUSTER_RECOVERY_SLRU_ENTRY) {
+			d->slru_entries++;
+			return census_entry(out, CLUSTER_RECOVERY_CENSUS_SLRU_SLOT);
+		}
+		if (d->slru_result == CLUSTER_RECOVERY_SLRU_DRAINED) {
+			cluster_recovery_slru_scan_destroy(census->slru);
+			census->slru = NULL;
+			d->phase = CLUSTER_RECOVERY_CENSUS_MX_PHYSICAL;
+		}
+		if (d->slru_result == CLUSTER_RECOVERY_SLRU_MORE
+			|| d->slru_result == CLUSTER_RECOVERY_SLRU_DRAINED)
 			return CLUSTER_RECOVERY_CENSUS_MORE;
 		break;
 	case CLUSTER_RECOVERY_CENSUS_MX_PHYSICAL:

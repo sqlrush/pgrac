@@ -590,7 +590,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(36);
+	UT_PLAN(38);
 	UT_RUN(test_native_inventory_uses_two_real_cold_passes);
 	UT_RUN(test_native_inventory_never_returns_partial_on_drift_io_or_error);
 	UT_RUN(test_native_inventory_capacity_is_not_partial_success);
@@ -627,6 +627,8 @@ main(int argc, char **argv)
 	UT_RUN(test_owned_census_destroy_each_phase);
 	UT_RUN(test_owned_census_target_obligations_keep_absence_extent_and_unsupported_forks);
 	UT_RUN(test_owned_census_target_join_and_final_observation_revoke_changed_inputs);
+	UT_RUN(test_owned_census_enumerates_raw_native_slru_slots);
+	UT_RUN(test_owned_census_native_slru_drift_and_scope_loss_revoke_outputs);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
