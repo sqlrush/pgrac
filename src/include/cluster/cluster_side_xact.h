@@ -139,6 +139,10 @@ extern RfSideXactApplyResultV1
 rf_side_xact_apply_covered_abort_v1(const RfSideXactOperationV1 *operation, void *arg,
 									RfSideXactVerifyAbortCoverageV1 verify);
 extern RfSideXactApplyResultV1
+rf_side_xact_apply_cold_abort_completion_v1(const RfSideXactOperationV1 *operation,
+											const uint8 *payload, uint32 length, void *arg,
+											RfSideXactVerifyAbortCoverageV1 verify);
+extern RfSideXactApplyResultV1
 rf_side_xact_target_preflight_owned_v1(const RfSideXactOperationV1 *operation,
 									   const uint8 *owned_payload, uint32 owned_payload_length);
 extern RfSideXactApplyResultV1 rf_side_xact_commit_prepared_requirements_v1(

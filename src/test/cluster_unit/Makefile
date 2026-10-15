@@ -2838,6 +2838,12 @@ $(CLUSTER_SIDE_XACT_O): $(top_srcdir)/src/backend/cluster/cluster_side_xact.c \
 		$(top_srcdir)/src/include/cluster/cluster_side_xact.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DRF_SIDE_XACT_TESTING \
 		-ffunction-sections -fdata-sections -c $< -o $@
+# Track only this native payload allocator in the full XACT owner fixture.
+test_cluster_side_xact_budget_product.o: $(top_srcdir)/src/backend/cluster/cluster_side_xact.c \
+		$(top_srcdir)/src/include/cluster/cluster_side_xact.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DRF_SIDE_XACT_TESTING \
+		-Dmalloc=side_xact_fixture_malloc -Dfree=side_xact_fixture_free \
+		-ffunction-sections -fdata-sections -c $< -o $@
 CLUSTER_SIDE_ONLINE_PLAN_TEST_O = test_cluster_side_online_plan.o
 $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O): \
 		$(top_srcdir)/src/backend/cluster/cluster_side_online_plan.c \
@@ -2884,11 +2890,11 @@ test_cluster_side_xact_stats.inc: $(top_srcdir)/src/backend/utils/activity/pgsta
 
 test_cluster_side_xact test_cluster_pi_contribution: %: %.c unit_test.h test_cluster_side_xact.c test_cluster_side_xact_stats.inc test_cluster_undo_header_identity.inc \
 		test_cluster_side_online_owner_product.o \
-		$(CLUSTER_SIDE_XACT_O) $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
+		test_cluster_side_xact_budget_product.o $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
 		$(SIDE_XACT_XACTDESC_O) $(SIDE_XACT_TT_2PC_RECORD_O) \
 		test_cluster_side_xact_undo_product.o $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_XACT_O) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_side_xact_budget_product.o \
 		test_cluster_side_online_owner_product.o \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(SIDE_XACT_XACTDESC_O) \
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \

@@ -1255,9 +1255,12 @@ rf_side_online_plan_abort_target_v1(const RfSideOnlinePlanV1 *plan,
 		|| plan->purpose != RF_SIDE_PLAN_RECOVERY || operation == NULL || out == NULL
 		|| operation->purpose != RF_SIDE_PLAN_RECOVERY || operation->history_only
 		|| operation->kind != RF_SIDE_ONLINE_OPERATION_XACT
-		|| operation->xact.kind != RF_SIDE_XACT_ABORT || operation->owned_payload != NULL
-		|| operation->owned_payload_length != 0
-		|| !rf_side_xact_structural_preflight_v1(&operation->xact)
+		|| operation->xact.kind != RF_SIDE_XACT_ABORT
+		|| (operation->xact.cold_completion_effects
+				? !rf_side_xact_cold_completion_preflight_v1(
+					  &operation->xact, operation->owned_payload, operation->owned_payload_length)
+				: (operation->owned_payload != NULL || operation->owned_payload_length != 0
+				   || !rf_side_xact_structural_preflight_v1(&operation->xact)))
 		|| rf_side_online_plan_origin_operation_count_v1(plan, operation->xact.origin_thread)
 			   == UINT32_MAX)
 		return false;
@@ -1270,7 +1273,16 @@ rf_side_online_plan_abort_target_v1(const RfSideOnlinePlanV1 *plan,
 		if (op->identity.record.origin_thread != operation->xact.origin_thread)
 			continue;
 		if (op->kind == RF_SIDE_ONLINE_OPERATION_XACT && op->xact.xid == operation->xact.xid) {
-			if (memcmp(op, operation, sizeof(*op)) != 0 || ++native_count != 1)
+			RfSideOnlineOperationV1 expected = *op;
+
+			if (expected.owned_payload_length != 0) {
+				if (expected.owned_payload_offset > plan->owned_payload_bytes
+					|| expected.owned_payload_length
+						   > plan->owned_payload_bytes - expected.owned_payload_offset)
+					return false;
+				expected.owned_payload = plan->owned_payload + expected.owned_payload_offset;
+			}
+			if (memcmp(&expected, operation, sizeof(expected)) != 0 || ++native_count != 1)
 				return false;
 		}
 		if (op->kind != RF_SIDE_ONLINE_OPERATION_UNDO || op->undo.kind != CLUSTER_UNDO_KIND_TT_ABORT
@@ -1924,14 +1936,18 @@ rf_side_online_plan_contribution_owners_v1(const RfSideOnlinePlanV1 *plan, uint3
 					result.owners |= RF_SIDE_CONTRIBUTION_INVALIDATION;
 				if (op->xact.relation_count != 0)
 					result.owners |= RF_SIDE_CONTRIBUTION_NATIVE_STRUCTURE;
-				if ((op->xact.xinfo & (XACT_COMPLETION_FORCE_SYNC_COMMIT
-					| XACT_COMPLETION_APPLY_FEEDBACK | XACT_XINFO_HAS_AE_LOCKS)) != 0)
+				if ((op->xact.xinfo
+					 & (XACT_COMPLETION_FORCE_SYNC_COMMIT | XACT_COMPLETION_APPLY_FEEDBACK
+						| XACT_XINFO_HAS_AE_LOCKS | XACT_XINFO_HAS_DROPPED_STATS))
+					!= 0)
 					result.owners |= RF_SIDE_CONTRIBUTION_COMPLETION;
 			}
 			break;
 		case RF_SIDE_XACT_ABORT:
 			/* Its TT transition is a separate original UNDO record. */
 			result.owners = RF_SIDE_CONTRIBUTION_TERMINAL;
+			if (op->xact.cold_completion_effects)
+				result.owners |= RF_SIDE_CONTRIBUTION_COMPLETION;
 			break;
 		case RF_SIDE_XACT_PREPARE:
 		case RF_SIDE_XACT_COMMIT_PREPARED:

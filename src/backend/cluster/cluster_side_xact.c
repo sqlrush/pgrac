@@ -349,20 +349,22 @@ side_xact_no_abort_effects(const xl_xact_parsed_abort *parsed)
 
 /* Bound native transactional statistics to their original supported owners. */
 static bool
-side_xact_cold_stats_valid(const xl_xact_parsed_commit *parsed)
+side_xact_cold_stats_valid(int count, const xl_xact_stats_item *items, uint32 xinfo, Oid database)
 {
-	for (int i = 0; i < parsed->nstats; i++) {
+	if (count < 0 || (count != 0 && items == NULL))
+		return false;
+	for (int i = 0; i < count; i++) {
 		xl_xact_stats_item item;
 
-		memcpy(&item, &parsed->stats[i], sizeof(item));
+		memcpy(&item, &items[i], sizeof(item));
 		/* Only the supported native transactional object owners. Fixed stats,
 		 * unknown kinds and unsupported subscription/slot effects cannot reach
 		 * pgstat's unchecked kind table. No catalog read or alternate owner. */
 		if ((item.kind != PGSTAT_KIND_RELATION && item.kind != PGSTAT_KIND_FUNCTION)
 			|| !OidIsValid(item.objoid)
 			|| (item.kind == PGSTAT_KIND_FUNCTION && !OidIsValid(item.dboid))
-			|| ((parsed->xinfo & XACT_XINFO_HAS_DBINFO) != 0 && item.dboid != InvalidOid
-				&& item.dboid != parsed->dbId))
+			|| ((xinfo & XACT_XINFO_HAS_DBINFO) != 0 && item.dboid != InvalidOid
+				&& item.dboid != database))
 			return false;
 	}
 	return true;
@@ -380,7 +382,9 @@ side_xact_pi_effects_valid(const xl_xact_parsed_commit *parsed, uint64 system_id
 
 	/* These additional transaction owners are not proved by this consumer. */
 	if (parsed->nsubxacts != 0
-		|| (cold_completion ? !side_xact_cold_stats_valid(parsed) : parsed->nstats != 0)
+		|| (cold_completion ? !side_xact_cold_stats_valid(parsed->nstats, parsed->stats,
+														  parsed->xinfo, parsed->dbId)
+							: parsed->nstats != 0)
 		|| (parsed->xinfo & XACT_XINFO_HAS_ORIGIN) != 0)
 		return false;
 	/* Every physical deletion must have its typed identity and version pair;
@@ -821,6 +825,43 @@ rf_side_xact_inspect_pi_v1(XLogReaderState *record, uint64 system_identifier, ui
 	return side_xact_decode(record, system_identifier, origin_thread, true, false, out);
 }
 
+/* Ordinary ABORT carries no TT locator. Retain its bounded native effects;
+ * only the cold plan can bind the exact preceding TT_ABORT and apply them. */
+static bool
+side_xact_decode_cold_abort(XLogReaderState *record, uint64 system_identifier, uint16 origin_thread,
+							RfSideXactOperationV1 *out)
+{
+	RfSideXactOperationV1 candidate = { 0 };
+	xl_xact_parsed_abort parsed;
+	const uint32 supported
+		= XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_DROPPED_STATS;
+
+	if (record == NULL || record->record == NULL || out == NULL || system_identifier == 0
+		|| origin_thread == 0 || origin_thread > 128 || XLogRecGetRmid(record) != RM_XACT_ID
+		|| (XLogRecGetInfo(record) & XLOG_XACT_OPMASK) != XLOG_XACT_ABORT
+		|| !TransactionIdIsNormal(XLogRecGetXid(record)) || XLogRecHasAnyBlockRefs(record)
+		|| !side_xact_completion_shape_valid(record, false))
+		return false;
+	ParseAbortRecord(XLogRecGetInfo(record), (xl_xact_abort *)XLogRecGetData(record), &parsed);
+	if ((parsed.xinfo & ~supported) != 0 || parsed.nsubxacts != 0 || parsed.nrels != 0
+		|| parsed.nstats <= 0 || !SCN_VALID(parsed.scn)
+		|| !side_xact_cold_stats_valid(parsed.nstats, parsed.stats, parsed.xinfo, parsed.dbId))
+		return false;
+	candidate.system_identifier = system_identifier;
+	candidate.origin_thread = origin_thread;
+	candidate.kind = RF_SIDE_XACT_ABORT;
+	candidate.xid = XLogRecGetXid(record);
+	candidate.database = parsed.dbId;
+	candidate.xinfo = parsed.xinfo;
+	candidate.terminal_scn = parsed.scn;
+	if (!side_xact_structural_preflight(&candidate, false))
+		return false;
+	candidate.cold_completion_effects = true;
+	candidate.completion_payload_length = XLogRecGetDataLen(record);
+	*out = candidate;
+	return true;
+}
+
 /* A recovery plan may retain native completion work that generic apply refuses.
  * Use the same bounded parser and message validation as inspection, but
  * produce a distinct operation that requires the executable cold owner. */
@@ -837,6 +878,9 @@ rf_side_xact_decode_recovery_v1(XLogReaderState *record, uint64 system_identifie
 		return false;
 	if (rf_side_xact_decode_v1(record, system_identifier, origin_thread, out))
 		return true;
+	if (record != NULL && record->record != NULL
+		&& (XLogRecGetInfo(record) & XLOG_XACT_OPMASK) == XLOG_XACT_ABORT)
+		return side_xact_decode_cold_abort(record, system_identifier, origin_thread, out);
 	if (!side_xact_decode(record, system_identifier, origin_thread, true, true, &candidate)
 		|| candidate.kind != RF_SIDE_XACT_COMMIT || (candidate.xinfo & ~supported) != 0
 		|| (candidate.invalidation_count == 0
@@ -864,8 +908,8 @@ rf_side_xact_cold_completion_preflight_v1(const RfSideXactOperationV1 *operation
 	bool valid;
 
 	if (operation == NULL || !operation->cold_completion_effects || operation->pi_read_only
-		|| operation->kind != RF_SIDE_XACT_COMMIT || payload == NULL || length == 0
-		|| length != operation->completion_payload_length
+		|| (operation->kind != RF_SIDE_XACT_COMMIT && operation->kind != RF_SIDE_XACT_ABORT)
+		|| payload == NULL || length == 0 || length != operation->completion_payload_length
 		|| operation->system_identifier != GetSystemIdentifier()
 		|| cluster_xid_origin_slot(operation->xid) != (int)operation->origin_thread - 1)
 		return false;
@@ -874,7 +918,9 @@ rf_side_xact_cold_completion_preflight_v1(const RfSideXactOperationV1 *operation
 	if (copy == NULL)
 		return false;
 	decoded.header.xl_rmid = RM_XACT_ID;
-	decoded.header.xl_info = XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO;
+	decoded.header.xl_info
+		= (operation->kind == RF_SIDE_XACT_COMMIT ? XLOG_XACT_COMMIT : XLOG_XACT_ABORT)
+		  | XLOG_XACT_HAS_INFO;
 	decoded.header.xl_xid = operation->xid;
 	decoded.max_block_id = -1;
 	decoded.main_data = (char *)copy;
@@ -963,7 +1009,7 @@ rf_side_xact_apply_cold_completion_v1(const RfSideXactOperationV1 *operation, co
 	/* The native cache replay owner temporarily uses DatabasePath. An
 	 * existing backend database context cannot be borrowed or destroyed. */
 	if (!rf_side_xact_cold_completion_preflight_v1(operation, payload, length)
-		|| DatabasePath != NULL || verify == NULL
+		|| operation->kind != RF_SIDE_XACT_COMMIT || DatabasePath != NULL || verify == NULL
 		|| !cluster_undo_recovery_cold_origin_authorized_v1(operation->origin_thread - 1)
 		|| ((operation->xinfo & (XACT_XINFO_HAS_DROPPED_STATS | XACT_COMPLETION_FORCE_SYNC_COMMIT))
 				!= 0
@@ -1023,9 +1069,8 @@ rf_side_xact_preflight_covered_abort_v1(const RfSideXactOperationV1 *operation)
 		   && (operation->xinfo & ~supported) == 0;
 }
 
-RfSideXactApplyResultV1
-rf_side_xact_apply_covered_abort_v1(const RfSideXactOperationV1 *operation, void *arg,
-									RfSideXactVerifyAbortCoverageV1 verify)
+static RfSideXactApplyResultV1
+side_xact_project_abort(const RfSideXactOperationV1 *operation)
 {
 	ClusterRemoteXactMutationV2 mutation;
 	ClusterRemoteXactOutcome outcome;
@@ -1033,9 +1078,6 @@ rf_side_xact_apply_covered_abort_v1(const RfSideXactOperationV1 *operation, void
 	uint16 post_wrap;
 	bool post_wrap_valid;
 
-	if (!rf_side_xact_preflight_covered_abort_v1(operation) || verify == NULL
-		|| !verify(arg, operation))
-		return RF_SIDE_XACT_APPLY_BLOCKED;
 	cluster_scn_recovery_replay_observe(operation->terminal_scn);
 	mutation = cluster_remote_xact_store_terminal_v2(operation->origin_thread - 1, operation->xid,
 													 false, NULL, CLUSTER_REMOTE_XACT_ABORTED,
@@ -1050,6 +1092,57 @@ rf_side_xact_apply_covered_abort_v1(const RfSideXactOperationV1 *operation, void
 	return outcome == CLUSTER_REMOTE_XACT_ABORTED && !SCN_VALID(post_scn) && !post_wrap_valid
 			   ? RF_SIDE_XACT_APPLY_OK
 			   : RF_SIDE_XACT_APPLY_POST_READ_FAILED;
+}
+
+RfSideXactApplyResultV1
+rf_side_xact_apply_covered_abort_v1(const RfSideXactOperationV1 *operation, void *arg,
+									RfSideXactVerifyAbortCoverageV1 verify)
+{
+	if (!rf_side_xact_preflight_covered_abort_v1(operation) || verify == NULL
+		|| !verify(arg, operation))
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+	return side_xact_project_abort(operation);
+}
+
+RfSideXactApplyResultV1
+rf_side_xact_apply_cold_abort_completion_v1(const RfSideXactOperationV1 *operation,
+											const uint8 *payload, uint32 length, void *arg,
+											RfSideXactVerifyAbortCoverageV1 verify)
+{
+	xl_xact_parsed_abort parsed;
+	uint8 *copy;
+	volatile RfSideXactApplyResultV1 result = RF_SIDE_XACT_APPLY_BLOCKED;
+
+	if (!rf_side_xact_cold_completion_preflight_v1(operation, payload, length)
+		|| operation->kind != RF_SIDE_XACT_ABORT || verify == NULL
+		|| !cluster_undo_recovery_cold_source_synced_v1(operation->origin_thread - 1))
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+	/* Coverage reparses the exact owned record. Finish it before retaining
+	 * our copy: the plan reserves one maximum simultaneous payload, not two. */
+	if (!verify(arg, operation)
+		|| !cluster_undo_recovery_cold_source_synced_v1(operation->origin_thread - 1))
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+	copy = side_xact_payload_copy(payload, length);
+	if (copy == NULL)
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+	PG_TRY();
+	{
+		/* The complete bytes passed bounded reparse above. The original owner
+		 * must prove canonical TT and native CLOG before statistics or terminal
+		 * projection. Use the source's durability, never a foreign local LSN. */
+		ParseAbortRecord(XLOG_XACT_ABORT | XLOG_XACT_HAS_INFO, (xl_xact_abort *)copy, &parsed);
+		if (cluster_undo_recovery_cold_source_synced_v1(operation->origin_thread - 1)) {
+			pgstat_execute_transactional_drops(parsed.nstats, parsed.stats, true);
+			if (cluster_undo_recovery_cold_source_synced_v1(operation->origin_thread - 1))
+				result = side_xact_project_abort(operation);
+		}
+	}
+	PG_FINALLY();
+	{
+		side_xact_payload_free(copy);
+	}
+	PG_END_TRY();
+	return result;
 }
 
 static RfSideXactApplyResultV1

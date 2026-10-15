@@ -230,6 +230,16 @@ rf_side_xact_apply_covered_abort_v1(const RfSideXactOperationV1 *operation, void
 	return RF_SIDE_XACT_APPLY_BLOCKED;
 }
 
+RfSideXactApplyResultV1
+rf_side_xact_apply_cold_abort_completion_v1(
+	const RfSideXactOperationV1 *operation pg_attribute_unused(),
+	const uint8 *payload pg_attribute_unused(), uint32 length pg_attribute_unused(),
+	void *arg pg_attribute_unused(), RfSideXactVerifyAbortCoverageV1 verify pg_attribute_unused())
+{
+	UT_ASSERT(false); /* Full payload/owner integration is in test_cluster_side_xact. */
+	return RF_SIDE_XACT_APPLY_BLOCKED;
+}
+
 Size
 rf_side_online_plan_scratch_available_v1(const RfSideOnlinePlanV1 *plan)
 {

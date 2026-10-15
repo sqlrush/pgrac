@@ -225,9 +225,13 @@ static bool
 side_owner_cold_abort_ready(RfSideOnlineProductionOwnerV1 *owner,
 							const RfSideOnlineOperationV1 *operation, ClusterUndoDecoded *target)
 {
-	return side_owner_cold_formed(owner) && operation->owned_payload == NULL
-		   && operation->owned_payload_length == 0
-		   && rf_side_xact_preflight_covered_abort_v1(&operation->xact)
+	return side_owner_cold_formed(owner)
+		   && (operation->xact.cold_completion_effects
+				   ? rf_side_xact_cold_completion_preflight_v1(&operation->xact,
+															   operation->owned_payload,
+															   operation->owned_payload_length)
+				   : (operation->owned_payload == NULL && operation->owned_payload_length == 0
+					  && rf_side_xact_preflight_covered_abort_v1(&operation->xact)))
 		   && operation->xact.origin_thread == owner->undo_authority->duty->origin_thread_id
 		   && rf_side_online_plan_abort_target_v1(owner->protected_plan, operation, target)
 		   && cluster_undo_recovery_cold_origin_authorized_v1(operation->xact.origin_thread - 1);
@@ -317,6 +321,8 @@ side_owner_preflight_xact(void *arg, const RfSideOnlineOperationV1 *operation)
 		ClusterUndoDecoded target;
 
 		return side_owner_cold_abort_ready(owner, operation, &target)
+			   && (!operation->xact.cold_completion_effects
+				   || cluster_undo_recovery_cold_source_sync_v1(operation->xact.origin_thread - 1))
 			   && side_owner_undo_target(owner, target.instance, target.segment_id, 0) != NULL;
 	}
 	if (operation->xact.cold_completion_effects)
@@ -457,6 +463,11 @@ side_owner_apply_xact(void *arg, const RfSideOnlineOperationV1 *operation)
 			|| !side_owner_install_target(
 				owner, side_owner_undo_target(owner, target.instance, target.segment_id, 0)))
 			return false;
+		if (operation->xact.cold_completion_effects)
+			return rf_side_xact_apply_cold_abort_completion_v1(
+					   &operation->xact, operation->owned_payload, operation->owned_payload_length,
+					   &coverage, side_owner_abort_covered)
+				   == RF_SIDE_XACT_APPLY_OK;
 		return rf_side_xact_apply_covered_abort_v1(&operation->xact, &coverage,
 												   side_owner_abort_covered)
 			   == RF_SIDE_XACT_APPLY_OK;
