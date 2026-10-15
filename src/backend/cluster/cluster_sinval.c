@@ -2105,8 +2105,10 @@ cluster_sinval_ack_wait_alloc_batch_id(void)
 
 /*
  * Insert an ack_wait entry keyed by batch_id, owned by the CURRENT backend
- * (its procLatch is signalled on completion), waiting for the alive_mask peers
- * until deadline_us.  Returns false if the HTAB is full (caller fails closed).
+ * (its procLatch is signalled on completion), waiting for the alive_mask peers.
+ * deadline_us records the caller's deadline, or zero for no protocol deadline.
+ * Only the caller enforces it and removes the entry; time alone never removes
+ * accepted ownership. Returns false if the HTAB is full (caller fails closed).
  */
 bool
 cluster_sinval_ack_wait_begin(uint64 batch_id, uint32 alive_mask, TimestampTz deadline_us)

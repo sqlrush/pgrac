@@ -170,6 +170,12 @@ static uint64 recorded_batch;
 static int record_count;
 static bool barrier_active, barrier_complete, epoch_change_complete;
 static int barrier_requests, barrier_waits, barrier_removes;
+/* Virtual time and scheduled delivery exercise the actual origin wait and
+ * ACK handler without a wall-clock sleep or a remote physical-drain claim. */
+static bool barrier_clock_wait, barrier_boot_drift;
+static int barrier_reply_after, barrier_stale_at, barrier_interrupt_at, barrier_identity_at;
+static TimestampTz barrier_registered_deadline;
+static int barrier_interrupt_sqlstate;
 static bool multiple_barriers;
 static uint64 allocated_batch, active_batch;
 static int barrier_record_base;
@@ -205,6 +211,7 @@ static bool cancel_wait;
 static bool drive_shared_ack;
 static bool expecting_error;
 static int reported_sqlstate;
+static char reported_hint[256];
 static ClusterKoSharedMessageV2 last_shared_request, last_shared_ack;
 static ClusterPiWritebackFactV2 offered_structure;
 static bool offer_notice_live;
@@ -479,6 +486,8 @@ void
 ProcessInterrupts(void)
 {
 	InterruptPending = false;
+	if (barrier_interrupt_sqlstate != 0)
+		reported_sqlstate = barrier_interrupt_sqlstate;
 	pg_re_throw();
 }
 void
@@ -732,6 +741,33 @@ WaitLatch(Latch *latch, int events, long timeout, uint32 wait_event)
 		pg_re_throw();
 	if (failure_records != 0)
 		return WL_LATCH_SET;
+	if (barrier_clock_wait) {
+		bool owned = false;
+		UT_ASSERT_EQ(wait_event, WAIT_EVENT_CLUSTER_OBJECT_FLUSH_WAIT);
+		UT_ASSERT_EQ(timeout, cluster_sinval_ack_timeout_ms);
+		UT_ASSERT_EQ(record_count, 0);
+		UT_ASSERT_EQ(drop_count, 0);
+		for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
+			if (storage.contexts[i].used && storage.contexts[i].request.batch_id == active_batch) {
+				owned = true;
+				UT_ASSERT(!storage.contexts[i].complete);
+			}
+		UT_ASSERT(owned);
+		/* An unintended loop fails deterministically instead of hanging the
+		 * test. The scheduled results below need at most four timed waits. */
+		if (barrier_waits > 8)
+			abort();
+		holder_probe_clock += (int64)timeout * USECS_PER_MSEC;
+		if (barrier_waits == barrier_interrupt_at)
+			InterruptPending = true;
+		if (barrier_waits == barrier_identity_at) {
+			if (barrier_boot_drift)
+				formation.membership.last_admitted_incarnation[1]++;
+			else
+				current_epoch++;
+		}
+		return WL_TIMEOUT;
+	}
 	current_epoch++;
 	barrier_complete = true;
 	return WL_LATCH_SET;
@@ -745,6 +781,10 @@ pg_re_throw(void)
 int
 errhint(const char *format, ...)
 {
+	va_list args;
+	va_start(args, format);
+	vsnprintf(reported_hint, sizeof(reported_hint), format, args);
+	va_end(args);
 	return 0;
 }
 int
@@ -834,6 +874,7 @@ cluster_sinval_ack_wait_begin(uint64 batch, uint32 mask, TimestampTz deadline)
 	active_batch = batch;
 	barrier_record_base = record_count;
 	barrier_active = true;
+	barrier_registered_deadline = deadline;
 	return true;
 }
 bool
@@ -845,9 +886,13 @@ cluster_sinval_ack_wait_is_complete(uint64 batch)
 		uint8 wire[CLUSTER_KO_SHARED_V3_BYTES];
 		ClusterKoSharedMessageV3 ack;
 		shared_send_tick();
+		if (barrier_clock_wait && barrier_waits < barrier_reply_after)
+			return false;
 		ack = sent_v3_request;
 		ack.base.verb = CLUSTER_KO_SHARED_ACK;
 		ack.base.status = drive_v3_failure ? CLUSTER_KO_SHARED_FAILED : CLUSTER_KO_SHARED_DONE;
+		if (barrier_clock_wait && barrier_waits == barrier_stale_at)
+			ack.base.batch_id++;
 		UT_ASSERT(cluster_ko_shared_encode_v3(&ack, wire, sizeof(wire)));
 		env.source_node_id = 1;
 		env.payload_length = sizeof(wire);
@@ -1203,6 +1248,7 @@ reset_test(void)
 	generation_race = cancel_wait = drive_shared_ack = false;
 	expecting_error = false;
 	reported_sqlstate = 0;
+	reported_hint[0] = '\0';
 	InterruptPending = false;
 	space_reads = send_calls = lock_calls = boot_change_phase = 0;
 	member_generation = 2;
@@ -1246,6 +1292,10 @@ reset_test(void)
 	barrier_record_base = 0;
 	epoch_change_complete = false;
 	barrier_requests = barrier_waits = barrier_removes = 0;
+	barrier_clock_wait = barrier_boot_drift = false;
+	barrier_reply_after = barrier_stale_at = barrier_interrupt_at = barrier_identity_at = 0;
+	barrier_registered_deadline = 0;
+	barrier_interrupt_sqlstate = 0;
 	failure_records = 0;
 	failed_peer = -1;
 	failed_batch = 0;
@@ -8225,7 +8275,7 @@ UT_TEST(test_v3_failure_cleanup_cannot_poison_reused_owner)
 	UT_ASSERT_EQ(storage.send_v3_count, 0);
 }
 
-UT_TEST(test_v3_origin_consumes_failure_before_an_ack_deadline)
+UT_TEST(test_v3_origin_consumes_failure_without_done)
 {
 	KoAxBinding binding = origin_marker_setup();
 	volatile bool caught = false;
@@ -8251,6 +8301,170 @@ UT_TEST(test_v3_origin_consumes_failure_before_an_ack_deadline)
 	UT_ASSERT(!barrier_active);
 	UT_ASSERT_EQ(current_epoch, 1);
 }
+
+static KoAxBinding
+origin_delayed_reply_setup(void)
+{
+	KoAxBinding binding = origin_marker_setup();
+	barrier_clock_wait = true;
+	barrier_complete = false;
+	barrier_reply_after = 3;
+	holder_probe_clock = 1;
+	return binding;
+}
+
+UT_TEST(test_v3_origin_waits_past_timeout_for_exact_ready)
+{
+	KoAxBinding binding = origin_delayed_reply_setup();
+	int saved_timeout = cluster_sinval_ack_timeout_ms;
+	cluster_sinval_ack_timeout_ms = 5000;
+	UT_ASSERT(ko_run_shared_barrier_impl_v3(space_identity.key.locator,
+										  CLUSTER_KO_SHARED_V3_OPERATION_DROP, &binding, NULL));
+	UT_ASSERT_EQ(barrier_waits, 3);
+	UT_ASSERT_EQ(holder_probe_clock, 1 + 15000 * USECS_PER_MSEC);
+	UT_ASSERT_EQ(barrier_registered_deadline, 0);
+	UT_ASSERT_EQ(barrier_requests, 1);
+	UT_ASSERT_EQ(record_count, 1);
+	UT_ASSERT_EQ(recorded_batch, marker_batch);
+	UT_ASSERT_EQ(barrier_removes, 1);
+	UT_ASSERT(!barrier_active);
+	UT_ASSERT_EQ(drop_count, 0);
+	cluster_sinval_ack_timeout_ms = saved_timeout;
+}
+
+UT_TEST(test_v3_origin_rejects_late_stale_ack_until_exact_ready)
+{
+	KoAxBinding binding = origin_delayed_reply_setup();
+	barrier_stale_at = 3;
+	UT_ASSERT(ko_run_shared_barrier_impl_v3(space_identity.key.locator,
+										  CLUSTER_KO_SHARED_V3_OPERATION_DROP, &binding, NULL));
+	UT_ASSERT_EQ(barrier_waits, 4);
+	UT_ASSERT_EQ(barrier_requests, 1);
+	UT_ASSERT_EQ(record_count, 1);
+	UT_ASSERT_EQ(recorded_batch, marker_batch);
+	UT_ASSERT_EQ(failure_records, 0);
+	UT_ASSERT_EQ(barrier_removes, 1);
+}
+
+UT_TEST(test_v3_origin_late_peer_failure_is_not_a_timeout)
+{
+	KoAxBinding binding = origin_delayed_reply_setup();
+	volatile bool caught = false;
+	drive_v3_failure = true;
+	expecting_error = true;
+	PG_TRY();
+	{
+		(void)ko_run_shared_barrier_impl_v3(space_identity.key.locator,
+											CLUSTER_KO_SHARED_V3_OPERATION_DROP, &binding, NULL);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	expecting_error = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(reported_sqlstate, ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE);
+	UT_ASSERT_EQ(failure_records, 1);
+	UT_ASSERT_EQ(failed_batch, marker_batch);
+	UT_ASSERT_EQ(record_count, 0);
+	UT_ASSERT_EQ(barrier_waits, 4); /* three timeouts, then the FAILED notification */
+	UT_ASSERT_EQ(barrier_removes, 1);
+	UT_ASSERT_EQ(drop_count, 0);
+}
+
+UT_TEST(test_v3_origin_missing_ack_waits_until_caller_interrupt)
+{
+	KoAxBinding binding = origin_delayed_reply_setup();
+	volatile bool caught = false;
+	barrier_reply_after = 100;
+	barrier_interrupt_at = 3;
+	barrier_interrupt_sqlstate = ERRCODE_QUERY_CANCELED;
+	PG_TRY();
+	{
+		(void)ko_run_shared_barrier_impl_v3(space_identity.key.locator,
+											CLUSTER_KO_SHARED_V3_OPERATION_DROP, &binding, NULL);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(reported_sqlstate, ERRCODE_QUERY_CANCELED);
+	UT_ASSERT_EQ(barrier_waits, 3);
+	UT_ASSERT_EQ(record_count + failure_records + drop_count, 0);
+	UT_ASSERT_EQ(barrier_removes, 1);
+	/* This verifies the original interrupt/SQL-waiter cleanup only. It is
+	 * not a proof of accepted-request cancellation or AX-owner handoff. */
+	UT_ASSERT(!barrier_active);
+}
+
+UT_TEST(test_v3_origin_identity_change_still_ends_wait)
+{
+	for (int drift = 0; drift < 2; drift++) {
+		KoAxBinding binding = origin_delayed_reply_setup();
+		barrier_reply_after = 100;
+		barrier_identity_at = 3;
+		barrier_boot_drift = drift != 0;
+		UT_ASSERT(!ko_run_shared_barrier_impl_v3(space_identity.key.locator,
+											   CLUSTER_KO_SHARED_V3_OPERATION_DROP, &binding, NULL));
+		UT_ASSERT_EQ(barrier_waits, 3);
+		UT_ASSERT_EQ(record_count + failure_records + drop_count, 0);
+		UT_ASSERT_EQ(barrier_removes, 1);
+	}
+}
+
+UT_TEST(test_v2_origin_preserves_ack_deadline)
+{
+	reset_test();
+	cluster_shared_config = true;
+	barrier_clock_wait = true;
+	barrier_complete = false;
+	holder_probe_clock = 1;
+	UT_ASSERT(!ko_run_shared_barrier(space_identity.key.locator));
+	UT_ASSERT_EQ(barrier_waits, 1);
+	UT_ASSERT_EQ(barrier_registered_deadline,
+				 1 + (int64)cluster_sinval_ack_timeout_ms * USECS_PER_MSEC);
+	UT_ASSERT_EQ(current_epoch, 1);
+	UT_ASSERT_EQ(record_count, 0);
+	UT_ASSERT_EQ(barrier_removes, 1);
+}
+
+UT_TEST(test_v3_native_identity_refusal_does_not_report_ack_timeout)
+{
+	RelationData relation;
+	Oid old_database = MyDatabaseId;
+	volatile bool caught = false;
+	v3_native_structure_setup(&relation);
+	MyDatabaseId = relation.rd_locator.dbOid;
+	barrier_clock_wait = true;
+	barrier_complete = false;
+	barrier_reply_after = 100;
+	barrier_identity_at = 3;
+	holder_probe_clock = 1;
+	expecting_error = true;
+	PG_TRY();
+	{
+		cluster_ko_flush_and_wait_ack_relation(&relation, RELPERSISTENCE_PERMANENT,
+											   CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	expecting_error = false;
+	MyDatabaseId = old_database;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(reported_sqlstate, ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE);
+	UT_ASSERT_EQ(barrier_waits, 3);
+	UT_ASSERT(reported_hint[0] != '\0');
+	UT_ASSERT(strstr(reported_hint, "cluster.sinval_ack_timeout_ms") == NULL);
+	UT_ASSERT_EQ(record_count + failure_records + drop_count, 0);
+	UT_ASSERT_EQ(barrier_removes, 1);
+}
+
 UT_TEST(test_v3_sender_does_not_resend_after_acceptance_or_ambiguous_error)
 {
 	for (int n = 0; n < 2; n++) {
@@ -8332,7 +8546,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(201);
+	UT_PLAN(208);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_create_reference_outlives_exact_space_children_and_blocks_ready);
 	UT_RUN(test_create_capacity_reserves_progress_for_every_accepted_constructor);
@@ -8529,7 +8743,14 @@ main(void)
 	UT_RUN(test_v3_peer_io_error_retains_exact_work_and_publishes_only_failure);
 	UT_RUN(test_v3_failure_reply_waits_for_existing_queue_capacity);
 	UT_RUN(test_v3_failure_cleanup_cannot_poison_reused_owner);
-	UT_RUN(test_v3_origin_consumes_failure_before_an_ack_deadline);
+	UT_RUN(test_v3_origin_consumes_failure_without_done);
+	UT_RUN(test_v3_origin_waits_past_timeout_for_exact_ready);
+	UT_RUN(test_v3_origin_rejects_late_stale_ack_until_exact_ready);
+	UT_RUN(test_v3_origin_late_peer_failure_is_not_a_timeout);
+	UT_RUN(test_v3_origin_missing_ack_waits_until_caller_interrupt);
+	UT_RUN(test_v3_origin_identity_change_still_ends_wait);
+	UT_RUN(test_v2_origin_preserves_ack_deadline);
+	UT_RUN(test_v3_native_identity_refusal_does_not_report_ack_timeout);
 	UT_RUN(test_v3_sender_does_not_resend_after_acceptance_or_ambiguous_error);
 	UT_RUN(test_v3_sender_bounds_retry_without_hiding_other_work);
 	UT_RUN(test_v3_ack_needs_actual_transport_admission_without_hard_error);

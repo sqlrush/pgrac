@@ -4785,8 +4785,7 @@ ko_shared_v3_peer_identity_current(const ClusterKoSharedMessageV3 *message)
 
 static bool
 ko_shared_wait_for_acks_v3(ClusterKoSharedMessageV3 *request, uint32 mask,
-											 const uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT],
-											 TimestampTz deadline)
+											 const uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT])
 {
 	ResetLatch(MyLatch);
 	KO_BUMP(flush_count);
@@ -4800,7 +4799,6 @@ ko_shared_wait_for_acks_v3(ClusterKoSharedMessageV3 *request, uint32 mask,
 			return false;
 	}
 	while (ko_shared_v3_control_current(request)) {
-		TimestampTz now;
 		int events;
 		int32 failed_peer;
 		CHECK_FOR_INTERRUPTS();
@@ -4820,11 +4818,12 @@ ko_shared_wait_for_acks_v3(ClusterKoSharedMessageV3 *request, uint32 mask,
 		}
 		if (cluster_sinval_ack_wait_is_complete(request->base.batch_id))
 			return ko_shared_v3_control_current(request) && ko_shared_v3_space_current(request);
-		now = GetCurrentTimestamp();
-		if (now >= deadline)
-			break;
+		/* A timed wait only schedules the next identity/interrupt check.
+		 * Missing READY is not evidence that the accepted drain failed;
+		 * exact ACKs, peer failure and caller cancellation keep their original
+		 * consumers. Latch notification can end this wait before the interval. */
 		events = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-								   (deadline - now + USECS_PER_MSEC - 1) / USECS_PER_MSEC,
+								   cluster_sinval_ack_timeout_ms,
 								   WAIT_EVENT_CLUSTER_OBJECT_FLUSH_WAIT);
 		ResetLatch(MyLatch);
 		if (events & WL_POSTMASTER_DEATH)
@@ -4843,7 +4842,6 @@ ko_run_shared_barrier_impl_v3(RelFileLocator locator, uint16 operation,
 	uint32 mask;
 	int context;
 	volatile bool begun = false, ok = false;
-	TimestampTz deadline;
 
 	if (!ko_shared_prepare_request_v3(locator, operation, binding, &request, boots, &mask))
 		return false;
@@ -4857,7 +4855,6 @@ ko_run_shared_barrier_impl_v3(RelFileLocator locator, uint16 operation,
 	if (context < 0)
 		return false;
 	batch_id = request.base.batch_id;
-	deadline = GetCurrentTimestamp() + (int64)cluster_sinval_ack_timeout_ms * USECS_PER_MSEC;
 	PG_TRY();
 	{
 		/* Reserve transaction-owned publication before any peer REQUEST can
@@ -4875,9 +4872,10 @@ ko_run_shared_barrier_impl_v3(RelFileLocator locator, uint16 operation,
 			if (ok)
 				KO_BUMP(native_count);
 		} else
-			begun = cluster_sinval_ack_wait_begin(request.base.batch_id, mask, deadline);
+			/* The original owner removes this entry; v3 has no protocol deadline. */
+			begun = cluster_sinval_ack_wait_begin(request.base.batch_id, mask, 0);
 		if (begun)
-			ok = ko_shared_wait_for_acks_v3(&request, mask, boots, deadline);
+			ok = ko_shared_wait_for_acks_v3(&request, mask, boots);
 	}
 	PG_FINALLY();
 	{
@@ -5088,8 +5086,11 @@ ko_flush_and_wait_ack(RelFileLocator rloc, char relpersistence, ClusterKoComplet
 				 errmsg("could not confirm every peer dropped buffers for relfilenode %u/%u/%u "
 						"before reuse",
 						(unsigned)rloc.spcOid, (unsigned)rloc.dbOid, (unsigned)rloc.relNumber),
-				 errhint("A peer did not acknowledge the cross-node buffer flush within "
-						 "cluster.sinval_ack_timeout_ms; check cluster health and retry.")));
+				 errhint(binding != NULL
+						 ? "Check cluster and peer logs for an object operation or identity failure "
+						   "before retrying."
+						 : "A peer did not acknowledge the cross-node buffer flush within "
+						   "cluster.sinval_ack_timeout_ms; check cluster health and retry.")));
 	}
 }
 
