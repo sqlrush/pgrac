@@ -5426,17 +5426,59 @@ ExtendBufferedRelTo(BufferManagerRelation bmr,
 		 bmr.smgr->smgr_cached_nblocks[fork] == InvalidBlockNumber) &&
 		!smgrexists(bmr.smgr, fork))
 	{
-		LockRelationForExtension(bmr.rel, ExclusiveLock);
+#ifdef USE_PGRAC_CLUSTER
+		RelFileLocator fork_locator = bmr.smgr->smgr_rlocator.locator;
+		BackendId fork_backend = bmr.smgr->smgr_rlocator.backend;
+		uint64 fork_serial = 0;
+		bool fork_scoped = cluster_enabled && cluster_shared_config
+						   && cluster_interconnect_tier == CLUSTER_IC_TIER_1
+						   && !RecoveryInProgress() && bmr.relpersistence != RELPERSISTENCE_TEMP
+						   && cluster_smgr_which_for(fork_locator, fork_backend) == 1;
 
-		/* could have been closed while waiting for lock */
-		if (bmr.rel)
-			bmr.smgr = RelationGetSmgr(bmr.rel);
+		/* The optional file constructor precedes the independent extension. */
+		if (fork_scoped && !cluster_ko_create_begin_v3(fork_locator, &fork_serial))
+			elog(ERROR, "auxiliary fork creation conflicts with object drain");
+		PG_TRY();
+		{
+#endif
+			LockRelationForExtension(bmr.rel, ExclusiveLock);
 
-		/* recheck, fork might have been created concurrently */
-		if (!smgrexists(bmr.smgr, fork))
-			smgrcreate(bmr.smgr, fork, flags & EB_PERFORMING_RECOVERY);
+			/* could have been closed while waiting for lock */
+			if (bmr.rel)
+				bmr.smgr = RelationGetSmgr(bmr.rel);
 
-		UnlockRelationForExtension(bmr.rel, ExclusiveLock);
+#ifdef USE_PGRAC_CLUSTER
+			if (fork_serial != 0
+				&& (!RelFileLocatorEquals(bmr.smgr->smgr_rlocator.locator, fork_locator)
+					|| bmr.smgr->smgr_rlocator.backend != fork_backend))
+				elog(ERROR, "auxiliary fork creation changed storage identity while waiting");
+#endif
+			/* recheck, fork might have been created concurrently */
+			if (!smgrexists(bmr.smgr, fork))
+#ifdef USE_PGRAC_CLUSTER
+			{
+				if (fork_serial != 0
+					&& !cluster_ko_create_write_begin_v3(fork_locator, fork_serial))
+					elog(ERROR, "auxiliary fork creation lost its original owner");
+#endif
+				smgrcreate(bmr.smgr, fork, flags & EB_PERFORMING_RECOVERY);
+#ifdef USE_PGRAC_CLUSTER
+			}
+#endif
+
+			UnlockRelationForExtension(bmr.rel, ExclusiveLock);
+#ifdef USE_PGRAC_CLUSTER
+		}
+		PG_CATCH();
+		{
+			cluster_ko_create_abort_v3(fork_serial);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		/* File/IO cleanup remains with its original owners. */
+		if (fork_serial != 0 && !cluster_ko_create_end_v3(fork_serial, true))
+			elog(ERROR, "auxiliary fork creation cannot retire its original owner");
+#endif
 	}
 
 	/*

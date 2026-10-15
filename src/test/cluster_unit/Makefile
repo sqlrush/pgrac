@@ -234,6 +234,8 @@ override CPPFLAGS := -I. -I$(top_srcdir)/src/include $(CPPFLAGS)
 # ----------
 # Default target: build all tests
 # ----------
+TESTS += test_cluster_space_lazy_fork
+
 all: $(TESTS) check_resource_x_send_c1
 
 cluster_unit_port_stubs.o: cluster_unit_port_stubs.c
@@ -454,6 +456,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_online_plan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_replay_batch,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_install,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_producer test_cluster_space_fork test_cluster_space_identity test_cluster_space_page_verify test_cluster_space_table_size test_cluster_space_wal test_cluster_space_storage test_cluster_space_recovery test_cluster_space_cache test_cluster_space_recovery_route test_cluster_space_copy test_cluster_space_copy_version test_cluster_heap_insert_version test_cluster_vm_version test_cluster_vm_redo,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_space_lazy_fork,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_generic_version test_cluster_generic_redo,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_wal_checkpoint_sample,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_wal_retained_cut test_cluster_wal_retained_cut_records,$(SIMPLE_TESTS))
@@ -2611,6 +2614,14 @@ test_cluster_space_extend_handoff.inc: $(top_srcdir)/src/backend/storage/buffer/
 	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_space_lazy_fork.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^ExtendBufferedRelTo\(/ { print "Buffer"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_space_lazy_fork: test_cluster_space_lazy_fork.c test_cluster_space_lazy_fork.inc unit_test.h $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
 test_cluster_space_extend: test_cluster_space_extend.c test_cluster_space_extend.inc test_cluster_space_extend_finish.inc test_cluster_space_extend_resize.inc test_cluster_space_extend_zero.inc test_cluster_space_extend_handoff.inc unit_test.h $(CLUSTER_HW_O) $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_HW_O) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
@@ -4677,6 +4688,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_space_lazy_fork.inc test_cluster_space_lazy_fork.inc.tmp
 	rm -f test_cluster_space_copy_index.inc test_cluster_space_copy_index.inc.tmp \
 		test_cluster_space_copy_heap.inc test_cluster_space_copy_heap.inc.tmp
 	rm -f test_cluster_space_copy_create.inc test_cluster_space_copy_create.inc.tmp
