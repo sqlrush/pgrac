@@ -161,6 +161,8 @@ static int fake_lwlock_depth = 0;
 int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 static bool object_admission_allowed = true;
 static bool object_current_continuation;
+static bool object_delivery_allowed = true;
+static int object_delivery_samples;
 static uint64 object_admission_revision = 1;
 static int object_admission_samples;
 static int object_smgr_route = 1;
@@ -216,6 +218,22 @@ cluster_ko_peer_current_valid_v3(const ClusterKoCurrentAdmissionV3 *sample, RelF
 	return sample != NULL && sample->target.fork == fork && sample->target.block == block
 		   && (sample->target.cleaner.serial == 0 || object_current_continuation)
 		   && cluster_ko_peer_admission_current_v3(&sample->target, locator);
+}
+
+bool
+cluster_ko_peer_delivery_begin_v3(RelFileLocator locator pg_attribute_unused(), uint64 *revision)
+{
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	object_delivery_samples++;
+	*revision = object_delivery_allowed ? object_admission_revision : 0;
+	return object_delivery_allowed;
+}
+
+bool
+cluster_ko_peer_delivery_current_v3(uint64 revision)
+{
+	UT_ASSERT(fake_lwlock_depth > 0);
+	return revision != 0 && revision == object_admission_revision;
 }
 
 static ClusterWalSourceRef local_pi_writer;
@@ -608,6 +626,8 @@ reset_fake_pcm_runtime(int max_entries)
 	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 	object_admission_allowed = true;
 	object_current_continuation = false;
+	object_delivery_allowed = true;
+	object_delivery_samples = 0;
 	object_admission_revision = 1;
 	object_admission_samples = 0;
 	object_smgr_route = 1;

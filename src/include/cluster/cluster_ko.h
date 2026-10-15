@@ -164,6 +164,12 @@ extern bool cluster_ko_peer_admission_begin_v3(RelFileLocator locator,
 											   ClusterKoPeerAdmissionV3 *out);
 extern bool cluster_ko_peer_admission_current_v3(const ClusterKoPeerAdmissionV3 *admission,
 												 RelFileLocator locator);
+/* Continuation gate only for an already retained local delivery target.
+ * The PCM owner must still prove its exact request/target under entry X.
+ * ACTIVE may finish old work; READY/COMMITTED cannot start an installer.
+ * Sample outside PCM locks, then revalidate before publishing the claim. */
+extern bool cluster_ko_peer_delivery_begin_v3(RelFileLocator locator, uint64 *revision);
+extern bool cluster_ko_peer_delivery_current_v3(uint64 revision);
 /* Exact native read only. A cleaner sample cannot be consumed by the
  * generic publication predicate above (including CR installation). */
 extern bool cluster_ko_peer_read_begin_v3(RelFileLocator locator, ForkNumber fork,

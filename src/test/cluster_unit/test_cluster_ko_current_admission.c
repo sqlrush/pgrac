@@ -194,10 +194,108 @@ UT_TEST(finite_current_owner_uses_original_requester_without_ordinary_bypass)
 	UT_ASSERT_EQ(caller.joined_request.assertion_sequence, 1);
 }
 
+static void
+close_delivery(void)
+{
+	object_delivery_allowed = false;
+	object_admission_revision++;
+}
+
+UT_TEST(delivery_cannot_reacquire_install_execution_after_local_ready)
+{
+	for (int race = 0; race < 2; race++) {
+		DeliveryObserverFixture fixture;
+		ResourceXDeliveryClaim later;
+		struct StopPcmEntryLayout *entry, before;
+
+		setup_delivery_observer(&fixture, false);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_end_exact(&fixture.delivery),
+					 RESOURCE_X_APPLY_APPLIED);
+		entry = hash_search((HTAB *)&fake_pcm_htab_token, &fixture.assertion.resource,
+							HASH_FIND, NULL);
+		UT_ASSERT_NOT_NULL(entry);
+		before = *entry;
+		cluster_shared_config = true;
+		if (race)
+			object_entry_lock_hook = close_delivery;
+		else
+			close_delivery();
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_begin_exact(
+						 &fixture.ref, &fixture.delivery.target, RESOURCE_X_DELIVERY_NORMAL, 200,
+						 &later),
+					 RESOURCE_X_APPLY_BAD_STATE);
+		UT_ASSERT_EQ(later.executor_sequence, 0);
+		UT_ASSERT_EQ(memcmp(entry, &before, sizeof(before)), 0);
+		UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	}
+}
+
+UT_TEST(active_fence_keeps_only_the_original_exact_delivery)
+{
+	DeliveryObserverFixture fixture;
+	ResourceXDeliveryClaim later;
+	ResourceXDeliveryTarget stale;
+	uint32 cursor = 0;
+	setup_delivery_observer(&fixture, false);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_end_exact(&fixture.delivery),
+				 RESOURCE_X_APPLY_APPLIED);
+	cluster_shared_config = true;
+	close_object();
+	/* New current callers are sealed, but the original retained target is
+	 * still local work and must be able to finish before READY. */
+	UT_ASSERT_EQ(cluster_pcm_lock_ko_local_relation_scan_v3(
+					 BufTagGetRelFileLocator(&fixture.assertion.resource), 17, 4, &cursor),
+				 CLUSTER_PCM_PI_RELATION_PENDING);
+	stale = fixture.delivery.target;
+	stale.generation++;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_begin_exact(
+					 &fixture.ref, &stale, RESOURCE_X_DELIVERY_NORMAL, 200, &later),
+				 RESOURCE_X_APPLY_STALE);
+	UT_ASSERT_EQ(later.executor_sequence, 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_begin_exact(
+					 &fixture.ref, &fixture.delivery.target, RESOURCE_X_DELIVERY_NORMAL, 200,
+					 &later),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(object_delivery_samples, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_end_exact(&later),
+				 RESOURCE_X_APPLY_APPLIED);
+	cursor = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_ko_local_relation_scan_v3(
+					 BufTagGetRelFileLocator(&fixture.assertion.resource), 17, 4, &cursor),
+				 CLUSTER_PCM_PI_RELATION_PENDING);
+}
+
+UT_TEST(delivery_private_or_non_v3_paths_keep_original_owner)
+{
+	for (int bypass = 0; bypass < 3; bypass++) {
+		DeliveryObserverFixture fixture;
+		ResourceXDeliveryClaim later;
+		setup_delivery_observer(&fixture, false);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_end_exact(&fixture.delivery),
+					 RESOURCE_X_APPLY_APPLIED);
+		cluster_shared_config = bypass != 0;
+		if (bypass == 1)
+			object_smgr_route = 0;
+		if (bypass == 2)
+			cluster_interconnect_tier = CLUSTER_IC_TIER_2;
+		close_delivery();
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_begin_exact(
+						 &fixture.ref, &fixture.delivery.target, RESOURCE_X_DELIVERY_NORMAL, 200,
+						 &later),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(object_delivery_samples, 0);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_end_exact(&later),
+					 RESOURCE_X_APPLY_APPLIED);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(14);
+	UT_RUN(delivery_cannot_reacquire_install_execution_after_local_ready);
+	UT_RUN(active_fence_keeps_only_the_original_exact_delivery);
+	UT_RUN(delivery_private_or_non_v3_paths_keep_original_owner);
 	UT_RUN(new_round_is_not_published_behind_fence);
 	UT_RUN(observer_cannot_admit_new_caller_to_old_round);
 	UT_RUN(step_preserves_old_round_but_refuses_new_follower);

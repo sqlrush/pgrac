@@ -12614,6 +12614,9 @@ cluster_pcm_lock_resource_x_delivery_claim_begin_exact(const ResourceXAcquisitio
 	ClusterPcmResourceXBootstrapRound *round;
 	ResourceXApplyResult result;
 	bool expired;
+	RelFileLocator locator;
+	uint64 object_revision = 0;
+	bool check_object;
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
@@ -12621,6 +12624,11 @@ cluster_pcm_lock_resource_x_delivery_claim_begin_exact(const ResourceXAcquisitio
 		|| target->buffer_id_plus_one == 0 || now_us == 0 || now_us == UINT64_MAX
 		|| (purpose != RESOURCE_X_DELIVERY_NORMAL && purpose != RESOURCE_X_DELIVERY_CLEANUP))
 		return RESOURCE_X_APPLY_INVALID;
+	locator = BufTagGetRelFileLocator(&ref->assertion.resource);
+	check_object = cluster_shared_config && cluster_interconnect_tier == CLUSTER_IC_TIER_1
+				   && cluster_smgr_which_for(locator, InvalidBackendId) == 1;
+	if (check_object)
+		(void)cluster_ko_peer_delivery_begin_v3(locator, &object_revision);
 	if (!pcm_entry_ref_acquire(&ref->assertion.resource, false, &entry_ref, &acquire_result))
 		return RESOURCE_X_APPLY_NOT_FOUND;
 	LWLockAcquire(&entry_ref.entry->entry_lock.lock, LW_EXCLUSIVE);
@@ -12644,7 +12652,12 @@ cluster_pcm_lock_resource_x_delivery_claim_begin_exact(const ResourceXAcquisitio
 			   || (round->failed_attempt_floor >= ref->acquisition_generation
 				   && round->head_failure_reason != RESOURCE_X_HEAD_NO_PROGRESS_EXPIRED))
 		result = RESOURCE_X_APPLY_BAD_STATE;
+	else if (check_object && !cluster_ko_peer_delivery_current_v3(object_revision))
+		result = RESOURCE_X_APPLY_BAD_STATE;
 	else {
+		/* Only the exact already-retained target can reach this point.  Its
+		 * round and delivery reference remain local drain work until the
+		 * original completion/cleanup owner retires them. */
 		if (purpose == RESOURCE_X_DELIVERY_CLEANUP)
 			pcm_resource_x_head_fail_locked(entry_ref.entry, RESOURCE_X_HEAD_NO_PROGRESS_EXPIRED);
 		pcm_resource_x_head_margin_note(round, now_us);

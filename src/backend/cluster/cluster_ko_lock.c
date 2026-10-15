@@ -1033,6 +1033,47 @@ cluster_ko_peer_admission_current_v3(const ClusterKoPeerAdmissionV3 *admission,
 		   && pg_atomic_read_u64(&ko_state->peer_admission_revision) == admission->revision;
 }
 
+bool
+cluster_ko_peer_delivery_begin_v3(RelFileLocator locator, uint64 *revision)
+{
+	bool allowed = true;
+	uint64 current;
+
+	if (revision != NULL)
+		*revision = 0;
+	if (ko_state == NULL || revision == NULL || !cluster_shared_config
+		|| cluster_interconnect_tier != CLUSTER_IC_TIER_1 || RecoveryInProgress()
+		|| locator.spcOid == 0 || locator.relNumber == 0)
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	current = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+	if (current == 0 || current == UINT64_MAX)
+		allowed = false;
+	for (unsigned i = 0; allowed && i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		const ClusterKoPeerFenceV3 *entry = &ko_state->peer_fences[i];
+
+		if (entry->state != CLUSTER_KO_PEER_FENCE_EMPTY
+			&& RelFileLocatorEquals(entry->request.base.key.locator, locator)
+			&& entry->state != CLUSTER_KO_PEER_FENCE_ACTIVE)
+			allowed = false;
+	}
+	if (allowed)
+		*revision = current;
+	SpinLockRelease(&ko_state->shared_lock);
+	return allowed;
+}
+
+bool
+cluster_ko_peer_delivery_current_v3(uint64 revision)
+{
+	/* Called under the original entry lock, before a retained target gains
+	 * an executor. This sample cannot create a caller, round or target. */
+	return ko_state != NULL && cluster_shared_config
+		   && cluster_interconnect_tier == CLUSTER_IC_TIER_1 && !RecoveryInProgress()
+		   && revision != 0 && revision != UINT64_MAX
+		   && pg_atomic_read_u64(&ko_state->peer_admission_revision) == revision;
+}
+
 static bool
 ko_cleaner_scope_equal(const ClusterCtrcCleanerReadScopeV3 *a,
 					   const ClusterCtrcCleanerReadScopeV3 *b)
@@ -1718,12 +1759,24 @@ cluster_ko_peer_fence_ready_v3(const ClusterKoSharedMessageV3 *request,
 		&& !ko_cleaner_pending_locked(request->base.key.locator)
 		&& !ko_extend_pending_locked(request->base.key.locator) && entry->local_scan_revision != 0
 		&& entry->local_scan_revision != UINT64_MAX
+		&& (entry->state == CLUSTER_KO_PEER_FENCE_READY
+			|| entry->local_scan_revision < UINT64_MAX - 1)
 		&& pg_atomic_read_u64(&ko_state->peer_admission_revision) == entry->local_scan_revision
 		/* This is the original bounded atomic gate snapshot, not a PCM/CF
 		 * lock acquisition. No directory lock is taken under the KO lock. */
 		&& cluster_pcm_lock_resource_x_gate_snapshot(&gate)
 		&& memcmp(&gate, &entry->local_scan_gate, sizeof(gate)) == 0
 		&& gate.phase == RESOURCE_X_GATE_OPEN && gate.formation == request->base.epoch) {
+		if (entry->state == CLUSTER_KO_PEER_FENCE_ACTIVE) {
+			uint64 sealed_revision = entry->local_scan_revision + 1;
+
+			/* An ACTIVE delivery sample cannot outlive the READY seal.  The
+			 * only change under this lock is sealing this already-proven cut;
+			 * carry this fence's proof forward and invalidate all old samples.
+			 * Other in-progress scans reobserve through their original owner. */
+			pg_atomic_write_u64(&ko_state->peer_admission_revision, sealed_revision);
+			entry->physical_revision = entry->local_scan_revision = sealed_revision;
+		}
 		entry->state = CLUSTER_KO_PEER_FENCE_READY;
 		ok = true;
 	}

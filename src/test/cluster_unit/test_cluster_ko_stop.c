@@ -6690,6 +6690,69 @@ UT_TEST(test_peer_admission_current_never_takes_object_lock_or_renews_identity)
 	UT_ASSERT(!cluster_ko_peer_admission_current_v3(NULL, request.base.key.locator));
 }
 
+UT_TEST(test_retained_delivery_sample_expires_at_ready_seal)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(934);
+	ClusterKoPeerFenceHandleV3 handle;
+	ClusterKoPeerFenceStateV3 state;
+	uint64 before, active, after, sealed;
+
+	UT_ASSERT(cluster_ko_peer_delivery_begin_v3(request.base.key.locator, &before));
+	UT_ASSERT(cluster_ko_peer_delivery_current_v3(before));
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+	UT_ASSERT(!cluster_ko_peer_delivery_current_v3(before));
+	UT_ASSERT(cluster_ko_peer_delivery_begin_v3(request.base.key.locator, &active));
+	UT_ASSERT(cluster_ko_peer_delivery_current_v3(active));
+	UT_ASSERT(fixture_completed_fence_ready(&request, &handle));
+	UT_ASSERT(!cluster_ko_peer_delivery_current_v3(active));
+	sealed = pg_atomic_read_u64(&storage.peer_admission_revision);
+	UT_ASSERT(!cluster_ko_peer_delivery_begin_v3(request.base.key.locator, &after));
+	UT_ASSERT_EQ(after, 0);
+	UT_ASSERT(cluster_ko_peer_fence_ready_v3(&request, &handle));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&storage.peer_admission_revision), sealed);
+	UT_ASSERT(cluster_ko_peer_commit_v3(request.base.origin_node, request.base.epoch,
+										request.base.origin_boot, request.base.peer_boot,
+										request.base.batch_id));
+	UT_ASSERT(!cluster_ko_peer_delivery_begin_v3(request.base.key.locator, &after));
+	UT_ASSERT_EQ(after, 0);
+}
+
+UT_TEST(test_retained_delivery_sample_rejects_invalid_and_recovery_state)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(935);
+	RelFileLocator bad = request.base.key.locator;
+	uint64 revision;
+
+	UT_ASSERT(!cluster_ko_peer_delivery_begin_v3(request.base.key.locator, NULL));
+	bad.relNumber = 0;
+	UT_ASSERT(!cluster_ko_peer_delivery_begin_v3(bad, &revision));
+	UT_ASSERT_EQ(revision, 0);
+	for (int kind = 0; kind < 2; kind++) {
+		pg_atomic_write_u64(&storage.peer_admission_revision, kind ? UINT64_MAX : 0);
+		UT_ASSERT(!cluster_ko_peer_delivery_begin_v3(request.base.key.locator, &revision));
+		UT_ASSERT_EQ(revision, 0);
+		UT_ASSERT(!cluster_ko_peer_delivery_current_v3(kind ? UINT64_MAX : 0));
+	}
+	pg_atomic_write_u64(&storage.peer_admission_revision, 1);
+	UT_ASSERT(cluster_ko_peer_delivery_begin_v3(request.base.key.locator, &revision));
+	fixture_recovering = true;
+	UT_ASSERT(!cluster_ko_peer_delivery_current_v3(revision));
+	UT_ASSERT(!cluster_ko_peer_delivery_begin_v3(request.base.key.locator, &revision));
+	UT_ASSERT_EQ(revision, 0);
+}
+
+UT_TEST(test_ready_seal_revision_never_wraps_or_reuses_old_sample)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(936);
+	ClusterKoPeerFenceHandleV3 handle;
+	ClusterKoPeerFenceStateV3 state;
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+	pg_atomic_write_u64(&storage.peer_admission_revision, UINT64_MAX - 1);
+	UT_ASSERT(!fixture_completed_fence_ready(&request, &handle));
+	UT_ASSERT_EQ(storage.peer_fences[handle.slot].state, CLUSTER_KO_PEER_FENCE_ACTIVE);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&storage.peer_admission_revision), UINT64_MAX - 1);
+}
+
 UT_TEST(test_peer_fence_revision_never_uses_zero_or_wraps)
 {
 	const uint64 invalid[] = { 0, UINT64_MAX - 1, UINT64_MAX };
@@ -7663,7 +7726,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(181);
+	UT_PLAN(184);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
 	UT_RUN(test_peer_space_entry_checks_precede_io);
@@ -7814,6 +7877,9 @@ main(void)
 	UT_RUN(test_extension_error_expires_locally_then_retires_only_after_original_locks);
 	UT_RUN(test_extension_backend_exit_retains_exact_unfinished_work_for_recovery);
 	UT_RUN(test_peer_fence_closes_new_admission_and_invalidates_prior_sample);
+	UT_RUN(test_retained_delivery_sample_expires_at_ready_seal);
+	UT_RUN(test_retained_delivery_sample_rejects_invalid_and_recovery_state);
+	UT_RUN(test_ready_seal_revision_never_wraps_or_reuses_old_sample);
 	UT_RUN(test_peer_admission_current_never_takes_object_lock_or_renews_identity);
 	UT_RUN(test_peer_fence_revision_never_uses_zero_or_wraps);
 	UT_RUN(test_peer_fence_commit_needs_exact_ready_operation);
