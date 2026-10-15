@@ -9031,6 +9031,9 @@ test_cluster_recovery_namespace: test_cluster_recovery_namespace.c unit_test.h \
 
 test_cluster_recovery_undo_store: test_cluster_recovery_undo_store.c test_cluster_recovery_namespace.c \
 		test_cluster_recovery_crypto_boundary.h test_cluster_recovery_page_census.inc unit_test.h \
+		test_cluster_recovery_relation_census.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_relation_census.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_relation_census.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_page_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_page_census.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_page_history.c \

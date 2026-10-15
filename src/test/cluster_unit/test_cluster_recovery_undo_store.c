@@ -22,6 +22,7 @@ int namespace_fixture_main(void);
 #include "../../backend/cluster/cluster_recovery_heap_scan.c"
 #include "../../backend/cluster/cluster_recovery_page_history.c"
 #include "../../backend/cluster/cluster_recovery_page_census.c"
+#include "../../backend/cluster/cluster_recovery_relation_census.c"
 
 static const uint8 store_uuid[16] = { 9, 3, 7 };
 
@@ -636,11 +637,12 @@ UT_TEST(test_read_and_final_recheck_failures_poison_already_borrowed_graph)
 }
 
 #include "test_cluster_recovery_page_census.inc"
+#include "test_cluster_recovery_relation_census.inc"
 
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(25);
 	UT_RUN(test_real_untouched_segment_files_feed_all_slots_and_the_full_transaction_chain);
 	UT_RUN(test_missing_segment_or_short_or_failed_read_is_not_an_empty_chain);
 	UT_RUN(test_foreign_database_or_tt_identity_never_selects_a_local_record);
@@ -658,6 +660,14 @@ main(void)
 	UT_RUN(test_history_without_a_record_or_prior_base_never_drains);
 	UT_RUN(test_page_census_rejects_partial_changed_or_invalid_inputs);
 	UT_RUN(test_final_whole_namespace_change_revokes_completed_page_census);
+	UT_RUN(test_whole_relation_union_keeps_all_roots_pages_and_history);
+	UT_RUN(test_whole_relation_missing_wal_target_is_not_an_empty_fork);
+	UT_RUN(test_whole_relation_missing_history_revokes_both_owners);
+	UT_RUN(test_whole_relation_io_and_short_reads_have_no_prefix);
+	UT_RUN(test_whole_relation_final_reobservation_includes_untouched_files);
+	UT_RUN(test_whole_relation_lifecycle_failure_stays_revoked);
+	UT_RUN(test_whole_relation_arguments_and_owned_budget);
+	UT_RUN(test_whole_relation_many_nonrelation_roots_remain_stepwise);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
