@@ -758,8 +758,10 @@ ko_shared_v3_control_at_generation(const ClusterKoSharedMessageV3 *message, uint
 	uint8 expected[CLUSTER_KO_SHARED_V3_BYTES], observed[sizeof(expected)];
 	int32 current_master, other;
 
+	/* A readable runtime source/cut or retained fence is not a recovery
+	 * write grant. Recovery keeps its own IR/isolation/ROOT-qualified owner. */
 	if (message == NULL || local_generation == 0 || local_generation == UINT64_MAX
-		|| cluster_interconnect_tier != CLUSTER_IC_TIER_1)
+		|| RecoveryInProgress() || cluster_interconnect_tier != CLUSTER_IC_TIER_1)
 		return false;
 	current = *message;
 	/* The AX wire token belongs to the origin. Each consumer retains and

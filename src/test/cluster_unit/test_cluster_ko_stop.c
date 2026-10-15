@@ -57,6 +57,7 @@ cluster_ic_dispatch_control_ingress(const ClusterICEnvelope *env, ClusterICContr
 
 static bool marker_capable = true, v3_local_ax, drive_v3_ack, marker_error;
 static bool drive_v3_failure;
+static bool fixture_recovering;
 static int failed_reply_count;
 static ClusterGrdHolderId v3_local_holder;
 Oid MyDatabaseId;
@@ -686,7 +687,7 @@ cluster_ic_send_envelope(uint8 type, int32 dest, const void *bytes, uint32 lengt
 bool
 RecoveryInProgress(void)
 {
-	return false;
+	return fixture_recovering;
 }
 TimestampTz
 GetCurrentTimestamp(void)
@@ -1078,6 +1079,7 @@ reset_test(void)
 	Assert(native_allocated == 0);
 	Assert(!ko_peer_attempt_active);
 	drive_v3_failure = false;
+	fixture_recovering = false;
 	failed_reply_count = 0;
 	native_allocate_calls = 0;
 	native_alloc_fail = false;
@@ -5771,6 +5773,55 @@ UT_TEST(test_v3_control_refuses_non_tier1_even_with_peer_caps)
 	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
 }
 
+UT_TEST(test_v3_runtime_request_does_not_create_recovery_authority)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(933);
+	fixture_recovering = true;
+	/* The original source/cut/capabilities remain available in this fixture.
+	 * They do not authorize a runtime drain in the recovery executor. */
+	UT_ASSERT(!ko_shared_v3_control_current(&request));
+	enqueue_shared_v3(&request);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&storage.inbound_head),
+				 pg_atomic_read_u32(&storage.inbound_tail));
+	UT_ASSERT_EQ(storage.peer_fence_serial, 0);
+	UT_ASSERT_EQ(flush_count, 0);
+	UT_ASSERT_EQ(sync_count, 0);
+	UT_ASSERT_EQ(drop_count, 0);
+	UT_ASSERT_EQ(storage.send_v3_count, 0);
+}
+
+UT_TEST(test_v3_retained_runtime_request_cannot_apply_during_recovery)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(934);
+	enqueue_shared_v3(&request);
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_ACTIVE);
+	fixture_recovering = true;
+	fixture_peer_drain();
+	UT_ASSERT_EQ(flush_count, 0);
+	UT_ASSERT_EQ(sync_count, 0);
+	UT_ASSERT_EQ(drop_count, 0);
+	UT_ASSERT(!storage.peer_fences[0].physical_applied);
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_ACTIVE);
+	UT_ASSERT_EQ(storage.send_v3_count, 0);
+}
+
+UT_TEST(test_v3_completed_local_scan_cannot_publish_recovery_ready)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(935);
+	ClusterKoPeerFenceHandleV3 handle;
+	ClusterKoPeerFenceStateV3 state;
+	ClusterKoPeerFenceV3 before;
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+	UT_ASSERT(ko_peer_fence_mark_physical_started_v3(&request, NULL));
+	UT_ASSERT(ko_peer_fence_mark_physical_applied_v3(&request));
+	before = storage.peer_fences[handle.slot];
+	UT_ASSERT(ko_peer_fence_local_scan_v3(&before, &handle));
+	fixture_recovering = true;
+	UT_ASSERT(!cluster_ko_peer_fence_ready_v3(&request, &handle));
+	UT_ASSERT_EQ(storage.peer_fences[handle.slot].state, CLUSTER_KO_PEER_FENCE_ACTIVE);
+	UT_ASSERT_EQ(storage.send_v3_count, 0);
+}
+
 UT_TEST(test_v3_receive_requires_exact_tcp_owner_before_queue)
 {
 	for (int fault = 0; fault <= 8; fault++) {
@@ -7498,7 +7549,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(174);
+	UT_PLAN(177);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
 	UT_RUN(test_peer_space_entry_checks_precede_io);
@@ -7618,6 +7669,9 @@ main(void)
 	UT_RUN(test_drop_abandon_scan_requires_original_executor_of_replaced_context);
 	UT_RUN(test_drop_abandon_requires_recovery_at_normal_stop_even_with_pending_work);
 	UT_RUN(test_v3_control_refuses_non_tier1_even_with_peer_caps);
+	UT_RUN(test_v3_runtime_request_does_not_create_recovery_authority);
+	UT_RUN(test_v3_retained_runtime_request_cannot_apply_during_recovery);
+	UT_RUN(test_v3_completed_local_scan_cannot_publish_recovery_ready);
 	UT_RUN(test_v3_receive_requires_exact_tcp_owner_before_queue);
 	UT_RUN(test_v3_inbound_retains_peer_route_without_rewriting_origin);
 	UT_RUN(test_v3_fence_registers_before_apply_and_delays_ack_until_local_ready);
