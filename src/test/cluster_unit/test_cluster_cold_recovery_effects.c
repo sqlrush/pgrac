@@ -16,6 +16,7 @@
 #include "access/xact.h"
 #include "access/xlogreader.h"
 #include "catalog/pg_control.h"
+#include "catalog/storage_xlog.h"
 #include "cluster/cluster_block_apply.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_page_detached.h"
@@ -367,10 +368,220 @@ UT_TEST(test_truncation_at_every_compound_boundary_refuses)
 	}
 }
 
+static ClusterColdStepV1
+step_for(const ClusterColdDecodedV1 *out, uint8 kind)
+{
+	ClusterColdStepV1 step = { 0 };
+	step.read_rec_ptr = out->record.read_rec_ptr;
+	step.end_rec_ptr = out->record.end_rec_ptr;
+	step.record_crc = out->record.record_crc;
+	step.rmid = out->record.rmid;
+	step.info = out->record.info;
+	step.step_kind = kind;
+	step.space_count = out->record.space_count;
+	if (step.space_count)
+		step.space_kind = out->record.space_ops[0].kind;
+	return step;
+}
+
+UT_TEST(test_dispatch_whole_native_and_refused_compound)
+{
+	EffectRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	completion(&r, true, ALL_XINFO);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, true));
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+	/* Clearing the coarse flag must not hide the unowned effects. */
+	out.record.record_flags = 0;
+	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+}
+
+UT_TEST(test_dispatch_partition_must_be_complete_known_and_disjoint)
+{
+	EffectRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	ClusterColdEffectRoutesV1 good;
+	completion(&r, true, ALL_XINFO);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+				 CLUSTER_COLD_OK);
+	good = out.effects;
+	for (uint32 bit = 1; bit <= CLUSTER_COLD_EFFECT_SCN; bit <<= 1) {
+		if (!(good.required & bit))
+			continue;
+		out.effects = good;
+		out.effects.native_apply &= ~bit;
+		UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, true));
+		out.effects = good;
+		out.effects.no_effect |= bit;
+		UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, true));
+		out.effects.native_apply &= ~bit;
+		UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, true));
+	}
+	out.effects = good;
+	out.effects.required |= 1U << 31;
+	out.effects.native_apply |= 1U << 31;
+	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, true));
+	memset(&out.effects, 0, sizeof(out.effects));
+	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, true));
+	UT_ASSERT(!cluster_cold_replay_effects_v1(NULL, NULL, true));
+}
+
+UT_TEST(test_dispatch_no_effect_only_for_original_foreign_control)
+{
+	EffectRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	record_init(&r, RM_XLOG_ID, XLOG_NOOP);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, false));
+	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, true));
+	out.effects.required |= CLUSTER_COLD_EFFECT_INVALIDATIONS;
+	out.effects.no_effect |= CLUSTER_COLD_EFFECT_INVALIDATIONS;
+	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+}
+
+UT_TEST(test_dispatch_page_skip_does_not_skip_other_consumers)
+{
+	ClusterColdDecodedV1 out = { 0 };
+	ClusterColdStepV1 step;
+	out.record.rmid = RM_HEAP_ID;
+	out.record.component_count = 1;
+	out.record.components = out.components;
+	out.effects.required
+		= CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_PAGE | CLUSTER_COLD_EFFECT_FSM;
+	out.effects.page_apply = out.effects.required;
+	step = step_for(&out, CLUSTER_COLD_STEP_PAGE);
+	for (int skip = 0; skip <= 1; skip++) {
+		step.all_skip = skip;
+		UT_ASSERT(cluster_cold_replay_effects_v1(&out, &step, true));
+		UT_ASSERT(cluster_cold_replay_effects_v1(&out, &step, false));
+	}
+	out.effects.required |= CLUSTER_COLD_EFFECT_TERMINAL;
+	out.effects.native_apply = CLUSTER_COLD_EFFECT_TERMINAL;
+	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, &step, true));
+	out.effects.required &= ~CLUSTER_COLD_EFFECT_TERMINAL;
+	out.effects.native_apply = 0;
+	for (int field = 0; field < 5; field++) {
+		step = step_for(&out, CLUSTER_COLD_STEP_PAGE);
+		if (field == 0)
+			step.read_rec_ptr++;
+		if (field == 1)
+			step.end_rec_ptr++;
+		if (field == 2)
+			step.record_crc++;
+		if (field == 3)
+			step.rmid++;
+		if (field == 4)
+			step.info++;
+		UT_ASSERT(!cluster_cold_replay_effects_v1(&out, &step, true));
+	}
+	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, true));
+}
+
+UT_TEST(test_dispatch_fsm_only_uses_original_native_redo)
+{
+	ClusterColdDecodedV1 out = { 0 };
+	ClusterColdStepV1 step = { 0 };
+	out.effects.required = CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_FSM;
+	out.effects.page_apply = out.effects.required;
+	UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, true));
+	UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, false));
+	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, &step, true));
+	out.effects.page_apply = 0;
+	out.effects.native_apply = out.effects.required;
+	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, true));
+}
+
+UT_TEST(test_dispatch_real_page_decoder_at_pass_two)
+{
+	EffectRecord *r = calloc(1, sizeof(*r) + sizeof(DecodedBkpBlock));
+	ClusterColdDecodedV1 out = { 0 };
+	ClusterColdStepV1 step;
+	UT_ASSERT(r != NULL);
+	for (int fsm = 0; fsm <= 1; fsm++) {
+		RfPageVersionEdgeEntryV1 *edge;
+		record_init(r, RM_XLOG_ID, XLOG_FPI);
+		r->decoded.max_block_id = 0;
+		r->decoded.blocks[0].in_use = true;
+		r->decoded.blocks[0].forknum = fsm ? FSM_FORKNUM : MAIN_FORKNUM;
+		r->decoded.has_page_version_edge = true;
+		r->decoded.page_version_edge.entry_count = 1;
+		r->decoded.page_version_edge.result_token = 9;
+		edge = &r->decoded.page_version_edge.entries[0];
+		edge->page_class = fsm ? RF_PAGE_CLASS_REBUILDABLE_FSM : RF_PAGE_CLASS_ORDINARY;
+		memset(edge->result_incarnation, 1, sizeof(edge->result_incarnation));
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r->reader, 99, uuid, false, true, &out),
+					 CLUSTER_COLD_OK);
+		step = step_for(&out, CLUSTER_COLD_STEP_PAGE);
+		step.all_skip = true;
+		UT_ASSERT(cluster_cold_replay_effects_v1(&out, fsm ? NULL : &step, false));
+	}
+	free(r);
+}
+
+UT_TEST(test_dispatch_space_drop_keeps_entire_native_commit)
+{
+	EffectRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	ClusterColdSpaceOpV1 ops[2]
+		= { { .kind = CLUSTER_COLD_SPACE_DROP }, { .kind = CLUSTER_COLD_SPACE_DROP } };
+	ClusterColdStepV1 step;
+	completion(&r, true, ALL_XINFO);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+				 CLUSTER_COLD_OK);
+	/* Already decoded SPACE projections; original decoder's payload cases
+	 * are exercised by test_cluster_cold_recovery_decode. */
+	out.record.space_count = 2;
+	out.record.space_ops = ops;
+	out.effects.required |= CLUSTER_COLD_EFFECT_SPACE;
+	out.effects.space_apply = CLUSTER_COLD_EFFECT_SPACE;
+	step = step_for(&out, CLUSTER_COLD_STEP_SPACE);
+	UT_ASSERT(cluster_cold_replay_effects_v1(&out, &step, true));
+	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, &step, false));
+	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, true));
+	step.space_count--;
+	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, &step, true));
+	step.space_count++;
+	ops[1].kind = CLUSTER_COLD_SPACE_CREATE;
+	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, &step, true));
+	ops[1].kind = CLUSTER_COLD_SPACE_DROP;
+	/* Moving an XACT side effect to SPACE cannot make a complete dispatch. */
+	out.effects.native_apply &= ~CLUSTER_COLD_EFFECT_SYNC;
+	out.effects.space_apply |= CLUSTER_COLD_EFFECT_SYNC;
+	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, &step, true));
+}
+
+UT_TEST(test_dispatch_standalone_space_and_original_refusal_flags)
+{
+	ClusterColdDecodedV1 out = { 0 };
+	ClusterColdSpaceOpV1 op = { .kind = CLUSTER_COLD_SPACE_CREATE };
+	ClusterColdStepV1 step;
+	out.record.rmid = RM_SMGR_ID;
+	out.record.space_count = 1;
+	out.record.space_ops = &op;
+	out.effects.required = CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_SPACE;
+	out.effects.space_apply = out.effects.required;
+	step = step_for(&out, CLUSTER_COLD_STEP_SPACE);
+	UT_ASSERT(cluster_cold_replay_effects_v1(&out, &step, true));
+	UT_ASSERT(cluster_cold_replay_effects_v1(&out, &step, false));
+	UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, true));
+	for (uint8 flag = 1; flag != 0; flag <<= 1) {
+		out.record.record_flags = flag;
+		UT_ASSERT(!cluster_cold_replay_effects_v1(&out, &step, true));
+	}
+	out.record.record_flags = 0;
+	out.record.space_ops = NULL;
+	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, &step, true));
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(22);
 	UT_RUN(test_whole_commit_effects_keep_native_owner);
 	UT_RUN(test_foreign_compound_cannot_drop_unowned_effects);
 	UT_RUN(test_relcache_work_exists_with_zero_messages);
@@ -385,6 +596,14 @@ main(void)
 	UT_RUN(test_registry_unknown_and_blocks_still_refuse);
 	UT_RUN(test_folded_tt_unknown_format_is_not_native_apply);
 	UT_RUN(test_truncation_at_every_compound_boundary_refuses);
+	UT_RUN(test_dispatch_whole_native_and_refused_compound);
+	UT_RUN(test_dispatch_partition_must_be_complete_known_and_disjoint);
+	UT_RUN(test_dispatch_no_effect_only_for_original_foreign_control);
+	UT_RUN(test_dispatch_page_skip_does_not_skip_other_consumers);
+	UT_RUN(test_dispatch_fsm_only_uses_original_native_redo);
+	UT_RUN(test_dispatch_real_page_decoder_at_pass_two);
+	UT_RUN(test_dispatch_space_drop_keeps_entire_native_commit);
+	UT_RUN(test_dispatch_standalone_space_and_original_refusal_flags);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

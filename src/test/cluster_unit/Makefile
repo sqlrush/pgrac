@@ -8794,10 +8794,12 @@ test_cluster_cold_recovery_decode: test_cluster_cold_recovery_decode.c unit_test
 
 # The effect matrix runs the real route/preflight and complete native parsers.
 test_cluster_cold_recovery_effects: test_cluster_cold_recovery_effects.c unit_test.h \
+		test_cluster_cold_recovery_replay_core.o \
 		$(CLUSTER_COLD_DECODE_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_DECODE_O) \
+		test_cluster_cold_recovery_replay_core.o \
 		$(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) $(CLUSTER_SIDE_XACT_O) \
 		$(SIDE_XACT_XACTDESC_O) $(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@

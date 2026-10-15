@@ -3303,6 +3303,10 @@ cluster_typed_replay_unscheduled(void *arg, uint32 participant)
 										&rep->decoded) != CLUSTER_COLD_OK)
 		cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
 									  "an unscheduled record no longer decodes");
+	if (!cluster_cold_replay_effects_v1(&rep->decoded, NULL, is_own))
+		cluster_typed_replay_mismatch(
+			rep, participant, r->ReadRecPtr,
+			"an unscheduled record has effects without a replay consumer");
 	switch (cluster_cold_unscheduled_v1(&rep->decoded.record))
 	{
 		case CLUSTER_COLD_UNSCHEDULED_REFUSE:
@@ -3424,7 +3428,21 @@ cluster_typed_replay_scheduled(void *arg, uint32 participant, const ClusterColdS
 							   ClusterColdPageActionV1 action)
 {
 	ClusterColdTypedReplay *rep = (ClusterColdTypedReplay *) arg;
+	ClusterColdTypedV1 *typed = rep->typed;
+	const ClusterWalSourceRef *source = &typed->sources[participant];
+	bool is_own = participant == typed->own_participant;
 	XLogReaderState *r = rep->current[participant];
+
+	/* Check the whole record before the first consumer or skip, including a
+	 * COMMIT's native effects before installing any of its SPACE drops. */
+	if (cluster_cold_recovery_decode_v1(r, typed->system_identifier,
+										source->claim.identity.storage_uuid, false, !is_own,
+										&rep->decoded)
+			!= CLUSTER_COLD_OK
+		|| !cluster_cold_replay_effects_v1(&rep->decoded, step, is_own)
+		|| action != cluster_cold_page_action_v1(step, is_own))
+		cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
+									  "a scheduled record has effects without a replay consumer");
 
 	switch (action)
 	{

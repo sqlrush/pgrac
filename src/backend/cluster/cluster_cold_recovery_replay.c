@@ -35,6 +35,8 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "access/xact.h"
+#include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
 
 typedef struct ColdReplayRun {
@@ -47,6 +49,99 @@ typedef struct ColdReplayRun {
 	uint64 consumed[CLUSTER_COLD_MAX_PARTICIPANTS];
 	XLogRecPtr last_end[CLUSTER_COLD_MAX_PARTICIPANTS];
 } ColdReplayRun;
+
+/* This is the original dispatch's consumer set, not another WAL decoder.
+ * The caller must decode the complete record again before invoking it.
+ * A page/SPACE skip never discharges an unrelated native side effect. */
+bool
+cluster_cold_replay_effects_v1(const ClusterColdDecodedV1 *decoded, const ClusterColdStepV1 *step,
+							   bool own)
+{
+	const ClusterColdRecordV1 *record;
+	const ClusterColdEffectRoutesV1 *e;
+	uint32 routes[4];
+	uint32 seen = 0;
+	const uint32 page_mask
+		= CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_PAGE | CLUSTER_COLD_EFFECT_FSM;
+	const uint32 space_mask = CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_SPACE;
+
+	if (decoded == NULL)
+		return false;
+	record = &decoded->record;
+	e = &decoded->effects;
+	if (!(e->required & CLUSTER_COLD_EFFECT_RECORD)
+		|| (e->required & ~((CLUSTER_COLD_EFFECT_SCN << 1) - 1U)) != 0 || e->refused != 0
+		|| (record->record_flags & ~CLUSTER_COLD_RECORD_FOREIGN_CONTROL) != 0
+		|| record->component_count > CLUSTER_COLD_MAX_COMPONENTS
+		|| (record->component_count != 0 && record->components == NULL)
+		|| (record->space_count != 0 && record->space_ops == NULL)
+		|| ((e->required & CLUSTER_COLD_EFFECT_PAGE) != 0) != (record->component_count != 0)
+		|| ((e->required & CLUSTER_COLD_EFFECT_SPACE) != 0) != (record->space_count != 0)
+		|| (e->native_apply
+			& (CLUSTER_COLD_EFFECT_PAGE | CLUSTER_COLD_EFFECT_FSM | CLUSTER_COLD_EFFECT_SPACE))
+			   != 0
+		|| (e->page_apply & ~page_mask) != 0 || (e->space_apply & ~space_mask) != 0
+		|| (e->no_effect & ~CLUSTER_COLD_EFFECT_RECORD) != 0)
+		return false;
+	routes[0] = e->native_apply;
+	routes[1] = e->page_apply;
+	routes[2] = e->space_apply;
+	routes[3] = e->no_effect;
+	for (uint32 i = 0; i < lengthof(routes); i++) {
+		if ((seen & routes[i]) != 0)
+			return false;
+		seen |= routes[i];
+	}
+	if (seen != e->required)
+		return false;
+	if (step == NULL) {
+		switch (cluster_cold_unscheduled_v1(record)) {
+		case CLUSTER_COLD_UNSCHEDULED_NATIVE:
+			/* The existing native callback also owns FSM-only page records.
+			 * Other generations' native file creation has its original owner;
+			 * their XACT/SLRU adapters are not wired by this check. */
+			return e->page_apply == e->required
+				   || (e->native_apply == e->required
+					   && (own
+						   || (record->rmid == RM_SMGR_ID
+							   && (record->info & ~XLR_INFO_MASK) == XLOG_SMGR_CREATE)));
+		case CLUSTER_COLD_UNSCHEDULED_FOREIGN_NOOP:
+			return !own && e->no_effect == e->required;
+		case CLUSTER_COLD_UNSCHEDULED_SPACE_SKIP:
+			return record->rmid == RM_SMGR_ID && record->space_count == 1
+				   && e->space_apply == e->required
+				   && record->space_ops[0].kind >= CLUSTER_COLD_SPACE_CREATE
+				   && record->space_ops[0].kind <= CLUSTER_COLD_SPACE_ADVANCE;
+		case CLUSTER_COLD_UNSCHEDULED_REFUSE:
+			return false;
+		}
+		return false;
+	}
+	if (record->record_flags != 0 || record->read_rec_ptr != step->read_rec_ptr
+		|| record->end_rec_ptr != step->end_rec_ptr || record->record_crc != step->record_crc
+		|| record->rmid != step->rmid || record->info != step->info)
+		return false;
+	if (step->step_kind == CLUSTER_COLD_STEP_PAGE)
+		return record->component_count > 0 && e->page_apply == e->required;
+	if (step->step_kind != CLUSTER_COLD_STEP_SPACE || record->space_count == 0
+		|| record->space_count != step->space_count || record->component_count != 0)
+		return false;
+	for (uint32 i = 0; i < record->space_count; i++)
+		if (record->space_ops[i].kind != step->space_kind)
+			return false;
+	if (step->space_kind == CLUSTER_COLD_SPACE_DROP)
+		/* SPACE installs every drop, then original native redo consumes the
+		 * full COMMIT, including all counted arrays and completion flags. */
+		return own && record->rmid == RM_XACT_ID
+			   && (record->info & XLOG_XACT_OPMASK) == XLOG_XACT_COMMIT
+			   && e->space_apply == CLUSTER_COLD_EFFECT_SPACE
+			   && (e->native_apply & (CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_TERMINAL))
+					  == (CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_TERMINAL)
+			   && (e->native_apply | e->space_apply) == e->required;
+	return record->rmid == RM_SMGR_ID && record->space_count == 1
+		   && step->space_kind >= CLUSTER_COLD_SPACE_CREATE
+		   && step->space_kind <= CLUSTER_COLD_SPACE_ADVANCE && e->space_apply == e->required;
+}
 
 ClusterColdPageActionV1
 cluster_cold_page_action_v1(const ClusterColdStepV1 *step, bool own)

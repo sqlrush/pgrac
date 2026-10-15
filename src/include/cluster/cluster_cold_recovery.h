@@ -543,6 +543,12 @@ extern ClusterColdDetailV1 cluster_cold_recovery_decode_v1(struct XLogReaderStat
 														   ClusterColdDecodedV1 *out);
 extern void cluster_cold_decoded_release_v1(ClusterColdDecodedV1 *decoded);
 
+/* Before a pass-2 consumer or skip, prove that its original dispatch covers
+ * the entire decoded record. NULL step means unscheduled. This is not
+ * source qualification, consumer readiness or a completion certificate. */
+extern bool cluster_cold_replay_effects_v1(const ClusterColdDecodedV1 *decoded,
+										   const ClusterColdStepV1 *step, bool own);
+
 /*
  * Pass-2 reader over one ROOT-selected writer generation.  Segments are
  * opened through the selected restart-input opener (claim, namespace and
