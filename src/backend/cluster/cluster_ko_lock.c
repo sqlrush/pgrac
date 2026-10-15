@@ -158,6 +158,10 @@ typedef struct ClusterKoPeerFenceV3 {
 	ClusterKoPeerFenceStateV3 state;
 	bool physical_started;
 	bool physical_applied;
+	uint8 physical_phase;
+	uint32 physical_cursor;
+	uint64 physical_revision;
+	ResourceXGateSnapshot physical_gate;
 	bool ack_queued;
 	bool failure_queued;
 	int failure_sqlerrcode;
@@ -235,6 +239,7 @@ typedef struct ClusterKoShared {
 static ClusterKoShared *ko_state = NULL;
 static ClusterKoPeerFenceHandleV3 ko_peer_attempt;
 static bool ko_peer_attempt_active;
+static bool ko_shared_v3_peer_identity_current(const ClusterKoSharedMessageV3 *message);
 static ClusterKoExtendWorkV3 ko_extend_local;
 static uint32 ko_extend_slot;
 static bool ko_extend_write_armed, ko_extend_materialized, ko_extend_aborting;
@@ -912,9 +917,15 @@ ko_peer_fence_mark_physical_applied_v3(const ClusterKoSharedMessageV3 *request)
 {
 	uint8 encoded[CLUSTER_KO_SHARED_V3_BYTES];
 	bool marked = false;
+	ResourceXGateSnapshot gate;
+	uint64 revision;
 
 	if (ko_state == NULL || request == NULL
 		|| !cluster_ko_shared_encode_v3(request, encoded, sizeof(encoded)))
+		return false;
+	revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+	if (revision == 0 || revision == UINT64_MAX || !cluster_pcm_lock_resource_x_gate_snapshot(&gate)
+		|| gate.phase != RESOURCE_X_GATE_OPEN || gate.formation != request->base.epoch)
 		return false;
 	SpinLockAcquire(&ko_state->shared_lock);
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
@@ -927,6 +938,10 @@ ko_peer_fence_mark_physical_applied_v3(const ClusterKoSharedMessageV3 *request)
 			&& entry->request.base.batch_id == request->base.batch_id
 			&& memcmp(entry->encoded, encoded, sizeof(encoded)) == 0) {
 			entry->physical_applied = true;
+			entry->physical_phase = 3;
+			entry->physical_cursor = 0;
+			entry->physical_revision = revision;
+			entry->physical_gate = gate;
 			entry->local_scan_cursor = 0;
 			entry->local_scan_complete = false;
 			entry->local_scan_revision = 0;
@@ -1698,6 +1713,8 @@ cluster_ko_peer_fence_ready_v3(const ClusterKoSharedMessageV3 *request,
 			|| entry->state == CLUSTER_KO_PEER_FENCE_READY)
 		&& memcmp(entry->encoded, encoded, sizeof(encoded)) == 0 && entry->physical_applied
 		&& entry->local_scan_complete && entry->failure_sqlerrcode == 0
+		&& entry->physical_revision == entry->local_scan_revision
+		&& memcmp(&entry->physical_gate, &entry->local_scan_gate, sizeof(entry->physical_gate)) == 0
 		&& !ko_cleaner_pending_locked(request->base.key.locator)
 		&& !ko_extend_pending_locked(request->base.key.locator) && entry->local_scan_revision != 0
 		&& entry->local_scan_revision != UINT64_MAX
@@ -1730,6 +1747,130 @@ ko_peer_fence_scan_reset_v3(const ClusterKoPeerFenceHandleV3 *handle)
 		memset(&entry->local_scan_gate, 0, sizeof(entry->local_scan_gate));
 	}
 	SpinLockRelease(&ko_state->shared_lock);
+}
+
+/* A physical pass can span SI ticks. Only its cursor is restartable;
+ * all buffer/current/PI responsibility remains with the native owners. */
+static void
+ko_peer_fence_physical_reset_locked(ClusterKoPeerFenceV3 *entry)
+{
+	entry->physical_applied = false;
+	entry->physical_phase = 0;
+	entry->physical_cursor = 0;
+	entry->physical_revision = 0;
+	memset(&entry->physical_gate, 0, sizeof(entry->physical_gate));
+	entry->local_scan_complete = false;
+	entry->local_scan_cursor = 0;
+	entry->local_scan_revision = 0;
+	memset(&entry->local_scan_gate, 0, sizeof(entry->local_scan_gate));
+}
+
+static bool
+ko_peer_physical_cut_current_v3(const ClusterKoPeerFenceV3 *before, uint64 revision,
+								const ResourceXGateSnapshot *gate)
+{
+	ResourceXGateSnapshot after;
+
+	return ko_shared_v3_control_at_generation(&before->request, before->peer_route_generation)
+		   && ko_shared_v3_peer_identity_current(&before->request)
+		   && pg_atomic_read_u64(&ko_state->peer_admission_revision) == revision
+		   && cluster_pcm_lock_resource_x_gate_snapshot(&after)
+		   && memcmp(gate, &after, sizeof(after)) == 0;
+}
+
+static bool
+ko_peer_fence_physical_tick_v3(ClusterKoPeerFenceV3 *before,
+							   const ClusterKoPeerFenceHandleV3 *handle)
+{
+	ClusterKoPeerFenceV3 *entry;
+	ResourceXGateSnapshot gate;
+	SMgrRelation smgr;
+	uint64 revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+	uint32 cursor = 0, budget = 128;
+	uint8 phase = 0;
+	bool applied = false;
+
+	if (revision == 0 || revision == UINT64_MAX || !cluster_pcm_lock_resource_x_gate_snapshot(&gate)
+		|| gate.phase != RESOURCE_X_GATE_OPEN || gate.formation != before->request.base.epoch
+		|| !ko_peer_physical_cut_current_v3(before, revision, &gate)
+		|| !cluster_ctrc_relation_removal_ready_shared(before->request.base.key.locator.spcOid,
+													   before->request.base.key.locator.dbOid,
+													   before->request.base.key.locator.relNumber))
+		return false;
+	if (before->physical_revision == revision
+		&& memcmp(&before->physical_gate, &gate, sizeof(gate)) == 0) {
+		phase = before->physical_phase;
+		cursor = before->physical_cursor;
+	}
+	SpinLockAcquire(&ko_state->shared_lock);
+	entry = &ko_state->peer_fences[handle->slot];
+	if (entry->serial != handle->serial || entry->state != CLUSTER_KO_PEER_FENCE_ACTIVE
+		|| !entry->physical_started || entry->failure_sqlerrcode != 0
+		|| memcmp(entry->encoded, before->encoded, sizeof(entry->encoded)) != 0
+		|| ko_cleaner_pending_locked(before->request.base.key.locator)
+		|| ko_extend_pending_locked(before->request.base.key.locator)) {
+		SpinLockRelease(&ko_state->shared_lock);
+		return false;
+	}
+	/* ERROR cannot leave an old prefix reusable. No KO lock spans native I/O. */
+	ko_peer_fence_physical_reset_locked(entry);
+	SpinLockRelease(&ko_state->shared_lock);
+	smgr = smgropen(before->request.base.key.locator, InvalidBackendId);
+	while (phase < 3 && budget > 0) {
+		if (phase == 1) {
+			for (ForkNumber fork = MAIN_FORKNUM; fork <= MAX_FORKNUM; fork++) {
+				if (smgrexists(smgr, fork))
+					smgrimmedsync(smgr, fork);
+				if (!ko_peer_physical_cut_current_v3(before, revision, &gate))
+					return false;
+			}
+			phase = 2;
+		} else {
+			uint32 start = cursor, remaining = budget;
+			ClusterBufferDrainResult result
+				= cluster_bufmgr_drain_relation_v3(smgr, phase == 0, &budget, &cursor);
+
+			if (budget > remaining || cursor < start || cursor - start > remaining - budget
+				|| !ko_peer_physical_cut_current_v3(before, revision, &gate))
+				return false;
+			if (result == CLUSTER_BUFFER_DRAIN_EMPTY) {
+				phase++;
+				cursor = 0;
+			} else if (result == CLUSTER_BUFFER_DRAIN_REDIRTIED && phase == 2) {
+				phase = 0;
+				cursor = 0;
+				break;
+			} else if (result == CLUSTER_BUFFER_DRAIN_WAIT || result == CLUSTER_BUFFER_DRAIN_MORE)
+				break;
+			else
+				return false;
+		}
+	}
+	if (!ko_peer_physical_cut_current_v3(before, revision, &gate))
+		return false;
+	if (phase == 3) {
+		cluster_hw_lease_discard(before->request.base.key.locator, MAIN_FORKNUM);
+		KO_BUMP(peer_apply_count);
+		CLUSTER_INJECTION_POINT("cluster-ko-peer-skip-ack");
+		if (cluster_injection_should_skip("cluster-ko-peer-skip-ack"))
+			return false;
+	}
+	SpinLockAcquire(&ko_state->shared_lock);
+	entry = &ko_state->peer_fences[handle->slot];
+	if (entry->serial == handle->serial && entry->state == CLUSTER_KO_PEER_FENCE_ACTIVE
+		&& entry->failure_sqlerrcode == 0
+		&& entry->peer_route_generation == before->peer_route_generation
+		&& memcmp(entry->encoded, before->encoded, sizeof(entry->encoded)) == 0
+		&& pg_atomic_read_u64(&ko_state->peer_admission_revision) == revision) {
+		entry->physical_phase = phase;
+		entry->physical_cursor = cursor;
+		entry->physical_revision = revision;
+		entry->physical_gate = gate;
+		entry->physical_applied = applied = phase == 3;
+		*before = *entry;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	return applied;
 }
 
 static bool
@@ -1778,6 +1919,11 @@ ko_peer_fence_local_scan_v3(const ClusterKoPeerFenceV3 *before,
 		entry->local_scan_revision = revision;
 		entry->local_scan_gate = gate;
 		entry->local_scan_complete = complete = scan == CLUSTER_PCM_PI_RELATION_EMPTY;
+		/* Existing requests can finish installing after the previous physical
+		 * pass. Keep them ACTIVE and resume the original flush/sync/drop pass;
+		 * a local protocol observation is never a buffer invalidation. */
+		if (scan == CLUSTER_PCM_PI_RELATION_PENDING)
+			ko_peer_fence_physical_reset_locked(entry);
 	}
 	SpinLockRelease(&ko_state->shared_lock);
 	return complete;
@@ -1801,16 +1947,17 @@ ko_peer_fence_local_ready_tick_v3(void)
 		ClusterKoPeerFenceHandleV3 handle;
 		uint64 route_generation;
 		ClusterKoPeerFenceStateV3 state;
-		bool physical_applied, ack_queued, failed;
+		bool physical_started, physical_applied, ack_queued, failed;
 
 		SpinLockAcquire(&ko_state->shared_lock);
 		state = ko_state->peer_fences[i].state;
+		physical_started = ko_state->peer_fences[i].physical_started;
 		physical_applied = ko_state->peer_fences[i].physical_applied;
 		ack_queued = ko_state->peer_fences[i].ack_queued;
 		failed = ko_state->peer_fences[i].failure_sqlerrcode != 0;
 		if ((state != CLUSTER_KO_PEER_FENCE_ACTIVE && state != CLUSTER_KO_PEER_FENCE_READY)
 			|| (failed ? ko_state->peer_fences[i].failure_queued
-					   : (!physical_applied || ack_queued))) {
+					   : (!physical_started || ack_queued))) {
 			SpinLockRelease(&ko_state->shared_lock);
 			continue;
 		}
@@ -1836,6 +1983,11 @@ ko_peer_fence_local_ready_tick_v3(void)
 		ko_peer_attempt_active = true;
 
 		if (state == CLUSTER_KO_PEER_FENCE_ACTIVE) {
+			if ((!physical_applied
+				 || !ko_peer_physical_cut_current_v3(&before, before.physical_revision,
+													 &before.physical_gate))
+				&& !ko_peer_fence_physical_tick_v3(&before, &handle))
+				goto next_owner;
 			if (!ko_peer_fence_local_scan_v3(&before, &handle))
 				goto next_owner;
 			if (!cluster_ko_peer_fence_ready_v3(&request, &handle))
@@ -5126,6 +5278,8 @@ cluster_ko_drain_inbound_and_apply(void)
 		 */
 		head = (head + 1) % CLUSTER_KO_INBOUND_CAPACITY;
 		pg_atomic_write_u32(&ko_state->inbound_head, head);
+		if (slot.shared && slot.v3)
+			goto next;
 
 		rloc.spcOid = (Oid)slot.spc_oid;
 		rloc.dbOid = (Oid)slot.db_oid;

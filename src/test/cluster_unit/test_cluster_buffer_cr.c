@@ -122,6 +122,9 @@ static void *copy_destination;
 static unsigned reserve_calls;
 static uint32 clock_hand;
 static unsigned physical_writes;
+static unsigned drain_mapping_race;
+static bool drain_content_busy;
+static bool drain_flush_deferred;
 int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 static bool ko_closed;
 static bool ko_cleaner_allowed;
@@ -243,6 +246,8 @@ static Buffer GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_contex
 static void InvalidateBufferCommitTailLocked(BufferDesc *, BufferTag *, uint32, LWLock *, uint32,
 											 uint8, bool);
 static void InvalidateBuffer(BufferDesc *buf);
+static bool cluster_bufmgr_in_gcs_drop;
+#define CLUSTER_INJECTION_POINT(name) ((void)0)
 
 bool
 LWLockHeldByMe(LWLock *lock pg_attribute_unused())
@@ -291,6 +296,16 @@ LWLockHeldByMeInMode(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attr
 bool
 LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
+	if (drain_mapping_race != 0 && mode == LW_EXCLUSIVE) {
+		BufferDesc *buf = GetBufferDescriptor(2);
+		if (drain_mapping_race == 1)
+			pg_atomic_fetch_or_u32(&buf->state, BM_DIRTY | BM_JUST_DIRTIED);
+		else if (drain_mapping_race == 2)
+			pg_atomic_fetch_add_u32(&buf->state, BUF_REFCOUNT_ONE);
+		else
+			owner_flags[2] = PCM_OWN_FLAG_REVOKING;
+		drain_mapping_race = 0;
+	}
 	if (++lock_acquisitions > 128)
 		longjmp(error_jump, 1);
 	if (collision_at_mapping && mode == LW_EXCLUSIVE) {
@@ -522,7 +537,7 @@ LockBuffer(Buffer buffer, int mode)
 bool
 LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
 {
-	return LWLockAcquire(lock, mode);
+	return !drain_content_busy && LWLockAcquire(lock, mode);
 }
 
 bool
@@ -543,6 +558,8 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln pg_attribute_unused(),
 			IOObject object pg_attribute_unused(), IOContext context pg_attribute_unused())
 {
 	UT_ASSERT_NE(buf->buffer_type, BUF_TYPE_CR);
+	if (drain_flush_deferred)
+		return;
 	physical_writes++;
 	pg_atomic_fetch_and_u32(&buf->state, ~(BM_DIRTY | BM_JUST_DIRTIED));
 }
@@ -613,7 +630,8 @@ reset_buffers(void)
 	memset(local_refcounts, 0, sizeof(local_refcounts));
 	memset(pages, 0, sizeof(pages));
 	remembered_pins = pin_waiter_signals = reserve_calls = 0;
-	physical_writes = 0;
+	physical_writes = drain_mapping_race = 0;
+	drain_content_busy = drain_flush_deferred = false;
 	clock_hand = 6;
 	cluster_enabled = false;
 	ClusterConfShmem = NULL;
@@ -1612,12 +1630,146 @@ UT_TEST(test_conditional_nonshared_paths_keep_native_behavior)
 	UT_ASSERT_EQ(lock_depth, 0);
 }
 
+static SMgrRelationData drain_relation;
+
+static ClusterBufferDrainResult
+drain_step(BufferTag tag, bool flush, uint32 *budget, uint32 *cursor)
+{
+	memset(&drain_relation, 0, sizeof(drain_relation));
+	drain_relation.smgr_rlocator.locator = BufTagGetRelFileLocator(&tag);
+	drain_relation.smgr_rlocator.backend = InvalidBackendId;
+	return cluster_bufmgr_drain_relation_v3(&drain_relation, flush, budget, cursor);
+}
+
+UT_TEST(test_object_drain_bounds_scan_and_preserves_foreign_pin)
+{
+	BufferTag tag = reset_buffers();
+	uint32 cursor = 0, budget = 2;
+	install_current(&tag, 2);
+	pg_atomic_fetch_add_u32(&GetBufferDescriptor(2)->state, BUF_REFCOUNT_ONE);
+	UT_ASSERT_EQ(drain_step(tag, false, &budget, &cursor), CLUSTER_BUFFER_DRAIN_MORE);
+	UT_ASSERT_EQ(cursor, 2);
+	UT_ASSERT_EQ(budget, 0);
+	budget = 128;
+	UT_ASSERT_EQ(drain_step(tag, false, &budget, &cursor), CLUSTER_BUFFER_DRAIN_WAIT);
+	UT_ASSERT_EQ(cursor, 2);
+	UT_ASSERT_EQ(frees + bumps, 0);
+	UT_ASSERT_EQ(lock_depth, 0);
+	pg_atomic_fetch_sub_u32(&GetBufferDescriptor(2)->state, BUF_REFCOUNT_ONE);
+	budget = 128;
+	UT_ASSERT_EQ(drain_step(tag, false, &budget, &cursor), CLUSTER_BUFFER_DRAIN_EMPTY);
+	UT_ASSERT_EQ(cursor, NBuffers);
+	UT_ASSERT_EQ(frees, 1);
+	UT_ASSERT_EQ(BufTableLookup(&tag, BufTableHashCode(&tag)), -1);
+}
+
+UT_TEST(test_object_drain_never_discards_dirty_or_io_work)
+{
+	uint32 flags[]
+		= { BM_DIRTY, BM_JUST_DIRTIED, BM_CHECKPOINT_NEEDED, BM_IO_ERROR, BM_IO_IN_PROGRESS };
+	for (unsigned i = 0; i < lengthof(flags); i++) {
+		BufferTag tag = reset_buffers();
+		uint32 cursor = 2, budget = 128;
+		install_current(&tag, 2);
+		pg_atomic_fetch_or_u32(&GetBufferDescriptor(2)->state, flags[i]);
+		UT_ASSERT_NE(drain_step(tag, false, &budget, &cursor), CLUSTER_BUFFER_DRAIN_EMPTY);
+		UT_ASSERT_EQ(cursor, 2);
+		UT_ASSERT_EQ(frees + bumps + physical_writes, 0);
+		UT_ASSERT((pg_atomic_read_u32(&GetBufferDescriptor(2)->state) & flags[i]) != 0);
+		UT_ASSERT_EQ(lock_depth, 0);
+	}
+}
+
+UT_TEST(test_object_drain_flushes_all_forks_and_preserves_cr)
+{
+	for (ForkNumber fork = MAIN_FORKNUM; fork <= MAX_FORKNUM; fork++) {
+		BufferTag tag = reset_buffers();
+		uint32 cursor = 0, budget = 128;
+		tag.forkNum = fork;
+		install_current(&tag, 2);
+		if (fork == MAIN_FORKNUM)
+			install_cr(&tag, 3);
+		pg_atomic_fetch_or_u32(&GetBufferDescriptor(2)->state, BM_DIRTY | BM_JUST_DIRTIED);
+		UT_ASSERT_EQ(drain_step(tag, true, &budget, &cursor), CLUSTER_BUFFER_DRAIN_EMPTY);
+		UT_ASSERT_EQ(physical_writes, 1);
+		UT_ASSERT_EQ(frees + bumps + remembered_pins, 0);
+		cursor = 0;
+		budget = 128;
+		UT_ASSERT_EQ(drain_step(tag, false, &budget, &cursor), CLUSTER_BUFFER_DRAIN_EMPTY);
+		UT_ASSERT_EQ(frees, fork == MAIN_FORKNUM ? 2 : 1);
+		UT_ASSERT_EQ(lock_depth, 0);
+	}
+}
+
+UT_TEST(test_object_drain_rechecks_dirty_pin_and_owner_under_mapping_lock)
+{
+	for (unsigned race = 1; race <= 3; race++) {
+		BufferTag tag = reset_buffers();
+		uint32 cursor = 2, budget = 128;
+		install_current(&tag, 2);
+		drain_mapping_race = race;
+		if (race == 3) {
+			/* A bare REVOKING bit without its exact reservation is corrupt.
+			 * The original owner reports ERROR rather than classifying it idle. */
+			expect_error = true;
+			if (setjmp(error_jump) == 0) {
+				(void)drain_step(tag, false, &budget, &cursor);
+				UT_ASSERT(false);
+			}
+		} else
+			UT_ASSERT_EQ(drain_step(tag, false, &budget, &cursor), CLUSTER_BUFFER_DRAIN_WAIT);
+		UT_ASSERT_EQ(cursor, 2);
+		UT_ASSERT_EQ(frees + bumps + lock_depth, 0);
+		UT_ASSERT_EQ(BufTableLookup(&tag, BufTableHashCode(&tag)), 2);
+	}
+}
+
+UT_TEST(test_object_drain_refused_flush_is_pending_without_pin_leak)
+{
+	for (unsigned kind = 0; kind < 2; kind++) {
+		BufferTag tag = reset_buffers();
+		uint32 cursor = 2, budget = 128;
+		install_current(&tag, 2);
+		pg_atomic_fetch_or_u32(&GetBufferDescriptor(2)->state, BM_DIRTY);
+		drain_content_busy = kind == 0;
+		drain_flush_deferred = kind == 1;
+		UT_ASSERT_EQ(drain_step(tag, true, &budget, &cursor), CLUSTER_BUFFER_DRAIN_WAIT);
+		UT_ASSERT_EQ(cursor, 2);
+		UT_ASSERT_EQ(physical_writes + frees + bumps + lock_depth + remembered_pins, 0);
+		UT_ASSERT((pg_atomic_read_u32(&GetBufferDescriptor(2)->state) & BM_DIRTY) != 0);
+		drain_content_busy = drain_flush_deferred = false;
+		budget = 128;
+		UT_ASSERT_EQ(drain_step(tag, true, &budget, &cursor), CLUSTER_BUFFER_DRAIN_EMPTY);
+		UT_ASSERT_EQ(physical_writes, 1);
+	}
+}
+
+UT_TEST(test_object_drain_invalid_input_never_advances_or_touches_buffers)
+{
+	BufferTag tag = reset_buffers();
+	uint32 cursor = 0, budget = 129;
+	install_current(&tag, 2);
+	UT_ASSERT_EQ(drain_step(tag, false, &budget, &cursor), CLUSTER_BUFFER_DRAIN_INVALID);
+	UT_ASSERT_EQ(cursor, 0);
+	budget = 128;
+	cursor = NBuffers + 1;
+	UT_ASSERT_EQ(drain_step(tag, false, &budget, &cursor), CLUSTER_BUFFER_DRAIN_INVALID);
+	UT_ASSERT_EQ(cursor, NBuffers + 1);
+	UT_ASSERT_EQ(frees + bumps + physical_writes + lock_depth, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(37);
+	UT_PLAN(43);
 	printf("# private pin entry: %zu bytes; current admission: %zu bytes\n",
 		   sizeof(PrivateRefCountEntry), sizeof(ClusterKoCurrentAdmissionV3));
+	UT_RUN(test_object_drain_bounds_scan_and_preserves_foreign_pin);
+	UT_RUN(test_object_drain_never_discards_dirty_or_io_work);
+	UT_RUN(test_object_drain_flushes_all_forks_and_preserves_cr);
+	UT_RUN(test_object_drain_invalid_input_never_advances_or_touches_buffers);
+	UT_RUN(test_object_drain_rechecks_dirty_pin_and_owner_under_mapping_lock);
+	UT_RUN(test_object_drain_refused_flush_is_pending_without_pin_leak);
 	UT_RUN(test_native_current_victim_keeps_original_behavior);
 	UT_RUN(test_cr_victim_preserves_current_and_removes_middle_head_tail);
 	UT_RUN(test_last_cr_only_victim_removes_anchor_without_current);

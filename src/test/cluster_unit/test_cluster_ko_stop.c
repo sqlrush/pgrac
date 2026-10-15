@@ -995,10 +995,39 @@ FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 	if (boot_change_phase == 1)
 		formation.membership.last_admitted_incarnation[1]++;
 }
+static ClusterBufferDrainResult buffer_drain_result;
+static unsigned buffer_drain_calls;
+static bool buffer_drain_drop_only;
+static uint32 buffer_drain_input;
+
+ClusterBufferDrainResult
+cluster_bufmgr_drain_relation_v3(SMgrRelation smgr, bool flush, uint32 *budget, uint32 *cursor)
+{
+	UT_ASSERT(smgr == &relation && *budget > 0 && *budget <= 128);
+	buffer_drain_calls++;
+	buffer_drain_input = *cursor;
+	if (buffer_drain_result != CLUSTER_BUFFER_DRAIN_EMPTY && (!buffer_drain_drop_only || !flush)) {
+		if (buffer_drain_result == CLUSTER_BUFFER_DRAIN_MORE) {
+			*cursor += *budget;
+			*budget = 0;
+		}
+		return buffer_drain_result;
+	}
+	/* Native buffer iteration is tested separately. These are the existing
+	 * physical I/O boundaries; neither callback is itself a READY proof. */
+	if (flush)
+		FlushRelationsAllBuffers(&smgr, 1);
+	else
+		DropRelationsAllBuffers(&smgr, 1);
+	return CLUSTER_BUFFER_DRAIN_EMPTY;
+}
+
 void
 DropRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 {
-	Assert(!flushing && flush_count == drop_count + 1);
+	Assert(!flushing
+		   && (ko_peer_attempt_active ? flush_count >= drop_count + 1
+									  : flush_count == drop_count + 1));
 	if (cluster_shared_config && shared_relation)
 		UT_ASSERT_EQ(synced_forks, existing_forks);
 	drop_count++;
@@ -1025,10 +1054,12 @@ smgrexists(SMgrRelation smgr, ForkNumber fork)
 void
 smgrimmedsync(SMgrRelation smgr, ForkNumber fork)
 {
-	Assert(smgr == &relation && !flushing && flush_count == drop_count + 1);
+	Assert(smgr == &relation && !flushing
+		   && (ko_peer_attempt_active ? flush_count >= drop_count + 1
+									  : flush_count == drop_count + 1));
 	Assert((existing_forks & (1u << fork)) != 0);
 	UT_ASSERT_EQ(ack_count, 0);
-	UT_ASSERT_EQ(drop_count, 0);
+	UT_ASSERT(flush_count >= drop_count + 1);
 	sync_count++;
 	if (fork == sync_fail_fork)
 		pg_re_throw();
@@ -1079,6 +1110,9 @@ reset_test(void)
 	Assert(native_allocated == 0);
 	Assert(!ko_peer_attempt_active);
 	drive_v3_failure = false;
+	buffer_drain_result = CLUSTER_BUFFER_DRAIN_EMPTY;
+	buffer_drain_calls = buffer_drain_input = 0;
+	buffer_drain_drop_only = false;
 	fixture_recovering = false;
 	failed_reply_count = 0;
 	native_allocate_calls = 0;
@@ -5872,6 +5906,86 @@ UT_TEST(test_v3_inbound_retains_peer_route_without_rewriting_origin)
 	}
 }
 
+UT_TEST(test_v3_physical_pending_is_owned_and_resumed_before_ready)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(931);
+
+	enqueue_shared_v3(&request);
+	buffer_drain_result = CLUSTER_BUFFER_DRAIN_WAIT;
+	fixture_peer_drain();
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_ACTIVE);
+	UT_ASSERT(!storage.peer_fences[0].physical_applied);
+	UT_ASSERT_EQ(storage.send_v3_count, 0);
+	UT_ASSERT_EQ(local_relation_scan_calls, 0);
+	UT_ASSERT_EQ(buffer_drain_calls, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&storage.inbound_head),
+				 pg_atomic_read_u32(&storage.inbound_tail));
+	buffer_drain_result = CLUSTER_BUFFER_DRAIN_EMPTY;
+	fixture_peer_drain();
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
+	UT_ASSERT_EQ(storage.send_v3_count, 1);
+}
+
+UT_TEST(test_v3_physical_cursor_resumes_and_drift_restarts_original_pass)
+{
+	for (unsigned drift = 0; drift < 3; drift++) {
+		ClusterKoSharedMessageV3 request = peer_fence_fixture(932 + drift);
+		enqueue_shared_v3(&request);
+		buffer_drain_result = CLUSTER_BUFFER_DRAIN_MORE;
+		fixture_peer_drain();
+		UT_ASSERT_EQ(storage.peer_fences[0].physical_cursor, 128);
+		if (drift == 1)
+			relation_gate_freeze++;
+		if (drift == 2)
+			(void)pg_atomic_fetch_add_u64(&storage.peer_admission_revision, 1);
+		fixture_peer_drain();
+		UT_ASSERT_EQ(buffer_drain_input, drift == 0 ? 128 : 0);
+		UT_ASSERT_EQ(storage.send_v3_count, 0);
+		buffer_drain_result = CLUSTER_BUFFER_DRAIN_EMPTY;
+		fixture_peer_drain();
+		UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
+		UT_ASSERT_EQ(storage.send_v3_count, 1);
+	}
+}
+
+UT_TEST(test_v3_redirtied_physical_pass_repeats_flush_and_sync_before_drop)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(935);
+	enqueue_shared_v3(&request);
+	buffer_drain_result = CLUSTER_BUFFER_DRAIN_REDIRTIED;
+	buffer_drain_drop_only = true;
+	fixture_peer_drain();
+	UT_ASSERT_EQ(flush_count, 1);
+	UT_ASSERT_EQ(drop_count, 0);
+	UT_ASSERT_EQ(storage.peer_fences[0].physical_phase, 0);
+	UT_ASSERT_EQ(storage.send_v3_count, 0);
+	buffer_drain_result = CLUSTER_BUFFER_DRAIN_EMPTY;
+	fixture_peer_drain();
+	UT_ASSERT_EQ(flush_count, 2);
+	UT_ASSERT_EQ(drop_count, 1);
+	UT_ASSERT_EQ(storage.send_v3_count, 1);
+}
+
+UT_TEST(test_v3_local_protocol_pending_requires_another_physical_pass)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(936);
+	enqueue_shared_v3(&request);
+	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_PENDING;
+	fixture_peer_drain();
+	UT_ASSERT_EQ(drop_count, 1);
+	UT_ASSERT(!storage.peer_fences[0].physical_applied);
+	UT_ASSERT_EQ(storage.send_v3_count, 0);
+	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_EMPTY;
+	buffer_drain_result = CLUSTER_BUFFER_DRAIN_WAIT;
+	fixture_peer_drain();
+	UT_ASSERT_EQ(storage.send_v3_count, 0);
+	UT_ASSERT_EQ(local_relation_scan_calls, 1);
+	buffer_drain_result = CLUSTER_BUFFER_DRAIN_EMPTY;
+	fixture_peer_drain();
+	UT_ASSERT_EQ(drop_count, 2);
+	UT_ASSERT_EQ(storage.send_v3_count, 1);
+}
+
 UT_TEST(test_v3_fence_registers_before_apply_and_delays_ack_until_local_ready)
 {
 	ClusterKoSharedMessageV3 request = peer_fence_fixture(907);
@@ -7549,7 +7663,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(177);
+	UT_PLAN(181);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_aux_space_dispatch_never_uses_backend_only_s);
 	UT_RUN(test_peer_space_entry_checks_precede_io);
@@ -7674,6 +7788,10 @@ main(void)
 	UT_RUN(test_v3_completed_local_scan_cannot_publish_recovery_ready);
 	UT_RUN(test_v3_receive_requires_exact_tcp_owner_before_queue);
 	UT_RUN(test_v3_inbound_retains_peer_route_without_rewriting_origin);
+	UT_RUN(test_v3_physical_pending_is_owned_and_resumed_before_ready);
+	UT_RUN(test_v3_physical_cursor_resumes_and_drift_restarts_original_pass);
+	UT_RUN(test_v3_redirtied_physical_pass_repeats_flush_and_sync_before_drop);
+	UT_RUN(test_v3_local_protocol_pending_requires_another_physical_pass);
 	UT_RUN(test_v3_fence_registers_before_apply_and_delays_ack_until_local_ready);
 	UT_RUN(test_v3_blocked_head_does_not_starve_completed_fence_continuation);
 	UT_RUN(test_v3_ready_scan_restarts_prefix_after_gate_or_admission_change);

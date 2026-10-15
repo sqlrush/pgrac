@@ -4947,7 +4947,7 @@ static bool InvalidateBufferCommitLocked(BufferDesc *buf, BufferTag *oldTag, uin
 static void InvalidateBufferCommitTailLocked(BufferDesc *buf, BufferTag *oldTag, uint32 oldHash,
 										 LWLock *oldPartitionLock, uint32 buf_state,
 										 uint8 old_pcm_mode, bool release_pcm_holder);
-static bool InvalidateBufferTry(BufferDesc *buf);
+static bool InvalidateBufferTry(BufferDesc *buf, bool preserve_dirty);
 static BufferDesc *BufferAlloc(SMgrRelation smgr,
 							   char relpersistence,
 							   ForkNumber forkNum,
@@ -6969,7 +6969,7 @@ InvalidateBufferCommitTailLocked(BufferDesc *buf, BufferTag *oldTag, uint32 oldH
  * fail-closes with a retryable deny).
  */
 static bool
-InvalidateBufferTry(BufferDesc *buf)
+InvalidateBufferTry(BufferDesc *buf, bool preserve_dirty)
 {
 	BufferTag	oldTag;
 	uint32		oldHash;		/* hash value for oldTag */
@@ -7035,7 +7035,7 @@ InvalidateBufferTry(BufferDesc *buf)
 	 * can arrive after the wrapper staged N. Native relation DROP is separate.
 	 * Author: SqlRush <sqlrush@gmail.com>
 	 */
-	if (cluster_shared_config && cluster_bufmgr_in_gcs_drop
+	if ((preserve_dirty || (cluster_shared_config && cluster_bufmgr_in_gcs_drop))
 		&& (buf_state
 			& (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR | BM_IO_IN_PROGRESS))
 			   != 0) {
@@ -11022,6 +11022,89 @@ FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 
 	pfree(srels);
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/* A qualified SI owner resumes the native flush/drop walks here. The cursor
+ * counts descriptors, not matches; blocked ownership stays at that descriptor.
+ * The caller keeps its object fence and performs the original per-fork sync
+ * between the flush and invalidation passes. */
+ClusterBufferDrainResult
+cluster_bufmgr_drain_relation_v3(SMgrRelation smgr, bool flush, uint32 *budget, uint32 *cursor)
+{
+	RelFileLocator locator;
+
+	if (smgr == NULL || budget == NULL || cursor == NULL || *budget == 0 || *budget > 128
+		|| NBuffers <= 0 || *cursor > (uint32)NBuffers || !cluster_shared_config
+		|| RelFileLocatorBackendIsTemp(smgr->smgr_rlocator))
+		return CLUSTER_BUFFER_DRAIN_INVALID;
+	locator = smgr->smgr_rlocator.locator;
+	if (!OidIsValid(locator.spcOid) || !OidIsValid(locator.relNumber))
+		return CLUSTER_BUFFER_DRAIN_INVALID;
+	if (flush)
+		ResourceOwnerEnlargeBuffers(CurrentResourceOwner);
+	while (*budget > 0 && *cursor < (uint32)NBuffers) {
+		BufferDesc *buf = GetBufferDescriptor(*cursor);
+		uint32 state;
+
+		(*budget)--;
+		if (flush)
+			ReservePrivateRefCountEntry();
+		state = LockBufHdr(buf);
+		if (!(state & BM_TAG_VALID) || !BufTagMatchesRelFileLocator(&buf->tag, &locator)) {
+			UnlockBufHdr(buf, state);
+			(*cursor)++;
+			continue;
+		}
+		if (state & (BM_IO_IN_PROGRESS | BM_IO_ERROR)) {
+			UnlockBufHdr(buf, state);
+			return CLUSTER_BUFFER_DRAIN_WAIT;
+		}
+		if (flush) {
+			if (!(state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED))) {
+				UnlockBufHdr(buf, state);
+				(*cursor)++;
+				continue;
+			}
+			if (buf->buffer_type == BUF_TYPE_CR || !(state & BM_VALID)) {
+				UnlockBufHdr(buf, state);
+				return CLUSTER_BUFFER_DRAIN_INVALID;
+			}
+			if (!(state & BM_DIRTY) || !cluster_bufmgr_pcm_aux_pin_admission_locked(buf)) {
+				UnlockBufHdr(buf, state);
+				return CLUSTER_BUFFER_DRAIN_WAIT;
+			}
+			PinBuffer_Locked(buf);
+			if (!LWLockConditionalAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED)) {
+				UnpinBuffer(buf);
+				return CLUSTER_BUFFER_DRAIN_WAIT;
+			}
+			FlushBuffer(buf, smgr, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+			LWLockRelease(BufferDescriptorGetContentLock(buf));
+			UnpinBuffer(buf);
+			state = LockBufHdr(buf);
+			if ((state & BM_TAG_VALID) && BufTagMatchesRelFileLocator(&buf->tag, &locator)
+				&& (state
+					& (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_IN_PROGRESS
+					   | BM_IO_ERROR))) {
+				UnlockBufHdr(buf, state);
+				return CLUSTER_BUFFER_DRAIN_WAIT;
+			}
+			UnlockBufHdr(buf, state);
+		} else {
+			if (state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) {
+				UnlockBufHdr(buf, state);
+				return CLUSTER_BUFFER_DRAIN_REDIRTIED;
+			}
+			/* Native Try repeats pin/dirty checks under mapping-X/header,
+			 * then uses the original exact ownership/eviction commit. */
+			if (!InvalidateBufferTry(buf, true))
+				return CLUSTER_BUFFER_DRAIN_WAIT;
+		}
+		(*cursor)++;
+	}
+	return *cursor == (uint32)NBuffers ? CLUSTER_BUFFER_DRAIN_EMPTY : CLUSTER_BUFFER_DRAIN_MORE;
+}
+#endif
 
 /* ---------------------------------------------------------------------
  *		RelationCopyStorageUsingBuffer
@@ -18439,7 +18522,7 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	 * its true PCM state.
 	 */
 	cluster_bufmgr_in_gcs_drop = true;	/* gates the drop-prepin inject */
-	invalidate_succeeded = InvalidateBufferTry(buf);	/* releases the header spinlock */
+	invalidate_succeeded = InvalidateBufferTry(buf, false); /* releases the header spinlock */
 	if (!invalidate_succeeded)
 	{
 		cluster_bufmgr_in_gcs_drop = false;
@@ -18945,7 +19028,7 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 	/* PGRAC: GCS serve-stall round-5 (A2) — bounded drop;  restore the
 	 * residency mode on a raced pin (mirrors the invalidate wrapper). */
 	cluster_bufmgr_in_gcs_drop = true;	/* gates the drop-prepin inject */
-	invalidate_succeeded = InvalidateBufferTry(buf);	/* releases the header spinlock */
+	invalidate_succeeded = InvalidateBufferTry(buf, false); /* releases the header spinlock */
 	if (!invalidate_succeeded)
 	{
 		cluster_bufmgr_in_gcs_drop = false;

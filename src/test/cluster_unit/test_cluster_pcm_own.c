@@ -8953,8 +8953,9 @@ UT_TEST(test_aux_passive_pin_admission_closes_on_exact_revoking_fence)
 		= buffer_alloc != NULL ? strstr(buffer_alloc, "\n/*\n * InvalidateBuffer") : NULL;
 	recent = strstr(source, "\nReadRecentBuffer(");
 	recent_end = recent != NULL ? strstr(recent, "\n/*\n * ReadBuffer") : NULL;
-	extend = strstr(source, "\nstatic BlockNumber\nExtendBufferedRelShared(");
-	extend_end = extend != NULL ? strstr(extend, "\n/*\n * MarkBufferDirty") : NULL;
+	extend = strstr(source, "\nstatic BlockNumber\nExtendBufferedRelSharedInternal(");
+	extend_end
+		= extend != NULL ? strstr(extend, "\nstatic BlockNumber\nExtendBufferedRelShared(") : NULL;
 	UT_ASSERT_NOT_NULL(lookup_pin);
 	UT_ASSERT_NOT_NULL(lookup_pin_end);
 	UT_ASSERT_NOT_NULL(buffer_alloc);

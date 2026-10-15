@@ -233,6 +233,20 @@ extern bool FlushOneBufferForSpaceRecovery(Buffer buffer,
 #endif
 extern void FlushRelationBuffers(Relation rel);
 extern void FlushRelationsAllBuffers(struct SMgrRelationData **smgrs, int nrels);
+#ifdef USE_PGRAC_CLUSTER
+typedef enum ClusterBufferDrainResult {
+	CLUSTER_BUFFER_DRAIN_INVALID = 0,
+	CLUSTER_BUFFER_DRAIN_MORE,
+	CLUSTER_BUFFER_DRAIN_WAIT,
+	CLUSTER_BUFFER_DRAIN_REDIRTIED,
+	CLUSTER_BUFFER_DRAIN_EMPTY
+} ClusterBufferDrainResult;
+
+extern ClusterBufferDrainResult cluster_bufmgr_drain_relation_v3(struct SMgrRelationData *smgr,
+																 bool flush, uint32 *budget,
+																 uint32 *cursor);
+#endif
+
 extern void CreateAndCopyRelationData(RelFileLocator src_rlocator,
 									  RelFileLocator dst_rlocator,
 									  bool permanent);
