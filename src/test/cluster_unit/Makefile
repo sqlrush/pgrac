@@ -9099,6 +9099,9 @@ test_cluster_recovery_native_roots: test_cluster_recovery_native_roots.c \
 
 test_cluster_recovery_wal_targets: test_cluster_recovery_wal_targets.c \
 		test_cluster_recovery_undo_targets.inc test_cluster_recovery_multixact_targets.inc \
+		test_cluster_recovery_multixact_physical.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_multixact_scan.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_multixact_scan.h \
 		test_cluster_recovery_native_roots.c test_cluster_recovery_root_set.c \
 		test_cluster_recovery_namespace.c test_cluster_recovery_crypto_boundary.h unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_wal_targets.c \

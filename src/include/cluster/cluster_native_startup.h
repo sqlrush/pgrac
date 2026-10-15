@@ -22,7 +22,12 @@
 #define CLUSTER_NATIVE_CLOG_PER_PAGE (BLCKSZ * 4)
 #define CLUSTER_NATIVE_SUBTRANS_PER_PAGE (BLCKSZ / sizeof(TransactionId))
 #define CLUSTER_NATIVE_MX_OFFSETS_PER_PAGE (BLCKSZ / sizeof(uint32))
-#define CLUSTER_NATIVE_MX_MEMBERS_PER_PAGE ((BLCKSZ / 20) * 4)
+#define CLUSTER_NATIVE_MX_GROUP_MEMBERS 4
+#define CLUSTER_NATIVE_MX_FLAG_BITS 8
+#define CLUSTER_NATIVE_MX_GROUP_BYTES                                                              \
+	(sizeof(uint32) + CLUSTER_NATIVE_MX_GROUP_MEMBERS * sizeof(TransactionId))
+#define CLUSTER_NATIVE_MX_MEMBERS_PER_PAGE                                                         \
+	((BLCKSZ / CLUSTER_NATIVE_MX_GROUP_BYTES) * CLUSTER_NATIVE_MX_GROUP_MEMBERS)
 #define CLUSTER_NATIVE_COMMIT_TS_PER_PAGE (BLCKSZ / 10)
 
 static inline bool

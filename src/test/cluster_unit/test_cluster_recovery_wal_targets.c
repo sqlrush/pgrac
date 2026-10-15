@@ -458,11 +458,12 @@ UT_TEST(test_bad_edge_mixed_side_and_unclassified_opcode_do_not_finish_roots)
 
 #include "test_cluster_recovery_undo_targets.inc"
 #include "test_cluster_recovery_multixact_targets.inc"
+#include "test_cluster_recovery_multixact_physical.inc"
 
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(29);
 	UT_RUN(test_page_and_rebuildable_fsm_keep_all_file_targets);
 	UT_RUN(test_typed_structure_keeps_all_forks_and_space_pages);
 	UT_RUN(test_native_create_and_truncate_do_not_invent_page_requirements);
@@ -484,6 +485,14 @@ main(void)
 	UT_RUN(test_mx_zero_page_and_truncate_preserve_distinct_obligations);
 	UT_RUN(test_mx_target_failures_revoke_the_whole_union);
 	UT_RUN(test_mx_target_capacity_never_exports_a_partial_union);
+	UT_RUN(test_mx_physical_census_retains_all_slots_and_origin_boundaries);
+	UT_RUN(test_mx_physical_uint32_tail_does_not_become_member_zero);
+	UT_RUN(test_mx_physical_empty_files_remain_explicit_candidates);
+	UT_RUN(test_mx_physical_missing_short_and_bad_geometry_do_not_drain);
+	UT_RUN(test_mx_physical_reads_and_rereads_refuse_all_io_failures);
+	UT_RUN(test_mx_physical_mutation_and_final_recheck_revoke_observations);
+	UT_RUN(test_mx_physical_budget_and_invalid_arguments_fail_closed);
+	UT_RUN(test_mx_physical_metadata_budget_preserves_untouched_files);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

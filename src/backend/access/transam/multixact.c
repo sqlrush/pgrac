@@ -207,6 +207,14 @@ StaticAssertDecl(MULTIXACT_OFFSETS_PER_PAGE == CLUSTER_NATIVE_MX_OFFSETS_PER_PAG
 				 "native MX offset inspection geometry");
 StaticAssertDecl(MULTIXACT_MEMBERS_PER_PAGE == CLUSTER_NATIVE_MX_MEMBERS_PER_PAGE,
 				 "native MX member inspection geometry");
+/* PGRAC: keep the read-only physical census bound to this native layout. */
+StaticAssertDecl(MULTIXACT_MEMBERS_PER_MEMBERGROUP == CLUSTER_NATIVE_MX_GROUP_MEMBERS,
+				 "native MX member group geometry");
+StaticAssertDecl(MULTIXACT_MEMBERGROUP_SIZE == CLUSTER_NATIVE_MX_GROUP_BYTES,
+				 "native MX member group bytes");
+StaticAssertDecl(MXACT_MEMBER_BITS_PER_XACT == CLUSTER_NATIVE_MX_FLAG_BITS
+				 && MULTIXACT_FLAGBYTES_PER_GROUP == sizeof(uint32),
+				 "native MX member flag geometry");
 #endif
 
 /*
