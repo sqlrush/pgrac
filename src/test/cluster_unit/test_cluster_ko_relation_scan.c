@@ -215,38 +215,124 @@ UT_TEST(object_roles_local_master_request_is_not_remote_directory_only)
 
 UT_TEST(object_roles_local_pi_and_unknown_references_never_filter_out)
 {
-	for (int kind = 0; kind < 7; kind++) {
+	for (int kind = 0; kind < 5; kind++) {
 		BufferTag tag = make_tag(6913);
 		struct StopPcmEntryLayout *entry;
 		setup_pi_write_master_with_holders(tag, 4);
 		entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
 		switch (kind) {
 		case 0:
-			cluster_pcm_lock_pi_holder_note(tag, 0);
-			break;
-		case 1:
 			entry->local_pi_first.source_flags = 1;
 			break;
-		case 2:
+		case 1:
 			entry->local_pi_last.source_flags = 1;
 			break;
-		case 3:
+		case 2:
 			pg_atomic_write_u32(&entry->pin_count, 1);
 			break;
-		case 4:
+		case 3:
 			pg_atomic_write_u32(&entry->wait_refcount, 1);
 			break;
-		case 5:
+		case 4:
 			pg_atomic_write_u32(&entry->transport_refcount, 1);
-			break;
-		case 6:
-			pg_atomic_write_u32(&entry->pi_holders_bitmap, 0);
-			entry->pi_watermark_lsn = 1;
 			break;
 		}
 		expect_roles(tag, CLUSTER_PCM_PI_RELATION_PENDING, CLUSTER_PCM_PI_RELATION_PENDING);
 		cluster_shared_config = false;
 	}
+}
+
+UT_TEST(object_roles_master_pi_accounting_does_not_reopen_local_work)
+{
+	for (int fork = MAIN_FORKNUM; fork <= MAX_FORKNUM; fork++) {
+		for (unsigned kind = 1; kind < 16; kind++) {
+			BufferTag tag = make_tag(6918);
+			PcmEntryRef ref;
+			PcmEntryAcquireResult acquired;
+			uint32 cursor = 0;
+			pi_relation_scan_setup();
+			cluster_node_id = 0;
+			tag.forkNum = fork;
+			UT_ASSERT(pcm_entry_ref_acquire(&tag, true, &ref, &acquired));
+			pcm_entry_ref_release(&ref);
+			/* These are master accounting producers, not local PI storage. */
+			if (kind & 1)
+				cluster_pcm_lock_pi_holder_note(tag, 0);
+			if (kind & 2)
+				cluster_pcm_lock_pi_holder_note(tag, 2);
+			if (kind & 4)
+				cluster_pcm_lock_pi_watermark_lsn_advance(tag, 200);
+			if (kind & 8)
+				cluster_pcm_lock_pi_watermark_scn_advance(tag, 80, CLUSTER_PCM_WM_SRC_REDECLARE, 2,
+														  31, 17);
+			expect_roles(tag, CLUSTER_PCM_PI_RELATION_EMPTY, CLUSTER_PCM_PI_RELATION_PENDING);
+			UT_ASSERT_EQ(
+				cluster_pcm_lock_ko_relation_scan_v3(BufTagGetRelFileLocator(&tag), 17, 4, &cursor),
+				CLUSTER_PCM_PI_RELATION_PENDING);
+			cluster_shared_config = false;
+		}
+	}
+}
+
+UT_TEST(object_roles_local_retirement_preserves_unfinished_master_cut)
+{
+	BufferTag tag = make_tag(6919);
+	ClusterPageWalBindingV1 binding = local_pi_setup(tag);
+	ClusterPcmLocalPiSnapshotV1 local, empty;
+	const ClusterPageDataReceiptV1 *receipt = (const void *)&pi_receipt_fixture;
+	struct StopPcmEntryLayout *entry;
+	uint32 cursor = 0;
+
+	cluster_node_id = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_pcm_local_pi_record_v1(tag, &binding));
+	cluster_pcm_lock_pi_holder_note(tag, 0);
+	cluster_pcm_lock_pi_holder_note(tag, 2);
+	cluster_pcm_lock_pi_watermark_lsn_advance(tag, 200);
+	cluster_pcm_lock_pi_watermark_scn_advance(tag, 80, CLUSTER_PCM_WM_SRC_REDECLARE, 2, 31, 17);
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &local));
+	expect_roles(tag, CLUSTER_PCM_PI_RELATION_PENDING, CLUSTER_PCM_PI_RELATION_PENDING);
+
+	/* The real PCM retire function still requires its original DATA/ACK
+	 * boundary. This fixture supplies that proof; it does not run IO or
+	 * transport and does not publish READY. No full master ACK is supplied. */
+	pi_receipt_valid = true;
+	pi_storage_receipt_valid = false;
+	memset(&pi_receipt_cut, 0, sizeof(pi_receipt_cut));
+	pi_ack_cut = pi_receipt_cut;
+	pi_ack_available = 1;
+	pi_ack_imported = 0;
+	UT_ASSERT(!cluster_pcm_local_pi_retire_v1(&local, receipt, NULL, NULL, 0, pi_acks[0]));
+	expect_roles(tag, CLUSTER_PCM_PI_RELATION_PENDING, CLUSTER_PCM_PI_RELATION_PENDING);
+	local_pi_covered = true;
+	UT_ASSERT(!cluster_pcm_local_pi_retire_v1(&local, receipt, NULL, NULL, 0, NULL));
+	expect_roles(tag, CLUSTER_PCM_PI_RELATION_PENDING, CLUSTER_PCM_PI_RELATION_PENDING);
+	UT_ASSERT(cluster_pcm_local_pi_retire_v1(&local, receipt, NULL, NULL, 0, pi_acks[0]));
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &empty));
+	UT_ASSERT_EQ(empty.first.record_start, 0);
+	UT_ASSERT_EQ(empty.last.record_start, 0);
+	UT_ASSERT(empty.revision > local.revision);
+	entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+	UT_ASSERT_NOT_NULL(entry);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), 5);
+	UT_ASSERT_EQ(entry->pi_watermark_lsn, 200);
+	UT_ASSERT_EQ(entry->pi_watermark_scn, 80);
+	expect_roles(tag, CLUSTER_PCM_PI_RELATION_EMPTY, CLUSTER_PCM_PI_RELATION_PENDING);
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_ko_relation_scan_v3(BufTagGetRelFileLocator(&tag), 17, 4, &cursor),
+		CLUSTER_PCM_PI_RELATION_PENDING);
+	UT_ASSERT(!cluster_pcm_lock_pi_obligations_absent_v1(tag));
+
+	/* A new local reference cannot borrow the earlier local retirement. */
+	binding.version.mutation_token++;
+	binding.record_start = 300;
+	binding.record_end = 400;
+	UT_ASSERT(cluster_pcm_local_pi_record_v1(tag, &binding));
+	UT_ASSERT(!cluster_pcm_local_pi_retire_v1(&local, receipt, NULL, NULL, 0, pi_acks[0]));
+	expect_roles(tag, CLUSTER_PCM_PI_RELATION_PENDING, CLUSTER_PCM_PI_RELATION_PENDING);
+	local_pi_writer_ready = false;
+	cluster_shared_config = false;
 }
 
 UT_TEST(object_roles_local_round_is_physical_even_on_nonmaster)
@@ -309,7 +395,7 @@ UT_TEST(object_roles_preserve_bounded_gate_and_reference_contract)
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(20);
 	UT_RUN(test_pi_relation_empty_requires_complete_bounded_scan);
 	UT_RUN(test_pi_relation_scan_checks_main_vm_and_original_references);
 	UT_RUN(test_pi_relation_scan_never_retires_master_or_local_pi);
@@ -325,6 +411,8 @@ main(void)
 	UT_RUN(object_roles_local_settled_terminal_is_directory_only);
 	UT_RUN(object_roles_local_master_request_is_not_remote_directory_only);
 	UT_RUN(object_roles_local_pi_and_unknown_references_never_filter_out);
+	UT_RUN(object_roles_master_pi_accounting_does_not_reopen_local_work);
+	UT_RUN(object_roles_local_retirement_preserves_unfinished_master_cut);
 	UT_RUN(object_roles_local_round_is_physical_even_on_nonmaster);
 	UT_RUN(object_roles_remote_debt_cannot_hide_bad_local_terminal_history);
 	UT_RUN(object_roles_preserve_bounded_gate_and_reference_contract);

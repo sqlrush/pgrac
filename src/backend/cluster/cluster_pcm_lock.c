@@ -10886,9 +10886,7 @@ pcm_resource_x_role_pending_locked(struct GrdEntry *entry,
 	if ((mode == PCM_STATE_X && entry->x_holder_node == cluster_node_id)
 		|| (mode == PCM_STATE_S && cluster_node_id >= 0
 			&& cluster_node_id < RESOURCE_X_PROTOCOL_NODE_LIMIT
-			&& (s_holders & (UINT32_C(1) << (uint32)cluster_node_id)) != 0)
-		|| (cluster_node_id >= 0 && cluster_node_id < RESOURCE_X_PROTOCOL_NODE_LIMIT
-			&& (pi_holders & (UINT32_C(1) << (uint32)cluster_node_id)) != 0))
+			&& (s_holders & (UINT32_C(1) << (uint32)cluster_node_id)) != 0))
 		local = true;
 	if (entry->s_holder_refcount_local != 0 || entry->local_pi_first.source_flags != 0
 		|| entry->local_pi_last.source_flags != 0
@@ -10899,8 +10897,7 @@ pcm_resource_x_role_pending_locked(struct GrdEntry *entry,
 	 * therefore cannot be subtracted from either projection. */
 	if (entry->convert_queue != NULL || pg_atomic_read_u32(&entry->pin_count) != 0
 		|| pg_atomic_read_u32(&entry->wait_refcount) != 0
-		|| pg_atomic_read_u32(&entry->transport_refcount) != 0 || entry->pi_watermark_lsn != 0
-		|| entry->pi_watermark_scn != 0)
+		|| pg_atomic_read_u32(&entry->transport_refcount) != 0)
 		local = directory = true;
 
 	if (state != NULL) {
@@ -10953,9 +10950,12 @@ pcm_resource_x_role_pending_locked(struct GrdEntry *entry,
 	}
 
 	/* Master mode/holder and pending conversion are directory service state;
-	 * local bits were already attributed above. */
+	 * local current holders were already attributed above. PI bitmap and
+	 * watermarks survive local PI retirement until the full master cut is
+	 * complete. Local PI is tracked by its owned references above. */
 	if ((mode == PCM_STATE_X && entry->x_holder_node != -1) || mode == PCM_STATE_S
-		|| pi_holders != 0 || entry->pending_x_requester_node != -1
+		|| pi_holders != 0 || entry->pi_watermark_lsn != 0 || entry->pi_watermark_scn != 0
+		|| entry->pending_x_requester_node != -1
 		|| entry->master_holder.node_id != INVALID_PCM_MASTER_HOLDER_NODE)
 		directory = true;
 
