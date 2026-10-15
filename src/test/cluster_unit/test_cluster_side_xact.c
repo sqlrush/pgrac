@@ -18,6 +18,7 @@
 #include "catalog/storage_xlog.h"
 #include "catalog/pg_control.h"
 #include "catalog/pg_tablespace_d.h"
+#include "cluster/cluster_multixact.h"
 #include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_side_online_owner.h"
@@ -106,6 +107,8 @@ static TransactionId canonical_expected_xid = 818;
 static uint16 canonical_expected_wrap = 8;
 static bool canonical_check_block, canonical_fail_data_write, canonical_corrupt_data_write;
 static bool canonical_file_io_error, canonical_materialize_failure;
+static bool cold_mx_test, cold_mx_online, cold_mx_preflight_fail, cold_mx_throw;
+static unsigned cold_mx_preflights, cold_mx_projections;
 static bool cold_clog_test, cold_clog_denied, cold_clog_apply_fail, cold_clog_verify_fail;
 static bool cold_clog_throw, cold_clog_stale_after_verify;
 static bool cold_abort_test, cold_abort_projection_conflict, cold_abort_projection_bad_read;
@@ -165,7 +168,24 @@ cluster_undo_recovery_origin_authorized_v1(int node)
 bool
 cluster_undo_recovery_cold_origin_authorized_v1(int node)
 {
-	return cold_clog_test && !cold_clog_denied && canonical_scope != NULL && node == 2;
+	return (cold_clog_test || cold_mx_test) && !cold_clog_denied && canonical_scope != NULL
+		   && node == 2;
+}
+
+/* The native adapter runs real SLRU in test_cluster_multixact_recovery. */
+bool
+cluster_multixact_native_recovery_preflight(int origin, const ClusterSideProjectionOperationV1 *op,
+											const uint8 *payload, uint32 length, XLogRecPtr begin,
+											XLogRecPtr end)
+{
+	UT_ASSERT(cold_mx_test && !cold_mx_online && canonical_scope != NULL);
+	UT_ASSERT_EQ(origin, 2);
+	UT_ASSERT_EQ(op->kind, CLUSTER_SIDE_PROJECTION_MULTIXACT);
+	UT_ASSERT(payload == NULL && length == 0 && begin >= 100 && end == begin + 100);
+	cold_mx_preflights++;
+	if (cold_mx_throw)
+		pg_re_throw();
+	return !cold_mx_preflight_fail && op->page_number < 524288;
 }
 
 /* Exact native CLOG IO is covered by test_cluster_clog_recovery. This boundary
@@ -364,12 +384,18 @@ rf_side_online_projection_owner_init_v1(RfSideOnlineProjectionOwnerV1 *owner, ui
 bool
 rf_side_online_projection_preflight_owned_v1(void *arg, const RfSideOnlineOperationV1 *op)
 {
-	UT_ASSERT(cold_clog_record_test && arg != NULL && op != NULL);
-	return cold_clog_record_test;
+	UT_ASSERT((cold_clog_record_test || cold_mx_test) && arg != NULL && op != NULL);
+	return cold_clog_record_test || cold_mx_test;
 }
 bool
 rf_side_online_projection_apply_owned_v1(void *arg, const RfSideOnlineOperationV1 *op)
 {
+	if (cold_mx_test) {
+		UT_ASSERT(arg != NULL && op != NULL);
+		UT_ASSERT(cold_mx_online || cold_mx_preflights >= 2);
+		cold_mx_projections++;
+		return true;
+	}
 	UT_ASSERT(cold_clog_record_test && arg != NULL && op != NULL);
 	UT_ASSERT(cold_clog_record_online || (cold_clog_applies == 1 && cold_clog_verifies == 1));
 	cold_clog_record_projections++;
@@ -3456,6 +3482,67 @@ canonical_authority_fresh(void *arg)
 	return arg != NULL;
 }
 
+UT_TEST(test_cold_owner_multixact_preflights_whole_set_before_projection)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		RfSideOnlinePlanV1 *plan = space_online_plan(fault == 5 ? 300 : 200);
+		RfSideOnlineProductionOwnerV1 owner;
+		ClusterRecoverySerialGuard guard = { 0 };
+		ClusterThreadRecoveryAuthorityV1 authority
+			= { .duty = &canonical_duty, .serial_guard = &guard };
+		RfPageProofDetailV1 result = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		volatile bool caught = false;
+		guard.mode
+			= fault == 4 ? CLUSTER_RECOVERY_SERIAL_ONLINE : CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+		for (int n = 0; n < (fault == 5 ? 2 : 1); n++) {
+			FakeXactRecord fake;
+			uint8 uuid[16];
+			RfPageOnlineRecordIdentityV1 identity;
+			RfDetachedRecordPlanV1 record;
+			int page = n == 1 ? 524288 : 0;
+			make_projection_record(&fake, RM_MULTIXACT_ID, XLOG_MULTIXACT_ZERO_OFF_PAGE, &page,
+								   sizeof(page));
+			memset(uuid, 0x44, sizeof(uuid));
+			identity = make_identity(&fake, uuid);
+			set_identity_range(&fake, &identity, 100 + n * 100, 200 + n * 100);
+			record = make_projection_record_plan(&fake);
+			UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &record, &identity),
+						 RF_PAGE_PROOF_DETAIL_OK);
+		}
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		cold_mx_test = control_scope_test = true;
+		cold_mx_online = fault == 4;
+		control_scope_denied = false;
+		control_scope_fault = 0;
+		cold_clog_denied = fault == 1;
+		cold_mx_preflight_fail = fault == 2;
+		cold_mx_throw = fault == 3;
+		cold_mx_preflights = cold_mx_projections = 0;
+		UT_ASSERT(rf_side_online_production_owner_init_v1(&owner, &authority,
+														  canonical_authority_fresh, 19, true));
+		UT_ASSERT(rf_side_online_production_bind_undo_v1(&owner, &authority));
+		PG_TRY();
+		{
+			result = rf_side_online_production_apply_v1(plan, &owner);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 3);
+		if (!caught)
+			UT_ASSERT_EQ(result, fault == 0 || fault == 4 ? RF_PAGE_PROOF_DETAIL_OK
+														  : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+		UT_ASSERT_EQ(cold_mx_projections, fault == 0 || fault == 4 ? 1 : 0);
+		UT_ASSERT_EQ(owner.protected_set_complete, fault == 0 || fault == 4);
+		UT_ASSERT(canonical_scope == NULL && !owner.protected_set_active);
+		cold_mx_test = cold_mx_online = cold_mx_preflight_fail = cold_mx_throw = false;
+		cold_clog_denied = control_scope_test = false;
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
 UT_TEST(test_cold_owner_native_clog_lifecycle_precedes_derived_projection)
 {
 	for (int fault = 0; fault < 11; fault++) {
@@ -5595,7 +5682,7 @@ UT_TEST(test_space_incarnation_end_rejects_old_uuid_reappearance_and_retained_ga
 int
 main(void)
 {
-	UT_PLAN(75);
+	UT_PLAN(76);
 	UT_RUN(test_space_incarnation_end_requires_an_actual_later_space0_contribution);
 	UT_RUN(test_space_incarnation_end_rejects_old_uuid_reappearance_and_retained_gaps);
 	UT_RUN(test_space_retained_ancestry_create_and_independent_page_terminal);
@@ -5626,6 +5713,7 @@ main(void)
 	UT_RUN(test_recycle_window_repeated_terminal_and_init_unknown_generation);
 	UT_RUN(test_physical_only_cut_and_reuse_anchor_boundary);
 	UT_RUN(test_physical_undo_is_durable_before_canonical_tt_publication);
+	UT_RUN(test_cold_owner_multixact_preflights_whole_set_before_projection);
 	UT_RUN(test_cold_owner_native_clog_lifecycle_precedes_derived_projection);
 	UT_RUN(test_cold_owner_persists_native_clog_before_commit_projection);
 	UT_RUN(test_real_plan_owner_and_xact_install_final_header_before_older_commit_projection);

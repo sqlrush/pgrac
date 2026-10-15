@@ -4121,6 +4121,7 @@ test_cluster_multixact_limits: test_cluster_multixact_limits.c unit_test.h \
 test_cluster_multixact_recovery test_cluster_multixact_limits_io: %: %.c unit_test.h \
 		$(top_srcdir)/src/backend/access/transam/multixact.c \
 		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/include/cluster/cluster_multixact.h \
 		$(top_srcdir)/src/backend/cluster/cluster_mxid_stripe.c \
 		$(top_srcdir)/src/backend/cluster/cluster_xid_authority.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \

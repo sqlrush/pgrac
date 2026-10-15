@@ -11,6 +11,7 @@
 #include "access/xlog_internal.h"
 #include "catalog/pg_control.h"
 #include "cluster/cluster_native_startup.h"
+#include "cluster/cluster_multixact.h"
 #include "cluster/cluster_remote_xact.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_side_online_owner.h"
@@ -389,6 +390,22 @@ side_owner_cold_clog_ready(RfSideOnlineProductionOwnerV1 *owner,
 }
 
 static bool
+side_owner_cold_multixact_ready(RfSideOnlineProductionOwnerV1 *owner,
+								const RfSideOnlineOperationV1 *operation)
+{
+	uint16 thread = operation->identity.record.origin_thread;
+
+	return operation->kind == RF_SIDE_ONLINE_OPERATION_PROJECTION
+		   && operation->projection.kind == CLUSTER_SIDE_PROJECTION_MULTIXACT
+		   && thread == owner->undo_authority->duty->origin_thread_id
+		   && cluster_undo_recovery_cold_origin_authorized_v1(thread - 1)
+		   && cluster_multixact_native_recovery_preflight(
+			   thread - 1, &operation->projection, operation->owned_payload,
+			   operation->owned_payload_length, operation->identity.record.read_rec_ptr,
+			   operation->identity.record.end_rec_ptr);
+}
+
+static bool
 side_owner_preflight_projection(void *arg, const RfSideOnlineOperationV1 *operation)
 {
 	RfSideOnlineProductionOwnerV1 *owner = (RfSideOnlineProductionOwnerV1 *)arg;
@@ -399,6 +416,10 @@ side_owner_preflight_projection(void *arg, const RfSideOnlineOperationV1 *operat
 	/* Validate the whole protected set before its first storage mutation. */
 	if (side_owner_cold_formed(owner) && operation->projection.kind == CLUSTER_SIDE_PROJECTION_CLOG
 		&& !side_owner_cold_clog_ready(owner, operation))
+		return false;
+	if (side_owner_cold_formed(owner)
+		&& operation->projection.kind == CLUSTER_SIDE_PROJECTION_MULTIXACT
+		&& !side_owner_cold_multixact_ready(owner, operation))
 		return false;
 	return rf_side_online_projection_preflight_owned_v1(&owner->projection, operation);
 }
@@ -486,6 +507,12 @@ side_owner_apply_projection(void *arg, const RfSideOnlineOperationV1 *operation)
 			|| !side_owner_cold_clog_ready(owner, operation) || !side_owner_authority_fresh(owner))
 			return false;
 	}
+	/* The original MX consumer owns native apply/readback and only then
+	 * publishes the derived overlay. Recheck cold input before entering it. */
+	if (side_owner_cold_formed(owner)
+		&& operation->projection.kind == CLUSTER_SIDE_PROJECTION_MULTIXACT
+		&& !side_owner_cold_multixact_ready(owner, operation))
+		return false;
 	return rf_side_online_projection_apply_owned_v1(&owner->projection, operation);
 }
 

@@ -6,6 +6,7 @@
 #include "postgres.h"
 
 #include "access/clog.h"
+#include "cluster/cluster_multixact.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_side_online_owner.h"
 #include "cluster/cluster_undo_segment_init.h"
@@ -75,6 +76,17 @@ bool
 cluster_undo_recovery_cold_origin_authorized_v1(int origin_node pg_attribute_unused())
 {
 	UT_ASSERT(false); /* Cold source/owner coverage is in test_cluster_side_xact. */
+	return false;
+}
+
+bool
+cluster_multixact_native_recovery_preflight(
+	int origin pg_attribute_unused(),
+	const ClusterSideProjectionOperationV1 *op pg_attribute_unused(),
+	const uint8 *payload pg_attribute_unused(), uint32 length pg_attribute_unused(),
+	XLogRecPtr begin pg_attribute_unused(), XLogRecPtr end pg_attribute_unused())
+{
+	UT_ASSERT(false); /* Native-control integration is in test_cluster_side_xact. */
 	return false;
 }
 

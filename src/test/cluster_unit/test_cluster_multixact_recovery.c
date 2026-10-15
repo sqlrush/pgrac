@@ -44,7 +44,7 @@ static uint32 wait_event;
 uint32 *my_wait_event_info = &wait_event;
 static char fixture_root[MAXPGPATH];
 static bool authority = true, revoke_on_lock, expect_error, fail_open, fail_sync, fail_dirsync;
-static bool fixture_retired;
+static bool fixture_retired, cold_scope;
 static int transient_fds;
 static unsigned writes, syncs, dirsyncs, reads;
 static struct {
@@ -133,6 +133,11 @@ bool
 cluster_undo_recovery_origin_authorized_v1(int origin)
 {
 	return authority && origin == 1;
+}
+bool
+cluster_undo_recovery_cold_origin_authorized_v1(int origin)
+{
+	return authority && cold_scope && origin == 1;
 }
 bool
 cluster_undo_recovery_multixact_page_retired_v1(int origin, XLogRecPtr source_lsn,
@@ -664,6 +669,130 @@ UT_TEST(next_offsets_truncate_retires_previous_boundary_segment)
 	fixture_idle();
 }
 
+UT_TEST(cold_own_origin_replays_native_records_without_local_controls)
+{
+	ClusterSideProjectionOperationV1 op = fixture_create(17, 71, 1);
+	MultiXactMember member = { 400, MultiXactStatusForShare };
+	SlruCtlData old_offsets = *MultiXactOffsetCtl;
+	SlruCtlData old_members = *MultiXactMemberCtl;
+	MultiXactStateData *old_state = MultiXactState;
+	MultiXactStateData local_state, saved_state;
+	PGAlignedBlock page;
+	unsigned before = writes;
+
+	memset(&local_state, 0x5a, sizeof(local_state));
+	memcpy(&saved_state, &local_state, sizeof(saved_state));
+	MultiXactState = &local_state;
+	cluster_node_id = 1;
+	cold_scope = false;
+	UT_ASSERT(!cluster_multixact_native_recovery_apply(1, &op, (uint8 *)&member, sizeof(member),
+													   100, 200));
+	UT_ASSERT_EQ(writes, before);
+	cold_scope = true;
+	fixture_zero(false, 0);
+	fixture_zero(true, 0);
+	UT_ASSERT(cluster_multixact_native_recovery_preflight(1, &op, (uint8 *)&member, sizeof(member),
+														  100, 200));
+	UT_ASSERT(cluster_multixact_native_recovery_apply(1, &op, (uint8 *)&member, sizeof(member), 100,
+													  200));
+	UT_ASSERT(cluster_multixact_native_recovery_verify(1, &op, (uint8 *)&member, sizeof(member),
+													   100, 200));
+	fixture_read(&MultiXactRecoveryOffsetCtl[1], 0, page.data);
+	UT_ASSERT_EQ(((MultiXactOffset *)page.data)[17], 71);
+	fixture_read(&MultiXactRecoveryMemberCtl[1], 0, page.data);
+	UT_ASSERT_EQ(*(TransactionId *)(page.data + MXOffsetToMemberOffset(71)), 400);
+	UT_ASSERT(memcmp(&old_offsets, MultiXactOffsetCtl, sizeof(old_offsets)) == 0);
+	UT_ASSERT(memcmp(&old_members, MultiXactMemberCtl, sizeof(old_members)) == 0);
+	UT_ASSERT(MultiXactState == &local_state);
+	/* Reuse the actual truncate/sync/readback path in the same own-origin scope. */
+	truncate_is_durable_and_retains_final_partial_segments();
+	UT_ASSERT(memcmp(&local_state, &saved_state, sizeof(local_state)) == 0);
+	MultiXactState = old_state;
+	cold_scope = false;
+	cluster_node_id = 0;
+	fixture_idle();
+}
+
+UT_TEST(native_preflight_checks_full_geometry_without_writes)
+{
+	ClusterSideProjectionOperationV1 create = fixture_create(17, 1, 1);
+	MultiXactMember member = { 100, MultiXactStatusForShare };
+	unsigned before = writes, before_sync = syncs, before_reads = reads;
+	cluster_node_id = 1;
+	cold_scope = true;
+	UT_ASSERT(cluster_multixact_native_recovery_preflight(1, &create, (uint8 *)&member,
+														  sizeof(member), 100, 200));
+	for (int fault = 0; fault < 9; fault++) {
+		ClusterSideProjectionOperationV1 op = create;
+		int origin = 1;
+		uint32 len = sizeof(member);
+		XLogRecPtr begin = 100, end = 200;
+		if (fault == 0)
+			cold_scope = false;
+		if (fault == 1)
+			origin = 128;
+		if (fault == 2)
+			op.member_offset = 0;
+		if (fault == 3)
+			len--;
+		if (fault == 4)
+			begin = 0;
+		if (fault == 5)
+			end = begin;
+		if (fault == 6)
+			op.member_count = UINT32_MAX;
+		if (fault == 7) {
+			op.action = CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE;
+			op.normalized_info = XLOG_MULTIXACT_ZERO_OFF_PAGE;
+			op.page_number = MultiXactIdToOffsetPage(MaxMultiXactId) + 1;
+			len = 0;
+		}
+		if (fault == 8) {
+			op.action = CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE;
+			op.normalized_info = XLOG_MULTIXACT_TRUNCATE_ID;
+			op.oldest_database = 1;
+			op.truncate_start_multixact = 100;
+			op.truncate_end_multixact = 99;
+			len = 0;
+		}
+		UT_ASSERT(!cluster_multixact_native_recovery_preflight(
+			origin, &op, len ? (uint8 *)&member : NULL, len, begin, end));
+		cold_scope = true;
+	}
+	UT_ASSERT_EQ(writes, before);
+	UT_ASSERT_EQ(syncs, before_sync);
+	UT_ASSERT_EQ(reads, before_reads);
+	cold_scope = false;
+	cluster_node_id = 0;
+	fixture_idle();
+}
+
+UT_TEST(cold_revocation_and_readback_failure_cannot_use_online_fallback)
+{
+	ClusterSideProjectionOperationV1 op = { 0 };
+	unsigned before = writes;
+	op.kind = CLUSTER_SIDE_PROJECTION_MULTIXACT;
+	op.action = CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE;
+	op.normalized_info = XLOG_MULTIXACT_ZERO_OFF_PAGE;
+	op.page_number = 0;
+	cluster_node_id = 1;
+	cold_scope = true;
+	UT_ASSERT(cluster_multixact_native_recovery_preflight(1, &op, NULL, 0, 100, 200));
+	revoke_on_lock = true;
+	UT_ASSERT(!cluster_multixact_native_recovery_apply(1, &op, NULL, 0, 100, 200));
+	revoke_on_lock = false;
+	authority = true;
+	UT_ASSERT_EQ(writes, before);
+	UT_ASSERT(cluster_multixact_native_recovery_apply(1, &op, NULL, 0, 100, 200));
+	cold_scope = false;
+	UT_ASSERT(!cluster_multixact_native_recovery_verify(1, &op, NULL, 0, 100, 200));
+	cold_scope = true;
+	UT_ASSERT(cluster_multixact_native_recovery_verify(1, &op, NULL, 0, 100, 200));
+	cold_scope = false;
+	cluster_node_id = 0;
+	fixture_idle();
+}
+
 static void
 fixture_cleanup(void)
 {
@@ -711,7 +840,7 @@ main(void)
 			return 2;
 	}
 	multi_recovery_shmem_init();
-	UT_PLAN(12);
+	UT_PLAN(15);
 	UT_RUN(shared_controls_are_distinct_and_use_original_namespace);
 	UT_RUN(authority_failure_and_local_origin_never_write);
 	UT_RUN(actual_native_create_crosses_offset_and_member_pages);
@@ -724,6 +853,9 @@ main(void)
 	UT_RUN(postread_observes_real_disk_corruption_and_replay_repairs_members);
 	UT_RUN(repeated_create_after_proven_later_truncate_reconstructs_only_retired_pages);
 	UT_RUN(next_offsets_truncate_retires_previous_boundary_segment);
+	UT_RUN(cold_own_origin_replays_native_records_without_local_controls);
+	UT_RUN(native_preflight_checks_full_geometry_without_writes);
+	UT_RUN(cold_revocation_and_readback_failure_cannot_use_online_fallback);
 	fixture_cleanup();
 	UT_DONE();
 	return ut_failed_count != 0;

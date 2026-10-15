@@ -4219,10 +4219,12 @@ multi_recovery_cache_discard(SlruCtl ctl)
 static bool
 multi_recovery_permitted(int origin)
 {
-	/* Own-origin native startup retains its original SLRU/counter owner. */
+	/* ONLINE cannot replay its own live origin. A qualified cold scope may
+	 * recover that origin's former files without touching local allocation. */
 	return cluster_shared_config && origin >= 0 && origin < MULTIXACT_RECOVERY_ORIGINS
-		&& origin != cluster_node_id && MultiXactRecoveryLocks != NULL
-		&& cluster_undo_recovery_origin_authorized_v1(origin);
+		   && MultiXactRecoveryLocks != NULL && cluster_undo_recovery_origin_authorized_v1(origin)
+		   && (origin != cluster_node_id
+			   || cluster_undo_recovery_cold_origin_authorized_v1(origin));
 }
 
 static bool
@@ -4529,6 +4531,20 @@ multi_recovery_operation(int origin, const ClusterSideProjectionOperationV1 *op,
 	}
 	return (verify || (multi_recovery_sync(members, origin) && multi_recovery_sync(offsets, origin)))
 		&& multi_recovery_directory_ready(origin);
+}
+
+/* Read-only validation before a protected set starts changing native storage. */
+bool
+cluster_multixact_native_recovery_preflight(int origin, const ClusterSideProjectionOperationV1 *op,
+											const uint8 *payload, uint32 length,
+											XLogRecPtr source_lsn, XLogRecPtr source_end_lsn)
+{
+	return source_lsn != InvalidXLogRecPtr && source_end_lsn > source_lsn
+		   && multi_recovery_permitted(origin)
+		   && multi_recovery_input_valid(origin, op, payload, length)
+		   && MultiXactRecoveryOffsetCtl[origin].shared != NULL
+		   && MultiXactRecoveryMemberCtl[origin].shared != NULL
+		   && multi_recovery_directory_ready(origin);
 }
 
 static bool
