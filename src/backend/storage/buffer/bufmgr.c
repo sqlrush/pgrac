@@ -12919,6 +12919,7 @@ cluster_bufmgr_observe_pi_storage_internal(const ClusterPageDataTargetV1 *target
 	volatile bool complete = false;
 	uint64 token;
 	ClusterPageDataReceiptV1 *receipt;
+	ClusterKoDirectoryIoV3 io;
 
 	if (target == NULL || out == NULL || *out != NULL || CurrentResourceOwner == NULL
 		|| !cluster_enabled || !cluster_shared_config || RecoveryInProgress()
@@ -12954,6 +12955,8 @@ cluster_bufmgr_observe_pi_storage_internal(const ClusterPageDataTargetV1 *target
 		|| !cluster_pcm_lock_pi_storage_matches_v1(&observed))
 		return false;
 	InitBufferTag(&space_tag, &key.locator, SPACE_FORKNUM, 0);
+	if (!cluster_ko_directory_io_begin_v3(key.locator, &io))
+		return false;
 	PG_TRY();
 	{
 		do {
@@ -13003,6 +13006,7 @@ cluster_bufmgr_observe_pi_storage_internal(const ClusterPageDataTargetV1 *target
 			LWLockRelease(BufferDescriptorGetContentLock(space));
 			cluster_bufmgr_unpin_for_gcs(space);
 		}
+		(void)cluster_ko_directory_io_end_v3(&io);
 	}
 	PG_END_TRY();
 	if (!complete)
@@ -16245,6 +16249,7 @@ cluster_bufmgr_read_storage_image_for_resource_x(
 {
 	PGIOAlignedBlock scratch;
 	SMgrRelation reln;
+	ClusterKoDirectoryIoV3 io;
 	Page page = (Page)scratch.data;
 
 	if (block_data != NULL)
@@ -16256,8 +16261,18 @@ cluster_bufmgr_read_storage_image_for_resource_x(
 	if (block_data == NULL || out_page_lsn == NULL || out_page_scn == NULL)
 		return false;
 
-	reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
-	smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
+	if (!cluster_ko_directory_io_begin_v3(BufTagGetRelFileLocator(&tag), &io))
+		return false;
+	PG_TRY();
+	{
+		reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
+		smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
 	if (!PageIsVerifiedForFork(page, BufTagGetForkNum(&tag), tag.blockNum,
 								PIV_LOG_WARNING | PIV_REPORT_STAT))
 		return false;

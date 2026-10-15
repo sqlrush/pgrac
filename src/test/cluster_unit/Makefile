@@ -4716,6 +4716,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_pcm_page_identity.inc test_cluster_pcm_page_identity.inc.tmp
 	rm -f test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc
 	rm -f test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc
+	rm -f test_cluster_ko_raw_io.inc
 	rm -f test_cluster_space_extend.inc test_cluster_space_extend_finish.inc test_cluster_space_extend_resize.inc test_cluster_space_extend_zero.inc test_cluster_space_extend_handoff.inc
 	rm -f test_cluster_undo_producer_owner.inc test_cluster_undo_block_native.inc
 	rm -f test_cluster_undo_lifecycle_native.inc test_cluster_undo_header_identity.inc
@@ -6422,7 +6423,7 @@ test_cluster_ko_writeback_codec.o: $(top_srcdir)/src/backend/cluster/cluster_pi_
 		$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_ko_stop test_cluster_ko_cancel test_cluster_ko_ready_owner: %: %.c test_cluster_ko_stop.c test_cluster_ko_space.inc test_cluster_ko_abandon.h test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
+test_cluster_ko_stop test_cluster_ko_cancel test_cluster_ko_ready_owner test_cluster_ko_drop_io: %: %.c test_cluster_ko_stop.c test_cluster_ko_space.inc test_cluster_ko_abandon.h test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
 		test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_ko_lock.c \
 		$(top_srcdir)/src/include/cluster/cluster_ko.h
@@ -9214,7 +9215,7 @@ test_cluster_ko_relation_scan test_cluster_ko_current_admission: %: %.c test_clu
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 TESTS += test_cluster_ko_cancel test_cluster_ges_release test_cluster_grd_ko_cancel test_cluster_acquire_ko_cancel
-TESTS += test_cluster_ko_ready_owner
+TESTS += test_cluster_ko_ready_owner test_cluster_ko_drop_io
 
 # Native lifecycle consumers, copied verbatim; surrounding hash/GES are fixtures.
 test_cluster_ko_native_upgrade.inc: $(top_srcdir)/src/backend/storage/lmgr/lock.c
@@ -9224,3 +9225,9 @@ test_cluster_ko_native_release_all.inc: $(top_srcdir)/src/backend/storage/lmgr/l
 test_cluster_ko_native_release.inc: $(top_srcdir)/src/backend/storage/lmgr/lock.c
 	awk '/^LockRelease\(/ { inside=1 } inside && /^\tif \(locallock->cluster_registered\)/ {emit=1; n++} emit && /^#endif/ {emit=0; inside=0} emit {print} END {if (n != 1 || emit) exit 1}' $< > $@
 test_cluster_ko_cancel: test_cluster_ko_native_upgrade.inc test_cluster_ko_native_release_all.inc test_cluster_ko_native_release.inc
+
+# Execute the same raw Resource-X storage reader as the original LMS owner.
+test_cluster_ko_raw_io.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c
+	awk '/^cluster_bufmgr_read_storage_image_for_resource_x\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< > $@
+test_cluster_ko_drop_io: test_cluster_ko_raw_io.inc

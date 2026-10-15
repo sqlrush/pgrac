@@ -169,6 +169,16 @@ typedef struct ClusterKoPeerFenceHandleV3 {
 	uint64 serial;
 } ClusterKoPeerFenceHandleV3;
 
+/* A reference to one entered synchronous directory I/O call. It carries no
+ * DATA, grant or retirement authority. End only from the entering process. */
+typedef struct ClusterKoDirectoryIoV3 {
+	uint32 slot;
+	int32 pid;
+	uint64 serial;
+} ClusterKoDirectoryIoV3;
+extern bool cluster_ko_directory_io_begin_v3(RelFileLocator locator, ClusterKoDirectoryIoV3 *out);
+extern bool cluster_ko_directory_io_end_v3(const ClusterKoDirectoryIoV3 *call);
+
 /* A local admission sample for one locator, not an AX or completion proof.
  * Sample outside mapping/header/PCM locks. Revalidate under the original
  * producer lock immediately before publishing its reference or image. */

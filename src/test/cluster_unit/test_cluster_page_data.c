@@ -28,6 +28,7 @@
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "executor/instrument.h"
@@ -73,6 +74,36 @@ static LWLock mapping;
 static unsigned pins[2];
 static int data_slot = 1;
 static bool locks[2], resident[2], busy[2], selected, sf_blocked, bad_checksum, bad_bytes;
+/* The actual KO exclusion/marker race is covered by test_cluster_ko_drop_io.
+ * This boundary checks the CP caller's range and final cleanup ordering. */
+static bool directory_io_denied, directory_io_entered;
+static unsigned directory_io_begins, directory_io_ends;
+
+bool
+cluster_ko_directory_io_begin_v3(RelFileLocator locator, ClusterKoDirectoryIoV3 *out)
+{
+	UT_ASSERT(!locks[0] && !locks[1]);
+	UT_ASSERT(!directory_io_entered);
+	directory_io_begins++;
+	memset(out, 0, sizeof(*out));
+	if (directory_io_denied)
+		return false;
+	directory_io_entered = true;
+	out->serial = 717;
+	return true;
+}
+
+bool
+cluster_ko_directory_io_end_v3(const ClusterKoDirectoryIoV3 *scope)
+{
+	UT_ASSERT(!locks[0] && !locks[1]);
+	UT_ASSERT(!pins[0] && !pins[1]);
+	UT_ASSERT(directory_io_entered && scope->serial == 717);
+	directory_io_entered = false;
+	directory_io_ends++;
+	return true;
+}
+
 static bool redeclare_scan_test;
 static int redeclare_scope = 1;
 static unsigned redeclare_content_attempts;
@@ -895,6 +926,10 @@ reset(void)
 {
 	PageHeader p = (PageHeader)pages[1].data;
 
+	UT_ASSERT(!directory_io_entered);
+	directory_io_denied = false;
+	directory_io_begins = directory_io_ends = 0;
+
 #ifndef PGRAC_TEST_REAL_PI_WRITEBACK
 	recovered_count = 3;
 	structural_consume_race = 0;
@@ -1550,6 +1585,9 @@ n_s_storage_observation_qualifies_only_terminal_data(void)
 		}
 		UT_ASSERT(cluster_bufmgr_observe_pi_storage_v1(&target, &cut, plan, sources, 3, &receipt));
 		UT_ASSERT(receipt != NULL);
+		UT_ASSERT(!directory_io_entered);
+		UT_ASSERT_EQ(directory_io_begins, 1);
+		UT_ASSERT_EQ(directory_io_ends, 1);
 		UT_ASSERT_EQ(writes + wal_flushes, 0);
 		UT_ASSERT_EQ(syncs, 1);
 		UT_ASSERT_EQ(reads, 2);
@@ -1564,6 +1602,24 @@ n_s_storage_observation_qualifies_only_terminal_data(void)
 		rf_page_online_plan_destroy_v1(&plan);
 		clean();
 	}
+}
+
+static void
+storage_observation_refuses_closed_drop_before_io(void)
+{
+	ClusterWalSourceRef sources[3];
+	ClusterPcmPiStorageCutV1 cut;
+	ClusterPageDataReceiptV1 *receipt = NULL;
+	RfPageOnlinePlanV1 *plan = prepare_storage_observation(sources, &cut);
+
+	directory_io_denied = true;
+	UT_ASSERT(!cluster_bufmgr_observe_pi_storage_v1(&target, &cut, plan, sources, 3, &receipt));
+	UT_ASSERT(receipt == NULL && !directory_io_entered);
+	UT_ASSERT_EQ(directory_io_begins, 1);
+	UT_ASSERT_EQ(directory_io_ends, 0);
+	UT_ASSERT_EQ(reads + writes + syncs + wal_flushes, 0);
+	rf_page_online_plan_destroy_v1(&plan);
+	clean();
 }
 
 static void
@@ -1631,6 +1687,9 @@ storage_observation_releases_space_on_io_error(void)
 		}
 		PG_END_TRY();
 		UT_ASSERT(caught);
+		UT_ASSERT(!directory_io_entered);
+		UT_ASSERT_EQ(directory_io_begins, 1);
+		UT_ASSERT_EQ(directory_io_ends, 1);
 		UT_ASSERT(receipt == NULL);
 		UT_ASSERT_EQ(writes + wal_flushes + aborts, 0);
 		rf_page_online_plan_destroy_v1(&plan);
@@ -5287,7 +5346,7 @@ int
 main(void)
 {
 #ifndef PGRAC_TEST_REAL_PI_WRITEBACK
-	UT_PLAN(78);
+	UT_PLAN(79);
 	UT_RUN(ordinary_flush_attempt_tracks_actual_data_submission);
 	UT_RUN(structural_remote_ack_import_binds_original_inputs_and_cut);
 	UT_RUN(structural_remote_ack_refuses_transport_input_and_collector_drift);
@@ -5323,7 +5382,7 @@ main(void)
 	UT_RUN(recovery_ack_cannot_outlive_original_input_membership_or_owner);
 	UT_RUN(recovery_ack_refuses_successor_pi_not_covered_by_actual_data);
 #else
-	UT_PLAN(44);
+	UT_PLAN(45);
 #endif
 	UT_RUN(space_data_writes_exact_typed_live_and_tombstoned_pages);
 	UT_RUN(space_binding_rejects_wrong_typed_identity_before_io);
@@ -5361,6 +5420,7 @@ main(void)
 	UT_RUN(plan_sources_are_immutable);
 	UT_RUN(pi_cut_must_match_current_holder_before_data);
 	UT_RUN(physical_receipts_close_only_exact_contributions);
+	UT_RUN(storage_observation_refuses_closed_drop_before_io);
 	UT_RUN(n_s_storage_observation_qualifies_only_terminal_data);
 	UT_RUN(storage_observation_rejects_incomplete_or_changed_proof);
 	UT_RUN(storage_observation_releases_space_on_io_error);

@@ -286,6 +286,7 @@ static uint64 relation_gate_freeze;
 static bool relation_gate_ok;
 static ClusterPcmPiRelationScanV2 local_relation_scan_result;
 static uint32 local_relation_scan_calls, local_relation_scan_advance;
+static RelFileNumber local_scan_rel_number = 99;
 static bool local_writeback_closed;
 static uint64 local_writeback_revision;
 static uint32 local_relation_scan_input;
@@ -323,7 +324,7 @@ ClusterPcmPiRelationScanV2
 cluster_pcm_lock_ko_local_relation_scan_v3(RelFileLocator locator, uint64 epoch, uint32 budget,
 										   uint32 *cursor)
 {
-	UT_ASSERT_EQ(locator.relNumber, 99);
+	UT_ASSERT_EQ(locator.relNumber, local_scan_rel_number);
 	UT_ASSERT_EQ(epoch, current_epoch);
 	UT_ASSERT_EQ(budget, 128);
 	local_relation_scan_calls++;
@@ -344,7 +345,7 @@ bool
 cluster_pi_writeback_local_relation_closed_v3(RelFileLocator locator, uint64 formation,
 											  uint64 *revision)
 {
-	UT_ASSERT_EQ(locator.relNumber, 99);
+	UT_ASSERT_EQ(locator.relNumber, local_scan_rel_number);
 	UT_ASSERT_EQ(formation, current_epoch);
 	*revision = local_writeback_closed ? local_writeback_revision : 0;
 	return local_writeback_closed;
@@ -1257,6 +1258,7 @@ reset_test(void)
 	relation_scan_calls = relation_scan_advance = 0;
 	relation_scan_epoch_drift = relation_scan_slot_drift = relation_scan_freeze_drift = false;
 	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_EMPTY;
+	local_scan_rel_number = 99;
 	local_writeback_closed = true;
 	local_writeback_revision = 1;
 	local_relation_scan_calls = local_relation_scan_advance = 0;
@@ -7719,14 +7721,17 @@ UT_TEST(test_peer_fence_capacity_does_not_delete_old_terminal)
 
 	for (int i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
 		request.base.batch_id = 400 + i;
+		request.base.key.locator.relNumber = local_scan_rel_number = 99 + i;
 		UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
 		UT_ASSERT(fixture_completed_fence_ready(&request, &handle));
 		UT_ASSERT(cluster_ko_peer_commit_v3(request.base.origin_node, request.base.epoch,
 			request.base.origin_boot, request.base.peer_boot, request.base.batch_id));
 	}
 	request.base.batch_id++;
+	request.base.key.locator.relNumber++;
 	UT_ASSERT(!cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
 	request.base.batch_id = 400;
+	request.base.key.locator.relNumber = local_scan_rel_number = 99;
 	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
 	UT_ASSERT_EQ(state, CLUSTER_KO_PEER_FENCE_COMMITTED);
 }
@@ -7739,6 +7744,7 @@ UT_TEST(test_peer_fence_terminal_gc_requires_local_quiescence)
 
 	for (int i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
 		request.base.batch_id = 1100 + i;
+		request.base.key.locator.relNumber = local_scan_rel_number = 99 + i;
 		UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
 		UT_ASSERT(fixture_completed_fence_ready(&request, &handle));
 		UT_ASSERT(cluster_ko_peer_commit_v3(request.base.origin_node, request.base.epoch,
@@ -7748,6 +7754,7 @@ UT_TEST(test_peer_fence_terminal_gc_requires_local_quiescence)
 		fixture_peer_reply_accepted(&storage.peer_fences[handle.slot]);
 	}
 	request.base.batch_id = 1100;
+	request.base.key.locator.relNumber = local_scan_rel_number = 99;
 	UT_ASSERT(storage.peer_fences[0].state == CLUSTER_KO_PEER_FENCE_COMMITTED);
 	UT_ASSERT(cluster_ko_peer_fence_gc_tick_v3());
 	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_EMPTY);
@@ -7763,6 +7770,7 @@ UT_TEST(test_peer_fence_rollback_gc_requires_exact_absent_holder)
 
 	for (int i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
 		request.base.batch_id = 1200 + i;
+		request.base.key.locator.relNumber = local_scan_rel_number = 99 + i;
 		UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
 		UT_ASSERT(fixture_completed_fence_ready(&request, &handle));
 		storage.peer_fences[handle.slot].physical_applied = true;
@@ -7776,6 +7784,7 @@ UT_TEST(test_peer_fence_rollback_gc_requires_exact_absent_holder)
 		}
 	}
 	request.base.batch_id = 1200;
+	request.base.key.locator.relNumber = local_scan_rel_number = 99;
 	handle.slot = 0;
 	handle.serial = storage.peer_fences[0].serial;
 	holder_probe_sends = 0;
@@ -7947,6 +7956,8 @@ UT_TEST(test_holder_gc_commit_consumes_exact_completed_query)
 				ClusterKoPeerFenceHandleV3 h;
 				ClusterKoPeerFenceStateV3 state;
 				request.base.batch_id += 100;
+				request.base.key.locator.relNumber++;
+				local_scan_rel_number = request.base.key.locator.relNumber;
 				UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &h, &state));
 				UT_ASSERT_EQ(h.slot, 0);
 				UT_ASSERT(fixture_completed_fence_ready(&request, &h));
