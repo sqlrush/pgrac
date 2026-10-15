@@ -103,6 +103,16 @@ cluster_undo_recovery_origin_authorized_v1(int origin_node)
 		   && undo_scope_current(active_scope);
 }
 
+bool
+cluster_undo_recovery_cold_origin_authorized_v1(int origin_node)
+{
+	return cluster_undo_recovery_origin_authorized_v1(origin_node)
+		   && active_scope->authority->serial_guard->mode == CLUSTER_RECOVERY_SERIAL_COLD_FORMED
+		   && rf_side_online_plan_recovery_source_matches_v1(
+			   active_scope->plan, active_scope->duty.system_identifier,
+			   active_scope->duty.storage_uuid, &active_scope->cut);
+}
+
 int
 cluster_undo_recovery_path_resolve_v1(uint8 owner, uint32 segment, char *path, size_t size)
 {

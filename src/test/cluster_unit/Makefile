@@ -473,6 +473,7 @@ TESTS += test_cluster_undo_native_lifecycle
 TESTS += test_cluster_undo_recovery
 TESTS += test_cluster_remote_xact_directory
 TESTS += test_cluster_multixact_recovery
+TESTS += test_cluster_clog_recovery
 TESTS += test_cluster_space_reservation
 TESTS += test_cluster_recovery_namespace
 TESTS += test_cluster_recovery_heap_scan
@@ -4120,6 +4121,15 @@ test_cluster_multixact_recovery test_cluster_multixact_limits_io: %: %.c unit_te
 		$(top_srcdir)/src/backend/access/transam/slru.c \
 		$(top_srcdir)/src/backend/cluster/cluster_mxid_stripe.c \
 		$(top_srcdir)/src/backend/cluster/cluster_xid_authority.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
+# PGRAC: original-origin CLOG against real disposable native SLRU files.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_clog_recovery: test_cluster_clog_recovery.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/clog.c \
+		$(top_srcdir)/src/include/access/clog.h \
+		$(top_srcdir)/src/backend/access/transam/slru.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 

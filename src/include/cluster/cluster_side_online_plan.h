@@ -132,6 +132,12 @@ extern bool rf_side_online_plan_source_matches_v1(const RfSideOnlinePlanV1 *plan
 												  uint64 system_identifier,
 												  const uint8 storage_uuid[16],
 												  const RfContributorStreamCutV1 *cut);
+/* Same complete source check, additionally rejecting inspect-only plans.
+ * This is a plan-purpose check, never independent mutation authority. */
+extern bool rf_side_online_plan_recovery_source_matches_v1(const RfSideOnlinePlanV1 *plan,
+														   uint64 system_identifier,
+														   const uint8 storage_uuid[16],
+														   const RfContributorStreamCutV1 *cut);
 /* UINT32_MAX for an invalid or unsealed plan. */
 extern uint32 rf_side_online_plan_participant_count_v1(const RfSideOnlinePlanV1 *plan);
 /* The physical lower alone must not authorize replay of retained history. */

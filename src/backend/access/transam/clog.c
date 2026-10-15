@@ -48,8 +48,14 @@
 #include "storage/sync.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_native_startup.h"
+#include "cluster/cluster_undo_recovery.h"
+#include "storage/fd.h"
+#include "storage/shmem.h"
 #endif
 
 /*
@@ -100,6 +106,15 @@ StaticAssertDecl(CLOG_XACTS_PER_PAGE == CLUSTER_NATIVE_CLOG_PER_PAGE,
 static SlruCtlData XactCtlData;
 
 #define XactCtl (&XactCtlData)
+
+#ifdef USE_PGRAC_CLUSTER
+#define CLOG_RECOVERY_ORIGINS 128
+#define CLOG_RECOVERY_BUFFERS 2
+static SlruCtlData ClogRecoveryCtl[CLOG_RECOVERY_ORIGINS];
+static LWLockPadded *ClogRecoveryLocks;
+
+static void clog_recovery_shmem_init(void);
+#endif
 
 
 static int	ZeroCLOGPage(int pageno, bool writeXlog);
@@ -747,13 +762,330 @@ CLOGShmemBuffers(void)
 	return Min(128, Max(4, NBuffers / 512));
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Only the original startup owner may restore a failed origin's native bits.
+ * Its complete terminal WAL, base/era and serialization proofs remain caller
+ * obligations; this storage API cannot turn an observed xid into authority. */
+static bool
+clog_recovery_permitted(int origin)
+{
+	return cluster_shared_config && InRecovery && AmStartupProcess() && origin >= 0
+		   && origin < CLOG_RECOVERY_ORIGINS && origin != cluster_node_id
+		   && ClogRecoveryLocks != NULL && ClogRecoveryCtl[origin].shared != NULL
+		   && cluster_undo_recovery_cold_origin_authorized_v1(origin);
+}
+
+static void
+clog_recovery_cache_discard(SlruCtl ctl)
+{
+	SlruShared shared = ctl->shared;
+
+	if (!LWLockHeldByMe(shared->ControlLock))
+		LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
+	for (int slot = 0; slot < shared->num_slots; slot++) {
+		if ((shared->page_status[slot] == SLRU_PAGE_READ_IN_PROGRESS
+			 || shared->page_status[slot] == SLRU_PAGE_WRITE_IN_PROGRESS)
+			&& LWLockHeldByMe(&shared->buffer_locks[slot].lock))
+			LWLockRelease(&shared->buffer_locks[slot].lock);
+		shared->page_status[slot] = SLRU_PAGE_EMPTY;
+		shared->page_dirty[slot] = false;
+	}
+	LWLockRelease(shared->ControlLock);
+}
+
+static bool
+clog_recovery_directory_ready(int origin)
+{
+	const char *children[3] = { "native_side", NULL, "pg_xact" };
+	int dirs[4] = { -1, -1, -1, -1 };
+	char origin_name[32];
+	char expected[MAXPGPATH];
+	struct stat st, routed;
+	int length;
+	bool ok = false;
+
+	if (!clog_recovery_permitted(origin) || cluster_shared_data_dir == NULL
+		|| cluster_shared_data_dir[0] != '/')
+		return false;
+	snprintf(origin_name, sizeof(origin_name), "origin_%d", origin);
+	children[1] = origin_name;
+	length = snprintf(expected, sizeof(expected), "%s/native_side/%s/pg_xact",
+					  cluster_shared_data_dir, origin_name);
+	if (length < 0 || length >= sizeof(expected)
+		|| strcmp(expected, ClogRecoveryCtl[origin].Dir) != 0)
+		return false;
+	dirs[0] = open(cluster_shared_data_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (dirs[0] < 0)
+		goto done;
+	for (int i = 1; i < 4; i++) {
+		dirs[i]
+			= openat(dirs[i - 1], children[i - 1], O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+		if (dirs[i] < 0)
+			goto done;
+	}
+	for (int i = 0; i < 4; i++)
+		if (fstat(dirs[i], &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != geteuid()
+			|| (st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+			goto done;
+	if (lstat(expected, &routed) != 0 || !S_ISDIR(routed.st_mode) || routed.st_dev != st.st_dev
+		|| routed.st_ino != st.st_ino)
+		goto done;
+	ok = true;
+done:
+	for (int i = 3; i >= 0; i--)
+		if (dirs[i] >= 0 && close(dirs[i]) != 0)
+			ok = false;
+	/* Revalidation can ERROR; do not keep raw directory FDs across it. */
+	return ok && clog_recovery_permitted(origin);
+}
+
+/* Terminal replay requires a real complete page. Only a separate, proved
+ * native ZERO/TRUNCATE owner may justify an absent base. */
+static bool
+clog_recovery_page_identity(SlruCtl ctl, int page, struct stat *out)
+{
+	char path[MAXPGPATH];
+	int length = snprintf(path, sizeof(path), "%s/%04X", ctl->Dir, page / SLRU_PAGES_PER_SEGMENT);
+
+	return length >= 0 && length < sizeof(path) && lstat(path, out) == 0 && S_ISREG(out->st_mode)
+		   && out->st_nlink == 1 && out->st_uid == geteuid()
+		   && (out->st_mode & (S_IWGRP | S_IWOTH)) == 0
+		   && out->st_size >= (off_t)(page % SLRU_PAGES_PER_SEGMENT + 1) * BLCKSZ;
+}
+
+static bool
+clog_recovery_same_file(const struct stat *before, const struct stat *after)
+{
+	return before->st_dev == after->st_dev && before->st_ino == after->st_ino
+		   && before->st_size == after->st_size;
+}
+
+typedef enum ClogRecoveryAccess {
+	CLOG_RECOVERY_PREFLIGHT,
+	CLOG_RECOVERY_WRITE,
+	CLOG_RECOVERY_VERIFY
+} ClogRecoveryAccess;
+
+static bool
+clog_recovery_status(SlruCtl ctl, int slot, TransactionId xid, XidStatus status,
+					 ClogRecoveryAccess access)
+{
+	uint8 *byte = (uint8 *)ctl->shared->page_buffer[slot] + TransactionIdToByte(xid);
+	int shift = TransactionIdToBIndex(xid) * CLOG_BITS_PER_XACT;
+	XidStatus current = (*byte >> shift) & CLOG_XACT_BITMASK;
+
+	if (access == CLOG_RECOVERY_VERIFY)
+		return current == status;
+	/* As in native replay, a completed child is never demoted by its
+	 * SUB_COMMITTED phase. Conflicting terminals are runtime refusals. */
+	if (status == TRANSACTION_STATUS_SUB_COMMITTED && current == TRANSACTION_STATUS_COMMITTED)
+		return true;
+	if (current != TRANSACTION_STATUS_IN_PROGRESS && current != TRANSACTION_STATUS_SUB_COMMITTED
+		&& current != status)
+		return false;
+	if (access == CLOG_RECOVERY_WRITE) {
+		*byte = (*byte & ~(CLOG_XACT_BITMASK << shift)) | (status << shift);
+		ctl->shared->page_dirty[slot] = true;
+	}
+	return true;
+}
+
+static bool
+clog_recovery_page(int origin, int page, TransactionId top, int count,
+				   const TransactionId *children, XidStatus status, ClogRecoveryAccess access)
+{
+	SlruCtl ctl = &ClogRecoveryCtl[origin];
+	struct stat before, after;
+	FileTag tag;
+	char path[MAXPGPATH];
+	int slot;
+	bool ok;
+
+	clog_recovery_cache_discard(ctl);
+	if (!clog_recovery_directory_ready(origin) || !clog_recovery_page_identity(ctl, page, &before))
+		return false;
+	LWLockAcquire(ctl->shared->ControlLock, LW_EXCLUSIVE);
+	slot = SimpleLruReadPage(ctl, page, true, top);
+	ok = clog_recovery_permitted(origin) && clog_recovery_page_identity(ctl, page, &after)
+		 && clog_recovery_same_file(&before, &after);
+	if (ok && TransactionIdIsValid(top))
+		ok = clog_recovery_status(ctl, slot, top, status, access);
+	for (int i = 0; ok && i < count; i++)
+		ok = clog_recovery_status(ctl, slot, children[i], status, access);
+	if (ok && access == CLOG_RECOVERY_WRITE) {
+		ok = clog_recovery_permitted(origin) && clog_recovery_page_identity(ctl, page, &after)
+			 && clog_recovery_same_file(&before, &after);
+		if (ok)
+			SimpleLruWritePage(ctl, slot);
+	}
+	LWLockRelease(ctl->shared->ControlLock);
+	if (!ok)
+		return false;
+	if (access == CLOG_RECOVERY_WRITE) {
+		memset(&tag, 0, sizeof(tag));
+		tag.segno = page / SLRU_PAGES_PER_SEGMENT;
+		if (!clog_recovery_permitted(origin) || SlruSyncFileTag(ctl, &tag, path) != 0)
+			return false;
+	}
+	return clog_recovery_directory_ready(origin) && clog_recovery_page_identity(ctl, page, &after)
+		   && clog_recovery_same_file(&before, &after);
+}
+
+static bool
+clog_recovery_children(int origin, int count, const TransactionId *children, XidStatus status,
+					   ClogRecoveryAccess access)
+{
+	for (int first = 0; first < count;) {
+		int last = first + 1;
+		int page = TransactionIdToPage(children[first]);
+
+		while (last < count && TransactionIdToPage(children[last]) == page)
+			last++;
+		if (!clog_recovery_page(origin, page, InvalidTransactionId, last - first, children + first,
+								status, access))
+			return false;
+		first = last;
+	}
+	return true;
+}
+
+static bool
+clog_recovery_tree(int origin, TransactionId xid, int count, const TransactionId *children,
+				   XidStatus status, bool verify)
+{
+	int page = TransactionIdToPage(xid);
+	int same = 0;
+	ClogRecoveryAccess access = verify ? CLOG_RECOVERY_VERIFY : CLOG_RECOVERY_PREFLIGHT;
+	const TransactionId *other;
+
+	while (same < count && TransactionIdToPage(children[same]) == page)
+		same++;
+	other = count > same ? children + same : NULL;
+	/* Preflight the whole tree before any terminal mutation. This is not
+	 * a replacement for complete WAL/base/era proof by the recovery owner. */
+	if (!clog_recovery_page(origin, page, xid, same, children, status, access)
+		|| !clog_recovery_children(origin, count - same, other, status, access))
+		return false;
+	if (verify)
+		return true;
+	if (status == TRANSACTION_STATUS_COMMITTED
+		&& !clog_recovery_children(origin, count - same, other, TRANSACTION_STATUS_SUB_COMMITTED,
+								   CLOG_RECOVERY_WRITE))
+		return false;
+	if (!clog_recovery_page(origin, page, xid, same, children, status, CLOG_RECOVERY_WRITE)
+		|| !clog_recovery_children(origin, count - same, other, status, CLOG_RECOVERY_WRITE))
+		return false;
+	fsync_fname(ClogRecoveryCtl[origin].Dir, true);
+	return clog_recovery_directory_ready(origin)
+		   && clog_recovery_tree(origin, xid, count, children, status, true);
+}
+
+static bool
+clog_recovery_access(int origin, TransactionId xid, int nsubxids, const TransactionId *subxids,
+					 XidStatus status, bool verify)
+{
+	volatile bool locked = false;
+	volatile bool ok = false;
+	LWLock *lock;
+	TransactionId previous = xid;
+
+	if (!clog_recovery_permitted(origin) || !TransactionIdIsNormal(xid) || nsubxids < 0
+		|| nsubxids > PG_INT32_MAX / (int)sizeof(TransactionId) || (nsubxids > 0 && subxids == NULL)
+		|| (status != TRANSACTION_STATUS_COMMITTED && status != TRANSACTION_STATUS_ABORTED))
+		return false;
+	for (int i = 0; i < nsubxids; i++) {
+		if (!TransactionIdIsNormal(subxids[i]) || !TransactionIdPrecedes(previous, subxids[i])
+			|| !TransactionIdPrecedes(xid, subxids[i]))
+			return false;
+		previous = subxids[i];
+	}
+	lock = &ClogRecoveryLocks[origin * 2 + 1].lock;
+	PG_TRY();
+	{
+		LWLockAcquire(lock, LW_EXCLUSIVE);
+		locked = true;
+		clog_recovery_cache_discard(&ClogRecoveryCtl[origin]);
+		if (clog_recovery_directory_ready(origin))
+			ok = clog_recovery_tree(origin, xid, nsubxids, subxids, status, verify);
+	}
+	PG_FINALLY();
+	{
+		if (locked) {
+			clog_recovery_cache_discard(&ClogRecoveryCtl[origin]);
+			LWLockRelease(lock);
+		}
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+/* Persist only the failed origin's native terminal bits. The local SLRU,
+ * allocation counters, TT, remote projection and serving gates are untouched.
+ * Author: SqlRush <sqlrush@gmail.com> */
+bool
+cluster_clog_native_recovery_apply_v1(int origin, TransactionId xid, int nsubxids,
+									  const TransactionId *subxids, XidStatus status)
+{
+	return clog_recovery_access(origin, xid, nsubxids, subxids, status, false);
+}
+
+/* An independent empty-cache disk readback, not a visibility certificate. */
+bool
+cluster_clog_native_recovery_verify_v1(int origin, TransactionId xid, int nsubxids,
+									   const TransactionId *subxids, XidStatus status)
+{
+	return clog_recovery_access(origin, xid, nsubxids, subxids, status, true);
+}
+
+static void
+clog_recovery_shmem_init(void)
+{
+	bool found;
+
+	ClogRecoveryLocks = ShmemInitStruct("CLOG recovery locks",
+										2 * CLOG_RECOVERY_ORIGINS * sizeof(LWLockPadded), &found);
+	for (int origin = 0; origin < CLOG_RECOVERY_ORIGINS; origin++) {
+		SlruCtl ctl = &ClogRecoveryCtl[origin];
+		LWLock *lock = &ClogRecoveryLocks[origin * 2].lock;
+		char name[64], path[MAXPGPATH];
+		int length;
+
+		if (!found) {
+			LWLockInitialize(lock, LWTRANCHE_XACT_BUFFER);
+			LWLockInitialize(&ClogRecoveryLocks[origin * 2 + 1].lock, LWTRANCHE_XACT_BUFFER);
+		}
+		if (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] != '/')
+			ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("shared CLOG recovery requires an absolute shared root")));
+		length = snprintf(path, sizeof(path), "%s/native_side/origin_%d/pg_xact",
+						  cluster_shared_data_dir, origin);
+		if (length < 0 || length >= sizeof(path) - 16)
+			ereport(FATAL, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+							errmsg("shared CLOG recovery path is too long")));
+		snprintf(name, sizeof(name), "CLOG recovery %d", origin);
+		ctl->PagePrecedes = CLOGPagePrecedes;
+		SimpleLruInit(ctl, name, CLOG_RECOVERY_BUFFERS, 0, lock, path, LWTRANCHE_XACT_BUFFER,
+					  SYNC_HANDLER_NONE);
+	}
+}
+#endif
+
 /*
  * Initialization of shared memory for CLOG
  */
 Size
 CLOGShmemSize(void)
 {
-	return SimpleLruShmemSize(CLOGShmemBuffers(), CLOG_LSNS_PER_PAGE);
+	Size size = SimpleLruShmemSize(CLOGShmemBuffers(), CLOG_LSNS_PER_PAGE);
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config) {
+		size = add_size(
+			size, mul_size(CLOG_RECOVERY_ORIGINS, SimpleLruShmemSize(CLOG_RECOVERY_BUFFERS, 0)));
+		size = add_size(size, mul_size(2 * CLOG_RECOVERY_ORIGINS, sizeof(LWLockPadded)));
+	}
+#endif
+	return size;
 }
 
 void
@@ -764,6 +1096,10 @@ CLOGShmemInit(void)
 				  XactSLRULock, "pg_xact", LWTRANCHE_XACT_BUFFER,
 				  SYNC_HANDLER_CLOG);
 	SlruPagePrecedesUnitTests(XactCtl, CLOG_XACTS_PER_PAGE);
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config)
+		clog_recovery_shmem_init();
+#endif
 }
 
 /*

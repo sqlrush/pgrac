@@ -1063,6 +1063,16 @@ rf_side_online_plan_source_matches_v1(const RfSideOnlinePlanV1 *plan, uint64 sys
 		   && cut->scan_end_exclusive == source->scan_end_exclusive;
 }
 
+bool
+rf_side_online_plan_recovery_source_matches_v1(const RfSideOnlinePlanV1 *plan,
+											   uint64 system_identifier,
+											   const uint8 storage_uuid[16],
+											   const RfContributorStreamCutV1 *cut)
+{
+	return rf_side_online_plan_source_matches_v1(plan, system_identifier, storage_uuid, cut)
+		   && plan->purpose == RF_SIDE_PLAN_RECOVERY;
+}
+
 static RfPageProofDetailV1
 side_plan_prepare_space(const RfSideOnlinePlanV1 *plan, const ClusterSpaceIdentityKey *expected,
 						const void *identity_page, const void *reservation_page, uint32 *order,

@@ -25,7 +25,7 @@ char *DataDir = "/recoverer/local";
 static ClusterConf conf;
 ClusterConf *ClusterConfShmem = &conf;
 
-static bool source_ok, storage_ok;
+static bool source_ok, storage_ok, recovery_purpose;
 static uint64 system_id;
 static uint8 storage_uuid[16];
 static ClusterThreadRecoveryAuthorityResultV1 authority_result;
@@ -88,6 +88,14 @@ cluster_shared_fs_undo_path_resolve(uint8 owner, uint32 segment, char *path, siz
 	path_calls++;
 	length = snprintf(path, size, "/shared/pg_undo/instance_%u/seg_%u.dat", owner - 1, segment);
 	return length < 0 || (size_t)length >= size ? -1 : 0;
+}
+
+bool
+rf_side_online_plan_recovery_source_matches_v1(const RfSideOnlinePlanV1 *p, uint64 sysid,
+											   const uint8 uuid[16],
+											   const RfContributorStreamCutV1 *cut)
+{
+	return recovery_purpose && rf_side_online_plan_source_matches_v1(p, sysid, uuid, cut);
 }
 
 bool
@@ -183,7 +191,7 @@ reset_authority(void)
 	memset(&token, 0, sizeof(token));
 	memset(&serial, 0, sizeof(serial));
 	memset(&authority, 0, sizeof(authority));
-	source_ok = storage_ok = true;
+	source_ok = storage_ok = recovery_purpose = true;
 	conf.node_count = 4;
 	cluster_enabled = cluster_undo_gcs_coherence = true;
 	system_id = 123;
@@ -397,10 +405,35 @@ UT_TEST(test_multixact_retirement_evidence_requires_current_original_scope)
 	cluster_undo_recovery_scope_leave_v1(&scope);
 }
 
+UT_TEST(test_cold_native_scope_requires_cold_mode_and_executable_plan)
+{
+	ClusterUndoRecoveryScopeV1 scope = { 0 };
+
+	reset_authority();
+	UT_ASSERT(!cluster_undo_recovery_cold_origin_authorized_v1(2));
+	UT_ASSERT(cluster_undo_recovery_scope_enter_v1(&scope, &authority, plan));
+	UT_ASSERT(!cluster_undo_recovery_cold_origin_authorized_v1(2));
+	serial.mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+	UT_ASSERT(cluster_undo_recovery_cold_origin_authorized_v1(2));
+	UT_ASSERT(!cluster_undo_recovery_cold_origin_authorized_v1(1));
+	recovery_purpose = false;
+	UT_ASSERT(!cluster_undo_recovery_cold_origin_authorized_v1(2));
+	recovery_purpose = true;
+	authority_result = CLUSTER_THREAD_AUTHORITY_FENCE_STALE;
+	UT_ASSERT(!cluster_undo_recovery_cold_origin_authorized_v1(2));
+	authority_result = CLUSTER_THREAD_AUTHORITY_OK;
+	root.validated_tail_lsn_exclusive++;
+	UT_ASSERT(!cluster_undo_recovery_cold_origin_authorized_v1(2));
+	root.validated_tail_lsn_exclusive--;
+	cluster_undo_recovery_scope_leave_v1(&scope);
+	UT_ASSERT(!cluster_undo_recovery_cold_origin_authorized_v1(2));
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
+	UT_RUN(test_cold_native_scope_requires_cold_mode_and_executable_plan);
 	UT_RUN(test_native_fsync_closes_only_the_canonical_write_obligation);
 	UT_RUN(test_native_directory_creation_uses_same_qualified_namespace);
 	UT_RUN(test_cached_native_fd_rechecks_recovery_authority);

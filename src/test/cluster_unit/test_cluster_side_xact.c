@@ -3525,6 +3525,7 @@ UT_TEST(test_sealed_source_match_requires_observed_namespace_and_exact_cut)
 	UT_ASSERT(!rf_side_online_plan_source_matches_v1(p, UINT64_C(0x11223344), uuid, &cut));
 	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(p), RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT(rf_side_online_plan_source_matches_v1(p, UINT64_C(0x11223344), uuid, &cut));
+	UT_ASSERT(rf_side_online_plan_recovery_source_matches_v1(p, UINT64_C(0x11223344), uuid, &cut));
 	for (int fault = 0; fault < 6; fault++) {
 		RfContributorStreamCutV1 bad = cut;
 		if (fault == 0)
@@ -3540,6 +3541,8 @@ UT_TEST(test_sealed_source_match_requires_observed_namespace_and_exact_cut)
 		if (fault == 5)
 			uuid[0] ^= 1;
 		UT_ASSERT(!rf_side_online_plan_source_matches_v1(p, UINT64_C(0x11223344), uuid, &bad));
+		UT_ASSERT(
+			!rf_side_online_plan_recovery_source_matches_v1(p, UINT64_C(0x11223344), uuid, &bad));
 	}
 	rf_side_online_plan_destroy_v1(&p);
 	p = space_online_plan(200);
@@ -3549,6 +3552,23 @@ UT_TEST(test_sealed_source_match_requires_observed_namespace_and_exact_cut)
 	memset(uuid, 0x44, sizeof(uuid));
 	UT_ASSERT(!rf_side_online_plan_source_matches_v1(p, UINT64_C(0x11223344), uuid, &cut));
 	rf_side_online_plan_destroy_v1(&p);
+	{
+		RfSideOnlinePlanRequestV1 request = { 0 };
+		request.system_identifier = UINT64_C(0x11223344);
+		memcpy(request.storage_uuid, uuid, 16);
+		request.physical_cuts = &cut;
+		request.participant_count = 1;
+		request.purpose = RF_SIDE_PLAN_PI_CONTRIBUTIONS;
+		UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &p), RF_PAGE_PROOF_DETAIL_OK);
+		make_undo_delta(&fake);
+		undo_header_feed(p, &fake, 100);
+		UT_ASSERT(rf_side_online_plan_bind_database_v1(p, 42));
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(p), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(rf_side_online_plan_source_matches_v1(p, UINT64_C(0x11223344), uuid, &cut));
+		UT_ASSERT(
+			!rf_side_online_plan_recovery_source_matches_v1(p, UINT64_C(0x11223344), uuid, &cut));
+		rf_side_online_plan_destroy_v1(&p);
+	}
 }
 
 UT_TEST(test_multixact_retired_page_requires_exact_later_sealed_truncate)
