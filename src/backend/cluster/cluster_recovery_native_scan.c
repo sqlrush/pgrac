@@ -15,6 +15,7 @@
 #include "access/clog.h"
 #include "access/commit_ts.h"
 #include "access/multixact.h"
+#include "access/twophase_rmgr.h"
 #include "catalog/storage_xlog.h"
 #include "catalog/pg_tablespace_d.h"
 #include "common/relmap.h"
@@ -42,6 +43,7 @@ struct ClusterRecoveryNativeScan {
 	ClusterUndoDecoded undo;
 	unsigned region;
 	uint32 ordinal;
+	uint32 prepared_cursor, prepared_ordinal;
 	bool primary_returned;
 	char *payload; /* MAXALIGNed bytes in the same allocation */
 };
@@ -289,6 +291,99 @@ native_multixact(ClusterRecoveryNativeScan *scan, uint8 opcode)
 	return CLUSTER_RECOVERY_NATIVE_UNSUPPORTED;
 }
 
+/* Bound each original StartPrepare segment before deriving its pointer.
+ * MAXALIGN padding is owned too, but is not interpreted as an array item. */
+static bool
+native_prepare_region(ClusterRecoveryNativeScan *scan, size_t *at, unsigned region,
+					  ClusterRecoveryNativeKind kind, int32 count, size_t width)
+{
+	size_t remaining = scan->record.payload_length - *at;
+	size_t bytes, aligned;
+
+	if (count < 0 || (size_t)count > remaining / width)
+		return false;
+	bytes = (size_t)count * width;
+	aligned = MAXALIGN(bytes);
+	if (aligned < bytes || aligned > remaining)
+		return false;
+	scan->regions[region] = (NativeRegion){ kind, scan->payload + *at, count, width };
+	*at += aligned;
+	return true;
+}
+
+/* Observe the complete native envelope, never run two-phase callbacks or
+ * infer a terminal from PREPARE. Resource-manager payloads (including TT)
+ * remain opaque until their own complete semantic consumer validates them. */
+static ClusterRecoveryNativeResult
+native_prepare(ClusterRecoveryNativeScan *scan)
+{
+	ClusterRecoveryNativeRecord *record = &scan->record;
+	xl_xact_prepare header;
+	size_t at = MAXALIGN(sizeof(header));
+	size_t length = record->payload_length;
+	const char *gid;
+
+	if (length < at || (uint8)scan->payload[offsetof(xl_xact_prepare, initfileinval)] > 1)
+		return CLUSTER_RECOVERY_NATIVE_SHAPE;
+	memcpy(&header, scan->payload, sizeof(header));
+	if (header.magic != TWOPHASE_MAGIC
+		|| (uint64)header.total_len != (uint64)length + sizeof(pg_crc32c)
+		|| !TransactionIdIsNormal(header.xid) || header.xid != record->header.xl_xid
+		|| !OidIsValid(header.database) || !OidIsValid(header.owner) || header.gidlen == 0
+		|| header.gidlen > GIDSIZE || MAXALIGN((size_t)header.gidlen) > length - at)
+		return CLUSTER_RECOVERY_NATIVE_SHAPE;
+	gid = scan->payload + at;
+	if (gid[header.gidlen - 1] != '\0' || memchr(gid, '\0', header.gidlen - 1) != NULL)
+		return CLUSTER_RECOVERY_NATIVE_SHAPE;
+	record->prepared_gid_offset = at;
+	record->prepared_gid_length = header.gidlen;
+	at += MAXALIGN((size_t)header.gidlen);
+	record->subxacts_offset = header.nsubxacts > 0 ? at : 0;
+	if (!native_prepare_region(scan, &at, 0, CLUSTER_RECOVERY_NATIVE_PREPARE_SUBXACT,
+							   header.nsubxacts, sizeof(TransactionId))
+		|| !native_prepare_region(scan, &at, 1, CLUSTER_RECOVERY_NATIVE_PREPARE_COMMIT_RELATION,
+								  header.ncommitrels, sizeof(RelFileLocator))
+		|| !native_prepare_region(scan, &at, 2, CLUSTER_RECOVERY_NATIVE_PREPARE_ABORT_RELATION,
+								  header.nabortrels, sizeof(RelFileLocator))
+		|| !native_prepare_region(scan, &at, 3, CLUSTER_RECOVERY_NATIVE_PREPARE_COMMIT_STATS,
+								  header.ncommitstats, sizeof(xl_xact_stats_item))
+		|| !native_prepare_region(scan, &at, 4, CLUSTER_RECOVERY_NATIVE_PREPARE_ABORT_STATS,
+								  header.nabortstats, sizeof(xl_xact_stats_item))
+		|| !native_prepare_region(scan, &at, 5, CLUSTER_RECOVERY_NATIVE_PREPARE_INVALIDATION,
+								  header.ninvalmsgs, sizeof(SharedInvalidationMessage)))
+		return CLUSTER_RECOVERY_NATIVE_SHAPE;
+	record->prepared_resources_offset = at;
+	scan->prepared_cursor = at;
+	while (at < length) {
+		TwoPhaseRecordOnDisk resource;
+		size_t aligned;
+		if (MAXALIGN(sizeof(resource)) > length - at)
+			return CLUSTER_RECOVERY_NATIVE_SHAPE;
+		memcpy(&resource, scan->payload + at, sizeof(resource));
+		at += MAXALIGN(sizeof(resource));
+		if (resource.rmid == TWOPHASE_RM_END_ID) {
+			if (resource.len != 0 || resource.info != 0 || at != length)
+				return CLUSTER_RECOVERY_NATIVE_SHAPE;
+			scan->primary = CLUSTER_RECOVERY_NATIVE_PREPARE;
+			record->top_xid = header.xid;
+			record->database = header.database;
+			record->nsubxacts = header.nsubxacts;
+			record->xact_time = header.prepared_at;
+			record->relcache_init_file = header.initfileinval;
+			record->origin = (xl_xact_origin){ header.origin_lsn, header.origin_timestamp };
+			return CLUSTER_RECOVERY_NATIVE_MORE;
+		}
+		if (resource.rmid > TWOPHASE_RM_MAX_ID)
+			return CLUSTER_RECOVERY_NATIVE_UNSUPPORTED;
+		aligned = MAXALIGN((size_t)resource.len);
+		if (aligned < resource.len || aligned > length - at)
+			return CLUSTER_RECOVERY_NATIVE_SHAPE;
+		at += aligned;
+		record->prepared_resource_count++;
+	}
+	return CLUSTER_RECOVERY_NATIVE_SHAPE; /* missing END, never an empty plan */
+}
+
 static ClusterRecoveryNativeResult
 native_commit(ClusterRecoveryNativeScan *scan)
 {
@@ -387,6 +482,8 @@ native_parse(ClusterRecoveryNativeScan *scan, XLogReaderState *reader)
 	if (record->header.xl_rmid != RM_XACT_ID)
 		return CLUSTER_RECOVERY_NATIVE_UNSUPPORTED;
 	switch (opcode) {
+	case XLOG_XACT_PREPARE:
+		return native_prepare(scan);
 	case XLOG_XACT_COMMIT:
 	case XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO:
 		return native_commit(scan);
@@ -561,6 +658,21 @@ cluster_recovery_native_scan_next(ClusterRecoveryNativeScan *scan, ClusterRecove
 		}
 		scan->region++;
 		scan->ordinal = 0;
+	}
+	if (scan->primary == CLUSTER_RECOVERY_NATIVE_PREPARE
+		&& scan->prepared_cursor < scan->record.payload_length) {
+		TwoPhaseRecordOnDisk resource;
+		/* Every header/body, aligned length and the final sentinel were
+		 * bounded before begin exported this immutable owned payload. */
+		memcpy(&resource, scan->payload + scan->prepared_cursor, sizeof(resource));
+		out->kind = resource.rmid == TWOPHASE_RM_END_ID ? CLUSTER_RECOVERY_NATIVE_PREPARE_END
+														: CLUSTER_RECOVERY_NATIVE_PREPARE_RESOURCE;
+		out->ordinal = scan->prepared_ordinal++;
+		out->record = &scan->record;
+		out->bytes = scan->payload + scan->prepared_cursor;
+		out->length = MAXALIGN(sizeof(resource)) + MAXALIGN((size_t)resource.len);
+		scan->prepared_cursor += out->length;
+		return CLUSTER_RECOVERY_NATIVE_EFFECT;
 	}
 	return CLUSTER_RECOVERY_NATIVE_END;
 }

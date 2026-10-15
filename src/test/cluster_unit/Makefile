@@ -3126,7 +3126,8 @@ RECOVERY_CENSUS_TEST_OBJS = \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_relmap_scan.o \
 		$(top_builddir)/src/backend/cluster/cluster_cr_apply.o
 
-test_cluster_recovery_native_inputs: $(RECOVERY_CENSUS_TEST_OBJS)
+test_cluster_recovery_native_inputs: $(top_srcdir)/src/include/access/twophase_rmgr.h
+test_cluster_recovery_native_inputs: $(RECOVERY_CENSUS_TEST_OBJS) test_cluster_recovery_prepare_fixture.h test_cluster_recovery_prepare_inputs.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_xact_join_inputs.inc test_cluster_recovery_relmap_physical_inputs.inc test_cluster_recovery_relmap_inputs.inc test_cluster_recovery_relmap_fixture.h
 
 test_cluster_control_root test_cluster_recovery_native_inputs: %: %.c test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc test_cluster_control_root_serving.inc \
@@ -9114,6 +9115,10 @@ test_cluster_recovery_relation_scan: test_cluster_recovery_relation_scan.c test_
 		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/backend/cluster/cluster_wal_claim.o cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(LDFLAGS) $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+test_cluster_recovery_native_scan: $(top_srcdir)/src/include/access/twophase_rmgr.h
+
+test_cluster_recovery_native_scan: test_cluster_recovery_prepare_fixture.h test_cluster_recovery_prepare_effects.inc
 
 test_cluster_recovery_native_scan: test_cluster_recovery_relmap_fixture.h test_cluster_recovery_relmap_effects.inc
 

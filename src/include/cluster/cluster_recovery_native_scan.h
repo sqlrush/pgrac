@@ -53,7 +53,16 @@ typedef enum ClusterRecoveryNativeKind {
 	CLUSTER_RECOVERY_NATIVE_COMMIT_TS_ZERO,
 	CLUSTER_RECOVERY_NATIVE_COMMIT_TS_TRUNCATE,
 	CLUSTER_RECOVERY_NATIVE_RELMAP_UPDATE,
-	CLUSTER_RECOVERY_NATIVE_RELMAP_ENTRY
+	CLUSTER_RECOVERY_NATIVE_RELMAP_ENTRY,
+	CLUSTER_RECOVERY_NATIVE_PREPARE,
+	CLUSTER_RECOVERY_NATIVE_PREPARE_SUBXACT,
+	CLUSTER_RECOVERY_NATIVE_PREPARE_COMMIT_RELATION,
+	CLUSTER_RECOVERY_NATIVE_PREPARE_ABORT_RELATION,
+	CLUSTER_RECOVERY_NATIVE_PREPARE_COMMIT_STATS,
+	CLUSTER_RECOVERY_NATIVE_PREPARE_ABORT_STATS,
+	CLUSTER_RECOVERY_NATIVE_PREPARE_INVALIDATION,
+	CLUSTER_RECOVERY_NATIVE_PREPARE_RESOURCE,
+	CLUSTER_RECOVERY_NATIVE_PREPARE_END
 } ClusterRecoveryNativeKind;
 
 /* Exact observed source and bytes, not a claim/cut authentication. Keep this
@@ -78,6 +87,8 @@ typedef struct ClusterRecoveryNativeRecord {
 	uint32 subxacts_offset;			   /* bounded original array within owned payload */
 	uint32 nsubxacts;				   /* membership, not the immediate parent chain */
 	uint32 mappings_offset, nmappings; /* bounded original relmap entries */
+	uint32 prepared_gid_offset, prepared_gid_length;
+	uint32 prepared_resources_offset, prepared_resource_count; /* excludes END */
 	Oid database;
 	Oid tablespace;
 	TimestampTz xact_time;
@@ -124,11 +135,19 @@ typedef struct ClusterRecoveryNativeScan ClusterRecoveryNativeScan;
  * Image CRC/shape acceptance is not authority-format compatibility, pending
  * publication, invalidation completion or RESET proof. */
 
+/* PREPARE keeps both possible outcome arrays separately and every original
+ * rmgr header/body/padding. RESOURCE bytes include the native on-disk header
+ * and aligned body; END is the original sentinel. Known resource bodies are
+ * opaque owner obligations, not validated TT/lock/transaction state. Empty
+ * native GIDs remain observations even if a strict apply owner rejects them.
+ * No callback, pending-state installation, terminal decision or completion
+ * follows. Prepared completion records remain explicitly unsupported. */
+
 /* Borrow an already verified reader only during begin; copy the entire main
  * payload under the explicit budget. No I/O, apply, authority or completion
  * is performed. The native parsers validate the complete shape before any
  * effect can escape. Original undo WAL uses the same owned record and pure
- * decoder/historical shape check. Prepared/unknown records and block
+ * decoder/historical shape check. Prepared completions/unknown records and block
  * components refuse;
  * they require their own complete consumers, never an empty effect list. */
 extern ClusterRecoveryNativeResult

@@ -379,8 +379,7 @@ UT_TEST(test_short_abort_assignment_invalidation_create_refuse)
 UT_TEST(test_prepared_and_unknown_are_not_empty)
 {
 	ClusterRecoveryNativeScan *scan = NULL;
-	uint8 opcodes[]
-		= { XLOG_XACT_PREPARE, XLOG_XACT_COMMIT_PREPARED, XLOG_XACT_ABORT_PREPARED, 0x70 };
+	uint8 opcodes[] = { XLOG_XACT_COMMIT_PREPARED, XLOG_XACT_ABORT_PREPARED, 0x70 };
 
 	for (unsigned i = 0; i < lengthof(opcodes); i++) {
 		terminal(true, 0);
@@ -588,11 +587,12 @@ UT_TEST(test_second_pass_binds_all_source_and_record_bytes)
 #include "test_cluster_recovery_multixact_effects.inc"
 #include "test_cluster_recovery_slru_effects.inc"
 #include "test_cluster_recovery_relmap_effects.inc"
+#include "test_cluster_recovery_prepare_effects.inc"
 
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(40);
 	UT_RUN(test_commit_keeps_every_effect_and_owned_source);
 	UT_RUN(test_abort_keeps_deletions_stats_and_subxact_membership);
 	UT_RUN(test_assignment_retains_real_top_membership);
@@ -626,6 +626,13 @@ main(void)
 	UT_RUN(test_relmap_rejects_every_truncation_and_bad_image);
 	UT_RUN(test_relmap_preserves_original_scope_budget_and_block_gates);
 	UT_RUN(test_relmap_recheck_retains_inactive_bytes_and_is_sticky);
+	UT_RUN(test_prepare_retains_both_outcomes_and_every_owned_resource);
+	UT_RUN(test_prepare_empty_and_max_gid_are_pending_not_terminal);
+	UT_RUN(test_prepare_all_truncations_and_header_count_faults_refuse);
+	UT_RUN(test_prepare_invalid_gid_boolean_resources_and_sentinel_refuse);
+	UT_RUN(test_prepare_source_budget_blocks_and_strict_completion_gates);
+	UT_RUN(test_prepare_full_bytes_rechecked_even_after_drain);
+	UT_RUN(test_prepare_repeated_resources_have_no_projection_cap);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

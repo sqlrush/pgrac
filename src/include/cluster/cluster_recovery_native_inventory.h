@@ -37,9 +37,10 @@ typedef struct ClusterRecoveryNativeInventoryDiag {
 	uint64 native_records;
 	uint64 multixact_records;				/* subset of native_records; no member/status proof */
 	uint64 clog_records, commit_ts_records; /* native observations, not lifecycle proofs */
-	uint64 relmap_records;					/* image observations, not publication proofs */
-	uint64 undo_records;					/* retained observations, not executed undo effects */
-	uint64 other_records;					/* families not yet enumerated by this inventory */
+	uint64 prepare_records; /* raw pending obligations, not prepared/terminal authority */
+	uint64 relmap_records;	/* image observations, not publication proofs */
+	uint64 undo_records;	/* retained observations, not executed undo effects */
+	uint64 other_records;	/* families not yet enumerated by this inventory */
 	uint64 page_targets;
 	uint64 rebuildable_targets;
 	uint64 structural_effects;

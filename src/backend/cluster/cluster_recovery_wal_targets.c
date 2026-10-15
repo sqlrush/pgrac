@@ -227,7 +227,7 @@ cluster_recovery_wal_targets_collect(ClusterRecoveryRootSet *roots, XLogReaderSt
 		|| rmid == RM_COMMIT_TS_ID || rmid == RM_RELMAP_ID
 		|| (rmid == RM_SMGR_ID && opcode == XLOG_SMGR_CREATE)) {
 		if (rmid == RM_MULTIXACT_ID || rmid == RM_CLOG_ID || rmid == RM_COMMIT_TS_ID
-			|| rmid == RM_RELMAP_ID)
+			|| rmid == RM_RELMAP_ID || (rmid == RM_XACT_ID && opcode == XLOG_XACT_PREPARE))
 			diag->unowned_records = 1;
 		if (!targets_native(roots, reader, source, cut, memory_budget, diag))
 			goto fail;

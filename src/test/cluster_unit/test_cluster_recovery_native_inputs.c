@@ -20,6 +20,7 @@ int control_fixture_main(int argc, char **argv);
 #include "../../backend/cluster/cluster_uba.c"
 #include "test_cluster_heap_small_scn.inc"
 #include "test_cluster_recovery_relmap_fixture.h"
+#include "test_cluster_recovery_prepare_fixture.h"
 
 static unsigned inventory_census_calls;
 static void (*inventory_between_passes)(void);
@@ -55,6 +56,7 @@ static XLogRecPtr inventory_mx_start, inventory_mx_previous;
 static XLogRecPtr inventory_slru_start[4], inventory_slru_previous[4];
 static unsigned inventory_slru_fault;
 static unsigned inventory_relmap_fault;
+static unsigned inventory_prepare_fault;
 
 /* These small records stay within the original checkpoint's first WAL page.
  * Header, main-data framing and CRC are actual native-reader inputs. */
@@ -372,6 +374,22 @@ inventory_fixture(bool unsupported, bool open_source)
 			extra = inventory_write_record(&source, extra.exclusive_end, extra.record_start,
 										   RM_RELMAP_ID, opcode, bytes, sizeof(bytes));
 		}
+		if (inventory_extra == 15) {
+			char bytes[TEST_PREPARE_MAX];
+			uint32 length = test_prepare_payload(bytes, true, 13);
+			uint8 opcode = XLOG_XACT_PREPARE;
+			if (inventory_prepare_fault == 1)
+				bytes[length - MAXALIGN(sizeof(TwoPhaseRecordOnDisk))
+					  + offsetof(TwoPhaseRecordOnDisk, rmid)] = 0xff;
+			if (inventory_prepare_fault == 2) {
+				int bad = -1;
+				memcpy(bytes + offsetof(xl_xact_prepare, nabortrels), &bad, sizeof(bad));
+			}
+			if (inventory_prepare_fault == 3)
+				opcode = XLOG_XACT_COMMIT_PREPARED;
+			extra = inventory_write_record(&source, extra.exclusive_end, extra.record_start,
+										   RM_XACT_ID, opcode, bytes, length);
+		}
 		create = inventory_write_record(&source, extra.exclusive_end, extra.record_start,
 										RM_SMGR_ID, XLOG_SMGR_CREATE, &payload, sizeof(payload));
 		if (i == 0) {
@@ -575,8 +593,8 @@ UT_TEST(test_native_inventory_open_unknown_and_online_never_observed)
 		UT_ASSERT(inventory == NULL);
 		if (mode == 0)
 			UT_ASSERT_EQ(diag.input_result, CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
-		if (mode == 1)
-			UT_ASSERT_EQ(diag.native_result, CLUSTER_RECOVERY_NATIVE_UNSUPPORTED);
+		if (mode == 1) /* COMMIT bytes under a now-recognized PREPARE opcode */
+			UT_ASSERT_EQ(diag.native_result, CLUSTER_RECOVERY_NATIVE_SHAPE);
 		cold_census_done(&inputs);
 	}
 }
@@ -665,6 +683,7 @@ cleanup:
 #include "test_cluster_recovery_xact_join_inputs.inc"
 #include "test_cluster_recovery_relmap_inputs.inc"
 #include "test_cluster_recovery_relmap_physical_inputs.inc"
+#include "test_cluster_recovery_prepare_inputs.inc"
 
 int
 main(int argc, char **argv)
@@ -673,7 +692,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(54);
+	UT_PLAN(57);
 	UT_RUN(test_native_inventory_uses_two_real_cold_passes);
 	UT_RUN(test_native_inventory_never_returns_partial_on_drift_io_or_error);
 	UT_RUN(test_native_inventory_capacity_is_not_partial_success);
@@ -728,6 +747,9 @@ main(int argc, char **argv)
 	UT_RUN(test_owned_census_maps_keep_all_copy_edges);
 	UT_RUN(test_owned_census_maps_final_root_and_wal_rechecks);
 	UT_RUN(test_owned_census_bad_map_revokes_all_children);
+	UT_RUN(test_cold_prepare_full_payload_and_polarities_remain_unowned);
+	UT_RUN(test_cold_prepare_two_pass_and_final_drift_revoke_roots);
+	UT_RUN(test_cold_prepare_invalid_or_completion_records_never_become_other);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

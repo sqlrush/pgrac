@@ -300,6 +300,9 @@ inventory_record(XLogReaderState *reader, const ClusterWalSourceRef *source,
 		work->diag.commit_ts_records++;
 	if (XLogRecGetRmid(reader) == RM_RELMAP_ID)
 		work->diag.relmap_records++;
+	if (XLogRecGetRmid(reader) == RM_XACT_ID
+		&& (XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_XACT_PREPARE)
+		work->diag.prepare_records++;
 	record->source_index = work->source_cursor;
 	record->ordinal = ordinal;
 	if (work->tail == NULL)

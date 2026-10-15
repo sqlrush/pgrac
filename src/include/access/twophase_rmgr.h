@@ -14,21 +14,30 @@
 #ifndef TWOPHASE_RMGR_H
 #define TWOPHASE_RMGR_H
 
-typedef void (*TwoPhaseCallback) (TransactionId xid, uint16 info,
-								  void *recdata, uint32 len);
+typedef void (*TwoPhaseCallback)(TransactionId xid, uint16 info, void *recdata, uint32 len);
 typedef uint8 TwoPhaseRmgrId;
+
+/* Original PREPARE WAL/state-file representation, shared with read-only
+ * inspectors. Each header and body is MAXALIGN'd; len excludes the header
+ * and padding. State files append a CRC which is not in the WAL payload. */
+#define TWOPHASE_MAGIC 0x57F94534
+typedef struct TwoPhaseRecordOnDisk {
+	uint32 len;
+	TwoPhaseRmgrId rmid;
+	uint16 info;
+} TwoPhaseRecordOnDisk;
 
 /*
  * Built-in resource managers
  */
-#define TWOPHASE_RM_END_ID			0
-#define TWOPHASE_RM_LOCK_ID			1
-#define TWOPHASE_RM_PGSTAT_ID		2
-#define TWOPHASE_RM_MULTIXACT_ID	3
-#define TWOPHASE_RM_PREDICATELOCK_ID	4
+#define TWOPHASE_RM_END_ID 0
+#define TWOPHASE_RM_LOCK_ID 1
+#define TWOPHASE_RM_PGSTAT_ID 2
+#define TWOPHASE_RM_MULTIXACT_ID 3
+#define TWOPHASE_RM_PREDICATELOCK_ID 4
 /* PGRAC (spec-3.15 D2): cluster TT bindings + SUBCOMMITTED links in 2PC. */
-#define TWOPHASE_RM_CLUSTER_TT_ID	5
-#define TWOPHASE_RM_MAX_ID			TWOPHASE_RM_CLUSTER_TT_ID
+#define TWOPHASE_RM_CLUSTER_TT_ID 5
+#define TWOPHASE_RM_MAX_ID TWOPHASE_RM_CLUSTER_TT_ID
 
 extern PGDLLIMPORT const TwoPhaseCallback twophase_recover_callbacks[];
 extern PGDLLIMPORT const TwoPhaseCallback twophase_postcommit_callbacks[];
@@ -36,7 +45,6 @@ extern PGDLLIMPORT const TwoPhaseCallback twophase_postabort_callbacks[];
 extern PGDLLIMPORT const TwoPhaseCallback twophase_standby_recover_callbacks[];
 
 
-extern void RegisterTwoPhaseRecord(TwoPhaseRmgrId rmid, uint16 info,
-								   const void *data, uint32 len);
+extern void RegisterTwoPhaseRecord(TwoPhaseRmgrId rmid, uint16 info, const void *data, uint32 len);
 
-#endif							/* TWOPHASE_RMGR_H */
+#endif /* TWOPHASE_RMGR_H */

@@ -1117,8 +1117,6 @@ TwoPhaseGetDummyProc(TransactionId xid, bool lock_held)
 /*
  * Header for a 2PC state file
  */
-#define TWOPHASE_MAGIC 0x57F94534 /* format identifier */
-
 typedef xl_xact_prepare TwoPhaseFileHeader;
 
 /*
@@ -1127,11 +1125,7 @@ typedef xl_xact_prepare TwoPhaseFileHeader;
  * NOTE: len counts only the rmgr data, not the TwoPhaseRecordOnDisk header.
  * The rmgr data will be stored starting on a MAXALIGN boundary.
  */
-typedef struct TwoPhaseRecordOnDisk {
-	uint32 len;			 /* length of rmgr data */
-	TwoPhaseRmgrId rmid; /* resource manager for this record */
-	uint16 info;		 /* flag bits for use by rmgr */
-} TwoPhaseRecordOnDisk;
+/* TwoPhaseRecordOnDisk and TWOPHASE_MAGIC are in twophase_rmgr.h. */
 
 /*
  * During prepare, the state file is assembled in memory before writing it
