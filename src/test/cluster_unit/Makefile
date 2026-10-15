@@ -3113,7 +3113,20 @@ test_cluster_catalog_origin_io.o: $(top_srcdir)/src/backend/cluster/cluster_init
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin_private.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
+RECOVERY_CENSUS_TEST_OBJS = \
+		$(top_builddir)/src/backend/cluster/cluster_recovery_relation_census.o \
+		$(top_builddir)/src/backend/cluster/cluster_recovery_relation_scan.o \
+		$(top_builddir)/src/backend/cluster/cluster_recovery_page_census.o \
+		$(top_builddir)/src/backend/cluster/cluster_recovery_page_history.o \
+		$(top_builddir)/src/backend/cluster/cluster_recovery_heap_scan.o \
+		$(top_builddir)/src/backend/cluster/cluster_recovery_multixact_scan.o \
+		$(top_builddir)/src/backend/cluster/cluster_cr_apply.o
+
+test_cluster_recovery_native_inputs: $(RECOVERY_CENSUS_TEST_OBJS)
+
 test_cluster_control_root test_cluster_recovery_native_inputs: %: %.c test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc test_cluster_control_root_serving.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_census.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_census.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_native_inventory.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_native_inventory.h \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_root_set.o \
@@ -3125,7 +3138,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs: %: %.c test_clust
 		$(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_undo_store.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_undo_scan.o \
-		test_cluster_control_cold_census.inc test_cluster_recovery_native_transcript.inc test_cluster_recovery_wal_tt_roots.inc test_cluster_recovery_multixact_inputs.inc test_cluster_recovery_multixact_join_inputs.inc test_cluster_heap_small_scn.inc \
+		test_cluster_control_cold_census.inc test_cluster_recovery_native_transcript.inc test_cluster_recovery_wal_tt_roots.inc test_cluster_recovery_multixact_inputs.inc test_cluster_recovery_multixact_join_inputs.inc test_cluster_recovery_census_inputs.inc test_cluster_heap_small_scn.inc \
 		test_cluster_control_root_initialized.inc test_cluster_control_root_first_start.inc test_cluster_control_catalog.inc \
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		test_cluster_control_native_xid.inc \
@@ -3151,7 +3164,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs: %: %.c test_clust
 		$(top_builddir)/src/backend/cluster/cluster_recovery_record_hash.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_native_scan.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_multixact_join.o \
-		$(if $(filter test_cluster_recovery_native_inputs,$@),$(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_store.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_scan.o) \
+		$(if $(filter test_cluster_recovery_native_inputs,$@),$(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_store.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_scan.o $(RECOVERY_CENSUS_TEST_OBJS)) \
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
 		test_cluster_wal_inputs_product.o \

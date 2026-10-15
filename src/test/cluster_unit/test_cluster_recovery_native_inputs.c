@@ -39,6 +39,7 @@ inventory_test_census(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitorV1 visi
 #define cluster_wal_inputs_cold_census_v1 inventory_test_census
 #include "../../backend/cluster/cluster_recovery_native_inventory.c"
 #undef cluster_wal_inputs_cold_census_v1
+#include "../../backend/cluster/cluster_recovery_census.c"
 
 static ClusterWalSourceRef inventory_fault_source;
 static XLogRecPtr inventory_commit_start, inventory_commit_previous;
@@ -289,10 +290,10 @@ inventory_fixture(bool unsupported, bool open_source)
 										   RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND, &binding,
 										   sizeof(binding));
 		}
-		if (inventory_extra == 5)
+		if (inventory_extra == 5 || inventory_extra == 9)
 			extra = inventory_write_bound_head(&source, commit, node);
-		if (inventory_extra >= 6 && inventory_extra <= 8)
-			extra = inventory_write_mx_sequence(&source, commit, node);
+		if (inventory_extra >= 6 && inventory_extra <= 9)
+			extra = inventory_write_mx_sequence(&source, extra, node);
 		create = inventory_write_record(&source, extra.exclusive_end, extra.record_start,
 										RM_SMGR_ID, XLOG_SMGR_CREATE, &payload, sizeof(payload));
 		if (i == 0) {
@@ -580,6 +581,7 @@ cleanup:
 #include "test_cluster_recovery_wal_tt_roots.inc"
 #include "test_cluster_recovery_multixact_inputs.inc"
 #include "test_cluster_recovery_multixact_join_inputs.inc"
+#include "test_cluster_recovery_census_inputs.inc"
 
 int
 main(int argc, char **argv)
@@ -588,7 +590,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(27);
+	UT_PLAN(34);
 	UT_RUN(test_native_inventory_uses_two_real_cold_passes);
 	UT_RUN(test_native_inventory_never_returns_partial_on_drift_io_or_error);
 	UT_RUN(test_native_inventory_capacity_is_not_partial_success);
@@ -616,6 +618,13 @@ main(int argc, char **argv)
 	UT_RUN(test_cold_mx_join_visits_all_saved_creates_and_preserves_effects);
 	UT_RUN(test_cold_mx_join_final_wal_drift_and_destroy_revoke_roots);
 	UT_RUN(test_cold_mx_join_refusal_poisons_inventory_and_partial_roots);
+	UT_RUN(test_owned_census_real_inputs_all_observation_families);
+	UT_RUN(test_owned_census_final_rereads_refuse_changes);
+	UT_RUN(test_owned_census_scope_loss_and_drained_invalidation);
+	UT_RUN(test_owned_census_missing_and_short_files_refuse);
+	UT_RUN(test_owned_census_error_releases_children);
+	UT_RUN(test_owned_census_open_input_and_budget_refuse);
+	UT_RUN(test_owned_census_destroy_each_phase);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
