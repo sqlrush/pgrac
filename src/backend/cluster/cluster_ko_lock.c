@@ -154,6 +154,15 @@ typedef struct ClusterKoInboundSlot {
 	uint64 epoch;
 } ClusterKoInboundSlot;
 
+typedef enum KoPeerReplyState {
+	KO_PEER_REPLY_NONE,
+	KO_PEER_REPLY_QUEUED,
+	KO_PEER_REPLY_SENDING,
+	KO_PEER_REPLY_TRANSPORT_OWNED,
+	KO_PEER_REPLY_UNKNOWN,
+	KO_PEER_REPLY_REJECTED
+} KoPeerReplyState;
+
 typedef struct ClusterKoPeerFenceV3 {
 	ClusterKoPeerFenceStateV3 state;
 	bool physical_started;
@@ -164,6 +173,7 @@ typedef struct ClusterKoPeerFenceV3 {
 	ResourceXGateSnapshot physical_gate;
 	bool ack_queued;
 	bool failure_queued;
+	uint8 reply_state;
 	int failure_sqlerrcode;
 	bool local_scan_complete;
 	uint32 local_scan_cursor;
@@ -2230,13 +2240,7 @@ ko_peer_fence_local_ready_tick_v3(void)
 		if (failed) {
 			request.base.verb = CLUSTER_KO_SHARED_ACK;
 			request.base.status = CLUSTER_KO_SHARED_FAILED;
-			if (ko_shared_enqueue_v3(&request, route_generation)) {
-				SpinLockAcquire(&ko_state->shared_lock);
-				if (ko_state->peer_fences[i].serial == handle.serial
-					&& ko_state->peer_fences[i].failure_sqlerrcode != 0)
-					ko_state->peer_fences[i].failure_queued = true;
-				SpinLockRelease(&ko_state->shared_lock);
-			}
+			(void)ko_shared_enqueue_v3(&request, route_generation);
 			continue;
 		}
 		ko_peer_attempt = handle;
@@ -2258,12 +2262,6 @@ ko_peer_fence_local_ready_tick_v3(void)
 		request.base.status = CLUSTER_KO_SHARED_DONE;
 		if (!ko_shared_enqueue_v3(&request, route_generation))
 			goto next_owner;
-		SpinLockAcquire(&ko_state->shared_lock);
-		if (ko_state->peer_fences[i].serial == handle.serial
-			&& ko_state->peer_fences[i].state == CLUSTER_KO_PEER_FENCE_READY
-			&& ko_state->peer_fences[i].physical_applied)
-			ko_state->peer_fences[i].ack_queued = true;
-		SpinLockRelease(&ko_state->shared_lock);
 	next_owner:
 		ko_peer_attempt_active = false;
 	}
@@ -2364,6 +2362,7 @@ cluster_ko_peer_fence_fresh_grant_v3(const ClusterLockAcquireRequest *request)
 			|| entry->request.ax_master_node != request->hw_grant.master
 			|| entry->peer_route_generation != request->hw_grant.master_generation
 			|| !entry->physical_applied || !entry->ack_queued
+			|| entry->reply_state != KO_PEER_REPLY_TRANSPORT_OWNED
 			|| (entry->holder_probe.nonce != 0 && !entry->holder_probe.reply)
 			|| ko_cleaner_pending_locked(entry->request.base.key.locator)
 			|| ko_extend_pending_locked(entry->request.base.key.locator)
@@ -2385,6 +2384,7 @@ cluster_ko_peer_fence_fresh_grant_v3(const ClusterLockAcquireRequest *request)
 			&& memcmp(entry->encoded, saved.encoded, sizeof(saved.encoded)) == 0
 			&& memcmp(&entry->holder_probe, &saved.holder_probe, sizeof(saved.holder_probe)) == 0
 			&& entry->physical_applied && entry->ack_queued
+			&& entry->reply_state == KO_PEER_REPLY_TRANSPORT_OWNED
 			&& !ko_cleaner_pending_locked(entry->request.base.key.locator)
 			&& !ko_extend_pending_locked(entry->request.base.key.locator)
 			&& !ko_peer_fence_has_queued_work_locked(entry)
@@ -2433,6 +2433,7 @@ cluster_ko_peer_fence_gc_tick_v3(void)
 		if ((saved.state != CLUSTER_KO_PEER_FENCE_READY
 			 && saved.state != CLUSTER_KO_PEER_FENCE_COMMITTED)
 			|| !saved.physical_applied || !saved.ack_queued
+			|| saved.reply_state != KO_PEER_REPLY_TRANSPORT_OWNED
 			|| ko_cleaner_pending_locked(saved.request.base.key.locator)
 			|| ko_extend_pending_locked(saved.request.base.key.locator)
 			|| ko_peer_fence_has_queued_work_locked(entry)) {
@@ -2475,6 +2476,7 @@ cluster_ko_peer_fence_gc_tick_v3(void)
 			&& memcmp(entry->encoded, saved.encoded, sizeof(saved.encoded)) == 0
 			&& memcmp(&entry->holder_probe, &saved.holder_probe, sizeof(saved.holder_probe)) == 0
 			&& entry->physical_applied && entry->ack_queued
+			&& entry->reply_state == KO_PEER_REPLY_TRANSPORT_OWNED
 			&& !ko_cleaner_pending_locked(entry->request.base.key.locator)
 			&& !ko_extend_pending_locked(entry->request.base.key.locator)
 			&& !ko_peer_fence_has_queued_work_locked(entry)
@@ -4087,28 +4089,138 @@ ko_shared_enqueue(const ClusterKoSharedMessageV2 *message)
 	return accepted;
 }
 
+/* Caller holds shared_lock. Result polarity and the complete original
+ * operation must agree; a queued frame cannot create a peer owner. */
+static bool
+ko_peer_reply_matches_locked(const ClusterKoPeerFenceV3 *entry,
+							const ClusterKoSharedMessageV3 *message, uint64 local_generation)
+{
+	if (entry->serial == 0 || entry->peer_route_generation != local_generation
+		|| !cluster_ko_shared_result_matches_v3(&entry->request, message))
+		return false;
+	if (message->base.status == CLUSTER_KO_SHARED_FAILED)
+		return (entry->state == CLUSTER_KO_PEER_FENCE_ACTIVE
+				|| entry->state == CLUSTER_KO_PEER_FENCE_READY)
+			   && entry->failure_sqlerrcode != 0;
+	return (entry->state == CLUSTER_KO_PEER_FENCE_READY
+			|| entry->state == CLUSTER_KO_PEER_FENCE_COMMITTED)
+		   && entry->physical_applied && entry->failure_sqlerrcode == 0;
+}
+
 static bool
 ko_shared_enqueue_v3(const ClusterKoSharedMessageV3 *message, uint64 local_generation)
 {
 	bool accepted = false;
 	uint8 bytes[CLUSTER_KO_SHARED_V3_BYTES];
+	ClusterKoPeerFenceV3 *reply_owner = NULL;
 
 	if (ko_state == NULL || local_generation == 0 || local_generation == UINT64_MAX
 		|| !cluster_ko_shared_encode_v3(message, bytes, sizeof(bytes)))
 		return false;
 	SpinLockAcquire(&ko_state->shared_lock);
-	if (ko_state->send_v3_count < CLUSTER_KO_SHARED_CAPACITY) {
+	if (message->base.verb == CLUSTER_KO_SHARED_ACK) {
+		for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+			ClusterKoPeerFenceV3 *entry = &ko_state->peer_fences[i];
+
+			if (entry->reply_state == KO_PEER_REPLY_NONE && !entry->ack_queued
+				&& !entry->failure_queued
+				&& ko_peer_reply_matches_locked(entry, message, local_generation)) {
+				reply_owner = entry;
+				break;
+			}
+		}
+	}
+	if (ko_state->send_v3_count < CLUSTER_KO_SHARED_CAPACITY
+		&& (message->base.verb == CLUSTER_KO_SHARED_REQUEST || reply_owner != NULL)) {
 		uint32 tail
 			= (ko_state->send_v3_head + ko_state->send_v3_count) % CLUSTER_KO_SHARED_CAPACITY;
 		ko_state->send_v3[tail] = *message;
 		ko_state->send_v3_route_generation[tail] = local_generation;
 		ko_state->send_v3_count++;
+		/* Publish ownership with the queue slot, before LMON can consume it. */
+		if (reply_owner != NULL) {
+			reply_owner->ack_queued = message->base.status == CLUSTER_KO_SHARED_DONE;
+			reply_owner->failure_queued = message->base.status == CLUSTER_KO_SHARED_FAILED;
+			reply_owner->reply_state = KO_PEER_REPLY_QUEUED;
+		}
 		accepted = true;
 	}
 	SpinLockRelease(&ko_state->shared_lock);
 	if (accepted)
 		cluster_lmon_wakeup();
 	return accepted;
+}
+
+static bool
+ko_peer_reply_send_begin(const ClusterKoSharedMessageV3 *message, uint64 local_generation,
+						ClusterKoPeerFenceHandleV3 *handle)
+{
+	bool owned = false;
+
+	SpinLockAcquire(&ko_state->shared_lock);
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		ClusterKoPeerFenceV3 *entry = &ko_state->peer_fences[i];
+
+		if (entry->reply_state != KO_PEER_REPLY_QUEUED
+			|| !(message->base.status == CLUSTER_KO_SHARED_DONE ? entry->ack_queued
+																 : entry->failure_queued)
+			|| !ko_peer_reply_matches_locked(entry, message, local_generation))
+			continue;
+		handle->slot = i;
+		handle->serial = entry->serial;
+		entry->reply_state = KO_PEER_REPLY_SENDING;
+		owned = true;
+		break;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	return owned;
+}
+
+static void
+ko_peer_reply_send_finish(const ClusterKoSharedMessageV3 *message, uint64 local_generation,
+						 const ClusterKoPeerFenceHandleV3 *handle, KoPeerReplyState state)
+{
+	ClusterKoPeerFenceV3 *entry;
+
+	SpinLockAcquire(&ko_state->shared_lock);
+	entry = &ko_state->peer_fences[handle->slot];
+	if (entry->serial == handle->serial && entry->reply_state == KO_PEER_REPLY_SENDING
+		&& ko_peer_reply_matches_locked(entry, message, local_generation))
+		entry->reply_state = state;
+	SpinLockRelease(&ko_state->shared_lock);
+}
+
+static ClusterICSendResult
+ko_peer_reply_send(const ClusterKoSharedMessageV3 *message, uint64 local_generation)
+{
+	ClusterKoPeerFenceHandleV3 handle;
+	volatile ClusterICSendResult result = CLUSTER_IC_SEND_HARD_ERROR;
+	uint8 bytes[CLUSTER_KO_SHARED_V3_BYTES];
+
+	if (!ko_peer_reply_send_begin(message, local_generation, &handle))
+		return result;
+	PG_TRY();
+	{
+		if (ko_shared_v3_control_at_generation(message, local_generation)
+			&& cluster_ko_shared_encode_v3(message, bytes, sizeof(bytes))) {
+			result = cluster_ic_send_envelope(PGRAC_IC_MSG_KO_FLUSH_ACK,
+											  message->base.origin_node, bytes, sizeof(bytes));
+			ko_peer_reply_send_finish(message, local_generation, &handle,
+				result == CLUSTER_IC_SEND_NOT_ADMITTED ? KO_PEER_REPLY_QUEUED
+				: (result == CLUSTER_IC_SEND_DONE || result == CLUSTER_IC_SEND_WOULD_BLOCK)
+					? KO_PEER_REPLY_TRANSPORT_OWNED : KO_PEER_REPLY_UNKNOWN);
+		} else
+			ko_peer_reply_send_finish(message, local_generation, &handle, KO_PEER_REPLY_REJECTED);
+	}
+	PG_CATCH();
+	{
+		/* The original slot survives ERROR, but an uncertain send is not
+		 * retried or reclaimed as a passive fence by a later owner tick. */
+		ko_peer_reply_send_finish(message, local_generation, &handle, KO_PEER_REPLY_UNKNOWN);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return result;
 }
 
 /* A queued request whose original backend has unwound must not be newly
@@ -4321,7 +4433,9 @@ cluster_ko_lmon_tick_v2(void)
 		SpinLockRelease(&ko_state->shared_lock);
 		if (!pending)
 			return;
-		if (ko_shared_v3_request_owned(&message)
+		if (message.base.verb == CLUSTER_KO_SHARED_ACK)
+			result = ko_peer_reply_send(&message, local_generation);
+		else if (ko_shared_v3_request_owned(&message)
 			&& ko_shared_v3_control_at_generation(&message, local_generation)
 			&& cluster_ko_shared_encode_v3(&message, bytes, sizeof(bytes))) {
 			/* ERROR may leave transport acceptance unknown. Arm the original
@@ -4410,10 +4524,16 @@ cluster_ko_shared_normal_stop_poll_v2(const char **reason)
 		} else if (ko_state->peer_fences[i].failure_sqlerrcode != 0) {
 			result = CLUSTER_NORMAL_STOP_INVALID;
 			why = "KO_PEER_APPLY_FAILED";
+		} else if (ko_state->peer_fences[i].reply_state >= KO_PEER_REPLY_UNKNOWN) {
+			result = CLUSTER_NORMAL_STOP_INVALID;
+			why = "KO_PEER_REPLY_UNRESOLVED";
 		} else if ((state == CLUSTER_KO_PEER_FENCE_ACTIVE
-					|| (state == CLUSTER_KO_PEER_FENCE_READY
+					|| ((state == CLUSTER_KO_PEER_FENCE_READY
+						 || state == CLUSTER_KO_PEER_FENCE_COMMITTED)
 						&& ko_state->peer_fences[i].physical_applied
-						&& !ko_state->peer_fences[i].ack_queued))
+						&& (!ko_state->peer_fences[i].ack_queued
+							|| ko_state->peer_fences[i].reply_state
+								   != KO_PEER_REPLY_TRANSPORT_OWNED)))
 				   && result == CLUSTER_NORMAL_STOP_READY) {
 			result = CLUSTER_NORMAL_STOP_PENDING;
 			why = "KO_PEER_DRAIN_OWNED";
