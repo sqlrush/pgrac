@@ -108,6 +108,9 @@ static bool reserve_owner, writer_allowed, revoke_on_flush;
 static bool ko_reserve_refused, ko_reserve_revoke_on_lock, ko_reserve_revoke_on_flush;
 static uint64 ko_reserve_revision;
 static unsigned ko_reserve_begins, ko_reserve_checks, buffer_reads;
+static bool create_refused, create_scope_live, create_scope_armed;
+static bool create_revoke_on_io, create_throw_on_read;
+static unsigned create_begins, create_ends, create_aborts, create_scope_effects;
 static bool hw_held, fail_hw_lock, throw_reserve_flush;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
@@ -137,6 +140,60 @@ static const ClusterSpaceRecoveryBatchV1 *cold_batch = (const ClusterSpaceRecove
 static bool cold_commit_window, cold_drop_proven;
 static unsigned cold_drop_checks;
 static bool cold_drop_second_refused;
+
+/* The real native/SPACE constructors run below. Only their KO lifetime
+ * boundary is substituted; the KO suite exercises the actual shared owner. */
+bool
+cluster_ko_create_begin_v3(RelFileLocator tag, uint64 *serial)
+{
+	UT_ASSERT(RelFileLocatorEquals(tag, locator) && !locked && !pinned);
+	create_begins++;
+	*serial = 0;
+	if (create_refused || create_scope_live)
+		return false;
+	create_scope_live = true;
+	*serial = 41;
+	return true;
+}
+
+bool
+cluster_ko_create_current_v3(RelFileLocator tag, uint64 *serial)
+{
+	UT_ASSERT(RelFileLocatorEquals(tag, locator) && !locked && !pinned);
+	*serial = create_scope_live ? 41 : 0;
+	return create_scope_live && !create_refused;
+}
+
+bool
+cluster_ko_create_write_begin_v3(RelFileLocator tag, uint64 serial)
+{
+	UT_ASSERT(RelFileLocatorEquals(tag, locator) && serial == 41 && !locked && !pinned);
+	if (!create_scope_live || create_refused)
+		return false;
+	create_scope_armed = true;
+	return true;
+}
+
+bool
+cluster_ko_create_end_v3(uint64 serial, bool complete)
+{
+	UT_ASSERT(serial == 41 && create_scope_live && !locked && !pinned);
+	create_ends++;
+	if (create_refused || (create_scope_armed && !complete))
+		return false;
+	create_scope_live = create_scope_armed = false;
+	return true;
+}
+
+void
+cluster_ko_create_abort_v3(uint64 serial)
+{
+	if (serial == 0)
+		return;
+	UT_ASSERT(serial == 41 && create_scope_live);
+	create_aborts++;
+}
+
 bool
 cluster_cold_replay_window_active_v1(void)
 {
@@ -525,6 +582,10 @@ smgrcreate(SMgrRelation rel, ForkNumber forknum, bool is_redo)
 {
 	if (rel != &storage || is_redo != recovering)
 		abort();
+	if (create_scope_live && create_scope_armed)
+		create_scope_effects++;
+	if (create_revoke_on_io)
+		create_refused = true;
 	if (forknum == MAIN_FORKNUM && (native_owner || recovering)) {
 		main_create_calls++;
 		return;
@@ -719,6 +780,8 @@ ReadBufferWithoutRelcache(RelFileLocator tag, ForkNumber forknum, BlockNumber bl
 		|| !permanent)
 		abort();
 	if (block == P_NEW) {
+		if (create_throw_on_read)
+			pg_re_throw();
 		if (blocks > 1 || mode != RBM_ZERO_AND_LOCK)
 			abort();
 		block = blocks++;
@@ -1332,6 +1395,9 @@ errcode(int code)
 static void
 reset(void)
 {
+	create_refused = create_scope_live = create_scope_armed = false;
+	create_revoke_on_io = create_throw_on_read = false;
+	create_begins = create_ends = create_aborts = create_scope_effects = 0;
 	MyBackendId = 1;
 	shared_identity_locks = maintenance_identity_locks = 0;
 	refuse_maintenance_lock = false;
@@ -1686,6 +1752,91 @@ UT_TEST(test_native_create_registers_abort_cleanup_before_space)
 	UT_ASSERT(delete_registered);
 	smgrDoPendingDeletes(false);
 	UT_ASSERT_EQ(unlink_calls, 1);
+}
+
+UT_TEST(test_create_fence_refuses_native_main_and_direct_space_before_effects)
+{
+	volatile bool caught = false;
+	reset();
+	native_owner = expecting_error = create_refused = true;
+	PG_TRY();
+	{
+		RelationCreateStorage(locator, RELPERSISTENCE_PERMANENT, true);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(io_calls + main_create_calls + create_calls + wal_calls + dirty_calls, 0);
+	UT_ASSERT(!delete_registered);
+	/* Clean the old implementation's successful creation after the RED. */
+	smgrDoPendingDeletes(false);
+	reset();
+	create_refused = true;
+	UT_ASSERT(!cluster_space_relation_create(locator));
+	UT_ASSERT_EQ(io_calls + create_calls + wal_calls + dirty_calls + random_calls, 0);
+	UT_ASSERT_EQ(next_token, 17);
+}
+
+UT_TEST(test_create_keeps_one_native_owner_through_both_forks)
+{
+	reset();
+	native_owner = true;
+	UT_ASSERT(RelationCreateStorage(locator, RELPERSISTENCE_PERMANENT, true) == &storage);
+	UT_ASSERT_EQ(create_begins, 1);
+	UT_ASSERT_EQ(create_ends, 1);
+	UT_ASSERT_EQ(create_scope_effects, 2);
+	UT_ASSERT(!create_scope_live && !pinned && !locked);
+	UT_ASSERT(delete_registered);
+	UT_ASSERT_EQ(capture_calls, 2);
+	smgrDoPendingDeletes(false);
+}
+
+UT_TEST(test_create_io_error_keeps_original_reference_and_abort_delete)
+{
+	volatile bool caught = false;
+	reset();
+	native_owner = expecting_error = create_throw_on_read = true;
+	PG_TRY();
+	{
+		RelationCreateStorage(locator, RELPERSISTENCE_PERMANENT, true);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT(create_scope_live && create_scope_armed);
+	UT_ASSERT(create_aborts != 0);
+	UT_ASSERT_EQ(create_ends, 0);
+	UT_ASSERT(delete_registered);
+	UT_ASSERT_EQ(wal_calls + dirty_calls, 0);
+	create_throw_on_read = false;
+	smgrDoPendingDeletes(false);
+}
+
+UT_TEST(test_create_scope_change_after_main_does_not_publish_space)
+{
+	volatile bool caught = false;
+	reset();
+	native_owner = expecting_error = create_revoke_on_io = true;
+	PG_TRY();
+	{
+		RelationCreateStorage(locator, RELPERSISTENCE_PERMANENT, true);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(main_create_calls, 1);
+	UT_ASSERT_EQ(create_calls + wal_calls + dirty_calls, 0);
+	UT_ASSERT(delete_registered && create_scope_live);
+	smgrDoPendingDeletes(false);
 }
 
 UT_TEST(test_native_descriptor_recognizes_typed_record)
@@ -3650,7 +3801,11 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(72);
+	UT_PLAN(76);
+	UT_RUN(test_create_fence_refuses_native_main_and_direct_space_before_effects);
+	UT_RUN(test_create_keeps_one_native_owner_through_both_forks);
+	UT_RUN(test_create_io_error_keeps_original_reference_and_abort_delete);
+	UT_RUN(test_create_scope_change_after_main_does_not_publish_space);
 	UT_RUN(test_native_structure_claim_passes_locked_identity_and_action);
 	UT_RUN(test_maintenance_identity_uses_current_owner_without_backend_id);
 	UT_RUN(test_maintenance_identity_retry_keeps_work_and_releases_pin);

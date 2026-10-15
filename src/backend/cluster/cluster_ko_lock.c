@@ -184,8 +184,9 @@ typedef struct ClusterKoCleanerWorkV3 {
 	ClusterCtrcCleanerReadScopeV3 scope;
 } ClusterKoCleanerWorkV3;
 
-/* References to running native extension calls, not an execution queue.
- * A reservation whose physical completion is unknown survives local ERROR. */
+/* References to running native extension/creation calls, not an execution
+ * queue. InvalidForkNumber names a constructor spanning MAIN and SPACE.
+ * Physical work whose completion is unknown survives local ERROR. */
 typedef struct ClusterKoExtendWorkV3 {
 	bool used;
 	bool failed;
@@ -245,6 +246,10 @@ static ClusterKoExtendWorkV3 ko_extend_local;
 static uint32 ko_extend_slot;
 static bool ko_extend_write_armed, ko_extend_materialized, ko_extend_aborting;
 static ResourceOwner ko_extend_owner;
+static ClusterKoExtendWorkV3 ko_create_local;
+static uint32 ko_create_slot;
+static bool ko_create_write_armed, ko_create_aborting;
+static ResourceOwner ko_create_owner;
 static bool ko_exit_registered;
 static dsa_area *ko_native_area;
 
@@ -424,6 +429,9 @@ cluster_ko_shmem_init(void)
 		memset(&ko_extend_local, 0, sizeof(ko_extend_local));
 		ko_extend_aborting = false;
 		ko_extend_owner = NULL;
+		memset(&ko_create_local, 0, sizeof(ko_create_local));
+		ko_create_write_armed = ko_create_aborting = false;
+		ko_create_owner = NULL;
 	}
 }
 
@@ -1352,13 +1360,181 @@ cluster_ko_extend_active_v3(void)
 	return ko_extend_local.used;
 }
 
+static void
+ko_storage_register_callbacks(void)
+{
+	if (!ko_resource_registered) {
+		RegisterResourceReleaseCallback(ko_shared_resource_release, NULL);
+		RegisterXactCallback(ko_shared_xact_event, NULL);
+		ko_resource_registered = true;
+	}
+	if (!ko_exit_registered) {
+		before_shmem_exit(ko_shared_backend_exit, (Datum)0);
+		ko_exit_registered = true;
+	}
+}
+
+bool
+cluster_ko_create_begin_v3(RelFileLocator locator, uint64 *serial)
+{
+	ClusterKoExtendWorkV3 work = { 0 };
+	int empty = -1;
+	unsigned available = 0, constructors = 0;
+	uint64 revision;
+	bool allowed = false;
+
+	if (serial != NULL)
+		*serial = 0;
+	if (serial == NULL || ko_state == NULL || ko_create_local.used || ko_extend_local.used
+		|| MyProcPid <= 0 || CurrentResourceOwner == NULL || !cluster_enabled
+		|| !cluster_shared_config || cluster_interconnect_tier != CLUSTER_IC_TIER_1
+		|| RecoveryInProgress() || locator.spcOid == 0 || locator.relNumber == 0
+		|| !cluster_wal_thread_current_v2_ref(&work.writer)
+		|| work.writer.claim.identity.origin_node_id != cluster_node_id
+		|| work.writer.claim.identity.origin_owner_incarnation == 0
+		|| work.writer.claim.identity.system_identifier == 0
+		|| (work.epoch = cluster_epoch_get_current()) == 0)
+		return false;
+	ko_storage_register_callbacks();
+	work.used = true;
+	work.pid = MyProcPid;
+	work.locator = locator;
+	work.fork = InvalidForkNumber;
+	SpinLockAcquire(&ko_state->shared_lock);
+	revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+	if (revision == 0 || revision == UINT64_MAX || ko_state->extend_serial == UINT64_MAX)
+		goto done;
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		if (ko_state->peer_fences[i].state != CLUSTER_KO_PEER_FENCE_EMPTY
+			&& RelFileLocatorEquals(ko_state->peer_fences[i].request.base.key.locator, locator))
+			goto done;
+		if (!ko_state->extend_work[i].used) {
+			available++;
+			if (empty < 0)
+				empty = i;
+		} else if (!ko_state->extend_work[i].failed
+				   && ko_state->extend_work[i].fork == InvalidForkNumber)
+			constructors++;
+	}
+	/* Every live constructor is promised one child slot. Its two SPACE
+	 * extensions run serially. Do not fill the table with parents which
+	 * can only release their own slots after acquiring a child slot. */
+	if (empty >= 0 && available >= constructors + 2) {
+		work.serial = ++ko_state->extend_serial;
+		ko_state->extend_work[empty] = work;
+		ko_create_local = work;
+		ko_create_slot = empty;
+		ko_create_write_armed = ko_create_aborting = false;
+		ko_create_owner = CurrentResourceOwner;
+		*serial = work.serial;
+		allowed = true;
+	}
+done:
+	SpinLockRelease(&ko_state->shared_lock);
+	return allowed;
+}
+
+bool
+cluster_ko_create_current_v3(RelFileLocator locator, uint64 *serial)
+{
+	ClusterWalSourceRef writer;
+	uint64 revision;
+	bool allowed;
+
+	if (serial != NULL)
+		*serial = 0;
+	if (serial == NULL || ko_state == NULL || !ko_create_local.used || ko_create_aborting
+		|| ko_create_local.pid != MyProcPid || CurrentResourceOwner != ko_create_owner
+		|| !cluster_enabled || !cluster_shared_config || RecoveryInProgress()
+		|| cluster_interconnect_tier != CLUSTER_IC_TIER_1
+		|| ko_create_slot >= CLUSTER_KO_SHARED_CAPACITY
+		|| !RelFileLocatorEquals(ko_create_local.locator, locator)
+		|| cluster_epoch_get_current() != ko_create_local.epoch
+		|| !cluster_wal_thread_current_v2_ref(&writer)
+		|| memcmp(&writer, &ko_create_local.writer, sizeof(writer)) != 0)
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+	allowed = revision != 0 && revision != UINT64_MAX
+			  && memcmp(&ko_state->extend_work[ko_create_slot], &ko_create_local,
+						sizeof(ko_create_local)) == 0
+			  && ko_extend_fences_allow_locked(&ko_create_local);
+	if (allowed)
+		*serial = ko_create_local.serial;
+	SpinLockRelease(&ko_state->shared_lock);
+	return allowed;
+}
+
+bool
+cluster_ko_create_write_begin_v3(RelFileLocator locator, uint64 serial)
+{
+	uint64 current;
+	if (serial == 0 || !cluster_ko_create_current_v3(locator, &current) || serial != current)
+		return false;
+	ko_create_write_armed = true;
+	return true;
+}
+
+void
+cluster_ko_create_abort_v3(uint64 serial)
+{
+	/* ERROR may still own buffer locks. Only expire local permission now;
+	 * the original AFTER_LOCKS callback retains unknown physical work. */
+	if (serial != 0 && ko_create_local.used && ko_create_local.serial == serial
+		&& ko_create_local.pid == MyProcPid)
+		ko_create_aborting = true;
+}
+
+bool
+cluster_ko_create_end_v3(uint64 serial, bool complete)
+{
+	bool retired = false;
+	uint64 current;
+
+	if (ko_state == NULL || serial == 0 || !ko_create_local.used
+		|| serial != ko_create_local.serial || ko_create_local.pid != MyProcPid
+		|| ko_create_owner != CurrentResourceOwner || ko_create_slot >= CLUSTER_KO_SHARED_CAPACITY
+		|| ko_extend_local.used)
+		return false;
+	if (complete && !cluster_ko_create_current_v3(ko_create_local.locator, &current))
+		complete = false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	if (memcmp(&ko_state->extend_work[ko_create_slot], &ko_create_local,
+			   sizeof(ko_create_local)) == 0) {
+		if (ko_create_write_armed && !complete)
+			ko_state->extend_work[ko_create_slot].failed = true;
+		else {
+			memset(&ko_state->extend_work[ko_create_slot], 0, sizeof(ko_create_local));
+			retired = true;
+		}
+		for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+			if (ko_state->peer_fences[i].state != CLUSTER_KO_PEER_FENCE_EMPTY
+				&& RelFileLocatorEquals(ko_state->peer_fences[i].request.base.key.locator,
+										ko_create_local.locator)) {
+				uint64 revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+				pg_atomic_write_u64(&ko_state->peer_admission_revision,
+									revision == 0 || revision == UINT64_MAX ? UINT64_MAX : revision + 1);
+				break;
+			}
+		}
+	}
+	memset(&ko_create_local, 0, sizeof(ko_create_local));
+	ko_create_owner = NULL;
+	ko_create_aborting = false;
+	SpinLockRelease(&ko_state->shared_lock);
+	cluster_sinval_set_proc_latch();
+	return retired;
+}
+
 bool
 cluster_ko_extend_begin_v3(RelFileLocator locator, ForkNumber fork, uint64 *serial, bool *retry)
 {
 	ClusterKoExtendWorkV3 work;
 	int empty = -1;
+	unsigned available = 0, constructors = 0;
 	bool allowed = false;
 	uint64 revision;
+	uint64 parent = 0;
 
 	if (serial != NULL)
 		*serial = 0;
@@ -1370,6 +1546,9 @@ cluster_ko_extend_begin_v3(RelFileLocator locator, ForkNumber fork, uint64 *seri
 		|| fork < MAIN_FORKNUM || fork > MAX_FORKNUM || locator.spcOid == 0
 		|| locator.relNumber == 0)
 		return false;
+	if (ko_create_local.used
+		&& (fork != SPACE_FORKNUM || !cluster_ko_create_current_v3(locator, &parent)))
+		return false;
 	memset(&work, 0, sizeof(work));
 	if (!cluster_wal_thread_current_v2_ref(&work.writer)
 		|| work.writer.claim.identity.origin_node_id != cluster_node_id
@@ -1377,17 +1556,12 @@ cluster_ko_extend_begin_v3(RelFileLocator locator, ForkNumber fork, uint64 *seri
 		|| work.writer.claim.identity.system_identifier == 0
 		|| (work.epoch = cluster_epoch_get_current()) == 0)
 		return false;
+	if (parent != 0 && (work.epoch != ko_create_local.epoch
+		|| memcmp(&work.writer, &ko_create_local.writer, sizeof(work.writer)) != 0))
+		return false;
 	/* Register the existing cleanup owner before publishing a reference.
 	 * The callbacks can allocate; none runs under the object lock. */
-	if (!ko_resource_registered) {
-		RegisterResourceReleaseCallback(ko_shared_resource_release, NULL);
-		RegisterXactCallback(ko_shared_xact_event, NULL);
-		ko_resource_registered = true;
-	}
-	if (!ko_exit_registered) {
-		before_shmem_exit(ko_shared_backend_exit, (Datum)0);
-		ko_exit_registered = true;
-	}
+	ko_storage_register_callbacks();
 	work.used = true;
 	work.pid = MyProcPid;
 	work.locator = locator;
@@ -1396,17 +1570,30 @@ cluster_ko_extend_begin_v3(RelFileLocator locator, ForkNumber fork, uint64 *seri
 	revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
 	if (revision == 0 || revision == UINT64_MAX || ko_state->extend_serial == UINT64_MAX)
 		goto done;
+	if (parent != 0
+		&& (memcmp(&ko_state->extend_work[ko_create_slot], &ko_create_local,
+				   sizeof(ko_create_local)) != 0 || !ko_extend_fences_allow_locked(&ko_create_local)))
+		goto done;
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
 		if (ko_state->peer_fences[i].state != CLUSTER_KO_PEER_FENCE_EMPTY
-			&& RelFileLocatorEquals(ko_state->peer_fences[i].request.base.key.locator, locator)) {
+			&& RelFileLocatorEquals(ko_state->peer_fences[i].request.base.key.locator, locator)
+			&& parent == 0) {
 			if (retry != NULL)
 				*retry = true;
 			goto done;
 		}
-		if (!ko_state->extend_work[i].used && empty < 0)
-			empty = i;
+		if (!ko_state->extend_work[i].used) {
+			available++;
+			if (empty < 0)
+				empty = i;
+		} else if (!ko_state->extend_work[i].failed
+				   && ko_state->extend_work[i].fork == InvalidForkNumber)
+			constructors++;
 	}
-	if (empty >= 0) {
+	/* Ordinary extension cannot take capacity promised to a constructor.
+	 * Exact child work consumes that promise and releases the slot through
+	 * its unchanged materialization/ResourceOwner path. */
+	if (empty >= 0 && (parent != 0 || available > constructors)) {
 		work.serial = ++ko_state->extend_serial;
 		ko_state->extend_work[empty] = work;
 		ko_extend_local = work;
@@ -2571,6 +2758,9 @@ ko_shared_resource_release(ResourceReleasePhase phase, bool commit, bool top,
 	if (phase == RESOURCE_RELEASE_AFTER_LOCKS && ko_extend_local.used && ko_extend_aborting
 		&& ko_extend_owner == CurrentResourceOwner && ko_extend_local.pid == MyProcPid)
 		(void)cluster_ko_extend_end_v3(ko_extend_local.serial);
+	if (phase == RESOURCE_RELEASE_AFTER_LOCKS && ko_create_local.used && ko_create_aborting
+		&& ko_create_owner == CurrentResourceOwner && ko_create_local.pid == MyProcPid)
+		(void)cluster_ko_create_end_v3(ko_create_local.serial, false);
 	if (phase != RESOURCE_RELEASE_BEFORE_LOCKS)
 		return;
 	parent = commit && !top ? ResourceOwnerGetParent(CurrentResourceOwner) : NULL;
@@ -3998,7 +4188,13 @@ ko_shared_backend_exit(int code, Datum arg)
 	if (ko_state == NULL)
 		return;
 	cluster_ko_extend_abort_v3(ko_extend_local.serial);
+	cluster_ko_create_abort_v3(ko_create_local.serial);
 	SpinLockAcquire(&ko_state->shared_lock);
+	if (ko_create_local.used && ko_create_local.pid == MyProcPid
+		&& ko_create_slot < CLUSTER_KO_SHARED_CAPACITY
+		&& memcmp(&ko_state->extend_work[ko_create_slot], &ko_create_local,
+				  sizeof(ko_create_local)) == 0)
+		ko_state->extend_work[ko_create_slot].failed = true;
 	if (ko_extend_local.used && ko_extend_local.pid == MyProcPid
 		&& ko_extend_slot < CLUSTER_KO_SHARED_CAPACITY
 		&& memcmp(&ko_state->extend_work[ko_extend_slot], &ko_extend_local, sizeof(ko_extend_local))
@@ -4198,10 +4394,12 @@ cluster_ko_shared_normal_stop_poll_v2(const char **reason)
 			continue;
 		if (ko_state->extend_work[i].failed) {
 			result = CLUSTER_NORMAL_STOP_INVALID;
-			why = "KO_EXTENSION_RECOVERY_REQUIRED";
+			why = ko_state->extend_work[i].fork == InvalidForkNumber
+				? "KO_CREATION_RECOVERY_REQUIRED" : "KO_EXTENSION_RECOVERY_REQUIRED";
 		} else if (result == CLUSTER_NORMAL_STOP_READY) {
 			result = CLUSTER_NORMAL_STOP_PENDING;
-			why = "KO_EXTENSION_OWNED";
+			why = ko_state->extend_work[i].fork == InvalidForkNumber
+				? "KO_CREATION_OWNED" : "KO_EXTENSION_OWNED";
 		}
 	}
 	SpinLockRelease(&ko_state->shared_lock);

@@ -208,6 +208,16 @@ extern bool cluster_ko_extend_write_done_v3(RelFileLocator locator, ForkNumber f
 extern bool cluster_ko_extend_end_v3(uint64 serial);
 extern void cluster_ko_extend_abort_v3(uint64 serial);
 
+/* Native MAIN/SPACE construction holds one reference in the same bounded
+ * table. A typed SPACE call can borrow only its exact original constructor;
+ * its child SPACE extensions retain independent references. No recovery,
+ * current, durability or deletion permission is conferred by these calls. */
+extern bool cluster_ko_create_begin_v3(RelFileLocator locator, uint64 *serial);
+extern bool cluster_ko_create_current_v3(RelFileLocator locator, uint64 *serial);
+extern bool cluster_ko_create_write_begin_v3(RelFileLocator locator, uint64 serial);
+extern bool cluster_ko_create_end_v3(uint64 serial, bool complete);
+extern void cluster_ko_create_abort_v3(uint64 serial);
+
 extern bool cluster_ko_peer_holder_begin_v3(const ClusterKoPeerFenceHandleV3 *handle);
 extern bool cluster_ko_peer_holder_result_v3(const ClusterKoPeerFenceHandleV3 *handle,
 											 ClusterGrdHolderObservation *observation,

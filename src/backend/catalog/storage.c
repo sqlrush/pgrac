@@ -194,6 +194,10 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 	SMgrRelation srel;
 	BackendId	backend;
 	bool		needs_wal;
+#ifdef USE_PGRAC_CLUSTER
+	uint64		create_serial = 0;
+	bool		create_scoped;
+#endif
 
 	Assert(!IsInParallelMode());	/* couldn't update pendingSyncHash */
 	RelationCheckStorageTransaction(rlocator, relpersistence, "creation");
@@ -217,6 +221,22 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 			return NULL;		/* placate compiler */
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	create_scoped = cluster_enabled && cluster_shared_config
+		&& cluster_interconnect_tier == CLUSTER_IC_TIER_1 && !RecoveryInProgress()
+		&& relpersistence != RELPERSISTENCE_TEMP
+		&& cluster_smgr_which_for(rlocator, backend) == 1;
+	if (create_scoped && !cluster_ko_create_begin_v3(rlocator, &create_serial))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot qualify shared relation creation for %u", rlocator.relNumber)));
+	PG_TRY();
+	{
+		/* The reference precedes MAIN and survives until SPACE hands its
+		 * buffers/WAL back to their original owners. No lock spans IO. */
+		if (create_scoped && !cluster_ko_create_write_begin_v3(rlocator, create_serial))
+			elog(ERROR, "shared relation creation lost its original owner");
+#endif
 	srel = smgropen(rlocator, backend);
 	smgrcreate(srel, MAIN_FORKNUM, false);
 
@@ -255,6 +275,17 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("could not create exact SPACE identity for relation %u", rlocator.relNumber)));
+	}
+	PG_CATCH();
+	{
+		cluster_ko_create_abort_v3(create_serial);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (create_scoped && !cluster_ko_create_end_v3(create_serial, true))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("shared relation creation requires its original recovery owner")));
 #endif
 
 	return srel;

@@ -593,8 +593,8 @@ cluster_space_init_vm_buffer_wal(const ClusterSpaceIdentity *identity, Buffer de
 	return cluster_space_copy_buffer_wal(identity, initialized.data, destination);
 }
 
-bool
-cluster_space_relation_create(RelFileLocator locator)
+static bool
+space_relation_create(RelFileLocator locator, uint64 create_serial)
 {
 	ClusterSpaceStructureChange change = { 0 };
 	ClusterSpaceWalChange *identity = &change.identity;
@@ -628,6 +628,8 @@ cluster_space_relation_create(RelFileLocator locator)
 	rel = smgropen(locator, InvalidBackendId);
 	if (smgrexists(rel, SPACE_FORKNUM))
 		return false;
+	if (create_serial != 0 && !cluster_ko_create_write_begin_v3(locator, create_serial))
+		return false;
 	smgrcreate(rel, SPACE_FORKNUM, false);
 	for (int i = 0; i < 2; i++) {
 		buffers[i] = ReadBufferWithoutRelcache(locator, SPACE_FORKNUM, P_NEW, RBM_ZERO_AND_LOCK,
@@ -660,6 +662,39 @@ done:
 		if (BufferIsValid(buffers[i]))
 			UnlockReleaseBuffer(buffers[i]);
 	return success;
+}
+
+bool
+cluster_space_relation_create(RelFileLocator locator)
+{
+	uint64 serial = 0;
+	bool owned = false;
+	bool result;
+
+	if (!cluster_enabled || !cluster_shared_config
+		|| cluster_interconnect_tier != CLUSTER_IC_TIER_1 || RecoveryInProgress()
+		|| cluster_smgr_which_for(locator, InvalidBackendId) != 1)
+		return space_relation_create(locator, 0);
+	/* The native MAIN constructor keeps its own reference. A standalone
+	 * typed caller must register before token/WAL, fork creation or pinning. */
+	if (!cluster_ko_create_current_v3(locator, &serial)) {
+		if (!cluster_ko_create_begin_v3(locator, &serial))
+			return false;
+		owned = true;
+	}
+	PG_TRY();
+	{
+		result = space_relation_create(locator, serial);
+	}
+	PG_CATCH();
+	{
+		cluster_ko_create_abort_v3(serial);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (owned && !cluster_ko_create_end_v3(serial, result))
+		return false;
+	return result;
 }
 
 BlockNumber
