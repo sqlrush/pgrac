@@ -1335,6 +1335,54 @@ refused:
 	return false;
 }
 
+bool
+cluster_space_drop_replay_verify_v1(XLogReaderState *record, TransactionId xid)
+{
+	xl_xact_parsed_commit parsed;
+
+	/* This only checks the result of the native deletion above its I/O
+	 * boundary. The original preflight must already have proved every
+	 * tombstone; absent files are never a substitute for that authority. */
+	if (!cluster_shared_config || !cluster_cold_replay_window_active_v1()
+		|| cluster_recmerge_apply_foreign || record == NULL || record->record == NULL
+		|| !RecoveryInProgress() || !TransactionIdIsNormal(xid)
+		|| XLogRecGetRmid(record) != RM_XACT_ID
+		|| (XLogRecGetInfo(record) & XLOG_XACT_OPMASK) != XLOG_XACT_COMMIT
+		|| XLogRecGetXid(record) != xid || XLogRecHasAnyBlockRefs(record)
+		|| XLogRecPtrIsInvalid(record->ReadRecPtr) || record->EndRecPtr <= record->ReadRecPtr
+		|| !ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)XLogRecGetData(record),
+							  XLogRecGetDataLen(record), &parsed)
+		|| parsed.nrels <= 0)
+		return false;
+	for (int i = 0; i < parsed.nrels; i++) {
+		ClusterSpaceIdentityKey expected, after;
+		uint16 thread, after_thread;
+		SMgrRelation smgr;
+
+		if (cluster_smgr_which_for(parsed.xlocators[i], InvalidBackendId) != 1)
+			continue;
+		if (!space_namespace(parsed.xlocators[i], true, &expected, &thread) || thread == 0
+			|| thread != record->cluster_expected_thread_id
+			|| expected.system_identifier != record->system_identifier)
+			return false;
+		smgr = smgropen(expected.locator, InvalidBackendId);
+		/* Shared redo keeps MAIN as an empty relfilenumber placeholder.
+		 * Auxiliary unlink can report WARNING, so returning from the native
+		 * delete is not sufficient to establish this physical postcondition. */
+		if (!smgrexists(smgr, MAIN_FORKNUM) || smgrnblocks(smgr, MAIN_FORKNUM) != 0)
+			return false;
+		for (ForkNumber fork = MAIN_FORKNUM + 1; fork <= MAX_FORKNUM; fork++)
+			if (smgrexists(smgr, fork))
+				return false;
+		if (!space_namespace(parsed.xlocators[i], true, &after, &after_thread)
+			|| after_thread != thread || !space_identity_key_matches(&expected, &after))
+			return false;
+	}
+	/* No sync, completion publication or replay-from-absence permission.
+	 * The original cold owner still owes its final durability/ROOT seal. */
+	return true;
+}
+
 static bool
 space_reservation_redo(XLogReaderState *record)
 {

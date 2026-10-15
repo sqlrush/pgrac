@@ -194,6 +194,7 @@
 #include "cluster/cluster_reconfig.h"			  /* PGRAC: spec-5.15 §2.4 joiner write gate */
 #include "cluster/cluster_sf_dep.h"			  /* PGRAC: spec-6.2 Smart Fusion commit brake */
 #include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_ko.h"
 #include "cluster/cluster_xnode_profile.h"	  /* PGRAC: spec-7.4 D0 commit census probes */
 #include "cluster/storage/cluster_undo_xlog.h" /* PGRAC: spec-3.18 D4.1 TT fold redo stamp */
@@ -7123,6 +7124,11 @@ xact_redo_commit(XLogReaderState *record, xl_xact_parsed_commit *parsed,
 
 		/* Make sure files supposed to be dropped are dropped */
 		DropRelationFiles(parsed->xlocators, parsed->nrels, true);
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_shared_config && cluster_cold_replay_window_active_v1()
+			&& !cluster_space_drop_replay_verify_v1(record, xid))
+			elog(PANIC, "xact_redo: cold SPACE deletion postcondition refused");
+#endif
 	}
 
 	if (parsed->nstats > 0)

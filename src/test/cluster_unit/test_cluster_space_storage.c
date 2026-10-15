@@ -132,6 +132,9 @@ static const ClusterSpaceRecoveryBatchV1 *cold_batch = (const ClusterSpaceRecove
 static bool cold_commit_window, cold_drop_proven;
 static unsigned cold_drop_checks;
 static bool cold_drop_second_refused;
+static bool drop_verify_fixture, post_drop_io, post_drop_throw, post_drop_lose_namespace;
+static unsigned post_drop_calls, post_drop_reads;
+static uint32 post_drop_forks;
 bool
 cluster_cold_replay_window_active_v1(void)
 {
@@ -467,6 +470,13 @@ smgrexists(SMgrRelation rel, ForkNumber forknum)
 {
 	if (rel != &storage)
 		abort();
+	if (post_drop_io) {
+		UT_ASSERT(forknum >= MAIN_FORKNUM && forknum <= MAX_FORKNUM);
+		post_drop_reads++;
+		if (post_drop_throw)
+			elog(ERROR, "injected post-unlink read failure");
+		return (post_drop_forks & (1U << forknum)) != 0;
+	}
 	if (deleted_all)
 		return false;
 	if ((recovering || truncate_owner)
@@ -513,6 +523,13 @@ smgrnblocks(SMgrRelation rel, ForkNumber forknum)
 void
 XLogFlush(XLogRecPtr lsn)
 {
+	if (drop_verify_fixture) {
+		UT_ASSERT_EQ(lsn, UINT64_C(0x10000300));
+		UT_ASSERT_EQ(pinned | locked, 0);
+		UT_ASSERT_EQ(post_drop_calls, 0);
+		flush_calls++;
+		return;
+	}
 	if (drop_owner) {
 		UT_ASSERT_EQ(lsn, UINT64_C(0x10000300));
 		UT_ASSERT_EQ(CritSectionCount, recovering ? 0 : 1);
@@ -1282,6 +1299,8 @@ reset(void)
 	cold_commit_window = cold_drop_proven = false;
 	cold_drop_checks = 0;
 	cold_drop_second_refused = false;
+	drop_verify_fixture = post_drop_io = post_drop_throw = post_drop_lose_namespace = false;
+	post_drop_calls = post_drop_reads = post_drop_forks = 0;
 	cold_truncate_permitted = cold_vm_clear = true;
 	native_commits = commit_decisions = 0;
 	plain_commit_emitter = false;
@@ -3017,6 +3036,121 @@ native_commit_redo_prefix(XLogReaderState *record, xl_xact_parsed_commit *parsed
 #include "test_cluster_space_commit_redo.inc"
 }
 
+static void
+DropRelationFiles(RelFileLocator *locators, int nlocators, bool isRedo)
+{
+	UT_ASSERT(drop_verify_fixture && isRedo);
+	UT_ASSERT_EQ(nlocators, 1);
+	UT_ASSERT(RelFileLocatorEquals(locators[0], locator));
+	UT_ASSERT_EQ(flush_calls, 1);
+	UT_ASSERT_EQ(pinned | locked, 0);
+	post_drop_calls++;
+	post_drop_io = true;
+	if (post_drop_lose_namespace)
+		have_ref = false;
+}
+
+static void
+native_commit_redo_drop(XLogReaderState *record, xl_xact_parsed_commit *parsed, TransactionId xid)
+{
+	XLogRecPtr lsn = record->EndRecPtr;
+
+#include "test_cluster_space_commit_drop.inc"
+}
+
+UT_TEST(test_cold_native_drop_requires_empty_main_and_no_auxiliary_forks)
+{
+	/* -2 = missing MAIN, -1 = nonempty MAIN; other values retain that fork. */
+	for (int fault = -2; fault <= MAX_FORKNUM; fault++) {
+		XLogReaderState reader;
+		DecodedXLogRecord decoded;
+		Relation rel = drop_replay_record(&reader, &decoded);
+		xl_xact_parsed_commit parsed;
+		unsigned created = create_calls;
+		volatile bool caught = false;
+
+		cold_commit_window = cold_drop_proven = drop_verify_fixture = true;
+		UT_ASSERT(ParseCommitRecord(wal_info, (xl_xact_commit *)commit_bytes, commit_len, &parsed));
+		native_commit_redo_prefix(&reader, &parsed, 501);
+		UT_ASSERT_EQ(cold_drop_checks, 1);
+		post_drop_forks = fault == -2 ? 0 : (1U << MAIN_FORKNUM);
+		if (fault > MAIN_FORKNUM)
+			post_drop_forks |= 1U << fault;
+		main_blocks = fault == -1 ? 1 : 0;
+		expecting_error = true;
+		PG_TRY();
+		{
+			native_commit_redo_drop(&reader, &parsed, 501);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		expecting_error = false;
+		UT_ASSERT_EQ(caught, fault != MAIN_FORKNUM);
+		if (caught)
+			UT_ASSERT_EQ(reported_level, PANIC);
+		UT_ASSERT_EQ(post_drop_calls, 1);
+		UT_ASSERT(post_drop_reads > 0);
+		UT_ASSERT_EQ(create_calls, created);
+		UT_ASSERT_EQ(dirty_calls + truncate_calls + unlink_calls, 0);
+		UT_ASSERT(!pinned && !locked);
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
+UT_TEST(test_cold_native_drop_preserves_post_unlink_io_and_namespace_refusal)
+{
+	for (unsigned fault = 0; fault < 2; fault++) {
+		XLogReaderState reader;
+		DecodedXLogRecord decoded;
+		Relation rel = drop_replay_record(&reader, &decoded);
+		xl_xact_parsed_commit parsed;
+		volatile bool caught = false;
+
+		cold_commit_window = cold_drop_proven = drop_verify_fixture = true;
+		UT_ASSERT(ParseCommitRecord(wal_info, (xl_xact_commit *)commit_bytes, commit_len, &parsed));
+		native_commit_redo_prefix(&reader, &parsed, 501);
+		post_drop_forks = 1U << MAIN_FORKNUM;
+		main_blocks = 0;
+		post_drop_throw = fault == 0;
+		post_drop_lose_namespace = fault == 1;
+		expecting_error = true;
+		PG_TRY();
+		{
+			native_commit_redo_drop(&reader, &parsed, 501);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		expecting_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(reported_level, fault == 0 ? ERROR : PANIC);
+		UT_ASSERT_EQ(post_drop_calls, 1);
+		UT_ASSERT(!pinned && !locked);
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
+UT_TEST(test_native_drop_outside_cold_owner_keeps_original_consumer)
+{
+	XLogReaderState reader;
+	DecodedXLogRecord decoded;
+	Relation rel = drop_replay_record(&reader, &decoded);
+	xl_xact_parsed_commit parsed;
+
+	drop_verify_fixture = true;
+	post_drop_throw = true;
+	UT_ASSERT(ParseCommitRecord(wal_info, (xl_xact_commit *)commit_bytes, commit_len, &parsed));
+	native_commit_redo_drop(&reader, &parsed, 501);
+	UT_ASSERT_EQ(post_drop_calls, 1);
+	UT_ASSERT_EQ(post_drop_reads, 0);
+	FreeFakeRelcacheEntry(rel);
+}
+
 UT_TEST(test_native_cold_commit_uses_already_proof_without_local_flush_or_rewrite)
 {
 	XLogReaderState reader;
@@ -3398,7 +3532,10 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(66);
+	UT_PLAN(69);
+	UT_RUN(test_cold_native_drop_requires_empty_main_and_no_auxiliary_forks);
+	UT_RUN(test_cold_native_drop_preserves_post_unlink_io_and_namespace_refusal);
+	UT_RUN(test_native_drop_outside_cold_owner_keeps_original_consumer);
 	UT_RUN(test_maintenance_identity_uses_current_owner_without_backend_id);
 	UT_RUN(test_maintenance_identity_retry_keeps_work_and_releases_pin);
 	UT_RUN(test_maintenance_identity_preserves_namespace_and_live_page_checks);

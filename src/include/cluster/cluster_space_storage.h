@@ -193,4 +193,8 @@ extern void cluster_space_drop_finish(ClusterSpaceDropState *state);
  * No previous record or process-local intent is required at a checkpoint cut. */
 extern bool cluster_space_drop_replay_commit(XLogReaderState *record, TransactionId xid);
 
+/* Cold native COMMIT postcondition only, after the qualified deletion.
+ * Neither replay authority nor a durable completion / missing-SPACE proof. */
+extern bool cluster_space_drop_replay_verify_v1(XLogReaderState *record, TransactionId xid);
+
 #endif /* CLUSTER_SPACE_STORAGE_H */
