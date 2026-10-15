@@ -260,6 +260,40 @@ cluster_recovery_root_set_add_target(ClusterRecoveryRootSet *roots, const RfPage
 	return roots_add_relation(roots, &page->locator, page->forknum, (uint64)page->blockno + 1);
 }
 
+bool
+cluster_recovery_root_set_targets_match(const ClusterRecoveryRootSet *roots,
+										uint64 system_identifier, uint64 database_incarnation,
+										const uint8 storage_uuid[16])
+{
+	return roots != NULL && !roots->started && roots->status == CLUSTER_RECOVERY_ROOTS_MORE
+		   && storage_uuid != NULL && system_identifier == roots->system_identifier
+		   && database_incarnation == roots->database_incarnation
+		   && memcmp(storage_uuid, roots->storage_uuid, 16) == 0;
+}
+
+ClusterRecoveryRootsResult
+cluster_recovery_root_set_add_fork(ClusterRecoveryRootSet *roots,
+								   const ClusterSpaceIdentityKey *key, ForkNumber forknum,
+								   uint64 required_blocks)
+{
+	if (roots == NULL)
+		return CLUSTER_RECOVERY_ROOTS_INVALID;
+	if (roots->status > CLUSTER_RECOVERY_ROOTS_OBSERVED)
+		return roots->status;
+	if (key == NULL || required_blocks > InvalidBlockNumber
+		|| !cluster_recovery_root_set_targets_match(roots, key->system_identifier,
+													key->database_incarnation, key->storage_uuid))
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	return roots_add_relation(roots, &key->locator, forknum, required_blocks);
+}
+
+void
+cluster_recovery_root_set_invalidate(ClusterRecoveryRootSet *roots)
+{
+	if (roots != NULL && roots->status <= CLUSTER_RECOVERY_ROOTS_OBSERVED)
+		roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+}
+
 ClusterRecoveryRootsResult
 cluster_recovery_root_set_add_native(ClusterRecoveryRootSet *roots,
 									 const ClusterRecoveryNativeEffect *effect)

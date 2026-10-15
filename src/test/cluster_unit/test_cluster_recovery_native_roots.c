@@ -210,6 +210,7 @@ UT_TEST(test_foreign_namespace_malformed_effect_or_late_add_poison_observation)
 	remove_root(fd);
 }
 
+#ifndef RECOVERY_NATIVE_ROOTS_FIXTURE_ONLY
 int
 main(void)
 {
@@ -220,3 +221,4 @@ main(void)
 	UT_DONE();
 	return ut_failed_count != 0;
 }
+#endif

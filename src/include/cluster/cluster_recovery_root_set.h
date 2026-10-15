@@ -69,6 +69,20 @@ cluster_recovery_root_set_begin(int root_fd, uint64 system_identifier, uint64 da
 extern ClusterRecoveryRootsResult
 cluster_recovery_root_set_add_target(ClusterRecoveryRootSet *roots, const RfPageIdentityV1 *page);
 
+/* Whole-fork/structural candidates use the full namespace, without inventing
+ * a page reference. required_blocks is an observed WAL requirement only.
+ * These calls are allowed only before the first physical step. */
+extern bool cluster_recovery_root_set_targets_match(const ClusterRecoveryRootSet *roots,
+													uint64 system_identifier,
+													uint64 database_incarnation,
+													const uint8 storage_uuid[16]);
+extern ClusterRecoveryRootsResult
+cluster_recovery_root_set_add_fork(ClusterRecoveryRootSet *roots,
+								   const ClusterSpaceIdentityKey *key, ForkNumber forknum,
+								   uint64 required_blocks);
+/* A failed producer must not leave its partial target set usable. */
+extern void cluster_recovery_root_set_invalidate(ClusterRecoveryRootSet *roots);
+
 struct ClusterRecoveryNativeEffect;
 /* Add one native CREATE fork or a terminal's relation deletion (all shared
  * forks) to the same physical union. These target whole files, so they do

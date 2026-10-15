@@ -485,6 +485,7 @@ TESTS += test_cluster_recovery_relation_scan
 TESTS += test_cluster_recovery_native_scan
 TESTS += test_cluster_recovery_native_roots
 TESTS += test_cluster_recovery_native_inputs
+TESTS += test_cluster_recovery_wal_targets
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_namespace,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_heap_scan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_undo_scan,$(SIMPLE_TESTS))
@@ -496,6 +497,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_recovery_relation_scan,$(SIMPLE_TESTS)
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_native_scan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_native_roots,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_native_inputs,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_recovery_wal_targets,$(SIMPLE_TESTS))
 CLUSTER_BLOCK_APPLY_O = $(top_builddir)/src/backend/cluster/cluster_block_apply.o \
 		test_cluster_block_apply_btree_product.o
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
@@ -9065,6 +9067,30 @@ test_cluster_recovery_native_roots: test_cluster_recovery_native_roots.c \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+test_cluster_recovery_wal_targets: test_cluster_recovery_wal_targets.c \
+		test_cluster_recovery_native_roots.c test_cluster_recovery_root_set.c \
+		test_cluster_recovery_namespace.c test_cluster_recovery_crypto_boundary.h unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_wal_targets.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_wal_targets.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_native_scan.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_native_scan.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h \
+		$(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) $(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
+		$(top_builddir)/src/backend/cluster/cluster_page_stable_base.o \
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
+		$(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
+		$(top_builddir)/src/backend/cluster/cluster_page_stable_base.o \
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
