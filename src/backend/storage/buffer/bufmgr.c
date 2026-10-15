@@ -11799,6 +11799,7 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 	volatile bool io_started = false;
 	volatile bool data_locked = false;
 	volatile bool complete = false;
+	volatile bool physical_cleanup_complete = false;
 	bool space_target, identity_target;
 	PGAlignedBlock expected, disk;
 	uint64 space_token;
@@ -11842,137 +11843,148 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 	}
 	if (!cluster_ko_directory_io_begin_v3(key.locator, &io))
 		return false;
+	/* The original call also owns receipt construction/publication. Keep
+	 * buffer cleanup inside it; an unfinished cleanup must retain ownership. */
 	PG_TRY();
 	{
-		do {
-			PageHeader header;
-			SMgrRelation rel;
-			uint16 stored_checksum;
-			int page_origin;
+		PG_TRY();
+		{
+			do {
+				PageHeader header;
+				SMgrRelation rel;
+				uint16 stored_checksum;
+				int page_origin;
 
-			space = cluster_page_data_try_hold(space_tag, identity_target, &space_owner);
-			if (space == NULL
-				|| !cluster_space_identity_page_decode(BufHdrGetBlock(space), BLCKSZ, SPACE_FORKNUM,
-													   0, &key, &space_identity, &space_token)
-				|| (!space_target && space_identity.state != CLUSTER_SPACE_IDENTITY_LIVE)
-				|| (!sample_identity
-					&& memcmp(space_identity.incarnation, target->version.segment_incarnation, 16)
-						   != 0))
-				break;
-			if (identity_target) {
-				data = space;
-				data_owner = space_owner;
-			} else
-				data = cluster_page_data_try_hold(data_tag, true, &data_owner);
-			data_locked = data != NULL;
-			if (data == NULL
-				|| (cut != NULL
-					&& data_owner.generation != write_cut.holder.requester_target_generation)
-				|| !cluster_page_wal_read_v1(BufferDescriptorGetBuffer(data), &space_identity,
-											 &binding)
-				|| (!cluster_page_data_source_same(&source, &binding.source)
-					&& (binding.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0))
-				break;
-			if (sample_current)
-				written_target.version = binding.version;
-			memcpy(expected.data, BufHdrGetBlock(data), BLCKSZ);
-			header = (PageHeader)expected.data;
-			if (PageIsNew(expected.data) || PageGetPageSize(expected.data) != BLCKSZ
-				|| PageGetPageLayoutVersion(expected.data) != PG_PAGE_LAYOUT_VERSION
-				|| (header->pd_flags & (~PD_VALID_FLAG_BITS | PD_UNDO_SEG_HEADER)) != 0
-				|| (!space_target && (header->pd_flags & PD_SPACE_METADATA) != 0)
-				|| header->pd_lower < SizeOfPageHeaderData || header->pd_lower > header->pd_upper
-				|| header->pd_upper > header->pd_special || header->pd_special > BLCKSZ
-				|| header->pd_block_scn != written_target.version.mutation_token
-				|| !PageGetLSNOrigin(expected.data, &page_origin)
-				|| page_origin != binding.source.claim.identity.origin_thread_id - 1
-				|| XLogRecPtrIsInvalid(PageGetLSN(expected.data))
-				|| ((binding.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
-					&& PageGetLSN(expected.data) > GetXLogInsertRecPtr()))
-				break;
-			/* A transportable completion includes the original WAL certificate,
-			 * including when the current buffer was already clean. Never certify
-			 * foreign WAL through the receiver's Flush pointer. */
-			if (sample_identity && !cluster_page_wal_flush_source_v1(&binding, &binding))
-				break;
-			rel = smgropen(key.locator, InvalidBackendId);
-			FlushBufferWithRecovery(data, rel, IOOBJECT_RELATION, IOCONTEXT_NORMAL, NULL,
-									&io_started, &binding, NULL);
-			if (!cluster_page_data_holder_ready(data, &data_tag, true, &live)
-				|| !cluster_pcm_own_fence_equal_exact(&data_owner, &live)
-				|| (live.semantic_buf_state & (BM_DIRTY | BM_JUST_DIRTIED)) != 0)
-				break;
-			/* The native write consumed a stable snapshot. Keep the raw pin
-			 * and SPACE identity owner, but let foreground current writers run
-			 * during fork fsync/readback. Reacquire without waiting below.
-			 * SPACE0 itself owns the identity lock and must retain that single
-			 * hold; neither reacquire it recursively nor release it twice. */
-			if (!identity_target) {
-				LWLockRelease(BufferDescriptorGetContentLock(data));
-				data_locked = false;
+				space = cluster_page_data_try_hold(space_tag, identity_target, &space_owner);
+				if (space == NULL
+					|| !cluster_space_identity_page_decode(BufHdrGetBlock(space), BLCKSZ, SPACE_FORKNUM,
+														   0, &key, &space_identity, &space_token)
+					|| (!space_target && space_identity.state != CLUSTER_SPACE_IDENTITY_LIVE)
+					|| (!sample_identity
+						&& memcmp(space_identity.incarnation, target->version.segment_incarnation, 16)
+							   != 0))
+					break;
+				if (identity_target) {
+					data = space;
+					data_owner = space_owner;
+				} else
+					data = cluster_page_data_try_hold(data_tag, true, &data_owner);
+				data_locked = data != NULL;
+				if (data == NULL
+					|| (cut != NULL
+						&& data_owner.generation != write_cut.holder.requester_target_generation)
+					|| !cluster_page_wal_read_v1(BufferDescriptorGetBuffer(data), &space_identity,
+												 &binding)
+					|| (!cluster_page_data_source_same(&source, &binding.source)
+						&& (binding.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0))
+					break;
+				if (sample_current)
+					written_target.version = binding.version;
+				memcpy(expected.data, BufHdrGetBlock(data), BLCKSZ);
+				header = (PageHeader)expected.data;
+				if (PageIsNew(expected.data) || PageGetPageSize(expected.data) != BLCKSZ
+					|| PageGetPageLayoutVersion(expected.data) != PG_PAGE_LAYOUT_VERSION
+					|| (header->pd_flags & (~PD_VALID_FLAG_BITS | PD_UNDO_SEG_HEADER)) != 0
+					|| (!space_target && (header->pd_flags & PD_SPACE_METADATA) != 0)
+					|| header->pd_lower < SizeOfPageHeaderData || header->pd_lower > header->pd_upper
+					|| header->pd_upper > header->pd_special || header->pd_special > BLCKSZ
+					|| header->pd_block_scn != written_target.version.mutation_token
+					|| !PageGetLSNOrigin(expected.data, &page_origin)
+					|| page_origin != binding.source.claim.identity.origin_thread_id - 1
+					|| XLogRecPtrIsInvalid(PageGetLSN(expected.data))
+					|| ((binding.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
+						&& PageGetLSN(expected.data) > GetXLogInsertRecPtr()))
+					break;
+				/* A transportable completion includes the original WAL certificate,
+				 * including when the current buffer was already clean. Never certify
+				 * foreign WAL through the receiver's Flush pointer. */
+				if (sample_identity && !cluster_page_wal_flush_source_v1(&binding, &binding))
+					break;
+				rel = smgropen(key.locator, InvalidBackendId);
+				FlushBufferWithRecovery(data, rel, IOOBJECT_RELATION, IOCONTEXT_NORMAL, NULL,
+										&io_started, &binding, NULL);
+				if (!cluster_page_data_holder_ready(data, &data_tag, true, &live)
+					|| !cluster_pcm_own_fence_equal_exact(&data_owner, &live)
+					|| (live.semantic_buf_state & (BM_DIRTY | BM_JUST_DIRTIED)) != 0)
+					break;
+				/* The native write consumed a stable snapshot. Keep the raw pin
+				 * and SPACE identity owner, but let foreground current writers run
+				 * during fork fsync/readback. Reacquire without waiting below.
+				 * SPACE0 itself owns the identity lock and must retain that single
+				 * hold; neither reacquire it recursively nor release it twice. */
+				if (!identity_target) {
+					LWLockRelease(BufferDescriptorGetContentLock(data));
+					data_locked = false;
+				}
+				smgrimmedsync(rel, target->identity.forknum);
+				smgrread(rel, target->identity.forknum, target->identity.blockno, disk.data);
+				/* Never let ignore_checksum_failure qualify physical DATA. Check
+				 * PageIsNew before computing checksums (native checksum asserts). */
+				if (PageIsNew(disk.data))
+					break;
+				stored_checksum = ((PageHeader)disk.data)->pd_checksum;
+				PageSetChecksumInplace(disk.data, target->identity.blockno);
+				if (DataChecksumsEnabled() && stored_checksum != ((PageHeader)disk.data)->pd_checksum)
+					break;
+				header->pd_checksum = ((PageHeader)disk.data)->pd_checksum = 0;
+				if (memcmp(expected.data, disk.data, BLCKSZ) != 0
+					|| (!data_locked
+						&& !LWLockConditionalAcquire(BufferDescriptorGetContentLock(data), LW_SHARED)))
+					break;
+				data_locked = true;
+				if (!cluster_page_data_holder_ready(data, &data_tag, true, &live)
+					|| !cluster_pcm_own_fence_equal_exact(&data_owner, &live)
+					|| (live.semantic_buf_state & (BM_DIRTY | BM_JUST_DIRTIED)) != 0
+					|| !cluster_page_wal_read_v1(BufferDescriptorGetBuffer(data), &space_identity,
+												 &reobserved)
+					|| !cluster_page_wal_same_mutation_v1(&binding, &reobserved)
+					|| !cluster_page_data_holder_ready(space, &space_tag, false, &live)
+					|| !cluster_pcm_own_fence_equal_exact(&space_owner, &live)
+					|| !cluster_wal_thread_current_v2_ref(&current)
+					|| !cluster_page_data_source_same(&source, &current))
+					break;
+				complete = true;
+			} while (false);
+		}
+		PG_FINALLY();
+		{
+			error_context_stack = saved_context;
+			if (io_started)
+				AbortBufferIO(BufferDescriptorGetBuffer(data));
+			if (data != NULL && data != space) {
+				/* elog(ERROR) reset holdoffs, but these exact locks remain ours. */
+				if (data_locked) {
+					if (InterruptHoldoffCount == 0)
+						HOLD_INTERRUPTS();
+					LWLockRelease(BufferDescriptorGetContentLock(data));
+				}
+				cluster_bufmgr_unpin_for_gcs(data);
 			}
-			smgrimmedsync(rel, target->identity.forknum);
-			smgrread(rel, target->identity.forknum, target->identity.blockno, disk.data);
-			/* Never let ignore_checksum_failure qualify physical DATA. Check
-			 * PageIsNew before computing checksums (native checksum asserts). */
-			if (PageIsNew(disk.data))
-				break;
-			stored_checksum = ((PageHeader)disk.data)->pd_checksum;
-			PageSetChecksumInplace(disk.data, target->identity.blockno);
-			if (DataChecksumsEnabled() && stored_checksum != ((PageHeader)disk.data)->pd_checksum)
-				break;
-			header->pd_checksum = ((PageHeader)disk.data)->pd_checksum = 0;
-			if (memcmp(expected.data, disk.data, BLCKSZ) != 0
-				|| (!data_locked
-					&& !LWLockConditionalAcquire(BufferDescriptorGetContentLock(data), LW_SHARED)))
-				break;
-			data_locked = true;
-			if (!cluster_page_data_holder_ready(data, &data_tag, true, &live)
-				|| !cluster_pcm_own_fence_equal_exact(&data_owner, &live)
-				|| (live.semantic_buf_state & (BM_DIRTY | BM_JUST_DIRTIED)) != 0
-				|| !cluster_page_wal_read_v1(BufferDescriptorGetBuffer(data), &space_identity,
-											 &reobserved)
-				|| !cluster_page_wal_same_mutation_v1(&binding, &reobserved)
-				|| !cluster_page_data_holder_ready(space, &space_tag, false, &live)
-				|| !cluster_pcm_own_fence_equal_exact(&space_owner, &live)
-				|| !cluster_wal_thread_current_v2_ref(&current)
-				|| !cluster_page_data_source_same(&source, &current))
-				break;
-			complete = true;
-		} while (false);
+			if (space != NULL) {
+				if (InterruptHoldoffCount == 0)
+					HOLD_INTERRUPTS();
+				LWLockRelease(BufferDescriptorGetContentLock(space));
+				cluster_bufmgr_unpin_for_gcs(space);
+			}
+			physical_cleanup_complete = true;
+		}
+		PG_END_TRY();
+		if (complete) {
+			receipt = palloc0(sizeof(*receipt));
+			receipt->magic = UINT64_C(0x5047444154413031);
+			receipt->target = written_target;
+			receipt->wal = binding;
+			receipt->pi_cut = write_cut;
+			*out = receipt;
+		}
 	}
 	PG_FINALLY();
 	{
-		error_context_stack = saved_context;
-		if (io_started)
-			AbortBufferIO(BufferDescriptorGetBuffer(data));
-		if (data != NULL && data != space) {
-			/* elog(ERROR) reset holdoffs, but these exact locks remain ours. */
-			if (data_locked) {
-				if (InterruptHoldoffCount == 0)
-					HOLD_INTERRUPTS();
-				LWLockRelease(BufferDescriptorGetContentLock(data));
-			}
-			cluster_bufmgr_unpin_for_gcs(data);
-		}
-		if (space != NULL) {
-			if (InterruptHoldoffCount == 0)
-				HOLD_INTERRUPTS();
-			LWLockRelease(BufferDescriptorGetContentLock(space));
-			cluster_bufmgr_unpin_for_gcs(space);
-		}
-		(void)cluster_ko_directory_io_end_v3(&io);
+		if (physical_cleanup_complete)
+			(void)cluster_ko_directory_io_end_v3(&io);
 	}
 	PG_END_TRY();
-	if (!complete)
-		return false;
-	receipt = palloc0(sizeof(*receipt));
-	receipt->magic = UINT64_C(0x5047444154413031);
-	receipt->target = written_target;
-	receipt->wal = binding;
-	receipt->pi_cut = write_cut;
-	*out = receipt;
-	return true;
+	return complete;
 }
 
 bool
@@ -12921,6 +12933,7 @@ cluster_bufmgr_observe_pi_storage_internal(const ClusterPageDataTargetV1 *target
 	ErrorContextCallback *saved_context = error_context_stack;
 	PGAlignedBlock before, after;
 	volatile bool complete = false;
+	volatile bool physical_cleanup_complete = false;
 	uint64 token;
 	ClusterPageDataReceiptV1 *receipt;
 	ClusterKoDirectoryIoV3 io;
@@ -12961,72 +12974,83 @@ cluster_bufmgr_observe_pi_storage_internal(const ClusterPageDataTargetV1 *target
 	InitBufferTag(&space_tag, &key.locator, SPACE_FORKNUM, 0);
 	if (!cluster_ko_directory_io_begin_v3(key.locator, &io))
 		return false;
+	/* The original call also owns receipt construction/publication. Keep
+	 * buffer cleanup inside it; an unfinished cleanup must retain ownership. */
 	PG_TRY();
 	{
-		do {
-			SMgrRelation rel;
-			/* SPACE0 is the identity itself. Its exact N/S master cut protects
-			 * this read-only observation even with no resident current buffer.
-			 * SPACE1 and ordinary DATA retain the original identity-S owner. */
-			if (!typed || target->identity.blockno != 0) {
-				space = cluster_page_data_try_hold(space_tag, false, &space_owner);
-				if (space == NULL
-					|| !cluster_space_identity_page_decode(
-						BufHdrGetBlock(space), BLCKSZ, SPACE_FORKNUM, 0, &key, &identity, &token)
-					|| (!typed && identity.state != CLUSTER_SPACE_IDENTITY_LIVE)
-					|| memcmp(identity.incarnation, target->version.segment_incarnation, 16) != 0
-					|| (typed
-						&& (identity.state != expected_identity.state
-							|| identity.sequence != expected_identity.sequence
-							|| identity.operation != expected_identity.operation)))
+		PG_TRY();
+		{
+			do {
+				SMgrRelation rel;
+				/* SPACE0 is the identity itself. Its exact N/S master cut protects
+				 * this read-only observation even with no resident current buffer.
+				 * SPACE1 and ordinary DATA retain the original identity-S owner. */
+				if (!typed || target->identity.blockno != 0) {
+					space = cluster_page_data_try_hold(space_tag, false, &space_owner);
+					if (space == NULL
+						|| !cluster_space_identity_page_decode(
+							BufHdrGetBlock(space), BLCKSZ, SPACE_FORKNUM, 0, &key, &identity, &token)
+						|| (!typed && identity.state != CLUSTER_SPACE_IDENTITY_LIVE)
+						|| memcmp(identity.incarnation, target->version.segment_incarnation, 16) != 0
+						|| (typed
+							&& (identity.state != expected_identity.state
+								|| identity.sequence != expected_identity.sequence
+								|| identity.operation != expected_identity.operation)))
+						break;
+				}
+				rel = smgropen(key.locator, InvalidBackendId);
+				smgrread(rel, target->identity.forknum, target->identity.blockno, before.data);
+				if (!cluster_page_data_storage_page_valid(&binding, before.data,
+														  typed ? &expected_identity : NULL))
 					break;
+				smgrimmedsync(rel, target->identity.forknum);
+				smgrread(rel, target->identity.forknum, target->identity.blockno, after.data);
+				if (!cluster_page_data_storage_page_valid(&binding, after.data,
+														  typed ? &expected_identity : NULL)
+					|| memcmp(before.data, after.data, BLCKSZ) != 0
+					|| (space != NULL
+						&& (!cluster_page_data_holder_ready(space, &space_tag, false, &live)
+							|| !cluster_pcm_own_fence_equal_exact(&space_owner, &live)))
+					|| !cluster_wal_thread_current_v2_ref(&current)
+					|| !cluster_page_data_source_same(&source, &current)
+					|| !cluster_pcm_lock_pi_storage_matches_v1(&observed))
+					break;
+				complete = true;
+			} while (false);
+		}
+		PG_FINALLY();
+		{
+			error_context_stack = saved_context;
+			if (space != NULL) {
+				if (InterruptHoldoffCount == 0)
+					HOLD_INTERRUPTS();
+				LWLockRelease(BufferDescriptorGetContentLock(space));
+				cluster_bufmgr_unpin_for_gcs(space);
 			}
-			rel = smgropen(key.locator, InvalidBackendId);
-			smgrread(rel, target->identity.forknum, target->identity.blockno, before.data);
-			if (!cluster_page_data_storage_page_valid(&binding, before.data,
-													  typed ? &expected_identity : NULL))
-				break;
-			smgrimmedsync(rel, target->identity.forknum);
-			smgrread(rel, target->identity.forknum, target->identity.blockno, after.data);
-			if (!cluster_page_data_storage_page_valid(&binding, after.data,
-													  typed ? &expected_identity : NULL)
-				|| memcmp(before.data, after.data, BLCKSZ) != 0
-				|| (space != NULL
-					&& (!cluster_page_data_holder_ready(space, &space_tag, false, &live)
-						|| !cluster_pcm_own_fence_equal_exact(&space_owner, &live)))
-				|| !cluster_wal_thread_current_v2_ref(&current)
-				|| !cluster_page_data_source_same(&source, &current)
-				|| !cluster_pcm_lock_pi_storage_matches_v1(&observed))
-				break;
-			complete = true;
-		} while (false);
+			physical_cleanup_complete = true;
+		}
+		PG_END_TRY();
+		if (complete) {
+			receipt = palloc0(sizeof(*receipt));
+			receipt->magic = UINT64_C(0x5047444154413031);
+			receipt->target = *target;
+			receipt->wal = binding;
+			receipt->storage_cut = observed;
+			if (typed) {
+				receipt->space_plan = fabric;
+				receipt->space_operation = typed_operation;
+				receipt->space_terminal = true;
+			}
+			*out = receipt;
+		}
 	}
 	PG_FINALLY();
 	{
-		error_context_stack = saved_context;
-		if (space != NULL) {
-			if (InterruptHoldoffCount == 0)
-				HOLD_INTERRUPTS();
-			LWLockRelease(BufferDescriptorGetContentLock(space));
-			cluster_bufmgr_unpin_for_gcs(space);
-		}
-		(void)cluster_ko_directory_io_end_v3(&io);
+		if (physical_cleanup_complete)
+			(void)cluster_ko_directory_io_end_v3(&io);
 	}
 	PG_END_TRY();
-	if (!complete)
-		return false;
-	receipt = palloc0(sizeof(*receipt));
-	receipt->magic = UINT64_C(0x5047444154413031);
-	receipt->target = *target;
-	receipt->wal = binding;
-	receipt->storage_cut = observed;
-	if (typed) {
-		receipt->space_plan = fabric;
-		receipt->space_operation = typed_operation;
-		receipt->space_terminal = true;
-	}
-	*out = receipt;
-	return true;
+	return complete;
 }
 
 bool

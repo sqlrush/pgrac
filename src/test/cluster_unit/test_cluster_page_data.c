@@ -3,6 +3,7 @@
  * Author: SqlRush <sqlrush@gmail.com> */
 #include "postgres.h"
 #include <unistd.h>
+#include <sys/wait.h>
 
 #include "access/xlog.h"
 #include "access/xact.h"
@@ -79,6 +80,10 @@ static bool locks[2], resident[2], busy[2], selected, sf_blocked, bad_checksum, 
 static bool directory_io_denied, directory_io_entered;
 static bool require_data_io_scope;
 static unsigned directory_io_begins, directory_io_ends;
+static ClusterPageDataReceiptV1 **receipt_publication_out;
+static bool receipt_allocation_watch, receipt_allocation_error, receipt_cleanup_error;
+static bool receipt_allocation_entered, receipt_allocation_clean, receipt_published_at_end;
+static unsigned receipt_allocations;
 
 bool
 cluster_ko_directory_io_begin_v3(RelFileLocator locator, ClusterKoDirectoryIoV3 *out)
@@ -100,6 +105,8 @@ cluster_ko_directory_io_end_v3(const ClusterKoDirectoryIoV3 *scope)
 	UT_ASSERT(!locks[0] && !locks[1]);
 	UT_ASSERT(!pins[0] && !pins[1]);
 	UT_ASSERT(directory_io_entered && scope->serial == 717);
+	if (receipt_publication_out != NULL)
+		receipt_published_at_end = *receipt_publication_out != NULL;
 	directory_io_entered = false;
 	directory_io_ends++;
 	return true;
@@ -638,6 +645,11 @@ static void
 cluster_bufmgr_unpin_for_gcs(BufferDesc *buf)
 {
 	UT_ASSERT(!locks[buf->buf_id] && pins[buf->buf_id]);
+	if (receipt_cleanup_error) {
+		receipt_cleanup_error = false;
+		InterruptHoldoffCount = 0;
+		pg_re_throw();
+	}
 	pins[buf->buf_id]--;
 }
 static bool
@@ -897,7 +909,23 @@ shared_buffer_write_error_callback(void *arg)
 #include "test_cluster_space_recovery_flush.inc"
 #include "test_cluster_page_flush.inc"
 #include "test_cluster_page_data_scn.inc"
+/* Observe the real caller's allocation boundary, not a replacement receipt
+ * builder. The existing allocator still owns successful memory. */
+static void *
+receipt_publication_alloc0(Size size)
+{
+	if (receipt_allocation_watch) {
+		receipt_allocations++;
+		receipt_allocation_entered = directory_io_entered;
+		receipt_allocation_clean = !locks[0] && !locks[1] && !pins[0] && !pins[1];
+		if (receipt_allocation_error)
+			pg_re_throw();
+	}
+	return palloc0(size);
+}
+#define palloc0 receipt_publication_alloc0
 #include "test_cluster_page_data.inc"
+#undef palloc0
 #include "test_cluster_block_redeclare_scan.inc"
 
 static void
@@ -941,6 +969,10 @@ reset(void)
 	directory_io_denied = false;
 	require_data_io_scope = false;
 	directory_io_begins = directory_io_ends = 0;
+	receipt_publication_out = NULL;
+	receipt_allocation_watch = receipt_allocation_error = receipt_cleanup_error = false;
+	receipt_allocation_entered = receipt_allocation_clean = receipt_published_at_end = false;
+	receipt_allocations = 0;
 
 #ifndef PGRAC_TEST_REAL_PI_WRITEBACK
 	recovered_count = 3;
@@ -5374,13 +5406,123 @@ space_storage_io_errors_never_export_or_leak_identity(void)
 		}
 }
 
+/* Exercise the actual DATA/storage producers. A committed marker must not
+ * overtake allocation/publication after physical cleanup. */
+static void
+receipt_publication_case(int mode, int error_stage)
+{
+	ClusterPageDataReceiptV1 *receipt = NULL;
+	ClusterWalSourceRef sources[3];
+	ClusterPageWalBindingV1 ancestor;
+	ClusterPcmPiStorageCutV1 cut;
+	RfPageOnlinePlanV1 *plan = NULL;
+	ClusterThreadRecoveryFabricPlanV1 *fabric = NULL;
+	volatile bool caught = false, result = false;
+
+	if (mode == 0)
+		reset();
+	else if (mode == 1)
+		plan = prepare_storage_observation(sources, &cut);
+	else
+		fabric = space_storage_fixture(mode - 2, false, false, sources, &ancestor, &cut);
+	receipt_publication_out = &receipt;
+	receipt_allocation_watch = true;
+	receipt_allocation_error = error_stage == 1;
+	receipt_cleanup_error = error_stage == 2;
+	PG_TRY();
+	{
+		if (mode == 0)
+			result = cluster_bufmgr_write_page_data_v1(&target, &receipt);
+		else if (mode == 1)
+			result = cluster_bufmgr_observe_pi_storage_v1(&target, &cut, plan, sources, 3,
+														  &receipt);
+		else
+			result = cluster_bufmgr_observe_pi_space_storage_v1(&identity.key, &cut, fabric,
+																 sources, 2, &receipt);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT_EQ(caught, error_stage != 0);
+	UT_ASSERT_EQ(result, error_stage == 0);
+	UT_ASSERT_EQ(receipt != NULL, error_stage == 0);
+	UT_ASSERT_EQ(directory_io_begins, 1);
+	if (error_stage == 2) {
+		UT_ASSERT(directory_io_entered);
+		UT_ASSERT_EQ(directory_io_ends, 0);
+		UT_ASSERT_EQ(receipt_allocations, 0);
+		UT_ASSERT(pins[0] || pins[1]);
+		/* Only child processes exercise this uncertain cleanup. Their exit
+		 * is test isolation, not a production recovery/completion proof. */
+		return;
+	}
+	UT_ASSERT_EQ(receipt_allocations, 1);
+	UT_ASSERT(receipt_allocation_entered);
+	UT_ASSERT(receipt_allocation_clean);
+	UT_ASSERT_EQ(receipt_published_at_end, error_stage == 0);
+	UT_ASSERT(!directory_io_entered);
+	UT_ASSERT_EQ(directory_io_ends, 1);
+	receipt_allocation_watch = false;
+	receipt_publication_out = NULL;
+	cluster_page_data_receipt_free_v1(&receipt);
+	if (plan != NULL)
+		rf_page_online_plan_destroy_v1(&plan);
+	if (fabric != NULL)
+		cluster_thread_recovery_fabric_plan_destroy_v1(&fabric);
+	clean();
+}
+
+static void
+receipt_publication_stays_inside_original_call(void)
+{
+	for (int mode = 0; mode < 4; mode++)
+		receipt_publication_case(mode, 0);
+}
+
+static void
+receipt_allocation_error_ends_call_without_output(void)
+{
+	for (int mode = 0; mode < 4; mode++)
+		receipt_publication_case(mode, 1);
+}
+
+static void
+receipt_cleanup_error_keeps_unknown_call_owned(void)
+{
+	for (int mode = 0; mode < 4; mode++) {
+		pid_t child;
+		int status;
+		if (mode == 2)
+			continue; /* SPACE0 storage observation has no physical pin. */
+		fflush(NULL);
+		child = fork();
+		UT_ASSERT(child >= 0);
+		if (child == 0) {
+			ut_current_failed = 0;
+			receipt_publication_case(mode, 2);
+			fflush(NULL);
+			_exit(ut_current_failed ? 1 : 0);
+		}
+		if (child > 0) {
+			UT_ASSERT_EQ(waitpid(child, &status, 0), child);
+			UT_ASSERT(WIFEXITED(status));
+			UT_ASSERT_EQ(WEXITSTATUS(status), 0);
+		}
+	}
+}
+
 #endif
 
 int
 main(void)
 {
 #ifndef PGRAC_TEST_REAL_PI_WRITEBACK
-	UT_PLAN(80);
+	UT_PLAN(83);
+	UT_RUN(receipt_publication_stays_inside_original_call);
+	UT_RUN(receipt_allocation_error_ends_call_without_output);
+	UT_RUN(receipt_cleanup_error_keeps_unknown_call_owned);
 	UT_RUN(ordinary_flush_attempt_tracks_actual_data_submission);
 	UT_RUN(structural_remote_ack_import_binds_original_inputs_and_cut);
 	UT_RUN(structural_remote_ack_refuses_transport_input_and_collector_drift);
