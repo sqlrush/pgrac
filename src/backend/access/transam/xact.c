@@ -2986,6 +2986,13 @@ CommitTransaction(void)
 	 */
 	AtEOXact_Inval(true);
 
+#ifdef USE_PGRAC_CLUSTER
+	/* Record the successful publication in the original committed DROP
+	 * owner before releasing its AX or handing off pending file deletion. */
+	if (!is_parallel_worker)
+		cluster_ko_shared_native_publication_v3();
+#endif
+
 	AtEOXact_MultiXact();
 
 	ResourceOwnerRelease(TopTransactionResourceOwner,

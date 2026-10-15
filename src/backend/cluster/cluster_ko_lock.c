@@ -141,6 +141,8 @@ typedef struct ClusterKoSharedContext {
 	int32 pid;
 	int32 drop_executor_pid;
 	uint64 serial;
+	uint32 drop_identity;
+	uint64 drop_identity_serial;
 	ClusterKoSharedMessageV2 request;
 	ClusterKoSharedMessageV3 request_v3;
 	uint64 peer_boots[CLUSTER_KO_SHARED_NODE_LIMIT];
@@ -346,6 +348,8 @@ struct ClusterKoCompletionV2 {
 	bool barrier_private;
 	bool barrier_v3;
 	uint16 barrier_ready_peers;
+	uint32 drop_identity;
+	uint64 drop_identity_serial;
 	dsa_pointer native_allocation;
 	ClusterKoNativeContinuation *native_reserved;
 	ClusterKoSharedMessageV2 barrier_request;
@@ -971,56 +975,57 @@ cluster_ko_directory_drop_committed_v3(RelFileLocator locator)
 	return committed;
 }
 
-/* The original SI executor reserves before any physical work. COMMIT never
- * allocates; exhaustion keeps the original negative operation owner. */
+/* The original SI executor reserves before physical work; a native origin
+ * reserves before REQUEST. COMMIT never allocates; exhaustion keeps the
+ * original negative operation owner. */
 static bool
-ko_drop_reserve_locked(ClusterKoPeerFenceV3 *entry)
+ko_drop_reserve_locked(const ClusterKoSharedMessageV3 *request, uint64 serial, uint32 *index)
 {
 	KoDropIdentity *identity;
 	uint32 link, bucket;
 
-	if (entry->request.operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP)
+	if (request->operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP)
 		return true;
-	if (entry->drop_identity != 0) {
-		if (entry->drop_identity > KO_DROP_IDENTITY_CAPACITY)
+	if (*index != 0) {
+		if (*index > KO_DROP_IDENTITY_CAPACITY)
 			return false;
-		identity = &ko_state->drop_identities[entry->drop_identity - 1];
+		identity = &ko_state->drop_identities[*index - 1];
 		return identity->state == KO_DROP_IDENTITY_RESERVED
-			&& identity->fence_serial == entry->serial
-			&& memcmp(&identity->request, &entry->request, sizeof(entry->request)) == 0;
+			&& identity->fence_serial == serial
+			&& memcmp(&identity->request, request, sizeof(*request)) == 0;
 	}
 	link = ko_state->drop_free;
 	if (link == 0 || link > KO_DROP_IDENTITY_CAPACITY
-		|| ko_drop_closed_locked(entry->request.base.key.locator))
+		|| ko_drop_closed_locked(request->base.key.locator))
 		return false;
 	identity = &ko_state->drop_identities[link - 1];
 	if (identity->state != KO_DROP_IDENTITY_FREE)
 		return false;
 	ko_state->drop_free = identity->next;
-	bucket = ko_drop_bucket(entry->request.base.key.locator);
+	bucket = ko_drop_bucket(request->base.key.locator);
 	memset(identity, 0, sizeof(*identity));
 	identity->state = KO_DROP_IDENTITY_RESERVED;
-	identity->request = entry->request;
-	identity->fence_serial = entry->serial;
+	identity->request = *request;
+	identity->fence_serial = serial;
 	identity->next = ko_state->drop_buckets[bucket];
 	ko_state->drop_buckets[bucket] = link;
-	entry->drop_identity = link;
+	*index = link;
 	return true;
 }
 
 static bool
-ko_drop_release_locked(ClusterKoPeerFenceV3 *entry)
+ko_drop_release_locked(const ClusterKoSharedMessageV3 *request, uint64 serial, uint32 index)
 {
 	KoDropIdentity *identity;
 	uint32 *link;
 
-	if (entry->drop_identity == 0)
+	if (index == 0)
 		return true;
-	if (entry->drop_identity > KO_DROP_IDENTITY_CAPACITY)
+	if (index > KO_DROP_IDENTITY_CAPACITY)
 		return false;
-	identity = &ko_state->drop_identities[entry->drop_identity - 1];
-	if (identity->fence_serial != entry->serial
-		|| memcmp(&identity->request, &entry->request, sizeof(entry->request)) != 0)
+	identity = &ko_state->drop_identities[index - 1];
+	if (identity->fence_serial != serial
+		|| memcmp(&identity->request, request, sizeof(*request)) != 0)
 		return false;
 	/* A committed DROP never reopens this old locator during this instance.
 	 * The native MAIN placeholder prevents its reuse by a new object. */
@@ -1029,7 +1034,7 @@ ko_drop_release_locked(ClusterKoPeerFenceV3 *entry)
 	if (identity->state != KO_DROP_IDENTITY_RESERVED)
 		return false;
 	link = &ko_state->drop_buckets[ko_drop_bucket(identity->request.base.key.locator)];
-	for (unsigned n = 0; *link != entry->drop_identity; n++) {
+	for (unsigned n = 0; *link != index; n++) {
 		if (*link == 0 || *link > KO_DROP_IDENTITY_CAPACITY || n >= KO_DROP_IDENTITY_CAPACITY)
 			return false;
 		link = &ko_state->drop_identities[*link - 1].next;
@@ -1037,7 +1042,7 @@ ko_drop_release_locked(ClusterKoPeerFenceV3 *entry)
 	*link = identity->next;
 	memset(identity, 0, sizeof(*identity));
 	identity->next = ko_state->drop_free;
-	ko_state->drop_free = entry->drop_identity;
+	ko_state->drop_free = index;
 	return true;
 }
 
@@ -1049,6 +1054,44 @@ ko_directory_io_pending_locked(RelFileLocator locator)
 			&& RelFileLocatorEquals(ko_state->directory_io[i].locator, locator))
 			return true;
 	return false;
+}
+
+/* Original native continuation reference; promotion changes the execution
+ * slot serial, not this immutable reservation or full operation identity. */
+static KoDropIdentity *
+ko_origin_drop_identity_locked(const ClusterKoSharedContext *context)
+{
+	KoDropIdentity *identity;
+
+	if (!context->v3 || context->request_v3.operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP
+		|| context->drop_identity == 0 || context->drop_identity > KO_DROP_IDENTITY_CAPACITY
+		|| context->drop_identity_serial == 0)
+		return NULL;
+	identity = &ko_state->drop_identities[context->drop_identity - 1];
+	if (identity->state < KO_DROP_IDENTITY_RESERVED || identity->state > KO_DROP_IDENTITY_RETIRED
+		|| identity->fence_serial != context->drop_identity_serial
+		|| memcmp(&identity->request, &context->request_v3, sizeof(identity->request)) != 0)
+		return NULL;
+	return identity;
+}
+
+static bool
+ko_origin_drop_io_closed(const ClusterKoSharedContext *context)
+{
+	KoDropIdentity *identity;
+	bool closed = false;
+
+	if (!context->v3 || context->request_v3.operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP)
+		return true;
+	SpinLockAcquire(&ko_state->shared_lock);
+	identity = ko_origin_drop_identity_locked(context);
+	if (identity != NULL && identity->state >= KO_DROP_IDENTITY_CLOSING
+		&& !ko_directory_io_pending_locked(context->request.key.locator)) {
+		identity->state = KO_DROP_IDENTITY_RETIRED;
+		closed = true;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	return closed;
 }
 
 bool
@@ -2349,7 +2392,7 @@ cluster_ko_peer_fence_ready_v3(const ClusterKoSharedMessageV3 *request,
 		&& cluster_pcm_lock_resource_x_gate_snapshot(&gate)
 		&& memcmp(&gate, &entry->local_scan_gate, sizeof(gate)) == 0
 		&& gate.phase == RESOURCE_X_GATE_OPEN && gate.formation == request->base.epoch
-		&& ko_drop_reserve_locked(entry)) {
+		&& ko_drop_reserve_locked(&entry->request, entry->serial, &entry->drop_identity)) {
 		if (entry->state == CLUSTER_KO_PEER_FENCE_ACTIVE) {
 			uint64 sealed_revision = entry->local_scan_revision + 1;
 
@@ -2450,7 +2493,7 @@ ko_peer_fence_physical_tick_v3(ClusterKoPeerFenceV3 *before,
 		SpinLockRelease(&ko_state->shared_lock);
 		return false;
 	}
-	if (!ko_drop_reserve_locked(entry)) {
+	if (!ko_drop_reserve_locked(&entry->request, entry->serial, &entry->drop_identity)) {
 		SpinLockRelease(&ko_state->shared_lock);
 		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 						errmsg("cannot reserve retired DROP identity"),
@@ -2695,7 +2738,7 @@ ko_peer_fence_clear_locked(ClusterKoPeerFenceV3 *entry)
 	revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
 	if (revision == 0 || revision >= UINT64_MAX - 1)
 		return false;
-	if (!ko_drop_release_locked(entry))
+	if (!ko_drop_release_locked(&entry->request, entry->serial, entry->drop_identity))
 		return false;
 	memset(entry, 0, sizeof(*entry));
 	(void)pg_atomic_fetch_add_u64(&ko_state->peer_admission_revision, 1);
@@ -3288,6 +3331,8 @@ ko_completion_snapshot(const ClusterKoCompletionV2 *completion, ClusterKoSharedC
 		out->used = out->complete = true;
 		out->pid = owned->pid;
 		out->serial = owned->serial;
+		out->drop_identity = owned->drop_identity;
+		out->drop_identity_serial = owned->drop_identity_serial;
 		out->v3 = owned->barrier_v3;
 		out->request = owned->barrier_v3 ? owned->barrier_request_v3.base
 											: owned->barrier_request;
@@ -3327,6 +3372,8 @@ ko_native_barrier_to_owner(ClusterKoCompletionV2 *completion)
 		if (before.v3) {
 			completion->barrier_request_v3 = before.request_v3;
 			completion->barrier_ready_peers = before.request_done_peers;
+			completion->drop_identity = before.drop_identity;
+			completion->drop_identity_serial = before.drop_identity_serial;
 		}
 		memcpy(completion->barrier_boots, before.peer_boots, sizeof(before.peer_boots));
 		completion->barrier_private = true;
@@ -3632,6 +3679,8 @@ ko_native_publish(ClusterKoCompletionV2 *owned, bool from_commit_tail)
 	work->context.used = work->context.complete = true;
 	work->context.pid = owned->pid;
 	work->context.serial = owned->serial;
+	work->context.drop_identity = owned->drop_identity;
+	work->context.drop_identity_serial = owned->drop_identity_serial;
 	work->context.v3 = owned->barrier_v3;
 	work->context.request = owned->barrier_v3 ? owned->barrier_request_v3.base
 											: owned->barrier_request;
@@ -3655,6 +3704,25 @@ ko_native_publish(ClusterKoCompletionV2 *owned, bool from_commit_tail)
 	if (!work->buffers_released)
 		owned->native_unready = owned->native_allocation;
 	SpinLockAcquire(&ko_state->shared_lock);
+	if (work->context.v3
+		&& work->context.request_v3.operation == CLUSTER_KO_SHARED_V3_OPERATION_DROP) {
+		ClusterKoSharedContext *origin = owned->slot < CLUSTER_KO_SHARED_CAPACITY
+			? &ko_state->contexts[owned->slot] : NULL;
+		KoDropIdentity *identity = ko_origin_drop_identity_locked(&work->context);
+
+		if (origin == NULL || !origin->used || origin->serial != owned->serial
+			|| origin->pid != owned->pid || origin->drop_identity != owned->drop_identity
+			|| origin->drop_identity_serial != owned->drop_identity_serial
+			|| identity == NULL || identity->state != KO_DROP_IDENTITY_RESERVED) {
+			work->recovery_required = true;
+			work->context.structure_owned = false;
+		} else {
+			/* Native work, including an incomplete observation, now owns this
+			 * reservation. The original AX result cannot recycle it. */
+			origin->drop_identity = 0;
+			origin->drop_identity_serial = 0;
+		}
+	}
 	if (work->recovery_required)
 		ko_state->native_recovery_required = true;
 	work->next = ko_state->native_incoming;
@@ -3701,6 +3769,78 @@ cluster_ko_shared_native_commit_v2(void)
 		owned->postcommit = true;
 		if (!ko_native_publish(owned, true))
 			elog(PANIC, "committed shared structural change lost its original completion owner");
+	}
+}
+
+/* Only the successful native AtEOXact_Inval COMMIT boundary calls this,
+ * after the original publication ACKs and before native lock release. Final
+ * SPACE DATA was saved before native_commit; no self-peer message or local
+ * SI cache callback may manufacture this fact. Never wait for IO here. */
+void
+cluster_ko_shared_native_publication_v3(void)
+{
+	if (ko_state == NULL || !cluster_enabled || !cluster_shared_config)
+		return;
+	for (ClusterKoCompletionV2 *owned = ko_completions; owned != NULL; owned = owned->next) {
+		ClusterKoNativeContinuation *work;
+		ClusterKoSharedContext before;
+		ClusterWalSourceRef writer;
+		bool qualified;
+
+		if (!owned->barrier_v3
+			|| owned->barrier_request_v3.operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP
+			|| !owned->native_transaction)
+			continue;
+		if (!owned->native_handed_off || !owned->postcommit || owned->native_pending
+			|| owned->pid != MyProcPid || owned->owner != TopTransactionResourceOwner
+			|| CurrentResourceOwner == NULL || TopTransactionResourceOwner == NULL
+			|| CurTransactionResourceOwner != TopTransactionResourceOwner || CritSectionCount != 0
+			|| (MyBackendType != B_BACKEND && MyBackendType != B_AUTOVAC_WORKER
+				&& MyBackendType != B_BG_WORKER)
+			|| !DsaPointerIsValid(owned->native_unready))
+			continue;
+		/* The original buffer-release handoff has not surrendered this DSA
+		 * pointer yet. No mapping/CONTROL work is performed under KO lock. */
+		work = dsa_get_address(ko_native_area, owned->native_unready);
+		SpinLockAcquire(&ko_state->shared_lock);
+		before = work->context;
+		qualified = !work->recovery_required && !work->buffers_released;
+		SpinLockRelease(&ko_state->shared_lock);
+		qualified = qualified && owned->space_observed && before.used && before.complete
+			&& before.v3 && before.structure_owned && before.structure_drop_pending
+			&& before.pid == owned->pid && before.serial == owned->serial
+			&& before.drop_identity == owned->drop_identity
+			&& before.drop_identity_serial == owned->drop_identity_serial
+			&& memcmp(&before.request_v3, &owned->barrier_request_v3,
+					  sizeof(before.request_v3)) == 0
+			&& memcmp(before.peer_boots, owned->barrier_boots, sizeof(before.peer_boots)) == 0
+			&& memcmp(&before.terminal, &owned->terminal, sizeof(before.terminal)) == 0
+			&& memcmp(before.structure, owned->structure, sizeof(before.structure)) == 0
+			&& ko_shared_ready_v3(&before) && ko_shared_origin_current(&before)
+			&& cluster_wal_thread_current_v2_ref(&writer)
+			&& memcmp(&writer, &before.terminal.source, sizeof(writer)) == 0;
+		SpinLockAcquire(&ko_state->shared_lock);
+		if (work->context.pid == owned->pid && work->context.serial == owned->serial
+			&& !work->buffers_released) {
+			KoDropIdentity *identity = ko_origin_drop_identity_locked(&before);
+			uint64 revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+
+			if (qualified && memcmp(&before, &work->context, sizeof(before)) == 0
+				&& identity != NULL && revision != 0 && revision < UINT64_MAX - 1) {
+				if (identity->state == KO_DROP_IDENTITY_RESERVED) {
+					identity->state = KO_DROP_IDENTITY_CLOSING;
+					pg_atomic_write_u64(&ko_state->peer_admission_revision, revision + 1);
+				}
+				if (!ko_directory_io_pending_locked(before.request.key.locator))
+					identity->state = KO_DROP_IDENTITY_RETIRED;
+			} else {
+				/* A completed publication does not repair an incomplete/stale
+				 * local carrier. Preserve it for the original recovery owner. */
+				work->recovery_required = true;
+				ko_state->native_recovery_required = true;
+			}
+		}
+		SpinLockRelease(&ko_state->shared_lock);
 	}
 }
 
@@ -3832,9 +3972,10 @@ cluster_ko_shared_native_promote_v2(void)
 						   failed ? "PRODUCER_INCOMPLETE" : "PROMOTION_CUT");
 		return CLUSTER_KO_STRUCTURE_INVALID;
 	}
-	if (!buffers_released) {
+	if (!buffers_released || !ko_origin_drop_io_closed(&before)) {
 		/* Let the rest of this finite batch advance while the original
-		 * producer completes its local buffer cleanup. No storage may run. */
+		 * producer completes its local buffer cleanup/publication or an
+		 * already-entered directory call exits. No storage may run. */
 		SpinLockAcquire(&ko_state->shared_lock);
 		if (ko_state->native_ready == selected) {
 			ko_state->native_ready = work->next;
@@ -3906,7 +4047,8 @@ ko_drop_context_current(const ClusterKoSharedContext *context)
 		   && cluster_page_wal_binding_shape_v1(&context->terminal)
 		   && context->terminal.flags == CLUSTER_PAGE_WAL_NATIVE_FLUSHED
 		   && ko_shared_origin_current(context) && cluster_wal_thread_current_v2_ref(&current)
-		   && memcmp(&current, &context->terminal.source, sizeof(current)) == 0;
+		   && memcmp(&current, &context->terminal.source, sizeof(current)) == 0
+		   && ko_origin_drop_io_closed(context);
 }
 
 static bool
@@ -5083,8 +5225,13 @@ ko_origin_release_tick(void)
 					for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
 						ClusterKoSharedContext *entry = &ko_state->contexts[i];
 						if (entry->used && entry->v3 && !entry->structure_owned
-							&& ko_origin_ax_equal(&before.request_v3, &entry->request_v3))
-							memset(entry, 0, sizeof(*entry));
+							&& ko_origin_ax_equal(&before.request_v3, &entry->request_v3)) {
+							if (ko_drop_release_locked(&entry->request_v3,
+								entry->drop_identity_serial, entry->drop_identity))
+								memset(entry, 0, sizeof(*entry));
+							else
+								entry->ax_failed = true;
+						}
 					}
 				}
 			}
@@ -5515,6 +5662,13 @@ ko_shared_reserve_v3(const ClusterKoSharedMessageV3 *request,
 			entry->request = request->base;
 			entry->request_v3 = *request;
 			memcpy(entry->peer_boots, boots, sizeof(entry->peer_boots));
+			if (completion != NULL
+				&& !ko_drop_reserve_locked(request, entry->serial, &entry->drop_identity)) {
+				memset(entry, 0, sizeof(*entry));
+				break;
+			}
+			if (entry->drop_identity != 0)
+				entry->drop_identity_serial = entry->serial;
 			context = i;
 			if (completion != NULL) {
 				completion->slot = i;

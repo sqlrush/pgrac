@@ -506,6 +506,7 @@ extern bool cluster_ko_shared_native_handoff_v2(ClusterKoCompletionV2 **completi
  * Transfer preallocated work while retaining the original pending-delete
  * handle. Disabled until the full structural protocol is advertised. */
 extern void cluster_ko_shared_native_commit_v2(void);
+extern void cluster_ko_shared_native_publication_v3(void);
 /* Native smgr only, after DropRelationsAllBuffers returns for this locator.
  * Releases only the original local-buffer gate, never physical durability. */
 extern void cluster_ko_shared_native_drop_buffers_released_v2(RelFileLocator locator);

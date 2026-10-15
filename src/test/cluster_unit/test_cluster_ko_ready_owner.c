@@ -99,6 +99,9 @@ publish_native_ready(bool drop)
 		UT_ASSERT(cluster_ko_shared_observe_truncate_v2(claimed));
 	native_commit_active = true;
 	cluster_ko_shared_native_commit_v2();
+	/* This direct handoff fixture now includes the real publication boundary.
+	 * The origin-marker test separately executes the extracted native caller. */
+	cluster_ko_shared_native_publication_v3();
 	UT_ASSERT(owner->native_handed_off);
 	if (drop)
 		cluster_ko_shared_native_drop_buffers_released_v2(space_identity.key.locator);

@@ -6428,7 +6428,7 @@ test_cluster_ko_writeback_codec.o: $(top_srcdir)/src/backend/cluster/cluster_pi_
 		$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_ko_stop test_cluster_ko_cancel test_cluster_ko_ready_owner test_cluster_ko_drop_io test_cluster_ko_source_io test_cluster_ko_sync_io test_cluster_ko_writeback_io: %: %.c test_cluster_ko_stop.c test_cluster_ko_space.inc test_cluster_ko_abandon.h test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
+test_cluster_ko_stop test_cluster_ko_cancel test_cluster_ko_ready_owner test_cluster_ko_drop_io test_cluster_ko_source_io test_cluster_ko_sync_io test_cluster_ko_writeback_io test_cluster_ko_origin_marker: %: %.c test_cluster_ko_stop.c test_cluster_ko_space.inc test_cluster_ko_abandon.h test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
 		test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_ko_lock.c \
 		$(top_srcdir)/src/include/cluster/cluster_ko.h
@@ -9288,3 +9288,7 @@ test_cluster_ko_writeback_smgr.inc: $(top_srcdir)/src/backend/cluster/storage/cl
 	awk '/^cluster_smgr_writeback\(/ { print "void"; emit=1; n++ } \
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+
+# Native origin publication with the original KO completion/AX owners.
+TESTS += test_cluster_ko_origin_marker
+all: test_cluster_ko_origin_marker
