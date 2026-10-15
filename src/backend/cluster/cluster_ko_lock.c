@@ -1251,7 +1251,7 @@ ko_extend_pending_locked(RelFileLocator locator)
 }
 
 /* The scope identifies only the two SPACE targets needed by its original
- * extension or raw copy. A read sample cannot publish a page or grant current;
+ * extension or raw writer. A read sample cannot publish a page or grant current;
  * the separate current admission consumer retains the original PCM proof. */
 static bool
 ko_storage_read_begin(RelFileLocator locator, ForkNumber fork, BlockNumber block,
@@ -1479,6 +1479,12 @@ cluster_ko_create_begin_v3(RelFileLocator locator, uint64 *serial)
 
 bool
 cluster_ko_copy_begin_v3(RelFileLocator locator, uint64 *serial)
+{
+	return ko_create_begin(locator, true, serial);
+}
+
+bool
+cluster_ko_build_begin_v3(RelFileLocator locator, uint64 *serial)
 {
 	return ko_create_begin(locator, true, serial);
 }

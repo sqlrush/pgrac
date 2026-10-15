@@ -1823,9 +1823,17 @@ test_cluster_btree_build_identity.inc: $(top_srcdir)/src/backend/access/nbtree/n
 	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_btree_build_leaf.inc: $(top_srcdir)/src/backend/access/nbtree/nbtsort.c Makefile
+	awk '/^typedef struct BTSpool/ { emit=1; spool++ } \
+	     /^_bt_leafbuild\(/ { print "static void"; emit=1; leaf++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (spool != 1 || leaf != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_btree_build_version: test_cluster_btree_build_version.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_ko.h \
 		test_cluster_btree_build_writer.inc test_cluster_btree_build_state.inc \
-		test_cluster_btree_build_finish.inc \
+		test_cluster_btree_build_finish.inc test_cluster_btree_build_leaf.inc \
 		test_cluster_space_bufpage_product.o \
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o $(CLUSTER_HW_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
@@ -4710,7 +4718,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_vm_repair_versioned.inc
 	rm -f test_cluster_vm_repair_clear.inc test_cluster_vm_repair_missing_heap.inc test_cluster_vm_repair_lpdead.inc
 	rm -f test_cluster_btree_build_writer.inc test_cluster_btree_build_state.inc \
-		test_cluster_btree_build_finish.inc
+		test_cluster_btree_build_finish.inc test_cluster_btree_build_leaf.inc
 	rm -f test_cluster_btree_leaf_meta.inc test_cluster_btree_leaf_vacuum.inc test_cluster_btree_leaf_delete.inc test_cluster_btree_leaf_dedup.inc test_cluster_btree_leaf_cycle.inc
 	rm -f test_cluster_btree_unique_hint.inc test_cluster_btree_scan_hint.inc
 	rm -f test_cluster_btree_leaf_helpers.inc test_cluster_btree_leaf_dedup_helpers.inc

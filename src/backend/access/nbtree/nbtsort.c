@@ -60,6 +60,8 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_reverse_key.h" /* PGRAC: spec-6.12f validate */
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_ic.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/storage/cluster_smgr.h"
 #endif
@@ -272,6 +274,7 @@ typedef struct BTWriteState
 	Page		btws_zeropage;	/* workspace for filling zeroes */
 #ifdef USE_PGRAC_CLUSTER
 	bool		versioned;
+	uint64		ko_serial;	/* original finite bulk-write owner */
 	ClusterSpaceIdentity identity;	/* PGRAC: copied before page construction */
 	BlockNumber reserved_blocks;	/* exclusive bound granted to this build */
 	/* PGRAC: bounded private pages, not an alternate shared buffer cache. */
@@ -581,6 +584,9 @@ static void
 _bt_leafbuild(BTSpool *btspool, BTSpool *btspool2)
 {
 	BTWriteState wstate;
+#ifdef USE_PGRAC_CLUSTER
+	uint64		build_serial = 0;
+#endif
 
 #ifdef BTREE_BUILD_STATS
 	if (log_btree_build_stats)
@@ -603,6 +609,22 @@ _bt_leafbuild(BTSpool *btspool, BTSpool *btspool2)
 
 	wstate.heap = btspool->heap;
 	wstate.index = btspool->index;
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: raw destination writes remain visible to object drain through
+	 * the original final sync. Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_enabled && cluster_shared_config
+		&& cluster_interconnect_tier == CLUSTER_IC_TIER_1 && !RecoveryInProgress()
+		&& RelationIsPermanent(wstate.index)
+		&& cluster_smgr_which_for(wstate.index->rd_locator, InvalidBackendId) == 1
+		&& !cluster_ko_build_begin_v3(wstate.index->rd_locator, &build_serial))
+		elog(ERROR, "cannot qualify shared btree build for %u", wstate.index->rd_locator.relNumber);
+	wstate.ko_serial = build_serial;
+	PG_TRY();
+	{
+		if (build_serial != 0
+			&& !cluster_ko_create_write_begin_v3(wstate.index->rd_locator, build_serial))
+			elog(ERROR, "shared btree build lost its original owner");
+#endif
 	wstate.inskey = _bt_mkscankey(wstate.index, NULL);
 	/* _bt_mkscankey() won't set allequalimage without metapage */
 	wstate.inskey->allequalimage = _bt_allequalimage(wstate.index, true);
@@ -630,6 +652,17 @@ _bt_leafbuild(BTSpool *btspool, BTSpool *btspool2)
 	pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE,
 								 PROGRESS_BTREE_PHASE_LEAF_LOAD);
 	_bt_load(&wstate, btspool, btspool2);
+#ifdef USE_PGRAC_CLUSTER
+	}
+	PG_CATCH();
+	{
+		cluster_ko_create_abort_v3(build_serial);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (build_serial != 0 && !cluster_ko_create_end_v3(build_serial, true))
+		elog(ERROR, "shared btree build requires its original recovery owner");
+#endif
 }
 
 /*
@@ -724,6 +757,11 @@ _bt_blwritepage_data(BTWriteState *wstate, Page page, BlockNumber blkno)
 			wstate->btws_zeropage = (Page) palloc_aligned(BLCKSZ,
 														  PG_IO_ALIGN_SIZE,
 														  MCXT_ALLOC_ZERO);
+#ifdef USE_PGRAC_CLUSTER
+		if (wstate->ko_serial != 0
+			&& !cluster_ko_create_write_begin_v3(wstate->index->rd_locator, wstate->ko_serial))
+			elog(ERROR, "shared btree build lost its original owner");
+#endif
 		/* don't set checksum for all-zero page */
 		smgrextend(RelationGetSmgr(wstate->index), MAIN_FORKNUM,
 				   wstate->btws_pages_written++,
@@ -731,6 +769,11 @@ _bt_blwritepage_data(BTWriteState *wstate, Page page, BlockNumber blkno)
 				   true);
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	if (wstate->ko_serial != 0
+		&& !cluster_ko_create_write_begin_v3(wstate->index->rd_locator, wstate->ko_serial))
+		elog(ERROR, "shared btree build lost its original owner");
+#endif
 	PageSetChecksumInplace(page, blkno);
 
 	/*
@@ -785,6 +828,9 @@ _bt_blwritepage(BTWriteState *wstate, Page page, BlockNumber blkno)
 		XLogRecPtr recptr;
 
 		Assert(wstate->btws_use_wal);
+		if (wstate->ko_serial != 0
+			&& !cluster_ko_create_write_begin_v3(wstate->index->rd_locator, wstate->ko_serial))
+			elog(ERROR, "shared btree build lost its original owner");
 		/* Reserve before emitting any page version. The unpublished build
 		 * owns these ranges under its original lifecycle lock. A bounded
 		 * batch also covers out-of-order zero fills; unused reservations
@@ -811,10 +857,17 @@ _bt_blwritepage(BTWriteState *wstate, Page page, BlockNumber blkno)
 			_bt_blflushpages(wstate);
 		if (blkno < wstate->btws_pages_written)
 		{
+			if (wstate->ko_serial != 0
+				&& !cluster_ko_create_write_begin_v3(wstate->index->rd_locator, wstate->ko_serial))
+				elog(ERROR, "shared btree build lost its original owner");
 			smgrread(RelationGetSmgr(wstate->index), MAIN_FORKNUM,
 					 blkno, before.data);
 			zero_before = before.data;
 		}
+		/* Reservation, predecessor flush/read may have waited. */
+		if (wstate->ko_serial != 0
+			&& !cluster_ko_create_write_begin_v3(wstate->index->rd_locator, wstate->ko_serial))
+			elog(ERROR, "shared btree build lost its original owner");
 		if (!cluster_space_btree_build_page_wal(&wstate->identity, blkno, page,
 												  zero_before, &recptr))
 			elog(ERROR, "shared btree build cannot capture exact new page version");
@@ -1578,7 +1631,14 @@ _bt_load(BTWriteState *wstate, BTSpool *btspool, BTSpool *btspool2)
 	 * still not be on disk when the crash occurs.
 	 */
 	if (wstate->btws_use_wal)
+	{
+#ifdef USE_PGRAC_CLUSTER
+		if (wstate->ko_serial != 0
+			&& !cluster_ko_create_write_begin_v3(wstate->index->rd_locator, wstate->ko_serial))
+			elog(ERROR, "shared btree build lost its original owner");
+#endif
 		smgrimmedsync(RelationGetSmgr(wstate->index), MAIN_FORKNUM);
+	}
 }
 
 /*

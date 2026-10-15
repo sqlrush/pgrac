@@ -6793,6 +6793,42 @@ UT_TEST(test_raw_copy_scope_keeps_exact_owner_cut_and_error_responsibility)
 	}
 }
 
+UT_TEST(test_bulk_build_uses_exact_finite_owner_and_original_error_exit)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterKoSharedMessageV3 request = peer_fence_fixture(1480 + fault);
+		ClusterKoPeerFenceHandleV3 handle;
+		ClusterKoPeerFenceStateV3 state;
+		ClusterKoCurrentAdmissionV3 sample = { 0 };
+		RelFileLocator locator = request.base.key.locator;
+		uint64 serial, other;
+
+		UT_ASSERT(cluster_ko_build_begin_v3(locator, &serial));
+		UT_ASSERT(!cluster_ko_copy_begin_v3(locator, &other));
+		UT_ASSERT(!cluster_ko_create_begin_v3(locator, &other));
+		UT_ASSERT(cluster_ko_create_write_begin_v3(locator, serial));
+		UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+		UT_ASSERT(cluster_ko_peer_current_begin_v3(locator, SPACE_FORKNUM, 0, &sample));
+		UT_ASSERT(!fixture_completed_fence_ready(&request, &handle));
+		if (fault == 0) {
+			UT_ASSERT(cluster_ko_create_end_v3(serial, true));
+			UT_ASSERT(!cluster_ko_peer_current_valid_v3(&sample, locator, SPACE_FORKNUM, 0));
+			UT_ASSERT(fixture_completed_fence_ready(&request, &handle));
+			UT_ASSERT(!cluster_ko_build_begin_v3(locator, &serial));
+		} else {
+			if (fault == 1)
+				cluster_ko_create_abort_v3(serial);
+			else
+				ko_shared_backend_exit(1, (Datum)0);
+			UT_ASSERT(!cluster_ko_peer_current_valid_v3(&sample, locator, SPACE_FORKNUM, 0));
+			ko_shared_resource_release(RESOURCE_RELEASE_AFTER_LOCKS, false, false, NULL);
+			UT_ASSERT(storage.extend_work[ko_create_slot].used);
+			UT_ASSERT(storage.extend_work[ko_create_slot].failed);
+			UT_ASSERT(!fixture_completed_fence_ready(&request, &handle));
+		}
+	}
+}
+
 UT_TEST(test_create_reference_outlives_exact_space_children_and_blocks_ready)
 {
 	ClusterKoSharedMessageV3 request = peer_fence_fixture(1400);
@@ -9072,7 +9108,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(221);
+	UT_PLAN(222);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_create_reference_outlives_exact_space_children_and_blocks_ready);
 	UT_RUN(test_create_capacity_reserves_progress_for_every_accepted_constructor);
@@ -9294,6 +9330,7 @@ main(void)
 	UT_RUN(test_v3_sender_error_cannot_restart_uncertain_send);
 	UT_RUN(test_raw_copy_scope_resumes_only_space_and_blocks_ready);
 	UT_RUN(test_raw_copy_scope_keeps_exact_owner_cut_and_error_responsibility);
+	UT_RUN(test_bulk_build_uses_exact_finite_owner_and_original_error_exit);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -214,9 +214,10 @@ extern void cluster_ko_extend_abort_v3(uint64 serial);
  * its child SPACE extensions retain independent references. No recovery,
  * current, durability or deletion permission is conferred by these calls. */
 extern bool cluster_ko_create_begin_v3(RelFileLocator locator, uint64 *serial);
-/* A raw destination copy uses the same finite owner/end/abort lifecycle,
- * with SPACE0/1 read admission fixed at registration for that purpose. */
+/* Raw destination copy and bulk build share the finite owner/end/abort
+ * lifecycle, with SPACE0/1 read admission fixed at registration. */
 extern bool cluster_ko_copy_begin_v3(RelFileLocator locator, uint64 *serial);
+extern bool cluster_ko_build_begin_v3(RelFileLocator locator, uint64 *serial);
 extern bool cluster_ko_create_current_v3(RelFileLocator locator, uint64 *serial);
 extern bool cluster_ko_create_write_begin_v3(RelFileLocator locator, uint64 serial);
 extern bool cluster_ko_create_end_v3(uint64 serial, bool complete);
