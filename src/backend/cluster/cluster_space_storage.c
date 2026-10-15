@@ -669,6 +669,7 @@ cluster_space_reserve(const ClusterSpaceIdentity *identity, const struct HwLock 
 	ClusterSpaceIdentityKey expected;
 	ClusterSpaceIdentity checked;
 	ClusterSpaceReservationChange change = { 0 };
+	ClusterKoCurrentAdmissionV3 admission;
 	ClusterResId resid;
 	PGAlignedBlock result;
 	uint8 expected_identity[CLUSTER_SPACE_IDENTITY_BYTES];
@@ -677,6 +678,7 @@ cluster_space_reserve(const ClusterSpaceIdentity *identity, const struct HwLock 
 	BlockNumber first = InvalidBlockNumber;
 	Buffer buffer;
 	XLogRecPtr lsn;
+	bool object_gated;
 
 	if (granted == NULL)
 		return InvalidBlockNumber;
@@ -691,6 +693,11 @@ cluster_space_reserve(const ClusterSpaceIdentity *identity, const struct HwLock 
 		return InvalidBlockNumber;
 	cluster_hw_resid_encode(expected.locator, MAIN_FORKNUM, &resid);
 	if (memcmp(&resid, &lock->req.resid, sizeof(resid)) != 0)
+		return InvalidBlockNumber;
+	object_gated = cluster_interconnect_tier == CLUSTER_IC_TIER_1;
+	if (object_gated
+		&& !cluster_ko_peer_current_begin_v3(expected.locator, SPACE_FORKNUM,
+											 CLUSTER_SPACE_RESERVATION_BLOCK, &admission))
 		return InvalidBlockNumber;
 
 	/* Existing HW(X) serializes reservations; existing GCS current/content-X
@@ -714,6 +721,12 @@ cluster_space_reserve(const ClusterSpaceIdentity *identity, const struct HwLock 
 												  &change.result.next_block);
 	if (change.granted == 0)
 		goto done;
+	/* Revalidate the original sample under content-X before token/WAL.
+	 * Never acquire or refresh object admission while holding this lock. */
+	if (object_gated
+		&& !cluster_ko_peer_current_valid_v3(&admission, expected.locator, SPACE_FORKNUM,
+											 CLUSTER_SPACE_RESERVATION_BLOCK))
+		goto done;
 	change.result_token = rf_page_mutation_token_next();
 	if (!cluster_space_reservation_wal_encode(&change, bytes, sizeof(bytes)))
 		goto done;
@@ -731,10 +744,13 @@ cluster_space_reserve(const ClusterSpaceIdentity *identity, const struct HwLock 
 	space_capture_native(buffer, &expected, lsn);
 	END_CRIT_SECTION();
 	XLogFlush(lsn);
-	/* A membership/activation fence during the flush may deny the grant.
+	/* An object/membership/activation fence during the flush may deny the grant.
 	 * Its durable reservation remains consumed; never roll it back or re-use
 	 * its range. The original checkpoint owns eventual DATA durability. */
-	if (cluster_bufmgr_pcm_x_content_holder_write_permitted(GetBufferDescriptor(buffer - 1))) {
+	if (cluster_bufmgr_pcm_x_content_holder_write_permitted(GetBufferDescriptor(buffer - 1))
+		&& (!object_gated
+			|| cluster_ko_peer_current_valid_v3(&admission, expected.locator, SPACE_FORKNUM,
+											   CLUSTER_SPACE_RESERVATION_BLOCK))) {
 		first = change.first_block;
 		*granted = change.granted;
 	}

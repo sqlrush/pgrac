@@ -105,6 +105,9 @@ static unsigned shared_identity_locks, maintenance_identity_locks;
 static bool refuse_maintenance_lock;
 static uint64 next_token;
 static bool reserve_owner, writer_allowed, revoke_on_flush;
+static bool ko_reserve_refused, ko_reserve_revoke_on_lock, ko_reserve_revoke_on_flush;
+static uint64 ko_reserve_revision;
+static unsigned ko_reserve_begins, ko_reserve_checks, buffer_reads;
 static bool hw_held, fail_hw_lock, throw_reserve_flush;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
@@ -274,6 +277,42 @@ cluster_hw_unlock(HwLock *lock)
 {
 	UT_ASSERT(hw_held && lock->held);
 	lock->held = lock->coordinated = hw_held = false;
+}
+
+/* Exact KO boundary; buffer/WAL effects below remain the native producer.
+ * The lock/flush fixtures can invalidate an already sampled revision. */
+bool
+cluster_ko_peer_current_begin_v3(RelFileLocator tag, ForkNumber fork, BlockNumber block,
+								 ClusterKoCurrentAdmissionV3 *out)
+{
+	UT_ASSERT(reserve_owner && !pinned && !locked);
+	UT_ASSERT(RelFileLocatorEquals(tag, locator));
+	UT_ASSERT_EQ(fork, SPACE_FORKNUM);
+	UT_ASSERT_EQ(block, CLUSTER_SPACE_RESERVATION_BLOCK);
+	ko_reserve_begins++;
+	if (ko_reserve_refused)
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->target.locator = tag;
+	out->target.fork = fork;
+	out->target.block = block;
+	out->target.revision = ko_reserve_revision;
+	return true;
+}
+
+bool
+cluster_ko_peer_current_valid_v3(const ClusterKoCurrentAdmissionV3 *admission,
+								 RelFileLocator tag, ForkNumber fork, BlockNumber block)
+{
+	UT_ASSERT(reserve_owner && pinned == 2 && locked == 2 && CritSectionCount == 0);
+	UT_ASSERT(RelFileLocatorEquals(tag, locator));
+	UT_ASSERT(RelFileLocatorEquals(admission->target.locator, tag));
+	UT_ASSERT_EQ(fork, SPACE_FORKNUM);
+	UT_ASSERT_EQ(block, CLUSTER_SPACE_RESERVATION_BLOCK);
+	UT_ASSERT_EQ(admission->target.fork, fork);
+	UT_ASSERT_EQ(admission->target.block, block);
+	ko_reserve_checks++;
+	return admission->target.revision == ko_reserve_revision;
 }
 
 bool
@@ -536,6 +575,8 @@ XLogFlush(XLogRecPtr lsn)
 			pg_re_throw();
 		if (revoke_on_flush)
 			writer_allowed = false;
+		if (ko_reserve_revoke_on_flush)
+			ko_reserve_revision++;
 		return;
 	}
 	if (!recovering || lsn != UINT64_C(0x20000200) || locked != 3)
@@ -686,6 +727,7 @@ ReadBufferWithoutRelcache(RelFileLocator tag, ForkNumber forknum, BlockNumber bl
 		abort();
 	if (pinned & (1 << block))
 		abort();
+	buffer_reads++;
 	pinned |= 1 << block;
 	return block + 1;
 }
@@ -708,6 +750,8 @@ LockBuffer(Buffer buffer, int mode)
 	if (mode == BUFFER_LOCK_SHARE)
 		shared_identity_locks++;
 	locked |= 1 << (buffer - 1);
+	if (reserve_owner && ko_reserve_revoke_on_lock)
+		ko_reserve_revision++;
 }
 
 bool
@@ -1356,6 +1400,9 @@ reset(void)
 	reject_current_ref = false;
 	next_token = 17;
 	reserve_owner = revoke_on_flush = false;
+	ko_reserve_refused = ko_reserve_revoke_on_lock = ko_reserve_revoke_on_flush = false;
+	ko_reserve_revision = 1;
+	ko_reserve_begins = ko_reserve_checks = buffer_reads = 0;
 	hw_held = fail_hw_lock = throw_reserve_flush = false;
 	writer_allowed = true;
 	CritSectionCount = blocks = io_calls = create_calls = wal_calls = dirty_calls = release_calls
@@ -2038,6 +2085,143 @@ UT_TEST(test_reservation_owner_requires_identity_hw_and_exact_pcm_permission)
 		UT_ASSERT_EQ(wal_calls, 1);
 		UT_ASSERT_EQ(flush_calls, 0);
 		UT_ASSERT(memcmp(saved, pages, sizeof(pages)) == 0);
+		UT_ASSERT(!pinned && !locked);
+	}
+}
+
+UT_TEST(test_reservation_object_refusal_precedes_read_and_mutation)
+{
+	ClusterSpaceIdentity identity;
+	HwLock lock;
+	PGAlignedBlock saved[2];
+	uint32 granted = 99;
+	unsigned reads, releases;
+
+	reservation_owner(&identity, &lock);
+	memcpy(saved, pages, sizeof(saved));
+	reads = buffer_reads;
+	releases = release_calls;
+	ko_reserve_refused = true;
+	UT_ASSERT_EQ(cluster_space_reserve(&identity, &lock, 7, &granted), InvalidBlockNumber);
+	UT_ASSERT_EQ(granted, 0);
+	UT_ASSERT_EQ(ko_reserve_begins, 1);
+	UT_ASSERT_EQ(ko_reserve_checks, 0);
+	UT_ASSERT_EQ(buffer_reads, reads);
+	UT_ASSERT_EQ(release_calls, releases);
+	UT_ASSERT_EQ(next_token, 18);
+	UT_ASSERT_EQ(wal_calls, 1);
+	UT_ASSERT_EQ(dirty_calls, 2);
+	UT_ASSERT_EQ(flush_calls, 0);
+	UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
+	UT_ASSERT(!pinned && !locked);
+	/* The private build wrapper must also return its original HW owner. */
+	UT_ASSERT(!cluster_space_reserve_exact(&identity, 0, 7));
+	UT_ASSERT(!hw_held && !pinned && !locked);
+	UT_ASSERT_EQ(buffer_reads, reads);
+	UT_ASSERT_EQ(next_token, 18);
+	UT_ASSERT_EQ(wal_calls, 1);
+}
+
+UT_TEST(test_reservation_object_drift_under_content_lock_precedes_token)
+{
+	ClusterSpaceIdentity identity;
+	HwLock lock;
+	PGAlignedBlock saved[2];
+	uint32 granted = 99;
+	unsigned releases;
+
+	reservation_owner(&identity, &lock);
+	memcpy(saved, pages, sizeof(saved));
+	releases = release_calls;
+	ko_reserve_revoke_on_lock = true;
+	UT_ASSERT_EQ(cluster_space_reserve(&identity, &lock, 7, &granted), InvalidBlockNumber);
+	UT_ASSERT_EQ(granted, 0);
+	UT_ASSERT_EQ(ko_reserve_begins, 1);
+	UT_ASSERT_EQ(ko_reserve_checks, 1);
+	UT_ASSERT_EQ(release_calls, releases + 1);
+	UT_ASSERT_EQ(next_token, 18);
+	UT_ASSERT_EQ(wal_calls, 1);
+	UT_ASSERT_EQ(dirty_calls, 2);
+	UT_ASSERT_EQ(flush_calls, 0);
+	UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
+	UT_ASSERT(!pinned && !locked);
+}
+
+UT_TEST(test_reservation_object_drift_after_flush_never_grants_or_reuses)
+{
+	ClusterSpaceIdentity identity;
+	ClusterSpaceReservationChange advance = { 0 };
+	HwLock lock;
+	uint32 granted = 99;
+
+	reservation_owner(&identity, &lock);
+	ko_reserve_revoke_on_flush = true;
+	UT_ASSERT_EQ(cluster_space_reserve(&identity, &lock, 4, &granted), InvalidBlockNumber);
+	UT_ASSERT_EQ(granted, 0);
+	UT_ASSERT_EQ(ko_reserve_begins, 1);
+	UT_ASSERT_EQ(ko_reserve_checks, 2);
+	UT_ASSERT_EQ(flush_calls, 1);
+	UT_ASSERT_EQ(wal_calls, 2);
+	UT_ASSERT(cluster_space_reservation_wal_decode(wal_bytes, registered_len, &advance));
+	UT_ASSERT_EQ(advance.before.next_block, 0);
+	UT_ASSERT_EQ(advance.result.next_block, 4);
+	UT_ASSERT_EQ(advance.result_token, 18);
+	UT_ASSERT(!pinned && !locked);
+	ko_reserve_revoke_on_flush = false;
+	UT_ASSERT_EQ(cluster_space_reserve(&identity, &lock, 2, &granted), 4);
+	UT_ASSERT_EQ(granted, 2);
+	UT_ASSERT_EQ(ko_reserve_begins, 2);
+	UT_ASSERT_EQ(ko_reserve_checks, 4);
+	UT_ASSERT_EQ(flush_calls, 2);
+	UT_ASSERT(!pinned && !locked);
+}
+
+UT_TEST(test_reservation_original_namespace_and_recovery_refuse_before_object_sample)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		ClusterSpaceIdentity identity;
+		HwLock lock;
+		PGAlignedBlock saved[2];
+		uint32 granted = 99;
+		unsigned reads;
+
+		reservation_owner(&identity, &lock);
+		memcpy(saved, pages, sizeof(saved));
+		reads = buffer_reads;
+		if (variant == 0)
+			cluster_enabled = false;
+		if (variant == 1)
+			cluster_shared_config = false;
+		if (variant == 2)
+			shared = false;
+		if (variant == 3)
+			recovering = true;
+		UT_ASSERT_EQ(cluster_space_reserve(&identity, &lock, 7, &granted), InvalidBlockNumber);
+		UT_ASSERT_EQ(granted, 0);
+		UT_ASSERT_EQ(ko_reserve_begins, 0);
+		UT_ASSERT_EQ(buffer_reads, reads);
+		UT_ASSERT_EQ(wal_calls, 1);
+		UT_ASSERT_EQ(next_token, 18);
+		UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
+		UT_ASSERT(!pinned && !locked);
+	}
+}
+
+UT_TEST(test_reservation_other_tiers_keep_original_non_ddl_path)
+{
+	for (int tier = CLUSTER_IC_TIER_2; tier <= CLUSTER_IC_TIER_3; tier++) {
+		ClusterSpaceIdentity identity;
+		HwLock lock;
+		uint32 granted = 99;
+
+		reservation_owner(&identity, &lock);
+		cluster_interconnect_tier = tier;
+		ko_reserve_refused = true;
+		UT_ASSERT_EQ(cluster_space_reserve(&identity, &lock, 3, &granted), 0);
+		UT_ASSERT_EQ(granted, 3);
+		UT_ASSERT_EQ(ko_reserve_begins, 0);
+		UT_ASSERT_EQ(ko_reserve_checks, 0);
+		UT_ASSERT_EQ(flush_calls, 1);
 		UT_ASSERT(!pinned && !locked);
 	}
 }
@@ -3466,7 +3650,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(67);
+	UT_PLAN(72);
 	UT_RUN(test_native_structure_claim_passes_locked_identity_and_action);
 	UT_RUN(test_maintenance_identity_uses_current_owner_without_backend_id);
 	UT_RUN(test_maintenance_identity_retry_keeps_work_and_releases_pin);
@@ -3507,6 +3691,11 @@ main(void)
 	UT_RUN(test_truncate_partial_restart_finishes_original_physical_owner);
 	UT_RUN(test_reservation_owner_uses_exact_page_and_flushes_before_grant);
 	UT_RUN(test_reservation_owner_requires_identity_hw_and_exact_pcm_permission);
+	UT_RUN(test_reservation_object_refusal_precedes_read_and_mutation);
+	UT_RUN(test_reservation_object_drift_under_content_lock_precedes_token);
+	UT_RUN(test_reservation_object_drift_after_flush_never_grants_or_reuses);
+	UT_RUN(test_reservation_original_namespace_and_recovery_refuse_before_object_sample);
+	UT_RUN(test_reservation_other_tiers_keep_original_non_ddl_path);
 	UT_RUN(test_revoked_after_flush_never_grants_or_reuses_the_reservation);
 	UT_RUN(test_reservation_owner_last_block_then_exhausted);
 	UT_RUN(test_reservation_native_replay_exact_before_and_duplicate);
