@@ -14,6 +14,7 @@
 #include "access/twophase_rmgr.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "access/xlogutils.h"
 #include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_scn.h"
@@ -29,6 +30,7 @@
 #include "pgstat.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "storage/standbydefs.h"
+#include "storage/standby.h"
 
 #define RF_SIDE_XACT_KNOWN_XINFO                                                                   \
 	(XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_SUBXACTS | XACT_XINFO_HAS_RELFILELOCATORS              \
@@ -867,8 +869,8 @@ side_xact_decode_cold_abort(XLogReaderState *record, uint64 system_identifier, u
 {
 	RfSideXactOperationV1 candidate = { 0 };
 	xl_xact_parsed_abort parsed;
-	const uint32 supported
-		= XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_DROPPED_STATS;
+	const uint32 supported = XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_SCN
+							 | XACT_XINFO_HAS_DROPPED_STATS | XACT_XINFO_HAS_AE_LOCKS;
 
 	if (record == NULL || record->record == NULL || out == NULL || system_identifier == 0
 		|| origin_thread == 0 || origin_thread > 128 || XLogRecGetRmid(record) != RM_XACT_ID
@@ -878,7 +880,8 @@ side_xact_decode_cold_abort(XLogReaderState *record, uint64 system_identifier, u
 		return false;
 	ParseAbortRecord(XLogRecGetInfo(record), (xl_xact_abort *)XLogRecGetData(record), &parsed);
 	if ((parsed.xinfo & ~supported) != 0 || parsed.nsubxacts != 0 || parsed.nrels != 0
-		|| parsed.nstats <= 0 || !SCN_VALID(parsed.scn)
+		|| (parsed.nstats == 0 && (parsed.xinfo & XACT_XINFO_HAS_AE_LOCKS) == 0)
+		|| !SCN_VALID(parsed.scn)
 		|| !side_xact_cold_stats_valid(parsed.nstats, parsed.stats, parsed.xinfo, parsed.dbId))
 		return false;
 	candidate.system_identifier = system_identifier;
@@ -906,12 +909,19 @@ rf_side_xact_decode_recovery_v1(XLogReaderState *record, uint64 system_identifie
 	RfSideXactOperationV1 candidate;
 	const uint32 supported = XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_TT_COMMIT
 							 | XACT_XINFO_HAS_INVALS | XACT_COMPLETION_UPDATE_RELCACHE_FILE
-							 | XACT_XINFO_HAS_DROPPED_STATS | XACT_COMPLETION_FORCE_SYNC_COMMIT;
+							 | XACT_XINFO_HAS_DROPPED_STATS | XACT_COMPLETION_FORCE_SYNC_COMMIT
+							 | XACT_XINFO_HAS_AE_LOCKS;
 
 	if (out == NULL)
 		return false;
-	if (rf_side_xact_decode_v1(record, system_identifier, origin_thread, out))
-		return true;
+	if (rf_side_xact_decode_v1(record, system_identifier, origin_thread, out)) {
+		if ((out->kind != RF_SIDE_XACT_COMMIT && out->kind != RF_SIDE_XACT_ABORT)
+			|| (out->xinfo & XACT_XINFO_HAS_AE_LOCKS) == 0)
+			return true;
+		/* A lock flag has no array, but still requires the original native
+		 * completion owner and the full source record, not generic projection. */
+		memset(out, 0, sizeof(*out));
+	}
 	if (record != NULL && record->record != NULL
 		&& (XLogRecGetInfo(record) & XLOG_XACT_OPMASK) == XLOG_XACT_ABORT)
 		return side_xact_decode_cold_abort(record, system_identifier, origin_thread, out);
@@ -919,7 +929,8 @@ rf_side_xact_decode_recovery_v1(XLogReaderState *record, uint64 system_identifie
 		|| candidate.kind != RF_SIDE_XACT_COMMIT || (candidate.xinfo & ~supported) != 0
 		|| (candidate.invalidation_count == 0
 			&& (candidate.xinfo
-				& (XACT_XINFO_HAS_DROPPED_STATS | XACT_COMPLETION_FORCE_SYNC_COMMIT))
+				& (XACT_XINFO_HAS_DROPPED_STATS | XACT_COMPLETION_FORCE_SYNC_COMMIT
+				   | XACT_XINFO_HAS_AE_LOCKS))
 				   == 0)
 		|| candidate.relation_count != 0 || candidate.space_drop_count != 0)
 		return false;
@@ -945,7 +956,9 @@ rf_side_xact_cold_completion_preflight_v1(const RfSideXactOperationV1 *operation
 		|| (operation->kind != RF_SIDE_XACT_COMMIT && operation->kind != RF_SIDE_XACT_ABORT)
 		|| payload == NULL || length == 0 || length != operation->completion_payload_length
 		|| operation->system_identifier != GetSystemIdentifier()
-		|| cluster_xid_origin_slot(operation->xid) != (int)operation->origin_thread - 1)
+		|| cluster_xid_origin_slot(operation->xid) != (int)operation->origin_thread - 1
+		|| ((operation->xinfo & XACT_XINFO_HAS_AE_LOCKS) != 0
+			&& (unsigned)standbyState > STANDBY_SNAPSHOT_READY))
 		return false;
 	/* Packed plan payloads need not have native structure alignment. */
 	copy = side_xact_payload_copy(payload, length);
@@ -1031,6 +1044,23 @@ rf_side_xact_apply_covered_commit_v1(const RfSideXactOperationV1 *operation, voi
 	return side_xact_project_commit_v1(operation);
 }
 
+/* Preserve the native recovery branch: disabled standby has no recovery
+ * lock table; initialized states release only this proven top transaction.
+ * The exact TT/CLOG owner has already completed, not inferred from this flag. */
+static bool
+side_xact_cold_release_locks(const RfSideXactOperationV1 *operation)
+{
+	if (!cluster_undo_recovery_cold_origin_authorized_v1(operation->origin_thread - 1))
+		return false;
+	if ((operation->xinfo & XACT_XINFO_HAS_AE_LOCKS) != 0) {
+		if ((unsigned)standbyState > STANDBY_SNAPSHOT_READY)
+			return false;
+		if (standbyState != STANDBY_DISABLED)
+			StandbyReleaseLockTree(operation->xid, 0, NULL);
+	}
+	return cluster_undo_recovery_cold_origin_authorized_v1(operation->origin_thread - 1);
+}
+
 RfSideXactApplyResultV1
 rf_side_xact_apply_cold_completion_v1(const RfSideXactOperationV1 *operation, const uint8 *payload,
 									  uint32 length, void *arg,
@@ -1069,9 +1099,11 @@ rf_side_xact_apply_cold_completion_v1(const RfSideXactOperationV1 *operation, co
 			 * WAL before any writes. Never XLogFlush a foreign LSN. A repeat
 			 * after interruption uses the original idempotent pgstat owner;
 			 * this does not advance ROOT/recovery completion or retention. */
-			if ((parsed.xinfo & (XACT_XINFO_HAS_DROPPED_STATS | XACT_COMPLETION_FORCE_SYNC_COMMIT))
-					== 0
-				|| cluster_undo_recovery_cold_source_synced_v1(operation->origin_thread - 1)) {
+			if (side_xact_cold_release_locks(operation)
+				&& ((parsed.xinfo
+					 & (XACT_XINFO_HAS_DROPPED_STATS | XACT_COMPLETION_FORCE_SYNC_COMMIT))
+						== 0
+					|| cluster_undo_recovery_cold_source_synced_v1(operation->origin_thread - 1))) {
 				if (parsed.nstats > 0)
 					pgstat_execute_transactional_drops(parsed.nstats, parsed.stats, true);
 				if (cluster_undo_recovery_cold_origin_authorized_v1(operation->origin_thread - 1))
@@ -1165,8 +1197,10 @@ rf_side_xact_apply_cold_abort_completion_v1(const RfSideXactOperationV1 *operati
 		 * must prove canonical TT and native CLOG before statistics or terminal
 		 * projection. Use the source's durability, never a foreign local LSN. */
 		ParseAbortRecord(XLOG_XACT_ABORT | XLOG_XACT_HAS_INFO, (xl_xact_abort *)copy, &parsed);
-		if (cluster_undo_recovery_cold_source_synced_v1(operation->origin_thread - 1)) {
-			pgstat_execute_transactional_drops(parsed.nstats, parsed.stats, true);
+		if (cluster_undo_recovery_cold_source_synced_v1(operation->origin_thread - 1)
+			&& side_xact_cold_release_locks(operation)) {
+			if (parsed.nstats > 0)
+				pgstat_execute_transactional_drops(parsed.nstats, parsed.stats, true);
 			if (cluster_undo_recovery_cold_source_synced_v1(operation->origin_thread - 1))
 				result = side_xact_project_abort(operation);
 		}

@@ -15,6 +15,7 @@
 #include "access/twophase_rmgr.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "access/xlogutils.h"
 #include "catalog/storage_xlog.h"
 #include "catalog/pg_control.h"
 #include "catalog/pg_tablespace_d.h"
@@ -31,6 +32,7 @@
 #include "cluster/cluster_xid_stripe_xlog.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "storage/standbydefs.h"
+#include "storage/standby.h"
 #include "pgstat.h"
 #include "utils/inval.h"
 #include "utils/syscache.h"
@@ -165,6 +167,30 @@ static bool cold_completion_test, cold_source_ready, cold_source_fail, cold_sour
 static bool cold_stats_throw, cold_stats_expire;
 static unsigned cold_source_calls, cold_source_order, cold_stats_calls, cold_stats_gc;
 static unsigned cold_stats_order;
+HotStandbyState standbyState = STANDBY_DISABLED;
+static bool cold_locks_test, cold_locks_throw, cold_locks_expire;
+static unsigned cold_locks_calls, cold_locks_order;
+
+/* Only the native recovery-lock API boundary is a fixture. The complete
+ * immutable plan, exact TT consumer and terminal ordering remain real. */
+void
+StandbyReleaseLockTree(TransactionId xid, int count, TransactionId *children)
+{
+	UT_ASSERT(cold_locks_test && canonical_scope != NULL);
+	UT_ASSERT(standbyState >= STANDBY_INITIALIZED && standbyState <= STANDBY_SNAPSHOT_READY);
+	UT_ASSERT_EQ(xid, 802);
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT(children == NULL);
+	UT_ASSERT_EQ(cold_clog_verifies, 1);
+	UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 0);
+	cold_locks_calls++;
+	cold_locks_order = ++prepare_apply.next_order;
+	if (cold_locks_throw)
+		pg_re_throw();
+	if (cold_locks_expire)
+		cold_clog_denied = true;
+}
+
 char *DatabasePath;
 
 bool
@@ -3184,8 +3210,8 @@ UT_TEST(test_cold_owner_abort_requires_durable_tt_and_native_clog_before_project
 		volatile bool caught = false;
 		RfPageProofDetailV1 result = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 
-		guard.mode
-			= fault == 7 ? CLUSTER_RECOVERY_SERIAL_ONLINE : CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+		guard.mode = (fault == 7 || fault == 8) ? CLUSTER_RECOVERY_SERIAL_ONLINE
+												: CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
 		undo_header_bind(&fake, 0);
 		undo_header_feed(plan, &fake, 100);
 		undo_header_abort(&fake, 4);
@@ -3193,6 +3219,8 @@ UT_TEST(test_cold_owner_abort_requires_durable_tt_and_native_clog_before_project
 		make_abort(&fake, 802);
 		if (fault == 8) {
 			xl_xact_xinfo xinfo;
+
+			fake.u.decoded.max_block_id = -1;
 			memcpy(&xinfo, fake.data + sizeof(xl_xact_abort), sizeof(xinfo));
 			xinfo.xinfo |= XACT_XINFO_HAS_AE_LOCKS;
 			memcpy(fake.data + sizeof(xl_xact_abort), &xinfo, sizeof(xinfo));
@@ -3839,6 +3867,206 @@ cold_completion_abort(FakeXactRecord *fake)
 	fake->u.decoded.max_block_id = -1;
 }
 
+static void
+cold_lock_completion(FakeXactRecord *fake, bool abort, bool combined)
+{
+	uint32 offset = abort ? MinSizeOfXactAbort : MinSizeOfXactCommit;
+	uint32 xinfo;
+
+	if (abort) {
+		if (combined)
+			cold_completion_abort(fake);
+		else
+			make_abort(fake, 802);
+	} else
+		cold_completion_commit(fake, combined, combined, combined);
+	memcpy(&xinfo, fake->data + offset, sizeof(xinfo));
+	xinfo |= XACT_XINFO_HAS_AE_LOCKS;
+	memcpy(fake->data + offset, &xinfo, sizeof(xinfo));
+	fake->u.decoded.max_block_id = -1;
+}
+
+UT_TEST(test_cold_lock_completion_retains_whole_native_record)
+{
+	for (int abort = 0; abort < 2; abort++)
+		for (int combined = 0; combined < 2; combined++) {
+			FakeXactRecord fake;
+			RfSideXactOperationV1 op;
+			uint8 unaligned[2048];
+
+			reset_prepare_apply();
+			cold_lock_completion(&fake, abort, combined);
+			if (!rf_side_xact_decode_recovery_v1(&fake.reader, UINT64_C(0x11223344), 3, &op)
+				|| !op.cold_completion_effects) {
+				UT_ASSERT(false);
+				continue;
+			}
+			UT_ASSERT(!op.pi_read_only && (op.xinfo & XACT_XINFO_HAS_AE_LOCKS) != 0);
+			UT_ASSERT_EQ(op.completion_payload_length, fake.u.decoded.main_data_len);
+			memcpy(unaligned + 1, fake.data, fake.u.decoded.main_data_len);
+			UT_ASSERT(rf_side_xact_cold_completion_preflight_v1(&op, unaligned + 1,
+																fake.u.decoded.main_data_len));
+			UT_ASSERT(!rf_side_xact_cold_completion_preflight_v1(&op, unaligned + 1,
+																 fake.u.decoded.main_data_len - 1));
+			UT_ASSERT_EQ(rf_side_xact_apply_owned_v1(&op, fake.data, fake.u.decoded.main_data_len),
+						 RF_SIDE_XACT_APPLY_BLOCKED);
+			for (int bad = 0; bad < 3; bad++) {
+				RfSideXactOperationV1 changed = op;
+				if (bad == 0)
+					changed.origin_thread++;
+				else if (bad == 1)
+					changed.xinfo &= ~XACT_XINFO_HAS_AE_LOCKS;
+				else
+					changed.pi_read_only = true;
+				UT_ASSERT(!rf_side_xact_cold_completion_preflight_v1(&changed, unaligned + 1,
+																	 fake.u.decoded.main_data_len));
+			}
+		}
+}
+
+UT_TEST(test_cold_lock_completion_uses_exact_tt_clog_and_native_owner)
+{
+	for (int abort = 0; abort < 2; abort++)
+		for (int fault = 0; fault < 15; fault++) {
+			RfSideOnlinePlanV1 *plan;
+			ClusterRecoverySerialGuard guard = { 0 };
+			ClusterThreadRecoveryAuthorityV1 authority
+				= { .duty = &canonical_duty, .serial_guard = &guard };
+			RfSideOnlineProductionOwnerV1 *owner;
+			RfSideXactOperationV1 op;
+			FakeXactRecord fake;
+			PGAlignedBlock initial;
+			volatile bool caught = false;
+			RfPageProofDetailV1 result = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			bool combined = fault == 4;
+			bool success = fault <= 4 || fault == 11;
+
+			cold_lock_completion(&fake, abort, combined);
+			if (!rf_side_xact_decode_recovery_v1(&fake.reader, UINT64_C(0x11223344), 3, &op)
+				|| !op.cold_completion_effects) {
+				UT_ASSERT(false);
+				continue;
+			}
+			plan = space_online_plan(abort ? 400 : 300);
+			owner = calloc(1, sizeof(*owner));
+			guard.mode = fault == 10 ? CLUSTER_RECOVERY_SERIAL_ONLINE
+									 : CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+			undo_header_bind(&fake, 0);
+			undo_header_feed(plan, &fake, 100);
+			if (abort) {
+				undo_header_abort(&fake, 4);
+				undo_header_feed(plan, &fake, 200);
+			}
+			cold_lock_completion(&fake, abort, combined);
+			undo_header_feed(plan, &fake, abort ? 300 : 200);
+			UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+			if (fault == 14) {
+				RfSideOnlineOperationV1 saved;
+				uint32 flags;
+				UT_ASSERT(rf_side_online_plan_operation_v1(plan, abort ? 2 : 1, &saved));
+				memcpy(&flags,
+					   saved.owned_payload + (abort ? MinSizeOfXactAbort : MinSizeOfXactCommit),
+					   sizeof(flags));
+				flags |= XACT_XINFO_HAS_GID;
+				memcpy((uint8 *)saved.owned_payload
+						   + (abort ? MinSizeOfXactAbort : MinSizeOfXactCommit),
+					   &flags, sizeof(flags));
+			}
+			reset_prepare_apply();
+			canonical_file = tmpfile();
+			UT_ASSERT(canonical_file != NULL && owner != NULL);
+			UT_ASSERT_EQ(ftruncate(fileno(canonical_file), UNDO_SEGMENT_SIZE_BYTES), 0);
+			cluster_undo_segment_make_header_bytes(513, 3, initial.data);
+			UT_ASSERT(pwrite(fileno(canonical_file), initial.data, BLCKSZ, 0) == BLCKSZ);
+			UT_ASSERT_EQ(fsync(fileno(canonical_file)), 0);
+			canonical_writes = canonical_syncs = 0;
+			canonical_expected_xid = 802;
+			canonical_expected_wrap = 7;
+			cold_completion_test = cold_clog_test = cold_locks_test = true;
+			cold_abort_test = abort;
+			cold_cache_test = combined && !abort;
+			cold_cache_init = false;
+			cold_source_ready = false;
+			cold_source_calls = cold_source_order = cold_stats_calls = cold_stats_order
+				= cold_stats_gc = 0;
+			cold_cache_calls = cold_cache_order = cold_clog_applies = cold_clog_verifies
+				= cold_clog_verified_order = 0;
+			cold_locks_calls = cold_locks_order = 0;
+			cold_clog_apply_fail = fault == 5;
+			cold_clog_verify_fail = fault == 6;
+			cold_clog_stale_after_verify = fault == 7;
+			cold_locks_throw = fault == 8;
+			cold_locks_expire = fault == 9;
+			standbyState = fault < 3	 ? (HotStandbyState)(STANDBY_INITIALIZED + fault)
+						   : fault == 3	 ? STANDBY_DISABLED
+						   : fault == 12 ? (HotStandbyState)77
+						   : fault == 13 ? (HotStandbyState)-1
+										 : STANDBY_INITIALIZED;
+			UT_ASSERT_EQ(payload_bytes, 0);
+			payload_peak = 0;
+			payload_tracking = true;
+			UT_ASSERT(rf_side_online_production_owner_init_v1(owner, &authority,
+															  canonical_authority_fresh, 19, true));
+			UT_ASSERT(rf_side_online_production_bind_undo_v1(owner, &authority));
+			if (fault == 11) {
+				UT_ASSERT_EQ(rf_side_online_production_apply_v1(plan, owner),
+							 RF_PAGE_PROOF_DETAIL_OK);
+				UT_ASSERT_EQ(cold_locks_calls, 1);
+				reset_prepare_apply();
+				canonical_writes = cold_clog_applies = cold_clog_verifies = cold_clog_verified_order
+					= 0;
+				cold_locks_calls = cold_locks_order = 0;
+				cold_source_ready = false;
+			}
+			PG_TRY();
+			{
+				result = rf_side_online_production_apply_v1(plan, owner);
+			}
+			PG_CATCH();
+			{
+				caught = true;
+			}
+			PG_END_TRY();
+			payload_tracking = false;
+			UT_ASSERT_EQ(payload_bytes, 0);
+			UT_ASSERT(payload_peak <= op.completion_payload_length);
+			UT_ASSERT_EQ(caught, fault == 8);
+			if (!caught)
+				UT_ASSERT_EQ(result, success ? RF_PAGE_PROOF_DETAIL_OK
+											 : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+			UT_ASSERT_EQ(cold_locks_calls,
+						 (success && fault != 3) || fault == 8 || fault == 9 ? 1 : 0);
+			UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, success ? 1 : 0);
+			if (success && fault != 3) {
+				UT_ASSERT(cold_clog_verified_order < cold_locks_order);
+				UT_ASSERT(cold_locks_order < prepare_apply.terminal_projection_order);
+				if (combined) {
+					if (!abort)
+						UT_ASSERT(cold_cache_order < cold_locks_order);
+					UT_ASSERT(cold_locks_order < cold_stats_order);
+				}
+			}
+			if (fault >= 10)
+				UT_ASSERT_EQ(canonical_writes, 0);
+			UT_ASSERT_EQ(owner->protected_set_complete, success);
+			UT_ASSERT(canonical_scope == NULL && canonical_writer_depth == 0
+					  && owner->undo_headers == NULL && !owner->protected_set_active
+					  && DatabasePath == NULL);
+			free(owner);
+			UT_ASSERT_EQ(fclose(canonical_file), 0);
+			canonical_file = NULL;
+			cold_completion_test = cold_source_ready = cold_cache_test = cold_clog_test
+				= cold_abort_test = false;
+			cold_clog_denied = cold_clog_apply_fail = cold_clog_verify_fail
+				= cold_clog_stale_after_verify = false;
+			cold_locks_test = cold_locks_throw = cold_locks_expire = false;
+			standbyState = STANDBY_DISABLED;
+			canonical_expected_xid = 818;
+			canonical_expected_wrap = 8;
+			rf_side_online_plan_destroy_v1(&plan);
+		}
+}
+
 UT_TEST(test_cold_native_stats_retain_completion_owner)
 {
 	for (int abort = 0; abort < 2; abort++) {
@@ -3928,7 +4156,7 @@ UT_TEST(test_cold_abort_stats_rejects_malformed_or_unowned_native_effects)
 			fake.u.decoded.main_data_len--;
 		memcpy(&xinfo, fake.data + MinSizeOfXactAbort, sizeof(xinfo));
 		if (fault == 9)
-			xinfo |= XACT_XINFO_HAS_AE_LOCKS;
+			xinfo |= XACT_XINFO_HAS_GID;
 		if (fault == 10)
 			xinfo |= XACT_COMPLETION_FORCE_SYNC_COMMIT;
 		if (fault == 11)
@@ -4324,7 +4552,7 @@ UT_TEST(test_cold_cache_decode_keeps_unsupported_effects_and_bad_messages_refuse
 		cold_cache_commit(&fake, false);
 		if (fault < 6) {
 			const uint32 flags[] = {
-				UINT32_C(1) << 20,		 XACT_COMPLETION_APPLY_FEEDBACK, XACT_XINFO_HAS_AE_LOCKS,
+				UINT32_C(1) << 20,		 XACT_COMPLETION_APPLY_FEEDBACK, XACT_XINFO_HAS_GID,
 				XACT_XINFO_HAS_SUBXACTS, XACT_XINFO_HAS_DROPPED_STATS,	 XACT_XINFO_HAS_ORIGIN
 			};
 			memcpy(&xinfo, fake.data + MinSizeOfXactCommit, sizeof(xinfo));
@@ -4623,14 +4851,16 @@ UT_TEST(test_cold_owner_persists_native_clog_before_commit_projection)
 		RfPageProofDetailV1 result = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 
 		guard.mode
-			= fault == 7 ? CLUSTER_RECOVERY_SERIAL_ONLINE : CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+			= fault >= 7 ? CLUSTER_RECOVERY_SERIAL_ONLINE : CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
 		undo_header_bind(&fake, 0);
 		undo_header_feed(plan, &fake, 100);
 		undo_header_commit(&fake, 0, 802);
 		if (fault == 8) {
 			xl_xact_xinfo xinfo;
 
-			/* A valid native flag is not an implemented cold completion effect. */
+			fake.u.decoded.max_block_id = -1;
+
+			/* ONLINE cannot use the cold recovery-lock completion owner. */
 			memcpy(&xinfo, fake.data + sizeof(xl_xact_commit), sizeof(xinfo));
 			xinfo.xinfo |= XACT_XINFO_HAS_AE_LOCKS;
 			memcpy(fake.data + sizeof(xl_xact_commit), &xinfo, sizeof(xinfo));
@@ -6994,7 +7224,9 @@ UT_TEST(test_space_incarnation_end_rejects_old_uuid_reappearance_and_retained_ga
 int
 main(void)
 {
-	UT_PLAN(94);
+	UT_PLAN(96);
+	UT_RUN(test_cold_lock_completion_retains_whole_native_record);
+	UT_RUN(test_cold_lock_completion_uses_exact_tt_clog_and_native_owner);
 	UT_RUN(test_cold_native_stats_retain_completion_owner);
 	UT_RUN(test_cold_abort_completion_keeps_owned_stats_and_refuses_generic_apply);
 	UT_RUN(test_cold_abort_stats_rejects_malformed_or_unowned_native_effects);
