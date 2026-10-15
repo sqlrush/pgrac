@@ -154,6 +154,8 @@ inventory_write_commit(const ClusterWalSourceRef *source, XLogRecPtr at, XLogRec
 	xl_xact_scn scn = { 5906 };
 	int nmsgs = 2;
 	size_t used = 0;
+	if (inventory_terminal_mode == 21)
+		xinfo |= XACT_XINFO_HAS_TT_COMMIT;
 
 	msgs[0].id = SHAREDINVALRELCACHE_ID;
 	msgs[0].rc.dbId = 5;
@@ -169,6 +171,17 @@ inventory_write_commit(const ClusterWalSourceRef *source, XLogRecPtr at, XLogRec
 	used += sizeof(msgs);
 	memcpy(payload + used, &scn, sizeof(scn));
 	used += sizeof(scn);
+	if (inventory_terminal_mode == 21) {
+		xl_xact_tt_commit tt = { 0 };
+		tt.instance = source->claim.identity.origin_thread_id;
+		tt.segment_id = (tt.instance - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+		tt.xid = 4195136;
+		tt.wrap = 1;
+		tt.commit_scn = 5906;
+		tt.format_version = CLUSTER_XACT_TT_COMMIT_VERSION;
+		memcpy(payload + used, &tt, sizeof(tt));
+		used += sizeof(tt);
+	}
 	return inventory_write_record(
 		source, at, previous, RM_XACT_ID,
 		unsupported ? XLOG_XACT_PREPARE : XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO, payload, used);
@@ -240,6 +253,17 @@ inventory_write_terminal_sequence(const ClusterWalSourceRef *source, WalTestReco
 	xl_undo_tt_slot_abort abort_record = { 0 };
 	xl_undo_tt_slot_abort_exact exact = { 0 };
 	size_t used = 0;
+	if (inventory_terminal_mode == 20) {
+		bind.segment_id = segment;
+		bind.instance = node + 1;
+		bind.xid = 4195136;
+		bind.wrap = 1;
+		bind.format_version = CLUSTER_UNDO_TT_BIND_VERSION;
+		for (unsigned i = 0; i < 72; i++)
+			next = inventory_write_record(source, next.exclusive_end, next.record_start,
+										  RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND, &bind,
+										  sizeof(bind));
+	}
 	folded.segment_id = segment;
 	folded.xid = 4195136;
 	folded.wrap = 1;
@@ -288,8 +312,9 @@ inventory_write_terminal_sequence(const ClusterWalSourceRef *source, WalTestReco
 	used += sizeof(scn);
 	memcpy(payload + used, &folded, sizeof(folded));
 	used += sizeof(folded);
-	next = inventory_write_record(source, next.exclusive_end, next.record_start, RM_XACT_ID,
-								  XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO, payload, used);
+	if (inventory_terminal_mode != 18)
+		next = inventory_write_record(source, next.exclusive_end, next.record_start, RM_XACT_ID,
+									  XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO, payload, used);
 	if (inventory_terminal_mode == 2 || (inventory_terminal_mode == 5 && node == 127)) {
 		xl_undo_segment_recycle recycle = { 0 };
 		recycle.segment_id = segment;
@@ -314,9 +339,14 @@ inventory_write_terminal_sequence(const ClusterWalSourceRef *source, WalTestReco
 	commit.instance = node + 1;
 	commit.xid = 4195136;
 	commit.wrap = 1;
-	commit.commit_scn = 5906;
-	next = inventory_write_record(source, next.exclusive_end, next.record_start, RM_CLUSTER_UNDO_ID,
-								  XLOG_UNDO_TT_SLOT_COMMIT, &commit, sizeof(commit));
+	commit.commit_scn = inventory_terminal_mode == 17 ? 5907 : 5906;
+	if (inventory_terminal_mode != 18)
+		next = inventory_write_record(source, next.exclusive_end, next.record_start,
+									  RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_COMMIT, &commit,
+									  sizeof(commit));
+	if (inventory_terminal_mode == 16 || inventory_terminal_mode == 17
+		|| inventory_terminal_mode == 21)
+		return next;
 	abort_record.segment_id = segment;
 	abort_record.instance = node + 1;
 	abort_record.xid = 4195136;
@@ -800,6 +830,7 @@ cleanup:
 #include "test_cluster_recovery_prepare_inputs.inc"
 #include "test_cluster_recovery_manifest_inputs.inc"
 #include "test_cluster_recovery_terminal_inputs.inc"
+#include "test_cluster_recovery_tt_terminal_inputs.inc"
 
 int
 main(int argc, char **argv)
@@ -808,7 +839,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(69);
+	UT_PLAN(76);
 	UT_RUN(test_native_inventory_uses_two_real_cold_passes);
 	UT_RUN(test_native_inventory_never_returns_partial_on_drift_io_or_error);
 	UT_RUN(test_native_inventory_capacity_is_not_partial_success);
@@ -878,6 +909,13 @@ main(int argc, char **argv)
 	UT_RUN(test_terminal_census_compares_original_physical_slots);
 	UT_RUN(test_terminal_census_final_changes_revoke_output);
 	UT_RUN(test_terminal_bad_exact_fields_refuse_and_revoke);
+	UT_RUN(test_terminal_lookup_exact_identity_and_unbound_records);
+	UT_RUN(test_terminal_lookup_consistent_and_conflicting_endpoints);
+	UT_RUN(test_terminal_lookup_bounded_query_and_key_change);
+	UT_RUN(test_terminal_lookup_final_input_drift_revokes);
+	UT_RUN(test_physical_tt_terminal_census_keeps_every_slot);
+	UT_RUN(test_physical_tt_terminal_census_final_rechecks);
+	UT_RUN(test_terminal_lookup_invalid_keys_and_incomplete_cursor_refuse);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

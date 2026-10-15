@@ -27,6 +27,7 @@ typedef struct NativeInventorySource {
 typedef struct NativeInventoryRecord {
 	struct NativeInventoryRecord *next;
 	ClusterRecoveryNativeScan *scan;
+	ClusterRecoveryTerminalEntry terminal; /* normalized once by the full terminal cursor */
 	uint32 source_index;
 	uint64 ordinal;
 } NativeInventoryRecord;
@@ -74,6 +75,9 @@ struct ClusterRecoveryNativeInventory {
 	ClusterRecoveryTerminalEntry terminal_pending;
 	bool terminal_started, terminal_searching;
 	ClusterRecoveryTerminalResult terminal_status;
+	NativeInventoryRecord *terminal_lookup_cursor;
+	ClusterRecoveryTerminalSummary terminal_lookup;
+	bool terminal_lookup_active;
 };
 
 static void
@@ -684,6 +688,7 @@ inventory_terminal_step(ClusterRecoveryNativeInventory *inventory,
 			inventory->diag.terminal_bound++;
 		else
 			inventory->diag.terminal_unbound++;
+		current->terminal = *pending;
 		*out = *pending;
 		inventory->terminal_cursor = current->next;
 		inventory->terminal_searching = false;
@@ -711,6 +716,109 @@ cluster_recovery_native_inventory_terminal_step(ClusterRecoveryNativeInventory *
 		result = inventory_terminal_fail(inventory, CLUSTER_RECOVERY_TERMINAL_CHANGED);
 	else
 		result = inventory_terminal_step(inventory, out);
+	if (diag != NULL)
+		*diag = inventory->diag;
+	return result;
+}
+
+static bool
+inventory_terminal_key_equal(const ClusterRecoveryTxnKey *a, const ClusterRecoveryTxnKey *b)
+{
+	return a->system_identifier == b->system_identifier
+		   && a->database_incarnation == b->database_incarnation
+		   && a->origin_node_id == b->origin_node_id && a->segment_id == b->segment_id
+		   && a->segment_generation == b->segment_generation && a->slot_offset == b->slot_offset
+		   && a->slot_wrap == b->slot_wrap && a->xid == b->xid;
+}
+
+static ClusterRecoveryTerminalResult
+inventory_terminal_lookup(ClusterRecoveryNativeInventory *inventory,
+						  const ClusterRecoveryTxnKey *key, ClusterRecoveryTerminalSummary *out)
+{
+	ClusterRecoveryTerminalSummary *summary = &inventory->terminal_lookup;
+	const ClusterWalSourceRef *source;
+	unsigned examined = 0;
+
+	if (!inventory->complete || inventory->status != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED)
+		return inventory_terminal_fail(inventory, CLUSTER_RECOVERY_TERMINAL_CHANGED);
+	if (key == NULL || out == NULL || inventory->source_count == 0
+		|| inventory->terminal_status != CLUSTER_RECOVERY_TERMINAL_DRAINED)
+		return inventory_terminal_fail(inventory, CLUSTER_RECOVERY_TERMINAL_INVALID);
+	source = &inventory->sources[0].source;
+	if (key->system_identifier != source->claim.identity.system_identifier
+		|| key->database_incarnation != source->claim.database_incarnation
+		|| key->origin_node_id >= UNDO_OWNER_INSTANCE_MAX || key->segment_id == 0
+		|| (key->segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE != key->origin_node_id
+		|| key->segment_generation == UINT32_MAX || key->slot_offset >= TT_SLOTS_PER_SEGMENT
+		|| key->slot_wrap == TT_WRAP_INVALID || !TransactionIdIsNormal(key->xid))
+		return inventory_terminal_fail(inventory, CLUSTER_RECOVERY_TERMINAL_INVALID);
+	if (!inventory->terminal_lookup_active) {
+		memset(summary, 0, sizeof(*summary));
+		summary->transaction = *key;
+		inventory->terminal_lookup_cursor = inventory->head;
+		inventory->terminal_lookup_active = true;
+	} else if (!inventory_terminal_key_equal(key, &summary->transaction))
+		return inventory_terminal_fail(inventory, CLUSTER_RECOVERY_TERMINAL_INVALID);
+
+	while (inventory->terminal_lookup_cursor != NULL && examined < INVENTORY_SEED_TICK) {
+		const ClusterRecoveryTerminalEntry *entry = &inventory->terminal_lookup_cursor->terminal;
+		const ClusterRecoveryTxnKey *candidate = &entry->transaction;
+		if (inventory->diag.terminal_lookup_examined == UINT64_MAX)
+			return inventory_terminal_fail(inventory, CLUSTER_RECOVERY_TERMINAL_CAPACITY);
+		inventory->diag.terminal_lookup_examined++;
+		examined++;
+		inventory->terminal_lookup_cursor = inventory->terminal_lookup_cursor->next;
+		if (entry->record == NULL)
+			continue;
+		if (entry->identity != CLUSTER_RECOVERY_TERMINAL_EXACT
+			&& entry->identity != CLUSTER_RECOVERY_TERMINAL_BOUND) {
+			/* Without a complete era/slot identity, a same-origin raw xid
+			 * cannot be dismissed as belonging to another wrap or transaction. */
+			if (candidate->system_identifier == key->system_identifier
+				&& candidate->database_incarnation == key->database_incarnation
+				&& candidate->origin_node_id == key->origin_node_id && candidate->xid == key->xid)
+				summary->unresolved_records++;
+			continue;
+		}
+		if (!inventory_terminal_key_equal(candidate, key))
+			continue;
+		if (summary->first_exact == NULL)
+			summary->first_exact = entry->record;
+		summary->exact_records++;
+		if (entry->status == TT_SLOT_COMMITTED) {
+			if (summary->has_commit && summary->commit_scn != entry->scn)
+				summary->conflict = true;
+			if (!summary->has_commit)
+				summary->commit_scn = entry->scn;
+			summary->has_commit = true;
+		} else if (entry->status == TT_SLOT_ABORTED)
+			summary->has_abort = true;
+		else
+			return inventory_terminal_fail(inventory, CLUSTER_RECOVERY_TERMINAL_INVALID);
+		if (summary->has_commit && summary->has_abort)
+			summary->conflict = true;
+	}
+	if (inventory->terminal_lookup_cursor != NULL)
+		return CLUSTER_RECOVERY_TERMINAL_MORE;
+	*out = *summary;
+	inventory->terminal_lookup_active = false;
+	return CLUSTER_RECOVERY_TERMINAL_ENTRY;
+}
+
+ClusterRecoveryTerminalResult
+cluster_recovery_native_inventory_terminal_lookup_step(ClusterRecoveryNativeInventory *inventory,
+													   const ClusterRecoveryTxnKey *key,
+													   ClusterRecoveryTerminalSummary *out,
+													   ClusterRecoveryNativeInventoryDiag *diag)
+{
+	ClusterRecoveryTerminalResult result;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (diag != NULL)
+		memset(diag, 0, sizeof(*diag));
+	if (inventory == NULL)
+		return CLUSTER_RECOVERY_TERMINAL_INVALID;
+	result = inventory_terminal_lookup(inventory, key, out);
 	if (diag != NULL)
 		*diag = inventory->diag;
 	return result;

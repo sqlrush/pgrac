@@ -259,6 +259,38 @@ cluster_recovery_undo_store_next(ClusterRecoveryUndoStore *store, ClusterRecover
 	return CLUSTER_RECOVERY_GRAPH_RECORD;
 }
 
+ClusterRecoveryGraphResult
+cluster_recovery_undo_store_at(ClusterRecoveryUndoStore *store, uint32 index,
+							   ClusterRecoveryUndoEntry *out)
+{
+	uint8 digest[32];
+	uint32 file = index / TT_SLOTS_PER_SEGMENT;
+	uint16 slot = index % TT_SLOTS_PER_SEGMENT;
+	const UndoSegmentHeaderData *header;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (store == NULL)
+		return CLUSTER_RECOVERY_GRAPH_INVALID;
+	if (store->status > CLUSTER_RECOVERY_GRAPH_DRAINED)
+		return store->status;
+	if (out == NULL || store->status != CLUSTER_RECOVERY_GRAPH_DRAINED || file > store->count
+		|| (file == store->count && slot != 0))
+		return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_INVALID);
+	if (!cluster_recovery_root_set_digest(store->roots, digest))
+		return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_CHANGED);
+	if (file == store->count)
+		return CLUSTER_RECOVERY_GRAPH_DRAINED;
+	if (!store->files[file].loaded)
+		return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_INVALID);
+	header = &store->files[file].header;
+	out->segment_id = header->segment_id;
+	out->segment_generation = header->wrap_count;
+	out->owner_instance = header->owner_instance;
+	out->slot_offset = slot;
+	out->slot = header->tt_slots[slot];
+	return CLUSTER_RECOVERY_GRAPH_RECORD;
+}
+
 const UndoSegmentHeaderData *
 cluster_recovery_undo_store_header(const ClusterRecoveryUndoStore *store, uint32 segment)
 {

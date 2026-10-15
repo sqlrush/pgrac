@@ -56,6 +56,16 @@ typedef struct ClusterRecoveryTerminalEntry {
 	ClusterRecoveryTerminalIdentity identity;
 } ClusterRecoveryTerminalEntry;
 
+/* Whole-retained-input comparison for one exact TT key. A missing or
+ * unresolved record is not an abort; agreement is not effect completion. */
+typedef struct ClusterRecoveryTerminalSummary {
+	ClusterRecoveryTxnKey transaction;
+	uint64 exact_records, unresolved_records;
+	const ClusterRecoveryNativeRecord *first_exact;
+	SCN commit_scn;
+	bool has_commit, has_abort, conflict;
+} ClusterRecoveryTerminalSummary;
+
 typedef struct ClusterRecoveryNativeInventoryDiag {
 	ClusterControlRootResult input_result;
 	RfPageProofDetailV1 input_detail;
@@ -78,6 +88,7 @@ typedef struct ClusterRecoveryNativeInventoryDiag {
 	uint64 tt_binding_records_examined;
 	uint64 tt_head_binding_missing;
 	uint64 terminal_records, terminal_bound, terminal_unbound, terminal_binding_examined;
+	uint64 terminal_lookup_examined;
 	uint64 mx_compared_offsets, mx_compared_members, mx_physical_mismatches;
 	uint64 xact_clog_compared, xact_parents_compared, xact_physical_mismatches;
 	ClusterRecoveryGraphResult graph_result;
@@ -169,6 +180,18 @@ extern ClusterRecoveryTerminalResult
 cluster_recovery_native_inventory_terminal_step(ClusterRecoveryNativeInventory *inventory,
 												ClusterRecoveryTerminalEntry *out,
 												ClusterRecoveryNativeInventoryDiag *diag);
+/* After terminal_step drains, compare all saved terminal edges to key.
+ * At most128 saved records per call; MORE clears out and pins this query key
+ * until ENTRY. A changed key or invalid input refuses and revokes dependents.
+ * ENTRY is a complete comparison (including zero matches), never terminal
+ * authority. Same-origin/xid unbound carriers remain unresolved even if exact
+ * records agree. Each original record/source/cut/payload remains available;
+ * no ordering across source LSNs or physical status overrides are inferred.
+ * No I/O, allocation or independent cursor reset. Final full inputs and
+ * physical TT/ROOT rereads remain mandatory through the caller's lifetime. */
+extern ClusterRecoveryTerminalResult cluster_recovery_native_inventory_terminal_lookup_step(
+	ClusterRecoveryNativeInventory *inventory, const ClusterRecoveryTxnKey *key,
+	ClusterRecoveryTerminalSummary *out, ClusterRecoveryNativeInventoryDiag *diag);
 extern void cluster_recovery_native_inventory_destroy(ClusterRecoveryNativeInventory *inventory);
 /* Independent retained terminal/assignment cursor, under the same borrowed
  * ROOT lifetime and failure rules as MX. At most 128 saved records or one

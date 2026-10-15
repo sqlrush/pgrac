@@ -213,14 +213,14 @@ UT_TEST(test_owned_census_real_inputs_all_observation_families)
 	ClusterRecoveryCensusEntry entry;
 	ClusterRecoveryCensusDiag diag = { 0 };
 	ClusterRecoveryCensusResult result = CLUSTER_RECOVERY_CENSUS_MORE;
-	unsigned unknown = 0, raw_pages = 0, mismatches = 0, kinds[12] = { 0 };
+	unsigned unknown = 0, raw_pages = 0, mismatches = 0, kinds[13] = { 0 };
 	for (unsigned steps = 0; steps < 200000; steps++) {
 		result = cluster_recovery_census_next(census, &entry);
 		if (result >= CLUSTER_RECOVERY_CENSUS_DRAINED)
 			break;
 		if (result != CLUSTER_RECOVERY_CENSUS_ENTRY)
 			continue;
-		UT_ASSERT(entry.kind >= 1 && entry.kind <= CLUSTER_RECOVERY_CENSUS_TERMINAL);
+		UT_ASSERT(entry.kind >= 1 && entry.kind <= CLUSTER_RECOVERY_CENSUS_TT_TERMINAL);
 		kinds[entry.kind]++;
 		if (entry.kind == CLUSTER_RECOVERY_CENSUS_RELATION) {
 			const ClusterRecoveryRelationCensusEntry *r = &entry.value.relation;

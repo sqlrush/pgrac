@@ -23,7 +23,7 @@ struct ClusterRecoveryCensus {
 	ClusterRecoveryCensusDiag diag;
 	ClusterRecoveryCensusManifest manifest;
 	ClusterRecoveryCensusResult status;
-	uint32 source_count, target_at;
+	uint32 source_count, target_at, tt_terminal_at;
 	uint8 storage_uuid[16];
 	uint64 system_identifier, database_incarnation;
 	size_t child_budget;
@@ -236,6 +236,59 @@ census_build_manifest(ClusterRecoveryCensus *census)
 }
 
 static ClusterRecoveryCensusResult
+census_tt_terminal(ClusterRecoveryCensus *census, ClusterRecoveryCensusEntry *out)
+{
+	ClusterRecoveryCensusDiag *d = &census->diag;
+	ClusterRecoveryCensusTTTerminal *value = &out->value.tt_terminal;
+	ClusterRecoveryUndoEntry *physical = &value->physical;
+	ClusterRecoveryTxnKey key = { 0 };
+
+	d->graph_result
+		= cluster_recovery_undo_store_at(census->undo, census->tt_terminal_at, physical);
+	if (d->graph_result == CLUSTER_RECOVERY_GRAPH_DRAINED) {
+		d->phase = CLUSTER_RECOVERY_CENSUS_RELMAP_PHYSICAL;
+		return CLUSTER_RECOVERY_CENSUS_MORE;
+	}
+	if (d->graph_result != CLUSTER_RECOVERY_GRAPH_RECORD)
+		return census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+	value->key_usable = TransactionIdIsNormal(physical->slot.xid)
+						&& physical->slot.wrap != TT_WRAP_INVALID
+						&& physical->segment_generation != UINT32_MAX;
+	if (value->key_usable) {
+		key.system_identifier = census->system_identifier;
+		key.database_incarnation = census->database_incarnation;
+		key.origin_node_id = physical->owner_instance - 1;
+		key.segment_id = physical->segment_id;
+		key.segment_generation = physical->segment_generation;
+		key.slot_offset = physical->slot_offset;
+		key.slot_wrap = physical->slot.wrap;
+		key.xid = physical->slot.xid;
+		d->terminal_result = cluster_recovery_native_inventory_terminal_lookup_step(
+			census->inventory, &key, &value->retained, &d->inventory);
+		if (d->terminal_result == CLUSTER_RECOVERY_TERMINAL_MORE)
+			return CLUSTER_RECOVERY_CENSUS_MORE;
+		if (d->terminal_result != CLUSTER_RECOVERY_TERMINAL_ENTRY)
+			return census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+		if (value->retained.exact_records == 0)
+			d->tt_terminal_missing++;
+		if (value->retained.unresolved_records != 0)
+			d->tt_terminal_unresolved++;
+		if (value->retained.conflict)
+			d->tt_terminal_conflicts++;
+		value->raw_terminal_matches
+			= value->retained.exact_records != 0 && value->retained.unresolved_records == 0
+			  && !value->retained.conflict
+			  && ((value->retained.has_commit && physical->slot.status == TT_SLOT_COMMITTED
+				   && physical->slot.commit_scn == value->retained.commit_scn)
+				  || (value->retained.has_abort && physical->slot.status == TT_SLOT_ABORTED
+					  && physical->slot.commit_scn == InvalidScn));
+	}
+	census->tt_terminal_at++;
+	d->tt_terminal_slots++;
+	return census_entry(out, CLUSTER_RECOVERY_CENSUS_TT_TERMINAL);
+}
+
+static ClusterRecoveryCensusResult
 census_step(ClusterRecoveryCensus *census, ClusterRecoveryCensusEntry *out)
 {
 	ClusterRecoveryCensusDiag *d = &census->diag;
@@ -441,12 +494,14 @@ census_step(ClusterRecoveryCensus *census, ClusterRecoveryCensusEntry *out)
 			return census_entry(out, CLUSTER_RECOVERY_CENSUS_TERMINAL);
 		}
 		if (d->terminal_result == CLUSTER_RECOVERY_TERMINAL_DRAINED)
-			d->phase = CLUSTER_RECOVERY_CENSUS_RELMAP_PHYSICAL;
+			d->phase = CLUSTER_RECOVERY_CENSUS_TT_TERMINALS;
 		if (d->terminal_result == CLUSTER_RECOVERY_TERMINAL_MORE
 			|| d->terminal_result == CLUSTER_RECOVERY_TERMINAL_DRAINED)
 			return CLUSTER_RECOVERY_CENSUS_MORE;
 		break;
 	}
+	case CLUSTER_RECOVERY_CENSUS_TT_TERMINALS:
+		return census_tt_terminal(census, out);
 	case CLUSTER_RECOVERY_CENSUS_RELMAP_PHYSICAL:
 		if (census->relmap == NULL)
 			d->relmap_result = cluster_recovery_relmap_scan_begin(

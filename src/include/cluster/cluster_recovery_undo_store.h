@@ -41,6 +41,12 @@ cluster_recovery_undo_store_graph(ClusterRecoveryUndoStore *store);
  * completes only this physical TT inventory, never the recovery graph. */
 extern ClusterRecoveryGraphResult cluster_recovery_undo_store_next(ClusterRecoveryUndoStore *store,
 																   ClusterRecoveryUndoEntry *out);
+/* Revisit every saved physical slot after enumeration. No new reads or
+ * terminal filtering; original root validity and final header rereads apply.
+ * index==total slots returns DRAINED, other failures clear out. */
+extern ClusterRecoveryGraphResult cluster_recovery_undo_store_at(ClusterRecoveryUndoStore *store,
+																 uint32 index,
+																 ClusterRecoveryUndoEntry *out);
 extern const UndoSegmentHeaderData *
 cluster_recovery_undo_store_header(const ClusterRecoveryUndoStore *store, uint32 segment);
 

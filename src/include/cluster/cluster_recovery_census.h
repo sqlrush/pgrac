@@ -41,6 +41,7 @@ typedef enum ClusterRecoveryCensusPhase {
 	CLUSTER_RECOVERY_CENSUS_MX_COMPARE,
 	CLUSTER_RECOVERY_CENSUS_XACT_COMPARE,
 	CLUSTER_RECOVERY_CENSUS_TERMINALS,
+	CLUSTER_RECOVERY_CENSUS_TT_TERMINALS,
 	CLUSTER_RECOVERY_CENSUS_RELMAP_PHYSICAL,
 	CLUSTER_RECOVERY_CENSUS_EFFECTS,
 	CLUSTER_RECOVERY_CENSUS_FINAL_TT,
@@ -60,7 +61,8 @@ typedef enum ClusterRecoveryCensusKind {
 	CLUSTER_RECOVERY_CENSUS_SLRU_SLOT,
 	CLUSTER_RECOVERY_CENSUS_XACT_MATCH,
 	CLUSTER_RECOVERY_CENSUS_RELMAP,
-	CLUSTER_RECOVERY_CENSUS_TERMINAL
+	CLUSTER_RECOVERY_CENSUS_TERMINAL,
+	CLUSTER_RECOVERY_CENSUS_TT_TERMINAL
 } ClusterRecoveryCensusKind;
 
 /* An edge from an observed TX record to the original physical/WAL union.
@@ -86,6 +88,14 @@ typedef struct ClusterRecoveryCensusTerminal {
 	bool physical_present, identity_matches, raw_terminal_matches;
 } ClusterRecoveryCensusTerminal;
 
+/* Revisit all physical slots, including those with no retained terminal.
+ * Invalid/empty raw identities remain explicit; no loser is inferred. */
+typedef struct ClusterRecoveryCensusTTTerminal {
+	ClusterRecoveryUndoEntry physical;
+	ClusterRecoveryTerminalSummary retained;
+	bool key_usable, raw_terminal_matches;
+} ClusterRecoveryCensusTTTerminal;
+
 typedef struct ClusterRecoveryCensusEntry {
 	ClusterRecoveryCensusKind kind;
 	union {
@@ -100,6 +110,7 @@ typedef struct ClusterRecoveryCensusEntry {
 		ClusterRecoveryXactJoinEntry xact_compare;
 		ClusterRecoveryRelmapEntry relmap;
 		ClusterRecoveryCensusTerminal terminal;
+		ClusterRecoveryCensusTTTerminal tt_terminal;
 	} value;
 } ClusterRecoveryCensusEntry;
 
@@ -125,6 +136,7 @@ typedef struct ClusterRecoveryCensusDiag {
 	uint64 relmap_entries;
 	uint64 terminal_entries, terminal_missing, terminal_identity_mismatches,
 		terminal_state_mismatches;
+	uint64 tt_terminal_slots, tt_terminal_missing, tt_terminal_unresolved, tt_terminal_conflicts;
 	uint64 tx_targets, tx_target_missing, tx_target_short, tx_space_missing;
 } ClusterRecoveryCensusDiag;
 
@@ -159,7 +171,10 @@ extern ClusterRecoveryCensusResult cluster_recovery_census_begin(ClusterWalInput
  * complete publication; missing fork edges remain explicit obligations.
  * Every retained terminal also joins its exact or same-source BIND identity
  * to the original physical TT; unresolved identities and reused/status/SCN
- * differences remain explicit. No terminal record overrides another.
+ * differences remain explicit. No terminal record overrides another. Every
+ * physical TT slot is then revisited against the complete retained terminal
+ * set: absent, unbound and conflicting endpoints remain distinct obligations.
+ * Even exact raw agreement grants no transaction/effect completion.
  * Transaction comparisons retain raw status/parent differences and grant
  * no era, terminal or complete parent-chain proof.
  * Then repeat saved TT headers, the entire physical ROOT and
