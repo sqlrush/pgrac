@@ -32,6 +32,7 @@ typedef enum ClusterRecoveryCensusPhase {
 	CLUSTER_RECOVERY_CENSUS_TT,
 	CLUSTER_RECOVERY_CENSUS_WAL_HEADS,
 	CLUSTER_RECOVERY_CENSUS_TX,
+	CLUSTER_RECOVERY_CENSUS_TX_TARGETS,
 	CLUSTER_RECOVERY_CENSUS_RELATIONS,
 	CLUSTER_RECOVERY_CENSUS_MX_PHYSICAL,
 	CLUSTER_RECOVERY_CENSUS_MX_COMPARE,
@@ -48,8 +49,23 @@ typedef enum ClusterRecoveryCensusKind {
 	CLUSTER_RECOVERY_CENSUS_RELATION,
 	CLUSTER_RECOVERY_CENSUS_MX_SLOT,
 	CLUSTER_RECOVERY_CENSUS_MX_MATCH,
-	CLUSTER_RECOVERY_CENSUS_NATIVE_EFFECT
+	CLUSTER_RECOVERY_CENSUS_NATIVE_EFFECT,
+	CLUSTER_RECOVERY_CENSUS_TX_TARGET
 } ClusterRecoveryCensusKind;
+
+/* An edge from an observed TX record to the original physical/WAL union.
+ * Missing indices/pointers and absent extents remain explicit obligations.
+ * These flags describe files only, not SPACE identity or lifecycle proof. */
+typedef struct ClusterRecoveryCensusTarget {
+	ClusterRecoveryGraphRecord transaction;
+	ClusterSpaceIdentityKey key;
+	ForkNumber forknum;
+	BlockNumber blockno;
+	uint64 required_blocks;
+	uint32 root_index, space_index; /* UINT32_MAX if no candidate */
+	const ClusterRecoveryRootEntry *root, *space;
+	bool target_physical, target_extent_present, space_physical;
+} ClusterRecoveryCensusTarget;
 
 typedef struct ClusterRecoveryCensusEntry {
 	ClusterRecoveryCensusKind kind;
@@ -60,6 +76,7 @@ typedef struct ClusterRecoveryCensusEntry {
 		ClusterRecoveryMultixactEntry mx;
 		ClusterRecoveryMultixactJoinEntry compare;
 		ClusterRecoveryNativeEffect effect;
+		ClusterRecoveryCensusTarget target;
 	} value;
 } ClusterRecoveryCensusEntry;
 
@@ -76,6 +93,7 @@ typedef struct ClusterRecoveryCensusDiag {
 	ClusterRecoveryNativeInventoryResult inventory_result;
 	ClusterRecoveryNativeInventoryDiag inventory;
 	uint64 tt_slots, tx_records, relation_entries, mx_entries, mx_comparisons, effects;
+	uint64 tx_targets, tx_target_missing, tx_target_short, tx_space_missing;
 } ClusterRecoveryCensusDiag;
 
 /* Borrow the original live cold inputs and their ROOT-selected isolated
@@ -91,14 +109,17 @@ extern ClusterRecoveryCensusResult cluster_recovery_census_begin(ClusterWalInput
 																 ClusterRecoveryCensus **out);
 
 /* Run the existing ROOT/WAL union, all TT slots and seeded TX records,
- * relation/page/history, raw physical MX, retained MX comparisons and native
- * effect cursors. Then repeat saved TT headers, the entire physical ROOT and
+ * all TX record target/SPACE candidates, relation/page/history, raw physical
+ * MX, retained MX comparisons and native effect cursors. Then repeat saved TT headers, the entire physical ROOT and
  * original cold WAL census. Each entry is borrowed until next/destroy and
  * provisional until all final rereads; later refusal revokes every child.
  * Ordinary refusals and ERROR clear the output and release owned children.
  * The failed cursor remains sticky and diagnosable until destroyed.
  *
- * Each call invokes one existing component step. WAL collection/recheck
+ * Target joins examine one saved node and at most two 128-probe lookups,
+ * with no I/O, allocation or changes to the ROOT baseline. Missing/short
+ * targets remain explicit obligations and do not complete recovery.
+ * Other calls invoke one existing component step. WAL collection/recheck
  * retain their original synchronous complete census; this API does NOT
  * promise a one-page, 128-operation or elapsed-time bound for those calls.
  *

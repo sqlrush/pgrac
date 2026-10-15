@@ -105,6 +105,14 @@ extern uint32 cluster_recovery_reference_graph_count(const ClusterRecoveryRefere
  * does not assert that all page/native/structural producers were supplied. */
 extern bool cluster_recovery_reference_graph_observed(const ClusterRecoveryReferenceGraph *graph);
 
+/* Enumerate every saved node, including non-root predecessors, only after
+ * the entire forest's second reads. Constant work, no I/O or new roots.
+ * index == count returns DRAINED; every other non-record result clears out.
+ * The original graph/producer lifetime and all later rechecks still apply. */
+extern ClusterRecoveryGraphResult
+cluster_recovery_reference_graph_at(const ClusterRecoveryReferenceGraph *graph, uint32 index,
+									ClusterRecoveryGraphRecord *out);
+
 /* Match a page locator against saved, fully re-read records, never against
  * the current TT slot generation guessed from the UBA. The forest must be
  * observed and outlive this lookup and all returned borrowed records.

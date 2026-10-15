@@ -612,10 +612,69 @@ UT_TEST(test_locator_validation_and_memory_limit_precede_allocation)
 	cluster_recovery_reference_graph_destroy(graph);
 }
 
+UT_TEST(test_observed_index_exposes_every_predecessor_without_io)
+{
+	ClusterRecoveryTxnKey key = transaction();
+	ClusterRecoveryReferenceGraph *graph;
+	ClusterRecoveryGraphRecord record, zero = { 0 };
+	unsigned records = 0, seen = 0;
+	uint64 sum = 0;
+	memset(&input, 0, sizeof(input));
+	add_record(257, 1, 16385, (UBA){ { 0, 0 } });
+	add_record(258, 2, 16388, input.records[0].address);
+	add_record(258, 3, 20001, input.records[1].address);
+	graph = begin_graph(1024 * 1024);
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_add(graph, &key, input.records[2].address), 0);
+	memset(&record, 0x71, sizeof(record));
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_at(graph, 0, &record),
+				 CLUSTER_RECOVERY_GRAPH_INVALID);
+	UT_ASSERT_EQ(memcmp(&record, &zero, sizeof(record)), 0);
+	UT_ASSERT_EQ(drain(graph, &records, &sum), CLUSTER_RECOVERY_GRAPH_DRAINED);
+	for (unsigned i = 0; i < 3; i++) {
+		ClusterRecoveryGraphResult result = cluster_recovery_reference_graph_at(graph, i, &record);
+		UT_ASSERT_EQ(result, CLUSTER_RECOVERY_GRAPH_RECORD);
+		if (result != CLUSTER_RECOVERY_GRAPH_RECORD || record.record == NULL)
+			continue;
+		UT_ASSERT_EQ(record.transaction.system_identifier, key.system_identifier);
+		UT_ASSERT_EQ(record.transaction.database_incarnation, key.database_incarnation);
+		UT_ASSERT_EQ(record.transaction.segment_id, key.segment_id);
+		UT_ASSERT_EQ(record.transaction.segment_generation, key.segment_generation);
+		UT_ASSERT_EQ(record.transaction.origin_node_id, key.origin_node_id);
+		UT_ASSERT_EQ(record.transaction.xid, key.xid);
+		UT_ASSERT_EQ(record.transaction.slot_offset, key.slot_offset);
+		UT_ASSERT_EQ(record.transaction.slot_wrap, key.slot_wrap);
+		for (unsigned j = 0; j < 3; j++) {
+			if (cluster_undo_record_uba_equal(record.record->address, input.records[j].address)) {
+				UT_ASSERT((seen & (1u << j)) == 0);
+				seen |= 1u << j;
+				UT_ASSERT_EQ(record.record_segment_generation, input.records[j].generation);
+				UT_ASSERT_EQ(record.record->header.target_block, j + 1);
+				UT_ASSERT_EQ(record.record->body_length, sizeof(UndoInsertPayload));
+			}
+		}
+	}
+	UT_ASSERT_EQ(seen, 7);
+	memset(&record, 0x71, sizeof(record));
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_at(graph, 3, &record),
+				 CLUSTER_RECOVERY_GRAPH_DRAINED);
+	UT_ASSERT_EQ(memcmp(&record, &zero, sizeof(record)), 0);
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_at(graph, 4, &record),
+				 CLUSTER_RECOVERY_GRAPH_INVALID);
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_at(graph, 0, NULL),
+				 CLUSTER_RECOVERY_GRAPH_INVALID);
+	UT_ASSERT_EQ(input.calls, 6);
+	cluster_recovery_reference_graph_invalidate(graph);
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_at(graph, 0, &record),
+				 CLUSTER_RECOVERY_GRAPH_INVALID);
+	UT_ASSERT_EQ(memcmp(&record, &zero, sizeof(record)), 0);
+	UT_ASSERT_EQ(input.calls, 6);
+	cluster_recovery_reference_graph_destroy(graph);
+}
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(16);
 	UT_RUN(test_cross_relation_and_segment_chain_is_not_page_history);
 	UT_RUN(test_multiple_roots_share_a_tail_without_a_false_cycle);
 	UT_RUN(test_active_path_cycle_and_self_edge_are_refused);
@@ -631,6 +690,7 @@ main(void)
 	UT_RUN(test_unknown_locator_is_not_current_slot_or_terminal_proof);
 	UT_RUN(test_ambiguous_canonical_generation_is_not_first_match_wins);
 	UT_RUN(test_locator_validation_and_memory_limit_precede_allocation);
+	UT_RUN(test_observed_index_exposes_every_predecessor_without_io);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

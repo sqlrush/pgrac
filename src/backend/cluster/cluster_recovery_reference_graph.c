@@ -415,6 +415,27 @@ cluster_recovery_reference_graph_observed(const ClusterRecoveryReferenceGraph *g
 	return graph != NULL && graph->status == CLUSTER_RECOVERY_GRAPH_DRAINED;
 }
 
+ClusterRecoveryGraphResult
+cluster_recovery_reference_graph_at(const ClusterRecoveryReferenceGraph *graph, uint32 index,
+									ClusterRecoveryGraphRecord *out)
+{
+	const RecoveryRecordNode *node;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || !cluster_recovery_reference_graph_observed(graph) || index > graph->count)
+		return CLUSTER_RECOVERY_GRAPH_INVALID;
+	if (index == graph->count)
+		return CLUSTER_RECOVERY_GRAPH_DRAINED;
+	node = &graph->nodes[index];
+	if (node->state != RECOVERY_NODE_DONE)
+		return CLUSTER_RECOVERY_GRAPH_INVALID;
+	out->transaction = node->transaction;
+	out->record_segment_generation = node->record_generation;
+	out->record = &node->record;
+	return CLUSTER_RECOVERY_GRAPH_RECORD;
+}
+
 ClusterRecoveryGraphLookupResult
 cluster_recovery_reference_lookup_begin(const ClusterRecoveryReferenceGraph *graph,
 										uint64 system_identifier, uint64 database_incarnation,

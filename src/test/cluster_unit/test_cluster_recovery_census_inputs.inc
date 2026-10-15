@@ -2,6 +2,8 @@
  * Author: SqlRush <sqlrush@gmail.com>
  * Copyright (c) 2026, pgrac contributors. */
 
+static unsigned owned_target_mode;
+
 static void
 owned_census_relation(int fd, const ClusterWalSourceRef *source, unsigned rel, bool empty)
 {
@@ -56,6 +58,25 @@ owned_census_fixture(ClusterWalInputsV1 **inputs, int *fd, char path[MAXPGPATH],
 	UT_ASSERT(file >= 0);
 	UT_ASSERT_EQ(write(file, "unexplained", 11), 11);
 	UT_ASSERT_EQ(close(file), 0);
+	if (owned_target_mode != 0) {
+		UndoRecordHeader record;
+		off_t offset = BLCKSZ + sizeof(UndoBlockHeader);
+		file = openat(*fd, "pg_undo/instance_0/seg_1.dat", O_RDWR);
+		UT_ASSERT(file >= 0);
+		UT_ASSERT_EQ(pread(file, &record, sizeof(record), offset), sizeof(record));
+		if (owned_target_mode == 1)
+			record.target_locator.relNumber = 20000;
+		if (owned_target_mode == 2)
+			record.target_locator.relNumber = 99999;
+		if (owned_target_mode == 3)
+			record.target_block = InvalidBlockNumber - 1;
+		if (owned_target_mode == 4)
+			UT_ASSERT_EQ(unlinkat(*fd, "base/5/16385_space", 0), 0);
+		if (owned_target_mode == 5)
+			record.target_fork = INIT_FORKNUM;
+		UT_ASSERT_EQ(pwrite(file, &record, sizeof(record), offset), sizeof(record));
+		UT_ASSERT_EQ(close(file), 0);
+	}
 	UT_ASSERT_EQ(cluster_recovery_census_begin(*inputs, *fd, 8 * 1024 * 1024, &census),
 				 CLUSTER_RECOVERY_CENSUS_MORE);
 	return census;
@@ -86,7 +107,7 @@ owned_census_done(ClusterRecoveryCensus *census, ClusterWalInputsV1 **inputs, in
 static ClusterRecoveryCensusResult
 owned_census_until(ClusterRecoveryCensus *census, ClusterRecoveryCensusPhase phase)
 {
-	ClusterRecoveryCensusDiag diag;
+	ClusterRecoveryCensusDiag diag = { 0 };
 	ClusterRecoveryCensusEntry entry;
 	for (unsigned steps = 0; steps < 100000; steps++) {
 		ClusterRecoveryCensusResult result;
@@ -120,16 +141,16 @@ UT_TEST(test_owned_census_real_inputs_all_observation_families)
 	int fd;
 	ClusterRecoveryCensus *census = owned_census_fixture(&inputs, &fd, path, false);
 	ClusterRecoveryCensusEntry entry;
-	ClusterRecoveryCensusDiag diag;
+	ClusterRecoveryCensusDiag diag = { 0 };
 	ClusterRecoveryCensusResult result = CLUSTER_RECOVERY_CENSUS_MORE;
-	unsigned unknown = 0, raw_pages = 0, mismatches = 0, kinds[7] = { 0 };
+	unsigned unknown = 0, raw_pages = 0, mismatches = 0, kinds[8] = { 0 };
 	for (unsigned steps = 0; steps < 100000; steps++) {
 		result = cluster_recovery_census_next(census, &entry);
 		if (result >= CLUSTER_RECOVERY_CENSUS_DRAINED)
 			break;
 		if (result != CLUSTER_RECOVERY_CENSUS_ENTRY)
 			continue;
-		UT_ASSERT(entry.kind >= 1 && entry.kind <= 6);
+		UT_ASSERT(entry.kind >= 1 && entry.kind <= 7);
 		kinds[entry.kind]++;
 		if (entry.kind == CLUSTER_RECOVERY_CENSUS_RELATION) {
 			const ClusterRecoveryRelationCensusEntry *r = &entry.value.relation;
@@ -137,12 +158,24 @@ UT_TEST(test_owned_census_real_inputs_all_observation_families)
 					   && strcmp(r->root->file.path, "unowned") == 0;
 			raw_pages += r->kind == CLUSTER_RECOVERY_RELATIONS_PAGE && !r->heap;
 		}
+		if (entry.kind == CLUSTER_RECOVERY_CENSUS_TX_TARGET) {
+			const ClusterRecoveryCensusTarget *target = &entry.value.target;
+			UT_ASSERT(target->transaction.record != NULL);
+			UT_ASSERT(target->root != NULL && target->space != NULL);
+			UT_ASSERT(target->target_physical && target->target_extent_present
+					  && target->space_physical);
+			UT_ASSERT_EQ(target->key.locator.relNumber, 16385);
+			UT_ASSERT_EQ(target->required_blocks, 1);
+			UT_ASSERT_EQ(target->transaction.transaction.xid, 4195136);
+			UT_ASSERT_EQ(target->transaction.transaction.slot_wrap, 1);
+		}
 		if (entry.kind == CLUSTER_RECOVERY_CENSUS_MX_MATCH)
 			mismatches += !entry.value.compare.equal;
 	}
 	UT_ASSERT_EQ(result, CLUSTER_RECOVERY_CENSUS_DRAINED);
 	UT_ASSERT_EQ(kinds[CLUSTER_RECOVERY_CENSUS_TT_SLOT], 96);
 	UT_ASSERT_EQ(kinds[CLUSTER_RECOVERY_CENSUS_TX_RECORD], 2);
+	UT_ASSERT_EQ(kinds[CLUSTER_RECOVERY_CENSUS_TX_TARGET], 2);
 	UT_ASSERT(kinds[CLUSTER_RECOVERY_CENSUS_MX_SLOT] > 4096);
 	UT_ASSERT_EQ(kinds[CLUSTER_RECOVERY_CENSUS_MX_MATCH], 6);
 	UT_ASSERT(kinds[CLUSTER_RECOVERY_CENSUS_NATIVE_EFFECT] > 10);
@@ -151,6 +184,8 @@ UT_TEST(test_owned_census_real_inputs_all_observation_families)
 	UT_ASSERT_EQ(mismatches, 2);
 	UT_ASSERT(cluster_recovery_census_diag(census, &diag));
 	UT_ASSERT_EQ(diag.phase, CLUSTER_RECOVERY_CENSUS_DONE);
+	UT_ASSERT_EQ(diag.tx_targets, 2);
+	UT_ASSERT_EQ(diag.tx_target_missing | diag.tx_target_short | diag.tx_space_missing, 0);
 	UT_ASSERT_EQ(diag.inventory.sources, 2);
 	UT_ASSERT_EQ(diag.inventory.tt_roots_added, 2);
 	UT_ASSERT_EQ(diag.inventory.mx_physical_mismatches, 2);
@@ -305,6 +340,96 @@ UT_TEST(test_owned_census_destroy_each_phase)
 		int fd;
 		ClusterRecoveryCensus *census = owned_census_fixture(&inputs, &fd, path, false);
 		UT_ASSERT_EQ(owned_census_until(census, phase), CLUSTER_RECOVERY_CENSUS_MORE);
+		owned_census_done(census, &inputs, fd, path);
+	}
+}
+
+UT_TEST(test_owned_census_target_obligations_keep_absence_extent_and_unsupported_forks)
+{
+	for (unsigned mode = 1; mode <= 5; mode++) {
+		ClusterWalInputsV1 *inputs;
+		char path[MAXPGPATH];
+		int fd;
+		ClusterRecoveryCensus *census;
+		ClusterRecoveryCensusEntry entry;
+		ClusterRecoveryCensusDiag diag = { 0 };
+		unsigned count = 0, seen = 0;
+		owned_target_mode = mode;
+		census = owned_census_fixture(&inputs, &fd, path, false);
+		owned_target_mode = 0;
+		if (mode == 5) {
+			UT_ASSERT_EQ(owned_census_until(census, 0), CLUSTER_RECOVERY_CENSUS_REFUSED);
+			owned_census_sticky(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+		} else {
+			UT_ASSERT_EQ(owned_census_until(census, CLUSTER_RECOVERY_CENSUS_TX_TARGETS), 0);
+			for (unsigned step = 0; step < 8; step++) {
+				ClusterRecoveryCensusResult result = cluster_recovery_census_next(census, &entry);
+				UT_ASSERT(result <= CLUSTER_RECOVERY_CENSUS_ENTRY);
+				if (result > CLUSTER_RECOVERY_CENSUS_ENTRY)
+					break;
+				if (result == CLUSTER_RECOVERY_CENSUS_ENTRY) {
+					const ClusterRecoveryCensusTarget *target = &entry.value.target;
+					UT_ASSERT_EQ(entry.kind, CLUSTER_RECOVERY_CENSUS_TX_TARGET);
+					count++;
+					if (target->transaction.transaction.origin_node_id == 0) {
+						seen++;
+						UT_ASSERT_EQ(target->target_physical, mode != 1);
+						UT_ASSERT_EQ(target->target_extent_present, mode == 4);
+						UT_ASSERT_EQ(target->space_physical, mode == 2 || mode == 3);
+						if (mode == 1) {
+							UT_ASSERT(target->root == NULL && target->space == NULL);
+							UT_ASSERT_EQ(target->root_index, UINT32_MAX);
+							UT_ASSERT_EQ(target->space_index, UINT32_MAX);
+						}
+						if (mode == 3)
+							UT_ASSERT_EQ(target->required_blocks, (uint64)InvalidBlockNumber);
+					}
+				}
+				UT_ASSERT(cluster_recovery_census_diag(census, &diag));
+				if (diag.phase == CLUSTER_RECOVERY_CENSUS_RELATIONS)
+					break;
+			}
+			UT_ASSERT_EQ(count, 2);
+			UT_ASSERT_EQ(seen, 1);
+			UT_ASSERT_EQ(diag.phase, CLUSTER_RECOVERY_CENSUS_RELATIONS);
+			UT_ASSERT_EQ(diag.tx_targets, 2);
+			UT_ASSERT_EQ(diag.tx_target_missing, mode == 1);
+			UT_ASSERT_EQ(diag.tx_target_short, mode == 2 || mode == 3);
+			UT_ASSERT_EQ(diag.tx_space_missing, mode == 4 ? 2 : mode == 1 ? 1 : 0);
+		}
+		if (mode == 4)
+			owned_census_relation(fd, &cluster_wal_inputs_at_v1(inputs, 0)->source, 16385, false);
+		owned_census_done(census, &inputs, fd, path);
+	}
+}
+
+UT_TEST(test_owned_census_target_join_and_final_observation_revoke_changed_inputs)
+{
+	for (unsigned mode = 0; mode < 3; mode++) {
+		ClusterWalInputsV1 *inputs;
+		char path[MAXPGPATH];
+		int fd;
+		ClusterRecoveryCensus *census = owned_census_fixture(&inputs, &fd, path, false);
+		ClusterRecoveryCensusEntry entry;
+		UT_ASSERT_EQ(owned_census_until(census, CLUSTER_RECOVERY_CENSUS_TX_TARGETS), 0);
+		UT_ASSERT_EQ(cluster_recovery_census_next(census, &entry), CLUSTER_RECOVERY_CENSUS_ENTRY);
+		UT_ASSERT_EQ(entry.kind, CLUSTER_RECOVERY_CENSUS_TX_TARGET);
+		if (mode == 0)
+			cluster_recovery_reference_graph_invalidate(census->graph);
+		if (mode == 1)
+			cluster_recovery_root_set_invalidate(census->roots);
+		if (mode == 2) {
+			uint32 block = 10;
+			int file = openat(fd, "pg_undo/instance_0/seg_1.dat", O_WRONLY);
+			UT_ASSERT(file >= 0);
+			UT_ASSERT_EQ(
+				pwrite(file, &block, sizeof(block),
+					   BLCKSZ + sizeof(UndoBlockHeader) + offsetof(UndoRecordHeader, target_block)),
+				sizeof(block));
+			UT_ASSERT_EQ(close(file), 0);
+		}
+		UT_ASSERT_EQ(owned_census_until(census, 0), CLUSTER_RECOVERY_CENSUS_REFUSED);
+		owned_census_sticky(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
 		owned_census_done(census, &inputs, fd, path);
 	}
 }

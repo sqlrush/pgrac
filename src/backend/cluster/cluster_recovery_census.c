@@ -19,7 +19,8 @@ struct ClusterRecoveryCensus {
 	ClusterRecoveryMultixactScan *mx;
 	ClusterRecoveryCensusDiag diag;
 	ClusterRecoveryCensusResult status;
-	uint32 source_count;
+	uint32 source_count, target_at;
+	uint8 storage_uuid[16];
 	uint64 system_identifier, database_incarnation;
 	size_t child_budget;
 };
@@ -82,6 +83,7 @@ cluster_recovery_census_begin(ClusterWalInputsV1 *inputs, int root_fd, size_t me
 	census->source_count = count;
 	census->system_identifier = first->source.claim.identity.system_identifier;
 	census->database_incarnation = first->source.claim.database_incarnation;
+	memcpy(census->storage_uuid, first->source.claim.identity.storage_uuid, 16);
 	census->child_budget = budget;
 	census->diag.phase = CLUSTER_RECOVERY_CENSUS_WAL;
 	PG_TRY();
@@ -116,6 +118,56 @@ census_entry(ClusterRecoveryCensusEntry *out, ClusterRecoveryCensusKind kind)
 {
 	out->kind = kind;
 	return CLUSTER_RECOVERY_CENSUS_ENTRY;
+}
+
+/* Two exact bounded candidate lookups for one fully re-read TX node. No
+ * late roots or rebased digest: an absent edge remains explicitly absent.
+ * Physical file presence/extent does not resolve incarnation or DROP/CREATE. */
+static ClusterRecoveryCensusResult
+census_target(ClusterRecoveryCensus *census, ClusterRecoveryCensusEntry *out)
+{
+	ClusterRecoveryCensusDiag *d = &census->diag;
+	ClusterRecoveryCensusTarget *target = &out->value.target;
+	const UndoRecordHeader *header;
+
+	d->graph_result = cluster_recovery_reference_graph_at(census->graph, census->target_at,
+														  &target->transaction);
+	if (d->graph_result == CLUSTER_RECOVERY_GRAPH_DRAINED) {
+		d->phase = CLUSTER_RECOVERY_CENSUS_RELATIONS;
+		return CLUSTER_RECOVERY_CENSUS_MORE;
+	}
+	if (d->graph_result != CLUSTER_RECOVERY_GRAPH_RECORD)
+		return census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+	header = &target->transaction.record->header;
+	target->key.system_identifier = target->transaction.transaction.system_identifier;
+	target->key.database_incarnation = target->transaction.transaction.database_incarnation;
+	memcpy(target->key.storage_uuid, census->storage_uuid, 16);
+	target->key.locator = header->target_locator;
+	target->forknum = header->target_fork;
+	target->blockno = header->target_block;
+	target->required_blocks = (uint64)header->target_block + 1;
+	d->roots_result = cluster_recovery_root_set_find_relation(census->roots, &target->key,
+															  target->forknum, &target->root_index);
+	if (d->roots_result != CLUSTER_RECOVERY_ROOTS_OBSERVED)
+		return census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+	d->roots_result = cluster_recovery_root_set_find_relation(census->roots, &target->key,
+															  SPACE_FORKNUM, &target->space_index);
+	if (d->roots_result != CLUSTER_RECOVERY_ROOTS_OBSERVED)
+		return census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+	target->root = cluster_recovery_root_set_entry(census->roots, target->root_index);
+	target->space = cluster_recovery_root_set_entry(census->roots, target->space_index);
+	target->target_physical
+		= target->root != NULL && (target->root->origins & CLUSTER_RECOVERY_ROOT_PHYSICAL) != 0;
+	target->target_extent_present
+		= target->target_physical && target->root->file.size / BLCKSZ >= target->required_blocks;
+	target->space_physical
+		= target->space != NULL && (target->space->origins & CLUSTER_RECOVERY_ROOT_PHYSICAL) != 0;
+	d->tx_targets++;
+	d->tx_target_missing += !target->target_physical;
+	d->tx_target_short += target->target_physical && !target->target_extent_present;
+	d->tx_space_missing += !target->space_physical;
+	census->target_at++;
+	return census_entry(out, CLUSTER_RECOVERY_CENSUS_TX_TARGET);
 }
 
 static ClusterRecoveryCensusResult
@@ -188,12 +240,14 @@ census_step(ClusterRecoveryCensus *census, ClusterRecoveryCensusEntry *out)
 			return census_entry(out, CLUSTER_RECOVERY_CENSUS_TX_RECORD);
 		}
 		if (d->graph_result == CLUSTER_RECOVERY_GRAPH_DRAINED)
-			d->phase = CLUSTER_RECOVERY_CENSUS_RELATIONS;
+			d->phase = CLUSTER_RECOVERY_CENSUS_TX_TARGETS;
 		if (d->graph_result == CLUSTER_RECOVERY_GRAPH_MORE
 			|| d->graph_result == CLUSTER_RECOVERY_GRAPH_PENDING
 			|| d->graph_result == CLUSTER_RECOVERY_GRAPH_DRAINED)
 			return CLUSTER_RECOVERY_CENSUS_MORE;
 		break;
+	case CLUSTER_RECOVERY_CENSUS_TX_TARGETS:
+		return census_target(census, out);
 	case CLUSTER_RECOVERY_CENSUS_RELATIONS:
 		if (census->relations == NULL) {
 			d->relation_result = cluster_recovery_relation_census_begin(

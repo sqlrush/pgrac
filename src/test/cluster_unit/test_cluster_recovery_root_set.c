@@ -737,10 +737,160 @@ UT_TEST(test_final_root_observation_resets_verification_in_bounded_steps)
 	remove_root(fd);
 }
 
+static ClusterSpaceIdentityKey
+lookup_key(RelFileNumber rel)
+{
+	ClusterSpaceIdentityKey key = { 0 };
+	key.system_identifier = 817;
+	key.database_incarnation = 91;
+	memcpy(key.storage_uuid, root_uuid, 16);
+	key.locator = (RelFileLocator){ 1663, 5, rel };
+	return key;
+}
+
+UT_TEST(test_observed_relation_lookup_preserves_missing_and_wal_only_candidates)
+{
+	int fd = new_root();
+	ClusterRecoveryRootSet *roots;
+	ClusterSpaceIdentityKey key = lookup_key(16385);
+	RfPageIdentityV1 missing = target(999, MAIN_FORKNUM, 17);
+	uint32 index;
+	uint8 before[32], after[32];
+	const ClusterRecoveryRootEntry *entry;
+	UT_ASSERT_EQ(mkdirat(fd, "base", 0700), 0);
+	UT_ASSERT_EQ(mkdirat(fd, "base/5", 0700), 0);
+	UT_ASSERT_EQ(mkdirat(fd, "global", 0700), 0);
+	root_file(fd, "base/5/16385", "data", 4);
+	root_file(fd, "base/5/16385_space", "space", 5);
+	root_file(fd, "base/5/16385_vm", "", 0);
+	root_file(fd, "global/1260", "catalog", 7);
+	roots = begin_roots(fd, 1024 * 1024);
+	UT_ASSERT_EQ(cluster_recovery_root_set_add_target(roots, &missing), 0);
+	UT_ASSERT_EQ(finish_roots(roots, NULL), CLUSTER_RECOVERY_ROOTS_OBSERVED);
+	UT_ASSERT(cluster_recovery_root_set_digest(roots, before));
+	for (unsigned kind = 0; kind < 6; kind++) {
+		ForkNumber forknum = MAIN_FORKNUM;
+		key = lookup_key(16385);
+		if (kind == 1)
+			forknum = SPACE_FORKNUM;
+		if (kind == 2)
+			forknum = VISIBILITYMAP_FORKNUM;
+		if (kind == 3)
+			key.locator.relNumber = 999;
+		if (kind == 4)
+			key.locator.relNumber = 100000;
+		if (kind == 5)
+			key.locator = (RelFileLocator){ 1664, 0, 1260 };
+		UT_ASSERT_EQ(cluster_recovery_root_set_find_relation(roots, &key, forknum, &index),
+					 CLUSTER_RECOVERY_ROOTS_OBSERVED);
+		if (kind == 4) {
+			UT_ASSERT_EQ(index, UINT32_MAX);
+			continue;
+		}
+		entry = cluster_recovery_root_set_entry(roots, index);
+		UT_ASSERT(entry != NULL);
+		if (entry == NULL)
+			continue;
+		UT_ASSERT_EQ(entry->file.locator.relNumber, key.locator.relNumber);
+		UT_ASSERT_EQ(entry->file.locator.dbOid, key.locator.dbOid);
+		UT_ASSERT_EQ(entry->file.forknum, forknum);
+		UT_ASSERT_EQ((entry->origins & CLUSTER_RECOVERY_ROOT_PHYSICAL) != 0, kind != 3);
+		if (kind == 2)
+			UT_ASSERT_EQ(entry->file.size, 0);
+		if (kind == 3)
+			UT_ASSERT_EQ(entry->required_blocks, 18);
+	}
+	UT_ASSERT(cluster_recovery_root_set_digest(roots, after));
+	UT_ASSERT_EQ(memcmp(before, after, 32), 0);
+	cluster_recovery_root_set_invalidate(roots);
+	index = 7;
+	UT_ASSERT_EQ(cluster_recovery_root_set_find_relation(roots, &key, MAIN_FORKNUM, &index),
+				 CLUSTER_RECOVERY_ROOTS_INVALID);
+	UT_ASSERT_EQ(index, UINT32_MAX);
+	cluster_recovery_root_set_destroy(roots);
+	remove_root(fd);
+}
+
+UT_TEST(test_observed_relation_lookup_refuses_namespace_and_unsupported_addresses)
+{
+	for (unsigned mode = 0; mode < 10; mode++) {
+		int fd = new_root();
+		ClusterRecoveryRootSet *roots = begin_roots(fd, 1024 * 1024);
+		ClusterSpaceIdentityKey key = lookup_key(16385);
+		ForkNumber forknum = MAIN_FORKNUM;
+		uint32 index = 7;
+		uint8 digest[32];
+		if (mode != 0)
+			UT_ASSERT_EQ(finish_roots(roots, NULL), CLUSTER_RECOVERY_ROOTS_OBSERVED);
+		if (mode == 1)
+			key.system_identifier++;
+		if (mode == 2)
+			key.database_incarnation++;
+		if (mode == 3)
+			key.storage_uuid[15]++;
+		if (mode == 4)
+			key.locator.relNumber = 0;
+		if (mode == 5)
+			key.locator = (RelFileLocator){ 1664, 5, 16385 };
+		if (mode == 6)
+			key.locator = (RelFileLocator){ 9999, 5, 16385 };
+		if (mode == 7)
+			forknum = INIT_FORKNUM;
+		UT_ASSERT_EQ(cluster_recovery_root_set_find_relation(roots, mode == 8 ? NULL : &key,
+															 forknum, mode == 9 ? NULL : &index),
+					 CLUSTER_RECOVERY_ROOTS_INVALID);
+		if (mode != 9)
+			UT_ASSERT_EQ(index, UINT32_MAX);
+		UT_ASSERT(!cluster_recovery_root_set_digest(roots, digest));
+		key = lookup_key(16385);
+		UT_ASSERT_EQ(cluster_recovery_root_set_find_relation(roots, &key, MAIN_FORKNUM, &index),
+					 CLUSTER_RECOVERY_ROOTS_INVALID);
+		cluster_recovery_root_set_destroy(roots);
+		remove_root(fd);
+	}
+}
+
+UT_TEST(test_observed_relation_lookup_collision_exhaustion_is_not_missing)
+{
+	int fd = new_root();
+	ClusterRecoveryRootSet *roots = begin_roots(fd, 1024 * 1024);
+	unsigned colliding = 0;
+	uint32 absent = 0, index = 0;
+	uint8 digest[32];
+	for (uint32 number = 1; number < 2000000 && colliding < 129; number++) {
+		char path[64];
+		uint64 hash = UINT64CONST(14695981039346656037);
+		RfPageIdentityV1 page = target(number, MAIN_FORKNUM, 0);
+		snprintf(path, sizeof(path), "base/5/%u", number);
+		for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
+			hash ^= *p;
+			hash *= UINT64CONST(1099511628211);
+		}
+		if ((hash & (roots->bucket_count - 1)) != 0)
+			continue;
+		if (++colliding <= 128)
+			UT_ASSERT_EQ(cluster_recovery_root_set_add_target(roots, &page), 0);
+		else
+			absent = number;
+	}
+	UT_ASSERT_EQ(colliding, 129);
+	UT_ASSERT_EQ(finish_roots(roots, NULL), CLUSTER_RECOVERY_ROOTS_OBSERVED);
+	{
+		ClusterSpaceIdentityKey key = lookup_key(absent);
+		UT_ASSERT_EQ(cluster_recovery_root_set_find_relation(roots, &key, MAIN_FORKNUM, &index),
+					 CLUSTER_RECOVERY_ROOTS_CAPACITY);
+		UT_ASSERT_EQ(index, UINT32_MAX);
+		UT_ASSERT(!cluster_recovery_root_set_digest(roots, digest));
+		UT_ASSERT_EQ(cluster_recovery_root_set_count(roots), 128);
+	}
+	cluster_recovery_root_set_destroy(roots);
+	remove_root(fd);
+}
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(24);
 	UT_RUN(test_unreferenced_physical_files_and_missing_wal_targets_are_preserved);
 	UT_RUN(test_native_slru_root_counts_are_exposed_only_after_observation);
 	UT_RUN(test_all_file_bytes_are_read_twice_in_bounded_chunks);
@@ -762,6 +912,9 @@ main(void)
 	UT_RUN(test_final_root_observation_reads_all_bytes_without_rebasing);
 	UT_RUN(test_final_root_observation_refuses_path_content_and_io_changes);
 	UT_RUN(test_final_root_observation_resets_verification_in_bounded_steps);
+	UT_RUN(test_observed_relation_lookup_preserves_missing_and_wal_only_candidates);
+	UT_RUN(test_observed_relation_lookup_refuses_namespace_and_unsupported_addresses);
+	UT_RUN(test_observed_relation_lookup_collision_exhaustion_is_not_missing);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

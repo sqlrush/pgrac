@@ -202,24 +202,18 @@ cluster_recovery_root_set_begin(int root_fd, uint64 system_identifier, uint64 da
 	return CLUSTER_RECOVERY_ROOTS_MORE;
 }
 
-static ClusterRecoveryRootsResult
-roots_add_relation(ClusterRecoveryRootSet *roots, const RelFileLocator *locator, ForkNumber forknum,
-				   uint64 required_blocks)
+/* Both producer enumeration and later target joins use the same legal
+ * address chain. Formatting a path does not establish physical existence. */
+static bool
+roots_relation_path(const RelFileLocator *locator, ForkNumber forknum, char path[MAXPGPATH])
 {
-	char path[MAXPGPATH];
 	const char *suffix;
-	ClusterRecoveryRootEntry *entry;
-	uint32 index;
 
-	if (roots == NULL)
-		return CLUSTER_RECOVERY_ROOTS_INVALID;
-	if (roots->status > CLUSTER_RECOVERY_ROOTS_OBSERVED)
-		return roots->status;
-	if (roots->started || locator == NULL || locator->relNumber == 0
+	if (locator == NULL || locator->relNumber == 0
 		|| (locator->spcOid == GLOBALTABLESPACE_OID
 				? locator->dbOid != InvalidOid
 				: locator->spcOid != DEFAULTTABLESPACE_OID || locator->dbOid == InvalidOid))
-		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+		return false;
 	switch (forknum) {
 	case MAIN_FORKNUM:
 		suffix = "";
@@ -234,12 +228,29 @@ roots_add_relation(ClusterRecoveryRootSet *roots, const RelFileLocator *locator,
 		suffix = "_space";
 		break;
 	default:
-		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+		return false;
 	}
 	if (locator->spcOid == GLOBALTABLESPACE_OID)
-		snprintf(path, sizeof(path), "global/%u%s", locator->relNumber, suffix);
+		snprintf(path, MAXPGPATH, "global/%u%s", locator->relNumber, suffix);
 	else
-		snprintf(path, sizeof(path), "base/%u/%u%s", locator->dbOid, locator->relNumber, suffix);
+		snprintf(path, MAXPGPATH, "base/%u/%u%s", locator->dbOid, locator->relNumber, suffix);
+	return true;
+}
+
+static ClusterRecoveryRootsResult
+roots_add_relation(ClusterRecoveryRootSet *roots, const RelFileLocator *locator, ForkNumber forknum,
+				   uint64 required_blocks)
+{
+	char path[MAXPGPATH];
+	ClusterRecoveryRootEntry *entry;
+	uint32 index;
+
+	if (roots == NULL)
+		return CLUSTER_RECOVERY_ROOTS_INVALID;
+	if (roots->status > CLUSTER_RECOVERY_ROOTS_OBSERVED)
+		return roots->status;
+	if (roots->started || !roots_relation_path(locator, forknum, path))
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
 	if (!roots_lookup(roots, path, true, &index))
 		return roots->status;
 	entry = &roots->entries[index];
@@ -818,6 +829,38 @@ cluster_recovery_root_set_storage_matches(const ClusterRecoveryRootSet *roots,
 		   && cluster_recovery_root_set_namespace_matches(roots, system_identifier,
 														  database_incarnation)
 		   && memcmp(roots->storage_uuid, storage_uuid, 16) == 0;
+}
+
+ClusterRecoveryRootsResult
+cluster_recovery_root_set_find_relation(ClusterRecoveryRootSet *roots,
+										const ClusterSpaceIdentityKey *key, ForkNumber forknum,
+										uint32 *index)
+{
+	char path[MAXPGPATH];
+	uint32 at;
+	const ClusterRecoveryRootEntry *entry;
+
+	if (index != NULL)
+		*index = UINT32_MAX;
+	if (roots == NULL)
+		return CLUSTER_RECOVERY_ROOTS_INVALID;
+	if (roots->status > CLUSTER_RECOVERY_ROOTS_OBSERVED)
+		return roots->status;
+	if (index == NULL || key == NULL
+		|| !cluster_recovery_root_set_storage_matches(roots, key->system_identifier,
+													  key->database_incarnation, key->storage_uuid)
+		|| !roots_relation_path(&key->locator, forknum, path))
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	if (!roots_lookup(roots, path, false, &at))
+		return roots->status; /* OBSERVED absence or sticky capacity refusal */
+	entry = &roots->entries[at];
+	if (entry->file.kind != CLUSTER_RECOVERY_FILE_RELATION || entry->file.forknum != forknum
+		|| entry->file.locator.spcOid != key->locator.spcOid
+		|| entry->file.locator.dbOid != key->locator.dbOid
+		|| entry->file.locator.relNumber != key->locator.relNumber)
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	*index = roots->merge[at];
+	return CLUSTER_RECOVERY_ROOTS_OBSERVED;
 }
 
 ClusterRecoveryRootsResult

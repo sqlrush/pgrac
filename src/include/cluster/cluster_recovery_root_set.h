@@ -47,6 +47,16 @@ typedef struct ClusterRecoveryRootsEvent {
 
 typedef struct ClusterRecoveryRootSet ClusterRecoveryRootSet;
 
+/* Exact candidate lookup in the already observed immutable union. At most
+ * 128 hash probes, no I/O or additions. OBSERVED with UINT32_MAX means no
+ * candidate: an unresolved obligation, never proof of deletion/completion.
+ * A present candidate can still be WAL-only or shorter than its target.
+ * Wrong namespace/unsupported address/capacity refuse and revoke the set. */
+extern ClusterRecoveryRootsResult
+cluster_recovery_root_set_find_relation(ClusterRecoveryRootSet *roots,
+										const ClusterSpaceIdentityKey *key, ForkNumber forknum,
+										uint32 *index);
+
 /* Counts of canonical native SLRU segment files present in the stable
  * physical root union.  This is an observation only: page-level native
  * census, horizon checks, and the recovery owner must still prove every
