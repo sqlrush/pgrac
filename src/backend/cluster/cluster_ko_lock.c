@@ -315,6 +315,7 @@ struct ClusterKoCompletionV2 {
 	 * releasing the transport slot before the next relation's barrier. */
 	bool barrier_private;
 	bool barrier_v3;
+	uint16 barrier_ready_peers;
 	dsa_pointer native_allocation;
 	ClusterKoNativeContinuation *native_reserved;
 	ClusterKoSharedMessageV2 barrier_request;
@@ -2962,6 +2963,27 @@ ko_shared_resource_release(ResourceReleasePhase phase, bool commit, bool top,
 	}
 }
 
+/* Preserve the original per-peer results, never synthesize legacy structural
+ * acceptance from READY. The caller separately validates the full live cut;
+ * COMMIT may retain an old cut for recovery without granting execution.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+ko_shared_ready_v3(const ClusterKoSharedContext *context)
+{
+	uint16 expected = 0;
+
+	if (!context->used || !context->v3 || context->origin_detached || context->ax_failed
+		|| context->request.origin_node != cluster_node_id
+		|| memcmp(&context->request, &context->request_v3.base, sizeof(context->request)) != 0
+		|| context->request_failed_peers != 0 || context->request_uncertain_peers != 0
+		|| context->request_sending_peers != 0)
+		return false;
+	for (unsigned peer = 0; peer < CLUSTER_KO_SHARED_NODE_LIMIT; peer++)
+		if (peer != cluster_node_id && context->peer_boots[peer] != 0)
+			expected |= (uint16)(1u << peer);
+	return context->request_sent_peers == expected && context->request_done_peers == expected;
+}
+
 static bool
 ko_completion_snapshot(const ClusterKoCompletionV2 *completion, ClusterKoSharedContext *out)
 {
@@ -2983,10 +3005,12 @@ ko_completion_snapshot(const ClusterKoCompletionV2 *completion, ClusterKoSharedC
 		out->v3 = owned->barrier_v3;
 		out->request = owned->barrier_v3 ? owned->barrier_request_v3.base
 											: owned->barrier_request;
-		if (owned->barrier_v3)
+		if (owned->barrier_v3) {
 			out->request_v3 = owned->barrier_request_v3;
+			out->request_sent_peers = out->request_done_peers = owned->barrier_ready_peers;
+		}
 		memcpy(out->peer_boots, owned->barrier_boots, sizeof(out->peer_boots));
-		return ko_shared_origin_current(out);
+		return (!out->v3 || ko_shared_ready_v3(out)) && ko_shared_origin_current(out);
 	}
 	if (owned->slot >= CLUSTER_KO_SHARED_CAPACITY)
 		return false;
@@ -2995,7 +3019,7 @@ ko_completion_snapshot(const ClusterKoCompletionV2 *completion, ClusterKoSharedC
 	valid = out->used && out->complete && !out->structure_owned && out->pid == owned->pid
 			&& out->serial == owned->serial;
 	SpinLockRelease(&ko_state->shared_lock);
-	return valid && ko_shared_origin_current(out);
+	return valid && (!out->v3 || ko_shared_ready_v3(out)) && ko_shared_origin_current(out);
 }
 
 /* No public value can create this proof. Move only this process's exact
@@ -3014,8 +3038,10 @@ ko_native_barrier_to_owner(ClusterKoCompletionV2 *completion)
 	if (memcmp(&ko_state->contexts[completion->slot], &before, sizeof(before)) == 0) {
 		completion->barrier_v3 = before.v3;
 		completion->barrier_request = before.request;
-		if (before.v3)
+		if (before.v3) {
 			completion->barrier_request_v3 = before.request_v3;
+			completion->barrier_ready_peers = before.request_done_peers;
+		}
 		memcpy(completion->barrier_boots, before.peer_boots, sizeof(before.peer_boots));
 		completion->barrier_private = true;
 		/* v3 retains its preallocated origin slot through native lock release.
@@ -3318,6 +3344,20 @@ ko_native_publish(ClusterKoCompletionV2 *owned, bool from_commit_tail)
 	work = owned->native_reserved;
 	memset(&work->context, 0, sizeof(work->context));
 	work->context.used = work->context.complete = true;
+	work->context.pid = owned->pid;
+	work->context.serial = owned->serial;
+	work->context.v3 = owned->barrier_v3;
+	work->context.request = owned->barrier_v3 ? owned->barrier_request_v3.base
+											: owned->barrier_request;
+	if (owned->barrier_v3) {
+		work->context.request_v3 = owned->barrier_request_v3;
+		work->context.request_sent_peers = work->context.request_done_peers
+			= owned->barrier_ready_peers;
+	}
+	memcpy(work->context.peer_boots, owned->barrier_boots, sizeof(owned->barrier_boots));
+	work->context.terminal = owned->terminal;
+	memcpy(work->context.structure, owned->structure, sizeof(owned->structure));
+	qualified = qualified && (!owned->barrier_v3 || ko_shared_ready_v3(&work->context));
 	work->context.structure_owned = qualified;
 	work->recovery_required = !qualified;
 	work->buffers_released = qualified
@@ -3326,16 +3366,6 @@ ko_native_publish(ClusterKoCompletionV2 *owned, bool from_commit_tail)
 	work->context.structure_drop_pending = qualified
 										   && change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE
 										   && !owned->drop_observed;
-	work->context.pid = owned->pid;
-	work->context.serial = owned->serial;
-	work->context.v3 = owned->barrier_v3;
-	work->context.request = owned->barrier_v3 ? owned->barrier_request_v3.base
-											: owned->barrier_request;
-	if (owned->barrier_v3)
-		work->context.request_v3 = owned->barrier_request_v3;
-	memcpy(work->context.peer_boots, owned->barrier_boots, sizeof(owned->barrier_boots));
-	work->context.terminal = owned->terminal;
-	memcpy(work->context.structure, owned->structure, sizeof(owned->structure));
 	if (!work->buffers_released)
 		owned->native_unready = owned->native_allocation;
 	SpinLockAcquire(&ko_state->shared_lock);
@@ -3581,6 +3611,7 @@ ko_drop_context_current(const ClusterKoSharedContext *context)
 	ClusterWalSourceRef current;
 
 	return context->used && context->complete && context->structure_owned
+		   && (!context->v3 || ko_shared_ready_v3(context))
 		   && context->structure_drop_pending && !context->structure_drop_failed
 		   && context->serial != 0 && context->request.origin_node == cluster_node_id
 		   && cluster_space_structure_wal_decode(context->structure, sizeof(context->structure),
@@ -3902,6 +3933,7 @@ ko_shared_structure_snapshot(uint32 slot, ClusterKoSharedContext *out)
 	context = ko_state->contexts[slot];
 	SpinLockRelease(&ko_state->shared_lock);
 	if (!context.used || !context.complete || !context.structure_owned
+		|| (context.v3 && !ko_shared_ready_v3(&context))
 		|| context.structure_drop_pending || context.serial == 0
 		|| (context.request.origin_node == cluster_node_id
 				? (!ko_shared_origin_current(&context)
@@ -5360,7 +5392,7 @@ ko_shared_v3_peer_identity_current(const ClusterKoSharedMessageV3 *message)
 
 static bool
 ko_shared_wait_for_acks_v3(ClusterKoSharedMessageV3 *request, uint32 mask,
-											 const uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT])
+							 const uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], uint32 context)
 {
 	ResetLatch(MyLatch);
 	KO_BUMP(flush_count);
@@ -5391,8 +5423,19 @@ ko_shared_wait_for_acks_v3(ClusterKoSharedMessageV3 *request, uint32 mask,
 					 errhint("Check the peer log for this operation's original error; "
 							 "the object drain has not completed.")));
 		}
-		if (cluster_sinval_ack_wait_is_complete(request->base.batch_id))
-			return ko_shared_v3_control_current(request) && ko_shared_v3_space_current(request);
+		if (cluster_sinval_ack_wait_is_complete(request->base.batch_id)) {
+			ClusterKoSharedContext current;
+
+			SpinLockAcquire(&ko_state->shared_lock);
+			current = ko_state->contexts[context];
+			SpinLockRelease(&ko_state->shared_lock);
+			/* A wait-table notification is not the operation's result set.
+			 * The original sender may still be returning after an early ACK;
+			 * wait for its reference instead of failing the native handoff. */
+			if (current.pid == MyProcPid && current.request.batch_id == request->base.batch_id
+				&& ko_shared_ready_v3(&current))
+				return ko_shared_v3_control_current(request) && ko_shared_v3_space_current(request);
+		}
 		/* A timed wait only schedules the next identity/interrupt check.
 		 * Missing READY is not evidence that the accepted drain failed;
 		 * exact ACKs, peer failure and caller cancellation keep their original
@@ -5450,7 +5493,7 @@ ko_run_shared_barrier_impl_v3(RelFileLocator locator, uint16 operation,
 			/* The original owner removes this entry; v3 has no protocol deadline. */
 			begun = cluster_sinval_ack_wait_begin(request.base.batch_id, mask, 0);
 		if (begun)
-			ok = ko_shared_wait_for_acks_v3(&request, mask, boots);
+			ok = ko_shared_wait_for_acks_v3(&request, mask, boots, context);
 	}
 	PG_FINALLY();
 	{
