@@ -51,6 +51,7 @@
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_lmd_wait_state.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_control_request.h"
 #include "cluster/cluster_shmem.h"
@@ -220,6 +221,25 @@ static int stub_admission_finish_after;
 static bool stub_admission_becomes_ready;
 static bool stub_admission_interrupt;
 static int stub_reserve_calls;
+static uint64 ko_sample_limit = UINT64_MAX;
+static int ko_sample_calls;
+static int ko_sample_reserve_count;
+
+/* KO ownership is exercised in test_cluster_ko_stop. This suite observes
+ * only the original S3 sampling boundary. */
+uint64
+cluster_ko_peer_fence_request_sample_v3(void)
+{
+	ko_sample_calls++;
+	ko_sample_reserve_count = stub_reserve_calls;
+	return ko_sample_limit;
+}
+
+bool
+cluster_ko_peer_fence_fresh_grant_v3(const ClusterLockAcquireRequest *request pg_attribute_unused())
+{
+	return false;
+}
 static const ClusterLockAcquireRequest *stub_admission_request;
 static bool stub_recovery_ready_for_test = false;
 static int32 stub_master_node = -1;
@@ -1950,13 +1970,55 @@ UT_TEST(test_pending_entry_cancel_keeps_no_request_or_reservation)
 	pending_entry_reset();
 }
 
+UT_TEST(test_relation_fence_sample_precedes_reservation_and_survives_retries)
+{
+	for (int refused = 0; refused <= 1; refused++) {
+		ClusterLockAcquireRequest req = { 0 };
+		int before = stub_reserve_calls;
+
+		req.resid.type = LOCKTAG_RELATION;
+		req.op = CLUSTER_LOCK_OP_REQUEST;
+		req.lockmode = AccessShareLock;
+		ko_sample_calls = 0;
+		ko_sample_limit = refused ? UINT64_MAX : 12;
+		stub_reserve_result = CLUSTER_GRD_ENTRY_NOT_READY;
+		UT_ASSERT_EQ(cluster_lock_acquire_s3_partition_reservation(&req),
+			CLUSTER_LOCK_ACQUIRE_FAIL_GRD_NOT_READY);
+		UT_ASSERT_EQ(req.ko_fence_serial_limit, ko_sample_limit);
+		UT_ASSERT_EQ(req.ko_fence_request_id, req.request_id);
+		UT_ASSERT_EQ(ko_sample_reserve_count, before);
+		ko_sample_limit = 99;
+		UT_ASSERT_EQ(cluster_lock_acquire_s3_partition_reservation(&req),
+			CLUSTER_LOCK_ACQUIRE_FAIL_GRD_NOT_READY);
+		UT_ASSERT_EQ(req.ko_fence_serial_limit, refused ? UINT64_MAX : 12);
+		UT_ASSERT_EQ(ko_sample_calls, 1);
+		UT_ASSERT_EQ(stub_reserve_calls, before + 2);
+	}
+	ko_sample_limit = UINT64_MAX;
+}
+
+UT_TEST(test_relation_fence_sample_never_created_after_a_grant)
+{
+	ClusterLockAcquireRequest req = { 0 };
+
+	req.resid.type = LOCKTAG_RELATION;
+	req.op = CLUSTER_LOCK_OP_REQUEST;
+	req.lockmode = AccessShareLock;
+	req.hw_grant.key.request_id = 123;
+	ko_sample_calls = 0;
+	UT_ASSERT_EQ(cluster_lock_acquire_s3_partition_reservation(&req),
+		CLUSTER_LOCK_ACQUIRE_FAIL_GRD_NOT_READY);
+	UT_ASSERT_EQ(req.ko_fence_serial_limit, UINT64_MAX);
+	UT_ASSERT_EQ(ko_sample_calls, 0);
+}
+
 UT_DEFINE_GLOBALS();
 
 
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	UT_PLAN(29);
+	UT_PLAN(31);
 
 	UT_RUN(test_7step_api_surface_linkable_and_initial_counters_zero);
 	UT_RUN(test_7step_s1_hc1_fail_closed);
@@ -1987,6 +2049,8 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 	UT_RUN(test_pending_entry_recovers_before_any_reservation);
 	UT_RUN(test_pending_entry_nowait_background_and_proven_loss);
 	UT_RUN(test_pending_entry_cancel_keeps_no_request_or_reservation);
+	UT_RUN(test_relation_fence_sample_precedes_reservation_and_survives_retries);
+	UT_RUN(test_relation_fence_sample_never_created_after_a_grant);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

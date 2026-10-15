@@ -2320,39 +2320,76 @@ ko_peer_fence_clear_locked(ClusterKoPeerFenceV3 *entry)
 	return true;
 }
 
+uint64
+cluster_ko_peer_fence_request_sample_v3(void)
+{
+	uint64 limit = UINT64_MAX;
+
+	if (ko_state == NULL || !cluster_shared_config
+		|| cluster_interconnect_tier != CLUSTER_IC_TIER_1 || RecoveryInProgress())
+		return limit;
+	SpinLockAcquire(&ko_state->shared_lock);
+	if (ko_state->peer_fence_serial < UINT64_MAX - 1)
+		limit = ko_state->peer_fence_serial + 1;
+	SpinLockRelease(&ko_state->shared_lock);
+	return limit;
+}
+
 bool
-cluster_ko_peer_fence_fresh_grant_v3(const ClusterResId *resid, const ClusterGrdHolderId *successor,
-									 uint64 master_generation)
+cluster_ko_peer_fence_fresh_grant_v3(const ClusterLockAcquireRequest *request)
 {
 	bool retired = false;
-	uint64 current_generation;
 
-	if (ko_state == NULL || cluster_interconnect_tier != CLUSTER_IC_TIER_1 || resid == NULL
-		|| successor == NULL || master_generation == 0 || successor->request_id == 0
-		|| successor->cluster_epoch != cluster_epoch_get_current())
-		return false;
-	/* The helper is called by the master-side dispatcher.  Re-read the
-	 * generation without overwriting the caller's exact token. */
-	if (cluster_grd_lookup_master_gen(resid, &current_generation) != cluster_node_id
-		|| current_generation != master_generation)
+	if (ko_state == NULL || !cluster_shared_config
+		|| cluster_interconnect_tier != CLUSTER_IC_TIER_1 || request == NULL
+		|| request->resid.type != LOCKTAG_RELATION || request->op != CLUSTER_LOCK_OP_REQUEST
+		|| request->current_mode != NoLock || request->ko_fence_serial_limit <= 1
+		|| request->ko_fence_serial_limit == UINT64_MAX || request->request_id == 0
+		|| request->ko_fence_request_id != request->request_id
+		|| !request->hw_grant.local_promoted
+		|| !cluster_ges_relation_grant_is_current(&request->hw_grant, &request->resid,
+			&request->holder, request->request_id, request->lockmode, request->dontwait))
 		return false;
 	SpinLockAcquire(&ko_state->shared_lock);
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
-		ClusterKoPeerFenceV3 *entry = &ko_state->peer_fences[i];
+		ClusterKoPeerFenceV3 saved, *entry;
+		bool current;
 
-		if (entry->state != CLUSTER_KO_PEER_FENCE_READY
-			&& entry->state != CLUSTER_KO_PEER_FENCE_COMMITTED)
-			continue;
-		if (memcmp(&entry->request.ax_resid, resid, sizeof(*resid)) != 0
-			|| memcmp(&entry->request.ax_holder, successor, sizeof(*successor)) == 0
-			|| entry->request.ax_master_generation != master_generation || !entry->physical_applied
-			|| !entry->ack_queued || ko_cleaner_pending_locked(entry->request.base.key.locator)
+		entry = &ko_state->peer_fences[i];
+		if ((entry->state != CLUSTER_KO_PEER_FENCE_READY
+			 && entry->state != CLUSTER_KO_PEER_FENCE_COMMITTED)
+			|| entry->serial == 0 || entry->serial >= request->ko_fence_serial_limit
+			|| memcmp(&entry->request.ax_resid, &request->resid, sizeof(request->resid)) != 0
+			|| memcmp(&entry->request.ax_holder, &request->holder, sizeof(request->holder)) == 0
+			|| entry->request.ax_master_node != request->hw_grant.master
+			|| entry->peer_route_generation != request->hw_grant.master_generation
+			|| !entry->physical_applied || !entry->ack_queued
+			|| (entry->holder_probe.nonce != 0 && !entry->holder_probe.reply)
+			|| ko_cleaner_pending_locked(entry->request.base.key.locator)
 			|| ko_extend_pending_locked(entry->request.base.key.locator)
 			|| ko_peer_fence_has_queued_work_locked(entry))
 			continue;
-		retired = ko_peer_fence_clear_locked(entry);
-		if (retired)
-			break;
+		saved = *entry;
+		SpinLockRelease(&ko_state->shared_lock);
+
+		/* Metadata and GES proof reads remain outside the KO lock. The wire
+		 * generation belongs to the old AX origin; this grant uses our saved
+		 * local route cut. Neither counter is substituted for the other. */
+		current = ko_shared_v3_control_at_generation(&saved.request, saved.peer_route_generation)
+			&& cluster_ges_relation_grant_is_current(&request->hw_grant, &request->resid,
+				&request->holder, request->request_id, request->lockmode, request->dontwait);
+		SpinLockAcquire(&ko_state->shared_lock);
+		entry = &ko_state->peer_fences[i];
+		if (current && entry->serial == saved.serial && entry->state == saved.state
+			&& entry->peer_route_generation == saved.peer_route_generation
+			&& memcmp(entry->encoded, saved.encoded, sizeof(saved.encoded)) == 0
+			&& memcmp(&entry->holder_probe, &saved.holder_probe, sizeof(saved.holder_probe)) == 0
+			&& entry->physical_applied && entry->ack_queued
+			&& !ko_cleaner_pending_locked(entry->request.base.key.locator)
+			&& !ko_extend_pending_locked(entry->request.base.key.locator)
+			&& !ko_peer_fence_has_queued_work_locked(entry)
+			&& ko_peer_fence_clear_locked(entry))
+			retired = true;
 	}
 	SpinLockRelease(&ko_state->shared_lock);
 	if (retired)

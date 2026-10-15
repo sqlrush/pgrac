@@ -208,6 +208,11 @@ typedef struct ClusterLockAcquireRequest {
 	/* PRE2 manual-control owner: process-local stable identity, never a
 	 * pointer into a copyable guard or the wire. Author: SqlRush. */
 	uint64 control_owner_id;
+	/* First S3 relation REQUEST only: fences below this local serial limit
+	 * predate this request. UINT64_MAX records an unusable sample so retries
+	 * cannot manufacture a later causal edge. Never sent on the wire. */
+	uint64 ko_fence_serial_limit;
+	uint64 ko_fence_request_id;
 } ClusterLockAcquireRequest;
 
 /* Error owner around the complete PG-native acquisition body.  The callback

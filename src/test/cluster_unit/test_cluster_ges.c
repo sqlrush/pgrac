@@ -100,20 +100,8 @@ static ClusterControlRequestCut stub_retire_cut;
 static int stub_retire_drain_budget;
 static ClusterGrdGrantIdentity stub_drained_grant;
 
-/* Standalone GES tests do not link the KO shared-memory owner.  Production
- * dispatch still calls the exact successor-grant hook; this stub keeps the
- * legacy protocol binary independent of cluster_ko_lock.o. */
-bool
-cluster_ko_peer_fence_fresh_grant_v3(const ClusterResId *resid pg_attribute_unused(),
-									 const ClusterGrdHolderId *successor pg_attribute_unused(),
-									 uint64 master_generation pg_attribute_unused())
-{
-	return false;
-}
-
 /* The standalone GES fixture does not link the holder-probe worker.  Keep
- * those ingress paths inert while still exercising the production grant
- * dispatch and its KO successor hook. */
+ * those ingress paths inert while exercising production grant dispatch. */
 bool
 cluster_ges_holder_probe_is_frame(const void *payload pg_attribute_unused(),
 								  Size length pg_attribute_unused())

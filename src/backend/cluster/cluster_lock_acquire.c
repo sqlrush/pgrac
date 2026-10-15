@@ -57,6 +57,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ir.h" /* spec-5.7 D8 — CLUSTER_IR_RESID_TYPE (freeze-gate bypass belt) */
 #include "cluster/cluster_inject.h" /* spec-4.6 L11/L14 — redeclare-skip probe */
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_lmd_wait_state.h" /* spec-5.8 D1d — per-proc wait-state */
 #include "cluster/cluster_lms.h"
@@ -317,6 +318,14 @@ cluster_lock_acquire_s3_partition_reservation(const ClusterLockAcquireRequest *r
 
 	mut = (ClusterLockAcquireRequest *)req;
 	fill_request_holder(mut);
+	/* Capture before any reservation or REQUEST can obtain a grant. Retain
+	 * even an empty/refused sample through retries of this same request. */
+	if (req->resid.type == LOCKTAG_RELATION && cluster_lock_acquire_is_native_request(req)
+		&& mut->ko_fence_serial_limit == 0) {
+		mut->ko_fence_request_id = req->request_id;
+		mut->ko_fence_serial_limit = req->hw_grant.key.request_id == 0
+			? cluster_ko_peer_fence_request_sample_v3() : UINT64_MAX;
+	}
 	if (!cluster_lock_owner_request_prepare(mut))
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 
@@ -710,6 +719,8 @@ cluster_lock_acquire_s5_promote_once(const ClusterLockAcquireRequest *req)
 					promoted = cluster_lock_acquire_retained_grant_is_current(req, &pending);
 				}
 				if (promoted) {
+					if (req->resid.type == LOCKTAG_RELATION)
+						(void)cluster_ko_peer_fence_fresh_grant_v3(req);
 					grant->registration_proof = true;
 					grant->consumed = true;
 					grant->cleanup_pending = false;

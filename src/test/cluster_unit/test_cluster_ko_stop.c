@@ -7460,26 +7460,217 @@ UT_TEST(test_holder_gc_completed_nonabsent_is_throttled_without_self_wakeup)
 	}
 }
 
-UT_TEST(test_peer_fence_fresh_grant_retires_only_different_holder)
-{
-	ClusterKoSharedMessageV3 request = peer_fence_fixture(1300);
-	ClusterKoPeerFenceHandleV3 handle;
-	ClusterKoPeerFenceStateV3 state;
-	ClusterGrdHolderId successor;
+/* The GES authentication boundary is explicit here. The companion real
+ * GES/S3/S5 handoff suite checks the original exact grant implementation. */
+static bool fresh_grant_current = true;
+static int fresh_grant_checks;
+static void (*fresh_grant_check_hook)(void);
 
-	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
-	UT_ASSERT(fixture_completed_fence_ready(&request, &handle));
-	storage.peer_fences[handle.slot].physical_applied = true;
-	storage.peer_fences[handle.slot].ack_queued = true;
-	v3_route_master_node = cluster_node_id;
-	request.ax_master_node = cluster_node_id;
-	UT_ASSERT(!cluster_ko_peer_fence_fresh_grant_v3(&request.ax_resid, &request.ax_holder,
-													request.ax_master_generation));
-	successor = request.ax_holder;
-	successor.request_id++;
-	UT_ASSERT(cluster_ko_peer_fence_fresh_grant_v3(&request.ax_resid, &successor,
-												   request.ax_master_generation));
-	UT_ASSERT_EQ(storage.peer_fences[handle.slot].state, CLUSTER_KO_PEER_FENCE_EMPTY);
+bool
+cluster_ges_relation_grant_is_current(const ClusterGesHwGrant *grant, const ClusterResId *resid,
+	const ClusterGrdHolderId *holder, uint64 request_id, uint32 mode, bool dontwait)
+{
+	Assert(SpinLockFree(&storage.shared_lock));
+	fresh_grant_checks++;
+	if (fresh_grant_checks == 2 && fresh_grant_check_hook != NULL)
+		fresh_grant_check_hook();
+	return fresh_grant_current && grant->grant_observed && grant->cleanup_pending
+		&& !grant->consumed && holder->node_id == cluster_node_id
+		&& holder->cluster_epoch == current_epoch && holder->request_id == request_id
+		&& grant->key.request_id == request_id && resid->type == LOCKTAG_RELATION
+		&& mode >= AccessShareLock && mode <= AccessExclusiveLock;
+}
+
+static ClusterLockAcquireRequest
+fresh_grant_fixture(const ClusterKoSharedMessageV3 *fence)
+{
+	ClusterLockAcquireRequest request = { 0 };
+
+	fresh_grant_current = true;
+	fresh_grant_checks = 0;
+	fresh_grant_check_hook = NULL;
+	request.resid = fence->ax_resid;
+	request.op = CLUSTER_LOCK_OP_REQUEST;
+	request.lockmode = AccessShareLock;
+	request.holder = fence->ax_holder;
+	request.holder.node_id = cluster_node_id;
+	request.holder.request_id += 100;
+	request.request_id = request.holder.request_id;
+	request.ko_fence_request_id = request.request_id;
+	request.ko_fence_serial_limit = cluster_ko_peer_fence_request_sample_v3();
+	request.hw_grant.master = v3_route_master_node;
+	request.hw_grant.master_generation = v3_route_generation;
+	request.hw_grant.key.request_id = request.request_id;
+	request.hw_grant.local_promoted = true;
+	request.hw_grant.grant_observed = true;
+	request.hw_grant.cleanup_pending = true;
+	return request;
+}
+
+UT_TEST(test_peer_fence_fresh_grant_needs_original_request_sample)
+{
+	for (int fault = 0; fault < 12; fault++) {
+		ClusterKoSharedMessageV3 fence = peer_fence_fixture(1300);
+		ClusterKoPeerFenceHandleV3 handle;
+		ClusterKoPeerFenceStateV3 state;
+		ClusterLockAcquireRequest request;
+		uint64 before = cluster_ko_peer_fence_request_sample_v3();
+
+		if (fault == 6)
+			fence.ax_holder.node_id = cluster_node_id;
+		UT_ASSERT(cluster_ko_peer_fence_begin_v3(&fence, &handle, &state));
+		UT_ASSERT(fixture_completed_fence_ready(&fence, &handle));
+		storage.peer_fences[handle.slot].ack_queued = true;
+		request = fresh_grant_fixture(&fence);
+		switch (fault) {
+		case 0: request.ko_fence_serial_limit = 0; break;
+		case 1: request.ko_fence_serial_limit = before; break;
+		case 2: request.ko_fence_serial_limit = UINT64_MAX; break;
+		case 3: request.ko_fence_request_id++; break;
+		case 4: request.current_mode = ShareLock; break;
+		case 5: request.op = CLUSTER_LOCK_OP_CONVERT; break;
+		case 6:
+			request.holder = fence.ax_holder;
+			request.request_id = request.ko_fence_request_id
+				= request.hw_grant.key.request_id = fence.ax_holder.request_id;
+			break;
+		case 7: request.hw_grant.local_promoted = false; break;
+		case 8: request.hw_grant.consumed = true; break;
+		case 9: request.hw_grant.grant_observed = false; break;
+		case 10: request.hw_grant.cleanup_pending = false; break;
+		case 11: fresh_grant_current = false; break;
+		}
+		UT_ASSERT(!cluster_ko_peer_fence_fresh_grant_v3(&request));
+		UT_ASSERT_EQ(storage.peer_fences[handle.slot].state, CLUSTER_KO_PEER_FENCE_READY);
+	}
+}
+
+UT_TEST(test_peer_fence_fresh_grant_accepts_local_and_remote_master_once)
+{
+	for (int local = 0; local <= 1; local++) {
+		ClusterKoSharedMessageV3 fence = peer_fence_fixture(1301);
+		ClusterKoPeerFenceHandleV3 handle;
+		ClusterKoPeerFenceStateV3 state;
+		ClusterLockAcquireRequest request;
+
+		if (local)
+			fence.ax_master_node = v3_route_master_node = cluster_node_id;
+		/* Origin wire and peer-local generations need not have equal values. */
+		fence.ax_master_generation = 27;
+		UT_ASSERT(cluster_ko_peer_fence_begin_v3(&fence, &handle, &state));
+		UT_ASSERT(fixture_completed_fence_ready(&fence, &handle));
+		storage.peer_fences[handle.slot].ack_queued = true;
+		request = fresh_grant_fixture(&fence);
+		/* Numeric request ordering is deliberately unrelated to causality. */
+		request.request_id = request.ko_fence_request_id
+			= request.hw_grant.key.request_id = request.holder.request_id = 1;
+		holder_si_wakes = 0;
+		UT_ASSERT(cluster_ko_peer_fence_fresh_grant_v3(&request));
+		UT_ASSERT_EQ(storage.peer_fences[handle.slot].state, CLUSTER_KO_PEER_FENCE_EMPTY);
+		UT_ASSERT_EQ(holder_si_wakes, 1);
+		UT_ASSERT(!cluster_ko_peer_fence_fresh_grant_v3(&request));
+		UT_ASSERT_EQ(holder_si_wakes, 1);
+	}
+}
+
+UT_TEST(test_peer_fence_fresh_grant_cannot_clear_a_later_fence)
+{
+	ClusterKoSharedMessageV3 fence = peer_fence_fixture(1302);
+	ClusterKoPeerFenceHandleV3 old, later;
+	ClusterKoPeerFenceStateV3 state;
+	ClusterLockAcquireRequest request;
+
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&fence, &old, &state));
+	UT_ASSERT(fixture_completed_fence_ready(&fence, &old));
+	storage.peer_fences[old.slot].ack_queued = true;
+	request = fresh_grant_fixture(&fence);
+	fence.base.batch_id++;
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&fence, &later, &state));
+	UT_ASSERT(fixture_completed_fence_ready(&fence, &later));
+	storage.peer_fences[later.slot].ack_queued = true;
+	UT_ASSERT(cluster_ko_peer_fence_fresh_grant_v3(&request));
+	UT_ASSERT_EQ(storage.peer_fences[old.slot].state, CLUSTER_KO_PEER_FENCE_EMPTY);
+	UT_ASSERT_EQ(storage.peer_fences[later.slot].state, CLUSTER_KO_PEER_FENCE_READY);
+}
+
+UT_TEST(test_peer_fence_fresh_grant_keeps_full_cut_and_finite_work)
+{
+	for (int fault = 0; fault < 11; fault++) {
+		ClusterKoSharedMessageV3 fence = peer_fence_fixture(1304);
+		ClusterKoPeerFenceHandleV3 handle;
+		ClusterKoPeerFenceStateV3 state;
+		ClusterLockAcquireRequest request;
+		ClusterKoPeerFenceV3 *entry;
+
+		UT_ASSERT(cluster_ko_peer_fence_begin_v3(&fence, &handle, &state));
+		UT_ASSERT(fixture_completed_fence_ready(&fence, &handle));
+		entry = &storage.peer_fences[handle.slot];
+		entry->ack_queued = true;
+		request = fresh_grant_fixture(&fence);
+		switch (fault) {
+		case 0: entry->state = CLUSTER_KO_PEER_FENCE_ACTIVE; break;
+		case 1: entry->ack_queued = false; break;
+		case 2: entry->physical_applied = false; break;
+		case 3: entry->holder_probe.nonce = 77; break;
+		case 4:
+			storage.cleaner_work[0].used = true;
+			storage.cleaner_work[0].locator = fence.base.key.locator;
+			break;
+		case 5:
+			storage.extend_work[0].used = true;
+			storage.extend_work[0].locator = fence.base.key.locator;
+			break;
+		case 6:
+			UT_ASSERT(ko_shared_enqueue_v3(&fence, v3_route_generation));
+			break;
+		case 7: v3_route_generation++; break;
+		case 8: formation.membership.last_admitted_incarnation[1]++; break;
+		case 9: request.hw_grant.master_generation++; break;
+		case 10: cluster_interconnect_tier = CLUSTER_IC_TIER_2; break;
+		}
+		UT_ASSERT(!cluster_ko_peer_fence_fresh_grant_v3(&request));
+		UT_ASSERT_NE(entry->state, CLUSTER_KO_PEER_FENCE_EMPTY);
+	}
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+}
+
+static int fresh_grant_drift;
+static void
+fresh_grant_mutate_during_proof(void)
+{
+	ClusterKoPeerFenceV3 *entry = &storage.peer_fences[0];
+
+	switch (fresh_grant_drift) {
+	case 0: entry->serial++; break;
+	case 1: entry->encoded[40]++; break;
+	case 2: entry->state = CLUSTER_KO_PEER_FENCE_ACTIVE; break;
+	case 3: entry->ack_queued = false; break;
+	case 4: entry->holder_probe.nonce++; break;
+	case 5:
+		storage.extend_work[0].used = true;
+		storage.extend_work[0].locator = entry->request.base.key.locator;
+		break;
+	}
+}
+
+UT_TEST(test_peer_fence_fresh_grant_rechecks_after_unlocked_proof)
+{
+	for (fresh_grant_drift = 0; fresh_grant_drift < 6; fresh_grant_drift++) {
+		ClusterKoSharedMessageV3 fence = peer_fence_fixture(1305);
+		ClusterKoPeerFenceHandleV3 handle;
+		ClusterKoPeerFenceStateV3 state;
+		ClusterLockAcquireRequest request;
+
+		UT_ASSERT(cluster_ko_peer_fence_begin_v3(&fence, &handle, &state));
+		UT_ASSERT_EQ(handle.slot, 0);
+		UT_ASSERT(fixture_completed_fence_ready(&fence, &handle));
+		storage.peer_fences[handle.slot].ack_queued = true;
+		request = fresh_grant_fixture(&fence);
+		fresh_grant_check_hook = fresh_grant_mutate_during_proof;
+		UT_ASSERT(!cluster_ko_peer_fence_fresh_grant_v3(&request));
+		UT_ASSERT_NE(storage.peer_fences[handle.slot].state, CLUSTER_KO_PEER_FENCE_EMPTY);
+	}
+	fresh_grant_check_hook = NULL;
 }
 
 UT_TEST(test_peer_committed_request_cannot_reenter_ingress_or_physical_owner)
@@ -8546,7 +8737,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(208);
+	UT_PLAN(212);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_create_reference_outlives_exact_space_children_and_blocks_ready);
 	UT_RUN(test_create_capacity_reserves_progress_for_every_accepted_constructor);
@@ -8721,7 +8912,11 @@ main(void)
 	UT_RUN(test_holder_gc_commit_consumes_exact_completed_query);
 	UT_RUN(test_holder_gc_full_pending_has_no_self_wakeup);
 	UT_RUN(test_holder_gc_completed_nonabsent_is_throttled_without_self_wakeup);
-	UT_RUN(test_peer_fence_fresh_grant_retires_only_different_holder);
+	UT_RUN(test_peer_fence_fresh_grant_needs_original_request_sample);
+	UT_RUN(test_peer_fence_fresh_grant_accepts_local_and_remote_master_once);
+	UT_RUN(test_peer_fence_fresh_grant_cannot_clear_a_later_fence);
+	UT_RUN(test_peer_fence_fresh_grant_keeps_full_cut_and_finite_work);
+	UT_RUN(test_peer_fence_fresh_grant_rechecks_after_unlocked_proof);
 	UT_RUN(test_peer_committed_request_cannot_reenter_ingress_or_physical_owner);
 	UT_RUN(test_peer_terminal_binds_operation_across_authenticated_publication_retarget);
 	UT_RUN(test_peer_fence_shmem_creation_initializes_but_attachment_retains);
