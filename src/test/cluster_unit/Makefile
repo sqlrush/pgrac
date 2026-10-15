@@ -484,6 +484,7 @@ TESTS += test_cluster_recovery_undo_store
 TESTS += test_cluster_recovery_relation_scan
 TESTS += test_cluster_recovery_native_scan
 TESTS += test_cluster_recovery_native_roots
+TESTS += test_cluster_recovery_native_inputs
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_namespace,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_heap_scan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_undo_scan,$(SIMPLE_TESTS))
@@ -494,6 +495,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_recovery_undo_store,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_relation_scan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_native_scan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_native_roots,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_recovery_native_inputs,$(SIMPLE_TESTS))
 CLUSTER_BLOCK_APPLY_O = $(top_builddir)/src/backend/cluster/cluster_block_apply.o \
 		test_cluster_block_apply_btree_product.o
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
@@ -3109,7 +3111,10 @@ test_cluster_catalog_origin_io.o: $(top_srcdir)/src/backend/cluster/cluster_init
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin_private.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc test_cluster_control_root_serving.inc \
+test_cluster_control_root test_cluster_recovery_native_inputs: %: %.c test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc test_cluster_control_root_serving.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_native_inventory.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_native_inventory.h \
+		$(top_builddir)/src/backend/cluster/cluster_recovery_native_scan.o \
 		test_cluster_control_cold_census.inc \
 		test_cluster_control_root_initialized.inc test_cluster_control_root_first_start.inc test_cluster_control_catalog.inc \
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
@@ -3130,6 +3135,7 @@ test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixt
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o \
 		$(top_srcdir)/src/include/cluster/cluster_wal_tail.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
+		$(top_builddir)/src/backend/cluster/cluster_recovery_native_scan.o \
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
 		test_cluster_wal_inputs_product.o \

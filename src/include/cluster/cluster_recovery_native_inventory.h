@@ -1,0 +1,62 @@
+/*-------------------------------------------------------------------------
+ * cluster_recovery_native_inventory.h
+ *    Native recovery effects observed through the original cold inputs.
+ *
+ * Copyright (c) 2026, pgrac contributors
+ * Author: SqlRush <sqlrush@gmail.com>
+ *-------------------------------------------------------------------------
+ */
+#ifndef CLUSTER_RECOVERY_NATIVE_INVENTORY_H
+#define CLUSTER_RECOVERY_NATIVE_INVENTORY_H
+
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_recovery_native_scan.h"
+#include "cluster/cluster_wal_inputs.h"
+
+typedef enum ClusterRecoveryNativeInventoryResult {
+	CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED = 0,
+	CLUSTER_RECOVERY_NATIVE_INVENTORY_EFFECT,
+	CLUSTER_RECOVERY_NATIVE_INVENTORY_END,
+	CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID,
+	CLUSTER_RECOVERY_NATIVE_INVENTORY_INPUT,
+	CLUSTER_RECOVERY_NATIVE_INVENTORY_UNSUPPORTED,
+	CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
+	CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY
+} ClusterRecoveryNativeInventoryResult;
+
+typedef struct ClusterRecoveryNativeInventoryDiag {
+	ClusterControlRootResult input_result;
+	RfPageProofDetailV1 input_detail;
+	ClusterRecoveryNativeResult native_result;
+	uint32 sources;
+	uint64 records;
+	uint64 native_records;
+	uint64 other_records; /* not owned or proven by this native inventory */
+	size_t owned_bytes;
+} ClusterRecoveryNativeInventoryDiag;
+
+typedef struct ClusterRecoveryNativeInventory ClusterRecoveryNativeInventory;
+
+/* Borrow the original startup cold scope for two complete physical passes.
+ * Every source (including explicit empty terminals), exact cut, native
+ * record position and full native bytes must agree. The original census
+ * validates ROOT/claim/WALR and the physical stream at the end of each pass.
+ * Failure/ERROR exposes no partial inventory. Destroy on every caller exit.
+ *
+ * These are owned observations, not a replay plan or terminal/OPEN/GC
+ * authority. Other record families remain separate obligations. The caller
+ * retains isolation/retention and revalidates the full graph before use.
+ * This calls the original synchronous physical visitors; memory_budget is
+ * an owned-allocation bound, not a one-page or elapsed-time bound. */
+extern ClusterRecoveryNativeInventoryResult
+cluster_recovery_native_inventory_build(ClusterWalInputsV1 *inputs, size_t memory_budget,
+										ClusterRecoveryNativeInventory **out,
+										ClusterRecoveryNativeInventoryDiag *diag);
+/* At most one native effect per call after both passes. END drains this
+ * native subset only; it never discharges other_records or physical roots. */
+extern ClusterRecoveryNativeInventoryResult
+cluster_recovery_native_inventory_next(ClusterRecoveryNativeInventory *inventory,
+									   ClusterRecoveryNativeEffect *out);
+extern void cluster_recovery_native_inventory_destroy(ClusterRecoveryNativeInventory *inventory);
+#endif
+#endif

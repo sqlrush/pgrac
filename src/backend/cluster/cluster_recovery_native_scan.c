@@ -364,4 +364,10 @@ cluster_recovery_native_scan_destroy(ClusterRecoveryNativeScan *scan)
 {
 	free(scan);
 }
+
+size_t
+cluster_recovery_native_scan_bytes(const ClusterRecoveryNativeScan *scan)
+{
+	return scan == NULL ? 0 : MAXALIGN(sizeof(*scan)) + scan->record.payload_length;
+}
 #endif
