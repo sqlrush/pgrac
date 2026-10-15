@@ -115,6 +115,9 @@ native_regions(ClusterRecoveryNativeScan *scan, int nsubxacts, const Transaction
 			   int nrels, const RelFileLocator *relations, int nstats,
 			   const xl_xact_stats_item *stats, int nmsgs, const SharedInvalidationMessage *msgs)
 {
+	scan->record.nsubxacts = nsubxacts;
+	if (nsubxacts != 0)
+		scan->record.subxacts_offset = (const char *)subxacts - scan->payload;
 	scan->regions[0] = (NativeRegion){ CLUSTER_RECOVERY_NATIVE_SUBXACT, (const char *)subxacts,
 									   nsubxacts, sizeof(*subxacts) };
 	scan->regions[1] = (NativeRegion){ CLUSTER_RECOVERY_NATIVE_RELATION_DROP,
@@ -358,6 +361,9 @@ native_parse(ClusterRecoveryNativeScan *scan, XLogReaderState *reader)
 			return CLUSTER_RECOVERY_NATIVE_SHAPE;
 		scan->primary = CLUSTER_RECOVERY_NATIVE_ASSIGNMENT;
 		record->top_xid = assignment.xtop;
+		record->nsubxacts = assignment.nsubxacts;
+		if (assignment.nsubxacts != 0)
+			record->subxacts_offset = MinSizeOfXactAssignment;
 		scan->regions[0] = (NativeRegion){ CLUSTER_RECOVERY_NATIVE_SUBXACT,
 										   scan->payload + MinSizeOfXactAssignment,
 										   assignment.nsubxacts, sizeof(TransactionId) };

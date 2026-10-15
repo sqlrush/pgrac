@@ -344,6 +344,17 @@ inventory_fixture(bool unsupported, bool open_source)
 			extra = inventory_write_mx_sequence(&source, extra, node);
 		if (inventory_extra >= 10 && inventory_extra <= 12)
 			extra = inventory_write_slru_sequence(&source, extra, node);
+		if (inventory_extra == 13) {
+			/* A separate assigned transaction, not a terminal/parent proof. */
+			char bytes[MinSizeOfXactAssignment + 2 * sizeof(TransactionId)] = { 0 };
+			TransactionId top = 4196000, children[] = { 4196001, 4196352 };
+			int count = 2;
+			memcpy(bytes, &top, sizeof(top));
+			memcpy(bytes + sizeof(top), &count, sizeof(count));
+			memcpy(bytes + MinSizeOfXactAssignment, children, sizeof(children));
+			extra = inventory_write_record(&source, extra.exclusive_end, extra.record_start,
+										   RM_XACT_ID, XLOG_XACT_ASSIGNMENT, bytes, sizeof(bytes));
+		}
 		create = inventory_write_record(&source, extra.exclusive_end, extra.record_start,
 										RM_SMGR_ID, XLOG_SMGR_CREATE, &payload, sizeof(payload));
 		if (i == 0) {
@@ -631,6 +642,7 @@ cleanup:
 #include "test_cluster_recovery_wal_tt_roots.inc"
 #include "test_cluster_recovery_multixact_inputs.inc"
 #include "test_cluster_recovery_slru_inputs.inc"
+#include "test_cluster_recovery_xact_slru_inputs.inc"
 #include "test_cluster_recovery_multixact_join_inputs.inc"
 #include "test_cluster_recovery_census_inputs.inc"
 
@@ -641,7 +653,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(42);
+	UT_PLAN(45);
 	UT_RUN(test_native_inventory_uses_two_real_cold_passes);
 	UT_RUN(test_native_inventory_never_returns_partial_on_drift_io_or_error);
 	UT_RUN(test_native_inventory_capacity_is_not_partial_success);
@@ -683,6 +695,9 @@ main(int argc, char **argv)
 	UT_RUN(test_cold_slru_records_keep_all_shapes_and_origin_targets);
 	UT_RUN(test_cold_slru_second_and_final_reads_revoke_the_union);
 	UT_RUN(test_cold_slru_bad_records_never_become_other);
+	UT_RUN(test_cold_terminal_assignment_target_union_without_zero);
+	UT_RUN(test_cold_child_record_drift_revokes_all_targets);
+	UT_RUN(test_owned_census_missing_or_short_terminal_clog_refuses);
 	UT_RUN(test_cold_commit_ts_keeps_original_profile_refusal);
 	UT_DONE();
 	return ut_failed_count != 0;

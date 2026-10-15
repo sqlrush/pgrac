@@ -2,9 +2,38 @@
  * Author: SqlRush <sqlrush@gmail.com>
  * Copyright (c) 2026, pgrac contributors. */
 
+/* Two required CLOG pages add 65536 one-slot observation steps; the optional
+ * three-family fixture adds 35635 more. This bounds fixture calls, not time. */
 static unsigned owned_target_mode;
+static unsigned owned_clog_fault;
 static bool owned_native_slru;
 static void owned_slru_files(int fd, bool create);
+
+/* Both retained terminal records name xid4195136, CLOG page128/segment4.
+ * Supply real files for the physical census, not a missing-target bypass. */
+static void
+owned_clog_files(int fd, bool create)
+{
+	char path[MAXPGPATH];
+	PGAlignedBlock page = { 0 };
+	for (unsigned i = 0; i < 2; ++i) {
+		unsigned node = i ? 127 : 0;
+		snprintf(path, sizeof(path), "native_side/origin_%u/pg_xact", node);
+		if (create)
+			UT_ASSERT_EQ(mkdirat(fd, path, 0700), 0);
+		snprintf(path, sizeof(path), "native_side/origin_%u/pg_xact/0004", node);
+		if (create) {
+			int file = openat(fd, path, O_CREAT | O_WRONLY, 0600);
+			UT_ASSERT(file >= 0);
+			UT_ASSERT_EQ(write(file, page.data, BLCKSZ), BLCKSZ);
+			UT_ASSERT_EQ(close(file), 0);
+		} else {
+			UT_ASSERT_EQ(unlinkat(fd, path, 0), 0);
+			snprintf(path, sizeof(path), "native_side/origin_%u/pg_xact", node);
+			UT_ASSERT_EQ(unlinkat(fd, path, AT_REMOVEDIR), 0);
+		}
+	}
+}
 
 static void
 owned_census_relation(int fd, const ClusterWalSourceRef *source, unsigned rel, bool empty)
@@ -56,6 +85,18 @@ owned_census_fixture(ClusterWalInputsV1 **inputs, int *fd, char path[MAXPGPATH],
 	wal_root_segment(*fd, 0);
 	wal_root_segment(*fd, 127);
 	inventory_mx_files(*fd, true, true);
+	owned_clog_files(*fd, true);
+	if (owned_clog_fault != 0) {
+		const char *path = "native_side/origin_0/pg_xact/0004";
+		if (owned_clog_fault == 1)
+			UT_ASSERT_EQ(unlinkat(*fd, path, 0), 0);
+		else {
+			int file = openat(*fd, path, O_WRONLY);
+			UT_ASSERT(file >= 0);
+			UT_ASSERT_EQ(ftruncate(file, owned_clog_fault == 2 ? 0 : BLCKSZ - 1), 0);
+			UT_ASSERT_EQ(close(file), 0);
+		}
+	}
 	file = openat(*fd, "unowned", O_CREAT | O_WRONLY, 0600);
 	UT_ASSERT(file >= 0);
 	UT_ASSERT_EQ(write(file, "unexplained", 11), 11);
@@ -91,6 +132,7 @@ owned_census_done(ClusterRecoveryCensus *census, ClusterWalInputsV1 **inputs, in
 				  const char *path)
 {
 	cluster_recovery_census_destroy(census);
+	owned_clog_files(fd, false);
 	inventory_mx_files(fd, false, false);
 	UT_ASSERT_EQ(unlinkat(fd, "pg_undo/instance_0/seg_1.dat", 0), 0);
 	UT_ASSERT_EQ(unlinkat(fd, "pg_undo/instance_127/seg_32513.dat", 0), 0);
@@ -113,7 +155,7 @@ owned_census_until(ClusterRecoveryCensus *census, ClusterRecoveryCensusPhase pha
 {
 	ClusterRecoveryCensusDiag diag = { 0 };
 	ClusterRecoveryCensusEntry entry;
-	for (unsigned steps = 0; steps < 100000; steps++) {
+	for (unsigned steps = 0; steps < 200000; steps++) {
 		ClusterRecoveryCensusResult result;
 		UT_ASSERT(cluster_recovery_census_diag(census, &diag));
 		if (diag.phase == phase && phase != 0)
@@ -138,6 +180,29 @@ owned_census_sticky(ClusterRecoveryCensus *census, ClusterRecoveryCensusResult r
 	UT_ASSERT_EQ(memcmp(&entry, &zero, sizeof(entry)), 0);
 }
 
+UT_TEST(test_owned_census_missing_or_short_terminal_clog_refuses)
+{
+	for (unsigned fault = 1; fault <= 3; ++fault) {
+		ClusterWalInputsV1 *inputs;
+		char path[MAXPGPATH];
+		int fd;
+		ClusterRecoveryCensus *census;
+		owned_clog_fault = fault;
+		census = owned_census_fixture(&inputs, &fd, path, false);
+		owned_clog_fault = 0;
+		UT_ASSERT_EQ(owned_census_until(census, 0), CLUSTER_RECOVERY_CENSUS_REFUSED);
+		owned_census_sticky(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+		if (fault == 1) {
+			/* Restore an empty path only for fixture teardown, after refusal. */
+			int file = openat(fd, "native_side/origin_0/pg_xact/0004", O_CREAT | O_WRONLY, 0600);
+			UT_ASSERT(file >= 0);
+			UT_ASSERT_EQ(close(file), 0);
+			owned_census_sticky(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+		}
+		owned_census_done(census, &inputs, fd, path);
+	}
+}
+
 UT_TEST(test_owned_census_real_inputs_all_observation_families)
 {
 	ClusterWalInputsV1 *inputs;
@@ -148,7 +213,7 @@ UT_TEST(test_owned_census_real_inputs_all_observation_families)
 	ClusterRecoveryCensusDiag diag = { 0 };
 	ClusterRecoveryCensusResult result = CLUSTER_RECOVERY_CENSUS_MORE;
 	unsigned unknown = 0, raw_pages = 0, mismatches = 0, kinds[9] = { 0 };
-	for (unsigned steps = 0; steps < 100000; steps++) {
+	for (unsigned steps = 0; steps < 200000; steps++) {
 		result = cluster_recovery_census_next(census, &entry);
 		if (result >= CLUSTER_RECOVERY_CENSUS_DRAINED)
 			break;
@@ -472,11 +537,11 @@ UT_TEST(test_owned_census_enumerates_raw_native_slru_slots)
 	ClusterRecoveryCensusEntry entry;
 	ClusterRecoveryCensusDiag diag;
 	ClusterRecoveryCensusResult result = CLUSTER_RECOVERY_CENSUS_MORE;
-	unsigned clogs = 0, parents = 0, times = 0, files = 0, padding = 0;
+	unsigned clogs = 0, origin_clogs = 0, parents = 0, times = 0, files = 0, padding = 0;
 	owned_native_slru = true;
 	census = owned_census_fixture(&inputs, &fd, path, false);
 	owned_native_slru = false;
-	for (unsigned i = 0; i < 100000; ++i) {
+	for (unsigned i = 0; i < 200000; ++i) {
 		const ClusterRecoverySlruEntry *s;
 		result = cluster_recovery_census_next(census, &entry);
 		if (result >= CLUSTER_RECOVERY_CENSUS_DRAINED)
@@ -490,9 +555,14 @@ UT_TEST(test_owned_census_enumerates_raw_native_slru_slots)
 		else if (s->kind == CLUSTER_RECOVERY_SLRU_PADDING)
 			padding++;
 		else if (s->kind == CLUSTER_RECOVERY_SLRU_CLOG) {
-			clogs++;
-			UT_ASSERT_EQ(s->origin_node, UINT32_MAX);
-			UT_ASSERT_EQ(s->raw_status, (0xb1 >> (2 * (s->slot % 4))) & 3);
+			if (s->origin_node == UINT32_MAX) {
+				clogs++;
+				UT_ASSERT_EQ(s->raw_status, (0xb1 >> (2 * (s->slot % 4))) & 3);
+			} else {
+				origin_clogs++;
+				UT_ASSERT(s->origin_node == 0 || s->origin_node == 127);
+				UT_ASSERT_EQ(s->raw_status, 0);
+			}
 		} else if (s->kind == CLUSTER_RECOVERY_SLRU_SUBTRANS) {
 			parents++;
 			UT_ASSERT_EQ(s->origin_node, 0);
@@ -506,12 +576,13 @@ UT_TEST(test_owned_census_enumerates_raw_native_slru_slots)
 	}
 	UT_ASSERT_EQ(result, CLUSTER_RECOVERY_CENSUS_DRAINED);
 	UT_ASSERT_EQ(clogs, BLCKSZ * 4);
+	UT_ASSERT_EQ(origin_clogs, 2 * BLCKSZ * 4);
 	UT_ASSERT_EQ(parents, BLCKSZ / 4);
 	UT_ASSERT_EQ(times, BLCKSZ / 10);
-	UT_ASSERT_EQ(files, 3);
+	UT_ASSERT_EQ(files, 5);
 	UT_ASSERT_EQ(padding, 1);
 	UT_ASSERT(cluster_recovery_census_diag(census, &diag));
-	UT_ASSERT_EQ(diag.slru_entries, clogs + parents + times + files + padding);
+	UT_ASSERT_EQ(diag.slru_entries, clogs + origin_clogs + parents + times + files + padding);
 	UT_ASSERT_EQ(inventory_census_calls, 3);
 	owned_census_sticky(census, CLUSTER_RECOVERY_CENSUS_DRAINED);
 	owned_slru_files(fd, false);

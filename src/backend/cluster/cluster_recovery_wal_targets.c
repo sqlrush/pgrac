@@ -168,7 +168,10 @@ targets_native(ClusterRecoveryRootSet *roots, XLogReaderState *reader,
 			if (diag->roots_result != CLUSTER_RECOVERY_ROOTS_MORE)
 				break;
 			diag->structural_effects++;
-		} else if (effect.kind == CLUSTER_RECOVERY_NATIVE_MULTIXACT_CREATE
+		} else if (effect.kind == CLUSTER_RECOVERY_NATIVE_TERMINAL
+				   || effect.kind == CLUSTER_RECOVERY_NATIVE_ASSIGNMENT
+				   || effect.kind == CLUSTER_RECOVERY_NATIVE_SUBXACT
+				   || effect.kind == CLUSTER_RECOVERY_NATIVE_MULTIXACT_CREATE
 				   || effect.kind == CLUSTER_RECOVERY_NATIVE_MULTIXACT_ZERO_OFFSETS
 				   || effect.kind == CLUSTER_RECOVERY_NATIVE_MULTIXACT_ZERO_MEMBERS
 				   || effect.kind == CLUSTER_RECOVERY_NATIVE_CLOG_ZERO
@@ -176,7 +179,8 @@ targets_native(ClusterRecoveryRootSet *roots, XLogReaderState *reader,
 			diag->roots_result = cluster_recovery_root_set_add_native(roots, &effect);
 			if (diag->roots_result != CLUSTER_RECOVERY_ROOTS_MORE)
 				break;
-			/* Physical candidates do not discharge members/horizons/truncate. */
+			/* Physical candidates do not discharge terminal/parent/member or
+			 * horizon/truncate obligations. */
 			diag->other_native_effects++;
 		} else if (effect.kind == CLUSTER_RECOVERY_NATIVE_TT_COMMIT) {
 			diag->roots_result = cluster_recovery_root_set_add_native(roots, &effect);

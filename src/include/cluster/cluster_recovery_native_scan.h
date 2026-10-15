@@ -73,6 +73,8 @@ typedef struct ClusterRecoveryNativeRecord {
 	uint32 payload_length;
 	uint32 xinfo;
 	TransactionId top_xid;
+	uint32 subxacts_offset; /* bounded original array within owned payload */
+	uint32 nsubxacts;		/* membership, not the immediate parent chain */
 	Oid database;
 	Oid tablespace;
 	TimestampTz xact_time;

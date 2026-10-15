@@ -57,11 +57,12 @@ UT_TEST(test_cold_slru_records_keep_all_shapes_and_origin_targets)
 			UT_ASSERT(entry->file.native_origin_node == 0 || entry->file.native_origin_node == 127);
 			origins[entry->file.native_origin_node == 127]++;
 			UT_ASSERT_EQ(entry->origins, CLUSTER_RECOVERY_ROOT_FROM_WAL);
-			UT_ASSERT_EQ(entry->file.native_segment, 1);
-			UT_ASSERT_EQ(entry->required_blocks, 2);
+			UT_ASSERT_EQ(entry->file.native_family, CLUSTER_RECOVERY_NATIVE_FAMILY_XACT);
+			UT_ASSERT(entry->file.native_segment == 1 || entry->file.native_segment == 4);
+			UT_ASSERT_EQ(entry->required_blocks, entry->file.native_segment == 1 ? 2 : 1);
 		}
-		UT_ASSERT_EQ(origins[0], 1);
-		UT_ASSERT_EQ(origins[1], 1);
+		UT_ASSERT_EQ(origins[0], 2); /* ZERO segment1 and terminal segment4 */
+		UT_ASSERT_EQ(origins[1], 2);
 	}
 	while ((result = cluster_recovery_native_inventory_next(inventory, &effect))
 		   == CLUSTER_RECOVERY_NATIVE_INVENTORY_EFFECT) {

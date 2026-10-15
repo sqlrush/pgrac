@@ -58,9 +58,15 @@ UT_TEST(test_cold_multixact_records_keep_all_shapes_and_origin_sources)
 			origin_files[entry->file.native_origin_node == 127]++;
 			UT_ASSERT_EQ(entry->origins, CLUSTER_RECOVERY_ROOT_FROM_WAL);
 			UT_ASSERT_EQ(entry->required_blocks, 1);
+			if (entry->file.native_family == CLUSTER_RECOVERY_NATIVE_FAMILY_XACT)
+				UT_ASSERT_EQ(entry->file.native_segment, 4);
+			else
+				UT_ASSERT(entry->file.native_family == CLUSTER_RECOVERY_NATIVE_FAMILY_MX_OFFSETS
+						  || entry->file.native_family
+								 == CLUSTER_RECOVERY_NATIVE_FAMILY_MX_MEMBERS);
 		}
-		UT_ASSERT_EQ(origin_files[0], 2);
-		UT_ASSERT_EQ(origin_files[1], 2);
+		UT_ASSERT_EQ(origin_files[0], 3); /* two MX files plus the terminal CLOG target */
+		UT_ASSERT_EQ(origin_files[1], 3);
 	}
 
 	while ((result = cluster_recovery_native_inventory_next(inventory, &effect))

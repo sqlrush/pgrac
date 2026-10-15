@@ -444,15 +444,47 @@ roots_add_multixact(ClusterRecoveryRootSet *roots, const ClusterRecoveryNativeEf
 }
 
 static ClusterRecoveryRootsResult
+roots_add_slru_page(ClusterRecoveryRootSet *roots, uint32 node, uint8 family, uint32 page)
+{
+	uint32 index, segment = page / SLRU_PAGES_PER_SEGMENT;
+	ClusterRecoveryRootEntry *entry;
+	const char *name;
+	char path[MAXPGPATH];
+
+	switch (family) {
+	case CLUSTER_RECOVERY_NATIVE_FAMILY_XACT:
+		name = "pg_xact";
+		break;
+	case CLUSTER_RECOVERY_NATIVE_FAMILY_SUBTRANS:
+		name = "pg_subtrans";
+		break;
+	case CLUSTER_RECOVERY_NATIVE_FAMILY_COMMIT_TS:
+		name = "pg_commit_ts";
+		break;
+	default:
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	}
+	snprintf(path, sizeof(path), "native_side/origin_%u/%s/%04X", node, name, segment);
+	if (!roots_lookup(roots, path, true, &index))
+		return roots->status;
+	entry = &roots->entries[index];
+	entry->file.kind = CLUSTER_RECOVERY_FILE_ORIGIN_SLRU;
+	entry->file.native_family = family;
+	entry->file.native_origin_node = node;
+	entry->file.native_segment = segment;
+	entry->origins |= CLUSTER_RECOVERY_ROOT_FROM_WAL;
+	entry->required_blocks
+		= Max(entry->required_blocks, (uint64)(page % SLRU_PAGES_PER_SEGMENT) + 1);
+	return CLUSTER_RECOVERY_ROOTS_MORE;
+}
+
+static ClusterRecoveryRootsResult
 roots_add_slru_zero(ClusterRecoveryRootSet *roots, const ClusterRecoveryNativeEffect *effect)
 {
 	const ClusterRecoveryNativeRecord *record = effect->record;
 	bool cts = effect->kind == CLUSTER_RECOVERY_NATIVE_COMMIT_TS_ZERO;
 	uint32 node = record->source.claim.identity.origin_node_id;
 	uint32 per_page = cts ? CLUSTER_NATIVE_COMMIT_TS_PER_PAGE : CLUSTER_NATIVE_CLOG_PER_PAGE;
-	uint32 index, segment;
-	ClusterRecoveryRootEntry *entry;
-	char path[MAXPGPATH];
 	int page;
 
 	if (!cluster_wal_claim_v2_ref_valid(&record->source.claim)
@@ -464,21 +496,61 @@ roots_add_slru_zero(ClusterRecoveryRootSet *roots, const ClusterRecoveryNativeEf
 	memcpy(&page, effect->bytes, sizeof(page));
 	if (page < 0 || (uint64)page > UINT32_MAX / per_page)
 		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
-	segment = (uint32)page / SLRU_PAGES_PER_SEGMENT;
-	snprintf(path, sizeof(path), "native_side/origin_%u/%s/%04X", node,
-			 cts ? "pg_commit_ts" : "pg_xact", segment);
-	if (!roots_lookup(roots, path, true, &index))
-		return roots->status;
-	entry = &roots->entries[index];
-	entry->file.kind = CLUSTER_RECOVERY_FILE_ORIGIN_SLRU;
-	entry->file.native_family
-		= cts ? CLUSTER_RECOVERY_NATIVE_FAMILY_COMMIT_TS : CLUSTER_RECOVERY_NATIVE_FAMILY_XACT;
-	entry->file.native_origin_node = node;
-	entry->file.native_segment = segment;
-	entry->origins |= CLUSTER_RECOVERY_ROOT_FROM_WAL;
-	entry->required_blocks
-		= Max(entry->required_blocks, (uint64)(page % SLRU_PAGES_PER_SEGMENT) + 1);
-	return CLUSTER_RECOVERY_ROOTS_MORE;
+	return roots_add_slru_page(roots, node,
+							   cts ? CLUSTER_RECOVERY_NATIVE_FAMILY_COMMIT_TS
+								   : CLUSTER_RECOVERY_NATIVE_FAMILY_XACT,
+							   (uint32)page);
+}
+
+/* Native terminal redo writes top and child CLOG slots; assignment redo
+ * writes only child SUBTRANS slots. These are file obligations, not proof
+ * of an xid's era/status or its original immediate parent. In particular,
+ * COMMIT does not imply that the historical commit_ts profile was enabled. */
+static ClusterRecoveryRootsResult
+roots_add_xact_slru(ClusterRecoveryRootSet *roots, const ClusterRecoveryNativeEffect *effect)
+{
+	const ClusterRecoveryNativeRecord *record = effect->record;
+	uint8 opcode = record->header.xl_info & ~XLR_INFO_MASK;
+	bool assignment = opcode == XLOG_XACT_ASSIGNMENT;
+	TransactionId xid = record->top_xid;
+	uint32 per_page = assignment ? CLUSTER_NATIVE_SUBTRANS_PER_PAGE : CLUSTER_NATIVE_CLOG_PER_PAGE;
+
+	if (!cluster_wal_claim_v2_ref_valid(&record->source.claim)
+		|| record->header.xl_rmid != RM_XACT_ID || record->payload == NULL
+		|| !TransactionIdIsNormal(xid)
+		|| (!assignment && opcode != XLOG_XACT_COMMIT
+			&& opcode != (XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO) && opcode != XLOG_XACT_ABORT
+			&& opcode != (XLOG_XACT_ABORT | XLOG_XACT_HAS_INFO))
+		|| (!assignment && record->header.xl_xid != xid)
+		|| record->subxacts_offset > record->payload_length
+		|| record->nsubxacts
+			   > (record->payload_length - record->subxacts_offset) / sizeof(TransactionId))
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	if (effect->kind == CLUSTER_RECOVERY_NATIVE_SUBXACT) {
+		/* Check the complete range before pointer arithmetic, then require
+		 * the precise original item, never an equal caller-owned copy. */
+		if (effect->ordinal >= record->nsubxacts || effect->length != sizeof(xid)
+			|| effect->bytes
+				   != record->payload + record->subxacts_offset
+						  + (size_t)effect->ordinal * sizeof(xid))
+			return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+		memcpy(&xid, effect->bytes, sizeof(xid));
+		if (!TransactionIdIsNormal(xid))
+			return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	} else {
+		if (effect->kind
+				!= (assignment ? CLUSTER_RECOVERY_NATIVE_ASSIGNMENT
+							   : CLUSTER_RECOVERY_NATIVE_TERMINAL)
+			|| effect->bytes != record->payload || effect->length != record->payload_length
+			|| effect->ordinal != 0)
+			return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+		if (assignment)
+			return CLUSTER_RECOVERY_ROOTS_MORE;
+	}
+	return roots_add_slru_page(roots, record->source.claim.identity.origin_node_id,
+							   assignment ? CLUSTER_RECOVERY_NATIVE_FAMILY_SUBTRANS
+										  : CLUSTER_RECOVERY_NATIVE_FAMILY_XACT,
+							   xid / per_page);
 }
 
 ClusterRecoveryRootsResult
@@ -500,6 +572,10 @@ cluster_recovery_root_set_add_native(ClusterRecoveryRootSet *roots,
 		|| memcmp(record->source.claim.identity.storage_uuid, roots->storage_uuid, 16) != 0)
 		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
 	opcode = record->header.xl_info & ~XLR_INFO_MASK;
+	if (effect->kind == CLUSTER_RECOVERY_NATIVE_TERMINAL
+		|| effect->kind == CLUSTER_RECOVERY_NATIVE_ASSIGNMENT
+		|| effect->kind == CLUSTER_RECOVERY_NATIVE_SUBXACT)
+		return roots_add_xact_slru(roots, effect);
 	if (effect->kind == CLUSTER_RECOVERY_NATIVE_CLOG_ZERO
 		|| effect->kind == CLUSTER_RECOVERY_NATIVE_COMMIT_TS_ZERO)
 		return roots_add_slru_zero(roots, effect);

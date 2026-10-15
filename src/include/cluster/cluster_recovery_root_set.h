@@ -111,6 +111,9 @@ struct ClusterRecoveryNativeEffect;
  * sentinel and wrapped members), never local SLRU targets. TRUNCATE/member
  * proofs remain independent. Native CLOG/commit_ts ZERO similarly preserves
  * the original-origin segment and page extent, without creating local files.
+ * Native terminal records add top/child CLOG targets; assignments add only
+ * child SUBTRANS targets. Raw addresses prove neither era nor parent/status;
+ * no commit_ts target is inferred without a historical enabled-profile proof.
  * State/horizon proofs and all other effects need their own
  * consumers. Source/record and lifecycle proofs remain in the cold graph.
  * A missing file is retained, never treated as an already-completed drop. */
