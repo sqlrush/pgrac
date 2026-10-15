@@ -11803,6 +11803,7 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 	PGAlignedBlock expected, disk;
 	uint64 space_token;
 	ClusterPageDataReceiptV1 *receipt;
+	ClusterKoDirectoryIoV3 io;
 
 	if (target == NULL || out == NULL || *out != NULL || CurrentResourceOwner == NULL
 		|| !cluster_enabled || !cluster_shared_config || RecoveryInProgress()
@@ -11839,6 +11840,8 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 			|| !BufferTagsEqual(&write_cut.holder.assertion.resource, &data_tag))
 			return false;
 	}
+	if (!cluster_ko_directory_io_begin_v3(key.locator, &io))
+		return false;
 	PG_TRY();
 	{
 		do {
@@ -11958,6 +11961,7 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 			LWLockRelease(BufferDescriptorGetContentLock(space));
 			cluster_bufmgr_unpin_for_gcs(space);
 		}
+		(void)cluster_ko_directory_io_end_v3(&io);
 	}
 	PG_END_TRY();
 	if (!complete)
@@ -16227,12 +16231,23 @@ cluster_bufmgr_read_storage_scn_for_gcs(BufferTag tag, SCN *out_page_scn)
 {
 	PGAlignedBlock scratch;
 	SMgrRelation reln;
+	ClusterKoDirectoryIoV3 io;
 
 	if (out_page_scn != NULL)
 		*out_page_scn = InvalidScn;
 
-	reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
-	smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
+	if (!cluster_ko_directory_io_begin_v3(BufTagGetRelFileLocator(&tag), &io))
+		return false;
+	PG_TRY();
+	{
+		reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
+		smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
 	if (!PageIsVerifiedForFork((Page) scratch.data, BufTagGetForkNum(&tag), tag.blockNum,
 								PIV_LOG_WARNING | PIV_REPORT_STAT))
 		return false;
@@ -18822,12 +18837,26 @@ cluster_bufmgr_read_block_scn_for_gcs(BufferDesc *buf)
 bool
 cluster_bufmgr_block_is_extension_for_gcs(BufferTag tag)
 {
-	SMgrRelation reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
+	SMgrRelation reln;
 	ForkNumber	fork = BufTagGetForkNum(&tag);
+	ClusterKoDirectoryIoV3 io;
+	volatile bool extension = false;
 
-	/* Drop any cached size so a concurrent extension is not missed. */
-	smgrrelease(reln);
-	return tag.blockNum >= smgrnblocks(reln, fork);
+	if (!cluster_ko_directory_io_begin_v3(BufTagGetRelFileLocator(&tag), &io))
+		return false;
+	PG_TRY();
+	{
+		reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
+		/* Drop any cached size so a concurrent extension is not missed. */
+		smgrrelease(reln);
+		extension = tag.blockNum >= smgrnblocks(reln, fork);
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
+	return extension;
 }
 
 bool
@@ -18840,6 +18869,8 @@ cluster_bufmgr_refresh_block_from_storage_for_gcs(BufferDesc *buf, SCN *out_page
 	uint32		buf_state;
 	bool		dirty;
 	bool		write_permitted;
+	ClusterKoDirectoryIoV3 io;
+	volatile bool refreshed = false;
 
 	if (out_page_scn != NULL)
 		*out_page_scn = InvalidScn;
@@ -18852,32 +18883,41 @@ cluster_bufmgr_refresh_block_from_storage_for_gcs(BufferDesc *buf, SCN *out_page
 	 * this cannot read past EOF (a concurrent truncate would ereport here,
 	 * which is the correct fail-closed outcome for a dropped block).
 	 */
-	reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
-	smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
-	if (!PageIsVerifiedForFork((Page) scratch.data, BufTagGetForkNum(&tag), tag.blockNum,
-								PIV_LOG_WARNING | PIV_REPORT_STAT))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("invalid page in block %u of relation %u during GCS storage-fallback refresh",
-						tag.blockNum, tag.relNumber)));
-
-	content_lock = BufferDescriptorGetContentLock(buf);
-	LWLockAcquire(content_lock, LW_EXCLUSIVE);
-	write_permitted = cluster_bufmgr_pcm_x_content_write_permitted(buf);
-	buf_state = LockBufHdr(buf);
-	dirty = (buf_state & BM_DIRTY) != 0;
-	UnlockBufHdr(buf, buf_state);
-	if (dirty || !write_permitted)
-	{
-		LWLockRelease(content_lock);
+	if (!cluster_ko_directory_io_begin_v3(BufTagGetRelFileLocator(&tag), &io))
 		return false;
-	}
-	memcpy((char *) BufHdrGetBlock(buf), scratch.data, BLCKSZ);
-	LWLockRelease(content_lock);
+	PG_TRY();
+	{
+		reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
+		smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
+		if (!PageIsVerifiedForFork((Page) scratch.data, BufTagGetForkNum(&tag), tag.blockNum,
+									PIV_LOG_WARNING | PIV_REPORT_STAT))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid page in block %u of relation %u during GCS storage-fallback refresh",
+							tag.blockNum, tag.relNumber)));
 
-	if (out_page_scn != NULL)
+		content_lock = BufferDescriptorGetContentLock(buf);
+		LWLockAcquire(content_lock, LW_EXCLUSIVE);
+		write_permitted = cluster_bufmgr_pcm_x_content_write_permitted(buf);
+		buf_state = LockBufHdr(buf);
+		dirty = (buf_state & BM_DIRTY) != 0;
+		UnlockBufHdr(buf, buf_state);
+		if (!dirty && write_permitted)
+		{
+			memcpy((char *) BufHdrGetBlock(buf), scratch.data, BLCKSZ);
+			refreshed = true;
+		}
+		LWLockRelease(content_lock);
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
+
+	if (refreshed && out_page_scn != NULL)
 		*out_page_scn = ((PageHeader) scratch.data)->pd_block_scn;
-	return true;
+	return refreshed;
 }
 
 /* ========================================================================

@@ -4716,7 +4716,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_pcm_page_identity.inc test_cluster_pcm_page_identity.inc.tmp
 	rm -f test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc
 	rm -f test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc
-	rm -f test_cluster_ko_raw_io.inc
+	rm -f test_cluster_ko_raw_io.inc test_cluster_ko_raw_consumers.inc
 	rm -f test_cluster_space_extend.inc test_cluster_space_extend_finish.inc test_cluster_space_extend_resize.inc test_cluster_space_extend_zero.inc test_cluster_space_extend_handoff.inc
 	rm -f test_cluster_undo_producer_owner.inc test_cluster_undo_block_native.inc
 	rm -f test_cluster_undo_lifecycle_native.inc test_cluster_undo_header_identity.inc
@@ -9231,3 +9231,8 @@ test_cluster_ko_raw_io.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c
 	awk '/^cluster_bufmgr_read_storage_image_for_resource_x\(/ { print "bool"; emit=1; n++ } \
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< > $@
 test_cluster_ko_drop_io: test_cluster_ko_raw_io.inc
+
+test_cluster_ko_raw_consumers.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c
+	awk '/^cluster_bufmgr_(read_storage_scn|refresh_block_from_storage|block_is_extension)_for_gcs\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< > $@
+test_cluster_ko_drop_io: test_cluster_ko_raw_consumers.inc

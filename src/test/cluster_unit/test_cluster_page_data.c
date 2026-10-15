@@ -77,6 +77,7 @@ static bool locks[2], resident[2], busy[2], selected, sf_blocked, bad_checksum, 
 /* The actual KO exclusion/marker race is covered by test_cluster_ko_drop_io.
  * This boundary checks the CP caller's range and final cleanup ordering. */
 static bool directory_io_denied, directory_io_entered;
+static bool require_data_io_scope;
 static unsigned directory_io_begins, directory_io_ends;
 
 bool
@@ -733,6 +734,8 @@ GetXLogInsertRecPtr(void)
 void
 XLogFlush(XLogRecPtr lsn)
 {
+	if (require_data_io_scope)
+		UT_ASSERT(directory_io_entered);
 	UT_ASSERT_EQ(lsn, PageGetLSN(pages[data_slot].data));
 	wal_flushes++;
 	fault(1);
@@ -755,12 +758,16 @@ DataChecksumsEnabled(void)
 SMgrRelation
 smgropen(RelFileLocator r, BackendId b)
 {
+	if (require_data_io_scope)
+		UT_ASSERT(directory_io_entered);
 	UT_ASSERT(RelFileLocatorEquals(r, target.identity.locator));
 	return &relation;
 }
 void
 smgrwrite(SMgrRelation r, ForkNumber f, BlockNumber b, const void *data, bool skip)
 {
+	if (require_data_io_scope)
+		UT_ASSERT(directory_io_entered);
 	if (storage_write_hook != NULL) {
 		storage_write_hook(r, f, b, data, skip);
 		return;
@@ -775,6 +782,8 @@ smgrwrite(SMgrRelation r, ForkNumber f, BlockNumber b, const void *data, bool sk
 void
 smgrimmedsync(SMgrRelation r, ForkNumber f)
 {
+	if (require_data_io_scope)
+		UT_ASSERT(directory_io_entered);
 	UT_ASSERT(!locks[1] && (locks[0] || (storage_read && data_slot == 0)));
 	fault(3);
 	UT_ASSERT_EQ(fsync(fileno(file)), 0);
@@ -812,6 +821,8 @@ smgrimmedsync(SMgrRelation r, ForkNumber f)
 void
 smgrread(SMgrRelation r, ForkNumber f, BlockNumber b, void *out)
 {
+	if (require_data_io_scope)
+		UT_ASSERT(directory_io_entered);
 	UT_ASSERT(!locks[1] && (locks[0] || (storage_read && data_slot == 0))
 			  && (storage_read || syncs));
 	fault(storage_read && reads > 0 ? 5 : 4);
@@ -928,6 +939,7 @@ reset(void)
 
 	UT_ASSERT(!directory_io_entered);
 	directory_io_denied = false;
+	require_data_io_scope = false;
 	directory_io_begins = directory_io_ends = 0;
 
 #ifndef PGRAC_TEST_REAL_PI_WRITEBACK
@@ -1046,7 +1058,11 @@ success_and_old_completion(void)
 	ClusterPageDataTargetV1 out;
 	PGAlignedBlock disk;
 	reset();
+	require_data_io_scope = true;
 	UT_ASSERT(cluster_bufmgr_write_page_data_v1(&target, &receipt));
+	UT_ASSERT(!directory_io_entered);
+	UT_ASSERT_EQ(directory_io_begins, 1);
+	UT_ASSERT_EQ(directory_io_ends, 1);
 	if (receipt == NULL)
 		return;
 	UT_ASSERT(receipt != NULL);
@@ -1066,6 +1082,20 @@ success_and_old_completion(void)
 	UT_ASSERT(pg_atomic_read_u32(&descriptors[1].bufferdesc.state) & BM_DIRTY);
 	cluster_page_data_receipt_free_v1(&receipt);
 	UT_ASSERT(receipt == NULL);
+}
+
+static void
+data_refuses_closed_object_before_original_write_work(void)
+{
+	ClusterPageDataReceiptV1 *receipt = NULL;
+	reset();
+	directory_io_denied = true;
+	UT_ASSERT(!cluster_bufmgr_write_page_data_v1(&target, &receipt));
+	UT_ASSERT(receipt == NULL && !directory_io_entered);
+	UT_ASSERT_EQ(writes + syncs + reads + wal_flushes, 0);
+	UT_ASSERT(pg_atomic_read_u32(&descriptors[1].bufferdesc.state) & BM_DIRTY);
+	clean();
+	cluster_page_data_receipt_free_v1(&receipt);
 }
 static void
 identity_refusals(void)
@@ -1172,6 +1202,7 @@ io_failure_cleanup(void)
 		ClusterPageDataReceiptV1 *r = NULL;
 		volatile bool caught = false;
 		reset();
+		require_data_io_scope = true;
 		throw_at = at;
 		PG_TRY();
 		{
@@ -1185,6 +1216,9 @@ io_failure_cleanup(void)
 		UT_ASSERT(caught);
 		UT_ASSERT(r == NULL);
 		UT_ASSERT_EQ(aborts, at <= 2 ? 1 : 0);
+		UT_ASSERT(!directory_io_entered);
+		UT_ASSERT_EQ(directory_io_begins, 1);
+		UT_ASSERT_EQ(directory_io_ends, 1);
 		clean();
 	}
 }
@@ -5346,7 +5380,7 @@ int
 main(void)
 {
 #ifndef PGRAC_TEST_REAL_PI_WRITEBACK
-	UT_PLAN(79);
+	UT_PLAN(80);
 	UT_RUN(ordinary_flush_attempt_tracks_actual_data_submission);
 	UT_RUN(structural_remote_ack_import_binds_original_inputs_and_cut);
 	UT_RUN(structural_remote_ack_refuses_transport_input_and_collector_drift);
@@ -5382,7 +5416,7 @@ main(void)
 	UT_RUN(recovery_ack_cannot_outlive_original_input_membership_or_owner);
 	UT_RUN(recovery_ack_refuses_successor_pi_not_covered_by_actual_data);
 #else
-	UT_PLAN(45);
+	UT_PLAN(46);
 #endif
 	UT_RUN(space_data_writes_exact_typed_live_and_tombstoned_pages);
 	UT_RUN(space_binding_rejects_wrong_typed_identity_before_io);
@@ -5407,6 +5441,7 @@ main(void)
 	UT_RUN(same_claim_data_under_later_root_ceiling);
 	UT_RUN(same_claim_pi_under_later_root_ceiling);
 	UT_RUN(success_and_old_completion);
+	UT_RUN(data_refuses_closed_object_before_original_write_work);
 	UT_RUN(identity_refusals);
 	UT_RUN(authority_refusals);
 	UT_RUN(explicit_wal_origin);
