@@ -12,6 +12,8 @@
  */
 #include "postgres.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "access/clog.h"
+#include "access/commit_ts.h"
 #include "access/multixact.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_native_startup.h"
@@ -128,6 +130,54 @@ native_array_size(uint32 length, size_t base, int count, size_t item_size)
 {
 	return length >= base && count >= 0 && (size_t)count <= (length - base) / item_size
 		   && base + (size_t)count * item_size == length;
+}
+
+/* The original native producers log a page number for ZERO, and the page
+ * containing oldest xid for TRUNCATE. Retain the raw horizon/database too;
+ * neither the page geometry nor its presence proves an era or a completed
+ * truncation. This is observation only, including disabled commit_ts history. */
+static ClusterRecoveryNativeResult
+native_slru(ClusterRecoveryNativeScan *scan, uint8 opcode, bool commit_ts)
+{
+	uint32 length = scan->record.payload_length;
+	uint32 per_page = commit_ts ? CLUSTER_NATIVE_COMMIT_TS_PER_PAGE : CLUSTER_NATIVE_CLOG_PER_PAGE;
+	int page;
+	TransactionId oldest;
+	uint8 zero = commit_ts ? COMMIT_TS_ZEROPAGE : CLOG_ZEROPAGE;
+	uint8 truncate = commit_ts ? COMMIT_TS_TRUNCATE : CLOG_TRUNCATE;
+
+	if (opcode == zero) {
+		if (length != sizeof(page))
+			return CLUSTER_RECOVERY_NATIVE_SHAPE;
+		memcpy(&page, scan->payload, sizeof(page));
+		if (page < 0 || (uint64)page > UINT32_MAX / per_page)
+			return CLUSTER_RECOVERY_NATIVE_SHAPE;
+		scan->primary = commit_ts ? CLUSTER_RECOVERY_NATIVE_COMMIT_TS_ZERO
+								  : CLUSTER_RECOVERY_NATIVE_CLOG_ZERO;
+		return CLUSTER_RECOVERY_NATIVE_MORE;
+	}
+	if (opcode != truncate)
+		return CLUSTER_RECOVERY_NATIVE_UNSUPPORTED;
+	if (commit_ts) {
+		xl_commit_ts_truncate record;
+		if (length != SizeOfCommitTsTruncate)
+			return CLUSTER_RECOVERY_NATIVE_SHAPE;
+		memcpy(&record, scan->payload, SizeOfCommitTsTruncate);
+		page = record.pageno;
+		oldest = record.oldestXid;
+	} else {
+		xl_clog_truncate record;
+		if (length != sizeof(record))
+			return CLUSTER_RECOVERY_NATIVE_SHAPE;
+		memcpy(&record, scan->payload, sizeof(record));
+		page = record.pageno;
+		oldest = record.oldestXact;
+	}
+	if (page < 0 || !TransactionIdIsNormal(oldest) || (uint64)page != oldest / per_page)
+		return CLUSTER_RECOVERY_NATIVE_SHAPE;
+	scan->primary = commit_ts ? CLUSTER_RECOVERY_NATIVE_COMMIT_TS_TRUNCATE
+							  : CLUSTER_RECOVERY_NATIVE_CLOG_TRUNCATE;
+	return CLUSTER_RECOVERY_NATIVE_MORE;
 }
 
 static ClusterRecoveryNativeResult
@@ -261,6 +311,8 @@ native_parse(ClusterRecoveryNativeScan *scan, XLogReaderState *reader)
 	ClusterRecoveryNativeRecord *record = &scan->record;
 	uint8 opcode = record->header.xl_info & ~XLR_INFO_MASK;
 
+	if (record->header.xl_rmid == RM_CLOG_ID || record->header.xl_rmid == RM_COMMIT_TS_ID)
+		return native_slru(scan, opcode, record->header.xl_rmid == RM_COMMIT_TS_ID);
 	if (record->header.xl_rmid == RM_MULTIXACT_ID)
 		return native_multixact(scan, opcode);
 	if (record->header.xl_rmid == RM_CLUSTER_UNDO_ID) {

@@ -3140,7 +3140,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs: %: %.c test_clust
 		$(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_undo_store.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_undo_scan.o \
-		test_cluster_control_cold_census.inc test_cluster_recovery_native_transcript.inc test_cluster_recovery_wal_tt_roots.inc test_cluster_recovery_multixact_inputs.inc test_cluster_recovery_multixact_join_inputs.inc test_cluster_recovery_census_inputs.inc test_cluster_heap_small_scn.inc \
+		test_cluster_control_cold_census.inc test_cluster_recovery_native_transcript.inc test_cluster_recovery_wal_tt_roots.inc test_cluster_recovery_multixact_inputs.inc test_cluster_recovery_slru_inputs.inc test_cluster_recovery_multixact_join_inputs.inc test_cluster_recovery_census_inputs.inc test_cluster_heap_small_scn.inc \
 		test_cluster_control_root_initialized.inc test_cluster_control_root_first_start.inc test_cluster_control_catalog.inc \
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		test_cluster_control_native_xid.inc \
@@ -9099,7 +9099,7 @@ test_cluster_recovery_relation_scan: test_cluster_recovery_relation_scan.c test_
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(LDFLAGS) $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
-test_cluster_recovery_native_scan: test_cluster_recovery_native_scan.c test_cluster_recovery_undo_effects.inc test_cluster_recovery_multixact_effects.inc unit_test.h \
+test_cluster_recovery_native_scan: test_cluster_recovery_native_scan.c test_cluster_recovery_undo_effects.inc test_cluster_recovery_multixact_effects.inc test_cluster_recovery_slru_effects.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_native_scan.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_native_scan.h \
 		$(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
@@ -9130,6 +9130,7 @@ test_cluster_recovery_native_roots: test_cluster_recovery_native_roots.c \
 
 test_cluster_recovery_wal_targets: test_cluster_recovery_wal_targets.c \
 		test_cluster_recovery_undo_targets.inc test_cluster_recovery_multixact_targets.inc \
+		test_cluster_recovery_slru_targets.inc \
 		test_cluster_recovery_multixact_physical.inc test_cluster_recovery_multixact_join.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_multixact_join.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_multixact_join.h \

@@ -47,7 +47,11 @@ typedef enum ClusterRecoveryNativeKind {
 	CLUSTER_RECOVERY_NATIVE_MULTIXACT_MEMBER,
 	CLUSTER_RECOVERY_NATIVE_MULTIXACT_ZERO_OFFSETS,
 	CLUSTER_RECOVERY_NATIVE_MULTIXACT_ZERO_MEMBERS,
-	CLUSTER_RECOVERY_NATIVE_MULTIXACT_TRUNCATE
+	CLUSTER_RECOVERY_NATIVE_MULTIXACT_TRUNCATE,
+	CLUSTER_RECOVERY_NATIVE_CLOG_ZERO,
+	CLUSTER_RECOVERY_NATIVE_CLOG_TRUNCATE,
+	CLUSTER_RECOVERY_NATIVE_COMMIT_TS_ZERO,
+	CLUSTER_RECOVERY_NATIVE_COMMIT_TS_TRUNCATE
 } ClusterRecoveryNativeKind;
 
 /* Exact observed source and bytes, not a claim/cut authentication. Keep this
@@ -102,6 +106,13 @@ typedef struct ClusterRecoveryNativeEffect {
  * observations do not authorize applying, truncating or releasing data. */
 
 typedef struct ClusterRecoveryNativeScan ClusterRecoveryNativeScan;
+
+/* CLOG/COMMIT_TS ZERO and TRUNCATE keep their complete original native
+ * payloads. The cutoff xid/database and page are observations, not FullXid,
+ * status, timestamp-validity, retention or deletion-completion proofs.
+ * ZERO targets only the original source's physical namespace; TRUNCATE
+ * retains a separate lifecycle obligation. No shared commit_ts replay is
+ * enabled by this inspector, and no SUBTRANS parent relationship is inferred. */
 
 /* Borrow an already verified reader only during begin; copy the entire main
  * payload under the explicit budget. No I/O, apply, authority or completion

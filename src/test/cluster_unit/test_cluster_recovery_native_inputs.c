@@ -9,6 +9,9 @@ int control_fixture_main(int argc, char **argv);
 #undef main
 #include "catalog/storage_xlog.h"
 #include "access/multixact.h"
+#include "access/clog.h"
+#include "access/commit_ts.h"
+#include "cluster/cluster_native_startup.h"
 #include "cluster/cluster_recovery_native_inventory.h"
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_recovery_record_hash.h"
@@ -48,6 +51,8 @@ static unsigned inventory_extra;
 static unsigned inventory_binding_case;
 static XLogRecPtr inventory_extra_start, inventory_extra_previous;
 static XLogRecPtr inventory_mx_start, inventory_mx_previous;
+static XLogRecPtr inventory_slru_start[4], inventory_slru_previous[4];
+static unsigned inventory_slru_fault;
 
 /* These small records stay within the original checkpoint's first WAL page.
  * Header, main-data framing and CRC are actual native-reader inputs. */
@@ -246,6 +251,49 @@ inventory_write_mx_sequence(const ClusterWalSourceRef *source, WalTestRecord nex
 								  XLOG_MULTIXACT_TRUNCATE_ID, &trunc, sizeof(trunc));
 }
 
+static uint8
+inventory_slru_payload(unsigned shape, char *bytes, bool changed)
+{
+	int page = 33;
+	xl_clog_truncate clog = { page, page * CLUSTER_NATIVE_CLOG_PER_PAGE, changed ? 6 : 5 };
+	xl_commit_ts_truncate cts
+		= { page, page * CLUSTER_NATIVE_COMMIT_TS_PER_PAGE + (changed ? 1 : 0) };
+	if (shape % 2 == 0) {
+		memcpy(bytes, &page, sizeof(page));
+		return sizeof(page);
+	}
+	if (shape == 1) {
+		memcpy(bytes, &clog, sizeof(clog));
+		return sizeof(clog);
+	}
+	memcpy(bytes, &cts, SizeOfCommitTsTruncate);
+	return SizeOfCommitTsTruncate;
+}
+
+static WalTestRecord
+inventory_write_slru_sequence(const ClusterWalSourceRef *source, WalTestRecord next, unsigned node)
+{
+	unsigned first = inventory_extra == 10 ? 0 : inventory_extra == 11 ? 2 : 3;
+	unsigned limit = inventory_extra == 10 ? 2 : first + 1;
+	for (unsigned shape = first; shape < limit; shape++) {
+		char bytes[sizeof(xl_clog_truncate)];
+		uint8 length = inventory_slru_payload(shape, bytes, false);
+		uint8 opcode = shape % 2 ? 0x10 : 0;
+		if (node == 0) {
+			inventory_slru_start[shape] = next.exclusive_end;
+			inventory_slru_previous[shape] = next.record_start;
+		}
+		if ((inventory_slru_fault == 1 && shape == 0) || (inventory_slru_fault == 2 && shape == 2))
+			opcode = 0xF0;
+		if ((inventory_slru_fault == 3 && shape == 1) || (inventory_slru_fault == 4 && shape == 3))
+			length--;
+		next = inventory_write_record(source, next.exclusive_end, next.record_start,
+									  shape < 2 ? RM_CLOG_ID : RM_COMMIT_TS_ID, opcode, bytes,
+									  length);
+	}
+	return next;
+}
+
 static ClusterWalInputsV1 *
 inventory_fixture(bool unsupported, bool open_source)
 {
@@ -294,6 +342,8 @@ inventory_fixture(bool unsupported, bool open_source)
 			extra = inventory_write_bound_head(&source, commit, node);
 		if (inventory_extra >= 6 && inventory_extra <= 9)
 			extra = inventory_write_mx_sequence(&source, extra, node);
+		if (inventory_extra >= 10 && inventory_extra <= 12)
+			extra = inventory_write_slru_sequence(&source, extra, node);
 		create = inventory_write_record(&source, extra.exclusive_end, extra.record_start,
 										RM_SMGR_ID, XLOG_SMGR_CREATE, &payload, sizeof(payload));
 		if (i == 0) {
@@ -580,6 +630,7 @@ cleanup:
 #include "test_cluster_recovery_native_transcript.inc"
 #include "test_cluster_recovery_wal_tt_roots.inc"
 #include "test_cluster_recovery_multixact_inputs.inc"
+#include "test_cluster_recovery_slru_inputs.inc"
 #include "test_cluster_recovery_multixact_join_inputs.inc"
 #include "test_cluster_recovery_census_inputs.inc"
 
@@ -590,7 +641,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(38);
+	UT_PLAN(42);
 	UT_RUN(test_native_inventory_uses_two_real_cold_passes);
 	UT_RUN(test_native_inventory_never_returns_partial_on_drift_io_or_error);
 	UT_RUN(test_native_inventory_capacity_is_not_partial_success);
@@ -629,6 +680,10 @@ main(int argc, char **argv)
 	UT_RUN(test_owned_census_target_join_and_final_observation_revoke_changed_inputs);
 	UT_RUN(test_owned_census_enumerates_raw_native_slru_slots);
 	UT_RUN(test_owned_census_native_slru_drift_and_scope_loss_revoke_outputs);
+	UT_RUN(test_cold_slru_records_keep_all_shapes_and_origin_targets);
+	UT_RUN(test_cold_slru_second_and_final_reads_revoke_the_union);
+	UT_RUN(test_cold_slru_bad_records_never_become_other);
+	UT_RUN(test_cold_commit_ts_keeps_original_profile_refusal);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

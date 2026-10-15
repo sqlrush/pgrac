@@ -586,11 +586,12 @@ UT_TEST(test_second_pass_binds_all_source_and_record_bytes)
 
 #include "test_cluster_recovery_undo_effects.inc"
 #include "test_cluster_recovery_multixact_effects.inc"
+#include "test_cluster_recovery_slru_effects.inc"
 
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(29);
 	UT_RUN(test_commit_keeps_every_effect_and_owned_source);
 	UT_RUN(test_abort_keeps_deletions_stats_and_subxact_membership);
 	UT_RUN(test_assignment_retains_real_top_membership);
@@ -616,6 +617,10 @@ main(void)
 	UT_RUN(test_multixact_bad_counts_truncation_and_member_bytes_refuse);
 	UT_RUN(test_multixact_zero_page_bounds_and_truncate_shape_refuse);
 	UT_RUN(test_multixact_cut_budget_and_final_recheck_keep_original_gates);
+	UT_RUN(test_native_slru_owns_all_four_shapes_and_raw_cutoff);
+	UT_RUN(test_native_slru_bad_page_cutoff_shape_and_unknown_refuse);
+	UT_RUN(test_native_slru_original_cut_shape_and_allocation_gates);
+	UT_RUN(test_native_slru_full_recheck_after_drain_is_sticky);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

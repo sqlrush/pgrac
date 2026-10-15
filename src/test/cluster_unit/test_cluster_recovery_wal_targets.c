@@ -458,13 +458,14 @@ UT_TEST(test_bad_edge_mixed_side_and_unclassified_opcode_do_not_finish_roots)
 
 #include "test_cluster_recovery_undo_targets.inc"
 #include "test_cluster_recovery_multixact_targets.inc"
+#include "test_cluster_recovery_slru_targets.inc"
 #include "test_cluster_recovery_multixact_physical.inc"
 #include "test_cluster_recovery_multixact_join.inc"
 
 int
 main(void)
 {
-	UT_PLAN(36);
+	UT_PLAN(40);
 	UT_RUN(test_page_and_rebuildable_fsm_keep_all_file_targets);
 	UT_RUN(test_typed_structure_keeps_all_forks_and_space_pages);
 	UT_RUN(test_native_create_and_truncate_do_not_invent_page_requirements);
@@ -501,6 +502,10 @@ main(void)
 	UT_RUN(test_mx_join_rejects_scope_capacity_and_non_create);
 	UT_RUN(test_mx_join_final_wal_or_roots_drift_revokes_drained);
 	UT_RUN(test_mx_join_metadata_search_has_a_bounded_step);
+	UT_RUN(test_slru_zero_roots_keep_local_origin_missing_short_and_maximum);
+	UT_RUN(test_slru_truncate_keeps_obligation_without_deleting_or_faking_roots);
+	UT_RUN(test_slru_zero_target_failures_poison_all_candidates);
+	UT_RUN(test_slru_zero_target_capacity_does_not_export_a_prefix);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

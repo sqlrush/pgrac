@@ -9,6 +9,8 @@
 #include "postgres.h"
 #include <fcntl.h>
 #include <unistd.h>
+#include "access/clog.h"
+#include "access/commit_ts.h"
 #include "access/multixact.h"
 #include "access/slru.h"
 #include "cluster/cluster_native_startup.h"
@@ -441,6 +443,44 @@ roots_add_multixact(ClusterRecoveryRootSet *roots, const ClusterRecoveryNativeEf
 	return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
 }
 
+static ClusterRecoveryRootsResult
+roots_add_slru_zero(ClusterRecoveryRootSet *roots, const ClusterRecoveryNativeEffect *effect)
+{
+	const ClusterRecoveryNativeRecord *record = effect->record;
+	bool cts = effect->kind == CLUSTER_RECOVERY_NATIVE_COMMIT_TS_ZERO;
+	uint32 node = record->source.claim.identity.origin_node_id;
+	uint32 per_page = cts ? CLUSTER_NATIVE_COMMIT_TS_PER_PAGE : CLUSTER_NATIVE_CLOG_PER_PAGE;
+	uint32 index, segment;
+	ClusterRecoveryRootEntry *entry;
+	char path[MAXPGPATH];
+	int page;
+
+	if (!cluster_wal_claim_v2_ref_valid(&record->source.claim)
+		|| record->header.xl_rmid != (cts ? RM_COMMIT_TS_ID : RM_CLOG_ID)
+		|| (record->header.xl_info & ~XLR_INFO_MASK) != (cts ? COMMIT_TS_ZEROPAGE : CLOG_ZEROPAGE)
+		|| effect->bytes != record->payload || effect->length != record->payload_length
+		|| effect->length != sizeof(page) || effect->ordinal != 0)
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	memcpy(&page, effect->bytes, sizeof(page));
+	if (page < 0 || (uint64)page > UINT32_MAX / per_page)
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	segment = (uint32)page / SLRU_PAGES_PER_SEGMENT;
+	snprintf(path, sizeof(path), "native_side/origin_%u/%s/%04X", node,
+			 cts ? "pg_commit_ts" : "pg_xact", segment);
+	if (!roots_lookup(roots, path, true, &index))
+		return roots->status;
+	entry = &roots->entries[index];
+	entry->file.kind = CLUSTER_RECOVERY_FILE_ORIGIN_SLRU;
+	entry->file.native_family
+		= cts ? CLUSTER_RECOVERY_NATIVE_FAMILY_COMMIT_TS : CLUSTER_RECOVERY_NATIVE_FAMILY_XACT;
+	entry->file.native_origin_node = node;
+	entry->file.native_segment = segment;
+	entry->origins |= CLUSTER_RECOVERY_ROOT_FROM_WAL;
+	entry->required_blocks
+		= Max(entry->required_blocks, (uint64)(page % SLRU_PAGES_PER_SEGMENT) + 1);
+	return CLUSTER_RECOVERY_ROOTS_MORE;
+}
+
 ClusterRecoveryRootsResult
 cluster_recovery_root_set_add_native(ClusterRecoveryRootSet *roots,
 									 const ClusterRecoveryNativeEffect *effect)
@@ -460,6 +500,9 @@ cluster_recovery_root_set_add_native(ClusterRecoveryRootSet *roots,
 		|| memcmp(record->source.claim.identity.storage_uuid, roots->storage_uuid, 16) != 0)
 		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
 	opcode = record->header.xl_info & ~XLR_INFO_MASK;
+	if (effect->kind == CLUSTER_RECOVERY_NATIVE_CLOG_ZERO
+		|| effect->kind == CLUSTER_RECOVERY_NATIVE_COMMIT_TS_ZERO)
+		return roots_add_slru_zero(roots, effect);
 	if (effect->kind == CLUSTER_RECOVERY_NATIVE_MULTIXACT_CREATE
 		|| effect->kind == CLUSTER_RECOVERY_NATIVE_MULTIXACT_ZERO_OFFSETS
 		|| effect->kind == CLUSTER_RECOVERY_NATIVE_MULTIXACT_ZERO_MEMBERS)
