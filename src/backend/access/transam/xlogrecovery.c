@@ -3091,9 +3091,10 @@ cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
  * per-block redo consultation and the restartpoint hold exist once their
  * owners publish the handshake macros; pass 1 takes every generation with
  * retained WAL from the participant census, and fenced generations are
- * published recovered after replay.  Other generations' typed side owners
- * with the XID/OID/MX/SCN bound merge are not wired yet, so every typed
- * plan currently refuses before IR.
+ * published recovered after replay.  The typed side-record owner is already
+ * called by cluster_typed_replay_unscheduled() for admitted side routes;
+ * exact route/source/authority/proof gates still decide whether a plan may
+ * proceed, and unknown or incomplete side plans remain fail-closed.
  */
 static const ClusterColdHandshakeV1 cluster_cold_handshake = {
 #ifdef CLUSTER_COLD_REDO_HOOK_CONSUMER_V1
@@ -3102,7 +3103,9 @@ static const ClusterColdHandshakeV1 cluster_cold_handshake = {
 	.redo_block_hook = false,
 #endif
 	.participant_census = true,
-	.side_owners = false,
+	/* cluster_cold_typed_side_record_v1 is the existing pass-2 owner for
+	 * every side route admitted by the sealed plan. */
+	.side_owners = true,
 	.completion_publish = true,
 #ifdef CLUSTER_COLD_RESTARTPOINT_HOLD_CONSUMER_V1
 	.restartpoint_hold = true,
