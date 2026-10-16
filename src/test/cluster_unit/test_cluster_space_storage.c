@@ -3285,22 +3285,71 @@ UT_TEST(test_native_structure_observation_needs_attribution_and_stable_native_fl
 	for (unsigned drop = 0; drop < 2; drop++) {
 		for (unsigned fault = 0; fault < 5; fault++) {
 			Relation rel = native_truncate_relation();
+			volatile bool caught = false;
 			observation_fault = fault;
 			if (fault == 1)
 				capture_result = CLUSTER_PAGE_WAL_UNATTRIBUTED;
 			if (drop) {
 				ClusterSpaceDropState *state = publish_drop_for_finish();
-				cluster_space_drop_finish(state);
+				expecting_error = fault != 0;
+				PG_TRY();
+				{
+					cluster_space_drop_finish(state);
+				}
+				PG_CATCH();
+				{
+					caught = true;
+				}
+				PG_END_TRY();
+				expecting_error = false;
 			} else
 				RelationTruncate(rel, 4);
+			UT_ASSERT_EQ(caught, drop && fault != 0);
 			UT_ASSERT_EQ(space_readbacks, 2);
 			UT_ASSERT_EQ(space_observe_calls, fault == 0 || fault == 4 ? 1 : 0);
 			UT_ASSERT_EQ(space_observations, fault == 0 ? 1 : 0);
 			UT_ASSERT_EQ(truncate_observations, !drop && fault == 0 ? 1 : 0);
-			UT_ASSERT_EQ(pinned | locked, 0);
-			UT_ASSERT_EQ(reported_level, 0);
+			if (drop && fault != 0) {
+				UT_ASSERT_EQ(pinned, 3);
+				UT_ASSERT_EQ(locked, 3);
+				UT_ASSERT_EQ(reported_level, PANIC);
+			} else {
+				UT_ASSERT_EQ(pinned | locked, 0);
+				UT_ASSERT_EQ(reported_level, 0);
+			}
 			FreeFakeRelcacheEntry(rel);
 		}
+	}
+}
+
+UT_TEST(test_native_drop_requires_final_space_observation_before_release)
+{
+	for (unsigned fault = 1; fault < 5; fault++) {
+		Relation rel = native_truncate_relation();
+		ClusterSpaceDropState *state;
+		volatile bool caught = false;
+
+		observation_fault = fault;
+		if (fault == 1)
+			capture_result = CLUSTER_PAGE_WAL_UNATTRIBUTED;
+		state = publish_drop_for_finish();
+		expecting_error = true;
+		PG_TRY();
+		{
+			cluster_space_drop_finish(state);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		expecting_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(reported_level, PANIC);
+		UT_ASSERT_EQ(unlink_calls + invalidations, 0);
+		UT_ASSERT_EQ(pinned, 3);
+		UT_ASSERT_EQ(locked, 3);
+		FreeFakeRelcacheEntry(rel);
 	}
 }
 
@@ -3801,7 +3850,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(76);
+	UT_PLAN(77);
 	UT_RUN(test_create_fence_refuses_native_main_and_direct_space_before_effects);
 	UT_RUN(test_create_keeps_one_native_owner_through_both_forks);
 	UT_RUN(test_create_io_error_keeps_original_reference_and_abort_delete);
@@ -3813,6 +3862,7 @@ main(void)
 	UT_RUN(test_native_drop_durable_finish_io_failure_keeps_original_owner);
 	UT_RUN(test_native_drop_durable_finish_requires_each_exact_page);
 	UT_RUN(test_native_structure_observation_needs_attribution_and_stable_native_flush);
+	UT_RUN(test_native_drop_requires_final_space_observation_before_release);
 	UT_RUN(test_cold_physical_truncate_touches_only_named_forks);
 	UT_RUN(test_cold_physical_truncate_leaves_already_short_forks_alone);
 	UT_RUN(test_native_truncate_persists_new_space_before_exposing_incarnation);

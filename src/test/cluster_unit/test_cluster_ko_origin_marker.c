@@ -111,6 +111,25 @@ prepare_origin(uint16 operation)
 	return owner;
 }
 
+/* The final SPACE q is a durable origin-side fact, not a substitute for the
+ * pre-COMMIT local Closed result.  Keep the negative explicit even when the
+ * shared context still carries a stale positive snapshot: the live native
+ * owner is the authority consumed by the final observation. */
+UT_TEST(test_origin_final_space_q_rejects_owner_before_local_closed)
+{
+	ClusterKoCompletionV2 *owner = prepare_origin(CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+
+	owner->space_observed = false;
+	owner->origin_data_closed = false;
+	UT_ASSERT(!cluster_ko_shared_observe_space_v2(owner, &postcommit_binding,
+			postcommit_wal, sizeof(postcommit_wal)));
+	UT_ASSERT(!owner->space_observed);
+	owner->origin_data_closed = true;
+	UT_ASSERT(cluster_ko_shared_observe_space_v2(owner, &postcommit_binding,
+			postcommit_wal, sizeof(postcommit_wal)));
+	native_fixture_shared_memory_end();
+}
+
 static void
 origin_release_ax(const ClusterKoSharedMessageV3 *request)
 {
@@ -309,9 +328,10 @@ UT_TEST(test_seventy_two_native_aborts_reuse_reservations_after_exact_s6)
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
 	UT_RUN(test_origin_reserves_before_request_and_abort_waits_for_s6);
 	UT_RUN(test_origin_identity_capacity_refuses_before_marker_and_peer_send);
+	UT_RUN(test_origin_final_space_q_rejects_owner_before_local_closed);
 	UT_RUN(test_origin_publication_closes_before_pending_delete_and_survives_ax_release);
 	UT_RUN(test_origin_inflight_call_blocks_promotion_without_reopening);
 	UT_RUN(test_origin_predelete_handoff_precedes_buffer_release);

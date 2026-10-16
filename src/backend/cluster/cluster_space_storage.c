@@ -1031,25 +1031,27 @@ space_structure_readback(SMgrRelation rel, Buffer buffer, BlockNumber block)
 
 /* Keep the original record with its preallocated KO owner. Missing native
  * attribution cannot manufacture a structural completion or retire a PI. */
-static void
+static bool
 space_structure_observe(ClusterSpaceTruncateState *state)
 {
 	ClusterSpaceStructureChange change;
 	ClusterPageWalBindingV1 before, after, certified;
 	if (state->ko_completion == NULL || RecoveryInProgress())
-		return;
+		return false;
 	if (!cluster_space_structure_wal_decode(state->wal, sizeof(state->wal), &change))
 		elog(PANIC, "SPACE observation lost its original structural record");
 	if (!cluster_page_wal_read_v1(state->buffers[0], &change.identity.result, &before)
 		|| before.record_end != state->lsn || !cluster_page_wal_flush_source_v1(&before, &certified)
 		|| !cluster_page_wal_read_v1(state->buffers[0], &change.identity.result, &after)
 		|| memcmp(&before, &after, sizeof(before)) != 0)
-		return;
-	if (cluster_ko_shared_observe_space_v2(state->ko_completion, &certified, state->wal,
-										   sizeof(state->wal))
-		&& change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE && state->base_synced
+		return false;
+	if (!cluster_ko_shared_observe_space_v2(state->ko_completion, &certified, state->wal,
+										 sizeof(state->wal)))
+		return false;
+	if (change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE && state->base_synced
 		&& state->truncate_published)
 		(void)cluster_ko_shared_observe_truncate_v2(state->ko_completion);
+	return true;
 }
 
 void
@@ -1222,7 +1224,15 @@ cluster_space_drop_finish(ClusterSpaceDropState *state)
 										   change.identity.result.key.locator.spcOid,
 										   change.identity.result.key.locator.dbOid,
 										   change.identity.result.key.locator.relNumber, j)));
-				space_structure_observe(entry);
+				if (!space_structure_observe(entry))
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("committed relation deletion lacks a durable SPACE observation"),
+							 errdetail("Relation %u/%u/%u has no final origin SPACE q.",
+										change.identity.result.key.locator.spcOid,
+										change.identity.result.key.locator.dbOid,
+										change.identity.result.key.locator.relNumber),
+							 errhint("Keep the original deletion owner for recovery.")));
 			}
 		}
 		PG_CATCH();

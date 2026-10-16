@@ -3996,6 +3996,14 @@ cluster_ko_shared_observe_space_v2(ClusterKoCompletionV2 *completion,
 		if (terminal->rmid != RM_XACT_ID || (terminal->info & XLOG_XACT_OPMASK) != XLOG_XACT_COMMIT
 			|| (terminal->info & XLOG_XACT_HAS_INFO) == 0)
 			return false;
+		/* DROP's final SPACE q is consumed only after the origin's own
+		 * pre-COMMIT checkpoint has reached local Closed.  The shared
+		 * snapshot below is a second identity/cut check; it must not be
+		 * allowed to turn a stale owner-local state into a durable result. */
+		if (owned->barrier_v3
+			&& owned->barrier_request_v3.operation == CLUSTER_KO_SHARED_V3_OPERATION_DROP
+			&& !owned->origin_data_closed)
+			return false;
 	} else
 		return false;
 	if (!ko_shared_structure_current(owned, &change.identity.expected, change.identity.action))
