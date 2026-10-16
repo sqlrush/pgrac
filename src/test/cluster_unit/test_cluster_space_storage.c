@@ -139,6 +139,10 @@ static uint32 post_drop_forks;
 static unsigned final_sync_calls;
 static unsigned final_sync_fault;
 static bool final_shared_backend = true;
+static bool drop_group_fixture;
+static unsigned drop_group_fault;
+static unsigned drop_open_target;
+static bool drop_first_changed;
 
 const ClusterSharedFsOps *
 cluster_shared_fs_get_active_ops(void)
@@ -152,10 +156,20 @@ cluster_shared_fs_get_active_ops(void)
 bool
 cluster_shared_fs_sharedfs_sync_drop_result(RelFileLocator target)
 {
-	UT_ASSERT(RelFileLocatorEquals(target, locator));
+	UT_ASSERT(target.spcOid == locator.spcOid && target.dbOid == locator.dbOid);
+	UT_ASSERT(target.relNumber == locator.relNumber
+			  || (drop_group_fixture && target.relNumber == locator.relNumber + 1));
 	UT_ASSERT_EQ(post_drop_calls, 1);
 	UT_ASSERT(post_drop_reads > 0 && cold_commit_window);
 	final_sync_calls++;
+	if (drop_group_fixture && target.relNumber == locator.relNumber + 1) {
+		if (drop_group_fault == 2)
+			return false;
+		if (drop_group_fault == 3)
+			drop_first_changed = true;
+	}
+	if (final_sync_fault == 6)
+		elog(ERROR, "injected cold DROP sync ERROR");
 	if (final_sync_fault == 2)
 		have_ref = false;
 	if (final_sync_fault == 3)
@@ -480,7 +494,8 @@ cluster_smgr_which_for(RelFileLocator tag, BackendId backend)
 {
 	if (backend != InvalidBackendId || tag.spcOid != locator.spcOid || tag.dbOid != locator.dbOid
 		|| (tag.relNumber != locator.relNumber
-			&& !(cold_drop_second_refused && tag.relNumber == locator.relNumber + 1)))
+			&& !((cold_drop_second_refused || drop_group_fixture)
+				 && tag.relNumber == locator.relNumber + 1)))
 		abort();
 	return shared ? 1 : 0;
 }
@@ -488,8 +503,12 @@ cluster_smgr_which_for(RelFileLocator tag, BackendId backend)
 SMgrRelation
 smgropen(RelFileLocator tag, BackendId backend)
 {
-	if (!RelFileLocatorEquals(tag, locator) || backend != InvalidBackendId)
+	if ((!RelFileLocatorEquals(tag, locator)
+		 && !(drop_group_fixture && tag.spcOid == locator.spcOid && tag.dbOid == locator.dbOid
+			  && tag.relNumber == locator.relNumber + 1))
+		|| backend != InvalidBackendId)
 		abort();
+	drop_open_target = tag.relNumber - locator.relNumber;
 	io_calls++;
 	return &storage;
 }
@@ -504,6 +523,10 @@ smgrexists(SMgrRelation rel, ForkNumber forknum)
 		post_drop_reads++;
 		if (post_drop_throw)
 			elog(ERROR, "injected post-unlink read failure");
+		if (forknum == SPACE_FORKNUM
+			&& ((drop_group_fault == 1 && drop_open_target == 1)
+				|| (drop_first_changed && drop_open_target == 0)))
+			return true;
 		return (post_drop_forks & (1U << forknum)) != 0;
 	}
 	if (deleted_all)
@@ -1346,6 +1369,8 @@ reset(void)
 	drop_verify_fixture = post_drop_io = post_drop_throw = post_drop_lose_namespace = false;
 	post_drop_calls = post_drop_reads = post_drop_forks = 0;
 	final_sync_calls = final_sync_fault = 0;
+	drop_group_fixture = drop_first_changed = false;
+	drop_group_fault = drop_open_target = 0;
 	final_shared_backend = true;
 	cold_truncate_permitted = cold_vm_clear = true;
 	native_commits = commit_decisions = 0;
@@ -3086,7 +3111,7 @@ static void
 DropRelationFiles(RelFileLocator *locators, int nlocators, bool isRedo)
 {
 	UT_ASSERT(drop_verify_fixture && isRedo);
-	UT_ASSERT_EQ(nlocators, 1);
+	UT_ASSERT_EQ(nlocators, drop_group_fixture ? 2 : 1);
 	UT_ASSERT(RelFileLocatorEquals(locators[0], locator));
 	UT_ASSERT_EQ(flush_calls, 1);
 	UT_ASSERT_EQ(pinned | locked, 0);
@@ -3189,10 +3214,11 @@ UT_TEST(test_cold_final_drop_checks_deleted_result_without_reinstall)
 	ClusterColdTypedV1 typed;
 	ClusterColdTypedReplay rep = { &typed };
 	volatile bool caught = false, ok = false;
-	unsigned reads;
+	unsigned reads, syncs;
 
 	final_drop_fixture(&typed, &reader);
 	reads = post_drop_reads;
+	syncs = final_sync_calls;
 	expecting_error = true;
 	PG_TRY();
 	{
@@ -3208,7 +3234,7 @@ UT_TEST(test_cold_final_drop_checks_deleted_result_without_reinstall)
 	UT_ASSERT_EQ(final_installs, 0);
 	UT_ASSERT(post_drop_reads > reads);
 	UT_ASSERT_EQ(post_drop_calls, 1);
-	UT_ASSERT_EQ(final_sync_calls, 1);
+	UT_ASSERT_EQ(final_sync_calls - syncs, 1);
 	FreeFakeRelcacheEntry(rel);
 }
 
@@ -3304,12 +3330,14 @@ UT_TEST(test_cold_final_drop_sync_failure_or_lost_scope_refuses)
 		Relation rel = drop_replay_record(&reader, &decoded);
 		ClusterColdTypedV1 typed;
 		ClusterColdTypedReplay rep = { &typed };
+		unsigned syncs;
 
 		final_drop_fixture(&typed, &reader);
+		syncs = final_sync_calls;
 		final_sync_fault = fault;
 		final_shared_backend = fault != 5;
 		UT_ASSERT(!cluster_typed_replay_space_final(&rep, 0));
-		UT_ASSERT_EQ(final_sync_calls, fault == 5 ? 0 : 1);
+		UT_ASSERT_EQ(final_sync_calls - syncs, fault == 5 ? 0 : 1);
 		UT_ASSERT_EQ(final_installs, 0);
 		FreeFakeRelcacheEntry(rel);
 	}
@@ -3408,6 +3436,186 @@ UT_TEST(test_cold_native_drop_preserves_post_unlink_io_and_namespace_refusal)
 		expecting_error = false;
 		UT_ASSERT(caught);
 		UT_ASSERT_EQ(reported_level, fault == 0 ? ERROR : PANIC);
+		UT_ASSERT_EQ(post_drop_calls, 1);
+		UT_ASSERT(!pinned && !locked);
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
+UT_TEST(test_cold_native_drop_finishes_durability_before_return)
+{
+	XLogReaderState reader;
+	DecodedXLogRecord decoded;
+	Relation rel = drop_replay_record(&reader, &decoded);
+	xl_xact_parsed_commit parsed;
+
+	cold_commit_window = cold_drop_proven = drop_verify_fixture = true;
+	UT_ASSERT(ParseCommitRecord(wal_info, (xl_xact_commit *)commit_bytes, commit_len, &parsed));
+	native_commit_redo_prefix(&reader, &parsed, 501);
+	post_drop_forks = 1U << MAIN_FORKNUM;
+	main_blocks = 0;
+	native_commit_redo_drop(&reader, &parsed, 501);
+	UT_ASSERT_EQ(final_sync_calls, 1);
+	UT_ASSERT_EQ(post_drop_calls, 1);
+	UT_ASSERT(!pinned && !locked);
+	FreeFakeRelcacheEntry(rel);
+}
+
+UT_TEST(test_cold_native_drop_sync_refusal_cannot_return_success)
+{
+	for (unsigned fault = 1; fault <= 6; fault++) {
+		XLogReaderState reader;
+		DecodedXLogRecord decoded;
+		Relation rel = drop_replay_record(&reader, &decoded);
+		xl_xact_parsed_commit parsed;
+		volatile bool caught = false;
+		unsigned allocations, frees;
+
+		cold_commit_window = cold_drop_proven = drop_verify_fixture = true;
+		UT_ASSERT(ParseCommitRecord(wal_info, (xl_xact_commit *)commit_bytes, commit_len, &parsed));
+		native_commit_redo_prefix(&reader, &parsed, 501);
+		post_drop_forks = 1U << MAIN_FORKNUM;
+		main_blocks = 0;
+		final_sync_fault = fault;
+		final_shared_backend = fault != 5;
+		allocations = fake_allocations;
+		frees = fake_frees;
+		expecting_error = true;
+		PG_TRY();
+		{
+			native_commit_redo_drop(&reader, &parsed, 501);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		expecting_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(reported_level, fault == 6 ? ERROR : PANIC);
+		UT_ASSERT_EQ(final_sync_calls, fault == 5 ? 0 : 1);
+		UT_ASSERT_EQ(post_drop_calls, 1);
+		UT_ASSERT_EQ(fake_allocations - allocations, fake_frees - frees);
+		UT_ASSERT(!pinned && !locked);
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
+static void
+cold_drop_add_second(DecodedXLogRecord *decoded)
+{
+	xl_xact_parsed_commit parsed;
+	ClusterSpaceStructureChange drop;
+	RelFileLocator second = locator;
+	char *after_locators;
+	int count = 2;
+	uint32 drops = 2;
+
+	UT_ASSERT(ParseCommitRecord(wal_info, (xl_xact_commit *)commit_bytes, commit_len, &parsed));
+	after_locators = (char *)(parsed.xlocators + 1);
+	memmove(after_locators + sizeof(second), after_locators,
+			commit_len - (after_locators - (char *)commit_bytes));
+	second.relNumber++;
+	memcpy(after_locators, &second, sizeof(second));
+	memcpy((char *)parsed.xlocators - sizeof(int), &count, sizeof(count));
+	commit_len += sizeof(second);
+	UT_ASSERT(ParseCommitRecord(wal_info, (xl_xact_commit *)commit_bytes, commit_len, &parsed));
+	UT_ASSERT(cluster_space_structure_wal_decode(parsed.space_drops,
+												 CLUSTER_SPACE_STRUCTURE_WAL_BYTES, &drop));
+	drop.identity.expected.key.locator = drop.identity.result.key.locator = second;
+	drop.reservation.before.identity.key.locator = drop.reservation.result.identity.key.locator
+		= second;
+	UT_ASSERT(cluster_space_structure_wal_encode(&drop, commit_bytes + commit_len,
+												 CLUSTER_SPACE_STRUCTURE_WAL_BYTES));
+	memcpy((char *)parsed.space_drops - sizeof(drops), &drops, sizeof(drops));
+	commit_len += CLUSTER_SPACE_STRUCTURE_WAL_BYTES;
+	decoded->main_data_len = commit_len;
+}
+
+UT_TEST(test_cold_native_drop_sync_checks_entire_group_before_and_after)
+{
+	for (unsigned fault = 0; fault <= 3; fault++) {
+		XLogReaderState reader;
+		DecodedXLogRecord decoded;
+		Relation rel = drop_replay_record(&reader, &decoded);
+		xl_xact_parsed_commit parsed;
+		volatile bool caught = false;
+
+		cold_drop_add_second(&decoded);
+		cold_commit_window = cold_drop_proven = drop_verify_fixture = drop_group_fixture = true;
+		UT_ASSERT(ParseCommitRecord(wal_info, (xl_xact_commit *)commit_bytes, commit_len, &parsed));
+		native_commit_redo_prefix(&reader, &parsed, 501);
+		UT_ASSERT_EQ(cold_drop_checks, 2);
+		post_drop_forks = 1U << MAIN_FORKNUM;
+		main_blocks = 0;
+		drop_group_fault = fault;
+		expecting_error = true;
+		PG_TRY();
+		{
+			native_commit_redo_drop(&reader, &parsed, 501);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		expecting_error = false;
+		UT_ASSERT_EQ(caught, fault != 0);
+		UT_ASSERT_EQ(final_sync_calls, fault == 1 ? 0 : 2);
+		UT_ASSERT_EQ(post_drop_calls, 1);
+		UT_ASSERT(!pinned && !locked);
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
+UT_TEST(test_cold_native_drop_sync_rejects_changed_complete_record)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		XLogReaderState reader;
+		DecodedXLogRecord decoded;
+		Relation rel = drop_replay_record(&reader, &decoded);
+		xl_xact_parsed_commit parsed;
+		ClusterSpaceStructureChange drop;
+		volatile bool caught = false;
+
+		cold_drop_add_second(&decoded);
+		cold_commit_window = cold_drop_proven = drop_verify_fixture = drop_group_fixture = true;
+		UT_ASSERT(ParseCommitRecord(wal_info, (xl_xact_commit *)commit_bytes, commit_len, &parsed));
+		native_commit_redo_prefix(&reader, &parsed, 501);
+		post_drop_forks = 1U << MAIN_FORKNUM;
+		main_blocks = 0;
+		if (fault == 0) {
+			UT_ASSERT(cluster_space_structure_wal_decode(parsed.space_drops
+															 + CLUSTER_SPACE_STRUCTURE_WAL_BYTES,
+														 CLUSTER_SPACE_STRUCTURE_WAL_BYTES, &drop));
+			drop.identity.expected.key.locator.relNumber++;
+			drop.identity.result.key.locator.relNumber++;
+			drop.reservation.before.identity.key.locator.relNumber++;
+			drop.reservation.result.identity.key.locator.relNumber++;
+			UT_ASSERT(cluster_space_structure_wal_encode(
+				&drop, (uint8 *)parsed.space_drops + CLUSTER_SPACE_STRUCTURE_WAL_BYTES,
+				CLUSTER_SPACE_STRUCTURE_WAL_BYTES));
+		} else if (fault == 1)
+			memcpy((uint8 *)parsed.space_drops + CLUSTER_SPACE_STRUCTURE_WAL_BYTES,
+				   parsed.space_drops, CLUSTER_SPACE_STRUCTURE_WAL_BYTES);
+		else if (fault == 2)
+			decoded.main_data_len--;
+		else
+			parsed.xlocators[1] = parsed.xlocators[0];
+		expecting_error = true;
+		PG_TRY();
+		{
+			native_commit_redo_drop(&reader, &parsed, 501);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		expecting_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(reported_level, PANIC);
+		UT_ASSERT_EQ(final_sync_calls, 0);
 		UT_ASSERT_EQ(post_drop_calls, 1);
 		UT_ASSERT(!pinned && !locked);
 		FreeFakeRelcacheEntry(rel);
@@ -3811,13 +4019,17 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(73);
+	UT_PLAN(77);
 	UT_RUN(test_cold_final_drop_checks_deleted_result_without_reinstall);
 	UT_RUN(test_cold_final_drop_rejects_incomplete_or_unbound_result);
 	UT_RUN(test_cold_final_drop_sync_failure_or_lost_scope_refuses);
 	UT_RUN(test_cold_final_non_drop_keeps_original_install);
 	UT_RUN(test_cold_native_drop_requires_empty_main_and_no_auxiliary_forks);
 	UT_RUN(test_cold_native_drop_preserves_post_unlink_io_and_namespace_refusal);
+	UT_RUN(test_cold_native_drop_finishes_durability_before_return);
+	UT_RUN(test_cold_native_drop_sync_refusal_cannot_return_success);
+	UT_RUN(test_cold_native_drop_sync_checks_entire_group_before_and_after);
+	UT_RUN(test_cold_native_drop_sync_rejects_changed_complete_record);
 	UT_RUN(test_native_drop_outside_cold_owner_keeps_original_consumer);
 	UT_RUN(test_maintenance_identity_uses_current_owner_without_backend_id);
 	UT_RUN(test_maintenance_identity_retry_keeps_work_and_releases_pin);

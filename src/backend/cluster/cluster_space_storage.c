@@ -1435,6 +1435,88 @@ cluster_space_drop_replay_verify_v1(XLogReaderState *record, TransactionId xid)
 	return true;
 }
 
+/* Complete this COMMIT's structural effect before its caller continues to
+ * later effects. The record-ordered cold owner already installed every exact
+ * TOMBSTONE and performed native deletion. A final full-source seal is still
+ * required; neither empty files nor this sync authorize replay from absence. */
+bool
+cluster_space_drop_replay_finish_v1(XLogReaderState *record, TransactionId xid)
+{
+	typedef struct ColdDropResult {
+		ClusterSpaceIdentityKey key;
+		ClusterSpaceRecoveryInput input;
+		ClusterSpaceColdSourceV1 source;
+	} ColdDropResult;
+	xl_xact_parsed_commit parsed;
+	const ClusterSharedFsOps *ops;
+	ColdDropResult *results;
+	RelFileLocator *sorted;
+	uint32 count = 0;
+	volatile bool ok = false;
+
+	if (!cluster_space_drop_replay_verify_v1(record, xid)
+		|| !ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)XLogRecGetData(record),
+							  XLogRecGetDataLen(record), &parsed)
+		|| (Size)parsed.nrels > MaxAllocSize / (sizeof(*results) + sizeof(*sorted)))
+		return false;
+	ops = cluster_shared_fs_get_active_ops();
+	if (ops == NULL || ops->id != CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS)
+		return false;
+	/* One bounded allocation, including the native sort view, is released on
+ * every refusal and ERROR. The complete WAL payload is borrowed unchanged. */
+	results = palloc0((Size)parsed.nrels * (sizeof(*results) + sizeof(*sorted)));
+	sorted = (RelFileLocator *)(results + parsed.nrels);
+	PG_TRY();
+	{
+		memcpy(sorted, parsed.xlocators, (Size)parsed.nrels * sizeof(*sorted));
+		qsort(sorted, parsed.nrels, sizeof(*sorted), space_locator_compare);
+		/* Match the original COMMIT preflight's sorted distinct shared targets.
+ * A later malformed/unbound target must refuse before the first sync. */
+		for (int i = 0; i < parsed.nrels; i++) {
+			ColdDropResult *target = &results[count];
+			uint16 thread;
+
+			if ((i != 0 && RelFileLocatorEquals(sorted[i], sorted[i - 1]))
+				|| cluster_smgr_which_for(sorted[i], InvalidBackendId) != 1)
+				continue;
+			if (count >= parsed.nspace_drops
+				|| !space_namespace(sorted[i], true, &target->key, &thread) || thread == 0
+				|| thread != record->cluster_expected_thread_id
+				|| target->key.system_identifier != record->system_identifier)
+				goto done;
+			target->input = (ClusterSpaceRecoveryInput){
+				parsed.space_drops + (Size)count * CLUSTER_SPACE_STRUCTURE_WAL_BYTES,
+				CLUSTER_SPACE_STRUCTURE_WAL_BYTES
+			};
+			target->source = (ClusterSpaceColdSourceV1){ thread, record->EndRecPtr };
+			if (!cluster_space_cold_drop_postcondition_v1(&target->key, &target->input,
+														  &target->source))
+				goto done;
+			count++;
+		}
+		if (count != parsed.nspace_drops)
+			goto done;
+		for (uint32 i = 0; i < count; i++)
+			if (!cluster_space_cold_drop_sync_v1(&results[i].key, &results[i].input,
+												 &results[i].source))
+				goto done;
+		/* Revisit earlier targets after the last target's I/O. No partial set
+ * can be returned as complete, even if an earlier fsync itself succeeded. */
+		for (uint32 i = 0; i < count; i++)
+			if (!cluster_space_cold_drop_postcondition_v1(&results[i].key, &results[i].input,
+														  &results[i].source))
+				goto done;
+		ok = cluster_space_drop_replay_verify_v1(record, xid);
+	done:;
+	}
+	PG_FINALLY();
+	{
+		pfree(results);
+	}
+	PG_END_TRY();
+	return ok;
+}
+
 static bool
 space_reservation_redo(XLogReaderState *record)
 {

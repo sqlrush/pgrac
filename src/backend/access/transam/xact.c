@@ -7126,8 +7126,8 @@ xact_redo_commit(XLogReaderState *record, xl_xact_parsed_commit *parsed,
 		DropRelationFiles(parsed->xlocators, parsed->nrels, true);
 #ifdef USE_PGRAC_CLUSTER
 		if (cluster_shared_config && cluster_cold_replay_window_active_v1()
-			&& !cluster_space_drop_replay_verify_v1(record, xid))
-			elog(PANIC, "xact_redo: cold SPACE deletion postcondition refused");
+			&& !cluster_space_drop_replay_finish_v1(record, xid))
+			elog(PANIC, "xact_redo: cold SPACE deletion completion refused");
 #endif
 	}
 

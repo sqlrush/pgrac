@@ -197,6 +197,11 @@ extern bool cluster_space_drop_replay_commit(XLogReaderState *record, Transactio
  * Neither replay authority nor a durable completion / missing-SPACE proof. */
 extern bool cluster_space_drop_replay_verify_v1(XLogReaderState *record, TransactionId xid);
 
+/* Original native cold COMMIT, after its qualified deletion: bind every
+ * native/typed target, sync existing results, then recheck the whole set.
+ * Not replay-from-absence authority or the final cold ROOT seal. */
+extern bool cluster_space_drop_replay_finish_v1(XLogReaderState *record, TransactionId xid);
+
 /* Same physical postcondition at the original sequencer's final callback,
  * after all scheduled records executed and every source was fully drained.
  * The sealed final TOMBSTONE binds the target, not execution authority. */
