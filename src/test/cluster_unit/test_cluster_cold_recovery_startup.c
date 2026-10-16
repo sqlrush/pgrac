@@ -1428,13 +1428,17 @@ UT_TEST(test_native_side_failure_or_late_drift_is_sticky)
 UT_TEST(test_undo_dispatch_selects_exact_record_and_keeps_space_proof)
 {
 	const uint8 infos[]
-		= { XLOG_UNDO_BLOCK_WRITE,	   XLOG_UNDO_BLOCK_WRITE_MULTI, XLOG_UNDO_SEGMENT_INIT,
-			XLOG_UNDO_SEGMENT_REUSE,   XLOG_UNDO_SEGMENT_RECYCLE,	XLOG_UNDO_TT_SLOT_BIND,
-			XLOG_UNDO_TT_SLOT_SET_HEAD };
+		= { XLOG_UNDO_BLOCK_WRITE,		XLOG_UNDO_BLOCK_WRITE_MULTI, XLOG_UNDO_SEGMENT_INIT,
+			XLOG_UNDO_SEGMENT_REUSE,	XLOG_UNDO_SEGMENT_RECYCLE,	 XLOG_UNDO_TT_SLOT_BIND,
+			XLOG_UNDO_TT_SLOT_SET_HEAD, XLOG_UNDO_TT_SLOT_ABORT };
 	for (uint32 i = 0; i < lengthof(infos); i++) {
 		ClusterColdRecordV1 record;
 		ClusterColdTypedV1 *typed = control_fixture_mode(&record, true);
 		side_record_fixture(&record, RM_CLUSTER_UNDO_ID, infos[i], RF_SIDE_ONLINE_OPERATION_UNDO);
+		if (infos[i] == XLOG_UNDO_TT_SLOT_ABORT) {
+			side_fixture[1].operations[1].undo.kind = CLUSTER_UNDO_KIND_TT_ABORT;
+			side_fixture[1].operations[1].undo.format_version = CLUSTER_UNDO_TT_ABORT_EXACT_VERSION;
+		}
 		UT_ASSERT(consume_control(typed, &record));
 		UT_ASSERT_EQ(control_calls, 1);
 		UT_ASSERT_EQ(control_selected, 1);

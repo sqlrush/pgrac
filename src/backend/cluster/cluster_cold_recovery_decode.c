@@ -472,15 +472,17 @@ cold_foreign_side(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan)
 	if (XLogRecGetRmid(reader) == RM_CLUSTER_UNDO_ID) {
 		ClusterUndoDecoded undo;
 
-		/* Use only connected record-local consumers. Undo terminal
-		 * effects cannot borrow the whole-source undo owner. */
+		/* Use only connected record-local consumers. Exact ABORT restores
+		 * its header; legacy terminals cannot borrow the whole-source owner. */
 		return plan->route.codec_id == RF_ROUTE_CODEC_SIDE_CLUSTER_UNDO
 			   && (info == XLOG_UNDO_BLOCK_WRITE || info == XLOG_UNDO_BLOCK_WRITE_MULTI
 				   || info == XLOG_UNDO_SEGMENT_INIT || info == XLOG_UNDO_SEGMENT_REUSE
 				   || info == XLOG_UNDO_SEGMENT_RECYCLE || info == XLOG_UNDO_TT_SLOT_BIND
-				   || info == XLOG_UNDO_TT_SLOT_SET_HEAD)
+				   || info == XLOG_UNDO_TT_SLOT_SET_HEAD || info == XLOG_UNDO_TT_SLOT_ABORT)
 			   && XLogRecGetData(reader) != NULL && cluster_undo_decode(reader, &undo)
-			   && cluster_undo_preflight(&undo);
+			   && cluster_undo_preflight(&undo)
+			   && (info != XLOG_UNDO_TT_SLOT_ABORT
+				   || undo.format_version == CLUSTER_UNDO_TT_ABORT_EXACT_VERSION);
 	}
 	if (plan->route.codec_id != RF_ROUTE_CODEC_SIDE_STANDARD)
 		return false;

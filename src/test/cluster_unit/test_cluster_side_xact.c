@@ -10086,10 +10086,201 @@ UT_TEST(test_cold_head_record_reserves_nested_data_reader_scratch)
 }
 
 
+static RfSideOnlinePlanV1 *
+abort_record_plan(uint32 generation, bool legacy, bool conflict)
+{
+	RfSideOnlinePlanV1 *plan = space_online_plan(400);
+	FakeXactRecord fake;
+	xl_undo_tt_slot_abort_exact abort = { 0 };
+	UBA head = { .raw = { UINT64_C(513) | (UINT64_C(9) << 32), 4 } };
+
+	abort.instance = 3;
+	abort.segment_id = 513;
+	abort.segment_generation = generation;
+	abort.slot_offset = 4;
+	abort.xid = 802;
+	abort.wrap = 7;
+	abort.format_version = CLUSTER_UNDO_TT_ABORT_EXACT_VERSION;
+	if (legacy)
+		make_tt_abort_delta(&fake, 802);
+	else
+		make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_ABORT, &abort,
+							   sizeof(abort));
+	undo_header_feed(plan, &fake, 100);
+	/* The selected terminal header must not execute a later DATA or head. */
+	record_prefix_fpi(plan, 200, 0x31);
+	make_tt_set_head_delta(&fake, conflict ? 818 : 802, &head);
+	undo_header_feed(plan, &fake, 300);
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	return plan;
+}
+
+UT_TEST(test_cold_exact_abort_record_installs_only_its_terminal_header)
+{
+	for (uint32 generation = 0; generation <= 9; generation += 9) {
+		RfSideOnlinePlanV1 *plan = abort_record_plan(generation, false, false);
+		ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
+		ClusterThreadRecoveryAuthorityV1 authority
+			= { .duty = &canonical_duty, .serial_guard = &guard };
+		RfSideOnlineProductionOwnerV1 owner;
+		RfSideOnlineOperationV1 operation;
+		PGAlignedBlock header, after, data = { 0 };
+		UndoSegmentHeaderData *h = (UndoSegmentHeaderData *)header.data;
+
+		cold_undo_block_record_open(&header, &owner, &authority);
+		h->wrap_count = generation;
+		UT_ASSERT(pwrite(fileno(canonical_file), header.data, BLCKSZ, 0) == BLCKSZ);
+		UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &operation));
+		for (int repeat = 0; repeat < 3; repeat++) {
+			/* The original exact terminal transition rearms old release
+			 * flags; this is not an idempotent no-work or GC proof. */
+			if (repeat == 2) {
+				h->tt_slots[4].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+				UT_ASSERT(pwrite(fileno(canonical_file), header.data, BLCKSZ, 0) == BLCKSZ);
+			}
+			canonical_writes = canonical_syncs = cold_source_calls = 0;
+			UT_ASSERT_EQ(
+				rf_side_online_production_apply_record_v1(plan, 0, &operation.identity, &owner),
+				RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT_EQ(canonical_writes, repeat != 1);
+			UT_ASSERT(canonical_syncs > 0 && cold_source_calls == 1);
+			UT_ASSERT(pread(fileno(canonical_file), after.data, BLCKSZ, 0) == BLCKSZ);
+			h->tt_slots[4].status = TT_SLOT_ABORTED;
+			h->tt_slots[4].flags = TT_FLAGS_RESERVED;
+			UT_ASSERT(memcmp(header.data, after.data, BLCKSZ) == 0);
+			UT_ASSERT(pread(fileno(canonical_file), after.data, BLCKSZ, 9 * BLCKSZ) == BLCKSZ);
+			UT_ASSERT(memcmp(data.data, after.data, BLCKSZ) == 0);
+			UT_ASSERT_EQ(cold_clog_applies + cold_clog_verifies
+							 + prepare_apply.terminal_projection_stores,
+						 0);
+		}
+		cold_undo_block_record_close(&owner);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_cold_exact_abort_record_keeps_complete_identity_and_source_refusals)
+{
+	for (int fault = 0; fault < 15; fault++) {
+		RfSideOnlinePlanV1 *plan = abort_record_plan(0, fault == 0, fault == 10);
+		ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
+		ClusterThreadRecoveryAuthorityV1 authority
+			= { .duty = &canonical_duty, .serial_guard = &guard };
+		RfSideOnlineProductionOwnerV1 owner;
+		RfSideOnlineOperationV1 operation;
+		PGAlignedBlock header;
+		UndoSegmentHeaderData *h = (UndoSegmentHeaderData *)header.data;
+
+		cold_undo_block_record_open(&header, &owner, &authority);
+		if (fault == 1)
+			h->wrap_count++;
+		if (fault == 2)
+			h->tt_slots[4].xid++;
+		if (fault == 3)
+			h->tt_slots[4].wrap++;
+		if (fault == 4) {
+			h->tt_slots[4].status = TT_SLOT_COMMITTED;
+			h->tt_slots[4].commit_scn = 999;
+		}
+		if (fault == 5) {
+			h->tt_slots[4].status = TT_SLOT_ABORTED;
+			h->tt_slots[4].flags = ~TT_SLOT_FLAGS_KNOWN;
+		}
+		if (fault == 14) {
+			h->tt_slots[4].status = TT_SLOT_ABORTED;
+			h->tt_slots[4].first_undo_block
+				= (UBA){ .raw = { UINT64_C(513) | (UINT64_C(9) << 32), 4 } };
+		}
+		UT_ASSERT(pwrite(fileno(canonical_file), header.data, BLCKSZ, 0) == BLCKSZ);
+		if (fault == 6 || fault == 7)
+			UT_ASSERT_EQ(ftruncate(fileno(canonical_file), fault == 6 ? 0 : BLCKSZ), 0);
+		cold_source_fail = fault == 8;
+		if (fault == 9)
+			guard.mode = CLUSTER_RECOVERY_SERIAL_ONLINE;
+		if (fault == 11)
+			record_target_drift = 2;
+		canonical_file_io_error = fault == 12;
+		UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &operation));
+		if (fault == 13)
+			operation.identity.record.record_crc++;
+		UT_ASSERT_NE(
+			rf_side_online_production_apply_record_v1(plan, 0, &operation.identity, &owner),
+			RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(canonical_writes, 0);
+		cold_undo_block_record_close(&owner);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_cold_exact_abort_record_io_error_and_postwrite_drift_keep_incomplete)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		RfSideOnlinePlanV1 *plan = abort_record_plan(0, false, false);
+		ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
+		ClusterThreadRecoveryAuthorityV1 authority
+			= { .duty = &canonical_duty, .serial_guard = &guard };
+		RfSideOnlineProductionOwnerV1 owner;
+		RfSideOnlineOperationV1 operation;
+		PGAlignedBlock header;
+		volatile bool caught = false;
+		volatile RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_INTERNAL;
+
+		cold_undo_block_record_open(&header, &owner, &authority);
+		ctrc_io_fault = fault == 1 ? 5 : fault < 3 ? fault + 1 : 0;
+		cold_source_throw = fault == 3;
+		record_target_drift = fault >= 4 ? fault - 1 : 0;
+		UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &operation));
+		PG_TRY();
+		{
+			detail
+				= rf_side_online_production_apply_record_v1(plan, 0, &operation.identity, &owner);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_NE(detail, RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(caught, fault == 2 || fault == 3);
+		UT_ASSERT_EQ(canonical_writes, fault == 3 ? 0 : 1);
+		cold_undo_block_record_close(&owner);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_cold_exact_abort_record_idempotence_still_requires_sync)
+{
+	RfSideOnlinePlanV1 *plan = abort_record_plan(0, false, false);
+	ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
+	ClusterThreadRecoveryAuthorityV1 authority
+		= { .duty = &canonical_duty, .serial_guard = &guard };
+	RfSideOnlineProductionOwnerV1 owner;
+	RfSideOnlineOperationV1 operation;
+	PGAlignedBlock header;
+	UndoSegmentHeaderData *h = (UndoSegmentHeaderData *)header.data;
+
+	cold_undo_block_record_open(&header, &owner, &authority);
+	h->tt_slots[4].status = TT_SLOT_ABORTED;
+	h->tt_slots[4].flags = TT_FLAGS_RESERVED;
+	UT_ASSERT(pwrite(fileno(canonical_file), header.data, BLCKSZ, 0) == BLCKSZ);
+	record_sync_failure = true;
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &operation));
+	UT_ASSERT_NE(rf_side_online_production_apply_record_v1(plan, 0, &operation.identity, &owner),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(canonical_syncs, 1);
+	UT_ASSERT_EQ(canonical_writes, 0);
+	cold_undo_block_record_close(&owner);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(143);
+	UT_PLAN(147);
+	UT_RUN(test_cold_exact_abort_record_installs_only_its_terminal_header);
+	UT_RUN(test_cold_exact_abort_record_keeps_complete_identity_and_source_refusals);
+	UT_RUN(test_cold_exact_abort_record_io_error_and_postwrite_drift_keep_incomplete);
+	UT_RUN(test_cold_exact_abort_record_idempotence_still_requires_sync);
 	UT_RUN(test_cold_head_record_reserves_nested_data_reader_scratch);
 	UT_RUN(test_cold_head_prefix_cannot_borrow_fpi_across_segment_rebirth);
 	UT_RUN(test_cold_head_prefix_requires_complete_selected_identity);

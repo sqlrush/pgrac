@@ -2722,8 +2722,8 @@ rf_side_online_plan_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index
 		|| identity->reserved_zero != 0
 		|| memcmp(&identity->record, &operation.identity.record, sizeof(identity->record)) != 0)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
-	/* XACT, undo terminal effects and SPACE still need their ordered
-	 * consumers. UNDO requires a record-local callback, never apply_undo. */
+	/* XACT, legacy terminal carriers, CTRC and SPACE still need their
+	 * ordered consumers. UNDO uses its record callback, never apply_undo. */
 	if (operation.kind != RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
 		&& operation.kind != RF_SIDE_ONLINE_OPERATION_PROJECTION
 		&& !(operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
@@ -2733,7 +2733,9 @@ rf_side_online_plan_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index
 				 || operation.undo.kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE
 				 || operation.undo.kind == CLUSTER_UNDO_KIND_SEGMENT_RECYCLE
 				 || operation.undo.kind == CLUSTER_UNDO_KIND_TT_BIND
-				 || operation.undo.kind == CLUSTER_UNDO_KIND_TT_SET_HEAD)
+				 || operation.undo.kind == CLUSTER_UNDO_KIND_TT_SET_HEAD
+				 || (operation.undo.kind == CLUSTER_UNDO_KIND_TT_ABORT
+					 && operation.undo.format_version == CLUSTER_UNDO_TT_ABORT_EXACT_VERSION))
 			 && ops->apply_undo_record != NULL))
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 	if (!ops->begin_protected_set(ops->arg))

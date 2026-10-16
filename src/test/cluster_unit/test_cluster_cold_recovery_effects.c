@@ -915,8 +915,17 @@ undo_header_effect_record(EffectRecord *r, uint8 info)
 			.wrap = 7,
 			.first_undo_block = { .raw = { UINT64_C(257) | (UINT64_C(9) << 32), 4 } } };
 
+	xl_undo_tt_slot_abort_exact abort = { .segment_id = 257,
+										  .instance = 2,
+										  .slot_offset = 4,
+										  .xid = 802,
+										  .wrap = 7,
+										  .format_version = CLUSTER_UNDO_TT_ABORT_EXACT_VERSION };
+
 	record_init(r, RM_CLUSTER_UNDO_ID, info);
-	if (info == XLOG_UNDO_TT_SLOT_SET_HEAD)
+	if (info == XLOG_UNDO_TT_SLOT_ABORT)
+		append(r, &abort, sizeof(abort));
+	else if (info == XLOG_UNDO_TT_SLOT_SET_HEAD)
 		append(r, &head, sizeof(head));
 	else if (info == XLOG_UNDO_SEGMENT_INIT)
 		append(r, &init, sizeof(init));
@@ -933,8 +942,8 @@ undo_header_effect_record(EffectRecord *r, uint8 info)
 UT_TEST(test_foreign_undo_header_routes_only_connected_record_consumers)
 {
 	const uint8 infos[]
-		= { XLOG_UNDO_SEGMENT_INIT, XLOG_UNDO_SEGMENT_REUSE, XLOG_UNDO_SEGMENT_RECYCLE,
-			XLOG_UNDO_TT_SLOT_BIND, XLOG_UNDO_TT_SLOT_SET_HEAD };
+		= { XLOG_UNDO_SEGMENT_INIT, XLOG_UNDO_SEGMENT_REUSE,	XLOG_UNDO_SEGMENT_RECYCLE,
+			XLOG_UNDO_TT_SLOT_BIND, XLOG_UNDO_TT_SLOT_SET_HEAD, XLOG_UNDO_TT_SLOT_ABORT };
 	for (uint32 i = 0; i < lengthof(infos); i++) {
 		EffectRecord r;
 		ClusterColdDecodedV1 out = { 0 };
@@ -955,8 +964,8 @@ UT_TEST(test_foreign_undo_header_routes_only_connected_record_consumers)
 UT_TEST(test_foreign_undo_header_malformed_carriers_remain_refused)
 {
 	const uint8 infos[]
-		= { XLOG_UNDO_SEGMENT_INIT, XLOG_UNDO_SEGMENT_REUSE, XLOG_UNDO_SEGMENT_RECYCLE,
-			XLOG_UNDO_TT_SLOT_BIND, XLOG_UNDO_TT_SLOT_SET_HEAD };
+		= { XLOG_UNDO_SEGMENT_INIT, XLOG_UNDO_SEGMENT_REUSE,	XLOG_UNDO_SEGMENT_RECYCLE,
+			XLOG_UNDO_TT_SLOT_BIND, XLOG_UNDO_TT_SLOT_SET_HEAD, XLOG_UNDO_TT_SLOT_ABORT };
 	for (uint32 i = 0; i < lengthof(infos); i++)
 		for (int fault = 0; fault < 6; fault++) {
 			EffectRecord r;
@@ -990,10 +999,43 @@ UT_TEST(test_foreign_undo_header_malformed_carriers_remain_refused)
 		}
 }
 
+UT_TEST(test_foreign_abort_requires_exact_version_and_complete_carrier)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		EffectRecord r;
+		ClusterColdDecodedV1 out = { 0 };
+		xl_undo_tt_slot_abort_exact abort;
+		undo_header_effect_record(&r, XLOG_UNDO_TT_SLOT_ABORT);
+		memcpy(&abort, r.data.bytes, sizeof(abort));
+		if (fault == 0) {
+			xl_undo_tt_slot_abort legacy
+				= { .segment_id = 257, .instance = 2, .slot_offset = 4, .xid = 802, .wrap = 7 };
+			record_init(&r, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_ABORT);
+			append(&r, &legacy, sizeof(legacy));
+		} else {
+			if (fault == 1)
+				abort.format_version++;
+			if (fault == 2)
+				abort.flags = 1;
+			if (fault == 3)
+				abort.reserved = 1;
+			if (fault == 4)
+				abort.segment_generation = UINT32_MAX;
+			memcpy(r.data.bytes, &abort, sizeof(abort));
+		}
+		if (cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out)
+			== CLUSTER_COLD_OK) {
+			UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+			UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(31);
+	UT_PLAN(32);
+	UT_RUN(test_foreign_abort_requires_exact_version_and_complete_carrier);
 	UT_RUN(test_foreign_undo_header_routes_only_connected_record_consumers);
 	UT_RUN(test_foreign_undo_header_malformed_carriers_remain_refused);
 	UT_RUN(test_foreign_undo_blocks_require_real_record_consumer);

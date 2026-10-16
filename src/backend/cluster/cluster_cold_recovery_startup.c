@@ -885,7 +885,7 @@ cold_record_side_kind(const ClusterColdRecordV1 *record)
 		&& (info == XLOG_UNDO_BLOCK_WRITE || info == XLOG_UNDO_BLOCK_WRITE_MULTI
 			|| info == XLOG_UNDO_SEGMENT_INIT || info == XLOG_UNDO_SEGMENT_REUSE
 			|| info == XLOG_UNDO_SEGMENT_RECYCLE || info == XLOG_UNDO_TT_SLOT_BIND
-			|| info == XLOG_UNDO_TT_SLOT_SET_HEAD))
+			|| info == XLOG_UNDO_TT_SLOT_SET_HEAD || info == XLOG_UNDO_TT_SLOT_ABORT))
 		return RF_SIDE_ONLINE_OPERATION_UNDO;
 	if ((record->rmid == RM_CLOG_ID && (info == CLOG_ZEROPAGE || info == CLOG_TRUNCATE))
 		|| (record->rmid == RM_MULTIXACT_ID
@@ -972,6 +972,12 @@ cluster_cold_typed_side_record_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFenc
 			continue;
 		if (match != UINT32_MAX || operation.history_only || operation.kind != kind
 			|| memcmp(&operation.identity, &identity, sizeof(identity)) != 0)
+			return false;
+		/* Keep the decoder's exact terminal carrier boundary at dispatch;
+		 * an older ABORT without segment generation is not this consumer. */
+		if (record->rmid == RM_CLUSTER_UNDO_ID && record->info == XLOG_UNDO_TT_SLOT_ABORT
+			&& (operation.undo.kind != CLUSTER_UNDO_KIND_TT_ABORT
+				|| operation.undo.format_version != CLUSTER_UNDO_TT_ABORT_EXACT_VERSION))
 			return false;
 		match = i;
 	}

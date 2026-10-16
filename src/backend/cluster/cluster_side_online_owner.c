@@ -23,6 +23,7 @@
 #include "cluster/cluster_undo_format.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_uba.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 #include "storage/standbydefs.h"
 #include "utils/inval.h"
 
@@ -596,7 +597,9 @@ side_owner_apply_undo_header_record(RfSideOnlineProductionOwnerV1 *owner, uint32
 	if (undo->kind != CLUSTER_UNDO_KIND_SEGMENT_INIT
 		&& undo->kind != CLUSTER_UNDO_KIND_SEGMENT_REUSE
 		&& undo->kind != CLUSTER_UNDO_KIND_SEGMENT_RECYCLE
-		&& undo->kind != CLUSTER_UNDO_KIND_TT_BIND && undo->kind != CLUSTER_UNDO_KIND_TT_SET_HEAD)
+		&& undo->kind != CLUSTER_UNDO_KIND_TT_BIND && undo->kind != CLUSTER_UNDO_KIND_TT_SET_HEAD
+		&& !(undo->kind == CLUSTER_UNDO_KIND_TT_ABORT
+			 && undo->format_version == CLUSTER_UNDO_TT_ABORT_EXACT_VERSION))
 		return false;
 	target = side_owner_undo_target(owner, undo->instance, undo->segment_id, 0);
 	if (target == NULL
@@ -637,7 +640,9 @@ side_owner_apply_undo_header_record(RfSideOnlineProductionOwnerV1 *owner, uint32
 				!= RF_PAGE_PROOF_DETAIL_OK
 			|| !side_owner_head_data(owner, undo, &target->file, &head_data, true)))
 		return false;
-	/* Do not install other targets or the whole-source final header. */
+	/* Do not install other targets or the whole-source final header. An
+	 * exact TT_ABORT restores only its canonical slot; the ordered native
+	 * ABORT still owns CLOG and the remaining transaction effects. */
 	target->final = prefix;
 	return side_owner_install_target(owner, target)
 		   && cluster_undo_smgr_recovery_read_block_v1(undo->segment_id, undo->instance, 0,
