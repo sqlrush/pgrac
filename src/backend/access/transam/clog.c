@@ -861,6 +861,50 @@ clog_recovery_same_file(const struct stat *before, const struct stat *after)
 		   && before->st_size == after->st_size;
 }
 
+/* Generic sync helpers may tolerate directory errors or ignore a sync-fd
+ * close error. Neither establishes cold recovery durability. */
+static bool
+clog_recovery_sync(SlruCtl ctl, int page, const struct stat *expected)
+{
+	bool directory = page < 0;
+	char path[MAXPGPATH];
+	struct stat before, opened, after;
+	volatile int fd = -1;
+	volatile bool ok = false;
+	int length;
+
+	length = directory
+				 ? snprintf(path, sizeof(path), "%s", ctl->Dir)
+				 : snprintf(path, sizeof(path), "%s/%04X", ctl->Dir, page / SLRU_PAGES_PER_SEGMENT);
+	if (length < 0 || length >= sizeof(path) || lstat(path, &before) != 0
+		|| (directory ? !S_ISDIR(before.st_mode) : !S_ISREG(before.st_mode))
+		|| before.st_uid != geteuid() || (before.st_mode & (S_IWGRP | S_IWOTH)) != 0
+		|| (!directory
+			&& (before.st_nlink != 1 || expected == NULL
+				|| !clog_recovery_same_file(&before, expected))))
+		return false;
+	PG_TRY();
+	{
+		fd = OpenTransientFile(path, (directory ? O_RDONLY | O_DIRECTORY : O_RDWR) | O_NOFOLLOW
+										 | O_CLOEXEC | PG_BINARY);
+		if (fd >= 0 && fstat(fd, &opened) == 0 && clog_recovery_same_file(&before, &opened)) {
+			pgstat_report_wait_start(WAIT_EVENT_SLRU_FLUSH_SYNC);
+			ok = pg_fsync(fd) == 0;
+			pgstat_report_wait_end();
+			ok = ok && fstat(fd, &after) == 0 && clog_recovery_same_file(&before, &after)
+				 && lstat(path, &after) == 0 && clog_recovery_same_file(&before, &after);
+		}
+	}
+	PG_FINALLY();
+	{
+		pgstat_report_wait_end();
+		if (fd >= 0 && CloseTransientFile(fd) != 0)
+			ok = false;
+	}
+	PG_END_TRY();
+	return ok;
+}
+
 typedef enum ClogRecoveryAccess {
 	CLOG_RECOVERY_PREFLIGHT,
 	CLOG_RECOVERY_WRITE,
@@ -897,8 +941,6 @@ clog_recovery_page(int origin, int page, TransactionId top, int count,
 {
 	SlruCtl ctl = &ClogRecoveryCtl[origin];
 	struct stat before, after;
-	FileTag tag;
-	char path[MAXPGPATH];
 	int slot;
 	bool ok;
 
@@ -922,12 +964,9 @@ clog_recovery_page(int origin, int page, TransactionId top, int count,
 	LWLockRelease(ctl->shared->ControlLock);
 	if (!ok)
 		return false;
-	if (access == CLOG_RECOVERY_WRITE) {
-		memset(&tag, 0, sizeof(tag));
-		tag.segno = page / SLRU_PAGES_PER_SEGMENT;
-		if (!clog_recovery_permitted(origin) || SlruSyncFileTag(ctl, &tag, path) != 0)
-			return false;
-	}
+	if (access == CLOG_RECOVERY_WRITE
+		&& (!clog_recovery_permitted(origin) || !clog_recovery_sync(ctl, page, &before)))
+		return false;
 	return clog_recovery_directory_ready(origin) && clog_recovery_page_identity(ctl, page, &after)
 		   && clog_recovery_same_file(&before, &after);
 }
@@ -976,7 +1015,8 @@ clog_recovery_tree(int origin, TransactionId xid, int count, const TransactionId
 	if (!clog_recovery_page(origin, page, xid, same, children, status, CLOG_RECOVERY_WRITE)
 		|| !clog_recovery_children(origin, count - same, other, status, CLOG_RECOVERY_WRITE))
 		return false;
-	fsync_fname(ClogRecoveryCtl[origin].Dir, true);
+	if (!clog_recovery_sync(&ClogRecoveryCtl[origin], -1, NULL))
+		return false;
 	return clog_recovery_directory_ready(origin)
 		   && clog_recovery_tree(origin, xid, count, children, status, true);
 }
@@ -1047,7 +1087,6 @@ clog_recovery_zero(int origin, int page, bool verify)
 	struct stat before, after;
 	bool exists, ok;
 	int slot;
-	FileTag tag = { 0 };
 
 	clog_recovery_cache_discard(ctl);
 	if (!clog_recovery_directory_ready(origin))
@@ -1080,10 +1119,9 @@ clog_recovery_zero(int origin, int page, bool verify)
 		return false;
 	if (verify)
 		return clog_recovery_directory_ready(origin);
-	tag.segno = page / SLRU_PAGES_PER_SEGMENT;
-	if (!clog_recovery_permitted(origin) || SlruSyncFileTag(ctl, &tag, path) != 0)
+	if (!clog_recovery_permitted(origin) || !clog_recovery_sync(ctl, page, &after)
+		|| !clog_recovery_sync(ctl, -1, NULL))
 		return false;
-	fsync_fname(ctl->Dir, true);
 	return clog_recovery_zero(origin, page, true);
 }
 
@@ -1140,8 +1178,8 @@ clog_recovery_truncate(int origin, int page, bool verify)
 		(void)SlruScanDirectory(ctl, clog_recovery_truncate_file, &scan);
 		if (!scan.ok)
 			return false;
-		if (scan.phase == 1)
-			fsync_fname(ctl->Dir, true);
+		if (scan.phase == 1 && !clog_recovery_sync(ctl, -1, NULL))
+			return false;
 	}
 	return clog_recovery_directory_ready(origin);
 }

@@ -50,6 +50,9 @@ static char fixture_root[MAXPGPATH];
 static bool authority = true, revoke_on_lock, expect_error, fail_open, fail_sync, fail_dirsync;
 static bool revoke_after_read, revoke_after_sync;
 static bool fail_read, fail_unlink;
+static bool fail_sync_close;
+static int synced_fd = -1, directory_sync_error, directory_open_error;
+static unsigned durability_faults;
 static unsigned deleted;
 static int transient_fds;
 static unsigned writes, syncs, dirsyncs, reads;
@@ -276,6 +279,11 @@ int
 OpenTransientFile(const char *path, int flags)
 {
 	int fd;
+	if (directory_open_error && (flags & O_DIRECTORY)) {
+		durability_faults++;
+		errno = directory_open_error;
+		return -1;
+	}
 	if ((fail_open && (flags & O_RDWR)) || (fail_read && !(flags & O_RDWR))) {
 		errno = EIO;
 		return -1;
@@ -288,12 +296,38 @@ OpenTransientFile(const char *path, int flags)
 int
 CloseTransientFile(int fd)
 {
+	bool fail = fail_sync_close && fd == synced_fd;
+	int rc;
+	if (fd == synced_fd)
+		synced_fd = -1;
 	transient_fds--;
-	return close(fd);
+	rc = close(fd);
+	if (fail) {
+		durability_faults++;
+		errno = EIO;
+		return -1;
+	}
+	return rc;
 }
 int
 pg_fsync(int fd)
 {
+	struct stat st;
+	UT_ASSERT_EQ(fstat(fd, &st), 0);
+	synced_fd = fd;
+	if (S_ISDIR(st.st_mode)) {
+		dirsyncs++;
+		if (fail_dirsync) {
+			errno = EIO;
+			(void)errstart(ERROR, NULL);
+		}
+		if (directory_sync_error) {
+			durability_faults++;
+			errno = directory_sync_error;
+			return -1;
+		}
+		return fsync(fd);
+	}
 	syncs++;
 	if (observe_sync_order && sync_state_count < lengthof(sync_states)) {
 		sync_states[sync_state_count][0] = fixture_status(100);
@@ -315,6 +349,13 @@ fsync_fname(const char *path, bool isdir)
 	int fd, rc;
 	UT_ASSERT(isdir);
 	dirsyncs++;
+	/* Match fd.c's generic directory exceptions; cold completion must not
+	 * inherit them. Actual CLOG/SLRU and their return handling run above. */
+	if (directory_open_error == EACCES || directory_open_error == EISDIR
+		|| directory_sync_error == EBADF || directory_sync_error == EINVAL) {
+		durability_faults++;
+		return;
+	}
 	if (fail_dirsync) {
 		errno = EIO;
 		(void)errstart(ERROR, NULL);
@@ -892,6 +933,43 @@ UT_TEST(native_clog_record_io_error_releases_original_locks_and_private_cache)
 	}
 }
 
+UT_TEST(native_clog_durability_failures_refuse_completion_and_allow_exact_retry)
+{
+	/* All four consumers must fail even if native bytes already match. */
+	for (int operation = 0; operation < 4; operation++) {
+		for (int fault = operation == 3 ? 1 : 0; fault < 5; fault++) {
+			ClusterSideProjectionOperationV1 op
+				= fixture_clog_record(operation == 3, operation == 3 ? 32 : 160);
+			XidStatus status
+				= operation == 1 ? TRANSACTION_STATUS_ABORTED : TRANSACTION_STATUS_COMMITTED;
+			unsigned before = durability_faults;
+			bool result;
+
+			fixture_zero(0);
+			fixture_zero(32);
+			fixture_zero(160);
+			fail_sync_close = fault == 0;
+			directory_sync_error = fault == 1 ? EINVAL : fault == 2 ? EBADF : 0;
+			directory_open_error = fault == 3 ? EACCES : fault == 4 ? EISDIR : 0;
+			result = operation < 2 ? cluster_clog_native_recovery_apply_v1(1, 100, 0, NULL, status)
+								   : cluster_clog_native_recovery_record_apply_v1(1, &op);
+			UT_ASSERT(!result);
+			UT_ASSERT(durability_faults > before);
+			fail_sync_close = false;
+			directory_sync_error = directory_open_error = 0;
+			fixture_idle();
+			if (operation < 2) {
+				UT_ASSERT(cluster_clog_native_recovery_apply_v1(1, 100, 0, NULL, status));
+				UT_ASSERT(cluster_clog_native_recovery_verify_v1(1, 100, 0, NULL, status));
+			} else {
+				UT_ASSERT(cluster_clog_native_recovery_record_apply_v1(1, &op));
+				UT_ASSERT(cluster_clog_native_recovery_record_verify_v1(1, &op));
+			}
+			fixture_idle();
+		}
+	}
+}
+
 static void
 fixture_cleanup(void)
 {
@@ -932,7 +1010,7 @@ main(void)
 			return 2;
 	}
 	clog_recovery_shmem_init();
-	UT_PLAN(17);
+	UT_PLAN(18);
 	UT_RUN(separate_original_origin_controls);
 	UT_RUN(commit_and_abort_persist_full_tree_without_local_pollution);
 	UT_RUN(conflicting_late_child_refuses_before_any_tree_write);
@@ -950,6 +1028,7 @@ main(void)
 	UT_RUN(native_clog_record_bad_scope_and_shape_do_not_write_or_delete);
 	UT_RUN(native_clog_record_alias_and_unlink_failure_remain_incomplete);
 	UT_RUN(native_clog_record_io_error_releases_original_locks_and_private_cache);
+	UT_RUN(native_clog_durability_failures_refuse_completion_and_allow_exact_retry);
 	fixture_cleanup();
 	UT_DONE();
 	return ut_failed_count != 0;
