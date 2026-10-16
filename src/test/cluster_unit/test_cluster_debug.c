@@ -49,6 +49,7 @@
 
 #include "cluster/cluster_catalog_stats.h" /* spec-6.14 D10b catalog counter stubs */
 #include "cluster/cluster_debug.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_undo_record_api.h"
@@ -1006,6 +1007,9 @@ uint64 cluster_ko_native_count(void);
 uint64 cluster_ko_lockfail_count(void);
 uint64 cluster_ko_peer_apply_count(void);
 uint64 cluster_ko_inbound_full_count(void);
+uint64 cluster_ko_origin_checkpoint_restart_count(const char *reason);
+uint64 cluster_ko_origin_checkpoint_wait_count(const char *reason);
+const char *cluster_ko_origin_checkpoint_reason_name(ClusterKoOriginCheckpointReason reason);
 uint64
 cluster_ko_flush_count(void)
 {
@@ -1040,6 +1044,21 @@ uint64
 cluster_ko_inbound_full_count(void)
 {
 	return 0;
+}
+uint64
+cluster_ko_origin_checkpoint_restart_count(const char *reason pg_attribute_unused())
+{
+	return 0;
+}
+uint64
+cluster_ko_origin_checkpoint_wait_count(const char *reason pg_attribute_unused())
+{
+	return 0;
+}
+const char *
+cluster_ko_origin_checkpoint_reason_name(ClusterKoOriginCheckpointReason reason pg_attribute_unused())
+{
+	return "progress";
 }
 
 uint64

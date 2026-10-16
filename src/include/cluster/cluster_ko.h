@@ -659,6 +659,27 @@ extern void cluster_ko_peer_apply_error_v3(int sqlerrcode);
 extern void cluster_ko_lmon_tick_v2(void);
 
 /* ---- observability counters (dump_ko; surfaced by pg_cluster_state) - */
+typedef enum ClusterKoOriginCheckpointReason
+{
+	CLUSTER_KO_ORIGIN_REASON_PROGRESS = 0,
+	CLUSTER_KO_ORIGIN_REASON_CUT_CURRENT,
+	CLUSTER_KO_ORIGIN_REASON_PEER_REVISION,
+	CLUSTER_KO_ORIGIN_REASON_GATE_NOT_OPEN,
+	CLUSTER_KO_ORIGIN_REASON_GATE_CHANGED,
+	CLUSTER_KO_ORIGIN_REASON_CTRC_NOT_READY,
+	CLUSTER_KO_ORIGIN_REASON_CLEANER_PENDING,
+	CLUSTER_KO_ORIGIN_REASON_EXTEND_PENDING,
+	CLUSTER_KO_ORIGIN_REASON_DRAIN_WAIT,
+	CLUSTER_KO_ORIGIN_REASON_DRAIN_MORE,
+	CLUSTER_KO_ORIGIN_REASON_DRAIN_REDIRTIED,
+	CLUSTER_KO_ORIGIN_REASON_PI_SCAN_PENDING,
+	CLUSTER_KO_ORIGIN_REASON_PI_SCAN_MORE,
+	CLUSTER_KO_ORIGIN_REASON_WB_NOT_CLOSED,
+	CLUSTER_KO_ORIGIN_REASON_WB_REVISION,
+	CLUSTER_KO_ORIGIN_REASON_CONTEXT_CHANGED,
+	CLUSTER_KO_ORIGIN_REASON_COUNT
+} ClusterKoOriginCheckpointReason;
+
 extern uint64 cluster_ko_flush_count(void);		   /* barriers initiated (enqueuer) */
 extern uint64 cluster_ko_ack_received_count(void); /* peer DONE ACKs recorded (enqueuer) */
 extern uint64 cluster_ko_failclosed_count(void);   /* 53RAA fail-closed (enqueuer) */
@@ -666,6 +687,10 @@ extern uint64 cluster_ko_native_count(void);	   /* no-op: single-node / no peer 
 extern uint64 cluster_ko_lockfail_count(void); /* KO(X) acquire failed (best-effort; barrier ran) */
 extern uint64 cluster_ko_peer_apply_count(void);   /* flush+drop applied + ACK'd (peer) */
 extern uint64 cluster_ko_inbound_full_count(void); /* KO inbound ring full (peer -> no ACK) */
+extern uint64 cluster_ko_origin_checkpoint_restart_count(const char *reason);
+extern uint64 cluster_ko_origin_checkpoint_wait_count(const char *reason);
+extern const char *cluster_ko_origin_checkpoint_reason_name(
+	ClusterKoOriginCheckpointReason reason);
 
 #endif /* !FRONTEND */
 

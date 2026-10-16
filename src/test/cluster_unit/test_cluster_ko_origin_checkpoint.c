@@ -9,6 +9,13 @@ int ko_stop_fixture_main(void);
 static RelationData origin_relation;
 static bool origin_cursor_drift;
 
+/* The AM04 diagnostic surface is intentionally queried by reason name so the
+ * unit test proves that the production loop records the predicate which sent
+ * it back to the latch.  These declarations are RED until the shared dump
+ * accessors are added. */
+extern uint64 cluster_ko_origin_checkpoint_restart_count(const char *reason);
+extern uint64 cluster_ko_origin_checkpoint_wait_count(const char *reason);
+
 static void
 prepare_origin(void)
 {
@@ -140,6 +147,22 @@ UT_TEST(test_origin_waits_for_local_protocol_and_physical_ack_owners)
 		UT_ASSERT_EQ(local_relation_scan_calls, 2);
 		native_fixture_shared_memory_end();
 	}
+}
+
+UT_TEST(test_origin_checkpoint_publishes_pi_scan_restart_reason)
+{
+	uint64 restart_before, wait_before;
+
+	prepare_origin();
+	restart_before = cluster_ko_origin_checkpoint_restart_count("pi_scan_pending");
+	wait_before = cluster_ko_origin_checkpoint_wait_count("pi_scan_pending");
+	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_PENDING;
+	local_writeback_closed = false;
+	origin_wait_hook = finish_origin_local_owners;
+	run_origin(CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+	UT_ASSERT(cluster_ko_origin_checkpoint_restart_count("pi_scan_pending") > restart_before);
+	UT_ASSERT(cluster_ko_origin_checkpoint_wait_count("pi_scan_pending") > wait_before);
+	native_fixture_shared_memory_end();
 }
 
 static ClusterBufferDrainResult
@@ -296,12 +319,13 @@ UT_TEST(test_in_place_truncate_keeps_its_original_origin_path)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_origin_joins_checkpoint_before_native_producer_returns);
 	UT_RUN(test_origin_fence_blocks_new_work_while_old_work_drains);
 	UT_RUN(test_origin_cancel_retains_accepted_operation_without_closed_result);
 	UT_RUN(test_origin_sync_error_cannot_invalidate_or_publish_local_closed);
 	UT_RUN(test_origin_waits_for_local_protocol_and_physical_ack_owners);
+	UT_RUN(test_origin_checkpoint_publishes_pi_scan_restart_reason);
 	UT_RUN(test_origin_resumes_bounded_prefix_only_under_the_same_gate);
 	UT_RUN(test_only_exact_native_space_writer_can_enter_after_old_data_closed);
 	UT_RUN(test_origin_rechecks_atomic_gate_at_closed_publication);

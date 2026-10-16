@@ -260,6 +260,9 @@ typedef struct ClusterKoShared {
 	pg_atomic_uint64 lockfail_count;	 /* KO(X) acquire failed (best-effort; barrier ran) */
 	pg_atomic_uint64 peer_apply_count;	 /* flush+drop applied + ACK'd (peer) */
 	pg_atomic_uint64 inbound_full_count; /* KO inbound ring full (peer -> no ACK) */
+	pg_atomic_uint64 origin_checkpoint_restart_count[CLUSTER_KO_ORIGIN_REASON_COUNT];
+	pg_atomic_uint64 origin_checkpoint_wait_count[CLUSTER_KO_ORIGIN_REASON_COUNT];
+	pg_atomic_uint64 origin_checkpoint_logged_mask;
 	pg_atomic_uint32 inbound_head;		 /* consumer (SI Broadcaster aux) */
 	pg_atomic_uint32 inbound_tail;		 /* producer (LMON IC handler) */
 	ClusterKoInboundSlot inbound[CLUSTER_KO_INBOUND_CAPACITY];
@@ -502,6 +505,11 @@ cluster_ko_shmem_init(void)
 		pg_atomic_init_u64(&ko_state->lockfail_count, 0);
 		pg_atomic_init_u64(&ko_state->peer_apply_count, 0);
 		pg_atomic_init_u64(&ko_state->inbound_full_count, 0);
+		for (int i = 0; i < CLUSTER_KO_ORIGIN_REASON_COUNT; i++) {
+			pg_atomic_init_u64(&ko_state->origin_checkpoint_restart_count[i], 0);
+			pg_atomic_init_u64(&ko_state->origin_checkpoint_wait_count[i], 0);
+		}
+		pg_atomic_init_u64(&ko_state->origin_checkpoint_logged_mask, 0);
 		pg_atomic_init_u32(&ko_state->inbound_head, 0);
 		pg_atomic_init_u32(&ko_state->inbound_tail, 0);
 		SpinLockInit(&ko_state->shared_lock);
@@ -591,6 +599,62 @@ uint64
 cluster_ko_inbound_full_count(void)
 {
 	return ko_state != NULL ? pg_atomic_read_u64(&ko_state->inbound_full_count) : 0;
+}
+
+static const char *const ko_origin_checkpoint_reason_names[CLUSTER_KO_ORIGIN_REASON_COUNT] = {
+	[CLUSTER_KO_ORIGIN_REASON_PROGRESS] = "progress",
+	[CLUSTER_KO_ORIGIN_REASON_CUT_CURRENT] = "cut_current",
+	[CLUSTER_KO_ORIGIN_REASON_PEER_REVISION] = "peer_revision",
+	[CLUSTER_KO_ORIGIN_REASON_GATE_NOT_OPEN] = "gate_not_open",
+	[CLUSTER_KO_ORIGIN_REASON_GATE_CHANGED] = "gate_changed",
+	[CLUSTER_KO_ORIGIN_REASON_CTRC_NOT_READY] = "ctrc_not_ready",
+	[CLUSTER_KO_ORIGIN_REASON_CLEANER_PENDING] = "cleaner_pending",
+	[CLUSTER_KO_ORIGIN_REASON_EXTEND_PENDING] = "extend_pending",
+	[CLUSTER_KO_ORIGIN_REASON_DRAIN_WAIT] = "drain_wait",
+	[CLUSTER_KO_ORIGIN_REASON_DRAIN_MORE] = "drain_more",
+	[CLUSTER_KO_ORIGIN_REASON_DRAIN_REDIRTIED] = "drain_redirtied",
+	[CLUSTER_KO_ORIGIN_REASON_PI_SCAN_PENDING] = "pi_scan_pending",
+	[CLUSTER_KO_ORIGIN_REASON_PI_SCAN_MORE] = "pi_scan_more",
+	[CLUSTER_KO_ORIGIN_REASON_WB_NOT_CLOSED] = "wb_not_closed",
+	[CLUSTER_KO_ORIGIN_REASON_WB_REVISION] = "wb_revision",
+	[CLUSTER_KO_ORIGIN_REASON_CONTEXT_CHANGED] = "context_changed"
+};
+
+const char *
+cluster_ko_origin_checkpoint_reason_name(ClusterKoOriginCheckpointReason reason)
+{
+	return reason < CLUSTER_KO_ORIGIN_REASON_COUNT
+		? ko_origin_checkpoint_reason_names[reason]
+		: "unknown";
+}
+
+static int
+ko_origin_checkpoint_reason_from_name(const char *name)
+{
+	if (name == NULL)
+		return -1;
+	for (int i = 0; i < CLUSTER_KO_ORIGIN_REASON_COUNT; i++)
+		if (strcmp(name, ko_origin_checkpoint_reason_names[i]) == 0)
+			return i;
+	return -1;
+}
+
+uint64
+cluster_ko_origin_checkpoint_restart_count(const char *reason)
+{
+	int index = ko_origin_checkpoint_reason_from_name(reason);
+	return ko_state != NULL && index >= 0
+		? pg_atomic_read_u64(&ko_state->origin_checkpoint_restart_count[index])
+		: 0;
+}
+
+uint64
+cluster_ko_origin_checkpoint_wait_count(const char *reason)
+{
+	int index = ko_origin_checkpoint_reason_from_name(reason);
+	return ko_state != NULL && index >= 0
+		? pg_atomic_read_u64(&ko_state->origin_checkpoint_wait_count[index])
+		: 0;
 }
 
 
@@ -3697,6 +3761,40 @@ ko_origin_checkpoint_cut_current(const ClusterKoCompletionV2 *owned,
 		&& memcmp(gate, &current, sizeof(current)) == 0;
 }
 
+/* Record one exact local predicate without making the observation an
+ * authority.  Counters live in the existing KO dump region; the first log
+ * per reason is guarded by a shared bit so concurrent origin backends do not
+ * turn a diagnosis into a log storm. */
+static void
+ko_origin_checkpoint_record(ClusterKoOriginCheckpointReason reason, bool wait,
+	RelFileLocator locator, uint8 phase, uint32 cursor, uint64 revision,
+	uint64 saved_revision, uint64 wb_revision, const ResourceXGateSnapshot *gate)
+{
+	uint64 bit, previous;
+
+	if (ko_state == NULL || reason >= CLUSTER_KO_ORIGIN_REASON_COUNT)
+		return;
+	if (wait)
+		(void)pg_atomic_fetch_add_u64(&ko_state->origin_checkpoint_wait_count[reason], 1);
+	else
+		(void)pg_atomic_fetch_add_u64(&ko_state->origin_checkpoint_restart_count[reason], 1);
+	bit = UINT64CONST(1) << reason;
+	previous = pg_atomic_fetch_or_u64(&ko_state->origin_checkpoint_logged_mask, bit);
+	if ((previous & bit) == 0) {
+		uint32 gate_phase = gate != NULL ? gate->phase : UINT32_MAX;
+		uint64 formation = gate != NULL ? gate->formation : 0;
+		uint64 freeze_generation = gate != NULL ? gate->freeze_generation : 0;
+
+		ereport(LOG,
+			(errmsg("native DROP origin checkpoint %s reason=%s locator=%u/%u/%u phase=%u cursor=%u revision=" UINT64_FORMAT " saved_revision=" UINT64_FORMAT " wb_revision=" UINT64_FORMAT " gate_phase=%u gate_formation=" UINT64_FORMAT " gate_freeze=" UINT64_FORMAT,
+				wait ? "wait" : "restart",
+				cluster_ko_origin_checkpoint_reason_name(reason),
+				locator.spcOid, locator.dbOid, locator.relNumber,
+				phase, cursor, revision, saved_revision, wb_revision,
+				gate_phase, formation, freeze_generation)));
+	}
+}
+
 /* Same object checkpoint, local execution: no self REQUEST/READY and no
  * terminal or file-delete proof. Stack cursors cannot survive ERROR/cancel.
  * The original shared operation retains admission/AX responsibility. */
@@ -3709,6 +3807,7 @@ ko_native_origin_checkpoint(ClusterKoCompletionV2 *owned)
 	uint32 cursor = 0;
 	uint8 phase = 0;
 	bool armed = false;
+	ClusterKoOriginCheckpointReason wait_reason = CLUSTER_KO_ORIGIN_REASON_PROGRESS;
 	RelFileLocator locator;
 
 	if (!ko_origin_checkpoint_snapshot(owned, &before))
@@ -3734,35 +3833,83 @@ ko_native_origin_checkpoint(ClusterKoCompletionV2 *owned)
 		uint64 revision, wb_revision = 0;
 		uint32 budget = 128;
 		SMgrRelation smgr;
-		bool finite, closed = false;
+		bool gate_observed, ctrc_ready, cleaner_pending, extend_pending, closed = false;
+
+		wait_reason = CLUSTER_KO_ORIGIN_REASON_PROGRESS;
 
 		CHECK_FOR_INTERRUPTS();
 		if (!ko_origin_checkpoint_snapshot(owned, &before) || !before.origin_checkpoint)
 			goto invalid;
 		revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
-		if (revision == 0 || revision == UINT64_MAX
-			|| !cluster_pcm_lock_resource_x_gate_snapshot(&gate)
-			|| gate.phase != RESOURCE_X_GATE_OPEN
-			|| !cluster_ctrc_relation_removal_ready_shared(locator.spcOid, locator.dbOid,
-				locator.relNumber))
+		gate_observed = cluster_pcm_lock_resource_x_gate_snapshot(&gate);
+		ctrc_ready = cluster_ctrc_relation_removal_ready_shared(locator.spcOid, locator.dbOid,
+			locator.relNumber);
+		if (revision == 0 || revision == UINT64_MAX) {
+			wait_reason = CLUSTER_KO_ORIGIN_REASON_PEER_REVISION;
+			ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
+					saved_revision, wb_revision, gate_observed ? &gate : NULL);
 			goto restart;
+		}
+		if (!gate_observed || gate.phase != RESOURCE_X_GATE_OPEN) {
+			wait_reason = CLUSTER_KO_ORIGIN_REASON_GATE_NOT_OPEN;
+			ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
+					saved_revision, wb_revision, gate_observed ? &gate : NULL);
+			goto restart;
+		}
+		if (!ctrc_ready) {
+			wait_reason = CLUSTER_KO_ORIGIN_REASON_CTRC_NOT_READY;
+			ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
+					saved_revision, wb_revision, &gate);
+			goto restart;
+		}
+		if (saved_revision != 0 && revision != saved_revision) {
+			wait_reason = CLUSTER_KO_ORIGIN_REASON_PEER_REVISION;
+			ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
+				saved_revision, wb_revision, &gate);
+		}
+		if (saved_revision != 0 && memcmp(&saved_gate, &gate, sizeof(gate)) != 0) {
+			wait_reason = CLUSTER_KO_ORIGIN_REASON_GATE_CHANGED;
+			ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
+				saved_revision, wb_revision, &gate);
+		}
 		if (revision != saved_revision || memcmp(&saved_gate, &gate, sizeof(gate)) != 0) {
 			phase = 0;
 			cursor = 0;
 		}
 		SpinLockAcquire(&ko_state->shared_lock);
-		finite = ko_cleaner_pending_locked(locator) || ko_extend_pending_locked(locator);
+		cleaner_pending = ko_cleaner_pending_locked(locator);
+		extend_pending = ko_extend_pending_locked(locator);
 		SpinLockRelease(&ko_state->shared_lock);
-		if (finite || !ko_origin_checkpoint_cut_current(owned, &before, revision, &gate))
+		if (cleaner_pending) {
+			wait_reason = CLUSTER_KO_ORIGIN_REASON_CLEANER_PENDING;
+			ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
+					saved_revision, wb_revision, &gate);
+		}
+		if (extend_pending) {
+			wait_reason = CLUSTER_KO_ORIGIN_REASON_EXTEND_PENDING;
+			ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
+					saved_revision, wb_revision, &gate);
+		}
+		if (cleaner_pending || extend_pending)
 			goto restart;
+		if (!ko_origin_checkpoint_cut_current(owned, &before, revision, &gate)) {
+			wait_reason = CLUSTER_KO_ORIGIN_REASON_CUT_CURRENT;
+			ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
+					saved_revision, wb_revision, &gate);
+			goto restart;
+		}
 		smgr = smgropen(locator, InvalidBackendId);
 		while (phase < 3 && budget > 0) {
 			if (phase == 1) {
 				for (ForkNumber fork = MAIN_FORKNUM; fork <= MAX_FORKNUM; fork++) {
 					if (smgrexists(smgr, fork))
 						smgrimmedsync(smgr, fork);
-					if (!ko_origin_checkpoint_cut_current(owned, &before, revision, &gate))
+					if (!ko_origin_checkpoint_cut_current(owned, &before, revision, &gate)) {
+						wait_reason = CLUSTER_KO_ORIGIN_REASON_CUT_CURRENT;
+						ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor,
+							revision, saved_revision, wb_revision, &gate);
 						goto restart;
+					}
 				}
 				phase = 2;
 			} else {
@@ -3771,15 +3918,26 @@ ko_native_origin_checkpoint(ClusterKoCompletionV2 *owned)
 					= cluster_bufmgr_drain_relation_v3(smgr, phase == 0, &budget, &cursor);
 				if (budget > remaining || cursor < start || cursor - start > remaining - budget)
 					goto invalid;
-				if (!ko_origin_checkpoint_cut_current(owned, &before, revision, &gate))
+				if (!ko_origin_checkpoint_cut_current(owned, &before, revision, &gate)) {
+					wait_reason = CLUSTER_KO_ORIGIN_REASON_CUT_CURRENT;
+					ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
+						saved_revision, wb_revision, &gate);
 					goto restart;
+				}
 				if (result == CLUSTER_BUFFER_DRAIN_EMPTY) {
 					phase++;
 					cursor = 0;
-				} else if (result == CLUSTER_BUFFER_DRAIN_REDIRTIED && phase == 2)
+				} else if (result == CLUSTER_BUFFER_DRAIN_REDIRTIED && phase == 2) {
+					wait_reason = CLUSTER_KO_ORIGIN_REASON_DRAIN_REDIRTIED;
+					ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
+						saved_revision, wb_revision, &gate);
 					goto restart;
-				else if (result == CLUSTER_BUFFER_DRAIN_WAIT || result == CLUSTER_BUFFER_DRAIN_MORE)
+				} else if (result == CLUSTER_BUFFER_DRAIN_WAIT || result == CLUSTER_BUFFER_DRAIN_MORE) {
+					wait_reason = result == CLUSTER_BUFFER_DRAIN_WAIT
+						? CLUSTER_KO_ORIGIN_REASON_DRAIN_WAIT
+						: CLUSTER_KO_ORIGIN_REASON_DRAIN_MORE;
 					break;
+				}
 				else
 					goto invalid;
 			}
@@ -3788,35 +3946,70 @@ ko_native_origin_checkpoint(ClusterKoCompletionV2 *owned)
 			uint32 start = cursor;
 			ClusterPcmPiRelationScanV2 scan
 				= cluster_pcm_lock_ko_local_relation_scan_v3(locator, gate.formation, 128, &cursor);
-			if (scan == CLUSTER_PCM_PI_RELATION_PENDING)
+			if (scan == CLUSTER_PCM_PI_RELATION_PENDING) {
+				wait_reason = CLUSTER_KO_ORIGIN_REASON_PI_SCAN_PENDING;
+				ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
+					saved_revision, wb_revision, &gate);
 				goto restart;
+			}
 			if (scan != CLUSTER_PCM_PI_RELATION_EMPTY
 				&& (scan != CLUSTER_PCM_PI_RELATION_MORE || cursor <= start || cursor - start > 128))
 				goto invalid;
 			if (scan == CLUSTER_PCM_PI_RELATION_EMPTY) {
 				if (!cluster_pi_writeback_local_relation_closed_v3(locator, before.request.epoch,
-						&wb_revision))
+						&wb_revision)) {
+					wait_reason = CLUSTER_KO_ORIGIN_REASON_WB_NOT_CLOSED;
+					ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
+						saved_revision, wb_revision, &gate);
 					goto restart;
+				}
 				closed = true;
-			}
+			} else
+				wait_reason = CLUSTER_KO_ORIGIN_REASON_PI_SCAN_MORE;
 		}
-		if (!ko_origin_checkpoint_cut_current(owned, &before, revision, &gate))
+		if (!ko_origin_checkpoint_cut_current(owned, &before, revision, &gate)) {
+			wait_reason = CLUSTER_KO_ORIGIN_REASON_CUT_CURRENT;
+			ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
+				saved_revision, wb_revision, &gate);
 			goto restart;
+		}
 		if (closed) {
-			ResourceXGateSnapshot final_gate;
-			if (!cluster_ctrc_relation_removal_ready_shared(locator.spcOid, locator.dbOid,
-					locator.relNumber)
-				|| !cluster_pi_writeback_local_revision_current_v3(wb_revision))
+			ResourceXGateSnapshot final_gate_snapshot;
+			bool final_ctrc_ready;
+			bool final_wb_current;
+			bool final_peer_revision = false;
+			bool final_context = false;
+			bool final_cleaner = false;
+			bool final_extend = false;
+			bool final_gate_current = false;
+
+			final_ctrc_ready = cluster_ctrc_relation_removal_ready_shared(locator.spcOid,
+				locator.dbOid, locator.relNumber);
+			final_wb_current = cluster_pi_writeback_local_revision_current_v3(wb_revision);
+			if (!final_ctrc_ready) {
+				wait_reason = CLUSTER_KO_ORIGIN_REASON_CTRC_NOT_READY;
+				ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
+					saved_revision, wb_revision, &gate);
+			}
+			if (!final_wb_current) {
+				wait_reason = CLUSTER_KO_ORIGIN_REASON_WB_REVISION;
+				ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
+					saved_revision, wb_revision, &gate);
+			}
+			if (!final_ctrc_ready || !final_wb_current)
 				goto restart;
 			SpinLockAcquire(&ko_state->shared_lock);
-			closed = revision < UINT64_MAX - 1
-				&& pg_atomic_read_u64(&ko_state->peer_admission_revision) == revision
-				&& memcmp(&ko_state->contexts[owned->slot], &before, sizeof(before)) == 0
-				&& !ko_cleaner_pending_locked(locator) && !ko_extend_pending_locked(locator)
-				&& cluster_pi_writeback_local_revision_current_v3(wb_revision)
-				/* Original bounded atomic reader; no PCM/CF lock under KO. */
-				&& cluster_pcm_lock_resource_x_gate_snapshot(&final_gate)
-				&& memcmp(&final_gate, &gate, sizeof(gate)) == 0;
+			final_peer_revision = revision < UINT64_MAX - 1
+				&& pg_atomic_read_u64(&ko_state->peer_admission_revision) == revision;
+			final_context = memcmp(&ko_state->contexts[owned->slot], &before, sizeof(before)) == 0;
+			final_cleaner = !ko_cleaner_pending_locked(locator);
+			final_extend = !ko_extend_pending_locked(locator);
+			final_wb_current = cluster_pi_writeback_local_revision_current_v3(wb_revision);
+			/* Original bounded atomic reader; no PCM/CF lock under KO. */
+			final_gate_current = cluster_pcm_lock_resource_x_gate_snapshot(&final_gate_snapshot)
+				&& memcmp(&final_gate_snapshot, &gate, sizeof(gate)) == 0;
+			closed = final_peer_revision && final_context && final_cleaner && final_extend
+				&& final_wb_current && final_gate_current;
 			if (closed) {
 				ko_state->contexts[owned->slot].origin_data_closed = true;
 				owned->origin_data_closed = true;
@@ -3825,6 +4018,36 @@ ko_native_origin_checkpoint(ClusterKoCompletionV2 *owned)
 			SpinLockRelease(&ko_state->shared_lock);
 			if (closed)
 				return;
+			if (!final_peer_revision) {
+				wait_reason = CLUSTER_KO_ORIGIN_REASON_PEER_REVISION;
+				ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
+					saved_revision, wb_revision, &gate);
+			}
+			if (!final_context) {
+				wait_reason = CLUSTER_KO_ORIGIN_REASON_CONTEXT_CHANGED;
+				ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
+					saved_revision, wb_revision, &gate);
+			}
+			if (!final_cleaner) {
+				wait_reason = CLUSTER_KO_ORIGIN_REASON_CLEANER_PENDING;
+				ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
+					saved_revision, wb_revision, &gate);
+			}
+			if (!final_extend) {
+				wait_reason = CLUSTER_KO_ORIGIN_REASON_EXTEND_PENDING;
+				ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
+					saved_revision, wb_revision, &gate);
+			}
+			if (!final_wb_current) {
+				wait_reason = CLUSTER_KO_ORIGIN_REASON_WB_REVISION;
+				ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
+					saved_revision, wb_revision, &gate);
+			}
+			if (!final_gate_current) {
+				wait_reason = CLUSTER_KO_ORIGIN_REASON_GATE_CHANGED;
+				ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
+					saved_revision, wb_revision, &gate);
+			}
 			goto restart;
 		}
 		saved_gate = gate;
@@ -3835,6 +4058,9 @@ ko_native_origin_checkpoint(ClusterKoCompletionV2 *owned)
 		cursor = 0;
 		saved_revision = 0;
 	wait:
+		ko_origin_checkpoint_record(wait_reason, true, locator, phase, cursor,
+			revision, saved_revision, wb_revision,
+			gate_observed ? &gate : NULL);
 		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 100L,
 			WAIT_EVENT_CLUSTER_OBJECT_FLUSH_WAIT);
 		ResetLatch(MyLatch);
