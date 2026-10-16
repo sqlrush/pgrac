@@ -1356,7 +1356,11 @@ UT_TEST(test_native_side_dispatch_rejects_wrong_kind_and_family)
 {
 	for (uint32 fault = 0; fault < 9; fault++) {
 		ClusterColdRecordV1 record;
-		ClusterColdTypedV1 *typed = control_fixture(&record);
+		ClusterColdTypedV1 *typed;
+
+		if (fault == 5)
+			continue; /* native COMMIT is now covered by the positive route test */
+		typed = control_fixture(&record);
 		side_record_fixture(&record, RM_CLOG_ID, CLOG_ZEROPAGE,
 							RF_SIDE_ONLINE_OPERATION_PROJECTION);
 		switch (fault) {
@@ -1543,10 +1547,27 @@ UT_TEST(test_native_abort_dispatch_matches_exact_captured_kind)
 	}
 }
 
+UT_TEST(test_native_commit_dispatch_selects_exact_consumer)
+{
+	ClusterColdRecordV1 record;
+	ClusterColdTypedV1 *typed = control_fixture_mode(&record, true);
+
+	side_record_fixture(&record, RM_XACT_ID, XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO,
+						RF_SIDE_ONLINE_OPERATION_XACT);
+	side_fixture[1].operations[1].xact.kind = RF_SIDE_XACT_COMMIT;
+	UT_ASSERT(consume_control(typed, &record));
+	UT_ASSERT_EQ(control_calls, 1);
+	UT_ASSERT_EQ(control_selected, 1);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	cluster_cold_replay_window_leave_v1();
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
 int
 main(void)
 {
-	UT_PLAN(45);
+	UT_PLAN(46);
+	UT_RUN(test_native_commit_dispatch_selects_exact_consumer);
 	UT_RUN(test_native_abort_dispatch_matches_exact_captured_kind);
 	UT_RUN(test_undo_dispatch_selects_exact_record_and_keeps_space_proof);
 	UT_RUN(test_undo_dispatch_rejects_wrong_identity_or_unowned_effect);

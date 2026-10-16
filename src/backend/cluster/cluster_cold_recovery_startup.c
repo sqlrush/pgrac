@@ -888,7 +888,10 @@ cold_record_side_kind(const ClusterColdRecordV1 *record)
 			|| info == XLOG_UNDO_SEGMENT_RECYCLE || info == XLOG_UNDO_TT_SLOT_BIND
 			|| info == XLOG_UNDO_TT_SLOT_SET_HEAD || info == XLOG_UNDO_TT_SLOT_ABORT))
 		return RF_SIDE_ONLINE_OPERATION_UNDO;
-	if (record->rmid == RM_XACT_ID && info == XLOG_XACT_ABORT)
+	/* Ordered native XACT completion is consumed by the existing cold owner;
+	 * prepared/2PC variants stay outside this route and fail closed. */
+	if (record->rmid == RM_XACT_ID
+		&& (info == XLOG_XACT_COMMIT || info == XLOG_XACT_ABORT))
 		return RF_SIDE_ONLINE_OPERATION_XACT;
 	if ((record->rmid == RM_CLOG_ID && (info == CLOG_ZEROPAGE || info == CLOG_TRUNCATE))
 		|| (record->rmid == RM_MULTIXACT_ID
