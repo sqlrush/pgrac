@@ -2269,7 +2269,7 @@ wb_batch_storage(uint32 index, const RfPageOnlinePlanV1 *page)
 		target.database_incarnation = wb_batch->local.claim.database_incarnation;
 		target.identity = view.page_identity;
 		target.version = view.expected_result;
-		return cluster_bufmgr_observe_pi_storage_v1(&target, &wb_batch->storage_cuts[index], page,
+		return cluster_bufmgr_observe_pi_storage_plan_v1(&target, &wb_batch->storage_cuts[index], wb_batch->plan,
 													wb_batch->sources, wb_batch->source_count,
 													&wb_batch->receipts[index]);
 	}

@@ -143,6 +143,9 @@ typedef struct ClusterKoSharedContext {
 	uint64 serial;
 	uint32 drop_identity;
 	uint64 drop_identity_serial;
+	/* Borrowed original committed carrier, valid only before I/O closing.
+	 * Its allocation cannot be freed while a directory call is entered. */
+	dsa_pointer pi_native_owner;
 	ClusterKoSharedMessageV2 request;
 	ClusterKoSharedMessageV3 request_v3;
 	uint64 peer_boots[CLUSTER_KO_SHARED_NODE_LIMIT];
@@ -369,6 +372,8 @@ static void ko_shared_xact_event(XactEvent event, void *arg);
 static bool ko_shared_v3_local_binding_current(const ClusterKoSharedMessageV3 *request);
 static bool ko_shared_v3_space_matches(const ClusterKoSharedMessageV3 *message,
 									   const ClusterSpaceIdentity *identity);
+static dsa_area *ko_native_attach(void);
+static bool ko_shared_ready_v3(const ClusterKoSharedContext *context);
 
 /* Process-local storage state belongs to the original active KO context.
  * It survives a checkpointer ERROR, but can never migrate to another process. */
@@ -1172,6 +1177,192 @@ cluster_ko_directory_io_end_v3(const ClusterKoDirectoryIoV3 *scope)
 		cluster_sinval_set_proc_latch();
 	return ended;
 }
+
+
+/* No external owner/route lookup under this lock. Both sampling and final
+ * consumption select the same unique original operation and entered call. */
+static bool
+ko_pi_storage_identity_locked(const ClusterSpaceIdentityKey *key,
+	const uint8 incarnation[16], const ClusterKoDirectoryIoV3 *call,
+	ClusterKoPiStorageIdentityV3 *out)
+{
+	ClusterKoPiStorageIdentityV3 selected = {0};
+	const KoDirectoryIo *entered;
+	bool found = false;
+	uint64 revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+
+	if (call->slot >= CLUSTER_KO_SHARED_CAPACITY || call->serial == 0
+		|| call->pid != MyProcPid || revision == 0 || revision == UINT64_MAX
+		|| ko_drop_closed_locked(key->locator))
+		return false;
+	entered = &ko_state->directory_io[call->slot];
+	if (entered->serial != call->serial || entered->pid != call->pid
+		|| !RelFileLocatorEquals(entered->locator, key->locator))
+		return false;
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		const ClusterKoSharedContext *origin = &ko_state->contexts[i];
+		const ClusterKoPeerFenceV3 *peer = &ko_state->peer_fences[i];
+		const ClusterKoSharedMessageV3 *request = NULL;
+		bool local_origin = false;
+		uint64 serial = 0, route = 0;
+		ClusterKoPeerFenceStateV3 state = CLUSTER_KO_PEER_FENCE_EMPTY;
+
+		if (origin->used && RelFileLocatorEquals(origin->request.key.locator, key->locator)) {
+			KoDropIdentity *identity = ko_origin_drop_identity_locked(origin);
+			bool native = DsaPointerIsValid(origin->pi_native_owner);
+
+			if (!origin->v3 || origin->origin_detached || origin->ax_release_requested
+				|| origin->ax_failed || origin->cancel_sqlerrcode != 0
+				|| origin->request_failed_peers != 0 || origin->structure_owned
+				|| (native ? (!origin->complete || origin->drop_identity != 0
+							|| origin->drop_identity_serial != 0)
+					: (identity == NULL || identity->state != KO_DROP_IDENTITY_RESERVED))
+				|| origin->request_v3.base.origin_node != cluster_node_id
+				|| memcmp(&origin->request, &origin->request_v3.base, sizeof(origin->request)) != 0)
+				return false;
+			request = &origin->request_v3;
+			serial = origin->serial;
+			route = request->ax_master_generation;
+			local_origin = true;
+			selected.native_owner = native ? (uint64)origin->pi_native_owner : 0;
+		}
+		if (peer->state != CLUSTER_KO_PEER_FENCE_EMPTY
+			&& RelFileLocatorEquals(peer->request.base.key.locator, key->locator)) {
+			uint8 encoded[CLUSTER_KO_SHARED_V3_BYTES];
+
+			if (request != NULL
+				|| (peer->state != CLUSTER_KO_PEER_FENCE_ACTIVE
+					&& peer->state != CLUSTER_KO_PEER_FENCE_READY)
+				|| peer->failure_sqlerrcode != 0 || peer->request.base.peer_node != cluster_node_id
+				|| !cluster_ko_shared_encode_v3(&peer->request, encoded, sizeof(encoded))
+				|| memcmp(encoded, peer->encoded, sizeof(encoded)) != 0)
+				return false;
+			request = &peer->request;
+			serial = peer->serial;
+			route = peer->peer_route_generation;
+			state = peer->state;
+		}
+		if (request == NULL)
+			continue;
+		if (found || serial == 0 || route == 0 || route == UINT64_MAX
+			|| request->base.verb != CLUSTER_KO_SHARED_REQUEST
+			|| request->operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP
+			|| request->base.key.system_identifier != key->system_identifier
+			|| request->base.key.database_incarnation != key->database_incarnation
+			|| memcmp(request->base.key.storage_uuid, key->storage_uuid, 16) != 0
+			|| memcmp(request->base.incarnation, incarnation, 16) != 0)
+			return false;
+		selected.request = *request;
+		selected.call = *call;
+		selected.serial = serial;
+		selected.route_generation = route;
+		selected.admission_revision = revision;
+		selected.slot = i;
+		selected.state = state;
+		selected.origin = local_origin;
+		found = true;
+	}
+	if (!found)
+		return false;
+	*out = selected;
+	return true;
+}
+
+static bool
+ko_pi_storage_role(void)
+{
+	return cluster_enabled && cluster_shared_config && ko_state != NULL
+		&& cluster_interconnect_tier == CLUSTER_IC_TIER_1 && !RecoveryInProgress()
+		&& MyBackendType == B_CHECKPOINTER && MyProcPid > 0
+		&& CurrentResourceOwner != NULL && CritSectionCount == 0;
+}
+
+static bool
+ko_pi_storage_same_locked(const ClusterKoPiStorageIdentityV3 *sample)
+{
+	ClusterKoPiStorageIdentityV3 now;
+
+	return ko_pi_storage_identity_locked(&sample->request.base.key,
+										sample->request.base.incarnation, &sample->call, &now)
+		&& now.serial == sample->serial && now.slot == sample->slot
+		&& now.route_generation == sample->route_generation
+		&& now.admission_revision == sample->admission_revision
+		&& now.state == sample->state && now.origin == sample->origin
+		&& now.native_owner == sample->native_owner
+		&& memcmp(&now.request, &sample->request, sizeof(now.request)) == 0;
+}
+
+static bool
+ko_pi_storage_native_current_locked(const ClusterKoPiStorageIdentityV3 *sample,
+	const ClusterKoNativeContinuation *work)
+{
+	const ClusterKoSharedContext *origin;
+	KoDropIdentity *identity;
+	if (sample->native_owner == 0)
+		return work == NULL;
+	if (!sample->origin || sample->slot >= CLUSTER_KO_SHARED_CAPACITY || work == NULL)
+		return false;
+	origin = &ko_state->contexts[sample->slot];
+	identity = ko_origin_drop_identity_locked(&work->context);
+	return !work->recovery_required && !work->buffers_released
+		&& work->context.used && work->context.complete && work->context.structure_owned
+		&& work->context.structure_drop_pending && !work->context.structure_drop_failed
+		&& work->context.pid == origin->pid && work->context.serial == sample->serial
+		&& memcmp(&work->context.request_v3, &sample->request, sizeof(sample->request)) == 0
+		&& memcmp(work->context.peer_boots, origin->peer_boots, sizeof(origin->peer_boots)) == 0
+		&& ko_shared_ready_v3(&work->context)
+		&& identity != NULL && identity->state == KO_DROP_IDENTITY_RESERVED;
+}
+
+bool
+cluster_ko_pi_storage_identity_current_v3(const ClusterKoPiStorageIdentityV3 *sample)
+{
+	bool valid;
+	const ClusterKoNativeContinuation *work = NULL;
+
+	if (sample == NULL || !ko_pi_storage_role())
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	valid = ko_pi_storage_same_locked(sample);
+	SpinLockRelease(&ko_state->shared_lock);
+	if (!valid)
+		return false;
+	/* Mapping is outside the spinlock. This checkpointer is the original
+	 * promoter; normal free requires all entered calls to drain, and an
+	 * abandoned carrier remains in the original failed list. */
+	if (sample->native_owner != 0)
+		work = dsa_get_address(ko_native_attach(), (dsa_pointer)sample->native_owner);
+	SpinLockAcquire(&ko_state->shared_lock);
+	valid = ko_pi_storage_same_locked(sample) && ko_pi_storage_native_current_locked(sample, work);
+	SpinLockRelease(&ko_state->shared_lock);
+	if (!valid || !ko_shared_v3_control_at_generation(&sample->request, sample->route_generation))
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	valid = ko_pi_storage_same_locked(sample) && ko_pi_storage_native_current_locked(sample, work);
+	SpinLockRelease(&ko_state->shared_lock);
+	return valid;
+}
+
+bool
+cluster_ko_pi_storage_identity_v3(const ClusterSpaceIdentityKey *key,
+	const uint8 incarnation[16], const ClusterKoDirectoryIoV3 *call,
+	ClusterKoPiStorageIdentityV3 *out)
+{
+	ClusterKoPiStorageIdentityV3 sample;
+	bool valid;
+
+	if (key == NULL || incarnation == NULL || call == NULL || out == NULL
+		|| !ko_pi_storage_role())
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	valid = ko_pi_storage_identity_locked(key, incarnation, call, &sample);
+	SpinLockRelease(&ko_state->shared_lock);
+	if (!valid || !cluster_ko_pi_storage_identity_current_v3(&sample))
+		return false;
+	*out = sample;
+	return true;
+}
+
 
 /* Recheck both at admission and at the original physical consumer. A
  * REQUEST already in the other inbound ring can outlive its COMMIT marker. */
@@ -3743,6 +3934,10 @@ ko_native_publish(ClusterKoCompletionV2 *owned, bool from_commit_tail)
 			 * reservation. The original AX result cannot recycle it. */
 			origin->drop_identity = 0;
 			origin->drop_identity_serial = 0;
+			/* Preserve the exact carrier across COMMIT-to-publication. This
+			 * borrow creates no work and is never followed after I/O closing. */
+			if (qualified)
+				origin->pi_native_owner = owned->native_allocation;
 		}
 	}
 	if (work->recovery_required)

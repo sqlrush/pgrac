@@ -77,6 +77,8 @@ extern uint32
 cluster_thread_recovery_fabric_participant_count_v1(const ClusterThreadRecoveryFabricPlanV1 *plan);
 extern bool cluster_thread_recovery_fabric_replay_allowed_v1(
 	const ClusterThreadRecoveryFabricPlanV1 *plan);
+extern bool cluster_thread_recovery_fabric_pi_contributions_v1(
+	const ClusterThreadRecoveryFabricPlanV1 *plan);
 extern bool
 cluster_thread_recovery_fabric_identity_matches_v1(const ClusterThreadRecoveryFabricPlanV1 *plan,
 												   uint64 system_identifier,

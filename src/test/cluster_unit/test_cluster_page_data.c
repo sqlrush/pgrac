@@ -119,6 +119,35 @@ cluster_ko_directory_io_end_v3(const ClusterKoDirectoryIoV3 *scope)
 	return true;
 }
 
+/* KO's exact snapshot/marker races run in test_cluster_ko_drop_io. Here
+ * this module boundary supplies a qualified original operation only. */
+static bool pi_drop_available, pi_drop_current, pi_drop_sampled, pi_drop_expire_sync;
+static ClusterKoSharedMessageV3 pi_drop_request;
+
+bool
+cluster_ko_pi_storage_identity_v3(const ClusterSpaceIdentityKey *key,
+	const uint8 incarnation[16], const ClusterKoDirectoryIoV3 *call,
+	ClusterKoPiStorageIdentityV3 *out)
+{
+	if (!pi_drop_available || !pi_drop_current || !directory_io_entered
+		|| call->serial != 717 || !RelFileLocatorEquals(key->locator, pi_drop_request.base.key.locator))
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->request = pi_drop_request;
+	out->call = *call;
+	out->serial = 19;
+	pi_drop_sampled = true;
+	return true;
+}
+
+bool
+cluster_ko_pi_storage_identity_current_v3(const ClusterKoPiStorageIdentityV3 *sample)
+{
+	return pi_drop_current && !directory_io_denied && directory_io_entered && sample->call.serial == 717
+		&& sample->serial == 19
+		&& memcmp(&sample->request, &pi_drop_request, sizeof(pi_drop_request)) == 0;
+}
+
 static bool redeclare_scan_test;
 static int redeclare_scope = 1;
 static unsigned redeclare_content_attempts;
@@ -804,7 +833,7 @@ smgrimmedsync(SMgrRelation r, ForkNumber f)
 {
 	if (require_data_io_scope)
 		UT_ASSERT(directory_io_entered);
-	UT_ASSERT(!locks[1] && (locks[0] || (storage_read && data_slot == 0)));
+	UT_ASSERT(!locks[1] && (locks[0] || (storage_read && (data_slot == 0 || (pi_drop_sampled && directory_io_entered)))));
 	fault(3);
 	UT_ASSERT_EQ(fsync(fileno(file)), 0);
 	syncs++;
@@ -835,6 +864,8 @@ smgrimmedsync(SMgrRelation r, ForkNumber f)
 		pg_atomic_write_u32(&own[data_slot].flags, PCM_OWN_FLAG_REVOKING);
 	if (storage_cut_changed)
 		storage_cut_current = false;
+	if (pi_drop_expire_sync)
+		pi_drop_current = false;
 	if (storage_space_changed)
 		pg_atomic_fetch_add_u64(&own[0].generation, 1);
 }
@@ -843,7 +874,7 @@ smgrread(SMgrRelation r, ForkNumber f, BlockNumber b, void *out)
 {
 	if (require_data_io_scope)
 		UT_ASSERT(directory_io_entered);
-	UT_ASSERT(!locks[1] && (locks[0] || (storage_read && data_slot == 0))
+	UT_ASSERT(!locks[1] && (locks[0] || (storage_read && (data_slot == 0 || (pi_drop_sampled && directory_io_entered))))
 			  && (storage_read || syncs));
 	fault(storage_read && reads > 0 ? 5 : 4);
 	reads++;
@@ -990,6 +1021,9 @@ reset(void)
 
 	UT_ASSERT(!directory_io_entered);
 	directory_io_denied = false;
+	pi_drop_available = pi_drop_sampled = pi_drop_expire_sync = false;
+	pi_drop_current = true;
+	memset(&pi_drop_request, 0, sizeof(pi_drop_request));
 	require_data_io_scope = false;
 	directory_io_begins = directory_io_ends = 0;
 	receipt_publication_out = NULL;

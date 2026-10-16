@@ -532,10 +532,217 @@ UT_TEST(test_directory_terminal_refuses_unknown_identity_and_runtime_scope)
 	UT_ASSERT(cluster_ko_directory_drop_retired_v3(locator));
 }
 
+
+/* Exact identity consumer, with no SPACE read, remote AX probe or DATA IO. */
+static ClusterKoSharedMessageV3
+pi_identity_peer(ClusterKoDirectoryIoV3 *call, bool ready)
+{
+	ClusterKoSharedMessageV3 request;
+	ClusterKoPeerFenceHandleV3 handle;
+	ClusterKoPeerFenceStateV3 state;
+
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+	CritSectionCount = 0;
+	request = peer_fence_fixture(53000);
+	local_scan_rel_number = request.base.key.locator.relNumber;
+	UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
+	if (ready) {
+		UT_ASSERT(fixture_completed_fence_ready(&request, &handle));
+		fixture_peer_reply_accepted(&storage.peer_fences[handle.slot]);
+	}
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT(cluster_ko_directory_io_begin_v3(request.base.key.locator, call));
+	return request;
+}
+
+UT_TEST(test_pi_identity_accepts_exact_active_and_ready_peer_only_with_call)
+{
+	for (int ready = 0; ready < 2; ready++) {
+		ClusterKoDirectoryIoV3 call;
+		ClusterKoSharedMessageV3 request = pi_identity_peer(&call, ready);
+		ClusterKoPiStorageIdentityV3 sample = {0};
+		unsigned probes = holder_probe_sends;
+		UT_ASSERT(cluster_ko_pi_storage_identity_v3(&request.base.key,
+			request.base.incarnation, &call, &sample));
+		UT_ASSERT(!sample.origin && sample.slot == 0);
+		UT_ASSERT_EQ(sample.serial, storage.peer_fences[0].serial);
+		UT_ASSERT_EQ(sample.route_generation, v3_route_generation);
+		UT_ASSERT_EQ(memcmp(&sample.request, &request, sizeof(request)), 0);
+		UT_ASSERT(cluster_ko_pi_storage_identity_current_v3(&sample));
+		UT_ASSERT_EQ(space_reads + maintenance_space_locks + ordinary_space_locks, 0);
+		UT_ASSERT_EQ(holder_probe_sends, probes);
+		UT_ASSERT(cluster_ko_directory_io_end_v3(&call));
+		UT_ASSERT(!cluster_ko_pi_storage_identity_current_v3(&sample));
+	}
+}
+
+UT_TEST(test_pi_identity_origin_retains_original_slot_after_private_handoff)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(53001);
+	ClusterKoCompletionV2 completion = {0};
+	ClusterKoDirectoryIoV3 call;
+	ClusterKoPiStorageIdentityV3 sample = {0};
+	uint64 boots[16], generation;
+	int slot;
+	request.base.origin_node = 0;
+	request.base.peer_node = 1;
+	request.base.origin_boot = writer.claim.identity.origin_owner_incarnation;
+	request.base.peer_boot = formation.membership.last_admitted_incarnation[1];
+	request.ax_holder.node_id = 0;
+	UT_ASSERT(ko_shared_members(&request.base, boots, &generation));
+	MyBackendType = B_BACKEND;
+	slot = ko_shared_reserve_v3(&request, boots, &completion);
+	UT_ASSERT(slot >= 0);
+	/* The original private handoff deliberately retains this shared slot. */
+	storage.contexts[slot].complete = true;
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT(cluster_ko_directory_io_begin_v3(request.base.key.locator, &call));
+	UT_ASSERT(cluster_ko_pi_storage_identity_v3(&request.base.key,
+		request.base.incarnation, &call, &sample));
+	UT_ASSERT(sample.origin && sample.slot == slot);
+	UT_ASSERT_EQ(sample.serial, completion.serial);
+	UT_ASSERT(cluster_ko_pi_storage_identity_current_v3(&sample));
+	for (unsigned bad = 0; bad < 5; bad++) {
+		ClusterKoSharedContext saved = storage.contexts[slot];
+		if (bad == 0) storage.contexts[slot].origin_detached = true;
+		if (bad == 1) storage.contexts[slot].ax_release_requested = true;
+		if (bad == 2) storage.contexts[slot].ax_failed = true;
+		if (bad == 3) storage.contexts[slot].drop_identity_serial++;
+		if (bad == 4) storage.contexts[slot].request_failed_peers = 2;
+		UT_ASSERT(!cluster_ko_pi_storage_identity_current_v3(&sample));
+		storage.contexts[slot] = saved;
+	}
+	UT_ASSERT(cluster_ko_directory_io_end_v3(&call));
+}
+
+UT_TEST(test_pi_identity_refuses_unknown_namespace_and_ambiguous_operation)
+{
+	for (unsigned bad = 0; bad < 8; bad++) {
+		ClusterKoDirectoryIoV3 call;
+		ClusterKoSharedMessageV3 request = pi_identity_peer(&call, false);
+		ClusterKoPiStorageIdentityV3 sample, sentinel;
+		memset(&sample, 0xa5, sizeof(sample));
+		sentinel = sample;
+		if (bad == 0) request.base.key.system_identifier++;
+		if (bad == 1) request.base.key.database_incarnation++;
+		if (bad == 2) request.base.key.storage_uuid[0]++;
+		if (bad == 3) request.base.key.locator.relNumber++;
+		if (bad == 4) request.base.incarnation[0]++;
+		if (bad == 5) storage.peer_fences[0].state = CLUSTER_KO_PEER_FENCE_EMPTY;
+		if (bad == 6) storage.peer_fences[1] = storage.peer_fences[0];
+		if (bad == 7) storage.peer_fences[0].request.operation = CLUSTER_KO_SHARED_V3_OPERATION_TRUNCATE;
+		UT_ASSERT(!cluster_ko_pi_storage_identity_v3(&request.base.key,
+			request.base.incarnation, &call, &sample));
+		UT_ASSERT_EQ(memcmp(&sample, &sentinel, sizeof(sample)), 0);
+		UT_ASSERT(cluster_ko_directory_io_end_v3(&call));
+	}
+}
+
+UT_TEST(test_pi_identity_rechecks_original_role_route_lifecycle_and_call)
+{
+	for (unsigned bad = 0; bad < 21; bad++) {
+		ClusterKoDirectoryIoV3 call;
+		ClusterKoSharedMessageV3 request = pi_identity_peer(&call, false);
+		ClusterKoPiStorageIdentityV3 sample = {0};
+		UT_ASSERT(cluster_ko_pi_storage_identity_v3(&request.base.key,
+			request.base.incarnation, &call, &sample));
+		switch (bad) {
+		case 0: storage.peer_fences[0].serial++; break;
+		case 1: storage.peer_fences[0].peer_route_generation++; break;
+		case 2: storage.peer_fences[0].request.ax_holder.procno++; break;
+		case 3: storage.peer_fences[0].request.space_mutation_token++; break;
+		case 4: storage.peer_fences[0].request.base.batch_id++; break;
+		case 5: storage.peer_fences[0].state = CLUSTER_KO_PEER_FENCE_COMMITTED; break;
+		case 6: storage.peer_fences[0].failure_sqlerrcode = ERRCODE_INTERNAL_ERROR; break;
+		case 7: v3_route_generation++; break;
+		case 8: current_epoch++; break;
+		case 9: writer.claim.identity.origin_owner_incarnation++; break;
+		case 10: marker_capable = false; break;
+		case 11: cluster_interconnect_tier = CLUSTER_IC_TIER_2; break;
+		case 12: fixture_recovering = true; break;
+		case 13: MyBackendType = B_BACKEND; break;
+		case 14: CurrentResourceOwner = NULL; break;
+		case 15: CritSectionCount = 1; break;
+		case 16: sample.call.serial++; break;
+		case 17: sample.call.pid++; break;
+		case 18: storage.directory_io[call.slot].locator.relNumber++; break;
+		case 19: pg_atomic_fetch_add_u64(&storage.peer_admission_revision, 1); break;
+		case 20: sample.request.full_fork_mask ^= 1; break;
+		}
+		UT_ASSERT(!cluster_ko_pi_storage_identity_current_v3(&sample));
+		CritSectionCount = 0;
+		UT_ASSERT(cluster_ko_directory_io_end_v3(&call));
+	}
+}
+
+UT_TEST(test_pi_identity_marker_closes_receipt_window_without_ending_call)
+{
+	ClusterKoDirectoryIoV3 call;
+	ClusterKoSharedMessageV3 request = pi_identity_peer(&call, true);
+	ClusterKoPiStorageIdentityV3 sample = {0};
+	UT_ASSERT(cluster_ko_pi_storage_identity_v3(&request.base.key,
+		request.base.incarnation, &call, &sample));
+	MyBackendType = B_SINVAL_BCAST;
+	UT_ASSERT(!commit_operation(&request));
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT(!cluster_ko_pi_storage_identity_current_v3(&sample));
+	UT_ASSERT(storage.directory_io[call.slot].serial == call.serial);
+	UT_ASSERT(cluster_ko_directory_io_end_v3(&call));
+	MyBackendType = B_SINVAL_BCAST;
+	UT_ASSERT(commit_operation(&request));
+}
+
+UT_TEST(test_pi_identity_follows_exact_native_commit_before_publication)
+{
+	ClusterKoCompletionV2 *owner = v3_native_structure_owner(CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+	ClusterKoCompletionV2 *claimed = NULL;
+	ClusterKoSharedMessageV3 request = owner->barrier_request_v3;
+	ClusterKoNativeContinuation *work;
+	ClusterKoDirectoryIoV3 call;
+	ClusterKoPiStorageIdentityV3 sample = {0};
+	ClusterPageWalBindingV1 terminal;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+
+	UT_ASSERT(cluster_ko_shared_claim_structure(&space_identity, CLUSTER_SPACE_WAL_TOMBSTONE, &claimed));
+	UT_ASSERT(claimed == owner);
+	v3_structure_record(true, space_identity.operation, &terminal, wal);
+	UT_ASSERT(cluster_ko_shared_observe_space_v2(owner, &terminal, wal, sizeof(wal)));
+	native_commit_active = true;
+	cluster_ko_shared_native_commit_v2();
+	UT_ASSERT(owner->native_handed_off && storage.contexts[owner->slot].drop_identity == 0);
+	work = dsa_get_address(ko_native_area, owner->native_unready);
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT(cluster_ko_directory_io_begin_v3(request.base.key.locator, &call));
+	UT_ASSERT(cluster_ko_pi_storage_identity_v3(&request.base.key, request.base.incarnation, &call, &sample));
+	UT_ASSERT(cluster_ko_pi_storage_identity_current_v3(&sample));
+	for (unsigned fault = 0; fault < 8; fault++) {
+		ClusterKoNativeContinuation saved = *work;
+		if (fault == 0) work->recovery_required = true;
+		if (fault == 1) work->buffers_released = true;
+		if (fault == 2) work->context.serial++;
+		if (fault == 3) work->context.pid++;
+		if (fault == 4) work->context.request_v3.base.batch_id++;
+		if (fault == 5) work->context.drop_identity_serial++;
+		if (fault == 6) work->context.request_done_peers = 0;
+		if (fault == 7) work->context.peer_boots[1]++;
+		UT_ASSERT(!cluster_ko_pi_storage_identity_current_v3(&sample));
+		*work = saved;
+	}
+	MyBackendType = B_BACKEND;
+	cluster_ko_shared_native_publication_v3();
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT(!cluster_ko_pi_storage_identity_current_v3(&sample));
+	UT_ASSERT_EQ(storage.directory_io[call.slot].serial, call.serial);
+	UT_ASSERT(cluster_ko_directory_io_end_v3(&call));
+	MyBackendType = B_BACKEND;
+	cluster_ko_shared_native_publication_v3();
+	UT_ASSERT(cluster_ko_directory_drop_retired_v3(request.base.key.locator));
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(19);
 	printf(
 		"# KO shared=%zu peer_fence=%zu drop_identity=%zu raw_io=%zu; identities=%u raw_calls=%u\n",
 		sizeof(ClusterKoShared), sizeof(ClusterKoPeerFenceV3), sizeof(KoDropIdentity),
@@ -553,6 +760,12 @@ main(void)
 	UT_RUN(test_extension_metadata_probe_cannot_outlive_committed_drop);
 	UT_RUN(test_directory_terminal_requires_entered_calls_to_drain_and_marker_retry);
 	UT_RUN(test_directory_terminal_refuses_unknown_identity_and_runtime_scope);
+	UT_RUN(test_pi_identity_accepts_exact_active_and_ready_peer_only_with_call);
+	UT_RUN(test_pi_identity_origin_retains_original_slot_after_private_handoff);
+	UT_RUN(test_pi_identity_refuses_unknown_namespace_and_ambiguous_operation);
+	UT_RUN(test_pi_identity_rechecks_original_role_route_lifecycle_and_call);
+	UT_RUN(test_pi_identity_marker_closes_receipt_window_without_ending_call);
+	UT_RUN(test_pi_identity_follows_exact_native_commit_before_publication);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -178,6 +178,25 @@ typedef struct ClusterKoDirectoryIoV3 {
 } ClusterKoDirectoryIoV3;
 extern bool cluster_ko_directory_io_begin_v3(RelFileLocator locator, ClusterKoDirectoryIoV3 *out);
 extern bool cluster_ko_directory_io_end_v3(const ClusterKoDirectoryIoV3 *call);
+/* Purpose-limited identity for the original checkpointer's PI observation.
+ * Requires an already entered call; neither this snapshot nor a recheck
+ * grants current, DATA completion, deletion or recovery permission. */
+typedef struct ClusterKoPiStorageIdentityV3 {
+	ClusterKoSharedMessageV3 request;
+	ClusterKoDirectoryIoV3 call;
+	uint64 serial;
+	uint64 route_generation;
+	uint64 admission_revision;
+	uint64 native_owner; /* Opaque original carrier; never caller-owned. */
+	uint32 slot;
+	ClusterKoPeerFenceStateV3 state;
+	bool origin;
+} ClusterKoPiStorageIdentityV3;
+extern bool cluster_ko_pi_storage_identity_v3(const ClusterSpaceIdentityKey *key,
+											const uint8 incarnation[16],
+											const ClusterKoDirectoryIoV3 *call,
+											ClusterKoPiStorageIdentityV3 *out);
+extern bool cluster_ko_pi_storage_identity_current_v3(const ClusterKoPiStorageIdentityV3 *sample);
 /* Positive runtime COMMIT evidence, only for canceling old-locator work.
  * Not a DATA receipt, READY, completed marker, or recovery authorization. */
 extern bool cluster_ko_directory_drop_committed_v3(RelFileLocator locator);

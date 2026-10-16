@@ -11637,6 +11637,11 @@ struct ClusterPageDataReceiptV1 {
 	const ClusterThreadRecoveryFabricPlanV1 *space_plan;
 	uint32 space_operation;
 	bool space_terminal;
+	/* Ordinary storage observations keep their complete immutable input.
+	 * Imported storage facts must bind it before physical PI consumption. */
+	const ClusterThreadRecoveryFabricPlanV1 *storage_plan;
+	const ClusterPiWritebackNoticeV1 *notice;
+	uint32 notice_index;
 };
 
 /* A structural receipt remains owned by the original completed KO slot.
@@ -12163,6 +12168,8 @@ cluster_page_data_from_notice_v1(const ClusterPiWritebackNoticeV1 *notice, uint3
 		receipt->wal = fact.binding;
 		receipt->pi_cut = fact.write_cut;
 		receipt->storage_cut = fact.storage_cut;
+		receipt->notice = notice;
+		receipt->notice_index = index;
 		*out = receipt;
 	}
 	PG_FINALLY();
@@ -12762,6 +12769,22 @@ cluster_page_structural_receipt_free_v2(ClusterPageStructuralReceiptV2 **receipt
 	*receipt = NULL;
 }
 
+static bool cluster_page_data_storage_lifecycle(const ClusterPageDataTargetV1 *target,
+	const ClusterPageWalBindingV1 *binding,
+	const ClusterThreadRecoveryFabricPlanV1 *fabric, const ClusterWalSourceRef *sources,
+	uint32 source_count, const RfSidePiStorageCaptureV1 *capture);
+
+static bool
+cluster_page_data_notice_current(const ClusterPageDataReceiptV1 *receipt)
+{
+	ClusterPiDataFactV1 fact;
+	return receipt->notice == NULL
+		|| (cluster_pi_writeback_notice_read_v1(receipt->notice, receipt->notice_index, &fact)
+			&& memcmp(&fact.binding, &receipt->wal, sizeof(fact.binding)) == 0
+			&& memcmp(&fact.write_cut, &receipt->pi_cut, sizeof(fact.write_cut)) == 0
+			&& memcmp(&fact.storage_cut, &receipt->storage_cut, sizeof(fact.storage_cut)) == 0);
+}
+
 bool
 cluster_page_data_bind_plan_v1(ClusterPageDataReceiptV1 *receipt,
 							   const ClusterThreadRecoveryFabricPlanV1 *plan)
@@ -12774,8 +12797,33 @@ cluster_page_data_bind_plan_v1(ClusterPageDataReceiptV1 *receipt,
 
 	if (!cluster_page_data_receipt_read_v1(receipt, &target))
 		return false;
-	if (target.identity.forknum != SPACE_FORKNUM)
-		return true; /* Its original PAGE proof remains mandatory. */
+	if (target.identity.forknum != SPACE_FORKNUM) {
+		ClusterWalSourceRef sources[RF_PAGE_STABLE_MAX_PARTICIPANTS];
+		uint32 count;
+		/* Current-writer and local resident observations retain their own
+		 * identity proof. A remote storage fact is authenticated, not a new
+		 * file observation: cover it with the peer's complete input. */
+		if (receipt->storage_cut.binding_generation == 0)
+			return true;
+		if (!cluster_page_data_notice_current(receipt))
+			return false;
+		if (receipt->storage_plan != NULL)
+			return receipt->storage_plan == plan;
+		if (receipt->notice == NULL)
+			return true;
+		count = cluster_thread_recovery_fabric_participant_count_v1(plan);
+		if (count == 0 || count > RF_PAGE_STABLE_MAX_PARTICIPANTS
+			|| !cluster_page_data_pi_fact_v1(receipt, &storage_fact))
+			return false;
+		for (uint32 i = 0; i < count; i++)
+			if (!rf_page_online_plan_source_v1(cluster_thread_recovery_fabric_page_plan_v1(plan),
+					i, &sources[i]))
+				return false;
+		if (!cluster_page_data_storage_lifecycle(&target, &receipt->wal, plan, sources, count, NULL))
+			return false;
+		receipt->storage_plan = plan;
+		return true;
+	}
 	if (receipt->space_plan != NULL)
 		return receipt->space_plan == plan;
 	if (!rf_page_identity_equal_v1(&target.identity, &receipt->wal.identity)
@@ -12870,6 +12918,31 @@ cluster_page_data_terminal_binding(const ClusterPageDataTargetV1 *target,
 			return false;
 		*out = binding;
 		return true;
+	}
+	return false;
+}
+
+static bool
+cluster_page_data_storage_lifecycle(const ClusterPageDataTargetV1 *target,
+	const ClusterPageWalBindingV1 *binding,
+	const ClusterThreadRecoveryFabricPlanV1 *fabric, const ClusterWalSourceRef *sources,
+	uint32 source_count, const RfSidePiStorageCaptureV1 *capture)
+{
+	const RfPageOnlinePlanV1 *page = cluster_thread_recovery_fabric_page_plan_v1(fabric);
+	ClusterPageWalBindingV1 terminal;
+
+	if (!cluster_thread_recovery_fabric_pi_contributions_v1(fabric)
+		|| !cluster_page_data_terminal_binding(target, page, sources, source_count, &terminal)
+		|| !cluster_page_wal_same_mutation_v1(binding, &terminal))
+		return false;
+	for (uint32 i = 0; i < rf_page_online_plan_target_count_v1(page); i++) {
+		RfPageOnlineTargetViewV1 view;
+		if (!rf_page_online_plan_target_v1(page, i, &view))
+			return false;
+		if (rf_page_identity_equal_v1(&view.page_identity, &target->identity))
+			return rf_side_online_plan_pi_storage_lifecycle_v1(
+				cluster_thread_recovery_fabric_side_plan_v1(fabric), &view, sources,
+				source_count, capture);
 	}
 	return false;
 }
@@ -12993,6 +13066,8 @@ cluster_bufmgr_observe_pi_storage_internal(const ClusterPageDataTargetV1 *target
 	uint64 token;
 	ClusterPageDataReceiptV1 *receipt;
 	ClusterKoDirectoryIoV3 io;
+	ClusterKoPiStorageIdentityV3 ko_identity = {0};
+	bool drop_identity = false;
 
 	if (target == NULL || out == NULL || *out != NULL || CurrentResourceOwner == NULL
 		|| !cluster_enabled || !cluster_shared_config || RecoveryInProgress()
@@ -13000,6 +13075,10 @@ cluster_bufmgr_observe_pi_storage_internal(const ClusterPageDataTargetV1 *target
 		|| cut->master_node != cluster_node_id)
 		return false;
 	typed = target->identity.forknum == SPACE_FORKNUM;
+	if (!typed && fabric != NULL
+		&& (!cluster_thread_recovery_fabric_pi_contributions_v1(fabric)
+			|| cluster_thread_recovery_fabric_page_plan_v1(fabric) != plan))
+		return false;
 	key.system_identifier = target->identity.system_identifier;
 	key.database_incarnation = target->database_incarnation;
 	memcpy(key.storage_uuid, target->identity.storage_uuid, 16);
@@ -13038,20 +13117,37 @@ cluster_bufmgr_observe_pi_storage_internal(const ClusterPageDataTargetV1 *target
 		{
 			do {
 				SMgrRelation rel;
-				/* SPACE0 is the identity itself. Its exact N/S master cut protects
-				 * this read-only observation even with no resident current buffer.
-				 * SPACE1 and ordinary DATA retain the original identity-S owner. */
+				/* The resident path keeps its original identity-S proof. Only
+				 * its unavailable-buffer case can use an exact DROP capture. */
 				if (!typed || target->identity.blockno != 0) {
 					space = cluster_page_data_try_hold(space_tag, false, &space_owner);
-					if (space == NULL
-						|| !cluster_space_identity_page_decode(
-							BufHdrGetBlock(space), BLCKSZ, SPACE_FORKNUM, 0, &key, &identity, &token)
-						|| (!typed && identity.state != CLUSTER_SPACE_IDENTITY_LIVE)
-						|| memcmp(identity.incarnation, target->version.segment_incarnation, 16) != 0
-						|| (typed
-							&& (identity.state != expected_identity.state
-								|| identity.sequence != expected_identity.sequence
-								|| identity.operation != expected_identity.operation)))
+					if (space == NULL && !typed && fabric != NULL
+						&& cluster_ko_pi_storage_identity_v3(&key,
+							target->version.segment_incarnation, &io, &ko_identity)) {
+						RfSidePiStorageCaptureV1 capture = {0};
+						capture.key = ko_identity.request.base.key;
+						memcpy(capture.incarnation, ko_identity.request.base.incarnation, 16);
+						capture.token = ko_identity.request.space_mutation_token;
+						capture.origin_node = ko_identity.request.base.origin_node;
+						capture.origin_boot = ko_identity.request.base.origin_boot;
+						capture.batch_id = ko_identity.request.base.batch_id;
+						if (ko_identity.request.operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP
+							|| !cluster_page_data_storage_lifecycle(target, &binding, fabric, sources,
+								source_count, &capture)
+							|| !cluster_ko_pi_storage_identity_current_v3(&ko_identity))
+							break;
+						drop_identity = true;
+					}
+					if (!drop_identity
+						&& (space == NULL
+							|| !cluster_space_identity_page_decode(
+								BufHdrGetBlock(space), BLCKSZ, SPACE_FORKNUM, 0, &key, &identity, &token)
+							|| (!typed && identity.state != CLUSTER_SPACE_IDENTITY_LIVE)
+							|| memcmp(identity.incarnation, target->version.segment_incarnation, 16) != 0
+							|| (typed
+								&& (identity.state != expected_identity.state
+									|| identity.sequence != expected_identity.sequence
+									|| identity.operation != expected_identity.operation))))
 						break;
 				}
 				rel = smgropen(key.locator, InvalidBackendId);
@@ -13069,7 +13165,8 @@ cluster_bufmgr_observe_pi_storage_internal(const ClusterPageDataTargetV1 *target
 							|| !cluster_pcm_own_fence_equal_exact(&space_owner, &live)))
 					|| !cluster_wal_thread_current_v2_ref(&current)
 					|| !cluster_page_data_source_same(&source, &current)
-					|| !cluster_pcm_lock_pi_storage_matches_v1(&observed))
+					|| !cluster_pcm_lock_pi_storage_matches_v1(&observed)
+					|| (drop_identity && !cluster_ko_pi_storage_identity_current_v3(&ko_identity)))
 					break;
 				complete = true;
 			} while (false);
@@ -13092,12 +13189,22 @@ cluster_bufmgr_observe_pi_storage_internal(const ClusterPageDataTargetV1 *target
 			receipt->target = *target;
 			receipt->wal = binding;
 			receipt->storage_cut = observed;
+			if (drop_identity) {
+				receipt->storage_plan = fabric;
+				/* Allocation can process interrupts. Publish only against the
+				 * original operation while the original entered call is live. */
+				if (!cluster_ko_pi_storage_identity_current_v3(&ko_identity)) {
+					pfree(receipt);
+					complete = false;
+				}
+			}
 			if (typed) {
 				receipt->space_plan = fabric;
 				receipt->space_operation = typed_operation;
 				receipt->space_terminal = true;
 			}
-			*out = receipt;
+			if (complete)
+				*out = receipt;
 		}
 	}
 	PG_FINALLY();
@@ -13118,6 +13225,17 @@ cluster_bufmgr_observe_pi_storage_v1(const ClusterPageDataTargetV1 *target,
 {
 	return cluster_bufmgr_observe_pi_storage_internal(target, cut, plan, sources, source_count,
 													  NULL, out);
+}
+
+bool
+cluster_bufmgr_observe_pi_storage_plan_v1(const ClusterPageDataTargetV1 *target,
+	const ClusterPcmPiStorageCutV1 *cut, const ClusterThreadRecoveryFabricPlanV1 *plan,
+	const ClusterWalSourceRef *sources, uint32 source_count, ClusterPageDataReceiptV1 **out)
+{
+	if (plan == NULL || !cluster_thread_recovery_fabric_pi_contributions_v1(plan))
+		return false;
+	return cluster_bufmgr_observe_pi_storage_internal(target, cut,
+		cluster_thread_recovery_fabric_page_plan_v1(plan), sources, source_count, plan, out);
 }
 
 bool
@@ -13161,9 +13279,16 @@ cluster_page_data_pi_storage_proof_v1(const ClusterPageDataReceiptV1 *receipt,
 			|| cluster_thread_recovery_fabric_page_plan_v1(receipt->space_plan) != plan
 			|| !cluster_page_data_prefix_v1(plan, sources, source_count, NULL, 0, prefixes))
 			return false;
-	} else if (!cluster_page_data_terminal_binding(&target, plan, sources, source_count, &terminal)
-			   || !cluster_page_wal_same_mutation_v1(&terminal, &receipt->wal))
-		return false;
+	} else {
+		if (!cluster_page_data_terminal_binding(&target, plan, sources, source_count, &terminal)
+			|| !cluster_page_wal_same_mutation_v1(&terminal, &receipt->wal)
+			|| (receipt->notice != NULL && (receipt->storage_plan == NULL
+				|| !cluster_page_data_notice_current(receipt)))
+			|| (receipt->storage_plan != NULL
+				&& (!cluster_thread_recovery_fabric_pi_contributions_v1(receipt->storage_plan)
+					|| cluster_thread_recovery_fabric_page_plan_v1(receipt->storage_plan) != plan)))
+			return false;
+	}
 	InitBufferTag(&tag, &target.identity.locator, target.identity.forknum, target.identity.blockno);
 	if (!BufferTagsEqual(&tag, &receipt->storage_cut.resource))
 		return false;

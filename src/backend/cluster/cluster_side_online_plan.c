@@ -2130,6 +2130,162 @@ rf_side_online_plan_space_terminal_v1(const RfSideOnlinePlanV1 *plan,
 }
 
 bool
+rf_side_online_plan_pi_storage_lifecycle_v1(const RfSideOnlinePlanV1 *plan,
+	const RfPageOnlineTargetViewV1 *target, const ClusterWalSourceRef *sources,
+	uint32 count, const RfSidePiStorageCaptureV1 *capture)
+{
+	ClusterSpaceIdentityKey key = {0};
+	RfSideSpaceTerminalV1 terminal;
+	RfSideSpaceContributionV1 captured = {0};
+	uint32 captured_operation = UINT32_MAX;
+	bool last, typed_seen = false, identity_seen = false, incarnation_ended = false;
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed
+		|| plan->failed || plan->purpose != RF_SIDE_PLAN_PI_CONTRIBUTIONS
+		|| target == NULL || sources == NULL || count != plan->participant_count || count == 0
+		|| plan->database_incarnation == 0 || target->page_identity.forknum == SPACE_FORKNUM
+		|| !rf_page_version_present_v1(&target->expected_result)
+		|| !rf_side_online_plan_page_lifecycle_v1(plan, target))
+		return false;
+	key.system_identifier = plan->system_identifier;
+	key.database_incarnation = plan->database_incarnation;
+	memcpy(key.storage_uuid, plan->storage_uuid, 16);
+	key.locator = target->page_identity.locator;
+	for (uint32 i = 0; i < count; i++) {
+		const ClusterWalSourceRef *source = &sources[i];
+		const RfContributorStreamCutV1 *cut = &plan->physical_cuts[i];
+		if (source->claim.identity.system_identifier != key.system_identifier
+			|| source->claim.database_incarnation != key.database_incarnation
+			|| memcmp(source->claim.identity.storage_uuid, key.storage_uuid, 16) != 0
+			|| source->claim.identity.origin_thread_id != cut->failed_thread
+			|| source->claim.identity.origin_owner_incarnation == 0
+			|| source->claim.identity.origin_owner_incarnation != cut->origin_owner_incarnation
+			|| source->timeline != cut->timeline_id)
+			return false;
+	}
+	if (capture != NULL
+		&& (capture->key.system_identifier != key.system_identifier
+			|| capture->key.database_incarnation != key.database_incarnation
+			|| memcmp(capture->key.storage_uuid, key.storage_uuid, 16) != 0
+			|| !RelFileLocatorEquals(capture->key.locator, key.locator)
+			|| memcmp(capture->incarnation, target->expected_result.segment_incarnation, 16) != 0
+			|| capture->token == 0 || capture->token == UINT64_MAX
+			|| capture->batch_id == 0 || capture->origin_boot == 0 || capture->origin_node < 0))
+		return false;
+	for (uint32 i = 0; i < plan->operation_count; i++)
+		for (uint32 j = 0; j < side_operation_space_count(&plan->operations[i]); j++) {
+			ClusterSpaceIdentityKey observed;
+			ClusterSpaceRecoveryInput input;
+			if (!side_operation_space_input(plan, &plan->operations[i], j, &observed, &input))
+				return false;
+			if (!RelFileLocatorEquals(observed.locator, key.locator))
+				continue;
+			typed_seen = true;
+			if (input.length == CLUSTER_SPACE_STRUCTURE_WAL_BYTES) {
+				ClusterSpaceStructureChange change;
+				identity_seen = true;
+				if (!cluster_space_structure_wal_decode(input.data, input.length, &change))
+					return false;
+				if ((change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE
+					 || change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE)
+					&& memcmp(change.identity.expected.incarnation,
+						target->expected_result.segment_incarnation, 16) == 0) {
+					/* Matching endpoint UUIDs cannot bridge an intervening
+					 * TRUNCATE or a later reuse of a tombstoned incarnation. */
+					if (change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE)
+						return false;
+					incarnation_ended = true;
+				}
+			}
+		}
+	/* A receiver covers an already authenticated DATA fact, including the
+	 * original resident-identity producer. An empty retained SPACE set is
+	 * not a replacement identity for a new file observation. */
+	if (!typed_seen)
+		return capture == NULL;
+	/* A resident producer may predate the retained input's SPACE0 edge.
+	 * Cover any retained ADVANCE-only history through the original strict
+	 * SPACE1 ancestry; it cannot supply a new captured SPACE0 identity. */
+	if (!identity_seen)
+		return capture == NULL
+			&& rf_side_online_plan_space_terminal_v1(plan, &key, 1, &terminal)
+			&& terminal.contribution.result.state == CLUSTER_SPACE_IDENTITY_LIVE
+			&& memcmp(terminal.contribution.result.incarnation,
+				target->expected_result.segment_incarnation, 16) == 0;
+	if (!rf_side_online_plan_space_terminal_v1(plan, &key, 0, &terminal)
+		|| memcmp(terminal.contribution.result.incarnation,
+				  target->expected_result.segment_incarnation, 16) != 0)
+		return false;
+	/* A captured SPACE0 token selects an exact retained identity, never a
+	 * PAGE token or a numerical predecessor. Ancestry includes history. */
+	if (capture != NULL) {
+		for (uint32 i = 0; i < plan->operation_count; i++)
+			for (uint32 j = 0; j < side_operation_space_count(&plan->operations[i]); j++) {
+				RfSideSpaceContributionV1 item;
+				if (!rf_side_online_plan_space_contribution_v1(plan, i, j, &item))
+					return false;
+				if ((item.page_mask & 1) == 0 || item.result_token[0] != capture->token
+					|| !RelFileLocatorEquals(item.result.key.locator, key.locator)
+					|| memcmp(item.result.incarnation, capture->incarnation, 16) != 0)
+					continue;
+				if (captured_operation != UINT32_MAX
+					|| item.result.state != CLUSTER_SPACE_IDENTITY_LIVE)
+					return false;
+				captured = item;
+				captured_operation = i;
+			}
+		if (captured_operation == UINT32_MAX
+			|| !rf_side_online_plan_space_covers_v1(plan, &key, 0, captured_operation,
+				terminal.operation, &last) || !last)
+			return false;
+	}
+	if (terminal.contribution.result.state == CLUSTER_SPACE_IDENTITY_LIVE)
+		return !incarnation_ended;
+	if (terminal.contribution.result.state == CLUSTER_SPACE_IDENTITY_TOMBSTONED) {
+		RfSideSpaceIncarnationEndV1 end;
+		RfSideOnlineOperationV1 operation;
+		xl_xact_parsed_commit parsed;
+		uint32 markers = 0;
+		if (!rf_side_online_plan_space_incarnation_end_v1(plan, &key,
+				target->expected_result.segment_incarnation, terminal.operation, &end)
+			|| !end.terminal || end.operation != terminal.operation
+			|| end.change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE
+			|| !rf_side_online_plan_operation_v1(plan, end.operation, &operation)
+			|| operation.kind != RF_SIDE_ONLINE_OPERATION_XACT
+			|| operation.identity.record.rmid != RM_XACT_ID
+			|| (operation.identity.record.info & XLOG_XACT_OPMASK) != XLOG_XACT_COMMIT
+			|| operation.identity.participant_index >= count
+			|| !ParseCommitRecord(operation.identity.record.info,
+				(xl_xact_commit *)operation.owned_payload, operation.owned_payload_length, &parsed))
+			return false;
+		if (capture != NULL) {
+			const ClusterWalSourceRef *source = &sources[operation.identity.participant_index];
+			uint8 before[CLUSTER_SPACE_IDENTITY_BYTES], expected[CLUSTER_SPACE_IDENTITY_BYTES];
+			if (end.change.identity.before_token != capture->token
+				|| source->claim.identity.origin_node_id != capture->origin_node
+				|| source->claim.identity.origin_owner_incarnation != capture->origin_boot
+				|| !cluster_space_identity_encode(&end.change.identity.expected, before, sizeof(before))
+				|| !cluster_space_identity_encode(&captured.result, expected, sizeof(expected))
+				|| memcmp(before, expected, sizeof(before)) != 0)
+				return false;
+		}
+		/* The authenticated DATA fact can be covered at a peer without a
+		 * fresh KO capture. The marker here is ancestry, not publication ACK. */
+		for (int i = 0; i < parsed.nmsgs; i++) {
+			const SharedInvalidationMessage *message = &parsed.msgs[i];
+			if (message->id != SHAREDINVALKO_COMMIT_ID)
+				continue;
+			if (!SharedInvalKoCommitIsValid(&message->ko))
+				return false;
+			if (capture == NULL || SharedInvalKoCommitBatchId(&message->ko) == capture->batch_id)
+				markers++;
+		}
+		return capture == NULL ? markers != 0 : markers == 1;
+	}
+	return false;
+}
+
+bool
 rf_side_online_plan_space_target_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 									ClusterSpaceIdentityKey *out)
 {

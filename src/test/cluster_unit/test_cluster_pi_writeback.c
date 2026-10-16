@@ -67,6 +67,21 @@ cluster_thread_recovery_fabric_side_plan_v1(const ClusterThreadRecoveryFabricPla
 {
 	return (const RfSideOnlinePlanV1 *)plan;
 }
+bool
+cluster_thread_recovery_fabric_pi_contributions_v1(const ClusterThreadRecoveryFabricPlanV1 *plan)
+{
+	return plan != NULL && (const void *)plan == wb_page_plan;
+}
+bool
+rf_side_online_plan_pi_storage_lifecycle_v1(const RfSideOnlinePlanV1 *plan,
+	const RfPageOnlineTargetViewV1 *view, const ClusterWalSourceRef *sources,
+	uint32 count, const RfSidePiStorageCaptureV1 *capture)
+{
+	/* Complete input is a boundary here; the real typed lifecycle and
+	 * authenticated DATA integration run in test_cluster_pi_drop_storage. */
+	return (const void *)plan == wb_page_plan && view != NULL && sources != NULL
+		&& count == 3 && capture == NULL;
+}
 uint32
 rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan)
 {

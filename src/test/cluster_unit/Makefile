@@ -2363,16 +2363,18 @@ test_cluster_page_data_scn.inc: $(top_srcdir)/src/backend/cluster/cluster_scn.c 
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2) exit 1 }' $< > $@
 
 test_cluster_page_data: test_cluster_page_data.c
-test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error: PI_WRITEBACK_CODEC_OBJS = $(CLUSTER_KO_O)
-test_cluster_page_data test_cluster_sync_error: $(CLUSTER_KO_O)
+test_cluster_pi_drop_storage: test_cluster_pi_drop_storage.c test_cluster_page_data.c
+test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error test_cluster_pi_drop_storage: PI_WRITEBACK_CODEC_OBJS = $(CLUSTER_KO_O)
+test_cluster_page_data test_cluster_sync_error test_cluster_pi_drop_storage: $(CLUSTER_KO_O)
 test_cluster_pi_writeback: test_cluster_pi_writeback_v2.inc $(CLUSTER_KO_O)
 test_cluster_pi_writeback: test_cluster_pi_writeback.c test_cluster_page_data.c \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_rebuild.c \
 		$(top_srcdir)/src/include/cluster/cluster_pi_rebuild.h \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_data_wire.h
-test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error: unit_test.h test_cluster_page_data.inc test_cluster_page_data_scn.inc \
+test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error test_cluster_pi_drop_storage: unit_test.h test_cluster_page_data.inc test_cluster_page_data_scn.inc \
 		test_cluster_block_redeclare_scan.inc \
+		$(top_srcdir)/src/include/cluster/cluster_ko.h \
 		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \
 		$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h $(CLUSTER_WAL_CLAIM_O) \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
@@ -2965,11 +2967,11 @@ test_cluster_side_xact test_cluster_pi_contribution: %: %.c unit_test.h test_clu
 CLUSTER_SIDE_ONLINE_OWNER_O = test_cluster_side_online_owner_product.o
 # The DATA integration uses the actual immutable fabric and typed SIDE
 # planner. The writeback scheduling fixture keeps its explicit input boundary.
-test_cluster_page_data test_cluster_sync_error: PAGE_DATA_SPACE_OBJS = $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
+test_cluster_page_data test_cluster_sync_error test_cluster_pi_drop_storage: PAGE_DATA_SPACE_OBJS = $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
 		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O)
-test_cluster_page_data test_cluster_sync_error: $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
+test_cluster_page_data test_cluster_sync_error test_cluster_pi_drop_storage: $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
 		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O)
@@ -9311,3 +9313,6 @@ all: test_cluster_ko_origin_marker
 
 TESTS += test_cluster_pcm_object_retire
 all: test_cluster_pcm_object_retire
+
+TESTS += test_cluster_pi_drop_storage
+all: test_cluster_pi_drop_storage

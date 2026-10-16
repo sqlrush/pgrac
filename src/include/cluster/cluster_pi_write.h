@@ -96,6 +96,14 @@ extern bool cluster_bufmgr_observe_pi_storage_v1(const ClusterPageDataTargetV1 *
 												 const ClusterWalSourceRef *sources,
 												 uint32 source_count,
 												 ClusterPageDataReceiptV1 **out);
+/* Same storage owner with a complete PI-only fabric. An exact runtime DROP
+ * may use its captured identity and typed lifecycle instead of a resident
+ * SPACE current. The original resident path is otherwise unchanged. */
+extern bool cluster_bufmgr_observe_pi_storage_plan_v1(
+	const ClusterPageDataTargetV1 *target, const ClusterPcmPiStorageCutV1 *cut,
+	const struct ClusterThreadRecoveryFabricPlanV1 *plan,
+	const ClusterWalSourceRef *sources, uint32 source_count,
+	ClusterPageDataReceiptV1 **out);
 /* Typed SPACE terminal selected from the complete retained input. SPACE0
  * is its own identity: exact master N/S cut plus typed read/fsync/read needs
  * no resident current image. SPACE1 retains the original SPACE0 identity-S.
