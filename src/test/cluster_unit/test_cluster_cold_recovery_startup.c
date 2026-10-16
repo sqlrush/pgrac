@@ -29,6 +29,7 @@
 #include <setjmp.h>
 
 #include "access/xlogreader.h"
+#include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cold_recovery_census.h"
 #include "cluster/cluster_side_online_plan.h"
@@ -36,6 +37,8 @@
 #include "storage/checksum.h"
 #include "storage/checksum_impl.h"
 #include "cluster/cluster_recovery_duty.h"
+#include "cluster/cluster_side_online_owner.h"
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_wal_tail.h"
 #include "utils/memutils.h"
@@ -926,10 +929,396 @@ UT_TEST(test_native_history_capture_gap_keeps_original_plan_but_no_side_authorit
 	}
 }
 
+static ClusterColdTypedV1 *
+control_fixture_mode(ClusterColdRecordV1 *record, bool with_space)
+{
+	ClusterColdTypedV1 *typed;
+	RfSideOnlineOperationV1 *operation;
+	fixture();
+	scan_space = with_space;
+	scan_space_offset = with_space ? 0x100 : 0;
+	control_native_pair_ok = false;
+	typed = prepare(0x800);
+	control_calls = control_init_calls = control_fault = 0;
+	control_selected = UINT32_MAX;
+	control_epoch = 7;
+	control_authority_ok = control_borrow_ok = control_cover_ok = true;
+	memset(&control_duty, 0, sizeof(control_duty));
+	control_duty.origin_thread_id = 2;
+	control_duty.origin_owner_incarnation = 12;
+	memset(&control_serial, 0, sizeof(control_serial));
+	control_serial.mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+	control_root = roots[2];
+	control_token = tokens[2];
+	memset(record, 0, sizeof(*record));
+	record->read_rec_ptr = 0x1000;
+	record->end_rec_ptr = 0x1100;
+	record->record_crc = 0x12345678;
+	record->rmid = RM_XLOG_ID;
+	record->info = XLOG_NOOP;
+	record->record_flags = CLUSTER_COLD_RECORD_FOREIGN_CONTROL;
+	side_fixture[1].operation_count = 3;
+	operation = &side_fixture[1].operations[1];
+	operation->kind = RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL;
+	operation->identity.record.system_identifier = 9;
+	memset(operation->identity.record.storage_uuid, 1, 16);
+	operation->identity.record.origin_thread = 2;
+	operation->identity.record.timeline_id = 1;
+	operation->identity.record.read_rec_ptr = 0x1000;
+	operation->identity.record.end_rec_ptr = 0x1100;
+	operation->identity.record.record_crc = 0x12345678;
+	operation->identity.record.rmid = RM_XLOG_ID;
+	operation->identity.record.info = XLOG_NOOP;
+	side_fixture[1].operations[0] = *operation;
+	side_fixture[1].operations[0].history_only = true;
+	side_fixture[1].operations[0].identity.record.read_rec_ptr = 0x100;
+	side_fixture[1].operations[0].identity.record.end_rec_ptr = 0x200;
+	side_fixture[1].operations[2] = *operation;
+	side_fixture[1].operations[2].identity.record.read_rec_ptr = 0x1200;
+	side_fixture[1].operations[2].identity.record.end_rec_ptr = 0x1300;
+	if (with_space) {
+		ClusterColdSpaceInputV1 input;
+		RelFileLocator locator;
+		uint32 count = 0;
+		UT_ASSERT(cluster_cold_plan_space_relation_v1(typed->plan, 0, &locator, &count));
+		UT_ASSERT_EQ(count, 1);
+		UT_ASSERT(cluster_cold_plan_space_input_v1(typed->plan, 0, 0, &input));
+		operation = &side_fixture[1].operations[2];
+		operation->kind = RF_SIDE_ONLINE_OPERATION_SPACE;
+		operation->purpose = RF_SIDE_PLAN_RECOVERY;
+		operation->space_key.locator = locator;
+		operation->space_key.system_identifier = 9;
+		operation->space_key.database_incarnation = 5;
+		memset(operation->space_key.storage_uuid, 1, 16);
+		operation->identity.record.read_rec_ptr = input.read_rec_ptr;
+		operation->identity.record.end_rec_ptr = input.end_rec_ptr;
+		operation->owned_payload = input.payload;
+		operation->owned_payload_length = input.payload_length;
+	}
+	cluster_cold_replay_window_enter_v1();
+	return typed;
+}
+
+static ClusterColdTypedV1 *
+control_fixture(ClusterColdRecordV1 *record)
+{
+	return control_fixture_mode(record, false);
+}
+
+static bool
+consume_control(ClusterColdTypedV1 *typed, const ClusterColdRecordV1 *record)
+{
+	return cluster_cold_typed_control_v1(typed, (ClusterRecoveryFencePlan *)&fixture_context, 1,
+										 record);
+}
+
+UT_TEST(test_control_dispatch_selects_current_record_only)
+{
+	ClusterColdRecordV1 record;
+	ClusterColdTypedV1 *typed = control_fixture(&record);
+	UT_ASSERT(consume_control(typed, &record));
+	UT_ASSERT_EQ(control_calls, 1);
+	UT_ASSERT_EQ(control_selected, 1);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	cluster_cold_replay_window_leave_v1();
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
+UT_TEST(test_control_dispatch_keeps_original_space_preflight)
+{
+	ClusterColdRecordV1 record;
+	ClusterColdTypedV1 *typed = control_fixture_mode(&record, true);
+	UT_ASSERT(consume_control(typed, &record));
+	UT_ASSERT_EQ(control_calls, 1);
+	UT_ASSERT_EQ(control_selected, 1);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	cluster_cold_replay_window_leave_v1();
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
+UT_TEST(test_control_dispatch_rejects_unbound_space_effect)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = control_fixture_mode(&record, true);
+		RfSideOnlineOperationV1 *op = &side_fixture[1].operations[2];
+		static const uint8 wrong[] = { 'B', 'A', 'D', '!' };
+		if (fault == 0)
+			op->space_key.locator.relNumber++;
+		if (fault == 1)
+			op->identity.record.read_rec_ptr++;
+		if (fault == 2)
+			op->identity.record.end_rec_ptr++;
+		if (fault == 3)
+			op->owned_payload_length--;
+		if (fault == 4)
+			op->owned_payload = wrong;
+		if (fault == 5)
+			op->purpose = RF_SIDE_PLAN_PI_CONTRIBUTIONS;
+		UT_ASSERT(!consume_control(typed, &record));
+		UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_control_dispatch_native_create_borrows_exact_typed_pair)
+{
+	for (int fault = 0; fault < 4; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = control_fixture_mode(&record, true);
+		RfSideOnlineOperationV1 *native = &side_fixture[1].operations[0];
+		RfSideOnlineOperationV1 *space = &side_fixture[1].operations[2];
+		xl_smgr_create create = { 0 };
+		create.rlocator = space->space_key.locator;
+		create.forkNum = MAIN_FORKNUM;
+		*native = side_fixture[1].operations[1];
+		native->kind = RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE;
+		native->purpose = RF_SIDE_PLAN_RECOVERY;
+		native->identity.record.read_rec_ptr = 0x800;
+		native->identity.record.end_rec_ptr = 0x900;
+		native->identity.record.rmid = RM_SMGR_ID;
+		native->identity.record.info = XLOG_SMGR_CREATE;
+		native->owned_payload = (const uint8 *)&create;
+		native->owned_payload_length = sizeof(create);
+		native->source_xid = space->source_xid = 3;
+		space->route.normalized_info = XLOG_SMGR_SPACE_IDENTITY;
+		control_native_pair_ok = fault != 1;
+		if (fault == 2)
+			native->source_xid++;
+		if (fault == 3)
+			space->owned_payload_length--;
+		UT_ASSERT_EQ(consume_control(typed, &record), fault == 0);
+		UT_ASSERT_EQ(typed->refusal == CLUSTER_COLD_OK, fault == 0);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_control_dispatch_rejects_wrong_record_or_effect)
+{
+	for (int fault = 0; fault < 17; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = control_fixture(&record);
+		RfSideOnlineOperationV1 *operation = &side_fixture[1].operations[1];
+		switch (fault) {
+		case 0:
+			record.record_crc++;
+			break;
+		case 1:
+			record.read_rec_ptr++;
+			break;
+		case 2:
+			record.end_rec_ptr++;
+			break;
+		case 3:
+			record.rmid = RM_CLOG_ID;
+			break;
+		case 4:
+			record.info = XLOG_NEXTOID;
+			break;
+		case 5:
+			record.component_count = 1;
+			break;
+		case 6:
+			record.space_count = 1;
+			break;
+		case 7:
+			record.record_flags |= CLUSTER_COLD_RECORD_SIDE_UNOWNED;
+			break;
+		case 8:
+			operation->history_only = true;
+			break;
+		case 9:
+			operation->kind = RF_SIDE_ONLINE_OPERATION_XACT;
+			break;
+		case 10:
+			operation->identity.record.system_identifier++;
+			break;
+		case 11:
+			operation->identity.record.storage_uuid[15]++;
+			break;
+		case 12:
+			operation->identity.record.origin_thread++;
+			break;
+		case 13:
+			operation->identity.record.timeline_id++;
+			break;
+		case 14:
+			operation->identity.participant_index = 1;
+			break;
+		case 15:
+			operation->identity.reserved_zero = 1;
+			break;
+		case 16:
+			side_fixture[1].operations[2] = *operation;
+			break;
+		}
+		UT_ASSERT(!consume_control(typed, &record));
+		UT_ASSERT_EQ(control_calls, 0);
+		UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_control_dispatch_requires_original_source_and_cold_scope)
+{
+	for (int fault = 0; fault < 17; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = control_fixture(&record);
+		switch (fault) {
+		case 0:
+			cluster_cold_replay_window_leave_v1();
+			break;
+		case 1:
+			fence_current = false;
+			break;
+		case 2:
+			typed->side_capture_detail[1] = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			break;
+		case 3:
+			typed->side_plans[1] = NULL;
+			break;
+		case 4:
+			control_borrow_ok = false;
+			break;
+		case 5:
+			control_authority_ok = false;
+			break;
+		case 6:
+			control_cover_ok = false;
+			break;
+		case 7:
+			control_serial.mode = 0;
+			break;
+		case 8:
+			control_root.validated_tail_lsn_exclusive++;
+			break;
+		case 9:
+			control_token.file_txn_seq++;
+			break;
+		case 10:
+			tokens[3].file_txn_seq++;
+			break;
+		case 11:
+			typed->sources[1].claim.claim_sha256[31]++;
+			break;
+		case 12:
+			control_epoch = 0;
+			break;
+		case 13:
+			control_epoch = (uint64)UINT32_MAX + 1;
+			break;
+		case 14:
+			typed->own_participant = 1;
+			break;
+		case 15:
+			typed->replay_count = 1;
+			break;
+		case 16:
+			typed->refusal = CLUSTER_COLD_SOURCE_GAP;
+			break;
+		}
+		UT_ASSERT(!consume_control(typed, &record));
+		UT_ASSERT_EQ(control_calls, 0);
+		UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_control_dispatch_rejects_capture_or_interval_drift)
+{
+	for (int fault = 0; fault < 7; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = control_fixture(&record);
+		switch (fault) {
+		case 0:
+			side_fixture[1].cut.origin_owner_incarnation++;
+			break;
+		case 1:
+			side_fixture[1].cut.scan_end_exclusive++;
+			break;
+		case 2:
+			side_fixture[1].redo++;
+			break;
+		case 3:
+			side_fixture[1].operation_count = 0;
+			break;
+		case 4:
+			side_fixture[1].sealed = false;
+			break;
+		case 5:
+			record.read_rec_ptr = 0x100;
+			record.end_rec_ptr = 0x200;
+			break;
+		case 6:
+			record.end_rec_ptr = 0x2001;
+			break;
+		}
+		UT_ASSERT(!consume_control(typed, &record));
+		UT_ASSERT_EQ(control_calls, 0);
+		UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_control_dispatch_failure_and_late_drift_remain_refused)
+{
+	for (int fault = 1; fault <= 7; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed;
+		if (fault == 5)
+			continue;
+		typed = control_fixture(&record);
+		control_fault = fault;
+		UT_ASSERT(!consume_control(typed, &record));
+		UT_ASSERT_EQ(control_calls, fault < 5 ? 1 : 0);
+		UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+		control_fault = 0;
+		UT_ASSERT(!consume_control(typed, &record));
+		UT_ASSERT_EQ(control_calls, fault < 5 ? 1 : 0);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_control_dispatch_error_does_not_leave_success)
+{
+	ClusterColdRecordV1 record;
+	ClusterColdTypedV1 *typed = control_fixture(&record);
+	volatile bool caught = false;
+	control_fault = 5;
+	if (sigsetjmp(source_sync_exception, 0) == 0)
+		(void)consume_control(typed, &record);
+	else
+		caught = true;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(control_calls, 1);
+	UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+	control_fault = 0;
+	UT_ASSERT(!consume_control(typed, &record));
+	UT_ASSERT_EQ(control_calls, 1);
+	cluster_cold_replay_window_leave_v1();
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(29);
+	UT_PLAN(38);
+	UT_RUN(test_control_dispatch_selects_current_record_only);
+	UT_RUN(test_control_dispatch_keeps_original_space_preflight);
+	UT_RUN(test_control_dispatch_native_create_borrows_exact_typed_pair);
+	UT_RUN(test_control_dispatch_rejects_unbound_space_effect);
+	UT_RUN(test_control_dispatch_rejects_wrong_record_or_effect);
+	UT_RUN(test_control_dispatch_requires_original_source_and_cold_scope);
+	UT_RUN(test_control_dispatch_rejects_capture_or_interval_drift);
+	UT_RUN(test_control_dispatch_failure_and_late_drift_remain_refused);
+	UT_RUN(test_control_dispatch_error_does_not_leave_success);
 	UT_RUN(test_native_history_capture_gap_keeps_original_plan_but_no_side_authority);
 	UT_RUN(test_prepare_seals_own_and_fenced_generations);
 	UT_RUN(test_side_capture_bound_to_each_original_replay_source);

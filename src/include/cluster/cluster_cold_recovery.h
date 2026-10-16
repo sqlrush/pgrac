@@ -726,6 +726,12 @@ extern void cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed);
 extern bool cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed,
 											   struct ClusterRecoveryFencePlan *fence);
 
+/* Consume one original foreign control record under its existing cold
+ * authority. Selection never authorizes a full source or recovery completion. */
+extern bool cluster_cold_typed_control_v1(ClusterColdTypedV1 *typed,
+										  struct ClusterRecoveryFencePlan *fence,
+										  uint32 participant, const ClusterColdRecordV1 *record);
+
 /*
  * Before the fence plan publishes its origins recovered: each origin is a
  * replayed participant (not the founder, the same owner incarnation) whose

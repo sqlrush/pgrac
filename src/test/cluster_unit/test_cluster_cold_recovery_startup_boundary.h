@@ -87,6 +87,7 @@ static uint16 fence_count;
 static ClusterColdDetailV1 scan_result[NROOTS + 1];
 static uint64 data_token;
 static uint64 database_incarnation[NROOTS + 1];
+static uint32 scan_space_offset;
 static bool scan_space;					/* thread 2 extends relation 300 before its page record */
 static ClusterWalSourceRef restart_ref; /* this node's bootstrap-validated restart input */
 static bool restart_ref_present;
@@ -243,6 +244,8 @@ struct RfSideOnlinePlanV1 {
 	uint32 captured;
 	bool bound;
 	bool sealed;
+	uint32 operation_count;
+	RfSideOnlineOperationV1 operations[4];
 };
 static RfSideOnlinePlanV1 side_fixture[NROOTS];
 static int side_creates, side_seals, side_destroys, side_fault;
@@ -349,8 +352,8 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 		advance.payload = payload;
 		advance.payload_length = sizeof(payload);
 		memset(&record, 0, sizeof(record));
-		record.read_rec_ptr = native_redo[thread];
-		record.end_rec_ptr = native_redo[thread] + 0x100;
+		record.read_rec_ptr = native_redo[thread] + scan_space_offset;
+		record.end_rec_ptr = record.read_rec_ptr + 0x100;
 		record.prev_rec_ptr = root->checkpoint_lower_lsn;
 		record.space_count = 1;
 		record.space_ops = &advance;
@@ -375,10 +378,11 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 	component.before.mutation_token = 5;
 	memset(component.result.segment_incarnation, 7, 16);
 	component.result.mutation_token = 6;
-	record.read_rec_ptr = native_redo[thread] + (scan_space && thread == 2 ? 0x100 : 0);
+	record.read_rec_ptr
+		= native_redo[thread] + (scan_space && thread == 2 ? scan_space_offset + 0x100 : 0);
 	record.end_rec_ptr = root->validated_tail_lsn_exclusive;
-	record.prev_rec_ptr
-		= scan_space && thread == 2 ? native_redo[thread] : root->checkpoint_lower_lsn;
+	record.prev_rec_ptr = scan_space && thread == 2 ? native_redo[thread] + scan_space_offset
+													: root->checkpoint_lower_lsn;
 	record.component_count = 1;
 	record.components = &component;
 	detail = cluster_cold_plan_feed_v1(plan, participant, &record);
@@ -623,6 +627,174 @@ history_generation(uint16 thread, uint64 incarnation, XLogRecPtr lower, XLogRecP
 }
 
 
+/* Exact-record dispatch boundary: real Startup selection and revalidation,
+ * with the original SIDE consumer and authority IO represented separately. */
+static uint64 control_epoch;
+static int control_calls, control_init_calls, control_fault;
+static uint32 control_selected;
+static bool control_authority_ok, control_borrow_ok, control_cover_ok;
+static bool control_native_pair_ok;
+static ClusterRecoveryDutyKey control_duty;
+static ClusterRecoverySerialGuard control_serial;
+static ClusterControlRootSnapshot control_root;
+static ClusterControlRootReadToken control_token;
+
+uint64
+cluster_epoch_get_current(void)
+{
+	return control_epoch;
+}
+
+bool
+cluster_recovery_merge_fence_plan_authority(ClusterRecoveryFencePlan *plan, uint16 thread,
+											ClusterThreadRecoveryAuthorityV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!control_borrow_ok || !cluster_recovery_merge_fence_plan_revalidate_nowait(plan)
+		|| thread != 2)
+		return false;
+	out->duty = &control_duty;
+	out->root_snapshot = &control_root;
+	out->root_token = &control_token;
+	out->serial_guard = &control_serial;
+	return true;
+}
+
+ClusterThreadRecoveryAuthorityResultV1
+cluster_thread_recovery_authority_revalidate_nowait_v1(
+	const ClusterThreadRecoveryAuthorityV1 *authority)
+{
+	return control_authority_ok && authority != NULL && authority->duty == &control_duty
+				   && authority->root_snapshot == &control_root
+				   && authority->root_token == &control_token
+				   && authority->serial_guard == &control_serial
+				   && control_serial.mode == CLUSTER_RECOVERY_SERIAL_COLD_FORMED
+			   ? CLUSTER_THREAD_AUTHORITY_OK
+			   : CLUSTER_THREAD_AUTHORITY_ROOT_STALE;
+}
+
+bool
+cluster_thread_recovery_authority_covers_window_v1(
+	const ClusterThreadRecoveryAuthorityV1 *authority, uint16 thread, XLogRecPtr lower,
+	XLogRecPtr upper)
+{
+	return control_cover_ok && authority->duty == &control_duty && thread == 2 && lower == 0x100
+		   && upper == 0x2000;
+}
+
+bool
+rf_side_online_plan_source_matches_v1(const RfSideOnlinePlanV1 *plan, uint64 system,
+									  const uint8 uuid[16], const RfContributorStreamCutV1 *cut)
+{
+	const uint8 expected[16] = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+	return plan != NULL && plan->sealed && plan->bound && system == 9
+		   && memcmp(uuid, expected, 16) == 0 && memcmp(cut, &plan->cut, sizeof(*cut)) == 0;
+}
+
+bool
+rf_side_online_plan_replay_start_matches_v1(const RfSideOnlinePlanV1 *plan, uint32 thread,
+											uint64 incarnation, uint64 database, XLogRecPtr redo)
+{
+	return plan != NULL && plan->sealed && database == 5 && plan->cut.failed_thread == thread
+		   && plan->cut.origin_owner_incarnation == incarnation && plan->redo == redo;
+}
+
+uint32
+rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan)
+{
+	return plan != NULL && plan->sealed ? plan->operation_count : 0;
+}
+
+bool
+rf_side_online_plan_operation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+								 RfSideOnlineOperationV1 *out)
+{
+	if (plan == NULL || !plan->sealed || index >= plan->operation_count)
+		return false;
+	*out = plan->operations[index];
+	return true;
+}
+
+bool
+rf_side_online_plan_native_creation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+									   ClusterSpaceStructureChange *creation)
+{
+	/*
+	 * Decoder boundary only: actual native/typed payload pairing also has
+	 * the original real SIDE plan regression.
+	 */
+	if (!control_native_pair_ok || plan != &side_fixture[1] || index != 0
+		|| plan->operations[index].source_xid != plan->operations[2].source_xid
+		|| plan->operations[index].identity.record.end_rec_ptr
+			   > plan->operations[2].identity.record.read_rec_ptr)
+		return false;
+	memset(creation, 0, sizeof(*creation));
+	creation->identity.action = CLUSTER_SPACE_WAL_CREATE;
+	creation->identity.result.key = plan->operations[2].space_key;
+	return true;
+}
+
+bool
+rf_side_online_production_owner_init_v1(RfSideOnlineProductionOwnerV1 *owner, void *arg,
+										RfSideOnlineFreshAuthorityV1 check, uint32 epoch,
+										bool retained)
+{
+	control_init_calls++;
+	UT_ASSERT_EQ(epoch, 7);
+	UT_ASSERT(retained);
+	memset(owner, 0, sizeof(*owner));
+	owner->authority_arg = arg;
+	owner->revalidate_authority = check;
+	return control_fault != 6;
+}
+
+bool
+rf_side_online_production_bind_undo_v1(RfSideOnlineProductionOwnerV1 *owner,
+									   const ClusterThreadRecoveryAuthorityV1 *authority)
+{
+	UT_ASSERT(owner->authority_arg == authority);
+	owner->undo_authority = authority;
+	return control_fault != 7;
+}
+
+RfPageProofDetailV1
+rf_side_online_production_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+										  const RfPageOnlineRecordIdentityV1 *identity,
+										  RfSideOnlineProductionOwnerV1 *owner)
+{
+	control_calls++;
+	control_selected = index;
+	UT_ASSERT(plan == &side_fixture[1]);
+	UT_ASSERT_EQ(index, 1);
+	UT_ASSERT_EQ(memcmp(identity, &plan->operations[index].identity, sizeof(*identity)), 0);
+	UT_ASSERT(owner->undo_authority != NULL);
+	UT_ASSERT(owner->revalidate_authority(owner->authority_arg));
+	/* Preserve the real record-local owner's whole-source callback contract. */
+	for (uint32 i = 0; i < plan->operation_count; i++) {
+		const RfSideOnlineOperationV1 *op = &plan->operations[i];
+		if (!op->history_only
+			&& (op->kind == RF_SIDE_ONLINE_OPERATION_SPACE
+				|| op->kind == RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE)) {
+			if (owner->preflight_space == NULL || owner->apply_space == NULL)
+				return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+			if (!owner->preflight_space(owner->space_arg, op))
+				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			/* Record selection must not execute SPACE early. */
+		}
+	}
+	if (control_fault == 1)
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	if (control_fault == 2)
+		tokens[3].file_txn_seq++;
+	if (control_fault == 3)
+		control_authority_ok = false;
+	if (control_fault == 4)
+		control_epoch++;
+	if (control_fault == 5)
+		siglongjmp(source_sync_exception, 1);
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
 static void
 fixture(void)
 {
@@ -670,6 +842,7 @@ fixture(void)
 	source_sync_calls = source_sync_fail_thread = source_sync_fault = 0;
 	memset(source_sync_order, 0, sizeof(source_sync_order));
 	fence_current = true;
+	scan_space_offset = 0;
 	cluster_cold_replay_window_leave_v1();
 	fence_count = 2;
 	data_token = 5;

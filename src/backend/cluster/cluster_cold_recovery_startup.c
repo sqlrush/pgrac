@@ -36,9 +36,12 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "access/xlogreader.h"
+#include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cold_recovery_census.h"
 #include "cluster/cluster_side_online_plan.h"
+#include "cluster/cluster_side_online_owner.h"
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_control_root.h"
 #include "cluster/cluster_page_cold_redo.h"
 #include "cluster/cluster_recovery_duty.h"
@@ -749,6 +752,221 @@ cluster_cold_route_v1(bool shared_config, bool merge_engaged)
 	if (!merge_engaged)
 		return CLUSTER_COLD_ROUTE_NATIVE;
 	return shared_config ? CLUSTER_COLD_ROUTE_TYPED : CLUSTER_COLD_ROUTE_REFUSE;
+}
+
+static bool
+cold_control_authority_current(void *arg)
+{
+	return cluster_thread_recovery_authority_revalidate_nowait_v1(
+			   (const ClusterThreadRecoveryAuthorityV1 *)arg)
+		   == CLUSTER_THREAD_AUTHORITY_OK;
+}
+
+typedef struct ColdControlSpace {
+	ClusterColdTypedV1 *typed;
+	ClusterRecoveryFencePlan *fence;
+	uint32 participant;
+} ColdControlSpace;
+
+/* Borrow the original sealed, whole-cohort SPACE proof, not a partial
+ * per-source reconstruction. Its original ordered owner still revalidates
+ * physical bytes and performs all installs at the scheduled SPACE step. */
+static bool
+cold_control_space_input(const ColdControlSpace *context, const RfSideOnlineOperationV1 *operation)
+{
+	const ClusterColdTypedV1 *typed = context->typed;
+	uint32 relations = cluster_cold_plan_space_relation_count_v1(typed->plan);
+
+	if (operation->kind != RF_SIDE_ONLINE_OPERATION_SPACE || operation->history_only
+		|| operation->purpose != RF_SIDE_PLAN_RECOVERY || operation->owned_payload == NULL
+		|| operation->owned_payload_length == 0
+		|| operation->space_key.system_identifier != typed->observer.system_identifier
+		|| operation->space_key.database_incarnation != typed->observer.database_incarnation
+		|| memcmp(operation->space_key.storage_uuid, typed->observer.storage_uuid, 16) != 0)
+		return false;
+	for (uint32 r = 0; r < relations; r++) {
+		RelFileLocator locator;
+		uint32 count;
+		if (!cluster_cold_plan_space_relation_v1(typed->plan, r, &locator, &count))
+			return false;
+		if (!RelFileLocatorEquals(locator, operation->space_key.locator))
+			continue;
+		for (uint32 i = 0; i < count; i++) {
+			ClusterColdSpaceInputV1 input;
+			if (!cluster_cold_plan_space_input_v1(typed->plan, r, i, &input))
+				return false;
+			if (input.participant == context->participant
+				&& input.read_rec_ptr == operation->identity.record.read_rec_ptr
+				&& input.end_rec_ptr == operation->identity.record.end_rec_ptr
+				&& input.payload_length == operation->owned_payload_length && input.payload != NULL
+				&& memcmp(input.payload, operation->owned_payload, input.payload_length) == 0)
+				return true;
+		}
+		return false;
+	}
+	return false;
+}
+
+static bool
+cold_control_space_preflight(void *arg, const RfSideOnlineOperationV1 *operation)
+{
+	ColdControlSpace *context = arg;
+	const RfSideOnlinePlanV1 *plan;
+	bool matched = false;
+
+	if (context == NULL || operation == NULL || operation->history_only
+		|| operation->purpose != RF_SIDE_PLAN_RECOVERY || operation->identity.participant_index != 0
+		|| operation->identity.record.origin_thread
+			   != context->typed->participants[context->participant].thread_id
+		|| !cold_replay_sources_current(context->typed, context->fence))
+		return false;
+	plan = context->typed->side_plans[context->participant];
+	if (operation->kind == RF_SIDE_ONLINE_OPERATION_SPACE)
+		matched = cold_control_space_input(context, operation);
+	else if (operation->kind == RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE) {
+		uint32 count = rf_side_online_plan_operation_count_v1(plan);
+		for (uint32 i = 0; i < count; i++) {
+			RfSideOnlineOperationV1 candidate;
+			ClusterSpaceStructureChange creation;
+			if (!rf_side_online_plan_operation_v1(plan, i, &candidate))
+				return false;
+			if (memcmp(&candidate.identity, &operation->identity, sizeof(candidate.identity)) != 0)
+				continue;
+			/*
+			 * The existing decoder proves the complete native CREATE and
+			 * its first same-source/xid typed CREATE pair.
+			 */
+			if (!rf_side_online_plan_native_creation_v1(plan, i, &creation))
+				return false;
+			for (uint32 j = i + 1; j < count; j++) {
+				if (!rf_side_online_plan_operation_v1(plan, j, &candidate))
+					return false;
+				if (candidate.identity.participant_index != operation->identity.participant_index
+					|| candidate.kind != RF_SIDE_ONLINE_OPERATION_SPACE
+					|| candidate.route.normalized_info != XLOG_SMGR_SPACE_IDENTITY
+					|| !RelFileLocatorEquals(candidate.space_key.locator,
+											 creation.identity.result.key.locator))
+					continue;
+				matched = cold_control_space_input(context, &candidate);
+				break;
+			}
+			break;
+		}
+	}
+	return matched && cold_replay_sources_current(context->typed, context->fence);
+}
+
+static bool
+cold_control_space_not_executed(void *arg pg_attribute_unused(),
+								const RfSideOnlineOperationV1 *operation pg_attribute_unused())
+{
+	/* A control callback must never execute or mark a later SPACE effect. */
+	return false;
+}
+
+/* The original sequencer owns record order and final completion. Never
+ * dispatch the whole-source plan before intervening PAGE/SPACE records. */
+bool
+cluster_cold_typed_control_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence,
+							  uint32 participant, const ClusterColdRecordV1 *record)
+{
+	const ClusterColdParticipantV1 *source;
+	const ColdRoot *selected;
+	const RfSideOnlinePlanV1 *plan;
+	RfContributorStreamCutV1 cut = { 0 };
+	RfPageOnlineRecordIdentityV1 identity = { 0 };
+	ClusterThreadRecoveryAuthorityV1 authority;
+	RfSideOnlineProductionOwnerV1 owner;
+	ColdControlSpace space = { typed, fence, participant };
+	uint32 match = UINT32_MAX;
+	uint32 count;
+	uint64 epoch;
+
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK)
+		return false;
+	/*
+	 * ERROR from an original owner must not leave a reusable prepared-success
+	 * state. No field is restored on an exceptional exit.
+	 */
+	cold_refuse(typed, CLUSTER_COLD_SIDE_OWNER_MISSING,
+				"pass-2 foreign control consumption is incomplete");
+	if (fence == NULL || record == NULL || !cluster_cold_replay_window_active_v1()
+		|| typed->plan == NULL || typed->replay_roots == NULL || typed->own_participant != 0
+		|| typed->replay_count == 0 || typed->replay_count > typed->participant_count
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->replay_root_count != typed->replay_count || participant >= typed->replay_count
+		|| participant == typed->own_participant || typed->side_capture_detail[participant] != 0
+		|| typed->side_plans[participant] == NULL
+		|| record->record_flags != CLUSTER_COLD_RECORD_FOREIGN_CONTROL
+		|| record->component_count != 0 || record->space_count != 0
+		|| !cold_replay_sources_current(typed, fence))
+		return false;
+	source = &typed->participants[participant];
+	selected = &typed->replay_roots[participant];
+	plan = typed->side_plans[participant];
+	if (record->read_rec_ptr < source->native_redo || record->end_rec_ptr <= record->read_rec_ptr
+		|| record->end_rec_ptr > source->tail_end)
+		return false;
+	cut.failed_thread = source->thread_id;
+	cut.timeline_id = source->timeline;
+	cut.origin_owner_incarnation = source->owner_incarnation;
+	cut.scan_begin_inclusive = source->physical_lower;
+	cut.scan_end_exclusive = source->tail_end;
+	cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+	if (!rf_side_online_plan_source_matches_v1(plan, typed->system_identifier,
+											   typed->observer.storage_uuid, &cut)
+		|| !rf_side_online_plan_replay_start_matches_v1(
+			plan, source->thread_id, source->owner_incarnation,
+			typed->observer.database_incarnation, source->native_redo))
+		return false;
+	identity.record.system_identifier = typed->system_identifier;
+	memcpy(identity.record.storage_uuid, typed->observer.storage_uuid, 16);
+	identity.record.origin_thread = source->thread_id;
+	identity.record.timeline_id = source->timeline;
+	identity.record.read_rec_ptr = record->read_rec_ptr;
+	identity.record.end_rec_ptr = record->end_rec_ptr;
+	identity.record.record_crc = record->record_crc;
+	identity.record.rmid = record->rmid;
+	identity.record.info = record->info;
+	count = rf_side_online_plan_operation_count_v1(plan);
+	for (uint32 i = 0; i < count; i++) {
+		RfSideOnlineOperationV1 operation;
+		if (!rf_side_online_plan_operation_v1(plan, i, &operation))
+			return false;
+		if (operation.identity.record.read_rec_ptr != record->read_rec_ptr)
+			continue;
+		if (match != UINT32_MAX || operation.history_only
+			|| operation.kind != RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
+			|| memcmp(&operation.identity, &identity, sizeof(identity)) != 0)
+			return false;
+		match = i;
+	}
+	epoch = cluster_epoch_get_current();
+	if (match == UINT32_MAX || epoch == 0 || epoch > UINT32_MAX
+		|| !cluster_recovery_merge_fence_plan_authority(fence, source->thread_id, &authority)
+		|| authority.duty == NULL || authority.root_snapshot == NULL || authority.root_token == NULL
+		|| authority.serial_guard == NULL
+		|| authority.serial_guard->mode != CLUSTER_RECOVERY_SERIAL_COLD_FORMED
+		|| memcmp(authority.root_snapshot, &selected->root, sizeof(selected->root)) != 0
+		|| memcmp(authority.root_token, &selected->token, sizeof(selected->token)) != 0
+		|| !cold_control_authority_current(&authority)
+		|| !cluster_thread_recovery_authority_covers_window_v1(
+			&authority, source->thread_id, source->physical_lower, source->tail_end)
+		|| !rf_side_online_production_owner_init_v1(
+			&owner, &authority, cold_control_authority_current, (uint32)epoch, true)
+		|| !rf_side_online_production_bind_undo_v1(&owner, &authority))
+		return false;
+	owner.space_arg = &space;
+	owner.preflight_space = cold_control_space_preflight;
+	owner.apply_space = cold_control_space_not_executed;
+	if (rf_side_online_production_apply_record_v1(plan, match, &identity, &owner)
+			!= RF_PAGE_PROOF_DETAIL_OK
+		|| cluster_epoch_get_current() != epoch || !cold_control_authority_current(&authority)
+		|| !cold_replay_sources_current(typed, fence))
+		return false;
+	typed->refusal = CLUSTER_COLD_OK;
+	typed->refusal_detail[0] = '\0';
+	return true;
 }
 
 static void

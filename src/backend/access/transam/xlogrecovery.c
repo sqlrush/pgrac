@@ -3320,9 +3320,10 @@ cluster_typed_replay_unscheduled(void *arg, uint32 participant)
 				AdvanceNextFullTransactionIdPastXid(r->record->header.xl_xid);
 			return true;
 		case CLUSTER_COLD_UNSCHEDULED_FOREIGN_NOOP:
-			/* Another generation's native control record: no effect here
-			 * (its SCN is covered by the plan's bound). */
-			return true;
+			/* Consume the exact captured control through its original cold
+			 * owner; no-effect classification is not a source completion. */
+			return cluster_cold_typed_control_v1(typed, *rep->fence_plan, participant,
+												 &rep->decoded.record);
 		case CLUSTER_COLD_UNSCHEDULED_NATIVE:
 			break;
 	}
