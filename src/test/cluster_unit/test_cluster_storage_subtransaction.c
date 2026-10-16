@@ -164,6 +164,29 @@ UT_TEST(test_temp_and_disabled_storage_keep_native_eligibility)
 	UT_ASSERT(!delete_registered);
 }
 
+UT_TEST(test_shared_relation_path_classification_for_ddl_guard)
+{
+	reset();
+	UT_ASSERT(RelationStorageUsesClusterSharedPath(locator,
+									 InvalidBackendId,
+									 RELPERSISTENCE_PERMANENT));
+	UT_ASSERT(!RelationStorageUsesClusterSharedPath(locator,
+									 1,
+									 RELPERSISTENCE_PERMANENT));
+	UT_ASSERT(!RelationStorageUsesClusterSharedPath(locator,
+									 InvalidBackendId,
+									 RELPERSISTENCE_TEMP));
+	shared = false;
+	UT_ASSERT(!RelationStorageUsesClusterSharedPath(locator,
+									 InvalidBackendId,
+									 RELPERSISTENCE_PERMANENT));
+	cluster_enabled = false;
+	shared = true;
+	UT_ASSERT(!RelationStorageUsesClusterSharedPath(locator,
+									 InvalidBackendId,
+									 RELPERSISTENCE_PERMANENT));
+}
+
 UT_TEST(test_shared_catalog_and_internal_create_cannot_bypass_refusal)
 {
 	for (int variant = 0; variant < 3; variant++)
@@ -677,12 +700,13 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(14);
+	UT_PLAN(15);
 	UT_RUN(test_child_create_refuses_before_storage_or_abort_owner);
 	UT_RUN(test_child_drop_refuses_before_ko_or_pending_delete);
 	UT_RUN(test_child_truncate_refuses_before_flush_or_structure);
 	UT_RUN(test_private_child_create_keeps_native_cleanup);
 	UT_RUN(test_temp_and_disabled_storage_keep_native_eligibility);
+	UT_RUN(test_shared_relation_path_classification_for_ddl_guard);
 	UT_RUN(test_shared_catalog_and_internal_create_cannot_bypass_refusal);
 	UT_RUN(test_native_create_registers_abort_cleanup_before_space);
 	UT_RUN(test_rdma_tier_drop_refuses_before_any_storage_effect);

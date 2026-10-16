@@ -175,6 +175,30 @@ RelationCheckStorageDrain(RelFileLocator rlocator, char relpersistence, const ch
 }
 
 /*
+ * Return the same storage admission decision used by smgropen for a
+ * relation that is about to be removed or truncated.  Utility preflight uses
+ * this read-only predicate to select the non-transactional shared DDL rule;
+ * temporary and ordinary PostgreSQL relations remain on their native path.
+ */
+bool
+RelationStorageUsesClusterSharedPath(RelFileLocator rlocator, BackendId backend,
+									 char relpersistence)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (backend != InvalidBackendId || relpersistence == RELPERSISTENCE_TEMP
+		|| !cluster_storage_mode_enabled())
+		return false;
+
+	return cluster_smgr_which_for(rlocator, backend) == 1;
+#else
+	(void) rlocator;
+	(void) backend;
+	(void) relpersistence;
+	return false;
+#endif
+}
+
+/*
  * RelationCreateStorage
  *		Create physical storage for a relation.
  *

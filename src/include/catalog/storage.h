@@ -26,6 +26,9 @@ extern void RelationCheckStorageTransaction(RelFileLocator rlocator, char relper
 											const char *operation);
 extern void RelationCheckStorageDrain(RelFileLocator rlocator, char relpersistence,
 									  const char *operation);
+extern bool RelationStorageUsesClusterSharedPath(RelFileLocator rlocator,
+												 BackendId backend,
+												 char relpersistence);
 
 extern SMgrRelation RelationCreateStorage(RelFileLocator rlocator,
 										  char relpersistence,

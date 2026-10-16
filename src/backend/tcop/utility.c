@@ -267,6 +267,62 @@ CheckClusterSharedUtilitySupport(Node *statement)
 	if (cluster_interconnect_tier != CLUSTER_IC_TIER_1 && IsA(statement, DropOwnedStmt))
 		CheckOwnedObjectsStorageDrop((DropOwnedStmt *)statement);
 }
+
+/*
+ * Oracle-style shared DROP/TRUNCATE is a standalone operation.  The check is
+ * made after resolving the explicit relation target but before event triggers,
+ * dependency deletion, storage creation, or any cluster side effect.  The
+ * target lookup is intentionally kept separate from the error helper so
+ * non-shared and temporary relations retain PostgreSQL behavior.
+ */
+static void
+CheckClusterSharedDDLTransaction(Node *statement, bool isTopLevel)
+{
+	bool shared_target = false;
+	const char *command = NULL;
+
+	if (statement == NULL || (!cluster_shared_config && !cluster_shared_catalog))
+		return;
+
+	if (IsA(statement, DropStmt))
+	{
+		DropStmt *drop = (DropStmt *) statement;
+
+		switch (drop->removeType)
+		{
+			case OBJECT_TABLE:
+			case OBJECT_INDEX:
+			case OBJECT_SEQUENCE:
+			case OBJECT_VIEW:
+			case OBJECT_MATVIEW:
+			case OBJECT_FOREIGN_TABLE:
+				shared_target = ClusterSharedDropHasTarget(drop);
+				command = "DROP";
+				break;
+			default:
+				/* Dependency-bearing object drops are enumerated by AM05. */
+				break;
+		}
+	}
+	else if (IsA(statement, TruncateStmt))
+	{
+		shared_target = ClusterSharedTruncateHasTarget((TruncateStmt *) statement);
+		command = "TRUNCATE";
+	}
+
+	if (!shared_target)
+		return;
+
+	if (IsInTransactionBlock(isTopLevel))
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("shared relation %s must be executed as a standalone statement",
+						 command),
+				 errhint("Run this shared DROP or TRUNCATE as a standalone top-level statement.")));
+
+	/* Keep the standalone statement's Oracle-style commit boundary explicit. */
+	MyXactFlags |= XACT_FLAGS_NEEDIMMEDIATECOMMIT;
+}
 #endif
 
 /* local function declarations */
@@ -799,6 +855,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 	/* PGRAC: reject unsupported index AMs/constraints before event triggers.
 	 * Author: SqlRush <sqlrush@gmail.com> */
 	CheckClusterSharedUtilitySupport(parsetree);
+	CheckClusterSharedDDLTransaction(parsetree, isTopLevel);
 	CheckClusterIndexSupport(parsetree);
 	if (IsA(parsetree, AlterTableStmt))
 		CheckClusterSharedAlterTable((AlterTableStmt *) parsetree, queryString);
