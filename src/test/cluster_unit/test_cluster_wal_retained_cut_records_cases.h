@@ -277,6 +277,7 @@ UT_TEST(test_records_short_abort_does_not_advance_retention)
 	for (int variant = 0; variant < 7; variant++) {
 		uint32 self, peer;
 		ClusterWalRetainedCutV1 cut;
+		ClusterWalRetainedCutDiagnosticsV1 diagnostics;
 		RfPageProofDetailV1 detail;
 		bool commit = variant >= 5;
 		RealRecord *record;
@@ -289,6 +290,7 @@ UT_TEST(test_records_short_abort_does_not_advance_retention)
 		uint8 junk[4] = { 9, 9, 9, 9 };
 
 		rec_two_writers(&self, &peer);
+		memset(&diagnostics, 0xa5, sizeof(diagnostics));
 		record = record_new(self, RM_XACT_ID,
 							(commit ? XLOG_XACT_COMMIT : XLOG_XACT_ABORT) | XLOG_XACT_HAS_INFO, 803,
 							0x2000, 0x2100);
@@ -324,9 +326,11 @@ UT_TEST(test_records_short_abort_does_not_advance_retention)
 			record_append(record, &count, sizeof(count));
 			record_append(record, &sub, sizeof(sub));
 		}
-		UT_ASSERT(compute_for(self, &cut, &detail) != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(compute_for_with_diagnostics(self, &cut, &detail, &diagnostics)
+				  != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 		UT_ASSERT(detail != RF_PAGE_PROOF_DETAIL_OK);
 		UT_ASSERT_EQ(cut.lower, InvalidXLogRecPtr);
+		UT_ASSERT(diagnostics.native_effects_incomplete > 0);
 		if (variant == 0) /* reaches the native fallback, which refuses it */
 			UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE);
 		if (ut_current_failed)

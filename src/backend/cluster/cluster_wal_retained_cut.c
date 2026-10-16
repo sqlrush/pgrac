@@ -763,7 +763,8 @@ retained_dirty_merge_presync(ClusterPageWalDirtyFloorV1 *dirty)
 
 ClusterControlRootResult
 cluster_wal_retained_cut_compute_v1(const ClusterWalSourceRef *self, ClusterWalRetainedCutV1 *out,
-									RfPageProofDetailV1 *detail)
+									RfPageProofDetailV1 *detail,
+									ClusterWalRetainedCutDiagnosticsV1 *diagnostics)
 {
 	ClusterWalInputsV1 *inputs = NULL;
 	RetainedCutWork *work;
@@ -771,6 +772,8 @@ cluster_wal_retained_cut_compute_v1(const ClusterWalSourceRef *self, ClusterWalR
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
+	if (diagnostics != NULL)
+		memset(diagnostics, 0, sizeof(*diagnostics));
 	if (detail != NULL)
 		*detail = RF_PAGE_PROOF_DETAIL_OK;
 	if (self == NULL || out == NULL || detail == NULL
@@ -794,9 +797,13 @@ cluster_wal_retained_cut_compute_v1(const ClusterWalSourceRef *self, ClusterWalR
 	PG_TRY();
 	{
 		result = retained_census(work, inputs, self, out, detail);
+		if (diagnostics != NULL)
+			diagnostics->native_effects_incomplete = work->native_effects_incomplete;
 	}
 	PG_CATCH();
 	{
+		if (diagnostics != NULL)
+			diagnostics->native_effects_incomplete = work->native_effects_incomplete;
 		retained_work_release(work, &inputs);
 		pfree(work);
 		PG_RE_THROW();
@@ -912,7 +919,7 @@ cluster_wal_retained_cut_after_checkpoint_v1(void)
 		|| !cluster_wal_thread_current_v2_ref(&self))
 		return;
 	started = GetCurrentTimestamp();
-	result = cluster_wal_retained_cut_compute_v1(&self, &cut, &detail);
+	result = cluster_wal_retained_cut_compute_v1(&self, &cut, &detail, NULL);
 	censused = GetCurrentTimestamp();
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && cut.lower > cut.old_lower)
 		result = cluster_control_root_v3_retained_lower_publish(

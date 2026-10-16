@@ -95,6 +95,13 @@ typedef struct ClusterWalRetainedCutV1 {
 	uint32 native_effects_incomplete;
 } ClusterWalRetainedCutV1;
 
+/* Diagnostics from a refused census are deliberately kept separate from the
+ * proof output.  A non-zero value is an observation of malformed native
+ * effects, never a partial retention proof. */
+typedef struct ClusterWalRetainedCutDiagnosticsV1 {
+	uint32 native_effects_incomplete;
+} ClusterWalRetainedCutDiagnosticsV1;
+
 /*
  * Checkpointer only, inside CreateCheckPoint after its redo point is chosen
  * and before CheckPointGuts (D S09 R-A22): snapshots the buffers' first own
@@ -113,9 +120,10 @@ extern void cluster_wal_retained_cut_before_sync_v1(XLogRecPtr redo);
  * the output is zeroed and detail names a PAGE/SIDE decode refusal.
  * Publishing is a separate ROOT operation that must compare root_token.
  */
-extern ClusterControlRootResult cluster_wal_retained_cut_compute_v1(const ClusterWalSourceRef *self,
-																	ClusterWalRetainedCutV1 *out,
-																	RfPageProofDetailV1 *detail);
+extern ClusterControlRootResult
+cluster_wal_retained_cut_compute_v1(const ClusterWalSourceRef *self, ClusterWalRetainedCutV1 *out,
+									RfPageProofDetailV1 *detail,
+									ClusterWalRetainedCutDiagnosticsV1 *diagnostics);
 
 /*
  * Checkpointer, after its own online checkpoint is published and before WAL
