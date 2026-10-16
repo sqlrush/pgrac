@@ -171,7 +171,7 @@ UT_TEST(test_origin_waits_for_local_protocol_and_physical_ack_owners)
 		origin_wait_hook = finish_origin_local_owners;
 		run_origin(CLUSTER_KO_SHARED_V3_OPERATION_DROP);
 		UT_ASSERT_EQ(origin_waits, 1);
-		UT_ASSERT_EQ(origin_flush_calls, 2);
+		UT_ASSERT_EQ(origin_flush_calls, fault == 0 ? 1 : 2);
 		UT_ASSERT_EQ(local_relation_scan_calls, 2);
 		native_fixture_shared_memory_end();
 	}

@@ -3950,7 +3950,13 @@ ko_native_origin_checkpoint(ClusterKoCompletionV2 *owned)
 				wait_reason = CLUSTER_KO_ORIGIN_REASON_PI_SCAN_PENDING;
 				ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
 					saved_revision, wb_revision, &gate);
-				goto restart;
+				/* A pending local owner is the current bounded scan item.  Keep
+				 * its cursor and the stable gate/revision while waiting; restarting
+				 * at phase zero would repeatedly rescan every earlier registry slot
+				 * and can starve this owner from ever reaching the final proof. */
+				saved_gate = gate;
+				saved_revision = revision;
+				goto wait;
 			}
 			if (scan != CLUSTER_PCM_PI_RELATION_EMPTY
 				&& (scan != CLUSTER_PCM_PI_RELATION_MORE || cursor <= start || cursor - start > 128))
