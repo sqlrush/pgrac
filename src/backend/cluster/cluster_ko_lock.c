@@ -121,6 +121,8 @@ typedef struct ClusterKoSharedContext {
 	bool used;
 	bool v3;
 	bool complete;
+	bool origin_checkpoint;
+	bool origin_data_closed;
 	bool structure_owned;
 	bool structure_drop_pending;
 	bool structure_drop_failed; /* Original executor requires retained-WAL recovery. */
@@ -345,6 +347,8 @@ struct ClusterKoCompletionV2 {
 	bool postcommit;
 	bool native_handed_off;
 	bool native_buffers_released;
+	/* Old DATA only: the final SPACE write creates a separate obligation. */
+	bool origin_data_closed;
 	dsa_pointer native_unready;
 	/* Native DDL keeps its verified barrier in the original ResourceOwner,
 	 * releasing the transport slot before the next relation's barrier. */
@@ -374,6 +378,10 @@ static bool ko_shared_v3_space_matches(const ClusterKoSharedMessageV3 *message,
 									   const ClusterSpaceIdentity *identity);
 static dsa_area *ko_native_attach(void);
 static bool ko_shared_ready_v3(const ClusterKoSharedContext *context);
+static bool ko_origin_space_read_begin(RelFileLocator locator, ForkNumber fork,
+	BlockNumber block, ClusterKoPeerAdmissionV3 *out);
+static bool ko_origin_space_read_current(const ClusterKoPeerAdmissionV3 *sample,
+	RelFileLocator locator, ForkNumber fork, BlockNumber block);
 
 /* Process-local storage state belongs to the original active KO context.
  * It survives a checkpointer ERROR, but can never migrate to another process. */
@@ -1531,6 +1539,15 @@ cluster_ko_peer_apply_error_v3(int sqlerrcode)
 						   request.operation, sqlerrcode)));
 }
 
+/* The origin participates locally, without manufacturing a self-peer frame.
+ * Its accepted operation keeps this exclusion through cancel/AX handoff. */
+static bool
+ko_origin_fenced_locked(const ClusterKoSharedContext *entry, RelFileLocator locator)
+{
+	return entry->used && entry->v3 && entry->origin_checkpoint
+		&& RelFileLocatorEquals(entry->request.key.locator, locator);
+}
+
 bool
 cluster_ko_peer_admission_begin_v3(RelFileLocator locator, ClusterKoPeerAdmissionV3 *out)
 {
@@ -1550,8 +1567,9 @@ cluster_ko_peer_admission_begin_v3(RelFileLocator locator, ClusterKoPeerAdmissio
 		const ClusterKoPeerFenceV3 *entry = &ko_state->peer_fences[i];
 		/* READY/COMMITTED do not reopen admission. Only a separately proven
 		 * lifecycle retirement may remove this old-locator exclusion. */
-		if (entry->state != CLUSTER_KO_PEER_FENCE_EMPTY
-			&& RelFileLocatorEquals(entry->request.base.key.locator, locator))
+		if ((entry->state != CLUSTER_KO_PEER_FENCE_EMPTY
+			 && RelFileLocatorEquals(entry->request.base.key.locator, locator))
+			|| ko_origin_fenced_locked(&ko_state->contexts[i], locator))
 			allowed = false;
 	}
 	if (allowed) {
@@ -1571,7 +1589,8 @@ cluster_ko_peer_admission_current_v3(const ClusterKoPeerAdmissionV3 *admission,
 	 * before releasing that original lock; the later drain must observe it. */
 	return ko_state != NULL && admission != NULL && cluster_shared_config
 		   && cluster_interconnect_tier == CLUSTER_IC_TIER_1 && admission->cleaner.serial == 0
-		   && admission->extension_serial == 0 && admission->revision != 0
+		   && admission->extension_serial == 0 && admission->origin_serial == 0
+		   && admission->revision != 0
 		   && admission->revision != UINT64_MAX && RelFileLocatorEquals(admission->locator, locator)
 		   && pg_atomic_read_u64(&ko_state->peer_admission_revision) == admission->revision;
 }
@@ -1639,6 +1658,16 @@ ko_cleaner_fences_allow_locked(RelFileLocator locator, const ClusterCtrcCleanerR
 		return false;
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
 		const ClusterKoPeerFenceV3 *entry = &ko_state->peer_fences[i];
+		const ClusterKoSharedContext *origin = &ko_state->contexts[i];
+		if (ko_origin_fenced_locked(origin, locator)) {
+			if (fenced != NULL)
+				*fenced = true;
+			if (origin->origin_data_closed || origin->origin_detached || origin->ax_failed
+				|| origin->request.key.system_identifier != scope->system_identifier
+				|| origin->request.epoch != scope->formation_epoch
+				|| origin->request.origin_boot != scope->boot_incarnation)
+				return false;
+		}
 		if (entry->state == CLUSTER_KO_PEER_FENCE_EMPTY
 			|| !RelFileLocatorEquals(entry->request.base.key.locator, locator))
 			continue;
@@ -1761,6 +1790,17 @@ ko_extend_fences_allow_locked(const ClusterKoExtendWorkV3 *work)
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
 		const ClusterKoPeerFenceV3 *entry = &ko_state->peer_fences[i];
 		const ClusterKoSharedMessageV2 *request = &entry->request.base;
+		const ClusterKoSharedContext *origin = &ko_state->contexts[i];
+		if (ko_origin_fenced_locked(origin, work->locator)) {
+			const ClusterKoSharedMessageV2 *r = &origin->request;
+			if (origin->origin_data_closed || origin->origin_detached || origin->ax_failed
+				|| r->epoch != work->epoch
+				|| r->origin_boot != work->writer.claim.identity.origin_owner_incarnation
+				|| r->key.system_identifier != work->writer.claim.identity.system_identifier
+				|| r->key.database_incarnation != work->writer.claim.database_incarnation
+				|| memcmp(r->key.storage_uuid, work->writer.claim.identity.storage_uuid, 16) != 0)
+				return false;
+		}
 		if (entry->state == CLUSTER_KO_PEER_FENCE_EMPTY
 			|| !RelFileLocatorEquals(request->key.locator, work->locator))
 			continue;
@@ -1846,7 +1886,8 @@ cluster_ko_peer_read_begin_v3(RelFileLocator locator, ForkNumber fork, BlockNumb
 	if (out == NULL || ko_state == NULL || !cluster_shared_config
 		|| cluster_interconnect_tier != CLUSTER_IC_TIER_1)
 		return false;
-	if (ko_storage_read_begin(locator, fork, block, out))
+	if (ko_origin_space_read_begin(locator, fork, block, out)
+		|| ko_storage_read_begin(locator, fork, block, out))
 		return true;
 	if (!cluster_ctrc_cleaner_read_scope_snapshot_v3(locator, fork, block, &scope)
 		|| scope.worker >= CLUSTER_CTRC_CLEANER_WORKERS)
@@ -1873,6 +1914,8 @@ bool
 cluster_ko_peer_read_current_v3(const ClusterKoPeerAdmissionV3 *admission, RelFileLocator locator,
 								ForkNumber fork, BlockNumber block)
 {
+	if (admission != NULL && admission->origin_serial != 0)
+		return ko_origin_space_read_current(admission, locator, fork, block);
 	if (admission != NULL && admission->extension_serial != 0)
 		return ko_state != NULL && admission->cleaner.serial == 0
 			   && ((admission->extension_serial == ko_extend_local.serial
@@ -1979,8 +2022,9 @@ ko_create_begin(RelFileLocator locator, bool raw_copy, bool buffer_copy, uint64 
 	if (revision == 0 || revision == UINT64_MAX || ko_state->extend_serial == UINT64_MAX)
 		goto done;
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
-		if (ko_state->peer_fences[i].state != CLUSTER_KO_PEER_FENCE_EMPTY
-			&& RelFileLocatorEquals(ko_state->peer_fences[i].request.base.key.locator, locator))
+		if ((ko_state->peer_fences[i].state != CLUSTER_KO_PEER_FENCE_EMPTY
+			 && RelFileLocatorEquals(ko_state->peer_fences[i].request.base.key.locator, locator))
+			|| ko_origin_fenced_locked(&ko_state->contexts[i], locator))
 			goto done;
 		if (!ko_state->extend_work[i].used) {
 			available++;
@@ -2143,9 +2187,10 @@ cluster_ko_create_end_v3(uint64 serial, bool complete)
 			retired = true;
 		}
 		for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
-			if (ko_state->peer_fences[i].state != CLUSTER_KO_PEER_FENCE_EMPTY
+			if ((ko_state->peer_fences[i].state != CLUSTER_KO_PEER_FENCE_EMPTY
 				&& RelFileLocatorEquals(ko_state->peer_fences[i].request.base.key.locator,
-										ko_create_local.locator)) {
+										ko_create_local.locator))
+				|| ko_origin_fenced_locked(&ko_state->contexts[i], ko_create_local.locator)) {
 				uint64 revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
 				pg_atomic_write_u64(&ko_state->peer_admission_revision,
 									revision == 0 || revision == UINT64_MAX ? UINT64_MAX : revision + 1);
@@ -2211,9 +2256,10 @@ cluster_ko_extend_begin_v3(RelFileLocator locator, ForkNumber fork, uint64 *seri
 				   sizeof(ko_create_local)) != 0 || !ko_extend_fences_allow_locked(&ko_create_local)))
 		goto done;
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
-		if (ko_state->peer_fences[i].state != CLUSTER_KO_PEER_FENCE_EMPTY
-			&& RelFileLocatorEquals(ko_state->peer_fences[i].request.base.key.locator, locator)
-			&& parent == 0) {
+		if (parent == 0
+			&& ((ko_state->peer_fences[i].state != CLUSTER_KO_PEER_FENCE_EMPTY
+				 && RelFileLocatorEquals(ko_state->peer_fences[i].request.base.key.locator, locator))
+				|| ko_origin_fenced_locked(&ko_state->contexts[i], locator))) {
 			if (retry != NULL)
 				*retry = true;
 			goto done;
@@ -2294,9 +2340,10 @@ cluster_ko_extend_end_v3(uint64 serial)
 		}
 		/* Any scan which overlapped this finite owner must retry. */
 		for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
-			if (ko_state->peer_fences[i].state != CLUSTER_KO_PEER_FENCE_EMPTY
+			if ((ko_state->peer_fences[i].state != CLUSTER_KO_PEER_FENCE_EMPTY
 				&& RelFileLocatorEquals(ko_state->peer_fences[i].request.base.key.locator,
-										ko_extend_local.locator)) {
+										ko_extend_local.locator))
+				|| ko_origin_fenced_locked(&ko_state->contexts[i], ko_extend_local.locator)) {
 				uint64 revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
 				pg_atomic_write_u64(&ko_state->peer_admission_revision,
 									revision == 0 || revision == UINT64_MAX ? UINT64_MAX
@@ -3538,6 +3585,9 @@ ko_completion_snapshot(const ClusterKoCompletionV2 *completion, ClusterKoSharedC
 	if (owned->barrier_private) {
 		if (!owned->native_transaction
 			|| (!owned->barrier_v3 && owned->slot != CLUSTER_KO_SHARED_CAPACITY)
+			|| (owned->barrier_v3
+				&& owned->barrier_request_v3.operation == CLUSTER_KO_SHARED_V3_OPERATION_DROP
+				&& !owned->origin_data_closed)
 			|| owned->serial == 0)
 			return false;
 		memset(out, 0, sizeof(*out));
@@ -3547,6 +3597,7 @@ ko_completion_snapshot(const ClusterKoCompletionV2 *completion, ClusterKoSharedC
 		out->drop_identity = owned->drop_identity;
 		out->drop_identity_serial = owned->drop_identity_serial;
 		out->v3 = owned->barrier_v3;
+		out->origin_checkpoint = out->origin_data_closed = owned->origin_data_closed;
 		out->request = owned->barrier_v3 ? owned->barrier_request_v3.base
 											: owned->barrier_request;
 		if (owned->barrier_v3) {
@@ -3600,6 +3651,261 @@ ko_native_barrier_to_owner(ClusterKoCompletionV2 *completion)
 	}
 	SpinLockRelease(&ko_state->shared_lock);
 	return moved;
+}
+
+/* Snapshot the same accepted origin operation before old DATA is closed.
+ * No private caller flag supplies an AX grant, peer result or identity. */
+static bool
+ko_origin_checkpoint_snapshot(const ClusterKoCompletionV2 *owned, ClusterKoSharedContext *out)
+{
+	bool valid;
+	if (owned == NULL || *ko_completion_link(owned) != owned || ko_state == NULL
+		|| !owned->native_transaction || !owned->barrier_private || !owned->barrier_v3
+		|| owned->barrier_request_v3.operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP
+		|| owned->native_handed_off || owned->postcommit || owned->pid != MyProcPid
+		|| !ko_completion_owner_current(owned) || CurrentResourceOwner == NULL
+		|| CritSectionCount != 0 || owned->slot >= CLUSTER_KO_SHARED_CAPACITY)
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	*out = ko_state->contexts[owned->slot];
+	valid = out->used && out->v3 && out->complete && !out->structure_owned
+		&& !out->origin_detached && !out->ax_release_requested && !out->ax_failed
+		&& out->cancel_sqlerrcode == 0 && out->pid == owned->pid && out->serial == owned->serial
+		&& out->drop_identity == owned->drop_identity
+		&& out->drop_identity_serial == owned->drop_identity_serial
+		&& memcmp(&out->request_v3, &owned->barrier_request_v3, sizeof(out->request_v3)) == 0
+		&& memcmp(out->peer_boots, owned->barrier_boots, sizeof(out->peer_boots)) == 0;
+	SpinLockRelease(&ko_state->shared_lock);
+	return valid && ko_shared_ready_v3(out) && ko_shared_origin_current(out)
+		&& ko_shared_v3_local_binding_current(&out->request_v3);
+}
+
+static bool
+ko_origin_checkpoint_cut_current(const ClusterKoCompletionV2 *owned,
+	const ClusterKoSharedContext *before, uint64 revision, const ResourceXGateSnapshot *gate)
+{
+	ClusterKoSharedContext after;
+	ResourceXGateSnapshot current;
+	return ko_origin_checkpoint_snapshot(owned, &after)
+		&& memcmp(before, &after, sizeof(after)) == 0
+		&& pg_atomic_read_u64(&ko_state->peer_admission_revision) == revision
+		&& cluster_pcm_lock_resource_x_gate_snapshot(&current)
+		&& memcmp(gate, &current, sizeof(current)) == 0;
+}
+
+/* Same object checkpoint, local execution: no self REQUEST/READY and no
+ * terminal or file-delete proof. Stack cursors cannot survive ERROR/cancel.
+ * The original shared operation retains admission/AX responsibility. */
+static void
+ko_native_origin_checkpoint(ClusterKoCompletionV2 *owned)
+{
+	ClusterKoSharedContext before;
+	ResourceXGateSnapshot saved_gate = {0};
+	uint64 saved_revision = 0;
+	uint32 cursor = 0;
+	uint8 phase = 0;
+	bool armed = false;
+	RelFileLocator locator;
+
+	if (!ko_origin_checkpoint_snapshot(owned, &before))
+		goto invalid;
+	locator = before.request.key.locator;
+	SpinLockAcquire(&ko_state->shared_lock);
+	{
+		uint64 revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+		ClusterKoSharedContext *entry = &ko_state->contexts[owned->slot];
+		if (revision != 0 && revision < UINT64_MAX - 1 && !entry->origin_checkpoint
+			&& memcmp(entry, &before, sizeof(before)) == 0 && !ko_drop_closed_locked(locator)) {
+			entry->origin_checkpoint = true;
+			(void)pg_atomic_fetch_add_u64(&ko_state->peer_admission_revision, 1);
+			armed = true;
+		}
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	if (!armed)
+		goto invalid;
+
+	for (;;) {
+		ResourceXGateSnapshot gate;
+		uint64 revision, wb_revision = 0;
+		uint32 budget = 128;
+		SMgrRelation smgr;
+		bool finite, closed = false;
+
+		CHECK_FOR_INTERRUPTS();
+		if (!ko_origin_checkpoint_snapshot(owned, &before) || !before.origin_checkpoint)
+			goto invalid;
+		revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+		if (revision == 0 || revision == UINT64_MAX
+			|| !cluster_pcm_lock_resource_x_gate_snapshot(&gate)
+			|| gate.phase != RESOURCE_X_GATE_OPEN
+			|| !cluster_ctrc_relation_removal_ready_shared(locator.spcOid, locator.dbOid,
+				locator.relNumber))
+			goto restart;
+		if (revision != saved_revision || memcmp(&saved_gate, &gate, sizeof(gate)) != 0) {
+			phase = 0;
+			cursor = 0;
+		}
+		SpinLockAcquire(&ko_state->shared_lock);
+		finite = ko_cleaner_pending_locked(locator) || ko_extend_pending_locked(locator);
+		SpinLockRelease(&ko_state->shared_lock);
+		if (finite || !ko_origin_checkpoint_cut_current(owned, &before, revision, &gate))
+			goto restart;
+		smgr = smgropen(locator, InvalidBackendId);
+		while (phase < 3 && budget > 0) {
+			if (phase == 1) {
+				for (ForkNumber fork = MAIN_FORKNUM; fork <= MAX_FORKNUM; fork++) {
+					if (smgrexists(smgr, fork))
+						smgrimmedsync(smgr, fork);
+					if (!ko_origin_checkpoint_cut_current(owned, &before, revision, &gate))
+						goto restart;
+				}
+				phase = 2;
+			} else {
+				uint32 start = cursor, remaining = budget;
+				ClusterBufferDrainResult result
+					= cluster_bufmgr_drain_relation_v3(smgr, phase == 0, &budget, &cursor);
+				if (budget > remaining || cursor < start || cursor - start > remaining - budget)
+					goto invalid;
+				if (!ko_origin_checkpoint_cut_current(owned, &before, revision, &gate))
+					goto restart;
+				if (result == CLUSTER_BUFFER_DRAIN_EMPTY) {
+					phase++;
+					cursor = 0;
+				} else if (result == CLUSTER_BUFFER_DRAIN_REDIRTIED && phase == 2)
+					goto restart;
+				else if (result == CLUSTER_BUFFER_DRAIN_WAIT || result == CLUSTER_BUFFER_DRAIN_MORE)
+					break;
+				else
+					goto invalid;
+			}
+		}
+		if (phase == 3) {
+			uint32 start = cursor;
+			ClusterPcmPiRelationScanV2 scan
+				= cluster_pcm_lock_ko_local_relation_scan_v3(locator, gate.formation, 128, &cursor);
+			if (scan == CLUSTER_PCM_PI_RELATION_PENDING)
+				goto restart;
+			if (scan != CLUSTER_PCM_PI_RELATION_EMPTY
+				&& (scan != CLUSTER_PCM_PI_RELATION_MORE || cursor <= start || cursor - start > 128))
+				goto invalid;
+			if (scan == CLUSTER_PCM_PI_RELATION_EMPTY) {
+				if (!cluster_pi_writeback_local_relation_closed_v3(locator, before.request.epoch,
+						&wb_revision))
+					goto restart;
+				closed = true;
+			}
+		}
+		if (!ko_origin_checkpoint_cut_current(owned, &before, revision, &gate))
+			goto restart;
+		if (closed) {
+			ResourceXGateSnapshot final_gate;
+			if (!cluster_ctrc_relation_removal_ready_shared(locator.spcOid, locator.dbOid,
+					locator.relNumber)
+				|| !cluster_pi_writeback_local_revision_current_v3(wb_revision))
+				goto restart;
+			SpinLockAcquire(&ko_state->shared_lock);
+			closed = revision < UINT64_MAX - 1
+				&& pg_atomic_read_u64(&ko_state->peer_admission_revision) == revision
+				&& memcmp(&ko_state->contexts[owned->slot], &before, sizeof(before)) == 0
+				&& !ko_cleaner_pending_locked(locator) && !ko_extend_pending_locked(locator)
+				&& cluster_pi_writeback_local_revision_current_v3(wb_revision)
+				/* Original bounded atomic reader; no PCM/CF lock under KO. */
+				&& cluster_pcm_lock_resource_x_gate_snapshot(&final_gate)
+				&& memcmp(&final_gate, &gate, sizeof(gate)) == 0;
+			if (closed) {
+				ko_state->contexts[owned->slot].origin_data_closed = true;
+				owned->origin_data_closed = true;
+				(void)pg_atomic_fetch_add_u64(&ko_state->peer_admission_revision, 1);
+			}
+			SpinLockRelease(&ko_state->shared_lock);
+			if (closed)
+				return;
+			goto restart;
+		}
+		saved_gate = gate;
+		saved_revision = revision;
+		goto wait;
+	restart:
+		phase = 0;
+		cursor = 0;
+		saved_revision = 0;
+	wait:
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 100L,
+			WAIT_EVENT_CLUSTER_OBJECT_FLUSH_WAIT);
+		ResetLatch(MyLatch);
+	}
+
+invalid:
+	ereport(ERROR, (errcode(ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE),
+		errmsg("could not prove the native DROP origin checkpoint"),
+		errhint("Retry after the original object and formation owners have settled.")));
+}
+
+/* Local, immutable owner qualification only. Safe under a buffer header;
+ * CONTROL/AX/shared slot validation belongs to the begin outside that lock. */
+static bool
+ko_origin_space_owner_current(const ClusterKoCompletionV2 *owned, RelFileLocator locator)
+{
+	return owned->native_transaction && owned->barrier_private && owned->barrier_v3
+		&& owned->origin_data_closed && !owned->native_handed_off && !owned->postcommit
+		&& owned->pid == MyProcPid && ko_completion_owner_current(owned)
+		&& owned->barrier_request_v3.operation == CLUSTER_KO_SHARED_V3_OPERATION_DROP
+		&& RelFileLocatorEquals(owned->barrier_request_v3.base.key.locator, locator);
+}
+
+static bool
+ko_origin_space_read_begin(RelFileLocator locator, ForkNumber fork, BlockNumber block,
+	ClusterKoPeerAdmissionV3 *out)
+{
+	ClusterKoCompletionV2 *candidate = NULL;
+	ClusterKoSharedContext before;
+	bool allowed;
+	uint64 revision;
+
+	if (fork != SPACE_FORKNUM || block > 1 || RecoveryInProgress())
+		return false;
+	for (ClusterKoCompletionV2 *owned = ko_completions; owned != NULL; owned = owned->next) {
+		if (!ko_origin_space_owner_current(owned, locator))
+			continue;
+		if (candidate != NULL)
+			return false;
+		candidate = owned;
+	}
+	if (candidate == NULL || !ko_origin_checkpoint_snapshot(candidate, &before)
+		|| !before.origin_checkpoint || !before.origin_data_closed)
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+	allowed = revision != 0 && revision != UINT64_MAX && !ko_drop_closed_locked(locator)
+		&& memcmp(&ko_state->contexts[candidate->slot], &before, sizeof(before)) == 0;
+	if (allowed) {
+		memset(out, 0, sizeof(*out));
+		out->locator = locator;
+		out->fork = fork;
+		out->block = block;
+		out->revision = revision;
+		out->origin_serial = candidate->serial;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	return allowed;
+}
+
+static bool
+ko_origin_space_read_current(const ClusterKoPeerAdmissionV3 *sample, RelFileLocator locator,
+	ForkNumber fork, BlockNumber block)
+{
+	if (ko_state == NULL || !cluster_shared_config || cluster_interconnect_tier != CLUSTER_IC_TIER_1
+		|| sample->origin_serial == 0 || sample->extension_serial != 0 || sample->cleaner.serial != 0
+		|| fork != SPACE_FORKNUM || block > 1 || sample->fork != fork || sample->block != block
+		|| !RelFileLocatorEquals(sample->locator, locator) || sample->revision == 0
+		|| sample->revision == UINT64_MAX
+		|| pg_atomic_read_u64(&ko_state->peer_admission_revision) != sample->revision)
+		return false;
+	for (const ClusterKoCompletionV2 *owned = ko_completions; owned != NULL; owned = owned->next)
+		if (owned->serial == sample->origin_serial)
+			return ko_origin_space_owner_current(owned, locator);
+	return false;
 }
 
 static bool
@@ -3909,6 +4215,7 @@ ko_native_publish(ClusterKoCompletionV2 *owned, bool from_commit_tail)
 	work->context.drop_identity = owned->drop_identity;
 	work->context.drop_identity_serial = owned->drop_identity_serial;
 	work->context.v3 = owned->barrier_v3;
+	work->context.origin_checkpoint = work->context.origin_data_closed = owned->origin_data_closed;
 	work->context.request = owned->barrier_v3 ? owned->barrier_request_v3.base
 											: owned->barrier_request;
 	if (owned->barrier_v3) {
@@ -3919,7 +4226,9 @@ ko_native_publish(ClusterKoCompletionV2 *owned, bool from_commit_tail)
 	memcpy(work->context.peer_boots, owned->barrier_boots, sizeof(owned->barrier_boots));
 	work->context.terminal = owned->terminal;
 	memcpy(work->context.structure, owned->structure, sizeof(owned->structure));
-	qualified = qualified && (!owned->barrier_v3 || ko_shared_ready_v3(&work->context));
+	qualified = qualified && (!owned->barrier_v3 || (ko_shared_ready_v3(&work->context)
+		&& (owned->barrier_request_v3.operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP
+			|| owned->origin_data_closed)));
 	work->context.structure_owned = qualified;
 	work->recovery_required = !qualified;
 	work->buffers_released = qualified
@@ -6670,6 +6979,8 @@ cluster_ko_flush_and_wait_ack_relation(Relation rel, char relpersistence, uint16
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE),
 					 errmsg("could not preserve the KO v3 completion proof")));
+		if (operation == CLUSTER_KO_SHARED_V3_OPERATION_DROP)
+			ko_native_origin_checkpoint(completion);
 		completion->native_pending = true;
 		return;
 	}

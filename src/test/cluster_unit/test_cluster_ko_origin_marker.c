@@ -164,8 +164,11 @@ UT_TEST(test_origin_identity_capacity_refuses_before_marker_and_peer_send)
 
 UT_TEST(test_origin_publication_closes_before_pending_delete_and_survives_ax_release)
 {
+	ClusterKoNativeContinuation *work;
 	(void)prepare_origin(CLUSTER_KO_SHARED_V3_OPERATION_DROP);
 	origin_native_tail();
+	work = dsa_get_address(ko_native_area, storage.native_incoming);
+	UT_ASSERT(work->context.origin_checkpoint && work->context.origin_data_closed);
 	UT_ASSERT(open_at_publication && closed_before_deletes);
 	UT_ASSERT(cluster_ko_directory_drop_committed_v3(origin_request.base.key.locator));
 	UT_ASSERT(!origin_io_allowed());
@@ -251,6 +254,8 @@ UT_TEST(test_seventy_two_native_aborts_reuse_reservations_after_exact_s6)
 
 		rel.rd_locator.relNumber++;
 		space_identity.key.locator = rel.rd_locator;
+		/* Origin now executes its local census for this exact operation. */
+		local_scan_rel_number = rel.rd_locator.relNumber;
 		/* The registration fixture counts sends within one operation. Do
 		 * not reset any shared owner, identity table or release state. */
 		barrier_requests = 0;

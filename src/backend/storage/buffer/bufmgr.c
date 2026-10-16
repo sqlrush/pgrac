@@ -11129,8 +11129,8 @@ FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 }
 
 #ifdef USE_PGRAC_CLUSTER
-/* A qualified SI owner resumes the native flush/drop walks here. The cursor
- * counts descriptors, not matches; blocked ownership stays at that descriptor.
+/* A qualified SI or native origin owner resumes the flush/drop walks here.
+ * The cursor counts descriptors, not matches; blocked ownership stays there.
  * The caller keeps its object fence and performs the original per-fork sync
  * between the flush and invalidation passes. */
 ClusterBufferDrainResult

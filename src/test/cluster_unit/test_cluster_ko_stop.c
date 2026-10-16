@@ -227,6 +227,12 @@ static uint64 member_generation;
 static bool capture_ok, cap_ok, space_ok, generation_race;
 static bool native_commit_active;
 static uint32 (*native_capability_hook)(void);
+static unsigned origin_drain_calls, origin_flush_calls, origin_invalidate_calls;
+static unsigned origin_sync_calls, origin_waits;
+static uint32 origin_synced_forks;
+static ClusterBufferDrainResult (*origin_drain_hook)(bool, uint32 *, uint32 *);
+static void (*origin_sync_hook)(ForkNumber);
+static void (*origin_wait_hook)(void);
 static int fixture_error_level;
 static unsigned fixture_log_events;
 
@@ -803,11 +809,20 @@ GetCurrentTimestamp(void)
 void
 ResetLatch(Latch *latch)
 {
-	Assert(barrier_active);
+	Assert(barrier_active || (drive_v3_ack && MyBackendType == B_BACKEND));
 }
 int
 WaitLatch(Latch *latch, int events, long timeout, uint32 wait_event)
 {
+	if (!barrier_active && drive_v3_ack && MyBackendType == B_BACKEND) {
+		UT_ASSERT_EQ(wait_event, WAIT_EVENT_CLUSTER_OBJECT_FLUSH_WAIT);
+		UT_ASSERT_EQ(timeout, 100);
+		if (++origin_waits > 32)
+			abort();
+		if (origin_wait_hook != NULL)
+			origin_wait_hook();
+		return WL_TIMEOUT;
+	}
 	Assert(barrier_active && timeout > 0);
 	barrier_waits++;
 	if (cancel_wait)
@@ -1157,6 +1172,18 @@ ClusterBufferDrainResult
 cluster_bufmgr_drain_relation_v3(SMgrRelation smgr, bool flush, uint32 *budget, uint32 *cursor)
 {
 	UT_ASSERT(smgr == &relation && *budget > 0 && *budget <= 128);
+	if (drive_v3_ack && MyBackendType == B_BACKEND) {
+		origin_drain_calls++;
+		if (flush)
+			origin_flush_calls++;
+		else {
+			origin_invalidate_calls++;
+			UT_ASSERT_EQ(origin_synced_forks, existing_forks);
+		}
+		if (origin_drain_hook != NULL)
+			return origin_drain_hook(flush, budget, cursor);
+		return CLUSTER_BUFFER_DRAIN_EMPTY;
+	}
 	buffer_drain_calls++;
 	buffer_drain_input = *cursor;
 	if (buffer_drain_result != CLUSTER_BUFFER_DRAIN_EMPTY && (!buffer_drain_drop_only || !flush)) {
@@ -1207,6 +1234,15 @@ smgrexists(SMgrRelation smgr, ForkNumber fork)
 void
 smgrimmedsync(SMgrRelation smgr, ForkNumber fork)
 {
+	if (drive_v3_ack && MyBackendType == B_BACKEND) {
+		UT_ASSERT(smgr == &relation);
+		UT_ASSERT(origin_flush_calls > 0);
+		origin_sync_calls++;
+		origin_synced_forks |= 1u << fork;
+		if (origin_sync_hook != NULL)
+			origin_sync_hook(fork);
+		return;
+	}
 	Assert(smgr == &relation && !flushing
 		   && (ko_peer_attempt_active ? flush_count >= drop_count + 1
 									  : flush_count == drop_count + 1));
@@ -1274,6 +1310,11 @@ reset_test(void)
 	native_alloc_fail = false;
 	native_commit_active = false;
 	native_capability_hook = NULL;
+	origin_drain_calls = origin_flush_calls = origin_invalidate_calls = 0;
+	origin_sync_calls = origin_waits = origin_synced_forks = 0;
+	origin_drain_hook = NULL;
+	origin_sync_hook = NULL;
+	origin_wait_hook = NULL;
 	ko_drop_poll_boundary = NULL;
 	fixture_log_events = 0;
 	ko_drop_scan = 0;

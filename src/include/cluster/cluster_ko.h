@@ -214,6 +214,7 @@ typedef struct ClusterKoPeerAdmissionV3 {
 	BlockNumber block;
 	ClusterCtrcCleanerReadScopeV3 cleaner;
 	uint64 extension_serial;
+	uint64 origin_serial; /* Exact native DROP's final SPACE writer only. */
 } ClusterKoPeerAdmissionV3;
 
 extern bool cluster_ko_peer_admission_begin_v3(RelFileLocator locator,
