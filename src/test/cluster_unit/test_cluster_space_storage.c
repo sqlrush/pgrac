@@ -35,6 +35,7 @@
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_xnode_profile.h"
 #include "cluster/storage/cluster_smgr.h"
+#include "cluster/storage/cluster_shared_fs.h"
 #include "miscadmin.h"
 #include "replication/origin.h"
 #include "storage/bufmgr.h"
@@ -135,6 +136,34 @@ static bool cold_drop_second_refused;
 static bool drop_verify_fixture, post_drop_io, post_drop_throw, post_drop_lose_namespace;
 static unsigned post_drop_calls, post_drop_reads;
 static uint32 post_drop_forks;
+static unsigned final_sync_calls;
+static unsigned final_sync_fault;
+static bool final_shared_backend = true;
+
+const ClusterSharedFsOps *
+cluster_shared_fs_get_active_ops(void)
+{
+	static const ClusterSharedFsOps shared_ops = { .id = CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS };
+	static const ClusterSharedFsOps local_ops = { .id = CLUSTER_SHARED_FS_BACKEND_LOCAL };
+
+	return final_shared_backend ? &shared_ops : &local_ops;
+}
+
+bool
+cluster_shared_fs_sharedfs_sync_drop_result(RelFileLocator target)
+{
+	UT_ASSERT(RelFileLocatorEquals(target, locator));
+	UT_ASSERT_EQ(post_drop_calls, 1);
+	UT_ASSERT(post_drop_reads > 0 && cold_commit_window);
+	final_sync_calls++;
+	if (final_sync_fault == 2)
+		have_ref = false;
+	if (final_sync_fault == 3)
+		cold_commit_window = false;
+	if (final_sync_fault == 4)
+		post_drop_forks |= 1U << SPACE_FORKNUM;
+	return final_sync_fault != 1;
+}
 bool
 cluster_cold_replay_window_active_v1(void)
 {
@@ -1316,6 +1345,8 @@ reset(void)
 	cold_drop_second_refused = false;
 	drop_verify_fixture = post_drop_io = post_drop_throw = post_drop_lose_namespace = false;
 	post_drop_calls = post_drop_reads = post_drop_forks = 0;
+	final_sync_calls = final_sync_fault = 0;
+	final_shared_backend = true;
 	cold_truncate_permitted = cold_vm_clear = true;
 	native_commits = commit_decisions = 0;
 	plain_commit_emitter = false;
@@ -3177,6 +3208,7 @@ UT_TEST(test_cold_final_drop_checks_deleted_result_without_reinstall)
 	UT_ASSERT_EQ(final_installs, 0);
 	UT_ASSERT(post_drop_reads > reads);
 	UT_ASSERT_EQ(post_drop_calls, 1);
+	UT_ASSERT_EQ(final_sync_calls, 1);
 	FreeFakeRelcacheEntry(rel);
 }
 
@@ -3260,6 +3292,25 @@ UT_TEST(test_cold_final_drop_rejects_incomplete_or_unbound_result)
 		expecting_error = false;
 		UT_ASSERT(caught || !ok);
 		UT_ASSERT_EQ(post_drop_calls, 1);
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
+UT_TEST(test_cold_final_drop_sync_failure_or_lost_scope_refuses)
+{
+	for (unsigned fault = 1; fault <= 5; fault++) {
+		XLogReaderState reader;
+		DecodedXLogRecord decoded;
+		Relation rel = drop_replay_record(&reader, &decoded);
+		ClusterColdTypedV1 typed;
+		ClusterColdTypedReplay rep = { &typed };
+
+		final_drop_fixture(&typed, &reader);
+		final_sync_fault = fault;
+		final_shared_backend = fault != 5;
+		UT_ASSERT(!cluster_typed_replay_space_final(&rep, 0));
+		UT_ASSERT_EQ(final_sync_calls, fault == 5 ? 0 : 1);
+		UT_ASSERT_EQ(final_installs, 0);
 		FreeFakeRelcacheEntry(rel);
 	}
 }
@@ -3760,9 +3811,10 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(72);
+	UT_PLAN(73);
 	UT_RUN(test_cold_final_drop_checks_deleted_result_without_reinstall);
 	UT_RUN(test_cold_final_drop_rejects_incomplete_or_unbound_result);
+	UT_RUN(test_cold_final_drop_sync_failure_or_lost_scope_refuses);
 	UT_RUN(test_cold_final_non_drop_keeps_original_install);
 	UT_RUN(test_cold_native_drop_requires_empty_main_and_no_auxiliary_forks);
 	UT_RUN(test_cold_native_drop_preserves_post_unlink_io_and_namespace_refusal);

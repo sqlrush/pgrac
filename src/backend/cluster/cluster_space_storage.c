@@ -31,6 +31,7 @@
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
+#include "cluster/storage/cluster_shared_fs.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/buf_internals.h"
@@ -1375,6 +1376,23 @@ cluster_space_cold_drop_postcondition_v1(const ClusterSpaceIdentityKey *key,
 		|| !space_identity_key_matches(key, &change.identity.result.key))
 		return false;
 	return space_drop_physical_result(key, source->origin_thread);
+}
+
+/* The original sequencer invokes this only after executing every scheduled
+ * record and draining all source cuts. Retain the cold proof across physical
+ * sync; it grants neither replay-from-absence nor final ROOT publication. */
+bool
+cluster_space_cold_drop_sync_v1(const ClusterSpaceIdentityKey *key,
+								const ClusterSpaceRecoveryInput *input,
+								const ClusterSpaceColdSourceV1 *source)
+{
+	const ClusterSharedFsOps *ops = cluster_shared_fs_get_active_ops();
+
+	if (ops == NULL || ops->id != CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS
+		|| !cluster_space_cold_drop_postcondition_v1(key, input, source)
+		|| !cluster_shared_fs_sharedfs_sync_drop_result(key->locator))
+		return false;
+	return cluster_space_cold_drop_postcondition_v1(key, input, source);
 }
 
 bool

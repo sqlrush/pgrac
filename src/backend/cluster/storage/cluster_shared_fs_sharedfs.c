@@ -658,6 +658,67 @@ done:
 	return durable;
 }
 
+/* The cold owner has already executed the exact native DROP and excludes
+ * other writers. Sync its existing result only: never truncate, unlink or
+ * adopt a replacement here. Two bounded raw descriptors live only within
+ * this call; allocate first, then use non-throwing I/O and close on every exit.
+ * This physical result is not a replay or recovery-completion certificate. */
+bool
+cluster_shared_fs_sharedfs_sync_drop_result(RelFileLocator locator)
+{
+	SharedFsDropFork forks[MAX_FORKNUM + 1];
+	char *paths[MAX_FORKNUM + 1];
+	char *parent;
+	struct stat parent_identity;
+	int directory = -1;
+	int saved_errno;
+	bool synced = false;
+
+	if (!enableFsync || !OidIsValid(locator.relNumber)) {
+		errno = EINVAL;
+		return false;
+	}
+	memset(forks, 0, sizeof(forks));
+	for (ForkNumber fork = MAIN_FORKNUM; fork <= MAX_FORKNUM; fork++) {
+		paths[fork] = cluster_shared_fs_sharedfs_relpath(locator, fork);
+		forks[fork].fd = -1;
+		forks[fork].name = strrchr(paths[fork], '/') + 1;
+	}
+	parent = pstrdup(paths[MAIN_FORKNUM]);
+	*strrchr(parent, '/') = '\0';
+	directory = open(parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | PG_BINARY);
+	if (directory < 0 || fstat(directory, &parent_identity) != 0)
+		goto done;
+	forks[MAIN_FORKNUM].fd
+		= openat(directory, forks[MAIN_FORKNUM].name, O_RDWR | O_NOFOLLOW | O_NONBLOCK | PG_BINARY);
+	if (forks[MAIN_FORKNUM].fd < 0
+		|| fstat(forks[MAIN_FORKNUM].fd, &forks[MAIN_FORKNUM].identity) != 0
+		|| !sharedfs_drop_namespace_matches(directory, parent, &parent_identity, forks, true))
+		goto done;
+	if (pg_fsync(forks[MAIN_FORKNUM].fd) != 0
+		|| !sharedfs_drop_namespace_matches(directory, parent, &parent_identity, forks, true)
+		|| pg_fsync(directory) != 0
+		|| !sharedfs_drop_namespace_matches(directory, parent, &parent_identity, forks, true))
+		goto done;
+	synced = true;
+
+done:
+	saved_errno = errno != 0 ? errno : EIO;
+	if (forks[MAIN_FORKNUM].fd >= 0 && close(forks[MAIN_FORKNUM].fd) != 0) {
+		synced = false;
+		saved_errno = errno;
+	}
+	if (directory >= 0 && close(directory) != 0) {
+		synced = false;
+		saved_errno = errno;
+	}
+	for (ForkNumber fork = MAIN_FORKNUM; fork <= MAX_FORKNUM; fork++)
+		pfree(paths[fork]);
+	pfree(parent);
+	errno = synced ? 0 : saved_errno;
+	return synced;
+}
+
 /* Original checkpointer work owns these raw descriptors across ERROR cleanup.
  * No pointer into a transaction/checkpointer scratch context is retained. */
 typedef struct SharedFsDropWorkFork {

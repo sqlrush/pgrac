@@ -204,4 +204,10 @@ extern bool cluster_space_cold_drop_postcondition_v1(const ClusterSpaceIdentityK
 													 const ClusterSpaceRecoveryInput *input,
 													 const ClusterSpaceColdSourceV1 *source);
 
+/* Final executed DROP result: verify, sync MAIN and its directory, then
+ * recheck the same cold namespace/source. No deletion or completion publish. */
+extern bool cluster_space_cold_drop_sync_v1(const ClusterSpaceIdentityKey *key,
+											const ClusterSpaceRecoveryInput *input,
+											const ClusterSpaceColdSourceV1 *source);
+
 #endif /* CLUSTER_SPACE_STORAGE_H */
