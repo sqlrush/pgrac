@@ -26,6 +26,7 @@
 #define USE_PGRAC_CLUSTER 1
 
 #include "postgres.h"
+#include <setjmp.h>
 
 #include "access/xlogreader.h"
 #include "cluster/cluster_cold_recovery.h"
@@ -678,10 +679,164 @@ UT_TEST(test_refusal_hints)
 			  != NULL);
 }
 
+static bool
+sync_sources(ClusterColdTypedV1 *typed)
+{
+	return cluster_cold_typed_sync_sources_v1(typed, (ClusterRecoveryFencePlan *)&fixture_context);
+}
+
+UT_TEST(test_source_barrier_all_replay_generations_only)
+{
+	ClusterColdTypedV1 *typed;
+
+	fixture();
+	history_generation(2, 9, 0x40, 0x80);
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(source_sync_calls, 0); /* pass 1 remains read only */
+	cluster_cold_replay_window_enter_v1();
+	UT_ASSERT(sync_sources(typed));
+	UT_ASSERT_EQ(source_sync_calls, 3);
+	UT_ASSERT_EQ(source_sync_order[0], 1);
+	UT_ASSERT_EQ(source_sync_order[1], 2);
+	UT_ASSERT_EQ(source_sync_order[2], 3);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	cluster_cold_replay_window_leave_v1();
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
+UT_TEST(test_source_barrier_refuses_sync_or_tail_failure_stickily)
+{
+	for (int fault = 1; fault <= 5; fault++)
+		for (uint16 thread = 1; thread <= NROOTS; thread++) {
+			ClusterColdTypedV1 *typed;
+
+			fixture();
+			typed = prepare(0x800);
+			source_sync_fault = fault;
+			source_sync_fail_thread = thread;
+			cluster_cold_replay_window_enter_v1();
+			UT_ASSERT(!sync_sources(typed));
+			UT_ASSERT_EQ(source_sync_calls, thread);
+			UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+			source_sync_fail_thread = 0;
+			UT_ASSERT(!sync_sources(typed));
+			UT_ASSERT_EQ(source_sync_calls, thread);
+			cluster_cold_replay_window_leave_v1();
+			cluster_cold_typed_destroy_v1(&typed);
+		}
+}
+
+UT_TEST(test_source_barrier_final_whole_scope_recheck)
+{
+	for (int fault = 6; fault <= 7; fault++) {
+		ClusterColdTypedV1 *typed;
+
+		fixture();
+		typed = prepare(0x800);
+		source_sync_fault = fault;
+		source_sync_fail_thread = NROOTS;
+		cluster_cold_replay_window_enter_v1();
+		UT_ASSERT(!sync_sources(typed));
+		UT_ASSERT_EQ(source_sync_calls, NROOTS);
+		UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_source_barrier_whole_source_preflight_before_sync)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		ClusterColdTypedV1 *typed;
+
+		fixture();
+		typed = prepare(0x800);
+		switch (fault) {
+		case 0:
+			source_result[3] = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			break;
+		case 1:
+			database_incarnation[3]++;
+			break;
+		case 2:
+			native_redo[3]++;
+			break;
+		case 3:
+			tokens[3].file_txn_seq++;
+			break;
+		case 4:
+			typed->sources[2].claim.claim_sha256[31] ^= 1;
+			break;
+		}
+		cluster_cold_replay_window_enter_v1();
+		UT_ASSERT(!sync_sources(typed));
+		UT_ASSERT_EQ(source_sync_calls, 0);
+		UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_source_barrier_requires_cold_window_and_original_scope)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		ClusterColdTypedV1 *typed;
+
+		fixture();
+		typed = prepare(0x800);
+		if (fault != 0)
+			cluster_cold_replay_window_enter_v1();
+		switch (fault) {
+		case 1:
+			fence_current = false;
+			break;
+		case 2:
+			typed->replay_count--;
+			break;
+		case 3:
+			typed->own_participant = typed->participant_count;
+			break;
+		case 4:
+			fence_count--;
+			break;
+		}
+		UT_ASSERT(!sync_sources(typed));
+		UT_ASSERT_EQ(source_sync_calls, 0);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+	UT_ASSERT(!sync_sources(NULL));
+}
+
+UT_TEST(test_source_barrier_error_does_not_leave_success)
+{
+	ClusterColdTypedV1 *typed;
+	volatile bool caught = false;
+
+	fixture();
+	typed = prepare(0x800);
+	source_sync_fault = 8;
+	source_sync_fail_thread = 2;
+	cluster_cold_replay_window_enter_v1();
+	if (sigsetjmp(source_sync_exception, 0) == 0)
+		(void)sync_sources(typed);
+	else
+		caught = true;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(source_sync_calls, 2);
+	UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+	source_sync_fail_thread = 0;
+	UT_ASSERT(!sync_sources(typed));
+	UT_ASSERT_EQ(source_sync_calls, 2);
+	cluster_cold_replay_window_leave_v1();
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(25);
 	UT_RUN(test_prepare_seals_own_and_fenced_generations);
 	UT_RUN(test_prepare_takes_history_generations_from_the_census);
 	UT_RUN(test_prepare_refuses_what_the_census_refuses);
@@ -701,6 +856,12 @@ main(void)
 	UT_RUN(test_observed_page_classification);
 	UT_RUN(test_refusal_hints);
 	UT_RUN(test_plan_memory_budget_parameter);
+	UT_RUN(test_source_barrier_all_replay_generations_only);
+	UT_RUN(test_source_barrier_refuses_sync_or_tail_failure_stickily);
+	UT_RUN(test_source_barrier_final_whole_scope_recheck);
+	UT_RUN(test_source_barrier_whole_source_preflight_before_sync);
+	UT_RUN(test_source_barrier_requires_cold_window_and_original_scope);
+	UT_RUN(test_source_barrier_error_does_not_leave_success);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

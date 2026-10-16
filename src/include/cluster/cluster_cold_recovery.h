@@ -676,6 +676,7 @@ extern void cluster_cold_durable_barrier_v1(const ClusterColdTouchedV1 *touched)
 struct ClusterRecoveryFencePlan;
 
 struct ClusterWalInputsV1;
+struct ClusterColdReplayRootV1;
 
 typedef struct ClusterColdTypedV1 {
 	MemoryContext context;
@@ -685,6 +686,8 @@ typedef struct ClusterColdTypedV1 {
 	uint32 participant_count;
 	uint32 replay_count; /* [0, replay_count): crashed; the rest history only */
 	uint32 own_participant;
+	struct ClusterColdReplayRootV1 *replay_roots; /* original pass-1 selection, not fresh roots */
+	uint32 replay_root_count;
 	struct ClusterWalInputsV1 *inputs;				   /* census read scope, released by pass 1 */
 	uint32 input_index[CLUSTER_COLD_MAX_PARTICIPANTS]; /* history: index in that scope */
 	uint64 system_identifier;
@@ -697,6 +700,11 @@ typedef struct ClusterColdTypedV1 {
 extern ClusterColdTypedV1 *cluster_cold_typed_prepare_v1(struct ClusterRecoveryFencePlan *fence,
 														 uint16 own_thread, XLogRecPtr own_redo);
 extern void cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed);
+
+/* Sync the selected crashed sources before pass-2 mutations. No replay or
+ * completion authority is created; a refusal invalidates this typed attempt. */
+extern bool cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed,
+											   struct ClusterRecoveryFencePlan *fence);
 
 /*
  * Before the fence plan publishes its origins recovered: each origin is a

@@ -90,6 +90,12 @@ static uint64 database_incarnation[NROOTS + 1];
 static bool scan_space;					/* thread 2 extends relation 300 before its page record */
 static ClusterWalSourceRef restart_ref; /* this node's bootstrap-validated restart input */
 static bool restart_ref_present;
+static int source_sync_calls;
+static uint16 source_sync_order[NROOTS];
+static uint16 source_sync_fail_thread;
+static int source_sync_fault;
+static bool fence_current;
+static sigjmp_buf source_sync_exception;
 
 bool
 cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
@@ -136,14 +142,70 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *root,
 {
 	uint16 thread = root->identity.origin_thread_id;
 
-	UT_ASSERT_EQ(memcmp(token, &tokens[thread], sizeof(*token)), 0);
 	memset(source, 0, sizeof(*source));
+	if (memcmp(token, &tokens[thread], sizeof(*token)) != 0
+		|| memcmp(root, &roots[thread], sizeof(*root)) != 0)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	source->claim.identity = root->identity;
 	source->claim.database_incarnation = database_incarnation[thread];
 	memset(source->claim.claim_sha256, thread, sizeof(source->claim.claim_sha256));
 	source->timeline = root->checkpoint_tli;
 	*redo = native_redo[thread];
 	return source_result[thread];
+}
+
+bool
+cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *plan)
+{
+	return plan != NULL && fence_current;
+}
+
+ClusterControlRootResult
+cluster_control_root_recovery_sync_v1(const ClusterControlRootSnapshot *root,
+									  const ClusterControlRootReadToken *token,
+									  ClusterWalTailObservation *out)
+{
+	uint16 thread = root->identity.origin_thread_id;
+
+	UT_ASSERT_EQ(memcmp(root, &roots[thread], sizeof(*root)), 0);
+	UT_ASSERT_EQ(memcmp(token, &tokens[thread], sizeof(*token)), 0);
+	if (source_sync_calls < NROOTS)
+		source_sync_order[source_sync_calls] = thread;
+	source_sync_calls++;
+	memset(out, 0, sizeof(*out));
+	out->complete_end = root->validated_tail_lsn_exclusive;
+	out->last_record_start = root->tail_last_record_lsn;
+	out->last_record_crc = root->tail_last_record_crc32c;
+	out->database_incarnation = database_incarnation[thread];
+	if (thread != source_sync_fail_thread)
+		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	switch (source_sync_fault) {
+	case 1:
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	case 2:
+		out->complete_end++;
+		break;
+	case 3:
+		out->last_record_start++;
+		break;
+	case 4:
+		out->last_record_crc++;
+		break;
+	case 5:
+		out->database_incarnation++;
+		break;
+	case 6:
+		database_incarnation[1]++;
+		break;
+	case 7:
+		fence_current = false;
+		break;
+	case 8:
+		siglongjmp(source_sync_exception, 1);
+	default:
+		break;
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
 uint16
@@ -518,6 +580,10 @@ fixture(void)
 	memset(restart_ref.claim.claim_sha256, 1, sizeof(restart_ref.claim.claim_sha256));
 	restart_ref.timeline = 1;
 	restart_ref_present = true;
+	source_sync_calls = source_sync_fail_thread = source_sync_fault = 0;
+	memset(source_sync_order, 0, sizeof(source_sync_order));
+	fence_current = true;
+	cluster_cold_replay_window_leave_v1();
 	fence_count = 2;
 	data_token = 5;
 	contexts_alive = 0;

@@ -55,7 +55,7 @@ int cluster_cold_recovery_plan_memory = CLUSTER_COLD_PLAN_MEMORY_DEFAULT_KB;
 	(CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID            \
 	 | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID)
 
-typedef struct ColdRoot {
+typedef struct ClusterColdReplayRootV1 {
 	ClusterControlRootSnapshot root;
 	ClusterControlRootReadToken token;
 } ColdRoot;
@@ -497,8 +497,10 @@ cluster_cold_typed_prepare_v1(ClusterRecoveryFencePlan *fence, uint16 own_thread
 	typed = (ClusterColdTypedV1 *)palloc0(sizeof(*typed));
 	typed->context = context;
 	roots = (ColdRoot *)palloc0(sizeof(ColdRoot) * CLUSTER_COLD_MAX_PARTICIPANTS);
+	typed->replay_roots = roots;
 	if (!cold_collect_roots(typed, fence, own_thread, roots))
 		goto done;
+	typed->replay_root_count = typed->participant_count;
 	for (uint32 i = 0; i < typed->participant_count; i++)
 		if (!cold_participant(typed, &roots[i], i))
 			goto done;
@@ -516,7 +518,6 @@ cluster_cold_typed_prepare_v1(ClusterRecoveryFencePlan *fence, uint16 own_thread
 		typed->refusal = CLUSTER_COLD_OK;
 
 done:
-	pfree(roots);
 	MemoryContextSwitchTo(old_context);
 	return typed;
 }
@@ -534,7 +535,100 @@ cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed_address)
 		cluster_wal_inputs_release_v1(&typed->inputs);
 	if (typed->plan != NULL)
 		cluster_cold_plan_destroy_v1(&typed->plan);
+	if (typed->replay_roots != NULL)
+		pfree(typed->replay_roots);
 	MemoryContextDelete(typed->context);
+}
+
+/* Re-select through each original ROOT token, never through a newer root. */
+static bool
+cold_replay_sources_current(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
+{
+	if ((uint32)cluster_recovery_merge_fence_plan_origin_count(fence) + 1 != typed->replay_count
+		|| !cluster_recovery_merge_fence_plan_revalidate_nowait(fence))
+		return false;
+	for (uint32 i = 0; i < typed->replay_count; i++) {
+		const ColdRoot *selected = &typed->replay_roots[i];
+		const ClusterWalSourceRef *expected = &typed->sources[i];
+		const ClusterColdParticipantV1 *participant = &typed->participants[i];
+		ClusterWalSourceRef source;
+		XLogRecPtr redo;
+
+		if (i != typed->own_participant) {
+			ColdRoot origin;
+			uint16 thread;
+
+			/* prepare() keeps the founder first, then the fence-plan order. */
+			if (!cluster_recovery_merge_fence_plan_origin(fence, i - 1, &thread, &origin.root,
+														  &origin.token)
+				|| thread != participant->thread_id
+				|| memcmp(&origin.root, &selected->root, sizeof(origin.root)) != 0
+				|| memcmp(&origin.token, &selected->token, sizeof(origin.token)) != 0)
+				return false;
+		}
+		if (cluster_control_root_recovery_source_v1(&selected->root, &selected->token, &source,
+													&redo)
+				!= CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			|| !cluster_control_root_identity_equal(&source.claim.identity,
+													&expected->claim.identity)
+			|| source.claim.database_incarnation != expected->claim.database_incarnation
+			|| source.claim.max_config_generation != expected->claim.max_config_generation
+			|| memcmp(source.claim.claim_sha256, expected->claim.claim_sha256, 32) != 0
+			|| source.timeline != expected->timeline
+			|| participant->thread_id != selected->root.identity.origin_thread_id
+			|| participant->owner_incarnation != selected->root.identity.origin_owner_incarnation
+			|| participant->timeline != selected->root.checkpoint_tli
+			|| participant->physical_lower != selected->root.checkpoint_lower_lsn
+			|| participant->tail_end != selected->root.validated_tail_lsn_exclusive
+			|| participant->native_redo != redo)
+			return false;
+	}
+	return cluster_recovery_merge_fence_plan_revalidate_nowait(fence);
+}
+
+bool
+cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
+{
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK)
+		return false;
+	/* ERROR from an original source owner must not leave a reusable OK plan. */
+	cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "pass-2 source durability is incomplete");
+	if (fence == NULL || !cluster_cold_replay_window_active_v1() || typed->plan == NULL
+		|| typed->replay_roots == NULL || typed->own_participant != 0 || typed->replay_count == 0
+		|| typed->replay_count > typed->participant_count
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->replay_root_count != typed->replay_count
+		|| cluster_cold_plan_participant_count_v1(typed->plan) != typed->participant_count
+		|| !cold_replay_sources_current(typed, fence))
+		return false;
+
+	/* The original source owner releases CF before syncing WAL/claim/dirs,
+	 * then rechecks its complete cut. No target consumer has run yet. */
+	for (uint32 i = 0; i < typed->replay_count; i++) {
+		const ColdRoot *selected = &typed->replay_roots[i];
+		ClusterWalTailObservation observed;
+		ClusterControlRootResult result;
+
+		result
+			= cluster_control_root_recovery_sync_v1(&selected->root, &selected->token, &observed);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			|| observed.complete_end != selected->root.validated_tail_lsn_exclusive
+			|| observed.last_record_start != selected->root.tail_last_record_lsn
+			|| observed.last_record_crc != selected->root.tail_last_record_crc32c
+			|| observed.database_incarnation != typed->sources[i].claim.database_incarnation
+			|| !cluster_recovery_merge_fence_plan_revalidate_nowait(fence)) {
+			cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
+						"thread %u pass-2 source sync refused (root result %d)",
+						(unsigned)typed->participants[i].thread_id, (int)result);
+			return false;
+		}
+	}
+	/* A later source's IO must not hide earlier source or scope drift. */
+	if (!cold_replay_sources_current(typed, fence))
+		return false;
+	typed->refusal = CLUSTER_COLD_OK;
+	typed->refusal_detail[0] = '\0';
+	return true;
 }
 
 ClusterColdRouteV1

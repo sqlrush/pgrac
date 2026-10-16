@@ -3687,6 +3687,10 @@ cluster_recovery_typed_replay(ClusterColdTypedV1 **typed_address, TimeLineID *re
 										  "the selected source cannot be opened");
 	}
 	cluster_cold_replay_window_enter_v1();
+	if (!cluster_cold_typed_sync_sources_v1(typed, *fence_plan))
+		cluster_recovery_typed_fail(fence_plan, typed_address,
+									"typed cold recovery source durability refused",
+									typed->refusal_detail);
 	cluster_recovery_merge_window_enter();
 	cluster_recovery_merge_set_own_lsn((uint64) typed->participants[typed->own_participant].native_redo);
 	if (cluster_cold_replay_run_v1(typed->plan, typed->participants, typed->participant_count,
