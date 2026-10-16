@@ -273,6 +273,7 @@
 #include "cluster/cluster_cf_phase2.h" /* PGRAC: spec-5.6 T6 cross-node verify */
 #include "cluster/cluster_cf_storage.h" /* PGRAC: spec-5.6 bootstrap authority window */
 #include "cluster/cluster_conf.h" /* PGRAC: RF-B exact one-node gate */
+#include "cluster/cluster_cold_recovery.h" /* PGRAC: hold restartpoint during typed cold replay */
 #include "cluster/cluster_gcs_block.h" /* PGRAC: spec-6.12h D-h2 PI-discard checkpoint seal */
 #include "cluster/cluster_guc.h" /* PGRAC: spec-5.6 cluster_controlfile_shared_authority */
 #include "cluster/cluster_hw_snapshot.h" /* PGRAC: spec-5.7 D3 HW authority checkpoint snapshot */
@@ -10177,6 +10178,19 @@ static void
 RecoveryRestartPoint(const CheckPoint *checkPoint, XLogReaderState *record)
 {
 #ifdef USE_PGRAC_CLUSTER
+	/* A typed cold replay window owns the retained cut.  Do not publish an
+	 * own-thread checkpoint from inside that window as a restartpoint: doing
+	 * so would let a later restart skip records that pass two has not yet
+	 * consumed.  The startup owner closes the window after the full replay;
+	 * no checkpointer wait is introduced here. */
+	if (cluster_cold_replay_window_active_v1())
+	{
+		elog(trace_recovery(DEBUG2),
+			 "skipping restart point from typed cold replay window at %X/%X",
+			 LSN_FORMAT_ARGS(checkPoint->redo));
+		return;
+	}
+
 	/*
 	 * PGRAC: spec-6.4 P1-c -- a FOREIGN WAL thread's checkpoint record must
 	 * never become this node's restartpoint anchor.  Its redo/record LSNs
