@@ -11,7 +11,9 @@
 #include "access/subtrans.h"
 #include "miscadmin.h"
 #include "access/xlog_internal.h"
+#include "access/xlogutils.h"
 #include "catalog/pg_control.h"
+#include "cluster/cluster_mode.h"
 #include "cluster/cluster_native_startup.h"
 #include "cluster/cluster_multixact.h"
 #include "cluster/cluster_remote_xact.h"
@@ -646,6 +648,46 @@ side_owner_assignment(const RfSideOnlineOperationV1 *operation, bool apply)
 	return ok;
 }
 
+/* These native controls describe their source's control file/allocators or
+ * standby readers. They do not replace the founder's own native redo. */
+static bool
+side_owner_native_control_kind(const RfSideOnlineOperationV1 *operation)
+{
+	const RfPageReplayRecordIdentityV1 *record = &operation->identity.record;
+	uint8 info = record->info & ~XLR_INFO_MASK;
+
+	if (record->rmid == RM_STANDBY_ID)
+		return info == XLOG_STANDBY_LOCK || info == XLOG_RUNNING_XACTS;
+	if (record->rmid != RM_XLOG_ID)
+		return false;
+	switch (info) {
+	case XLOG_CHECKPOINT_SHUTDOWN:
+	case XLOG_CHECKPOINT_ONLINE:
+	case XLOG_NEXTOID:
+	case XLOG_PARAMETER_CHANGE:
+	case XLOG_FPW_CHANGE:
+	case XLOG_SWITCH:
+	case XLOG_NOOP:
+	case XLOG_BACKUP_END:
+	case XLOG_RESTORE_POINT:
+	case XLOG_END_OF_RECOVERY:
+	case XLOG_OVERWRITE_CONTRECORD:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool
+side_owner_cold_control_no_effect(const RfSideOnlineProductionOwnerV1 *owner,
+								  const RfSideOnlineOperationV1 *operation)
+{
+	return side_owner_cold_formed(owner) && cluster_node_id >= 0
+		   && cluster_node_id <= SCN_MAX_VALID_NODE_ID
+		   && operation->identity.record.origin_thread != cluster_node_id + 1
+		   && standbyState == STANDBY_DISABLED && side_owner_native_control_kind(operation);
+}
+
 static bool
 side_owner_preflight_control(void *arg, const RfSideOnlineOperationV1 *operation)
 {
@@ -682,46 +724,32 @@ side_owner_preflight_control(void *arg, const RfSideOnlineOperationV1 *operation
 			return false;
 		if (record->rmid == RM_XACT_ID && info == XLOG_XACT_ASSIGNMENT)
 			return side_owner_assignment(operation, false);
-		return record->rmid == RM_STANDBY_ID && info == XLOG_INVALIDATIONS && DatabasePath == NULL
-			   && rf_side_standby_invalidation_preflight_v1(operation->owned_payload,
-															operation->owned_payload_length);
+		if (record->rmid == RM_STANDBY_ID && info == XLOG_INVALIDATIONS)
+			return DatabasePath == NULL
+				   && rf_side_standby_invalidation_preflight_v1(operation->owned_payload,
+																operation->owned_payload_length);
+		return side_owner_cold_control_no_effect(owner, operation);
 	}
 	if (scope->authority->serial_guard->mode != CLUSTER_RECOVERY_SERIAL_ONLINE)
 		return false;
-	if (record->rmid == RM_STANDBY_ID)
-		return info == XLOG_STANDBY_LOCK || info == XLOG_RUNNING_XACTS;
-	if (record->rmid != RM_XLOG_ID)
-		return false;
-	switch (info) {
-	case XLOG_CHECKPOINT_SHUTDOWN:
-	case XLOG_CHECKPOINT_ONLINE:
-	case XLOG_NEXTOID:
-	case XLOG_PARAMETER_CHANGE:
-	case XLOG_FPW_CHANGE:
-	case XLOG_SWITCH:
-	case XLOG_NOOP:
-	case XLOG_BACKUP_END:
-	case XLOG_RESTORE_POINT:
-	case XLOG_END_OF_RECOVERY:
-	case XLOG_OVERWRITE_CONTRECORD:
-		return true;
-	default:
-		return false;
-	}
+	return side_owner_native_control_kind(operation);
 }
 
 static bool
 side_owner_apply_control(void *arg, const RfSideOnlineOperationV1 *operation)
 {
 	RfSideOnlineProductionOwnerV1 *owner = arg;
+	bool cold_no_effect;
 
 	if (!side_owner_preflight_control(arg, operation))
 		return false;
+	cold_no_effect = side_owner_cold_control_no_effect(owner, operation);
 	if (side_owner_cold_formed(owner) && operation->identity.record.rmid == RM_XACT_ID) {
 		if (!side_owner_assignment(operation, true)
 			|| !side_owner_preflight_control(arg, operation))
 			return false;
-	} else if (side_owner_cold_formed(owner)) {
+	} else if (side_owner_cold_formed(owner) && operation->identity.record.rmid == RM_STANDBY_ID
+			   && (operation->identity.record.info & ~XLR_INFO_MASK) == XLOG_INVALIDATIONS) {
 		xl_invalidations *copy = owner_alloc(operation->owned_payload_length);
 
 		if (copy == NULL)
@@ -749,6 +777,12 @@ side_owner_apply_control(void *arg, const RfSideOnlineOperationV1 *operation)
 			return false;
 	}
 	cluster_scn_recovery_replay_observe(operation->control_scn);
+	/* A source/role change cannot convert the cold no-effect classification
+	 * into an online success after observing the original SCN. */
+	if (cold_no_effect
+		&& (!side_owner_cold_control_no_effect(owner, operation)
+			|| !side_owner_preflight_control(arg, operation)))
+		return false;
 	return true;
 }
 

@@ -149,6 +149,9 @@ static uint32 control_observe_calls;
 static bool control_scope_test, control_scope_denied, control_fresh = true;
 static int control_scope_fault;
 static bool control_observe_throw, control_expire_after_observe;
+static bool cold_control_test;
+static unsigned cold_control_drift;
+int cluster_node_id = 0;
 static TimestampTz canonical_projection_time;
 static uint16 canonical_projection_wrap;
 static TransactionId canonical_expected_xid = 818;
@@ -371,7 +374,8 @@ cluster_undo_recovery_origin_authorized_v1(int node)
 bool
 cluster_undo_recovery_cold_origin_authorized_v1(int node)
 {
-	return (cold_clog_test || cold_mx_test || cold_standalone_cache_test || cold_assignment_test)
+	return (cold_clog_test || cold_mx_test || cold_standalone_cache_test || cold_assignment_test
+			|| cold_control_test)
 		   && !cold_clog_denied && canonical_scope != NULL && node == 2;
 }
 
@@ -795,6 +799,13 @@ cluster_scn_recovery_replay_observe(SCN scn)
 		control_observe_calls++;
 		if (control_expire_after_observe)
 			control_fresh = false;
+		if (cold_control_drift == 1)
+			standbyState = STANDBY_INITIALIZED;
+		else if (cold_control_drift == 2)
+			cluster_node_id = 2;
+		else if (cold_control_drift == 3)
+			((ClusterRecoverySerialGuard *)canonical_scope->authority->serial_guard)->mode
+				= CLUSTER_RECOVERY_SERIAL_ONLINE;
 	}
 }
 
@@ -7019,6 +7030,209 @@ UT_TEST(test_cold_standalone_cache_error_and_expiry_leave_no_completion)
 	}
 }
 
+
+/* Mutations caught: treating every cold control as unsupported, dropping a
+ * foreign invalidation with the controls, or accepting stale primary/source
+ * context after SCN observation. Use the real immutable plan and owner. */
+static void
+cold_control_reset(void)
+{
+	control_scope_test = cold_control_test = true;
+	control_scope_denied = cold_clog_denied = false;
+	control_fresh = true;
+	control_scope_fault = 0;
+	control_observe_throw = control_expire_after_observe = false;
+	cold_control_drift = 0;
+	cluster_node_id = 0;
+	standbyState = STANDBY_DISABLED;
+	control_observed_scn = control_observe_calls = 0;
+	canonical_writes = canonical_syncs = cold_cache_calls = cold_source_calls = 0;
+	cold_clog_applies = cold_clog_verifies = cold_locks_calls = 0;
+	memset(&prepare_apply, 0, sizeof(prepare_apply));
+}
+
+static void
+cold_control_owner(RfSideOnlineProductionOwnerV1 *owner,
+				   ClusterThreadRecoveryAuthorityV1 *authority, ClusterRecoveryDutyKey *duty)
+{
+	duty->system_identifier = UINT64_C(0x11223344);
+	duty->origin_owner_incarnation = 9;
+	memset(duty->storage_uuid, 0x44, 16);
+	UT_ASSERT(rf_side_online_production_owner_init_v1(owner, authority, control_authority_fresh, 19,
+													  true));
+	UT_ASSERT(rf_side_online_production_bind_undo_v1(owner, authority));
+}
+
+UT_TEST(test_cold_foreign_control_consumes_no_founder_or_transaction_effects)
+{
+	static const uint8 infos[] = { XLOG_CHECKPOINT_SHUTDOWN,
+								   XLOG_CHECKPOINT_ONLINE,
+								   XLOG_PARAMETER_CHANGE,
+								   XLOG_FPW_CHANGE,
+								   XLOG_NEXTOID,
+								   XLOG_NOOP,
+								   XLOG_SWITCH,
+								   XLOG_BACKUP_END,
+								   XLOG_RESTORE_POINT,
+								   XLOG_END_OF_RECOVERY,
+								   XLOG_OVERWRITE_CONTRECORD };
+	for (unsigned i = 0; i < lengthof(infos); i++)
+		for (unsigned standby = 0; standby < 2; standby++) {
+			RfSideOnlinePlanV1 *plan = control_online_plan(
+				infos[i], standby == 0 ? XLOG_STANDBY_LOCK : XLOG_RUNNING_XACTS);
+			ClusterRecoveryDutyKey duty = canonical_duty;
+			ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
+			ClusterThreadRecoveryAuthorityV1 authority = { .duty = &duty, .serial_guard = &guard };
+			RfSideOnlineProductionOwnerV1 owner;
+			cold_control_reset();
+			cold_control_owner(&owner, &authority, &duty);
+			UT_ASSERT_EQ(rf_side_online_production_preflight_v1(plan, &owner),
+						 RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT_EQ(control_observe_calls, 0);
+			UT_ASSERT_EQ(rf_side_online_production_apply_v1(plan, &owner), RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT_EQ(control_observe_calls, 2);
+			UT_ASSERT_EQ(control_observed_scn, 701);
+			UT_ASSERT(owner.protected_set_complete);
+			UT_ASSERT_EQ(canonical_writes + canonical_syncs + cold_cache_calls + cold_source_calls
+							 + cold_clog_applies + cold_clog_verifies + cold_locks_calls
+							 + prepare_apply.terminal_projection_stores,
+						 0);
+			UT_ASSERT(canonical_scope == NULL && canonical_writer_depth == 0
+					  && owner.protected_plan == NULL && !owner.protected_set_active);
+			rf_side_online_plan_destroy_v1(&plan);
+		}
+	cold_control_reset();
+	control_scope_test = cold_control_test = false;
+}
+
+UT_TEST(test_cold_foreign_controls_keep_original_role_source_and_effect_gates)
+{
+	static const int scope_faults[] = { 7, 8, 9, 10, 11, 13, 14, 15 };
+	for (unsigned fault = 0; fault < 26; fault++) {
+		RfSideOnlinePlanV1 *plan = control_online_plan(
+			XLOG_CHECKPOINT_ONLINE, fault == 25 ? XLOG_INVALIDATIONS : XLOG_RUNNING_XACTS);
+		ClusterRecoveryDutyKey duty = canonical_duty;
+		ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
+		ClusterThreadRecoveryAuthorityV1 authority = { .duty = &duty, .serial_guard = &guard };
+		RfSideOnlineProductionOwnerV1 owner;
+		cold_control_reset();
+		cold_control_owner(&owner, &authority, &duty);
+		switch (fault) {
+		case 0:
+			cluster_node_id = 2;
+			break;
+		case 1:
+			cluster_node_id = -1;
+			break;
+		case 2:
+			cluster_node_id = 128;
+			break;
+		case 3:
+			standbyState = STANDBY_INITIALIZED;
+			break;
+		case 4:
+			standbyState = STANDBY_SNAPSHOT_PENDING;
+			break;
+		case 5:
+			standbyState = STANDBY_SNAPSHOT_READY;
+			break;
+		case 6:
+			standbyState = (HotStandbyState)-1;
+			break;
+		case 7:
+			standbyState = (HotStandbyState)(STANDBY_SNAPSHOT_READY + 1);
+			break;
+		case 8:
+			cold_clog_denied = true;
+			break;
+		case 9:
+			control_scope_denied = true;
+			break;
+		case 10:
+			control_fresh = false;
+			break;
+		case 11:
+			guard.mode = 0;
+			break;
+		case 12:
+			authority.serial_guard = NULL;
+			break;
+		case 13:
+			duty.origin_thread_id = 2;
+			break;
+		case 22:
+			duty.storage_uuid[0]++;
+			break;
+		case 23:
+			duty.system_identifier++;
+			break;
+		case 24:
+			duty.origin_owner_incarnation++;
+			break;
+		case 25:
+			/* A valid invalidation still needs its native consumer. An
+			 * occupied DatabasePath must refuse, not silently no-op. */
+			DatabasePath = malloc(1);
+			UT_ASSERT(DatabasePath != NULL);
+			DatabasePath[0] = '\0';
+			break;
+		default:
+			if (fault >= 14 && fault < 22)
+				control_scope_fault = scope_faults[fault - 14];
+			break;
+		}
+		UT_ASSERT_NE(rf_side_online_production_preflight_v1(plan, &owner), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_NE(rf_side_online_production_apply_v1(plan, &owner), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(control_observe_calls + cold_cache_calls + canonical_writes, 0);
+		UT_ASSERT(!owner.protected_set_complete && !owner.protected_set_active
+				  && canonical_scope == NULL && canonical_writer_depth == 0);
+		if (fault == 25) {
+			UT_ASSERT(DatabasePath != NULL);
+			free(DatabasePath);
+			DatabasePath = NULL;
+		}
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+	cold_control_reset();
+	control_scope_test = cold_control_test = false;
+}
+
+UT_TEST(test_cold_control_rechecks_context_after_observation_and_unwinds_error)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		RfSideOnlinePlanV1 *plan = control_online_plan(XLOG_NEXTOID, XLOG_RUNNING_XACTS);
+		ClusterRecoveryDutyKey duty = canonical_duty;
+		ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
+		ClusterThreadRecoveryAuthorityV1 authority = { .duty = &duty, .serial_guard = &guard };
+		static RfSideOnlineProductionOwnerV1 owner;
+		volatile bool caught = false;
+		volatile RfPageProofDetailV1 result = RF_PAGE_PROOF_DETAIL_INTERNAL;
+		cold_control_reset();
+		cold_control_owner(&owner, &authority, &duty);
+		control_observe_throw = fault == 0;
+		control_expire_after_observe = fault == 1;
+		cold_control_drift = fault >= 2 ? fault - 1 : 0;
+		PG_TRY();
+		{
+			result = rf_side_online_production_apply_v1(plan, &owner);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 0);
+		UT_ASSERT_NE(result, RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(control_observe_calls, fault == 0 ? 0 : 1);
+		UT_ASSERT(!owner.protected_set_complete && !owner.protected_set_active
+				  && owner.protected_plan == NULL && canonical_scope == NULL
+				  && canonical_writer_depth == 0);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+	cold_control_reset();
+	control_scope_test = cold_control_test = false;
+}
+
 UT_TEST(test_native_controls_use_original_online_owner_before_any_side_effect)
 {
 	static const uint8 infos[] = { XLOG_CHECKPOINT_SHUTDOWN,
@@ -8051,7 +8265,7 @@ UT_TEST(test_cold_initial_ctrc_release_preserves_failed_io_and_scope_responsibil
 int
 main(void)
 {
-	UT_PLAN(107);
+	UT_PLAN(110);
 	UT_RUN(test_cold_compound_drop_classifies_the_complete_native_record);
 	UT_RUN(test_cold_compound_drop_rejects_partial_or_unknown_effects);
 	UT_RUN(test_cold_compound_drop_owns_all_effects_and_original_space_inputs);
@@ -8087,6 +8301,9 @@ main(void)
 	UT_RUN(test_stripe_records_retain_exact_control_obligation_without_pcm_target);
 	UT_RUN(test_stripe_malformed_or_wrong_source_cannot_seal);
 	UT_RUN(test_native_controls_use_original_online_owner_before_any_side_effect);
+	UT_RUN(test_cold_foreign_control_consumes_no_founder_or_transaction_effects);
+	UT_RUN(test_cold_foreign_controls_keep_original_role_source_and_effect_gates);
+	UT_RUN(test_cold_control_rechecks_context_after_observation_and_unwinds_error);
 	UT_RUN(test_cold_assignment_shape_wrap_alignment_and_budget);
 	UT_RUN(test_cold_assignment_retains_complete_bounded_original_payload);
 	UT_RUN(test_cold_assignment_original_owner_gates_and_cleanup);

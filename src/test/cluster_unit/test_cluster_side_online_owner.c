@@ -5,6 +5,7 @@
  */
 #include "postgres.h"
 #include "access/subtrans.h"
+#include "access/xlogutils.h"
 
 #include "access/clog.h"
 #include "cluster/cluster_multixact.h"
@@ -74,6 +75,8 @@ cluster_undo_recovery_origin_authorized_v1(int origin_node pg_attribute_unused()
 }
 
 char *DatabasePath;
+int cluster_node_id = 0;
+HotStandbyState standbyState = STANDBY_DISABLED;
 
 bool
 rf_side_xact_assignment_preflight_v1(const uint8 *payload pg_attribute_unused(),
