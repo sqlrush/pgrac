@@ -133,6 +133,34 @@ finish_origin_local_owners(void)
 	local_writeback_closed = true;
 }
 
+static void
+advance_origin_pi_scan_after_pending(void)
+{
+	if (origin_waits == 1) {
+		/* The first bounded pass made progress; the next pass is pending. */
+		local_relation_scan_result = CLUSTER_PCM_PI_RELATION_PENDING;
+		local_relation_scan_advance = 0;
+	} else if (origin_waits == 2) {
+		/* Once the pending owner settles, the same bounded scan must resume. */
+		local_relation_scan_result = CLUSTER_PCM_PI_RELATION_EMPTY;
+		local_relation_scan_advance = 0;
+	}
+}
+
+UT_TEST(test_origin_pi_pending_resumes_from_bounded_cursor)
+{
+	prepare_origin();
+	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_MORE;
+	local_relation_scan_advance = 128;
+	local_writeback_closed = true;
+	origin_wait_hook = advance_origin_pi_scan_after_pending;
+	run_origin(CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+	UT_ASSERT_EQ(local_relation_scan_calls, 3);
+	/* A PENDING result must not restart the complete registry scan at zero. */
+	UT_ASSERT_EQ(local_relation_scan_input, 128);
+	native_fixture_shared_memory_end();
+}
+
 UT_TEST(test_origin_waits_for_local_protocol_and_physical_ack_owners)
 {
 	for (unsigned fault = 0; fault < 2; fault++) {
@@ -319,11 +347,12 @@ UT_TEST(test_in_place_truncate_keeps_its_original_origin_path)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
 	UT_RUN(test_origin_joins_checkpoint_before_native_producer_returns);
 	UT_RUN(test_origin_fence_blocks_new_work_while_old_work_drains);
 	UT_RUN(test_origin_cancel_retains_accepted_operation_without_closed_result);
 	UT_RUN(test_origin_sync_error_cannot_invalidate_or_publish_local_closed);
+	UT_RUN(test_origin_pi_pending_resumes_from_bounded_cursor);
 	UT_RUN(test_origin_waits_for_local_protocol_and_physical_ack_owners);
 	UT_RUN(test_origin_checkpoint_publishes_pi_scan_restart_reason);
 	UT_RUN(test_origin_resumes_bounded_prefix_only_under_the_same_gate);
