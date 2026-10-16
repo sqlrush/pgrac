@@ -493,6 +493,29 @@ side_projection_decode(const RfDetachedRecordPlanV1 *record_plan,
 	return false;
 }
 
+bool
+rf_side_online_projection_record_shape_v1(XLogReaderState *record)
+{
+	RfDetachedRecordPlanV1 record_plan = { 0 };
+	RfSideOnlineOperationV1 candidate = { 0 };
+	uint32 payload_offset;
+	uint32 payload_length;
+	uint8 rmid;
+
+	if (record == NULL || record->record == NULL || XLogRecMaxBlockId(record) >= 0
+		|| (XLogRecGetInfo(record) & XLR_INFO_MASK) != 0)
+		return false;
+	rmid = XLogRecGetRmid(record);
+	if (rmid != RM_CLOG_ID && rmid != RM_MULTIXACT_ID && rmid != RM_COMMIT_TS_ID)
+		return false;
+	record_plan.source_record = record;
+	record_plan.route.rmid = rmid;
+	record_plan.route.normalized_info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
+	record_plan.route.record_owner = RF_ROUTE_OWNER_SIDE_TYPED;
+	record_plan.route.codec_id = RF_ROUTE_CODEC_SIDE_STANDARD;
+	return side_projection_decode(&record_plan, &candidate, &payload_offset, &payload_length);
+}
+
 static bool
 side_plan_commit_prepared_dependencies_closed(const RfSideOnlinePlanV1 *plan, uint32 terminal_index)
 {

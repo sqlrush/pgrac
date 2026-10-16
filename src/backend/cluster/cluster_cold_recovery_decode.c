@@ -48,6 +48,7 @@
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_page_detached.h"
+#include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_space_reservation.h"
@@ -491,10 +492,12 @@ cold_foreign_side(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan,
 		return false;
 	switch (XLogRecGetRmid(reader)) {
 	case RM_CLOG_ID:
-		return info == CLOG_ZEROPAGE || info == CLOG_TRUNCATE;
+		return (info == CLOG_ZEROPAGE || info == CLOG_TRUNCATE)
+			   && rf_side_online_projection_record_shape_v1(reader);
 	case RM_MULTIXACT_ID:
-		return info == XLOG_MULTIXACT_ZERO_OFF_PAGE || info == XLOG_MULTIXACT_ZERO_MEM_PAGE
-			   || info == XLOG_MULTIXACT_CREATE_ID || info == XLOG_MULTIXACT_TRUNCATE_ID;
+		return (info == XLOG_MULTIXACT_ZERO_OFF_PAGE || info == XLOG_MULTIXACT_ZERO_MEM_PAGE
+				|| info == XLOG_MULTIXACT_CREATE_ID || info == XLOG_MULTIXACT_TRUNCATE_ID)
+			   && rf_side_online_projection_record_shape_v1(reader);
 	case RM_XACT_ID:
 		/* Ordinary COMMIT and ABORT are record-local native consumers only
 		 * after the recovery decoder has validated the complete payload. A

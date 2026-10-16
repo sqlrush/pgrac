@@ -332,6 +332,11 @@ extern RfPageProofDetailV1 rf_side_record_census_v1(const RfDetachedRecordPlanV1
 													RfSideCensusSpaceVisitorV1 visit_space,
 													void *arg, RfSideContributionOwnersV1 *out);
 
+/* Validate one record-local CLOG/MultiXact/commit_ts projection with the same
+ * decoder used by the retained plan. Shape only: no plan, authority, or
+ * execution permission is created. */
+extern bool rf_side_online_projection_record_shape_v1(XLogReaderState *record);
+
 /* Complete sorted unique namespace/locator set for typed SPACE, including
  * each original COMMIT-DROP participant. Sealing checks every source chain;
  * enumeration grants no target, lifecycle or durability authority.

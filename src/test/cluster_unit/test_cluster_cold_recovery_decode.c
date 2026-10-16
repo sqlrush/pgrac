@@ -27,6 +27,8 @@
 
 #include "postgres.h"
 
+#include "access/clog.h"
+#include "access/multixact.h"
 #include "access/xact.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
@@ -511,6 +513,29 @@ UT_TEST(test_foreign_commit_shape_uses_reader_origin_thread)
 	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
 }
 
+UT_TEST(test_foreign_projection_requires_complete_payload_shape)
+{
+	FakeRecord record;
+	ClusterColdDecodedV1 out = { 0 };
+	int page = 0;
+	const uint8 rmids[] = { RM_CLOG_ID, RM_MULTIXACT_ID };
+	const uint8 infos[] = { CLOG_ZEROPAGE, XLOG_MULTIXACT_ZERO_OFF_PAGE };
+
+	for (uint32 i = 0; i < lengthof(rmids); i++) {
+		fake_record(&record, rmids[i], infos[i], 0);
+		preflight_plan.route.codec_id = RF_ROUTE_CODEC_SIDE_STANDARD;
+		record.storage.decoded.main_data_len = 0;
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+					 CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+		memcpy(record.data, &page, sizeof(page));
+		record.storage.decoded.main_data_len = sizeof(page);
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+					 CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
+	}
+}
+
 /*
  * Another generation's native control records -- checkpoints, NEXTOID,
  * parameter, FPW and timeline records, segment switches, restore points,
@@ -832,7 +857,7 @@ UT_TEST(test_detached_capture_borrows_only_a_complete_decode)
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(15);
 	UT_RUN(test_detached_capture_borrows_only_a_complete_decode);
 	UT_RUN(test_page_record_maps_ordinary_components);
 	UT_RUN(test_registry_refusal_is_opcode_unsupported);
@@ -843,6 +868,7 @@ main(void)
 	UT_RUN(test_foreign_side_records_have_no_cold_owner);
 	UT_RUN(test_foreign_commit_side_owner_requires_record_local_shape);
 	UT_RUN(test_foreign_commit_shape_uses_reader_origin_thread);
+	UT_RUN(test_foreign_projection_requires_complete_payload_shape);
 	UT_RUN(test_foreign_native_control_is_typed_noop);
 	UT_RUN(test_space_identity_changes_are_typed);
 	UT_RUN(test_space_reservation_advance_is_typed);
