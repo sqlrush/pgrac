@@ -514,6 +514,15 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 	if (nrels == 0)
 		return;
 
+#ifdef USE_PGRAC_CLUSTER
+	/* Hand off the exact committed native DROP before buffer invalidation.
+	 * This does not claim the buffers are gone; the callback below must still
+	 * observe the post-DropRelationsAllBuffers fact for the same locator. */
+	for (i = 0; i < nrels; i++)
+		if (rels[i]->smgr_which == CLUSTER_SMGR_SMGRSW_INDEX)
+			(void) cluster_ko_shared_native_prepare_drop_v2(rels[i]->smgr_rlocator.locator);
+#endif
+
 	/*
 	 * Get rid of any remaining buffers for the relations.  bufmgr will just
 	 * drop them without bothering to write the contents.

@@ -103,8 +103,10 @@ publish_native_ready(bool drop)
 	 * The origin-marker test separately executes the extracted native caller. */
 	cluster_ko_shared_native_publication_v3();
 	UT_ASSERT(owner->native_handed_off);
-	if (drop)
+	if (drop) {
+		UT_ASSERT(cluster_ko_shared_native_prepare_drop_v2(space_identity.key.locator));
 		cluster_ko_shared_native_drop_buffers_released_v2(space_identity.key.locator);
+	}
 	MyBackendType = B_CHECKPOINTER;
 	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
 	for (uint32 i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)

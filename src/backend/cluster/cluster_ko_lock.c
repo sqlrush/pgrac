@@ -330,6 +330,10 @@ static bool ko_shared_enqueue_v3(const ClusterKoSharedMessageV3 *message, uint64
 typedef struct ClusterKoNativeContinuation {
 	dsa_pointer next;
 	bool buffers_released;
+	/* The original owner has passed the pre-delete handoff. This is
+	 * deliberately separate from buffers_released: DropRelationsAllBuffers
+	 * must still provide the latter as a real post-invalidation fact. */
+	bool predelete_ready;
 	bool recovery_required;
 	ClusterKoSharedContext context;
 } ClusterKoNativeContinuation;
@@ -4411,6 +4415,7 @@ cluster_ko_shared_native_drop_buffers_released_v2(RelFileLocator locator)
 		work = dsa_get_address(ko_native_area, owned->native_unready);
 		SpinLockAcquire(&ko_state->shared_lock);
 		if (work->context.pid == owned->pid && work->context.serial == owned->serial
+			&& work->predelete_ready
 			&& memcmp(&work->context.terminal, &owned->terminal, sizeof(owned->terminal)) == 0
 			&& memcmp(work->context.structure, owned->structure, sizeof(owned->structure)) == 0) {
 			owned->native_unready = InvalidDsaPointer;
@@ -4418,6 +4423,62 @@ cluster_ko_shared_native_drop_buffers_released_v2(RelFileLocator locator)
 		}
 		SpinLockRelease(&ko_state->shared_lock);
 	}
+}
+
+/* Called immediately before the native smgr path enters
+ * DropRelationsAllBuffers. This is a handoff, not an invalidation result:
+ * the committed DATA/SPACE proof is retained in the continuation and the
+ * exact origin identity is still fenced. Entered directory calls remain a
+ * separate checkpointer predicate; the following buffer routine must set
+ * buffers_released independently, and a callback without this phase is
+ * ignored.
+ */
+bool
+cluster_ko_shared_native_prepare_drop_v2(RelFileLocator locator)
+{
+	if (ko_state == NULL || TopTransactionResourceOwner == NULL
+		|| CurTransactionResourceOwner != TopTransactionResourceOwner || CritSectionCount != 0)
+		return false;
+	for (ClusterKoCompletionV2 *owned = ko_completions; owned != NULL; owned = owned->next) {
+		ClusterKoNativeContinuation *work;
+		ClusterKoSharedContext before;
+		ClusterSpaceStructureChange change;
+		bool recovery_required;
+		bool buffers_released;
+
+		if (owned->pid != MyProcPid || owned->owner != TopTransactionResourceOwner
+			|| !owned->native_transaction || !owned->native_handed_off || !owned->postcommit
+			|| !owned->space_observed || !DsaPointerIsValid(owned->native_unready)
+			|| !RelFileLocatorEquals(owned->terminal.identity.locator, locator)
+			|| !cluster_space_structure_wal_decode(owned->structure, sizeof(owned->structure),
+												   &change)
+			|| change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE)
+			continue;
+		work = dsa_get_address(ko_native_area, owned->native_unready);
+		SpinLockAcquire(&ko_state->shared_lock);
+		before = work->context;
+		recovery_required = work->recovery_required;
+		buffers_released = work->buffers_released;
+		SpinLockRelease(&ko_state->shared_lock);
+		if (before.pid != owned->pid || before.serial != owned->serial
+			|| before.drop_identity != owned->drop_identity
+			|| before.drop_identity_serial != owned->drop_identity_serial
+			|| !before.used || !before.complete || !before.v3 || !before.origin_data_closed
+			|| !before.structure_owned || !before.structure_drop_pending
+			|| recovery_required || buffers_released
+			|| !ko_shared_origin_current(&before))
+			continue;
+		SpinLockAcquire(&ko_state->shared_lock);
+		if (work->context.pid == before.pid && work->context.serial == before.serial
+			&& memcmp(&work->context, &before, sizeof(before)) == 0
+			&& !work->recovery_required && !work->buffers_released) {
+			work->predelete_ready = true;
+			SpinLockRelease(&ko_state->shared_lock);
+			return true;
+		}
+		SpinLockRelease(&ko_state->shared_lock);
+	}
+	return false;
 }
 
 /* Retained work suppresses the old backend pathname operation, even after

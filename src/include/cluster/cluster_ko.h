@@ -533,6 +533,10 @@ extern void cluster_ko_shared_native_publication_v3(void);
 /* Native smgr only, after DropRelationsAllBuffers returns for this locator.
  * Releases only the original local-buffer gate, never physical durability. */
 extern void cluster_ko_shared_native_drop_buffers_released_v2(RelFileLocator locator);
+/* Native smgr only, immediately before DropRelationsAllBuffers. This
+ * handoff does not claim invalidation; the following callback must still
+ * publish buffers_released for the same continuation. */
+extern bool cluster_ko_shared_native_prepare_drop_v2(RelFileLocator locator);
 /* True suppresses the backend's obsolete pathname operation, even with a
  * now-stale cut. It conveys no physical completion or reuse permission. */
 extern bool cluster_ko_shared_native_drop_deferred_v2(RelFileLocator locator);

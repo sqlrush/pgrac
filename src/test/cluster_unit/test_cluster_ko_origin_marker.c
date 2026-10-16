@@ -19,6 +19,9 @@ static unsigned publication_fault;
 static bool open_at_publication, closed_before_deletes;
 static ClusterKoSharedMessageV3 origin_request;
 
+/* AM04: the pre-delete handoff is distinct from DropRelationsAllBuffers. */
+extern bool cluster_ko_shared_native_prepare_drop_v2(RelFileLocator locator);
+
 static KoDropIdentity *
 origin_identity(void)
 {
@@ -170,6 +173,10 @@ UT_TEST(test_origin_publication_closes_before_pending_delete_and_survives_ax_rel
 	work = dsa_get_address(ko_native_area, storage.native_incoming);
 	UT_ASSERT(work->context.origin_checkpoint && work->context.origin_data_closed);
 	UT_ASSERT(open_at_publication && closed_before_deletes);
+	UT_ASSERT_EQ(storage.native_waiting, 1);
+	UT_ASSERT(work->predelete_ready);
+	UT_ASSERT(work->buffers_released);
+	UT_ASSERT(!work->recovery_required);
 	UT_ASSERT(cluster_ko_directory_drop_committed_v3(origin_request.base.key.locator));
 	UT_ASSERT(!origin_io_allowed());
 	origin_release_ax(&origin_request);
@@ -188,6 +195,7 @@ UT_TEST(test_origin_inflight_call_blocks_promotion_without_reopening)
 	UT_ASSERT(cluster_ko_directory_io_begin_v3(origin_request.base.key.locator, &io));
 	origin_native_tail();
 	UT_ASSERT(closed_before_deletes);
+	UT_ASSERT_EQ(storage.native_waiting, 1);
 	MyBackendType = B_CHECKPOINTER;
 	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PENDING);
 	UT_ASSERT(!origin_io_allowed());
@@ -195,6 +203,26 @@ UT_TEST(test_origin_inflight_call_blocks_promotion_without_reopening)
 	UT_ASSERT(cluster_ko_directory_io_end_v3(&io));
 	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
 	UT_ASSERT(!origin_io_allowed());
+	native_fixture_shared_memory_end();
+}
+
+UT_TEST(test_origin_predelete_handoff_precedes_buffer_release)
+{
+	ClusterKoNativeContinuation *work;
+
+	(void)prepare_origin(CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+	native_commit_active = true;
+	cluster_ko_shared_native_commit_v2();
+	origin_publication(true);
+	cluster_ko_shared_native_publication_v3();
+	work = dsa_get_address(ko_native_area, storage.native_incoming);
+	UT_ASSERT(!work->buffers_released);
+	/* A callback without the preliminary phase cannot claim invalidation. */
+	cluster_ko_shared_native_drop_buffers_released_v2(origin_request.base.key.locator);
+	UT_ASSERT(!work->buffers_released);
+	UT_ASSERT(cluster_ko_shared_native_prepare_drop_v2(origin_request.base.key.locator));
+	cluster_ko_shared_native_drop_buffers_released_v2(origin_request.base.key.locator);
+	UT_ASSERT(work->buffers_released);
 	native_fixture_shared_memory_end();
 }
 
@@ -281,11 +309,12 @@ UT_TEST(test_seventy_two_native_aborts_reuse_reservations_after_exact_s6)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
 	UT_RUN(test_origin_reserves_before_request_and_abort_waits_for_s6);
 	UT_RUN(test_origin_identity_capacity_refuses_before_marker_and_peer_send);
 	UT_RUN(test_origin_publication_closes_before_pending_delete_and_survives_ax_release);
 	UT_RUN(test_origin_inflight_call_blocks_promotion_without_reopening);
+	UT_RUN(test_origin_predelete_handoff_precedes_buffer_release);
 	UT_RUN(test_failed_publication_cannot_manufacture_local_marker);
 	UT_RUN(test_publication_exact_continuation_drift_retains_failed_owner);
 	UT_RUN(test_inplace_truncate_does_not_get_drop_identity_or_gate);
