@@ -64,6 +64,7 @@ static bool side_xact_decode_ok;
 static RfSideXactKindV1 side_xact_decode_kind;
 static uint32 side_xact_decode_relation_count;
 static uint32 side_xact_decode_space_drop_count;
+static uint16 side_xact_decode_origin_required;
 
 RfPageProofDetailV1
 rf_page_detached_preflight_v1(XLogReaderState *record, bool space_active,
@@ -118,7 +119,9 @@ rf_side_xact_decode_recovery_v1(XLogReaderState *record, uint64 system_identifie
 								uint16 origin_thread, RfSideXactOperationV1 *operation)
 {
 	(void)record;
-	if (!side_xact_decode_ok || operation == NULL)
+	if (!side_xact_decode_ok || operation == NULL
+		|| (side_xact_decode_origin_required != 0
+			&& origin_thread != side_xact_decode_origin_required))
 		return false;
 	memset(operation, 0, sizeof(*operation));
 	operation->system_identifier = system_identifier;
@@ -185,6 +188,7 @@ fake_record(FakeRecord *record, uint8 rmid, uint8 info, int blocks)
 	side_xact_decode_kind = RF_SIDE_XACT_INVALID;
 	side_xact_decode_relation_count = 0;
 	side_xact_decode_space_drop_count = 0;
+	side_xact_decode_origin_required = 0;
 }
 
 static void
@@ -470,6 +474,8 @@ UT_TEST(test_foreign_commit_side_owner_requires_record_local_shape)
 	preflight_plan.route.codec_id = RF_ROUTE_CODEC_SIDE_STANDARD;
 	side_xact_decode_ok = true;
 	side_xact_decode_kind = RF_SIDE_XACT_COMMIT;
+	record.reader.cluster_expected_thread_id = 1;
+	side_xact_decode_origin_required = 1;
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
 					 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
@@ -487,6 +493,22 @@ UT_TEST(test_foreign_commit_side_owner_requires_record_local_shape)
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
 					 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+}
+
+UT_TEST(test_foreign_commit_shape_uses_reader_origin_thread)
+{
+	FakeRecord record;
+	ClusterColdDecodedV1 out = { 0 };
+
+	fake_record(&record, RM_XACT_ID, XLOG_XACT_COMMIT, 0);
+	preflight_plan.route.codec_id = RF_ROUTE_CODEC_SIDE_STANDARD;
+	side_xact_decode_ok = true;
+	side_xact_decode_kind = RF_SIDE_XACT_COMMIT;
+	record.reader.cluster_expected_thread_id = 2;
+	side_xact_decode_origin_required = 2;
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
 }
 
 /*
@@ -810,7 +832,7 @@ UT_TEST(test_detached_capture_borrows_only_a_complete_decode)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
 	UT_RUN(test_detached_capture_borrows_only_a_complete_decode);
 	UT_RUN(test_page_record_maps_ordinary_components);
 	UT_RUN(test_registry_refusal_is_opcode_unsupported);
@@ -820,6 +842,7 @@ main(void)
 	UT_RUN(test_malformed_plan_refused);
 	UT_RUN(test_foreign_side_records_have_no_cold_owner);
 	UT_RUN(test_foreign_commit_side_owner_requires_record_local_shape);
+	UT_RUN(test_foreign_commit_shape_uses_reader_origin_thread);
 	UT_RUN(test_foreign_native_control_is_typed_noop);
 	UT_RUN(test_space_identity_changes_are_typed);
 	UT_RUN(test_space_reservation_advance_is_typed);

@@ -502,11 +502,14 @@ cold_foreign_side(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan,
 		 * transaction opcodes never enter this route. */
 		if (info == XLOG_XACT_COMMIT || info == XLOG_XACT_ABORT) {
 			RfSideXactOperationV1 operation;
+			uint16 origin_thread = reader->cluster_expected_thread_id;
 
 			/* Classification must not turn malformed/unsupported effects into
-			 * a foreign consumer. The real origin is bound later by the
-			 * immutable plan; origin 1 is sufficient for this shape probe. */
-			return rf_side_xact_decode_recovery_v1(reader, system_identifier, 1, &operation)
+			 * a foreign consumer. The cold reader binds the source thread before
+			 * decoding; use that identity for TT validation instead of assuming
+			 * the first WAL thread. The immutable plan still revalidates it later. */
+			return rf_side_xact_decode_recovery_v1(reader, system_identifier, origin_thread,
+										  &operation)
 				   && ((info == XLOG_XACT_COMMIT && operation.kind == RF_SIDE_XACT_COMMIT)
 					   || (info == XLOG_XACT_ABORT && operation.kind == RF_SIDE_XACT_ABORT))
 				   && operation.relation_count == 0 && operation.space_drop_count == 0;
