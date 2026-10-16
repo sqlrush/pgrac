@@ -177,7 +177,7 @@ UT_TEST(test_origin_waits_for_local_protocol_and_physical_ack_owners)
 	}
 }
 
-UT_TEST(test_origin_checkpoint_publishes_pi_scan_restart_reason)
+UT_TEST(test_origin_checkpoint_publishes_pi_scan_wait_reason)
 {
 	uint64 restart_before, wait_before;
 
@@ -188,7 +188,7 @@ UT_TEST(test_origin_checkpoint_publishes_pi_scan_restart_reason)
 	local_writeback_closed = false;
 	origin_wait_hook = finish_origin_local_owners;
 	run_origin(CLUSTER_KO_SHARED_V3_OPERATION_DROP);
-	UT_ASSERT(cluster_ko_origin_checkpoint_restart_count("pi_scan_pending") > restart_before);
+	UT_ASSERT_EQ(cluster_ko_origin_checkpoint_restart_count("pi_scan_pending"), restart_before);
 	UT_ASSERT(cluster_ko_origin_checkpoint_wait_count("pi_scan_pending") > wait_before);
 	native_fixture_shared_memory_end();
 }
@@ -354,7 +354,7 @@ main(void)
 	UT_RUN(test_origin_sync_error_cannot_invalidate_or_publish_local_closed);
 	UT_RUN(test_origin_pi_pending_resumes_from_bounded_cursor);
 	UT_RUN(test_origin_waits_for_local_protocol_and_physical_ack_owners);
-	UT_RUN(test_origin_checkpoint_publishes_pi_scan_restart_reason);
+	UT_RUN(test_origin_checkpoint_publishes_pi_scan_wait_reason);
 	UT_RUN(test_origin_resumes_bounded_prefix_only_under_the_same_gate);
 	UT_RUN(test_only_exact_native_space_writer_can_enter_after_old_data_closed);
 	UT_RUN(test_origin_rechecks_atomic_gate_at_closed_publication);

@@ -3948,7 +3948,7 @@ ko_native_origin_checkpoint(ClusterKoCompletionV2 *owned)
 				= cluster_pcm_lock_ko_local_relation_scan_v3(locator, gate.formation, 128, &cursor);
 			if (scan == CLUSTER_PCM_PI_RELATION_PENDING) {
 				wait_reason = CLUSTER_KO_ORIGIN_REASON_PI_SCAN_PENDING;
-				ko_origin_checkpoint_record(wait_reason, false, locator, phase, cursor, revision,
+				ko_origin_checkpoint_record(wait_reason, true, locator, phase, cursor, revision,
 					saved_revision, wb_revision, &gate);
 				/* A pending local owner is the current bounded scan item.  Keep
 				 * its cursor and the stable gate/revision while waiting; restarting
