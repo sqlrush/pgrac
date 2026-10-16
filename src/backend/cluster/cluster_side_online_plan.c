@@ -1512,17 +1512,16 @@ side_plan_prepare_slots(const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 s
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
-RfPageProofDetailV1
-rf_side_online_plan_prepare_undo_block_v1(const RfSideOnlinePlanV1 *plan, uint8 instance,
-										  uint32 segment_id, uint32 block_no,
-										  RfSideUndoBlockImageV1 *out)
+static RfPageProofDetailV1
+side_plan_prepare_undo_block(const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 segment_id,
+							 uint32 block_no, uint32 end, RfSideUndoBlockImageV1 *out)
 {
 	RfSideUndoBlockImageV1 prepared;
 	bool anchored = false;
 	Size scratch = sizeof(prepared) + BLCKSZ;
 
 	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || out == NULL
-		|| instance == 0 || instance > 128 || segment_id == 0
+		|| end > plan->operation_count || instance == 0 || instance > 128 || segment_id == 0
 		|| ((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1 != instance || block_no == 0
 		|| block_no >= UNDO_BLOCKS_PER_SEGMENT)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
@@ -1530,7 +1529,7 @@ rf_side_online_plan_prepare_undo_block_v1(const RfSideOnlinePlanV1 *plan, uint8 
 		return RF_PAGE_PROOF_DETAIL_CAPACITY;
 	memset(&prepared, 0, sizeof(prepared));
 	prepared.source_index = UINT32_MAX;
-	for (uint32 i = 0; i < plan->operation_count; i++) {
+	for (uint32 i = 0; i < end; i++) {
 		const RfSideOnlineOperationV1 *op = &plan->operations[i];
 		const ClusterUndoDecoded *d = &op->undo;
 
@@ -1559,10 +1558,9 @@ rf_side_online_plan_prepare_undo_block_v1(const RfSideOnlinePlanV1 *plan, uint8 
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
-RfPageProofDetailV1
-rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan, uint8 instance,
-										   uint32 segment_id, const char *base,
-										   RfSideUndoHeaderImageV1 *out)
+static RfPageProofDetailV1
+side_plan_prepare_undo_header(const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 segment_id,
+							  const char *base, uint32 end, RfSideUndoHeaderImageV1 *out)
 {
 	RfSideUndoHeaderImageV1 prepared;
 	PGAlignedBlock seed;
@@ -1572,7 +1570,7 @@ rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan, uint8
 	bool base_valid, observed = false, full_image = false, found = false;
 
 	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || out == NULL
-		|| instance == 0 || instance > 128 || segment_id == 0
+		|| end > plan->operation_count || instance == 0 || instance > 128 || segment_id == 0
 		|| ((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1 != instance)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	if (scratch > plan->memory_budget || plan->memory_used > plan->memory_budget - scratch)
@@ -1580,7 +1578,7 @@ rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan, uint8
 	memset(&prepared, 0, sizeof(prepared));
 	prepared.source_index = UINT32_MAX;
 	base_valid = base != NULL && UndoSegmentHeader_identity_matches(base, segment_id, instance);
-	for (uint32 i = 0; i < plan->operation_count; i++) {
+	for (uint32 i = 0; i < end; i++) {
 		const RfSideOnlineOperationV1 *op = &plan->operations[i];
 		uint16 slot;
 
@@ -1616,9 +1614,8 @@ rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan, uint8
 			memcpy(seed.data, base, BLCKSZ);
 	}
 	prepared.page = seed;
-	for (uint32 i = 0; i <= plan->operation_count; i++) {
-		const RfSideOnlineOperationV1 *op
-			= i == plan->operation_count ? NULL : &plan->operations[i];
+	for (uint32 i = 0; i <= end; i++) {
+		const RfSideOnlineOperationV1 *op = i == end ? NULL : &plan->operations[i];
 		const char *target;
 
 		if (op != NULL) {
@@ -1678,6 +1675,66 @@ rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan, uint8
 		prepared.source_index = UINT32_MAX;
 	*out = prepared;
 	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_block_v1(const RfSideOnlinePlanV1 *plan, uint8 instance,
+										  uint32 segment_id, uint32 block_no,
+										  RfSideUndoBlockImageV1 *out)
+{
+	return side_plan_prepare_undo_block(plan, instance, segment_id, block_no,
+										plan != NULL ? plan->operation_count : 0, out);
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan, uint8 instance,
+										   uint32 segment_id, const char *base,
+										   RfSideUndoHeaderImageV1 *out)
+{
+	return side_plan_prepare_undo_header(plan, instance, segment_id, base,
+										 plan != NULL ? plan->operation_count : 0, out);
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+										   const RfPageOnlineRecordIdentityV1 *identity,
+										   const char *base, RfSideUndoHeaderImageV1 *out)
+{
+	const RfSideOnlineOperationV1 *operation;
+	uint8 instance;
+	uint32 segment;
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || plan->failed
+		|| plan->purpose != RF_SIDE_PLAN_RECOVERY || out == NULL || identity == NULL
+		|| index >= plan->operation_count)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	operation = &plan->operations[index];
+	if (operation->history_only || operation->purpose != RF_SIDE_PLAN_RECOVERY
+		|| identity->reserved_zero != 0
+		|| identity->participant_index != operation->identity.participant_index
+		|| memcmp(&identity->record, &operation->identity.record, sizeof(identity->record)) != 0
+		|| rf_side_online_plan_origin_operation_count_v1(plan, identity->record.origin_thread)
+			   == UINT32_MAX)
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	if (operation->kind == RF_SIDE_ONLINE_OPERATION_UNDO) {
+		const ClusterUndoDecoded *undo = &operation->undo;
+
+		instance = undo->instance;
+		segment = undo->segment_id;
+		if (undo->kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
+			|| undo->kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI)
+			return side_plan_prepare_undo_block(plan, instance, segment, undo->block_no, index + 1,
+												out);
+	} else if (operation->kind == RF_SIDE_ONLINE_OPERATION_XACT
+			   && operation->xact.kind == RF_SIDE_XACT_COMMIT && operation->xact.has_tt_delta) {
+		instance = operation->xact.tt_delta.instance;
+		segment = operation->xact.tt_delta.segment_id;
+	} else
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	/* Original immutable full-source input stays intact. Only the private
+	 * reconstruction endpoint changes; later lifecycle/terminal records
+	 * cannot establish the selected prefix's base or enter its output. */
+	return side_plan_prepare_undo_header(plan, instance, segment, base, index + 1, out);
 }
 
 typedef struct SideSpaceSourceInput {

@@ -8904,10 +8904,343 @@ UT_TEST(test_cold_record_dispatch_executes_only_selected_native_projection)
 	}
 }
 
+/* The selected-prefix preparation must not borrow a later terminal, REUSE
+ * or FPI. These are the real immutable decoder and transition functions;
+ * no IO/authority stub participates in producing these private images. */
+UT_TEST(test_undo_record_prefix_stops_before_future_terminal_and_rebind)
+{
+	RfSideOnlinePlanV1 *plan = undo_repeated_slot_plan_sources(false, true);
+	PGAlignedBlock base, saved;
+	RfSideUndoHeaderImageV1 out = { 0 }, whole;
+	RfSideOnlineOperationV1 operation;
+
+	cluster_undo_segment_make_header_bytes(513, 3, base.data);
+	saved = base;
+	for (uint32 i = 0; i < 4; i++) {
+		const TTSlot *slot;
+
+		UT_ASSERT(rf_side_online_plan_operation_v1(plan, i, &operation));
+		UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_record_v1(plan, i, &operation.identity,
+																base.data, &out),
+					 RF_PAGE_PROOF_DETAIL_OK);
+		slot = &((UndoSegmentHeaderData *)out.page.data)->tt_slots[4];
+		UT_ASSERT_EQ(slot->xid, i < 2 ? 802 : 818);
+		UT_ASSERT_EQ(slot->wrap, i < 2 ? 7 : 8);
+		UT_ASSERT_EQ(slot->status, i % 2 ? TT_SLOT_COMMITTED : TT_SLOT_ACTIVE);
+		UT_ASSERT_EQ(slot->commit_scn, i % 2 ? 999 : 0);
+		UT_ASSERT_EQ(out.operation_count, i + 1);
+		UT_ASSERT_EQ(out.source_index, i);
+		UT_ASSERT(memcmp(base.data, saved.data, BLCKSZ) == 0);
+	}
+	UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_header_v1(plan, 3, 513, base.data, &whole),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(memcmp(out.page.data, whole.page.data, BLCKSZ) == 0);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_undo_record_prefix_keeps_init_and_reuse_boundaries)
+{
+	RfSideOnlinePlanV1 *plan = space_online_plan(600);
+	FakeXactRecord fake;
+	RfSideOnlineOperationV1 operation;
+	RfSideUndoHeaderImageV1 out = { 0 };
+	struct {
+		xl_cluster_undo_segment_init record;
+		uint8 page[BLCKSZ];
+	} init = { 0 };
+	struct {
+		xl_undo_segment_reuse record;
+		uint8 page[BLCKSZ];
+	} reuse = { 0 };
+
+	init.record.instance = reuse.record.instance = 3;
+	init.record.segment_id = reuse.record.segment_id = 513;
+	reuse.record.new_generation = 1;
+	cluster_undo_segment_make_header_bytes(513, 3, (char *)init.page);
+	memcpy(reuse.page, init.page, BLCKSZ);
+	((UndoSegmentHeaderData *)reuse.page)->wrap_count = 1;
+	make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_INIT, &init, sizeof(init));
+	undo_header_feed(plan, &fake, 100);
+	undo_header_bind(&fake, 0);
+	undo_header_feed(plan, &fake, 200);
+	undo_header_commit(&fake, 0, 802);
+	undo_header_feed(plan, &fake, 300);
+	make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_REUSE, &reuse,
+						   sizeof(reuse));
+	undo_header_feed(plan, &fake, 400);
+	undo_header_bind(&fake, 1);
+	undo_header_feed(plan, &fake, 500);
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	for (uint32 i = 0; i < 5; i++) {
+		const UndoSegmentHeaderData *header;
+
+		UT_ASSERT(rf_side_online_plan_operation_v1(plan, i, &operation));
+		UT_ASSERT_EQ(
+			rf_side_online_plan_prepare_undo_record_v1(plan, i, &operation.identity, NULL, &out),
+			RF_PAGE_PROOF_DETAIL_OK);
+		header = (const UndoSegmentHeaderData *)out.page.data;
+		UT_ASSERT_EQ(header->wrap_count, i < 3 ? 0 : 1);
+		UT_ASSERT_EQ(header->tt_slots[4].status, i == 2				? TT_SLOT_COMMITTED
+												 : i == 1 || i == 4 ? TT_SLOT_ACTIVE
+																	: 0);
+		UT_ASSERT(out.has_full_image);
+		UT_ASSERT_EQ(out.operation_count, i + 1);
+		UT_ASSERT_EQ(out.source_index, i);
+	}
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+static void
+record_prefix_fpi(RfSideOnlinePlanV1 *plan, XLogRecPtr begin, uint8 byte)
+{
+	FakeXactRecord fake;
+	struct {
+		xl_undo_block_write record;
+		uint8 page[BLCKSZ];
+	} fpi = { 0 };
+	fpi.record.instance = 3;
+	fpi.record.segment_id = 513;
+	fpi.record.block_no = 9;
+	fpi.record.has_fpi = 1;
+	memset(fpi.page, byte, BLCKSZ);
+	make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE, &fpi, sizeof(fpi));
+	undo_header_feed(plan, &fake, begin);
+}
+
+UT_TEST(test_undo_record_prefix_never_installs_a_later_block_image)
+{
+	RfSideOnlinePlanV1 *plan = space_online_plan(400);
+	RfSideOnlineOperationV1 operation;
+	RfSideUndoBlockImageV1 out = { 0 }, whole;
+	FakeXactRecord fake;
+	PGAlignedBlock expected;
+
+	record_prefix_fpi(plan, 100, 0x31);
+	make_undo_delta(&fake);
+	undo_header_feed(plan, &fake, 200);
+	record_prefix_fpi(plan, 300, 0x73);
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	for (uint32 i = 0; i < 3; i++) {
+		UT_ASSERT(rf_side_online_plan_operation_v1(plan, i, &operation));
+		UT_ASSERT(cluster_undo_prepare_block_v1(
+			&operation.undo, operation.owned_payload, operation.owned_payload_length,
+			operation.identity.record.end_rec_ptr, i ? expected.data : NULL, expected.data));
+		UT_ASSERT_EQ(
+			rf_side_online_plan_prepare_undo_record_v1(plan, i, &operation.identity, NULL, &out),
+			RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(memcmp(out.page.data, expected.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(((UndoBlockHeader *)out.page.data)->block_lsn, 200 + i * 100);
+		UT_ASSERT_EQ(out.source_index, i);
+		UT_ASSERT_EQ(out.operation_count, i + 1);
+	}
+	UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_block_v1(plan, 3, 513, 9, &whole),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(memcmp(out.page.data, whole.page.data, BLCKSZ) == 0);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_undo_record_prefix_rejects_future_fpi_and_ahead_data)
+{
+	/* A later full image cannot repair the selected unanchored delta. */
+	RfSideOnlinePlanV1 *plan = space_online_plan(300);
+	RfSideOnlineOperationV1 operation;
+	RfSideUndoHeaderImageV1 out, saved, final;
+	FakeXactRecord fake;
+	PGAlignedBlock base;
+
+	make_undo_delta(&fake);
+	undo_header_feed(plan, &fake, 100);
+	record_prefix_fpi(plan, 200, 0x31);
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &operation));
+	memset(&saved, 0x92, sizeof(saved));
+	out = saved;
+	UT_ASSERT_NE(
+		rf_side_online_plan_prepare_undo_record_v1(plan, 0, &operation.identity, NULL, &out),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+	rf_side_online_plan_destroy_v1(&plan);
+
+	plan = undo_repeated_slot_plan_sources(false, false);
+	cluster_undo_segment_make_header_bytes(513, 3, base.data);
+	UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_header_v1(plan, 3, 513, base.data, &final),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &operation));
+	for (int drift = 0; drift < 2; drift++) {
+		PGAlignedBlock observed = final.page;
+		if (drift)
+			((UndoSegmentHeaderData *)observed.data)->wrap_count++;
+		out = saved;
+		UT_ASSERT_NE(rf_side_online_plan_prepare_undo_record_v1(plan, 0, &operation.identity,
+																observed.data, &out),
+					 RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+	}
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_undo_record_prefix_selector_requires_complete_identity_and_replay_role)
+{
+	for (unsigned fault = 0; fault < 17; fault++) {
+		XLogRecPtr redo = 300;
+		RfSideOnlinePlanV1 *plan = space_online_plan_redo(300, fault == 14 ? &redo : NULL);
+		RfSideOnlineOperationV1 operation;
+		RfSideUndoHeaderImageV1 out, saved;
+		FakeXactRecord fake;
+		PGAlignedBlock base;
+		uint32 index = 0;
+
+		undo_header_bind(&fake, 0);
+		undo_header_feed(plan, &fake, 100);
+		undo_header_commit(&fake, 0, 802);
+		undo_header_feed(plan, &fake, 200);
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &operation));
+		if (fault == 0)
+			operation.identity.record.system_identifier++;
+		if (fault == 1)
+			operation.identity.record.storage_uuid[15]++;
+		if (fault == 2)
+			operation.identity.record.origin_thread++;
+		if (fault == 3)
+			operation.identity.record.timeline_id++;
+		if (fault == 4)
+			operation.identity.record.read_rec_ptr++;
+		if (fault == 5)
+			operation.identity.record.end_rec_ptr++;
+		if (fault == 6)
+			operation.identity.record.record_crc++;
+		if (fault == 7)
+			operation.identity.record.rmid++;
+		if (fault == 8)
+			operation.identity.record.info++;
+		if (fault == 9)
+			operation.identity.participant_index++;
+		if (fault == 10)
+			operation.identity.reserved_zero = 1;
+		if (fault == 11)
+			index = UINT32_MAX;
+		if (fault == 12)
+			index = 2;
+		cluster_undo_segment_make_header_bytes(513, 3, base.data);
+		memset(&saved, 0xa6, sizeof(saved));
+		out = saved;
+		UT_ASSERT_NE(rf_side_online_plan_prepare_undo_record_v1(
+						 fault == 15 ? NULL : plan, index, fault == 13 ? NULL : &operation.identity,
+						 base.data, fault == 16 ? NULL : &out),
+					 RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+	{
+		RfPageProofDetailV1 detail;
+		RfSideOnlinePlanV1 *pi = cold_cache_budget_plan(0, true, 1, &detail);
+		RfSideOnlineOperationV1 operation;
+		RfSideUndoHeaderImageV1 out = { 0 };
+		PGAlignedBlock base;
+
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(pi), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(rf_side_online_plan_operation_v1(pi, 0, &operation));
+		cluster_undo_segment_make_header_bytes(513, 3, base.data);
+		UT_ASSERT_NE(
+			rf_side_online_plan_prepare_undo_record_v1(pi, 0, &operation.identity, base.data, &out),
+			RF_PAGE_PROOF_DETAIL_OK);
+		rf_side_online_plan_destroy_v1(&pi);
+	}
+}
+
+UT_TEST(test_undo_record_prefix_is_not_complete_source_acceptance)
+{
+	RfSideOnlinePlanV1 *plan = undo_repeated_slot_plan_sources(true, false);
+	RfSideOnlineOperationV1 operation;
+	RfSideUndoHeaderImageV1 out, saved;
+	PGAlignedBlock base;
+
+	cluster_undo_segment_make_header_bytes(513, 3, base.data);
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &operation));
+	UT_ASSERT_EQ(
+		rf_side_online_plan_prepare_undo_record_v1(plan, 0, &operation.identity, base.data, &out),
+		RF_PAGE_PROOF_DETAIL_OK);
+	memset(&saved, 0x32, sizeof(saved));
+	out = saved;
+	UT_ASSERT_NE(rf_side_online_plan_prepare_undo_header_v1(plan, 3, 513, base.data, &out),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 3, &operation));
+	UT_ASSERT_NE(
+		rf_side_online_plan_prepare_undo_record_v1(plan, 3, &operation.identity, base.data, &out),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_undo_record_prefix_refuses_ambiguous_sources_and_other_effects)
+{
+	for (int variant = 0; variant < 2; variant++) {
+		RfSideOnlinePlanRequestV1 request = { 0 };
+		RfContributorStreamCutV1 cuts[2] = { { 0 } };
+		RfSideOnlinePlanV1 *plan = NULL;
+		RfSideOnlineOperationV1 operation;
+		RfSideUndoHeaderImageV1 out, saved;
+		PGAlignedBlock base;
+
+		request.system_identifier = UINT64_C(0x11223344);
+		memset(request.storage_uuid, 0x44, 16);
+		request.participant_count = variant == 0 ? 2 : 1;
+		request.physical_cuts = cuts;
+		for (uint32 i = 0; i < request.participant_count; i++) {
+			cuts[i].failed_thread = 3;
+			cuts[i].timeline_id = 7;
+			cuts[i].flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+			cuts[i].scan_begin_inclusive = 100;
+			cuts[i].scan_end_exclusive = 200;
+			cuts[i].origin_owner_incarnation = 41 + i;
+		}
+		UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
+		for (uint32 i = 0; i < request.participant_count; i++) {
+			FakeXactRecord fake;
+			RfPageOnlineRecordIdentityV1 identity;
+			RfDetachedRecordPlanV1 record;
+			int page = 17;
+
+			if (variant == 0)
+				undo_header_bind(&fake, 0);
+			else
+				make_projection_record(&fake, RM_CLOG_ID, CLOG_ZEROPAGE, &page, sizeof(page));
+			identity = make_identity(&fake, request.storage_uuid);
+			identity.participant_index = i;
+			set_identity_range(&fake, &identity, 100, 200);
+			record
+				= variant == 0 ? make_undo_record_plan(&fake) : make_projection_record_plan(&fake);
+			UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &record, &identity),
+						 RF_PAGE_PROOF_DETAIL_OK);
+		}
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		cluster_undo_segment_make_header_bytes(513, 3, base.data);
+		memset(&saved, 0x18, sizeof(saved));
+		for (uint32 i = 0; i < request.participant_count; i++) {
+			out = saved;
+			UT_ASSERT(rf_side_online_plan_operation_v1(plan, i, &operation));
+			UT_ASSERT_NE(rf_side_online_plan_prepare_undo_record_v1(plan, i, &operation.identity,
+																	base.data, &out),
+						 RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+		}
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(119);
+	UT_PLAN(126);
+	UT_RUN(test_undo_record_prefix_stops_before_future_terminal_and_rebind);
+	UT_RUN(test_undo_record_prefix_keeps_init_and_reuse_boundaries);
+	UT_RUN(test_undo_record_prefix_never_installs_a_later_block_image);
+	UT_RUN(test_undo_record_prefix_rejects_future_fpi_and_ahead_data);
+	UT_RUN(test_undo_record_prefix_selector_requires_complete_identity_and_replay_role);
+	UT_RUN(test_undo_record_prefix_is_not_complete_source_acceptance);
+	UT_RUN(test_undo_record_prefix_refuses_ambiguous_sources_and_other_effects);
 	UT_RUN(test_logical_invalidation_capture_is_bounded_and_owned);
 	UT_RUN(test_cold_logical_invalidations_do_not_execute_cache_or_terminal);
 	UT_RUN(test_cold_logical_invalidation_rejects_wrong_context_and_unwinds);

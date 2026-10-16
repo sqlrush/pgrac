@@ -204,6 +204,17 @@ extern RfPageProofDetailV1
 rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan, uint8 instance,
 										   uint32 segment_id, const char *base,
 										   RfSideUndoHeaderImageV1 *out);
+/* Prepare only the selected TT/undo record's source prefix. Full identity,
+ * source uniqueness and recovery purpose are required. This is a private
+ * image, not an apply/terminal or complete-source proof; the original owner
+ * still owes whole-source preflight, target binding and durability. A header
+ * base outside the prefix is refused, never inferred covered by later WAL.
+ * Block images require a prefix FPI and do not inspect target DATA. No output
+ * change on refusal. */
+extern RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+										   const RfPageOnlineRecordIdentityV1 *identity,
+										   const char *base, RfSideUndoHeaderImageV1 *out);
 extern uint32 rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan);
 typedef struct RfSideSpaceContributionV1 {
 	ClusterSpaceIdentity result;
