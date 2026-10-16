@@ -1695,10 +1695,10 @@ rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan, uint8
 										 plan != NULL ? plan->operation_count : 0, out);
 }
 
-RfPageProofDetailV1
-rf_side_online_plan_prepare_undo_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
-										   const RfPageOnlineRecordIdentityV1 *identity,
-										   const char *base, RfSideUndoHeaderImageV1 *out)
+static RfPageProofDetailV1
+side_plan_prepare_undo_record(const RfSideOnlinePlanV1 *plan, uint32 index,
+							  const RfPageOnlineRecordIdentityV1 *identity, const char *base,
+							  bool header_only, RfSideUndoHeaderImageV1 *out)
 {
 	const RfSideOnlineOperationV1 *operation;
 	uint8 instance;
@@ -1721,8 +1721,9 @@ rf_side_online_plan_prepare_undo_record_v1(const RfSideOnlinePlanV1 *plan, uint3
 
 		instance = undo->instance;
 		segment = undo->segment_id;
-		if (undo->kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
-			|| undo->kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI)
+		if (!header_only
+			&& (undo->kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
+				|| undo->kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI))
 			return side_plan_prepare_undo_block(plan, instance, segment, undo->block_no, index + 1,
 												out);
 	} else if (operation->kind == RF_SIDE_ONLINE_OPERATION_XACT
@@ -1735,6 +1736,22 @@ rf_side_online_plan_prepare_undo_record_v1(const RfSideOnlinePlanV1 *plan, uint3
 	 * reconstruction endpoint changes; later lifecycle/terminal records
 	 * cannot establish the selected prefix's base or enter its output. */
 	return side_plan_prepare_undo_header(plan, instance, segment, base, index + 1, out);
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+										   const RfPageOnlineRecordIdentityV1 *identity,
+										   const char *base, RfSideUndoHeaderImageV1 *out)
+{
+	return side_plan_prepare_undo_record(plan, index, identity, base, false, out);
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_record_header_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+												  const RfPageOnlineRecordIdentityV1 *identity,
+												  const char *base, RfSideUndoHeaderImageV1 *out)
+{
+	return side_plan_prepare_undo_record(plan, index, identity, base, true, out);
 }
 
 typedef struct SideSpaceSourceInput {
@@ -2677,11 +2694,14 @@ rf_side_online_plan_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index
 		|| identity->reserved_zero != 0
 		|| memcmp(&identity->record, &operation.identity.record, sizeof(identity->record)) != 0)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
-	/* These consumers use the selected owned operation only. The current
-	 * XACT/UNDO owner prepares a final whole-source TT image, and the SPACE
-	 * owner has a separate ordered target cursor: neither is record-local. */
+	/* XACT/header and SPACE still need their own ordered consumers. Block
+	 * UNDO requires an explicit record-local callback, never apply_undo. */
 	if (operation.kind != RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
-		&& operation.kind != RF_SIDE_ONLINE_OPERATION_PROJECTION)
+		&& operation.kind != RF_SIDE_ONLINE_OPERATION_PROJECTION
+		&& !(operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
+			 && (operation.undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
+				 || operation.undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI)
+			 && ops->apply_undo_record != NULL))
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 	if (!ops->begin_protected_set(ops->arg))
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
@@ -2695,7 +2715,9 @@ rf_side_online_plan_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index
 			&& !ops->prepare_apply(ops->arg))
 			detail = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 		if (detail == RF_PAGE_PROOF_DETAIL_OK) {
-			bool applied = operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
+			bool applied = operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
+							   ? ops->apply_undo_record(ops->arg, index, &operation)
+						   : operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
 							   ? ops->apply_control(ops->arg, &operation)
 							   : ops->apply_projection(ops->arg, &operation);
 			if (!applied)

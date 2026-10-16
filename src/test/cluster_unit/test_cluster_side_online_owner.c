@@ -228,6 +228,28 @@ rf_side_online_plan_prepare_undo_block_v1(const RfSideOnlinePlanV1 *plan, uint8 
 	return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 }
 
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_record_v1(
+	const RfSideOnlinePlanV1 *plan pg_attribute_unused(), uint32 index pg_attribute_unused(),
+	const RfPageOnlineRecordIdentityV1 *identity pg_attribute_unused(),
+	const char *base pg_attribute_unused(), RfSideUndoHeaderImageV1 *out)
+{
+	UT_ASSERT(false); /* Record-local integration is in test_cluster_side_xact. */
+	memset(out, 0, sizeof(*out));
+	return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_record_header_v1(
+	const RfSideOnlinePlanV1 *plan pg_attribute_unused(), uint32 index pg_attribute_unused(),
+	const RfPageOnlineRecordIdentityV1 *identity pg_attribute_unused(),
+	const char *base pg_attribute_unused(), RfSideUndoHeaderImageV1 *out)
+{
+	UT_ASSERT(false); /* The whole-source fixture must not dispatch a record. */
+	memset(out, 0, sizeof(*out));
+	return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+}
+
 /* Immutable-planner boundary; the real planner's source/slot proof is covered
  * by test_cluster_side_xact. This fixture supplies one predetermined result. */
 RfPageProofDetailV1

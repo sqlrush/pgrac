@@ -19,6 +19,7 @@
 #include "cluster/cluster_remote_xact.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_side_online_owner.h"
+#include "cluster/cluster_undo_format.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "storage/standbydefs.h"
 #include "utils/inval.h"
@@ -544,6 +545,59 @@ side_owner_apply_undo(void *arg, const RfSideOnlineOperationV1 *operation)
 }
 
 static bool
+side_owner_apply_undo_record(void *arg, uint32 index, const RfSideOnlineOperationV1 *operation)
+{
+	RfSideOnlineProductionOwnerV1 *owner = arg;
+	const ClusterUndoDecoded *undo;
+	SideUndoHeader *segment, *target;
+	RfSideUndoHeaderImageV1 header_prefix, block_prefix;
+	PGAlignedBlock current;
+	UndoBlockHeader observed;
+
+	if (owner == NULL || !owner->protected_set_active || !side_owner_cold_formed(owner)
+		|| !side_owner_authority_fresh(owner) || operation == NULL
+		|| operation->kind != RF_SIDE_ONLINE_OPERATION_UNDO
+		|| (operation->undo.kind != CLUSTER_UNDO_KIND_BLOCK_WRITE
+			&& operation->undo.kind != CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI))
+		return false;
+	undo = &operation->undo;
+	segment = side_owner_undo_target(owner, undo->instance, undo->segment_id, 0);
+	target = side_owner_undo_target(owner, undo->instance, undo->segment_id, undo->block_no);
+	/* Earlier segment lifecycle/TT records must already be durable. Do not
+	 * create a file or install the full-source header on a block callback. */
+	if (segment == NULL || target == NULL || !segment->file.exists
+		|| segment->file.size != UNDO_SEGMENT_SIZE_BYTES
+		|| rf_side_online_plan_prepare_undo_record_header_v1(owner->protected_plan, index,
+															 &operation->identity,
+															 segment->base.data, &header_prefix)
+			   != RF_PAGE_PROOF_DETAIL_OK
+		|| memcmp(segment->base.data, header_prefix.page.data, BLCKSZ) != 0
+		|| rf_side_online_plan_prepare_undo_record_v1(owner->protected_plan, index,
+													  &operation->identity, NULL, &block_prefix)
+			   != RF_PAGE_PROOF_DETAIL_OK)
+		return false;
+	/* A later observed block cannot be rewound by this record-local entry.
+	 * Equal LSN alone is not an idempotence proof: all bytes must match. */
+	memcpy(&observed, target->base.data, sizeof(observed));
+	if (observed.block_lsn >= operation->identity.record.end_rec_ptr
+		&& memcmp(target->base.data, block_prefix.page.data, BLCKSZ) != 0)
+		return false;
+	if (!side_owner_authority_fresh(owner)
+		|| !cluster_undo_smgr_recovery_read_block_v1(undo->segment_id, undo->instance, 0,
+													 &segment->file, current.data)
+		|| memcmp(current.data, header_prefix.page.data, BLCKSZ) != 0)
+		return false;
+	/* The full-source preflight remains intact; replace only this private
+	 * target's result. Original exact read/write/sync/readback owns the IO. */
+	target->final = block_prefix;
+	return side_owner_install_target(owner, target)
+		   && cluster_undo_smgr_recovery_read_block_v1(undo->segment_id, undo->instance, 0,
+													   &segment->file, current.data)
+		   && memcmp(current.data, header_prefix.page.data, BLCKSZ) == 0
+		   && side_owner_authority_fresh(owner);
+}
+
+static bool
 side_owner_apply_projection(void *arg, const RfSideOnlineOperationV1 *operation)
 {
 	RfSideOnlineProductionOwnerV1 *owner = (RfSideOnlineProductionOwnerV1 *)arg;
@@ -823,6 +877,7 @@ side_owner_apply_ops(RfSideOnlineProductionOwnerV1 *owner, RfSideOnlineApplyOpsV
 	ops->preflight_projection = side_owner_preflight_projection;
 	ops->apply_xact = side_owner_apply_xact;
 	ops->apply_undo = side_owner_apply_undo;
+	ops->apply_undo_record = side_owner_apply_undo_record;
 	ops->apply_projection = side_owner_apply_projection;
 	ops->preflight_control = side_owner_preflight_control;
 	ops->apply_control = side_owner_apply_control;

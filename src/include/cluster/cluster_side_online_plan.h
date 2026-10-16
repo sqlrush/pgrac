@@ -101,6 +101,8 @@ typedef struct RfSideOnlineApplyOpsV1 {
 	/* Optional owner barrier after all target preflights and before any
 	 * apply. Not called for preflight-only or an empty selected set. */
 	bool (*prepare_apply)(void *arg);
+	/* A whole-source undo consumer must not be used for one record. */
+	bool (*apply_undo_record)(void *arg, uint32 index, const RfSideOnlineOperationV1 *operation);
 } RfSideOnlineApplyOpsV1;
 
 /* Production owner for the RF-SIDE v2 non-authoritative projections.  The
@@ -215,6 +217,12 @@ extern RfPageProofDetailV1
 rf_side_online_plan_prepare_undo_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 										   const RfPageOnlineRecordIdentityV1 *identity,
 										   const char *base, RfSideUndoHeaderImageV1 *out);
+/* The same exact prefix's segment header, including for a block record.
+ * This is private byte preparation, not permission to install a header. */
+extern RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_record_header_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+												  const RfPageOnlineRecordIdentityV1 *identity,
+												  const char *base, RfSideUndoHeaderImageV1 *out);
 extern uint32 rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan);
 typedef struct RfSideSpaceContributionV1 {
 	ClusterSpaceIdentity result;
@@ -335,10 +343,11 @@ extern RfPageProofDetailV1 rf_side_online_plan_preflight_v1(const RfSideOnlinePl
 															const RfSideOnlineApplyOpsV1 *ops);
 extern RfPageProofDetailV1 rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan,
 														const RfSideOnlineApplyOpsV1 *ops);
-/* Dispatch one exact record-local control/projection operation after the
+/* Dispatch one exact control/projection or dedicated undo-block operation after the
  * original whole-source preflight. The enclosing sequencer owns WAL order
  * and final completion; end_protected_set receives complete=false even on
- * success. XACT/UNDO/SPACE require ordered target preparation and refuse. */
+ * success. XACT, undo headers and SPACE still require ordered target preparation
+ * and refuse. */
 extern RfPageProofDetailV1
 rf_side_online_plan_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 									const RfPageOnlineRecordIdentityV1 *identity,
