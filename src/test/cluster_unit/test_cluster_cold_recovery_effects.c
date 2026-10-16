@@ -1031,10 +1031,47 @@ UT_TEST(test_foreign_abort_requires_exact_version_and_complete_carrier)
 	}
 }
 
+
+UT_TEST(test_foreign_native_abort_keeps_complete_record_effects)
+{
+	for (int variant = 0; variant < 3; variant++) {
+		EffectRecord r;
+		ClusterColdDecodedV1 out = { 0 };
+		uint32 xinfo = XACT_XINFO_HAS_SCN;
+		if (variant > 0) xinfo |= XACT_XINFO_HAS_DROPPED_STATS;
+		if (variant == 2) xinfo |= XACT_COMPLETION_FORCE_SYNC_COMMIT | XACT_XINFO_HAS_AE_LOCKS;
+		completion(&r, false, xinfo);
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out), CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
+		UT_ASSERT_EQ(out.effects.native_apply, out.effects.required);
+		UT_ASSERT_EQ(out.effects.refused | out.effects.no_effect, 0);
+		UT_ASSERT(partitioned(&out.effects));
+		UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, false));
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out), CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.record.record_flags, 0);
+	}
+}
+
+UT_TEST(test_foreign_native_abort_unsupported_effects_are_not_consumers)
+{
+	const uint32 extra[] = { XACT_XINFO_HAS_SUBXACTS, XACT_XINFO_HAS_RELFILELOCATORS,
+		XACT_XINFO_HAS_TWOPHASE, XACT_XINFO_HAS_ORIGIN };
+	for (uint32 i = 0; i < lengthof(extra); i++) {
+		EffectRecord r;
+		ClusterColdDecodedV1 out = { 0 };
+		completion(&r, false, XACT_XINFO_HAS_SCN | extra[i]);
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out), CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.record.record_flags & CLUSTER_COLD_RECORD_FOREIGN_SIDE, 0);
+		UT_ASSERT_EQ(out.effects.refused, out.effects.required);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(32);
+	UT_PLAN(34);
+	UT_RUN(test_foreign_native_abort_keeps_complete_record_effects);
+	UT_RUN(test_foreign_native_abort_unsupported_effects_are_not_consumers);
 	UT_RUN(test_foreign_abort_requires_exact_version_and_complete_carrier);
 	UT_RUN(test_foreign_undo_header_routes_only_connected_record_consumers);
 	UT_RUN(test_foreign_undo_header_malformed_carriers_remain_refused);

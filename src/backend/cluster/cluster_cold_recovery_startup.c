@@ -874,7 +874,8 @@ cold_control_space_not_executed(void *arg pg_attribute_unused(),
 static RfSideOnlineOperationKindV1
 cold_record_side_kind(const ClusterColdRecordV1 *record)
 {
-	uint8 info = record->info & ~XLR_INFO_MASK;
+	uint8 info = record->rmid == RM_XACT_ID ? record->info & XLOG_XACT_OPMASK
+										   : record->info & ~XLR_INFO_MASK;
 
 	if (record->record_flags == CLUSTER_COLD_RECORD_FOREIGN_CONTROL)
 		return RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL;
@@ -887,6 +888,8 @@ cold_record_side_kind(const ClusterColdRecordV1 *record)
 			|| info == XLOG_UNDO_SEGMENT_RECYCLE || info == XLOG_UNDO_TT_SLOT_BIND
 			|| info == XLOG_UNDO_TT_SLOT_SET_HEAD || info == XLOG_UNDO_TT_SLOT_ABORT))
 		return RF_SIDE_ONLINE_OPERATION_UNDO;
+	if (record->rmid == RM_XACT_ID && info == XLOG_XACT_ABORT)
+		return RF_SIDE_ONLINE_OPERATION_XACT;
 	if ((record->rmid == RM_CLOG_ID && (info == CLOG_ZEROPAGE || info == CLOG_TRUNCATE))
 		|| (record->rmid == RM_MULTIXACT_ID
 			&& (info == XLOG_MULTIXACT_ZERO_OFF_PAGE || info == XLOG_MULTIXACT_ZERO_MEM_PAGE

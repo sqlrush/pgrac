@@ -462,9 +462,12 @@ cold_foreign_control(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan
  * immutable SIDE capture and whole-source consumer preflight still validate
  * the complete payload and original-origin storage before any mutation. */
 static bool
-cold_foreign_side(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan)
+cold_foreign_side(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan,
+				  uint64 system_identifier)
 {
-	uint8 info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+	uint8 info = XLogRecGetRmid(reader) == RM_XACT_ID
+					 ? XLogRecGetInfo(reader) & XLOG_XACT_OPMASK
+					 : XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
 
 	if (XLogRecMaxBlockId(reader) >= 0 || (XLogRecGetInfo(reader) & XLR_INFO_MASK) != 0
 		|| plan->route.record_owner != RF_ROUTE_OWNER_SIDE_TYPED)
@@ -493,6 +496,16 @@ cold_foreign_side(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan)
 		return info == XLOG_MULTIXACT_ZERO_OFF_PAGE || info == XLOG_MULTIXACT_ZERO_MEM_PAGE
 			   || info == XLOG_MULTIXACT_CREATE_ID || info == XLOG_MULTIXACT_TRUNCATE_ID;
 	case RM_XACT_ID:
+		/* Ordinary ABORT is a bounded native consumer only after the exact
+		 * preceding TT_ABORT carrier has been installed by the cold owner. */
+		if (info == XLOG_XACT_ABORT) {
+			RfSideXactOperationV1 operation;
+
+			/* Classification must not turn malformed/unsupported effects into
+			 * a foreign consumer. The real origin is bound later by the
+			 * immutable plan; origin 1 is sufficient for this shape probe. */
+			return rf_side_xact_decode_recovery_v1(reader, system_identifier, 1, &operation);
+		}
 		return info == XLOG_XACT_ASSIGNMENT;
 	case RM_STANDBY_ID:
 		return info == XLOG_INVALIDATIONS;
@@ -644,7 +657,7 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 	if (foreign && plan.route.record_owner != RF_ROUTE_OWNER_PAGE_CODEC && !has_owner) {
 		if (cold_foreign_control(reader, &plan))
 			out->record.record_flags |= CLUSTER_COLD_RECORD_FOREIGN_CONTROL;
-		else if (cold_foreign_side(reader, &plan))
+		else if (cold_foreign_side(reader, &plan, system_identifier))
 			out->record.record_flags |= CLUSTER_COLD_RECORD_FOREIGN_SIDE;
 		else
 			out->record.record_flags |= CLUSTER_COLD_RECORD_SIDE_UNOWNED;

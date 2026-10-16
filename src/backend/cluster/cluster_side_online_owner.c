@@ -486,9 +486,7 @@ side_owner_apply_xact(void *arg, const RfSideOnlineOperationV1 *operation)
 
 		if (!side_owner_authority_fresh(owner)
 			|| !side_owner_cold_abort_ready(owner, operation, &target)
-			|| !side_owner_install_data(owner)
-			|| !side_owner_install_target(
-				owner, side_owner_undo_target(owner, target.instance, target.segment_id, 0)))
+			|| side_owner_undo_target(owner, target.instance, target.segment_id, 0) == NULL)
 			return false;
 		if (operation->xact.cold_completion_effects)
 			return rf_side_xact_apply_cold_abort_completion_v1(

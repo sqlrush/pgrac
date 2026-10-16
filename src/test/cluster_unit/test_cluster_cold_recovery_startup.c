@@ -1522,10 +1522,32 @@ UT_TEST(test_undo_block_dispatch_owner_failure_and_drift_stay_refused)
 	}
 }
 
+
+UT_TEST(test_native_abort_dispatch_matches_exact_captured_kind)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = control_fixture_mode(&record, true);
+		side_record_fixture(&record, RM_XACT_ID, XLOG_XACT_ABORT | XLOG_XACT_HAS_INFO,
+							RF_SIDE_ONLINE_OPERATION_XACT);
+		side_fixture[1].operations[1].xact.kind = RF_SIDE_XACT_ABORT;
+		if (fault == 1) side_fixture[1].operations[1].kind = RF_SIDE_ONLINE_OPERATION_PROJECTION;
+		if (fault == 2) side_fixture[1].operations[1].identity.record.rmid = RM_CLOG_ID;
+		if (fault == 3) record.record_crc++;
+		if (fault == 4) record.info |= 1;
+		UT_ASSERT_EQ(consume_control(typed, &record), fault == 0);
+		UT_ASSERT_EQ(control_calls, fault == 0 ? 1 : 0);
+		UT_ASSERT_EQ(typed->refusal, fault == 0 ? CLUSTER_COLD_OK : CLUSTER_COLD_SIDE_OWNER_MISSING);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(44);
+	UT_PLAN(45);
+	UT_RUN(test_native_abort_dispatch_matches_exact_captured_kind);
 	UT_RUN(test_undo_dispatch_selects_exact_record_and_keeps_space_proof);
 	UT_RUN(test_undo_dispatch_rejects_wrong_identity_or_unowned_effect);
 	UT_RUN(test_undo_block_dispatch_owner_failure_and_drift_stay_refused);
