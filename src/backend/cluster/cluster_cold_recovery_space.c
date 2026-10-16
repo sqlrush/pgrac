@@ -14,9 +14,10 @@
  *	  (shrink_forks).
  *
  *	  The install itself (physical action, stamping, write, fsync,
- *	  post-read) belongs to the SPACE owner.  Until it provides its cold
- *	  entry this build refuses every install; the readiness gate refuses a
- *	  plan with SPACE inputs before any modification.
+ *	  post-read) belongs to the SPACE owner.  The production typed cold
+ *	  handshake below advertises this owner only because this file now
+ *	  supplies its complete entry; the readiness gate still refuses every
+ *	  plan whose owner or inputs are incomplete before any modification.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -39,6 +40,16 @@
 
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_space_storage.h"
+
+/*
+ * This translation unit is the production R-A11 owner.  Keep the capability
+ * local to the owner rather than relying on an external build switch: a
+ * missing switch would silently advertise a false negative and reject every
+ * valid SPACE plan.  All physical work remains behind the existing
+ * cluster_space_recovery_cold_relation_install_v1() identity, source,
+ * durability and read-back gates.
+ */
+#define CLUSTER_COLD_SPACE_OWNER_CONSUMER_V1 1
 
 bool
 cluster_cold_space_owner_v1(void)
