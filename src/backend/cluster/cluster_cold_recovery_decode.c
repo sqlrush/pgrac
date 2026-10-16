@@ -48,8 +48,10 @@
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_page_detached.h"
+#include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_space_reservation.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 #include "replication/message.h"
 #include "storage/standbydefs.h"
 #include "utils/memutils.h"
@@ -465,8 +467,19 @@ cold_foreign_side(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan)
 	uint8 info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
 
 	if (XLogRecMaxBlockId(reader) >= 0 || (XLogRecGetInfo(reader) & XLR_INFO_MASK) != 0
-		|| plan->route.record_owner != RF_ROUTE_OWNER_SIDE_TYPED
-		|| plan->route.codec_id != RF_ROUTE_CODEC_SIDE_STANDARD)
+		|| plan->route.record_owner != RF_ROUTE_OWNER_SIDE_TYPED)
+		return false;
+	if (XLogRecGetRmid(reader) == RM_CLUSTER_UNDO_ID) {
+		ClusterUndoDecoded undo;
+
+		/* Only the existing record-local block consumer is connected. Header
+		 * and terminal effects cannot borrow the whole-source undo owner. */
+		return plan->route.codec_id == RF_ROUTE_CODEC_SIDE_CLUSTER_UNDO
+			   && (info == XLOG_UNDO_BLOCK_WRITE || info == XLOG_UNDO_BLOCK_WRITE_MULTI)
+			   && XLogRecGetData(reader) != NULL && cluster_undo_decode(reader, &undo)
+			   && cluster_undo_preflight(&undo);
+	}
+	if (plan->route.codec_id != RF_ROUTE_CODEC_SIDE_STANDARD)
 		return false;
 	switch (XLogRecGetRmid(reader)) {
 	case RM_CLOG_ID:
@@ -617,7 +630,8 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 		return detail;
 
 	/* Other generations' record-local native adapters retain their original
-	 * origin. Outcomes/undo and remaining lifecycle effects still require
+	 * origin. Undo blocks use their exact prefix consumer; outcomes, undo
+	 * headers and remaining lifecycle effects still require
 	 * their ordered whole-source owners, never founder native redo. */
 	has_owner = XLogRecGetRmid(reader) == RM_SMGR_ID
 				&& ((XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_SMGR_CREATE

@@ -23,6 +23,7 @@
 #include "cluster/cluster_block_apply.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_page_detached.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 #include "storage/standbydefs.h"
 #include "unit_test.h"
 
@@ -56,7 +57,7 @@ typedef struct EffectRecord {
 	XLogReaderState reader;
 	union {
 		uint64 aligned;
-		char bytes[2048];
+		char bytes[BLCKSZ + 128];
 	} data;
 	DecodedXLogRecord decoded;
 } EffectRecord;
@@ -760,10 +761,139 @@ UT_TEST(test_logical_xact_invalidations_do_not_hide_bad_shape)
 	}
 }
 
+
+/* Only route shapes here; actual prefix installation uses the production
+ * owner and temporary files in test_cluster_side_xact. */
+static void
+undo_block_effect_record(EffectRecord *r, bool multi, bool fpi)
+{
+	char body[BLCKSZ] = { 0 };
+	xl_undo_block_write single = { .segment_id = 257,
+								   .block_no = 9,
+								   .instance = 2,
+								   .has_fpi = fpi,
+								   .rec_off = fpi ? 0 : 128,
+								   .rec_len = fpi ? 0 : 16,
+								   .slot_off = fpi ? 0 : BLCKSZ - sizeof(UndoSlotDirEntry) };
+	xl_undo_block_write_multi multiple
+		= { .segment_id = 257,
+			.block_no = 9,
+			.instance = 2,
+			.has_fpi = fpi,
+			.rec_off = fpi ? 0 : 128,
+			.rec_len = fpi ? 0 : 16,
+			.slot_off = fpi ? 0 : BLCKSZ - 2 * sizeof(UndoSlotDirEntry),
+			.slot_len = fpi ? 0 : 2 * sizeof(UndoSlotDirEntry) };
+	Size slots = multi ? 2 * sizeof(UndoSlotDirEntry) : sizeof(UndoSlotDirEntry);
+
+	record_init(r, RM_CLUSTER_UNDO_ID, multi ? XLOG_UNDO_BLOCK_WRITE_MULTI : XLOG_UNDO_BLOCK_WRITE);
+	if (multi)
+		append(r, &multiple, sizeof(multiple));
+	else
+		append(r, &single, sizeof(single));
+	append(r, body, fpi ? BLCKSZ : UNDO_BLOCK_HDR_PREFIX_LEN + 16 + slots);
+}
+
+UT_TEST(test_foreign_undo_blocks_require_real_record_consumer)
+{
+	for (int multi = 0; multi < 2; multi++)
+		for (int fpi = 0; fpi < 2; fpi++) {
+			EffectRecord r;
+			ClusterColdDecodedV1 out = { 0 };
+			undo_block_effect_record(&r, multi, fpi);
+			UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+						 CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
+			UT_ASSERT_EQ(out.effects.native_apply, CLUSTER_COLD_EFFECT_RECORD);
+			UT_ASSERT_EQ(out.effects.no_effect | out.effects.refused, 0);
+			UT_ASSERT(partitioned(&out.effects));
+			UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&out.record),
+						 CLUSTER_COLD_UNSCHEDULED_FOREIGN_SIDE);
+			UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, false));
+			UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, true));
+			UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+						 CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(out.record.record_flags, 0);
+			UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, true));
+		}
+}
+
+UT_TEST(test_foreign_undo_blocks_reject_malformed_or_unowned_shapes)
+{
+	const uint8 infos[]
+		= { XLOG_UNDO_SEGMENT_INIT,		XLOG_UNDO_TT_SLOT_BIND,		   XLOG_UNDO_TT_SLOT_COMMIT,
+			XLOG_UNDO_TT_SLOT_ABORT,	XLOG_UNDO_SEGMENT_RECYCLE,	   XLOG_UNDO_SEGMENT_REUSE,
+			XLOG_UNDO_TT_SLOT_SET_HEAD, XLOG_UNDO_TT_SLOT_CTRC_RELEASE };
+	for (int multi = 0; multi < 2; multi++)
+		for (int fault = 0; fault < 12; fault++) {
+			EffectRecord r;
+			ClusterColdDecodedV1 out = { 0 };
+			xl_undo_block_write *block;
+			undo_block_effect_record(&r, multi, true);
+			block = (xl_undo_block_write *)r.data.bytes;
+			switch (fault) {
+			case 0:
+				r.decoded.main_data_len = sizeof(*block) - 1;
+				break;
+			case 1:
+				r.decoded.main_data_len--;
+				break;
+			case 2:
+				r.decoded.main_data_len++;
+				break;
+			case 3:
+				block->has_fpi = 2;
+				break;
+			case 4:
+				block->block_no = 0;
+				break;
+			case 5:
+				block->instance = 0;
+				break;
+			case 6:
+				block->segment_id = 1;
+				break;
+			case 7:
+				block->rec_len = 1;
+				break;
+			case 8:
+				block->rec_off = 1;
+				break;
+			case 9:
+				r.decoded.header.xl_info |= 1;
+				break;
+			case 10:
+				r.decoded.header.xl_info = 0xF0;
+				break;
+			case 11:
+				r.decoded.main_data = NULL;
+				break;
+			}
+			if (cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out)
+				== CLUSTER_COLD_OK) {
+				UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+				UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+			}
+		}
+	/* Header/TT lifecycle has not acquired a record-local execution owner. */
+	for (uint32 i = 0; i < lengthof(infos); i++) {
+		EffectRecord r;
+		ClusterColdDecodedV1 out = { 0 };
+		record_init(&r, RM_CLUSTER_UNDO_ID, infos[i]);
+		if (cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out)
+			== CLUSTER_COLD_OK) {
+			UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+			UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(27);
+	UT_PLAN(29);
+	UT_RUN(test_foreign_undo_blocks_require_real_record_consumer);
+	UT_RUN(test_foreign_undo_blocks_reject_malformed_or_unowned_shapes);
 	UT_RUN(test_logical_xact_invalidations_keep_physical_no_effect);
 	UT_RUN(test_logical_xact_invalidations_do_not_hide_bad_shape);
 	UT_RUN(test_foreign_clog_and_multixact_use_native_side_consumer);

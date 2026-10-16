@@ -26,6 +26,7 @@
 #define USE_PGRAC_CLUSTER 1
 
 #include "postgres.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 #include <setjmp.h>
 
 #include "access/xlogreader.h"
@@ -1423,10 +1424,104 @@ UT_TEST(test_native_side_failure_or_late_drift_is_sticky)
 	}
 }
 
+
+UT_TEST(test_undo_block_dispatch_selects_exact_record_and_keeps_space_proof)
+{
+	const uint8 infos[] = { XLOG_UNDO_BLOCK_WRITE, XLOG_UNDO_BLOCK_WRITE_MULTI };
+	for (uint32 i = 0; i < lengthof(infos); i++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = control_fixture_mode(&record, true);
+		side_record_fixture(&record, RM_CLUSTER_UNDO_ID, infos[i], RF_SIDE_ONLINE_OPERATION_UNDO);
+		UT_ASSERT(consume_control(typed, &record));
+		UT_ASSERT_EQ(control_calls, 1);
+		UT_ASSERT_EQ(control_selected, 1);
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_undo_block_dispatch_rejects_wrong_identity_or_unowned_header)
+{
+	for (uint32 fault = 0; fault < 10; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = control_fixture(&record);
+		side_record_fixture(&record, RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE,
+							RF_SIDE_ONLINE_OPERATION_UNDO);
+		switch (fault) {
+		case 0:
+			side_fixture[1].operations[1].kind = RF_SIDE_ONLINE_OPERATION_PROJECTION;
+			break;
+		case 1:
+			record.record_crc++;
+			break;
+		case 2:
+			record.info |= 1;
+			side_fixture[1].operations[1].identity.record.info = record.info;
+			break;
+		case 3:
+			side_record_fixture(&record, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND,
+								RF_SIDE_ONLINE_OPERATION_UNDO);
+			break;
+		case 4:
+			side_record_fixture(&record, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_COMMIT,
+								RF_SIDE_ONLINE_OPERATION_UNDO);
+			break;
+		case 5:
+			side_record_fixture(&record, RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_INIT,
+								RF_SIDE_ONLINE_OPERATION_UNDO);
+			break;
+		case 6:
+			side_fixture[1].operations[1].history_only = true;
+			break;
+		case 7:
+			record.record_flags |= CLUSTER_COLD_RECORD_FOREIGN_CONTROL;
+			break;
+		case 8:
+			control_serial.mode = CLUSTER_RECOVERY_SERIAL_ONLINE;
+			break;
+		case 9:
+			tokens[2].file_txn_seq++;
+			break;
+		}
+		UT_ASSERT(!consume_control(typed, &record));
+		UT_ASSERT_EQ(control_calls, 0);
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SIDE_OWNER_MISSING);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_undo_block_dispatch_owner_failure_and_drift_stay_refused)
+{
+	for (uint32 fault = 1; fault <= 7; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = control_fixture(&record);
+		side_record_fixture(&record, RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE_MULTI,
+							RF_SIDE_ONLINE_OPERATION_UNDO);
+		control_fault = fault;
+		if (sigsetjmp(source_sync_exception, 0) == 0) {
+			UT_ASSERT(!consume_control(typed, &record));
+			UT_ASSERT(fault != 5);
+		} else
+			UT_ASSERT_EQ(fault, 5);
+		UT_ASSERT_EQ(control_calls, fault <= 5 ? 1 : 0);
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SIDE_OWNER_MISSING);
+		control_fault = 0;
+		UT_ASSERT(!consume_control(typed, &record));
+		UT_ASSERT_EQ(control_calls, fault <= 5 ? 1 : 0);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(41);
+	UT_PLAN(44);
+	UT_RUN(test_undo_block_dispatch_selects_exact_record_and_keeps_space_proof);
+	UT_RUN(test_undo_block_dispatch_rejects_wrong_identity_or_unowned_header);
+	UT_RUN(test_undo_block_dispatch_owner_failure_and_drift_stay_refused);
 	UT_RUN(test_native_side_dispatch_selects_exact_existing_consumer);
 	UT_RUN(test_native_side_dispatch_rejects_wrong_kind_and_family);
 	UT_RUN(test_native_side_failure_or_late_drift_is_sticky);

@@ -45,6 +45,7 @@
 #include "cluster/cluster_cold_recovery_census.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_side_online_owner.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_control_root.h"
 #include "cluster/cluster_page_cold_redo.h"
@@ -880,6 +881,9 @@ cold_record_side_kind(const ClusterColdRecordV1 *record)
 	if (record->record_flags != CLUSTER_COLD_RECORD_FOREIGN_SIDE
 		|| (record->info & XLR_INFO_MASK) != 0)
 		return RF_SIDE_ONLINE_OPERATION_INVALID;
+	if (record->rmid == RM_CLUSTER_UNDO_ID
+		&& (info == XLOG_UNDO_BLOCK_WRITE || info == XLOG_UNDO_BLOCK_WRITE_MULTI))
+		return RF_SIDE_ONLINE_OPERATION_UNDO;
 	if ((record->rmid == RM_CLOG_ID && (info == CLOG_ZEROPAGE || info == CLOG_TRUNCATE))
 		|| (record->rmid == RM_MULTIXACT_ID
 			&& (info == XLOG_MULTIXACT_ZERO_OFF_PAGE || info == XLOG_MULTIXACT_ZERO_MEM_PAGE
