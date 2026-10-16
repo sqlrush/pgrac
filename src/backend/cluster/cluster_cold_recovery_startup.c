@@ -36,6 +36,10 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "access/xlogreader.h"
+#include "access/clog.h"
+#include "access/multixact.h"
+#include "access/xact.h"
+#include "storage/standbydefs.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cold_recovery_census.h"
@@ -864,11 +868,34 @@ cold_control_space_not_executed(void *arg pg_attribute_unused(),
 	return false;
 }
 
+/* Match the original immutable SIDE operation kind as well as its full
+ * WAL identity. No XACT/UNDO whole-source preparation is dispatched here. */
+static RfSideOnlineOperationKindV1
+cold_record_side_kind(const ClusterColdRecordV1 *record)
+{
+	uint8 info = record->info & ~XLR_INFO_MASK;
+
+	if (record->record_flags == CLUSTER_COLD_RECORD_FOREIGN_CONTROL)
+		return RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL;
+	if (record->record_flags != CLUSTER_COLD_RECORD_FOREIGN_SIDE
+		|| (record->info & XLR_INFO_MASK) != 0)
+		return RF_SIDE_ONLINE_OPERATION_INVALID;
+	if ((record->rmid == RM_CLOG_ID && (info == CLOG_ZEROPAGE || info == CLOG_TRUNCATE))
+		|| (record->rmid == RM_MULTIXACT_ID
+			&& (info == XLOG_MULTIXACT_ZERO_OFF_PAGE || info == XLOG_MULTIXACT_ZERO_MEM_PAGE
+				|| info == XLOG_MULTIXACT_CREATE_ID || info == XLOG_MULTIXACT_TRUNCATE_ID)))
+		return RF_SIDE_ONLINE_OPERATION_PROJECTION;
+	if ((record->rmid == RM_XACT_ID && info == XLOG_XACT_ASSIGNMENT)
+		|| (record->rmid == RM_STANDBY_ID && info == XLOG_INVALIDATIONS))
+		return RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL;
+	return RF_SIDE_ONLINE_OPERATION_INVALID;
+}
+
 /* The original sequencer owns record order and final completion. Never
  * dispatch the whole-source plan before intervening PAGE/SPACE records. */
 bool
-cluster_cold_typed_control_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence,
-							  uint32 participant, const ClusterColdRecordV1 *record)
+cluster_cold_typed_side_record_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence,
+								  uint32 participant, const ClusterColdRecordV1 *record)
 {
 	const ClusterColdParticipantV1 *source;
 	const ColdRoot *selected;
@@ -878,6 +905,7 @@ cluster_cold_typed_control_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePla
 	ClusterThreadRecoveryAuthorityV1 authority;
 	RfSideOnlineProductionOwnerV1 owner;
 	ColdControlSpace space = { typed, fence, participant };
+	RfSideOnlineOperationKindV1 kind;
 	uint32 match = UINT32_MAX;
 	uint32 count;
 	uint64 epoch;
@@ -889,7 +917,7 @@ cluster_cold_typed_control_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePla
 	 * state. No field is restored on an exceptional exit.
 	 */
 	cold_refuse(typed, CLUSTER_COLD_SIDE_OWNER_MISSING,
-				"pass-2 foreign control consumption is incomplete");
+				"pass-2 foreign SIDE record consumption is incomplete");
 	if (fence == NULL || record == NULL || !cluster_cold_replay_window_active_v1()
 		|| typed->plan == NULL || typed->replay_roots == NULL || typed->own_participant != 0
 		|| typed->replay_count == 0 || typed->replay_count > typed->participant_count
@@ -897,7 +925,7 @@ cluster_cold_typed_control_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePla
 		|| typed->replay_root_count != typed->replay_count || participant >= typed->replay_count
 		|| participant == typed->own_participant || typed->side_capture_detail[participant] != 0
 		|| typed->side_plans[participant] == NULL
-		|| record->record_flags != CLUSTER_COLD_RECORD_FOREIGN_CONTROL
+		|| (kind = cold_record_side_kind(record)) == RF_SIDE_ONLINE_OPERATION_INVALID
 		|| record->component_count != 0 || record->space_count != 0
 		|| !cold_replay_sources_current(typed, fence))
 		return false;
@@ -935,8 +963,7 @@ cluster_cold_typed_control_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePla
 			return false;
 		if (operation.identity.record.read_rec_ptr != record->read_rec_ptr)
 			continue;
-		if (match != UINT32_MAX || operation.history_only
-			|| operation.kind != RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
+		if (match != UINT32_MAX || operation.history_only || operation.kind != kind
 			|| memcmp(&operation.identity, &identity, sizeof(identity)) != 0)
 			return false;
 		match = i;

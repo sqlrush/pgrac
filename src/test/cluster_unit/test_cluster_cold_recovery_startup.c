@@ -29,6 +29,10 @@
 #include <setjmp.h>
 
 #include "access/xlogreader.h"
+#include "access/clog.h"
+#include "access/multixact.h"
+#include "access/xact.h"
+#include "storage/standbydefs.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cold_recovery_census.h"
@@ -1008,8 +1012,8 @@ control_fixture(ClusterColdRecordV1 *record)
 static bool
 consume_control(ClusterColdTypedV1 *typed, const ClusterColdRecordV1 *record)
 {
-	return cluster_cold_typed_control_v1(typed, (ClusterRecoveryFencePlan *)&fixture_context, 1,
-										 record);
+	return cluster_cold_typed_side_record_v1(typed, (ClusterRecoveryFencePlan *)&fixture_context, 1,
+											 record);
 }
 
 UT_TEST(test_control_dispatch_selects_current_record_only)
@@ -1306,10 +1310,126 @@ UT_TEST(test_control_dispatch_error_does_not_leave_success)
 }
 
 
+static void
+side_record_fixture(ClusterColdRecordV1 *record, uint8 rmid, uint8 info,
+					RfSideOnlineOperationKindV1 kind)
+{
+	RfSideOnlineOperationV1 *operation = &side_fixture[1].operations[1];
+	record->record_flags = CLUSTER_COLD_RECORD_FOREIGN_SIDE;
+	record->rmid = rmid;
+	record->info = info;
+	operation->identity.record.rmid = rmid;
+	operation->identity.record.info = info;
+	operation->kind = kind;
+}
+
+UT_TEST(test_native_side_dispatch_selects_exact_existing_consumer)
+{
+	const uint8 rmids[] = { RM_CLOG_ID,		 RM_CLOG_ID,	  RM_MULTIXACT_ID, RM_MULTIXACT_ID,
+							RM_MULTIXACT_ID, RM_MULTIXACT_ID, RM_XACT_ID,	   RM_STANDBY_ID };
+	const uint8 infos[] = { CLOG_ZEROPAGE,
+							CLOG_TRUNCATE,
+							XLOG_MULTIXACT_ZERO_OFF_PAGE,
+							XLOG_MULTIXACT_ZERO_MEM_PAGE,
+							XLOG_MULTIXACT_CREATE_ID,
+							XLOG_MULTIXACT_TRUNCATE_ID,
+							XLOG_XACT_ASSIGNMENT,
+							XLOG_INVALIDATIONS };
+	for (uint32 i = 0; i < lengthof(rmids); i++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = control_fixture_mode(&record, true);
+		bool accepted;
+		side_record_fixture(&record, rmids[i], infos[i],
+							i < 6 ? RF_SIDE_ONLINE_OPERATION_PROJECTION
+								  : RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL);
+		accepted = consume_control(typed, &record);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+		UT_ASSERT(accepted);
+		UT_ASSERT_EQ(control_calls, 1);
+		UT_ASSERT_EQ(control_selected, 1);
+	}
+}
+
+UT_TEST(test_native_side_dispatch_rejects_wrong_kind_and_family)
+{
+	for (uint32 fault = 0; fault < 9; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = control_fixture(&record);
+		side_record_fixture(&record, RM_CLOG_ID, CLOG_ZEROPAGE,
+							RF_SIDE_ONLINE_OPERATION_PROJECTION);
+		switch (fault) {
+		case 0:
+			side_fixture[1].operations[1].kind = RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL;
+			break;
+		case 1:
+			record.record_flags |= CLUSTER_COLD_RECORD_FOREIGN_CONTROL;
+			break;
+		case 2:
+			record.record_flags |= CLUSTER_COLD_RECORD_SIDE_UNOWNED;
+			break;
+		case 3:
+			record.record_crc++;
+			break;
+		case 4:
+			record.info = 0xF0;
+			side_fixture[1].operations[1].identity.record.info = record.info;
+			break;
+		case 5:
+			side_record_fixture(&record, RM_XACT_ID, XLOG_XACT_COMMIT,
+								RF_SIDE_ONLINE_OPERATION_XACT);
+			break;
+		case 6:
+			side_record_fixture(&record, RM_XACT_ID, XLOG_XACT_INVALIDATIONS,
+								RF_SIDE_ONLINE_OPERATION_XACT);
+			break;
+		case 7:
+			side_record_fixture(&record, RM_XACT_ID, XLOG_XACT_ASSIGNMENT,
+								RF_SIDE_ONLINE_OPERATION_PROJECTION);
+			break;
+		case 8:
+			side_record_fixture(&record, RM_STANDBY_ID, XLOG_INVALIDATIONS,
+								RF_SIDE_ONLINE_OPERATION_XACT);
+			break;
+		}
+		UT_ASSERT(!consume_control(typed, &record));
+		UT_ASSERT_EQ(control_calls, 0);
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SIDE_OWNER_MISSING);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_native_side_failure_or_late_drift_is_sticky)
+{
+	for (uint32 fault = 1; fault <= 7; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = control_fixture(&record);
+		side_record_fixture(&record, RM_MULTIXACT_ID, XLOG_MULTIXACT_CREATE_ID,
+							RF_SIDE_ONLINE_OPERATION_PROJECTION);
+		control_fault = fault;
+		if (sigsetjmp(source_sync_exception, 0) == 0) {
+			UT_ASSERT(!consume_control(typed, &record));
+			UT_ASSERT(fault != 5);
+		} else
+			UT_ASSERT_EQ(fault, 5);
+		UT_ASSERT_EQ(control_calls, fault <= 5 ? 1 : 0);
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SIDE_OWNER_MISSING);
+		control_fault = 0;
+		UT_ASSERT(!consume_control(typed, &record));
+		UT_ASSERT_EQ(control_calls, fault <= 5 ? 1 : 0);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(38);
+	UT_PLAN(41);
+	UT_RUN(test_native_side_dispatch_selects_exact_existing_consumer);
+	UT_RUN(test_native_side_dispatch_rejects_wrong_kind_and_family);
+	UT_RUN(test_native_side_failure_or_late_drift_is_sticky);
 	UT_RUN(test_control_dispatch_selects_current_record_only);
 	UT_RUN(test_control_dispatch_keeps_original_space_preflight);
 	UT_RUN(test_control_dispatch_native_create_borrows_exact_typed_pair);

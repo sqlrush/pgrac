@@ -3285,7 +3285,8 @@ cluster_typed_replay_next(void *arg, uint32 participant, ClusterColdReplayRecord
  * prepared-transaction and unowned side record after native redo, so what
  * reaches here is the founder's own record (native owner), another
  * generation's rebuildable FSM-only page record, relation file creation or
- * native control record (no effect on the founder), or a SPACE change the
+ * native control record (no effect on the founder), an explicitly owned
+ * record-local native SIDE effect, or a SPACE change the
  * SPACE owner installs later or the SPACE pages on disk already cover (never
  * replayed natively); anything else means pass 1 saw other input
  * (cluster_cold_unscheduled_v1).
@@ -3322,8 +3323,14 @@ cluster_typed_replay_unscheduled(void *arg, uint32 participant)
 		case CLUSTER_COLD_UNSCHEDULED_FOREIGN_NOOP:
 			/* Consume the exact captured control through its original cold
 			 * owner; no-effect classification is not a source completion. */
-			return cluster_cold_typed_control_v1(typed, *rep->fence_plan, participant,
-												 &rep->decoded.record);
+			return cluster_cold_typed_side_record_v1(typed, *rep->fence_plan, participant,
+													 &rep->decoded.record);
+		case CLUSTER_COLD_UNSCHEDULED_FOREIGN_SIDE:
+			/* Keep the original pre-mutation fence and source-local consumer;
+			 * never run another origin's SLRU through founder native redo. */
+			cluster_typed_replay_foreign_gate(rep);
+			return cluster_cold_typed_side_record_v1(typed, *rep->fence_plan, participant,
+													 &rep->decoded.record);
 		case CLUSTER_COLD_UNSCHEDULED_NATIVE:
 			break;
 	}

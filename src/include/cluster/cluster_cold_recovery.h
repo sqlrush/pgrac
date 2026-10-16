@@ -144,11 +144,11 @@ typedef struct ClusterColdSpaceOpV1 {
  * already-durable history before it.  UNSUPPORTED marks input outside the
  * supported profile (prepared transactions) and is refused anywhere.
  * SIDE_UNOWNED marks a non-page effect of another generation for which no
- * typed cold owner exists yet (transaction outcomes, undo, SLRU); like
+ * typed cold owner exists yet (whole-source transaction outcomes, undo); like
  * STRUCTURAL it is refused after native redo and is never replayed as a
  * no-op.  FOREIGN_CONTROL marks another generation's native control record
  * (XLOG checkpoint, NEXTOID, parameter, FPW, timeline and segment records,
- * standby records, logical messages): on the founder its typed effect is
+ * standby locks/running transactions, logical messages): its typed effect is
  * none, as in crash recovery -- they describe that writer's own control file
  * and counters -- so it is consumed without native replay.
  */
@@ -156,7 +156,9 @@ typedef struct ClusterColdSpaceOpV1 {
 #define CLUSTER_COLD_RECORD_UNSUPPORTED UINT8_C(0x02)
 #define CLUSTER_COLD_RECORD_SIDE_UNOWNED UINT8_C(0x04)
 #define CLUSTER_COLD_RECORD_FOREIGN_CONTROL UINT8_C(0x08)
-#define CLUSTER_COLD_RECORD_KNOWN_FLAGS UINT8_C(0x0F)
+/* Original-origin record-local consumer, never founder native redo/no-op. */
+#define CLUSTER_COLD_RECORD_FOREIGN_SIDE UINT8_C(0x10)
+#define CLUSTER_COLD_RECORD_KNOWN_FLAGS UINT8_C(0x1F)
 
 /* Every decoded record of a participant is fed, in its LSN order.  Records
  * without ordinary page components only advance the participant cursor. */
@@ -378,14 +380,16 @@ extern ClusterColdPageActionV1 cluster_cold_page_action_v1(const ClusterColdStep
  * Pass-2 handling of a decoded record without a scheduled step.  SPACE
  * effects are never replayed natively: the SPACE owner installs them, or the
  * SPACE pages on disk already cover them.  Another generation's native
- * control record is consumed without replay.  Page versions, refused flags
+ * control record is consumed without replay; record-local SIDE effects use
+ * their original-origin consumer. Page versions, refused flags
  * or a commit's drops (always a step) mean pass 1 saw other input.
  */
 typedef enum ClusterColdUnscheduledV1 {
 	CLUSTER_COLD_UNSCHEDULED_NATIVE = 0,
 	CLUSTER_COLD_UNSCHEDULED_SPACE_SKIP = 1,
 	CLUSTER_COLD_UNSCHEDULED_REFUSE = 2,
-	CLUSTER_COLD_UNSCHEDULED_FOREIGN_NOOP = 3
+	CLUSTER_COLD_UNSCHEDULED_FOREIGN_NOOP = 3,
+	CLUSTER_COLD_UNSCHEDULED_FOREIGN_SIDE = 4
 } ClusterColdUnscheduledV1;
 
 extern ClusterColdUnscheduledV1 cluster_cold_unscheduled_v1(const ClusterColdRecordV1 *record);
@@ -726,11 +730,13 @@ extern void cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed);
 extern bool cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed,
 											   struct ClusterRecoveryFencePlan *fence);
 
-/* Consume one original foreign control record under its existing cold
- * authority. Selection never authorizes a full source or recovery completion. */
-extern bool cluster_cold_typed_control_v1(ClusterColdTypedV1 *typed,
-										  struct ClusterRecoveryFencePlan *fence,
-										  uint32 participant, const ClusterColdRecordV1 *record);
+/* Consume one original foreign control or record-local native SIDE effect
+ * under its existing cold authority. Selection never authorizes a full source
+ * or recovery completion. */
+extern bool cluster_cold_typed_side_record_v1(ClusterColdTypedV1 *typed,
+											  struct ClusterRecoveryFencePlan *fence,
+											  uint32 participant,
+											  const ClusterColdRecordV1 *record);
 
 /*
  * Before the fence plan publishes its origins recovered: each origin is a

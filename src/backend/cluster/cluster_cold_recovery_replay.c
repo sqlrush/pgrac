@@ -71,7 +71,9 @@ cluster_cold_replay_effects_v1(const ClusterColdDecodedV1 *decoded, const Cluste
 	e = &decoded->effects;
 	if (!(e->required & CLUSTER_COLD_EFFECT_RECORD)
 		|| (e->required & ~((CLUSTER_COLD_EFFECT_SCN << 1) - 1U)) != 0 || e->refused != 0
-		|| (record->record_flags & ~CLUSTER_COLD_RECORD_FOREIGN_CONTROL) != 0
+		|| (record->record_flags
+			& ~(CLUSTER_COLD_RECORD_FOREIGN_CONTROL | CLUSTER_COLD_RECORD_FOREIGN_SIDE))
+			   != 0
 		|| record->component_count > CLUSTER_COLD_MAX_COMPONENTS
 		|| (record->component_count != 0 && record->components == NULL)
 		|| (record->space_count != 0 && record->space_ops == NULL)
@@ -107,6 +109,8 @@ cluster_cold_replay_effects_v1(const ClusterColdDecodedV1 *decoded, const Cluste
 							   && (record->info & ~XLR_INFO_MASK) == XLOG_SMGR_CREATE)));
 		case CLUSTER_COLD_UNSCHEDULED_FOREIGN_NOOP:
 			return !own && e->no_effect == e->required;
+		case CLUSTER_COLD_UNSCHEDULED_FOREIGN_SIDE:
+			return !own && e->native_apply == e->required;
 		case CLUSTER_COLD_UNSCHEDULED_SPACE_SKIP:
 			return record->rmid == RM_SMGR_ID && record->space_count == 1
 				   && e->space_apply == e->required
@@ -159,11 +163,16 @@ cluster_cold_unscheduled_v1(const ClusterColdRecordV1 *record)
 	uint32 i;
 
 	if (record == NULL || record->component_count != 0
+		|| (record->record_flags & ~CLUSTER_COLD_RECORD_KNOWN_FLAGS) != 0
 		|| (record->record_flags
 			& (CLUSTER_COLD_RECORD_STRUCTURAL | CLUSTER_COLD_RECORD_UNSUPPORTED
 			   | CLUSTER_COLD_RECORD_SIDE_UNOWNED))
 			   != 0)
 		return CLUSTER_COLD_UNSCHEDULED_REFUSE;
+	if ((record->record_flags & CLUSTER_COLD_RECORD_FOREIGN_SIDE) != 0)
+		return record->record_flags == CLUSTER_COLD_RECORD_FOREIGN_SIDE && record->space_count == 0
+				   ? CLUSTER_COLD_UNSCHEDULED_FOREIGN_SIDE
+				   : CLUSTER_COLD_UNSCHEDULED_REFUSE;
 	if ((record->record_flags & CLUSTER_COLD_RECORD_FOREIGN_CONTROL) != 0)
 		return record->space_count == 0 ? CLUSTER_COLD_UNSCHEDULED_FOREIGN_NOOP
 										: CLUSTER_COLD_UNSCHEDULED_REFUSE;

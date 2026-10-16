@@ -13,6 +13,8 @@
 #define USE_PGRAC_CLUSTER 1
 #include "postgres.h"
 #include "access/commit_ts.h"
+#include "access/clog.h"
+#include "access/multixact.h"
 #include "access/xact.h"
 #include "access/xlogreader.h"
 #include "catalog/pg_control.h"
@@ -230,9 +232,12 @@ UT_TEST(test_foreign_invalidation_is_not_no_effect)
 	append(&r, &inval, MinSizeOfInvalidations);
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
 				 CLUSTER_COLD_OK);
-	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
 	UT_ASSERT_EQ(out.effects.no_effect, 0);
-	UT_ASSERT(out.effects.refused & CLUSTER_COLD_EFFECT_RELCACHE);
+	UT_ASSERT_EQ(out.effects.refused, 0);
+	UT_ASSERT(out.effects.native_apply & CLUSTER_COLD_EFFECT_RELCACHE);
+	UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, false));
+	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, true));
 	UT_ASSERT(partitioned(&out.effects));
 }
 
@@ -578,10 +583,113 @@ UT_TEST(test_dispatch_standalone_space_and_original_refusal_flags)
 	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, &step, true));
 }
 
+
+UT_TEST(test_foreign_clog_and_multixact_use_native_side_consumer)
+{
+	const uint8 rmids[] = { RM_CLOG_ID,		 RM_CLOG_ID,	  RM_MULTIXACT_ID,
+							RM_MULTIXACT_ID, RM_MULTIXACT_ID, RM_MULTIXACT_ID };
+	const uint8 infos[] = { CLOG_ZEROPAGE,
+							CLOG_TRUNCATE,
+							XLOG_MULTIXACT_ZERO_OFF_PAGE,
+							XLOG_MULTIXACT_ZERO_MEM_PAGE,
+							XLOG_MULTIXACT_CREATE_ID,
+							XLOG_MULTIXACT_TRUNCATE_ID };
+	for (uint32 i = 0; i < lengthof(rmids); i++) {
+		EffectRecord r;
+		ClusterColdDecodedV1 out = { 0 };
+		int page = 0;
+		xl_clog_truncate clog = { .pageno = 0, .oldestXact = 100, .oldestXactDb = 5 };
+		xl_multixact_create create = { .mid = 5, .moff = 20, .nmembers = 1 };
+		MultiXactMember member = { .xid = 100, .status = MultiXactStatusForUpdate };
+		xl_multixact_truncate truncate = { .oldestMultiDB = 5,
+										   .startTruncOff = 1,
+										   .endTruncOff = 5,
+										   .startTruncMemb = 1,
+										   .endTruncMemb = 20 };
+		record_init(&r, rmids[i], infos[i]);
+		if (i == 1)
+			append(&r, &clog, sizeof(clog));
+		else if (i == 4) {
+			append(&r, &create, SizeOfMultiXactCreate);
+			append(&r, &member, sizeof(member));
+		} else if (i == 5)
+			append(&r, &truncate, SizeOfMultiXactTruncate);
+		else
+			append(&r, &page, sizeof(page));
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+					 CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
+		UT_ASSERT_EQ(out.effects.native_apply, CLUSTER_COLD_EFFECT_RECORD);
+		UT_ASSERT_EQ(out.effects.no_effect, 0);
+		UT_ASSERT_EQ(out.effects.refused, 0);
+		UT_ASSERT(partitioned(&out.effects));
+		UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&out.record),
+					 CLUSTER_COLD_UNSCHEDULED_FOREIGN_SIDE);
+		UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, false));
+		UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, true));
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+					 CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.record.record_flags, 0);
+		UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, true));
+	}
+}
+
+UT_TEST(test_foreign_assignment_keeps_native_parent_effect)
+{
+	EffectRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	xl_xact_assignment assignment = { .xtop = 100, .nsubxacts = 1 };
+	TransactionId child = 101;
+	record_init(&r, RM_XACT_ID, XLOG_XACT_ASSIGNMENT);
+	append(&r, &assignment, MinSizeOfXactAssignment);
+	append(&r, &child, sizeof(child));
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
+	UT_ASSERT_EQ(out.effects.native_apply,
+				 CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_CHILDREN);
+	UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, false));
+	out.effects.no_effect = out.effects.native_apply;
+	out.effects.native_apply = 0;
+	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+	r.decoded.main_data_len--;
+	UT_ASSERT(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out)
+			  != CLUSTER_COLD_OK);
+}
+
+UT_TEST(test_foreign_side_dispatch_rejects_mixed_flags_and_unowned_xact)
+{
+	ClusterColdDecodedV1 out = { 0 };
+	EffectRecord r;
+	SharedInvalidationMessage msg = { 0 };
+	out.record.record_flags = CLUSTER_COLD_RECORD_FOREIGN_SIDE;
+	out.record.rmid = RM_CLOG_ID;
+	out.record.info = CLOG_ZEROPAGE;
+	out.effects.required = out.effects.native_apply = CLUSTER_COLD_EFFECT_RECORD;
+	UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, false));
+	for (uint8 bit = 1; bit != 0; bit <<= 1) {
+		if (bit == CLUSTER_COLD_RECORD_FOREIGN_SIDE)
+			continue;
+		out.record.record_flags = CLUSTER_COLD_RECORD_FOREIGN_SIDE | bit;
+		UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+		UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&out.record), CLUSTER_COLD_UNSCHEDULED_REFUSE);
+	}
+	/* Standalone XACT invalidations still use the whole-source XACT owner. */
+	record_init(&r, RM_XACT_ID, XLOG_XACT_INVALIDATIONS);
+	counted(&r, &msg, 1, sizeof(msg));
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+}
+
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(25);
+	UT_RUN(test_foreign_clog_and_multixact_use_native_side_consumer);
+	UT_RUN(test_foreign_assignment_keeps_native_parent_effect);
+	UT_RUN(test_foreign_side_dispatch_rejects_mixed_flags_and_unowned_xact);
 	UT_RUN(test_whole_commit_effects_keep_native_owner);
 	UT_RUN(test_foreign_compound_cannot_drop_unowned_effects);
 	UT_RUN(test_relcache_work_exists_with_zero_messages);

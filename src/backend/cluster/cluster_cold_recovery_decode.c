@@ -10,8 +10,9 @@
  *	  identity and reservation changes and a commit's relation drops become
  *	  typed SPACE effects for the SPACE owner; the founder's own non-page
  *	  records keep their native redo owner, as does relation file creation;
- *	  another generation's other non-page records, the remaining relation
- *	  lifecycle and prepared-transaction records are flagged so the plan
+ *	  record-local foreign native effects use their original-origin adapters;
+ *	  the other non-page records, remaining relation lifecycle and
+ *	  prepared-transaction records are flagged so the plan
  *	  refuses them after the native redo start.  Routed side components
  *	  inside page records are refused until their typed cold owner exists.
  *
@@ -38,6 +39,8 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "access/heapam_xlog.h"
+#include "access/clog.h"
+#include "access/multixact.h"
 #include "access/xact.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
@@ -446,6 +449,33 @@ cold_foreign_control(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan
 	}
 }
 
+/* Only existing record-local native consumers may enter this route. The
+ * immutable SIDE capture and whole-source consumer preflight still validate
+ * the complete payload and original-origin storage before any mutation. */
+static bool
+cold_foreign_side(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan)
+{
+	uint8 info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+
+	if (XLogRecMaxBlockId(reader) >= 0 || (XLogRecGetInfo(reader) & XLR_INFO_MASK) != 0
+		|| plan->route.record_owner != RF_ROUTE_OWNER_SIDE_TYPED
+		|| plan->route.codec_id != RF_ROUTE_CODEC_SIDE_STANDARD)
+		return false;
+	switch (XLogRecGetRmid(reader)) {
+	case RM_CLOG_ID:
+		return info == CLOG_ZEROPAGE || info == CLOG_TRUNCATE;
+	case RM_MULTIXACT_ID:
+		return info == XLOG_MULTIXACT_ZERO_OFF_PAGE || info == XLOG_MULTIXACT_ZERO_MEM_PAGE
+			   || info == XLOG_MULTIXACT_CREATE_ID || info == XLOG_MULTIXACT_TRUNCATE_ID;
+	case RM_XACT_ID:
+		return info == XLOG_XACT_ASSIGNMENT;
+	case RM_STANDBY_ID:
+		return info == XLOG_INVALIDATIONS;
+	default:
+		return false;
+	}
+}
+
 static ClusterColdDetailV1
 cold_map_components(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan,
 					uint64 system_identifier, const uint8 storage_uuid[16],
@@ -579,19 +609,20 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 	if (detail != CLUSTER_COLD_OK)
 		return detail;
 
-	/*
-	 * Another generation's side effects (outcomes, undo, SLRU) have no typed
-	 * cold owner yet; never a silent no-op.  Its SPACE changes have the SPACE
-	 * owner, and creating a relation file is idempotent, so their native redo
-	 * is the owner's.  Its native control records are typed no-ops.
-	 */
+	/* Other generations' record-local native adapters retain their original
+	 * origin. Outcomes/undo and remaining lifecycle effects still require
+	 * their ordered whole-source owners, never founder native redo. */
 	has_owner = XLogRecGetRmid(reader) == RM_SMGR_ID
 				&& ((XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_SMGR_CREATE
 					|| out->record.space_count > 0);
-	if (foreign && plan.route.record_owner != RF_ROUTE_OWNER_PAGE_CODEC && !has_owner)
-		out->record.record_flags |= cold_foreign_control(reader, &plan)
-										? CLUSTER_COLD_RECORD_FOREIGN_CONTROL
-										: CLUSTER_COLD_RECORD_SIDE_UNOWNED;
+	if (foreign && plan.route.record_owner != RF_ROUTE_OWNER_PAGE_CODEC && !has_owner) {
+		if (cold_foreign_control(reader, &plan))
+			out->record.record_flags |= CLUSTER_COLD_RECORD_FOREIGN_CONTROL;
+		else if (cold_foreign_side(reader, &plan))
+			out->record.record_flags |= CLUSTER_COLD_RECORD_FOREIGN_SIDE;
+		else
+			out->record.record_flags |= CLUSTER_COLD_RECORD_SIDE_UNOWNED;
+	}
 	detail = cold_map_components(reader, &plan, system_identifier, storage_uuid, out);
 	if (detail == CLUSTER_COLD_OK) {
 		cold_effect_routes(&plan, effects, out);
