@@ -545,6 +545,63 @@ side_owner_apply_undo(void *arg, const RfSideOnlineOperationV1 *operation)
 }
 
 static bool
+side_owner_apply_undo_header_record(RfSideOnlineProductionOwnerV1 *owner, uint32 index,
+									const RfSideOnlineOperationV1 *operation)
+{
+	const ClusterUndoDecoded *undo = &operation->undo;
+	SideUndoHeader *target;
+	RfSideUndoHeaderImageV1 prefix;
+	PGAlignedBlock current;
+	bool image;
+
+	if (undo->kind != CLUSTER_UNDO_KIND_SEGMENT_INIT
+		&& undo->kind != CLUSTER_UNDO_KIND_SEGMENT_REUSE
+		&& undo->kind != CLUSTER_UNDO_KIND_SEGMENT_RECYCLE
+		&& undo->kind != CLUSTER_UNDO_KIND_TT_BIND)
+		return false;
+	target = side_owner_undo_target(owner, undo->instance, undo->segment_id, 0);
+	if (target == NULL
+		|| rf_side_online_plan_prepare_undo_record_v1(
+			   owner->protected_plan, index, &operation->identity, target->base.data, &prefix)
+			   != RF_PAGE_PROOF_DETAIL_OK)
+		return false;
+	image = undo->kind == CLUSTER_UNDO_KIND_SEGMENT_INIT
+			|| undo->kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE;
+	/* Only this record's full header may create/extend its segment. A delta
+	 * cannot borrow a preceding or future image to materialize missing DATA. */
+	if (image) {
+		ClusterUndoSmgrRecoveryFileV1 materialized;
+
+		if (!prefix.has_full_image || !side_owner_authority_fresh(owner)
+			|| !cluster_undo_smgr_recovery_materialize_v1(undo->segment_id, undo->instance,
+														  &target->file, target->base.data,
+														  prefix.page.data)
+			|| !cluster_undo_smgr_recovery_probe_v1(undo->segment_id, undo->instance, &materialized,
+													current.data)
+			|| !materialized.exists || materialized.size != UNDO_SEGMENT_SIZE_BYTES
+			|| (target->file.exists
+				&& (target->file.device != materialized.device
+					|| target->file.inode != materialized.inode))
+			|| memcmp(current.data, target->base.data, BLCKSZ) != 0)
+			return false;
+		target->file = materialized;
+	} else if (!target->file.exists || target->file.size != UNDO_SEGMENT_SIZE_BYTES)
+		return false;
+	if (!side_owner_authority_fresh(owner)
+		|| !cluster_undo_smgr_recovery_read_block_v1(undo->segment_id, undo->instance, 0,
+													 &target->file, current.data)
+		|| memcmp(current.data, target->base.data, BLCKSZ) != 0)
+		return false;
+	/* Do not install other targets or the whole-source final header. */
+	target->final = prefix;
+	return side_owner_install_target(owner, target)
+		   && cluster_undo_smgr_recovery_read_block_v1(undo->segment_id, undo->instance, 0,
+													   &target->file, current.data)
+		   && memcmp(current.data, prefix.page.data, BLCKSZ) == 0
+		   && side_owner_authority_fresh(owner);
+}
+
+static bool
 side_owner_apply_undo_record(void *arg, uint32 index, const RfSideOnlineOperationV1 *operation)
 {
 	RfSideOnlineProductionOwnerV1 *owner = arg;
@@ -556,11 +613,12 @@ side_owner_apply_undo_record(void *arg, uint32 index, const RfSideOnlineOperatio
 
 	if (owner == NULL || !owner->protected_set_active || !side_owner_cold_formed(owner)
 		|| !side_owner_authority_fresh(owner) || operation == NULL
-		|| operation->kind != RF_SIDE_ONLINE_OPERATION_UNDO
-		|| (operation->undo.kind != CLUSTER_UNDO_KIND_BLOCK_WRITE
-			&& operation->undo.kind != CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI))
+		|| operation->kind != RF_SIDE_ONLINE_OPERATION_UNDO)
 		return false;
 	undo = &operation->undo;
+	if (undo->kind != CLUSTER_UNDO_KIND_BLOCK_WRITE
+		&& undo->kind != CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI)
+		return side_owner_apply_undo_header_record(owner, index, operation);
 	segment = side_owner_undo_target(owner, undo->instance, undo->segment_id, 0);
 	target = side_owner_undo_target(owner, undo->instance, undo->segment_id, undo->block_no);
 	/* Earlier segment lifecycle/TT records must already be durable. Do not

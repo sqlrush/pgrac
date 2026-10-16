@@ -882,7 +882,9 @@ cold_record_side_kind(const ClusterColdRecordV1 *record)
 		|| (record->info & XLR_INFO_MASK) != 0)
 		return RF_SIDE_ONLINE_OPERATION_INVALID;
 	if (record->rmid == RM_CLUSTER_UNDO_ID
-		&& (info == XLOG_UNDO_BLOCK_WRITE || info == XLOG_UNDO_BLOCK_WRITE_MULTI))
+		&& (info == XLOG_UNDO_BLOCK_WRITE || info == XLOG_UNDO_BLOCK_WRITE_MULTI
+			|| info == XLOG_UNDO_SEGMENT_INIT || info == XLOG_UNDO_SEGMENT_REUSE
+			|| info == XLOG_UNDO_SEGMENT_RECYCLE || info == XLOG_UNDO_TT_SLOT_BIND))
 		return RF_SIDE_ONLINE_OPERATION_UNDO;
 	if ((record->rmid == RM_CLOG_ID && (info == CLOG_ZEROPAGE || info == CLOG_TRUNCATE))
 		|| (record->rmid == RM_MULTIXACT_ID

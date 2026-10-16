@@ -1425,9 +1425,11 @@ UT_TEST(test_native_side_failure_or_late_drift_is_sticky)
 }
 
 
-UT_TEST(test_undo_block_dispatch_selects_exact_record_and_keeps_space_proof)
+UT_TEST(test_undo_dispatch_selects_exact_record_and_keeps_space_proof)
 {
-	const uint8 infos[] = { XLOG_UNDO_BLOCK_WRITE, XLOG_UNDO_BLOCK_WRITE_MULTI };
+	const uint8 infos[]
+		= { XLOG_UNDO_BLOCK_WRITE,	 XLOG_UNDO_BLOCK_WRITE_MULTI, XLOG_UNDO_SEGMENT_INIT,
+			XLOG_UNDO_SEGMENT_REUSE, XLOG_UNDO_SEGMENT_RECYCLE,	  XLOG_UNDO_TT_SLOT_BIND };
 	for (uint32 i = 0; i < lengthof(infos); i++) {
 		ClusterColdRecordV1 record;
 		ClusterColdTypedV1 *typed = control_fixture_mode(&record, true);
@@ -1441,7 +1443,7 @@ UT_TEST(test_undo_block_dispatch_selects_exact_record_and_keeps_space_proof)
 	}
 }
 
-UT_TEST(test_undo_block_dispatch_rejects_wrong_identity_or_unowned_header)
+UT_TEST(test_undo_dispatch_rejects_wrong_identity_or_unowned_effect)
 {
 	for (uint32 fault = 0; fault < 10; fault++) {
 		ClusterColdRecordV1 record;
@@ -1460,7 +1462,7 @@ UT_TEST(test_undo_block_dispatch_rejects_wrong_identity_or_unowned_header)
 			side_fixture[1].operations[1].identity.record.info = record.info;
 			break;
 		case 3:
-			side_record_fixture(&record, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND,
+			side_record_fixture(&record, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_SET_HEAD,
 								RF_SIDE_ONLINE_OPERATION_UNDO);
 			break;
 		case 4:
@@ -1468,7 +1470,7 @@ UT_TEST(test_undo_block_dispatch_rejects_wrong_identity_or_unowned_header)
 								RF_SIDE_ONLINE_OPERATION_UNDO);
 			break;
 		case 5:
-			side_record_fixture(&record, RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_INIT,
+			side_record_fixture(&record, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_CTRC_RELEASE,
 								RF_SIDE_ONLINE_OPERATION_UNDO);
 			break;
 		case 6:
@@ -1519,8 +1521,8 @@ int
 main(void)
 {
 	UT_PLAN(44);
-	UT_RUN(test_undo_block_dispatch_selects_exact_record_and_keeps_space_proof);
-	UT_RUN(test_undo_block_dispatch_rejects_wrong_identity_or_unowned_header);
+	UT_RUN(test_undo_dispatch_selects_exact_record_and_keeps_space_proof);
+	UT_RUN(test_undo_dispatch_rejects_wrong_identity_or_unowned_effect);
 	UT_RUN(test_undo_block_dispatch_owner_failure_and_drift_stay_refused);
 	UT_RUN(test_native_side_dispatch_selects_exact_existing_consumer);
 	UT_RUN(test_native_side_dispatch_rejects_wrong_kind_and_family);

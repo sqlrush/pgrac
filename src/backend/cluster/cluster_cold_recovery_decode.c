@@ -472,10 +472,12 @@ cold_foreign_side(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan)
 	if (XLogRecGetRmid(reader) == RM_CLUSTER_UNDO_ID) {
 		ClusterUndoDecoded undo;
 
-		/* Only the existing record-local block consumer is connected. Header
-		 * and terminal effects cannot borrow the whole-source undo owner. */
+		/* Use only connected record-local consumers. Undo head/terminal
+		 * effects cannot borrow the whole-source undo owner. */
 		return plan->route.codec_id == RF_ROUTE_CODEC_SIDE_CLUSTER_UNDO
-			   && (info == XLOG_UNDO_BLOCK_WRITE || info == XLOG_UNDO_BLOCK_WRITE_MULTI)
+			   && (info == XLOG_UNDO_BLOCK_WRITE || info == XLOG_UNDO_BLOCK_WRITE_MULTI
+				   || info == XLOG_UNDO_SEGMENT_INIT || info == XLOG_UNDO_SEGMENT_REUSE
+				   || info == XLOG_UNDO_SEGMENT_RECYCLE || info == XLOG_UNDO_TT_SLOT_BIND)
 			   && XLogRecGetData(reader) != NULL && cluster_undo_decode(reader, &undo)
 			   && cluster_undo_preflight(&undo);
 	}
@@ -630,8 +632,8 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 		return detail;
 
 	/* Other generations' record-local native adapters retain their original
-	 * origin. Undo blocks use their exact prefix consumer; outcomes, undo
-	 * headers and remaining lifecycle effects still require
+	 * origin. Undo blocks/headers use their exact prefix consumer; outcomes,
+	 * undo heads and remaining lifecycle effects still require
 	 * their ordered whole-source owners, never founder native redo. */
 	has_owner = XLogRecGetRmid(reader) == RM_SMGR_ID
 				&& ((XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_SMGR_CREATE

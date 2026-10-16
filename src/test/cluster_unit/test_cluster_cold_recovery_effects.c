@@ -24,6 +24,7 @@
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_page_detached.h"
 #include "cluster/storage/cluster_undo_xlog.h"
+#include "cluster/cluster_undo_segment.h"
 #include "storage/standbydefs.h"
 #include "unit_test.h"
 
@@ -875,7 +876,7 @@ UT_TEST(test_foreign_undo_blocks_reject_malformed_or_unowned_shapes)
 				UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
 			}
 		}
-	/* Header/TT lifecycle has not acquired a record-local execution owner. */
+	/* Empty header and TT carriers cannot acquire execution authority. */
 	for (uint32 i = 0; i < lengthof(infos); i++) {
 		EffectRecord r;
 		ClusterColdDecodedV1 out = { 0 };
@@ -888,10 +889,101 @@ UT_TEST(test_foreign_undo_blocks_reject_malformed_or_unowned_shapes)
 	}
 }
 
+static void
+undo_header_effect_record(EffectRecord *r, uint8 info)
+{
+	char page[BLCKSZ] = { 0 };
+	xl_cluster_undo_segment_init init = { .segment_id = 257, .instance = 2 };
+	xl_undo_segment_reuse reuse
+		= { .segment_id = 257, .instance = 2, .old_generation = 0, .new_generation = 1 };
+	xl_undo_segment_recycle recycle = { .segment_id = 257,
+										.instance = 2,
+										.old_state = SEGMENT_COMMITTED,
+										.new_state = SEGMENT_RECYCLABLE };
+	xl_undo_tt_slot_bind bind = { .segment_id = 257,
+								  .instance = 2,
+								  .slot_offset = 4,
+								  .xid = 802,
+								  .wrap = 7,
+								  .format_version = CLUSTER_UNDO_TT_BIND_VERSION };
+
+	record_init(r, RM_CLUSTER_UNDO_ID, info);
+	if (info == XLOG_UNDO_SEGMENT_INIT)
+		append(r, &init, sizeof(init));
+	else if (info == XLOG_UNDO_SEGMENT_REUSE)
+		append(r, &reuse, sizeof(reuse));
+	else if (info == XLOG_UNDO_SEGMENT_RECYCLE)
+		append(r, &recycle, sizeof(recycle));
+	else
+		append(r, &bind, sizeof(bind));
+	if (info == XLOG_UNDO_SEGMENT_INIT || info == XLOG_UNDO_SEGMENT_REUSE)
+		append(r, page, sizeof(page));
+}
+
+UT_TEST(test_foreign_undo_header_routes_only_connected_record_consumers)
+{
+	const uint8 infos[] = { XLOG_UNDO_SEGMENT_INIT, XLOG_UNDO_SEGMENT_REUSE,
+							XLOG_UNDO_SEGMENT_RECYCLE, XLOG_UNDO_TT_SLOT_BIND };
+	for (uint32 i = 0; i < lengthof(infos); i++) {
+		EffectRecord r;
+		ClusterColdDecodedV1 out = { 0 };
+		undo_header_effect_record(&r, infos[i]);
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+					 CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
+		UT_ASSERT_EQ(out.effects.native_apply, CLUSTER_COLD_EFFECT_RECORD);
+		UT_ASSERT_EQ(out.effects.no_effect | out.effects.refused, 0);
+		UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, false));
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+					 CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.record.record_flags, 0);
+		UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, true));
+	}
+}
+
+UT_TEST(test_foreign_undo_header_malformed_carriers_remain_refused)
+{
+	const uint8 infos[] = { XLOG_UNDO_SEGMENT_INIT, XLOG_UNDO_SEGMENT_REUSE,
+							XLOG_UNDO_SEGMENT_RECYCLE, XLOG_UNDO_TT_SLOT_BIND };
+	for (uint32 i = 0; i < lengthof(infos); i++)
+		for (int fault = 0; fault < 6; fault++) {
+			EffectRecord r;
+			ClusterColdDecodedV1 out = { 0 };
+			undo_header_effect_record(&r, infos[i]);
+			switch (fault) {
+			case 0:
+				r.decoded.main_data_len--;
+				break;
+			case 1:
+				r.decoded.main_data_len++;
+				break;
+			case 2:
+				r.decoded.header.xl_info |= 1;
+				break;
+			case 3:
+				r.decoded.main_data = NULL;
+				break;
+			case 4:
+				memset(r.data.bytes, 0, sizeof(uint32));
+				break;
+			case 5:
+				r.decoded.header.xl_info = 0xF0;
+				break;
+			}
+			if (cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out)
+				== CLUSTER_COLD_OK) {
+				UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+				UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+			}
+		}
+}
+
 int
 main(void)
 {
-	UT_PLAN(29);
+	UT_PLAN(31);
+	UT_RUN(test_foreign_undo_header_routes_only_connected_record_consumers);
+	UT_RUN(test_foreign_undo_header_malformed_carriers_remain_refused);
 	UT_RUN(test_foreign_undo_blocks_require_real_record_consumer);
 	UT_RUN(test_foreign_undo_blocks_reject_malformed_or_unowned_shapes);
 	UT_RUN(test_logical_xact_invalidations_keep_physical_no_effect);

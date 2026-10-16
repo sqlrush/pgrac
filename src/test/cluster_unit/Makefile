@@ -8853,6 +8853,7 @@ test_cluster_cold_recovery_decode: test_cluster_cold_recovery_decode.c unit_test
 
 # The effect matrix runs the real route/preflight and complete native parsers.
 test_cluster_cold_recovery_effects: test_cluster_cold_recovery_effects.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
 		test_cluster_cold_recovery_replay_core.o \
 		$(CLUSTER_COLD_DECODE_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) \
