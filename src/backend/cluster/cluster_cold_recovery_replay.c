@@ -61,6 +61,7 @@ cluster_cold_replay_effects_v1(const ClusterColdDecodedV1 *decoded, const Cluste
 	const ClusterColdEffectRoutesV1 *e;
 	uint32 routes[4];
 	uint32 seen = 0;
+	uint32 no_effect_mask = CLUSTER_COLD_EFFECT_RECORD;
 	const uint32 page_mask
 		= CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_PAGE | CLUSTER_COLD_EFFECT_FSM;
 	const uint32 space_mask = CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_SPACE;
@@ -69,6 +70,11 @@ cluster_cold_replay_effects_v1(const ClusterColdDecodedV1 *decoded, const Cluste
 		return false;
 	record = &decoded->record;
 	e = &decoded->effects;
+	/* Only the native physical-redo no-op carries this logical message
+	 * array. COMMIT and standby invalidations still require consumers. */
+	if (record->record_flags == CLUSTER_COLD_RECORD_FOREIGN_CONTROL && record->rmid == RM_XACT_ID
+		&& record->info == XLOG_XACT_INVALIDATIONS)
+		no_effect_mask |= CLUSTER_COLD_EFFECT_INVALIDATIONS;
 	if (!(e->required & CLUSTER_COLD_EFFECT_RECORD)
 		|| (e->required & ~((CLUSTER_COLD_EFFECT_SCN << 1) - 1U)) != 0 || e->refused != 0
 		|| (record->record_flags
@@ -83,7 +89,7 @@ cluster_cold_replay_effects_v1(const ClusterColdDecodedV1 *decoded, const Cluste
 			& (CLUSTER_COLD_EFFECT_PAGE | CLUSTER_COLD_EFFECT_FSM | CLUSTER_COLD_EFFECT_SPACE))
 			   != 0
 		|| (e->page_apply & ~page_mask) != 0 || (e->space_apply & ~space_mask) != 0
-		|| (e->no_effect & ~CLUSTER_COLD_EFFECT_RECORD) != 0)
+		|| (e->no_effect & ~no_effect_mask) != 0)
 		return false;
 	routes[0] = e->native_apply;
 	routes[1] = e->page_apply;

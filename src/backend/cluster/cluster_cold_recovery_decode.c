@@ -416,6 +416,13 @@ cold_foreign_control(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan
 		return XLogRecGetRmid(reader) == RM_LOGICALMSG_ID && info == XLOG_LOGICAL_MESSAGE;
 	if (plan->route.record_owner != RF_ROUTE_OWNER_SIDE_TYPED)
 		return false;
+	/* xact_redo ignores the logical decoder's command-level marker.
+	 * COMMIT and standby invalidations retain their actual consumers. */
+	if (XLogRecGetRmid(reader) == RM_XACT_ID)
+		return plan->route.codec_id == RF_ROUTE_CODEC_SIDE_STANDARD
+			   && info == XLOG_XACT_INVALIDATIONS
+			   && cold_counted_shape(reader, MinSizeOfXactInvals, offsetof(xl_xact_invals, nmsgs),
+									 sizeof(SharedInvalidationMessage));
 	if (XLogRecGetRmid(reader) == RM_STANDBY_ID)
 		/* INVALIDATIONS includes persistent relcache-init work. A foreign
 		 * adapter must perform it; a fresh process is not its completion. */

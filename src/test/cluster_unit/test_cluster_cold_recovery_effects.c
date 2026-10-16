@@ -12,6 +12,7 @@
  */
 #define USE_PGRAC_CLUSTER 1
 #include "postgres.h"
+#include <limits.h>
 #include "access/commit_ts.h"
 #include "access/clog.h"
 #include "access/multixact.h"
@@ -661,7 +662,6 @@ UT_TEST(test_foreign_side_dispatch_rejects_mixed_flags_and_unowned_xact)
 {
 	ClusterColdDecodedV1 out = { 0 };
 	EffectRecord r;
-	SharedInvalidationMessage msg = { 0 };
 	out.record.record_flags = CLUSTER_COLD_RECORD_FOREIGN_SIDE;
 	out.record.rmid = RM_CLOG_ID;
 	out.record.info = CLOG_ZEROPAGE;
@@ -674,19 +674,98 @@ UT_TEST(test_foreign_side_dispatch_rejects_mixed_flags_and_unowned_xact)
 		UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
 		UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&out.record), CLUSTER_COLD_UNSCHEDULED_REFUSE);
 	}
-	/* Standalone XACT invalidations still use the whole-source XACT owner. */
-	record_init(&r, RM_XACT_ID, XLOG_XACT_INVALIDATIONS);
-	counted(&r, &msg, 1, sizeof(msg));
+	/* A terminal record is never a record-local no-effect control. */
+	completion(&r, true, XACT_XINFO_HAS_SCN);
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
 				 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
 	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
 }
 
+UT_TEST(test_logical_xact_invalidations_keep_physical_no_effect)
+{
+	EffectRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	SharedInvalidationMessage msgs[2] = { 0 };
+	msgs[0].rc.id = SHAREDINVALRELCACHE_ID;
+	msgs[0].rc.dbId = 5;
+	msgs[0].rc.relId = 123;
+	msgs[1].cc.id = 0;
+	msgs[1].cc.dbId = 5;
+	for (int count = 0; count <= 2; count++) {
+		record_init(&r, RM_XACT_ID, XLOG_XACT_INVALIDATIONS);
+		counted(&r, msgs, count, sizeof(msgs[0]));
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+					 CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_CONTROL);
+		UT_ASSERT_EQ(out.effects.no_effect,
+					 CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_INVALIDATIONS);
+		UT_ASSERT_EQ(out.effects.native_apply | out.effects.refused, 0);
+		UT_ASSERT(partitioned(&out.effects));
+		UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, false));
+		UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&out.record),
+					 CLUSTER_COLD_UNSCHEDULED_FOREIGN_NOOP);
+		out.record.rmid = RM_STANDBY_ID;
+		out.record.info = XLOG_INVALIDATIONS;
+		UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+		out.record.rmid = RM_XACT_ID;
+		out.record.info = XLOG_XACT_COMMIT;
+		UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+		out.record.info = XLOG_XACT_INVALIDATIONS | XLOG_XACT_HAS_INFO;
+		UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+					 CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.record.record_flags, 0);
+		UT_ASSERT_EQ(out.effects.no_effect, 0);
+		UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, true));
+	}
+}
+
+UT_TEST(test_logical_xact_invalidations_do_not_hide_bad_shape)
+{
+	for (int fault = 0; fault < 7; fault++) {
+		EffectRecord r;
+		ClusterColdDecodedV1 out = { 0 };
+		SharedInvalidationMessage msg = { 0 };
+		int count;
+		record_init(&r, RM_XACT_ID, XLOG_XACT_INVALIDATIONS);
+		counted(&r, &msg, 1, sizeof(msg));
+		switch (fault) {
+		case 0:
+			r.decoded.main_data_len = MinSizeOfXactInvals - 1;
+			break;
+		case 1:
+			r.decoded.main_data_len--;
+			break;
+		case 2:
+			r.decoded.main_data_len++;
+			break;
+		case 3:
+		case 4:
+			count = fault == 3 ? -1 : INT_MAX;
+			memcpy(r.data.bytes, &count, sizeof(count));
+			break;
+		case 5:
+			r.decoded.header.xl_info |= XLOG_XACT_HAS_INFO;
+			break;
+		case 6:
+			r.decoded.header.xl_info |= 1;
+			break;
+		}
+		if (cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out)
+			== CLUSTER_COLD_OK) {
+			UT_ASSERT(out.record.record_flags != CLUSTER_COLD_RECORD_FOREIGN_CONTROL);
+			UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(27);
+	UT_RUN(test_logical_xact_invalidations_keep_physical_no_effect);
+	UT_RUN(test_logical_xact_invalidations_do_not_hide_bad_shape);
 	UT_RUN(test_foreign_clog_and_multixact_use_native_side_consumer);
 	UT_RUN(test_foreign_assignment_keeps_native_parent_effect);
 	UT_RUN(test_foreign_side_dispatch_rejects_mixed_flags_and_unowned_xact);

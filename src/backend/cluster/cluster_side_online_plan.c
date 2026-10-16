@@ -751,8 +751,19 @@ side_native_control_valid(XLogReaderState *reader, const RfPageOnlineRecordIdent
 	if (XLogRecMaxBlockId(reader) >= 0 || reader->record->has_page_version_edge
 		|| (length > 0 && data == NULL) || (XLogRecGetInfo(reader) & XLR_INFO_MASK) != 0)
 		return false;
-	if (XLogRecGetRmid(reader) == RM_XACT_ID)
-		return info == XLOG_XACT_ASSIGNMENT && rf_side_xact_assignment_preflight_v1(data, length);
+	if (XLogRecGetRmid(reader) == RM_XACT_ID) {
+		int count;
+
+		if (info == XLOG_XACT_ASSIGNMENT)
+			return rf_side_xact_assignment_preflight_v1(data, length);
+		/* Preserve the full logical-decoding array, even though physical
+		 * xact_redo performs no work for this command-level marker. */
+		if (info != XLOG_XACT_INVALIDATIONS || length < MinSizeOfXactInvals)
+			return false;
+		memcpy(&count, data + offsetof(xl_xact_invals, nmsgs), sizeof(count));
+		return count >= 0
+			   && (uint64)count * sizeof(SharedInvalidationMessage) == length - MinSizeOfXactInvals;
+	}
 	if (XLogRecGetRmid(reader) == RM_STANDBY_ID)
 		return side_native_standby_valid(data, length, info);
 	if (XLogRecGetRmid(reader) == RM_CLUSTER_XID_STRIPE_ID)
@@ -859,8 +870,10 @@ side_decode_record(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *recor
 	if (record_plan->route.record_owner == RF_ROUTE_OWNER_SIDE_TYPED) {
 		if (((record_plan->route.rmid == RM_XLOG_ID || record_plan->route.rmid == RM_STANDBY_ID
 			  || (record_plan->route.rmid == RM_XACT_ID
-				  && (XLogRecGetInfo(record_plan->source_record) & ~XLR_INFO_MASK)
-						 == XLOG_XACT_ASSIGNMENT))
+				  && ((XLogRecGetInfo(record_plan->source_record) & ~XLR_INFO_MASK)
+						  == XLOG_XACT_ASSIGNMENT
+					  || (XLogRecGetInfo(record_plan->source_record) & ~XLR_INFO_MASK)
+							 == XLOG_XACT_INVALIDATIONS)))
 			 && record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_STANDARD)
 			|| (record_plan->route.rmid == RM_CLUSTER_XID_STRIPE_ID
 				&& record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_XID_STRIPE_SHMEM)) {

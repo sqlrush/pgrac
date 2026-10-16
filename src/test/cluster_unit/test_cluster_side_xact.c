@@ -8419,6 +8419,217 @@ UT_TEST(test_cold_whole_source_barrier_precedes_every_native_effect)
 		}
 }
 
+/* Logical command invalidations are deliberately not the standby cache
+ * record. Physical xact_redo leaves them to logical decoding; committed
+ * invalidations are independently owned by the complete COMMIT record. */
+static RfPageProofDetailV1
+logical_invalidation_feed(RfSideOnlinePlanV1 *plan, int index, int fault)
+{
+	PGAlignedBlock payload = { 0 };
+	xl_xact_invals *invals = (xl_xact_invals *)payload.data;
+	uint32 length = MinSizeOfXactInvals + 2 * sizeof(SharedInvalidationMessage);
+	FakeXactRecord fake;
+	uint8 uuid[16];
+	RfPageOnlineRecordIdentityV1 identity;
+	RfDetachedRecordPlanV1 record;
+
+	invals->nmsgs = 2;
+	invals->msgs[0].rc.id = SHAREDINVALRELCACHE_ID;
+	invals->msgs[0].rc.dbId = 5;
+	invals->msgs[0].rc.relId = 1259;
+	invals->msgs[1].cc.id = 0;
+	invals->msgs[1].cc.dbId = 5;
+	invals->msgs[1].cc.hashValue = 0x11223344;
+	switch (fault) {
+	case 1:
+		length = MinSizeOfXactInvals - 1;
+		break;
+	case 2:
+		length--;
+		break;
+	case 3:
+		length++;
+		break;
+	case 4:
+		invals->nmsgs = -1;
+		break;
+	case 5:
+		invals->nmsgs = INT_MAX;
+		break;
+	case 10:
+		invals->nmsgs = 0;
+		length = MinSizeOfXactInvals;
+		break;
+	}
+	make_projection_record(&fake, RM_XACT_ID, XLOG_XACT_INVALIDATIONS, payload.data, length);
+	fake.u.decoded.max_block_id = -1;
+	fake.u.decoded.header.xl_scn = 700 + index;
+	fake.u.decoded.header.xl_xid = fault == 9 ? InvalidTransactionId : 800;
+	if (fault == 6)
+		fake.u.decoded.header.xl_info |= XLOG_XACT_HAS_INFO;
+	if (fault == 7)
+		fake.u.decoded.header.xl_info |= 1;
+	if (fault == 8)
+		fake.u.decoded.max_block_id = 0;
+	memset(uuid, 0x44, sizeof(uuid));
+	identity = make_identity(&fake, uuid);
+	set_identity_range(&fake, &identity, 100 + index * 100, 200 + index * 100);
+	record = make_projection_record_plan(&fake);
+	return rf_side_online_plan_feed_record_v1(plan, &record, &identity);
+}
+
+static RfSideOnlinePlanV1 *
+logical_invalidation_plan(void)
+{
+	RfSideOnlinePlanV1 *plan = space_online_plan(300);
+	UT_ASSERT_EQ(logical_invalidation_feed(plan, 0, 0), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(logical_invalidation_feed(plan, 1, 0), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	return plan;
+}
+
+UT_TEST(test_logical_invalidation_capture_is_bounded_and_owned)
+{
+	for (int fault = 0; fault <= 10; fault++) {
+		RfSideOnlinePlanV1 *plan = space_online_plan(200);
+		RfSideOnlineOperationV1 operation;
+		RfPageProofDetailV1 result = logical_invalidation_feed(plan, 0, fault);
+		UT_ASSERT_EQ(result == RF_PAGE_PROOF_DETAIL_OK, fault == 0 || fault >= 9);
+		if (result == RF_PAGE_PROOF_DETAIL_OK) {
+			xl_xact_invals *invals;
+			UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &operation));
+			UT_ASSERT_EQ(operation.kind, RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL);
+			UT_ASSERT_EQ(operation.identity.record.rmid, RM_XACT_ID);
+			UT_ASSERT_EQ(operation.identity.record.info, XLOG_XACT_INVALIDATIONS);
+			UT_ASSERT_EQ(operation.control_scn, 700);
+			invals = (xl_xact_invals *)operation.owned_payload;
+			UT_ASSERT_EQ(invals->nmsgs, fault == 10 ? 0 : 2);
+			UT_ASSERT_EQ(operation.owned_payload_length,
+						 MinSizeOfXactInvals + invals->nmsgs * sizeof(SharedInvalidationMessage));
+			if (invals->nmsgs != 0) {
+				UT_ASSERT_EQ(invals->msgs[0].rc.relId, 1259);
+				UT_ASSERT_EQ(invals->msgs[1].cc.hashValue, 0x11223344);
+			}
+		}
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_cold_logical_invalidations_do_not_execute_cache_or_terminal)
+{
+	RfSideOnlinePlanV1 *plan = logical_invalidation_plan();
+	ClusterRecoveryDutyKey duty = canonical_duty;
+	ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
+	ClusterThreadRecoveryAuthorityV1 authority = { .duty = &duty, .serial_guard = &guard };
+	RfSideOnlineProductionOwnerV1 owner;
+	RfSideOnlineOperationV1 operation;
+
+	cold_control_reset();
+	cold_control_owner(&owner, &authority, &duty);
+	for (uint32 i = 0; i < 2; i++) {
+		UT_ASSERT(rf_side_online_plan_operation_v1(plan, i, &operation));
+		cold_source_calls = 0;
+		UT_ASSERT_EQ(
+			rf_side_online_production_apply_record_v1(plan, i, &operation.identity, &owner),
+			RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(control_observe_calls, i + 1);
+		UT_ASSERT_EQ(control_observed_scn, 700 + i);
+		UT_ASSERT_EQ(cold_source_calls, 1);
+		UT_ASSERT_EQ(cold_cache_calls + canonical_writes + canonical_syncs + cold_clog_applies
+						 + cold_clog_verifies + cold_locks_calls
+						 + prepare_apply.terminal_projection_stores,
+					 0);
+		UT_ASSERT(!owner.protected_set_complete && !owner.protected_set_active);
+		UT_ASSERT(owner.protected_plan == NULL && canonical_scope == NULL
+				  && canonical_writer_depth == 0 && DatabasePath == NULL);
+	}
+	cold_control_reset();
+	control_scope_test = cold_control_test = false;
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_cold_logical_invalidation_rejects_wrong_context_and_unwinds)
+{
+	for (int fault = 0; fault < 13; fault++) {
+		RfSideOnlinePlanV1 *plan = logical_invalidation_plan();
+		ClusterRecoveryDutyKey duty = canonical_duty;
+		ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
+		ClusterThreadRecoveryAuthorityV1 authority = { .duty = &duty, .serial_guard = &guard };
+		static RfSideOnlineProductionOwnerV1 owner;
+		RfSideOnlineOperationV1 operation;
+		volatile bool caught = false;
+		volatile RfPageProofDetailV1 result = RF_PAGE_PROOF_DETAIL_INTERNAL;
+
+		cold_control_reset();
+		cold_control_owner(&owner, &authority, &duty);
+		UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &operation));
+		switch (fault) {
+		case 0:
+			guard.mode = CLUSTER_RECOVERY_SERIAL_ONLINE;
+			break;
+		case 1:
+			cluster_node_id = 2;
+			break;
+		case 2:
+			standbyState = STANDBY_INITIALIZED;
+			break;
+		case 3:
+			cold_clog_denied = true;
+			break;
+		case 4:
+			control_scope_fault = 8;
+			break; /* A later record crosses the cut. */
+		case 5:
+			control_fresh = false;
+			break;
+		case 6:
+			operation.identity.record.record_crc++;
+			break;
+		case 7:
+			control_observe_throw = true;
+			break;
+		case 8:
+			control_expire_after_observe = true;
+			break;
+		case 9:
+			cold_control_drift = 1;
+			break;
+		case 10:
+			cold_control_drift = 2;
+			break;
+		case 11:
+			cold_control_drift = 3;
+			break;
+		case 12:
+			operation.identity.record.info = XLOG_XACT_ASSIGNMENT;
+			break;
+		}
+		PG_TRY();
+		{
+			result
+				= rf_side_online_production_apply_record_v1(plan, 0, &operation.identity, &owner);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_NE(result, RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(caught, fault == 7);
+		UT_ASSERT_EQ(control_observe_calls, fault >= 8 && fault <= 11 ? 1 : 0);
+		UT_ASSERT_EQ(cold_cache_calls + canonical_writes + cold_clog_applies + cold_locks_calls
+						 + prepare_apply.terminal_projection_stores,
+					 0);
+		UT_ASSERT(!owner.protected_set_complete && !owner.protected_set_active
+				  && owner.protected_plan == NULL && canonical_scope == NULL
+				  && canonical_writer_depth == 0 && DatabasePath == NULL);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+	cold_control_reset();
+	control_scope_test = cold_control_test = false;
+}
+
 UT_TEST(test_cold_record_dispatch_does_not_execute_future_controls_or_close_source)
 {
 	RfSideOnlinePlanV1 *plan = cold_standalone_cache_plan(0);
@@ -8696,7 +8907,10 @@ UT_TEST(test_cold_record_dispatch_executes_only_selected_native_projection)
 int
 main(void)
 {
-	UT_PLAN(116);
+	UT_PLAN(119);
+	UT_RUN(test_logical_invalidation_capture_is_bounded_and_owned);
+	UT_RUN(test_cold_logical_invalidations_do_not_execute_cache_or_terminal);
+	UT_RUN(test_cold_logical_invalidation_rejects_wrong_context_and_unwinds);
 	UT_RUN(test_cold_record_dispatch_does_not_execute_future_controls_or_close_source);
 	UT_RUN(test_cold_record_dispatch_requires_exact_record_and_original_cold_scope);
 	UT_RUN(test_cold_record_dispatch_keeps_whole_source_preflight_and_error_cleanup);

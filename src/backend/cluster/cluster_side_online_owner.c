@@ -704,7 +704,10 @@ side_owner_cold_control_no_effect(const RfSideOnlineProductionOwnerV1 *owner,
 	return side_owner_cold_formed(owner) && cluster_node_id >= 0
 		   && cluster_node_id <= SCN_MAX_VALID_NODE_ID
 		   && operation->identity.record.origin_thread != cluster_node_id + 1
-		   && standbyState == STANDBY_DISABLED && side_owner_native_control_kind(operation);
+		   && standbyState == STANDBY_DISABLED
+		   && (side_owner_native_control_kind(operation)
+			   || (operation->identity.record.rmid == RM_XACT_ID
+				   && operation->identity.record.info == XLOG_XACT_INVALIDATIONS));
 }
 
 static bool
@@ -763,7 +766,8 @@ side_owner_apply_control(void *arg, const RfSideOnlineOperationV1 *operation)
 	if (!side_owner_preflight_control(arg, operation))
 		return false;
 	cold_no_effect = side_owner_cold_control_no_effect(owner, operation);
-	if (side_owner_cold_formed(owner) && operation->identity.record.rmid == RM_XACT_ID) {
+	if (side_owner_cold_formed(owner) && operation->identity.record.rmid == RM_XACT_ID
+		&& (operation->identity.record.info & ~XLR_INFO_MASK) == XLOG_XACT_ASSIGNMENT) {
 		if (!side_owner_assignment(operation, true)
 			|| !side_owner_preflight_control(arg, operation))
 			return false;
