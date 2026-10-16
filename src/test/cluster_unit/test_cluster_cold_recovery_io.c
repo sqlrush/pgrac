@@ -317,7 +317,7 @@ scan(ClusterColdScanResultV1 *result, bool foreign)
 	root.identity.system_identifier = 77;
 	memset(root.identity.storage_uuid, 5, 16);
 	root.validated_tail_lsn_exclusive = 0x1300;
-	detail = cluster_cold_scan_root_v1(plan, 0, &root, &token, !foreign, foreign, result);
+	detail = cluster_cold_scan_root_v1(plan, 0, &root, &token, !foreign, foreign, NULL, result);
 	cluster_cold_plan_destroy_v1(&plan);
 	return detail;
 }
@@ -381,7 +381,7 @@ UT_TEST(test_scan_root_proves_the_cut)
 	UT_ASSERT_EQ(scan(&result, true), CLUSTER_COLD_SOURCE_GAP);
 	UT_ASSERT_EQ(result.failed_read_rec_ptr, 0x1100);
 
-	UT_ASSERT_EQ(cluster_cold_scan_root_v1(NULL, 0, NULL, NULL, false, false, &result),
+	UT_ASSERT_EQ(cluster_cold_scan_root_v1(NULL, 0, NULL, NULL, false, false, NULL, &result),
 				 CLUSTER_COLD_INVALID_ARGUMENT);
 	UT_ASSERT_EQ(result.records, 0);
 }
@@ -714,9 +714,69 @@ UT_TEST(test_scan_input_proves_the_cut)
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
+
+UT_TEST(test_root_scan_captures_original_identity_and_refuses_side_failure)
+{
+	for (int fault = 0; fault < 7; fault++) {
+		ClusterColdPlanV1 *plan = scan_plan();
+		ClusterControlRootSnapshot root = { 0 };
+		ClusterControlRootReadToken token = { 0 };
+		ClusterColdScanResultV1 result;
+		ClusterColdDetailV1 detail;
+		scan_reset();
+		side_capture_calls = 0;
+		side_capture_fail_at = fault == 1 || fault == 4 || fault == 5 ? 2 : 0;
+		if (fault == 6)
+			side_capture_fail_at = 1;
+		side_capture_refusal = fault == 4 || fault == 5 ? RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE
+														: RF_PAGE_PROOF_DETAIL_CAPACITY;
+		if (fault == 6)
+			side_capture_refusal = RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED;
+		root.identity.system_identifier = 77;
+		memset(root.identity.storage_uuid, 5, 16);
+		root.identity.origin_thread_id = 2;
+		root.checkpoint_tli = 1;
+		root.validated_tail_lsn_exclusive = 0x1300;
+		if (fault == 2)
+			decode_refusal_at[1] = CLUSTER_COLD_OPCODE_UNSUPPORTED;
+		if (fault == 3)
+			observed_end++;
+		detail = cluster_cold_scan_root_v1(plan, 0, &root, &token, false, fault != 5,
+										   (RfSideOnlinePlanV1 *)&side_capture_token, &result);
+		UT_ASSERT_EQ(side_capture_calls, fault == 2 || fault == 6 ? 1 : 2);
+		UT_ASSERT_EQ(captured_identity[0].participant_index, 0);
+		UT_ASSERT_EQ(captured_identity[0].record.system_identifier, 77);
+		UT_ASSERT_EQ(captured_identity[0].record.origin_thread, 2);
+		UT_ASSERT_EQ(captured_identity[0].record.timeline_id, 1);
+		UT_ASSERT_EQ(captured_identity[0].record.storage_uuid[15], 5);
+		UT_ASSERT_EQ(captured_identity[0].record.record_crc, 0x9876);
+		UT_ASSERT_EQ(captured_identity[0].record.rmid, RM_HEAP_ID);
+		UT_ASSERT_EQ(captured_identity[0].record.info, 0x10);
+		UT_ASSERT_EQ(captured_identity[0].record.read_rec_ptr, 0x1000);
+		UT_ASSERT_EQ(captured_identity[0].record.end_rec_ptr, 0x1100);
+		if (fault == 0 || fault >= 4)
+			UT_ASSERT_EQ(detail, CLUSTER_COLD_OK);
+		else
+			UT_ASSERT(detail != CLUSTER_COLD_OK);
+		if (fault == 1) {
+			UT_ASSERT_EQ(result.records, 1);
+			UT_ASSERT_EQ(result.failed_read_rec_ptr, 0x1100);
+			UT_ASSERT_EQ(result.route_detail, RF_PAGE_PROOF_DETAIL_CAPACITY);
+		}
+		if (fault >= 4) {
+			UT_ASSERT_EQ(result.side_capture_detail, side_capture_refusal);
+			UT_ASSERT_EQ(result.side_capture_read_rec_ptr, fault == 6 ? 0x1000 : 0x1100);
+			UT_ASSERT_EQ(result.records, 2);
+		}
+		cluster_cold_plan_destroy_v1(&plan);
+	}
+}
+
 int
 main(void)
 {
+	UT_PLAN(12);
+	UT_RUN(test_root_scan_captures_original_identity_and_refuses_side_failure);
 	UT_RUN(test_observe_absent_and_present);
 	UT_RUN(test_observe_identity_overlay);
 	UT_RUN(test_observe_identity_cached_per_relation);

@@ -50,6 +50,7 @@
 
 #include "access/xlogrecord.h"
 #include "cluster/cluster_page_stable_base.h"
+#include "cluster/cluster_page_detached.h"
 #include "cluster/cluster_wal_source.h"
 
 #define CLUSTER_COLD_RECOVERY_INTERFACE_V1 1
@@ -525,6 +526,8 @@ typedef struct ClusterColdDecodedV1 {
 	ClusterColdRecordV1 record;
 	ClusterColdComponentV1 components[CLUSTER_COLD_MAX_COMPONENTS];
 	ClusterColdEffectRoutesV1 effects;
+	/* Borrowed from this decode only; capture before advancing the reader. */
+	RfDetachedRecordPlanV1 detached;
 	uint8 route_owner;	/* RfRecordRouteOwnerV1 */
 	uint8 route_detail; /* RfPageProofDetailV1 of a refused record */
 	ClusterColdSpaceOpV1 *space_ops;
@@ -616,18 +619,30 @@ extern const char *cluster_cold_refusal_hint_v1(ClusterColdDetailV1 detail);
 /* Pass-1 scan of one RECOVERY_REQUIRED root through the sealed recovery
  * visitor, feeding the plan participant at caller index `participant`.
  * Every visited record is provisional until the visit and the observed cut
- * (complete end, record count) match the ROOT. */
+ * (complete end, record count) match the ROOT. Optional side_plan is an
+ * unsealed single-source plan for this ROOT; it captures every complete
+ * decoded record without changing any original ownership/refusal flags.
+ * If its execution profile is narrower than native/history acceptance,
+ * side_capture_detail marks the entire optional capture unusable. The
+ * caller discards it, and all captures on later whole-input failure. */
 typedef struct ClusterColdScanResultV1 {
 	uint64 records;
 	int root_result; /* ClusterControlRootResult of the visit */
 	XLogRecPtr failed_read_rec_ptr;
 	uint8 route_detail;
+	/* Capture profile differs from native/history acceptance. Nonzero means
+	 * discard the entire optional SIDE plan; it cannot authorize replay. */
+	uint8 side_capture_detail;
+	XLogRecPtr side_capture_read_rec_ptr;
 } ClusterColdScanResultV1;
+
+struct RfSideOnlinePlanV1;
 
 extern ClusterColdDetailV1 cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 													 const ClusterControlRootSnapshot *root,
 													 const ClusterControlRootReadToken *token,
 													 bool space_active, bool foreign,
+													 struct RfSideOnlinePlanV1 *side_plan,
 													 ClusterColdScanResultV1 *result);
 
 /* Pass 2 consumed exactly the ROOT-sealed cut of replayed generation
@@ -688,6 +703,11 @@ typedef struct ClusterColdTypedV1 {
 	uint32 own_participant;
 	struct ClusterColdReplayRootV1 *replay_roots; /* original pass-1 selection, not fresh roots */
 	uint32 replay_root_count;
+	/* Per crashed source, including its retained pre-redo records. History-only
+	 * generations retain the original census path and never become executable. */
+	struct RfSideOnlinePlanV1 *side_plans[CLUSTER_COLD_MAX_PARTICIPANTS];
+	uint8 side_capture_detail[CLUSTER_COLD_MAX_PARTICIPANTS];
+	XLogRecPtr side_capture_read_rec_ptr[CLUSTER_COLD_MAX_PARTICIPANTS];
 	struct ClusterWalInputsV1 *inputs;				   /* census read scope, released by pass 1 */
 	uint32 input_index[CLUSTER_COLD_MAX_PARTICIPANTS]; /* history: index in that scope */
 	uint64 system_identifier;

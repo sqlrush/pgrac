@@ -27,6 +27,8 @@
 #ifndef TEST_CLUSTER_COLD_RECOVERY_IO_BOUNDARY_H
 #define TEST_CLUSTER_COLD_RECOVERY_IO_BOUNDARY_H
 
+#include "cluster/cluster_side_online_plan.h"
+
 /* ---- process and memory boundaries ---- */
 volatile sig_atomic_t InterruptPending = false;
 static uint32 wait_event_slot;
@@ -307,6 +309,25 @@ static uint64 decode_saw_system;
 static uint8 decode_saw_uuid0;
 static int decode_releases;
 
+
+static int side_capture_token, side_capture_calls, side_capture_fail_at;
+static RfPageOnlineRecordIdentityV1 captured_identity[4];
+static RfPageProofDetailV1 side_capture_refusal;
+
+RfPageProofDetailV1
+rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *record,
+								   const RfPageOnlineRecordIdentityV1 *identity)
+{
+	UT_ASSERT(plan == (RfSideOnlinePlanV1 *)&side_capture_token);
+	UT_ASSERT(record->preflight_complete && record->source_record != NULL);
+	UT_ASSERT_EQ(record->source_record->ReadRecPtr, identity->record.read_rec_ptr);
+	UT_ASSERT_EQ(record->source_record->EndRecPtr, identity->record.end_rec_ptr);
+	UT_ASSERT(side_capture_calls < 4);
+	captured_identity[side_capture_calls++] = *identity;
+	return side_capture_calls == side_capture_fail_at ? side_capture_refusal
+													  : RF_PAGE_PROOF_DETAIL_OK;
+}
+
 ClusterControlRootResult
 cluster_control_root_recovery_visit(const ClusterControlRootSnapshot *expected,
 									const ClusterControlRootReadToken *token,
@@ -357,6 +378,10 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 	out->record.prev_rec_ptr = i == 0 ? reader->ReadRecPtr - 0x40 : visit_read[i - 1];
 	out->record.scn = 1;
 	out->record.rmid = RM_HEAP_ID;
+	out->record.info = 0x10;
+	out->record.record_crc = 0x9876;
+	out->detached.source_record = reader;
+	out->detached.preflight_complete = true;
 	return CLUSTER_COLD_OK;
 }
 

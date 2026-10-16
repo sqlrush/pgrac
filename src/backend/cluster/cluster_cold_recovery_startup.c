@@ -38,6 +38,7 @@
 #include "access/xlogreader.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cold_recovery_census.h"
+#include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_control_root.h"
 #include "cluster/cluster_page_cold_redo.h"
 #include "cluster/cluster_recovery_duty.h"
@@ -438,14 +439,74 @@ cold_scan_history(ClusterColdTypedV1 *typed)
 	return true;
 }
 
+
+static bool cold_sources_match(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence);
+
+/* Reserve a bounded part of the existing plan budget for original SIDE
+ * payload ownership. The PAGE and SIDE budgets together never exceed it. */
+static Size
+cold_side_budget(const ClusterColdTypedV1 *typed)
+{
+	Size total = (Size)cluster_cold_recovery_plan_memory * 1024;
+	return typed->replay_count == 0
+			   ? 0
+			   : Min((Size)RF_SIDE_ONLINE_PLAN_MAX_BYTES, total / 2 / typed->replay_count);
+}
+
+static void
+cold_side_destroy(ClusterColdTypedV1 *typed)
+{
+	for (uint32 i = 0; i < CLUSTER_COLD_MAX_PARTICIPANTS; i++)
+		rf_side_online_plan_destroy_v1(&typed->side_plans[i]);
+}
+
 static bool
-cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots)
+cold_side_create(ClusterColdTypedV1 *typed)
+{
+	for (uint32 i = 0; i < typed->replay_count; i++) {
+		const ClusterColdParticipantV1 *participant = &typed->participants[i];
+		RfContributorStreamCutV1 cut = { 0 };
+		RfSideOnlinePlanRequestV1 request = { 0 };
+		RfPageProofDetailV1 detail;
+
+		cut.failed_thread = participant->thread_id;
+		cut.timeline_id = participant->timeline;
+		cut.origin_owner_incarnation = participant->owner_incarnation;
+		cut.scan_begin_inclusive = participant->physical_lower;
+		cut.scan_end_exclusive = participant->tail_end;
+		cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+		if (cut.scan_begin_inclusive == cut.scan_end_exclusive)
+			cut.flags |= RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY;
+		request.system_identifier = typed->system_identifier;
+		memcpy(request.storage_uuid, typed->observer.storage_uuid, 16);
+		request.physical_cuts = &cut;
+		request.participant_count = 1;
+		request.redo_starts = &participant->native_redo;
+		request.memory_budget = cold_side_budget(typed);
+		request.purpose = RF_SIDE_PLAN_RECOVERY;
+		if (request.memory_budget == 0)
+			detail = RF_PAGE_PROOF_DETAIL_CAPACITY;
+		else
+			detail = rf_side_online_plan_create_v1(&request, &typed->side_plans[i]);
+		if (detail != RF_PAGE_PROOF_DETAIL_OK) {
+			cold_refuse(typed, CLUSTER_COLD_CAPACITY,
+						"thread %u SIDE plan creation refused (detail %u)",
+						(unsigned)participant->thread_id, (unsigned)detail);
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool
+cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots,
+				   ClusterRecoveryFencePlan *fence)
 {
 	ClusterColdDiagV1 diag;
 	ClusterColdDetailV1 detail;
 	uint32 i;
 
-	if (!cold_space_namespace(typed))
+	if (!cold_space_namespace(typed) || !cold_side_create(typed))
 		return false;
 	detail = cluster_cold_plan_set_space_check_v1(typed->plan, cluster_cold_space_check_v1,
 												  &typed->observer);
@@ -457,8 +518,9 @@ cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots)
 	for (i = 0; i < typed->replay_count; i++) {
 		ClusterColdScanResultV1 scan;
 
-		detail = cluster_cold_scan_root_v1(typed->plan, i, &roots[i].root, &roots[i].token, false,
-										   i != typed->own_participant, &scan);
+		detail
+			= cluster_cold_scan_root_v1(typed->plan, i, &roots[i].root, &roots[i].token, false,
+										i != typed->own_participant, typed->side_plans[i], &scan);
 		typed->scanned_records += scan.records;
 		if (detail != CLUSTER_COLD_OK) {
 			cold_refuse(typed, detail,
@@ -469,6 +531,11 @@ cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots)
 						(unsigned)scan.route_detail);
 			return false;
 		}
+		if (scan.side_capture_detail != 0) {
+			typed->side_capture_detail[i] = scan.side_capture_detail;
+			typed->side_capture_read_rec_ptr[i] = scan.side_capture_read_rec_ptr;
+			rf_side_online_plan_destroy_v1(&typed->side_plans[i]);
+		}
 	}
 	if (!cold_scan_history(typed))
 		return false;
@@ -476,6 +543,37 @@ cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots)
 									   &diag);
 	if (detail != CLUSTER_COLD_OK) {
 		cold_refuse_diag(typed, detail, "plan seal", &diag);
+		return false;
+	}
+	/* No provisional payload plan survives a later source or ROOT failure. */
+	if (!cold_sources_match(typed, fence)) {
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "SIDE capture source changed before seal");
+		return false;
+	}
+	for (uint32 i = 0; i < typed->replay_count; i++) {
+		RfPageProofDetailV1 side_detail;
+		if (typed->side_plans[i] == NULL)
+			continue;
+		if (!rf_side_online_plan_bind_database_v1(typed->side_plans[i],
+												  typed->observer.database_incarnation))
+			side_detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+		else
+			side_detail = rf_side_online_plan_seal_v1(typed->side_plans[i]);
+		if (side_detail == RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE
+			|| side_detail == RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED) {
+			/* Original native/history coverage can exceed this execution
+			 * profile. Keep its classification, never a partial SIDE seal. */
+			typed->side_capture_detail[i] = (uint8)side_detail;
+			rf_side_online_plan_destroy_v1(&typed->side_plans[i]);
+		} else if (side_detail != RF_PAGE_PROOF_DETAIL_OK) {
+			cold_refuse(typed, CLUSTER_COLD_SIDE_OWNER_MISSING,
+						"thread %u SIDE seal refused (detail %u)",
+						(unsigned)typed->participants[i].thread_id, (unsigned)side_detail);
+			return false;
+		}
+	}
+	if (!cold_sources_match(typed, fence)) {
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "SIDE capture source changed after seal");
 		return false;
 	}
 	return true;
@@ -507,17 +605,20 @@ cluster_cold_typed_prepare_v1(ClusterRecoveryFencePlan *fence, uint16 own_thread
 	if (!cold_own_restart(typed, own_thread, own_redo) || !cold_census(typed, roots))
 		goto done;
 	typed->system_identifier = roots[0].root.identity.system_identifier;
-	detail
-		= cluster_cold_plan_create_v1(typed->participants, typed->participant_count,
-									  (Size)cluster_cold_recovery_plan_memory * 1024, &typed->plan);
+	detail = cluster_cold_plan_create_v1(typed->participants, typed->participant_count,
+										 (Size)cluster_cold_recovery_plan_memory * 1024
+											 - cold_side_budget(typed) * typed->replay_count,
+										 &typed->plan);
 	if (detail != CLUSTER_COLD_OK) {
 		cold_refuse(typed, detail, "plan creation refused: %s", cold_detail_name(detail));
 		goto done;
 	}
-	if (cold_scan_and_seal(typed, roots))
+	if (cold_scan_and_seal(typed, roots, fence))
 		typed->refusal = CLUSTER_COLD_OK;
 
 done:
+	if (typed->refusal != CLUSTER_COLD_OK)
+		cold_side_destroy(typed);
 	MemoryContextSwitchTo(old_context);
 	return typed;
 }
@@ -533,6 +634,7 @@ cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed_address)
 	*typed_address = NULL;
 	if (typed->inputs != NULL)
 		cluster_wal_inputs_release_v1(&typed->inputs);
+	cold_side_destroy(typed);
 	if (typed->plan != NULL)
 		cluster_cold_plan_destroy_v1(&typed->plan);
 	if (typed->replay_roots != NULL)
@@ -542,10 +644,10 @@ cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed_address)
 
 /* Re-select through each original ROOT token, never through a newer root. */
 static bool
-cold_replay_sources_current(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
+cold_sources_match(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
 {
-	if ((uint32)cluster_recovery_merge_fence_plan_origin_count(fence) + 1 != typed->replay_count
-		|| !cluster_recovery_merge_fence_plan_revalidate_nowait(fence))
+	if (fence == NULL
+		|| (uint32)cluster_recovery_merge_fence_plan_origin_count(fence) + 1 != typed->replay_count)
 		return false;
 	for (uint32 i = 0; i < typed->replay_count; i++) {
 		const ColdRoot *selected = &typed->replay_roots[i];
@@ -583,7 +685,17 @@ cold_replay_sources_current(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan 
 			|| participant->native_redo != redo)
 			return false;
 	}
-	return cluster_recovery_merge_fence_plan_revalidate_nowait(fence);
+	return true;
+}
+
+/* Pass 1 has not acquired the serial set. Execution revalidation belongs
+ * only to pass 2, around the same complete original-source comparison. */
+static bool
+cold_replay_sources_current(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
+{
+	return cluster_recovery_merge_fence_plan_revalidate_nowait(fence)
+		   && cold_sources_match(typed, fence)
+		   && cluster_recovery_merge_fence_plan_revalidate_nowait(fence);
 }
 
 bool
@@ -670,6 +782,17 @@ cluster_cold_typed_ready_v1(const ClusterColdTypedV1 *typed,
 	if (!handshake->side_owners)
 		cold_reason_append(reason, reason_size,
 						   "no typed side owners or XID/OID/MX/SCN bound merge (R-A5)");
+	for (i = 0; i < typed->replay_count; i++) {
+		if (typed->side_capture_detail[i] != 0 || typed->side_plans[i] == NULL) {
+			char text[128];
+			(void)snprintf(text, sizeof(text),
+						   "thread %u has no complete SIDE capture (detail %u, record %X/%X)",
+						   (unsigned)typed->participants[i].thread_id,
+						   (unsigned)typed->side_capture_detail[i],
+						   LSN_FORMAT_ARGS(typed->side_capture_read_rec_ptr[i]));
+			cold_reason_append(reason, reason_size, text);
+		}
+	}
 	if (!handshake->completion_publish)
 		cold_reason_append(reason, reason_size, "no recovery completion publication (R-A7)");
 	if (!handshake->restartpoint_hold)

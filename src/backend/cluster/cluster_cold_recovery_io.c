@@ -53,6 +53,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_space_reservation.h"
+#include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_wal_restart_read.h"
 #include "cluster/cluster_wal_tail.h"
 #include "pgstat.h"
@@ -295,6 +296,9 @@ cluster_cold_observe_data_v1(void *arg, const RfPageIdentityV1 *page, ClusterCol
 
 typedef struct ColdScanWork {
 	ClusterColdPlanV1 *plan;
+	RfSideOnlinePlanV1 *side_plan;
+	uint16 source_thread;
+	TimeLineID timeline;
 	uint32 participant;
 	uint64 system_identifier;
 	uint8 storage_uuid[16];
@@ -317,6 +321,39 @@ cold_scan_visit(XLogReaderState *reader, void *arg)
 	if (work->detail == CLUSTER_COLD_OK)
 		work->detail
 			= cluster_cold_plan_feed_v1(work->plan, work->participant, &work->decoded.record);
+	if (work->detail == CLUSTER_COLD_OK && work->side_plan != NULL) {
+		const ClusterColdRecordV1 *record = &work->decoded.record;
+		RfPageOnlineRecordIdentityV1 identity = { 0 };
+		RfPageProofDetailV1 captured;
+
+		/* Each SIDE plan owns exactly this original source, independently
+		 * of the PAGE plan's participant order and history-only sources. */
+		identity.record.system_identifier = work->system_identifier;
+		memcpy(identity.record.storage_uuid, work->storage_uuid, 16);
+		identity.record.origin_thread = work->source_thread;
+		identity.record.timeline_id = work->timeline;
+		identity.record.read_rec_ptr = record->read_rec_ptr;
+		identity.record.end_rec_ptr = record->end_rec_ptr;
+		identity.record.record_crc = record->record_crc;
+		identity.record.rmid = record->rmid;
+		identity.record.info = record->info;
+		captured = rf_side_online_plan_feed_record_v1(work->side_plan, &work->decoded.detached,
+													  &identity);
+		if (captured == RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE
+			|| captured == RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED) {
+			/* The original plan above owns native/history acceptance. A
+			 * narrower SIDE profile cannot invalidate it, but this source
+			 * must never expose a partial SIDE plan as executable. */
+			work->result->side_capture_detail = (uint8)captured;
+			work->result->side_capture_read_rec_ptr = record->read_rec_ptr;
+			work->side_plan = NULL;
+		} else if (captured != RF_PAGE_PROOF_DETAIL_OK) {
+			work->decoded.route_detail = (uint8)captured;
+			work->detail = captured == RF_PAGE_PROOF_DETAIL_CAPACITY
+							   ? CLUSTER_COLD_CAPACITY
+							   : CLUSTER_COLD_SIDE_OWNER_MISSING;
+		}
+	}
 	if (work->detail != CLUSTER_COLD_OK) {
 		work->result->failed_read_rec_ptr = reader->ReadRecPtr;
 		work->result->route_detail = work->decoded.route_detail;
@@ -366,7 +403,7 @@ ClusterColdDetailV1
 cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 						  const ClusterControlRootSnapshot *root,
 						  const ClusterControlRootReadToken *token, bool space_active, bool foreign,
-						  ClusterColdScanResultV1 *result)
+						  struct RfSideOnlinePlanV1 *side_plan, ClusterColdScanResultV1 *result)
 {
 	ColdScanWork *work;
 	ClusterWalTailObservation observed;
@@ -378,6 +415,9 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 	if (plan == NULL || root == NULL || token == NULL)
 		return CLUSTER_COLD_INVALID_ARGUMENT;
 	work = cold_scan_work(plan, participant, &root->identity, space_active, foreign, result);
+	work->side_plan = side_plan;
+	work->source_thread = root->identity.origin_thread_id;
+	work->timeline = root->checkpoint_tli;
 	memset(&observed, 0, sizeof(observed));
 	visit = cluster_control_root_recovery_visit(root, token, cold_scan_visit, work, &observed);
 	return cold_scan_finish(work, visit, &observed, root->validated_tail_lsn_exclusive);

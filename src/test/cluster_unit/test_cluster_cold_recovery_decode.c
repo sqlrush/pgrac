@@ -735,10 +735,31 @@ UT_TEST(test_commit_space_drops_are_typed)
 	UT_ASSERT_EQ(out.space_capacity, 0);
 }
 
+
+UT_TEST(test_detached_capture_borrows_only_a_complete_decode)
+{
+	FakeRecord record;
+	ClusterColdDecodedV1 out = { 0 };
+	fake_record(&record, RM_XLOG_ID, XLOG_NOOP, 0);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT(out.detached.preflight_complete);
+	UT_ASSERT(out.detached.source_record == &record.reader);
+	UT_ASSERT_EQ(out.detached.route.rmid, RM_XLOG_ID);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_CONTROL);
+	preflight_result = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	UT_ASSERT(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out)
+			  != CLUSTER_COLD_OK);
+	UT_ASSERT(!out.detached.preflight_complete);
+	UT_ASSERT_NULL(out.detached.source_record);
+	cluster_cold_decoded_release_v1(&out);
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
+	UT_RUN(test_detached_capture_borrows_only_a_complete_decode);
 	UT_RUN(test_page_record_maps_ordinary_components);
 	UT_RUN(test_registry_refusal_is_opcode_unsupported);
 	UT_RUN(test_cold_owner_policy);

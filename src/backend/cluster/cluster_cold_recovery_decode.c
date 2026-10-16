@@ -593,8 +593,10 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 										? CLUSTER_COLD_RECORD_FOREIGN_CONTROL
 										: CLUSTER_COLD_RECORD_SIDE_UNOWNED;
 	detail = cold_map_components(reader, &plan, system_identifier, storage_uuid, out);
-	if (detail == CLUSTER_COLD_OK)
+	if (detail == CLUSTER_COLD_OK) {
 		cold_effect_routes(&plan, effects, out);
+		out->detached = plan;
+	}
 	return detail;
 }
 
@@ -609,6 +611,7 @@ cluster_cold_decoded_release_v1(ClusterColdDecodedV1 *decoded)
 	decoded->space_capacity = 0;
 	decoded->record.space_ops = NULL;
 	decoded->record.space_count = 0;
+	memset(&decoded->detached, 0, sizeof(decoded->detached));
 }
 
 #endif /* USE_PGRAC_CLUSTER */

@@ -31,6 +31,7 @@
 #include "access/xlogreader.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cold_recovery_census.h"
+#include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_page_cold_redo.h"
 #include "storage/checksum.h"
 #include "storage/checksum_impl.h"
@@ -833,11 +834,107 @@ UT_TEST(test_source_barrier_error_does_not_leave_success)
 	cluster_cold_typed_destroy_v1(&typed);
 }
 
+
+UT_TEST(test_side_capture_bound_to_each_original_replay_source)
+{
+	ClusterColdTypedV1 *typed;
+	Size total_budget = (Size)cluster_cold_recovery_plan_memory * 1024;
+
+	fixture();
+	history_generation(2, 9, 0x40, 0x80);
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(side_creates, NROOTS);
+	UT_ASSERT_EQ(side_seals, NROOTS);
+	UT_ASSERT(side_budget_total <= total_budget / 2);
+	for (uint32 i = 0; i < NROOTS; i++) {
+		RfSideOnlinePlanV1 *plan = typed->side_plans[i];
+		UT_ASSERT_NOT_NULL(plan);
+		if (plan == NULL)
+			continue;
+		UT_ASSERT(plan == &side_fixture[i]);
+		UT_ASSERT(plan->sealed && plan->bound);
+		UT_ASSERT_EQ(plan->cut.failed_thread, i + 1);
+		UT_ASSERT_EQ(plan->cut.origin_owner_incarnation, 11 + i);
+		UT_ASSERT_EQ(plan->cut.scan_begin_inclusive, 0x100);
+		UT_ASSERT_EQ(plan->cut.scan_end_exclusive, 0x2000);
+		UT_ASSERT_EQ(plan->redo, 0x800);
+		UT_ASSERT_EQ(plan->captured, 2);
+	}
+	UT_ASSERT_NULL(typed->side_plans[3]);
+	UT_ASSERT_EQ(history_scans, 1);
+	cluster_cold_typed_destroy_v1(&typed);
+	UT_ASSERT_EQ(side_destroys, NROOTS);
+}
+
+UT_TEST(test_side_capture_failure_never_exposes_a_partial_plan)
+{
+	for (int fault = 1; fault <= 5; fault++) {
+		ClusterColdTypedV1 *typed;
+		fixture();
+		side_fault = fault;
+		typed = prepare(0x800);
+		UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+		for (uint32 i = 0; i < CLUSTER_COLD_MAX_PARTICIPANTS; i++)
+			UT_ASSERT_NULL(typed->side_plans[i]);
+		UT_ASSERT_EQ(side_destroys, side_creates);
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_side_capture_keeps_original_scan_and_seal_refusals)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		ClusterColdTypedV1 *typed;
+		fixture();
+		if (fault == 0)
+			scan_result[3] = CLUSTER_COLD_SIDE_OWNER_MISSING;
+		else if (fault == 1)
+			census_revalidate_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		else
+			data_token = 3;
+		typed = prepare(0x800);
+		UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+		for (uint32 i = 0; i < CLUSTER_COLD_MAX_PARTICIPANTS; i++)
+			UT_ASSERT_NULL(typed->side_plans[i]);
+		UT_ASSERT_EQ(side_seals, 0);
+		UT_ASSERT_EQ(side_destroys, side_creates);
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+
+UT_TEST(test_native_history_capture_gap_keeps_original_plan_but_no_side_authority)
+{
+	for (int fault = 6; fault <= 7; fault++) {
+		ClusterColdTypedV1 *typed;
+		ClusterColdHandshakeV1 all = { true, true, true, true, true, true };
+		char reason[256];
+		fixture();
+		side_fault = fault;
+		typed = prepare(0x800);
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+		UT_ASSERT_NULL(typed->side_plans[0]);
+		UT_ASSERT_NOT_NULL(typed->side_plans[1]);
+		UT_ASSERT_EQ(typed->side_capture_detail[0], RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+		UT_ASSERT_EQ(typed->side_capture_read_rec_ptr[0], fault == 6 ? 0x100 : InvalidXLogRecPtr);
+		UT_ASSERT_EQ(side_seals, 2);
+		UT_ASSERT(!cluster_cold_typed_ready_v1(typed, &all, reason, sizeof(reason)));
+		UT_ASSERT(strstr(reason, "SIDE capture") != NULL);
+		cluster_cold_typed_destroy_v1(&typed);
+		UT_ASSERT_EQ(side_destroys, NROOTS);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(29);
+	UT_RUN(test_native_history_capture_gap_keeps_original_plan_but_no_side_authority);
 	UT_RUN(test_prepare_seals_own_and_fenced_generations);
+	UT_RUN(test_side_capture_bound_to_each_original_replay_source);
+	UT_RUN(test_side_capture_failure_never_exposes_a_partial_plan);
+	UT_RUN(test_side_capture_keeps_original_scan_and_seal_refusals);
 	UT_RUN(test_prepare_takes_history_generations_from_the_census);
 	UT_RUN(test_prepare_refuses_what_the_census_refuses);
 	UT_RUN(test_prepare_refuses_unsealed_own_generation);
