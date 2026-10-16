@@ -496,15 +496,20 @@ cold_foreign_side(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan,
 		return info == XLOG_MULTIXACT_ZERO_OFF_PAGE || info == XLOG_MULTIXACT_ZERO_MEM_PAGE
 			   || info == XLOG_MULTIXACT_CREATE_ID || info == XLOG_MULTIXACT_TRUNCATE_ID;
 	case RM_XACT_ID:
-		/* Ordinary ABORT is a bounded native consumer only after the exact
-		 * preceding TT_ABORT carrier has been installed by the cold owner. */
-		if (info == XLOG_XACT_ABORT) {
+		/* Ordinary COMMIT and ABORT are record-local native consumers only
+		 * after the recovery decoder has validated the complete payload. A
+		 * relation/SPACE suffix remains with the structural owner; prepared
+		 * transaction opcodes never enter this route. */
+		if (info == XLOG_XACT_COMMIT || info == XLOG_XACT_ABORT) {
 			RfSideXactOperationV1 operation;
 
 			/* Classification must not turn malformed/unsupported effects into
 			 * a foreign consumer. The real origin is bound later by the
 			 * immutable plan; origin 1 is sufficient for this shape probe. */
-			return rf_side_xact_decode_recovery_v1(reader, system_identifier, 1, &operation);
+			return rf_side_xact_decode_recovery_v1(reader, system_identifier, 1, &operation)
+				   && ((info == XLOG_XACT_COMMIT && operation.kind == RF_SIDE_XACT_COMMIT)
+					   || (info == XLOG_XACT_ABORT && operation.kind == RF_SIDE_XACT_ABORT))
+				   && operation.relation_count == 0 && operation.space_drop_count == 0;
 		}
 		return info == XLOG_XACT_ASSIGNMENT;
 	case RM_STANDBY_ID:

@@ -60,6 +60,10 @@ static bool commit_parse_ok = true;
 static int abort_nrels;
 static uint32 commit_nspace_drops;
 static const char *commit_space_drops;
+static bool side_xact_decode_ok;
+static RfSideXactKindV1 side_xact_decode_kind;
+static uint32 side_xact_decode_relation_count;
+static uint32 side_xact_decode_space_drop_count;
 
 RfPageProofDetailV1
 rf_page_detached_preflight_v1(XLogReaderState *record, bool space_active,
@@ -107,6 +111,22 @@ ParseAbortRecord(uint8 info, xl_xact_abort *xlrec, xl_xact_parsed_abort *parsed)
 	(void)xlrec;
 	memset(parsed, 0, sizeof(*parsed));
 	parsed->nrels = abort_nrels;
+}
+
+bool
+rf_side_xact_decode_recovery_v1(XLogReaderState *record, uint64 system_identifier,
+								uint16 origin_thread, RfSideXactOperationV1 *operation)
+{
+	(void)record;
+	if (!side_xact_decode_ok || operation == NULL)
+		return false;
+	memset(operation, 0, sizeof(*operation));
+	operation->system_identifier = system_identifier;
+	operation->origin_thread = origin_thread;
+	operation->kind = side_xact_decode_kind;
+	operation->relation_count = side_xact_decode_relation_count;
+	operation->space_drop_count = side_xact_decode_space_drop_count;
+	return true;
 }
 
 typedef struct FakeRecord {
@@ -161,6 +181,10 @@ fake_record(FakeRecord *record, uint8 rmid, uint8 info, int blocks)
 	commit_parse_ok = true;
 	commit_nspace_drops = 0;
 	commit_space_drops = NULL;
+	side_xact_decode_ok = false;
+	side_xact_decode_kind = RF_SIDE_XACT_INVALID;
+	side_xact_decode_relation_count = 0;
+	side_xact_decode_space_drop_count = 0;
 }
 
 static void
@@ -435,6 +459,34 @@ UT_TEST(test_foreign_side_records_have_no_cold_owner)
 				 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.record.record_flags, 0);
 	UT_ASSERT_EQ(out.record.component_count, 1);
+}
+
+UT_TEST(test_foreign_commit_side_owner_requires_record_local_shape)
+{
+	FakeRecord record;
+	ClusterColdDecodedV1 out = { 0 };
+
+	fake_record(&record, RM_XACT_ID, XLOG_XACT_COMMIT, 0);
+	preflight_plan.route.codec_id = RF_ROUTE_CODEC_SIDE_STANDARD;
+	side_xact_decode_ok = true;
+	side_xact_decode_kind = RF_SIDE_XACT_COMMIT;
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+					 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
+
+	/* A relation/SPACE suffix belongs to the structural owner, not the
+	 * record-local foreign side consumer. */
+	side_xact_decode_relation_count = 1;
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+					 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+
+	/* A decoder result whose kind does not match the opcode is fail-closed. */
+	side_xact_decode_relation_count = 0;
+	side_xact_decode_kind = RF_SIDE_XACT_ABORT;
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+					 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
 }
 
 /*
@@ -758,7 +810,7 @@ UT_TEST(test_detached_capture_borrows_only_a_complete_decode)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_detached_capture_borrows_only_a_complete_decode);
 	UT_RUN(test_page_record_maps_ordinary_components);
 	UT_RUN(test_registry_refusal_is_opcode_unsupported);
@@ -767,6 +819,7 @@ main(void)
 	UT_RUN(test_storage_lifecycle_classification);
 	UT_RUN(test_malformed_plan_refused);
 	UT_RUN(test_foreign_side_records_have_no_cold_owner);
+	UT_RUN(test_foreign_commit_side_owner_requires_record_local_shape);
 	UT_RUN(test_foreign_native_control_is_typed_noop);
 	UT_RUN(test_space_identity_changes_are_typed);
 	UT_RUN(test_space_reservation_advance_is_typed);
