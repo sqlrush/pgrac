@@ -8,6 +8,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "access/clog.h"
+#include "access/subtrans.h"
 #include "miscadmin.h"
 #include "access/xlog_internal.h"
 #include "catalog/pg_control.h"
@@ -613,6 +614,39 @@ side_owner_apply_space(void *arg, const RfSideOnlineOperationV1 *operation)
  * unknown SIDE work. In particular cache invalidations need the RESET owner.
  */
 static bool
+side_owner_assignment(const RfSideOnlineOperationV1 *operation, bool apply)
+{
+	int origin = operation->identity.record.origin_thread - 1;
+	xl_xact_assignment *copy;
+	volatile bool ok = false;
+
+	if (!rf_side_xact_assignment_preflight_v1(operation->owned_payload,
+											  operation->owned_payload_length))
+		return false;
+	copy = owner_alloc(operation->owned_payload_length);
+	if (copy == NULL)
+		return false;
+	memcpy(copy, operation->owned_payload, operation->owned_payload_length);
+	PG_TRY();
+	{
+		ok = cluster_subtrans_native_recovery_preflight_v1(origin, copy->xtop, copy->nsubxacts,
+														   copy->xsub);
+		if (ok && apply)
+			ok = cluster_undo_recovery_cold_source_sync_v1(origin)
+				 && cluster_subtrans_native_recovery_apply_v1(origin, copy->xtop, copy->nsubxacts,
+															  copy->xsub)
+				 && cluster_subtrans_native_recovery_verify_v1(origin, copy->xtop, copy->nsubxacts,
+															   copy->xsub);
+	}
+	PG_FINALLY();
+	{
+		owner_free(copy);
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+static bool
 side_owner_preflight_control(void *arg, const RfSideOnlineOperationV1 *operation)
 {
 	RfSideOnlineProductionOwnerV1 *owner = arg;
@@ -643,11 +677,15 @@ side_owner_preflight_control(void *arg, const RfSideOnlineOperationV1 *operation
 		|| !cluster_undo_recovery_origin_authorized_v1(record->origin_thread - 1))
 		return false;
 	info = record->info & ~XLR_INFO_MASK;
-	if (side_owner_cold_formed(owner))
+	if (side_owner_cold_formed(owner)) {
+		if (!cluster_undo_recovery_cold_origin_authorized_v1(record->origin_thread - 1))
+			return false;
+		if (record->rmid == RM_XACT_ID && info == XLOG_XACT_ASSIGNMENT)
+			return side_owner_assignment(operation, false);
 		return record->rmid == RM_STANDBY_ID && info == XLOG_INVALIDATIONS && DatabasePath == NULL
-			   && cluster_undo_recovery_cold_origin_authorized_v1(record->origin_thread - 1)
 			   && rf_side_standby_invalidation_preflight_v1(operation->owned_payload,
 															operation->owned_payload_length);
+	}
 	if (scope->authority->serial_guard->mode != CLUSTER_RECOVERY_SERIAL_ONLINE)
 		return false;
 	if (record->rmid == RM_STANDBY_ID)
@@ -679,7 +717,11 @@ side_owner_apply_control(void *arg, const RfSideOnlineOperationV1 *operation)
 
 	if (!side_owner_preflight_control(arg, operation))
 		return false;
-	if (side_owner_cold_formed(owner)) {
+	if (side_owner_cold_formed(owner) && operation->identity.record.rmid == RM_XACT_ID) {
+		if (!side_owner_assignment(operation, true)
+			|| !side_owner_preflight_control(arg, operation))
+			return false;
+	} else if (side_owner_cold_formed(owner)) {
 		xl_invalidations *copy = owner_alloc(operation->owned_payload_length);
 
 		if (copy == NULL)

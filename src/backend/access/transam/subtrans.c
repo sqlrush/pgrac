@@ -33,6 +33,14 @@
 #include "postgres.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_native_startup.h"
+#include "cluster/cluster_undo_recovery.h"
+#include "storage/fd.h"
+#include "storage/shmem.h"
+#include "storage/proc.h"
+#include "utils/wait_event.h"
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 #include "access/slru.h"
@@ -79,6 +87,14 @@ static SlruCtlData SubTransCtlData;
 
 #define SubTransCtl  (&SubTransCtlData)
 
+
+#ifdef USE_PGRAC_CLUSTER
+/* Original-origin recovery never aliases the local live SUBTRANS cache. */
+#define SUBTRANS_RECOVERY_ORIGINS 128
+#define SUBTRANS_RECOVERY_BUFFERS 2
+static SlruCtlData SubtransRecoveryCtl[SUBTRANS_RECOVERY_ORIGINS];
+static LWLockPadded *SubtransRecoveryLocks;
+#endif
 
 static int	ZeroSUBTRANSPage(int pageno);
 static bool SubTransPagePrecedes(int page1, int page2);
@@ -195,13 +211,345 @@ SubTransGetTopmostTransaction(TransactionId xid)
 }
 
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: exact native ASSIGNMENT effects only. Complete source/base/era and
+ * the cold serial owner remain mandatory; these bytes are not terminal proof.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+subtrans_recovery_permitted(int origin)
+{
+	return cluster_shared_config && InRecovery && AmStartupProcess() && origin >= 0
+		   && origin < SUBTRANS_RECOVERY_ORIGINS && origin != cluster_node_id
+		   && SubtransRecoveryLocks != NULL && SubtransRecoveryCtl[origin].shared != NULL
+		   && cluster_undo_recovery_cold_origin_authorized_v1(origin);
+}
+
+static void
+subtrans_recovery_cache_discard(SlruCtl ctl)
+{
+	SlruShared shared = ctl->shared;
+
+	if (!LWLockHeldByMe(shared->ControlLock))
+		LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
+	for (int slot = 0; slot < shared->num_slots; slot++) {
+		if ((shared->page_status[slot] == SLRU_PAGE_READ_IN_PROGRESS
+			 || shared->page_status[slot] == SLRU_PAGE_WRITE_IN_PROGRESS)
+			&& LWLockHeldByMe(&shared->buffer_locks[slot].lock))
+			LWLockRelease(&shared->buffer_locks[slot].lock);
+		shared->page_status[slot] = SLRU_PAGE_EMPTY;
+		shared->page_dirty[slot] = false;
+	}
+	LWLockRelease(shared->ControlLock);
+}
+
+static bool
+subtrans_recovery_directory_ready(int origin)
+{
+	const char *children[3] = { "native_side", NULL, "pg_subtrans" };
+	int dirs[4] = { -1, -1, -1, -1 };
+	char origin_name[32];
+	char expected[MAXPGPATH];
+	struct stat st, routed;
+	int length;
+	bool ok = false;
+
+	if (!subtrans_recovery_permitted(origin) || cluster_shared_data_dir == NULL
+		|| cluster_shared_data_dir[0] != '/')
+		return false;
+	snprintf(origin_name, sizeof(origin_name), "origin_%d", origin);
+	children[1] = origin_name;
+	length = snprintf(expected, sizeof(expected), "%s/native_side/%s/pg_subtrans",
+					  cluster_shared_data_dir, origin_name);
+	if (length < 0 || length >= sizeof(expected)
+		|| strcmp(expected, SubtransRecoveryCtl[origin].Dir) != 0)
+		return false;
+	dirs[0] = open(cluster_shared_data_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (dirs[0] < 0)
+		goto done;
+	for (int i = 1; i < 4; i++) {
+		dirs[i]
+			= openat(dirs[i - 1], children[i - 1], O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+		if (dirs[i] < 0)
+			goto done;
+	}
+	for (int i = 0; i < 4; i++)
+		if (fstat(dirs[i], &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != geteuid()
+			|| (st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+			goto done;
+	if (lstat(expected, &routed) != 0 || !S_ISDIR(routed.st_mode) || routed.st_dev != st.st_dev
+		|| routed.st_ino != st.st_ino)
+		goto done;
+	ok = true;
+done:
+	for (int i = 3; i >= 0; i--)
+		if (dirs[i] >= 0 && close(dirs[i]) != 0)
+			ok = false;
+	/* Revalidation can ERROR; do not keep raw directory FDs across it. */
+	return ok && subtrans_recovery_permitted(origin);
+}
+
+/* ASSIGNMENT requires an existing complete base page. Missing retained
+ * parentage is not a zero page or proof of an absent transaction. */
+static bool
+subtrans_recovery_page_identity(SlruCtl ctl, int page, struct stat *out)
+{
+	char path[MAXPGPATH];
+	int length = snprintf(path, sizeof(path), "%s/%04X", ctl->Dir, page / SLRU_PAGES_PER_SEGMENT);
+
+	return length >= 0 && length < sizeof(path) && lstat(path, out) == 0 && S_ISREG(out->st_mode)
+		   && out->st_nlink == 1 && out->st_uid == geteuid()
+		   && (out->st_mode & (S_IWGRP | S_IWOTH)) == 0
+		   && out->st_size >= (off_t)(page % SLRU_PAGES_PER_SEGMENT + 1) * BLCKSZ;
+}
+
+static bool
+subtrans_recovery_same_file(const struct stat *before, const struct stat *after)
+{
+	return before->st_dev == after->st_dev && before->st_ino == after->st_ino
+		   && before->st_size == after->st_size;
+}
+
+/* Generic fsync helpers may ignore directory errors or sync-fd close
+ * errors. Recovery completion needs every one of these results explicitly. */
+static bool
+subtrans_recovery_sync(SlruCtl ctl, int page, const struct stat *expected)
+{
+	bool directory = page < 0;
+	char path[MAXPGPATH];
+	struct stat before, opened, after;
+	volatile int fd = -1;
+	volatile bool ok = false;
+	int length;
+
+	length = directory
+				 ? snprintf(path, sizeof(path), "%s", ctl->Dir)
+				 : snprintf(path, sizeof(path), "%s/%04X", ctl->Dir, page / SLRU_PAGES_PER_SEGMENT);
+	if (length < 0 || length >= sizeof(path) || lstat(path, &before) != 0
+		|| (directory ? !S_ISDIR(before.st_mode) : !S_ISREG(before.st_mode))
+		|| before.st_uid != geteuid() || (before.st_mode & (S_IWGRP | S_IWOTH)) != 0
+		|| (!directory
+			&& (before.st_nlink != 1 || expected == NULL
+				|| !subtrans_recovery_same_file(&before, expected))))
+		return false;
+	PG_TRY();
+	{
+		fd = OpenTransientFile(path, (directory ? O_RDONLY | O_DIRECTORY : O_RDWR) | O_NOFOLLOW
+										 | O_CLOEXEC | PG_BINARY);
+		if (fd >= 0 && fstat(fd, &opened) == 0 && subtrans_recovery_same_file(&before, &opened)) {
+			pgstat_report_wait_start(WAIT_EVENT_SLRU_FLUSH_SYNC);
+			ok = pg_fsync(fd) == 0;
+			pgstat_report_wait_end();
+			ok = ok && fstat(fd, &after) == 0 && subtrans_recovery_same_file(&before, &after)
+				 && lstat(path, &after) == 0 && subtrans_recovery_same_file(&before, &after);
+		}
+	}
+	PG_FINALLY();
+	{
+		pgstat_report_wait_end();
+		if (fd >= 0 && CloseTransientFile(fd) != 0)
+			ok = false;
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+typedef enum SubtransRecoveryAccess {
+	SUBTRANS_RECOVERY_PREFLIGHT,
+	SUBTRANS_RECOVERY_WRITE,
+	SUBTRANS_RECOVERY_VERIFY
+} SubtransRecoveryAccess;
+
+static bool
+subtrans_recovery_page(int origin, int page, TransactionId top, int count,
+					   const TransactionId *children, SubtransRecoveryAccess access)
+{
+	SlruCtl ctl = &SubtransRecoveryCtl[origin];
+	struct stat before, after;
+	TransactionId *slots;
+	int slot;
+	bool ok;
+
+	subtrans_recovery_cache_discard(ctl);
+	if (!subtrans_recovery_directory_ready(origin)
+		|| !subtrans_recovery_page_identity(ctl, page, &before))
+		return false;
+	LWLockAcquire(ctl->shared->ControlLock, LW_EXCLUSIVE);
+	slot = SimpleLruReadPage(ctl, page, true, top);
+	slots = (TransactionId *)ctl->shared->page_buffer[slot];
+	ok = subtrans_recovery_permitted(origin) && subtrans_recovery_page_identity(ctl, page, &after)
+		 && subtrans_recovery_same_file(&before, &after);
+	for (int i = 0; ok && i < count; i++) {
+		TransactionId current = slots[TransactionIdToEntry(children[i])];
+
+		/* A retained different parent cannot be relabelled as the top. */
+		ok = current == top
+			 || (access != SUBTRANS_RECOVERY_VERIFY && current == InvalidTransactionId);
+	}
+	if (ok && access == SUBTRANS_RECOVERY_WRITE) {
+		ok = subtrans_recovery_permitted(origin)
+			 && subtrans_recovery_page_identity(ctl, page, &after)
+			 && subtrans_recovery_same_file(&before, &after);
+		if (ok) {
+			for (int i = 0; i < count; i++)
+				slots[TransactionIdToEntry(children[i])] = top;
+			ctl->shared->page_dirty[slot] = true;
+			SimpleLruWritePage(ctl, slot);
+		}
+	}
+	LWLockRelease(ctl->shared->ControlLock);
+	if (!ok)
+		return false;
+	if (access == SUBTRANS_RECOVERY_WRITE
+		&& (!subtrans_recovery_permitted(origin) || !subtrans_recovery_sync(ctl, page, &before)))
+		return false;
+	return subtrans_recovery_directory_ready(origin)
+		   && subtrans_recovery_page_identity(ctl, page, &after)
+		   && subtrans_recovery_same_file(&before, &after);
+}
+
+static bool
+subtrans_recovery_children(int origin, TransactionId top, int count, const TransactionId *children,
+						   SubtransRecoveryAccess access)
+{
+	for (int first = 0; first < count;) {
+		int last = first + 1;
+		int page = TransactionIdToPage(children[first]);
+
+		while (last < count && TransactionIdToPage(children[last]) == page)
+			last++;
+		if (!subtrans_recovery_page(origin, page, top, last - first, children + first, access))
+			return false;
+		first = last;
+	}
+	return true;
+}
+
+static bool
+subtrans_recovery_access(int origin, TransactionId top, int count, const TransactionId *children,
+						 SubtransRecoveryAccess access)
+{
+	volatile bool locked = false;
+	volatile bool ok = false;
+	LWLock *lock;
+	TransactionId previous = top;
+
+	/* Same bounded list emitted by AssignTransactionId; native wrap ordering
+	 * is preserved. No parent-chain or transaction-status inference occurs. */
+	if (!subtrans_recovery_permitted(origin) || !TransactionIdIsNormal(top) || count <= 0
+		|| count > PGPROC_MAX_CACHED_SUBXIDS || children == NULL)
+		return false;
+	for (int i = 0; i < count; i++) {
+		if (!TransactionIdIsNormal(children[i]) || !TransactionIdPrecedes(previous, children[i])
+			|| !TransactionIdPrecedes(top, children[i])
+			|| (uint32)(children[i] - top) >= UINT32_C(0x80000000))
+			return false;
+		previous = children[i];
+	}
+	if (access == SUBTRANS_RECOVERY_WRITE && !cluster_undo_recovery_cold_source_synced_v1(origin))
+		return false;
+	lock = &SubtransRecoveryLocks[origin * 2 + 1].lock;
+	PG_TRY();
+	{
+		LWLockAcquire(lock, LW_EXCLUSIVE);
+		locked = true;
+		subtrans_recovery_cache_discard(&SubtransRecoveryCtl[origin]);
+		ok = subtrans_recovery_directory_ready(origin)
+			 && subtrans_recovery_children(
+				 origin, top, count, children,
+				 access == SUBTRANS_RECOVERY_WRITE ? SUBTRANS_RECOVERY_PREFLIGHT : access);
+		/* All pages and slots must pass before the first native write. */
+		if (ok && access == SUBTRANS_RECOVERY_WRITE) {
+			ok = subtrans_recovery_children(origin, top, count, children, access);
+			if (ok) {
+				ok = subtrans_recovery_sync(&SubtransRecoveryCtl[origin], -1, NULL)
+					 && subtrans_recovery_directory_ready(origin)
+					 && subtrans_recovery_children(origin, top, count, children,
+												   SUBTRANS_RECOVERY_VERIFY);
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		if (locked) {
+			subtrans_recovery_cache_discard(&SubtransRecoveryCtl[origin]);
+			LWLockRelease(lock);
+		}
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+bool
+cluster_subtrans_native_recovery_preflight_v1(int origin, TransactionId top, int count,
+											  const TransactionId *children)
+{
+	return subtrans_recovery_access(origin, top, count, children, SUBTRANS_RECOVERY_PREFLIGHT);
+}
+
+bool
+cluster_subtrans_native_recovery_apply_v1(int origin, TransactionId top, int count,
+										  const TransactionId *children)
+{
+	return subtrans_recovery_access(origin, top, count, children, SUBTRANS_RECOVERY_WRITE);
+}
+
+bool
+cluster_subtrans_native_recovery_verify_v1(int origin, TransactionId top, int count,
+										   const TransactionId *children)
+{
+	return subtrans_recovery_access(origin, top, count, children, SUBTRANS_RECOVERY_VERIFY);
+}
+
+static void
+subtrans_recovery_shmem_init(void)
+{
+	bool found;
+
+	SubtransRecoveryLocks = ShmemInitStruct(
+		"SUBTRANS recovery locks", 2 * SUBTRANS_RECOVERY_ORIGINS * sizeof(LWLockPadded), &found);
+	for (int origin = 0; origin < SUBTRANS_RECOVERY_ORIGINS; origin++) {
+		SlruCtl ctl = &SubtransRecoveryCtl[origin];
+		LWLock *lock = &SubtransRecoveryLocks[origin * 2].lock;
+		char name[64], path[MAXPGPATH];
+		int length;
+
+		if (!found) {
+			LWLockInitialize(lock, LWTRANCHE_SUBTRANS_BUFFER);
+			LWLockInitialize(&SubtransRecoveryLocks[origin * 2 + 1].lock,
+							 LWTRANCHE_SUBTRANS_BUFFER);
+		}
+		if (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] != '/')
+			ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("shared SUBTRANS recovery requires an absolute shared root")));
+		length = snprintf(path, sizeof(path), "%s/native_side/origin_%d/pg_subtrans",
+						  cluster_shared_data_dir, origin);
+		if (length < 0 || length >= sizeof(path) - 16)
+			ereport(FATAL, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+							errmsg("shared SUBTRANS recovery path is too long")));
+		snprintf(name, sizeof(name), "SUBTRANS recovery %d", origin);
+		ctl->PagePrecedes = SubTransPagePrecedes;
+		SimpleLruInit(ctl, name, SUBTRANS_RECOVERY_BUFFERS, 0, lock, path,
+					  LWTRANCHE_SUBTRANS_BUFFER, SYNC_HANDLER_NONE);
+	}
+}
+#endif
+
 /*
  * Initialization of shared memory for SUBTRANS
  */
 Size
 SUBTRANSShmemSize(void)
 {
-	return SimpleLruShmemSize(NUM_SUBTRANS_BUFFERS, 0);
+	Size size = SimpleLruShmemSize(NUM_SUBTRANS_BUFFERS, 0);
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config) {
+		size = add_size(size, mul_size(SUBTRANS_RECOVERY_ORIGINS,
+									 SimpleLruShmemSize(SUBTRANS_RECOVERY_BUFFERS, 0)));
+		size = add_size(size, mul_size(2 * SUBTRANS_RECOVERY_ORIGINS, sizeof(LWLockPadded)));
+	}
+#endif
+	return size;
 }
 
 void
@@ -219,6 +567,10 @@ SUBTRANSShmemInit(void)
 	SimpleLruInit(SubTransCtl, "Subtrans", NUM_SUBTRANS_BUFFERS, 0, SubtransSLRULock, "pg_subtrans",
 				  LWTRANCHE_SUBTRANS_BUFFER, handler);
 	SlruPagePrecedesUnitTests(SubTransCtl, SUBTRANS_XACTS_PER_PAGE);
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config)
+		subtrans_recovery_shmem_init();
+#endif
 }
 
 /*

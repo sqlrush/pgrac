@@ -4,6 +4,8 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/subtrans.h"
+#include "storage/proc.h"
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -172,6 +174,45 @@ HotStandbyState standbyState = STANDBY_DISABLED;
 static bool cold_locks_test, cold_locks_throw, cold_locks_expire;
 static unsigned cold_locks_calls, cold_locks_order;
 
+static bool cold_assignment_test, assignment_refuse, assignment_throw, assignment_expire;
+static unsigned assignment_preflights, assignment_applies, assignment_verifies;
+
+/* Native file IO is covered separately by test_cluster_subtrans_recovery. */
+static bool
+assignment_call(int origin, TransactionId top, int count, const TransactionId *children)
+{
+	UT_ASSERT(cold_assignment_test && canonical_scope != NULL && origin == 2);
+	UT_ASSERT(top == 800 && count == 2 && children[0] == 801 && children[1] == 802);
+	return !assignment_refuse;
+}
+bool
+cluster_subtrans_native_recovery_preflight_v1(int origin, TransactionId top, int count,
+											  const TransactionId *children)
+{
+	assignment_preflights++;
+	return assignment_call(origin, top, count, children);
+}
+bool
+cluster_subtrans_native_recovery_apply_v1(int origin, TransactionId top, int count,
+										  const TransactionId *children)
+{
+	assignment_applies++;
+	UT_ASSERT(cold_source_ready && cold_source_calls > 0);
+	if (assignment_throw)
+		pg_re_throw();
+	return assignment_call(origin, top, count, children);
+}
+bool
+cluster_subtrans_native_recovery_verify_v1(int origin, TransactionId top, int count,
+										   const TransactionId *children)
+{
+	assignment_verifies++;
+	UT_ASSERT(assignment_applies == assignment_verifies);
+	if (assignment_expire)
+		control_fresh = false;
+	return assignment_call(origin, top, count, children);
+}
+
 /* Only the native recovery-lock API boundary is a fixture. The complete
  * immutable plan, exact TT consumer and terminal ordering remain real. */
 void
@@ -330,8 +371,8 @@ cluster_undo_recovery_origin_authorized_v1(int node)
 bool
 cluster_undo_recovery_cold_origin_authorized_v1(int node)
 {
-	return (cold_clog_test || cold_mx_test || cold_standalone_cache_test) && !cold_clog_denied
-		   && canonical_scope != NULL && node == 2;
+	return (cold_clog_test || cold_mx_test || cold_standalone_cache_test || cold_assignment_test)
+		   && !cold_clog_denied && canonical_scope != NULL && node == 2;
 }
 
 /* The native adapter runs real SLRU in test_cluster_multixact_recovery. */
@@ -6544,6 +6585,212 @@ cold_standalone_cache_plan(int fault)
 	return plan;
 }
 
+static RfSideOnlinePlanV1 *
+assignment_plan_options(int fault, bool inspect, Size budget, RfPageProofDetailV1 *detail)
+{
+	RfSideOnlinePlanV1 *plan = NULL;
+	RfContributorStreamCutV1 cut = { .failed_thread = 3,
+									 .timeline_id = 7,
+									 .flags = RF_CONTRIBUTOR_CUT_COMPLETE,
+									 .scan_begin_inclusive = 100,
+									 .scan_end_exclusive = 200 };
+	RfSideOnlinePlanRequestV1 request
+		= { .system_identifier = UINT64_C(0x11223344),
+			.physical_cuts = &cut,
+			.participant_count = 1,
+			.memory_budget = budget,
+			.purpose = inspect ? RF_SIDE_PLAN_PI_CONTRIBUTIONS : RF_SIDE_PLAN_RECOVERY };
+	PGAlignedBlock payload = { 0 };
+	xl_xact_assignment *a = (xl_xact_assignment *)payload.data;
+	uint32 length = MinSizeOfXactAssignment + 2 * sizeof(TransactionId);
+	FakeXactRecord fake;
+	RfPageOnlineRecordIdentityV1 identity;
+	RfDetachedRecordPlanV1 record;
+	uint8 uuid[16];
+
+	memset(request.storage_uuid, 0x44, sizeof(request.storage_uuid));
+	*detail = rf_side_online_plan_create_v1(&request, &plan);
+	if (*detail != RF_PAGE_PROOF_DETAIL_OK)
+		return plan;
+	a->xtop = 800;
+	a->nsubxacts = 2;
+	a->xsub[0] = 801;
+	a->xsub[1] = 802;
+	switch (fault) {
+	case 1:
+		length--;
+		break;
+	case 2:
+		length++;
+		break;
+	case 3:
+		a->nsubxacts = -1;
+		break;
+	case 4:
+		a->nsubxacts = INT_MAX;
+		break;
+	case 5:
+		a->xtop = FrozenTransactionId;
+		break;
+	case 6:
+		a->xsub[1] = a->xsub[0];
+		break;
+	case 7:
+		a->xsub[1] = 799;
+		break;
+	case 8:
+		a->xsub[1] = InvalidTransactionId;
+		break;
+	case 9:
+		a->xsub[1] = a->xtop + UINT32_C(0x80000000);
+		break;
+	}
+	make_projection_record(&fake, RM_XACT_ID, XLOG_XACT_ASSIGNMENT, payload.data, length);
+	fake.u.decoded.max_block_id = -1;
+	memset(uuid, 0x44, sizeof(uuid));
+	identity = make_identity(&fake, uuid);
+	set_identity_range(&fake, &identity, 100, 200);
+	record = make_projection_record_plan(&fake);
+	*detail = rf_side_online_plan_feed_record_v1(plan, &record, &identity);
+	/* The owned payload must survive the source reader buffer. */
+	memset(fake.data, 0xe1, sizeof(fake.data));
+	if (*detail == RF_PAGE_PROOF_DETAIL_OK)
+		*detail = rf_side_online_plan_seal_v1(plan);
+	return plan;
+}
+
+static RfSideOnlinePlanV1 *
+assignment_plan(int fault, RfPageProofDetailV1 *detail)
+{
+	return assignment_plan_options(fault, false, 0, detail);
+}
+
+UT_TEST(test_cold_assignment_shape_wrap_alignment_and_budget)
+{
+	PGAlignedBlock payload = { 0 };
+	xl_xact_assignment *a = (xl_xact_assignment *)payload.data;
+	uint8 unaligned[512];
+	uint32 length;
+	RfPageProofDetailV1 detail;
+	RfSideOnlinePlanV1 *inspect = assignment_plan_options(0, true, 0, &detail);
+	RfSideOnlinePlanV1 *replay;
+	RfSideOnlineProductionOwnerV1 owner;
+	RfSideOnlineOperationV1 op;
+	Size stored, copy;
+
+	UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_side_online_plan_operation_v1(inspect, 0, &op));
+	copy = op.owned_payload_length;
+	stored = RF_SIDE_ONLINE_PLAN_MAX_BYTES - rf_side_online_plan_scratch_available_v1(inspect);
+	UT_ASSERT(
+		rf_side_online_production_owner_init_v1(&owner, &owner, control_authority_fresh, 19, true));
+	UT_ASSERT_EQ(rf_side_online_production_apply_v1(inspect, &owner),
+				 RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT);
+	rf_side_online_plan_destroy_v1(&inspect);
+	for (int exact = 0; exact < 2; exact++) {
+		replay = assignment_plan_options(0, false, stored + copy - 1 + exact, &detail);
+		UT_ASSERT_EQ(detail, exact ? RF_PAGE_PROOF_DETAIL_OK : RF_PAGE_PROOF_DETAIL_CAPACITY);
+		rf_side_online_plan_destroy_v1(&replay);
+	}
+	a->xtop = UINT32_MAX - 1;
+	a->nsubxacts = 3;
+	a->xsub[0] = UINT32_MAX;
+	a->xsub[1] = 3;
+	a->xsub[2] = 4;
+	length = MinSizeOfXactAssignment + 3 * sizeof(TransactionId);
+	memcpy(unaligned + 1, payload.data, length);
+	UT_ASSERT(rf_side_xact_assignment_preflight_v1(unaligned + 1, length));
+	UT_ASSERT(!rf_side_xact_assignment_preflight_v1(NULL, length));
+	a->xtop = 800;
+	a->nsubxacts = PGPROC_MAX_CACHED_SUBXIDS;
+	for (int i = 0; i < PGPROC_MAX_CACHED_SUBXIDS; i++)
+		a->xsub[i] = 801 + i;
+	length = MinSizeOfXactAssignment + a->nsubxacts * sizeof(TransactionId);
+	UT_ASSERT(rf_side_xact_assignment_preflight_v1((uint8 *)payload.data, length));
+	a->nsubxacts++;
+	UT_ASSERT(!rf_side_xact_assignment_preflight_v1((uint8 *)payload.data,
+													length + sizeof(TransactionId)));
+	a->nsubxacts = 0;
+	UT_ASSERT(
+		!rf_side_xact_assignment_preflight_v1((uint8 *)payload.data, MinSizeOfXactAssignment));
+}
+
+UT_TEST(test_cold_assignment_retains_complete_bounded_original_payload)
+{
+	for (int fault = 0; fault < 10; fault++) {
+		RfPageProofDetailV1 detail;
+		RfSideOnlinePlanV1 *plan = assignment_plan(fault, &detail);
+		UT_ASSERT_EQ(detail == RF_PAGE_PROOF_DETAIL_OK, fault == 0);
+		if (detail == RF_PAGE_PROOF_DETAIL_OK) {
+			RfSideOnlineOperationV1 op;
+			xl_xact_assignment copy;
+			UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &op));
+			UT_ASSERT_EQ(op.kind, RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL);
+			UT_ASSERT_EQ(op.owned_payload_length, MinSizeOfXactAssignment + 8);
+			memcpy(&copy, op.owned_payload, MinSizeOfXactAssignment);
+			UT_ASSERT_EQ(copy.xtop, 800);
+			UT_ASSERT_EQ(copy.nsubxacts, 2);
+		}
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_cold_assignment_original_owner_gates_and_cleanup)
+{
+	for (int fault = 0; fault < 8; fault++) {
+		RfPageProofDetailV1 detail;
+		RfSideOnlinePlanV1 *plan = assignment_plan(0, &detail);
+		ClusterRecoveryDutyKey duty = canonical_duty;
+		ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
+		ClusterThreadRecoveryAuthorityV1 authority = { .duty = &duty, .serial_guard = &guard };
+		static RfSideOnlineProductionOwnerV1 owner;
+		volatile RfPageProofDetailV1 result = RF_PAGE_PROOF_DETAIL_INTERNAL;
+		volatile bool caught = false;
+
+		UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_OK);
+		duty.system_identifier = UINT64_C(0x11223344);
+		duty.origin_owner_incarnation = 9;
+		memset(duty.storage_uuid, 0x44, 16);
+		if (fault == 1)
+			guard.mode = CLUSTER_RECOVERY_SERIAL_ONLINE;
+		control_scope_test = cold_assignment_test = cold_completion_test = true;
+		cold_clog_denied = fault == 2;
+		control_scope_fault = fault == 3 ? 7 : 0;
+		assignment_refuse = fault == 4;
+		cold_source_fail = fault == 5;
+		assignment_throw = fault == 6;
+		assignment_expire = fault == 7;
+		assignment_preflights = assignment_applies = assignment_verifies = 0;
+		cold_source_calls = control_observe_calls = canonical_writes = 0;
+		cold_source_ready = false;
+		UT_ASSERT(rf_side_online_production_owner_init_v1(&owner, &authority,
+														  control_authority_fresh, 19, true));
+		UT_ASSERT(rf_side_online_production_bind_undo_v1(&owner, &authority));
+		PG_TRY();
+		{
+			result = rf_side_online_production_apply_v1(plan, &owner);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 6);
+		UT_ASSERT_EQ(result == RF_PAGE_PROOF_DETAIL_OK, fault == 0);
+		UT_ASSERT_EQ(owner.protected_set_complete, fault == 0);
+		UT_ASSERT_EQ(assignment_applies, fault == 0 || fault >= 6 ? 1 : 0);
+		UT_ASSERT_EQ(assignment_verifies, fault == 0 || fault == 7 ? 1 : 0);
+		UT_ASSERT_EQ(control_observe_calls, fault == 0 ? 1 : 0);
+		UT_ASSERT(canonical_scope == NULL && canonical_writer_depth == 0);
+		control_scope_test = cold_assignment_test = cold_completion_test = false;
+		cold_clog_denied = cold_source_fail = assignment_refuse = false;
+		assignment_throw = assignment_expire = false;
+		control_scope_fault = 0;
+		control_fresh = true;
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
 UT_TEST(test_cold_standalone_cache_shape_and_unaligned_payload)
 {
 	for (int fault = 0; fault <= 14; fault++) {
@@ -7804,7 +8051,7 @@ UT_TEST(test_cold_initial_ctrc_release_preserves_failed_io_and_scope_responsibil
 int
 main(void)
 {
-	UT_PLAN(104);
+	UT_PLAN(107);
 	UT_RUN(test_cold_compound_drop_classifies_the_complete_native_record);
 	UT_RUN(test_cold_compound_drop_rejects_partial_or_unknown_effects);
 	UT_RUN(test_cold_compound_drop_owns_all_effects_and_original_space_inputs);
@@ -7840,6 +8087,9 @@ main(void)
 	UT_RUN(test_stripe_records_retain_exact_control_obligation_without_pcm_target);
 	UT_RUN(test_stripe_malformed_or_wrong_source_cannot_seal);
 	UT_RUN(test_native_controls_use_original_online_owner_before_any_side_effect);
+	UT_RUN(test_cold_assignment_shape_wrap_alignment_and_budget);
+	UT_RUN(test_cold_assignment_retains_complete_bounded_original_payload);
+	UT_RUN(test_cold_assignment_original_owner_gates_and_cleanup);
 	UT_RUN(test_cold_standalone_cache_shape_and_unaligned_payload);
 	UT_RUN(test_cold_standalone_cache_reserves_one_copy_and_keeps_pi_nonexecuting);
 	UT_RUN(test_cold_standalone_cache_uses_original_owner_and_full_set_preflight);

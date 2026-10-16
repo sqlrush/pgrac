@@ -4,6 +4,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/subtrans.h"
 
 #include "access/clog.h"
 #include "cluster/cluster_multixact.h"
@@ -73,6 +74,41 @@ cluster_undo_recovery_origin_authorized_v1(int origin_node pg_attribute_unused()
 }
 
 char *DatabasePath;
+
+bool
+rf_side_xact_assignment_preflight_v1(const uint8 *payload pg_attribute_unused(),
+									 uint32 length pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
+bool
+cluster_subtrans_native_recovery_preflight_v1(int o pg_attribute_unused(),
+											  TransactionId t pg_attribute_unused(),
+											  int n pg_attribute_unused(),
+											  const TransactionId *c pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
+bool
+cluster_subtrans_native_recovery_apply_v1(int o pg_attribute_unused(),
+										  TransactionId t pg_attribute_unused(),
+										  int n pg_attribute_unused(),
+										  const TransactionId *c pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
+bool
+cluster_subtrans_native_recovery_verify_v1(int o pg_attribute_unused(),
+										   TransactionId t pg_attribute_unused(),
+										   int n pg_attribute_unused(),
+										   const TransactionId *c pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
 
 bool
 rf_side_standby_invalidation_preflight_v1(const uint8 *payload pg_attribute_unused(),

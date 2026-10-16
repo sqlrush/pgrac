@@ -31,6 +31,7 @@
 #include "cluster/cluster_undo_recovery.h"
 #include "storage/standbydefs.h"
 #include "storage/standby.h"
+#include "storage/proc.h"
 
 #define RF_SIDE_XACT_KNOWN_XINFO                                                                   \
 	(XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_SUBXACTS | XACT_XINFO_HAS_RELFILELOCATORS              \
@@ -81,6 +82,36 @@ side_xact_payload_copy(const uint8 *payload, uint32 length)
 	if (copy != NULL)
 		memcpy(copy, payload, length);
 	return copy;
+}
+
+/* Native AssignTransactionId emits at most this process-local xid array.
+ * Decode by copy: the retained payload need not be aligned. Membership is
+ * not an immediate-parent chain, a terminal proof or an allocator watermark. */
+bool
+rf_side_xact_assignment_preflight_v1(const uint8 *payload, uint32 length)
+{
+	xl_xact_assignment header;
+	TransactionId previous;
+
+	if (payload == NULL || length < MinSizeOfXactAssignment)
+		return false;
+	memcpy(&header, payload, MinSizeOfXactAssignment);
+	if (!TransactionIdIsNormal(header.xtop) || header.nsubxacts <= 0
+		|| header.nsubxacts > PGPROC_MAX_CACHED_SUBXIDS
+		|| length != MinSizeOfXactAssignment + (Size)header.nsubxacts * sizeof(TransactionId))
+		return false;
+	previous = header.xtop;
+	for (int i = 0; i < header.nsubxacts; i++) {
+		TransactionId child;
+
+		memcpy(&child, payload + MinSizeOfXactAssignment + (Size)i * sizeof(child), sizeof(child));
+		if (!TransactionIdIsNormal(child) || (uint32)(child - previous) == 0
+			|| (uint32)(child - previous) >= UINT32_C(0x80000000)
+			|| (uint32)(child - header.xtop) >= UINT32_C(0x80000000))
+			return false;
+		previous = child;
+	}
+	return true;
 }
 
 static bool

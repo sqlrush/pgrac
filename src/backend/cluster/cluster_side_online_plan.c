@@ -751,6 +751,8 @@ side_native_control_valid(XLogReaderState *reader, const RfPageOnlineRecordIdent
 	if (XLogRecMaxBlockId(reader) >= 0 || reader->record->has_page_version_edge
 		|| (length > 0 && data == NULL) || (XLogRecGetInfo(reader) & XLR_INFO_MASK) != 0)
 		return false;
+	if (XLogRecGetRmid(reader) == RM_XACT_ID)
+		return info == XLOG_XACT_ASSIGNMENT && rf_side_xact_assignment_preflight_v1(data, length);
 	if (XLogRecGetRmid(reader) == RM_STANDBY_ID)
 		return side_native_standby_valid(data, length, info);
 	if (XLogRecGetRmid(reader) == RM_CLUSTER_XID_STRIPE_ID)
@@ -855,7 +857,10 @@ side_decode_record(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *recor
 	memset(candidate, 0, sizeof(*candidate));
 	*payload = NULL;
 	if (record_plan->route.record_owner == RF_ROUTE_OWNER_SIDE_TYPED) {
-		if (((record_plan->route.rmid == RM_XLOG_ID || record_plan->route.rmid == RM_STANDBY_ID)
+		if (((record_plan->route.rmid == RM_XLOG_ID || record_plan->route.rmid == RM_STANDBY_ID
+			  || (record_plan->route.rmid == RM_XACT_ID
+				  && (XLogRecGetInfo(record_plan->source_record) & ~XLR_INFO_MASK)
+						 == XLOG_XACT_ASSIGNMENT))
 			 && record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_STANDARD)
 			|| (record_plan->route.rmid == RM_CLUSTER_XID_STRIPE_ID
 				&& record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_XID_STRIPE_SHMEM)) {
@@ -990,8 +995,11 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 			  && candidate.xact.cold_completion_effects)
 			 || (candidate.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
 				 && plan->purpose == RF_SIDE_PLAN_RECOVERY
-				 && candidate.identity.record.rmid == RM_STANDBY_ID
-				 && (candidate.identity.record.info & ~XLR_INFO_MASK) == XLOG_INVALIDATIONS))
+				 && ((candidate.identity.record.rmid == RM_STANDBY_ID
+					  && (candidate.identity.record.info & ~XLR_INFO_MASK) == XLOG_INVALIDATIONS)
+					 || (candidate.identity.record.rmid == RM_XACT_ID
+						 && (candidate.identity.record.info & ~XLR_INFO_MASK)
+								== XLOG_XACT_ASSIGNMENT))))
 			&& candidate.owned_payload_length > plan->cold_completion_scratch_bytes) {
 			Size extra = candidate.owned_payload_length - plan->cold_completion_scratch_bytes;
 
