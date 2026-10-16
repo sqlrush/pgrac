@@ -4022,6 +4022,60 @@ dump_ko(ReturnSetInfo *rsinfo)
 		emit_row(rsinfo, "ko", key,
 				 fmt_int64((int64)cluster_ko_origin_checkpoint_wait_count(reason)));
 	}
+	{
+		ClusterKoOriginCheckpointPendingV1 pending = {0};
+		bool valid = cluster_ko_origin_checkpoint_pending_identity(&pending);
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_identity_valid",
+				 fmt_int64(valid ? 1 : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_registry_slot",
+				 fmt_int64(valid ? (int64)pending.registry_slot : -1));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_spc_oid",
+				 fmt_int64(valid ? (int64)pending.locator.spcOid : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_db_oid",
+				 fmt_int64(valid ? (int64)pending.locator.dbOid : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_rel_number",
+				 fmt_int64(valid ? (int64)pending.locator.relNumber : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_fork",
+				 fmt_int64(valid ? (int64)pending.forknum : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_block",
+				 fmt_int64(valid ? (int64)pending.blocknum : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_binding_generation",
+				 fmt_int64(valid ? (int64)pending.binding_generation : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_local_pi_revision",
+				 fmt_int64(valid ? (int64)pending.local_pi_revision : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_pcm_state",
+				 fmt_int64(valid ? (int64)pending.pcm_state : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_current_holder",
+				 fmt_int64(valid ? (int64)pending.current_holder_node : -1));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_master_holder",
+				 fmt_int64(valid ? (int64)pending.master_holder_node : -1));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_master_node",
+				 fmt_int64(valid ? (int64)pending.master_node : -1));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_x_requester",
+				 fmt_int64(valid ? (int64)pending.pending_x_requester_node : -1));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_s_holders",
+				 fmt_int64(valid ? (int64)pending.s_holders_bitmap : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_pi_holders",
+				 fmt_int64(valid ? (int64)pending.pi_holders_bitmap : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_pi_first_source_node",
+				 fmt_int64(valid ? (int64)pending.pi_source_node_first : -1));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_pi_first_source_boot",
+				 fmt_int64(valid ? (int64)pending.pi_source_boot_first : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_pi_first_source_slot",
+				 fmt_int64(valid ? (int64)pending.pi_source_slot_first : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_pi_last_source_node",
+				 fmt_int64(valid ? (int64)pending.pi_source_node_last : -1));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_pi_last_source_boot",
+				 fmt_int64(valid ? (int64)pending.pi_source_boot_last : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_pi_last_source_slot",
+				 fmt_int64(valid ? (int64)pending.pi_source_slot_last : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_predicate_mask",
+				 fmt_int64(valid ? (int64)pending.pending_predicate_mask : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_first_token",
+				 fmt_int64(valid ? (int64)pending.first_token : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_last_token",
+				 fmt_int64(valid ? (int64)pending.last_token : 0));
+	}
 }
 
 /*

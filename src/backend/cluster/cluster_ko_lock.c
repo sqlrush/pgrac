@@ -263,6 +263,8 @@ typedef struct ClusterKoShared {
 	pg_atomic_uint64 origin_checkpoint_restart_count[CLUSTER_KO_ORIGIN_REASON_COUNT];
 	pg_atomic_uint64 origin_checkpoint_wait_count[CLUSTER_KO_ORIGIN_REASON_COUNT];
 	pg_atomic_uint64 origin_checkpoint_logged_mask;
+	pg_atomic_uint64 origin_checkpoint_pending_logged_mask;
+	ClusterKoOriginCheckpointPendingV1 origin_checkpoint_pending;
 	pg_atomic_uint32 inbound_head;		 /* consumer (SI Broadcaster aux) */
 	pg_atomic_uint32 inbound_tail;		 /* producer (LMON IC handler) */
 	ClusterKoInboundSlot inbound[CLUSTER_KO_INBOUND_CAPACITY];
@@ -510,6 +512,10 @@ cluster_ko_shmem_init(void)
 			pg_atomic_init_u64(&ko_state->origin_checkpoint_wait_count[i], 0);
 		}
 		pg_atomic_init_u64(&ko_state->origin_checkpoint_logged_mask, 0);
+		pg_atomic_init_u64(&ko_state->origin_checkpoint_pending_logged_mask, 0);
+		memset(&ko_state->origin_checkpoint_pending, 0,
+			   sizeof(ko_state->origin_checkpoint_pending));
+		ko_state->origin_checkpoint_pending.registry_slot = UINT32_MAX;
 		pg_atomic_init_u32(&ko_state->inbound_head, 0);
 		pg_atomic_init_u32(&ko_state->inbound_tail, 0);
 		SpinLockInit(&ko_state->shared_lock);
@@ -655,6 +661,20 @@ cluster_ko_origin_checkpoint_wait_count(const char *reason)
 	return ko_state != NULL && index >= 0
 		? pg_atomic_read_u64(&ko_state->origin_checkpoint_wait_count[index])
 		: 0;
+}
+
+bool
+cluster_ko_origin_checkpoint_pending_identity(ClusterKoOriginCheckpointPendingV1 *out)
+{
+	bool valid;
+
+	if (out == NULL || ko_state == NULL)
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	*out = ko_state->origin_checkpoint_pending;
+	valid = out->valid;
+	SpinLockRelease(&ko_state->shared_lock);
+	return valid;
 }
 
 
@@ -3761,6 +3781,66 @@ ko_origin_checkpoint_cut_current(const ClusterKoCompletionV2 *owned,
 		&& memcmp(gate, &current, sizeof(current)) == 0;
 }
 
+/* The scanner supplies this value while holding the exact registry entry lock.
+ * Keep the last value in the existing KO dump region and emit one complete
+ * identity record for this reason.  This is observation only; no field below
+ * is consumed as a retirement or DATA proof. */
+static void
+ko_origin_checkpoint_record_pending_identity(const ClusterPcmPiPendingIdentityV1 *pending)
+{
+	ClusterKoOriginCheckpointPendingV1 snapshot;
+	uint64 bit, previous;
+
+	if (ko_state == NULL || pending == NULL)
+		return;
+	snapshot = (ClusterKoOriginCheckpointPendingV1) {
+		.registry_slot = pending->registry_slot,
+		.locator = BufTagGetRelFileLocator(&pending->tag),
+		.forknum = pending->tag.forkNum,
+		.blocknum = pending->tag.blockNum,
+		.binding_generation = pending->binding_generation,
+		.local_pi_revision = pending->local_pi_revision,
+		.pcm_state = pending->pcm_state,
+		.current_holder_node = pending->current_holder_node,
+		.master_holder_node = pending->master_holder_node,
+		.master_node = pending->master_node,
+		.pending_x_requester_node = pending->pending_x_requester_node,
+		.s_holders_bitmap = pending->s_holders_bitmap,
+		.pi_holders_bitmap = pending->pi_holders_bitmap,
+		.pi_source_node_first = pending->pi_source_node_first,
+		.pi_source_node_last = pending->pi_source_node_last,
+		.pi_source_boot_first = pending->pi_source_boot_first,
+		.pi_source_boot_last = pending->pi_source_boot_last,
+		.pi_source_slot_first = pending->pi_source_slot_first,
+		.pi_source_slot_last = pending->pi_source_slot_last,
+		.pending_predicate_mask = pending->pending_predicate_mask,
+		.first_token = pending->local_pi_first.token,
+		.last_token = pending->local_pi_last.token,
+		.valid = pending->valid
+	};
+	SpinLockAcquire(&ko_state->shared_lock);
+	ko_state->origin_checkpoint_pending = snapshot;
+	SpinLockRelease(&ko_state->shared_lock);
+
+	bit = UINT64CONST(1) << CLUSTER_KO_ORIGIN_REASON_PI_SCAN_PENDING;
+	previous = pg_atomic_fetch_or_u64(&ko_state->origin_checkpoint_pending_logged_mask, bit);
+	if ((previous & bit) == 0) {
+		ereport(LOG,
+			(errmsg("native DROP origin checkpoint pi_scan_pending identity valid=%s slot=%u locator=%u/%u/%u fork=%u block=%u binding_generation=" UINT64_FORMAT " local_pi_revision=" UINT64_FORMAT " pcm_state=%u current_holder=%d master_holder=%d master_node=%d pending_x_requester=%d s_holders=%u pi_holders=%u predicate_mask=0x%08X pi_first_source_node=%d pi_first_source_boot=" UINT64_FORMAT " pi_first_source_slot=%u pi_last_source_node=%d pi_last_source_boot=" UINT64_FORMAT " pi_last_source_slot=%u pi_first_token=" UINT64_FORMAT " pi_last_token=" UINT64_FORMAT,
+				snapshot.valid ? "true" : "false",
+				snapshot.registry_slot, snapshot.locator.spcOid, snapshot.locator.dbOid,
+				snapshot.locator.relNumber, snapshot.forknum, snapshot.blocknum,
+				snapshot.binding_generation, snapshot.local_pi_revision, snapshot.pcm_state,
+				snapshot.current_holder_node, snapshot.master_holder_node, snapshot.master_node,
+				snapshot.pending_x_requester_node, snapshot.s_holders_bitmap,
+				snapshot.pi_holders_bitmap, snapshot.pending_predicate_mask,
+				snapshot.pi_source_node_first, snapshot.pi_source_boot_first,
+				snapshot.pi_source_slot_first, snapshot.pi_source_node_last,
+				snapshot.pi_source_boot_last, snapshot.pi_source_slot_last,
+				 snapshot.first_token, snapshot.last_token)));
+	}
+}
+
 /* Record one exact local predicate without making the observation an
  * authority.  Counters live in the existing KO dump region; the first log
  * per reason is guarded by a shared bit so concurrent origin backends do not
@@ -3943,11 +4023,16 @@ ko_native_origin_checkpoint(ClusterKoCompletionV2 *owned)
 			}
 		}
 		if (phase == 3) {
+			ClusterPcmPiPendingIdentityV1 pending_identity;
+			ClusterPcmPiRelationScanV2 scan;
 			uint32 start = cursor;
-			ClusterPcmPiRelationScanV2 scan
-				= cluster_pcm_lock_ko_local_relation_scan_v3(locator, gate.formation, 128, &cursor);
+
+			memset(&pending_identity, 0, sizeof(pending_identity));
+			scan = cluster_pcm_lock_ko_local_relation_scan_v3_identity(locator, gate.formation,
+				128, &cursor, &pending_identity);
 			if (scan == CLUSTER_PCM_PI_RELATION_PENDING) {
 				wait_reason = CLUSTER_KO_ORIGIN_REASON_PI_SCAN_PENDING;
+				ko_origin_checkpoint_record_pending_identity(&pending_identity);
 				ko_origin_checkpoint_record(wait_reason, true, locator, phase, cursor, revision,
 					saved_revision, wb_revision, &gate);
 				/* A pending local owner is the current bounded scan item.  Keep

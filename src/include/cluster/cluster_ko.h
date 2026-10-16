@@ -155,6 +155,39 @@ typedef struct ClusterKoSharedMessageV3 {
 	uint64 space_mutation_token;
 } ClusterKoSharedMessageV3;
 
+/* Last exact local PI identity observed by the native origin checkpoint.
+ * Values are diagnostic snapshots only and never grant a retirement or DATA
+ * proof.  A source node/boot of -1/0 explicitly means the retained WAL ref
+ * could not expose that identity, rather than guessing from a slot number. */
+typedef struct ClusterKoOriginCheckpointPendingV1 {
+	uint32 registry_slot;
+	RelFileLocator locator;
+	uint32 forknum;
+	uint32 blocknum;
+	uint64 binding_generation;
+	uint64 local_pi_revision;
+	uint32 pcm_state;
+	int32 current_holder_node;
+	int32 master_holder_node;
+	int32 master_node;
+	int32 pending_x_requester_node;
+	uint32 s_holders_bitmap;
+	uint32 pi_holders_bitmap;
+	int32 pi_source_node_first;
+	int32 pi_source_node_last;
+	uint64 pi_source_boot_first;
+	uint64 pi_source_boot_last;
+	uint16 pi_source_slot_first;
+	uint16 pi_source_slot_last;
+	uint32 pending_predicate_mask;
+	uint64 first_token;
+	uint64 last_token;
+	bool valid;
+} ClusterKoOriginCheckpointPendingV1;
+
+extern bool cluster_ko_origin_checkpoint_pending_identity(
+	ClusterKoOriginCheckpointPendingV1 *out);
+
 /* The original peer owner retains this exact operation through publication.
  * A handle is process-independent, but is neither a READY nor an AX proof. */
 typedef enum ClusterKoPeerFenceStateV3 {

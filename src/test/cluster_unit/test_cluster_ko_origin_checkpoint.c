@@ -193,6 +193,30 @@ UT_TEST(test_origin_checkpoint_publishes_pi_scan_wait_reason)
 	native_fixture_shared_memory_end();
 }
 
+UT_TEST(test_origin_checkpoint_publishes_pending_slot_identity)
+{
+	ClusterKoOriginCheckpointPendingV1 pending;
+
+	prepare_origin();
+	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_PENDING;
+	local_writeback_closed = false;
+	origin_wait_hook = finish_origin_local_owners;
+	run_origin(CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+	UT_ASSERT(cluster_ko_origin_checkpoint_pending_identity(&pending));
+	UT_ASSERT(pending.valid);
+	UT_ASSERT_EQ(pending.registry_slot, 530);
+	UT_ASSERT_EQ(pending.locator.spcOid, origin_relation.rd_locator.spcOid);
+	UT_ASSERT_EQ(pending.locator.dbOid, origin_relation.rd_locator.dbOid);
+	UT_ASSERT_EQ(pending.locator.relNumber, origin_relation.rd_locator.relNumber);
+	UT_ASSERT_EQ(pending.forknum, (uint32)SPACE_FORKNUM);
+	UT_ASSERT_EQ(pending.blocknum, 0);
+	UT_ASSERT_EQ(pending.pcm_state, PCM_STATE_N);
+	UT_ASSERT_EQ(pending.current_holder_node, -1);
+	UT_ASSERT_EQ(pending.master_node, 0);
+	UT_ASSERT(pending.pending_predicate_mask != 0);
+	native_fixture_shared_memory_end();
+}
+
 static ClusterBufferDrainResult
 resume_origin_buffer(bool flush, uint32 *budget, uint32 *cursor)
 {
@@ -347,7 +371,7 @@ UT_TEST(test_in_place_truncate_keeps_its_original_origin_path)
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(15);
 	UT_RUN(test_origin_joins_checkpoint_before_native_producer_returns);
 	UT_RUN(test_origin_fence_blocks_new_work_while_old_work_drains);
 	UT_RUN(test_origin_cancel_retains_accepted_operation_without_closed_result);
@@ -355,6 +379,7 @@ main(void)
 	UT_RUN(test_origin_pi_pending_resumes_from_bounded_cursor);
 	UT_RUN(test_origin_waits_for_local_protocol_and_physical_ack_owners);
 	UT_RUN(test_origin_checkpoint_publishes_pi_scan_wait_reason);
+	UT_RUN(test_origin_checkpoint_publishes_pending_slot_identity);
 	UT_RUN(test_origin_resumes_bounded_prefix_only_under_the_same_gate);
 	UT_RUN(test_only_exact_native_space_writer_can_enter_after_old_data_closed);
 	UT_RUN(test_origin_rechecks_atomic_gate_at_closed_publication);

@@ -365,6 +365,44 @@ cluster_pcm_lock_ko_local_relation_scan_v3(RelFileLocator locator, uint64 epoch,
 	return local_relation_scan_result;
 }
 
+ClusterPcmPiRelationScanV2
+cluster_pcm_lock_ko_local_relation_scan_v3_identity(RelFileLocator locator, uint64 epoch,
+														 uint32 budget, uint32 *cursor,
+														 ClusterPcmPiPendingIdentityV1 *pending_out)
+{
+	ClusterPcmPiRelationScanV2 result
+		= cluster_pcm_lock_ko_local_relation_scan_v3(locator, epoch, budget, cursor);
+
+	if (result == CLUSTER_PCM_PI_RELATION_PENDING && pending_out != NULL) {
+		memset(pending_out, 0, sizeof(*pending_out));
+		pending_out->registry_slot = 530;
+		pending_out->tag = (BufferTag) {
+			.spcOid = 1663,
+			.dbOid = 5,
+			.relNumber = 99,
+			.forkNum = SPACE_FORKNUM,
+			.blockNum = 0
+		};
+		pending_out->binding_generation = 75;
+		pending_out->local_pi_revision = 1;
+		pending_out->pcm_state = PCM_STATE_N;
+		pending_out->current_holder_node = -1;
+		pending_out->master_holder_node = -1;
+		pending_out->master_node = 0;
+		pending_out->pi_source_node_first = 0;
+		pending_out->pi_source_node_last = 0;
+		pending_out->pi_source_boot_first = 11;
+		pending_out->pi_source_boot_last = 11;
+		pending_out->pi_source_slot_first = 1;
+		pending_out->pi_source_slot_last = 1;
+		pending_out->pending_predicate_mask = CLUSTER_PCM_PI_PENDING_LOCAL_PI;
+		pending_out->local_pi_first.token = 6398;
+		pending_out->local_pi_last.token = 6398;
+		pending_out->valid = true;
+	}
+	return result;
+}
+
 bool
 cluster_pi_writeback_local_relation_closed_v3(RelFileLocator locator, uint64 formation,
 											  uint64 *revision)
