@@ -173,6 +173,7 @@ static bool cold_completion_test, cold_source_ready, cold_source_fail, cold_sour
 static bool cold_stats_throw, cold_stats_expire;
 static unsigned cold_source_calls, cold_source_order, cold_stats_calls, cold_stats_gc;
 static unsigned cold_stats_order;
+static bool cold_source_barrier_test, cold_source_drift;
 HotStandbyState standbyState = STANDBY_DISABLED;
 static bool cold_locks_test, cold_locks_throw, cold_locks_expire;
 static unsigned cold_locks_calls, cold_locks_order;
@@ -241,13 +242,19 @@ char *DatabasePath;
 bool
 cluster_undo_recovery_cold_source_sync_v1(int node)
 {
-	UT_ASSERT(cold_completion_test && canonical_scope != NULL && node == 2);
-	UT_ASSERT_EQ(canonical_writes, 0);
+	UT_ASSERT(canonical_scope != NULL && node == 2);
+	/* The real helper caches only within the qualified scope, not by xid or
+	 * a process-global successful sync from a previous replay attempt. */
+	if (canonical_scope->wal_synced)
+		return true;
+	if (cold_completion_test || cold_source_barrier_test)
+		UT_ASSERT_EQ(canonical_writes, 0);
 	cold_source_calls++;
 	cold_source_order = ++prepare_apply.next_order;
 	if (cold_source_throw)
 		pg_re_throw();
 	cold_source_ready = !cold_source_fail;
+	canonical_scope->wal_synced = cold_source_ready;
 	return cold_source_ready;
 }
 
@@ -309,6 +316,8 @@ ProcessCommittedInvalidationMessages(const SharedInvalidationMessage *msgs, int 
 	UT_ASSERT_EQ(msgs[1].cat.id, SHAREDINVALCATALOG_ID);
 	UT_ASSERT_EQ(msgs[1].cat.dbId, InvalidOid);
 	UT_ASSERT_EQ(msgs[1].cat.catId, 1260);
+	if (cold_source_barrier_test)
+		UT_ASSERT(cold_source_ready && cold_source_calls == 1);
 	cold_cache_calls++;
 	cold_cache_order = ++prepare_apply.next_order;
 	if (cold_cache_throw) {
@@ -331,6 +340,11 @@ cluster_undo_recovery_scope_enter_v1(ClusterUndoRecoveryScopeV1 *scope,
 {
 	UT_ASSERT((canonical_file != NULL || control_scope_test) && canonical_scope == NULL
 			  && plan != NULL && authority != NULL);
+	memset(scope, 0, sizeof(*scope));
+	scope->authority = authority;
+	scope->plan = plan;
+	scope->duty = *authority->duty;
+	cold_source_ready = false;
 	if (control_scope_test) {
 		if (control_scope_denied)
 			return false;
@@ -408,6 +422,8 @@ cluster_clog_native_recovery_record_apply_v1(int origin, const ClusterSideProjec
 	UT_ASSERT_EQ(op->kind, CLUSTER_SIDE_PROJECTION_CLOG);
 	UT_ASSERT_EQ(op->page_number, 97);
 	UT_ASSERT_EQ(cold_clog_record_projections, 0);
+	if (cold_source_barrier_test)
+		UT_ASSERT(cold_source_ready && cold_source_calls == 1);
 	cold_clog_applies++;
 	if (cold_clog_throw)
 		siglongjmp(*PG_exception_stack, 1);
@@ -439,6 +455,8 @@ cluster_clog_native_recovery_apply_v1(int origin, TransactionId xid, int count,
 	UT_ASSERT_EQ(status,
 				 cold_abort_test ? TRANSACTION_STATUS_ABORTED : TRANSACTION_STATUS_COMMITTED);
 	UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 0);
+	if (cold_source_barrier_test)
+		UT_ASSERT(cold_source_ready && cold_source_calls == 1);
 	cold_clog_applies++;
 	if (cold_clog_throw)
 		siglongjmp(*PG_exception_stack, 1);
@@ -501,6 +519,8 @@ cluster_undo_smgr_write_block(ClusterUndoPathIntent intent, uint32 segment, uint
 {
 	UT_ASSERT(canonical_scope != NULL && intent == CLUSTER_UNDO_PATH_RECOVERY_SHARED);
 	UT_ASSERT(segment == 513 && instance == 3 && (block == 0 || block == 9) && sync);
+	if (cold_source_barrier_test)
+		UT_ASSERT(cold_source_ready && cold_source_calls == 1);
 	canonical_writes++;
 	if (ctrc_io_fault == 1)
 		return false;
@@ -609,6 +629,8 @@ rf_side_online_projection_apply_owned_v1(void *arg, const RfSideOnlineOperationV
 	if (cold_mx_test) {
 		UT_ASSERT(arg != NULL && op != NULL);
 		UT_ASSERT(cold_mx_online || cold_mx_preflights >= 2);
+		if (cold_source_barrier_test)
+			UT_ASSERT(cold_source_ready && cold_source_calls == 1);
 		cold_mx_projections++;
 		return true;
 	}
@@ -3737,6 +3759,7 @@ UT_TEST(test_cold_owner_multixact_preflights_whole_set_before_projection)
 		cold_mx_preflight_fail = fault == 2;
 		cold_mx_throw = fault == 3;
 		cold_mx_preflights = cold_mx_projections = 0;
+		cold_source_calls = 0;
 		UT_ASSERT(rf_side_online_production_owner_init_v1(&owner, &authority,
 														  canonical_authority_fresh, 19, true));
 		UT_ASSERT(rf_side_online_production_bind_undo_v1(&owner, &authority));
@@ -3754,6 +3777,9 @@ UT_TEST(test_cold_owner_multixact_preflights_whole_set_before_projection)
 			UT_ASSERT_EQ(result, fault == 0 || fault == 4 ? RF_PAGE_PROOF_DETAIL_OK
 														  : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
 		UT_ASSERT_EQ(cold_mx_projections, fault == 0 || fault == 4 ? 1 : 0);
+		/* Rejected full-set preflight and ONLINE never reach the cold
+		 * barrier, including a valid first record followed by an invalid one. */
+		UT_ASSERT_EQ(cold_source_calls, fault == 0 ? 1 : 0);
 		UT_ASSERT_EQ(owner.protected_set_complete, fault == 0 || fault == 4);
 		UT_ASSERT(canonical_scope == NULL && !owner.protected_set_active);
 		cold_mx_test = cold_mx_online = cold_mx_preflight_fail = cold_mx_throw = false;
@@ -7089,12 +7115,16 @@ UT_TEST(test_cold_foreign_control_consumes_no_founder_or_transaction_effects)
 			UT_ASSERT_EQ(rf_side_online_production_preflight_v1(plan, &owner),
 						 RF_PAGE_PROOF_DETAIL_OK);
 			UT_ASSERT_EQ(control_observe_calls, 0);
+			UT_ASSERT_EQ(cold_source_calls, 0);
 			UT_ASSERT_EQ(rf_side_online_production_apply_v1(plan, &owner), RF_PAGE_PROOF_DETAIL_OK);
 			UT_ASSERT_EQ(control_observe_calls, 2);
 			UT_ASSERT_EQ(control_observed_scn, 701);
 			UT_ASSERT(owner.protected_set_complete);
-			UT_ASSERT_EQ(canonical_writes + canonical_syncs + cold_cache_calls + cold_source_calls
-							 + cold_clog_applies + cold_clog_verifies + cold_locks_calls
+			/* The whole cold source barrier is durability, not replay of the
+			 * foreign founder/checkpoint or any transaction effect. */
+			UT_ASSERT_EQ(cold_source_calls, 1);
+			UT_ASSERT_EQ(canonical_writes + canonical_syncs + cold_cache_calls + cold_clog_applies
+							 + cold_clog_verifies + cold_locks_calls
 							 + prepare_apply.terminal_projection_stores,
 						 0);
 			UT_ASSERT(canonical_scope == NULL && canonical_writer_depth == 0
@@ -8262,10 +8292,137 @@ UT_TEST(test_cold_initial_ctrc_release_preserves_failed_io_and_scope_responsibil
 	}
 }
 
+static bool
+source_barrier_authority_fresh(void *arg)
+{
+	return arg != NULL && !(cold_source_drift && cold_source_calls != 0);
+}
+
+UT_TEST(test_cold_whole_source_barrier_precedes_every_native_effect)
+{
+	/* Actual immutable plan and production owner. Source durability and
+	 * native CLOG/MX/cache IO are fixtures; canonical TT uses a real file. */
+	for (int family = 0; family < 4; family++)
+		for (int fault = 0; fault < 4; fault++) {
+			RfSideOnlinePlanV1 *plan;
+			ClusterRecoveryDutyKey duty = canonical_duty;
+			ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
+			ClusterThreadRecoveryAuthorityV1 authority = { .duty = &duty, .serial_guard = &guard };
+			RfSideOnlineProductionOwnerV1 *owner = calloc(1, sizeof(*owner));
+			volatile RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_INTERNAL;
+			volatile bool caught = false;
+			FakeXactRecord fake;
+
+			reset_prepare_apply();
+			cold_source_barrier_test = true;
+			cold_source_calls = cold_source_order = 0;
+			cold_source_ready = false;
+			cold_source_fail = fault == 1;
+			cold_source_throw = fault == 2;
+			cold_source_drift = fault == 3;
+			canonical_writes = canonical_syncs = 0;
+			cold_mx_preflights = cold_mx_projections = 0;
+			cold_clog_applies = cold_clog_verifies = cold_clog_record_projections = 0;
+			cold_cache_calls = control_observe_calls = 0;
+			cold_mx_test = family == 0;
+			cold_clog_test = family == 1 || family == 2;
+			cold_clog_record_test = family == 1;
+			control_scope_test = family != 2;
+			cold_standalone_cache_test = cold_cache_test = cold_cache_init = family == 3;
+			control_scope_fault = 0;
+			control_fresh = true;
+			duty.system_identifier = UINT64_C(0x11223344);
+			duty.origin_owner_incarnation = 9;
+			memset(duty.storage_uuid, 0x44, 16);
+			if (family == 3)
+				plan = cold_standalone_cache_plan(0);
+			else {
+				plan = space_online_plan(family == 2 ? 300 : 200);
+				if (family == 2) {
+					PGAlignedBlock initial;
+
+					undo_header_bind(&fake, 0);
+					undo_header_feed(plan, &fake, 100);
+					undo_header_commit(&fake, 0, 802);
+					undo_header_feed(plan, &fake, 200);
+					canonical_file = tmpfile();
+					UT_ASSERT(canonical_file != NULL);
+					UT_ASSERT_EQ(ftruncate(fileno(canonical_file), UNDO_SEGMENT_SIZE_BYTES), 0);
+					cluster_undo_segment_make_header_bytes(513, 3, initial.data);
+					UT_ASSERT_EQ(pwrite(fileno(canonical_file), initial.data, BLCKSZ, 0), BLCKSZ);
+					UT_ASSERT_EQ(fsync(fileno(canonical_file)), 0);
+					canonical_expected_xid = 802;
+					canonical_expected_wrap = 7;
+				} else {
+					RfPageOnlineRecordIdentityV1 identity;
+					RfDetachedRecordPlanV1 record;
+					uint8 uuid[16];
+					int page = family == 0 ? 0 : 97;
+
+					make_projection_record(&fake, family == 0 ? RM_MULTIXACT_ID : RM_CLOG_ID,
+										   family == 0 ? XLOG_MULTIXACT_ZERO_OFF_PAGE
+													   : CLOG_ZEROPAGE,
+										   &page, sizeof(page));
+					memset(uuid, 0x44, sizeof(uuid));
+					identity = make_identity(&fake, uuid);
+					set_identity_range(&fake, &identity, 100, 200);
+					record = make_projection_record_plan(&fake);
+					UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &record, &identity),
+								 RF_PAGE_PROOF_DETAIL_OK);
+				}
+				UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+			}
+			UT_ASSERT(rf_side_online_production_owner_init_v1(
+				owner, &authority, source_barrier_authority_fresh, 19, true));
+			UT_ASSERT(rf_side_online_production_bind_undo_v1(owner, &authority));
+			/* A read-only target preflight cannot consume this write barrier. */
+			UT_ASSERT_EQ(rf_side_online_production_preflight_v1(plan, owner),
+						 RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT_EQ(cold_source_calls, 0);
+			PG_TRY();
+			{
+				detail = rf_side_online_production_apply_v1(plan, owner);
+			}
+			PG_CATCH();
+			{
+				caught = true;
+			}
+			PG_END_TRY();
+			UT_ASSERT_EQ(caught, fault == 2);
+			if (!caught)
+				UT_ASSERT_EQ(detail, fault == 0 ? RF_PAGE_PROOF_DETAIL_OK
+												: RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+			UT_ASSERT_EQ(cold_source_calls, 1);
+			UT_ASSERT_EQ(owner->protected_set_complete, fault == 0);
+			if (fault != 0) {
+				UT_ASSERT_EQ(canonical_writes + canonical_syncs + cold_clog_applies
+								 + cold_clog_verifies + cold_clog_record_projections
+								 + cold_mx_projections + cold_cache_calls + control_observe_calls
+								 + prepare_apply.terminal_projection_stores,
+							 0);
+			}
+			UT_ASSERT(canonical_scope == NULL && canonical_writer_depth == 0
+					  && owner->undo_headers == NULL && !owner->protected_set_active);
+			if (canonical_file != NULL) {
+				UT_ASSERT_EQ(fclose(canonical_file), 0);
+				canonical_file = NULL;
+			}
+			free(owner);
+			rf_side_online_plan_destroy_v1(&plan);
+			cold_source_barrier_test = cold_source_fail = cold_source_throw = cold_source_drift
+				= false;
+			cold_mx_test = cold_clog_test = cold_clog_record_test = control_scope_test = false;
+			cold_standalone_cache_test = cold_cache_test = cold_cache_init = false;
+			cold_source_ready = false;
+			canonical_expected_xid = 818;
+			canonical_expected_wrap = 8;
+		}
+}
+
 int
 main(void)
 {
-	UT_PLAN(110);
+	UT_PLAN(111);
 	UT_RUN(test_cold_compound_drop_classifies_the_complete_native_record);
 	UT_RUN(test_cold_compound_drop_rejects_partial_or_unknown_effects);
 	UT_RUN(test_cold_compound_drop_owns_all_effects_and_original_space_inputs);
@@ -8376,6 +8533,7 @@ main(void)
 	UT_RUN(test_multixact_retired_page_requires_exact_later_sealed_truncate);
 	UT_RUN(test_cold_abort_requires_exact_preceding_immutable_carrier);
 	UT_RUN(test_cold_owner_abort_requires_durable_tt_and_native_clog_before_projection);
+	UT_RUN(test_cold_whole_source_barrier_precedes_every_native_effect);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

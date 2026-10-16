@@ -2537,6 +2537,8 @@ side_plan_apply_active(const RfSideOnlinePlanV1 *plan, const RfSideOnlineApplyOp
 	detail = side_plan_preflight_active(plan, ops);
 	if (detail != RF_PAGE_PROOF_DETAIL_OK)
 		return detail;
+	if (ops->prepare_apply != NULL && !ops->prepare_apply(ops->arg))
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 	for (i = 0; i < plan->operation_count; i++) {
 		RfSideOnlineOperationV1 operation = plan->operations[i];
 		bool applied;

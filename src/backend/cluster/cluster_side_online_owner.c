@@ -314,6 +314,25 @@ side_owner_end_protected_set(void *arg, bool complete)
 }
 
 static bool
+side_owner_prepare_apply(void *arg)
+{
+	RfSideOnlineProductionOwnerV1 *owner = arg;
+
+	if (owner == NULL || !owner->protected_set_active)
+		return false;
+	if (!side_owner_cold_formed(owner))
+		return true;
+	/* Every cold native/TT consumer can make target bytes durable. Bind the
+	 * original source WAL and claim before the first such effect, including
+	 * operations without completion flags. The original helper caches only
+	 * inside this exact scope and revalidates its ROOT/source after IO. */
+	return side_owner_authority_fresh(owner) && owner->undo_authority->duty != NULL
+		   && cluster_undo_recovery_cold_source_sync_v1(
+			   (int)owner->undo_authority->duty->origin_thread_id - 1)
+		   && side_owner_authority_fresh(owner);
+}
+
+static bool
 side_owner_preflight_xact(void *arg, const RfSideOnlineOperationV1 *operation)
 {
 	RfSideOnlineProductionOwnerV1 *owner = (RfSideOnlineProductionOwnerV1 *)arg;
@@ -835,6 +854,7 @@ rf_side_online_production_apply_v1(const RfSideOnlinePlanV1 *plan,
 	ops.source_thread = side_owner_source_thread(owner);
 	ops.begin_protected_set = side_owner_begin_protected_set;
 	ops.end_protected_set = side_owner_end_protected_set;
+	ops.prepare_apply = side_owner_prepare_apply;
 	ops.preflight_xact = side_owner_preflight_xact;
 	ops.preflight_undo = side_owner_preflight_undo;
 	ops.preflight_projection = side_owner_preflight_projection;

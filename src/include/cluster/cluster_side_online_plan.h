@@ -98,6 +98,9 @@ typedef struct RfSideOnlineApplyOpsV1 {
 	/* Zero selects the whole plan. A nonzero original thread selects only
 	 * its operations; this is a selector, never recovery authority. */
 	uint16 source_thread;
+	/* Optional owner barrier after all target preflights and before any
+	 * apply. Not called for preflight-only or an empty selected set. */
+	bool (*prepare_apply)(void *arg);
 } RfSideOnlineApplyOpsV1;
 
 /* Production owner for the RF-SIDE v2 non-authoritative projections.  The
