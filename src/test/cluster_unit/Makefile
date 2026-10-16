@@ -2896,6 +2896,9 @@ test_cluster_wal_checkpoint_sample: test_cluster_wal_checkpoint_sample.c unit_te
 		test_cluster_wal_checkpoint_sample.inc test_cluster_wal_checkpoint_dump.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
+CLUSTER_SIDE_HEAD_READER_O = $(top_builddir)/src/backend/cluster/cluster_recovery_undo_scan.o \
+		$(top_builddir)/src/backend/cluster/cluster_uba.o
+
 test_cluster_pi_contribution: test_cluster_page_data_stable.o
 
 test_cluster_side_xact_stats.inc: $(top_srcdir)/src/backend/utils/activity/pgstat_xact.c Makefile
@@ -2903,14 +2906,14 @@ test_cluster_side_xact_stats.inc: $(top_srcdir)/src/backend/utils/activity/pgsta
 	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_side_xact test_cluster_pi_contribution: %: %.c unit_test.h test_cluster_side_xact.c test_cluster_side_xact_stats.inc test_cluster_undo_header_identity.inc \
-		test_cluster_side_online_owner_product.o \
+test_cluster_side_xact test_cluster_pi_contribution: %: %.c unit_test.h test_cluster_side_xact.c test_cluster_side_xact_stats.inc test_cluster_undo_header_identity.inc test_cluster_heap_small_scn.inc \
+		test_cluster_side_online_owner_product.o $(CLUSTER_SIDE_HEAD_READER_O) \
 		test_cluster_side_xact_budget_product.o $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
 		$(SIDE_XACT_XACTDESC_O) $(SIDE_XACT_TT_2PC_RECORD_O) \
 		test_cluster_side_xact_undo_product.o $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_side_xact_budget_product.o \
-		test_cluster_side_online_owner_product.o \
+		test_cluster_side_online_owner_product.o $(CLUSTER_SIDE_HEAD_READER_O) \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(SIDE_XACT_XACTDESC_O) \
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
 		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
@@ -2942,14 +2945,15 @@ $(CLUSTER_SIDE_ONLINE_OWNER_O): $(top_srcdir)/src/backend/cluster/cluster_side_o
 		$(top_srcdir)/src/include/access/clog.h \
 		$(top_srcdir)/src/include/cluster/cluster_native_startup.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_online_owner.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_undo_scan.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_xact.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(SIDE_OWNER_TEST_CPPFLAGS) \
 		-ffunction-sections -fdata-sections -c $< -o $@
-test_cluster_side_online_owner: test_cluster_side_online_owner.c unit_test.h test_cluster_undo_header_identity.inc \
-		$(CLUSTER_SIDE_ONLINE_OWNER_O) test_cluster_side_xact_undo_product.o \
+test_cluster_side_online_owner: test_cluster_side_online_owner.c unit_test.h test_cluster_undo_header_identity.inc test_cluster_heap_small_scn.inc \
+		$(CLUSTER_SIDE_ONLINE_OWNER_O) $(CLUSTER_SIDE_HEAD_READER_O) test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(SIDE_OWNER_TEST_CPPFLAGS) $< $(CLUSTER_SIDE_ONLINE_OWNER_O) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(SIDE_OWNER_TEST_CPPFLAGS) $< $(CLUSTER_SIDE_ONLINE_OWNER_O) $(CLUSTER_SIDE_HEAD_READER_O) \
 		test_cluster_side_xact_undo_product.o $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
 		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@

@@ -16,11 +16,13 @@
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_native_startup.h"
 #include "cluster/cluster_multixact.h"
+#include "cluster/cluster_recovery_undo_scan.h"
 #include "cluster/cluster_remote_xact.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_side_online_owner.h"
 #include "cluster/cluster_undo_format.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/cluster_uba.h"
 #include "storage/standbydefs.h"
 #include "utils/inval.h"
 
@@ -544,6 +546,42 @@ side_owner_apply_undo(void *arg, const RfSideOnlineOperationV1 *operation)
 		   && cluster_undo_apply_tt_v1(&operation->undo) == CLUSTER_UNDO_APPLY_OK;
 }
 
+/* The record-local header callback cannot make an absent or later undo page
+ * into the selected head's DATA. Bind the complete existing block first. */
+static bool
+side_owner_head_data(RfSideOnlineProductionOwnerV1 *owner, const ClusterUndoDecoded *undo,
+					 const ClusterUndoSmgrRecoveryFileV1 *file,
+					 const RfSideUndoBlockImageV1 *expected, bool sync)
+{
+	PGAlignedBlock current;
+	ClusterRecoveryUndoRecord record;
+	uint32 segment, block;
+	uint16 slot, row;
+
+	if (!side_owner_authority_fresh(owner)
+		|| !uba_decode_record(undo->first_undo_block, &segment, &block, &slot, &row)
+		|| segment != undo->segment_id || slot != undo->slot_offset || !file->exists
+		|| file->size != UNDO_SEGMENT_SIZE_BYTES
+		|| !cluster_undo_smgr_recovery_read_block_v1(segment, undo->instance, block, file,
+													 current.data)
+		|| memcmp(current.data, expected->page.data, BLCKSZ) != 0
+		|| cluster_recovery_undo_record_read(current.data, BLCKSZ, segment, block, undo->instance,
+											 undo->first_undo_block, &record)
+			   != CLUSTER_RECOVERY_UNDO_ENTRY
+		|| record.header.xid != undo->xid || record.header.tt_wrap_plus1 == 0
+		|| record.header.tt_wrap_plus1 - 1 != undo->wrap
+		|| record.header.tt_slot_segment_id != segment
+		|| record.header.tt_slot_id != (uint32)slot + 1)
+		return false;
+	if (sync
+		&& (!cluster_undo_smgr_fsync_segment_file(segment, undo->instance)
+			|| !cluster_undo_smgr_recovery_read_block_v1(segment, undo->instance, block, file,
+														 current.data)
+			|| memcmp(current.data, expected->page.data, BLCKSZ) != 0))
+		return false;
+	return side_owner_authority_fresh(owner);
+}
+
 static bool
 side_owner_apply_undo_header_record(RfSideOnlineProductionOwnerV1 *owner, uint32 index,
 									const RfSideOnlineOperationV1 *operation)
@@ -551,13 +589,14 @@ side_owner_apply_undo_header_record(RfSideOnlineProductionOwnerV1 *owner, uint32
 	const ClusterUndoDecoded *undo = &operation->undo;
 	SideUndoHeader *target;
 	RfSideUndoHeaderImageV1 prefix;
+	RfSideUndoBlockImageV1 head_data;
 	PGAlignedBlock current;
 	bool image;
 
 	if (undo->kind != CLUSTER_UNDO_KIND_SEGMENT_INIT
 		&& undo->kind != CLUSTER_UNDO_KIND_SEGMENT_REUSE
 		&& undo->kind != CLUSTER_UNDO_KIND_SEGMENT_RECYCLE
-		&& undo->kind != CLUSTER_UNDO_KIND_TT_BIND)
+		&& undo->kind != CLUSTER_UNDO_KIND_TT_BIND && undo->kind != CLUSTER_UNDO_KIND_TT_SET_HEAD)
 		return false;
 	target = side_owner_undo_target(owner, undo->instance, undo->segment_id, 0);
 	if (target == NULL
@@ -592,12 +631,20 @@ side_owner_apply_undo_header_record(RfSideOnlineProductionOwnerV1 *owner, uint32
 													 &target->file, current.data)
 		|| memcmp(current.data, target->base.data, BLCKSZ) != 0)
 		return false;
+	if (undo->kind == CLUSTER_UNDO_KIND_TT_SET_HEAD
+		&& (rf_side_online_plan_prepare_undo_head_block_v1(owner->protected_plan, index,
+														   &operation->identity, &head_data)
+				!= RF_PAGE_PROOF_DETAIL_OK
+			|| !side_owner_head_data(owner, undo, &target->file, &head_data, true)))
+		return false;
 	/* Do not install other targets or the whole-source final header. */
 	target->final = prefix;
 	return side_owner_install_target(owner, target)
 		   && cluster_undo_smgr_recovery_read_block_v1(undo->segment_id, undo->instance, 0,
 													   &target->file, current.data)
 		   && memcmp(current.data, prefix.page.data, BLCKSZ) == 0
+		   && (undo->kind != CLUSTER_UNDO_KIND_TT_SET_HEAD
+			   || side_owner_head_data(owner, undo, &target->file, &head_data, false))
 		   && side_owner_authority_fresh(owner);
 }
 
@@ -616,6 +663,10 @@ side_owner_apply_undo_record(void *arg, uint32 index, const RfSideOnlineOperatio
 		|| operation->kind != RF_SIDE_ONLINE_OPERATION_UNDO)
 		return false;
 	undo = &operation->undo;
+	/* Include the selected header/DATA images, nested header preparation and
+	 * the bounded complete-record reader, not only cached target allocations. */
+	if (undo->kind == CLUSTER_UNDO_KIND_TT_SET_HEAD && owner->undo_bytes_remaining < 12 * BLCKSZ)
+		return false;
 	if (undo->kind != CLUSTER_UNDO_KIND_BLOCK_WRITE
 		&& undo->kind != CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI)
 		return side_owner_apply_undo_header_record(owner, index, operation);

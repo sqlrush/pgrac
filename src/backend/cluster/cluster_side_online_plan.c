@@ -18,6 +18,7 @@
 #include "catalog/storage_xlog.h"
 #include "storage/standbydefs.h"
 #include "cluster/cluster_side_online_plan.h"
+#include "cluster/cluster_uba.h"
 #include "cluster/cluster_native_startup.h"
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_xid_stripe_xlog.h"
@@ -1552,7 +1553,7 @@ side_plan_prepare_undo_block(const RfSideOnlinePlanV1 *plan, uint8 instance, uin
 		prepared.source_index = i;
 		prepared.operation_count++;
 	}
-	if (prepared.operation_count == 0)
+	if (!anchored || prepared.operation_count == 0)
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 	*out = prepared;
 	return RF_PAGE_PROOF_DETAIL_OK;
@@ -1752,6 +1753,33 @@ rf_side_online_plan_prepare_undo_record_header_v1(const RfSideOnlinePlanV1 *plan
 												  const char *base, RfSideUndoHeaderImageV1 *out)
 {
 	return side_plan_prepare_undo_record(plan, index, identity, base, true, out);
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_head_block_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+											   const RfPageOnlineRecordIdentityV1 *identity,
+											   RfSideUndoBlockImageV1 *out)
+{
+	const RfSideOnlineOperationV1 *op;
+	uint32 segment, block;
+	uint16 slot, row;
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || plan->failed
+		|| plan->purpose != RF_SIDE_PLAN_RECOVERY || index >= plan->operation_count
+		|| identity == NULL || out == NULL)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	op = &plan->operations[index];
+	if (op->history_only || op->purpose != RF_SIDE_PLAN_RECOVERY
+		|| op->kind != RF_SIDE_ONLINE_OPERATION_UNDO
+		|| op->undo.kind != CLUSTER_UNDO_KIND_TT_SET_HEAD || identity->reserved_zero != 0
+		|| identity->participant_index != op->identity.participant_index
+		|| memcmp(&identity->record, &op->identity.record, sizeof(identity->record)) != 0
+		|| rf_side_online_plan_origin_operation_count_v1(plan, identity->record.origin_thread)
+			   == UINT32_MAX
+		|| !cluster_undo_preflight(&op->undo)
+		|| !uba_decode_record(op->undo.first_undo_block, &segment, &block, &slot, &row))
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	return side_plan_prepare_undo_block(plan, op->undo.instance, segment, block, index, out);
 }
 
 typedef struct SideSpaceSourceInput {
@@ -2694,7 +2722,7 @@ rf_side_online_plan_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index
 		|| identity->reserved_zero != 0
 		|| memcmp(&identity->record, &operation.identity.record, sizeof(identity->record)) != 0)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
-	/* XACT, undo head/terminal effects and SPACE still need their ordered
+	/* XACT, undo terminal effects and SPACE still need their ordered
 	 * consumers. UNDO requires a record-local callback, never apply_undo. */
 	if (operation.kind != RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
 		&& operation.kind != RF_SIDE_ONLINE_OPERATION_PROJECTION
@@ -2704,7 +2732,8 @@ rf_side_online_plan_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index
 				 || operation.undo.kind == CLUSTER_UNDO_KIND_SEGMENT_INIT
 				 || operation.undo.kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE
 				 || operation.undo.kind == CLUSTER_UNDO_KIND_SEGMENT_RECYCLE
-				 || operation.undo.kind == CLUSTER_UNDO_KIND_TT_BIND)
+				 || operation.undo.kind == CLUSTER_UNDO_KIND_TT_BIND
+				 || operation.undo.kind == CLUSTER_UNDO_KIND_TT_SET_HEAD)
 			 && ops->apply_undo_record != NULL))
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 	if (!ops->begin_protected_set(ops->arg))

@@ -907,8 +907,18 @@ undo_header_effect_record(EffectRecord *r, uint8 info)
 								  .wrap = 7,
 								  .format_version = CLUSTER_UNDO_TT_BIND_VERSION };
 
+	xl_undo_tt_slot_set_head head
+		= { .segment_id = 257,
+			.instance = 2,
+			.slot_offset = 4,
+			.xid = 802,
+			.wrap = 7,
+			.first_undo_block = { .raw = { UINT64_C(257) | (UINT64_C(9) << 32), 4 } } };
+
 	record_init(r, RM_CLUSTER_UNDO_ID, info);
-	if (info == XLOG_UNDO_SEGMENT_INIT)
+	if (info == XLOG_UNDO_TT_SLOT_SET_HEAD)
+		append(r, &head, sizeof(head));
+	else if (info == XLOG_UNDO_SEGMENT_INIT)
 		append(r, &init, sizeof(init));
 	else if (info == XLOG_UNDO_SEGMENT_REUSE)
 		append(r, &reuse, sizeof(reuse));
@@ -922,8 +932,9 @@ undo_header_effect_record(EffectRecord *r, uint8 info)
 
 UT_TEST(test_foreign_undo_header_routes_only_connected_record_consumers)
 {
-	const uint8 infos[] = { XLOG_UNDO_SEGMENT_INIT, XLOG_UNDO_SEGMENT_REUSE,
-							XLOG_UNDO_SEGMENT_RECYCLE, XLOG_UNDO_TT_SLOT_BIND };
+	const uint8 infos[]
+		= { XLOG_UNDO_SEGMENT_INIT, XLOG_UNDO_SEGMENT_REUSE, XLOG_UNDO_SEGMENT_RECYCLE,
+			XLOG_UNDO_TT_SLOT_BIND, XLOG_UNDO_TT_SLOT_SET_HEAD };
 	for (uint32 i = 0; i < lengthof(infos); i++) {
 		EffectRecord r;
 		ClusterColdDecodedV1 out = { 0 };
@@ -943,8 +954,9 @@ UT_TEST(test_foreign_undo_header_routes_only_connected_record_consumers)
 
 UT_TEST(test_foreign_undo_header_malformed_carriers_remain_refused)
 {
-	const uint8 infos[] = { XLOG_UNDO_SEGMENT_INIT, XLOG_UNDO_SEGMENT_REUSE,
-							XLOG_UNDO_SEGMENT_RECYCLE, XLOG_UNDO_TT_SLOT_BIND };
+	const uint8 infos[]
+		= { XLOG_UNDO_SEGMENT_INIT, XLOG_UNDO_SEGMENT_REUSE, XLOG_UNDO_SEGMENT_RECYCLE,
+			XLOG_UNDO_TT_SLOT_BIND, XLOG_UNDO_TT_SLOT_SET_HEAD };
 	for (uint32 i = 0; i < lengthof(infos); i++)
 		for (int fault = 0; fault < 6; fault++) {
 			EffectRecord r;

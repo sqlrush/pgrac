@@ -1428,8 +1428,9 @@ UT_TEST(test_native_side_failure_or_late_drift_is_sticky)
 UT_TEST(test_undo_dispatch_selects_exact_record_and_keeps_space_proof)
 {
 	const uint8 infos[]
-		= { XLOG_UNDO_BLOCK_WRITE,	 XLOG_UNDO_BLOCK_WRITE_MULTI, XLOG_UNDO_SEGMENT_INIT,
-			XLOG_UNDO_SEGMENT_REUSE, XLOG_UNDO_SEGMENT_RECYCLE,	  XLOG_UNDO_TT_SLOT_BIND };
+		= { XLOG_UNDO_BLOCK_WRITE,	   XLOG_UNDO_BLOCK_WRITE_MULTI, XLOG_UNDO_SEGMENT_INIT,
+			XLOG_UNDO_SEGMENT_REUSE,   XLOG_UNDO_SEGMENT_RECYCLE,	XLOG_UNDO_TT_SLOT_BIND,
+			XLOG_UNDO_TT_SLOT_SET_HEAD };
 	for (uint32 i = 0; i < lengthof(infos); i++) {
 		ClusterColdRecordV1 record;
 		ClusterColdTypedV1 *typed = control_fixture_mode(&record, true);
@@ -1462,7 +1463,7 @@ UT_TEST(test_undo_dispatch_rejects_wrong_identity_or_unowned_effect)
 			side_fixture[1].operations[1].identity.record.info = record.info;
 			break;
 		case 3:
-			side_record_fixture(&record, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_SET_HEAD,
+			side_record_fixture(&record, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_ABORT,
 								RF_SIDE_ONLINE_OPERATION_UNDO);
 			break;
 		case 4:

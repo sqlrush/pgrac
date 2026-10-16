@@ -190,6 +190,13 @@ typedef struct RfSideUndoHeaderImageV1 {
 } RfSideUndoHeaderImageV1;
 
 typedef RfSideUndoHeaderImageV1 RfSideUndoBlockImageV1;
+/* Reconstruct only the referenced DATA before this exact SET_HEAD record.
+ * Requires a retained FPI in that segment incarnation; never reads DATA or
+ * grants permission to install a header or a later source image. */
+extern RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_head_block_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+											   const RfPageOnlineRecordIdentityV1 *identity,
+											   RfSideUndoBlockImageV1 *out);
 /* Physical replay starts at a source FPI in each segment incarnation, never
  * at an inferred DATA LSN. Installation remains the original owner's duty. */
 extern RfPageProofDetailV1 rf_side_online_plan_prepare_undo_block_v1(const RfSideOnlinePlanV1 *plan,

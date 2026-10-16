@@ -19,6 +19,7 @@
 
 UT_DEFINE_GLOBALS();
 #include "test_cluster_undo_header_identity.inc"
+#include "test_cluster_heap_small_scn.inc"
 
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
@@ -236,6 +237,15 @@ rf_side_online_plan_prepare_undo_record_v1(
 {
 	UT_ASSERT(false); /* Record-local integration is in test_cluster_side_xact. */
 	memset(out, 0, sizeof(*out));
+	return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_head_block_v1(
+	const RfSideOnlinePlanV1 *plan pg_attribute_unused(), uint32 index pg_attribute_unused(),
+	const RfPageOnlineRecordIdentityV1 *identity pg_attribute_unused(),
+	RfSideUndoBlockImageV1 *out pg_attribute_unused())
+{
 	return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 }
 
