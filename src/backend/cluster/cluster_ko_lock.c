@@ -3852,6 +3852,20 @@ cluster_ko_shared_structure_handoff_v2(ClusterKoCompletionV2 **completion)
 	return true;
 }
 
+/* A native carrier keeps its original protocol version throughout handoff
+ * and background execution. One version's capabilities cannot admit another. */
+static bool
+ko_native_capable(bool v3)
+{
+	uint32 capabilities = cluster_ic_local_capability_word();
+	uint32 required = v3
+		? PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3 | PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1
+		: PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+
+	return (!v3 || cluster_interconnect_tier == CLUSTER_IC_TIER_1)
+		&& (capabilities & required) == required;
+}
+
 /* Retain the original committed proof even if its cut has since gone stale.
  * Retention is not authority to execute: the background consumer must recheck
  * the entire original scope before doing anything. Preallocation makes this
@@ -3975,11 +3989,11 @@ cluster_ko_shared_native_handoff_v2(ClusterKoCompletionV2 **completion)
 void
 cluster_ko_shared_native_commit_v2(void)
 {
-	if (!cluster_enabled || !cluster_shared_config
-		|| (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) == 0)
+	if (!cluster_enabled || !cluster_shared_config)
 		return;
 	for (ClusterKoCompletionV2 *owned = ko_completions; owned != NULL; owned = owned->next) {
-		if (!owned->native_transaction || owned->native_pending || owned->native_handed_off)
+		if (!owned->native_transaction || owned->native_pending || owned->native_handed_off
+			|| !ko_native_capable(owned->barrier_v3))
 			continue;
 		/* A claimed SPACE change must have saved its actual record and
 		 * preallocated continuation before this irreversible point. */
@@ -4121,7 +4135,7 @@ static void
 ko_native_deferred(const ClusterKoSharedContext *context, uint64 *reported, const char *stage)
 {
 	if (!context->used || context->serial == 0
-		|| (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) == 0)
+		|| !ko_native_capable(context->v3))
 		return;
 	KO_BUMP(failclosed_count);
 	if (*reported != context->serial) {
@@ -4146,7 +4160,7 @@ cluster_ko_shared_native_promote_v2(void)
 	ClusterWalSourceRef current;
 	int slot = -1;
 	bool moved = false;
-	bool failed, buffers_released;
+	bool failed, buffers_released, capable;
 
 	if (ko_state == NULL || MyBackendType != B_CHECKPOINTER || CurrentResourceOwner == NULL
 		|| CritSectionCount != 0 || !cluster_enabled || !cluster_shared_config)
@@ -4173,8 +4187,10 @@ cluster_ko_shared_native_promote_v2(void)
 	failed = work->recovery_required;
 	buffers_released = work->buffers_released;
 	SpinLockRelease(&ko_state->shared_lock);
-	if (failed || !ko_shared_origin_current(&before) || !cluster_wal_thread_current_v2_ref(&current)
-		|| memcmp(&current, &before.terminal.source, sizeof(current)) != 0) {
+	capable = ko_native_capable(before.v3);
+	if (capable && (failed || !ko_shared_origin_current(&before)
+		|| !cluster_wal_thread_current_v2_ref(&current)
+		|| memcmp(&current, &before.terminal.source, sizeof(current)) != 0)) {
 		SpinLockAcquire(&ko_state->shared_lock);
 		if (ko_state->native_ready == selected && ko_state->native_waiting != 0) {
 			ko_state->native_ready = work->next;
@@ -4189,10 +4205,10 @@ cluster_ko_shared_native_promote_v2(void)
 						   failed ? "PRODUCER_INCOMPLETE" : "PROMOTION_CUT");
 		return CLUSTER_KO_STRUCTURE_INVALID;
 	}
-	if (!buffers_released || !ko_origin_drop_io_closed(&before)) {
+	if (!capable || !buffers_released || !ko_origin_drop_io_closed(&before)) {
 		/* Let the rest of this finite batch advance while the original
-		 * producer completes its local buffer cleanup/publication or an
-		 * already-entered directory call exits. No storage may run. */
+		 * mode is unavailable, the producer completes buffer cleanup or
+		 * publication, or an entered directory call exits. No storage runs. */
 		SpinLockAcquire(&ko_state->shared_lock);
 		if (ko_state->native_ready == selected) {
 			ko_state->native_ready = work->next;
@@ -4226,7 +4242,7 @@ cluster_ko_shared_native_poll_v2(void)
 
 	if (ko_state == NULL || !cluster_enabled || !cluster_shared_config
 		|| MyBackendType != B_CHECKPOINTER || CurrentResourceOwner == NULL || CritSectionCount != 0
-		|| (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) == 0)
+		|| (!ko_native_capable(false) && !ko_native_capable(true)))
 		return false;
 	progress = cluster_ko_shared_native_promote_v2() == CLUSTER_KO_STRUCTURE_PROGRESS;
 	/* No WAL input, content/entry lock or remote wait spans physical work.
@@ -4255,6 +4271,7 @@ ko_drop_context_current(const ClusterKoSharedContext *context)
 	ClusterWalSourceRef current;
 
 	return context->used && context->complete && context->structure_owned
+		   && ko_native_capable(context->v3)
 		   && (!context->v3 || ko_shared_ready_v3(context))
 		   && context->structure_drop_pending && !context->structure_drop_failed
 		   && context->serial != 0 && context->request.origin_node == cluster_node_id

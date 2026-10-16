@@ -183,6 +183,11 @@ volatile uint32 CritSectionCount;
 bool cluster_enabled = true;
 bool cluster_object_reuse_flush_enabled = false;
 bool cluster_shared_config = false;
+bool cluster_smart_fusion;
+int cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_1;
+bool cluster_ic_suppress_caps_reply;
+bool cluster_ic_suppress_gcs_done_cap;
+bool cluster_ic_suppress_xid_flock_cap;
 int cluster_space_affinity = CLUSTER_SPACE_AFFINITY_STATIC;
 int cluster_injection_armed_count = 0;
 static ClusterKoShared storage;
@@ -221,6 +226,7 @@ static ClusterSpaceIdentity space_identity;
 static uint64 member_generation;
 static bool capture_ok, cap_ok, space_ok, generation_race;
 static bool native_commit_active;
+static uint32 (*native_capability_hook)(void);
 static int fixture_error_level;
 static unsigned fixture_log_events;
 
@@ -552,9 +558,19 @@ cluster_membership_cut_generation(void)
 {
 	return member_generation;
 }
+static uint32 native_real_capability_word(void);
+#define cluster_ic_local_capability_word native_real_capability_word
+#include "test_cluster_ko_native_capability.inc"
+#undef cluster_ic_local_capability_word
 uint32
 cluster_ic_local_capability_word(void)
 {
+	if (native_capability_hook != NULL)
+		return native_capability_hook();
+	/* v3 fixtures use the same producer as HELLO; only the explicit legacy
+	 * cases simulate the old structural capability. */
+	if (v3_route_live)
+		return native_real_capability_word();
 	return native_commit_active ? PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2 : 0;
 }
 bool
@@ -1257,6 +1273,7 @@ reset_test(void)
 	marker_native_allocation = InvalidDsaPointer;
 	native_alloc_fail = false;
 	native_commit_active = false;
+	native_capability_hook = NULL;
 	ko_drop_poll_boundary = NULL;
 	fixture_log_events = 0;
 	ko_drop_scan = 0;
@@ -5264,6 +5281,7 @@ UT_TEST(test_native_committed_seventy_two_owners_survive_full_background_region)
 			exit_callback(0, (Datum)0);
 			UT_ASSERT_EQ(completion_allocations, 0);
 			MyBackendType = B_CHECKPOINTER;
+			native_commit_active = true; /* This is the legacy structural owner. */
 			ko_exit_registered = false;
 			exit_callback = NULL; /* A fresh checkpointer has no prior native barrier. */
 			UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PENDING);
@@ -5381,6 +5399,7 @@ UT_TEST(test_native_autovacuum_truncate_keeps_its_committed_continuation)
 	if (moved) {
 		UT_ASSERT(owner == NULL);
 		MyBackendType = B_CHECKPOINTER;
+		native_commit_active = true; /* This is the legacy structural owner. */
 		UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
 		UT_ASSERT(!storage.contexts[0].structure_drop_pending);
 	} else
@@ -5430,6 +5449,7 @@ UT_TEST(test_native_continuation_retains_stale_commit_but_cannot_serve_it)
 	UT_ASSERT(owner == NULL);
 	UT_ASSERT(!cluster_ko_shared_native_handoff_v2(&old));
 	MyBackendType = B_CHECKPOINTER;
+	native_commit_active = true; /* This is the legacy structural owner. */
 	for (unsigned attempt = 0; attempt < 3; attempt++) {
 		UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(),
 					 attempt == 0 ? CLUSTER_KO_STRUCTURE_INVALID : CLUSTER_KO_STRUCTURE_RELEASED);
@@ -5455,6 +5475,7 @@ prepare_promoted_drop(ClusterPageWalBindingV1 *binding, uint8 *wal)
 	if (!native_handoff_after_buffers(&owner))
 		abort();
 	MyBackendType = B_CHECKPOINTER;
+	native_commit_active = true; /* This is the legacy structural owner. */
 	if (cluster_ko_shared_native_promote_v2() != CLUSTER_KO_STRUCTURE_PROGRESS)
 		abort();
 	for (uint32 i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)

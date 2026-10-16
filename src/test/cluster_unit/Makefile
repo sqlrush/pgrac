@@ -6430,7 +6430,7 @@ test_cluster_ko_writeback_codec.o: $(top_srcdir)/src/backend/cluster/cluster_pi_
 		$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_ko_stop test_cluster_ko_cancel test_cluster_ko_ready_owner test_cluster_ko_drop_io test_cluster_ko_source_io test_cluster_ko_sync_io test_cluster_ko_writeback_io test_cluster_ko_origin_marker: %: %.c test_cluster_ko_stop.c test_cluster_ko_space.inc test_cluster_ko_abandon.h test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
+test_cluster_ko_stop test_cluster_ko_cancel test_cluster_ko_ready_owner test_cluster_ko_drop_io test_cluster_ko_source_io test_cluster_ko_sync_io test_cluster_ko_writeback_io test_cluster_ko_origin_marker test_cluster_ko_native_route: %: %.c test_cluster_ko_stop.c test_cluster_ko_space.inc test_cluster_ko_abandon.h test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
 		test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_ko_lock.c \
 		$(top_srcdir)/src/include/cluster/cluster_ko.h
@@ -6439,6 +6439,16 @@ test_cluster_ko_stop test_cluster_ko_cancel test_cluster_ko_ready_owner test_clu
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) \
 		$(top_builddir)/src/common/libpgcommon.a $(filter -lcrypto,$(LIBS)) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_ko_native_route
+all: test_cluster_ko_native_route
+
+test_cluster_ko_native_capability.inc: $(top_srcdir)/src/backend/cluster/cluster_ic.c Makefile
+	awk '/^cluster_ic_local_capability_word\(/ { print "uint32"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_ko_stop test_cluster_ko_cancel test_cluster_ko_ready_owner test_cluster_ko_drop_io test_cluster_ko_source_io test_cluster_ko_sync_io test_cluster_ko_writeback_io test_cluster_ko_origin_marker test_cluster_ko_native_route test_cluster_drop_work: test_cluster_ko_native_capability.inc
 
 # Actual original KO owner and storage consumer; syscall faults use real files.
 test_cluster_drop_work: test_cluster_drop_work.c test_cluster_ko_space.inc test_cluster_ko_abandon.h test_cluster_ko_stop.c test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h \
