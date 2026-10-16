@@ -805,6 +805,29 @@ side_owner_apply_control(void *arg, const RfSideOnlineOperationV1 *operation)
 	return true;
 }
 
+static void
+side_owner_apply_ops(RfSideOnlineProductionOwnerV1 *owner, RfSideOnlineApplyOpsV1 *ops)
+{
+	memset(ops, 0, sizeof(*ops));
+	ops->arg = owner;
+	ops->source_thread = side_owner_source_thread(owner);
+	ops->begin_protected_set = side_owner_begin_protected_set;
+	ops->end_protected_set = side_owner_end_protected_set;
+	ops->prepare_apply = side_owner_prepare_apply;
+	ops->preflight_xact = side_owner_preflight_xact;
+	ops->preflight_undo = side_owner_preflight_undo;
+	ops->preflight_projection = side_owner_preflight_projection;
+	ops->apply_xact = side_owner_apply_xact;
+	ops->apply_undo = side_owner_apply_undo;
+	ops->apply_projection = side_owner_apply_projection;
+	ops->preflight_control = side_owner_preflight_control;
+	ops->apply_control = side_owner_apply_control;
+	if (owner->preflight_space != NULL && owner->apply_space != NULL) {
+		ops->preflight_space = side_owner_preflight_space;
+		ops->apply_space = side_owner_apply_space;
+	}
+}
+
 RfPageProofDetailV1
 rf_side_online_production_preflight_v1(const RfSideOnlinePlanV1 *plan,
 									   RfSideOnlineProductionOwnerV1 *owner)
@@ -816,23 +839,8 @@ rf_side_online_production_preflight_v1(const RfSideOnlinePlanV1 *plan,
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	owner->protected_set_complete = false;
 	owner->protected_plan = plan;
-	memset(&ops, 0, sizeof(ops));
-	ops.arg = owner;
-	ops.source_thread = side_owner_source_thread(owner);
-	ops.begin_protected_set = side_owner_begin_protected_set;
-	ops.end_protected_set = side_owner_end_protected_set;
-	ops.preflight_xact = side_owner_preflight_xact;
-	ops.preflight_undo = side_owner_preflight_undo;
-	ops.preflight_projection = side_owner_preflight_projection;
-	ops.apply_xact = side_owner_apply_xact;
-	ops.apply_undo = side_owner_apply_undo;
-	ops.apply_projection = side_owner_apply_projection;
-	ops.preflight_control = side_owner_preflight_control;
-	ops.apply_control = side_owner_apply_control;
-	if (owner->preflight_space != NULL && owner->apply_space != NULL) {
-		ops.preflight_space = side_owner_preflight_space;
-		ops.apply_space = side_owner_apply_space;
-	}
+	side_owner_apply_ops(owner, &ops);
+
 	detail = rf_side_online_plan_preflight_v1(plan, &ops);
 	owner->protected_plan = NULL;
 	return detail;
@@ -849,24 +857,8 @@ rf_side_online_production_apply_v1(const RfSideOnlinePlanV1 *plan,
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	owner->protected_set_complete = false;
 	owner->protected_plan = plan;
-	memset(&ops, 0, sizeof(ops));
-	ops.arg = owner;
-	ops.source_thread = side_owner_source_thread(owner);
-	ops.begin_protected_set = side_owner_begin_protected_set;
-	ops.end_protected_set = side_owner_end_protected_set;
-	ops.prepare_apply = side_owner_prepare_apply;
-	ops.preflight_xact = side_owner_preflight_xact;
-	ops.preflight_undo = side_owner_preflight_undo;
-	ops.preflight_projection = side_owner_preflight_projection;
-	ops.apply_xact = side_owner_apply_xact;
-	ops.apply_undo = side_owner_apply_undo;
-	ops.apply_projection = side_owner_apply_projection;
-	ops.preflight_control = side_owner_preflight_control;
-	ops.apply_control = side_owner_apply_control;
-	if (owner->preflight_space != NULL && owner->apply_space != NULL) {
-		ops.preflight_space = side_owner_preflight_space;
-		ops.apply_space = side_owner_apply_space;
-	}
+	side_owner_apply_ops(owner, &ops);
+
 	detail = rf_side_online_plan_apply_v1(plan, &ops);
 	owner->protected_plan = NULL;
 	if (detail != RF_PAGE_PROOF_DETAIL_OK)
@@ -881,6 +873,39 @@ rf_side_online_production_apply_v1(const RfSideOnlinePlanV1 *plan,
 	}
 	return owner->protected_set_complete ? RF_PAGE_PROOF_DETAIL_OK
 										 : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+}
+
+RfPageProofDetailV1
+rf_side_online_production_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+										  const RfPageOnlineRecordIdentityV1 *identity,
+										  RfSideOnlineProductionOwnerV1 *owner)
+{
+	RfSideOnlineApplyOpsV1 ops;
+	RfPageProofDetailV1 detail;
+
+	if (owner == NULL || owner->protected_set_active)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	owner->protected_set_complete = false;
+	if (plan == NULL || identity == NULL || !side_owner_cold_formed(owner))
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	owner->protected_plan = plan;
+	side_owner_apply_ops(owner, &ops);
+	PG_TRY();
+	{
+		detail = rf_side_online_plan_apply_record_v1(plan, index, identity, &ops);
+	}
+	PG_FINALLY();
+	{
+		owner->protected_plan = NULL;
+	}
+	PG_END_TRY();
+	if (detail != RF_PAGE_PROOF_DETAIL_OK)
+		return detail;
+	/* This is a record result, never protected_set_complete. Recheck the
+	 * original owner after scope cleanup just as the full-source path does. */
+	return side_owner_cold_formed(owner) && side_owner_authority_fresh(owner)
+			   ? RF_PAGE_PROOF_DETAIL_OK
+			   : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 }
 
 #endif

@@ -2591,6 +2591,56 @@ rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan, const RfSideOnlineA
 	PG_END_TRY();
 	return detail;
 }
+
+RfPageProofDetailV1
+rf_side_online_plan_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+									const RfPageOnlineRecordIdentityV1 *identity,
+									const RfSideOnlineApplyOpsV1 *ops)
+{
+	RfSideOnlineOperationV1 operation;
+	RfPageProofDetailV1 detail;
+
+	if (!side_plan_apply_ops_valid(plan, ops) || plan->failed || identity == NULL
+		|| !rf_side_online_plan_operation_v1(plan, index, &operation) || ops->source_thread == 0
+		|| operation.history_only || operation.identity.record.origin_thread != ops->source_thread
+		|| identity->participant_index != operation.identity.participant_index
+		|| identity->reserved_zero != 0
+		|| memcmp(&identity->record, &operation.identity.record, sizeof(identity->record)) != 0)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	/* These consumers use the selected owned operation only. The current
+	 * XACT/UNDO owner prepares a final whole-source TT image, and the SPACE
+	 * owner has a separate ordered target cursor: neither is record-local. */
+	if (operation.kind != RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
+		&& operation.kind != RF_SIDE_ONLINE_OPERATION_PROJECTION)
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	if (!ops->begin_protected_set(ops->arg))
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	PG_TRY();
+	{
+		/* Do not turn record selection into permission to skip an unsupported
+		 * later effect in this source. All original preflights still precede
+		 * the first mutation and the original source durability barrier. */
+		detail = side_plan_preflight_active(plan, ops);
+		if (detail == RF_PAGE_PROOF_DETAIL_OK && ops->prepare_apply != NULL
+			&& !ops->prepare_apply(ops->arg))
+			detail = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		if (detail == RF_PAGE_PROOF_DETAIL_OK) {
+			bool applied = operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
+							   ? ops->apply_control(ops->arg, &operation)
+							   : ops->apply_projection(ops->arg, &operation);
+			if (!applied)
+				detail = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		}
+	}
+	PG_FINALLY();
+	{
+		/* Only the enclosing ordered replay can close the complete source. */
+		ops->end_protected_set(ops->arg, false);
+	}
+	PG_END_TRY();
+	return detail;
+}
+
 void
 rf_side_online_plan_destroy_v1(RfSideOnlinePlanV1 **plan_address)
 {

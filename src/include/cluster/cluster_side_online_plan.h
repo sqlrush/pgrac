@@ -324,6 +324,15 @@ extern RfPageProofDetailV1 rf_side_online_plan_preflight_v1(const RfSideOnlinePl
 															const RfSideOnlineApplyOpsV1 *ops);
 extern RfPageProofDetailV1 rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan,
 														const RfSideOnlineApplyOpsV1 *ops);
+/* Dispatch one exact record-local control/projection operation after the
+ * original whole-source preflight. The enclosing sequencer owns WAL order
+ * and final completion; end_protected_set receives complete=false even on
+ * success. XACT/UNDO/SPACE require ordered target preparation and refuse. */
+extern RfPageProofDetailV1
+rf_side_online_plan_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+									const RfPageOnlineRecordIdentityV1 *identity,
+									const RfSideOnlineApplyOpsV1 *ops);
+
 extern bool rf_side_online_projection_owner_init_v1(RfSideOnlineProjectionOwnerV1 *owner,
 													uint32 cluster_epoch,
 													bool failed_origin_redo_retained);
