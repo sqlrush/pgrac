@@ -45,6 +45,10 @@ uint32 *my_wait_event_info = &wait_event;
 static char fixture_root[MAXPGPATH];
 static bool authority = true, revoke_on_lock, expect_error, fail_open, fail_sync, fail_dirsync;
 static bool fixture_retired, cold_scope;
+static bool fail_sync_close;
+static int sync_fault_family = -1, synced_fd = -1, synced_family = -1;
+static int directory_sync_error, directory_open_error;
+static unsigned durability_faults;
 static int transient_fds;
 static unsigned writes, syncs, dirsyncs, reads;
 static struct {
@@ -259,6 +263,13 @@ int
 OpenTransientFile(const char *path, int flags)
 {
 	int fd;
+	const char *directory = sync_fault_family == 0 ? MultiXactRecoveryOffsetCtl[1].Dir
+												   : MultiXactRecoveryMemberCtl[1].Dir;
+	if (directory_open_error && sync_fault_family >= 0 && strcmp(path, directory) == 0) {
+		durability_faults++;
+		errno = directory_open_error;
+		return -1;
+	}
 	if (fail_open && (flags & O_RDWR)) {
 		errno = EIO;
 		return -1;
@@ -271,12 +282,50 @@ OpenTransientFile(const char *path, int flags)
 int
 CloseTransientFile(int fd)
 {
+	bool fail = fail_sync_close && fd == synced_fd && synced_family == sync_fault_family;
+	int rc;
+	if (fd == synced_fd)
+		synced_fd = synced_family = -1;
 	transient_fds--;
-	return close(fd);
+	rc = close(fd);
+	if (fail) {
+		durability_faults++;
+		errno = EIO;
+		return -1;
+	}
+	return rc;
 }
 int
 pg_fsync(int fd)
 {
+	struct stat st;
+	UT_ASSERT_EQ(fstat(fd, &st), 0);
+	synced_fd = fd;
+	synced_family = -1;
+	for (int family = 0; family < 2; family++) {
+		const char *directory
+			= family ? MultiXactRecoveryMemberCtl[1].Dir : MultiXactRecoveryOffsetCtl[1].Dir;
+		struct stat expected;
+		char path[MAXPGPATH];
+
+		snprintf(path, sizeof(path), S_ISDIR(st.st_mode) ? "%s" : "%s/0000", directory);
+		if (lstat(path, &expected) == 0 && expected.st_dev == st.st_dev
+			&& expected.st_ino == st.st_ino)
+			synced_family = family;
+	}
+	if (S_ISDIR(st.st_mode)) {
+		dirsyncs++;
+		if (fail_dirsync) {
+			errno = EIO;
+			(void)errstart(ERROR, NULL);
+		}
+		if (directory_sync_error && synced_family == sync_fault_family) {
+			durability_faults++;
+			errno = directory_sync_error;
+			return -1;
+		}
+		return fsync(fd);
+	}
 	syncs++;
 	if (fail_sync) {
 		errno = EIO;
@@ -288,8 +337,17 @@ void
 fsync_fname(const char *path, bool isdir)
 {
 	int fd, rc;
+	const char *directory = sync_fault_family == 0 ? MultiXactRecoveryOffsetCtl[1].Dir
+												   : MultiXactRecoveryMemberCtl[1].Dir;
 	UT_ASSERT(isdir);
 	dirsyncs++;
+	/* These are exactly the generic fd.c directory exceptions. */
+	if (sync_fault_family >= 0 && strcmp(path, directory) == 0
+		&& (directory_open_error == EACCES || directory_open_error == EISDIR
+			|| directory_sync_error == EINVAL || directory_sync_error == EBADF)) {
+		durability_faults++;
+		return;
+	}
 	if (fail_dirsync) {
 		errno = EIO;
 		(void)errstart(ERROR, NULL);
@@ -793,6 +851,58 @@ UT_TEST(cold_revocation_and_readback_failure_cannot_use_online_fallback)
 	fixture_idle();
 }
 
+UT_TEST(native_multixact_durability_errors_refuse_both_families)
+{
+	for (int family = 0; family < 2; family++) {
+		for (int operation = 0; operation < 3; operation++) {
+			for (int fault = operation == 2 ? 1 : 0; fault < 5; fault++) {
+				ClusterSideProjectionOperationV1 op = fixture_create(17, 71, 1);
+				MultiXactMember member = { 400, MultiXactStatusForShare };
+				const uint8 *payload = operation == 0 ? (uint8 *)&member : NULL;
+				uint32 length = operation == 0 ? sizeof(member) : 0;
+				unsigned before = durability_faults;
+
+				fixture_zero(false, 0);
+				fixture_zero(true, 0);
+				if (operation != 0) {
+					memset(&op, 0, sizeof(op));
+					op.kind = CLUSTER_SIDE_PROJECTION_MULTIXACT;
+					if (operation == 1) {
+						op.action = CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE;
+						op.normalized_info
+							= family ? XLOG_MULTIXACT_ZERO_MEM_PAGE : XLOG_MULTIXACT_ZERO_OFF_PAGE;
+					} else {
+						op.action = CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE;
+						op.normalized_info = XLOG_MULTIXACT_TRUNCATE_ID;
+						op.oldest_database = 1;
+						op.truncate_start_multixact = 1;
+						op.truncate_end_multixact
+							= MULTIXACT_OFFSETS_PER_PAGE * SLRU_PAGES_PER_SEGMENT + 1;
+						op.truncate_end_member
+							= MULTIXACT_MEMBERS_PER_PAGE * SLRU_PAGES_PER_SEGMENT + 1;
+					}
+				}
+				sync_fault_family = family;
+				fail_sync_close = fault == 0;
+				directory_sync_error = fault == 1 ? EINVAL : fault == 2 ? EBADF : 0;
+				directory_open_error = fault == 3 ? EACCES : fault == 4 ? EISDIR : 0;
+				UT_ASSERT(
+					!cluster_multixact_native_recovery_apply(1, &op, payload, length, 100, 200));
+				UT_ASSERT(durability_faults > before);
+				sync_fault_family = -1;
+				fail_sync_close = false;
+				directory_sync_error = directory_open_error = 0;
+				fixture_idle();
+				UT_ASSERT(
+					cluster_multixact_native_recovery_apply(1, &op, payload, length, 100, 200));
+				UT_ASSERT(
+					cluster_multixact_native_recovery_verify(1, &op, payload, length, 100, 200));
+				fixture_idle();
+			}
+		}
+	}
+}
+
 static void
 fixture_cleanup(void)
 {
@@ -840,7 +950,7 @@ main(void)
 			return 2;
 	}
 	multi_recovery_shmem_init();
-	UT_PLAN(15);
+	UT_PLAN(16);
 	UT_RUN(shared_controls_are_distinct_and_use_original_namespace);
 	UT_RUN(authority_failure_and_local_origin_never_write);
 	UT_RUN(actual_native_create_crosses_offset_and_member_pages);
@@ -856,6 +966,7 @@ main(void)
 	UT_RUN(cold_own_origin_replays_native_records_without_local_controls);
 	UT_RUN(native_preflight_checks_full_geometry_without_writes);
 	UT_RUN(cold_revocation_and_readback_failure_cannot_use_online_fallback);
+	UT_RUN(native_multixact_durability_errors_refuse_both_families);
 	fixture_cleanup();
 	UT_DONE();
 	return ut_failed_count != 0;

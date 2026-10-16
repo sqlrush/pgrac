@@ -152,6 +152,7 @@
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
+#include "utils/wait_event.h"
 
 
 /*
@@ -4416,10 +4417,56 @@ multi_recovery_members(SlruCtl ctl, const ClusterSideProjectionOperationV1 *op,
 }
 
 static bool
+multi_recovery_same_file(const struct stat *before, const struct stat *after)
+{
+	return before->st_dev == after->st_dev && before->st_ino == after->st_ino
+		   && before->st_size == after->st_size;
+}
+
+/* Native recovery completion cannot inherit generic directory exceptions
+ * or ignore failure closing the descriptor that performed the sync. */
+static bool
+multi_recovery_sync_path(SlruCtl ctl, int segment)
+{
+	bool directory = segment < 0;
+	char path[MAXPGPATH];
+	struct stat before, opened, after;
+	volatile int fd = -1;
+	volatile bool ok = false;
+	int length;
+
+	length = directory ? snprintf(path, sizeof(path), "%s", ctl->Dir)
+					   : snprintf(path, sizeof(path), "%s/%04X", ctl->Dir, segment);
+	if (length < 0 || length >= sizeof(path) || lstat(path, &before) != 0
+		|| (directory ? !S_ISDIR(before.st_mode) : !S_ISREG(before.st_mode))
+		|| before.st_uid != geteuid() || (before.st_mode & (S_IWGRP | S_IWOTH)) != 0
+		|| (!directory && before.st_nlink != 1))
+		return false;
+	PG_TRY();
+	{
+		fd = OpenTransientFile(path, (directory ? O_RDONLY | O_DIRECTORY : O_RDWR) | O_NOFOLLOW
+										 | O_CLOEXEC | PG_BINARY);
+		if (fd >= 0 && fstat(fd, &opened) == 0 && multi_recovery_same_file(&before, &opened)) {
+			pgstat_report_wait_start(WAIT_EVENT_SLRU_FLUSH_SYNC);
+			ok = pg_fsync(fd) == 0;
+			pgstat_report_wait_end();
+			ok = ok && fstat(fd, &after) == 0 && multi_recovery_same_file(&before, &after)
+				 && lstat(path, &after) == 0 && multi_recovery_same_file(&before, &after);
+		}
+	}
+	PG_FINALLY();
+	{
+		pgstat_report_wait_end();
+		if (fd >= 0 && CloseTransientFile(fd) != 0)
+			ok = false;
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+static bool
 multi_recovery_sync(SlruCtl ctl, int origin)
 {
-	FileTag tag;
-	char path[MAXPGPATH];
 	int segments[MULTIXACT_RECOVERY_BUFFERS];
 	int count = 0;
 
@@ -4444,13 +4491,10 @@ multi_recovery_sync(SlruCtl ctl, int origin)
 		return false;
 	SimpleLruWriteAll(ctl, false);
 	for (int i = 0; i < count; i++) {
-		memset(&tag, 0, sizeof(tag));
-		tag.segno = segments[i];
-		if (!multi_recovery_permitted(origin) || SlruSyncFileTag(ctl, &tag, path) != 0)
+		if (!multi_recovery_permitted(origin) || !multi_recovery_sync_path(ctl, segments[i]))
 			return false;
 	}
-	fsync_fname(ctl->Dir, true);
-	return multi_recovery_permitted(origin);
+	return multi_recovery_sync_path(ctl, -1) && multi_recovery_permitted(origin);
 }
 
 /* Use the record's exact native range, retaining the final partial segment. */
