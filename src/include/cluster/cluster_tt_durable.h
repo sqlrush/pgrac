@@ -233,7 +233,9 @@ extern uint8 cluster_tt_slot_durable_commit_stage(uint32 segment_id, uint32 segm
 /* True when exactly this transaction's slot stamp is staged and unwritten. */
 extern bool cluster_tt_slot_durable_commit_staged(uint32 segment_id, uint16 slot_offset,
 												  TransactionId xid, uint16 wrap);
-/* Critical-section safe: write the staged stamp; PANIC on any failure. */
+/* Ordinary-transaction commit only: requires a valid native VXID, the commit
+ * critical section and DELAY_CHKPT_START held since before WAL insertion.
+ * Write the staged stamp after WAL flush; PANIC on any failure. */
 extern void cluster_tt_slot_durable_commit_apply(XLogRecPtr commit_end);
 /* Never throws: release a staged stamp that was never written. */
 extern void cluster_tt_slot_durable_commit_unstage(void);

@@ -470,6 +470,7 @@ static XLogRecPtr g_write_requires_flush = InvalidXLogRecPtr;
 static bool g_write_before_flush = false;
 static PGPROC g_fake_proc;
 PGPROC *MyProc = &g_fake_proc;
+volatile uint32 CritSectionCount = 0;
 
 void
 cluster_undo_block0_pin_downgrade(ClusterUndoBlock0Pin *pin)
@@ -856,7 +857,7 @@ cluster_undo_smgr_write_header_bytes(ClusterUndoPathIntent intent pg_attribute_u
 									 uint32 len)
 {
 	g_write_hdr_calls++;
-	g_write_delay_flags = MyProc->delayChkptFlags;
+	g_write_delay_flags = MyProc != NULL ? MyProc->delayChkptFlags : 0;
 	g_ctrc_write_order = ++g_ctrc_event_sequence;
 	if (g_require_abort_flush_before_write && !g_abort_flush_seen)
 		return false;
@@ -1097,6 +1098,9 @@ reset_current_write_mock(void)
 	g_tt_wal_count = 0;
 	memset(&g_last_set_head, 0, sizeof(g_last_set_head));
 	memset(&g_fake_proc, 0, sizeof(g_fake_proc));
+	g_fake_proc.lxid = 1;
+	MyProc = &g_fake_proc;
+	CritSectionCount = 0;
 }
 
 static ClusterSemanticAdmissionToken
@@ -2131,13 +2135,103 @@ UT_TEST(test_active_publish_rejects_same_wrap_different_xid_before_wal)
  *	precommit and written after the commit record flush (F-D-29)
  * ============================================================ */
 
+/* The ordinary caller holds this window from before WAL insert until after
+ * the stamp. Restore it even when the fixture intercepts a production PANIC. */
+static void
+apply_in_commit_window(XLogRecPtr commit_end)
+{
+	int saved_flags = MyProc->delayChkptFlags;
+	uint32 saved_critical = CritSectionCount;
+
+	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+	CritSectionCount++;
+	PG_TRY();
+	{
+		cluster_tt_slot_durable_commit_apply(commit_end);
+	}
+	PG_FINALLY();
+	{
+		MyProc->delayChkptFlags = saved_flags;
+		CritSectionCount = saved_critical;
+	}
+	PG_END_TRY();
+}
+
 /* Flush the commit record ending at commit_end, then write the staged stamp. */
 static void
 apply_after_flush(XLogRecPtr commit_end)
 {
 	g_flush_ptr = commit_end;
 	g_write_requires_flush = commit_end;
-	cluster_tt_slot_durable_commit_apply(commit_end);
+	apply_in_commit_window(commit_end);
+}
+
+/* Flushed WAL alone cannot qualify the ordinary checkpoint-covered stamp.
+ * An auxiliary process's delay flag has no valid VXID for the native wait. */
+static void
+check_commit_apply_unprotected(unsigned missing)
+{
+	ClusterSemanticAdmissionToken admission = source_modifier_token();
+	UndoSegmentHeaderData *resident = (UndoSegmentHeaderData *)g_current_resident;
+	TTSlot before;
+	TTSlot successor;
+	volatile bool caught = false;
+
+	reset_current_write_mock();
+	seed_current_exact_active(7, 100, 5);
+	before = resident->tt_slots[7];
+	(void)cluster_tt_slot_durable_commit_stage(1, 4, 7, 100, 5, scn_encode(1, 42), &admission,
+											   &successor);
+	g_flush_ptr = (XLogRecPtr)0x5000;
+	MyProc->delayChkptFlags = DELAY_CHKPT_START;
+	CritSectionCount = 1;
+	if (missing == 0)
+		MyProc->delayChkptFlags = DELAY_CHKPT_COMPLETE;
+	else if (missing == 1)
+		MyProc->lxid = InvalidLocalTransactionId;
+	else if (missing == 2)
+		CritSectionCount = 0;
+	else
+		MyProc = NULL;
+	PG_TRY();
+	{
+		cluster_tt_slot_durable_commit_apply((XLogRecPtr)0x5000);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	MyProc = &g_fake_proc;
+	MyProc->delayChkptFlags = 0;
+	CritSectionCount = 0;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(last_ereport_elevel, PANIC);
+	UT_ASSERT_EQ(g_lock_content_calls, 0);
+	UT_ASSERT_EQ(g_write_hdr_calls, 0);
+	UT_ASSERT_EQ(memcmp(&resident->tt_slots[7], &before, sizeof(before)), 0);
+	UT_ASSERT(cluster_tt_slot_durable_commit_staged(1, 7, 100, 5));
+	UT_ASSERT_EQ(g_writer_fd_open, 1);
+}
+
+UT_TEST(test_commit_apply_requires_checkpoint_start_delay)
+{
+	check_commit_apply_unprotected(0);
+}
+
+UT_TEST(test_commit_apply_requires_valid_native_wait_vxid)
+{
+	check_commit_apply_unprotected(1);
+}
+
+UT_TEST(test_commit_apply_requires_critical_section)
+{
+	check_commit_apply_unprotected(2);
+}
+
+UT_TEST(test_commit_apply_requires_native_process)
+{
+	check_commit_apply_unprotected(3);
 }
 
 UT_TEST(test_commit_stage_then_apply_publishes_identical_durable_and_resident_successor)
@@ -2160,6 +2254,9 @@ UT_TEST(test_commit_stage_then_apply_publishes_identical_durable_and_resident_su
 	UT_ASSERT(admission.entered);
 	UT_ASSERT_EQ(g_write_hdr_calls, 1);
 	UT_ASSERT(!g_write_before_flush);
+	UT_ASSERT((g_write_delay_flags & DELAY_CHKPT_START) != 0);
+	UT_ASSERT_EQ(MyProc->delayChkptFlags, 0);
+	UT_ASSERT_EQ(CritSectionCount, 0);
 	UT_ASSERT_EQ(memcmp(&successor, &g_last_written_slot, sizeof(successor)), 0);
 	UT_ASSERT_EQ(memcmp(&resident->tt_slots[7], &successor, sizeof(successor)), 0);
 	UT_ASSERT(cluster_tt_durable_slot_match(successor.status, successor.xid, successor.wrap,
@@ -2207,7 +2304,7 @@ UT_TEST(test_precommit_stamp_never_precedes_commit_record_flush)
 	g_flush_ptr = (XLogRecPtr)0x4fff;
 	PG_TRY();
 	{
-		cluster_tt_slot_durable_commit_apply((XLogRecPtr)0x5000);
+		apply_in_commit_window((XLogRecPtr)0x5000);
 	}
 	PG_CATCH();
 	{
@@ -3666,7 +3763,7 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(112);
+	UT_PLAN(116);
 
 	UT_RUN(test_layout_sizes);
 
@@ -3711,6 +3808,10 @@ main(int argc, char **argv)
 	UT_RUN(test_active_publish_retries_rollover_before_xcur_allocator_linearization);
 	UT_RUN(test_active_publish_rejects_same_wrap_different_xid_before_wal);
 	UT_RUN(test_commit_stage_then_apply_publishes_identical_durable_and_resident_successor);
+	UT_RUN(test_commit_apply_requires_checkpoint_start_delay);
+	UT_RUN(test_commit_apply_requires_valid_native_wait_vxid);
+	UT_RUN(test_commit_apply_requires_critical_section);
+	UT_RUN(test_commit_apply_requires_native_process);
 	UT_RUN(test_precommit_stamp_never_precedes_commit_record_flush);
 	UT_RUN(test_commit_stage_target_open_reuses_same_block0_authority);
 	UT_RUN(test_commit_stage_accepts_exact_active_on_rolled_away_segment);

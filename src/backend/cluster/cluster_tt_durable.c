@@ -1387,6 +1387,15 @@ cluster_tt_slot_durable_commit_apply(XLogRecPtr commit_end)
 	if (!stage->armed)
 		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("no canonical TT commit stamp is staged for this commit record")));
+	/* The native checkpoint wait ignores processes without a valid VXID.
+	 * Recovery executors must use their separately captured stamp window. */
+	if (MyProc == NULL || !LocalTransactionIdIsValid(MyProc->lxid) || CritSectionCount == 0
+		|| (MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0)
+		ereport(PANIC,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("canonical TT commit stamp has no native checkpoint protection"),
+				 errhint("Apply the ordinary commit stamp inside its transaction's checkpoint "
+						 "delay window, after flushing the commit record.")));
 	if (XLogRecPtrIsInvalid(commit_end) || GetFlushRecPtr(NULL) < commit_end)
 		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("canonical TT commit stamp would precede its commit record"),
