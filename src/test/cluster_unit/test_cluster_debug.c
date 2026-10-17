@@ -6228,7 +6228,7 @@ UT_TEST(test_debug_phase_symbol_present)
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(23);
 	UT_RUN(test_debug_dump_normal_completion_never_fabricates_unready_proof);
 	UT_RUN(test_debug_dump_srf_linkable);
 	UT_RUN(test_debug_dump_omits_retired_legacy_pcm_x_compatibility_keys);

@@ -11260,7 +11260,8 @@ cluster_bufmgr_discard_buffer_v4(BufferDesc *buf)
 			&& buf->pcm_state != PCM_STATE_X)
 		|| !(fence_sampled = true, fence_matches = cluster_pcm_own_fence_matches_locked(buf, &capture))
 		|| (buf->buffer_type != BUF_TYPE_CURRENT && buf->buffer_type != BUF_TYPE_PI
-			&& buf->buffer_type != BUF_TYPE_CR)) {
+			&& buf->buffer_type != BUF_TYPE_CR && buf->buffer_type != BUF_TYPE_SCUR
+			&& buf->buffer_type != BUF_TYPE_XCUR)) {
 		/* First rejected term, with the original short-circuit probe order.
 		 * 2=pin, 4=I/O, 8=generation, 16=delivery, 32=PCM, 64=fence, 128=type. */
 		detail.state = state;
@@ -11280,7 +11281,9 @@ cluster_bufmgr_discard_buffer_v4(BufferDesc *buf)
 		LWLockRelease(partition);
 		return false;
 	}
-	/* CR has its own version-chain mapping tail and never owns dirty work. */
+	/* SCUR/XCUR are native current-copy labels, retained even after release.
+	 * The original PCM/fence capture above, rather than the hint label, owns
+	 * the eviction. CR has a separate read-only version-chain mapping tail. */
 	if (buf->buffer_type == BUF_TYPE_CR) {
 		bool complete = InvalidateBufferCommitLocked(buf, &tag, hash, partition, state);
 		if (!complete) {

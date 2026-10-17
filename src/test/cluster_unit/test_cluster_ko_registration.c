@@ -1861,7 +1861,7 @@ UT_TEST(test_prepared_mode_keeps_original_completed_legacy_owner)
 int
 main(void)
 {
-	UT_PLAN(54);
+	UT_PLAN(55);
 	UT_RUN(test_production_capability_selects_complete_committed_window);
 	UT_RUN(test_production_origin_refuses_old_peer_before_publication);
 	UT_RUN(test_production_origin_cannot_use_legacy_barrier_with_no_peers);

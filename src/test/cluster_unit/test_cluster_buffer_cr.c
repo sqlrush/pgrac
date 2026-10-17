@@ -1821,15 +1821,19 @@ UT_TEST(test_committed_discard_requires_retired_identity_before_any_buffer_touch
 UT_TEST(test_committed_discard_removes_dirty_current_and_pi_all_forks_without_io)
 {
 	for (ForkNumber fork = MAIN_FORKNUM; fork <= MAX_FORKNUM; fork++) {
-		for (unsigned kind = 0; kind < 3; kind++) {
+		for (unsigned kind = 0; kind < 7; kind++) {
 			BufferTag tag = reset_buffers();
 			BufferDesc *buf = GetBufferDescriptor(2);
 			uint32 budget = 128, cursor = 0;
 			tag.forkNum = fork;
 			ko_retired = true;
 			install_current(&tag, 2);
-			buf->pcm_state = kind == 0 ? PCM_STATE_X : kind == 1 ? PCM_STATE_S : PCM_STATE_N;
+			buf->pcm_state = kind == 0 || kind == 4 ? PCM_STATE_X
+				: kind == 1 || kind == 3 ? PCM_STATE_S : PCM_STATE_N;
 			if (kind == 2) buf->buffer_type = BUF_TYPE_PI;
+			/* Real native labels, including the last label retained after release. */
+			if (kind == 3 || kind == 5) buf->buffer_type = BUF_TYPE_SCUR;
+			if (kind == 4 || kind == 6) buf->buffer_type = BUF_TYPE_XCUR;
 			pg_atomic_fetch_or_u32(&buf->state, BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED);
 			UT_ASSERT_EQ(cluster_bufmgr_discard_relation_v4(ko_locator, &budget, &cursor),
 				CLUSTER_BUFFER_DRAIN_EMPTY);
@@ -1845,19 +1849,27 @@ UT_TEST(test_committed_discard_removes_dirty_current_and_pi_all_forks_without_io
 
 UT_TEST(test_origin_discard_scope_removes_dead_bytes_without_directory_retirement)
 {
-	BufferTag tag = reset_buffers();
-	uint32 budget = 128, cursor = 0;
+	for (unsigned kind = 0; kind < 3; kind++) {
+		BufferTag tag = reset_buffers();
+		uint32 budget = 128, cursor = 0;
 
-	ko_origin_discard = true; /* Exact native owner is the separate KO fixture. */
-	install_current(&tag, 2);
-	pg_atomic_fetch_or_u32(&GetBufferDescriptor(2)->state, BM_DIRTY);
-	UT_ASSERT(!cluster_ko_directory_drop_retired_v3(ko_locator));
-	UT_ASSERT_EQ(cluster_bufmgr_discard_relation_v4(ko_locator, &budget, &cursor),
-		CLUSTER_BUFFER_DRAIN_EMPTY);
-	UT_ASSERT_EQ(BufTableLookup(&tag, BufTableHashCode(&tag)), -1);
-	UT_ASSERT_EQ(frees, 1);
-	UT_ASSERT_EQ(physical_writes + lock_depth + remembered_pins, 0);
-	UT_ASSERT(!cluster_ko_directory_drop_retired_v3(ko_locator));
+		ko_origin_discard = true; /* Exact native owner is the separate KO fixture. */
+		/* Keep the original MAIN/current case and the observed SPACE/XCUR tuple. */
+		if (kind != 0) tag.forkNum = SPACE_FORKNUM;
+		install_current(&tag, 2);
+		if (kind != 0) {
+			GetBufferDescriptor(2)->buffer_type = kind == 1 ? BUF_TYPE_SCUR : BUF_TYPE_XCUR;
+			GetBufferDescriptor(2)->pcm_state = kind == 1 ? PCM_STATE_S : PCM_STATE_X;
+		}
+		pg_atomic_fetch_or_u32(&GetBufferDescriptor(2)->state, BM_DIRTY);
+		UT_ASSERT(!cluster_ko_directory_drop_retired_v3(ko_locator));
+		UT_ASSERT_EQ(cluster_bufmgr_discard_relation_v4(ko_locator, &budget, &cursor),
+			CLUSTER_BUFFER_DRAIN_EMPTY);
+		UT_ASSERT_EQ(BufTableLookup(&tag, BufTableHashCode(&tag)), -1);
+		UT_ASSERT_EQ(frees, 1);
+		UT_ASSERT_EQ(physical_writes + lock_depth + remembered_pins, 0);
+		UT_ASSERT(!cluster_ko_directory_drop_retired_v3(ko_locator));
+	}
 }
 
 UT_TEST(test_committed_discard_keeps_pins_io_and_ownership_reservations)
