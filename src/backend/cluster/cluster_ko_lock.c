@@ -337,6 +337,9 @@ static bool ko_shared_enqueue_v3(const ClusterKoSharedMessageV3 *message, uint64
 
 typedef struct ClusterKoNativeContinuation {
 	dsa_pointer next;
+	/* The original transaction publication returned before committed drain.
+	 * This records a milestone, never READY, SPACE or deletion authority. */
+	bool publication_observed;
 	bool buffers_released;
 	/* The original owner has passed the pre-delete handoff. This is
 	 * deliberately separate from buffers_released: DropRelationsAllBuffers
@@ -4713,10 +4716,58 @@ cluster_ko_shared_native_commit_v2(void)
 	}
 }
 
+/* A registered operation reaches publication before its committed drain.
+ * Keep that original phase separate from the completed SPACE consumer below.
+ * The native allocation is still producer-owned; all mutable comparisons and
+ * the milestone publication share the original KO lock. No live proof or I/O
+ * can repair or refresh a committed operation here. */
+static void
+ko_native_registration_published(ClusterKoCompletionV2 *owned,
+								ClusterKoNativeContinuation *work,
+								const ClusterKoSharedContext *before)
+{
+	ClusterKoSharedContext *entry = NULL;
+	bool qualified;
+
+	SpinLockAcquire(&ko_state->shared_lock);
+	if (owned->slot < CLUSTER_KO_SHARED_CAPACITY)
+		entry = &ko_state->contexts[owned->slot];
+	qualified = !owned->barrier_private && !owned->space_observed
+		&& !owned->truncate_observed && !owned->drop_observed && !owned->origin_data_closed
+		&& owned->barrier_ready_peers == 0 && !work->recovery_required
+		&& !work->buffers_released && !work->predelete_ready
+		&& before->used && before->v3 && before->committed_drain_pending
+		&& !before->complete && !before->origin_detached && !before->ax_release_requested
+		&& !before->ax_failed && !before->structure_owned && before->cancel_sqlerrcode == 0
+		&& before->pid == owned->pid && before->serial == owned->serial
+		&& (before->request_sent_peers | before->request_sending_peers
+			| before->request_uncertain_peers | before->request_done_peers
+			| before->request_failed_peers) == 0
+		&& memcmp(&before->request, &owned->barrier_request_v3.base,
+				  sizeof(before->request)) == 0
+		&& memcmp(&before->request_v3, &owned->barrier_request_v3,
+				  sizeof(before->request_v3)) == 0
+		&& memcmp(before->peer_boots, owned->barrier_boots, sizeof(before->peer_boots)) == 0
+		&& memcmp(before, &work->context, sizeof(*before)) == 0
+		&& entry != NULL && memcmp(before, entry, sizeof(*before)) == 0;
+	if (work->context.pid == owned->pid && work->context.serial == owned->serial
+		&& !work->buffers_released) {
+		if (qualified)
+			work->publication_observed = true;
+		else {
+			work->recovery_required = true;
+			ko_state->native_recovery_required = true;
+		}
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+}
+
 /* Only the successful native AtEOXact_Inval COMMIT boundary calls this,
- * after the original publication ACKs and before native lock release. Final
- * SPACE DATA was saved before native_commit; no self-peer message or local
- * SI cache callback may manufacture this fact. Never wait for IO here. */
+ * after the original publication ACKs and before native lock release.
+ * Completed barriers retain their original SPACE-before-close contract;
+ * committed registrations retain publication separately until their drain.
+ * No self-peer message or local SI cache callback may manufacture this fact.
+ * Never wait for IO here. */
 void
 cluster_ko_shared_native_publication_v3(void)
 {
@@ -4729,7 +4780,9 @@ cluster_ko_shared_native_publication_v3(void)
 		bool qualified;
 
 		if (!owned->barrier_v3
-			|| owned->barrier_request_v3.operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP
+			|| (owned->barrier_request_v3.operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP
+				&& (owned->barrier_private || owned->barrier_request_v3.operation
+					!= CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD))
 			|| !owned->native_transaction)
 			continue;
 		if (!owned->native_handed_off || !owned->postcommit || owned->native_pending
@@ -4747,6 +4800,12 @@ cluster_ko_shared_native_publication_v3(void)
 		before = work->context;
 		qualified = !work->recovery_required && !work->buffers_released;
 		SpinLockRelease(&ko_state->shared_lock);
+		if (before.committed_drain_pending) {
+			ko_native_registration_published(owned, work, &before);
+			continue;
+		}
+		if (owned->barrier_request_v3.operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP)
+			continue;
 		qualified = qualified && owned->space_observed && before.used && before.complete
 			&& before.v3 && before.structure_owned && before.structure_drop_pending
 			&& before.pid == owned->pid && before.serial == owned->serial
