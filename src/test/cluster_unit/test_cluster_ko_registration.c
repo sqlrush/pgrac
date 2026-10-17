@@ -1228,6 +1228,8 @@ run_committed_window(uint16 operation, unsigned mode, bool held)
 	window_work = owner->native_reserved;
 	window_slot = owner->slot;
 	window_mode = mode;
+	native_window_space = mode == 7 ? NULL : (ClusterSpaceDropState *)&window_request;
+	native_window_space_owner = mode == 8 ? NULL : owner;
 	window_expect_ready = held && mode < 3;
 	postcommit_owner = owner;
 	memset(&postcommit_binding, 0, sizeof(postcommit_binding));
@@ -1266,7 +1268,9 @@ run_committed_window(uint16 operation, unsigned mode, bool held)
 	UT_ASSERT(!caught);
 	UT_ASSERT_EQ(postcommit_deletes, 1);
 	UT_ASSERT_EQ(native_fork_unlinks, 0);
-	UT_ASSERT_EQ(send_calls, !held ? 0 : mode == 1 ? 2 : 1);
+	UT_ASSERT_EQ(native_window_space_checks, held ? 1 : 0);
+	UT_ASSERT_EQ(native_window_space_releases, mode == 7 ? 0 : 1);
+	UT_ASSERT_EQ(send_calls, !held || mode >= 7 ? 0 : mode == 1 ? 2 : 1);
 	UT_ASSERT(!barrier_active);
 	UT_ASSERT_EQ(native_window_errors_flushed, held && mode == 5 ? 1 : 0);
 	if (held && mode == 2)
@@ -1298,7 +1302,7 @@ UT_TEST(test_commit_window_keeps_backpressure_and_exact_result_waits)
 
 UT_TEST(test_commit_window_failure_retains_original_owner_without_error)
 {
-	for (unsigned mode = 3; mode <= 6; mode++)
+	for (unsigned mode = 3; mode <= 8; mode++)
 		run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, mode, true);
 }
 
@@ -1307,10 +1311,56 @@ UT_TEST(test_commit_window_never_enters_without_held_interrupts)
 	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, false);
 }
 
+UT_TEST(test_prepared_mode_never_falls_back_from_changed_committed_identity)
+{
+	KoAxBinding binding = committed_origin_setup();
+	ClusterKoCompletionV2 *owner = committed_origin_register(
+		CLUSTER_KO_SHARED_V3_OPERATION_DROP, &binding), *claimed = NULL;
+	bool mode = false;
+
+	UT_ASSERT(!cluster_ko_shared_drop_prepare_mode_v4(owner, &mode));
+	UT_ASSERT(!mode);
+	UT_ASSERT(cluster_ko_shared_claim_structure(&space_identity, CLUSTER_SPACE_WAL_TOMBSTONE,
+		&claimed));
+	UT_ASSERT(claimed == owner);
+	UT_ASSERT(cluster_ko_shared_drop_prepare_mode_v4(owner, &mode) && mode);
+	UT_ASSERT(!cluster_ko_shared_drop_write_current(owner, &space_identity));
+	owner->barrier_committed_discard = false;
+	UT_ASSERT(!cluster_ko_shared_drop_prepare_mode_v4(owner, &mode));
+	UT_ASSERT(mode); /* Failed classification leaves output unchanged. */
+	owner->barrier_committed_discard = true;
+	storage.contexts[owner->slot].serial++;
+	UT_ASSERT(!cluster_ko_shared_drop_prepare_mode_v4(owner, &mode));
+	UT_ASSERT(mode);
+	storage.contexts[owner->slot].serial--;
+	UT_ASSERT(cluster_ko_shared_drop_prepare_mode_v4(owner, &mode) && mode);
+	owner->postcommit = true;
+	UT_ASSERT(!cluster_ko_shared_drop_prepare_mode_v4(owner, &mode));
+	owner->postcommit = false;
+	assert_no_object_work();
+	cluster_ko_shared_release_v2(&owner);
+}
+
+UT_TEST(test_prepared_mode_keeps_original_completed_legacy_owner)
+{
+	ClusterKoCompletionV2 *owner = v3_native_structure_owner(
+		CLUSTER_KO_SHARED_V3_OPERATION_DROP), *claimed = NULL;
+	bool mode = true;
+
+	UT_ASSERT(cluster_ko_shared_claim_structure(&space_identity, CLUSTER_SPACE_WAL_TOMBSTONE,
+		&claimed));
+	UT_ASSERT(claimed == owner);
+	UT_ASSERT(cluster_ko_shared_drop_prepare_mode_v4(owner, &mode) && !mode);
+	UT_ASSERT(cluster_ko_shared_drop_write_current(owner, &space_identity));
+	cluster_ko_shared_release_v2(&owner);
+}
+
 int
 main(void)
 {
-	UT_PLAN(40);
+	UT_PLAN(42);
+	UT_RUN(test_prepared_mode_never_falls_back_from_changed_committed_identity);
+	UT_RUN(test_prepared_mode_keeps_original_completed_legacy_owner);
 	UT_RUN(test_actual_commit_window_collects_ready_after_local_cleanup);
 	UT_RUN(test_commit_window_keeps_backpressure_and_exact_result_waits);
 	UT_RUN(test_commit_window_failure_retains_original_owner_without_error);

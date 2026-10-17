@@ -1488,7 +1488,13 @@ AtSubStart_ResourceOwner(void)
  * If you change this function, see RecordTransactionCommitPrepared also.
  */
 static TransactionId
-RecordTransactionCommit(void)
+RecordTransactionCommit(
+#ifdef USE_PGRAC_CLUSTER
+	ClusterSpaceDropState **deferred_drop
+#else
+	void
+#endif
+)
 {
 	TransactionId xid = GetTopTransactionIdIfAny();
 	bool		markXidCommitted = TransactionIdIsValid(xid);
@@ -1754,7 +1760,8 @@ RecordTransactionCommit(void)
 			space_drop = cluster_space_drop_prepare(rels, nrels);
 			if (space_drop == NULL)
 				elog(ERROR, "cannot prepare exact SPACE deletion");
-			if (!cluster_space_drop_authorize(space_drop))
+			if (!cluster_space_drop_is_deferred_v4(space_drop)
+				&& !cluster_space_drop_authorize(space_drop))
 				elog(ERROR, "cannot authorize exact SPACE deletion");
 			space_drop_data = cluster_space_drop_wal(space_drop, &space_drop_len);
 		}
@@ -1907,7 +1914,10 @@ RecordTransactionCommit(void)
 		if (space_drop != NULL)
 		{
 			Assert(commit_record_flushed);
-			cluster_space_drop_publish(space_drop, XactLastRecEnd);
+			if (cluster_space_drop_is_deferred_v4(space_drop))
+				cluster_space_drop_defer_v4(space_drop, XactLastRecEnd);
+			else
+				cluster_space_drop_publish(space_drop, XactLastRecEnd);
 		}
 #endif
 		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
@@ -1917,7 +1927,10 @@ RecordTransactionCommit(void)
 #ifdef USE_PGRAC_CLUSTER
 	if (space_drop != NULL)
 	{
-		cluster_space_drop_finish(space_drop);
+		if (cluster_space_drop_is_deferred_v4(space_drop))
+			*deferred_drop = space_drop;
+		else
+			cluster_space_drop_finish(space_drop);
 		space_drop = NULL;
 	}
 	if (markXidCommitted)
@@ -2693,6 +2706,9 @@ CommitTransaction(void)
 	TransactionState s = CurrentTransactionState;
 	TransactionId latestXid;
 	bool		is_parallel_worker;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterSpaceDropState *deferred_space_drop = NULL;
+#endif
 
 	is_parallel_worker = (s->blockState == TBLOCK_PARALLEL_INPROGRESS);
 
@@ -2903,7 +2919,11 @@ CommitTransaction(void)
 		 * We need to mark our XIDs as committed in pg_xact.  This is where we
 		 * durably commit.
 		 */
+#ifdef USE_PGRAC_CLUSTER
+		latestXid = RecordTransactionCommit(&deferred_space_drop);
+#else
 		latestXid = RecordTransactionCommit();
+#endif
 	}
 	else
 	{
@@ -3000,7 +3020,14 @@ CommitTransaction(void)
 	 * original AX is still held. Unfinished physical work stays native-owned.
 	 * Spec: 2026-10-16-pre2-p014-am05-shared-ddl-autocommit.md */
 	if (!is_parallel_worker)
-		cluster_ko_shared_native_window_v4();
+	{
+		cluster_ko_shared_native_window_v4(deferred_space_drop);
+		/* The immutable COMMIT remains in WAL and the original native owner
+		 * retains unfinished work. Release only this private preparation. */
+		if (deferred_space_drop != NULL)
+			cluster_space_drop_finish(deferred_space_drop);
+		deferred_space_drop = NULL;
+	}
 #endif
 
 	ResourceOwnerRelease(TopTransactionResourceOwner,

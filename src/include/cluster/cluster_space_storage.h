@@ -190,6 +190,14 @@ typedef struct ClusterSpaceDropState ClusterSpaceDropState;
  * delay still held. Finish unlocks before unlink. */
 extern ClusterSpaceDropState *cluster_space_drop_prepare(const RelFileLocator *locators, int count);
 extern const char *cluster_space_drop_wal(const ClusterSpaceDropState *state, uint32 *len);
+/* Deferred native purpose retains this unpinned preparation through local
+ * transaction cleanup. The original commit critical section records its
+ * flushed LSN, without publishing either page. No new persistent format. */
+extern bool cluster_space_drop_is_deferred_v4(const ClusterSpaceDropState *state);
+extern void cluster_space_drop_defer_v4(ClusterSpaceDropState *state, XLogRecPtr commit_lsn);
+struct ClusterKoCompletionV2;
+extern bool cluster_space_drop_committed_owner_v4(const ClusterSpaceDropState *state,
+												 const struct ClusterKoCompletionV2 *completion);
 extern bool cluster_space_drop_authorize(ClusterSpaceDropState *state);
 extern void cluster_space_drop_publish(ClusterSpaceDropState *state, XLogRecPtr commit_lsn);
 extern void cluster_space_drop_finish(ClusterSpaceDropState *state);

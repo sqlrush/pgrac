@@ -508,6 +508,10 @@ extern bool cluster_ko_shared_claim_v2(const ClusterSpaceIdentityKey *key,
 extern bool cluster_ko_shared_claim_structure(const ClusterSpaceIdentity *identity,
 											  ClusterSpaceWalAction action,
 											  ClusterKoCompletionV2 **out);
+/* Read the original claimed native purpose before COMMIT. This does not
+ * confer physical write permission; an unknown/mismatched owner refuses. */
+extern bool cluster_ko_shared_drop_prepare_mode_v4(const ClusterKoCompletionV2 *completion,
+												  bool *committed_discard);
 /* Outside critical sections, validate the claimed operation's completed
  * barrier before physical write. The SPACE owner checks this before reacquiring
  * its pages and after revalidating their exact typed predecessor under lock. */
@@ -592,7 +596,8 @@ extern bool cluster_ko_shared_native_handoff_v2(ClusterKoCompletionV2 **completi
  * handle. Disabled until the full structural protocol is advertised. */
 extern void cluster_ko_shared_native_commit_v2(void);
 extern void cluster_ko_shared_native_publication_v3(void);
-extern void cluster_ko_shared_native_window_v4(void);
+struct ClusterSpaceDropState;
+extern void cluster_ko_shared_native_window_v4(const struct ClusterSpaceDropState *space_drop);
 /* Native smgr only, after DropRelationsAllBuffers returns for this locator.
  * Releases only the original local-buffer gate, never physical durability. */
 extern void cluster_ko_shared_native_drop_buffers_released_v2(RelFileLocator locator);

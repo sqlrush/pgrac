@@ -94,6 +94,7 @@ static unsigned ko_claims;
 static unsigned ko_structure_claims;
 static bool ko_pending, ko_claim_unavailable;
 static bool ko_drop_write_allowed;
+static bool committed_drop_mode, drop_mode_unknown;
 static bool ko_drop_write_revoke_on_read;
 static int drop_resume_read_error;
 static unsigned ko_drop_write_checks;
@@ -1193,6 +1194,18 @@ cluster_ko_shared_claim_structure(const ClusterSpaceIdentity *identity,
 	return cluster_ko_shared_claim_v2(&identity->key, identity->incarnation, out);
 }
 
+bool
+cluster_ko_shared_drop_prepare_mode_v4(const ClusterKoCompletionV2 *completion,
+									 bool *committed_discard)
+{
+	UT_ASSERT_EQ(pinned | locked | CritSectionCount, 0);
+	UT_ASSERT(completion == (ClusterKoCompletionV2 *)&ko_handle && !ko_pending);
+	if (drop_mode_unknown)
+		return false;
+	*committed_discard = committed_drop_mode;
+	return true;
+}
+
 /* The real KO readiness consumer is exercised in the registration fixture.
  * Here bind the original captured identity, independently of the page bytes
  * that the SPACE producer must revalidate after reacquiring them. */
@@ -1501,6 +1514,7 @@ reset(void)
 	ko_structure_claims = 0;
 	ko_pending = ko_claim_unavailable = false;
 	ko_drop_write_allowed = true;
+	committed_drop_mode = drop_mode_unknown = false;
 	ko_drop_write_revoke_on_read = false;
 	drop_resume_read_error = -1;
 	ko_drop_write_checks = 0;
@@ -3740,10 +3754,37 @@ UT_TEST(test_native_drop_requires_final_space_observation_before_release)
 	}
 }
 
+UT_TEST(test_deferred_record_requires_known_original_mode_and_commit)
+{
+	for (unsigned unknown = 0; unknown < 2; unknown++) {
+		Relation rel = native_truncate_relation();
+		ClusterSpaceDropState *state;
+
+		drop_owner = committed_drop_mode = true;
+		drop_mode_unknown = unknown;
+		state = prepare_original_drop(&locator, 1);
+		UT_ASSERT((state == NULL) == (unknown != 0));
+		UT_ASSERT_EQ(dirty_calls + space_flushes + space_syncs + space_observations, 0);
+		UT_ASSERT_EQ(pinned | locked, 0);
+		if (state != NULL) {
+			UT_ASSERT(cluster_space_drop_is_deferred_v4(state));
+			UT_ASSERT(!cluster_space_drop_committed_owner_v4(state,
+				(ClusterKoCompletionV2 *)&ko_handle));
+			/* A later fixture mode change cannot reclassify the preparation. */
+			committed_drop_mode = false;
+			UT_ASSERT(cluster_space_drop_is_deferred_v4(state));
+			cluster_space_drop_finish(state);
+		}
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
 UT_TEST(test_native_commit_logs_decides_and_publishes_before_checkpoint_release)
 {
 	Relation rel = native_truncate_relation();
 	ClusterSpaceDropState *space_drop = NULL;
+	ClusterSpaceDropState *deferred_space_drop = NULL;
+	ClusterSpaceDropState **deferred_drop = &deferred_space_drop;
 	const char *space_drop_data = NULL;
 	uint32 space_drop_len = 0;
 	bool wrote_xlog = true, markXidCommitted = true, forceSyncCommit = false;
@@ -3786,6 +3827,95 @@ UT_TEST(test_native_commit_logs_decides_and_publishes_before_checkpoint_release)
 		cluster_space_drop_finish(space_drop); /* Release the pre-fix RED fixture. */
 	smgrDoPendingDeletes(true);
 	UT_ASSERT_EQ(unlink_calls, 1);
+	pfree(rels);
+	FreeFakeRelcacheEntry(rel);
+}
+
+UT_TEST(test_committed_drop_records_wal_without_precommit_physical_authorization)
+{
+	Relation rel = native_truncate_relation();
+	ClusterSpaceDropState *space_drop = NULL;
+	ClusterSpaceDropState *deferred_space_drop = NULL;
+	ClusterSpaceDropState **deferred_drop = &deferred_space_drop;
+	volatile bool caught = false;
+	const char *space_drop_data = NULL;
+	uint32 space_drop_len = 0;
+	bool wrote_xlog = true, markXidCommitted = true, forceSyncCommit = false;
+	bool RelcacheInitFileInval = false, has_tt_fold = false, commit_record_flushed = false;
+	bool tt_stamp_staged = false;
+	int nchildren = 0, nrels = 1, ndroppedstats = 0, nmsgs = 0;
+	int synchronous_commit = SYNCHRONOUS_COMMIT_OFF;
+	TransactionId xid = 501, *children = NULL;
+	RelFileLocator *rels = &locator;
+	xl_xact_stats_item *droppedstats = NULL;
+	SharedInvalidationMessage *invalMessages = NULL;
+	SCN commit_scn = InvalidScn, tt_commit_scn = InvalidScn;
+	xl_xact_tt_commit tt_fold = { 0 };
+	ClusterSpaceIdentity identity;
+	ClusterSpaceIdentityKey expected;
+	uint64 token;
+
+	drop_owner = committed_drop_mode = true;
+	ko_drop_write_allowed = false;
+	UT_ASSERT(cluster_space_relation_read_identity(locator, &identity));
+	expected = identity.key;
+	native_owner = true;
+	storage.smgr_owner = &rel->rd_smgr;
+	RelationDropStorage(rel);
+	nrels = smgrGetPendingDeletes(true, &rels);
+	UT_ASSERT_EQ(nrels, 1);
+expecting_error = true;
+	PG_TRY(); {
+#include "test_cluster_space_commit.inc"
+	}
+	PG_CATCH(); { caught = true; }
+	PG_END_TRY();
+	expecting_error = false;
+	UT_ASSERT(!caught);
+	UT_ASSERT_EQ(ko_drop_write_checks, 0);
+	UT_ASSERT_EQ(native_commits, 1);
+	UT_ASSERT_EQ(commit_decisions, 1);
+	UT_ASSERT_EQ(dirty_calls + space_flushes + space_syncs + space_readbacks + space_observations, 0);
+	UT_ASSERT(commit_record_flushed);
+	UT_ASSERT_EQ(MyProc->delayChkptFlags | CritSectionCount | pinned | locked, 0);
+	UT_ASSERT(space_drop == NULL && deferred_space_drop != NULL);
+	if (deferred_space_drop != NULL) {
+		uint32 length;
+		char *record = (char *)cluster_space_drop_wal(deferred_space_drop, &length);
+		uint8 saved = record[0];
+
+		UT_ASSERT(cluster_space_drop_committed_owner_v4(deferred_space_drop,
+			(ClusterKoCompletionV2 *)&ko_handle));
+		UT_ASSERT(!cluster_space_drop_committed_owner_v4(deferred_space_drop,
+			(ClusterKoCompletionV2 *)&token));
+		UT_ASSERT(!cluster_space_drop_committed_owner_v4(NULL,
+			(ClusterKoCompletionV2 *)&ko_handle));
+		/* Neither a different serialized count nor changed original payload
+		 * may authorize this collector. Restore only the test's corruption. */
+		record[0] ^= 1;
+		UT_ASSERT(!cluster_space_drop_committed_owner_v4(deferred_space_drop,
+			(ClusterKoCompletionV2 *)&ko_handle));
+		record[0] = saved;
+		record[length - 1] ^= 1;
+		UT_ASSERT(!cluster_space_drop_committed_owner_v4(deferred_space_drop,
+			(ClusterKoCompletionV2 *)&ko_handle));
+		record[length - 1] ^= 1;
+		flush_calls = 0;
+		UT_ASSERT(!cluster_space_drop_committed_owner_v4(deferred_space_drop,
+			(ClusterKoCompletionV2 *)&ko_handle));
+		flush_calls = 1;
+		UT_ASSERT(cluster_space_drop_committed_owner_v4(deferred_space_drop,
+			(ClusterKoCompletionV2 *)&ko_handle));
+	}
+	UT_ASSERT(cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0, &expected,
+											 &identity, &token));
+	UT_ASSERT_EQ(identity.state, CLUSTER_SPACE_IDENTITY_LIVE);
+	/* No native deletion is authorized by a recorded COMMIT alone. */
+	UT_ASSERT_EQ(unlink_calls, 0);
+	if (space_drop != NULL)
+		cluster_space_drop_finish(space_drop);
+	if (deferred_space_drop != NULL)
+		cluster_space_drop_finish(deferred_space_drop);
 	pfree(rels);
 	FreeFakeRelcacheEntry(rel);
 }
@@ -4231,7 +4361,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(85);
+	UT_PLAN(87);
 	UT_RUN(test_drop_record_preparation_releases_both_pages_before_return);
 	UT_RUN(test_drop_resume_rejects_changed_reservation_without_replacing_record);
 	UT_RUN(test_drop_resume_preserves_record_and_requires_both_exact_predecessors);
@@ -4310,6 +4440,8 @@ main(void)
 	UT_RUN(test_drop_pair_stays_live_until_native_commit_is_durable);
 	UT_RUN(test_drop_precommit_failure_or_abandonment_preserves_live_pages);
 	UT_RUN(test_native_commit_logs_decides_and_publishes_before_checkpoint_release);
+	UT_RUN(test_committed_drop_records_wal_without_precommit_physical_authorization);
+	UT_RUN(test_deferred_record_requires_known_original_mode_and_commit);
 	UT_RUN(test_atomic_drop_commit_replays_all_partial_tombstones);
 	UT_RUN(test_drop_commit_refuses_missing_or_unbound_payload_before_mutation);
 	UT_RUN(test_standalone_tombstone_has_no_commit_authority);

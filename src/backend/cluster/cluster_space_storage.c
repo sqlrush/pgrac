@@ -835,6 +835,8 @@ struct ClusterSpaceDropState {
 	int count;
 	bool published;
 	bool write_authorized;
+	bool committed_discard; /* Immutable purpose, not physical permission. */
+	XLogRecPtr commit_lsn;  /* Set only by the original durable COMMIT caller. */
 	char *wal;
 	uint32 wal_len;
 	ClusterSpaceTruncateState *entries[FLEXIBLE_ARRAY_MEMBER];
@@ -1141,6 +1143,7 @@ cluster_space_drop_prepare(const RelFileLocator *locators, int count)
 	for (int i = 0; i < count; i++) {
 		ClusterSpaceIdentityKey expected;
 		ClusterSpaceTruncateState *entry;
+		bool committed_discard;
 
 		if ((i != 0 && RelFileLocatorEquals(sorted[i], sorted[i - 1]))
 			|| cluster_smgr_which_for(sorted[i], InvalidBackendId) != 1)
@@ -1154,6 +1157,10 @@ cluster_space_drop_prepare(const RelFileLocator *locators, int count)
 		/* Retain the record and original KO owner, not page references across
 		 * transaction cleanup. Physical publication requalifies the same pair. */
 		space_structure_unlock(entry);
+		if (!cluster_ko_shared_drop_prepare_mode_v4(entry->ko_completion, &committed_discard)
+			|| (state->count != 1 && state->committed_discard != committed_discard))
+			goto refused;
+		state->committed_discard = committed_discard;
 	}
 	if (state->count != 0) {
 		uint32 n = state->count;
@@ -1178,6 +1185,62 @@ cluster_space_drop_wal(const ClusterSpaceDropState *state, uint32 *len)
 {
 	*len = state == NULL ? 0 : state->wal_len;
 	return state == NULL ? NULL : state->wal;
+}
+
+bool
+cluster_space_drop_is_deferred_v4(const ClusterSpaceDropState *state)
+{
+	return state != NULL && state->count > 0 && state->committed_discard;
+}
+
+/* Same native COMMIT as the existing typed tail. This saves a WAL fact only;
+ * neither the old locked-page publisher nor a recovery writer is invoked. */
+void
+cluster_space_drop_defer_v4(ClusterSpaceDropState *state, XLogRecPtr commit_lsn)
+{
+	if (!cluster_space_drop_is_deferred_v4(state) || state->published || state->write_authorized
+		|| !XLogRecPtrIsInvalid(state->commit_lsn) || CritSectionCount == 0 || MyProc == NULL
+		|| !(MyProc->delayChkptFlags & DELAY_CHKPT_START)
+		|| XLogRecPtrIsInvalid(commit_lsn) || XLogNeedsFlush(commit_lsn))
+		elog(PANIC, "cannot retain SPACE deletion outside its original durable commit");
+	for (int i = 0; i < state->count; i++)
+		for (int j = 0; j < 2; j++)
+			if (BufferIsValid(state->entries[i]->buffers[j]))
+				elog(PANIC, "deferred SPACE deletion retained a buffer reference");
+	state->commit_lsn = commit_lsn;
+}
+
+/* Borrowed by the original committed-window collector. Compare the private
+ * entry with the exact bytes that the original native COMMIT emitted. The
+ * opaque completion must be the one claimed while preparing that record. */
+bool
+cluster_space_drop_committed_owner_v4(const ClusterSpaceDropState *state,
+									 const ClusterKoCompletionV2 *completion)
+{
+	int matches = 0;
+	uint32 count;
+
+	if (!cluster_space_drop_is_deferred_v4(state) || completion == NULL
+		|| state->published || state->write_authorized || CritSectionCount != 0
+		|| XLogRecPtrIsInvalid(state->commit_lsn) || XLogNeedsFlush(state->commit_lsn)
+		|| state->wal == NULL
+		|| state->wal_len != sizeof(uint32) + (Size)state->count * CLUSTER_SPACE_STRUCTURE_WAL_BYTES)
+		return false;
+	memcpy(&count, state->wal, sizeof(count));
+	if (count != state->count)
+		return false;
+	for (int i = 0; i < state->count; i++) {
+		const ClusterSpaceTruncateState *entry = state->entries[i];
+
+		if (entry->ko_completion != completion)
+			continue;
+		if (BufferIsValid(entry->buffers[0]) || BufferIsValid(entry->buffers[1])
+			|| memcmp(entry->wal, state->wal + sizeof(uint32)
+					  + (Size)i * CLUSTER_SPACE_STRUCTURE_WAL_BYTES, sizeof(entry->wal)) != 0)
+			return false;
+		matches++;
+	}
+	return matches == 1;
 }
 
 bool

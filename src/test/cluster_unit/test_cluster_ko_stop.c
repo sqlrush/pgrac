@@ -17,6 +17,7 @@
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "utils/memutils.h"
+#include "cluster/cluster_space_storage.h"
 #include "utils/resowner.h"
 #include "utils/inval.h"
 #include "utils/relcache.h"
@@ -75,6 +76,22 @@ static uint64 v3_refuse_batch;
 static bool v3_send_throw;
 static void (*v3_ack_send_hook)(void);
 static void (*lmon_wakeup_hook)(void);
+static const ClusterSpaceDropState *native_window_space;
+static const ClusterKoCompletionV2 *native_window_space_owner;
+static unsigned native_window_space_checks, native_window_space_releases;
+bool
+cluster_space_drop_committed_owner_v4(const ClusterSpaceDropState *state,
+									 const ClusterKoCompletionV2 *completion)
+{
+	native_window_space_checks++;
+	return state != NULL && state == native_window_space && completion == native_window_space_owner;
+}
+void
+cluster_space_drop_finish(ClusterSpaceDropState *state)
+{
+	Assert(state != NULL && state == native_window_space);
+	native_window_space_releases++;
+}
 static void (*native_window_wait_hook)(void);
 static unsigned native_window_errors_flushed;
 
@@ -1428,6 +1445,9 @@ reset_test(void)
 	native_alloc_fail = false;
 	native_commit_active = false;
 	native_window_wait_hook = NULL;
+	native_window_space = NULL;
+	native_window_space_owner = NULL;
+	native_window_space_checks = native_window_space_releases = 0;
 	native_window_errors_flushed = 0;
 	fixture_absent_ack_batch = 0;
 	fixture_absent_ack_removes = 0;
@@ -3914,6 +3934,7 @@ static void
 run_native_postcommit(void)
 {
 	bool is_parallel_worker = false;
+	ClusterSpaceDropState *deferred_space_drop = (ClusterSpaceDropState *)native_window_space;
 #include "test_cluster_ko_postcommit.inc"
 }
 

@@ -4547,6 +4547,29 @@ ko_shared_structure_current(const ClusterKoCompletionV2 *completion,
 		   && ko_shared_v3_local_binding_current(&context.request_v3);
 }
 
+/* The SPACE preparation already claimed this exact transaction-owned handle.
+ * Freeze its purpose; do not choose a phase from a later capability sample. */
+bool
+cluster_ko_shared_drop_prepare_mode_v4(const ClusterKoCompletionV2 *completion,
+									 bool *committed_discard)
+{
+	const ClusterKoCompletionV2 *owned = *ko_completion_link(completion);
+	ClusterKoSharedContext registered;
+
+	if (owned == NULL || committed_discard == NULL || !owned->native_transaction
+		|| owned->native_pending || owned->postcommit || owned->native_handed_off
+		|| owned->space_observed || owned->pid != MyProcPid
+		|| !ko_completion_owner_current(owned) || CritSectionCount != 0)
+		return false;
+	if (owned->barrier_committed_discard) {
+		if (!owned->barrier_v3 || !ko_shared_registration_snapshot_v3(owned, &registered))
+			return false;
+	} else if (!ko_completion_snapshot(owned, &registered))
+		return false;
+	*committed_discard = owned->barrier_committed_discard;
+	return true;
+}
+
 /* Record preparation may consume an unsent registration. Physical publication
  * still requires the original completed barrier and local DROP closure. */
 bool
@@ -7585,7 +7608,7 @@ ko_native_window_wait(ClusterKoCompletionV2 *owned, ClusterKoNativeContinuation 
  * the preallocated native owner and protecting AX, including uncertain sends.
  * No result here completes local discard, SPACE, deletion or recovery. */
 void
-cluster_ko_shared_native_window_v4(void)
+cluster_ko_shared_native_window_v4(const ClusterSpaceDropState *space_drop)
 {
 	if (ko_state == NULL || !cluster_enabled || !cluster_shared_config
 		|| InterruptHoldoffCount == 0 || CritSectionCount != 0 || MyProcPid <= 0
@@ -7611,7 +7634,8 @@ cluster_ko_shared_native_window_v4(void)
 		work = dsa_get_address(ko_native_area, owned->native_unready);
 		PG_TRY();
 		{
-			ready = ko_native_window_wait(owned, work);
+			ready = cluster_space_drop_committed_owner_v4(space_drop, owned)
+				&& ko_native_window_wait(owned, work);
 		}
 		PG_CATCH();
 		{
