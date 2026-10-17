@@ -68,6 +68,12 @@ diagnostic surfaces.
 
 ## Release and deployment boundary
 
+Shared DROP physical completion requires `data_sync_retry = off` (the
+default). With `data_sync_retry = on`, the committed SPACE completion phase
+logs the unsupported setting and refuses before storage I/O. Physical cleanup
+remains pending; this does not roll back an already committed transaction.
+Changing `data_sync_retry` requires an instance restart.
+
 For current four-node validation, install the same eligible build on every
 node. Mixed-version rolling compatibility for this transaction path is not a
 current validation claim; a protocol mismatch must remain fail closed rather

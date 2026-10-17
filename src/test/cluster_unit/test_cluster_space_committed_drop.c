@@ -7,6 +7,7 @@ int space_storage_fixture_main(void);
 #include "cluster/cluster_mrp.h"
 #include "cluster/cluster_write_fence.h"
 #include "cluster/storage/cluster_shared_fs.h"
+#include "test_cluster_space_close_policy.inc"
 
 /* Only the parent lacks this symbol. The candidate's actual strong producer
  * replaces this runtime refusal; provider counters prove which body ran. */
@@ -22,6 +23,7 @@ cluster_space_drop_complete_v4(const ClusterSpaceDropState *s,
 static PGIOAlignedBlock disk[2];
 static unsigned opens, closes, reads, writes, syncs, fence_checks, adg_checks;
 static unsigned fault, fail_at;
+static unsigned close_failures;
 static bool scope_current;
 static ClusterKoDirectoryIoV3 scope = { .slot = 2, .pid = 123, .serial = 7 };
 static ClusterSharedFsHandle *handle = (ClusterSharedFsHandle *)&disk;
@@ -106,6 +108,12 @@ cluster_shared_fs_close(ClusterSharedFsHandle *h)
 	UT_ASSERT(h == handle);
 	closes++;
 	if (fault == 14) pg_re_throw();
+	/* FileClose's non-temporary close failure uses this real native policy.
+	 * The provider/syscall remains a fixture; LOG deliberately returns. */
+	if (fault == 15) {
+		close_failures++;
+		elog(data_sync_elevel(LOG), "fixture could not close SPACE file");
+	}
 }
 
 static ClusterSpaceDropState *
@@ -139,6 +147,7 @@ setup_committed(Relation *relation, bool missing)
 	MyProc->delayChkptFlags = 0;
 	END_CRIT_SECTION();
 	opens=closes=reads=writes=syncs=fence_checks=adg_checks=0;
+	close_failures=0;
 	fault=fail_at=0;
 	scope_current=true;
 	return state;
@@ -264,14 +273,72 @@ UT_TEST(test_final_space_rejects_valid_foreign_or_unrelated_typed_predecessor)
 	}
 }
 
+UT_TEST(test_final_space_refuses_retry_configuration_before_provider_io)
+{
+	for (unsigned failed_close = 0; failed_close < 2; failed_close++) {
+		Relation rel;
+		ClusterSpaceDropState *state = setup_committed(&rel, false);
+		ClusterPageWalBindingV1 out, saved;
+		uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], saved_wal[sizeof(wal)];
+
+		data_sync_retry = true;
+		UT_ASSERT_EQ(data_sync_elevel(LOG), LOG);
+		fault = failed_close ? 15 : 0;
+		memset(&out, 0x55, sizeof(out)); saved = out;
+		memset(wal, 0x66, sizeof(wal)); memcpy(saved_wal, wal, sizeof(wal));
+		UT_ASSERT(!finish(state, &out, wal));
+		UT_ASSERT_EQ(opens + reads + writes + syncs + closes, 0);
+		UT_ASSERT_EQ(close_failures, 0);
+		UT_ASSERT_EQ(reported_level, LOG);
+		UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+		UT_ASSERT(memcmp(wal, saved_wal, sizeof(wal)) == 0);
+		UT_ASSERT_EQ(pinned | locked, 0);
+		UT_ASSERT_EQ(dirty_calls + capture_calls + unlink_calls, 0);
+		cluster_space_drop_finish(state);
+		FreeFakeRelcacheEntry(rel);
+	}
+	data_sync_retry = false;
+}
+
+UT_TEST(test_final_space_default_close_failure_preserves_native_panic_policy)
+{
+	Relation rel;
+	ClusterSpaceDropState *state = setup_committed(&rel, false);
+	ClusterPageWalBindingV1 out, saved;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], saved_wal[sizeof(wal)];
+	volatile bool caught = false, ok = false;
+
+	UT_ASSERT(!data_sync_retry);
+	UT_ASSERT_EQ(data_sync_elevel(LOG), PANIC);
+	fault = 15;
+	memset(&out, 0x55, sizeof(out)); saved = out;
+	memset(wal, 0x66, sizeof(wal)); memcpy(saved_wal, wal, sizeof(wal));
+	expecting_error = true;
+	PG_TRY(); { ok = finish(state, &out, wal); }
+	PG_CATCH(); { caught = true; }
+	PG_END_TRY();
+	expecting_error = false;
+	/* errfinish is a fixture longjmp, not an installed-server PANIC run. */
+	UT_ASSERT(caught && !ok);
+	UT_ASSERT_EQ(reported_level, PANIC);
+	UT_ASSERT_EQ(closes, 1);
+	UT_ASSERT_EQ(close_failures, 1);
+	UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+	UT_ASSERT(memcmp(wal, saved_wal, sizeof(wal)) == 0);
+	cluster_space_drop_finish(state);
+	FreeFakeRelcacheEntry(rel);
+}
+
 int main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(7);
 	UT_RUN(test_final_space_uses_original_commit_without_buffer_current);
 	UT_RUN(test_final_space_refuses_missing_or_changed_commit_before_io);
 	UT_RUN(test_final_space_error_short_corrupt_or_drift_keeps_outputs_unpublished);
 	UT_RUN(test_final_space_rejects_wrong_typed_identity_before_writes);
 	UT_RUN(test_final_space_rejects_valid_foreign_or_unrelated_typed_predecessor);
+	UT_RUN(test_final_space_refuses_retry_configuration_before_provider_io);
+	UT_RUN(test_final_space_default_close_failure_preserves_native_panic_policy);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

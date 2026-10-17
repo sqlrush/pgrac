@@ -9360,3 +9360,16 @@ all: test_cluster_pi_drop_storage
 
 TESTS += test_cluster_space_committed_drop
 all: test_cluster_space_committed_drop
+
+test_cluster_space_committed_drop: test_cluster_space_close_policy.inc
+
+test_cluster_space_close_policy.inc: $(top_srcdir)/src/backend/storage/file/fd.c Makefile
+	awk '/^data_sync_elevel\(/ { print "int"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (n != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+clean distclean maintainer-clean: clean-space-close-policy
+.PHONY: clean-space-close-policy
+clean-space-close-policy:
+	rm -f test_cluster_space_close_policy.inc test_cluster_space_close_policy.inc.tmp

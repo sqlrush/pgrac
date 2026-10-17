@@ -38,6 +38,7 @@
 #include "storage/bufmgr.h"
 #include "storage/buf_internals.h"
 #include "storage/checksum.h"
+#include "storage/fd.h"
 #include "storage/smgr.h"
 #include "storage/proc.h"
 #include "utils/catcache.h"
@@ -1294,6 +1295,17 @@ cluster_space_drop_complete_v4(const ClusterSpaceDropState *state,
 	if (io == NULL || terminal == NULL || wal == NULL
 		|| !cluster_space_drop_committed_owner_v4(state, completion))
 		return false;
+	/* FileClose may log and return after a failed close with this startup
+	 * setting. This consumer cannot certify that outcome. Refuse before
+	 * provider I/O; retain the original committed owner for recovery. */
+	if (data_sync_retry) {
+		ereport(LOG,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("committed shared DROP completion requires data_sync_retry = off"),
+				 errhint("Set data_sync_retry to off and restart the instance. "
+						 "The committed physical operation remains pending.")));
+		return false;
+	}
 	for (int i = 0; i < state->count; i++)
 		if (state->entries[i]->ko_completion == completion)
 			entry = state->entries[i];

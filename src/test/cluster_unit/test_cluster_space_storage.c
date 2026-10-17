@@ -41,6 +41,7 @@
 #include "storage/buf_internals.h"
 #include "storage/checksum.h"
 #include "storage/freespace.h"
+#include "storage/fd.h"
 #include "storage/smgr.h"
 #include "storage/proc.h"
 #include "utils/hsearch.h"
@@ -52,6 +53,7 @@
 UT_DEFINE_GLOBALS();
 
 bool cluster_shared_config = true, cluster_enabled = true, cluster_shared_catalog;
+bool data_sync_retry;
 int cluster_node_id = 0;
 int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 int NBuffers = 2, NLocBuffer;
@@ -1461,6 +1463,7 @@ errcode(int code)
 static void
 reset(void)
 {
+	data_sync_retry = false;
 	create_refused = create_scope_live = create_scope_armed = false;
 	create_revoke_on_io = create_throw_on_read = false;
 	create_begins = create_ends = create_aborts = create_scope_effects = 0;
