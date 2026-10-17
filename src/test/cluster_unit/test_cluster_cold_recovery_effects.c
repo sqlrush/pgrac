@@ -25,6 +25,7 @@
 #include "cluster/cluster_page_detached.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "cluster/cluster_undo_segment.h"
+#include "pgstat.h"
 #include "storage/standbydefs.h"
 #include "unit_test.h"
 
@@ -72,6 +73,8 @@ record_init(EffectRecord *r, uint8 rmid, uint8 info)
 	r->reader.record = &r->decoded;
 	r->reader.ReadRecPtr = 0x1000;
 	r->reader.EndRecPtr = 0x1800;
+	/* The real cold reader binds this from the retained source claim. */
+	r->reader.cluster_expected_thread_id = 1;
 	r->decoded.header.xl_rmid = rmid;
 	r->decoded.header.xl_info = info;
 	r->decoded.header.xl_xid = 100;
@@ -101,7 +104,8 @@ completion(EffectRecord *r, bool commit, uint32 xinfo)
 	TimestampTz timestamp = 1;
 	TransactionId children[2] = { 101, 102 };
 	RelFileLocator relations[2] = { { 1663, 5, 123 }, { 1663, 5, 124 } };
-	xl_xact_stats_item stats[2] = { { 0 } };
+	xl_xact_stats_item stats[2] = { { .kind = PGSTAT_KIND_RELATION, .dboid = 5, .objoid = 123 },
+									{ .kind = PGSTAT_KIND_FUNCTION, .dboid = 5, .objoid = 124 } };
 	SharedInvalidationMessage msgs[2] = { { 0 } };
 	xl_xact_origin origin = { 0 };
 	xl_xact_scn scn = { .scn = 23 };
@@ -634,6 +638,21 @@ UT_TEST(test_foreign_clog_and_multixact_use_native_side_consumer)
 					 CLUSTER_COLD_OK);
 		UT_ASSERT_EQ(out.record.record_flags, 0);
 		UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, true));
+
+		/* The same real decoder must refuse every missing suffix and trailing
+		 * byte; a known opcode alone is not a complete foreign effect. */
+		for (uint32 length = 0, complete_length = r.decoded.main_data_len;
+			 length <= complete_length; length++) {
+			r.decoded.main_data_len = length == complete_length ? length + 1 : length;
+			UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+						 CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+			UT_ASSERT_EQ(out.effects.refused, out.effects.required);
+			UT_ASSERT_EQ(out.effects.native_apply | out.effects.no_effect, 0);
+			UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&out.record), CLUSTER_COLD_UNSCHEDULED_REFUSE);
+			UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+			r.decoded.main_data_len = complete_length;
+		}
 	}
 }
 
@@ -1034,12 +1053,14 @@ UT_TEST(test_foreign_abort_requires_exact_version_and_complete_carrier)
 
 UT_TEST(test_foreign_native_abort_keeps_complete_record_effects)
 {
-	for (int variant = 0; variant < 3; variant++) {
+	for (int variant = 0; variant < 4; variant++) {
 		EffectRecord r;
 		ClusterColdDecodedV1 out = { 0 };
 		uint32 xinfo = XACT_XINFO_HAS_SCN;
-		if (variant > 0) xinfo |= XACT_XINFO_HAS_DROPPED_STATS;
-		if (variant == 2) xinfo |= XACT_COMPLETION_FORCE_SYNC_COMMIT | XACT_XINFO_HAS_AE_LOCKS;
+		if (variant & 1)
+			xinfo |= XACT_XINFO_HAS_DROPPED_STATS;
+		if (variant & 2)
+			xinfo |= XACT_XINFO_HAS_AE_LOCKS;
 		completion(&r, false, xinfo);
 		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out), CLUSTER_COLD_OK);
 		UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
@@ -1049,6 +1070,93 @@ UT_TEST(test_foreign_native_abort_keeps_complete_record_effects)
 		UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, false));
 		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out), CLUSTER_COLD_OK);
 		UT_ASSERT_EQ(out.record.record_flags, 0);
+	}
+}
+
+UT_TEST(test_foreign_native_xact_requires_bound_source_identity)
+{
+	for (uint16 origin = 1; origin <= 2; origin++)
+		for (int commit = 0; commit <= 1; commit++) {
+			EffectRecord r;
+			ClusterColdDecodedV1 out = { 0 };
+			uint32 xinfo = XACT_XINFO_HAS_SCN;
+
+			if (commit)
+				xinfo |= XACT_XINFO_HAS_TT_COMMIT;
+			completion(&r, commit, xinfo);
+			r.reader.cluster_expected_thread_id = origin;
+			if (commit) {
+				xl_xact_tt_commit tt;
+				Size offset = r.decoded.main_data_len - sizeof(tt);
+
+				memcpy(&tt, r.data.bytes + offset, sizeof(tt));
+				tt.instance = origin;
+				tt.segment_id = origin == 1 ? 1 : 257;
+				memcpy(r.data.bytes + offset, &tt, sizeof(tt));
+			}
+			UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+						 CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
+			UT_ASSERT_EQ(out.effects.native_apply, out.effects.required);
+			UT_ASSERT_EQ(out.effects.refused | out.effects.no_effect, 0);
+			UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, false));
+			for (int fault = 0; fault < (commit ? 3 : 2); fault++) {
+				r.reader.cluster_expected_thread_id = fault == 0   ? 0
+													  : fault == 1 ? 129
+																   : 3 - origin;
+				UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+							 CLUSTER_COLD_OK);
+				UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+				UT_ASSERT_EQ(out.effects.refused, out.effects.required);
+				UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+			}
+		}
+}
+
+UT_TEST(test_foreign_native_abort_rejects_commit_flags_and_unknown_stats)
+{
+	EffectRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	xl_xact_stats_item invalid[2] = { { 0 } };
+	Size stats_offset = MinSizeOfXactAbort + sizeof(xl_xact_xinfo) + MinSizeOfXactStatsItems;
+
+	/* XactLogAbortRecord emits AE_LOCKS but never FORCE_SYNC_COMMIT. */
+	completion(&r, false,
+			   XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_DROPPED_STATS | XACT_XINFO_HAS_AE_LOCKS
+				   | XACT_COMPLETION_FORCE_SYNC_COMMIT);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+				 CLUSTER_COLD_COMPONENT_INVALID);
+	UT_ASSERT_EQ(out.effects.required, 0);
+	completion(&r, false, XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_DROPPED_STATS);
+	memcpy(r.data.bytes + stats_offset, invalid, sizeof(invalid));
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+	UT_ASSERT_EQ(out.effects.refused, out.effects.required);
+	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+}
+
+UT_TEST(test_foreign_native_xact_origin_effect_has_no_consumer)
+{
+	for (int commit = 0; commit <= 1; commit++) {
+		EffectRecord r;
+		ClusterColdDecodedV1 out = { 0 };
+		xl_xact_origin origin = { .origin_lsn = 0x900, .origin_timestamp = 1 };
+		uint32 xinfo = XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_ORIGIN;
+		Size offset = (commit ? MinSizeOfXactCommit : MinSizeOfXactAbort) + sizeof(xl_xact_xinfo);
+
+		if (commit)
+			xinfo |= XACT_XINFO_HAS_TT_COMMIT;
+		completion(&r, commit, xinfo);
+		memcpy(r.data.bytes + offset, &origin, sizeof(origin));
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+					 CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+		UT_ASSERT((out.effects.required & CLUSTER_COLD_EFFECT_ORIGIN) != 0);
+		UT_ASSERT_EQ(out.effects.refused, out.effects.required);
+		UT_ASSERT_EQ(out.effects.native_apply | out.effects.no_effect, 0);
+		UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&out.record), CLUSTER_COLD_UNSCHEDULED_REFUSE);
+		UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
 	}
 }
 
@@ -1069,8 +1177,11 @@ UT_TEST(test_foreign_native_abort_unsupported_effects_are_not_consumers)
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(37);
 	UT_RUN(test_foreign_native_abort_keeps_complete_record_effects);
+	UT_RUN(test_foreign_native_xact_requires_bound_source_identity);
+	UT_RUN(test_foreign_native_abort_rejects_commit_flags_and_unknown_stats);
+	UT_RUN(test_foreign_native_xact_origin_effect_has_no_consumer);
 	UT_RUN(test_foreign_native_abort_unsupported_effects_are_not_consumers);
 	UT_RUN(test_foreign_abort_requires_exact_version_and_complete_carrier);
 	UT_RUN(test_foreign_undo_header_routes_only_connected_record_consumers);

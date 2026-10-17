@@ -8842,6 +8842,8 @@ CLUSTER_COLD_DECODE_O = test_cluster_cold_recovery_decode_core.o
 
 $(CLUSTER_COLD_DECODE_O): $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_decode.c \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_xact.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
@@ -8864,13 +8866,17 @@ test_cluster_cold_recovery_effects: test_cluster_cold_recovery_effects.c unit_te
 		$(CLUSTER_COLD_DECODE_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) \
 		$(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
-		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O) \
+		$(SIDE_XACT_TT_2PC_RECORD_O) \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_DECODE_O) \
 		test_cluster_cold_recovery_replay_core.o \
 		$(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) $(CLUSTER_SIDE_XACT_O) \
 		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) \
-		$(SIDE_XACT_XACTDESC_O) $(top_builddir)/src/common/libpgcommon_srv.a \
-		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O) \
+		$(SIDE_XACT_TT_2PC_RECORD_O) \
+		$(SIDE_XACT_XACTDESC_O) $(top_builddir)/src/common/libpgcommon.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lssl -lcrypto -o $@
 
 CLUSTER_COLD_STARTUP_O = test_cluster_cold_recovery_startup_core.o test_cluster_cold_recovery_startup_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)
 

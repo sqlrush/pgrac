@@ -512,9 +512,12 @@ cold_foreign_side(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan,
 			 * decoding; use that identity for TT validation instead of assuming
 			 * the first WAL thread. The immutable plan still revalidates it later. */
 			return rf_side_xact_decode_recovery_v1(reader, system_identifier, origin_thread,
-										  &operation)
+												   &operation)
 				   && ((info == XLOG_XACT_COMMIT && operation.kind == RF_SIDE_XACT_COMMIT)
 					   || (info == XLOG_XACT_ABORT && operation.kind == RF_SIDE_XACT_ABORT))
+				   /* Strict SIDE may decode replication-origin metadata, but the
+					* foreign cold owner has no consumer for that effect. */
+				   && (operation.xinfo & XACT_XINFO_HAS_ORIGIN) == 0
 				   && operation.relation_count == 0 && operation.space_drop_count == 0;
 		}
 		return info == XLOG_XACT_ASSIGNMENT;
