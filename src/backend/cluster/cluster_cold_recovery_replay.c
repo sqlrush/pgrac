@@ -319,6 +319,8 @@ cluster_cold_replay_run_v1(const ClusterColdPlanV1 *plan,
 	uint32 steps;
 	uint32 relations;
 	uint32 i;
+	uint32 drain_order[CLUSTER_COLD_MAX_PARTICIPANTS];
+	bool seen[CLUSTER_COLD_MAX_PARTICIPANTS] = { 0 };
 
 	if (result == NULL)
 		return CLUSTER_COLD_REPLAY_INVALID_ARGUMENT;
@@ -340,13 +342,23 @@ cluster_cold_replay_run_v1(const ClusterColdPlanV1 *plan,
 	run.own = own;
 	run.ops = ops;
 	run.arg = arg;
-	for (i = 0; i < participant_count; i++)
+	for (i = 0; i < participant_count; i++) {
 		run.last_end[i] = participants[i].native_redo;
+		drain_order[i] = ops->source_order != NULL ? UINT32_MAX : i;
+	}
+	if (ops->source_order != NULL && !ops->source_order(arg, drain_order, participant_count))
+		return replay_stop(&run, CLUSTER_COLD_REPLAY_CALLBACK, 0, InvalidXLogRecPtr);
+	/* Reject partial/duplicate output before the first consumer. */
+	for (i = 0; i < participant_count; i++) {
+		if (drain_order[i] >= participant_count || seen[drain_order[i]])
+			return replay_stop(&run, CLUSTER_COLD_REPLAY_CALLBACK, 0, InvalidXLogRecPtr);
+		seen[drain_order[i]] = true;
+	}
 	steps = cluster_cold_plan_step_count_v1(plan);
 	for (i = 0; i < steps && detail == CLUSTER_COLD_REPLAY_OK; i++)
 		detail = replay_step(&run, i);
 	for (i = 0; i < participant_count && detail == CLUSTER_COLD_REPLAY_OK; i++)
-		detail = replay_drain(&run, i);
+		detail = replay_drain(&run, drain_order[i]);
 	for (i = 0; i < relations && detail == CLUSTER_COLD_REPLAY_OK; i++) {
 		if (!ops->space_final(arg, i))
 			return replay_stop(&run, CLUSTER_COLD_REPLAY_CALLBACK, own, run.last_end[own]);

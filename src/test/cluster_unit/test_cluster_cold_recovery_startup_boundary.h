@@ -777,9 +777,16 @@ rf_side_online_plan_recovery_abort_sources_v1(const RfSideOnlinePlanV1 *plan, ui
 		|| plan->operations[index].kind != RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT
 		|| plan->operations[index].recovery_target_source >= plan->source_count)
 		return false;
-	*writer = plan->sources[1];
-	*target = plan->sources[plan->operations[index].recovery_target_source];
-	return true;
+	for (uint32 p = 0; p < plan->source_count; p++) {
+		if (plan->sources[p].claim.identity.origin_thread_id == plan->cut.failed_thread
+			&& plan->sources[p].claim.identity.origin_owner_incarnation
+				   == plan->cut.origin_owner_incarnation) {
+			*writer = plan->sources[p];
+			*target = plan->sources[plan->operations[index].recovery_target_source];
+			return true;
+		}
+	}
+	return false;
 }
 
 bool

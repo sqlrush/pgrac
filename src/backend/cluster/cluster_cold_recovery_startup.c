@@ -1022,6 +1022,121 @@ cold_source_ref_matches(const ClusterWalSourceRef *a, const ClusterWalSourceRef 
 		   && a->timeline == b->timeline;
 }
 
+/* Resolve the original bound identities, never source-array proximity. */
+static uint32
+cold_recovery_abort_target(const ClusterColdTypedV1 *typed, uint32 participant, uint32 index)
+{
+	ClusterWalSourceRef writer, target;
+	uint32 match = UINT32_MAX;
+
+	if (!rf_side_online_plan_recovery_abort_sources_v1(typed->side_plans[participant], index,
+													   &writer, &target)
+		|| !cold_source_ref_matches(&writer, &typed->sources[participant]))
+		return UINT32_MAX;
+	for (uint32 i = 0; i < typed->participant_count; i++) {
+		if (!cold_source_ref_matches(&target, &typed->sources[i]))
+			continue;
+		if (match != UINT32_MAX)
+			return UINT32_MAX;
+		match = i;
+	}
+	return match;
+}
+
+/* Only reorder the original remainder drains. Scheduled PAGE/SPACE and
+ * per-stream ordering remain with the original sequencer; a C0 in a prefix
+ * still requires its target's actual drain at the dispatch boundary. */
+bool
+cluster_cold_typed_drain_order_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence,
+								  uint32 *order, uint32 count)
+{
+	bool depends[CLUSTER_COLD_MAX_PARTICIPANTS][CLUSTER_COLD_MAX_PARTICIPANTS] = { 0 };
+	bool emitted[CLUSTER_COLD_MAX_PARTICIPANTS] = { 0 };
+	uint32 result[CLUSTER_COLD_MAX_PARTICIPANTS];
+
+	if (order != NULL && count <= CLUSTER_COLD_MAX_PARTICIPANTS)
+		for (uint32 i = 0; i < count; i++)
+			order[i] = UINT32_MAX;
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK)
+		return false;
+	cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "pass-2 C0 source ordering is incomplete");
+	if (order == NULL || count == 0 || count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| count != typed->participant_count || typed->plan == NULL
+		|| cluster_cold_plan_participant_count_v1(typed->plan) != count
+		|| typed->own_participant != 0 || typed->replay_count == 0 || typed->replay_count > count
+		|| typed->replay_roots == NULL || typed->replay_root_count != typed->replay_count
+		|| fence == NULL || !cluster_cold_replay_window_active_v1()
+		|| !cold_replay_sources_current(typed, fence))
+		return false;
+	for (uint32 p = 0; p < typed->replay_count; p++) {
+		const ClusterColdParticipantV1 *source = &typed->participants[p];
+		const RfSideOnlinePlanV1 *plan = typed->side_plans[p];
+		RfContributorStreamCutV1 cut = { 0 };
+		uint32 operations;
+
+		cut.failed_thread = source->thread_id;
+		cut.timeline_id = source->timeline;
+		cut.origin_owner_incarnation = source->owner_incarnation;
+		cut.scan_begin_inclusive = source->physical_lower;
+		cut.scan_end_exclusive = source->tail_end;
+		cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+		if (plan == NULL || typed->side_capture_detail[p] != 0
+			|| !rf_side_online_plan_source_matches_v1(plan, typed->system_identifier,
+													  typed->observer.storage_uuid, &cut)
+			|| !rf_side_online_plan_replay_start_matches_v1(
+				plan, source->thread_id, source->owner_incarnation,
+				typed->observer.database_incarnation, source->native_redo))
+			return false;
+		operations = rf_side_online_plan_operation_count_v1(plan);
+		for (uint32 i = 0; i < operations; i++) {
+			RfSideOnlineOperationV1 operation;
+			uint32 target;
+
+			if (!rf_side_online_plan_operation_v1(plan, i, &operation))
+				return false;
+			if (operation.kind != RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT)
+				continue;
+			target = cold_recovery_abort_target(typed, p, i);
+			/* The existing target owner grants neither founder nor history
+			 * mutation. Ordering cannot manufacture that authority or use
+			 * writer checkpoint coverage to skip a retained C0. */
+			if (operation.history_only || target >= typed->replay_count
+				|| target == typed->own_participant
+				|| operation.identity.record.read_rec_ptr < source->native_redo
+				|| operation.identity.record.end_rec_ptr <= operation.identity.record.read_rec_ptr
+				|| operation.identity.record.end_rec_ptr > source->tail_end)
+				return false;
+			if (target != p)
+				depends[p][target] = true;
+		}
+	}
+	/* Stable ordinal choice among ready sources; at most 128 sources, no
+	 * new queue or persistent progress. Repeated edges count only once. */
+	for (uint32 slot = 0; slot < count; slot++) {
+		uint32 choice = UINT32_MAX;
+		for (uint32 p = 0; p < count; p++) {
+			bool ready = !emitted[p];
+			for (uint32 target = 0; target < count && ready; target++)
+				if (depends[p][target] && !emitted[target])
+					ready = false;
+			if (ready) {
+				choice = p;
+				break;
+			}
+		}
+		if (choice == UINT32_MAX)
+			return false;
+		result[slot] = choice;
+		emitted[choice] = true;
+	}
+	if (!cold_replay_sources_current(typed, fence))
+		return false;
+	memcpy(order, result, count * sizeof(*order));
+	typed->refusal = CLUSTER_COLD_OK;
+	typed->refusal_detail[0] = '\0';
+	return true;
+}
+
 static bool
 cold_recovery_abort_record(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence,
 						   uint32 participant, uint32 index,
@@ -1029,20 +1144,8 @@ cold_recovery_abort_record(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *
 						   const ClusterThreadRecoveryAuthorityV1 *writer)
 {
 	const RfSideOnlinePlanV1 *plan = typed->side_plans[participant];
-	ClusterWalSourceRef bound_writer, bound_target;
 	ClusterThreadRecoveryAuthorityV1 target;
-	uint32 match = UINT32_MAX;
-
-	if (!rf_side_online_plan_recovery_abort_sources_v1(plan, index, &bound_writer, &bound_target)
-		|| !cold_source_ref_matches(&bound_writer, &typed->sources[participant]))
-		return false;
-	for (uint32 i = 0; i < typed->participant_count; i++) {
-		if (!cold_source_ref_matches(&bound_target, &typed->sources[i]))
-			continue;
-		if (match != UINT32_MAX)
-			return false;
-		match = i;
-	}
+	uint32 match = cold_recovery_abort_target(typed, participant, index);
 	/* A history claim or own restart input is not a borrowed current
 	 * mutation authority. Do not substitute a newer generation of the thread. */
 	/* Same-source C0 follows its original stream prefix. A different source

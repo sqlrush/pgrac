@@ -442,6 +442,9 @@ typedef struct ClusterColdReplayOpsV1 {
 	 * exact counted drain. A refusal stops before later sources/finalization. */
 	bool (*source_drained)(void *arg, uint32 participant,
 						   const struct ClusterColdReplayResultV1 *progress, uint64 records);
+	/* Optional complete remainder-drain permutation, validated before any
+	 * record callback. Scheduled steps and each stream order stay unchanged. */
+	bool (*source_order)(void *arg, uint32 *order, uint32 count);
 } ClusterColdReplayOpsV1;
 
 typedef struct ClusterColdReplayResultV1 {
@@ -745,6 +748,12 @@ extern bool cluster_cold_typed_source_drained_v1(ClusterColdTypedV1 *typed,
 												 uint32 participant,
 												 const ClusterColdReplayResultV1 *progress,
 												 uint64 records);
+
+/* Order only the remainder drains by exact captured C0 dependencies.
+ * Failure exports no partial order or completion authority. */
+extern bool cluster_cold_typed_drain_order_v1(ClusterColdTypedV1 *typed,
+											  struct ClusterRecoveryFencePlan *fence, uint32 *order,
+											  uint32 count);
 
 /* Consume one original foreign control or record-local native SIDE effect
  * under its existing cold authority. Selection never authorizes a full source

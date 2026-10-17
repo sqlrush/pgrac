@@ -3539,10 +3539,18 @@ cluster_typed_replay_source_drained(void *arg, uint32 participant,
 												records);
 }
 
+static bool
+cluster_typed_replay_source_order(void *arg, uint32 *order, uint32 count)
+{
+	ClusterColdTypedReplay *rep = (ClusterColdTypedReplay *)arg;
+
+	return cluster_cold_typed_drain_order_v1(rep->typed, *rep->fence_plan, order, count);
+}
+
 static const ClusterColdReplayOpsV1 cluster_typed_replay_ops = {
 	cluster_typed_replay_next,			 cluster_typed_replay_unscheduled,
 	cluster_typed_replay_scheduled,		 cluster_typed_replay_space_final,
-	cluster_typed_replay_source_drained,
+	cluster_typed_replay_source_drained, cluster_typed_replay_source_order,
 };
 
 /* A sequencer stop is fatal: report it in pass-1 terms. */

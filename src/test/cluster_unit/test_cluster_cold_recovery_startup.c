@@ -2105,10 +2105,129 @@ UT_TEST(test_source_drain_is_attempt_local_and_not_recovery_completion)
 	cluster_cold_typed_destroy_v1(&typed);
 }
 
+
+static bool
+source_order_fixture(ClusterColdTypedV1 *typed, uint32 *order)
+{
+	return cluster_cold_typed_drain_order_v1(typed, (ClusterRecoveryFencePlan *)&fixture_context,
+											 order, typed->participant_count);
+}
+
+UT_TEST(test_c0_drain_order_exact_target_before_writer_without_completion)
+{
+	for (uint32 target = 1; target <= 2; target++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = c0_fixture(&record, target);
+		uint32 order[3] = { UINT32_MAX, UINT32_MAX, UINT32_MAX };
+		memset(typed->source_drained, 0, sizeof(typed->source_drained));
+		UT_ASSERT(source_order_fixture(typed, order));
+		UT_ASSERT_EQ(order[0], 0);
+		UT_ASSERT_EQ(order[1], target == 1 ? 1 : 2);
+		UT_ASSERT_EQ(order[2], target == 1 ? 2 : 1);
+		UT_ASSERT(!typed->source_drained[0] && !typed->source_drained[1]
+				  && !typed->source_drained[2]);
+		UT_ASSERT_EQ(c0_calls, 0);
+		UT_ASSERT_EQ(control_calls, 0);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_drain_order_preserves_no_dependency_and_repeated_edges)
+{
+	ClusterColdRecordV1 record;
+	ClusterColdTypedV1 *typed = control_fixture(&record);
+	uint32 order[3] = { UINT32_MAX, UINT32_MAX, UINT32_MAX };
+	UT_ASSERT(source_order_fixture(typed, order));
+	UT_ASSERT_EQ(order[0], 0);
+	UT_ASSERT_EQ(order[1], 1);
+	UT_ASSERT_EQ(order[2], 2);
+	cluster_cold_replay_window_leave_v1();
+	cluster_cold_typed_destroy_v1(&typed);
+	typed = c0_fixture(&record, 2);
+	side_fixture[1].operations[2] = side_fixture[1].operations[1];
+	side_fixture[1].operations[2].identity.record.read_rec_ptr++;
+	side_fixture[1].operation_count = 3;
+	UT_ASSERT(source_order_fixture(typed, order));
+	UT_ASSERT_EQ(order[0], 0);
+	UT_ASSERT_EQ(order[1], 2);
+	UT_ASSERT_EQ(order[2], 1);
+	cluster_cold_replay_window_leave_v1();
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
+UT_TEST(test_drain_order_rejects_cycle_without_partial_order)
+{
+	ClusterColdRecordV1 record;
+	ClusterColdTypedV1 *typed = c0_fixture(&record, 2);
+	uint32 order[3] = { 0, 1, 2 };
+	side_fixture[2].operations[1] = side_fixture[1].operations[1];
+	side_fixture[2].operations[1].recovery_target_source = 1;
+	side_fixture[2].operation_count = 2;
+	UT_ASSERT(!source_order_fixture(typed, order));
+	for (uint32 p = 0; p < 3; p++)
+		UT_ASSERT_EQ(order[p], UINT32_MAX);
+	UT_ASSERT_NE(typed->refusal, CLUSTER_COLD_OK);
+	side_fixture[2].operation_count = 0;
+	UT_ASSERT(!source_order_fixture(typed, order));
+	UT_ASSERT_EQ(c0_calls, 0);
+	cluster_cold_replay_window_leave_v1();
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
+UT_TEST(test_drain_order_rejects_identity_capture_and_scope_drift)
+{
+	for (int fault = 0; fault < 9; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = c0_fixture(&record, 2);
+		uint32 order[3] = { 0, 1, 2 };
+		switch (fault) {
+		case 0:
+			side_fixture[1].sources[2].claim.claim_sha256[31]++;
+			break;
+		case 1:
+			side_fixture[1].sources[1].claim.claim_sha256[31]++;
+			break;
+		case 2:
+			side_fixture[1].operations[1].history_only = true;
+			break;
+		case 3:
+			side_fixture[1].cut.scan_end_exclusive++;
+			break;
+		case 4:
+			side_fixture[1].redo++;
+			break;
+		case 5:
+			side_fixture[1].sealed = false;
+			break;
+		case 6:
+			fence_current = false;
+			break;
+		case 7:
+			tokens[3].file_txn_seq++;
+			break;
+		case 8:
+			cluster_cold_replay_window_leave_v1();
+			break;
+		}
+		UT_ASSERT(!source_order_fixture(typed, order));
+		for (uint32 p = 0; p < 3; p++)
+			UT_ASSERT_EQ(order[p], UINT32_MAX);
+		UT_ASSERT_NE(typed->refusal, CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(c0_calls, 0);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(58);
+	UT_PLAN(62);
+	UT_RUN(test_c0_drain_order_exact_target_before_writer_without_completion);
+	UT_RUN(test_drain_order_preserves_no_dependency_and_repeated_edges);
+	UT_RUN(test_drain_order_rejects_cycle_without_partial_order);
+	UT_RUN(test_drain_order_rejects_identity_capture_and_scope_drift);
 	UT_RUN(test_c0_target_requires_its_own_completed_drain);
 	UT_RUN(test_source_drain_rechecks_exact_tail_count_and_scope);
 	UT_RUN(test_source_drain_is_attempt_local_and_not_recovery_completion);
