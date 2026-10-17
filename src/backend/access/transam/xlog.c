@@ -257,6 +257,7 @@
 #include "cluster/cluster_scn.h" /* PGRAC: xl_scn stamp (spec-4.5) */
 #include "cluster/cluster_wal_state.h" /* PGRAC: checkpoint redo / fpw sticky (spec-4.5) */
 #include "cluster/cluster_wal_retention.h" /* PGRAC: STOP-05 guarded WAL reuse */
+#include "cluster/cluster_recovery_stamp.h"
 #include "cluster/cluster_wal_retained_cut.h" /* PGRAC: S07 retention lower */
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_initdb_base.h"
@@ -8794,6 +8795,59 @@ ClusterCheckpointYieldForShutdown(bool online)
 						errmsg("checkpoint interrupted to service normal shutdown")));
 }
 
+/* PGRAC: captured recovery writers complete before checkpoint target IO.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+ClusterCheckpointWaitRecoveryStamps(int flags)
+{
+	ClusterRecoveryStampCaptureV1 capture;
+	ClusterWalSourceRef ref;
+	uint64 epoch = 0;
+	bool stopping = (flags & CHECKPOINT_IS_SHUTDOWN) != 0;
+	bool online = (flags & (CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_END_OF_RECOVERY)) == 0;
+
+	if (!cluster_recovery_stamp_capture_v1(&capture))
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("could not capture recovery stamp windows")));
+	if (capture.count == 0)
+		return;
+	if (MyBackendType == B_STARTUP && capture.caller_owned)
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("startup checkpoint cannot wait for its own recovery stamp")));
+	if (stopping) {
+		epoch = cluster_epoch_get_current();
+		if (epoch == 0 || !cluster_wal_thread_current_v2_ref(&ref))
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+							errmsg("recovery stamp checkpoint wait has no writer identity")));
+	}
+	for (;;) {
+		ClusterRecoveryStampPollV1 result;
+		uint64 started_us = stopping ? cluster_checkpoint_wait_budget_now() : 0;
+		long timeout_ms = 20;
+
+		CHECK_FOR_INTERRUPTS();
+		if (MyBackendType == B_STARTUP)
+			HandleStartupProcInterrupts();
+		ClusterCheckpointYieldForShutdown(online);
+		ResetLatch(MyLatch);
+		result = cluster_recovery_stamp_poll_v1(&capture);
+		if (result == CLUSTER_RECOVERY_STAMP_INVALID)
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+							errmsg("captured recovery stamp window is unproven")));
+		if (result == CLUSTER_RECOVERY_STAMP_COMPLETE) {
+			if (stopping)
+				(void)cluster_checkpoint_wait_budget_charge(false, started_us, &ref, epoch);
+			return;
+		}
+		AbsorbSyncRequests();
+		ClusterCheckpointYieldForShutdown(online);
+		if (stopping)
+			timeout_ms = cluster_checkpoint_wait_budget_charge(true, started_us, &ref, epoch);
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, timeout_ms,
+						WAIT_EVENT_RECOVERY_STAMP);
+	}
+}
+
 static void
 ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 {
@@ -9513,6 +9567,8 @@ CreateCheckPoint(int flags)
 	pfree(vxids);
 
 #ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config)
+		ClusterCheckpointWaitRecoveryStamps(flags);
 	/* PGRAC (S07 R-A22): snapshot the buffers' first own records before the
 	 * sync barrier, so a page this checkpoint does not write but someone
 	 * writes after the barrier is still counted by its census.

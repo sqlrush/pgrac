@@ -201,6 +201,7 @@ cluster_recovery_plan_candidate_set(ClusterRecoveryPlan *plan, uint16 tid)
 #ifndef FRONTEND
 
 #include "port/atomics.h"
+#include "cluster/cluster_recovery_stamp.h"
 
 /*
  * Per-dead-thread online replay slot (spec-4.11 3b-4b).  Bookkeeping for the
@@ -230,6 +231,7 @@ typedef struct ClusterThreadReplaySlot {
 	uint64 pin_lifecycle;
 	uint32 pin_tail_tli;
 	uint32 pin_checkpoint_tli;
+	ClusterRecoveryStampSlotV1 stamp;
 } ClusterThreadReplaySlot;
 
 /*

@@ -445,6 +445,9 @@ pgstat_get_wait_ipc(WaitEventIPC w)
 	case WAIT_EVENT_BUFFER_IO:
 		event_name = "BufferIO";
 		break;
+	case WAIT_EVENT_RECOVERY_STAMP:
+		event_name = "RecoveryStamp";
+		break;
 	case WAIT_EVENT_CHECKPOINT_DONE:
 		event_name = "CheckpointDone";
 		break;
