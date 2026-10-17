@@ -143,7 +143,9 @@
  *	              history only) before the serial set is taken; pass 2
  *	              (cluster_recovery_typed_replay) replays the sealed
  *	              schedule, matching every page record to its pass-1
- *	              identity; SPACE changes are installed by the SPACE owner
+ *	              identity. An exact C0 dependency may finish a target
+ *	              source whose scheduled steps already ran, without changing
+ *	              the PAGE/SPACE schedule. The SPACE owner installs changes
  *	              at their steps (repeating a TRUNCATE's shrink only where
  *	              nothing proves it durable) and in full at the end, never
  *	              replayed natively; another generation's native control
@@ -205,6 +207,7 @@
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_recovery_worker.h"
 #include "cluster/storage/cluster_smgr.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_restart_read.h"
 #include "cluster/cluster_write_fence.h"
@@ -3528,6 +3531,47 @@ cluster_typed_replay_scheduled(void *arg, uint32 participant, const ClusterColdS
 #endif
 }
 
+/* PGRAC: bind the current C0 before the sequencer touches its target. */
+static bool
+cluster_typed_replay_dependency(void *arg, uint32 participant,
+								const ClusterColdReplayRecordV1 *record, uint32 *target)
+{
+	ClusterColdTypedReplay *rep = (ClusterColdTypedReplay *)arg;
+	ClusterColdTypedV1 *typed;
+	XLogReaderState *r;
+	bool is_own;
+
+	if (target != NULL)
+		*target = CLUSTER_COLD_NO_INDEX;
+	if (rep == NULL || rep->typed == NULL || record == NULL || target == NULL
+		|| participant >= rep->typed->participant_count
+		|| participant >= CLUSTER_COLD_MAX_PARTICIPANTS || rep->fence_plan == NULL
+		|| *rep->fence_plan == NULL)
+		return false;
+	typed = rep->typed;
+	r = rep->current[participant];
+	if (r == NULL || r->record == NULL || record->read_rec_ptr != r->ReadRecPtr
+		|| record->end_rec_ptr != r->EndRecPtr
+		|| record->record_crc != (uint32)r->record->header.xl_crc
+		|| record->rmid != r->record->header.xl_rmid || record->info != r->record->header.xl_info)
+		return false;
+	if (record->rmid != RM_CLUSTER_UNDO_ID
+		|| (record->info & ~XLR_INFO_MASK) != XLOG_UNDO_RECOVERY_TT_ABORT)
+		return true;
+	/* Validate the complete current carrier before touching another stream.
+	 * The ordinary consumer decodes it again after the target drain, since
+	 * that drain uses the same scratch but preserves this source's reader. */
+	is_own = participant == typed->own_participant;
+	if (cluster_cold_recovery_decode_v1(r, typed->system_identifier,
+										typed->sources[participant].claim.identity.storage_uuid,
+										false, !is_own, &rep->decoded)
+			!= CLUSTER_COLD_OK
+		|| !cluster_cold_replay_effects_v1(&rep->decoded, NULL, is_own))
+		return false;
+	return cluster_cold_typed_record_target_v1(typed, *rep->fence_plan, participant,
+											   &rep->decoded.record, target);
+}
+
 /* The original counted source drain supplies C0 target ordering only. */
 static bool
 cluster_typed_replay_source_drained(void *arg, uint32 participant,
@@ -3551,6 +3595,7 @@ static const ClusterColdReplayOpsV1 cluster_typed_replay_ops = {
 	cluster_typed_replay_next,			 cluster_typed_replay_unscheduled,
 	cluster_typed_replay_scheduled,		 cluster_typed_replay_space_final,
 	cluster_typed_replay_source_drained, cluster_typed_replay_source_order,
+	cluster_typed_replay_dependency,
 };
 
 /* A sequencer stop is fatal: report it in pass-1 terms. */

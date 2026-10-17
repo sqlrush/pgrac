@@ -782,16 +782,28 @@ cluster_cold_typed_source_drained_v1(ClusterColdTypedV1 *typed, ClusterRecoveryF
 		|| cluster_cold_plan_participant_count_v1(typed->plan) != typed->participant_count
 		|| participant >= typed->participant_count || progress == NULL
 		|| progress->detail != CLUSTER_COLD_REPLAY_OK
-		|| progress->steps_done != cluster_cold_plan_step_count_v1(typed->plan)
+		|| progress->steps_done > cluster_cold_plan_step_count_v1(typed->plan)
 		|| records != cluster_cold_plan_replay_record_count_v1(typed->plan, participant)
 		|| !cold_replay_sources_current(typed, fence))
 		return false;
+	/* Only this source may drain early. The original global completion
+	 * predicate still requires every scheduled step and final durability. */
+	for (uint32 i = progress->steps_done; i < cluster_cold_plan_step_count_v1(typed->plan); i++) {
+		ClusterColdStepV1 step;
+		if (!cluster_cold_plan_step_v1(typed->plan, i, &step) || step.participant == participant)
+			return false;
+	}
 	/* Founder/history/empty inputs do not acquire target mutation or base
 	 * coverage here. Their existing final completion owners remain required. */
 	if (participant < typed->replay_count && participant != typed->own_participant
 		&& records != 0) {
-		if (!cluster_cold_completion_proven_v1(typed->plan, &typed->replay_roots[participant].root,
-											   progress, participant))
+		const ClusterControlRootSnapshot *root = &typed->replay_roots[participant].root;
+		if (root->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+			|| (root->root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID) == 0
+			|| root->tail_last_record_lsn == InvalidXLogRecPtr
+			|| progress->last_read[participant] != root->tail_last_record_lsn
+			|| progress->last_crc[participant] != root->tail_last_record_crc32c
+			|| progress->last_end[participant] != root->validated_tail_lsn_exclusive)
 			return false;
 		typed->source_drained[participant] = true;
 	}
@@ -1043,9 +1055,77 @@ cold_recovery_abort_target(const ClusterColdTypedV1 *typed, uint32 participant, 
 	return match;
 }
 
-/* Only reorder the original remainder drains. Scheduled PAGE/SPACE and
- * per-stream ordering remain with the original sequencer; a C0 in a prefix
- * still requires its target's actual drain at the dispatch boundary. */
+/* Resolve only a complete captured record. The sequencer may use the
+ * index to finish a ready target, but execution still rebinds both owners. */
+bool
+cluster_cold_typed_record_target_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence,
+									uint32 participant, const ClusterColdRecordV1 *record,
+									uint32 *target)
+{
+	const ClusterColdParticipantV1 *source;
+	const RfSideOnlinePlanV1 *plan;
+	ClusterThreadRecoveryAuthorityV1 authority;
+	RfPageOnlineRecordIdentityV1 identity = { 0 };
+	uint32 match = UINT32_MAX, resolved;
+
+	if (target != NULL)
+		*target = CLUSTER_COLD_NO_INDEX;
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK)
+		return false;
+	if (target == NULL || record == NULL || participant >= typed->participant_count) {
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "pass-2 record dependency is invalid");
+		return false;
+	}
+	if (record->rmid != RM_CLUSTER_UNDO_ID
+		|| (record->info & ~XLR_INFO_MASK) != XLOG_UNDO_RECOVERY_TT_ABORT)
+		return true;
+	cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "pass-2 C0 target dependency is incomplete");
+	if (cold_record_side_kind(record) != RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT
+		|| record->component_count != 0 || record->space_count != 0
+		|| !cold_side_source_authority(typed, fence, participant, &authority))
+		return false;
+	source = &typed->participants[participant];
+	plan = typed->side_plans[participant];
+	if (record->read_rec_ptr < source->native_redo || record->end_rec_ptr <= record->read_rec_ptr
+		|| record->end_rec_ptr > source->tail_end)
+		return false;
+	identity.record.system_identifier = typed->system_identifier;
+	memcpy(identity.record.storage_uuid, typed->observer.storage_uuid, 16);
+	identity.record.origin_thread = source->thread_id;
+	identity.record.timeline_id = source->timeline;
+	identity.record.read_rec_ptr = record->read_rec_ptr;
+	identity.record.end_rec_ptr = record->end_rec_ptr;
+	identity.record.record_crc = record->record_crc;
+	identity.record.rmid = record->rmid;
+	identity.record.info = record->info;
+	for (uint32 i = 0; i < rf_side_online_plan_operation_count_v1(plan); i++) {
+		RfSideOnlineOperationV1 operation;
+		if (!rf_side_online_plan_operation_v1(plan, i, &operation))
+			return false;
+		if (operation.identity.record.read_rec_ptr != record->read_rec_ptr)
+			continue;
+		if (match != UINT32_MAX || operation.history_only
+			|| operation.kind != RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT
+			|| operation.purpose != RF_SIDE_PLAN_RECOVERY
+			|| memcmp(&operation.identity, &identity, sizeof(identity)) != 0
+			|| !cluster_recovery_tt_abort_valid_v1(&operation.recovery_abort))
+			return false;
+		match = i;
+	}
+	if (match == UINT32_MAX
+		|| (resolved = cold_recovery_abort_target(typed, participant, match)) == UINT32_MAX
+		|| !cold_participant_authority(typed, fence, resolved, &authority)
+		|| !cold_replay_sources_current(typed, fence))
+		return false;
+	*target = resolved;
+	typed->refusal = CLUSTER_COLD_OK;
+	typed->refusal_detail[0] = '\0';
+	return true;
+}
+
+/* Order the original remainder drains. The sequencer may also drain an
+ * exact C0 target whose scheduled steps already ran; PAGE/SPACE order and
+ * each source's record order remain unchanged. */
 bool
 cluster_cold_typed_drain_order_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence,
 								  uint32 *order, uint32 count)

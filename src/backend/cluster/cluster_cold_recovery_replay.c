@@ -7,8 +7,9 @@
  *	  (a page record or a SPACE step), in schedule order, its participant's
  *	  stream is read up to the record; every record before it has no
  *	  scheduled step and replays in stream order.  The scheduled record must
- *	  carry its pass-1 identity (start, end, CRC, rmgr, info).  Afterwards
- *	  every participant is drained to its validated tail and must have
+ *	  carry its pass-1 identity (start, end, CRC, rmgr, info). An exact
+ *	  dependency may drain a source once its scheduled steps have run;
+ *	  afterwards every remaining participant drains to its tail and must have
  *	  consumed exactly the records pass 1 counted after its native redo
  *	  start, and every SPACE relation is installed in full.
  *
@@ -48,6 +49,9 @@ typedef struct ColdReplayRun {
 	ClusterColdReplayResultV1 *result;
 	uint64 consumed[CLUSTER_COLD_MAX_PARTICIPANTS];
 	XLogRecPtr last_end[CLUSTER_COLD_MAX_PARTICIPANTS];
+	uint32 scheduled_through[CLUSTER_COLD_MAX_PARTICIPANTS];
+	bool draining[CLUSTER_COLD_MAX_PARTICIPANTS];
+	bool drained[CLUSTER_COLD_MAX_PARTICIPANTS];
 } ColdReplayRun;
 
 /* This is the original dispatch's consumer set, not another WAL decoder.
@@ -225,6 +229,34 @@ replay_identity_matches(const ClusterColdReplayRecordV1 *record, const ClusterCo
 		   && record->rmid == step->rmid && record->info == step->info;
 }
 
+static ClusterColdReplayDetailV1 replay_drain(ColdReplayRun *run, uint32 participant);
+
+/* The original owner resolves the captured record's exact dependency. A
+ * target with a future scheduled step cannot be drained out of plan order. */
+static ClusterColdReplayDetailV1
+replay_unscheduled(ColdReplayRun *run, uint32 participant, const ClusterColdReplayRecordV1 *record)
+{
+	uint32 target = CLUSTER_COLD_NO_INDEX;
+	ClusterColdReplayDetailV1 detail;
+
+	if (run->ops->record_dependency != NULL
+		&& !run->ops->record_dependency(run->arg, participant, record, &target))
+		return replay_stop(run, CLUSTER_COLD_REPLAY_CALLBACK, participant, record->read_rec_ptr);
+	if (target != CLUSTER_COLD_NO_INDEX && target != participant) {
+		if (target >= cluster_cold_plan_participant_count_v1(run->plan)
+			|| run->ops->source_drained == NULL)
+			return replay_stop(run, CLUSTER_COLD_REPLAY_CALLBACK, participant,
+							   record->read_rec_ptr);
+		detail = replay_drain(run, target);
+		if (detail != CLUSTER_COLD_REPLAY_OK)
+			return detail;
+	}
+	replay_consumed(run, participant, record);
+	if (!run->ops->unscheduled(run->arg, participant))
+		return replay_stop(run, CLUSTER_COLD_REPLAY_CALLBACK, participant, record->read_rec_ptr);
+	return CLUSTER_COLD_REPLAY_OK;
+}
+
 /* Replay a participant's records up to the scheduled one and return it. */
 static ClusterColdReplayDetailV1
 replay_until(ColdReplayRun *run, uint32 participant, XLogRecPtr target,
@@ -242,9 +274,11 @@ replay_until(ColdReplayRun *run, uint32 participant, XLogRecPtr target,
 		}
 		if (record.read_rec_ptr > target)
 			return replay_stop(run, CLUSTER_COLD_REPLAY_TARGET_PASSED, participant, target);
-		replay_consumed(run, participant, &record);
-		if (!run->ops->unscheduled(run->arg, participant))
-			return replay_stop(run, CLUSTER_COLD_REPLAY_CALLBACK, participant, record.read_rec_ptr);
+		{
+			ClusterColdReplayDetailV1 detail = replay_unscheduled(run, participant, &record);
+			if (detail != CLUSTER_COLD_REPLAY_OK)
+				return detail;
+		}
 	}
 }
 
@@ -285,14 +319,25 @@ replay_drain(ColdReplayRun *run, uint32 participant)
 	const ClusterColdParticipantV1 *cut = &run->participants[participant];
 	ClusterColdReplayRecordV1 record;
 
+	if (run->drained[participant])
+		return CLUSTER_COLD_REPLAY_OK;
+	if (run->draining[participant] || run->scheduled_through[participant] > run->result->steps_done)
+		return replay_stop(run, CLUSTER_COLD_REPLAY_CALLBACK, participant,
+						   run->last_end[participant]);
+	/* At most one active drain per participant: recursive dependencies are
+	 * bounded by the existing source capacity, and cycles cannot consume a
+	 * pending record or pretend that its source completed. */
+	run->draining[participant] = true;
 	memset(&record, 0, sizeof(record));
 	while (run->ops->next(run->arg, participant, &record)) {
 		if (record.end_rec_ptr > cut->tail_end)
 			return replay_stop(run, CLUSTER_COLD_REPLAY_PAST_TAIL, participant,
 							   record.read_rec_ptr);
-		replay_consumed(run, participant, &record);
-		if (!run->ops->unscheduled(run->arg, participant))
-			return replay_stop(run, CLUSTER_COLD_REPLAY_CALLBACK, participant, record.read_rec_ptr);
+		{
+			ClusterColdReplayDetailV1 detail = replay_unscheduled(run, participant, &record);
+			if (detail != CLUSTER_COLD_REPLAY_OK)
+				return detail;
+		}
 		memset(&record, 0, sizeof(record));
 	}
 	if (run->last_end[participant] != cut->tail_end
@@ -305,6 +350,8 @@ replay_drain(ColdReplayRun *run, uint32 participant)
 									 run->consumed[participant]))
 		return replay_stop(run, CLUSTER_COLD_REPLAY_CALLBACK, participant,
 						   run->last_end[participant]);
+	run->draining[participant] = false;
+	run->drained[participant] = true;
 	return CLUSTER_COLD_REPLAY_OK;
 }
 
@@ -355,6 +402,12 @@ cluster_cold_replay_run_v1(const ClusterColdPlanV1 *plan,
 		seen[drain_order[i]] = true;
 	}
 	steps = cluster_cold_plan_step_count_v1(plan);
+	for (i = 0; i < steps; i++) {
+		ClusterColdStepV1 step;
+		if (!cluster_cold_plan_step_v1(plan, i, &step) || step.participant >= participant_count)
+			return replay_stop(&run, CLUSTER_COLD_REPLAY_STEP_UNUSABLE, 0, InvalidXLogRecPtr);
+		run.scheduled_through[step.participant] = i + 1;
+	}
 	for (i = 0; i < steps && detail == CLUSTER_COLD_REPLAY_OK; i++)
 		detail = replay_step(&run, i);
 	for (i = 0; i < participant_count && detail == CLUSTER_COLD_REPLAY_OK; i++)

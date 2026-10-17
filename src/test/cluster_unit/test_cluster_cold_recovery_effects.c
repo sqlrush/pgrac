@@ -67,6 +67,37 @@ typedef struct EffectRecord {
 	DecodedXLogRecord decoded;
 } EffectRecord;
 
+/* Original xlog adapter; only the final already-tested authority owner is
+ * a boundary. The decoder and effect validation below are real code. */
+typedef struct ClusterColdTypedReplay {
+	ClusterColdTypedV1 *typed;
+	struct ClusterRecoveryFencePlan **fence_plan;
+	XLogReaderState *current[CLUSTER_COLD_MAX_PARTICIPANTS];
+	ClusterColdDecodedV1 decoded;
+} ClusterColdTypedReplay;
+
+static unsigned dependency_calls;
+static bool dependency_owner_ok;
+static uint8 dependency_fence;
+
+bool
+cluster_cold_typed_record_target_v1(ClusterColdTypedV1 *typed,
+									struct ClusterRecoveryFencePlan *fence, uint32 participant,
+									const ClusterColdRecordV1 *record, uint32 *target)
+{
+	dependency_calls++;
+	UT_ASSERT_EQ(participant, 1);
+	UT_ASSERT(typed != NULL && fence == (struct ClusterRecoveryFencePlan *)&dependency_fence);
+	UT_ASSERT_EQ(record->record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
+	UT_ASSERT_EQ(record->rmid, RM_CLUSTER_UNDO_ID);
+	UT_ASSERT_EQ(record->info, XLOG_UNDO_RECOVERY_TT_ABORT);
+	if (dependency_owner_ok)
+		*target = 2;
+	return dependency_owner_ok;
+}
+
+#include "test_cluster_cold_dependency.inc"
+
 static const uint8 uuid[16] = { 1 };
 
 static void
@@ -1486,10 +1517,100 @@ UT_TEST(test_c0_route_keeps_complete_bounded_payload_validation)
 	}
 }
 
+UT_TEST(test_original_startup_dependency_decodes_before_target_owner)
+{
+	for (int fault = 0; fault < 12; fault++) {
+		EffectRecord r;
+		ClusterColdTypedV1 typed = { 0 };
+		ClusterColdTypedReplay replay = { 0 };
+		struct ClusterRecoveryFencePlan *fence = (void *)&dependency_fence;
+		ClusterColdReplayRecordV1 record = { 0 };
+		uint32 target = 999;
+		recovery_abort_record(&r);
+		typed.system_identifier = 99;
+		typed.participant_count = 3;
+		typed.own_participant = 0;
+		memcpy(typed.sources[1].claim.identity.storage_uuid, uuid, 16);
+		replay.typed = &typed;
+		replay.fence_plan = &fence;
+		replay.current[1] = &r.reader;
+		record.read_rec_ptr = r.reader.ReadRecPtr;
+		record.end_rec_ptr = r.reader.EndRecPtr;
+		record.record_crc = r.decoded.header.xl_crc;
+		record.rmid = r.decoded.header.xl_rmid;
+		record.info = r.decoded.header.xl_info;
+		dependency_calls = 0;
+		dependency_owner_ok = fault != 1;
+		switch (fault) {
+		case 2:
+			record.record_crc ^= 1;
+			break;
+		case 3:
+			record.rmid = RM_XACT_ID;
+			break;
+		case 4:
+			record.read_rec_ptr++;
+			break;
+		case 5:
+			r.decoded.main_data_len--;
+			break;
+		case 6:
+			typed.own_participant = 1;
+			break;
+		case 7:
+			r.reader.cluster_expected_thread_id = 2;
+			break;
+		case 8:
+			replay.current[1] = NULL;
+			break;
+		case 9:
+			replay.fence_plan = NULL;
+			break;
+		case 10:
+			typed.participant_count = 1;
+			break;
+		case 11:
+			record.end_rec_ptr--;
+			break;
+		}
+		UT_ASSERT_EQ(cluster_typed_replay_dependency(&replay, 1, &record, &target), fault == 0);
+		UT_ASSERT_EQ(target, fault == 0 ? 2 : CLUSTER_COLD_NO_INDEX);
+		UT_ASSERT_EQ(dependency_calls, fault <= 1 ? 1 : 0);
+		UT_ASSERT(replay.current[1] == (fault == 8 ? NULL : &r.reader));
+		cluster_cold_decoded_release_v1(&replay.decoded);
+	}
+}
+
+UT_TEST(test_original_startup_dependency_leaves_non_c0_with_existing_dispatch)
+{
+	EffectRecord r;
+	ClusterColdTypedV1 typed = { 0 };
+	ClusterColdTypedReplay replay = { 0 };
+	struct ClusterRecoveryFencePlan *fence = (void *)&dependency_fence;
+	ClusterColdReplayRecordV1 record = { 0 };
+	uint32 target = 999;
+	record_init(&r, RM_XLOG_ID, XLOG_NOOP);
+	typed.participant_count = 2;
+	replay.typed = &typed;
+	replay.fence_plan = &fence;
+	replay.current[1] = &r.reader;
+	record.read_rec_ptr = r.reader.ReadRecPtr;
+	record.end_rec_ptr = r.reader.EndRecPtr;
+	record.record_crc = r.decoded.header.xl_crc;
+	record.rmid = RM_XLOG_ID;
+	record.info = XLOG_NOOP;
+	dependency_calls = 0;
+	UT_ASSERT(cluster_typed_replay_dependency(&replay, 1, &record, &target));
+	UT_ASSERT_EQ(target, CLUSTER_COLD_NO_INDEX);
+	UT_ASSERT_EQ(dependency_calls, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(44);
+	UT_PLAN(46);
+	UT_RUN(test_original_startup_dependency_decodes_before_target_owner);
+	UT_RUN(test_original_startup_dependency_leaves_non_c0_with_existing_dispatch);
 	UT_RUN(test_foreign_c0_routes_whole_record_to_exact_side_consumer);
 	UT_RUN(test_own_c0_is_never_native_or_history_no_effect);
 	UT_RUN(test_c0_route_rejects_unowned_envelope_effects);

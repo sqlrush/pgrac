@@ -438,13 +438,19 @@ typedef struct ClusterColdReplayOpsV1 {
 	 * inputs, or verify the physical result of an already executed DROP;
 	 * required when the plan has SPACE relations. */
 	bool (*space_final)(void *arg, uint32 relation);
-	/* Optional owner notification after all scheduled steps and this source's
-	 * exact counted drain. A refusal stops before later sources/finalization. */
+	/* Optional owner notification after this source's scheduled steps and
+	 * exact counted drain. Other sources may still have scheduled work;
+	 * this does not grant global completion. Refusal stops further replay. */
 	bool (*source_drained)(void *arg, uint32 participant,
 						   const struct ClusterColdReplayResultV1 *progress, uint64 records);
 	/* Optional complete remainder-drain permutation, validated before any
 	 * record callback. Scheduled steps and each stream order stay unchanged. */
 	bool (*source_order)(void *arg, uint32 *order, uint32 count);
+	/* Optional exact dependency of the current unscheduled record. The owner
+	 * returns NO_INDEX for none; a different source must finish its original
+	 * scheduled steps and counted drain before this record is consumed. */
+	bool (*record_dependency)(void *arg, uint32 participant,
+							  const ClusterColdReplayRecordV1 *record, uint32 *target);
 } ClusterColdReplayOpsV1;
 
 typedef struct ClusterColdReplayResultV1 {
@@ -754,6 +760,13 @@ extern bool cluster_cold_typed_source_drained_v1(ClusterColdTypedV1 *typed,
 extern bool cluster_cold_typed_drain_order_v1(ClusterColdTypedV1 *typed,
 											  struct ClusterRecoveryFencePlan *fence, uint32 *order,
 											  uint32 count);
+
+/* Resolve one already-decoded, captured C0 dependency. This returns only
+ * an exact source index, never a completion or mutation permission. */
+extern bool cluster_cold_typed_record_target_v1(ClusterColdTypedV1 *typed,
+												struct ClusterRecoveryFencePlan *fence,
+												uint32 participant,
+												const ClusterColdRecordV1 *record, uint32 *target);
 
 /* Consume one original foreign control or record-local native SIDE effect
  * under its existing cold authority. Selection never authorizes a full source

@@ -2220,10 +2220,133 @@ UT_TEST(test_drain_order_rejects_identity_capture_and_scope_drift)
 	}
 }
 
+UT_TEST(test_source_drain_before_unrelated_steps_is_not_global_completion)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = control_fixture(&record);
+		ClusterColdReplayResultV1 progress = { 0 };
+		ClusterColdStepV1 step;
+		uint64 count = cluster_cold_plan_replay_record_count_v1(typed->plan, 1);
+		UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(typed->plan), 3);
+		UT_ASSERT(cluster_cold_plan_step_v1(typed->plan, 1, &step));
+		UT_ASSERT_EQ(step.participant, 1);
+		UT_ASSERT(cluster_cold_plan_step_v1(typed->plan, 2, &step));
+		UT_ASSERT_EQ(step.participant, 2);
+		progress.steps_done = 2;
+		progress.last_read[1] = roots[2].tail_last_record_lsn;
+		progress.last_end[1] = roots[2].validated_tail_lsn_exclusive;
+		progress.last_crc[1] = roots[2].tail_last_record_crc32c;
+		if (fault == 1)
+			progress.steps_done = 1;
+		if (fault == 2)
+			progress.steps_done = 4;
+		if (fault == 3)
+			progress.last_crc[1] ^= 1;
+		if (fault == 4)
+			tokens[1].file_txn_seq++;
+		UT_ASSERT_EQ(cluster_cold_typed_source_drained_v1(
+						 typed, (ClusterRecoveryFencePlan *)&fixture_context, 1, &progress, count),
+					 fault == 0);
+		UT_ASSERT_EQ(typed->source_drained[1], fault == 0);
+		UT_ASSERT(!typed->source_drained[0] && !typed->source_drained[2]);
+		UT_ASSERT(!cluster_cold_completion_proven_v1(typed->plan, &roots[2], &progress, 1));
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_c0_dependency_resolves_captured_target_without_completing_it)
+{
+	for (uint32 same = 0; same < 2; same++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = c0_fixture(&record, same ? 1 : 2);
+		uint32 target = 999;
+		memset(typed->source_drained, 0, sizeof(typed->source_drained));
+		UT_ASSERT(cluster_cold_typed_record_target_v1(
+			typed, (ClusterRecoveryFencePlan *)&fixture_context, 1, &record, &target));
+		UT_ASSERT_EQ(target, same ? 1 : 2);
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(c0_calls, 0);
+		UT_ASSERT(!typed->source_drained[0] && !typed->source_drained[1]
+				  && !typed->source_drained[2]);
+		if (!same) {
+			UT_ASSERT(!consume_control(typed, &record));
+			UT_ASSERT_EQ(c0_calls, 0);
+		}
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+	{
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = control_fixture(&record);
+		uint32 target = 999;
+		UT_ASSERT(cluster_cold_typed_record_target_v1(
+			typed, (ClusterRecoveryFencePlan *)&fixture_context, 1, &record, &target));
+		UT_ASSERT_EQ(target, CLUSTER_COLD_NO_INDEX);
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_c0_dependency_refuses_changed_identity_scope_and_partial_output)
+{
+	for (int fault = 0; fault < 10; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = c0_fixture(&record, 2);
+		uint32 target = 999;
+		switch (fault) {
+		case 0:
+			record.record_crc ^= 1;
+			break;
+		case 1:
+			record.end_rec_ptr++;
+			break;
+		case 2:
+			record.record_flags = 0;
+			break;
+		case 3:
+			side_fixture[1].operations[1].history_only = true;
+			break;
+		case 4:
+			side_fixture[1].operations[0] = side_fixture[1].operations[1];
+			break;
+		case 5:
+			side_fixture[1].sources[2].claim.claim_sha256[31] ^= 1;
+			break;
+		case 6:
+			typed->replay_count = 2;
+			break;
+		case 7:
+			c0_target_current = false;
+			break;
+		case 8:
+			tokens[1].file_txn_seq++;
+			break;
+		case 9:
+			cluster_cold_replay_window_leave_v1();
+			break;
+		}
+		UT_ASSERT(!cluster_cold_typed_record_target_v1(
+			typed, (ClusterRecoveryFencePlan *)&fixture_context, 1, &record, &target));
+		UT_ASSERT_EQ(target, CLUSTER_COLD_NO_INDEX);
+		UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(c0_calls, 0);
+		UT_ASSERT(!cluster_cold_typed_record_target_v1(
+			typed, (ClusterRecoveryFencePlan *)&fixture_context, 1, &record, &target));
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(62);
+	UT_PLAN(65);
+	UT_RUN(test_source_drain_before_unrelated_steps_is_not_global_completion);
+	UT_RUN(test_c0_dependency_resolves_captured_target_without_completing_it);
+	UT_RUN(test_c0_dependency_refuses_changed_identity_scope_and_partial_output);
 	UT_RUN(test_c0_drain_order_exact_target_before_writer_without_completion);
 	UT_RUN(test_drain_order_preserves_no_dependency_and_repeated_edges);
 	UT_RUN(test_drain_order_rejects_cycle_without_partial_order);
