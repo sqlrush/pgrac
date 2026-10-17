@@ -694,6 +694,7 @@ side_owner_apply_undo_header_record(RfSideOnlineProductionOwnerV1 *owner, uint32
 		&& undo->kind != CLUSTER_UNDO_KIND_SEGMENT_REUSE
 		&& undo->kind != CLUSTER_UNDO_KIND_SEGMENT_RECYCLE
 		&& undo->kind != CLUSTER_UNDO_KIND_TT_BIND && undo->kind != CLUSTER_UNDO_KIND_TT_SET_HEAD
+		&& undo->kind != CLUSTER_UNDO_KIND_TT_CTRC_RELEASE
 		&& !(undo->kind == CLUSTER_UNDO_KIND_TT_ABORT
 			 && undo->format_version == CLUSTER_UNDO_TT_ABORT_EXACT_VERSION))
 		return false;
@@ -725,6 +726,18 @@ side_owner_apply_undo_header_record(RfSideOnlineProductionOwnerV1 *owner, uint32
 		target->file = materialized;
 	} else if (!target->file.exists || target->file.size != UNDO_SEGMENT_SIZE_BYTES)
 		return false;
+	if (undo->kind == CLUSTER_UNDO_KIND_TT_CTRC_RELEASE) {
+		ClusterUndoHeaderPrepareResultV1 result;
+
+		/* Redo this retained release only. Its original exact transition
+		 * must explain the entire selected prefix from the observed DATA;
+		 * release cannot install a missing earlier terminal or another slot. */
+		current = target->base;
+		result = cluster_undo_prepare_header_v1(undo, NULL, 0, target->base.data, current.data);
+		if ((result != CLUSTER_UNDO_HEADER_APPLY && result != CLUSTER_UNDO_HEADER_ALREADY)
+			|| memcmp(current.data, prefix.page.data, BLCKSZ) != 0)
+			return false;
+	}
 	if (!side_owner_authority_fresh(owner)
 		|| !cluster_undo_smgr_recovery_read_block_v1(undo->segment_id, undo->instance, 0,
 													 &target->file, current.data)
@@ -766,7 +779,9 @@ side_owner_apply_undo_record(void *arg, uint32 index, const RfSideOnlineOperatio
 	undo = &operation->undo;
 	/* Include the selected header/DATA images, nested header preparation and
 	 * the bounded complete-record reader, not only cached target allocations. */
-	if (undo->kind == CLUSTER_UNDO_KIND_TT_SET_HEAD && owner->undo_bytes_remaining < 12 * BLCKSZ)
+	if ((undo->kind == CLUSTER_UNDO_KIND_TT_SET_HEAD
+		 || undo->kind == CLUSTER_UNDO_KIND_TT_CTRC_RELEASE)
+		&& owner->undo_bytes_remaining < 12 * BLCKSZ)
 		return false;
 	if (undo->kind != CLUSTER_UNDO_KIND_BLOCK_WRITE
 		&& undo->kind != CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI)

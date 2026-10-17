@@ -482,7 +482,8 @@ cold_foreign_side(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan,
 			   && (info == XLOG_UNDO_BLOCK_WRITE || info == XLOG_UNDO_BLOCK_WRITE_MULTI
 				   || info == XLOG_UNDO_SEGMENT_INIT || info == XLOG_UNDO_SEGMENT_REUSE
 				   || info == XLOG_UNDO_SEGMENT_RECYCLE || info == XLOG_UNDO_TT_SLOT_BIND
-				   || info == XLOG_UNDO_TT_SLOT_SET_HEAD || info == XLOG_UNDO_TT_SLOT_ABORT)
+				   || info == XLOG_UNDO_TT_SLOT_SET_HEAD || info == XLOG_UNDO_TT_SLOT_ABORT
+				   || info == XLOG_UNDO_TT_SLOT_CTRC_RELEASE)
 			   && XLogRecGetData(reader) != NULL && cluster_undo_decode(reader, &undo)
 			   && cluster_undo_preflight(&undo)
 			   && (info != XLOG_UNDO_TT_SLOT_ABORT

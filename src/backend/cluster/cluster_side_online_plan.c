@@ -2758,7 +2758,7 @@ rf_side_online_plan_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index
 		|| memcmp(&identity->record, &operation.identity.record, sizeof(identity->record)) != 0)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	/* XACT and UNDO require their record callbacks, never the whole-source
-	 * consumers. Legacy terminal carriers, CTRC and SPACE remain separate. */
+	 * consumers. Legacy terminal carriers and SPACE remain separate. */
 	if (operation.kind != RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
 		&& operation.kind != RF_SIDE_ONLINE_OPERATION_PROJECTION
 		&& !(operation.kind == RF_SIDE_ONLINE_OPERATION_XACT
@@ -2773,6 +2773,7 @@ rf_side_online_plan_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index
 				 || operation.undo.kind == CLUSTER_UNDO_KIND_SEGMENT_RECYCLE
 				 || operation.undo.kind == CLUSTER_UNDO_KIND_TT_BIND
 				 || operation.undo.kind == CLUSTER_UNDO_KIND_TT_SET_HEAD
+				 || operation.undo.kind == CLUSTER_UNDO_KIND_TT_CTRC_RELEASE
 				 || (operation.undo.kind == CLUSTER_UNDO_KIND_TT_ABORT
 					 && operation.undo.format_version == CLUSTER_UNDO_TT_ABORT_EXACT_VERSION))
 			 && ops->apply_undo_record != NULL))

@@ -1174,10 +1174,76 @@ UT_TEST(test_foreign_native_abort_unsupported_effects_are_not_consumers)
 	}
 }
 
+UT_TEST(test_foreign_ctrc_release_requires_original_complete_carrier)
+{
+	for (int fault = 0; fault < 10; fault++) {
+		EffectRecord r;
+		ClusterColdDecodedV1 out = { 0 };
+		xl_undo_tt_slot_ctrc_release_v1 release
+			= { .segment_id = 257,
+				.xid = 802,
+				.cluster_epoch = 11,
+				.root_id = 12,
+				.root_generation = 13,
+				.formation_epoch = 14,
+				.admission_record_generation = 15,
+				.seal_generation = 16,
+				.touched_nodes_low = 2,
+				.slot_offset = 4,
+				.slot_wrap = 7,
+				.owner_instance = 2,
+				.terminal_status = TT_SLOT_COMMITTED,
+				.format_version = CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION,
+				.flags = CLUSTER_UNDO_TT_CTRC_RELEASE_ALL_TOUCHED_ACKED };
+		uint8 bytes[CLUSTER_UNDO_TT_CTRC_RELEASE_BYTES];
+		ClusterColdDetailV1 detail;
+
+		memset(release.ack_set_digest, 0x5a, sizeof(release.ack_set_digest));
+		UT_ASSERT(cluster_undo_tt_ctrc_release_encode(&release, bytes));
+		record_init(&r, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_CTRC_RELEASE);
+		append(&r, bytes, sizeof(bytes));
+		if (fault == 1)
+			r.decoded.main_data_len--;
+		if (fault == 2)
+			r.decoded.main_data_len++;
+		if (fault == 3)
+			r.data.bytes[offsetof(xl_undo_tt_slot_ctrc_release_v1, format_version)]++;
+		if (fault == 4)
+			r.data.bytes[offsetof(xl_undo_tt_slot_ctrc_release_v1, flags)] = 0;
+		if (fault == 5)
+			memset(r.data.bytes + offsetof(xl_undo_tt_slot_ctrc_release_v1, root_id), 0, 4);
+		if (fault == 6)
+			memset(r.data.bytes + offsetof(xl_undo_tt_slot_ctrc_release_v1, segment_generation),
+				   0xff, 4);
+		if (fault == 7)
+			r.decoded.header.xl_info |= 1;
+		if (fault == 8)
+			r.decoded.main_data = NULL;
+		if (fault == 9)
+			r.data.bytes[offsetof(xl_undo_tt_slot_ctrc_release_v1, terminal_status)]
+				= TT_SLOT_ACTIVE;
+		detail = cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out);
+		if (fault == 0) {
+			UT_ASSERT_EQ(detail, CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
+			UT_ASSERT_EQ(out.effects.native_apply, CLUSTER_COLD_EFFECT_RECORD);
+			UT_ASSERT_EQ(out.effects.refused | out.effects.no_effect, 0);
+			UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, false));
+			UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+						 CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(out.record.record_flags, 0);
+		} else if (detail == CLUSTER_COLD_OK) {
+			UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+			UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(37);
+	UT_PLAN(38);
+	UT_RUN(test_foreign_ctrc_release_requires_original_complete_carrier);
 	UT_RUN(test_foreign_native_abort_keeps_complete_record_effects);
 	UT_RUN(test_foreign_native_xact_requires_bound_source_identity);
 	UT_RUN(test_foreign_native_abort_rejects_commit_flags_and_unknown_stats);

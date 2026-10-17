@@ -886,7 +886,8 @@ cold_record_side_kind(const ClusterColdRecordV1 *record)
 		&& (info == XLOG_UNDO_BLOCK_WRITE || info == XLOG_UNDO_BLOCK_WRITE_MULTI
 			|| info == XLOG_UNDO_SEGMENT_INIT || info == XLOG_UNDO_SEGMENT_REUSE
 			|| info == XLOG_UNDO_SEGMENT_RECYCLE || info == XLOG_UNDO_TT_SLOT_BIND
-			|| info == XLOG_UNDO_TT_SLOT_SET_HEAD || info == XLOG_UNDO_TT_SLOT_ABORT))
+			|| info == XLOG_UNDO_TT_SLOT_SET_HEAD || info == XLOG_UNDO_TT_SLOT_ABORT
+			|| info == XLOG_UNDO_TT_SLOT_CTRC_RELEASE))
 		return RF_SIDE_ONLINE_OPERATION_UNDO;
 	/* Ordered native XACT completion is consumed by the existing cold owner;
 	 * prepared/2PC variants stay outside this route and fail closed. */
@@ -984,6 +985,10 @@ cluster_cold_typed_side_record_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFenc
 		if (record->rmid == RM_CLUSTER_UNDO_ID && record->info == XLOG_UNDO_TT_SLOT_ABORT
 			&& (operation.undo.kind != CLUSTER_UNDO_KIND_TT_ABORT
 				|| operation.undo.format_version != CLUSTER_UNDO_TT_ABORT_EXACT_VERSION))
+			return false;
+		if (record->rmid == RM_CLUSTER_UNDO_ID && record->info == XLOG_UNDO_TT_SLOT_CTRC_RELEASE
+			&& (operation.undo.kind != CLUSTER_UNDO_KIND_TT_CTRC_RELEASE
+				|| operation.undo.format_version != CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION))
 			return false;
 		match = i;
 	}
