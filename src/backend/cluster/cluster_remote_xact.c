@@ -421,12 +421,47 @@ remote_xact_open_page(int origin_node, TransactionId xid, bool create, bool writ
 	return SimpleLruReadPage(ctl, pageno, true, xid);
 }
 
+/* Recovery completion requires every sync/close result, including directories. */
+static bool
+remote_xact_sync_strict(const char *path, bool directory)
+{
+	volatile int fd = -1;
+	volatile int saved_errno = 0;
+	volatile bool ok = false;
+
+	PG_TRY();
+	{
+		fd = OpenTransientFile(path, (directory ? O_RDONLY | O_DIRECTORY : O_RDWR) | O_NOFOLLOW
+										 | O_CLOEXEC | PG_BINARY);
+		if (fd >= 0) {
+			pgstat_report_wait_start(WAIT_EVENT_SLRU_FLUSH_SYNC);
+			ok = pg_fsync(fd) == 0;
+			pgstat_report_wait_end();
+		}
+		if (!ok)
+			saved_errno = errno;
+	}
+	PG_FINALLY();
+	{
+		pgstat_report_wait_end();
+		if (fd >= 0 && CloseTransientFile(fd) != 0) {
+			if (ok)
+				saved_errno = errno;
+			ok = false;
+		}
+	}
+	PG_END_TRY();
+	if (!ok)
+		errno = saved_errno;
+	return ok;
+}
+
 static void
 remote_xact_force_durable(int pageno, TransactionId abort_xid)
 {
 	SlruCtl ctl = remote_xact_ctl((uint32)pageno >> CLUSTER_REMOTE_XACT_ORIGIN_PAGE_SHIFT);
-	FileTag tag;
 	char path[MAXPGPATH];
+	int length;
 
 	/*
 	 * RF-SIDE pending/projection readiness is allowed only after stable
@@ -438,13 +473,18 @@ remote_xact_force_durable(int pageno, TransactionId abort_xid)
 										abort_xid))
 		ereport(ERROR, (errmsg("remote transaction recovery authority expired before write")));
 	SimpleLruWriteAll(ctl, true);
-	memset(&tag, 0, sizeof(tag));
-	tag.segno = (uint32)(pageno / SLRU_PAGES_PER_SEGMENT);
-	if (SlruSyncFileTag(ctl, &tag, path) != 0)
+	length = snprintf(path, sizeof(path), "%s/%04X", ctl->Dir,
+					  (uint32)(pageno / SLRU_PAGES_PER_SEGMENT));
+	if (length < 0 || length >= sizeof(path))
+		ereport(ERROR, (errmsg("remote transaction segment path is too long")));
+	if (!remote_xact_sync_strict(path, false))
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not synchronize remote transaction segment \"%s\": %m", path)));
-	fsync_fname(ctl->Dir, true);
+	if (!remote_xact_sync_strict(ctl->Dir, true))
+		ereport(ERROR, (errcode_for_file_access(),
+						errmsg("could not synchronize remote transaction directory \"%s\": %m",
+							   ctl->Dir)));
 }
 
 static ClusterRemoteXactMutationV2
