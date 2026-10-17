@@ -48,6 +48,7 @@ static uint32 wait_event;
 uint32 *my_wait_event_info = &wait_event;
 static char fixture_root[MAXPGPATH];
 static bool authority = true, revoke_on_lock, expect_error, fail_open, fail_sync, fail_dirsync;
+static bool c0_authority;
 static bool revoke_after_read, revoke_after_sync;
 static bool fail_read, fail_unlink;
 static bool fail_sync_close;
@@ -150,6 +151,11 @@ cluster_undo_recovery_cold_origin_authorized_v1(int origin)
 	return authority && origin == 1;
 }
 bool
+cluster_undo_recovery_abort_clog_authorized_v1(int origin, TransactionId xid)
+{
+	return c0_authority && origin == 1 && xid == 100;
+}
+bool
 TransactionIdPrecedes(TransactionId a, TransactionId b)
 {
 	return (int32)(a - b) < 0;
@@ -192,7 +198,7 @@ LWLockAcquire(LWLock *lock, LWLockMode mode pg_attribute_unused())
 	UT_ASSERT(!fixture_locks[i].held);
 	fixture_locks[i].held = true;
 	if (revoke_on_lock && lock == &ClogRecoveryLocks[3].lock)
-		authority = false;
+		authority = c0_authority = false;
 	return true;
 }
 void
@@ -229,7 +235,7 @@ pgstat_count_slru_page_read(int i pg_attribute_unused())
 {
 	reads++;
 	if (revoke_after_read)
-		authority = false;
+		authority = c0_authority = false;
 	if (change_after_read) {
 		char path[MAXPGPATH], replacement[MAXPGPATH];
 		int mutation = change_after_read;
@@ -340,7 +346,7 @@ pg_fsync(int fd)
 		return -1;
 	}
 	if (revoke_after_sync)
-		authority = false;
+		authority = c0_authority = false;
 	return fsync(fd);
 }
 void
@@ -970,6 +976,108 @@ UT_TEST(native_clog_durability_failures_refuse_completion_and_allow_exact_retry)
 	}
 }
 
+UT_TEST(c0_exact_native_abort_does_not_authorize_an_origin)
+{
+	TransactionId child = 101;
+	ClusterSideProjectionOperationV1 zero = fixture_clog_record(false, 160);
+	ClusterSideProjectionOperationV1 truncate = fixture_clog_record(true, 32);
+	unsigned before;
+	fixture_zero(0);
+	authority = false;
+	c0_authority = true;
+	before = writes;
+	UT_ASSERT(
+		!cluster_clog_native_recovery_apply_v1(1, 100, 0, NULL, TRANSACTION_STATUS_COMMITTED));
+	UT_ASSERT(!cluster_clog_native_recovery_apply_v1(1, 101, 0, NULL, TRANSACTION_STATUS_ABORTED));
+	UT_ASSERT(
+		!cluster_clog_native_recovery_apply_v1(1, 100, 1, &child, TRANSACTION_STATUS_ABORTED));
+	UT_ASSERT(!cluster_clog_native_recovery_apply_v1(0, 100, 0, NULL, TRANSACTION_STATUS_ABORTED));
+	UT_ASSERT(!cluster_clog_native_recovery_apply_v1(2, 100, 0, NULL, TRANSACTION_STATUS_ABORTED));
+	UT_ASSERT(!cluster_clog_native_recovery_record_apply_v1(1, &zero));
+	UT_ASSERT(!cluster_clog_native_recovery_record_apply_v1(1, &truncate));
+	UT_ASSERT_EQ(writes, before);
+	UT_ASSERT(cluster_clog_native_recovery_apply_v1(1, 100, 0, NULL, TRANSACTION_STATUS_ABORTED));
+	UT_ASSERT(cluster_clog_native_recovery_verify_v1(1, 100, 0, NULL, TRANSACTION_STATUS_ABORTED));
+	UT_ASSERT_EQ(fixture_status(100), TRANSACTION_STATUS_ABORTED);
+	UT_ASSERT_EQ(fixture_status(101), TRANSACTION_STATUS_IN_PROGRESS);
+	c0_authority = false;
+	UT_ASSERT(!cluster_clog_native_recovery_verify_v1(1, 100, 0, NULL, TRANSACTION_STATUS_ABORTED));
+	authority = true;
+	fixture_idle();
+}
+
+UT_TEST(c0_native_abort_retains_conflict_and_durability_refusal)
+{
+	for (int fault = 0; fault < 4; fault++) {
+		unsigned before;
+		fixture_zero(0);
+		authority = false;
+		c0_authority = true;
+		if (fault == 0)
+			fixture_bit(100, TRANSACTION_STATUS_COMMITTED);
+		fail_sync = fault == 1;
+		fail_sync_close = fault == 2;
+		directory_sync_error = fault == 3 ? EINVAL : 0;
+		before = writes;
+		UT_ASSERT(
+			!cluster_clog_native_recovery_apply_v1(1, 100, 0, NULL, TRANSACTION_STATUS_ABORTED));
+		if (fault == 0) {
+			UT_ASSERT_EQ(writes, before);
+			UT_ASSERT_EQ(fixture_status(100), TRANSACTION_STATUS_COMMITTED);
+		} else
+			UT_ASSERT(writes > before);
+		fail_sync = fail_sync_close = false;
+		directory_sync_error = 0;
+		c0_authority = false;
+		authority = true;
+		fixture_idle();
+	}
+}
+
+UT_TEST(c0_native_abort_revocation_and_error_keep_original_cleanup)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		volatile bool caught = false;
+		volatile bool result = false;
+		unsigned before;
+		fixture_zero(0);
+		authority = false;
+		c0_authority = true;
+		revoke_on_lock = fault == 0;
+		revoke_after_read = fault == 1;
+		revoke_after_sync = fault == 2;
+		fail_read = fault == 3;
+		fail_open = fault == 4;
+		fail_dirsync = fault == 5;
+		expect_error = true;
+		before = writes;
+		PG_TRY();
+		{
+			result = cluster_clog_native_recovery_apply_v1(1, 100, 0, NULL,
+														   TRANSACTION_STATUS_ABORTED);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught || !result);
+		if (fault <= 1)
+			UT_ASSERT_EQ(writes, before);
+		expect_error = revoke_on_lock = revoke_after_read = revoke_after_sync = false;
+		fail_read = fail_open = fail_dirsync = false;
+		fixture_idle();
+		c0_authority = true;
+		UT_ASSERT(
+			cluster_clog_native_recovery_apply_v1(1, 100, 0, NULL, TRANSACTION_STATUS_ABORTED));
+		UT_ASSERT(
+			cluster_clog_native_recovery_verify_v1(1, 100, 0, NULL, TRANSACTION_STATUS_ABORTED));
+		c0_authority = false;
+		authority = true;
+		fixture_idle();
+	}
+}
+
 static void
 fixture_cleanup(void)
 {
@@ -1010,7 +1118,7 @@ main(void)
 			return 2;
 	}
 	clog_recovery_shmem_init();
-	UT_PLAN(18);
+	UT_PLAN(21);
 	UT_RUN(separate_original_origin_controls);
 	UT_RUN(commit_and_abort_persist_full_tree_without_local_pollution);
 	UT_RUN(conflicting_late_child_refuses_before_any_tree_write);
@@ -1029,6 +1137,9 @@ main(void)
 	UT_RUN(native_clog_record_alias_and_unlink_failure_remain_incomplete);
 	UT_RUN(native_clog_record_io_error_releases_original_locks_and_private_cache);
 	UT_RUN(native_clog_durability_failures_refuse_completion_and_allow_exact_retry);
+	UT_RUN(c0_exact_native_abort_does_not_authorize_an_origin);
+	UT_RUN(c0_native_abort_retains_conflict_and_durability_refusal);
+	UT_RUN(c0_native_abort_revocation_and_error_keep_original_cleanup);
 	fixture_cleanup();
 	UT_DONE();
 	return ut_failed_count != 0;

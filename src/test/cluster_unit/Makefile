@@ -2811,6 +2811,7 @@ test_cluster_undo_dir_native.inc: $(top_srcdir)/src/backend/cluster/storage/clus
 	mv $@.tmp $@
 
 test_cluster_undo_recovery_product.o: $(top_srcdir)/src/backend/cluster/cluster_undo_recovery.c \
+		$(top_srcdir)/src/include/access/clog.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
@@ -4184,6 +4185,7 @@ test_cluster_multixact_recovery test_cluster_multixact_limits_io: %: %.c unit_te
 test_cluster_clog_recovery: test_cluster_clog_recovery.c unit_test.h \
 		$(top_srcdir)/src/backend/access/transam/clog.c \
 		$(top_srcdir)/src/include/access/clog.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_projection.h \
 		$(top_srcdir)/src/backend/access/transam/slru.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \

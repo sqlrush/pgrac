@@ -2,6 +2,7 @@
  * immutable plan delivery and held-FD IO below are controlled boundaries. */
 #include "postgres.h"
 #include "access/xlog.h"
+#include "access/clog.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_undo_recovery.h"
@@ -34,6 +35,8 @@ static bool synced[2], fd_held, nested;
 static unsigned sync_calls, prepares, writes, closes, path_calls;
 static int fail_sync, fail_read_source, throw_stage, drift_stage, drift_kind;
 static bool fail_prepare, fail_write, fail_close;
+static bool fail_clog_apply, fail_clog_verify;
+static unsigned clog_applies, clog_verifies;
 static char order[64];
 static unsigned order_count;
 
@@ -248,6 +251,7 @@ cluster_undo_smgr_recovery_abort_prepare_v1(const ClusterRecoveryTTAbortV1 *reco
 	UT_ASSERT(!cluster_undo_recovery_origin_authorized_v1(1));
 	UT_ASSERT(!cluster_undo_recovery_cold_origin_authorized_v1(1));
 	UT_ASSERT(!cluster_undo_recovery_origin_authorized_v1(2));
+	UT_ASSERT(!cluster_undo_recovery_abort_clog_authorized_v1(1, record->exact.xid));
 	UT_ASSERT(!cluster_undo_recovery_scope_enter_v1(&ordinary, &authorities[1], plan));
 	UT_ASSERT(cluster_undo_recovery_path_resolve_v1(2, 257, path, sizeof(path)) == 0);
 	UT_ASSERT(strcmp(path, "/shared/undo/2/257") == 0);
@@ -270,12 +274,56 @@ cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 stamp)
 {
 	UT_ASSERT(fd_held && stamp.token == 19);
 	writes++;
+	UT_ASSERT(
+		!cluster_undo_recovery_abort_clog_authorized_v1(1, operation.recovery_abort.exact.xid));
 	note('S');
 	inject(4);
 	if (fail_write)
 		return false;
 	disk_slot.status = TT_SLOT_ABORTED;
 	return true;
+}
+
+static void
+clog_exact_scope(int origin, TransactionId xid, int nsubxids, const TransactionId *children,
+				 XidStatus status)
+{
+	UT_ASSERT_EQ(origin, 1);
+	UT_ASSERT_EQ(xid, operation.recovery_abort.exact.xid);
+	UT_ASSERT_EQ(nsubxids, 0);
+	UT_ASSERT_NULL(children);
+	UT_ASSERT_EQ(status, TRANSACTION_STATUS_ABORTED);
+	UT_ASSERT(fd_held && synced[0] && synced[1]);
+	UT_ASSERT_EQ(disk_slot.status, TT_SLOT_ABORTED);
+	UT_ASSERT(cluster_undo_recovery_abort_clog_authorized_v1(origin, xid));
+	UT_ASSERT(!cluster_undo_recovery_abort_clog_authorized_v1(origin, xid + 1));
+	UT_ASSERT(!cluster_undo_recovery_abort_clog_authorized_v1(2, xid));
+	UT_ASSERT(!cluster_undo_recovery_abort_clog_authorized_v1(-1, xid));
+	UT_ASSERT(!cluster_undo_recovery_abort_clog_authorized_v1(128, xid));
+	UT_ASSERT(!cluster_undo_recovery_origin_authorized_v1(origin));
+	UT_ASSERT(!cluster_undo_recovery_cold_origin_authorized_v1(origin));
+}
+
+bool
+cluster_clog_native_recovery_apply_v1(int origin, TransactionId xid, int nsubxids,
+									  const TransactionId *children, XidStatus status)
+{
+	clog_applies++;
+	note('A');
+	clog_exact_scope(origin, xid, nsubxids, children, status);
+	inject(5);
+	return !fail_clog_apply;
+}
+
+bool
+cluster_clog_native_recovery_verify_v1(int origin, TransactionId xid, int nsubxids,
+									   const TransactionId *children, XidStatus status)
+{
+	clog_verifies++;
+	note('V');
+	clog_exact_scope(origin, xid, nsubxids, children, status);
+	inject(6);
+	return !fail_clog_verify;
 }
 
 bool
@@ -309,6 +357,8 @@ reset(void)
 	fail_sync = fail_read_source = -1;
 	throw_stage = drift_stage = drift_kind = 0;
 	fail_prepare = fail_write = fail_close = false;
+	fail_clog_apply = fail_clog_verify = false;
+	clog_applies = clog_verifies = 0;
 	for (int i = 0; i < 2; i++) {
 		ClusterWalThreadClaimRefV2 *ref = &sources[i].claim;
 		ref->identity.system_identifier = system_id;
@@ -386,6 +436,8 @@ no_path(void)
 {
 	char path[MAXPGPATH];
 	UT_ASSERT(!fd_held);
+	UT_ASSERT(
+		!cluster_undo_recovery_abort_clog_authorized_v1(1, operation.recovery_abort.exact.xid));
 	UT_ASSERT_EQ(cluster_undo_recovery_path_resolve_v1(2, 257, path, sizeof(path)), -1);
 	UT_ASSERT_EQ(cluster_undo_recovery_intent_for_owner(2), CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL);
 }
@@ -395,7 +447,9 @@ UT_TEST(exact_c0_replay_binds_two_owners_and_durable_order)
 	reset();
 	UT_ASSERT(cluster_recovery_tt_abort_valid_v1(&operation.recovery_abort));
 	UT_ASSERT(apply());
-	UT_ASSERT(strcmp(order, "WTPSC") == 0);
+	UT_ASSERT(strcmp(order, "WTPSAVC") == 0);
+	UT_ASSERT_EQ(clog_applies, 1);
+	UT_ASSERT_EQ(clog_verifies, 1);
 	UT_ASSERT_EQ(disk_slot.status, TT_SLOT_ABORTED);
 	UT_ASSERT_EQ(closes, 1);
 	no_path();
@@ -505,7 +559,7 @@ UT_TEST(wrong_record_or_crossed_authorities_never_resolve_a_path)
 
 UT_TEST(sync_prepare_write_close_failure_never_reports_completion)
 {
-	for (int fault = 0; fault < 7; fault++) {
+	for (int fault = 0; fault < 9; fault++) {
 		reset();
 		if (fault < 4)
 			fail_sync = fault;
@@ -515,22 +569,28 @@ UT_TEST(sync_prepare_write_close_failure_never_reports_completion)
 			fail_write = true;
 		if (fault == 6)
 			fail_close = true;
+		if (fault == 7)
+			fail_clog_apply = true;
+		if (fault == 8)
+			fail_clog_verify = true;
 		UT_ASSERT(!apply());
 		UT_ASSERT_EQ(writes, fault >= 5 ? 1 : 0);
 		UT_ASSERT_EQ(closes, fault >= 5 ? 1 : 0);
+		UT_ASSERT_EQ(clog_applies, fault >= 6 ? 1 : 0);
+		UT_ASSERT_EQ(clog_verifies, fault == 6 || fault == 8 ? 1 : 0);
 		no_path();
 	}
 }
 
 UT_TEST(authority_drift_at_each_io_boundary_is_not_success)
 {
-	for (int stage = 1; stage <= 4; stage++)
+	for (int stage = 1; stage <= 6; stage++)
 		for (int fault = 0; fault < 10; fault++) {
 			reset();
 			drift_stage = stage;
 			drift_kind = fault;
 			UT_ASSERT(!apply());
-			UT_ASSERT_EQ(writes, stage == 4 ? 1 : 0);
+			UT_ASSERT_EQ(writes, stage >= 4 ? 1 : 0);
 			UT_ASSERT_EQ(closes, stage >= 3 ? 1 : 0);
 			no_path();
 		}
@@ -538,7 +598,7 @@ UT_TEST(authority_drift_at_each_io_boundary_is_not_success)
 
 UT_TEST(error_rethrows_and_removes_target_scope_and_held_descriptor)
 {
-	for (int stage = 1; stage <= 4; stage++) {
+	for (int stage = 1; stage <= 6; stage++) {
 		volatile bool caught = false;
 		reset();
 		throw_stage = stage;

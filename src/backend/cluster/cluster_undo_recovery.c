@@ -7,6 +7,7 @@
 #include "postgres.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "access/clog.h"
 #include "access/xlog.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_guc.h"
@@ -29,6 +30,7 @@ typedef struct RecoveryAbortScope {
 	ClusterWalSourceRef source[2];
 	RfPageOnlineRecordIdentityV1 identity;
 	ClusterRecoveryTTAbortV1 record;
+	bool clog_active;
 } RecoveryAbortScope;
 
 static const RecoveryAbortScope *active_abort;
@@ -190,8 +192,20 @@ cluster_undo_recovery_abort_replay_v1(const RfSideOnlinePlanV1 *plan, uint32 ind
 			&& recovery_abort_current(&scope)
 			&& cluster_undo_smgr_recovery_abort_write_v1(
 				(ClusterUndoSmgrRecoveryStampV1){ stamp.token })
-			&& recovery_abort_current(&scope))
-			ok = true;
+			&& recovery_abort_current(&scope)) {
+			/* The target slot and both inputs are durable before restoring
+			 * this one target-native ABORT bit. No ordinary origin is admitted. */
+			scope.clog_active = true;
+			ok = cluster_clog_native_recovery_apply_v1(scope.record.target_thread - 1,
+													   scope.record.exact.xid, 0, NULL,
+													   TRANSACTION_STATUS_ABORTED)
+				 && recovery_abort_current(&scope)
+				 && cluster_clog_native_recovery_verify_v1(scope.record.target_thread - 1,
+														   scope.record.exact.xid, 0, NULL,
+														   TRANSACTION_STATUS_ABORTED)
+				 && recovery_abort_current(&scope);
+			scope.clog_active = false;
+		}
 	}
 	PG_FINALLY();
 	{
@@ -301,6 +315,14 @@ cluster_undo_recovery_cold_origin_authorized_v1(int origin_node)
 		   && rf_side_online_plan_recovery_source_matches_v1(
 			   active_scope->plan, active_scope->duty.system_identifier,
 			   active_scope->duty.storage_uuid, &active_scope->cut);
+}
+
+bool
+cluster_undo_recovery_abort_clog_authorized_v1(int origin_node, TransactionId xid)
+{
+	return origin_node >= 0 && origin_node < 128 && active_abort != NULL
+		   && active_abort->clog_active && active_abort->record.target_thread == origin_node + 1
+		   && active_abort->record.exact.xid == xid && recovery_abort_current(active_abort);
 }
 
 bool

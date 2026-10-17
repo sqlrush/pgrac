@@ -768,12 +768,27 @@ CLOGShmemBuffers(void)
  * Its complete terminal WAL, base/era and serialization proofs remain caller
  * obligations; this storage API cannot turn an observed xid into authority. */
 static bool
-clog_recovery_permitted(int origin)
+clog_recovery_initialized(int origin)
 {
 	return cluster_shared_config && InRecovery && AmStartupProcess() && origin >= 0
 		   && origin < CLOG_RECOVERY_ORIGINS && origin != cluster_node_id
-		   && ClogRecoveryLocks != NULL && ClogRecoveryCtl[origin].shared != NULL
+		   && ClogRecoveryLocks != NULL && ClogRecoveryCtl[origin].shared != NULL;
+}
+
+static bool
+clog_recovery_permitted(int origin)
+{
+	return clog_recovery_initialized(origin)
 		   && cluster_undo_recovery_cold_origin_authorized_v1(origin);
+}
+
+static bool
+clog_recovery_terminal_permitted(int origin, TransactionId xid, int count, XidStatus status)
+{
+	return clog_recovery_initialized(origin)
+		   && (cluster_undo_recovery_cold_origin_authorized_v1(origin)
+			   || (count == 0 && TransactionIdIsNormal(xid) && status == TRANSACTION_STATUS_ABORTED
+				   && cluster_undo_recovery_abort_clog_authorized_v1(origin, xid)));
 }
 
 static void
@@ -795,7 +810,7 @@ clog_recovery_cache_discard(SlruCtl ctl)
 }
 
 static bool
-clog_recovery_directory_ready(int origin)
+clog_recovery_terminal_directory_ready(int origin, TransactionId xid, int count, XidStatus status)
 {
 	const char *children[3] = { "native_side", NULL, "pg_xact" };
 	int dirs[4] = { -1, -1, -1, -1 };
@@ -805,8 +820,8 @@ clog_recovery_directory_ready(int origin)
 	int length;
 	bool ok = false;
 
-	if (!clog_recovery_permitted(origin) || cluster_shared_data_dir == NULL
-		|| cluster_shared_data_dir[0] != '/')
+	if (!clog_recovery_terminal_permitted(origin, xid, count, status)
+		|| cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] != '/')
 		return false;
 	snprintf(origin_name, sizeof(origin_name), "origin_%d", origin);
 	children[1] = origin_name;
@@ -837,7 +852,16 @@ done:
 		if (dirs[i] >= 0 && close(dirs[i]) != 0)
 			ok = false;
 	/* Revalidation can ERROR; do not keep raw directory FDs across it. */
-	return ok && clog_recovery_permitted(origin);
+	return ok && clog_recovery_terminal_permitted(origin, xid, count, status);
+}
+
+static bool
+clog_recovery_directory_ready(int origin)
+{
+	/* Invalid/nonterminal has no C0 permission; ZERO/TRUNCATE keep their
+	 * ordinary origin qualification at every directory revalidation. */
+	return clog_recovery_terminal_directory_ready(origin, InvalidTransactionId, 0,
+												  TRANSACTION_STATUS_IN_PROGRESS);
 }
 
 /* Terminal replay requires a real complete page. Only a separate, proved
@@ -945,18 +969,21 @@ clog_recovery_page(int origin, int page, TransactionId top, int count,
 	bool ok;
 
 	clog_recovery_cache_discard(ctl);
-	if (!clog_recovery_directory_ready(origin) || !clog_recovery_page_identity(ctl, page, &before))
+	if (!clog_recovery_terminal_directory_ready(origin, top, count, status)
+		|| !clog_recovery_page_identity(ctl, page, &before))
 		return false;
 	LWLockAcquire(ctl->shared->ControlLock, LW_EXCLUSIVE);
 	slot = SimpleLruReadPage(ctl, page, true, top);
-	ok = clog_recovery_permitted(origin) && clog_recovery_page_identity(ctl, page, &after)
+	ok = clog_recovery_terminal_permitted(origin, top, count, status)
+		 && clog_recovery_page_identity(ctl, page, &after)
 		 && clog_recovery_same_file(&before, &after);
 	if (ok && TransactionIdIsValid(top))
 		ok = clog_recovery_status(ctl, slot, top, status, access);
 	for (int i = 0; ok && i < count; i++)
 		ok = clog_recovery_status(ctl, slot, children[i], status, access);
 	if (ok && access == CLOG_RECOVERY_WRITE) {
-		ok = clog_recovery_permitted(origin) && clog_recovery_page_identity(ctl, page, &after)
+		ok = clog_recovery_terminal_permitted(origin, top, count, status)
+			 && clog_recovery_page_identity(ctl, page, &after)
 			 && clog_recovery_same_file(&before, &after);
 		if (ok)
 			SimpleLruWritePage(ctl, slot);
@@ -965,9 +992,11 @@ clog_recovery_page(int origin, int page, TransactionId top, int count,
 	if (!ok)
 		return false;
 	if (access == CLOG_RECOVERY_WRITE
-		&& (!clog_recovery_permitted(origin) || !clog_recovery_sync(ctl, page, &before)))
+		&& (!clog_recovery_terminal_permitted(origin, top, count, status)
+			|| !clog_recovery_sync(ctl, page, &before)))
 		return false;
-	return clog_recovery_directory_ready(origin) && clog_recovery_page_identity(ctl, page, &after)
+	return clog_recovery_terminal_directory_ready(origin, top, count, status)
+		   && clog_recovery_page_identity(ctl, page, &after)
 		   && clog_recovery_same_file(&before, &after);
 }
 
@@ -1017,7 +1046,7 @@ clog_recovery_tree(int origin, TransactionId xid, int count, const TransactionId
 		return false;
 	if (!clog_recovery_sync(&ClogRecoveryCtl[origin], -1, NULL))
 		return false;
-	return clog_recovery_directory_ready(origin)
+	return clog_recovery_terminal_directory_ready(origin, xid, count, status)
 		   && clog_recovery_tree(origin, xid, count, children, status, true);
 }
 
@@ -1030,7 +1059,8 @@ clog_recovery_access(int origin, TransactionId xid, int nsubxids, const Transact
 	LWLock *lock;
 	TransactionId previous = xid;
 
-	if (!clog_recovery_permitted(origin) || !TransactionIdIsNormal(xid) || nsubxids < 0
+	if (!clog_recovery_terminal_permitted(origin, xid, nsubxids, status)
+		|| !TransactionIdIsNormal(xid) || nsubxids < 0
 		|| nsubxids > PG_INT32_MAX / (int)sizeof(TransactionId) || (nsubxids > 0 && subxids == NULL)
 		|| (status != TRANSACTION_STATUS_COMMITTED && status != TRANSACTION_STATUS_ABORTED))
 		return false;
@@ -1046,7 +1076,7 @@ clog_recovery_access(int origin, TransactionId xid, int nsubxids, const Transact
 		LWLockAcquire(lock, LW_EXCLUSIVE);
 		locked = true;
 		clog_recovery_cache_discard(&ClogRecoveryCtl[origin]);
-		if (clog_recovery_directory_ready(origin))
+		if (clog_recovery_terminal_directory_ready(origin, xid, nsubxids, status))
 			ok = clog_recovery_tree(origin, xid, nsubxids, subxids, status, verify);
 	}
 	PG_FINALLY();
