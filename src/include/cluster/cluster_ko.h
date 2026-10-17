@@ -386,8 +386,7 @@ extern bool cluster_ko_shared_ack_matches_v3(const ClusterKoSharedMessageV3 *req
 extern bool cluster_ko_shared_result_matches_v3(const ClusterKoSharedMessageV3 *request,
 												const ClusterKoSharedMessageV3 *result);
 
-/* Pure PKO4 codec only. Runtime advertisement/dispatch must wait for the
- * committed-discard consumer; no v2/v3 frame fallback is permitted. */
+/* PKO4 committed-discard codec; no v2/v3 frame fallback is permitted. */
 extern bool cluster_ko_shared_encode_v4(const ClusterKoSharedMessageV4 *message, void *bytes,
 										size_t length);
 extern bool cluster_ko_shared_decode_v4(const void *bytes, size_t length,

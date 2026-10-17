@@ -1,4 +1,4 @@
-/* Native KO routing with the production capability producer and COMMIT/CP
+/* Legacy KO routing with explicit old-binary capabilities and real COMMIT/CP
  * callers. GES, SPACE durability, publication and buffer cleanup retain the
  * explicit standalone fixtures; no local cleanup is a physical IO proof.
  * Author: SqlRush <sqlrush@gmail.com> */
@@ -11,7 +11,7 @@ static uint32 missing_capabilities;
 static uint32
 native_incomplete_capabilities(void)
 {
-	return native_real_capability_word() & ~missing_capabilities;
+	return native_legacy_v3_capability_word() & ~missing_capabilities;
 }
 
 static uint32
@@ -47,14 +47,14 @@ prepare_native_v3(void)
 	postcommit_storage_consumer = NULL;
 	postcommit_buffer_error = false;
 	native_commit_active = true;
-	native_capability_hook = native_real_capability_word;
+	native_capability_hook = native_legacy_v3_capability_word;
 }
 
-/* The origin PKO4 producer is not enabled by this slice. Supply its already
- * authenticated shared result at the original completion-capture boundary;
+/* Supply an authenticated result at the old private-capture boundary. The
+ * production PKO4 registration/window is covered by the registration tests;
  * native capture/COMMIT/publication/CP consumers below are real. Old DATA,
  * final SPACE and all-peer READY remain the existing explicit fixtures, not
- * evidence of the future committed-discard producer or SQL completion. */
+ * evidence of the committed-discard producer or SQL completion. */
 static void
 prepare_committed_capture(void)
 {
@@ -121,7 +121,7 @@ UT_TEST(test_committed_capture_requires_its_own_control_not_live_v3)
 		else if (fault < 4)
 			cluster_interconnect_tier = fault == 2 ? CLUSTER_IC_TIER_2 : CLUSTER_IC_TIER_3;
 		else if (fault == 4)
-			native_capability_hook = native_real_capability_word;
+			native_capability_hook = native_legacy_v3_capability_word;
 		else
 			object_wire_missing_capabilities |= PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1;
 		UT_ASSERT(!ko_native_barrier_to_owner(postcommit_owner));
@@ -137,7 +137,7 @@ UT_TEST(test_committed_private_owner_cannot_downgrade_at_commit)
 {
 	if (!capture_committed_owner())
 		return;
-	native_capability_hook = native_real_capability_word;
+	native_capability_hook = native_legacy_v3_capability_word;
 	object_wire_missing_capabilities = 0;
 	cluster_ko_shared_native_commit_v2();
 	UT_ASSERT(!postcommit_owner->native_handed_off);
@@ -159,7 +159,7 @@ UT_TEST(test_committed_queued_owner_keeps_purpose_across_capability_loss)
 		else if (fault < 4)
 			cluster_interconnect_tier = fault == 2 ? CLUSTER_IC_TIER_2 : CLUSTER_IC_TIER_3;
 		else
-			native_capability_hook = native_real_capability_word;
+			native_capability_hook = native_legacy_v3_capability_word;
 		UT_ASSERT(!run_native_checkpointer());
 		UT_ASSERT_EQ(storage.native_waiting, 1);
 		UT_ASSERT(!storage.native_recovery_required);
@@ -209,7 +209,7 @@ UT_TEST(test_native_publication_rejects_changed_committed_purpose)
 	/* Even a matching legacy carrier and reservation cannot rewrite the
 	 * private owner's previously captured committed-discard purpose. */
 	work->context.committed_discard = identity->committed_discard = false;
-	native_capability_hook = native_real_capability_word;
+	native_capability_hook = native_legacy_v3_capability_word;
 	object_wire_missing_capabilities = 0;
 	cluster_ko_shared_native_publication_v3();
 	UT_ASSERT(work->recovery_required && storage.native_recovery_required);
@@ -236,12 +236,12 @@ UT_TEST(test_native_identity_rejects_wrong_purpose_and_malformed_version)
 	native_fixture_shared_memory_end();
 }
 
-UT_TEST(test_real_v3_commit_transfers_before_callbacks_and_cp_promotes)
+UT_TEST(test_legacy_v3_commit_transfers_before_callbacks_and_cp_promotes)
 {
 	bool found = false;
 
 	prepare_native_v3();
-	UT_ASSERT_EQ(native_real_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2, 0);
+	UT_ASSERT_EQ(native_legacy_v3_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2, 0);
 	run_native_postcommit();
 	UT_ASSERT_EQ(storage.native_waiting, 1);
 	UT_ASSERT_EQ(completion_allocations, 0);
@@ -256,7 +256,7 @@ UT_TEST(test_real_v3_commit_transfers_before_callbacks_and_cp_promotes)
 	native_fixture_shared_memory_end();
 }
 
-UT_TEST(test_real_v3_commit_callback_error_retains_native_owner)
+UT_TEST(test_legacy_v3_commit_callback_error_retains_native_owner)
 {
 	volatile bool caught = false;
 	prepare_native_v3();
@@ -314,7 +314,7 @@ UT_TEST(test_queued_v3_keeps_its_original_capability_requirement)
 		UT_ASSERT(!storage.native_recovery_required);
 		UT_ASSERT_EQ(native_fork_unlinks, 0);
 		cluster_interconnect_tier = CLUSTER_IC_TIER_1;
-		native_capability_hook = native_real_capability_word;
+		native_capability_hook = native_legacy_v3_capability_word;
 		UT_ASSERT(run_native_checkpointer());
 		UT_ASSERT_EQ(storage.native_waiting, 0);
 		native_fixture_shared_memory_end();
@@ -325,7 +325,7 @@ UT_TEST(test_v3_capabilities_do_not_commit_legacy_work)
 {
 	prepare_postcommit(false);
 	UT_ASSERT(cluster_ko_shared_observe_truncate_v2(postcommit_owner));
-	native_capability_hook = native_real_capability_word;
+	native_capability_hook = native_legacy_v3_capability_word;
 	cluster_ko_shared_native_commit_v2();
 	UT_ASSERT(!postcommit_owner->native_handed_off);
 	UT_ASSERT_EQ(storage.native_waiting, 0);
@@ -340,7 +340,7 @@ UT_TEST(test_v3_poll_cannot_promote_legacy_native_work)
 	cluster_ko_shared_native_commit_v2();
 	UT_ASSERT_EQ(storage.native_waiting, 1);
 	MyBackendType = B_CHECKPOINTER;
-	native_capability_hook = native_real_capability_word;
+	native_capability_hook = native_legacy_v3_capability_word;
 	UT_ASSERT(!cluster_ko_shared_native_poll_v2());
 	UT_ASSERT_EQ(storage.native_waiting, 1);
 	UT_ASSERT(!storage.native_recovery_required);
@@ -359,7 +359,7 @@ UT_TEST(test_v3_capabilities_do_not_execute_published_legacy_drop)
 	ClusterKoSharedContext before = storage.contexts[slot];
 	ClusterKoDropWorkV2 *work = NULL;
 
-	native_capability_hook = native_real_capability_word;
+	native_capability_hook = native_legacy_v3_capability_word;
 	UT_ASSERT(!cluster_ko_shared_drop_work_begin_v2(&cursor, 16, &work));
 	UT_ASSERT(work == NULL);
 	UT_ASSERT(memcmp(&storage.contexts[slot], &before, sizeof(before)) == 0);
@@ -386,8 +386,8 @@ main(void)
 	UT_RUN(test_committed_capability_does_not_promote_live_or_legacy);
 	UT_RUN(test_native_publication_rejects_changed_committed_purpose);
 	UT_RUN(test_native_identity_rejects_wrong_purpose_and_malformed_version);
-	UT_RUN(test_real_v3_commit_transfers_before_callbacks_and_cp_promotes);
-	UT_RUN(test_real_v3_commit_callback_error_retains_native_owner);
+	UT_RUN(test_legacy_v3_commit_transfers_before_callbacks_and_cp_promotes);
+	UT_RUN(test_legacy_v3_commit_callback_error_retains_native_owner);
 	UT_RUN(test_v3_commit_requires_both_capabilities_and_tier1);
 	UT_RUN(test_queued_v3_keeps_its_original_capability_requirement);
 	UT_RUN(test_v3_capabilities_do_not_commit_legacy_work);

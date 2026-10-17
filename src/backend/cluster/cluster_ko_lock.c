@@ -938,7 +938,9 @@ ko_shared_control_current(const ClusterKoSharedMessageV2 *message)
 	uint8 expected[CLUSTER_KO_SHARED_V2_BYTES], observed[CLUSTER_KO_SHARED_V2_BYTES];
 	int other;
 
-	if (message->origin_node >= CLUSTER_KO_SHARED_NODE_LIMIT
+	/* A shared PKO4 runtime cannot execute or complete an old v2 operation. */
+	if ((cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1) != 0
+		|| message->origin_node >= CLUSTER_KO_SHARED_NODE_LIMIT
 		|| message->peer_node >= CLUSTER_KO_SHARED_NODE_LIMIT
 		|| (cluster_node_id != message->origin_node && cluster_node_id != message->peer_node)
 		|| !cluster_ko_shared_encode_v2(message, expected, sizeof(expected))
@@ -1019,8 +1021,7 @@ ko_shared_object_control_at_generation(const ClusterKoSharedMessageV3 *message,
 	 * write grant. Recovery keeps its own IR/isolation/ROOT-qualified owner. */
 	if (message == NULL || local_generation == 0 || local_generation == UINT64_MAX
 		|| RecoveryInProgress() || cluster_interconnect_tier != CLUSTER_IC_TIER_1
-		|| (committed_discard
-			&& (cluster_ic_local_capability_word() & required_capabilities) != required_capabilities))
+		|| (cluster_ic_local_capability_word() & required_capabilities) != required_capabilities)
 		return false;
 	current = *message;
 	/* The AX wire token belongs to the origin. Each consumer retains and
@@ -7090,9 +7091,8 @@ ko_shared_prepare_request_object(RelFileLocator locator, uint16 operation,
 	if (request == NULL || binding == NULL || mask == NULL || ko_state == NULL
 		|| operation < CLUSTER_KO_SHARED_V3_OPERATION_DROP
 		|| operation > CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD
-		|| (committed_discard
-			&& (operation == CLUSTER_KO_SHARED_V3_OPERATION_TRUNCATE
-				|| !ko_native_capable(true, true)))
+		|| !ko_native_capable(true, committed_discard)
+		|| (committed_discard && operation == CLUSTER_KO_SHARED_V3_OPERATION_TRUNCATE)
 		|| binding->resid.type != LOCKTAG_RELATION
 		|| binding->resid.lockmethodid != DEFAULT_LOCKMETHOD
 		|| binding->holder.node_id != (uint32)cluster_node_id

@@ -661,15 +661,27 @@ static uint32 native_real_capability_word(void);
 #define cluster_ic_local_capability_word native_real_capability_word
 #include "test_cluster_ko_native_capability.inc"
 #undef cluster_ic_local_capability_word
+
+/* Retained v3 tests explicitly simulate the old binary's capability profile.
+ * New-path tests select native_real_capability_word without adding any bits. */
+static uint32
+native_legacy_v3_capability_word(void)
+{
+	uint32 caps = native_real_capability_word() & ~PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1;
+
+	if (cluster_shared_config && cluster_interconnect_tier == CLUSTER_IC_TIER_1)
+		caps |= PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3;
+	return caps;
+}
+
 uint32
 cluster_ic_local_capability_word(void)
 {
 	if (native_capability_hook != NULL)
 		return native_capability_hook();
-	/* v3 fixtures use the same producer as HELLO; only the explicit legacy
-	 * cases simulate the old structural capability. */
+	/* Keep each old-protocol fixture on its original binary profile. */
 	if (v3_route_live)
-		return native_real_capability_word();
+		return native_legacy_v3_capability_word();
 	return native_commit_active ? PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2 : 0;
 }
 bool

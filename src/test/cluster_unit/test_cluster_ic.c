@@ -1027,7 +1027,7 @@ UT_TEST(test_config_members_capability_profile)
 UT_TEST(test_object_drain_caps_require_configured_tier1)
 {
 	const uint32 caps
-		= PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3 | PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1;
+		= PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1 | PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1;
 	int saved_tier = cluster_interconnect_tier;
 	bool saved_shared = cluster_shared_config;
 	for (int shared = 0; shared < 2; shared++) {
@@ -1036,22 +1036,32 @@ UT_TEST(test_object_drain_caps_require_configured_tier1)
 			cluster_interconnect_tier = tier;
 			UT_ASSERT_EQ(cluster_ic_local_capability_word() & caps,
 						 shared && tier == CLUSTER_IC_TIER_1 ? caps : 0);
+			UT_ASSERT_EQ(cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3, 0);
 		}
 	}
 	cluster_shared_config = saved_shared;
 	cluster_interconnect_tier = saved_tier;
 }
 
-UT_TEST(test_committed_discard_contract_is_not_prematurely_advertised)
+UT_TEST(test_committed_discard_hello_carries_production_profile)
 {
 	int saved_tier = cluster_interconnect_tier;
 	bool saved_shared = cluster_shared_config;
-	/* Wire support alone cannot advertise a working commit-window consumer. */
+	uint8 wire[PGRAC_IC_HELLO_BYTES];
+	ClusterICHelloMsg parsed;
+	const uint32 caps = PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1
+		| PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1;
+
 	for (int shared = 0; shared < 2; shared++) {
 		cluster_shared_config = shared;
 		for (int tier = CLUSTER_IC_TIER_STUB; tier <= CLUSTER_IC_TIER_3; tier++) {
 			cluster_interconnect_tier = tier;
-			UT_ASSERT_EQ(cluster_ic_local_capability_word() & UINT32_C(0x10000000), 0);
+			cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1,
+				PGRAC_IC_ENVELOPE_VERSION_V1, 0, "am05", CLUSTER_IC_PLANE_CONTROL, 1);
+			UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
+			UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed) & caps,
+				shared && tier == CLUSTER_IC_TIER_1 ? caps : 0);
+			UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed) & PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3, 0);
 		}
 	}
 	cluster_shared_config = saved_shared;
@@ -1087,7 +1097,7 @@ main(void)
 	UT_RUN(test_control_root_v1_capability_is_advertised_without_reserved_bit_alias);
 	UT_RUN(test_config_members_capability_profile);
 	UT_RUN(test_object_drain_caps_require_configured_tier1);
-	UT_RUN(test_committed_discard_contract_is_not_prematurely_advertised);
+	UT_RUN(test_committed_discard_hello_carries_production_profile);
 	UT_RUN(test_hello_wire_data_plane_bytes);	/* spec-7.2 D2 */
 	UT_RUN(test_hello_worker_fields_roundtrip); /* spec-7.3 D3 */
 	UT_RUN(test_hello_smart_fusion_capability_gate);

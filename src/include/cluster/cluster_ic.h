@@ -416,13 +416,12 @@ typedef enum ClusterICPlane {
 /* Allocated for the complete structural PI consumer. Not advertised while
  * its original-owner transport and retirement path are still incomplete. */
 #define PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2 UINT32_C(0x02000000)
-/* P0-14 R2: versioned object-drain PKO3/READY contract.  This is deliberately
- * independent from the legacy structural receipt capability above. */
+/* Retained PKO3 allocation; shared tier1 now advertises PKO4 instead. */
 #define PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3 UINT32_C(0x04000000)
 /* Versioned transactional fence markers and exact holder observations. */
 #define PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1 UINT32_C(0x08000000)
-/* PKO4 committed old-incarnation discard. Reserved here, not advertised until
- * its commit-window and peer consumers are active; only tier1 may enable it. */
+/* PKO4 committed old-incarnation discard; advertised only by shared tier1.
+ * Admission still requires the matching peer capability and exact owner. */
 #define PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1 UINT32_C(0x10000000)
 
 /* Stage 8 R10 D10-03: complete capability allocation census.  Sum equals OR

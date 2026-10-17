@@ -97,7 +97,9 @@ UT_TEST(test_legacy_owner_cannot_be_reinterpreted_as_committed)
 {
 	ClusterKoSharedMessageV4 request = committed_peer(1003);
 
+	native_capability_hook = native_legacy_v3_capability_word;
 	enqueue_shared_v3(&request.object);
+	native_capability_hook = committed_capabilities;
 	receive_committed(&request, 0);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&storage.inbound_tail), 1);
 	UT_ASSERT_EQ(storage.peer_fence_serial, 1);
@@ -255,6 +257,9 @@ UT_TEST(test_new_ack_does_not_complete_legacy_origin)
 	storage.contexts[0].request_sent_peers = 2;
 	receive_result(&request, true, CLUSTER_KO_SHARED_DONE, 0);
 	UT_ASSERT_EQ(record_count, 0);
+	receive_result(&request, false, CLUSTER_KO_SHARED_DONE, 0);
+	UT_ASSERT_EQ(record_count, 0);
+	native_capability_hook = native_legacy_v3_capability_word;
 	receive_result(&request, false, CLUSTER_KO_SHARED_DONE, 0);
 	UT_ASSERT_EQ(record_count, 1);
 	UT_ASSERT_EQ(storage.contexts[0].request_done_peers, 2);
@@ -552,10 +557,49 @@ UT_TEST(test_live_object_never_uses_committed_local_pi_discard)
 	UT_ASSERT_EQ(storage.send_v3_count, 0);
 }
 
+UT_TEST(test_production_capability_admits_committed_peer_and_ready)
+{
+	ClusterKoSharedMessageV4 request = committed_peer(1600);
+	ClusterKoDirectoryIoV3 denied;
+
+	native_capability_hook = native_real_capability_word;
+	receive_committed(&request, 0);
+	fixture_peer_drain();
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
+	UT_ASSERT_EQ(storage.send_v3_count, 1);
+	UT_ASSERT(cluster_ko_directory_drop_retired_v3(request.object.base.key.locator));
+	UT_ASSERT(!cluster_ko_directory_io_begin_v3(request.object.base.key.locator, &denied));
+	UT_ASSERT_EQ(committed_discard_calls, 1);
+	UT_ASSERT_EQ(flush_count + sync_count + drop_count + space_reads + buffer_drain_calls, 0);
+	object_wire_send_hook = capture_committed;
+	shared_send_tick();
+	UT_ASSERT_EQ(sent_type, PGRAC_IC_MSG_KO_FLUSH_ACK);
+	UT_ASSERT(cluster_ko_shared_ack_matches_v4(&request, &sent_committed));
+}
+
+UT_TEST(test_production_capability_rejects_old_requests_before_any_owner)
+{
+	for (unsigned version = 2; version <= 3; version++) {
+		ClusterKoSharedMessageV3 request = peer_fence_fixture(1601 + version);
+
+		native_capability_hook = native_real_capability_word;
+		if (version == 2)
+			enqueue_shared(&request.base);
+		else
+			enqueue_shared_v3(&request);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&storage.inbound_tail), 0);
+		UT_ASSERT_EQ(storage.peer_fence_serial, 0);
+		UT_ASSERT_EQ(storage.send_v3_count, 0);
+		UT_ASSERT_EQ(committed_discard_calls + space_reads + flush_count + sync_count + drop_count, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(24);
+	UT_RUN(test_production_capability_admits_committed_peer_and_ready);
+	UT_RUN(test_production_capability_rejects_old_requests_before_any_owner);
 	UT_RUN(test_committed_request_registers_exact_version_without_legacy_physical_work);
 	UT_RUN(test_committed_retransmit_keeps_one_owner_and_rejects_legacy_same_key);
 	UT_RUN(test_legacy_owner_cannot_be_reinterpreted_as_committed);

@@ -47,6 +47,7 @@ assert_no_object_work(void)
 static uint32 committed_origin_missing_caps;
 static bool committed_origin_only_caps;
 static bool committed_origin_revoke_after_release;
+static bool committed_origin_production_caps;
 
 static uint32
 committed_origin_capabilities(void)
@@ -70,7 +71,8 @@ committed_origin_setup(void)
 	committed_origin_missing_caps = 0;
 	committed_origin_only_caps = false;
 	committed_origin_revoke_after_release = false;
-	native_capability_hook = committed_origin_capabilities;
+	native_capability_hook = committed_origin_production_caps
+		? native_real_capability_word : committed_origin_capabilities;
 	cluster_hw_lease_install(space_identity.key.locator, MAIN_FORKNUM, 4, 4);
 	return binding;
 }
@@ -1463,7 +1465,12 @@ run_committed_window(uint16 operation, unsigned mode, bool held, unsigned origin
 	}
 	owner = committed_origin_register(operation, &binding);
 	if (owner == NULL)
-		abort();
+		return;
+	UT_ASSERT(owner->barrier_committed_discard);
+	if (!owner->barrier_committed_discard) {
+		cluster_ko_shared_release_v2(&owner);
+		return;
+	}
 	UT_ASSERT(cluster_ko_shared_claim_structure(&space_identity, CLUSTER_SPACE_WAL_TOMBSTONE,
 		&claimed));
 	UT_ASSERT(claimed == owner);
@@ -1658,6 +1665,59 @@ UT_TEST(test_committed_window_closes_same_native_owner_without_duplicate_file_wo
 	window_final_case = 0;
 }
 
+UT_TEST(test_production_capability_selects_complete_committed_window)
+{
+	committed_origin_production_caps = true;
+	window_final_case = 1;
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 0);
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD, 0, true, 0);
+	window_final_case = 0;
+	committed_origin_production_caps = false;
+}
+
+UT_TEST(test_production_origin_refuses_old_peer_before_publication)
+{
+	for (unsigned fault = 0; fault < 2; fault++) {
+		KoAxBinding binding = committed_origin_setup();
+		ClusterKoCompletionV2 *owner = NULL;
+		volatile bool caught = false;
+
+		native_capability_hook = native_real_capability_word;
+		object_wire_missing_capabilities = fault == 0
+			? PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1
+			: PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1;
+		expecting_error = true;
+		PG_TRY(); {
+			(void)ko_shared_begin_v3(space_identity.key.locator, RELPERSISTENCE_PERMANENT,
+				CLUSTER_KO_SHARED_V3_OPERATION_DROP, &binding, &owner);
+		}
+		PG_CATCH(); { caught = true; }
+		PG_END_TRY();
+		expecting_error = false;
+		UT_ASSERT(caught && owner == NULL);
+		UT_ASSERT_EQ(marker_registrations, 0);
+		if (owner != NULL)
+			cluster_ko_shared_release_v2(&owner);
+		UT_ASSERT_EQ(native_allocated, 0);
+		assert_no_object_work();
+	}
+}
+
+UT_TEST(test_production_origin_cannot_use_legacy_barrier_with_no_peers)
+{
+	KoAxBinding binding = origin_marker_setup();
+	ClusterKoSharedMessageV3 request = { 0 };
+	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT];
+	uint32 mask = 0;
+
+	native_capability_hook = native_real_capability_word;
+	formation.membership.membership_state[1] = CLUSTER_MEMBER_DEAD;
+	formation.membership.last_admitted_incarnation[1] = 0;
+	UT_ASSERT(!ko_shared_prepare_request_v3(space_identity.key.locator,
+		CLUSTER_KO_SHARED_V3_OPERATION_DROP, &binding, &request, boots, &mask));
+	UT_ASSERT_EQ(space_reads + marker_registrations + native_allocated + barrier_requests, 0);
+}
+
 UT_TEST(test_committed_window_close_rejects_changed_proof_and_unclosed_work)
 {
 	window_final_case = 1;
@@ -1772,7 +1832,10 @@ UT_TEST(test_prepared_mode_keeps_original_completed_legacy_owner)
 int
 main(void)
 {
-	UT_PLAN(51);
+	UT_PLAN(54);
+	UT_RUN(test_production_capability_selects_complete_committed_window);
+	UT_RUN(test_production_origin_refuses_old_peer_before_publication);
+	UT_RUN(test_production_origin_cannot_use_legacy_barrier_with_no_peers);
 	UT_RUN(test_committed_window_closes_same_native_owner_without_duplicate_file_work);
 	UT_RUN(test_committed_window_close_rejects_changed_proof_and_unclosed_work);
 	UT_RUN(test_committed_origin_self_or_failed_work_hands_off_without_waiting);
