@@ -2401,10 +2401,65 @@ UT_TEST(test_c0_dependency_refuses_changed_identity_scope_and_partial_output)
 	}
 }
 
+UT_TEST(test_tt_base_capture_includes_history_before_wal_scan)
+{
+	ClusterColdTypedV1 *typed;
+	Size total = (Size)cluster_cold_recovery_plan_memory * 1024;
+
+	fixture();
+	history_generation(2, 9, 0x40, 0x80);
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(tt_base_captures, 1);
+	UT_ASSERT_EQ(tt_base_participants, 4);
+	UT_ASSERT_EQ(tt_base_budget, total / 4);
+	UT_ASSERT(side_budget_total + tt_base_budget < total);
+	UT_ASSERT_EQ(tt_base_rechecks, 0);
+	cluster_cold_typed_destroy_v1(&typed);
+	UT_ASSERT_EQ(tt_base_destroys, 1);
+}
+
+UT_TEST(test_tt_base_capture_failure_stops_before_side_and_scan)
+{
+	ClusterColdTypedV1 *typed;
+
+	fixture();
+	tt_base_capture_result = CLUSTER_COLD_SOURCE_GAP;
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
+	UT_ASSERT_EQ(tt_base_captures, 1);
+	UT_ASSERT_EQ(side_creates, 0);
+	UT_ASSERT_EQ(typed->scanned_records, 0);
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
+UT_TEST(test_tt_base_drift_refuses_pass_two_stickily)
+{
+	ClusterColdTypedV1 *typed;
+
+	fixture();
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	tt_base_recheck_result = CLUSTER_COLD_SOURCE_GAP;
+	cluster_cold_replay_window_enter_v1();
+	UT_ASSERT(!sync_sources(typed));
+	UT_ASSERT_EQ(source_sync_calls, NROOTS);
+	UT_ASSERT_EQ(tt_base_rechecks, 1);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
+	tt_base_recheck_result = CLUSTER_COLD_OK;
+	UT_ASSERT(!sync_sources(typed));
+	UT_ASSERT_EQ(tt_base_rechecks, 1);
+	cluster_cold_replay_window_leave_v1();
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
 int
 main(void)
 {
-	UT_PLAN(67);
+	UT_PLAN(70);
+	UT_RUN(test_tt_base_capture_includes_history_before_wal_scan);
+	UT_RUN(test_tt_base_capture_failure_stops_before_side_and_scan);
+	UT_RUN(test_tt_base_drift_refuses_pass_two_stickily);
 	UT_RUN(test_source_barrier_rechecks_complete_native_checkpoint);
 	UT_RUN(test_source_barrier_final_native_checkpoint_change_is_sticky);
 	UT_RUN(test_source_drain_before_unrelated_steps_is_not_global_completion);

@@ -133,6 +133,7 @@ OBJS = \
 	cluster_recovery_relation_census.o \
 	cluster_cold_recovery_space.o \
 	cluster_cold_recovery_startup.o \
+	cluster_cold_recovery_tt.o \
 	cluster_cold_recovery_replay.o \
 	cluster_recovery_duty.o \
 	cluster_cf_enqueue.o \

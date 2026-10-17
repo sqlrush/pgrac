@@ -711,6 +711,8 @@ struct ClusterRecoveryFencePlan;
 
 struct ClusterWalInputsV1;
 struct ClusterColdReplayRootV1;
+struct ClusterColdTtBaseV1;
+struct UndoSegmentHeaderData;
 
 typedef struct ClusterColdTypedV1 {
 	MemoryContext context;
@@ -722,6 +724,7 @@ typedef struct ClusterColdTypedV1 {
 	uint32 own_participant;
 	struct ClusterColdReplayRootV1 *replay_roots; /* original pass-1 selection, not fresh roots */
 	uint32 replay_root_count;
+	struct ClusterColdTtBaseV1 *tt_base; /* raw original-owner input, no outcome authority */
 	bool source_drained[CLUSTER_COLD_MAX_PARTICIPANTS]; /* this pass-2 attempt only */
 	/* Per crashed source, including its retained pre-redo records. Each plan
 	 * binds the complete retained source set; that does not authorize target
@@ -741,6 +744,17 @@ typedef struct ClusterColdTypedV1 {
 extern ClusterColdTypedV1 *cluster_cold_typed_prepare_v1(struct ClusterRecoveryFencePlan *fence,
 														 uint16 own_thread, XLogRecPtr own_redo);
 extern void cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed);
+
+/* Read-only TT base input owned by the original cold attempt. Every segment
+ * address of every participant origin (including history) is inspected.
+ * These bytes prove neither FullXid, checkpoint coverage nor loser status. */
+extern ClusterColdDetailV1 cluster_cold_tt_base_capture_v1(ClusterColdTypedV1 *typed, Size budget);
+extern ClusterColdDetailV1 cluster_cold_tt_base_recheck_v1(ClusterColdTypedV1 *typed);
+extern void cluster_cold_tt_base_destroy_v1(ClusterColdTypedV1 *typed);
+extern uint32 cluster_cold_tt_base_count_v1(const ClusterColdTypedV1 *typed);
+extern const struct UndoSegmentHeaderData *
+cluster_cold_tt_base_header_v1(const ClusterColdTypedV1 *typed, uint32 index, uint8 *owner,
+							   uint32 *segment);
 
 /* Sync the selected crashed sources before pass-2 mutations. No replay or
  * completion authority is created; a refusal invalidates this typed attempt. */

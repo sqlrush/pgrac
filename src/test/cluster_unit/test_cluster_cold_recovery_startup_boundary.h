@@ -99,6 +99,38 @@ static uint16 source_sync_fail_thread;
 static int source_sync_fault;
 static bool fence_current;
 static sigjmp_buf source_sync_exception;
+static int tt_base_captures, tt_base_rechecks, tt_base_destroys;
+static uint32 tt_base_participants;
+static Size tt_base_budget;
+static ClusterColdDetailV1 tt_base_capture_result, tt_base_recheck_result;
+static bool tt_base_captured;
+
+ClusterColdDetailV1
+cluster_cold_tt_base_capture_v1(ClusterColdTypedV1 *typed, Size budget)
+{
+	tt_base_captures++;
+	tt_base_participants = typed->participant_count;
+	tt_base_budget = budget;
+	tt_base_captured = tt_base_capture_result == CLUSTER_COLD_OK;
+	return tt_base_capture_result;
+}
+
+ClusterColdDetailV1
+cluster_cold_tt_base_recheck_v1(ClusterColdTypedV1 *typed)
+{
+	(void)typed;
+	tt_base_rechecks++;
+	return tt_base_recheck_result;
+}
+
+void
+cluster_cold_tt_base_destroy_v1(ClusterColdTypedV1 *typed)
+{
+	(void)typed;
+	if (tt_base_captured)
+		tt_base_destroys++;
+	tt_base_captured = false;
+}
 
 bool
 cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
@@ -926,6 +958,11 @@ static void
 fixture(void)
 {
 	uint16 thread;
+	tt_base_captures = tt_base_rechecks = tt_base_destroys = 0;
+	tt_base_participants = 0;
+	tt_base_budget = 0;
+	tt_base_capture_result = tt_base_recheck_result = CLUSTER_COLD_OK;
+	tt_base_captured = false;
 	c0_mode = false;
 	memset(side_fixture, 0, sizeof(side_fixture));
 	side_creates = side_seals = side_destroys = side_fault = 0;

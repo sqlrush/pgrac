@@ -458,8 +458,13 @@ cold_scan_history(ClusterColdTypedV1 *typed)
 
 static bool cold_sources_match(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence);
 
-/* Reserve a bounded part of the existing plan budget for original SIDE
- * payload ownership. The PAGE and SIDE budgets together never exceed it. */
+/* PAGE, SIDE and original TT inputs share the existing plan budget. */
+static Size
+cold_tt_budget(void)
+{
+	return (Size)cluster_cold_recovery_plan_memory * 1024 / 4;
+}
+
 static Size
 cold_side_budget(const ClusterColdTypedV1 *typed)
 {
@@ -532,7 +537,15 @@ cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots,
 	ClusterColdDetailV1 detail;
 	uint32 i;
 
-	if (!cold_space_namespace(typed) || !cold_side_create(typed))
+	if (!cold_space_namespace(typed))
+		return false;
+	detail = cluster_cold_tt_base_capture_v1(typed, cold_tt_budget());
+	if (detail != CLUSTER_COLD_OK) {
+		cold_refuse(typed, detail, "original TT base capture refused: %s",
+					cold_detail_name(detail));
+		return false;
+	}
+	if (!cold_side_create(typed))
 		return false;
 	detail = cluster_cold_plan_set_space_check_v1(typed->plan, cluster_cold_space_check_v1,
 												  &typed->observer);
@@ -633,7 +646,8 @@ cluster_cold_typed_prepare_v1(ClusterRecoveryFencePlan *fence, uint16 own_thread
 	typed->system_identifier = roots[0].root.identity.system_identifier;
 	detail = cluster_cold_plan_create_v1(typed->participants, typed->participant_count,
 										 (Size)cluster_cold_recovery_plan_memory * 1024
-											 - cold_side_budget(typed) * typed->replay_count,
+											 - cold_side_budget(typed) * typed->replay_count
+											 - cold_tt_budget(),
 										 &typed->plan);
 	if (detail != CLUSTER_COLD_OK) {
 		cold_refuse(typed, detail, "plan creation refused: %s", cold_detail_name(detail));
@@ -643,8 +657,10 @@ cluster_cold_typed_prepare_v1(ClusterRecoveryFencePlan *fence, uint16 own_thread
 		typed->refusal = CLUSTER_COLD_OK;
 
 done:
-	if (typed->refusal != CLUSTER_COLD_OK)
+	if (typed->refusal != CLUSTER_COLD_OK) {
 		cold_side_destroy(typed);
+		cluster_cold_tt_base_destroy_v1(typed);
+	}
 	MemoryContextSwitchTo(old_context);
 	return typed;
 }
@@ -661,6 +677,7 @@ cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed_address)
 	if (typed->inputs != NULL)
 		cluster_wal_inputs_release_v1(&typed->inputs);
 	cold_side_destroy(typed);
+	cluster_cold_tt_base_destroy_v1(typed);
 	if (typed->plan != NULL)
 		cluster_cold_plan_destroy_v1(&typed->plan);
 	if (typed->replay_roots != NULL)
@@ -767,6 +784,8 @@ cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFen
 		}
 	}
 	/* A later source's IO must not hide earlier source or scope drift. */
+	if (cluster_cold_tt_base_recheck_v1(typed) != CLUSTER_COLD_OK)
+		return false;
 	if (!cold_replay_sources_current(typed, fence))
 		return false;
 	typed->refusal = CLUSTER_COLD_OK;
