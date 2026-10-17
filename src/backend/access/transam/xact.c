@@ -18,6 +18,8 @@
  *
  *	Modified by: SqlRush <sqlrush@gmail.com>
  *	Reconcile prepared undo ownership after abort releases LWLocks.
+ *	Defer DROP SPACE dirty marking until the committed publication.
+ *	Spec: 2026-10-16-pre2-p014-am05-shared-ddl-autocommit.md
  *	Spec: spec-1.16-local-scn-maintenance.md (commit/abort SCN advance)
  *	Spec: spec-1.18-wal-record-xl-scn.md (WAL emit + replay observe)
  *
@@ -1757,10 +1759,6 @@ RecordTransactionCommit(void)
 #endif
 		START_CRIT_SECTION();
 		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
-#ifdef USE_PGRAC_CLUSTER
-		if (space_drop != NULL)
-			cluster_space_drop_mark_dirty(space_drop);
-#endif
 
 		/*
 		 * Insert the commit XLOG record.

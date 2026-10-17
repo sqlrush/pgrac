@@ -1169,21 +1169,22 @@ cluster_space_drop_wal(const ClusterSpaceDropState *state, uint32 *len)
 }
 
 void
-cluster_space_drop_mark_dirty(ClusterSpaceDropState *state)
+cluster_space_drop_publish(ClusterSpaceDropState *state, XLogRecPtr commit_lsn)
 {
-	Assert(state != NULL && CritSectionCount > 0);
-	Assert(MyProc->delayChkptFlags & DELAY_CHKPT_START);
+	/* The native commit caller has already flushed WAL and decided COMMIT.
+	 * Preserve the original checkpoint delay and locked buffers until both
+	 * pages are dirty and published. Preparation and WAL insertion alone must
+	 * leave the LIVE pages unmodified, including their dirty state. */
+	if (state == NULL || CritSectionCount == 0 || state->published || MyProc == NULL
+		|| !(MyProc->delayChkptFlags & DELAY_CHKPT_START)
+		|| XLogRecPtrIsInvalid(commit_lsn) || XLogNeedsFlush(commit_lsn))
+		ereport(PANIC,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("cannot publish relation deletion outside its durable commit owner"),
+				 errhint("Keep the committed deletion pending and recover from its original WAL.")));
 	for (int i = 0; i < state->count; i++)
 		for (int j = 0; j < 2; j++)
 			MarkBufferDirty(state->entries[i]->buffers[j]);
-}
-
-void
-cluster_space_drop_publish(ClusterSpaceDropState *state, XLogRecPtr commit_lsn)
-{
-	Assert(state != NULL && CritSectionCount > 0 && !state->published);
-	Assert(MyProc->delayChkptFlags & DELAY_CHKPT_START);
-	Assert(!XLogRecPtrIsInvalid(commit_lsn) && !XLogNeedsFlush(commit_lsn));
 	for (int i = 0; i < state->count; i++) {
 		space_structure_publish(state->entries[i], commit_lsn);
 	}

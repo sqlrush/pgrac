@@ -118,6 +118,8 @@ static BufferDescPadded descriptors[2];
 BufferDescPadded *BufferDescriptors = descriptors;
 static bool truncate_owner, drop_owner, deleted_all, expecting_error;
 static int reported_level;
+static bool expect_publish_guard;
+static unsigned publish_guard_assertions;
 static unsigned relation_flushes, fork_syncs, invalidations, random_calls;
 static unsigned base_buffer_invalidations;
 static bool fail_base_invalidation, low_binding_resident;
@@ -290,6 +292,7 @@ TransactionIdCommitTree(TransactionId xid, int count, TransactionId *children)
 {
 	UT_ASSERT_EQ(flush_calls, 1);
 	UT_ASSERT_EQ(native_commits, 1);
+	UT_ASSERT_EQ(dirty_calls, 0);
 	UT_ASSERT_EQ(CritSectionCount, 1);
 	UT_ASSERT_EQ(((PageHeader)page.data)->pd_block_scn, 17);
 	commit_decisions++;
@@ -387,6 +390,10 @@ cluster_bufmgr_pcm_x_content_holder_write_permitted(BufferDesc *buffer)
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
 {
+	if (expect_publish_guard) {
+		publish_guard_assertions++;
+		pg_re_throw();
+	}
 	printf("# Unexpected assertion: %s at %s:%d\n", condition, file, line);
 	abort();
 }
@@ -856,6 +863,8 @@ MarkBufferDirty(Buffer buffer)
 		|| (buffer == 1 ? !cluster_space_identity_page_valid(page.data, BLCKSZ)
 						: !cluster_space_reservation_page_valid(pages[1].data, BLCKSZ)))
 		abort();
+	if (drop_owner && !recovering)
+		UT_ASSERT_EQ(flush_calls, 1);
 	dirty_calls++;
 }
 
@@ -919,7 +928,7 @@ XLogInsert(RmgrId rmid, uint8 info)
 		}
 		UT_ASSERT_EQ(info, XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO | XLR_SPECIAL_REL_UPDATE);
 		UT_ASSERT_EQ(locked, 3);
-		UT_ASSERT_EQ(dirty_calls, 2);
+		UT_ASSERT_EQ(dirty_calls, 0);
 		UT_ASSERT(ParseCommitRecord(info, (xl_xact_commit *)commit_bytes, commit_len, &parsed));
 		UT_ASSERT_EQ(parsed.nspace_drops, 1);
 		UT_ASSERT(RelFileLocatorEquals(parsed.xlocators[0], locator));
@@ -1410,6 +1419,8 @@ reset(void)
 	fake_allocations = fake_frees = 0;
 	truncate_owner = drop_owner = deleted_all = expecting_error = false;
 	reported_level = 0;
+	expect_publish_guard = false;
+	publish_guard_assertions = 0;
 	relation_flushes = fork_syncs = invalidations = random_calls = 0;
 	base_buffer_invalidations = 0;
 	fail_base_invalidation = low_binding_resident = false;
@@ -3085,7 +3096,6 @@ emit_drop_commit(ClusterSpaceDropState *state, const RelFileLocator *deletes, in
 	uint32 len;
 	const char *data = cluster_space_drop_wal(state, &len);
 
-	cluster_space_drop_mark_dirty(state);
 	XactLogCommitRecord(1, 0, NULL, count, unconstify(RelFileLocator *, deletes), 0, NULL, 0, NULL,
 						false, 0, InvalidTransactionId, NULL, InvalidScn, NULL, data, len);
 }
@@ -3123,10 +3133,12 @@ UT_TEST(test_drop_pair_stays_live_until_native_commit_is_durable)
 	START_CRIT_SECTION();
 	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
 	emit_drop_commit(state, deletes, 2);
+	UT_ASSERT_EQ(dirty_calls, 0);
 	UT_ASSERT_EQ(wal_calls, 1); /* Native pending delete can contain duplicates. */
 	UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
 	XLogFlush(UINT64_C(0x10000300)); /* Original forced COMMIT flush. */
 	cluster_space_drop_publish(state, UINT64_C(0x10000300));
+	UT_ASSERT_EQ(dirty_calls, 2);
 	UT_ASSERT_EQ(capture_calls, 2);
 	UT_ASSERT(cluster_space_structure_wal_decode(wal_bytes, registered_len, &change));
 	UT_ASSERT(cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0,
@@ -3193,6 +3205,59 @@ publish_drop_for_finish(void)
 	MyProc->delayChkptFlags = 0;
 	END_CRIT_SECTION();
 	return state;
+}
+
+/* The linked publisher must reject invalid invocation in production as well
+ * as cassert builds. The fixture catches PANIC to inspect the untouched owner;
+ * an assertion alone deliberately fails this test. */
+UT_TEST(test_drop_publication_requires_durable_critical_owner_at_runtime)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		Relation rel = native_truncate_relation();
+		ClusterSpaceDropState *state;
+		PGAlignedBlock saved[2];
+		unsigned dirties, captures;
+		volatile bool caught = false;
+
+		drop_owner = true;
+		state = fault == 5 ? publish_drop_for_finish() : prepare_original_drop(&locator, 1);
+		UT_ASSERT(state != NULL);
+		if (state == NULL) {
+			FreeFakeRelcacheEntry(rel);
+			continue;
+		}
+		memcpy(saved, pages, sizeof(saved));
+		dirties = dirty_calls;
+		captures = capture_calls;
+		CritSectionCount = fault == 1 ? 0 : 1;
+		MyProc->delayChkptFlags = fault == 2 ? 0 : DELAY_CHKPT_START;
+		expecting_error = expect_publish_guard = true;
+		PG_TRY();
+		{
+			cluster_space_drop_publish(fault == 0 ? NULL : state,
+				fault == 3 ? InvalidXLogRecPtr : UINT64_C(0x10000300));
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		expecting_error = expect_publish_guard = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(reported_level, PANIC);
+		UT_ASSERT_EQ(publish_guard_assertions, 0);
+		UT_ASSERT_EQ(dirty_calls, dirties);
+		UT_ASSERT_EQ(capture_calls, captures);
+		UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
+		UT_ASSERT_EQ(pinned, 3);
+		UT_ASSERT_EQ(locked, 3);
+		UT_ASSERT_EQ(unlink_calls + truncate_calls, 0);
+		CritSectionCount = 0;
+		MyProc->delayChkptFlags = 0;
+		cluster_space_drop_finish(state);
+		UT_ASSERT_EQ(pinned | locked, 0);
+		FreeFakeRelcacheEntry(rel);
+	}
 }
 
 UT_TEST(test_native_drop_durable_finish_io_failure_keeps_original_owner)
@@ -3392,6 +3457,7 @@ UT_TEST(test_native_commit_logs_decides_and_publishes_before_checkpoint_release)
 #include "test_cluster_space_commit.inc"
 	UT_ASSERT_EQ(native_commits, 1);
 	UT_ASSERT_EQ(commit_decisions, 1);
+	UT_ASSERT_EQ(dirty_calls, 2);
 	UT_ASSERT(commit_record_flushed);
 	UT_ASSERT_EQ(MyProc->delayChkptFlags, 0);
 	UT_ASSERT_EQ(CritSectionCount, 0);
@@ -3713,7 +3779,6 @@ UT_TEST(test_native_commit_optional_tail_and_bounded_parser)
 	replorigin_session_origin_timestamp = 789;
 	START_CRIT_SECTION();
 	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
-	cluster_space_drop_mark_dirty(state);
 	XactLogCommitRecord(123, 2, children, 1, &locator, 1, &stats, 1, &msg, true,
 						XACT_FLAGS_ACQUIREDACCESSEXCLUSIVELOCK, InvalidTransactionId, NULL, 42, &tt,
 						data, len);
@@ -3850,7 +3915,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(77);
+	UT_PLAN(78);
 	UT_RUN(test_create_fence_refuses_native_main_and_direct_space_before_effects);
 	UT_RUN(test_create_keeps_one_native_owner_through_both_forks);
 	UT_RUN(test_create_io_error_keeps_original_reference_and_abort_delete);
@@ -3859,6 +3924,7 @@ main(void)
 	UT_RUN(test_maintenance_identity_uses_current_owner_without_backend_id);
 	UT_RUN(test_maintenance_identity_retry_keeps_work_and_releases_pin);
 	UT_RUN(test_maintenance_identity_preserves_namespace_and_live_page_checks);
+	UT_RUN(test_drop_publication_requires_durable_critical_owner_at_runtime);
 	UT_RUN(test_native_drop_durable_finish_io_failure_keeps_original_owner);
 	UT_RUN(test_native_drop_durable_finish_requires_each_exact_page);
 	UT_RUN(test_native_structure_observation_needs_attribution_and_stable_native_flush);
