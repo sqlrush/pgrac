@@ -31,6 +31,7 @@
 #include "postgres.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_recovery_tt_record.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 
 
@@ -95,6 +96,25 @@ cluster_undo_desc(StringInfo buf, XLogReaderState *record)
 		else
 			appendStringInfo(buf, "malformed abort payload length %u",
 				(unsigned) XLogRecGetDataLen(record));
+		break;
+	}
+	case XLOG_UNDO_RECOVERY_TT_ABORT: {
+		ClusterRecoveryTTAbortV1 rec;
+
+		if (!cluster_recovery_tt_abort_decode_v1((const uint8 *)payload,
+				XLogRecGetDataLen(record), &rec))
+			appendStringInfo(buf, "malformed recovery TT abort payload");
+		else
+			appendStringInfo(buf,
+				"target thread %u incarnation " UINT64_FORMAT
+				" writer thread %u incarnation " UINT64_FORMAT
+				" serial " UINT64_FORMAT " epoch " UINT64_FORMAT
+				" full xid " UINT64_FORMAT " segment %u generation %u slot %u wrap %u",
+				(unsigned)rec.target_thread, rec.target_incarnation,
+				(unsigned)rec.writer_thread, rec.writer_incarnation,
+				rec.recovery_serial, rec.target_epoch, rec.target_full_xid,
+				rec.exact.segment_id, rec.exact.segment_generation,
+				(unsigned)rec.exact.slot_offset, (unsigned)rec.exact.wrap);
 		break;
 	}
 	case XLOG_UNDO_SEGMENT_RECYCLE: {
@@ -183,6 +203,8 @@ cluster_undo_identify(uint8 info)
 		return "UNDO_TT_SLOT_COMMIT";
 	case XLOG_UNDO_TT_SLOT_ABORT:
 		return "UNDO_TT_SLOT_ABORT";
+	case XLOG_UNDO_RECOVERY_TT_ABORT:
+		return "UNDO_RECOVERY_TT_ABORT";
 	case XLOG_UNDO_SEGMENT_RECYCLE:
 		return "UNDO_SEGMENT_RECYCLE";
 	case XLOG_UNDO_SEGMENT_REUSE:
