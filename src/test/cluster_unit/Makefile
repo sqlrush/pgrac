@@ -8410,8 +8410,10 @@ test_cluster_buffer_cr_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmg
 	     /^FindAndDropRelationBuffers\(/ { print "static void"; emit=1; find++ } \
 	     /^InvalidateBufferTry\(/ { print "static bool"; emit=1; try_drop++ } \
 	     /^cluster_bufmgr_drain_relation_v3\(/ { print "ClusterBufferDrainResult"; emit=1; drain++ } \
+	     /^cluster_bufmgr_discard_buffer_v4\(/ { print "static bool"; emit=1; discard_buffer++ } \
+	     /^cluster_bufmgr_discard_relation_v4\(/ { print "ClusterBufferDrainResult"; emit=1; discard_relation++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (ko_remember != 1 || conditional != 2 || recent != 1 || alloc != 1 || ko_sample != 1 || ko_native_sample != 1 || track != 1 || aux != 1 || retained != 1 || write_gate != 4 || walk != 1 || cr != 1 || reserve != 1 || cache != 2 || commit != 1 || drop != 1 || tail != 1 || victim != 1 || get_victim != 1 || sync_one != 1 || find != 1 || try_drop != 1 || drain != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (ko_remember != 1 || conditional != 2 || recent != 1 || alloc != 1 || ko_sample != 1 || ko_native_sample != 1 || track != 1 || aux != 1 || retained != 1 || write_gate != 4 || walk != 1 || cr != 1 || reserve != 1 || cache != 2 || commit != 1 || drop != 1 || tail != 1 || victim != 1 || get_victim != 1 || sync_one != 1 || find != 1 || try_drop != 1 || drain != 1 || discard_buffer != 1 || discard_relation != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_buffer_cr_pins.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile

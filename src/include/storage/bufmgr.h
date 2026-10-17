@@ -245,6 +245,11 @@ typedef enum ClusterBufferDrainResult {
 extern ClusterBufferDrainResult cluster_bufmgr_drain_relation_v3(struct SMgrRelationData *smgr,
 																 bool flush, uint32 *budget,
 																 uint32 *cursor);
+/* Only an immutable, I/O-retired committed old-object tombstone admits this
+ * no-write discard. Directory responsibility is not completed here. */
+extern ClusterBufferDrainResult cluster_bufmgr_discard_relation_v4(RelFileLocator locator,
+																 uint32 *budget, uint32 *cursor);
+
 #endif
 
 extern void CreateAndCopyRelationData(RelFileLocator src_rlocator,

@@ -63,6 +63,7 @@ UT_TEST(test_committed_request_registers_exact_version_without_legacy_physical_w
 	ClusterKoSharedMessageV4 request = committed_peer(1001);
 	ClusterKoPeerFenceHandleV3 old_handle = { .slot = 0, .serial = 1 };
 
+	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_PENDING;
 	receive_committed(&request, 0);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&storage.inbound_tail), 1);
 	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_ACTIVE);
@@ -316,6 +317,7 @@ UT_TEST(test_peer_failure_reply_uses_original_version_and_exact_send_owner)
 	ClusterKoSharedMessageV4 request = committed_peer(1100);
 	ClusterKoSharedMessageV3 failure = request.object;
 
+	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_PENDING;
 	receive_committed(&request, 0);
 	fixture_peer_drain();
 	ko_peer_attempt = (ClusterKoPeerFenceHandleV3){ .slot = 0, .serial = storage.peer_fences[0].serial };
@@ -347,6 +349,7 @@ UT_TEST(test_pending_new_peer_is_not_ready_or_normal_stop_complete)
 	ClusterKoSharedMessageV4 request = committed_peer(1101);
 	const char *reason = NULL;
 
+	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_PENDING;
 	receive_committed(&request, 0);
 	fixture_peer_drain();
 	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_PENDING);
@@ -355,10 +358,172 @@ UT_TEST(test_pending_new_peer_is_not_ready_or_normal_stop_complete)
 	UT_ASSERT_EQ(flush_count + sync_count + drop_count + buffer_drain_calls, 0);
 }
 
+UT_TEST(test_committed_peer_closes_entered_io_before_discard_and_ready)
+{
+	ClusterKoSharedMessageV4 request = committed_peer(1200);
+	ClusterKoDirectoryIoV3 entered, refused;
+	RelFileLocator locator = request.object.base.key.locator;
+
+	UT_ASSERT(cluster_ko_directory_io_begin_v3(locator, &entered));
+	receive_committed(&request, 0);
+	fixture_peer_drain();
+	UT_ASSERT(cluster_ko_directory_drop_committed_v3(locator));
+	UT_ASSERT(!cluster_ko_directory_drop_retired_v3(locator));
+	UT_ASSERT(!cluster_ko_directory_io_begin_v3(locator, &refused));
+	UT_ASSERT_EQ(committed_discard_calls + storage.send_v3_count, 0);
+	UT_ASSERT(cluster_ko_directory_io_end_v3(&entered));
+	fixture_peer_drain();
+	UT_ASSERT(cluster_ko_directory_drop_retired_v3(locator));
+	UT_ASSERT_EQ(committed_discard_calls, 1);
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
+	UT_ASSERT_EQ(storage.send_v3_count, 1);
+	UT_ASSERT(storage.send_committed_discard[storage.send_v3_head]);
+	UT_ASSERT_EQ(flush_count + sync_count + drop_count + space_reads + buffer_drain_calls, 0);
+}
+
+UT_TEST(test_committed_discard_resumes_bounded_cursor_without_live_proof)
+{
+	ClusterKoSharedMessageV4 request = committed_peer(1201);
+	removal_ready = false; /* Dead data is not a CTRC live-object DATA proof. */
+	space_ok = false;
+	committed_discard_result = CLUSTER_BUFFER_DRAIN_MORE;
+	receive_committed(&request, 0);
+	fixture_peer_drain();
+	UT_ASSERT_EQ(committed_discard_calls, 1);
+	UT_ASSERT_EQ(storage.peer_fences[0].physical_cursor, 128);
+	fixture_peer_drain();
+	UT_ASSERT_EQ(committed_discard_input, 128);
+	UT_ASSERT_EQ(storage.peer_fences[0].physical_cursor, 256);
+	committed_discard_result = CLUSTER_BUFFER_DRAIN_EMPTY;
+	fixture_peer_drain();
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
+	UT_ASSERT_EQ(flush_count + sync_count + drop_count + space_reads + buffer_drain_calls, 0);
+}
+
+UT_TEST(test_committed_discard_keeps_local_and_writeback_responsibility)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterKoSharedMessageV4 request = committed_peer(1202 + fault);
+		if (fault == 0) committed_discard_result = CLUSTER_BUFFER_DRAIN_WAIT;
+		if (fault == 1) local_relation_scan_result = CLUSTER_PCM_PI_RELATION_PENDING;
+		if (fault == 2) local_writeback_closed = false;
+		receive_committed(&request, 0);
+		fixture_peer_drain();
+		UT_ASSERT_EQ(committed_discard_calls, 1);
+		UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_ACTIVE);
+		UT_ASSERT_EQ(storage.send_v3_count, 0);
+		committed_discard_result = CLUSTER_BUFFER_DRAIN_EMPTY;
+		local_relation_scan_result = CLUSTER_PCM_PI_RELATION_EMPTY;
+		local_writeback_closed = true;
+		fixture_peer_drain();
+		UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
+	}
+}
+
+static void committed_cut_drift(void) { relation_gate_freeze++; }
+static void committed_discard_error(void) { pg_re_throw(); }
+
+UT_TEST(test_committed_discard_drift_and_error_never_publish_ready)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterKoSharedMessageV4 request = committed_peer(1210 + fault);
+		volatile bool caught = false;
+		committed_discard_hook = fault == 0 ? committed_cut_drift : committed_discard_error;
+		receive_committed(&request, 0);
+		PG_TRY(); { fixture_peer_drain(); }
+		PG_CATCH(); {
+			caught = true;
+			cluster_ko_peer_apply_error_v3(ERRCODE_IO_ERROR);
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault != 0);
+		UT_ASSERT(!storage.peer_fences[0].physical_applied);
+		UT_ASSERT_EQ(storage.send_v3_count, 0);
+		UT_ASSERT(cluster_ko_directory_drop_retired_v3(request.object.base.key.locator));
+		committed_discard_hook = NULL;
+		fixture_peer_drain();
+		UT_ASSERT_EQ(storage.send_v3_count, 1);
+		UT_ASSERT_EQ(storage.send_v3[storage.send_v3_head].base.status,
+			fault == 0 ? CLUSTER_KO_SHARED_DONE : CLUSTER_KO_SHARED_FAILED);
+	}
+}
+
+UT_TEST(test_rewrite_old_uses_committed_identity_and_old_wire_cannot_claim_it)
+{
+	ClusterKoSharedMessageV4 request = committed_peer(1220);
+	request.object.operation = CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD;
+	receive_committed(&request, 0);
+	fixture_peer_drain();
+	UT_ASSERT(cluster_ko_directory_drop_retired_v3(request.object.base.key.locator));
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
+	UT_ASSERT_EQ(storage.send_v3_count, 1);
+	enqueue_shared_v3(&request.object);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&storage.inbound_tail), 1);
+	UT_ASSERT_EQ(storage.peer_fence_serial, 1);
+}
+
+UT_TEST(test_committed_gc_requires_accepted_ready_and_keeps_negative_identity)
+{
+	ClusterKoSharedMessageV4 request = committed_peer(1300), first = request;
+	ClusterKoDirectoryIoV3 refused;
+
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		request.object.base.batch_id = 1300 + i;
+		request.object.base.key.locator.relNumber = 99 + i;
+		local_scan_rel_number = 99 + i;
+		receive_committed(&request, 0);
+		fixture_peer_drain();
+		UT_ASSERT_EQ(storage.peer_fences[i].state, CLUSTER_KO_PEER_FENCE_READY);
+	}
+	UT_ASSERT(!cluster_ko_peer_fence_gc_tick_v3());
+	object_wire_send_hook = capture_committed;
+	v3_send_result = CLUSTER_IC_SEND_NOT_ADMITTED;
+	shared_send_tick();
+	UT_ASSERT(!cluster_ko_peer_fence_gc_tick_v3());
+	v3_send_result = CLUSTER_IC_SEND_DONE;
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) shared_send_tick();
+	UT_ASSERT_EQ(storage.send_v3_count, 0);
+	UT_ASSERT(cluster_ko_peer_fence_gc_tick_v3());
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
+		UT_ASSERT_EQ(storage.peer_fences[i].state, CLUSTER_KO_PEER_FENCE_EMPTY);
+	UT_ASSERT(cluster_ko_directory_drop_retired_v3(first.object.base.key.locator));
+	UT_ASSERT(!cluster_ko_directory_io_begin_v3(first.object.base.key.locator, &refused));
+	receive_committed(&first, 0);
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_EMPTY);
+	request.object.base.batch_id++;
+	request.object.base.key.locator.relNumber++;
+	local_scan_rel_number++;
+	receive_committed(&request, 0);
+	fixture_peer_drain();
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
+}
+
+UT_TEST(test_committed_closure_capacity_and_finite_owner_never_become_empty)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterKoSharedMessageV4 request = committed_peer(1400 + fault);
+		RelFileLocator locator = request.object.base.key.locator;
+		if (fault == 0) storage.drop_free = 0;
+		if (fault == 1) {
+			storage.cleaner_work[0].used = true;
+			storage.cleaner_work[0].locator = locator;
+		}
+		if (fault == 2) {
+			storage.extend_work[0].used = true;
+			storage.extend_work[0].locator = locator;
+		}
+		receive_committed(&request, 0);
+		fixture_peer_drain();
+		UT_ASSERT_EQ(committed_discard_calls + storage.send_v3_count, 0);
+		UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_ACTIVE);
+		UT_ASSERT(!cluster_ko_directory_drop_retired_v3(locator));
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(20);
 	UT_RUN(test_committed_request_registers_exact_version_without_legacy_physical_work);
 	UT_RUN(test_committed_retransmit_keeps_one_owner_and_rejects_legacy_same_key);
 	UT_RUN(test_legacy_owner_cannot_be_reinterpreted_as_committed);
@@ -372,6 +537,13 @@ main(void)
 	UT_RUN(test_sender_error_keeps_unknown_and_does_not_repeat_transport);
 	UT_RUN(test_peer_failure_reply_uses_original_version_and_exact_send_owner);
 	UT_RUN(test_pending_new_peer_is_not_ready_or_normal_stop_complete);
+	UT_RUN(test_committed_peer_closes_entered_io_before_discard_and_ready);
+	UT_RUN(test_committed_discard_resumes_bounded_cursor_without_live_proof);
+	UT_RUN(test_committed_discard_keeps_local_and_writeback_responsibility);
+	UT_RUN(test_committed_discard_drift_and_error_never_publish_ready);
+	UT_RUN(test_rewrite_old_uses_committed_identity_and_old_wire_cannot_claim_it);
+	UT_RUN(test_committed_gc_requires_accepted_ready_and_keeps_negative_identity);
+	UT_RUN(test_committed_closure_capacity_and_finite_owner_never_become_empty);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

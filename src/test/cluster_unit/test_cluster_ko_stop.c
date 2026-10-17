@@ -1256,6 +1256,30 @@ cluster_bufmgr_drain_relation_v3(SMgrRelation smgr, bool flush, uint32 *budget, 
 	return CLUSTER_BUFFER_DRAIN_EMPTY;
 }
 
+/* Explicit bufmgr boundary: production descriptor retirement has its own tests. */
+static unsigned committed_discard_calls;
+static uint32 committed_discard_input;
+static ClusterBufferDrainResult committed_discard_result = CLUSTER_BUFFER_DRAIN_EMPTY;
+static void (*committed_discard_hook)(void);
+ClusterBufferDrainResult cluster_bufmgr_discard_relation_v4(RelFileLocator locator,
+														  uint32 *budget, uint32 *cursor);
+ClusterBufferDrainResult
+cluster_bufmgr_discard_relation_v4(RelFileLocator locator, uint32 *budget, uint32 *cursor)
+{
+	UT_ASSERT(SpinLockFree(&storage.shared_lock));
+	UT_ASSERT(cluster_ko_directory_drop_retired_v3(locator));
+	UT_ASSERT(*budget > 0 && *budget <= 128);
+	committed_discard_calls++;
+	committed_discard_input = *cursor;
+	if (committed_discard_hook != NULL)
+		committed_discard_hook();
+	if (committed_discard_result == CLUSTER_BUFFER_DRAIN_MORE) {
+		*cursor += *budget;
+		*budget = 0;
+	}
+	return committed_discard_result;
+}
+
 void
 DropRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 {
@@ -1355,6 +1379,9 @@ reset_test(void)
 	drive_v3_failure = false;
 	object_wire_missing_capabilities = 0;
 	object_wire_send_hook = NULL;
+	committed_discard_calls = committed_discard_input = 0;
+	committed_discard_result = CLUSTER_BUFFER_DRAIN_EMPTY;
+	committed_discard_hook = NULL;
 	buffer_drain_result = CLUSTER_BUFFER_DRAIN_EMPTY;
 	buffer_drain_calls = buffer_drain_input = 0;
 	buffer_drain_drop_only = false;

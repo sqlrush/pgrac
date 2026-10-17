@@ -63,6 +63,7 @@ static BufferDescPadded descriptors[64];
 static LWLockPadded mapping_locks[BUFFER_MAPPING_LWLOCK_OFFSET + NUM_BUFFER_PARTITIONS];
 static uint64 owner_generation[64];
 static uint32 owner_flags[64];
+static uint64 owner_writer[64], owner_activation[64], owner_delivery[64];
 static unsigned bumps;
 static unsigned frees;
 static unsigned wal_resets;
@@ -134,6 +135,18 @@ static unsigned ko_close_at_header;
 static unsigned header_calls;
 static int storage_route = 1;
 static RelFileLocator ko_locator;
+
+static bool ko_retired;
+bool
+cluster_ko_directory_drop_retired_v3(RelFileLocator locator)
+{
+	UT_ASSERT_EQ(lock_depth, 0);
+	for (int i = 0; i < NBuffers; i++)
+		UT_ASSERT((pg_atomic_read_u32(&GetBufferDescriptor(i)->state) & BM_LOCKED) == 0);
+	return ko_retired && RelFileLocatorEquals(locator, ko_locator);
+}
+extern ClusterBufferDrainResult cluster_bufmgr_discard_relation_v4(RelFileLocator locator,
+																 uint32 *budget, uint32 *cursor);
 
 /* Waiting is an explicit fixture boundary. The real caller must arrive
  * here with neither a target reference nor any buffer/mapping lock retained. */
@@ -289,9 +302,9 @@ LWLockHeldByMeInMode(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attr
 }
 
 #define cluster_pcm_own_flags_get(id) owner_flags[id]
-#define cluster_pcm_own_writer_activation_token_get(id) UINT64_C(0)
-#define cluster_pcm_own_resource_x_activation_generation_get(id) UINT64_C(0)
-#define cluster_pcm_own_delivery_attempt_get(id) UINT64_C(0)
+#define cluster_pcm_own_writer_activation_token_get(id) owner_writer[id]
+#define cluster_pcm_own_resource_x_activation_generation_get(id) owner_activation[id]
+#define cluster_pcm_own_delivery_attempt_get(id) owner_delivery[id]
 
 bool
 LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
@@ -373,6 +386,8 @@ cluster_pcm_own_eviction_capture_locked(BufferDesc *buf, ClusterPcmOwnEvictionCa
 	memset(out, 0, sizeof(*out));
 	out->tag = buf->tag;
 	out->generation = owner_generation[buf->buf_id];
+	out->writer_activation_token = owner_writer[buf->buf_id];
+	out->resource_x_activation_generation = owner_activation[buf->buf_id];
 	out->flags = owner_flags[buf->buf_id];
 	out->pcm_state = buf->pcm_state;
 	out->buffer_type = buf->buffer_type;
@@ -382,7 +397,10 @@ static bool
 cluster_pcm_own_fence_matches_locked(BufferDesc *buf, const ClusterPcmOwnSnapshot *before)
 {
 	return owner_generation[buf->buf_id] == before->generation
-		   && owner_flags[buf->buf_id] == before->flags && buf->buffer_type == before->buffer_type
+		   && owner_flags[buf->buf_id] == before->flags
+		   && owner_writer[buf->buf_id] == before->writer_activation_token
+		   && owner_activation[buf->buf_id] == before->resource_x_activation_generation
+		   && buf->buffer_type == before->buffer_type
 		   && buf->pcm_state == before->pcm_state && BufferTagsEqual(&buf->tag, &before->tag);
 }
 
@@ -631,6 +649,9 @@ reset_buffers(void)
 	MainLWLockArray = mapping_locks;
 	memset(descriptors, 0, sizeof(descriptors));
 	memset(owner_flags, 0, sizeof(owner_flags));
+	memset(owner_writer, 0, sizeof(owner_writer));
+	memset(owner_activation, 0, sizeof(owner_activation));
+	memset(owner_delivery, 0, sizeof(owner_delivery));
 	memset(private_pin, 0, sizeof(private_pin));
 	memset(PrivateRefCountArray, 0, sizeof(PrivateRefCountArray));
 	memset(private_hash, 0, sizeof(private_hash));
@@ -650,7 +671,7 @@ reset_buffers(void)
 	storage_route = 1;
 	ko_cleaner_allowed = false;
 	ko_revision = 1;
-	ko_closed = false;
+	ko_closed = ko_retired = false;
 	ko_close_at_header = header_calls = 0;
 	read_io_calls = object_waits = 0;
 	close_at_mapping = collision_at_mapping = false;
@@ -1768,10 +1789,118 @@ UT_TEST(test_object_drain_invalid_input_never_advances_or_touches_buffers)
 	UT_ASSERT_EQ(frees + bumps + physical_writes + lock_depth, 0);
 }
 
+UT_TEST(test_committed_discard_requires_retired_identity_before_any_buffer_touch)
+{
+	BufferTag tag = reset_buffers();
+	uint32 budget = 128, cursor = 0;
+	install_current(&tag, 2);
+	pg_atomic_fetch_or_u32(&GetBufferDescriptor(2)->state, BM_DIRTY);
+	UT_ASSERT_EQ(cluster_bufmgr_discard_relation_v4(ko_locator, &budget, &cursor),
+		CLUSTER_BUFFER_DRAIN_INVALID);
+	UT_ASSERT_EQ(cursor, 0);
+	UT_ASSERT_EQ(budget, 128);
+	UT_ASSERT_EQ(frees + bumps + header_calls + physical_writes, 0);
+}
+
+UT_TEST(test_committed_discard_removes_dirty_current_and_pi_all_forks_without_io)
+{
+	for (ForkNumber fork = MAIN_FORKNUM; fork <= MAX_FORKNUM; fork++) {
+		for (unsigned kind = 0; kind < 3; kind++) {
+			BufferTag tag = reset_buffers();
+			BufferDesc *buf = GetBufferDescriptor(2);
+			uint32 budget = 128, cursor = 0;
+			tag.forkNum = fork;
+			ko_retired = true;
+			install_current(&tag, 2);
+			buf->pcm_state = kind == 0 ? PCM_STATE_X : kind == 1 ? PCM_STATE_S : PCM_STATE_N;
+			if (kind == 2) buf->buffer_type = BUF_TYPE_PI;
+			pg_atomic_fetch_or_u32(&buf->state, BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED);
+			UT_ASSERT_EQ(cluster_bufmgr_discard_relation_v4(ko_locator, &budget, &cursor),
+				CLUSTER_BUFFER_DRAIN_EMPTY);
+			UT_ASSERT_EQ(cursor, NBuffers);
+			UT_ASSERT_EQ(BufTableLookup(&tag, BufTableHashCode(&tag)), -1);
+			UT_ASSERT_EQ(frees, 1);
+			UT_ASSERT_EQ(bumps, 1);
+			UT_ASSERT_EQ(wal_resets, 1);
+			UT_ASSERT_EQ(physical_writes + lock_depth + remembered_pins, 0);
+		}
+	}
+}
+
+UT_TEST(test_committed_discard_keeps_pins_io_and_ownership_reservations)
+{
+	for (unsigned fault = 0; fault < 11; fault++) {
+		BufferTag tag = reset_buffers();
+		BufferDesc *buf = GetBufferDescriptor(2);
+		uint32 budget = 128, cursor = 0, state;
+		ko_retired = true;
+		install_current(&tag, 2);
+		pg_atomic_fetch_or_u32(&buf->state, BM_DIRTY);
+		switch (fault) {
+		case 0: pg_atomic_fetch_add_u32(&buf->state, BUF_REFCOUNT_ONE); break;
+		case 1: pg_atomic_fetch_or_u32(&buf->state, BM_IO_IN_PROGRESS); break;
+		case 2: pg_atomic_fetch_or_u32(&buf->state, BM_IO_ERROR); break;
+		case 3: owner_flags[2] = PCM_OWN_FLAG_REVOKING; break;
+		case 4: owner_generation[2] = UINT64_MAX; break;
+		case 5: buf->buffer_type = UINT8_MAX; break;
+		case 6: owner_generation[2] = 0; break;
+		case 7: owner_writer[2] = 7; break;
+		case 8: owner_activation[2] = 7; break;
+		case 9: owner_delivery[2] = 7; break;
+		case 10: buf->pcm_state = UINT8_MAX; break;
+		}
+		state = pg_atomic_read_u32(&buf->state);
+		UT_ASSERT(cluster_bufmgr_discard_relation_v4(ko_locator, &budget, &cursor)
+			!= CLUSTER_BUFFER_DRAIN_EMPTY);
+		UT_ASSERT_EQ(cursor, 2);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&buf->state), state);
+		UT_ASSERT_EQ(BufTableLookup(&tag, BufTableHashCode(&tag)), 2);
+		UT_ASSERT_EQ(bumps + frees + physical_writes + lock_depth, 0);
+	}
+}
+
+UT_TEST(test_committed_discard_budget_and_mapping_race_keep_original_owner)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		BufferTag tag = reset_buffers();
+		uint32 cursor = 0, budget = 2;
+		ko_retired = true;
+		install_current(&tag, 2);
+		UT_ASSERT_EQ(cluster_bufmgr_discard_relation_v4(ko_locator, &budget, &cursor),
+			CLUSTER_BUFFER_DRAIN_MORE);
+		UT_ASSERT_EQ(cursor, 2);
+		UT_ASSERT_EQ(budget, 0);
+		budget = 128;
+		drain_mapping_race = fault == 0 ? 2 : fault == 1 ? 3 : 1;
+		UT_ASSERT_EQ(cluster_bufmgr_discard_relation_v4(ko_locator, &budget, &cursor),
+			fault == 2 ? CLUSTER_BUFFER_DRAIN_EMPTY : CLUSTER_BUFFER_DRAIN_WAIT);
+		UT_ASSERT_EQ(frees, fault == 2 ? 1 : 0);
+		UT_ASSERT_EQ(physical_writes + lock_depth, 0);
+	}
+}
+
+UT_TEST(test_committed_discard_removes_clean_cr_with_original_mapping_tail)
+{
+	BufferTag tag = reset_buffers();
+	uint32 cursor = 0, budget = 128;
+	int head;
+	uint64 generation;
+	ko_retired = true;
+	install_current(&tag, 0);
+	install_cr(&tag, 1);
+	install_cr(&tag, 2);
+	UT_ASSERT_EQ(cluster_bufmgr_discard_relation_v4(ko_locator, &budget, &cursor),
+		CLUSTER_BUFFER_DRAIN_EMPTY);
+	UT_ASSERT_EQ(frees, 3);
+	UT_ASSERT(!BufTableCRLookup(&tag, BufTableHashCode(&tag), &head, &generation));
+	UT_ASSERT_EQ(BufTableLookup(&tag, BufTableHashCode(&tag)), -1);
+	UT_ASSERT_EQ(physical_writes + lock_depth, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(43);
+	UT_PLAN(48);
 	printf("# private pin entry: %zu bytes; current admission: %zu bytes\n",
 		   sizeof(PrivateRefCountEntry), sizeof(ClusterKoCurrentAdmissionV3));
 	UT_RUN(test_object_drain_bounds_scan_and_preserves_foreign_pin);
@@ -1817,6 +1946,11 @@ main(void)
 	UT_RUN(test_cleanup_lock_keeps_original_pin_when_object_is_fenced);
 	UT_RUN(test_conditional_object_sample_never_replaces_pcm_proof);
 	UT_RUN(test_conditional_nonshared_paths_keep_native_behavior);
+	UT_RUN(test_committed_discard_requires_retired_identity_before_any_buffer_touch);
+	UT_RUN(test_committed_discard_removes_dirty_current_and_pi_all_forks_without_io);
+	UT_RUN(test_committed_discard_keeps_pins_io_and_ownership_reservations);
+	UT_RUN(test_committed_discard_budget_and_mapping_race_keep_original_owner);
+	UT_RUN(test_committed_discard_removes_clean_cr_with_original_mapping_tail);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

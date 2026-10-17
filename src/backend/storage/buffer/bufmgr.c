@@ -11209,6 +11209,92 @@ cluster_bufmgr_drain_relation_v3(SMgrRelation smgr, bool flush, uint32 *budget, 
 	}
 	return *cursor == (uint32)NBuffers ? CLUSTER_BUFFER_DRAIN_EMPTY : CLUSTER_BUFFER_DRAIN_MORE;
 }
+/* AM05: remove dead-object bytes under the original mapping/header tuple.
+ * No content bytes are read. Zero pins and no I/O exclude a byte user;
+ * reservations/activation retain their original owner. The immutable KO
+ * tombstone was checked outside these locks and can never reopen this locator.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static bool
+cluster_bufmgr_discard_buffer_v4(BufferDesc *buf)
+{
+	BufferTag tag = buf->tag;
+	ClusterPcmOwnEvictionCapture capture;
+	ClusterPcmOwnResult result;
+	uint32 state = pg_atomic_read_u32(&buf->state), hash;
+	uint32 flags = 0;
+	uint64 generation = 0;
+	LWLock *partition;
+
+	cluster_pcm_own_eviction_capture_locked(buf, &capture);
+	UnlockBufHdr(buf, state);
+	hash = BufTableHashCode(&tag);
+	partition = BufMappingPartitionLock(hash);
+	if (!LWLockConditionalAcquire(partition, LW_EXCLUSIVE))
+		return false;
+	state = LockBufHdr(buf);
+	if (!BufferTagsEqual(&tag, &buf->tag)) {
+		UnlockBufHdr(buf, state);
+		LWLockRelease(partition);
+		return true;
+	}
+	if (BUF_STATE_GET_REFCOUNT(state) != 0 || (state & (BM_IO_IN_PROGRESS | BM_IO_ERROR)) != 0
+		|| capture.generation == 0 || cluster_pcm_own_delivery_attempt_get(buf->buf_id) != 0
+		|| (buf->pcm_state != PCM_STATE_N && buf->pcm_state != PCM_STATE_S
+			&& buf->pcm_state != PCM_STATE_X)
+		|| !cluster_pcm_own_fence_matches_locked(buf, &capture)
+		|| (buf->buffer_type != BUF_TYPE_CURRENT && buf->buffer_type != BUF_TYPE_PI
+			&& buf->buffer_type != BUF_TYPE_CR)) {
+		UnlockBufHdr(buf, state);
+		LWLockRelease(partition);
+		return false;
+	}
+	/* CR has its own version-chain mapping tail and never owns dirty work. */
+	if (buf->buffer_type == BUF_TYPE_CR)
+		return InvalidateBufferCommitLocked(buf, &tag, hash, partition, state);
+	if (BufTableLookup(&tag, hash) != buf->buf_id) {
+		UnlockBufHdr(buf, state);
+		LWLockRelease(partition);
+		return false;
+	}
+	result = cluster_pcm_own_eviction_commit_locked(buf, &capture, &generation, &flags);
+	if (result != CLUSTER_PCM_OWN_OK) {
+		UnlockBufHdr(buf, state);
+		LWLockRelease(partition);
+		return false;
+	}
+	/* The old incarnation is dead: do not publish another live PI or send an
+	 * X release. Descriptor refs alone end here; directory/local owners still
+	 * block READY until their original exact consumers finish. */
+	InvalidateBufferCommitTailLocked(buf, &tag, hash, partition, state, PCM_STATE_N, false);
+	return true;
+}
+
+ClusterBufferDrainResult
+cluster_bufmgr_discard_relation_v4(RelFileLocator locator, uint32 *budget, uint32 *cursor)
+{
+	if (budget == NULL || cursor == NULL || *budget == 0 || *budget > 128
+		|| NBuffers <= 0 || *cursor > (uint32)NBuffers
+		|| !cluster_ko_directory_drop_retired_v3(locator))
+		return CLUSTER_BUFFER_DRAIN_INVALID;
+	while (*budget > 0 && *cursor < (uint32)NBuffers) {
+		BufferDesc *buf = GetBufferDescriptor(*cursor);
+		uint32 state;
+
+		(*budget)--;
+		state = LockBufHdr(buf);
+		if (!(state & BM_TAG_VALID) || !BufTagMatchesRelFileLocator(&buf->tag, &locator)) {
+			UnlockBufHdr(buf, state);
+			(*cursor)++;
+			continue;
+		}
+		if (!cluster_bufmgr_discard_buffer_v4(buf))
+			return CLUSTER_BUFFER_DRAIN_WAIT;
+		(*cursor)++;
+	}
+	return *cursor == (uint32)NBuffers ? CLUSTER_BUFFER_DRAIN_EMPTY : CLUSTER_BUFFER_DRAIN_MORE;
+}
+
 #endif
 
 /* ---------------------------------------------------------------------

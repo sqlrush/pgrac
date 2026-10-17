@@ -225,6 +225,7 @@ typedef enum KoDropIdentityState {
  * They are instance-local and are never authority for recovery or DATA. */
 typedef struct KoDropIdentity {
 	KoDropIdentityState state;
+	bool committed_discard;
 	uint32 next;
 	uint64 fence_serial;
 	ClusterKoSharedMessageV3 request;
@@ -1132,7 +1133,9 @@ ko_directory_drop_at_least(RelFileLocator locator, uint8 minimum_state)
 		if (identity->state < KO_DROP_IDENTITY_RESERVED
 			|| identity->state > KO_DROP_IDENTITY_RETIRED
 			|| identity->fence_serial == 0
-			|| identity->request.operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP) {
+			|| (identity->request.operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP
+				&& (!identity->committed_discard
+					|| identity->request.operation != CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD))) {
 			committed = false;
 			break;
 		}
@@ -1163,18 +1166,23 @@ cluster_ko_directory_drop_retired_v3(RelFileLocator locator)
  * reserves before REQUEST. COMMIT never allocates; exhaustion keeps the
  * original negative operation owner. */
 static bool
-ko_drop_reserve_locked(const ClusterKoSharedMessageV3 *request, uint64 serial, uint32 *index)
+ko_drop_reserve_object_locked(const ClusterKoSharedMessageV3 *request, uint64 serial,
+							 uint32 *index, bool committed_discard)
 {
 	KoDropIdentity *identity;
 	uint32 link, bucket;
 
-	if (request->operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP)
+	if (!committed_discard && request->operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP)
 		return true;
+	if (request->operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP
+		&& request->operation != CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD)
+		return false;
 	if (*index != 0) {
 		if (*index > KO_DROP_IDENTITY_CAPACITY)
 			return false;
 		identity = &ko_state->drop_identities[*index - 1];
 		return identity->state == KO_DROP_IDENTITY_RESERVED
+			&& identity->committed_discard == committed_discard
 			&& identity->fence_serial == serial
 			&& memcmp(&identity->request, request, sizeof(*request)) == 0;
 	}
@@ -1189,12 +1197,41 @@ ko_drop_reserve_locked(const ClusterKoSharedMessageV3 *request, uint64 serial, u
 	bucket = ko_drop_bucket(request->base.key.locator);
 	memset(identity, 0, sizeof(*identity));
 	identity->state = KO_DROP_IDENTITY_RESERVED;
+	identity->committed_discard = committed_discard;
 	identity->request = *request;
 	identity->fence_serial = serial;
 	identity->next = ko_state->drop_buckets[bucket];
 	ko_state->drop_buckets[bucket] = link;
 	*index = link;
 	return true;
+}
+
+static bool
+ko_drop_reserve_locked(const ClusterKoSharedMessageV3 *request, uint64 serial, uint32 *index)
+{
+	return ko_drop_reserve_object_locked(request, serial, index, false);
+}
+
+/* PKO4 itself is the authenticated post-COMMIT request. A catalog marker
+ * can precede it on the independent SI ring, so never infer this purpose
+ * from marker arrival or a matching locator. The negative identity remains
+ * after the active slot is reused. No KO lock spans buffer or directory work.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static KoDropIdentity *
+ko_peer_discard_identity_locked(const ClusterKoPeerFenceV3 *entry)
+{
+	KoDropIdentity *identity;
+
+	if (!entry->committed_discard || entry->drop_identity == 0
+		|| entry->drop_identity > KO_DROP_IDENTITY_CAPACITY)
+		return NULL;
+	identity = &ko_state->drop_identities[entry->drop_identity - 1];
+	return identity->committed_discard && identity->fence_serial == entry->serial
+		&& identity->state >= KO_DROP_IDENTITY_RESERVED
+		&& identity->state <= KO_DROP_IDENTITY_RETIRED
+		&& memcmp(&identity->request, &entry->request, sizeof(entry->request)) == 0
+		? identity : NULL;
 }
 
 static bool
@@ -2784,9 +2821,9 @@ ko_peer_holder_lmon_tick(void)
 
 /* Called by the original drain owner only after its complete READY
  * conjunction. This state transition itself performs no drain or ACK. */
-bool
-cluster_ko_peer_fence_ready_v3(const ClusterKoSharedMessageV3 *request,
-							 const ClusterKoPeerFenceHandleV3 *handle)
+static bool
+ko_peer_fence_ready(const ClusterKoSharedMessageV3 *request,
+					const ClusterKoPeerFenceHandleV3 *handle, bool committed_discard)
 {
 	uint8 encoded[CLUSTER_KO_SHARED_V3_BYTES];
 	ClusterKoPeerFenceV3 *entry;
@@ -2796,16 +2833,16 @@ cluster_ko_peer_fence_ready_v3(const ClusterKoSharedMessageV3 *request,
 
 	if (ko_state == NULL || request == NULL || handle == NULL || !AmSinvalBcastProcess()
 		|| handle->slot >= CLUSTER_KO_SHARED_CAPACITY || handle->serial == 0
-		|| !cluster_ko_shared_encode_v3(request, encoded, sizeof(encoded)))
+		|| !ko_shared_object_encode(request, committed_discard, encoded, sizeof(encoded)))
 		return false;
 	SpinLockAcquire(&ko_state->shared_lock);
 	peer_route_generation = ko_state->peer_fences[handle->slot].peer_route_generation;
 	SpinLockRelease(&ko_state->shared_lock);
-	if (!ko_shared_v3_control_at_generation(request, peer_route_generation))
+	if (!ko_shared_object_control_at_generation(request, peer_route_generation, committed_discard))
 		return false;
 	SpinLockAcquire(&ko_state->shared_lock);
 	entry = &ko_state->peer_fences[handle->slot];
-	if (entry->serial == handle->serial && entry->peer_route_generation == peer_route_generation
+	if (entry->committed_discard == committed_discard && entry->serial == handle->serial && entry->peer_route_generation == peer_route_generation
 		&& (entry->state == CLUSTER_KO_PEER_FENCE_ACTIVE
 			|| entry->state == CLUSTER_KO_PEER_FENCE_READY)
 		&& memcmp(entry->encoded, encoded, sizeof(encoded)) == 0 && entry->physical_applied
@@ -2824,7 +2861,10 @@ cluster_ko_peer_fence_ready_v3(const ClusterKoSharedMessageV3 *request,
 		&& cluster_pcm_lock_resource_x_gate_snapshot(&gate)
 		&& memcmp(&gate, &entry->local_scan_gate, sizeof(gate)) == 0
 		&& gate.phase == RESOURCE_X_GATE_OPEN
-		&& ko_drop_reserve_locked(&entry->request, entry->serial, &entry->drop_identity)) {
+		&& (committed_discard
+			? (ko_peer_discard_identity_locked(entry) != NULL
+			   && ko_peer_discard_identity_locked(entry)->state == KO_DROP_IDENTITY_RETIRED)
+			: ko_drop_reserve_locked(&entry->request, entry->serial, &entry->drop_identity))) {
 		if (entry->state == CLUSTER_KO_PEER_FENCE_ACTIVE) {
 			uint64 sealed_revision = entry->local_scan_revision + 1;
 
@@ -2840,6 +2880,13 @@ cluster_ko_peer_fence_ready_v3(const ClusterKoSharedMessageV3 *request,
 	}
 	SpinLockRelease(&ko_state->shared_lock);
 	return ok;
+}
+
+bool
+cluster_ko_peer_fence_ready_v3(const ClusterKoSharedMessageV3 *request,
+							 const ClusterKoPeerFenceHandleV3 *handle)
+{
+	return ko_peer_fence_ready(request, handle, false);
 }
 
 /* Invalid/error attempts retire only the local scan hint, never the object
@@ -2996,6 +3043,121 @@ ko_peer_fence_physical_tick_v3(ClusterKoPeerFenceV3 *before,
 }
 
 static bool
+ko_peer_discard_cut_current(const ClusterKoPeerFenceV3 *before, uint64 revision,
+						   const ResourceXGateSnapshot *gate)
+{
+	ResourceXGateSnapshot after;
+
+	return before->committed_discard
+		&& ko_shared_object_control_at_generation(&before->request,
+			before->peer_route_generation, true)
+		&& pg_atomic_read_u64(&ko_state->peer_admission_revision) == revision
+		&& cluster_pcm_lock_resource_x_gate_snapshot(&after)
+		&& after.phase == RESOURCE_X_GATE_OPEN && memcmp(gate, &after, sizeof(after)) == 0;
+}
+
+/* Closing stops new entered calls immediately; their exact end and the
+ * original finite owners must finish before this becomes I/O-retired.
+ * This is neither buffer removal nor READY nor directory completion. */
+static bool
+ko_peer_discard_close_locked(ClusterKoPeerFenceV3 *entry)
+{
+	KoDropIdentity *identity;
+	uint64 revision;
+
+	if (entry->drop_identity == 0
+		&& !ko_drop_reserve_object_locked(&entry->request, entry->serial,
+			&entry->drop_identity, true))
+		return false;
+	identity = ko_peer_discard_identity_locked(entry);
+	if (identity == NULL)
+		return false;
+	if (identity->state == KO_DROP_IDENTITY_RESERVED) {
+		revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+		if (revision == 0 || revision >= UINT64_MAX - 1)
+			return false;
+		identity->state = KO_DROP_IDENTITY_CLOSING;
+		pg_atomic_write_u64(&ko_state->peer_admission_revision, revision + 1);
+		ko_peer_fence_physical_reset_locked(entry);
+	}
+	if (ko_directory_io_pending_locked(entry->request.base.key.locator)
+		|| ko_cleaner_pending_locked(entry->request.base.key.locator)
+		|| ko_extend_pending_locked(entry->request.base.key.locator))
+		return false;
+	identity->state = KO_DROP_IDENTITY_RETIRED;
+	return true;
+}
+
+/* The existing SI owner advances at most 128 descriptors, without opening
+ * storage or taking new current. Every error consumes only the scan hint;
+ * committed negative identity and unresolved owners remain. */
+static bool
+ko_peer_fence_discard_tick_v4(ClusterKoPeerFenceV3 *before,
+							 const ClusterKoPeerFenceHandleV3 *handle)
+{
+	ResourceXGateSnapshot gate, after;
+	ClusterKoPeerFenceV3 *entry;
+	ClusterBufferDrainResult result;
+	uint64 revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+	uint32 cursor = 0, budget = 128, start;
+	bool applied = false;
+
+	if (revision == 0 || revision >= UINT64_MAX - 1
+		|| !cluster_pcm_lock_resource_x_gate_snapshot(&gate)
+		|| gate.phase != RESOURCE_X_GATE_OPEN
+		|| !ko_peer_discard_cut_current(before, revision, &gate))
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	entry = &ko_state->peer_fences[handle->slot];
+	if (entry->serial != handle->serial || !entry->committed_discard
+		|| entry->state != CLUSTER_KO_PEER_FENCE_ACTIVE || !entry->physical_started
+		|| entry->failure_sqlerrcode != 0
+		|| entry->peer_route_generation != before->peer_route_generation
+		|| memcmp(entry->encoded, before->encoded, sizeof(entry->encoded)) != 0
+		|| pg_atomic_read_u64(&ko_state->peer_admission_revision) != revision
+		|| !cluster_pcm_lock_resource_x_gate_snapshot(&after)
+		|| memcmp(&gate, &after, sizeof(gate)) != 0
+		|| !ko_peer_discard_close_locked(entry)) {
+		SpinLockRelease(&ko_state->shared_lock);
+		return false;
+	}
+	/* CLOSING itself invalidated old admission samples. Use its resulting
+	 * revision, not the pre-close sample; do not invalidate our own prefix. */
+	revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+	if (entry->physical_revision == revision
+		&& memcmp(&entry->physical_gate, &gate, sizeof(gate)) == 0)
+		cursor = entry->physical_cursor;
+	ko_peer_fence_physical_reset_locked(entry);
+	SpinLockRelease(&ko_state->shared_lock);
+	start = cursor;
+	result = cluster_bufmgr_discard_relation_v4(before->request.base.key.locator, &budget, &cursor);
+	if (budget > 128 || cursor < start || cursor - start > 128 - budget
+		|| (result != CLUSTER_BUFFER_DRAIN_EMPTY && result != CLUSTER_BUFFER_DRAIN_MORE
+			&& result != CLUSTER_BUFFER_DRAIN_WAIT)
+		|| !ko_peer_discard_cut_current(before, revision, &gate))
+		return false;
+	if (result == CLUSTER_BUFFER_DRAIN_EMPTY)
+		cluster_hw_lease_discard(before->request.base.key.locator, MAIN_FORKNUM);
+	SpinLockAcquire(&ko_state->shared_lock);
+	entry = &ko_state->peer_fences[handle->slot];
+	if (entry->serial == handle->serial && entry->committed_discard
+		&& entry->state == CLUSTER_KO_PEER_FENCE_ACTIVE && entry->failure_sqlerrcode == 0
+		&& entry->peer_route_generation == before->peer_route_generation
+		&& memcmp(entry->encoded, before->encoded, sizeof(entry->encoded)) == 0
+		&& pg_atomic_read_u64(&ko_state->peer_admission_revision) == revision
+		&& cluster_pcm_lock_resource_x_gate_snapshot(&after)
+		&& memcmp(&gate, &after, sizeof(gate)) == 0) {
+		entry->physical_cursor = cursor;
+		entry->physical_revision = revision;
+		entry->physical_gate = gate;
+		entry->physical_applied = applied = result == CLUSTER_BUFFER_DRAIN_EMPTY;
+		*before = *entry;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	return applied;
+}
+
+static bool
 ko_peer_fence_local_scan_v3(const ClusterKoPeerFenceV3 *before,
 							const ClusterKoPeerFenceHandleV3 *handle)
 {
@@ -3102,28 +3264,30 @@ ko_peer_fence_local_ready_tick_v3(void)
 			(void)ko_shared_enqueue_object(&request, route_generation, before.committed_discard);
 			continue;
 		}
-		/* PKO4 remains owned until its committed-discard consumer is ready.
-		 * Never execute the live-object flush/PI proof for this purpose. */
-		if (before.committed_discard)
-			continue;
 		ko_peer_attempt = handle;
 		ko_peer_attempt_active = true;
 
 		if (state == CLUSTER_KO_PEER_FENCE_ACTIVE) {
-			if ((!physical_applied
+			if (before.committed_discard) {
+				if ((!physical_applied
+					 || !ko_peer_discard_cut_current(&before, before.physical_revision,
+						 &before.physical_gate))
+					&& !ko_peer_fence_discard_tick_v4(&before, &handle))
+					goto next_owner;
+			} else if ((!physical_applied
 				 || !ko_peer_physical_cut_current_v3(&before, before.physical_revision,
 													 &before.physical_gate))
 				&& !ko_peer_fence_physical_tick_v3(&before, &handle))
 				goto next_owner;
 			if (!ko_peer_fence_local_scan_v3(&before, &handle))
 				goto next_owner;
-			if (!cluster_ko_peer_fence_ready_v3(&request, &handle))
+			if (!ko_peer_fence_ready(&request, &handle, before.committed_discard))
 				goto next_owner;
 		}
 
 		request.base.verb = CLUSTER_KO_SHARED_ACK;
 		request.base.status = CLUSTER_KO_SHARED_DONE;
-		if (!ko_shared_enqueue_v3(&request, route_generation))
+		if (!ko_shared_enqueue_object(&request, route_generation, before.committed_discard))
 			goto next_owner;
 	next_owner:
 		ko_peer_attempt_active = false;
@@ -3307,7 +3471,7 @@ cluster_ko_peer_fence_gc_tick_v3(void)
 		}
 		SpinLockRelease(&ko_state->shared_lock);
 
-		if (saved.state == CLUSTER_KO_PEER_FENCE_COMMITTED) {
+		if (saved.state == CLUSTER_KO_PEER_FENCE_COMMITTED || saved.committed_discard) {
 			/* COMMIT supersedes the observation, not the query's owner.
 			 * Wait for its exact reply before retiring the terminal record;
 			 * PRESENT/UNKNOWN here finish only the query, never prove abort. */
@@ -3345,6 +3509,9 @@ cluster_ko_peer_fence_gc_tick_v3(void)
 			&& !ko_cleaner_pending_locked(entry->request.base.key.locator)
 			&& !ko_extend_pending_locked(entry->request.base.key.locator)
 			&& !ko_peer_fence_has_queued_work_locked(entry)
+			&& (!entry->committed_discard
+				|| (ko_peer_discard_identity_locked(entry) != NULL
+					&& ko_peer_discard_identity_locked(entry)->state == KO_DROP_IDENTITY_RETIRED))
 			&& ko_peer_fence_clear_locked(entry))
 			retired = progress = true;
 		SpinLockRelease(&ko_state->shared_lock);
