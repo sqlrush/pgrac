@@ -472,10 +472,263 @@ UT_TEST(test_invalid_input_budget_lookup_and_destroy)
 	UT_ASSERT_EQ(allocations, 0);
 }
 
+static ClusterColdTtSlotKeyV1
+slot_key(uint8 owner, uint32 segment, uint32 generation, uint32 offset, TransactionId xid,
+		 uint16 wrap)
+{
+	ClusterColdTtSlotKeyV1 key = { 0 };
+
+	key.owner_instance = owner;
+	key.segment_id = segment;
+	key.segment_generation = generation;
+	key.slot_offset = offset;
+	key.xid = xid;
+	key.slot_wrap = wrap;
+	return key;
+}
+
+static void
+assert_cleared(const ClusterColdTtSlotInputV1 *out)
+{
+	ClusterColdTtSlotInputV1 zero = { 0 };
+
+	UT_ASSERT_EQ(memcmp(out, &zero, sizeof(zero)), 0);
+}
+
+UT_TEST(test_slot_enumeration_includes_every_raw_history_slot)
+{
+	ClusterColdTypedV1 typed;
+	UndoSegmentHeaderData header = header_for(128, 32768);
+	ClusterColdTtSlotInputV1 out;
+
+	fixture(&typed);
+	typed.participant_count = 2;
+	typed.participants[1].thread_id = 128;
+	typed.replay_count = 1;
+	for (uint32 i = 0; i < TT_SLOTS_PER_SEGMENT; i++)
+		memset(&header.tt_slots[i], i, sizeof(TTSlot));
+	write_header(32768, &header, true);
+	UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(&typed, INPUT_BUDGET), CLUSTER_COLD_OK);
+	for (uint32 i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		UT_ASSERT(cluster_cold_tt_base_slot_v1(&typed, 0, i, &out));
+		UT_ASSERT_EQ(out.key.owner_instance, 128);
+		UT_ASSERT_EQ(out.key.segment_id, 32768);
+		UT_ASSERT_EQ(out.key.segment_generation, 0);
+		UT_ASSERT_EQ(out.key.slot_offset, i);
+		UT_ASSERT_EQ(out.key.xid, header.tt_slots[i].xid);
+		UT_ASSERT_EQ(out.key.slot_wrap, header.tt_slots[i].wrap);
+		UT_ASSERT_EQ(memcmp(&out.slot, &header.tt_slots[i], sizeof(TTSlot)), 0);
+	}
+	cluster_cold_tt_base_destroy_v1(&typed);
+}
+
+UT_TEST(test_slot_enumeration_bounds_and_missing_input_clear_outputs)
+{
+	ClusterColdTypedV1 typed;
+	UndoSegmentHeaderData header = header_for(1, 1);
+	ClusterColdTtSlotInputV1 out;
+
+	fixture(&typed);
+	write_header(1, &header, true);
+	UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(&typed, INPUT_BUDGET), CLUSTER_COLD_OK);
+	for (int fault = 0; fault < 5; fault++) {
+		memset(&out, 0xA5, sizeof(out));
+		UT_ASSERT(!cluster_cold_tt_base_slot_v1(fault == 0 ? NULL : &typed,
+												fault == 1	 ? 1
+												: fault == 2 ? UINT32_MAX
+															 : 0,
+												fault == 3	 ? TT_SLOTS_PER_SEGMENT
+												: fault == 4 ? UINT32_MAX
+															 : 0,
+												&out));
+		assert_cleared(&out);
+	}
+	UT_ASSERT(!cluster_cold_tt_base_slot_v1(&typed, 0, 0, NULL));
+	cluster_cold_tt_base_destroy_v1(&typed);
+	memset(&out, 0xA5, sizeof(out));
+	UT_ASSERT(!cluster_cold_tt_base_slot_v1(&typed, 0, 0, &out));
+	assert_cleared(&out);
+}
+
+UT_TEST(test_exact_match_preserves_active_head_generation_zero_and_last_slot)
+{
+	ClusterColdTypedV1 typed;
+	UndoSegmentHeaderData header = header_for(128, 32768);
+	ClusterColdTtSlotKeyV1 key = slot_key(128, 32768, 0, 47, 1234, 0);
+	ClusterColdTtSlotInputV1 out;
+
+	fixture(&typed);
+	typed.participant_count = 2;
+	typed.participants[1].thread_id = 128;
+	typed.replay_count = 1;
+	header.tt_slots[47].xid = key.xid;
+	header.tt_slots[47].status = TT_SLOT_ACTIVE;
+	header.tt_slots[47].first_undo_block.raw[0] = UINT64_C(0x12345678);
+	header.tt_slots[47].first_undo_block.raw[1] = UINT64_C(0xABCDEF);
+	write_header(32768, &header, true);
+	UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(&typed, INPUT_BUDGET), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_tt_base_match_v1(&typed, &key, &out));
+	UT_ASSERT_EQ(out.key.segment_generation, 0);
+	UT_ASSERT_EQ(out.key.slot_wrap, 0);
+	UT_ASSERT_EQ(out.slot.status, TT_SLOT_ACTIVE);
+	UT_ASSERT_EQ(memcmp(&out.slot, &header.tt_slots[47], sizeof(TTSlot)), 0);
+	cluster_cold_tt_base_destroy_v1(&typed);
+}
+
+UT_TEST(test_exact_match_rejects_each_identity_mismatch_without_partial_output)
+{
+	ClusterColdTypedV1 typed;
+	UndoSegmentHeaderData header = header_for(1, 256);
+	ClusterColdTtSlotKeyV1 key = slot_key(1, 256, 7, 47, 1234, 9);
+	ClusterColdTtSlotInputV1 out;
+
+	fixture(&typed);
+	header.wrap_count = key.segment_generation;
+	header.tt_slots[47].xid = key.xid;
+	header.tt_slots[47].wrap = key.slot_wrap;
+	header.tt_slots[47].status = TT_SLOT_ACTIVE;
+	write_header(256, &header, true);
+	UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(&typed, INPUT_BUDGET), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_tt_base_match_v1(&typed, &key, &out));
+	for (int fault = 0; fault < 7; fault++) {
+		ClusterColdTtSlotKeyV1 bad = key;
+
+		switch (fault) {
+		case 0:
+			bad.owner_instance++;
+			break;
+		case 1:
+			bad.segment_id--;
+			break;
+		case 2:
+			bad.segment_generation--;
+			break;
+		case 3:
+			bad.segment_generation++;
+			break;
+		case 4:
+			bad.slot_offset--;
+			break;
+		case 5:
+			bad.xid++;
+			break;
+		case 6:
+			bad.slot_wrap++;
+			break;
+		}
+		memset(&out, 0xA5, sizeof(out));
+		UT_ASSERT(!cluster_cold_tt_base_match_v1(&typed, &bad, &out));
+		assert_cleared(&out);
+	}
+	cluster_cold_tt_base_destroy_v1(&typed);
+}
+
+UT_TEST(test_exact_match_invalid_claims_and_null_arguments_clear_outputs)
+{
+	ClusterColdTypedV1 typed;
+	UndoSegmentHeaderData header = header_for(1, 1);
+	ClusterColdTtSlotKeyV1 key = slot_key(1, 1, 0, 0, 3, 0);
+	ClusterColdTtSlotInputV1 out;
+
+	fixture(&typed);
+	write_header(1, &header, true);
+	UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(&typed, INPUT_BUDGET), CLUSTER_COLD_OK);
+	for (int fault = 0; fault < 10; fault++) {
+		ClusterColdTtSlotKeyV1 bad = key;
+
+		switch (fault) {
+		case 0:
+			bad.owner_instance = 0;
+			break;
+		case 1:
+			bad.owner_instance = 129;
+			break;
+		case 2:
+			bad.segment_id = 0;
+			break;
+		case 3:
+			bad.slot_offset = TT_SLOTS_PER_SEGMENT;
+			break;
+		case 4:
+			bad.slot_offset = UINT32_MAX;
+			break;
+		case 5:
+			bad.xid = InvalidTransactionId;
+			break;
+		case 6:
+			bad.xid = FrozenTransactionId;
+			break;
+		case 7:
+			bad.slot_wrap = TT_WRAP_INVALID;
+			break;
+		}
+		memset(&out, 0xA5, sizeof(out));
+		UT_ASSERT(!cluster_cold_tt_base_match_v1(fault == 8 ? NULL : &typed,
+												 fault == 9 ? NULL : &bad, &out));
+		assert_cleared(&out);
+	}
+	UT_ASSERT(!cluster_cold_tt_base_match_v1(&typed, &key, NULL));
+	cluster_cold_tt_base_destroy_v1(&typed);
+}
+
+UT_TEST(test_slot_copies_and_aliased_match_do_not_modify_captured_input)
+{
+	ClusterColdTypedV1 typed;
+	UndoSegmentHeaderData header = header_for(1, 1);
+	ClusterColdTtSlotInputV1 first, second;
+
+	fixture(&typed);
+	header.tt_slots[0].xid = 3;
+	header.tt_slots[0].status = TT_SLOT_ACTIVE;
+	write_header(1, &header, true);
+	UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(&typed, INPUT_BUDGET), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_tt_base_slot_v1(&typed, 0, 0, &first));
+	UT_ASSERT(cluster_cold_tt_base_match_v1(&typed, &first.key, &first));
+	first.slot.xid = 999;
+	UT_ASSERT(cluster_cold_tt_base_slot_v1(&typed, 0, 0, &second));
+	UT_ASSERT_EQ(second.slot.xid, 3);
+	UT_ASSERT_EQ(second.key.xid, 3);
+	UT_ASSERT_EQ(cluster_cold_tt_base_recheck_v1(&typed), CLUSTER_COLD_OK);
+	cluster_cold_tt_base_destroy_v1(&typed);
+	UT_ASSERT_EQ(second.slot.xid, 3); /* independent copy survives release */
+}
+
+UT_TEST(test_failed_capture_and_sticky_recheck_export_no_slot_or_match)
+{
+	for (int fault = 0; fault < 2; fault++) {
+		ClusterColdTypedV1 typed;
+		UndoSegmentHeaderData header = header_for(1, 1);
+		ClusterColdTtSlotKeyV1 key = slot_key(1, 1, 0, 0, 3, 0);
+		ClusterColdTtSlotInputV1 out;
+
+		fixture(&typed);
+		header.tt_slots[0].xid = 3;
+		header.tt_slots[0].status = TT_SLOT_ACTIVE;
+		write_header(1, &header, true);
+		if (fault == 0) {
+			read_fault = 1;
+			UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(&typed, INPUT_BUDGET),
+						 CLUSTER_COLD_SOURCE_GAP);
+		} else {
+			UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(&typed, INPUT_BUDGET), CLUSTER_COLD_OK);
+			header.tt_slots[0].wrap++;
+			write_header(1, &header, false);
+			UT_ASSERT_EQ(cluster_cold_tt_base_recheck_v1(&typed), CLUSTER_COLD_SOURCE_GAP);
+		}
+		memset(&out, 0xA5, sizeof(out));
+		UT_ASSERT(!cluster_cold_tt_base_slot_v1(&typed, 0, 0, &out));
+		assert_cleared(&out);
+		memset(&out, 0xA5, sizeof(out));
+		UT_ASSERT(!cluster_cold_tt_base_match_v1(&typed, &key, &out));
+		assert_cleared(&out);
+		cluster_cold_tt_base_destroy_v1(&typed);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(19);
 	UT_RUN(test_absence_scans_all_addresses_and_deduplicates_history_origins);
 	UT_RUN(test_all_slots_noncurrent_segments_and_generation_zero_are_retained);
 	UT_RUN(test_history_origin_last_segment_is_captured);
@@ -488,6 +741,13 @@ main(void)
 	UT_RUN(test_presence_replacement_size_and_io_drift_refuse);
 	UT_RUN(test_participant_origin_drift_refuses);
 	UT_RUN(test_invalid_input_budget_lookup_and_destroy);
+	UT_RUN(test_slot_enumeration_includes_every_raw_history_slot);
+	UT_RUN(test_slot_enumeration_bounds_and_missing_input_clear_outputs);
+	UT_RUN(test_exact_match_preserves_active_head_generation_zero_and_last_slot);
+	UT_RUN(test_exact_match_rejects_each_identity_mismatch_without_partial_output);
+	UT_RUN(test_exact_match_invalid_claims_and_null_arguments_clear_outputs);
+	UT_RUN(test_slot_copies_and_aliased_match_do_not_modify_captured_input);
+	UT_RUN(test_failed_capture_and_sticky_recheck_export_no_slot_or_match);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

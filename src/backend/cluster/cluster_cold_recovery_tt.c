@@ -275,3 +275,73 @@ cluster_cold_tt_base_header_v1(const ClusterColdTypedV1 *typed, uint32 index, ui
 	*segment = input->segment;
 	return (const UndoSegmentHeaderData *)input->block.data;
 }
+
+static void
+cold_tt_slot_copy(const ColdTtInputV1 *input, uint32 slot_offset, ClusterColdTtSlotInputV1 *out)
+{
+	const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)input->block.data;
+	const TTSlot *slot = &header->tt_slots[slot_offset];
+
+	out->key.owner_instance = input->owner;
+	out->key.segment_id = input->segment;
+	out->key.segment_generation = header->wrap_count;
+	out->key.slot_offset = slot_offset;
+	out->key.xid = slot->xid;
+	out->key.slot_wrap = slot->wrap;
+	out->slot = *slot;
+}
+
+bool
+cluster_cold_tt_base_slot_v1(const ClusterColdTypedV1 *typed, uint32 segment_index,
+							 uint32 slot_offset, ClusterColdTtSlotInputV1 *out)
+{
+	const ColdTtInputV1 *input;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (slot_offset >= TT_SLOTS_PER_SEGMENT
+		|| segment_index >= cluster_cold_tt_base_count_v1(typed))
+		return false;
+	input = typed->tt_base->first;
+	while (segment_index-- > 0)
+		input = input->next;
+	cold_tt_slot_copy(input, slot_offset, out);
+	return true;
+}
+
+bool
+cluster_cold_tt_base_match_v1(const ClusterColdTypedV1 *typed,
+							  const ClusterColdTtSlotKeyV1 *expected, ClusterColdTtSlotInputV1 *out)
+{
+	ClusterColdTtSlotKeyV1 key;
+	const ColdTtInputV1 *input;
+
+	if (out == NULL)
+		return false;
+	/* A caller may use its previous input copy's key as the expectation. */
+	if (expected != NULL)
+		key = *expected;
+	memset(out, 0, sizeof(*out));
+	if (expected == NULL || key.owner_instance == 0 || key.owner_instance > COLD_TT_MAX_ORIGINS
+		|| key.segment_id == 0
+		|| (key.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 != key.owner_instance
+		|| key.slot_offset >= TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(key.xid)
+		|| key.slot_wrap == TT_WRAP_INVALID || cluster_cold_tt_base_count_v1(typed) == 0)
+		return false;
+	for (input = typed->tt_base->first; input != NULL; input = input->next) {
+		const UndoSegmentHeaderData *header;
+		const TTSlot *slot;
+
+		if (input->owner != key.owner_instance || input->segment != key.segment_id)
+			continue;
+		header = (const UndoSegmentHeaderData *)input->block.data;
+		slot = &header->tt_slots[key.slot_offset];
+		if (header->wrap_count != key.segment_generation || slot->xid != key.xid
+			|| slot->wrap != key.slot_wrap)
+			return false;
+		cold_tt_slot_copy(input, key.slot_offset, out);
+		return true;
+	}
+	return false;
+}

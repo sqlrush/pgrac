@@ -52,6 +52,7 @@
 #include "cluster/cluster_page_stable_base.h"
 #include "cluster/cluster_page_detached.h"
 #include "cluster/cluster_wal_source.h"
+#include "cluster/cluster_tt_slot.h"
 
 #define CLUSTER_COLD_RECOVERY_INTERFACE_V1 1
 #define CLUSTER_COLD_MAX_PARTICIPANTS RF_PAGE_STABLE_MAX_PARTICIPANTS
@@ -766,6 +767,31 @@ extern uint32 cluster_cold_tt_base_count_v1(const ClusterColdTypedV1 *typed);
 extern const struct UndoSegmentHeaderData *
 cluster_cold_tt_base_header_v1(const ClusterColdTypedV1 *typed, uint32 index, uint8 *owner,
 							   uint32 *segment);
+
+/* Physical input identity only: xid is raw, not FullXid, and there is no
+ * cluster epoch or checkpoint/terminal proof. Generation zero is valid. */
+typedef struct ClusterColdTtSlotKeyV1 {
+	uint8 owner_instance;
+	uint32 segment_id;
+	uint32 segment_generation;
+	uint32 slot_offset;
+	TransactionId xid;
+	uint16 slot_wrap;
+} ClusterColdTtSlotKeyV1;
+
+typedef struct ClusterColdTtSlotInputV1 {
+	ClusterColdTtSlotKeyV1 key;
+	TTSlot slot;
+} ClusterColdTtSlotInputV1;
+
+/* Enumerate every physical slot without filtering status, then optionally
+ * match an expected physical key. Both copy input only and clear output on
+ * failure. A match grants no top binding, outcome or mutation authority. */
+extern bool cluster_cold_tt_base_slot_v1(const ClusterColdTypedV1 *typed, uint32 segment_index,
+										 uint32 slot_offset, ClusterColdTtSlotInputV1 *out);
+extern bool cluster_cold_tt_base_match_v1(const ClusterColdTypedV1 *typed,
+										  const ClusterColdTtSlotKeyV1 *expected,
+										  ClusterColdTtSlotInputV1 *out);
 
 /* Sync the selected crashed sources before pass-2 mutations. No replay or
  * completion authority is created; a refusal invalidates this typed attempt. */
