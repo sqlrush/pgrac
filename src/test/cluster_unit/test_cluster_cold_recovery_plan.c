@@ -29,6 +29,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 
 #include "unit_test.h"
 
@@ -942,10 +943,55 @@ UT_TEST(test_compact_plan_capacity)
 	destroy_plan(&plan);
 }
 
+/* A writer checkpoint cannot cover a C0's different target mutation. */
+UT_TEST(test_c0_history_is_not_checkpoint_coverage)
+{
+	for (int boundary = 0; boundary < 2; boundary++) {
+		ClusterColdParticipantV1 parts[1] = { part(2, 12, 0x100, 0x1000, 0x2000) };
+		ClusterColdPlanV1 *plan = make_plan(parts, 1);
+		ClusterColdRecordV1 record = { 0 };
+		record.read_rec_ptr = 0x100;
+		record.end_rec_ptr = boundary ? 0x1000 : 0x200;
+		record.rmid = RM_CLUSTER_UNDO_ID;
+		record.info = XLOG_UNDO_RECOVERY_TT_ABORT;
+		record.record_flags = CLUSTER_COLD_RECORD_FOREIGN_SIDE;
+		UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 0, &record),
+					 CLUSTER_COLD_STRUCTURAL_UNSUPPORTED);
+		UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 0);
+		record.rmid = RM_HEAP_ID;
+		record.info = 0;
+		record.record_flags = 0;
+		UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 0, &record), CLUSTER_COLD_STATE);
+		destroy_plan(&plan);
+	}
+}
+
+UT_TEST(test_c0_replay_range_retains_full_record_obligation)
+{
+	ClusterColdParticipantV1 parts[1] = { part(2, 12, 0x1000, 0x1000, 0x1100) };
+	ClusterColdPlanV1 *plan = make_plan(parts, 1);
+	ClusterColdRecordV1 record = { 0 };
+	ClusterColdDiagV1 diag;
+	ObserveTable table = { 0 };
+	record.read_rec_ptr = 0x1000;
+	record.end_rec_ptr = 0x1100;
+	record.rmid = RM_CLUSTER_UNDO_ID;
+	record.info = XLOG_UNDO_RECOVERY_TT_ABORT;
+	record.record_flags = CLUSTER_COLD_RECORD_FOREIGN_SIDE;
+	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 0, &record), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 0), 1);
+	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 0);
+	UT_ASSERT_EQ(table.calls, 0);
+	destroy_plan(&plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(34);
+	UT_RUN(test_c0_history_is_not_checkpoint_coverage);
+	UT_RUN(test_c0_replay_range_retains_full_record_obligation);
 	UT_RUN(test_lower_lag_old_fpi_cannot_overwrite_newer_durable);
 	UT_RUN(test_data_behind_history_is_refused);
 	UT_RUN(test_a_b_c_exact_order_ignores_scn_and_lsn);

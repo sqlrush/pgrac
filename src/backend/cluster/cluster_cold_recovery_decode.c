@@ -345,7 +345,7 @@ cold_space_reservation(XLogReaderState *reader, uint64 system_identifier,
 
 static ClusterColdDetailV1
 cold_record_flags(XLogReaderState *reader, uint64 system_identifier, const uint8 storage_uuid[16],
-				  ClusterColdDecodedV1 *out, uint8 *flags, uint32 *effects)
+				  bool foreign, ClusterColdDecodedV1 *out, uint8 *flags, uint32 *effects)
 {
 	uint8 info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
 
@@ -365,11 +365,11 @@ cold_record_flags(XLogReaderState *reader, uint64 system_identifier, const uint8
 														XLogRecGetDataLen(reader), &c0)
 				|| c0.writer_thread != reader->cluster_expected_thread_id)
 				return CLUSTER_COLD_COMPONENT_INVALID;
-			/* Writer checkpoint coverage cannot discharge a different target's
-			 * stamp. Until that cold consumer is connected, refuse before and
-			 * after native redo rather than allowing a history-only no-op. */
+			/* Only the original foreign dispatch has a target consumer. It
+			 * still binds both retained sources and the exact target authority;
+			 * own native redo cannot apply this record or skip its history. */
 			*effects |= CLUSTER_COLD_EFFECT_TT | CLUSTER_COLD_EFFECT_TERMINAL;
-			*flags = CLUSTER_COLD_RECORD_UNSUPPORTED;
+			*flags = foreign ? 0 : CLUSTER_COLD_RECORD_UNSUPPORTED;
 		}
 		return CLUSTER_COLD_OK;
 	case RM_COMMIT_TS_ID:
@@ -499,6 +499,11 @@ cold_foreign_side(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan,
 	if (XLogRecGetRmid(reader) == RM_CLUSTER_UNDO_ID) {
 		ClusterUndoDecoded undo;
 
+		/* The complete C0 envelope and payload were checked by
+		 * cold_record_flags. Its dual-source consumer is separate from the
+		 * ordinary original-origin undo decoder below. */
+		if (info == XLOG_UNDO_RECOVERY_TT_ABORT)
+			return plan->route.codec_id == RF_ROUTE_CODEC_SIDE_CLUSTER_UNDO;
 		/* Use only connected record-local consumers. Exact ABORT restores
 		 * its header; legacy terminals cannot borrow the whole-source owner. */
 		return plan->route.codec_id == RF_ROUTE_CODEC_SIDE_CLUSTER_UNDO
@@ -686,7 +691,7 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 		return CLUSTER_COLD_OPCODE_UNSUPPORTED;
 	}
 	out->route_owner = plan.route.record_owner;
-	detail = cold_record_flags(reader, system_identifier, storage_uuid, out,
+	detail = cold_record_flags(reader, system_identifier, storage_uuid, foreign, out,
 							   &out->record.record_flags, &effects);
 	if (detail != CLUSTER_COLD_OK)
 		return detail;

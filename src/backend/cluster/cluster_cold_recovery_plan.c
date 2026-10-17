@@ -43,6 +43,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "cluster/cluster_cold_recovery_plan_internal.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 
 static int
 identity_compare(const RfPageIdentityV1 *left, const RfPageIdentityV1 *right)
@@ -454,6 +455,12 @@ cluster_cold_plan_feed_v1(ClusterColdPlanV1 *plan, uint32 participant,
 	else {
 		owner = &plan->participants[plan->canonical[participant]];
 		detail = record_cursor_check(owner, record);
+		/* C0 names a separate target. The writer's checkpoint is not
+		 * target coverage, including an entirely historical source. */
+		if (detail == CLUSTER_COLD_OK && record->rmid == RM_CLUSTER_UNDO_ID
+			&& record->info == XLOG_UNDO_RECOVERY_TT_ABORT
+			&& record->end_rec_ptr <= owner->cut.native_redo)
+			detail = CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
 		/* A durable lifecycle change before native redo is history; after
 		 * it, its order against other generations needs its own owner. */
 		if (detail == CLUSTER_COLD_OK
