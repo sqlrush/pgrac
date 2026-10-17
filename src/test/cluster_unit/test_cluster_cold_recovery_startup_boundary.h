@@ -558,6 +558,9 @@ static XLogRecPtr census_redo_skew; /* added to thread 2's census native redo */
 static ClusterColdCensusEntryV1 census_history[MAX_HISTORY];
 static uint32 census_history_count;
 static int census_begins;
+static ClusterWalInputV1 census_inputs[13];
+static int census_input_fault;
+static uint32 census_fault_index;
 
 static int history_scans;
 static uint32 history_scan_index;
@@ -569,6 +572,62 @@ cluster_wal_inputs_cold_begin_v1(const uint8 storage_uuid[16], uint64 system_ide
 	census_begins++;
 	UT_ASSERT_EQ(system_identifier, 9);
 	UT_ASSERT_EQ(storage_uuid[0], 1);
+	memset(census_inputs, 0, sizeof(census_inputs));
+	for (uint32 i = 1; i <= NROOTS; i++) {
+		ClusterWalRecoveryCheckpointV1 selected;
+		ClusterWalInputV1 *item = &census_inputs[i];
+		cluster_control_root_recovery_checkpoint_v1(&roots[i], &tokens[i], &selected);
+		item->kind = CLUSTER_WAL_INPUT_CHECKPOINT;
+		item->current = true;
+		item->source = selected.source;
+		item->checkpoint = roots[i];
+		item->checkpoint_start = selected.checkpoint_start;
+		item->native_redo = selected.checkpoint.redo;
+		item->native_checkpoint = selected.checkpoint;
+	}
+	for (uint32 i = 0; i < census_history_count; i++) {
+		const ClusterColdCensusEntryV1 *entry = &census_history[i];
+		ClusterWalInputV1 *item = &census_inputs[entry->input_index];
+		item->kind = CLUSTER_WAL_INPUT_CHECKPOINT;
+		item->source = entry->source;
+		item->checkpoint = roots[entry->cut.thread_id];
+		item->checkpoint.identity = entry->identity;
+		item->checkpoint.checkpoint_lower_lsn = entry->cut.physical_lower;
+		item->checkpoint.validated_tail_lsn_exclusive = entry->cut.tail_end;
+		item->checkpoint_start = entry->cut.physical_lower;
+		item->native_redo = entry->cut.physical_lower;
+		item->native_checkpoint = native_checkpoint[entry->cut.thread_id].checkpoint;
+		item->native_checkpoint.redo = item->native_redo;
+	}
+	{
+		ClusterWalInputV1 *item = &census_inputs[census_fault_index];
+		switch (census_input_fault) {
+		case 2:
+			item->kind = CLUSTER_WAL_INPUT_INITIALIZER_TERMINAL;
+			break;
+		case 3:
+			item->native_checkpoint.redo++;
+			break;
+		case 4:
+			item->source.claim.claim_sha256[0]++;
+			break;
+		case 5:
+			item->checkpoint.identity.origin_owner_incarnation++;
+			break;
+		case 6:
+			item->checkpoint_start = InvalidXLogRecPtr;
+			break;
+		case 7:
+			item->native_checkpoint.nextXid = FullTransactionIdFromU64(17);
+			break;
+		case 8:
+			item->native_checkpoint.ThisTimeLineID++;
+			break;
+		case 9:
+			item->checkpoint.checkpoint_lower_lsn++;
+			break;
+		}
+	}
 	*out = census_begin_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			   ? (ClusterWalInputsV1 *)&census_scope
 			   : NULL;
@@ -579,15 +638,17 @@ uint32
 cluster_wal_inputs_count_v1(ClusterWalInputsV1 *inputs)
 {
 	UT_ASSERT(inputs == (ClusterWalInputsV1 *)&census_scope);
-	return 0;
+	return lengthof(census_inputs);
 }
 
 const ClusterWalInputV1 *
 cluster_wal_inputs_at_v1(ClusterWalInputsV1 *inputs, uint32 index)
 {
-	(void)inputs;
-	(void)index;
-	return NULL;
+	UT_ASSERT(inputs == (ClusterWalInputsV1 *)&census_scope);
+	return index >= lengthof(census_inputs)
+				   || (census_input_fault == 1 && index == census_fault_index)
+			   ? NULL
+			   : &census_inputs[index];
 }
 
 ClusterControlRootResult
@@ -627,7 +688,7 @@ cluster_cold_census_select_v1(const ClusterWalInputV1 *const *inputs, uint32 cou
 		e->input_index = thread;
 		e->role = CLUSTER_COLD_CENSUS_REPLAY;
 		e->identity = roots[thread].identity;
-		e->source.claim.identity = roots[thread].identity;
+		e->source = census_inputs[thread].source;
 		e->cut.thread_id = thread;
 		e->cut.timeline = roots[thread].checkpoint_tli;
 		e->cut.owner_incarnation = roots[thread].identity.origin_owner_incarnation;
@@ -694,6 +755,7 @@ history_generation(uint16 thread, uint64 incarnation, XLogRecPtr lower, XLogRecP
 	e->identity.origin_owner_incarnation = incarnation;
 	e->source.claim.identity = e->identity;
 	e->source.claim.database_incarnation = 5;
+	e->source.timeline = 1;
 	e->cut.thread_id = thread;
 	e->cut.timeline = 1;
 	e->cut.owner_incarnation = incarnation;
@@ -1030,6 +1092,8 @@ fixture(void)
 	census_bad_thread = 0;
 	census_redo_skew = 0;
 	census_history_count = 0;
+	census_input_fault = 0;
+	census_fault_index = 11;
 	census_begins = census_releases = history_scans = 0;
 	history_scan_index = 0;
 }

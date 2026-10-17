@@ -2453,10 +2453,94 @@ UT_TEST(test_tt_base_drift_refuses_pass_two_stickily)
 	cluster_cold_typed_destroy_v1(&typed);
 }
 
+UT_TEST(test_checkpoint_inputs_survive_census_for_every_generation)
+{
+	ClusterColdTypedV1 *typed;
+	ClusterControlRootSnapshot root;
+	ClusterWalRecoveryCheckpointV1 checkpoint;
+
+	fixture();
+	history_generation(2, 9, 0x40, 0x80);
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT_NULL(typed->inputs);
+	for (uint32 i = 0; i < typed->participant_count; i++) {
+		uint32 input = i < typed->replay_count ? i + 1 : 11;
+		UT_ASSERT(cluster_cold_typed_checkpoint_v1(typed, i, &root, &checkpoint));
+		UT_ASSERT_EQ(memcmp(&root, &census_inputs[input].checkpoint, sizeof(root)), 0);
+		UT_ASSERT_EQ(memcmp(&checkpoint.source, &typed->sources[i], sizeof(checkpoint.source)), 0);
+		UT_ASSERT_EQ(checkpoint.checkpoint_start, census_inputs[input].checkpoint_start);
+		UT_ASSERT_EQ(memcmp(&checkpoint.checkpoint, &census_inputs[input].native_checkpoint,
+							sizeof(checkpoint.checkpoint)),
+					 0);
+	}
+	/* A history cut still has no replay interval. Its actual checkpoint redo
+	 * is retained independently, with no access to the released census. */
+	memset(&census_inputs[11], 0xa5, sizeof(census_inputs[11]));
+	UT_ASSERT(cluster_cold_typed_checkpoint_v1(typed, 3, &root, &checkpoint));
+	UT_ASSERT_EQ(checkpoint.checkpoint.redo, 0x40);
+	UT_ASSERT_EQ(typed->participants[3].native_redo, 0x80);
+	UT_ASSERT_EQ(root.identity.origin_owner_incarnation, 9);
+	UT_ASSERT_EQ(typed->replay_root_count, 3);
+	cluster_cold_typed_destroy_v1(&typed);
+	UT_ASSERT_EQ(contexts_alive, 0);
+}
+
+UT_TEST(test_checkpoint_input_mismatch_stops_before_capture_and_scan)
+{
+	for (int fault = 1; fault <= 9; fault++) {
+		ClusterColdTypedV1 *typed;
+		fixture();
+		history_generation(2, 9, 0x40, 0x80);
+		census_input_fault = fault;
+		census_fault_index = fault == 7 ? 2 : 11;
+		typed = prepare(0x800);
+		UT_ASSERT_NE(typed->refusal, CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(typed->scanned_records, 0);
+		UT_ASSERT_EQ(tt_base_captures, 0);
+		UT_ASSERT_EQ(side_creates, 0);
+		cluster_cold_typed_destroy_v1(&typed);
+		UT_ASSERT_EQ(contexts_alive, 0);
+	}
+}
+
+UT_TEST(test_checkpoint_export_clears_unsealed_and_failed_output)
+{
+	ClusterColdTypedV1 *typed;
+	ClusterControlRootSnapshot root, zero_root = { 0 };
+	ClusterWalRecoveryCheckpointV1 checkpoint, zero_checkpoint = { 0 };
+	ClusterColdPlanV1 *plan;
+
+	fixture();
+	typed = prepare(0x800);
+	for (int fault = 0; fault < 5; fault++) {
+		memset(&root, 0xa5, sizeof(root));
+		memset(&checkpoint, 0xa5, sizeof(checkpoint));
+		if (fault == 4)
+			typed->refusal = CLUSTER_COLD_SOURCE_GAP;
+		UT_ASSERT(!cluster_cold_typed_checkpoint_v1(
+			fault == 0 ? NULL : typed, fault == 1 ? typed->participant_count : 0,
+			fault == 2 ? NULL : &root, fault == 3 ? NULL : &checkpoint));
+		if (fault != 2)
+			UT_ASSERT_EQ(memcmp(&root, &zero_root, sizeof(root)), 0);
+		if (fault != 3)
+			UT_ASSERT_EQ(memcmp(&checkpoint, &zero_checkpoint, sizeof(checkpoint)), 0);
+	}
+	typed->refusal = CLUSTER_COLD_OK;
+	plan = typed->plan;
+	typed->plan = NULL; /* unsealed state, no exported authority */
+	UT_ASSERT(!cluster_cold_typed_checkpoint_v1(typed, 0, &root, &checkpoint));
+	typed->plan = plan;
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
 int
 main(void)
 {
-	UT_PLAN(70);
+	UT_PLAN(73);
+	UT_RUN(test_checkpoint_inputs_survive_census_for_every_generation);
+	UT_RUN(test_checkpoint_input_mismatch_stops_before_capture_and_scan);
+	UT_RUN(test_checkpoint_export_clears_unsealed_and_failed_output);
 	UT_RUN(test_tt_base_capture_includes_history_before_wal_scan);
 	UT_RUN(test_tt_base_capture_failure_stops_before_side_and_scan);
 	UT_RUN(test_tt_base_drift_refuses_pass_two_stickily);

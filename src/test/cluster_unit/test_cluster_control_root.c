@@ -21992,6 +21992,9 @@ inputs_check_all_origins_exact_native_anchor(bool cold)
 													  &anchors[i].identity));
 		UT_ASSERT_EQ(item->native_redo, anchors[i].checkpoint_copy.redo);
 		UT_ASSERT_EQ(item->checkpoint_start, anchors[i].checkpoint);
+		UT_ASSERT_EQ(memcmp(&item->native_checkpoint, &anchors[i].checkpoint_copy,
+							sizeof(item->native_checkpoint)),
+					 0);
 		UT_ASSERT_EQ(memcmp(item->source.claim.claim_sha256, anchors[i].claim_sha256, 32), 0);
 	}
 	UT_ASSERT(cluster_wal_inputs_at_v1(inputs, 2) == NULL);
@@ -22375,6 +22378,9 @@ inputs_check_retained_generations_remain_distinct(bool cold)
 													&history.records[j].snapshot.identity)) {
 				seen[j] = true;
 				UT_ASSERT(!item->current);
+				UT_ASSERT_EQ(item->native_checkpoint.redo, item->native_redo);
+				UT_ASSERT_EQ(item->native_checkpoint.ThisTimeLineID,
+							 item->checkpoint.checkpoint_tli);
 				UT_ASSERT_EQ(memcmp(&item->checkpoint, &history.records[j].snapshot,
 									sizeof(item->checkpoint)),
 							 0);

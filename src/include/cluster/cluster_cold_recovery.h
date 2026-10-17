@@ -713,6 +713,8 @@ struct ClusterWalInputsV1;
 struct ClusterColdReplayRootV1;
 struct ClusterColdTtBaseV1;
 struct UndoSegmentHeaderData;
+struct ClusterControlRootSnapshot;
+struct ClusterWalRecoveryCheckpointV1;
 
 typedef struct ClusterColdTypedV1 {
 	MemoryContext context;
@@ -722,7 +724,9 @@ typedef struct ClusterColdTypedV1 {
 	uint32 participant_count;
 	uint32 replay_count; /* [0, replay_count): crashed; the rest history only */
 	uint32 own_participant;
-	struct ClusterColdReplayRootV1 *replay_roots; /* original pass-1 selection, not fresh roots */
+	/* Original checkpoints for all participants; only [0, replay_root_count)
+	 * have the original ROOT tokens permitting replay-source revalidation. */
+	struct ClusterColdReplayRootV1 *replay_roots;
 	uint32 replay_root_count;
 	struct ClusterColdTtBaseV1 *tt_base; /* raw original-owner input, no outcome authority */
 	bool source_drained[CLUSTER_COLD_MAX_PARTICIPANTS]; /* this pass-2 attempt only */
@@ -744,6 +748,13 @@ typedef struct ClusterColdTypedV1 {
 extern ClusterColdTypedV1 *cluster_cold_typed_prepare_v1(struct ClusterRecoveryFencePlan *fence,
 														 uint16 own_thread, XLogRecPtr own_redo);
 extern void cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed);
+
+/* Original native checkpoint input for any selected generation, including
+ * history. Copies only sealed input; failure clears both outputs. This does
+ * not establish TT era, checkpoint coverage, replay or loser authority. */
+extern bool cluster_cold_typed_checkpoint_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+											 struct ClusterControlRootSnapshot *out_root,
+											 struct ClusterWalRecoveryCheckpointV1 *out_checkpoint);
 
 /* Read-only TT base input owned by the original cold attempt. Every segment
  * address of every participant origin (including history) is inspected.

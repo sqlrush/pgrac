@@ -386,6 +386,7 @@ inputs_checkpoint(ClusterWalInputsV1 *inputs, const WalInputsWork *work,
 		return result;
 	item->checkpoint_start = native.checkPoint;
 	item->native_redo = native.checkPointCopy.redo;
+	memcpy(&item->native_checkpoint, &native.checkPointCopy, sizeof(item->native_checkpoint));
 	inputs->count++;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }

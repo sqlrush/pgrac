@@ -71,6 +71,7 @@ typedef struct ClusterColdReplayRootV1 {
 	ClusterControlRootReadToken token;
 	XLogRecPtr checkpoint_start;
 	CheckPoint native_checkpoint;
+	bool checkpoint_captured;
 } ColdRoot;
 
 static const char *
@@ -178,6 +179,7 @@ cold_participant(ClusterColdTypedV1 *typed, ColdRoot *root, uint32 index)
 	typed->sources[index] = selected.source;
 	root->checkpoint_start = selected.checkpoint_start;
 	memcpy(&root->native_checkpoint, &selected.checkpoint, sizeof(root->native_checkpoint));
+	root->checkpoint_captured = true;
 	memset(participant, 0, sizeof(*participant));
 	participant->thread_id = root->root.identity.origin_thread_id;
 	participant->timeline = root->root.checkpoint_tli;
@@ -335,8 +337,8 @@ cold_census_name(ClusterColdCensusDetailV1 detail)
 /* The census's crashed generations are exactly the roots already taken, with
  * the same cut; append its history-only generations as participants. */
 static bool
-cold_census_take(ClusterColdTypedV1 *typed, const ColdRoot *roots,
-				 const ClusterColdCensusEntryV1 *entries, uint32 count)
+cold_census_take(ClusterColdTypedV1 *typed, ColdRoot *roots, const ClusterWalInputV1 *const *inputs,
+				 uint32 input_count, const ClusterColdCensusEntryV1 *entries, uint32 count)
 {
 	uint32 crashed = typed->participant_count;
 	uint32 i;
@@ -344,13 +346,43 @@ cold_census_take(ClusterColdTypedV1 *typed, const ColdRoot *roots,
 
 	for (i = 0; i < count; i++) {
 		const ClusterColdCensusEntryV1 *entry = &entries[i];
+		const ClusterWalInputV1 *input
+			= entry->input_index < input_count ? inputs[entry->input_index] : NULL;
+
+		/* Preserve the complete checkpoint read by the original retained-WAL
+		 * owner, before its scope is released. A history cut intentionally has
+		 * native_redo == tail; its checkpoint's actual redo is a separate input. */
+		if (input == NULL || input->kind != CLUSTER_WAL_INPUT_CHECKPOINT
+			|| !cluster_control_root_identity_equal(&input->checkpoint.identity, &entry->identity)
+			|| !cluster_control_root_identity_equal(&input->source.claim.identity, &entry->identity)
+			|| memcmp(&input->source, &entry->source, sizeof(input->source)) != 0
+			|| input->source.timeline != entry->cut.timeline
+			|| input->checkpoint.checkpoint_tli != entry->cut.timeline
+			|| input->checkpoint.checkpoint_lower_lsn != entry->cut.physical_lower
+			|| input->checkpoint.validated_tail_lsn_exclusive != entry->cut.tail_end
+			|| XLogRecPtrIsInvalid(input->checkpoint_start)
+			|| input->native_checkpoint.ThisTimeLineID != entry->cut.timeline
+			|| input->native_checkpoint.redo != input->native_redo
+			|| input->native_redo < entry->cut.physical_lower
+			|| input->native_redo > entry->cut.tail_end) {
+			cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+						"thread %u census native checkpoint input differs from its selected source",
+						(unsigned)entry->cut.thread_id);
+			return false;
+		}
 
 		if (entry->role == CLUSTER_COLD_CENSUS_REPLAY) {
 			for (k = 0; k < crashed; k++)
 				if (cluster_control_root_identity_equal(&roots[k].root.identity, &entry->identity))
 					break;
 			if (k == crashed
-				|| memcmp(&typed->participants[k], &entry->cut, sizeof(entry->cut)) != 0) {
+				|| memcmp(&typed->participants[k], &entry->cut, sizeof(entry->cut)) != 0
+				|| memcmp(&roots[k].root, &input->checkpoint, sizeof(input->checkpoint)) != 0
+				|| memcmp(&typed->sources[k], &input->source, sizeof(input->source)) != 0
+				|| roots[k].checkpoint_start != input->checkpoint_start
+				|| memcmp(&roots[k].native_checkpoint, &input->native_checkpoint,
+						  sizeof(input->native_checkpoint))
+					   != 0) {
 				cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
 							"thread %u census cut differs from its ROOT source (native redo %X/%X)",
 							(unsigned)entry->cut.thread_id,
@@ -367,6 +399,11 @@ cold_census_take(ClusterColdTypedV1 *typed, const ColdRoot *roots,
 		typed->participants[typed->participant_count] = entry->cut;
 		typed->sources[typed->participant_count] = entry->source;
 		typed->input_index[typed->participant_count] = entry->input_index;
+		roots[typed->participant_count].root = input->checkpoint;
+		roots[typed->participant_count].checkpoint_start = input->checkpoint_start;
+		memcpy(&roots[typed->participant_count].native_checkpoint, &input->native_checkpoint,
+			   sizeof(input->native_checkpoint));
+		roots[typed->participant_count].checkpoint_captured = true;
 		typed->participant_count++;
 	}
 	return true;
@@ -375,7 +412,7 @@ cold_census_take(ClusterColdTypedV1 *typed, const ColdRoot *roots,
 /* Complete participant census: every generation with retained WAL under one
  * cold read scope, held until pass 1 has scanned the history-only ones. */
 static bool
-cold_census(ClusterColdTypedV1 *typed, const ColdRoot *roots)
+cold_census(ClusterColdTypedV1 *typed, ColdRoot *roots)
 {
 	const ClusterControlRootIdentity *own = &roots[0].root.identity;
 	const ClusterWalInputV1 **inputs;
@@ -416,7 +453,7 @@ cold_census(ClusterColdTypedV1 *typed, const ColdRoot *roots)
 					"participant census refused: %s (input %u, thread %u)",
 					cold_census_name(detail), bad, (unsigned)thread);
 	else
-		taken = cold_census_take(typed, roots, entries, kept);
+		taken = cold_census_take(typed, roots, inputs, count, entries, kept);
 	pfree(crashed);
 	pfree(entries);
 	pfree(inputs);
@@ -683,6 +720,35 @@ cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed_address)
 	if (typed->replay_roots != NULL)
 		pfree(typed->replay_roots);
 	MemoryContextDelete(typed->context);
+}
+
+bool
+cluster_cold_typed_checkpoint_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+								 ClusterControlRootSnapshot *out_root,
+								 ClusterWalRecoveryCheckpointV1 *out_checkpoint)
+{
+	const ColdRoot *selected;
+
+	if (out_root != NULL)
+		memset(out_root, 0, sizeof(*out_root));
+	if (out_checkpoint != NULL)
+		memset(out_checkpoint, 0, sizeof(*out_checkpoint));
+	if (out_root == NULL || out_checkpoint == NULL || typed == NULL
+		|| typed->refusal != CLUSTER_COLD_OK || typed->plan == NULL || typed->replay_roots == NULL
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| participant >= typed->participant_count)
+		return false;
+	selected = &typed->replay_roots[participant];
+	if (!selected->checkpoint_captured
+		|| !cluster_control_root_identity_equal(&selected->root.identity,
+												&typed->sources[participant].claim.identity))
+		return false;
+	*out_root = selected->root;
+	out_checkpoint->source = typed->sources[participant];
+	out_checkpoint->checkpoint_start = selected->checkpoint_start;
+	memcpy(&out_checkpoint->checkpoint, &selected->native_checkpoint,
+		   sizeof(out_checkpoint->checkpoint));
+	return true;
 }
 
 /* Re-select through each original ROOT token, never through a newer root. */

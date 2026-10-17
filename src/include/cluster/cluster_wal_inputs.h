@@ -20,6 +20,7 @@ typedef struct ClusterWalInputV1 {
 	ClusterControlRootSnapshot checkpoint;
 	XLogRecPtr checkpoint_start;
 	XLogRecPtr native_redo;
+	CheckPoint native_checkpoint; /* complete original immutable-anchor input */
 	/* Only the terminal alternative uses these fields. It has no checkpoint. */
 	XLogRecPtr first_segment;
 	ClusterWalStartupObservation terminal;
