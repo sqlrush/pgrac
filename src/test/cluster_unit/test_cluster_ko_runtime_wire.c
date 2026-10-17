@@ -520,10 +520,42 @@ UT_TEST(test_committed_closure_capacity_and_finite_owner_never_become_empty)
 	}
 }
 
+UT_TEST(test_committed_local_pi_uses_discard_consumer_but_keeps_writeback_gate)
+{
+	ClusterKoSharedMessageV4 request = committed_peer(1500);
+
+	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_PENDING;
+	local_pi_only_pending = true;
+	local_writeback_closed = false;
+	receive_committed(&request, 0);
+	fixture_peer_drain();
+	UT_ASSERT_EQ(local_discard_calls, 1);
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_ACTIVE);
+	UT_ASSERT_EQ(storage.send_v3_count, 0);
+	local_writeback_closed = true;
+	fixture_peer_drain();
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
+	UT_ASSERT_EQ(storage.send_v3_count, 1);
+	UT_ASSERT_EQ(flush_count + sync_count + drop_count + space_reads, 0);
+}
+
+UT_TEST(test_live_object_never_uses_committed_local_pi_discard)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(1501);
+
+	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_PENDING;
+	local_pi_only_pending = true;
+	enqueue_shared_v3(&request);
+	fixture_peer_drain();
+	UT_ASSERT_EQ(local_discard_calls, 0);
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_ACTIVE);
+	UT_ASSERT_EQ(storage.send_v3_count, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(22);
 	UT_RUN(test_committed_request_registers_exact_version_without_legacy_physical_work);
 	UT_RUN(test_committed_retransmit_keeps_one_owner_and_rejects_legacy_same_key);
 	UT_RUN(test_legacy_owner_cannot_be_reinterpreted_as_committed);
@@ -544,6 +576,8 @@ main(void)
 	UT_RUN(test_rewrite_old_uses_committed_identity_and_old_wire_cannot_claim_it);
 	UT_RUN(test_committed_gc_requires_accepted_ready_and_keeps_negative_identity);
 	UT_RUN(test_committed_closure_capacity_and_finite_owner_never_become_empty);
+	UT_RUN(test_committed_local_pi_uses_discard_consumer_but_keeps_writeback_gate);
+	UT_RUN(test_live_object_never_uses_committed_local_pi_discard);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -325,10 +325,239 @@ UT_TEST(test_dead_local_pi_keeps_inflight_current_and_reference_gates)
 	}
 }
 
+/* Mutation under the entry lock must move only the two exact local refs;
+ * the master entry and independent directory requests survive. */
+UT_TEST(test_local_drop_discard_preserves_remote_master_obligation)
+{
+	BufferTag tag = make_tag(7500);
+	ResourceXDecodedFrame assertion;
+	ResourceXMasterSnapshot before_master, after_master;
+	struct StopPcmEntryLayout before, expected;
+	uint32 cursor = 0;
+
+	cluster_node_id = 0;
+	(void)drop_local_fixture(tag);
+	pg_atomic_write_u32(&directory_entry(tag)->pi_holders_bitmap, 5);
+	directory_entry(tag)->pi_watermark_lsn = 200;
+	directory_entry(tag)->pi_watermark_scn = 90;
+	assertion = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X, tag, 2, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&assertion, 2, &before_master),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(before_master.phase, RESOURCE_X_MASTER_WAIT_PROOF);
+	before = *directory_entry(tag);
+	UT_ASSERT_EQ(cluster_pcm_lock_ko_local_relation_scan_v3(object_drop_locator, 17, 128, &cursor),
+		CLUSTER_PCM_PI_RELATION_PENDING);
+	UT_ASSERT_EQ(memcmp(directory_entry(tag), &before, sizeof(before)), 0);
+	cursor = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_ko_local_relation_discard_v4(object_drop_locator, 17, 128, &cursor),
+		CLUSTER_PCM_PI_RELATION_EMPTY);
+	expected = before;
+	memset(&expected.local_pi_first, 0, sizeof(expected.local_pi_first));
+	memset(&expected.local_pi_last, 0, sizeof(expected.local_pi_last));
+	expected.local_pi_revision++;
+	UT_ASSERT_NOT_NULL(directory_entry(tag));
+	UT_ASSERT_EQ(memcmp(directory_entry(tag), &expected, sizeof(expected)), 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
+		&assertion.common.logical_assertion, &after_master), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(memcmp(&before_master, &after_master, sizeof(before_master)), 0);
+	cursor = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_ko_directory_relation_scan_v3(object_drop_locator, 17, 128, &cursor),
+		CLUSTER_PCM_PI_RELATION_PENDING);
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+}
+
+UT_TEST(test_local_drop_discard_releases_exact_sources_once)
+{
+	BufferTag tag = make_tag(7501);
+	ClusterPageWalBindingV1 binding, other, observed;
+	ClusterPageWalRefV1 retained = { 0 }, next = { 0 }, reused = { 0 };
+	uint16 source_slot;
+	uint64 revision;
+	uint32 cursor = 0;
+
+	cluster_node_id = 0;
+	binding = drop_local_fixture(tag);
+	UT_ASSERT(cluster_page_wal_ref_retain_v1(&binding, &retained));
+	source_slot = retained.source_flags & UINT16_C(0x7fff);
+	revision = directory_entry(tag)->local_pi_revision;
+	UT_ASSERT_EQ(cluster_pcm_lock_ko_local_relation_discard_v4(object_drop_locator, 17, 128, &cursor),
+		CLUSTER_PCM_PI_RELATION_EMPTY);
+	UT_ASSERT_EQ(directory_entry(tag)->local_pi_revision, revision + 1);
+	UT_ASSERT(cluster_page_wal_ref_read_v1(&retained, binding.identity.locator,
+		tag.forkNum, tag.blockNum, &observed));
+	UT_ASSERT_EQ(memcmp(&observed, &binding, sizeof(binding)), 0);
+	other = binding;
+	other.source.claim.identity.origin_owner_incarnation++;
+	UT_ASSERT(cluster_page_wal_ref_retain_v1(&other, &next));
+	UT_ASSERT((next.source_flags & UINT16_C(0x7fff)) != source_slot);
+	UT_ASSERT(cluster_page_wal_ref_release_v1(&retained));
+	other.source.claim.identity.origin_owner_incarnation++;
+	UT_ASSERT(cluster_page_wal_ref_retain_v1(&other, &reused));
+	UT_ASSERT_EQ(reused.source_flags & UINT16_C(0x7fff), source_slot);
+	cursor = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_ko_local_relation_discard_v4(object_drop_locator, 17, 128, &cursor),
+		CLUSTER_PCM_PI_RELATION_EMPTY);
+	UT_ASSERT_EQ(directory_entry(tag)->local_pi_revision, revision + 1);
+	UT_ASSERT(cluster_page_wal_ref_release_v1(&next));
+	UT_ASSERT(cluster_page_wal_ref_release_v1(&reused));
+}
+
+UT_TEST(test_local_drop_discard_rejects_unknown_identity_refs_and_cut)
+{
+	for (unsigned fault = 0; fault < 16; fault++) {
+		BufferTag tag = make_tag(7510 + fault);
+		struct StopPcmEntryLayout *entry, before;
+		RelFileLocator locator;
+		uint64 formation = 17;
+		uint32 cursor = 0, budget = 128;
+
+		cluster_node_id = 0;
+		(void)drop_local_fixture(tag);
+		entry = directory_entry(tag);
+		locator = object_drop_locator;
+		switch (fault) {
+		case 0: object_drop_retired = false; break;
+		case 1: locator.relNumber++; break;
+		case 2: entry->local_pi_first.source_flags = 0; break;
+		case 3: entry->local_pi_last.source_flags = 0; break;
+		case 4: entry->local_pi_first.source_flags = UINT16_MAX; break;
+		case 5: entry->local_pi_last.end = entry->local_pi_last.start; break;
+		case 6: entry->local_pi_first.token = 0; break;
+		case 7: entry->local_pi_last.source_flags &= UINT16_C(0x7fff); break;
+		case 8: entry->local_pi_revision = 0; break;
+		case 9: entry->local_pi_revision = UINT64_MAX; break;
+		case 10: entry->local_pi_revision = UINT64_MAX - 1; break;
+		case 11: memset(entry->local_pi_first.incarnation, 0, 16); break;
+		case 12: formation++; break;
+		case 13: budget = 0; break;
+		case 14: budget = 129; break;
+		case 15: entry->local_pi_first.source_flags = entry->local_pi_last.source_flags = 0; break;
+		}
+		before = *entry;
+		UT_ASSERT_EQ(cluster_pcm_lock_ko_local_relation_discard_v4(locator, formation, budget, &cursor),
+			CLUSTER_PCM_PI_RELATION_INVALID);
+		UT_ASSERT_EQ(memcmp(entry, &before, sizeof(before)), 0);
+		UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	}
+}
+
+UT_TEST(test_local_drop_discard_keeps_current_and_inflight_local_owners)
+{
+	for (unsigned fault = 0; fault < 8; fault++) {
+		BufferTag tag = make_tag(7540 + fault);
+		struct StopPcmEntryLayout *entry, before;
+		ResourceXDecodedFrame assertion;
+		ResourceXMasterSnapshot snapshot;
+		uint32 cursor = 0;
+
+		cluster_node_id = 0;
+		(void)drop_local_fixture(tag);
+		entry = directory_entry(tag);
+		switch (fault) {
+		case 0: pg_atomic_write_u32(&entry->pin_count, 1); break;
+		case 1: pg_atomic_write_u32(&entry->wait_refcount, 1); break;
+		case 2: pg_atomic_write_u32(&entry->transport_refcount, 1); break;
+		case 3: entry->s_holder_refcount_local = 1; break;
+		case 4: pg_atomic_write_u32(&entry->master_state, PCM_STATE_X); break;
+		case 5: entry->pending_x_requester_node = 0; break;
+		case 6: entry->resource_x_formation = 18; break;
+		case 7:
+			assertion = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X, tag, 0, 0);
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&assertion, 0, &snapshot),
+				RESOURCE_X_APPLY_APPLIED);
+			break;
+		}
+		before = *entry;
+		UT_ASSERT(cluster_pcm_lock_ko_local_relation_discard_v4(object_drop_locator, 17, 128, &cursor)
+			!= CLUSTER_PCM_PI_RELATION_EMPTY);
+		UT_ASSERT_EQ(memcmp(entry, &before, sizeof(before)), 0);
+		UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	}
+}
+
+UT_TEST(test_local_drop_discard_is_bounded_and_leaves_other_locator)
+{
+	BufferTag tag = make_tag(7560), sibling = tag, other = tag;
+	ClusterPageWalBindingV1 binding, next;
+	ClusterPcmLocalPiSnapshotV1 untouched, after;
+	struct StopPcmEntryLayout *first, *second;
+	uint32 first_slot;
+	uint32 cursor = 0;
+
+	cluster_node_id = 0;
+	binding = drop_local_fixture(tag);
+	sibling.forkNum = VISIBILITYMAP_FORKNUM;
+	next = binding;
+	next.identity.forknum = sibling.forkNum;
+	UT_ASSERT(cluster_pcm_local_pi_record_v1(sibling, &next));
+	other.relNumber++;
+	next = binding;
+	next.identity.locator = BufTagGetRelFileLocator(&other);
+	UT_ASSERT(cluster_pcm_local_pi_record_v1(other, &next));
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(other, &untouched));
+	/* Registry placement is hashed, not insertion ordered. Select the first
+	 * matching slot so one-slot work must leave the other reference intact. */
+	first = directory_entry(tag);
+	second = directory_entry(sibling);
+	if (first->registry_slot > second->registry_slot) {
+		first = directory_entry(sibling);
+		second = directory_entry(tag);
+	}
+	first_slot = first->registry_slot;
+	cursor = first_slot;
+	UT_ASSERT_EQ(cluster_pcm_lock_ko_local_relation_discard_v4(object_drop_locator, 17, 1, &cursor),
+		CLUSTER_PCM_PI_RELATION_MORE);
+	UT_ASSERT_EQ(cursor, first_slot + 1);
+	UT_ASSERT_EQ(first->local_pi_first.source_flags, 0);
+	UT_ASSERT(second->local_pi_first.source_flags != 0);
+	cursor = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_ko_local_relation_discard_v4(object_drop_locator, 17, 128, &cursor),
+		CLUSTER_PCM_PI_RELATION_EMPTY);
+	UT_ASSERT_EQ(directory_entry(tag)->local_pi_first.source_flags, 0);
+	UT_ASSERT_EQ(directory_entry(sibling)->local_pi_first.source_flags, 0);
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(other, &after));
+	UT_ASSERT_EQ(memcmp(&untouched, &after, sizeof(after)), 0);
+}
+
+static void
+close_discard_gate(void)
+{
+	ResourceXGateSnapshot gate;
+	UT_ASSERT(cluster_pcm_lock_resource_x_gate_snapshot(&gate));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_fail_closed_exact(&gate),
+		RESOURCE_X_APPLY_APPLIED);
+}
+
+UT_TEST(test_local_drop_discard_rechecks_binding_and_gate_after_entry_lock)
+{
+	BufferTag tag = make_tag(7561);
+	struct StopPcmEntryLayout before;
+	uint32 cursor = 0;
+
+	cluster_node_id = 0;
+	(void)drop_local_fixture(tag);
+	before = *directory_entry(tag);
+	changed_tag = tag;
+	object_entry_lock_hook = change_entry_generation;
+	UT_ASSERT_EQ(cluster_pcm_lock_ko_local_relation_discard_v4(object_drop_locator, 17, 128, &cursor),
+		CLUSTER_PCM_PI_RELATION_INVALID);
+	before.binding_generation++;
+	UT_ASSERT_EQ(memcmp(directory_entry(tag), &before, sizeof(before)), 0);
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	(void)drop_local_fixture(tag);
+	before = *directory_entry(tag);
+	cursor = 0;
+	object_entry_lock_hook = close_discard_gate;
+	UT_ASSERT_EQ(cluster_pcm_lock_ko_local_relation_discard_v4(object_drop_locator, 17, 128, &cursor),
+		CLUSTER_PCM_PI_RELATION_INVALID);
+	UT_ASSERT_EQ(memcmp(directory_entry(tag), &before, sizeof(before)), 0);
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(21);
 	UT_RUN(test_terminal_drop_ends_directory_pi_without_data_or_ack);
 	UT_RUN(test_original_bounded_reclaim_retires_terminal_watermark_and_pi);
 	UT_RUN(test_unproven_or_wrong_object_keeps_original_debt);
@@ -345,6 +574,12 @@ main(void)
 	UT_RUN(test_local_pi_retirement_requires_exact_responsibility_and_physical_ack);
 	UT_RUN(test_local_structural_retirement_preserves_concurrent_responsibility);
 	UT_RUN(test_local_pi_keeps_first_and_latest_across_master_changes);
+	UT_RUN(test_local_drop_discard_preserves_remote_master_obligation);
+	UT_RUN(test_local_drop_discard_releases_exact_sources_once);
+	UT_RUN(test_local_drop_discard_rejects_unknown_identity_refs_and_cut);
+	UT_RUN(test_local_drop_discard_keeps_current_and_inflight_local_owners);
+	UT_RUN(test_local_drop_discard_is_bounded_and_leaves_other_locator);
+	UT_RUN(test_local_drop_discard_rechecks_binding_and_gate_after_entry_lock);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

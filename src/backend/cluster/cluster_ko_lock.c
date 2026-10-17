@@ -3183,8 +3183,11 @@ ko_peer_fence_local_scan_v3(const ClusterKoPeerFenceV3 *before,
 	 * cleared without taking the KO lock from an unwinding directory stack.
 	 * Only the fully revalidated return below publishes a new hint. */
 	ko_peer_fence_scan_reset_v3(handle);
-	scan = cluster_pcm_lock_ko_local_relation_scan_v3(before->request.base.key.locator,
-													  gate.formation, 128, &cursor);
+	scan = before->committed_discard
+		? cluster_pcm_lock_ko_local_relation_discard_v4(before->request.base.key.locator,
+			gate.formation, 128, &cursor)
+		: cluster_pcm_lock_ko_local_relation_scan_v3(before->request.base.key.locator,
+			gate.formation, 128, &cursor);
 	if (scan == CLUSTER_PCM_PI_RELATION_EMPTY
 		&& !cluster_pi_writeback_local_relation_closed_v3(
 			before->request.base.key.locator, before->request.base.epoch, &writeback_revision))

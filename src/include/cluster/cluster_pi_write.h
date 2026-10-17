@@ -393,6 +393,13 @@ extern ClusterPcmPiRelationScanV2 cluster_pcm_lock_ko_local_relation_scan_v3(Rel
 																			 uint64 formation,
 																			 uint32 budget,
 																			 uint32 *cursor);
+/* Committed old-object consumer, not a read-only census. Requires the
+ * immutable I/O-retired identity; releases only exact local PI references
+ * when all other local owners are closed. Master responsibility is retained.
+ * The caller still supplies physical closure and the full READY conjunction. */
+extern ClusterPcmPiRelationScanV2
+cluster_pcm_lock_ko_local_relation_discard_v4(RelFileLocator locator, uint64 formation,
+											  uint32 budget, uint32 *cursor);
 extern ClusterPcmPiRelationScanV2
 cluster_pcm_lock_ko_local_relation_scan_v3_identity(RelFileLocator locator, uint64 formation,
 																											 uint32 budget, uint32 *cursor,

@@ -307,6 +307,8 @@ static uint64 relation_gate_formation;
 static bool relation_gate_ok;
 static ClusterPcmPiRelationScanV2 local_relation_scan_result;
 static uint32 local_relation_scan_calls, local_relation_scan_advance;
+static uint32 local_discard_calls;
+static bool local_pi_only_pending;
 static RelFileNumber local_scan_rel_number = 99;
 static bool local_writeback_closed;
 static uint64 local_writeback_revision;
@@ -367,6 +369,22 @@ cluster_pcm_lock_ko_local_relation_scan_v3(RelFileLocator locator, uint64 epoch,
 	if (local_relation_scan_drift == 5)
 		relation_gate_formation++;
 	return local_relation_scan_result;
+}
+
+/* The actual PCM reference consumer is exercised by its linked PCM fixture. */
+ClusterPcmPiRelationScanV2 cluster_pcm_lock_ko_local_relation_discard_v4(
+	RelFileLocator locator, uint64 formation, uint32 budget, uint32 *cursor);
+ClusterPcmPiRelationScanV2
+cluster_pcm_lock_ko_local_relation_discard_v4(RelFileLocator locator, uint64 formation,
+											  uint32 budget, uint32 *cursor)
+{
+	ClusterPcmPiRelationScanV2 result;
+
+	local_discard_calls++;
+	UT_ASSERT(cluster_ko_directory_drop_retired_v3(locator));
+	result = cluster_pcm_lock_ko_local_relation_scan_v3(locator, formation, budget, cursor);
+	return local_pi_only_pending && result == CLUSTER_PCM_PI_RELATION_PENDING
+		? CLUSTER_PCM_PI_RELATION_EMPTY : result;
 }
 
 ClusterPcmPiRelationScanV2
@@ -1425,6 +1443,8 @@ reset_test(void)
 	local_writeback_closed = true;
 	local_writeback_revision = 1;
 	local_relation_scan_calls = local_relation_scan_advance = 0;
+	local_discard_calls = 0;
+	local_pi_only_pending = false;
 	local_relation_scan_input = local_relation_scan_drift = 0;
 	relation_gate_sample_hook = NULL;
 	local_writeback_sample_hook = NULL;
