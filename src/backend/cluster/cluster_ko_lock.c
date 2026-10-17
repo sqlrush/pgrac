@@ -376,6 +376,8 @@ struct ClusterKoCompletionV2 {
 	 * releasing the transport slot before the next relation's barrier. */
 	bool barrier_private;
 	bool barrier_v3;
+	/* Immutable protocol purpose, independent of physical completion. */
+	bool barrier_committed_discard;
 	uint16 barrier_ready_peers;
 	uint32 drop_identity;
 	uint64 drop_identity_serial;
@@ -1291,6 +1293,7 @@ ko_origin_drop_identity_locked(const ClusterKoSharedContext *context)
 	identity = &ko_state->drop_identities[context->drop_identity - 1];
 	if (identity->state < KO_DROP_IDENTITY_RESERVED || identity->state > KO_DROP_IDENTITY_RETIRED
 		|| identity->fence_serial != context->drop_identity_serial
+		|| identity->committed_discard != context->committed_discard
 		|| memcmp(&identity->request, &context->request_v3, sizeof(identity->request)) != 0)
 		return NULL;
 	return identity;
@@ -3682,11 +3685,13 @@ ko_shared_origin_current(const ClusterKoSharedContext *context)
 	ClusterWalSourceRef ref;
 	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], generation;
 
-	if (context == NULL)
+	if (context == NULL || (context->committed_discard && !context->v3))
 		return false;
 	m = context->v3 ? &context->request_v3.base : &context->request;
 	current = *m;
-	if (context->v3 && !ko_shared_v3_control_current(&context->request_v3))
+	if (context->v3
+		&& !ko_shared_object_control_at_generation(&context->request_v3,
+			context->request_v3.ax_master_generation, context->committed_discard))
 		return false;
 	return cluster_enabled && cluster_shared_config && !RecoveryInProgress()
 		   && cluster_node_id == m->origin_node && cluster_wal_thread_current_v2_ref(&ref)
@@ -3928,6 +3933,7 @@ ko_completion_snapshot(const ClusterKoCompletionV2 *completion, ClusterKoSharedC
 	const ClusterKoCompletionV2 *owned = *ko_completion_link(completion);
 	if (owned == NULL || owned->native_handed_off || owned->pid != MyProcPid
 		|| !ko_completion_owner_current(owned) || CurrentResourceOwner == NULL
+		|| (owned->barrier_committed_discard && !owned->barrier_v3)
 		|| CritSectionCount != 0 || ko_state == NULL)
 		return false;
 	if (owned->barrier_private) {
@@ -3945,6 +3951,7 @@ ko_completion_snapshot(const ClusterKoCompletionV2 *completion, ClusterKoSharedC
 		out->drop_identity = owned->drop_identity;
 		out->drop_identity_serial = owned->drop_identity_serial;
 		out->v3 = owned->barrier_v3;
+		out->committed_discard = owned->barrier_committed_discard;
 		out->origin_checkpoint = out->origin_data_closed = owned->origin_data_closed;
 		out->request = owned->barrier_v3 ? owned->barrier_request_v3.base
 											: owned->barrier_request;
@@ -3980,6 +3987,7 @@ ko_native_barrier_to_owner(ClusterKoCompletionV2 *completion)
 	SpinLockAcquire(&ko_state->shared_lock);
 	if (memcmp(&ko_state->contexts[completion->slot], &before, sizeof(before)) == 0) {
 		completion->barrier_v3 = before.v3;
+		completion->barrier_committed_discard = before.committed_discard;
 		completion->barrier_request = before.request;
 		if (before.v3) {
 			completion->barrier_request_v3 = before.request_v3;
@@ -4766,14 +4774,17 @@ cluster_ko_shared_structure_handoff_v2(ClusterKoCompletionV2 **completion)
 /* A native carrier keeps its original protocol version throughout handoff
  * and background execution. One version's capabilities cannot admit another. */
 static bool
-ko_native_capable(bool v3)
+ko_native_capable(bool v3, bool committed_discard)
 {
 	uint32 capabilities = cluster_ic_local_capability_word();
 	uint32 required = v3
-		? PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3 | PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1
+		? PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1
+		  | (committed_discard ? PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1
+							   : PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3)
 		: PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
 
-	return (!v3 || cluster_interconnect_tier == CLUSTER_IC_TIER_1)
+	return (!committed_discard || v3)
+		&& (!v3 || cluster_interconnect_tier == CLUSTER_IC_TIER_1)
 		&& (capabilities & required) == required;
 }
 
@@ -4799,6 +4810,7 @@ ko_native_publish_registration(ClusterKoCompletionV2 *owned)
 	SpinLockAcquire(&ko_state->shared_lock);
 	origin = &ko_state->contexts[owned->slot];
 	if (origin->used && origin->v3 && !origin->complete && !origin->committed_drain_pending
+		&& origin->committed_discard == owned->barrier_committed_discard
 		&& !origin->origin_detached && !origin->ax_release_requested && !origin->ax_failed
 		&& !origin->structure_owned && origin->cancel_sqlerrcode == 0
 		&& origin->pid == owned->pid && origin->serial == owned->serial
@@ -4845,6 +4857,7 @@ ko_native_publish(ClusterKoCompletionV2 *owned, bool from_commit_tail)
 		return false;
 	if (owned == NULL || owned->pid != MyProcPid || owned->owner != TopTransactionResourceOwner
 		|| !owned->native_transaction || owned->native_pending
+		|| (owned->barrier_committed_discard && !owned->barrier_v3)
 		|| owned->native_handed_off || !owned->postcommit || owned->serial == 0
 		|| owned->native_reserved == NULL || !DsaPointerIsValid(owned->native_allocation))
 		return false;
@@ -4869,6 +4882,7 @@ ko_native_publish(ClusterKoCompletionV2 *owned, bool from_commit_tail)
 	work->context.drop_identity = owned->drop_identity;
 	work->context.drop_identity_serial = owned->drop_identity_serial;
 	work->context.v3 = owned->barrier_v3;
+	work->context.committed_discard = owned->barrier_committed_discard;
 	work->context.origin_checkpoint = work->context.origin_data_closed = owned->origin_data_closed;
 	work->context.request = owned->barrier_v3 ? owned->barrier_request_v3.base
 											: owned->barrier_request;
@@ -4901,6 +4915,7 @@ ko_native_publish(ClusterKoCompletionV2 *owned, bool from_commit_tail)
 		KoDropIdentity *identity = ko_origin_drop_identity_locked(&work->context);
 
 		if (origin == NULL || !origin->used || origin->serial != owned->serial
+			|| !origin->v3 || origin->committed_discard != owned->barrier_committed_discard
 			|| origin->pid != owned->pid || origin->drop_identity != owned->drop_identity
 			|| origin->drop_identity_serial != owned->drop_identity_serial
 			|| identity == NULL || identity->state != KO_DROP_IDENTITY_RESERVED) {
@@ -4956,7 +4971,7 @@ cluster_ko_shared_native_commit_v2(void)
 		return;
 	for (ClusterKoCompletionV2 *owned = ko_completions; owned != NULL; owned = owned->next) {
 		if (!owned->native_transaction || owned->native_pending || owned->native_handed_off
-			|| (!ko_native_capable(owned->barrier_v3)
+			|| (!ko_native_capable(owned->barrier_v3, owned->barrier_committed_discard)
 				&& !(owned->barrier_v3 && !owned->barrier_private)))
 			continue;
 		/* The original claimed identity and allocation must survive this
@@ -4988,6 +5003,7 @@ ko_native_registration_published(ClusterKoCompletionV2 *owned,
 		&& owned->barrier_ready_peers == 0 && !work->recovery_required
 		&& !work->buffers_released && !work->predelete_ready
 		&& before->used && before->v3 && before->committed_drain_pending
+		&& before->committed_discard == owned->barrier_committed_discard
 		&& !before->complete && !before->origin_detached && !before->ax_release_requested
 		&& !before->ax_failed && !before->structure_owned && before->cancel_sqlerrcode == 0
 		&& before->pid == owned->pid && before->serial == owned->serial
@@ -5059,6 +5075,7 @@ cluster_ko_shared_native_publication_v3(void)
 			continue;
 		qualified = qualified && owned->space_observed && before.used && before.complete
 			&& before.v3 && before.structure_owned && before.structure_drop_pending
+			&& before.committed_discard == owned->barrier_committed_discard
 			&& before.pid == owned->pid && before.serial == owned->serial
 			&& before.drop_identity == owned->drop_identity
 			&& before.drop_identity_serial == owned->drop_identity_serial
@@ -5123,6 +5140,7 @@ cluster_ko_shared_native_drop_buffers_released_v2(RelFileLocator locator)
 		SpinLockAcquire(&ko_state->shared_lock);
 		if (work->context.pid == owned->pid && work->context.serial == owned->serial
 			&& work->predelete_ready
+			&& work->context.committed_discard == owned->barrier_committed_discard
 			&& memcmp(&work->context.terminal, &owned->terminal, sizeof(owned->terminal)) == 0
 			&& memcmp(work->context.structure, owned->structure, sizeof(owned->structure)) == 0) {
 			owned->native_unready = InvalidDsaPointer;
@@ -5168,6 +5186,7 @@ cluster_ko_shared_native_prepare_drop_v2(RelFileLocator locator)
 		buffers_released = work->buffers_released;
 		SpinLockRelease(&ko_state->shared_lock);
 		if (before.pid != owned->pid || before.serial != owned->serial
+			|| before.committed_discard != owned->barrier_committed_discard
 			|| before.drop_identity != owned->drop_identity
 			|| before.drop_identity_serial != owned->drop_identity_serial
 			|| !before.used || !before.complete || !before.v3 || !before.origin_data_closed
@@ -5212,7 +5231,7 @@ static void
 ko_native_deferred(const ClusterKoSharedContext *context, uint64 *reported, const char *stage)
 {
 	if (!context->used || context->serial == 0
-		|| !ko_native_capable(context->v3))
+		|| !ko_native_capable(context->v3, context->committed_discard))
 		return;
 	KO_BUMP(failclosed_count);
 	if (*reported != context->serial) {
@@ -5264,7 +5283,7 @@ cluster_ko_shared_native_promote_v2(void)
 	failed = work->recovery_required;
 	buffers_released = work->buffers_released;
 	SpinLockRelease(&ko_state->shared_lock);
-	capable = ko_native_capable(before.v3);
+	capable = ko_native_capable(before.v3, before.committed_discard);
 	if (capable && (failed || (!before.committed_drain_pending
 		&& (!ko_shared_origin_current(&before)
 			|| !cluster_wal_thread_current_v2_ref(&current)
@@ -5321,7 +5340,8 @@ cluster_ko_shared_native_poll_v2(void)
 
 	if (ko_state == NULL || !cluster_enabled || !cluster_shared_config
 		|| MyBackendType != B_CHECKPOINTER || CurrentResourceOwner == NULL || CritSectionCount != 0
-		|| (!ko_native_capable(false) && !ko_native_capable(true)))
+		|| (!ko_native_capable(false, false) && !ko_native_capable(true, false)
+			&& !ko_native_capable(true, true)))
 		return false;
 	progress = cluster_ko_shared_native_promote_v2() == CLUSTER_KO_STRUCTURE_PROGRESS;
 	/* No WAL input, content/entry lock or remote wait spans physical work.
@@ -5350,7 +5370,7 @@ ko_drop_context_current(const ClusterKoSharedContext *context)
 	ClusterWalSourceRef current;
 
 	return context->used && context->complete && context->structure_owned
-		   && ko_native_capable(context->v3)
+		   && ko_native_capable(context->v3, context->committed_discard)
 		   && (!context->v3 || ko_shared_ready_v3(context))
 		   && context->structure_drop_pending && !context->structure_drop_failed
 		   && context->serial != 0 && context->request.origin_node == cluster_node_id

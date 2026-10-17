@@ -595,7 +595,7 @@ UT_TEST(test_committed_registration_survives_original_cleanup_and_blocks_s6)
 
 UT_TEST(test_commit_registration_rejects_changed_owner_or_executed_context)
 {
-	for (unsigned fault = 0; fault < 14; fault++) {
+	for (unsigned fault = 0; fault < 15; fault++) {
 		ClusterKoCompletionV2 *owner = claimed_registration(CLUSTER_KO_SHARED_V3_OPERATION_DROP);
 		ClusterKoSharedContext *entry = &storage.contexts[owner->slot];
 		ClusterKoSharedContext before = *entry;
@@ -617,6 +617,7 @@ UT_TEST(test_commit_registration_rejects_changed_owner_or_executed_context)
 		case 11: entry->request_sent_peers = 2; break;
 		case 12: entry->request_failed_peers = 2; break;
 		case 13: entry->structure_owned = true; break;
+		case 14: entry->committed_discard = true; break;
 		}
 		UT_ASSERT(!ko_native_publish(owner, true));
 		UT_ASSERT_EQ(storage.native_waiting, 0);
@@ -742,7 +743,7 @@ UT_TEST(test_pending_publication_retains_immutable_cut_without_live_proofs)
 
 UT_TEST(test_pending_publication_rejects_changed_active_operation)
 {
-	for (unsigned fault = 0; fault < 14; fault++) {
+	for (unsigned fault = 0; fault < 15; fault++) {
 		ClusterKoCompletionV2 *owner = claimed_registration(CLUSTER_KO_SHARED_V3_OPERATION_DROP);
 		ClusterKoNativeContinuation *work = owner->native_reserved;
 		ClusterKoSharedContext *entry = &storage.contexts[owner->slot];
@@ -764,6 +765,9 @@ UT_TEST(test_pending_publication_rejects_changed_active_operation)
 		case 11: entry->complete = true; break;
 		case 12: work->recovery_required = true; break;
 		case 13: owner->slot = CLUSTER_KO_SHARED_CAPACITY; break;
+		case 14:
+			entry->committed_discard = work->context.committed_discard = true;
+			break;
 		}
 		cluster_ko_shared_native_publication_v3();
 		UT_ASSERT(work->recovery_required && storage.native_recovery_required);
