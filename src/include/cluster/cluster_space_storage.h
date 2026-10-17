@@ -202,6 +202,14 @@ extern bool cluster_space_drop_replay_verify_v1(XLogReaderState *record, Transac
  * Not replay-from-absence authority or the final cold ROOT seal. */
 extern bool cluster_space_drop_replay_finish_v1(XLogReaderState *record, TransactionId xid);
 
+/* Executable cold foreign-source owner only, borrowing its immutable,
+ * fully decoded selected COMMIT (reader must not advance). Qualifies every original
+ * native/typed shared target, syncs that source, then performs the native
+ * deletion and strict whole-result sync/readback. Structural effect only:
+ * caller still owes canonical TT/CLOG, remaining COMMIT effects and final
+ * cold seal. Does not authorize replay from missing SPACE. */
+extern bool cluster_space_cold_drop_foreign_v1(XLogReaderState *record, TransactionId xid);
+
 /* Same physical postcondition at the original sequencer's final callback,
  * after all scheduled records executed and every source was fully drained.
  * The sealed final TOMBSTONE binds the target, not execution authority. */
