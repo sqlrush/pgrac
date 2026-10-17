@@ -44,6 +44,7 @@
 #include "storage/fd.h"
 #include "storage/ipc.h" /* before_shmem_exit (fd cache cleanup) */
 #include "utils/elog.h"
+#include "utils/resowner.h"
 
 #include "cluster/cluster_undo_gcs.h"		 /* cluster_undo_intent_for_owner (D2-2) */
 #include "cluster/cluster_undo_record_api.h" /* smgr syscall counter bumps */
@@ -566,6 +567,183 @@ cluster_undo_smgr_header_writer_close(int fd)
 {
 	if (fd >= 0)
 		(void)close(fd);
+}
+
+/* Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md */
+typedef struct RecoveryHeaderStamp {
+	int fd;
+	ResourceOwner owner;
+	uint64 token;
+	bool failed;
+	struct stat file;
+	uint32 slot_offset;
+	PGAlignedBlock before;
+	PGAlignedBlock after;
+} RecoveryHeaderStamp;
+
+/* One serial recovery stamp, with no stack callback or re-openable VFD. */
+static RecoveryHeaderStamp recovery_header_stamp = { .fd = -1 };
+static uint64 recovery_header_stamp_serial;
+static bool recovery_header_stamp_registered;
+static bool recovery_header_stamp_exit_registered;
+
+static bool
+recovery_header_stamp_release(void)
+{
+	int fd = recovery_header_stamp.fd;
+	bool ok;
+
+	if (fd < 0)
+		return false;
+	memset(&recovery_header_stamp, 0, sizeof(recovery_header_stamp));
+	recovery_header_stamp.fd = -1;
+	ok = close(fd) == 0;
+	cluster_undo_record_note_smgr_close();
+	ReleaseExternalFD();
+	return ok;
+}
+
+static void
+recovery_header_stamp_resource_release(ResourceReleasePhase phase, bool isCommit, bool isTopLevel,
+									   void *arg)
+{
+	if (phase == RESOURCE_RELEASE_AFTER_LOCKS && recovery_header_stamp.fd >= 0
+		&& recovery_header_stamp.owner == CurrentResourceOwner)
+		(void)recovery_header_stamp_release();
+}
+
+static void
+recovery_header_stamp_exit(int code, Datum arg)
+{
+	(void)recovery_header_stamp_release();
+}
+
+static bool
+recovery_header_stamp_file_matches(const struct stat *observed)
+{
+	const struct stat *expected = &recovery_header_stamp.file;
+
+	return S_ISREG(observed->st_mode) && observed->st_nlink > 0
+		   && observed->st_dev == expected->st_dev && observed->st_ino == expected->st_ino
+		   && observed->st_size == expected->st_size;
+}
+
+bool
+cluster_undo_smgr_recovery_abort_prepare_v1(const ClusterRecoveryTTAbortV1 *record,
+											ClusterUndoSmgrRecoveryStampV1 *out)
+{
+	RecoveryHeaderStamp *stage = &recovery_header_stamp;
+	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)stage->before.data;
+	struct stat after;
+	char path[MAXPGPATH];
+	int fd;
+
+	if (out == NULL)
+		return false;
+	out->token = 0;
+	if (CurrentResourceOwner == NULL || stage->fd >= 0 || recovery_header_stamp_serial == UINT64_MAX
+		|| !cluster_recovery_tt_abort_valid_v1(record)
+		|| cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED, record->exact.instance,
+									 record->exact.segment_id, path, sizeof(path))
+			   != 0)
+		return false;
+	/* Registration and descriptor reservation precede opening the target. */
+	if (!recovery_header_stamp_registered) {
+		RegisterResourceReleaseCallback(recovery_header_stamp_resource_release, NULL);
+		recovery_header_stamp_registered = true;
+	}
+	if (!recovery_header_stamp_exit_registered) {
+		before_shmem_exit(recovery_header_stamp_exit, (Datum)0);
+		recovery_header_stamp_exit_registered = true;
+	}
+	if (!AcquireExternalFD())
+		return false;
+	fd = BasicOpenFile(path, O_RDWR | O_NOFOLLOW | PG_BINARY);
+	if (fd < 0) {
+		ReleaseExternalFD();
+		return false;
+	}
+	cluster_undo_record_note_smgr_open();
+	stage->fd = fd;
+	stage->owner = CurrentResourceOwner;
+	if (fstat(fd, &stage->file) != 0 || !S_ISREG(stage->file.st_mode) || stage->file.st_nlink == 0
+		|| stage->file.st_size != UNDO_SEGMENT_SIZE_BYTES)
+		goto refused;
+	if (pg_pread(fd, stage->before.data, BLCKSZ, 0) != BLCKSZ) {
+		cluster_undo_record_note_smgr_pread();
+		goto refused;
+	}
+	cluster_undo_record_note_smgr_pread();
+	if (!UndoSegmentHeader_identity_matches(stage->before.data, record->exact.segment_id,
+											record->exact.instance)
+		|| cluster_recovery_tt_abort_match_v1(record, header->wrap_count,
+											  &header->tt_slots[record->exact.slot_offset])
+			   == CLUSTER_RECOVERY_TT_ABORT_REFUSED
+		|| fstat(fd, &after) != 0 || !recovery_header_stamp_file_matches(&after))
+		goto refused;
+	stage->slot_offset = offsetof(UndoSegmentHeaderData, tt_slots)
+						 + (uint32)record->exact.slot_offset * sizeof(TTSlot);
+	memcpy(stage->after.data, stage->before.data, BLCKSZ);
+	((UndoSegmentHeaderData *)stage->after.data)->tt_slots[record->exact.slot_offset].status
+		= TT_SLOT_ABORTED;
+	stage->token = ++recovery_header_stamp_serial;
+	out->token = stage->token;
+	return true;
+
+refused:
+	(void)recovery_header_stamp_release();
+	return false;
+}
+
+bool
+cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 stamp)
+{
+	RecoveryHeaderStamp *stage = &recovery_header_stamp;
+	PGAlignedBlock observed;
+	struct stat file;
+	ssize_t size;
+
+	if (stamp.token == 0 || stage->fd < 0 || stage->token != stamp.token
+		|| stage->owner != CurrentResourceOwner || stage->failed)
+		return false;
+	/* No allocation, path/scope resolution or checkpoint delegation here. */
+	if (fstat(stage->fd, &file) != 0 || !recovery_header_stamp_file_matches(&file))
+		goto refused;
+	size = pg_pread(stage->fd, observed.data, BLCKSZ, 0);
+	cluster_undo_record_note_smgr_pread();
+	if (size != BLCKSZ || memcmp(observed.data, stage->before.data, BLCKSZ) != 0)
+		goto refused;
+	if (memcmp(stage->before.data, stage->after.data, BLCKSZ) != 0) {
+		size = pg_pwrite(stage->fd, stage->after.data + stage->slot_offset, sizeof(TTSlot),
+						 stage->slot_offset);
+		cluster_undo_record_note_smgr_pwrite();
+		if (size != sizeof(TTSlot))
+			goto refused;
+	}
+	/* An already-result observation must also become durable. */
+	if (pg_fsync(stage->fd) != 0)
+		goto refused;
+	size = pg_pread(stage->fd, observed.data, BLCKSZ, 0);
+	cluster_undo_record_note_smgr_pread();
+	if (size != BLCKSZ || memcmp(observed.data, stage->after.data, BLCKSZ) != 0
+		|| fstat(stage->fd, &file) != 0 || !recovery_header_stamp_file_matches(&file))
+		goto refused;
+	memcpy(stage->before.data, stage->after.data, BLCKSZ);
+	return true;
+
+refused:
+	stage->failed = true;
+	return false;
+}
+
+bool
+cluster_undo_smgr_recovery_abort_close_v1(ClusterUndoSmgrRecoveryStampV1 stamp)
+{
+	if (stamp.token == 0 || recovery_header_stamp.fd < 0
+		|| recovery_header_stamp.token != stamp.token
+		|| recovery_header_stamp.owner != CurrentResourceOwner)
+		return false;
+	return recovery_header_stamp_release();
 }
 
 bool

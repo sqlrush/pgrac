@@ -47,6 +47,7 @@
 #include "storage/block.h"
 
 #include "cluster/cluster_undo_root_descriptor.h"
+#include "cluster/cluster_recovery_tt_record.h"
 #include "cluster/storage/cluster_undo_alloc.h" /* ClusterUndoPathIntent (D2-2) */
 
 
@@ -151,6 +152,22 @@ extern bool cluster_undo_smgr_header_writer_write(int fd, ClusterUndoPathIntent 
 												  uint32 segment_id, uint8 owner_instance,
 												  uint32 offset, const char *buf, uint32 len);
 extern void cluster_undo_smgr_header_writer_close(int fd);
+
+/* Storage-only C0 adapter. The caller keeps the exact target reservation and
+ * recovery authority throughout, and flushes the record before write. Prepare
+ * may resolve the qualified recovery path; write only uses the held raw FD.
+ * A token carries no transaction, WAL, checkpoint or completion authority. */
+typedef struct ClusterUndoSmgrRecoveryStampV1 {
+	uint64 token;
+} ClusterUndoSmgrRecoveryStampV1;
+
+extern bool cluster_undo_smgr_recovery_abort_prepare_v1(const ClusterRecoveryTTAbortV1 *record,
+														ClusterUndoSmgrRecoveryStampV1 *out);
+extern bool cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 stamp);
+/* Also released with the owning ResourceOwner. Cleanup never clears a
+ * recovery duty/window or turns a failed write into completion. */
+extern bool cluster_undo_smgr_recovery_abort_close_v1(ClusterUndoSmgrRecoveryStampV1 stamp);
+
 
 /*
  * Redo: block zero already shows a replayed TT record's effect (or a newer
