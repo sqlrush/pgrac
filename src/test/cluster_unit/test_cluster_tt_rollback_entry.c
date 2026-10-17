@@ -40,6 +40,11 @@ static unsigned resolve_clog_reads, resolve_proc_reads, resolve_aborts;
 static unsigned resolve_probe_calls;
 static ClusterUndoSmgrFinalState resolve_probe_state;
 static bool resolve_probe_identity_ok;
+static uint32 resolve_extra_segment;
+static PGAlignedBlock resolve_extra_block;
+static ClusterUndoSmgrFinalState resolve_extra_state;
+static SCN highwater_observed;
+static unsigned highwater_observe_calls, highwater_count_calls, highwater_probes_at_observe;
 
 /* Explicit IO boundary for the original scanner. The separate smgr publication
  * tests execute the real final-path probe, including size/identity failures. */
@@ -50,6 +55,11 @@ cluster_undo_smgr_probe_segment(ClusterUndoPathIntent intent, uint32 segment_id,
 	resolve_probe_calls++;
 	if (owner != (uint8)(cluster_node_id + 1) || intent != cluster_undo_intent_for_owner(owner))
 		resolve_probe_identity_ok = false;
+	if (segment_id == resolve_extra_segment) {
+		if (resolve_extra_state == CLUSTER_UNDO_SMGR_FINAL_EXACT)
+			memcpy(block0, resolve_extra_block.data, BLCKSZ);
+		return resolve_extra_state;
+	}
 	if (segment_id != g_canned_block_segment)
 		return CLUSTER_UNDO_SMGR_FINAL_ABSENT;
 	if (resolve_probe_state == CLUSTER_UNDO_SMGR_FINAL_EXACT)
@@ -78,6 +88,20 @@ cluster_tt_recovery_count_active_resolved_aborted(void)
 	resolve_aborts++;
 }
 
+void
+cluster_scn_recovery_replay_observe(SCN scn)
+{
+	highwater_observed = scn;
+	highwater_observe_calls++;
+	highwater_probes_at_observe = resolve_probe_calls;
+}
+
+void
+cluster_tt_recovery_count_scn_highwater_recovered(void)
+{
+	highwater_count_calls++;
+}
+
 #include "test_cluster_tt_resolve_entry.inc"
 
 static void
@@ -91,6 +115,11 @@ resolve_setup(bool shared, TransactionId xid)
 	resolve_probe_calls = 0;
 	resolve_probe_state = CLUSTER_UNDO_SMGR_FINAL_EXACT;
 	resolve_probe_identity_ok = true;
+	resolve_extra_segment = 0;
+	resolve_extra_state = CLUSTER_UNDO_SMGR_FINAL_EXACT;
+	memset(resolve_extra_block.data, 0, BLCKSZ);
+	highwater_observed = InvalidScn;
+	highwater_observe_calls = highwater_count_calls = highwater_probes_at_observe = 0;
 	g_canned_block_segment = 1;
 	g_read_block_ok = g_read_hdr_ok = true;
 	g_read_hdr_fail_on_call = 0;
@@ -286,6 +315,112 @@ UT_TEST(test_shared_scan_skips_only_absent_segments)
 	UT_ASSERT_EQ(g_tt_wal_count + g_write_hdr_calls, 0);
 }
 
+UT_TEST(test_shared_highwater_refuses_bad_input_before_observing_any_peak)
+{
+	const ClusterUndoSmgrFinalState failures[]
+		= { CLUSTER_UNDO_SMGR_FINAL_INVALID, CLUSTER_UNDO_SMGR_FINAL_IO_ERROR,
+			(ClusterUndoSmgrFinalState)99 };
+	for (unsigned mode = 0; mode < 2 * lengthof(failures); mode++) {
+		volatile bool refused = false;
+		PGAlignedBlock before;
+		bool late = mode >= lengthof(failures);
+		resolve_setup(true, 777);
+		seed_block_slot(7, TT_SLOT_COMMITTED, 777, 123);
+		if (late) {
+			resolve_extra_segment = CLUSTER_UNDO_SEGS_PER_INSTANCE;
+			resolve_extra_state = failures[mode % lengthof(failures)];
+		} else
+			resolve_probe_state = failures[mode];
+		memcpy(before.data, g_canned_block, BLCKSZ);
+		PG_TRY();
+		{
+			(void)cluster_tt_recovery_observe_scn_highwater();
+		}
+		PG_CATCH();
+		{
+			refused = true;
+		}
+		PG_END_TRY();
+		cluster_shared_config = false;
+		UT_ASSERT(refused);
+		UT_ASSERT_EQ(last_ereport_errcode, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+		UT_ASSERT_EQ(resolve_probe_calls, late ? CLUSTER_UNDO_SEGS_PER_INSTANCE : 1);
+		UT_ASSERT(resolve_probe_identity_ok);
+		UT_ASSERT_EQ(highwater_observe_calls + highwater_count_calls, 0);
+		UT_ASSERT_EQ(g_read_block_calls + g_read_hdr_calls + g_write_hdr_calls, 0);
+		UT_ASSERT_EQ(g_tt_wal_count + resolve_clog_reads + resolve_proc_reads + resolve_aborts, 0);
+		UT_ASSERT_EQ(memcmp(before.data, g_canned_block, BLCKSZ), 0);
+	}
+}
+
+UT_TEST(test_shared_highwater_observes_last_slot_after_all_owned_segments)
+{
+	PGAlignedBlock before, extra_before;
+	UndoSegmentHeaderData *extra;
+	resolve_setup(true, 777);
+	cluster_tt_recovery_resolve_active = false; /* Highwater has its own startup obligation. */
+	cluster_node_id = 3;
+	g_canned_block_segment = 3 * CLUSTER_UNDO_SEGS_PER_INSTANCE + 42;
+	seed_block_slot(7, TT_SLOT_COMMITTED, 777, 123);
+	seed_block_slot(8, TT_SLOT_ACTIVE, 778, 999);
+	seed_block_slot(9, TT_SLOT_ABORTED, 779, 999);
+	seed_block_slot(10, TT_SLOT_COMMITTED, 780, InvalidScn);
+	resolve_extra_segment = 4 * CLUSTER_UNDO_SEGS_PER_INSTANCE;
+	extra = (UndoSegmentHeaderData *)resolve_extra_block.data;
+	extra->tt_slots[TT_SLOTS_PER_SEGMENT - 1].status = TT_SLOT_COMMITTED;
+	extra->tt_slots[TT_SLOTS_PER_SEGMENT - 1].xid = 781;
+	extra->tt_slots[TT_SLOTS_PER_SEGMENT - 1].commit_scn = 987;
+	memcpy(before.data, g_canned_block, BLCKSZ);
+	memcpy(extra_before.data, resolve_extra_block.data, BLCKSZ);
+	UT_ASSERT_EQ(cluster_tt_recovery_observe_scn_highwater(), 1);
+	cluster_shared_config = false;
+	UT_ASSERT_EQ(resolve_probe_calls, CLUSTER_UNDO_SEGS_PER_INSTANCE);
+	UT_ASSERT(resolve_probe_identity_ok);
+	UT_ASSERT_EQ(highwater_observe_calls, 1);
+	UT_ASSERT_EQ(highwater_count_calls, 1);
+	UT_ASSERT_EQ(highwater_observed, 987);
+	UT_ASSERT_EQ(highwater_probes_at_observe, CLUSTER_UNDO_SEGS_PER_INSTANCE);
+	UT_ASSERT_EQ(g_read_block_calls + g_read_hdr_calls + g_write_hdr_calls + g_tt_wal_count, 0);
+	UT_ASSERT_EQ(memcmp(before.data, g_canned_block, BLCKSZ), 0);
+	UT_ASSERT_EQ(memcmp(extra_before.data, resolve_extra_block.data, BLCKSZ), 0);
+}
+
+UT_TEST(test_shared_highwater_absence_or_no_committed_peak_observes_nothing)
+{
+	for (unsigned absent = 0; absent < 2; absent++) {
+		resolve_setup(true, 777);
+		resolve_probe_state
+			= absent ? CLUSTER_UNDO_SMGR_FINAL_ABSENT : CLUSTER_UNDO_SMGR_FINAL_EXACT;
+		g_read_block_ok = false;
+		UT_ASSERT_EQ(cluster_tt_recovery_observe_scn_highwater(), 0);
+		cluster_shared_config = false;
+		UT_ASSERT_EQ(resolve_probe_calls, CLUSTER_UNDO_SEGS_PER_INSTANCE);
+		UT_ASSERT_EQ(g_read_block_calls, 0);
+		UT_ASSERT_EQ(highwater_observe_calls + highwater_count_calls, 0);
+	}
+}
+
+UT_TEST(test_highwater_keeps_nonshared_reads_and_disabled_noop)
+{
+	resolve_setup(false, 777);
+	seed_block_slot(7, TT_SLOT_COMMITTED, 777, 123);
+	UT_ASSERT_EQ(cluster_tt_recovery_observe_scn_highwater(), 1);
+	UT_ASSERT_EQ(g_read_block_calls, CLUSTER_UNDO_SEGS_PER_INSTANCE);
+	UT_ASSERT_EQ(resolve_probe_calls, 0);
+	UT_ASSERT_EQ(highwater_observed, 123);
+	UT_ASSERT_EQ(highwater_observe_calls, 1);
+	UT_ASSERT_EQ(highwater_count_calls, 1);
+	for (unsigned mode = 0; mode < 2; mode++) {
+		resolve_setup(true, 777);
+		cluster_enabled = mode != 0;
+		cluster_node_id = mode == 1 ? -1 : 0;
+		UT_ASSERT_EQ(cluster_tt_recovery_observe_scn_highwater(), 0);
+		cluster_shared_config = false;
+		UT_ASSERT_EQ(g_read_block_calls + resolve_probe_calls, 0);
+		UT_ASSERT_EQ(highwater_observe_calls + highwater_count_calls, 0);
+	}
+}
+
 UT_TEST(test_shared_legacy_rollback_refuses_before_any_undo_read)
 {
 	for (unsigned mode = 0; mode < 4; mode++) {
@@ -341,7 +476,7 @@ UT_TEST(test_disabled_legacy_rollback_does_not_scan)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(11);
+	UT_PLAN(15);
 	UT_RUN(test_shared_legacy_rollback_refuses_before_any_undo_read);
 	UT_RUN(test_nonshared_legacy_rollback_keeps_original_scan);
 	UT_RUN(test_disabled_legacy_rollback_does_not_scan);
@@ -353,6 +488,10 @@ main(int argc, char **argv)
 	UT_RUN(test_shared_scan_keeps_noncurrent_generation_zero_unreleased_slots);
 	UT_RUN(test_shared_scan_refuses_active_last_slot_in_noncurrent_generation_zero_segment);
 	UT_RUN(test_shared_scan_skips_only_absent_segments);
+	UT_RUN(test_shared_highwater_refuses_bad_input_before_observing_any_peak);
+	UT_RUN(test_shared_highwater_observes_last_slot_after_all_owned_segments);
+	UT_RUN(test_shared_highwater_absence_or_no_committed_peak_observes_nothing);
+	UT_RUN(test_highwater_keeps_nonshared_reads_and_disabled_noop);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

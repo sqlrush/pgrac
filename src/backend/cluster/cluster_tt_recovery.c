@@ -58,6 +58,36 @@
 #define CLUSTER_TT_RECOVERY_MAX_CHAIN_STEPS 1000000
 
 /*
+ * Both startup consumers require the same published-header read contract.
+ * Shared input may be skipped only when the final path is explicitly absent;
+ * a damaged or unreadable published segment is not an empty recovery input.
+ * The existing probe validates file size and header identity, not exact-top
+ * transaction identity or completeness of the cross-source recovery census.
+ */
+static bool
+tt_recovery_read_header(uint32 segment_id, uint8 owner, char block0[BLCKSZ])
+{
+	ClusterUndoSmgrFinalState state;
+
+	if (!cluster_shared_config)
+		return cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner), segment_id, owner,
+											0, block0);
+
+	state = cluster_undo_smgr_probe_segment(cluster_undo_intent_for_owner(owner), segment_id, owner,
+											block0);
+	if (state == CLUSTER_UNDO_SMGR_FINAL_ABSENT)
+		return false;
+	if (state != CLUSTER_UNDO_SMGR_FINAL_EXACT)
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						errmsg("could not validate published undo segment for shared recovery"),
+						errdetail("Undo segment %u, owner %u, final-path probe state %d.",
+								  segment_id, (unsigned)owner, (int)state),
+						errhint("Preserve the original DATA and WAL. A damaged or unreadable "
+								"segment cannot be treated as absent.")));
+	return true;
+}
+
+/*
  * cluster_tt_recovery_xact_liveness -- spec-4.8 D1.
  *
  *	Backend wrapper over the pure classifier: consult CLOG (did it commit)
@@ -131,24 +161,8 @@ cluster_tt_recovery_resolve_active_slots(void)
 		UndoSegmentHeaderData *hdr;
 		uint16 i;
 
-		if (cluster_shared_config) {
-			ClusterUndoSmgrFinalState state;
-
-			state = cluster_undo_smgr_probe_segment(cluster_undo_intent_for_owner(owner),
-													segment_id, owner, blockbuf.data);
-			if (state == CLUSTER_UNDO_SMGR_FINAL_ABSENT)
-				continue;
-			if (state != CLUSTER_UNDO_SMGR_FINAL_EXACT)
-				ereport(ERROR,
-						(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
-						 errmsg("could not validate published undo segment for shared recovery"),
-						 errdetail("Undo segment %u, owner %u, final-path probe state %d.",
-								   segment_id, (unsigned)owner, (int)state),
-						 errhint("Preserve the original DATA and WAL. A damaged or unreadable "
-								 "segment cannot be treated as absent.")));
-		} else if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner), segment_id,
-												 owner, 0, blockbuf.data))
-			continue; /* Original nonshared read-miss behavior. */
+		if (!tt_recovery_read_header(segment_id, owner, blockbuf.data))
+			continue;
 
 		hdr = (UndoSegmentHeaderData *)blockbuf.data;
 		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
@@ -236,9 +250,8 @@ cluster_tt_recovery_observe_scn_highwater(void)
 		UndoSegmentHeaderData *hdr;
 		uint16 i;
 
-		if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner), segment_id, owner,
-										  0, blockbuf.data))
-			continue; /* absent / unreadable -> skip */
+		if (!tt_recovery_read_header(segment_id, owner, blockbuf.data))
+			continue;
 
 		hdr = (UndoSegmentHeaderData *)blockbuf.data;
 		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {

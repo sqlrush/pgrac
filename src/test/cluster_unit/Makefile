@@ -7114,10 +7114,12 @@ test_cluster_tt_rollback_entry.inc: $(top_srcdir)/src/backend/cluster/cluster_tt
 	     END { if (types != 1 || found != 1) exit 1 }' $< > $@
 
 test_cluster_tt_resolve_entry.inc: $(top_srcdir)/src/backend/cluster/cluster_tt_recovery.c Makefile
-	awk '/^cluster_tt_recovery_xact_liveness\(/ { print "ClusterTtRecoveryLiveness"; emit=1; found++ } \
+	awk '/^tt_recovery_read_header\(/ { print "static bool"; emit=1; found++ } \
+	     /^cluster_tt_recovery_xact_liveness\(/ { print "ClusterTtRecoveryLiveness"; emit=1; found++ } \
 	     /^cluster_tt_recovery_resolve_active_slots\(/ { print "int"; emit=1; found++ } \
+	     /^cluster_tt_recovery_observe_scn_highwater\(/ { print "int"; emit=1; found++ } \
 	     emit { print } emit && /^}/ { emit=0 } \
-	     END { if (found != 2) exit 1 }' $< > $@
+	     END { if (found != 4) exit 1 }' $< > $@
 
 test_cluster_tt_rollback_entry: test_cluster_tt_rollback_entry.c test_cluster_tt_durable.c \
 		unit_test.h test_cluster_tt_rollback_entry.inc test_cluster_tt_resolve_entry.inc $(CLUSTER_TT_DURABLE_O)
