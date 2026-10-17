@@ -471,6 +471,7 @@ TESTS += test_cluster_btree_redo test_cluster_cold_init_redo
 TESTS += test_cluster_page_dependency
 TESTS += test_cluster_undo_producer
 TESTS += test_cluster_undo_native_lifecycle
+TESTS += test_cluster_recovery_c0_apply
 TESTS += test_cluster_undo_recovery
 TESTS += test_cluster_remote_xact_directory
 TESTS += test_cluster_multixact_recovery
@@ -2810,8 +2811,19 @@ test_cluster_undo_dir_native.inc: $(top_srcdir)/src/backend/cluster/storage/clus
 	mv $@.tmp $@
 
 test_cluster_undo_recovery_product.o: $(top_srcdir)/src/backend/cluster/cluster_undo_recovery.c \
-		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h
+		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_tt_record.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_recovery_c0_apply: test_cluster_recovery_c0_apply.c unit_test.h \
+        test_cluster_undo_recovery_product.o \
+        $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_undo_recovery_product.o \
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_undo_recovery: test_cluster_undo_recovery.c unit_test.h \
 		test_cluster_undo_path_native.inc test_cluster_undo_fd_native.inc test_cluster_undo_dir_native.inc \

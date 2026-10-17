@@ -9,6 +9,7 @@
 #include <setjmp.h>
 
 #include "cluster/cluster_mode.h"
+#include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_undo_gcs.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_undo_smgr.h"
@@ -41,6 +42,40 @@ static ClusterThreadRecoveryAuthorityV1 authority;
 static const RfSideOnlinePlanV1 *plan = (const RfSideOnlinePlanV1 *)(uintptr_t)1;
 static unsigned wal_sync_calls;
 static int wal_sync_fault;
+
+/* The ordinary scope never enters the separate selected-C0 path. */
+bool
+cluster_cold_replay_window_active_v1(void)
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+bool
+rf_side_online_plan_recovery_abort_sources_v1(const RfSideOnlinePlanV1 *p, uint32 index,
+											  ClusterWalSourceRef *writer,
+											  ClusterWalSourceRef *target)
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+bool
+rf_side_online_plan_replay_start_matches_v1(const RfSideOnlinePlanV1 *p, uint32 thread,
+											uint64 incarnation, uint64 db, XLogRecPtr redo)
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+ClusterControlRootResult
+cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *expected,
+										const ClusterControlRootReadToken *selected,
+										ClusterWalSourceRef *out, XLogRecPtr *redo)
+{
+	UT_ASSERT(false);
+	return CLUSTER_CONTROL_ROOT_IO_ERROR;
+}
 
 ClusterControlRootResult
 cluster_control_root_recovery_sync_v1(const ClusterControlRootSnapshot *expected,

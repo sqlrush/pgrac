@@ -24,6 +24,14 @@ extern bool cluster_undo_recovery_scope_enter_v1(ClusterUndoRecoveryScopeV1 *sco
 												 const ClusterThreadRecoveryAuthorityV1 *authority,
 												 const RfSideOnlinePlanV1 *plan);
 extern void cluster_undo_recovery_scope_leave_v1(ClusterUndoRecoveryScopeV1 *scope);
+/* Replay one already sealed C0 inside Startup's original pass-2 window,
+ * under separate current writer/target owners.
+ * Success covers only the exact durable TT slot, not native projections,
+ * cleanup, N4 loser classification or whole-source recovery completion. */
+extern bool cluster_undo_recovery_abort_replay_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+												  const RfPageOnlineRecordIdentityV1 *identity,
+												  const ClusterThreadRecoveryAuthorityV1 *writer,
+												  const ClusterThreadRecoveryAuthorityV1 *target);
 /* The SIDE projection shares this original sealed-source recovery scope. */
 extern bool cluster_undo_recovery_origin_authorized_v1(int origin_node);
 /* Native cold consumers also require the original cold serial mode and
