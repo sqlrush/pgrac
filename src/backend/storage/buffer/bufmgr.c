@@ -11275,7 +11275,7 @@ cluster_bufmgr_discard_relation_v4(RelFileLocator locator, uint32 *budget, uint3
 {
 	if (budget == NULL || cursor == NULL || *budget == 0 || *budget > 128
 		|| NBuffers <= 0 || *cursor > (uint32)NBuffers
-		|| !cluster_ko_directory_drop_retired_v3(locator))
+		|| !cluster_ko_local_drop_discard_current_v4(locator))
 		return CLUSTER_BUFFER_DRAIN_INVALID;
 	while (*budget > 0 && *cursor < (uint32)NBuffers) {
 		BufferDesc *buf = GetBufferDescriptor(*cursor);

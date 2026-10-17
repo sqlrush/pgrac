@@ -7603,10 +7603,291 @@ ko_native_window_wait(ClusterKoCompletionV2 *owned, ClusterKoNativeContinuation 
 	return ready;
 }
 
+/* Spec: 2026-10-16-pre2-p014-am05-shared-ddl-autocommit.md
+ * Only the original committed backend may consume local discard. Its saved
+ * typed SPACE preparation has already been matched by the window caller.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+ko_native_discard_owner_current(const ClusterKoCompletionV2 *owned)
+{
+	return cluster_enabled && cluster_shared_config && ko_state != NULL
+		&& cluster_interconnect_tier == CLUSTER_IC_TIER_1 && !RecoveryInProgress()
+		&& InterruptHoldoffCount != 0 && CritSectionCount == 0 && MyProcPid > 0
+		&& (MyBackendType == B_BACKEND || MyBackendType == B_AUTOVAC_WORKER
+			|| MyBackendType == B_BG_WORKER)
+		&& TopTransactionResourceOwner != NULL && CurrentResourceOwner != NULL
+		&& CurTransactionResourceOwner == TopTransactionResourceOwner
+		&& owned->native_transaction && owned->postcommit && owned->native_handed_off
+		&& !owned->native_pending && owned->barrier_v3 && owned->barrier_committed_discard
+		&& !owned->barrier_private && !owned->space_observed && !owned->origin_data_closed
+		&& owned->pid == MyProcPid && owned->owner == TopTransactionResourceOwner
+		&& owned->slot < CLUSTER_KO_SHARED_CAPACITY && DsaPointerIsValid(owned->native_unready);
+}
+
+static bool
+ko_native_discard_same_locked(const ClusterKoCompletionV2 *owned,
+	const ClusterKoNativeContinuation *work, const ClusterKoSharedContext *before)
+{
+	const KoDropIdentity *identity;
+
+	if (!ko_native_discard_owner_current(owned)
+		|| !work->publication_observed || work->recovery_required
+		|| work->buffers_released || work->predelete_ready
+		|| !before->committed_discard || !before->committed_drain_pending
+		|| before->complete || before->structure_owned || !before->origin_checkpoint
+		|| before->origin_data_closed || before->cancel_sqlerrcode != 0
+		|| before->ax_release_requested || !ko_shared_ready_v3(before)
+		|| before->pid != owned->pid || before->serial != owned->serial
+		|| memcmp(&before->request_v3, &owned->barrier_request_v3,
+			sizeof(before->request_v3)) != 0
+		|| memcmp(before->peer_boots, owned->barrier_boots, sizeof(before->peer_boots)) != 0
+		|| memcmp(before, &work->context, sizeof(*before)) != 0
+		|| memcmp(before, &ko_state->contexts[owned->slot], sizeof(*before)) != 0
+		|| before->drop_identity == 0 || before->drop_identity > KO_DROP_IDENTITY_CAPACITY)
+		return false;
+	identity = &ko_state->drop_identities[before->drop_identity - 1];
+	return identity->state == KO_DROP_IDENTITY_CLOSING && identity->committed_discard
+		&& identity->fence_serial == before->drop_identity_serial
+		&& memcmp(&identity->request, &before->request_v3, sizeof(identity->request)) == 0;
+}
+
+static bool
+ko_native_discard_pending_locked(RelFileLocator locator, bool *recovery)
+{
+	bool pending = false;
+
+	if (recovery != NULL)
+		*recovery = false;
+	/* No new liveness query: only the original records' exact local PID and
+	 * failed verdict. This committed backend cannot release its own scope
+	 * while waiting, and failed finite work already belongs to recovery. */
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		const KoDirectoryIo *io = &ko_state->directory_io[i];
+		const ClusterKoExtendWorkV3 *extend = &ko_state->extend_work[i];
+
+		if (io->serial != 0 && RelFileLocatorEquals(io->locator, locator)) {
+			pending = true;
+			if (recovery != NULL && io->pid == MyProcPid)
+				*recovery = true;
+		}
+		if (extend->used && RelFileLocatorEquals(extend->locator, locator)) {
+			pending = true;
+			if (recovery != NULL && (extend->pid == MyProcPid || extend->failed))
+				*recovery = true;
+		}
+	}
+	for (unsigned i = 0; i < CLUSTER_CTRC_CLEANER_WORKERS; i++) {
+		const ClusterKoCleanerWorkV3 *cleaner = &ko_state->cleaner_work[i];
+
+		if (cleaner->used && RelFileLocatorEquals(cleaner->locator, locator)) {
+			pending = true;
+			if (recovery != NULL && cleaner->scope.pid == MyProcPid)
+				*recovery = true;
+		}
+	}
+	return pending;
+}
+
+bool
+cluster_ko_local_drop_discard_current_v4(RelFileLocator locator)
+{
+	bool found = false;
+
+	/* Existing peer proof remains immutable. The origin's local exception
+	 * is not global RETIRED: its final SPACE obligation is still outstanding. */
+	if (cluster_ko_directory_drop_retired_v3(locator))
+		return true;
+	for (ClusterKoCompletionV2 *owned = ko_completions; owned != NULL; owned = owned->next) {
+		ClusterKoNativeContinuation *work;
+		bool current;
+
+		if (!ko_native_discard_owner_current(owned)
+			|| !RelFileLocatorEquals(locator, owned->barrier_request_v3.base.key.locator))
+			continue;
+		work = dsa_get_address(ko_native_area, owned->native_unready);
+		SpinLockAcquire(&ko_state->shared_lock);
+		current = ko_native_discard_same_locked(owned, work, &work->context)
+			&& !ko_native_discard_pending_locked(locator, NULL);
+		SpinLockRelease(&ko_state->shared_lock);
+		if (!current || found)
+			return false;
+		found = true;
+	}
+	return found;
+}
+
+static bool
+ko_native_discard_cut_current(const ClusterKoSharedContext *before, uint64 revision,
+	const ResourceXGateSnapshot *gate)
+{
+	ResourceXGateSnapshot after;
+
+	return ko_shared_origin_current(before)
+		&& ko_shared_v3_local_binding_current(&before->request_v3)
+		&& pg_atomic_read_u64(&ko_state->peer_admission_revision) == revision
+		&& cluster_pcm_lock_resource_x_gate_snapshot(&after)
+		&& after.phase == RESOURCE_X_GATE_OPEN && memcmp(gate, &after, sizeof(after)) == 0;
+}
+
+/* Same native operation, no self REQUEST and no live-object flush/proof.
+ * CLOSING blocks ordinary producers, but is deliberately not RETIRED: final
+ * SPACE and the later no-I/O directory terminal have separate consumers.
+ * Cursors stay on this stack and cannot survive ERROR or owner handoff. */
+static bool
+ko_native_origin_discard_v4(ClusterKoCompletionV2 *owned, ClusterKoNativeContinuation *work)
+{
+	ClusterKoSharedContext before;
+	ClusterKoSharedContext *entry;
+	ResourceXGateSnapshot gate, after;
+	RelFileLocator locator = owned->barrier_request_v3.base.key.locator;
+	uint64 revision, saved_revision, wb_revision = 0;
+	uint32 cursor = 0;
+	unsigned phase = 0;
+	bool same, pending, recovery;
+
+	if (!ko_native_discard_owner_current(owned)
+		|| !ko_native_window_snapshot(owned, work, &before) || !ko_shared_ready_v3(&before)
+		|| before.origin_checkpoint || before.origin_data_closed
+		|| !cluster_pcm_lock_resource_x_gate_snapshot(&gate) || gate.phase != RESOURCE_X_GATE_OPEN)
+		return false;
+	revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+	if (revision == 0 || revision >= UINT64_MAX - 1
+		|| !ko_native_discard_cut_current(&before, revision, &gate))
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	entry = &ko_state->contexts[owned->slot];
+	same = memcmp(&before, entry, sizeof(before)) == 0
+		&& memcmp(&before, &work->context, sizeof(before)) == 0
+		&& pg_atomic_read_u64(&ko_state->peer_admission_revision) == revision
+		&& cluster_pcm_lock_resource_x_gate_snapshot(&after)
+		&& memcmp(&gate, &after, sizeof(gate)) == 0;
+	if (same) {
+		KoDropIdentity *identity = &ko_state->drop_identities[before.drop_identity - 1];
+
+		same = identity->state == KO_DROP_IDENTITY_RESERVED && identity->committed_discard
+			&& identity->fence_serial == before.drop_identity_serial
+			&& memcmp(&identity->request, &before.request_v3, sizeof(identity->request)) == 0;
+		if (same) {
+			identity->state = KO_DROP_IDENTITY_CLOSING;
+			entry->origin_checkpoint = true;
+			before = work->context = *entry;
+			/* Consume our own close revision, never invalidate our prefix. */
+			pg_atomic_write_u64(&ko_state->peer_admission_revision, ++revision);
+		}
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	if (!same)
+		return false;
+	saved_revision = revision;
+	for (;;) {
+		int events;
+
+		ResetLatch(MyLatch);
+		revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+		if (revision == 0 || revision >= UINT64_MAX - 1
+			|| !ko_native_discard_cut_current(&before, revision, &gate))
+			return false;
+		if (revision != saved_revision) {
+			phase = cursor = 0;
+			saved_revision = revision;
+		}
+		SpinLockAcquire(&ko_state->shared_lock);
+		same = ko_native_discard_same_locked(owned, work, &before);
+		pending = ko_native_discard_pending_locked(locator, &recovery);
+		SpinLockRelease(&ko_state->shared_lock);
+		if (!same || recovery)
+			return false;
+		if (pending)
+			goto wait;
+		if (phase == 0) {
+			uint32 budget = 128, start = cursor;
+			ClusterBufferDrainResult result
+				= cluster_bufmgr_discard_relation_v4(locator, &budget, &cursor);
+
+			if (budget > 128 || cursor < start || cursor - start > 128 - budget
+				|| (result != CLUSTER_BUFFER_DRAIN_EMPTY && result != CLUSTER_BUFFER_DRAIN_MORE
+					&& result != CLUSTER_BUFFER_DRAIN_WAIT))
+				return false;
+			if (result != CLUSTER_BUFFER_DRAIN_EMPTY)
+				goto wait;
+			/* A returned physical prefix is not permission for the next
+			 * consumer if its original operation or admission cut moved. */
+			if (!ko_native_discard_cut_current(&before, revision, &gate)) {
+				phase = cursor = 0;
+				goto wait;
+			}
+			SpinLockAcquire(&ko_state->shared_lock);
+			same = ko_native_discard_same_locked(owned, work, &before);
+			pending = ko_native_discard_pending_locked(locator, &recovery);
+			SpinLockRelease(&ko_state->shared_lock);
+			if (!same || recovery)
+				return false;
+			if (pending) {
+				cursor = 0;
+				goto wait;
+			}
+			cluster_hw_lease_discard(locator, MAIN_FORKNUM);
+			phase = 1;
+			cursor = 0;
+		}
+		if (phase == 1) {
+			uint32 start = cursor;
+			ClusterPcmPiRelationScanV2 result
+				= cluster_pcm_lock_ko_local_relation_discard_v4(locator, gate.formation, 128, &cursor);
+
+			if (cursor < start || cursor - start > 128
+				|| (result != CLUSTER_PCM_PI_RELATION_EMPTY && result != CLUSTER_PCM_PI_RELATION_MORE
+					&& result != CLUSTER_PCM_PI_RELATION_PENDING))
+				return false;
+			if (result == CLUSTER_PCM_PI_RELATION_PENDING) {
+				/* A retained local install may have finished while we waited. */
+				phase = cursor = 0;
+				goto wait;
+			}
+			if (result == CLUSTER_PCM_PI_RELATION_MORE)
+				goto wait;
+			phase = 2;
+		}
+		if (!cluster_pi_writeback_local_relation_closed_v3(locator, before.request.epoch,
+			&wb_revision)) {
+			phase = 1;
+			cursor = 0;
+			goto wait;
+		}
+		if (!ko_native_discard_cut_current(&before, revision, &gate)
+			|| !cluster_pi_writeback_local_revision_current_v3(wb_revision)) {
+			phase = cursor = 0;
+			goto wait;
+		}
+		SpinLockAcquire(&ko_state->shared_lock);
+		same = ko_native_discard_same_locked(owned, work, &before);
+		pending = ko_native_discard_pending_locked(locator, &recovery)
+			|| pg_atomic_read_u64(&ko_state->peer_admission_revision) != revision
+			|| !cluster_pcm_lock_resource_x_gate_snapshot(&after)
+			|| memcmp(&gate, &after, sizeof(gate)) != 0
+			|| !cluster_pi_writeback_local_revision_current_v3(wb_revision);
+		if (same && !pending) {
+			entry->origin_data_closed = owned->origin_data_closed = true;
+			work->context = *entry;
+		}
+		SpinLockRelease(&ko_state->shared_lock);
+		if (!same || recovery)
+			return false;
+		if (!pending)
+			return true;
+		phase = cursor = 0;
+	wait:
+		events = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+			100L, WAIT_EVENT_CLUSTER_OBJECT_FLUSH_WAIT);
+		if (events & WL_POSTMASTER_DEATH)
+			return false;
+	}
+}
+
 /* The native caller invokes this after local invalidation/MultiXact and
  * before LOCKS release. Failure cannot roll back catalog COMMIT: preserve
  * the preallocated native owner and protecting AX, including uncertain sends.
- * No result here completes local discard, SPACE, deletion or recovery. */
+ * Local discard does not complete final SPACE, deletion or recovery. */
 void
 cluster_ko_shared_native_window_v4(const ClusterSpaceDropState *space_drop)
 {
@@ -7635,7 +7916,8 @@ cluster_ko_shared_native_window_v4(const ClusterSpaceDropState *space_drop)
 		PG_TRY();
 		{
 			ready = cluster_space_drop_committed_owner_v4(space_drop, owned)
-				&& ko_native_window_wait(owned, work);
+				&& ko_native_window_wait(owned, work)
+				&& ko_native_origin_discard_v4(owned, work);
 		}
 		PG_CATCH();
 		{

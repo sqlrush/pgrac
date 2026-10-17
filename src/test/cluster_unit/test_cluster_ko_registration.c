@@ -1122,13 +1122,82 @@ UT_TEST(test_publication_retry_rechecks_identity_and_cannot_clear_failure)
 
 /* The native commit tail and KO producer/LMON/ACK consumers are real.
  * WAL commit, local PG cleanup, transport and peer physical work are fixture
- * boundaries. READY here never claims origin discard or final SPACE. */
+ * boundaries. Separate original local consumers follow READY, never final SPACE. */
 static unsigned window_mode;
 static bool window_expect_ready;
+static bool window_expect_closed;
+static unsigned window_origin_case;
+static ClusterKoDirectoryIoV3 window_entered;
 static uint32 window_interrupt_holdoff, window_query_cancel_holdoff;
 static ClusterKoSharedMessageV4 window_request;
 static ClusterKoNativeContinuation *window_work;
 static unsigned window_slot;
+
+static void
+window_origin_discard(void)
+{
+	RelFileLocator locator = window_work->context.request.key.locator;
+	ClusterKoDirectoryIoV3 call;
+
+	UT_ASSERT_EQ(postcommit_phases, 1);
+	UT_ASSERT_EQ(postcommit_cleanup_mask, 15);
+	UT_ASSERT_EQ(postcommit_owner->barrier_ready_peers, 2);
+	UT_ASSERT(cluster_ko_local_drop_discard_current_v4(locator));
+	UT_ASSERT(!cluster_ko_directory_drop_retired_v3(locator));
+	UT_ASSERT(!cluster_ko_directory_io_begin_v3(locator, &call));
+	UT_ASSERT_EQ(flush_count + sync_count + drop_count + native_fork_unlinks, 0);
+	switch (window_origin_case) {
+	case 2:
+		UT_ASSERT_EQ(committed_discard_input, (committed_discard_calls - 1) * 128);
+		committed_discard_result = committed_discard_calls < 3
+			? CLUSTER_BUFFER_DRAIN_MORE : CLUSTER_BUFFER_DRAIN_EMPTY;
+		break;
+	case 7:
+		if (committed_discard_calls == 1)
+			(void)pg_atomic_fetch_add_u64(&storage.peer_admission_revision, 1);
+		else
+			UT_ASSERT_EQ(committed_discard_input, 0);
+		break;
+	case 8: relation_gate_ok = false; break;
+	case 9: storage.contexts[window_slot].serial++; break;
+	case 10:
+		InterruptHoldoffCount = QueryCancelHoldoffCount = CritSectionCount = 0;
+		pg_re_throw();
+		break;
+	case 13: {
+		ClusterKoCompletionV2 saved = *postcommit_owner;
+		ClusterKoSharedContext context = storage.contexts[window_slot];
+		for (unsigned fault = 0; fault < 9; fault++) {
+			switch (fault) {
+			case 0: postcommit_owner->pid++; break;
+			case 1: postcommit_owner->owner = (ResourceOwner)2; break;
+			case 2: postcommit_owner->postcommit = false; break;
+			case 3: postcommit_owner->native_handed_off = false; break;
+			case 4: window_work->recovery_required = true; break;
+			case 5: window_work->publication_observed = false; break;
+			case 6: storage.contexts[window_slot].request_v3.base.incarnation[0]++; break;
+			case 7: storage.contexts[window_slot].request_done_peers = 0; break;
+			case 8: InterruptHoldoffCount = 0; break;
+			}
+			UT_ASSERT(!cluster_ko_local_drop_discard_current_v4(locator));
+			*postcommit_owner = saved;
+			window_work->recovery_required = false;
+			window_work->publication_observed = true;
+			storage.contexts[window_slot] = context;
+			InterruptHoldoffCount = window_interrupt_holdoff;
+		}
+		UT_ASSERT(cluster_ko_local_drop_discard_current_v4(locator));
+		break;
+	}
+	}
+}
+
+static void
+window_wb_revision(void)
+{
+	local_writeback_revision++;
+	local_writeback_sample_hook = NULL;
+}
 
 static void
 window_deliver(uint16 status)
@@ -1184,6 +1253,44 @@ window_wait(void)
 {
 	UT_ASSERT_EQ(postcommit_cleanup_mask, 15);
 	UT_ASSERT_EQ(postcommit_phases, 1);
+	if (!barrier_active) {
+		RelFileLocator locator = window_work->context.request.key.locator;
+
+		UT_ASSERT(!postcommit_owner->origin_data_closed);
+		UT_ASSERT(!cluster_ko_directory_drop_retired_v3(locator));
+		if (window_origin_case == 1) {
+			int32 origin_pid = MyProcPid;
+
+			UT_ASSERT_EQ(committed_discard_calls + local_discard_calls, 0);
+			UT_ASSERT(!cluster_ko_local_drop_discard_current_v4(locator));
+			/* Only the other original owner can end this call. */
+			MyProcPid = window_entered.pid;
+			UT_ASSERT(cluster_ko_directory_io_end_v3(&window_entered));
+			MyProcPid = origin_pid;
+		}
+		if (window_origin_case == 3)
+			committed_discard_result = CLUSTER_BUFFER_DRAIN_EMPTY;
+		if (window_origin_case == 4 || window_origin_case == 5) {
+			UT_ASSERT_EQ(local_discard_calls, 1);
+			local_relation_scan_result = CLUSTER_PCM_PI_RELATION_EMPTY;
+		}
+		if (window_origin_case == 6)
+			local_writeback_closed = true;
+		if (window_origin_case == 14 || window_origin_case == 15) {
+			UT_ASSERT_EQ(committed_discard_calls + local_discard_calls, 0);
+			UT_ASSERT(!cluster_ko_local_drop_discard_current_v4(locator));
+			/* Explicit original finite-owner completion boundary. */
+			storage.cleaner_work[0].used = false;
+			storage.extend_work[0].used = false;
+		}
+		if (window_origin_case >= 16) {
+			/* Exit a buggy wait deterministically; it may not claim that
+			 * this original self/failed obligation can finish independently. */
+			UT_ASSERT_EQ(origin_waits, 0);
+			relation_gate_ok = false;
+		}
+		return;
+	}
 	if (window_mode == 6)
 		current_epoch++;
 	else if (window_mode == 2) {
@@ -1203,15 +1310,23 @@ window_storage_observer(RelFileLocator locator)
 	UT_ASSERT_EQ(window_work->context.request_done_peers, window_expect_ready ? 2 : 0);
 	UT_ASSERT(window_work->context.committed_drain_pending && !window_work->context.complete);
 	UT_ASSERT(!window_work->buffers_released && !window_work->predelete_ready);
-	UT_ASSERT(!postcommit_owner->barrier_private && !postcommit_owner->origin_data_closed);
+	UT_ASSERT(!postcommit_owner->barrier_private);
+	UT_ASSERT_EQ(postcommit_owner->origin_data_closed, window_expect_closed);
+	UT_ASSERT_EQ(window_work->context.origin_data_closed, window_expect_closed);
+	if (window_origin_case == 0) {
+		UT_ASSERT_EQ(committed_discard_calls, window_expect_ready ? 1 : 0);
+		UT_ASSERT_EQ(local_discard_calls, window_expect_ready ? 1 : 0);
+	}
+	UT_ASSERT(!cluster_ko_directory_drop_retired_v3(locator));
 	UT_ASSERT(!cluster_ko_shared_native_prepare_drop_v2(locator));
 	UT_ASSERT(!ko_origin_release_ready(window_slot));
+	UT_ASSERT(!cluster_ko_local_drop_discard_current_v4(locator));
 	UT_ASSERT_EQ(native_fork_unlinks + flush_count + sync_count + drop_count, 0);
 	return true;
 }
 
 static void
-run_committed_window(uint16 operation, unsigned mode, bool held)
+run_committed_window(uint16 operation, unsigned mode, bool held, unsigned origin_case)
 {
 	KoAxBinding binding = committed_origin_setup();
 	ClusterKoCompletionV2 *owner, *claimed = NULL;
@@ -1228,9 +1343,12 @@ run_committed_window(uint16 operation, unsigned mode, bool held)
 	window_work = owner->native_reserved;
 	window_slot = owner->slot;
 	window_mode = mode;
+	window_origin_case = origin_case;
 	native_window_space = mode == 7 ? NULL : (ClusterSpaceDropState *)&window_request;
 	native_window_space_owner = mode == 8 ? NULL : owner;
 	window_expect_ready = held && mode < 3;
+	window_expect_closed = window_expect_ready
+		&& (origin_case < 8 || (origin_case > 11 && origin_case < 16));
 	postcommit_owner = owner;
 	memset(&postcommit_binding, 0, sizeof(postcommit_binding));
 	postcommit_binding.identity.locator = owner->barrier_request_v3.base.key.locator;
@@ -1245,6 +1363,41 @@ run_committed_window(uint16 operation, unsigned mode, bool held)
 	object_wire_send_hook = window_send;
 	lmon_wakeup_hook = shared_send_tick;
 	native_window_wait_hook = window_wait;
+	committed_discard_hook = window_origin_discard;
+	local_scan_rel_number = owner->barrier_request_v3.base.key.locator.relNumber;
+	if (origin_case == 1 || origin_case == 16) {
+		int32 origin_pid = MyProcPid;
+
+		if (origin_case == 1)
+			MyProcPid++;
+		UT_ASSERT(cluster_ko_directory_io_begin_v3(space_identity.key.locator, &window_entered));
+		MyProcPid = origin_pid;
+	}
+	if (origin_case == 3)
+		committed_discard_result = CLUSTER_BUFFER_DRAIN_WAIT;
+	if (origin_case == 4) {
+		local_relation_scan_result = CLUSTER_PCM_PI_RELATION_MORE;
+		local_relation_scan_advance = 128;
+	}
+	if (origin_case == 5)
+		local_relation_scan_result = CLUSTER_PCM_PI_RELATION_PENDING;
+	if (origin_case == 6)
+		local_writeback_closed = false;
+	if (origin_case == 11)
+		local_relation_scan_drift = 4;
+	if (origin_case == 12)
+		local_writeback_sample_hook = window_wb_revision;
+	if (origin_case == 14 || origin_case == 18) {
+		storage.cleaner_work[0].used = true;
+		storage.cleaner_work[0].locator = space_identity.key.locator;
+		storage.cleaner_work[0].scope.pid = origin_case == 18 ? MyProcPid : MyProcPid + 1;
+	}
+	if (origin_case == 15 || origin_case == 17 || origin_case == 19) {
+		storage.extend_work[0].used = true;
+		storage.extend_work[0].locator = space_identity.key.locator;
+		storage.extend_work[0].pid = origin_case == 17 ? MyProcPid : MyProcPid + 1;
+		storage.extend_work[0].failed = origin_case == 19;
+	}
 	UT_ASSERT_EQ(send_calls, 0); /* No REQUEST escaped the real precommit producer. */
 	window_interrupt_holdoff = held ? mode == 5 ? 3 : 1 : 0;
 	window_query_cancel_holdoff = held && mode == 5 ? 2 : 0;
@@ -1272,10 +1425,11 @@ run_committed_window(uint16 operation, unsigned mode, bool held)
 	UT_ASSERT_EQ(native_window_space_releases, mode == 7 ? 0 : 1);
 	UT_ASSERT_EQ(send_calls, !held || mode >= 7 ? 0 : mode == 1 ? 2 : 1);
 	UT_ASSERT(!barrier_active);
-	UT_ASSERT_EQ(native_window_errors_flushed, held && mode == 5 ? 1 : 0);
+	UT_ASSERT_EQ(native_window_errors_flushed,
+		held && (mode == 5 || origin_case == 10 || origin_case == 11) ? 1 : 0);
 	if (held && mode == 2)
 		UT_ASSERT_EQ(barrier_waits, 2);
-	/* This component has not done local discard/final SPACE. Original final
+	/* Final SPACE is still outstanding. Original final
 	 * cleanup therefore retains recovery/AX ownership, never completion. */
 	UT_ASSERT(window_work->recovery_required && storage.native_recovery_required);
 	UT_ASSERT(storage.contexts[window_slot].used && !ko_origin_release_ready(window_slot));
@@ -1283,32 +1437,90 @@ run_committed_window(uint16 operation, unsigned mode, bool held)
 	if (held && (mode == 4 || mode == 5))
 		UT_ASSERT_EQ(storage.contexts[window_slot].request_uncertain_peers, 2);
 	UT_ASSERT_EQ(origin_drain_calls + origin_flush_calls + origin_invalidate_calls, 0);
-	UT_ASSERT_EQ(pg_atomic_read_u64(&leases.d_orphan_zero), 0);
-	UT_ASSERT_EQ(cluster_hw_lease_next_block(space_identity.key.locator, MAIN_FORKNUM), 4);
+	if (window_expect_closed) {
+		UT_ASSERT(committed_discard_calls > 0 && local_discard_calls > 0);
+		UT_ASSERT_EQ(cluster_hw_lease_next_block(space_identity.key.locator, MAIN_FORKNUM),
+			InvalidBlockNumber);
+	}
+	if (origin_case == 2) {
+		UT_ASSERT_EQ(committed_discard_calls, 3);
+		UT_ASSERT_EQ(origin_waits, 2);
+	}
+	if (origin_case == 4)
+		UT_ASSERT_EQ(local_relation_scan_input, 128);
+	if (origin_case == 5 || origin_case == 7 || origin_case == 12)
+		UT_ASSERT(committed_discard_calls >= 2);
+	if (origin_case >= 16) {
+		UT_ASSERT_EQ(origin_waits + committed_discard_calls + local_discard_calls, 0);
+		if (origin_case == 16)
+			UT_ASSERT_EQ(storage.directory_io[window_entered.slot].serial, window_entered.serial);
+		else if (origin_case == 18)
+			UT_ASSERT(storage.cleaner_work[0].used);
+		else
+			UT_ASSERT(storage.extend_work[0].used);
+		if (origin_case == 19)
+			UT_ASSERT(storage.extend_work[0].failed);
+	}
 	native_fixture_shared_memory_end();
 }
 
 UT_TEST(test_actual_commit_window_collects_ready_after_local_cleanup)
 {
-	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true);
-	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD, 0, true);
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 0);
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD, 0, true, 0);
 }
 
 UT_TEST(test_commit_window_keeps_backpressure_and_exact_result_waits)
 {
-	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 1, true);
-	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 2, true);
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 1, true, 0);
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 2, true, 0);
 }
 
 UT_TEST(test_commit_window_failure_retains_original_owner_without_error)
 {
 	for (unsigned mode = 3; mode <= 8; mode++)
-		run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, mode, true);
+		run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, mode, true, 0);
 }
 
 UT_TEST(test_commit_window_never_enters_without_held_interrupts)
 {
-	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, false);
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, false, 0);
+}
+
+UT_TEST(test_committed_origin_waits_for_original_io_and_finite_owners)
+{
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 1);
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 14);
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 15);
+}
+
+UT_TEST(test_committed_origin_preserves_bounded_scan_and_wait_progress)
+{
+	for (unsigned origin_case = 2; origin_case <= 6; origin_case++)
+		run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, origin_case);
+}
+
+UT_TEST(test_committed_origin_rescans_changed_revisions_without_self_invalidation)
+{
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 7);
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 12);
+}
+
+UT_TEST(test_committed_origin_drift_and_error_keep_native_obligation)
+{
+	for (unsigned origin_case = 8; origin_case <= 11; origin_case++)
+		run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, origin_case);
+}
+
+UT_TEST(test_committed_origin_discard_scope_is_not_generic_io_or_retirement)
+{
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 13);
+}
+
+UT_TEST(test_committed_origin_self_or_failed_work_hands_off_without_waiting)
+{
+	for (unsigned origin_case = 16; origin_case <= 19; origin_case++)
+		run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, origin_case);
 }
 
 UT_TEST(test_prepared_mode_never_falls_back_from_changed_committed_identity)
@@ -1358,7 +1570,13 @@ UT_TEST(test_prepared_mode_keeps_original_completed_legacy_owner)
 int
 main(void)
 {
-	UT_PLAN(42);
+	UT_PLAN(48);
+	UT_RUN(test_committed_origin_self_or_failed_work_hands_off_without_waiting);
+	UT_RUN(test_committed_origin_waits_for_original_io_and_finite_owners);
+	UT_RUN(test_committed_origin_preserves_bounded_scan_and_wait_progress);
+	UT_RUN(test_committed_origin_rescans_changed_revisions_without_self_invalidation);
+	UT_RUN(test_committed_origin_drift_and_error_keep_native_obligation);
+	UT_RUN(test_committed_origin_discard_scope_is_not_generic_io_or_retirement);
 	UT_RUN(test_prepared_mode_never_falls_back_from_changed_committed_identity);
 	UT_RUN(test_prepared_mode_keeps_original_completed_legacy_owner);
 	UT_RUN(test_actual_commit_window_collects_ready_after_local_cleanup);

@@ -401,7 +401,7 @@ cluster_pcm_lock_ko_local_relation_discard_v4(RelFileLocator locator, uint64 for
 	ClusterPcmPiRelationScanV2 result;
 
 	local_discard_calls++;
-	UT_ASSERT(cluster_ko_directory_drop_retired_v3(locator));
+	UT_ASSERT(cluster_ko_local_drop_discard_current_v4(locator));
 	result = cluster_pcm_lock_ko_local_relation_scan_v3(locator, formation, budget, cursor);
 	return local_pi_only_pending && result == CLUSTER_PCM_PI_RELATION_PENDING
 		? CLUSTER_PCM_PI_RELATION_EMPTY : result;
@@ -901,10 +901,10 @@ int
 WaitLatch(Latch *latch, int events, long timeout, uint32 wait_event)
 {
 	if (native_window_wait_hook != NULL) {
-		UT_ASSERT(barrier_active && InterruptHoldoffCount != 0);
-		UT_ASSERT_EQ(timeout, cluster_sinval_ack_timeout_ms);
+		UT_ASSERT(InterruptHoldoffCount != 0);
+		UT_ASSERT_EQ(timeout, barrier_active ? cluster_sinval_ack_timeout_ms : 100);
 		UT_ASSERT_EQ(wait_event, WAIT_EVENT_CLUSTER_OBJECT_FLUSH_WAIT);
-		if (++barrier_waits > 8)
+		if ((barrier_active ? ++barrier_waits : ++origin_waits) > 8)
 			abort();
 		native_window_wait_hook();
 		return WL_TIMEOUT;
@@ -1319,7 +1319,7 @@ ClusterBufferDrainResult
 cluster_bufmgr_discard_relation_v4(RelFileLocator locator, uint32 *budget, uint32 *cursor)
 {
 	UT_ASSERT(SpinLockFree(&storage.shared_lock));
-	UT_ASSERT(cluster_ko_directory_drop_retired_v3(locator));
+	UT_ASSERT(cluster_ko_local_drop_discard_current_v4(locator));
 	UT_ASSERT(*budget > 0 && *budget <= 128);
 	committed_discard_calls++;
 	committed_discard_input = *cursor;

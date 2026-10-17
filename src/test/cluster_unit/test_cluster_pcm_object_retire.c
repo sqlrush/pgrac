@@ -325,6 +325,37 @@ UT_TEST(test_dead_local_pi_keeps_inflight_current_and_reference_gates)
 	}
 }
 
+UT_TEST(test_origin_discard_scope_does_not_retire_master_directory)
+{
+	BufferTag tag = make_tag(7499);
+	struct StopPcmEntryLayout *entry, before, expected;
+	uint32 cursor = 0;
+
+	cluster_node_id = 0;
+	(void)drop_local_fixture(tag);
+	object_drop_retired = false;
+	object_origin_discard = true; /* Exact KO owner tested by its production consumer. */
+	entry = directory_entry(tag);
+	pg_atomic_write_u32(&entry->pi_holders_bitmap, 5);
+	entry->pi_watermark_lsn = 200;
+	entry->pi_watermark_scn = 90;
+	before = *entry;
+	UT_ASSERT(!pcm_entry_try_retire_exact(&tag, entry->binding_generation,
+		PCM_RETIRE_REASON_OBJECT_RETIRED));
+	UT_ASSERT_EQ(memcmp(entry, &before, sizeof(before)), 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_ko_local_relation_discard_v4(object_drop_locator, 17, 128,
+		&cursor), CLUSTER_PCM_PI_RELATION_EMPTY);
+	expected = before;
+	memset(&expected.local_pi_first, 0, sizeof(expected.local_pi_first));
+	memset(&expected.local_pi_last, 0, sizeof(expected.local_pi_last));
+	expected.local_pi_revision++;
+	UT_ASSERT_EQ(memcmp(entry, &expected, sizeof(expected)), 0);
+	UT_ASSERT(!pcm_entry_try_retire_exact(&tag, entry->binding_generation,
+		PCM_RETIRE_REASON_OBJECT_RETIRED));
+	UT_ASSERT_EQ(memcmp(entry, &expected, sizeof(expected)), 0);
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+}
+
 /* Mutation under the entry lock must move only the two exact local refs;
  * the master entry and independent directory requests survive. */
 UT_TEST(test_local_drop_discard_preserves_remote_master_obligation)
@@ -557,7 +588,8 @@ UT_TEST(test_local_drop_discard_rechecks_binding_and_gate_after_entry_lock)
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(22);
+	UT_RUN(test_origin_discard_scope_does_not_retire_master_directory);
 	UT_RUN(test_terminal_drop_ends_directory_pi_without_data_or_ack);
 	UT_RUN(test_original_bounded_reclaim_retires_terminal_watermark_and_pi);
 	UT_RUN(test_unproven_or_wrong_object_keeps_original_debt);

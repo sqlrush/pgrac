@@ -11118,12 +11118,12 @@ pcm_pi_relation_scan_role(RelFileLocator locator, uint64 formation, uint32 budge
 	ForEachLWLockHeldByMe(pcm_normal_stop_note_held_lock, &held);
 	if (held)
 		return CLUSTER_PCM_PI_RELATION_INVALID;
-	/* This immutable exclusion is read before any directory lock. It grants
+	/* This exclusion is read before any directory lock. It grants
 	 * only dead-object reference retirement, never DATA or current rights. */
 	if (discard_local
 		&& (!cluster_enabled || !object_drain || role != PCM_RELATION_SCAN_LOCAL
 			|| cluster_node_id < 0 || cluster_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT
-			|| !cluster_ko_directory_drop_retired_v3(locator)))
+			|| !cluster_ko_local_drop_discard_current_v4(locator)))
 		return CLUSTER_PCM_PI_RELATION_INVALID;
 	position = *cursor;
 	end = position + Min(budget, (uint32)pcm_grd_effective - position);

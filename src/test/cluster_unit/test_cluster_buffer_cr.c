@@ -137,6 +137,7 @@ static int storage_route = 1;
 static RelFileLocator ko_locator;
 
 static bool ko_retired;
+static bool ko_origin_discard;
 bool
 cluster_ko_directory_drop_retired_v3(RelFileLocator locator)
 {
@@ -144,6 +145,12 @@ cluster_ko_directory_drop_retired_v3(RelFileLocator locator)
 	for (int i = 0; i < NBuffers; i++)
 		UT_ASSERT((pg_atomic_read_u32(&GetBufferDescriptor(i)->state) & BM_LOCKED) == 0);
 	return ko_retired && RelFileLocatorEquals(locator, ko_locator);
+}
+bool
+cluster_ko_local_drop_discard_current_v4(RelFileLocator locator)
+{
+	return cluster_ko_directory_drop_retired_v3(locator)
+		|| (ko_origin_discard && RelFileLocatorEquals(locator, ko_locator));
 }
 extern ClusterBufferDrainResult cluster_bufmgr_discard_relation_v4(RelFileLocator locator,
 																 uint32 *budget, uint32 *cursor);
@@ -671,7 +678,7 @@ reset_buffers(void)
 	storage_route = 1;
 	ko_cleaner_allowed = false;
 	ko_revision = 1;
-	ko_closed = ko_retired = false;
+	ko_closed = ko_retired = ko_origin_discard = false;
 	ko_close_at_header = header_calls = 0;
 	read_io_calls = object_waits = 0;
 	close_at_mapping = collision_at_mapping = false;
@@ -1827,6 +1834,23 @@ UT_TEST(test_committed_discard_removes_dirty_current_and_pi_all_forks_without_io
 	}
 }
 
+UT_TEST(test_origin_discard_scope_removes_dead_bytes_without_directory_retirement)
+{
+	BufferTag tag = reset_buffers();
+	uint32 budget = 128, cursor = 0;
+
+	ko_origin_discard = true; /* Exact native owner is the separate KO fixture. */
+	install_current(&tag, 2);
+	pg_atomic_fetch_or_u32(&GetBufferDescriptor(2)->state, BM_DIRTY);
+	UT_ASSERT(!cluster_ko_directory_drop_retired_v3(ko_locator));
+	UT_ASSERT_EQ(cluster_bufmgr_discard_relation_v4(ko_locator, &budget, &cursor),
+		CLUSTER_BUFFER_DRAIN_EMPTY);
+	UT_ASSERT_EQ(BufTableLookup(&tag, BufTableHashCode(&tag)), -1);
+	UT_ASSERT_EQ(frees, 1);
+	UT_ASSERT_EQ(physical_writes + lock_depth + remembered_pins, 0);
+	UT_ASSERT(!cluster_ko_directory_drop_retired_v3(ko_locator));
+}
+
 UT_TEST(test_committed_discard_keeps_pins_io_and_ownership_reservations)
 {
 	for (unsigned fault = 0; fault < 11; fault++) {
@@ -1900,7 +1924,8 @@ UT_TEST(test_committed_discard_removes_clean_cr_with_original_mapping_tail)
 int
 main(void)
 {
-	UT_PLAN(48);
+	UT_PLAN(49);
+	UT_RUN(test_origin_discard_scope_removes_dead_bytes_without_directory_retirement);
 	printf("# private pin entry: %zu bytes; current admission: %zu bytes\n",
 		   sizeof(PrivateRefCountEntry), sizeof(ClusterKoCurrentAdmissionV3));
 	UT_RUN(test_object_drain_bounds_scan_and_preserves_foreign_pin);

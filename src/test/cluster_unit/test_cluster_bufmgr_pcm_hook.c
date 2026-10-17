@@ -98,6 +98,12 @@ cluster_ko_directory_drop_retired_v3(RelFileLocator locator pg_attribute_unused(
 }
 
 bool
+cluster_ko_local_drop_discard_current_v4(RelFileLocator locator)
+{
+	return cluster_ko_directory_drop_retired_v3(locator);
+}
+
+bool
 cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 {
 	memset(out, 0, sizeof(*out));

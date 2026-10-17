@@ -458,6 +458,7 @@ static bool fake_lwlock_conditional_fail_once = false;
 /* Object publication and its entered-I/O drain are tested by the KO fixture.
  * This directory fixture supplies only their exact immutable terminal result. */
 static bool object_drop_retired;
+static bool object_origin_discard;
 static RelFileLocator object_drop_locator;
 static unsigned object_drop_queries;
 bool cluster_ko_directory_drop_retired_v3(RelFileLocator locator);
@@ -467,6 +468,13 @@ cluster_ko_directory_drop_retired_v3(RelFileLocator locator)
 	UT_ASSERT_EQ(fake_lwlock_depth, 0);
 	object_drop_queries++;
 	return object_drop_retired && RelFileLocatorEquals(locator, object_drop_locator);
+}
+bool cluster_ko_local_drop_discard_current_v4(RelFileLocator locator);
+bool
+cluster_ko_local_drop_discard_current_v4(RelFileLocator locator)
+{
+	return cluster_ko_directory_drop_retired_v3(locator)
+		|| (object_origin_discard && RelFileLocatorEquals(locator, object_drop_locator));
 }
 
 /* PGRAC: spec-2.31 D1 v0.4 — ConditionVariable stub counters (declared
@@ -637,7 +645,7 @@ s_lock(volatile slock_t *lock, const char *file pg_attribute_unused(),
 static void
 reset_fake_pcm_runtime(int max_entries)
 {
-	object_drop_retired = false;
+	object_drop_retired = object_origin_discard = false;
 	memset(&object_drop_locator, 0, sizeof(object_drop_locator));
 	object_drop_queries = 0;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_1;

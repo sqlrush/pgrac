@@ -247,6 +247,10 @@ extern bool cluster_ko_directory_drop_committed_v3(RelFileLocator locator);
 /* Stronger than committed: original entered directory calls have drained.
  * Read outside PCM locks; immutable until shared-state reinitialization. */
 extern bool cluster_ko_directory_drop_retired_v3(RelFileLocator locator);
+/* Dead local bytes/PI only: peer retirement or this backend's exact committed
+ * origin discard window. Read outside buffer/PCM locks. Not I/O authority,
+ * directory retirement, final SPACE or a completed native deletion. */
+extern bool cluster_ko_local_drop_discard_current_v4(RelFileLocator locator);
 
 /* A local admission sample for one locator, not an AX or completion proof.
  * Sample outside mapping/header/PCM locks. Revalidate under the original
