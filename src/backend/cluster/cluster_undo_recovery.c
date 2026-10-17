@@ -12,6 +12,7 @@
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_mode.h"
+#include "cluster/cluster_remote_xact.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_wal_tail.h"
@@ -31,6 +32,7 @@ typedef struct RecoveryAbortScope {
 	RfPageOnlineRecordIdentityV1 identity;
 	ClusterRecoveryTTAbortV1 record;
 	bool clog_active;
+	bool projection_active;
 } RecoveryAbortScope;
 
 static const RecoveryAbortScope *active_abort;
@@ -205,6 +207,30 @@ cluster_undo_recovery_abort_replay_v1(const RfSideOnlinePlanV1 *plan, uint32 ind
 														   TRANSACTION_STATUS_ABORTED)
 				 && recovery_abort_current(&scope);
 			scope.clog_active = false;
+			if (ok) {
+				ClusterRemoteXactMutationV2 mutation;
+				SCN scn = InvalidScn;
+				uint16 wrap = 0;
+				bool wrap_valid = false;
+
+				/* Derived target projection follows canonical and native
+				 * durability. The WAL writer remains a separate identity. */
+				scope.projection_active = true;
+				mutation = cluster_remote_xact_store_terminal_v2(
+					scope.record.target_thread - 1, scope.record.exact.xid, false, NULL,
+					CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, 0, false, 0);
+				scope.projection_active = false;
+				ok = (mutation == CLUSTER_REMOTE_XACT_MUTATION_STORED
+					  || mutation == CLUSTER_REMOTE_XACT_MUTATION_UNCHANGED)
+					 && recovery_abort_current(&scope);
+				if (ok)
+					ok = cluster_remote_commit_outcome_ex(scope.record.target_thread - 1,
+														  scope.record.exact.xid, &scn, &wrap,
+														  &wrap_valid)
+							 == CLUSTER_REMOTE_XACT_ABORTED
+						 && scn == InvalidScn && !wrap_valid && wrap == 0
+						 && recovery_abort_current(&scope);
+			}
 		}
 	}
 	PG_FINALLY();
@@ -322,6 +348,15 @@ cluster_undo_recovery_abort_clog_authorized_v1(int origin_node, TransactionId xi
 {
 	return origin_node >= 0 && origin_node < 128 && active_abort != NULL
 		   && active_abort->clog_active && active_abort->record.target_thread == origin_node + 1
+		   && active_abort->record.exact.xid == xid && recovery_abort_current(active_abort);
+}
+
+bool
+cluster_undo_recovery_abort_projection_authorized_v1(int origin_node, TransactionId xid)
+{
+	return origin_node >= 0 && origin_node < 128 && active_abort != NULL
+		   && active_abort->projection_active
+		   && active_abort->record.target_thread == origin_node + 1
 		   && active_abort->record.exact.xid == xid && recovery_abort_current(active_abort);
 }
 

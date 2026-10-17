@@ -37,11 +37,18 @@ char *cluster_shared_data_dir;
 int pg_dir_create_mode = S_IRWXU;
 static bool fixture_startup;
 static int fixture_authorized_origin = -1;
+static bool fixture_c0_projection;
 
 bool
 cluster_undo_recovery_origin_authorized_v1(int origin)
 {
 	return origin == fixture_authorized_origin;
+}
+
+bool
+cluster_undo_recovery_abort_projection_authorized_v1(int origin, TransactionId xid)
+{
+	return fixture_c0_projection && origin == 1 && xid == 1000;
 }
 #undef AmStartupProcess
 #define AmStartupProcess() fixture_startup
@@ -78,7 +85,8 @@ static bool expect_error;
 static jmp_buf error_boundary;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
-static bool fixture_native_directory_ready(SlruCtl ctl, int origin, bool write);
+static bool fixture_native_directory_ready(SlruCtl ctl, int origin, bool write,
+										   TransactionId abort_xid);
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -110,14 +118,14 @@ pg_re_throw(void)
 }
 
 static bool
-remote_xact_directory_ready(SlruCtl ctl, int origin, bool write)
+remote_xact_directory_ready(SlruCtl ctl, int origin, bool write, TransactionId abort_xid)
 {
 	directory_checks++;
 	UT_ASSERT(ctl == fixture_expected_ctl && origin == 1);
 	UT_ASSERT_EQ(access_lock_depth, 1);
 	(void)write;
 	if (fixture_files)
-		return fixture_native_directory_ready(ctl, origin, write);
+		return fixture_native_directory_ready(ctl, origin, write, abort_xid);
 	return fixture_directory_ok;
 }
 
@@ -138,8 +146,10 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 	if (lock == &fixture_access_lock) {
 		UT_ASSERT(mode == LW_EXCLUSIVE && access_lock_depth == 0 && lock_depth == 0);
 		access_lock_depth++;
-		if (fixture_revoke_on_lock)
+		if (fixture_revoke_on_lock) {
 			fixture_authorized_origin = -1;
+			fixture_c0_projection = false;
+		}
 		return true;
 	}
 	UT_ASSERT(lock == &fixture_lock && mode == LW_EXCLUSIVE && lock_depth == 0);
@@ -325,6 +335,7 @@ reset_fixture(void)
 	fixture_startup = false;
 	cluster_shared_config = false;
 	fixture_authorized_origin = -1;
+	fixture_c0_projection = false;
 	fixture_physical_exists = false;
 	fixture_files = false;
 	physical_reads = 0;
@@ -684,10 +695,136 @@ UT_TEST(shared_origin_projection_survives_writer_exit_and_local_directory_change
 	UT_ASSERT_EQ(rmdir(root), 0);
 }
 
+UT_TEST(c0_abort_permission_is_exact_and_does_not_grant_an_origin)
+{
+	const uint8 digest[28] = { 1 };
+	reset_fixture();
+	cluster_shared_config = fixture_startup = fixture_c0_projection = true;
+	fixture_expected_ctl = &ClusterRemoteXactOriginCtlData[1];
+	UT_ASSERT_EQ(cluster_remote_xact_store_terminal_v2(
+					 1, 1001, false, NULL, CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, 0, false, 0),
+				 CLUSTER_REMOTE_XACT_MUTATION_INVALID);
+	UT_ASSERT_EQ(cluster_remote_xact_store_terminal_v2(
+					 2, 1000, false, NULL, CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, 0, false, 0),
+				 CLUSTER_REMOTE_XACT_MUTATION_INVALID);
+	UT_ASSERT_EQ(cluster_remote_xact_store_terminal_v2(
+					 1, 1000, false, NULL, CLUSTER_REMOTE_XACT_COMMITTED, 12, 34, true, 2),
+				 CLUSTER_REMOTE_XACT_MUTATION_INVALID);
+	UT_ASSERT_EQ(cluster_remote_xact_store_terminal_v2(
+					 1, 1000, true, digest, CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, 0, false, 0),
+				 CLUSTER_REMOTE_XACT_MUTATION_INVALID);
+	UT_ASSERT_EQ(cluster_remote_xact_store_terminal_v2(
+					 1, 1000, false, digest, CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, 0, false, 0),
+				 CLUSTER_REMOTE_XACT_MUTATION_INVALID);
+	UT_ASSERT_EQ(cluster_remote_xact_store_prepared_v2(1, 1000, digest),
+				 CLUSTER_REMOTE_XACT_MUTATION_INVALID);
+	UT_ASSERT(!cluster_remote_xact_reset_range_v2(1, 1000, 1));
+	UT_ASSERT(!cluster_remote_xact_truncate_before_v2(1, 16384));
+	UT_ASSERT_EQ(writes + syncs + dirsyncs + directory_checks + deletes, 0);
+	fixture_startup = false;
+	cluster_remote_xact_online_writer_push();
+	UT_ASSERT_EQ(cluster_remote_xact_store_terminal_v2(
+					 1, 1000, false, NULL, CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, 0, false, 0),
+				 CLUSTER_REMOTE_XACT_MUTATION_INVALID);
+	cluster_remote_xact_online_writer_pop();
+	fixture_startup = true;
+	UT_ASSERT_EQ(cluster_remote_xact_store_terminal_v2(
+					 1, 1000, false, NULL, CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, 0, false, 0),
+				 CLUSTER_REMOTE_XACT_MUTATION_STORED);
+	UT_ASSERT_EQ(writes, 1);
+	UT_ASSERT_EQ(syncs, 1);
+	UT_ASSERT_EQ(dirsyncs, 1);
+	fixture_c0_projection = false;
+	UT_ASSERT_EQ(cluster_remote_xact_store_terminal_v2(
+					 1, 1000, false, NULL, CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, 0, false, 0),
+				 CLUSTER_REMOTE_XACT_MUTATION_INVALID);
+	UT_ASSERT_EQ(writes, 1);
+	UT_ASSERT_EQ(lock_depth + access_lock_depth, 0);
+}
+
+UT_TEST(c0_projection_retains_conflict_revocation_and_error_cleanup)
+{
+	reset_fixture();
+	cluster_shared_config = fixture_startup = true;
+	fixture_expected_ctl = &ClusterRemoteXactOriginCtlData[1];
+	fixture_authorized_origin = 1;
+	UT_ASSERT_EQ(cluster_remote_xact_store_terminal_v2(
+					 1, 1000, false, NULL, CLUSTER_REMOTE_XACT_COMMITTED, 12, 34, true, 2),
+				 CLUSTER_REMOTE_XACT_MUTATION_STORED);
+	fixture_authorized_origin = -1;
+	fixture_c0_projection = true;
+	UT_ASSERT_EQ(cluster_remote_xact_store_terminal_v2(
+					 1, 1000, false, NULL, CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, 0, false, 0),
+				 CLUSTER_REMOTE_XACT_MUTATION_CONFLICT);
+	UT_ASSERT_EQ(writes, 1);
+	for (int fault = 0; fault < 2; fault++) {
+		reset_fixture();
+		cluster_shared_config = fixture_startup = fixture_c0_projection = true;
+		fixture_expected_ctl = &ClusterRemoteXactOriginCtlData[1];
+		fixture_revoke_on_lock = fault == 0;
+		sync_error = fault == 1 ? -1 : 0;
+		expect_error = true;
+		if (setjmp(error_boundary) == 0) {
+			UT_ASSERT_EQ(cluster_remote_xact_store_terminal_v2(1, 1000, false, NULL,
+															   CLUSTER_REMOTE_XACT_ABORTED,
+															   InvalidScn, 0, false, 0),
+						 CLUSTER_REMOTE_XACT_MUTATION_INVALID);
+			UT_ASSERT_EQ(fault, 0);
+		}
+		expect_error = false;
+		UT_ASSERT_EQ(lock_depth + access_lock_depth, 0);
+		UT_ASSERT(!fixture_dirty[0]);
+		UT_ASSERT_EQ(fixture_status[0], SLRU_PAGE_EMPTY);
+		if (fault == 0)
+			UT_ASSERT_EQ(writes + directory_checks, 0);
+	}
+}
+
+UT_TEST(c0_projection_reads_back_original_target_files_without_cached_success)
+{
+	char root[] = "/tmp/pre2-c0-projection-XXXXXX";
+	char native[MAXPGPATH], origin[MAXPGPATH], segment[MAXPGPATH];
+	SCN scn;
+	uint16 wrap;
+	bool wrap_valid;
+	reset_fixture();
+	UT_ASSERT(mkdtemp(root) != NULL);
+	snprintf(native, sizeof(native), "%s/native_side", root);
+	snprintf(origin, sizeof(origin), "%s/origin_1", native);
+	UT_ASSERT_EQ(mkdir(native, 0700), 0);
+	UT_ASSERT_EQ(mkdir(origin, 0700), 0);
+	fixture_files = cluster_shared_config = fixture_startup = fixture_c0_projection = true;
+	fixture_expected_ctl = &ClusterRemoteXactOriginCtlData[1];
+	cluster_shared_data_dir = root;
+	snprintf(fixture_expected_ctl->Dir, sizeof(fixture_expected_ctl->Dir), "%s/pg_xact_remote_v2",
+			 origin);
+	UT_ASSERT_EQ(cluster_remote_xact_store_terminal_v2(
+					 1, 1000, false, NULL, CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, 0, false, 0),
+				 CLUSTER_REMOTE_XACT_MUTATION_STORED);
+	fixture_c0_projection = false;
+	memset(fixture_page.data, 0xAA, BLCKSZ);
+	fixture_number[0] = cluster_remote_xact_pageno(1, 1000);
+	fixture_status[0] = SLRU_PAGE_VALID;
+	UT_ASSERT_EQ(cluster_remote_commit_outcome_ex(1, 1000, &scn, &wrap, &wrap_valid),
+				 CLUSTER_REMOTE_XACT_ABORTED);
+	UT_ASSERT(scn == InvalidScn && !wrap_valid && wrap == 0);
+	UT_ASSERT_EQ(physical_reads, 1);
+	snprintf(segment, sizeof(segment), "%s/%04X", fixture_expected_ctl->Dir,
+			 cluster_remote_xact_pageno(1, 1000) / SLRU_PAGES_PER_SEGMENT);
+	UT_ASSERT_EQ(unlink(segment), 0);
+	UT_ASSERT_EQ(cluster_remote_commit_outcome_ex(1, 1000, &scn, &wrap, &wrap_valid),
+				 CLUSTER_REMOTE_XACT_INDOUBT);
+	UT_ASSERT_EQ(lock_depth + access_lock_depth, 0);
+	UT_ASSERT_EQ(rmdir(fixture_expected_ctl->Dir), 0);
+	UT_ASSERT_EQ(rmdir(origin), 0);
+	UT_ASSERT_EQ(rmdir(native), 0);
+	UT_ASSERT_EQ(rmdir(root), 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(19);
 	UT_RUN(ordinary_backend_cannot_prepare);
 	UT_RUN(ordinary_backend_cannot_publish_terminal);
 	UT_RUN(ordinary_backend_cannot_reset_or_truncate);
@@ -704,6 +841,9 @@ main(void)
 	UT_RUN(shared_projection_sync_error_clears_cache_and_access_lock);
 	UT_RUN(shared_invalid_arguments_and_revoked_owner_have_no_directory_effect);
 	UT_RUN(shared_origin_projection_survives_writer_exit_and_local_directory_change);
+	UT_RUN(c0_abort_permission_is_exact_and_does_not_grant_an_origin);
+	UT_RUN(c0_projection_retains_conflict_revocation_and_error_cleanup);
+	UT_RUN(c0_projection_reads_back_original_target_files_without_cached_success);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

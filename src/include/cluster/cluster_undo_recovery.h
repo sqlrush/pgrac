@@ -26,8 +26,8 @@ extern bool cluster_undo_recovery_scope_enter_v1(ClusterUndoRecoveryScopeV1 *sco
 extern void cluster_undo_recovery_scope_leave_v1(ClusterUndoRecoveryScopeV1 *scope);
 /* Replay one already sealed C0 inside Startup's original pass-2 window,
  * under separate current writer/target owners.
- * Success covers the exact durable TT slot and its target-native ABORT bit,
- * not derived projections, cleanup, N4 or whole-source recovery completion. */
+ * Success covers the exact durable TT slot, target-native ABORT bit and its
+ * derived projection, not cleanup, N4 or whole-source recovery completion. */
 extern bool cluster_undo_recovery_abort_replay_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 												  const RfPageOnlineRecordIdentityV1 *identity,
 												  const ClusterThreadRecoveryAuthorityV1 *writer,
@@ -40,6 +40,9 @@ extern bool cluster_undo_recovery_cold_origin_authorized_v1(int origin_node);
 /* Only the already-durable exact C0 target's top-level native ABORT bit.
  * This does not authorize an origin scope or other native operations. */
 extern bool cluster_undo_recovery_abort_clog_authorized_v1(int origin_node, TransactionId xid);
+/* Exact C0-derived ABORT only, after native TT/CLOG completion. */
+extern bool cluster_undo_recovery_abort_projection_authorized_v1(int origin_node,
+																 TransactionId xid);
 /* Sync the original cold source once in this scope, never a local WAL LSN.
  * A successful physical sync remains subject to the full original authority. */
 extern bool cluster_undo_recovery_cold_source_sync_v1(int origin_node);

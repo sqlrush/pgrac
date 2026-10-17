@@ -5,6 +5,7 @@
 #include "access/clog.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_remote_xact.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_wal_tail.h"
@@ -37,6 +38,9 @@ static int fail_sync, fail_read_source, throw_stage, drift_stage, drift_kind;
 static bool fail_prepare, fail_write, fail_close;
 static bool fail_clog_apply, fail_clog_verify;
 static unsigned clog_applies, clog_verifies;
+static unsigned projection_stores, projection_reads;
+static ClusterRemoteXactMutationV2 projection_result;
+static int projection_read_fault;
 static char order[64];
 static unsigned order_count;
 
@@ -252,6 +256,7 @@ cluster_undo_smgr_recovery_abort_prepare_v1(const ClusterRecoveryTTAbortV1 *reco
 	UT_ASSERT(!cluster_undo_recovery_cold_origin_authorized_v1(1));
 	UT_ASSERT(!cluster_undo_recovery_origin_authorized_v1(2));
 	UT_ASSERT(!cluster_undo_recovery_abort_clog_authorized_v1(1, record->exact.xid));
+	UT_ASSERT(!cluster_undo_recovery_abort_projection_authorized_v1(1, record->exact.xid));
 	UT_ASSERT(!cluster_undo_recovery_scope_enter_v1(&ordinary, &authorities[1], plan));
 	UT_ASSERT(cluster_undo_recovery_path_resolve_v1(2, 257, path, sizeof(path)) == 0);
 	UT_ASSERT(strcmp(path, "/shared/undo/2/257") == 0);
@@ -295,6 +300,7 @@ clog_exact_scope(int origin, TransactionId xid, int nsubxids, const TransactionI
 	UT_ASSERT_EQ(status, TRANSACTION_STATUS_ABORTED);
 	UT_ASSERT(fd_held && synced[0] && synced[1]);
 	UT_ASSERT_EQ(disk_slot.status, TT_SLOT_ABORTED);
+	UT_ASSERT(!cluster_undo_recovery_abort_projection_authorized_v1(origin, xid));
 	UT_ASSERT(cluster_undo_recovery_abort_clog_authorized_v1(origin, xid));
 	UT_ASSERT(!cluster_undo_recovery_abort_clog_authorized_v1(origin, xid + 1));
 	UT_ASSERT(!cluster_undo_recovery_abort_clog_authorized_v1(2, xid));
@@ -324,6 +330,51 @@ cluster_clog_native_recovery_verify_v1(int origin, TransactionId xid, int nsubxi
 	clog_exact_scope(origin, xid, nsubxids, children, status);
 	inject(6);
 	return !fail_clog_verify;
+}
+
+ClusterRemoteXactMutationV2
+cluster_remote_xact_store_terminal_v2(int origin, TransactionId xid, bool prepared,
+									  const uint8 digest[28], ClusterRemoteXactOutcome outcome,
+									  SCN scn, TimestampTz timestamp, bool wrap_valid, uint16 wrap)
+{
+	projection_stores++;
+	note('M');
+	UT_ASSERT_EQ(origin, 1); /* Target thread 2, not writer thread 3. */
+	UT_ASSERT_EQ(xid, 0x400102);
+	UT_ASSERT(!prepared && digest == NULL && outcome == CLUSTER_REMOTE_XACT_ABORTED);
+	UT_ASSERT(scn == InvalidScn && timestamp == 0 && !wrap_valid && wrap == 0);
+	UT_ASSERT(fd_held && synced[0] && synced[1] && disk_slot.status == TT_SLOT_ABORTED);
+	UT_ASSERT(clog_applies == 1 && clog_verifies == 1);
+	UT_ASSERT(!cluster_undo_recovery_abort_clog_authorized_v1(origin, xid));
+	UT_ASSERT(!cluster_undo_recovery_origin_authorized_v1(origin));
+	UT_ASSERT(!cluster_undo_recovery_cold_origin_authorized_v1(origin));
+	UT_ASSERT(cluster_undo_recovery_abort_projection_authorized_v1(origin, xid));
+	UT_ASSERT(!cluster_undo_recovery_abort_projection_authorized_v1(origin, xid + 1));
+	UT_ASSERT(!cluster_undo_recovery_abort_projection_authorized_v1(2, xid));
+	UT_ASSERT(!cluster_undo_recovery_abort_projection_authorized_v1(-1, xid));
+	UT_ASSERT(!cluster_undo_recovery_abort_projection_authorized_v1(128, xid));
+	inject(7);
+	return projection_result;
+}
+
+ClusterRemoteXactOutcome
+cluster_remote_commit_outcome_ex(int origin, TransactionId xid, SCN *scn, uint16 *wrap,
+								 bool *wrap_valid)
+{
+	projection_reads++;
+	note('Q');
+	UT_ASSERT_EQ(origin, 1);
+	UT_ASSERT_EQ(xid, 0x400102);
+	UT_ASSERT_EQ(projection_stores, 1);
+	/* The write capability ends before the independent read. */
+	UT_ASSERT(!cluster_undo_recovery_abort_projection_authorized_v1(origin, xid));
+	*scn = projection_read_fault == 1 ? 17 : InvalidScn;
+	*wrap = projection_read_fault == 2 ? 9 : 0;
+	*wrap_valid = projection_read_fault == 2;
+	inject(8);
+	return projection_read_fault == 3	? CLUSTER_REMOTE_XACT_COMMITTED
+		   : projection_read_fault == 4 ? CLUSTER_REMOTE_XACT_INDOUBT
+										: CLUSTER_REMOTE_XACT_ABORTED;
 }
 
 bool
@@ -359,6 +410,9 @@ reset(void)
 	fail_prepare = fail_write = fail_close = false;
 	fail_clog_apply = fail_clog_verify = false;
 	clog_applies = clog_verifies = 0;
+	projection_stores = projection_reads = 0;
+	projection_result = CLUSTER_REMOTE_XACT_MUTATION_STORED;
+	projection_read_fault = 0;
 	for (int i = 0; i < 2; i++) {
 		ClusterWalThreadClaimRefV2 *ref = &sources[i].claim;
 		ref->identity.system_identifier = system_id;
@@ -438,6 +492,8 @@ no_path(void)
 	UT_ASSERT(!fd_held);
 	UT_ASSERT(
 		!cluster_undo_recovery_abort_clog_authorized_v1(1, operation.recovery_abort.exact.xid));
+	UT_ASSERT(!cluster_undo_recovery_abort_projection_authorized_v1(
+		1, operation.recovery_abort.exact.xid));
 	UT_ASSERT_EQ(cluster_undo_recovery_path_resolve_v1(2, 257, path, sizeof(path)), -1);
 	UT_ASSERT_EQ(cluster_undo_recovery_intent_for_owner(2), CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL);
 }
@@ -447,9 +503,11 @@ UT_TEST(exact_c0_replay_binds_two_owners_and_durable_order)
 	reset();
 	UT_ASSERT(cluster_recovery_tt_abort_valid_v1(&operation.recovery_abort));
 	UT_ASSERT(apply());
-	UT_ASSERT(strcmp(order, "WTPSAVC") == 0);
+	UT_ASSERT(strcmp(order, "WTPSAVMQC") == 0);
 	UT_ASSERT_EQ(clog_applies, 1);
 	UT_ASSERT_EQ(clog_verifies, 1);
+	UT_ASSERT_EQ(projection_stores, 1);
+	UT_ASSERT_EQ(projection_reads, 1);
 	UT_ASSERT_EQ(disk_slot.status, TT_SLOT_ABORTED);
 	UT_ASSERT_EQ(closes, 1);
 	no_path();
@@ -578,13 +636,15 @@ UT_TEST(sync_prepare_write_close_failure_never_reports_completion)
 		UT_ASSERT_EQ(closes, fault >= 5 ? 1 : 0);
 		UT_ASSERT_EQ(clog_applies, fault >= 6 ? 1 : 0);
 		UT_ASSERT_EQ(clog_verifies, fault == 6 || fault == 8 ? 1 : 0);
+		UT_ASSERT_EQ(projection_stores, fault == 6 ? 1 : 0);
+		UT_ASSERT_EQ(projection_reads, fault == 6 ? 1 : 0);
 		no_path();
 	}
 }
 
 UT_TEST(authority_drift_at_each_io_boundary_is_not_success)
 {
-	for (int stage = 1; stage <= 6; stage++)
+	for (int stage = 1; stage <= 8; stage++)
 		for (int fault = 0; fault < 10; fault++) {
 			reset();
 			drift_stage = stage;
@@ -598,7 +658,7 @@ UT_TEST(authority_drift_at_each_io_boundary_is_not_success)
 
 UT_TEST(error_rethrows_and_removes_target_scope_and_held_descriptor)
 {
-	for (int stage = 1; stage <= 6; stage++) {
+	for (int stage = 1; stage <= 8; stage++) {
 		volatile bool caught = false;
 		reset();
 		throw_stage = stage;
@@ -634,16 +694,37 @@ UT_TEST(replay_does_not_reuse_prior_authority_or_sync_success)
 	UT_ASSERT(!apply());
 	UT_ASSERT_EQ(writes, 1);
 	current[1] = CLUSTER_THREAD_AUTHORITY_OK;
+	clog_applies = clog_verifies = projection_stores = projection_reads = 0;
 	UT_ASSERT(apply());
 	UT_ASSERT_EQ(writes, 2);
 	UT_ASSERT_EQ(sync_calls, 4);
 	no_path();
 }
 
+UT_TEST(projection_conflict_or_bad_readback_never_reports_completion)
+{
+	for (int fault = 0; fault < 7; fault++) {
+		reset();
+		if (fault == 0)
+			projection_result = CLUSTER_REMOTE_XACT_MUTATION_CONFLICT;
+		else if (fault == 1)
+			projection_result = CLUSTER_REMOTE_XACT_MUTATION_INVALID;
+		else if (fault == 2)
+			projection_result = CLUSTER_REMOTE_XACT_MUTATION_UNCHANGED;
+		else
+			projection_read_fault = fault - 2;
+		UT_ASSERT_EQ(apply(), fault == 2);
+		UT_ASSERT_EQ(projection_stores, 1);
+		UT_ASSERT_EQ(projection_reads, fault >= 2 ? 1 : 0);
+		UT_ASSERT_EQ(closes, 1);
+		no_path();
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
 	UT_RUN(exact_c0_replay_binds_two_owners_and_durable_order);
 	UT_RUN(missing_authority_or_changed_claim_refuses_before_io);
 	UT_RUN(wrong_record_or_crossed_authorities_never_resolve_a_path);
@@ -652,6 +733,7 @@ main(void)
 	UT_RUN(error_rethrows_and_removes_target_scope_and_held_descriptor);
 	UT_RUN(replay_outside_original_startup_window_cannot_mutate);
 	UT_RUN(replay_does_not_reuse_prior_authority_or_sync_success);
+	UT_RUN(projection_conflict_or_bad_readback_never_reports_completion);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
