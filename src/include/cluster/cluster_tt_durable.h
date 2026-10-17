@@ -454,6 +454,8 @@ extern ClusterTtRecoveryLiveness cluster_tt_recovery_xact_liveness(TransactionId
 
 /*
  * cluster_tt_recovery_resolve_active_slots -- legacy instance-local scan.
+ *	Shared scans skip only absent final paths; present segments must pass the
+ *	original full-size/identity probe, including noncurrent/generation-0 slots.
  *	Shared ACTIVE slots refuse before local CLOG/process lookup or mutation;
  *	nonshared slots retain the original liveness-based ABORTED transition.
  *	Called once from StartupXLOG after recovery completes (WAL

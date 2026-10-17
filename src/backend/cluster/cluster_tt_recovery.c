@@ -90,16 +90,18 @@ cluster_tt_recovery_xact_liveness(TransactionId xid)
 /*
  * cluster_tt_recovery_resolve_active_slots -- spec-4.8 D1.
  *
- *	Scan this instance's undo segment headers. Shared ACTIVE slots refuse
- *	before consulting local liveness; nonshared slots retain the original
- *	transition to ABORTED unless their owning transaction is LIVE.
+ *	Scan this instance's undo segment headers. Shared scans skip only an
+ *	absent final path and require the original full-size/identity probe for
+ *	present segments. Shared ACTIVE slots refuse before consulting local
+ *	liveness; nonshared slots retain the original transition to ABORTED
+ *	unless their owning transaction is LIVE.
  *	Returns the number of slots resolved to ABORTED.
  *
  *	Called once from StartupXLOG after recovery completes (WAL writes enabled,
  *	prepared set loaded, RecoveryInProgress() false).  Gated by cluster.enabled
  *	+ cluster.tt_recovery_resolve_active.
  *
- *	The legacy read-miss skip is not a complete shared inventory: no caller
+ *	This instance-local scan is not a complete shared inventory: no caller
  *	may interpret zero resolved slots as transaction recovery completion.
  *	Nonshared durable_abort performs a targeted slot RMW, preserving the
  *	other slots in the in-memory iteration snapshot.
@@ -129,9 +131,24 @@ cluster_tt_recovery_resolve_active_slots(void)
 		UndoSegmentHeaderData *hdr;
 		uint16 i;
 
-		if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner), segment_id, owner,
-										  0, blockbuf.data))
-			continue; /* absent / unreadable -> skip (never false-abort) */
+		if (cluster_shared_config) {
+			ClusterUndoSmgrFinalState state;
+
+			state = cluster_undo_smgr_probe_segment(cluster_undo_intent_for_owner(owner),
+													segment_id, owner, blockbuf.data);
+			if (state == CLUSTER_UNDO_SMGR_FINAL_ABSENT)
+				continue;
+			if (state != CLUSTER_UNDO_SMGR_FINAL_EXACT)
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						 errmsg("could not validate published undo segment for shared recovery"),
+						 errdetail("Undo segment %u, owner %u, final-path probe state %d.",
+								   segment_id, (unsigned)owner, (int)state),
+						 errhint("Preserve the original DATA and WAL. A damaged or unreadable "
+								 "segment cannot be treated as absent.")));
+		} else if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner), segment_id,
+												 owner, 0, blockbuf.data))
+			continue; /* Original nonshared read-miss behavior. */
 
 		hdr = (UndoSegmentHeaderData *)blockbuf.data;
 		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
