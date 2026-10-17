@@ -41,8 +41,8 @@ CopyErrorData(void)
 {
 	abort();
 }
-void
-FlushErrorState(void)
+static void
+drop_storage_flush_error(void)
 {
 	abort();
 }
@@ -322,7 +322,11 @@ work_statfs(int fd, struct statfs *out)
 #undef pg_fsync
 #undef ftruncate
 int cluster_smgr_which_for(RelFileLocator locator, BackendId backend);
+/* Keep the original storage ERROR boundary separate from the native
+ * committed-window error-state consumer supplied by test_cluster_ko_stop. */
+#define FlushErrorState drop_storage_flush_error
 #include "../../backend/cluster/storage/cluster_smgr.c"
+#undef FlushErrorState
 
 static int
 descriptor_count(void)

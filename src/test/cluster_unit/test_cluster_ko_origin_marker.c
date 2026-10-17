@@ -75,6 +75,7 @@ static void
 origin_native_tail(void)
 {
 	bool is_parallel_worker = false;
+	ClusterSpaceDropState *deferred_space_drop = NULL; /* Legacy marker fixture. */
 #define AtEOXact_Inval origin_publication
 #define smgrDoPendingDeletes origin_pending_deletes
 #include "test_cluster_ko_postcommit.inc"

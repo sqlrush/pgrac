@@ -1286,7 +1286,10 @@ ko_origin_drop_identity_locked(const ClusterKoSharedContext *context)
 {
 	KoDropIdentity *identity;
 
-	if (!context->v3 || context->request_v3.operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP
+	if (!context->v3
+		|| (context->request_v3.operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP
+			&& (!context->committed_discard
+				|| context->request_v3.operation != CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD))
 		|| context->drop_identity == 0 || context->drop_identity > KO_DROP_IDENTITY_CAPACITY
 		|| context->drop_identity_serial == 0)
 		return NULL;
@@ -1305,7 +1308,10 @@ ko_origin_drop_io_closed(const ClusterKoSharedContext *context)
 	KoDropIdentity *identity;
 	bool closed = false;
 
-	if (!context->v3 || context->request_v3.operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP)
+	if (!context->v3
+		|| (context->request_v3.operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP
+			&& (!context->committed_discard
+				|| context->request_v3.operation != CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD)))
 		return true;
 	SpinLockAcquire(&ko_state->shared_lock);
 	identity = ko_origin_drop_identity_locked(context);
@@ -5712,7 +5718,9 @@ cluster_ko_shared_drop_work_finish_v2(ClusterKoDropWorkV2 **work)
 		return false;
 	owned = *work;
 	retired_drop = owned->context.v3
-		&& owned->context.request_v3.operation == CLUSTER_KO_SHARED_V3_OPERATION_DROP;
+		&& (owned->context.request_v3.operation == CLUSTER_KO_SHARED_V3_OPERATION_DROP
+			|| (owned->context.committed_discard
+				&& owned->context.request_v3.operation == CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD));
 	SpinLockAcquire(&ko_state->shared_lock);
 	if (retired_drop) {
 		KoDropIdentity *identity = ko_origin_drop_identity_locked(&owned->context);
@@ -7887,7 +7895,7 @@ ko_native_origin_discard_v4(ClusterKoCompletionV2 *owned, ClusterKoNativeContinu
 /* This phase may only borrow the committed operation's original call slot.
  * Generic CLOSING admission remains closed, including other calls by this PID. */
 static bool
-ko_native_space_owner_current(const ClusterKoCompletionV2 *owned)
+ko_native_final_owner_current(const ClusterKoCompletionV2 *owned, bool observed)
 {
 	return owned != NULL && ko_state != NULL && cluster_enabled && cluster_shared_config
 		&& cluster_interconnect_tier == CLUSTER_IC_TIER_1 && !RecoveryInProgress()
@@ -7898,9 +7906,15 @@ ko_native_space_owner_current(const ClusterKoCompletionV2 *owned)
 		&& CurTransactionResourceOwner == TopTransactionResourceOwner
 		&& owned->native_transaction && owned->postcommit && owned->native_handed_off
 		&& !owned->native_pending && owned->barrier_v3 && owned->barrier_committed_discard
-		&& !owned->barrier_private && !owned->space_observed && owned->origin_data_closed
+		&& !owned->barrier_private && owned->space_observed == observed && owned->origin_data_closed
 		&& owned->pid == MyProcPid && owned->owner == TopTransactionResourceOwner
 		&& owned->slot < CLUSTER_KO_SHARED_CAPACITY && DsaPointerIsValid(owned->native_unready);
+}
+
+static bool
+ko_native_space_owner_current(const ClusterKoCompletionV2 *owned)
+{
+	return ko_native_final_owner_current(owned, false);
 }
 
 static bool
@@ -8059,6 +8073,99 @@ ko_native_final_space_v4(const ClusterSpaceDropState *space_drop,
 	return observed;
 }
 
+/* Final SPACE is saved, but its entered call must have ended before the
+ * permanent negative identity or the file-work handoff can be published.
+ * The producer's private pointer remains valid until the original smgr
+ * post-buffer callback independently surrenders it. */
+static bool
+ko_native_close_same_locked(const ClusterKoCompletionV2 *owned,
+	const ClusterKoNativeContinuation *work, const ClusterKoSharedContext *before)
+{
+	KoDropIdentity *identity;
+
+	if (!ko_native_final_owner_current(owned, true) || !work->publication_observed
+		|| work->recovery_required || work->buffers_released || work->predelete_ready
+		|| !before->used || !before->v3 || !before->committed_discard
+		|| !before->committed_drain_pending || before->complete || !before->structure_owned
+		|| !before->structure_drop_pending || before->structure_drop_failed
+		|| before->drop_executor_pid != 0 || !before->origin_checkpoint || !before->origin_data_closed
+		|| before->origin_detached || before->ax_failed || before->ax_release_requested
+		|| before->cancel_sqlerrcode != 0 || !ko_shared_ready_v3(before)
+		|| before->request_done_peers != owned->barrier_ready_peers
+		|| before->pid != owned->pid || before->serial != owned->serial
+		|| owned->drop_identity != 0 || owned->drop_identity_serial != 0
+		|| memcmp(&before->request_v3, &owned->barrier_request_v3, sizeof(before->request_v3)) != 0
+		|| memcmp(before->peer_boots, owned->barrier_boots, sizeof(before->peer_boots)) != 0
+		|| memcmp(&before->terminal, &owned->terminal, sizeof(before->terminal)) != 0
+		|| memcmp(before->structure, owned->structure, sizeof(before->structure)) != 0
+		|| memcmp(before, &work->context, sizeof(*before)) != 0
+		|| memcmp(before, &ko_state->contexts[owned->slot], sizeof(*before)) != 0
+		|| ko_native_discard_pending_locked(before->request.key.locator, NULL))
+		return false;
+	identity = ko_origin_drop_identity_locked(before);
+	return identity != NULL && identity->state == KO_DROP_IDENTITY_CLOSING;
+}
+
+/* Spec: 2026-10-16-pre2-p014-am05-shared-ddl-autocommit.md
+ * Consume the original publication, READY, local discard and final SPACE
+ * together. No self message, file operation or fabricated buffer-release
+ * callback. The active origin remains a separate native AX/result owner.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+ko_native_window_close_v4(ClusterKoCompletionV2 *owned, ClusterKoNativeContinuation *work)
+{
+	ClusterKoSharedContext before;
+	ClusterWalSourceRef source;
+	ResourceXGateSnapshot gate, after;
+	uint64 revision, wb_revision;
+	bool current;
+
+	if (!ko_native_final_owner_current(owned, true))
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	before = work->context;
+	current = ko_native_close_same_locked(owned, work, &before);
+	SpinLockRelease(&ko_state->shared_lock);
+	revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+	if (!current || revision == 0 || revision == UINT64_MAX
+		|| !cluster_pcm_lock_resource_x_gate_snapshot(&gate) || gate.phase != RESOURCE_X_GATE_OPEN
+		|| !ko_native_discard_cut_current(&before, revision, &gate)
+		|| !cluster_wal_thread_current_v2_ref(&source)
+		|| memcmp(&source, &before.terminal.source, sizeof(source)) != 0
+		|| !cluster_pi_writeback_local_relation_closed_v3(before.request.key.locator,
+			before.request.epoch, &wb_revision)
+		|| !cluster_pi_writeback_local_revision_current_v3(wb_revision))
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	current = ko_native_close_same_locked(owned, work, &before)
+		&& pg_atomic_read_u64(&ko_state->peer_admission_revision) == revision
+		&& cluster_pcm_lock_resource_x_gate_snapshot(&after)
+		&& memcmp(&gate, &after, sizeof(gate)) == 0
+		&& cluster_pi_writeback_local_revision_current_v3(wb_revision);
+	if (current) {
+		ClusterKoSharedContext *entry = &ko_state->contexts[owned->slot];
+		KoDropIdentity *identity = ko_origin_drop_identity_locked(&before);
+
+		identity->state = KO_DROP_IDENTITY_RETIRED;
+		entry->complete = true;
+		entry->committed_drain_pending = false;
+		work->context = *entry;
+		/* The registered path has not taken the legacy private-barrier
+		 * snapshot. Capture its same immutable reservation exactly once for
+		 * the original post-locks predelete/buffer-release consumers. */
+		owned->drop_identity = before.drop_identity;
+		owned->drop_identity_serial = before.drop_identity_serial;
+		/* Only the original native carrier may execute the file work.
+		 * Keep the origin slot through native S6, without a second file owner
+		 * or a reference that could recycle the immutable negative identity. */
+		entry->structure_owned = entry->structure_drop_pending = false;
+		entry->drop_identity = 0;
+		entry->drop_identity_serial = 0;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	return current;
+}
+
 /* The native caller invokes this after local invalidation/MultiXact and
  * before LOCKS release. Failure cannot roll back catalog COMMIT: preserve
  * the preallocated native owner and protecting AX, including uncertain sends.
@@ -8093,7 +8200,8 @@ cluster_ko_shared_native_window_v4(const ClusterSpaceDropState *space_drop)
 			ready = cluster_space_drop_committed_owner_v4(space_drop, owned)
 				&& ko_native_window_wait(owned, work)
 				&& ko_native_origin_discard_v4(owned, work)
-				&& ko_native_final_space_v4(space_drop, owned, work);
+				&& ko_native_final_space_v4(space_drop, owned, work)
+				&& ko_native_window_close_v4(owned, work);
 		}
 		PG_CATCH();
 		{
