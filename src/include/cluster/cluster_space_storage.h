@@ -180,10 +180,12 @@ extern void cluster_space_truncate_finish(ClusterSpaceTruncateState *state, Rela
 typedef struct ClusterSpaceDropState ClusterSpaceDropState;
 
 /* Native commit owner of its pending-delete list, after exclusive lifecycle
- * and KO. Prepare only locks/validates private results and serializes the
- * optional native COMMIT tail. Authorize separately checks the original
- * completed operation outside the critical section, with those pages still
- * locked. Publish marks dirty and installs both pages
+ * and KO. Prepare validates private results, serializes the optional native
+ * COMMIT tail and releases its page references. Authorize separately checks
+ * the completed operation, reacquires both pages and revalidates the exact
+ * two-page predecessor outside the critical section. A clean refusal releases
+ * those references; an ERROR retains the original ResourceOwner cleanup.
+ * Publish marks dirty and installs both pages
  * only after that COMMIT is flushed and decided, with the original checkpoint
  * delay still held. Finish unlocks before unlink. */
 extern ClusterSpaceDropState *cluster_space_drop_prepare(const RelFileLocator *locators, int count);

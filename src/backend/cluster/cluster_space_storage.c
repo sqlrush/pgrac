@@ -844,11 +844,19 @@ StaticAssertDecl(XACT_SPACE_DROP_RECORD_BYTES == CLUSTER_SPACE_STRUCTURE_WAL_BYT
 				 "native COMMIT and SPACE structural formats must agree");
 
 static void
-space_truncate_release(ClusterSpaceTruncateState *state)
+space_structure_unlock(ClusterSpaceTruncateState *state)
 {
 	for (int i = 1; i >= 0; i--)
-		if (BufferIsValid(state->buffers[i]))
+		if (BufferIsValid(state->buffers[i])) {
 			UnlockReleaseBuffer(state->buffers[i]);
+			state->buffers[i] = InvalidBuffer;
+		}
+}
+
+static void
+space_truncate_release(ClusterSpaceTruncateState *state)
+{
+	space_structure_unlock(state);
 	pfree(state);
 }
 
@@ -1143,6 +1151,9 @@ cluster_space_drop_prepare(const RelFileLocator *locators, int count)
 		if (entry == NULL)
 			goto refused;
 		state->entries[state->count++] = entry;
+		/* Retain the record and original KO owner, not page references across
+		 * transaction cleanup. Physical publication requalifies the same pair. */
+		space_structure_unlock(entry);
 	}
 	if (state->count != 0) {
 		uint32 n = state->count;
@@ -1180,14 +1191,47 @@ cluster_space_drop_authorize(ClusterSpaceDropState *state)
 	for (int i = 0; i < state->count; i++) {
 		ClusterSpaceTruncateState *entry = state->entries[i];
 		ClusterSpaceStructureChange change;
+		PGAlignedBlock prepared[2];
+		SMgrRelation smgr;
+		uint8 apply_mask;
 
 		if (!cluster_space_structure_wal_decode(entry->wal, sizeof(entry->wal), &change)
 			|| change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE
 			|| !cluster_ko_shared_drop_write_current(entry->ko_completion, &change.identity.expected))
-			return false;
+			goto refused;
+		smgr = smgropen(change.identity.expected.key.locator, InvalidBackendId);
+		if (!smgrexists(smgr, SPACE_FORKNUM) || smgrnblocks(smgr, SPACE_FORKNUM) != 2)
+			goto refused;
+		for (int j = 0; j < 2; j++) {
+			if (!BufferIsValid(entry->buffers[j])) {
+				entry->buffers[j] = ReadBufferWithoutRelcache(change.identity.expected.key.locator,
+					SPACE_FORKNUM, j, RBM_NORMAL, NULL, true);
+				LockBuffer(entry->buffers[j], BUFFER_LOCK_EXCLUSIVE);
+			}
+			if (BufferIsLocal(entry->buffers[j]) || BufferGetBlockNumber(entry->buffers[j]) != j
+				|| !cluster_bufmgr_pcm_x_content_holder_write_permitted(
+					GetBufferDescriptor(entry->buffers[j] - 1)))
+				goto refused;
+			memcpy(prepared[j].data, BufferGetPage(entry->buffers[j]), BLCKSZ);
+		}
+		/* Reapply only the original typed record to private copies. An exact
+		 * two-page predecessor is required; ALREADY/partial results belong to
+		 * recovery, not this still-unpublished native owner. Never mint a new
+		 * token or refresh the expected identity after releasing the pins. */
+		if (cluster_space_structure_apply(&change, &change.identity.expected.key,
+				prepared[0].data, prepared[1].data, BLCKSZ, &apply_mask)
+				!= CLUSTER_SPACE_IDENTITY_APPLY
+			|| apply_mask != 3
+			|| !cluster_ko_shared_drop_write_current(entry->ko_completion, &change.identity.expected))
+			goto refused;
+		memcpy(entry->result, prepared, sizeof(prepared));
 	}
 	state->write_authorized = true;
 	return true;
+refused:
+	for (int i = state->count - 1; i >= 0; i--)
+		space_structure_unlock(state->entries[i]);
+	return false;
 }
 
 void

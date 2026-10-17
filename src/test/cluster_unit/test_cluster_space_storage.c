@@ -94,8 +94,11 @@ static unsigned ko_claims;
 static unsigned ko_structure_claims;
 static bool ko_pending, ko_claim_unavailable;
 static bool ko_drop_write_allowed;
+static bool ko_drop_write_revoke_on_read;
+static int drop_resume_read_error;
 static unsigned ko_drop_write_checks;
 static ClusterSpaceIdentityKey ko_key;
+static ClusterSpaceIdentity ko_old_identity;
 static uint8 ko_incarnation[16];
 static int ko_handle;
 static unsigned space_observe_calls, space_observations, observation_reads;
@@ -627,7 +630,9 @@ XLogFlush(XLogRecPtr lsn)
 	if (drop_owner) {
 		UT_ASSERT_EQ(lsn, UINT64_C(0x10000300));
 		UT_ASSERT_EQ(CritSectionCount, recovering ? 0 : 1);
-		UT_ASSERT_EQ(locked, deleted_all ? 0 : 3);
+		/* COMMIT consumes the private record even when its SPACE references
+		 * are detached. Physical publication still requires both locked pages. */
+		UT_ASSERT((pinned == 0 && locked == 0) || (pinned == 3 && locked == 3));
 		flush_calls++;
 		return;
 	}
@@ -788,6 +793,8 @@ ReadBufferWithoutRelcache(RelFileLocator tag, ForkNumber forknum, BlockNumber bl
 	if (!RelFileLocatorEquals(tag, locator) || forknum != SPACE_FORKNUM || strategy != NULL
 		|| !permanent)
 		abort();
+	if (drop_resume_read_error >= 0 && (BlockNumber)drop_resume_read_error == block)
+		pg_re_throw();
 	if (block == P_NEW) {
 		if (create_throw_on_read)
 			pg_re_throw();
@@ -801,6 +808,8 @@ ReadBufferWithoutRelcache(RelFileLocator tag, ForkNumber forknum, BlockNumber bl
 		abort();
 	buffer_reads++;
 	pinned |= 1 << block;
+	if (ko_drop_write_revoke_on_read)
+		ko_drop_write_allowed = false;
 	return block + 1;
 }
 
@@ -929,7 +938,7 @@ XLogInsert(RmgrId rmid, uint8 info)
 			return XactLastRecEnd = UINT64_C(0x10000300);
 		}
 		UT_ASSERT_EQ(info, XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO | XLR_SPECIAL_REL_UPDATE);
-		UT_ASSERT_EQ(locked, 3);
+		UT_ASSERT((pinned == 0 && locked == 0) || (pinned == 3 && locked == 3));
 		UT_ASSERT_EQ(dirty_calls, 0);
 		UT_ASSERT(ParseCommitRecord(info, (xl_xact_commit *)commit_bytes, commit_len, &parsed));
 		UT_ASSERT_EQ(parsed.nspace_drops, 1);
@@ -1130,8 +1139,10 @@ cluster_ko_flush_and_wait_ack(RelFileLocator tag, char persistence)
 		memcpy(ko_key.storage_uuid, ref.claim.identity.storage_uuid, 16);
 		ko_pending = cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0,
 														&ko_key, &identity, &token);
-		if (ko_pending)
+		if (ko_pending) {
 			memcpy(ko_incarnation, identity.incarnation, 16);
+			ko_old_identity = identity;
+		}
 	}
 }
 
@@ -1183,23 +1194,18 @@ cluster_ko_shared_claim_structure(const ClusterSpaceIdentity *identity,
 }
 
 /* The real KO readiness consumer is exercised in the registration fixture.
- * Here enforce the native SPACE caller's exact old-page argument and phase. */
+ * Here bind the original captured identity, independently of the page bytes
+ * that the SPACE producer must revalidate after reacquiring them. */
 bool
 cluster_ko_shared_drop_write_current(const ClusterKoCompletionV2 *completion,
 									const ClusterSpaceIdentity *identity)
 {
-	ClusterSpaceIdentity current;
-	uint64 token;
-
 	ko_drop_write_checks++;
 	UT_ASSERT(CritSectionCount == 0);
-	UT_ASSERT_EQ(pinned, 3);
-	UT_ASSERT_EQ(locked, 3);
+	UT_ASSERT((pinned == 0 && locked == 0) || (pinned == 3 && locked == 3));
 	UT_ASSERT_EQ(wal_calls + dirty_calls + truncate_calls + unlink_calls, 0);
 	UT_ASSERT(completion == (ClusterKoCompletionV2 *)&ko_handle && !ko_pending);
-	UT_ASSERT(cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0,
-		&ko_key, &current, &token));
-	UT_ASSERT(identity != NULL && memcmp(identity, &current, sizeof(current)) == 0);
+	UT_ASSERT(identity != NULL && memcmp(identity, &ko_old_identity, sizeof(ko_old_identity)) == 0);
 	return ko_drop_write_allowed;
 }
 int
@@ -1495,6 +1501,8 @@ reset(void)
 	ko_structure_claims = 0;
 	ko_pending = ko_claim_unavailable = false;
 	ko_drop_write_allowed = true;
+	ko_drop_write_revoke_on_read = false;
+	drop_resume_read_error = -1;
 	ko_drop_write_checks = 0;
 	space_observe_calls = space_observations = observation_reads = observation_fault = 0;
 	truncate_observations = 0;
@@ -3173,6 +3181,199 @@ UT_TEST(test_registered_drop_record_is_not_physical_write_permission)
 	FreeFakeRelcacheEntry(rel);
 }
 
+UT_TEST(test_drop_record_preparation_releases_both_pages_before_return)
+{
+	Relation rel = native_truncate_relation();
+	ClusterSpaceDropState *state;
+	PGAlignedBlock saved[2];
+	uint32 length;
+	unsigned releases = release_calls;
+
+	drop_owner = true;
+	memcpy(saved, pages, sizeof(saved));
+	state = prepare_original_drop(&locator, 1);
+	UT_ASSERT(state != NULL);
+	if (state != NULL) {
+		UT_ASSERT_EQ(pinned | locked, 0);
+		UT_ASSERT_EQ(release_calls, releases + 2);
+		UT_ASSERT(cluster_space_drop_wal(state, &length) != NULL);
+		UT_ASSERT_EQ(length, sizeof(uint32) + CLUSTER_SPACE_STRUCTURE_WAL_BYTES);
+		UT_ASSERT_EQ(dirty_calls + wal_calls + capture_calls + space_observations, 0);
+		UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
+		cluster_space_drop_finish(state);
+		UT_ASSERT_EQ(release_calls, releases + 2);
+	}
+	UT_ASSERT_EQ(pinned | locked, 0);
+	FreeFakeRelcacheEntry(rel);
+}
+
+UT_TEST(test_drop_resume_rejects_changed_reservation_without_replacing_record)
+{
+	Relation rel = native_truncate_relation();
+	ClusterSpaceDropState *state;
+	ClusterSpaceStructureChange change;
+	PGAlignedBlock changed[2];
+	uint8 saved[sizeof(uint32) + CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	const char *wal;
+	uint32 length;
+	uint64 token;
+
+	drop_owner = true;
+	state = prepare_original_drop(&locator, 1);
+	UT_ASSERT(state != NULL);
+	if (state == NULL) {
+		FreeFakeRelcacheEntry(rel);
+		return;
+	}
+	wal = cluster_space_drop_wal(state, &length);
+	UT_ASSERT(length == sizeof(saved));
+	memcpy(saved, wal, sizeof(saved));
+	UT_ASSERT(cluster_space_structure_wal_decode(wal + sizeof(uint32),
+		CLUSTER_SPACE_STRUCTURE_WAL_BYTES, &change));
+	change.reservation.before.next_block++;
+	UT_ASSERT(cluster_space_reservation_page_encode(&change.reservation.before,
+		change.reservation.before_token, pages[1].data, BLCKSZ));
+	memcpy(changed, pages, sizeof(changed));
+	token = next_token;
+	UT_ASSERT(!cluster_space_drop_authorize(state));
+	UT_ASSERT_EQ(pinned | locked, 0);
+	UT_ASSERT_EQ(next_token, token);
+	UT_ASSERT(memcmp(wal, saved, sizeof(saved)) == 0);
+	UT_ASSERT(memcmp(changed, pages, sizeof(changed)) == 0);
+	UT_ASSERT_EQ(dirty_calls + wal_calls + capture_calls + space_observations, 0);
+	cluster_space_drop_finish(state);
+	FreeFakeRelcacheEntry(rel);
+}
+
+UT_TEST(test_drop_resume_preserves_record_and_requires_both_exact_predecessors)
+{
+	for (unsigned fault = 0; fault < 10; fault++) {
+		Relation rel = native_truncate_relation();
+		ClusterSpaceDropState *state;
+		ClusterSpaceStructureChange change;
+		PGAlignedBlock changed[2], original[2];
+		uint8 saved[sizeof(uint32) + CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+		const char *wal;
+		uint32 length;
+		uint64 token;
+
+		drop_owner = true;
+		state = prepare_original_drop(&locator, 1);
+		UT_ASSERT(state != NULL);
+		if (state == NULL) { FreeFakeRelcacheEntry(rel); continue; }
+		wal = cluster_space_drop_wal(state, &length);
+		UT_ASSERT_EQ(length, sizeof(saved));
+		memcpy(saved, wal, sizeof(saved));
+		memcpy(original, pages, sizeof(original));
+		UT_ASSERT(cluster_space_structure_wal_decode(wal + sizeof(uint32),
+			CLUSTER_SPACE_STRUCTURE_WAL_BYTES, &change));
+		if (fault == 0) {
+			change.identity.expected.incarnation[0] ^= 1;
+			UT_ASSERT(cluster_space_identity_page_encode(&change.identity.expected,
+				change.identity.before_token, page.data, BLCKSZ));
+		} else if (fault == 1) {
+			UT_ASSERT(cluster_space_identity_page_encode(&change.identity.expected,
+				change.identity.before_token + 1, page.data, BLCKSZ));
+		} else if (fault == 2) {
+			UT_ASSERT(cluster_space_reservation_page_encode(&change.reservation.before,
+				change.reservation.before_token + 1, pages[1].data, BLCKSZ));
+		} else if (fault == 3 || fault == 4) {
+			pages[fault - 3].data[BLCKSZ - 1] ^= 1;
+		} else if (fault == 5) {
+			UT_ASSERT(cluster_space_identity_page_encode(&change.identity.result,
+				change.identity.result_token, page.data, BLCKSZ));
+		} else if (fault == 6) {
+			UT_ASSERT(cluster_space_reservation_page_encode(&change.reservation.result,
+				change.reservation.result_token, pages[1].data, BLCKSZ));
+		} else if (fault == 7) {
+			uint8 applied;
+			UT_ASSERT_EQ(cluster_space_structure_apply(&change, &change.identity.expected.key,
+				page.data, pages[1].data, BLCKSZ, &applied), CLUSTER_SPACE_IDENTITY_APPLY);
+			UT_ASSERT_EQ(applied, 3);
+		} else if (fault == 8)
+			exists = false;
+		else
+			blocks = 1;
+		memcpy(changed, pages, sizeof(changed));
+		token = next_token;
+		UT_ASSERT(!cluster_space_drop_authorize(state));
+		UT_ASSERT_EQ(pinned | locked, 0);
+		UT_ASSERT_EQ(next_token, token);
+		UT_ASSERT_EQ(ko_structure_claims, 1);
+		UT_ASSERT(memcmp(wal, saved, sizeof(saved)) == 0);
+		UT_ASSERT(memcmp(changed, pages, sizeof(changed)) == 0);
+		UT_ASSERT_EQ(dirty_calls + wal_calls + capture_calls + space_observations, 0);
+		/* Restore the exact predecessor; retry consumes the same private
+		 * record and original operation, without a new claim or token. */
+		memcpy(pages, original, sizeof(original));
+		exists = true;
+		blocks = 2;
+		UT_ASSERT(cluster_space_drop_authorize(state));
+		UT_ASSERT_EQ(pinned, 3);
+		UT_ASSERT_EQ(locked, 3);
+		UT_ASSERT_EQ(next_token, token);
+		UT_ASSERT_EQ(ko_structure_claims, 1);
+		UT_ASSERT(memcmp(wal, saved, sizeof(saved)) == 0);
+		cluster_space_drop_finish(state);
+		UT_ASSERT_EQ(pinned | locked, 0);
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
+UT_TEST(test_drop_resume_rechecks_permission_after_page_acquisition)
+{
+	Relation rel = native_truncate_relation();
+	ClusterSpaceDropState *state;
+	PGAlignedBlock saved[2];
+	uint64 token;
+
+	drop_owner = true;
+	state = prepare_original_drop(&locator, 1);
+	UT_ASSERT(state != NULL);
+	if (state == NULL) { FreeFakeRelcacheEntry(rel); return; }
+	memcpy(saved, pages, sizeof(saved));
+	token = next_token;
+	ko_drop_write_revoke_on_read = true;
+	UT_ASSERT(!cluster_space_drop_authorize(state));
+	UT_ASSERT_EQ(ko_drop_write_checks, 2);
+	UT_ASSERT_EQ(pinned | locked, 0);
+	UT_ASSERT_EQ(next_token, token);
+	UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
+	UT_ASSERT_EQ(dirty_calls + wal_calls + capture_calls + space_observations, 0);
+	cluster_space_drop_finish(state);
+	FreeFakeRelcacheEntry(rel);
+}
+
+UT_TEST(test_drop_resume_read_error_retains_original_cleanup_without_publication)
+{
+	Relation rel = native_truncate_relation();
+	ClusterSpaceDropState *state;
+	PGAlignedBlock saved[2];
+	volatile bool caught = false;
+
+	drop_owner = true;
+	state = prepare_original_drop(&locator, 1);
+	UT_ASSERT(state != NULL);
+	if (state == NULL) { FreeFakeRelcacheEntry(rel); return; }
+	memcpy(saved, pages, sizeof(saved));
+	drop_resume_read_error = 1;
+	PG_TRY(); { (void)cluster_space_drop_authorize(state); }
+	PG_CATCH(); { caught = true; }
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	/* The first pin/content lock belongs to the original cleanup owner;
+	 * an ERROR is not a clean refusal or a successful physical handoff. */
+	UT_ASSERT_EQ(pinned, 1);
+	UT_ASSERT_EQ(locked, 1);
+	UT_ASSERT_EQ(ko_drop_write_checks, 1);
+	UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
+	UT_ASSERT_EQ(dirty_calls + wal_calls + capture_calls + space_observations, 0);
+	drop_resume_read_error = -1;
+	cluster_space_drop_finish(state);
+	UT_ASSERT_EQ(pinned | locked, 0);
+	FreeFakeRelcacheEntry(rel);
+}
+
 UT_TEST(test_drop_write_refusal_keeps_private_record_and_expires_previous_permission)
 {
 	for (unsigned fault = 0; fault < 3; fault++) {
@@ -3200,10 +3401,10 @@ UT_TEST(test_drop_write_refusal_keeps_private_record_and_expires_previous_permis
 			CritSectionCount = 1;
 		UT_ASSERT(!cluster_space_drop_authorize(state));
 		CritSectionCount = 0;
-		UT_ASSERT_EQ(ko_drop_write_checks, fault == 1 ? 2 : 1);
+		UT_ASSERT_EQ(ko_drop_write_checks, fault == 0 ? 1 : fault == 1 ? 3 : 2);
 		UT_ASSERT_EQ(dirty_calls + capture_calls + wal_calls + space_observations, 0);
-		UT_ASSERT_EQ(pinned, 3);
-		UT_ASSERT_EQ(locked, 3);
+		UT_ASSERT_EQ(pinned, fault == 2 ? 3 : 0);
+		UT_ASSERT_EQ(locked, fault == 2 ? 3 : 0);
 		START_CRIT_SECTION();
 		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
 		emit_drop_commit(state, &locator, 1);
@@ -3569,7 +3770,7 @@ UT_TEST(test_native_commit_logs_decides_and_publishes_before_checkpoint_release)
 	nrels = smgrGetPendingDeletes(true, &rels);
 	UT_ASSERT_EQ(nrels, 1);
 #include "test_cluster_space_commit.inc"
-	UT_ASSERT_EQ(ko_drop_write_checks, 1);
+	UT_ASSERT_EQ(ko_drop_write_checks, 2);
 	UT_ASSERT_EQ(native_commits, 1);
 	UT_ASSERT_EQ(commit_decisions, 1);
 	UT_ASSERT_EQ(dirty_calls, 2);
@@ -4030,7 +4231,12 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(80);
+	UT_PLAN(85);
+	UT_RUN(test_drop_record_preparation_releases_both_pages_before_return);
+	UT_RUN(test_drop_resume_rejects_changed_reservation_without_replacing_record);
+	UT_RUN(test_drop_resume_preserves_record_and_requires_both_exact_predecessors);
+	UT_RUN(test_drop_resume_rechecks_permission_after_page_acquisition);
+	UT_RUN(test_drop_resume_read_error_retains_original_cleanup_without_publication);
 	UT_RUN(test_registered_drop_record_is_not_physical_write_permission);
 	UT_RUN(test_drop_write_refusal_keeps_private_record_and_expires_previous_permission);
 	UT_RUN(test_create_fence_refuses_native_main_and_direct_space_before_effects);

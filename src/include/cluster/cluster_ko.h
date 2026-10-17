@@ -486,8 +486,9 @@ extern bool cluster_ko_shared_claim_v2(const ClusterSpaceIdentityKey *key,
 extern bool cluster_ko_shared_claim_structure(const ClusterSpaceIdentity *identity,
 											  ClusterSpaceWalAction action,
 											  ClusterKoCompletionV2 **out);
-/* Outside critical sections, with the original SPACE pages still locked:
- * validate the claimed operation's completed barrier before physical write. */
+/* Outside critical sections, validate the claimed operation's completed
+ * barrier before physical write. The SPACE owner checks this before reacquiring
+ * its pages and after revalidating their exact typed predecessor under lock. */
 extern bool cluster_ko_shared_drop_write_current(const ClusterKoCompletionV2 *completion,
 												   const ClusterSpaceIdentity *identity);
 struct ClusterPageWalBindingV1;
