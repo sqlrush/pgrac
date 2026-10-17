@@ -8,6 +8,7 @@
 
 #include "cluster/cluster_page_online_plan.h"
 #include "cluster/cluster_side_projection.h"
+#include "cluster/cluster_recovery_tt_record.h"
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_space_reservation.h"
@@ -34,7 +35,9 @@ typedef enum RfSideOnlineOperationKindV1 {
 	RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL = 5,
 	/* Native structural WAL retained for its original owner, never applied
 	 * by a PI plan or substituted for a typed SPACE version. */
-	RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE = 6
+	RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE = 6,
+	/* Dual-identity C0, retained separately; no ordinary UNDO apply permission. */
+	RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT = 7
 } RfSideOnlineOperationKindV1;
 
 typedef struct RfSideOnlinePlanRequestV1 {
@@ -66,6 +69,8 @@ typedef struct RfSideOnlineOperationV1 {
 	SCN control_scn;
 	RfSidePlanPurposeV1 purpose;
 	TransactionId source_xid;
+	ClusterRecoveryTTAbortV1 recovery_abort;
+	uint16 recovery_target_participant;
 } RfSideOnlineOperationV1;
 
 typedef bool (*RfSideOnlineApplyXactV1)(void *arg, const RfSideOnlineOperationV1 *operation);
@@ -120,6 +125,15 @@ typedef struct RfSideOnlineProjectionOwnerV1 {
 
 extern RfPageProofDetailV1 rf_side_online_plan_create_v1(const RfSideOnlinePlanRequestV1 *request,
 														 RfSideOnlinePlanV1 **out_plan);
+/* Copy the original retained full source set before feed. Pure binding, not
+ * ROOT selection, fencing, retention or mutation authority. Failure poisons
+ * the plan; rebinding/late binding is refused. */
+extern bool rf_side_online_plan_bind_sources_v1(RfSideOnlinePlanV1 *plan,
+												const ClusterWalSourceRef *sources, uint32 count);
+/* Complete immutable target/source values for a sealed C0 operation only. */
+extern bool rf_side_online_plan_recovery_abort_sources_v1(const RfSideOnlinePlanV1 *plan,
+														  uint32 index, ClusterWalSourceRef *writer,
+														  ClusterWalSourceRef *target);
 extern RfPageProofDetailV1
 rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 								   const RfDetachedRecordPlanV1 *record_plan,
