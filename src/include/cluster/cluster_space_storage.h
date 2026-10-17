@@ -181,11 +181,14 @@ typedef struct ClusterSpaceDropState ClusterSpaceDropState;
 
 /* Native commit owner of its pending-delete list, after exclusive lifecycle
  * and KO. Prepare only locks/validates private results and serializes the
- * optional native COMMIT tail. Publish marks dirty and installs both pages
+ * optional native COMMIT tail. Authorize separately checks the original
+ * completed operation outside the critical section, with those pages still
+ * locked. Publish marks dirty and installs both pages
  * only after that COMMIT is flushed and decided, with the original checkpoint
  * delay still held. Finish unlocks before unlink. */
 extern ClusterSpaceDropState *cluster_space_drop_prepare(const RelFileLocator *locators, int count);
 extern const char *cluster_space_drop_wal(const ClusterSpaceDropState *state, uint32 *len);
+extern bool cluster_space_drop_authorize(ClusterSpaceDropState *state);
 extern void cluster_space_drop_publish(ClusterSpaceDropState *state, XLogRecPtr commit_lsn);
 extern void cluster_space_drop_finish(ClusterSpaceDropState *state);
 

@@ -1754,6 +1754,8 @@ RecordTransactionCommit(void)
 			space_drop = cluster_space_drop_prepare(rels, nrels);
 			if (space_drop == NULL)
 				elog(ERROR, "cannot prepare exact SPACE deletion");
+			if (!cluster_space_drop_authorize(space_drop))
+				elog(ERROR, "cannot authorize exact SPACE deletion");
 			space_drop_data = cluster_space_drop_wal(space_drop, &space_drop_len);
 		}
 #endif

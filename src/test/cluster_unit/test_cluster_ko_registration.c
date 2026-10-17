@@ -264,10 +264,146 @@ UT_TEST(test_original_caller_cleans_up_dispatch_error)
 	UT_ASSERT_EQ(storage.contexts[0].request_failed_peers, 2);
 }
 
+UT_TEST(test_registered_drop_can_prepare_record_without_a_completed_barrier)
+{
+	KoAxBinding binding;
+	ClusterKoCompletionV2 *owner = register_operation(&binding, CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+	ClusterKoCompletionV2 *claimed = NULL, *again = NULL;
+	ClusterKoSharedContext completed;
+
+	UT_ASSERT(owner->native_transaction && owner->native_pending);
+	UT_ASSERT(cluster_ko_shared_claim_structure(&space_identity, CLUSTER_SPACE_WAL_TOMBSTONE,
+		&claimed));
+	UT_ASSERT(claimed == owner && !owner->native_pending);
+	UT_ASSERT(!cluster_ko_shared_claim_structure(&space_identity, CLUSTER_SPACE_WAL_TOMBSTONE,
+		&again));
+	UT_ASSERT(again == NULL);
+	UT_ASSERT(!ko_completion_snapshot(owner, &completed));
+	UT_ASSERT(!ko_shared_structure_current(owner, &space_identity, CLUSTER_SPACE_WAL_TOMBSTONE));
+	UT_ASSERT(!cluster_ko_shared_drop_write_current(owner, &space_identity));
+	UT_ASSERT(!owner->barrier_private && !owner->space_observed && !owner->origin_data_closed);
+	assert_no_object_work();
+	cluster_ko_shared_release_v2(&owner);
+}
+
+UT_TEST(test_registered_record_claim_requires_exact_drop_identity_and_owner)
+{
+	for (unsigned fault = 0; fault < 8; fault++) {
+		KoAxBinding binding;
+		ClusterKoCompletionV2 *owner = register_operation(&binding, CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+		ClusterKoCompletionV2 *claimed = NULL;
+		ClusterSpaceIdentity identity = space_identity;
+		ClusterSpaceWalAction action = CLUSTER_SPACE_WAL_TOMBSTONE;
+
+		if (fault == 0) identity.operation++;
+		if (fault == 1) identity.incarnation[0]++;
+		if (fault == 2) identity.key.database_incarnation++;
+		if (fault == 3) identity.key.locator.relNumber++;
+		if (fault == 4) action = CLUSTER_SPACE_WAL_TRUNCATE;
+		if (fault == 5) v3_local_ax = false;
+		if (fault == 6) CritSectionCount = 1;
+		if (fault == 7) CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)2;
+		UT_ASSERT(!cluster_ko_shared_claim_structure(&identity, action, &claimed));
+		UT_ASSERT(claimed == NULL);
+		CritSectionCount = 0;
+		CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)1;
+		assert_no_object_work();
+		cluster_ko_shared_release_v2(&owner);
+	}
+}
+
+UT_TEST(test_registered_claim_abort_keeps_exact_unsent_s6_responsibility)
+{
+	KoAxBinding binding;
+	ClusterKoCompletionV2 *owner = register_operation(&binding, CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+	ClusterKoCompletionV2 *claimed = NULL;
+	unsigned slot = owner->slot;
+	uint64 serial = owner->serial;
+
+	UT_ASSERT(cluster_ko_shared_claim_structure(&space_identity, CLUSTER_SPACE_WAL_TOMBSTONE,
+		&claimed));
+	UT_ASSERT(claimed == owner);
+	resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	UT_ASSERT(ko_completions == NULL && native_allocated == 0 && completion_allocations == 0);
+	UT_ASSERT(storage.contexts[slot].used && storage.contexts[slot].origin_detached);
+	UT_ASSERT_EQ(storage.contexts[slot].serial, serial);
+	UT_ASSERT(!storage.contexts[slot].ax_release_requested && !storage.contexts[slot].complete);
+	assert_no_object_work();
+}
+
+UT_TEST(test_registered_claim_keeps_legacy_truncate_and_ambiguity_refusals)
+{
+	KoAxBinding binding;
+	ClusterKoCompletionV2 *owner = register_operation(&binding,
+		CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD), *other = NULL, *claimed = NULL;
+
+	UT_ASSERT(!cluster_ko_shared_claim_v2(&space_identity.key, space_identity.incarnation,
+		&claimed));
+	UT_ASSERT(claimed == NULL && owner->native_pending);
+	UT_ASSERT(ko_shared_begin_v3(space_identity.key.locator, RELPERSISTENCE_PERMANENT,
+		CLUSTER_KO_SHARED_V3_OPERATION_DROP, &binding, &other));
+	UT_ASSERT(!cluster_ko_shared_claim_structure(&space_identity, CLUSTER_SPACE_WAL_TOMBSTONE,
+		&claimed));
+	UT_ASSERT(claimed == NULL && owner->native_pending && other->native_pending);
+	cluster_ko_shared_release_v2(&other);
+	UT_ASSERT(cluster_ko_shared_claim_structure(&space_identity, CLUSTER_SPACE_WAL_TOMBSTONE,
+		&claimed));
+	UT_ASSERT(claimed == owner);
+	UT_ASSERT(!cluster_ko_shared_drop_write_current(owner, &space_identity));
+	assert_no_object_work();
+	cluster_ko_shared_release_v2(&owner);
+
+	owner = register_operation(&binding, CLUSTER_KO_SHARED_V3_OPERATION_TRUNCATE);
+	claimed = NULL;
+	UT_ASSERT(!cluster_ko_shared_claim_structure(&space_identity, CLUSTER_SPACE_WAL_TRUNCATE,
+		&claimed));
+	UT_ASSERT(!cluster_ko_shared_claim_structure(&space_identity, CLUSTER_SPACE_WAL_TOMBSTONE,
+		&claimed));
+	UT_ASSERT(claimed == NULL && owner->native_pending);
+	assert_no_object_work();
+	cluster_ko_shared_release_v2(&owner);
+}
+
+UT_TEST(test_drop_write_permission_consumes_original_completed_owner)
+{
+	for (unsigned fault = 0; fault < 8; fault++) {
+		ClusterKoCompletionV2 *owner = v3_native_structure_owner(
+			CLUSTER_KO_SHARED_V3_OPERATION_DROP), *claimed = NULL;
+		ClusterSpaceIdentity identity = space_identity;
+		unsigned requests = barrier_requests, reads = space_reads, allocations = native_allocate_calls;
+
+		UT_ASSERT(!cluster_ko_shared_drop_write_current(owner, &identity));
+		UT_ASSERT(cluster_ko_shared_claim_structure(&identity, CLUSTER_SPACE_WAL_TOMBSTONE,
+			&claimed));
+		UT_ASSERT(claimed == owner);
+		UT_ASSERT(cluster_ko_shared_drop_write_current(owner, &identity));
+		if (fault == 0) owner->origin_data_closed = false;
+		if (fault == 1) owner->native_pending = true;
+		if (fault == 2) owner->space_observed = true;
+		if (fault == 3) identity.operation++;
+		if (fault == 4) v3_local_ax = false;
+		if (fault == 5) owner->barrier_ready_peers = 0;
+		if (fault == 6) CritSectionCount = 1;
+		if (fault == 7) CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)2;
+		UT_ASSERT(!cluster_ko_shared_drop_write_current(owner, &identity));
+		UT_ASSERT_EQ(barrier_requests, requests);
+		UT_ASSERT_EQ(space_reads, reads);
+		UT_ASSERT_EQ(native_allocate_calls, allocations);
+		CritSectionCount = 0;
+		CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)1;
+		cluster_ko_shared_release_v2(&owner);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(17);
+	UT_RUN(test_registered_drop_can_prepare_record_without_a_completed_barrier);
+	UT_RUN(test_registered_record_claim_requires_exact_drop_identity_and_owner);
+	UT_RUN(test_registered_claim_abort_keeps_exact_unsent_s6_responsibility);
+	UT_RUN(test_registered_claim_keeps_legacy_truncate_and_ambiguity_refusals);
+	UT_RUN(test_drop_write_permission_consumes_original_completed_owner);
 	UT_RUN(test_registration_does_not_execute_or_supply_a_completion);
 	UT_RUN(test_execution_consumes_the_same_registration_once);
 	UT_RUN(test_changed_registration_is_not_refreshed_or_dispatched);

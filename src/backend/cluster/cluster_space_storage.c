@@ -834,6 +834,7 @@ struct ClusterSpaceTruncateState {
 struct ClusterSpaceDropState {
 	int count;
 	bool published;
+	bool write_authorized;
 	char *wal;
 	uint32 wal_len;
 	ClusterSpaceTruncateState *entries[FLEXIBLE_ARRAY_MEMBER];
@@ -886,8 +887,8 @@ space_structure_prepare(const ClusterSpaceIdentityKey *expected, ClusterSpaceWal
 		|| identity->expected.sequence == UINT64_MAX
 		|| (action == CLUSTER_SPACE_WAL_TRUNCATE && nblocks > reservation->before.next_block))
 		goto refused;
-	/* Take the original barrier while the exact old identity is still
-	 * locked. Its ResourceOwner retains the completion through transaction
+	/* Take the original operation while the exact old identity is still
+	 * locked. Its ResourceOwner retains the handle through transaction
 	 * exit; preparing a replacement page does not prove durable completion. */
 	if (!cluster_ko_shared_claim_structure(&identity->expected, action, &state->ko_completion))
 		goto refused;
@@ -1168,6 +1169,27 @@ cluster_space_drop_wal(const ClusterSpaceDropState *state, uint32 *len)
 	return state == NULL ? NULL : state->wal;
 }
 
+bool
+cluster_space_drop_authorize(ClusterSpaceDropState *state)
+{
+	if (state == NULL)
+		return false;
+	state->write_authorized = false;
+	if (state->published || CritSectionCount != 0 || RecoveryInProgress())
+		return false;
+	for (int i = 0; i < state->count; i++) {
+		ClusterSpaceTruncateState *entry = state->entries[i];
+		ClusterSpaceStructureChange change;
+
+		if (!cluster_space_structure_wal_decode(entry->wal, sizeof(entry->wal), &change)
+			|| change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE
+			|| !cluster_ko_shared_drop_write_current(entry->ko_completion, &change.identity.expected))
+			return false;
+	}
+	state->write_authorized = true;
+	return true;
+}
+
 void
 cluster_space_drop_publish(ClusterSpaceDropState *state, XLogRecPtr commit_lsn)
 {
@@ -1175,7 +1197,8 @@ cluster_space_drop_publish(ClusterSpaceDropState *state, XLogRecPtr commit_lsn)
 	 * Preserve the original checkpoint delay and locked buffers until both
 	 * pages are dirty and published. Preparation and WAL insertion alone must
 	 * leave the LIVE pages unmodified, including their dirty state. */
-	if (state == NULL || CritSectionCount == 0 || state->published || MyProc == NULL
+	if (state == NULL || CritSectionCount == 0 || state->published || !state->write_authorized
+		|| MyProc == NULL
 		|| !(MyProc->delayChkptFlags & DELAY_CHKPT_START)
 		|| XLogRecPtrIsInvalid(commit_lsn) || XLogNeedsFlush(commit_lsn))
 		ereport(PANIC,

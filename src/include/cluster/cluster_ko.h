@@ -458,10 +458,11 @@ extern void cluster_ko_flush_and_wait_ack_relation(struct RelationData *rel,
 																	char relpersistence, uint16 operation);
 
 #ifdef USE_PGRAC_CLUSTER
-/* Original barrier's process/ResourceOwner-local completion. The caller still
- * holds exclusive relation lifecycle authority. Only a successful original
- * barrier can construct this handle; raw ACK bytes cannot. Release before its
- * owner ends, on every exit. These APIs certify only the KO scope, never a
+/* Original operation's process/ResourceOwner-local handle. The caller still
+ * holds exclusive relation lifecycle authority. A v3 registration may retain
+ * the handle before its barrier; completion consumers still require the
+ * original completed operation. Release before its owner ends, on every exit.
+ * These APIs certify only the KO scope, never a
  * commit, a durable structural effect, an ancestor chain or PI retirement.
  * Direct begin binds CurrentResourceOwner. The native shared DDL wrapper
  * retains its completion with CurTransactionResourceOwner for SPACE. */
@@ -478,12 +479,17 @@ extern bool cluster_ko_shared_begin_v2(RelFileLocator rlocator, char relpersiste
  * second barrier. Refusal leaves out unchanged. */
 extern bool cluster_ko_shared_claim_v2(const ClusterSpaceIdentityKey *key,
 									   const uint8 incarnation[16], ClusterKoCompletionV2 **out);
-/* Native structural writer: the locked old SPACE identity and action must
- * match the completed operation. V3 also requires its exact original local
- * AX binding. The identity-only v2 entry cannot consume a v3 completion. */
+/* Native structural record preparation: the locked old SPACE identity and
+ * action must match the original operation. An unsent v3 DROP/REWRITE_OLD
+ * registration can prepare TOMBSTONE only; it is not write permission.
+ * V3 keeps its exact local AX binding. Identity-only v2 cannot consume v3. */
 extern bool cluster_ko_shared_claim_structure(const ClusterSpaceIdentity *identity,
 											  ClusterSpaceWalAction action,
 											  ClusterKoCompletionV2 **out);
+/* Outside critical sections, with the original SPACE pages still locked:
+ * validate the claimed operation's completed barrier before physical write. */
+extern bool cluster_ko_shared_drop_write_current(const ClusterKoCompletionV2 *completion,
+												   const ClusterSpaceIdentity *identity);
 struct ClusterPageWalBindingV1;
 /* Original SPACE finish, after both pages have an exact durable observation.
  * Saves only that observation in the already reserved native handle. This is

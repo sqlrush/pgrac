@@ -386,6 +386,8 @@ static void ko_shared_xact_event(XactEvent event, void *arg);
 static bool ko_shared_v3_local_binding_current(const ClusterKoSharedMessageV3 *request);
 static bool ko_shared_v3_space_matches(const ClusterKoSharedMessageV3 *message,
 									   const ClusterSpaceIdentity *identity);
+static bool ko_shared_registration_snapshot_v3(const ClusterKoCompletionV2 *completion,
+												   ClusterKoSharedContext *out);
 static dsa_area *ko_native_attach(void);
 static bool ko_shared_ready_v3(const ClusterKoSharedContext *context);
 static bool ko_origin_space_read_begin(RelFileLocator locator, ForkNumber fork,
@@ -4280,6 +4282,22 @@ ko_shared_structure_current(const ClusterKoCompletionV2 *completion,
 		   && ko_shared_v3_local_binding_current(&context.request_v3);
 }
 
+/* Record preparation may consume an unsent registration. Physical publication
+ * still requires the original completed barrier and local DROP closure. */
+bool
+cluster_ko_shared_drop_write_current(const ClusterKoCompletionV2 *completion,
+									const ClusterSpaceIdentity *identity)
+{
+	const ClusterKoCompletionV2 *owned = *ko_completion_link(completion);
+
+	return owned != NULL && owned->native_transaction && !owned->native_pending
+		&& !owned->space_observed
+		&& (!owned->barrier_v3
+			|| owned->barrier_request_v3.operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP
+			|| owned->origin_data_closed)
+		&& ko_shared_structure_current(owned, identity, CLUSTER_SPACE_WAL_TOMBSTONE);
+}
+
 bool
 cluster_ko_shared_observe_space_v2(ClusterKoCompletionV2 *completion,
 								   const struct ClusterPageWalBindingV1 *terminal, const void *wal,
@@ -5660,7 +5678,7 @@ cluster_ko_shared_postcommit_cleanup_v2(void)
 	}
 }
 
-/* Only the original native wrapper offers a completion for SPACE to take.
+/* Only the original native wrapper offers an operation for SPACE to take.
  * Keep the ResourceOwner throughout; taking it does not complete the DDL or
  * convey COMMIT/durability. Ambiguous repeated barriers are not authority. */
 static bool
@@ -5673,8 +5691,14 @@ ko_shared_claim(const ClusterSpaceIdentityKey *key, const uint8 incarnation[16],
 		return false;
 	for (ClusterKoCompletionV2 *completion = ko_completions; completion != NULL;
 		 completion = completion->next) {
-		if (!completion->native_pending
-			|| !cluster_ko_shared_covers_v2(completion, key, incarnation))
+		ClusterKoSharedContext registered;
+
+		if (!completion->native_pending)
+			continue;
+		if (!cluster_ko_shared_covers_v2(completion, key, incarnation)
+			&& (identity == NULL
+				|| !ko_shared_registration_snapshot_v3(completion, &registered)
+				|| !ko_shared_context_covers(&registered, key, incarnation)))
 			continue;
 		if (candidate != NULL)
 			return false;
@@ -5683,8 +5707,18 @@ ko_shared_claim(const ClusterSpaceIdentityKey *key, const uint8 incarnation[16],
 	if (candidate == NULL)
 		return false;
 	if (identity != NULL) {
-		if (!ko_shared_structure_current(candidate, identity, action))
-			return false;
+		if (!ko_shared_structure_current(candidate, identity, action)) {
+			ClusterKoSharedContext registered;
+
+			/* This claim prepares the existing TOMBSTONE record only. The
+			 * completed-operation consumers remain separate and unchanged. */
+			if (action != CLUSTER_SPACE_WAL_TOMBSTONE
+				|| !ko_shared_registration_snapshot_v3(candidate, &registered)
+				|| !ko_shared_v3_space_matches(&registered.request_v3, identity)
+				|| (registered.request_v3.operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP
+					&& registered.request_v3.operation != CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD))
+				return false;
+		}
 	} else if (candidate->barrier_v3 || !cluster_ko_shared_covers_v2(candidate, key, incarnation))
 		return false;
 	candidate->native_pending = false;
@@ -6962,14 +6996,14 @@ ko_shared_wait_for_acks_v3(ClusterKoSharedMessageV3 *request, uint32 mask,
  * Consume only the original, still-unsent registration. A later execution
  * must not allocate another batch or refresh the transaction's identity. */
 static bool
-ko_shared_registered_v3(RelFileLocator locator, uint16 operation, const KoAxBinding *binding,
-						const ClusterKoCompletionV2 *completion, ClusterKoSharedContext *out)
+ko_shared_registration_snapshot_v3(const ClusterKoCompletionV2 *completion,
+								   ClusterKoSharedContext *out)
 {
 	const ClusterKoCompletionV2 *owned = *ko_completion_link(completion);
 	const ClusterKoSharedMessageV3 *request;
 	bool valid;
 
-	if (owned == NULL || binding == NULL || ko_state == NULL || out == NULL
+	if (owned == NULL || ko_state == NULL || out == NULL || !owned->native_transaction
 		|| owned->pid != MyProcPid || !ko_completion_owner_current(owned)
 		|| CritSectionCount != 0 || !owned->barrier_v3 || owned->barrier_private
 		|| owned->native_handed_off || owned->space_observed
@@ -6977,13 +7011,6 @@ ko_shared_registered_v3(RelFileLocator locator, uint16 operation, const KoAxBind
 		|| !DsaPointerIsValid(owned->native_allocation) || owned->native_reserved == NULL)
 		return false;
 	request = &owned->barrier_request_v3;
-	if (!RelFileLocatorEquals(locator, request->base.key.locator) || operation != request->operation
-		|| memcmp(&binding->resid, &request->ax_resid, sizeof(binding->resid)) != 0
-		|| memcmp(&binding->holder, &request->ax_holder, sizeof(binding->holder)) != 0
-		|| binding->request_id != request->ax_request_id
-		|| binding->master_node != request->ax_master_node
-		|| binding->master_generation != request->ax_master_generation)
-		return false;
 	SpinLockAcquire(&ko_state->shared_lock);
 	*out = ko_state->contexts[owned->slot];
 	valid = out->used && out->v3 && !out->complete && !out->origin_detached
@@ -6996,6 +7023,26 @@ ko_shared_registered_v3(RelFileLocator locator, uint16 operation, const KoAxBind
 		&& memcmp(out->peer_boots, owned->barrier_boots, sizeof(out->peer_boots)) == 0;
 	SpinLockRelease(&ko_state->shared_lock);
 	return valid && ko_shared_origin_current(out) && ko_shared_v3_local_binding_current(request);
+}
+
+static bool
+ko_shared_registered_v3(RelFileLocator locator, uint16 operation, const KoAxBinding *binding,
+						const ClusterKoCompletionV2 *completion, ClusterKoSharedContext *out)
+{
+	const ClusterKoCompletionV2 *owned = *ko_completion_link(completion);
+	const ClusterKoSharedMessageV3 *request;
+
+	if (owned == NULL || binding == NULL)
+		return false;
+	request = &owned->barrier_request_v3;
+	return RelFileLocatorEquals(locator, request->base.key.locator)
+		&& operation == request->operation
+		&& memcmp(&binding->resid, &request->ax_resid, sizeof(binding->resid)) == 0
+		&& memcmp(&binding->holder, &request->ax_holder, sizeof(binding->holder)) == 0
+		&& binding->request_id == request->ax_request_id
+		&& binding->master_node == request->ax_master_node
+		&& binding->master_generation == request->ax_master_generation
+		&& ko_shared_registration_snapshot_v3(owned, out);
 }
 
 static bool
@@ -7204,6 +7251,9 @@ ko_flush_and_wait_ack(RelFileLocator rloc, char relpersistence, ClusterKoComplet
 					(errcode(ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE),
 					 errmsg("the registered KO v3 operation is no longer current"),
 					 errhint("Retry the transaction after the relation grant and formation are stable.")));
+		/* Execution consumes the unsent offer. The native wrapper reoffers
+		 * only after its original barrier and local closure both succeed. */
+		completion->native_pending = false;
 	}
 	/* The caller holds exclusive lifecycle authority. A parked range from
 	 * before a truncate/reset must not survive until this file regrows.
@@ -7391,7 +7441,8 @@ ko_shared_begin_v3(RelFileLocator rloc, char relpersistence, uint16 operation,
 	if (out == NULL || *out != NULL || binding == NULL || !cluster_enabled
 		|| !cluster_shared_config || ko_state == NULL || relpersistence == RELPERSISTENCE_TEMP
 		|| RecoveryInProgress() || cluster_node_id < 0 || CurrentResourceOwner == NULL
-		|| TopTransactionContext == NULL || CritSectionCount != 0 || MyProcPid <= 0)
+		|| !ko_native_transaction_current() || TopTransactionContext == NULL
+		|| CritSectionCount != 0 || MyProcPid <= 0)
 		return false;
 	if (!ko_resource_registered) {
 		RegisterResourceReleaseCallback(ko_shared_resource_release, NULL);
@@ -7399,7 +7450,9 @@ ko_shared_begin_v3(RelFileLocator rloc, char relpersistence, uint16 operation,
 		ko_resource_registered = true;
 	}
 	completion = MemoryContextAllocZero(TopTransactionContext, sizeof(*completion));
-	completion->owner = CurrentResourceOwner;
+	completion->owner = CurTransactionResourceOwner;
+	completion->native_transaction = true;
+	completion->native_pending = true;
 	completion->pid = MyProcPid;
 	completion->slot = CLUSTER_KO_SHARED_CAPACITY;
 	completion->next = ko_completions;

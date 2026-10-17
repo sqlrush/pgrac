@@ -93,6 +93,8 @@ static unsigned ko_calls;
 static unsigned ko_claims;
 static unsigned ko_structure_claims;
 static bool ko_pending, ko_claim_unavailable;
+static bool ko_drop_write_allowed;
+static unsigned ko_drop_write_checks;
 static ClusterSpaceIdentityKey ko_key;
 static uint8 ko_incarnation[16];
 static int ko_handle;
@@ -1179,6 +1181,27 @@ cluster_ko_shared_claim_structure(const ClusterSpaceIdentity *identity,
 	UT_ASSERT(memcmp(identity, &current, sizeof(current)) == 0);
 	return cluster_ko_shared_claim_v2(&identity->key, identity->incarnation, out);
 }
+
+/* The real KO readiness consumer is exercised in the registration fixture.
+ * Here enforce the native SPACE caller's exact old-page argument and phase. */
+bool
+cluster_ko_shared_drop_write_current(const ClusterKoCompletionV2 *completion,
+									const ClusterSpaceIdentity *identity)
+{
+	ClusterSpaceIdentity current;
+	uint64 token;
+
+	ko_drop_write_checks++;
+	UT_ASSERT(CritSectionCount == 0);
+	UT_ASSERT_EQ(pinned, 3);
+	UT_ASSERT_EQ(locked, 3);
+	UT_ASSERT_EQ(wal_calls + dirty_calls + truncate_calls + unlink_calls, 0);
+	UT_ASSERT(completion == (ClusterKoCompletionV2 *)&ko_handle && !ko_pending);
+	UT_ASSERT(cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0,
+		&ko_key, &current, &token));
+	UT_ASSERT(identity != NULL && memcmp(identity, &current, sizeof(current)) == 0);
+	return ko_drop_write_allowed;
+}
 int
 errmsg(const char *fmt, ...)
 {
@@ -1471,6 +1494,8 @@ reset(void)
 	ko_claims = 0;
 	ko_structure_claims = 0;
 	ko_pending = ko_claim_unavailable = false;
+	ko_drop_write_allowed = true;
+	ko_drop_write_checks = 0;
 	space_observe_calls = space_observations = observation_reads = observation_fault = 0;
 	truncate_observations = 0;
 	current_ref_reads = restart_ref_reads = 0;
@@ -3109,6 +3134,98 @@ prepare_original_drop(const RelFileLocator *deletes, int count)
 	return cluster_space_drop_prepare(deletes, count);
 }
 
+UT_TEST(test_registered_drop_record_is_not_physical_write_permission)
+{
+	Relation rel = native_truncate_relation();
+	ClusterSpaceDropState *state;
+	PGAlignedBlock saved[2];
+	volatile bool caught = false;
+
+	drop_owner = true;
+	state = prepare_original_drop(&locator, 1);
+	UT_ASSERT(state != NULL);
+	if (state == NULL) {
+		FreeFakeRelcacheEntry(rel);
+		return;
+	}
+	memcpy(saved, pages, sizeof(saved));
+	START_CRIT_SECTION();
+	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+	emit_drop_commit(state, &locator, 1);
+	XLogFlush(UINT64_C(0x10000300));
+	expecting_error = expect_publish_guard = true;
+	PG_TRY();
+	{
+		cluster_space_drop_publish(state, UINT64_C(0x10000300));
+	}
+	PG_CATCH(); { caught = true; }
+	PG_END_TRY();
+	expecting_error = expect_publish_guard = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(reported_level, PANIC);
+	UT_ASSERT_EQ(dirty_calls + capture_calls, 0);
+	UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
+	MyProc->delayChkptFlags = 0;
+	END_CRIT_SECTION();
+	cluster_space_drop_finish(state);
+	UT_ASSERT_EQ(space_flushes + space_syncs + space_readbacks + space_observations, 0);
+	UT_ASSERT_EQ(pinned | locked, 0);
+	FreeFakeRelcacheEntry(rel);
+}
+
+UT_TEST(test_drop_write_refusal_keeps_private_record_and_expires_previous_permission)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		Relation rel = native_truncate_relation();
+		ClusterSpaceDropState *state;
+		PGAlignedBlock saved[2];
+		const char *wal;
+		uint32 len;
+		volatile bool caught = false;
+
+		drop_owner = true;
+		state = prepare_original_drop(&locator, 1);
+		UT_ASSERT(state != NULL);
+		if (state == NULL) {
+			FreeFakeRelcacheEntry(rel);
+			continue;
+		}
+		memcpy(saved, pages, sizeof(saved));
+		wal = cluster_space_drop_wal(state, &len);
+		UT_ASSERT(wal != NULL && len == sizeof(uint32) + CLUSTER_SPACE_STRUCTURE_WAL_BYTES);
+		if (fault != 0)
+			UT_ASSERT(cluster_space_drop_authorize(state));
+		ko_drop_write_allowed = false;
+		if (fault == 2)
+			CritSectionCount = 1;
+		UT_ASSERT(!cluster_space_drop_authorize(state));
+		CritSectionCount = 0;
+		UT_ASSERT_EQ(ko_drop_write_checks, fault == 1 ? 2 : 1);
+		UT_ASSERT_EQ(dirty_calls + capture_calls + wal_calls + space_observations, 0);
+		UT_ASSERT_EQ(pinned, 3);
+		UT_ASSERT_EQ(locked, 3);
+		START_CRIT_SECTION();
+		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+		emit_drop_commit(state, &locator, 1);
+		XLogFlush(UINT64_C(0x10000300));
+		expecting_error = expect_publish_guard = true;
+		PG_TRY(); { cluster_space_drop_publish(state, UINT64_C(0x10000300)); }
+		PG_CATCH(); { caught = true; }
+		PG_END_TRY();
+		expecting_error = expect_publish_guard = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(reported_level, PANIC);
+		UT_ASSERT_EQ(dirty_calls + capture_calls, 0);
+		UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
+		MyProc->delayChkptFlags = 0;
+		END_CRIT_SECTION();
+		cluster_space_drop_finish(state);
+		UT_ASSERT_EQ(pinned | locked, 0);
+		UT_ASSERT_EQ(space_flushes + space_syncs + space_readbacks, 0);
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
 UT_TEST(test_drop_pair_stays_live_until_native_commit_is_durable)
 {
 	Relation rel = native_truncate_relation();
@@ -3130,6 +3247,7 @@ UT_TEST(test_drop_pair_stays_live_until_native_commit_is_durable)
 	}
 	UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
 	UT_ASSERT_EQ(wal_calls + dirty_calls, 0);
+	UT_ASSERT(cluster_space_drop_authorize(state));
 	START_CRIT_SECTION();
 	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
 	emit_drop_commit(state, deletes, 2);
@@ -3197,6 +3315,7 @@ publish_drop_for_finish(void)
 	state = prepare_original_drop(&locator, 1);
 	if (state == NULL)
 		abort();
+	UT_ASSERT(cluster_space_drop_authorize(state));
 	START_CRIT_SECTION();
 	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
 	emit_drop_commit(state, &locator, 1);
@@ -3226,6 +3345,8 @@ UT_TEST(test_drop_publication_requires_durable_critical_owner_at_runtime)
 			FreeFakeRelcacheEntry(rel);
 			continue;
 		}
+		if (fault != 5)
+			UT_ASSERT(cluster_space_drop_authorize(state));
 		memcpy(saved, pages, sizeof(saved));
 		dirties = dirty_calls;
 		captures = capture_calls;
@@ -3421,9 +3542,9 @@ UT_TEST(test_native_drop_requires_final_space_observation_before_release)
 UT_TEST(test_native_commit_logs_decides_and_publishes_before_checkpoint_release)
 {
 	Relation rel = native_truncate_relation();
-	ClusterSpaceDropState *space_drop;
-	const char *space_drop_data;
-	uint32 space_drop_len;
+	ClusterSpaceDropState *space_drop = NULL;
+	const char *space_drop_data = NULL;
+	uint32 space_drop_len = 0;
 	bool wrote_xlog = true, markXidCommitted = true, forceSyncCommit = false;
 	bool RelcacheInitFileInval = false, has_tt_fold = false, commit_record_flushed = false;
 	bool tt_stamp_staged = false;
@@ -3447,14 +3568,8 @@ UT_TEST(test_native_commit_logs_decides_and_publishes_before_checkpoint_release)
 	RelationDropStorage(rel);
 	nrels = smgrGetPendingDeletes(true, &rels);
 	UT_ASSERT_EQ(nrels, 1);
-	space_drop = cluster_space_drop_prepare(rels, nrels);
-	UT_ASSERT(space_drop != NULL);
-	if (space_drop == NULL) {
-		FreeFakeRelcacheEntry(rel);
-		return;
-	}
-	space_drop_data = cluster_space_drop_wal(space_drop, &space_drop_len);
 #include "test_cluster_space_commit.inc"
+	UT_ASSERT_EQ(ko_drop_write_checks, 1);
 	UT_ASSERT_EQ(native_commits, 1);
 	UT_ASSERT_EQ(commit_decisions, 1);
 	UT_ASSERT_EQ(dirty_calls, 2);
@@ -3915,7 +4030,9 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(78);
+	UT_PLAN(80);
+	UT_RUN(test_registered_drop_record_is_not_physical_write_permission);
+	UT_RUN(test_drop_write_refusal_keeps_private_record_and_expires_previous_permission);
 	UT_RUN(test_create_fence_refuses_native_main_and_direct_space_before_effects);
 	UT_RUN(test_create_keeps_one_native_owner_through_both_forks);
 	UT_RUN(test_create_io_error_keeps_original_reference_and_abort_delete);

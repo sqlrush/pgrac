@@ -2518,7 +2518,7 @@ test_cluster_space_recovery_route: test_cluster_space_recovery_route.c test_clus
 
 test_cluster_space_commit.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
 	awk '/^RecordTransactionCommit\(/ { inside=1 } \
-	     inside && /^\t\tSTART_CRIT_SECTION\(\);/ { emit=1; parts++ } \
+	     inside && /^\t\tif \(cluster_shared_config && nrels > 0\)/ { print "#ifdef USE_PGRAC_CLUSTER"; emit=1; parts++ } \
 	     emit && /^\t\tif \(replorigin\)/ { emit=0 } \
 	     inside && /^\tif \(\(wrote_xlog && markXidCommitted &&/ { emit=1; parts++ } \
 	     emit && /^\t\/\* Compute latestXid/ { emit=0; done++ } \
