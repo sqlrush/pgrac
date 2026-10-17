@@ -1042,10 +1042,26 @@ UT_TEST(test_object_drain_caps_require_configured_tier1)
 	cluster_interconnect_tier = saved_tier;
 }
 
+UT_TEST(test_committed_discard_contract_is_not_prematurely_advertised)
+{
+	int saved_tier = cluster_interconnect_tier;
+	bool saved_shared = cluster_shared_config;
+	/* Wire support alone cannot advertise a working commit-window consumer. */
+	for (int shared = 0; shared < 2; shared++) {
+		cluster_shared_config = shared;
+		for (int tier = CLUSTER_IC_TIER_STUB; tier <= CLUSTER_IC_TIER_3; tier++) {
+			cluster_interconnect_tier = tier;
+			UT_ASSERT_EQ(cluster_ic_local_capability_word() & UINT32_C(0x10000000), 0);
+		}
+	}
+	cluster_shared_config = saved_shared;
+	cluster_interconnect_tier = saved_tier;
+}
+
 int
 main(void)
 {
-	UT_PLAN(30); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
+	UT_PLAN(31); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
 	UT_RUN(test_ic_send_bytes_linkable);
 	UT_RUN(test_ic_recv_bytes_linkable);
 	UT_RUN(test_ic_init_linkable);
@@ -1071,6 +1087,7 @@ main(void)
 	UT_RUN(test_control_root_v1_capability_is_advertised_without_reserved_bit_alias);
 	UT_RUN(test_config_members_capability_profile);
 	UT_RUN(test_object_drain_caps_require_configured_tier1);
+	UT_RUN(test_committed_discard_contract_is_not_prematurely_advertised);
 	UT_RUN(test_hello_wire_data_plane_bytes);	/* spec-7.2 D2 */
 	UT_RUN(test_hello_worker_fields_roundtrip); /* spec-7.3 D3 */
 	UT_RUN(test_hello_smart_fusion_capability_gate);

@@ -310,7 +310,8 @@ test_cluster_resource_x_identity: test_cluster_resource_x_identity.c \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_resource_x_node_wire: test_cluster_resource_x_node_wire.c unit_test.h \
-		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O)
+		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
+		$(top_srcdir)/src/include/cluster/cluster_ic.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
@@ -4205,7 +4206,8 @@ test_cluster_gviews: test_cluster_gviews.c unit_test.h $(CLUSTER_VERSION_O) \
 # of them since the unit test only takes function addresses (never
 # invokes a path that triggers ereport or CRC computation).
 test_cluster_ic: test_cluster_ic.c unit_test.h $(CLUSTER_VERSION_O) \
-		$(CLUSTER_IC_O) cluster_unit_port_stubs.o
+		$(CLUSTER_IC_O) cluster_unit_port_stubs.o \
+		$(top_srcdir)/src/include/cluster/cluster_ic.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_IC_O) cluster_unit_port_stubs.o -o $@
 

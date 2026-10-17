@@ -110,6 +110,8 @@ extern void cluster_ko_ax_cleanup_finish_v3(const ClusterKoAxCleanupV3 *sample);
 #define CLUSTER_KO_SHARED_V2_BYTES 160
 #define CLUSTER_KO_SHARED_V3_BYTES 240
 #define CLUSTER_KO_SHARED_V3_VERSION 3
+#define CLUSTER_KO_SHARED_V4_BYTES 240
+#define CLUSTER_KO_SHARED_V4_VERSION 4
 #define CLUSTER_KO_SHARED_CONTEXT_LIMIT_V2 64
 #define CLUSTER_KO_SHARED_MEMBER_BYTES 16
 #define CLUSTER_KO_SHARED_REQUEST 1
@@ -154,6 +156,15 @@ typedef struct ClusterKoSharedMessageV3 {
 	uint16 full_fork_mask;
 	uint64 space_mutation_token;
 } ClusterKoSharedMessageV3;
+
+/* Committed old-incarnation discard has a distinct wire and value type.
+ * The object identity is unchanged, but a v3 flush result is not this READY
+ * contract. Representation alone proves neither COMMIT nor physical closure.
+ * Shared new-relfilenode TRUNCATE uses REWRITE_OLD for the removed identity;
+ * the in-place TRUNCATE operation is not part of this contract. */
+typedef struct ClusterKoSharedMessageV4 {
+	ClusterKoSharedMessageV3 object;
+} ClusterKoSharedMessageV4;
 
 /* Last exact local PI identity observed by the native origin checkpoint.
  * Values are diagnostic snapshots only and never grant a retirement or DATA
@@ -370,6 +381,17 @@ extern bool cluster_ko_shared_ack_matches_v3(const ClusterKoSharedMessageV3 *req
  * successful ACK. Consumers must retain its negative polarity. */
 extern bool cluster_ko_shared_result_matches_v3(const ClusterKoSharedMessageV3 *request,
 												const ClusterKoSharedMessageV3 *result);
+
+/* Pure PKO4 codec only. Runtime advertisement/dispatch must wait for the
+ * committed-discard consumer; no v2/v3 frame fallback is permitted. */
+extern bool cluster_ko_shared_encode_v4(const ClusterKoSharedMessageV4 *message, void *bytes,
+										size_t length);
+extern bool cluster_ko_shared_decode_v4(const void *bytes, size_t length,
+										ClusterKoSharedMessageV4 *out);
+extern bool cluster_ko_shared_result_matches_v4(const ClusterKoSharedMessageV4 *request,
+											 const ClusterKoSharedMessageV4 *result);
+extern bool cluster_ko_shared_ack_matches_v4(const ClusterKoSharedMessageV4 *request,
+										  const ClusterKoSharedMessageV4 *ack);
 #endif
 
 #ifndef FRONTEND

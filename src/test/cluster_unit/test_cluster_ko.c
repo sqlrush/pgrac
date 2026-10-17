@@ -473,10 +473,169 @@ UT_TEST(shared_v3_failure_matches_identity_but_never_done)
 	UT_ASSERT(!cluster_ko_shared_result_matches_v3(&request, &result));
 }
 
+static ClusterKoSharedMessageV4
+shared_v4_fixture(void)
+{
+	ClusterKoSharedMessageV4 m = { 0 };
+	m.object = shared_v3_fixture();
+	return m;
+}
+
+UT_TEST(shared_v4_roundtrip_has_its_own_contract_and_full_identity)
+{
+	const uint16 operations[] = { CLUSTER_KO_SHARED_V3_OPERATION_DROP,
+		CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD };
+	for (size_t op = 0; op < lengthof(operations); op++) {
+		for (int result = 0; result < 3; result++) {
+			ClusterKoSharedMessageV4 m = shared_v4_fixture(), out;
+			ClusterKoSharedMessageV3 legacy_out;
+			uint8 bytes[CLUSTER_KO_SHARED_V4_BYTES + 1], old[CLUSTER_KO_SHARED_V3_BYTES];
+			m.object.operation = operations[op];
+			if (result != 0) {
+				m.object.base.verb = CLUSTER_KO_SHARED_ACK;
+				m.object.base.status = result == 1 ? CLUSTER_KO_SHARED_DONE : CLUSTER_KO_SHARED_FAILED;
+			}
+			/* A holder/master may be remote; physical permission is not a codec fact. */
+			m.object.ax_holder.node_id = m.object.base.peer_node;
+			m.object.ax_master_node = m.object.base.peer_node;
+			UT_ASSERT(cluster_ko_shared_encode_v4(&m, bytes + 1, CLUSTER_KO_SHARED_V4_BYTES));
+			UT_ASSERT_EQ(memcmp(bytes + 1, "PKO4", 4), 0);
+			UT_ASSERT_EQ(bytes[5], 4);
+			UT_ASSERT_EQ(bytes[6], 0);
+			UT_ASSERT_EQ(bytes[7], 240);
+			UT_ASSERT_EQ(bytes[8], 0);
+			UT_ASSERT(cluster_ko_shared_decode_v4(bytes + 1, CLUSTER_KO_SHARED_V4_BYTES, &out));
+			UT_ASSERT_EQ(memcmp(&m, &out, sizeof(m)), 0);
+			UT_ASSERT(cluster_ko_shared_encode_v3(&m.object, old, sizeof(old)));
+			UT_ASSERT_EQ(memcmp(bytes + 9, old + 8, sizeof(old) - 8), 0);
+			UT_ASSERT(!cluster_ko_shared_decode_v3(bytes + 1, CLUSTER_KO_SHARED_V4_BYTES,
+				&legacy_out));
+		}
+	}
+}
+
+UT_TEST(shared_v4_decoder_rejects_old_unknown_truncated_and_reserved_frames)
+{
+	ClusterKoSharedMessageV4 m = shared_v4_fixture(), out, before;
+	uint8 bytes[CLUSTER_KO_SHARED_V4_BYTES + 1], legacy[CLUSTER_KO_SHARED_V3_BYTES];
+	const unsigned reserved[] = { 0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15,
+		228, 229, 230, 231 };
+	memset(&out, 0xce, sizeof(out));
+	before = out;
+	UT_ASSERT(cluster_ko_shared_encode_v3(&m.object, legacy, sizeof(legacy)));
+	UT_ASSERT(!cluster_ko_shared_decode_v4(legacy, sizeof(legacy), &out));
+	UT_ASSERT_EQ(memcmp(&out, &before, sizeof(out)), 0);
+	UT_ASSERT(cluster_ko_shared_encode_v2(&m.object.base, legacy, CLUSTER_KO_SHARED_V2_BYTES));
+	UT_ASSERT(!cluster_ko_shared_decode_v4(legacy, CLUSTER_KO_SHARED_V2_BYTES, &out));
+	UT_ASSERT(cluster_ko_shared_encode_v4(&m, bytes, CLUSTER_KO_SHARED_V4_BYTES));
+	for (size_t len = 0; len <= sizeof(bytes); len++) {
+		if (len == CLUSTER_KO_SHARED_V4_BYTES)
+			continue;
+		UT_ASSERT(!cluster_ko_shared_decode_v4(bytes, len, &out));
+		UT_ASSERT_EQ(memcmp(&out, &before, sizeof(out)), 0);
+	}
+	for (size_t i = 0; i < lengthof(reserved); i++) {
+		bytes[reserved[i]] ^= 0x80;
+		UT_ASSERT(!cluster_ko_shared_decode_v4(bytes, CLUSTER_KO_SHARED_V4_BYTES, &out));
+		UT_ASSERT_EQ(memcmp(&out, &before, sizeof(out)), 0);
+		bytes[reserved[i]] ^= 0x80;
+	}
+}
+
+UT_TEST(shared_v4_rejects_inplace_truncate_and_inexact_object_identity)
+{
+	for (int which = 0; which < 12; which++) {
+		ClusterKoSharedMessageV4 m = shared_v4_fixture(), out, before;
+		uint8 bytes[CLUSTER_KO_SHARED_V4_BYTES], saved[sizeof(bytes)];
+		memset(bytes, 0xed, sizeof(bytes));
+		memcpy(saved, bytes, sizeof(bytes));
+		switch (which) {
+		case 0: m.object.operation = CLUSTER_KO_SHARED_V3_OPERATION_TRUNCATE; break;
+		case 1: m.object.operation = 0; break;
+		case 2: m.object.operation = UINT16_MAX; break;
+		case 3: m.object.ax_mode = ShareLock; break;
+		case 4: m.object.ax_request_id++; break;
+		case 5: m.object.ax_holder.cluster_epoch++; break;
+		case 6: m.object.ax_resid.field1++; break;
+		case 7: m.object.ax_master_generation = 0; break;
+		case 8: m.object.full_fork_mask ^= 1; break;
+		case 9: m.object.space_mutation_token = 0; break;
+		case 10: m.object.base.origin_boot = 0; break;
+		case 11: memset(m.object.base.incarnation, 0, 16); break;
+		}
+		UT_ASSERT(!cluster_ko_shared_encode_v4(&m, bytes, sizeof(bytes)));
+		UT_ASSERT_EQ(memcmp(bytes, saved, sizeof(bytes)), 0);
+		/* The old in-place contract is valid v3; changing only its wire
+		 * envelope must not make it a committed old-incarnation discard. */
+		if (which == 0) {
+			UT_ASSERT(cluster_ko_shared_encode_v3(&m.object, bytes, sizeof(bytes)));
+			memcpy(bytes, "PKO4", 4);
+			bytes[4] = 4;
+			memset(&out, 0xce, sizeof(out));
+			before = out;
+			UT_ASSERT(!cluster_ko_shared_decode_v4(bytes, sizeof(bytes), &out));
+			UT_ASSERT_EQ(memcmp(&out, &before, sizeof(out)), 0);
+		}
+	}
+}
+
+UT_TEST(shared_v4_result_requires_every_original_byte_and_separates_failed)
+{
+	ClusterKoSharedMessageV4 request = shared_v4_fixture(), ack = request, changed;
+	uint8 bytes[CLUSTER_KO_SHARED_V4_BYTES];
+	ack.object.base.verb = CLUSTER_KO_SHARED_ACK;
+	ack.object.base.status = CLUSTER_KO_SHARED_DONE;
+	UT_ASSERT(cluster_ko_shared_result_matches_v4(&request, &ack));
+	UT_ASSERT(cluster_ko_shared_ack_matches_v4(&request, &ack));
+	UT_ASSERT(cluster_ko_shared_encode_v4(&ack, bytes, sizeof(bytes)));
+	for (size_t i = 0; i < sizeof(bytes); i++) {
+		bytes[i] ^= 1;
+		if (cluster_ko_shared_decode_v4(bytes, sizeof(bytes), &changed))
+			UT_ASSERT(!cluster_ko_shared_result_matches_v4(&request, &changed));
+		bytes[i] ^= 1;
+	}
+	ack.object.base.status = CLUSTER_KO_SHARED_FAILED;
+	UT_ASSERT(cluster_ko_shared_result_matches_v4(&request, &ack));
+	UT_ASSERT(!cluster_ko_shared_ack_matches_v4(&request, &ack));
+	ack.object.space_mutation_token++;
+	UT_ASSERT(!cluster_ko_shared_result_matches_v4(&request, &ack));
+	UT_ASSERT(!cluster_ko_shared_result_matches_v4(&request, &request));
+	request.object.operation = ack.object.operation = CLUSTER_KO_SHARED_V3_OPERATION_TRUNCATE;
+	ack.object.space_mutation_token--;
+	UT_ASSERT(!cluster_ko_shared_result_matches_v4(&request, &ack));
+}
+
+UT_TEST(shared_v4_refuses_alias_null_and_wrong_output_length)
+{
+	union {
+		ClusterKoSharedMessageV4 value;
+		uint8 bytes[512];
+	} storage, before;
+	ClusterKoSharedMessageV4 request = shared_v4_fixture();
+	memset(&storage, 0xed, sizeof(storage));
+	storage.value = request;
+	before = storage;
+	UT_ASSERT(!cluster_ko_shared_encode_v4(&storage.value, storage.bytes + 1, 240));
+	UT_ASSERT_EQ(memcmp(&storage, &before, sizeof(storage)), 0);
+	UT_ASSERT(!cluster_ko_shared_encode_v4(&request, storage.bytes, 239));
+	UT_ASSERT(!cluster_ko_shared_encode_v4(&request, storage.bytes, 241));
+	UT_ASSERT_EQ(memcmp(&storage, &before, sizeof(storage)), 0);
+	UT_ASSERT(cluster_ko_shared_encode_v4(&request, storage.bytes + 1, 240));
+	before = storage;
+	UT_ASSERT(!cluster_ko_shared_decode_v4(storage.bytes + 1, 240, &storage.value));
+	UT_ASSERT_EQ(memcmp(&storage, &before, sizeof(storage)), 0);
+	UT_ASSERT(!cluster_ko_shared_encode_v4(NULL, storage.bytes, 240));
+	UT_ASSERT(!cluster_ko_shared_encode_v4(&request, NULL, 240));
+	UT_ASSERT(!cluster_ko_shared_decode_v4(NULL, 240, &request));
+	UT_ASSERT(!cluster_ko_shared_decode_v4(storage.bytes, 240, NULL));
+	UT_ASSERT(!cluster_ko_shared_result_matches_v4(NULL, &request));
+	UT_ASSERT(!cluster_ko_shared_ack_matches_v4(&request, NULL));
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(19);
 	UT_RUN(test_ko_resid_encode);
 	UT_RUN(test_ko_resid_namespace_distinct);
 	UT_RUN(test_ko_vs_dl_resid_distinct);
@@ -491,6 +650,11 @@ main(void)
 	UT_RUN(shared_v3_wire_binds_ax_and_rejects_v2_or_reserved);
 	UT_RUN(shared_v3_codec_allows_remote_ges_holder_identity);
 	UT_RUN(shared_v3_failure_matches_identity_but_never_done);
+	UT_RUN(shared_v4_roundtrip_has_its_own_contract_and_full_identity);
+	UT_RUN(shared_v4_decoder_rejects_old_unknown_truncated_and_reserved_frames);
+	UT_RUN(shared_v4_rejects_inplace_truncate_and_inexact_object_identity);
+	UT_RUN(shared_v4_result_requires_every_original_byte_and_separates_failed);
+	UT_RUN(shared_v4_refuses_alias_null_and_wrong_output_length);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;
