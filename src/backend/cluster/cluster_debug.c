@@ -4010,6 +4010,12 @@ dump_ko(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "ko", "lockfail_count", fmt_int64((int64)cluster_ko_lockfail_count()));
 	emit_row(rsinfo, "ko", "peer_apply_count", fmt_int64((int64)cluster_ko_peer_apply_count()));
 	emit_row(rsinfo, "ko", "inbound_full_count", fmt_int64((int64)cluster_ko_inbound_full_count()));
+	for (int i = 0; i < CLUSTER_KO_DISCARD_REASON_COUNT; i++) {
+		char key[128];
+		const char *reason = cluster_ko_origin_discard_reason_name(i);
+		snprintf(key, sizeof(key), "origin_discard_%s_count", reason);
+		emit_row(rsinfo, "ko", key, fmt_int64((int64)cluster_ko_origin_discard_count(reason)));
+	}
 	for (int i = 0; i < CLUSTER_KO_ORIGIN_REASON_COUNT; i++) {
 		char key[128];
 		const char *reason = cluster_ko_origin_checkpoint_reason_name(

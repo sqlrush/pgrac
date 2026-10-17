@@ -271,6 +271,8 @@ typedef struct ClusterKoShared {
 	pg_atomic_uint64 origin_checkpoint_wait_count[CLUSTER_KO_ORIGIN_REASON_COUNT];
 	pg_atomic_uint64 origin_checkpoint_logged_mask;
 	pg_atomic_uint64 origin_checkpoint_pending_logged_mask;
+	pg_atomic_uint64 origin_discard_count[CLUSTER_KO_DISCARD_REASON_COUNT];
+	pg_atomic_uint64 origin_discard_logged_mask;
 	ClusterKoOriginCheckpointPendingV1 origin_checkpoint_pending;
 	pg_atomic_uint32 inbound_head;		 /* consumer (SI Broadcaster aux) */
 	pg_atomic_uint32 inbound_tail;		 /* producer (LMON IC handler) */
@@ -531,6 +533,9 @@ cluster_ko_shmem_init(void)
 		}
 		pg_atomic_init_u64(&ko_state->origin_checkpoint_logged_mask, 0);
 		pg_atomic_init_u64(&ko_state->origin_checkpoint_pending_logged_mask, 0);
+		for (int i = 0; i < CLUSTER_KO_DISCARD_REASON_COUNT; i++)
+			pg_atomic_init_u64(&ko_state->origin_discard_count[i], 0);
+		pg_atomic_init_u64(&ko_state->origin_discard_logged_mask, 0);
 		memset(&ko_state->origin_checkpoint_pending, 0,
 			   sizeof(ko_state->origin_checkpoint_pending));
 		ko_state->origin_checkpoint_pending.registry_slot = UINT32_MAX;
@@ -643,6 +648,44 @@ static const char *const ko_origin_checkpoint_reason_names[CLUSTER_KO_ORIGIN_REA
 	[CLUSTER_KO_ORIGIN_REASON_WB_REVISION] = "wb_revision",
 	[CLUSTER_KO_ORIGIN_REASON_CONTEXT_CHANGED] = "context_changed"
 };
+
+static const char *const ko_origin_discard_reason_names[CLUSTER_KO_DISCARD_REASON_COUNT] = {
+	"peer_revision", "directory_pending", "extend_pending", "cleaner_pending",
+	"buffer_more", "buffer_wait", "buffer_cut", "buffer_pending", "pi_more",
+	"pi_pending", "wb_not_closed", "final_cut", "wb_revision", "final_pending"
+};
+static ClusterKoDiscardDetailV1 ko_origin_discard_detail;
+
+const char *
+cluster_ko_origin_discard_reason_name(int reason)
+{
+	return reason >= 0 && reason < CLUSTER_KO_DISCARD_REASON_COUNT
+		? ko_origin_discard_reason_names[reason] : "unknown";
+}
+
+uint64
+cluster_ko_origin_discard_count(const char *reason)
+{
+	if (ko_state != NULL && reason != NULL)
+		for (int i = 0; i < CLUSTER_KO_DISCARD_REASON_COUNT; i++)
+			if (strcmp(reason, ko_origin_discard_reason_names[i]) == 0)
+				return pg_atomic_read_u64(&ko_state->origin_discard_count[i]);
+	return 0;
+}
+
+/* Backend-local scratch, never read by a correctness predicate. */
+void
+cluster_ko_origin_discard_detail_v1(const ClusterKoDiscardDetailV1 *detail)
+{
+	if (detail != NULL)
+		ko_origin_discard_detail = *detail;
+	else {
+		memset(&ko_origin_discard_detail, 0, sizeof(ko_origin_discard_detail));
+		ko_origin_discard_detail.forknum = InvalidForkNumber;
+		ko_origin_discard_detail.blocknum = InvalidBlockNumber;
+		ko_origin_discard_detail.slot = UINT32_MAX;
+	}
+}
 
 const char *
 cluster_ko_origin_checkpoint_reason_name(ClusterKoOriginCheckpointReason reason)
@@ -7663,6 +7706,10 @@ static bool
 ko_native_discard_pending_locked(RelFileLocator locator, bool *recovery)
 {
 	bool pending = false;
+	ClusterKoDiscardDetailV1 detail = {
+		.locator = locator, .forknum = InvalidForkNumber,
+		.blocknum = InvalidBlockNumber, .slot = UINT32_MAX
+	};
 
 	if (recovery != NULL)
 		*recovery = false;
@@ -7675,11 +7722,29 @@ ko_native_discard_pending_locked(RelFileLocator locator, bool *recovery)
 
 		if (io->serial != 0 && RelFileLocatorEquals(io->locator, locator)) {
 			pending = true;
+			detail.predicate_mask |= 1u << CLUSTER_KO_DISCARD_DIRECTORY_IO;
+			if (!detail.valid) {
+				detail.source = CLUSTER_KO_DISCARD_DIRECTORY_IO;
+				detail.slot = i;
+				detail.pid = io->pid;
+				detail.revision = io->serial;
+				detail.valid = true;
+			}
 			if (recovery != NULL && io->pid == MyProcPid)
 				*recovery = true;
 		}
 		if (extend->used && RelFileLocatorEquals(extend->locator, locator)) {
 			pending = true;
+			detail.predicate_mask |= 1u << CLUSTER_KO_DISCARD_EXTEND;
+			if (!detail.valid) {
+				detail.source = CLUSTER_KO_DISCARD_EXTEND;
+				detail.slot = i;
+				detail.pid = extend->pid;
+				detail.forknum = extend->fork;
+				detail.revision = extend->serial;
+				detail.flags = extend->failed;
+				detail.valid = true;
+			}
 			if (recovery != NULL && (extend->pid == MyProcPid || extend->failed))
 				*recovery = true;
 		}
@@ -7689,10 +7754,19 @@ ko_native_discard_pending_locked(RelFileLocator locator, bool *recovery)
 
 		if (cleaner->used && RelFileLocatorEquals(cleaner->locator, locator)) {
 			pending = true;
+			detail.predicate_mask |= 1u << CLUSTER_KO_DISCARD_CLEANER;
+			if (!detail.valid) {
+				detail.source = CLUSTER_KO_DISCARD_CLEANER;
+				detail.slot = i;
+				detail.pid = cleaner->scope.pid;
+				detail.valid = true;
+			}
 			if (recovery != NULL && cleaner->scope.pid == MyProcPid)
 				*recovery = true;
 		}
 	}
+	if (pending)
+		cluster_ko_origin_discard_detail_v1(&detail);
 	return pending;
 }
 
@@ -7741,6 +7815,38 @@ ko_native_discard_cut_current(const ClusterKoSharedContext *before, uint64 revis
  * CLOSING blocks ordinary producers, but is deliberately not RETIRED: final
  * SPACE and the later no-I/O directory terminal have separate consumers.
  * Cursors stay on this stack and cannot survive ERROR or owner handoff. */
+/* One first LOG per reason per instance; every occurrence is counted. Copies
+ * from the failed consumer are diagnostic and never feed a retry decision.
+ * No subsystem lock is held here. Spec: AM05, CC observability 2026-10-18. */
+static void
+ko_origin_discard_record(ClusterKoOriginDiscardReason reason, bool wait,
+	const ClusterKoCompletionV2 *owned, uint8 phase, uint32 cursor,
+	uint64 revision, uint64 saved_revision, uint64 wb_revision,
+	const ResourceXGateSnapshot *gate, uint32 subpredicate)
+{
+	ClusterKoDiscardDetailV1 detail = ko_origin_discard_detail;
+	RelFileLocator locator = owned->barrier_request_v3.base.key.locator;
+	uint64 bit = UINT64CONST(1) << reason;
+	uint64 previous;
+
+	(void)pg_atomic_fetch_add_u64(&ko_state->origin_discard_count[reason], 1);
+	previous = pg_atomic_fetch_or_u64(&ko_state->origin_discard_logged_mask, bit);
+	if ((previous & bit) == 0)
+		ereport(LOG,
+			(errmsg("native DROP origin discard %s reason=%s locator=%u/%u/%u batch=" UINT64_FORMAT " serial=" UINT64_FORMAT " phase=%u cursor=%u revision=" UINT64_FORMAT " saved_revision=" UINT64_FORMAT " wb_revision=" UINT64_FORMAT " gate_phase=%u gate_formation=" UINT64_FORMAT " gate_freeze=" UINT64_FORMAT " subpredicate=%u detail_valid=%u source=%u projection=0x%X x_holder=%d s_holders=0x%X s_refs=%u local_owner=%u detail_locator=%u/%u/%u fork=%d block=%u slot=%u owner_pid=%d state=%u refs=%u flags=0x%08X predicate_mask=0x%08X detail_revision=" UINT64_FORMAT " value=" UINT64_FORMAT " value2=" UINT64_FORMAT,
+				wait ? "wait" : "restart", cluster_ko_origin_discard_reason_name(reason),
+				locator.spcOid, locator.dbOid, locator.relNumber,
+				owned->barrier_request_v3.base.batch_id, owned->serial, phase, cursor,
+				revision, saved_revision, wb_revision, gate->phase, gate->formation,
+				gate->freeze_generation, subpredicate, detail.valid, detail.source,
+				detail.projection, detail.current_holder_node, detail.s_holders,
+				detail.s_holder_refs, detail.local_owner_state,
+				detail.locator.spcOid, detail.locator.dbOid, detail.locator.relNumber,
+				detail.forknum, detail.blocknum, detail.slot, detail.pid, detail.state,
+				detail.refs, detail.flags, detail.predicate_mask, detail.revision,
+				detail.value, detail.value2)));
+}
+
 static bool
 ko_native_origin_discard_v4(ClusterKoCompletionV2 *owned, ClusterKoNativeContinuation *work)
 {
@@ -7789,38 +7895,60 @@ ko_native_origin_discard_v4(ClusterKoCompletionV2 *owned, ClusterKoNativeContinu
 	saved_revision = revision;
 	for (;;) {
 		int events;
+		bool cut_current;
+		uint32 final_predicate = 0;
 
 		ResetLatch(MyLatch);
+		cluster_ko_origin_discard_detail_v1(NULL);
 		revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
 		if (revision == 0 || revision >= UINT64_MAX - 1
 			|| !ko_native_discard_cut_current(&before, revision, &gate))
 			return false;
 		if (revision != saved_revision) {
+			ko_origin_discard_record(CLUSTER_KO_DISCARD_PEER_REVISION, false, owned, phase, cursor,
+				revision, saved_revision, wb_revision, &gate, 0);
 			phase = cursor = 0;
 			saved_revision = revision;
 		}
+		cluster_ko_origin_discard_detail_v1(NULL);
 		SpinLockAcquire(&ko_state->shared_lock);
 		same = ko_native_discard_same_locked(owned, work, &before);
 		pending = ko_native_discard_pending_locked(locator, &recovery);
 		SpinLockRelease(&ko_state->shared_lock);
 		if (!same || recovery)
 			return false;
-		if (pending)
+		if (pending) {
+			ClusterKoOriginDiscardReason reason = ko_origin_discard_detail.source == CLUSTER_KO_DISCARD_DIRECTORY_IO
+				? CLUSTER_KO_DISCARD_DIRECTORY_PENDING
+				: ko_origin_discard_detail.source == CLUSTER_KO_DISCARD_EXTEND
+				? CLUSTER_KO_DISCARD_EXTEND_PENDING : CLUSTER_KO_DISCARD_CLEANER_PENDING;
+			ko_origin_discard_record(reason, true, owned, phase, cursor,
+				revision, saved_revision, wb_revision, &gate, 0);
 			goto wait;
+		}
 		if (phase == 0) {
 			uint32 budget = 128, start = cursor;
-			ClusterBufferDrainResult result
-				= cluster_bufmgr_discard_relation_v4(locator, &budget, &cursor);
+			ClusterBufferDrainResult result;
+
+			cluster_ko_origin_discard_detail_v1(NULL);
+			result = cluster_bufmgr_discard_relation_v4(locator, &budget, &cursor);
 
 			if (budget > 128 || cursor < start || cursor - start > 128 - budget
 				|| (result != CLUSTER_BUFFER_DRAIN_EMPTY && result != CLUSTER_BUFFER_DRAIN_MORE
 					&& result != CLUSTER_BUFFER_DRAIN_WAIT))
 				return false;
-			if (result != CLUSTER_BUFFER_DRAIN_EMPTY)
+			if (result != CLUSTER_BUFFER_DRAIN_EMPTY) {
+				ko_origin_discard_record(result == CLUSTER_BUFFER_DRAIN_MORE
+					? CLUSTER_KO_DISCARD_BUFFER_MORE : CLUSTER_KO_DISCARD_BUFFER_WAIT,
+					true, owned, phase, cursor, revision, saved_revision, wb_revision, &gate, 0);
 				goto wait;
+			}
 			/* A returned physical prefix is not permission for the next
 			 * consumer if its original operation or admission cut moved. */
 			if (!ko_native_discard_cut_current(&before, revision, &gate)) {
+				cluster_ko_origin_discard_detail_v1(NULL);
+				ko_origin_discard_record(CLUSTER_KO_DISCARD_BUFFER_CUT, true, owned, phase, cursor,
+					revision, saved_revision, wb_revision, &gate, 0);
 				phase = cursor = 0;
 				goto wait;
 			}
@@ -7831,6 +7959,8 @@ ko_native_origin_discard_v4(ClusterKoCompletionV2 *owned, ClusterKoNativeContinu
 			if (!same || recovery)
 				return false;
 			if (pending) {
+				ko_origin_discard_record(CLUSTER_KO_DISCARD_BUFFER_PENDING, true, owned, phase, cursor,
+					revision, saved_revision, wb_revision, &gate, 0);
 				cursor = 0;
 				goto wait;
 			}
@@ -7840,40 +7970,55 @@ ko_native_origin_discard_v4(ClusterKoCompletionV2 *owned, ClusterKoNativeContinu
 		}
 		if (phase == 1) {
 			uint32 start = cursor;
-			ClusterPcmPiRelationScanV2 result
-				= cluster_pcm_lock_ko_local_relation_discard_v4(locator, gate.formation, 128, &cursor);
+			ClusterPcmPiRelationScanV2 result;
+
+			cluster_ko_origin_discard_detail_v1(NULL);
+			result = cluster_pcm_lock_ko_local_relation_discard_v4(locator, gate.formation, 128, &cursor);
 
 			if (cursor < start || cursor - start > 128
 				|| (result != CLUSTER_PCM_PI_RELATION_EMPTY && result != CLUSTER_PCM_PI_RELATION_MORE
 					&& result != CLUSTER_PCM_PI_RELATION_PENDING))
 				return false;
 			if (result == CLUSTER_PCM_PI_RELATION_PENDING) {
+				ko_origin_discard_record(CLUSTER_KO_DISCARD_PI_PENDING, true, owned, phase, cursor,
+					revision, saved_revision, wb_revision, &gate, 0);
 				/* A retained local install may have finished while we waited. */
 				phase = cursor = 0;
 				goto wait;
 			}
-			if (result == CLUSTER_PCM_PI_RELATION_MORE)
+			if (result == CLUSTER_PCM_PI_RELATION_MORE) {
+				ko_origin_discard_record(CLUSTER_KO_DISCARD_PI_MORE, true, owned, phase, cursor,
+					revision, saved_revision, wb_revision, &gate, 0);
 				goto wait;
+			}
 			phase = 2;
 		}
+		cluster_ko_origin_discard_detail_v1(NULL);
 		if (!cluster_pi_writeback_local_relation_closed_v3(locator, before.request.epoch,
 			&wb_revision)) {
+			ko_origin_discard_record(CLUSTER_KO_DISCARD_WB_NOT_CLOSED, true, owned, phase, cursor,
+				revision, saved_revision, wb_revision, &gate, 0);
 			phase = 1;
 			cursor = 0;
 			goto wait;
 		}
-		if (!ko_native_discard_cut_current(&before, revision, &gate)
+		if (!(cut_current = ko_native_discard_cut_current(&before, revision, &gate))
 			|| !cluster_pi_writeback_local_revision_current_v3(wb_revision)) {
+			cluster_ko_origin_discard_detail_v1(NULL);
+			ko_origin_discard_record(cut_current ? CLUSTER_KO_DISCARD_WB_REVISION
+				: CLUSTER_KO_DISCARD_FINAL_CUT, true, owned, phase, cursor,
+				revision, saved_revision, wb_revision, &gate, 0);
 			phase = cursor = 0;
 			goto wait;
 		}
+		cluster_ko_origin_discard_detail_v1(NULL);
 		SpinLockAcquire(&ko_state->shared_lock);
 		same = ko_native_discard_same_locked(owned, work, &before);
 		pending = ko_native_discard_pending_locked(locator, &recovery)
-			|| pg_atomic_read_u64(&ko_state->peer_admission_revision) != revision
-			|| !cluster_pcm_lock_resource_x_gate_snapshot(&after)
-			|| memcmp(&gate, &after, sizeof(gate)) != 0
-			|| !cluster_pi_writeback_local_revision_current_v3(wb_revision);
+			|| (final_predicate = 1, pg_atomic_read_u64(&ko_state->peer_admission_revision) != revision)
+			|| (final_predicate = 2, !cluster_pcm_lock_resource_x_gate_snapshot(&after))
+			|| (final_predicate = 3, memcmp(&gate, &after, sizeof(gate)) != 0)
+			|| (final_predicate = 4, !cluster_pi_writeback_local_revision_current_v3(wb_revision));
 		if (same && !pending) {
 			entry->origin_data_closed = owned->origin_data_closed = true;
 			work->context = *entry;
@@ -7883,6 +8028,8 @@ ko_native_origin_discard_v4(ClusterKoCompletionV2 *owned, ClusterKoNativeContinu
 			return false;
 		if (!pending)
 			return true;
+		ko_origin_discard_record(CLUSTER_KO_DISCARD_FINAL_PENDING, true, owned, phase, cursor,
+			revision, saved_revision, wb_revision, &gate, final_predicate);
 		phase = cursor = 0;
 	wait:
 		events = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,

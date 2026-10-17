@@ -1045,6 +1045,28 @@ cluster_ko_inbound_full_count(void)
 {
 	return 0;
 }
+bool
+cluster_ko_origin_checkpoint_pending_identity(ClusterKoOriginCheckpointPendingV1 *out pg_attribute_unused())
+{
+	return false;
+}
+
+uint64
+cluster_ko_origin_discard_count(const char *reason)
+{
+	return strcmp(reason, "buffer_wait") == 0 ? 17 : 0;
+}
+const char *
+cluster_ko_origin_discard_reason_name(int reason)
+{
+	static const char *const names[] = {
+		"peer_revision", "directory_pending", "extend_pending", "cleaner_pending",
+		"buffer_more", "buffer_wait", "buffer_cut", "buffer_pending", "pi_more",
+		"pi_pending", "wb_not_closed", "final_cut", "wb_revision", "final_pending"
+	};
+	return reason >= 0 && reason < (int)lengthof(names) ? names[reason] : "unknown";
+}
+
 uint64
 cluster_ko_origin_checkpoint_restart_count(const char *reason pg_attribute_unused())
 {
@@ -5530,6 +5552,21 @@ UT_TEST(test_debug_dump_exposes_exact_current_protocol_debt_gauges)
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_invalid_debt_count"), "19");
 }
 
+UT_TEST(test_debug_dump_exposes_origin_discard_reason_counters)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+	memset(&rsinfo, 0, sizeof(rsinfo));
+	captured_dump_row_count = captured_formatted_value_count = 0;
+	fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+	(void)cluster_dump_state(fcinfo);
+	UT_ASSERT_EQ(captured_dump_count("ko", "origin_discard_buffer_wait_count"), 1);
+	if (captured_dump_count("ko", "origin_discard_buffer_wait_count") == 1)
+		UT_ASSERT_STR_EQ(captured_dump_value("ko", "origin_discard_buffer_wait_count"), "17");
+	UT_ASSERT_EQ(captured_dump_count("ko", "origin_discard_pi_pending_count"), 1);
+}
+
 UT_TEST(test_debug_dump_exposes_receipt_lifetime_and_cancel_before_counters)
 {
 	LOCAL_FCINFO(fcinfo, 0);
@@ -6201,6 +6238,7 @@ main(void)
 	UT_RUN(test_debug_dump_exposes_reply_wait_sites_without_fabricating_zeros);
 	UT_RUN(test_debug_dump_exposes_paired_wait_margins_without_zero_fabrication);
 	UT_RUN(test_debug_dump_exposes_vm_counts_and_histogram_as_separate_cohorts);
+	UT_RUN(test_debug_dump_exposes_origin_discard_reason_counters);
 	UT_RUN(test_debug_dump_exposes_receipt_lifetime_and_cancel_before_counters);
 	UT_RUN(test_debug_dump_exposes_tt_and_itl_reason_counters_without_fake_zero);
 	UT_RUN(test_debug_dump_exposes_closed_ctrc_observability);

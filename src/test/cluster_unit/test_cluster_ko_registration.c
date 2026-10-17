@@ -1204,8 +1204,14 @@ window_origin_discard(void)
 			? CLUSTER_BUFFER_DRAIN_MORE : CLUSTER_BUFFER_DRAIN_EMPTY;
 		break;
 	case 7:
-		if (committed_discard_calls == 1)
+		if (committed_discard_calls == 1) {
+			/* A prior consumer's tuple must not become cut-failure evidence. */
+			ClusterKoDiscardDetailV1 stale = {
+				.locator = locator, .source = CLUSTER_KO_DISCARD_WB, .valid = true
+			};
+			cluster_ko_origin_discard_detail_v1(&stale);
 			(void)pg_atomic_fetch_add_u64(&storage.peer_admission_revision, 1);
+		}
 		else
 			UT_ASSERT_EQ(committed_discard_input, 0);
 		break;
@@ -1299,6 +1305,8 @@ window_send(uint8 type, int32 dest, const void *bytes, uint32 length)
 	return CLUSTER_IC_SEND_DONE;
 }
 
+static bool window_observability;
+
 static void
 window_wait(void)
 {
@@ -1307,6 +1315,8 @@ window_wait(void)
 	if (!barrier_active) {
 		RelFileLocator locator = window_work->context.request.key.locator;
 
+		if (window_observability && window_origin_case == 7)
+			UT_ASSERT(!ko_origin_discard_detail.valid);
 		UT_ASSERT(!postcommit_owner->origin_data_closed);
 		UT_ASSERT(!cluster_ko_directory_drop_retired_v3(locator));
 		if (window_origin_case == 1) {
@@ -1647,6 +1657,16 @@ run_committed_window(uint16 operation, unsigned mode, bool held, unsigned origin
 			UT_ASSERT(!window_work->buffers_released);
 		}
 	}
+	if (window_observability) {
+		const char *reason = origin_case == 1 ? "directory_pending"
+			: origin_case == 2 ? "buffer_more" : origin_case == 3 ? "buffer_wait"
+			: origin_case == 4 ? "pi_more" : origin_case == 5 ? "pi_pending"
+			: origin_case == 6 ? "wb_not_closed" : origin_case == 7 ? "buffer_cut"
+			: origin_case == 14 ? "cleaner_pending" : "extend_pending";
+		UT_ASSERT(cluster_ko_origin_discard_count(reason) > 0);
+		UT_ASSERT_EQ(cluster_ko_origin_discard_count("unknown"), 0);
+		UT_ASSERT_EQ(cluster_ko_origin_checkpoint_wait_count("drain_wait"), 0);
+	}
 	native_fixture_shared_memory_end();
 }
 
@@ -1756,6 +1776,15 @@ UT_TEST(test_committed_origin_waits_for_original_io_and_finite_owners)
 	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 15);
 }
 
+UT_TEST(test_committed_origin_discard_counts_the_actual_wait_branch)
+{
+	const unsigned cases[] = {1, 2, 3, 4, 5, 6, 7, 14, 15};
+	window_observability = true;
+	for (unsigned i = 0; i < lengthof(cases); i++)
+		run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, cases[i]);
+	window_observability = false;
+}
+
 UT_TEST(test_committed_origin_preserves_bounded_scan_and_wait_progress)
 {
 	for (unsigned origin_case = 2; origin_case <= 6; origin_case++)
@@ -1840,6 +1869,7 @@ main(void)
 	UT_RUN(test_committed_window_close_rejects_changed_proof_and_unclosed_work);
 	UT_RUN(test_committed_origin_self_or_failed_work_hands_off_without_waiting);
 	UT_RUN(test_committed_origin_waits_for_original_io_and_finite_owners);
+	UT_RUN(test_committed_origin_discard_counts_the_actual_wait_branch);
 	UT_RUN(test_committed_origin_preserves_bounded_scan_and_wait_progress);
 	UT_RUN(test_committed_origin_rescans_changed_revisions_without_self_invalidation);
 	UT_RUN(test_committed_origin_drift_and_error_keep_native_obligation);

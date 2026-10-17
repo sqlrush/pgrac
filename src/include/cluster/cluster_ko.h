@@ -754,6 +754,60 @@ typedef enum ClusterKoOriginCheckpointReason
 	CLUSTER_KO_ORIGIN_REASON_COUNT
 } ClusterKoOriginCheckpointReason;
 
+/* Diagnostic copies only: none of these values grants discard or I/O authority.
+ * The subsystem copies its rejected tuple while holding its existing locks;
+ * the origin logs it only after those locks have been released. */
+typedef struct ClusterKoDiscardDetailV1 {
+	RelFileLocator locator;
+	int32 forknum;
+	uint32 blocknum;
+	uint32 slot;
+	int32 pid;
+	uint32 source;
+	uint32 state;
+	uint32 refs;
+	uint32 flags;
+	uint32 predicate_mask;
+	uint32 projection; /* bit 0 LOCAL, bit 1 local PI, bit 2 DIRECTORY */
+	int32 current_holder_node;
+	uint32 s_holders;
+	uint32 s_holder_refs;
+	uint32 local_owner_state;
+	uint64 revision;
+	uint64 value;
+	uint64 value2;
+	bool valid;
+} ClusterKoDiscardDetailV1;
+
+#define CLUSTER_KO_DISCARD_BUFFER 1
+#define CLUSTER_KO_DISCARD_DIRECTORY_IO 2
+#define CLUSTER_KO_DISCARD_EXTEND 3
+#define CLUSTER_KO_DISCARD_CLEANER 4
+#define CLUSTER_KO_DISCARD_PCM 5
+#define CLUSTER_KO_DISCARD_WB 6
+
+typedef enum ClusterKoOriginDiscardReason {
+	CLUSTER_KO_DISCARD_PEER_REVISION,
+	CLUSTER_KO_DISCARD_DIRECTORY_PENDING,
+	CLUSTER_KO_DISCARD_EXTEND_PENDING,
+	CLUSTER_KO_DISCARD_CLEANER_PENDING,
+	CLUSTER_KO_DISCARD_BUFFER_MORE,
+	CLUSTER_KO_DISCARD_BUFFER_WAIT,
+	CLUSTER_KO_DISCARD_BUFFER_CUT,
+	CLUSTER_KO_DISCARD_BUFFER_PENDING,
+	CLUSTER_KO_DISCARD_PI_MORE,
+	CLUSTER_KO_DISCARD_PI_PENDING,
+	CLUSTER_KO_DISCARD_WB_NOT_CLOSED,
+	CLUSTER_KO_DISCARD_FINAL_CUT,
+	CLUSTER_KO_DISCARD_WB_REVISION,
+	CLUSTER_KO_DISCARD_FINAL_PENDING,
+	CLUSTER_KO_DISCARD_REASON_COUNT
+} ClusterKoOriginDiscardReason;
+
+extern void cluster_ko_origin_discard_detail_v1(const ClusterKoDiscardDetailV1 *detail);
+extern uint64 cluster_ko_origin_discard_count(const char *reason);
+extern const char *cluster_ko_origin_discard_reason_name(int reason);
+
 extern uint64 cluster_ko_flush_count(void);		   /* barriers initiated (enqueuer) */
 extern uint64 cluster_ko_ack_received_count(void); /* peer DONE ACKs recorded (enqueuer) */
 extern uint64 cluster_ko_failclosed_count(void);   /* 53RAA fail-closed (enqueuer) */

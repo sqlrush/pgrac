@@ -895,6 +895,10 @@ cluster_pi_writeback_local_relation_closed_v3(RelFileLocator locator, uint64 for
 	uint32 state, version, count;
 	int32 pid;
 	bool pending, started, matches = false;
+	ClusterKoDiscardDetailV1 detail = {
+		.locator = locator, .forknum = InvalidForkNumber,
+		.blocknum = InvalidBlockNumber, .source = CLUSTER_KO_DISCARD_WB
+	};
 
 	if (revision != NULL)
 		*revision = 0;
@@ -920,6 +924,13 @@ cluster_pi_writeback_local_relation_closed_v3(RelFileLocator locator, uint64 for
 			reply.v1 = wb_shared->reply;
 	}
 	SpinLockRelease(&wb_shared->lock);
+	detail.slot = version;
+	detail.pid = pid;
+	detail.state = state;
+	detail.flags = (pending ? 1u : 0u) | (started ? 2u : 0u);
+	detail.revision = request_revision;
+	detail.value = sampled;
+	cluster_ko_origin_discard_detail_v1(&detail);
 	if (!cluster_pi_writeback_local_revision_current_v3(sampled) || state > WB_REPLIED)
 		return false;
 	if (state == WB_EMPTY) {
@@ -939,9 +950,17 @@ cluster_pi_writeback_local_relation_closed_v3(RelFileLocator locator, uint64 for
 					&& !cluster_pi_writeback_ack_matches_v2(&request.v2, &reply.v2)))
 				return false;
 			count = request.v2.count;
-			for (uint32 i = 0; i < count; i++)
-				matches |= RelFileLocatorEquals(
-					wb_v2_page(&request.v2.facts[i])->binding.identity.locator, locator);
+			for (uint32 i = 0; i < count; i++) {
+				const ClusterPiDataFactV1 *fact = wb_v2_page(&request.v2.facts[i]);
+				matches |= RelFileLocatorEquals(fact->binding.identity.locator, locator);
+				if (matches && !detail.valid) {
+					detail.forknum = fact->binding.identity.forknum;
+					detail.blocknum = fact->binding.identity.blockno;
+					detail.value2 = count;
+					detail.valid = true;
+					cluster_ko_origin_discard_detail_v1(&detail);
+				}
+			}
 		} else if (version == 1) {
 			if (!wb_message_valid(&request.v1) || request.v1.verb != CLUSTER_PI_WRITEBACK_NOTIFY
 				|| request.v1.epoch != formation
@@ -949,9 +968,17 @@ cluster_pi_writeback_local_relation_closed_v3(RelFileLocator locator, uint64 for
 				|| (state == WB_REPLIED && !wb_reply_matches(&request.v1, &reply.v1)))
 				return false;
 			count = request.v1.count;
-			for (uint32 i = 0; i < count; i++)
-				matches
-					|= RelFileLocatorEquals(request.v1.facts[i].binding.identity.locator, locator);
+			for (uint32 i = 0; i < count; i++) {
+				const ClusterPiDataFactV1 *fact = &request.v1.facts[i];
+				matches |= RelFileLocatorEquals(fact->binding.identity.locator, locator);
+				if (matches && !detail.valid) {
+					detail.forknum = fact->binding.identity.forknum;
+					detail.blocknum = fact->binding.identity.blockno;
+					detail.value2 = count;
+					detail.valid = true;
+					cluster_ko_origin_discard_detail_v1(&detail);
+				}
+			}
 		} else
 			return false;
 		if (matches && (state != WB_REPLIED || pending))

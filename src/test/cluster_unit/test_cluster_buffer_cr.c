@@ -46,6 +46,15 @@
 UT_DEFINE_GLOBALS();
 #include "test_cluster_buffer_mapping_fixture.h"
 
+static ClusterKoDiscardDetailV1 discarded_detail;
+
+void
+cluster_ko_origin_discard_detail_v1(const ClusterKoDiscardDetailV1 *detail)
+{
+	if (detail != NULL)
+		discarded_detail = *detail;
+}
+
 BufferDescPadded *BufferDescriptors;
 LWLockPadded *MainLWLockArray;
 bool cluster_shared_config = true;
@@ -1873,9 +1882,22 @@ UT_TEST(test_committed_discard_keeps_pins_io_and_ownership_reservations)
 		case 9: owner_delivery[2] = 7; break;
 		case 10: buf->pcm_state = UINT8_MAX; break;
 		}
+		memset(&discarded_detail, 0, sizeof(discarded_detail));
 		state = pg_atomic_read_u32(&buf->state);
 		UT_ASSERT(cluster_bufmgr_discard_relation_v4(ko_locator, &budget, &cursor)
 			!= CLUSTER_BUFFER_DRAIN_EMPTY);
+		UT_ASSERT(discarded_detail.valid);
+		UT_ASSERT_EQ(discarded_detail.source, CLUSTER_KO_DISCARD_BUFFER);
+		UT_ASSERT(RelFileLocatorEquals(discarded_detail.locator, ko_locator));
+		UT_ASSERT_EQ(discarded_detail.forknum, tag.forkNum);
+		UT_ASSERT_EQ(discarded_detail.blocknum, tag.blockNum);
+		UT_ASSERT_EQ(discarded_detail.slot, 2);
+		if (fault == 0) {
+			UT_ASSERT_EQ(discarded_detail.refs, 1);
+			UT_ASSERT_EQ(discarded_detail.predicate_mask, 2);
+		}
+		if (fault == 1 || fault == 2)
+			UT_ASSERT_EQ(discarded_detail.predicate_mask, 4);
 		UT_ASSERT_EQ(cursor, 2);
 		UT_ASSERT_EQ(pg_atomic_read_u32(&buf->state), state);
 		UT_ASSERT_EQ(BufTableLookup(&tag, BufTableHashCode(&tag)), 2);

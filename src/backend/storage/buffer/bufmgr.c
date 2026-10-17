@@ -11225,40 +11225,82 @@ cluster_bufmgr_discard_buffer_v4(BufferDesc *buf)
 	uint32 flags = 0;
 	uint64 generation = 0;
 	LWLock *partition;
+	uint32 delivery = UINT32_MAX;
+	bool fence_sampled = false, fence_matches = false;
+	ClusterKoDiscardDetailV1 detail = {
+		.locator = BufTagGetRelFileLocator(&tag), .forknum = tag.forkNum,
+		.blocknum = tag.blockNum, .slot = buf->buf_id,
+		.source = CLUSTER_KO_DISCARD_BUFFER, .state = state,
+		.refs = BUF_STATE_GET_REFCOUNT(state), .flags = buf->pcm_state,
+		.valid = true
+	};
 
 	cluster_pcm_own_eviction_capture_locked(buf, &capture);
+	detail.revision = capture.generation;
 	UnlockBufHdr(buf, state);
 	hash = BufTableHashCode(&tag);
 	partition = BufMappingPartitionLock(hash);
-	if (!LWLockConditionalAcquire(partition, LW_EXCLUSIVE))
+	if (!LWLockConditionalAcquire(partition, LW_EXCLUSIVE)) {
+		detail.predicate_mask = 1; /* mapping lock */
+		cluster_ko_origin_discard_detail_v1(&detail);
 		return false;
+	}
 	state = LockBufHdr(buf);
+	detail.state = state;
+	detail.refs = BUF_STATE_GET_REFCOUNT(state);
+	detail.flags = buf->pcm_state;
 	if (!BufferTagsEqual(&tag, &buf->tag)) {
 		UnlockBufHdr(buf, state);
 		LWLockRelease(partition);
 		return true;
 	}
 	if (BUF_STATE_GET_REFCOUNT(state) != 0 || (state & (BM_IO_IN_PROGRESS | BM_IO_ERROR)) != 0
-		|| capture.generation == 0 || cluster_pcm_own_delivery_attempt_get(buf->buf_id) != 0
+		|| capture.generation == 0 || (delivery = cluster_pcm_own_delivery_attempt_get(buf->buf_id)) != 0
 		|| (buf->pcm_state != PCM_STATE_N && buf->pcm_state != PCM_STATE_S
 			&& buf->pcm_state != PCM_STATE_X)
-		|| !cluster_pcm_own_fence_matches_locked(buf, &capture)
+		|| !(fence_sampled = true, fence_matches = cluster_pcm_own_fence_matches_locked(buf, &capture))
 		|| (buf->buffer_type != BUF_TYPE_CURRENT && buf->buffer_type != BUF_TYPE_PI
 			&& buf->buffer_type != BUF_TYPE_CR)) {
+		/* First rejected term, with the original short-circuit probe order.
+		 * 2=pin, 4=I/O, 8=generation, 16=delivery, 32=PCM, 64=fence, 128=type. */
+		detail.state = state;
+		detail.refs = BUF_STATE_GET_REFCOUNT(state);
+		detail.flags = buf->pcm_state;
+		detail.value = delivery;
+		detail.predicate_mask = detail.refs != 0 ? 2
+			: (state & (BM_IO_IN_PROGRESS | BM_IO_ERROR)) != 0 ? 4
+			: capture.generation == 0 ? 8 : delivery != 0 ? 16
+			: (buf->pcm_state != PCM_STATE_N && buf->pcm_state != PCM_STATE_S
+				&& buf->pcm_state != PCM_STATE_X) ? 32
+			: fence_sampled && !fence_matches ? 64 : 128;
+		if (detail.refs != 0)
+			detail.value2 = GetPrivateRefCount(BufferDescriptorGetBuffer(buf));
+		cluster_ko_origin_discard_detail_v1(&detail);
 		UnlockBufHdr(buf, state);
 		LWLockRelease(partition);
 		return false;
 	}
 	/* CR has its own version-chain mapping tail and never owns dirty work. */
-	if (buf->buffer_type == BUF_TYPE_CR)
-		return InvalidateBufferCommitLocked(buf, &tag, hash, partition, state);
+	if (buf->buffer_type == BUF_TYPE_CR) {
+		bool complete = InvalidateBufferCommitLocked(buf, &tag, hash, partition, state);
+		if (!complete) {
+			detail.predicate_mask = 1024; /* CR mapping tail */
+			cluster_ko_origin_discard_detail_v1(&detail);
+		}
+		return complete;
+	}
 	if (BufTableLookup(&tag, hash) != buf->buf_id) {
+		detail.predicate_mask = 256; /* mapping identity */
+		cluster_ko_origin_discard_detail_v1(&detail);
 		UnlockBufHdr(buf, state);
 		LWLockRelease(partition);
 		return false;
 	}
 	result = cluster_pcm_own_eviction_commit_locked(buf, &capture, &generation, &flags);
 	if (result != CLUSTER_PCM_OWN_OK) {
+		detail.predicate_mask = 512; /* original eviction result */
+		detail.value = result;
+		cluster_ko_origin_discard_detail_v1(&detail);
 		UnlockBufHdr(buf, state);
 		LWLockRelease(partition);
 		return false;

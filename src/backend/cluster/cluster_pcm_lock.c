@@ -10919,7 +10919,7 @@ static bool
 pcm_resource_x_role_pending_locked(struct GrdEntry *entry,
 								   const ClusterPcmResourceXMasterState *state,
 								   PcmRelationScanRole role,
-								   uint32 *predicate_mask, bool *only_local_pi)
+								   uint32 *predicate_mask, bool *only_local_pi, uint32 *projection)
 {
 	const ClusterPcmResourceXBootstrapRound *round = &entry->resource_x_bootstrap_round;
 	bool local = false;
@@ -11072,6 +11072,8 @@ pcm_resource_x_role_pending_locked(struct GrdEntry *entry,
 			: role == PCM_RELATION_SCAN_DIRECTORY ? directory : false;
 		if (only_local_pi != NULL)
 			*only_local_pi = local_pi && !local;
+		if (projection != NULL)
+			*projection = (local ? 1u : 0u) | (local_pi ? 2u : 0u) | (directory ? 4u : 0u);
 		#undef PCM_PENDING_NOTE
 		return result;
 	}
@@ -11135,7 +11137,7 @@ pcm_pi_relation_scan_role(RelFileLocator locator, uint64 formation, uint32 budge
 		struct GrdEntry *entry;
 		bool active, retained, valid, pending = false, only_local_pi = false;
 		uint32 mode, s_holders, pi_holders;
-		uint32 predicate_mask = 0;
+		uint32 predicate_mask = 0, pending_projection = 0;
 
 		if (slot->state == PCM_REGISTRY_EMPTY) {
 			if (memcmp(slot, &empty_slot, sizeof(*slot)) != 0
@@ -11215,7 +11217,7 @@ pcm_pi_relation_scan_role(RelFileLocator locator, uint64 formation, uint32 budge
 					|| entry->pi_watermark_scn != 0 || entry->local_pi_first.source_flags != 0
 					|| entry->local_pi_last.source_flags != 0)
 				: pcm_resource_x_role_pending_locked(entry, state, role, &predicate_mask,
-														&only_local_pi);
+														&only_local_pi, &pending_projection);
 			if (discard_local) {
 				static const ClusterPageWalRefV1 empty;
 				ClusterPcmLocalPiSnapshotV1 local;
@@ -11289,6 +11291,25 @@ pcm_pi_relation_scan_role(RelFileLocator locator, uint64 formation, uint32 budge
 					pending_out->pi_source_slot_last = entry->local_pi_last.source_flags & UINT16_C(0x7fff);
 				}
 			}
+		}
+		if (discard_local && result == CLUSTER_PCM_PI_RELATION_PENDING) {
+			/* Copy the rejected local tuple under the original entry lock.
+			 * The sink only copies backend-local diagnostic bytes. */
+			ClusterKoDiscardDetailV1 detail = {
+				.locator = BufTagGetRelFileLocator(&entry->tag),
+				.forknum = entry->tag.forkNum, .blocknum = entry->tag.blockNum,
+				.slot = entry->registry_slot, .source = CLUSTER_KO_DISCARD_PCM,
+				.state = mode, .refs = pg_atomic_read_u32(&entry->pin_count),
+				.flags = pg_atomic_read_u32(&entry->wait_refcount),
+				.predicate_mask = predicate_mask, .projection = pending_projection,
+				.current_holder_node = entry->x_holder_node,
+				.s_holders = s_holders, .s_holder_refs = entry->s_holder_refcount_local,
+				.local_owner_state = entry->resource_x_local_owner.state,
+				.revision = entry->local_pi_revision,
+				.value = pg_atomic_read_u32(&entry->transport_refcount),
+				.value2 = entry->resource_x_local_owner.state, .valid = true
+			};
+			cluster_ko_origin_discard_detail_v1(&detail);
 		}
 		LWLockRelease(&entry->entry_lock.lock);
 		if (result != CLUSTER_PCM_PI_RELATION_MORE)
