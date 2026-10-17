@@ -217,6 +217,8 @@ static int barrier_interrupt_sqlstate;
 static void (*barrier_before_interrupt)(void);
 static bool multiple_barriers;
 static uint64 allocated_batch, active_batch;
+static uint64 fixture_absent_ack_batch;
+static unsigned fixture_absent_ack_removes;
 static int barrier_record_base;
 static KoFlushHeader last_request;
 static bool gate_admit = true;
@@ -1055,6 +1057,12 @@ cluster_sinval_ack_wait_is_complete(uint64 batch)
 void
 cluster_sinval_ack_wait_remove(uint64 batch)
 {
+	/* The native hash lookup is a no-op for this explicitly absent waiter.
+	 * Keep the original active-waiter assertion for every other fixture. */
+	if (!barrier_active && fixture_absent_ack_batch != 0 && batch == fixture_absent_ack_batch) {
+		fixture_absent_ack_removes++;
+		return;
+	}
 	Assert(barrier_active && batch == active_batch);
 	barrier_removes++;
 	barrier_active = false;
@@ -1347,6 +1355,8 @@ reset_test(void)
 	marker_native_allocation = InvalidDsaPointer;
 	native_alloc_fail = false;
 	native_commit_active = false;
+	fixture_absent_ack_batch = 0;
+	fixture_absent_ack_removes = 0;
 	native_capability_hook = NULL;
 	origin_drain_calls = origin_flush_calls = origin_invalidate_calls = 0;
 	origin_sync_calls = origin_waits = origin_synced_forks = 0;

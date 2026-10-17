@@ -121,6 +121,9 @@ typedef struct ClusterKoSharedContext {
 	bool used;
 	bool v3;
 	bool complete;
+	/* Durable COMMIT handed off this registration before its drain ran.
+	 * Neither native execution nor AX release may consume it as complete. */
+	bool committed_drain_pending;
 	bool origin_checkpoint;
 	bool origin_data_closed;
 	bool structure_owned;
@@ -4525,6 +4528,53 @@ ko_native_capable(bool v3)
  * the entire original scope before doing anything. Preallocation makes this
  * postcommit transfer independent of active-slot capacity and allocator I/O. */
 static bool
+ko_native_publish_registration(ClusterKoCompletionV2 *owned)
+{
+	ClusterKoSharedContext *origin;
+	ClusterKoNativeContinuation *work = owned->native_reserved;
+	bool published = false;
+
+	if (!owned->barrier_v3 || owned->space_observed || owned->truncate_observed
+		|| owned->drop_observed || owned->origin_data_closed || owned->barrier_ready_peers != 0
+		|| owned->slot >= CLUSTER_KO_SHARED_CAPACITY
+		|| (owned->barrier_request_v3.operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP
+			&& owned->barrier_request_v3.operation != CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD))
+		return false;
+	/* This is preservation after durable COMMIT, not permission to execute.
+	 * Do not refresh the operation or demand a still-live remote proof here. */
+	SpinLockAcquire(&ko_state->shared_lock);
+	origin = &ko_state->contexts[owned->slot];
+	if (origin->used && origin->v3 && !origin->complete && !origin->committed_drain_pending
+		&& !origin->origin_detached && !origin->ax_release_requested && !origin->ax_failed
+		&& !origin->structure_owned && origin->cancel_sqlerrcode == 0
+		&& origin->pid == owned->pid && origin->serial == owned->serial
+		&& (origin->request_sent_peers | origin->request_sending_peers
+			| origin->request_uncertain_peers | origin->request_done_peers
+			| origin->request_failed_peers) == 0
+		&& memcmp(&origin->request, &owned->barrier_request_v3.base,
+				  sizeof(origin->request)) == 0
+		&& memcmp(&origin->request_v3, &owned->barrier_request_v3,
+				  sizeof(origin->request_v3)) == 0
+		&& memcmp(origin->peer_boots, owned->barrier_boots, sizeof(origin->peer_boots)) == 0) {
+		/* Keep the exact active operation for the original commit-window
+		 * producer. The same preallocated carrier survives callback/exit
+		 * failure without granting deletion or releasing the protecting AX. */
+		origin->committed_drain_pending = true;
+		work->context = *origin;
+		work->buffers_released = work->predelete_ready = work->recovery_required = false;
+		work->next = ko_state->native_incoming;
+		ko_state->native_incoming = owned->native_allocation;
+		ko_state->native_waiting++;
+		owned->native_unready = owned->native_allocation;
+		owned->native_allocation = InvalidDsaPointer;
+		owned->native_reserved = NULL;
+		owned->native_handed_off = published = true;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	return published;
+}
+
+static bool
 ko_native_publish(ClusterKoCompletionV2 *owned, bool from_commit_tail)
 {
 	ClusterKoNativeContinuation *work;
@@ -4540,10 +4590,12 @@ ko_native_publish(ClusterKoCompletionV2 *owned, bool from_commit_tail)
 		|| CurTransactionResourceOwner != TopTransactionResourceOwner)
 		return false;
 	if (owned == NULL || owned->pid != MyProcPid || owned->owner != TopTransactionResourceOwner
-		|| !owned->native_transaction || !owned->barrier_private || owned->native_pending
+		|| !owned->native_transaction || owned->native_pending
 		|| owned->native_handed_off || !owned->postcommit || owned->serial == 0
 		|| owned->native_reserved == NULL || !DsaPointerIsValid(owned->native_allocation))
 		return false;
+	if (!owned->barrier_private)
+		return from_commit_tail && ko_native_publish_registration(owned);
 	qualified
 		= owned->space_observed
 		  && cluster_space_structure_wal_decode(owned->structure, sizeof(owned->structure), &change)
@@ -4650,10 +4702,11 @@ cluster_ko_shared_native_commit_v2(void)
 		return;
 	for (ClusterKoCompletionV2 *owned = ko_completions; owned != NULL; owned = owned->next) {
 		if (!owned->native_transaction || owned->native_pending || owned->native_handed_off
-			|| !ko_native_capable(owned->barrier_v3))
+			|| (!ko_native_capable(owned->barrier_v3)
+				&& !(owned->barrier_v3 && !owned->barrier_private)))
 			continue;
-		/* A claimed SPACE change must have saved its actual record and
-		 * preallocated continuation before this irreversible point. */
+		/* The original claimed identity and allocation must survive this
+		 * irreversible point even when its physical drain has not run. */
 		owned->postcommit = true;
 		if (!ko_native_publish(owned, true))
 			elog(PANIC, "committed shared structural change lost its original completion owner");
@@ -4902,9 +4955,10 @@ cluster_ko_shared_native_promote_v2(void)
 	buffers_released = work->buffers_released;
 	SpinLockRelease(&ko_state->shared_lock);
 	capable = ko_native_capable(before.v3);
-	if (capable && (failed || !ko_shared_origin_current(&before)
-		|| !cluster_wal_thread_current_v2_ref(&current)
-		|| memcmp(&current, &before.terminal.source, sizeof(current)) != 0)) {
+	if (capable && (failed || (!before.committed_drain_pending
+		&& (!ko_shared_origin_current(&before)
+			|| !cluster_wal_thread_current_v2_ref(&current)
+			|| memcmp(&current, &before.terminal.source, sizeof(current)) != 0)))) {
 		SpinLockAcquire(&ko_state->shared_lock);
 		if (ko_state->native_ready == selected && ko_state->native_waiting != 0) {
 			ko_state->native_ready = work->next;
@@ -4919,7 +4973,8 @@ cluster_ko_shared_native_promote_v2(void)
 						   failed ? "PRODUCER_INCOMPLETE" : "PROMOTION_CUT");
 		return CLUSTER_KO_STRUCTURE_INVALID;
 	}
-	if (!capable || !buffers_released || !ko_origin_drop_io_closed(&before)) {
+	if (!capable || before.committed_drain_pending || !buffers_released
+		|| !ko_origin_drop_io_closed(&before)) {
 		/* Let the rest of this finite batch advance while the original
 		 * mode is unavailable, the producer completes buffer cleanup or
 		 * publication, or an entered directory call exits. No storage runs. */
@@ -6261,6 +6316,7 @@ ko_origin_release_ready(unsigned slot)
 			|| !ko_origin_ax_equal(&selected->request_v3, &entry->request_v3))
 			continue;
 		if (i < slot || !entry->origin_detached || !entry->ax_release_requested || entry->ax_failed
+			|| entry->committed_drain_pending
 			|| entry->request_failed_peers != 0 || entry->request_sending_peers != 0
 			|| entry->request_uncertain_peers != 0
 			|| (entry->request_done_peers & entry->request_sent_peers) != entry->request_sent_peers)

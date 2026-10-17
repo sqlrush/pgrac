@@ -395,10 +395,271 @@ UT_TEST(test_drop_write_permission_consumes_original_completed_owner)
 	}
 }
 
+static ClusterKoCompletionV2 *
+claimed_registration(uint16 operation)
+{
+	KoAxBinding binding;
+	ClusterKoCompletionV2 *owner = register_operation(&binding, operation), *claimed = NULL;
+
+	UT_ASSERT(cluster_ko_shared_claim_structure(&space_identity, CLUSTER_SPACE_WAL_TOMBSTONE,
+		&claimed));
+	UT_ASSERT(claimed == owner && !owner->native_pending);
+	return owner;
+}
+
+/* The caller is the real irreversible native hook, not XACT_EVENT_COMMIT.
+ * A caught baseline PANIC is a failed test, never a successful handoff. */
+static bool
+commit_registration(void)
+{
+	volatile bool caught = false;
+
+	expecting_error = true;
+	PG_TRY(); { cluster_ko_shared_native_commit_v2(); }
+	PG_CATCH(); { caught = true; }
+	PG_END_TRY();
+	expecting_error = false;
+	UT_ASSERT(!caught);
+	if (caught) {
+		native_fixture_shared_memory_end();
+		return false;
+	}
+	return true;
+}
+
+UT_TEST(test_committed_registration_transfers_once_without_completion)
+{
+	const uint16 operations[] = { CLUSTER_KO_SHARED_V3_OPERATION_DROP,
+		CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD };
+
+	for (unsigned n = 0; n < lengthof(operations); n++) {
+		ClusterKoCompletionV2 *owner = claimed_registration(operations[n]);
+		ClusterKoSharedContext before = storage.contexts[owner->slot];
+		dsa_pointer allocation = owner->native_allocation;
+		ClusterKoNativeContinuation *work = owner->native_reserved;
+		unsigned slot = owner->slot;
+
+		UT_ASSERT(!owner->barrier_private && !owner->space_observed);
+		if (!commit_registration())
+			continue;
+		UT_ASSERT(owner->native_handed_off && owner->postcommit);
+		UT_ASSERT(!DsaPointerIsValid(owner->native_allocation) && owner->native_reserved == NULL);
+		UT_ASSERT_EQ(owner->native_unready, allocation);
+		UT_ASSERT_EQ(storage.native_incoming, allocation);
+		UT_ASSERT_EQ(storage.native_waiting, 1);
+		UT_ASSERT_EQ(native_allocate_calls, 1);
+		UT_ASSERT_EQ(native_free_calls, 0);
+		UT_ASSERT(!work->recovery_required && !storage.native_recovery_required);
+		UT_ASSERT(!work->buffers_released && !work->predelete_ready);
+		UT_ASSERT(work->context.used && work->context.v3 && !work->context.complete);
+		UT_ASSERT(!work->context.structure_owned && !work->context.origin_data_closed);
+		UT_ASSERT_EQ(work->context.pid, before.pid);
+		UT_ASSERT_EQ(work->context.serial, before.serial);
+		UT_ASSERT(memcmp(&work->context.request_v3, &before.request_v3,
+			sizeof(before.request_v3)) == 0);
+		UT_ASSERT(memcmp(work->context.peer_boots, before.peer_boots, sizeof(before.peer_boots)) == 0);
+		UT_ASSERT_EQ(work->context.request_sent_peers | work->context.request_done_peers, 0);
+		UT_ASSERT(storage.contexts[slot].used && !storage.contexts[slot].complete);
+		UT_ASSERT(!ko_shared_ready_v3(&work->context));
+		UT_ASSERT(!cluster_ko_shared_native_prepare_drop_v2(before.request.key.locator));
+		UT_ASSERT(cluster_ko_shared_native_drop_deferred_v2(before.request.key.locator));
+		UT_ASSERT(!cluster_ko_shared_drop_write_current(owner, &space_identity));
+		cluster_ko_shared_native_commit_v2();
+		UT_ASSERT_EQ(storage.native_waiting, 1);
+		UT_ASSERT_EQ(native_allocate_calls, 1);
+		assert_no_object_work();
+		native_fixture_shared_memory_end();
+	}
+}
+
+UT_TEST(test_committed_registration_cp_waits_without_live_proof_or_io)
+{
+	ClusterKoCompletionV2 *owner = claimed_registration(CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+	ClusterKoNativeContinuation *work = owner->native_reserved;
+	dsa_pointer allocation = owner->native_allocation;
+	unsigned reads = space_reads;
+	const char *reason;
+
+	if (!commit_registration())
+		return;
+	/* A committed pending owner must not be classified by the later live
+	 * DATA/SPACE gate while its original producer is still doing cleanup. */
+	current_epoch++;
+	v3_local_ax = false;
+	MyBackendType = B_CHECKPOINTER;
+	for (unsigned n = 0; n < 3; n++) {
+		UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PENDING);
+		UT_ASSERT_EQ(storage.native_incoming, allocation);
+		UT_ASSERT_EQ(storage.native_waiting, 1);
+		UT_ASSERT(!DsaPointerIsValid(storage.native_failed));
+		UT_ASSERT(!work->recovery_required && !storage.native_recovery_required);
+	}
+	UT_ASSERT_EQ(space_reads, reads);
+	UT_ASSERT_EQ(native_free_calls, 0);
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_PENDING);
+	assert_no_object_work();
+	MyBackendType = B_BACKEND;
+	native_fixture_shared_memory_end();
+}
+
+UT_TEST(test_committed_registration_handoff_retains_original_cut_after_drift)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ClusterKoCompletionV2 *owner = claimed_registration(CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+		ClusterKoSharedMessageV3 request = owner->barrier_request_v3;
+		ClusterKoNativeContinuation *work = owner->native_reserved;
+		bool committed;
+
+		if (fault == 0) current_epoch++;
+		if (fault == 1) v3_local_ax = false;
+		if (fault == 2) formation.membership.last_admitted_incarnation[1]++;
+		if (fault == 3) cluster_interconnect_tier = CLUSTER_IC_TIER_2;
+		committed = commit_registration();
+		cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+		if (!committed)
+			continue;
+		UT_ASSERT(owner->native_handed_off);
+		UT_ASSERT(memcmp(&work->context.request_v3, &request, sizeof(request)) == 0);
+		UT_ASSERT(!work->context.complete && !work->context.structure_owned);
+		UT_ASSERT(!work->recovery_required && !storage.native_recovery_required);
+		assert_no_object_work();
+		native_fixture_shared_memory_end();
+	}
+}
+
+UT_TEST(test_committed_registration_survives_original_cleanup_and_blocks_s6)
+{
+	for (unsigned failing = 0; failing < 2; failing++) {
+		ClusterKoCompletionV2 *owner = claimed_registration(CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+		ClusterKoNativeContinuation *work = owner->native_reserved;
+		ClusterGrdHolderId holder = owner->barrier_request_v3.ax_holder;
+		unsigned slot = owner->slot;
+		LOCKTAG tag;
+		const char *reason;
+		volatile bool caught = false;
+
+		SET_LOCKTAG_RELATION(tag, owner->barrier_request_v3.ax_resid.field1,
+			owner->barrier_request_v3.ax_resid.field2);
+		postcommit_owner = owner;
+		memset(&postcommit_binding, 0, sizeof(postcommit_binding));
+		postcommit_binding.identity.locator = owner->barrier_request_v3.base.key.locator;
+		postcommit_drop = true;
+		postcommit_error = postcommit_scope_changed = postcommit_buffer_error = false;
+		postcommit_callback_error = failing != 0;
+		postcommit_deletes = postcommit_phases = 0;
+		postcommit_native_count = 1;
+		postcommit_storage_consumer = NULL;
+		native_fork_unlinks = native_fork_closes = native_smgr_invalidations = 0;
+		native_commit_active = expecting_error = true;
+		PG_TRY(); { run_native_postcommit(); }
+		PG_CATCH(); { caught = true; }
+		PG_END_TRY();
+		expecting_error = false;
+		UT_ASSERT_EQ(caught, failing != 0);
+		if (!DsaPointerIsValid(storage.native_incoming)) {
+			native_fixture_shared_memory_end();
+			continue;
+		}
+		UT_ASSERT_EQ(storage.native_waiting, 1);
+		UT_ASSERT_EQ(postcommit_deletes, failing ? 0 : 1);
+		UT_ASSERT_EQ(native_fork_unlinks, 0);
+		UT_ASSERT(!work->context.complete && !work->buffers_released);
+		if (failing) {
+			UT_ASSERT(!work->recovery_required);
+			fixture_absent_ack_batch = work->context.request.batch_id;
+			exit_callback(0, (Datum)0);
+		}
+		UT_ASSERT_EQ(fixture_absent_ack_removes, failing);
+		UT_ASSERT_EQ(completion_allocations, 0);
+		UT_ASSERT(work->recovery_required && storage.native_recovery_required);
+		UT_ASSERT_EQ(native_free_calls, 0);
+		UT_ASSERT(storage.contexts[slot].used && storage.contexts[slot].origin_detached);
+		UT_ASSERT(cluster_ko_ax_release_handoff_v3(&tag, AccessExclusiveLock, &holder));
+		UT_ASSERT(!ko_origin_release_ready(slot));
+		storage.ax_release_cursor = slot;
+		ko_origin_release_tick();
+		UT_ASSERT_EQ(release_poll_calls, 0);
+		UT_ASSERT(cluster_ko_ax_acquire_pending_v3(&work->context.request_v3.ax_resid,
+			holder.procno, 0));
+		UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_INVALID);
+		MyBackendType = B_CHECKPOINTER;
+		UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_INVALID);
+		UT_ASSERT(DsaPointerIsValid(storage.native_failed));
+		UT_ASSERT_EQ(storage.native_waiting, 0);
+		UT_ASSERT(storage.contexts[slot].used && !ko_origin_release_ready(slot));
+		MyBackendType = B_BACKEND;
+		native_fixture_shared_memory_end();
+	}
+}
+
+UT_TEST(test_commit_registration_rejects_changed_owner_or_executed_context)
+{
+	for (unsigned fault = 0; fault < 14; fault++) {
+		ClusterKoCompletionV2 *owner = claimed_registration(CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+		ClusterKoSharedContext *entry = &storage.contexts[owner->slot];
+		ClusterKoSharedContext before = *entry;
+		ClusterKoCompletionV2 saved = *owner;
+
+		owner->postcommit = true;
+		switch (fault) {
+		case 0: owner->postcommit = false; break;
+		case 1: owner->native_pending = true; break;
+		case 2: owner->owner = (ResourceOwner)2; break;
+		case 3: owner->pid++; break;
+		case 4: entry->serial++; break;
+		case 5: entry->request_v3.space_mutation_token++; break;
+		case 6: entry->peer_boots[1]++; break;
+		case 7: entry->origin_detached = true; break;
+		case 8: entry->complete = true; break;
+		case 9: entry->request_sending_peers = 2; break;
+		case 10: entry->request_uncertain_peers = 2; break;
+		case 11: entry->request_sent_peers = 2; break;
+		case 12: entry->request_failed_peers = 2; break;
+		case 13: entry->structure_owned = true; break;
+		}
+		UT_ASSERT(!ko_native_publish(owner, true));
+		UT_ASSERT_EQ(storage.native_waiting, 0);
+		UT_ASSERT(!owner->native_handed_off);
+		UT_ASSERT_EQ(native_allocated, 1);
+		UT_ASSERT_EQ(native_free_calls, 0);
+		*owner = saved;
+		*entry = before;
+		cluster_ko_shared_release_v2(&owner);
+	}
+}
+
+UT_TEST(test_registered_handoff_cannot_be_started_by_abort_or_unclaimed_commit)
+{
+	KoAxBinding binding;
+	ClusterKoCompletionV2 *owner = register_operation(&binding, CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+	unsigned slot = owner->slot;
+
+	cluster_ko_shared_native_commit_v2();
+	UT_ASSERT(!owner->native_handed_off && !owner->postcommit);
+	UT_ASSERT_EQ(storage.native_waiting, 0);
+	owner->native_pending = false;
+	owner->postcommit = true;
+	UT_ASSERT(!ko_native_publish(owner, false));
+	owner->postcommit = false;
+	resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	UT_ASSERT_EQ(native_free_calls, 1);
+	UT_ASSERT_EQ(native_allocated, 0);
+	UT_ASSERT(storage.contexts[slot].origin_detached);
+	storage.contexts[slot].ax_release_requested = true;
+	UT_ASSERT(ko_origin_release_ready(slot));
+	assert_no_object_work();
+}
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(23);
+	UT_RUN(test_committed_registration_transfers_once_without_completion);
+	UT_RUN(test_committed_registration_cp_waits_without_live_proof_or_io);
+	UT_RUN(test_committed_registration_handoff_retains_original_cut_after_drift);
+	UT_RUN(test_committed_registration_survives_original_cleanup_and_blocks_s6);
+	UT_RUN(test_commit_registration_rejects_changed_owner_or_executed_context);
+	UT_RUN(test_registered_handoff_cannot_be_started_by_abort_or_unclaimed_commit);
 	UT_RUN(test_registered_drop_can_prepare_record_without_a_completed_barrier);
 	UT_RUN(test_registered_record_claim_requires_exact_drop_identity_and_owner);
 	UT_RUN(test_registered_claim_abort_keeps_exact_unsent_s6_responsibility);
