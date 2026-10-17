@@ -103,6 +103,8 @@ typedef struct RfSideOnlineApplyOpsV1 {
 	bool (*prepare_apply)(void *arg);
 	/* A whole-source undo consumer must not be used for one record. */
 	bool (*apply_undo_record)(void *arg, uint32 index, const RfSideOnlineOperationV1 *operation);
+	/* A selected COMMIT must not install later DATA or TT terminals. */
+	bool (*apply_xact_record)(void *arg, uint32 index, const RfSideOnlineOperationV1 *operation);
 } RfSideOnlineApplyOpsV1;
 
 /* Production owner for the RF-SIDE v2 non-authoritative projections.  The

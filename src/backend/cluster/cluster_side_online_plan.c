@@ -2745,13 +2745,14 @@ rf_side_online_plan_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index
 		|| identity->reserved_zero != 0
 		|| memcmp(&identity->record, &operation.identity.record, sizeof(identity->record)) != 0)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
-	/* XACT, legacy terminal carriers, CTRC and SPACE still need their
-	 * ordered consumers. UNDO uses its record callback, never apply_undo. */
+	/* COMMIT and UNDO require their record callbacks, never the whole-source
+	 * consumers. Legacy terminal carriers, CTRC and SPACE remain separate. */
 	if (operation.kind != RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
 		&& operation.kind != RF_SIDE_ONLINE_OPERATION_PROJECTION
 		&& !(operation.kind == RF_SIDE_ONLINE_OPERATION_XACT
-			 && operation.xact.kind == RF_SIDE_XACT_ABORT
-			 && ops->apply_xact != NULL)
+			 && operation.xact.kind == RF_SIDE_XACT_ABORT && ops->apply_xact != NULL)
+		&& !(operation.kind == RF_SIDE_ONLINE_OPERATION_XACT
+			 && operation.xact.kind == RF_SIDE_XACT_COMMIT && ops->apply_xact_record != NULL)
 		&& !(operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
 			 && (operation.undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
 				 || operation.undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI
@@ -2777,7 +2778,9 @@ rf_side_online_plan_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index
 			detail = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 		if (detail == RF_PAGE_PROOF_DETAIL_OK) {
 			bool applied = operation.kind == RF_SIDE_ONLINE_OPERATION_XACT
-							   ? ops->apply_xact(ops->arg, &operation)
+							   ? (operation.xact.kind == RF_SIDE_XACT_COMMIT
+									  ? ops->apply_xact_record(ops->arg, index, &operation)
+									  : ops->apply_xact(ops->arg, &operation))
 						   : operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
 							   ? ops->apply_undo_record(ops->arg, index, &operation)
 						   : operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL

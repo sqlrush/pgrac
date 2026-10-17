@@ -474,6 +474,20 @@ side_owner_preflight_projection(void *arg, const RfSideOnlineOperationV1 *operat
 }
 
 static bool
+side_owner_finish_commit(RfSideOnlineProductionOwnerV1 *owner,
+						 const RfSideOnlineOperationV1 *operation)
+{
+	if (operation->xact.cold_completion_effects)
+		return side_owner_cold_formed(owner)
+			   && rf_side_xact_apply_cold_completion_v1(&operation->xact, operation->owned_payload,
+														operation->owned_payload_length, owner,
+														side_owner_commit_covered)
+					  == RF_SIDE_XACT_APPLY_OK;
+	return rf_side_xact_apply_covered_commit_v1(&operation->xact, owner, side_owner_commit_covered)
+		   == RF_SIDE_XACT_APPLY_OK;
+}
+
+static bool
 side_owner_apply_xact(void *arg, const RfSideOnlineOperationV1 *operation)
 {
 	RfSideOnlineProductionOwnerV1 *owner = (RfSideOnlineProductionOwnerV1 *)arg;
@@ -507,21 +521,58 @@ side_owner_apply_xact(void *arg, const RfSideOnlineOperationV1 *operation)
 			|| !side_owner_install_target(
 				owner, side_owner_undo_target(owner, d->instance, d->segment_id, 0)))
 			return false;
-		if (operation->xact.cold_completion_effects)
-			return side_owner_cold_formed(owner)
-				   && rf_side_xact_apply_cold_completion_v1(
-						  &operation->xact, operation->owned_payload,
-						  operation->owned_payload_length, owner, side_owner_commit_covered)
-						  == RF_SIDE_XACT_APPLY_OK;
-		return rf_side_xact_apply_covered_commit_v1(&operation->xact, owner,
-													side_owner_commit_covered)
-			   == RF_SIDE_XACT_APPLY_OK;
+		return side_owner_finish_commit(owner, operation);
 	}
 	return owner != NULL && owner->protected_set_active && side_owner_authority_fresh(owner)
 		   && operation != NULL && operation->kind == RF_SIDE_ONLINE_OPERATION_XACT
 		   && rf_side_xact_apply_owned_v1(&operation->xact, operation->owned_payload,
 										  operation->owned_payload_length)
 				  == RF_SIDE_XACT_APPLY_OK;
+}
+
+static bool
+side_owner_apply_xact_record(void *arg, uint32 index, const RfSideOnlineOperationV1 *operation)
+{
+	RfSideOnlineProductionOwnerV1 *owner = arg;
+	const xl_xact_tt_commit *delta;
+	SideUndoHeader *target;
+	RfSideUndoHeaderImageV1 prefix;
+	PGAlignedBlock current;
+	ClusterUndoHeaderPrepareResultV1 result;
+
+	if (owner == NULL || !owner->protected_set_active || !side_owner_cold_formed(owner)
+		|| !side_owner_authority_fresh(owner) || operation == NULL
+		|| operation->kind != RF_SIDE_ONLINE_OPERATION_XACT
+		|| !side_owner_cold_commit_ready(owner, &operation->xact))
+		return false;
+	delta = &operation->xact.tt_delta;
+	target = side_owner_undo_target(owner, delta->instance, delta->segment_id, 0);
+	/* A COMMIT cannot materialize a segment from a different record's image,
+	 * install future DATA, or consume the full-source final TT header. */
+	if (target == NULL || !target->file.exists || target->file.size != UNDO_SEGMENT_SIZE_BYTES
+		|| owner->undo_bytes_remaining < 8 * BLCKSZ
+		|| rf_side_online_plan_prepare_undo_record_v1(
+			   owner->protected_plan, index, &operation->identity, target->base.data, &prefix)
+			   != RF_PAGE_PROOF_DETAIL_OK)
+		return false;
+	current = target->base;
+	result = cluster_undo_prepare_commit_v1(
+		delta->instance, delta->segment_id, delta->segment_generation, delta->slot_offset,
+		delta->wrap, delta->xid, delta->commit_scn, target->base.data, current.data);
+	/* Reconstruction is a check, not permission to replay missing earlier TT
+	 * steps here. Only the original single-record transition may change DATA. */
+	if ((result != CLUSTER_UNDO_HEADER_APPLY && result != CLUSTER_UNDO_HEADER_ALREADY)
+		|| memcmp(current.data, prefix.page.data, BLCKSZ) != 0 || !side_owner_authority_fresh(owner)
+		|| !cluster_undo_smgr_recovery_read_block_v1(delta->segment_id, delta->instance, 0,
+													 &target->file, current.data)
+		|| memcmp(current.data, target->base.data, BLCKSZ) != 0)
+		return false;
+	target->final = prefix;
+	return side_owner_install_target(owner, target)
+		   && cluster_undo_smgr_recovery_read_block_v1(delta->segment_id, delta->instance, 0,
+													   &target->file, current.data)
+		   && memcmp(current.data, prefix.page.data, BLCKSZ) == 0
+		   && side_owner_authority_fresh(owner) && side_owner_finish_commit(owner, operation);
 }
 
 static bool
@@ -988,6 +1039,7 @@ side_owner_apply_ops(RfSideOnlineProductionOwnerV1 *owner, RfSideOnlineApplyOpsV
 	ops->preflight_undo = side_owner_preflight_undo;
 	ops->preflight_projection = side_owner_preflight_projection;
 	ops->apply_xact = side_owner_apply_xact;
+	ops->apply_xact_record = side_owner_apply_xact_record;
 	ops->apply_undo = side_owner_apply_undo;
 	ops->apply_undo_record = side_owner_apply_undo_record;
 	ops->apply_projection = side_owner_apply_projection;

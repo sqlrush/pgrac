@@ -10446,10 +10446,324 @@ UT_TEST(test_cold_native_abort_record_refuses_unproved_prefix_and_native_failure
 	}
 }
 
+static RfSideOnlinePlanV1 *
+native_commit_record_plan(bool completion, bool conflict)
+{
+	RfSideOnlinePlanV1 *plan = space_online_plan(600);
+	FakeXactRecord fake;
+	xl_undo_tt_slot_bind bind;
+	xl_xact_tt_commit delta;
+	uint32 offset;
+
+	undo_header_bind(&fake, 0);
+	undo_header_feed(plan, &fake, 100);
+	if (completion)
+		cold_completion_commit(&fake, true, true, true);
+	else
+		undo_header_commit(&fake, 0, 802);
+	undo_header_feed(plan, &fake, 200);
+	/* Neither later DATA nor reuse/COMMIT of the same TT slot belongs to
+	 * the selected record. Full-source preflight must still check them. */
+	record_prefix_fpi(plan, 300, 0x31);
+	undo_header_bind(&fake, 0);
+	memcpy(&bind, fake.data, sizeof(bind));
+	bind.xid = 818;
+	bind.wrap = 8;
+	memcpy(fake.data, &bind, sizeof(bind));
+	undo_header_feed(plan, &fake, 400);
+	undo_header_commit(&fake, 0, conflict ? 834 : 818);
+	offset = fake.u.decoded.main_data_len - sizeof(delta);
+	memcpy(&delta, fake.data + offset, sizeof(delta));
+	delta.wrap = 8;
+	memcpy(fake.data + offset, &delta, sizeof(delta));
+	undo_header_feed(plan, &fake, 500);
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	return plan;
+}
+
+static void
+native_commit_record_open(PGAlignedBlock *header, RfSideOnlineProductionOwnerV1 *owner,
+						  ClusterThreadRecoveryAuthorityV1 *authority, bool completion)
+{
+	cold_undo_block_record_open(header, owner, authority);
+	canonical_expected_xid = 802;
+	canonical_expected_wrap = 7;
+	cold_completion_test = completion;
+	cold_cache_test = completion;
+	cold_source_ready = false;
+	cold_source_calls = cold_source_order = cold_stats_calls = cold_stats_order = cold_stats_gc = 0;
+	cold_cache_calls = cold_clog_verified_order = 0;
+}
+
+static void
+native_commit_record_close(RfSideOnlineProductionOwnerV1 *owner)
+{
+	cold_cache_test = cold_cache_throw = cold_cache_expire = false;
+	native_abort_record_close(owner);
+}
+
+UT_TEST(test_cold_native_commit_record_installs_only_selected_terminal)
+{
+	for (int completion = 0; completion < 2; completion++) {
+		RfSideOnlinePlanV1 *plan = native_commit_record_plan(completion != 0, false);
+		ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
+		ClusterThreadRecoveryAuthorityV1 authority
+			= { .duty = &canonical_duty, .serial_guard = &guard };
+		RfSideOnlineProductionOwnerV1 owner;
+		RfSideOnlineOperationV1 operation;
+		PGAlignedBlock header, after, zero = { 0 };
+
+		native_commit_record_open(&header, &owner, &authority, completion != 0);
+		UT_ASSERT(rf_side_online_plan_operation_v1(plan, 1, &operation));
+		for (int repeat = 0; repeat < 2; repeat++) {
+			reset_prepare_apply();
+			canonical_writes = canonical_syncs = cold_source_calls = cold_stats_calls = 0;
+			cold_clog_applies = cold_clog_verifies = cold_cache_calls = 0;
+			cold_source_ready = false;
+			UT_ASSERT_EQ(
+				rf_side_online_production_apply_record_v1(plan, 1, &operation.identity, &owner),
+				RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT_EQ(canonical_writes, repeat == 0 ? 1 : 0);
+			UT_ASSERT(canonical_syncs > 0 && cold_source_calls == 1);
+			UT_ASSERT_EQ(cold_clog_applies, 1);
+			UT_ASSERT_EQ(cold_clog_verifies, 1);
+			UT_ASSERT_EQ(cold_stats_calls, completion ? 3 : 0);
+			UT_ASSERT_EQ(cold_cache_calls, completion ? 1 : 0);
+			UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 1);
+			UT_ASSERT(cold_source_order < cold_clog_verified_order
+					  && cold_clog_verified_order < prepare_apply.terminal_projection_order);
+			if (completion)
+				UT_ASSERT(cold_clog_verified_order < cold_stats_order
+						  && cold_stats_order < prepare_apply.terminal_projection_order);
+			((UndoSegmentHeaderData *)header.data)->tt_slots[4].status = TT_SLOT_COMMITTED;
+			((UndoSegmentHeaderData *)header.data)->tt_slots[4].commit_scn = 999;
+			UT_ASSERT(pread(fileno(canonical_file), after.data, BLCKSZ, 0) == BLCKSZ);
+			UT_ASSERT(memcmp(header.data, after.data, BLCKSZ) == 0);
+			UT_ASSERT(pread(fileno(canonical_file), after.data, BLCKSZ, 9 * BLCKSZ) == BLCKSZ);
+			UT_ASSERT(memcmp(zero.data, after.data, BLCKSZ) == 0);
+			UT_ASSERT(!owner.protected_set_complete && !owner.protected_set_active
+					  && owner.undo_headers == NULL && owner.protected_plan == NULL);
+		}
+		native_commit_record_close(&owner);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_cold_native_commit_record_requires_prior_tt_steps)
+{
+	RfSideOnlinePlanV1 *plan = space_online_plan(400);
+	ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
+	ClusterThreadRecoveryAuthorityV1 authority
+		= { .duty = &canonical_duty, .serial_guard = &guard };
+	RfSideOnlineProductionOwnerV1 owner;
+	RfSideOnlineOperationV1 operation;
+	PGAlignedBlock header;
+	FakeXactRecord fake;
+	xl_undo_tt_slot_bind other;
+
+	undo_header_bind(&fake, 0);
+	undo_header_feed(plan, &fake, 100);
+	undo_header_bind(&fake, 0);
+	memcpy(&other, fake.data, sizeof(other));
+	other.slot_offset = 5;
+	other.xid = 818;
+	memcpy(fake.data, &other, sizeof(other));
+	undo_header_feed(plan, &fake, 200);
+	undo_header_commit(&fake, 0, 802);
+	undo_header_feed(plan, &fake, 300);
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	native_commit_record_open(&header, &owner, &authority, false);
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 2, &operation));
+	UT_ASSERT_NE(rf_side_online_production_apply_record_v1(plan, 2, &operation.identity, &owner),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(canonical_writes + cold_clog_applies + prepare_apply.terminal_projection_stores,
+				 0);
+	/* The original ordered BIND, not COMMIT's source-prefix reconstruction,
+	 * installs the other slot. COMMIT can then consume its exact predecessor. */
+	cold_source_calls = 0;
+	cold_source_ready = false;
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 1, &operation));
+	UT_ASSERT_EQ(rf_side_online_production_apply_record_v1(plan, 1, &operation.identity, &owner),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	canonical_writes = cold_source_calls = 0;
+	cold_source_ready = false;
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 2, &operation));
+	UT_ASSERT_EQ(rf_side_online_production_apply_record_v1(plan, 2, &operation.identity, &owner),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(canonical_writes, 1);
+	UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 1);
+	native_commit_record_close(&owner);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_cold_native_commit_record_refuses_unproved_inputs_before_write)
+{
+	for (int fault = 0; fault < 16; fault++) {
+		RfSideOnlinePlanV1 *plan = native_commit_record_plan(false, fault == 14);
+		ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
+		ClusterThreadRecoveryAuthorityV1 authority
+			= { .duty = &canonical_duty, .serial_guard = &guard };
+		RfSideOnlineProductionOwnerV1 owner;
+		RfSideOnlineOperationV1 operation;
+		PGAlignedBlock header;
+		UndoSegmentHeaderData *h = (UndoSegmentHeaderData *)header.data;
+
+		native_commit_record_open(&header, &owner, &authority, false);
+		if (fault == 0)
+			memset(&h->tt_slots[4], 0, sizeof(TTSlot));
+		if (fault == 1)
+			h->tt_slots[4].status = TT_SLOT_ABORTED;
+		if (fault == 2)
+			h->tt_slots[4].xid++;
+		if (fault == 3)
+			h->tt_slots[4].wrap++;
+		if (fault == 4)
+			h->wrap_count++;
+		if (fault == 5) {
+			h->tt_slots[4].xid = 818;
+			h->tt_slots[4].wrap = 8;
+			h->tt_slots[4].status = TT_SLOT_COMMITTED;
+			h->tt_slots[4].commit_scn = 999;
+		}
+		UT_ASSERT(pwrite(fileno(canonical_file), header.data, BLCKSZ, 0) == BLCKSZ);
+		if (fault == 6 || fault == 7)
+			UT_ASSERT_EQ(ftruncate(fileno(canonical_file), fault == 6 ? BLCKSZ : 0), 0);
+		if (fault == 8)
+			guard.mode = CLUSTER_RECOVERY_SERIAL_ONLINE;
+		UT_ASSERT(rf_side_online_plan_operation_v1(plan, 1, &operation));
+		if (fault == 9)
+			operation.identity.record.record_crc++;
+		cold_source_fail = fault == 10;
+		canonical_file_io_error = fault == 11;
+		record_target_drift = fault == 12 ? 1 : fault == 13 ? 2 : 0;
+		cold_clog_denied = fault == 15;
+		UT_ASSERT_NE(
+			rf_side_online_production_apply_record_v1(plan, 1, &operation.identity, &owner),
+			RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(
+			canonical_writes + cold_clog_applies + prepare_apply.terminal_projection_stores, 0);
+		native_commit_record_close(&owner);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_cold_native_commit_record_keeps_ordered_undo_data)
+{
+	RfSideOnlinePlanV1 *plan = space_online_plan(500);
+	ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
+	ClusterThreadRecoveryAuthorityV1 authority
+		= { .duty = &canonical_duty, .serial_guard = &guard };
+	RfSideOnlineProductionOwnerV1 owner;
+	RfSideOnlineOperationV1 operation;
+	PGAlignedBlock header, before, after;
+	FakeXactRecord fake;
+
+	undo_header_bind(&fake, 0);
+	undo_header_feed(plan, &fake, 100);
+	record_prefix_fpi(plan, 200, 0x31);
+	undo_header_commit(&fake, 0, 802);
+	undo_header_feed(plan, &fake, 300);
+	record_prefix_fpi(plan, 400, 0x52);
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	native_commit_record_open(&header, &owner, &authority, false);
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 1, &operation));
+	UT_ASSERT_EQ(rf_side_online_production_apply_record_v1(plan, 1, &operation.identity, &owner),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(pread(fileno(canonical_file), before.data, BLCKSZ, 9 * BLCKSZ) == BLCKSZ);
+	UT_ASSERT_EQ(((UndoBlockHeader *)before.data)->block_lsn, 300);
+	canonical_writes = cold_source_calls = 0;
+	cold_source_ready = false;
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 2, &operation));
+	UT_ASSERT_EQ(rf_side_online_production_apply_record_v1(plan, 2, &operation.identity, &owner),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(canonical_writes, 1);
+	UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 1);
+	UT_ASSERT(pread(fileno(canonical_file), after.data, BLCKSZ, 9 * BLCKSZ) == BLCKSZ);
+	UT_ASSERT(memcmp(before.data, after.data, BLCKSZ) == 0);
+	native_commit_record_close(&owner);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_cold_native_commit_record_failures_never_publish_completion)
+{
+	for (int fault = 0; fault < 13; fault++) {
+		RfSideOnlinePlanV1 *plan = native_commit_record_plan(true, false);
+		ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
+		ClusterThreadRecoveryAuthorityV1 authority
+			= { .duty = &canonical_duty, .serial_guard = &guard };
+		RfSideOnlineProductionOwnerV1 owner;
+		RfSideOnlineOperationV1 operation;
+		PGAlignedBlock header;
+		volatile bool caught = false;
+		volatile RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_INTERNAL;
+
+		native_commit_record_open(&header, &owner, &authority, true);
+		UT_ASSERT(rf_side_online_plan_operation_v1(plan, 1, &operation));
+		cold_clog_apply_fail = fault == 0;
+		cold_clog_verify_fail = fault == 1;
+		cold_clog_stale_after_verify = fault == 2;
+		cold_clog_throw = fault == 3;
+		cold_stats_throw = fault == 4;
+		cold_stats_expire = fault == 5;
+		cold_source_throw = fault == 6;
+		cold_cache_throw = fault == 7;
+		cold_cache_expire = fault == 8;
+		ctrc_io_fault = fault == 9 ? 1 : fault == 10 ? 3 : 0;
+		record_target_drift = fault == 11 ? 3 : fault == 12 ? 4 : 0;
+		PG_TRY();
+		{
+			detail
+				= rf_side_online_production_apply_record_v1(plan, 1, &operation.identity, &owner);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_NE(detail, RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(caught, fault == 3 || fault == 4 || fault == 6 || fault == 7 || fault == 10);
+		UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 0);
+		UT_ASSERT(!owner.protected_set_complete && !owner.protected_set_active
+				  && owner.undo_headers == NULL && owner.protected_plan == NULL);
+		native_commit_record_close(&owner);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_cold_native_commit_record_idempotence_requires_sync)
+{
+	RfSideOnlinePlanV1 *plan = native_commit_record_plan(false, false);
+	ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
+	ClusterThreadRecoveryAuthorityV1 authority
+		= { .duty = &canonical_duty, .serial_guard = &guard };
+	RfSideOnlineProductionOwnerV1 owner;
+	RfSideOnlineOperationV1 operation;
+	PGAlignedBlock header;
+
+	native_commit_record_open(&header, &owner, &authority, false);
+	((UndoSegmentHeaderData *)header.data)->tt_slots[4].status = TT_SLOT_COMMITTED;
+	((UndoSegmentHeaderData *)header.data)->tt_slots[4].commit_scn = 999;
+	UT_ASSERT(pwrite(fileno(canonical_file), header.data, BLCKSZ, 0) == BLCKSZ);
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 1, &operation));
+	record_sync_failure = true;
+	UT_ASSERT_NE(rf_side_online_production_apply_record_v1(plan, 1, &operation.identity, &owner),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(canonical_writes + cold_clog_applies + prepare_apply.terminal_projection_stores,
+				 0);
+	native_commit_record_close(&owner);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(149);
+	UT_PLAN(155);
+	UT_RUN(test_cold_native_commit_record_installs_only_selected_terminal);
+	UT_RUN(test_cold_native_commit_record_requires_prior_tt_steps);
+	UT_RUN(test_cold_native_commit_record_refuses_unproved_inputs_before_write);
+	UT_RUN(test_cold_native_commit_record_keeps_ordered_undo_data);
+	UT_RUN(test_cold_native_commit_record_failures_never_publish_completion);
+	UT_RUN(test_cold_native_commit_record_idempotence_requires_sync);
 	UT_RUN(test_cold_native_abort_record_requires_installed_tt_before_exact_effects);
 	UT_RUN(test_cold_native_abort_record_refuses_unproved_prefix_and_native_failures);
 	UT_RUN(test_cold_exact_abort_record_installs_only_its_terminal_header);
