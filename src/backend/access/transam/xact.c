@@ -2995,6 +2995,14 @@ CommitTransaction(void)
 
 	AtEOXact_MultiXact();
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: collect committed object results after local cleanup while the
+	 * original AX is still held. Unfinished physical work stays native-owned.
+	 * Spec: 2026-10-16-pre2-p014-am05-shared-ddl-autocommit.md */
+	if (!is_parallel_worker)
+		cluster_ko_shared_native_window_v4();
+#endif
+
 	ResourceOwnerRelease(TopTransactionResourceOwner,
 						 RESOURCE_RELEASE_LOCKS,
 						 true, true);

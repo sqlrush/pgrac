@@ -75,6 +75,8 @@ static uint64 v3_refuse_batch;
 static bool v3_send_throw;
 static void (*v3_ack_send_hook)(void);
 static void (*lmon_wakeup_hook)(void);
+static void (*native_window_wait_hook)(void);
+static unsigned native_window_errors_flushed;
 
 int32
 cluster_grd_lookup_master_gen(const ClusterResId *resid, uint64 *generation)
@@ -181,6 +183,7 @@ BackendType MyBackendType = B_BACKEND;
 BackendId MyBackendId = 1;
 volatile sig_atomic_t InterruptPending;
 volatile uint32 InterruptHoldoffCount;
+volatile uint32 QueryCancelHoldoffCount;
 volatile uint32 CritSectionCount;
 bool cluster_enabled = true;
 bool cluster_object_reuse_flush_enabled = false;
@@ -880,6 +883,15 @@ ResetLatch(Latch *latch)
 int
 WaitLatch(Latch *latch, int events, long timeout, uint32 wait_event)
 {
+	if (native_window_wait_hook != NULL) {
+		UT_ASSERT(barrier_active && InterruptHoldoffCount != 0);
+		UT_ASSERT_EQ(timeout, cluster_sinval_ack_timeout_ms);
+		UT_ASSERT_EQ(wait_event, WAIT_EVENT_CLUSTER_OBJECT_FLUSH_WAIT);
+		if (++barrier_waits > 8)
+			abort();
+		native_window_wait_hook();
+		return WL_TIMEOUT;
+	}
 	if (!barrier_active && drive_v3_ack && MyBackendType == B_BACKEND) {
 		UT_ASSERT_EQ(wait_event, WAIT_EVENT_CLUSTER_OBJECT_FLUSH_WAIT);
 		UT_ASSERT_EQ(timeout, 100);
@@ -933,6 +945,11 @@ int
 geterrcode(void)
 {
 	return reported_sqlstate;
+}
+void
+FlushErrorState(void)
+{
+	native_window_errors_flushed++;
 }
 void
 pg_re_throw(void)
@@ -1410,6 +1427,8 @@ reset_test(void)
 	marker_native_allocation = InvalidDsaPointer;
 	native_alloc_fail = false;
 	native_commit_active = false;
+	native_window_wait_hook = NULL;
+	native_window_errors_flushed = 0;
 	fixture_absent_ack_batch = 0;
 	fixture_absent_ack_removes = 0;
 	native_capability_hook = NULL;
@@ -3712,6 +3731,7 @@ static uint8 postcommit_wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 static bool postcommit_drop, postcommit_error, postcommit_scope_changed;
 static bool postcommit_callback_error;
 static unsigned postcommit_deletes, postcommit_phases;
+static unsigned postcommit_cleanup_mask;
 static unsigned postcommit_native_count = 1;
 static bool (*postcommit_storage_consumer)(RelFileLocator);
 
@@ -3747,20 +3767,25 @@ void
 AtEOXact_Buffers(bool commit)
 {
 	UT_ASSERT(commit);
+	postcommit_cleanup_mask |= 1;
 }
 void
 AtEOXact_RelationCache(bool commit)
 {
 	UT_ASSERT(commit);
+	postcommit_cleanup_mask |= 2;
 }
 void
 AtEOXact_Inval(bool commit)
 {
 	UT_ASSERT(commit);
+	postcommit_cleanup_mask |= 4;
 }
 void
 AtEOXact_MultiXact(void)
-{}
+{
+	postcommit_cleanup_mask |= 8;
+}
 static bool postcommit_buffer_error;
 static void
 native_drop_buffers(RelFileLocator locator)

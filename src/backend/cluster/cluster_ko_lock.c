@@ -7441,6 +7441,208 @@ ko_shared_wait_for_acks_v3(ClusterKoSharedMessageV3 *request, uint32 mask,
 	return false;
 }
 
+/* The original committed allocation is not promotable/freeable while its
+ * drain is pending. Keep its exact immutable identity; mirror only results
+ * from the same active operation, never from a wait-table notification. */
+static bool
+ko_native_window_snapshot(ClusterKoCompletionV2 *owned, ClusterKoNativeContinuation *work,
+						  ClusterKoSharedContext *out)
+{
+	ClusterKoSharedContext *entry;
+	KoDropIdentity *identity;
+	bool valid;
+
+	if (owned->slot >= CLUSTER_KO_SHARED_CAPACITY)
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	entry = &ko_state->contexts[owned->slot];
+	identity = entry->drop_identity > 0 && entry->drop_identity <= KO_DROP_IDENTITY_CAPACITY
+		? &ko_state->drop_identities[entry->drop_identity - 1] : NULL;
+	valid = work->publication_observed && !work->recovery_required
+		&& !work->buffers_released && !work->predelete_ready
+		&& work->context.used && work->context.v3 && work->context.committed_discard
+		&& work->context.committed_drain_pending && !work->context.complete
+		&& entry->used && entry->v3 && entry->committed_discard
+		&& entry->committed_drain_pending && !entry->complete && !entry->structure_owned
+		&& !entry->origin_detached && !entry->ax_release_requested && !entry->ax_failed
+		&& entry->pid == owned->pid && entry->serial == owned->serial
+		&& entry->pid == work->context.pid && entry->serial == work->context.serial
+		&& entry->drop_identity == work->context.drop_identity
+		&& entry->drop_identity_serial == work->context.drop_identity_serial
+		&& identity != NULL && identity->state == KO_DROP_IDENTITY_RESERVED
+		&& identity->committed_discard && identity->fence_serial == entry->drop_identity_serial
+		&& memcmp(&identity->request, &entry->request_v3, sizeof(identity->request)) == 0
+		&& memcmp(&entry->request, &entry->request_v3.base, sizeof(entry->request)) == 0
+		&& memcmp(&entry->request_v3, &owned->barrier_request_v3,
+				  sizeof(entry->request_v3)) == 0
+		&& memcmp(&entry->request_v3, &work->context.request_v3,
+				  sizeof(entry->request_v3)) == 0
+		&& memcmp(entry->peer_boots, owned->barrier_boots, sizeof(entry->peer_boots)) == 0
+		&& memcmp(entry->peer_boots, work->context.peer_boots, sizeof(entry->peer_boots)) == 0;
+	if (valid)
+		*out = work->context = *entry;
+	SpinLockRelease(&ko_state->shared_lock);
+	return valid;
+}
+
+/* This consumer records only all-peer READY. Local discard, final SPACE,
+ * buffer release and physical completion still require their own consumers. */
+static bool
+ko_native_window_ready(ClusterKoCompletionV2 *owned, ClusterKoNativeContinuation *work,
+					  const ClusterKoSharedContext *before)
+{
+	bool ready;
+
+	SpinLockAcquire(&ko_state->shared_lock);
+	ready = work->publication_observed && !work->recovery_required && !work->buffers_released
+		&& memcmp(before, &work->context, sizeof(*before)) == 0
+		&& memcmp(before, &ko_state->contexts[owned->slot], sizeof(*before)) == 0
+		&& ko_shared_ready_v3(before);
+	if (ready)
+		owned->barrier_ready_peers = before->request_done_peers;
+	SpinLockRelease(&ko_state->shared_lock);
+	return ready;
+}
+
+/* No cancellation check or transaction-error deadline is legal here. The
+ * original wait entry is only a latch correlation; exact operation results
+ * and the sender's returned reference determine readiness. */
+static bool
+ko_native_window_wait(ClusterKoCompletionV2 *owned, ClusterKoNativeContinuation *work)
+{
+	ClusterKoSharedContext before;
+	uint64 batch = owned->barrier_request_v3.base.batch_id;
+	uint16 mask = 0, queued = 0;
+	volatile bool begun = false, ready = false;
+
+	if (!ko_native_window_snapshot(owned, work, &before)
+		|| !ko_shared_origin_current(&before)
+		|| !ko_shared_v3_local_binding_current(&before.request_v3))
+		return false;
+	for (unsigned peer = 0; peer < CLUSTER_KO_SHARED_NODE_LIMIT; peer++)
+		if (peer != cluster_node_id && before.peer_boots[peer] != 0)
+			mask |= (uint16)(1u << peer);
+	PG_TRY();
+	{
+		begun = cluster_sinval_ack_wait_begin(batch, mask, 0);
+		while (begun) {
+			bool enqueued = false, qualified = true;
+			int events;
+
+			ResetLatch(MyLatch);
+			if (!ko_native_window_snapshot(owned, work, &before)
+				|| !ko_shared_origin_current(&before)
+				|| !ko_shared_v3_local_binding_current(&before.request_v3)
+				|| before.request_failed_peers != 0 || before.cancel_sqlerrcode != 0
+				|| (before.request_uncertain_peers & ~before.request_sending_peers) != 0)
+				break;
+			if (ko_shared_ready_v3(&before) && ko_native_window_ready(owned, work, &before)) {
+				ready = true;
+				break;
+			}
+			queued |= before.request_sent_peers | before.request_sending_peers;
+			for (unsigned peer = 0; peer < CLUSTER_KO_SHARED_NODE_LIMIT; peer++) {
+				ClusterKoSharedMessageV3 request = before.request_v3;
+				uint16 bit = (uint16)(1u << peer);
+
+				if ((mask & bit) == 0 || (queued & bit) != 0)
+					continue;
+				request.base.peer_node = peer;
+				request.base.peer_boot = before.peer_boots[peer];
+				if (!ko_shared_object_control_at_generation(&request,
+						request.ax_master_generation, true)) {
+					qualified = false;
+					break;
+				}
+				if (ko_shared_enqueue_object(&request, request.ax_master_generation, true)) {
+					queued |= bit;
+					enqueued = true;
+				}
+			}
+			if (!qualified)
+				break;
+			/* Consume an early result before sleeping. Queue capacity/refusal
+			 * otherwise waits on the original LMON/ACK owner, without resends. */
+			if (enqueued)
+				continue;
+			events = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+				cluster_sinval_ack_timeout_ms, WAIT_EVENT_CLUSTER_OBJECT_FLUSH_WAIT);
+			if (events & WL_POSTMASTER_DEATH)
+				break;
+		}
+	}
+	PG_FINALLY();
+	{
+		if (begun)
+			cluster_sinval_ack_wait_remove(batch);
+	}
+	PG_END_TRY();
+	return ready;
+}
+
+/* The native caller invokes this after local invalidation/MultiXact and
+ * before LOCKS release. Failure cannot roll back catalog COMMIT: preserve
+ * the preallocated native owner and protecting AX, including uncertain sends.
+ * No result here completes local discard, SPACE, deletion or recovery. */
+void
+cluster_ko_shared_native_window_v4(void)
+{
+	if (ko_state == NULL || !cluster_enabled || !cluster_shared_config
+		|| InterruptHoldoffCount == 0 || CritSectionCount != 0 || MyProcPid <= 0
+		|| (MyBackendType != B_BACKEND && MyBackendType != B_AUTOVAC_WORKER
+			&& MyBackendType != B_BG_WORKER)
+		|| TopTransactionResourceOwner == NULL || CurrentResourceOwner == NULL
+		|| CurTransactionResourceOwner != TopTransactionResourceOwner)
+		return;
+	for (ClusterKoCompletionV2 *owned = ko_completions; owned != NULL; owned = owned->next) {
+		ClusterKoNativeContinuation *work;
+		MemoryContext oldcontext = CurrentMemoryContext;
+		const uint32 interrupt_holdoff = InterruptHoldoffCount;
+		const uint32 query_cancel_holdoff = QueryCancelHoldoffCount;
+		volatile bool ready = false;
+		volatile int sqlerrcode = ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE;
+
+		if (!owned->native_transaction || !owned->postcommit || !owned->native_handed_off
+			|| owned->native_pending || !owned->barrier_v3 || !owned->barrier_committed_discard
+			|| owned->barrier_private || owned->space_observed || owned->origin_data_closed
+			|| owned->pid != MyProcPid || owned->owner != TopTransactionResourceOwner
+			|| !DsaPointerIsValid(owned->native_unready))
+			continue;
+		work = dsa_get_address(ko_native_area, owned->native_unready);
+		PG_TRY();
+		{
+			ready = ko_native_window_wait(owned, work);
+		}
+		PG_CATCH();
+		{
+			/* ERROR clears both counts. This handler remains inside the
+			 * native committed window; its caller owns the matching resume. */
+			InterruptHoldoffCount = interrupt_holdoff;
+			QueryCancelHoldoffCount = query_cancel_holdoff;
+			if (geterrcode() != 0)
+				sqlerrcode = geterrcode();
+			MemoryContextSwitchTo(oldcontext);
+			FlushErrorState();
+		}
+		PG_END_TRY();
+		if (!ready) {
+			SpinLockAcquire(&ko_state->shared_lock);
+			/* Never refresh or free an unqualified carrier. This exact
+			 * original obligation still blocks physical promotion and S6. */
+			work->recovery_required = true;
+			ko_state->native_recovery_required = true;
+			if (owned->slot < CLUSTER_KO_SHARED_CAPACITY) {
+				ClusterKoSharedContext *entry = &ko_state->contexts[owned->slot];
+				if (entry->used && entry->pid == owned->pid && entry->serial == owned->serial) {
+					entry->ax_failed = true;
+					entry->cancel_sqlerrcode = sqlerrcode;
+				}
+			}
+			SpinLockRelease(&ko_state->shared_lock);
+		}
+	}
+}
+
 /* Spec: 2026-10-16-pre2-p014-am05-shared-ddl-autocommit.md
  * Consume only the original, still-unsent registration. A later execution
  * must not allocate another batch or refresh the transaction's identity. */

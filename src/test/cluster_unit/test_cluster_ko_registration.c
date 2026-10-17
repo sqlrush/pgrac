@@ -1120,10 +1120,201 @@ UT_TEST(test_publication_retry_rechecks_identity_and_cannot_clear_failure)
 	native_fixture_shared_memory_end();
 }
 
+/* The native commit tail and KO producer/LMON/ACK consumers are real.
+ * WAL commit, local PG cleanup, transport and peer physical work are fixture
+ * boundaries. READY here never claims origin discard or final SPACE. */
+static unsigned window_mode;
+static bool window_expect_ready;
+static uint32 window_interrupt_holdoff, window_query_cancel_holdoff;
+static ClusterKoSharedMessageV4 window_request;
+static ClusterKoNativeContinuation *window_work;
+static unsigned window_slot;
+
+static void
+window_deliver(uint16 status)
+{
+	ClusterKoSharedMessageV4 ack = window_request;
+	ClusterICEnvelope env = { .source_node_id = ack.object.base.peer_node,
+		.payload_length = CLUSTER_KO_SHARED_V4_BYTES };
+	uint8 bytes[CLUSTER_KO_SHARED_V4_BYTES];
+
+	ack.object.base.verb = CLUSTER_KO_SHARED_ACK;
+	ack.object.base.status = status;
+	UT_ASSERT(cluster_ko_shared_encode_v4(&ack, bytes, sizeof(bytes)));
+	cluster_ko_flush_ack_handler(&env, bytes);
+}
+
+static ClusterICSendResult
+window_send(uint8 type, int32 dest, const void *bytes, uint32 length)
+{
+	UT_ASSERT_EQ(type, PGRAC_IC_MSG_KO_FLUSH);
+	UT_ASSERT_EQ(dest, 1);
+	UT_ASSERT_EQ(length, CLUSTER_KO_SHARED_V4_BYTES);
+	UT_ASSERT(cluster_ko_shared_decode_v4(bytes, length, &window_request));
+	UT_ASSERT_EQ(postcommit_cleanup_mask, 15);
+	UT_ASSERT_EQ(postcommit_phases, 1); /* Native LOCKS have not been released. */
+	UT_ASSERT(InterruptHoldoffCount != 0 && window_work->publication_observed);
+	UT_ASSERT(postcommit_owner->native_handed_off && postcommit_owner->postcommit);
+	UT_ASSERT_EQ(postcommit_owner->barrier_ready_peers, 0);
+	send_calls++;
+	if (window_mode == 1 && send_calls == 1)
+		return CLUSTER_IC_SEND_NOT_ADMITTED;
+	if (window_mode == 4)
+		return CLUSTER_IC_SEND_HARD_ERROR;
+	if (window_mode == 5) {
+		/* Native errfinish(ERROR) clears these before PG_RE_THROW. A plain
+		 * fixture longjmp would miss the committed caller's restore duty. */
+		InterruptHoldoffCount = QueryCancelHoldoffCount = CritSectionCount = 0;
+		pg_re_throw();
+	}
+	if (window_mode == 2 || window_mode == 6) {
+		/* A wait-table notification is not an exact operation result. */
+		cluster_sinval_ack_wait_record(window_request.object.base.batch_id, dest);
+		UT_ASSERT_EQ(storage.contexts[window_slot].request_done_peers, 0);
+		return CLUSTER_IC_SEND_WOULD_BLOCK;
+	}
+	window_deliver(window_mode == 3 ? CLUSTER_KO_SHARED_FAILED : CLUSTER_KO_SHARED_DONE);
+	UT_ASSERT_EQ(storage.contexts[window_slot].request_sending_peers, 2);
+	UT_ASSERT(!window_work->context.complete);
+	return CLUSTER_IC_SEND_DONE;
+}
+
+static void
+window_wait(void)
+{
+	UT_ASSERT_EQ(postcommit_cleanup_mask, 15);
+	UT_ASSERT_EQ(postcommit_phases, 1);
+	if (window_mode == 6)
+		current_epoch++;
+	else if (window_mode == 2) {
+		if (barrier_waits == 2)
+			window_deliver(CLUSTER_KO_SHARED_DONE);
+	} else
+		shared_send_tick();
+}
+
+static bool
+window_storage_observer(RelFileLocator locator)
+{
+	UT_ASSERT_EQ(InterruptHoldoffCount, window_interrupt_holdoff);
+	UT_ASSERT_EQ(QueryCancelHoldoffCount, window_query_cancel_holdoff);
+	UT_ASSERT(RelFileLocatorEquals(locator, window_work->context.request.key.locator));
+	UT_ASSERT_EQ(postcommit_owner->barrier_ready_peers, window_expect_ready ? 2 : 0);
+	UT_ASSERT_EQ(window_work->context.request_done_peers, window_expect_ready ? 2 : 0);
+	UT_ASSERT(window_work->context.committed_drain_pending && !window_work->context.complete);
+	UT_ASSERT(!window_work->buffers_released && !window_work->predelete_ready);
+	UT_ASSERT(!postcommit_owner->barrier_private && !postcommit_owner->origin_data_closed);
+	UT_ASSERT(!cluster_ko_shared_native_prepare_drop_v2(locator));
+	UT_ASSERT(!ko_origin_release_ready(window_slot));
+	UT_ASSERT_EQ(native_fork_unlinks + flush_count + sync_count + drop_count, 0);
+	return true;
+}
+
+static void
+run_committed_window(uint16 operation, unsigned mode, bool held)
+{
+	KoAxBinding binding = committed_origin_setup();
+	ClusterKoCompletionV2 *owner, *claimed = NULL;
+	volatile bool caught = false;
+
+	committed_origin_only_caps = true;
+	object_wire_missing_capabilities = PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3;
+	owner = committed_origin_register(operation, &binding);
+	if (owner == NULL)
+		abort();
+	UT_ASSERT(cluster_ko_shared_claim_structure(&space_identity, CLUSTER_SPACE_WAL_TOMBSTONE,
+		&claimed));
+	UT_ASSERT(claimed == owner);
+	window_work = owner->native_reserved;
+	window_slot = owner->slot;
+	window_mode = mode;
+	window_expect_ready = held && mode < 3;
+	postcommit_owner = owner;
+	memset(&postcommit_binding, 0, sizeof(postcommit_binding));
+	postcommit_binding.identity.locator = owner->barrier_request_v3.base.key.locator;
+	postcommit_drop = true;
+	postcommit_error = postcommit_scope_changed = postcommit_buffer_error = false;
+	postcommit_callback_error = false;
+	postcommit_deletes = postcommit_phases = postcommit_cleanup_mask = 0;
+	postcommit_native_count = 1;
+	postcommit_storage_consumer = window_storage_observer;
+	native_fork_unlinks = native_fork_closes = native_smgr_invalidations = 0;
+	native_commit_active = true;
+	object_wire_send_hook = window_send;
+	lmon_wakeup_hook = shared_send_tick;
+	native_window_wait_hook = window_wait;
+	UT_ASSERT_EQ(send_calls, 0); /* No REQUEST escaped the real precommit producer. */
+	window_interrupt_holdoff = held ? mode == 5 ? 3 : 1 : 0;
+	window_query_cancel_holdoff = held && mode == 5 ? 2 : 0;
+	InterruptHoldoffCount = window_interrupt_holdoff;
+	QueryCancelHoldoffCount = window_query_cancel_holdoff;
+	expecting_error = true;
+	PG_TRY(); { run_native_postcommit(); }
+	PG_CATCH(); { caught = true; }
+	PG_END_TRY();
+	expecting_error = false;
+	UT_ASSERT_EQ(InterruptHoldoffCount, window_interrupt_holdoff);
+	UT_ASSERT_EQ(QueryCancelHoldoffCount, window_query_cancel_holdoff);
+	if (held && InterruptHoldoffCount != 0) {
+		/* The original CommitTransaction tail owns this matching resume. */
+		RESUME_INTERRUPTS();
+		UT_ASSERT_EQ(InterruptHoldoffCount, window_interrupt_holdoff - 1);
+	}
+	InterruptHoldoffCount = 0;
+	QueryCancelHoldoffCount = 0;
+	postcommit_storage_consumer = NULL;
+	UT_ASSERT(!caught);
+	UT_ASSERT_EQ(postcommit_deletes, 1);
+	UT_ASSERT_EQ(native_fork_unlinks, 0);
+	UT_ASSERT_EQ(send_calls, !held ? 0 : mode == 1 ? 2 : 1);
+	UT_ASSERT(!barrier_active);
+	UT_ASSERT_EQ(native_window_errors_flushed, held && mode == 5 ? 1 : 0);
+	if (held && mode == 2)
+		UT_ASSERT_EQ(barrier_waits, 2);
+	/* This component has not done local discard/final SPACE. Original final
+	 * cleanup therefore retains recovery/AX ownership, never completion. */
+	UT_ASSERT(window_work->recovery_required && storage.native_recovery_required);
+	UT_ASSERT(storage.contexts[window_slot].used && !ko_origin_release_ready(window_slot));
+	UT_ASSERT_EQ(native_free_calls, 0);
+	if (held && (mode == 4 || mode == 5))
+		UT_ASSERT_EQ(storage.contexts[window_slot].request_uncertain_peers, 2);
+	UT_ASSERT_EQ(origin_drain_calls + origin_flush_calls + origin_invalidate_calls, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&leases.d_orphan_zero), 0);
+	UT_ASSERT_EQ(cluster_hw_lease_next_block(space_identity.key.locator, MAIN_FORKNUM), 4);
+	native_fixture_shared_memory_end();
+}
+
+UT_TEST(test_actual_commit_window_collects_ready_after_local_cleanup)
+{
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true);
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD, 0, true);
+}
+
+UT_TEST(test_commit_window_keeps_backpressure_and_exact_result_waits)
+{
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 1, true);
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 2, true);
+}
+
+UT_TEST(test_commit_window_failure_retains_original_owner_without_error)
+{
+	for (unsigned mode = 3; mode <= 6; mode++)
+		run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, mode, true);
+}
+
+UT_TEST(test_commit_window_never_enters_without_held_interrupts)
+{
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, false);
+}
+
 int
 main(void)
 {
-	UT_PLAN(36);
+	UT_PLAN(40);
+	UT_RUN(test_actual_commit_window_collects_ready_after_local_cleanup);
+	UT_RUN(test_commit_window_keeps_backpressure_and_exact_result_waits);
+	UT_RUN(test_commit_window_failure_retains_original_owner_without_error);
+	UT_RUN(test_commit_window_never_enters_without_held_interrupts);
 	UT_RUN(test_committed_native_entry_registers_without_precommit_object_work);
 	UT_RUN(test_committed_registration_accepts_new_only_capabilities);
 	UT_RUN(test_new_origin_refusal_never_falls_back_to_live_v3);
