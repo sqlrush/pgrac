@@ -140,6 +140,13 @@ extern RfSideXactApplyResultV1
 rf_side_xact_apply_cold_completion_v1(const RfSideXactOperationV1 *operation, const uint8 *payload,
 									  uint32 length, void *arg,
 									  RfSideXactVerifyCommitCoverageV1 verify);
+/* Selected immutable cold foreign COMMIT only. The structural proof runs
+ * before verify installs canonical TT/CLOG; actual deletion/sync completes
+ * before stats/derived terminal. Not the generic/whole-source consumer. */
+extern RfSideXactApplyResultV1
+rf_side_xact_apply_cold_drop_completion_v1(const RfSideXactOperationV1 *operation,
+										   XLogReaderState *record, void *arg,
+										   RfSideXactVerifyCommitCoverageV1 verify);
 /* Ordinary ABORT has no native TT locator. Only an original cold owner that
  * proved its exact preceding carrier and native CLOG may publish this result. */
 extern bool rf_side_xact_preflight_covered_abort_v1(const RfSideXactOperationV1 *operation);

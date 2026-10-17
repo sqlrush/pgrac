@@ -3709,6 +3709,31 @@ UT_TEST(test_cold_foreign_drop_executes_exact_source_without_local_flush)
 	}
 }
 
+UT_TEST(test_cold_foreign_drop_preflight_proves_whole_group_without_mutation)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		XLogReaderState reader;
+		DecodedXLogRecord decoded;
+		Relation rel = cold_foreign_drop_record(&reader, &decoded, true);
+
+		if (fault == 1)
+			cold_drop_proven = false;
+		if (fault == 2)
+			foreign_proof_refuse_at = 2;
+		if (fault == 3)
+			foreign_drop_authorized = false;
+		if (fault == 4)
+			cold_commit_window = false;
+		UT_ASSERT_EQ(cluster_space_cold_drop_foreign_preflight_v1(&reader, 501), fault == 0);
+		UT_ASSERT_EQ(cold_drop_checks, fault == 1 ? 1 : fault >= 3 ? 0 : 2);
+		UT_ASSERT_EQ(foreign_source_syncs + post_drop_calls + final_sync_calls + wal_calls
+						 + dirty_calls + flush_calls + pinned + locked,
+					 0);
+		UT_ASSERT(cluster_recmerge_apply_foreign);
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
 UT_TEST(test_cold_foreign_drop_checks_all_targets_before_and_after_sync)
 {
 	for (unsigned fault = 0; fault < 4; fault++) {
@@ -4358,8 +4383,9 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(87);
+	UT_PLAN(88);
 	UT_RUN(test_cold_foreign_drop_executes_exact_source_without_local_flush);
+	UT_RUN(test_cold_foreign_drop_preflight_proves_whole_group_without_mutation);
 	UT_RUN(test_cold_foreign_drop_checks_all_targets_before_and_after_sync);
 	UT_RUN(test_cold_foreign_drop_deduplicates_execution_not_original_record);
 	UT_RUN(test_cold_foreign_drop_requires_active_exact_cold_source);

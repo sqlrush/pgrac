@@ -1587,6 +1587,13 @@ cluster_space_drop_replay_finish_v1(XLogReaderState *record, TransactionId xid)
 }
 
 bool
+cluster_space_cold_drop_foreign_preflight_v1(XLogReaderState *record, TransactionId xid)
+{
+	return cluster_shared_config && cluster_cold_replay_window_active_v1()
+		   && space_drop_replay_commit(record, xid, true);
+}
+
+bool
 cluster_space_cold_drop_foreign_v1(XLogReaderState *record, TransactionId xid)
 {
 	xl_xact_parsed_commit parsed;

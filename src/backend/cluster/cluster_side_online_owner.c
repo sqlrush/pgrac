@@ -192,7 +192,6 @@ side_owner_cold_commit_ready(RfSideOnlineProductionOwnerV1 *owner,
 		   && (operation->cold_completion_effects
 			   || ((operation->xinfo & ~supported) == 0
 				   && operation->completion_payload_length == 0))
-		   && operation->space_drop_count == 0
 		   && operation->origin_thread == owner->undo_authority->duty->origin_thread_id
 		   && rf_side_online_plan_contains_commit_v1(owner->protected_plan, operation)
 		   && cluster_undo_recovery_cold_origin_authorized_v1(operation->origin_thread - 1);
@@ -337,12 +336,19 @@ side_owner_prepare_apply(void *arg)
 }
 
 static bool
-side_owner_preflight_xact(void *arg, const RfSideOnlineOperationV1 *operation)
+side_owner_preflight_xact_selected(void *arg, const RfSideOnlineOperationV1 *operation,
+								   bool selected_record)
 {
 	RfSideOnlineProductionOwnerV1 *owner = (RfSideOnlineProductionOwnerV1 *)arg;
 
 	if (owner == NULL || !owner->protected_set_active || !side_owner_authority_fresh(owner)
 		|| operation == NULL || operation->kind != RF_SIDE_ONLINE_OPERATION_XACT)
+		return false;
+	/* Whole-source apply cannot stand in for ordered compound replay. A
+	 * selected record validates structural targets before its first TT write. */
+	if ((operation->xact.relation_count != 0 || operation->xact.space_drop_count != 0)
+		&& (!selected_record || !operation->xact.cold_completion_effects
+			|| operation->xact.relation_count == 0 || operation->xact.space_drop_count == 0))
 		return false;
 	if (side_owner_cold_formed(owner) && operation->xact.kind == RF_SIDE_XACT_ABORT) {
 		ClusterUndoDecoded target;
@@ -377,6 +383,18 @@ side_owner_preflight_xact(void *arg, const RfSideOnlineOperationV1 *operation)
 		return side_owner_undo_target(owner, delta->instance, delta->segment_id, 0) != NULL;
 	}
 	return true;
+}
+
+static bool
+side_owner_preflight_xact(void *arg, const RfSideOnlineOperationV1 *operation)
+{
+	return side_owner_preflight_xact_selected(arg, operation, false);
+}
+
+static bool
+side_owner_preflight_xact_record(void *arg, const RfSideOnlineOperationV1 *operation)
+{
+	return side_owner_preflight_xact_selected(arg, operation, true);
 }
 
 static bool
@@ -565,6 +583,54 @@ side_owner_apply_abort_record(RfSideOnlineProductionOwnerV1 *owner, uint32 index
 }
 
 static bool
+side_owner_record_commit_covered(void *arg, const RfSideXactOperationV1 *operation)
+{
+	RfSideOnlineProductionOwnerV1 *owner = arg;
+	SideUndoHeader *target = side_owner_undo_target(owner, operation->tt_delta.instance,
+													operation->tt_delta.segment_id, 0);
+	PGAlignedBlock current;
+
+	/* Called only after the structural owner proved every target. The
+	 * selected prefix has already been compared with this one transition.
+	 * SPACE proof may perform IO: preserve the original selected-record
+	 * binding/readback on both sides of installation, not cached-fd reads. */
+	return target != NULL && side_owner_authority_fresh(owner)
+		   && cluster_undo_smgr_recovery_read_block_v1(target->segment_id, target->instance, 0,
+													   &target->file, current.data)
+		   && memcmp(current.data, target->base.data, BLCKSZ) == 0
+		   && side_owner_install_target(owner, target)
+		   && cluster_undo_smgr_recovery_read_block_v1(target->segment_id, target->instance, 0,
+													   &target->file, current.data)
+		   && memcmp(current.data, target->final.page.data, BLCKSZ) == 0
+		   && side_owner_authority_fresh(owner) && side_owner_commit_covered(owner, operation);
+}
+
+static bool
+side_owner_finish_drop_record(RfSideOnlineProductionOwnerV1 *owner,
+							  const RfSideOnlineOperationV1 *operation)
+{
+	XLogReaderState record = { 0 };
+	DecodedXLogRecord decoded = { 0 };
+	const RfPageReplayRecordIdentityV1 *ref = &operation->identity.record;
+
+	decoded.header.xl_rmid = ref->rmid;
+	decoded.header.xl_info = ref->info;
+	decoded.header.xl_crc = ref->record_crc;
+	decoded.header.xl_xid = operation->xact.xid;
+	decoded.max_block_id = -1;
+	decoded.main_data = (char *)operation->owned_payload;
+	decoded.main_data_len = operation->owned_payload_length;
+	record.record = &decoded;
+	record.ReadRecPtr = ref->read_rec_ptr;
+	record.EndRecPtr = ref->end_rec_ptr;
+	record.system_identifier = operation->xact.system_identifier;
+	record.cluster_expected_thread_id = ref->origin_thread;
+	return rf_side_xact_apply_cold_drop_completion_v1(&operation->xact, &record, owner,
+													  side_owner_record_commit_covered)
+		   == RF_SIDE_XACT_APPLY_OK;
+}
+
+static bool
 side_owner_apply_commit_record(RfSideOnlineProductionOwnerV1 *owner, uint32 index,
 							   const RfSideOnlineOperationV1 *operation)
 {
@@ -599,6 +665,8 @@ side_owner_apply_commit_record(RfSideOnlineProductionOwnerV1 *owner, uint32 inde
 		|| memcmp(current.data, target->base.data, BLCKSZ) != 0)
 		return false;
 	target->final = prefix;
+	if (operation->xact.space_drop_count != 0)
+		return side_owner_finish_drop_record(owner, operation);
 	return side_owner_install_target(owner, target)
 		   && cluster_undo_smgr_recovery_read_block_v1(delta->segment_id, delta->instance, 0,
 													   &target->file, current.data)
@@ -1175,6 +1243,7 @@ rf_side_online_production_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	owner->protected_plan = plan;
 	side_owner_apply_ops(owner, &ops);
+	ops.preflight_xact = side_owner_preflight_xact_record;
 	PG_TRY();
 	{
 		detail = rf_side_online_plan_apply_record_v1(plan, index, identity, &ops);

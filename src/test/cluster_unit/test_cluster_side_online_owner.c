@@ -151,6 +151,16 @@ rf_side_xact_apply_cold_completion_v1(const RfSideXactOperationV1 *operation pg_
 	return RF_SIDE_XACT_APPLY_BLOCKED;
 }
 
+RfSideXactApplyResultV1
+rf_side_xact_apply_cold_drop_completion_v1(
+	const RfSideXactOperationV1 *operation pg_attribute_unused(),
+	XLogReaderState *record pg_attribute_unused(), void *arg pg_attribute_unused(),
+	RfSideXactVerifyCommitCoverageV1 verify pg_attribute_unused())
+{
+	UT_ASSERT(false); /* Full compound execution uses test_cluster_side_xact. */
+	return RF_SIDE_XACT_APPLY_BLOCKED;
+}
+
 bool
 cluster_undo_recovery_cold_source_sync_v1(int origin_node pg_attribute_unused())
 {

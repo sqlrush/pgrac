@@ -209,6 +209,10 @@ extern bool cluster_space_drop_replay_finish_v1(XLogReaderState *record, Transac
  * caller still owes canonical TT/CLOG, remaining COMMIT effects and final
  * cold seal. Does not authorize replay from missing SPACE. */
 extern bool cluster_space_cold_drop_foreign_v1(XLogReaderState *record, TransactionId xid);
+/* Same complete structural proof without mutation, before the selected
+ * compound record changes canonical TT/CLOG. Execution rechecks it again. */
+extern bool cluster_space_cold_drop_foreign_preflight_v1(XLogReaderState *record,
+														 TransactionId xid);
 
 /* Same physical postcondition at the original sequencer's final callback,
  * after all scheduled records executed and every source was fully drained.
