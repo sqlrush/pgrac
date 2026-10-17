@@ -2415,7 +2415,8 @@ test_cluster_sync_dispatch.inc: $(top_srcdir)/src/backend/cluster/storage/cluste
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< > $@
 
 test_cluster_sync_smgr.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_smgr.c Makefile
-	awk '/^cluster_smgr_(init_filetag|register_dirty)\(/ { print "static void"; emit=1; n++ } \
+	awk '/^cluster_smgr_begin_write_io\(/ { print "static void"; emit=1 } \
+	     /^cluster_smgr_(init_filetag|register_dirty)\(/ { print "static void"; emit=1; n++ } \
 	     /^cluster_smgr_write\(/ { print "void"; emit=1; n++ } \
 	     /^cluster_smgr_writeback\(/ { print "void"; emit=1; n++ } \
 	     /^cluster_smgr_immedsync\(/ { print "void"; emit=1; n++ } \
@@ -4692,7 +4693,8 @@ check_r11_source_removal_census:
 clean distclean maintainer-clean:
 	rm -f test_cluster_ko_writeback_io.inc test_cluster_ko_writeback_io.inc.tmp \
 		test_cluster_ko_writeback_smgr.inc test_cluster_ko_writeback_smgr.inc.tmp
-	rm -f test_cluster_ko_sync_io.inc test_cluster_ko_sync_io.inc.tmp
+	rm -f test_cluster_ko_sync_io.inc test_cluster_ko_sync_io.inc.tmp \
+		test_cluster_ko_provider_io.inc test_cluster_ko_provider_io.inc.tmp
 	rm -f test_cluster_space_lazy_fork.inc test_cluster_space_lazy_fork.inc.tmp
 	rm -f test_cluster_space_copy_index.inc test_cluster_space_copy_index.inc.tmp \
 		test_cluster_space_copy_heap.inc test_cluster_space_copy_heap.inc.tmp
@@ -9291,10 +9293,21 @@ test_cluster_ko_source_io.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c
 # Queued shared-file fsync and the original KO call/COMMIT boundary.
 TESTS += test_cluster_ko_sync_io
 all: test_cluster_ko_sync_io
-test_cluster_ko_sync_io: test_cluster_ko_sync_io.inc
+test_cluster_ko_sync_io: test_cluster_ko_sync_io.inc test_cluster_ko_provider_io.inc
 test_cluster_ko_sync_io.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_smgr.c Makefile
 	awk '/^cluster_smgr_syncfiletag\(/ { print "int"; emit=1; n++ } \
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Actual provider calls plus metadata/queue helpers; KO lifetime stays real.
+test_cluster_ko_provider_io.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_smgr.c Makefile
+	awk '/^cluster_smgr_begin_write_io\(/ { print "static void"; emit=1 } \
+	     /^cluster_smgr_(init_filetag|register_dirty)\(/ { print "static void"; emit=1; helpers++ } \
+	     /^cluster_smgr_state_lookup\(/ { print "static ClusterSmgrRelationState *"; emit=1; helpers++ } \
+	     /^cluster_smgr_ensure_handle\(/ { print "static ClusterSharedFsHandle *"; emit=1; helpers++ } \
+	     /^cluster_smgr_(extend|zeroextend|write|truncate|immedsync)\(/ { print "void"; emit=1; calls++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (helpers != 4 || calls != 5 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Native advisory batching with real KO call/COMMIT ordering.

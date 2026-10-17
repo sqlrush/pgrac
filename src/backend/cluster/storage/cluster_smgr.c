@@ -50,6 +50,8 @@
 
 #include <sys/stat.h>
 
+#include "access/xlog.h"
+
 #include "commands/tablespace.h"
 #include "common/relpath.h"
 #include "miscadmin.h" /* spec-5.2 D1: CritSectionCount */
@@ -109,6 +111,36 @@ typedef struct ClusterSmgrRelationState {
 static HTAB *cluster_smgr_relations = NULL;
 
 #define CLUSTER_SMGR_INITIAL_HTAB_SIZE 1024
+
+/* Required runtime provider writes are entered old-incarnation calls. The directory
+ * tombstone is checked before opening a handle and the call is released even
+ * when the provider throws; a refusal is never reported as a successful
+ * writeback or durability result. */
+static void
+cluster_smgr_begin_write_io(SMgrRelation reln, const char *operation,
+							ClusterKoDirectoryIoV3 *io)
+{
+	/* Runtime DROP fences are not recovery write authority. The original
+	 * write-fence/apply-master gates precede this helper; recovery keeps
+	 * those owners and does not consume a runtime KO call slot. */
+	if (RecoveryInProgress()) {
+		memset(io, 0, sizeof(*io));
+		return;
+	}
+	if (cluster_ko_directory_io_begin_v3(reln->smgr_rlocator.locator, io))
+		return;
+
+	if (cluster_ko_directory_drop_committed_v3(reln->smgr_rlocator.locator))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("shared relation incarnation is retired during %s", operation),
+				 errhint("the committed DROP tombstone rejects further storage I/O")));
+
+	ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("shared storage write authority is unavailable during %s", operation),
+				 errhint("retry after the current shared-object operation reaches a terminal state")));
+}
 
 static void
 cluster_smgr_init_filetag(FileTag *tag, RelFileLocator rlocator, ForkNumber forknum)
@@ -737,27 +769,37 @@ void
 cluster_smgr_extend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, const void *buffer,
 					bool skipFsync)
 {
-	ClusterSmgrRelationState *state;
-	ClusterSharedFsHandle *handle;
+	ClusterSmgrRelationState *state = NULL;
+	ClusterSharedFsHandle *handle = NULL;
+	ClusterKoDirectoryIoV3 io;
 
 	/* spec-4.12 D5 (L240): reject before extending the underlying file. */
 	cluster_write_fence_reject_if_fenced("extend");
 	/* spec-6.4 INV-ADG5 (P0-1): an ADG standby write also needs the apply-master lease. */
 	cluster_mrp_standby_shared_write_gate("extend");
+	cluster_smgr_begin_write_io(reln, "extend", &io);
 
-	state = cluster_smgr_state_lookup(reln, true);
-	handle = cluster_smgr_ensure_handle(state, forknum);
+	PG_TRY();
+	{
+		state = cluster_smgr_state_lookup(reln, true);
+		handle = cluster_smgr_ensure_handle(state, forknum);
 
-	/*
-	 * Establish logical EOF first, then write the caller's real page.  POSIX
-	 * backends tolerate this as a zero-write followed by the real write; raw
-	 * block_device requires the explicit extend so writes past logical EOF fail
-	 * closed instead of silently allocating.
-	 */
-	cluster_shared_fs_extend(handle, blocknum);
-	cluster_shared_fs_write(handle, blocknum, (const char *)buffer);
-	if (!skipFsync)
-		cluster_smgr_register_dirty(reln, forknum, handle);
+		/*
+		 * Establish logical EOF first, then write the caller's real page.  POSIX
+		 * backends tolerate this as a zero-write followed by the real write; raw
+		 * block_device requires the explicit extend so writes past logical EOF fail
+		 * closed instead of silently allocating.
+		 */
+		cluster_shared_fs_extend(handle, blocknum);
+		cluster_shared_fs_write(handle, blocknum, (const char *)buffer);
+		if (!skipFsync)
+			cluster_smgr_register_dirty(reln, forknum, handle);
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
 }
 
 
@@ -765,8 +807,9 @@ void
 cluster_smgr_zeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, int nblocks,
 						bool skipFsync)
 {
-	ClusterSmgrRelationState *state;
-	ClusterSharedFsHandle *handle;
+	ClusterSmgrRelationState *state = NULL;
+	ClusterSharedFsHandle *handle = NULL;
+	ClusterKoDirectoryIoV3 io;
 	char zerobuf[BLCKSZ];
 	int i;
 
@@ -774,6 +817,7 @@ cluster_smgr_zeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber block
 	cluster_write_fence_reject_if_fenced("zero-extend");
 	/* spec-6.4 INV-ADG5 (P0-1): an ADG standby write also needs the apply-master lease. */
 	cluster_mrp_standby_shared_write_gate("zero-extend");
+	cluster_smgr_begin_write_io(reln, "zero-extend", &io);
 
 	/*
 	 * mdzeroextend cannot be used as a fallback: it operates on PG's
@@ -786,16 +830,24 @@ cluster_smgr_zeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber block
 	 * may add a bulk zero-extend callback to cluster_shared_fs for
 	 * performance; for stage 1.2 simple iteration is sufficient.
 	 */
-	state = cluster_smgr_state_lookup(reln, true);
-	handle = cluster_smgr_ensure_handle(state, forknum);
+	PG_TRY();
+	{
+		state = cluster_smgr_state_lookup(reln, true);
+		handle = cluster_smgr_ensure_handle(state, forknum);
 
-	memset(zerobuf, 0, BLCKSZ);
-	for (i = 0; i < nblocks; i++) {
-		cluster_shared_fs_extend(handle, blocknum + i);
-		cluster_shared_fs_write(handle, blocknum + i, zerobuf);
+		memset(zerobuf, 0, BLCKSZ);
+		for (i = 0; i < nblocks; i++) {
+			cluster_shared_fs_extend(handle, blocknum + i);
+			cluster_shared_fs_write(handle, blocknum + i, zerobuf);
+		}
+		if (!skipFsync && nblocks > 0)
+			cluster_smgr_register_dirty(reln, forknum, handle);
 	}
-	if (!skipFsync && nblocks > 0)
-		cluster_smgr_register_dirty(reln, forknum, handle);
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
 }
 
 
@@ -829,20 +881,30 @@ void
 cluster_smgr_write(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, const void *buffer,
 				   bool skipFsync)
 {
-	ClusterSmgrRelationState *state;
-	ClusterSharedFsHandle *handle;
+	ClusterSmgrRelationState *state = NULL;
+	ClusterSharedFsHandle *handle = NULL;
+	ClusterKoDirectoryIoV3 io;
 
 	/* spec-4.12 D5 (L240): reject before the shared-storage block write. */
 	cluster_write_fence_reject_if_fenced("write");
 	/* spec-6.4 INV-ADG5 (P0-1): an ADG standby write also needs the apply-master lease. */
 	cluster_mrp_standby_shared_write_gate("write");
+	cluster_smgr_begin_write_io(reln, "write", &io);
 
-	state = cluster_smgr_state_lookup(reln, true);
-	handle = cluster_smgr_ensure_handle(state, forknum);
+	PG_TRY();
+	{
+		state = cluster_smgr_state_lookup(reln, true);
+		handle = cluster_smgr_ensure_handle(state, forknum);
 
-	cluster_shared_fs_write(handle, blocknum, (const char *)buffer);
-	if (!skipFsync)
-		cluster_smgr_register_dirty(reln, forknum, handle);
+		cluster_shared_fs_write(handle, blocknum, (const char *)buffer);
+		if (!skipFsync)
+			cluster_smgr_register_dirty(reln, forknum, handle);
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
 }
 
 
@@ -894,8 +956,9 @@ void
 cluster_smgr_truncate(SMgrRelation reln, ForkNumber forknum, BlockNumber old_blocks,
 					  BlockNumber nblocks)
 {
-	ClusterSmgrRelationState *state;
-	ClusterSharedFsHandle *handle;
+	ClusterSmgrRelationState *state = NULL;
+	ClusterSharedFsHandle *handle = NULL;
+	ClusterKoDirectoryIoV3 io;
 
 	(void)old_blocks; /* not needed at stage 1.2; useful for sync metadata */
 
@@ -903,19 +966,29 @@ cluster_smgr_truncate(SMgrRelation reln, ForkNumber forknum, BlockNumber old_blo
 	cluster_write_fence_reject_if_fenced("truncate");
 	/* spec-6.4 INV-ADG5 (P0-1): an ADG standby write also needs the apply-master lease. */
 	cluster_mrp_standby_shared_write_gate("truncate");
+	cluster_smgr_begin_write_io(reln, "truncate", &io);
 
-	state = cluster_smgr_state_lookup(reln, true);
-	handle = cluster_smgr_ensure_handle(state, forknum);
+	PG_TRY();
+	{
+		state = cluster_smgr_state_lookup(reln, true);
+		handle = cluster_smgr_ensure_handle(state, forknum);
 
-	cluster_shared_fs_truncate(handle, nblocks);
+		cluster_shared_fs_truncate(handle, nblocks);
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
 }
 
 
 void
 cluster_smgr_immedsync(SMgrRelation reln, ForkNumber forknum)
 {
-	ClusterSmgrRelationState *state;
-	ClusterSharedFsHandle *handle;
+	ClusterSmgrRelationState *state = NULL;
+	ClusterSharedFsHandle *handle = NULL;
+	ClusterKoDirectoryIoV3 io;
 
 	/* An immediate sync is the completion edge of a shared-storage write,
 	 * not an authority bypass.  Keep the same pre-provider ownership gates as
@@ -923,11 +996,20 @@ cluster_smgr_immedsync(SMgrRelation reln, ForkNumber forknum)
 	 * publish a durability result for an object it no longer owns. */
 	cluster_write_fence_reject_if_fenced("immedsync");
 	cluster_mrp_standby_shared_write_gate("immedsync");
+	cluster_smgr_begin_write_io(reln, "immedsync", &io);
 
-	state = cluster_smgr_state_lookup(reln, true);
-	handle = cluster_smgr_ensure_handle(state, forknum);
+	PG_TRY();
+	{
+		state = cluster_smgr_state_lookup(reln, true);
+		handle = cluster_smgr_ensure_handle(state, forknum);
 
-	cluster_shared_fs_immedsync(handle);
+		cluster_shared_fs_immedsync(handle);
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
 }
 
 int

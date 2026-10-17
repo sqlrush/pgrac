@@ -306,16 +306,346 @@ UT_TEST(original_gates_and_missing_file_keep_their_polarity)
 	UT_ASSERT(sync_commit());
 }
 
+/* The required provider calls also reach storage with a cached handle. Run
+ * their real lookup/open/dirty-registration bodies against the same real KO
+ * table and marker; only HTAB, filesystem and authority are fixtures. */
+typedef struct ClusterSmgrRelationState {
+	RelFileLocatorBackend rlocator;
+	ClusterSharedFsHandle *fork_handles[MAX_FORKNUM + 1];
+} ClusterSmgrRelationState;
+static HTAB *cluster_smgr_relations;
+static ClusterSmgrRelationState provider_state;
+static SMgrRelationData provider_relation;
+static PGAlignedBlock provider_page;
+static unsigned provider_steps[8], provider_gates, provider_accepted, provider_entries;
+static int provider_op, provider_fault, provider_gate_fault;
+static bool provider_probe, provider_queue, provider_skip;
+static const char *const provider_names[] = {
+	"extend", "zero-extend", "write", "truncate", "immedsync"
+};
+
+static void
+provider_step(unsigned step)
+{
+	UT_ASSERT(SpinLockFree(&storage.shared_lock));
+	UT_ASSERT_EQ(provider_gates, 2);
+	provider_steps[step]++;
+	provider_entries += sync_call_count() != 0;
+	if (provider_probe && sync_commit())
+		provider_accepted++;
+	if ((int)step == provider_fault)
+		pg_re_throw();
+}
+
+static void
+provider_fence(const char *op)
+{
+	UT_ASSERT_STR_EQ(op, provider_names[provider_op]);
+	UT_ASSERT_EQ(provider_gates++, 0);
+	if (provider_gate_fault == 1)
+		pg_re_throw();
+}
+
+static void
+provider_standby(const char *op)
+{
+	UT_ASSERT_STR_EQ(op, provider_names[provider_op]);
+	UT_ASSERT_EQ(provider_gates++, 1);
+	if (provider_gate_fault == 2)
+		pg_re_throw();
+}
+
+static void *
+provider_hash(HTAB *table, const void *key, HASHACTION action, bool *found)
+{
+	const RelFileLocatorBackend *locator = key;
+	UT_ASSERT(table == cluster_smgr_relations && action == HASH_ENTER);
+	UT_ASSERT(RelFileLocatorEquals(locator->locator, provider_state.rlocator.locator));
+	UT_ASSERT_EQ(locator->backend, InvalidBackendId);
+	provider_step(1);
+	*found = true;
+	return &provider_state;
+}
+
+static void
+provider_open(RelFileLocator locator, ForkNumber fork, ClusterSharedFsHandle **out)
+{
+	UT_ASSERT(RelFileLocatorEquals(locator, sync_tag.rlocator));
+	UT_ASSERT_EQ(fork, sync_tag.forknum);
+	provider_step(2);
+	*out = (ClusterSharedFsHandle *)1;
+}
+
+static void
+provider_extend(ClusterSharedFsHandle *handle, BlockNumber block)
+{
+	UT_ASSERT(handle == (ClusterSharedFsHandle *)1);
+	UT_ASSERT(block == 4 || (provider_op == 1 && block == 5));
+	provider_step(3);
+}
+
+static int
+provider_write(ClusterSharedFsHandle *handle, BlockNumber block, const char *bytes)
+{
+	UT_ASSERT(handle == (ClusterSharedFsHandle *)1);
+	UT_ASSERT(block == 4 || (provider_op == 1 && block == 5));
+	if (provider_op == 1) {
+		for (unsigned i = 0; i < BLCKSZ; i++)
+			UT_ASSERT_EQ(bytes[i], 0);
+	} else
+		UT_ASSERT(bytes == provider_page.data);
+	provider_step(4);
+	return 0;
+}
+
+static void
+provider_truncate(ClusterSharedFsHandle *handle, BlockNumber blocks)
+{
+	UT_ASSERT(handle == (ClusterSharedFsHandle *)1 && blocks == 4);
+	provider_step(3);
+}
+
+static void
+provider_sync(ClusterSharedFsHandle *handle)
+{
+	UT_ASSERT(handle == (ClusterSharedFsHandle *)1);
+	provider_step(7);
+}
+
+static bool
+provider_register(const FileTag *tag, SyncRequestType type, bool retry)
+{
+	UT_ASSERT_EQ(tag->handler, SYNC_HANDLER_CLUSTER_SHARED);
+	UT_ASSERT(RelFileLocatorEquals(tag->rlocator, sync_tag.rlocator));
+	UT_ASSERT_EQ(tag->forknum, sync_tag.forknum);
+	UT_ASSERT(type == SYNC_REQUEST && !retry);
+	provider_step(5);
+	return provider_queue;
+}
+
+static int
+provider_barrier(ClusterSharedFsHandle *handle)
+{
+	UT_ASSERT(handle == (ClusterSharedFsHandle *)1);
+	provider_step(6);
+	return 0;
+}
+
+#define hash_search provider_hash
+#define cluster_write_fence_reject_if_fenced provider_fence
+#define cluster_mrp_standby_shared_write_gate provider_standby
+#define cluster_shared_fs_open_existing provider_open
+#define cluster_shared_fs_extend provider_extend
+#define cluster_shared_fs_write provider_write
+#define cluster_shared_fs_truncate provider_truncate
+#define cluster_shared_fs_immedsync provider_sync
+#define cluster_shared_fs_barrier_sync provider_barrier
+#define RegisterSyncRequest provider_register
+#include "test_cluster_ko_provider_io.inc"
+#undef hash_search
+#undef cluster_write_fence_reject_if_fenced
+#undef cluster_mrp_standby_shared_write_gate
+#undef cluster_shared_fs_open_existing
+#undef cluster_shared_fs_extend
+#undef cluster_shared_fs_write
+#undef cluster_shared_fs_truncate
+#undef cluster_shared_fs_immedsync
+#undef cluster_shared_fs_barrier_sync
+#undef RegisterSyncRequest
+
+static void
+provider_fixture(int op, ForkNumber fork, bool cached)
+{
+	sync_fixture(300 + op);
+	sync_tag.forknum = fork;
+	provider_op = op;
+	provider_probe = provider_skip = false;
+	provider_queue = true;
+	provider_fault = provider_gate_fault = 0;
+	provider_gates = provider_accepted = provider_entries = 0;
+	memset(provider_steps, 0, sizeof(provider_steps));
+	memset(&provider_state, 0, sizeof(provider_state));
+	memset(&provider_relation, 0, sizeof(provider_relation));
+	provider_relation.smgr_rlocator.locator = sync_tag.rlocator;
+	provider_relation.smgr_rlocator.backend = InvalidBackendId;
+	provider_state.rlocator = provider_relation.smgr_rlocator;
+	if (cached)
+		provider_state.fork_handles[fork] = (ClusterSharedFsHandle *)1;
+	cluster_smgr_relations = (HTAB *)1;
+}
+
+static bool
+provider_call(void)
+{
+	volatile bool returned = false;
+	provider_gates = 0;
+	expecting_error = true;
+	PG_TRY();
+	{
+		switch (provider_op) {
+		case 0: cluster_smgr_extend(&provider_relation, sync_tag.forknum, 4, provider_page.data, provider_skip); break;
+		case 1: cluster_smgr_zeroextend(&provider_relation, sync_tag.forknum, 4, 2, provider_skip); break;
+		case 2: cluster_smgr_write(&provider_relation, sync_tag.forknum, 4, provider_page.data, provider_skip); break;
+		case 3: cluster_smgr_truncate(&provider_relation, sync_tag.forknum, 8, 4); break;
+		case 4: cluster_smgr_immedsync(&provider_relation, sync_tag.forknum); break;
+		}
+		returned = true;
+	}
+	PG_CATCH(); {}
+	PG_END_TRY();
+	expecting_error = false;
+	return returned;
+}
+
+UT_TEST(provider_scope_blocks_marker_through_required_io_and_queue)
+{
+	for (int op = 0; op < 5; op++)
+		for (ForkNumber fork = MAIN_FORKNUM; fork <= MAX_FORKNUM; fork++)
+			for (int cached = 0; cached <= 1; cached++) {
+				provider_fixture(op, fork, cached);
+				provider_probe = true;
+				provider_queue = false;
+				UT_ASSERT(provider_call());
+				UT_ASSERT_EQ(provider_accepted, 0);
+				UT_ASSERT_EQ(provider_steps[1], 1);
+				UT_ASSERT_EQ(provider_steps[2], !cached);
+				UT_ASSERT_EQ(provider_steps[3], op == 1 ? 2 : op == 0 || op == 3);
+				UT_ASSERT_EQ(provider_steps[4], op == 1 ? 2 : op == 0 || op == 2);
+				UT_ASSERT_EQ(provider_steps[5], op < 3);
+				UT_ASSERT_EQ(provider_steps[6], op < 3);
+				UT_ASSERT_EQ(provider_steps[7], op == 4);
+				UT_ASSERT_EQ(sync_call_count(), 0);
+				UT_ASSERT(sync_commit());
+			}
+}
+
+UT_TEST(retired_required_io_never_opens_or_uses_cached_handle)
+{
+	for (int op = 0; op < 5; op++)
+		for (ForkNumber fork = MAIN_FORKNUM; fork <= MAX_FORKNUM; fork++)
+			for (int cached = 0; cached <= 1; cached++) {
+				provider_fixture(op, fork, cached);
+				UT_ASSERT(sync_commit());
+				UT_ASSERT(!provider_call());
+				UT_ASSERT_EQ(reported_sqlstate, ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE);
+				UT_ASSERT_EQ(provider_steps[1] + provider_steps[2] + provider_steps[3]
+					+ provider_steps[4] + provider_steps[5] + provider_steps[6] + provider_steps[7], 0);
+				UT_ASSERT_EQ(sync_call_count(), 0);
+			}
+}
+
+UT_TEST(provider_error_releases_only_its_call_and_never_returns_success)
+{
+	for (int op = 0; op < 5; op++)
+		for (int fault = 1; fault <= 7; fault++) {
+			bool reached = fault <= 2 || (fault == 3 && (op == 0 || op == 1 || op == 3))
+				|| (fault >= 4 && fault <= 6 && op < 3) || (fault == 7 && op == 4);
+			ClusterKoDirectoryIoV3 outer;
+			provider_fixture(op, MAIN_FORKNUM, false);
+			UT_ASSERT(cluster_ko_directory_io_begin_v3(sync_tag.rlocator, &outer));
+			provider_queue = false;
+			provider_probe = true;
+			provider_fault = fault;
+			UT_ASSERT_EQ(provider_call(), !reached);
+			UT_ASSERT_EQ(provider_accepted, 0);
+			UT_ASSERT_EQ(sync_call_count(), 1);
+			UT_ASSERT(!sync_commit());
+			UT_ASSERT(cluster_ko_directory_io_end_v3(&outer));
+			UT_ASSERT(sync_commit());
+		}
+}
+
+UT_TEST(closing_unknown_and_full_table_refuse_before_provider_access)
+{
+	for (int op = 0; op < 5; op++)
+		for (int fault = 0; fault < 4; fault++) {
+			ClusterKoDirectoryIoV3 occupied[CLUSTER_KO_SHARED_CAPACITY];
+			unsigned count = fault == 3 ? CLUSTER_KO_SHARED_CAPACITY : fault == 0 ? 1 : 0;
+			provider_fixture(op, MAIN_FORKNUM, true);
+			for (unsigned i = 0; i < count; i++)
+				UT_ASSERT(cluster_ko_directory_io_begin_v3(sync_tag.rlocator, &occupied[i]));
+			if (fault == 0) UT_ASSERT(!sync_commit());
+			if (fault == 1) ko_state = NULL;
+			if (fault == 2) storage.directory_io_serial = UINT64_MAX;
+			UT_ASSERT(!provider_call());
+			UT_ASSERT_EQ(provider_steps[1], 0);
+			UT_ASSERT_EQ(sync_call_count(), count);
+			ko_state = &storage;
+			for (unsigned i = 0; i < count; i++)
+				UT_ASSERT(cluster_ko_directory_io_end_v3(&occupied[i]));
+		}
+}
+
+UT_TEST(provider_original_gates_recovery_and_skip_fsync_remain_distinct)
+{
+	for (int op = 0; op < 5; op++) {
+		for (int gate = 1; gate <= 2; gate++) {
+			provider_fixture(op, MAIN_FORKNUM, true);
+			fixture_recovering = true;
+			provider_gate_fault = gate;
+			UT_ASSERT(!provider_call());
+			UT_ASSERT_EQ(provider_steps[1], 0);
+			UT_ASSERT_EQ(sync_call_count(), 0);
+		}
+		provider_fixture(op, MAIN_FORKNUM, false);
+		fixture_recovering = true;
+		ko_state = NULL; /* No runtime fence is an authority for recovery. */
+		UT_ASSERT(provider_call());
+		UT_ASSERT_EQ(provider_entries, 0);
+		ko_state = &storage;
+		provider_fixture(op, MAIN_FORKNUM, false);
+		provider_skip = true;
+		UT_ASSERT(provider_call());
+		UT_ASSERT_EQ(provider_steps[5] + provider_steps[6], 0);
+		UT_ASSERT(provider_entries != 0);
+		UT_ASSERT_EQ(sync_call_count(), 0);
+	}
+}
+
+UT_TEST(required_writes_keep_the_negative_identity_after_active_gc)
+{
+	ClusterKoSharedMessageV3 first;
+	provider_fixture(0, MAIN_FORKNUM, true);
+	first = sync_request;
+	UT_ASSERT(sync_commit());
+	for (unsigned i = 1; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		ClusterKoPeerFenceHandleV3 handle;
+		ClusterKoPeerFenceStateV3 state;
+		sync_request = first;
+		sync_request.base.batch_id += i;
+		sync_request.base.key.locator.relNumber += i;
+		local_scan_rel_number = sync_request.base.key.locator.relNumber;
+		UT_ASSERT(cluster_ko_peer_fence_begin_v3(&sync_request, &handle, &state));
+		UT_ASSERT(fixture_completed_fence_ready(&sync_request, &handle));
+		fixture_peer_reply_accepted(&storage.peer_fences[handle.slot]);
+		UT_ASSERT(sync_commit());
+	}
+	sync_request = first;
+	UT_ASSERT(cluster_ko_peer_fence_gc_tick_v3());
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_EMPTY);
+	for (provider_op = 0; provider_op < 5; provider_op++) {
+		UT_ASSERT(!provider_call());
+		UT_ASSERT_EQ(provider_steps[1], 0);
+		UT_ASSERT_EQ(sync_call_count(), 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(12);
 	UT_RUN(entered_sync_blocks_marker_through_close_and_error);
 	UT_RUN(committed_drop_cancels_without_io_after_active_gc);
 	UT_RUN(closing_cancels_new_sync_without_releasing_entered_call);
 	UT_RUN(unknown_refusal_never_becomes_canceled_or_io);
 	UT_RUN(reservation_other_locator_and_native_scope_are_not_retirement);
 	UT_RUN(original_gates_and_missing_file_keep_their_polarity);
+	UT_RUN(provider_scope_blocks_marker_through_required_io_and_queue);
+	UT_RUN(retired_required_io_never_opens_or_uses_cached_handle);
+	UT_RUN(provider_error_releases_only_its_call_and_never_returns_success);
+	UT_RUN(closing_unknown_and_full_table_refuse_before_provider_access);
+	UT_RUN(provider_original_gates_recovery_and_skip_fsync_remain_distinct);
+	UT_RUN(required_writes_keep_the_negative_identity_after_active_gc);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

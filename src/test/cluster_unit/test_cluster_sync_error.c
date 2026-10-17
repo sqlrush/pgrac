@@ -232,7 +232,34 @@ cluster_shared_fs_close(ClusterSharedFsHandle *handle)
 #define ENSURE_ACTIVE() Assert(cluster_shared_fs_active_ops != NULL)
 #include "test_cluster_sync_dispatch.inc"
 #undef ENSURE_ACTIVE
+/* Provider calls may run inside the original pinned/content-locked DATA
+ * scope. Keep that scope's fixture separate: exact runtime KO/marker races
+ * execute in test_cluster_ko_sync_io, with the real KO table. */
+static bool provider_scope_entered;
+static bool
+provider_scope_begin(RelFileLocator locator, ClusterKoDirectoryIoV3 *out)
+{
+	UT_ASSERT(!provider_scope_entered);
+	UT_ASSERT(RelFileLocatorEquals(locator, relation.smgr_rlocator.locator));
+	memset(out, 0, sizeof(*out));
+	out->serial = 919;
+	provider_scope_entered = true;
+	return true;
+}
+static bool
+provider_scope_end(const ClusterKoDirectoryIoV3 *scope)
+{
+	if (scope->serial == 0)
+		return true;
+	UT_ASSERT(provider_scope_entered && scope->serial == 919);
+	provider_scope_entered = false;
+	return true;
+}
+#define cluster_ko_directory_io_begin_v3 provider_scope_begin
+#define cluster_ko_directory_io_end_v3 provider_scope_end
 #include "test_cluster_sync_smgr.inc"
+#undef cluster_ko_directory_io_begin_v3
+#undef cluster_ko_directory_io_end_v3
 
 static void
 setup(int provider)
@@ -240,6 +267,7 @@ setup(int provider)
 	BufferDesc *buf;
 	uint32 state;
 	reset();
+	UT_ASSERT(!provider_scope_entered);
 	memset(observed, 0, sizeof(*observed));
 	memset(&first_before, 0, sizeof(first_before));
 	writeback_calls = 0;
