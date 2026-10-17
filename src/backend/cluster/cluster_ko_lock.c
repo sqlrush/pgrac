@@ -6714,7 +6714,8 @@ ko_origin_release_tick(void)
 		attempt = before.ax_release;
 		PG_TRY();
 		{
-			if (!ko_shared_v3_control_current(&before.request_v3))
+			if (!ko_shared_object_control_at_generation(&before.request_v3,
+					before.request_v3.ax_master_generation, before.committed_discard))
 				result = CLUSTER_GES_REDECLARE_CUT_CHANGED;
 			else
 				result = cluster_ges_release_poll(
@@ -6722,7 +6723,8 @@ ko_origin_release_tick(void)
 					&before.request_v3.ax_holder, before.request_v3.ax_master_node,
 					before.request_v3.ax_master_generation, before.ax_lock_group);
 			if (result == CLUSTER_GES_REDECLARE_CONFIRMED
-				&& !ko_shared_v3_control_current(&before.request_v3))
+				&& !ko_shared_object_control_at_generation(&before.request_v3,
+					before.request_v3.ax_master_generation, before.committed_discard))
 				result = CLUSTER_GES_REDECLARE_CUT_CHANGED;
 		}
 		PG_FINALLY();
@@ -7045,9 +7047,10 @@ ko_shared_v3_local_binding_current(const ClusterKoSharedMessageV3 *request)
 }
 
 static bool
-ko_shared_prepare_request_v3(RelFileLocator locator, uint16 operation,
+ko_shared_prepare_request_object(RelFileLocator locator, uint16 operation,
 							 const KoAxBinding *binding, ClusterKoSharedMessageV3 *request,
-							 uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], uint32 *mask)
+							 uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], uint32 *mask,
+							 bool committed_discard)
 {
 	ClusterSpaceIdentity identity;
 	ClusterWalSourceRef ref;
@@ -7056,6 +7059,9 @@ ko_shared_prepare_request_v3(RelFileLocator locator, uint16 operation,
 	if (request == NULL || binding == NULL || mask == NULL || ko_state == NULL
 		|| operation < CLUSTER_KO_SHARED_V3_OPERATION_DROP
 		|| operation > CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD
+		|| (committed_discard
+			&& (operation == CLUSTER_KO_SHARED_V3_OPERATION_TRUNCATE
+				|| !ko_native_capable(true, true)))
 		|| binding->resid.type != LOCKTAG_RELATION
 		|| binding->resid.lockmethodid != DEFAULT_LOCKMETHOD
 		|| binding->holder.node_id != (uint32)cluster_node_id
@@ -7099,11 +7105,20 @@ ko_shared_prepare_request_v3(RelFileLocator locator, uint16 operation,
 			continue;
 		request->base.peer_node = n;
 		request->base.peer_boot = boots[n];
-		if (!ko_shared_v3_control_current(request))
+		if (!ko_shared_object_control_at_generation(request, request->ax_master_generation,
+			committed_discard))
 			return false;
 		*mask |= 1u << n;
 	}
 	return cluster_membership_cut_generation_current(generation);
+}
+
+static bool
+ko_shared_prepare_request_v3(RelFileLocator locator, uint16 operation,
+							 const KoAxBinding *binding, ClusterKoSharedMessageV3 *request,
+							 uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], uint32 *mask)
+{
+	return ko_shared_prepare_request_object(locator, operation, binding, request, boots, mask, false);
 }
 
 static int
@@ -7140,9 +7155,9 @@ ko_shared_reserve(const ClusterKoSharedMessageV2 *request,
 }
 
 static int
-ko_shared_reserve_v3(const ClusterKoSharedMessageV3 *request,
+ko_shared_reserve_object(const ClusterKoSharedMessageV3 *request,
 					 const uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT],
-					 ClusterKoCompletionV2 *completion)
+					 ClusterKoCompletionV2 *completion, bool committed_discard)
 {
 	int context = -1;
 	uint64 revision;
@@ -7174,6 +7189,7 @@ ko_shared_reserve_v3(const ClusterKoSharedMessageV3 *request,
 			entry->ax_lock_group = group;
 			entry->used = true;
 			entry->v3 = true;
+			entry->committed_discard = committed_discard;
 			entry->complete = false;
 			entry->request_sent_peers = entry->request_uncertain_peers = 0;
 			entry->pid = MyProcPid;
@@ -7182,7 +7198,8 @@ ko_shared_reserve_v3(const ClusterKoSharedMessageV3 *request,
 			entry->request_v3 = *request;
 			memcpy(entry->peer_boots, boots, sizeof(entry->peer_boots));
 			if (completion != NULL
-				&& !ko_drop_reserve_locked(request, entry->serial, &entry->drop_identity)) {
+				&& !ko_drop_reserve_object_locked(request, entry->serial, &entry->drop_identity,
+					committed_discard)) {
 				memset(entry, 0, sizeof(*entry));
 				break;
 			}
@@ -7192,6 +7209,7 @@ ko_shared_reserve_v3(const ClusterKoSharedMessageV3 *request,
 			if (completion != NULL) {
 				completion->slot = i;
 				completion->serial = entry->serial;
+				completion->barrier_committed_discard = committed_discard;
 			}
 			break;
 		}
@@ -7199,6 +7217,14 @@ ko_shared_reserve_v3(const ClusterKoSharedMessageV3 *request,
 	pg_atomic_write_u64(&ko_state->ax_publication_revision, revision + 2);
 	SpinLockRelease(&ko_state->shared_lock);
 	return context;
+}
+
+static int
+ko_shared_reserve_v3(const ClusterKoSharedMessageV3 *request,
+					 const uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT],
+					 ClusterKoCompletionV2 *completion)
+{
+	return ko_shared_reserve_object(request, boots, completion, false);
 }
 
 static bool
@@ -7437,6 +7463,7 @@ ko_shared_registration_snapshot_v3(const ClusterKoCompletionV2 *completion,
 	SpinLockAcquire(&ko_state->shared_lock);
 	*out = ko_state->contexts[owned->slot];
 	valid = out->used && out->v3 && !out->complete && !out->origin_detached
+		&& out->committed_discard == owned->barrier_committed_discard
 		&& !out->ax_release_requested && !out->ax_failed && !out->structure_owned
 		&& out->pid == owned->pid && out->serial == owned->serial
 		&& (out->request_sent_peers | out->request_sending_peers | out->request_uncertain_peers
@@ -7481,7 +7508,8 @@ ko_run_shared_barrier_impl_v3(RelFileLocator locator, uint16 operation,
 	volatile bool begun = false, ok = false;
 
 	if (completion != NULL) {
-		if (!ko_shared_registered_v3(locator, operation, binding, completion, &registered))
+		if (!ko_shared_registered_v3(locator, operation, binding, completion, &registered)
+			|| registered.committed_discard)
 			return false;
 		request = registered.request_v3;
 		memcpy(boots, registered.peer_boots, sizeof(boots));
@@ -7860,6 +7888,7 @@ ko_shared_begin_v3(RelFileLocator rloc, char relpersistence, uint16 operation,
 	ClusterKoSharedMessageV3 request = { 0 };
 	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT];
 	uint32 mask;
+	bool committed_discard;
 
 	if (out == NULL || *out != NULL || binding == NULL || !cluster_enabled
 		|| !cluster_shared_config || ko_state == NULL || relpersistence == RELPERSISTENCE_TEMP
@@ -7867,6 +7896,11 @@ ko_shared_begin_v3(RelFileLocator rloc, char relpersistence, uint16 operation,
 		|| !ko_native_transaction_current() || TopTransactionContext == NULL
 		|| CritSectionCount != 0 || MyProcPid <= 0)
 		return false;
+	/* Choose the protocol once, before registration. Peer refusal cannot
+	 * reinterpret this operation as live v3; later capability changes cannot
+	 * change the original purpose. Advertisement remains a separate gate. */
+	committed_discard = (cluster_ic_local_capability_word()
+		& PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1) != 0;
 	if (!ko_resource_registered) {
 		RegisterResourceReleaseCallback(ko_shared_resource_release, NULL);
 		RegisterXactCallback(ko_shared_xact_event, NULL);
@@ -7889,9 +7923,10 @@ ko_shared_begin_v3(RelFileLocator rloc, char relpersistence, uint16 operation,
 			ereport(ERROR,
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("could not reserve the KO v3 completion owner")));
-		if (!ko_shared_prepare_request_v3(rloc, operation, binding, &request, boots, &mask)
+		if (!ko_shared_prepare_request_object(rloc, operation, binding, &request, boots, &mask,
+			committed_discard)
 			|| !ko_shared_v3_local_binding_current(&request)
-			|| ko_shared_reserve_v3(&request, boots, completion) < 0)
+			|| ko_shared_reserve_object(&request, boots, completion, committed_discard) < 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE),
 					 errmsg("could not register the KO v3 operation"),
@@ -7935,6 +7970,12 @@ cluster_ko_flush_and_wait_ack_relation(Relation rel, char relpersistence, uint16
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE),
 					 errmsg("could not retain the KO v3 completion owner")));
+		/* The committed-discard owner has no precommit physical authority.
+		 * Keep the original pending handle for the native SPACE/COMMIT owner;
+		 * REQUEST, local discard and final completion belong to its later
+		 * irreversible commit window. */
+		if (completion->barrier_committed_discard)
+			return;
 		PG_TRY();
 		{
 			ko_flush_and_wait_ack(rel->rd_locator, relpersistence, completion, operation, &binding);

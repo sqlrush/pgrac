@@ -44,6 +44,286 @@ assert_no_object_work(void)
 	UT_ASSERT_EQ(cluster_hw_lease_next_block(space_identity.key.locator, MAIN_FORKNUM), 4);
 }
 
+static uint32 committed_origin_missing_caps;
+static bool committed_origin_only_caps;
+static bool committed_origin_revoke_after_release;
+
+static uint32
+committed_origin_capabilities(void)
+{
+	uint32 caps = PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1
+		| PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1;
+	if (!committed_origin_only_caps)
+		caps |= native_real_capability_word();
+	if (committed_origin_revoke_after_release && release_poll_calls != 0)
+		caps &= ~PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1;
+	return caps & ~committed_origin_missing_caps;
+}
+
+/* Actual origin constructor/claim/COMMIT consumers; only capability, GES,
+ * SPACE identity, allocation and transport use the existing fixture. No
+ * authenticated PKO4 context or completion is manufactured here. */
+static KoAxBinding
+committed_origin_setup(void)
+{
+	KoAxBinding binding = origin_marker_setup();
+	committed_origin_missing_caps = 0;
+	committed_origin_only_caps = false;
+	committed_origin_revoke_after_release = false;
+	native_capability_hook = committed_origin_capabilities;
+	cluster_hw_lease_install(space_identity.key.locator, MAIN_FORKNUM, 4, 4);
+	return binding;
+}
+
+static ClusterKoCompletionV2 *
+committed_origin_register(uint16 operation, KoAxBinding *binding)
+{
+	ClusterKoCompletionV2 *owner = NULL;
+	volatile bool caught = false;
+	expecting_error = true;
+	PG_TRY(); {
+		UT_ASSERT(ko_shared_begin_v3(space_identity.key.locator, RELPERSISTENCE_PERMANENT,
+			operation, binding, &owner));
+	}
+	PG_CATCH(); { caught = true; }
+	PG_END_TRY();
+	expecting_error = false;
+	UT_ASSERT(!caught && owner != NULL);
+	return owner;
+}
+
+UT_TEST(test_committed_native_entry_registers_without_precommit_object_work)
+{
+	const uint16 operations[] = { CLUSTER_KO_SHARED_V3_OPERATION_DROP,
+		CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD };
+	for (unsigned n = 0; n < lengthof(operations); n++) {
+		RelationData relation;
+		ClusterKoCompletionV2 *owner;
+		ClusterKoSharedContext snapshot;
+		Oid saved_database = MyDatabaseId;
+		v3_native_structure_setup(&relation);
+		committed_origin_missing_caps = 0;
+		committed_origin_only_caps = false;
+		committed_origin_revoke_after_release = false;
+		native_capability_hook = committed_origin_capabilities;
+		cluster_hw_lease_install(relation.rd_locator, MAIN_FORKNUM, 4, 4);
+		MyDatabaseId = relation.rd_locator.dbOid;
+		cluster_ko_flush_and_wait_ack_relation(&relation, RELPERSISTENCE_PERMANENT, operations[n]);
+		MyDatabaseId = saved_database;
+		owner = ko_completions;
+		UT_ASSERT(owner != NULL);
+		if (owner == NULL)
+			continue;
+		UT_ASSERT(owner->native_pending && owner->barrier_committed_discard);
+		UT_ASSERT(!owner->barrier_private && !owner->origin_data_closed);
+		UT_ASSERT(ko_shared_registration_snapshot_v3(owner, &snapshot));
+		UT_ASSERT(storage.contexts[owner->slot].committed_discard);
+		UT_ASSERT_EQ(marker_registrations, 1);
+		UT_ASSERT_EQ(native_allocate_calls, 1);
+		assert_no_object_work();
+		cluster_ko_shared_release_v2(&owner);
+		UT_ASSERT_EQ(native_allocated, 0);
+	}
+}
+
+UT_TEST(test_committed_registration_accepts_new_only_capabilities)
+{
+	const uint16 operations[] = { CLUSTER_KO_SHARED_V3_OPERATION_DROP,
+		CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD };
+	for (unsigned n = 0; n < lengthof(operations); n++) {
+		KoAxBinding binding = committed_origin_setup();
+		ClusterKoCompletionV2 *owner;
+		KoDropIdentity *identity;
+		committed_origin_only_caps = true;
+		object_wire_missing_capabilities = PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3;
+		owner = committed_origin_register(operations[n], &binding);
+		if (owner == NULL)
+			continue;
+		UT_ASSERT(owner->barrier_committed_discard);
+		UT_ASSERT_EQ(storage.contexts[owner->slot].request_v3.operation, operations[n]);
+		UT_ASSERT(storage.contexts[owner->slot].drop_identity != 0);
+		if (storage.contexts[owner->slot].drop_identity != 0) {
+			identity = &storage.drop_identities[storage.contexts[owner->slot].drop_identity - 1];
+			UT_ASSERT(identity->committed_discard);
+			UT_ASSERT_EQ(identity->state, KO_DROP_IDENTITY_RESERVED);
+			UT_ASSERT(memcmp(&identity->request, &owner->barrier_request_v3,
+				sizeof(identity->request)) == 0);
+		}
+		assert_no_object_work();
+		cluster_ko_shared_release_v2(&owner);
+		UT_ASSERT_EQ(native_allocated, 0);
+	}
+}
+
+UT_TEST(test_new_origin_refusal_never_falls_back_to_live_v3)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		KoAxBinding binding = committed_origin_setup();
+		ClusterKoCompletionV2 *owner = NULL;
+		volatile bool caught = false;
+		uint16 operation = CLUSTER_KO_SHARED_V3_OPERATION_DROP;
+		if (fault == 0) committed_origin_missing_caps = PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1;
+		if (fault == 1) object_wire_missing_capabilities = PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1;
+		if (fault == 2) object_wire_missing_capabilities = PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1;
+		if (fault == 3) cluster_interconnect_tier = CLUSTER_IC_TIER_2;
+		if (fault == 4) cluster_interconnect_tier = CLUSTER_IC_TIER_3;
+		if (fault == 5) operation = CLUSTER_KO_SHARED_V3_OPERATION_TRUNCATE;
+		if (fault == 6) v3_local_ax = false;
+		expecting_error = true;
+		PG_TRY(); {
+			(void)ko_shared_begin_v3(space_identity.key.locator, RELPERSISTENCE_PERMANENT,
+				operation, &binding, &owner);
+		}
+		PG_CATCH(); { caught = true; }
+		PG_END_TRY();
+		expecting_error = false;
+		UT_ASSERT(caught && owner == NULL);
+		UT_ASSERT_EQ(marker_registrations, 0);
+		UT_ASSERT_EQ(native_allocated, 0);
+		assert_no_object_work();
+		cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+		if (owner != NULL)
+			cluster_ko_shared_release_v2(&owner);
+	}
+}
+
+UT_TEST(test_committed_registration_cannot_enter_live_barrier)
+{
+	KoAxBinding binding = committed_origin_setup();
+	ClusterKoCompletionV2 *owner = committed_origin_register(CLUSTER_KO_SHARED_V3_OPERATION_DROP,
+		&binding);
+	if (owner == NULL)
+		return;
+	UT_ASSERT(!ko_run_shared_barrier_impl_v3(space_identity.key.locator,
+		CLUSTER_KO_SHARED_V3_OPERATION_DROP, &binding, owner));
+	assert_no_object_work();
+	UT_ASSERT(!owner->barrier_private && !storage.contexts[owner->slot].complete);
+	cluster_ko_shared_release_v2(&owner);
+}
+
+UT_TEST(test_committed_registration_purpose_is_bound_before_claim)
+{
+	KoAxBinding binding = committed_origin_setup();
+	ClusterKoCompletionV2 *owner = committed_origin_register(CLUSTER_KO_SHARED_V3_OPERATION_DROP,
+		&binding);
+	ClusterKoSharedContext snapshot;
+	if (owner == NULL)
+		return;
+	storage.contexts[owner->slot].committed_discard = false;
+	UT_ASSERT(!ko_shared_registration_snapshot_v3(owner, &snapshot));
+	assert_no_object_work();
+	cluster_ko_shared_release_v2(&owner);
+}
+
+UT_TEST(test_actual_new_registration_survives_commit_publication_without_completion)
+{
+	KoAxBinding binding = committed_origin_setup();
+	ClusterKoCompletionV2 *owner = committed_origin_register(CLUSTER_KO_SHARED_V3_OPERATION_DROP,
+		&binding), *claimed = NULL;
+	ClusterKoNativeContinuation *work;
+	if (owner == NULL)
+		return;
+	UT_ASSERT(cluster_ko_shared_claim_structure(&space_identity, CLUSTER_SPACE_WAL_TOMBSTONE,
+		&claimed));
+	UT_ASSERT(claimed == owner);
+	work = owner->native_reserved;
+	cluster_ko_shared_native_commit_v2();
+	UT_ASSERT(owner->native_handed_off && work->context.committed_discard);
+	cluster_ko_shared_native_publication_v3();
+	UT_ASSERT(work->publication_observed && !work->recovery_required);
+	UT_ASSERT(work->context.committed_drain_pending && !work->context.complete);
+	UT_ASSERT(!work->buffers_released && !work->predelete_ready);
+	UT_ASSERT_EQ(storage.native_waiting, 1);
+	UT_ASSERT(!cluster_ko_shared_native_prepare_drop_v2(space_identity.key.locator));
+	UT_ASSERT(!cluster_ko_directory_drop_committed_v3(space_identity.key.locator));
+	assert_no_object_work();
+	native_fixture_shared_memory_end();
+}
+
+/* Abort releases the private registration, but only the original AX handoff
+ * and confirmed S6 result may retire the shared operation and reservation. */
+static unsigned
+committed_origin_abort_to_release(void)
+{
+	KoAxBinding binding = committed_origin_setup();
+	ClusterKoCompletionV2 *owner;
+	ClusterKoSharedContext before;
+	LOCKTAG tag;
+	unsigned slot;
+
+	committed_origin_only_caps = true;
+	object_wire_missing_capabilities = PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3;
+	owner = committed_origin_register(CLUSTER_KO_SHARED_V3_OPERATION_DROP, &binding);
+	if (owner == NULL)
+		abort();
+	slot = owner->slot;
+	before = storage.contexts[slot];
+	resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	UT_ASSERT(ko_completions == NULL);
+	UT_ASSERT_EQ(native_allocated + completion_allocations, 0);
+	UT_ASSERT(storage.contexts[slot].used && storage.contexts[slot].origin_detached);
+	UT_ASSERT(storage.contexts[slot].committed_discard);
+	UT_ASSERT_EQ(storage.contexts[slot].serial, before.serial);
+	UT_ASSERT(!storage.contexts[slot].ax_release_requested);
+	UT_ASSERT(memcmp(&storage.contexts[slot].request_v3, &before.request_v3,
+		sizeof(before.request_v3)) == 0);
+	memset(&tag, 0, sizeof(tag));
+	SET_LOCKTAG_RELATION(tag, before.request_v3.ax_resid.field1, before.request_v3.ax_resid.field2);
+	UT_ASSERT(cluster_ko_ax_release_handoff_v3(&tag, AccessExclusiveLock,
+		&before.request_v3.ax_holder));
+	UT_ASSERT(ko_origin_release_ready(slot));
+	return slot;
+}
+
+UT_TEST(test_new_only_abort_waits_for_original_s6_then_reclaims)
+{
+	unsigned slot = committed_origin_abort_to_release();
+	ClusterKoSharedContext before = storage.contexts[slot];
+	KoDropIdentity *identity = &storage.drop_identities[before.drop_identity - 1];
+
+	storage.ax_release_cursor = slot;
+	shared_send_tick();
+	UT_ASSERT_EQ(release_poll_calls, 1);
+	UT_ASSERT(storage.contexts[slot].used && !storage.contexts[slot].ax_failed);
+	UT_ASSERT_EQ(storage.contexts[slot].serial, before.serial);
+	UT_ASSERT_EQ(identity->state, KO_DROP_IDENTITY_RESERVED);
+	UT_ASSERT_EQ(storage.contexts[slot].ax_release.exchange.key.request_id,
+		before.request_v3.ax_holder.request_id);
+	release_poll_result = CLUSTER_GES_REDECLARE_CONFIRMED;
+	storage.ax_release_cursor = slot;
+	shared_send_tick();
+	UT_ASSERT_EQ(release_poll_calls, 2);
+	UT_ASSERT(!storage.contexts[slot].used);
+	UT_ASSERT_EQ(identity->state, KO_DROP_IDENTITY_FREE);
+	assert_no_object_work();
+}
+
+UT_TEST(test_new_abort_s6_preserves_owner_on_control_drift)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		unsigned slot = committed_origin_abort_to_release();
+		ClusterKoSharedContext before = storage.contexts[slot];
+		KoDropIdentity *identity = &storage.drop_identities[before.drop_identity - 1];
+
+		if (fault == 0)
+			committed_origin_missing_caps = PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1;
+		if (fault == 1)
+			object_wire_missing_capabilities |= PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1;
+		if (fault == 2)
+			committed_origin_revoke_after_release = true;
+		release_poll_result = CLUSTER_GES_REDECLARE_CONFIRMED;
+		storage.ax_release_cursor = slot;
+		shared_send_tick();
+		UT_ASSERT_EQ(release_poll_calls, fault == 2 ? 1 : 0);
+		UT_ASSERT(storage.contexts[slot].used && storage.contexts[slot].ax_failed);
+		UT_ASSERT_EQ(storage.contexts[slot].serial, before.serial);
+		UT_ASSERT_EQ(identity->state, KO_DROP_IDENTITY_RESERVED);
+		UT_ASSERT(memcmp(&identity->request, &before.request_v3,
+			sizeof(identity->request)) == 0);
+		assert_no_object_work();
+	}
+}
+
 UT_TEST(test_registration_does_not_execute_or_supply_a_completion)
 {
 	for (uint16 op = CLUSTER_KO_SHARED_V3_OPERATION_DROP;
@@ -843,7 +1123,15 @@ UT_TEST(test_publication_retry_rechecks_identity_and_cannot_clear_failure)
 int
 main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(36);
+	UT_RUN(test_committed_native_entry_registers_without_precommit_object_work);
+	UT_RUN(test_committed_registration_accepts_new_only_capabilities);
+	UT_RUN(test_new_origin_refusal_never_falls_back_to_live_v3);
+	UT_RUN(test_committed_registration_cannot_enter_live_barrier);
+	UT_RUN(test_committed_registration_purpose_is_bound_before_claim);
+	UT_RUN(test_actual_new_registration_survives_commit_publication_without_completion);
+	UT_RUN(test_new_only_abort_waits_for_original_s6_then_reclaims);
+	UT_RUN(test_new_abort_s6_preserves_owner_on_control_drift);
 	UT_RUN(test_pending_publication_requires_original_committed_backend_owner);
 	UT_RUN(test_publication_retry_rechecks_identity_and_cannot_clear_failure);
 	UT_RUN(test_original_publication_does_not_fail_a_pending_commit_window);
