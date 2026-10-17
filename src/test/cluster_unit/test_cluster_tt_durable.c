@@ -217,6 +217,7 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
  *	Mocked cluster_undo_smgr + emit + cluster_node_id
  * ============================================================ */
 int cluster_node_id = 0;
+bool cluster_shared_config;
 int cluster_ges_request_timeout_ms = 1000;
 volatile sig_atomic_t InterruptPending = false;
 sigjmp_buf *PG_exception_stack = NULL;
@@ -3276,6 +3277,40 @@ UT_TEST(test_durable_abort_preserves_identity)
 	UT_ASSERT_EQ((int)SCN_VALID(g_last_written_slot.commit_scn), 0);
 }
 
+UT_TEST(test_shared_legacy_abort_refuses_before_wal_or_io)
+{
+	TTSlot before;
+	volatile bool refused = false;
+
+	memset(&g_canned_slot, 0, sizeof(g_canned_slot));
+	g_canned_slot.status = TT_SLOT_ACTIVE;
+	g_canned_slot.xid = 777;
+	g_canned_slot.wrap = 4;
+	g_canned_slot.first_undo_block.raw[0] = 19;
+	g_canned_slot.first_undo_block.raw[1] = 37;
+	before = g_canned_slot;
+	g_read_hdr_calls = g_write_hdr_calls = g_tt_wal_count = 0;
+	last_ereport_elevel = last_ereport_errcode = 0;
+	cluster_shared_config = true;
+	PG_TRY();
+	{
+		cluster_tt_slot_durable_abort(1, 7, 777, 4);
+	}
+	PG_CATCH();
+	{
+		refused = true;
+	}
+	PG_END_TRY();
+	cluster_shared_config = false;
+	UT_ASSERT(refused);
+	UT_ASSERT_EQ(last_ereport_elevel, ERROR);
+	UT_ASSERT_EQ(last_ereport_errcode, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(g_tt_wal_count, 0);
+	UT_ASSERT_EQ(g_read_hdr_calls, 0);
+	UT_ASSERT_EQ(g_write_hdr_calls, 0);
+	UT_ASSERT_EQ(memcmp(&before, &g_canned_slot, sizeof(before)), 0);
+}
+
 UT_TEST(test_typed_redo_abort_is_durable_and_idempotent)
 {
 	g_read_hdr_ok = true;
@@ -3294,6 +3329,14 @@ UT_TEST(test_typed_redo_abort_is_durable_and_idempotent)
 	UT_ASSERT_EQ(g_last_written_slot.xid, 778);
 	UT_ASSERT_EQ(g_last_written_slot.wrap, 5);
 	UT_ASSERT(UBA_is_invalid(g_last_written_slot.first_undo_block));
+}
+
+UT_TEST(test_shared_exact_abort_and_record_redo_remain_available)
+{
+	cluster_shared_config = true;
+	test_ordinary_abort_flushes_exact_carrier_before_terminal_write();
+	test_typed_redo_abort_is_durable_and_idempotent();
+	cluster_shared_config = false;
 }
 
 UT_TEST(test_typed_redo_set_head_requires_aborted_identity)
@@ -3623,7 +3666,7 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(110);
+	UT_PLAN(112);
 
 	UT_RUN(test_layout_sizes);
 
@@ -3717,7 +3760,9 @@ main(int argc, char **argv)
 	UT_RUN(test_scan_pass_read_fail_returns_false);
 
 	UT_RUN(test_durable_abort_preserves_identity);
+	UT_RUN(test_shared_legacy_abort_refuses_before_wal_or_io);
 	UT_RUN(test_typed_redo_abort_is_durable_and_idempotent);
+	UT_RUN(test_shared_exact_abort_and_record_redo_remain_available);
 	UT_RUN(test_typed_redo_set_head_requires_aborted_identity);
 	UT_RUN(test_typed_redo_present_state_is_made_durable);
 

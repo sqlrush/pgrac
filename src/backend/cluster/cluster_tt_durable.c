@@ -1484,6 +1484,15 @@ cluster_tt_slot_durable_abort(uint32 segment_id, uint16 slot_offset, Transaction
 	uint32 off = tt_slot_file_offset(slot_offset);
 	TTSlot slot;
 
+	/* This legacy raw-xid writer clears the undo head and has no exact
+	 * generation, top/base, or recovery-source proof. Shared recovery must
+	 * use the qualified typed transition, never this local compatibility path. */
+	if (cluster_shared_config)
+		ereport(
+			ERROR,
+			(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+			 errmsg("legacy TT abort cannot supply shared recovery proof"),
+			 errhint("Preserve the original DATA and WAL for exact shared transaction recovery.")));
 	Assert(slot_offset < TT_SLOTS_PER_SEGMENT);
 	Assert(TransactionIdIsValid(xid));
 

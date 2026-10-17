@@ -4724,6 +4724,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_data_sync_policy.inc test_cluster_sync_providers.inc \
 		test_cluster_sync_dispatch.inc test_cluster_sync_smgr.inc
 	rm -f test_cluster_tt_rollback_entry.inc
+	rm -f test_cluster_tt_resolve_entry.inc
 	rm -f test_cluster_tt_terminal_route.inc test_cluster_tt_terminal_route.inc.tmp
 	rm -f test_cluster_typed_redo_reader.inc test_cluster_typed_redo_fpi.inc test_cluster_cold_init_native.inc
 	rm -f test_cluster_current_mx_local_sample.inc test_cluster_current_mx_reply_builder.inc
@@ -7080,8 +7081,14 @@ test_cluster_tt_rollback_entry.inc: $(top_srcdir)/src/backend/cluster/cluster_tt
 	     emit { print } emit && /^}/ { emit=0 } \
 	     END { if (types != 1 || found != 1) exit 1 }' $< > $@
 
+test_cluster_tt_resolve_entry.inc: $(top_srcdir)/src/backend/cluster/cluster_tt_recovery.c Makefile
+	awk '/^cluster_tt_recovery_xact_liveness\(/ { print "ClusterTtRecoveryLiveness"; emit=1; found++ } \
+	     /^cluster_tt_recovery_resolve_active_slots\(/ { print "int"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (found != 2) exit 1 }' $< > $@
+
 test_cluster_tt_rollback_entry: test_cluster_tt_rollback_entry.c test_cluster_tt_durable.c \
-		unit_test.h test_cluster_tt_rollback_entry.inc $(CLUSTER_TT_DURABLE_O)
+		unit_test.h test_cluster_tt_rollback_entry.inc test_cluster_tt_resolve_entry.inc $(CLUSTER_TT_DURABLE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_TT_DURABLE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
 

@@ -8,7 +8,6 @@ struct ClusterResId;
 #undef main
 
 bool cluster_enabled = true;
-bool cluster_shared_config;
 bool cluster_tt_recovery_resolve_active = true;
 static unsigned rollback_reads, rollback_chains;
 struct TTRevertExpect;
@@ -33,6 +32,136 @@ rollback_chain(UBA head, const struct TTRevertExpect *expected)
 #include "test_cluster_tt_rollback_entry.inc"
 #undef revert_aborted_undo_chain
 #undef cluster_undo_smgr_read_block
+
+/* The real post-EOR scanner and liveness wrapper, with only their IO and
+ * native CLOG/process dependencies supplied by the existing fixture. */
+static bool resolve_committed, resolve_in_progress;
+static unsigned resolve_clog_reads, resolve_proc_reads, resolve_aborts;
+
+bool
+TransactionIdDidCommit(TransactionId xid)
+{
+	resolve_clog_reads++;
+	return resolve_committed;
+}
+
+bool TransactionIdIsInProgress(TransactionId xid);
+bool
+TransactionIdIsInProgress(TransactionId xid)
+{
+	resolve_proc_reads++;
+	return resolve_in_progress;
+}
+
+void
+cluster_tt_recovery_count_active_resolved_aborted(void)
+{
+	resolve_aborts++;
+}
+
+#include "test_cluster_tt_resolve_entry.inc"
+
+static void
+resolve_setup(bool shared, TransactionId xid)
+{
+	cluster_enabled = cluster_tt_recovery_resolve_active = true;
+	cluster_shared_config = shared;
+	cluster_node_id = 0;
+	resolve_committed = resolve_in_progress = false;
+	resolve_clog_reads = resolve_proc_reads = resolve_aborts = 0;
+	g_canned_block_segment = 1;
+	g_read_block_ok = g_read_hdr_ok = true;
+	g_read_hdr_fail_on_call = 0;
+	g_read_hdr_second_enabled = false;
+	g_read_block_calls = g_read_hdr_calls = g_write_hdr_calls = g_tt_wal_count = 0;
+	last_ereport_elevel = last_ereport_errcode = 0;
+	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_block_slot(7, TT_SLOT_ACTIVE, xid, InvalidScn);
+	g_canned_slot = ((UndoSegmentHeaderData *)g_canned_block)->tt_slots[7];
+	g_canned_slot.first_undo_block.raw[0] = 19;
+	g_canned_slot.first_undo_block.raw[1] = 37;
+	((UndoSegmentHeaderData *)g_canned_block)->tt_slots[7] = g_canned_slot;
+}
+
+UT_TEST(test_shared_active_never_uses_local_liveness_or_writes_abort)
+{
+	/* Neither a local committed/process answer nor invalid raw xid proves
+	 * the exact shared top/base/terminal obligation or permits clearing head. */
+	for (unsigned mode = 0; mode < 5; mode++) {
+		volatile bool refused = false;
+		PGAlignedBlock before;
+		resolve_setup(true, mode == 3	? InvalidTransactionId
+							: mode == 4 ? FrozenTransactionId
+										: 777);
+		resolve_committed = mode == 1;
+		resolve_in_progress = mode == 2;
+		memcpy(before.data, g_canned_block, BLCKSZ);
+		PG_TRY();
+		{
+			(void)cluster_tt_recovery_resolve_active_slots();
+		}
+		PG_CATCH();
+		{
+			refused = true;
+		}
+		PG_END_TRY();
+		cluster_shared_config = false;
+		UT_ASSERT(refused);
+		UT_ASSERT_EQ(last_ereport_errcode, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+		UT_ASSERT_EQ(resolve_clog_reads, 0);
+		UT_ASSERT_EQ(resolve_proc_reads, 0);
+		UT_ASSERT_EQ(resolve_aborts, 0);
+		UT_ASSERT_EQ(g_tt_wal_count, 0);
+		UT_ASSERT_EQ(g_read_hdr_calls, 0);
+		UT_ASSERT_EQ(g_write_hdr_calls, 0);
+		UT_ASSERT_EQ(memcmp(before.data, g_canned_block, BLCKSZ), 0);
+	}
+}
+
+UT_TEST(test_shared_terminal_only_scan_preserves_slots)
+{
+	PGAlignedBlock before;
+	resolve_setup(true, 777);
+	seed_block_slot(7, TT_SLOT_COMMITTED, 777, 123);
+	seed_block_slot(8, TT_SLOT_ABORTED, 778, InvalidScn);
+	memcpy(before.data, g_canned_block, BLCKSZ);
+	UT_ASSERT_EQ(cluster_tt_recovery_resolve_active_slots(), 0);
+	cluster_shared_config = false;
+	UT_ASSERT_EQ(resolve_clog_reads + resolve_proc_reads + resolve_aborts, 0);
+	UT_ASSERT_EQ(g_tt_wal_count + g_write_hdr_calls, 0);
+	UT_ASSERT_EQ(memcmp(before.data, g_canned_block, BLCKSZ), 0);
+}
+
+UT_TEST(test_native_active_resolution_keeps_liveness_and_original_writer)
+{
+	for (unsigned mode = 0; mode < 3; mode++) {
+		resolve_setup(false, 777);
+		resolve_committed = mode == 1;
+		resolve_in_progress = mode == 2;
+		UT_ASSERT_EQ(cluster_tt_recovery_resolve_active_slots(), mode == 0 ? 1 : 0);
+		UT_ASSERT_EQ(resolve_clog_reads, 1);
+		UT_ASSERT_EQ(resolve_proc_reads, 1);
+		UT_ASSERT_EQ(resolve_aborts, mode == 0 ? 1 : 0);
+		UT_ASSERT_EQ(g_tt_wal_count, mode == 0 ? 1 : 0);
+		UT_ASSERT_EQ(g_write_hdr_calls, mode == 0 ? 1 : 0);
+		if (mode == 0)
+			UT_ASSERT_EQ(g_last_written_slot.status, TT_SLOT_ABORTED);
+	}
+}
+
+UT_TEST(test_disabled_active_scanner_keeps_original_noop)
+{
+	for (unsigned mode = 0; mode < 3; mode++) {
+		resolve_setup(true, 777);
+		cluster_enabled = mode != 0;
+		cluster_tt_recovery_resolve_active = mode != 1;
+		cluster_node_id = mode == 2 ? -1 : 0;
+		UT_ASSERT_EQ(cluster_tt_recovery_resolve_active_slots(), 0);
+		cluster_shared_config = false;
+		UT_ASSERT_EQ(g_read_block_calls + g_read_hdr_calls + g_write_hdr_calls, 0);
+		UT_ASSERT_EQ(resolve_clog_reads + resolve_proc_reads + resolve_aborts, 0);
+	}
+}
 
 UT_TEST(test_shared_legacy_rollback_refuses_before_any_undo_read)
 {
@@ -89,10 +218,14 @@ UT_TEST(test_disabled_legacy_rollback_does_not_scan)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(3);
+	UT_PLAN(7);
 	UT_RUN(test_shared_legacy_rollback_refuses_before_any_undo_read);
 	UT_RUN(test_nonshared_legacy_rollback_keeps_original_scan);
 	UT_RUN(test_disabled_legacy_rollback_does_not_scan);
+	UT_RUN(test_shared_active_never_uses_local_liveness_or_writes_abort);
+	UT_RUN(test_shared_terminal_only_scan_preserves_slots);
+	UT_RUN(test_native_active_resolution_keeps_liveness_and_original_writer);
+	UT_RUN(test_disabled_active_scanner_keeps_original_noop);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -245,9 +245,10 @@ extern XLogRecPtr cluster_tt_slot_durable_abort_exact(
 	uint16 wrap, const ClusterSemanticAdmissionToken *admission, TTSlot *successor_out);
 
 /*
- * cluster_tt_slot_durable_abort -- spec-3.15 D5.  Stamps TT_SLOT_ABORTED
- * preserving xid/wrap (V-2), emitting 0x31 first.  Used by crash-left ACTIVE
- * resolution; ROLLBACK PREPARED uses the staged two-phase finish above.
+ * cluster_tt_slot_durable_abort -- legacy nonshared crash-left resolution.
+ * Stamps TT_SLOT_ABORTED preserving xid/wrap, but clears the undo head and
+ * lacks an exact generation/recovery proof. Shared mode refuses before WAL
+ * or IO; ordinary exact abort and typed terminal redo are separate owners.
  */
 extern void cluster_tt_slot_durable_abort(uint32 segment_id, uint16 slot_offset, TransactionId xid,
 										  uint16 wrap);
@@ -450,13 +451,14 @@ cluster_tt_recovery_classify_revert(bool is_delete_record, bool record_xid_abort
 extern ClusterTtRecoveryLiveness cluster_tt_recovery_xact_liveness(TransactionId xid);
 
 /*
- * cluster_tt_recovery_resolve_active_slots -- scan this instance's undo segment
- *	headers and durably resolve every crash-left TT_SLOT_ACTIVE slot to
- *	TT_SLOT_ABORTED unless its owning xact is LIVE (committed / resurrected
- *	prepared).  Called once from StartupXLOG after recovery completes (WAL
+ * cluster_tt_recovery_resolve_active_slots -- legacy instance-local scan.
+ *	Shared ACTIVE slots refuse before local CLOG/process lookup or mutation;
+ *	nonshared slots retain the original liveness-based ABORTED transition.
+ *	Called once from StartupXLOG after recovery completes (WAL
  *	writes enabled, prepared set loaded), gated by cluster.enabled +
  *	cluster.tt_recovery_resolve_active.  Returns the number of slots resolved
- *	to ABORTED.  Backend-only (cluster_tt_recovery.c).
+ *	to ABORTED, not a complete shared inventory or service proof.
+ *	Backend-only (cluster_tt_recovery.c).
  */
 extern int cluster_tt_recovery_resolve_active_slots(void);
 
