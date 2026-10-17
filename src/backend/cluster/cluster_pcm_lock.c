@@ -966,6 +966,8 @@ static bool pcm_resource_x_local_handoff_valid(const ClusterPcmResourceXLocalHan
 static bool pcm_resource_x_local_owner_priority_clear_locked(struct GrdEntry *entry);
 static bool pcm_resource_x_local_owner_expire_locked(struct GrdEntry *entry, uint64 now_us);
 static void pcm_local_pi_release_locked(struct GrdEntry *entry);
+static bool pcm_local_pi_snapshot_locked(struct GrdEntry *entry,
+										ClusterPcmLocalPiSnapshotV1 *out);
 static bool pcm_local_pi_source_equal(const ClusterWalSourceRef *a, const ClusterWalSourceRef *b);
 static uint64 pcm_resource_x_monotonic_us(void);
 static bool pcm_resource_x_head_changed_locked(struct GrdEntry *entry, bool semantic_progress,
@@ -1918,6 +1920,7 @@ static bool
 pcm_entry_retire_eligible_locked(struct GrdEntry *entry, uint64 expected_generation,
 								 PcmRetireRefusal *why, bool object_retired)
 {
+	static const ClusterPageWalRefV1 empty_pi;
 	static const ClusterPcmResourceXMasterRequest empty_request;
 	static const ClusterPcmResourceXTerminalTombstone empty_tombstone;
 	ClusterPcmResourceXMasterState *state;
@@ -1969,12 +1972,29 @@ pcm_entry_retire_eligible_locked(struct GrdEntry *entry, uint64 expected_generat
 		*why = PCM_RETIRE_REFUSAL_HOLDER_PRESENT;
 		return false;
 	}
-	/* A terminal DROP ends only the master directory debt. Local PI and
-	 * every physical/protocol/reference condition below remain mandatory. */
-	if ((!object_retired && pg_atomic_read_u32(&entry->pi_holders_bitmap) != 0)
-		|| entry->local_pi_first.source_flags != 0 || entry->local_pi_last.source_flags != 0) {
+	/* Live objects still require their original DATA/physical-ACK consumer. */
+	if (!object_retired && (pg_atomic_read_u32(&entry->pi_holders_bitmap) != 0
+		|| entry->local_pi_first.source_flags != 0 || entry->local_pi_last.source_flags != 0)) {
 		*why = PCM_RETIRE_REFUSAL_PI_PRESENT;
 		return false;
+	}
+	/* AM05: a committed, I/O-retired DROP may discard this quiescent entry's
+	 * two owned local references. This is reference validation, not a DATA
+	 * proof. Partial/unknown responsibility and every other owner below still
+	 * refuse. The original caller has already checked the immutable tombstone
+	 * outside the directory lock; no KO lock is acquired here. */
+	if (object_retired
+		&& (memcmp(&entry->local_pi_first, &empty_pi, sizeof(empty_pi)) != 0
+			|| memcmp(&entry->local_pi_last, &empty_pi, sizeof(empty_pi)) != 0)) {
+		ClusterPcmLocalPiSnapshotV1 local;
+
+		if (entry->local_pi_revision >= UINT64_MAX - 1
+			|| !pcm_local_pi_snapshot_locked(entry, &local)
+			|| (local.first.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
+			|| (local.last.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0) {
+			*why = PCM_RETIRE_REFUSAL_PI_PRESENT;
+			return false;
+		}
 	}
 	if (!object_retired
 		&& (entry->pi_watermark_lsn != InvalidXLogRecPtr || entry->pi_watermark_scn != InvalidScn)) {
@@ -2151,6 +2171,7 @@ pcm_entry_retire_classify_exact(const BufferTag *tag, uint64 expected_generation
 bool
 pcm_entry_try_retire_exact(const BufferTag *tag, uint64 binding_generation, PcmRetireReason reason)
 {
+	ClusterPageWalRefV1 retired_local[2] = { 0 };
 	ClusterPcmResourceXMasterState *state;
 	ClusterPcmResourceXSlot *registry_slot;
 	ClusterPcmWmProvSlot *provenance_slot = NULL;
@@ -2242,6 +2263,14 @@ pcm_entry_try_retire_exact(const BufferTag *tag, uint64 binding_generation, PcmR
 		return false;
 	}
 
+	/* These copies transfer ownership only if the original HASH_REMOVE below
+	 * succeeds. Every refusal before it retains the references in the entry.
+	 * Release outside all directory/entry/provenance locks, never by clearing
+	 * a source pool slot or claiming an ordinary physical ACK. */
+	if (object_retired) {
+		retired_local[0] = entry->local_pi_first;
+		retired_local[1] = entry->local_pi_last;
+	}
 	pg_atomic_write_u32(&entry->lifecycle, PCM_ENTRY_RETIRING);
 	if (authority_generation > binding_generation && authority_generation > retired_authority_floor)
 		pg_atomic_write_u64(&ClusterPcm->resource_x_retired_authority_floor, authority_generation);
@@ -2271,6 +2300,10 @@ pcm_entry_try_retire_exact(const BufferTag *tag, uint64 binding_generation, PcmR
 		return false;
 	}
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
+	if (object_retired && retired_local[0].source_flags != 0
+		&& (!cluster_page_wal_ref_release_v1(&retired_local[0])
+			|| !cluster_page_wal_ref_release_v1(&retired_local[1])))
+		elog(PANIC, "retired DROP lost its owned local PI references");
 	pg_atomic_fetch_add_u64(&ClusterPcm->reclaim_success_count, 1);
 	return true;
 }
