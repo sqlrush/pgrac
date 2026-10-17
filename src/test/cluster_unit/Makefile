@@ -2580,7 +2580,7 @@ test_cluster_storage_owned_gate.inc: $(top_srcdir)/src/backend/catalog/pg_shdepe
 
 test_cluster_storage_subtransaction: test_cluster_storage_delete_gate.inc test_cluster_storage_truncate_gate.inc test_cluster_storage_truncate_apply.inc test_cluster_storage_owned_gate.inc $(top_srcdir)/src/backend/nodes/list.c
 
-test_cluster_space_storage test_cluster_storage_subtransaction: %: %.c test_cluster_space_storage.c test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc unit_test.h test_cluster_space_catalog_product.o test_cluster_space_smgrdesc_product.o test_cluster_side_xact_xactdesc.o \
+test_cluster_space_storage test_cluster_storage_subtransaction test_cluster_space_committed_drop: %: %.c test_cluster_space_storage.c test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc unit_test.h test_cluster_space_catalog_product.o test_cluster_space_smgrdesc_product.o test_cluster_side_xact_xactdesc.o \
 		$(top_builddir)/src/backend/storage/page/checksum.o \
 		test_cluster_space_xlogutils_product.o \
 		test_cluster_space_storage_product.o $(CLUSTER_HW_O) \
@@ -9357,3 +9357,6 @@ all: test_cluster_pcm_object_retire
 
 TESTS += test_cluster_pi_drop_storage
 all: test_cluster_pi_drop_storage
+
+TESTS += test_cluster_space_committed_drop
+all: test_cluster_space_committed_drop

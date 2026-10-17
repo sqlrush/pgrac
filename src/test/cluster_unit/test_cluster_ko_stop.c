@@ -79,6 +79,19 @@ static void (*lmon_wakeup_hook)(void);
 static const ClusterSpaceDropState *native_window_space;
 static const ClusterKoCompletionV2 *native_window_space_owner;
 static unsigned native_window_space_checks, native_window_space_releases;
+static unsigned native_window_space_finishes;
+static bool (*native_window_space_finish_hook)(const ClusterKoCompletionV2 *,
+	const ClusterKoDirectoryIoV3 *, ClusterPageWalBindingV1 *, void *);
+bool
+cluster_space_drop_complete_v4(const ClusterSpaceDropState *state,
+	const ClusterKoCompletionV2 *completion, const ClusterKoDirectoryIoV3 *io,
+	ClusterPageWalBindingV1 *terminal, void *wal)
+{
+	Assert(state == native_window_space && completion == native_window_space_owner);
+	native_window_space_finishes++;
+	return native_window_space_finish_hook != NULL
+		&& native_window_space_finish_hook(completion, io, terminal, wal);
+}
 bool
 cluster_space_drop_committed_owner_v4(const ClusterSpaceDropState *state,
 									 const ClusterKoCompletionV2 *completion)
@@ -1448,6 +1461,8 @@ reset_test(void)
 	native_window_space = NULL;
 	native_window_space_owner = NULL;
 	native_window_space_checks = native_window_space_releases = 0;
+	native_window_space_finishes = 0;
+	native_window_space_finish_hook = NULL;
 	native_window_errors_flushed = 0;
 	fixture_absent_ack_batch = 0;
 	fixture_absent_ack_removes = 0;

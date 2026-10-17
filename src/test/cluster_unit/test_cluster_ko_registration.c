@@ -1127,6 +1127,7 @@ static unsigned window_mode;
 static bool window_expect_ready;
 static bool window_expect_closed;
 static unsigned window_origin_case;
+static unsigned window_final_case;
 static ClusterKoDirectoryIoV3 window_entered;
 static uint32 window_interrupt_holdoff, window_query_cancel_holdoff;
 static ClusterKoSharedMessageV4 window_request;
@@ -1301,6 +1302,50 @@ window_wait(void)
 }
 
 static bool
+window_final_space_fixture(const ClusterKoCompletionV2 *owner,
+	const ClusterKoDirectoryIoV3 *io, ClusterPageWalBindingV1 *terminal, void *wal)
+{
+	ClusterKoDirectoryIoV3 wrong = *io, ordinary;
+	ClusterSpaceIdentity expected = space_identity;
+	ClusterKoSharedContext *entry = &storage.contexts[window_slot];
+	KoDropIdentity *identity = &storage.drop_identities[entry->drop_identity - 1];
+
+	UT_ASSERT(owner == postcommit_owner && owner->origin_data_closed);
+	UT_ASSERT_EQ(identity->state, KO_DROP_IDENTITY_CLOSING);
+	UT_ASSERT(cluster_ko_native_space_current_v4(owner, io, &expected));
+	UT_ASSERT(!cluster_ko_directory_io_begin_v3(expected.key.locator, &ordinary));
+	UT_ASSERT(!cluster_ko_directory_drop_retired_v3(expected.key.locator));
+	wrong.serial++;
+	UT_ASSERT(!cluster_ko_native_space_current_v4(owner, &wrong, &expected));
+	wrong = *io; wrong.pid++;
+	UT_ASSERT(!cluster_ko_native_space_current_v4(owner, &wrong, &expected));
+	expected.operation++;
+	UT_ASSERT(!cluster_ko_native_space_current_v4(owner, io, &expected));
+	v3_structure_record(true, space_identity.operation, terminal, wal);
+	switch (window_final_case) {
+	case 1: break;
+	case 2: terminal->record_start = 0; break;
+	case 3: terminal->flags = 0; break;
+	case 4: terminal->identity.forknum = MAIN_FORKNUM; break;
+	case 5: terminal->version.mutation_token++; break;
+	case 6: terminal->source.timeline++; break;
+	case 7: terminal->info = 0; break;
+	case 8: entry->request_done_peers = 0; break;
+	case 9: entry->origin_detached = true; break;
+	case 10: window_work->recovery_required = true; break;
+	case 11: identity->state = KO_DROP_IDENTITY_RETIRED; break;
+	case 12: entry->serial++; break;
+	case 13: v3_local_ax = false; break;
+	case 14: relation_gate_ok = false; break;
+	case 15: pg_re_throw(); break;
+	case 16: ((uint8 *)wal)[0] ^= 1; break;
+	case 17: terminal->identity.system_identifier++; break;
+	case 18: terminal->identity.storage_uuid[0]++; break;
+	}
+	return true;
+}
+
+static bool
 window_storage_observer(RelFileLocator locator)
 {
 	UT_ASSERT_EQ(InterruptHoldoffCount, window_interrupt_holdoff);
@@ -1311,16 +1356,23 @@ window_storage_observer(RelFileLocator locator)
 	UT_ASSERT(window_work->context.committed_drain_pending && !window_work->context.complete);
 	UT_ASSERT(!window_work->buffers_released && !window_work->predelete_ready);
 	UT_ASSERT(!postcommit_owner->barrier_private);
+	UT_ASSERT_EQ(postcommit_owner->space_observed, window_expect_closed && window_final_case == 1);
+	UT_ASSERT_EQ(window_work->context.structure_owned, window_expect_closed && window_final_case == 1);
+	if (window_final_case == 1) {
+		UT_ASSERT(memcmp(&postcommit_owner->terminal, &window_work->context.terminal,
+			sizeof(postcommit_owner->terminal)) == 0);
+		UT_ASSERT(!cluster_ko_native_space_current_v4(postcommit_owner, &window_entered, &space_identity));
+	}
 	UT_ASSERT_EQ(postcommit_owner->origin_data_closed, window_expect_closed);
 	UT_ASSERT_EQ(window_work->context.origin_data_closed, window_expect_closed);
 	if (window_origin_case == 0) {
 		UT_ASSERT_EQ(committed_discard_calls, window_expect_ready ? 1 : 0);
 		UT_ASSERT_EQ(local_discard_calls, window_expect_ready ? 1 : 0);
 	}
-	UT_ASSERT(!cluster_ko_directory_drop_retired_v3(locator));
+	UT_ASSERT_EQ(cluster_ko_directory_drop_retired_v3(locator), window_final_case == 11);
 	UT_ASSERT(!cluster_ko_shared_native_prepare_drop_v2(locator));
 	UT_ASSERT(!ko_origin_release_ready(window_slot));
-	UT_ASSERT(!cluster_ko_local_drop_discard_current_v4(locator));
+	UT_ASSERT_EQ(cluster_ko_local_drop_discard_current_v4(locator), window_final_case == 11);
 	UT_ASSERT_EQ(native_fork_unlinks + flush_count + sync_count + drop_count, 0);
 	return true;
 }
@@ -1334,6 +1386,16 @@ run_committed_window(uint16 operation, unsigned mode, bool held, unsigned origin
 
 	committed_origin_only_caps = true;
 	object_wire_missing_capabilities = PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3;
+	if (window_final_case != 0) {
+		space_identity.sequence = 1;
+		writer.claim.identity.origin_thread_id = 1;
+		writer.claim.identity.thread_claim_created_at = 123;
+		writer.claim.identity.root_lineage_seq = 1;
+		writer.claim.identity.authority_uuid[0] = 17;
+		writer.claim.max_config_generation = 1;
+		writer.claim.claim_sha256[0] = 19;
+		writer.timeline = 1;
+	}
 	owner = committed_origin_register(operation, &binding);
 	if (owner == NULL)
 		abort();
@@ -1346,6 +1408,7 @@ run_committed_window(uint16 operation, unsigned mode, bool held, unsigned origin
 	window_origin_case = origin_case;
 	native_window_space = mode == 7 ? NULL : (ClusterSpaceDropState *)&window_request;
 	native_window_space_owner = mode == 8 ? NULL : owner;
+	native_window_space_finish_hook = window_final_case == 0 ? NULL : window_final_space_fixture;
 	window_expect_ready = held && mode < 3;
 	window_expect_closed = window_expect_ready
 		&& (origin_case < 8 || (origin_case > 11 && origin_case < 16));
@@ -1423,14 +1486,15 @@ run_committed_window(uint16 operation, unsigned mode, bool held, unsigned origin
 	UT_ASSERT_EQ(native_fork_unlinks, 0);
 	UT_ASSERT_EQ(native_window_space_checks, held ? 1 : 0);
 	UT_ASSERT_EQ(native_window_space_releases, mode == 7 ? 0 : 1);
+	UT_ASSERT_EQ(native_window_space_finishes, window_expect_closed ? 1 : 0);
 	UT_ASSERT_EQ(send_calls, !held || mode >= 7 ? 0 : mode == 1 ? 2 : 1);
 	UT_ASSERT(!barrier_active);
 	UT_ASSERT_EQ(native_window_errors_flushed,
-		held && (mode == 5 || origin_case == 10 || origin_case == 11) ? 1 : 0);
+		held && (mode == 5 || origin_case == 10 || origin_case == 11 || window_final_case == 15) ? 1 : 0);
 	if (held && mode == 2)
 		UT_ASSERT_EQ(barrier_waits, 2);
-	/* Final SPACE is still outstanding. Original final
-	 * cleanup therefore retains recovery/AX ownership, never completion. */
+	/* Permanent close/deletion is still outstanding, independently of the
+	 * final SPACE result. Original cleanup retains recovery/AX ownership. */
 	UT_ASSERT(window_work->recovery_required && storage.native_recovery_required);
 	UT_ASSERT(storage.contexts[window_slot].used && !ko_origin_release_ready(window_slot));
 	UT_ASSERT_EQ(native_free_calls, 0);
@@ -1462,6 +1526,13 @@ run_committed_window(uint16 operation, unsigned mode, bool held, unsigned origin
 			UT_ASSERT(storage.extend_work[0].failed);
 	}
 	native_fixture_shared_memory_end();
+}
+
+UT_TEST(test_committed_window_final_space_keeps_original_owner_and_negative_identity)
+{
+	for (window_final_case = 1; window_final_case <= 18; window_final_case++)
+		run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 0);
+	window_final_case = 0;
 }
 
 UT_TEST(test_actual_commit_window_collects_ready_after_local_cleanup)
@@ -1570,7 +1641,7 @@ UT_TEST(test_prepared_mode_keeps_original_completed_legacy_owner)
 int
 main(void)
 {
-	UT_PLAN(48);
+	UT_PLAN(49);
 	UT_RUN(test_committed_origin_self_or_failed_work_hands_off_without_waiting);
 	UT_RUN(test_committed_origin_waits_for_original_io_and_finite_owners);
 	UT_RUN(test_committed_origin_preserves_bounded_scan_and_wait_progress);
@@ -1579,6 +1650,7 @@ main(void)
 	UT_RUN(test_committed_origin_discard_scope_is_not_generic_io_or_retirement);
 	UT_RUN(test_prepared_mode_never_falls_back_from_changed_committed_identity);
 	UT_RUN(test_prepared_mode_keeps_original_completed_legacy_owner);
+	UT_RUN(test_committed_window_final_space_keeps_original_owner_and_negative_identity);
 	UT_RUN(test_actual_commit_window_collects_ready_after_local_cleanup);
 	UT_RUN(test_commit_window_keeps_backpressure_and_exact_result_waits);
 	UT_RUN(test_commit_window_failure_retains_original_owner_without_error);

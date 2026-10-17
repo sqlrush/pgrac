@@ -27,9 +27,12 @@
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_ko.h"
+#include "cluster/cluster_mrp.h"
 #include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_write_fence.h"
+#include "cluster/storage/cluster_shared_fs.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
@@ -837,6 +840,10 @@ struct ClusterSpaceDropState {
 	bool write_authorized;
 	bool committed_discard; /* Immutable purpose, not physical permission. */
 	XLogRecPtr commit_lsn;  /* Set only by the original durable COMMIT caller. */
+	XLogRecPtr commit_start;
+	XLogRecord commit_record;
+	ClusterWalSourceRef commit_source;
+	bool commit_attributed;
 	char *wal;
 	uint32 wal_len;
 	ClusterSpaceTruncateState *entries[FLEXIBLE_ARRAY_MEMBER];
@@ -1208,6 +1215,15 @@ cluster_space_drop_defer_v4(ClusterSpaceDropState *state, XLogRecPtr commit_lsn)
 			if (BufferIsValid(state->entries[i]->buffers[j]))
 				elog(PANIC, "deferred SPACE deletion retained a buffer reference");
 	state->commit_lsn = commit_lsn;
+	/* Capture the successful insertion before later local cleanup can insert
+	 * another record. Missing attribution retains recovery responsibility. */
+	state->commit_attributed = XLogGetLastInsertRecord(commit_lsn, &state->commit_start,
+		&state->commit_record)
+		&& state->commit_start != InvalidXLogRecPtr && state->commit_start < commit_lsn
+		&& state->commit_record.xl_rmid == RM_XACT_ID
+		&& (state->commit_record.xl_info & XLOG_XACT_OPMASK) == XLOG_XACT_COMMIT
+		&& (state->commit_record.xl_info & XLOG_XACT_HAS_INFO) != 0
+		&& cluster_wal_thread_current_v2_ref(&state->commit_source);
 }
 
 /* Borrowed by the original committed-window collector. Compare the private
@@ -1241,6 +1257,126 @@ cluster_space_drop_committed_owner_v4(const ClusterSpaceDropState *state,
 		matches++;
 	}
 	return matches == 1;
+}
+
+static bool
+space_committed_current(const ClusterSpaceDropState *state,
+	const ClusterKoCompletionV2 *completion, const ClusterKoDirectoryIoV3 *io,
+	const ClusterSpaceIdentity *expected)
+{
+	ClusterWalSourceRef current;
+
+	return state->commit_attributed && !RecoveryInProgress()
+		&& !XLogNeedsFlush(state->commit_lsn)
+		&& cluster_wal_thread_current_v2_ref(&current)
+		&& memcmp(&current, &state->commit_source, sizeof(current)) == 0
+		&& cluster_ko_native_space_current_v4(completion, io, expected);
+}
+
+/* No buffer/current reacquisition. This is the original committed record's
+ * two-page publication under its original entered-call owner. Open-existing
+ * cannot create a missing file. The same typed transition and checksums guard
+ * reads before and after the required synchronous DATA completion. */
+bool
+cluster_space_drop_complete_v4(const ClusterSpaceDropState *state,
+	const ClusterKoCompletionV2 *completion, const ClusterKoDirectoryIoV3 *io,
+	ClusterPageWalBindingV1 *terminal, void *wal)
+{
+	const ClusterSpaceTruncateState *entry = NULL;
+	ClusterSpaceStructureChange change;
+	ClusterPageWalBindingV1 value = {0};
+	ClusterSharedFsHandle *volatile handle = NULL;
+	PGIOAlignedBlock result[2], disk;
+	ClusterSpaceIdentityTransition transition;
+	uint8 mask;
+	volatile bool ready = false;
+
+	if (io == NULL || terminal == NULL || wal == NULL
+		|| !cluster_space_drop_committed_owner_v4(state, completion))
+		return false;
+	for (int i = 0; i < state->count; i++)
+		if (state->entries[i]->ko_completion == completion)
+			entry = state->entries[i];
+	if (entry == NULL || !cluster_space_structure_wal_decode(entry->wal, sizeof(entry->wal), &change)
+		|| change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE
+		|| !space_committed_current(state, completion, io, &change.identity.expected))
+		return false;
+	value.source = state->commit_source;
+	value.identity.system_identifier = change.identity.result.key.system_identifier;
+	memcpy(value.identity.storage_uuid, change.identity.result.key.storage_uuid, 16);
+	value.identity.locator = change.identity.result.key.locator;
+	value.identity.forknum = SPACE_FORKNUM;
+	memcpy(value.version.segment_incarnation, change.identity.result.incarnation, 16);
+	value.version.mutation_token = change.identity.result_token;
+	value.record_start = state->commit_start;
+	value.record_end = state->commit_lsn;
+	value.record_crc = state->commit_record.xl_crc;
+	value.rmid = state->commit_record.xl_rmid;
+	value.info = state->commit_record.xl_info;
+	value.flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
+	if (!cluster_page_wal_binding_shape_v1(&value)
+		|| value.source.claim.database_incarnation != change.identity.result.key.database_incarnation)
+		return false;
+	PG_TRY();
+	{
+		cluster_write_fence_reject_if_fenced("committed SPACE");
+		cluster_mrp_standby_shared_write_gate("committed SPACE");
+		if (!space_committed_current(state, completion, io, &change.identity.expected))
+			goto finished;
+		cluster_shared_fs_open_existing(value.identity.locator, SPACE_FORKNUM, (ClusterSharedFsHandle **)&handle);
+		if (cluster_shared_fs_nblocks(handle) != 2)
+			goto finished;
+		for (unsigned i = 0; i < 2; i++) {
+			if (!space_committed_current(state, completion, io, &change.identity.expected)
+				|| cluster_shared_fs_read(handle, i, result[i].data) != BLCKSZ
+				|| PageIsNew(result[i].data)
+				|| (DataChecksumsEnabled() && ((PageHeader)result[i].data)->pd_checksum
+					!= pg_checksum_page(result[i].data, i)))
+				goto finished;
+		}
+		transition = cluster_space_structure_apply(&change, &change.identity.expected.key,
+			result[0].data, result[1].data, BLCKSZ, &mask);
+		if (transition != CLUSTER_SPACE_IDENTITY_APPLY && transition != CLUSTER_SPACE_IDENTITY_ALREADY)
+			goto finished;
+		for (unsigned i = 0; i < 2; i++) {
+			space_set_lsn(result[i].data, state->commit_lsn, entry->token);
+			if (DataChecksumsEnabled())
+				((PageHeader)result[i].data)->pd_checksum = pg_checksum_page(result[i].data, i);
+			cluster_write_fence_reject_if_fenced("committed SPACE write");
+			cluster_mrp_standby_shared_write_gate("committed SPACE write");
+			if (!space_committed_current(state, completion, io, &change.identity.expected)
+				|| cluster_shared_fs_write(handle, i, result[i].data) != BLCKSZ)
+				goto finished;
+		}
+		for (unsigned pass = 0; pass < 2; pass++) {
+			if (pass != 0) {
+				cluster_write_fence_reject_if_fenced("committed SPACE sync");
+				cluster_mrp_standby_shared_write_gate("committed SPACE sync");
+				if (!space_committed_current(state, completion, io, &change.identity.expected))
+					goto finished;
+				cluster_shared_fs_immedsync(handle);
+			}
+			for (unsigned i = 0; i < 2; i++) {
+				if (!space_committed_current(state, completion, io, &change.identity.expected)
+					|| cluster_shared_fs_read(handle, i, disk.data) != BLCKSZ
+					|| memcmp(disk.data, result[i].data, BLCKSZ) != 0)
+					goto finished;
+			}
+		}
+		ready = space_committed_current(state, completion, io, &change.identity.expected);
+finished:;
+	}
+	PG_FINALLY();
+	{
+		if (handle != NULL)
+			cluster_shared_fs_close(handle);
+	}
+	PG_END_TRY();
+	if (!ready || !space_committed_current(state, completion, io, &change.identity.expected))
+		return false;
+	memcpy(wal, entry->wal, sizeof(entry->wal));
+	*terminal = value;
+	return true;
 }
 
 bool

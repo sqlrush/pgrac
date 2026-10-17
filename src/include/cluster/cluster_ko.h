@@ -493,6 +493,9 @@ extern void cluster_ko_flush_and_wait_ack_relation(struct RelationData *rel,
  * Direct begin binds CurrentResourceOwner. The native shared DDL wrapper
  * retains its completion with CurTransactionResourceOwner for SPACE. */
 typedef struct ClusterKoCompletionV2 ClusterKoCompletionV2;
+/* The original committed backend's entered SPACE call, never general I/O. */
+extern bool cluster_ko_native_space_current_v4(const ClusterKoCompletionV2 *completion,
+	const ClusterKoDirectoryIoV3 *call, const ClusterSpaceIdentity *expected);
 /* Successful subtransaction cleanup transfers this original handle to its
  * parent ResourceOwner. Native observed handles span top-level commit's
  * pending deletes; all others end at the original ResourceOwner cleanup.

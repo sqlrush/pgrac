@@ -198,6 +198,14 @@ extern void cluster_space_drop_defer_v4(ClusterSpaceDropState *state, XLogRecPtr
 struct ClusterKoCompletionV2;
 extern bool cluster_space_drop_committed_owner_v4(const ClusterSpaceDropState *state,
 												 const struct ClusterKoCompletionV2 *completion);
+struct ClusterKoDirectoryIoV3;
+struct ClusterPageWalBindingV1;
+/* Same committed preparation and entered call; writes only its two existing
+ * SPACE pages. Output is published after sync/readback and exact revalidation.
+ * Refusal/ERROR leaves physical and native recovery responsibility intact. */
+extern bool cluster_space_drop_complete_v4(const ClusterSpaceDropState *state,
+	const struct ClusterKoCompletionV2 *completion, const struct ClusterKoDirectoryIoV3 *call,
+	struct ClusterPageWalBindingV1 *terminal, void *wal);
 extern bool cluster_space_drop_authorize(ClusterSpaceDropState *state);
 extern void cluster_space_drop_publish(ClusterSpaceDropState *state, XLogRecPtr commit_lsn);
 extern void cluster_space_drop_finish(ClusterSpaceDropState *state);

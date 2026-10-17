@@ -95,6 +95,7 @@ static unsigned ko_structure_claims;
 static bool ko_pending, ko_claim_unavailable;
 static bool ko_drop_write_allowed;
 static bool committed_drop_mode, drop_mode_unknown;
+static bool commit_attribution_missing;
 static bool ko_drop_write_revoke_on_read;
 static int drop_resume_read_error;
 static unsigned ko_drop_write_checks;
@@ -658,6 +659,20 @@ XLogFlush(XLogRecPtr lsn)
 	if (!recovering || lsn != UINT64_C(0x20000200) || locked != 3)
 		abort();
 	flush_calls++;
+}
+
+bool
+XLogGetLastInsertRecord(XLogRecPtr end, XLogRecPtr *start, XLogRecord *record)
+{
+	if (commit_attribution_missing || !drop_owner || wal_calls == 0
+		|| end != UINT64_C(0x10000300))
+		return false;
+	memset(record, 0, sizeof(*record));
+	record->xl_rmid = RM_XACT_ID;
+	record->xl_info = wal_info;
+	record->xl_crc = 7;
+	*start = end - 0x100;
+	return true;
 }
 
 bool
@@ -1515,6 +1530,7 @@ reset(void)
 	ko_pending = ko_claim_unavailable = false;
 	ko_drop_write_allowed = true;
 	committed_drop_mode = drop_mode_unknown = false;
+	commit_attribution_missing = false;
 	ko_drop_write_revoke_on_read = false;
 	drop_resume_read_error = -1;
 	ko_drop_write_checks = 0;

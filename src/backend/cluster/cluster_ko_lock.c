@@ -7884,6 +7884,181 @@ ko_native_origin_discard_v4(ClusterKoCompletionV2 *owned, ClusterKoNativeContinu
 	}
 }
 
+/* This phase may only borrow the committed operation's original call slot.
+ * Generic CLOSING admission remains closed, including other calls by this PID. */
+static bool
+ko_native_space_owner_current(const ClusterKoCompletionV2 *owned)
+{
+	return owned != NULL && ko_state != NULL && cluster_enabled && cluster_shared_config
+		&& cluster_interconnect_tier == CLUSTER_IC_TIER_1 && !RecoveryInProgress()
+		&& InterruptHoldoffCount != 0 && CritSectionCount == 0 && MyProcPid > 0
+		&& (MyBackendType == B_BACKEND || MyBackendType == B_AUTOVAC_WORKER
+			|| MyBackendType == B_BG_WORKER)
+		&& TopTransactionResourceOwner != NULL && CurrentResourceOwner != NULL
+		&& CurTransactionResourceOwner == TopTransactionResourceOwner
+		&& owned->native_transaction && owned->postcommit && owned->native_handed_off
+		&& !owned->native_pending && owned->barrier_v3 && owned->barrier_committed_discard
+		&& !owned->barrier_private && !owned->space_observed && owned->origin_data_closed
+		&& owned->pid == MyProcPid && owned->owner == TopTransactionResourceOwner
+		&& owned->slot < CLUSTER_KO_SHARED_CAPACITY && DsaPointerIsValid(owned->native_unready);
+}
+
+static bool
+ko_native_space_same_locked(const ClusterKoCompletionV2 *owned,
+	const ClusterKoNativeContinuation *work, const ClusterKoSharedContext *before,
+	const ClusterKoDirectoryIoV3 *io)
+{
+	const KoDropIdentity *identity;
+	RelFileLocator locator = before->request.key.locator;
+
+	if (!ko_native_space_owner_current(owned) || !work->publication_observed
+		|| work->recovery_required || work->buffers_released || work->predelete_ready
+		|| !before->used || !before->v3 || !before->committed_discard
+		|| !before->committed_drain_pending || before->complete || before->structure_owned
+		|| !before->origin_checkpoint || !before->origin_data_closed
+		|| before->origin_detached || before->ax_failed || before->ax_release_requested
+		|| before->cancel_sqlerrcode != 0 || !ko_shared_ready_v3(before)
+		|| before->pid != owned->pid || before->serial != owned->serial
+		|| memcmp(&before->request, &before->request_v3.base, sizeof(before->request)) != 0
+		|| memcmp(&before->request_v3, &owned->barrier_request_v3,
+			sizeof(before->request_v3)) != 0
+		|| memcmp(before->peer_boots, owned->barrier_boots, sizeof(before->peer_boots)) != 0
+		|| memcmp(before, &work->context, sizeof(*before)) != 0
+		|| memcmp(before, &ko_state->contexts[owned->slot], sizeof(*before)) != 0
+		|| before->drop_identity == 0 || before->drop_identity > KO_DROP_IDENTITY_CAPACITY
+		|| (io != NULL && (io->slot >= CLUSTER_KO_SHARED_CAPACITY || io->serial == 0
+			|| io->pid != MyProcPid)))
+		return false;
+	identity = &ko_state->drop_identities[before->drop_identity - 1];
+	if (identity->state != KO_DROP_IDENTITY_CLOSING || !identity->committed_discard
+		|| identity->fence_serial != before->drop_identity_serial
+		|| memcmp(&identity->request, &before->request_v3, sizeof(identity->request)) != 0)
+		return false;
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		const KoDirectoryIo *call = &ko_state->directory_io[i];
+		if (io != NULL && i == io->slot) {
+			if (call->serial != io->serial || call->pid != io->pid
+				|| !RelFileLocatorEquals(call->locator, locator))
+				return false;
+		} else if (call->serial != 0 && RelFileLocatorEquals(call->locator, locator))
+			return false;
+		if (ko_state->extend_work[i].used
+			&& RelFileLocatorEquals(ko_state->extend_work[i].locator, locator))
+			return false;
+	}
+	for (unsigned i = 0; i < CLUSTER_CTRC_CLEANER_WORKERS; i++)
+		if (ko_state->cleaner_work[i].used
+			&& RelFileLocatorEquals(ko_state->cleaner_work[i].locator, locator))
+			return false;
+	return true;
+}
+
+bool
+cluster_ko_native_space_current_v4(const ClusterKoCompletionV2 *completion,
+	const ClusterKoDirectoryIoV3 *io, const ClusterSpaceIdentity *expected)
+{
+	const ClusterKoCompletionV2 *owned = *ko_completion_link(completion);
+	ClusterKoNativeContinuation *work;
+	ClusterKoSharedContext before;
+	ResourceXGateSnapshot gate;
+	bool current;
+
+	if (!ko_native_space_owner_current(owned) || io == NULL || expected == NULL
+		|| !ko_shared_v3_space_matches(&owned->barrier_request_v3, expected))
+		return false;
+	work = dsa_get_address(ko_native_area, owned->native_unready);
+	SpinLockAcquire(&ko_state->shared_lock);
+	before = work->context;
+	current = ko_native_space_same_locked(owned, work, &before, io);
+	SpinLockRelease(&ko_state->shared_lock);
+	if (!current || !ko_shared_origin_current(&before)
+		|| !ko_shared_v3_local_binding_current(&before.request_v3)
+		|| !cluster_pcm_lock_resource_x_gate_snapshot(&gate) || gate.phase != RESOURCE_X_GATE_OPEN)
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	current = ko_native_space_same_locked(owned, work, &before, io);
+	SpinLockRelease(&ko_state->shared_lock);
+	return current;
+}
+
+static bool
+ko_native_final_space_v4(const ClusterSpaceDropState *space_drop,
+	ClusterKoCompletionV2 *owned, ClusterKoNativeContinuation *work)
+{
+	ClusterKoSharedContext before;
+	ClusterKoDirectoryIoV3 io = {0};
+	ClusterPageWalBindingV1 terminal;
+	ClusterSpaceStructureChange change;
+	ClusterWalSourceRef current;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	volatile bool observed = false;
+
+	if (!ko_native_space_owner_current(owned))
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	before = work->context;
+	if (ko_native_space_same_locked(owned, work, &before, NULL)
+		&& ko_state->directory_io_serial < UINT64_MAX) {
+		for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+			KoDirectoryIo *call = &ko_state->directory_io[i];
+			if (call->serial != 0)
+				continue;
+			call->locator = before.request.key.locator;
+			call->pid = MyProcPid;
+			call->serial = ++ko_state->directory_io_serial;
+			io.slot = i;
+			io.pid = call->pid;
+			io.serial = call->serial;
+			break;
+		}
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	if (io.serial == 0)
+		return false;
+	PG_TRY();
+	{
+		if (cluster_space_drop_complete_v4(space_drop, owned, &io, &terminal, wal)
+			&& cluster_space_structure_wal_decode(wal, sizeof(wal), &change)
+			&& change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE
+			&& cluster_page_wal_binding_shape_v1(&terminal)
+			&& terminal.flags == CLUSTER_PAGE_WAL_NATIVE_FLUSHED
+			&& terminal.rmid == RM_XACT_ID
+			&& (terminal.info & XLOG_XACT_OPMASK) == XLOG_XACT_COMMIT
+			&& (terminal.info & XLOG_XACT_HAS_INFO) != 0
+			&& terminal.identity.forknum == SPACE_FORKNUM && terminal.identity.blockno == 0
+			&& RelFileLocatorEquals(terminal.identity.locator, change.identity.result.key.locator)
+			&& terminal.version.mutation_token == change.identity.result_token
+			&& memcmp(terminal.version.segment_incarnation, change.identity.result.incarnation, 16) == 0
+			&& terminal.identity.system_identifier == change.identity.result.key.system_identifier
+			&& terminal.source.claim.database_incarnation == change.identity.result.key.database_incarnation
+			&& memcmp(terminal.identity.storage_uuid, change.identity.result.key.storage_uuid, 16) == 0
+			&& cluster_wal_thread_current_v2_ref(&current)
+			&& memcmp(&current, &terminal.source, sizeof(current)) == 0
+			&& cluster_ko_native_space_current_v4(owned, &io, &change.identity.expected)) {
+			SpinLockAcquire(&ko_state->shared_lock);
+			if (ko_native_space_same_locked(owned, work, &before, &io)) {
+				ClusterKoSharedContext *entry = &ko_state->contexts[owned->slot];
+				entry->terminal = terminal;
+				memcpy(entry->structure, wal, sizeof(wal));
+				entry->structure_owned = entry->structure_drop_pending = true;
+				work->context = *entry;
+				owned->terminal = terminal;
+				memcpy(owned->structure, wal, sizeof(wal));
+				owned->space_observed = true;
+				observed = true;
+			}
+			SpinLockRelease(&ko_state->shared_lock);
+		}
+	}
+	PG_FINALLY();
+	{
+		if (!cluster_ko_directory_io_end_v3(&io))
+			observed = false;
+	}
+	PG_END_TRY();
+	return observed;
+}
+
 /* The native caller invokes this after local invalidation/MultiXact and
  * before LOCKS release. Failure cannot roll back catalog COMMIT: preserve
  * the preallocated native owner and protecting AX, including uncertain sends.
@@ -7917,7 +8092,8 @@ cluster_ko_shared_native_window_v4(const ClusterSpaceDropState *space_drop)
 		{
 			ready = cluster_space_drop_committed_owner_v4(space_drop, owned)
 				&& ko_native_window_wait(owned, work)
-				&& ko_native_origin_discard_v4(owned, work);
+				&& ko_native_origin_discard_v4(owned, work)
+				&& ko_native_final_space_v4(space_drop, owned, work);
 		}
 		PG_CATCH();
 		{
