@@ -4756,6 +4756,8 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_tt_rollback_entry.inc
 	rm -f test_cluster_tt_resolve_entry.inc
 	rm -f test_cluster_tt_terminal_route.inc test_cluster_tt_terminal_route.inc.tmp
+	rm -f test_cluster_tt_checkpoint_apply.inc test_cluster_tt_checkpoint_wait.inc \
+		test_cluster_tt_checkpoint_redo.inc
 	rm -f test_cluster_typed_redo_reader.inc test_cluster_typed_redo_fpi.inc test_cluster_cold_init_native.inc
 	rm -f test_cluster_current_mx_local_sample.inc test_cluster_current_mx_reply_builder.inc
 	rm -f test_cluster_page_cold_redo_product.o
@@ -7422,14 +7424,22 @@ test_cluster_tt_checkpoint_wait.inc: $(top_srcdir)/src/backend/access/transam/xl
 	     END { if (starts != 1 || !done || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_tt_checkpoint_redo.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
+	awk '/^build_undo_segment_path\(/ { print "static int"; emit=1; paths++ } \
+	     /^cluster_tt_durable_redo_stamp_slot_exact\(/ { print "void"; emit=1; stamps++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (paths != 1 || stamps != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_tt_checkpoint_cuts: test_cluster_tt_checkpoint_cuts.c \
 		test_cluster_undo_header_durability.c unit_test.h \
 		test_cluster_tt_checkpoint_apply.inc test_cluster_tt_checkpoint_wait.inc \
+		test_cluster_tt_checkpoint_redo.inc $(CLUSTER_SIDE_UNDO_O) \
 		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
 		$(CLUSTER_TT_DURABLE_O) $(CLUSTER_UNDO_BUF_O) $(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
 		$(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_UNDO_BLOCK0_RESIDENT_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
-		$(CLUSTER_UNDO_BUF_O) $(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
+		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_UNDO_BUF_O) $(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
 		$(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_UNDO_BLOCK0_RESIDENT_O) \
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
