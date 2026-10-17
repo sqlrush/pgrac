@@ -120,6 +120,7 @@
 typedef struct ClusterKoSharedContext {
 	bool used;
 	bool v3;
+	bool committed_discard; /* Immutable PKO4 purpose, not completion. */
 	bool complete;
 	/* Durable COMMIT handed off this registration before its drain ran.
 	 * Neither native execution nor AX release may consume it as complete. */
@@ -164,6 +165,7 @@ typedef struct ClusterKoSharedContext {
 typedef struct ClusterKoInboundSlot {
 	bool shared;
 	bool v3;
+	bool committed_discard;
 	ClusterKoSharedMessageV2 qualified;
 	ClusterKoSharedMessageV3 qualified_v3;
 	ClusterICControlIngress ingress;
@@ -187,6 +189,7 @@ typedef enum KoPeerReplyState {
 
 typedef struct ClusterKoPeerFenceV3 {
 	ClusterKoPeerFenceStateV3 state;
+	bool committed_discard;
 	bool physical_started;
 	bool physical_applied;
 	uint8 physical_phase;
@@ -278,6 +281,7 @@ typedef struct ClusterKoShared {
 	uint32 send_v3_head, send_v3_count;
 	ClusterKoSharedMessageV3 send_v3[CLUSTER_KO_SHARED_CAPACITY];
 	uint64 send_v3_route_generation[CLUSTER_KO_SHARED_CAPACITY];
+	bool send_committed_discard[CLUSTER_KO_SHARED_CAPACITY];
 	uint64 context_serial;
 	/* Even publication version; odd only during a bounded GRD cleanup. */
 	pg_atomic_uint64 ax_publication_revision;
@@ -334,6 +338,8 @@ static dsa_area *ko_native_area;
 typedef struct KoAxBinding KoAxBinding;
 static bool ko_capture_relation_ax_binding(Relation rel, KoAxBinding *out);
 static bool ko_shared_enqueue_v3(const ClusterKoSharedMessageV3 *message, uint64 local_generation);
+static bool ko_shared_enqueue_object(const ClusterKoSharedMessageV3 *message, uint64 local_generation,
+								 bool committed_discard);
 
 typedef struct ClusterKoNativeContinuation {
 	dsa_pointer next;
@@ -951,14 +957,54 @@ ko_shared_control_current(const ClusterKoSharedMessageV2 *message)
 		   && memcmp(expected, observed, sizeof(expected)) == 0;
 }
 
+/* The purpose is fixed by the original operation, never inferred from a
+ * matching locator or a later COMMIT marker. Each codec checks its own wire
+ * version before decoding the common bounded identity. */
+static bool
+ko_shared_object_encode(const ClusterKoSharedMessageV3 *message, bool committed_discard,
+						void *bytes, size_t length)
+{
+	ClusterKoSharedMessageV4 newer;
+
+	if (!committed_discard)
+		return cluster_ko_shared_encode_v3(message, bytes, length);
+	if (message == NULL)
+		return false;
+	newer.object = *message;
+	return cluster_ko_shared_encode_v4(&newer, bytes, length);
+}
+
+static bool
+ko_shared_object_decode(const void *bytes, size_t length, ClusterKoSharedMessageV3 *message,
+						bool *committed_discard)
+{
+	ClusterKoSharedMessageV4 newer;
+
+	if (bytes == NULL || message == NULL || committed_discard == NULL
+		|| length != CLUSTER_KO_SHARED_V4_BYTES)
+		return false;
+	if (memcmp(bytes, "PKO4", 4) == 0) {
+		if (!cluster_ko_shared_decode_v4(bytes, length, &newer))
+			return false;
+		*message = newer.object;
+		*committed_discard = true;
+		return true;
+	}
+	*committed_discard = false;
+	return cluster_ko_shared_decode_v3(bytes, length, message);
+}
+
 /* R2: v3 retains the exact v2 formation/WAL cut, but binds the peer check to
  * the independently negotiated object-drain capability and the immutable AX
  * suffix. No maintenance identity read is part of this control predicate. */
 static bool
-ko_shared_v3_control_at_generation(const ClusterKoSharedMessageV3 *message, uint64 local_generation)
+ko_shared_object_control_at_generation(const ClusterKoSharedMessageV3 *message,
+									 uint64 local_generation, bool committed_discard)
 {
 	const uint32 required_capabilities
-		= PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3 | PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1;
+		= PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1
+		  | (committed_discard ? PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1
+							   : PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3);
 	ClusterKoSharedMessageV3 current;
 	ClusterWalSourceRef ref;
 	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], generation;
@@ -969,7 +1015,9 @@ ko_shared_v3_control_at_generation(const ClusterKoSharedMessageV3 *message, uint
 	/* A readable runtime source/cut or retained fence is not a recovery
 	 * write grant. Recovery keeps its own IR/isolation/ROOT-qualified owner. */
 	if (message == NULL || local_generation == 0 || local_generation == UINT64_MAX
-		|| RecoveryInProgress() || cluster_interconnect_tier != CLUSTER_IC_TIER_1)
+		|| RecoveryInProgress() || cluster_interconnect_tier != CLUSTER_IC_TIER_1
+		|| (committed_discard
+			&& (cluster_ic_local_capability_word() & required_capabilities) != required_capabilities))
 		return false;
 	current = *message;
 	/* The AX wire token belongs to the origin. Each consumer retains and
@@ -982,7 +1030,7 @@ ko_shared_v3_control_at_generation(const ClusterKoSharedMessageV3 *message, uint
 		|| message->base.peer_node >= CLUSTER_KO_SHARED_NODE_LIMIT
 		|| (cluster_node_id != message->base.origin_node
 			&& cluster_node_id != message->base.peer_node)
-		|| !cluster_ko_shared_encode_v3(message, expected, sizeof(expected))
+		|| !ko_shared_object_encode(message, committed_discard, expected, sizeof(expected))
 		|| !cluster_wal_thread_current_v2_ref(&ref)
 		|| ref.claim.identity.origin_node_id != cluster_node_id
 		|| ref.claim.identity.system_identifier != message->base.key.system_identifier
@@ -1000,11 +1048,17 @@ ko_shared_v3_control_at_generation(const ClusterKoSharedMessageV3 *message, uint
 		|| capability_generation == 0
 		|| (capabilities & required_capabilities) != required_capabilities
 		|| !cluster_membership_cut_generation_current(generation)
-		|| !cluster_ko_shared_encode_v3(&current, observed, sizeof(observed)))
+		|| !ko_shared_object_encode(&current, committed_discard, observed, sizeof(observed)))
 		return false;
 	return memcmp(expected, observed, sizeof(expected)) == 0
 		   && cluster_grd_lookup_master_gen(&message->ax_resid, &generation) == current_master
 		   && generation == local_generation;
+}
+
+static bool
+ko_shared_v3_control_at_generation(const ClusterKoSharedMessageV3 *message, uint64 local_generation)
+{
+	return ko_shared_object_control_at_generation(message, local_generation, false);
 }
 
 static bool
@@ -1472,12 +1526,13 @@ cluster_ko_pi_storage_identity_v3(const ClusterSpaceIdentityKey *key,
 /* Recheck both at admission and at the original physical consumer. A
  * REQUEST already in the other inbound ring can outlive its COMMIT marker. */
 static bool
-ko_peer_request_ended_or_conflicts_v3(const ClusterKoSharedMessageV3 *request)
+ko_peer_request_ended_or_conflicts(const ClusterKoSharedMessageV3 *request,
+								 bool committed_discard)
 {
 	uint8 encoded[CLUSTER_KO_SHARED_V3_BYTES];
 	bool refused = false;
 
-	if (!cluster_ko_shared_encode_v3(request, encoded, sizeof(encoded)))
+	if (!ko_shared_object_encode(request, committed_discard, encoded, sizeof(encoded)))
 		return true;
 	SpinLockAcquire(&ko_state->shared_lock);
 	refused = ko_drop_closed_locked(request->base.key.locator);
@@ -1495,18 +1550,24 @@ ko_peer_request_ended_or_conflicts_v3(const ClusterKoSharedMessageV3 *request)
 	return refused;
 }
 
+static bool
+ko_peer_request_ended_or_conflicts_v3(const ClusterKoSharedMessageV3 *request)
+{
+	return ko_peer_request_ended_or_conflicts(request, false);
+}
+
 /* The LMON handler publishes one exact physical owner before the SPSC slot is
  * visible.  A retry which arrives after the slot is consumed must not create a
  * second flush/drop attempt; the original SI owner is responsible for either
  * the READY ACK or the existing fail-closed timeout. */
 static bool
-ko_peer_fence_physical_owned_v3(const ClusterKoSharedMessageV3 *request)
+ko_peer_fence_physical_owned(const ClusterKoSharedMessageV3 *request, bool committed_discard)
 {
 	uint8 encoded[CLUSTER_KO_SHARED_V3_BYTES];
 	bool owned = false;
 
 	if (ko_state == NULL || request == NULL
-		|| !cluster_ko_shared_encode_v3(request, encoded, sizeof(encoded)))
+		|| !ko_shared_object_encode(request, committed_discard, encoded, sizeof(encoded)))
 		return true;
 	SpinLockAcquire(&ko_state->shared_lock);
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
@@ -1528,14 +1589,14 @@ ko_peer_fence_physical_owned_v3(const ClusterKoSharedMessageV3 *request)
 }
 
 static bool
-ko_peer_fence_mark_physical_started_v3(const ClusterKoSharedMessageV3 *request,
-									   ClusterKoPeerFenceHandleV3 *handle)
+ko_peer_fence_mark_physical_started(const ClusterKoSharedMessageV3 *request,
+									   ClusterKoPeerFenceHandleV3 *handle, bool committed_discard)
 {
 	uint8 encoded[CLUSTER_KO_SHARED_V3_BYTES];
 	bool marked = false;
 
 	if (ko_state == NULL || request == NULL
-		|| !cluster_ko_shared_encode_v3(request, encoded, sizeof(encoded)))
+		|| !ko_shared_object_encode(request, committed_discard, encoded, sizeof(encoded)))
 		return false;
 	SpinLockAcquire(&ko_state->shared_lock);
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
@@ -1557,6 +1618,13 @@ ko_peer_fence_mark_physical_started_v3(const ClusterKoSharedMessageV3 *request,
 	}
 	SpinLockRelease(&ko_state->shared_lock);
 	return marked;
+}
+
+static bool
+ko_peer_fence_mark_physical_started_v3(const ClusterKoSharedMessageV3 *request,
+									 ClusterKoPeerFenceHandleV3 *handle)
+{
+	return ko_peer_fence_mark_physical_started(request, handle, false);
 }
 
 static bool
@@ -2457,10 +2525,10 @@ cluster_ko_extend_end_v3(uint64 serial)
 	return retired;
 }
 
-bool
-cluster_ko_peer_fence_begin_v3(const ClusterKoSharedMessageV3 *request,
+static bool
+ko_peer_fence_begin(const ClusterKoSharedMessageV3 *request,
 							 ClusterKoPeerFenceHandleV3 *handle,
-							 ClusterKoPeerFenceStateV3 *state)
+							 ClusterKoPeerFenceStateV3 *state, bool committed_discard)
 {
 	uint8 encoded[CLUSTER_KO_SHARED_V3_BYTES];
 	uint64 peer_route_generation;
@@ -2473,8 +2541,8 @@ cluster_ko_peer_fence_begin_v3(const ClusterKoSharedMessageV3 *request,
 		|| request->base.peer_node != cluster_node_id
 		|| cluster_grd_lookup_master_gen(&request->ax_resid, &peer_route_generation)
 			   != request->ax_master_node
-		|| !ko_shared_v3_control_at_generation(request, peer_route_generation)
-		|| !cluster_ko_shared_encode_v3(request, encoded, sizeof(encoded)))
+		|| !ko_shared_object_control_at_generation(request, peer_route_generation, committed_discard)
+		|| !ko_shared_object_encode(request, committed_discard, encoded, sizeof(encoded)))
 		return false;
 	SpinLockAcquire(&ko_state->shared_lock);
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
@@ -2505,6 +2573,7 @@ cluster_ko_peer_fence_begin_v3(const ClusterKoSharedMessageV3 *request,
 
 		memset(entry, 0, sizeof(*entry));
 		entry->request = *request;
+		entry->committed_discard = committed_discard;
 		entry->peer_route_generation = peer_route_generation;
 		memcpy(entry->encoded, encoded, sizeof(encoded));
 		entry->serial = ++ko_state->peer_fence_serial;
@@ -2520,6 +2589,14 @@ cluster_ko_peer_fence_begin_v3(const ClusterKoSharedMessageV3 *request,
  done:
 	SpinLockRelease(&ko_state->shared_lock);
 	return ok;
+}
+
+bool
+cluster_ko_peer_fence_begin_v3(const ClusterKoSharedMessageV3 *request,
+							 ClusterKoPeerFenceHandleV3 *handle,
+							 ClusterKoPeerFenceStateV3 *state)
+{
+	return ko_peer_fence_begin(request, handle, state, false);
 }
 
 /* Query state shares the exact peer slot, but cannot advance its drain or
@@ -3022,9 +3099,13 @@ ko_peer_fence_local_ready_tick_v3(void)
 		if (failed) {
 			request.base.verb = CLUSTER_KO_SHARED_ACK;
 			request.base.status = CLUSTER_KO_SHARED_FAILED;
-			(void)ko_shared_enqueue_v3(&request, route_generation);
+			(void)ko_shared_enqueue_object(&request, route_generation, before.committed_discard);
 			continue;
 		}
+		/* PKO4 remains owned until its committed-discard consumer is ready.
+		 * Never execute the live-object flush/PI proof for this purpose. */
+		if (before.committed_discard)
+			continue;
 		ko_peer_attempt = handle;
 		ko_peer_attempt_active = true;
 
@@ -5898,9 +5979,11 @@ ko_shared_enqueue(const ClusterKoSharedMessageV2 *message)
  * operation must agree; a queued frame cannot create a peer owner. */
 static bool
 ko_peer_reply_matches_locked(const ClusterKoPeerFenceV3 *entry,
-							const ClusterKoSharedMessageV3 *message, uint64 local_generation)
+							const ClusterKoSharedMessageV3 *message, uint64 local_generation,
+							 bool committed_discard)
 {
-	if (entry->serial == 0 || entry->peer_route_generation != local_generation
+	if (entry->committed_discard != committed_discard || entry->serial == 0
+		|| entry->peer_route_generation != local_generation
 		|| !cluster_ko_shared_result_matches_v3(&entry->request, message))
 		return false;
 	if (message->base.status == CLUSTER_KO_SHARED_FAILED)
@@ -5913,14 +5996,15 @@ ko_peer_reply_matches_locked(const ClusterKoPeerFenceV3 *entry,
 }
 
 static bool
-ko_shared_enqueue_v3(const ClusterKoSharedMessageV3 *message, uint64 local_generation)
+ko_shared_enqueue_object(const ClusterKoSharedMessageV3 *message, uint64 local_generation,
+							 bool committed_discard)
 {
 	bool accepted = false;
 	uint8 bytes[CLUSTER_KO_SHARED_V3_BYTES];
 	ClusterKoPeerFenceV3 *reply_owner = NULL;
 
 	if (ko_state == NULL || local_generation == 0 || local_generation == UINT64_MAX
-		|| !cluster_ko_shared_encode_v3(message, bytes, sizeof(bytes)))
+		|| !ko_shared_object_encode(message, committed_discard, bytes, sizeof(bytes)))
 		return false;
 	SpinLockAcquire(&ko_state->shared_lock);
 	if (message->base.verb == CLUSTER_KO_SHARED_ACK) {
@@ -5929,7 +6013,7 @@ ko_shared_enqueue_v3(const ClusterKoSharedMessageV3 *message, uint64 local_gener
 
 			if (entry->reply_state == KO_PEER_REPLY_NONE && !entry->ack_queued
 				&& !entry->failure_queued
-				&& ko_peer_reply_matches_locked(entry, message, local_generation)) {
+				&& ko_peer_reply_matches_locked(entry, message, local_generation, committed_discard)) {
 				reply_owner = entry;
 				break;
 			}
@@ -5941,6 +6025,7 @@ ko_shared_enqueue_v3(const ClusterKoSharedMessageV3 *message, uint64 local_gener
 			= (ko_state->send_v3_head + ko_state->send_v3_count) % CLUSTER_KO_SHARED_CAPACITY;
 		ko_state->send_v3[tail] = *message;
 		ko_state->send_v3_route_generation[tail] = local_generation;
+		ko_state->send_committed_discard[tail] = committed_discard;
 		ko_state->send_v3_count++;
 		/* Publish ownership with the queue slot, before LMON can consume it. */
 		if (reply_owner != NULL) {
@@ -5957,7 +6042,14 @@ ko_shared_enqueue_v3(const ClusterKoSharedMessageV3 *message, uint64 local_gener
 }
 
 static bool
+ko_shared_enqueue_v3(const ClusterKoSharedMessageV3 *message, uint64 local_generation)
+{
+	return ko_shared_enqueue_object(message, local_generation, false);
+}
+
+static bool
 ko_peer_reply_send_begin(const ClusterKoSharedMessageV3 *message, uint64 local_generation,
+						 bool committed_discard,
 						ClusterKoPeerFenceHandleV3 *handle)
 {
 	bool owned = false;
@@ -5969,7 +6061,7 @@ ko_peer_reply_send_begin(const ClusterKoSharedMessageV3 *message, uint64 local_g
 		if (entry->reply_state != KO_PEER_REPLY_QUEUED
 			|| !(message->base.status == CLUSTER_KO_SHARED_DONE ? entry->ack_queued
 																 : entry->failure_queued)
-			|| !ko_peer_reply_matches_locked(entry, message, local_generation))
+			|| !ko_peer_reply_matches_locked(entry, message, local_generation, committed_discard))
 			continue;
 		handle->slot = i;
 		handle->serial = entry->serial;
@@ -5983,6 +6075,7 @@ ko_peer_reply_send_begin(const ClusterKoSharedMessageV3 *message, uint64 local_g
 
 static void
 ko_peer_reply_send_finish(const ClusterKoSharedMessageV3 *message, uint64 local_generation,
+						 bool committed_discard,
 						 const ClusterKoPeerFenceHandleV3 *handle, KoPeerReplyState state)
 {
 	ClusterKoPeerFenceV3 *entry;
@@ -5990,38 +6083,41 @@ ko_peer_reply_send_finish(const ClusterKoSharedMessageV3 *message, uint64 local_
 	SpinLockAcquire(&ko_state->shared_lock);
 	entry = &ko_state->peer_fences[handle->slot];
 	if (entry->serial == handle->serial && entry->reply_state == KO_PEER_REPLY_SENDING
-		&& ko_peer_reply_matches_locked(entry, message, local_generation))
+		&& ko_peer_reply_matches_locked(entry, message, local_generation, committed_discard))
 		entry->reply_state = state;
 	SpinLockRelease(&ko_state->shared_lock);
 }
 
 static ClusterICSendResult
-ko_peer_reply_send(const ClusterKoSharedMessageV3 *message, uint64 local_generation)
+ko_peer_reply_send(const ClusterKoSharedMessageV3 *message, uint64 local_generation,
+							 bool committed_discard)
 {
 	ClusterKoPeerFenceHandleV3 handle;
 	volatile ClusterICSendResult result = CLUSTER_IC_SEND_HARD_ERROR;
 	uint8 bytes[CLUSTER_KO_SHARED_V3_BYTES];
 
-	if (!ko_peer_reply_send_begin(message, local_generation, &handle))
+	if (!ko_peer_reply_send_begin(message, local_generation, committed_discard, &handle))
 		return result;
 	PG_TRY();
 	{
-		if (ko_shared_v3_control_at_generation(message, local_generation)
-			&& cluster_ko_shared_encode_v3(message, bytes, sizeof(bytes))) {
+		if (ko_shared_object_control_at_generation(message, local_generation, committed_discard)
+			&& ko_shared_object_encode(message, committed_discard, bytes, sizeof(bytes))) {
 			result = cluster_ic_send_envelope(PGRAC_IC_MSG_KO_FLUSH_ACK,
 											  message->base.origin_node, bytes, sizeof(bytes));
-			ko_peer_reply_send_finish(message, local_generation, &handle,
+			ko_peer_reply_send_finish(message, local_generation, committed_discard, &handle,
 				result == CLUSTER_IC_SEND_NOT_ADMITTED ? KO_PEER_REPLY_QUEUED
 				: (result == CLUSTER_IC_SEND_DONE || result == CLUSTER_IC_SEND_WOULD_BLOCK)
 					? KO_PEER_REPLY_TRANSPORT_OWNED : KO_PEER_REPLY_UNKNOWN);
 		} else
-			ko_peer_reply_send_finish(message, local_generation, &handle, KO_PEER_REPLY_REJECTED);
+			ko_peer_reply_send_finish(message, local_generation, committed_discard, &handle,
+									 KO_PEER_REPLY_REJECTED);
 	}
 	PG_CATCH();
 	{
 		/* The original slot survives ERROR, but an uncertain send is not
 		 * retried or reclaimed as a passive fence by a later owner tick. */
-		ko_peer_reply_send_finish(message, local_generation, &handle, KO_PEER_REPLY_UNKNOWN);
+		ko_peer_reply_send_finish(message, local_generation, committed_discard, &handle,
+								 KO_PEER_REPLY_UNKNOWN);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -6059,7 +6155,7 @@ ko_shared_request_owned(const ClusterKoSharedMessageV2 *message)
 }
 
 static bool
-ko_shared_v3_request_claim(const ClusterKoSharedMessageV3 *message)
+ko_shared_object_request_claim(const ClusterKoSharedMessageV3 *message, bool committed_discard)
 {
 	ClusterKoSharedMessageV3 ack = *message;
 	bool owned = false;
@@ -6072,7 +6168,8 @@ ko_shared_v3_request_claim(const ClusterKoSharedMessageV3 *message)
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
 		ClusterKoSharedContext *entry = &ko_state->contexts[i];
 		ClusterKoSharedMessageV3 expected;
-		if (!entry->used || !entry->v3 || entry->complete || entry->origin_detached
+		if (!entry->used || !entry->v3 || entry->committed_discard != committed_discard
+			|| entry->complete || entry->origin_detached
 			|| entry->request_v3.base.batch_id != message->base.batch_id
 			|| message->base.peer_node >= CLUSTER_KO_SHARED_NODE_LIMIT
 			|| ((entry->request_sent_peers | entry->request_uncertain_peers)
@@ -6093,6 +6190,12 @@ ko_shared_v3_request_claim(const ClusterKoSharedMessageV3 *message)
 	return owned;
 }
 
+static bool
+ko_shared_v3_request_claim(const ClusterKoSharedMessageV3 *message)
+{
+	return ko_shared_object_request_claim(message, false);
+}
+
 /* DONE and WOULD_BLOCK transfer the exact frame to transport. An ambiguous
  * hard error must not retry it on another carrier. Neither result is READY. */
 typedef enum KoSendOwnership {
@@ -6102,7 +6205,8 @@ typedef enum KoSendOwnership {
 } KoSendOwnership;
 
 static void
-ko_shared_v3_record_ownership(const ClusterKoSharedMessageV3 *message, KoSendOwnership ownership)
+ko_shared_object_record_ownership(const ClusterKoSharedMessageV3 *message, KoSendOwnership ownership,
+								 bool committed_discard)
 {
 	ClusterKoSharedMessageV3 ack = *message;
 
@@ -6116,7 +6220,8 @@ ko_shared_v3_record_ownership(const ClusterKoSharedMessageV3 *message, KoSendOwn
 		ClusterKoSharedContext *entry = &ko_state->contexts[i];
 		ClusterKoSharedMessageV3 expected;
 
-		if (!entry->used || !entry->v3 || entry->request_v3.base.batch_id != message->base.batch_id)
+		if (!entry->used || !entry->v3 || entry->committed_discard != committed_discard
+			|| entry->request_v3.base.batch_id != message->base.batch_id)
 			continue;
 		expected = entry->request_v3;
 		expected.base.peer_node = message->base.peer_node;
@@ -6135,6 +6240,12 @@ ko_shared_v3_record_ownership(const ClusterKoSharedMessageV3 *message, KoSendOwn
 		break;
 	}
 	SpinLockRelease(&ko_state->shared_lock);
+}
+
+static void
+ko_shared_v3_record_ownership(const ClusterKoSharedMessageV3 *message, KoSendOwnership ownership)
+{
+	ko_shared_object_record_ownership(message, ownership, false);
 }
 
 static void
@@ -6491,6 +6602,7 @@ cluster_ko_lmon_tick_v2(void)
 	for (unsigned n = 0; n < attempts; n++) {
 		ClusterKoSharedMessageV3 message;
 		uint64 local_generation;
+		bool committed_discard;
 		uint8 bytes[CLUSTER_KO_SHARED_V3_BYTES];
 		ClusterICSendResult result = CLUSTER_IC_SEND_HARD_ERROR;
 		bool pending;
@@ -6500,15 +6612,17 @@ cluster_ko_lmon_tick_v2(void)
 		if (pending) {
 			message = ko_state->send_v3[ko_state->send_v3_head];
 			local_generation = ko_state->send_v3_route_generation[ko_state->send_v3_head];
+			committed_discard = ko_state->send_committed_discard[ko_state->send_v3_head];
 		}
 		SpinLockRelease(&ko_state->shared_lock);
 		if (!pending)
 			break;
 		if (message.base.verb == CLUSTER_KO_SHARED_ACK)
-			result = ko_peer_reply_send(&message, local_generation);
-		else if (ko_shared_v3_control_at_generation(&message, local_generation)
-				 && cluster_ko_shared_encode_v3(&message, bytes, sizeof(bytes))
-				 && ko_shared_v3_request_claim(&message)) {
+			result = ko_peer_reply_send(&message, local_generation, committed_discard);
+		else if (ko_shared_object_control_at_generation(&message, local_generation, committed_discard)
+				 && ko_shared_object_encode(&message, committed_discard, bytes, sizeof(bytes))
+				 && (committed_discard ? ko_shared_object_request_claim(&message, true)
+									  : ko_shared_v3_request_claim(&message))) {
 			volatile ClusterICSendResult sent = CLUSTER_IC_SEND_HARD_ERROR;
 			PG_TRY();
 			{
@@ -6517,12 +6631,15 @@ cluster_ko_lmon_tick_v2(void)
 			}
 			PG_FINALLY();
 			{
-				ko_shared_v3_record_ownership(&message, sent == CLUSTER_IC_SEND_NOT_ADMITTED
-															? KO_SEND_CALLER_OWNED
-														: (sent == CLUSTER_IC_SEND_DONE
-														   || sent == CLUSTER_IC_SEND_WOULD_BLOCK)
-															? KO_SEND_TRANSPORT_OWNED
-															: KO_SEND_UNKNOWN);
+				KoSendOwnership ownership
+					= sent == CLUSTER_IC_SEND_NOT_ADMITTED ? KO_SEND_CALLER_OWNED
+					  : (sent == CLUSTER_IC_SEND_DONE || sent == CLUSTER_IC_SEND_WOULD_BLOCK)
+						  ? KO_SEND_TRANSPORT_OWNED : KO_SEND_UNKNOWN;
+
+				if (committed_discard)
+					ko_shared_object_record_ownership(&message, ownership, true);
+				else
+					ko_shared_v3_record_ownership(&message, ownership);
 			}
 			PG_END_TRY();
 			result = sent;
@@ -6538,6 +6655,7 @@ cluster_ko_lmon_tick_v2(void)
 				= (ko_state->send_v3_head + ko_state->send_v3_count) % CLUSTER_KO_SHARED_CAPACITY;
 			ko_state->send_v3[tail] = message;
 			ko_state->send_v3_route_generation[tail] = local_generation;
+			ko_state->send_committed_discard[tail] = committed_discard;
 			ko_state->send_v3_count++;
 		}
 		SpinLockRelease(&ko_state->shared_lock);
@@ -7698,13 +7816,14 @@ cluster_ko_flush_request_handler(const ClusterICEnvelope *env, const void *paylo
 	uint64 peer_route_generation = 0;
 	uint32 head, tail, next;
 	bool shared = cluster_shared_config;
-	bool v3 = false;
+	bool v3 = false, committed_discard = false;
 
 	if (ko_state == NULL || env == NULL || payload == NULL)
 		return;
 	if (shared) {
 		if (env->payload_length == CLUSTER_KO_SHARED_V3_BYTES) {
-			if (!cluster_ko_shared_decode_v3(payload, env->payload_length, &qualified_v3)
+			if (!ko_shared_object_decode(payload, env->payload_length, &qualified_v3,
+									 &committed_discard)
 				|| qualified_v3.base.verb != CLUSTER_KO_SHARED_REQUEST
 				|| qualified_v3.base.peer_node != cluster_node_id
 				|| qualified_v3.base.origin_node != env->source_node_id || !AmLmonProcess()
@@ -7715,7 +7834,8 @@ cluster_ko_flush_request_handler(const ClusterICEnvelope *env, const void *paylo
 				|| ingress.source_node != qualified_v3.base.origin_node
 				|| cluster_grd_lookup_master_gen(&qualified_v3.ax_resid, &peer_route_generation)
 					   != qualified_v3.ax_master_node
-				|| !ko_shared_v3_control_at_generation(&qualified_v3, peer_route_generation))
+				|| !ko_shared_object_control_at_generation(&qualified_v3, peer_route_generation,
+													  committed_discard))
 				return;
 			v3 = true;
 			legacy.batch_id = qualified_v3.base.batch_id;
@@ -7751,7 +7871,8 @@ cluster_ko_flush_request_handler(const ClusterICEnvelope *env, const void *paylo
 	 * Existing ACK completion still follows its original exact wait entry. */
 	if (!cluster_normal_stop_service_new_work(true))
 		return;
-	if (v3 && ko_peer_request_ended_or_conflicts_v3(&qualified_v3))
+	if (v3 && (committed_discard ? ko_peer_request_ended_or_conflicts(&qualified_v3, true)
+								  : ko_peer_request_ended_or_conflicts_v3(&qualified_v3)))
 		return;
 	/* SPSC enqueue (LMON is the only producer). */
 	tail = pg_atomic_read_u32(&ko_state->inbound_tail);
@@ -7774,6 +7895,7 @@ cluster_ko_flush_request_handler(const ClusterICEnvelope *env, const void *paylo
 			const ClusterKoInboundSlot *queued = &ko_state->inbound[scan];
 
 			if (queued->shared && queued->v3
+				&& queued->committed_discard == committed_discard
 				&& memcmp(&queued->qualified_v3, &qualified_v3, sizeof(qualified_v3)) == 0)
 				return;
 			scan = (scan + 1) % CLUSTER_KO_INBOUND_CAPACITY;
@@ -7784,14 +7906,15 @@ cluster_ko_flush_request_handler(const ClusterICEnvelope *env, const void *paylo
 			ClusterKoPeerFenceHandleV3 handle;
 			ClusterKoPeerFenceStateV3 state;
 
-			if (!cluster_ko_peer_fence_begin_v3(&qualified_v3, &handle, &state)
+			if (!ko_peer_fence_begin(&qualified_v3, &handle, &state, committed_discard)
 				|| (state != CLUSTER_KO_PEER_FENCE_ACTIVE && state != CLUSTER_KO_PEER_FENCE_READY)
-				|| ko_peer_fence_physical_owned_v3(&qualified_v3))
+				|| ko_peer_fence_physical_owned(&qualified_v3, committed_discard))
 				return;
 		}
 	}
 	ko_state->inbound[tail].shared = shared;
 	ko_state->inbound[tail].v3 = v3;
+	ko_state->inbound[tail].committed_discard = committed_discard;
 	ko_state->inbound[tail].qualified = qualified;
 	ko_state->inbound[tail].qualified_v3 = qualified_v3;
 	ko_state->inbound[tail].ingress = ingress;
@@ -7828,20 +7951,23 @@ cluster_ko_flush_ack_handler(const ClusterICEnvelope *env, const void *payload)
 	if (cluster_shared_config) {
 		if (env->payload_length == CLUSTER_KO_SHARED_V3_BYTES) {
 			ClusterKoSharedMessageV3 ack;
-			bool matched = false;
+			bool matched = false, committed_discard = false;
 
-			if (!cluster_ko_shared_decode_v3(payload, env->payload_length, &ack)
+			if (!ko_shared_object_decode(payload, env->payload_length, &ack, &committed_discard)
 				|| ack.base.verb != CLUSTER_KO_SHARED_ACK
 				|| (ack.base.status != CLUSTER_KO_SHARED_DONE
 					&& ack.base.status != CLUSTER_KO_SHARED_FAILED)
 				|| ack.base.origin_node != cluster_node_id
-				|| ack.base.peer_node != env->source_node_id || !ko_shared_v3_control_current(&ack))
+				|| ack.base.peer_node != env->source_node_id
+				|| !ko_shared_object_control_at_generation(&ack, ack.ax_master_generation,
+														 committed_discard))
 				return;
 			SpinLockAcquire(&ko_state->shared_lock);
 			for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
 				ClusterKoSharedContext *entry = &ko_state->contexts[i];
 				ClusterKoSharedMessageV3 expected;
 				if (!entry->used || !entry->v3
+					|| entry->committed_discard != committed_discard
 					|| entry->request_v3.base.batch_id != ack.base.batch_id
 					|| ((entry->request_sent_peers | entry->request_uncertain_peers)
 						& (1u << ack.base.peer_node))
@@ -7944,7 +8070,7 @@ cluster_ko_drain_inbound_and_apply(void)
 		pg_read_barrier();
 		slot = ko_state->inbound[head]; /* copy before publishing consumer progress */
 		if (slot.shared && slot.v3
-			&& ko_peer_request_ended_or_conflicts_v3(&slot.qualified_v3)) {
+			&& ko_peer_request_ended_or_conflicts(&slot.qualified_v3, slot.committed_discard)) {
 			head = (head + 1) % CLUSTER_KO_INBOUND_CAPACITY;
 			pg_atomic_write_u32(&ko_state->inbound_head, head);
 			goto next;
@@ -7953,7 +8079,8 @@ cluster_ko_drain_inbound_and_apply(void)
 		 * terminal-reference proof is still pending. This is the existing ring's
 		 * REQUEST -> READY continuation: later requests are not acknowledged out
 		 * of order, and no identity read or synthetic ACK is introduced. */
-		if (slot.shared && slot.v3 && slot.epoch == cluster_epoch_get_current()
+		if (slot.shared && slot.v3 && !slot.committed_discard
+			&& slot.epoch == cluster_epoch_get_current()
 			&& slot.shared == cluster_shared_config
 			&& ko_shared_v3_control_at_generation(&slot.qualified_v3, slot.peer_route_generation)
 			&& !cluster_ctrc_relation_removal_ready_shared(
@@ -7965,7 +8092,9 @@ cluster_ko_drain_inbound_and_apply(void)
 			return;
 		}
 		if (slot.shared && slot.v3) {
-			if (!ko_peer_fence_mark_physical_started_v3(&slot.qualified_v3, &ko_peer_attempt)) {
+			if (!(slot.committed_discard
+				  ? ko_peer_fence_mark_physical_started(&slot.qualified_v3, &ko_peer_attempt, true)
+				  : ko_peer_fence_mark_physical_started_v3(&slot.qualified_v3, &ko_peer_attempt))) {
 				head = (head + 1) % CLUSTER_KO_INBOUND_CAPACITY;
 				pg_atomic_write_u32(&ko_state->inbound_head, head);
 				goto next;

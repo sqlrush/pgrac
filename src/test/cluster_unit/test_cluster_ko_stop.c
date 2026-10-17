@@ -58,6 +58,8 @@ cluster_ic_dispatch_control_ingress(const ClusterICEnvelope *env, ClusterICContr
 
 static bool marker_capable = true, v3_local_ax, drive_v3_ack, marker_error;
 static bool drive_v3_failure;
+static uint32 object_wire_missing_capabilities;
+static ClusterICSendResult (*object_wire_send_hook)(uint8, int32, const void *, uint32);
 static bool fixture_recovering;
 static int failed_reply_count;
 static ClusterGrdHolderId v3_local_holder;
@@ -742,9 +744,13 @@ cluster_sf_peer_capability_word_sample(int32 peer_id, uint32 required, uint32 *w
 			   || required == PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3
 			   || required
 					  == (PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3
-						  | PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1)));
-	if ((required & PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3) != 0) {
+						  | PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1)
+			   || required == (PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1
+							   | PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1)));
+	if ((required & (PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3
+					 | PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1)) != 0) {
 		*word = marker_capable ? required : required & ~PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1;
+		*word &= ~object_wire_missing_capabilities;
 		*generation = v3_route_live ? 19 : 0;
 		return v3_route_live;
 	}
@@ -786,6 +792,8 @@ cluster_ic_send_envelope(uint8 type, int32 dest, const void *bytes, uint32 lengt
 {
 	ClusterKoSharedMessageV2 m;
 	Assert(SpinLockFree(&storage.shared_lock));
+	if (object_wire_send_hook != NULL)
+		return object_wire_send_hook(type, dest, bytes, length);
 	if (drive_v3_ack && length == CLUSTER_KO_SHARED_V3_BYTES) {
 		Assert(dest == 1 && type == PGRAC_IC_MSG_KO_FLUSH);
 		UT_ASSERT(cluster_ko_shared_decode_v3(bytes, length, &sent_v3_request));
@@ -1345,6 +1353,8 @@ reset_test(void)
 	Assert(native_allocated == 0);
 	Assert(!ko_peer_attempt_active);
 	drive_v3_failure = false;
+	object_wire_missing_capabilities = 0;
+	object_wire_send_hook = NULL;
 	buffer_drain_result = CLUSTER_BUFFER_DRAIN_EMPTY;
 	buffer_drain_calls = buffer_drain_input = 0;
 	buffer_drain_drop_only = false;
