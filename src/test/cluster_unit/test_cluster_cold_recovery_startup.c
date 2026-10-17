@@ -1765,10 +1765,259 @@ UT_TEST(test_compound_final_rebinds_scope_and_rejects_failure_stickily)
 	}
 }
 
+static ClusterColdTypedV1 *
+c0_fixture(ClusterColdRecordV1 *record, uint32 target)
+{
+	ClusterColdTypedV1 *typed = control_fixture(record);
+	RfSideOnlineOperationV1 *op = &side_fixture[1].operations[1];
+	ClusterRecoveryTTAbortV1 *c0 = &op->recovery_abort;
+	side_record_fixture(record, RM_CLUSTER_UNDO_ID, XLOG_UNDO_RECOVERY_TT_ABORT,
+						RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT);
+	c0_mode = c0_target_borrow = c0_target_current = c0_target_cover = true;
+	c0_calls = c0_fault = 0;
+	c0_duty = roots[3].identity;
+	c0_root = roots[3];
+	c0_token = tokens[3];
+	c0_serial = control_serial;
+	op->recovery_target_source = target;
+	op->purpose = RF_SIDE_PLAN_RECOVERY;
+	c0->version = 1;
+	c0->length = CLUSTER_RECOVERY_TT_ABORT_BYTES;
+	c0->flags = CLUSTER_RECOVERY_TT_ABORT_TOP_KNOWN;
+	c0->writer_thread = 2;
+	c0->writer_incarnation = 12;
+	c0->target_thread = target + 1;
+	c0->target_incarnation = target + 11;
+	c0->recovery_serial = 3;
+	c0->target_epoch = 4;
+	c0->target_full_xid = c0->top_full_xid = UINT64_C(0x700400102);
+	memcpy(c0->target_claim_sha256, typed->sources[target].claim.claim_sha256, 32);
+	c0->exact = (xl_undo_tt_slot_abort_exact){ .segment_id = target * 256 + 1,
+											   .xid = 0x400102,
+											   .slot_offset = 5,
+											   .wrap = 9,
+											   .instance = target + 1,
+											   .format_version = 1 };
+	c0->before.xid = c0->exact.xid;
+	c0->before.wrap = 9;
+	c0->before.status = TT_SLOT_ACTIVE;
+	UT_ASSERT(cluster_recovery_tt_abort_valid_v1(c0));
+	return typed;
+}
+
+UT_TEST(test_c0_dispatch_binds_writer_and_target_separately)
+{
+	for (uint32 target = 1; target <= 2; target++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = c0_fixture(&record, target);
+		UT_ASSERT(consume_control(typed, &record));
+		UT_ASSERT_EQ(c0_calls, 1);
+		UT_ASSERT_EQ(control_init_calls, 0);
+		UT_ASSERT_EQ(control_calls, 0);
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_c0_dispatch_target_does_not_borrow_its_side_plan)
+{
+	ClusterColdRecordV1 record;
+	ClusterColdTypedV1 *typed = c0_fixture(&record, 2);
+	RfSideOnlinePlanV1 *saved = typed->side_plans[2];
+	typed->side_plans[2] = NULL;
+	typed->side_capture_detail[2] = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	UT_ASSERT(consume_control(typed, &record));
+	UT_ASSERT_EQ(c0_calls, 1);
+	UT_ASSERT_EQ(control_init_calls, 0);
+	typed->side_plans[2] = saved;
+	cluster_cold_replay_window_leave_v1();
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
+UT_TEST(test_c0_dispatch_requires_full_bound_source_set)
+{
+	for (int fault = 0; fault < 13; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = c0_fixture(&record, 2);
+		ClusterWalSourceRef *target = &side_fixture[1].sources[2];
+		switch (fault) {
+		case 0:
+			side_fixture[1].sources[1].claim.claim_sha256[31]++;
+			break;
+		case 1:
+			target->claim.claim_sha256[31]++;
+			break;
+		case 2:
+			target->claim.database_incarnation++;
+			break;
+		case 3:
+			target->claim.max_config_generation++;
+			break;
+		case 4:
+			target->timeline++;
+			break;
+		case 5:
+			target->claim.identity.authority_uuid[15]++;
+			break;
+		case 6:
+			target->claim.identity.origin_owner_incarnation++;
+			break;
+		case 7:
+			side_fixture[1].operations[1].recovery_target_source = 0;
+			break;
+		case 8:
+			side_fixture[1].source_count = 2;
+			break;
+		case 9:
+			side_fixture[1].sealed = false;
+			break;
+		case 10:
+			typed->sources[3] = typed->sources[2];
+			typed->participant_count++;
+			break;
+		case 11:
+			/* A retained history ref is not a current mutation authority. */
+			typed->sources[3] = *target;
+			typed->sources[3].claim.identity.origin_owner_incarnation--;
+			*target = typed->sources[3];
+			typed->participant_count++;
+			break;
+		case 12:
+			side_fixture[1].bound = false;
+			break;
+		}
+		UT_ASSERT(!consume_control(typed, &record));
+		UT_ASSERT_EQ(c0_calls, 0);
+		UT_ASSERT_EQ(control_calls, 0);
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SIDE_OWNER_MISSING);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_c0_dispatch_requires_target_current_authority)
+{
+	for (int fault = 0; fault < 9; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = c0_fixture(&record, 2);
+		switch (fault) {
+		case 0:
+			c0_target_borrow = false;
+			break;
+		case 1:
+			c0_target_current = false;
+			break;
+		case 2:
+			c0_target_cover = false;
+			break;
+		case 3:
+			c0_serial.mode = CLUSTER_RECOVERY_SERIAL_ONLINE;
+			break;
+		case 4:
+			c0_token.file_txn_seq++;
+			break;
+		case 5:
+			c0_root.validated_tail_lsn_exclusive++;
+			break;
+		case 6:
+			cluster_cold_replay_window_leave_v1();
+			break;
+		case 7:
+			control_borrow_ok = false;
+			break;
+		case 8:
+			control_epoch = 0;
+			break;
+		}
+		UT_ASSERT(!consume_control(typed, &record));
+		UT_ASSERT_EQ(c0_calls, 0);
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SIDE_OWNER_MISSING);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_c0_dispatch_rejects_uncaptured_or_unowned_records)
+{
+	for (int fault = 0; fault < 8; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = c0_fixture(&record, 2);
+		RfSideOnlineOperationV1 *op = &side_fixture[1].operations[1];
+		switch (fault) {
+		case 0:
+			op->history_only = true;
+			break;
+		case 1:
+			op->identity.record.record_crc++;
+			break;
+		case 2:
+			record.component_count = 1;
+			break;
+		case 3:
+			record.space_count = 1;
+			break;
+		case 4:
+			record.record_flags = CLUSTER_COLD_RECORD_UNSUPPORTED;
+			break;
+		case 5:
+			side_fixture[1].operations[2] = *op;
+			break;
+		case 6:
+			record.info |= XLR_SPECIAL_REL_UPDATE;
+			break;
+		case 7:
+			record.read_rec_ptr = 0x100;
+			break;
+		}
+		UT_ASSERT(!consume_control(typed, &record));
+		UT_ASSERT_EQ(c0_calls, 0);
+		UT_ASSERT_EQ(control_calls, 0);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_c0_dispatch_failure_error_and_final_drift_stay_sticky)
+{
+	for (int fault = 1; fault <= 7; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = c0_fixture(&record, 2);
+		volatile bool accepted = false;
+		volatile bool caught = false;
+		c0_fault = fault;
+		PG_TRY();
+		{
+			accepted = consume_control(typed, &record);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(!accepted);
+		UT_ASSERT_EQ(caught, fault == 2);
+		UT_ASSERT_EQ(c0_calls, 1);
+		UT_ASSERT_EQ(control_init_calls, 0);
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SIDE_OWNER_MISSING);
+		c0_fault = 0;
+		UT_ASSERT(!consume_control(typed, &record));
+		UT_ASSERT_EQ(c0_calls, 1);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(49);
+	UT_PLAN(55);
+	UT_RUN(test_c0_dispatch_binds_writer_and_target_separately);
+	UT_RUN(test_c0_dispatch_target_does_not_borrow_its_side_plan);
+	UT_RUN(test_c0_dispatch_requires_full_bound_source_set);
+	UT_RUN(test_c0_dispatch_requires_target_current_authority);
+	UT_RUN(test_c0_dispatch_rejects_uncaptured_or_unowned_records);
+	UT_RUN(test_c0_dispatch_failure_error_and_final_drift_stay_sticky);
 	UT_RUN(test_side_capture_source_bind_failure_stops_before_scan);
 	UT_RUN(test_compound_dispatch_binds_complete_drop_array);
 	UT_RUN(test_compound_final_rebinds_scope_and_rejects_failure_stickily);

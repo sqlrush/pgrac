@@ -896,6 +896,8 @@ cold_record_side_kind(const ClusterColdRecordV1 *record)
 			&& !(record->rmid == RM_XACT_ID && info == XLOG_XACT_COMMIT && record->space_count > 0
 				 && (record->info & XLR_INFO_MASK) == XLR_SPECIAL_REL_UPDATE)))
 		return RF_SIDE_ONLINE_OPERATION_INVALID;
+	if (record->rmid == RM_CLUSTER_UNDO_ID && info == XLOG_UNDO_RECOVERY_TT_ABORT)
+		return RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT;
 	if (record->rmid == RM_CLUSTER_UNDO_ID
 		&& (info == XLOG_UNDO_BLOCK_WRITE || info == XLOG_UNDO_BLOCK_WRITE_MULTI
 			|| info == XLOG_UNDO_SEGMENT_INIT || info == XLOG_UNDO_SEGMENT_REUSE
@@ -919,6 +921,33 @@ cold_record_side_kind(const ClusterColdRecordV1 *record)
 	return RF_SIDE_ONLINE_OPERATION_INVALID;
 }
 
+/* A target's current authority is independent of its SIDE capture. */
+static bool
+cold_participant_authority(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence,
+						   uint32 participant, ClusterThreadRecoveryAuthorityV1 *authority)
+{
+	const ClusterColdParticipantV1 *source;
+	const ColdRoot *selected;
+	if (fence == NULL || !cluster_cold_replay_window_active_v1() || typed->plan == NULL
+		|| typed->replay_roots == NULL || typed->own_participant != 0 || typed->replay_count == 0
+		|| typed->replay_count > typed->participant_count
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->replay_root_count != typed->replay_count || participant >= typed->replay_count
+		|| participant == typed->own_participant || !cold_replay_sources_current(typed, fence))
+		return false;
+	source = &typed->participants[participant];
+	selected = &typed->replay_roots[participant];
+	return cluster_recovery_merge_fence_plan_authority(fence, source->thread_id, authority)
+		   && authority->duty != NULL && authority->root_snapshot != NULL
+		   && authority->root_token != NULL && authority->serial_guard != NULL
+		   && authority->serial_guard->mode == CLUSTER_RECOVERY_SERIAL_COLD_FORMED
+		   && memcmp(authority->root_snapshot, &selected->root, sizeof(selected->root)) == 0
+		   && memcmp(authority->root_token, &selected->token, sizeof(selected->token)) == 0
+		   && cold_control_authority_current(authority)
+		   && cluster_thread_recovery_authority_covers_window_v1(
+			   authority, source->thread_id, source->physical_lower, source->tail_end);
+}
+
 /* Rebind the same immutable whole-source authority for record execution
  * and for the sequencer's post-drain physical durability check. */
 static bool
@@ -926,18 +955,12 @@ cold_side_source_authority(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *
 						   uint32 participant, ClusterThreadRecoveryAuthorityV1 *authority)
 {
 	const ClusterColdParticipantV1 *source;
-	const ColdRoot *selected;
 	RfContributorStreamCutV1 cut = { 0 };
-	if (fence == NULL || !cluster_cold_replay_window_active_v1() || typed->plan == NULL
-		|| typed->replay_roots == NULL || typed->own_participant != 0 || typed->replay_count == 0
-		|| typed->replay_count > typed->participant_count
-		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
-		|| typed->replay_root_count != typed->replay_count || participant >= typed->replay_count
-		|| participant == typed->own_participant || typed->side_capture_detail[participant] != 0
-		|| typed->side_plans[participant] == NULL || !cold_replay_sources_current(typed, fence))
+	if (participant >= CLUSTER_COLD_MAX_PARTICIPANTS || typed->side_capture_detail[participant] != 0
+		|| typed->side_plans[participant] == NULL
+		|| !cold_participant_authority(typed, fence, participant, authority))
 		return false;
 	source = &typed->participants[participant];
-	selected = &typed->replay_roots[participant];
 	cut.failed_thread = source->thread_id;
 	cut.timeline_id = source->timeline;
 	cut.origin_owner_incarnation = source->owner_incarnation;
@@ -949,16 +972,45 @@ cold_side_source_authority(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *
 												 typed->observer.storage_uuid, &cut)
 		   && rf_side_online_plan_replay_start_matches_v1(
 			   typed->side_plans[participant], source->thread_id, source->owner_incarnation,
-			   typed->observer.database_incarnation, source->native_redo)
-		   && cluster_recovery_merge_fence_plan_authority(fence, source->thread_id, authority)
-		   && authority->duty != NULL && authority->root_snapshot != NULL
-		   && authority->root_token != NULL && authority->serial_guard != NULL
-		   && authority->serial_guard->mode == CLUSTER_RECOVERY_SERIAL_COLD_FORMED
-		   && memcmp(authority->root_snapshot, &selected->root, sizeof(selected->root)) == 0
-		   && memcmp(authority->root_token, &selected->token, sizeof(selected->token)) == 0
-		   && cold_control_authority_current(authority)
-		   && cluster_thread_recovery_authority_covers_window_v1(
-			   authority, source->thread_id, source->physical_lower, source->tail_end);
+			   typed->observer.database_incarnation, source->native_redo);
+}
+
+static bool
+cold_source_ref_matches(const ClusterWalSourceRef *a, const ClusterWalSourceRef *b)
+{
+	return cluster_control_root_identity_equal(&a->claim.identity, &b->claim.identity)
+		   && a->claim.database_incarnation == b->claim.database_incarnation
+		   && a->claim.max_config_generation == b->claim.max_config_generation
+		   && memcmp(a->claim.claim_sha256, b->claim.claim_sha256, 32) == 0
+		   && a->timeline == b->timeline;
+}
+
+static bool
+cold_recovery_abort_record(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence,
+						   uint32 participant, uint32 index,
+						   const RfPageOnlineRecordIdentityV1 *identity,
+						   const ClusterThreadRecoveryAuthorityV1 *writer)
+{
+	const RfSideOnlinePlanV1 *plan = typed->side_plans[participant];
+	ClusterWalSourceRef bound_writer, bound_target;
+	ClusterThreadRecoveryAuthorityV1 target;
+	uint32 match = UINT32_MAX;
+
+	if (!rf_side_online_plan_recovery_abort_sources_v1(plan, index, &bound_writer, &bound_target)
+		|| !cold_source_ref_matches(&bound_writer, &typed->sources[participant]))
+		return false;
+	for (uint32 i = 0; i < typed->participant_count; i++) {
+		if (!cold_source_ref_matches(&bound_target, &typed->sources[i]))
+			continue;
+		if (match != UINT32_MAX)
+			return false;
+		match = i;
+	}
+	/* A history claim or own restart input is not a borrowed current
+	 * mutation authority. Do not substitute a newer generation of the thread. */
+	return match != UINT32_MAX && cold_participant_authority(typed, fence, match, &target)
+		   && cluster_undo_recovery_abort_replay_v1(plan, index, identity, writer, &target)
+		   && cold_control_authority_current(&target);
 }
 
 /* A compound dispatch must retain every originally decoded SPACE payload.
@@ -1057,17 +1109,24 @@ cluster_cold_typed_side_record_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFenc
 		match = i;
 	}
 	epoch = cluster_epoch_get_current();
-	if (match == UINT32_MAX || epoch == 0 || epoch > UINT32_MAX
-		|| !rf_side_online_production_owner_init_v1(
-			&owner, &authority, cold_control_authority_current, (uint32)epoch, true)
-		|| !rf_side_online_production_bind_undo_v1(&owner, &authority))
+	if (match == UINT32_MAX || epoch == 0 || epoch > UINT32_MAX)
 		return false;
-	owner.space_arg = &space;
-	owner.preflight_space = cold_control_space_preflight;
-	owner.apply_space = cold_control_space_not_executed;
-	if (rf_side_online_production_apply_record_v1(plan, match, &identity, &owner)
-			!= RF_PAGE_PROOF_DETAIL_OK
-		|| cluster_epoch_get_current() != epoch || !cold_control_authority_current(&authority)
+	if (kind == RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT) {
+		if (!cold_recovery_abort_record(typed, fence, participant, match, &identity, &authority))
+			return false;
+	} else {
+		if (!rf_side_online_production_owner_init_v1(
+				&owner, &authority, cold_control_authority_current, (uint32)epoch, true)
+			|| !rf_side_online_production_bind_undo_v1(&owner, &authority))
+			return false;
+		owner.space_arg = &space;
+		owner.preflight_space = cold_control_space_preflight;
+		owner.apply_space = cold_control_space_not_executed;
+		if (rf_side_online_production_apply_record_v1(plan, match, &identity, &owner)
+			!= RF_PAGE_PROOF_DETAIL_OK)
+			return false;
+	}
+	if (cluster_epoch_get_current() != epoch || !cold_control_authority_current(&authority)
 		|| !cold_replay_sources_current(typed, fence))
 		return false;
 	typed->refusal = CLUSTER_COLD_OK;

@@ -664,6 +664,12 @@ static ClusterRecoveryDutyKey control_duty;
 static ClusterRecoverySerialGuard control_serial;
 static ClusterControlRootSnapshot control_root;
 static ClusterControlRootReadToken control_token;
+static bool c0_mode, c0_target_borrow, c0_target_current, c0_target_cover;
+static int c0_calls, c0_fault;
+static ClusterRecoveryDutyKey c0_duty;
+static ClusterRecoverySerialGuard c0_serial;
+static ClusterControlRootSnapshot c0_root;
+static ClusterControlRootReadToken c0_token;
 
 uint64
 cluster_epoch_get_current(void)
@@ -676,6 +682,15 @@ cluster_recovery_merge_fence_plan_authority(ClusterRecoveryFencePlan *plan, uint
 											ClusterThreadRecoveryAuthorityV1 *out)
 {
 	memset(out, 0, sizeof(*out));
+	if (c0_mode && thread == 3) {
+		if (!c0_target_borrow || !cluster_recovery_merge_fence_plan_revalidate_nowait(plan))
+			return false;
+		out->duty = &c0_duty;
+		out->root_snapshot = &c0_root;
+		out->root_token = &c0_token;
+		out->serial_guard = &c0_serial;
+		return true;
+	}
 	if (!control_borrow_ok || !cluster_recovery_merge_fence_plan_revalidate_nowait(plan)
 		|| thread != 2)
 		return false;
@@ -690,6 +705,13 @@ ClusterThreadRecoveryAuthorityResultV1
 cluster_thread_recovery_authority_revalidate_nowait_v1(
 	const ClusterThreadRecoveryAuthorityV1 *authority)
 {
+	if (c0_mode && authority != NULL && authority->duty == &c0_duty)
+		return c0_target_current && authority->root_snapshot == &c0_root
+					   && authority->root_token == &c0_token
+					   && authority->serial_guard == &c0_serial
+					   && c0_serial.mode == CLUSTER_RECOVERY_SERIAL_COLD_FORMED
+				   ? CLUSTER_THREAD_AUTHORITY_OK
+				   : CLUSTER_THREAD_AUTHORITY_ROOT_STALE;
 	return control_authority_ok && authority != NULL && authority->duty == &control_duty
 				   && authority->root_snapshot == &control_root
 				   && authority->root_token == &control_token
@@ -704,6 +726,8 @@ cluster_thread_recovery_authority_covers_window_v1(
 	const ClusterThreadRecoveryAuthorityV1 *authority, uint16 thread, XLogRecPtr lower,
 	XLogRecPtr upper)
 {
+	if (c0_mode && authority->duty == &c0_duty)
+		return c0_target_cover && thread == 3 && lower == 0x100 && upper == 0x2000;
 	return control_cover_ok && authority->duty == &control_duty && thread == 2 && lower == 0x100
 		   && upper == 0x2000;
 }
@@ -738,6 +762,58 @@ rf_side_online_plan_operation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 	if (plan == NULL || !plan->sealed || index >= plan->operation_count)
 		return false;
 	*out = plan->operations[index];
+	return true;
+}
+
+/* Captured-plan and IO boundaries only. The real C0 planner and the real
+ * held-FD execution owner have independent tests. */
+bool
+rf_side_online_plan_recovery_abort_sources_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+											  ClusterWalSourceRef *writer,
+											  ClusterWalSourceRef *target)
+{
+	if (!c0_mode || plan == NULL || !plan->sealed || !plan->bound || index >= plan->operation_count
+		|| plan->source_count < 2
+		|| plan->operations[index].kind != RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT
+		|| plan->operations[index].recovery_target_source >= plan->source_count)
+		return false;
+	*writer = plan->sources[1];
+	*target = plan->sources[plan->operations[index].recovery_target_source];
+	return true;
+}
+
+bool
+cluster_undo_recovery_abort_replay_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+									  const RfPageOnlineRecordIdentityV1 *identity,
+									  const ClusterThreadRecoveryAuthorityV1 *writer,
+									  const ClusterThreadRecoveryAuthorityV1 *target)
+{
+	c0_calls++;
+	UT_ASSERT(plan == &side_fixture[1]);
+	UT_ASSERT_EQ(index, 1);
+	UT_ASSERT_EQ(memcmp(identity, &plan->operations[index].identity, sizeof(*identity)), 0);
+	UT_ASSERT(writer->duty == &control_duty);
+	UT_ASSERT(target->duty
+			  == (plan->operations[index].recovery_target_source == 1 ? &control_duty : &c0_duty));
+	UT_ASSERT_EQ(cluster_thread_recovery_authority_revalidate_nowait_v1(writer),
+				 CLUSTER_THREAD_AUTHORITY_OK);
+	UT_ASSERT_EQ(cluster_thread_recovery_authority_revalidate_nowait_v1(target),
+				 CLUSTER_THREAD_AUTHORITY_OK);
+	UT_ASSERT(cluster_cold_replay_window_active_v1());
+	if (c0_fault == 1)
+		return false;
+	if (c0_fault == 2)
+		siglongjmp(*PG_exception_stack, 1);
+	if (c0_fault == 3)
+		control_epoch++;
+	if (c0_fault == 4)
+		c0_target_current = false;
+	if (c0_fault == 5)
+		tokens[3].file_txn_seq++;
+	if (c0_fault == 6)
+		control_authority_ok = false;
+	if (c0_fault == 7)
+		fence_current = false;
 	return true;
 }
 
@@ -825,6 +901,7 @@ static void
 fixture(void)
 {
 	uint16 thread;
+	c0_mode = false;
 	memset(side_fixture, 0, sizeof(side_fixture));
 	side_creates = side_seals = side_destroys = side_fault = 0;
 	side_budget_total = 0;
