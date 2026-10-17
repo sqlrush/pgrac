@@ -531,19 +531,50 @@ side_owner_apply_xact(void *arg, const RfSideOnlineOperationV1 *operation)
 }
 
 static bool
-side_owner_apply_xact_record(void *arg, uint32 index, const RfSideOnlineOperationV1 *operation)
+side_owner_apply_abort_record(RfSideOnlineProductionOwnerV1 *owner, uint32 index,
+							  const RfSideOnlineOperationV1 *operation)
 {
-	RfSideOnlineProductionOwnerV1 *owner = arg;
+	ClusterUndoDecoded aborted;
+	SideUndoHeader *target;
+	RfSideUndoHeaderImageV1 prefix;
+	PGAlignedBlock current;
+
+	if (!side_owner_cold_abort_ready(owner, operation, &aborted))
+		return false;
+	target = side_owner_undo_target(owner, aborted.instance, aborted.segment_id, 0);
+	/* The earlier TT_ABORT must already be installed. This native record may
+	 * only sync and verify that exact prefix, never repair a missing TT step
+	 * or install later DATA, a rebind, or the full-source final header. */
+	if (target == NULL || !target->file.exists || target->file.size != UNDO_SEGMENT_SIZE_BYTES
+		|| owner->undo_bytes_remaining < 8 * BLCKSZ
+		|| rf_side_online_plan_prepare_undo_record_header_v1(
+			   owner->protected_plan, index, &operation->identity, target->base.data, &prefix)
+			   != RF_PAGE_PROOF_DETAIL_OK
+		|| memcmp(target->base.data, prefix.page.data, BLCKSZ) != 0
+		|| !side_owner_authority_fresh(owner)
+		|| !cluster_undo_smgr_recovery_read_block_v1(aborted.segment_id, aborted.instance, 0,
+													 &target->file, current.data)
+		|| memcmp(current.data, target->base.data, BLCKSZ) != 0)
+		return false;
+	target->final = prefix;
+	return side_owner_install_target(owner, target)
+		   && cluster_undo_smgr_recovery_read_block_v1(aborted.segment_id, aborted.instance, 0,
+													   &target->file, current.data)
+		   && memcmp(current.data, prefix.page.data, BLCKSZ) == 0
+		   && side_owner_authority_fresh(owner) && side_owner_apply_xact(owner, operation);
+}
+
+static bool
+side_owner_apply_commit_record(RfSideOnlineProductionOwnerV1 *owner, uint32 index,
+							   const RfSideOnlineOperationV1 *operation)
+{
 	const xl_xact_tt_commit *delta;
 	SideUndoHeader *target;
 	RfSideUndoHeaderImageV1 prefix;
 	PGAlignedBlock current;
 	ClusterUndoHeaderPrepareResultV1 result;
 
-	if (owner == NULL || !owner->protected_set_active || !side_owner_cold_formed(owner)
-		|| !side_owner_authority_fresh(owner) || operation == NULL
-		|| operation->kind != RF_SIDE_ONLINE_OPERATION_XACT
-		|| !side_owner_cold_commit_ready(owner, &operation->xact))
+	if (!side_owner_cold_commit_ready(owner, &operation->xact))
 		return false;
 	delta = &operation->xact.tt_delta;
 	target = side_owner_undo_target(owner, delta->instance, delta->segment_id, 0);
@@ -573,6 +604,22 @@ side_owner_apply_xact_record(void *arg, uint32 index, const RfSideOnlineOperatio
 													   &target->file, current.data)
 		   && memcmp(current.data, prefix.page.data, BLCKSZ) == 0
 		   && side_owner_authority_fresh(owner) && side_owner_finish_commit(owner, operation);
+}
+
+/* Keep the mutually exclusive page scratch in each consumer, not in this
+ * dispatcher: the eight-page bound must not depend on tail-call optimization. */
+static bool
+side_owner_apply_xact_record(void *arg, uint32 index, const RfSideOnlineOperationV1 *operation)
+{
+	RfSideOnlineProductionOwnerV1 *owner = arg;
+
+	if (owner == NULL || !owner->protected_set_active || !side_owner_cold_formed(owner)
+		|| !side_owner_authority_fresh(owner) || operation == NULL
+		|| operation->kind != RF_SIDE_ONLINE_OPERATION_XACT)
+		return false;
+	if (operation->xact.kind == RF_SIDE_XACT_ABORT)
+		return side_owner_apply_abort_record(owner, index, operation);
+	return side_owner_apply_commit_record(owner, index, operation);
 }
 
 static bool

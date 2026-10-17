@@ -1754,6 +1754,18 @@ side_plan_prepare_undo_record(const RfSideOnlinePlanV1 *plan, uint32 index,
 			   && operation->xact.kind == RF_SIDE_XACT_COMMIT && operation->xact.has_tt_delta) {
 		instance = operation->xact.tt_delta.instance;
 		segment = operation->xact.tt_delta.segment_id;
+	} else if (header_only && operation->kind == RF_SIDE_ONLINE_OPERATION_XACT
+			   && operation->xact.kind == RF_SIDE_XACT_ABORT) {
+		RfSideOnlineOperationV1 exported;
+		ClusterUndoDecoded target;
+
+		/* Bind the complete native payload and its unique earlier TT_ABORT.
+		 * Native ABORT itself is not another TT transition. */
+		if (!rf_side_online_plan_operation_v1(plan, index, &exported)
+			|| !rf_side_online_plan_abort_target_v1(plan, &exported, &target))
+			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		instance = target.instance;
+		segment = target.segment_id;
 	} else
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 	/* Original immutable full-source input stays intact. Only the private
@@ -2745,14 +2757,14 @@ rf_side_online_plan_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index
 		|| identity->reserved_zero != 0
 		|| memcmp(&identity->record, &operation.identity.record, sizeof(identity->record)) != 0)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
-	/* COMMIT and UNDO require their record callbacks, never the whole-source
+	/* XACT and UNDO require their record callbacks, never the whole-source
 	 * consumers. Legacy terminal carriers, CTRC and SPACE remain separate. */
 	if (operation.kind != RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
 		&& operation.kind != RF_SIDE_ONLINE_OPERATION_PROJECTION
 		&& !(operation.kind == RF_SIDE_ONLINE_OPERATION_XACT
-			 && operation.xact.kind == RF_SIDE_XACT_ABORT && ops->apply_xact != NULL)
-		&& !(operation.kind == RF_SIDE_ONLINE_OPERATION_XACT
-			 && operation.xact.kind == RF_SIDE_XACT_COMMIT && ops->apply_xact_record != NULL)
+			 && (operation.xact.kind == RF_SIDE_XACT_COMMIT
+				 || operation.xact.kind == RF_SIDE_XACT_ABORT)
+			 && ops->apply_xact_record != NULL)
 		&& !(operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
 			 && (operation.undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
 				 || operation.undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI
@@ -2778,9 +2790,7 @@ rf_side_online_plan_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index
 			detail = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 		if (detail == RF_PAGE_PROOF_DETAIL_OK) {
 			bool applied = operation.kind == RF_SIDE_ONLINE_OPERATION_XACT
-							   ? (operation.xact.kind == RF_SIDE_XACT_COMMIT
-									  ? ops->apply_xact_record(ops->arg, index, &operation)
-									  : ops->apply_xact(ops->arg, &operation))
+							   ? ops->apply_xact_record(ops->arg, index, &operation)
 						   : operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
 							   ? ops->apply_undo_record(ops->arg, index, &operation)
 						   : operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL

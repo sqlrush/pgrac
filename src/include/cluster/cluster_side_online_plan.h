@@ -103,7 +103,7 @@ typedef struct RfSideOnlineApplyOpsV1 {
 	bool (*prepare_apply)(void *arg);
 	/* A whole-source undo consumer must not be used for one record. */
 	bool (*apply_undo_record)(void *arg, uint32 index, const RfSideOnlineOperationV1 *operation);
-	/* A selected COMMIT must not install later DATA or TT terminals. */
+	/* A selected COMMIT/ABORT must not install later DATA or TT terminals. */
 	bool (*apply_xact_record)(void *arg, uint32 index, const RfSideOnlineOperationV1 *operation);
 } RfSideOnlineApplyOpsV1;
 
@@ -226,7 +226,8 @@ extern RfPageProofDetailV1
 rf_side_online_plan_prepare_undo_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 										   const RfPageOnlineRecordIdentityV1 *identity,
 										   const char *base, RfSideUndoHeaderImageV1 *out);
-/* The same exact prefix's segment header, including for a block record.
+/* The same exact prefix's segment header, including for a block record or
+ * native ABORT bound to its unique preceding exact TT_ABORT.
  * This is private byte preparation, not permission to install a header. */
 extern RfPageProofDetailV1
 rf_side_online_plan_prepare_undo_record_header_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
