@@ -498,8 +498,18 @@ cold_side_create(ClusterColdTypedV1 *typed)
 			detail = RF_PAGE_PROOF_DETAIL_CAPACITY;
 		else
 			detail = rf_side_online_plan_create_v1(&request, &typed->side_plans[i]);
+		/* The stream is local to this capture; a C0 target need not be.
+		 * Preserve every original census claim, including history, before
+		 * any feed. These copies do not replace the live input/target scope. */
+		if (detail == RF_PAGE_PROOF_DETAIL_OK
+			&& !rf_side_online_plan_bind_sources_v1(typed->side_plans[i], typed->sources,
+													typed->participant_count))
+			detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
 		if (detail != RF_PAGE_PROOF_DETAIL_OK) {
-			cold_refuse(typed, CLUSTER_COLD_CAPACITY,
+			cold_refuse(typed,
+						detail == RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH
+							? CLUSTER_COLD_PARTICIPANT_INVALID
+							: CLUSTER_COLD_CAPACITY,
 						"thread %u SIDE plan creation refused (detail %u)",
 						(unsigned)participant->thread_id, (unsigned)detail);
 			return false;

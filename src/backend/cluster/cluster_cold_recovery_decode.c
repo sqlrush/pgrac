@@ -353,6 +353,25 @@ cold_record_flags(XLogReaderState *reader, uint64 system_identifier, const uint8
 	switch (XLogRecGetRmid(reader)) {
 	case RM_XACT_ID:
 		return cold_xact_flags(reader, system_identifier, storage_uuid, out, flags, effects);
+	case RM_CLUSTER_UNDO_ID:
+		if (info == XLOG_UNDO_RECOVERY_TT_ABORT) {
+			ClusterRecoveryTTAbortV1 c0;
+
+			if (XLogRecGetInfo(reader) != XLOG_UNDO_RECOVERY_TT_ABORT
+				|| XLogRecHasAnyBlockRefs(reader) || TransactionIdIsValid(XLogRecGetXid(reader))
+				|| TransactionIdIsValid(reader->record->toplevel_xid)
+				|| XLogRecGetOrigin(reader) != InvalidRepOriginId
+				|| !cluster_recovery_tt_abort_decode_v1((const uint8 *)XLogRecGetData(reader),
+														XLogRecGetDataLen(reader), &c0)
+				|| c0.writer_thread != reader->cluster_expected_thread_id)
+				return CLUSTER_COLD_COMPONENT_INVALID;
+			/* Writer checkpoint coverage cannot discharge a different target's
+			 * stamp. Until that cold consumer is connected, refuse before and
+			 * after native redo rather than allowing a history-only no-op. */
+			*effects |= CLUSTER_COLD_EFFECT_TT | CLUSTER_COLD_EFFECT_TERMINAL;
+			*flags = CLUSTER_COLD_RECORD_UNSUPPORTED;
+		}
+		return CLUSTER_COLD_OK;
 	case RM_COMMIT_TS_ID:
 		/* Shared commit_ts has no recovery consumer, including own history. */
 		*flags = CLUSTER_COLD_RECORD_UNSUPPORTED;

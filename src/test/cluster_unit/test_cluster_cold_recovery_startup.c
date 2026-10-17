@@ -870,11 +870,31 @@ UT_TEST(test_side_capture_bound_to_each_original_replay_source)
 		UT_ASSERT_EQ(plan->cut.scan_end_exclusive, 0x2000);
 		UT_ASSERT_EQ(plan->redo, 0x800);
 		UT_ASSERT_EQ(plan->captured, 2);
+		UT_ASSERT_EQ(plan->source_count, typed->participant_count);
+		UT_ASSERT(memcmp(plan->sources, typed->sources,
+						 typed->participant_count * sizeof(typed->sources[0]))
+				  == 0);
 	}
 	UT_ASSERT_NULL(typed->side_plans[3]);
 	UT_ASSERT_EQ(history_scans, 1);
 	cluster_cold_typed_destroy_v1(&typed);
 	UT_ASSERT_EQ(side_destroys, NROOTS);
+}
+
+UT_TEST(test_side_capture_source_bind_failure_stops_before_scan)
+{
+	ClusterColdTypedV1 *typed;
+	fixture();
+	history_generation(2, 9, 0x40, 0x80);
+	side_fault = 8;
+	typed = prepare(0x800);
+	UT_ASSERT_NE(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(typed->scanned_records, 0);
+	UT_ASSERT_EQ(side_seals, 0);
+	for (uint32 i = 0; i < CLUSTER_COLD_MAX_PARTICIPANTS; i++)
+		UT_ASSERT_NULL(typed->side_plans[i]);
+	UT_ASSERT_EQ(side_destroys, side_creates);
+	cluster_cold_typed_destroy_v1(&typed);
 }
 
 UT_TEST(test_side_capture_failure_never_exposes_a_partial_plan)
@@ -1748,7 +1768,8 @@ UT_TEST(test_compound_final_rebinds_scope_and_rejects_failure_stickily)
 int
 main(void)
 {
-	UT_PLAN(48);
+	UT_PLAN(49);
+	UT_RUN(test_side_capture_source_bind_failure_stops_before_scan);
 	UT_RUN(test_compound_dispatch_binds_complete_drop_array);
 	UT_RUN(test_compound_final_rebinds_scope_and_rejects_failure_stickily);
 	UT_RUN(test_native_commit_dispatch_selects_exact_consumer);

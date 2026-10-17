@@ -241,6 +241,8 @@ static int census_releases;
  * ownership is tested separately. No mutation authority is manufactured. */
 struct RfSideOnlinePlanV1 {
 	RfContributorStreamCutV1 cut;
+	ClusterWalSourceRef sources[CLUSTER_COLD_MAX_PARTICIPANTS];
+	uint32 source_count;
 	XLogRecPtr redo;
 	uint32 captured;
 	bool bound;
@@ -271,6 +273,21 @@ rf_side_online_plan_create_v1(const RfSideOnlinePlanRequestV1 *request, RfSideOn
 	(*out)->redo = request->redo_starts[0];
 	side_budget_total += request->memory_budget;
 	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+bool
+rf_side_online_plan_bind_sources_v1(RfSideOnlinePlanV1 *plan, const ClusterWalSourceRef *sources,
+									uint32 count)
+{
+	UT_ASSERT_EQ(plan->captured, 0);
+	UT_ASSERT_EQ(census_releases, 0);
+	if (side_fault == 8 && plan == &side_fixture[1])
+		return false;
+	if (sources == NULL || count == 0 || count > CLUSTER_COLD_MAX_PARTICIPANTS)
+		return false;
+	memcpy(plan->sources, sources, count * sizeof(*sources));
+	plan->source_count = count;
+	return true;
 }
 
 bool

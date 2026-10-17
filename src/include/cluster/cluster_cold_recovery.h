@@ -707,8 +707,9 @@ typedef struct ClusterColdTypedV1 {
 	uint32 own_participant;
 	struct ClusterColdReplayRootV1 *replay_roots; /* original pass-1 selection, not fresh roots */
 	uint32 replay_root_count;
-	/* Per crashed source, including its retained pre-redo records. History-only
-	 * generations retain the original census path and never become executable. */
+	/* Per crashed source, including its retained pre-redo records. Each plan
+	 * binds the complete retained source set; that does not authorize target
+	 * mutation. History-only generations retain the original census path. */
 	struct RfSideOnlinePlanV1 *side_plans[CLUSTER_COLD_MAX_PARTICIPANTS];
 	uint8 side_capture_detail[CLUSTER_COLD_MAX_PARTICIPANTS];
 	XLogRecPtr side_capture_read_rec_ptr[CLUSTER_COLD_MAX_PARTICIPANTS];

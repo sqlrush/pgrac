@@ -54,6 +54,7 @@ struct RfSideOnlinePlanV1 {
 	uint32 participant_count;
 	RfContributorStreamCutV1 *physical_cuts;
 	ClusterWalSourceRef *sources;
+	uint32 source_count;
 	XLogRecPtr *redo_starts;
 	XLogRecPtr *last_record_end;
 	bool *participant_seen;
@@ -78,6 +79,26 @@ side_source_bind_failed(RfSideOnlinePlanV1 *plan)
 	return false;
 }
 
+/* Streamed participants can be only a subset of the retained ROOT inputs.
+ * Source array order carries no authority and is not a participant index. */
+static uint32
+side_cut_source(const RfContributorStreamCutV1 *cut, const ClusterWalSourceRef *sources,
+				uint32 count)
+{
+	uint32 found = UINT32_MAX;
+
+	for (uint32 i = 0; i < count; i++) {
+		const ClusterControlRootIdentity *id = &sources[i].claim.identity;
+		if (id->origin_thread_id != cut->failed_thread
+			|| id->origin_owner_incarnation != cut->origin_owner_incarnation)
+			continue;
+		if (found != UINT32_MAX || sources[i].timeline != cut->timeline_id)
+			return UINT32_MAX;
+		found = i;
+	}
+	return found;
+}
+
 bool
 rf_side_online_plan_bind_sources_v1(RfSideOnlinePlanV1 *plan, const ClusterWalSourceRef *sources,
 									uint32 count)
@@ -86,25 +107,32 @@ rf_side_online_plan_bind_sources_v1(RfSideOnlinePlanV1 *plan, const ClusterWalSo
 	ClusterWalSourceRef *bound;
 
 	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || plan->sealed || plan->failed
-		|| plan->sources != NULL || sources == NULL || count != plan->participant_count
-		|| count == 0 || count > RF_PAGE_STABLE_MAX_PARTICIPANTS || plan->operation_count != 0)
+		|| plan->sources != NULL || sources == NULL || count < plan->participant_count || count == 0
+		|| count > RF_PAGE_STABLE_MAX_PARTICIPANTS || plan->operation_count != 0)
 		return side_source_bind_failed(plan);
 	for (uint32 i = 0; i < count; i++) {
 		const ClusterWalThreadClaimRefV2 *claim = &sources[i].claim;
 		const ClusterControlRootIdentity *id = &claim->identity;
-		const RfContributorStreamCutV1 *cut = &plan->physical_cuts[i];
 
-		if (plan->participant_seen[i] || !cluster_wal_claim_v2_ref_valid(claim)
+		if (!cluster_wal_claim_v2_ref_valid(claim)
 			|| id->system_identifier != plan->system_identifier
-			|| memcmp(id->storage_uuid, plan->storage_uuid, 16) != 0
-			|| id->origin_thread_id != cut->failed_thread
-			|| id->origin_owner_incarnation != cut->origin_owner_incarnation
-			|| sources[i].timeline != cut->timeline_id
+			|| memcmp(id->storage_uuid, plan->storage_uuid, 16) != 0 || sources[i].timeline == 0
 			|| claim->database_incarnation != sources[0].claim.database_incarnation
 			|| (plan->database_incarnation != 0
 				&& plan->database_incarnation != claim->database_incarnation))
 			return side_source_bind_failed(plan);
+		/* A repeated identity is ambiguous even with the same hash/timeline;
+		 * a second claim must never repair or override the first one. */
+		for (uint32 j = 0; j < i; j++)
+			if (sources[j].claim.identity.origin_thread_id == id->origin_thread_id
+				&& sources[j].claim.identity.origin_owner_incarnation
+					   == id->origin_owner_incarnation)
+				return side_source_bind_failed(plan);
 	}
+	for (uint32 i = 0; i < plan->participant_count; i++)
+		if (plan->participant_seen[i]
+			|| side_cut_source(&plan->physical_cuts[i], sources, count) == UINT32_MAX)
+			return side_source_bind_failed(plan);
 	bytes = (Size)count * sizeof(*bound);
 	if (bytes > plan->memory_budget || plan->memory_used > plan->memory_budget - bytes)
 		return side_source_bind_failed(plan);
@@ -113,6 +141,7 @@ rf_side_online_plan_bind_sources_v1(RfSideOnlinePlanV1 *plan, const ClusterWalSo
 		return side_source_bind_failed(plan);
 	memcpy(bound, sources, bytes);
 	plan->sources = bound;
+	plan->source_count = count;
 	plan->memory_used += bytes;
 	return true;
 }
@@ -123,6 +152,7 @@ rf_side_online_plan_recovery_abort_sources_v1(const RfSideOnlinePlanV1 *plan, ui
 											  ClusterWalSourceRef *target)
 {
 	const RfSideOnlineOperationV1 *op;
+	uint32 writer_index;
 
 	if (writer != NULL)
 		memset(writer, 0, sizeof(*writer));
@@ -135,10 +165,14 @@ rf_side_online_plan_recovery_abort_sources_v1(const RfSideOnlinePlanV1 *plan, ui
 	op = &plan->operations[index];
 	if (op->kind != RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT
 		|| op->identity.participant_index >= plan->participant_count
-		|| op->recovery_target_participant >= plan->participant_count)
+		|| op->recovery_target_source >= plan->source_count)
 		return false;
-	*writer = plan->sources[op->identity.participant_index];
-	*target = plan->sources[op->recovery_target_participant];
+	writer_index = side_cut_source(&plan->physical_cuts[op->identity.participant_index],
+								   plan->sources, plan->source_count);
+	if (writer_index == UINT32_MAX)
+		return false;
+	*writer = plan->sources[writer_index];
+	*target = plan->sources[op->recovery_target_source];
 	return true;
 }
 
@@ -948,6 +982,7 @@ side_recovery_abort_decode(const RfSideOnlinePlanV1 *plan,
 	const ClusterWalThreadClaimRefV2 *writer;
 	ClusterRecoveryTTAbortV1 *c0 = &candidate->recovery_abort;
 	uint32 target = UINT32_MAX;
+	uint32 writer_index;
 
 	if (plan->purpose != RF_SIDE_PLAN_RECOVERY || plan->sources == NULL
 		|| record_plan->route.normalized_info != XLOG_UNDO_RECOVERY_TT_ABORT
@@ -959,11 +994,15 @@ side_recovery_abort_decode(const RfSideOnlinePlanV1 *plan,
 		|| !cluster_recovery_tt_abort_decode_v1((const uint8 *)XLogRecGetData(reader),
 												XLogRecGetDataLen(reader), c0))
 		return false;
-	writer = &plan->sources[identity->participant_index].claim;
+	writer_index = side_cut_source(&plan->physical_cuts[identity->participant_index], plan->sources,
+								   plan->source_count);
+	if (writer_index == UINT32_MAX)
+		return false;
+	writer = &plan->sources[writer_index].claim;
 	if (writer->identity.origin_thread_id != c0->writer_thread
 		|| writer->identity.origin_owner_incarnation != c0->writer_incarnation)
 		return false;
-	for (uint32 i = 0; i < plan->participant_count; i++) {
+	for (uint32 i = 0; i < plan->source_count; i++) {
 		const ClusterWalThreadClaimRefV2 *claim = &plan->sources[i].claim;
 		const ClusterControlRootIdentity *id = &claim->identity;
 
@@ -981,7 +1020,7 @@ side_recovery_abort_decode(const RfSideOnlinePlanV1 *plan,
 	if (target == UINT32_MAX)
 		return false;
 	candidate->kind = RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT;
-	candidate->recovery_target_participant = (uint16)target;
+	candidate->recovery_target_source = (uint16)target;
 	candidate->owned_payload_length = XLogRecGetDataLen(reader);
 	return true;
 }

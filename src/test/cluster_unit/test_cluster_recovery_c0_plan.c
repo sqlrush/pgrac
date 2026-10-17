@@ -137,7 +137,7 @@ UT_TEST(c0_keeps_writer_and_target_full_values)
 		if (rf_side_online_plan_operation_v1(plan, 0, &op)) {
 			UT_ASSERT_EQ(op.kind, RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT);
 			UT_ASSERT_EQ(op.identity.record.origin_thread, 3);
-			UT_ASSERT_EQ(op.recovery_target_participant, 0);
+			UT_ASSERT_EQ(op.recovery_target_source, 0);
 			UT_ASSERT_EQ(op.recovery_abort.target_thread, 2);
 			UT_ASSERT_EQ(op.owned_payload_length, 152);
 			UT_ASSERT(memcmp(op.owned_payload, f.fake.data, 152) == 0);
@@ -438,10 +438,140 @@ UT_TEST(c0_writer_checkpoint_does_not_complete_target_history)
 	rf_side_online_plan_destroy_v1(&plan);
 }
 
+/* A cold capture streams one crashed writer but its target can be another
+ * retained generation, including history of the same thread. */
+static RfSideOnlinePlanV1 *
+c0_writer_plan(C0Fixture *f)
+{
+	RfSideOnlinePlanRequestV1 request = { 0 };
+	RfSideOnlinePlanV1 *plan = NULL;
+	request.system_identifier = f->identity.record.system_identifier;
+	memcpy(request.storage_uuid, f->identity.record.storage_uuid, 16);
+	request.physical_cuts = &f->cuts[1];
+	request.participant_count = 1;
+	request.purpose = RF_SIDE_PLAN_RECOVERY;
+	f->identity.participant_index = 0;
+	UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
+	return plan;
+}
+
+UT_TEST(c0_single_writer_resolves_target_from_reordered_retained_set)
+{
+	for (int reverse = 0; reverse < 2; reverse++) {
+		C0Fixture f;
+		ClusterWalSourceRef sources[3], writer = { 0 }, target = { 0 };
+		RfSideOnlinePlanV1 *plan;
+		RfSideOnlineOperationV1 op;
+		bool bound;
+		c0_fixture(&f);
+		sources[reverse] = f.sources[0];
+		sources[1 - reverse] = f.sources[1];
+		sources[2] = f.sources[1];
+		sources[2].claim.identity.origin_owner_incarnation = 17;
+		sources[2].claim.claim_sha256[31] ^= 0x80;
+		plan = c0_writer_plan(&f);
+		bound = rf_side_online_plan_bind_sources_v1(plan, sources, 3);
+		UT_ASSERT(bound);
+		if (bound) {
+			memset(sources, 0, sizeof(sources));
+			UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &f.record, &f.identity),
+						 RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &op));
+			UT_ASSERT_EQ(op.identity.participant_index, 0);
+			UT_ASSERT(rf_side_online_plan_recovery_abort_sources_v1(plan, 0, &writer, &target));
+			UT_ASSERT(memcmp(&writer, &f.sources[1], sizeof(writer)) == 0);
+			UT_ASSERT(memcmp(&target, &f.sources[0], sizeof(target)) == 0);
+		}
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(c0_retained_set_refuses_missing_ambiguous_and_foreign_sources)
+{
+	for (int fault = 0; fault < 8; fault++) {
+		C0Fixture f;
+		ClusterWalSourceRef sources[3];
+		RfSideOnlinePlanV1 *plan;
+		c0_fixture(&f);
+		memcpy(sources, f.sources, sizeof(f.sources));
+		sources[2] = f.sources[0];
+		sources[2].claim.identity.origin_owner_incarnation = 19;
+		sources[2].claim.claim_sha256[31] ^= 1;
+		switch (fault) {
+		case 0:
+			sources[1].claim.identity.origin_owner_incarnation++;
+			break;
+		case 1:
+			sources[2] = sources[0];
+			break;
+		case 2:
+			sources[2] = sources[0];
+			sources[2].claim.claim_sha256[31] ^= 1;
+			break;
+		case 3:
+			sources[2].claim.identity.system_identifier++;
+			break;
+		case 4:
+			sources[2].claim.identity.storage_uuid[15] ^= 1;
+			break;
+		case 5:
+			sources[2].claim.database_incarnation++;
+			break;
+		case 6:
+			sources[2].timeline = 0;
+			break;
+		case 7:
+			sources[1].timeline++;
+			break;
+		}
+		plan = c0_writer_plan(&f);
+		UT_ASSERT(!rf_side_online_plan_bind_sources_v1(plan, sources, 3));
+		UT_ASSERT(!rf_side_online_plan_bind_sources_v1(plan, f.sources, 2));
+		UT_ASSERT_NE(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(c0_target_need_not_have_a_streamed_wal_cut)
+{
+	C0Fixture f;
+	RfSideOnlinePlanV1 *plan;
+	ClusterWalSourceRef writer, target;
+	bool bound;
+	c0_fixture(&f);
+	/* A retained generation of the writer's thread is a distinct target. */
+	f.sources[0] = f.sources[1];
+	f.sources[0].claim.identity.origin_owner_incarnation = 17;
+	f.sources[0].claim.claim_sha256[31] ^= 1;
+	f.c0.target_thread = 3;
+	f.c0.target_incarnation = 17;
+	f.c0.exact.instance = 3;
+	f.c0.exact.segment_id = 513;
+	memset(&f.c0.before.first_undo_block, 0, sizeof(f.c0.before.first_undo_block));
+	memcpy(f.c0.target_claim_sha256, f.sources[0].claim.claim_sha256, 32);
+	c0_encode(&f);
+	plan = c0_writer_plan(&f);
+	bound = rf_side_online_plan_bind_sources_v1(plan, f.sources, 2);
+	UT_ASSERT(bound);
+	if (bound) {
+		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &f.record, &f.identity),
+					 RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(rf_side_online_plan_recovery_abort_sources_v1(plan, 0, &writer, &target));
+		UT_ASSERT_EQ(writer.claim.identity.origin_owner_incarnation, 33);
+		UT_ASSERT_EQ(target.claim.identity.origin_owner_incarnation, 17);
+	}
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(12);
+	UT_RUN(c0_single_writer_resolves_target_from_reordered_retained_set);
+	UT_RUN(c0_retained_set_refuses_missing_ambiguous_and_foreign_sources);
+	UT_RUN(c0_target_need_not_have_a_streamed_wal_cut);
 	UT_RUN(c0_keeps_writer_and_target_full_values);
 	UT_RUN(c0_missing_or_changed_claim_never_becomes_ordinary_undo);
 	UT_RUN(c0_malformed_payload_and_header_refuse_before_capture);

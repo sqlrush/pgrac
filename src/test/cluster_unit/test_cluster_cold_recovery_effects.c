@@ -25,6 +25,7 @@
 #include "cluster/cluster_page_detached.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "cluster/cluster_undo_segment.h"
+#include "cluster/cluster_recovery_tt_record.h"
 #include "cluster/cluster_space_reservation.h"
 #include "pgstat.h"
 #include "replication/origin.h"
@@ -1349,10 +1350,66 @@ UT_TEST(test_foreign_compound_rejects_unconsumed_frame_and_payload)
 	}
 }
 
+UT_TEST(test_c0_without_target_owner_is_never_native_or_history_no_effect)
+{
+	for (int foreign = 0; foreign < 2; foreign++) {
+		EffectRecord r;
+		ClusterColdDecodedV1 out = { 0 };
+		ClusterRecoveryTTAbortV1 c0 = { 0 };
+		ClusterColdStepV1 step;
+		record_init(&r, RM_CLUSTER_UNDO_ID, XLOG_UNDO_RECOVERY_TT_ABORT);
+		r.decoded.header.xl_xid = InvalidTransactionId;
+		c0.version = 1;
+		c0.length = 152;
+		c0.flags = 1;
+		c0.target_thread = 2;
+		c0.writer_thread = 1;
+		c0.target_incarnation = 22;
+		c0.writer_incarnation = 11;
+		c0.recovery_serial = 3;
+		c0.target_epoch = 4;
+		c0.target_full_xid = c0.top_full_xid = UINT64_C(0x700400102);
+		memset(c0.target_claim_sha256, 0x21, 32);
+		c0.exact = (xl_undo_tt_slot_abort_exact){ .segment_id = 257,
+												  .segment_generation = 0,
+												  .xid = 0x400102,
+												  .slot_offset = 5,
+												  .wrap = 9,
+												  .instance = 2,
+												  .format_version = 1 };
+		c0.before.xid = c0.exact.xid;
+		c0.before.wrap = 9;
+		c0.before.status = TT_SLOT_ACTIVE;
+		UT_ASSERT(cluster_recovery_tt_abort_encode_v1(&c0, (uint8 *)r.data.bytes, 152));
+		r.decoded.main_data_len = 152;
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 9, uuid, false, foreign, &out),
+					 CLUSTER_COLD_OK);
+		/* UNSUPPORTED is rejected even before native_redo by the original
+		 * cold plan. SIDE_UNOWNED alone would allow a history-only skip. */
+		UT_ASSERT((out.record.record_flags & CLUSTER_COLD_RECORD_UNSUPPORTED) != 0);
+		UT_ASSERT_EQ(out.effects.required, CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_TT
+											   | CLUSTER_COLD_EFFECT_TERMINAL);
+		UT_ASSERT_EQ(out.effects.refused, out.effects.required);
+		UT_ASSERT_EQ(out.effects.native_apply | out.effects.no_effect, 0);
+		step = step_for(&out, CLUSTER_COLD_STEP_PAGE);
+		UT_ASSERT(!cluster_cold_replay_effects_v1(&out, &step, !foreign));
+		/* A valid envelope is still required even for a refused capability. */
+		r.decoded.main_data_len--;
+		UT_ASSERT_NE(cluster_cold_recovery_decode_v1(&r.reader, 9, uuid, false, foreign, &out),
+					 CLUSTER_COLD_OK);
+		r.decoded.main_data_len++;
+		r.decoded.header.xl_xid = 23;
+		UT_ASSERT_NE(cluster_cold_recovery_decode_v1(&r.reader, 9, uuid, false, foreign, &out),
+					 CLUSTER_COLD_OK);
+		cluster_cold_decoded_release_v1(&out);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(40);
+	UT_PLAN(41);
+	UT_RUN(test_c0_without_target_owner_is_never_native_or_history_no_effect);
 	UT_RUN(test_foreign_compound_uses_scheduled_whole_commit_consumer);
 	UT_RUN(test_foreign_compound_rejects_unconsumed_frame_and_payload);
 	UT_RUN(test_foreign_ctrc_release_requires_original_complete_carrier);
