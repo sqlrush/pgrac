@@ -25,7 +25,9 @@
 #include "cluster/cluster_page_detached.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "cluster/cluster_undo_segment.h"
+#include "cluster/cluster_space_reservation.h"
 #include "pgstat.h"
+#include "replication/origin.h"
 #include "storage/standbydefs.h"
 #include "unit_test.h"
 
@@ -122,6 +124,10 @@ completion(EffectRecord *r, bool commit, uint32 xinfo)
 	record_init(r, RM_XACT_ID, (commit ? XLOG_XACT_COMMIT : XLOG_XACT_ABORT) | XLOG_XACT_HAS_INFO);
 	append(r, &timestamp, sizeof(timestamp));
 	append(r, &xinfo, sizeof(xinfo));
+	if (xinfo & XACT_XINFO_HAS_DBINFO) {
+		xl_xact_dbinfo db = { .dbId = 5, .tsId = 1663 };
+		append(r, &db, sizeof(db));
+	}
 	if (xinfo & XACT_XINFO_HAS_SUBXACTS)
 		counted(r, children, 2, sizeof(children[0]));
 	if (xinfo & XACT_XINFO_HAS_RELFILELOCATORS)
@@ -1239,10 +1245,116 @@ UT_TEST(test_foreign_ctrc_release_requires_original_complete_carrier)
 	}
 }
 
+static void
+compound_drop_record(EffectRecord *r)
+{
+	const uint32 flags = XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_RELFILELOCATORS
+						 | XACT_XINFO_HAS_SPACE_DROP | XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_TT_COMMIT
+						 | XACT_XINFO_HAS_DROPPED_STATS | XACT_XINFO_HAS_INVALS
+						 | XACT_COMPLETION_FORCE_SYNC_COMMIT;
+	uint32 count = 2;
+	completion(r, true, flags);
+	append(r, &count, sizeof(count));
+	for (uint32 i = 0; i < count; i++) {
+		ClusterSpaceStructureChange c = { 0 };
+		char bytes[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+		c.identity.action = CLUSTER_SPACE_WAL_TOMBSTONE;
+		c.identity.expected.key.system_identifier = 99;
+		c.identity.expected.key.database_incarnation = 4;
+		memcpy(c.identity.expected.key.storage_uuid, uuid, 16);
+		c.identity.expected.key.locator = (RelFileLocator){ 1663, 5, 123 + i };
+		memset(c.identity.expected.incarnation, 0x31, 16);
+		c.identity.expected.sequence = 1;
+		c.identity.expected.operation = 7;
+		c.identity.expected.state = CLUSTER_SPACE_IDENTITY_LIVE;
+		c.identity.result = c.identity.expected;
+		c.identity.result.sequence++;
+		c.identity.result.operation++;
+		c.identity.result.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+		c.identity.before_token = 17;
+		c.identity.result_token = 211;
+		c.identity.nblocks = InvalidBlockNumber;
+		c.reservation.action = CLUSTER_SPACE_RESERVATION_TOMBSTONE;
+		c.reservation.before.identity = c.identity.expected;
+		c.reservation.result.identity = c.identity.result;
+		c.reservation.before.next_block = c.reservation.result.next_block = 10;
+		c.reservation.before_token = 99;
+		c.reservation.result_token = 211;
+		UT_ASSERT(cluster_space_structure_wal_encode(&c, bytes, sizeof(bytes)));
+		append(r, bytes, sizeof(bytes));
+	}
+}
+
+UT_TEST(test_foreign_compound_uses_scheduled_whole_commit_consumer)
+{
+	for (int special = 0; special <= 1; special++) {
+		EffectRecord r;
+		ClusterColdDecodedV1 out = { 0 };
+		ClusterColdStepV1 step;
+		compound_drop_record(&r);
+		if (special)
+			r.decoded.header.xl_info |= XLR_SPECIAL_REL_UPDATE;
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+					 CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
+		UT_ASSERT_EQ(out.record.space_count, 2);
+		UT_ASSERT_EQ(out.effects.refused, 0);
+		UT_ASSERT_EQ(out.effects.space_apply, CLUSTER_COLD_EFFECT_SPACE);
+		UT_ASSERT_EQ(out.effects.native_apply,
+					 CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_TERMINAL
+						 | CLUSTER_COLD_EFFECT_RELATIONS | CLUSTER_COLD_EFFECT_TT
+						 | CLUSTER_COLD_EFFECT_SCN | CLUSTER_COLD_EFFECT_STATS
+						 | CLUSTER_COLD_EFFECT_INVALIDATIONS | CLUSTER_COLD_EFFECT_SYNC);
+		step = step_for(&out, CLUSTER_COLD_STEP_SPACE);
+		UT_ASSERT(cluster_cold_replay_effects_v1(&out, &step, false));
+		UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+		UT_ASSERT(!cluster_cold_replay_effects_v1(&out, &step, true));
+		step.space_count--;
+		UT_ASSERT(!cluster_cold_replay_effects_v1(&out, &step, false));
+		step.space_count++;
+		out.space_ops[1].kind = CLUSTER_COLD_SPACE_CREATE;
+		UT_ASSERT(!cluster_cold_replay_effects_v1(&out, &step, false));
+		cluster_cold_decoded_release_v1(&out);
+	}
+}
+
+UT_TEST(test_foreign_compound_rejects_unconsumed_frame_and_payload)
+{
+	for (int fault = 0; fault < 7; fault++) {
+		EffectRecord r;
+		ClusterColdDecodedV1 out = { 0 };
+		ClusterColdDetailV1 detail;
+		compound_drop_record(&r);
+		if (fault == 0)
+			r.decoded.record_origin = 1;
+		if (fault == 1)
+			r.decoded.toplevel_xid = 101;
+		if (fault == 2)
+			r.decoded.header.xl_info |= XLR_CHECK_CONSISTENCY;
+		if (fault == 3)
+			r.decoded.main_data_len--;
+		if (fault == 4)
+			r.reader.cluster_expected_thread_id = 2;
+		if (fault == 5)
+			r.decoded.header.xl_xid++;
+		if (fault == 6)
+			r.decoded.has_page_version_edge = true;
+		detail = cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out);
+		if (detail == CLUSTER_COLD_OK) {
+			ClusterColdStepV1 step = step_for(&out, CLUSTER_COLD_STEP_SPACE);
+			UT_ASSERT(out.record.record_flags != CLUSTER_COLD_RECORD_FOREIGN_SIDE);
+			UT_ASSERT(!cluster_cold_replay_effects_v1(&out, &step, false));
+		}
+		cluster_cold_decoded_release_v1(&out);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(38);
+	UT_PLAN(40);
+	UT_RUN(test_foreign_compound_uses_scheduled_whole_commit_consumer);
+	UT_RUN(test_foreign_compound_rejects_unconsumed_frame_and_payload);
 	UT_RUN(test_foreign_ctrc_release_requires_original_complete_carrier);
 	UT_RUN(test_foreign_native_abort_keeps_complete_record_effects);
 	UT_RUN(test_foreign_native_xact_requires_bound_source_identity);

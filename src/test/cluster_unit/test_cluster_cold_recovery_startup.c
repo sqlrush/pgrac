@@ -43,6 +43,8 @@
 #include "storage/checksum_impl.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_side_online_owner.h"
+#include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_wal_tail.h"
@@ -935,12 +937,13 @@ UT_TEST(test_native_history_capture_gap_keeps_original_plan_but_no_side_authorit
 }
 
 static ClusterColdTypedV1 *
-control_fixture_mode(ClusterColdRecordV1 *record, bool with_space)
+control_fixture_kind(ClusterColdRecordV1 *record, bool with_space, bool drop)
 {
 	ClusterColdTypedV1 *typed;
 	RfSideOnlineOperationV1 *operation;
 	fixture();
 	scan_space = with_space;
+	scan_space_drop = drop;
 	scan_space_offset = with_space ? 0x100 : 0;
 	control_native_pair_ok = false;
 	typed = prepare(0x800);
@@ -1002,6 +1005,12 @@ control_fixture_mode(ClusterColdRecordV1 *record, bool with_space)
 	}
 	cluster_cold_replay_window_enter_v1();
 	return typed;
+}
+
+static ClusterColdTypedV1 *
+control_fixture_mode(ClusterColdRecordV1 *record, bool with_space)
+{
+	return control_fixture_kind(record, with_space, false);
 }
 
 static ClusterColdTypedV1 *
@@ -1571,10 +1580,177 @@ UT_TEST(test_native_commit_dispatch_selects_exact_consumer)
 	cluster_cold_typed_destroy_v1(&typed);
 }
 
+/* Actual decoder and storage adapters have independent component tests.
+ * Here the real sealed plan and dispatcher must keep exact captured bytes. */
+static ClusterColdTypedV1 *
+compound_fixture(ClusterColdRecordV1 *record, ClusterColdSpaceOpV1 *op)
+{
+	ClusterColdTypedV1 *typed = control_fixture_kind(record, true, true);
+	ClusterColdSpaceInputV1 input;
+	RfSideOnlineOperationV1 *captured = &side_fixture[1].operations[1];
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_plan_space_input_v1(typed->plan, 0, 0, &input));
+	side_record_fixture(record, RM_XACT_ID,
+						XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO | XLR_SPECIAL_REL_UPDATE,
+						RF_SIDE_ONLINE_OPERATION_XACT);
+	record->read_rec_ptr = captured->identity.record.read_rec_ptr = input.read_rec_ptr;
+	record->end_rec_ptr = captured->identity.record.end_rec_ptr = input.end_rec_ptr;
+	captured->xact.kind = RF_SIDE_XACT_COMMIT;
+	captured->xact.cold_completion_effects = true;
+	captured->xact.relation_count = captured->xact.space_drop_count = 1;
+	captured->owned_payload = input.payload;
+	captured->owned_payload_length = input.payload_length;
+	captured->xact.space_drop_offset = 0;
+	side_fixture[1].operation_count = 2;
+	memset(op, 0, sizeof(*op));
+	op->kind = CLUSTER_COLD_SPACE_DROP;
+	op->locator = (RelFileLocator){ 1663, 5, 300 };
+	op->payload = input.payload;
+	op->payload_length = input.payload_length;
+	record->space_count = 1;
+	record->space_ops = op;
+	return typed;
+}
+
+UT_TEST(test_compound_dispatch_binds_complete_drop_array)
+{
+	for (int fault = 0; fault < 9; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdSpaceOpV1 op;
+		ClusterColdTypedV1 *typed = compound_fixture(&record, &op);
+		char different[CLUSTER_SPACE_STRUCTURE_WAL_BYTES] = { 'X' };
+		if (fault == 1)
+			op.kind = CLUSTER_COLD_SPACE_CREATE;
+		if (fault == 2)
+			op.payload_length--;
+		if (fault == 3)
+			op.payload = different;
+		if (fault == 4)
+			side_fixture[1].operations[1].xact.space_drop_count++;
+		if (fault == 5)
+			side_fixture[1].operations[1].xact.space_drop_offset++;
+		if (fault == 6)
+			record.space_ops = NULL;
+		if (fault == 7)
+			record.info |= XLR_CHECK_CONSISTENCY;
+		if (fault == 8)
+			side_fixture[1].operations[1].xact.cold_completion_effects = false;
+		UT_ASSERT_EQ(consume_control(typed, &record), fault == 0);
+		UT_ASSERT_EQ(control_calls, fault == 0 ? 1 : 0);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+void
+pg_re_throw(void)
+{
+	UT_ASSERT_NOT_NULL(PG_exception_stack);
+	siglongjmp(*PG_exception_stack, 1);
+}
+static ClusterUndoRecoveryScopeV1 *final_scope;
+static unsigned final_scope_enters, final_scope_leaves, final_drop_syncs;
+static int final_drop_fault;
+
+bool
+cluster_undo_recovery_scope_enter_v1(ClusterUndoRecoveryScopeV1 *scope,
+									 const ClusterThreadRecoveryAuthorityV1 *authority,
+									 const RfSideOnlinePlanV1 *plan)
+{
+	UT_ASSERT_NULL(final_scope);
+	UT_ASSERT(plan == &side_fixture[1]);
+	UT_ASSERT_EQ(cluster_thread_recovery_authority_revalidate_nowait_v1(authority),
+				 CLUSTER_THREAD_AUTHORITY_OK);
+	final_scope_enters++;
+	if (final_drop_fault == 1)
+		return false;
+	final_scope = scope;
+	return true;
+}
+void
+cluster_undo_recovery_scope_leave_v1(ClusterUndoRecoveryScopeV1 *scope)
+{
+	UT_ASSERT(final_scope == scope);
+	final_scope = NULL;
+	final_scope_leaves++;
+}
+bool
+cluster_space_cold_drop_foreign_sync_v1(const ClusterSpaceIdentityKey *key,
+										const ClusterSpaceRecoveryInput *input,
+										const ClusterSpaceColdSourceV1 *source)
+{
+	UT_ASSERT_NOT_NULL(final_scope);
+	UT_ASSERT_EQ(key->system_identifier, 9);
+	UT_ASSERT_EQ(key->database_incarnation, 5);
+	UT_ASSERT_EQ(key->locator.relNumber, 300);
+	UT_ASSERT_EQ(source->origin_thread, 2);
+	UT_ASSERT_EQ(source->end_rec_ptr, 0xa00);
+	UT_ASSERT_EQ(input->length, CLUSTER_SPACE_STRUCTURE_WAL_BYTES);
+	UT_ASSERT_EQ(((const char *)input->data)[0], 'D');
+	final_drop_syncs++;
+	if (final_drop_fault == 3)
+		siglongjmp(*PG_exception_stack, 1);
+	if (final_drop_fault == 4)
+		control_authority_ok = false;
+	if (final_drop_fault == 5)
+		tokens[1].file_txn_seq++;
+	if (final_drop_fault == 6)
+		control_epoch++;
+	return final_drop_fault != 2;
+}
+
+UT_TEST(test_compound_final_rebinds_scope_and_rejects_failure_stickily)
+{
+	for (int fault = 0; fault < 11; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdSpaceOpV1 op;
+		ClusterColdTypedV1 *typed = compound_fixture(&record, &op);
+		volatile bool result = false, caught = false;
+		final_drop_fault = fault;
+		final_scope_enters = final_scope_leaves = final_drop_syncs = 0;
+		final_scope = NULL;
+		if (fault == 7)
+			control_serial.mode = CLUSTER_RECOVERY_SERIAL_ONLINE;
+		if (fault == 8)
+			side_fixture[1].bound = false;
+		if (fault == 9)
+			control_token.file_txn_seq++;
+		if (fault == 10)
+			typed->replay_count = 1;
+		PG_TRY();
+		{
+			result = cluster_cold_typed_drop_final_v1(
+				typed, (ClusterRecoveryFencePlan *)&fixture_context, 0);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(result, fault == 0);
+		UT_ASSERT_EQ(caught, fault == 3);
+		UT_ASSERT_EQ(final_scope_enters, fault <= 6 ? 1 : 0);
+		UT_ASSERT_EQ(final_scope_leaves, fault <= 6 && fault != 1 ? 1 : 0);
+		UT_ASSERT_NULL(final_scope);
+		if (fault) {
+			UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SIDE_OWNER_MISSING);
+			final_drop_fault = 0;
+			UT_ASSERT(!cluster_cold_typed_drop_final_v1(
+				typed, (ClusterRecoveryFencePlan *)&fixture_context, 0));
+		}
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(46);
+	UT_PLAN(48);
+	UT_RUN(test_compound_dispatch_binds_complete_drop_array);
+	UT_RUN(test_compound_final_rebinds_scope_and_rejects_failure_stickily);
 	UT_RUN(test_native_commit_dispatch_selects_exact_consumer);
 	UT_RUN(test_native_abort_dispatch_matches_exact_captured_kind);
 	UT_RUN(test_undo_dispatch_selects_exact_record_and_keeps_space_proof);

@@ -2527,11 +2527,12 @@ test_cluster_space_commit_drop.inc: $(top_srcdir)/src/backend/access/transam/xac
 	     emit { print } /^}/ { inside=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-# Exercise the original cold final callback after the native DROP consumer.
+# Exercise the original scheduled and final SPACE callbacks.
 test_cluster_space_cold_final.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile
-	awk '/^cluster_typed_replay_space_final\(/ { print "static bool"; emit=1; found++ } \
+	awk '/^cluster_typed_replay_space_step\(/ { print "static void"; emit=1; found++ } \
+	     /^cluster_typed_replay_space_final\(/ { print "static bool"; emit=1; found++ } \
 	     emit { print } emit && /^}/ { emit=0; done++ } \
-	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	     END { if (found != 2 || done != 2) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_space_commit_emit.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile

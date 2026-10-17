@@ -3380,9 +3380,10 @@ cluster_typed_replay_space_install(ClusterColdTypedReplay *rep, uint32 relation,
 /*
  * A CREATE, TRUNCATE or a commit's relation drops.  The SPACE owner brings
  * each relation through this step's input first (never further, so pages
- * of an incarnation never see a later one); a drop's commit then replays
- * natively, its files and outcome still owned by the commit redo.  Without
- * a cold SPACE install the readiness gate refused such a plan before IR.
+ * of an incarnation never see a later one). The complete COMMIT then uses
+ * native own-thread redo or the exact captured foreign cold SIDE owner,
+ * retaining all native effects. Without a cold SPACE install the readiness
+ * gate refused such a plan before IR.
  */
 static void
 cluster_typed_replay_space_step(ClusterColdTypedReplay *rep, uint32 participant,
@@ -3391,10 +3392,6 @@ cluster_typed_replay_space_step(ClusterColdTypedReplay *rep, uint32 participant,
 	bool		is_own = participant == rep->typed->own_participant;
 	uint32		i;
 
-	/* Pass 1 refuses another generation's commit (R-A5). */
-	if (step->space_kind == CLUSTER_COLD_SPACE_DROP && !is_own)
-		cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
-									  "another generation's relation drops reached replay");
 	if (!is_own)
 		cluster_typed_replay_foreign_gate(rep);
 	for (i = 0; i < step->space_count; i++)
@@ -3410,6 +3407,14 @@ cluster_typed_replay_space_step(ClusterColdTypedReplay *rep, uint32 participant,
 	}
 	if (step->space_kind == CLUSTER_COLD_SPACE_DROP)
 	{
+		if (!is_own)
+		{
+			if (!cluster_cold_typed_side_record_v1(rep->typed, *rep->fence_plan,
+												 participant, &rep->decoded.record))
+				cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
+												  "a complete foreign DROP COMMIT consumer refused");
+			return;
+		}
 		rep->apply_foreign = false;
 		cluster_typed_replay_apply(r, rep);
 	}
@@ -3418,7 +3423,7 @@ cluster_typed_replay_space_step(ClusterColdTypedReplay *rep, uint32 participant,
 }
 
 /* Every scheduled record already succeeded and all sources were drained
- * by the original sequencer. A final DROP's native COMMIT has therefore
+ * by the original sequencer. A final DROP's complete COMMIT has therefore
  * deleted SPACE in this invocation: sync and recheck its result, never
  * reinstall the deleted fork. This does not authorize replay from absent SPACE. */
 static bool
@@ -3440,11 +3445,11 @@ cluster_typed_replay_space_final(void *arg, uint32 relation)
 		ClusterSpaceColdSourceV1 source;
 		const ClusterColdParticipantV1 *participant;
 
-		/* Foreign/native DROP remains unsupported. The last input must be
-		 * part of the own stream actually replayed by this invocation. */
-		if (last.participant != rep->typed->own_participant ||
-			last.participant >= rep->typed->participant_count)
+		if (last.participant >= rep->typed->participant_count)
 			return false;
+		if (last.participant != rep->typed->own_participant)
+			return cluster_cold_typed_drop_final_v1(rep->typed, *rep->fence_plan, relation);
+		/* The original native branch remains bound to its own replayed stream. */
 		participant = &rep->typed->participants[last.participant];
 		if (XLogRecPtrIsInvalid(last.read_rec_ptr) ||
 			last.read_rec_ptr < participant->native_redo ||

@@ -758,6 +758,12 @@ extern bool cluster_cold_completion_ready_v1(const ClusterColdTypedV1 *typed,
  * cold SPACE install (cluster_cold_space_owner_v1, the handshake's
  * space_owner).
  */
+/* Post-drain foreign DROP check under its original exact cold source scope;
+ * no reinstall of absent SPACE or recovery completion publication. */
+extern bool cluster_cold_typed_drop_final_v1(ClusterColdTypedV1 *typed,
+											 struct ClusterRecoveryFencePlan *fence,
+											 uint32 relation);
+
 extern bool cluster_cold_space_owner_v1(void);
 extern bool cluster_cold_typed_space_install_v1(const ClusterColdTypedV1 *typed, uint32 relation,
 												uint32 through, bool step);

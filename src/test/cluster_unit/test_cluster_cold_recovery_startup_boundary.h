@@ -88,6 +88,7 @@ static ClusterColdDetailV1 scan_result[NROOTS + 1];
 static uint64 data_token;
 static uint64 database_incarnation[NROOTS + 1];
 static uint32 scan_space_offset;
+static bool scan_space_drop;
 static bool scan_space;					/* thread 2 extends relation 300 before its page record */
 static ClusterWalSourceRef restart_ref; /* this node's bootstrap-validated restart input */
 static bool restart_ref_present;
@@ -341,6 +342,7 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 		return detail;
 	if (scan_space && thread == 2) {
 		static const char payload[4] = { 'A', 'D', 'V', '1' };
+		static const char drop_payload[CLUSTER_SPACE_STRUCTURE_WAL_BYTES] = { 'D' };
 		ClusterColdSpaceOpV1 advance;
 
 		memset(&advance, 0, sizeof(advance));
@@ -351,6 +353,13 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 		memset(advance.result_incarnation, 7, 16);
 		advance.payload = payload;
 		advance.payload_length = sizeof(payload);
+		if (scan_space_drop) {
+			advance.kind = CLUSTER_COLD_SPACE_DROP;
+			memset(advance.result_incarnation, 0, 16);
+			memset(advance.before_incarnation, 7, 16);
+			advance.payload = drop_payload;
+			advance.payload_length = sizeof(drop_payload);
+		}
 		memset(&record, 0, sizeof(record));
 		record.read_rec_ptr = native_redo[thread] + scan_space_offset;
 		record.end_rec_ptr = record.read_rec_ptr + 0x100;
@@ -843,6 +852,7 @@ fixture(void)
 	memset(source_sync_order, 0, sizeof(source_sync_order));
 	fence_current = true;
 	scan_space_offset = 0;
+	scan_space_drop = false;
 	cluster_cold_replay_window_leave_v1();
 	fence_count = 2;
 	data_token = 5;

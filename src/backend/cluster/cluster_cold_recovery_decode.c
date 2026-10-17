@@ -54,6 +54,7 @@
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "replication/message.h"
+#include "replication/origin.h"
 #include "storage/standbydefs.h"
 #include "utils/memutils.h"
 
@@ -470,7 +471,10 @@ cold_foreign_side(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan,
 					 ? XLogRecGetInfo(reader) & XLOG_XACT_OPMASK
 					 : XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
 
-	if (XLogRecMaxBlockId(reader) >= 0 || (XLogRecGetInfo(reader) & XLR_INFO_MASK) != 0
+	if (XLogRecMaxBlockId(reader) >= 0
+		|| ((XLogRecGetInfo(reader) & XLR_INFO_MASK) != 0
+			&& !(XLogRecGetRmid(reader) == RM_XACT_ID && info == XLOG_XACT_COMMIT
+				 && (XLogRecGetInfo(reader) & XLR_INFO_MASK) == XLR_SPECIAL_REL_UPDATE))
 		|| plan->route.record_owner != RF_ROUTE_OWNER_SIDE_TYPED)
 		return false;
 	if (XLogRecGetRmid(reader) == RM_CLUSTER_UNDO_ID) {
@@ -519,7 +523,13 @@ cold_foreign_side(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan,
 				   /* Strict SIDE may decode replication-origin metadata, but the
 					* foreign cold owner has no consumer for that effect. */
 				   && (operation.xinfo & XACT_XINFO_HAS_ORIGIN) == 0
-				   && operation.relation_count == 0 && operation.space_drop_count == 0;
+				   && ((operation.relation_count == 0 && operation.space_drop_count == 0
+						&& (XLogRecGetInfo(reader) & XLR_INFO_MASK) == 0)
+					   || (info == XLOG_XACT_COMMIT && operation.relation_count > 0
+						   && operation.space_drop_count > 0
+						   && !reader->record->has_page_version_edge
+						   && XLogRecGetOrigin(reader) == InvalidRepOriginId
+						   && !TransactionIdIsValid(reader->record->toplevel_xid)));
 		}
 		return info == XLOG_XACT_ASSIGNMENT;
 	case RM_STANDBY_ID:

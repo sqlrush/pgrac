@@ -1449,6 +1449,14 @@ cluster_space_cold_drop_sync_v1(const ClusterSpaceIdentityKey *key,
 	return space_cold_drop_sync(key, input, source, false);
 }
 
+bool
+cluster_space_cold_drop_foreign_sync_v1(const ClusterSpaceIdentityKey *key,
+										const ClusterSpaceRecoveryInput *input,
+										const ClusterSpaceColdSourceV1 *source)
+{
+	return space_cold_drop_sync(key, input, source, true);
+}
+
 static bool
 space_drop_replay_verify(XLogReaderState *record, TransactionId xid, bool cold_foreign)
 {

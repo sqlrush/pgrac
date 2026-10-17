@@ -3185,11 +3185,85 @@ native_commit_redo_drop(XLogReaderState *record, xl_xact_parsed_commit *parsed, 
  * is covered separately in test_cluster_cold_recovery_replay. */
 typedef struct ClusterColdTypedReplay {
 	ClusterColdTypedV1 *typed;
+	struct ClusterRecoveryFencePlan **fence_plan;
+	ClusterColdDecodedV1 decoded;
+	bool apply_foreign;
 } ClusterColdTypedReplay;
 
 static ClusterColdSpaceInputV1 final_input;
 static unsigned final_installs;
 static bool final_plan_valid;
+static unsigned step_gates, step_native, step_side, step_advance, final_foreign;
+static int step_fault;
+static bool step_foreign, final_foreign_ok;
+
+bool
+cluster_cold_plan_step_space_v1(const ClusterColdPlanV1 *plan, uint32 step, uint32 op,
+								uint32 *relation, uint32 *input)
+{
+	UT_ASSERT(plan == (ClusterColdPlanV1 *)42 && step == 7 && op < 2);
+	if (step_fault == 2 && op == 1)
+		return false;
+	*relation = op;
+	*input = 0;
+	return true;
+}
+static void
+cluster_typed_replay_mismatch(ClusterColdTypedReplay *rep, uint32 participant, XLogRecPtr ptr,
+							  const char *reason)
+{
+	(void)rep;
+	(void)participant;
+	(void)ptr;
+	elog(ERROR, "%s", reason);
+}
+static void
+cluster_typed_replay_foreign_gate(ClusterColdTypedReplay *rep)
+{
+	(void)rep;
+	UT_ASSERT_EQ(final_installs + step_side + step_native, 0);
+	step_gates++;
+	if (step_fault == 1)
+		elog(ERROR, "injected foreign gate refusal");
+}
+static void
+cluster_typed_replay_apply(XLogReaderState *reader, void *arg)
+{
+	ClusterColdTypedReplay *rep = arg;
+	(void)reader;
+	UT_ASSERT_EQ(final_installs, 2);
+	UT_ASSERT(!rep->apply_foreign && !step_foreign);
+	step_native++;
+}
+void
+AdvanceNextFullTransactionIdPastXid(TransactionId xid)
+{
+	UT_ASSERT_EQ(xid, 501);
+	UT_ASSERT_EQ(final_installs, 2);
+	step_advance++;
+}
+bool
+cluster_cold_typed_side_record_v1(ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence,
+								  uint32 participant, const ClusterColdRecordV1 *record)
+{
+	UT_ASSERT(typed != NULL && fence == (struct ClusterRecoveryFencePlan *)42);
+	UT_ASSERT(participant == 1 && record->space_count == 2);
+	UT_ASSERT_EQ(final_installs, 2);
+	UT_ASSERT_EQ(step_gates, 1);
+	step_side++;
+	return step_fault != 4;
+}
+bool
+cluster_cold_typed_drop_final_v1(ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence,
+								 uint32 relation)
+{
+	if (typed->participant_count != 2 || fence != (struct ClusterRecoveryFencePlan *)42
+		|| relation != 0)
+		return false;
+	UT_ASSERT_EQ(final_installs, 0);
+	final_foreign++;
+	return final_foreign_ok;
+}
 
 bool
 cluster_cold_plan_space_relation_v1(const ClusterColdPlanV1 *plan, uint32 index,
@@ -3216,8 +3290,17 @@ static void
 cluster_typed_replay_space_install(ClusterColdTypedReplay *rep, uint32 relation, uint32 through,
 								   bool step)
 {
-	UT_ASSERT(rep->typed->plan == (ClusterColdPlanV1 *)42 && relation == 0 && through == 0);
-	UT_ASSERT(!step);
+	UT_ASSERT(rep->typed->plan == (ClusterColdPlanV1 *)42 && through == 0);
+	if (step) {
+		UT_ASSERT(relation < 2 && relation == final_installs);
+		UT_ASSERT_EQ(step_gates, step_foreign ? 1 : 0);
+		UT_ASSERT_EQ(step_side + step_native, 0);
+		final_installs++;
+		if (step_fault == 3 && relation == 1)
+			elog(ERROR, "injected SPACE install ERROR");
+		return;
+	}
+	UT_ASSERT_EQ(relation, 0);
 	final_installs++;
 	/* The actual cold installer requires the SPACE pages for TOMBSTONE.
 	 * Native deletion has already removed them in this invocation. */
@@ -3226,6 +3309,102 @@ cluster_typed_replay_space_install(ClusterColdTypedReplay *rep, uint32 relation,
 }
 
 #include "test_cluster_space_cold_final.inc"
+
+UT_TEST(test_original_space_step_orders_complete_install_before_commit)
+{
+	for (unsigned variant = 0; variant < 4; variant++) {
+		ClusterColdTypedV1 typed = { 0 };
+		struct ClusterRecoveryFencePlan *fence = (struct ClusterRecoveryFencePlan *)42;
+		ClusterColdTypedReplay rep = { .typed = &typed, .fence_plan = &fence };
+		ClusterColdStepV1 step = { 0 };
+		XLogReaderState reader = { 0 };
+		DecodedXLogRecord decoded = { 0 };
+		volatile bool caught = false;
+		typed.plan = (ClusterColdPlanV1 *)42;
+		step_foreign = variant % 2 != 0;
+		step_fault = 0;
+		step_gates = step_native = step_side = step_advance = final_installs = 0;
+		step.step_index = 7;
+		step.space_count = 2;
+		step.space_kind = variant < 2 ? CLUSTER_COLD_SPACE_DROP : CLUSTER_COLD_SPACE_CREATE;
+		reader.record = &decoded;
+		decoded.header.xl_xid = 501;
+		rep.decoded.record.space_count = 2;
+		expecting_error = true;
+		PG_TRY();
+		{
+			cluster_typed_replay_space_step(&rep, step_foreign ? 1 : 0, &step, &reader);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		expecting_error = false;
+		UT_ASSERT(!caught);
+		UT_ASSERT_EQ(final_installs, 2);
+		UT_ASSERT_EQ(step_native, variant == 0);
+		UT_ASSERT_EQ(step_side, variant == 1);
+		UT_ASSERT_EQ(step_advance, variant == 2);
+	}
+}
+
+UT_TEST(test_original_foreign_space_refusal_never_runs_commit_early)
+{
+	for (int fault = 1; fault <= 4; fault++) {
+		ClusterColdTypedV1 typed = { 0 };
+		struct ClusterRecoveryFencePlan *fence = (struct ClusterRecoveryFencePlan *)42;
+		ClusterColdTypedReplay rep = { .typed = &typed, .fence_plan = &fence };
+		ClusterColdStepV1 step = { 0 };
+		XLogReaderState reader = { 0 };
+		volatile bool caught = false;
+		typed.plan = (ClusterColdPlanV1 *)42;
+		step_foreign = true;
+		step_fault = fault;
+		step_gates = step_native = step_side = step_advance = final_installs = 0;
+		step.step_index = 7;
+		step.space_count = 2;
+		step.space_kind = CLUSTER_COLD_SPACE_DROP;
+		rep.decoded.record.space_count = 2;
+		expecting_error = true;
+		PG_TRY();
+		{
+			cluster_typed_replay_space_step(&rep, 1, &step, &reader);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		expecting_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(step_gates, 1);
+		UT_ASSERT_EQ(final_installs, fault == 1 ? 0 : fault == 2 ? 1 : 2);
+		UT_ASSERT_EQ(step_side, fault == 4);
+		UT_ASSERT_EQ(step_native + step_advance, 0);
+	}
+	step_fault = 0;
+}
+
+UT_TEST(test_original_foreign_final_uses_exact_scope_without_reinstall)
+{
+	for (unsigned fault = 0; fault < 2; fault++) {
+		ClusterColdTypedV1 typed = { 0 };
+		struct ClusterRecoveryFencePlan *fence = (struct ClusterRecoveryFencePlan *)42;
+		ClusterColdTypedReplay rep = { .typed = &typed, .fence_plan = &fence };
+		typed.plan = (ClusterColdPlanV1 *)42;
+		typed.participant_count = 2;
+		final_plan_valid = true;
+		memset(&final_input, 0, sizeof(final_input));
+		final_input.kind = CLUSTER_COLD_SPACE_DROP;
+		final_input.participant = 1;
+		final_foreign = final_installs = 0;
+		final_foreign_ok = fault == 0;
+		UT_ASSERT_EQ(cluster_typed_replay_space_final(&rep, 0), fault == 0);
+		UT_ASSERT_EQ(final_foreign, 1);
+		UT_ASSERT_EQ(final_installs, 0);
+	}
+}
 
 static void
 final_drop_fixture(ClusterColdTypedV1 *typed, XLogReaderState *reader)
@@ -3705,6 +3884,48 @@ UT_TEST(test_cold_foreign_drop_executes_exact_source_without_local_flush)
 		UT_ASSERT_EQ(final_sync_calls, 1);
 		UT_ASSERT_EQ(wal_calls + dirty_calls + flush_calls + pinned + locked, 0);
 		UT_ASSERT_EQ(cluster_recmerge_apply_foreign, ambient != 0);
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
+UT_TEST(test_foreign_final_sync_preserves_scope_and_result_checks)
+{
+	for (unsigned fault = 0; fault < 9; fault++) {
+		XLogReaderState reader;
+		DecodedXLogRecord decoded;
+		Relation rel = cold_foreign_drop_record(&reader, &decoded, false);
+		xl_xact_parsed_commit parsed;
+		ClusterSpaceStructureChange change;
+		ClusterSpaceRecoveryInput input;
+		ClusterSpaceColdSourceV1 source = { 2, reader.EndRecPtr };
+		unsigned before;
+		UT_ASSERT(cluster_space_cold_drop_foreign_v1(&reader, 501));
+		UT_ASSERT(ParseCommitRecord(wal_info, (xl_xact_commit *)commit_bytes, commit_len, &parsed));
+		input.data = parsed.space_drops;
+		input.length = CLUSTER_SPACE_STRUCTURE_WAL_BYTES;
+		UT_ASSERT(cluster_space_structure_wal_decode(input.data, input.length, &change));
+		before = final_sync_calls;
+		if (fault == 1)
+			foreign_drop_authorized = false;
+		if (fault == 2)
+			source.origin_thread = 1;
+		if (fault == 3)
+			input.length--;
+		if (fault == 4)
+			final_sync_fault = 1;
+		if (fault == 5)
+			final_sync_fault = 2;
+		if (fault == 6)
+			final_sync_fault = 3;
+		if (fault == 7)
+			final_sync_fault = 4;
+		if (fault == 8)
+			source.end_rec_ptr = InvalidXLogRecPtr;
+		UT_ASSERT_EQ(
+			cluster_space_cold_drop_foreign_sync_v1(&change.identity.result.key, &input, &source),
+			fault == 0);
+		UT_ASSERT_EQ(final_sync_calls - before, fault == 0 || (fault >= 4 && fault <= 7) ? 1 : 0);
+		UT_ASSERT_EQ(post_drop_calls, 1);
 		FreeFakeRelcacheEntry(rel);
 	}
 }
@@ -4383,7 +4604,11 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(88);
+	UT_PLAN(92);
+	UT_RUN(test_original_space_step_orders_complete_install_before_commit);
+	UT_RUN(test_original_foreign_space_refusal_never_runs_commit_early);
+	UT_RUN(test_original_foreign_final_uses_exact_scope_without_reinstall);
+	UT_RUN(test_foreign_final_sync_preserves_scope_and_result_checks);
 	UT_RUN(test_cold_foreign_drop_executes_exact_source_without_local_flush);
 	UT_RUN(test_cold_foreign_drop_preflight_proves_whole_group_without_mutation);
 	UT_RUN(test_cold_foreign_drop_checks_all_targets_before_and_after_sync);

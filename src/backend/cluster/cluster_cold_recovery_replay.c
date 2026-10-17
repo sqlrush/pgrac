@@ -127,12 +127,15 @@ cluster_cold_replay_effects_v1(const ClusterColdDecodedV1 *decoded, const Cluste
 		}
 		return false;
 	}
-	if (record->record_flags != 0 || record->read_rec_ptr != step->read_rec_ptr
-		|| record->end_rec_ptr != step->end_rec_ptr || record->record_crc != step->record_crc
-		|| record->rmid != step->rmid || record->info != step->info)
+	if ((record->record_flags != 0
+		 && !(!own && record->record_flags == CLUSTER_COLD_RECORD_FOREIGN_SIDE))
+		|| record->read_rec_ptr != step->read_rec_ptr || record->end_rec_ptr != step->end_rec_ptr
+		|| record->record_crc != step->record_crc || record->rmid != step->rmid
+		|| record->info != step->info)
 		return false;
 	if (step->step_kind == CLUSTER_COLD_STEP_PAGE)
-		return record->component_count > 0 && e->page_apply == e->required;
+		return record->record_flags == 0 && record->component_count > 0
+			   && e->page_apply == e->required;
 	if (step->step_kind != CLUSTER_COLD_STEP_SPACE || record->space_count == 0
 		|| record->space_count != step->space_count || record->component_count != 0)
 		return false;
@@ -140,15 +143,16 @@ cluster_cold_replay_effects_v1(const ClusterColdDecodedV1 *decoded, const Cluste
 		if (record->space_ops[i].kind != step->space_kind)
 			return false;
 	if (step->space_kind == CLUSTER_COLD_SPACE_DROP)
-		/* SPACE installs every drop, then original native redo consumes the
-		 * full COMMIT, including all counted arrays and completion flags. */
-		return own && record->rmid == RM_XACT_ID
+		/* SPACE installs every drop before the original native or exact
+		 * foreign consumer executes the complete COMMIT effects. */
+		return record->record_flags == (own ? 0 : CLUSTER_COLD_RECORD_FOREIGN_SIDE)
+			   && record->rmid == RM_XACT_ID
 			   && (record->info & XLOG_XACT_OPMASK) == XLOG_XACT_COMMIT
 			   && e->space_apply == CLUSTER_COLD_EFFECT_SPACE
 			   && (e->native_apply & (CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_TERMINAL))
 					  == (CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_TERMINAL)
 			   && (e->native_apply | e->space_apply) == e->required;
-	return record->rmid == RM_SMGR_ID && record->space_count == 1
+	return record->record_flags == 0 && record->rmid == RM_SMGR_ID && record->space_count == 1
 		   && step->space_kind >= CLUSTER_COLD_SPACE_CREATE
 		   && step->space_kind <= CLUSTER_COLD_SPACE_ADVANCE && e->space_apply == e->required;
 }
