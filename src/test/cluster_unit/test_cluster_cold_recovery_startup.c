@@ -62,6 +62,7 @@ ExceptionalCondition(const char *condition_name, const char *file_name, int line
 }
 
 #include "test_cluster_cold_recovery_startup_boundary.h"
+#include "test_cluster_cold_source_completion.inc"
 
 UT_TEST(test_prepare_seals_own_and_fenced_generations)
 {
@@ -1765,6 +1766,20 @@ UT_TEST(test_compound_final_rebinds_scope_and_rejects_failure_stickily)
 	}
 }
 
+static bool
+source_drained_fixture(ClusterColdTypedV1 *typed, uint32 participant)
+{
+	ClusterColdReplayResultV1 progress = { 0 };
+	const ClusterControlRootSnapshot *root = &roots[typed->participants[participant].thread_id];
+	progress.steps_done = cluster_cold_plan_step_count_v1(typed->plan);
+	progress.last_read[participant] = root->tail_last_record_lsn;
+	progress.last_end[participant] = root->validated_tail_lsn_exclusive;
+	progress.last_crc[participant] = root->tail_last_record_crc32c;
+	return cluster_cold_typed_source_drained_v1(
+		typed, (ClusterRecoveryFencePlan *)&fixture_context, participant, &progress,
+		cluster_cold_plan_replay_record_count_v1(typed->plan, participant));
+}
+
 static ClusterColdTypedV1 *
 c0_fixture(ClusterColdRecordV1 *record, uint32 target)
 {
@@ -1802,6 +1817,8 @@ c0_fixture(ClusterColdRecordV1 *record, uint32 target)
 	c0->before.wrap = 9;
 	c0->before.status = TT_SLOT_ACTIVE;
 	UT_ASSERT(cluster_recovery_tt_abort_valid_v1(c0));
+	if (target != 1)
+		UT_ASSERT(source_drained_fixture(typed, target));
 	return typed;
 }
 
@@ -2008,10 +2025,93 @@ UT_TEST(test_c0_dispatch_failure_error_and_final_drift_stay_sticky)
 	}
 }
 
+UT_TEST(test_c0_target_requires_its_own_completed_drain)
+{
+	ClusterColdRecordV1 record;
+	ClusterColdTypedV1 *typed = c0_fixture(&record, 2);
+	typed->source_drained[2] = false;
+	/* The writer or another source completing cannot stand in for target 2. */
+	typed->source_drained[0] = typed->source_drained[1] = true;
+	UT_ASSERT(!consume_control(typed, &record));
+	UT_ASSERT_EQ(c0_calls, 0);
+	UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+	UT_ASSERT(!source_drained_fixture(typed, 2));
+	cluster_cold_replay_window_leave_v1();
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
+UT_TEST(test_source_drain_rechecks_exact_tail_count_and_scope)
+{
+	for (int fault = 0; fault < 9; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = control_fixture(&record);
+		ClusterColdReplayResultV1 progress = { 0 };
+		uint64 count = cluster_cold_plan_replay_record_count_v1(typed->plan, 2);
+		progress.steps_done = cluster_cold_plan_step_count_v1(typed->plan);
+		progress.last_read[2] = roots[3].tail_last_record_lsn;
+		progress.last_end[2] = roots[3].validated_tail_lsn_exclusive;
+		progress.last_crc[2] = roots[3].tail_last_record_crc32c;
+		switch (fault) {
+		case 0:
+			progress.last_read[2]++;
+			break;
+		case 1:
+			progress.last_end[2]--;
+			break;
+		case 2:
+			progress.last_crc[2] ^= 1;
+			break;
+		case 3:
+			count++;
+			break;
+		case 4:
+			progress.steps_done--;
+			break;
+		case 5:
+			progress.detail = CLUSTER_COLD_REPLAY_CALLBACK;
+			break;
+		case 6:
+			tokens[1].file_txn_seq++;
+			break;
+		case 7:
+			fence_current = false;
+			break;
+		case 8:
+			cluster_cold_replay_window_leave_v1();
+			break;
+		}
+		UT_ASSERT(!cluster_cold_typed_source_drained_v1(
+			typed, (ClusterRecoveryFencePlan *)&fixture_context, 2, &progress, count));
+		UT_ASSERT(!typed->source_drained[2]);
+		UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+		UT_ASSERT(!source_drained_fixture(typed, 2));
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_source_drain_is_attempt_local_and_not_recovery_completion)
+{
+	ClusterColdRecordV1 record;
+	ClusterColdTypedV1 *typed = control_fixture(&record);
+	UT_ASSERT(source_drained_fixture(typed, 2));
+	UT_ASSERT(typed->source_drained[2]);
+	UT_ASSERT(!typed->source_drained[0] && !typed->source_drained[1]);
+	UT_ASSERT(
+		cluster_cold_typed_sync_sources_v1(typed, (ClusterRecoveryFencePlan *)&fixture_context));
+	UT_ASSERT(!typed->source_drained[2]);
+	UT_ASSERT_EQ(c0_calls, 0);
+	cluster_cold_replay_window_leave_v1();
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
 int
 main(void)
 {
-	UT_PLAN(55);
+	UT_PLAN(58);
+	UT_RUN(test_c0_target_requires_its_own_completed_drain);
+	UT_RUN(test_source_drain_rechecks_exact_tail_count_and_scope);
+	UT_RUN(test_source_drain_is_attempt_local_and_not_recovery_completion);
 	UT_RUN(test_c0_dispatch_binds_writer_and_target_separately);
 	UT_RUN(test_c0_dispatch_target_does_not_borrow_its_side_plan);
 	UT_RUN(test_c0_dispatch_requires_full_bound_source_set);

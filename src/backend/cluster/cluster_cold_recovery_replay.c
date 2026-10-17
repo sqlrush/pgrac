@@ -300,6 +300,11 @@ replay_drain(ColdReplayRun *run, uint32 participant)
 			   != cluster_cold_plan_replay_record_count_v1(run->plan, participant))
 		return replay_stop(run, CLUSTER_COLD_REPLAY_CUT_DIFFERS, participant,
 						   run->last_end[participant]);
+	if (run->ops->source_drained != NULL
+		&& !run->ops->source_drained(run->arg, participant, run->result,
+									 run->consumed[participant]))
+		return replay_stop(run, CLUSTER_COLD_REPLAY_CALLBACK, participant,
+						   run->last_end[participant]);
 	return CLUSTER_COLD_REPLAY_OK;
 }
 

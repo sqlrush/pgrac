@@ -79,6 +79,11 @@ typedef struct Harness {
 	bool refuse_unscheduled;
 	bool refuse_scheduled;
 	bool refuse_space_final;
+	bool refuse_source_drained;
+	bool drained[2];
+	uint64 drained_records[2];
+	XLogRecPtr drained_end[2];
+	uint32 drained_steps[2];
 } Harness;
 
 static RfPageVersionV1
@@ -335,7 +340,20 @@ op_space_final(void *arg, uint32 relation)
 	return !h->refuse_space_final;
 }
 
-static const ClusterColdReplayOpsV1 ops = { op_next, op_unscheduled, op_scheduled, op_space_final };
+static bool
+op_source_drained(void *arg, uint32 participant, const ClusterColdReplayResultV1 *progress,
+				  uint64 records)
+{
+	Harness *h = arg;
+	h->drained[participant] = true;
+	h->drained_records[participant] = records;
+	h->drained_end[participant] = progress->last_end[participant];
+	h->drained_steps[participant] = progress->steps_done;
+	return !h->refuse_source_drained;
+}
+
+static const ClusterColdReplayOpsV1 ops
+	= { op_next, op_unscheduled, op_scheduled, op_space_final, op_source_drained };
 
 static bool
 event_is(const Harness *h, int i, TraceKind kind, uint32 participant, XLogRecPtr read)
@@ -748,10 +766,71 @@ UT_TEST(test_unscheduled_record_handling)
 	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(NULL), CLUSTER_COLD_UNSCHEDULED_REFUSE);
 }
 
+UT_TEST(test_source_drain_notification_is_after_complete_replay)
+{
+	ClusterColdPlanV1 *plan;
+	ClusterColdReplayResultV1 result;
+	Harness h;
+	fixture(false);
+	plan = seal();
+	harness_init(&h);
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_OK);
+	UT_ASSERT(h.drained[0] && h.drained[1]);
+	UT_ASSERT_EQ(h.drained_records[0], 4);
+	UT_ASSERT_EQ(h.drained_records[1], 2);
+	UT_ASSERT_EQ(h.drained_end[0], 0x1500);
+	UT_ASSERT_EQ(h.drained_end[1], 0x1300);
+	UT_ASSERT_EQ(h.drained_steps[0], 3);
+	UT_ASSERT_EQ(h.drained_steps[1], 3);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_failed_source_or_notification_never_finishes_later_work)
+{
+	ClusterColdPlanV1 *plan;
+	ClusterColdReplayResultV1 result;
+	Harness h;
+	fixture(false);
+	plan = seal();
+	for (int fault = 0; fault < 5; fault++) {
+		harness_init(&h);
+		if (fault == 0)
+			h.refuse_unscheduled = true;
+		else if (fault == 1)
+			h.refuse_scheduled = true;
+		else if (fault == 2)
+			h.stream[1].count--;
+		else if (fault == 3)
+			h.stream[1].record[1].end_rec_ptr = 0x1400;
+		else
+			h.refuse_source_drained = true;
+		UT_ASSERT_NE(run(plan, &h, &result), CLUSTER_COLD_REPLAY_OK);
+		UT_ASSERT(!h.drained[1]);
+		if (fault == 4) {
+			UT_ASSERT(h.drained[0]);
+			UT_ASSERT_EQ(result.detail, CLUSTER_COLD_REPLAY_CALLBACK);
+		} else if (fault < 2)
+			UT_ASSERT(!h.drained[0]);
+	}
+	cluster_cold_plan_destroy_v1(&plan);
+
+	space_fixture();
+	plan = seal();
+	harness_init(&h);
+	h.refuse_source_drained = true;
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_CALLBACK);
+	UT_ASSERT_EQ(result.space_relations_finished, 0);
+	for (int i = 0; i < h.events; i++)
+		UT_ASSERT(h.trace[i].kind != T_SPACE_FINAL);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(13);
+	UT_RUN(test_source_drain_notification_is_after_complete_replay);
+	UT_RUN(test_failed_source_or_notification_never_finishes_later_work);
 	UT_RUN(test_replay_follows_schedule_and_drains);
 	UT_RUN(test_replay_page_actions);
 	UT_RUN(test_replay_scheduled_record_must_match);

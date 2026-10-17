@@ -3528,11 +3528,21 @@ cluster_typed_replay_scheduled(void *arg, uint32 participant, const ClusterColdS
 #endif
 }
 
+/* The original counted source drain supplies C0 target ordering only. */
+static bool
+cluster_typed_replay_source_drained(void *arg, uint32 participant,
+									const ClusterColdReplayResultV1 *progress, uint64 records)
+{
+	ClusterColdTypedReplay *rep = (ClusterColdTypedReplay *)arg;
+
+	return cluster_cold_typed_source_drained_v1(rep->typed, *rep->fence_plan, participant, progress,
+												records);
+}
+
 static const ClusterColdReplayOpsV1 cluster_typed_replay_ops = {
-	cluster_typed_replay_next,
-	cluster_typed_replay_unscheduled,
-	cluster_typed_replay_scheduled,
-	cluster_typed_replay_space_final,
+	cluster_typed_replay_next,			 cluster_typed_replay_unscheduled,
+	cluster_typed_replay_scheduled,		 cluster_typed_replay_space_final,
+	cluster_typed_replay_source_drained,
 };
 
 /* A sequencer stop is fatal: report it in pass-1 terms. */

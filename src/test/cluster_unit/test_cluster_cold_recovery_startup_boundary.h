@@ -930,6 +930,11 @@ fixture(void)
 		roots[thread].checkpoint_tli = roots[thread].tail_tli = 1;
 		roots[thread].checkpoint_lower_lsn = 0x100;
 		roots[thread].validated_tail_lsn_exclusive = 0x2000;
+		/* The scan fixture's final page record starts at native_redo and
+		 * has the zero CRC of its fully zero-initialized record header. */
+		roots[thread].root_flags |= CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
+		roots[thread].tail_last_record_lsn = 0x800;
+		roots[thread].tail_last_record_crc32c = 0;
 		native_redo[thread] = 0x800;
 		source_result[thread] = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 		scan_result[thread] = CLUSTER_COLD_OK;

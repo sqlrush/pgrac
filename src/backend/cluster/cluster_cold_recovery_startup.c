@@ -725,6 +725,7 @@ cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFen
 		return false;
 	/* ERROR from an original source owner must not leave a reusable OK plan. */
 	cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "pass-2 source durability is incomplete");
+	memset(typed->source_drained, 0, sizeof(typed->source_drained));
 	if (fence == NULL || !cluster_cold_replay_window_active_v1() || typed->plan == NULL
 		|| typed->replay_roots == NULL || typed->own_participant != 0 || typed->replay_count == 0
 		|| typed->replay_count > typed->participant_count
@@ -758,6 +759,42 @@ cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFen
 	/* A later source's IO must not hide earlier source or scope drift. */
 	if (!cold_replay_sources_current(typed, fence))
 		return false;
+	typed->refusal = CLUSTER_COLD_OK;
+	typed->refusal_detail[0] = '\0';
+	return true;
+}
+
+/* Only the original sequencer calls this after its counted drain. Keep
+ * the captured ROOT's exact tail proof; EOF or a source number is not one. */
+bool
+cluster_cold_typed_source_drained_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence,
+									 uint32 participant, const ClusterColdReplayResultV1 *progress,
+									 uint64 records)
+{
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK)
+		return false;
+	cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "pass-2 source drain is incomplete");
+	if (fence == NULL || !cluster_cold_replay_window_active_v1() || typed->plan == NULL
+		|| typed->replay_roots == NULL || typed->own_participant != 0 || typed->replay_count == 0
+		|| typed->replay_count > typed->participant_count
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->replay_root_count != typed->replay_count
+		|| cluster_cold_plan_participant_count_v1(typed->plan) != typed->participant_count
+		|| participant >= typed->participant_count || progress == NULL
+		|| progress->detail != CLUSTER_COLD_REPLAY_OK
+		|| progress->steps_done != cluster_cold_plan_step_count_v1(typed->plan)
+		|| records != cluster_cold_plan_replay_record_count_v1(typed->plan, participant)
+		|| !cold_replay_sources_current(typed, fence))
+		return false;
+	/* Founder/history/empty inputs do not acquire target mutation or base
+	 * coverage here. Their existing final completion owners remain required. */
+	if (participant < typed->replay_count && participant != typed->own_participant
+		&& records != 0) {
+		if (!cluster_cold_completion_proven_v1(typed->plan, &typed->replay_roots[participant].root,
+											   progress, participant))
+			return false;
+		typed->source_drained[participant] = true;
+	}
 	typed->refusal = CLUSTER_COLD_OK;
 	typed->refusal_detail[0] = '\0';
 	return true;
@@ -1008,7 +1045,11 @@ cold_recovery_abort_record(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *
 	}
 	/* A history claim or own restart input is not a borrowed current
 	 * mutation authority. Do not substitute a newer generation of the thread. */
-	return match != UINT32_MAX && cold_participant_authority(typed, fence, match, &target)
+	/* Same-source C0 follows its original stream prefix. A different source
+	 * must have consumed its complete captured cut first; never compare LSNs
+	 * from different streams or treat the writer checkpoint as target cover. */
+	return match != UINT32_MAX && (match == participant || typed->source_drained[match])
+		   && cold_participant_authority(typed, fence, match, &target)
 		   && cluster_undo_recovery_abort_replay_v1(plan, index, identity, writer, &target)
 		   && cold_control_authority_current(&target);
 }

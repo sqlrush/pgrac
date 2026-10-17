@@ -423,6 +423,8 @@ typedef enum ClusterColdReplayDetailV1 {
 	CLUSTER_COLD_REPLAY_CALLBACK = 8	   /* a callback refused the record */
 } ClusterColdReplayDetailV1;
 
+struct ClusterColdReplayResultV1;
+
 typedef struct ClusterColdReplayOpsV1 {
 	/* Next record of a participant; false at end of stream or on failure. */
 	bool (*next)(void *arg, uint32 participant, ClusterColdReplayRecordV1 *out);
@@ -436,6 +438,10 @@ typedef struct ClusterColdReplayOpsV1 {
 	 * inputs, or verify the physical result of an already executed DROP;
 	 * required when the plan has SPACE relations. */
 	bool (*space_final)(void *arg, uint32 relation);
+	/* Optional owner notification after all scheduled steps and this source's
+	 * exact counted drain. A refusal stops before later sources/finalization. */
+	bool (*source_drained)(void *arg, uint32 participant,
+						   const struct ClusterColdReplayResultV1 *progress, uint64 records);
 } ClusterColdReplayOpsV1;
 
 typedef struct ClusterColdReplayResultV1 {
@@ -707,6 +713,7 @@ typedef struct ClusterColdTypedV1 {
 	uint32 own_participant;
 	struct ClusterColdReplayRootV1 *replay_roots; /* original pass-1 selection, not fresh roots */
 	uint32 replay_root_count;
+	bool source_drained[CLUSTER_COLD_MAX_PARTICIPANTS]; /* this pass-2 attempt only */
 	/* Per crashed source, including its retained pre-redo records. Each plan
 	 * binds the complete retained source set; that does not authorize target
 	 * mutation. History-only generations retain the original census path. */
@@ -730,6 +737,14 @@ extern void cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed);
  * completion authority is created; a refusal invalidates this typed attempt. */
 extern bool cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed,
 											   struct ClusterRecoveryFencePlan *fence);
+
+/* Bind the original sequencer's completed source to its captured ROOT.
+ * This is redo ordering only, not terminal, service or OPEN authority. */
+extern bool cluster_cold_typed_source_drained_v1(ClusterColdTypedV1 *typed,
+												 struct ClusterRecoveryFencePlan *fence,
+												 uint32 participant,
+												 const ClusterColdReplayResultV1 *progress,
+												 uint64 records);
 
 /* Consume one original foreign control or record-local native SIDE effect
  * under its existing cold authority. Selection never authorizes a full source

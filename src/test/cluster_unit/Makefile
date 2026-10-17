@@ -8945,7 +8945,12 @@ test_cluster_cold_recovery_startup_plan_core.o: $(top_srcdir)/src/backend/cluste
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 
+test_cluster_cold_source_completion.inc: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_io.c Makefile
+	awk '/^cluster_cold_completion_proven_v1\(/ { print "bool"; emit=1; count++ } emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_test.h $(CLUSTER_COLD_STARTUP_O) \
+		test_cluster_cold_source_completion.inc \
 		test_cluster_cold_recovery_startup_boundary.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
