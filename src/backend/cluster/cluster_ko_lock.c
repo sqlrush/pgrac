@@ -369,6 +369,7 @@ struct ClusterKoCompletionV2 {
 	dsa_pointer native_allocation;
 	ClusterKoNativeContinuation *native_reserved;
 	ClusterKoSharedMessageV2 barrier_request;
+	/* v3 captures these at registration; completion is checked separately. */
 	ClusterKoSharedMessageV3 barrier_request_v3;
 	uint64 barrier_boots[CLUSTER_KO_SHARED_NODE_LIMIT];
 	ClusterPageWalBindingV1 terminal;
@@ -6957,35 +6958,90 @@ ko_shared_wait_for_acks_v3(ClusterKoSharedMessageV3 *request, uint32 mask,
 	return false;
 }
 
+/* Spec: 2026-10-16-pre2-p014-am05-shared-ddl-autocommit.md
+ * Consume only the original, still-unsent registration. A later execution
+ * must not allocate another batch or refresh the transaction's identity. */
+static bool
+ko_shared_registered_v3(RelFileLocator locator, uint16 operation, const KoAxBinding *binding,
+						const ClusterKoCompletionV2 *completion, ClusterKoSharedContext *out)
+{
+	const ClusterKoCompletionV2 *owned = *ko_completion_link(completion);
+	const ClusterKoSharedMessageV3 *request;
+	bool valid;
+
+	if (owned == NULL || binding == NULL || ko_state == NULL || out == NULL
+		|| owned->pid != MyProcPid || !ko_completion_owner_current(owned)
+		|| CritSectionCount != 0 || !owned->barrier_v3 || owned->barrier_private
+		|| owned->native_handed_off || owned->space_observed
+		|| owned->slot >= CLUSTER_KO_SHARED_CAPACITY || owned->serial == 0
+		|| !DsaPointerIsValid(owned->native_allocation) || owned->native_reserved == NULL)
+		return false;
+	request = &owned->barrier_request_v3;
+	if (!RelFileLocatorEquals(locator, request->base.key.locator) || operation != request->operation
+		|| memcmp(&binding->resid, &request->ax_resid, sizeof(binding->resid)) != 0
+		|| memcmp(&binding->holder, &request->ax_holder, sizeof(binding->holder)) != 0
+		|| binding->request_id != request->ax_request_id
+		|| binding->master_node != request->ax_master_node
+		|| binding->master_generation != request->ax_master_generation)
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	*out = ko_state->contexts[owned->slot];
+	valid = out->used && out->v3 && !out->complete && !out->origin_detached
+		&& !out->ax_release_requested && !out->ax_failed && !out->structure_owned
+		&& out->pid == owned->pid && out->serial == owned->serial
+		&& (out->request_sent_peers | out->request_sending_peers | out->request_uncertain_peers
+			| out->request_done_peers | out->request_failed_peers) == 0
+		&& memcmp(&out->request, &request->base, sizeof(out->request)) == 0
+		&& memcmp(&out->request_v3, request, sizeof(*request)) == 0
+		&& memcmp(out->peer_boots, owned->barrier_boots, sizeof(out->peer_boots)) == 0;
+	SpinLockRelease(&ko_state->shared_lock);
+	return valid && ko_shared_origin_current(out) && ko_shared_v3_local_binding_current(request);
+}
+
 static bool
 ko_run_shared_barrier_impl_v3(RelFileLocator locator, uint16 operation,
 							  const KoAxBinding *binding, ClusterKoCompletionV2 *completion)
 {
 	ClusterKoSharedMessageV3 request = { 0 };
+	ClusterKoSharedContext registered;
 	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT];
 	uint64 batch_id;
 	uint32 mask;
 	int context;
 	volatile bool begun = false, ok = false;
 
-	if (!ko_shared_prepare_request_v3(locator, operation, binding, &request, boots, &mask))
-		return false;
-	if (!ko_shared_v3_local_binding_current(&request))
-		return false;
-	if (mask == 0 && completion == NULL) {
-		KO_BUMP(native_count);
-		return true;
+	if (completion != NULL) {
+		if (!ko_shared_registered_v3(locator, operation, binding, completion, &registered))
+			return false;
+		request = registered.request_v3;
+		memcpy(boots, registered.peer_boots, sizeof(boots));
+		mask = 0;
+		for (unsigned n = 0; n < CLUSTER_KO_SHARED_NODE_LIMIT; n++)
+			if (n != cluster_node_id && boots[n] != 0)
+				mask |= 1u << n;
+		context = completion->slot;
+	} else {
+		if (!ko_shared_prepare_request_v3(locator, operation, binding, &request, boots, &mask)
+			|| !ko_shared_v3_local_binding_current(&request))
+			return false;
+		if (mask == 0) {
+			KO_BUMP(native_count);
+			return true;
+		}
+		context = ko_shared_reserve_v3(&request, boots, NULL);
+		if (context < 0)
+			return false;
+		SpinLockAcquire(&ko_state->shared_lock);
+		registered = ko_state->contexts[context];
+		SpinLockRelease(&ko_state->shared_lock);
 	}
-	context = ko_shared_reserve_v3(&request, boots, completion);
-	if (context < 0)
-		return false;
 	batch_id = request.base.batch_id;
 	PG_TRY();
 	{
 		/* Reserve transaction-owned publication before any peer REQUEST can
 		 * escape. Abort discards it through the original invalidation owner;
 		 * registration failure unwinds only this still-unsent reservation. */
-		if (mask != 0)
+		if (mask != 0 && completion == NULL)
 			CacheInvalidateKoCommit(batch_id);
 		if (mask == 0) {
 			ClusterKoSharedContext scope = { 0 };
@@ -7004,13 +7060,25 @@ ko_run_shared_barrier_impl_v3(RelFileLocator locator, uint16 operation,
 	}
 	PG_FINALLY();
 	{
+		ClusterKoSharedContext *current;
+
 		SpinLockAcquire(&ko_state->shared_lock);
-		if (ok && completion != NULL)
-			ko_state->contexts[context].complete = true;
-		else if (!ok)
-			ko_state->contexts[context].origin_detached = true;
-		else
-			memset(&ko_state->contexts[context], 0, sizeof(ko_state->contexts[context]));
+		current = &ko_state->contexts[context];
+		if (current->used && current->v3 && current->pid == registered.pid
+			&& current->serial == registered.serial && !current->structure_owned
+			&& memcmp(&current->request_v3, &registered.request_v3,
+					  sizeof(current->request_v3)) == 0
+			&& memcmp(current->peer_boots, registered.peer_boots, sizeof(current->peer_boots)) == 0) {
+			if (ok && completion != NULL)
+				ok = ko_shared_ready_v3(current);
+			if (ok && completion != NULL)
+				current->complete = true;
+			else if (!ok)
+				current->origin_detached = true;
+			else
+				memset(current, 0, sizeof(*current));
+		} else
+			ok = false;
 		SpinLockRelease(&ko_state->shared_lock);
 		if (begun)
 			cluster_sinval_ack_wait_remove(batch_id);
@@ -7128,6 +7196,15 @@ ko_flush_and_wait_ack(RelFileLocator rloc, char relpersistence, ClusterKoComplet
 		return;
 	if (cluster_node_id < 0 || RecoveryInProgress())
 		return;
+	if (binding != NULL && completion != NULL) {
+		ClusterKoSharedContext registered;
+
+		if (!ko_shared_registered_v3(rloc, operation, binding, completion, &registered))
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE),
+					 errmsg("the registered KO v3 operation is no longer current"),
+					 errhint("Retry the transaction after the relation grant and formation are stable.")));
+	}
 	/* The caller holds exclusive lifecycle authority. A parked range from
 	 * before a truncate/reset must not survive until this file regrows.
 	 * Discard even when there are no peers; aborted DDL only orphans it. */
@@ -7285,11 +7362,31 @@ cluster_ko_shared_begin_v2(RelFileLocator rloc, char relpersistence, ClusterKoCo
 	return true;
 }
 
+static void
+ko_shared_registration_error_v3(ClusterKoCompletionV2 **completion, int sqlerrcode)
+{
+	ClusterKoCompletionV2 *owned = *completion;
+
+	SpinLockAcquire(&ko_state->shared_lock);
+	if (owned->slot < CLUSTER_KO_SHARED_CAPACITY
+		&& ko_state->contexts[owned->slot].used
+		&& ko_state->contexts[owned->slot].pid == owned->pid
+		&& ko_state->contexts[owned->slot].serial == owned->serial)
+		ko_state->contexts[owned->slot].cancel_sqlerrcode = sqlerrcode;
+	SpinLockRelease(&ko_state->shared_lock);
+	cluster_ko_shared_release_v2(completion);
+}
+
+/* Registration owns only the original allocation, identity and reversible
+ * commit publication. It neither runs an object barrier nor proves READY. */
 static bool
 ko_shared_begin_v3(RelFileLocator rloc, char relpersistence, uint16 operation,
 					const KoAxBinding *binding, ClusterKoCompletionV2 **out)
 {
 	ClusterKoCompletionV2 *completion;
+	ClusterKoSharedMessageV3 request = { 0 };
+	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT];
+	uint32 mask;
 
 	if (out == NULL || *out != NULL || binding == NULL || !cluster_enabled
 		|| !cluster_shared_config || ko_state == NULL || relpersistence == RELPERSISTENCE_TEMP
@@ -7316,18 +7413,22 @@ ko_shared_begin_v3(RelFileLocator rloc, char relpersistence, uint16 operation,
 			ereport(ERROR,
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("could not reserve the KO v3 completion owner")));
-		ko_flush_and_wait_ack(rloc, relpersistence, completion, operation, binding);
+		if (!ko_shared_prepare_request_v3(rloc, operation, binding, &request, boots, &mask)
+			|| !ko_shared_v3_local_binding_current(&request)
+			|| ko_shared_reserve_v3(&request, boots, completion) < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE),
+					 errmsg("could not register the KO v3 operation"),
+					 errhint("Retry after the relation identity, grant and formation are stable.")));
+		completion->barrier_v3 = true;
+		completion->barrier_request_v3 = request;
+		memcpy(completion->barrier_boots, boots, sizeof(boots));
+		if (mask != 0)
+			CacheInvalidateKoCommit(request.base.batch_id);
 	}
 	PG_CATCH();
 	{
-		int sqlerrcode = geterrcode();
-		SpinLockAcquire(&ko_state->shared_lock);
-		if (completion->slot < CLUSTER_KO_SHARED_CAPACITY
-			&& ko_state->contexts[completion->slot].used
-			&& ko_state->contexts[completion->slot].serial == completion->serial)
-			ko_state->contexts[completion->slot].cancel_sqlerrcode = sqlerrcode;
-		SpinLockRelease(&ko_state->shared_lock);
-		cluster_ko_shared_release_v2(&completion);
+		ko_shared_registration_error_v3(&completion, geterrcode());
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -7358,6 +7459,16 @@ cluster_ko_flush_and_wait_ack_relation(Relation rel, char relpersistence, uint16
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE),
 					 errmsg("could not retain the KO v3 completion owner")));
+		PG_TRY();
+		{
+			ko_flush_and_wait_ack(rel->rd_locator, relpersistence, completion, operation, &binding);
+		}
+		PG_CATCH();
+		{
+			ko_shared_registration_error_v3(&completion, geterrcode());
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
 		completion->owner = CurTransactionResourceOwner;
 		completion->native_transaction = true;
 		completion->barrier_v3 = true;
