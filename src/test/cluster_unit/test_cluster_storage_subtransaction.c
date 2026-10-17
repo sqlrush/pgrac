@@ -164,7 +164,7 @@ UT_TEST(test_temp_and_disabled_storage_keep_native_eligibility)
 	UT_ASSERT(!delete_registered);
 }
 
-UT_TEST(test_shared_relation_path_classification_for_ddl_guard)
+UT_TEST(test_shared_relation_path_classification_for_ddl_routing)
 {
 	reset();
 	UT_ASSERT(RelationStorageUsesClusterSharedPath(locator,
@@ -706,7 +706,7 @@ main(void)
 	UT_RUN(test_child_truncate_refuses_before_flush_or_structure);
 	UT_RUN(test_private_child_create_keeps_native_cleanup);
 	UT_RUN(test_temp_and_disabled_storage_keep_native_eligibility);
-	UT_RUN(test_shared_relation_path_classification_for_ddl_guard);
+	UT_RUN(test_shared_relation_path_classification_for_ddl_routing);
 	UT_RUN(test_shared_catalog_and_internal_create_cannot_bypass_refusal);
 	UT_RUN(test_native_create_registers_abort_cleanup_before_space);
 	UT_RUN(test_rdma_tier_drop_refuses_before_any_storage_effect);

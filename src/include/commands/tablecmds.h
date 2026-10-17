@@ -29,10 +29,6 @@ extern ObjectAddress DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 
 extern void RemoveRelations(DropStmt *drop);
 extern void CheckRelationsStorageDrop(DropStmt *drop);
-#ifdef USE_PGRAC_CLUSTER
-extern bool ClusterSharedDropHasTarget(DropStmt *drop);
-extern bool ClusterSharedTruncateHasTarget(TruncateStmt *stmt);
-#endif
 
 extern Oid	AlterTableLookupRelation(AlterTableStmt *stmt, LOCKMODE lockmode);
 

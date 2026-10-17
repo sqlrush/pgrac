@@ -176,9 +176,9 @@ RelationCheckStorageDrain(RelFileLocator rlocator, char relpersistence, const ch
 
 /*
  * Return the same storage admission decision used by smgropen for a
- * relation that is about to be removed or truncated.  Utility preflight uses
- * this read-only predicate to select the non-transactional shared DDL rule;
- * temporary and ordinary PostgreSQL relations remain on their native path.
+ * relation that is about to be removed or truncated.  This read-only
+ * classification does not impose a transaction policy; temporary and
+ * backend-local relations remain on their native storage path.
  */
 bool
 RelationStorageUsesClusterSharedPath(RelFileLocator rlocator, BackendId backend,
