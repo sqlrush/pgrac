@@ -2065,9 +2065,13 @@ ExecuteTruncateGuts(List *explicit_rels,
 		 * a new relfilenumber in the current (sub)transaction, then we can
 		 * just truncate it in-place, because a rollback would cause the whole
 		 * table or the current physical file to be thrown away anyway.
+		 * Shared storage always takes the new-file path: the committed object
+		 * drain retires the old locator, which must not be reused in-place.
 		 */
-		if (rel->rd_createSubid == mySubid ||
-			rel->rd_newRelfilelocatorSubid == mySubid)
+		if ((rel->rd_createSubid == mySubid ||
+			 rel->rd_newRelfilelocatorSubid == mySubid) &&
+			!RelationStorageUsesClusterSharedPath(rel->rd_locator, rel->rd_backend,
+													 rel->rd_rel->relpersistence))
 		{
 			/* Immediate, non-rollbackable truncation is OK */
 			heap_truncate_one_rel(rel);

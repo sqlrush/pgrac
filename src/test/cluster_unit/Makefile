@@ -2557,6 +2557,20 @@ test_cluster_storage_truncate_gate.inc: $(top_srcdir)/src/backend/commands/table
 	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Execute the original per-relation storage loop, after trigger/preflight work.
+# Catalog replacement, TOAST opening and index rebuild are fixture boundaries.
+test_cluster_storage_truncate_apply.inc: $(top_srcdir)/src/backend/commands/tablecmds.c Makefile
+	awk '/^typedef struct ForeignTruncateInfo$$/ { type=1; types++ } \
+	     type { print } /^} ForeignTruncateInfo;/ { type=0 } \
+	     /^ExecuteTruncateGuts\(/ { inside=1 } \
+	     inside && /^\tmySubid = GetCurrentSubTransactionId\(\);/ \
+	     { print "static void execute_truncate_storage_fixture(List *rels) { HTAB *ft_htab = NULL; SubTransactionId mySubid; ListCell *cell;"; emit=1; found++ } \
+	     emit && /^\t\/\* Now go through the hash table, and truncate foreign tables \*\// \
+	     { print "UT_ASSERT(ft_htab == NULL); }"; emit=0; done++ } \
+	     emit { print } /^}/ { inside=0 } \
+	     END { if (types != 1 || found != 1 || done != 1 || type || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_storage_owned_gate.inc: $(top_srcdir)/src/backend/catalog/pg_shdepend.c Makefile
 	awk '/^shdepDropOwnedInternal\(/ { print "static void"; emit=1; found++ } \
 	     /^shdep(CheckOwnedStorageDrop|DropOwned)\(/ { print "void"; emit=1; found++ } \
@@ -2564,7 +2578,7 @@ test_cluster_storage_owned_gate.inc: $(top_srcdir)/src/backend/catalog/pg_shdepe
 	     END { if (found != 3 || done != 3 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_storage_subtransaction: test_cluster_storage_delete_gate.inc test_cluster_storage_truncate_gate.inc test_cluster_storage_owned_gate.inc $(top_srcdir)/src/backend/nodes/list.c
+test_cluster_storage_subtransaction: test_cluster_storage_delete_gate.inc test_cluster_storage_truncate_gate.inc test_cluster_storage_truncate_apply.inc test_cluster_storage_owned_gate.inc $(top_srcdir)/src/backend/nodes/list.c
 
 test_cluster_space_storage test_cluster_storage_subtransaction: %: %.c test_cluster_space_storage.c test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc unit_test.h test_cluster_space_catalog_product.o test_cluster_space_smgrdesc_product.o test_cluster_side_xact_xactdesc.o \
 		$(top_builddir)/src/backend/storage/page/checksum.o \

@@ -297,10 +297,20 @@ UT_TEST(test_rdma_tier_truncate_refuses_before_flush_or_structure)
 static RelationData deletion_relations[2];
 static FormData_pg_class deletion_forms[2];
 static unsigned deletion_effects, deletion_events;
+static bool truncate_route_active;
+static RelationData truncate_route_relations[4];
+static FormData_pg_class truncate_route_forms[4];
+static unsigned truncate_toast_opens;
 
 Relation
 relation_open(Oid oid, LOCKMODE lockmode)
 {
+	if (truncate_route_active) {
+		UT_ASSERT_EQ(oid, 9101);
+		UT_ASSERT_EQ(lockmode, AccessExclusiveLock);
+		truncate_toast_opens++;
+		return &truncate_route_relations[1];
+	}
 	UT_ASSERT(oid == 9100 || oid == 9101);
 	UT_ASSERT_EQ(lockmode, NoLock);
 	return &deletion_relations[oid - 9100];
@@ -696,11 +706,226 @@ UT_TEST(test_storage_drain_tier_gate_preserves_temp_private_and_disabled)
 	}
 }
 
+/* AM05: exercise the unmodified per-relation loop from ExecuteTruncateGuts.
+ * Only catalog/physical replacement and index effects below are fixtures;
+ * the storage route classifier is the real catalog/storage.c implementation.
+ * This is not a full SQL, trigger or COMMIT/fabric test. */
+#include "catalog/index.h"
+#include "foreign/fdwapi.h"
+#include "storage/predicate.h"
+#include "utils/lsyscache.h"
+
+static unsigned truncate_inplace_calls, truncate_new_calls, truncate_index_calls;
+static unsigned truncate_conflict_calls, truncate_stat_calls;
+static Oid truncate_index_oid;
+static bool truncate_new_error;
+
+SubTransactionId
+GetCurrentSubTransactionId(void)
+{
+	return 7;
+}
+
+void
+heap_truncate_one_rel(Relation rel)
+{
+	UT_ASSERT(truncate_route_active);
+	truncate_inplace_calls++;
+}
+
+void
+CheckTableForSerializableConflictIn(Relation rel)
+{
+	UT_ASSERT(truncate_route_active);
+	truncate_conflict_calls++;
+}
+
+void
+RelationSetNewRelfilenumber(Relation rel, char persistence)
+{
+	UT_ASSERT(truncate_route_active);
+	UT_ASSERT_EQ(persistence, rel->rd_rel->relpersistence);
+	truncate_new_calls++;
+	if (truncate_new_error)
+		ereport(ERROR, (errmsg("fixture new-storage failure")));
+	/* Catalog and file creation are explicit boundaries. Give each real
+	 * caller-selected replacement an independently distinct fixture locator. */
+	rel->rd_locator.relNumber = 50000 + truncate_new_calls;
+	rel->rd_newRelfilelocatorSubid = 7;
+}
+
+bool
+reindex_relation(Oid relid, int flags, ReindexParams *params)
+{
+	UT_ASSERT(truncate_route_active);
+	UT_ASSERT_EQ(flags, REINDEX_REL_PROCESS_TOAST);
+	UT_ASSERT_EQ(params->options, 0);
+	truncate_index_calls++;
+	truncate_index_oid = relid;
+	return true;
+}
+
+void
+pgstat_count_truncate(Relation rel)
+{
+	UT_ASSERT(truncate_route_active);
+	truncate_stat_calls++;
+}
+
+Oid
+GetForeignServerIdByRelId(Oid relid)
+{
+	/* Foreign-server execution is outside this storage-route fixture. */
+	abort();
+}
+
+#include "test_cluster_storage_truncate_apply.inc"
+
+static void
+reset_truncate_route(void)
+{
+	/* The original smgr selector fixture checks one exact locator per call. */
+	locator.relNumber = 20000;
+	reset();
+	truncate_route_active = true;
+	truncate_new_error = false;
+	truncate_inplace_calls = truncate_new_calls = truncate_index_calls = 0;
+	truncate_conflict_calls = truncate_stat_calls = truncate_toast_opens = 0;
+	truncate_index_oid = InvalidOid;
+	memset(truncate_route_relations, 0, sizeof(truncate_route_relations));
+	memset(truncate_route_forms, 0, sizeof(truncate_route_forms));
+	for (unsigned i = 0; i < lengthof(truncate_route_relations); i++) {
+		Relation rel = &truncate_route_relations[i];
+		rel->rd_id = 9100 + i;
+		rel->rd_locator = locator;
+		rel->rd_locator.relNumber = 20000 + i;
+		rel->rd_backend = InvalidBackendId;
+		rel->rd_rel = &truncate_route_forms[i];
+		rel->rd_rel->relkind = RELKIND_RELATION;
+		rel->rd_rel->relpersistence = RELPERSISTENCE_PERMANENT;
+	}
+}
+
+UT_TEST(test_shared_transaction_local_storage_always_selects_new_locator)
+{
+	for (unsigned shape = 0; shape < 4; shape++) {
+		Relation rel;
+		List *rels;
+		reset_truncate_route();
+		rel = &truncate_route_relations[0];
+		rel->rd_createSubid = shape & 1 ? 0 : 7;
+		rel->rd_newRelfilelocatorSubid = shape & 1 ? 7 : 0;
+		rel->rd_rel->relpersistence = shape & 2 ? RELPERSISTENCE_UNLOGGED
+												  : RELPERSISTENCE_PERMANENT;
+		rels = list_make1(rel);
+		execute_truncate_storage_fixture(rels);
+		UT_ASSERT_EQ(truncate_inplace_calls, 0);
+		UT_ASSERT_EQ(truncate_new_calls, 1);
+		UT_ASSERT_EQ(truncate_index_calls, 1);
+		UT_ASSERT_EQ(truncate_conflict_calls, 1);
+		UT_ASSERT_EQ(truncate_stat_calls, 1);
+		UT_ASSERT_EQ(truncate_index_oid, 9100);
+		UT_ASSERT_EQ(rel->rd_locator.relNumber, 50001);
+		/* A second TRUNCATE in the same transaction also replaces storage. */
+		locator = rel->rd_locator;
+		execute_truncate_storage_fixture(rels);
+		UT_ASSERT_EQ(truncate_inplace_calls, 0);
+		UT_ASSERT_EQ(truncate_new_calls, 2);
+		UT_ASSERT_EQ(truncate_index_calls, 2);
+		UT_ASSERT_EQ(rel->rd_locator.relNumber, 50002);
+		list_free(rels);
+	}
+	truncate_route_active = false;
+	locator.relNumber = 16384;
+}
+
+UT_TEST(test_native_truncate_retains_its_original_local_transaction_choice)
+{
+	for (unsigned route = 0; route < 4; route++) {
+		for (unsigned local = 0; local < 3; local++) {
+			Relation rel;
+			List *rels;
+			reset_truncate_route();
+			rel = &truncate_route_relations[0];
+			if (route == 0) shared = false;
+			if (route == 1) rel->rd_rel->relpersistence = RELPERSISTENCE_TEMP;
+			if (route == 2) rel->rd_backend = 1;
+			if (route == 3) cluster_enabled = false;
+			rel->rd_createSubid = local == 1 ? 7 : 0;
+			rel->rd_newRelfilelocatorSubid = local == 2 ? 7 : 0;
+			rels = list_make1(rel);
+			execute_truncate_storage_fixture(rels);
+			UT_ASSERT_EQ(truncate_inplace_calls, local == 0 ? 0 : 1);
+			UT_ASSERT_EQ(truncate_new_calls, local == 0 ? 1 : 0);
+			UT_ASSERT_EQ(truncate_index_calls, local == 0 ? 1 : 0);
+			UT_ASSERT_EQ(truncate_stat_calls, 1);
+			list_free(rels);
+		}
+	}
+	truncate_route_active = false;
+	locator.relNumber = 16384;
+}
+
+UT_TEST(test_shared_route_keeps_toast_indexes_and_mixed_relation_ownership)
+{
+	List *rels;
+	reset_truncate_route();
+	truncate_route_relations[0].rd_createSubid = 7;
+	truncate_route_forms[0].reltoastrelid = 9101;
+	truncate_route_forms[1].relkind = RELKIND_TOASTVALUE;
+	truncate_route_forms[2].relpersistence = RELPERSISTENCE_TEMP;
+	truncate_route_relations[2].rd_createSubid = 7;
+	truncate_route_forms[3].relkind = RELKIND_PARTITIONED_TABLE;
+	truncate_route_relations[3].rd_createSubid = 7;
+	rels = list_make3(&truncate_route_relations[0], &truncate_route_relations[2],
+					  &truncate_route_relations[3]);
+	execute_truncate_storage_fixture(rels);
+	UT_ASSERT_EQ(truncate_inplace_calls, 1);
+	UT_ASSERT_EQ(truncate_new_calls, 2);
+	UT_ASSERT_EQ(truncate_toast_opens, 1);
+	UT_ASSERT_EQ(truncate_index_calls, 1);
+	UT_ASSERT_EQ(truncate_index_oid, 9100);
+	UT_ASSERT_EQ(truncate_stat_calls, 2);
+	UT_ASSERT_EQ(truncate_route_relations[0].rd_locator.relNumber, 50001);
+	UT_ASSERT_EQ(truncate_route_relations[1].rd_locator.relNumber, 50002);
+	UT_ASSERT_EQ(truncate_route_relations[2].rd_locator.relNumber, 20002);
+	UT_ASSERT_EQ(truncate_route_relations[3].rd_locator.relNumber, 20003);
+	list_free(rels);
+	truncate_route_active = false;
+	locator.relNumber = 16384;
+}
+
+UT_TEST(test_failed_shared_replacement_never_falls_back_to_inplace)
+{
+	List *rels;
+	volatile bool caught = false;
+	reset_truncate_route();
+	truncate_route_relations[0].rd_createSubid = 7;
+	truncate_new_error = expecting_error = true;
+	rels = list_make1(&truncate_route_relations[0]);
+	PG_TRY();
+	{
+		execute_truncate_storage_fixture(rels);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(truncate_inplace_calls + truncate_index_calls + truncate_stat_calls, 0);
+	UT_ASSERT_EQ(truncate_new_calls, 1);
+	UT_ASSERT_EQ(truncate_route_relations[0].rd_locator.relNumber, 20000);
+	list_free(rels);
+	truncate_route_active = false;
+	locator.relNumber = 16384;
+}
+
 int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(15);
+	UT_PLAN(19);
 	UT_RUN(test_child_create_refuses_before_storage_or_abort_owner);
 	UT_RUN(test_child_drop_refuses_before_ko_or_pending_delete);
 	UT_RUN(test_child_truncate_refuses_before_flush_or_structure);
@@ -716,6 +941,10 @@ main(void)
 	UT_RUN(test_rdma_drop_owned_refuses_before_acl_or_policy_changes);
 	UT_RUN(test_drop_owned_executes_only_its_checked_workset);
 	UT_RUN(test_storage_drain_tier_gate_preserves_temp_private_and_disabled);
+	UT_RUN(test_shared_transaction_local_storage_always_selects_new_locator);
+	UT_RUN(test_native_truncate_retains_its_original_local_transaction_choice);
+	UT_RUN(test_shared_route_keeps_toast_indexes_and_mixed_relation_ownership);
+	UT_RUN(test_failed_shared_replacement_never_falls_back_to_inplace);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
