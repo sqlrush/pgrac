@@ -11050,6 +11050,7 @@ typedef struct RecoveryWalVisitWork {
 	ControlFileData control;
 	ClusterWalTailObservation tail;
 	LOCKMODE cf_mode;
+	bool native_checkpoint;
 } RecoveryWalVisitWork;
 
 static ClusterControlRootResult
@@ -11062,8 +11063,8 @@ recovery_wal_visit_root(RecoveryWalVisitWork *work)
 	if (!acquire_clusterwide_cf(ShareLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	work->cf_mode = ShareLock;
-	result = read_thread_version(&work->expected.identity, &work->image, &work->control,
-								 &file_token, CONTROL_ROOT_HEADER_VERSION_V3);
+	result = read_thread_input(&work->expected.identity, &work->image, &work->control, &file_token,
+							   CONTROL_ROOT_HEADER_VERSION_V3, work->native_checkpoint);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		make_read_token(&work->image, node + 1, CONTROL_ROOT_SOURCE_PRIMARY, &actual);
 		if (!read_token_equal(&work->token, &actual)
@@ -11134,6 +11135,59 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *expect
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		*out = work->ref;
 		*native_redo = work->control.checkPointCopy.redo;
+	}
+	pfree(work);
+	return result;
+}
+
+ClusterControlRootResult
+cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *expected,
+											const ClusterControlRootReadToken *token,
+											ClusterWalRecoveryCheckpointV1 *out)
+{
+	RecoveryWalVisitWork *work;
+	ClusterControlRootResult result;
+
+	if (history_ranges_overlap(expected, sizeof(*expected), out, sizeof(*out))
+		|| history_ranges_overlap(token, sizeof(*token), out, sizeof(*out)))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (expected == NULL || token == NULL || out == NULL || expected->identity.origin_node_id < 0
+		|| expected->identity.origin_node_id >= CLUSTER_MAX_NODES
+		|| expected->identity.origin_thread_id != expected->identity.origin_node_id + 1
+		|| expected->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!cluster_enabled || !cluster_shared_config || !cluster_controlfile_shared_authority
+		|| CritSectionCount != 0 || expected->identity.system_identifier != GetSystemIdentifier())
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	result = storage_contract_check(expected->identity.storage_uuid, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	work = palloc0(sizeof(*work));
+	work->expected = *expected;
+	work->token = *token;
+	work->native_checkpoint = true;
+	PG_TRY();
+	{
+		result = recovery_wal_visit_root(work);
+	}
+	PG_CATCH();
+	{
+		if (work->cf_mode != NoLock)
+			(void)release_cf(work->cf_mode, CLUSTER_CONTROL_ROOT_IO_ERROR);
+		pfree(work);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	/* Publish only after the original CF release is confirmed. In particular
+	 * never export the common nextXid projection as this source's base era. */
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		out->source = work->ref;
+		out->checkpoint_start = work->control.checkPoint;
+		memcpy(&out->checkpoint, &work->control.checkPointCopy, sizeof(out->checkpoint));
 	}
 	pfree(work);
 	return result;

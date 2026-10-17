@@ -69,6 +69,8 @@ int cluster_cold_recovery_plan_memory = CLUSTER_COLD_PLAN_MEMORY_DEFAULT_KB;
 typedef struct ClusterColdReplayRootV1 {
 	ClusterControlRootSnapshot root;
 	ClusterControlRootReadToken token;
+	XLogRecPtr checkpoint_start;
+	CheckPoint native_checkpoint;
 } ColdRoot;
 
 static const char *
@@ -155,29 +157,33 @@ cold_own_root(ClusterColdTypedV1 *typed, uint16 own_thread, ColdRoot *out)
 	return true;
 }
 
-/* Exact source, native redo and cut of one sealed root, from its token. */
+/* Exact source, complete native checkpoint and cut from the original token.
+ * This binds input only, not a TT slot's era or a winner/loser decision. */
 static bool
-cold_participant(ClusterColdTypedV1 *typed, const ColdRoot *root, uint32 index)
+cold_participant(ClusterColdTypedV1 *typed, ColdRoot *root, uint32 index)
 {
 	ClusterColdParticipantV1 *participant = &typed->participants[index];
 	ClusterControlRootResult result;
-	XLogRecPtr native_redo = InvalidXLogRecPtr;
+	ClusterWalRecoveryCheckpointV1 selected;
 
-	result = cluster_control_root_recovery_source_v1(&root->root, &root->token,
-													 &typed->sources[index], &native_redo);
-	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || native_redo < root->root.checkpoint_lower_lsn
-		|| native_redo > root->root.validated_tail_lsn_exclusive) {
+	result = cluster_control_root_recovery_checkpoint_v1(&root->root, &root->token, &selected);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| selected.checkpoint.redo < root->root.checkpoint_lower_lsn
+		|| selected.checkpoint.redo > root->root.validated_tail_lsn_exclusive) {
 		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
 					"thread %u native checkpoint input is unproven (result %d)",
 					(unsigned)root->root.identity.origin_thread_id, (int)result);
 		return false;
 	}
+	typed->sources[index] = selected.source;
+	root->checkpoint_start = selected.checkpoint_start;
+	memcpy(&root->native_checkpoint, &selected.checkpoint, sizeof(root->native_checkpoint));
 	memset(participant, 0, sizeof(*participant));
 	participant->thread_id = root->root.identity.origin_thread_id;
 	participant->timeline = root->root.checkpoint_tli;
 	participant->owner_incarnation = root->root.identity.origin_owner_incarnation;
 	participant->physical_lower = root->root.checkpoint_lower_lsn;
-	participant->native_redo = native_redo;
+	participant->native_redo = selected.checkpoint.redo;
 	participant->tail_end = root->root.validated_tail_lsn_exclusive;
 	return true;
 }
@@ -673,8 +679,8 @@ cold_sources_match(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
 		const ColdRoot *selected = &typed->replay_roots[i];
 		const ClusterWalSourceRef *expected = &typed->sources[i];
 		const ClusterColdParticipantV1 *participant = &typed->participants[i];
-		ClusterWalSourceRef source;
-		XLogRecPtr redo;
+		ClusterWalRecoveryCheckpointV1 observed;
+		const ClusterWalSourceRef *source = &observed.source;
 
 		if (i != typed->own_participant) {
 			ColdRoot origin;
@@ -688,21 +694,25 @@ cold_sources_match(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
 				|| memcmp(&origin.token, &selected->token, sizeof(origin.token)) != 0)
 				return false;
 		}
-		if (cluster_control_root_recovery_source_v1(&selected->root, &selected->token, &source,
-													&redo)
+		if (cluster_control_root_recovery_checkpoint_v1(&selected->root, &selected->token,
+														&observed)
 				!= CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			|| !cluster_control_root_identity_equal(&source.claim.identity,
+			|| !cluster_control_root_identity_equal(&source->claim.identity,
 													&expected->claim.identity)
-			|| source.claim.database_incarnation != expected->claim.database_incarnation
-			|| source.claim.max_config_generation != expected->claim.max_config_generation
-			|| memcmp(source.claim.claim_sha256, expected->claim.claim_sha256, 32) != 0
-			|| source.timeline != expected->timeline
+			|| source->claim.database_incarnation != expected->claim.database_incarnation
+			|| source->claim.max_config_generation != expected->claim.max_config_generation
+			|| memcmp(source->claim.claim_sha256, expected->claim.claim_sha256, 32) != 0
+			|| source->timeline != expected->timeline
 			|| participant->thread_id != selected->root.identity.origin_thread_id
 			|| participant->owner_incarnation != selected->root.identity.origin_owner_incarnation
 			|| participant->timeline != selected->root.checkpoint_tli
 			|| participant->physical_lower != selected->root.checkpoint_lower_lsn
 			|| participant->tail_end != selected->root.validated_tail_lsn_exclusive
-			|| participant->native_redo != redo)
+			|| participant->native_redo != observed.checkpoint.redo
+			|| selected->checkpoint_start != observed.checkpoint_start
+			|| memcmp(&selected->native_checkpoint, &observed.checkpoint,
+					  sizeof(observed.checkpoint))
+				   != 0)
 			return false;
 	}
 	return true;

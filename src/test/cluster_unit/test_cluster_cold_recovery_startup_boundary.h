@@ -82,6 +82,7 @@ pfree(void *pointer)
 static ClusterControlRootSnapshot roots[NROOTS + 1];
 static ClusterControlRootReadToken tokens[NROOTS + 1];
 static XLogRecPtr native_redo[NROOTS + 1];
+static ClusterWalRecoveryCheckpointV1 native_checkpoint[NROOTS + 1];
 static ClusterControlRootResult source_result[NROOTS + 1];
 static uint16 fence_count;
 static ClusterColdDetailV1 scan_result[NROOTS + 1];
@@ -156,6 +157,20 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *root,
 	return source_result[thread];
 }
 
+ClusterControlRootResult
+cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *root,
+											const ClusterControlRootReadToken *token,
+											ClusterWalRecoveryCheckpointV1 *out)
+{
+	ClusterControlRootResult result;
+	*out = native_checkpoint[root->identity.origin_thread_id];
+	result
+		= cluster_control_root_recovery_source_v1(root, token, &out->source, &out->checkpoint.redo);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		memset(out, 0, sizeof(*out));
+	return result;
+}
+
 bool
 cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *plan)
 {
@@ -206,6 +221,9 @@ cluster_control_root_recovery_sync_v1(const ClusterControlRootSnapshot *root,
 		break;
 	case 8:
 		siglongjmp(source_sync_exception, 1);
+	case 9:
+		native_checkpoint[1].checkpoint.oldestXid++;
+		break;
 	default:
 		break;
 	}
@@ -915,6 +933,7 @@ fixture(void)
 
 	memset(roots, 0, sizeof(roots));
 	memset(tokens, 0, sizeof(tokens));
+	memset(native_checkpoint, 0, sizeof(native_checkpoint));
 	for (thread = 1; thread <= NROOTS; thread++) {
 		ClusterControlRootIdentity *id = &roots[thread].identity;
 		ClusterWalThreadClaim claim;
@@ -943,6 +962,10 @@ fixture(void)
 		roots[thread].tail_last_record_lsn = 0x800;
 		roots[thread].tail_last_record_crc32c = 0;
 		native_redo[thread] = 0x800;
+		native_checkpoint[thread].checkpoint_start = 0x900;
+		native_checkpoint[thread].checkpoint.ThisTimeLineID = 1;
+		native_checkpoint[thread].checkpoint.nextXid
+			= FullTransactionIdFromU64(UINT64CONST(0x100000100) + thread);
 		source_result[thread] = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 		scan_result[thread] = CLUSTER_COLD_OK;
 		database_incarnation[thread] = 5;

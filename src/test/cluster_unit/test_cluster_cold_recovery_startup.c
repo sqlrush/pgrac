@@ -757,6 +757,67 @@ UT_TEST(test_source_barrier_final_whole_scope_recheck)
 	}
 }
 
+UT_TEST(test_source_barrier_rechecks_complete_native_checkpoint)
+{
+	for (uint16 thread = 1; thread <= NROOTS; thread++)
+		for (int fault = 0; fault < 6; fault++) {
+			ClusterColdTypedV1 *typed;
+			ClusterWalRecoveryCheckpointV1 saved;
+			fixture();
+			typed = prepare(0x800);
+			UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+			saved = native_checkpoint[thread];
+			switch (fault) {
+			case 0:
+				native_checkpoint[thread].checkpoint_start++;
+				break;
+			case 1:
+				native_checkpoint[thread].checkpoint.nextXid = FullTransactionIdFromU64(
+					U64FromFullTransactionId(saved.checkpoint.nextXid) + (UINT64CONST(1) << 32));
+				break;
+			case 2:
+				native_checkpoint[thread].checkpoint.oldestXid++;
+				break;
+			case 3:
+				native_checkpoint[thread].checkpoint.nextMulti++;
+				break;
+			case 4:
+				native_checkpoint[thread].checkpoint.time++;
+				break;
+			case 5:
+				native_checkpoint[thread].checkpoint.fullPageWrites
+					= !saved.checkpoint.fullPageWrites;
+				break;
+			}
+			cluster_cold_replay_window_enter_v1();
+			UT_ASSERT(!sync_sources(typed));
+			UT_ASSERT_EQ(source_sync_calls, 0);
+			native_checkpoint[thread] = saved;
+			UT_ASSERT(!sync_sources(typed));
+			UT_ASSERT_EQ(source_sync_calls, 0);
+			cluster_cold_replay_window_leave_v1();
+			cluster_cold_typed_destroy_v1(&typed);
+		}
+}
+
+UT_TEST(test_source_barrier_final_native_checkpoint_change_is_sticky)
+{
+	ClusterColdTypedV1 *typed;
+	fixture();
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	source_sync_fault = 9;
+	source_sync_fail_thread = NROOTS;
+	cluster_cold_replay_window_enter_v1();
+	UT_ASSERT(!sync_sources(typed));
+	UT_ASSERT_EQ(source_sync_calls, NROOTS);
+	native_checkpoint[1].checkpoint.oldestXid--;
+	UT_ASSERT(!sync_sources(typed));
+	UT_ASSERT_EQ(source_sync_calls, NROOTS);
+	cluster_cold_replay_window_leave_v1();
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
 UT_TEST(test_source_barrier_whole_source_preflight_before_sync)
 {
 	for (int fault = 0; fault < 5; fault++) {
@@ -2343,7 +2404,9 @@ UT_TEST(test_c0_dependency_refuses_changed_identity_scope_and_partial_output)
 int
 main(void)
 {
-	UT_PLAN(65);
+	UT_PLAN(67);
+	UT_RUN(test_source_barrier_rechecks_complete_native_checkpoint);
+	UT_RUN(test_source_barrier_final_native_checkpoint_change_is_sticky);
 	UT_RUN(test_source_drain_before_unrelated_steps_is_not_global_completion);
 	UT_RUN(test_c0_dependency_resolves_captured_target_without_completing_it);
 	UT_RUN(test_c0_dependency_refuses_changed_identity_scope_and_partial_output);

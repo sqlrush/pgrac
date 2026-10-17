@@ -12566,6 +12566,118 @@ UT_TEST(test_runtime_pending_checkpoint_promotes_without_claiming_recovery_done)
 	}
 }
 
+/* Exact native anchor input; common counters deliberately differ. */
+static bool
+recovery_checkpoint_fixture(ClusterControlRootSnapshot *snapshot,
+							ClusterControlRootReadToken *token)
+{
+	ClusterRecoverySerialGuard serial;
+	ClusterThreadRecLaunchEligibility eligibility = { 0 };
+	ClusterWalStartupImage op = pending_inspection_fixture(&serial, true);
+
+	if (ut_current_failed)
+		return false;
+	eligibility.origin_thread = 1;
+	eligibility.attempt_stamp = 123;
+	eligibility.subject_kind = CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER;
+	eligibility.duty = op.claim.identity;
+	memcpy(eligibility.selected_root_sha256, serial.pending.file.image_sha256, 32);
+	test_worker_pin_held = false;
+	return thread_recovery_worker_run(&eligibility) == CLUSTER_THREADREC_DEFERRED
+		   && cluster_control_root_v3_read_canonical(1, &op.claim.identity, snapshot, token)
+				  == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+UT_TEST(test_recovery_checkpoint_selects_native_not_common_counters)
+{
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootReadToken token;
+	ClusterWalRecoveryCheckpointV1 observed;
+	ClusterWalSourceRef source;
+	XLogRecPtr redo;
+	ControlRootImage *root = palloc0(sizeof(*root));
+	ClusterControlRootFileToken file;
+	ControlFileData projected;
+
+	UT_ASSERT(recovery_checkpoint_fixture(&snapshot, &token));
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_read_thread_locked(&snapshot.identity, root, &projected, &file), 0);
+	test_actual_cf = test_cf_mode = NoLock;
+	UT_ASSERT(U64FromFullTransactionId(projected.checkPointCopy.nextXid) != 103);
+	UT_ASSERT_EQ(cluster_control_root_recovery_checkpoint_v1(&snapshot, &token, &observed), 0);
+	UT_ASSERT_EQ(U64FromFullTransactionId(observed.checkpoint.nextXid), 103);
+	UT_ASSERT_EQ(observed.checkpoint_start, projected.checkPoint);
+	UT_ASSERT_EQ(observed.checkpoint.ThisTimeLineID, snapshot.checkpoint_tli);
+	UT_ASSERT_EQ(observed.checkpoint.redo, snapshot.checkpoint_lower_lsn);
+	UT_ASSERT_EQ(cluster_control_root_recovery_source_v1(&snapshot, &token, &source, &redo), 0);
+	UT_ASSERT_EQ(memcmp(&source, &observed.source, sizeof(source)), 0);
+	UT_ASSERT_EQ(observed.checkpoint.redo, redo);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	test_reserve_mode = false;
+	pfree(root);
+}
+
+UT_TEST(test_recovery_checkpoint_refusal_does_not_export_input)
+{
+	for (int fault = 0; fault < 7; fault++) {
+		ClusterControlRootSnapshot snapshot, saved;
+		ClusterControlRootReadToken token;
+		ClusterWalRecoveryCheckpointV1 out, zero = { 0 };
+		volatile ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		volatile bool caught = false;
+
+		UT_ASSERT(recovery_checkpoint_fixture(&snapshot, &token));
+		if (fault == 0)
+			token.file_txn_seq++;
+		if (fault == 1)
+			snapshot.root_flags ^= CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+		if (fault == 2)
+			test_cf_release_confirmed = false;
+		if (fault == 3) {
+			test_actual_cf = test_cf_mode = ShareLock;
+			test_checkpoint_outer_cf = true;
+		}
+		if (fault == 4)
+			cluster_enabled = false;
+		memset(&out, 0xa5, sizeof(out));
+		test_throw_root_read = fault == 6;
+		PG_TRY();
+		{
+			result = cluster_control_root_recovery_checkpoint_v1(fault == 5 ? NULL : &snapshot,
+																 &token, &out);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		test_throw_root_read = false;
+		UT_ASSERT_EQ(caught, fault == 6);
+		if (fault == 6)
+			UT_ASSERT_EQ(test_actual_cf, NoLock);
+		cluster_enabled = true;
+		test_cf_release_confirmed = true;
+		test_actual_cf = test_cf_mode = NoLock;
+		test_checkpoint_outer_cf = false;
+		test_reserve_mode = false;
+		UT_ASSERT(result != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		saved = snapshot;
+		UT_ASSERT_EQ(cluster_control_root_recovery_checkpoint_v1(
+						 &snapshot, &token, (ClusterWalRecoveryCheckpointV1 *)&snapshot),
+					 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+		UT_ASSERT_EQ(memcmp(&snapshot, &saved, sizeof(saved)), 0);
+		{
+			ClusterControlRootReadToken saved_token = token;
+			UT_ASSERT_EQ(cluster_control_root_recovery_checkpoint_v1(
+							 &snapshot, &token, (ClusterWalRecoveryCheckpointV1 *)&token),
+						 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+			UT_ASSERT_EQ(memcmp(&token, &saved_token, sizeof(token)), 0);
+		}
+	}
+}
+
 static int recovery_sync_fault;
 static unsigned recovery_sync_seen;
 
@@ -22816,7 +22928,9 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 	if (getenv("PGRAC_PRE2_TEST_RECOVERY_SYNC") != NULL) {
-		UT_PLAN(3);
+		UT_PLAN(5);
+		UT_RUN(test_recovery_checkpoint_selects_native_not_common_counters);
+		UT_RUN(test_recovery_checkpoint_refusal_does_not_export_input);
 		UT_RUN(test_exact_recovery_source_sync_never_publishes_stale_input);
 		UT_RUN(test_exact_recovery_source_discards_stale_or_cancelled_input);
 		UT_RUN(test_runtime_pending_checkpoint_promotes_without_claiming_recovery_done);
@@ -22955,7 +23069,9 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(459);
+	UT_PLAN(461);
+	UT_RUN(test_recovery_checkpoint_selects_native_not_common_counters);
+	UT_RUN(test_recovery_checkpoint_refusal_does_not_export_input);
 	UT_RUN(test_exact_recovery_source_sync_never_publishes_stale_input);
 	UT_RUN(test_checkpoint_cf_refusal_cannot_hide_staging_discard_failure);
 	UT_RUN(test_clean_restart_without_provider_keeps_collective_exit_and_actual_install);

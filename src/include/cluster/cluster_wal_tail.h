@@ -72,6 +72,20 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *expect
 										const ClusterControlRootReadToken *token,
 										ClusterWalSourceRef *out, XLogRecPtr *native_redo);
 
+/* Exact selected origin checkpoint, not the common allocator projection.
+ * This is provisional input only: its nextXid is not proof of a TT slot's
+ * FullXid/era, terminal state, retention, or permission to recover it. */
+typedef struct ClusterWalRecoveryCheckpointV1 {
+	ClusterWalSourceRef source;
+	XLogRecPtr checkpoint_start;
+	CheckPoint checkpoint;
+} ClusterWalRecoveryCheckpointV1;
+
+extern ClusterControlRootResult
+cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *expected,
+											const ClusterControlRootReadToken *token,
+											ClusterWalRecoveryCheckpointV1 *out);
+
 /* Startup-only physical input, never a close/recovery/serving permission.
  * Zero maxima mean no PARAMETER_CHANGE record was observed; the caller must
  * also retain the predecessor/history/configuration requirements. */
