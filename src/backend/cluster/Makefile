@@ -290,6 +290,7 @@ OBJS = \
 	cluster_relmap_owner.o \
 	cluster_relmap_retention.o \
 	cluster_relmap_retention_restore.o \
+	cluster_relmap_retention_census.o \
 	cluster_sequence.o \
 	cluster_sequence_shmem.o \
 	cluster_shared_catalog.o \

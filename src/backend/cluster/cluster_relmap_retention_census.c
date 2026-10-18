@@ -1,0 +1,338 @@
+/* PGRAC: relmap pending census through the original cold ROOT reader.
+ * Author: SqlRush <sqlrush@gmail.com>
+ * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md */
+#include "postgres.h"
+
+#include "catalog/pg_tablespace_d.h"
+#include "cluster/cluster_relmap_retention_census.h"
+
+#ifdef USE_PGRAC_CLUSTER
+typedef struct CensusOrigin {
+	ClusterRelmapRetentionDirectory *directory;
+	uint64 generation;
+	uint64 native_floor;
+	uint64 last_issued;
+} CensusOrigin;
+
+struct ClusterRelmapRetentionCensus {
+	ClusterRecoveryRootSet *roots;
+	uint64 system_identifier;
+	uint64 database_incarnation;
+	uint8 storage_uuid[16];
+	uint8 digest[32];
+	CensusOrigin origins[CLUSTER_RELMAP_RETENTION_MAX_ORIGINS];
+	uint16 nodes[CLUSTER_RELMAP_RETENTION_MAX_ORIGINS];
+	size_t origin_count;
+	size_t check_origin;
+	uint32 count;
+	uint32 next_entry;
+	ClusterRelmapCensusResult result;
+	bool global_seen;
+	bool base_seen;
+	bool rechecking;
+	bool checked;
+	char namespace_path[MAXPGPATH];
+	ClusterRelmapV2Namespace identity;
+	uint8 copies[2][CLUSTER_RELMAP_V2_FILE_SIZE];
+	unsigned present;
+	bool reading;
+	unsigned copy;
+	size_t offset;
+};
+
+static ClusterRelmapCensusResult
+census_input_failed(ClusterRecoveryRootSet *roots,
+	ClusterRelmapRetentionDirectory *const directories[], size_t count,
+	ClusterRelmapCensusResult result)
+{
+	if (directories != NULL && count <= CLUSTER_RELMAP_RETENTION_MAX_ORIGINS)
+		for (size_t i = 0; i < count; i++)
+			cluster_relmap_retention_invalidate(directories[i]);
+	cluster_recovery_root_set_invalidate(roots);
+	return result;
+}
+
+static ClusterRelmapCensusResult
+census_failed(ClusterRelmapRetentionCensus *census, ClusterRelmapCensusResult result)
+{
+	census->result = result;
+	for (size_t i = 0; i < census->origin_count; i++)
+		cluster_relmap_retention_invalidate(census->origins[census->nodes[i]].directory);
+	cluster_recovery_root_set_invalidate(census->roots);
+	return result;
+}
+
+static ClusterRelmapCensusResult
+census_root_failed(ClusterRelmapRetentionCensus *census, ClusterRecoveryRootsResult result)
+{
+	return census_failed(census, result == CLUSTER_RECOVERY_ROOTS_CAPACITY
+		? CLUSTER_RELMAP_CENSUS_CAPACITY : result == CLUSTER_RECOVERY_ROOTS_IO
+		? CLUSTER_RELMAP_CENSUS_UNAVAILABLE : CLUSTER_RELMAP_CENSUS_CHANGED);
+}
+
+static bool
+census_origin_same(const ClusterRelmapRetentionCensus *census, uint16 node)
+{
+	const CensusOrigin *saved = &census->origins[node];
+	const ClusterRelmapRetentionDirectory *directory = saved->directory;
+
+	return directory != NULL && directory->state == CLUSTER_RELMAP_RETENTION_BUILDING
+		&& directory->system_identifier == census->system_identifier
+		&& directory->database_incarnation == census->database_incarnation
+		&& directory->origin == node && directory->generation == saved->generation
+		&& directory->native_floor == saved->native_floor
+		&& directory->last_issued == saved->last_issued && directory->truncate_serial == 0
+		&& directory->inflight.generation == 0 && directory->inflight.serial == 0
+		&& directory->inflight.cutoff == 0;
+}
+
+static bool
+census_root_same(const ClusterRelmapRetentionCensus *census)
+{
+	uint8 digest[32];
+
+	return cluster_recovery_root_set_storage_matches(census->roots,
+		census->system_identifier, census->database_incarnation, census->storage_uuid)
+		&& cluster_recovery_root_set_count(census->roots) == census->count
+		&& cluster_recovery_root_set_digest(census->roots, digest)
+		&& memcmp(census->digest, digest, sizeof(digest)) == 0;
+}
+
+ClusterRelmapCensusResult
+cluster_relmap_retention_census_begin(
+	ClusterRecoveryRootSet *roots, uint64 system_identifier, uint64 database_incarnation,
+	const uint8 storage_uuid[16], ClusterRelmapRetentionDirectory *const directories[],
+	size_t count, size_t memory_budget, ClusterRelmapRetentionCensus **out)
+{
+	ClusterRelmapRetentionCensus *census;
+	ClusterRelmapCensusResult result = CLUSTER_RELMAP_CENSUS_INVALID;
+
+	if (out != NULL)
+		*out = NULL;
+	if (out == NULL || system_identifier == 0 || database_incarnation == 0
+		|| storage_uuid == NULL || directories == NULL || count == 0
+		|| count > CLUSTER_RELMAP_RETENTION_MAX_ORIGINS)
+		goto fail;
+	if (memory_budget < sizeof(*census)) {
+		result = CLUSTER_RELMAP_CENSUS_CAPACITY;
+		goto fail;
+	}
+	if (!cluster_recovery_root_set_storage_matches(roots, system_identifier,
+		database_incarnation, storage_uuid))
+		goto fail;
+	census = calloc(1, sizeof(*census));
+	if (census == NULL) {
+		result = CLUSTER_RELMAP_CENSUS_CAPACITY;
+		goto fail;
+	}
+	census->roots = roots;
+	census->system_identifier = system_identifier;
+	census->database_incarnation = database_incarnation;
+	memcpy(census->storage_uuid, storage_uuid, sizeof(census->storage_uuid));
+	census->count = cluster_recovery_root_set_count(roots);
+	if (!cluster_recovery_root_set_digest(roots, census->digest)) {
+		free(census);
+		goto fail;
+	}
+	for (size_t i = 0; i < count; i++) {
+		ClusterRelmapRetentionDirectory *directory = directories[i];
+		CensusOrigin *saved;
+
+		if (directory == NULL || directory->origin >= lengthof(census->origins)
+			|| census->origins[directory->origin].directory != NULL
+			|| directory->generation == 0) {
+			free(census);
+			goto fail;
+		}
+		saved = &census->origins[directory->origin];
+		saved->directory = directory;
+		saved->generation = directory->generation;
+		saved->native_floor = directory->native_floor;
+		saved->last_issued = directory->last_issued;
+		if (!census_origin_same(census, directory->origin)) {
+			free(census);
+			goto fail;
+		}
+		census->nodes[census->origin_count++] = directory->origin;
+	}
+	*out = census;
+	return CLUSTER_RELMAP_CENSUS_MORE;
+fail:
+	return census_input_failed(roots, directories, count, result);
+}
+
+/* Reuse the original canonical classifier for global and direct base/db
+ * directories. This does not declare other D1 file obligations explained. */
+static bool
+census_namespace(const char *path, Oid *dbid)
+{
+	char authority[MAXPGPATH];
+	RelFileLocator locator;
+	ForkNumber forknum;
+
+	if (strcmp(path, "global") != 0
+		&& (strncmp(path, "base/", 5) != 0 || strchr(path + 5, '/') != NULL))
+		return false;
+	if (snprintf(authority, sizeof(authority), "%s/pgrac_relmap_authority", path)
+		>= sizeof(authority)
+		|| cluster_recovery_namespace_classify(authority, &locator, &forknum)
+			!= CLUSTER_RECOVERY_FILE_RELMAP_AUTHORITY)
+		return false;
+	*dbid = locator.dbOid;
+	return true;
+}
+
+static ClusterRelmapCensusResult
+census_namespace_finish(ClusterRelmapRetentionCensus *census)
+{
+	ClusterRelmapV2View view;
+	ClusterRelmapRetentionKey key = { 0 };
+	ClusterRelmapRetentionResult result;
+	uint16 node;
+
+	if (census->present != 3
+		|| cluster_relmap_v2_read_pair(census->copies[0], sizeof(census->copies[0]),
+			census->copies[1], sizeof(census->copies[1]), &census->identity, &view)
+			!= CLUSTER_RELMAP_V2_PAIR_VALID || !view.pending_complete)
+		return census_failed(census, CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+	if (view.has_pending) {
+		node = view.pending_owner.node;
+		if (node >= lengthof(census->origins) || census->origins[node].directory == NULL)
+			return census_failed(census, CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+		if (!census_origin_same(census, node))
+			return census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
+		key.identity = census->identity;
+		key.generation = view.pending_generation;
+		key.origin = node;
+		key.top_full_xid = view.pending_owner.top_full_xid;
+		key.membership_epoch = view.pending_owner.membership_epoch;
+		key.admitted_incarnation = view.pending_owner.admitted_incarnation;
+		key.boot_incarnation = view.pending_owner.boot_incarnation;
+		result = cluster_relmap_retention_build_add(census->origins[node].directory,
+			&key, view.pending_owner.wal_end);
+		if (result != CLUSTER_RELMAP_RETENTION_OK)
+			return census_failed(census, result == CLUSTER_RELMAP_RETENTION_CAPACITY_EXCEEDED
+				? CLUSTER_RELMAP_CENSUS_CAPACITY : CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+	}
+	census->namespace_path[0] = '\0';
+	census->present = 0;
+	memset(census->copies, 0, sizeof(census->copies));
+	return CLUSTER_RELMAP_CENSUS_MORE;
+}
+
+ClusterRelmapCensusResult
+cluster_relmap_retention_census_next(ClusterRelmapRetentionCensus *census)
+{
+	const ClusterRecoveryRootEntry *entry;
+	ClusterRecoveryRootsResult result;
+	Oid dbid;
+	bool directory;
+
+	if (census == NULL)
+		return CLUSTER_RELMAP_CENSUS_INVALID;
+	if (census->result > CLUSTER_RELMAP_CENSUS_DRAINED)
+		return census->result;
+	if (census->checked || census->result == CLUSTER_RELMAP_CENSUS_DRAINED) {
+		/* Separate from the last recheck I/O tick; at most128 origin checks. */
+		for (size_t i = 0; i < census->origin_count; i++)
+			if (!census_origin_same(census, census->nodes[i]))
+				return census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
+		if (!census_root_same(census))
+			return census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
+		census->result = CLUSTER_RELMAP_CENSUS_DRAINED;
+		return census->result;
+	}
+	/* The build is exclusive throughout. Check one qualification each tick,
+	 * its exact pending origin before add, and all origins before DRAINED. */
+	if (!census_origin_same(census, census->nodes[census->check_origin]))
+		return census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
+	census->check_origin = (census->check_origin + 1) % census->origin_count;
+	if (census->rechecking) {
+		ClusterRecoveryRootsEvent event;
+
+		result = cluster_recovery_root_set_step(census->roots, &event);
+		if (result > CLUSTER_RECOVERY_ROOTS_OBSERVED)
+			return census_root_failed(census, result);
+		if (result == CLUSTER_RECOVERY_ROOTS_OBSERVED)
+			census->checked = true;
+		return CLUSTER_RELMAP_CENSUS_MORE;
+	}
+	if (!census_root_same(census))
+		return census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
+	if (census->reading) {
+		size_t length = Min((size_t)BLCKSZ, CLUSTER_RELMAP_V2_FILE_SIZE - census->offset);
+
+		result = cluster_recovery_root_set_read(census->roots, census->next_entry,
+			census->offset, census->copies[census->copy] + census->offset, length);
+		if (result != CLUSTER_RECOVERY_ROOTS_BYTES)
+			return census_root_failed(census, result);
+		census->offset += length;
+		if (census->offset == CLUSTER_RELMAP_V2_FILE_SIZE) {
+			census->present |= 1U << census->copy;
+			census->reading = false;
+			census->next_entry++;
+		}
+		return CLUSTER_RELMAP_CENSUS_MORE;
+	}
+	entry = census->next_entry < census->count
+		? cluster_recovery_root_set_entry(census->roots, census->next_entry) : NULL;
+	if (census->namespace_path[0] != '\0') {
+		size_t length = strlen(census->namespace_path);
+
+		if (entry == NULL || strncmp(entry->file.path, census->namespace_path, length) != 0
+			|| entry->file.path[length] != '/')
+			return census_namespace_finish(census);
+	}
+	if (entry == NULL) {
+		if (census->next_entry != census->count || !census->global_seen || !census->base_seen)
+			return census_failed(census, CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+		result = cluster_recovery_root_set_recheck_begin(census->roots);
+		if (result != CLUSTER_RECOVERY_ROOTS_MORE)
+			return census_root_failed(census, result);
+		census->rechecking = true;
+		return CLUSTER_RELMAP_CENSUS_MORE;
+	}
+	directory = entry->file.kind == CLUSTER_RECOVERY_FILE_DIRECTORY
+		&& (entry->origins & CLUSTER_RECOVERY_ROOT_PHYSICAL) != 0
+		&& S_ISDIR(entry->file.observed.st_mode);
+	if (strcmp(entry->file.path, "base") == 0) {
+		if (!directory)
+			return census_failed(census, CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+		census->base_seen = true;
+	}
+	if (census_namespace(entry->file.path, &dbid)) {
+		if (!directory || census->namespace_path[0] != '\0')
+			return census_failed(census, CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+		strlcpy(census->namespace_path, entry->file.path, sizeof(census->namespace_path));
+		census->identity = (ClusterRelmapV2Namespace){ census->system_identifier,
+			census->database_incarnation, dbid, dbid == InvalidOid };
+		if (dbid == InvalidOid)
+			census->global_seen = true;
+	} else if (entry->file.kind == CLUSTER_RECOVERY_FILE_RELMAP_AUTHORITY
+		|| entry->file.kind == CLUSTER_RECOVERY_FILE_RELMAP_AUTHORITY_BACKUP) {
+		census->copy = entry->file.kind == CLUSTER_RECOVERY_FILE_RELMAP_AUTHORITY ? 0 : 1;
+		if (census->namespace_path[0] == '\0'
+			|| entry->file.locator.dbOid != census->identity.dbid
+			|| entry->file.locator.spcOid != (census->identity.shared
+				? GLOBALTABLESPACE_OID : DEFAULTTABLESPACE_OID)
+			|| (census->present & (1U << census->copy)) != 0
+			|| (entry->origins & CLUSTER_RECOVERY_ROOT_PHYSICAL) == 0
+			|| !S_ISREG(entry->file.observed.st_mode)
+			|| entry->file.size != CLUSTER_RELMAP_V2_FILE_SIZE)
+			return census_failed(census, CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+		census->reading = true;
+		census->offset = 0;
+		return CLUSTER_RELMAP_CENSUS_MORE;
+	}
+	census->next_entry++;
+	return CLUSTER_RELMAP_CENSUS_MORE;
+}
+
+void
+cluster_relmap_retention_census_destroy(ClusterRelmapRetentionCensus *census)
+{
+	if (census != NULL && census->result == CLUSTER_RELMAP_CENSUS_MORE)
+		census_failed(census, CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+	free(census);
+}
+#endif

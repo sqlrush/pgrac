@@ -1,0 +1,471 @@
+/* Real ROOT readers and physical relmap pairs, not authority-return mocks.
+ * Author: SqlRush <sqlrush@gmail.com>
+ * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md */
+#define RECOVERY_ROOT_SET_FIXTURE_ONLY
+#include "test_cluster_recovery_root_set.c"
+#include "cluster/cluster_relmap_retention_census.h"
+
+#define CENSUS_BUDGET (128 * 1024)
+#define CENSUS_FULL UINT64CONST(0x200000123)
+
+typedef struct CensusFixture {
+	int fd;
+	ClusterRecoveryRootSet *roots;
+	ClusterRelmapRetentionCensus *census;
+	ClusterRelmapRetentionDirectory origin[2];
+	ClusterRelmapRetentionDirectory *directories[2];
+} CensusFixture;
+
+static RelMapFile
+census_map(RelFileNumber number)
+{
+	RelMapFile map = { 0 };
+
+	map.magic = RELMAPPER_FILEMAGIC;
+	map.num_mappings = 1;
+	map.mappings[0].mapoid = 1259;
+	map.mappings[0].mapfilenumber = number;
+	INIT_CRC32C(map.crc);
+	COMP_CRC32C(map.crc, &map, offsetof(RelMapFile, crc));
+	FIN_CRC32C(map.crc);
+	return map;
+}
+
+static void
+census_wire(uint8 bytes[CLUSTER_RELMAP_V2_FILE_SIZE], Oid dbid, uint16 owner,
+	bool pending, bool published)
+{
+	ClusterRelmapV2Image image = { 0 };
+
+	image.identity = (ClusterRelmapV2Namespace){ 817, 91, dbid, dbid == InvalidOid };
+	image.committed_generation = published ? 2 : 1;
+	image.committed = census_map(published ? 40001 : 40000);
+	if (pending) {
+		image.pending_generation = 2;
+		image.pending_owner = (ClusterRelmapV2Owner){ owner, CENSUS_FULL, 0, 101, 909, 202 };
+		image.pending = census_map(40001);
+	}
+	UT_ASSERT_EQ(cluster_relmap_v2_encode(&image, bytes, CLUSTER_RELMAP_V2_FILE_SIZE),
+		CLUSTER_RELMAP_V2_VALID);
+}
+
+/* primary clean + backup pending is a legal discard cut. */
+static void
+census_pair(int fd, Oid dbid, uint16 owner, bool primary_pending, bool backup_pending,
+	bool published)
+{
+	char path[MAXPGPATH], directory[32];
+	uint8 bytes[CLUSTER_RELMAP_V2_FILE_SIZE];
+
+	if (dbid == InvalidOid)
+		strlcpy(directory, "global", sizeof(directory));
+	else
+		snprintf(directory, sizeof(directory), "base/%u", dbid);
+	census_wire(bytes, dbid, owner, primary_pending, published);
+	snprintf(path, sizeof(path), "%s/pgrac_relmap_authority", directory);
+	root_file(fd, path, bytes, sizeof(bytes));
+	census_wire(bytes, dbid, owner, backup_pending, false);
+	snprintf(path, sizeof(path), "%s/pgrac_relmap_authority.bak", directory);
+	root_file(fd, path, bytes, sizeof(bytes));
+}
+
+static void
+census_fixture(CensusFixture *f, bool pending)
+{
+	memset(f, 0, sizeof(*f));
+	f->fd = new_root();
+	if (f->fd < 0 || mkdirat(f->fd, "global", 0700) != 0
+		|| mkdirat(f->fd, "base", 0700) != 0 || mkdirat(f->fd, "base/5", 0700) != 0)
+		abort();
+	census_pair(f->fd, InvalidOid, 0, false, false, false);
+	census_pair(f->fd, 5, 3, false, pending, false);
+	root_file(f->fd, "unrelated", "cold", 4);
+	for (unsigned i = 0; i < 2; i++) {
+		UT_ASSERT_EQ(cluster_relmap_retention_build_start(&f->origin[i], 817, 91,
+			i == 0 ? 3 : 7, 1, UINT64CONST(0x200000003), UINT64CONST(0x200000400)),
+			CLUSTER_RELMAP_RETENTION_OK);
+		/* The caller array order must not select the pending origin. */
+		f->directories[1 - i] = &f->origin[i];
+	}
+}
+
+static bool
+census_observe_begin(CensusFixture *f)
+{
+	f->roots = begin_roots(f->fd, 4 * 1024 * 1024);
+	UT_ASSERT_EQ(finish_roots(f->roots, NULL), CLUSTER_RECOVERY_ROOTS_OBSERVED);
+	UT_ASSERT_EQ(cluster_relmap_retention_census_begin(f->roots, 817, 91, root_uuid,
+		f->directories, 2, CENSUS_BUDGET, &f->census), CLUSTER_RELMAP_CENSUS_MORE);
+	UT_ASSERT(f->census != NULL);
+	return f->census != NULL;
+}
+
+static ClusterRelmapCensusResult
+census_drain(CensusFixture *f)
+{
+	ClusterRelmapCensusResult result = CLUSTER_RELMAP_CENSUS_MORE;
+
+	for (unsigned i = 0; i < 20000 && result == CLUSTER_RELMAP_CENSUS_MORE; i++)
+		result = cluster_relmap_retention_census_next(f->census);
+	UT_ASSERT_NE(result, CLUSTER_RELMAP_CENSUS_MORE);
+	return result;
+}
+
+static const ClusterRelmapRetentionPin *
+census_pin(const ClusterRelmapRetentionDirectory *directory, Oid dbid)
+{
+	for (unsigned i = 0; i < lengthof(directory->pins); i++)
+		if (directory->pins[i].occupied && directory->pins[i].key.identity.dbid == dbid)
+			return &directory->pins[i];
+	return NULL;
+}
+
+static bool
+census_until_pin(CensusFixture *f)
+{
+	ClusterRelmapCensusResult result = CLUSTER_RELMAP_CENSUS_MORE;
+
+	for (unsigned i = 0; i < 20000 && result == CLUSTER_RELMAP_CENSUS_MORE; i++) {
+		if (census_pin(&f->origin[0], 5) != NULL)
+			return true;
+		result = cluster_relmap_retention_census_next(f->census);
+	}
+	UT_ASSERT(false);
+	return false;
+}
+
+static void
+census_refused(CensusFixture *f)
+{
+	uint8 digest[32];
+
+	UT_ASSERT(!cluster_recovery_root_set_digest(f->roots, digest));
+	for (unsigned i = 0; i < 2; i++) {
+		UT_ASSERT_EQ(f->origin[i].state, CLUSTER_RELMAP_RETENTION_UNKNOWN);
+		UT_ASSERT_NE(cluster_relmap_retention_build_finish(&f->origin[i]),
+			CLUSTER_RELMAP_RETENTION_OK);
+	}
+}
+
+static void
+census_cleanup(CensusFixture *f)
+{
+	cluster_relmap_retention_census_destroy(f->census);
+	cluster_recovery_root_set_destroy(f->roots);
+	remove_root(f->fd);
+	UT_ASSERT_EQ(rmdir(test_path), 0);
+}
+
+UT_TEST(test_all_physical_namespaces_and_original_backup_only_pending)
+{
+	CensusFixture f;
+	const ClusterRelmapRetentionPin *pin;
+	uint8 before[32], after[32];
+
+	census_fixture(&f, true);
+	UT_ASSERT_EQ(mkdirat(f.fd, "base/6", 0700), 0);
+	census_pair(f.fd, 6, 7, true, true, false);
+	if (census_observe_begin(&f)) {
+		UT_ASSERT(cluster_recovery_root_set_digest(f.roots, before));
+		UT_ASSERT_EQ(census_drain(&f), CLUSTER_RELMAP_CENSUS_DRAINED);
+		UT_ASSERT(cluster_recovery_root_set_digest(f.roots, after));
+		UT_ASSERT_EQ(memcmp(before, after, sizeof(before)), 0);
+		for (unsigned i = 0; i < 2; i++) {
+			pin = census_pin(&f.origin[i], i == 0 ? 5 : 6);
+			UT_ASSERT(pin != NULL);
+			if (pin != NULL) {
+				UT_ASSERT_EQ(pin->key.identity.system_identifier, 817);
+				UT_ASSERT_EQ(pin->key.identity.database_incarnation, 91);
+				UT_ASSERT(!pin->key.identity.shared);
+				UT_ASSERT_EQ(pin->key.origin, i == 0 ? 3 : 7);
+				UT_ASSERT_EQ(pin->key.generation, 2);
+				UT_ASSERT_EQ(pin->key.top_full_xid, CENSUS_FULL);
+				UT_ASSERT_EQ(pin->key.membership_epoch, 0);
+				UT_ASSERT_EQ(pin->key.admitted_incarnation, 101);
+				UT_ASSERT_EQ(pin->key.boot_incarnation, 202);
+				UT_ASSERT_EQ(pin->wal_end, 909);
+				UT_ASSERT(pin->may_be_staged);
+			}
+			UT_ASSERT_EQ(f.origin[i].state, CLUSTER_RELMAP_RETENTION_BUILDING);
+			UT_ASSERT_NE(cluster_relmap_retention_allocation_check(&f.origin[i],
+				UINT64CONST(0x200000401)), CLUSTER_RELMAP_RETENTION_OK);
+		}
+	}
+	census_cleanup(&f);
+}
+
+UT_TEST(test_all_legal_pair_cuts_keep_pending_without_publishing_complete)
+{
+	for (unsigned cut = 0; cut < 3; cut++) {
+		CensusFixture f;
+
+		census_fixture(&f, true);
+		census_pair(f.fd, 5, 3, cut == 0, cut != 0, cut == 1);
+		if (census_observe_begin(&f)) {
+			UT_ASSERT_EQ(census_drain(&f), CLUSTER_RELMAP_CENSUS_DRAINED);
+			UT_ASSERT(census_pin(&f.origin[0], 5) != NULL);
+			cluster_relmap_retention_census_destroy(f.census);
+			f.census = NULL;
+			UT_ASSERT_EQ(f.origin[0].state, CLUSTER_RELMAP_RETENTION_BUILDING);
+		}
+		census_cleanup(&f);
+	}
+}
+
+UT_TEST(test_clean_census_stays_unpublished)
+{
+	CensusFixture f;
+
+	census_fixture(&f, false);
+	if (census_observe_begin(&f)) {
+		UT_ASSERT_EQ(census_drain(&f), CLUSTER_RELMAP_CENSUS_DRAINED);
+		for (unsigned i = 0; i < 2; i++) {
+			UT_ASSERT(census_pin(&f.origin[i], 5) == NULL);
+			UT_ASSERT_EQ(f.origin[i].state, CLUSTER_RELMAP_RETENTION_BUILDING);
+		}
+	}
+	census_cleanup(&f);
+}
+
+UT_TEST(test_missing_copies_and_unreferenced_database_never_mean_empty)
+{
+	const char *missing[] = { "global/pgrac_relmap_authority",
+		"global/pgrac_relmap_authority.bak", "base/5/pgrac_relmap_authority",
+		"base/5/pgrac_relmap_authority.bak", NULL };
+
+	for (unsigned i = 0; i < lengthof(missing); i++) {
+		CensusFixture f;
+
+		census_fixture(&f, false);
+		if (missing[i] != NULL)
+			UT_ASSERT_EQ(unlinkat(f.fd, missing[i], 0), 0);
+		else
+			UT_ASSERT_EQ(mkdirat(f.fd, "base/999", 0700), 0);
+		if (census_observe_begin(&f)) {
+			UT_ASSERT_NE(census_drain(&f), CLUSTER_RELMAP_CENSUS_DRAINED);
+			census_refused(&f);
+		}
+		census_cleanup(&f);
+	}
+}
+
+UT_TEST(test_global_and_base_roots_are_required)
+{
+	for (unsigned i = 0; i < 2; i++) {
+		CensusFixture f;
+
+		census_fixture(&f, false);
+		if (i == 0) {
+			UT_ASSERT_EQ(unlinkat(f.fd, "global/pgrac_relmap_authority", 0), 0);
+			UT_ASSERT_EQ(unlinkat(f.fd, "global/pgrac_relmap_authority.bak", 0), 0);
+			UT_ASSERT_EQ(unlinkat(f.fd, "global", AT_REMOVEDIR), 0);
+		} else {
+			UT_ASSERT_EQ(unlinkat(f.fd, "base/5/pgrac_relmap_authority", 0), 0);
+			UT_ASSERT_EQ(unlinkat(f.fd, "base/5/pgrac_relmap_authority.bak", 0), 0);
+			UT_ASSERT_EQ(unlinkat(f.fd, "base/5", AT_REMOVEDIR), 0);
+			UT_ASSERT_EQ(unlinkat(f.fd, "base", AT_REMOVEDIR), 0);
+		}
+		if (census_observe_begin(&f)) {
+			UT_ASSERT_NE(census_drain(&f), CLUSTER_RELMAP_CENSUS_DRAINED);
+			census_refused(&f);
+		}
+		census_cleanup(&f);
+	}
+}
+
+UT_TEST(test_degraded_foreign_short_and_conflicting_pairs_refuse)
+{
+	for (unsigned bad = 0; bad < 5; bad++) {
+		CensusFixture f;
+		uint8 bytes[CLUSTER_RELMAP_V2_FILE_SIZE];
+
+		census_fixture(&f, true);
+		census_wire(bytes, bad == 1 ? 6 : 5, bad == 2 ? 7 : 3, true, false);
+		if (bad == 0)
+			bytes[0] ^= 1;
+		if (bad == 4)
+			bytes[CLUSTER_RELMAP_V2_PENDING_OFFSET] ^= 1;
+		root_file(f.fd, "base/5/pgrac_relmap_authority", bytes,
+			bad == 3 ? sizeof(bytes) - 1 : sizeof(bytes));
+		if (census_observe_begin(&f)) {
+			UT_ASSERT_NE(census_drain(&f), CLUSTER_RELMAP_CENSUS_DRAINED);
+			census_refused(&f);
+		}
+		census_cleanup(&f);
+	}
+}
+
+UT_TEST(test_unknown_origin_native_gone_and_fullxid_window_refuse)
+{
+	for (unsigned bad = 0; bad < 3; bad++) {
+		CensusFixture f;
+
+		census_fixture(&f, true);
+		if (bad == 0)
+			census_pair(f.fd, 5, 8, true, true, false);
+		else if (bad == 1)
+			f.origin[0].native_floor = CENSUS_FULL + 1;
+		else
+			f.origin[0].last_issued = CENSUS_FULL + UINT64CONST(0x80000000);
+		if (census_observe_begin(&f)) {
+			UT_ASSERT_NE(census_drain(&f), CLUSTER_RELMAP_CENSUS_DRAINED);
+			census_refused(&f);
+		}
+		census_cleanup(&f);
+	}
+}
+
+UT_TEST(test_later_failure_preserves_earlier_pending_and_is_sticky)
+{
+	CensusFixture f;
+	ClusterRelmapCensusResult result;
+
+	census_fixture(&f, true);
+	UT_ASSERT_EQ(mkdirat(f.fd, "base/6", 0700), 0);
+	if (census_observe_begin(&f)) {
+		UT_ASSERT(census_until_pin(&f));
+		result = census_drain(&f);
+		UT_ASSERT_NE(result, CLUSTER_RELMAP_CENSUS_DRAINED);
+		UT_ASSERT_EQ(cluster_relmap_retention_census_next(f.census), result);
+		UT_ASSERT(census_pin(&f.origin[0], 5) != NULL);
+		census_refused(&f);
+	}
+	census_cleanup(&f);
+}
+
+UT_TEST(test_whole_root_recheck_rejects_new_namespace_inode_and_unrelated_change)
+{
+	for (unsigned change = 0; change < 3; change++) {
+		CensusFixture f;
+		uint8 bytes[CLUSTER_RELMAP_V2_FILE_SIZE];
+
+		census_fixture(&f, true);
+		if (census_observe_begin(&f) && census_until_pin(&f)) {
+			if (change == 0) {
+				UT_ASSERT_EQ(mkdirat(f.fd, "base/8", 0700), 0);
+				census_pair(f.fd, 8, 0, false, false, false);
+			} else if (change == 1) {
+				census_wire(bytes, 5, 3, true, false);
+				root_file(f.fd, "replacement", bytes, sizeof(bytes));
+				UT_ASSERT_EQ(renameat(f.fd, "replacement", f.fd,
+					"base/5/pgrac_relmap_authority.bak"), 0);
+			} else
+				root_file(f.fd, "unrelated", "warm", 4);
+			UT_ASSERT_EQ(census_drain(&f), CLUSTER_RELMAP_CENSUS_CHANGED);
+			UT_ASSERT(census_pin(&f.origin[0], 5) != NULL);
+			census_refused(&f);
+		}
+		census_cleanup(&f);
+	}
+}
+
+UT_TEST(test_origin_qualification_cannot_change_during_scan)
+{
+	for (unsigned change = 0; change < 3; change++) {
+		CensusFixture f;
+
+		census_fixture(&f, true);
+		if (census_observe_begin(&f) && census_until_pin(&f)) {
+			if (change == 0)
+				f.origin[0].generation++;
+			else if (change == 1)
+				f.origin[0].native_floor++;
+			else
+				f.origin[0].last_issued++;
+			UT_ASSERT_EQ(census_drain(&f), CLUSTER_RELMAP_CENSUS_CHANGED);
+			UT_ASSERT(census_pin(&f.origin[0], 5) != NULL);
+			census_refused(&f);
+		}
+		census_cleanup(&f);
+	}
+}
+
+UT_TEST(test_interrupted_cursor_invalidates_without_losing_pending)
+{
+	CensusFixture f;
+
+	census_fixture(&f, true);
+	if (census_observe_begin(&f) && census_until_pin(&f)) {
+		cluster_relmap_retention_census_destroy(f.census);
+		f.census = NULL;
+		UT_ASSERT(census_pin(&f.origin[0], 5) != NULL);
+		census_refused(&f);
+	}
+	census_cleanup(&f);
+}
+
+UT_TEST(test_read_io_short_read_and_corruption_never_drain)
+{
+	for (unsigned fault = 1; fault < 4; fault++) {
+		CensusFixture f;
+
+		census_fixture(&f, true);
+		if (census_observe_begin(&f)) {
+			inject_pread_fault = fault < 3 ? fault : 0;
+			inject_read_corruption = fault == 3;
+			UT_ASSERT_NE(census_drain(&f), CLUSTER_RELMAP_CENSUS_DRAINED);
+			inject_pread_fault = 0;
+			inject_read_corruption = false;
+			census_refused(&f);
+		}
+		census_cleanup(&f);
+	}
+}
+
+UT_TEST(test_invalid_begin_poisoning_and_oversized_array_bound)
+{
+	for (unsigned bad = 0; bad < 7; bad++) {
+		CensusFixture f;
+		uint8 uuid[16];
+		size_t count = 2;
+		ClusterRelmapCensusResult result;
+
+		census_fixture(&f, false);
+		f.roots = begin_roots(f.fd, 4 * 1024 * 1024);
+		UT_ASSERT_EQ(finish_roots(f.roots, NULL), CLUSTER_RECOVERY_ROOTS_OBSERVED);
+		memcpy(uuid, root_uuid, sizeof(uuid));
+		if (bad == 1)
+			f.directories[1] = f.directories[0];
+		if (bad == 2)
+			f.directories[0] = NULL;
+		if (bad == 3)
+			uuid[0]++;
+		if (bad == 6)
+			count = CLUSTER_RELMAP_RETENTION_MAX_ORIGINS + 1;
+		result = cluster_relmap_retention_census_begin(f.roots, bad == 4 ? 818 : 817,
+			91, uuid, f.directories, count, bad == 0 ? 0 : CENSUS_BUDGET,
+			bad == 5 ? NULL : &f.census);
+		UT_ASSERT_NE(result, CLUSTER_RELMAP_CENSUS_MORE);
+		UT_ASSERT(f.census == NULL);
+		if (bad == 6) {
+			/* count exceeds the actual two-element array: no element may be read. */
+			UT_ASSERT_EQ(f.origin[0].state, CLUSTER_RELMAP_RETENTION_BUILDING);
+			UT_ASSERT_EQ(f.origin[1].state, CLUSTER_RELMAP_RETENTION_BUILDING);
+		} else
+			for (unsigned i = 0; i < 2; i++)
+				if (f.directories[i] != NULL)
+					UT_ASSERT_EQ(f.directories[i]->state, CLUSTER_RELMAP_RETENTION_UNKNOWN);
+		census_cleanup(&f);
+	}
+}
+
+int
+main(void)
+{
+	UT_PLAN(13);
+	UT_RUN(test_all_physical_namespaces_and_original_backup_only_pending);
+	UT_RUN(test_all_legal_pair_cuts_keep_pending_without_publishing_complete);
+	UT_RUN(test_clean_census_stays_unpublished);
+	UT_RUN(test_missing_copies_and_unreferenced_database_never_mean_empty);
+	UT_RUN(test_global_and_base_roots_are_required);
+	UT_RUN(test_degraded_foreign_short_and_conflicting_pairs_refuse);
+	UT_RUN(test_unknown_origin_native_gone_and_fullxid_window_refuse);
+	UT_RUN(test_later_failure_preserves_earlier_pending_and_is_sticky);
+	UT_RUN(test_whole_root_recheck_rejects_new_namespace_inode_and_unrelated_change);
+	UT_RUN(test_origin_qualification_cannot_change_during_scan);
+	UT_RUN(test_interrupted_cursor_invalidates_without_losing_pending);
+	UT_RUN(test_read_io_short_read_and_corruption_never_drain);
+	UT_RUN(test_invalid_begin_poisoning_and_oversized_array_bound);
+	UT_DONE();
+	return ut_failed_count != 0;
+}
