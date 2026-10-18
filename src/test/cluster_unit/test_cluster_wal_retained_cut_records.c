@@ -59,7 +59,10 @@ UT_DEFINE_GLOBALS();
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(23);
+	UT_RUN(test_records_cold_prepared_tt_sources_refuse_history_and_redo);
+	UT_RUN(test_records_cold_exact_abort_sources_stay_supported);
+	UT_RUN(test_records_cold_tt_terminal_carriers_require_full_payload);
 	UT_RUN(test_records_cold_ordered_counter_candidate);
 	UT_RUN(test_records_cold_terminal_counter_inputs);
 	UT_RUN(test_records_cold_abort_children_require_native_tree_shape);

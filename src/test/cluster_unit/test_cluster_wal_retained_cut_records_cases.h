@@ -47,6 +47,146 @@ expect_cut(uint32 source, XLogRecPtr lower, ClusterWalRetainedPinV1 pin, uint32 
 
 /* Exercise the cold classifier and original SIDE validator together. The
  * optional SIDE capture is not the owner of native/history acceptance. */
+static RealRecord *
+rec_cold_tt_terminal(uint32 source, int carrier)
+{
+	uint16 thread = items[source].source.claim.identity.origin_thread_id;
+	uint32 segment = (uint32)(thread - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	RealRecord *r;
+
+	if (carrier == 0)
+		return rec_tt_commit(source, 0x1000, 0x1100, 801, 4);
+	if (carrier == 2) {
+		xl_undo_tt_slot_set_head head = { 0 };
+
+		head.segment_id = segment;
+		head.slot_offset = 4;
+		head.wrap = 7;
+		head.xid = 801;
+		head.instance = thread;
+		head.first_undo_block = uba_encode(segment, 1, 4, 128);
+		r = record_new(source, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_SET_HEAD, 801, 0x1000, 0x1100);
+		record_append(r, &head, sizeof(head));
+	} else {
+		r = record_new(source, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_ABORT, 801, 0x1000, 0x1100);
+		if (carrier == 3) {
+			xl_undo_tt_slot_abort_exact abort = { 0 };
+
+			abort.segment_id = segment;
+			/* Generation zero is a valid original INIT identity. */
+			abort.segment_generation = 0;
+			abort.slot_offset = 4;
+			abort.wrap = 7;
+			abort.xid = 801;
+			abort.instance = thread;
+			abort.format_version = CLUSTER_UNDO_TT_ABORT_EXACT_VERSION;
+			record_append(r, &abort, sizeof(abort));
+		} else {
+			xl_undo_tt_slot_abort abort = { 0 };
+
+			abort.segment_id = segment;
+			abort.slot_offset = 4;
+			abort.wrap = 7;
+			abort.xid = 801;
+			abort.instance = thread;
+			record_append(r, &abort, sizeof(abort));
+		}
+	}
+	return r;
+}
+
+/* Feed the real decoder's output straight into the original planner. A
+ * checkpoint cannot make an unsupported prepared carrier into ordinary history. */
+static ClusterColdDetailV1
+rec_cold_tt_feed(const ClusterColdDecodedV1 *decoded, uint16 thread, bool history)
+{
+	ClusterColdParticipantV1 cut = { 0 };
+	ClusterColdPlanV1 *plan = NULL;
+	ClusterColdDetailV1 detail;
+
+	cut.thread_id = thread;
+	cut.timeline = 1;
+	cut.owner_incarnation = 11;
+	cut.physical_lower = decoded->record.read_rec_ptr;
+	cut.native_redo = history ? decoded->record.end_rec_ptr : cut.physical_lower;
+	cut.tail_end = decoded->record.end_rec_ptr;
+	detail = cluster_cold_plan_create_v1(&cut, 1, 4 * 1024 * 1024, &plan);
+	if (detail == CLUSTER_COLD_OK)
+		detail = cluster_cold_plan_feed_v1(plan, 0, &decoded->record);
+	cluster_cold_plan_destroy_v1(&plan);
+	return detail;
+}
+
+UT_TEST(test_records_cold_prepared_tt_sources_refuse_history_and_redo)
+{
+	for (int carrier = 0; carrier < 3; carrier++)
+		for (int origin = 0; origin < 2; origin++)
+			for (int foreign = 0; foreign < 2; foreign++) {
+				uint32 self, peer, source;
+				RealRecord *r;
+				ClusterColdDecodedV1 decoded = { 0 };
+
+				rec_two_writers(&self, &peer);
+				source = origin ? peer : self;
+				r = rec_cold_tt_terminal(source, carrier);
+				UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(
+								 &r->reader, REC_SYSID,
+								 items[source].source.claim.identity.storage_uuid, false, foreign,
+								 &decoded),
+							 CLUSTER_COLD_OK);
+				UT_ASSERT(decoded.record.record_flags & CLUSTER_COLD_RECORD_UNSUPPORTED);
+				for (int history = 0; history < 2; history++)
+					UT_ASSERT_EQ(rec_cold_tt_feed(&decoded, origin + 1, history),
+								 CLUSTER_COLD_STRUCTURAL_UNSUPPORTED);
+				cluster_cold_decoded_release_v1(&decoded);
+			}
+}
+
+UT_TEST(test_records_cold_exact_abort_sources_stay_supported)
+{
+	for (int origin = 0; origin < 2; origin++)
+		for (int foreign = 0; foreign < 2; foreign++) {
+			uint32 self, peer, source;
+			RealRecord *r;
+			ClusterColdDecodedV1 decoded = { 0 };
+
+			rec_two_writers(&self, &peer);
+			source = origin ? peer : self;
+			r = rec_cold_tt_terminal(source, 3);
+			UT_ASSERT_EQ(
+				cluster_cold_recovery_decode_v1(&r->reader, REC_SYSID,
+												items[source].source.claim.identity.storage_uuid,
+												false, foreign, &decoded),
+				CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(decoded.record.record_flags,
+						 foreign ? CLUSTER_COLD_RECORD_FOREIGN_SIDE : 0);
+			for (int history = 0; history < 2; history++)
+				UT_ASSERT_EQ(rec_cold_tt_feed(&decoded, origin + 1, history), CLUSTER_COLD_OK);
+			cluster_cold_decoded_release_v1(&decoded);
+		}
+}
+
+UT_TEST(test_records_cold_tt_terminal_carriers_require_full_payload)
+{
+	for (int carrier = 0; carrier < 4; carrier++)
+		for (int foreign = 0; foreign < 2; foreign++)
+			for (int extra = 0; extra < 2; extra++) {
+				uint32 self, peer;
+				RealRecord *r;
+				ClusterColdDecodedV1 decoded = { 0 };
+
+				rec_two_writers(&self, &peer);
+				r = rec_cold_tt_terminal(self, carrier);
+				r->u.decoded.main_data_len += extra ? 1 : -1;
+				UT_ASSERT_EQ(
+					cluster_cold_recovery_decode_v1(&r->reader, REC_SYSID,
+													items[self].source.claim.identity.storage_uuid,
+													false, foreign, &decoded),
+					CLUSTER_COLD_COMPONENT_INVALID);
+				cluster_cold_decoded_release_v1(&decoded);
+			}
+}
+
 UT_TEST(test_records_cold_assignment_rejects_malformed_xids)
 {
 	for (int fault = 0; fault < 10; fault++) {

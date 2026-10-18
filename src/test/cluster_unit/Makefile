@@ -3297,6 +3297,11 @@ test_cluster_wal_retained_cut: test_cluster_wal_retained_cut.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
+# Keep these definitions before the retained-record prerequisite expansion.
+CLUSTER_COLD_PLAN_SPLIT_O = test_cluster_cold_recovery_plan_store_core.o test_cluster_cold_recovery_plan_seal_core.o \
+	test_cluster_cold_recovery_plan_space_core.o test_cluster_cold_recovery_plan_schedule_core.o
+CLUSTER_COLD_PLAN_O = test_cluster_cold_recovery_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)
+
 RETAINED_RECORD_OBJS = $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
 		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
@@ -3308,10 +3313,10 @@ test_cluster_wal_retained_cut_records: test_cluster_wal_retained_cut_records.c u
 		$(top_srcdir)/src/backend/cluster/cluster_wal_retained_generation.c \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_retained_cut_internal.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_retained_cut.h \
-		$(RETAINED_RECORD_OBJS) test_cluster_cold_recovery_decode_core.o \
+		$(RETAINED_RECORD_OBJS) $(CLUSTER_COLD_PLAN_O) test_cluster_cold_recovery_decode_core.o \
 		test_cluster_cold_recovery_xid_core.o \
 		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(RETAINED_RECORD_OBJS) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(RETAINED_RECORD_OBJS) $(CLUSTER_COLD_PLAN_O) \
 		$(CLUSTER_COLD_DECODE_O) test_cluster_cold_recovery_xid_core.o \
 		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
@@ -8900,10 +8905,6 @@ test_cluster_control_root test_cluster_cf_authority: \
 
 # Typed cold recovery tests use the real plan and explicit owner boundaries.
 # Author: SqlRush <sqlrush@gmail.com>
-CLUSTER_COLD_PLAN_SPLIT_O = test_cluster_cold_recovery_plan_store_core.o test_cluster_cold_recovery_plan_seal_core.o \
-	test_cluster_cold_recovery_plan_space_core.o test_cluster_cold_recovery_plan_schedule_core.o
-CLUSTER_COLD_PLAN_O = test_cluster_cold_recovery_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)
-
 test_cluster_cold_recovery_plan_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_plan.c \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h

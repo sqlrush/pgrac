@@ -356,7 +356,20 @@ cold_record_flags(XLogReaderState *reader, uint64 system_identifier, const uint8
 	case RM_XACT_ID:
 		return cold_xact_flags(reader, system_identifier, storage_uuid, out, flags, effects);
 	case RM_CLUSTER_UNDO_ID:
-		if (info == XLOG_UNDO_RECOVERY_TT_ABORT) {
+		if (info == XLOG_UNDO_TT_SLOT_COMMIT || info == XLOG_UNDO_TT_SLOT_SET_HEAD
+			|| info == XLOG_UNDO_TT_SLOT_ABORT) {
+			ClusterUndoDecoded undo;
+
+			if (!cluster_undo_decode(reader, &undo) || !cluster_undo_preflight(&undo))
+				return CLUSTER_COLD_COMPONENT_INVALID;
+			/* Prepared resolution can emit these standalone carriers before
+			 * its XACT terminal. Refuse them even in retained history: a
+			 * checkpoint is not a complete prepared-transaction consumer.
+			 * Ordinary abort has its separate exact-generation carrier. */
+			if (info != XLOG_UNDO_TT_SLOT_ABORT
+				|| undo.format_version != CLUSTER_UNDO_TT_ABORT_EXACT_VERSION)
+				*flags = CLUSTER_COLD_RECORD_UNSUPPORTED;
+		} else if (info == XLOG_UNDO_RECOVERY_TT_ABORT) {
 			ClusterRecoveryTTAbortV1 c0;
 
 			if (XLogRecGetInfo(reader) != XLOG_UNDO_RECOVERY_TT_ABORT
