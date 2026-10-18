@@ -1490,8 +1490,9 @@ UT_TEST(test_pcm_illegal_transition_validator_rejects)
 UT_TEST(test_pcm_disable_path_counters_return_zero)
 {
 	/*
-	 * In cluster_unit binary cluster_pcm_grd_init is never called so
-	 * ClusterPcm stays NULL — all 9 counter accessors return 0.
+	 * The startup-only section runs before cluster_pcm_grd_init, so
+	 * ClusterPcm is NULL and all nine accessors must return zero. Later
+	 * runtime fixtures initialize the region and exercise real counters.
 	 */
 	UT_ASSERT_EQ((int)cluster_pcm_get_trans_n_to_s_count(), 0);
 	UT_ASSERT_EQ((int)cluster_pcm_get_trans_n_to_x_count(), 0);
@@ -23836,17 +23837,21 @@ main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	UT_PLAN(361);
+	/* Observe the actual startup state before any runtime fixture overrides
+	 * the postmaster GUC or initializes shared PCM state and counters. */
+	UT_RUN(test_pcm_grd_max_entries_default_is_minus_one);
+	UT_RUN(test_pcm_disable_path_counters_return_zero);
+	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
+
 	UT_RUN(test_resource_x_pi_complete_resumes_native_master_without_new_assert);
 	UT_RUN(test_resource_x_master_work_never_substitutes_for_pi_or_admission);
 	UT_RUN(test_resource_x_master_work_rejects_stale_capture_before_io);
 	UT_RUN(test_resource_x_master_work_rechecks_after_storage_io);
 	UT_RUN(test_resource_x_master_work_duplicate_and_error_leave_original_owner);
-	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
-	UT_RUN(test_pcm_grd_max_entries_default_is_minus_one);
 	UT_RUN(test_pcm_buffer_desc_invariants_hold_at_stage_2_30);
 	UT_RUN(test_pcm_lock_module_init_symbol_is_callable);
 	UT_RUN(test_pcm_trans_1_n_to_s_validator_accepts);
@@ -23859,7 +23864,6 @@ main(void)
 	UT_RUN(test_pcm_trans_8_s_to_n_release_validator_accepts);
 	UT_RUN(test_pcm_trans_9_cleanout_validator_reachable_but_apply_fail_closed);
 	UT_RUN(test_pcm_illegal_transition_validator_rejects);
-	UT_RUN(test_pcm_disable_path_counters_return_zero);
 	UT_RUN(test_pcm_wait_margin_keeps_each_ratio_pair_and_separate_lifetimes);
 	UT_RUN(test_resource_x_trace_is_exact_bounded_and_cannot_erase_unexported_evidence);
 	UT_RUN(test_resource_x_trace_observes_actual_head_and_same_ref_waiters);
