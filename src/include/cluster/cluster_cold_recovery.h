@@ -869,6 +869,13 @@ extern ClusterColdDetailV1 cluster_cold_tt_after_redo_capture_v1(ClusterColdType
 extern ClusterColdDetailV1 cluster_cold_tt_after_redo_recheck_v1(ClusterColdTypedV1 *typed);
 extern void cluster_cold_tt_after_redo_reset_v1(ClusterColdTypedV1 *typed);
 extern uint32 cluster_cold_tt_after_redo_count_v1(const ClusterColdTypedV1 *typed);
+/* Distinguish a captured empty inventory from absent or refused input. */
+extern bool cluster_cold_tt_after_redo_namespace_matches_v1(const ClusterColdTypedV1 *typed);
+/* Exact physical lookup in one valid captured inventory. Clears index on
+ * absence/refusal; no disk access, reconstruction or recovery authority. */
+extern const UndoSegmentHeaderData *cluster_cold_tt_header_find_v1(const ClusterColdTypedV1 *typed,
+																   bool after_redo, uint8 owner,
+																   uint32 segment, uint32 *index);
 /* Complete retained post-redo header input, indexed in its own inventory.
  * Failure clears available identity outputs. No original-base coverage. */
 extern const struct UndoSegmentHeaderData *
@@ -945,6 +952,14 @@ extern bool cluster_cold_typed_tt_after_redo_readback_v1(const ClusterColdTypedV
 														 uint32 participant,
 														 uint32 post_segment_index,
 														 struct RfSideUndoHeaderImageV1 *out);
+
+/* Check both captured inventories and every current source's ordinary TT
+ * target. Current origins use the sealed native fold; history-only origins
+ * must retain their original full header bytes and are never replayed here.
+ * This read-only comparison grants no checkpoint/base, history-effect, top,
+ * loser or C0 authority. Original source isolation and final rechecks remain
+ * the caller's obligations; no completion flag is stored. */
+extern bool cluster_cold_typed_tt_redo_inventory_v1(const ClusterColdTypedV1 *typed);
 
 /* Copy any physical slot after the same selected source's sealed ordinary
  * redo, or match its resulting physical key. No status is filtered during

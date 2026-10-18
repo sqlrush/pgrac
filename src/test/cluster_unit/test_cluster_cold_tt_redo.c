@@ -2935,10 +2935,199 @@ UT_TEST(tt_post_readback_requires_valid_post_capture_and_keeps_final_refusal)
 	tt_redo_destroy(&f);
 }
 
+static void
+tt_inventory_extra(uint32 segment, uint8 owner, PGAlignedBlock *page)
+{
+	cluster_undo_segment_make_header_bytes(segment, owner, page->data);
+	((UndoSegmentHeaderData *)page->data)->tt_slots[47].xid = 900;
+	((UndoSegmentHeaderData *)page->data)->tt_slots[47].wrap = 9;
+	((UndoSegmentHeaderData *)page->data)->tt_slots[47].status = TT_SLOT_ACTIVE;
+	tt_readback_write(segment, page, true);
+}
+
+static void
+tt_inventory_remove(uint32 segment)
+{
+	char path[MAXPGPATH];
+
+	snprintf(path, sizeof(path), "%s/%u", tt_redo_dir, segment);
+	UT_ASSERT_EQ(unlink(path), 0);
+}
+
+UT_TEST(tt_inventory_checks_untouched_current_and_history_headers)
+{
+	TtRedoFixture f;
+	PGAlignedBlock second, history;
+
+	tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+	tt_inventory_extra(514, 3, &second);
+	tt_inventory_extra(257, 2, &history);
+	tt_redo_seed_recapture(&f);
+	tt_redo_seal(&f);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+	UT_ASSERT_EQ(cluster_cold_tt_base_count_v1(&f.typed), 3);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_count_v1(&f.typed), 3);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_recheck_v1(&f.typed), CLUSTER_COLD_OK);
+	tt_inventory_remove(257);
+	tt_inventory_remove(514);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_inventory_matches_new_native_full_image_and_terminal)
+{
+	for (int terminal = 0; terminal < 2; terminal++) {
+		TtRedoFixture f;
+		PGAlignedBlock expected;
+
+		tt_post_readback_new(&f, &expected, terminal != 0);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_inventory_refuses_disappeared_original_even_when_selected_header_matches)
+{
+	for (int history = 0; history < 2; history++) {
+		TtRedoFixture f;
+		PGAlignedBlock extra;
+		RfSideUndoHeaderImageV1 out;
+		uint32 segment = history ? 257 : 514;
+
+		tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+		tt_inventory_extra(segment, history ? 2 : 3, &extra);
+		tt_redo_seed_recapture(&f);
+		tt_redo_seal(&f);
+		tt_inventory_remove(segment);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(cluster_cold_typed_tt_after_redo_readback_v1(&f.typed, 0, 0, &out));
+		UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_inventory_requires_current_wal_targets_even_with_empty_observed_inventory)
+{
+	TtRedoFixture f;
+	PGAlignedBlock expected;
+
+	tt_post_readback_new(&f, &expected, true);
+	tt_inventory_remove(513);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_tt_base_count_v1(&f.typed), 0);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_count_v1(&f.typed), 0);
+	UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+	tt_readback_write(513, &expected, true);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_inventory_refuses_unexplained_new_current_or_history_segment)
+{
+	for (int history = 0; history < 2; history++) {
+		TtRedoFixture f;
+		PGAlignedBlock extra;
+		uint32 segment = history ? 257 : 514;
+
+		tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+		tt_redo_seal(&f);
+		tt_inventory_extra(segment, history ? 2 : 3, &extra);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+		tt_inventory_remove(segment);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_inventory_compares_every_untouched_current_and_history_byte)
+{
+	for (int history = 0; history < 2; history++) {
+		TtRedoFixture f;
+		PGAlignedBlock extra, changed;
+		uint32 segment = history ? 257 : 514;
+
+		tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+		tt_inventory_extra(segment, history ? 2 : 3, &extra);
+		tt_redo_seed_recapture(&f);
+		tt_redo_seal(&f);
+		changed = extra;
+		changed.data[BLCKSZ - 1] ^= 1;
+		tt_readback_write(segment, &changed, false);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+		tt_inventory_remove(segment);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_inventory_empty_capture_still_requires_exact_current_source)
+{
+	TtRedoFixture f;
+	PGAlignedBlock saved;
+
+	tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+	saved = f.base;
+	tt_post_readback_empty_original(&f);
+	UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+	UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed)); /* unsealed */
+	tt_redo_seal(&f);
+	UT_ASSERT(cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+	f.typed.sources[0].claim.claim_sha256[0] ^= 1;
+	UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+	f.typed.sources[0].claim.claim_sha256[0] ^= 1;
+	f.typed.participants[0].native_redo++;
+	UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+	f.typed.participants[0].native_redo--;
+	f.typed.refusal = CLUSTER_COLD_SOURCE_GAP;
+	UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+	f.typed.refusal = CLUSTER_COLD_OK;
+	f.typed.replay_count = 0;
+	UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+	f.typed.replay_count = 1;
+	UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(NULL));
+	tt_readback_write(513, &saved, true);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_inventory_refuses_ambiguous_current_origin_and_sticky_post_failure)
+{
+	TtRedoFixture f;
+	PGAlignedBlock changed;
+
+	tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+	tt_redo_seal(&f);
+	f.typed.participants[1] = f.typed.participants[0];
+	f.typed.sources[1] = f.typed.sources[0];
+	f.typed.side_plans[1] = f.typed.side_plans[0];
+	f.typed.replay_count = 2;
+	tt_redo_seed_recapture(&f);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+	UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+	f.typed.replay_count = 1;
+	f.typed.side_plans[1] = NULL;
+	UT_ASSERT(cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+	changed = f.base;
+	changed.data[BLCKSZ - 1] ^= 1;
+	tt_readback_write(513, &changed, false);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_recheck_v1(&f.typed), CLUSTER_COLD_SOURCE_GAP);
+	tt_readback_write(513, &f.base, false);
+	UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+	tt_redo_destroy(&f);
+}
+
 int
 main(void)
 {
-	UT_PLAN(68);
+	UT_PLAN(76);
+	UT_RUN(tt_inventory_checks_untouched_current_and_history_headers);
+	UT_RUN(tt_inventory_matches_new_native_full_image_and_terminal);
+	UT_RUN(tt_inventory_refuses_disappeared_original_even_when_selected_header_matches);
+	UT_RUN(tt_inventory_requires_current_wal_targets_even_with_empty_observed_inventory);
+	UT_RUN(tt_inventory_refuses_unexplained_new_current_or_history_segment);
+	UT_RUN(tt_inventory_compares_every_untouched_current_and_history_byte);
+	UT_RUN(tt_inventory_empty_capture_still_requires_exact_current_source);
+	UT_RUN(tt_inventory_refuses_ambiguous_current_origin_and_sticky_post_failure);
 	UT_RUN(tt_post_readback_reconstructs_new_init_bind_and_commit_without_base);
 	UT_RUN(tt_post_readback_selects_existing_base_by_physical_identity);
 	UT_RUN(tt_post_readback_never_seeds_missing_base_from_observed_bytes);

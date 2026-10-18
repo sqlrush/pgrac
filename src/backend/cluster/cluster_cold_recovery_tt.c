@@ -427,11 +427,41 @@ cluster_cold_tt_after_redo_recheck_v1(ClusterColdTypedV1 *typed)
 uint32
 cluster_cold_tt_after_redo_count_v1(const ClusterColdTypedV1 *typed)
 {
-	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK
-		|| !cold_tt_namespace_matches(typed, typed->tt_base)
-		|| !cold_tt_namespace_matches(typed, typed->tt_after_redo))
+	if (!cluster_cold_tt_after_redo_namespace_matches_v1(typed))
 		return 0;
 	return typed->tt_after_redo->count;
+}
+
+bool
+cluster_cold_tt_after_redo_namespace_matches_v1(const ClusterColdTypedV1 *typed)
+{
+	return typed != NULL && typed->refusal == CLUSTER_COLD_OK
+		   && cold_tt_namespace_matches(typed, typed->tt_base)
+		   && cold_tt_namespace_matches(typed, typed->tt_after_redo);
+}
+
+const UndoSegmentHeaderData *
+cluster_cold_tt_header_find_v1(const ClusterColdTypedV1 *typed, bool after_redo, uint8 owner,
+							   uint32 segment, uint32 *index)
+{
+	const ClusterColdTtBaseV1 *base;
+	uint32 i = 0;
+
+	if (index != NULL)
+		*index = UINT32_MAX;
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK
+		|| !cold_tt_namespace_matches(typed, typed->tt_base)
+		|| (after_redo && !cluster_cold_tt_after_redo_namespace_matches_v1(typed)))
+		return NULL;
+	base = after_redo ? typed->tt_after_redo : typed->tt_base;
+	for (const ColdTtInputV1 *input = base->first; input != NULL; input = input->next, i++) {
+		if (input->owner != owner || input->segment != segment)
+			continue;
+		if (index != NULL)
+			*index = i;
+		return (const UndoSegmentHeaderData *)input->block.data;
+	}
+	return NULL;
 }
 
 const UndoSegmentHeaderData *

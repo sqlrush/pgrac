@@ -175,7 +175,7 @@ cluster_cold_typed_tt_after_redo_readback_v1(const ClusterColdTypedV1 *typed, ui
 	const UndoSegmentHeaderData *observed;
 	RfSideUndoHeaderImageV1 folded;
 	uint8 owner;
-	uint32 segment, count, original_index = UINT32_MAX;
+	uint32 segment, original_index;
 	bool has_header_work;
 
 	if (out == NULL)
@@ -188,19 +188,7 @@ cluster_cold_typed_tt_after_redo_readback_v1(const ClusterColdTypedV1 *typed, ui
 	observed = cluster_cold_tt_after_redo_header_v1(typed, post_segment_index, &owner, &segment);
 	if (observed == NULL)
 		return false;
-	count = cluster_cold_tt_base_count_v1(typed);
-	for (uint32 i = 0; i < count; i++) {
-		uint8 base_owner;
-		uint32 base_segment;
-
-		if (cluster_cold_tt_base_header_v1(typed, i, &base_owner, &base_segment) == NULL)
-			return false;
-		if (base_owner == owner && base_segment == segment) {
-			original_index = i;
-			break;
-		}
-	}
-	if (original_index != UINT32_MAX) {
+	if (cluster_cold_tt_header_find_v1(typed, false, owner, segment, &original_index) != NULL) {
 		if (!cluster_cold_typed_tt_redo_header_v1(typed, participant, original_index, &folded))
 			return false;
 	} else {
@@ -217,6 +205,81 @@ cluster_cold_typed_tt_after_redo_readback_v1(const ClusterColdTypedV1 *typed, ui
 		return false;
 	*out = folded;
 	return true;
+}
+
+bool
+cluster_cold_typed_tt_redo_inventory_v1(const ClusterColdTypedV1 *typed)
+{
+	uint32 originals_seen = 0;
+	uint32 post_count;
+
+	if (!cluster_cold_tt_after_redo_namespace_matches_v1(typed) || typed->replay_count == 0
+		|| typed->replay_count > typed->participant_count)
+		return false;
+	/* Even an empty physical inventory needs every current source's exact,
+	 * sealed ordinary cut. Never choose arbitrarily between current owners. */
+	for (uint32 p = 0; p < typed->replay_count; p++) {
+		bool unused_header_work;
+
+		for (uint32 q = 0; q < p; q++)
+			if (typed->participants[p].thread_id == typed->participants[q].thread_id)
+				return false;
+		if (!cold_tt_redo_source(typed, p, 0, 0, &unused_header_work))
+			return false;
+		/* Pre-redo history is already in the base. Only actually replayed
+		 * operations require a present physical target in this inventory. */
+		for (uint32 i = 0; i < rf_side_online_plan_operation_count_v1(typed->side_plans[p]); i++) {
+			RfSideOnlineOperationV1 operation;
+			uint8 owner;
+			uint32 segment;
+
+			if (!rf_side_online_plan_operation_v1(typed->side_plans[p], i, &operation))
+				return false;
+			if (operation.history_only)
+				continue;
+			if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO) {
+				owner = operation.undo.instance;
+				segment = operation.undo.segment_id;
+			} else if (operation.kind == RF_SIDE_ONLINE_OPERATION_XACT
+					   && operation.xact.has_tt_delta) {
+				owner = operation.xact.tt_delta.instance;
+				segment = operation.xact.tt_delta.segment_id;
+			} else
+				continue;
+			if (owner != typed->participants[p].thread_id
+				|| cluster_cold_tt_header_find_v1(typed, true, owner, segment, NULL) == NULL)
+				return false;
+		}
+	}
+	post_count = cluster_cold_tt_after_redo_count_v1(typed);
+	for (uint32 i = 0; i < post_count; i++) {
+		const UndoSegmentHeaderData *observed, *base;
+		RfSideUndoHeaderImageV1 folded;
+		uint8 owner;
+		uint32 segment, p;
+
+		observed = cluster_cold_tt_after_redo_header_v1(typed, i, &owner, &segment);
+		if (observed == NULL)
+			return false;
+		base = cluster_cold_tt_header_find_v1(typed, false, owner, segment, NULL);
+		if (base != NULL)
+			originals_seen++;
+		for (p = 0; p < typed->replay_count; p++)
+			if (typed->participants[p].thread_id == owner)
+				break;
+		if (p < typed->replay_count) {
+			if (!cluster_cold_typed_tt_after_redo_readback_v1(typed, p, i, &folded))
+				return false;
+		} else {
+			/* A history-only source is not a current redo owner. Its bytes
+			 * must remain unchanged; this does not qualify its old effects. */
+			if (base == NULL || memcmp(observed, base, BLCKSZ) != 0)
+				return false;
+		}
+	}
+	/* Captures enumerate each physical owner/segment once. Matching all post
+	 * headers must account for every original, including untouched segments. */
+	return originals_seen == cluster_cold_tt_base_count_v1(typed);
 }
 
 bool
