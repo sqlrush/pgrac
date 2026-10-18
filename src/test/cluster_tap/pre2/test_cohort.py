@@ -44,6 +44,18 @@ class CohortTest(unittest.TestCase):
         self.assertIn("common.cluster.crossnode_runtime_visibility='on'\n", text)
         self.assertIn("common.cluster.undo_gcs_coherence='on'\n", text)
 
+    def test_shared_business_input_reuses_terminal_proofs_unless_explicitly_disabled(self):
+        for count in (2, 4):
+            with self.subTest(count=count):
+                self.assertIn("common.cluster.page_scn_shortcut='on'\n",
+                              self.render(self.layout(count)))
+            for value in ('off', 'on'):
+                layout = self.layout(count)
+                layout['extra_conf'] = [f'cluster.page_scn_shortcut={value}']
+                with self.subTest(count=count, value=value):
+                    self.assertIn(f"common.cluster.page_scn_shortcut='{value}'\n",
+                                  self.render(layout))
+
     def test_explicit_visibility_negatives_keep_their_original_inputs(self):
         for visibility, coherence in (('off', 'off'), ('off', 'on'), ('on', 'off')):
             layout = self.layout(4)
