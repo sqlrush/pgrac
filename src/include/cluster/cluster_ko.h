@@ -812,6 +812,55 @@ extern void cluster_ko_origin_discard_detail_v1(const ClusterKoDiscardDetailV1 *
 extern uint64 cluster_ko_origin_discard_count(const char *reason);
 extern const char *cluster_ko_origin_discard_reason_name(int reason);
 
+/* Diagnostic copies, never authority or a wire record. Zero means no failure. */
+typedef enum ClusterKoNativeFailureReason {
+	CLUSTER_KO_NATIVE_FAIL_NONE,
+	CLUSTER_KO_NATIVE_FAIL_PUBLISH,
+	CLUSTER_KO_NATIVE_FAIL_PUBLISH_IDENTITY,
+	CLUSTER_KO_NATIVE_FAIL_REGISTRATION,
+	CLUSTER_KO_NATIVE_FAIL_PUBLICATION,
+	CLUSTER_KO_NATIVE_FAIL_WINDOW_OWNER,
+	CLUSTER_KO_NATIVE_FAIL_WINDOW_WAIT,
+	CLUSTER_KO_NATIVE_FAIL_WINDOW_DISCARD,
+	CLUSTER_KO_NATIVE_FAIL_WINDOW_SPACE,
+	CLUSTER_KO_NATIVE_FAIL_WINDOW_CLOSE,
+	CLUSTER_KO_NATIVE_FAIL_WINDOW_ERROR,
+	CLUSTER_KO_NATIVE_FAIL_ABANDON,
+	CLUSTER_KO_NATIVE_FAIL_PROMOTION_CUT,
+	CLUSTER_KO_NATIVE_FAIL_UNTRACKED,
+	CLUSTER_KO_NATIVE_FAIL_COUNT
+} ClusterKoNativeFailureReason;
+
+typedef enum ClusterKoNativeFailureStage {
+	CLUSTER_KO_NATIVE_STAGE_NONE,
+	CLUSTER_KO_NATIVE_STAGE_OWNER,
+	CLUSTER_KO_NATIVE_STAGE_WAIT,
+	CLUSTER_KO_NATIVE_STAGE_DISCARD,
+	CLUSTER_KO_NATIVE_STAGE_SPACE,
+	CLUSTER_KO_NATIVE_STAGE_CLOSE
+} ClusterKoNativeFailureStage;
+
+typedef struct ClusterKoNativeFailureV1 {
+	uint32 reason, stage;
+	int32 sqlerrcode, pid, producer_pid;
+	uint32 slot, operation;
+	int64 captured_pg_us;
+	RelFileLocator locator;
+	uint64 serial, batch, epoch, drop_identity_serial, revision;
+	uint32 drop_identity, identity_state;
+	/* work: publication/predelete/buffers/recovery, low bit first. */
+	uint32 work_flags, owner_flags, context_flags, entry_flags, matches, handoff;
+	uint16 sent_peers, sending_peers, uncertain_peers, done_peers, failed_peers;
+	uint64 terminal_start, terminal_end, source_thread, source_boot, mutation_token;
+	uint32 source_timeline;
+} ClusterKoNativeFailureV1;
+
+extern const char *cluster_ko_native_failure_reason_name(int reason);
+extern const char *cluster_ko_native_failure_stage_name(int stage);
+extern uint64 cluster_ko_native_failure_count(const char *reason);
+extern bool cluster_ko_native_failure_first(const char *reason, ClusterKoNativeFailureV1 *out);
+
+
 extern uint64 cluster_ko_flush_count(void);		   /* barriers initiated (enqueuer) */
 extern uint64 cluster_ko_ack_received_count(void); /* peer DONE ACKs recorded (enqueuer) */
 extern uint64 cluster_ko_failclosed_count(void);   /* 53RAA fail-closed (enqueuer) */

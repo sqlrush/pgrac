@@ -271,6 +271,7 @@ UT_TEST(test_publication_exact_continuation_drift_retains_failed_owner)
 		UT_ASSERT(!cluster_ko_directory_drop_committed_v3(origin_request.base.key.locator));
 		UT_ASSERT(origin_io_allowed());
 		UT_ASSERT(storage.native_recovery_required);
+		UT_ASSERT_EQ(cluster_ko_native_failure_count("publication"), 1);
 		MyBackendType = B_CHECKPOINTER;
 		UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_INVALID);
 		native_fixture_shared_memory_end();

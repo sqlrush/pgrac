@@ -1067,6 +1067,35 @@ cluster_ko_origin_discard_reason_name(int reason)
 	return reason >= 0 && reason < (int)lengthof(names) ? names[reason] : "unknown";
 }
 
+/* Explicit diagnostic sink fixture, not a native producer/authority proof. */
+const char *
+cluster_ko_native_failure_reason_name(int reason)
+{
+	static const char *const names[] = {
+		"none", "publish", "publish_identity", "registration_publication", "publication",
+		"window_owner", "window_wait", "window_discard", "window_space", "window_close",
+		"window_error", "abandon", "promotion_cut", "producer_untracked"
+	};
+	return reason >= 0 && reason < (int)lengthof(names) ? names[reason] : "unknown";
+}
+uint64
+cluster_ko_native_failure_count(const char *reason)
+{
+	return strcmp(reason, "window_close") == 0 ? 23 : 0;
+}
+bool
+cluster_ko_native_failure_first(const char *reason, ClusterKoNativeFailureV1 *out)
+{
+	if (strcmp(reason, "window_close") != 0)
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->stage = CLUSTER_KO_NATIVE_STAGE_CLOSE;
+	out->locator = (RelFileLocator){1663, 5, 16385};
+	out->serial = 29;
+	out->batch = 12;
+	return true;
+}
+
 uint64
 cluster_ko_origin_checkpoint_restart_count(const char *reason pg_attribute_unused())
 {
@@ -5565,6 +5594,18 @@ UT_TEST(test_debug_dump_exposes_origin_discard_reason_counters)
 	if (captured_dump_count("ko", "origin_discard_buffer_wait_count") == 1)
 		UT_ASSERT_STR_EQ(captured_dump_value("ko", "origin_discard_buffer_wait_count"), "17");
 	UT_ASSERT_EQ(captured_dump_count("ko", "origin_discard_pi_pending_count"), 1);
+	{
+		const char *const keys[] = { "native_failure_window_close_count",
+			"native_failure_window_close_first_stage", "native_failure_window_close_first_locator",
+			"native_failure_window_close_first_serial" };
+		const char *const values[] = { "23", "5", "1663/5/16385", "29" };
+
+		for (unsigned i = 0; i < lengthof(keys); i++) {
+			UT_ASSERT_EQ(captured_dump_count("ko", keys[i]), 1);
+			if (captured_dump_count("ko", keys[i]) == 1)
+				UT_ASSERT_STR_EQ(captured_dump_value("ko", keys[i]), values[i]);
+		}
+	}
 }
 
 UT_TEST(test_debug_dump_exposes_receipt_lifetime_and_cancel_before_counters)

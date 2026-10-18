@@ -4240,12 +4240,21 @@ UT_TEST(test_native_stale_head_does_not_hide_later_current_work)
 	MyBackendType = B_CHECKPOINTER;
 	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_INVALID);
 	UT_ASSERT_EQ(storage.native_waiting, 1);
-	UT_ASSERT_EQ(fixture_log_events, 1);
+	{
+		ClusterKoNativeFailureV1 first = {0};
+
+		UT_ASSERT(cluster_ko_native_failure_first("promotion_cut", &first));
+		UT_ASSERT(RelFileLocatorEquals(first.locator, postcommit_binding.identity.locator));
+		UT_ASSERT(first.locator.relNumber != 199);
+	}
+	UT_ASSERT_EQ(fixture_log_events, 2); /* Original deferred LOG + saved first-failure LOG. */
+	UT_ASSERT_EQ(cluster_ko_native_failure_count("promotion_cut"), 1);
 	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
 	UT_ASSERT_EQ(storage.contexts[0].terminal.identity.locator.relNumber, 199);
 	UT_ASSERT_EQ(storage.native_waiting, 0);
 	UT_ASSERT_EQ(native_allocated, 1);
-	UT_ASSERT_EQ(fixture_log_events, 1);
+	UT_ASSERT_EQ(fixture_log_events, 2); /* Original deferred LOG + saved first-failure LOG. */
+	UT_ASSERT_EQ(cluster_ko_native_failure_count("promotion_cut"), 1);
 	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_INVALID);
 	native_fixture_shared_memory_end();
 }

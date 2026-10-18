@@ -855,6 +855,7 @@ UT_TEST(test_committed_registration_survives_original_cleanup_and_blocks_s6)
 		UT_ASSERT_EQ(fixture_absent_ack_removes, failing);
 		UT_ASSERT_EQ(completion_allocations, 0);
 		UT_ASSERT(work->recovery_required && storage.native_recovery_required);
+		UT_ASSERT_EQ(cluster_ko_native_failure_count("abandon"), 1);
 		UT_ASSERT_EQ(native_free_calls, 0);
 		UT_ASSERT(storage.contexts[slot].used && storage.contexts[slot].origin_detached);
 		UT_ASSERT(cluster_ko_ax_release_handoff_v3(&tag, AccessExclusiveLock, &holder));
@@ -982,6 +983,7 @@ UT_TEST(test_original_publication_does_not_fail_a_pending_commit_window)
 	/* No successful drain is fabricated by this fixture. The original final
 	 * cleanup still abandons the unready carrier for recovery. */
 	UT_ASSERT(work->recovery_required && storage.native_recovery_required);
+	UT_ASSERT_EQ(cluster_ko_native_failure_count("abandon"), 1);
 	UT_ASSERT_EQ(native_free_calls, 0);
 	native_fixture_shared_memory_end();
 }
@@ -1053,6 +1055,8 @@ UT_TEST(test_pending_publication_rejects_changed_active_operation)
 		}
 		cluster_ko_shared_native_publication_v3();
 		UT_ASSERT(work->recovery_required && storage.native_recovery_required);
+		UT_ASSERT_EQ(cluster_ko_native_failure_count(fault == 12
+			? "producer_untracked" : "registration_publication"), 1);
 		UT_ASSERT(!work->publication_observed);
 		UT_ASSERT(!work->buffers_released && !work->predelete_ready);
 		UT_ASSERT(!cluster_ko_directory_drop_committed_v3(work->context.request.key.locator));
@@ -1131,6 +1135,10 @@ static bool window_expect_closed;
 static unsigned window_origin_case;
 static unsigned window_final_case;
 static unsigned window_close_case, window_close_samples;
+/* Only the new directed diagnostics tests enable this observer. */
+static const char *native_observation_reason;
+static uint32 native_observation_stage;
+
 static ClusterKoDirectoryIoV3 window_entered;
 static uint32 window_interrupt_holdoff, window_query_cancel_holdoff;
 static ClusterKoSharedMessageV4 window_request;
@@ -1667,7 +1675,90 @@ run_committed_window(uint16 operation, unsigned mode, bool held, unsigned origin
 		UT_ASSERT_EQ(cluster_ko_origin_discard_count("unknown"), 0);
 		UT_ASSERT_EQ(cluster_ko_origin_checkpoint_wait_count("drain_wait"), 0);
 	}
+	if (native_observation_reason != NULL) {
+		ClusterKoNativeFailureV1 first, after;
+
+		memset(&first, 0x5a, sizeof(first));
+		after = first;
+		if (strcmp(native_observation_reason, "none") == 0) {
+			after = first;
+			UT_ASSERT(!cluster_ko_native_failure_first("window_close", &first));
+			UT_ASSERT(memcmp(&first, &after, sizeof(first)) == 0);
+			for (int i = 1; i < CLUSTER_KO_NATIVE_FAIL_COUNT; i++)
+				UT_ASSERT_EQ(cluster_ko_native_failure_count(
+					cluster_ko_native_failure_reason_name(i)), 0);
+		} else {
+			UT_ASSERT(cluster_ko_native_failure_first(native_observation_reason, &first));
+			UT_ASSERT_EQ(first.stage, native_observation_stage);
+			UT_ASSERT(RelFileLocatorEquals(first.locator, space_identity.key.locator));
+			UT_ASSERT_EQ(first.serial, window_work->context.serial);
+			UT_ASSERT_EQ(first.batch, window_work->context.request.batch_id);
+			UT_ASSERT_EQ(first.producer_pid, window_work->context.pid);
+			UT_ASSERT_EQ(cluster_ko_native_failure_count(native_observation_reason), 1);
+			/* Secondary CP failure and producer exit must retain the original
+			 * snapshot rather than naming promotion as the first cause. */
+			MyBackendType = B_CHECKPOINTER;
+			UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_INVALID);
+			UT_ASSERT(cluster_ko_native_failure_first(native_observation_reason, &after));
+			UT_ASSERT(memcmp(&first, &after, sizeof(first)) == 0);
+			UT_ASSERT_EQ(cluster_ko_native_failure_count(native_observation_reason), 1);
+			UT_ASSERT_EQ(cluster_ko_native_failure_count("promotion_cut"), 0);
+			UT_ASSERT(window_work->recovery_required && storage.native_recovery_required);
+		}
+		UT_ASSERT_EQ(cluster_ko_native_failure_count(NULL), 0);
+		UT_ASSERT_EQ(cluster_ko_native_failure_count("unknown"), 0);
+		UT_ASSERT(!cluster_ko_native_failure_first("unknown", &after));
+	}
 	native_fixture_shared_memory_end();
+}
+
+UT_TEST(test_native_window_first_failure_has_exact_stage_and_work)
+{
+	native_observation_reason = "window_owner";
+	native_observation_stage = CLUSTER_KO_NATIVE_STAGE_OWNER;
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 7, true, 0);
+	native_observation_reason = "window_wait";
+	native_observation_stage = CLUSTER_KO_NATIVE_STAGE_WAIT;
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 3, true, 0);
+	native_observation_reason = "window_discard";
+	native_observation_stage = CLUSTER_KO_NATIVE_STAGE_DISCARD;
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 8);
+	native_observation_reason = "window_space";
+	native_observation_stage = CLUSTER_KO_NATIVE_STAGE_SPACE;
+	window_final_case = 2;
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 0);
+	native_observation_reason = "window_close";
+	native_observation_stage = CLUSTER_KO_NATIVE_STAGE_CLOSE;
+	window_final_case = window_close_case = 1;
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 0);
+	window_final_case = window_close_case = 0;
+	native_observation_reason = NULL;
+}
+
+UT_TEST(test_native_window_caught_error_retains_evaluating_stage)
+{
+	native_observation_reason = "window_error";
+	native_observation_stage = CLUSTER_KO_NATIVE_STAGE_WAIT;
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 5, true, 0);
+	native_observation_stage = CLUSTER_KO_NATIVE_STAGE_DISCARD;
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 10);
+	native_observation_stage = CLUSTER_KO_NATIVE_STAGE_SPACE;
+	window_final_case = 15;
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 0);
+	native_observation_stage = CLUSTER_KO_NATIVE_STAGE_CLOSE;
+	window_final_case = 1; window_close_case = 12;
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 0);
+	window_final_case = window_close_case = 0;
+	native_observation_reason = NULL;
+}
+
+UT_TEST(test_native_healthy_window_has_no_first_failure)
+{
+	native_observation_reason = "none";
+	window_final_case = 1;
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 0);
+	window_final_case = 0;
+	native_observation_reason = NULL;
 }
 
 UT_TEST(test_committed_window_final_space_keeps_original_owner_and_negative_identity)
@@ -1861,7 +1952,10 @@ UT_TEST(test_prepared_mode_keeps_original_completed_legacy_owner)
 int
 main(void)
 {
-	UT_PLAN(55);
+	UT_PLAN(58);
+	UT_RUN(test_native_window_first_failure_has_exact_stage_and_work);
+	UT_RUN(test_native_window_caught_error_retains_evaluating_stage);
+	UT_RUN(test_native_healthy_window_has_no_first_failure);
 	UT_RUN(test_production_capability_selects_complete_committed_window);
 	UT_RUN(test_production_origin_refuses_old_peer_before_publication);
 	UT_RUN(test_production_origin_cannot_use_legacy_barrier_with_no_peers);

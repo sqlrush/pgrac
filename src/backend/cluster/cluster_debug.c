@@ -4016,6 +4016,36 @@ dump_ko(ReturnSetInfo *rsinfo)
 		snprintf(key, sizeof(key), "origin_discard_%s_count", reason);
 		emit_row(rsinfo, "ko", key, fmt_int64((int64)cluster_ko_origin_discard_count(reason)));
 	}
+	for (int i = 1; i < CLUSTER_KO_NATIVE_FAIL_COUNT; i++) {
+		char key[160];
+		const char *reason = cluster_ko_native_failure_reason_name(i);
+		ClusterKoNativeFailureV1 first;
+
+		snprintf(key, sizeof(key), "native_failure_%s_count", reason);
+		emit_row(rsinfo, "ko", key, fmt_int64((int64)cluster_ko_native_failure_count(reason)));
+		if (cluster_ko_native_failure_first(reason, &first)) {
+#define KO_NATIVE_FIRST_FIELD(field) \
+			snprintf(key, sizeof(key), "native_failure_%s_first_" #field, reason); \
+			emit_row(rsinfo, "ko", key, fmt_int64((int64)first.field))
+			KO_NATIVE_FIRST_FIELD(stage);
+			KO_NATIVE_FIRST_FIELD(captured_pg_us);
+			KO_NATIVE_FIRST_FIELD(serial);
+			KO_NATIVE_FIRST_FIELD(batch);
+			KO_NATIVE_FIRST_FIELD(producer_pid);
+			KO_NATIVE_FIRST_FIELD(slot);
+			KO_NATIVE_FIRST_FIELD(sqlerrcode);
+			KO_NATIVE_FIRST_FIELD(work_flags);
+			KO_NATIVE_FIRST_FIELD(owner_flags);
+			KO_NATIVE_FIRST_FIELD(context_flags);
+			KO_NATIVE_FIRST_FIELD(entry_flags);
+			KO_NATIVE_FIRST_FIELD(matches);
+			KO_NATIVE_FIRST_FIELD(handoff);
+#undef KO_NATIVE_FIRST_FIELD
+			snprintf(key, sizeof(key), "native_failure_%s_first_locator", reason);
+			emit_row(rsinfo, "ko", key, psprintf("%u/%u/%u", first.locator.spcOid,
+				first.locator.dbOid, first.locator.relNumber));
+		}
+	}
 	for (int i = 0; i < CLUSTER_KO_ORIGIN_REASON_COUNT; i++) {
 		char key[128];
 		const char *reason = cluster_ko_origin_checkpoint_reason_name(

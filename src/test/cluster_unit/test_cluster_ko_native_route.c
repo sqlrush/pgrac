@@ -213,9 +213,41 @@ UT_TEST(test_native_publication_rejects_changed_committed_purpose)
 	object_wire_missing_capabilities = 0;
 	cluster_ko_shared_native_publication_v3();
 	UT_ASSERT(work->recovery_required && storage.native_recovery_required);
+	UT_ASSERT_EQ(cluster_ko_native_failure_count("publication"), 1);
 	UT_ASSERT_EQ(identity->state, KO_DROP_IDENTITY_RESERVED);
 	UT_ASSERT(!work->buffers_released && !work->predelete_ready);
 	native_fixture_shared_memory_end();
+}
+
+UT_TEST(test_native_private_publish_records_qualification_or_identity_first)
+{
+	for (unsigned fault = 0; fault < 2; fault++) {
+		ClusterKoCompletionV2 *owner;
+		ClusterKoNativeContinuation *work;
+		ClusterKoNativeFailureV1 first = {0}, after = {0};
+		const char *reason = fault == 0 ? "publish" : "publish_identity";
+
+		prepare_native_v3();
+		owner = postcommit_owner;
+		work = owner->native_reserved;
+		if (fault == 0)
+			owner->space_observed = false;
+		else
+			owner->drop_identity_serial++;
+		cluster_ko_shared_native_commit_v2();
+		UT_ASSERT(owner->native_handed_off);
+		UT_ASSERT(work->recovery_required && storage.native_recovery_required);
+		UT_ASSERT(cluster_ko_native_failure_first(reason, &first));
+		UT_ASSERT_EQ(first.serial, work->context.serial);
+		UT_ASSERT_EQ(first.batch, work->context.request.batch_id);
+		UT_ASSERT(RelFileLocatorEquals(first.locator, work->context.request.key.locator));
+		UT_ASSERT_EQ(cluster_ko_native_failure_count(reason), 1);
+		ko_native_abandon_unready(owner);
+		UT_ASSERT(cluster_ko_native_failure_first(reason, &after));
+		UT_ASSERT(memcmp(&first, &after, sizeof(first)) == 0);
+		UT_ASSERT_EQ(cluster_ko_native_failure_count("abandon"), 0);
+		native_fixture_shared_memory_end();
+	}
 }
 
 UT_TEST(test_native_identity_rejects_wrong_purpose_and_malformed_version)
@@ -378,7 +410,8 @@ UT_TEST(test_v3_capabilities_do_not_execute_published_legacy_drop)
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(15);
+	UT_RUN(test_native_private_publish_records_qualification_or_identity_first);
 	UT_RUN(test_committed_purpose_survives_private_snapshot_and_native_cp);
 	UT_RUN(test_committed_capture_requires_its_own_control_not_live_v3);
 	UT_RUN(test_committed_private_owner_cannot_downgrade_at_commit);
