@@ -49,6 +49,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "unit_test.h"
+#include "test_cluster_storage_pending_types.inc"
 
 UT_DEFINE_GLOBALS();
 
@@ -84,6 +85,10 @@ static uint8 wal_info;
 static uint32 registered_len;
 static unsigned main_create_calls, unlink_calls;
 static bool native_owner, delete_registered;
+static PendingRelDelete *native_pending;
+static bool check_create_birth_on_end;
+static bool abort_writeback_watch, abort_writeback_refused, abort_writeback_drift;
+static unsigned abort_writeback_calls;
 static RelFileLocator locator = { DEFAULTTABLESPACE_OID, 5, 16384 };
 static BlockNumber main_blocks;
 static unsigned truncate_calls, flush_calls, fsm_vacuums;
@@ -118,7 +123,7 @@ static bool ko_reserve_refused, ko_reserve_revoke_on_lock, ko_reserve_revoke_on_
 static uint64 ko_reserve_revision;
 static unsigned ko_reserve_begins, ko_reserve_checks, buffer_reads;
 static bool create_refused, create_scope_live, create_scope_armed;
-static bool create_revoke_on_io, create_throw_on_read;
+static bool create_revoke_on_io, create_throw_on_read, create_throw_on_release;
 static unsigned create_begins, create_ends, create_aborts, create_scope_effects;
 static bool hw_held, fail_hw_lock, throw_reserve_flush;
 sigjmp_buf *PG_exception_stack;
@@ -190,6 +195,15 @@ cluster_ko_create_end_v3(uint64 serial, bool complete)
 {
 	UT_ASSERT(serial == 41 && create_scope_live && !locked && !pinned);
 	create_ends++;
+	if (check_create_birth_on_end) {
+		UT_ASSERT_NOT_NULL(native_pending);
+		if (native_pending != NULL) {
+			UT_ASSERT_EQ(native_pending->shared_create.create_serial, serial);
+			UT_ASSERT_EQ(native_pending->shared_create.identity.state, CLUSTER_SPACE_IDENTITY_LIVE);
+			UT_ASSERT(RelFileLocatorEquals(native_pending->shared_create.identity.key.locator,
+										  locator));
+		}
+	}
 	if (create_refused || (create_scope_armed && !complete))
 		return false;
 	create_scope_live = create_scope_armed = false;
@@ -882,6 +896,10 @@ UnlockReleaseBuffer(Buffer buffer)
 	pinned &= ~(1 << (buffer - 1));
 	locked &= ~(1 << (buffer - 1));
 	release_calls++;
+	if (create_throw_on_release) {
+		create_throw_on_release = false;
+		pg_re_throw();
+	}
 }
 
 void
@@ -1065,7 +1083,9 @@ MemoryContextAlloc(MemoryContext context, Size size)
 	if (context != TopMemoryContext || !native_owner)
 		abort();
 	delete_registered = true;
-	return malloc(size);
+	UT_ASSERT_EQ(size, sizeof(PendingRelDelete));
+	native_pending = malloc(size);
+	return native_pending;
 }
 void *
 palloc(Size size)
@@ -1134,6 +1154,8 @@ smgrdounlinkall(SMgrRelation *rels, int count, bool redo)
 {
 	if (count != 1 || rels[0] != &storage || redo || !delete_registered)
 		abort();
+	if (abort_writeback_watch)
+		UT_ASSERT_EQ(abort_writeback_calls, 1);
 	if (drop_owner) {
 		UT_ASSERT_EQ(commit_decisions, 1);
 		UT_ASSERT_EQ(space_flushes, 2);
@@ -1300,6 +1322,29 @@ FlushRelationBuffers(Relation rel)
 	UT_ASSERT(truncate_owner && rel == fake_relation && locked == 0);
 	UT_ASSERT_EQ(ko_calls, 1);
 	relation_flushes++;
+}
+
+/* Native writeback is exercised separately with the real flush walk/writer.
+ * This physical boundary checks the original pending-delete caller's order. */
+bool cluster_bufmgr_flush_created_abort_v1(SMgrRelation rel);
+bool
+cluster_bufmgr_flush_created_abort_v1(SMgrRelation rel)
+{
+	UT_ASSERT(rel == &storage);
+	if (abort_writeback_watch)
+		UT_ASSERT(!create_scope_live);
+	UT_ASSERT_EQ(pinned | locked | CritSectionCount, 0);
+	abort_writeback_calls++;
+	if (abort_writeback_drift) {
+		ClusterSpaceIdentity changed;
+		uint64 token;
+		UT_ASSERT_NOT_NULL(native_pending);
+		UT_ASSERT(cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0,
+						&native_pending->shared_create.identity.key, &changed, &token));
+		changed.incarnation[0] ^= 1;
+		UT_ASSERT(cluster_space_identity_page_encode(&changed, token, page.data, BLCKSZ));
+	}
+	return !abort_writeback_refused;
 }
 void
 DropRelationBuffers(SMgrRelation rel, ForkNumber *forks, int count, BlockNumber *first)
@@ -1480,7 +1525,12 @@ reset(void)
 	data_sync_retry = false;
 	create_refused = create_scope_live = create_scope_armed = false;
 	create_revoke_on_io = create_throw_on_read = false;
+	create_throw_on_release = false;
 	create_begins = create_ends = create_aborts = create_scope_effects = 0;
+	native_pending = NULL;
+	check_create_birth_on_end = false;
+	abort_writeback_watch = abort_writeback_refused = abort_writeback_drift = false;
+	abort_writeback_calls = 0;
 	MyBackendId = 1;
 	shared_identity_locks = maintenance_identity_locks = 0;
 	refuse_maintenance_lock = false;
@@ -1593,6 +1643,193 @@ UT_TEST(test_real_create_binds_selected_namespace_and_wal)
 	UT_ASSERT_EQ(change.identity.result.incarnation[15], 0x45);
 	UT_ASSERT(cluster_space_reservation_page_valid(pages[1].data, BLCKSZ));
 	UT_ASSERT_EQ(PageGetLSN(pages[1].data), UINT64_C(0x10000200));
+}
+
+UT_TEST(test_observed_create_captures_original_birth_without_owning_scope)
+{
+	ClusterSpaceCreateObservationV1 observation = {0};
+	ClusterSpaceStructureChange change = {0};
+	uint64 serial = 0;
+
+	reset();
+	UT_ASSERT(cluster_ko_create_begin_v3(locator, &serial));
+	UT_ASSERT(cluster_space_relation_create_observed_v1(locator, serial, &observation));
+	UT_ASSERT(cluster_space_structure_wal_decode(wal_bytes, sizeof(wal_bytes), &change));
+	UT_ASSERT_EQ(observation.create_serial, serial);
+	UT_ASSERT_EQ(observation.identity.operation, 17);
+	UT_ASSERT_EQ(observation.identity.sequence, 1);
+	UT_ASSERT_EQ(observation.identity.state, CLUSTER_SPACE_IDENTITY_LIVE);
+	UT_ASSERT(RelFileLocatorEquals(observation.identity.key.locator,
+								  change.identity.result.key.locator));
+	UT_ASSERT_EQ(observation.identity.key.system_identifier, change.identity.result.key.system_identifier);
+	UT_ASSERT_EQ(observation.identity.key.database_incarnation, change.identity.result.key.database_incarnation);
+	UT_ASSERT_EQ(memcmp(observation.identity.key.storage_uuid, change.identity.result.key.storage_uuid, 16), 0);
+	UT_ASSERT_EQ(memcmp(observation.identity.incarnation, change.identity.result.incarnation, 16), 0);
+	UT_ASSERT_EQ(memcmp(&observation.namespace_source, &ref, sizeof(ref)), 0);
+	UT_ASSERT_EQ(observation.end_rec_ptr, UINT64_C(0x10000200));
+	UT_ASSERT_EQ(current_ref_reads, 1);
+	UT_ASSERT_EQ(create_begins, 1);
+	UT_ASSERT_EQ(create_ends, 0);
+	UT_ASSERT(!pinned && !locked && create_scope_live);
+	UT_ASSERT(cluster_ko_create_end_v3(serial, true));
+	UT_ASSERT(!create_scope_live);
+	UT_ASSERT_EQ(observation.create_serial, serial); /* observation does not retain scope */
+}
+
+UT_TEST(test_observed_create_refuses_unbound_owner_before_effects)
+{
+	for (int scenario = 0; scenario < 12; scenario++) {
+		ClusterSpaceCreateObservationV1 observation, before;
+		uint64 serial = 0;
+
+		reset();
+		UT_ASSERT(cluster_ko_create_begin_v3(locator, &serial));
+		memset(&observation, 0xa5, sizeof(observation));
+		before = observation;
+		if (scenario == 0) serial = 0;
+		else if (scenario == 1) serial++;
+		else if (scenario == 2) create_scope_live = false;
+		else if (scenario == 3) create_refused = true;
+		else if (scenario == 4) cluster_enabled = false;
+		else if (scenario == 5) cluster_shared_config = false;
+		else if (scenario == 6) cluster_interconnect_tier = CLUSTER_IC_TIER_2;
+		else if (scenario == 7) recovering = true;
+		else if (scenario == 8) shared = false;
+		else if (scenario == 9) have_ref = false;
+		else if (scenario == 10) exists = true;
+		UT_ASSERT(!cluster_space_relation_create_observed_v1(locator, serial,
+														 scenario == 11 ? NULL : &observation));
+		UT_ASSERT_EQ(memcmp(&observation, &before, sizeof(before)), 0);
+		/* The existing-SPACE case has a valid owner and needs the original
+		 * read-only existence probe; every unbound owner still has zero I/O. */
+		UT_ASSERT_EQ(io_calls, scenario == 10 ? 1 : 0);
+		UT_ASSERT_EQ(create_calls + wal_calls + dirty_calls, 0);
+		UT_ASSERT_EQ(create_begins, 1);
+		UT_ASSERT_EQ(create_ends, 0);
+	}
+}
+
+UT_TEST(test_native_pending_delete_keeps_birth_before_create_scope_ends)
+{
+	ClusterSpaceStructureChange change = {0};
+	RelFileLocator *deletes = NULL;
+
+	reset();
+	native_owner = check_create_birth_on_end = true;
+	UT_ASSERT(RelationCreateStorage(locator, RELPERSISTENCE_PERMANENT, true) == &storage);
+	UT_ASSERT_NOT_NULL(native_pending);
+	UT_ASSERT(cluster_space_structure_wal_decode(wal_bytes, sizeof(wal_bytes), &change));
+	if (native_pending != NULL) {
+		UT_ASSERT(!native_pending->atCommit);
+		UT_ASSERT_EQ(native_pending->nestLevel, 1);
+		UT_ASSERT_EQ(native_pending->shared_create.create_serial, 41);
+		UT_ASSERT_EQ(native_pending->shared_create.identity.operation, change.identity.result.operation);
+		UT_ASSERT_EQ(memcmp(native_pending->shared_create.identity.incarnation,
+							 change.identity.result.incarnation, 16), 0);
+		UT_ASSERT_EQ(memcmp(&native_pending->shared_create.namespace_source, &ref, sizeof(ref)), 0);
+		UT_ASSERT_EQ(native_pending->shared_create.end_rec_ptr, UINT64_C(0x10000200));
+	}
+	UT_ASSERT(!create_scope_live);
+	UT_ASSERT_EQ(smgrGetPendingDeletes(false, &deletes), 1);
+	if (deletes != NULL) {
+		UT_ASSERT(RelFileLocatorEquals(deletes[0], locator));
+		pfree(deletes);
+	}
+	smgrDoPendingDeletes(false); /* original physical boundary remains a fixture */
+}
+
+UT_TEST(test_native_failed_space_create_never_invents_birth_observation)
+{
+	ClusterSpaceCreateObservationV1 empty = {0};
+	volatile bool caught = false;
+
+	reset();
+	native_owner = expecting_error = create_throw_on_read = true;
+	PG_TRY();
+	{
+		(void) RelationCreateStorage(locator, RELPERSISTENCE_PERMANENT, true);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_NOT_NULL(native_pending);
+	if (native_pending != NULL)
+		UT_ASSERT_EQ(memcmp(&native_pending->shared_create, &empty, sizeof(empty)), 0);
+	UT_ASSERT(create_aborts != 0);
+	UT_ASSERT_EQ(wal_calls, 0);
+	smgrDoPendingDeletes(false);
+}
+
+UT_TEST(test_native_birth_survives_error_releasing_created_space)
+{
+	volatile bool caught = false;
+
+	reset();
+	native_owner = expecting_error = create_throw_on_release = true;
+	PG_TRY();
+	{
+		(void) RelationCreateStorage(locator, RELPERSISTENCE_PERMANENT, true);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_NOT_NULL(native_pending);
+	if (native_pending != NULL) {
+		UT_ASSERT_EQ(native_pending->shared_create.create_serial, 41);
+		UT_ASSERT_EQ(native_pending->shared_create.identity.operation, 17);
+		UT_ASSERT_EQ(native_pending->shared_create.identity.state, CLUSTER_SPACE_IDENTITY_LIVE);
+		UT_ASSERT_EQ(native_pending->shared_create.end_rec_ptr, UINT64_C(0x10000200));
+		UT_ASSERT_EQ(memcmp(&native_pending->shared_create.namespace_source, &ref, sizeof(ref)), 0);
+	}
+	UT_ASSERT_EQ(create_ends, 0);
+	UT_ASSERT(create_aborts != 0 && create_scope_live);
+	/* Explicit ResourceOwner boundary: native cleanup releases the remaining
+	 * fixture pin, without claiming that abort-delete retirement has run. */
+	for (int i = 1; i <= 2; i++)
+		if (pinned & (1 << (i - 1)))
+			UnlockReleaseBuffer(i);
+	smgrDoPendingDeletes(false);
+}
+
+UT_TEST(test_two_native_pending_deletes_keep_distinct_births)
+{
+	RelFileLocator original = locator;
+	PendingRelDelete *first;
+	RelFileLocator *deletes = NULL;
+
+	reset();
+	native_owner = true;
+	UT_ASSERT(RelationCreateStorage(locator, RELPERSISTENCE_PERMANENT, true) == &storage);
+	first = native_pending;
+	/* Two logical storage objects use the same producer. Only the per-object
+	 * buffer/storage fixtures are reset; the real pending-delete list stays. */
+	locator.relNumber++;
+	exists = false;
+	blocks = 0;
+	memset(pages, 0, sizeof(pages));
+	UT_ASSERT(RelationCreateStorage(locator, RELPERSISTENCE_PERMANENT, true) == &storage);
+	UT_ASSERT(native_pending != first && native_pending->next == first);
+	UT_ASSERT(RelFileLocatorEquals(first->shared_create.identity.key.locator, original));
+	UT_ASSERT(RelFileLocatorEquals(native_pending->shared_create.identity.key.locator, locator));
+	UT_ASSERT_EQ(first->shared_create.identity.operation, 17);
+	UT_ASSERT_EQ(native_pending->shared_create.identity.operation, 18);
+	UT_ASSERT_EQ(smgrGetPendingDeletes(false, &deletes), 2);
+	if (deletes != NULL) {
+		UT_ASSERT(RelFileLocatorEquals(deletes[0], locator));
+		UT_ASSERT(RelFileLocatorEquals(deletes[1], original));
+		pfree(deletes);
+	}
+	/* End only the native registration lifetime here; physical abort-delete
+	 * is deliberately not represented by the fixture's one-object unlink. */
+	smgrDoPendingDeletes(true);
+	UT_ASSERT_EQ(unlink_calls, 0);
+	locator = original;
 }
 
 UT_TEST(test_native_space_unavailable_attribution_forgets_under_same_owner)
@@ -4394,7 +4631,13 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(87);
+	UT_PLAN(93);
+	UT_RUN(test_observed_create_captures_original_birth_without_owning_scope);
+	UT_RUN(test_observed_create_refuses_unbound_owner_before_effects);
+	UT_RUN(test_native_pending_delete_keeps_birth_before_create_scope_ends);
+	UT_RUN(test_native_failed_space_create_never_invents_birth_observation);
+	UT_RUN(test_native_birth_survives_error_releasing_created_space);
+	UT_RUN(test_two_native_pending_deletes_keep_distinct_births);
 	UT_RUN(test_drop_record_preparation_releases_both_pages_before_return);
 	UT_RUN(test_drop_resume_rejects_changed_reservation_without_replacing_record);
 	UT_RUN(test_drop_resume_preserves_record_and_requires_both_exact_predecessors);

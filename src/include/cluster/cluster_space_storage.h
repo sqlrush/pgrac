@@ -18,6 +18,7 @@
 #include "cluster/cluster_page_producer.h"
 #include "cluster/cluster_space_identity.h"
 #include "cluster/cluster_space_reservation.h"
+#include "cluster/cluster_wal_thread.h"
 #include "storage/buf.h"
 #include "utils/relcache.h"
 
@@ -26,6 +27,32 @@
  * False MUST abort that operation. No legacy/local
  * relation acquires a SPACE identity, and no existing identity is replaced. */
 extern bool cluster_space_relation_create(RelFileLocator locator);
+
+/* Process-local observation produced by the original live CREATE scope.
+ * This value does not retain that scope, certify ABORT/COMMIT, or authorize
+ * discard, I/O or directory retirement. It has no persistent representation. */
+typedef struct ClusterSpaceCreateObservationV1 {
+	ClusterSpaceIdentity identity;
+	ClusterWalSourceRef namespace_source; /* namespace sample, not WAL attribution */
+	uint64 create_serial;
+	XLogRecPtr end_rec_ptr;
+} ClusterSpaceCreateObservationV1;
+
+/* Native MAIN constructor only, under its existing create serial and abort
+ * pending-delete owner. Capture the actual typed CREATE at its WAL publication
+ * before releasing buffers. False leaves output unchanged. A post-publication
+ * ERROR preserves the observation and the original cleanup obligation. The
+ * caller owns that scope and every ERROR cleanup. Never starts a new scope. */
+extern bool cluster_space_relation_create_observed_v1(RelFileLocator locator,
+	uint64 create_serial, ClusterSpaceCreateObservationV1 *out);
+
+/* Only the original native abort pending-delete for this new storage may
+ * call this, after its transaction/users are gone and before unlink/reuse.
+ * Match the actual CREATE identity, use the unchanged writer/WAL gates, and
+ * recheck identity. A namespace sample/serial never grants death authority.
+ * False/ERROR leaves pending-delete responsible; this does not evict/unlink. */
+extern bool cluster_space_relation_flush_created_abort_v1(RelFileLocator locator,
+													 const ClusterSpaceCreateObservationV1 *created);
 
 /* Original relation owner holds its lifecycle lock. Reads exact LIVE state
  * through native buffers; never creates missing storage. Output unchanged

@@ -82,6 +82,9 @@ typedef struct PendingRelDelete
 	BackendId	backend;		/* InvalidBackendId if not a temp rel */
 	bool		atCommit;		/* T=delete at commit; F=delete at abort */
 	int			nestLevel;		/* xact nesting level of request */
+#ifdef USE_PGRAC_CLUSTER
+	ClusterSpaceCreateObservationV1 shared_create;	/* process-local birth only */
+#endif
 	struct PendingRelDelete *next;	/* linked-list link */
 } PendingRelDelete;
 
@@ -246,6 +249,7 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 #ifdef USE_PGRAC_CLUSTER
 	uint64		create_serial = 0;
 	bool		create_scoped;
+	PendingRelDelete *abort_pending = NULL;
 #endif
 
 	Assert(!IsInParallelMode());	/* couldn't update pendingSyncHash */
@@ -302,6 +306,10 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 
 		pending = (PendingRelDelete *)
 			MemoryContextAlloc(TopMemoryContext, sizeof(PendingRelDelete));
+#ifdef USE_PGRAC_CLUSTER
+		memset(&pending->shared_create, 0, sizeof(pending->shared_create));
+		abort_pending = pending;
+#endif
 		pending->rlocator = rlocator;
 		pending->backend = backend;
 		pending->atCommit = false;	/* delete if abort */
@@ -320,7 +328,11 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 	/* PGRAC: the native abort-delete owner is registered before any SPACE
 	 * creation, unless the caller owns whole-directory cleanup (CREATE
 	 * DATABASE). Temporary/unlogged relations keep their native contract. */
-	if (needs_wal && !cluster_space_relation_create(rlocator))
+	if (needs_wal
+		&& !(create_scoped && abort_pending != NULL
+			 ? cluster_space_relation_create_observed_v1(rlocator, create_serial,
+				 &abort_pending->shared_create)
+			 : cluster_space_relation_create(rlocator)))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("could not create exact SPACE identity for relation %u", rlocator.relNumber)));
@@ -388,6 +400,9 @@ RelationDropStorage(Relation rel)
 	/* Add the relation to the list of stuff to delete at commit */
 	pending = (PendingRelDelete *)
 		MemoryContextAlloc(TopMemoryContext, sizeof(PendingRelDelete));
+#ifdef USE_PGRAC_CLUSTER
+	memset(&pending->shared_create, 0, sizeof(pending->shared_create));
+#endif
 	pending->rlocator = rel->rd_locator;
 	pending->backend = rel->rd_backend;
 	pending->atCommit = true;	/* delete if commit */
@@ -1036,6 +1051,34 @@ smgrDoPendingDeletes(bool isCommit)
 	int			nrels = 0,
 				maxrels = 0;
 	SMgrRelation *srels = NULL;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Keep the whole native pending list until every selected writeback has
+	 * succeeded. A later object must not strand earlier entries on ERROR. */
+	for (pending = pendingDeletes; pending != NULL; pending = pending->next)
+	{
+		if (pending->nestLevel < nestLevel)
+			continue;
+		/* The original abort owner must make its new shared storage clean
+		 * through the ordinary WAL-first writer before generic eviction.
+		 * Keep the pending entry linked if proof/output fails. An incomplete
+		 * constructor without a published birth keeps its original cleanup. */
+		if (!isCommit && !pending->atCommit
+			&& (pending->shared_create.create_serial != 0
+				|| pending->shared_create.identity.state != 0
+				|| !XLogRecPtrIsInvalid(pending->shared_create.end_rec_ptr))
+			&& (pending->backend != InvalidBackendId
+				|| !cluster_space_relation_flush_created_abort_v1(pending->rlocator,
+															 &pending->shared_create)))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot finish shared new-storage abort writeback"),
+					 errdetail("Original pending-delete retained for relation %u/%u/%u, create serial %llu.",
+							   pending->rlocator.spcOid, pending->rlocator.dbOid,
+							   pending->rlocator.relNumber,
+							   (unsigned long long)pending->shared_create.create_serial)));
+	}
+#endif
 
 	prev = NULL;
 	for (pending = pendingDeletes; pending != NULL; pending = next)

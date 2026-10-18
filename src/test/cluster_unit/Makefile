@@ -209,6 +209,7 @@ TESTS = test_cluster_vm_read_visibility test_cluster_heap_maintenance test_clust
 
 # Path to the cluster_version object (no PG deps, safe to link standalone).
 TESTS += test_cluster_tt_abort_owner test_cluster_tt_active_owner
+TESTS += test_cluster_abort_writer test_cluster_storage_abort_writeback
 TESTS += test_cluster_undo_header_durability
 TESTS += test_cluster_tt_2pc_finish
 TESTS += test_cluster_tt_rollback_entry
@@ -2194,7 +2195,8 @@ test_cluster_space_identity test_cluster_space_wal test_cluster_space_reservatio
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
 		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a -o $@
 
-test_cluster_space_catalog_product.o: $(top_srcdir)/src/backend/catalog/storage.c
+test_cluster_space_catalog_product.o: $(top_srcdir)/src/backend/catalog/storage.c \
+		$(top_srcdir)/src/include/cluster/cluster_space_storage.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 # PGRAC: extract each actual identity-acquisition branch, including its error gate.
@@ -2365,16 +2367,31 @@ test_cluster_page_data_scn.inc: $(top_srcdir)/src/backend/cluster/cluster_scn.c 
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2) exit 1 }' $< > $@
 
 test_cluster_page_data: test_cluster_page_data.c
+test_cluster_abort_writer: test_cluster_abort_writer.c test_cluster_page_data.c test_cluster_abort_writer_flush.inc
+
+test_cluster_abort_writer_flush.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk 'BEGIN { print "static int rlocator_comparator(const void *, const void *);" } \
+	     /^#define[ \t]+RELS_BSEARCH_THRESHOLD/ { print; threshold++ } \
+	     /^typedef struct SMgrSortArray/ { type=1; types++ } \
+	     type { print; if ($$0 ~ /^} SMgrSortArray;/) type=0; next } \
+	     /^cluster_bufmgr_should_pcm_track\(/ || /^cluster_bufmgr_pcm_aux_pin_admission_locked\(/ \
+	       { print "static inline bool"; emit=1; helpers++ } \
+	     /^rlocator_comparator\(/ { print "static int"; emit=1; compare++ } \
+	     /^FlushRelationsAllBuffers\(/ { print "void"; emit=1; walk++ } \
+	     /^cluster_bufmgr_flush_created_abort_v1\(/ { print "bool"; emit=1; finish++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (threshold != 1 || types != 1 || helpers != 2 || compare != 1 || walk != 1 || finish != 1 || emit || type) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 test_cluster_pi_drop_storage: test_cluster_pi_drop_storage.c test_cluster_page_data.c
-test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error test_cluster_pi_drop_storage: PI_WRITEBACK_CODEC_OBJS = $(CLUSTER_KO_O)
-test_cluster_page_data test_cluster_sync_error test_cluster_pi_drop_storage: $(CLUSTER_KO_O)
+test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error test_cluster_pi_drop_storage test_cluster_abort_writer: PI_WRITEBACK_CODEC_OBJS = $(CLUSTER_KO_O)
+test_cluster_page_data test_cluster_sync_error test_cluster_pi_drop_storage test_cluster_abort_writer: $(CLUSTER_KO_O)
 test_cluster_pi_writeback: test_cluster_pi_writeback_v2.inc $(CLUSTER_KO_O)
 test_cluster_pi_writeback: test_cluster_pi_writeback.c test_cluster_page_data.c \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_rebuild.c \
 		$(top_srcdir)/src/include/cluster/cluster_pi_rebuild.h \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_data_wire.h
-test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error test_cluster_pi_drop_storage: unit_test.h test_cluster_page_data.inc test_cluster_page_data_scn.inc \
+test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error test_cluster_pi_drop_storage test_cluster_abort_writer: unit_test.h test_cluster_page_data.inc test_cluster_page_data_scn.inc \
 		test_cluster_block_redeclare_scan.inc \
 		$(top_srcdir)/src/include/cluster/cluster_ko.h \
 		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \
@@ -2441,6 +2458,7 @@ test_cluster_space_recovery: test_cluster_space_recovery.c unit_test.h test_clus
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto -o $@
 
 test_cluster_space_storage_product.o: $(top_srcdir)/src/backend/cluster/cluster_space_storage.c \
+		$(top_srcdir)/src/include/cluster/cluster_space_storage.h \
 		$(top_srcdir)/src/include/cluster/cluster_grd.h \
         $(top_srcdir)/src/include/cluster/cluster_ges_handoff.h \
 		$(top_srcdir)/src/include/cluster/cluster_hw.h \
@@ -2579,6 +2597,12 @@ test_cluster_storage_owned_gate.inc: $(top_srcdir)/src/backend/catalog/pg_shdepe
 	     END { if (found != 3 || done != 3 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_storage_pending_types.inc: $(top_srcdir)/src/backend/catalog/storage.c Makefile
+	awk '/^typedef struct PendingRelDelete/ { emit=1; found++ } \
+	     emit { print } /^} PendingRelDelete;/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_storage_xact_types.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
 	awk '/^typedef enum TBlockState/ { emit=1; found++ } emit { print } /^} TBlockState;/ { emit=0; done++ } END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
@@ -2587,11 +2611,11 @@ test_cluster_storage_xact_gate.inc: $(top_srcdir)/src/backend/access/transam/xac
 	awk '/^(IsTransactionBlock|IsInTransactionBlock|PreventInTransactionBlock)\(/ { print ($$0 ~ /^Prevent/ ? "void" : "bool"); emit=1; found++ } emit { print } emit && /^}/ { emit=0; done++ } END { if (found != 3 || done != 3 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_space_storage test_cluster_storage_subtransaction test_cluster_space_committed_drop: test_cluster_storage_xact_types.inc test_cluster_storage_xact_gate.inc
+test_cluster_space_storage test_cluster_storage_subtransaction test_cluster_space_committed_drop test_cluster_storage_abort_writeback: test_cluster_storage_xact_types.inc test_cluster_storage_xact_gate.inc test_cluster_storage_pending_types.inc
 
 test_cluster_storage_subtransaction: test_cluster_storage_delete_gate.inc test_cluster_storage_truncate_gate.inc test_cluster_storage_truncate_apply.inc test_cluster_storage_owned_gate.inc $(top_srcdir)/src/backend/nodes/list.c
 
-test_cluster_space_storage test_cluster_storage_subtransaction test_cluster_space_committed_drop: %: %.c test_cluster_space_storage.c test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc unit_test.h test_cluster_space_catalog_product.o test_cluster_space_smgrdesc_product.o test_cluster_side_xact_xactdesc.o \
+test_cluster_space_storage test_cluster_storage_subtransaction test_cluster_space_committed_drop test_cluster_storage_abort_writeback: %: %.c test_cluster_space_storage.c test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc unit_test.h test_cluster_space_catalog_product.o test_cluster_space_smgrdesc_product.o test_cluster_side_xact_xactdesc.o \
 		$(top_builddir)/src/backend/storage/page/checksum.o \
 		test_cluster_space_xlogutils_product.o \
 		test_cluster_space_storage_product.o $(CLUSTER_HW_O) \
@@ -2994,11 +3018,11 @@ test_cluster_side_xact test_cluster_pi_contribution: %: %.c unit_test.h test_clu
 CLUSTER_SIDE_ONLINE_OWNER_O = test_cluster_side_online_owner_product.o
 # The DATA integration uses the actual immutable fabric and typed SIDE
 # planner. The writeback scheduling fixture keeps its explicit input boundary.
-test_cluster_page_data test_cluster_sync_error test_cluster_pi_drop_storage: PAGE_DATA_SPACE_OBJS = $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
+test_cluster_page_data test_cluster_sync_error test_cluster_pi_drop_storage test_cluster_abort_writer: PAGE_DATA_SPACE_OBJS = $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
 		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O)
-test_cluster_page_data test_cluster_sync_error test_cluster_pi_drop_storage: $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
+test_cluster_page_data test_cluster_sync_error test_cluster_pi_drop_storage test_cluster_abort_writer: $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
 		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O)
@@ -4083,7 +4107,7 @@ test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-$(filter-out test_cluster_postmaster_lwlock test_cluster_phase_publication test_cluster_checkpoint_cleanup test_cluster_checkpoint_wait_budget test_cluster_checkpoint_error test_cluster_sync_error test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
+$(filter-out test_cluster_abort_writer test_cluster_storage_abort_writeback test_cluster_postmaster_lwlock test_cluster_phase_publication test_cluster_checkpoint_cleanup test_cluster_checkpoint_wait_budget test_cluster_checkpoint_error test_cluster_sync_error test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
 
 # Native CR metadata checks are inline in the shared descriptor definition.
@@ -4745,6 +4769,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_page_wal_pregrant.inc
 	rm -f test_cluster_page_wal_image.inc
 	rm -f test_cluster_page_flush.inc
+	rm -f test_cluster_abort_writer_flush.inc
 	rm -f test_cluster_page_identity_equal.c test_cluster_page_identity_equal.o
 	rm -f test_cluster_pcm_s_prepare.inc
 	rm -f test_cluster_ko_source_io.inc

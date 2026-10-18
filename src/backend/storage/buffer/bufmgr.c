@@ -11242,6 +11242,33 @@ FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 }
 
 #ifdef USE_PGRAC_CLUSTER
+bool
+cluster_bufmgr_flush_created_abort_v1(SMgrRelation rel)
+{
+	int i;
+
+	if (rel == NULL || RelFileLocatorBackendIsTemp(rel->smgr_rlocator)
+		|| rel->smgr_which != CLUSTER_SMGR_SMGRSW_INDEX)
+		return false;
+	FlushRelationsAllBuffers(&rel, 1);
+
+	/* A normal flush may skip a retained/fenced image. Never convert its
+	 * return into a claim of clean completion. Ordinary cached-X eviction
+	 * still owns every pin, generation, gate and remote completion check. */
+	for (i = 0; i < NBuffers; i++) {
+		BufferDesc *buf = GetBufferDescriptor(i);
+		uint32 state = LockBufHdr(buf);
+		bool pending = (state & BM_TAG_VALID) != 0
+			&& BufTagMatchesRelFileLocator(&buf->tag, &rel->smgr_rlocator.locator)
+			&& (state & (BM_DIRTY | BM_IO_IN_PROGRESS | BM_IO_ERROR)) != 0;
+
+		UnlockBufHdr(buf, state);
+		if (pending)
+			return false;
+	}
+	return true;
+}
+
 /* A qualified SI or native origin owner resumes the flush/drop walks here.
  * The cursor counts descriptors, not matches; blocked ownership stays there.
  * The caller keeps its object fence and performs the original per-fork sync

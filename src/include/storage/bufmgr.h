@@ -234,6 +234,12 @@ extern bool FlushOneBufferForSpaceRecovery(Buffer buffer,
 extern void FlushRelationBuffers(Relation rel);
 extern void FlushRelationsAllBuffers(struct SMgrRelationData **smgrs, int nrels);
 #ifdef USE_PGRAC_CLUSTER
+/* Original abort pending-delete owns the exact newly created shared storage.
+ * Use the ordinary writer, then check that it left no dirty/IO/error image.
+ * This grants no eviction/death authority; the original clean eviction and
+ * physical deletion contracts must still complete. False retains that owner. */
+extern bool cluster_bufmgr_flush_created_abort_v1(struct SMgrRelationData *smgr);
+
 typedef enum ClusterBufferDrainResult {
 	CLUSTER_BUFFER_DRAIN_INVALID = 0,
 	CLUSTER_BUFFER_DRAIN_MORE,

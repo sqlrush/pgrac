@@ -111,7 +111,8 @@ space_identity_key_matches(const ClusterSpaceIdentityKey *a, const ClusterSpaceI
 }
 
 static bool
-space_namespace(RelFileLocator locator, bool redo, ClusterSpaceIdentityKey *out, uint16 *thread)
+space_namespace_capture(RelFileLocator locator, bool redo, ClusterSpaceIdentityKey *out,
+	uint16 *thread, ClusterWalSourceRef *source)
 {
 	ClusterWalSourceRef ref;
 
@@ -127,7 +128,15 @@ space_namespace(RelFileLocator locator, bool redo, ClusterSpaceIdentityKey *out,
 	out->locator = locator;
 	if (thread != NULL)
 		*thread = ref.claim.identity.origin_thread_id;
+	if (source != NULL)
+		*source = ref;
 	return true;
+}
+
+static bool
+space_namespace(RelFileLocator locator, bool redo, ClusterSpaceIdentityKey *out, uint16 *thread)
+{
+	return space_namespace_capture(locator, redo, out, thread, NULL);
 }
 
 /* Native merged recovery may remap the stored LSN into the recovering
@@ -207,6 +216,44 @@ bool
 cluster_space_relation_read_identity(RelFileLocator locator, ClusterSpaceIdentity *out)
 {
 	return space_read_identity(locator, false, out);
+}
+
+static bool
+space_created_abort_identity_matches(RelFileLocator locator,
+									 const ClusterSpaceCreateObservationV1 *created)
+{
+	ClusterSpaceIdentity current;
+	uint8 birth_bytes[CLUSTER_SPACE_IDENTITY_BYTES];
+	uint8 current_bytes[CLUSTER_SPACE_IDENTITY_BYTES];
+
+	/* Canonical codecs avoid padding comparisons. This is an identity check,
+	 * not an interpretation of the namespace sample as WAL/death evidence. */
+	if (created == NULL || created->create_serial == 0
+		|| XLogRecPtrIsInvalid(created->end_rec_ptr)
+		|| created->identity.state != CLUSTER_SPACE_IDENTITY_LIVE
+		|| !RelFileLocatorEquals(locator, created->identity.key.locator)
+		|| !cluster_space_identity_encode(&created->identity, birth_bytes, sizeof(birth_bytes))
+		|| !space_read_identity(locator, false, &current)
+		|| !cluster_space_identity_encode(&current, current_bytes, sizeof(current_bytes)))
+		return false;
+	return memcmp(birth_bytes, current_bytes, sizeof(birth_bytes)) == 0;
+}
+
+bool
+cluster_space_relation_flush_created_abort_v1(RelFileLocator locator,
+											const ClusterSpaceCreateObservationV1 *created)
+{
+	SMgrRelation rel;
+
+	/* The native pending-delete still owns this not-published relation.
+	 * Its birth identity must match before any data output; no ended CREATE
+	 * scope, SQL lifecycle lock, COMMIT or tombstone is borrowed here. */
+	if (!space_created_abort_identity_matches(locator, created))
+		return false;
+	rel = smgropen(locator, InvalidBackendId);
+	if (!cluster_bufmgr_flush_created_abort_v1(rel))
+		return false;
+	return space_created_abort_identity_matches(locator, created);
 }
 
 bool
@@ -598,9 +645,11 @@ cluster_space_init_vm_buffer_wal(const ClusterSpaceIdentity *identity, Buffer de
 }
 
 static bool
-space_relation_create(RelFileLocator locator, uint64 create_serial)
+space_relation_create(RelFileLocator locator, uint64 create_serial,
+	ClusterSpaceCreateObservationV1 *observed)
 {
 	ClusterSpaceStructureChange change = { 0 };
+	ClusterSpaceCreateObservationV1 birth = { 0 };
 	ClusterSpaceWalChange *identity = &change.identity;
 	PGAlignedBlock result[2];
 	uint8 bytes[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
@@ -611,8 +660,10 @@ space_relation_create(RelFileLocator locator, uint64 create_serial)
 	bool success = false;
 
 	if (!cluster_shared_config || cluster_smgr_which_for(locator, InvalidBackendId) != 1)
-		return true;
-	if (RecoveryInProgress() || !space_namespace(locator, false, &identity->result.key, NULL))
+		return observed == NULL;
+	if (RecoveryInProgress()
+		|| !space_namespace_capture(locator, false, &identity->result.key, NULL,
+			observed != NULL ? &birth.namespace_source : NULL))
 		return false;
 	identity->action = CLUSTER_SPACE_WAL_CREATE;
 	identity->nblocks = InvalidBlockNumber;
@@ -660,6 +711,15 @@ space_relation_create(RelFileLocator locator, uint64 create_serial)
 		space_capture_native(buffers[i], &identity->result.key, lsn);
 	}
 	END_CRIT_SECTION();
+	if (observed != NULL) {
+		birth.identity = identity->result;
+		birth.create_serial = create_serial;
+		birth.end_rec_ptr = lsn;
+		/* The native pending-delete allocation already exists. Preserve the
+		 * actual published birth before any buffer release can ERROR. This
+		 * observation cannot retain or recreate the live constructor scope. */
+		*observed = birth;
+	}
 	success = true;
 done:
 	for (int i = 1; i >= 0; i--)
@@ -678,7 +738,7 @@ cluster_space_relation_create(RelFileLocator locator)
 	if (!cluster_enabled || !cluster_shared_config
 		|| cluster_interconnect_tier != CLUSTER_IC_TIER_1 || RecoveryInProgress()
 		|| cluster_smgr_which_for(locator, InvalidBackendId) != 1)
-		return space_relation_create(locator, 0);
+		return space_relation_create(locator, 0, NULL);
 	/* The native MAIN constructor keeps its own reference. A standalone
 	 * typed caller must register before token/WAL, fork creation or pinning. */
 	if (!cluster_ko_create_current_v3(locator, &serial)) {
@@ -688,7 +748,7 @@ cluster_space_relation_create(RelFileLocator locator)
 	}
 	PG_TRY();
 	{
-		result = space_relation_create(locator, serial);
+		result = space_relation_create(locator, serial, NULL);
 	}
 	PG_CATCH();
 	{
@@ -698,6 +758,33 @@ cluster_space_relation_create(RelFileLocator locator)
 	PG_END_TRY();
 	if (owned && !cluster_ko_create_end_v3(serial, result))
 		return false;
+	return result;
+}
+
+bool
+cluster_space_relation_create_observed_v1(RelFileLocator locator, uint64 create_serial,
+	ClusterSpaceCreateObservationV1 *out)
+{
+	uint64 current = 0;
+	bool result;
+
+	if (out == NULL || create_serial == 0 || !cluster_enabled || !cluster_shared_config
+		|| cluster_interconnect_tier != CLUSTER_IC_TIER_1 || RecoveryInProgress()
+		|| cluster_smgr_which_for(locator, InvalidBackendId) != 1
+		|| !cluster_ko_create_current_v3(locator, &current) || current != create_serial)
+		return false;
+	PG_TRY();
+	{
+		result = space_relation_create(locator, create_serial, out);
+	}
+	PG_CATCH();
+	{
+		/* Keep the ordinary constructor's immediate permission expiry; the
+		 * original ResourceOwner and pending-delete still own cleanup. */
+		cluster_ko_create_abort_v3(create_serial);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 	return result;
 }
 
