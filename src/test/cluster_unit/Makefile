@@ -569,6 +569,7 @@ test_cluster_relmap_v2: test_cluster_relmap_v2.c unit_test.h \
 # Fresh image constructor must link as a frontend, without backend services.
 test_cluster_relmap_init: test_cluster_relmap_init.c unit_test.h \
 		$(top_srcdir)/src/include/common/relmap.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
 		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
@@ -6324,7 +6325,10 @@ test_cluster_r4_cr_walk: test_cluster_r4_cr_walk.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_initdb_relmap: test_cluster_initdb_relmap.c unit_test.h \
-		$(top_srcdir)/src/bin/initdb/pgrac_relmap.c $(top_srcdir)/src/bin/initdb/pgrac_relmap.h
+		$(top_srcdir)/src/bin/initdb/pgrac_relmap.c $(top_srcdir)/src/bin/initdb/pgrac_relmap.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< $(LDFLAGS) \
 		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@

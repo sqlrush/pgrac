@@ -249,10 +249,122 @@ UT_TEST(null_and_unaligned_buffers)
 	UT_ASSERT_EQ(out[sizeof(out) - 1], 36);
 }
 
+UT_TEST(v2_clean_images_bind_original_namespace)
+{
+	for (int shared = 0; shared <= 1; ++shared) {
+		ClusterRelmapV2Namespace identity = { 91, 27, shared ? 0 : 5, shared };
+		RelMapFile map = native_map(shared);
+		char input[sizeof(map) + 1], out[CLUSTER_RELMAP_V2_FILE_SIZE + 2] = { 0 };
+		ClusterRelmapV2Image image = { 0 };
+		ClusterRelmapV2View view = { 0 };
+		memcpy(input + 1, &map, sizeof(map));
+		out[0] = 35;
+		out[sizeof(out) - 1] = 36;
+		UT_ASSERT_EQ(cluster_relmap_authority_v2_init_image(&identity, input + 1, sizeof(map),
+														out + 1, sizeof(out) - 2), CLUSTER_RELMAP_INIT_OK);
+		UT_ASSERT_EQ(cluster_relmap_v2_decode(out + 1, sizeof(out) - 2, &identity, &image),
+					 CLUSTER_RELMAP_V2_VALID);
+		UT_ASSERT_EQ(image.committed_generation, 1);
+		UT_ASSERT_EQ(image.pending_generation, 0);
+		UT_ASSERT_EQ(memcmp(&image.committed, &map, sizeof(map)), 0);
+		UT_ASSERT_EQ(cluster_relmap_v2_read_pair(out + 1, sizeof(out) - 2, out + 1,
+												   sizeof(out) - 2, &identity, &view), CLUSTER_RELMAP_V2_PAIR_VALID);
+		UT_ASSERT(view.pending_complete && !view.has_pending && !view.used_backup);
+		for (size_t i = CLUSTER_RELMAP_V2_PENDING_OFFSET; i < sizeof(out) - 2; ++i)
+			UT_ASSERT_EQ(out[1 + i], 0);
+		UT_ASSERT_EQ(memcmp(input + 1, &map, sizeof(map)), 0);
+		UT_ASSERT_EQ(out[0], 35);
+		UT_ASSERT_EQ(out[sizeof(out) - 1], 36);
+	}
+}
+
+static bool
+v2_rejected(const ClusterRelmapV2Namespace *identity, const void *map, size_t length,
+			size_t output_length, ClusterRelmapInitResult expected)
+{
+	char out[CLUSTER_RELMAP_V2_FILE_SIZE + 2] = { 0 }, before[sizeof(out)];
+	out[0] = 35;
+	out[sizeof(out) - 1] = 36;
+	memcpy(before, out, sizeof(out));
+	return cluster_relmap_authority_v2_init_image(identity, map, length, out + 1, output_length)
+		== expected && memcmp(out, before, sizeof(out)) == 0;
+}
+
+UT_TEST(v2_requires_identity_and_exact_lengths)
+{
+	ClusterRelmapV2Namespace identity = { 91, 27, 5, false };
+	RelMapFile map = native_map(false);
+	UT_ASSERT(v2_rejected(NULL, &map, sizeof(map), CLUSTER_RELMAP_V2_FILE_SIZE,
+						 CLUSTER_RELMAP_INIT_INVALID_ARGUMENT));
+	for (int field = 0; field < 2; ++field) {
+		ClusterRelmapV2Namespace bad = identity;
+		if (field == 0) bad.system_identifier = 0;
+		else bad.database_incarnation = 0;
+		UT_ASSERT(v2_rejected(&bad, &map, sizeof(map), CLUSTER_RELMAP_V2_FILE_SIZE,
+							 CLUSTER_RELMAP_INIT_INVALID_ARGUMENT));
+	}
+	identity.shared = true;
+	UT_ASSERT(v2_rejected(&identity, &map, sizeof(map), CLUSTER_RELMAP_V2_FILE_SIZE,
+						 CLUSTER_RELMAP_INIT_NAMESPACE_MISMATCH));
+	identity.shared = false;
+	UT_ASSERT(v2_rejected(&identity, NULL, sizeof(map), CLUSTER_RELMAP_V2_FILE_SIZE,
+						 CLUSTER_RELMAP_INIT_INVALID_ARGUMENT));
+	UT_ASSERT_EQ(cluster_relmap_authority_v2_init_image(&identity, &map, sizeof(map), NULL,
+														  CLUSTER_RELMAP_V2_FILE_SIZE), CLUSTER_RELMAP_INIT_INVALID_ARGUMENT);
+	const size_t lengths[] = { 0, sizeof(map) - 1, sizeof(map) + 1 };
+	for (size_t i = 0; i < lengthof(lengths); ++i)
+		UT_ASSERT(v2_rejected(&identity, &map, lengths[i], CLUSTER_RELMAP_V2_FILE_SIZE,
+							 CLUSTER_RELMAP_INIT_INVALID_LENGTH));
+	const size_t outputs[] = { 0, CLUSTER_RELMAP_AUTHORITY_FILE_SIZE,
+		CLUSTER_RELMAP_V2_FILE_SIZE - 1, CLUSTER_RELMAP_V2_FILE_SIZE + 1 };
+	for (size_t i = 0; i < lengthof(outputs); ++i)
+		UT_ASSERT(v2_rejected(&identity, &map, sizeof(map), outputs[i],
+							 CLUSTER_RELMAP_INIT_INVALID_LENGTH));
+}
+
+UT_TEST(v2_rejects_nonbootstrap_native_maps_unchanged)
+{
+	ClusterRelmapV2Namespace identity = { 91, 27, 5, false };
+	const ClusterRelmapInitResult errors[] = { CLUSTER_RELMAP_INIT_INVALID_MAGIC,
+		CLUSTER_RELMAP_INIT_INVALID_CRC, CLUSTER_RELMAP_INIT_INVALID_COUNT,
+		CLUSTER_RELMAP_INIT_INVALID_ENTRY, CLUSTER_RELMAP_INIT_DUPLICATE,
+		CLUSTER_RELMAP_INIT_NAMESPACE_MISMATCH };
+	for (size_t i = 0; i < lengthof(errors); ++i) {
+		RelMapFile map = native_map(false);
+		switch (i) {
+			case 0: map.magic++; break;
+			case 1: map.crc ^= 1; break;
+			case 2: map.num_mappings--; break;
+			case 3: map.mappings[0].mapfilenumber++; break;
+			case 4: map.mappings[1] = map.mappings[0]; break;
+			case 5: map = native_map(true); break;
+		}
+		if (i != 1) checksum(&map);
+		UT_ASSERT(v2_rejected(&identity, &map, sizeof(map), CLUSTER_RELMAP_V2_FILE_SIZE, errors[i]));
+	}
+}
+
+UT_TEST(v2_never_overwrites_existing_output)
+{
+	ClusterRelmapV2Namespace identity = { 91, 27, 5, false };
+	RelMapFile map = native_map(false);
+	char out[CLUSTER_RELMAP_V2_FILE_SIZE], before[sizeof(out)];
+	bool rejected = true;
+	for (size_t i = 0; i < sizeof(out); ++i) {
+		memset(out, 0, sizeof(out));
+		out[i] = 1;
+		memcpy(before, out, sizeof(out));
+		rejected = rejected && cluster_relmap_authority_v2_init_image(&identity, &map, sizeof(map),
+														out, sizeof(out)) == CLUSTER_RELMAP_INIT_OUTPUT_NOT_EMPTY
+			&& memcmp(out, before, sizeof(out)) == 0;
+	}
+	UT_ASSERT(rejected);
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(12);
 	UT_RUN(valid_initial_images);
 	UT_RUN(exact_lengths);
 	UT_RUN(bad_magic_crc_count);
@@ -261,6 +373,10 @@ main(void)
 	UT_RUN(rewritten_map_and_reordering);
 	UT_RUN(existing_output_zero_overwrite);
 	UT_RUN(null_and_unaligned_buffers);
+	UT_RUN(v2_clean_images_bind_original_namespace);
+	UT_RUN(v2_requires_identity_and_exact_lengths);
+	UT_RUN(v2_rejects_nonbootstrap_native_maps_unchanged);
+	UT_RUN(v2_never_overwrites_existing_output);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

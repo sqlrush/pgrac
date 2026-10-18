@@ -13,6 +13,7 @@
 
 #define AUTHORITY_NAME "pgrac_relmap_authority"
 #define MAP_NAME "pg_filenode.map"
+static const char *const authority_names[] = { AUTHORITY_NAME, AUTHORITY_NAME ".bak" };
 
 /* Root, global, base, and the three databases made by this initdb. */
 static const unsigned map_directories[] = {1, 3, 4, 5};
@@ -28,7 +29,9 @@ typedef struct InitialMap
 	int fd;
 	struct stat identity;
 	RelMapFile native;
-	char image[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE];
+	size_t image_size;
+	char image[CLUSTER_RELMAP_V2_FILE_SIZE];
+	struct stat created[2];
 } InitialMap;
 
 static bool
@@ -126,33 +129,66 @@ source_current(int directory, const InitialMap *map)
 }
 
 static bool
-persist_image(int directory, const InitialMap *map)
+persist_image(int directory, InitialMap *map, unsigned copy)
 {
-	char actual[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE];
+	char actual[CLUSTER_RELMAP_V2_FILE_SIZE];
 	struct stat held, named;
-	int fd = openat(directory, AUTHORITY_NAME,
+	int fd = openat(directory, authority_names[copy],
 		O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, pg_file_create_mode);
 	ssize_t n;
 	bool ok = false;
 	if (fd < 0) return false;
-	do { n = pwrite(fd, map->image, sizeof(map->image), 0); } while (n < 0 && errno == EINTR);
-	if (n != sizeof(map->image) || fsync(fd) != 0) goto done;
-	do { n = pread(fd, actual, sizeof(actual), 0); } while (n < 0 && errno == EINTR);
-	if (n != sizeof(actual) || memcmp(actual, map->image, sizeof(actual)) != 0
+	do { n = pwrite(fd, map->image, map->image_size, 0); } while (n < 0 && errno == EINTR);
+	if (n != map->image_size || fsync(fd) != 0) goto done;
+	do { n = pread(fd, actual, map->image_size, 0); } while (n < 0 && errno == EINTR);
+	if (n != map->image_size || memcmp(actual, map->image, map->image_size) != 0
 		|| fstat(fd, &held) != 0
-		|| fstatat(directory, AUTHORITY_NAME, &named, AT_SYMLINK_NOFOLLOW) != 0
+		|| fstatat(directory, authority_names[copy], &named, AT_SYMLINK_NOFOLLOW) != 0
 		|| !same_file(&held, &named) || !S_ISREG(held.st_mode)
-		|| held.st_size != sizeof(actual) || held.st_uid != geteuid()
+		|| held.st_size != map->image_size || held.st_uid != geteuid()
 		|| held.st_nlink != 1 || (held.st_mode & 0022) != 0
 		|| fsync(directory) != 0) goto done;
+	map->created[copy] = held;
 	ok = true;
 done:
 	if (close(fd) != 0) ok = false;
 	return ok;
 }
 
-bool
-pgrac_initdb_relmap_create(int source_fd, int shared_fd)
+/* Reopen every created copy after ALL writes, retaining its original inode. */
+static bool
+created_pair_current(int directory, const InitialMap *map,
+					 const ClusterRelmapV2Namespace *identity)
+{
+	char bytes[2][CLUSTER_RELMAP_V2_FILE_SIZE];
+	ClusterRelmapV2View view;
+	for (unsigned c = 0; c < lengthof(authority_names); ++c)
+	{
+		struct stat held, named, after;
+		ssize_t n;
+		bool ok = false;
+		int fd = openat(directory, authority_names[c], O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+		if (fd < 0) return false;
+		if (fstat(fd, &held) != 0 || !same_file(&held, &map->created[c])) goto done;
+		do { n = pread(fd, bytes[c], sizeof(bytes[c]), 0); } while (n < 0 && errno == EINTR);
+		if (n != sizeof(bytes[c]) || memcmp(bytes[c], map->image, sizeof(bytes[c])) != 0
+			|| fstat(fd, &after) != 0 || !same_file(&held, &after)
+			|| fstatat(directory, authority_names[c], &named, AT_SYMLINK_NOFOLLOW) != 0
+			|| !same_file(&held, &named)) goto done;
+		ok = true;
+	done:
+		if (close(fd) != 0) ok = false;
+		if (!ok) return false;
+	}
+	return cluster_relmap_v2_read_pair(bytes[0], sizeof(bytes[0]), bytes[1], sizeof(bytes[1]),
+			identity, &view) == CLUSTER_RELMAP_V2_PAIR_VALID
+		&& view.pending_complete && !view.has_pending && view.committed_generation == 1
+		&& memcmp(&view.committed, &map->native, sizeof(map->native)) == 0;
+}
+
+static bool
+create_initial_maps(int source_fd, int shared_fd, bool v2,
+					uint64 system_identifier, uint64 database_incarnation)
 {
 	int source[6] = {source_fd, -1, -1, -1, -1, -1};
 	int target[6] = {shared_fd, -1, -1, -1, -1, -1};
@@ -161,7 +197,8 @@ pgrac_initdb_relmap_create(int source_fd, int shared_fd)
 	bool ok = false;
 
 	for (unsigned i = 0; i < lengthof(maps); ++i) maps[i].fd = -1;
-	if (!owned_directory(source_fd, &a) || !owned_directory(shared_fd, &b)
+	if ((v2 && (system_identifier == 0 || database_incarnation == 0))
+		|| !owned_directory(source_fd, &a) || !owned_directory(shared_fd, &b)
 		|| (a.st_dev == b.st_dev && a.st_ino == b.st_ino)
 		|| !open_directories(source) || !open_directories(target)
 		|| !database_set_exact(source[2]) || !database_set_exact(target[2])) goto done;
@@ -170,6 +207,8 @@ pgrac_initdb_relmap_create(int source_fd, int shared_fd)
 	{
 		unsigned d = map_directories[i];
 		InitialMap *map = &maps[i];
+		ClusterRelmapV2Namespace identity = { system_identifier, database_incarnation,
+			map_databases[i], i == 0 };
 		ssize_t n;
 		if (!owned_directory(source[d], &a) || !owned_directory(target[d], &b)
 			|| (a.st_dev == b.st_dev && a.st_ino == b.st_ino)
@@ -180,16 +219,19 @@ pgrac_initdb_relmap_create(int source_fd, int shared_fd)
 			|| map->identity.st_nlink != 1 || (map->identity.st_mode & 0022) != 0
 			|| map->identity.st_size != sizeof(map->native)) goto done;
 		do { n = pread(map->fd, &map->native, sizeof(map->native), 0); } while (n < 0 && errno == EINTR);
-		if (n != sizeof(map->native) || !source_current(source[d], map)
-			|| cluster_relmap_authority_init_image(i == 0, map_databases[i],
-				&map->native, sizeof(map->native), map->image, sizeof(map->image))
-				!= CLUSTER_RELMAP_INIT_OK) goto done;
+		map->image_size = v2 ? CLUSTER_RELMAP_V2_FILE_SIZE : CLUSTER_RELMAP_AUTHORITY_FILE_SIZE;
+		if (n != sizeof(map->native) || !source_current(source[d], map)) goto done;
+		if ((v2 ? cluster_relmap_authority_v2_init_image(&identity, &map->native,
+					  sizeof(map->native), map->image, map->image_size)
+				: cluster_relmap_authority_init_image(i == 0, map_databases[i], &map->native,
+					  sizeof(map->native), map->image, map->image_size)) != CLUSTER_RELMAP_INIT_OK) goto done;
 	}
 	for (unsigned i = 0; i < lengthof(maps); ++i)
 	{
-		if (!directories_current(source) || !directories_current(target)
-			|| !source_current(source[map_directories[i]], &maps[i])
-			|| !persist_image(target[map_directories[i]], &maps[i])) goto done;
+		for (unsigned c = 0; c < (v2 ? 2 : 1); ++c)
+			if (!directories_current(source) || !directories_current(target)
+				|| !source_current(source[map_directories[i]], &maps[i])
+				|| !persist_image(target[map_directories[i]], &maps[i], c)) goto done;
 	}
 	for (unsigned i = 0; i < lengthof(maps); ++i)
 		if (!source_current(source[map_directories[i]], &maps[i])) goto done;
@@ -197,6 +239,19 @@ pgrac_initdb_relmap_create(int source_fd, int shared_fd)
 		|| !directories_current(source) || !directories_current(target)
 		|| fsync(target[2]) != 0 || fsync(shared_fd) != 0
 		|| !directories_current(source) || !directories_current(target)) goto done;
+	if (v2)
+	{
+		for (unsigned i = 0; i < lengthof(maps); ++i)
+		{
+			ClusterRelmapV2Namespace identity = { system_identifier, database_incarnation,
+				map_databases[i], i == 0 };
+			if (!created_pair_current(target[map_directories[i]], &maps[i], &identity)) goto done;
+		}
+		for (unsigned i = 0; i < lengthof(maps); ++i)
+			if (!source_current(source[map_directories[i]], &maps[i])) goto done;
+		if (!database_set_exact(source[2]) || !database_set_exact(target[2])
+			|| !directories_current(source) || !directories_current(target)) goto done;
+	}
 	ok = true;
 done:
 	for (unsigned i = 0; i < lengthof(maps); ++i)
@@ -207,4 +262,17 @@ done:
 		if (target[i] >= 0 && close(target[i]) != 0) ok = false;
 	}
 	return ok;
+}
+
+bool
+pgrac_initdb_relmap_create(int source_fd, int shared_fd)
+{
+	return create_initial_maps(source_fd, shared_fd, false, 0, 0);
+}
+
+bool
+pgrac_initdb_relmap_v2_create(int source_fd, int shared_fd,
+								uint64 system_identifier, uint64 database_incarnation)
+{
+	return create_initial_maps(source_fd, shared_fd, true, system_identifier, database_incarnation);
 }

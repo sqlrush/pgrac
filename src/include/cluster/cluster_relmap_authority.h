@@ -214,6 +214,18 @@ extern void cluster_relmap_authority_publish(bool shared_map, Oid dbid, uint64 g
 extern void cluster_relmap_authority_discard_pending(bool shared_map, Oid dbid, uint64 generation);
 
 /*
+ * Fresh v2 image only: same native bootstrap inventory and no-partial-output
+ * contract as init_image, with a nonzero original system/DB incarnation.
+ * Produces generation 1 committed, no pending. Output must be exactly 2176
+ * zero bytes. Does not authenticate freshness, identity provenance or startup
+ * permission. The original creator owns O_EXCL creation of BOTH synced copies.
+ */
+extern ClusterRelmapInitResult
+cluster_relmap_authority_v2_init_image(const ClusterRelmapV2Namespace *identity,
+									 const void *native_map, size_t native_len,
+									 void *output, size_t output_len);
+
+/*
  * V2 storage primitives; not wired into the live v1 publisher.  The caller
  * serializes the namespace with its relmap lock and binds expected to the
  * selected authority.  Read exposes committed data and pending obligations
