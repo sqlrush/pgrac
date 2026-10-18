@@ -195,3 +195,62 @@ cluster_cold_typed_undo_redo_record_v1(const ClusterColdTypedV1 *typed, uint32 p
 	*generation = ((const UndoSegmentHeaderData *)header.page.data)->wrap_count;
 	return true;
 }
+
+ClusterRecoveryGraphResult
+cluster_cold_typed_tt_redo_graph_read_v1(void *arg, const ClusterRecoveryTxnKey *key, UBA address,
+										 ClusterRecoveryUndoRecord *out, uint32 *generation)
+{
+	const ClusterColdTtRedoGraphInputV1 *input = arg;
+	const ClusterColdTypedV1 *typed;
+	ClusterColdTtSlotKeyV1 expected = { 0 };
+	ClusterColdTtSlotInputV1 slot;
+	ClusterRecoveryGraphResult result = CLUSTER_RECOVERY_GRAPH_INVALID;
+	uint32 physical_segment, block, canonical_index = UINT32_MAX, physical_index = UINT32_MAX;
+	uint16 tt_slot, row;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (generation != NULL)
+		*generation = 0;
+	if (input == NULL || input->typed == NULL || key == NULL || out == NULL || generation == NULL)
+		return result;
+	typed = input->typed;
+	if (!cluster_cold_tt_base_namespace_matches_v1(typed, key->system_identifier,
+												   key->database_incarnation)
+		|| key->origin_node_id >= UNDO_OWNER_INSTANCE_MAX)
+		return CLUSTER_RECOVERY_GRAPH_IDENTITY;
+	if (!uba_decode_record(address, &physical_segment, &block, &tt_slot, &row))
+		return result;
+	expected.owner_instance = key->origin_node_id + 1;
+	expected.segment_id = key->segment_id;
+	expected.segment_generation = key->segment_generation;
+	expected.slot_offset = key->slot_offset;
+	expected.xid = key->xid;
+	expected.slot_wrap = key->slot_wrap;
+	for (uint32 i = 0; i < cluster_cold_tt_base_count_v1(typed); i++) {
+		uint8 owner;
+		uint32 segment;
+
+		if (cluster_cold_tt_base_header_v1(typed, i, &owner, &segment) == NULL)
+			return result;
+		if (owner != expected.owner_instance)
+			continue;
+		if (segment == expected.segment_id)
+			canonical_index = i;
+		if (segment == physical_segment)
+			physical_index = i;
+	}
+	if (canonical_index == UINT32_MAX || physical_index == UINT32_MAX
+		|| !cluster_cold_typed_tt_redo_match_v1(typed, input->participant, canonical_index,
+												&expected, &slot))
+		return CLUSTER_RECOVERY_GRAPH_IDENTITY;
+	if (!cluster_cold_typed_undo_redo_record_v1(typed, input->participant, physical_index, address,
+												out, generation))
+		return result;
+	result = cluster_recovery_tx_record_check(key, address, out, *generation);
+	if (result == CLUSTER_RECOVERY_GRAPH_MORE)
+		return CLUSTER_RECOVERY_GRAPH_RECORD;
+	memset(out, 0, sizeof(*out));
+	*generation = 0;
+	return result;
+}

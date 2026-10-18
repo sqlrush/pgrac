@@ -769,6 +769,12 @@ extern const struct UndoSegmentHeaderData *
 cluster_cold_tt_base_header_v1(const ClusterColdTypedV1 *typed, uint32 index, uint8 *owner,
 							   uint32 *segment);
 
+/* Match raw namespace input against the retained capture and current caller.
+ * This is neither source isolation nor checkpoint or transaction authority. */
+extern bool cluster_cold_tt_base_namespace_matches_v1(const ClusterColdTypedV1 *typed,
+													  uint64 system_identifier,
+													  uint64 database_incarnation);
+
 /* Physical input identity only: xid is raw, not FullXid, and there is no
  * cluster epoch or checkpoint/terminal proof. Generation zero is valid. */
 typedef struct ClusterColdTtSlotKeyV1 {
@@ -857,6 +863,24 @@ extern bool cluster_cold_typed_undo_redo_record_v1(const ClusterColdTypedV1 *typ
 												   UBA address,
 												   struct ClusterRecoveryUndoRecord *out,
 												   uint32 *generation);
+
+/* One explicitly selected original replay participant, never a history or
+ * owner-id shortcut. The caller retains this context throughout graph use. */
+typedef struct ClusterColdTtRedoGraphInputV1 {
+	const ClusterColdTypedV1 *typed;
+	uint32 participant;
+} ClusterColdTtRedoGraphInputV1;
+
+/* Existing reference-graph callback over an exact after-redo TT key and the
+ * same source's final FPI-backed records. No DATA fallback or install. Every
+ * call, including graph verification, repeats the source and identity checks;
+ * refusal clears outputs and the graph retains its normal sticky failure.
+ * A drained supplied graph proves no FullXid/epoch/top, producer/checkpoint
+ * coverage, loser, C0 or OPEN authority. Original source isolation and final
+ * base/source rechecks remain required. The raw pre-redo callback is unchanged. */
+extern ClusterRecoveryGraphResult
+cluster_cold_typed_tt_redo_graph_read_v1(void *arg, const ClusterRecoveryTxnKey *key, UBA address,
+										 struct ClusterRecoveryUndoRecord *out, uint32 *generation);
 
 /* Sync the selected crashed sources before pass-2 mutations. No replay or
  * completion authority is created; a refusal invalidates this typed attempt. */

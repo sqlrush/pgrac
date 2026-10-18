@@ -345,6 +345,24 @@ cluster_cold_tt_base_header_v1(const ClusterColdTypedV1 *typed, uint32 index, ui
 	return (const UndoSegmentHeaderData *)input->block.data;
 }
 
+bool
+cluster_cold_tt_base_namespace_matches_v1(const ClusterColdTypedV1 *typed, uint64 system_identifier,
+										  uint64 database_incarnation)
+{
+	const ClusterColdTtBaseV1 *base;
+	bool owners[COLD_TT_MAX_ORIGINS + 1];
+
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK || typed->tt_base == NULL)
+		return false;
+	base = typed->tt_base;
+	return base->captured && base->detail == CLUSTER_COLD_OK && system_identifier != 0
+		   && database_incarnation != 0 && base->system_identifier == system_identifier
+		   && base->database_incarnation == database_incarnation
+		   && typed->system_identifier == base->system_identifier
+		   && typed->observer.database_incarnation == base->database_incarnation
+		   && cold_tt_owners(typed, owners) && memcmp(owners, base->owners, sizeof(owners)) == 0;
+}
+
 static void
 cold_tt_slot_copy(const ColdTtInputV1 *input, uint32 slot_offset, ClusterColdTtSlotInputV1 *out)
 {

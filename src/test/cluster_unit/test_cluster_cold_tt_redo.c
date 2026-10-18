@@ -981,10 +981,346 @@ UT_TEST(tt_redo_undo_requires_new_fpi_after_segment_reuse_and_returns_new_genera
 	}
 }
 
+static ClusterRecoveryTxnKey
+tt_redo_graph_key(TtRedoFixture *f)
+{
+	ClusterColdTtSlotInputV1 input;
+
+	UT_ASSERT(cluster_cold_typed_tt_redo_slot_v1(&f->typed, 0, 0, 4, &input));
+	return (ClusterRecoveryTxnKey){ .system_identifier = f->typed.system_identifier,
+									.database_incarnation = f->typed.observer.database_incarnation,
+									.origin_node_id = input.key.owner_instance - 1,
+									.segment_id = input.key.segment_id,
+									.segment_generation = input.key.segment_generation,
+									.slot_offset = input.key.slot_offset,
+									.xid = input.key.xid,
+									.slot_wrap = input.key.slot_wrap };
+}
+
+static void
+tt_redo_graph_refuses(ClusterColdTtRedoGraphInputV1 *input, const ClusterRecoveryTxnKey *key,
+					  UBA address, ClusterRecoveryGraphResult expected)
+{
+	ClusterRecoveryUndoRecord out, zero = { 0 };
+	uint32 generation = UINT32_MAX;
+
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT_EQ(cluster_cold_typed_tt_redo_graph_read_v1(input, key, address, &out, &generation),
+				 expected);
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	UT_ASSERT_EQ(generation, 0);
+}
+
+static void
+tt_redo_graph_walk(TtRedoFixture *f, const ClusterRecoveryTxnKey *key, UBA head,
+				   uint32 physical_generation, bool drift_before_verify)
+{
+	ClusterColdTtRedoGraphInputV1 input = { &f->typed, 0 };
+	ClusterRecoveryReferenceGraph *graph = NULL;
+	ClusterRecoveryGraphRecord out;
+	ClusterRecoveryGraphResult result = CLUSTER_RECOVERY_GRAPH_MORE;
+	unsigned records = 0;
+
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_begin(
+					 1024 * 1024, cluster_cold_typed_tt_redo_graph_read_v1, &input, &graph),
+				 CLUSTER_RECOVERY_GRAPH_MORE);
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_add(graph, key, head),
+				 CLUSTER_RECOVERY_GRAPH_MORE);
+	for (unsigned i = 0; i < 32; i++) {
+		result = cluster_recovery_reference_graph_step(graph, &out);
+		if (result == CLUSTER_RECOVERY_GRAPH_RECORD) {
+			UT_ASSERT_NOT_NULL(out.record);
+			UT_ASSERT_EQ(out.record->header.xid, key->xid);
+			UT_ASSERT_EQ(out.record_segment_generation, physical_generation);
+			records++;
+			if (drift_before_verify)
+				f->typed.system_identifier++;
+		} else if (result != CLUSTER_RECOVERY_GRAPH_MORE)
+			break;
+	}
+	UT_ASSERT_EQ(records, 1);
+	UT_ASSERT_EQ(result, drift_before_verify ? CLUSTER_RECOVERY_GRAPH_IDENTITY
+											 : CLUSTER_RECOVERY_GRAPH_DRAINED);
+	UT_ASSERT_NULL(out.record);
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_observed(graph), !drift_before_verify);
+	if (drift_before_verify)
+		f->typed.system_identifier--;
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_step(graph, &out), result);
+	cluster_recovery_reference_graph_destroy(graph);
+}
+
+UT_TEST(tt_redo_graph_uses_rebound_slot_and_owned_fpi_bytes_at_generation_zero)
+{
+	TtRedoFixture f;
+	FakeXactRecord fake;
+	xl_undo_tt_slot_bind bind;
+	PGAlignedBlock page;
+	UndoRecordHeader record;
+	UndoSlotDirEntry directory;
+	ClusterRecoveryTxnKey key, stale;
+	ClusterColdTtRedoGraphInputV1 input = { &f.typed, 0 };
+	ClusterRecoveryUndoRecord out;
+	uint32 generation = UINT32_MAX;
+	char path[MAXPGPATH];
+	int fd;
+
+	tt_redo_fixture(&f, 300, RF_SIDE_PLAN_RECOVERY);
+	((UndoSegmentHeaderData *)f.base.data)->tt_slots[4].status = TT_SLOT_RECYCLABLE;
+	snprintf(path, sizeof(path), "%s/513", tt_redo_dir);
+	fd = open(path, O_RDWR);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(pwrite(fd, f.base.data, BLCKSZ, 0), BLCKSZ);
+	UT_ASSERT_EQ(close(fd), 0);
+	cluster_cold_tt_base_destroy_v1(&f.typed);
+	UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(&f.typed, (Size)1024 * 1024), CLUSTER_COLD_OK);
+	undo_header_bind(&fake, 0);
+	memcpy(&bind, fake.data, sizeof(bind));
+	bind.wrap = 8;
+	bind.xid = 806;
+	memcpy(fake.data, &bind, sizeof(bind));
+	undo_header_feed(f.typed.side_plans[0], &fake, 100);
+	tt_redo_record_page(&page, 806);
+	memcpy(&directory, page.data + UNDO_SLOT_DIR_OFFSET(0), sizeof(directory));
+	memcpy(&record, page.data + directory.record_offset, sizeof(record));
+	record.tt_wrap_plus1 = 9;
+	memcpy(page.data + directory.record_offset, &record, sizeof(record));
+	tt_redo_feed_record_page(&f, 200, &page, true);
+	tt_redo_seal(&f);
+	key = tt_redo_graph_key(&f);
+	UT_ASSERT_EQ(key.segment_generation, 0);
+	UT_ASSERT_EQ(key.xid, 806);
+	UT_ASSERT_EQ(key.slot_wrap, 8);
+	UT_ASSERT_EQ(cluster_cold_typed_tt_redo_graph_read_v1(
+					 &input, &key, tt_redo_record_address(513, 9, 0), &out, &generation),
+				 CLUSTER_RECOVERY_GRAPH_RECORD);
+	UT_ASSERT_EQ(generation, 0);
+	memset(out.payload, 0xa5, sizeof(out.payload));
+	memset(page.data, 0, BLCKSZ);
+	tt_redo_graph_walk(&f, &key, tt_redo_record_address(513, 9, 0), 0, false);
+	stale = key;
+	stale.xid = 802;
+	stale.slot_wrap = 7;
+	tt_redo_graph_refuses(&input, &stale, tt_redo_record_address(513, 9, 0),
+						  CLUSTER_RECOVERY_GRAPH_IDENTITY);
+	UT_ASSERT_EQ(cluster_cold_tt_base_recheck_v1(&f.typed), CLUSTER_COLD_OK);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_redo_graph_cross_segment_record_keeps_physical_generation)
+{
+	TtRedoFixture f;
+	PGAlignedBlock page, physical;
+	FakeXactRecord fake;
+	xl_undo_block_write carrier = { 0 };
+	uint8 bytes[sizeof(carrier) + BLCKSZ];
+	ClusterRecoveryTxnKey key;
+	char path[MAXPGPATH];
+	int fd;
+
+	tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+	cluster_undo_segment_make_header_bytes(514, 3, physical.data);
+	((UndoSegmentHeaderData *)physical.data)->wrap_count = 91;
+	snprintf(path, sizeof(path), "%s/514", tt_redo_dir);
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(ftruncate(fd, UNDO_SEGMENT_SIZE_BYTES), 0);
+	UT_ASSERT_EQ(pwrite(fd, physical.data, BLCKSZ, 0), BLCKSZ);
+	UT_ASSERT_EQ(close(fd), 0);
+	cluster_cold_tt_base_destroy_v1(&f.typed);
+	UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(&f.typed, (Size)1024 * 1024), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_tt_base_count_v1(&f.typed), 2);
+	tt_redo_record_page(&page, 802);
+	carrier.instance = 3;
+	carrier.segment_id = 514;
+	carrier.block_no = 9;
+	carrier.has_fpi = true;
+	memcpy(bytes, &carrier, sizeof(carrier));
+	memcpy(bytes + sizeof(carrier), page.data, BLCKSZ);
+	make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE, bytes, sizeof(bytes));
+	undo_header_feed(f.typed.side_plans[0], &fake, 100);
+	tt_redo_seal(&f);
+	key = tt_redo_graph_key(&f);
+	tt_redo_graph_walk(&f, &key, tt_redo_record_address(514, 9, 0), 91, false);
+	UT_ASSERT_EQ(cluster_cold_tt_base_recheck_v1(&f.typed), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(unlink(path), 0);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_redo_graph_refuses_namespace_key_source_and_argument_drift)
+{
+	TtRedoFixture f;
+	PGAlignedBlock page;
+	ClusterRecoveryTxnKey key, changed;
+	ClusterColdTtRedoGraphInputV1 input = { &f.typed, 0 };
+	ClusterRecoveryUndoRecord out, zero = { 0 };
+	uint32 generation;
+	UBA address = tt_redo_record_address(513, 9, 0);
+
+	tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+	tt_redo_record_page(&page, 802);
+	tt_redo_feed_record_page(&f, 100, &page, true);
+	tt_redo_seal(&f);
+	key = tt_redo_graph_key(&f);
+	for (int fault = 0; fault < 11; fault++) {
+		changed = key;
+		switch (fault) {
+		case 0:
+			changed.system_identifier++;
+			break;
+		case 1:
+			changed.database_incarnation++;
+			break;
+		case 2:
+			changed.origin_node_id++;
+			break;
+		case 3:
+			changed.segment_id++;
+			break;
+		case 4:
+			changed.segment_generation++;
+			break;
+		case 5:
+			changed.slot_offset++;
+			break;
+		case 6:
+			changed.xid++;
+			break;
+		case 7:
+			changed.slot_wrap++;
+			break;
+		case 8:
+			changed.system_identifier = ++f.typed.system_identifier;
+			break;
+		case 9:
+			changed.database_incarnation = ++f.typed.observer.database_incarnation;
+			break;
+		case 10:
+			f.typed.system_identifier = changed.system_identifier = 0;
+			break;
+		}
+		tt_redo_graph_refuses(&input, &changed, address, CLUSTER_RECOVERY_GRAPH_IDENTITY);
+		if (fault == 0 || fault == 1 || fault >= 8)
+			UT_ASSERT(!cluster_cold_tt_base_namespace_matches_v1(
+				&f.typed, changed.system_identifier, changed.database_incarnation));
+		f.typed.system_identifier = key.system_identifier;
+		f.typed.observer.database_incarnation = key.database_incarnation;
+	}
+	f.typed.participants[1].thread_id = 1;
+	tt_redo_graph_refuses(&input, &key, address, CLUSTER_RECOVERY_GRAPH_IDENTITY);
+	f.typed.participants[1].thread_id = 2;
+	for (int fault = 0; fault < 3; fault++) {
+		input.participant = fault == 0 ? 1 : (fault == 1 ? 2 : UINT32_MAX);
+		tt_redo_graph_refuses(&input, &key, address, CLUSTER_RECOVERY_GRAPH_IDENTITY);
+	}
+	input.participant = 0;
+	f.typed.participants[0].native_redo++;
+	tt_redo_graph_refuses(&input, &key, address, CLUSTER_RECOVERY_GRAPH_IDENTITY);
+	f.typed.participants[0].native_redo--;
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT_EQ(cluster_cold_typed_tt_redo_graph_read_v1(&input, &key, address, &out, NULL),
+				 CLUSTER_RECOVERY_GRAPH_INVALID);
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	generation = UINT32_MAX;
+	UT_ASSERT_EQ(cluster_cold_typed_tt_redo_graph_read_v1(&input, &key, address, NULL, &generation),
+				 CLUSTER_RECOVERY_GRAPH_INVALID);
+	UT_ASSERT_EQ(generation, 0);
+	tt_redo_graph_refuses(NULL, &key, address, CLUSTER_RECOVERY_GRAPH_INVALID);
+	input.typed = NULL;
+	tt_redo_graph_refuses(&input, &key, address, CLUSTER_RECOVERY_GRAPH_INVALID);
+	input.typed = &f.typed;
+	tt_redo_graph_refuses(&input, NULL, address, CLUSTER_RECOVERY_GRAPH_INVALID);
+	tt_redo_graph_refuses(&input, &key, (UBA)InvalidUba_init, CLUSTER_RECOVERY_GRAPH_INVALID);
+	tt_redo_graph_refuses(&input, &key, tt_redo_record_address(514, 9, 0),
+						  CLUSTER_RECOVERY_GRAPH_IDENTITY);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_redo_graph_second_read_refuses_drift_and_keeps_graph_failure)
+{
+	TtRedoFixture f;
+	PGAlignedBlock page;
+	ClusterRecoveryTxnKey key;
+
+	tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+	tt_redo_record_page(&page, 802);
+	tt_redo_feed_record_page(&f, 100, &page, true);
+	tt_redo_seal(&f);
+	key = tt_redo_graph_key(&f);
+	tt_redo_graph_walk(&f, &key, tt_redo_record_address(513, 9, 0), 0, true);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_redo_graph_no_fpi_never_falls_back_to_valid_data)
+{
+	TtRedoFixture f;
+	PGAlignedBlock page;
+	ClusterRecoveryTxnKey key;
+	ClusterColdTtRedoGraphInputV1 input = { &f.typed, 0 };
+	char path[MAXPGPATH];
+	int fd;
+
+	tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+	tt_redo_record_page(&page, 802);
+	snprintf(path, sizeof(path), "%s/513", tt_redo_dir);
+	fd = open(path, O_RDWR);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(pwrite(fd, page.data, BLCKSZ, 9 * BLCKSZ), BLCKSZ);
+	UT_ASSERT_EQ(close(fd), 0);
+	tt_redo_seal(&f);
+	key = tt_redo_graph_key(&f);
+	tt_redo_graph_refuses(&input, &key, tt_redo_record_address(513, 9, 0),
+						  CLUSTER_RECOVERY_GRAPH_INVALID);
+	UT_ASSERT_NULL(f.typed.tt_base->blocks);
+	UT_ASSERT_EQ(cluster_cold_tt_base_recheck_v1(&f.typed), CLUSTER_COLD_OK);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_redo_graph_refuses_raw_record_without_exact_transaction_identity)
+{
+	for (int fault = 0; fault < 4; fault++) {
+		TtRedoFixture f;
+		PGAlignedBlock page;
+		UndoSlotDirEntry directory;
+		UndoRecordHeader record;
+		ClusterRecoveryTxnKey key;
+		ClusterColdTtRedoGraphInputV1 input = { &f.typed, 0 };
+		ClusterRecoveryUndoRecord raw;
+		uint32 generation;
+		UBA address = tt_redo_record_address(513, 9, 0);
+
+		tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+		tt_redo_record_page(&page, 802);
+		memcpy(&directory, page.data + UNDO_SLOT_DIR_OFFSET(0), sizeof(directory));
+		memcpy(&record, page.data + directory.record_offset, sizeof(record));
+		switch (fault) {
+		case 0:
+			record.xid++;
+			break;
+		case 1:
+			record.tt_wrap_plus1 = 0;
+			break;
+		case 2:
+			record.tt_wrap_plus1++;
+			break;
+		case 3:
+			record.tt_slot_segment_id++;
+			break;
+		}
+		memcpy(page.data + directory.record_offset, &record, sizeof(record));
+		tt_redo_feed_record_page(&f, 100, &page, true);
+		tt_redo_seal(&f);
+		key = tt_redo_graph_key(&f);
+		UT_ASSERT(
+			cluster_cold_typed_undo_redo_record_v1(&f.typed, 0, 0, address, &raw, &generation));
+		tt_redo_graph_refuses(&input, &key, address, CLUSTER_RECOVERY_GRAPH_IDENTITY);
+		tt_redo_destroy(&f);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(30);
 	UT_RUN(tt_redo_commit_without_bind_keeps_original_all_slots_and_heads);
 	UT_RUN(tt_redo_unrelated_terminal_preserves_active_input);
 	UT_RUN(tt_redo_empty_cut_preserves_input_and_requires_canonical_flags);
@@ -1009,6 +1345,12 @@ main(void)
 	UT_RUN(tt_redo_undo_refuses_bad_bounds_source_and_arguments_with_cleared_outputs);
 	UT_RUN(tt_redo_undo_refuses_malformed_fpi_record);
 	UT_RUN(tt_redo_undo_requires_new_fpi_after_segment_reuse_and_returns_new_generation);
+	UT_RUN(tt_redo_graph_uses_rebound_slot_and_owned_fpi_bytes_at_generation_zero);
+	UT_RUN(tt_redo_graph_cross_segment_record_keeps_physical_generation);
+	UT_RUN(tt_redo_graph_refuses_namespace_key_source_and_argument_drift);
+	UT_RUN(tt_redo_graph_second_read_refuses_drift_and_keeps_graph_failure);
+	UT_RUN(tt_redo_graph_no_fpi_never_falls_back_to_valid_data);
+	UT_RUN(tt_redo_graph_refuses_raw_record_without_exact_transaction_identity);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
