@@ -57,6 +57,7 @@
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_lock_owner.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_cssd.h"
 #include "cluster/cluster_epoch.h"	   /* cluster_epoch_get_current (version-coherent) */
@@ -3688,6 +3689,28 @@ cl_normal_stop_checkpoint_run(ClusterPhase1FullStopPlan *plan,
 		ResetLatch(MyLatch);
 		cluster_cf_retirement_poll();
 		cluster_lock_owners_service_poll();
+		if (step == 0 && !after_checkpoint
+			&& pg_atomic_read_u32(&cl_normal_stop->phase) < CLUSTER_NORMAL_STOP_CHECKPOINT
+			&& cluster_normal_stop_failure() == CLUSTER_NORMAL_STOP_FAILURE_NONE) {
+			PcmReclaimBatch retired = {0};
+			bool owner_progress;
+			/* Continue the original bounded no-I/O master consumer before
+			 * the producer cut. Same cursor, gates, owner and absolute budget;
+			 * passive module census never executes native physical work. */
+			LWLockAcquire(&cl_state->lock, LW_SHARED);
+			deadline = cl_state->barrier_deadline_us;
+			LWLockRelease(&cl_state->lock);
+			now = (uint64)GetCurrentTimestamp();
+			if (now != 0 && deadline != UINT64_MAX && now < deadline) {
+				owner_progress = cluster_ko_shared_native_poll_v2();
+				if (cluster_pcm_lock_reclaim_bounded(128, &retired)
+					&& retired.examined_count != 0
+					&& (!retired.complete_wrap || retired.retired_count != 0))
+					owner_progress = true;
+				if (owner_progress)
+					SetLatch(MyLatch);
+			}
+		}
 		if (step == 0)
 			result = cl_normal_stop_checkpoint_poll(expected, plan, observation, &progress);
 		else if (step == 1)

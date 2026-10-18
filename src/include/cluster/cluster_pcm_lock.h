@@ -445,6 +445,32 @@ typedef struct PcmGrdProtocolDebtStats {
 StaticAssertDecl(sizeof(PcmGrdProtocolDebtStats) == 7 * sizeof(uint64),
 				 "PcmGrdProtocolDebtStats must remain a fixed read-only gauge cohort");
 
+/* First refusing source-site and its original locked values. Pure diagnostics,
+ * not wire, retirement authority or a normal-stop decision input. */
+typedef struct PcmNormalStopRefusalV1 {
+	uint32 code, source_line;
+	int32 pid, node, request_node, x_holder, pending_x;
+	int64 captured_pg_us;
+	BufferTag tag, registry_tag;
+	uint32 slot, registry_state, registry_reserved, lifecycle, gate;
+	uint64 binding, registry_binding, state_binding, formation, gate_formation, authority;
+	uint32 pins, waits, transport, mode, s_holders, pi_holders, local_refs, master_holder, convert;
+	uint64 pending_x_lsn;
+	uint32 owner_state, owner_buffer, round_phase, send_pending;
+	uint64 owner_generation, attempt, round_formation, round_master_session, delivery_sequence;
+	uint32 local_pi_first, local_pi_last;
+	uint64 pi_lsn, pi_scn;
+	uint32 request_phase, tombstone_valid, tombstone_phase;
+	int32 tombstone_node;
+	uint64 request_formation, request_session, assertion, base, final_authority;
+	uint64 requester_connection, requester_target;
+	uint32 sender_connection, holder_status, holder_image, grant, requester_settlement;
+	uint32 requester_join_grant, requester_join_image, deferred, retry_pending, retry_running;
+	uint32 source_settlement, priority;
+} PcmNormalStopRefusalV1;
+
+extern bool cluster_pcm_normal_stop_first_refusal_v1(PcmNormalStopRefusalV1 *out);
+
 typedef struct PcmEntryRef {
 	GrdEntry *entry;
 	BufferTag tag;

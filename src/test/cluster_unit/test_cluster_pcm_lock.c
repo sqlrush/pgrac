@@ -457,6 +457,8 @@ static bool fake_lwlock_conditional_fail_once = false;
 
 /* Object publication and its entered-I/O drain are tested by the KO fixture.
  * This directory fixture supplies only their exact immutable terminal result. */
+int MyProcPid = 4242; /* Explicit backend identity for the diagnostic boundary. */
+
 static bool object_drop_retired;
 static bool object_origin_discard;
 static RelFileLocator object_drop_locator;

@@ -993,10 +993,269 @@ UT_TEST(test_drop_local_requester_send_completes_before_terminal_consumption)
 		17, 128, &cursor), CLUSTER_PCM_PI_RELATION_EMPTY);
 }
 
+/* Real master assertion/grant/install/SETTLED producer, followed by LOCAL. */
+static BufferTag
+drop_settled_master_fixture(bool tombstone)
+{
+	BufferTag tag = make_tag(7300);
+	PcmAuthoritySnapshot authority;
+	ResourceXDecodedFrame assertion;
+	ResourceXDecodedFrame settlement;
+	ResourceXDurableProof durable;
+	ResourceXIntentSlot grant_intent;
+	ResourceXMasterSnapshot snapshot;
+	uint8 grant_bytes[RESOURCE_X_PROOF_V1_BYTES];
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_N_TO_X, 0),
+				 PCM_GCS_TRANSITION_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_X_TO_N_RELEASE, 0),
+				 PCM_GCS_TRANSITION_APPLIED);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &authority));
+
+	assertion = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X, tag, 3, 3);
+	assertion.common.base_authority_generation = authority.transition_count;
+	assertion.common.authority_generation = authority.transition_count;
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_adapter_base_bind_exact(&assertion.common.logical_assertion, 17,
+															authority.transition_count, &authority),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&assertion, 3, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+
+	memset(&durable, 0, sizeof(durable));
+	durable.assertion = assertion.common.logical_assertion;
+	durable.base_authority_generation = authority.transition_count;
+	durable.resource_formation = 17;
+	durable.master_session_incarnation = 31;
+	durable.assertion_sequence = assertion.common.assertion_sequence;
+	durable.requester_target_generation = 41;
+	durable.page_scn_lsn = 82;
+	durable.page_checksum = UINT32_C(0x12345678);
+	durable.source_proof_crc32c = UINT32_C(0x87654321);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_durable_proof_exact(&durable, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_grant_intent_snapshot_exact(
+			&assertion.common.logical_assertion, &grant_intent, grant_bytes, sizeof(grant_bytes)),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_grant_intent_stage_exact(&grant_intent, 101),
+				 RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_grant_intent_complete_exact(&grant_intent));
+
+	settlement = make_resource_x_master_frame(RESOURCE_X_WIRE_INSTALL_SETTLEMENT, tag, 3, 3);
+	settlement.common.outcome = RESOURCE_X_OUTCOME_OK;
+	settlement.common.base_authority_generation = durable.base_authority_generation;
+	settlement.common.authority_generation = snapshot.final_authority_generation;
+	settlement.body.install_settlement.conversion_base_generation
+		= durable.base_authority_generation;
+	settlement.body.install_settlement.final_authority_generation
+		= snapshot.final_authority_generation;
+	settlement.body.install_settlement.requester_connection_generation = 91;
+	settlement.body.install_settlement.requester_target_generation = 41;
+	settlement.body.install_settlement.page_scn_lsn = durable.page_scn_lsn;
+	settlement.body.install_settlement.page_checksum = durable.page_checksum;
+	settlement.body.install_settlement.source_proof_crc32c = durable.source_proof_crc32c;
+	settlement.body.install_settlement.installed_mode = PCM_STATE_X;
+	settlement.body.install_settlement.requester_role = RESOURCE_X_REQUESTER_ROLE_ACQUIRER;
+	settlement.body.install_settlement.terminal_outcome = RESOURCE_X_OUTCOME_OK;
+	settlement.body.install_settlement.terminal_state = RESOURCE_X_SETTLEMENT_TERMINAL_INSTALLED;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_install_settlement_exact(&settlement, 3, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	if (tombstone)
+		UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_settled_retire_exact(
+			&assertion.common.logical_assertion, assertion.common.assertion_sequence, &snapshot),
+		RESOURCE_X_APPLY_APPLIED);
+
+	cluster_node_id = 3; /* Original requester now runs its local consumer. */
+	object_drop_locator = BufTagGetRelFileLocator(&tag);
+	object_drop_retired = false;
+	object_origin_discard = true;
+	cluster_enabled = cluster_shared_config = true;
+	return tag;
+}
+
+UT_TEST(test_real_settled_local_drop_stays_pending_until_original_am03_retirement)
+{
+	for (unsigned tombstone = 0; tombstone < 2; tombstone++) {
+		BufferTag tag = drop_settled_master_fixture(tombstone != 0);
+		struct StopPcmEntryLayout *entry = directory_entry(tag), before;
+		uint32 cursor = 0;
+		const char *reason = NULL;
+
+		UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+		UT_ASSERT_EQ(cluster_pcm_lock_ko_local_relation_discard_v4(object_drop_locator,
+			17, 128, &cursor), CLUSTER_PCM_PI_RELATION_EMPTY);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->master_state), PCM_STATE_N);
+		UT_ASSERT_EQ(entry->x_holder_node, -1);
+		UT_ASSERT_EQ(entry->local_pi_first.source_flags, 0);
+		UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, &reason), CLUSTER_NORMAL_STOP_INVALID);
+		UT_ASSERT_EQ(scan_directory(), 0);
+		UT_ASSERT(directory_entry(tag) != NULL);
+		object_origin_discard = false;
+		object_drop_retired = true; /* Explicit immutable KO/no-I/O proof boundary. */
+		before = *entry;
+		UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, &reason), CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_STR_EQ(reason, "PCM_OBJECT_RETIRE_PENDING");
+		UT_ASSERT(memcmp(entry, &before, sizeof(before)) == 0);
+		UT_ASSERT_EQ(scan_directory(), 0);
+		UT_ASSERT(directory_entry(tag) == NULL);
+		UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, &reason), CLUSTER_NORMAL_STOP_READY);
+		UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	}
+}
+
+UT_TEST(test_pcm_stop_first_refusal_keeps_original_locked_identity)
+{
+	BufferTag tag = drop_settled_master_fixture(true);
+	PcmNormalStopRefusalV1 first, after;
+	struct StopPcmEntryLayout *entry = directory_entry(tag);
+	uint32 cursor = 0;
+
+	memset(&first, 0x55, sizeof(first)); after = first;
+	UT_ASSERT(!cluster_pcm_normal_stop_first_refusal_v1(&first));
+	UT_ASSERT(memcmp(&first, &after, sizeof(first)) == 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_ko_local_relation_discard_v4(object_drop_locator,
+		17, 128, &cursor), CLUSTER_PCM_PI_RELATION_EMPTY);
+	UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT(cluster_pcm_normal_stop_first_refusal_v1(&first));
+	UT_ASSERT_EQ(first.code, 218); /* Exact original SETTLED/no-cover predicate. */
+	UT_ASSERT(first.source_line != 0);
+	UT_ASSERT(BufferTagsEqual(&first.tag, &tag));
+	UT_ASSERT_EQ(first.binding, entry->binding_generation);
+	UT_ASSERT_EQ(first.slot, entry->registry_slot);
+	UT_ASSERT_EQ(first.mode, PCM_STATE_N);
+	UT_ASSERT_EQ(first.x_holder, -1);
+	UT_ASSERT_EQ(first.pi_holders, 0);
+	UT_ASSERT_EQ(first.pins | first.waits | first.transport | first.send_pending, 0);
+	UT_ASSERT_EQ(first.tombstone_valid, 1);
+	UT_ASSERT_EQ(first.tombstone_node, 3);
+	UT_ASSERT_EQ(first.tombstone_phase, RESOURCE_X_MASTER_SETTLED);
+	UT_ASSERT_EQ(first.request_node, 3);
+	UT_ASSERT_EQ(first.request_phase, RESOURCE_X_MASTER_SETTLED);
+	pg_atomic_write_u32(&entry->lifecycle, UINT32_MAX);
+	UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT(cluster_pcm_normal_stop_first_refusal_v1(&after));
+	UT_ASSERT(memcmp(&first, &after, sizeof(first)) == 0);
+	UT_ASSERT(!cluster_pcm_normal_stop_first_refusal_v1(NULL));
+}
+
+UT_TEST(test_object_retire_pending_never_hides_another_invalid_entry_or_registry)
+{
+	for (unsigned orphan = 0; orphan < 2; orphan++) {
+		BufferTag tag = drop_settled_master_fixture(true), other = tag;
+		struct StopPcmEntryLayout *entry = directory_entry(tag), before;
+		PcmNormalStopRefusalV1 first = {0};
+		uint32 cursor = 0;
+		const char *reason = NULL;
+		bool found = false;
+
+		UT_ASSERT_EQ(cluster_pcm_lock_ko_local_relation_discard_v4(object_drop_locator,
+			17, 128, &cursor), CLUSTER_PCM_PI_RELATION_EMPTY);
+		object_origin_discard = false;
+		object_drop_retired = true;
+		before = *entry;
+		UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, &reason), CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_STR_EQ(reason, "PCM_OBJECT_RETIRE_PENDING");
+		other.relNumber++;
+		UT_ASSERT(cluster_gcs_block_master_rebuild_from_redeclare(
+			other, PCM_STATE_N, 80, 90, 0, 7));
+		/* The fake hash visits the proven dead entry first. The independent
+		 * refusal must survive both the entry and reverse-registry scans. */
+		if (orphan)
+			(void)hash_search((HTAB *)&fake_pcm_htab_token, &other, HASH_REMOVE, &found);
+		else
+			pg_atomic_write_u32(&directory_entry(other)->lifecycle, UINT32_MAX);
+		if (orphan)
+			UT_ASSERT(found);
+		UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, &reason), CLUSTER_NORMAL_STOP_INVALID);
+		UT_ASSERT(memcmp(entry, &before, sizeof(before)) == 0);
+		UT_ASSERT(directory_entry(tag) != NULL);
+		UT_ASSERT(cluster_pcm_normal_stop_first_refusal_v1(&first));
+		UT_ASSERT_EQ(first.code, 218);
+		UT_ASSERT(BufferTagsEqual(&first.tag, &tag));
+		UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	}
+}
+
+UT_TEST(test_settled_object_retirement_keeps_every_unqualified_responsibility)
+{
+	for (unsigned fault = 0; fault < 12; fault++) {
+		BufferTag tag = drop_settled_master_fixture(true);
+		struct StopPcmEntryLayout *entry = directory_entry(tag), before;
+		uint32 cursor = 0;
+		UT_ASSERT_EQ(cluster_pcm_lock_ko_local_relation_discard_v4(object_drop_locator,
+			17, 128, &cursor), CLUSTER_PCM_PI_RELATION_EMPTY);
+		object_origin_discard = false;
+		object_drop_retired = true;
+		switch (fault) {
+		case 0: object_drop_retired = false; break; /* Includes entered-I/O not closed. */
+		case 1: object_drop_locator.relNumber++; break;
+		case 2: entry->binding_generation++; break;
+		case 3: pg_atomic_write_u32(&entry->pin_count, 1); break;
+		case 4: pg_atomic_write_u32(&entry->wait_refcount, 1); break;
+		case 5: pg_atomic_write_u32(&entry->transport_refcount, 1); break;
+		case 6: entry->resource_x_local_owner.state = UINT8_MAX; break;
+		case 7: entry->resource_x_bootstrap_round.send.pending = 1; break;
+		case 8: entry->s_holder_refcount_local = 1; break;
+		case 9: entry->pending_x_requester_node = 1; break;
+		case 10:
+			pg_atomic_write_u32(&entry->master_state, PCM_STATE_X);
+			entry->x_holder_node = 3;
+			break;
+		case 11: entry->resource_x_bootstrap_round.phase = UINT8_C(5) /* Original private FAILED_CLOSED phase, not the public action. */; break;
+		}
+		before = *entry;
+		UT_ASSERT(stop_pcm_poll(false, NULL, NULL, NULL) != CLUSTER_NORMAL_STOP_READY);
+		UT_ASSERT_EQ(scan_directory(), 0);
+		UT_ASSERT(directory_entry(tag) != NULL);
+		UT_ASSERT(memcmp(entry, &before, sizeof(before)) == 0);
+		UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	}
+}
+UT_TEST(test_pcm_stop_refusal_distinguishes_original_protocol_and_outer_guards)
+{
+	const uint32 codes[] = {101, 102, 104, 105, 105, 302};
+	for (unsigned fault = 0; fault < lengthof(codes); fault++) {
+		BufferTag tag = drop_settled_master_fixture(true);
+		struct StopPcmEntryLayout *entry = directory_entry(tag);
+		PcmNormalStopRefusalV1 first;
+		uint32 cursor = 0;
+		UT_ASSERT_EQ(cluster_pcm_lock_ko_local_relation_discard_v4(object_drop_locator,
+			17, 128, &cursor), CLUSTER_PCM_PI_RELATION_EMPTY);
+		switch (fault) {
+		case 0: pg_atomic_write_u32(&entry->lifecycle, UINT32_MAX); break;
+		case 1: entry->resource_x_local_owner.state = UINT8_MAX; break;
+		case 2: entry->resource_x_bootstrap_round.phase = UINT8_MAX; break;
+		case 3: entry->binding_generation = 0; break;
+		case 4: entry->registry_slot = UINT32_MAX; break;
+		case 5: entry->resource_x_bootstrap_round.phase = UINT8_C(5) /* Original private FAILED_CLOSED phase, not the public action. */; break;
+		}
+		UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+		UT_ASSERT(cluster_pcm_normal_stop_first_refusal_v1(&first));
+		UT_ASSERT_EQ(first.code, codes[fault]);
+		UT_ASSERT_EQ(first.binding, entry->binding_generation);
+		UT_ASSERT_EQ(first.slot, entry->registry_slot);
+		UT_ASSERT(BufferTagsEqual(&first.tag, &tag));
+		UT_ASSERT_EQ(first.owner_state, entry->resource_x_local_owner.state);
+		UT_ASSERT_EQ(first.round_phase, entry->resource_x_bootstrap_round.phase);
+		UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(38);
+	UT_RUN(test_object_retire_pending_never_hides_another_invalid_entry_or_registry);
+	UT_RUN(test_settled_object_retirement_keeps_every_unqualified_responsibility);
+	UT_RUN(test_pcm_stop_refusal_distinguishes_original_protocol_and_outer_guards);
+	UT_RUN(test_pcm_stop_first_refusal_keeps_original_locked_identity);
+	UT_RUN(test_real_settled_local_drop_stays_pending_until_original_am03_retirement);
 	UT_RUN(test_origin_discard_scope_does_not_retire_master_directory);
 	UT_RUN(test_terminal_drop_ends_directory_pi_without_data_or_ack);
 	UT_RUN(test_original_bounded_reclaim_retires_terminal_watermark_and_pi);

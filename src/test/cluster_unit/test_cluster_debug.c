@@ -1349,6 +1349,22 @@ cluster_pcm_grd_protocol_debt_snapshot(PcmGrdProtocolDebtStats *out)
 }
 
 bool
+cluster_pcm_normal_stop_first_refusal_v1(PcmNormalStopRefusalV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->code = 218;
+	out->source_line = 777;
+	out->binding = 29;
+	out->slot = 1187;
+	out->x_holder = -1;
+	out->request_node = out->tombstone_node = 3;
+	out->tombstone_valid = 1;
+	out->tombstone_phase = RESOURCE_X_MASTER_SETTLED;
+	out->tag = (BufferTag){.spcOid=1663, .dbOid=5, .relNumber=16385, .forkNum=0, .blockNum=0};
+	return true;
+}
+
+bool
 cluster_pcm_lock_resource_x_gate_snapshot(ResourceXGateSnapshot *snapshot_out)
 {
 	memset(snapshot_out, 0, sizeof(*snapshot_out));
@@ -5584,6 +5600,26 @@ UT_TEST(test_debug_dump_exposes_exact_current_protocol_debt_gauges)
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_invalid_debt_count"), "19");
 }
 
+UT_TEST(test_debug_dump_exposes_pcm_first_refusal_identity_and_subpredicate)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	const char *const keys[] = {"normal_stop_first_code", "normal_stop_first_source_line",
+		"normal_stop_first_tag", "normal_stop_first_binding", "normal_stop_first_slot",
+		"normal_stop_first_x_holder", "normal_stop_first_tombstone_node"};
+	const char *const values[] = {"218", "777", "1663/5/16385/0/0", "29", "1187", "-1", "3"};
+	memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+	memset(&rsinfo, 0, sizeof(rsinfo));
+	captured_dump_row_count = captured_formatted_value_count = 0;
+	fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+	(void)cluster_dump_state(fcinfo);
+	for (unsigned i = 0; i < lengthof(keys); i++) {
+		UT_ASSERT_EQ(captured_dump_count("pcm", keys[i]), 1);
+		if (captured_dump_count("pcm", keys[i]) == 1)
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", keys[i]), values[i]);
+	}
+}
+
 UT_TEST(test_debug_dump_exposes_origin_discard_reason_counters)
 {
 	LOCAL_FCINFO(fcinfo, 0);
@@ -6275,7 +6311,8 @@ UT_TEST(test_debug_phase_symbol_present)
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(24);
+	UT_RUN(test_debug_dump_exposes_pcm_first_refusal_identity_and_subpredicate);
 	UT_RUN(test_debug_dump_normal_completion_never_fabricates_unready_proof);
 	UT_RUN(test_debug_dump_srf_linkable);
 	UT_RUN(test_debug_dump_omits_retired_legacy_pcm_x_compatibility_keys);

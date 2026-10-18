@@ -2102,6 +2102,48 @@ dump_pcm(ReturnSetInfo *rsinfo)
 			 fmt_uint64(protocol_debt.evicting_entry_count));
 	emit_row(rsinfo, "pcm", "resource_x_invalid_debt_count",
 			 fmt_uint64(protocol_debt.invalid_entry_count));
+	{
+		PcmNormalStopRefusalV1 f;
+		if (cluster_pcm_normal_stop_first_refusal_v1(&f)) {
+#define PCM_STOP_FIELD(field) \
+		emit_row(rsinfo, "pcm", "normal_stop_first_" #field, fmt_uint64(f.field))
+			PCM_STOP_FIELD(code); PCM_STOP_FIELD(source_line); PCM_STOP_FIELD(captured_pg_us);
+			PCM_STOP_FIELD(slot); PCM_STOP_FIELD(binding); PCM_STOP_FIELD(registry_state);
+			PCM_STOP_FIELD(registry_reserved); PCM_STOP_FIELD(registry_binding);
+			PCM_STOP_FIELD(state_binding); PCM_STOP_FIELD(lifecycle); PCM_STOP_FIELD(gate);
+			PCM_STOP_FIELD(formation); PCM_STOP_FIELD(gate_formation); PCM_STOP_FIELD(authority);
+			PCM_STOP_FIELD(pins); PCM_STOP_FIELD(waits); PCM_STOP_FIELD(transport);
+			PCM_STOP_FIELD(mode); PCM_STOP_FIELD(s_holders); PCM_STOP_FIELD(pi_holders);
+			PCM_STOP_FIELD(local_refs); PCM_STOP_FIELD(master_holder); PCM_STOP_FIELD(owner_state);
+			PCM_STOP_FIELD(pending_x_lsn); PCM_STOP_FIELD(convert);
+			PCM_STOP_FIELD(owner_buffer); PCM_STOP_FIELD(owner_generation); PCM_STOP_FIELD(round_phase);
+			PCM_STOP_FIELD(send_pending); PCM_STOP_FIELD(attempt); PCM_STOP_FIELD(round_formation);
+			PCM_STOP_FIELD(round_master_session); PCM_STOP_FIELD(delivery_sequence);
+			PCM_STOP_FIELD(local_pi_first); PCM_STOP_FIELD(local_pi_last);
+			PCM_STOP_FIELD(pi_lsn); PCM_STOP_FIELD(pi_scn); PCM_STOP_FIELD(request_phase);
+			PCM_STOP_FIELD(tombstone_valid); PCM_STOP_FIELD(tombstone_phase);
+			PCM_STOP_FIELD(request_formation); PCM_STOP_FIELD(request_session); PCM_STOP_FIELD(assertion);
+			PCM_STOP_FIELD(base); PCM_STOP_FIELD(final_authority); PCM_STOP_FIELD(requester_connection);
+			PCM_STOP_FIELD(requester_target); PCM_STOP_FIELD(sender_connection);
+			PCM_STOP_FIELD(holder_status); PCM_STOP_FIELD(holder_image); PCM_STOP_FIELD(grant);
+			PCM_STOP_FIELD(requester_settlement); PCM_STOP_FIELD(requester_join_grant);
+			PCM_STOP_FIELD(requester_join_image); PCM_STOP_FIELD(deferred);
+			PCM_STOP_FIELD(retry_pending); PCM_STOP_FIELD(retry_running);
+			PCM_STOP_FIELD(source_settlement); PCM_STOP_FIELD(priority);
+#undef PCM_STOP_FIELD
+#define PCM_STOP_SIGNED(field) \
+		emit_row(rsinfo, "pcm", "normal_stop_first_" #field, psprintf("%d", f.field))
+			PCM_STOP_SIGNED(pid); PCM_STOP_SIGNED(node); PCM_STOP_SIGNED(request_node);
+			PCM_STOP_SIGNED(x_holder); PCM_STOP_SIGNED(tombstone_node);
+			PCM_STOP_SIGNED(pending_x);
+#undef PCM_STOP_SIGNED
+			emit_row(rsinfo, "pcm", "normal_stop_first_tag", psprintf("%u/%u/%u/%d/%u",
+				f.tag.spcOid, f.tag.dbOid, f.tag.relNumber, f.tag.forkNum, f.tag.blockNum));
+			emit_row(rsinfo, "pcm", "normal_stop_first_registry_tag", psprintf("%u/%u/%u/%d/%u",
+				f.registry_tag.spcOid, f.registry_tag.dbOid, f.registry_tag.relNumber,
+				f.registry_tag.forkNum, f.registry_tag.blockNum));
+		}
+	}
 	for (refusal = PCM_RETIRE_REFUSAL_GATE_NOT_OPEN; refusal < PCM_RETIRE_REFUSAL_N; refusal++)
 		emit_row(rsinfo, "pcm", reclaim_refusal_keys[refusal],
 				 fmt_uint64(lifecycle.reclaim_refused[refusal]));
