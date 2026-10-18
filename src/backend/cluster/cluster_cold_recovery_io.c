@@ -426,7 +426,7 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 ClusterColdDetailV1
 cluster_cold_scan_input_v1(ClusterColdPlanV1 *plan, uint32 participant, ClusterWalInputsV1 *inputs,
 						   uint32 index, bool space_active, bool foreign,
-						   ClusterColdScanResultV1 *result)
+						   RfSideOnlinePlanV1 *side_plan, ClusterColdScanResultV1 *result)
 {
 	const ClusterWalInputV1 *input;
 	ColdScanWork *work;
@@ -441,6 +441,9 @@ cluster_cold_scan_input_v1(ClusterColdPlanV1 *plan, uint32 participant, ClusterW
 		return CLUSTER_COLD_INVALID_ARGUMENT;
 	work = cold_scan_work(plan, participant, &input->checkpoint.identity, space_active, foreign,
 						  result);
+	work->side_plan = side_plan;
+	work->source_thread = input->checkpoint.identity.origin_thread_id;
+	work->timeline = input->checkpoint.checkpoint_tli;
 	memset(&observed, 0, sizeof(observed));
 	visit = cluster_wal_inputs_visit_retained_v1(inputs, index, cold_scan_visit, work, &observed);
 	return cold_scan_finish(work, visit, &observed, input->checkpoint.validated_tail_lsn_exclusive);

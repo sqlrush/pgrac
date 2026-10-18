@@ -300,7 +300,7 @@ struct RfSideOnlinePlanV1 {
 	uint32 operation_count;
 	RfSideOnlineOperationV1 operations[4];
 };
-static RfSideOnlinePlanV1 side_fixture[NROOTS];
+static RfSideOnlinePlanV1 side_fixture[CLUSTER_COLD_MAX_PARTICIPANTS];
 static int side_creates, side_seals, side_destroys, side_fault;
 static Size side_budget_total;
 
@@ -317,7 +317,9 @@ rf_side_online_plan_create_v1(const RfSideOnlinePlanRequestV1 *request, RfSideOn
 			  && request->memory_budget <= RF_SIDE_ONLINE_PLAN_MAX_BYTES);
 	if (side_fault == 1 && side_creates == 1)
 		return RF_PAGE_PROOF_DETAIL_CAPACITY;
-	UT_ASSERT(side_creates < NROOTS);
+	if (side_fault == 9 && side_creates == NROOTS)
+		return RF_PAGE_PROOF_DETAIL_CAPACITY;
+	UT_ASSERT(side_creates < CLUSTER_COLD_MAX_PARTICIPANTS);
 	*out = &side_fixture[side_creates++];
 	(*out)->cut = request->physical_cuts[0];
 	(*out)->redo = request->redo_starts[0];
@@ -344,9 +346,11 @@ bool
 rf_side_online_plan_bind_database_v1(RfSideOnlinePlanV1 *plan, uint64 database)
 {
 	UT_ASSERT_EQ(database, 5);
-	UT_ASSERT_EQ(side_creates, NROOTS);
+	UT_ASSERT(side_creates >= NROOTS);
 	UT_ASSERT_EQ(census_releases, 1);
 	if (side_fault == 2 && plan == &side_fixture[1])
+		return false;
+	if (side_fault == 13 && plan == &side_fixture[NROOTS])
 		return false;
 	plan->bound = true;
 	return true;
@@ -355,11 +359,18 @@ rf_side_online_plan_bind_database_v1(RfSideOnlinePlanV1 *plan, uint64 database)
 RfPageProofDetailV1
 rf_side_online_plan_seal_v1(RfSideOnlinePlanV1 *plan)
 {
-	UT_ASSERT(plan->bound && plan->captured == 2);
+	UT_ASSERT(plan->bound
+			  && plan->captured == (plan->cut.scan_end_exclusive == plan->redo ? 1 : 2));
 	if (side_fault == 3 && plan == &side_fixture[1])
 		return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
 	if (side_fault == 7 && plan == &side_fixture[0])
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	if (plan == &side_fixture[NROOTS]) {
+		if (side_fault == 11)
+			return RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED;
+		if (side_fault == 14)
+			return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
+	}
 	plan->sealed = true;
 	side_seals++;
 	/* A later source cannot hide drift of the first original ROOT. */
@@ -720,7 +731,7 @@ cluster_cold_census_cover_v1(const ClusterColdCensusEntryV1 *entries, uint32 cou
 ClusterColdDetailV1
 cluster_cold_scan_input_v1(ClusterColdPlanV1 *plan, uint32 participant, ClusterWalInputsV1 *inputs,
 						   uint32 index, bool space_active, bool foreign,
-						   ClusterColdScanResultV1 *result)
+						   RfSideOnlinePlanV1 *side_plan, ClusterColdScanResultV1 *result)
 {
 	const ClusterColdCensusEntryV1 *entry = NULL;
 	ClusterColdRecordV1 record;
@@ -740,6 +751,17 @@ cluster_cold_scan_input_v1(ClusterColdPlanV1 *plan, uint32 participant, ClusterW
 	record.end_rec_ptr = entry->cut.tail_end;
 	record.prev_rec_ptr = 0x10;
 	result->records = 1;
+	if (side_plan != NULL) {
+		UT_ASSERT_EQ(side_plan->cut.failed_thread, entry->cut.thread_id);
+		UT_ASSERT_EQ(side_plan->cut.origin_owner_incarnation, entry->cut.owner_incarnation);
+		side_plan->captured = 1;
+		if (side_fault == 10) {
+			result->side_capture_detail = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			result->side_capture_read_rec_ptr = record.read_rec_ptr;
+		}
+		if (side_fault == 12)
+			return CLUSTER_COLD_CAPACITY;
+	}
 	return cluster_cold_plan_feed_v1(plan, participant, &record);
 }
 

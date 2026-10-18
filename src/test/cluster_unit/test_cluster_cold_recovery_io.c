@@ -676,7 +676,7 @@ UT_TEST(test_scan_input_proves_the_cut)
 	generation(2, 12, false, CLOSED, 0x1000, 0x1300, 0x1300);
 	scan_reset();
 	plan = scan_plan();
-	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 1, false, true, &result),
+	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 1, false, true, NULL, &result),
 				 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(retained_index_seen, 1);
 	UT_ASSERT_EQ(result.records, 2);
@@ -689,7 +689,7 @@ UT_TEST(test_scan_input_proves_the_cut)
 	scan_reset();
 	plan = scan_plan();
 	retained_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 1, false, true, &result),
+	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 1, false, true, NULL, &result),
 				 CLUSTER_COLD_SOURCE_GAP);
 	cluster_cold_plan_destroy_v1(&plan);
 	retained_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
@@ -697,7 +697,7 @@ UT_TEST(test_scan_input_proves_the_cut)
 	scan_reset();
 	plan = scan_plan();
 	observed_end = 0x1200;
-	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 1, false, true, &result),
+	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 1, false, true, NULL, &result),
 				 CLUSTER_COLD_SOURCE_GAP);
 	cluster_cold_plan_destroy_v1(&plan);
 
@@ -705,15 +705,57 @@ UT_TEST(test_scan_input_proves_the_cut)
 	scan_reset();
 	plan = scan_plan();
 	terminal(3, 0);
-	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 7, false, true, &result),
+	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 7, false, true, NULL, &result),
 				 CLUSTER_COLD_INVALID_ARGUMENT);
-	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 2, false, true, &result),
+	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 2, false, true, NULL, &result),
 				 CLUSTER_COLD_INVALID_ARGUMENT);
-	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, NULL, 1, false, true, &result),
+	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, NULL, 1, false, true, NULL, &result),
 				 CLUSTER_COLD_INVALID_ARGUMENT);
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
+
+UT_TEST(test_history_scan_captures_its_original_source_and_whole_refusal)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		ClusterColdScanResultV1 result;
+		ClusterColdPlanV1 *plan;
+		ClusterColdDetailV1 detail;
+		scope_reset();
+		generation(2, 12, false, CLOSED, 0x1000, 0x1300, 0x1300);
+		scope_inputs[0].checkpoint.checkpoint_tli = 7;
+		scan_reset();
+		side_capture_calls = 0;
+		side_capture_fail_at = fault == 1 || fault == 2 ? 1 : 0;
+		side_capture_refusal
+			= fault == 1 ? RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE : RF_PAGE_PROOF_DETAIL_CAPACITY;
+		if (fault == 3)
+			observed_end++;
+		if (fault == 4)
+			retained_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		plan = scan_plan();
+		detail = cluster_cold_scan_input_v1(plan, 0, SCOPE, 0, false, true,
+											(RfSideOnlinePlanV1 *)&side_capture_token, &result);
+		UT_ASSERT_EQ(retained_index_seen, 0);
+		UT_ASSERT_EQ(side_capture_calls, fault == 1 || fault == 2 ? 1 : 2);
+		UT_ASSERT_EQ(captured_identity[0].record.system_identifier, 77);
+		UT_ASSERT_EQ(captured_identity[0].record.storage_uuid[15], 5);
+		UT_ASSERT_EQ(captured_identity[0].record.origin_thread, 2);
+		UT_ASSERT_EQ(captured_identity[0].record.timeline_id, 7);
+		UT_ASSERT_EQ(captured_identity[0].record.read_rec_ptr, 0x1000);
+		UT_ASSERT_EQ(captured_identity[0].record.end_rec_ptr, 0x1100);
+		UT_ASSERT_EQ(captured_identity[0].record.record_crc, 0x9876);
+		UT_ASSERT_EQ(detail, fault < 2	  ? CLUSTER_COLD_OK
+							 : fault == 2 ? CLUSTER_COLD_CAPACITY
+										  : CLUSTER_COLD_SOURCE_GAP);
+		if (fault == 1) {
+			UT_ASSERT_EQ(result.records, 2);
+			UT_ASSERT_EQ(result.side_capture_detail, RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+			UT_ASSERT_EQ(result.side_capture_read_rec_ptr, 0x1000);
+		}
+		cluster_cold_plan_destroy_v1(&plan);
+	}
+}
 
 UT_TEST(test_root_scan_captures_original_identity_and_refuses_side_failure)
 {
@@ -775,7 +817,8 @@ UT_TEST(test_root_scan_captures_original_identity_and_refuses_side_failure)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
+	UT_RUN(test_history_scan_captures_its_original_source_and_whole_refusal);
 	UT_RUN(test_root_scan_captures_original_identity_and_refuses_side_failure);
 	UT_RUN(test_observe_absent_and_present);
 	UT_RUN(test_observe_identity_overlay);

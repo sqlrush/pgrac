@@ -469,8 +469,9 @@ cold_scan_history(ClusterColdTypedV1 *typed)
 
 	for (i = typed->replay_count; i < typed->participant_count; i++) {
 		ClusterColdScanResultV1 scan;
-		ClusterColdDetailV1 detail = cluster_cold_scan_input_v1(
-			typed->plan, i, typed->inputs, typed->input_index[i], false, true, &scan);
+		ClusterColdDetailV1 detail
+			= cluster_cold_scan_input_v1(typed->plan, i, typed->inputs, typed->input_index[i],
+										 false, true, typed->side_plans[i], &scan);
 
 		typed->scanned_records += scan.records;
 		if (detail != CLUSTER_COLD_OK) {
@@ -479,6 +480,11 @@ cold_scan_history(ClusterColdTypedV1 *typed)
 						cold_detail_name(detail), (unsigned)typed->participants[i].thread_id,
 						LSN_FORMAT_ARGS(scan.failed_read_rec_ptr), scan.root_result);
 			return false;
+		}
+		if (scan.side_capture_detail != 0) {
+			typed->side_capture_detail[i] = scan.side_capture_detail;
+			typed->side_capture_read_rec_ptr[i] = scan.side_capture_read_rec_ptr;
+			rf_side_online_plan_destroy_v1(&typed->side_plans[i]);
 		}
 	}
 	result = cluster_wal_inputs_revalidate_v1(typed->inputs);
@@ -506,9 +512,9 @@ static Size
 cold_side_budget(const ClusterColdTypedV1 *typed)
 {
 	Size total = (Size)cluster_cold_recovery_plan_memory * 1024;
-	return typed->replay_count == 0
+	return typed->participant_count == 0
 			   ? 0
-			   : Min((Size)RF_SIDE_ONLINE_PLAN_MAX_BYTES, total / 2 / typed->replay_count);
+			   : Min((Size)RF_SIDE_ONLINE_PLAN_MAX_BYTES, total / 2 / typed->participant_count);
 }
 
 static void
@@ -521,7 +527,7 @@ cold_side_destroy(ClusterColdTypedV1 *typed)
 static bool
 cold_side_create(ClusterColdTypedV1 *typed)
 {
-	for (uint32 i = 0; i < typed->replay_count; i++) {
+	for (uint32 i = 0; i < typed->participant_count; i++) {
 		const ClusterColdParticipantV1 *participant = &typed->participants[i];
 		RfContributorStreamCutV1 cut = { 0 };
 		RfSideOnlinePlanRequestV1 request = { 0 };
@@ -626,7 +632,7 @@ cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots,
 		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "SIDE capture source changed before seal");
 		return false;
 	}
-	for (uint32 i = 0; i < typed->replay_count; i++) {
+	for (uint32 i = 0; i < typed->participant_count; i++) {
 		RfPageProofDetailV1 side_detail;
 		if (typed->side_plans[i] == NULL)
 			continue;
@@ -683,7 +689,7 @@ cluster_cold_typed_prepare_v1(ClusterRecoveryFencePlan *fence, uint16 own_thread
 	typed->system_identifier = roots[0].root.identity.system_identifier;
 	detail = cluster_cold_plan_create_v1(typed->participants, typed->participant_count,
 										 (Size)cluster_cold_recovery_plan_memory * 1024
-											 - cold_side_budget(typed) * typed->replay_count
+											 - cold_side_budget(typed) * typed->participant_count
 											 - cold_tt_budget(),
 										 &typed->plan);
 	if (detail != CLUSTER_COLD_OK) {

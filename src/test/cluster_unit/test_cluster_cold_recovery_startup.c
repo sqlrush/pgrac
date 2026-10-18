@@ -37,6 +37,7 @@
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cold_recovery_census.h"
+#include "cluster/cluster_cold_recovery_plan_internal.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_page_cold_redo.h"
 #include "storage/checksum.h"
@@ -907,17 +908,18 @@ UT_TEST(test_source_barrier_error_does_not_leave_success)
 }
 
 
-UT_TEST(test_side_capture_bound_to_each_original_replay_source)
+UT_TEST(test_side_capture_bound_to_each_original_source)
 {
 	ClusterColdTypedV1 *typed;
+	RfSideOnlinePlanV1 *history;
 	Size total_budget = (Size)cluster_cold_recovery_plan_memory * 1024;
 
 	fixture();
 	history_generation(2, 9, 0x40, 0x80);
 	typed = prepare(0x800);
 	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
-	UT_ASSERT_EQ(side_creates, NROOTS);
-	UT_ASSERT_EQ(side_seals, NROOTS);
+	UT_ASSERT_EQ(side_creates, NROOTS + 1);
+	UT_ASSERT_EQ(side_seals, NROOTS + 1);
 	UT_ASSERT(side_budget_total <= total_budget / 2);
 	for (uint32 i = 0; i < NROOTS; i++) {
 		RfSideOnlinePlanV1 *plan = typed->side_plans[i];
@@ -937,10 +939,26 @@ UT_TEST(test_side_capture_bound_to_each_original_replay_source)
 						 typed->participant_count * sizeof(typed->sources[0]))
 				  == 0);
 	}
-	UT_ASSERT_NULL(typed->side_plans[3]);
+	history = typed->side_plans[NROOTS];
+	UT_ASSERT_NOT_NULL(history);
+	if (history != NULL) {
+		UT_ASSERT(history->sealed && history->bound);
+		UT_ASSERT_EQ(history->cut.failed_thread, 2);
+		UT_ASSERT_EQ(history->cut.origin_owner_incarnation, 9);
+		UT_ASSERT_EQ(history->cut.scan_begin_inclusive, 0x40);
+		UT_ASSERT_EQ(history->cut.scan_end_exclusive, 0x80);
+		/* Retained history remains outside the pass-2 replay window. */
+		UT_ASSERT_EQ(history->redo, history->cut.scan_end_exclusive);
+		UT_ASSERT_EQ(history->captured, 1);
+		UT_ASSERT_EQ(history->source_count, typed->participant_count);
+		UT_ASSERT(memcmp(history->sources, typed->sources,
+						 typed->participant_count * sizeof(typed->sources[0]))
+				  == 0);
+	}
+	UT_ASSERT_EQ(typed->replay_count, NROOTS);
 	UT_ASSERT_EQ(history_scans, 1);
 	cluster_cold_typed_destroy_v1(&typed);
-	UT_ASSERT_EQ(side_destroys, NROOTS);
+	UT_ASSERT_EQ(side_destroys, NROOTS + 1);
 }
 
 UT_TEST(test_side_capture_source_bind_failure_stops_before_scan)
@@ -957,6 +975,38 @@ UT_TEST(test_side_capture_source_bind_failure_stops_before_scan)
 		UT_ASSERT_NULL(typed->side_plans[i]);
 	UT_ASSERT_EQ(side_destroys, side_creates);
 	cluster_cold_typed_destroy_v1(&typed);
+}
+
+UT_TEST(test_history_side_capture_refusals_keep_original_boundaries)
+{
+	for (int fault = 9; fault <= 14; fault++) {
+		ClusterColdTypedV1 *typed;
+		fixture();
+		history_generation(2, 9, 0x40, 0x80);
+		side_fault = fault;
+		typed = prepare(0x800);
+		if (fault == 10 || fault == 11) {
+			/* Original history remains accepted, but no partial SIDE input. */
+			UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+			UT_ASSERT_NULL(typed->side_plans[NROOTS]);
+			UT_ASSERT_EQ(typed->side_capture_detail[NROOTS],
+						 fault == 10 ? RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE
+									 : RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED);
+			UT_ASSERT_EQ(typed->side_capture_read_rec_ptr[NROOTS],
+						 fault == 10 ? 0x40 : InvalidXLogRecPtr);
+			UT_ASSERT_EQ(side_seals, NROOTS);
+			UT_ASSERT_EQ(typed->replay_count, NROOTS);
+		} else {
+			UT_ASSERT_NE(typed->refusal, CLUSTER_COLD_OK);
+			for (uint32 i = 0; i < CLUSTER_COLD_MAX_PARTICIPANTS; i++)
+				UT_ASSERT_NULL(typed->side_plans[i]);
+			if (fault == 9)
+				UT_ASSERT_EQ(typed->scanned_records, 0);
+		}
+		cluster_cold_typed_destroy_v1(&typed);
+		UT_ASSERT_EQ(census_releases, 1);
+		UT_ASSERT_EQ(side_destroys, side_creates);
+	}
 }
 
 UT_TEST(test_side_capture_failure_never_exposes_a_partial_plan)
@@ -2414,6 +2464,7 @@ UT_TEST(test_tt_base_capture_includes_history_before_wal_scan)
 	UT_ASSERT_EQ(tt_base_participants, 4);
 	UT_ASSERT_EQ(tt_base_budget, total / 4);
 	UT_ASSERT(side_budget_total + tt_base_budget < total);
+	UT_ASSERT(typed->plan->memory_budget + side_budget_total + tt_base_budget <= total);
 	UT_ASSERT_EQ(tt_base_rechecks, 0);
 	cluster_cold_typed_destroy_v1(&typed);
 	UT_ASSERT_EQ(tt_base_destroys, 1);
@@ -2537,7 +2588,8 @@ UT_TEST(test_checkpoint_export_clears_unsealed_and_failed_output)
 int
 main(void)
 {
-	UT_PLAN(73);
+	UT_PLAN(74);
+	UT_RUN(test_history_side_capture_refusals_keep_original_boundaries);
 	UT_RUN(test_checkpoint_inputs_survive_census_for_every_generation);
 	UT_RUN(test_checkpoint_input_mismatch_stops_before_capture_and_scan);
 	UT_RUN(test_checkpoint_export_clears_unsealed_and_failed_output);
@@ -2584,7 +2636,7 @@ main(void)
 	UT_RUN(test_control_dispatch_error_does_not_leave_success);
 	UT_RUN(test_native_history_capture_gap_keeps_original_plan_but_no_side_authority);
 	UT_RUN(test_prepare_seals_own_and_fenced_generations);
-	UT_RUN(test_side_capture_bound_to_each_original_replay_source);
+	UT_RUN(test_side_capture_bound_to_each_original_source);
 	UT_RUN(test_side_capture_failure_never_exposes_a_partial_plan);
 	UT_RUN(test_side_capture_keeps_original_scan_and_seal_refusals);
 	UT_RUN(test_prepare_takes_history_generations_from_the_census);
