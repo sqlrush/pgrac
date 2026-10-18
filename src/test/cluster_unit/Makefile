@@ -9135,10 +9135,12 @@ test_cluster_cold_recovery_io_core.o: $(top_srcdir)/src/backend/cluster/cluster_
 
 test_cluster_cold_recovery_io test_cluster_cold_recovery_complete: %: %.c unit_test.h \
 		test_cluster_cold_recovery_io_boundary.h test_cluster_cold_recovery_io_core.o \
+		test_cluster_cold_recovery_xid_core.o \
 		$(CLUSTER_COLD_PLAN_O) cluster_unit_port_stubs.o \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_census.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< test_cluster_cold_recovery_io_core.o \
+		test_cluster_cold_recovery_xid_core.o \
 		$(CLUSTER_COLD_PLAN_O) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 test_cluster_recovery_merge_seal test_cluster_recovery_merge_complete: %: %.c unit_test.h \

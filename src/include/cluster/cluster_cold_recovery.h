@@ -692,6 +692,9 @@ extern const char *cluster_cold_refusal_hint_v1(ClusterColdDetailV1 detail);
  * caller discards it, and all captures on later whole-input failure. */
 typedef struct ClusterColdScanResultV1 {
 	uint64 records;
+	/* Read-only history checkpoint-to-tail counter input. Zero unless the
+	 * complete retained visit proves its cut; not an effect/freshness proof. */
+	ClusterColdXidProgressV1 history_xid;
 	int root_result; /* ClusterControlRootResult of the visit */
 	XLogRecPtr failed_read_rec_ptr;
 	uint8 route_detail;
@@ -779,6 +782,10 @@ typedef struct ClusterColdTypedV1 {
 	/* Provisional native counters after counted pass-2 drain. Zero means
 	 * missing; these do not prove global effects/durability or all-thread N. */
 	uint64 xid_next_at_drain[CLUSTER_COLD_MAX_PARTICIPANTS];
+	/* Read-only pass-1 inputs for history generations. Their source redo is
+	 * the original checkpoint's, not the history mutation cut at tail. No
+	 * pass-2 endpoint: final source freshness/durability still needs proof. */
+	ClusterColdXidProgressV1 history_xid[CLUSTER_COLD_MAX_PARTICIPANTS];
 	/* Per selected source, including its retained pre-redo records. Each plan
 	 * binds the complete retained source set; that does not authorize target
 	 * mutation. History-only generations keep their redo cut at the tail. */

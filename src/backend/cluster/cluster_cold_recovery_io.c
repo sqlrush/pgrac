@@ -306,6 +306,7 @@ typedef struct ColdScanWork {
 	bool foreign;
 	ClusterColdDetailV1 detail;
 	ClusterColdScanResultV1 *result;
+	ClusterColdXidProgressV1 history_xid;
 	ClusterColdDecodedV1 decoded;
 } ColdScanWork;
 
@@ -321,6 +322,19 @@ cold_scan_visit(XLogReaderState *reader, void *arg)
 	if (work->detail == CLUSTER_COLD_OK)
 		work->detail
 			= cluster_cold_plan_feed_v1(work->plan, work->participant, &work->decoded.record);
+	if (work->detail == CLUSTER_COLD_OK && work->history_xid.begun && !work->history_xid.failed) {
+		ClusterColdXidProgressV1 *xid = &work->history_xid;
+		const ClusterColdRecordV1 *record = &work->decoded.record;
+
+		/* History still grants no physical replay. Only records at the
+		 * original checkpoint's redo cut advance this read-only counter. */
+		if (record->read_rec_ptr >= xid->source.native_redo)
+			(void)cluster_cold_xid_record_v1(xid, &xid->source, record, &work->decoded.xid_input);
+		else if (record->end_rec_ptr > xid->source.native_redo) {
+			xid->failed = true;
+			xid->next_xid = 0;
+		}
+	}
 	if (work->detail == CLUSTER_COLD_OK && work->side_plan != NULL) {
 		const ClusterColdRecordV1 *record = &work->decoded.record;
 		RfPageOnlineRecordIdentityV1 identity = { 0 };
@@ -395,8 +409,49 @@ cold_scan_finish(ColdScanWork *work, ClusterControlRootResult visit,
 		&& (visit != CLUSTER_CONTROL_ROOT_OK_PRIMARY || observed->records != result->records
 			|| observed->complete_end != tail))
 		detail = CLUSTER_COLD_SOURCE_GAP;
+	if (detail == CLUSTER_COLD_OK && work->history_xid.begun && !work->history_xid.failed) {
+		ClusterColdXidProgressV1 *xid = &work->history_xid;
+		uint64 next;
+
+		/* While visiting, expected_records is only a byte-derived upper
+		 * bound. The original full retained visit above has now proved the
+		 * complete input count/cut; freeze its post-redo count, then require
+		 * the ordered fold to reach that exact tail. No effect is certified. */
+		xid->expected_records = xid->records;
+		if (cluster_cold_xid_candidate_v1(xid, &xid->source, &next))
+			result->history_xid = *xid;
+	}
 	pfree(work);
 	return detail;
+}
+
+/* Optional counter capture uses the original immutable checkpoint, not the
+ * history participant's mutation cut at tail. Missing/unsupported inputs
+ * leave no candidate without changing the original plan's acceptance. */
+static void
+cold_scan_history_xid_begin(ColdScanWork *work, const ClusterWalInputV1 *input)
+{
+	const ClusterControlRootSnapshot *root = &input->checkpoint;
+	const CheckPoint *checkpoint = &input->native_checkpoint;
+	ClusterColdParticipantV1 source = { 0 };
+
+	if (!cluster_control_root_identity_equal(&root->identity, &input->source.claim.identity)
+		|| input->source.timeline != root->checkpoint_tli
+		|| XLogRecPtrIsInvalid(input->checkpoint_start)
+		|| checkpoint->ThisTimeLineID != root->checkpoint_tli
+		|| checkpoint->redo != input->native_redo)
+		return;
+	source.thread_id = root->identity.origin_thread_id;
+	source.timeline = root->checkpoint_tli;
+	source.owner_incarnation = root->identity.origin_owner_incarnation;
+	source.physical_lower = root->checkpoint_lower_lsn;
+	source.native_redo = checkpoint->redo;
+	source.tail_end = root->validated_tail_lsn_exclusive;
+	if (source.native_redo < source.physical_lower || source.native_redo > source.tail_end)
+		return;
+	(void)cluster_cold_xid_begin_v1(&work->history_xid, &source,
+									U64FromFullTransactionId(checkpoint->nextXid),
+									source.tail_end - source.native_redo);
 }
 
 ClusterColdDetailV1
@@ -444,6 +499,7 @@ cluster_cold_scan_input_v1(ClusterColdPlanV1 *plan, uint32 participant, ClusterW
 	work->side_plan = side_plan;
 	work->source_thread = input->checkpoint.identity.origin_thread_id;
 	work->timeline = input->checkpoint.checkpoint_tli;
+	cold_scan_history_xid_begin(work, input);
 	memset(&observed, 0, sizeof(observed));
 	visit = cluster_wal_inputs_visit_retained_v1(inputs, index, cold_scan_visit, work, &observed);
 	return cold_scan_finish(work, visit, &observed, input->checkpoint.validated_tail_lsn_exclusive);

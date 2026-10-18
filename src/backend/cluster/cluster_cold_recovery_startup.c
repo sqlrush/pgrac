@@ -467,6 +467,7 @@ cold_scan_history(ClusterColdTypedV1 *typed)
 	ClusterControlRootResult result;
 	uint32 i;
 
+	memset(typed->history_xid, 0, sizeof(typed->history_xid));
 	for (i = typed->replay_count; i < typed->participant_count; i++) {
 		ClusterColdScanResultV1 scan;
 		ClusterColdDetailV1 detail
@@ -479,8 +480,10 @@ cold_scan_history(ClusterColdTypedV1 *typed)
 						"pass-1 scan refused: %s; history thread %u record %X/%X (root result %d)",
 						cold_detail_name(detail), (unsigned)typed->participants[i].thread_id,
 						LSN_FORMAT_ARGS(scan.failed_read_rec_ptr), scan.root_result);
+			memset(typed->history_xid, 0, sizeof(typed->history_xid));
 			return false;
 		}
+		typed->history_xid[i] = scan.history_xid;
 		if (scan.side_capture_detail != 0) {
 			typed->side_capture_detail[i] = scan.side_capture_detail;
 			typed->side_capture_read_rec_ptr[i] = scan.side_capture_read_rec_ptr;
@@ -493,6 +496,7 @@ cold_scan_history(ClusterColdTypedV1 *typed)
 		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
 					"participant census changed while it was scanned (root result %d)",
 					(int)result);
+		memset(typed->history_xid, 0, sizeof(typed->history_xid));
 		return false;
 	}
 	return true;

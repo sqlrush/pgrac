@@ -121,6 +121,14 @@ UT_TEST(test_prepare_takes_history_generations_from_the_census)
 	/* history only: still the three crashed generations' steps */
 	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(typed->plan), 3);
 	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(typed->plan, 3), 0);
+	UT_ASSERT(typed->history_xid[3].begun && !typed->history_xid[3].failed);
+	UT_ASSERT_EQ(typed->history_xid[3].source.thread_id, 2);
+	UT_ASSERT_EQ(typed->history_xid[3].source.owner_incarnation, 9);
+	UT_ASSERT_EQ(typed->history_xid[3].source.native_redo, 0x40);
+	UT_ASSERT_EQ(typed->history_xid[3].last_end, 0x80);
+	UT_ASSERT_EQ(typed->history_xid[3].records, 1);
+	UT_ASSERT_EQ(typed->history_xid[0].next_xid, 0);
+	UT_ASSERT_EQ(typed->xid_next_at_drain[3], 0);
 	cluster_cold_typed_destroy_v1(&typed);
 	UT_ASSERT_EQ(census_releases, 1);
 }
@@ -178,6 +186,7 @@ UT_TEST(test_prepare_refuses_what_the_census_refuses)
 	typed = prepare(0x800);
 	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
 	UT_ASSERT(strstr(typed->refusal_detail, "census changed") != NULL);
+	UT_ASSERT_EQ(typed->history_xid[3].next_xid, 0);
 	UT_ASSERT_NULL(typed->inputs);
 	UT_ASSERT_EQ(census_releases, 1);
 	cluster_cold_typed_destroy_v1(&typed);

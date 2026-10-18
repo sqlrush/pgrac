@@ -334,6 +334,7 @@ scan_reset(void)
 	observed_records_delta = 0;
 	observed_end = 0x1300;
 	memset(decode_refusal_at, 0, sizeof(decode_refusal_at));
+	memset(decode_xid_input, 0, sizeof(decode_xid_input));
 	decode_releases = 0;
 }
 
@@ -714,6 +715,166 @@ UT_TEST(test_scan_input_proves_the_cut)
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
+static ClusterWalInputV1 *
+history_counter_input(XLogRecPtr redo)
+{
+	ClusterWalInputV1 *input;
+
+	scope_reset();
+	scan_reset();
+	input = generation(2, 12, false, CLOSED, 0x1000, redo, 0x1300);
+	input->native_checkpoint.redo = redo;
+	input->native_checkpoint.ThisTimeLineID = 1;
+	input->native_checkpoint.nextXid = FullTransactionIdFromEpochAndXid(8, 100);
+	for (int i = 0; i < visit_count; i++) {
+		decode_xid_input[i].complete = true;
+		decode_xid_input[i].record_xid = 110 + i;
+		decode_xid_input[i].payload_xid = 120 + i;
+	}
+	return input;
+}
+
+static ClusterColdPlanV1 *
+history_counter_plan(void)
+{
+	ClusterColdParticipantV1 cut = { 0 };
+	ClusterColdPlanV1 *plan = NULL;
+
+	cut.thread_id = 2;
+	cut.timeline = 1;
+	cut.owner_incarnation = 12;
+	cut.physical_lower = 0x1000;
+	cut.native_redo = cut.tail_end = 0x1300;
+	UT_ASSERT_EQ(cluster_cold_plan_create_v1(&cut, 1, 1024 * 1024, &plan), CLUSTER_COLD_OK);
+	return plan;
+}
+
+UT_TEST(test_history_counter_native_seed_and_post_redo_cut)
+{
+	ClusterColdScanResultV1 result;
+	ClusterColdPlanV1 *plan = history_counter_plan();
+	uint64 next = 0;
+
+	history_counter_input(0x1100);
+	/* A larger pre-checkpoint xid must not be folded into the native seed. */
+	decode_xid_input[0].payload_xid = 1000;
+	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 0, false, true, NULL, &result),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT(
+		cluster_cold_xid_candidate_v1(&result.history_xid, &result.history_xid.source, &next));
+	UT_ASSERT_EQ(next, U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(8, 122)));
+	UT_ASSERT_EQ(result.records, 2);
+	UT_ASSERT_EQ(result.history_xid.records, 1);
+	UT_ASSERT_EQ(result.history_xid.expected_records, 1);
+	UT_ASSERT_EQ(result.history_xid.source.thread_id, 2);
+	UT_ASSERT_EQ(result.history_xid.source.owner_incarnation, 12);
+	UT_ASSERT_EQ(result.history_xid.source.native_redo, 0x1100);
+	UT_ASSERT_EQ(result.history_xid.last_end, 0x1300);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_history_counter_wrap_and_native_checkpoint_order)
+{
+	ClusterColdScanResultV1 result;
+	ClusterColdPlanV1 *plan = history_counter_plan();
+	ClusterWalInputV1 *input = history_counter_input(0x1000);
+	uint64 next;
+
+	input->native_checkpoint.nextXid = FullTransactionIdFromEpochAndXid(7, UINT32_MAX - 1);
+	decode_xid_input[0].record_xid = UINT32_MAX;
+	decode_xid_input[0].payload_xid = InvalidTransactionId;
+	decode_xid_input[1].record_xid = 4;
+	decode_xid_input[1].payload_xid = 9;
+	decode_xid_input[1].checkpoint_next_xid
+		= U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(8, 8));
+	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 0, false, true, NULL, &result),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT(
+		cluster_cold_xid_candidate_v1(&result.history_xid, &result.history_xid.source, &next));
+	UT_ASSERT_EQ(next, U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(8, 10)));
+	UT_ASSERT_EQ(result.history_xid.records, 2);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_history_counter_empty_native_cut_uses_checkpoint)
+{
+	ClusterColdScanResultV1 result;
+	ClusterColdPlanV1 *plan = history_counter_plan();
+	uint64 next;
+
+	history_counter_input(0x1300);
+	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 0, false, true, NULL, &result),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT(
+		cluster_cold_xid_candidate_v1(&result.history_xid, &result.history_xid.source, &next));
+	UT_ASSERT_EQ(next, U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(8, 100)));
+	UT_ASSERT_EQ(result.history_xid.records, 0);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_history_counter_missing_or_conflicting_inputs_stay_missing)
+{
+	for (int fault = 0; fault < 9; fault++) {
+		ClusterColdScanResultV1 result;
+		ClusterColdPlanV1 *plan = history_counter_plan();
+		ClusterWalInputV1 *input = history_counter_input(0x1100);
+		uint64 next = 99;
+
+		if (fault == 0)
+			input->native_checkpoint.nextXid = InvalidFullTransactionId;
+		if (fault == 1)
+			input->native_checkpoint.redo++;
+		if (fault == 2)
+			input->native_checkpoint.ThisTimeLineID++;
+		if (fault == 3)
+			input->checkpoint_start = InvalidXLogRecPtr;
+		if (fault == 4)
+			input->source.claim.identity.origin_owner_incarnation++;
+		if (fault == 5)
+			decode_xid_input[1].complete = false;
+		if (fault == 6)
+			input->native_redo = input->native_checkpoint.redo = 0x1080;
+		if (fault == 7)
+			input->native_redo = input->native_checkpoint.redo = 0x1400;
+		if (fault == 8)
+			input->native_redo = input->native_checkpoint.redo = 0x800;
+		UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 0, false, true, NULL, &result),
+					 CLUSTER_COLD_OK);
+		UT_ASSERT(
+			!cluster_cold_xid_candidate_v1(&result.history_xid, &result.history_xid.source, &next));
+		UT_ASSERT_EQ(next, 0);
+		UT_ASSERT_EQ(result.history_xid.next_xid, 0);
+		cluster_cold_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_history_counter_failed_whole_visit_discards_capture)
+{
+	for (int fault = 0; fault < 4; fault++) {
+		ClusterColdScanResultV1 result;
+		ClusterColdPlanV1 *plan = history_counter_plan();
+		uint64 next = 99;
+
+		history_counter_input(0x1000);
+		memset(&result, 0xa5, sizeof(result));
+		if (fault == 0)
+			retained_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		if (fault == 1)
+			observed_end--;
+		if (fault == 2)
+			observed_records_delta++;
+		if (fault == 3)
+			decode_refusal_at[1] = CLUSTER_COLD_CAPACITY;
+		UT_ASSERT(cluster_cold_scan_input_v1(plan, 0, SCOPE, 0, false, true, NULL, &result)
+				  != CLUSTER_COLD_OK);
+		UT_ASSERT(
+			!cluster_cold_xid_candidate_v1(&result.history_xid, &result.history_xid.source, &next));
+		UT_ASSERT_EQ(next, 0);
+		UT_ASSERT_EQ(result.history_xid.next_xid, 0);
+		cluster_cold_plan_destroy_v1(&plan);
+	}
+}
+
 
 UT_TEST(test_history_scan_captures_its_original_source_and_whole_refusal)
 {
@@ -817,7 +978,12 @@ UT_TEST(test_root_scan_captures_original_identity_and_refuses_side_failure)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(18);
+	UT_RUN(test_history_counter_native_seed_and_post_redo_cut);
+	UT_RUN(test_history_counter_wrap_and_native_checkpoint_order);
+	UT_RUN(test_history_counter_empty_native_cut_uses_checkpoint);
+	UT_RUN(test_history_counter_missing_or_conflicting_inputs_stay_missing);
+	UT_RUN(test_history_counter_failed_whole_visit_discards_capture);
 	UT_RUN(test_history_scan_captures_its_original_source_and_whole_refusal);
 	UT_RUN(test_root_scan_captures_original_identity_and_refuses_side_failure);
 	UT_RUN(test_observe_absent_and_present);

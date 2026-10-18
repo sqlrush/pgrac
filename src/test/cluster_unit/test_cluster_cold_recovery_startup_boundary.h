@@ -751,6 +751,14 @@ cluster_cold_scan_input_v1(ClusterColdPlanV1 *plan, uint32 participant, ClusterW
 	record.end_rec_ptr = entry->cut.tail_end;
 	record.prev_rec_ptr = 0x10;
 	result->records = 1;
+	result->history_xid.source = entry->cut;
+	result->history_xid.source.native_redo = record.read_rec_ptr;
+	result->history_xid.next_xid
+		= U64FromFullTransactionId(census_inputs[index].native_checkpoint.nextXid);
+	result->history_xid.expected_records = result->history_xid.records = 1;
+	result->history_xid.last_read = record.read_rec_ptr;
+	result->history_xid.last_end = record.end_rec_ptr;
+	result->history_xid.begun = true;
 	if (side_plan != NULL) {
 		UT_ASSERT_EQ(side_plan->cut.failed_thread, entry->cut.thread_id);
 		UT_ASSERT_EQ(side_plan->cut.origin_owner_incarnation, entry->cut.owner_incarnation);
