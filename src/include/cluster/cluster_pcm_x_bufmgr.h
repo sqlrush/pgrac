@@ -84,6 +84,15 @@ typedef struct ClusterPcmOwnSnapshot {
 	uint8 _reserved[2];
 } ClusterPcmOwnSnapshot;
 
+/* Passive stop diagnostics, sampled under the same header lock as the
+ * original stop predicate. Never a reusable permission or owner transfer. */
+typedef struct ClusterBufferStopObservation {
+	ClusterPcmOwnSnapshot own;
+	uint64 delivery;
+	uint32 state;
+	int wait_backend_pgprocno;
+} ClusterBufferStopObservation;
+
 /* Local descriptor residency only.  The Resource-X entry owns the attempt
  * binding; these wrappers prove tag/generation under the header lock. */
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_delivery_hold_begin_exact(

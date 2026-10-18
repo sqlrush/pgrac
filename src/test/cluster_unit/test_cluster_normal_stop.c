@@ -418,6 +418,16 @@ cluster_bufmgr_normal_stop_local_checkpoint_poll(BufferTag *tag, int *buffer, co
 }
 
 ClusterNormalStopPollResult
+cluster_bufmgr_normal_stop_observed(bool post, bool require_pi_retired, BufferTag *tag,
+	int *buffer, const char **reason, ClusterBufferStopObservation *observation)
+{
+	memset(observation, 0, sizeof(*observation));
+	return post && !require_pi_retired
+		? cluster_bufmgr_normal_stop_local_checkpoint_poll(tag, buffer, reason)
+		: cluster_bufmgr_normal_stop_poll(post, tag, buffer, reason);
+}
+
+ClusterNormalStopPollResult
 cluster_bufmgr_normal_stop_pi_retire(BufferTag *tag, int *buffer, const char **reason)
 {
 	/* The separate bufmgr test executes the actual owner. Here the real

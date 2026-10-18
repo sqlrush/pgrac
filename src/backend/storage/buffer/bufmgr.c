@@ -416,7 +416,8 @@ cluster_bufmgr_stop_held_lock(LWLock *lock, LWLockMode mode, void *context)
 
 static ClusterNormalStopPollResult
 cluster_bufmgr_stop_poll(bool post_checkpoint, bool require_pi_retired, BufferTag *tag_out,
-						int *buffer_id_out, const char **reason_out)
+						int *buffer_id_out, const char **reason_out,
+						ClusterBufferStopObservation *observation)
 {
 	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
 	BufferTag observed = { 0 };
@@ -424,6 +425,9 @@ cluster_bufmgr_stop_poll(bool post_checkpoint, bool require_pi_retired, BufferTa
 	int observed_id = -1;
 	bool held_lock = false;
 	int i;
+
+	if (observation != NULL)
+		MemSet(observation, 0, sizeof(*observation));
 
 	if (!IsUnderPostmaster || !cluster_enabled || NBuffers <= 0 || BufferDescriptors == NULL
 		|| ClusterPcmOwnArray == NULL || ClusterPiShadow == NULL) {
@@ -444,7 +448,7 @@ cluster_bufmgr_stop_poll(bool post_checkpoint, bool require_pi_retired, BufferTa
 		uint32 state = LockBufHdr(buf);
 		ClusterNormalStopPollResult current = CLUSTER_NORMAL_STOP_READY;
 		const char *current_reason = "BUFMGR_READY";
-		ClusterPcmOwnSnapshot own;
+		ClusterPcmOwnSnapshot own = { 0 };
 		uint64 delivery = 0;
 		bool is_pi = buf->buffer_type == BUF_TYPE_PI;
 
@@ -505,6 +509,12 @@ cluster_bufmgr_stop_poll(bool post_checkpoint, bool require_pi_retired, BufferTa
 			reason = current_reason;
 			observed = buf->tag;
 			observed_id = i;
+			if (observation != NULL) {
+				observation->own = own;
+				observation->state = state & ~BM_LOCKED;
+				observation->delivery = delivery;
+				observation->wait_backend_pgprocno = buf->wait_backend_pgprocno;
+			}
 		}
 		UnlockBufHdr(buf, state);
 	}
@@ -523,14 +533,49 @@ cluster_bufmgr_normal_stop_poll(bool post_checkpoint, BufferTag *tag_out, int *b
 								const char **reason_out)
 {
 	return cluster_bufmgr_stop_poll(post_checkpoint, post_checkpoint, tag_out, buffer_id_out,
-								   reason_out);
+								   reason_out, NULL);
+}
+
+ClusterNormalStopPollResult
+cluster_bufmgr_normal_stop_observed(bool post_checkpoint, bool require_pi_retired,
+	BufferTag *tag_out, int *buffer_id_out, const char **reason_out,
+	ClusterBufferStopObservation *observation)
+{
+	return cluster_bufmgr_stop_poll(post_checkpoint, require_pi_retired, tag_out,
+		buffer_id_out, reason_out, observation);
 }
 
 ClusterNormalStopPollResult
 cluster_bufmgr_normal_stop_local_checkpoint_poll(BufferTag *tag_out, int *buffer_id_out,
 												   const char **reason_out)
 {
-	return cluster_bufmgr_stop_poll(true, false, tag_out, buffer_id_out, reason_out);
+	return cluster_bufmgr_stop_poll(true, false, tag_out, buffer_id_out, reason_out, NULL);
+}
+
+/* Native cleanup diagnostics do not acquire authority or change an owner.
+ * Sample under the header lock, but emit only after releasing it. */
+static void
+cluster_bufmgr_trace_cleanup(BufferDesc *buf, const char *stage, uint64 attempt)
+{
+	ClusterPcmOwnSnapshot own;
+	uint32 state;
+	uint64 delivery;
+
+	if (!cluster_trace_cleanup || CritSectionCount != 0 || ClusterPcmOwnArray == NULL)
+		return;
+	state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_post_state_locked(buf, state, &own);
+	delivery = cluster_pcm_own_delivery_attempt_get(buf->buf_id);
+	UnlockBufHdr(buf, state);
+	elog(LOG, "cluster cleanup buffer stage=%s attempt=" UINT64_FORMAT
+		 " tag=%u/%u/%u/%u/%u buffer=%d state=%08x refs=%u pcm=%u type=%u "
+		 "gen=" UINT64_FORMAT " flags=%x token=" UINT64_FORMAT
+		 " activation=" UINT64_FORMAT " r4=" UINT64_FORMAT " delivery=" UINT64_FORMAT,
+		 stage, attempt, own.tag.spcOid, own.tag.dbOid, own.tag.relNumber,
+		 (unsigned) own.tag.forkNum, own.tag.blockNum, buf->buf_id, state & ~BM_LOCKED,
+		 BUF_STATE_GET_REFCOUNT(state), own.pcm_state, own.buffer_type, own.generation,
+		 own.flags, own.reservation_token, own.writer_activation_token,
+		 own.resource_x_activation_generation, delivery);
 }
 
 /* A normal D-h1 PI is !BM_VALID.  PCM-X retained-image transfer deliberately
@@ -3193,6 +3238,7 @@ cluster_bufmgr_pcm_acquire_shared_owned(BufferDesc *buf,
 			result = cluster_pcm_own_reservation_abort_exact(
 				buf->buf_id, base->generation, reservation_token, PCM_OWN_FLAG_GRANT_PENDING);
 		UnlockBufHdr(buf, state);
+		cluster_bufmgr_trace_cleanup(buf, "shared_acquire_catch", (uint64) result);
 		if (result != CLUSTER_PCM_OWN_OK)
 			elog(LOG,
 				 "cluster shared acquisition error cleanup not proven: buffer=%d "
@@ -6205,6 +6251,9 @@ InvalidateBuffer(BufferDesc *buf)
 	uint32		oldHash;		/* hash value for oldTag */
 	LWLock	   *oldPartitionLock;	/* buffer partition lock for it */
 	uint32		buf_state;
+#ifdef USE_PGRAC_CLUSTER
+	uint64 cleanup_attempt = 0;
+#endif
 
 	/* Save the original buffer tag before dropping the spinlock */
 	oldTag = buf->tag;
@@ -6220,6 +6269,9 @@ InvalidateBuffer(BufferDesc *buf)
 	 */
 	oldHash = BufTableHashCode(&oldTag);
 	oldPartitionLock = BufMappingPartitionLock(oldHash);
+#ifdef USE_PGRAC_CLUSTER
+	cluster_bufmgr_trace_cleanup(buf, "invalidate_enter", 0);
+#endif
 
 retry:
 
@@ -6262,6 +6314,11 @@ retry:
 
 	if (!InvalidateBufferCommitLocked(buf, &oldTag, oldHash, oldPartitionLock, buf_state))
 	{
+#ifdef USE_PGRAC_CLUSTER
+		cleanup_attempt++;
+		if ((cleanup_attempt & (cleanup_attempt - 1)) == 0)
+			cluster_bufmgr_trace_cleanup(buf, "invalidate_retry", cleanup_attempt);
+#endif
 		pg_usleep(1000L);
 		goto retry;
 	}

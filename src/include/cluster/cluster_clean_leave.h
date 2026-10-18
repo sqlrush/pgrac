@@ -644,7 +644,7 @@ cluster_normal_stop_fronts_poll(ClusterPhase1FullStopPlan *plan_out, const char 
 typedef struct ClusterNormalStopModuleObservation {
 	const char *module;
 	const char *reason;
-	char object[192];
+	char object[512];
 } ClusterNormalStopModuleObservation;
 /* Checkpointer, or LMON for the post-checkpoint send cut only. Original
  * shared polls execute outside the leave lock; private actor ownership is
@@ -839,6 +839,11 @@ extern ClusterNormalStopPollResult cluster_hw_normal_stop_poll(const char **doma
 extern ClusterNormalStopPollResult cluster_undo_block0_normal_stop_poll(
 	bool post_checkpoint, const uint8 root_descriptor[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
 	uint64 expected_epoch, uint32 *segment_out, int *tt_slot_out, const char **reason_out);
+struct ClusterBufferStopObservation;
+extern ClusterNormalStopPollResult cluster_bufmgr_normal_stop_observed(
+	bool post_checkpoint, bool require_pi_retired, struct buftag *tag_out,
+	int *buffer_id_out, const char **reason_out,
+	struct ClusterBufferStopObservation *observation);
 extern ClusterNormalStopPollResult cluster_bufmgr_normal_stop_poll(bool post_checkpoint,
 																   struct buftag *tag_out,
 																   int *buffer_id_out,

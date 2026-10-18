@@ -1166,6 +1166,15 @@ cluster_bufmgr_resource_x_writer_report_failure(ResourceXApplyResult result pg_a
 #define cluster_gcs_block_resource_x_local_s_barrier_active capacity_local_barrier
 #define LWLockHeldByMe capacity_lock_held
 #define GetBufferDescriptor(id) ((void)(id), &capacity_buffer)
+/* Logging only is a fixture boundary here. The actual default-off helper
+ * and critical-section exclusion execute in test_cluster_bufmgr_stop. */
+static void
+cluster_bufmgr_trace_cleanup(BufferDesc *buf, const char *stage, uint64 attempt)
+{
+	(void) buf;
+	(void) stage;
+	(void) attempt;
+}
 #include "test_cluster_gcs_read_rearm_owner.inc"
 #undef GetBufferDescriptor
 #undef LWLockHeldByMe

@@ -5652,19 +5652,26 @@ test_cluster_pcm_checksum_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_g
 # Compile the actual owner observer and original PI/IO completion bodies.
 # Native buffer header, mapping, ResourceOwner and checkpoint IO boundaries
 # are explicit fixtures; no second implementation of the stop predicate.
+test_cluster_cleanup_trace.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
+	awk '/^cluster_xact_trace_cleanup\(/ { print "static void"; emit=1; core++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (core != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_bufmgr_stop_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^cluster_bufmgr_stop_held_lock\(/ { print "static void"; emit=1; held++ } \
+	     /^cluster_bufmgr_trace_cleanup\(/ { print "static void"; emit=1; trace++ } \
 	     /^cluster_bufmgr_stop_poll\(/ { print "static ClusterNormalStopPollResult"; emit=1; scan++ } \
-	     /^cluster_bufmgr_normal_stop_(poll|local_checkpoint_poll|pi_retire)\(/ { print "ClusterNormalStopPollResult"; emit=1; poll++ } \
+	     /^cluster_bufmgr_normal_stop_(observed|poll|local_checkpoint_poll|pi_retire)\(/ { print "ClusterNormalStopPollResult"; emit=1; poll++ } \
 	     /^cluster_bufmgr_convert_to_pi_locked\(/ { print "static bool"; emit=1; convert++ } \
 	     /^cluster_bufmgr_discard_pi_block\(/ { print "bool"; emit=1; discard++ } \
 	     /^TerminateBufferIO\(/ { print "static void"; emit=1; io++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (held != 1 || scan != 1 || poll != 3 || convert != 1 || discard != 1 || io != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (held != 1 || trace != 1 || scan != 1 || poll != 4 || convert != 1 || discard != 1 || io != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_bufmgr_stop: test_cluster_bufmgr_stop.c unit_test.h \
-		test_cluster_pcm_snapshot_owner.inc test_cluster_bufmgr_stop_owner.inc $(CLUSTER_PCM_OWN_O)
+		test_cluster_pcm_snapshot_owner.inc test_cluster_bufmgr_stop_owner.inc test_cluster_cleanup_trace.inc $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_PCM_OWN_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 

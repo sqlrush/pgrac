@@ -37,6 +37,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_pcm_x_bufmgr.h"
 
 #include "cluster/cluster_lmd.h"
 
@@ -1947,13 +1948,23 @@ cl_normal_stop_modules_poll(bool post_checkpoint, bool require_pi_retired,
 		case 8:
 			result = cluster_grd_normal_stop_poll(&resid, &index, &current.reason);
 			break;
-		case 9:
-			result = post_checkpoint && !require_pi_retired
-						 ? cluster_bufmgr_normal_stop_local_checkpoint_poll(&tag, &backend,
-																			&current.reason)
-						 : cluster_bufmgr_normal_stop_poll(post_checkpoint, &tag, &backend,
-														   &current.reason);
+		case 9: {
+			ClusterBufferStopObservation observed;
+
+			result = cluster_bufmgr_normal_stop_observed(post_checkpoint,
+				post_checkpoint && require_pi_retired, &tag, &backend, &current.reason, &observed);
+			snprintf(current.object, sizeof(current.object),
+				"tag=%u/%u/%u/%u/%u buffer=%d state=%08x refs=%u waitproc=%d "
+				"pcm=%u type=%u gen=" UINT64_FORMAT " flags=%x token=" UINT64_FORMAT
+				" activation=" UINT64_FORMAT " r4=" UINT64_FORMAT " delivery=" UINT64_FORMAT,
+				tag.spcOid, tag.dbOid, tag.relNumber, (unsigned) tag.forkNum, tag.blockNum,
+				backend, observed.state, BUF_STATE_GET_REFCOUNT(observed.state),
+				observed.wait_backend_pgprocno, observed.own.pcm_state, observed.own.buffer_type,
+				observed.own.generation, observed.own.flags, observed.own.reservation_token,
+				observed.own.writer_activation_token, observed.own.resource_x_activation_generation,
+				observed.delivery);
 			break;
+		}
 		case 10:
 			result = cluster_oid_lease_normal_stop_poll(&current.reason);
 			strlcpy(current.object, "oid-lease", sizeof(current.object));
@@ -1974,7 +1985,7 @@ cl_normal_stop_modules_poll(bool post_checkpoint, bool require_pi_retired,
 		default:
 			result = CLUSTER_NORMAL_STOP_INVALID;
 		}
-		if (owner == 4 || owner == 9)
+		if (owner == 4)
 			snprintf(current.object, sizeof(current.object), "tag=%u/%u/%u/%u/%u slot=%u buffer=%d",
 					 tag.spcOid, tag.dbOid, tag.relNumber, (unsigned)tag.forkNum, tag.blockNum,
 					 index, backend);

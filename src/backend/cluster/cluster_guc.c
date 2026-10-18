@@ -115,6 +115,7 @@ int cluster_recovery_merge_wait_timeout = 10000;
 bool cluster_xnode_profile_enabled = false;
 /* Diagnostic per-storage-UPDATE phase trace; default OFF. */
 bool cluster_update_trace_enabled = false;
+bool cluster_trace_cleanup = false;
 char *cluster_trace_visibility_relids = NULL;
 bool cluster_trace_visibility_enabled = false;
 ClusterVisibilityTraceFilter cluster_trace_visibility_filter = { 0 };
@@ -1726,6 +1727,10 @@ cluster_init_guc(void)
 		"cluster.update_trace", gettext_noop("Enable whole-UPDATE execution phase tracing."),
 		gettext_noop("A full diagnostic capture drops new records, never overwrites."),
 		&cluster_update_trace_enabled, false, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.trace_cleanup", gettext_noop("Log transaction cleanup and buffer invalidation phases."),
+		NULL, &cluster_trace_cleanup, false, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	DefineCustomStringVariable(
 		"cluster.trace_visibility_relids",
