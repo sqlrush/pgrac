@@ -214,6 +214,7 @@ TESTS += test_cluster_tt_abort_owner test_cluster_tt_active_owner
 TESTS += test_cluster_undo_header_durability
 TESTS += test_cluster_tt_checkpoint_cuts
 TESTS += test_cluster_tt_checkpoint_native
+TESTS += test_cluster_tt_checkpoint_publish
 TESTS += test_cluster_tt_2pc_finish
 TESTS += test_cluster_tt_rollback_entry
 TESTS += test_cluster_cr_native_origin test_cluster_cr_mvcc_origin
@@ -588,7 +589,7 @@ test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
 SIMPLE_TESTS := $(filter-out test_cluster_wal_restart_read test_cluster_wal_writer test_cluster_wal_cut test_cluster_pi_data test_cluster_thread_tail,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_checkpoint_native test_cluster_startup_sync test_cluster_checkpoint_buffers test_cluster_page_data test_cluster_pi_writeback test_cluster_block_redeclare test_cluster_page_wal,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_tt_checkpoint_publish test_cluster_checkpoint_native test_cluster_startup_sync test_cluster_checkpoint_buffers test_cluster_page_data test_cluster_pi_writeback test_cluster_block_redeclare test_cluster_page_wal,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_request,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_retire,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_retire_master,$(SIMPLE_TESTS))
@@ -4776,7 +4777,9 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_tt_resolve_entry.inc
 	rm -f test_cluster_tt_terminal_route.inc test_cluster_tt_terminal_route.inc.tmp
 	rm -f test_cluster_tt_checkpoint_apply.inc test_cluster_tt_checkpoint_wait.inc \
-		test_cluster_tt_checkpoint_redo.inc
+		test_cluster_tt_checkpoint_redo.inc test_cluster_tt_checkpoint_native.inc \
+		test_cluster_tt_checkpoint_select.inc test_cluster_tt_checkpoint_guts.inc \
+		test_cluster_tt_checkpoint_publish.inc
 	rm -f test_cluster_typed_redo_reader.inc test_cluster_typed_redo_fpi.inc test_cluster_cold_init_native.inc
 	rm -f test_cluster_current_mx_local_sample.inc test_cluster_current_mx_reply_builder.inc
 	rm -f test_cluster_page_cold_redo_product.o
@@ -7460,7 +7463,32 @@ test_cluster_tt_checkpoint_redo.inc: $(top_srcdir)/src/backend/cluster/storage/c
 
 test_cluster_tt_checkpoint_native: test_cluster_tt_checkpoint_native.inc test_cluster_space_commit_emit.inc test_cluster_side_xact_xactdesc.o
 
-test_cluster_tt_checkpoint_cuts test_cluster_tt_checkpoint_native: %: %.c \
+test_cluster_tt_checkpoint_select.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^#define INSERT_FREESPACE\(/ { macro=1; macros++ } \
+	     macro { print; if ($$0 !~ /\\$$/) macro=0 } \
+	     /^CreateCheckPoint\(/ { owner=1 } \
+	     owner && /freespace = INSERT_FREESPACE\(curInsert\);/ { emit=1; starts++ } \
+	     emit { print; if (/checkPoint.redo = curInsert;/) { emit=0; done++; exit } } \
+	     END { if (macros != 1 || starts != 1 || done != 1 || macro || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_tt_checkpoint_guts.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^CheckPointGuts\(/ { print "static void"; emit=1; starts++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (starts != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_tt_checkpoint_publish.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^CreateCheckPoint\(/ { owner=1 } \
+	     owner && /vxids = GetVirtualXIDsDelayingChkpt\(&nvxids, DELAY_CHKPT_START\);/ { emit=1; starts++ } \
+	     emit { print; if (/ClusterCheckpointV3Publish\(&v3_checkpoint, recptr\);/) { print "#endif"; emit=0; done++; exit } } \
+	     END { if (starts != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_tt_checkpoint_publish: test_cluster_tt_checkpoint_select.inc \
+		test_cluster_tt_checkpoint_guts.inc test_cluster_tt_checkpoint_publish.inc
+
+test_cluster_tt_checkpoint_cuts test_cluster_tt_checkpoint_native test_cluster_tt_checkpoint_publish: %: %.c \
 		test_cluster_tt_checkpoint_cuts.c \
 		test_cluster_undo_header_durability.c unit_test.h \
 		test_cluster_tt_checkpoint_apply.inc test_cluster_tt_checkpoint_wait.inc \
