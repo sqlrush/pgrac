@@ -1542,6 +1542,62 @@ UT_TEST(test_ctrc_physical_active_sample_excludes_precommit_committed_window)
 	UT_ASSERT(physical_active);
 }
 
+/* The old-segment physical sampler exposes the exact precommit observation to
+ * its consumer only when canonical bytes carry a valid commit SCN while the
+ * native xid remains live.  A true ACTIVE slot is the CTRC-ready proof and
+ * must clear that retry hint. */
+UT_TEST(test_physical_locator_precommit_retry_marks_committed_window)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterUndoBlock0CurrentGuard guard;
+	ClusterUndoBlock0ResolvedRoot root;
+	ClusterTTSlotPhysicalLocator locator;
+	ClusterTTStatusKey key;
+	ClusterTTStatusResult result;
+	bool physical_active = true;
+	bool precommit_retry = false;
+
+	reset_exact_origin_fixture();
+	test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+	test_twophase_xid = TEST_ORIGIN_XID;
+	test_current_segment = TEST_TT_SEGMENT + 1;
+	memset(&admission, 0, sizeof(admission));
+	admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	admission.record_generation = 5;
+	admission.formation_epoch = test_formation_epoch;
+	admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	admission.entered = true;
+	memset(&guard, 0, sizeof(guard));
+	memset(&root, 0, sizeof(root));
+	root.intent = CLUSTER_UNDO_PATH_RUNTIME_SHARED;
+	root.root_id = 92;
+	root.root_generation = 7;
+	memset(&locator, 0, sizeof(locator));
+	locator.segment_id = TEST_TT_SEGMENT;
+	locator.xid = TEST_ORIGIN_XID;
+	locator.slot_offset = TEST_TT_OFFSET;
+	locator.wrap = TEST_ORIGIN_WRAP;
+
+	UT_ASSERT(cluster_runtime_visibility_physical_locator_sample_held(
+		&locator, &admission, &guard, &root, &key, &result, &physical_active,
+		&precommit_retry));
+	UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_IN_PROGRESS);
+	UT_ASSERT(!physical_active);
+	UT_ASSERT(precommit_retry);
+	UT_ASSERT_EQ(result.commit_scn, InvalidScn);
+
+	test_tt_slot.status = TT_SLOT_ACTIVE;
+	test_tt_slot.commit_scn = InvalidScn;
+	physical_active = false;
+	precommit_retry = true;
+	UT_ASSERT(cluster_runtime_visibility_physical_locator_sample_held(
+		&locator, &admission, &guard, &root, &key, &result, &physical_active,
+		&precommit_retry));
+	UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_IN_PROGRESS);
+	UT_ASSERT(physical_active);
+	UT_ASSERT(!precommit_retry);
+}
+
 /* A backend-local canonical binding remains the exact owner locator for the
  * whole xid lifetime even after retention pressure rolls CURRENT forward.
  * CTRC PREPARE must therefore sample the binding's old physical segment,
@@ -5760,7 +5816,7 @@ UT_TEST(test_self_fresh_role_does_not_inherit_ordinary_abort_permission)
 int
 main(void)
 {
-	UT_PLAN(161);
+	UT_PLAN(162);
 	UT_RUN(test_retained_active_identity_reaches_real_undo_pending);
 	UT_RUN(test_retained_undo_pending_requires_matching_active_tt_receipt);
 	UT_RUN(test_retained_undo_pending_guard_drift_cannot_publish);
@@ -5827,6 +5883,7 @@ main(void)
 	UT_RUN(test_out_of_domain_values_fail_closed);
 	UT_RUN(test_current_member_target_canonical_active_requires_exact_physical_slot);
 	UT_RUN(test_ctrc_physical_active_sample_excludes_precommit_committed_window);
+	UT_RUN(test_physical_locator_precommit_retry_marks_committed_window);
 	UT_RUN(test_ctrc_current_owner_uses_published_binding_across_rollover);
 	UT_RUN(test_other_backend_rolled_active_uses_locator_and_ctrc);
 	UT_RUN(test_current_mx_other_backend_rolled_active_records_original_touch);
