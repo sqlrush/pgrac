@@ -1022,6 +1022,8 @@ cold_replay_sources_current(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan 
 bool
 cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
 {
+	volatile bool synced = true;
+
 	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK)
 		return false;
 	/* ERROR from an original source owner must not leave a reusable OK plan. */
@@ -1037,32 +1039,49 @@ cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFen
 		|| !cold_replay_sources_current(typed, fence))
 		return false;
 
-	/* The original source owner releases CF before syncing WAL/claim/dirs,
-	 * then rechecks its complete cut. No target consumer has run yet. */
-	for (uint32 i = 0; i < typed->replay_count; i++) {
-		const ColdRoot *selected = &typed->replay_roots[i];
-		ClusterWalTailObservation observed;
-		ClusterControlRootResult result;
+	PG_TRY();
+	{
+		/* Every input uses the original owner, with physical I/O outside CF.
+		 * History is read-only input, not a replay frontier or recovery duty. */
+		for (uint32 i = 0; i < typed->participant_count; i++) {
+			const ColdRoot *selected = &typed->replay_roots[i];
+			ClusterWalTailObservation observed;
+			ClusterControlRootResult result;
 
-		result
-			= cluster_control_root_recovery_sync_v1(&selected->root, &selected->token, &observed);
-		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			|| observed.complete_end != selected->root.validated_tail_lsn_exclusive
-			|| observed.last_record_start != selected->root.tail_last_record_lsn
-			|| observed.last_record_crc != selected->root.tail_last_record_crc32c
-			|| observed.database_incarnation != typed->sources[i].claim.database_incarnation
-			|| !cluster_recovery_merge_fence_plan_revalidate_nowait(fence)) {
-			cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
-						"thread %u pass-2 source sync refused (root result %d)",
-						(unsigned)typed->participants[i].thread_id, (int)result);
-			return false;
+			if (i < typed->replay_count)
+				result = cluster_control_root_recovery_sync_v1(&selected->root, &selected->token,
+															   &observed);
+			else
+				result = cluster_wal_inputs_cold_sync_v1(&selected->root, &typed->census_root,
+														 &observed);
+			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				|| observed.complete_end != selected->root.validated_tail_lsn_exclusive
+				|| observed.last_record_start != selected->root.tail_last_record_lsn
+				|| observed.last_record_crc != selected->root.tail_last_record_crc32c
+				|| observed.database_incarnation != typed->sources[i].claim.database_incarnation
+				|| !cluster_recovery_merge_fence_plan_revalidate_nowait(fence)) {
+				cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
+							"thread %u pass-2 source sync refused (root result %d)",
+							(unsigned)typed->participants[i].thread_id, (int)result);
+				synced = false;
+				break;
+			}
 		}
+		/* A later source's IO must not hide earlier source or scope drift. */
+		if (synced)
+			synced = cluster_cold_tt_base_recheck_v1(typed) == CLUSTER_COLD_OK
+					 && cold_replay_sources_current(typed, fence);
 	}
-	/* A later source's IO must not hide earlier source or scope drift. */
-	if (cluster_cold_tt_base_recheck_v1(typed) != CLUSTER_COLD_OK)
+	PG_CATCH();
+	{
+		cold_execution_inputs_failed(typed);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!synced) {
+		cold_execution_inputs_failed(typed);
 		return false;
-	if (!cold_replay_sources_current(typed, fence))
-		return false;
+	}
 	typed->refusal = CLUSTER_COLD_OK;
 	typed->refusal_detail[0] = '\0';
 	return true;

@@ -22568,6 +22568,126 @@ UT_TEST(test_cold_checkpoint_rechecks_root_after_claim_and_cleans_error)
 	}
 }
 
+UT_TEST(test_cold_sync_retained_files_under_original_owner_without_cf)
+{
+	ClusterControlRootFileToken token;
+	ClusterWalInputV1 items[3];
+	ClusterWalTailObservation out;
+
+	if (!inputs_cold_checkpoint_fixture(&token, items)) {
+		UT_ASSERT(false);
+		return;
+	}
+	inputs_claim_observe = true;
+	inputs_claim_calls = inputs_claim_under_cf = inputs_claim_unpinned = 0;
+	inputs_claim_fault = 0;
+	for (unsigned i = 0; i < 2; i++) {
+		UT_ASSERT(!items[i].current);
+		recovery_sync_fault = 0;
+		recovery_sync_seen = test_startup_claim_syncs = 0;
+		test_startup_sync_hook = recovery_sync_observe;
+		UT_ASSERT_EQ(cluster_wal_inputs_cold_sync_v1(&items[i].checkpoint, &token, &out), 0);
+		test_startup_sync_hook = NULL;
+		UT_ASSERT_EQ(recovery_sync_seen, 5); /* segment, claim, three directories */
+		UT_ASSERT_EQ(test_startup_claim_syncs, 1);
+		UT_ASSERT_EQ(out.complete_end, items[i].checkpoint.validated_tail_lsn_exclusive);
+		UT_ASSERT_EQ(out.last_record_start, items[i].checkpoint.tail_last_record_lsn);
+		UT_ASSERT_EQ(out.last_record_crc, items[i].checkpoint.tail_last_record_crc32c);
+		UT_ASSERT_EQ(out.database_incarnation, items[i].source.claim.database_incarnation);
+	}
+	UT_ASSERT_EQ(inputs_claim_under_cf, 0);
+	UT_ASSERT_EQ(inputs_claim_unpinned, 0);
+	inputs_cold_checkpoint_done();
+}
+
+UT_TEST(test_cold_sync_each_io_failure_root_race_and_error_discard_output)
+{
+	for (unsigned fault = 1; fault <= 7; fault++) {
+		ClusterControlRootFileToken token;
+		ClusterWalInputV1 items[3];
+		ClusterWalTailObservation out, zero = { 0 };
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		volatile bool caught = false;
+
+		if (!inputs_cold_checkpoint_fixture(&token, items)) {
+			UT_ASSERT(false);
+			return;
+		}
+		recovery_sync_fault = fault == 6 ? 3 : fault == 7 ? 4 : 0;
+		recovery_sync_seen = test_history_sync_count = 0;
+		test_history_fail_sync = fault <= 5 ? fault : 0;
+		test_startup_sync_hook = recovery_sync_observe;
+		memset(&out, 0xa5, sizeof(out));
+		PG_TRY();
+		{
+			result = cluster_wal_inputs_cold_sync_v1(&items[0].checkpoint, &token, &out);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		test_startup_sync_hook = NULL;
+		test_history_fail_sync = 0;
+		UT_ASSERT_EQ(caught, fault == 7);
+		UT_ASSERT(result != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		UT_ASSERT(recovery_sync_seen > 0);
+		if (fault <= 5)
+			UT_ASSERT_EQ(recovery_sync_seen, fault);
+		inputs_cold_checkpoint_done();
+	}
+}
+
+UT_TEST(test_cold_sync_requires_exact_root_fsync_role_and_disjoint_output)
+{
+	ClusterControlRootFileToken token, changed;
+	ClusterWalInputV1 items[3];
+	ClusterWalTailObservation out, zero = { 0 };
+	ClusterControlRootSnapshot expected, saved;
+
+	if (!inputs_cold_checkpoint_fixture(&token, items)) {
+		UT_ASSERT(false);
+		return;
+	}
+	for (unsigned fault = 0; fault < 4; fault++) {
+		expected = items[0].checkpoint;
+		changed = token;
+		if (fault == 0)
+			changed.file_txn_seq++;
+		if (fault == 1)
+			enableFsync = false;
+		if (fault == 2)
+			expected.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+		if (fault == 3)
+			MyBackendType = B_BACKEND;
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT(cluster_wal_inputs_cold_sync_v1(&expected, &changed, &out)
+				  != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		enableFsync = true;
+		MyBackendType = B_STARTUP;
+	}
+	expected = saved = items[0].checkpoint;
+	UT_ASSERT_EQ(
+		cluster_wal_inputs_cold_sync_v1(&expected, &token, (ClusterWalTailObservation *)&expected),
+		CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(memcmp(&expected, &saved, sizeof(saved)), 0);
+	changed = token;
+	UT_ASSERT_EQ(
+		cluster_wal_inputs_cold_sync_v1(&expected, &changed, (ClusterWalTailObservation *)&changed),
+		CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(memcmp(&changed, &token, sizeof(token)), 0);
+	/* The recovery-only entry point must keep its original lifecycle gate. */
+	UT_ASSERT_EQ(expected.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED);
+	UT_ASSERT_EQ(cluster_wal_tail_sync_sealed_v1(cluster_wal_threads_dir, &items[0].source,
+												 wal_segment_size, &expected,
+												 items[0].checkpoint_start, &out),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+	inputs_cold_checkpoint_done();
+}
+
 static void
 inputs_check_retained_generations_remain_distinct(bool cold)
 {
@@ -23224,6 +23344,14 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
+	if (getenv("PGRAC_PRE2_TEST_COLD_SYNC") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_cold_sync_retained_files_under_original_owner_without_cf);
+		UT_RUN(test_cold_sync_each_io_failure_root_race_and_error_discard_output);
+		UT_RUN(test_cold_sync_requires_exact_root_fsync_role_and_disjoint_output);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_COLD_CHECKPOINT") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_cold_checkpoint_selects_exact_retained_native_input_without_read_pin);
@@ -23302,7 +23430,10 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(465);
+	UT_PLAN(468);
+	UT_RUN(test_cold_sync_retained_files_under_original_owner_without_cf);
+	UT_RUN(test_cold_sync_each_io_failure_root_race_and_error_discard_output);
+	UT_RUN(test_cold_sync_requires_exact_root_fsync_role_and_disjoint_output);
 	UT_RUN(test_cold_checkpoint_selects_exact_retained_native_input_without_read_pin);
 	UT_RUN(test_cold_checkpoint_rejects_changed_root_snapshot_and_role_without_output);
 	UT_RUN(test_cold_checkpoint_requires_physical_claim_and_anchor);

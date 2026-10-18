@@ -48,6 +48,14 @@ cluster_wal_retained_visit_v1(const char *wal_root, const ClusterWalSourceRef *r
 							  XLogRecPtr checkpoint_start, ClusterWalRecordVisitor visitor,
 							  void *arg, ClusterWalTailObservation *out);
 
+/* Sync the same read-only retained cut and its actual claim/namespace, then
+ * recheck physical identities. The caller retains its original owner/scope;
+ * synchronization does not change lifecycle or authorize recovery. */
+extern ClusterControlRootResult
+cluster_wal_retained_sync_v1(const char *wal_root, const ClusterWalSourceRef *ref, int segment_size,
+							 const ClusterControlRootSnapshot *retained,
+							 XLogRecPtr checkpoint_start, ClusterWalTailObservation *out);
+
 /* Resolve the selected v3 claim/anchor under CF-S, scan without CF, then
  * reobserve the exact root token/record. Caller retains and revalidates its
  * separate IR/fencing/WALR owner bundle. This supplies input, not permission. */

@@ -734,7 +734,10 @@ wal_tail_sync_inputs(WalTailWork *work)
 	if (!enableFsync
 		|| (!work->startup_mode
 			&& (work->sealed == NULL
-				|| work->sealed->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED))
+				|| (work->sealed->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+					&& work->sealed->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
+					&& work->sealed->lifecycle
+						   != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE)))
 		|| !wal_tail_paths_current(work))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	for (WalTailSegment *s = work->segments; s != NULL; s = s->next) {
@@ -979,7 +982,7 @@ wal_tail_visit_exact(const char *wal_root, const ClusterWalSourceRef *ref, int s
 		expected = *sealed;
 	memset(out, 0, sizeof(*out));
 	if (sealed == NULL || ref == NULL || checkpoint_start == 0
-		|| (sync_inputs && (!enableFsync || !recovery_only || visitor != NULL))
+		|| (sync_inputs && (!enableFsync || visitor != NULL))
 		|| (expected.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
 			&& (recovery_only
 				|| (expected.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
@@ -1024,6 +1027,15 @@ cluster_wal_retained_visit_v1(const char *wal_root, const ClusterWalSourceRef *r
 {
 	return wal_tail_visit_exact(wal_root, ref, segment_size, retained, checkpoint_start, visitor,
 								arg, out, false, false);
+}
+
+ClusterControlRootResult
+cluster_wal_retained_sync_v1(const char *wal_root, const ClusterWalSourceRef *ref, int segment_size,
+							 const ClusterControlRootSnapshot *retained,
+							 XLogRecPtr checkpoint_start, ClusterWalTailObservation *out)
+{
+	return wal_tail_visit_exact(wal_root, ref, segment_size, retained, checkpoint_start, NULL, NULL,
+								out, false, true);
 }
 
 ClusterControlRootResult

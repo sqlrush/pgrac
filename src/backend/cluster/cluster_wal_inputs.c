@@ -1336,6 +1336,41 @@ cluster_wal_inputs_cold_checkpoint_v1(const ClusterControlRootSnapshot *expected
 }
 
 ClusterControlRootResult
+cluster_wal_inputs_cold_sync_v1(const ClusterControlRootSnapshot *expected,
+								const ClusterControlRootFileToken *root_token,
+								ClusterWalTailObservation *out)
+{
+	ClusterWalRecoveryCheckpointV1 selected, confirmed;
+	ClusterWalTailObservation observed;
+	ClusterControlRootResult result;
+
+	if (inputs_overlap(expected, sizeof(*expected), out, sizeof(*out))
+		|| inputs_overlap(root_token, sizeof(*root_token), out, sizeof(*out)))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (expected == NULL || root_token == NULL || out == NULL || !enableFsync)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	result = cluster_wal_inputs_cold_checkpoint_v1(expected, root_token, &selected);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	/* The checkpoint selector releases CF before returning. Keep all physical
+	 * WAL/claim/namespace I/O under the caller's existing execution retention. */
+	result
+		= cluster_wal_retained_sync_v1(cluster_wal_threads_dir, &selected.source, wal_segment_size,
+									   expected, selected.checkpoint_start, &observed);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	result = cluster_wal_inputs_cold_checkpoint_v1(expected, root_token, &confirmed);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (memcmp(&selected, &confirmed, sizeof(selected)) != 0)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	*out = observed;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
 cluster_wal_inputs_revalidate_v1(ClusterWalInputsV1 *inputs)
 {
 	WalInputsWork *work;

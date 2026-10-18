@@ -79,6 +79,13 @@ extern ClusterControlRootResult cluster_wal_inputs_cold_begin_v1(const uint8 sto
 extern ClusterControlRootResult cluster_wal_inputs_cold_checkpoint_v1(
 	const ClusterControlRootSnapshot *expected, const ClusterControlRootFileToken *root_token,
 	ClusterWalRecoveryCheckpointV1 *out);
+/* Original execution owner only; sync exact retained WAL/claim/namespace and
+ * reselect the same native checkpoint and whole ROOT after I/O outside CF.
+ * Acquires no scope and grants no endpoint or recovery authority. */
+extern ClusterControlRootResult
+cluster_wal_inputs_cold_sync_v1(const ClusterControlRootSnapshot *expected,
+								const ClusterControlRootFileToken *root_token,
+								ClusterWalTailObservation *out);
 /* Metadata token of the whole selected ROOT, not a publication capability.
  * Like at_v1, this requires the same live scope/owner; call revalidate_v1
  * before consuming provisional results. Invalid scopes produce no token. */

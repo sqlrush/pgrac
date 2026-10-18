@@ -923,22 +923,33 @@ sync_sources(ClusterColdTypedV1 *typed)
 	return cluster_cold_typed_sync_sources_v1(typed, (ClusterRecoveryFencePlan *)&fixture_context);
 }
 
-UT_TEST(test_source_barrier_all_replay_generations_only)
+UT_TEST(test_source_barrier_all_selected_generations)
 {
 	ClusterColdTypedV1 *typed;
 
 	fixture();
 	history_generation(2, 9, 0x40, 0x80);
+	history_generation(2, 10, 0x80, 0xc0);
+	history_generation(3, 8, 0x40, 0x90);
 	typed = prepare(0x800);
 	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(source_sync_calls, 0); /* pass 1 remains read only */
+	UT_ASSERT_EQ(history_sync_calls, 0);
 	cluster_cold_replay_window_enter_v1();
 	UT_ASSERT(sync_sources(typed));
 	UT_ASSERT_EQ(source_sync_calls, 3);
 	UT_ASSERT_EQ(source_sync_order[0], 1);
 	UT_ASSERT_EQ(source_sync_order[1], 2);
 	UT_ASSERT_EQ(source_sync_order[2], 3);
-	UT_ASSERT_EQ(history_checkpoint_reads, 2);
+	UT_ASSERT_EQ(history_sync_calls, 3);
+	UT_ASSERT_EQ(history_sync_threads[0], 2);
+	UT_ASSERT_EQ(history_sync_incarnations[0], 9);
+	UT_ASSERT_EQ(history_sync_threads[1], 2);
+	UT_ASSERT_EQ(history_sync_incarnations[1], 10);
+	UT_ASSERT_EQ(history_sync_threads[2], 3);
+	UT_ASSERT_EQ(history_sync_incarnations[2], 8);
+	UT_ASSERT_EQ(history_checkpoint_reads, 12);
+	UT_ASSERT_EQ(census_begins, census_releases);
 	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
 	cluster_cold_replay_window_leave_v1();
 	cluster_cold_typed_destroy_v1(&typed);
@@ -972,6 +983,89 @@ UT_TEST(test_history_execution_freshness_refuses_changed_input_before_sync)
 	}
 }
 
+UT_TEST(test_history_durability_failure_discards_provisional_inputs_stickily)
+{
+	for (unsigned fault = 1; fault <= 5; fault++)
+		for (unsigned fail_at = 1; fail_at <= 2; fail_at++) {
+			ClusterColdTypedV1 *typed;
+			fixture();
+			history_generation(2, 9, 0x40, 0x80);
+			history_generation(2, 10, 0x80, 0xc0);
+			typed = prepare(0x800);
+			UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+			typed->xid_next_at_drain[0] = 99;
+			history_sync_fault = fault;
+			history_sync_fail_at = fail_at;
+			cluster_cold_replay_window_enter_v1();
+			UT_ASSERT(!sync_sources(typed));
+			UT_ASSERT_EQ(source_sync_calls, NROOTS);
+			UT_ASSERT_EQ(history_sync_calls, fail_at);
+			UT_ASSERT_EQ(typed->xid_next_at_drain[0], 0);
+			UT_ASSERT_EQ(typed->history_xid[typed->replay_count].next_xid, 0);
+			UT_ASSERT(!typed->census_root_captured);
+			UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+			history_sync_fault = 0;
+			UT_ASSERT(!sync_sources(typed));
+			UT_ASSERT_EQ(history_sync_calls, fail_at);
+			UT_ASSERT_EQ(census_begins, census_releases);
+			cluster_cold_replay_window_leave_v1();
+			cluster_cold_typed_destroy_v1(&typed);
+		}
+}
+
+UT_TEST(test_history_durability_rechecks_root_checkpoint_and_original_owner)
+{
+	for (unsigned fault = 6; fault <= 8; fault++) {
+		ClusterColdTypedV1 *typed;
+		fixture();
+		history_generation(2, 9, 0x40, 0x80);
+		history_generation(3, 8, 0x40, 0x90);
+		typed = prepare(0x800);
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+		history_sync_fault = fault;
+		history_sync_fail_at = 2;
+		cluster_cold_replay_window_enter_v1();
+		UT_ASSERT(!sync_sources(typed));
+		UT_ASSERT_EQ(history_sync_calls, 2);
+		UT_ASSERT_EQ(typed->history_xid[typed->replay_count].next_xid, 0);
+		UT_ASSERT(!typed->census_root_captured);
+		UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_history_durability_error_clears_provisional_inputs)
+{
+	ClusterColdTypedV1 *typed;
+	volatile bool caught = false;
+	fixture();
+	history_generation(2, 9, 0x40, 0x80);
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	history_sync_fault = 9;
+	history_sync_fail_at = 1;
+	cluster_cold_replay_window_enter_v1();
+	PG_TRY();
+	{
+		(void)sync_sources(typed);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(history_sync_calls, 1);
+	UT_ASSERT_EQ(typed->history_xid[typed->replay_count].next_xid, 0);
+	UT_ASSERT(!typed->census_root_captured);
+	UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+	UT_ASSERT(!sync_sources(typed));
+	UT_ASSERT_EQ(history_sync_calls, 1);
+	cluster_cold_replay_window_leave_v1();
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
 UT_TEST(test_history_execution_freshness_rechecks_after_last_source_sync)
 {
 	for (int fault = 10; fault <= 11; fault++) {
@@ -984,7 +1078,8 @@ UT_TEST(test_history_execution_freshness_rechecks_after_last_source_sync)
 		cluster_cold_replay_window_enter_v1();
 		UT_ASSERT(!sync_sources(typed));
 		UT_ASSERT_EQ(source_sync_calls, NROOTS);
-		UT_ASSERT_EQ(history_checkpoint_reads, 2);
+		UT_ASSERT_EQ(history_sync_calls, 1);
+		UT_ASSERT(history_checkpoint_reads >= 2);
 		UT_ASSERT_EQ(typed->history_xid[typed->replay_count].next_xid, 0);
 		UT_ASSERT(!typed->census_root_captured);
 		UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
@@ -2896,7 +2991,10 @@ UT_TEST(test_checkpoint_export_clears_unsealed_and_failed_output)
 int
 main(void)
 {
-	UT_PLAN(87);
+	UT_PLAN(90);
+	UT_RUN(test_history_durability_failure_discards_provisional_inputs_stickily);
+	UT_RUN(test_history_durability_rechecks_root_checkpoint_and_original_owner);
+	UT_RUN(test_history_durability_error_clears_provisional_inputs);
 	UT_RUN(test_history_execution_freshness_refuses_changed_input_before_sync);
 	UT_RUN(test_history_execution_freshness_rechecks_after_last_source_sync);
 	UT_RUN(test_history_execution_freshness_requires_original_owner_and_cleans_error);
@@ -2979,7 +3077,7 @@ main(void)
 	UT_RUN(test_observed_page_classification);
 	UT_RUN(test_refusal_hints);
 	UT_RUN(test_plan_memory_budget_parameter);
-	UT_RUN(test_source_barrier_all_replay_generations_only);
+	UT_RUN(test_source_barrier_all_selected_generations);
 	UT_RUN(test_source_barrier_refuses_sync_or_tail_failure_stickily);
 	UT_RUN(test_source_barrier_final_whole_scope_recheck);
 	UT_RUN(test_source_barrier_whole_source_preflight_before_sync);

@@ -564,7 +564,7 @@ cluster_cold_space_check_v1(void *arg, const RelFileLocator *locator,
  * census_history adds history-only generations.  The census selection
  * itself is tested with the I/O module.
  */
-#define MAX_HISTORY 2
+#define MAX_HISTORY 3
 static int census_scope;
 static ClusterControlRootResult census_begin_result;
 static ClusterControlRootResult census_revalidate_result;
@@ -579,11 +579,14 @@ static ClusterColdCensusEntryV1 census_history[MAX_HISTORY];
 static uint32 census_history_count;
 static bool census_history_current;
 static int census_begins;
-static ClusterWalInputV1 census_inputs[13];
+static ClusterWalInputV1 census_inputs[11 + MAX_HISTORY];
 static int census_input_fault;
 static uint32 census_fault_index;
 static unsigned history_checkpoint_reads;
 static unsigned history_checkpoint_fault;
+static unsigned history_sync_calls, history_sync_fail_at, history_sync_fault;
+static uint64 history_sync_incarnations[MAX_HISTORY];
+static uint16 history_sync_threads[MAX_HISTORY];
 
 static unsigned serial_input_calls;
 static uint16 serial_input_count, serial_input_threads[128];
@@ -707,6 +710,57 @@ cluster_wal_inputs_cold_checkpoint_v1(const ClusterControlRootSnapshot *expected
 		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 	}
 	return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_cold_sync_v1(const ClusterControlRootSnapshot *expected,
+								const ClusterControlRootFileToken *root_token,
+								ClusterWalTailObservation *out)
+{
+	ClusterWalRecoveryCheckpointV1 selected, confirmed;
+	ClusterControlRootResult result;
+	unsigned call = history_sync_calls++;
+
+	UT_ASSERT(call < MAX_HISTORY);
+	if (call < MAX_HISTORY) {
+		history_sync_incarnations[call] = expected->identity.origin_owner_incarnation;
+		history_sync_threads[call] = expected->identity.origin_thread_id;
+	}
+	memset(out, 0, sizeof(*out));
+	result = cluster_wal_inputs_cold_checkpoint_v1(expected, root_token, &selected);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (call + 1 == history_sync_fail_at) {
+		if (history_sync_fault == 1)
+			return CLUSTER_CONTROL_ROOT_IO_ERROR;
+		if (history_sync_fault == 6)
+			census_token.file_txn_seq++;
+		if (history_sync_fault == 7)
+			census_input_fault = 7;
+		if (history_sync_fault == 8)
+			fence_current = false;
+		if (history_sync_fault == 9)
+			siglongjmp(*PG_exception_stack, 1);
+	}
+	result = cluster_wal_inputs_cold_checkpoint_v1(expected, root_token, &confirmed);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| memcmp(&selected, &confirmed, sizeof(selected)) != 0)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	out->complete_end = expected->validated_tail_lsn_exclusive;
+	out->last_record_start = expected->tail_last_record_lsn;
+	out->last_record_crc = expected->tail_last_record_crc32c;
+	out->database_incarnation = selected.source.claim.database_incarnation;
+	if (call + 1 == history_sync_fail_at) {
+		if (history_sync_fault == 2)
+			out->complete_end++;
+		if (history_sync_fault == 3)
+			out->last_record_start++;
+		if (history_sync_fault == 4)
+			out->last_record_crc++;
+		if (history_sync_fault == 5)
+			out->database_incarnation++;
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
 ClusterControlRootResult
@@ -1223,6 +1277,9 @@ fixture(void)
 	census_history_current = false;
 	census_input_fault = 0;
 	history_checkpoint_reads = history_checkpoint_fault = 0;
+	history_sync_calls = history_sync_fail_at = history_sync_fault = 0;
+	memset(history_sync_incarnations, 0, sizeof(history_sync_incarnations));
+	memset(history_sync_threads, 0, sizeof(history_sync_threads));
 	census_fault_index = 11;
 	census_begins = census_releases = history_scans = 0;
 	history_scan_index = 0;
