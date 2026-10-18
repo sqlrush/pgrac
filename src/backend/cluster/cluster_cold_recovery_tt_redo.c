@@ -287,7 +287,8 @@ cluster_cold_typed_tt_redo_inventory_v1(const ClusterColdTypedV1 *typed)
 	}
 	/* Captures enumerate each physical owner/segment once. Matching all post
 	 * headers must account for every original, including untouched segments. */
-	return originals_seen == cluster_cold_tt_base_count_v1(typed);
+	return originals_seen == cluster_cold_tt_base_count_v1(typed)
+		   && cluster_cold_tt_after_redo_undo_matches_v1(typed);
 }
 
 bool
@@ -378,56 +379,45 @@ cluster_cold_typed_undo_redo_record_v1(const ClusterColdTypedV1 *typed, uint32 p
 	return true;
 }
 
-bool
-cluster_cold_typed_undo_base_redo_record_v1(ClusterColdTypedV1 *typed, uint32 participant,
-											uint32 segment_index, UBA address,
-											ClusterRecoveryUndoRecord *out, uint32 *generation)
+static const RfSideOnlinePlanV1 *
+cold_tt_undo_base_redo_plan(const ClusterColdTypedV1 *typed, uint32 participant,
+							uint32 segment_index, uint8 *owner, uint32 *segment)
 {
 	const UndoSegmentHeaderData *base_header;
 	const RfSideOnlinePlanV1 *plan;
 	RfSideUndoHeaderImageV1 header;
-	PGAlignedBlock block;
-	ClusterRecoveryUndoRecord record;
-	uint8 owner;
-	uint32 segment, address_segment, block_no, captured_generation, count;
-	uint16 tt_slot, row;
-	XLogRecPtr base_lsn;
 
-	if (out != NULL)
-		memset(out, 0, sizeof(*out));
-	if (generation != NULL)
-		*generation = 0;
-	if (out == NULL || generation == NULL
-		|| (base_header = cluster_cold_tt_base_header_v1(typed, segment_index, &owner, &segment))
-			   == NULL
-		|| !uba_decode_record(address, &address_segment, &block_no, &tt_slot, &row)
-		|| address_segment != segment || block_no == 0
+	base_header = cluster_cold_tt_base_header_v1(typed, segment_index, owner, segment);
+	if (base_header == NULL
 		|| !cluster_cold_typed_tt_redo_header_v1(typed, participant, segment_index, &header)
 		|| base_header->wrap_count != ((const UndoSegmentHeaderData *)header.page.data)->wrap_count)
-		return false;
+		return NULL;
 	plan = typed->side_plans[participant];
-	count = rf_side_online_plan_operation_count_v1(plan);
-	/* This explicit base path does not establish generation ancestry. Even a
-	 * later FPI cannot make the captured DATA belong to a new incarnation. */
-	for (uint32 i = 0; i < count; i++) {
+	/* A later FPI cannot give captured DATA ancestry after INIT or REUSE. */
+	for (uint32 i = 0; i < rf_side_online_plan_operation_count_v1(plan); i++) {
 		RfSideOnlineOperationV1 operation;
 
 		if (!rf_side_online_plan_operation_v1(plan, i, &operation)
-			|| (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO && operation.undo.instance == owner
-				&& operation.undo.segment_id == segment
+			|| (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO && operation.undo.instance == *owner
+				&& operation.undo.segment_id == *segment
 				&& (operation.undo.kind == CLUSTER_UNDO_KIND_SEGMENT_INIT
 					|| operation.undo.kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE)))
-			return false;
+			return NULL;
 	}
-	if (!cluster_cold_tt_base_block_v1(typed, segment_index, block_no, &block, &captured_generation)
-		|| captured_generation != base_header->wrap_count)
-		return false;
-	base_lsn = ((const UndoBlockHeader *)block.data)->block_lsn;
-	/* Never infer that a numerically newer DATA block is covered by this WAL.
-	 * A qualified checkpoint/base proof remains a separate owner obligation. */
+	return plan;
+}
+
+static bool
+cold_tt_undo_base_redo_block(const ClusterColdTypedV1 *typed, uint32 participant,
+							 const RfSideOnlinePlanV1 *plan, uint8 owner, uint32 segment,
+							 uint32 block_no, PGAlignedBlock *block)
+{
+	XLogRecPtr base_lsn = ((const UndoBlockHeader *)block->data)->block_lsn;
+
+	/* This bound alone never qualifies checkpoint/base coverage. */
 	if (XLogRecPtrIsInvalid(base_lsn) || base_lsn > typed->participants[participant].native_redo)
 		return false;
-	for (uint32 i = 0; i < count; i++) {
+	for (uint32 i = 0; i < rf_side_online_plan_operation_count_v1(plan); i++) {
 		RfSideOnlineOperationV1 operation;
 		const ClusterUndoDecoded *decoded = &operation.undo;
 
@@ -441,12 +431,63 @@ cluster_cold_typed_undo_base_redo_record_v1(ClusterColdTypedV1 *typed, uint32 pa
 			continue;
 		if (!cluster_undo_prepare_block_v1(
 				decoded, operation.owned_payload, operation.owned_payload_length,
-				operation.identity.record.end_rec_ptr, block.data, block.data))
+				operation.identity.record.end_rec_ptr, block->data, block->data))
 			return false;
 	}
-	if (cluster_recovery_undo_record_read(block.data, BLCKSZ, segment, block_no, owner, address,
-										  &record)
-		!= CLUSTER_RECOVERY_UNDO_ENTRY)
+	return true;
+}
+
+bool
+cluster_cold_typed_undo_base_redo_block_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+										   uint32 segment_index, uint32 block_no,
+										   const PGAlignedBlock *base, PGAlignedBlock *out)
+{
+	const RfSideOnlinePlanV1 *plan;
+	PGAlignedBlock block;
+	uint8 owner;
+	uint32 segment;
+
+	if (base != NULL)
+		block = *base;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (base == NULL || out == NULL || block_no == 0 || block_no >= UNDO_SEGMENT_SIZE_BYTES / BLCKSZ
+		|| (plan = cold_tt_undo_base_redo_plan(typed, participant, segment_index, &owner, &segment))
+			   == NULL
+		|| !cold_tt_undo_base_redo_block(typed, participant, plan, owner, segment, block_no,
+										 &block))
+		return false;
+	*out = block;
+	return true;
+}
+
+bool
+cluster_cold_typed_undo_base_redo_record_v1(ClusterColdTypedV1 *typed, uint32 participant,
+											uint32 segment_index, UBA address,
+											ClusterRecoveryUndoRecord *out, uint32 *generation)
+{
+	const RfSideOnlinePlanV1 *plan;
+	PGAlignedBlock block;
+	ClusterRecoveryUndoRecord record;
+	uint8 owner;
+	uint32 segment, address_segment, block_no, captured_generation;
+	uint16 tt_slot, row;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (generation != NULL)
+		*generation = 0;
+	if (out == NULL || generation == NULL
+		|| (plan = cold_tt_undo_base_redo_plan(typed, participant, segment_index, &owner, &segment))
+			   == NULL
+		|| !uba_decode_record(address, &address_segment, &block_no, &tt_slot, &row)
+		|| address_segment != segment || block_no == 0
+		|| !cluster_cold_tt_base_block_v1(typed, segment_index, block_no, &block,
+										  &captured_generation)
+		|| !cold_tt_undo_base_redo_block(typed, participant, plan, owner, segment, block_no, &block)
+		|| cluster_recovery_undo_record_read(block.data, BLCKSZ, segment, block_no, owner, address,
+											 &record)
+			   != CLUSTER_RECOVERY_UNDO_ENTRY)
 		return false;
 	*out = record;
 	*generation = captured_generation;

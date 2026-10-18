@@ -114,6 +114,22 @@ fixture_close(int fd)
 	return result;
 }
 
+/* This raw-capture fixture does not link the semantic redo consumer. */
+bool
+cluster_cold_typed_undo_base_redo_block_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+										   uint32 segment_index, uint32 block_no,
+										   const PGAlignedBlock *base, PGAlignedBlock *out)
+{
+	(void)typed;
+	(void)participant;
+	(void)segment_index;
+	(void)block_no;
+	(void)base;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return false;
+}
+
 #undef pg_pread
 #define pg_pread fixture_pread
 #define close fixture_close

@@ -483,6 +483,48 @@ cluster_cold_tt_after_redo_namespace_matches_v1(const ClusterColdTypedV1 *typed)
 		   && cold_tt_namespace_matches(typed, typed->tt_after_redo);
 }
 
+bool
+cluster_cold_tt_after_redo_undo_matches_v1(const ClusterColdTypedV1 *typed)
+{
+	Size originals = 0, posts = 0;
+
+	if (!cluster_cold_tt_after_redo_namespace_matches_v1(typed) || typed->replay_count == 0
+		|| typed->replay_count > typed->participant_count)
+		return false;
+	for (const ColdTtBlockV1 *before = typed->tt_base->blocks; before != NULL;
+		 before = before->next) {
+		const ColdTtBlockV1 *after;
+		PGAlignedBlock expected;
+		uint32 p, index;
+		uint8 owner = before->file->owner;
+		uint32 segment = before->file->segment;
+
+		for (after = typed->tt_after_redo->blocks; after != NULL; after = after->next)
+			if (after->file->owner == owner && after->file->segment == segment
+				&& after->block == before->block)
+				break;
+		if (after == NULL)
+			return false;
+		for (p = 0; p < typed->replay_count; p++)
+			if (typed->participants[p].thread_id == owner)
+				break;
+		if (p < typed->replay_count) {
+			if (cluster_cold_tt_header_find_v1(typed, false, owner, segment, &index) == NULL
+				|| !cluster_cold_typed_undo_base_redo_block_v1(typed, p, index, before->block,
+															   &before->bytes, &expected))
+				return false;
+		} else
+			expected = before->bytes;
+		if (memcmp(after->bytes.data, expected.data, BLCKSZ) != 0)
+			return false;
+		originals++;
+	}
+	for (const ColdTtBlockV1 *after = typed->tt_after_redo->blocks; after != NULL;
+		 after = after->next)
+		posts++;
+	return originals == posts;
+}
+
 const UndoSegmentHeaderData *
 cluster_cold_tt_header_find_v1(const ClusterColdTypedV1 *typed, bool after_redo, uint8 owner,
 							   uint32 segment, uint32 *index)

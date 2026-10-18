@@ -873,6 +873,11 @@ extern void cluster_cold_tt_after_redo_reset_v1(ClusterColdTypedV1 *typed);
 extern uint32 cluster_cold_tt_after_redo_count_v1(const ClusterColdTypedV1 *typed);
 /* Distinguish a captured empty inventory from absent or refused input. */
 extern bool cluster_cold_tt_after_redo_namespace_matches_v1(const ClusterColdTypedV1 *typed);
+/* Original inventory consumer: compare every retained UNDO block pair with
+ * the sealed current source's native fold, or unchanged history-only bytes.
+ * Does not reread disk or qualify base coverage. Final source/header/block
+ * rechecks remain with the original owner. */
+extern bool cluster_cold_tt_after_redo_undo_matches_v1(const ClusterColdTypedV1 *typed);
 /* Exact physical lookup in one valid captured inventory. Clears index on
  * absence/refusal; no disk access, reconstruction or recovery authority. */
 extern const UndoSegmentHeaderData *cluster_cold_tt_header_find_v1(const ClusterColdTypedV1 *typed,
@@ -958,6 +963,8 @@ extern bool cluster_cold_typed_tt_after_redo_readback_v1(const ClusterColdTypedV
 /* Check both captured inventories and every current source's ordinary TT
  * target. Current origins use the sealed native fold; history-only origins
  * must retain their original full header bytes and are never replayed here.
+ * Every already-cached UNDO data block also needs the exact native after
+ * image, including unchanged bytes and history-only blocks.
  * This read-only comparison grants no checkpoint/base, history-effect, top,
  * loser or C0 authority. Original source isolation and final rechecks remain
  * the caller's obligations; no completion flag is stored. */
@@ -1006,6 +1013,15 @@ extern bool cluster_cold_typed_undo_base_redo_record_v1(ClusterColdTypedV1 *type
 														UBA address,
 														struct ClusterRecoveryUndoRecord *out,
 														uint32 *generation);
+
+/* Fold a retained original UNDO block without rereading pre-redo disk bytes.
+ * Uses the record reader's exact source, generation, lifecycle and LSN guards.
+ * Successful output owns bytes; failure clears out. Base may alias out.
+ * No checkpoint/base coverage, transaction or completion authority. */
+extern bool cluster_cold_typed_undo_base_redo_block_v1(const ClusterColdTypedV1 *typed,
+													   uint32 participant, uint32 segment_index,
+													   uint32 block_no, const PGAlignedBlock *base,
+													   PGAlignedBlock *out);
 
 /* One explicitly selected original replay participant, never a history or
  * owner-id shortcut. The caller retains this context throughout graph use. */

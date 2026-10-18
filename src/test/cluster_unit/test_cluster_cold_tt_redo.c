@@ -3215,10 +3215,152 @@ UT_TEST(tt_inventory_refuses_ambiguous_current_origin_and_sticky_post_failure)
 	tt_redo_destroy(&f);
 }
 
+static void
+tt_undo_readback_write(uint32 segment, uint32 block, const PGAlignedBlock *page)
+{
+	char path[MAXPGPATH];
+	int fd;
+
+	snprintf(path, sizeof(path), "%s/%u", tt_redo_dir, segment);
+	fd = open(path, O_RDWR);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(pwrite(fd, page->data, BLCKSZ, (off_t)block * BLCKSZ), BLCKSZ);
+	UT_ASSERT_EQ(close(fd), 0);
+}
+
+static void
+tt_undo_readback_cache(TtRedoFixture *f, uint8 owner, uint32 segment, uint32 block,
+					   const PGAlignedBlock *page)
+{
+	PGAlignedBlock saved;
+	uint32 index, generation;
+
+	tt_undo_readback_write(segment, block, page);
+	UT_ASSERT_NOT_NULL(cluster_cold_tt_header_find_v1(&f->typed, false, owner, segment, &index));
+	UT_ASSERT(cluster_cold_tt_base_block_v1(&f->typed, index, block, &saved, &generation));
+	UT_ASSERT(memcmp(saved.data, page->data, BLCKSZ) == 0);
+}
+
+static void
+tt_undo_readback_delta(TtRedoFixture *f, bool fpi, PGAlignedBlock *base, PGAlignedBlock *expected)
+{
+	PGAlignedBlock page;
+	RfSideOnlineOperationV1 operation;
+
+	tt_redo_fixture(f, 200, RF_SIDE_PLAN_RECOVERY);
+	tt_redo_record_page(base, 802);
+	((UndoBlockHeader *)base->data)->block_lsn = 90;
+	tt_undo_readback_cache(f, 3, 513, 9, base);
+	tt_redo_record_page(&page, 900);
+	tt_redo_feed_record_page(f, 100, &page, fpi);
+	tt_redo_seal(f);
+	UT_ASSERT(rf_side_online_plan_operation_v1(f->typed.side_plans[0], 0, &operation));
+	UT_ASSERT(cluster_undo_prepare_block_v1(
+		&operation.undo, operation.owned_payload, operation.owned_payload_length,
+		operation.identity.record.end_rec_ptr, base->data, expected->data));
+}
+
+UT_TEST(tt_inventory_undo_matches_native_delta_and_fpi_without_changing_base)
+{
+	for (int fpi = 0; fpi < 2; fpi++) {
+		TtRedoFixture f;
+		PGAlignedBlock base, expected;
+
+		tt_undo_readback_delta(&f, fpi, &base, &expected);
+		tt_undo_readback_write(513, 9, &expected);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+		UT_ASSERT(memcmp(f.typed.tt_base->blocks->bytes.data, base.data, BLCKSZ) == 0);
+		UT_ASSERT(memcmp(f.typed.tt_after_redo->blocks->bytes.data, expected.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_recheck_v1(&f.typed), CLUSTER_COLD_OK);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_inventory_undo_refuses_missing_redo_and_any_post_block_byte_mismatch)
+{
+	for (int fault = 0; fault < 4; fault++) {
+		TtRedoFixture f;
+		PGAlignedBlock base, expected;
+
+		tt_undo_readback_delta(&f, false, &base, &expected);
+		if (fault == 0)
+			expected = base;
+		else if (fault == 1)
+			expected.data[BLCKSZ - 1] ^= 1;
+		else if (fault == 2)
+			((UndoBlockHeader *)expected.data)->block_lsn++;
+		else {
+			UndoSlotDirEntry directory;
+
+			memcpy(&directory, expected.data + UNDO_SLOT_DIR_OFFSET(1), sizeof(directory));
+			expected.data[directory.record_offset] ^= 1;
+		}
+		tt_undo_readback_write(513, 9, &expected);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_recheck_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_inventory_undo_checks_all_cached_current_and_history_blocks)
+{
+	for (int fault = -1; fault < 3; fault++) {
+		TtRedoFixture f;
+		PGAlignedBlock page, history, changed;
+
+		tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+		tt_inventory_extra(257, 2, &history);
+		tt_redo_seed_recapture(&f);
+		tt_redo_record_page(&page, 802);
+		((UndoBlockHeader *)page.data)->block_lsn = 90;
+		tt_undo_readback_cache(&f, 3, 513, 9, &page);
+		tt_undo_readback_cache(&f, 3, 513, 10, &page);
+		tt_undo_readback_cache(&f, 2, 257, 9, &page);
+		tt_redo_seal(&f);
+		if (fault >= 0) {
+			changed = page;
+			changed.data[BLCKSZ - 1] ^= 1;
+			tt_undo_readback_write(fault == 2 ? 257 : 513, fault == 1 ? 10 : 9, &changed);
+		}
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_recheck_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(cluster_cold_typed_tt_redo_inventory_v1(&f.typed) == (fault == -1));
+		tt_inventory_remove(257);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_inventory_undo_refuses_unusable_base_or_missing_post_pair)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		TtRedoFixture f;
+		PGAlignedBlock page;
+
+		tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+		tt_redo_record_page(&page, 802);
+		((UndoBlockHeader *)page.data)->block_lsn = fault == 0 ? 0 : (fault == 1 ? 101 : 90);
+		tt_undo_readback_cache(&f, 3, 513, 9, &page);
+		tt_redo_seal(&f);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		if (fault == 2) {
+			pfree(f.typed.tt_after_redo->blocks);
+			f.typed.tt_after_redo->blocks = NULL;
+		}
+		UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+		tt_redo_destroy(&f);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(79);
+	UT_PLAN(83);
+	UT_RUN(tt_inventory_undo_matches_native_delta_and_fpi_without_changing_base);
+	UT_RUN(tt_inventory_undo_refuses_missing_redo_and_any_post_block_byte_mismatch);
+	UT_RUN(tt_inventory_undo_checks_all_cached_current_and_history_blocks);
+	UT_RUN(tt_inventory_undo_refuses_unusable_base_or_missing_post_pair);
 	UT_RUN(tt_inventory_checks_untouched_current_and_history_headers);
 	UT_RUN(tt_inventory_refuses_unchanged_current_header_with_bad_layout);
 	UT_RUN(tt_inventory_refuses_unchanged_history_header_with_bad_layout);
