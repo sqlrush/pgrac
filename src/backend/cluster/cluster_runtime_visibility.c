@@ -974,6 +974,74 @@ cluster_runtime_visibility_ctrc_key_fill(const ClusterTTSlotCurrentOwner *owner,
 	return true;
 }
 
+/* A raw-xid-only scan needs a caller-owned interpretation scope. */
+typedef struct ClusterTtLocateScope {
+	FullTransactionId full_xid;
+	uint64 formation_epoch;
+	uint64 system_identifier;
+	uint64 boot_incarnation;
+	uint32 current_segment;
+	int origin_node_id;
+} ClusterTtLocateScope;
+
+static bool
+cluster_runtime_visibility_locate_scope_capture(TransactionId xid,
+												const ClusterSemanticAdmissionToken *admission,
+												ClusterTtLocateScope *scope)
+{
+	FullTransactionId next;
+	TransactionId oldest_clog;
+
+	if (scope == NULL || admission == NULL || !TransactionIdIsNormal(xid)
+		|| !cluster_runtime_visibility_admission_current(CLUSTER_TX_RESOLVE_VISIBILITY, admission))
+		return false;
+
+	/* No lock spans the durable scan or SCUR acquisition.  A subsequent
+	 * capture must still place this xid in the retained native interval.
+	 * Beyond the first raw wrap, the locator cannot establish which full
+	 * xid its disk candidate denotes; do not infer an era from proximity. */
+	next = ReadNextFullTransactionId();
+	if (!FullTransactionIdIsValid(next) || EpochFromFullTransactionId(next) != 0
+		|| xid >= XidFromFullTransactionId(next))
+		return false;
+	LWLockAcquire(XactTruncationLock, LW_SHARED);
+	oldest_clog = ShmemVariableCache->oldestClogXid;
+	LWLockRelease(XactTruncationLock);
+	if (!TransactionIdIsNormal(oldest_clog) || xid < oldest_clog
+		|| cluster_xid_origin_slot(xid) != cluster_node_id)
+		return false;
+
+	memset(scope, 0, sizeof(*scope));
+	scope->full_xid = FullTransactionIdFromEpochAndXid(0, xid);
+	scope->formation_epoch = cluster_epoch_get_current();
+	scope->system_identifier = GetSystemIdentifier();
+	scope->boot_incarnation = cluster_qvotec_get_self_incarnation();
+	scope->current_segment = cluster_tt_slot_current_segment(cluster_node_id);
+	scope->origin_node_id = cluster_node_id;
+	return scope->formation_epoch == admission->formation_epoch
+		   && scope->formation_epoch <= UINT32_MAX && scope->system_identifier != 0
+		   && scope->boot_incarnation != 0 && scope->current_segment != 0
+		   && cluster_runtime_visibility_admission_current(CLUSTER_TX_RESOLVE_VISIBILITY,
+														   admission);
+}
+
+static bool
+cluster_runtime_visibility_locate_scope_current(TransactionId xid,
+												const ClusterSemanticAdmissionToken *admission,
+												const ClusterTtLocateScope *expected)
+{
+	ClusterTtLocateScope current;
+
+	return expected != NULL
+		   && cluster_runtime_visibility_locate_scope_capture(xid, admission, &current)
+		   && FullTransactionIdEquals(current.full_xid, expected->full_xid)
+		   && current.formation_epoch == expected->formation_epoch
+		   && current.system_identifier == expected->system_identifier
+		   && current.boot_incarnation == expected->boot_incarnation
+		   && current.current_segment == expected->current_segment
+		   && current.origin_node_id == expected->origin_node_id;
+}
+
 static bool
 cluster_runtime_visibility_current_owner_lookup_internal(
 	TransactionId xid, ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out,
@@ -992,7 +1060,10 @@ cluster_runtime_visibility_current_owner_lookup_internal(
 	ClusterCtrcTxnKeyV1 ctrc_key;
 	ClusterCtrcParticipantIdentity participant;
 	ClusterCanonicalTxnBinding local_binding;
+	ClusterTTSlotPhysicalLocator physical_locator = { 0 };
+	ClusterTtLocateScope locate_scope;
 	const ClusterCanonicalTxnBinding *expected_binding = NULL;
+	bool located_physical = false;
 	ClusterUndoBlock0Result current_result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 	bool sampled = false;
 	bool ctrc_physical_active = false;
@@ -1031,9 +1102,35 @@ cluster_runtime_visibility_current_owner_lookup_internal(
 																		 &owner))
 			goto done;
 		expected_binding = &local_binding;
-	} else if (!cluster_tt_slot_current_owner_by_xid(cluster_node_id, xid, &owner)
-			   || !cluster_runtime_visibility_current_owner_shape_valid(xid, &owner))
-		goto done;
+	} else if (cluster_tt_slot_current_owner_by_xid(cluster_node_id, xid, &owner)) {
+		if (!cluster_runtime_visibility_current_owner_shape_valid(xid, &owner))
+			goto done;
+	} else {
+		uint16 segment = 0;
+		uint16 slot = TT_SLOTS_PER_SEGMENT;
+		uint16 wrap = TT_WRAP_INVALID;
+
+		if (!cluster_runtime_visibility_locate_scope_capture(xid, &admission, &locate_scope)
+			|| cluster_tt_slot_durable_locate_any_by_xid_origin(cluster_node_id, xid, &segment,
+																&slot, &wrap, NULL)
+				   != CLUSTER_TT_DURABLE_LOCATE_FOUND)
+			goto done;
+		physical_locator.segment_id = segment;
+		physical_locator.xid = xid;
+		physical_locator.slot_offset = slot;
+		physical_locator.wrap = wrap;
+		if (!cluster_runtime_visibility_physical_locator_shape_valid(&physical_locator)
+			|| !cluster_runtime_visibility_locate_scope_current(xid, &admission, &locate_scope))
+			goto done;
+		/* Only identity is reused for the CTRC key.  Disk status is not a
+		 * verdict, and the CURRENT-only recheck is inapplicable to old slots. */
+		memset(&owner, 0, sizeof(owner));
+		owner.segment_id = segment;
+		owner.xid = xid;
+		owner.slot_offset = slot;
+		owner.wrap = wrap;
+		located_physical = true;
+	}
 	logical.owner_instance = (uint8)((uint32)cluster_node_id + 1);
 	logical.segment_id = owner.segment_id;
 	if (!cluster_runtime_visibility_resolve_root_admitted(
@@ -1048,10 +1145,18 @@ cluster_runtime_visibility_current_owner_lookup_internal(
 	{
 		if (cluster_runtime_visibility_candidate_acquire(&logical, &admission, &guard, &cleanup,
 														 &current_result)
-			== CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
-			sampled = cluster_runtime_visibility_current_owner_sample_held_internal(
-				xid, &owner, expected_binding, &admission, &guard, &root, key_out, result_out,
-				&ctrc_physical_active);
+			== CLUSTER_UNDO_BLOCK0_CURRENT_HELD) {
+			if (located_physical)
+				sampled = cluster_runtime_visibility_physical_locator_sample_held(
+							  &physical_locator, &admission, &guard, &root, key_out, result_out,
+							  &ctrc_physical_active, NULL)
+						  && cluster_runtime_visibility_locate_scope_current(xid, &admission,
+																			 &locate_scope);
+			else
+				sampled = cluster_runtime_visibility_current_owner_sample_held_internal(
+					xid, &owner, expected_binding, &admission, &guard, &root, key_out, result_out,
+					&ctrc_physical_active);
+		}
 		if (sampled && ctrc_required && !ctrc_physical_active)
 			sampled = false;
 		if (sampled && ctrc_required && result_out->status == CLUSTER_TT_STATUS_IN_PROGRESS) {
@@ -1103,6 +1208,13 @@ cluster_runtime_visibility_current_owner_lookup_internal(
 	}
 	PG_END_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
 								PointerGetDatum(&cleanup));
+	if (sampled && located_physical
+		&& (!cluster_runtime_visibility_locate_scope_current(xid, &admission, &locate_scope)
+			|| !cluster_runtime_visibility_resolve_root_admitted(
+				CLUSTER_TX_RESOLVE_VISIBILITY, &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+				logical.owner_instance, logical.segment_id, &final_root)
+			|| !cluster_runtime_visibility_candidate_root_matches(&root, &final_root)))
+		sampled = false;
 
 done:
 	cluster_semantic_activation_leave(&admission);
