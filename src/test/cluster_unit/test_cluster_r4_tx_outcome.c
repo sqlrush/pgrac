@@ -179,6 +179,12 @@ static bool test_mx_batch_enabled;
 static int test_mx_remote_calls;
 static bool test_mx_remote_failed;
 static bool test_mx_remote_revokes_grant;
+static int test_undo_pending_prepare_calls;
+static int test_undo_pending_cancel_calls;
+static ClusterCtrcTxnKeyV1 test_undo_pending_key;
+static ClusterCtrcParticipantIdentity test_undo_pending_participant;
+static ClusterCtrcPublicationIdV1 test_undo_pending_publication;
+static ClusterCtrcTargetV1 test_undo_pending_target;
 static uint32 test_current_segment;
 static bool test_current_segment_drift_on_recheck;
 static int test_current_segment_calls;
@@ -857,6 +863,40 @@ cluster_ctrc_origin_grant_publishable(const ClusterCtrcTxnKeyV1 *key,
 		   && participant->formation_epoch == test_formation_epoch;
 }
 
+TransactionId
+GetTopTransactionIdIfAny(void)
+{
+	return TEST_ORIGIN_XID;
+}
+
+ClusterCtrcPrepareResult
+cluster_ctrc_receipt_prepare_shared(const ClusterCtrcTxnKeyV1 *key,
+									const ClusterCtrcParticipantIdentity *participant, uint32 grant,
+									const ClusterCtrcPublicationIdV1 *publication,
+									const ClusterCtrcTargetV1 *target,
+									ClusterCtrcReceiptHandle *handle)
+{
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+	UT_ASSERT_EQ(grant, test_ctrc_touch_grant);
+	test_undo_pending_prepare_calls++;
+	test_undo_pending_key = *key;
+	test_undo_pending_participant = *participant;
+	test_undo_pending_publication = *publication;
+	test_undo_pending_target = *target;
+	memset(handle, 0, sizeof(*handle));
+	handle->key = *key;
+	handle->valid = true;
+	return CLUSTER_CTRC_PREPARE_READY;
+}
+
+bool
+cluster_ctrc_receipt_cancel_shared(const ClusterCtrcReceiptHandle *handle)
+{
+	UT_ASSERT(handle->valid);
+	test_undo_pending_cancel_calls++;
+	return true;
+}
+
 uint32
 cluster_tt_slot_current_segment(int node_id)
 {
@@ -1239,6 +1279,12 @@ reset_exact_origin_fixture(void)
 	test_mx_remote_calls = 0;
 	test_mx_remote_failed = false;
 	test_mx_remote_revokes_grant = false;
+	test_undo_pending_prepare_calls = 0;
+	test_undo_pending_cancel_calls = 0;
+	memset(&test_undo_pending_key, 0, sizeof(test_undo_pending_key));
+	memset(&test_undo_pending_participant, 0, sizeof(test_undo_pending_participant));
+	memset(&test_undo_pending_publication, 0, sizeof(test_undo_pending_publication));
+	memset(&test_undo_pending_target, 0, sizeof(test_undo_pending_target));
 	test_current_segment = TEST_TT_SEGMENT + 1;
 	test_current_segment_drift_on_recheck = false;
 	test_current_segment_calls = 0;
@@ -1940,6 +1986,159 @@ reset_rolled_updater_fixture(bool cross_segment)
 	test_origin_record.tt_slot_segment_id = cross_segment ? TEST_TT_SEGMENT : TEST_RECORD_SEGMENT;
 	test_ctrc_touch_segment = cross_segment ? TEST_TT_SEGMENT : TEST_RECORD_SEGMENT;
 	test_ctrc_touch_generation = cross_segment ? 23 : 17;
+}
+
+void undo_pending_test_reserve(ClusterUndoRecordPrepareReceipt *receipt, uint16 segment,
+							   uint16 offset, uint8 pending_mask);
+bool undo_pending_test_receipt_matches(const ClusterUndoRecordPrepareReceipt *receipt);
+
+static void
+assert_undo_pending_refused(ClusterUndoRecordPrepareReceipt *receipt)
+{
+	ClusterUndoRecordPrepareReceipt original = *receipt;
+
+	UT_ASSERT(!cluster_undo_record_ctrc_prepare_pending(receipt, 0));
+	UT_ASSERT(memcmp(receipt, &original, sizeof(*receipt)) == 0);
+	UT_ASSERT_EQ(test_undo_pending_prepare_calls, 0);
+	UT_ASSERT_EQ(test_undo_pending_cancel_calls, 0);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+	UT_ASSERT_EQ(test_xact_lock_depth, 0);
+	UT_ASSERT_EQ(test_native_fence_depth, 0);
+}
+
+UT_TEST(test_retained_active_identity_reaches_real_undo_pending)
+{
+	int binding;
+
+	for (binding = 0; binding < 2; binding++) {
+		ClusterUndoRecordPrepareReceipt receipt;
+		uint8 ordinal;
+
+		reset_rolled_active_fixture();
+		test_local_binding_available = binding != 0;
+		undo_pending_test_reserve(&receipt, TEST_TT_SEGMENT, TEST_TT_OFFSET, 3);
+		for (ordinal = 0; ordinal < 2; ordinal++) {
+			uint8 bit = UINT8_C(1) << ordinal;
+
+			UT_ASSERT(cluster_undo_record_ctrc_prepare_pending(&receipt, ordinal));
+			UT_ASSERT(undo_pending_test_receipt_matches(&receipt));
+			UT_ASSERT(receipt.ctrc_handles[ordinal].valid);
+			UT_ASSERT((receipt.ctrc_prepared_mask & bit) != 0);
+			UT_ASSERT(memcmp(&test_undo_pending_key, &test_ctrc_touched_key,
+							 sizeof(test_undo_pending_key))
+					  == 0);
+			UT_ASSERT(memcmp(&test_undo_pending_participant, &test_ctrc_touched_participant,
+							 sizeof(test_undo_pending_participant))
+					  == 0);
+			UT_ASSERT_EQ(test_undo_pending_key.segment_id, TEST_TT_SEGMENT);
+			UT_ASSERT_EQ(test_undo_pending_key.slot_offset, TEST_TT_OFFSET);
+			UT_ASSERT_EQ(test_undo_pending_key.slot_wrap, TEST_ORIGIN_WRAP);
+			UT_ASSERT_EQ(test_undo_pending_publication.requester_node_id, 0);
+			UT_ASSERT_EQ(test_undo_pending_publication.requester_boot_incarnation,
+						 test_boot_incarnation);
+			UT_ASSERT_EQ(test_undo_pending_publication.capability_record_generation, 77);
+			UT_ASSERT_EQ(test_undo_pending_publication.requester_backend_id, MyBackendId);
+			UT_ASSERT_EQ(test_undo_pending_publication.wire_request_id,
+						 receipt.reservation_sequence);
+			UT_ASSERT_EQ(test_undo_pending_publication.operation_id,
+						 receipt.reservation_sequence + ordinal);
+			UT_ASSERT_EQ(test_undo_pending_publication.attempt_generation, 3);
+			UT_ASSERT_EQ(test_undo_pending_publication.reference_kind, CTRC_REF_HEAP_ITL_UBA);
+			UT_ASSERT_EQ(test_undo_pending_publication.target_kind,
+						 CTRC_TARGET_PAGE_PENDING_ITL_SLOT);
+			UT_ASSERT_EQ(test_undo_pending_publication.grant_generation, test_ctrc_touch_grant);
+			UT_ASSERT_EQ(test_undo_pending_target.block_number, 37 + ordinal);
+			UT_ASSERT_EQ(receipt.absolute_deadline_us, 1000);
+		}
+		UT_ASSERT_EQ(receipt.ctrc_prepared_mask, 3);
+		UT_ASSERT_EQ(receipt.ctrc_applied_mask, 0);
+		UT_ASSERT_EQ(test_undo_pending_prepare_calls, 2);
+		UT_ASSERT_EQ(test_undo_pending_cancel_calls, 0);
+		UT_ASSERT_EQ(test_durable_locator_calls, binding ? 0 : 2);
+		UT_ASSERT(!test_current_owner_available);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, test_candidate_release_calls);
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+		UT_ASSERT_EQ(test_xact_lock_depth, 0);
+	}
+}
+
+UT_TEST(test_retained_undo_pending_requires_matching_active_tt_receipt)
+{
+	int fault;
+
+	for (fault = 0; fault < 8; fault++) {
+		ClusterUndoRecordPrepareReceipt receipt;
+
+		reset_rolled_active_fixture();
+		undo_pending_test_reserve(&receipt, TEST_TT_SEGMENT + (fault == 0),
+								  TEST_TT_OFFSET + (fault == 1), 1);
+		switch (fault) {
+		case 2:
+			test_ctrc_touch_grant = 0;
+			break;
+		case 3:
+		case 4:
+			test_tt_slot.status = TT_SLOT_COMMITTED;
+			test_tt_slot.commit_scn = test_commit_scn;
+			if (fault == 4)
+				test_native_status = TRANSACTION_STATUS_COMMITTED;
+			break;
+		case 5:
+			test_tt_slot.status = TT_SLOT_ABORTED;
+			test_native_status = TRANSACTION_STATUS_ABORTED;
+			break;
+		case 6:
+			test_twophase_prepared = true;
+			break;
+		case 7:
+			receipt.reservation_sequence++;
+			break;
+		default:
+			break;
+		}
+		assert_undo_pending_refused(&receipt);
+		UT_ASSERT_EQ(test_ctrc_touch_calls, fault <= 2 ? 1 : 0);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, test_candidate_release_calls);
+	}
+}
+
+UT_TEST(test_retained_undo_pending_guard_drift_cannot_publish)
+{
+	int fault;
+
+	for (fault = 0; fault < 12; fault++) {
+		ClusterUndoRecordPrepareReceipt receipt;
+
+		reset_rolled_active_fixture();
+		undo_pending_test_reserve(&receipt, TEST_TT_SEGMENT, TEST_TT_OFFSET, 1);
+		switch (fault) {
+		case 0:
+			test_tt_slot.wrap++;
+			break;
+		case 1:
+			test_candidate_copy_generation_drift = true;
+			break;
+		case 2:
+			test_ctrc_touch_generation_drift = true;
+			break;
+		case 3:
+			test_candidate_release_admission_drift = true;
+			break;
+		case 4:
+			test_candidate_release_failed = true;
+			break;
+		case 5:
+			test_candidate_release_epoch_drift = true;
+			break;
+		default:
+			test_release_scope_drift = fault - 5;
+			break;
+		}
+		assert_undo_pending_refused(&receipt);
+		UT_ASSERT(undo_pending_test_receipt_matches(&receipt));
+		UT_ASSERT_EQ(test_candidate_acquire_calls, test_candidate_release_calls);
+		UT_ASSERT_EQ(test_candidate_cancel_calls, fault == 4 ? 1 : 0);
+	}
 }
 
 static ClusterMxResolveResult
@@ -5537,7 +5736,10 @@ UT_TEST(test_self_fresh_role_does_not_inherit_ordinary_abort_permission)
 int
 main(void)
 {
-	UT_PLAN(157);
+	UT_PLAN(160);
+	UT_RUN(test_retained_active_identity_reaches_real_undo_pending);
+	UT_RUN(test_retained_undo_pending_requires_matching_active_tt_receipt);
+	UT_RUN(test_retained_undo_pending_guard_drift_cannot_publish);
 	UT_RUN(test_retained_active_identity_reaches_real_mx_batch);
 	UT_RUN(test_retained_active_mx_batch_scrubs_earlier_local_proof);
 	UT_RUN(test_retained_mx_precommit_retries_preserve_batch_deadline);

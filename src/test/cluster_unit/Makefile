@@ -6046,12 +6046,19 @@ test_cluster_current_mx_local_sample.inc: $(top_srcdir)/src/backend/cluster/clus
 	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_undo_pending_product.o: test_cluster_undo_pending_product.c \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_record.c \
+		$(top_srcdir)/src/include/cluster/cluster_undo_record_api.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
 test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c unit_test.h \
 		test_cluster_current_mx_local_sample.inc \
+		test_cluster_undo_pending_product.o \
 		$(CLUSTER_R4_RUNTIME_VIS_TEST_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O) \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
 		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_RUNTIME_VIS_POLICY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		test_cluster_undo_pending_product.o \
 		$(CLUSTER_R4_RUNTIME_VIS_TEST_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O) \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
 		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_RUNTIME_VIS_POLICY_O) \
