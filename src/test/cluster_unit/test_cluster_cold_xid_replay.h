@@ -16,6 +16,29 @@ static bool replay_checkpoint_ok, replay_decode_ok, replay_drain_ok;
 static bool replay_decode_foreign;
 static unsigned replay_drain_calls;
 static uint8 replay_fence;
+static unsigned replay_barrier_calls, replay_endpoint_calls;
+static bool replay_endpoint_ok;
+
+void
+cluster_cold_durable_barrier_v1(const ClusterColdTouchedV1 *touched)
+{
+	UT_ASSERT(touched != NULL);
+	replay_barrier_calls++;
+}
+
+bool
+cluster_cold_typed_xid_endpoints_v1(ClusterColdTypedV1 *typed,
+									struct ClusterRecoveryFencePlan *fence,
+									const ClusterColdReplayResultV1 *result,
+									const ClusterColdXidProgressV1 *progress)
+{
+	UT_ASSERT(typed == &replay_typed);
+	UT_ASSERT(fence == (struct ClusterRecoveryFencePlan *)&replay_fence);
+	UT_ASSERT(result != NULL && progress != NULL);
+	UT_ASSERT_EQ(replay_barrier_calls, 1);
+	replay_endpoint_calls++;
+	return replay_endpoint_ok;
+}
 
 static void
 HandleStartupProcInterrupts(void)
@@ -243,5 +266,18 @@ UT_TEST(test_replay_xid_bad_checkpoint_or_source)
 		if (fault == 2) replay_checkpoints[1].checkpoint.redo++;
 		UT_ASSERT(!cluster_typed_replay_xid_begin(&replay_adapter));
 		UT_ASSERT_EQ(replay_typed.xid_next_at_drain[1], 0);
+	}
+}
+
+UT_TEST(test_replay_endpoints_follow_durability_and_propagate_refusal)
+{
+	for (int ok = 0; ok <= 1; ok++) {
+		ClusterColdReplayResultV1 result = { 0 };
+		replay_xid_reset(1);
+		replay_barrier_calls = replay_endpoint_calls = 0;
+		replay_endpoint_ok = ok;
+		UT_ASSERT_EQ(cluster_typed_replay_durable_endpoints(&replay_adapter, &result), ok);
+		UT_ASSERT_EQ(replay_barrier_calls, 1);
+		UT_ASSERT_EQ(replay_endpoint_calls, 1);
 	}
 }

@@ -64,6 +64,7 @@ ExceptionalCondition(const char *condition_name, const char *file_name, int line
 
 #include "test_cluster_cold_recovery_startup_boundary.h"
 #include "test_cluster_cold_source_completion.inc"
+#include "test_cluster_cold_endpoints.h"
 
 UT_TEST(test_prepare_seals_own_and_fenced_generations)
 {
@@ -2991,7 +2992,16 @@ UT_TEST(test_checkpoint_export_clears_unsealed_and_failed_output)
 int
 main(void)
 {
-	UT_PLAN(90);
+	UT_PLAN(99);
+	UT_RUN(test_endpoints_maximum_uses_complete_full_width_inputs);
+	UT_RUN(test_endpoints_include_every_history_generation_original_checkpoint_cut);
+	UT_RUN(test_endpoints_reject_partial_or_conflicting_replay_counters);
+	UT_RUN(test_endpoints_reject_missing_or_tail_only_history_inputs);
+	UT_RUN(test_endpoints_require_whole_sequencer_completion_and_exact_tails);
+	UT_RUN(test_endpoints_require_current_original_owner_and_all_sources);
+	UT_RUN(test_endpoints_recheck_original_sources_before_publishing_maximum);
+	UT_RUN(test_endpoints_error_discards_group_and_preserves_prior_refusal);
+	UT_RUN(test_endpoints_new_sync_invalidates_previous_aggregate);
 	UT_RUN(test_history_durability_failure_discards_provisional_inputs_stickily);
 	UT_RUN(test_history_durability_rechecks_root_checkpoint_and_original_owner);
 	UT_RUN(test_history_durability_error_clears_provisional_inputs);

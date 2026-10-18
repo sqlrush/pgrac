@@ -637,6 +637,8 @@ census_refresh_inputs(void)
 		item->checkpoint.identity = entry->identity;
 		item->checkpoint.checkpoint_lower_lsn = entry->cut.physical_lower;
 		item->checkpoint.validated_tail_lsn_exclusive = entry->cut.tail_end;
+		item->checkpoint.tail_last_record_lsn = entry->cut.physical_lower;
+		item->checkpoint.tail_last_record_crc32c = 0;
 		item->checkpoint_start = entry->cut.physical_lower;
 		item->native_redo = entry->cut.physical_lower;
 		item->native_checkpoint = native_checkpoint[entry->cut.thread_id].checkpoint;
@@ -704,6 +706,8 @@ cluster_wal_inputs_cold_checkpoint_v1(const ClusterControlRootSnapshot *expected
 			fence_current = false;
 		if (history_checkpoint_fault == 2)
 			siglongjmp(*PG_exception_stack, 1);
+		if (history_checkpoint_fault == 3)
+			native_checkpoint[1].checkpoint.oldestXid++;
 		out->source = item->source;
 		out->checkpoint_start = item->checkpoint_start;
 		out->checkpoint = item->native_checkpoint;

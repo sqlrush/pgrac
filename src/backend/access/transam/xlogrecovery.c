@@ -3227,6 +3227,7 @@ cluster_typed_replay_xid_begin(ClusterColdTypedReplay *rep)
 
 	memset(rep->xid_progress, 0, sizeof(rep->xid_progress));
 	memset(typed->xid_next_at_drain, 0, sizeof(typed->xid_next_at_drain));
+	typed->xid_next_after_redo = 0;
 	if (typed->participant_count == 0
 		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
 		|| typed->replay_count > typed->participant_count)
@@ -3721,6 +3722,16 @@ cluster_typed_replay_unpublished(uint16 thread, const char *what, int detail)
 	pg_unreachable();
 }
 
+/* Keep the original physical durability barrier before counter publication. */
+static bool
+cluster_typed_replay_durable_endpoints(ClusterColdTypedReplay *rep,
+									   const ClusterColdReplayResultV1 *result)
+{
+	cluster_cold_durable_barrier_v1(&rep->touched);
+	return cluster_cold_typed_xid_endpoints_v1(rep->typed, *rep->fence_plan, result,
+											   rep->xid_progress);
+}
+
 /*
  * Publish every fenced generation recovered: pass 2 must have ended exactly
  * at its sealed tail, every file pass 2 changed (and every SPACE relation)
@@ -3739,7 +3750,9 @@ cluster_typed_replay_publish(ClusterColdTypedReplay *rep, const ClusterColdRepla
 	if (!cluster_cold_completion_ready_v1(rep->typed, plan, result, &rep->touched, &thread))
 		cluster_typed_replay_unpublished(thread, "Replay did not end at its sealed tail",
 										 (int) result->detail);
-	cluster_cold_durable_barrier_v1(&rep->touched);
+	if (!cluster_typed_replay_durable_endpoints(rep, result))
+		cluster_typed_replay_unpublished(thread, "Original-source counter endpoints are incomplete",
+										 (int)rep->typed->refusal);
 	switch (cluster_recovery_merge_fence_plan_complete_v1(plan, &thread, &detail))
 	{
 		case CLUSTER_RECOVERY_FENCE_COMPLETE_OK:

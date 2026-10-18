@@ -782,6 +782,9 @@ typedef struct ClusterColdTypedV1 {
 	/* Provisional native counters after counted pass-2 drain. Zero means
 	 * missing; these do not prove global effects/durability or all-thread N. */
 	uint64 xid_next_at_drain[CLUSTER_COLD_MAX_PARTICIPANTS];
+	/* Full-width maximum of every original counter endpoint after replay
+	 * and the caller's durability barrier. No TT/top/loser authority. */
+	uint64 xid_next_after_redo;
 	/* Read-only pass-1 inputs for history generations. Their source redo is
 	 * the original checkpoint's, not the history mutation cut at tail. No
 	 * pass-2 endpoint: final source freshness/durability still needs proof. */
@@ -1006,6 +1009,13 @@ cluster_cold_typed_tt_base_redo_graph_read_v1(void *arg, const ClusterRecoveryTx
  * completion authority is created; a refusal invalidates this typed attempt. */
 extern bool cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed,
 											   struct ClusterRecoveryFencePlan *fence);
+
+/* Call after the original sequencer and physical durability barrier, while
+ * the original execution owner remains held. No allocator is advanced. */
+extern bool cluster_cold_typed_xid_endpoints_v1(ClusterColdTypedV1 *typed,
+												struct ClusterRecoveryFencePlan *fence,
+												const ClusterColdReplayResultV1 *result,
+												const ClusterColdXidProgressV1 *progress);
 
 /* Bind the original sequencer's completed source to its captured ROOT.
  * This is redo ordering only, not terminal, service or OPEN authority. */

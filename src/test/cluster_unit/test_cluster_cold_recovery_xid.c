@@ -322,7 +322,8 @@ UT_TEST(test_null_and_uninitialized_inputs)
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(25);
+	UT_RUN(test_replay_endpoints_follow_durability_and_propagate_refusal);
 	UT_RUN(test_empty_cut_retains_checkpoint);
 	UT_RUN(test_ordered_header_and_payload);
 	UT_RUN(test_wrap_skips_reserved_xids);

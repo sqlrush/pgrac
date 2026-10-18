@@ -992,6 +992,7 @@ cold_execution_inputs_failed(ClusterColdTypedV1 *typed)
 		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "pass-2 original input freshness is incomplete");
 	memset(typed->history_xid, 0, sizeof(typed->history_xid));
 	memset(typed->xid_next_at_drain, 0, sizeof(typed->xid_next_at_drain));
+	typed->xid_next_after_redo = 0;
 	typed->census_root_captured = false;
 }
 
@@ -1028,6 +1029,7 @@ cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFen
 		return false;
 	/* ERROR from an original source owner must not leave a reusable OK plan. */
 	cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "pass-2 source durability is incomplete");
+	typed->xid_next_after_redo = 0;
 	memset(typed->source_drained, 0, sizeof(typed->source_drained));
 	memset(typed->xid_next_at_drain, 0, sizeof(typed->xid_next_at_drain));
 	if (fence == NULL || !cluster_cold_replay_window_active_v1() || typed->plan == NULL
@@ -1084,6 +1086,109 @@ cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFen
 	}
 	typed->refusal = CLUSTER_COLD_OK;
 	typed->refusal_detail[0] = '\0';
+	return true;
+}
+
+static bool
+cold_xid_endpoint(const ClusterColdTypedV1 *typed, const ClusterColdReplayResultV1 *result,
+				  const ClusterColdXidProgressV1 *progress, uint32 p, uint64 *next)
+{
+	const ColdRoot *selected = &typed->replay_roots[p];
+	const ClusterControlRootSnapshot *root = &selected->root;
+	ClusterColdParticipantV1 source = typed->participants[p];
+	const ClusterColdXidProgressV1 *xid = &progress[p];
+	uint64 records = cluster_cold_plan_replay_record_count_v1(typed->plan, p);
+
+	if (!selected->checkpoint_captured
+		|| !cluster_cold_plan_participant_matches_v1(typed->plan, p, &source))
+		return false;
+	if (p >= typed->replay_count) {
+		/* A zero-record tail mutation cut cannot supply the original
+		 * checkpoint-to-tail counter coverage of a history generation. */
+		if (records != 0 || result->last_read[p] != InvalidXLogRecPtr
+			|| result->last_end[p] != InvalidXLogRecPtr || result->last_crc[p] != 0)
+			return false;
+		source.native_redo = selected->native_checkpoint.redo;
+		xid = &typed->history_xid[p];
+		if (source.native_redo != source.tail_end) {
+			if (progress[p].begun || progress[p].failed || typed->xid_next_at_drain[p] != 0)
+				return false;
+		} else {
+			uint64 drained;
+			if (progress[p].expected_records != 0 || progress[p].last_read != InvalidXLogRecPtr
+				|| !cluster_cold_xid_candidate_v1(&progress[p], &source, &drained)
+				|| drained != typed->xid_next_at_drain[p] || drained != xid->next_xid)
+				return false;
+		}
+	} else if (selected->native_checkpoint.redo != source.native_redo
+			   || xid->expected_records != records || xid->last_read != result->last_read[p]
+			   || result->last_end[p] != (records == 0 ? InvalidXLogRecPtr : xid->last_end)
+			   || typed->xid_next_at_drain[p] != xid->next_xid
+			   || (records == 0 && result->last_crc[p] != 0)
+			   || (records != 0 && result->last_crc[p] != root->tail_last_record_crc32c))
+		return false;
+	if (!cluster_cold_xid_candidate_v1(xid, &source, next))
+		return false;
+	if (source.native_redo == source.tail_end)
+		return xid->records == 0 && xid->last_read == InvalidXLogRecPtr;
+	return xid->records != 0
+		   && (root->root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID) != 0
+		   && xid->last_read == root->tail_last_record_lsn;
+}
+
+bool
+cluster_cold_typed_xid_endpoints_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence,
+									const ClusterColdReplayResultV1 *result,
+									const ClusterColdXidProgressV1 *progress)
+{
+	uint64 maximum = 0;
+	volatile bool ready = false;
+
+	if (typed == NULL)
+		return false;
+	typed->xid_next_after_redo = 0;
+	if (typed->refusal != CLUSTER_COLD_OK)
+		return false;
+	cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "pass-2 original counter endpoints are incomplete");
+	if (fence == NULL || !cluster_cold_replay_window_active_v1() || result == NULL
+		|| progress == NULL || typed->plan == NULL || typed->replay_roots == NULL
+		|| typed->own_participant != 0 || typed->replay_count == 0
+		|| typed->replay_count > typed->participant_count
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->replay_root_count != typed->replay_count
+		|| cluster_cold_plan_participant_count_v1(typed->plan) != typed->participant_count
+		|| result->detail != CLUSTER_COLD_REPLAY_OK
+		|| result->steps_done != cluster_cold_plan_step_count_v1(typed->plan)
+		|| result->space_relations_finished
+			   != cluster_cold_plan_space_relation_count_v1(typed->plan)
+		|| result->own_read != result->last_read[0] || result->own_end != result->last_end[0]) {
+		cold_execution_inputs_failed(typed);
+		return false;
+	}
+	PG_TRY();
+	{
+		ready = cold_replay_sources_current(typed, fence);
+		for (uint32 p = 0; ready && p < typed->participant_count; p++) {
+			uint64 next;
+			ready = cold_xid_endpoint(typed, result, progress, p, &next);
+			if (ready && next > maximum)
+				maximum = next;
+		}
+		if (ready)
+			ready = cold_replay_sources_current(typed, fence);
+	}
+	PG_CATCH();
+	{
+		cold_execution_inputs_failed(typed);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!ready) {
+		cold_execution_inputs_failed(typed);
+		return false;
+	}
+	typed->xid_next_after_redo = maximum;
+	typed->refusal = CLUSTER_COLD_OK;
 	return true;
 }
 
