@@ -167,6 +167,7 @@ static int test_local_binding_calls;
 static ClusterCanonicalTxnBinding test_local_binding;
 static int test_ctrc_touch_calls;
 static uint32 test_ctrc_touch_grant;
+static ClusterCtrcTouchResult test_ctrc_touch_result = CLUSTER_CTRC_TOUCH_RECORDED;
 static uint32 test_ctrc_touch_segment;
 static uint32 test_ctrc_touch_generation;
 static ClusterCtrcTxnKeyV1 test_ctrc_touched_key;
@@ -849,7 +850,7 @@ cluster_ctrc_origin_touch_exact(const ClusterCtrcTxnKeyV1 *key,
 		else
 			test_candidate_tt_generation++;
 	}
-	return test_ctrc_touch_grant == 0 ? CLUSTER_CTRC_TOUCH_REFUSED : CLUSTER_CTRC_TOUCH_RECORDED;
+	return test_ctrc_touch_grant == 0 ? CLUSTER_CTRC_TOUCH_REFUSED : test_ctrc_touch_result;
 }
 
 bool
@@ -1267,6 +1268,7 @@ reset_exact_origin_fixture(void)
 	test_local_binding.active_lsn = test_flush_lsn;
 	test_ctrc_touch_calls = 0;
 	test_ctrc_touch_grant = 41;
+	test_ctrc_touch_result = CLUSTER_CTRC_TOUCH_RECORDED;
 	test_ctrc_touch_segment = TEST_TT_SEGMENT;
 	test_ctrc_touch_generation = 23;
 	memset(&test_ctrc_touched_key, 0, sizeof(test_ctrc_touched_key));
@@ -2578,6 +2580,34 @@ UT_TEST(test_other_backend_rolled_active_uses_locator_and_ctrc)
 		UT_ASSERT_EQ(test_candidate_release_calls, 1);
 		UT_ASSERT_EQ(test_candidate_held_count, 0);
 	}
+}
+
+UT_TEST(test_other_backend_rolled_active_accepts_duplicate_ctrc_touch)
+{
+	ClusterTTStatusKey key;
+	ClusterTTStatusResult result;
+	ClusterCtrcTxnKeyV1 ctrc_key;
+	ClusterCtrcParticipantIdentity participant;
+	uint32 grant = 0;
+
+	reset_rolled_active_fixture();
+	test_ctrc_touch_result = CLUSTER_CTRC_TOUCH_DUPLICATE;
+	UT_ASSERT(cluster_runtime_visibility_current_owner_lookup_exact_ctrc_full(
+		TEST_ORIGIN_XID, &key, &result, &grant, &ctrc_key, &participant));
+	UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_IN_PROGRESS);
+	UT_ASSERT(result.authoritative);
+	UT_ASSERT_EQ(grant, test_ctrc_touch_grant);
+	UT_ASSERT_EQ(test_ctrc_touch_calls, 1);
+	UT_ASSERT_EQ(test_durable_locator_calls, 1);
+	UT_ASSERT_EQ(test_current_owner_calls, 1);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 1);
+	UT_ASSERT_EQ(test_candidate_release_calls, 1);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+	UT_ASSERT_EQ(key.undo_segment_id, TEST_TT_SEGMENT);
+	UT_ASSERT_EQ(ctrc_key.segment_id, TEST_TT_SEGMENT);
+	UT_ASSERT_EQ(ctrc_key.segment_generation, test_ctrc_touch_generation);
+	UT_ASSERT_EQ(ctrc_key.slot_offset, TEST_TT_OFFSET);
+	UT_ASSERT_EQ(ctrc_key.slot_wrap, TEST_ORIGIN_WRAP);
 }
 
 UT_TEST(test_current_mx_other_backend_rolled_active_records_original_touch)
@@ -5816,7 +5846,7 @@ UT_TEST(test_self_fresh_role_does_not_inherit_ordinary_abort_permission)
 int
 main(void)
 {
-	UT_PLAN(162);
+	UT_PLAN(163);
 	UT_RUN(test_retained_active_identity_reaches_real_undo_pending);
 	UT_RUN(test_retained_undo_pending_requires_matching_active_tt_receipt);
 	UT_RUN(test_retained_undo_pending_guard_drift_cannot_publish);
@@ -5886,6 +5916,7 @@ main(void)
 	UT_RUN(test_physical_locator_precommit_retry_marks_committed_window);
 	UT_RUN(test_ctrc_current_owner_uses_published_binding_across_rollover);
 	UT_RUN(test_other_backend_rolled_active_uses_locator_and_ctrc);
+	UT_RUN(test_other_backend_rolled_active_accepts_duplicate_ctrc_touch);
 	UT_RUN(test_current_mx_other_backend_rolled_active_records_original_touch);
 	UT_RUN(test_other_backend_rolled_terminal_uses_canonical_status);
 	UT_RUN(test_other_backend_rolled_locator_failures_do_not_acquire);
