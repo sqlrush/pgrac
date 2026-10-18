@@ -484,10 +484,239 @@ UT_TEST(tt_redo_refuses_standalone_prepared_tt_without_xact_terminal)
 	}
 }
 
+static void
+tt_redo_slot_refuses(TtRedoFixture *f, uint32 participant, uint32 segment, uint32 slot)
+{
+	ClusterColdTtSlotInputV1 out, zero = { 0 };
+
+	memset(&out, 0xa9, sizeof(out));
+	UT_ASSERT(!cluster_cold_typed_tt_redo_slot_v1(&f->typed, participant, segment, slot, &out));
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+}
+
+UT_TEST(tt_redo_slots_enumerate_every_status_and_preserve_generation_zero)
+{
+	TtRedoFixture f;
+	ClusterColdTtSlotInputV1 out;
+	const UndoSegmentHeaderData *base;
+	uint8 owner;
+	uint32 segment;
+
+	tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+	tt_redo_seal(&f);
+	base = cluster_cold_tt_base_header_v1(&f.typed, 0, &owner, &segment);
+	UT_ASSERT_NOT_NULL(base);
+	for (uint32 i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		UT_ASSERT(cluster_cold_typed_tt_redo_slot_v1(&f.typed, 0, 0, i, &out));
+		UT_ASSERT_EQ(out.key.owner_instance, 3);
+		UT_ASSERT_EQ(out.key.segment_id, 513);
+		UT_ASSERT_EQ(out.key.segment_generation, 0);
+		UT_ASSERT_EQ(out.key.slot_offset, i);
+		UT_ASSERT_EQ(out.key.xid, base->tt_slots[i].xid);
+		UT_ASSERT_EQ(out.key.slot_wrap, base->tt_slots[i].wrap);
+		UT_ASSERT(memcmp(&out.slot, &base->tt_slots[i], sizeof(TTSlot)) == 0);
+		memset(&out, 0xa9, sizeof(out));
+	}
+	UT_ASSERT(memcmp(base, f.base.data, BLCKSZ) == 0);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_redo_slot_reads_commit_and_matches_after_image_independently)
+{
+	TtRedoFixture f;
+	FakeXactRecord fake;
+	ClusterColdTtSlotInputV1 before, out;
+
+	tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+	UT_ASSERT(cluster_cold_tt_base_slot_v1(&f.typed, 0, 4, &before));
+	undo_header_commit(&fake, 0, 802);
+	undo_header_feed(f.typed.side_plans[0], &fake, 100);
+	tt_redo_seal(&f);
+	UT_ASSERT(cluster_cold_typed_tt_redo_slot_v1(&f.typed, 0, 0, 4, &out));
+	UT_ASSERT_EQ(before.slot.status, TT_SLOT_ACTIVE);
+	UT_ASSERT_EQ(out.slot.status, TT_SLOT_COMMITTED);
+	UT_ASSERT_EQ(out.slot.commit_scn, 999);
+	UT_ASSERT(cluster_cold_typed_tt_redo_match_v1(&f.typed, 0, 0, &out.key, &out));
+	UT_ASSERT_EQ(out.slot.status, TT_SLOT_COMMITTED);
+	UT_ASSERT_EQ(out.slot.commit_scn, 999);
+	memset(&out.slot, 0xa9, sizeof(out.slot));
+	UT_ASSERT(cluster_cold_typed_tt_redo_match_v1(&f.typed, 0, 0, &before.key, &out));
+	UT_ASSERT_EQ(out.slot.status, TT_SLOT_COMMITTED);
+	UT_ASSERT(cluster_cold_tt_base_slot_v1(&f.typed, 0, 4, &before));
+	UT_ASSERT_EQ(before.slot.status, TT_SLOT_ACTIVE);
+	UT_ASSERT(!SCN_VALID(before.slot.commit_scn));
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_redo_slot_reads_exact_abort_without_loser_inference)
+{
+	TtRedoFixture f;
+	FakeXactRecord fake;
+	ClusterColdTtSlotInputV1 out;
+
+	tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+	undo_header_abort(&fake, 4);
+	undo_header_feed(f.typed.side_plans[0], &fake, 100);
+	tt_redo_seal(&f);
+	UT_ASSERT(cluster_cold_typed_tt_redo_slot_v1(&f.typed, 0, 0, 4, &out));
+	UT_ASSERT_EQ(out.slot.status, TT_SLOT_ABORTED);
+	UT_ASSERT_EQ(out.key.xid, 802);
+	UT_ASSERT_EQ(out.key.slot_wrap, 7);
+	UT_ASSERT(cluster_cold_typed_tt_redo_match_v1(&f.typed, 0, 0, &out.key, &out));
+	UT_ASSERT_EQ(out.slot.status, TT_SLOT_ABORTED);
+	UT_ASSERT(cluster_cold_typed_tt_redo_slot_v1(&f.typed, 0, 0, 47, &out));
+	UT_ASSERT_EQ(out.slot.status, TT_SLOT_ACTIVE);
+	UT_ASSERT(memcmp(&out.slot.first_undo_block,
+					 &((UndoSegmentHeaderData *)f.base.data)->tt_slots[47].first_undo_block,
+					 sizeof(UBA))
+			  == 0);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_redo_match_refuses_each_stale_key_field_and_clears_output)
+{
+	TtRedoFixture f;
+	ClusterColdTtSlotInputV1 input, out, zero = { 0 };
+	ClusterColdTtSlotKeyV1 key;
+
+	tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+	tt_redo_seal(&f);
+	UT_ASSERT(cluster_cold_typed_tt_redo_slot_v1(&f.typed, 0, 0, 47, &input));
+	for (int fault = 0; fault < 10; fault++) {
+		key = input.key;
+		if (fault == 0)
+			key.owner_instance = 2;
+		if (fault == 1)
+			key.segment_id++;
+		if (fault == 2)
+			key.segment_generation++;
+		if (fault == 3)
+			key.slot_offset--;
+		if (fault == 4)
+			key.xid++;
+		if (fault == 5)
+			key.slot_wrap++;
+		if (fault == 6)
+			key.owner_instance = 0;
+		if (fault == 7)
+			key.slot_offset = TT_SLOTS_PER_SEGMENT;
+		if (fault == 8)
+			key.xid = InvalidTransactionId;
+		if (fault == 9)
+			key.slot_wrap = TT_WRAP_INVALID;
+		memset(&out, 0xa9, sizeof(out));
+		UT_ASSERT(!cluster_cold_typed_tt_redo_match_v1(&f.typed, 0, 0, &key, &out));
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	}
+	UT_ASSERT(cluster_cold_typed_tt_redo_match_v1(&f.typed, 0, 0, &input.key, &out));
+	UT_ASSERT_EQ(out.slot.status, TT_SLOT_ACTIVE);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_redo_slots_reject_unsealed_history_bounds_and_invalid_arguments)
+{
+	TtRedoFixture f;
+	ClusterColdTtSlotInputV1 out, zero = { 0 };
+	ClusterColdTtSlotKeyV1 key = { 0 };
+
+	tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+	tt_redo_slot_refuses(&f, 0, 0, 4);
+	tt_redo_seal(&f);
+	tt_redo_slot_refuses(&f, 1, 0, 4);
+	tt_redo_slot_refuses(&f, UINT32_MAX, 0, 4);
+	tt_redo_slot_refuses(&f, 0, UINT32_MAX, 4);
+	tt_redo_slot_refuses(&f, 0, 0, TT_SLOTS_PER_SEGMENT);
+	UT_ASSERT(cluster_cold_tt_base_slot_v1(&f.typed, 0, 4, &out));
+	key = out.key;
+	UT_ASSERT(!cluster_cold_typed_tt_redo_match_v1(&f.typed, 0, 1, &key, &out));
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	memset(&out, 0xa9, sizeof(out));
+	UT_ASSERT(!cluster_cold_typed_tt_redo_slot_v1(NULL, 0, 0, 4, &out));
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	UT_ASSERT(!cluster_cold_typed_tt_redo_slot_v1(&f.typed, 0, 0, 4, NULL));
+	memset(&out, 0xa9, sizeof(out));
+	UT_ASSERT(!cluster_cold_typed_tt_redo_match_v1(NULL, 0, 0, &key, &out));
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	memset(&out, 0xa9, sizeof(out));
+	UT_ASSERT(!cluster_cold_typed_tt_redo_match_v1(&f.typed, 0, 0, NULL, &out));
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	UT_ASSERT(!cluster_cold_typed_tt_redo_match_v1(&f.typed, 0, 0, &key, NULL));
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_redo_slots_refuse_source_drift_and_unsupported_prepared_input)
+{
+	TtRedoFixture f;
+	FakeXactRecord fake;
+	ClusterColdTtSlotInputV1 input, out, zero = { 0 };
+
+	tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+	make_commit_prepared(&fake, 802, 16384, 901, 123456);
+	undo_header_feed(f.typed.side_plans[0], &fake, 100);
+	tt_redo_seal(&f);
+	tt_redo_slot_refuses(&f, 0, 0, 4);
+	UT_ASSERT(cluster_cold_tt_base_slot_v1(&f.typed, 0, 4, &input));
+	memset(&out, 0xa9, sizeof(out));
+	UT_ASSERT(!cluster_cold_typed_tt_redo_match_v1(&f.typed, 0, 0, &input.key, &out));
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	tt_redo_destroy(&f);
+	tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+	tt_redo_seal(&f);
+	UT_ASSERT(cluster_cold_tt_base_slot_v1(&f.typed, 0, 4, &input));
+	f.typed.participants[0].native_redo++;
+	tt_redo_slot_refuses(&f, 0, 0, 4);
+	memset(&out, 0xa9, sizeof(out));
+	UT_ASSERT(!cluster_cold_typed_tt_redo_match_v1(&f.typed, 0, 0, &input.key, &out));
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_redo_slots_use_reused_binding_instead_of_captured_key)
+{
+	TtRedoFixture f;
+	FakeXactRecord fake;
+	xl_undo_tt_slot_bind bind;
+	ClusterColdTtSlotInputV1 before, out, zero = { 0 };
+	UndoSegmentHeaderData *header;
+	char path[MAXPGPATH];
+	int fd;
+
+	tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+	header = (UndoSegmentHeaderData *)f.base.data;
+	header->tt_slots[4].status = TT_SLOT_RECYCLABLE;
+	snprintf(path, sizeof(path), "%s/513", tt_redo_dir);
+	fd = open(path, O_RDWR);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(pwrite(fd, f.base.data, BLCKSZ, 0), BLCKSZ);
+	UT_ASSERT_EQ(close(fd), 0);
+	cluster_cold_tt_base_destroy_v1(&f.typed);
+	UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(&f.typed, (Size)1024 * 1024), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_tt_base_slot_v1(&f.typed, 0, 4, &before));
+	undo_header_bind(&fake, 0);
+	memcpy(&bind, fake.data, sizeof(bind));
+	bind.wrap = 8;
+	bind.xid = 806;
+	memcpy(fake.data, &bind, sizeof(bind));
+	undo_header_feed(f.typed.side_plans[0], &fake, 100);
+	tt_redo_seal(&f);
+	UT_ASSERT(cluster_cold_typed_tt_redo_slot_v1(&f.typed, 0, 0, 4, &out));
+	UT_ASSERT_EQ(out.key.xid, 806);
+	UT_ASSERT_EQ(out.key.slot_wrap, 8);
+	UT_ASSERT_EQ(out.slot.status, TT_SLOT_ACTIVE);
+	UT_ASSERT(cluster_cold_typed_tt_redo_match_v1(&f.typed, 0, 0, &out.key, &out));
+	UT_ASSERT_EQ(out.slot.xid, 806);
+	UT_ASSERT(!cluster_cold_typed_tt_redo_match_v1(&f.typed, 0, 0, &before.key, &out));
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	UT_ASSERT(cluster_cold_tt_base_slot_v1(&f.typed, 0, 4, &out));
+	UT_ASSERT_EQ(out.slot.xid, 802);
+	UT_ASSERT_EQ(out.slot.status, TT_SLOT_RECYCLABLE);
+	tt_redo_destroy(&f);
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(19);
 	UT_RUN(tt_redo_commit_without_bind_keeps_original_all_slots_and_heads);
 	UT_RUN(tt_redo_unrelated_terminal_preserves_active_input);
 	UT_RUN(tt_redo_empty_cut_preserves_input_and_requires_canonical_flags);
@@ -500,6 +729,13 @@ main(void)
 	UT_RUN(tt_redo_refuses_c0_in_ordinary_only_input);
 	UT_RUN(tt_redo_retains_native_refusal_of_unretired_active_head);
 	UT_RUN(tt_redo_refuses_standalone_prepared_tt_without_xact_terminal);
+	UT_RUN(tt_redo_slots_enumerate_every_status_and_preserve_generation_zero);
+	UT_RUN(tt_redo_slot_reads_commit_and_matches_after_image_independently);
+	UT_RUN(tt_redo_slot_reads_exact_abort_without_loser_inference);
+	UT_RUN(tt_redo_match_refuses_each_stale_key_field_and_clears_output);
+	UT_RUN(tt_redo_slots_reject_unsealed_history_bounds_and_invalid_arguments);
+	UT_RUN(tt_redo_slots_refuse_source_drift_and_unsupported_prepared_input);
+	UT_RUN(tt_redo_slots_use_reused_binding_instead_of_captured_key);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

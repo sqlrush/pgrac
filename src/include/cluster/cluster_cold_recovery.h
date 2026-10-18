@@ -826,6 +826,23 @@ extern bool cluster_cold_typed_tt_redo_header_v1(const ClusterColdTypedV1 *typed
 												 uint32 participant, uint32 segment_index,
 												 struct RfSideUndoHeaderImageV1 *out);
 
+/* Copy any physical slot after the same selected source's sealed ordinary
+ * redo, or match its resulting physical key. No status is filtered during
+ * enumeration, and generation zero is valid. A pre-redo key is insufficient
+ * after slot/segment reuse. These are raw input copies, not FullXid/epoch,
+ * canonical top, checkpoint coverage, loser or C0/OPEN authority. History,
+ * C0 and prepared inputs retain the header fold's refusal. Failure clears
+ * available output; expected may point into out. Original source isolation
+ * and final rechecks remain required. The existing raw graph callback still
+ * matches only the captured pre-redo key. */
+extern bool cluster_cold_typed_tt_redo_slot_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+											   uint32 segment_index, uint32 slot_offset,
+											   ClusterColdTtSlotInputV1 *out);
+extern bool cluster_cold_typed_tt_redo_match_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+												uint32 segment_index,
+												const ClusterColdTtSlotKeyV1 *expected,
+												ClusterColdTtSlotInputV1 *out);
+
 /* Sync the selected crashed sources before pass-2 mutations. No replay or
  * completion authority is created; a refusal invalidates this typed attempt. */
 extern bool cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed,

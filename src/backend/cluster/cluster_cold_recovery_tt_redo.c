@@ -105,3 +105,56 @@ cluster_cold_typed_tt_redo_header_v1(const ClusterColdTypedV1 *typed, uint32 par
 	*out = image;
 	return true;
 }
+
+bool
+cluster_cold_typed_tt_redo_slot_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+								   uint32 segment_index, uint32 slot_offset,
+								   ClusterColdTtSlotInputV1 *out)
+{
+	ClusterColdTtSlotInputV1 input;
+	RfSideUndoHeaderImageV1 image;
+	const UndoSegmentHeaderData *header;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!cluster_cold_tt_base_slot_v1(typed, segment_index, slot_offset, &input)
+		|| !cluster_cold_typed_tt_redo_header_v1(typed, participant, segment_index, &image))
+		return false;
+	header = (const UndoSegmentHeaderData *)image.page.data;
+	input.slot = header->tt_slots[slot_offset];
+	input.key.segment_generation = header->wrap_count;
+	input.key.xid = input.slot.xid;
+	input.key.slot_wrap = input.slot.wrap;
+	*out = input;
+	return true;
+}
+
+bool
+cluster_cold_typed_tt_redo_match_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+									uint32 segment_index, const ClusterColdTtSlotKeyV1 *expected,
+									ClusterColdTtSlotInputV1 *out)
+{
+	ClusterColdTtSlotKeyV1 key;
+	ClusterColdTtSlotInputV1 input;
+
+	if (out == NULL)
+		return false;
+	if (expected != NULL)
+		key = *expected;
+	memset(out, 0, sizeof(*out));
+	if (expected == NULL || key.owner_instance == 0 || key.owner_instance > 128
+		|| key.segment_id == 0
+		|| (key.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 != key.owner_instance
+		|| key.slot_offset >= TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(key.xid)
+		|| key.slot_wrap == TT_WRAP_INVALID)
+		return false;
+	if (!cluster_cold_typed_tt_redo_slot_v1(typed, participant, segment_index, key.slot_offset,
+											&input)
+		|| input.key.owner_instance != key.owner_instance || input.key.segment_id != key.segment_id
+		|| input.key.segment_generation != key.segment_generation || input.key.xid != key.xid
+		|| input.key.slot_wrap != key.slot_wrap)
+		return false;
+	*out = input;
+	return true;
+}
