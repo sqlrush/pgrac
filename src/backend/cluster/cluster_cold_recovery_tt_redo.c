@@ -254,6 +254,7 @@ cluster_cold_typed_tt_redo_inventory_v1(const ClusterColdTypedV1 *typed)
 	post_count = cluster_cold_tt_after_redo_count_v1(typed);
 	for (uint32 i = 0; i < post_count; i++) {
 		const UndoSegmentHeaderData *observed, *base;
+		ClusterRecoveryUndoScan *scan = NULL;
 		RfSideUndoHeaderImageV1 folded;
 		uint8 owner;
 		uint32 segment, p;
@@ -261,6 +262,13 @@ cluster_cold_typed_tt_redo_inventory_v1(const ClusterColdTypedV1 *typed)
 		observed = cluster_cold_tt_after_redo_header_v1(typed, i, &owner, &segment);
 		if (observed == NULL)
 			return false;
+		/* Exact unchanged bytes still need the original full header codec:
+		 * identity alone does not interpret every slot/status/flag or layout.
+		 * This grants no checkpoint coverage or transaction classification. */
+		if (cluster_recovery_undo_scan_begin(observed, BLCKSZ, segment, owner, &scan)
+			!= CLUSTER_RECOVERY_UNDO_MORE)
+			return false;
+		cluster_recovery_undo_scan_destroy(scan);
 		base = cluster_cold_tt_header_find_v1(typed, false, owner, segment, NULL);
 		if (base != NULL)
 			originals_seen++;

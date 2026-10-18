@@ -2974,6 +2974,105 @@ UT_TEST(tt_inventory_checks_untouched_current_and_history_headers)
 	tt_redo_destroy(&f);
 }
 
+static void
+tt_inventory_bad_layout(bool history)
+{
+	for (int fault = 0; fault < 9; fault++) {
+		TtRedoFixture f;
+		PGAlignedBlock extra;
+		UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)extra.data;
+		uint32 segment = history ? 257 : 514;
+
+		tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+		tt_inventory_extra(segment, history ? 2 : 3, &extra);
+		switch (fault) {
+		case 0:
+			header->tt_slots[47].status = TT_SLOT_RECYCLABLE + 1;
+			break;
+		case 1:
+			header->tt_slots[0].status = TT_SLOT_INVALID;
+			break;
+		case 2:
+			header->tt_slots[47].flags = 0x80;
+			break;
+		case 3:
+			header->segment_flags = 0x80;
+			break;
+		case 4:
+			header->pd_lower++;
+			break;
+		case 5:
+			header->pd_upper--;
+			break;
+		case 6:
+			header->pd_special--;
+			break;
+		case 7:
+			header->pd_flags |= PD_HAS_ITL;
+			break;
+		case 8:
+			header->pd_flags |= PD_SPACE_METADATA;
+			break;
+		}
+		tt_readback_write(segment, &extra, false);
+		tt_redo_seed_recapture(&f);
+		tt_redo_seal(&f);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		/* The original and post-redo bytes agree exactly. That cannot make
+		 * an uninterpretable last slot or header into a qualified input. */
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_recheck_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+		tt_inventory_remove(segment);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_inventory_refuses_unchanged_current_header_with_bad_layout)
+{
+	tt_inventory_bad_layout(false);
+}
+
+UT_TEST(tt_inventory_refuses_unchanged_history_header_with_bad_layout)
+{
+	tt_inventory_bad_layout(true);
+}
+
+UT_TEST(tt_inventory_accepts_known_layout_for_all_slots_and_generation_zero)
+{
+	TtRedoFixture f;
+	PGAlignedBlock extra;
+	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)extra.data;
+
+	tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+	for (uint8 owner = 2; owner <= 3; owner++) {
+		uint32 segment = owner == 2 ? 257 : 514;
+
+		tt_inventory_extra(segment, owner, &extra);
+		for (uint32 slot = 0; slot < TT_SLOTS_PER_SEGMENT; slot++) {
+			TTSlot *entry = &header->tt_slots[slot];
+
+			entry->status = slot % (TT_SLOT_RECYCLABLE + 1);
+			if (entry->status != TT_SLOT_UNUSED) {
+				entry->xid = 900 + slot;
+				entry->wrap = 1;
+			}
+			if (entry->status >= TT_SLOT_COMMITTED) {
+				entry->flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+				entry->commit_scn = 123456;
+			}
+		}
+		UT_ASSERT_EQ(header->wrap_count, 0);
+		tt_readback_write(segment, &extra, false);
+	}
+	tt_redo_seed_recapture(&f);
+	tt_redo_seal(&f);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+	tt_inventory_remove(257);
+	tt_inventory_remove(514);
+	tt_redo_destroy(&f);
+}
+
 UT_TEST(tt_inventory_matches_new_native_full_image_and_terminal)
 {
 	for (int terminal = 0; terminal < 2; terminal++) {
@@ -3119,8 +3218,11 @@ UT_TEST(tt_inventory_refuses_ambiguous_current_origin_and_sticky_post_failure)
 int
 main(void)
 {
-	UT_PLAN(76);
+	UT_PLAN(79);
 	UT_RUN(tt_inventory_checks_untouched_current_and_history_headers);
+	UT_RUN(tt_inventory_refuses_unchanged_current_header_with_bad_layout);
+	UT_RUN(tt_inventory_refuses_unchanged_history_header_with_bad_layout);
+	UT_RUN(tt_inventory_accepts_known_layout_for_all_slots_and_generation_zero);
 	UT_RUN(tt_inventory_matches_new_native_full_image_and_terminal);
 	UT_RUN(tt_inventory_refuses_disappeared_original_even_when_selected_header_matches);
 	UT_RUN(tt_inventory_requires_current_wal_targets_even_with_empty_observed_inventory);
