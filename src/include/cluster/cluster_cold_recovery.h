@@ -1145,6 +1145,13 @@ extern bool cluster_cold_typed_drop_final_v1(ClusterColdTypedV1 *typed,
 											 struct ClusterRecoveryFencePlan *fence,
 											 uint32 relation);
 
+/* Original sequencer final callback only, after every scheduled record and
+ * source drain succeeded. Bind the exact terminal cold SPACE input to its
+ * original sealed native ABORT, then ask its physical owner for the result.
+ * No match leaves aborted false; refusal preserves it. No completion grant. */
+extern bool cluster_cold_typed_space_abort_final_v1(const ClusterColdTypedV1 *typed,
+													uint32 relation, bool *aborted);
+
 extern bool cluster_cold_space_owner_v1(void);
 extern bool cluster_cold_typed_space_install_v1(const ClusterColdTypedV1 *typed, uint32 relation,
 												uint32 through, bool step);

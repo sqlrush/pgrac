@@ -3253,6 +3253,22 @@ cluster_cold_typed_side_record_v1(ClusterColdTypedV1 *typed, struct ClusterRecov
 	step_side++;
 	return step_fault != 4;
 }
+static bool final_abort_ok = true;
+static bool final_aborted;
+static unsigned final_abort_checks;
+
+bool
+cluster_cold_typed_space_abort_final_v1(const ClusterColdTypedV1 *typed, uint32 relation,
+										bool *aborted)
+{
+	UT_ASSERT(typed->plan == (ClusterColdPlanV1 *)42 && relation == 0);
+	final_abort_checks++;
+	if (!final_abort_ok)
+		return false;
+	*aborted = final_aborted;
+	return true;
+}
+
 bool
 cluster_cold_typed_drop_final_v1(ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence,
 								 uint32 relation)
@@ -3571,6 +3587,29 @@ UT_TEST(test_cold_final_drop_sync_failure_or_lost_scope_refuses)
 		UT_ASSERT_EQ(final_installs, 0);
 		FreeFakeRelcacheEntry(rel);
 	}
+}
+
+UT_TEST(test_original_final_abort_checks_result_without_reinstall)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterColdTypedV1 typed = { 0 };
+		ClusterColdTypedReplay rep = { .typed = &typed };
+
+		typed.plan = (ClusterColdPlanV1 *)42;
+		typed.participant_count = 2;
+		final_plan_valid = true;
+		memset(&final_input, 0, sizeof(final_input));
+		final_input.kind = CLUSTER_COLD_SPACE_ADVANCE;
+		final_installs = final_abort_checks = 0;
+		post_drop_io = false;
+		final_abort_ok = fault != 1;
+		final_aborted = fault == 0;
+		UT_ASSERT_EQ(cluster_typed_replay_space_final(&rep, 0), fault != 1);
+		UT_ASSERT_EQ(final_abort_checks, 1);
+		UT_ASSERT_EQ(final_installs, fault == 2 ? 1 : 0);
+	}
+	final_abort_ok = true;
+	final_aborted = false;
 }
 
 UT_TEST(test_cold_final_non_drop_keeps_original_install)
@@ -4604,7 +4643,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(92);
+	UT_PLAN(93);
 	UT_RUN(test_original_space_step_orders_complete_install_before_commit);
 	UT_RUN(test_original_foreign_space_refusal_never_runs_commit_early);
 	UT_RUN(test_original_foreign_final_uses_exact_scope_without_reinstall);
@@ -4623,6 +4662,7 @@ main(void)
 	UT_RUN(test_cold_final_drop_checks_deleted_result_without_reinstall);
 	UT_RUN(test_cold_final_drop_rejects_incomplete_or_unbound_result);
 	UT_RUN(test_cold_final_drop_sync_failure_or_lost_scope_refuses);
+	UT_RUN(test_original_final_abort_checks_result_without_reinstall);
 	UT_RUN(test_cold_final_non_drop_keeps_original_install);
 	UT_RUN(test_cold_native_drop_requires_empty_main_and_no_auxiliary_forks);
 	UT_RUN(test_cold_native_drop_preserves_post_unlink_io_and_namespace_refusal);

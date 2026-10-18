@@ -106,6 +106,8 @@ typedef struct SpaceColdAbortDelete {
 static bool space_cold_abort_delete(ClusterSpaceRecoveryBatchV1 *batch,
 									const SpaceColdAbortDelete *work, Size budget);
 
+static bool space_cold_abort_main(RelFileLocator locator, bool deleted);
+
 static bool
 space_cold_phase(void)
 {
@@ -832,7 +834,7 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 						const ClusterSpaceColdSourceV1 *origins, uint32 count, uint32 through,
 						uint8 shrink_forks, bool drop_already, const RfSideOnlinePlanV1 *abort_side,
 						const ClusterSpaceColdSourceV1 *abort_source, Size budget,
-						const SpaceColdAbortDelete *abort_delete)
+						bool abort_result, const SpaceColdAbortDelete *abort_delete)
 {
 	ClusterRecoverySerialGuard *guards[CLUSTER_WAL_RETENTION_MAX_THREADS];
 	ClusterWalRetentionPin *pin = NULL;
@@ -845,7 +847,8 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 	bool abort_already = abort_side != NULL;
 
 	if (budget > MaxAllocSize || (abort_side == NULL) != (abort_source == NULL)
-		|| (abort_delete != NULL && abort_side == NULL))
+		|| (abort_delete != NULL && abort_side == NULL)
+		|| (abort_result && (abort_side == NULL || abort_delete != NULL)))
 		return false;
 	if (abort_already) {
 		ClusterSpaceStructureChange create;
@@ -903,7 +906,9 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 	batch->order = (uint32 *)(batch->targets + 1);
 	batch->sources = authorities;
 	batch->cold_inputs = inputs;
-	batch->side = abort_side;
+	/* A final result uses one captured stream and the independent, complete
+	 * original cold owner. Other held ROOTs are not SIDE participants. */
+	batch->side = abort_result ? NULL : abort_side;
 	batch->cold_result_already = drop_already || abort_already;
 	batch->cold_shrink_step = through;
 	batch->cold_shrink_forks = shrink_forks;
@@ -938,14 +943,28 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 				|| memcmp(source.claim.identity.storage_uuid, key->storage_uuid, 16) != 0
 				|| source.claim.database_incarnation != key->database_incarnation
 				|| owners[i].native_redo < owners[i].root.checkpoint_lower_lsn
-				|| owners[i].native_redo > owners[i].root.validated_tail_lsn_exclusive
-				|| (abort_already
-					&& (!rf_side_online_plan_recovery_claim_matches_v1(abort_side, &source)
-						|| !rf_side_online_plan_replay_start_matches_v1(
-							abort_side, guard->duty.origin_thread_id,
-							guard->duty.origin_owner_incarnation, key->database_incarnation,
-							owners[i].native_redo))))
+				|| owners[i].native_redo > owners[i].root.validated_tail_lsn_exclusive)
 				goto done;
+			if (abort_already
+				&& (!abort_result || guard->duty.origin_thread_id == abort_source->origin_thread)) {
+				RfContributorStreamCutV1 cut
+					= { .failed_thread = guard->duty.origin_thread_id,
+						.origin_owner_incarnation = guard->duty.origin_owner_incarnation,
+						.timeline_id = owners[i].root.checkpoint_tli,
+						.flags = RF_CONTRIBUTOR_CUT_COMPLETE,
+						.scan_begin_inclusive = owners[i].root.checkpoint_lower_lsn,
+						.scan_end_exclusive = owners[i].root.validated_tail_lsn_exclusive };
+
+				if (!rf_side_online_plan_recovery_claim_matches_v1(abort_side, &source)
+					|| !rf_side_online_plan_replay_start_matches_v1(
+						abort_side, guard->duty.origin_thread_id,
+						guard->duty.origin_owner_incarnation, key->database_incarnation,
+						owners[i].native_redo)
+					|| (abort_result
+						&& !rf_side_online_plan_recovery_source_matches_v1(
+							abort_side, key->system_identifier, key->storage_uuid, &cut)))
+					goto done;
+			}
 			authorities[i]
 				= (ClusterThreadRecoveryAuthorityV1){ .duty = &guard->duty,
 													  .root_snapshot = &owners[i].root,
@@ -996,6 +1015,15 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 					|= structure.identity.action == CLUSTER_SPACE_WAL_CREATE;
 			}
 		}
+		/* The original sequencer already executed this ABORT and drained
+		 * every source. Reuse its complete retained ancestry and owner set,
+		 * but inspect only the physical result: deleted SPACE cannot qualify
+		 * the pre-delete check and must never be installed here. */
+		if (abort_result) {
+			ok = space_sources_fresh(batch) && space_cold_abort_main(key->locator, true)
+				 && space_sources_fresh(batch);
+			goto done;
+		}
 		if (!space_target_run(batch, 0, false, UINT32_MAX) || !space_sources_fresh(batch))
 			goto done;
 		if (batch->cold_result_already) {
@@ -1034,7 +1062,7 @@ cluster_space_recovery_cold_relation_install_v1(const ClusterSpaceIdentityKey *k
 												uint32 count, uint32 through, uint8 shrink_forks)
 {
 	return space_cold_relation_run(key, inputs, origins, count, through, shrink_forks, false, NULL,
-								   NULL, MaxAllocSize, NULL);
+								   NULL, MaxAllocSize, false, NULL);
 }
 
 bool
@@ -1043,12 +1071,12 @@ cluster_space_recovery_cold_drop_already_v1(const ClusterSpaceIdentityKey *key,
 											const ClusterSpaceColdSourceV1 *source)
 {
 	return space_cold_relation_run(key, input, source, 1, 0, 0, true, NULL, NULL, MaxAllocSize,
-								   NULL);
+								   false, NULL);
 }
 
 static bool
 space_cold_abort_run(const RfSideOnlinePlanV1 *side, uint32 index, uint32 relation, Size budget,
-					 const SpaceColdAbortDelete *work)
+					 bool result, const SpaceColdAbortDelete *work)
 {
 	RfSideOnlineOperationV1 abort, create;
 	ClusterSpaceRecoveryInput *inputs;
@@ -1109,7 +1137,7 @@ space_cold_abort_run(const RfSideOnlinePlanV1 *side, uint32 index, uint32 relati
 		if (n != count)
 			goto done;
 		ok = space_cold_relation_run(&create.space_key, inputs, origins, count, count - 1, 0, false,
-									 side, &terminal, budget - bytes, work);
+									 side, &terminal, budget - bytes, result, work);
 	done:;
 	}
 	PG_FINALLY();
@@ -1125,7 +1153,15 @@ cluster_space_recovery_cold_abort_preflight_v1(const RfSideOnlinePlanV1 *side, u
 											   uint32 relation)
 {
 	return space_cold_abort_run(side, index, relation,
-								rf_side_online_plan_scratch_available_v1(side), NULL);
+								rf_side_online_plan_scratch_available_v1(side), false, NULL);
+}
+
+bool
+cluster_space_recovery_cold_abort_result_v1(const RfSideOnlinePlanV1 *side, uint32 index,
+											uint32 relation)
+{
+	return space_cold_abort_run(side, index, relation,
+								rf_side_online_plan_scratch_available_v1(side), true, NULL);
 }
 
 static int
@@ -1174,7 +1210,7 @@ space_cold_abort_group(ClusterSpaceRecoveryBatchV1 *batch, const SpaceColdAbortD
 		if (!space_sources_fresh(batch)
 			|| (!deleted
 				&& !space_cold_abort_run(work->side, work->index, work->targets[i].relation, budget,
-										 NULL))
+										 false, NULL))
 			|| !space_sources_fresh(batch) || !space_cold_abort_main(work->locators[i], deleted)
 			|| !space_sources_fresh(batch))
 			return false;
@@ -1269,7 +1305,7 @@ space_cold_abort_execute(const RfSideOnlinePlanV1 *side, uint32 index, Size fini
 				work.locators[work.count++] = work.targets[i].locator;
 			}
 		ok = space_cold_abort_run(side, index, work.targets[0].relation,
-								  budget - bytes - native_bytes, &work);
+								  budget - bytes - native_bytes, false, &work);
 	done:;
 	}
 	PG_FINALLY();
