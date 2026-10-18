@@ -2237,6 +2237,72 @@ rf_side_online_plan_native_creation_v1(const RfSideOnlinePlanV1 *plan, uint32 in
 	return true;
 }
 
+/* Native ABORT has no SPACE incarnation. Keep every pending-delete locator
+ * tied to a unique earlier CREATE pair in this original source and xid.
+ * This proves the input binding, not permission to delete any storage. */
+static bool
+side_native_abort_deletes_covered(const RfSideOnlinePlanV1 *plan, uint32 index)
+{
+	const RfSideOnlineOperationV1 *op = &plan->operations[index];
+	xl_xact_parsed_abort parsed;
+	uint8 *copy;
+	bool result = false;
+
+	if (plan->purpose != RF_SIDE_PLAN_RECOVERY || !op->xact.cold_completion_effects
+		|| op->source_xid != op->xact.xid || op->owned_payload_offset > plan->owned_payload_bytes
+		|| op->owned_payload_length > plan->owned_payload_bytes - op->owned_payload_offset
+		|| !rf_side_xact_cold_completion_payload_v1(
+			&op->xact, plan->owned_payload + op->owned_payload_offset, op->owned_payload_length))
+		return false;
+	/* The bounded validator freed its aligned copy. Reuse the plan's single
+	 * maximum-payload scratch reservation while reading native locators. */
+	copy = side_alloc0(op->owned_payload_length);
+	if (copy == NULL)
+		return false;
+	memcpy(copy, plan->owned_payload + op->owned_payload_offset, op->owned_payload_length);
+	ParseAbortRecord(XLOG_XACT_ABORT | XLOG_XACT_HAS_INFO, (xl_xact_abort *)copy, &parsed);
+	for (int r = 0; r < parsed.nrels; r++) {
+		bool found = false;
+
+		for (uint32 j = 0; j < plan->operation_count; j++) {
+			const RfSideOnlineOperationV1 *create = &plan->operations[j];
+			ClusterSpaceStructureChange change;
+			xl_smgr_create native;
+			uint32 typed;
+
+			if (create->kind != RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE)
+				continue;
+			memcpy(&native, plan->owned_payload + create->owned_payload_offset, sizeof(native));
+			if (!RelFileLocatorEquals(native.rlocator, parsed.xlocators[r]))
+				continue;
+			if (found || j >= index || create->source_xid != op->source_xid
+				|| create->identity.participant_index != op->identity.participant_index
+				|| create->identity.record.end_rec_ptr > op->identity.record.read_rec_ptr
+				|| !side_native_creation(plan, j, &change, &typed) || typed >= index
+				|| plan->operations[typed].identity.record.end_rec_ptr
+					   > op->identity.record.read_rec_ptr)
+				goto done;
+			/* A completed raw xid cannot lend its CREATE to a later reuse. */
+			for (uint32 k = j + 1; k < index; k++) {
+				const RfSideOnlineOperationV1 *between = &plan->operations[k];
+
+				if (between->identity.participant_index == op->identity.participant_index
+					&& between->kind == RF_SIDE_ONLINE_OPERATION_XACT
+					&& between->xact.xid == op->xact.xid)
+					goto done;
+			}
+			found = true;
+		}
+		/* Native pending-delete duplicates may share this same exact pair. */
+		if (!found)
+			goto done;
+	}
+	result = true;
+done:
+	side_free(copy);
+	return result;
+}
+
 static bool
 side_native_structures_covered(const RfSideOnlinePlanV1 *plan)
 {
@@ -2246,6 +2312,11 @@ side_native_structures_covered(const RfSideOnlinePlanV1 *plan)
 
 		if (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE
 			&& !side_native_creation(plan, i, &change, &typed))
+			return false;
+		if (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_XACT
+			&& plan->operations[i].xact.kind == RF_SIDE_XACT_ABORT
+			&& plan->operations[i].xact.relation_count != 0
+			&& !side_native_abort_deletes_covered(plan, i))
 			return false;
 	}
 	return true;
@@ -2387,6 +2458,8 @@ rf_side_online_plan_contribution_owners_v1(const RfSideOnlinePlanV1 *plan, uint3
 			result.owners = RF_SIDE_CONTRIBUTION_TERMINAL;
 			if (op->xact.cold_completion_effects)
 				result.owners |= RF_SIDE_CONTRIBUTION_COMPLETION;
+			if (op->xact.relation_count != 0)
+				result.owners |= RF_SIDE_CONTRIBUTION_NATIVE_STRUCTURE;
 			break;
 		case RF_SIDE_XACT_PREPARE:
 		case RF_SIDE_XACT_COMMIT_PREPARED:

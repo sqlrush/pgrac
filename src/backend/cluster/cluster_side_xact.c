@@ -933,7 +933,7 @@ side_xact_decode_cold_abort(XLogReaderState *record, uint64 system_identifier, u
 	xl_xact_parsed_abort parsed;
 	const uint32 supported = XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_SCN
 							 | XACT_XINFO_HAS_DROPPED_STATS | XACT_XINFO_HAS_AE_LOCKS
-							 | XACT_XINFO_HAS_SUBXACTS;
+							 | XACT_XINFO_HAS_SUBXACTS | XACT_XINFO_HAS_RELFILELOCATORS;
 
 	if (record == NULL || record->record == NULL || out == NULL || system_identifier == 0
 		|| origin_thread == 0 || origin_thread > 128 || XLogRecGetRmid(record) != RM_XACT_ID
@@ -942,10 +942,10 @@ side_xact_decode_cold_abort(XLogReaderState *record, uint64 system_identifier, u
 		|| !side_xact_completion_shape_valid(record, false))
 		return false;
 	ParseAbortRecord(XLogRecGetInfo(record), (xl_xact_abort *)XLogRecGetData(record), &parsed);
-	if ((parsed.xinfo & ~supported) != 0 || parsed.nrels != 0
+	if ((parsed.xinfo & ~supported) != 0
 		|| !rf_side_xact_children_preflight_v1(XLogRecGetXid(record), parsed.nsubxacts,
 											   parsed.subxacts)
-		|| (parsed.nsubxacts == 0 && parsed.nstats == 0
+		|| (parsed.nsubxacts == 0 && parsed.nstats == 0 && parsed.nrels == 0
 			&& (parsed.xinfo & XACT_XINFO_HAS_AE_LOCKS) == 0)
 		|| !SCN_VALID(parsed.scn)
 		|| !side_xact_cold_stats_valid(parsed.nstats, parsed.stats, parsed.xinfo, parsed.dbId))
@@ -959,6 +959,10 @@ side_xact_decode_cold_abort(XLogReaderState *record, uint64 system_identifier, u
 	candidate.terminal_scn = parsed.scn;
 	if (!side_xact_structural_preflight(&candidate, false))
 		return false;
+	/* Native ABORT has locators, not typed tombstones. Retain the complete
+	 * input; sealing must bind its CREATE source and runtime still refuses
+	 * until the physical deletion owner is connected. */
+	candidate.relation_count = parsed.nrels;
 	candidate.cold_completion_effects = true;
 	candidate.completion_payload_length = XLogRecGetDataLen(record);
 	*out = candidate;
@@ -1062,6 +1066,10 @@ rf_side_xact_cold_completion_preflight_v1(const RfSideXactOperationV1 *operation
 	if (operation == NULL || !operation->cold_completion_effects || operation->pi_read_only
 		|| (operation->kind != RF_SIDE_XACT_COMMIT && operation->kind != RF_SIDE_XACT_ABORT)
 		|| payload == NULL || length == 0 || length != operation->completion_payload_length)
+		return false;
+	/* Captured ABORT-delete inputs do not yet have an executable structural
+	 * consumer. Refuse before TT coverage, native CLOG or completion effects. */
+	if (operation->kind == RF_SIDE_XACT_ABORT && operation->relation_count != 0)
 		return false;
 	return operation->system_identifier == GetSystemIdentifier()
 		   && cluster_xid_origin_slot(operation->xid) == (int)operation->origin_thread - 1

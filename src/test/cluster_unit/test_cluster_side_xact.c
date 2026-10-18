@@ -4035,6 +4035,79 @@ cold_completion_abort(FakeXactRecord *fake)
 }
 
 static void
+cold_abort_deletes(FakeXactRecord *fake, const RelFileLocator *locators, int count, bool stats)
+{
+	xl_xact_dbinfo db = { .dbId = 5, .tsId = DEFAULTTABLESPACE_OID };
+	uint32 offset = MinSizeOfXactAbort + sizeof(xl_xact_xinfo) + sizeof(db);
+	uint32 added = sizeof(count) + count * sizeof(*locators), xinfo;
+
+	if (stats)
+		cold_completion_abort(fake);
+	else
+		make_abort(fake, 802);
+	memcpy(fake->data + MinSizeOfXactAbort + sizeof(xl_xact_xinfo), &db, sizeof(db));
+	UT_ASSERT(fake->u.decoded.main_data_len + added <= sizeof(fake->data));
+	memmove(fake->data + offset + added, fake->data + offset,
+			fake->u.decoded.main_data_len - offset);
+	memcpy(fake->data + offset, &count, sizeof(count));
+	memcpy(fake->data + offset + sizeof(count), locators, count * sizeof(*locators));
+	memcpy(&xinfo, fake->data + MinSizeOfXactAbort, sizeof(xinfo));
+	xinfo |= XACT_XINFO_HAS_RELFILELOCATORS;
+	memcpy(fake->data + MinSizeOfXactAbort, &xinfo, sizeof(xinfo));
+	fake->u.decoded.main_data_len += added;
+	fake->u.decoded.header.xl_info |= XLR_SPECIAL_REL_UPDATE;
+	fake->u.decoded.max_block_id = -1;
+}
+
+static RfPageProofDetailV1
+cold_abort_delete_feed(RfSideOnlinePlanV1 *plan, FakeXactRecord *fake, XLogRecPtr begin,
+					   uint32 participant)
+{
+	uint8 uuid[16];
+	RfPageOnlineRecordIdentityV1 identity;
+	RfDetachedRecordPlanV1 record;
+
+	memset(uuid, 0x44, sizeof(uuid));
+	identity = make_identity(fake, uuid);
+	identity.participant_index = participant;
+	identity.record.origin_thread += participant;
+	set_identity_range(fake, &identity, begin, begin + 100);
+	record = fake->u.decoded.header.xl_rmid == RM_XACT_ID ? make_record_plan(fake)
+														  : make_projection_record_plan(fake);
+	return rf_side_online_plan_feed_record_v1(plan, &record, &identity);
+}
+
+static void
+cold_abort_create_record(FakeXactRecord *fake, RelFileLocator locator, bool native,
+						 TransactionId xid)
+{
+	ClusterSpaceReservationChange advance = space_advance_fixture();
+	ClusterSpaceStructureChange create = { 0 };
+	xl_smgr_create smgr = { locator, MAIN_FORKNUM };
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+
+	if (native)
+		make_projection_record(fake, RM_SMGR_ID, XLOG_SMGR_CREATE | XLR_SPECIAL_REL_UPDATE, &smgr,
+							   sizeof(smgr));
+	else {
+		advance.before.identity.key.locator = locator;
+		advance.before.next_block = 0;
+		create.identity.action = CLUSTER_SPACE_WAL_CREATE;
+		create.identity.nblocks = InvalidBlockNumber;
+		create.identity.result = advance.before.identity;
+		create.identity.result_token = advance.before_token;
+		create.reservation.action = CLUSTER_SPACE_RESERVATION_INIT;
+		create.reservation.result = advance.before;
+		create.reservation.result_token = advance.before_token;
+		UT_ASSERT(cluster_space_structure_wal_encode(&create, wal, sizeof(wal)));
+		make_projection_record(fake, RM_SMGR_ID, XLOG_SMGR_SPACE_IDENTITY | XLR_SPECIAL_REL_UPDATE,
+							   wal, sizeof(wal));
+	}
+	fake->u.decoded.header.xl_xid = xid;
+	fake->u.decoded.max_block_id = -1;
+}
+
+static void
 cold_lock_completion(FakeXactRecord *fake, bool abort, bool combined)
 {
 	uint32 offset = abort ? MinSizeOfXactAbort : MinSizeOfXactCommit;
@@ -4686,6 +4759,195 @@ UT_TEST(test_cold_native_stats_retain_completion_owner)
 		UT_ASSERT((owners.owners & RF_SIDE_CONTRIBUTION_INVALIDATION) == 0);
 		rf_side_online_plan_destroy_v1(&plan);
 	}
+}
+
+UT_TEST(test_cold_abort_delete_retains_complete_native_carrier)
+{
+	RelFileLocator locators[] = { { DEFAULTTABLESPACE_OID, 5, 16384 },
+								  { DEFAULTTABLESPACE_OID, 5, 16384 },
+								  { DEFAULTTABLESPACE_OID, 5, 16385 } };
+
+	for (int stats = 0; stats < 2; stats++) {
+		FakeXactRecord fake;
+		RfSideXactOperationV1 operation, rejected;
+		uint8 unaligned[1025];
+
+		cold_abort_deletes(&fake, locators, lengthof(locators), stats);
+		if (!rf_side_xact_decode_recovery_v1(&fake.reader, UINT64_C(0x11223344), 3, &operation)) {
+			UT_ASSERT(false);
+			continue;
+		}
+		UT_ASSERT(operation.kind == RF_SIDE_XACT_ABORT && operation.cold_completion_effects);
+		UT_ASSERT_EQ(operation.relation_count, lengthof(locators));
+		UT_ASSERT_EQ(operation.space_drop_count, 0);
+		UT_ASSERT_EQ(operation.completion_payload_length, fake.u.decoded.main_data_len);
+		UT_ASSERT(!rf_side_xact_decode_v1(&fake.reader, UINT64_C(0x11223344), 3, &rejected));
+		UT_ASSERT(!rf_side_xact_inspect_pi_v1(&fake.reader, UINT64_C(0x11223344), 3, &rejected));
+		memcpy(unaligned + 1, fake.data, fake.u.decoded.main_data_len);
+		UT_ASSERT(rf_side_xact_cold_completion_payload_v1(&operation, unaligned + 1,
+														  fake.u.decoded.main_data_len));
+		operation.relation_count--;
+		UT_ASSERT(!rf_side_xact_cold_completion_payload_v1(&operation, unaligned + 1,
+														   fake.u.decoded.main_data_len));
+	}
+	for (int fault = 0; fault < 4; fault++) {
+		FakeXactRecord fake;
+		RfSideXactOperationV1 rejected, empty = { 0 };
+		uint32 offset = MinSizeOfXactAbort + sizeof(xl_xact_xinfo) + sizeof(xl_xact_dbinfo);
+		int count = fault == 0 ? -1 : INT_MAX;
+
+		cold_abort_deletes(&fake, locators, lengthof(locators), false);
+		if (fault < 2)
+			memcpy(fake.data + offset, &count, sizeof(count));
+		else if (fault == 2)
+			fake.u.decoded.main_data_len--;
+		else
+			fake.data[fake.u.decoded.main_data_len++] = 0;
+		memset(&rejected, 0xa5, sizeof(rejected));
+		UT_ASSERT(
+			!rf_side_xact_decode_recovery_v1(&fake.reader, UINT64_C(0x11223344), 3, &rejected));
+		UT_ASSERT(memcmp(&rejected, &empty, sizeof(empty)) == 0);
+	}
+}
+
+UT_TEST(test_cold_abort_delete_plan_binds_every_locator_and_owns_original_bytes)
+{
+	RelFileLocator locators[] = { { DEFAULTTABLESPACE_OID, 5, 16384 },
+								  { DEFAULTTABLESPACE_OID, 5, 16384 },
+								  { DEFAULTTABLESPACE_OID, 5, 16385 } };
+
+	for (int shape = 0; shape < 3; shape++) {
+		uint32 pairs = shape == 2 ? 2 : 1;
+		RfSideOnlinePlanV1 *plan = space_online_plan((pairs * 2 + 2) * 100);
+		RfSideOnlineOperationV1 operation;
+		RfSideContributionOwnersV1 owners;
+		FakeXactRecord fake;
+		uint8 original[1024];
+		uint32 length;
+
+		for (uint32 i = 0; i < pairs * 2; i++) {
+			cold_abort_create_record(&fake, locators[i < 2 ? 0 : 2], i % 2 == 0, 802);
+			UT_ASSERT_EQ(cold_abort_delete_feed(plan, &fake, (i + 1) * 100, 0),
+						 RF_PAGE_PROOF_DETAIL_OK);
+		}
+		cold_abort_deletes(&fake, locators, shape + 1, shape == 2);
+		length = fake.u.decoded.main_data_len;
+		memcpy(original, fake.data, length);
+		UT_ASSERT_EQ(cold_abort_delete_feed(plan, &fake, (pairs * 2 + 1) * 100, 0),
+					 RF_PAGE_PROOF_DETAIL_OK);
+		memset(fake.data, 0xee, length);
+		UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+		if (rf_side_online_plan_seal_v1(plan) != RF_PAGE_PROOF_DETAIL_OK) {
+			UT_ASSERT(false);
+			rf_side_online_plan_destroy_v1(&plan);
+			continue;
+		}
+		UT_ASSERT(rf_side_online_plan_operation_v1(plan, pairs * 2, &operation));
+		UT_ASSERT_EQ(operation.xact.relation_count, shape + 1);
+		UT_ASSERT_EQ(operation.owned_payload_length, length);
+		UT_ASSERT(memcmp(operation.owned_payload, original, length) == 0);
+		UT_ASSERT(rf_side_online_plan_contribution_owners_v1(plan, pairs * 2, &owners));
+		UT_ASSERT((owners.owners & RF_SIDE_CONTRIBUTION_NATIVE_STRUCTURE) != 0);
+		UT_ASSERT((owners.owners & RF_SIDE_CONTRIBUTION_COMPLETION) != 0);
+		UT_ASSERT((owners.owners & RF_SIDE_CONTRIBUTION_TERMINAL) != 0);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_cold_abort_delete_plan_refuses_missing_conflicting_or_late_source_proof)
+{
+	/* N=native MAIN CREATE, T=typed CREATE, B=earlier terminal, A=native ABORT. */
+	const char *events[] = { "TA", "NA", "NTA", "NTA", "NTA", "NAT", "NTBA", "NTNTA" };
+	RelFileLocator locator = { DEFAULTTABLESPACE_OID, 5, 16384 };
+
+	for (uint32 fault = 0; fault < lengthof(events); fault++) {
+		uint32 count = strlen(events[fault]);
+		RfContributorStreamCutV1 cuts[2] = { { .failed_thread = 3,
+											   .timeline_id = 7,
+											   .flags = RF_CONTRIBUTOR_CUT_COMPLETE,
+											   .scan_begin_inclusive = 100,
+											   .scan_end_exclusive = (count + 1) * 100 },
+											 { .failed_thread = 4,
+											   .timeline_id = 7,
+											   .flags = RF_CONTRIBUTOR_CUT_COMPLETE,
+											   .scan_begin_inclusive = 100,
+											   .scan_end_exclusive = 200 } };
+		RfSideOnlinePlanRequestV1 request = { .system_identifier = UINT64_C(0x11223344),
+											  .physical_cuts = cuts,
+											  .participant_count = fault == 4 ? 2 : 1 };
+		RfSideOnlinePlanV1 *plan = NULL;
+		RelFileLocator created = locator;
+		bool fed = true;
+
+		if (fault == 3)
+			created.relNumber++;
+		if (fault == 4)
+			cuts[0].scan_end_exclusive -= 100;
+		memset(request.storage_uuid, 0x44, 16);
+		UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
+		for (uint32 i = 0; i < count; i++) {
+			FakeXactRecord fake;
+			bool abort = events[fault][i] == 'A';
+			uint32 participant = fault == 4 && abort ? 1 : 0;
+
+			if (abort)
+				cold_abort_deletes(&fake, &locator, 1, false);
+			else if (events[fault][i] == 'B') {
+				make_abort(&fake, 802);
+				fake.u.decoded.max_block_id = -1;
+			} else
+				cold_abort_create_record(&fake, created, events[fault][i] == 'N',
+										 fault == 2 ? 803 : 802);
+			if (cold_abort_delete_feed(plan, &fake, participant ? 100 : (i + 1) * 100, participant)
+				!= RF_PAGE_PROOF_DETAIL_OK) {
+				UT_ASSERT(false);
+				fed = false;
+				break;
+			}
+		}
+		if (fed) {
+			UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+			UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+		}
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_cold_abort_delete_input_cannot_enter_tt_clog_or_native_completion)
+{
+	RelFileLocator locator = { DEFAULTTABLESPACE_OID, 5, 16384 };
+	FakeXactRecord fake;
+	RfSideXactOperationV1 operation;
+	ClusterUndoRecoveryScopeV1 scope = { 0 };
+	int coverage_calls = 0;
+
+	reset_prepare_apply();
+	cold_abort_deletes(&fake, &locator, 1, true);
+	if (!rf_side_xact_decode_recovery_v1(&fake.reader, UINT64_C(0x11223344), 3, &operation)) {
+		UT_ASSERT(false);
+		return;
+	}
+	canonical_scope = &scope;
+	cold_clog_test = cold_source_ready = cold_abort_test = true;
+	cold_clog_applies = cold_clog_verifies = cold_stats_calls = 0;
+	UT_ASSERT(!rf_side_xact_cold_completion_preflight_v1(&operation, fake.data,
+														 fake.u.decoded.main_data_len));
+	UT_ASSERT(
+		!rf_side_xact_cold_abort_clog_v1(&operation, fake.data, fake.u.decoded.main_data_len));
+	UT_ASSERT_EQ(rf_side_xact_apply_cold_abort_completion_v1(
+					 &operation, fake.data, fake.u.decoded.main_data_len, &coverage_calls,
+					 drop_coverage_must_not_run),
+				 RF_SIDE_XACT_APPLY_BLOCKED);
+	UT_ASSERT_EQ(rf_side_xact_apply_owned_v1(&operation, fake.data, fake.u.decoded.main_data_len),
+				 RF_SIDE_XACT_APPLY_BLOCKED);
+	UT_ASSERT_EQ(coverage_calls, 0);
+	UT_ASSERT_EQ(cold_clog_applies, 0);
+	UT_ASSERT_EQ(cold_clog_verifies, 0);
+	UT_ASSERT_EQ(cold_stats_calls, 0);
+	UT_ASSERT_EQ(prepare_apply.tt_stamps, 0);
+	UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 0);
+	canonical_scope = NULL;
+	cold_clog_test = cold_source_ready = cold_abort_test = false;
 }
 
 UT_TEST(test_cold_abort_completion_keeps_owned_stats_and_refuses_generic_apply)
@@ -11828,7 +12090,7 @@ UT_TEST(test_cold_terminal_frame_refusal_preserves_pi_inspection)
 int
 main(void)
 {
-	UT_PLAN(176);
+	UT_PLAN(180);
 	UT_RUN(test_cold_strict_terminals_refuse_unconsumed_frame);
 	UT_RUN(test_cold_effectful_terminals_refuse_unconsumed_frame);
 	UT_RUN(test_cold_terminal_capture_keeps_unconsumed_frame_out_of_history_and_replay);
@@ -11905,6 +12167,10 @@ main(void)
 	UT_RUN(test_cold_lock_completion_retains_whole_native_record);
 	UT_RUN(test_cold_lock_completion_uses_exact_tt_clog_and_native_owner);
 	UT_RUN(test_cold_native_stats_retain_completion_owner);
+	UT_RUN(test_cold_abort_delete_retains_complete_native_carrier);
+	UT_RUN(test_cold_abort_delete_plan_binds_every_locator_and_owns_original_bytes);
+	UT_RUN(test_cold_abort_delete_plan_refuses_missing_conflicting_or_late_source_proof);
+	UT_RUN(test_cold_abort_delete_input_cannot_enter_tt_clog_or_native_completion);
 	UT_RUN(test_cold_abort_completion_keeps_owned_stats_and_refuses_generic_apply);
 	UT_RUN(test_cold_abort_stats_rejects_malformed_or_unowned_native_effects);
 	UT_RUN(test_cold_abort_stats_keeps_exact_native_record_and_tt_carrier);
