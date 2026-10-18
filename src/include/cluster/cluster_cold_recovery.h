@@ -793,6 +793,17 @@ extern bool cluster_cold_tt_base_match_v1(const ClusterColdTypedV1 *typed,
 										  const ClusterColdTtSlotKeyV1 *expected,
 										  ClusterColdTtSlotInputV1 *out);
 
+struct ClusterRecoveryUndoRecord;
+/* Copy raw original UNDO from a captured physical segment, which may differ
+ * from its canonical TT segment. Retain each whole block once within the TT
+ * budget and reread it in base_recheck before pass-2. No canonical transaction,
+ * generation ancestry, checksum, FullXid/epoch, top, complete-chain or terminal
+ * proof is created; the graph owner must check those independently. Failure
+ * clears outputs; source, parse or allocation refusal invalidates TT input. */
+extern bool cluster_cold_tt_undo_record_v1(ClusterColdTypedV1 *typed, UBA address,
+										   struct ClusterRecoveryUndoRecord *out,
+										   uint32 *generation);
+
 struct RfSideUndoHeaderImageV1;
 /* Fold one selected original source's ordinary redo into a private copy of
  * its captured TT header. This is input reconstruction, not FullXid/epoch,

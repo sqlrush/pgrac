@@ -21,6 +21,8 @@
 #include <unistd.h>
 
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_recovery_undo_scan.h"
+#include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/storage/cluster_shared_fs.h"
 #include "cluster/storage/cluster_undo_alloc.h"
@@ -39,10 +41,18 @@ typedef struct ColdTtInputV1 {
 	PGAlignedBlock block;
 } ColdTtInputV1;
 
+typedef struct ColdTtBlockV1 {
+	struct ColdTtBlockV1 *next;
+	const ColdTtInputV1 *file;
+	uint32 block;
+	PGAlignedBlock bytes;
+} ColdTtBlockV1;
+
 typedef struct ClusterColdTtBaseV1 {
 	bool owners[COLD_TT_MAX_ORIGINS + 1];
 	ColdTtInputV1 *first;
 	ColdTtInputV1 *last;
+	ColdTtBlockV1 *blocks;
 	Size used;
 	Size budget;
 	uint32 count;
@@ -118,10 +128,58 @@ done:
 	return result;
 }
 
+/* The original owner still supplies isolation. Bind the DATA read to the
+ * captured file identity and complete block zero, not just a segment number. */
+static bool
+cold_tt_read_data(const ColdTtInputV1 *input, uint32 block, char *bytes)
+{
+	char path[MAXPGPATH];
+	PGAlignedBlock header;
+	struct stat before, after, named;
+	int flags = O_RDONLY | PG_BINARY;
+	int fd;
+	bool result = false;
+
+#ifdef O_NOFOLLOW
+	flags |= O_NOFOLLOW;
+#endif
+	if (cluster_shared_fs_undo_path_resolve(input->owner, input->segment, path, sizeof(path)) != 0)
+		return false;
+	fd = BasicOpenFile(path, flags);
+	if (fd < 0)
+		return false;
+	if (fstat(fd, &before) != 0 || !S_ISREG(before.st_mode) || before.st_dev != input->device
+		|| before.st_ino != input->inode || before.st_size != input->size)
+		goto done;
+	if (pg_pread(fd, bytes, BLCKSZ, (off_t)block * BLCKSZ) != BLCKSZ || fstat(fd, &after) != 0
+		|| lstat(path, &named) != 0 || !cold_tt_same_file(&before, &after)
+		|| !cold_tt_same_file(&after, &named))
+		goto done;
+	if (pg_pread(fd, header.data, BLCKSZ, 0) != BLCKSZ
+		|| memcmp(header.data, input->block.data, BLCKSZ) != 0 || fstat(fd, &after) != 0
+		|| lstat(path, &named) != 0 || !cold_tt_same_file(&before, &after)
+		|| !cold_tt_same_file(&after, &named))
+		goto done;
+	result = true;
+done:
+	if (close(fd) != 0)
+		result = false;
+	return result;
+}
+
 static void
 cold_tt_clear(ClusterColdTtBaseV1 *base)
 {
 	ColdTtInputV1 *input = base->first;
+	ColdTtBlockV1 *block = base->blocks;
+
+	while (block != NULL) {
+		ColdTtBlockV1 *next = block->next;
+
+		pfree(block);
+		block = next;
+	}
+	base->blocks = NULL;
 
 	while (input != NULL) {
 		ColdTtInputV1 *next = input->next;
@@ -234,6 +292,13 @@ cluster_cold_tt_base_recheck_v1(ClusterColdTypedV1 *typed)
 	}
 	if (saved != NULL)
 		return base->detail;
+	for (const ColdTtBlockV1 *block = base->blocks; block != NULL; block = block->next) {
+		PGAlignedBlock observed;
+
+		if (!cold_tt_read_data(block->file, block->block, observed.data)
+			|| memcmp(block->bytes.data, observed.data, BLCKSZ) != 0)
+			return base->detail;
+	}
 	base->detail = CLUSTER_COLD_OK;
 	return CLUSTER_COLD_OK;
 }
@@ -343,5 +408,74 @@ cluster_cold_tt_base_match_v1(const ClusterColdTypedV1 *typed,
 		cold_tt_slot_copy(input, key.slot_offset, out);
 		return true;
 	}
+	return false;
+}
+
+bool
+cluster_cold_tt_undo_record_v1(ClusterColdTypedV1 *typed, UBA address,
+							   ClusterRecoveryUndoRecord *out, uint32 *generation)
+{
+	ClusterColdTtBaseV1 *base;
+	const ColdTtInputV1 *file;
+	ColdTtBlockV1 *block, *allocated = NULL;
+	ClusterRecoveryUndoRecord record;
+	bool owners[COLD_TT_MAX_ORIGINS + 1];
+	uint32 segment, blockno;
+	uint16 slot, row;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (generation != NULL)
+		*generation = 0;
+	if (typed == NULL || out == NULL || generation == NULL || typed->tt_base == NULL)
+		return false;
+	base = typed->tt_base;
+	if (!base->captured || base->detail != CLUSTER_COLD_OK)
+		return false;
+	base->detail = CLUSTER_COLD_SOURCE_GAP;
+	if (typed->refusal != CLUSTER_COLD_OK || !cold_tt_owners(typed, owners)
+		|| memcmp(owners, base->owners, sizeof(owners)) != 0
+		|| !uba_decode_record(address, &segment, &blockno, &slot, &row))
+		return false;
+	for (file = base->first; file != NULL; file = file->next)
+		if (file->segment == segment)
+			break;
+	if (file == NULL)
+		return false;
+	for (block = base->blocks; block != NULL; block = block->next)
+		if (block->file == file && block->block == blockno)
+			break;
+	if (block == NULL) {
+		if (sizeof(*block) > base->budget - base->used) {
+			base->detail = CLUSTER_COLD_CAPACITY;
+			return false;
+		}
+		allocated = palloc_extended(sizeof(*block), MCXT_ALLOC_NO_OOM);
+		if (allocated == NULL) {
+			base->detail = CLUSTER_COLD_OOM;
+			return false;
+		}
+		block = allocated;
+		block->file = file;
+		block->block = blockno;
+		if (!cold_tt_read_data(file, blockno, block->bytes.data))
+			goto refused;
+	}
+	if (cluster_recovery_undo_record_read(block->bytes.data, BLCKSZ, segment, blockno, file->owner,
+										  address, &record)
+		!= CLUSTER_RECOVERY_UNDO_ENTRY)
+		goto refused;
+	if (allocated != NULL) {
+		block->next = base->blocks;
+		base->blocks = block;
+		base->used += sizeof(*block);
+	}
+	base->detail = CLUSTER_COLD_OK;
+	*out = record;
+	*generation = ((const UndoSegmentHeaderData *)file->block.data)->wrap_count;
+	return true;
+refused:
+	if (allocated != NULL)
+		pfree(allocated);
 	return false;
 }

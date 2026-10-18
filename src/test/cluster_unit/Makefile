@@ -8989,11 +8989,13 @@ test_cluster_cold_recovery_effects: test_cluster_cold_recovery_effects.c unit_te
 
 CLUSTER_COLD_STARTUP_O = test_cluster_cold_recovery_startup_core.o test_cluster_cold_recovery_startup_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)
 
-test_cluster_cold_tt_base: test_cluster_cold_tt_base.c unit_test.h \
+test_cluster_cold_tt_base: test_cluster_cold_tt_base.c unit_test.h test_cluster_heap_small_scn.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_cold_recovery_tt.c \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
-		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h cluster_unit_port_stubs.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h $(CLUSTER_SIDE_HEAD_READER_O) \
+		cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_SIDE_HEAD_READER_O) \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 test_cluster_cold_recovery_startup_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_census.h \

@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_recovery_undo_scan.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/storage/cluster_shared_fs.h"
 #include "cluster/storage/cluster_undo_alloc.h"
@@ -25,6 +26,8 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+#include "test_cluster_heap_small_scn.inc"
 
 static char test_dir[MAXPGPATH], opened_path[MAXPGPATH];
 static uint16 visits[129][256];
@@ -88,7 +91,7 @@ fixture_pread(int fd, void *buf, size_t count, off_t offset)
 {
 	ssize_t result;
 
-	if (read_fault == 1) {
+	if (read_fault == 1 || (read_fault == 4 && offset != 0)) {
 		errno = EIO;
 		return -1;
 	}
@@ -725,10 +728,315 @@ UT_TEST(test_failed_capture_and_sticky_recheck_export_no_slot_or_match)
 	}
 }
 
+static UBA
+record_address(uint32 segment, uint32 block, uint16 row)
+{
+	UBA address = { { ((uint64)block << 32) | segment, ((uint64)row << 16) | 6 } };
+
+	return address;
+}
+
+static void
+write_record_block(uint8 owner, uint32 segment, uint32 blockno, bool corrupt_second)
+{
+	PGAlignedBlock page = { 0 };
+	UndoBlockHeader block = { 0 };
+	char path[MAXPGPATH];
+	int fd;
+
+	block.magic = PGRAC_UNDO_BLOCK_MAGIC;
+	block.block_version = UNDO_BLOCK_VERSION_1;
+	block.free_offset = sizeof(block);
+	for (uint16 i = 0; i < 2; i++) {
+		UndoRecordHeader header = { 0 };
+		UndoSlotDirEntry directory = { 0 };
+		UndoInsertPayload payload = { 32, 0 };
+
+		header.record_type = UNDO_RECORD_INSERT;
+		header.flags = UNDO_REC_FLAG_FIRST_IN_TX;
+		header.payload_length = sizeof(payload);
+		header.xid = 42 + i;
+		header.origin_node_id = owner - 1;
+		header.tt_slot_segment_id = (owner - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+		header.tt_slot_id = 7;
+		header.tt_wrap_plus1 = i; /* Unknown wrap stays raw input. */
+		header.target_locator = (RelFileLocator){ 1663, 5, 16385 };
+		header.target_offset = 1;
+		directory.record_offset = block.free_offset;
+		directory.record_length = sizeof(header) + sizeof(payload);
+		directory.record_type = header.record_type;
+		directory.flags = header.flags;
+		if (i == 1 && corrupt_second)
+			directory.record_offset = sizeof(block) - 1;
+		memcpy(page.data + block.free_offset, &header, sizeof(header));
+		memcpy(page.data + block.free_offset + sizeof(header), &payload, sizeof(payload));
+		memcpy(page.data + UNDO_SLOT_DIR_OFFSET(i), &directory, sizeof(directory));
+		block.slot_count++;
+		block.free_offset += directory.record_length;
+	}
+	memcpy(page.data, &block, sizeof(block));
+	file_path(segment, path);
+	fd = open(path, O_RDWR);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(pwrite(fd, page.data, BLCKSZ, (off_t)blockno * BLCKSZ), BLCKSZ);
+	UT_ASSERT_EQ(close(fd), 0);
+}
+
+static void
+assert_record_cleared(const ClusterRecoveryUndoRecord *record, uint32 generation)
+{
+	ClusterRecoveryUndoRecord zero = { 0 };
+
+	UT_ASSERT_EQ(memcmp(record, &zero, sizeof(zero)), 0);
+	UT_ASSERT_EQ(generation, 0);
+}
+
+UT_TEST(test_original_undo_records_keep_raw_identity_and_history_origin)
+{
+	for (uint16 owner = 1; owner <= 128; owner += 127) {
+		ClusterColdTypedV1 typed;
+		uint32 segment = (owner - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+		UndoSegmentHeaderData header = header_for(owner, segment);
+		ClusterRecoveryUndoRecord record;
+		uint32 generation = UINT32_MAX;
+
+		fixture(&typed);
+		typed.participant_count = 2;
+		typed.replay_count = 1;
+		typed.participants[1].thread_id = owner;
+		write_header(segment, &header, true);
+		write_record_block(owner, segment, 3, false);
+		UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(&typed, INPUT_BUDGET), CLUSTER_COLD_OK);
+		for (uint16 row = 0; row < 2; row++) {
+			int previous_calls = alloc_calls;
+
+			UT_ASSERT(cluster_cold_tt_undo_record_v1(&typed, record_address(segment, 3, row),
+													 &record, &generation));
+			UT_ASSERT_EQ(record.header.xid, 42 + row);
+			UT_ASSERT_EQ(record.header.tt_wrap_plus1, row);
+			UT_ASSERT_EQ(record.header.origin_node_id, owner - 1);
+			UT_ASSERT_EQ(record.block_header.crc64, 0); /* Not checksum authority. */
+			UT_ASSERT_EQ(generation, 0);
+			if (row == 0) {
+				typed.tt_base->budget = typed.tt_base->used;
+				alloc_fail = alloc_calls + 1;
+			} else
+				UT_ASSERT_EQ(alloc_calls, previous_calls);
+		}
+		UT_ASSERT_EQ(cluster_cold_tt_base_recheck_v1(&typed), CLUSTER_COLD_OK);
+		cluster_cold_tt_base_destroy_v1(&typed);
+		UT_ASSERT_EQ(record.header.xid, 43); /* Independent output copy. */
+	}
+}
+
+UT_TEST(test_record_physical_segment_is_distinct_from_canonical_tt_segment)
+{
+	ClusterColdTypedV1 typed;
+	UndoSegmentHeaderData canonical = header_for(1, 1), physical = header_for(1, 2);
+	ClusterRecoveryUndoRecord record;
+	uint32 generation;
+
+	fixture(&typed);
+	physical.wrap_count = 91;
+	write_header(1, &canonical, true);
+	write_header(2, &physical, true);
+	write_record_block(1, 2, 3, false);
+	UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(&typed, INPUT_BUDGET), CLUSTER_COLD_OK);
+	UT_ASSERT(
+		cluster_cold_tt_undo_record_v1(&typed, record_address(2, 3, 0), &record, &generation));
+	UT_ASSERT_EQ(record.header.tt_slot_segment_id, 1);
+	UT_ASSERT_EQ(generation, 91);
+	UT_ASSERT_EQ(cluster_cold_tt_base_recheck_v1(&typed), CLUSTER_COLD_OK);
+	cluster_cold_tt_base_destroy_v1(&typed);
+}
+
+UT_TEST(test_record_file_and_io_drift_invalidate_all_captured_inputs)
+{
+	for (int fault = 0; fault < 10; fault++) {
+		ClusterColdTypedV1 typed;
+		UndoSegmentHeaderData header = header_for(1, 1);
+		ClusterRecoveryUndoRecord record;
+		uint32 generation = UINT32_MAX;
+		char path[MAXPGPATH];
+		int fd;
+
+		fixture(&typed);
+		write_header(1, &header, true);
+		write_record_block(1, 1, 3, false);
+		UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(&typed, INPUT_BUDGET), CLUSTER_COLD_OK);
+		file_path(1, path);
+		switch (fault) {
+		case 0:
+			UT_ASSERT_EQ(unlink(path), 0);
+			break;
+		case 1:
+			fd = open(path, O_RDONLY); /* Hold old inode to forbid reuse. */
+			UT_ASSERT_EQ(unlink(path), 0);
+			write_header(1, &header, true);
+			write_record_block(1, 1, 3, false);
+			UT_ASSERT_EQ(close(fd), 0);
+			break;
+		case 2:
+			UT_ASSERT_EQ(truncate(path, BLCKSZ), 0);
+			break;
+		case 3:
+			header._reserved[0]++;
+			write_header(1, &header, false);
+			break;
+		case 4:
+		case 5:
+		case 6:
+			read_fault = fault - 3;
+			break;
+		case 7:
+			close_fault = 1;
+			break;
+		case 8:
+			path_error = true;
+			break;
+		case 9:
+			typed.participants[0].thread_id = 2;
+			break;
+		}
+		memset(&record, 0xA5, sizeof(record));
+		UT_ASSERT(
+			!cluster_cold_tt_undo_record_v1(&typed, record_address(1, 3, 0), &record, &generation));
+		assert_record_cleared(&record, generation);
+		UT_ASSERT_EQ(cluster_cold_tt_base_count_v1(&typed), 0);
+		cluster_cold_tt_base_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_record_recheck_covers_unused_bytes_and_data_read_failure)
+{
+	for (int fault = 0; fault < 2; fault++) {
+		ClusterColdTypedV1 typed;
+		UndoSegmentHeaderData header = header_for(1, 1);
+		ClusterRecoveryUndoRecord record;
+		uint32 generation;
+		char path[MAXPGPATH];
+		char changed = 42;
+		int fd;
+
+		fixture(&typed);
+		write_header(1, &header, true);
+		write_record_block(1, 1, 3, false);
+		UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(&typed, INPUT_BUDGET), CLUSTER_COLD_OK);
+		UT_ASSERT(
+			cluster_cold_tt_undo_record_v1(&typed, record_address(1, 3, 0), &record, &generation));
+		if (fault == 0) {
+			file_path(1, path);
+			fd = open(path, O_RDWR);
+			UT_ASSERT_EQ(pwrite(fd, &changed, 1, 3 * BLCKSZ + BLCKSZ / 2), 1);
+			UT_ASSERT_EQ(close(fd), 0);
+		} else
+			read_fault = 4; /* Header rereads succeed; retained DATA reread fails. */
+		UT_ASSERT_EQ(cluster_cold_tt_base_recheck_v1(&typed), CLUSTER_COLD_SOURCE_GAP);
+		UT_ASSERT_EQ(cluster_cold_tt_base_count_v1(&typed), 0);
+		memset(&record, 0xA5, sizeof(record));
+		generation = UINT32_MAX;
+		UT_ASSERT(
+			!cluster_cold_tt_undo_record_v1(&typed, record_address(1, 3, 0), &record, &generation));
+		assert_record_cleared(&record, generation);
+		cluster_cold_tt_base_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_complete_block_refuses_bad_unselected_row)
+{
+	ClusterColdTypedV1 typed;
+	UndoSegmentHeaderData header = header_for(1, 1);
+	ClusterRecoveryUndoRecord record;
+	uint32 generation = UINT32_MAX;
+
+	fixture(&typed);
+	write_header(1, &header, true);
+	write_record_block(1, 1, 3, true);
+	UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(&typed, INPUT_BUDGET), CLUSTER_COLD_OK);
+	memset(&record, 0xA5, sizeof(record));
+	UT_ASSERT(
+		!cluster_cold_tt_undo_record_v1(&typed, record_address(1, 3, 0), &record, &generation));
+	assert_record_cleared(&record, generation);
+	UT_ASSERT_EQ(cluster_cold_tt_base_count_v1(&typed), 0);
+	cluster_cold_tt_base_destroy_v1(&typed);
+}
+
+UT_TEST(test_record_capacity_and_allocation_failure_discard_the_capture)
+{
+	for (int fault = 0; fault < 2; fault++) {
+		ClusterColdTypedV1 typed;
+		UndoSegmentHeaderData header = header_for(1, 1);
+		ClusterRecoveryUndoRecord record;
+		uint32 generation = UINT32_MAX;
+
+		fixture(&typed);
+		write_header(1, &header, true);
+		write_record_block(1, 1, 3, false);
+		UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(&typed, INPUT_BUDGET), CLUSTER_COLD_OK);
+		if (fault == 0)
+			typed.tt_base->budget = typed.tt_base->used;
+		else
+			alloc_fail = alloc_calls + 1;
+		memset(&record, 0xA5, sizeof(record));
+		UT_ASSERT(
+			!cluster_cold_tt_undo_record_v1(&typed, record_address(1, 3, 0), &record, &generation));
+		assert_record_cleared(&record, generation);
+		UT_ASSERT_EQ(cluster_cold_tt_base_recheck_v1(&typed),
+					 fault == 0 ? CLUSTER_COLD_CAPACITY : CLUSTER_COLD_OOM);
+		UT_ASSERT_EQ(cluster_cold_tt_base_count_v1(&typed), 0);
+		cluster_cold_tt_base_destroy_v1(&typed);
+		UT_ASSERT_EQ(allocations, 0);
+	}
+}
+
+UT_TEST(test_record_invalid_address_and_missing_source_clear_outputs)
+{
+	for (int fault = 0; fault < 7; fault++) {
+		ClusterColdTypedV1 typed;
+		UndoSegmentHeaderData header = header_for(1, 1);
+		ClusterRecoveryUndoRecord record;
+		uint32 generation = UINT32_MAX;
+		UBA address = record_address(1, 3, 0);
+
+		fixture(&typed);
+		write_header(1, &header, true);
+		write_record_block(1, 1, 3, false);
+		UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(&typed, INPUT_BUDGET), CLUSTER_COLD_OK);
+		switch (fault) {
+		case 0:
+			address = record_address(0, 3, 0);
+			break;
+		case 1:
+			address = record_address(1, 0, 0);
+			break;
+		case 2:
+			address = record_address(1, UNDO_SEGMENT_SIZE_BYTES / BLCKSZ, 0);
+			break;
+		case 3:
+			address = record_address(2, 3, 0); /* Absent segment in selected origin. */
+			break;
+		case 4:
+			address = record_address(CLUSTER_UNDO_SEGS_PER_INSTANCE + 1, 3, 0);
+			break;
+		case 5:
+			address = record_address(1, 3, 2); /* No such row. */
+			break;
+		case 6:
+			typed.refusal = CLUSTER_COLD_SOURCE_GAP;
+			break;
+		}
+		memset(&record, 0xA5, sizeof(record));
+		UT_ASSERT(!cluster_cold_tt_undo_record_v1(&typed, address, &record, &generation));
+		assert_record_cleared(&record, generation);
+		UT_ASSERT_EQ(cluster_cold_tt_base_count_v1(&typed), 0);
+		cluster_cold_tt_base_destroy_v1(&typed);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(26);
 	UT_RUN(test_absence_scans_all_addresses_and_deduplicates_history_origins);
 	UT_RUN(test_all_slots_noncurrent_segments_and_generation_zero_are_retained);
 	UT_RUN(test_history_origin_last_segment_is_captured);
@@ -748,6 +1056,13 @@ main(void)
 	UT_RUN(test_exact_match_invalid_claims_and_null_arguments_clear_outputs);
 	UT_RUN(test_slot_copies_and_aliased_match_do_not_modify_captured_input);
 	UT_RUN(test_failed_capture_and_sticky_recheck_export_no_slot_or_match);
+	UT_RUN(test_original_undo_records_keep_raw_identity_and_history_origin);
+	UT_RUN(test_record_physical_segment_is_distinct_from_canonical_tt_segment);
+	UT_RUN(test_record_file_and_io_drift_invalidate_all_captured_inputs);
+	UT_RUN(test_record_recheck_covers_unused_bytes_and_data_read_failure);
+	UT_RUN(test_complete_block_refuses_bad_unselected_row);
+	UT_RUN(test_record_capacity_and_allocation_failure_discard_the_capture);
+	UT_RUN(test_record_invalid_address_and_missing_source_clear_outputs);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
