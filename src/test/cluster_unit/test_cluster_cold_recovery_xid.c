@@ -317,10 +317,12 @@ UT_TEST(test_null_and_uninitialized_inputs)
 	UT_ASSERT(!cluster_cold_xid_candidate_v1(&p, &s, NULL));
 }
 
+#include "test_cluster_cold_xid_replay.h"
+
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(24);
 	UT_RUN(test_empty_cut_retains_checkpoint);
 	UT_RUN(test_ordered_header_and_payload);
 	UT_RUN(test_wrap_skips_reserved_xids);
@@ -337,6 +339,14 @@ main(void)
 	UT_RUN(test_count_and_tail_both_required);
 	UT_RUN(test_invalid_seed_and_source_do_not_leave_old_result);
 	UT_RUN(test_null_and_uninitialized_inputs);
+	UT_RUN(test_replay_xid_original_seeds_and_reset);
+	UT_RUN(test_replay_xid_native_read_fold_and_drain);
+	UT_RUN(test_replay_xid_no_endpoint_without_original_drain);
+	UT_RUN(test_replay_xid_count_and_consumed_identity);
+	UT_RUN(test_replay_xid_bad_record_cannot_publish);
+	UT_RUN(test_replay_xid_history_cut_is_not_checkpoint_coverage);
+	UT_RUN(test_replay_xid_empty_exact_checkpoint_cut);
+	UT_RUN(test_replay_xid_bad_checkpoint_or_source);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

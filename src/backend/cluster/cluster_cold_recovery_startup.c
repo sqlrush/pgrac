@@ -825,6 +825,7 @@ cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFen
 	/* ERROR from an original source owner must not leave a reusable OK plan. */
 	cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "pass-2 source durability is incomplete");
 	memset(typed->source_drained, 0, sizeof(typed->source_drained));
+	memset(typed->xid_next_at_drain, 0, sizeof(typed->xid_next_at_drain));
 	if (fence == NULL || !cluster_cold_replay_window_active_v1() || typed->plan == NULL
 		|| typed->replay_roots == NULL || typed->own_participant != 0 || typed->replay_count == 0
 		|| typed->replay_count > typed->participant_count

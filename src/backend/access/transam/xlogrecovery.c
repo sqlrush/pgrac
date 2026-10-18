@@ -204,6 +204,7 @@
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_wal_tail.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_recovery_worker.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -3210,11 +3211,45 @@ typedef struct ClusterColdTypedReplay
 	ClusterColdReaderV1 *readers[CLUSTER_COLD_MAX_PARTICIPANTS];
 	XLogReaderState *current[CLUSTER_COLD_MAX_PARTICIPANTS];
 	char	   *errormsg[CLUSTER_COLD_MAX_PARTICIPANTS];
+	ClusterColdXidProgressV1 xid_progress[CLUSTER_COLD_MAX_PARTICIPANTS];
 	bool		foreign_mutation_started;
 	bool		apply_foreign;	/* the record being applied is another generation's */
 	ClusterColdDecodedV1 decoded;	/* scratch for unscheduled records */
 	ClusterColdTouchedV1 touched;	/* files pass 2 changed, made durable before completion */
 } ClusterColdTypedReplay;
+
+static bool
+cluster_typed_replay_xid_begin(ClusterColdTypedReplay *rep)
+{
+	ClusterColdTypedV1 *typed = rep->typed;
+
+	memset(rep->xid_progress, 0, sizeof(rep->xid_progress));
+	memset(typed->xid_next_at_drain, 0, sizeof(typed->xid_next_at_drain));
+	if (typed->participant_count == 0
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->replay_count > typed->participant_count)
+		return false;
+	for (uint32 i = 0; i < typed->participant_count; i++)
+	{
+		ClusterControlRootSnapshot root;
+		ClusterWalRecoveryCheckpointV1 checkpoint;
+		if (!cluster_cold_typed_checkpoint_v1(typed, i, &root, &checkpoint))
+			return false;
+		/* History normally has its native replay cut at the tail. Its
+		 * checkpoint seed alone cannot stand in for the omitted records. */
+		if (checkpoint.checkpoint.redo != typed->participants[i].native_redo)
+		{
+			if (i < typed->replay_count)
+				return false;
+			continue;
+		}
+		if (!cluster_cold_xid_begin_v1(&rep->xid_progress[i], &typed->participants[i],
+									 U64FromFullTransactionId(checkpoint.checkpoint.nextXid),
+									 cluster_cold_plan_replay_record_count_v1(typed->plan, i)))
+			return false;
+	}
+	return true;
+}
 
 static void
 pg_attribute_noreturn()
@@ -3281,6 +3316,27 @@ cluster_typed_replay_next(void *arg, uint32 participant, ClusterColdReplayRecord
 	out->record_crc = (uint32) r->record->header.xl_crc;
 	out->rmid = r->record->header.xl_rmid;
 	out->info = r->record->header.xl_info;
+	/* Fold the original reader's ordered inputs even for records whose
+	 * pages will be skipped. This is provisional until consumption and
+	 * the original source owner's counted drain both succeed. */
+	if (rep->xid_progress[participant].begun)
+	{
+		ClusterColdTypedV1 *typed = rep->typed;
+		bool is_own = participant == typed->own_participant;
+
+		if (cluster_cold_recovery_decode_v1(r, typed->system_identifier,
+											typed->sources[participant].claim.identity.storage_uuid,
+											false, !is_own, &rep->decoded) != CLUSTER_COLD_OK)
+		{
+			rep->xid_progress[participant].failed = true;
+			rep->xid_progress[participant].next_xid = 0;
+			return false;
+		}
+		if (!cluster_cold_xid_record_v1(&rep->xid_progress[participant],
+									  &typed->participants[participant], &rep->decoded.record,
+									  &rep->decoded.xid_input))
+			return false;
+	}
 	return true;
 }
 
@@ -3572,15 +3628,30 @@ cluster_typed_replay_dependency(void *arg, uint32 participant,
 											   &rep->decoded.record, target);
 }
 
-/* The original counted source drain supplies C0 target ordering only. */
+/* Preserve the original drain owner; a counted counter is still neither
+ * global replay completion nor a qualified all-thread endpoint. */
 static bool
 cluster_typed_replay_source_drained(void *arg, uint32 participant,
 									const ClusterColdReplayResultV1 *progress, uint64 records)
 {
 	ClusterColdTypedReplay *rep = (ClusterColdTypedReplay *)arg;
+	const ClusterColdXidProgressV1 *xid = &rep->xid_progress[participant];
+	uint64 next_xid;
 
-	return cluster_cold_typed_source_drained_v1(rep->typed, *rep->fence_plan, participant, progress,
-												records);
+	rep->typed->xid_next_at_drain[participant] = 0;
+	if (!cluster_cold_typed_source_drained_v1(rep->typed, *rep->fence_plan, participant, progress,
+												 records))
+		return false;
+	if (!xid->begun)
+		return true; /* Missing history coverage stays missing, never a seed-only endpoint. */
+	/* The sequencer's result cursors stay zero for an empty source. The
+	 * candidate still proves that its checkpoint redo equals the tail. */
+	if (records != xid->records || progress->last_read[participant] != xid->last_read
+		|| progress->last_end[participant] != (records != 0 ? xid->last_end : InvalidXLogRecPtr)
+		|| !cluster_cold_xid_candidate_v1(xid, &rep->typed->participants[participant], &next_xid))
+		return false;
+	rep->typed->xid_next_at_drain[participant] = next_xid;
+	return true;
 }
 
 static bool
@@ -3768,6 +3839,10 @@ cluster_recovery_typed_replay(ClusterColdTypedV1 **typed_address, TimeLineID *re
 		cluster_recovery_typed_fail(fence_plan, typed_address,
 									"typed cold recovery source durability refused",
 									typed->refusal_detail);
+	if (!cluster_typed_replay_xid_begin(rep))
+		cluster_recovery_typed_fail(fence_plan, typed_address,
+									"typed cold recovery counter input refused",
+									"An original checkpoint seed or replay cut is missing or invalid.");
 	cluster_recovery_merge_window_enter();
 	cluster_recovery_merge_set_own_lsn((uint64) typed->participants[typed->own_participant].native_redo);
 	if (cluster_cold_replay_run_v1(typed->plan, typed->participants, typed->participant_count,

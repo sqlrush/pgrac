@@ -776,6 +776,9 @@ typedef struct ClusterColdTypedV1 {
 	uint32 replay_root_count;
 	struct ClusterColdTtBaseV1 *tt_base; /* raw original-owner input, no outcome authority */
 	bool source_drained[CLUSTER_COLD_MAX_PARTICIPANTS]; /* this pass-2 attempt only */
+	/* Provisional native counters after counted pass-2 drain. Zero means
+	 * missing; these do not prove global effects/durability or all-thread N. */
+	uint64 xid_next_at_drain[CLUSTER_COLD_MAX_PARTICIPANTS];
 	/* Per selected source, including its retained pre-redo records. Each plan
 	 * binds the complete retained source set; that does not authorize target
 	 * mutation. History-only generations keep their redo cut at the tail. */

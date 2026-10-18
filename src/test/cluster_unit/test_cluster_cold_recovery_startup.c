@@ -728,8 +728,10 @@ UT_TEST(test_source_barrier_refuses_sync_or_tail_failure_stickily)
 			typed = prepare(0x800);
 			source_sync_fault = fault;
 			source_sync_fail_thread = thread;
+			typed->xid_next_at_drain[0] = 99;
 			cluster_cold_replay_window_enter_v1();
 			UT_ASSERT(!sync_sources(typed));
+			UT_ASSERT_EQ(typed->xid_next_at_drain[0], 0);
 			UT_ASSERT_EQ(source_sync_calls, thread);
 			UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
 			source_sync_fail_thread = 0;
@@ -2208,9 +2210,11 @@ UT_TEST(test_source_drain_is_attempt_local_and_not_recovery_completion)
 	UT_ASSERT(source_drained_fixture(typed, 2));
 	UT_ASSERT(typed->source_drained[2]);
 	UT_ASSERT(!typed->source_drained[0] && !typed->source_drained[1]);
+	typed->xid_next_at_drain[2] = 99;
 	UT_ASSERT(
 		cluster_cold_typed_sync_sources_v1(typed, (ClusterRecoveryFencePlan *)&fixture_context));
 	UT_ASSERT(!typed->source_drained[2]);
+	UT_ASSERT_EQ(typed->xid_next_at_drain[2], 0);
 	UT_ASSERT_EQ(c0_calls, 0);
 	cluster_cold_replay_window_leave_v1();
 	cluster_cold_typed_destroy_v1(&typed);
