@@ -161,6 +161,13 @@ static int test_local_binding_calls;
 static ClusterCanonicalTxnBinding test_local_binding;
 static int test_ctrc_touch_calls;
 static uint32 test_ctrc_touch_grant;
+static uint32 test_ctrc_touch_segment;
+static uint32 test_ctrc_touch_generation;
+static ClusterCtrcTxnKeyV1 test_ctrc_touched_key;
+static ClusterCtrcParticipantIdentity test_ctrc_touched_participant;
+static bool test_ctrc_touch_generation_drift;
+static bool test_ctrc_revoke_on_release;
+static bool test_ctrc_grant_revoked;
 static uint32 test_current_segment;
 static bool test_current_segment_drift_on_recheck;
 static int test_current_segment_calls;
@@ -754,14 +761,22 @@ cluster_ctrc_origin_touch_exact(const ClusterCtrcTxnKeyV1 *key,
 	UT_ASSERT_NOT_NULL(key);
 	UT_ASSERT_NOT_NULL(participant);
 	UT_ASSERT_NOT_NULL(grant_out);
-	UT_ASSERT_EQ(key->segment_id, TEST_TT_SEGMENT);
-	UT_ASSERT_EQ(key->segment_generation, (uint32)23);
+	UT_ASSERT_EQ(key->segment_id, test_ctrc_touch_segment);
+	UT_ASSERT_EQ(key->segment_generation, test_ctrc_touch_generation);
 	UT_ASSERT_EQ(key->slot_offset, TEST_TT_OFFSET);
 	UT_ASSERT_EQ(key->slot_wrap, TEST_ORIGIN_WRAP);
 	UT_ASSERT_EQ((int)key->xid, (int)TEST_ORIGIN_XID);
 	UT_ASSERT_EQ(participant->node_id, (uint16)cluster_node_id);
 	UT_ASSERT_EQ(proof_class, CTRC_PROOF_ACTIVE);
+	test_ctrc_touched_key = *key;
+	test_ctrc_touched_participant = *participant;
 	*grant_out = test_ctrc_touch_grant;
+	if (test_ctrc_touch_generation_drift) {
+		if (key->segment_id == TEST_RECORD_SEGMENT)
+			test_candidate_data_generation++;
+		else
+			test_candidate_tt_generation++;
+	}
 	return test_ctrc_touch_grant == 0 ? CLUSTER_CTRC_TOUCH_REFUSED : CLUSTER_CTRC_TOUCH_RECORDED;
 }
 
@@ -770,7 +785,7 @@ cluster_ctrc_origin_grant_publishable(const ClusterCtrcTxnKeyV1 *key,
 									  const ClusterCtrcParticipantIdentity *participant,
 									  uint32 grant_generation)
 {
-	return key != NULL && participant != NULL && grant_generation != 0
+	return !test_ctrc_grant_revoked && key != NULL && participant != NULL && grant_generation != 0
 		   && grant_generation == test_ctrc_touch_grant && key->xid == TEST_ORIGIN_XID
 		   && key->formation_epoch == test_formation_epoch
 		   && participant->formation_epoch == test_formation_epoch;
@@ -955,6 +970,8 @@ cluster_undo_block0_current_release_begin(ClusterUndoBlock0CurrentGuard *guard
 	if (test_candidate_release_fault_call != 0
 		&& test_candidate_release_calls != test_candidate_release_fault_call)
 		return CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED;
+	if (test_ctrc_revoke_on_release)
+		test_ctrc_grant_revoked = true;
 	if (test_candidate_release_admission_drift)
 		test_admission_revoked = true;
 	if (test_candidate_release_epoch_drift)
@@ -1144,6 +1161,13 @@ reset_exact_origin_fixture(void)
 	test_local_binding.active_lsn = test_flush_lsn;
 	test_ctrc_touch_calls = 0;
 	test_ctrc_touch_grant = 41;
+	test_ctrc_touch_segment = TEST_TT_SEGMENT;
+	test_ctrc_touch_generation = 23;
+	memset(&test_ctrc_touched_key, 0, sizeof(test_ctrc_touched_key));
+	memset(&test_ctrc_touched_participant, 0, sizeof(test_ctrc_touched_participant));
+	test_ctrc_touch_generation_drift = false;
+	test_ctrc_revoke_on_release = false;
+	test_ctrc_grant_revoked = false;
 	test_current_segment = TEST_TT_SEGMENT + 1;
 	test_current_segment_drift_on_recheck = false;
 	test_current_segment_calls = 0;
@@ -1835,6 +1859,177 @@ assert_rolled_lookup_unknown(void)
 	UT_ASSERT(memcmp(&participant, &empty_participant, sizeof(participant)) == 0);
 	UT_ASSERT_EQ(test_candidate_held_count, 0);
 	UT_ASSERT_EQ(test_xact_lock_depth, 0);
+}
+
+static void
+reset_rolled_updater_fixture(bool cross_segment)
+{
+	reset_rolled_active_fixture();
+	test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+	test_origin_record.tt_slot_segment_id = cross_segment ? TEST_TT_SEGMENT : TEST_RECORD_SEGMENT;
+	test_ctrc_touch_segment = cross_segment ? TEST_TT_SEGMENT : TEST_RECORD_SEGMENT;
+	test_ctrc_touch_generation = cross_segment ? 23 : 17;
+}
+
+static void
+check_rolled_active_updater_sample(bool expected_proof)
+{
+	ClusterTTStatusKey key;
+	ClusterTTStatusResult result;
+	ClusterCtrcTxnKeyV1 ctrc_key;
+	ClusterTxLocator canonical;
+	ClusterTTStatusKey empty_key = { 0 };
+	ClusterCtrcTxnKeyV1 empty_ctrc_key = { 0 };
+	ClusterTxLocator empty_locator = { 0 };
+	uint32 grant = 99;
+	uint32 capability = 99;
+	bool cross_segment = true;
+	bool retry = true;
+
+	memset(&key, 0xa5, sizeof(key));
+	memset(&result, 0xa5, sizeof(result));
+	memset(&ctrc_key, 0xa5, sizeof(ctrc_key));
+	memset(&canonical, 0xa5, sizeof(canonical));
+	test_updater_retry_observer = &retry;
+	UT_ASSERT_EQ(cluster_runtime_visibility_current_mx_updater_provenance_exact(
+					 &test_origin_locator, 0, &key, &result, &grant, &capability, &ctrc_key,
+					 &canonical, &cross_segment, &retry),
+				 expected_proof);
+	test_updater_retry_observer = NULL;
+	UT_ASSERT(!retry);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+	UT_ASSERT_EQ(test_candidate_max_held_count, 1);
+	UT_ASSERT_EQ(test_xact_lock_depth, 0);
+	UT_ASSERT_EQ(test_native_fence_depth, 0);
+	UT_ASSERT_EQ(test_by_xid_scan_calls, 0);
+	UT_ASSERT_EQ(test_durable_locator_calls, 0);
+	if (expected_proof) {
+		UT_ASSERT(result.authoritative);
+		UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_IN_PROGRESS);
+		UT_ASSERT_EQ(result.commit_scn, InvalidScn);
+		UT_ASSERT_EQ(key.undo_segment_id, test_ctrc_touch_segment);
+		UT_ASSERT_EQ(key.tt_slot_id, cluster_tt_slot_offset_to_id(TEST_TT_OFFSET));
+		UT_ASSERT_EQ(key.cluster_epoch, test_formation_epoch);
+		UT_ASSERT_EQ(key.local_xid, TEST_ORIGIN_XID);
+		UT_ASSERT_EQ(grant, test_ctrc_touch_grant);
+		UT_ASSERT_EQ(capability, 77);
+		UT_ASSERT(memcmp(&ctrc_key, &test_ctrc_touched_key, sizeof(ctrc_key)) == 0);
+		UT_ASSERT_EQ(ctrc_key.system_identifier, test_system_identifier);
+		UT_ASSERT_EQ(ctrc_key.origin_boot_incarnation, test_boot_incarnation);
+		UT_ASSERT_EQ(ctrc_key.admission_record_generation, 77);
+		UT_ASSERT_EQ(test_ctrc_touched_participant.capability_record_generation, capability);
+		UT_ASSERT_EQ(test_ctrc_touched_participant.boot_incarnation, test_boot_incarnation);
+		UT_ASSERT_EQ(test_ctrc_touched_participant.formation_epoch, test_formation_epoch);
+		UT_ASSERT_EQ(canonical.xid, TEST_ORIGIN_XID);
+		UT_ASSERT_EQ(canonical.tt_wrap, TEST_ORIGIN_WRAP);
+		UT_ASSERT(memcmp(&canonical.uba, &test_origin_locator.uba, sizeof(canonical.uba)) == 0);
+		UT_ASSERT_EQ(cross_segment, test_ctrc_touch_segment != TEST_RECORD_SEGMENT);
+	} else {
+		UT_ASSERT(!result.authoritative);
+		UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_UNKNOWN);
+		UT_ASSERT_EQ(result.commit_scn, InvalidScn);
+		UT_ASSERT_EQ(grant, 0);
+		UT_ASSERT_EQ(capability, 0);
+		UT_ASSERT(memcmp(&key, &empty_key, sizeof(key)) == 0);
+		UT_ASSERT(memcmp(&ctrc_key, &empty_ctrc_key, sizeof(ctrc_key)) == 0);
+		UT_ASSERT(memcmp(&canonical, &empty_locator, sizeof(canonical)) == 0);
+		UT_ASSERT(!cross_segment);
+	}
+}
+
+UT_TEST(test_local_updater_rolled_active_preserves_original_identity)
+{
+	int cross_segment;
+	int epoch_zero;
+
+	for (cross_segment = 0; cross_segment < 2; cross_segment++) {
+		for (epoch_zero = 0; epoch_zero < 2; epoch_zero++) {
+			reset_rolled_updater_fixture(cross_segment != 0);
+			if (epoch_zero)
+				test_formation_epoch = 0;
+			/* The real updater consumer must follow UndoRecord, not CURRENT. */
+			check_rolled_active_updater_sample(true);
+			UT_ASSERT_EQ(test_ctrc_touch_calls, 1);
+			UT_ASSERT_EQ(test_candidate_acquire_calls, cross_segment ? 3 : 1);
+			UT_ASSERT_EQ(test_candidate_release_calls, test_candidate_acquire_calls);
+			UT_ASSERT_EQ(test_candidate_acquire_segments[0], TEST_RECORD_SEGMENT);
+			if (cross_segment) {
+				UT_ASSERT_EQ(test_candidate_acquire_segments[1], TEST_TT_SEGMENT);
+				UT_ASSERT_EQ(test_candidate_acquire_segments[2], TEST_RECORD_SEGMENT);
+			}
+		}
+	}
+}
+
+UT_TEST(test_local_updater_rolled_active_requires_canonical_slot)
+{
+	int cross_segment;
+	int fault;
+
+	for (cross_segment = 0; cross_segment < 2; cross_segment++) {
+		for (fault = 0; fault < 4; fault++) {
+			reset_rolled_updater_fixture(cross_segment != 0);
+			switch (fault) {
+			case 0:
+				test_tt_slot.wrap++;
+				break;
+			case 1:
+				test_tt_slot.xid++;
+				break;
+			case 2:
+				test_twophase_prepared = true;
+				break;
+			case 3:
+				test_tt_slot.commit_scn = test_commit_scn;
+				break;
+			}
+			check_rolled_active_updater_sample(false);
+			UT_ASSERT_EQ(test_ctrc_touch_calls, 0);
+			UT_ASSERT_EQ(test_candidate_release_calls, test_candidate_acquire_calls);
+		}
+	}
+}
+
+UT_TEST(test_local_updater_rolled_active_rechecks_touch_and_original_data)
+{
+	int cross_segment;
+	int fault;
+
+	for (cross_segment = 0; cross_segment < 2; cross_segment++) {
+		for (fault = 0; fault < 3; fault++) {
+			reset_rolled_updater_fixture(cross_segment != 0);
+			if (fault == 0)
+				test_ctrc_touch_grant = 0;
+			else if (fault == 1)
+				test_ctrc_touch_generation_drift = true;
+			else
+				test_candidate_mutate_record_on_recheck = true;
+			check_rolled_active_updater_sample(false);
+			UT_ASSERT_EQ(test_ctrc_touch_calls, 1);
+			UT_ASSERT_EQ(test_candidate_release_calls, test_candidate_acquire_calls);
+		}
+	}
+}
+
+UT_TEST(test_local_updater_rolled_active_final_release_fences)
+{
+	int cross_segment;
+	int fault;
+
+	for (cross_segment = 0; cross_segment < 2; cross_segment++) {
+		for (fault = 0; fault < 4; fault++) {
+			reset_rolled_updater_fixture(cross_segment != 0);
+			test_candidate_release_fault_call = cross_segment ? 3 : 1;
+			test_candidate_release_failed = fault == 0;
+			test_candidate_release_epoch_drift = fault == 1;
+			test_candidate_release_admission_drift = fault == 2;
+			test_ctrc_revoke_on_release = fault == 3;
+			check_rolled_active_updater_sample(false);
+			UT_ASSERT_EQ(test_ctrc_touch_calls, 1);
+			UT_ASSERT_EQ(test_candidate_release_calls, cross_segment ? 3 : 1);
+			UT_ASSERT_EQ(test_candidate_cancel_calls, fault == 0 ? 1 : 0);
+		}
+	}
 }
 
 UT_TEST(test_other_backend_rolled_active_uses_locator_and_ctrc)
@@ -5086,7 +5281,11 @@ UT_TEST(test_self_fresh_role_does_not_inherit_ordinary_abort_permission)
 int
 main(void)
 {
-	UT_PLAN(150);
+	UT_PLAN(154);
+	UT_RUN(test_local_updater_rolled_active_preserves_original_identity);
+	UT_RUN(test_local_updater_rolled_active_requires_canonical_slot);
+	UT_RUN(test_local_updater_rolled_active_rechecks_touch_and_original_data);
+	UT_RUN(test_local_updater_rolled_active_final_release_fences);
 	UT_RUN(test_local_updater_precommit_retries_only_after_guard_release);
 	UT_RUN(test_local_updater_precommit_release_and_admission_failure_stay_unknown);
 	UT_RUN(test_local_updater_does_not_retry_unproven_samples);
