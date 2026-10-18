@@ -22,8 +22,8 @@
 #include "cluster/cluster_uba.h"
 
 static bool
-cold_tt_redo_source(const ClusterColdTypedV1 *typed, uint32 participant, uint8 owner,
-					uint32 segment, bool *has_header_work)
+cold_tt_source(const ClusterColdTypedV1 *typed, uint32 participant, uint8 owner, uint32 segment,
+			   bool *has_header_work)
 {
 	const ClusterColdParticipantV1 *source;
 	const RfSideOnlinePlanV1 *plan;
@@ -33,10 +33,13 @@ cold_tt_redo_source(const ClusterColdTypedV1 *typed, uint32 participant, uint8 o
 	*has_header_work = false;
 	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK || typed->participant_count == 0
 		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
-		|| typed->replay_count > typed->participant_count || participant >= typed->replay_count
+		|| typed->replay_count > typed->participant_count || participant >= typed->participant_count
 		|| typed->side_capture_detail[participant] != RF_PAGE_PROOF_DETAIL_OK)
 		return false;
 	source = &typed->participants[participant];
+	/* A retained generation supplies input only; it has no replay interval. */
+	if (participant >= typed->replay_count && source->native_redo != source->tail_end)
+		return false;
 	plan = typed->side_plans[participant];
 	if (owner != 0 && owner != source->thread_id)
 		return false;
@@ -64,6 +67,8 @@ cold_tt_redo_source(const ClusterColdTypedV1 *typed, uint32 participant, uint8 o
 
 		if (!rf_side_online_plan_operation_v1(plan, i, &operation))
 			return false;
+		if (participant >= typed->replay_count && !operation.history_only)
+			return false;
 		/* These need their own complete proof/consumer. Do not silently
 		 * return an ordinary-only image of a source that contains them. */
 		if (operation.kind == RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT
@@ -89,6 +94,15 @@ cold_tt_redo_source(const ClusterColdTypedV1 *typed, uint32 participant, uint8 o
 			*has_header_work = true;
 	}
 	return true;
+}
+
+/* Readback/fold consumers remain limited to actual replay owners. */
+static bool
+cold_tt_redo_source(const ClusterColdTypedV1 *typed, uint32 participant, uint8 owner,
+					uint32 segment, bool *has_header_work)
+{
+	return typed != NULL && participant < typed->replay_count
+		   && cold_tt_source(typed, participant, owner, segment, has_header_work);
 }
 
 bool
@@ -216,15 +230,17 @@ cluster_cold_typed_tt_redo_inventory_v1(const ClusterColdTypedV1 *typed)
 	if (!cluster_cold_tt_after_redo_namespace_matches_v1(typed) || typed->replay_count == 0
 		|| typed->replay_count > typed->participant_count)
 		return false;
-	/* Even an empty physical inventory needs every current source's exact,
-	 * sealed ordinary cut. Never choose arbitrarily between current owners. */
-	for (uint32 p = 0; p < typed->replay_count; p++) {
+	/* An empty physical inventory still needs every selected source's sealed
+	 * ordinary cut, including retained generations without surviving TT files.
+	 * This validates their input/profile, not their checkpoint/effects proof. */
+	for (uint32 p = 0; p < typed->participant_count; p++) {
 		bool unused_header_work;
 
-		for (uint32 q = 0; q < p; q++)
-			if (typed->participants[p].thread_id == typed->participants[q].thread_id)
-				return false;
-		if (!cold_tt_redo_source(typed, p, 0, 0, &unused_header_work))
+		if (p < typed->replay_count)
+			for (uint32 q = 0; q < p; q++)
+				if (typed->participants[p].thread_id == typed->participants[q].thread_id)
+					return false;
+		if (!cold_tt_source(typed, p, 0, 0, &unused_header_work))
 			return false;
 		/* Pre-redo history is already in the base. Only actually replayed
 		 * operations require a present physical target in this inventory. */
