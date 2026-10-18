@@ -20,6 +20,7 @@
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "catalog/pg_control.h"
+#include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_block_apply.h"
 #include "cluster/cluster_cold_recovery.h"
@@ -704,6 +705,173 @@ UT_TEST(test_logical_message_rejects_nonproducer_carriers)
 			UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, !foreign));
 		}
 	}
+}
+
+static void
+smgr_record(EffectRecord *r, bool truncate, bool shared, ForkNumber fork)
+{
+	RelFileLocator locator = { .spcOid = shared ? GLOBALTABLESPACE_OID : DEFAULTTABLESPACE_OID,
+							   .dbOid = shared ? InvalidOid : 5,
+							   .relNumber = 42 };
+
+	record_init(r, RM_SMGR_ID,
+				(truncate ? XLOG_SMGR_TRUNCATE : XLOG_SMGR_CREATE) | XLR_SPECIAL_REL_UPDATE);
+	if (truncate) {
+		xl_smgr_truncate data = { .blkno = 0, .rlocator = locator, .flags = SMGR_TRUNCATE_ALL };
+
+		append(r, &data, sizeof(data));
+	} else {
+		xl_smgr_create data = { .rlocator = locator, .forkNum = fork };
+
+		append(r, &data, sizeof(data));
+	}
+}
+
+UT_TEST(test_smgr_native_carriers_keep_existing_effect_owners)
+{
+	for (int truncate = 0; truncate <= 1; truncate++) {
+		for (int foreign = 0; foreign <= 1; foreign++) {
+			for (int shared = 0; shared <= 1; shared++) {
+				for (ForkNumber fork = MAIN_FORKNUM; fork <= MAX_FORKNUM; fork++) {
+					for (int consistency = 0; consistency <= 1; consistency++) {
+						EffectRecord r;
+						ClusterColdDecodedV1 out = { 0 };
+
+						smgr_record(&r, truncate, shared, fork);
+						if (consistency)
+							r.decoded.header.xl_info |= XLR_CHECK_CONSISTENCY;
+						UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true,
+																	 foreign, &out),
+									 CLUSTER_COLD_OK);
+						UT_ASSERT(partitioned(&out.effects));
+						UT_ASSERT_EQ(out.effects.required, CLUSTER_COLD_EFFECT_RECORD);
+						UT_ASSERT_EQ(out.effects.native_apply,
+									 truncate ? 0 : CLUSTER_COLD_EFFECT_RECORD);
+						UT_ASSERT_EQ(out.effects.refused,
+									 truncate ? CLUSTER_COLD_EFFECT_RECORD : 0);
+						UT_ASSERT_EQ(out.record.record_flags,
+									 truncate
+										 ? CLUSTER_COLD_RECORD_STRUCTURAL
+											   | (foreign ? CLUSTER_COLD_RECORD_SIDE_UNOWNED : 0)
+										 : 0);
+					}
+				}
+			}
+		}
+	}
+}
+
+static void
+check_bad_smgr_carriers(bool truncate)
+{
+	for (int foreign = 0; foreign <= 1; foreign++) {
+		for (int fault = 0; fault < 14; fault++) {
+			EffectRecord r;
+			ClusterColdDecodedV1 out = { 0 };
+			xl_smgr_create create;
+			xl_smgr_truncate shrink;
+			RelFileLocator *locator;
+
+			smgr_record(&r, truncate, false, MAIN_FORKNUM);
+			if (truncate) {
+				memcpy(&shrink, r.data.bytes, sizeof(shrink));
+				locator = &shrink.rlocator;
+			} else {
+				memcpy(&create, r.data.bytes, sizeof(create));
+				locator = &create.rlocator;
+			}
+			switch (fault) {
+			case 0:
+				r.decoded.main_data_len = 0;
+				break;
+			case 1:
+				r.decoded.main_data_len--;
+				break;
+			case 2:
+				r.decoded.main_data_len++;
+				break;
+			case 3:
+				r.decoded.main_data = NULL;
+				break;
+			case 4:
+				r.decoded.header.xl_info &= ~XLR_SPECIAL_REL_UPDATE;
+				break;
+			case 5:
+				r.decoded.header.xl_info |= 0x08;
+				break;
+			case 6:
+				locator->spcOid = InvalidOid;
+				break;
+			case 7:
+				locator->relNumber = InvalidRelFileNumber;
+				break;
+			case 8:
+				locator->dbOid = InvalidOid;
+				break;
+			case 9:
+				locator->spcOid = GLOBALTABLESPACE_OID;
+				break;
+			case 10:
+				if (truncate)
+					shrink.flags = 0x08;
+				else
+					create.forkNum = MAX_FORKNUM + 1;
+				break;
+			case 11:
+				if (truncate)
+					shrink.blkno = InvalidBlockNumber;
+				else
+					create.forkNum = InvalidForkNumber;
+				break;
+			case 12:
+				if (truncate)
+					shrink.flags = 0;
+				else
+					r.decoded.main_data_len = UINT32_MAX;
+				break;
+			case 13:
+				r.decoded.header.xl_info |= 0x04;
+				break;
+			}
+			if (truncate)
+				memcpy(r.data.bytes, &shrink, sizeof(shrink));
+			else
+				memcpy(r.data.bytes, &create, sizeof(create));
+			UT_ASSERT(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, foreign, &out)
+					  != CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(out.effects.required, 0);
+			UT_ASSERT_EQ(out.effects.native_apply | out.effects.no_effect, 0);
+			UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, !foreign));
+		}
+		/* A complete payload still cannot own a hidden page effect. */
+		{
+			EffectRecord r;
+			ClusterColdDecodedV1 out = { 0 };
+			union {
+				DecodedXLogRecord decoded;
+				char bytes[sizeof(DecodedXLogRecord) + sizeof(DecodedBkpBlock)];
+			} blocked = { 0 };
+
+			smgr_record(&r, truncate, false, MAIN_FORKNUM);
+			memcpy(&blocked.decoded, &r.decoded, sizeof(r.decoded));
+			blocked.decoded.max_block_id = 0;
+			blocked.decoded.blocks[0].in_use = true;
+			r.reader.record = &blocked.decoded;
+			UT_ASSERT(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, foreign, &out)
+					  != CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(out.effects.required, 0);
+		}
+	}
+}
+
+UT_TEST(test_smgr_create_rejects_incomplete_or_nonproducer_carriers)
+{
+	check_bad_smgr_carriers(false);
+}
+
+UT_TEST(test_smgr_truncate_rejects_incomplete_or_nonproducer_carriers)
+{
+	check_bad_smgr_carriers(true);
 }
 
 UT_TEST(test_registry_unknown_and_blocks_still_refuse)
@@ -2002,7 +2170,10 @@ UT_TEST(test_original_startup_dependency_leaves_non_c0_with_existing_dispatch)
 int
 main(void)
 {
-	UT_PLAN(53);
+	UT_PLAN(56);
+	UT_RUN(test_smgr_native_carriers_keep_existing_effect_owners);
+	UT_RUN(test_smgr_create_rejects_incomplete_or_nonproducer_carriers);
+	UT_RUN(test_smgr_truncate_rejects_incomplete_or_nonproducer_carriers);
 	UT_RUN(test_original_startup_dependency_decodes_before_target_owner);
 	UT_RUN(test_original_startup_dependency_leaves_non_c0_with_existing_dispatch);
 	UT_RUN(test_foreign_c0_routes_whole_record_to_exact_side_consumer);

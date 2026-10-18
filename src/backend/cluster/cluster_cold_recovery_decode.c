@@ -45,6 +45,7 @@
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "catalog/pg_control.h"
+#include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_page_detached.h"
@@ -414,6 +415,43 @@ cold_xlog_control_shape(XLogReaderState *reader)
 	}
 }
 
+/* Native smgr_redo and the touched-file collector read these fixed structs
+ * directly. Check their complete carrier before either can see an effect,
+ * including our own source and records retained before its redo cut. */
+static bool
+cold_smgr_native_shape(XLogReaderState *reader)
+{
+	uint8 info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+	RelFileLocator locator;
+
+	if (XLogRecGetData(reader) == NULL || XLogRecHasAnyBlockRefs(reader)
+		|| (XLogRecGetInfo(reader) & ~XLR_CHECK_CONSISTENCY) != (info | XLR_SPECIAL_REL_UPDATE))
+		return false;
+	if (info == XLOG_SMGR_CREATE) {
+		xl_smgr_create create;
+
+		if (XLogRecGetDataLen(reader) != sizeof(create))
+			return false;
+		memcpy(&create, XLogRecGetData(reader), sizeof(create));
+		if (create.forkNum < MAIN_FORKNUM || create.forkNum > MAX_FORKNUM)
+			return false;
+		locator = create.rlocator;
+	} else if (info == XLOG_SMGR_TRUNCATE) {
+		xl_smgr_truncate truncate;
+
+		if (XLogRecGetDataLen(reader) != sizeof(truncate))
+			return false;
+		memcpy(&truncate, XLogRecGetData(reader), sizeof(truncate));
+		if (truncate.blkno == InvalidBlockNumber || truncate.flags == 0
+			|| (truncate.flags & ~SMGR_TRUNCATE_ALL) != 0)
+			return false;
+		locator = truncate.rlocator;
+	} else
+		return false;
+	return OidIsValid(locator.spcOid) && locator.relNumber != InvalidRelFileNumber
+		   && ((locator.spcOid == GLOBALTABLESPACE_OID) == (locator.dbOid == InvalidOid));
+}
+
 static ClusterColdDetailV1
 cold_record_flags(XLogReaderState *reader, uint64 system_identifier, const uint8 storage_uuid[16],
 				  bool foreign, ClusterColdDecodedV1 *out, uint8 *flags, uint32 *effects)
@@ -487,6 +525,8 @@ cold_record_flags(XLogReaderState *reader, uint64 system_identifier, const uint8
 			return cold_space_identity(reader, system_identifier, storage_uuid, out);
 		if (info == XLOG_SMGR_SPACE_RESERVATION)
 			return cold_space_reservation(reader, system_identifier, storage_uuid, out);
+		if (!cold_smgr_native_shape(reader))
+			return CLUSTER_COLD_COMPONENT_INVALID;
 		/* A truncation without a SPACE identity change has no cold owner. */
 		if (info == XLOG_SMGR_TRUNCATE)
 			*flags = CLUSTER_COLD_RECORD_STRUCTURAL;

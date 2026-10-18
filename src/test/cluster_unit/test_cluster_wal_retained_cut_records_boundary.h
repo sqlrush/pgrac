@@ -553,8 +553,10 @@ rec_abort(uint32 source, XLogRecPtr read, XLogRecPtr end, TransactionId xid,
 static RealRecord *
 rec_smgr(uint32 source, XLogRecPtr read, XLogRecPtr end, bool truncate, RelFileNumber relnumber)
 {
-	RealRecord *r = record_new(source, RM_SMGR_ID, truncate ? XLOG_SMGR_TRUNCATE : XLOG_SMGR_CREATE,
-							   InvalidTransactionId, read, end);
+	RealRecord *r
+		= record_new(source, RM_SMGR_ID,
+					 (truncate ? XLOG_SMGR_TRUNCATE : XLOG_SMGR_CREATE) | XLR_SPECIAL_REL_UPDATE,
+					 InvalidTransactionId, read, end);
 
 	if (truncate) {
 		xl_smgr_truncate xlrec = { 0 };

@@ -408,6 +408,26 @@ UT_TEST(test_transaction_lifecycle_classification)
 	}
 }
 
+static void
+native_smgr_record(FakeRecord *record, bool truncate)
+{
+	RelFileLocator locator = { .spcOid = DEFAULTTABLESPACE_OID, .dbOid = 5, .relNumber = 100 };
+
+	fake_record(record, RM_SMGR_ID,
+				(truncate ? XLOG_SMGR_TRUNCATE : XLOG_SMGR_CREATE) | XLR_SPECIAL_REL_UPDATE, 0);
+	if (truncate) {
+		xl_smgr_truncate data = { .blkno = 2, .rlocator = locator, .flags = SMGR_TRUNCATE_ALL };
+
+		memcpy(record->data, &data, sizeof(data));
+		record->storage.decoded.main_data_len = sizeof(data);
+	} else {
+		xl_smgr_create data = { .rlocator = locator, .forkNum = MAIN_FORKNUM };
+
+		memcpy(record->data, &data, sizeof(data));
+		record->storage.decoded.main_data_len = sizeof(data);
+	}
+}
+
 UT_TEST(test_storage_lifecycle_classification)
 {
 	FakeRecord record;
@@ -430,7 +450,9 @@ UT_TEST(test_storage_lifecycle_classification)
 	Size i;
 
 	for (i = 0; i < lengthof(cases); i++) {
-		if (cases[i].rmid == RM_STANDBY_ID)
+		if (cases[i].rmid == RM_SMGR_ID)
+			native_smgr_record(&record, cases[i].info == XLOG_SMGR_TRUNCATE);
+		else if (cases[i].rmid == RM_STANDBY_ID)
 			standby_record(&record, cases[i].info, true);
 		else
 			fake_record(&record, cases[i].rmid, cases[i].info, 0);
@@ -523,7 +545,7 @@ UT_TEST(test_foreign_side_records_have_no_cold_owner)
 	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
 
 	/* Creating a relation file is idempotent: its native redo is the owner. */
-	fake_record(&record, RM_SMGR_ID, XLOG_SMGR_CREATE, 0);
+	native_smgr_record(&record, false);
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
 				 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.record.record_flags, 0);

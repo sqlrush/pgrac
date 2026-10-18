@@ -762,16 +762,39 @@ UT_TEST(test_records_native_smgr_create_and_truncate)
 {
 	for (int variant = 0; variant < 2; variant++) {
 		uint32 self, peer;
+		RealRecord *r;
 
 		rec_two_writers(&self, &peer);
-		rec_smgr(self, 0x1400, 0x1440, false, 16500);
+		r = rec_smgr(self, 0x1400, 0x1440, false, 16500);
 		if (variant == 1)
-			rec_smgr(self, 0x2400, 0x2440, true, 16500);
+			r = rec_smgr(self, 0x2400, 0x2440, true, 16500);
 		expect_cut(
 			self, variant == 0 ? REC_SELF_REDO : 0x2400,
 			variant == 0 ? CLUSTER_WAL_RETAINED_PIN_NONE : CLUSTER_WAL_RETAINED_PIN_STRUCTURE, 0);
 		if (ut_current_failed)
 			printf("# smgr variant %d\n", variant);
+		for (int foreign = 0; foreign < 2; foreign++) {
+			ClusterColdDecodedV1 decoded = { 0 };
+			uint32 length = r->u.decoded.main_data_len;
+
+			UT_ASSERT_EQ(rec_counter_decode(r, foreign, &decoded), CLUSTER_COLD_OK);
+			for (int history = 0; history < 2; history++)
+				UT_ASSERT_EQ(rec_cold_tt_feed(&decoded, 1, history),
+							 variant && !history ? CLUSTER_COLD_STRUCTURAL_UNSUPPORTED
+												 : CLUSTER_COLD_OK);
+			cluster_cold_decoded_release_v1(&decoded);
+			/* Retaining a native record before redo cannot excuse bad bytes. */
+			for (uint32 size = 0; size <= length + 1; size++) {
+				if (size == length)
+					continue;
+				r->u.decoded.main_data_len = size;
+				UT_ASSERT_EQ(rec_counter_decode(r, foreign, &decoded),
+							 CLUSTER_COLD_COMPONENT_INVALID);
+				UT_ASSERT_EQ(decoded.effects.required, 0);
+				cluster_cold_decoded_release_v1(&decoded);
+			}
+			r->u.decoded.main_data_len = length;
+		}
 	}
 }
 
