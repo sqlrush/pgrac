@@ -99,6 +99,8 @@ typedef struct SpaceColdAbortDelete {
 	uint32 count;
 	SpaceColdAbortTarget *targets;
 	RelFileLocator *locators;
+	ClusterSpaceColdAbortFinishV1 finish;
+	void *finish_arg;
 } SpaceColdAbortDelete;
 
 static bool space_cold_abort_delete(ClusterSpaceRecoveryBatchV1 *batch,
@@ -1198,19 +1200,31 @@ space_cold_abort_delete(ClusterSpaceRecoveryBatchV1 *batch, const SpaceColdAbort
 			|| !space_sources_fresh(batch))
 			return false;
 	/* An earlier target must still satisfy the result after the last sync.
+	 * Keep this original batch alive through a synchronous continuation;
+	 * neither a callback nor its return value is a persisted deletion proof.
 	 * Missing incarnation proof on a later retry remains BLOCKED. */
-	return space_cold_abort_group(batch, work, budget, true);
+	return space_cold_abort_group(batch, work, budget, true)
+		   && (work->finish == NULL
+			   || (work->finish(work->finish_arg, work->side, work->index)
+				   && space_cold_abort_group(batch, work, budget, true)));
 }
 
-bool
-cluster_space_recovery_cold_abort_delete_v1(const RfSideOnlinePlanV1 *side, uint32 index)
+static bool
+space_cold_abort_execute(const RfSideOnlinePlanV1 *side, uint32 index, Size finish_bytes, void *arg,
+						 ClusterSpaceColdAbortFinishV1 finish)
 {
 	RfSideOnlineOperationV1 abort;
-	SpaceColdAbortDelete work = { .side = side, .index = index };
+	SpaceColdAbortDelete work
+		= { .side = side, .index = index, .finish = finish, .finish_arg = arg };
 	Size bytes, native_bytes, budget = rf_side_online_plan_scratch_available_v1(side);
 	uint32 creation, count;
 	bool ok = false;
 
+	/* The continuation runs while the original proof storage is retained.
+	 * Reserve its peak scratch now, never discover that shortage after unlink. */
+	if (finish_bytes > budget)
+		return false;
+	budget -= finish_bytes;
 	if (!space_cold_phase() || !rf_side_online_plan_abort_creation_v1(side, index, 0, &creation)
 		|| !rf_side_online_plan_operation_v1(side, index, &abort)
 		|| (count = abort.xact.relation_count) == 0
@@ -1254,6 +1268,20 @@ cluster_space_recovery_cold_abort_delete_v1(const RfSideOnlinePlanV1 *side, uint
 	}
 	PG_END_TRY();
 	return ok;
+}
+
+bool
+cluster_space_recovery_cold_abort_delete_v1(const RfSideOnlinePlanV1 *side, uint32 index)
+{
+	return space_cold_abort_execute(side, index, 0, NULL, NULL);
+}
+
+bool
+cluster_space_recovery_cold_abort_finish_v1(const RfSideOnlinePlanV1 *side, uint32 index,
+											Size finish_bytes, void *arg,
+											ClusterSpaceColdAbortFinishV1 finish)
+{
+	return finish != NULL && space_cold_abort_execute(side, index, finish_bytes, arg, finish);
 }
 
 bool

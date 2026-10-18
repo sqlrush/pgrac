@@ -99,6 +99,8 @@ static uint16 source_sync_fault_thread;
 static int source_sync_fault;
 static unsigned abort_deletes, abort_directory_syncs;
 static int abort_delete_fault, abort_directory_fault;
+static unsigned abort_finishes;
+static int abort_finish_fault;
 static bool abort_second_target;
 static Size abort_plan_budget;
 static SMgrRelationData missing_relation;
@@ -967,6 +969,8 @@ reset(void)
 	source_sync_fault = 0;
 	abort_deletes = abort_directory_syncs = 0;
 	abort_delete_fault = abort_directory_fault = 0;
+	abort_finishes = 0;
+	abort_finish_fault = 0;
 	abort_second_target = false;
 	abort_plan_budget = 0;
 	fail_create_source_sync = wrong_create_source_sync = false;
@@ -3167,6 +3171,131 @@ abort_create_installed(bool advance)
 	return abort_create_installed_targets(advance, false);
 }
 
+typedef struct AbortFinishExpected {
+	const RfSideOnlinePlanV1 *side;
+	uint32 index;
+} AbortFinishExpected;
+
+static bool
+abort_finish(void *arg, const RfSideOnlinePlanV1 *plan, uint32 index)
+{
+	AbortFinishExpected *expected = arg;
+
+	UT_ASSERT(expected != NULL && plan == expected->side && index == expected->index);
+	UT_ASSERT(cold_protected() && CurrentResourceOwner == source_owner);
+	UT_ASSERT(!pins && !locks && !hw_held);
+	UT_ASSERT_EQ(abort_deletes, 1);
+	UT_ASSERT_EQ(abort_directory_syncs, 1);
+	UT_ASSERT_EQ(source_sync_mask, 1);
+	UT_ASSERT(main_exists && !exists && smgrnblocks(&relation, MAIN_FORKNUM) == 0);
+	abort_finishes++;
+	if (abort_finish_fault == 2)
+		stale = true;
+	if (abort_finish_fault == 3)
+		exists = true;
+	if (abort_finish_fault == 4)
+		pg_re_throw();
+	return abort_finish_fault != 1;
+}
+
+UT_TEST(test_cold_abort_finish_holds_original_owner_after_durable_native_result)
+{
+	for (int advance = 0; advance < 2; advance++) {
+		uint32 index = abort_create_installed(advance);
+		AbortFinishExpected expected = { side, index };
+
+		UT_ASSERT(cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected,
+															  abort_finish));
+		UT_ASSERT_EQ(abort_finishes, 1);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+		/* The synchronous continuation is not a retained deletion receipt. */
+		UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected,
+															   abort_finish));
+		UT_ASSERT_EQ(abort_finishes, 1);
+		UT_ASSERT_EQ(abort_deletes, 1);
+	}
+}
+
+UT_TEST(test_cold_abort_finish_reserves_scratch_and_requires_callback_before_mutation)
+{
+	for (int problem = 0; problem < 3; problem++) {
+		uint32 index = abort_create_installed_targets(false, problem == 2);
+		AbortFinishExpected expected = { side, index };
+		unsigned before = create_source_syncs;
+		Size bytes = problem == 1 ? rf_side_online_plan_scratch_available_v1(side) : 2048;
+
+		UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, bytes, &expected,
+															   problem == 0 ? NULL : abort_finish));
+		UT_ASSERT_EQ(create_source_syncs, before);
+		UT_ASSERT_EQ(abort_deletes + abort_directory_syncs + abort_finishes, 0);
+		UT_ASSERT(exists && main_exists);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_finish_never_runs_before_complete_source_and_physical_result)
+{
+	for (int problem = 0; problem < 4; problem++) {
+		uint32 index = abort_create_installed(false);
+		AbortFinishExpected expected = { side, index };
+
+		UT_ASSERT_EQ(ftruncate(fileno(main_file), 3 * BLCKSZ), 0);
+		if (problem == 0) {
+			source_sync_fault_thread = duties[0].origin_thread_id;
+			source_sync_fault = 1;
+		} else if (problem == 1)
+			abort_delete_fault = 2;
+		else
+			abort_directory_fault = problem == 2 ? 1 : 4;
+		UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected,
+															   abort_finish));
+		UT_ASSERT_EQ(abort_finishes, 0);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_finish_refusal_or_late_drift_cannot_complete)
+{
+	for (int problem = 1; problem <= 3; problem++) {
+		uint32 index = abort_create_installed(false);
+		AbortFinishExpected expected = { side, index };
+
+		abort_finish_fault = problem;
+		UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected,
+															   abort_finish));
+		UT_ASSERT_EQ(abort_finishes, 1);
+		UT_ASSERT_EQ(abort_deletes, 1);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_finish_error_unwinds_owner_without_absence_retry)
+{
+	uint32 index = abort_create_installed(false);
+	AbortFinishExpected expected = { side, index };
+	volatile bool caught = false;
+
+	abort_finish_fault = 4;
+	PG_TRY();
+	{
+		(void)cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected,
+														  abort_finish);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(abort_finishes, 1);
+	UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	abort_finish_fault = 0;
+	UT_ASSERT(
+		!cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected, abort_finish));
+	UT_ASSERT_EQ(abort_deletes, 1);
+	UT_ASSERT_EQ(abort_finishes, 1);
+}
+
 UT_TEST(test_cold_abort_delete_syncs_original_source_and_distinct_native_result)
 {
 	for (int advance = 0; advance < 2; advance++) {
@@ -3459,7 +3588,12 @@ UT_TEST(test_cold_abort_preflight_io_error_unwinds_original_owner_for_retry)
 int
 main(void)
 {
-	UT_PLAN(71);
+	UT_PLAN(76);
+	UT_RUN(test_cold_abort_finish_holds_original_owner_after_durable_native_result);
+	UT_RUN(test_cold_abort_finish_reserves_scratch_and_requires_callback_before_mutation);
+	UT_RUN(test_cold_abort_finish_never_runs_before_complete_source_and_physical_result);
+	UT_RUN(test_cold_abort_finish_refusal_or_late_drift_cannot_complete);
+	UT_RUN(test_cold_abort_finish_error_unwinds_owner_without_absence_retry);
 	UT_RUN(test_cold_abort_delete_syncs_original_source_and_distinct_native_result);
 	UT_RUN(test_cold_abort_delete_preflights_entire_group_before_source_sync);
 	UT_RUN(test_cold_abort_delete_refuses_unknown_owner_main_or_backend_before_sync);

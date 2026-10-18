@@ -55,6 +55,18 @@ extern bool cluster_space_recovery_cold_abort_preflight_v1(const RfSideOnlinePla
 extern bool cluster_space_recovery_cold_abort_delete_v1(const RfSideOnlinePlanV1 *side,
 														uint32 index);
 
+/* Run a synchronous continuation only after that entire deletion is durable,
+ * retaining the original all-source owner until it returns and the result is
+ * rechecked. Reserve finish_bytes of additional simultaneous plan scratch
+ * before mutation; the callback must stay within it and prove its own TT/CLOG
+ * and terminal obligations. No receipt survives this call or permits retry
+ * without the original physical SPACE proof. NULL finish is refused. */
+typedef bool (*ClusterSpaceColdAbortFinishV1)(void *arg, const RfSideOnlinePlanV1 *side,
+											  uint32 index);
+extern bool cluster_space_recovery_cold_abort_finish_v1(const RfSideOnlinePlanV1 *side,
+														uint32 index, Size finish_bytes, void *arg,
+														ClusterSpaceColdAbortFinishV1 finish);
+
 extern bool cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *plan,
 												const ClusterThreadRecoveryAuthorityV1 *sources,
 												uint32 count, ClusterSpaceRecoveryBatchV1 **out);
