@@ -181,6 +181,7 @@ static int test_mx_remote_calls;
 static bool test_mx_remote_failed;
 static bool test_mx_remote_revokes_grant;
 static bool test_mx_remote_epoch_drift;
+static bool test_mx_remote_identity_mismatch;
 static int test_undo_pending_prepare_calls;
 static int test_undo_pending_cancel_calls;
 static ClusterCtrcTxnKeyV1 test_undo_pending_key;
@@ -501,6 +502,8 @@ cluster_gcs_current_mx_member_proof_fetch_and_wait(
 	proof->member_status = decoded.trailer.body.asks[0].member_status;
 	proof->state = CCM_COMMITTED;
 	proof->commit_scn = scn_encode(1, 50);
+	if (test_mx_remote_identity_mismatch)
+		proof->member_xid = TEST_ORIGIN_XID;
 	*proof_count = 1;
 	if (test_mx_remote_revokes_grant)
 		test_ctrc_grant_revoked = true;
@@ -1285,6 +1288,7 @@ reset_exact_origin_fixture(void)
 	test_mx_remote_failed = false;
 	test_mx_remote_revokes_grant = false;
 	test_mx_remote_epoch_drift = false;
+	test_mx_remote_identity_mismatch = false;
 	test_undo_pending_prepare_calls = 0;
 	test_undo_pending_cancel_calls = 0;
 	memset(&test_undo_pending_key, 0, sizeof(test_undo_pending_key));
@@ -2365,6 +2369,28 @@ UT_TEST(test_retained_active_mx_batch_rechecks_remote_epoch)
 	UT_ASSERT_EQ(test_mx_remote_calls, 1);
 	assert_mx_batch_unknown(proofs, 2, &updater, capabilities);
 	UT_ASSERT_EQ(test_formation_epoch, 43);
+	UT_ASSERT_EQ(test_ctrc_touch_calls, 1);
+	UT_ASSERT_EQ(test_durable_locator_calls, 1);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, test_candidate_release_calls);
+}
+
+UT_TEST(test_retained_active_mx_batch_rejects_remote_identity_mismatch)
+{
+	ClusterCurrentMemberProof proofs[2];
+	ClusterCurrentUpdaterProof updater;
+	uint32 capabilities[2];
+	TimestampTz deadline = 0;
+
+	/* A remote committed proof remains provisional until its member identity
+	 * matches the descriptor that the requester sent for that ordinal. */
+	reset_rolled_active_fixture();
+	test_mx_remote_identity_mismatch = true;
+	UT_ASSERT_EQ(
+		resolve_rolled_mx_batch(false, true, proofs, &updater, capabilities, &deadline),
+		CMX_RESOLVE_UNKNOWN);
+	UT_ASSERT_EQ(test_mx_remote_calls, 1);
+	assert_mx_batch_unknown(proofs, 2, &updater, capabilities);
+	UT_ASSERT_EQ(test_formation_epoch, 42);
 	UT_ASSERT_EQ(test_ctrc_touch_calls, 1);
 	UT_ASSERT_EQ(test_durable_locator_calls, 1);
 	UT_ASSERT_EQ(test_candidate_acquire_calls, test_candidate_release_calls);
@@ -5987,13 +6013,14 @@ UT_TEST(test_self_fresh_role_does_not_inherit_ordinary_abort_permission)
 int
 main(void)
 {
-	UT_PLAN(169);
+	UT_PLAN(170);
 	UT_RUN(test_retained_active_identity_reaches_real_undo_pending);
 	UT_RUN(test_retained_undo_pending_requires_matching_active_tt_receipt);
 	UT_RUN(test_retained_undo_pending_guard_drift_cannot_publish);
 	UT_RUN(test_retained_active_identity_reaches_real_mx_batch);
 	UT_RUN(test_retained_active_mx_batch_scrubs_earlier_local_proof);
 	UT_RUN(test_retained_active_mx_batch_rechecks_remote_epoch);
+	UT_RUN(test_retained_active_mx_batch_rejects_remote_identity_mismatch);
 	UT_RUN(test_retained_mx_precommit_retries_preserve_batch_deadline);
 	UT_RUN(test_local_updater_rolled_active_preserves_original_identity);
 	UT_RUN(test_local_updater_rolled_active_accepts_duplicate_ctrc_touch);
