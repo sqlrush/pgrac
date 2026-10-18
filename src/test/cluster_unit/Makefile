@@ -531,6 +531,14 @@ TESTS += test_cluster_relmap_v2
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_v2_storage
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2_storage,$(SIMPLE_TESTS))
+TESTS += test_cluster_relmap_retention
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_retention,$(SIMPLE_TESTS))
+
+test_cluster_relmap_retention: test_cluster_relmap_retention.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o $(top_builddir)/src/port/libpgport.a -o $@
 
 # Compile the real storage module with pass-through syscall fault boundaries.
 test_cluster_relmap_v2_storage_product.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_authority.c \
