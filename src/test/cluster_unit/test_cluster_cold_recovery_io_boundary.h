@@ -28,6 +28,12 @@
 #define TEST_CLUSTER_COLD_RECOVERY_IO_BOUNDARY_H
 
 #include "cluster/cluster_side_online_plan.h"
+#include "access/clog.h"
+#include "access/commit_ts.h"
+#include "access/multixact.h"
+#include "access/subtrans.h"
+#include "cluster/storage/cluster_undo_buf.h"
+#include "postmaster/bgwriter.h"
 
 /* ---- process and memory boundaries ---- */
 volatile sig_atomic_t InterruptPending = false;
@@ -519,6 +525,55 @@ cluster_recovery_merge_fence_plan_origin(const ClusterRecoveryFencePlan *plan, u
 #define MAX_BARRIER_EVENTS 32
 static char barrier_events[MAX_BARRIER_EVENTS][32];
 static int barrier_event_count;
+static char native_barrier_events[32];
+static unsigned native_barrier_count;
+static int native_sync_relation_events;
+static bool native_sync_ok = true;
+
+static void
+native_barrier_event(char event)
+{
+	if (native_barrier_count + 1 >= sizeof(native_barrier_events))
+		abort();
+	native_barrier_events[native_barrier_count++] = event;
+	native_barrier_events[native_barrier_count] = '\0';
+}
+
+void
+CheckPointCLOG(void)
+{
+	native_barrier_event('c');
+}
+void
+CheckPointCommitTs(void)
+{
+	native_barrier_event('t');
+}
+void
+CheckPointSUBTRANS(void)
+{
+	native_barrier_event('p');
+}
+void
+CheckPointMultiXact(void)
+{
+	native_barrier_event('m');
+}
+
+void
+cluster_undo_buf_flush_all(bool checkpoint)
+{
+	UT_ASSERT(checkpoint);
+	native_barrier_event('u');
+}
+
+bool
+RequestStartupSync(void)
+{
+	native_barrier_event('s');
+	native_sync_relation_events = barrier_event_count;
+	return native_sync_ok;
+}
 
 static void
 barrier_event(char kind, const RelFileLocator *locator, int fork)

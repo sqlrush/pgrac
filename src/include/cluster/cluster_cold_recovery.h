@@ -745,7 +745,11 @@ extern void cluster_cold_touched_add_v1(ClusterColdTouchedV1 *touched,
 										const RelFileLocator *locator, ForkNumber fork);
 extern void cluster_cold_touched_add_record_v1(ClusterColdTouchedV1 *touched,
 											   struct XLogReaderState *record);
-extern void cluster_cold_durable_barrier_v1(const ClusterColdTouchedV1 *touched);
+/* Startup-only: also write the founder's native SLRU/undo caches, then use
+ * the original checkpointer sync handshake. An empty relation set does not
+ * prove those caches clean. False leaves counter/completion publication
+ * blocked; errors from the original write/sync owners propagate. */
+extern bool cluster_cold_durable_barrier_v1(const ClusterColdTouchedV1 *touched);
 
 /*
  * Typed cold replay driver state (startup process).  prepare() runs pass 1

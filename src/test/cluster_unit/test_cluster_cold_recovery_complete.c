@@ -403,8 +403,8 @@ UT_TEST(test_barrier_writes_then_syncs)
 	forks[3].exists = true; /* 200 SPACE, untouched: not synced */
 	barrier_event_count = 0;
 	memset(&touched, 0, sizeof(touched));
-	cluster_cold_durable_barrier_v1(&touched);
-	cluster_cold_durable_barrier_v1(NULL);
+	UT_ASSERT(cluster_cold_durable_barrier_v1(&touched));
+	UT_ASSERT(cluster_cold_durable_barrier_v1(NULL));
 	UT_ASSERT_EQ(barrier_event_count, 0);
 
 	l = locator(100);
@@ -415,7 +415,8 @@ UT_TEST(test_barrier_writes_then_syncs)
 	l = locator(200);
 	cluster_cold_touched_add_v1(&touched, &l, MAIN_FORKNUM);
 	cluster_cold_touched_add_v1(&touched, &l, FSM_FORKNUM); /* never created */
-	cluster_cold_durable_barrier_v1(&touched);
+	native_barrier_count = 0;
+	UT_ASSERT(cluster_cold_durable_barrier_v1(&touched));
 	UT_ASSERT_EQ(barrier_event_count, 6);
 	UT_ASSERT(strcmp(barrier_events[0], "w100/-1") == 0);
 	UT_ASSERT(strcmp(barrier_events[1], "w200/-1") == 0);
@@ -428,18 +429,51 @@ UT_TEST(test_barrier_writes_then_syncs)
 		UT_ASSERT(strcmp(barrier_events[4], space) == 0);
 	}
 	UT_ASSERT(strcmp(barrier_events[5], "s200/0") == 0);
+	UT_ASSERT(strcmp(native_barrier_events, "ctpmus") == 0);
+	UT_ASSERT_EQ(native_sync_relation_events, 6);
 	pfree(touched.rels);
+}
+
+UT_TEST(test_barrier_flushes_native_without_relation_files)
+{
+	ClusterColdTouchedV1 touched = { 0 };
+
+	for (int null_input = 0; null_input <= 1; null_input++) {
+		barrier_event_count = 0;
+		native_barrier_count = 0;
+		native_barrier_events[0] = '\0';
+		native_sync_relation_events = -1;
+		UT_ASSERT(cluster_cold_durable_barrier_v1(null_input ? NULL : &touched));
+		UT_ASSERT(strcmp(native_barrier_events, "ctpmus") == 0);
+		UT_ASSERT_EQ(native_sync_relation_events, 0);
+		UT_ASSERT_EQ(barrier_event_count, 0);
+	}
+}
+
+UT_TEST(test_barrier_refuses_unconfirmed_native_sync)
+{
+	ClusterColdTouchedV1 touched = { 0 };
+	bool result;
+
+	native_barrier_count = 0;
+	native_sync_ok = false;
+	result = cluster_cold_durable_barrier_v1(&touched);
+	native_sync_ok = true;
+	UT_ASSERT(!result);
+	UT_ASSERT(strcmp(native_barrier_events, "ctpmus") == 0);
 }
 
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(7);
 	UT_RUN(test_completion_proof);
 	UT_RUN(test_completion_ready);
 	UT_RUN(test_touched_set);
 	UT_RUN(test_touched_by_record);
 	UT_RUN(test_barrier_writes_then_syncs);
+	UT_RUN(test_barrier_flushes_native_without_relation_files);
+	UT_RUN(test_barrier_refuses_unconfirmed_native_sync);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
