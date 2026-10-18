@@ -3485,6 +3485,50 @@ cl_normal_stop_checkpoint_state_locked(uint32 expected_services, uint32 phase, u
 	return cluster_normal_stop_failure() == CLUSTER_NORMAL_STOP_FAILURE_NONE;
 }
 
+/* Diagnostic-only coherent buffer observation before any frontend cut is
+ * consumed. It grants no cut, creates no work/reference and never changes
+ * the caller's verdict. The original DRAIN census must still run later. */
+static void
+cl_normal_stop_trace_pre_front_buffer(void)
+{
+	static TimestampTz last_trace;
+	ClusterBufferStopObservation observed;
+	BufferTag tag = { 0 };
+	const char *reason;
+	ClusterNormalStopPollResult result;
+	TimestampTz now;
+	uint32 mask;
+	int buffer = -1;
+
+	if (!cluster_trace_cleanup || CritSectionCount != 0 || !AmCheckpointerProcess())
+		return;
+	now = GetCurrentTimestamp();
+	if (last_trace != 0 && now >= last_trace && now - last_trace < INT64CONST(1000000))
+		return;
+	last_trace = now;
+	result = cluster_bufmgr_normal_stop_observed(false, false, &tag, &buffer,
+		&reason, &observed);
+	mask = (BUF_STATE_GET_REFCOUNT(observed.state) != 0 ? 1u : 0u)
+		| ((observed.state & BM_IO_IN_PROGRESS) != 0 ? 2u : 0u)
+		| ((observed.state & BM_PIN_COUNT_WAITER) != 0 ? 4u : 0u)
+		| (observed.own.flags != 0 ? 8u : 0u)
+		| (observed.own.writer_activation_token != 0 ? 16u : 0u)
+		| (observed.own.resource_x_activation_generation != 0 ? 32u : 0u)
+		| (observed.delivery != 0 ? 64u : 0u)
+		| (observed.own.pcm_state == PCM_STATE_READ_IMAGE ? 128u : 0u);
+	elog(LOG, "normal-stop passive pre-frontend buffer result=%d reason=%s "
+		"mask=%u tag=%u/%u/%u/%u/%u buffer=%d state=%08x refs=%u waitproc=%d "
+		"pcm=%u type=%u gen=" UINT64_FORMAT " flags=%x token=" UINT64_FORMAT
+		" activation=" UINT64_FORMAT " r4=" UINT64_FORMAT " delivery=" UINT64_FORMAT,
+		(int) result, reason, mask, tag.spcOid, tag.dbOid, tag.relNumber,
+		(unsigned) tag.forkNum, tag.blockNum, buffer, observed.state,
+		BUF_STATE_GET_REFCOUNT(observed.state), observed.wait_backend_pgprocno,
+		observed.own.pcm_state, observed.own.buffer_type, observed.own.generation,
+		observed.own.flags, observed.own.reservation_token,
+		observed.own.writer_activation_token, observed.own.resource_x_activation_generation,
+		observed.delivery);
+}
+
 static ClusterNormalStopPollResult
 cl_normal_stop_checkpoint_poll(uint32 expected_services, ClusterPhase1FullStopPlan *plan_out,
 							   ClusterNormalStopModuleObservation *observation,
@@ -3519,6 +3563,7 @@ cl_normal_stop_checkpoint_poll(uint32 expected_services, ClusterPhase1FullStopPl
 	phase = pg_atomic_read_u32(&cl_normal_stop->phase);
 	if (phase <= CLUSTER_NORMAL_STOP_DRAIN
 		&& (!cluster_shared_config || !progress->identity_ready)) {
+		cl_normal_stop_trace_pre_front_buffer();
 		result = cluster_normal_stop_fronts_poll(&observed, &observation->reason);
 		if (result != CLUSTER_NORMAL_STOP_READY)
 			return result;

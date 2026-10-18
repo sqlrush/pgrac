@@ -43,6 +43,9 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+bool cluster_trace_cleanup;
+volatile uint32 CritSectionCount;
+
 
 static ClusterCleanLeaveSharedState test_region;
 static bool test_found;
@@ -6379,6 +6382,32 @@ UT_TEST(test_original_continuation_gate_ends_at_seal_or_original_deadline)
  UT_ASSERT(cluster_normal_stop_continuation_allowed());
 }
 
+UT_TEST(test_pre_front_buffer_observation_never_advances_cut)
+{
+	uint32 phase;
+
+	reset_identity();
+	front_local_postmaster_cut(false);
+	phase = pg_atomic_read_u32(&cl_normal_stop->phase);
+	MyAuxProcType = CheckpointerProcess;
+	cluster_trace_cleanup = false;
+	cl_normal_stop_trace_pre_front_buffer();
+	UT_ASSERT_EQ(module_calls[9], 0);
+	cluster_trace_cleanup = true;
+	cl_normal_stop_trace_pre_front_buffer();
+	UT_ASSERT_EQ(module_calls[9], 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), phase);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->frontends_gone), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_idle_mask), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_seal), 0);
+	CritSectionCount = 1;
+	fixture_now += 2000000;
+	cl_normal_stop_trace_pre_front_buffer();
+	UT_ASSERT_EQ(module_calls[9], 1);
+	CritSectionCount = 0;
+	cluster_trace_cleanup = false;
+}
+
 int
 main(void)
 {
@@ -6388,7 +6417,8 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(161);
+	UT_PLAN(162);
+	UT_RUN(test_pre_front_buffer_observation_never_advances_cut);
 	UT_RUN(test_original_continuation_gate_ends_at_seal_or_original_deadline);
 	UT_RUN(test_actual_prepare_never_starts_native_work_after_producer_seal);
 	UT_RUN(test_actual_prepare_does_not_start_owner_work_after_original_deadline);

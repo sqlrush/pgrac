@@ -4822,6 +4822,7 @@ clean distclean maintainer-clean:
 		test_cluster_heap_vm_delete.inc test_cluster_heap_vm_pretoast.inc \
 		test_cluster_pcm_snapshot_owner.inc \
 		test_cluster_pcm_transition_owner.inc \
+		test_cluster_pcm_abort_read_image.inc \
 		test_cluster_pcm_gcs_drop.inc test_cluster_pcm_downgrade.inc test_cluster_pcm_eviction_gate.inc \
 		test_cluster_pcm_flush_owner.inc \
 		test_cluster_pcm_barrier_proof.inc \
@@ -5516,6 +5517,13 @@ test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/
 	     END { if (ordinary_snapshot != 1 || n_candidate != 1 || bump_failure != 1 || bump != 1 || evict != 1 || shape != 1 || wal_copy != 1 || known_new != 1 || ordinary_lookup != 1 || direct_lookup != 1 || sidecar != 1 || activate != 1 || clear != 1 || copy != 1 || held_valid != 1 || held_validate != 1 || held_adopt != 1 || held_finish != 1 || held_abandon != 1 || drop != 1 || finish != 1 || delivery_begin != 1 || delivery_snapshot != 1 || delivery_release != 1 || normal_reserve != 1 || delivery_reserve != 1 || read_publish != 1 || read_clear != 1 || read_release != 1 || grant_abort != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_pcm_abort_read_image.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_bufmgr_pcm_read_image_last_pin\(/ { print "static void"; emit=1; retire++ } \
+	     /^UnpinBuffer\(/ { print "static void"; emit=1; unpin++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (unpin != 1 || retire != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_pcm_source_finish_consumer.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^gcs_block_resource_x_source_finish_owned\(/ { print "static ResourceXApplyResult"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } \
@@ -5687,6 +5695,7 @@ test_cluster_pcm_page_identity.inc: $(top_srcdir)/src/backend/cluster/cluster_pa
 test_cluster_pcm_own: test_cluster_pcm_own.c unit_test.h \
 		test_cluster_pcm_page_identity.inc \
 		test_cluster_pcm_snapshot_owner.inc test_cluster_pcm_transition_owner.inc \
+		test_cluster_pcm_abort_read_image.inc \
 		test_cluster_pcm_flush_owner.inc \
 		test_cluster_pcm_gcs_drop.inc test_cluster_pcm_downgrade.inc test_cluster_pcm_eviction_gate.inc \
 		test_cluster_pcm_barrier_proof.inc \

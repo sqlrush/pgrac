@@ -1168,12 +1168,17 @@ cluster_bufmgr_resource_x_writer_report_failure(ResourceXApplyResult result pg_a
 #define GetBufferDescriptor(id) ((void)(id), &capacity_buffer)
 /* Logging only is a fixture boundary here. The actual default-off helper
  * and critical-section exclusion execute in test_cluster_bufmgr_stop. */
+static bool route_cleanup_trace_raise;
 static void
 cluster_bufmgr_trace_cleanup(BufferDesc *buf, const char *stage, uint64 attempt)
 {
 	(void) buf;
 	(void) stage;
 	(void) attempt;
+	if (route_cleanup_trace_raise) {
+		route_cleanup_trace_raise = false;
+		siglongjmp(*PG_exception_stack, 1);
+	}
 }
 #include "test_cluster_gcs_read_rearm_owner.inc"
 #undef GetBufferDescriptor
@@ -4826,7 +4831,7 @@ UT_TEST(test_shared_acquire_error_retires_only_its_quiescent_n_reservation)
 	cluster_gcs_block_retransmit_max_retries = 0;
 	cluster_gcs_reply_timeout_ms = 1;
 	NBuffers = 1;
-	for (mode = 0; mode < 15; mode++) {
+	for (mode = 0; mode < 16; mode++) {
 		ClusterPcmOwnEntry entry, before;
 		ClusterPcmOwnSnapshot base;
 		ClusterPcmGrantBeginWaitReason wait_reason;
@@ -4844,6 +4849,7 @@ UT_TEST(test_shared_acquire_error_retires_only_its_quiescent_n_reservation)
 		requester_send.suppress_reply = true;
 		cluster_gcs_reply_timeout_ms = mode == 14 ? 10 : 1;
 		reply_cv_timed_sleep_raise = mode == 14;
+		route_cleanup_trace_raise = mode == 15;
 		capacity_acquire_success = mode == 12;
 		if (mode == 13)
 			requester_send.refuse_enqueue_calls = 1;
@@ -4893,12 +4899,12 @@ UT_TEST(test_shared_acquire_error_retires_only_its_quiescent_n_reservation)
 			caught = true;
 		PG_exception_stack = saved_stack;
 		route_ereport_armed = false;
-		UT_ASSERT_EQ(caught, mode < 12 || mode == 14);
+		UT_ASSERT_EQ(caught, mode < 12 || mode == 14 || mode == 15);
 		UT_ASSERT_EQ(granted, mode == 12);
 		UT_ASSERT_EQ(retry_denied, mode == 13);
 		UT_ASSERT_EQ(requester_send.done_calls, 0);
 		UT_ASSERT_EQ(memcmp(&capacity_buffer, &buffer_before, sizeof(buffer_before)), 0);
-		if (mode == 0 || mode == 14) {
+		if (mode == 0 || mode == 14 || mode == 15) {
 			uint64 next_token = 0;
 			ClusterPcmOwnSnapshot next_base;
 

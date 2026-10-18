@@ -335,6 +335,7 @@ static bool transition_wal_error;
 static int transition_wal_calls;
 static int transition_wal_changes;
 bool cluster_enabled = true;
+volatile uint32 CritSectionCount;
 bool cluster_shared_config;
 bool cluster_past_image;
 static bool transition_drop_active, transition_prepin_dirty, transition_unpin_dirty;
@@ -356,6 +357,7 @@ static int route_drift;
 static int n_predecessor_header_step;
 static int read_reclaim_drift;
 static bool read_reclaim_error;
+static bool read_unpin_lock_error;
 static ResourceXApplyResult route_bind_result = RESOURCE_X_APPLY_APPLIED;
 
 /* Only process-local ledger presence is a fixture. The exact production
@@ -456,6 +458,10 @@ transition_lock_acquire(LWLock *lock, LWLockMode mode)
 		transition_mapping_held = true;
 	} else {
 		UT_ASSERT(lock == BufferDescriptorGetContentLock(transition_buf));
+		if (read_unpin_lock_error) {
+			read_unpin_lock_error = false;
+			pg_re_throw();
+		}
 		if (transition_copy_active && !transition_s_prepare && !transition_downgrade_active) {
 			if (cluster_shared_config && transition_capabilities != 0)
 				UT_ASSERT(mode == LW_SHARED || mode == LW_EXCLUSIVE);
@@ -472,6 +478,10 @@ transition_lock_acquire(LWLock *lock, LWLockMode mode)
 			pg_atomic_fetch_add_u64(&ClusterPcmOwnArray[transition_buf->buf_id].generation, 1);
 		else if (read_reclaim_drift == 2)
 			pg_atomic_fetch_or_u32(&transition_buf->state, BM_IO_IN_PROGRESS);
+		else if (read_reclaim_drift == 3)
+			pg_atomic_fetch_add_u64(&ClusterPcmOwnArray[transition_buf->buf_id].reservation_token, 1);
+		else if (read_reclaim_drift == 4)
+			transition_buf->tag.blockNum++;
 		read_reclaim_drift = 0;
 	}
 	return true;
@@ -773,6 +783,32 @@ transition_flush_with_output(BufferDesc *buf, volatile bool *wrote)
 #define FlushBufferWithAttempt(buf, rel, object, context, wrote)                                   \
 	transition_flush_with_output(buf, wrote)
 #include "test_cluster_pcm_transition_owner.inc"
+
+/* The native last-private-pin path is production C. Only process-local pin
+ * bookkeeping and waiter signalling are fixture boundaries. */
+typedef struct AbortReadImagePin
+{
+	int32 refcount;
+} AbortReadImagePin;
+static AbortReadImagePin abort_read_image_pin;
+static unsigned abort_read_image_forgets, abort_read_image_freed, abort_read_image_signals;
+#define PrivateRefCountEntry AbortReadImagePin
+#define GetPrivateRefCountEntry(buffer, move) ((void)(buffer), &abort_read_image_pin)
+#define ResourceOwnerForgetBuffer(owner, buffer) ((void)(buffer), abort_read_image_forgets++)
+#define ForgetPrivateRefCountEntry(ref) ((void)(ref), abort_read_image_freed++)
+#define WaitBufHdrUnlocked(buf) (pg_atomic_read_u32(&(buf)->state) & ~BM_LOCKED)
+#define ProcSendSignal(procno) ((void)(procno), abort_read_image_signals++)
+#define VALGRIND_MAKE_MEM_NOACCESS(address, bytes) ((void)0)
+#define UnpinBuffer abort_read_image_unpin
+#include "test_cluster_pcm_abort_read_image.inc"
+#undef UnpinBuffer
+#undef VALGRIND_MAKE_MEM_NOACCESS
+#undef ProcSendSignal
+#undef WaitBufHdrUnlocked
+#undef ForgetPrivateRefCountEntry
+#undef ResourceOwnerForgetBuffer
+#undef GetPrivateRefCountEntry
+#undef PrivateRefCountEntry
 #undef FlushBufferWithAttempt
 #undef MemoryContextSwitchTo
 #undef CurrentMemoryContext
@@ -5405,6 +5441,149 @@ UT_TEST(test_abandoned_read_image_cleanup_balances_exception_and_does_not_grant)
 	UT_ASSERT_EQ(transition_pin_count, 0);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state), state);
 	UT_ASSERT(!transition_mapping_held && !transition_content_held);
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_native_last_pin_retires_only_quiescent_read_image)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	bool saved_enabled = cluster_enabled;
+	bool saved_shared = cluster_shared_config;
+
+	for (int scenario = 0; scenario < 21; scenario++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry, before;
+		ResourceXDecodedFrame dispatch;
+		ClusterPcmOwnSnapshot base;
+		PGAlignedBlock bytes;
+		uint64 token, generation;
+		uint32 state;
+
+		token = delivery_reader_fixture(&buf, &entry, &dispatch, &base, MAIN_FORKNUM, true);
+		transition_content_held = true;
+		UT_ASSERT_EQ(cluster_pcm_own_publish_read_image_exact(&buf, &base, token, &generation),
+					 CLUSTER_PCM_OWN_OK);
+		/* Native abort first releases content locks, then releases the exact
+		 * ResourceOwner pins. No future reader/delivery is needed to retire it. */
+		transition_content_held = false;
+		cluster_enabled = cluster_shared_config = true;
+		abort_read_image_pin.refcount = scenario == 1 ? 2 : 1;
+		abort_read_image_forgets = abort_read_image_freed = abort_read_image_signals = 0;
+		state = (pg_atomic_read_u32(&buf.state) & ~BUF_REFCOUNT_MASK) | BUF_REFCOUNT_ONE;
+		if (scenario == 2)
+			state += BUF_REFCOUNT_ONE;
+		else if (scenario == 3)
+			state |= BM_IO_IN_PROGRESS;
+		else if (scenario == 4)
+			state |= BM_IO_ERROR;
+		else if (scenario == 5)
+			state |= BM_DIRTY;
+		else if (scenario == 6)
+			state |= BM_PIN_COUNT_WAITER;
+		else if (scenario == 7)
+			pg_atomic_write_u32(&entry.flags, PCM_OWN_FLAG_GRANT_PENDING);
+		else if (scenario == 8)
+			pg_atomic_write_u64(&entry.writer_activation_token, 11);
+		else if (scenario == 9)
+			pg_atomic_write_u64(&entry.resource_x_activation_generation, 12);
+		else if (scenario == 10)
+			pg_atomic_write_u64(&entry.delivery_attempt, 13);
+		else if (scenario == 11)
+			transition_content_busy = true;
+		else if (scenario == 12)
+			cluster_enabled = false;
+		else if (scenario == 13)
+			cluster_shared_config = false;
+		else if (scenario == 14)
+			buf.buffer_type = BUF_TYPE_PI;
+		else if (scenario == 15)
+			state &= ~BM_VALID;
+		else if (scenario >= 16 && scenario <= 19)
+			read_reclaim_drift = scenario - 15;
+		else if (scenario == 20)
+			CritSectionCount = 1;
+		pg_atomic_write_u32(&buf.state, state);
+		memcpy(&before, &entry, sizeof(before));
+		memcpy(bytes.data, transition_page.data, BLCKSZ);
+		abort_read_image_unpin(&buf);
+		UT_ASSERT_EQ(abort_read_image_forgets, 1);
+		UT_ASSERT_EQ(abort_read_image_pin.refcount, scenario == 1 ? 1 : 0);
+		UT_ASSERT_EQ(abort_read_image_freed, scenario == 1 ? 0 : 1);
+		UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf.state)),
+					 scenario == 1 || scenario == 2 ? 1 : 0);
+		if (scenario == 0) {
+			UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_N);
+			UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), generation + 1);
+			UT_ASSERT_EQ(cluster_pcm_own_reservation_token_get(0), token);
+		} else {
+			UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_READ_IMAGE);
+			/* These changes belong to the injected intervening actor; the
+			 * returning pin may not consume its successor identity. */
+			if (scenario == 16)
+				pg_atomic_fetch_add_u64(&before.generation, 1);
+			else if (scenario == 18)
+				pg_atomic_fetch_add_u64(&before.reservation_token, 1);
+			UT_ASSERT_EQ(memcmp(&entry, &before, sizeof(entry)), 0);
+		}
+		UT_ASSERT_EQ(memcmp(transition_page.data, bytes.data, BLCKSZ), 0);
+		UT_ASSERT(!transition_content_held && !transition_mapping_held);
+		CritSectionCount = 0;
+	}
+	cluster_enabled = saved_enabled;
+	cluster_shared_config = saved_shared;
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_last_pin_lock_error_preserves_original_pin_owner)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	bool saved_shared = cluster_shared_config;
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ResourceXDecodedFrame dispatch;
+	ClusterPcmOwnSnapshot base;
+	uint64 token, generation;
+	volatile bool caught = false;
+	uint32 state;
+
+	token = delivery_reader_fixture(&buf, &entry, &dispatch, &base, MAIN_FORKNUM, true);
+	transition_content_held = true;
+	UT_ASSERT_EQ(cluster_pcm_own_publish_read_image_exact(&buf, &base, token, &generation),
+				 CLUSTER_PCM_OWN_OK);
+	transition_content_held = false;
+	cluster_shared_config = true;
+	abort_read_image_pin.refcount = 1;
+	abort_read_image_forgets = abort_read_image_freed = 0;
+	state = (pg_atomic_read_u32(&buf.state) & ~BUF_REFCOUNT_MASK) | BUF_REFCOUNT_ONE;
+	pg_atomic_write_u32(&buf.state, state);
+	read_unpin_lock_error = true;
+	PG_TRY();
+	{
+		abort_read_image_unpin(&buf);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(abort_read_image_forgets, 0);
+	UT_ASSERT_EQ(abort_read_image_freed, 0);
+	UT_ASSERT_EQ(abort_read_image_pin.refcount, 1);
+	UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf.state)), 1);
+	UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_READ_IMAGE);
+	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), generation);
+	UT_ASSERT(!transition_content_held && !transition_mapping_held);
+	/* Once the injected lock limit is gone, original cleanup can retry the
+	 * same remembered pin and complete exactly once. */
+	if (abort_read_image_pin.refcount == 1) {
+		abort_read_image_unpin(&buf);
+		UT_ASSERT_EQ(abort_read_image_forgets, 1);
+		UT_ASSERT_EQ(abort_read_image_freed, 1);
+		UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_N);
+		UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf.state)), 0);
+	}
+	cluster_shared_config = saved_shared;
 	ClusterPcmOwnArray = saved;
 }
 
@@ -10383,7 +10562,7 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(170);
+	UT_PLAN(172);
 	UT_RUN(test_native_flush_refuses_cr_before_starting_io);
 	UT_RUN(test_shared_leave_releases_dirty_and_clean_x_through_exact_owner);
 	UT_RUN(test_shared_leave_write_and_sync_error_keep_x_and_mapping);
@@ -10433,6 +10612,8 @@ main(void)
 	UT_RUN(test_assert_dispatch_reclaims_only_abandoned_read_image);
 	UT_RUN(test_abandoned_read_image_adapter_preserves_all_refusal_boundaries);
 	UT_RUN(test_abandoned_read_image_cleanup_balances_exception_and_does_not_grant);
+	UT_RUN(test_native_last_pin_retires_only_quiescent_read_image);
+	UT_RUN(test_last_pin_lock_error_preserves_original_pin_owner);
 	UT_RUN(test_delivery_dispatch_preserves_ordinary_read_abort_then_arms);
 	UT_RUN(test_real_known_new_sidecar_rejects_installed_remote_image);
 	UT_RUN(test_real_remote_image_t2_t3_use_image_proof_not_page_is_new);

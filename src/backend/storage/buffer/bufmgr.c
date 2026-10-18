@@ -3214,6 +3214,7 @@ cluster_bufmgr_pcm_acquire_shared_owned(BufferDesc *buf,
 
 	PG_TRY();
 	{
+		cluster_bufmgr_trace_cleanup(buf, "shared_acquire_enter", reservation_token);
 		acquired = cluster_pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_S, retry_denied);
 	}
 	PG_CATCH();
@@ -8768,6 +8769,53 @@ PinBuffer_Locked(BufferDesc *buf)
  * This should be applied only to shared buffers, never local ones.  This
  * always adjusts CurrentResourceOwner.
  */
+#ifdef USE_PGRAC_CLUSTER
+/* Normal UNLOCK retires READ_IMAGE before releasing content. ERROR/FATAL
+ * cleanup uses LWLockReleaseAll instead, so the original last pin must finish
+ * that same non-durable bracket. Its pin preserves the descriptor mapping;
+ * sole shared reference plus content-X excludes another live user. Reuse the
+ * exact generation/token reclaimer, never clear a grant, IO, delivery or
+ * dirty image. Refusal leaves the responsibility visible to normal stop.
+ * No wait, allocation, message, data write or Resource-X grant is introduced.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static void
+cluster_bufmgr_pcm_read_image_last_pin(BufferDesc *buf)
+{
+	ClusterPcmOwnSnapshot published;
+	LWLock *content_lock;
+	uint32 state;
+	uint64 cleared_generation;
+	bool eligible;
+
+	if (!cluster_enabled || !cluster_shared_config || CritSectionCount != 0
+		|| ClusterPcmOwnArray == NULL
+		|| buf->pcm_state != (uint8) PCM_STATE_READ_IMAGE)
+		return;
+	content_lock = BufferDescriptorGetContentLock(buf);
+	if (LWLockHeldByMe(content_lock))
+		return;
+	state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_locked(buf, &published);
+	eligible = BUF_STATE_GET_REFCOUNT(state) == 1
+		&& (state & (BM_TAG_VALID | BM_VALID)) == (BM_TAG_VALID | BM_VALID)
+		&& (state & (BM_DIRTY | BM_IO_IN_PROGRESS | BM_IO_ERROR | BM_PIN_COUNT_WAITER)) == 0
+		&& published.pcm_state == (uint8) PCM_STATE_READ_IMAGE
+		&& published.buffer_type == (uint8) BUF_TYPE_CURRENT
+		&& published.flags == 0 && published.writer_activation_token == 0
+		&& published.resource_x_activation_generation == 0
+		&& cluster_pcm_own_delivery_attempt_get(buf->buf_id) == 0;
+	UnlockBufHdr(buf, state);
+	if (!eligible || !LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE))
+		return;
+	/* A new generation, token, IO interval or delivery cannot be absorbed by
+	 * the original pin. The established reclaimer checks the whole identity
+	 * again under the header lock while content-X remains held. */
+	(void) cluster_pcm_own_reclaim_read_image_exact(buf, &published, &cleared_generation);
+	LWLockRelease(content_lock);
+}
+#endif
+
 static void
 UnpinBuffer(BufferDesc *buf)
 {
@@ -8779,6 +8827,14 @@ UnpinBuffer(BufferDesc *buf)
 	/* not moving as we're likely deleting it soon anyway */
 	ref = GetPrivateRefCountEntry(b, false);
 	Assert(ref != NULL);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Conditional lock acquisition can ERROR at the native held-lock limit.
+	 * Keep both the ResourceOwner pin and private count until it has returned,
+	 * so ordinary abort cleanup can still release this original reference. */
+	if (ref->refcount == 1)
+		cluster_bufmgr_pcm_read_image_last_pin(buf);
+#endif
 
 	ResourceOwnerForgetBuffer(CurrentResourceOwner, b);
 
