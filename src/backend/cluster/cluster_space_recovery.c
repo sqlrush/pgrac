@@ -99,7 +99,7 @@ typedef struct SpaceColdAbortDelete {
 	uint32 count;
 	SpaceColdAbortTarget *targets;
 	RelFileLocator *locators;
-	ClusterSpaceColdAbortFinishV1 finish;
+	ClusterSpaceColdAbortFinishV1 before_delete, finish;
 	void *finish_arg;
 } SpaceColdAbortDelete;
 
@@ -1191,6 +1191,12 @@ space_cold_abort_delete(ClusterSpaceRecoveryBatchV1 *batch, const SpaceColdAbort
 	if (!space_cold_abort_group(batch, work, budget, false) || !space_cold_relation_sync(batch)
 		|| !space_cold_abort_group(batch, work, budget, false))
 		return false;
+	/* Native CLOG/lock obligations must precede unlink, inside this owner.
+	 * Requalify all targets after the callback before touching any file. */
+	if (work->before_delete != NULL
+		&& (!work->before_delete(work->finish_arg, work->side, work->index)
+			|| !space_cold_abort_group(batch, work, budget, false)))
+		return false;
 	DropRelationFiles(work->locators, work->count, true);
 	if (!space_cold_abort_group(batch, work, budget, true))
 		return false;
@@ -1211,11 +1217,15 @@ space_cold_abort_delete(ClusterSpaceRecoveryBatchV1 *batch, const SpaceColdAbort
 
 static bool
 space_cold_abort_execute(const RfSideOnlinePlanV1 *side, uint32 index, Size finish_bytes, void *arg,
+						 ClusterSpaceColdAbortFinishV1 before_delete,
 						 ClusterSpaceColdAbortFinishV1 finish)
 {
 	RfSideOnlineOperationV1 abort;
-	SpaceColdAbortDelete work
-		= { .side = side, .index = index, .finish = finish, .finish_arg = arg };
+	SpaceColdAbortDelete work = { .side = side,
+								  .index = index,
+								  .before_delete = before_delete,
+								  .finish = finish,
+								  .finish_arg = arg };
 	Size bytes, native_bytes, budget = rf_side_online_plan_scratch_available_v1(side);
 	uint32 creation, count;
 	bool ok = false;
@@ -1273,15 +1283,17 @@ space_cold_abort_execute(const RfSideOnlinePlanV1 *side, uint32 index, Size fini
 bool
 cluster_space_recovery_cold_abort_delete_v1(const RfSideOnlinePlanV1 *side, uint32 index)
 {
-	return space_cold_abort_execute(side, index, 0, NULL, NULL);
+	return space_cold_abort_execute(side, index, 0, NULL, NULL, NULL);
 }
 
 bool
 cluster_space_recovery_cold_abort_finish_v1(const RfSideOnlinePlanV1 *side, uint32 index,
 											Size finish_bytes, void *arg,
+											ClusterSpaceColdAbortFinishV1 before_delete,
 											ClusterSpaceColdAbortFinishV1 finish)
 {
-	return finish != NULL && space_cold_abort_execute(side, index, finish_bytes, arg, finish);
+	return finish != NULL
+		   && space_cold_abort_execute(side, index, finish_bytes, arg, before_delete, finish);
 }
 
 bool

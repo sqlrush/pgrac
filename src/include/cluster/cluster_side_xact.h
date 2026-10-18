@@ -170,6 +170,14 @@ extern RfSideXactApplyResultV1
 rf_side_xact_apply_cold_abort_completion_v1(const RfSideXactOperationV1 *operation,
 											const uint8 *payload, uint32 length, void *arg,
 											RfSideXactVerifyAbortCoverageV1 verify);
+/* Selected sealed ABORT with native pending deletes. TT coverage and CLOG/locks
+ * precede unlink; stats/terminal follow durable deletion in the original SPACE
+ * owner. Reserve owner_bytes for all caller storage still live during it. */
+struct RfSideOnlinePlanV1;
+extern RfSideXactApplyResultV1
+rf_side_xact_apply_cold_abort_delete_completion_v1(const struct RfSideOnlinePlanV1 *plan,
+												   uint32 index, Size owner_bytes, void *arg,
+												   RfSideXactVerifyAbortCoverageV1 verify);
 extern RfSideXactApplyResultV1
 rf_side_xact_target_preflight_owned_v1(const RfSideXactOperationV1 *operation,
 									   const uint8 *owned_payload, uint32 owned_payload_length);
