@@ -24,6 +24,7 @@ int drop_owner_fixture_main(void);
 bool cluster_shared_catalog = true;
 bool IsBinaryUpgrade = false;
 bool enableFsync = true;
+static void (*work_main_sync_observe)(int);
 char *cluster_shared_data_dir;
 int io_direct_flags;
 volatile uint32 QueryCancelHoldoffCount;
@@ -224,7 +225,10 @@ work_sync(int fd)
 	} else {
 		main_syncs++;
 		UT_ASSERT_EQ(st.st_size, 0);
-		UT_ASSERT_EQ(unlinks, 0);
+		if (work_main_sync_observe != NULL)
+			work_main_sync_observe(fd);
+		else
+			UT_ASSERT_EQ(unlinks, 0);
 		if (work_fault == WORK_MAIN_SYNC) {
 			if (work_unknown_on_failure)
 				capture_ok = false;
@@ -405,6 +409,7 @@ work_setup_impl(const char *name, unsigned native, bool stale)
 	external_fds = 0;
 	external_fd_limit = 1024;
 	work_native_v3 = native == 2;
+	work_main_sync_observe = NULL;
 	finish_local_drift = 0;
 	if (native) {
 		if (native == 2)
@@ -1561,6 +1566,7 @@ UT_TEST(test_v3_native_failed_io_keeps_original_recovery_obligation)
 	}
 }
 
+#ifndef DROP_WORK_NO_MAIN
 int
 main(void)
 {
@@ -1610,3 +1616,4 @@ main(void)
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
+#endif

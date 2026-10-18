@@ -352,6 +352,8 @@ static RelFileNumber local_scan_rel_number = 99;
 static bool local_writeback_closed;
 static uint64 local_writeback_revision;
 static uint32 local_relation_scan_input;
+static void (*local_relation_scan_hook)(RelFileLocator);
+static unsigned native_window_origin_wait_limit = 8;
 static unsigned local_relation_scan_drift;
 static void (*relation_gate_sample_hook)(void);
 static void (*local_writeback_sample_hook)(void);
@@ -390,12 +392,14 @@ ClusterPcmPiRelationScanV2
 cluster_pcm_lock_ko_local_relation_scan_v3(RelFileLocator locator, uint64 epoch, uint32 budget,
 										   uint32 *cursor)
 {
-	UT_ASSERT_EQ(locator.relNumber, local_scan_rel_number);
 	if (epoch != (relation_gate_formation != 0 ? relation_gate_formation : current_epoch))
 		return CLUSTER_PCM_PI_RELATION_INVALID;
 	UT_ASSERT_EQ(budget, 128);
 	local_relation_scan_calls++;
 	local_relation_scan_input = *cursor;
+	if (local_relation_scan_hook != NULL)
+		local_relation_scan_hook(locator);
+	UT_ASSERT_EQ(locator.relNumber, local_scan_rel_number);
 	*cursor += local_relation_scan_advance;
 	if (local_relation_scan_drift == 1)
 		relation_gate_freeze++;
@@ -935,7 +939,8 @@ WaitLatch(Latch *latch, int events, long timeout, uint32 wait_event)
 		UT_ASSERT(InterruptHoldoffCount != 0);
 		UT_ASSERT_EQ(timeout, barrier_active ? cluster_sinval_ack_timeout_ms : 100);
 		UT_ASSERT_EQ(wait_event, WAIT_EVENT_CLUSTER_OBJECT_FLUSH_WAIT);
-		if ((barrier_active ? ++barrier_waits : ++origin_waits) > 8)
+		if ((barrier_active ? ++barrier_waits : ++origin_waits)
+			> (barrier_active ? 8 : native_window_origin_wait_limit))
 			abort();
 		native_window_wait_hook();
 		return WL_TIMEOUT;
@@ -1568,6 +1573,8 @@ reset_test(void)
 	local_discard_calls = 0;
 	local_pi_only_pending = false;
 	local_relation_scan_input = local_relation_scan_drift = 0;
+	local_relation_scan_hook = NULL;
+	native_window_origin_wait_limit = 8;
 	relation_gate_sample_hook = NULL;
 	local_writeback_sample_hook = NULL;
 	relation_gate_freeze = 3;

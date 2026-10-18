@@ -4045,6 +4045,33 @@ dump_ts(ReturnSetInfo *rsinfo)
 static void
 dump_ko(ReturnSetInfo *rsinfo)
 {
+	ClusterKoDropTraceV1 trace;
+	if (cluster_ko_drop_pending_v1(&trace)) {
+		char key[96], value[96];
+#define KO_DROP_TRACE_ROW(field) \
+		do { \
+			snprintf(key, sizeof(key), "drop_pending_" #field); \
+			snprintf(value, sizeof(value), UINT64_FORMAT, (uint64)trace.field); \
+			emit_row(rsinfo, "ko", key, value); \
+		} while (0)
+		KO_DROP_TRACE_ROW(slot); KO_DROP_TRACE_ROW(serial); KO_DROP_TRACE_ROW(batch);
+		KO_DROP_TRACE_ROW(operation); KO_DROP_TRACE_ROW(drop_pending); KO_DROP_TRACE_ROW(failed);
+		KO_DROP_TRACE_ROW(observed); KO_DROP_TRACE_ROW(phase); KO_DROP_TRACE_ROW(step);
+		KO_DROP_TRACE_ROW(provider_step);
+		KO_DROP_TRACE_ROW(cursor); KO_DROP_TRACE_ROW(prefix_cursor); KO_DROP_TRACE_ROW(local_result);
+		KO_DROP_TRACE_ROW(selections); KO_DROP_TRACE_ROW(gate_observed); KO_DROP_TRACE_ROW(gate_phase);
+		KO_DROP_TRACE_ROW(gate_formation); KO_DROP_TRACE_ROW(gate_freeze);
+		KO_DROP_TRACE_ROW(revision); KO_DROP_TRACE_ROW(current_revision);
+		KO_DROP_TRACE_ROW(io_attempted);
+#undef KO_DROP_TRACE_ROW
+		emit_row(rsinfo, "ko", "drop_pending_pid", fmt_int64(trace.pid));
+		emit_row(rsinfo, "ko", "drop_pending_forknum", fmt_int64(trace.forknum));
+		emit_row(rsinfo, "ko", "drop_pending_io_error", fmt_int64(trace.io_error));
+		emit_row(rsinfo, "ko", "drop_pending_sampled_pg_us", fmt_int64(trace.observed_pg_us));
+		snprintf(value, sizeof(value), "%u/%u/%u", trace.locator.spcOid,
+			trace.locator.dbOid, trace.locator.relNumber);
+		emit_row(rsinfo, "ko", "drop_pending_locator", value);
+	}
 	emit_row(rsinfo, "ko", "flush_count", fmt_int64((int64)cluster_ko_flush_count()));
 	emit_row(rsinfo, "ko", "ack_received_count", fmt_int64((int64)cluster_ko_ack_received_count()));
 	emit_row(rsinfo, "ko", "failclosed_count", fmt_int64((int64)cluster_ko_failclosed_count()));

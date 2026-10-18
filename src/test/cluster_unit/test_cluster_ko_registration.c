@@ -1135,6 +1135,7 @@ static unsigned window_mode;
 static bool window_expect_ready;
 static bool window_expect_closed;
 static unsigned window_origin_case;
+static uint32 window_scan_capacity;
 static unsigned window_final_case;
 static unsigned window_close_case, window_close_samples;
 /* Only the new directed diagnostics tests enable this observer. */
@@ -1211,7 +1212,8 @@ window_origin_discard(void)
 	switch (window_origin_case) {
 	case 2:
 		UT_ASSERT_EQ(committed_discard_input, (committed_discard_calls - 1) * 128);
-		committed_discard_result = committed_discard_calls < 3
+		committed_discard_result = committed_discard_calls < (window_scan_capacity != 0
+			? window_scan_capacity / 128 : 3)
 			? CLUSTER_BUFFER_DRAIN_MORE : CLUSTER_BUFFER_DRAIN_EMPTY;
 		break;
 	case 7:
@@ -1258,6 +1260,15 @@ window_origin_discard(void)
 		break;
 	}
 	}
+}
+
+static void
+window_local_scan_continue(RelFileLocator locator pg_attribute_unused())
+{
+	uint32 end = window_scan_capacity != 0 ? window_scan_capacity : 256;
+	local_relation_scan_advance = 128;
+	local_relation_scan_result = local_relation_scan_input + 128 < end
+		? CLUSTER_PCM_PI_RELATION_MORE : CLUSTER_PCM_PI_RELATION_EMPTY;
 }
 
 static void
@@ -1500,6 +1511,10 @@ run_committed_window(uint16 operation, unsigned mode, bool held, unsigned origin
 	window_close_samples = 0;
 	window_mode = mode;
 	window_origin_case = origin_case;
+	if (window_scan_capacity != 0 || origin_case == 4)
+		local_relation_scan_hook = window_local_scan_continue;
+	if (window_scan_capacity != 0)
+		native_window_origin_wait_limit = 64;
 	native_window_space = mode == 7 ? NULL : (ClusterSpaceDropState *)&window_request;
 	native_window_space_owner = mode == 8 ? NULL : owner;
 	native_window_space_finish_hook = window_final_case == 0 ? NULL : window_final_space_fixture;
@@ -1603,8 +1618,9 @@ run_committed_window(uint16 operation, unsigned mode, bool held, unsigned origin
 			InvalidBlockNumber);
 	}
 	if (origin_case == 2) {
-		UT_ASSERT_EQ(committed_discard_calls, 3);
-		UT_ASSERT_EQ(origin_waits, 2);
+		UT_ASSERT_EQ(committed_discard_calls, window_scan_capacity != 0
+			? window_scan_capacity / 128 : 3);
+		UT_ASSERT_EQ(origin_waits, 0);
 	}
 	if (origin_case == 4)
 		UT_ASSERT_EQ(local_relation_scan_input, 128);
@@ -1649,7 +1665,13 @@ run_committed_window(uint16 operation, unsigned mode, bool held, unsigned origin
 				 * boundary. Real provider effects are tested in drop_work;
 				 * this fixture does not claim physical unlink or durability. */
 				local_relation_scan_advance = 128;
-				UT_ASSERT(cluster_ko_shared_drop_work_begin_v2(&cursor, 1, &file_work));
+				for (unsigned segment = 0; segment < 16; segment++) {
+					cursor = i;
+					UT_ASSERT(cluster_ko_shared_drop_work_begin_v2(&cursor, 1, &file_work));
+					if (file_work == NULL || cluster_ko_shared_drop_work_revalidate_v2(file_work))
+						break;
+					file_work = NULL; /* Only a borrowed pointer; the original owner retains it. */
+				}
 				UT_ASSERT(file_work != NULL);
 				if (file_work == NULL)
 					break;
@@ -2041,10 +2063,27 @@ UT_TEST(test_prepared_mode_keeps_original_completed_legacy_owner)
 	cluster_ko_shared_release_v2(&owner);
 }
 
+UT_TEST(test_two_object_16mb_discard_timer_budget)
+{
+	unsigned waits = 0;
+	window_scan_capacity = 16 * 1024 * 1024 / BLCKSZ;
+	window_final_case = 1;
+	for (unsigned object = 0; object < 2; object++) {
+		run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 2);
+		waits += origin_waits;
+		UT_ASSERT_EQ(committed_discard_calls, 16);
+		UT_ASSERT(local_discard_calls >= 16);
+	}
+	window_scan_capacity = window_final_case = 0;
+	printf("# two 16MB object scans: requested timed waits=%u ms\n", waits * 100);
+	UT_ASSERT(waits * 100 <= 1000);
+}
+
 int
 main(void)
 {
-	UT_PLAN(60);
+	UT_PLAN(61);
+	UT_RUN(test_two_object_16mb_discard_timer_budget);
 	UT_RUN(test_native_abandon_and_promotion_have_distinct_write_ids);
 	UT_RUN(test_native_window_first_failure_has_exact_stage_and_work);
 	UT_RUN(test_native_space_substage_survives_work_promotion_and_stop);

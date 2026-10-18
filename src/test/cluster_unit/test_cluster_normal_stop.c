@@ -4931,6 +4931,20 @@ UT_TEST(test_actual_prepare_does_not_start_owner_work_after_original_deadline)
 	checkpoint_native_remaining = 0;
 }
 
+UT_TEST(test_actual_prepare_never_starts_native_work_after_producer_seal)
+{
+	ClusterPhase1FullStopPlan plan = {0};
+	seed_module_drain();
+	idle_original_actors();
+	checkpoint_native_remaining = 1;
+	checkpoint_native_calls = checkpoint_retire_calls = 0;
+	pg_atomic_write_u32(&cl_normal_stop->service_seal, 1);
+	UT_ASSERT(!cluster_normal_stop_checkpoint_prepare(&plan, NULL));
+	UT_ASSERT_EQ(checkpoint_native_calls + checkpoint_retire_calls, 0);
+	UT_ASSERT_EQ(checkpoint_native_remaining, 1);
+	checkpoint_native_remaining = 0;
+}
+
 UT_TEST(test_actual_prepare_wait_drives_original_quiesce_and_ack)
 {
 	ClusterPhase1FullStopPlan plan = { 0 };
@@ -6345,7 +6359,8 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(159);
+	UT_PLAN(160);
+	UT_RUN(test_actual_prepare_never_starts_native_work_after_producer_seal);
 	UT_RUN(test_actual_prepare_does_not_start_owner_work_after_original_deadline);
 	UT_RUN(test_actual_prepare_keeps_failed_native_work_and_rejects_stop);
 	UT_RUN(test_actual_prepare_services_original_native_and_am03_with_same_deadline);

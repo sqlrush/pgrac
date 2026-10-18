@@ -3691,6 +3691,7 @@ cl_normal_stop_checkpoint_run(ClusterPhase1FullStopPlan *plan,
 		cluster_lock_owners_service_poll();
 		if (step == 0 && !after_checkpoint
 			&& pg_atomic_read_u32(&cl_normal_stop->phase) < CLUSTER_NORMAL_STOP_CHECKPOINT
+			&& pg_atomic_read_u32(&cl_normal_stop->service_seal) == 0
 			&& cluster_normal_stop_failure() == CLUSTER_NORMAL_STOP_FAILURE_NONE) {
 			PcmReclaimBatch retired = {0};
 			bool owner_progress;

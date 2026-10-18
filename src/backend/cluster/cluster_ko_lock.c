@@ -317,6 +317,7 @@ typedef struct ClusterKoShared {
 	dsa_pointer native_failed; /* Retained evidence; never re-enters execution. */
 	bool native_recovery_required;
 	uint64 native_waiting;
+	ClusterKoDropTraceV1 drop_trace[CLUSTER_KO_SHARED_CAPACITY];
 } ClusterKoShared;
 
 static ClusterKoShared *ko_state = NULL;
@@ -430,11 +431,13 @@ struct ClusterKoDropWorkV2 {
 	bool abandoned;
 	/* Only a hint for this original CP work, never a new physical result. */
 	bool local_scan_complete;
+	bool local_scan_progress;
 	uint32 local_scan_cursor;
 	uint64 local_scan_revision;
 	uint64 local_writeback_revision;
 	ResourceXGateSnapshot local_scan_gate;
 	ClusterKoSharedContext context;
+	ClusterKoDropTraceV1 observation;
 };
 static ClusterKoDropWorkV2 *ko_drop_work[CLUSTER_KO_SHARED_CAPACITY];
 static uint32 ko_drop_scan;
@@ -560,6 +563,7 @@ cluster_ko_shmem_init(void)
 		pg_atomic_init_u64(&ko_state->ax_publication_revision, 2);
 		ko_state->ax_release_cursor = 0;
 		memset(ko_state->contexts, 0, sizeof(ko_state->contexts));
+		memset(ko_state->drop_trace, 0, sizeof(ko_state->drop_trace));
 		ko_state->peer_fence_serial = 0;
 		pg_atomic_init_u64(&ko_state->peer_admission_revision, 1);
 		ko_state->holder_probe_nonce = 0;
@@ -5624,17 +5628,25 @@ cluster_ko_shared_native_promote_v2(void)
 bool
 cluster_ko_shared_native_poll_v2(void)
 {
-	bool progress, completed = false;
+	bool progress, selected, completed = false;
 
 	if (ko_state == NULL || !cluster_enabled || !cluster_shared_config
 		|| MyBackendType != B_CHECKPOINTER || CurrentResourceOwner == NULL || CritSectionCount != 0
 		|| (!ko_native_capable(false, false) && !ko_native_capable(true, false)
 			&& !ko_native_capable(true, true)))
 		return false;
+	CHECK_FOR_INTERRUPTS();
 	progress = cluster_ko_shared_native_promote_v2() == CLUSTER_KO_STRUCTURE_PROGRESS;
 	/* No WAL input, content/entry lock or remote wait spans physical work.
-	 * A failing item still advances this cursor; wrapping waits another tick. */
-	if (cluster_smgr_drop_work_poll(&ko_drop_scan, &completed)) {
+	 * A failing item still advances this cursor in the original fair order. */
+	selected = cluster_smgr_drop_work_poll(&ko_drop_scan, &completed);
+	/* A cursor wrap is not an external wait. Keep one selected work and
+	 * one bounded LOCAL segment per call, in the same fair slot order. */
+	if (!selected && ko_drop_scan != 0) {
+		ko_drop_scan = 0;
+		selected = cluster_smgr_drop_work_poll(&ko_drop_scan, &completed);
+	}
+	if (selected) {
 		if (!completed) {
 			ClusterKoSharedContext context;
 			uint32 slot = ko_drop_scan - 1;
@@ -5644,6 +5656,7 @@ cluster_ko_shared_native_poll_v2(void)
 			context = ko_state->contexts[slot];
 			SpinLockRelease(&ko_state->shared_lock);
 			ko_native_deferred(&context, &ko_drop_report_serial[slot], "DROP_WORK");
+			progress |= ko_drop_work[slot] != NULL && ko_drop_work[slot]->local_scan_progress;
 		}
 		progress |= completed;
 	} else
@@ -5749,6 +5762,63 @@ ko_drop_work_local_sample_current(const ClusterKoDropWorkV2 *work)
 	return current;
 }
 
+static void
+ko_drop_trace_snapshot_locked(uint32 slot, ClusterKoDropTraceV1 *out)
+{
+	const ClusterKoSharedContext *context = &ko_state->contexts[slot];
+	*out = ko_state->drop_trace[slot];
+	if (out->serial != context->serial || out->batch != context->request.batch_id
+		|| !RelFileLocatorEquals(out->locator, context->request.key.locator))
+		memset(out, 0, sizeof(*out));
+	if (!out->observed)
+		out->phase = CLUSTER_KO_DROP_TRACE_CONTEXT;
+	out->locator = context->request.key.locator;
+	out->slot = slot;
+	out->pid = context->drop_executor_pid;
+	out->serial = context->serial;
+	out->batch = context->request.batch_id;
+	out->operation = context->v3 ? context->request_v3.operation : 0;
+	out->drop_pending = context->structure_drop_pending;
+	out->failed = context->structure_drop_failed || context->ax_failed
+		|| context->request_failed_peers != 0;
+	out->current_revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+}
+
+void
+cluster_ko_drop_work_note_v1(ClusterKoDropWorkV2 *work, uint32 phase, uint32 step,
+	ForkNumber fork, bool io_attempted, int io_error)
+{
+	ClusterKoDropTraceV1 *trace;
+	int saved_errno = errno;
+	if (ko_state == NULL || !ko_drop_work_owned(work)) {
+		errno = saved_errno;
+		return;
+	}
+	trace = &work->observation;
+	trace->locator = work->context.request.key.locator;
+	trace->slot = work->slot;
+	trace->pid = work->pid;
+	trace->serial = work->context.serial;
+	trace->batch = work->context.request.batch_id;
+	trace->phase = phase;
+	trace->step = step;
+	if (phase == CLUSTER_KO_DROP_TRACE_PROVIDER)
+		trace->provider_step = step;
+	trace->forknum = fork;
+	trace->io_attempted = io_attempted;
+	trace->io_error = io_attempted ? io_error : 0;
+	trace->prefix_cursor = work->local_scan_cursor;
+	trace->observed_pg_us = GetCurrentTimestamp();
+	trace->observed = true;
+	SpinLockAcquire(&ko_state->shared_lock);
+	if (memcmp(&ko_state->contexts[work->slot], &work->context, sizeof(work->context)) == 0) {
+		trace->current_revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
+		ko_state->drop_trace[work->slot] = *trace;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	errno = saved_errno;
+}
+
 /* The native producer already persisted the final SPACE and retired its
  * buffers. That alone does not retire local PI/protocol or ACK-send owners.
  * Resume their existing local-only census without waiting for remote master
@@ -5762,13 +5832,18 @@ ko_drop_work_local_scan(ClusterKoDropWorkV2 *work)
 	uint64 revision, writeback_revision = 0;
 	uint64 previous_revision = work->local_scan_revision;
 	uint32 start = 0, cursor;
-	bool same;
+	bool same, gate_valid = false;
 
+	work->local_scan_progress = false;
+	work->observation.selections++;
 	if (!work->context.v3)
 		return;
 	same = ko_drop_work_local_sample_current(work);
-	if (same && work->local_scan_complete)
+	if (same && work->local_scan_complete) {
+		cluster_ko_drop_work_note_v1(work, CLUSTER_KO_DROP_TRACE_LOCAL, 0,
+			InvalidForkNumber, false, 0);
 		return;
+	}
 	if (same)
 		start = work->local_scan_cursor;
 	work->local_scan_complete = false;
@@ -5777,10 +5852,23 @@ ko_drop_work_local_scan(ClusterKoDropWorkV2 *work)
 	work->local_writeback_revision = 0;
 	memset(&work->local_scan_gate, 0, sizeof(work->local_scan_gate));
 	revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
-	if (revision == 0 || revision == UINT64_MAX
-		|| !cluster_pcm_lock_resource_x_gate_snapshot(&gate)
-		|| gate.phase != RESOURCE_X_GATE_OPEN)
+	work->observation.revision = revision;
+	work->observation.gate_observed = false;
+	work->observation.gate_phase = 0;
+	work->observation.gate_formation = work->observation.gate_freeze = 0;
+	if (revision != 0 && revision != UINT64_MAX)
+		gate_valid = cluster_pcm_lock_resource_x_gate_snapshot(&gate);
+	if (gate_valid) {
+		work->observation.gate_observed = true;
+		work->observation.gate_phase = gate.phase;
+		work->observation.gate_formation = gate.formation;
+		work->observation.gate_freeze = gate.freeze_generation;
+	}
+	if (!gate_valid || gate.phase != RESOURCE_X_GATE_OPEN) {
+		cluster_ko_drop_work_note_v1(work, CLUSTER_KO_DROP_TRACE_LOCAL, 1,
+			InvalidForkNumber, false, 0);
 		return;
+	}
 	/* The cut may change between validating the old prefix and sampling
 	 * this attempt. Never relabel that prefix with the replacement cut. */
 	if (revision != previous_revision || memcmp(&gate, &previous_gate, sizeof(gate)) != 0)
@@ -5790,18 +5878,29 @@ ko_drop_work_local_scan(ClusterKoDropWorkV2 *work)
 	 * still consumes the independently authenticated membership epoch. */
 	scan = cluster_pcm_lock_ko_local_relation_scan_v3(work->context.request.key.locator,
 													  gate.formation, 128, &cursor);
+	work->observation.cursor = cursor;
+	work->observation.local_result = scan;
 	if ((scan != CLUSTER_PCM_PI_RELATION_MORE && scan != CLUSTER_PCM_PI_RELATION_EMPTY)
-		|| cursor <= start || cursor - start > 128)
+		|| cursor <= start || cursor - start > 128) {
+		cluster_ko_drop_work_note_v1(work, CLUSTER_KO_DROP_TRACE_LOCAL, 2,
+			InvalidForkNumber, false, 0);
 		return;
+	}
 	if (scan == CLUSTER_PCM_PI_RELATION_EMPTY
 		&& !cluster_pi_writeback_local_relation_closed_v3(work->context.request.key.locator,
 															 work->context.request.epoch,
-															 &writeback_revision))
+															 &writeback_revision)) {
+		cluster_ko_drop_work_note_v1(work, CLUSTER_KO_DROP_TRACE_LOCAL, 3,
+			InvalidForkNumber, false, 0);
 		return;
+	}
 	if (!ko_drop_work_context_current(work)
 		|| !cluster_pcm_lock_resource_x_gate_snapshot(&after)
-		|| memcmp(&gate, &after, sizeof(gate)) != 0)
+		|| memcmp(&gate, &after, sizeof(gate)) != 0) {
+		cluster_ko_drop_work_note_v1(work, CLUSTER_KO_DROP_TRACE_LOCAL, 4,
+			InvalidForkNumber, false, 0);
 		return;
+	}
 	SpinLockAcquire(&ko_state->shared_lock);
 	if (pg_atomic_read_u64(&ko_state->peer_admission_revision) == revision
 		&& !ko_cleaner_pending_locked(work->context.request.key.locator)
@@ -5813,8 +5912,11 @@ ko_drop_work_local_scan(ClusterKoDropWorkV2 *work)
 		work->local_scan_gate = gate;
 		work->local_writeback_revision = writeback_revision;
 		work->local_scan_complete = scan == CLUSTER_PCM_PI_RELATION_EMPTY;
+		work->local_scan_progress = cursor > start;
 	}
 	SpinLockRelease(&ko_state->shared_lock);
+	cluster_ko_drop_work_note_v1(work, CLUSTER_KO_DROP_TRACE_LOCAL,
+		work->local_scan_progress ? 0 : 5, InvalidForkNumber, false, 0);
 }
 
 bool
@@ -5972,7 +6074,11 @@ cluster_ko_shared_drop_work_finish_v2(ClusterKoDropWorkV2 **work)
 	ClusterKoDropWorkV2 *owned;
 	bool retired_drop;
 	bool finished = false;
+	uint32 refusal = 5;
 
+	if (work != NULL)
+		cluster_ko_drop_work_note_v1(*work, CLUSTER_KO_DROP_TRACE_FINISH, 1,
+			InvalidForkNumber, false, 0);
 	if (work == NULL || !cluster_ko_shared_drop_work_revalidate_v2(*work))
 		return false;
 	owned = *work;
@@ -5987,10 +6093,18 @@ cluster_ko_shared_drop_work_finish_v2(ClusterKoDropWorkV2 **work)
 		/* Consume the same local proof with the exact context. The physical
 		 * caller has synced the namespace and closed every original FD. A
 		 * changed proof retains that durable work for its original next tick. */
-		if (identity == NULL || identity->state != KO_DROP_IDENTITY_RETIRED
-			|| ko_directory_io_pending_locked(owned->context.request.key.locator)
-			|| !owned->local_scan_complete || !ko_drop_work_local_sample_current_locked(owned))
+		if (identity == NULL || identity->state != KO_DROP_IDENTITY_RETIRED) {
+			refusal = 2;
 			goto done;
+		}
+		if (ko_directory_io_pending_locked(owned->context.request.key.locator)) {
+			refusal = 3;
+			goto done;
+		}
+		if (!owned->local_scan_complete || !ko_drop_work_local_sample_current_locked(owned)) {
+			refusal = 4;
+			goto done;
+		}
 	}
 	if (memcmp(&ko_state->contexts[owned->slot], &owned->context, sizeof(owned->context)) == 0) {
 		if (retired_drop) {
@@ -6007,11 +6121,32 @@ cluster_ko_shared_drop_work_finish_v2(ClusterKoDropWorkV2 **work)
 	}
 done:
 	SpinLockRelease(&ko_state->shared_lock);
-	if (!finished)
+	if (!finished) {
+		cluster_ko_drop_work_note_v1(owned, CLUSTER_KO_DROP_TRACE_FINISH, refusal,
+			InvalidForkNumber, false, 0);
 		return false;
+	}
 	pfree(owned);
 	*work = NULL;
 	return true;
+}
+
+bool
+cluster_ko_drop_pending_v1(ClusterKoDropTraceV1 *out)
+{
+	bool found = false;
+	if (out == NULL || ko_state == NULL)
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	for (uint32 slot = 0; slot < CLUSTER_KO_SHARED_CAPACITY; slot++) {
+		if (!ko_state->contexts[slot].used || !ko_state->contexts[slot].structure_owned)
+			continue;
+		ko_drop_trace_snapshot_locked(slot, out);
+		found = true;
+		break;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	return found;
 }
 
 static bool
@@ -7151,6 +7286,10 @@ cluster_ko_shared_normal_stop_poll_v2(const char **reason)
 	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
 	const char *why = "KO_SHARED_EMPTY";
 	ClusterKoNativeFailureV1 failures[CLUSTER_KO_NATIVE_FAIL_COUNT] = {0};
+	ClusterKoDropTraceV1 pending = {0};
+	bool pending_context = false;
+	static int64 last_trace_us;
+	static uint64 last_trace_serial;
 
 	if (ko_state == NULL) {
 		if (reason != NULL)
@@ -7192,11 +7331,15 @@ cluster_ko_shared_normal_stop_poll_v2(const char **reason)
 			 * is still allowed to wait. LMON owns the existing failed stop. */
 			result = CLUSTER_NORMAL_STOP_INVALID;
 			why = "KO_SHARED_DROP_RECOVERY_REQUIRED";
+			ko_drop_trace_snapshot_locked(i, &pending);
+			pending_context = true;
 		} else if (ko_state->contexts[i].used && result == CLUSTER_NORMAL_STOP_READY) {
 			result = CLUSTER_NORMAL_STOP_PENDING;
 			why = ko_state->contexts[i].structure_owned ? "KO_SHARED_STRUCTURE_OWNED"
 				  : ko_state->contexts[i].complete		? "KO_SHARED_COMPLETION_OWNED"
 														: "KO_SHARED_BARRIER_PENDING";
+			ko_drop_trace_snapshot_locked(i, &pending);
+			pending_context = true;
 		}
 	}
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
@@ -7250,6 +7393,29 @@ cluster_ko_shared_normal_stop_poll_v2(const char **reason)
 		}
 	}
 	SpinLockRelease(&ko_state->shared_lock);
+	if (pending_context) {
+		int64 now = GetCurrentTimestamp();
+		if (pending.serial != last_trace_serial || now < last_trace_us
+			|| now - last_trace_us >= INT64CONST(1000000)) {
+			last_trace_serial = pending.serial;
+			last_trace_us = now;
+			ereport(LOG, (errmsg("KO normal-stop retained context"),
+				errdetail("reason=%s locator=%u/%u/%u slot=%u serial=" UINT64_FORMAT
+				" batch=" UINT64_FORMAT " operation=%u pending=%u failed=%u pid=%d"
+				" observed=%u sampled_pg_us=" INT64_FORMAT " phase=%u step=%u provider_step=%u cursor=%u prefix=%u"
+				" local_result=%u selections=" UINT64_FORMAT " gate_observed=%u gate=%u/" UINT64_FORMAT
+				"/" UINT64_FORMAT " revision=" UINT64_FORMAT "/" UINT64_FORMAT
+				" fork=%d io_attempted=%u io_error=%d",
+				why, pending.locator.spcOid, pending.locator.dbOid, pending.locator.relNumber,
+				pending.slot, pending.serial, pending.batch, pending.operation, pending.drop_pending,
+				pending.failed, pending.pid, pending.observed, pending.observed_pg_us,
+				pending.phase, pending.step, pending.provider_step, pending.cursor,
+				pending.prefix_cursor, pending.local_result,
+				pending.selections, pending.gate_observed, pending.gate_phase, pending.gate_formation,
+				pending.gate_freeze, pending.revision, pending.current_revision, pending.forknum,
+				pending.io_attempted, pending.io_error)));
+		}
+	}
 	for (int i = 1; i < CLUSTER_KO_NATIVE_FAIL_COUNT; i++)
 		ko_native_failure_log(&failures[i], "normal_stop");
 	if (reason != NULL)
@@ -8125,6 +8291,7 @@ ko_native_origin_discard_v4(ClusterKoCompletionV2 *owned, ClusterKoNativeContinu
 		bool cut_current;
 		uint32 final_predicate = 0;
 
+		CHECK_FOR_INTERRUPTS();
 		ResetLatch(MyLatch);
 		cluster_ko_origin_discard_detail_v1(NULL);
 		revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
@@ -8167,7 +8334,13 @@ ko_native_origin_discard_v4(ClusterKoCompletionV2 *owned, ClusterKoNativeContinu
 			if (result != CLUSTER_BUFFER_DRAIN_EMPTY) {
 				ko_origin_discard_record(result == CLUSTER_BUFFER_DRAIN_MORE
 					? CLUSTER_KO_DISCARD_BUFFER_MORE : CLUSTER_KO_DISCARD_BUFFER_WAIT,
-					true, owned, phase, cursor, revision, saved_revision, wb_revision, &gate, 0);
+					result != CLUSTER_BUFFER_DRAIN_MORE, owned, phase, cursor,
+					revision, saved_revision, wb_revision, &gate, 0);
+				if (result == CLUSTER_BUFFER_DRAIN_MORE) {
+					if (cursor <= start)
+						return false;
+					continue;
+				}
 				goto wait;
 			}
 			/* A returned physical prefix is not permission for the next
@@ -8214,9 +8387,11 @@ ko_native_origin_discard_v4(ClusterKoCompletionV2 *owned, ClusterKoNativeContinu
 				goto wait;
 			}
 			if (result == CLUSTER_PCM_PI_RELATION_MORE) {
-				ko_origin_discard_record(CLUSTER_KO_DISCARD_PI_MORE, true, owned, phase, cursor,
+				ko_origin_discard_record(CLUSTER_KO_DISCARD_PI_MORE, false, owned, phase, cursor,
 					revision, saved_revision, wb_revision, &gate, 0);
-				goto wait;
+				if (cursor <= start)
+					return false;
+				continue;
 			}
 			phase = 2;
 		}

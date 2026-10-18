@@ -1007,6 +1007,23 @@ uint64 cluster_ko_native_count(void);
 uint64 cluster_ko_lockfail_count(void);
 uint64 cluster_ko_peer_apply_count(void);
 uint64 cluster_ko_inbound_full_count(void);
+static bool dump_drop_trace;
+bool
+cluster_ko_drop_pending_v1(ClusterKoDropTraceV1 *out)
+{
+	if (!dump_drop_trace || out == NULL) return false;
+	memset(out, 0, sizeof(*out));
+	out->locator = (RelFileLocator){1663, 5, 16385};
+	out->serial = 42;
+	out->batch = 12;
+	out->observed = out->gate_observed = out->io_attempted = true;
+	out->phase = CLUSTER_KO_DROP_TRACE_PROVIDER;
+	out->step = 8;
+	out->cursor = 2048;
+	out->io_error = EIO;
+	out->forknum = -1;
+	return true;
+}
 uint64 cluster_ko_origin_checkpoint_restart_count(const char *reason);
 uint64 cluster_ko_origin_checkpoint_wait_count(const char *reason);
 const char *cluster_ko_origin_checkpoint_reason_name(ClusterKoOriginCheckpointReason reason);
@@ -5600,6 +5617,30 @@ UT_TEST(test_debug_dump_exposes_exact_current_protocol_debt_gauges)
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_invalid_debt_count"), "19");
 }
 
+UT_TEST(test_debug_dump_exposes_native_drop_context_and_real_io_observation)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	const char *const keys[] = {"drop_pending_locator", "drop_pending_serial",
+		"drop_pending_batch", "drop_pending_phase", "drop_pending_step",
+		"drop_pending_cursor", "drop_pending_io_attempted", "drop_pending_io_error",
+		"drop_pending_forknum"};
+	const char *const values[] = {"1663/5/16385", "42", "12", "3", "8",
+		"2048", "1", "5", "-1"};
+	memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+	memset(&rsinfo, 0, sizeof(rsinfo));
+	captured_dump_row_count = captured_formatted_value_count = 0;
+	fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+	dump_drop_trace = true;
+	(void)cluster_dump_state(fcinfo);
+	dump_drop_trace = false;
+	for (unsigned i = 0; i < lengthof(keys); i++) {
+		UT_ASSERT_EQ(captured_dump_count("ko", keys[i]), 1);
+		if (captured_dump_count("ko", keys[i]) == 1)
+			UT_ASSERT_STR_EQ(captured_dump_value("ko", keys[i]), values[i]);
+	}
+}
+
 UT_TEST(test_debug_dump_exposes_pcm_first_refusal_identity_and_subpredicate)
 {
 	LOCAL_FCINFO(fcinfo, 0);
@@ -6311,7 +6352,8 @@ UT_TEST(test_debug_phase_symbol_present)
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(25);
+	UT_RUN(test_debug_dump_exposes_native_drop_context_and_real_io_observation);
 	UT_RUN(test_debug_dump_exposes_pcm_first_refusal_identity_and_subpredicate);
 	UT_RUN(test_debug_dump_normal_completion_never_fabricates_unready_proof);
 	UT_RUN(test_debug_dump_srf_linkable);

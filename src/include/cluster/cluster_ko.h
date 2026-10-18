@@ -660,6 +660,30 @@ extern bool cluster_ko_shared_drop_work_abandon_next_v2(uint32 *cursor, Size sto
  * pathname operations. Success consumes the work, admits the original
  * structural PI consumer, and grants no MAIN/WAL reclamation authority. */
 extern bool cluster_ko_shared_drop_work_finish_v2(ClusterKoDropWorkV2 **work);
+
+/* Volatile diagnostics of the original CP file responsibility; no authority. */
+typedef struct ClusterKoDropTraceV1 {
+	RelFileLocator locator;
+	uint32 slot;
+	int32 pid;
+	uint64 serial, batch;
+	uint32 operation;
+	uint32 phase, step, provider_step, cursor, prefix_cursor, local_result;
+	uint32 gate_phase;
+	uint64 revision, current_revision, gate_formation, gate_freeze, selections;
+	int64 observed_pg_us;
+	int32 forknum, io_error;
+	bool observed, gate_observed, io_attempted, drop_pending, failed;
+} ClusterKoDropTraceV1;
+
+#define CLUSTER_KO_DROP_TRACE_CONTEXT 1
+#define CLUSTER_KO_DROP_TRACE_LOCAL 2
+#define CLUSTER_KO_DROP_TRACE_PROVIDER 3
+#define CLUSTER_KO_DROP_TRACE_FINISH 4
+
+extern bool cluster_ko_drop_pending_v1(ClusterKoDropTraceV1 *out);
+extern void cluster_ko_drop_work_note_v1(ClusterKoDropWorkV2 *work, uint32 phase,
+	uint32 step, ForkNumber fork, bool io_attempted, int io_error);
 /* End only this node's original background work, after its complete local
  * responsibility scan and, for an origin, all peer ownership handoffs.
  * Other accepted owners retain their own work. No global retirement or
