@@ -3487,7 +3487,9 @@ cluster_typed_replay_space_step(ClusterColdTypedReplay *rep, uint32 participant,
 /* Every scheduled record already succeeded and all sources were drained
  * by the original sequencer. A final DROP's complete COMMIT has therefore
  * deleted SPACE in this invocation: sync and recheck its result, never
- * reinstall the deleted fork. This does not authorize replay from absent SPACE. */
+ * reinstall the deleted fork. A final CREATE/ADVANCE may instead have been
+ * consumed by its exact native ABORT; its original owner checks that result.
+ * Neither check authorizes replay from absent SPACE. */
 static bool
 cluster_typed_replay_space_final(void *arg, uint32 relation)
 {
@@ -3495,6 +3497,7 @@ cluster_typed_replay_space_final(void *arg, uint32 relation)
 	RelFileLocator locator;
 	uint32		count = 0;
 	ClusterColdSpaceInputV1 last;
+	bool		aborted = false;
 
 	if (!cluster_cold_plan_space_relation_v1(rep->typed->plan, relation, &locator, &count) ||
 		count == 0 ||
@@ -3525,6 +3528,10 @@ cluster_typed_replay_space_final(void *arg, uint32 relation)
 		source.end_rec_ptr = last.end_rec_ptr;
 		return cluster_space_cold_drop_sync_v1(&key, &input, &source);
 	}
+	if (!cluster_cold_typed_space_abort_final_v1(rep->typed, relation, &aborted))
+		return false;
+	if (aborted)
+		return true;
 	cluster_typed_replay_space_install(rep, relation, count - 1, false);
 	return true;
 }

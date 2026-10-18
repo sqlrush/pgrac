@@ -2327,6 +2327,12 @@ test_cluster_space_cache: test_cluster_space_cache.c unit_test.h test_cluster_sp
 test_cluster_space_cleanout_product.o: $(top_srcdir)/src/backend/cluster/cluster_itl_cleanout.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
+test_cluster_cold_space_final_product.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_space.c \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
+		$(top_srcdir)/src/include/cluster/cluster_space_recovery.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
 test_cluster_space_recovery_product.o: $(top_srcdir)/src/backend/cluster/cluster_space_recovery.c \
 		$(top_srcdir)/src/include/cluster/cluster_grd.h \
         $(top_srcdir)/src/include/cluster/cluster_ges_handoff.h \
@@ -2462,9 +2468,10 @@ test_cluster_sync_error: test_cluster_sync_error.c test_cluster_page_data.c \
 test_cluster_shared_fs test_cluster_smgr test_cluster_shared_fs_sharedfs test_cluster_shared_fs_block_device test_cluster_shared_fs_drop test_cluster_shared_fs_cold_drop: test_cluster_data_sync_policy.inc
 
 test_cluster_space_recovery: test_cluster_space_recovery.c unit_test.h test_cluster_space_recovery_flush.inc \
+		test_cluster_cold_space_final_product.o \
 		test_cluster_space_recovery_product.o test_cluster_space_storage_product.o $(CLUSTER_HW_O) $(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_recovery_product.o test_cluster_space_storage_product.o $(CLUSTER_HW_O) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_cold_space_final_product.o test_cluster_space_recovery_product.o test_cluster_space_storage_product.o $(CLUSTER_HW_O) \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) $(CLUSTER_WAL_CLAIM_O) \
 		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \

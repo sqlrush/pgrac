@@ -47,6 +47,14 @@ extern bool cluster_space_recovery_cold_drop_already_v1(const ClusterSpaceIdenti
 extern bool cluster_space_recovery_cold_abort_preflight_v1(const RfSideOnlinePlanV1 *side,
 														   uint32 index, uint32 relation);
 
+/* Read-only final physical result of one original native ABORT item, under
+ * its sealed CREATE/ADVANCE ancestry and original complete cold source owner.
+ * Requires occupied empty MAIN and every auxiliary absent. This is a result
+ * check only: caller must have executed the original sequencer and drained all
+ * sources. It grants no retry, deletion, durability or recovery completion. */
+extern bool cluster_space_recovery_cold_abort_result_v1(const RfSideOnlinePlanV1 *side,
+														uint32 index, uint32 relation);
+
 /* Execute only the original ABORT's qualified native pending-delete group.
  * Sync the retained source before native unlink, retain occupied MAIN and
  * verify/sync the complete physical result and directory. No TT/CLOG or
