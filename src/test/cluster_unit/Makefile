@@ -3805,9 +3805,9 @@ test_cluster_control_walr.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_ret
 test_cluster_control_ir_plan.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
 	awk '/^#define CLUSTER_RECOVERY_FENCE_PLAN_MAGIC/ { print; constants++ } \
 	     /^typedef struct ClusterRecoveryFenceOrigin \{/ || /^struct ClusterRecoveryFencePlan \{/ { emit=1; types++ } \
-	     /^(recovery_fence_plan_valid|recovery_fence_plan_release_members|recovery_fence_plan_find_origin|cluster_recovery_merge_fence_plan_acquire_serial|cluster_recovery_merge_fence_plan_revalidate_nowait|cluster_recovery_merge_fence_plan_authority|cluster_recovery_merge_fence_plan_release_serial|cluster_recovery_merge_fence_plan_destroy)\(/ { print prev; emit=1; count++ } \
+	     /^(recovery_fence_plan_acquire_serial_inputs|recovery_fence_plan_valid|recovery_fence_plan_release_members|recovery_fence_plan_find_origin|cluster_recovery_merge_fence_plan_acquire_serial|cluster_recovery_merge_fence_plan_acquire_serial_inputs_v1|cluster_recovery_merge_fence_plan_revalidate_nowait|cluster_recovery_merge_fence_plan_authority|cluster_recovery_merge_fence_plan_release_serial|cluster_recovery_merge_fence_plan_destroy)\(/ { print prev; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
-	     END { if (constants != 1 || types != 2 || count != 8) exit 1 }' $< > $@.tmp
+	     END { if (constants != 1 || types != 2 || count != 10) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_control_ir: test_cluster_control_ir.c test_cluster_cf_enqueue.c unit_test.h \

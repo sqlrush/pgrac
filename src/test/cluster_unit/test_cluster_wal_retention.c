@@ -3394,6 +3394,202 @@ UT_TEST(test_pending_pin_refuses_stale_or_mixed_inputs_before_retaining_owner)
 	}
 }
 
+static ClusterWalRetentionPinThreadRequest
+input_pin_request(uint16 thread, ClusterWalRetentionInterval *interval)
+{
+	*interval = (ClusterWalRetentionInterval){ .thread_id = thread, .tli = 1,
+		.start_lsn = TEST_WAL_SEG_SIZE, .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	return make_pin_request(thread, interval, 1);
+}
+
+UT_TEST(test_input_pin_orders_union_and_keeps_original_ir_subset)
+{
+	const uint16 threads[] = { 1, 2, 3, 4 };
+	ClusterWalRetentionInterval intervals[2];
+	ClusterWalRetentionPinThreadRequest requests[2];
+	ClusterRecoverySerialGuardSet serial = { 0 };
+	ClusterRecoverySerialGuard *borrowed[4] = { NULL };
+	ClusterWalRetentionPin *pin = NULL, *borrow = NULL;
+	uint16 count = 0;
+
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	requests[0] = input_pin_request(2, &intervals[0]);
+	requests[1] = input_pin_request(4, &intervals[1]);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire_inputs_v1(requests, 2, threads, 4, &pin),
+				 CLUSTER_WAL_PIN_OK);
+	if (pin == NULL)
+		return;
+	UT_ASSERT_EQ(fake_acquire_call_count, 4);
+	for (unsigned i = 0; i < 4; i++) {
+		UT_ASSERT_EQ(fake_acquire_requests[i].resid.field1, threads[i]);
+		UT_ASSERT_EQ(fake_acquire_requests[i].lockmode, ShareLock);
+	}
+	serial.count = 2;
+	for (unsigned i = 0; i < 2; i++) {
+		serial.guards[i] = make_serial_guard(&requests[i]);
+		serial.guards[i].mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+	}
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_set(pin, &serial), CLUSTER_WAL_PIN_OK);
+	if (pin == NULL)
+		return;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_borrow_cold_v1(&borrow, borrowed, 4, &count),
+				 CLUSTER_WAL_PIN_OK);
+	if (pin == NULL)
+		return;
+	UT_ASSERT(borrow == pin);
+	UT_ASSERT_EQ(count, 2);
+	UT_ASSERT(borrowed[0] == &serial.guards[0] && borrowed[1] == &serial.guards[1]);
+	UT_ASSERT_NULL(borrowed[2]);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin), CLUSTER_WAL_PIN_OK);
+	if (pin == NULL)
+		return;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(fake_release_call_count, 4);
+	for (unsigned i = 0; i < 4; i++)
+		UT_ASSERT_EQ(fake_release_threads[i], threads[3 - i]);
+	reset_pin_fakes();
+}
+
+UT_TEST(test_input_pin_refuses_bad_or_incomplete_sets_before_io)
+{
+	const uint16 invalid[][2] = { { 2, 1 }, { 2, 2 }, { 0, 2 }, { 2, 129 }, { 1, 3 } };
+	ClusterWalRetentionInterval interval;
+	ClusterWalRetentionPinThreadRequest request = input_pin_request(2, &interval);
+	ClusterWalRetentionPin *pin = NULL;
+
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	for (unsigned i = 0; i < lengthof(invalid); i++)
+		UT_ASSERT_EQ(cluster_wal_retention_pin_acquire_inputs_v1(&request, 1, invalid[i], 2, &pin),
+					 CLUSTER_WAL_PIN_INVALID);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire_inputs_v1(&request, 1, NULL, 0, &pin),
+				 CLUSTER_WAL_PIN_INVALID);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire_inputs_v1(&request, 1, invalid[0], 129, &pin),
+				 CLUSTER_WAL_PIN_INVALID);
+	UT_ASSERT_NULL(pin);
+	UT_ASSERT_EQ(fake_acquire_call_count, 0);
+	reset_pin_fakes();
+}
+
+UT_TEST(test_input_pin_unwinds_each_partial_union_grant)
+{
+	const uint16 threads[] = { 1, 2, 3, 4 };
+	ClusterWalRetentionInterval interval;
+	ClusterWalRetentionPinThreadRequest request = input_pin_request(2, &interval);
+
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ClusterWalRetentionPin *pin = NULL;
+		reset_pin_fakes();
+		cluster_shared_config = true;
+		fake_acquire_result_count = 4;
+		fake_acquire_results[fault] = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+		UT_ASSERT_EQ(cluster_wal_retention_pin_acquire_inputs_v1(&request, 1, threads, 4, &pin),
+					 CLUSTER_WAL_PIN_UNAVAILABLE);
+		UT_ASSERT_NULL(pin);
+		UT_ASSERT_EQ(fake_acquire_call_count, fault + 1);
+		UT_ASSERT_EQ(fake_release_call_count, fault);
+		for (unsigned i = 0; i < fault; i++)
+			UT_ASSERT_EQ(fake_release_threads[i], threads[fault - i - 1]);
+		UT_ASSERT_FALSE(cluster_wal_retention_active_pin_present());
+	}
+	reset_pin_fakes();
+}
+
+UT_TEST(test_input_pin_checks_extra_owners_before_bind_and_after_ir)
+{
+	const uint16 threads[] = { 1, 2, 3 };
+	ClusterWalRetentionInterval interval;
+	ClusterWalRetentionPinThreadRequest request = input_pin_request(2, &interval);
+	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
+
+	for (unsigned phase = 0; phase < 3; phase++) {
+		ClusterWalRetentionPin *pin = NULL;
+		reset_pin_fakes();
+		cluster_shared_config = true;
+		UT_ASSERT_EQ(cluster_wal_retention_pin_acquire_inputs_v1(&request, 1, threads, 3, &pin),
+					 CLUSTER_WAL_PIN_OK);
+		if (pin == NULL)
+			return;
+		if (phase == 2)
+			UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
+		fake_control_owner_stale_thread = 3;
+		if (phase == 0)
+			UT_ASSERT_EQ(cluster_wal_retention_pin_preflight_revalidate_wait_v1(pin),
+						 CLUSTER_WAL_PIN_STALE);
+		else if (phase == 1)
+			UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_STALE);
+		else
+			UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin), CLUSTER_WAL_PIN_STALE);
+		fake_control_owner_stale_thread = 0;
+		UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+		UT_ASSERT_EQ(fake_release_call_count, 3);
+	}
+	reset_pin_fakes();
+}
+
+UT_TEST(test_input_pin_uncertain_release_keeps_entire_cleanup_owner)
+{
+	const uint16 threads[] = { 1, 2, 3 };
+	ClusterWalRetentionInterval interval;
+	ClusterWalRetentionPinThreadRequest request = input_pin_request(2, &interval);
+	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
+	ClusterWalRetentionPin *pin = NULL, *other = NULL;
+
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire_inputs_v1(&request, 1, threads, 3, &pin),
+				 CLUSTER_WAL_PIN_OK);
+	if (pin == NULL)
+		return;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
+	if (pin == NULL)
+		return;
+	fake_release_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_UNCONFIRMED);
+	UT_ASSERT_NOT_NULL(pin);
+	UT_ASSERT_EQ(fake_release_call_count, 3);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin), CLUSTER_WAL_PIN_STALE);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire_inputs_v1(&request, 1, threads, 3, &other),
+				 CLUSTER_WAL_PIN_CAPACITY);
+	fake_release_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(fake_release_call_count, 6);
+	reset_pin_fakes();
+}
+
+UT_TEST(test_input_pin_error_cleanup_releases_granted_history)
+{
+	const uint16 threads[] = { 1, 2, 3 };
+	ClusterWalRetentionInterval interval;
+	ClusterWalRetentionPinThreadRequest request = input_pin_request(2, &interval);
+	ClusterWalRetentionPin *pin = NULL;
+	volatile bool caught = false;
+
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	fake_acquire_error_at = 3;
+	PG_TRY();
+	{
+		(void)cluster_wal_retention_pin_acquire_inputs_v1(&request, 1, threads, 3, &pin);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	if (!caught)
+		return;
+	fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
+								   fake_resource_release_arg);
+	UT_ASSERT_EQ(fake_release_call_count, 2);
+	UT_ASSERT_EQ(fake_release_threads[0], 2);
+	UT_ASSERT_EQ(fake_release_threads[1], 1);
+	UT_ASSERT_FALSE(cluster_wal_retention_active_pin_present());
+	reset_pin_fakes();
+}
+
 UT_TEST(test_read_pin_covers_sorted_threads_without_recovery_authority)
 {
 	uint16 threads[] = { 1, 3 };
@@ -3662,7 +3858,13 @@ main(int argc, char **argv)
 		return write_fixture_wal_segment(argc, argv);
 	if (argc != 1)
 		return 2;
-	UT_PLAN(74);
+	UT_PLAN(80);
+	UT_RUN(test_input_pin_orders_union_and_keeps_original_ir_subset);
+	UT_RUN(test_input_pin_refuses_bad_or_incomplete_sets_before_io);
+	UT_RUN(test_input_pin_unwinds_each_partial_union_grant);
+	UT_RUN(test_input_pin_checks_extra_owners_before_bind_and_after_ir);
+	UT_RUN(test_input_pin_uncertain_release_keeps_entire_cleanup_owner);
+	UT_RUN(test_input_pin_error_cleanup_releases_granted_history);
 	UT_RUN(test_cold_borrow_returns_original_complete_set_without_acquiring);
 	UT_RUN(test_cold_borrow_never_exports_a_partial_or_stale_set);
 	UT_RUN(test_cold_borrow_preserves_the_original_owner_and_closed_phase);

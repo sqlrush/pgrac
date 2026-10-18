@@ -96,6 +96,64 @@ UT_TEST(test_prepare_seals_own_and_fenced_generations)
  * participants with nothing to replay; they are scanned under the census
  * scope, which pass 1 releases before it returns.
  */
+UT_TEST(test_execution_pin_includes_history_only_thread_once_after_census_release)
+{
+	ClusterColdTypedV1 *typed;
+
+	fixture();
+	fence_count = 1;
+	history_generation(3, 9, 0x40, 0x80);
+	history_generation(2, 8, 0x20, 0x60);
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(typed->replay_count, 2);
+	UT_ASSERT_EQ(typed->participant_count, 4);
+	UT_ASSERT(cluster_cold_typed_acquire_serial_v1(typed, (ClusterRecoveryFencePlan *)1));
+	UT_ASSERT_EQ(serial_input_calls, 1);
+	UT_ASSERT_EQ(serial_input_count, 3);
+	for (unsigned i = 0; i < 3; i++)
+		UT_ASSERT_EQ(serial_input_threads[i], i + 1);
+	UT_ASSERT_EQ(census_begins, 2);
+	UT_ASSERT_EQ(census_releases, 2);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
+UT_TEST(test_execution_pin_refuses_changed_census_before_retention)
+{
+	ClusterColdTypedV1 *typed;
+
+	fixture();
+	history_generation(2, 9, 0x40, 0x80);
+	typed = prepare(0x800);
+	census_input_fault = 4;
+	census_fault_index = 11;
+	UT_ASSERT(!cluster_cold_typed_acquire_serial_v1(typed, (ClusterRecoveryFencePlan *)1));
+	UT_ASSERT_EQ(serial_input_calls, 0);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
+	UT_ASSERT(!typed->history_xid[3].begun);
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
+UT_TEST(test_execution_pin_acquire_failure_is_sticky_and_discards_counters)
+{
+	ClusterColdTypedV1 *typed;
+
+	fixture();
+	history_generation(2, 9, 0x40, 0x80);
+	typed = prepare(0x800);
+	serial_input_ok = false;
+	UT_ASSERT(!cluster_cold_typed_acquire_serial_v1(typed, (ClusterRecoveryFencePlan *)1));
+	UT_ASSERT_EQ(serial_input_calls, 1);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
+	UT_ASSERT(!typed->census_root_captured);
+	UT_ASSERT(!typed->history_xid[3].begun);
+	serial_input_ok = true;
+	UT_ASSERT(!cluster_cold_typed_acquire_serial_v1(typed, (ClusterRecoveryFencePlan *)1));
+	UT_ASSERT_EQ(serial_input_calls, 1);
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
 UT_TEST(test_prepare_takes_history_generations_from_the_census)
 {
 	ClusterColdTypedV1 *typed;
@@ -2759,7 +2817,10 @@ UT_TEST(test_checkpoint_export_clears_unsealed_and_failed_output)
 int
 main(void)
 {
-	UT_PLAN(81);
+	UT_PLAN(84);
+	UT_RUN(test_execution_pin_includes_history_only_thread_once_after_census_release);
+	UT_RUN(test_execution_pin_refuses_changed_census_before_retention);
+	UT_RUN(test_execution_pin_acquire_failure_is_sticky_and_discards_counters);
 	UT_RUN(test_census_recheck_keeps_current_closed_history);
 	UT_RUN(test_census_root_capture_failure_discards_history);
 	UT_RUN(test_census_recheck_preserves_original_history_inputs_only);

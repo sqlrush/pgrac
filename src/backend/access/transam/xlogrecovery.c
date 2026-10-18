@@ -3182,13 +3182,9 @@ cluster_recovery_typed_begin(ClusterRecoveryFencePlan **fence_plan)
 	if (!cluster_cold_typed_ready_v1(typed, &handshake, readiness, sizeof(readiness)))
 		cluster_recovery_typed_fail(fence_plan, &typed,
 									"typed cold recovery cannot replay this plan yet", readiness);
-	/* Reopen/release the original census read owner before taking any
-	 * execution pin or IR. This is metadata freshness, not execution proof. */
-	if (!cluster_cold_typed_recheck_inputs_v1(typed))
-		cluster_recovery_typed_fail(fence_plan, &typed,
-									"cold recovery retained inputs changed before execution",
-									typed->refusal_detail);
-	serial_acquired = cluster_recovery_merge_fence_plan_acquire_serial(*fence_plan);
+	/* Recheck/release the census, then retain all physical input threads
+	 * before taking the unchanged foreign-origin IR set. */
+	serial_acquired = cluster_cold_typed_acquire_serial_v1(typed, *fence_plan);
 	if (serial_acquired)
 		plan_committed = cluster_recovery_merge_commit_plan_nowait(*fence_plan);
 	if (!serial_acquired || !plan_committed)

@@ -53,6 +53,7 @@
 #include "cluster/cluster_page_cold_redo.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_recovery_merge.h"
+#include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_wal_tail.h"
 #include "cluster/cluster_wal_thread.h"
 #include "storage/bufpage.h"
@@ -594,6 +595,56 @@ cluster_cold_typed_recheck_inputs_v1(ClusterColdTypedV1 *typed)
 	typed->refusal = CLUSTER_COLD_OK;
 	typed->refusal_detail[0] = '\0';
 	return true;
+}
+
+bool
+cluster_cold_typed_acquire_serial_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
+{
+	bool selected[CLUSTER_WAL_RETENTION_MAX_THREADS + 1] = { false };
+	uint16 threads[CLUSTER_WAL_RETENTION_MAX_THREADS];
+	uint16 count = 0;
+	bool acquired = false;
+
+	if (typed == NULL)
+		return false;
+	if (fence == NULL || !cluster_cold_typed_recheck_inputs_v1(typed))
+		goto refused;
+	for (uint32 i = 0; i < typed->participant_count; i++) {
+		uint16 thread = typed->participants[i].thread_id;
+
+		if (thread == 0 || thread > CLUSTER_WAL_RETENTION_MAX_THREADS
+			|| thread != typed->replay_roots[i].root.identity.origin_thread_id
+			|| thread != typed->sources[i].claim.identity.origin_thread_id)
+			goto refused;
+		selected[thread] = true;
+	}
+	for (uint16 thread = 1; thread <= CLUSTER_WAL_RETENTION_MAX_THREADS; thread++) {
+		if (selected[thread])
+			threads[count++] = thread;
+	}
+	cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "execution input retention is incomplete");
+	PG_TRY();
+	{
+		acquired = cluster_recovery_merge_fence_plan_acquire_serial_inputs_v1(fence, threads, count);
+	}
+	PG_CATCH();
+	{
+		memset(&typed->history_xid, 0, sizeof(typed->history_xid));
+		typed->census_root_captured = false;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!acquired)
+		goto refused;
+	typed->refusal = CLUSTER_COLD_OK;
+	typed->refusal_detail[0] = '\0';
+	return true;
+
+refused:
+	cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "execution input retention could not be established");
+	memset(&typed->history_xid, 0, sizeof(typed->history_xid));
+	typed->census_root_captured = false;
+	return false;
 }
 
 static bool cold_sources_match(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence);

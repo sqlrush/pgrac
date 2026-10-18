@@ -577,6 +577,24 @@ static ClusterWalInputV1 census_inputs[13];
 static int census_input_fault;
 static uint32 census_fault_index;
 
+static unsigned serial_input_calls;
+static uint16 serial_input_count, serial_input_threads[128];
+static bool serial_input_ok;
+
+bool
+cluster_recovery_merge_fence_plan_acquire_serial_inputs_v1(
+	ClusterRecoveryFencePlan *plan, const uint16 *threads, uint16 count)
+{
+	UT_ASSERT_NOT_NULL(plan);
+	UT_ASSERT_EQ(census_begins, census_releases);
+	UT_ASSERT(!cluster_cold_replay_window_active_v1());
+	serial_input_calls++;
+	serial_input_count = count;
+	UT_ASSERT(count <= lengthof(serial_input_threads));
+	memcpy(serial_input_threads, threads, count * sizeof(*threads));
+	return serial_input_ok;
+}
+
 static int history_scans;
 static uint32 history_scan_index;
 
@@ -1068,6 +1086,10 @@ static void
 fixture(void)
 {
 	uint16 thread;
+
+	serial_input_calls = serial_input_count = 0;
+	serial_input_ok = true;
+	memset(serial_input_threads, 0, sizeof(serial_input_threads));
 	tt_base_captures = tt_base_rechecks = tt_base_destroys = 0;
 	tt_base_participants = 0;
 	tt_base_budget = 0;

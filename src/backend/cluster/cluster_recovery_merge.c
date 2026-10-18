@@ -1537,8 +1537,9 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 	return CLUSTER_MERGE_ENGAGE;
 }
 
-bool
-cluster_recovery_merge_fence_plan_acquire_serial(ClusterRecoveryFencePlan *plan)
+static bool
+recovery_fence_plan_acquire_serial_inputs(ClusterRecoveryFencePlan *plan,
+									   const uint16 *input_threads, uint16 ninput_threads)
 {
 	ClusterRecoverySerialRequest *requests;
 	ClusterRecoverySerialAcquireResult result;
@@ -1570,9 +1571,16 @@ cluster_recovery_merge_fence_plan_acquire_serial(ClusterRecoveryFencePlan *plan)
 				break;
 			}
 		}
-		pin_result = valid ? cluster_wal_retention_pin_acquire(pin_requests, plan->origin_count,
-															   &plan->retention_pin)
-						   : CLUSTER_WAL_PIN_INVALID;
+		pin_result = CLUSTER_WAL_PIN_INVALID;
+		if (valid) {
+			if (ninput_threads != 0)
+				pin_result = cluster_wal_retention_pin_acquire_inputs_v1(
+					pin_requests, plan->origin_count, input_threads, ninput_threads,
+					&plan->retention_pin);
+			else
+				pin_result = cluster_wal_retention_pin_acquire(pin_requests, plan->origin_count,
+																 &plan->retention_pin);
+		}
 		pfree(intervals);
 		pfree(pin_requests);
 		if (pin_result != CLUSTER_WAL_PIN_OK)
@@ -1606,6 +1614,22 @@ cluster_recovery_merge_fence_plan_acquire_serial(ClusterRecoveryFencePlan *plan)
 		return false;
 	plan->serial_held = true;
 	return true;
+}
+
+bool
+cluster_recovery_merge_fence_plan_acquire_serial(ClusterRecoveryFencePlan *plan)
+{
+	return recovery_fence_plan_acquire_serial_inputs(plan, NULL, 0);
+}
+
+bool
+cluster_recovery_merge_fence_plan_acquire_serial_inputs_v1(
+	ClusterRecoveryFencePlan *plan, const uint16 *input_threads, uint16 ninput_threads)
+{
+	if (!cluster_shared_config || input_threads == NULL || ninput_threads == 0
+		|| ninput_threads > CLUSTER_WAL_STATE_SLOT_COUNT)
+		return false;
+	return recovery_fence_plan_acquire_serial_inputs(plan, input_threads, ninput_threads);
 }
 
 bool

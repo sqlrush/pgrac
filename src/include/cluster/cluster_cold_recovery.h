@@ -811,6 +811,11 @@ extern void cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed);
  * compare the complete selected ROOT and history checkpoints, then release
  * all read pins. Success is freshness input, not execution/durability proof. */
 extern bool cluster_cold_typed_recheck_inputs_v1(ClusterColdTypedV1 *typed);
+/* Recheck/release the original census, then retain every selected physical
+ * thread in the original execution owner before its unchanged foreign IR set.
+ * This does not qualify history durability, final freshness or endpoints. */
+extern bool cluster_cold_typed_acquire_serial_v1(ClusterColdTypedV1 *typed,
+												 struct ClusterRecoveryFencePlan *fence);
 
 /* Original native checkpoint input for any selected generation, including
  * history. Copies only sealed input; failure clears both outputs. This does

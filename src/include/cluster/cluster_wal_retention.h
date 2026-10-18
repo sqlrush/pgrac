@@ -346,6 +346,13 @@ extern ClusterWalrReleaseResult cluster_wal_read_pin_release_v1(ClusterWalReadPi
 extern ClusterWalPinResult
 cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *requests,
 								  uint16 nthreads, ClusterWalRetentionPin **out_pin);
+/* Acquire one ordered WALR-S union before IR. input_threads is the sorted,
+ * distinct physical source set and must contain every recovery request.
+ * Extra threads protect retained inputs only: they never add IR, recovery
+ * duties or publication authority. Qualify ROOT/claims/durability separately. */
+extern ClusterWalPinResult cluster_wal_retention_pin_acquire_inputs_v1(
+	const ClusterWalRetentionPinThreadRequest *requests, uint16 nthreads,
+	const uint16 *input_threads, uint16 ninput_threads, ClusterWalRetentionPin **out_pin);
 extern ClusterWalPinResult
 cluster_wal_retention_pin_bind_one(ClusterWalRetentionPin *pin,
 								   ClusterRecoverySerialGuard *held_serial);

@@ -509,6 +509,9 @@ extern ClusterMergeEngage
 cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo,
 										  ClusterRecoveryFencePlan **out_plan);
 extern bool cluster_recovery_merge_fence_plan_acquire_serial(ClusterRecoveryFencePlan *plan);
+/* Read-only input threads join this same pre-IR pin, never the IR set. */
+extern bool cluster_recovery_merge_fence_plan_acquire_serial_inputs_v1(
+	ClusterRecoveryFencePlan *plan, const uint16 *input_threads, uint16 ninput_threads);
 extern bool cluster_recovery_merge_commit_plan_nowait(ClusterRecoveryFencePlan *plan);
 extern bool cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *plan);
 extern uint16 cluster_recovery_merge_fence_plan_origin_count(const ClusterRecoveryFencePlan *plan);

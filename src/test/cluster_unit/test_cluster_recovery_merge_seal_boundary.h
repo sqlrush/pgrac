@@ -690,6 +690,15 @@ cluster_wal_retention_pin_acquire(
 }
 
 ClusterWalPinResult
+cluster_wal_retention_pin_acquire_inputs_v1(
+	const ClusterWalRetentionPinThreadRequest *requests pg_attribute_unused(),
+	uint16 nthreads pg_attribute_unused(), const uint16 *input_threads pg_attribute_unused(),
+	uint16 ninput_threads pg_attribute_unused(), ClusterWalRetentionPin **out_pin pg_attribute_unused())
+{
+	UNREACHED();
+}
+
+ClusterWalPinResult
 cluster_wal_retention_pin_bind_one(ClusterWalRetentionPin *pin pg_attribute_unused(),
 								   ClusterRecoverySerialGuard *held_serial pg_attribute_unused())
 {
