@@ -133,8 +133,8 @@ int cluster_adg_lease_takeover_grace_ms = 5000;
 int cluster_adg_barrier_interval_ms = 1000;
 int cluster_wal_sender_timeout_sec = 60;
 int cluster_wal_receiver_timeout_sec = 60;
-/* spec-6.12c: read-layer-3 resolver terminal memo (default OFF). */
-bool cluster_page_scn_shortcut = false;
+/* spec-6.12c: read-layer-3 resolver terminal memo (default ON). */
+bool cluster_page_scn_shortcut = true;
 /* spec-6.12a: quiescent-block S-cache via X->S downgrade (default OFF). */
 bool cluster_read_scache = false;
 /* spec-6.12e1: GES release-side handoff verify + counters (default OFF). */
@@ -1847,15 +1847,16 @@ cluster_init_guc(void)
 	 * replays them instead of repeating the TT overlay lookup for every
 	 * tuple.  Terminal outcomes are immutable, so the memo never answers
 	 * anything the same transaction's authoritative lookup did not
-	 * already answer.  Default OFF: resolver behaviour byte-identical to
-	 * the 5.59 baseline.  SUSET for measurement-window toggling (same
+	 * already answer.  Default ON: this exact terminal memo is the normal
+	 * read path; explicit OFF remains available for compatibility and
+	 * diagnostic comparisons.  SUSET for measurement-window toggling (same
 	 * rationale as cluster.xnode_profile).
 	 */
 	DefineCustomBoolVariable(
 		"cluster.page_scn_shortcut",
 		gettext_noop("Enable the cross-node visibility resolver terminal-outcome memo."),
-		gettext_noop("Off keeps the per-tuple TT lookup path byte-identical."),
-		&cluster_page_scn_shortcut, false, PGC_SUSET, 0, NULL, NULL, NULL);
+		gettext_noop("Off disables the memo for compatibility or diagnostic comparison; fail-closed checks remain active."),
+		&cluster_page_scn_shortcut, true, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/*
 	 * cluster.read_scache -- spec-6.12 wave a (read layer 1).  When on, a

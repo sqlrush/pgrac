@@ -120,6 +120,11 @@ int cluster_injection_armed_count = 0;
 int cluster_gcs_reply_timeout_ms = 1;
 static uint64 ut_lms_master_generation = (UINT64_C(1) << 32) | UINT64_C(1);
 static uint64 ut_master_session = 31;
+static uint32 ready_connection_generation = 61;
+static bool ready_peer_ok = true;
+static uint32 bootstrap_ingress_generation;
+static unsigned bootstrap_ack_count;
+static ResourceXDecodedFrame bootstrap_last_ack;
 uint64
 cluster_qvotec_get_self_incarnation(void)
 {
@@ -4002,7 +4007,8 @@ UT_TEST(test_resource_x_bootstrap_terminal_retire_clears_binding_not_floor)
 	UT_ASSERT_EQ(ack.common.base_authority_generation, UINT64_C(2));
 }
 
-UT_TEST(test_resource_x_bootstrap_dispatches_one_current_base_at_a_time)
+static void
+check_resource_x_bootstrap_active_queue(int drift)
 {
 	BufferTag tag = make_tag(151);
 	ResourceXDecodedFrame first_request;
@@ -4040,8 +4046,11 @@ UT_TEST(test_resource_x_bootstrap_dispatches_one_current_base_at_a_time)
 				 RESOURCE_X_APPLY_BAD_STATE);
 	UT_ASSERT(memcmp(&second_ack, &zero_ack, sizeof(second_ack)) == 0);
 
-	/* The first otherwise-admissible rejection owns the single exact next
-	 * admission.  A later requester cannot overwrite that identity. */
+	/* Every otherwise-admissible node has one bounded queue item. Later
+	 * arrivals cannot overwrite or bypass the first retained identity. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(&third_request, 3, 63, 77, 31,
+																	 73, &second_ack),
+				 RESOURCE_X_APPLY_BAD_STATE);
 	stop_new_work_allowed = false;
 	stop_new_work_calls = 0;
 	memset(&second_ack, 0xa5, sizeof(second_ack));
@@ -4112,6 +4121,71 @@ UT_TEST(test_resource_x_bootstrap_dispatches_one_current_base_at_a_time)
 					 &assertion.common.logical_assertion, 41, &snapshot),
 				 RESOURCE_X_APPLY_APPLIED);
 
+	/* A retained successor must become LMS work without another requester
+	 * packet or advancing the 500ms physical-loss clock. */
+	{
+		ResourceXIntentSlot slot;
+		ResourceXAcquisitionRef delivery;
+		ResourceXIntentProbeResult result = RESOURCE_X_INTENT_PROBE_IDLE;
+		uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
+		uint32 examined;
+		ResourceXBootstrapWork work;
+		ResourceXBootstrapWork stale;
+
+		for (int i = 0; i < 32; i++) {
+			result = cluster_pcm_lock_resource_x_outbound_work_probe_exact(
+				1, &slot, payload, sizeof(payload), &examined, &delivery);
+			UT_ASSERT(examined <= 1);
+			UT_ASSERT(result != RESOURCE_X_INTENT_PROBE_CORRUPT);
+			if (result == RESOURCE_X_INTENT_PROBE_BOOTSTRAP
+				|| result == RESOURCE_X_INTENT_PROBE_IDLE
+				|| result == RESOURCE_X_INTENT_PROBE_COMPLETE)
+				break;
+		}
+		UT_ASSERT_EQ(result, RESOURCE_X_INTENT_PROBE_BOOTSTRAP);
+		memcpy(&work, payload, sizeof(work));
+		UT_ASSERT_EQ(work.request.logical_assertion.requester_node, 2);
+		/* A late scan snapshot cannot delete a different exact queue item. */
+		stale = work;
+		stale.enqueue_order++;
+		cluster_pcm_lock_resource_x_bootstrap_forget_exact(&stale);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_resume_exact(&stale, &replay_ack),
+					 RESOURCE_X_APPLY_STALE);
+		ready_connection_generation = 72;
+		bootstrap_ingress_generation = 62;
+		bootstrap_ack_count = 0;
+		ready_peer_ok = false;
+		UT_ASSERT_EQ(cluster_gcs_block_resource_x_bootstrap_tick(&work),
+					 RESOURCE_X_APPLY_BAD_STATE);
+		UT_ASSERT_EQ(bootstrap_ack_count, 0);
+		ready_peer_ok = true;
+		if (drift != 0) {
+			if (drift == 1)
+				bootstrap_ingress_generation++;
+			else
+				ready_connection_generation++;
+			UT_ASSERT_EQ(cluster_gcs_block_resource_x_bootstrap_tick(&work),
+						 RESOURCE_X_APPLY_STALE);
+			UT_ASSERT_EQ(bootstrap_ack_count, 0);
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_resume_exact(&work, &replay_ack),
+						 RESOURCE_X_APPLY_STALE);
+			ready_connection_generation = 61;
+			bootstrap_ingress_generation = 0;
+			/* Invalidating the old head exposes the next retained requester. */
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+							 &third_request, 3, 63, 77, 31, 73, &replay_ack),
+						 RESOURCE_X_APPLY_APPLIED);
+			UT_ASSERT_EQ(replay_ack.common.base_authority_generation, UINT64_C(2));
+			return;
+		}
+		UT_ASSERT_EQ(cluster_gcs_block_resource_x_bootstrap_tick(&work), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(bootstrap_ack_count, 1);
+		UT_ASSERT_EQ(bootstrap_last_ack.common.logical_assertion.requester_node, 2);
+		UT_ASSERT_EQ(bootstrap_last_ack.common.base_authority_generation, UINT64_C(2));
+		ready_connection_generation = 61;
+		bootstrap_ingress_generation = 0;
+	}
+
 	/* Retirement does not let a fresh contender bypass the retained exact
 	 * successor.  The priority never froze base 1: only the exact successor
 	 * replay may now sample current base 2 and create an ordinary receipt. */
@@ -4123,9 +4197,24 @@ UT_TEST(test_resource_x_bootstrap_dispatches_one_current_base_at_a_time)
 
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(&second_request, 2, 62, 77, 31,
 																	 72, &second_ack),
-				 RESOURCE_X_APPLY_APPLIED);
+				 RESOURCE_X_APPLY_DUPLICATE);
 	UT_ASSERT_EQ(second_ack.common.base_authority_generation, UINT64_C(2));
 	UT_ASSERT_EQ(stop_new_work_calls, 0);
+}
+
+UT_TEST(test_resource_x_bootstrap_dispatches_one_current_base_at_a_time)
+{
+	check_resource_x_bootstrap_active_queue(0);
+}
+
+UT_TEST(test_resource_x_bootstrap_active_queue_rejects_ingress_drift)
+{
+	check_resource_x_bootstrap_active_queue(1);
+}
+
+UT_TEST(test_resource_x_bootstrap_active_queue_rejects_outbound_drift)
+{
+	check_resource_x_bootstrap_active_queue(2);
 }
 
 UT_TEST(test_resource_x_bootstrap_r8_clears_old_binding_not_attempt_floor)
@@ -14455,7 +14544,6 @@ UT_TEST(test_resource_x_gcs_predecessor_reobserve_is_not_authority)
  * suite. Synthetic endless-probe mode tests just the scheduler's16 bound. */
 BackendType MyBackendType = B_LMS;
 int cluster_lms_workers = 2;
-static bool ready_peer_ok = true;
 static bool ready_ring_full;
 static bool ready_interleave_once;
 static bool ready_stale_interleave_once;
@@ -14467,7 +14555,7 @@ static bool
 gcs_block_pcm_x_resource_x_peer_ready_exact(int32 node, uint32 *connection)
 {
 	UT_ASSERT(node >= 0 && node < RESOURCE_X_PROTOCOL_NODE_LIMIT);
-	*connection = 61;
+	*connection = ready_connection_generation;
 	return ready_peer_ok;
 }
 
@@ -16539,6 +16627,14 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 type, uint32 dest, const void *pa
 {
 	ResourceXDecodedFrame frame;
 	ResourceXWireReject reject;
+	if (type == RESOURCE_X_MSG_IMAGE_OR_GRANT) {
+		UT_ASSERT(cluster_resource_x_wire_decode(type, payload, length, &frame, &reject));
+		UT_ASSERT_EQ(frame.kind, RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP);
+		UT_ASSERT_EQ(dest, frame.common.logical_assertion.requester_node);
+		bootstrap_last_ack = frame;
+		bootstrap_ack_count++;
+		return true;
+	}
 	UT_ASSERT_EQ(type, RESOURCE_X_MSG_BLOCKED_TO_N);
 	UT_ASSERT_EQ(dest, 0);
 	UT_ASSERT(cluster_resource_x_wire_decode(type, payload, length, &frame, &reject));
@@ -23039,6 +23135,26 @@ cluster_bufmgr_read_storage_image_for_resource_x(BufferTag tag, char *image,
  * proof bytes, the callback, directory rechecks and grant intent are real. */
 #include "test_cluster_pcm_master_durable.inc"
 
+uint64
+cluster_epoch_get_current(void)
+{
+	return 17;
+}
+
+ClusterSemanticResourceXPeerOpenResult
+cluster_semantic_activation_resource_x_peer_open_check(const ClusterSemanticAdmissionToken *token,
+													   int32 node, uint32 generation)
+{
+	UT_ASSERT(token->entered);
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	UT_ASSERT(node >= 0 && node < RESOURCE_X_PROTOCOL_NODE_LIMIT);
+	return bootstrap_ingress_generation == 0 || generation == bootstrap_ingress_generation
+			   ? CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH
+			   : CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_DRIFT;
+}
+
+#include "test_cluster_pcm_bootstrap_tick.inc"
+
 static uint64
 lms_outbound_monotonic_us(void)
 {
@@ -23838,7 +23954,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(361);
+	UT_PLAN(363);
 	/* Observe the actual startup state before any runtime fixture overrides
 	 * the postmaster GUC or initializes shared PCM state and counters. */
 	UT_RUN(test_pcm_grd_max_entries_default_is_minus_one);
@@ -23928,6 +24044,8 @@ main(void)
 	UT_RUN(test_resource_x_bootstrap_receipt_drift_invalidates_but_keeps_floor);
 	UT_RUN(test_resource_x_bootstrap_terminal_retire_clears_binding_not_floor);
 	UT_RUN(test_resource_x_bootstrap_dispatches_one_current_base_at_a_time);
+	UT_RUN(test_resource_x_bootstrap_active_queue_rejects_ingress_drift);
+	UT_RUN(test_resource_x_bootstrap_active_queue_rejects_outbound_drift);
 	UT_RUN(test_resource_x_bootstrap_r8_clears_old_binding_not_attempt_floor);
 	UT_RUN(test_resource_x_bootstrap_round_fans_in_and_retries_same_attempt);
 	UT_RUN(test_resource_x_node_fanin_ignores_caller_deadline_and_retry_slice);

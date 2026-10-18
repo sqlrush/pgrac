@@ -88,7 +88,7 @@
 
 #define PGRAC_RESOURCE_X_RETAINED_SENDER_GENERATION UINT32_C(1)
 #define PGRAC_RESOURCE_X_OUTBOUND_OWNER_SLOTS (RESOURCE_X_PROTOCOL_NODE_LIMIT + 5)
-#define PGRAC_RESOURCE_X_WORK_OWNER_SLOTS (PGRAC_RESOURCE_X_OUTBOUND_OWNER_SLOTS + 4)
+#define PGRAC_RESOURCE_X_WORK_OWNER_SLOTS (PGRAC_RESOURCE_X_OUTBOUND_OWNER_SLOTS + 5)
 #define PGRAC_RESOURCE_X_PROOF_DIGEST_OFFSET UINT64_C(1469598103934665603)
 #define PGRAC_RESOURCE_X_PROOF_DIGEST_PRIME UINT64_C(1099511628211)
 #define PGRAC_RESOURCE_X_NATIVE_INITIAL_FORMATION UINT64_C(1)
@@ -569,11 +569,12 @@ typedef struct ClusterPcmResourceXTerminalTombstone {
 #define RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY UINT8_C(0)
 #define RESOURCE_X_BOOTSTRAP_PRIORITY_NEXT_ADMISSION UINT8_C(1)
 
-/* PGRAC adaptation: one bounded non-authority successor identity per
- * resource.  It retains neither an ACK nor a sampled authority base. */
+/* PGRAC adaptation: one bounded non-authority successor per requester
+ * node, ordered by arrival. No queued item owns an ACK or authority base. */
 typedef struct ClusterPcmResourceXBootstrapPriority {
 	ResourceXDecodedCommon request;
 	uint64 r4_record_generation;
+	uint64 enqueue_order;
 	uint32 authenticated_ingress_connection_generation;
 	uint32 master_sender_connection_generation;
 	uint8 state;
@@ -699,7 +700,7 @@ typedef struct ClusterPcmResourceXMasterState {
 	uint64 holder_pair_drained_master_session;
 	int32 holder_pair_drained_master_node;
 	uint32 holder_pair_drained_reserved;
-	ClusterPcmResourceXBootstrapPriority bootstrap_priority;
+	ClusterPcmResourceXBootstrapPriority bootstrap_priority[RESOURCE_X_PROTOCOL_NODE_LIMIT];
 	ClusterPcmResourceXBootstrapReceipt bootstrap_receipts[RESOURCE_X_PROTOCOL_NODE_LIMIT];
 	ClusterPcmResourceXMasterRequest requests[RESOURCE_X_PROTOCOL_NODE_LIMIT];
 	ClusterPcmResourceXTerminalTombstone terminal_tombstone;
@@ -724,8 +725,8 @@ StaticAssertDecl(sizeof(ClusterPcmResourceXMasterRequest) == 352,
 				 "Resource-X master request must retain exact grant physical lineage");
 StaticAssertDecl(sizeof(ClusterPcmResourceXTerminalTombstone) == 360,
 				 "Resource-X terminal tombstone must retain the complete grant");
-StaticAssertDecl(sizeof(ClusterPcmResourceXBootstrapPriority) == 120,
-				 "Resource-X bootstrap priority layout must remain 120 bytes");
+StaticAssertDecl(sizeof(ClusterPcmResourceXBootstrapPriority) == 128,
+				 "Resource-X bootstrap queue item must remain bounded");
 StaticAssertDecl(sizeof(ClusterPcmResourceXBootstrapReceipt) == 224,
 				 "Resource-X bootstrap receipt layout must remain 224 bytes");
 StaticAssertDecl(sizeof(ClusterPcmResourceXControlIntent) == 408,
@@ -742,7 +743,7 @@ StaticAssertDecl(sizeof(ClusterPcmResourceXRequesterJoin) == 9120,
 				 "Resource-X requester join layout must remain 9120 bytes");
 StaticAssertDecl(sizeof(ClusterPcmResourceXDeferredSettlement) == 160,
 				 "Resource-X deferred settlement must remain bounded");
-StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 45984,
+StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 49960,
 				 "D4 Resource-X master state must bind object generation");
 
 typedef struct ClusterPcmShared {
@@ -946,6 +947,12 @@ pcm_resource_x_bootstrap_receipt_invalidate(ClusterPcmResourceXBootstrapReceipt 
 static bool
 pcm_resource_x_bootstrap_priority_valid(const ClusterPcmResourceXBootstrapPriority *priority);
 static void pcm_resource_x_bootstrap_priority_clear(ClusterPcmResourceXBootstrapPriority *priority);
+static bool pcm_resource_x_bootstrap_queue_empty(const ClusterPcmResourceXMasterState *state);
+static bool pcm_resource_x_bootstrap_queue_valid(const ClusterPcmResourceXMasterState *state,
+												 const BufferTag *tag);
+static const ClusterPcmResourceXBootstrapPriority *
+pcm_resource_x_bootstrap_queue_head(const ClusterPcmResourceXMasterState *state);
+
 static uint64 pcm_resource_x_source_fence_get_u64(const uint8 *bytes);
 static ResourceXApplyResult pcm_resource_x_holder_pair_precedes_local_bootstrap_locked(
 	struct GrdEntry *entry, int32 current_master_node, uint64 current_master_session,
@@ -2089,8 +2096,7 @@ pcm_entry_retire_eligible_locked(struct GrdEntry *entry, uint64 expected_generat
 		*why = PCM_RETIRE_REFUSAL_REQUESTER_NOT_TERMINAL;
 		return false;
 	}
-	if (!pcm_resource_x_bootstrap_priority_valid(&state->bootstrap_priority)
-		|| state->bootstrap_priority.state != RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY
+	if (!pcm_resource_x_bootstrap_queue_empty(state)
 		|| state->grant_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
 		|| state->authority_generation == 0 || state->authority_generation == UINT64_MAX
 		|| state->next_enqueue_order == 0 || state->next_enqueue_order == UINT64_MAX) {
@@ -2522,27 +2528,33 @@ pcm_resource_x_reconfig_proof_slot_locked(struct GrdEntry *entry,
 		digest = pcm_resource_x_proof_digest_u64(digest, (uint64)local_owner->state);
 	}
 
-	priority = &state->bootstrap_priority;
-	if (!pcm_resource_x_bootstrap_priority_valid(priority))
-		return false;
-	digest = pcm_resource_x_proof_digest_u64(digest, (uint64)priority->state);
-	if (priority->state == RESOURCE_X_BOOTSTRAP_PRIORITY_NEXT_ADMISSION) {
-		if (!BufferTagsEqual(&priority->request.logical_assertion.resource, &entry->tag)
-			|| (priority->request.resource_formation != token->old_formation
-				&& priority->request.resource_formation != token->new_formation))
+	for (requester_node = 0; requester_node < RESOURCE_X_PROTOCOL_NODE_LIMIT; requester_node++) {
+		priority = &state->bootstrap_priority[requester_node];
+		if (!pcm_resource_x_bootstrap_priority_valid(priority)
+			|| (priority->state != RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY
+				&& priority->request.logical_assertion.requester_node != requester_node))
 			return false;
-		if (priority->request.resource_formation == token->old_formation)
-			*old_residual_out = true;
-		digest = pcm_resource_x_proof_digest_u64(digest, priority->request.resource_formation);
-		digest = pcm_resource_x_proof_digest_u64(digest, priority->request.assertion_sequence);
-		digest = pcm_resource_x_proof_digest_u64(
-			digest, (uint64)(uint32)priority->request.logical_assertion.requester_node);
-		digest = pcm_resource_x_proof_digest_u64(digest, priority->r4_record_generation);
-		digest = pcm_resource_x_proof_digest_u64(
-			digest, (uint64)priority->authenticated_ingress_connection_generation);
-		digest = pcm_resource_x_proof_digest_u64(
-			digest, (uint64)priority->master_sender_connection_generation);
-		digest = pcm_resource_x_proof_digest_u64(digest, (uint64)priority->request.semantic_crc32c);
+		digest = pcm_resource_x_proof_digest_u64(digest, (uint64)priority->state);
+		digest = pcm_resource_x_proof_digest_u64(digest, priority->enqueue_order);
+		if (priority->state == RESOURCE_X_BOOTSTRAP_PRIORITY_NEXT_ADMISSION) {
+			if (!BufferTagsEqual(&priority->request.logical_assertion.resource, &entry->tag)
+				|| (priority->request.resource_formation != token->old_formation
+					&& priority->request.resource_formation != token->new_formation))
+				return false;
+			if (priority->request.resource_formation == token->old_formation)
+				*old_residual_out = true;
+			digest = pcm_resource_x_proof_digest_u64(digest, priority->request.resource_formation);
+			digest = pcm_resource_x_proof_digest_u64(digest, priority->request.assertion_sequence);
+			digest = pcm_resource_x_proof_digest_u64(
+				digest, (uint64)(uint32)priority->request.logical_assertion.requester_node);
+			digest = pcm_resource_x_proof_digest_u64(digest, priority->r4_record_generation);
+			digest = pcm_resource_x_proof_digest_u64(
+				digest, (uint64)priority->authenticated_ingress_connection_generation);
+			digest = pcm_resource_x_proof_digest_u64(
+				digest, (uint64)priority->master_sender_connection_generation);
+			digest = pcm_resource_x_proof_digest_u64(digest,
+													 (uint64)priority->request.semantic_crc32c);
+		}
 	}
 
 	for (requester_node = 0; requester_node < RESOURCE_X_PROTOCOL_NODE_LIMIT; requester_node++) {
@@ -3330,24 +3342,29 @@ cluster_resource_x_reconfig_sweep(const ResourceXReconfigToken *token, uint32 pr
 			&& source_settlement.common.resource_formation == token->old_formation)
 			memset(&master_state->source_settlement, 0, sizeof(master_state->source_settlement));
 		bootstrap_priority_invalidated = false;
-		if (!pcm_resource_x_bootstrap_priority_valid(&master_state->bootstrap_priority)
-			|| (master_state->bootstrap_priority.state != RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY
-				&& (!BufferTagsEqual(
-						&master_state->bootstrap_priority.request.logical_assertion.resource,
-						&entry->tag)
-					|| (master_state->bootstrap_priority.request.resource_formation
-							!= token->old_formation
-						&& master_state->bootstrap_priority.request.resource_formation
-							   != token->new_formation)))) {
-			LWLockRelease(&entry->entry_lock.lock);
-			pcm_resource_x_reconfig_block();
-			return pcm_resource_x_reconfig_return_release(&entry_ref, RESOURCE_X_RECONFIG_CORRUPT);
-		}
-		if (master_state->bootstrap_priority.state == RESOURCE_X_BOOTSTRAP_PRIORITY_NEXT_ADMISSION
-			&& master_state->bootstrap_priority.request.resource_formation
-				   == token->old_formation) {
-			pcm_resource_x_bootstrap_priority_clear(&master_state->bootstrap_priority);
-			bootstrap_priority_invalidated = true;
+		for (bootstrap_requester_node = 0;
+			 bootstrap_requester_node < RESOURCE_X_PROTOCOL_NODE_LIMIT;
+			 bootstrap_requester_node++) {
+			ClusterPcmResourceXBootstrapPriority *priority
+				= &master_state->bootstrap_priority[bootstrap_requester_node];
+			if (!pcm_resource_x_bootstrap_priority_valid(priority)
+				|| (priority->state != RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY
+					&& (priority->request.logical_assertion.requester_node
+							!= bootstrap_requester_node
+						|| !BufferTagsEqual(&priority->request.logical_assertion.resource,
+											&entry->tag)
+						|| (priority->request.resource_formation != token->old_formation
+							&& priority->request.resource_formation != token->new_formation)))) {
+				LWLockRelease(&entry->entry_lock.lock);
+				pcm_resource_x_reconfig_block();
+				return pcm_resource_x_reconfig_return_release(&entry_ref,
+															  RESOURCE_X_RECONFIG_CORRUPT);
+			}
+			if (priority->state == RESOURCE_X_BOOTSTRAP_PRIORITY_NEXT_ADMISSION
+				&& priority->request.resource_formation == token->old_formation) {
+				pcm_resource_x_bootstrap_priority_clear(priority);
+				bootstrap_priority_invalidated = true;
+			}
 		}
 		bootstrap_receipt_invalidated = false;
 		for (bootstrap_requester_node = 0;
@@ -3909,8 +3926,7 @@ pcm_resource_x_terminal_state_locked(struct GrdEntry *entry,
 		|| state->grant_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
 		|| state->requester_settlement_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
 		|| !pcm_resource_x_requester_join_empty_locked(&state->requester_join)
-		|| !pcm_resource_x_bootstrap_priority_valid(&state->bootstrap_priority)
-		|| state->bootstrap_priority.state != RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY)
+		|| !pcm_resource_x_bootstrap_queue_empty(state))
 		return pcm_protocol_refuse(diagnostic, 205, __LINE__, -1);
 	if (!pcm_resource_x_settlement_retry_decode_locked(entry, state, NULL)
 		|| state->settlement_retry.pending
@@ -8977,7 +8993,9 @@ pcm_normal_stop_refusal_values_locked(struct GrdEntry *entry, PcmNormalStopRefus
 	f->retry_pending = state->settlement_retry.pending;
 	f->retry_running = state->settlement_retry.running;
 	f->source_settlement = state->source_settlement.state;
-	f->priority = state->bootstrap_priority.state;
+	f->priority = pcm_resource_x_bootstrap_queue_empty(state)
+					  ? RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY
+					  : RESOURCE_X_BOOTSTRAP_PRIORITY_NEXT_ADMISSION;
 	if (f->node >= 0 && f->node < RESOURCE_X_PROTOCOL_NODE_LIMIT)
 		request_node = f->node;
 	else if (state->terminal_tombstone.valid == 1)
@@ -9390,9 +9408,9 @@ pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out, b
 		else if (state->source_settlement.state == RESOURCE_X_SOURCE_SETTLEMENT_PENDING)
 			retained = true;
 
-		if (!pcm_resource_x_bootstrap_priority_valid(&state->bootstrap_priority))
+		if (!pcm_resource_x_bootstrap_queue_valid(state, &entry->tag))
 			PCM_PROTOCOL_INVALID(111, -1);
-		else if (state->bootstrap_priority.state != RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY)
+		else if (!pcm_resource_x_bootstrap_queue_empty(state))
 			retained = true;
 
 		for (node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
@@ -11279,7 +11297,7 @@ pcm_resource_x_role_pending_locked(struct GrdEntry *entry,
 				PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_BLOCK_INTENT);
 			}
 		}
-		if (state->bootstrap_priority.state != RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY) {
+		if (!pcm_resource_x_bootstrap_queue_empty(state)) {
 			directory = true;
 			PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_BOOTSTRAP_RECEIPT);
 		}
@@ -18426,6 +18444,7 @@ pcm_resource_x_bootstrap_priority_valid(const ClusterPcmResourceXBootstrapPriori
 		   && request->outcome == RESOURCE_X_OUTCOME_NONE
 		   && (request->flags == 0 || request->flags == RESOURCE_X_COMMON_FLAG_REMOTE_ADMISSION)
 		   && priority->r4_record_generation != 0 && priority->r4_record_generation != UINT64_MAX
+		   && priority->enqueue_order != 0 && priority->enqueue_order != UINT64_MAX
 		   && priority->authenticated_ingress_connection_generation != 0
 		   && priority->authenticated_ingress_connection_generation != UINT32_MAX
 		   && priority->master_sender_connection_generation != 0
@@ -18436,7 +18455,68 @@ static void
 pcm_resource_x_bootstrap_priority_clear(ClusterPcmResourceXBootstrapPriority *priority)
 {
 	Assert(priority != NULL);
-	memset(priority, 0, sizeof(*priority));
+	if (priority->state != RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY) {
+		memset(priority, 0, sizeof(*priority));
+		pcm_resource_x_intent_mark_dirty();
+	} else
+		memset(priority, 0, sizeof(*priority));
+}
+
+static bool
+pcm_resource_x_bootstrap_queue_empty(const ClusterPcmResourceXMasterState *state)
+{
+	for (int32 node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++)
+		if (!pcm_resource_x_bootstrap_priority_valid(&state->bootstrap_priority[node])
+			|| state->bootstrap_priority[node].state != RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY)
+			return false;
+	return true;
+}
+
+static bool
+pcm_resource_x_bootstrap_queue_valid(const ClusterPcmResourceXMasterState *state,
+									 const BufferTag *tag)
+{
+	for (int32 node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
+		const ClusterPcmResourceXBootstrapPriority *priority = &state->bootstrap_priority[node];
+		if (!pcm_resource_x_bootstrap_priority_valid(priority))
+			return false;
+		if (priority->state != RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY
+			&& (priority->request.logical_assertion.requester_node != node
+				|| !BufferTagsEqual(&priority->request.logical_assertion.resource, tag)
+				|| priority->enqueue_order >= state->next_enqueue_order))
+			return false;
+	}
+	return true;
+}
+
+/* Caller validates the queue under the same entry lock. */
+static const ClusterPcmResourceXBootstrapPriority *
+pcm_resource_x_bootstrap_queue_head(const ClusterPcmResourceXMasterState *state)
+{
+	const ClusterPcmResourceXBootstrapPriority *head = NULL;
+	for (int32 node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
+		const ClusterPcmResourceXBootstrapPriority *priority = &state->bootstrap_priority[node];
+		if (priority->state == RESOURCE_X_BOOTSTRAP_PRIORITY_NEXT_ADMISSION
+			&& (head == NULL || priority->enqueue_order < head->enqueue_order))
+			head = priority;
+	}
+	return head;
+}
+
+static bool
+pcm_resource_x_bootstrap_work_matches(const ClusterPcmResourceXMasterState *state,
+									  const ClusterPcmResourceXBootstrapPriority *priority,
+									  const ResourceXBootstrapWork *work)
+{
+	return priority->state == RESOURCE_X_BOOTSTRAP_PRIORITY_NEXT_ADMISSION
+		   && state->binding_generation == work->binding_generation
+		   && priority->enqueue_order == work->enqueue_order
+		   && pcm_resource_x_common_equal(&priority->request, &work->request)
+		   && priority->r4_record_generation == work->r4_record_generation
+		   && priority->authenticated_ingress_connection_generation
+				  == work->authenticated_ingress_connection_generation
+		   && priority->master_sender_connection_generation
+				  == work->master_sender_connection_generation;
 }
 
 static void
@@ -18550,8 +18630,8 @@ pcm_resource_x_dispatch_diagnostic_should_log(void)
  * and retired with its canonical request, issuing another requester an ACK
  * for the same base would create two independently valid ASSERT candidates.
  * Serialize that non-authority dispatch using the fixed receipt/request
- * state; the separate single NEXT_ADMISSION identity provides bounded
- * priority without retaining a base or ACK. */
+ * state; the per-node NEXT_ADMISSION queue retains arrival order
+ * without retaining a base or ACK. */
 static PcmResourceXBootstrapDispatchState
 pcm_resource_x_bootstrap_dispatch_state_locked(struct GrdEntry *entry,
 											   const ClusterPcmResourceXMasterState *state,
@@ -18566,7 +18646,8 @@ pcm_resource_x_bootstrap_dispatch_state_locked(struct GrdEntry *entry,
 	Assert(entry != NULL);
 	Assert(state != NULL);
 	Assert(requester_node >= 0 && requester_node < RESOURCE_X_PROTOCOL_NODE_LIMIT);
-	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED)
+		   || LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
 	requester_bit = UINT32_C(1) << (uint32)requester_node;
 	if (!pcm_resource_x_source_settlement_debt_decode_locked(entry, state, &source_settlement))
 		return PCM_RESOURCE_X_BOOTSTRAP_DISPATCH_CORRUPT;
@@ -18954,14 +19035,15 @@ pcm_resource_x_admitted_assertion_snapshot(const ClusterPcmResourceXBootstrapRec
 	out->common.semantic_crc32c = 0;
 }
 
-ResourceXApplyResult
-cluster_pcm_lock_resource_x_bootstrap_request_exact(
+static ResourceXApplyResult
+pcm_resource_x_bootstrap_request(
 	const ResourceXDecodedFrame *request, int32 authenticated_source_node,
 	uint32 authenticated_ingress_connection_generation, uint64 r4_record_generation,
 	uint64 current_master_session_incarnation, uint32 master_sender_connection_generation,
-	ResourceXDecodedFrame *ack_out)
+	const ResourceXBootstrapWork *queued_work, ResourceXDecodedFrame *ack_out)
 {
 	ClusterPcmResourceXBootstrapPriority *priority;
+	const ClusterPcmResourceXBootstrapPriority *head;
 	ClusterPcmResourceXBootstrapReceipt *receipt;
 	ClusterPcmResourceXMasterRequest *master_request;
 	ClusterPcmResourceXMasterState *state;
@@ -19007,14 +19089,17 @@ cluster_pcm_lock_resource_x_bootstrap_request_exact(
 		pcm_entry_ref_release(&entry_ref);
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
-	priority = &state->bootstrap_priority;
-	if (!pcm_resource_x_bootstrap_priority_valid(priority)
-		|| (priority->state == RESOURCE_X_BOOTSTRAP_PRIORITY_NEXT_ADMISSION
-			&& !BufferTagsEqual(&priority->request.logical_assertion.resource, &entry->tag))) {
-		pcm_resource_x_bootstrap_priority_clear(priority);
+	priority = &state->bootstrap_priority[requester_node];
+	if (!pcm_resource_x_bootstrap_queue_valid(state, &entry->tag)) {
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	if (queued_work != NULL
+		&& !pcm_resource_x_bootstrap_work_matches(state, priority, queued_work)) {
+		LWLockRelease(&entry->entry_lock.lock);
+		pcm_entry_ref_release(&entry_ref);
+		return RESOURCE_X_APPLY_STALE;
 	}
 	if (priority->state == RESOURCE_X_BOOTSTRAP_PRIORITY_NEXT_ADMISSION
 		&& (priority->request.resource_formation != gate_formation
@@ -19110,24 +19195,31 @@ cluster_pcm_lock_resource_x_bootstrap_request_exact(
 		if (dispatch_state == PCM_RESOURCE_X_BOOTSTRAP_DISPATCH_CORRUPT) {
 			pcm_resource_x_bootstrap_priority_clear(priority);
 			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-		} else if (dispatch_state == PCM_RESOURCE_X_BOOTSTRAP_DISPATCH_SOURCE_INELIGIBLE)
+		} else if (dispatch_state == PCM_RESOURCE_X_BOOTSTRAP_DISPATCH_SOURCE_INELIGIBLE) {
+			/* A type-17/source release can cancel this attempt. Never leave
+			 * such an identity at the head of the retained queue. */
+			if (priority_exact_wire)
+				pcm_resource_x_bootstrap_priority_clear(priority);
 			result = RESOURCE_X_APPLY_BAD_STATE;
-		else if (dispatch_state == PCM_RESOURCE_X_BOOTSTRAP_DISPATCH_OCCUPIED) {
-			/* Only a new successor is an admission. An already retained
-			 * exact priority remains owned work and keeps its original path. */
+		} else if ((head = pcm_resource_x_bootstrap_queue_head(state)),
+				   dispatch_state == PCM_RESOURCE_X_BOOTSTRAP_DISPATCH_OCCUPIED
+					   || (head != NULL && head != priority)) {
 			if (priority->state == RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY
+				&& state->next_enqueue_order != UINT64_MAX
 				&& cluster_normal_stop_service_new_work(true)) {
 				pcm_resource_x_common_copy(&priority->request, &request->common);
 				priority->r4_record_generation = r4_record_generation;
+				priority->enqueue_order = state->next_enqueue_order++;
 				priority->authenticated_ingress_connection_generation
 					= authenticated_ingress_connection_generation;
 				priority->master_sender_connection_generation = master_sender_connection_generation;
 				priority->state = RESOURCE_X_BOOTSTRAP_PRIORITY_NEXT_ADMISSION;
+				pcm_resource_x_intent_mark_dirty();
 			}
 			result = RESOURCE_X_APPLY_BAD_STATE;
 		} else if (priority->state == RESOURCE_X_BOOTSTRAP_PRIORITY_NEXT_ADMISSION
 				   && !priority_exact_wire)
-			result = RESOURCE_X_APPLY_BAD_STATE;
+			result = RESOURCE_X_APPLY_STALE;
 		else if (!priority_exact_wire && !cluster_normal_stop_service_new_work(true))
 			result = RESOURCE_X_APPLY_BAD_STATE;
 		else {
@@ -19170,6 +19262,62 @@ cluster_pcm_lock_resource_x_bootstrap_request_exact(
 	LWLockRelease(&entry->entry_lock.lock);
 	pcm_entry_ref_release(&entry_ref);
 	return result;
+}
+
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_bootstrap_request_exact(
+	const ResourceXDecodedFrame *request, int32 authenticated_source_node,
+	uint32 authenticated_ingress_connection_generation, uint64 r4_record_generation,
+	uint64 current_master_session_incarnation, uint32 master_sender_connection_generation,
+	ResourceXDecodedFrame *ack_out)
+{
+	return pcm_resource_x_bootstrap_request(
+		request, authenticated_source_node, authenticated_ingress_connection_generation,
+		r4_record_generation, current_master_session_incarnation,
+		master_sender_connection_generation, NULL, ack_out);
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_bootstrap_resume_exact(const ResourceXBootstrapWork *work,
+												   ResourceXDecodedFrame *ack_out)
+{
+	ResourceXDecodedFrame request;
+	if (work == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	memset(&request, 0, sizeof(request));
+	request.kind = RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP;
+	request.payload_bytes = RESOURCE_X_CONTROL_V1_BYTES;
+	pcm_resource_x_common_copy(&request.common, &work->request);
+	return pcm_resource_x_bootstrap_request(
+		&request, request.common.logical_assertion.requester_node,
+		work->authenticated_ingress_connection_generation, work->r4_record_generation,
+		request.common.master_session_incarnation, work->master_sender_connection_generation, work,
+		ack_out);
+}
+
+void
+cluster_pcm_lock_resource_x_bootstrap_forget_exact(const ResourceXBootstrapWork *work)
+{
+	PcmEntryRef entry_ref;
+	PcmEntryAcquireResult acquire_result;
+	struct GrdEntry *entry;
+	ClusterPcmResourceXMasterState *state;
+	ClusterPcmResourceXBootstrapPriority *priority;
+	if (work == NULL || !resource_x_assertion_valid(&work->request.logical_assertion)
+		|| !pcm_entry_ref_acquire(&work->request.logical_assertion.resource, false, &entry_ref,
+								  &acquire_result))
+		return;
+	entry = entry_ref.entry;
+	pcm_entry_lock_exclusive(entry);
+	state = pcm_resource_x_master_state_for_entry(entry);
+	if (state != NULL) {
+		priority = &state->bootstrap_priority[work->request.logical_assertion.requester_node];
+		if (pcm_resource_x_bootstrap_work_matches(state, priority, work))
+			pcm_resource_x_bootstrap_priority_clear(priority);
+	}
+	LWLockRelease(&entry->entry_lock.lock);
+	pcm_entry_ref_release(&entry_ref);
 }
 
 bool
@@ -24990,6 +25138,8 @@ cluster_pcm_lock_resource_x_settled_retire_exact(const ResourceXAssertion *asser
 		receipt->highest_attempt_floor = assertion_sequence;
 	pcm_resource_x_bootstrap_receipt_invalidate(receipt);
 	memset(request, 0, sizeof(*request));
+	if (!pcm_resource_x_bootstrap_queue_empty(state))
+		pcm_resource_x_intent_mark_dirty();
 	LWLockRelease(&entry->entry_lock.lock);
 	pcm_entry_ref_release(&entry_ref);
 	return RESOURCE_X_APPLY_APPLIED;
@@ -25901,6 +26051,44 @@ cluster_pcm_lock_resource_x_outbound_work_probe_exact(uint32 probe_budget,
 			ResourceXIntentSlot *slot;
 			uint8 *payload;
 
+			if (owner_index == PGRAC_RESOURCE_X_OUTBOUND_OWNER_SLOTS + 4) {
+				const ClusterPcmResourceXBootstrapPriority *head;
+				ResourceXBootstrapWork work;
+				if (!pcm_resource_x_bootstrap_queue_valid(state, &entry->tag)) {
+					LWLockRelease(&entry->entry_lock.lock);
+					pcm_entry_ref_release(&entry_ref);
+					return RESOURCE_X_INTENT_PROBE_CORRUPT;
+				}
+				head = pcm_resource_x_bootstrap_queue_head(state);
+				if (head == NULL)
+					continue;
+				if (!pcm_resource_x_intent_mark_pending(false)) {
+					LWLockRelease(&entry->entry_lock.lock);
+					pcm_entry_ref_release(&entry_ref);
+					return RESOURCE_X_INTENT_PROBE_CORRUPT;
+				}
+				if (!cluster_pcm_lock_resource_x_gate_open_exact(head->request.resource_formation)
+					|| pcm_resource_x_bootstrap_dispatch_state_locked(
+						   entry, state, head->request.logical_assertion.requester_node)
+						   == PCM_RESOURCE_X_BOOTSTRAP_DISPATCH_OCCUPIED)
+					continue;
+				memset(&work, 0, sizeof(work));
+				pcm_resource_x_common_copy(&work.request, &head->request);
+				work.binding_generation = state->binding_generation;
+				work.enqueue_order = head->enqueue_order;
+				work.r4_record_generation = head->r4_record_generation;
+				work.authenticated_ingress_connection_generation
+					= head->authenticated_ingress_connection_generation;
+				work.master_sender_connection_generation
+					= head->master_sender_connection_generation;
+				memcpy(payload_out, &work, sizeof(work));
+				LWLockRelease(&entry->entry_lock.lock);
+				pcm_entry_ref_release(&entry_ref);
+				pg_atomic_write_u64(&ClusterPcm->resource_x_intent_next_state_index, cursor + 1);
+				pg_atomic_write_u32(&ClusterPcm->resource_x_intent_next_owner_index, 0);
+				*examined_out = examined;
+				return RESOURCE_X_INTENT_PROBE_BOOTSTRAP;
+			}
 			if (owner_index == PGRAC_RESOURCE_X_OUTBOUND_OWNER_SLOTS + 3) {
 				ResourceXMasterDurableWork work;
 
@@ -26653,6 +26841,8 @@ cluster_pcm_lock_resource_x_source_settlement_ack_exact(const ResourceXDecodedFr
 	}
 	memset(&debt->intent.slot, 0, sizeof(debt->intent.slot));
 	debt->state = RESOURCE_X_SOURCE_SETTLEMENT_ACKED;
+	if (!pcm_resource_x_bootstrap_queue_empty(state))
+		pcm_resource_x_intent_mark_dirty();
 	result = RESOURCE_X_APPLY_APPLIED;
 
 source_settlement_ack_done:

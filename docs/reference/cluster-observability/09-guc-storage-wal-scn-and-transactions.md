@@ -74,14 +74,14 @@ SELECT name, setting, unit, context, source, pending_restart FROM pg_settings WH
 | 属性 | 值 |
 |---|---|
 | 类型 | `bool` |
-| 默认值 | `false` |
+| 默认值 | `true` |
 | 范围/枚举 | on / off |
 | Context | `superuser` |
 | 生效方式 | 超级用户可在会话/系统范围修改 |
 | 单位 | — |
 | 内置短说明（与 `pg_settings.short_desc` 对应） | Enable the cross-node visibility resolver terminal-outcome memo. |
 
-工作原理与调节影响：开关 页面 / SCN / `shortcut` 路径。改变值只影响该开关明确覆盖的路径；安全拒绝条件不因关闭诊断开关而消失。
+工作原理与调节影响：默认开启页面 / SCN / `shortcut` 路径，在同一后端按精确事务身份复用已由权威 TT/undo 路径证明的 COMMITTED（含有效 SCN）或 ABORTED 终态，避免对同一事务逐行重复查询。UNKNOWN、进行中、身份不完整或身份域发生变化的结果不会缓存；安全拒绝条件不因关闭开关而消失。需要兼容旧逐 tuple 路径或做基线对比时才显式设为 `off`。
 
 依赖与保护：无额外配置钩子；组合约束仍可能在启动或运行入口检查。
 
