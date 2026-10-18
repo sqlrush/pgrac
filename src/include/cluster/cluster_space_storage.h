@@ -202,10 +202,11 @@ struct ClusterKoDirectoryIoV3;
 struct ClusterPageWalBindingV1;
 /* Same committed preparation and entered call; writes only its two existing
  * SPACE pages. Output is published after sync/readback and exact revalidation.
- * Refusal/ERROR leaves physical and native recovery responsibility intact. */
+ * Refusal/ERROR leaves physical and native recovery responsibility intact.
+ * Optional diagnostic_stage is caller-owned observation, never authority. */
 extern bool cluster_space_drop_complete_v4(const ClusterSpaceDropState *state,
 	const struct ClusterKoCompletionV2 *completion, const struct ClusterKoDirectoryIoV3 *call,
-	struct ClusterPageWalBindingV1 *terminal, void *wal);
+	struct ClusterPageWalBindingV1 *terminal, void *wal, uint32 *diagnostic_stage);
 extern bool cluster_space_drop_authorize(ClusterSpaceDropState *state);
 extern void cluster_space_drop_publish(ClusterSpaceDropState *state, XLogRecPtr commit_lsn);
 extern void cluster_space_drop_finish(ClusterSpaceDropState *state);

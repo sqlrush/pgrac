@@ -15,9 +15,9 @@ int space_storage_fixture_main(void);
 __attribute__((weak, noinline)) bool
 cluster_space_drop_complete_v4(const ClusterSpaceDropState *s,
  const ClusterKoCompletionV2 *c, const ClusterKoDirectoryIoV3 *i,
- ClusterPageWalBindingV1 *t, void *w)
+ ClusterPageWalBindingV1 *t, void *w, uint32 *d)
 {
- (void)s; (void)c; (void)i; (void)t; (void)w;
+ (void)s; (void)c; (void)i; (void)t; (void)w; (void)d;
  return false;
 }
 
@@ -27,6 +27,8 @@ static unsigned opens, closes, reads, writes, syncs, fence_checks, adg_checks;
 static unsigned fault, fail_at;
 static unsigned close_failures;
 static bool scope_current;
+static bool close_throws;
+static uint32 diagnostic_stage;
 static ClusterKoDirectoryIoV3 scope = { .slot = 2, .pid = 123, .serial = 7 };
 static ClusterSharedFsHandle *handle = (ClusterSharedFsHandle *)&disk;
 
@@ -109,7 +111,7 @@ cluster_shared_fs_close(ClusterSharedFsHandle *h)
 {
 	UT_ASSERT(h == handle);
 	closes++;
-	if (fault == 14) pg_re_throw();
+	if (fault == 14 || close_throws) pg_re_throw();
 	/* FileClose's non-temporary close failure uses this real native policy.
 	 * The provider/syscall remains a fixture; LOG deliberately returns. */
 	if (fault == 15) {
@@ -172,6 +174,8 @@ setup_committed(Relation *relation, bool missing)
 	opens=closes=reads=writes=syncs=fence_checks=adg_checks=0;
 	close_failures=0;
 	fault=fail_at=0;
+	close_throws=false;
+	diagnostic_stage=CLUSTER_KO_NATIVE_SPACE_NONE;
 	scope_current=true;
 	return state;
 }
@@ -180,7 +184,57 @@ static bool
 finish(ClusterSpaceDropState *state, ClusterPageWalBindingV1 *terminal, uint8 *wal)
 {
 	return cluster_space_drop_complete_v4(state, (ClusterKoCompletionV2 *)&ko_handle,
-			&scope, terminal, wal);
+			&scope, terminal, wal, &diagnostic_stage);
+}
+
+UT_TEST(test_final_space_reports_causal_substage_and_preserves_it_during_cleanup)
+{
+	const uint32 expected[] = { CLUSTER_KO_NATIVE_SPACE_NONE,
+		CLUSTER_KO_NATIVE_SPACE_COMMIT, CLUSTER_KO_NATIVE_SPACE_CURRENT,
+		CLUSTER_KO_NATIVE_SPACE_INPUT, CLUSTER_KO_NATIVE_SPACE_INPUT,
+		CLUSTER_KO_NATIVE_SPACE_INPUT, CLUSTER_KO_NATIVE_SPACE_PUBLICATION,
+		CLUSTER_KO_NATIVE_SPACE_PUBLICATION, CLUSTER_KO_NATIVE_SPACE_READBACK,
+		CLUSTER_KO_NATIVE_SPACE_PUBLICATION, CLUSTER_KO_NATIVE_SPACE_POSTCHECK,
+		CLUSTER_KO_NATIVE_SPACE_INPUT, CLUSTER_KO_NATIVE_SPACE_ENTERED_IO,
+		CLUSTER_KO_NATIVE_SPACE_COMMIT };
+
+	for (unsigned n = 0; n < lengthof(expected); n++) {
+		Relation rel;
+		ClusterSpaceDropState *state = setup_committed(&rel, n == 1);
+		ClusterPageWalBindingV1 terminal = {0};
+		uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES] = {0};
+		volatile bool caught = false, ok = false;
+
+		switch (n) {
+		case 2: scope_current = false; break;
+		case 3: state->entries[0]->result[0].data[BLCKSZ-1] ^= 1; break;
+		case 4: fault = 4; break;
+		case 5: disk[0].data[BLCKSZ-1] ^= 1; break;
+		case 6: fault = 11; fail_at = 1; break;
+		case 7: fault = 12; break;
+		case 8: fault = 7; fail_at = 3; break;
+		case 9: fault = 14; break;
+		case 10: fault = 8; fail_at = 6; break;
+		case 11: fault = 4; close_throws = true; break;
+		case 13: fault = 9; fail_at = 1; break;
+		}
+		expecting_error = true;
+		PG_TRY(); {
+			ok = n == 12 ? cluster_space_drop_complete_v4(state,
+				(ClusterKoCompletionV2 *)&ko_handle, NULL, &terminal, wal, &diagnostic_stage)
+				: finish(state, &terminal, wal);
+		} PG_CATCH(); { caught = true; } PG_END_TRY();
+		expecting_error = false;
+		UT_ASSERT_EQ(ok, n == 0);
+		UT_ASSERT_EQ(caught, n == 7 || n == 9 || n == 11);
+		UT_ASSERT_EQ(diagnostic_stage, expected[n]);
+		if (n != 0) {
+			UT_ASSERT_EQ(terminal.record_end, 0);
+			UT_ASSERT_EQ(wal[0], 0);
+		}
+		cluster_space_drop_finish(state);
+		FreeFakeRelcacheEntry(rel);
+	}
 }
 
 UT_TEST(test_final_space_uses_original_commit_without_buffer_current)
@@ -550,7 +604,8 @@ UT_TEST(test_final_space_accepts_same_commit_postimage_or_split_publication)
 }
 int main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(15);
+	UT_RUN(test_final_space_reports_causal_substage_and_preserves_it_during_cleanup);
 	UT_RUN(test_final_space_publishes_retained_bytes_after_cache_reuse);
 	UT_RUN(test_final_space_accepts_same_commit_postimage_or_split_publication);
 	UT_RUN(test_final_space_rejects_changed_retained_images_or_record_binding);

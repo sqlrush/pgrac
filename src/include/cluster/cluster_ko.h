@@ -846,6 +846,19 @@ typedef enum ClusterKoNativeFailureStage {
 	CLUSTER_KO_NATIVE_STAGE_PROMOTE
 } ClusterKoNativeFailureStage;
 
+/* Diagnostic-only final SPACE substages; stable IDs, never authority. */
+typedef enum ClusterKoNativeSpaceStage {
+	CLUSTER_KO_NATIVE_SPACE_NONE,
+	CLUSTER_KO_NATIVE_SPACE_ENTERED_IO,
+	CLUSTER_KO_NATIVE_SPACE_COMMIT,
+	CLUSTER_KO_NATIVE_SPACE_CURRENT,
+	CLUSTER_KO_NATIVE_SPACE_INPUT,
+	CLUSTER_KO_NATIVE_SPACE_PUBLICATION,
+	CLUSTER_KO_NATIVE_SPACE_READBACK,
+	CLUSTER_KO_NATIVE_SPACE_POSTCHECK,
+	CLUSTER_KO_NATIVE_SPACE_IO_END
+} ClusterKoNativeSpaceStage;
+
 /* Stable IDs for the seven original recovery_required writes. */
 typedef enum ClusterKoNativeFailureSite {
 	CLUSTER_KO_NATIVE_SITE_ABANDON = 1,
@@ -860,7 +873,7 @@ typedef enum ClusterKoNativeFailureSite {
 #define CLUSTER_KO_NATIVE_ERROR_SUMMARY_BYTES 192
 
 typedef struct ClusterKoNativeFailureV1 {
-	uint32 reason, stage, site;
+	uint32 reason, stage, site, space_stage;
 	char error_message[CLUSTER_KO_NATIVE_ERROR_SUMMARY_BYTES];
 	int32 sqlerrcode, pid, producer_pid;
 	uint32 slot, operation;

@@ -1260,18 +1260,30 @@ cluster_space_drop_committed_owner_v4(const ClusterSpaceDropState *state,
 	return matches == 1;
 }
 
+/* Optional caller-owned scratch only. It records the evaluating substage on
+ * ERROR and the first causal refusal on a normal false return. */
+static void
+space_committed_stage(uint32 *diagnostic_stage, uint32 stage)
+{
+	if (diagnostic_stage != NULL)
+		*diagnostic_stage = stage;
+}
+
 static bool
 space_committed_current(const ClusterSpaceDropState *state,
 	const ClusterKoCompletionV2 *completion, const ClusterKoDirectoryIoV3 *io,
-	const ClusterSpaceIdentity *expected)
+	const ClusterSpaceIdentity *expected, uint32 *diagnostic_stage, uint32 current_stage)
 {
 	ClusterWalSourceRef current;
 
-	return state->commit_attributed && !RecoveryInProgress()
+	space_committed_stage(diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_COMMIT);
+	if (!(state->commit_attributed && !RecoveryInProgress()
 		&& !XLogNeedsFlush(state->commit_lsn)
 		&& cluster_wal_thread_current_v2_ref(&current)
-		&& memcmp(&current, &state->commit_source, sizeof(current)) == 0
-		&& cluster_ko_native_space_current_v4(completion, io, expected);
+		&& memcmp(&current, &state->commit_source, sizeof(current)) == 0))
+		return false;
+	space_committed_stage(diagnostic_stage, current_stage);
+	return cluster_ko_native_space_current_v4(completion, io, expected);
 }
 
 /* The original COMMIT-bound retained pair owns publication. Disk input only
@@ -1320,7 +1332,7 @@ space_committed_disk_input(const ClusterSpaceStructureChange *change, unsigned b
 bool
 cluster_space_drop_complete_v4(const ClusterSpaceDropState *state,
 	const ClusterKoCompletionV2 *completion, const ClusterKoDirectoryIoV3 *io,
-	ClusterPageWalBindingV1 *terminal, void *wal)
+	ClusterPageWalBindingV1 *terminal, void *wal, uint32 *diagnostic_stage)
 {
 	const ClusterSpaceTruncateState *entry = NULL;
 	ClusterSpaceStructureChange change;
@@ -1329,12 +1341,19 @@ cluster_space_drop_complete_v4(const ClusterSpaceDropState *state,
 	PGIOAlignedBlock result[2], disk;
 	volatile bool ready = false;
 
-	if (io == NULL || terminal == NULL || wal == NULL
-		|| !cluster_space_drop_committed_owner_v4(state, completion))
+	space_committed_stage(diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_ENTERED_IO);
+	if (io == NULL)
+		return false;
+	space_committed_stage(diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_INPUT);
+	if (terminal == NULL || wal == NULL)
+		return false;
+	space_committed_stage(diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_COMMIT);
+	if (!cluster_space_drop_committed_owner_v4(state, completion))
 		return false;
 	/* FileClose may log and return after a failed close with this startup
 	 * setting. This consumer cannot certify that outcome. Refuse before
 	 * provider I/O; retain the original committed owner for recovery. */
+	space_committed_stage(diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_PUBLICATION);
 	if (data_sync_retry) {
 		ereport(LOG,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -1346,15 +1365,21 @@ cluster_space_drop_complete_v4(const ClusterSpaceDropState *state,
 	for (int i = 0; i < state->count; i++)
 		if (state->entries[i]->ko_completion == completion)
 			entry = state->entries[i];
+	space_committed_stage(diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_COMMIT);
 	if (entry == NULL || !cluster_space_structure_wal_decode(entry->wal, sizeof(entry->wal), &change)
-		|| change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE
-		|| !space_committed_current(state, completion, io, &change.identity.expected))
+		|| change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE)
+		return false;
+	if (!space_committed_current(state, completion, io, &change.identity.expected,
+		diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_CURRENT))
 		return false;
 	/* The prepare owner already applied this exact typed change. Canonical
 	 * images are comparison witnesses only: reject damaged/mixed/unrelated
 	 * retained bytes, and copy only the original pair into the I/O images. */
-	if (entry->token != change.identity.result_token
-		|| !cluster_space_identity_page_encode(&change.identity.result,
+	space_committed_stage(diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_COMMIT);
+	if (entry->token != change.identity.result_token)
+		return false;
+	space_committed_stage(diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_INPUT);
+	if (!cluster_space_identity_page_encode(&change.identity.result,
 			change.identity.result_token, disk.data, BLCKSZ)
 		|| memcmp(disk.data, entry->result[0].data, BLCKSZ) != 0
 		|| !cluster_space_reservation_page_encode(&change.reservation.result,
@@ -1376,21 +1401,29 @@ cluster_space_drop_complete_v4(const ClusterSpaceDropState *state,
 	value.rmid = state->commit_record.xl_rmid;
 	value.info = state->commit_record.xl_info;
 	value.flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
+	space_committed_stage(diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_COMMIT);
 	if (!cluster_page_wal_binding_shape_v1(&value)
 		|| value.source.claim.database_incarnation != change.identity.result.key.database_incarnation)
 		return false;
 	PG_TRY();
 	{
+		space_committed_stage(diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_CURRENT);
 		cluster_write_fence_reject_if_fenced("committed SPACE");
 		cluster_mrp_standby_shared_write_gate("committed SPACE");
-		if (!space_committed_current(state, completion, io, &change.identity.expected))
+		if (!space_committed_current(state, completion, io, &change.identity.expected,
+			diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_CURRENT))
 			goto finished;
+		space_committed_stage(diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_PUBLICATION);
 		cluster_shared_fs_open_existing(value.identity.locator, SPACE_FORKNUM, (ClusterSharedFsHandle **)&handle);
+		space_committed_stage(diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_INPUT);
 		if (cluster_shared_fs_nblocks(handle) != 2)
 			goto finished;
 		for (unsigned i = 0; i < 2; i++) {
-			if (!space_committed_current(state, completion, io, &change.identity.expected)
-				|| cluster_shared_fs_read(handle, i, disk.data) != BLCKSZ
+			if (!space_committed_current(state, completion, io, &change.identity.expected,
+				diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_CURRENT))
+				goto finished;
+			space_committed_stage(diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_INPUT);
+			if (cluster_shared_fs_read(handle, i, disk.data) != BLCKSZ
 				|| !space_committed_disk_input(&change, i, disk.data))
 				goto finished;
 		}
@@ -1398,40 +1431,56 @@ cluster_space_drop_complete_v4(const ClusterSpaceDropState *state,
 			space_set_lsn(result[i].data, state->commit_lsn, entry->token);
 			if (DataChecksumsEnabled())
 				((PageHeader)result[i].data)->pd_checksum = pg_checksum_page(result[i].data, i);
+			space_committed_stage(diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_CURRENT);
 			cluster_write_fence_reject_if_fenced("committed SPACE write");
 			cluster_mrp_standby_shared_write_gate("committed SPACE write");
-			if (!space_committed_current(state, completion, io, &change.identity.expected)
-				|| cluster_shared_fs_write(handle, i, result[i].data) != BLCKSZ)
+			if (!space_committed_current(state, completion, io, &change.identity.expected,
+				diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_CURRENT))
+				goto finished;
+			space_committed_stage(diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_PUBLICATION);
+			if (cluster_shared_fs_write(handle, i, result[i].data) != BLCKSZ)
 				goto finished;
 		}
 		for (unsigned pass = 0; pass < 2; pass++) {
 			if (pass != 0) {
+				space_committed_stage(diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_CURRENT);
 				cluster_write_fence_reject_if_fenced("committed SPACE sync");
 				cluster_mrp_standby_shared_write_gate("committed SPACE sync");
-				if (!space_committed_current(state, completion, io, &change.identity.expected))
+				if (!space_committed_current(state, completion, io, &change.identity.expected,
+					diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_CURRENT))
 					goto finished;
+				space_committed_stage(diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_PUBLICATION);
 				cluster_shared_fs_immedsync(handle);
 			}
 			for (unsigned i = 0; i < 2; i++) {
-				if (!space_committed_current(state, completion, io, &change.identity.expected)
-					|| cluster_shared_fs_read(handle, i, disk.data) != BLCKSZ
+				if (!space_committed_current(state, completion, io, &change.identity.expected,
+					diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_CURRENT))
+					goto finished;
+				space_committed_stage(diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_READBACK);
+				if (cluster_shared_fs_read(handle, i, disk.data) != BLCKSZ
 					|| memcmp(disk.data, result[i].data, BLCKSZ) != 0)
 					goto finished;
 			}
 		}
-		ready = space_committed_current(state, completion, io, &change.identity.expected);
+		ready = space_committed_current(state, completion, io, &change.identity.expected,
+			diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_POSTCHECK);
 finished:;
 	}
 	PG_FINALLY();
 	{
+		/* Do not replace an earlier refusal/ERROR with cleanup's stage. */
+		if (ready)
+			space_committed_stage(diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_PUBLICATION);
 		if (handle != NULL)
 			cluster_shared_fs_close(handle);
 	}
 	PG_END_TRY();
-	if (!ready || !space_committed_current(state, completion, io, &change.identity.expected))
+	if (!ready || !space_committed_current(state, completion, io, &change.identity.expected,
+		diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_POSTCHECK))
 		return false;
 	memcpy(wal, entry->wal, sizeof(entry->wal));
 	*terminal = value;
+	space_committed_stage(diagnostic_stage, CLUSTER_KO_NATIVE_SPACE_NONE);
 	return true;
 }
 

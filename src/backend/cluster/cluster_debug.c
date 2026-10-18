@@ -4028,6 +4028,7 @@ dump_ko(ReturnSetInfo *rsinfo)
 			snprintf(key, sizeof(key), "native_failure_%s_first_" #field, reason); \
 			emit_row(rsinfo, "ko", key, fmt_int64((int64)first.field))
 			KO_NATIVE_FIRST_FIELD(stage);
+			KO_NATIVE_FIRST_FIELD(space_stage);
 			KO_NATIVE_FIRST_FIELD(site);
 			KO_NATIVE_FIRST_FIELD(captured_pg_us);
 			KO_NATIVE_FIRST_FIELD(serial);

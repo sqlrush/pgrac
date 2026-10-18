@@ -1699,6 +1699,9 @@ run_committed_window(uint16 operation, unsigned mode, bool held, unsigned origin
 			UT_ASSERT(cluster_ko_native_failure_first(native_observation_reason, &first));
 			UT_ASSERT_EQ(first.site, CLUSTER_KO_NATIVE_SITE_WINDOW);
 			UT_ASSERT_EQ(first.stage, native_observation_stage);
+			UT_ASSERT_EQ(first.space_stage, native_observation_stage == CLUSTER_KO_NATIVE_STAGE_SPACE
+				? (window_final_case == 2 ? CLUSTER_KO_NATIVE_SPACE_POSTCHECK
+					: native_window_space_diagnostic) : CLUSTER_KO_NATIVE_SPACE_NONE);
 			UT_ASSERT(RelFileLocatorEquals(first.locator, space_identity.key.locator));
 			UT_ASSERT_EQ(first.serial, window_work->context.serial);
 			UT_ASSERT_EQ(first.batch, window_work->context.request.batch_id);
@@ -1722,6 +1725,11 @@ run_committed_window(uint16 operation, unsigned mode, bool held, unsigned origin
 			UT_ASSERT(strstr(last_native_failure_log, "site=7") != NULL);
 			UT_ASSERT(strstr(last_native_failure_log, "serial=") != NULL);
 			UT_ASSERT(strstr(last_native_failure_log, "batch=") != NULL);
+			{
+				char field[32];
+				snprintf(field, sizeof(field), "space_stage=%u ", first.space_stage);
+				UT_ASSERT(strstr(last_native_failure_log, field) != NULL);
+			}
 			if (strcmp(native_observation_reason, "window_error") == 0)
 				UT_ASSERT(strstr(last_native_failure_log,
 					"error_summary=\"fixture native ERROR summary") != NULL);
@@ -1794,6 +1802,18 @@ UT_TEST(test_native_window_caught_error_retains_evaluating_stage)
 	window_final_case = 1; window_close_case = 12;
 	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 0);
 	window_final_case = window_close_case = 0;
+	native_observation_reason = NULL;
+}
+
+UT_TEST(test_native_space_substage_survives_work_promotion_and_stop)
+{
+	native_observation_reason = "window_space";
+	native_observation_stage = CLUSTER_KO_NATIVE_STAGE_SPACE;
+	for (native_window_space_diagnostic = CLUSTER_KO_NATIVE_SPACE_ENTERED_IO;
+		native_window_space_diagnostic <= CLUSTER_KO_NATIVE_SPACE_IO_END;
+		native_window_space_diagnostic++)
+		run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 0);
+	native_window_space_diagnostic = CLUSTER_KO_NATIVE_SPACE_PUBLICATION;
 	native_observation_reason = NULL;
 }
 
@@ -2024,9 +2044,10 @@ UT_TEST(test_prepared_mode_keeps_original_completed_legacy_owner)
 int
 main(void)
 {
-	UT_PLAN(59);
+	UT_PLAN(60);
 	UT_RUN(test_native_abandon_and_promotion_have_distinct_write_ids);
 	UT_RUN(test_native_window_first_failure_has_exact_stage_and_work);
+	UT_RUN(test_native_space_substage_survives_work_promotion_and_stop);
 	UT_RUN(test_native_window_caught_error_retains_evaluating_stage);
 	UT_RUN(test_native_healthy_window_has_no_first_failure);
 	UT_RUN(test_production_capability_selects_complete_committed_window);

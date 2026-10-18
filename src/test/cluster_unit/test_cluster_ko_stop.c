@@ -80,15 +80,17 @@ static const ClusterSpaceDropState *native_window_space;
 static const ClusterKoCompletionV2 *native_window_space_owner;
 static unsigned native_window_space_checks, native_window_space_releases;
 static unsigned native_window_space_finishes;
+static uint32 native_window_space_diagnostic = CLUSTER_KO_NATIVE_SPACE_PUBLICATION;
 static bool (*native_window_space_finish_hook)(const ClusterKoCompletionV2 *,
 	const ClusterKoDirectoryIoV3 *, ClusterPageWalBindingV1 *, void *);
 bool
 cluster_space_drop_complete_v4(const ClusterSpaceDropState *state,
 	const ClusterKoCompletionV2 *completion, const ClusterKoDirectoryIoV3 *io,
-	ClusterPageWalBindingV1 *terminal, void *wal)
+	ClusterPageWalBindingV1 *terminal, void *wal, uint32 *diagnostic_stage)
 {
 	Assert(state == native_window_space && completion == native_window_space_owner);
 	native_window_space_finishes++;
+	*diagnostic_stage = native_window_space_diagnostic;
 	return native_window_space_finish_hook != NULL
 		&& native_window_space_finish_hook(completion, io, terminal, wal);
 }

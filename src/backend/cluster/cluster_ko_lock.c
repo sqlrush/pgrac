@@ -360,6 +360,7 @@ typedef struct ClusterKoNativeContinuation {
 	bool predelete_ready;
 	bool recovery_required;
 	uint32 diagnostic_handoff;
+	uint32 diagnostic_space_stage;
 	bool diagnostic_logged;
 	ClusterKoNativeFailureV1 first_failure;
 	ClusterKoSharedContext context;
@@ -767,6 +768,8 @@ ko_native_failure_capture_locked(ClusterKoNativeContinuation *work,
 	f.reason = reason;
 	f.stage = stage;
 	f.site = site;
+	f.space_stage = site == CLUSTER_KO_NATIVE_SITE_WINDOW && stage == CLUSTER_KO_NATIVE_STAGE_SPACE
+		? work->diagnostic_space_stage : CLUSTER_KO_NATIVE_SPACE_NONE;
 	if (error_message != NULL)
 		strlcpy(f.error_message, error_message, sizeof(f.error_message));
 	f.sqlerrcode = sqlerrcode;
@@ -832,7 +835,7 @@ ko_native_failure_log(const ClusterKoNativeFailureV1 *f, const char *consumer)
 {
 	if (f->reason == CLUSTER_KO_NATIVE_FAIL_NONE)
 		return;
-	elog(LOG, "native committed producer failure consumer=%s site=%u reason=%s stage=%s captured_pg_us=" INT64_FORMAT
+	elog(LOG, "native committed producer failure consumer=%s site=%u reason=%s stage=%s space_stage=%u captured_pg_us=" INT64_FORMAT
 		 " locator=%u/%u/%u operation=%u serial=" UINT64_FORMAT " batch=" UINT64_FORMAT
 		 " epoch=" UINT64_FORMAT " producer_pid=%d captured_pid=%d slot=%u sqlerrcode=%d"
 		 " work_flags=0x%x owner_flags=0x%x context_flags=0x%x entry_flags=0x%x matches=0x%x handoff=0x%x"
@@ -841,6 +844,7 @@ ko_native_failure_log(const ClusterKoNativeFailureV1 *f, const char *consumer)
 		 " terminal=" UINT64_FORMAT "/" UINT64_FORMAT " source_thread=" UINT64_FORMAT
 		 " source_boot=" UINT64_FORMAT " timeline=%u mutation=" UINT64_FORMAT " error_summary=\"%s\"",
 		 consumer, f->site, cluster_ko_native_failure_reason_name(f->reason), cluster_ko_native_failure_stage_name(f->stage),
+		 f->space_stage,
 		 f->captured_pg_us, f->locator.spcOid, f->locator.dbOid, f->locator.relNumber, f->operation,
 		 f->serial, f->batch, f->epoch, f->producer_pid, f->pid, f->slot, f->sqlerrcode,
 		 f->work_flags, f->owner_flags, f->context_flags, f->entry_flags, f->matches, f->handoff,
@@ -8377,23 +8381,26 @@ ko_native_final_space_v4(const ClusterSpaceDropState *space_drop,
 	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 	volatile bool observed = false;
 
+	work->diagnostic_space_stage = CLUSTER_KO_NATIVE_SPACE_CURRENT;
 	if (!ko_native_space_owner_current(owned))
 		return false;
 	SpinLockAcquire(&ko_state->shared_lock);
 	before = work->context;
-	if (ko_native_space_same_locked(owned, work, &before, NULL)
-		&& ko_state->directory_io_serial < UINT64_MAX) {
-		for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
-			KoDirectoryIo *call = &ko_state->directory_io[i];
-			if (call->serial != 0)
-				continue;
-			call->locator = before.request.key.locator;
-			call->pid = MyProcPid;
-			call->serial = ++ko_state->directory_io_serial;
-			io.slot = i;
-			io.pid = call->pid;
-			io.serial = call->serial;
-			break;
+	if (ko_native_space_same_locked(owned, work, &before, NULL)) {
+		work->diagnostic_space_stage = CLUSTER_KO_NATIVE_SPACE_ENTERED_IO;
+		if (ko_state->directory_io_serial < UINT64_MAX) {
+			for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+				KoDirectoryIo *call = &ko_state->directory_io[i];
+				if (call->serial != 0)
+					continue;
+				call->locator = before.request.key.locator;
+				call->pid = MyProcPid;
+				call->serial = ++ko_state->directory_io_serial;
+				io.slot = i;
+				io.pid = call->pid;
+				io.serial = call->serial;
+				break;
+			}
 		}
 	}
 	SpinLockRelease(&ko_state->shared_lock);
@@ -8401,45 +8408,53 @@ ko_native_final_space_v4(const ClusterSpaceDropState *space_drop,
 		return false;
 	PG_TRY();
 	{
-		if (cluster_space_drop_complete_v4(space_drop, owned, &io, &terminal, wal)
-			&& cluster_space_structure_wal_decode(wal, sizeof(wal), &change)
-			&& change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE
-			&& cluster_page_wal_binding_shape_v1(&terminal)
-			&& terminal.flags == CLUSTER_PAGE_WAL_NATIVE_FLUSHED
-			&& terminal.rmid == RM_XACT_ID
-			&& (terminal.info & XLOG_XACT_OPMASK) == XLOG_XACT_COMMIT
-			&& (terminal.info & XLOG_XACT_HAS_INFO) != 0
-			&& terminal.identity.forknum == SPACE_FORKNUM && terminal.identity.blockno == 0
-			&& RelFileLocatorEquals(terminal.identity.locator, change.identity.result.key.locator)
-			&& terminal.version.mutation_token == change.identity.result_token
-			&& memcmp(terminal.version.segment_incarnation, change.identity.result.incarnation, 16) == 0
-			&& terminal.identity.system_identifier == change.identity.result.key.system_identifier
-			&& terminal.source.claim.database_incarnation == change.identity.result.key.database_incarnation
-			&& memcmp(terminal.identity.storage_uuid, change.identity.result.key.storage_uuid, 16) == 0
-			&& cluster_wal_thread_current_v2_ref(&current)
-			&& memcmp(&current, &terminal.source, sizeof(current)) == 0
-			&& cluster_ko_native_space_current_v4(owned, &io, &change.identity.expected)) {
-			SpinLockAcquire(&ko_state->shared_lock);
-			if (ko_native_space_same_locked(owned, work, &before, &io)) {
-				ClusterKoSharedContext *entry = &ko_state->contexts[owned->slot];
-				entry->terminal = terminal;
-				memcpy(entry->structure, wal, sizeof(wal));
-				entry->structure_owned = entry->structure_drop_pending = true;
-				work->context = *entry;
-				owned->terminal = terminal;
-				memcpy(owned->structure, wal, sizeof(wal));
-				owned->space_observed = true;
-				observed = true;
+		if (cluster_space_drop_complete_v4(space_drop, owned, &io, &terminal, wal,
+			&work->diagnostic_space_stage)) {
+			work->diagnostic_space_stage = CLUSTER_KO_NATIVE_SPACE_POSTCHECK;
+			if (cluster_space_structure_wal_decode(wal, sizeof(wal), &change)
+				&& change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE
+				&& cluster_page_wal_binding_shape_v1(&terminal)
+				&& terminal.flags == CLUSTER_PAGE_WAL_NATIVE_FLUSHED
+				&& terminal.rmid == RM_XACT_ID
+				&& (terminal.info & XLOG_XACT_OPMASK) == XLOG_XACT_COMMIT
+				&& (terminal.info & XLOG_XACT_HAS_INFO) != 0
+				&& terminal.identity.forknum == SPACE_FORKNUM && terminal.identity.blockno == 0
+				&& RelFileLocatorEquals(terminal.identity.locator, change.identity.result.key.locator)
+				&& terminal.version.mutation_token == change.identity.result_token
+				&& memcmp(terminal.version.segment_incarnation, change.identity.result.incarnation, 16) == 0
+				&& terminal.identity.system_identifier == change.identity.result.key.system_identifier
+				&& terminal.source.claim.database_incarnation == change.identity.result.key.database_incarnation
+				&& memcmp(terminal.identity.storage_uuid, change.identity.result.key.storage_uuid, 16) == 0
+				&& cluster_wal_thread_current_v2_ref(&current)
+				&& memcmp(&current, &terminal.source, sizeof(current)) == 0
+				&& cluster_ko_native_space_current_v4(owned, &io, &change.identity.expected)) {
+				SpinLockAcquire(&ko_state->shared_lock);
+				if (ko_native_space_same_locked(owned, work, &before, &io)) {
+					ClusterKoSharedContext *entry = &ko_state->contexts[owned->slot];
+					entry->terminal = terminal;
+					memcpy(entry->structure, wal, sizeof(wal));
+					entry->structure_owned = entry->structure_drop_pending = true;
+					work->context = *entry;
+					owned->terminal = terminal;
+					memcpy(owned->structure, wal, sizeof(wal));
+					owned->space_observed = true;
+					observed = true;
+				}
+				SpinLockRelease(&ko_state->shared_lock);
 			}
-			SpinLockRelease(&ko_state->shared_lock);
 		}
 	}
 	PG_FINALLY();
 	{
+		/* An earlier refusal/ERROR remains first even if io_end also fails. */
+		if (observed)
+			work->diagnostic_space_stage = CLUSTER_KO_NATIVE_SPACE_IO_END;
 		if (!cluster_ko_directory_io_end_v3(&io))
 			observed = false;
 	}
 	PG_END_TRY();
+	if (observed)
+		work->diagnostic_space_stage = CLUSTER_KO_NATIVE_SPACE_NONE;
 	return observed;
 }
 
