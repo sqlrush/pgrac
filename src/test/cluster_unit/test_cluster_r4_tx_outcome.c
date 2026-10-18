@@ -2474,6 +2474,21 @@ UT_TEST(test_local_updater_rolled_active_preserves_original_identity)
 	}
 }
 
+UT_TEST(test_local_updater_rolled_active_accepts_duplicate_ctrc_touch)
+{
+	int cross_segment;
+
+	for (cross_segment = 0; cross_segment < 2; cross_segment++) {
+		reset_rolled_updater_fixture(cross_segment != 0);
+		test_ctrc_touch_result = CLUSTER_CTRC_TOUCH_DUPLICATE;
+		check_rolled_active_updater_sample(true);
+		UT_ASSERT_EQ(test_ctrc_touch_calls, 1);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, cross_segment ? 3 : 1);
+		UT_ASSERT_EQ(test_candidate_release_calls, test_candidate_acquire_calls);
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+	}
+}
+
 UT_TEST(test_local_updater_rolled_active_requires_canonical_slot)
 {
 	int cross_segment;
@@ -5846,7 +5861,7 @@ UT_TEST(test_self_fresh_role_does_not_inherit_ordinary_abort_permission)
 int
 main(void)
 {
-	UT_PLAN(163);
+	UT_PLAN(164);
 	UT_RUN(test_retained_active_identity_reaches_real_undo_pending);
 	UT_RUN(test_retained_undo_pending_requires_matching_active_tt_receipt);
 	UT_RUN(test_retained_undo_pending_guard_drift_cannot_publish);
@@ -5854,6 +5869,7 @@ main(void)
 	UT_RUN(test_retained_active_mx_batch_scrubs_earlier_local_proof);
 	UT_RUN(test_retained_mx_precommit_retries_preserve_batch_deadline);
 	UT_RUN(test_local_updater_rolled_active_preserves_original_identity);
+	UT_RUN(test_local_updater_rolled_active_accepts_duplicate_ctrc_touch);
 	UT_RUN(test_local_updater_rolled_active_requires_canonical_slot);
 	UT_RUN(test_local_updater_rolled_active_rechecks_touch_and_original_data);
 	UT_RUN(test_local_updater_rolled_active_final_release_fences);
