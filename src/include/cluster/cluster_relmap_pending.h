@@ -16,6 +16,7 @@
 #define CLUSTER_RELMAP_PENDING_H
 
 #include "cluster/cluster_space_identity.h"
+#include "common/cluster_relmap_v2.h"
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -64,7 +65,35 @@ typedef struct ClusterRelmapPendingSet
 	ClusterRelmapPendingEntry entries[CLUSTER_RELMAP_PENDING_CAPACITY];
 } ClusterRelmapPendingSet;
 
+/*
+ * Structural pending records are replayed from the exact cold-recovery
+ * stream.  They are not inferred from the opaque v2 pending RelMapFile.
+ */
+typedef struct ClusterRelmapPendingDescriptor
+{
+	ClusterRelmapPendingKind kind;
+	ClusterSpaceIdentityKey identity;
+} ClusterRelmapPendingDescriptor;
+
 extern void cluster_relmap_pending_init(ClusterRelmapPendingSet *set);
+
+/*
+ * Rebuild an unproven structural directory from a committed-only v2 reader
+ * result.  The caller must pass the exact pair result and view returned by
+ * cluster_relmap_v2_read_pair (or its authority wrapper).  A degraded or
+ * incomplete pair is never treated as an empty directory.  The v2 pending
+ * image is deliberately ignored: structural DROP/TRUNCATE descriptors come
+ * from the exact cold-recovery stream, and every resulting entry starts with
+ * all terminal proof bits clear.
+ *
+ * The destination must be freshly initialized and empty.  On any failure it
+ * is left unchanged.
+ */
+extern ClusterRelmapPendingResult cluster_relmap_pending_rebuild_from_committed(
+	ClusterRelmapPendingSet *set, const ClusterRelmapV2Namespace *expected,
+	ClusterRelmapV2PairResult pair_result,
+	const ClusterRelmapV2View *view,
+	const ClusterRelmapPendingDescriptor *descriptors, size_t descriptor_count);
 
 /*
  * Add a DROP/TRUNCATE obligation.  MAIN must already be represented by the

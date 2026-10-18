@@ -94,11 +94,63 @@ pending_proofs_complete(const ClusterRelmapPendingEntry *entry)
 		entry->native_terminal && entry->tt_complete && entry->space_complete;
 }
 
+static bool
+pending_set_empty(const ClusterRelmapPendingSet *set)
+{
+	if (set == NULL || set->has_namespace)
+		return false;
+
+	for (int i = 0; i < CLUSTER_RELMAP_PENDING_CAPACITY; i++)
+		if (set->entries[i].occupied)
+			return false;
+	return true;
+}
+
 void
 cluster_relmap_pending_init(ClusterRelmapPendingSet *set)
 {
 	if (set != NULL)
 		memset(set, 0, sizeof(*set));
+}
+
+ClusterRelmapPendingResult
+cluster_relmap_pending_rebuild_from_committed(
+	ClusterRelmapPendingSet *set, const ClusterRelmapV2Namespace *expected,
+	ClusterRelmapV2PairResult pair_result,
+	const ClusterRelmapV2View *view,
+	const ClusterRelmapPendingDescriptor *descriptors, size_t descriptor_count)
+{
+	ClusterRelmapPendingSet rebuilt;
+
+	if (set == NULL || expected == NULL || view == NULL ||
+		expected->system_identifier == 0 || expected->database_incarnation == 0 ||
+		expected->shared != (expected->dbid == InvalidOid) ||
+		(descriptor_count > 0 && descriptors == NULL))
+		return CLUSTER_RELMAP_PENDING_INVALID_INPUT;
+	if (pair_result != CLUSTER_RELMAP_V2_PAIR_VALID ||
+		!view->pending_complete || view->committed_generation == 0)
+		return CLUSTER_RELMAP_PENDING_NOT_READY;
+	if (!pending_set_empty(set))
+		return CLUSTER_RELMAP_PENDING_CONFLICT;
+	if (descriptor_count > CLUSTER_RELMAP_PENDING_CAPACITY)
+		return CLUSTER_RELMAP_PENDING_CAPACITY_EXCEEDED;
+
+	cluster_relmap_pending_init(&rebuilt);
+	for (size_t i = 0; i < descriptor_count; i++)
+	{
+		ClusterRelmapPendingResult result;
+
+		if (descriptors[i].identity.system_identifier != expected->system_identifier ||
+			descriptors[i].identity.database_incarnation != expected->database_incarnation)
+			return CLUSTER_RELMAP_PENDING_CONFLICT;
+		result = cluster_relmap_pending_add(&rebuilt, descriptors[i].kind,
+														&descriptors[i].identity, true);
+		if (result != CLUSTER_RELMAP_PENDING_OK)
+			return result;
+	}
+
+	*set = rebuilt;
+	return CLUSTER_RELMAP_PENDING_OK;
 }
 
 ClusterRelmapPendingResult

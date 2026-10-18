@@ -576,15 +576,23 @@ test_cluster_relmap_retention: test_cluster_relmap_retention.c unit_test.h \
 test_cluster_relmap_pending: test_cluster_relmap_pending.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_pending.h \
 		$(top_srcdir)/src/include/cluster/cluster_space_identity.h \
-		test_cluster_relmap_pending_product.o $(CLUSTER_UNIT_PORT_LIBS)
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		test_cluster_relmap_pending_product.o test_cluster_relmap_v2_codec_product.o \
+		$(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
 		test_cluster_relmap_pending_product.o \
+		test_cluster_relmap_v2_codec_product.o \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_relmap_pending_product.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_pending.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_pending.h \
 		$(top_srcdir)/src/include/cluster/cluster_space_identity.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -c $< -o $@
+
+test_cluster_relmap_v2_codec_product.o: $(top_srcdir)/src/common/cluster_relmap_v2.c \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_srcdir)/src/include/common/relmap.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND -c $< -o $@
 
 # Compile the real storage module with pass-through syscall fault boundaries.
 test_cluster_relmap_v2_storage_product.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_authority.c \
