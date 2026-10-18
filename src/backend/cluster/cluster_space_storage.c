@@ -1274,10 +1274,49 @@ space_committed_current(const ClusterSpaceDropState *state,
 		&& cluster_ko_native_space_current_v4(completion, io, expected);
 }
 
-/* No buffer/current reacquisition. This is the original committed record's
- * two-page publication under its original entered-call owner. Open-existing
- * cannot create a missing file. The same typed transition and checksums guard
- * reads before and after the required synchronous DATA completion. */
+/* The original COMMIT-bound retained pair owns publication. Disk input only
+ * excludes conflicting/corrupt files; discarded dirty SPACE need not have
+ * reached DATA. A lower LIVE allocation frontier is compatible only with
+ * the exact same identity and a distinct opaque token, never token ordering.
+ * This private caller already holds the original current/fence/entered-I/O. */
+static bool
+space_committed_disk_input(const ClusterSpaceStructureChange *change, unsigned block, Page page)
+{
+	const uint8 *bytes = (const uint8 *)page;
+	ClusterSpaceIdentityTransition transition;
+	ClusterSpaceReservation reservation;
+	uint8 actual[CLUSTER_SPACE_IDENTITY_BYTES], expected[CLUSTER_SPACE_IDENTITY_BYTES];
+	uint64 token;
+	unsigned i;
+
+	for (i = 0; i < BLCKSZ && bytes[i] == 0; i++)
+		;
+	if (i == BLCKSZ)
+		return true;
+	if (PageIsNew(page) || (DataChecksumsEnabled()
+		&& ((PageHeader)page)->pd_checksum != pg_checksum_page(page, block)))
+		return false;
+	if (block == 0) {
+		transition = cluster_space_wal_apply(&change->identity,
+			&change->identity.expected.key, page, BLCKSZ);
+		return transition == CLUSTER_SPACE_IDENTITY_APPLY || transition == CLUSTER_SPACE_IDENTITY_ALREADY;
+	}
+	transition = cluster_space_reservation_apply(&change->reservation,
+		&change->identity.expected.key, page, BLCKSZ);
+	if (transition == CLUSTER_SPACE_IDENTITY_APPLY || transition == CLUSTER_SPACE_IDENTITY_ALREADY)
+		return true;
+	return cluster_space_reservation_page_decode(page, BLCKSZ, SPACE_FORKNUM, 1,
+			&change->identity.expected.key, &reservation, &token)
+		&& reservation.next_block < change->reservation.before.next_block
+		&& token != change->reservation.before_token && token != change->reservation.result_token
+		&& cluster_space_identity_encode(&reservation.identity, actual, sizeof(actual))
+		&& cluster_space_identity_encode(&change->reservation.before.identity, expected, sizeof(expected))
+		&& memcmp(actual, expected, sizeof(actual)) == 0;
+}
+
+/* No buffer/current reacquisition or old-page writeback. Publish the exact
+ * prepared result of the original durable COMMIT under its entered owner.
+ * Open-existing cannot create a missing file; sync/full readback are retained. */
 bool
 cluster_space_drop_complete_v4(const ClusterSpaceDropState *state,
 	const ClusterKoCompletionV2 *completion, const ClusterKoDirectoryIoV3 *io,
@@ -1288,8 +1327,6 @@ cluster_space_drop_complete_v4(const ClusterSpaceDropState *state,
 	ClusterPageWalBindingV1 value = {0};
 	ClusterSharedFsHandle *volatile handle = NULL;
 	PGIOAlignedBlock result[2], disk;
-	ClusterSpaceIdentityTransition transition;
-	uint8 mask;
 	volatile bool ready = false;
 
 	if (io == NULL || terminal == NULL || wal == NULL
@@ -1313,6 +1350,19 @@ cluster_space_drop_complete_v4(const ClusterSpaceDropState *state,
 		|| change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE
 		|| !space_committed_current(state, completion, io, &change.identity.expected))
 		return false;
+	/* The prepare owner already applied this exact typed change. Canonical
+	 * images are comparison witnesses only: reject damaged/mixed/unrelated
+	 * retained bytes, and copy only the original pair into the I/O images. */
+	if (entry->token != change.identity.result_token
+		|| !cluster_space_identity_page_encode(&change.identity.result,
+			change.identity.result_token, disk.data, BLCKSZ)
+		|| memcmp(disk.data, entry->result[0].data, BLCKSZ) != 0
+		|| !cluster_space_reservation_page_encode(&change.reservation.result,
+			change.reservation.result_token, disk.data, BLCKSZ)
+		|| memcmp(disk.data, entry->result[1].data, BLCKSZ) != 0)
+		return false;
+	for (unsigned i = 0; i < 2; i++)
+		memcpy(result[i].data, entry->result[i].data, BLCKSZ);
 	value.source = state->commit_source;
 	value.identity.system_identifier = change.identity.result.key.system_identifier;
 	memcpy(value.identity.storage_uuid, change.identity.result.key.storage_uuid, 16);
@@ -1340,16 +1390,10 @@ cluster_space_drop_complete_v4(const ClusterSpaceDropState *state,
 			goto finished;
 		for (unsigned i = 0; i < 2; i++) {
 			if (!space_committed_current(state, completion, io, &change.identity.expected)
-				|| cluster_shared_fs_read(handle, i, result[i].data) != BLCKSZ
-				|| PageIsNew(result[i].data)
-				|| (DataChecksumsEnabled() && ((PageHeader)result[i].data)->pd_checksum
-					!= pg_checksum_page(result[i].data, i)))
+				|| cluster_shared_fs_read(handle, i, disk.data) != BLCKSZ
+				|| !space_committed_disk_input(&change, i, disk.data))
 				goto finished;
 		}
-		transition = cluster_space_structure_apply(&change, &change.identity.expected.key,
-			result[0].data, result[1].data, BLCKSZ, &mask);
-		if (transition != CLUSTER_SPACE_IDENTITY_APPLY && transition != CLUSTER_SPACE_IDENTITY_ALREADY)
-			goto finished;
 		for (unsigned i = 0; i < 2; i++) {
 			space_set_lsn(result[i].data, state->commit_lsn, entry->token);
 			if (DataChecksumsEnabled())

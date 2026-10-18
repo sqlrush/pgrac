@@ -9361,7 +9361,14 @@ all: test_cluster_pi_drop_storage
 TESTS += test_cluster_space_committed_drop
 all: test_cluster_space_committed_drop
 
-test_cluster_space_committed_drop: test_cluster_space_close_policy.inc
+test_cluster_space_committed_drop: test_cluster_space_close_policy.inc test_cluster_space_drop_state.inc
+
+# White-box binding faults use the exact private carriers, not a public test ABI.
+test_cluster_space_drop_state.inc: $(top_srcdir)/src/backend/cluster/cluster_space_storage.c Makefile
+	awk '/^struct ClusterSpaceTruncateState \{/ || /^struct ClusterSpaceDropState \{/ \
+	     { emit=1; n++ } emit { print } emit && /^};/ { emit=0; done++ } \
+	     END { if (n != 2 || done != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 
 test_cluster_space_close_policy.inc: $(top_srcdir)/src/backend/storage/file/fd.c Makefile
 	awk '/^data_sync_elevel\(/ { print "int"; emit=1; n++ } \
@@ -9373,3 +9380,4 @@ clean distclean maintainer-clean: clean-space-close-policy
 .PHONY: clean-space-close-policy
 clean-space-close-policy:
 	rm -f test_cluster_space_close_policy.inc test_cluster_space_close_policy.inc.tmp
+	rm -f test_cluster_space_drop_state.inc test_cluster_space_drop_state.inc.tmp
