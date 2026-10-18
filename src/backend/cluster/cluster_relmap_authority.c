@@ -38,8 +38,10 @@
 
 #include "cluster/cluster_guc.h" /* cluster_shared_data_dir */
 #include "cluster/cluster_relmap_authority.h"
+#include "cluster/cluster_relmap_retention.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "storage/lwlock.h"
 
 #define COMMITTED_SLOT_OFFSET CLUSTER_RELMAP_COMMITTED_OFFSET
 #define PENDING_SLOT_OFFSET CLUSTER_RELMAP_PENDING_OFFSET
@@ -655,17 +657,22 @@ relmap_v2_store_pair(const RelmapV2Directory *dirs, const ClusterRelmapV2Namespa
 bool
 cluster_relmap_authority_v2_write_pending(const ClusterRelmapV2Namespace *expected,
 										uint64 generation, const ClusterRelmapV2Owner *owner,
-										const RelMapFile *pending)
+										const RelMapFile *pending,
+										ClusterRelmapRetentionDirectory *retention,
+										LWLock *retention_lock)
 {
 	RelmapV2Directory dirs;
 	RelmapV2Copy copies[2];
 	ClusterRelmapV2View view;
 	ClusterRelmapV2Image image;
+	ClusterRelmapRetentionKey key = { 0 };
+	ClusterRelmapRetentionResult retained;
 	unsigned char bytes[CLUSTER_RELMAP_V2_FILE_SIZE];
 	bool ok = false;
 
 	/* No I/O can turn a disabled sync policy into durable stage permission. */
-	if (!enableFsync || owner == NULL || pending == NULL)
+	if (!enableFsync || owner == NULL || pending == NULL || retention == NULL
+		|| retention_lock == NULL || LWLockHeldByMe(retention_lock))
 		return false;
 	if (!relmap_v2_open_dirs(expected, &dirs))
 		goto done;
@@ -682,6 +689,24 @@ cluster_relmap_authority_v2_write_pending(const ClusterRelmapV2Namespace *expect
 	image.pending = *pending;
 	if (cluster_relmap_v2_encode(&image, bytes, sizeof(bytes)) != CLUSTER_RELMAP_V2_VALID)
 		goto done;
+	/* Bind the pin to the bytes being installed, never to a caller-supplied
+	 * "retained" boolean. Preparation/cancellation may race the read-only
+	 * preflight, so check and mark under the same lock immediately before the
+	 * first possible pending write. No I/O or other lock runs under it. */
+	key.identity = image.identity;
+	key.generation = image.pending_generation;
+	key.origin = image.pending_owner.node;
+	key.top_full_xid = image.pending_owner.top_full_xid;
+	key.membership_epoch = image.pending_owner.membership_epoch;
+	key.admitted_incarnation = image.pending_owner.admitted_incarnation;
+	key.boot_incarnation = image.pending_owner.boot_incarnation;
+	LWLockAcquire(retention_lock, LW_EXCLUSIVE);
+	retained = cluster_relmap_retention_stage_start(retention, &key, image.pending_owner.wal_end);
+	LWLockRelease(retention_lock);
+	if (retained != CLUSTER_RELMAP_RETENTION_OK)
+		goto done;
+	/* Every later failure keeps may_be_staged, including a failed first write
+	 * or directory close. Ordinary ERROR cleanup must not cancel this pin. */
 	ok = relmap_v2_store_pair(&dirs, expected, bytes, copies);
 done:
 	if (!relmap_v2_close_dirs(&dirs))

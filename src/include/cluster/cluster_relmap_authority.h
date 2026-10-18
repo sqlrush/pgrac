@@ -227,15 +227,28 @@ cluster_relmap_authority_v2_read(const ClusterRelmapV2Namespace *expected,
  * Stage into an initialized, clean v2 pair, primary before backup, with both
  * copies synced and read back before returning true.  Never initializes or
  * repairs a missing/foreign/degraded authority, nor replaces an old pending.
- * The original owner must have sampled its real FullXid and admission before
- * WAL and registered retention before calling.  This API cannot prove that
- * provenance.  False may leave durable pending in either copy: retain the
- * obligation and propagate the original failure; it is not commit/release
- * permission.  No caller may infer cancellation merely from a false return.
+ * The original owner must sample its real FullXid/admission and register
+ * retention_begin BEFORE WAL. Pass that original-origin directory and the
+ * SAME lock used for all access to its published state, not held on entry.
+ * After read-only preflight this function marks the exact pin may_be_staged
+ * under that lock, releases it, then writes. Missing/unknown/mismatching pins
+ * cannot stage. The namespace X lock serializes the whole call with terminal
+ * cleanup and generation replacement. No disk I/O runs under retention_lock.
+ *
+ * This does not authenticate a complete census, producer provenance, WAL
+ * durability or TT/claim retention. False may leave durable pending in either
+ * copy: retain the obligation and propagate the original failure; it is not
+ * commit/release permission. No caller may infer cancellation merely from a
+ * false return, even when the first write failed. There is no live v2 caller.
  */
+struct ClusterRelmapRetentionDirectory;
+struct LWLock;
+
 extern bool cluster_relmap_authority_v2_write_pending(const ClusterRelmapV2Namespace *expected,
 													uint64 generation, const ClusterRelmapV2Owner *owner,
-													const RelMapFile *pending);
+													const RelMapFile *pending,
+													struct ClusterRelmapRetentionDirectory *retention,
+													struct LWLock *retention_lock);
 
 typedef enum ClusterRelmapV2ClearResult {
 	CLUSTER_RELMAP_V2_CLEARED_POSTREAD,

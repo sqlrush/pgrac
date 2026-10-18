@@ -543,6 +543,7 @@ test_cluster_relmap_retention: test_cluster_relmap_retention.c unit_test.h \
 # Compile the real storage module with pass-through syscall fault boundaries.
 test_cluster_relmap_v2_storage_product.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_authority.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
 		$(top_srcdir)/src/include/common/cluster_relmap_v2.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Dwrite=relmap_test_write -Dread=relmap_test_read \
 		-Drenameat=relmap_test_renameat -Dclose=relmap_test_close -c $< -o $@
@@ -3797,9 +3798,12 @@ test_cluster_xid_authority: test_cluster_xid_authority.c unit_test.h \
 
 # spec-6.14 D5: test_cluster_relmap_authority links cluster_relmap_authority.o
 # (the two-phase pending/committed authority substrate).  fd.c + ereport
-# stubbed locally; CRC32C from libpgport.  The write-path activation (relmapper
+# stubbed locally; CRC32C from libpgport. The authority object includes dormant
+# v2 staging, so link its real retention dependency and abort-stub unused locks.
+# The write-path activation (relmapper
 # hook, publish-then-invalidate, crash arbitration) is exercised by TAP.
-CLUSTER_RELMAP_AUTHORITY_O = $(top_builddir)/src/backend/cluster/cluster_relmap_authority.o
+CLUSTER_RELMAP_AUTHORITY_O = $(top_builddir)/src/backend/cluster/cluster_relmap_authority.o \
+	$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o
 test_cluster_relmap_consumer.inc: $(top_srcdir)/src/backend/utils/cache/relmapper.c Makefile
 	awk '/^cluster_read_relmap_from_authority\(/ { print "static void"; emit=1; n++ } \
 	     emit { print } /^}/ { emit=0 } END { if (n != 1) exit 1 }' $< > $@.tmp

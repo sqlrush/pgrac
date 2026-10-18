@@ -23,6 +23,7 @@
 #include "cluster/cluster_relmap_retention_restore.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "storage/lwlock.h"
 
 #undef printf
 #undef fprintf
@@ -42,12 +43,53 @@ static unsigned int fail_write, fail_rename, fail_file_sync, fail_dir_sync;
 static bool corrupt_after_rename, replace_during_read, replace_after_rename;
 static unsigned int fault_rename;
 static bool fail_directory_close;
+static LWLock retention_lock;
+static bool retention_held, observing_stage;
+static bool cancel_on_read, invalidate_on_read, cancel_on_write;
+static unsigned int io_under_retention_lock, writes_without_pin;
+static unsigned int retention_acquires, retention_releases;
+static ClusterRelmapRetentionDirectory writer_retention;
+static ClusterRelmapRetentionKey writer_key;
+static ClusterRelmapRetentionResult cancelled;
 static const char *const names[] = {
 	"pgrac_relmap_authority", "pgrac_relmap_authority.bak",
 	"pgrac_relmap_authority.tmp", "pgrac_relmap_authority.bak.tmp", "replacement"
 };
 static const ClusterRelmapV2Namespace identity = { 12345, 67890, InvalidOid, true };
 static const ClusterRelmapV2Owner owner = { 3, UINT64CONST(0x200000123), 0, 101, 909, 202 };
+
+/* Serialized backend lock boundary, not a concurrent LWLock implementation. */
+bool
+LWLockAcquire(LWLock *lock, LWLockMode mode)
+{
+	if (lock != &retention_lock || mode != LW_EXCLUSIVE || retention_held)
+		abort();
+	retention_held = true;
+	retention_acquires++;
+	return true;
+}
+
+void
+LWLockRelease(LWLock *lock)
+{
+	if (lock != &retention_lock || !retention_held)
+		abort();
+	retention_held = false;
+	retention_releases++;
+}
+
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	return lock == &retention_lock && retention_held;
+}
+
+static void
+observe_io(void)
+{
+	if (retention_held)
+		io_under_retention_lock++;
+}
 
 /* Only backend facilities are supplied here.  Every successful I/O is real. */
 void
@@ -114,6 +156,7 @@ pg_fsync(int fd)
 	unsigned int call;
 	unsigned int fail;
 
+	observe_io();
 	if (fstat(fd, &st) != 0)
 		abort();
 	if (S_ISDIR(st.st_mode)) {
@@ -143,6 +186,7 @@ relmap_test_close(int fd)
 	bool directory;
 	int rc;
 
+	observe_io();
 	if (fstat(fd, &st) != 0)
 		abort();
 	directory = S_ISDIR(st.st_mode);
@@ -158,6 +202,19 @@ relmap_test_close(int fd)
 ssize_t
 relmap_test_write(int fd, const void *bytes, size_t len)
 {
+	observe_io();
+	if (observing_stage) {
+		const ClusterRelmapRetentionPin *pin = &writer_retention.pins[0];
+
+		if (!pin->occupied || !pin->may_be_staged || pin->wal_end != owner.wal_end)
+			writes_without_pin++;
+		if (cancel_on_write) {
+			cancel_on_write = false;
+			LWLockAcquire(&retention_lock, LW_EXCLUSIVE);
+			cancelled = cluster_relmap_retention_cancel_prepare(&writer_retention, &writer_key);
+			LWLockRelease(&retention_lock);
+		}
+	}
 	if (++writes == fail_write) {
 		errno = ENOSPC;
 		return -1;
@@ -189,6 +246,16 @@ relmap_test_read(int fd, void *bytes, size_t len)
 {
 	ssize_t n = read(fd, bytes, len);
 
+	observe_io();
+	if (observing_stage && (cancel_on_read || invalidate_on_read)) {
+		LWLockAcquire(&retention_lock, LW_EXCLUSIVE);
+		if (cancel_on_read)
+			cancelled = cluster_relmap_retention_cancel_prepare(&writer_retention, &writer_key);
+		if (invalidate_on_read)
+			cluster_relmap_retention_invalidate(&writer_retention);
+		LWLockRelease(&retention_lock);
+		cancel_on_read = invalidate_on_read = false;
+	}
 	reads++;
 	if (replace_during_read && reads == 1)
 		replace_primary();
@@ -200,6 +267,7 @@ relmap_test_renameat(int olddir, const char *old, int newdir, const char *new)
 {
 	int rc;
 
+	observe_io();
 	if (++renames == fail_rename) {
 		errno = EIO;
 		return -1;
@@ -290,6 +358,11 @@ reset_io(void)
 	corrupt_after_rename = replace_during_read = replace_after_rename = false;
 	fault_rename = 1;
 	fail_directory_close = false;
+	retention_held = observing_stage = false;
+	cancel_on_read = invalidate_on_read = cancel_on_write = false;
+	io_under_retention_lock = writes_without_pin = 0;
+	retention_acquires = retention_releases = 0;
+	cancelled = CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
 }
 
 static void
@@ -324,14 +397,46 @@ setup(const ClusterRelmapV2Namespace *ns)
 		abort();
 	write_copy(0, bytes, sizeof(bytes));
 	write_copy(1, bytes, sizeof(bytes));
+	memset(&writer_retention, 0, sizeof(writer_retention));
+	memset(&writer_key, 0, sizeof(writer_key));
+	writer_key.identity = *ns;
+	writer_key.generation = 8;
+	writer_key.origin = owner.node;
+	writer_key.top_full_xid = owner.top_full_xid;
+	writer_key.membership_epoch = owner.membership_epoch;
+	writer_key.admitted_incarnation = owner.admitted_incarnation;
+	writer_key.boot_incarnation = owner.boot_incarnation;
+	if (cluster_relmap_retention_build_start(&writer_retention, ns->system_identifier,
+		ns->database_incarnation, owner.node, 1, owner.top_full_xid - 16,
+		owner.top_full_xid + 16) != CLUSTER_RELMAP_RETENTION_OK
+		|| cluster_relmap_retention_build_finish(&writer_retention) != CLUSTER_RELMAP_RETENTION_OK)
+		abort();
+	LWLockAcquire(&retention_lock, LW_EXCLUSIVE);
+	if (cluster_relmap_retention_begin(&writer_retention, &writer_key)
+		!= CLUSTER_RELMAP_RETENTION_OK)
+		abort();
+	LWLockRelease(&retention_lock);
+	reset_io();
+}
+
+static bool
+stage_request(const ClusterRelmapV2Namespace *ns, uint64 generation,
+	const ClusterRelmapV2Owner *request_owner)
+{
+	RelMapFile map = map_image(40001);
+	bool result;
+
+	observing_stage = true;
+	result = cluster_relmap_authority_v2_write_pending(ns, generation, request_owner, &map,
+		&writer_retention, &retention_lock);
+	observing_stage = false;
+	return result;
 }
 
 static bool
 stage(const ClusterRelmapV2Namespace *ns)
 {
-	RelMapFile map = map_image(40001);
-
-	return cluster_relmap_authority_v2_write_pending(ns, 8, &owner, &map);
+	return stage_request(ns, 8, &owner);
 }
 
 UT_TEST(test_stage_both_copies_before_success)
@@ -419,16 +524,15 @@ UT_TEST(test_wrong_identity_format_or_owner_does_not_write)
 {
 	ClusterRelmapV2Namespace wrong = identity;
 	ClusterRelmapV2Owner bad_owner = owner;
-	RelMapFile map = map_image(40001);
 	unsigned char bytes[2176];
 	ClusterRelmapV2View view;
 
 	setup(&identity);
 	wrong.database_incarnation++;
 	UT_ASSERT(!stage(&wrong));
-	UT_ASSERT(!cluster_relmap_authority_v2_write_pending(&identity, 9, &owner, &map));
+	UT_ASSERT(!stage_request(&identity, 9, &owner));
 	bad_owner.boot_incarnation = 0;
-	UT_ASSERT(!cluster_relmap_authority_v2_write_pending(&identity, 8, &bad_owner, &map));
+	UT_ASSERT(!stage_request(&identity, 8, &bad_owner));
 	enableFsync = false;
 	UT_ASSERT(!stage(&identity));
 	enableFsync = true;
@@ -508,6 +612,15 @@ UT_TEST(test_each_io_failure_retains_the_obligation)
 			else
 				fail_dir_sync = copy;
 			UT_ASSERT(!stage(&identity));
+			UT_ASSERT(writer_retention.pins[0].occupied);
+			UT_ASSERT(writer_retention.pins[0].may_be_staged);
+			UT_ASSERT_EQ(writer_retention.pins[0].wal_end, owner.wal_end);
+			LWLockAcquire(&retention_lock, LW_EXCLUSIVE);
+			cancelled = cluster_relmap_retention_cancel_prepare(&writer_retention, &writer_key);
+			LWLockRelease(&retention_lock);
+			UT_ASSERT_EQ(cancelled, CLUSTER_RELMAP_RETENTION_RETAINED);
+			UT_ASSERT_EQ(writes_without_pin, 0);
+			UT_ASSERT_EQ(io_under_retention_lock, 0);
 			UT_ASSERT_EQ(cluster_relmap_authority_v2_read(&identity, &view),
 						 CLUSTER_RELMAP_V2_PAIR_VALID);
 			UT_ASSERT_EQ(view.committed.mappings[0].mapfilenumber, 40000);
@@ -1187,10 +1300,126 @@ UT_TEST(test_restore_invalid_arguments_cannot_leave_build_publishable)
 	UT_ASSERT_EQ(reads, 0);
 }
 
+UT_TEST(test_stage_requires_complete_existing_pin)
+{
+	for (int kind = 0; kind < 3; kind++) {
+		setup(&identity);
+		LWLockAcquire(&retention_lock, LW_EXCLUSIVE);
+		if (kind == 0)
+			writer_retention.state = CLUSTER_RELMAP_RETENTION_BUILDING;
+		else if (kind == 1)
+			cluster_relmap_retention_invalidate(&writer_retention);
+		else
+			cancelled = cluster_relmap_retention_cancel_prepare(&writer_retention, &writer_key);
+		LWLockRelease(&retention_lock);
+		UT_ASSERT(!stage(&identity));
+		UT_ASSERT_EQ(writes, 0);
+		UT_ASSERT_EQ(renames, 0);
+	}
+}
+
+UT_TEST(test_stage_owner_must_match_exact_pin)
+{
+	for (int field = 0; field < 8; field++) {
+		ClusterRelmapV2Namespace ns = identity;
+		ClusterRelmapV2Owner changed = owner;
+
+		setup(&identity);
+		switch (field) {
+			case 0: changed.node++; break;
+			case 1: changed.top_full_xid += UINT64CONST(0x100000000); break;
+			case 2: changed.membership_epoch++; break;
+			case 3: changed.admitted_incarnation++; break;
+			case 4: changed.boot_incarnation++; break;
+			case 5: ns.system_identifier++; break;
+			case 6: ns.database_incarnation++; break;
+			case 7: ns.shared = false; ns.dbid = 42; break;
+		}
+		UT_ASSERT(!stage_request(&ns, 8, &changed));
+		UT_ASSERT_EQ(writes, 0);
+		UT_ASSERT(writer_retention.pins[0].occupied);
+		UT_ASSERT(!writer_retention.pins[0].may_be_staged);
+	}
+}
+
+UT_TEST(test_stage_requires_nonheld_retention_lock)
+{
+	for (int kind = 0; kind < 3; kind++) {
+		RelMapFile map = map_image(40001);
+		bool result;
+
+		setup(&identity);
+		if (kind == 2)
+			LWLockAcquire(&retention_lock, LW_EXCLUSIVE);
+		result = cluster_relmap_authority_v2_write_pending(&identity, 8, &owner, &map,
+			kind == 0 ? NULL : &writer_retention, kind == 1 ? NULL : &retention_lock);
+		if (kind == 2)
+			LWLockRelease(&retention_lock);
+		UT_ASSERT(!result);
+		UT_ASSERT_EQ(writes, 0);
+		UT_ASSERT_EQ(reads, 0);
+		UT_ASSERT_EQ(io_under_retention_lock, 0);
+	}
+}
+
+UT_TEST(test_pin_is_irrevocable_before_first_pending_write)
+{
+	setup(&identity);
+	cancel_on_write = true;
+	UT_ASSERT(stage(&identity));
+	UT_ASSERT_EQ(cancelled, CLUSTER_RELMAP_RETENTION_RETAINED);
+	UT_ASSERT_EQ(writes_without_pin, 0);
+	UT_ASSERT_EQ(io_under_retention_lock, 0);
+	UT_ASSERT(!retention_held);
+	UT_ASSERT_EQ(retention_acquires, retention_releases);
+	UT_ASSERT(retention_acquires >= 2);
+	UT_ASSERT(writer_retention.pins[0].occupied);
+	UT_ASSERT(writer_retention.pins[0].may_be_staged);
+	UT_ASSERT_EQ(writer_retention.pins[0].wal_end, owner.wal_end);
+}
+
+UT_TEST(test_preflight_cancellation_prevents_pending_write)
+{
+	setup(&identity);
+	cancel_on_read = true;
+	UT_ASSERT(!stage(&identity));
+	UT_ASSERT_EQ(cancelled, CLUSTER_RELMAP_RETENTION_OK);
+	UT_ASSERT(!writer_retention.pins[0].occupied);
+	UT_ASSERT_EQ(writes, 0);
+	UT_ASSERT_EQ(renames, 0);
+	UT_ASSERT_EQ(io_under_retention_lock, 0);
+	UT_ASSERT(!retention_held);
+}
+
+UT_TEST(test_preflight_invalidation_prevents_pending_write)
+{
+	setup(&identity);
+	invalidate_on_read = true;
+	UT_ASSERT(!stage(&identity));
+	UT_ASSERT_EQ(writer_retention.state, CLUSTER_RELMAP_RETENTION_UNKNOWN);
+	UT_ASSERT(writer_retention.pins[0].occupied);
+	UT_ASSERT_EQ(writes, 0);
+	UT_ASSERT_EQ(renames, 0);
+	UT_ASSERT_EQ(io_under_retention_lock, 0);
+}
+
+UT_TEST(test_changed_wal_cannot_rebind_staged_pin)
+{
+	setup(&identity);
+	LWLockAcquire(&retention_lock, LW_EXCLUSIVE);
+	UT_ASSERT_EQ(cluster_relmap_retention_stage_start(&writer_retention, &writer_key,
+		owner.wal_end + 1), CLUSTER_RELMAP_RETENTION_OK);
+	LWLockRelease(&retention_lock);
+	UT_ASSERT(!stage(&identity));
+	UT_ASSERT_EQ(writes, 0);
+	UT_ASSERT_EQ(writer_retention.pins[0].wal_end, owner.wal_end + 1);
+	UT_ASSERT(writer_retention.pins[0].occupied && writer_retention.pins[0].may_be_staged);
+}
+
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(40);
 	UT_RUN(test_stage_both_copies_before_success);
 	UT_RUN(test_per_database_namespace);
 	UT_RUN(test_missing_authority_is_never_seeded);
@@ -1224,6 +1453,13 @@ main(void)
 	UT_RUN(test_restore_capacity_failure_keeps_all_previously_restored_pins);
 	UT_RUN(test_restore_allows_distinct_global_and_database_pending);
 	UT_RUN(test_restore_invalid_arguments_cannot_leave_build_publishable);
+	UT_RUN(test_stage_requires_complete_existing_pin);
+	UT_RUN(test_stage_owner_must_match_exact_pin);
+	UT_RUN(test_stage_requires_nonheld_retention_lock);
+	UT_RUN(test_pin_is_irrevocable_before_first_pending_write);
+	UT_RUN(test_preflight_cancellation_prevents_pending_write);
+	UT_RUN(test_preflight_invalidation_prevents_pending_write);
+	UT_RUN(test_changed_wal_cannot_rebind_staged_pin);
 	cleanup();
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

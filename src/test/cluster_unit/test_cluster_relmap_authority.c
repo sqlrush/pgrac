@@ -46,6 +46,7 @@
 #include "miscadmin.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
+#include "storage/lwlock.h"
 #include "utils/elog.h"
 
 #undef printf
@@ -110,6 +111,26 @@ int
 errhint(const char *fmt pg_attribute_unused(), ...)
 {
 	return 0;
+}
+
+/* The linked authority object also contains dormant v2 stage code. These
+ * symbols must link, but v1 tests must never enter that lock path. */
+bool
+LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+{
+	abort();
+}
+
+void
+LWLockRelease(LWLock *lock pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+LWLockHeldByMe(LWLock *lock pg_attribute_unused())
+{
+	abort();
 }
 
 /* Use the actual mapper consumer, with only backend lock/wait boundaries stubbed. */
