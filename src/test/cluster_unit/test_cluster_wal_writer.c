@@ -59,6 +59,7 @@ static bool held = true, mapping_held, active = true, member = true, fence = tru
 			have_ref = true;
 static bool fence_epoch_lag, fence_lease_zero, fence_expired, self_fenced;
 static uint64 epoch = 7, incarnation = 99;
+static uint64 relmap_admission_delta;
 static uint64 initialized_writer_epoch, clean_writer_epoch;
 static ClusterWalSourceRef ref;
 static ClusterWalSourceRef restart_ref;
@@ -98,7 +99,7 @@ cluster_qvotec_get_self_incarnation(void)
 uint64
 cluster_membership_get_last_admitted_incarnation(int32 n pg_attribute_unused())
 {
-	return incarnation;
+	return incarnation + relmap_admission_delta;
 }
 ClusterMembershipState
 cluster_membership_get_state(int32 n pg_attribute_unused())
@@ -505,6 +506,7 @@ fixture(void)
 	ShutdownRequestPending = false;
 	memset(&writer_startup, 0, sizeof(writer_startup));
 	epoch = 7;
+	relmap_admission_delta = 0;
 	initialized_writer_epoch = clean_writer_epoch = 0;
 	incarnation = 99;
 	CritSectionCount = 1;
@@ -1389,10 +1391,12 @@ UT_TEST(test_requested_flush_rejects_foreign_or_unsafe_context_without_io)
 	}
 }
 
+#include "test_cluster_relmap_owner.inc"
+
 int
 main(void)
 {
-	UT_PLAN(31);
+	UT_PLAN(37);
 	UT_RUN(test_clean_writer_requires_selected_exit_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_requires_selected_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_keeps_runtime_fence_and_exact_owner_refusals);
@@ -1424,6 +1428,12 @@ main(void)
 	UT_RUN(test_native_device_or_postflush_authority_failure_never_acknowledges);
 	UT_RUN(test_startup_binds_only_revalidated_actual_empty_owner);
 	UT_RUN(test_startup_rejects_changed_selection_route_or_owner);
+	UT_RUN(test_relmap_capture_preserves_original_full_identity);
+	UT_RUN(test_relmap_capture_refuses_unsafe_context_before_assigning);
+	UT_RUN(test_relmap_writer_is_sampled_after_original_top_assignment);
+	UT_RUN(test_relmap_invalid_top_or_unqualified_writer_cannot_be_captured);
+	UT_RUN(test_relmap_revalidation_never_adopts_new_writer_or_reassigns_top);
+	UT_RUN(test_relmap_sample_fields_and_original_lock_context_are_exact);
 	if (scratch[0] && !rmtree(scratch, true))
 		abort();
 	pfree(cluster_wal_threads_dir);
