@@ -468,6 +468,7 @@ cold_scan_history(ClusterColdTypedV1 *typed)
 	uint32 i;
 
 	memset(typed->history_xid, 0, sizeof(typed->history_xid));
+	typed->census_root_captured = false;
 	for (i = typed->replay_count; i < typed->participant_count; i++) {
 		ClusterColdScanResultV1 scan;
 		ClusterColdDetailV1 detail
@@ -491,6 +492,8 @@ cold_scan_history(ClusterColdTypedV1 *typed)
 		}
 	}
 	result = cluster_wal_inputs_revalidate_v1(typed->inputs);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result = cluster_wal_inputs_root_token_v1(typed->inputs, &typed->census_root);
 	cluster_wal_inputs_release_v1(&typed->inputs);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
@@ -499,9 +502,99 @@ cold_scan_history(ClusterColdTypedV1 *typed)
 		memset(typed->history_xid, 0, sizeof(typed->history_xid));
 		return false;
 	}
+	typed->census_root_captured = true;
 	return true;
 }
 
+
+/* This scope owns only provisional metadata reads. It must be released
+ * before the caller acquires the execution pin/IR set; it cannot replace
+ * that set's later retention, source-durability and freshness checks. */
+static bool
+cold_census_matches(ClusterColdTypedV1 *typed)
+{
+	ClusterControlRootFileToken token;
+	uint32 count = cluster_wal_inputs_count_v1(typed->inputs);
+
+	if (cluster_wal_inputs_root_token_v1(typed->inputs, &token)
+			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| memcmp(&token, &typed->census_root, sizeof(token)) != 0)
+		return false;
+	for (uint32 i = typed->replay_count; i < typed->participant_count; i++) {
+		const ColdRoot *selected = &typed->replay_roots[i];
+		const ClusterWalInputV1 *input
+			= typed->input_index[i] < count
+				  ? cluster_wal_inputs_at_v1(typed->inputs, typed->input_index[i])
+				  : NULL;
+
+		/* The whole ROOT token also fixes input ordering and claim/anchor
+		 * references. Compare the actual checkpoint bytes read by that owner,
+		 * including the full-width seed used for the preserved history fold.
+		 * Preserve the original census role: current CLOSED/RECOVERY_COMPLETE
+		 * inputs can also be history. */
+		if (input == NULL || input->kind != CLUSTER_WAL_INPUT_CHECKPOINT
+			|| !selected->checkpoint_captured
+			|| memcmp(&input->checkpoint, &selected->root, sizeof(input->checkpoint)) != 0
+			|| memcmp(&input->source, &typed->sources[i], sizeof(input->source)) != 0
+			|| input->checkpoint_start != selected->checkpoint_start
+			|| input->native_redo != selected->native_checkpoint.redo
+			|| memcmp(&input->native_checkpoint, &selected->native_checkpoint,
+					  sizeof(input->native_checkpoint)) != 0)
+			return false;
+	}
+	return cluster_wal_inputs_revalidate_v1(typed->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+bool
+cluster_cold_typed_recheck_inputs_v1(ClusterColdTypedV1 *typed)
+{
+	bool matched = false;
+
+	if (typed == NULL)
+		return false;
+	if (typed->refusal != CLUSTER_COLD_OK || typed->plan == NULL || typed->inputs != NULL
+		|| !typed->census_root_captured || typed->replay_roots == NULL
+		|| typed->own_participant != 0 || typed->replay_count == 0
+		|| typed->replay_count > typed->participant_count
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->replay_root_count != typed->replay_count
+		|| cluster_cold_plan_participant_count_v1(typed->plan) != typed->participant_count
+		|| cluster_cold_replay_window_active_v1()) {
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "pre-execution census state is invalid");
+		memset(typed->history_xid, 0, sizeof(typed->history_xid));
+		typed->census_root_captured = false;
+		return false;
+	}
+	/* ERROR must also leave this attempt refused, with no surviving inputs. */
+	cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "pre-execution census freshness is incomplete");
+	PG_TRY();
+	{
+		const ClusterControlRootIdentity *own = &typed->replay_roots[0].root.identity;
+
+		if (cluster_wal_inputs_cold_begin_v1(own->storage_uuid, typed->system_identifier,
+											  &typed->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			matched = cold_census_matches(typed);
+		if (typed->inputs != NULL)
+			cluster_wal_inputs_release_v1(&typed->inputs);
+	}
+	PG_CATCH();
+	{
+		memset(typed->history_xid, 0, sizeof(typed->history_xid));
+		typed->census_root_captured = false;
+		if (typed->inputs != NULL)
+			cluster_wal_inputs_release_v1(&typed->inputs);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!matched) {
+		memset(typed->history_xid, 0, sizeof(typed->history_xid));
+		typed->census_root_captured = false;
+		return false;
+	}
+	typed->refusal = CLUSTER_COLD_OK;
+	typed->refusal_detail[0] = '\0';
+	return true;
+}
 
 static bool cold_sources_match(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence);
 

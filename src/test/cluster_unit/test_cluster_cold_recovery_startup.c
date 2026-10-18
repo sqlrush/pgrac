@@ -133,6 +133,164 @@ UT_TEST(test_prepare_takes_history_generations_from_the_census)
 	UT_ASSERT_EQ(census_releases, 1);
 }
 
+UT_TEST(test_census_root_capture_failure_discards_history)
+{
+	ClusterColdTypedV1 *typed;
+
+	fixture();
+	history_generation(2, 9, 0x40, 0x80);
+	census_token_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
+	UT_ASSERT(!typed->census_root_captured);
+	UT_ASSERT_EQ(typed->history_xid[3].next_xid, 0);
+	UT_ASSERT_EQ(census_releases, 1);
+	UT_ASSERT_NULL(typed->inputs);
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
+UT_TEST(test_census_recheck_preserves_original_history_inputs_only)
+{
+	ClusterColdTypedV1 *typed;
+	ClusterColdXidProgressV1 saved;
+
+	fixture();
+	history_generation(2, 9, 0x40, 0x80);
+	history_generation(3, 8, 0x20, 0x60);
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT(typed->census_root_captured);
+	UT_ASSERT_EQ(memcmp(&typed->census_root, &census_token, sizeof(census_token)), 0);
+	saved = typed->history_xid[3];
+	UT_ASSERT(cluster_cold_typed_recheck_inputs_v1(typed));
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(census_begins, 2);
+	UT_ASSERT_EQ(census_releases, 2);
+	UT_ASSERT_EQ(census_token_reads, 2);
+	UT_ASSERT_NULL(typed->inputs);
+	UT_ASSERT_EQ(memcmp(&saved, &typed->history_xid[3], sizeof(saved)), 0);
+	UT_ASSERT_EQ(typed->participants[3].native_redo, 0x80);
+	UT_ASSERT_EQ(typed->xid_next_at_drain[3], 0);
+	UT_ASSERT(!typed->source_drained[3]);
+	UT_ASSERT_EQ(source_sync_calls, 0);
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
+UT_TEST(test_census_recheck_rejects_every_changed_root_token_byte)
+{
+	for (size_t byte = 0; byte < sizeof(census_token); byte++) {
+		ClusterColdTypedV1 *typed;
+
+		fixture();
+		history_generation(2, 9, 0x40, 0x80);
+		typed = prepare(0x800);
+		((unsigned char *)&census_token)[byte] ^= 1;
+		UT_ASSERT(!cluster_cold_typed_recheck_inputs_v1(typed));
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
+		UT_ASSERT(!typed->census_root_captured);
+		UT_ASSERT_EQ(typed->history_xid[3].next_xid, 0);
+		UT_ASSERT_EQ(census_releases, 2);
+		UT_ASSERT_NULL(typed->inputs);
+		UT_ASSERT(!cluster_cold_typed_recheck_inputs_v1(typed));
+		UT_ASSERT_EQ(census_begins, 2);
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_census_recheck_keeps_current_closed_history)
+{
+	ClusterColdTypedV1 *typed;
+
+	fixture();
+	fence_count = 1;
+	history_generation(3, 13, 0x40, 0x80);
+	census_history_current = true;
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(typed->replay_count, 2);
+	UT_ASSERT_EQ(typed->participant_count, 3);
+	UT_ASSERT(typed->history_xid[2].begun);
+	UT_ASSERT(cluster_cold_typed_recheck_inputs_v1(typed));
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(census_releases, 2);
+	UT_ASSERT_EQ(typed->participants[2].native_redo, 0x80);
+	UT_ASSERT_EQ(typed->xid_next_at_drain[2], 0);
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
+UT_TEST(test_census_recheck_rejects_changed_history_metadata)
+{
+	for (int fault = 1; fault <= 9; fault++) {
+		ClusterColdTypedV1 *typed;
+
+		fixture();
+		history_generation(2, 9, 0x40, 0x80);
+		typed = prepare(0x800);
+		census_input_fault = fault;
+		UT_ASSERT(!cluster_cold_typed_recheck_inputs_v1(typed));
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
+		UT_ASSERT_EQ(typed->history_xid[3].next_xid, 0);
+		UT_ASSERT_EQ(census_releases, 2);
+		UT_ASSERT_NULL(typed->inputs);
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_census_recheck_scope_failures_discard_provisional_group)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		ClusterColdTypedV1 *typed;
+
+		fixture();
+		history_generation(2, 9, 0x40, 0x80);
+		typed = prepare(0x800);
+		if (fault == 0)
+			census_begin_result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		else if (fault == 1)
+			census_token_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		else
+			census_revalidate_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		UT_ASSERT(!cluster_cold_typed_recheck_inputs_v1(typed));
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
+		UT_ASSERT(!typed->census_root_captured);
+		UT_ASSERT_EQ(typed->history_xid[3].next_xid, 0);
+		UT_ASSERT_EQ(census_releases, fault == 0 ? 1 : 2);
+		UT_ASSERT_NULL(typed->inputs);
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_census_recheck_refuses_missing_or_execution_state)
+{
+	UT_ASSERT(!cluster_cold_typed_recheck_inputs_v1(NULL));
+	for (int fault = 0; fault < 5; fault++) {
+		ClusterColdTypedV1 *typed;
+		ClusterColdPlanV1 *plan;
+
+		fixture();
+		history_generation(2, 9, 0x40, 0x80);
+		typed = prepare(0x800);
+		plan = typed->plan;
+		if (fault == 0)
+			typed->census_root_captured = false;
+		else if (fault == 1)
+			typed->plan = NULL;
+		else if (fault == 2)
+			cluster_cold_replay_window_enter_v1();
+		else if (fault == 3)
+			typed->participant_count = CLUSTER_COLD_MAX_PARTICIPANTS + 1;
+		else
+			typed->refusal = CLUSTER_COLD_SOURCE_GAP;
+		UT_ASSERT(!cluster_cold_typed_recheck_inputs_v1(typed));
+		UT_ASSERT_EQ(census_begins, 1);
+		UT_ASSERT_EQ(typed->history_xid[3].next_xid, 0);
+		typed->plan = plan;
+		typed->participant_count = 4;
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
 /* Every census refusal stops pass 1 before the plan is built or scanned,
  * and the census scope is released. */
 UT_TEST(test_prepare_refuses_what_the_census_refuses)
@@ -2601,7 +2759,15 @@ UT_TEST(test_checkpoint_export_clears_unsealed_and_failed_output)
 int
 main(void)
 {
-	UT_PLAN(74);
+	UT_PLAN(81);
+	UT_RUN(test_census_recheck_keeps_current_closed_history);
+	UT_RUN(test_census_root_capture_failure_discards_history);
+	UT_RUN(test_census_recheck_preserves_original_history_inputs_only);
+	UT_RUN(test_census_recheck_rejects_every_changed_root_token_byte);
+	UT_RUN(test_census_recheck_rejects_changed_history_metadata);
+	UT_RUN(test_census_recheck_scope_failures_discard_provisional_group);
+	UT_RUN(test_census_recheck_refuses_missing_or_execution_state);
+
 	UT_RUN(test_history_side_capture_refusals_keep_original_boundaries);
 	UT_RUN(test_checkpoint_inputs_survive_census_for_every_generation);
 	UT_RUN(test_checkpoint_input_mismatch_stops_before_capture_and_scan);

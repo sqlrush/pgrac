@@ -793,6 +793,8 @@ typedef struct ClusterColdTypedV1 {
 	uint8 side_capture_detail[CLUSTER_COLD_MAX_PARTICIPANTS];
 	XLogRecPtr side_capture_read_rec_ptr[CLUSTER_COLD_MAX_PARTICIPANTS];
 	struct ClusterWalInputsV1 *inputs;				   /* census read scope, released by pass 1 */
+	ClusterControlRootFileToken census_root; /* metadata only, never an execution pin */
+	bool census_root_captured;
 	uint32 input_index[CLUSTER_COLD_MAX_PARTICIPANTS]; /* history: index in that scope */
 	uint64 system_identifier;
 	uint64 scanned_records;
@@ -804,6 +806,11 @@ typedef struct ClusterColdTypedV1 {
 extern ClusterColdTypedV1 *cluster_cold_typed_prepare_v1(struct ClusterRecoveryFencePlan *fence,
 														 uint16 own_thread, XLogRecPtr own_redo);
 extern void cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed);
+
+/* Startup before execution pin/IR only. Reopen the original cold input owner,
+ * compare the complete selected ROOT and history checkpoints, then release
+ * all read pins. Success is freshness input, not execution/durability proof. */
+extern bool cluster_cold_typed_recheck_inputs_v1(ClusterColdTypedV1 *typed);
 
 /* Original native checkpoint input for any selected generation, including
  * history. Copies only sealed input; failure clears both outputs. This does

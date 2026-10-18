@@ -562,12 +562,16 @@ cluster_cold_space_check_v1(void *arg, const RelFileLocator *locator,
 static int census_scope;
 static ClusterControlRootResult census_begin_result;
 static ClusterControlRootResult census_revalidate_result;
+static ClusterControlRootResult census_token_result;
+static ClusterControlRootFileToken census_token;
+static int census_token_reads;
 static ClusterColdCensusDetailV1 census_select_result;
 static ClusterColdCensusDetailV1 census_cover_result;
 static uint16 census_bad_thread;
 static XLogRecPtr census_redo_skew; /* added to thread 2's census native redo */
 static ClusterColdCensusEntryV1 census_history[MAX_HISTORY];
 static uint32 census_history_count;
+static bool census_history_current;
 static int census_begins;
 static ClusterWalInputV1 census_inputs[13];
 static int census_input_fault;
@@ -600,8 +604,11 @@ cluster_wal_inputs_cold_begin_v1(const uint8 storage_uuid[16], uint64 system_ide
 		const ClusterColdCensusEntryV1 *entry = &census_history[i];
 		ClusterWalInputV1 *item = &census_inputs[entry->input_index];
 		item->kind = CLUSTER_WAL_INPUT_CHECKPOINT;
+		item->current = census_history_current;
 		item->source = entry->source;
 		item->checkpoint = roots[entry->cut.thread_id];
+		if (census_history_current)
+			item->checkpoint.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
 		item->checkpoint.identity = entry->identity;
 		item->checkpoint.checkpoint_lower_lsn = entry->cut.physical_lower;
 		item->checkpoint.validated_tail_lsn_exclusive = entry->cut.tail_end;
@@ -660,6 +667,17 @@ cluster_wal_inputs_at_v1(ClusterWalInputsV1 *inputs, uint32 index)
 				   || (census_input_fault == 1 && index == census_fault_index)
 			   ? NULL
 			   : &census_inputs[index];
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_root_token_v1(ClusterWalInputsV1 *inputs, ClusterControlRootFileToken *out)
+{
+	UT_ASSERT(inputs == (ClusterWalInputsV1 *)&census_scope);
+	census_token_reads++;
+	memset(out, 0, sizeof(*out));
+	if (census_token_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*out = census_token;
+	return census_token_result;
 }
 
 ClusterControlRootResult
@@ -1117,11 +1135,17 @@ fixture(void)
 	contexts_alive = 0;
 	census_begin_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 	census_revalidate_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	census_token_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	memset(&census_token, 0, sizeof(census_token));
+	census_token.system_identifier = 9;
+	census_token.file_txn_seq = 5;
+	census_token_reads = 0;
 	census_select_result = CLUSTER_COLD_CENSUS_OK;
 	census_cover_result = CLUSTER_COLD_CENSUS_OK;
 	census_bad_thread = 0;
 	census_redo_skew = 0;
 	census_history_count = 0;
+	census_history_current = false;
 	census_input_fault = 0;
 	census_fault_index = 11;
 	census_begins = census_releases = history_scans = 0;
