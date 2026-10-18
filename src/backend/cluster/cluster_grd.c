@@ -6069,6 +6069,172 @@ cluster_grd_sweep_runs(void)
  *   holderless entries.
  * ============================================================ */
 
+/* Unlike the SQL summary walker, diagnostics must not pin/release an entry:
+ * releasing a lookup pin could retire a cold entry. The shard lock protects
+ * its address against HASH_REMOVE; the entry lock protects every vector. */
+ClusterGrdQueueObservationStatus
+cluster_grd_queue_snapshot(const ClusterResId *resid, ClusterGrdQueueSnapshot *out,
+						   ClusterGrdQueueMemberSnapshot *members, int capacity)
+{
+	ClusterGrdEntry *entry;
+	ClusterGrdQueueObservationStatus status;
+	uint64 hash64;
+	uint32 shard;
+	int64 total = 0;
+	bool found;
+
+	if (out == NULL)
+		return CLUSTER_GRD_QUEUE_INVALID;
+	memset(out, 0, sizeof(*out));
+	if (resid == NULL || capacity < 0 || (capacity > 0 && members == NULL))
+		return CLUSTER_GRD_QUEUE_INVALID;
+	out->resid = *resid;
+	if (cluster_grd_entry_htab == NULL || cluster_grd_shard_locks == NULL
+		|| cluster_grd_state == NULL)
+		return CLUSTER_GRD_QUEUE_UNAVAILABLE;
+	grd_slot_area_attach();
+	hash64 = cluster_grd_hash_resource(resid);
+	shard = (uint32)(hash64 % PGRAC_GRD_SHARD_COUNT);
+	LWLockAcquire(&cluster_grd_shard_locks[shard].lock, LW_SHARED);
+	entry = hash_search_with_hash_value(cluster_grd_entry_htab, resid, (uint32)hash64, HASH_FIND,
+										&found);
+	if (entry == NULL) {
+		LWLockRelease(&cluster_grd_shard_locks[shard].lock);
+		return CLUSTER_GRD_QUEUE_ABSENT;
+	}
+	SpinLockAcquire(&entry->lock);
+	out->generation = entry->generation;
+	out->last_modified_scn = entry->last_modified_scn;
+	out->state_flags = entry->state_flags;
+	out->pin_count = pg_atomic_read_u32(&entry->pin);
+	out->ngranted = entry->ngranted;
+	out->nwaiters = entry->nwaiters;
+	out->nconverts = entry->nconverts;
+	out->nreservations = entry->nreservations;
+	status = CLUSTER_GRD_QUEUE_INVALID;
+	for (int k = 0; k < GRD_VECTOR_COUNT; k++) {
+		int count = grd_vector_count(entry, (GrdVectorKind)k);
+
+		if (count < 0 || count > entry->vectors[k].capacity)
+			goto done;
+		total += count;
+	}
+	if (total > INT_MAX)
+		goto done;
+	out->required = (int)total;
+	for (int k = 0; k < GRD_VECTOR_COUNT; k++) {
+		int count = grd_vector_count(entry, (GrdVectorKind)k);
+
+		for (int i = 0; i < count && out->copied < capacity; i++) {
+			ClusterGrdQueueMemberSnapshot *row = &members[out->copied++];
+
+			memset(row, 0, sizeof(*row));
+			row->ordinal = i;
+			switch ((GrdVectorKind)k) {
+			case GRD_HOLDERS: {
+				const ClusterGrdHolder *h = &grd_holders(entry)[i];
+
+				row->kind = CLUSTER_GRD_QUEUE_HOLDER;
+				row->id.node_id = h->node_id;
+				row->id.procno = h->procno;
+				row->id.cluster_epoch = h->cluster_epoch;
+				row->id.request_id = h->request_id;
+				row->source_node_id = h->node_id;
+				row->lock_group_procno_plus_one = h->lock_group_procno_plus_one;
+				row->mode = h->mode;
+				break;
+			}
+			case GRD_WAITERS: {
+				const ClusterGrdWaiter *w = &grd_waiters(entry)[i];
+
+				row->kind = CLUSTER_GRD_QUEUE_WAITER;
+				row->id.node_id = w->node_id;
+				row->id.procno = w->procno;
+				row->id.cluster_epoch = w->cluster_epoch;
+				row->id.request_id = w->request_id;
+				row->source_node_id = w->source_node_id;
+				row->lock_group_procno_plus_one = w->lock_group_procno_plus_one;
+				row->mode = w->mode;
+				row->request_opcode = w->request_opcode;
+				row->waiter_xid = w->waiter_xid;
+				row->wait_seq = w->wait_seq;
+				row->shard_master_generation = w->shard_master_generation;
+				row->wait_start = w->wait_start;
+				row->fair_queue_seq = w->fair_queue_seq;
+				row->skip_count = w->skip_count;
+				row->boosted = w->boosted;
+				break;
+			}
+			case GRD_CONVERTS: {
+				const ClusterGrdConvert *c = &grd_converts(entry)[i];
+
+				row->kind = CLUSTER_GRD_QUEUE_CONVERT;
+				row->id.node_id = c->node_id;
+				row->id.procno = c->procno;
+				row->id.cluster_epoch = c->cluster_epoch;
+				row->id.request_id = c->convert_request_id;
+				row->source_node_id = c->source_node_id;
+				row->lock_group_procno_plus_one = c->lock_group_procno_plus_one;
+				row->mode = c->requested_mode;
+				row->current_mode = c->current_mode;
+				row->request_opcode = c->request_opcode;
+				row->waiter_xid = c->waiter_xid;
+				row->wait_seq = c->wait_seq;
+				row->shard_master_generation = c->shard_master_generation;
+				row->wait_start = c->wait_start;
+				row->fair_queue_seq = c->fair_queue_seq;
+				row->skip_count = c->skip_count;
+				row->boosted = c->boosted;
+				break;
+			}
+			case GRD_RESERVATIONS:
+				row->kind = CLUSTER_GRD_QUEUE_RESERVATION;
+				row->id = grd_reservations(entry)[i].id;
+				row->source_node_id = row->id.node_id;
+				row->mode = grd_reservations(entry)[i].mode;
+				break;
+			default:
+				pg_unreachable();
+			}
+		}
+	}
+	status = out->copied < out->required ? CLUSTER_GRD_QUEUE_TRUNCATED : CLUSTER_GRD_QUEUE_OBSERVED;
+done:
+	SpinLockRelease(&entry->lock);
+	LWLockRelease(&cluster_grd_shard_locks[shard].lock);
+	return status;
+}
+
+bool
+cluster_grd_queue_snapshots_walk(ClusterGrdQueueSnapshotVisitor visitor, void *ctx,
+								 int member_capacity)
+{
+	ClusterResId *resids = NULL;
+	ClusterGrdQueueMemberSnapshot *members = NULL;
+	int nresids;
+
+	if (visitor == NULL || member_capacity < 0
+		|| (Size)member_capacity > MaxAllocSize / sizeof(*members) || cluster_grd_entry_htab == NULL
+		|| cluster_grd_shard_locks == NULL || cluster_grd_state == NULL)
+		return false;
+	if (member_capacity > 0)
+		members = palloc((Size)member_capacity * sizeof(*members));
+	nresids = cluster_grd_snapshot_entry_resids(&resids);
+	for (int r = 0; r < nresids; r++) {
+		ClusterGrdQueueSnapshot entry;
+		ClusterGrdQueueObservationStatus status;
+
+		CHECK_FOR_INTERRUPTS();
+		status = cluster_grd_queue_snapshot(&resids[r], &entry, members, member_capacity);
+		visitor(ctx, status, &entry, members);
+	}
+	if (members != NULL)
+		pfree(members);
+	if (resids != NULL)
+		pfree(resids);
+	return true;
+}
+
 void
 cluster_grd_entries_walk(ClusterGrdEntryRowVisitor visitor, void *ctx)
 {

@@ -892,4 +892,48 @@ cluster_txw_get_timeout_count(void)
 	return ClusterTxw ? pg_atomic_read_u64(&ClusterTxw->timeout_count) : 0;
 }
 
+/* An explicit diagnostic caller owns the output storage. Copy under the
+ * original waiter lock, without publishing waits or changing any counters. */
+bool
+cluster_tx_enqueue_snapshot(ClusterTxWaitSnapshot *out, int capacity, int *copied, int *required)
+{
+	bool valid = true;
+
+	if (copied != NULL)
+		*copied = 0;
+	if (required != NULL)
+		*required = 0;
+	if (copied == NULL || required == NULL || capacity < 0 || (capacity > 0 && out == NULL)
+		|| ClusterTxw == NULL)
+		return false;
+
+	LWLockAcquire(&ClusterTxw->lock, LW_SHARED);
+	for (int i = 0; i < ClusterTxw->nslots; i++) {
+		const ClusterTxwWaitSlot *slot = &ClusterTxw->slots[i];
+		ClusterTxWaitSnapshot *row;
+
+		if (slot->waiting == CLUSTER_TXW_SLOT_FREE)
+			continue;
+		if (slot->waiting != CLUSTER_TXW_SLOT_SOURCE && slot->waiting != CLUSTER_TXW_SLOT_TARGET
+			&& slot->waiting != CLUSTER_TXW_SLOT_SOURCE_CURRENT_MX) {
+			valid = false;
+			break;
+		}
+		(*required)++;
+		if (*copied >= capacity)
+			continue;
+		row = &out[(*copied)++];
+		memset(row, 0, sizeof(*row));
+		row->procno = i;
+		row->kind = slot->waiting;
+		if (slot->waiting == CLUSTER_TXW_SLOT_TARGET)
+			memcpy(&row->target_locator, slot->identity.target_locator_words,
+				   sizeof(row->target_locator));
+		else
+			row->source_key = slot->identity.source_key;
+	}
+	LWLockRelease(&ClusterTxw->lock);
+	return valid;
+}
+
 #endif /* USE_PGRAC_CLUSTER */

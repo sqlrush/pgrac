@@ -7966,6 +7966,224 @@ UT_TEST(test_grd_projection_oom_retracts_all_old_wait_edges)
 	}
 }
 
+/* The passive key walk has a cancellation point between entries. */
+volatile sig_atomic_t InterruptPending = false;
+void
+ProcessInterrupts(void)
+{
+	UT_ASSERT(false);
+}
+
+UT_TEST(test_grd_queue_observation_distinguishes_unavailable_absent_and_empty)
+{
+	ClusterResId resid;
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdQueueSnapshot snapshot;
+	uint64 hits;
+
+	convert_teardown();
+	bast_resid(6100, &resid);
+	UT_ASSERT_EQ(cluster_grd_queue_snapshot(&resid, &snapshot, NULL, 0),
+				 CLUSTER_GRD_QUEUE_UNAVAILABLE);
+	UT_ASSERT_EQ(cluster_grd_queue_snapshot(NULL, &snapshot, NULL, 0), CLUSTER_GRD_QUEUE_INVALID);
+	UT_ASSERT_EQ(cluster_grd_queue_snapshot(&resid, NULL, NULL, 0), CLUSTER_GRD_QUEUE_INVALID);
+	convert_reset();
+	UT_ASSERT_EQ(cluster_grd_queue_snapshot(&resid, &snapshot, NULL, 0), CLUSTER_GRD_QUEUE_ABSENT);
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&resid, true, &entry), CLUSTER_GRD_ENTRY_OK);
+	hits = cluster_grd_entry_lookup_hit_count();
+	UT_ASSERT_EQ(cluster_grd_queue_snapshot(&resid, &snapshot, NULL, 0),
+				 CLUSTER_GRD_QUEUE_OBSERVED);
+	UT_ASSERT_EQ(snapshot.required, 0);
+	UT_ASSERT_EQ(snapshot.copied, 0);
+	UT_ASSERT_EQ(snapshot.pin_count, 1);
+	UT_ASSERT_EQ(cluster_grd_entry_pin_count(entry), 1);
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_hit_count(), hits);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 1);
+	UT_ASSERT_EQ(cluster_grd_queue_snapshot(&resid, &snapshot, NULL, 1), CLUSTER_GRD_QUEUE_INVALID);
+	UT_ASSERT_EQ(cluster_grd_queue_snapshot(&resid, &snapshot, NULL, -1),
+				 CLUSTER_GRD_QUEUE_INVALID);
+	cluster_grd_entry_release(entry);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+	convert_teardown();
+}
+
+static void
+observe_queue_visitor(void *ctx, ClusterGrdQueueObservationStatus status,
+					  const ClusterGrdQueueSnapshot *entry,
+					  const ClusterGrdQueueMemberSnapshot *members)
+{
+	ClusterGrdQueueSnapshot again;
+	ClusterGrdQueueMemberSnapshot copy[8];
+	int *visited = ctx;
+
+	UT_ASSERT(stop_held_lock == NULL);
+	UT_ASSERT_EQ(status, CLUSTER_GRD_QUEUE_OBSERVED);
+	UT_ASSERT_EQ(entry->copied, 3);
+	UT_ASSERT_EQ(members[0].kind, CLUSTER_GRD_QUEUE_HOLDER);
+	/* A visitor may query again: the walk must not retain an entry/shard lock. */
+	UT_ASSERT_EQ(cluster_grd_queue_snapshot(&entry->resid, &again, copy, 8), status);
+	UT_ASSERT_EQ(again.generation, entry->generation);
+	(*visited)++;
+}
+
+UT_TEST(test_grd_queue_observation_copies_native_waiter_identity_without_mutation)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId holder = bast_holder(1, 700, 501);
+	ClusterGrdHolderId waiters[2] = { bast_holder(2, 701, 502), bast_holder(3, 702, 503) };
+	ClusterGrdWaiterMeta meta = { 900, 71, 702 };
+	ClusterGrdQueueSnapshot snapshot;
+	ClusterGrdQueueMemberSnapshot members[8];
+	ClusterGrdEntry *entry = NULL;
+	uint64 hits, generation;
+	int visited = 0;
+
+	convert_reset();
+	ut_wfg_reset();
+	ut_mock_epoch = 0;
+	bast_resid(6101, &resid);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(
+					 &resid, &holder, 1, 501, 0, UT_GES_OPCODE_REQUEST, ExclusiveLock, NULL, NULL),
+				 CLUSTER_GRD_GRANT_NOW);
+	for (int i = 0; i < 2; i++) {
+		meta.xid = 900 + i;
+		meta.wait_seq = 71 + i;
+		UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant_meta(
+						 &resid, &waiters[i], 2 + i, waiters[i].request_id, meta, 0,
+						 UT_GES_OPCODE_REQUEST, ShareLock, NULL, NULL),
+					 CLUSTER_GRD_ENQUEUED_WAITER);
+	}
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&resid, false, &entry), CLUSTER_GRD_ENTRY_OK);
+	hits = cluster_grd_entry_lookup_hit_count();
+	generation = entry->generation;
+	UT_ASSERT_EQ(cluster_grd_queue_snapshot(&resid, &snapshot, members, 8),
+				 CLUSTER_GRD_QUEUE_OBSERVED);
+	UT_ASSERT_EQ(snapshot.required, 3);
+	UT_ASSERT_EQ(snapshot.ngranted, 1);
+	UT_ASSERT_EQ(snapshot.nwaiters, 2);
+	UT_ASSERT_EQ(snapshot.generation, generation);
+	UT_ASSERT_EQ(members[0].id.request_id, 501);
+	UT_ASSERT_EQ(members[0].mode, ExclusiveLock);
+	for (int i = 0; i < 2; i++) {
+		UT_ASSERT_EQ(members[1 + i].kind, CLUSTER_GRD_QUEUE_WAITER);
+		UT_ASSERT_EQ(members[1 + i].ordinal, i);
+		UT_ASSERT_EQ(members[1 + i].id.node_id, waiters[i].node_id);
+		UT_ASSERT_EQ(members[1 + i].id.procno, waiters[i].procno);
+		UT_ASSERT_EQ(members[1 + i].id.cluster_epoch, waiters[i].cluster_epoch);
+		UT_ASSERT_EQ(members[1 + i].id.request_id, waiters[i].request_id);
+		UT_ASSERT_EQ(members[1 + i].source_node_id, 2 + i);
+		UT_ASSERT_EQ(members[1 + i].waiter_xid, 900 + i);
+		UT_ASSERT_EQ(members[1 + i].wait_seq, 71 + i);
+		UT_ASSERT_EQ(members[1 + i].lock_group_procno_plus_one, 702);
+		UT_ASSERT_EQ(members[1 + i].mode, ShareLock);
+		UT_ASSERT_EQ(members[1 + i].request_opcode, UT_GES_OPCODE_REQUEST);
+	}
+	stop_lock_tracking = true;
+	UT_ASSERT(cluster_grd_queue_snapshots_walk(observe_queue_visitor, &visited, 8));
+	stop_lock_tracking = false;
+	UT_ASSERT_EQ(visited, 1);
+	UT_ASSERT_EQ(cluster_grd_entry_pin_count(entry), 1);
+	UT_ASSERT_EQ(entry->generation, generation);
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_hit_count(), hits);
+	UT_ASSERT_EQ(ut_wfg_n, 2);
+	cluster_grd_entry_release(entry);
+	for (int i = 0; i < 2; i++)
+		UT_ASSERT_EQ(cluster_grd_cancel_waiter_by_id(&resid, &waiters[i]), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_release_holder_by_id(&resid, &holder), CLUSTER_GRD_ENTRY_OK);
+	convert_teardown();
+}
+
+UT_TEST(test_grd_queue_observation_keeps_convert_and_reservation_distinct)
+{
+	ClusterGrdEntry *entry;
+	ClusterGrdConvert req;
+	bool drain = false;
+	ClusterGrdHolderId reservation = bast_holder(3, 300, 33);
+	ClusterGrdQueueSnapshot snapshot;
+	ClusterGrdQueueMemberSnapshot members[8];
+	uint64 generation;
+
+	convert_reset();
+	entry = convert_make_entry(6102);
+	convert_grant(entry, 1, 100, 11, ShareLock);
+	convert_grant(entry, 2, 200, 22, ShareLock);
+	req = convert_req(1, 100, ShareLock, ExclusiveLock, 53);
+	req.waiter_xid = 912;
+	req.wait_seq = 93;
+	UT_ASSERT_EQ(cluster_grd_entry_request_convert(entry, &req, &drain),
+				 CLUSTER_GRD_CONVERT_ENQUEUED);
+	UT_ASSERT_EQ(cluster_grd_reservation_create(entry, &reservation, AccessShareLock),
+				 CLUSTER_GRD_ENTRY_OK);
+	generation = entry->generation;
+	UT_ASSERT_EQ(cluster_grd_queue_snapshot(&entry->resid, &snapshot, members, 8),
+				 CLUSTER_GRD_QUEUE_OBSERVED);
+	UT_ASSERT_EQ(snapshot.ngranted, 2);
+	UT_ASSERT_EQ(snapshot.nconverts, 1);
+	UT_ASSERT_EQ(snapshot.nreservations, 1);
+	UT_ASSERT_EQ(snapshot.required, 4);
+	UT_ASSERT_EQ(members[2].kind, CLUSTER_GRD_QUEUE_CONVERT);
+	UT_ASSERT_EQ(members[2].id.request_id, 53);
+	UT_ASSERT_EQ(members[2].current_mode, ShareLock);
+	UT_ASSERT_EQ(members[2].mode, ExclusiveLock);
+	UT_ASSERT_EQ(members[2].waiter_xid, 912);
+	UT_ASSERT_EQ(members[2].wait_seq, 93);
+	UT_ASSERT_EQ(members[3].kind, CLUSTER_GRD_QUEUE_RESERVATION);
+	UT_ASSERT_EQ(members[3].id.request_id, 33);
+	UT_ASSERT_EQ(members[3].mode, AccessShareLock);
+	UT_ASSERT_EQ(entry->generation, generation);
+	UT_ASSERT_EQ(cluster_grd_entry_pin_count(entry), 1);
+	cluster_grd_entry_release(entry);
+	convert_teardown();
+}
+
+UT_TEST(test_grd_queue_observation_copies_dynamic_vector_and_reports_truncation)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId holders[17];
+	ClusterGrdQueueSnapshot snapshot;
+	ClusterGrdQueueMemberSnapshot members[32];
+	unsigned char tail[sizeof(members[1])];
+	uint64 hits;
+	Size pool_used;
+
+	convert_reset();
+	bast_resid(6103, &resid);
+	for (int i = 0; i < 17; i++) {
+		holders[i] = bast_holder(1, 400 + i, 1 + i);
+		UT_ASSERT_EQ(
+			cluster_grd_entry_enqueue_or_grant(&resid, &holders[i], 1, holders[i].request_id, 0,
+											   UT_GES_OPCODE_REQUEST, RowExclusiveLock, NULL, NULL),
+			CLUSTER_GRD_GRANT_NOW);
+	}
+	pool_used = ut_grd_pool_used;
+	UT_ASSERT(pool_used > 0);
+	hits = cluster_grd_entry_lookup_hit_count();
+	memset(members, 0x5a, sizeof(members));
+	memcpy(tail, &members[1], sizeof(tail));
+	UT_ASSERT_EQ(cluster_grd_queue_snapshot(&resid, &snapshot, members, 1),
+				 CLUSTER_GRD_QUEUE_TRUNCATED);
+	UT_ASSERT_EQ(snapshot.copied, 1);
+	UT_ASSERT_EQ(snapshot.required, 17);
+	UT_ASSERT_EQ(memcmp(tail, &members[1], sizeof(tail)), 0);
+	UT_ASSERT_EQ(cluster_grd_queue_snapshot(&resid, &snapshot, NULL, 0),
+				 CLUSTER_GRD_QUEUE_TRUNCATED);
+	UT_ASSERT_EQ(snapshot.copied, 0);
+	UT_ASSERT_EQ(snapshot.required, 17);
+	UT_ASSERT_EQ(cluster_grd_queue_snapshot(&resid, &snapshot, members, 32),
+				 CLUSTER_GRD_QUEUE_OBSERVED);
+	for (int i = 0; i < 17; i++) {
+		UT_ASSERT_EQ(members[i].id.request_id, holders[i].request_id);
+		UT_ASSERT_EQ(members[i].ordinal, i);
+	}
+	UT_ASSERT_EQ(snapshot.pin_count, 0);
+	UT_ASSERT_EQ(ut_grd_pool_used, pool_used);
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_hit_count(), hits);
+	for (int i = 0; i < 17; i++)
+		UT_ASSERT_EQ(cluster_grd_release_holder_by_id(&resid, &holders[i]), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(ut_grd_pool_used, 0);
+	convert_teardown();
+}
+
 int
 /* cppcheck-suppress constParameter
  * Reason: main() keeps the standard test harness signature used by the
@@ -7981,8 +8199,12 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(171);
+	UT_PLAN(175);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
+	UT_RUN(test_grd_queue_observation_distinguishes_unavailable_absent_and_empty);
+	UT_RUN(test_grd_queue_observation_copies_native_waiter_identity_without_mutation);
+	UT_RUN(test_grd_queue_observation_keeps_convert_and_reservation_distinct);
+	UT_RUN(test_grd_queue_observation_copies_dynamic_vector_and_reports_truncation);
 	UT_RUN(test_parallel_group_worker_cannot_wait_behind_blocked_ddl);
 	UT_RUN(test_parallel_group_convert_uses_original_holder_group);
 	UT_RUN(test_parallel_group_waiter_drain_and_wfg);
