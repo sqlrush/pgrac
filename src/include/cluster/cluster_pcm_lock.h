@@ -813,7 +813,8 @@ typedef enum ResourceXIntentProbeResult {
 	RESOURCE_X_INTENT_PROBE_DELIVERY = 5,
 	RESOURCE_X_INTENT_PROBE_SOURCE_FINISH = 6,
 	RESOURCE_X_INTENT_PROBE_SOURCE_SETTLEMENT = 7,
-	RESOURCE_X_INTENT_PROBE_MASTER_DURABLE = 8
+	RESOURCE_X_INTENT_PROBE_MASTER_DURABLE = 8,
+	RESOURCE_X_INTENT_PROBE_BOOTSTRAP = 9
 } ResourceXIntentProbeResult;
 
 typedef enum ResourceXIntentState {
@@ -916,6 +917,19 @@ typedef struct ResourceXMasterDurableWork {
 
 StaticAssertDecl(sizeof(ResourceXMasterDurableWork) <= RESOURCE_X_PROOF_V1_BYTES,
 				 "local master work must fit the existing probe payload");
+
+/* Exact retained master-queue reference; local work, never wire authority. */
+typedef struct ResourceXBootstrapWork {
+	ResourceXDecodedCommon request;
+	uint64 binding_generation;
+	uint64 enqueue_order;
+	uint64 r4_record_generation;
+	uint32 authenticated_ingress_connection_generation;
+	uint32 master_sender_connection_generation;
+} ResourceXBootstrapWork;
+
+StaticAssertDecl(sizeof(ResourceXBootstrapWork) <= RESOURCE_X_PROOF_V1_BYTES,
+				 "bootstrap work must fit the existing probe payload");
 
 #define RESOURCE_X_REQUESTER_JOIN_HAS_IMAGE UINT32_C(0x00000001)
 #define RESOURCE_X_REQUESTER_JOIN_HAS_GRANT UINT32_C(0x00000002)
@@ -1505,6 +1519,11 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_bootstrap_request_exact(
 	uint32 authenticated_ingress_connection_generation, uint64 r4_record_generation,
 	uint64 current_master_session_incarnation, uint32 master_sender_connection_generation,
 	ResourceXDecodedFrame *ack_out);
+/* LMS must revalidate current semantic, peer and session admission first. */
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_bootstrap_resume_exact(const ResourceXBootstrapWork *work,
+												   ResourceXDecodedFrame *ack_out);
+extern void cluster_pcm_lock_resource_x_bootstrap_forget_exact(const ResourceXBootstrapWork *work);
 extern bool cluster_pcm_lock_resource_x_s_barrier_active(const BufferTag *tag);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
 	const ResourceXDecodedFrame *assertion, int32 authenticated_source_node,

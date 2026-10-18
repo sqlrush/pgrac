@@ -13402,6 +13402,85 @@ done:
 		gcs_block_resource_x_stage_ready_tag(&frame->common.logical_assertion.resource);
 }
 
+/* A retained request is not a newly authenticated packet. Revalidate its
+ * original ingress and return connection, plus all current admission domains,
+ * before the master samples a base. Temporary unavailability retains work. */
+static ResourceXApplyResult
+gcs_block_resource_x_bootstrap_admitted(const ResourceXBootstrapWork *work,
+										const ClusterSemanticAdmissionToken *admission)
+{
+	ResourceXGateSnapshot gate;
+	ResourceXApplyResult result;
+	uint64 session;
+	uint32 outbound_connection;
+	int32 master;
+	int32 requester = work->request.logical_assertion.requester_node;
+
+	if (admission->record_generation != work->r4_record_generation)
+		return RESOURCE_X_APPLY_STALE;
+	result = gcs_block_resource_x_target_peer_result_exact(
+		admission, requester, work->authenticated_ingress_connection_generation);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	if (gcs_block_resource_x_gate_session_snapshot_result(&work->request.logical_assertion.resource,
+														  &gate, &master, &session)
+		!= PCM_X_SESSION_AUTH_OK)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	if (master != cluster_node_id || gate.formation != work->request.resource_formation
+		|| session != work->request.master_session_incarnation)
+		return RESOURCE_X_APPLY_STALE;
+	if (!gcs_block_pcm_x_resource_x_peer_ready_exact(requester, &outbound_connection))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	if (outbound_connection != work->master_sender_connection_generation
+		|| !cluster_semantic_activation_recheck(admission))
+		return RESOURCE_X_APPLY_STALE;
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
+ResourceXApplyResult
+cluster_gcs_block_resource_x_bootstrap_tick(const ResourceXBootstrapWork *work)
+{
+	ClusterSemanticAdmissionToken admission = { 0 };
+	ResourceXDecodedFrame outbound;
+	volatile ResourceXApplyResult result = RESOURCE_X_APPLY_BAD_STATE;
+	volatile bool ready = false;
+
+	if (MyBackendType != B_LMS || work == NULL
+		|| !resource_x_assertion_valid(&work->request.logical_assertion))
+		return RESOURCE_X_APPLY_INVALID;
+	if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+										  CLUSTER_SEMANTIC_TARGET_SIDE, &admission)
+		!= CLUSTER_SEMANTIC_ADMISSION_OK)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	PG_TRY();
+	{
+		result = gcs_block_resource_x_bootstrap_admitted(work, &admission);
+		if (result == RESOURCE_X_APPLY_STALE)
+			cluster_pcm_lock_resource_x_bootstrap_forget_exact(work);
+		else if (result == RESOURCE_X_APPLY_APPLIED) {
+			result = cluster_pcm_lock_resource_x_bootstrap_resume_exact(work, &outbound);
+			if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE) {
+				ready = true;
+				/* The existing fused path already created the canonical request;
+				 * ordinary local-proof bootstrap still sends its exact ACK. */
+				if (outbound.kind != RESOURCE_X_WIRE_ASSERT_X
+					&& gcs_block_resource_x_bootstrap_admitted(work, &admission)
+						   == RESOURCE_X_APPLY_APPLIED)
+					(void)gcs_block_resource_x_bootstrap_ack_stage_exact(
+						work->request.logical_assertion.requester_node, &outbound);
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
+	if (ready)
+		gcs_block_resource_x_stage_ready_tag(&work->request.logical_assertion.resource);
+	return result;
+}
+
 static ResourceXApplyResult
 gcs_block_resource_x_bootstrapped_assert_ingress(const ClusterICEnvelope *env,
 												 const ResourceXDecodedFrame *assertion,

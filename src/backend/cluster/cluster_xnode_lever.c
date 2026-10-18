@@ -45,6 +45,9 @@
 
 #include <string.h>
 
+#include "access/transam.h"
+#include "cluster/cluster_conf.h"
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_xnode_lever.h"
@@ -139,11 +142,31 @@ typedef struct ClusterVisMemoEntry {
 } ClusterVisMemoEntry;
 
 static ClusterVisMemoEntry cluster_vis_memo[CLUSTER_VIS_MEMO_SLOTS];
+static LocalTransactionId cluster_vis_memo_lxid;
+static uint64 cluster_vis_memo_epoch;
 
 static inline bool
-vis_memo_active(void)
+vis_memo_active(const ClusterTTStatusKey *key)
 {
-	return cluster_page_scn_shortcut && MyProc != NULL && LocalTransactionIdIsValid(MyProc->lxid);
+	uint64 epoch;
+
+	if (!cluster_page_scn_shortcut || MyProc == NULL || !LocalTransactionIdIsValid(MyProc->lxid)) {
+		cluster_vis_memo_lxid = InvalidLocalTransactionId;
+		return false;
+	}
+	epoch = cluster_epoch_get_current();
+	/* Retire the whole observed identity domain, so restoring a prior numeric
+	 * lxid or epoch cannot resurrect an earlier transaction's facts. */
+	if (cluster_vis_memo_lxid != MyProc->lxid || cluster_vis_memo_epoch != epoch) {
+		memset(cluster_vis_memo, 0, sizeof(cluster_vis_memo));
+		cluster_vis_memo_lxid = MyProc->lxid;
+		cluster_vis_memo_epoch = epoch;
+	}
+	/* Legacy/incomplete identities still use the authoritative resolver. */
+	return key != NULL && epoch != 0 && epoch <= UINT32_MAX && key->cluster_epoch == epoch
+		   && key->origin_node_id < CLUSTER_MAX_NODES && key->undo_segment_id != 0
+		   && key->tt_slot_id != 0 && TransactionIdIsNormal(key->local_xid) && key->_reserved == 0
+		   && key->_reserved2 == 0;
 }
 
 static inline uint32
@@ -171,7 +194,7 @@ cluster_vis_memo_probe(const ClusterTTStatusKey *key, uint8 *status_out, SCN *sc
 {
 	ClusterVisMemoEntry *e;
 
-	if (!vis_memo_active() || key == NULL)
+	if (!vis_memo_active(key))
 		return false;
 
 	e = &cluster_vis_memo[vis_memo_slot(key)];
@@ -193,7 +216,7 @@ cluster_vis_memo_install(const ClusterTTStatusKey *key, uint8 status, SCN commit
 {
 	ClusterVisMemoEntry *e;
 
-	if (!vis_memo_active() || key == NULL)
+	if (!vis_memo_active(key))
 		return;
 	if (!vis_memo_status_terminal(status, commit_scn))
 		return; /* 8.A: only immutable terminal facts enter */

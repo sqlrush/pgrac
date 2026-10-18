@@ -5435,6 +5435,16 @@ test_cluster_pcm_master_durable.inc: $(top_srcdir)/src/backend/cluster/cluster_g
 	     END { if (count != 9 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Exercise the actual master queue callback and its peer/ACK path.
+test_cluster_pcm_bootstrap_tick.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_resource_x_target_peer_result_exact\(/ { print "static ResourceXApplyResult"; emit=1; count++ } \
+	     /^gcs_block_resource_x_bootstrap_ack_stage_exact\(/ { print "static bool"; emit=1; count++ } \
+	     /^gcs_block_resource_x_bootstrap_admitted\(/ { print "static ResourceXApplyResult"; emit=1; count++ } \
+	     /^cluster_gcs_block_resource_x_bootstrap_tick\(/ { print "ResourceXApplyResult"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (count != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 # Exercise the actual final LMS0 wait adjustment with the real PCM fixture.
 test_cluster_pcm_lms_intent_wait.inc: $(top_srcdir)/src/backend/cluster/cluster_lms.c Makefile
 	awk '/DATA tick owns separate management\/dispatch brackets/ { emit=1; begin++ } \
@@ -5452,6 +5462,7 @@ test_cluster_pcm_settlement_ingress.inc: $(top_srcdir)/src/backend/cluster/clust
 
 test_cluster_pcm_lock test_cluster_pcm_object_retire: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
 		test_cluster_pcm_master_durable.inc \
+		test_cluster_pcm_bootstrap_tick.inc \
 		test_cluster_pcm_settlement_ingress.inc \
 		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
 		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \

@@ -796,6 +796,13 @@ cluster_lms_outbound_resource_x_intent_pump(void)
 			break;
 		if (probe_result == RESOURCE_X_INTENT_PROBE_MORE)
 			continue;
+		if (probe_result == RESOURCE_X_INTENT_PROBE_BOOTSTRAP) {
+			ResourceXBootstrapWork work;
+
+			memcpy(&work, payload, sizeof(work));
+			(void)cluster_gcs_block_resource_x_bootstrap_tick(&work);
+			continue;
+		}
 		if (probe_result == RESOURCE_X_INTENT_PROBE_MASTER_DURABLE) {
 			ResourceXMasterDurableWork work;
 
