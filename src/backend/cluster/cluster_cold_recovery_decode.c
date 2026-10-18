@@ -345,6 +345,31 @@ cold_space_reservation(XLogReaderState *reader, uint64 system_identifier,
 	return CLUSTER_COLD_OK;
 }
 
+/* LogLogicalMessage writes a native header, a strlen(prefix)+1 C string,
+ * then exactly message_size arbitrary bytes. Physical redo is a no-op,
+ * but that does not qualify incomplete bytes in either retained stream. */
+static bool
+cold_logical_message_shape(XLogReaderState *reader)
+{
+	const char *data = XLogRecGetData(reader);
+	uint32 length = XLogRecGetDataLen(reader);
+	Size prefix_size, message_size, remaining;
+
+	if (XLogRecGetInfo(reader) != XLOG_LOGICAL_MESSAGE || XLogRecHasAnyBlockRefs(reader)
+		|| data == NULL || length < SizeOfLogicalMessage)
+		return false;
+	/* Do not read an invalid native bool representation as bool. */
+	if ((unsigned char)data[offsetof(xl_logical_message, transactional)] > 1)
+		return false;
+	memcpy(&prefix_size, data + offsetof(xl_logical_message, prefix_size), sizeof(prefix_size));
+	memcpy(&message_size, data + offsetof(xl_logical_message, message_size), sizeof(message_size));
+	remaining = length - SizeOfLogicalMessage;
+	if (prefix_size == 0 || prefix_size > remaining || message_size != remaining - prefix_size)
+		return false;
+	return memchr(data + SizeOfLogicalMessage, '\0', prefix_size)
+		   == data + SizeOfLogicalMessage + prefix_size - 1;
+}
+
 static ClusterColdDetailV1
 cold_record_flags(XLogReaderState *reader, uint64 system_identifier, const uint8 storage_uuid[16],
 				  bool foreign, ClusterColdDecodedV1 *out, uint8 *flags, uint32 *effects)
@@ -391,6 +416,9 @@ cold_record_flags(XLogReaderState *reader, uint64 system_identifier, const uint8
 		/* Shared commit_ts has no recovery consumer, including own history. */
 		*flags = CLUSTER_COLD_RECORD_UNSUPPORTED;
 		return CLUSTER_COLD_OK;
+	case RM_LOGICALMSG_ID:
+		return cold_logical_message_shape(reader) ? CLUSTER_COLD_OK
+												  : CLUSTER_COLD_COMPONENT_INVALID;
 	case RM_STANDBY_ID:
 		/* A primary-context no-effect route still needs complete native
 		 * bytes, including retained history and our own source. */

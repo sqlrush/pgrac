@@ -732,6 +732,7 @@ UT_TEST(test_foreign_native_control_is_typed_noop)
 {
 	FakeRecord record;
 	ClusterColdDecodedV1 out = { 0 };
+	xl_logical_message message = { .dbId = 5, .prefix_size = 1 };
 	static const struct {
 		uint8 rmid;
 		uint8 info;
@@ -777,6 +778,8 @@ UT_TEST(test_foreign_native_control_is_typed_noop)
 	}
 
 	fake_record(&record, RM_LOGICALMSG_ID, XLOG_LOGICAL_MESSAGE, 0);
+	memcpy(record.data, &message, SizeOfLogicalMessage);
+	record.storage.decoded.main_data_len = SizeOfLogicalMessage + 1;
 	preflight_plan.route.record_owner = RF_ROUTE_OWNER_LOGICAL_NOOP;
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
 				 CLUSTER_COLD_OK);

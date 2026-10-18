@@ -28,6 +28,7 @@
 #include "cluster/cluster_recovery_tt_record.h"
 #include "cluster/cluster_space_reservation.h"
 #include "pgstat.h"
+#include "replication/message.h"
 #include "replication/origin.h"
 #include "storage/standbydefs.h"
 #include "unit_test.h"
@@ -363,6 +364,142 @@ UT_TEST(test_exact_foreign_noop_stays_no_effect)
 				 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.effects.no_effect, CLUSTER_COLD_EFFECT_RECORD);
 	UT_ASSERT(partitioned(&out.effects));
+}
+
+static void
+logical_message(EffectRecord *r, bool transactional, const char *prefix, const char *message,
+				Size length)
+{
+	xl_logical_message header = { .dbId = 5,
+								  .transactional = transactional,
+								  .prefix_size = strlen(prefix) + 1,
+								  .message_size = length };
+
+	record_init(r, RM_LOGICALMSG_ID, XLOG_LOGICAL_MESSAGE);
+	append(r, &header, SizeOfLogicalMessage);
+	append(r, prefix, header.prefix_size);
+	append(r, message, length);
+}
+
+UT_TEST(test_logical_message_keeps_complete_native_no_effect_carrier)
+{
+	const char message[] = { '\0', (char)0xff, 'x', '\0' };
+
+	for (int variant = 0; variant < 32; variant++) {
+		for (int foreign = 0; foreign <= 1; foreign++) {
+			EffectRecord r;
+			ClusterColdDecodedV1 out = { 0 };
+
+			logical_message(&r, (variant & 1) != 0, variant & 2 ? "prefix" : "", message,
+							variant & 4 ? sizeof(message) : 0);
+			r.decoded.record_origin = variant & 8 ? 7 : InvalidRepOriginId;
+			if (variant & 16) {
+				memmove(r.data.bytes + 1, r.data.bytes, r.decoded.main_data_len);
+				r.decoded.main_data++;
+			}
+			UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, foreign, &out),
+						 CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(out.record.record_flags,
+						 foreign ? CLUSTER_COLD_RECORD_FOREIGN_CONTROL : 0);
+			UT_ASSERT_EQ(out.effects.required, CLUSTER_COLD_EFFECT_RECORD);
+			UT_ASSERT_EQ(out.effects.native_apply, foreign ? 0 : CLUSTER_COLD_EFFECT_RECORD);
+			UT_ASSERT_EQ(out.effects.no_effect, foreign ? CLUSTER_COLD_EFFECT_RECORD : 0);
+			UT_ASSERT_EQ(out.effects.refused, 0);
+			UT_ASSERT(partitioned(&out.effects));
+			UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, !foreign));
+		}
+	}
+}
+
+UT_TEST(test_logical_message_requires_every_native_payload_byte)
+{
+	const char message[] = { '\0', 'x', (char)0xff };
+	EffectRecord complete;
+
+	logical_message(&complete, true, "prefix", message, sizeof(message));
+	for (uint32 length = 0; length < complete.decoded.main_data_len; length++) {
+		for (int foreign = 0; foreign <= 1; foreign++) {
+			EffectRecord r;
+			ClusterColdDecodedV1 out = { 0 };
+
+			logical_message(&r, true, "prefix", message, sizeof(message));
+			r.decoded.main_data_len = length;
+			UT_ASSERT(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, foreign, &out)
+					  != CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(out.effects.required, 0);
+			UT_ASSERT_EQ(out.effects.no_effect | out.effects.native_apply, 0);
+			UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, !foreign));
+		}
+	}
+}
+
+UT_TEST(test_logical_message_rejects_nonproducer_carriers)
+{
+	const char message[] = { '\0', 'x', (char)0xff };
+
+	for (int fault = 0; fault < 16; fault++) {
+		for (int foreign = 0; foreign <= 1; foreign++) {
+			EffectRecord r;
+			ClusterColdDecodedV1 out = { 0 };
+			Size size;
+			union {
+				DecodedXLogRecord decoded;
+				char bytes[sizeof(DecodedXLogRecord) + sizeof(DecodedBkpBlock)];
+			} blocked = { 0 };
+
+			logical_message(&r, true, "prefix", message, sizeof(message));
+			switch (fault) {
+			case 0:
+				r.decoded.main_data = NULL;
+				break;
+			case 1:
+			case 2:
+			case 3:
+				size = fault == 1 ? 0 : fault == 2 ? r.decoded.main_data_len : SIZE_MAX;
+				memcpy(r.data.bytes + offsetof(xl_logical_message, prefix_size), &size,
+					   sizeof(size));
+				break;
+			case 4:
+			case 5:
+				size = fault == 4 ? SIZE_MAX : sizeof(message) - 1;
+				memcpy(r.data.bytes + offsetof(xl_logical_message, message_size), &size,
+					   sizeof(size));
+				break;
+			case 6:
+				r.data.bytes[SizeOfLogicalMessage + strlen("prefix")] = 'x';
+				break;
+			case 7:
+				r.data.bytes[SizeOfLogicalMessage + 1] = '\0';
+				break;
+			case 8:
+				r.decoded.main_data_len++;
+				break;
+			case 9:
+				r.data.bytes[offsetof(xl_logical_message, transactional)] = 2;
+				break;
+			case 10:
+				r.decoded.header.xl_info = 0x10;
+				break;
+			case 11:
+			case 12:
+			case 13:
+			case 14:
+				r.decoded.header.xl_info |= 1 << (fault - 11);
+				break;
+			case 15:
+				memcpy(&blocked.decoded, &r.decoded, sizeof(r.decoded));
+				blocked.decoded.max_block_id = 0;
+				blocked.decoded.blocks[0].in_use = true;
+				r.reader.record = &blocked.decoded;
+				break;
+			}
+			UT_ASSERT(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, foreign, &out)
+					  != CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(out.effects.required, 0);
+			UT_ASSERT_EQ(out.effects.no_effect | out.effects.native_apply, 0);
+			UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, !foreign));
+		}
+	}
 }
 
 UT_TEST(test_registry_unknown_and_blocks_still_refuse)
@@ -1661,7 +1798,7 @@ UT_TEST(test_original_startup_dependency_leaves_non_c0_with_existing_dispatch)
 int
 main(void)
 {
-	UT_PLAN(47);
+	UT_PLAN(50);
 	UT_RUN(test_original_startup_dependency_decodes_before_target_owner);
 	UT_RUN(test_original_startup_dependency_leaves_non_c0_with_existing_dispatch);
 	UT_RUN(test_foreign_c0_routes_whole_record_to_exact_side_consumer);
@@ -1698,6 +1835,9 @@ main(void)
 	UT_RUN(test_abort_routes_all_native_effects);
 	UT_RUN(test_unknown_or_truncated_commit_clears_routes);
 	UT_RUN(test_exact_foreign_noop_stays_no_effect);
+	UT_RUN(test_logical_message_keeps_complete_native_no_effect_carrier);
+	UT_RUN(test_logical_message_requires_every_native_payload_byte);
+	UT_RUN(test_logical_message_rejects_nonproducer_carriers);
 	UT_RUN(test_registry_unknown_and_blocks_still_refuse);
 	UT_RUN(test_folded_tt_unknown_format_is_not_native_apply);
 	UT_RUN(test_truncation_at_every_compound_boundary_refuses);
