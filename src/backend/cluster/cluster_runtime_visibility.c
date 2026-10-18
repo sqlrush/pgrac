@@ -1293,10 +1293,11 @@ cluster_runtime_visibility_local_terminal_lookup_exact(TransactionId xid,
 	ClusterUndoBlock0Result current_result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 	ClusterTTSlotPhysicalLocator locator;
 	ClusterTTDurableLocate locate_result;
+	ClusterTtLocateScope locate_scope;
+	ClusterUndoBlock0ResolvedRoot final_root;
 	uint16 segment_id = 0;
 	uint16 slot_offset = 0;
 	uint16 slot_wrap = TT_WRAP_INVALID;
-	uint64 epoch;
 	bool sampled = false;
 	bool precommit_retry = false;
 	bool physical_active = false;
@@ -1314,31 +1315,30 @@ cluster_runtime_visibility_local_terminal_lookup_exact(TransactionId xid,
 	MemSet(&logical, 0, sizeof(logical));
 	MemSet(&root, 0, sizeof(root));
 	MemSet(&locator, 0, sizeof(locator));
+	MemSet(&locate_scope, 0, sizeof(locate_scope));
+	MemSet(&final_root, 0, sizeof(final_root));
 	if (key_out == NULL || result_out == NULL || cluster_node_id < 0
 		|| cluster_node_id >= CLUSTER_MAX_NODES || !TransactionIdIsNormal(xid)
 		|| cluster_xid_origin_slot(xid) != cluster_node_id)
 		return false;
-	epoch = cluster_epoch_get_current();
-	/* Epoch zero is the valid clean-formation epoch.  The exact TARGET
-	 * admission token below, not a nonzero sentinel test, fences this sample
-	 * against activation drift. */
-	if (epoch > UINT32_MAX)
-		return false;
+	if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+										  CLUSTER_SEMANTIC_TARGET_SIDE, &admission)
+			!= CLUSTER_SEMANTIC_ADMISSION_OK
+		|| !cluster_runtime_visibility_locate_scope_capture(xid, &admission, &locate_scope))
+		goto done;
+	/* The raw-xid locator supplies identity only within this admitted native
+	 * interval.  Epoch zero remains valid; no native lock spans disk I/O. */
 	locate_result = cluster_tt_slot_durable_locate_any_by_xid_origin(
 		cluster_node_id, xid, &segment_id, &slot_offset, &slot_wrap, NULL);
 	if (locate_result != CLUSTER_TT_DURABLE_LOCATE_FOUND || segment_id == 0
-		|| slot_offset >= TT_SLOTS_PER_SEGMENT || slot_wrap == TT_WRAP_INVALID)
-		return false;
+		|| slot_offset >= TT_SLOTS_PER_SEGMENT || slot_wrap == TT_WRAP_INVALID
+		|| !cluster_runtime_visibility_locate_scope_current(xid, &admission, &locate_scope))
+		goto done;
 	locator.segment_id = segment_id;
 	locator.xid = xid;
 	locator.slot_offset = slot_offset;
 	locator.wrap = slot_wrap;
 
-	if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
-										  CLUSTER_SEMANTIC_TARGET_SIDE, &admission)
-			!= CLUSTER_SEMANTIC_ADMISSION_OK
-		|| admission.formation_epoch != epoch)
-		goto done;
 	logical.owner_instance = (uint8)((uint32)cluster_node_id + 1);
 	logical.segment_id = segment_id;
 	if (!cluster_runtime_visibility_resolve_root_admitted(
@@ -1375,7 +1375,11 @@ cluster_runtime_visibility_local_terminal_lookup_exact(TransactionId xid,
 	PG_END_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
 								PointerGetDatum(&cleanup));
 	if ((sampled || precommit_retry)
-		&& (cluster_epoch_get_current() != epoch
+		&& (!cluster_runtime_visibility_locate_scope_current(xid, &admission, &locate_scope)
+			|| !cluster_runtime_visibility_resolve_root_admitted(
+				CLUSTER_TX_RESOLVE_VISIBILITY, &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+				logical.owner_instance, logical.segment_id, &final_root)
+			|| !cluster_runtime_visibility_candidate_root_matches(&root, &final_root)
 			|| !cluster_runtime_visibility_admission_current(CLUSTER_TX_RESOLVE_VISIBILITY,
 															 &admission))) {
 		sampled = false;

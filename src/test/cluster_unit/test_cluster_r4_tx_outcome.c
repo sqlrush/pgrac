@@ -975,6 +975,9 @@ cluster_undo_block0_current_release_begin(ClusterUndoBlock0CurrentGuard *guard
 	case 5:
 		test_current_segment++;
 		break;
+	case 6:
+		test_candidate_root_drift = true;
+		break;
 	default:
 		break;
 	}
@@ -2323,6 +2326,182 @@ UT_TEST(test_current_member_local_terminal_accepts_clean_formation_epoch_zero)
 	UT_ASSERT_EQ(test_candidate_acquire_calls, 1);
 	UT_ASSERT_EQ(test_candidate_block0_copy_calls, 1);
 	UT_ASSERT_EQ(test_candidate_release_calls, 1);
+}
+
+static void
+assert_local_terminal_unknown(void)
+{
+	ClusterTTStatusKey key;
+	ClusterTTStatusKey zero_key = { 0 };
+	ClusterTTStatusResult result;
+	bool retry = true;
+
+	memset(&key, 0xa5, sizeof(key));
+	memset(&result, 0xa5, sizeof(result));
+	UT_ASSERT(!cluster_runtime_visibility_local_terminal_lookup_exact(TEST_ORIGIN_XID, &key,
+																	  &result, &retry));
+	UT_ASSERT_EQ(memcmp(&key, &zero_key, sizeof(key)), 0);
+	UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_UNKNOWN);
+	UT_ASSERT_EQ(result.commit_scn, InvalidScn);
+	UT_ASSERT(!result.authoritative);
+	UT_ASSERT(!retry);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+	UT_ASSERT_EQ(test_xact_lock_depth, 0);
+	UT_ASSERT_EQ(test_ctrc_touch_calls, 0);
+}
+
+UT_TEST(test_local_terminal_locator_rejects_unproven_native_era_before_io)
+{
+	int fault;
+
+	for (fault = 0; fault < 8; fault++) {
+		reset_exact_origin_fixture();
+		switch (fault) {
+		case 0:
+			test_next_full_xid = FullTransactionIdFromEpochAndXid(1, 1000);
+			break;
+		case 1:
+			test_next_full_xid = InvalidFullTransactionId;
+			break;
+		case 2:
+			test_next_full_xid = FullTransactionIdFromEpochAndXid(0, TEST_ORIGIN_XID);
+			break;
+		case 3:
+			test_next_full_xid = FullTransactionIdFromEpochAndXid(0, TEST_ORIGIN_XID - 1);
+			break;
+		case 4:
+			test_variable_cache.oldestClogXid = TEST_ORIGIN_XID + 1;
+			break;
+		case 5:
+			test_variable_cache.oldestClogXid = InvalidTransactionId;
+			break;
+		case 6:
+			test_system_identifier = 0;
+			break;
+		case 7:
+			test_boot_incarnation = 0;
+			break;
+		}
+		assert_local_terminal_unknown();
+		UT_ASSERT_EQ(test_durable_locator_calls, 0);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, 0);
+	}
+}
+
+UT_TEST(test_local_terminal_locator_rechecks_native_scope_after_scan)
+{
+	int fault;
+
+	for (fault = 0; fault < 2; fault++) {
+		reset_exact_origin_fixture();
+		if (fault == 0)
+			test_oldest_clog_on_locate = TEST_ORIGIN_XID + 1;
+		else
+			test_next_full_on_locate = FullTransactionIdFromEpochAndXid(1, 1000);
+		assert_local_terminal_unknown();
+		UT_ASSERT_EQ(test_durable_locator_calls, 1);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, 0);
+	}
+}
+
+UT_TEST(test_local_terminal_rechecks_scope_and_root_after_release)
+{
+	int aborted;
+	int fault;
+
+	for (aborted = 0; aborted < 2; aborted++) {
+		for (fault = 1; fault <= 6; fault++) {
+			reset_exact_origin_fixture();
+			if (aborted) {
+				test_native_status = TRANSACTION_STATUS_ABORTED;
+				test_tt_slot.status = TT_SLOT_ABORTED;
+				test_tt_slot.commit_scn = InvalidScn;
+			}
+			test_release_scope_drift = fault;
+			assert_local_terminal_unknown();
+			UT_ASSERT_EQ(test_durable_locator_calls, 1);
+			UT_ASSERT_EQ(test_candidate_release_calls, 1);
+		}
+	}
+}
+
+UT_TEST(test_local_terminal_scope_drift_clears_precommit_retry)
+{
+	int fault;
+
+	for (fault = 1; fault <= 6; fault++) {
+		reset_exact_origin_fixture();
+		test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+		test_twophase_xid = TEST_ORIGIN_XID;
+		test_release_scope_drift = fault;
+		assert_local_terminal_unknown();
+		UT_ASSERT_EQ(test_candidate_release_calls, 1);
+	}
+}
+
+UT_TEST(test_local_terminal_retained_boundary_and_counter_advance_stay_valid)
+{
+	ClusterTTStatusKey key;
+	ClusterTTStatusResult result;
+	bool retry;
+	int aborted;
+
+	for (aborted = 0; aborted < 2; aborted++) {
+		reset_exact_origin_fixture();
+		test_variable_cache.oldestClogXid = TEST_ORIGIN_XID;
+		test_next_full_on_locate = FullTransactionIdFromEpochAndXid(0, 1200);
+		/* The locator's status is deliberately contrary to canonical bytes. */
+		test_durable_locator_status = aborted ? TT_SLOT_COMMITTED : TT_SLOT_ABORTED;
+		if (aborted) {
+			test_native_status = TRANSACTION_STATUS_ABORTED;
+			test_tt_slot.status = TT_SLOT_ABORTED;
+			test_tt_slot.commit_scn = InvalidScn;
+		}
+		retry = true;
+		UT_ASSERT(cluster_runtime_visibility_local_terminal_lookup_exact(TEST_ORIGIN_XID, &key,
+																		 &result, &retry));
+		UT_ASSERT_EQ(key.undo_segment_id, TEST_TT_SEGMENT);
+		UT_ASSERT_EQ(key.tt_slot_id, (uint32)4);
+		UT_ASSERT_EQ(key.local_xid, TEST_ORIGIN_XID);
+		UT_ASSERT_EQ(result.status,
+					 aborted ? CLUSTER_TT_STATUS_ABORTED : CLUSTER_TT_STATUS_COMMITTED);
+		UT_ASSERT_EQ(result.commit_scn, aborted ? InvalidScn : test_commit_scn);
+		UT_ASSERT(result.authoritative);
+		UT_ASSERT(!retry);
+		UT_ASSERT_EQ(test_durable_locator_calls, 1);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, 1);
+		UT_ASSERT_EQ(test_candidate_release_calls, 1);
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+		UT_ASSERT_EQ(test_xact_lock_depth, 0);
+	}
+}
+
+UT_TEST(test_current_mx_terminal_fallback_cannot_bypass_native_era)
+{
+	ClusterTTStatusKey key;
+	ClusterTTStatusResult result;
+	ClusterCtrcTxnKeyV1 ctrc_key;
+	uint32 grant;
+	uint32 capability;
+	int fault;
+
+	for (fault = 0; fault < 2; fault++) {
+		reset_exact_origin_fixture();
+		test_xid_is_mine = false;
+		if (fault == 0)
+			test_next_full_xid = FullTransactionIdFromEpochAndXid(1, 1000);
+		else
+			test_variable_cache.oldestClogXid = TEST_ORIGIN_XID + 1;
+		UT_ASSERT_EQ(current_mx_local_member_sample_exact(TEST_ORIGIN_XID, &key, &result, &grant,
+														  &capability, &ctrc_key),
+					 CMX_RESOLVE_UNKNOWN);
+		UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_UNKNOWN);
+		UT_ASSERT(!result.authoritative);
+		UT_ASSERT_EQ(grant, 0);
+		UT_ASSERT_EQ(capability, 0);
+		UT_ASSERT_EQ(test_durable_locator_calls, 0);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, 0);
+	}
 }
 
 UT_TEST(test_current_member_active_on_current_segment_requires_live_owner_index)
@@ -4907,7 +5086,7 @@ UT_TEST(test_self_fresh_role_does_not_inherit_ordinary_abort_permission)
 int
 main(void)
 {
-	UT_PLAN(144);
+	UT_PLAN(150);
 	UT_RUN(test_local_updater_precommit_retries_only_after_guard_release);
 	UT_RUN(test_local_updater_precommit_release_and_admission_failure_stay_unknown);
 	UT_RUN(test_local_updater_does_not_retry_unproven_samples);
@@ -4979,6 +5158,12 @@ main(void)
 	UT_RUN(test_current_member_rolled_terminal_uses_locator_then_canonical_scur);
 	UT_RUN(test_current_member_terminal_on_current_segment_survives_retired_owner_index);
 	UT_RUN(test_current_member_local_terminal_accepts_clean_formation_epoch_zero);
+	UT_RUN(test_local_terminal_locator_rejects_unproven_native_era_before_io);
+	UT_RUN(test_local_terminal_locator_rechecks_native_scope_after_scan);
+	UT_RUN(test_local_terminal_rechecks_scope_and_root_after_release);
+	UT_RUN(test_local_terminal_scope_drift_clears_precommit_retry);
+	UT_RUN(test_local_terminal_retained_boundary_and_counter_advance_stay_valid);
+	UT_RUN(test_current_mx_terminal_fallback_cannot_bypass_native_era);
 	UT_RUN(test_current_member_active_on_current_segment_requires_live_owner_index);
 	UT_RUN(test_exact_origin_committed_uses_canonical_tt_identity_and_direct_clog);
 	UT_RUN(test_visibility_remote_origin_selects_generation_without_foreign_scur);
