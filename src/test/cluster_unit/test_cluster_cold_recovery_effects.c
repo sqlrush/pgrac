@@ -195,6 +195,121 @@ partitioned(const ClusterColdEffectRoutesV1 *e)
 	return seen != 0 && seen == e->required;
 }
 
+static void
+terminal_children(EffectRecord *r, bool commit, TransactionId top, int count,
+				  const TransactionId *children)
+{
+	TimestampTz timestamp = 1;
+	uint32 xinfo = XACT_XINFO_HAS_SUBXACTS | XACT_XINFO_HAS_SCN;
+	xl_xact_scn scn = { .scn = 23 };
+	xl_xact_tt_commit tt = { .segment_id = 1,
+							 .segment_generation = 0,
+							 .xid = top,
+							 .slot_offset = 1,
+							 .wrap = 1,
+							 .instance = 1,
+							 .format_version = CLUSTER_XACT_TT_COMMIT_VERSION,
+							 .commit_scn = 23 };
+
+	if (commit)
+		xinfo |= XACT_XINFO_HAS_TT_COMMIT;
+	record_init(r, RM_XACT_ID, (commit ? XLOG_XACT_COMMIT : XLOG_XACT_ABORT) | XLOG_XACT_HAS_INFO);
+	r->decoded.header.xl_xid = top;
+	append(r, &timestamp, sizeof(timestamp));
+	append(r, &xinfo, sizeof(xinfo));
+	counted(r, children, count, sizeof(*children));
+	append(r, &scn, sizeof(scn));
+	if (commit)
+		append(r, &tt, sizeof(tt));
+}
+
+static void
+check_bad_terminal_children(bool commit, bool foreign)
+{
+	static const struct {
+		TransactionId top;
+		TransactionId children[2];
+	} bad[] = { { 100, { InvalidTransactionId, 102 } },
+				{ 100, { BootstrapTransactionId, 102 } },
+				{ 100, { FrozenTransactionId, 102 } },
+				{ 100, { 100, 102 } },
+				{ 100, { 101, 101 } },
+				{ 100, { 103, 102 } },
+				{ 100, { 99, 102 } },
+				{ 100, { 100U + 0x80000000U, 102 } },
+				{ InvalidTransactionId, { 101, 102 } },
+				{ BootstrapTransactionId, { 101, 102 } },
+				{ FrozenTransactionId, { 101, 102 } } };
+
+	for (Size i = 0; i < lengthof(bad); i++) {
+		EffectRecord r;
+		ClusterColdDecodedV1 out = { 0 };
+
+		terminal_children(&r, commit, bad[i].top, 2, bad[i].children);
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, foreign, &out),
+					 CLUSTER_COLD_COMPONENT_INVALID);
+		UT_ASSERT_EQ(out.effects.required, 0);
+		UT_ASSERT_EQ(out.effects.native_apply | out.effects.page_apply | out.effects.space_apply
+						 | out.effects.no_effect | out.effects.refused,
+					 0);
+	}
+}
+
+UT_TEST(test_own_commit_rejects_invalid_terminal_children)
+{
+	check_bad_terminal_children(true, false);
+}
+
+UT_TEST(test_own_abort_rejects_invalid_terminal_children)
+{
+	check_bad_terminal_children(false, false);
+}
+
+UT_TEST(test_foreign_commit_rejects_invalid_terminal_children)
+{
+	check_bad_terminal_children(true, true);
+}
+
+UT_TEST(test_foreign_abort_rejects_invalid_terminal_children)
+{
+	check_bad_terminal_children(false, true);
+}
+
+static void
+check_terminal_children(TransactionId top, int count, const TransactionId *children)
+{
+	for (int commit = 0; commit <= 1; commit++) {
+		for (int foreign = 0; foreign <= 1; foreign++) {
+			EffectRecord r;
+			ClusterColdDecodedV1 out = { 0 };
+
+			terminal_children(&r, commit, top, count, children);
+			UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, foreign, &out),
+						 CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(out.record.record_flags, foreign ? CLUSTER_COLD_RECORD_FOREIGN_SIDE : 0);
+			UT_ASSERT(out.effects.native_apply & CLUSTER_COLD_EFFECT_CHILDREN);
+			UT_ASSERT_EQ(out.effects.refused | out.effects.no_effect, 0);
+			UT_ASSERT(partitioned(&out.effects));
+		}
+	}
+}
+
+UT_TEST(test_terminal_children_allow_native_xid_wrap)
+{
+	TransactionId children[] = { UINT32_MAX, FirstNormalTransactionId };
+
+	check_terminal_children(UINT32_MAX - 1, lengthof(children), children);
+}
+
+UT_TEST(test_terminal_children_are_not_limited_to_assignment_cache)
+{
+	TransactionId children[256];
+
+	for (Size i = 0; i < lengthof(children); i++)
+		children[i] = 101 + i;
+	check_terminal_children(100, lengthof(children), children);
+}
+
 #define ALL_XINFO                                                                                  \
 	(XACT_XINFO_HAS_SUBXACTS | XACT_XINFO_HAS_RELFILELOCATORS | XACT_XINFO_HAS_DROPPED_STATS       \
 	 | XACT_XINFO_HAS_INVALS | XACT_XINFO_HAS_ORIGIN | XACT_XINFO_HAS_SCN                          \
@@ -2346,7 +2461,7 @@ UT_TEST(test_original_startup_dependency_leaves_non_c0_with_existing_dispatch)
 int
 main(void)
 {
-	UT_PLAN(59);
+	UT_PLAN(65);
 	UT_RUN(test_smgr_native_carriers_keep_existing_effect_owners);
 	UT_RUN(test_smgr_create_rejects_incomplete_or_nonproducer_carriers);
 	UT_RUN(test_smgr_truncate_rejects_incomplete_or_nonproducer_carriers);
@@ -2385,6 +2500,12 @@ main(void)
 	UT_RUN(test_commit_ts_is_unsupported_even_for_own_source);
 	UT_RUN(test_foreign_invalidation_is_not_no_effect);
 	UT_RUN(test_assignment_requires_complete_counted_payload);
+	UT_RUN(test_own_commit_rejects_invalid_terminal_children);
+	UT_RUN(test_own_abort_rejects_invalid_terminal_children);
+	UT_RUN(test_foreign_commit_rejects_invalid_terminal_children);
+	UT_RUN(test_foreign_abort_rejects_invalid_terminal_children);
+	UT_RUN(test_terminal_children_allow_native_xid_wrap);
+	UT_RUN(test_terminal_children_are_not_limited_to_assignment_cache);
 	UT_RUN(test_invalidations_require_complete_counted_payload);
 	UT_RUN(test_abort_routes_all_native_effects);
 	UT_RUN(test_unknown_or_truncated_commit_clears_routes);

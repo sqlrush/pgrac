@@ -87,6 +87,10 @@ extern bool rf_side_xact_inspection_preflight_v1(const RfSideXactOperationV1 *op
 /* Every xinfo section of a COMMIT/ABORT lies within its main data and no
  * unknown or misplaced section is present. */
 extern bool rf_side_xact_completion_shape_v1(XLogReaderState *record, bool commit);
+/* The bounded native terminal child list advances from a normal top within
+ * its XID half-circle. This proves neither immediate parents nor replay authority. */
+extern bool rf_side_xact_children_preflight_v1(TransactionId top, int count,
+											   const TransactionId *children);
 
 typedef enum RfSideXactApplyResultV1 {
 	RF_SIDE_XACT_APPLY_OK = 0,

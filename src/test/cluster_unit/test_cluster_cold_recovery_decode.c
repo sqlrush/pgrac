@@ -118,6 +118,16 @@ rf_side_xact_completion_shape_v1(XLogReaderState *record, bool commit)
 	return abort_shape_ok;
 }
 
+/* Real child lists and the shared validator are linked in the effects test;
+ * these parser stubs intentionally produce no children. */
+bool
+rf_side_xact_children_preflight_v1(TransactionId top, int count, const TransactionId *children)
+{
+	(void)top;
+	UT_ASSERT(count == 0 && children == NULL);
+	return true;
+}
+
 void
 ParseAbortRecord(uint8 info, xl_xact_abort *xlrec, xl_xact_parsed_abort *parsed)
 {

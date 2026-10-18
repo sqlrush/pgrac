@@ -234,6 +234,11 @@ cold_xact_flags(XLogReaderState *reader, uint64 system_identifier, const uint8 s
 		if (!ParseCommitRecord(info, (xl_xact_commit *)XLogRecGetData(reader),
 							   XLogRecGetDataLen(reader), &parsed))
 			return CLUSTER_COLD_COMPONENT_INVALID;
+		/* Own/native and retained-history records need the same complete
+		 * child identity check even when no optional SIDE plan is captured. */
+		if (!rf_side_xact_children_preflight_v1(XLogRecGetXid(reader), parsed.nsubxacts,
+												parsed.subxacts))
+			return CLUSTER_COLD_COMPONENT_INVALID;
 		/* Native parsing bounds the delta but does not validate its version.
 		 * An unknown delta must not reach the original exact-slot writer. */
 		if (parsed.has_tt_commit
@@ -258,6 +263,9 @@ cold_xact_flags(XLogReaderState *reader, uint64 system_identifier, const uint8 s
 		if (!rf_side_xact_completion_shape_v1(reader, false))
 			return CLUSTER_COLD_COMPONENT_INVALID;
 		ParseAbortRecord(info, (xl_xact_abort *)XLogRecGetData(reader), &parsed);
+		if (!rf_side_xact_children_preflight_v1(XLogRecGetXid(reader), parsed.nsubxacts,
+												parsed.subxacts))
+			return CLUSTER_COLD_COMPONENT_INVALID;
 		*flags = parsed.nrels > 0 ? CLUSTER_COLD_RECORD_STRUCTURAL : 0;
 		*effects |= cold_completion_effects(parsed.xinfo, parsed.nsubxacts, parsed.nrels,
 											parsed.nstats, 0);

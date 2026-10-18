@@ -414,12 +414,12 @@ side_xact_cold_stats_valid(int count, const xl_xact_stats_item *items, uint32 xi
 /* Match the native CLOG tree contract before any terminal mutation. The
  * bounded parser already proved the complete list fits its original record;
  * terminal membership does not prove an immediate SUBTRANS parent edge. */
-static bool
-side_xact_cold_children_valid(TransactionId top, int count, const TransactionId *children)
+bool
+rf_side_xact_children_preflight_v1(TransactionId top, int count, const TransactionId *children)
 {
 	TransactionId previous = top;
 
-	if (count < 0 || (count > 0 && children == NULL))
+	if (count < 0 || (count > 0 && (children == NULL || !TransactionIdIsNormal(top))))
 		return false;
 	for (int i = 0; i < count; i++) {
 		TransactionId child;
@@ -785,7 +785,7 @@ side_xact_decode(XLogReaderState *record, uint64 system_identifier, uint16 origi
 						  : (!side_xact_no_commit_effects(&parsed)
 							 && !side_xact_space_drops_valid(&parsed, system_identifier)))
 			|| (cold_completion
-				&& !side_xact_cold_children_valid(xid, parsed.nsubxacts, parsed.subxacts))
+				&& !rf_side_xact_children_preflight_v1(xid, parsed.nsubxacts, parsed.subxacts))
 			|| (parsed.xinfo & XACT_XINFO_HAS_TWOPHASE) != 0 || !SCN_VALID(parsed.scn)
 			|| side_xact_commit_timestamp(&parsed) == 0 || !parsed.has_tt_commit
 			|| !side_xact_tt_delta_valid(&parsed.tt_commit, origin_thread, xid, parsed.scn))
@@ -940,7 +940,8 @@ side_xact_decode_cold_abort(XLogReaderState *record, uint64 system_identifier, u
 		return false;
 	ParseAbortRecord(XLogRecGetInfo(record), (xl_xact_abort *)XLogRecGetData(record), &parsed);
 	if ((parsed.xinfo & ~supported) != 0 || parsed.nrels != 0
-		|| !side_xact_cold_children_valid(XLogRecGetXid(record), parsed.nsubxacts, parsed.subxacts)
+		|| !rf_side_xact_children_preflight_v1(XLogRecGetXid(record), parsed.nsubxacts,
+											   parsed.subxacts)
 		|| (parsed.nsubxacts == 0 && parsed.nstats == 0
 			&& (parsed.xinfo & XACT_XINFO_HAS_AE_LOCKS) == 0)
 		|| !SCN_VALID(parsed.scn)
