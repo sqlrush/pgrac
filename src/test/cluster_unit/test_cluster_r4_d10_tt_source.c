@@ -637,6 +637,101 @@ UT_TEST(test_install_lookup_and_delete_publish_only_after_recheck)
 	UT_ASSERT_EQ(fake_leave_count, 3);
 }
 
+UT_TEST(test_subcommitted_source_preserves_parent_identity)
+{
+	ClusterTTStatusKey child = make_key((TransactionId)609);
+	ClusterTTStatusKey parent = make_key((TransactionId)610);
+	ClusterTTStatusSourceRequest request;
+	ClusterTTStatusSourceResult result;
+
+	reset_fixture();
+	memset(&request, 0, sizeof(request));
+	request.key = &parent;
+	request.status = CLUSTER_TT_STATUS_IN_PROGRESS;
+	request.commit_scn = InvalidScn;
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+
+	request.key = &child;
+	request.parent_key = &parent;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
+					 CLUSTER_TT_SOURCE_INSTALL_SUBCOMMITTED, &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT_EQ(cluster_tt_status_get_install_count(), 2);
+	UT_ASSERT_EQ(cluster_tt_status_get_subcommitted_install_count(), 1);
+
+	/* A parent binding is a normal local entry and must carry the zero
+	 * parent-key sentinel; only the child publishes the exact chain edge. */
+	request.key = &parent;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
+					 CLUSTER_TT_SOURCE_LOOKUP, &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT(result.lookup.authoritative);
+	UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_IN_PROGRESS);
+	UT_ASSERT_EQ(result.lookup.commit_scn, InvalidScn);
+	UT_ASSERT_EQ(result.lookup.status_epoch, parent.cluster_epoch);
+	UT_ASSERT(!result.lookup.has_parent_key);
+	UT_ASSERT(bytes_are_zero(&result.lookup.parent_key, sizeof(result.lookup.parent_key)));
+
+	request.key = &child;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
+					 CLUSTER_TT_SOURCE_LOOKUP, &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT(result.lookup.authoritative);
+	UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_SUBCOMMITTED);
+	UT_ASSERT_EQ(result.lookup.commit_scn, InvalidScn);
+	UT_ASSERT_EQ(result.lookup.status_epoch, child.cluster_epoch);
+	UT_ASSERT(result.lookup.has_parent_key);
+	UT_ASSERT_EQ(memcmp(&result.lookup.parent_key, &parent, sizeof(parent)), 0);
+	UT_ASSERT_EQ(cluster_tt_status_get_lookup_hit_count(), 2);
+	UT_ASSERT_EQ(cluster_tt_status_get_subcommitted_lookup_hit_count(), 1);
+}
+
+UT_TEST(test_subcommitted_source_requires_parent_pointer)
+{
+	ClusterTTStatusKey child = make_key((TransactionId)611);
+	ClusterTTStatusSourceRequest request;
+	ClusterTTStatusSourceResult result;
+
+	reset_fixture();
+	memset(&request, 0, sizeof(request));
+	request.key = &child;
+	request.parent_key = NULL;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
+					 CLUSTER_TT_SOURCE_INSTALL_SUBCOMMITTED, &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_CLOSED);
+	UT_ASSERT(bytes_are_zero(&result, sizeof(result)));
+	UT_ASSERT_EQ(cluster_tt_status_get_subcommitted_install_count(), 0);
+	UT_ASSERT_EQ(fake_enter_count, 1);
+	UT_ASSERT_EQ(fake_recheck_count, 0);
+	UT_ASSERT_EQ(fake_leave_count, 1);
+}
+
+UT_TEST(test_parent_chain_follow_counter_is_admitted)
+{
+	ClusterTTStatusSourceResult result;
+
+	reset_fixture();
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
+					 CLUSTER_TT_SOURCE_BUMP_PARENT_CHAIN_FOLLOW, NULL, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(bytes_are_zero(&result, sizeof(result)));
+	UT_ASSERT_EQ(cluster_tt_status_get_parent_chain_follow_count(), 1);
+	UT_ASSERT_EQ(fake_enter_count, 1);
+	UT_ASSERT_EQ(fake_recheck_count, 1);
+	UT_ASSERT_EQ(fake_leave_count, 1);
+}
+
 UT_TEST(test_missing_required_pointer_closes_after_admission)
 {
 	ClusterTTStatusSourceRequest request;
@@ -1031,11 +1126,14 @@ UT_TEST(test_error_path_runs_single_leave_funnel)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(16);
 	UT_RUN(test_frozen_tt_source_operation_domain);
 	UT_RUN(test_active_refuses_before_request_inspection_and_mutation);
 	UT_RUN(test_disabled_source_executes_matching_counter_arm);
 	UT_RUN(test_install_lookup_and_delete_publish_only_after_recheck);
+	UT_RUN(test_subcommitted_source_preserves_parent_identity);
+	UT_RUN(test_subcommitted_source_requires_parent_pointer);
+	UT_RUN(test_parent_chain_follow_counter_is_admitted);
 	UT_RUN(test_missing_required_pointer_closes_after_admission);
 	UT_RUN(test_unknown_operation_closes_after_admission);
 	UT_RUN(test_generation_drift_discards_fixed_result);
