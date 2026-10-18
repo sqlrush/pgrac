@@ -6033,6 +6033,9 @@ test_cluster_retained_remote: test_cluster_retained_remote.c test_cluster_retain
 
 CLUSTER_R4_RUNTIME_VIS_TEST_O = test_cluster_r4_runtime_visibility_exact.o
 CLUSTER_R4_RUNTIME_VIS_UBA_O = $(top_builddir)/src/backend/cluster/cluster_uba.o
+CLUSTER_MULTIXACT_CURRENT_O = $(top_builddir)/src/backend/cluster/cluster_multixact_current.o
+CLUSTER_MULTIXACT_CURRENT_WIRE_O = \
+	$(top_builddir)/src/backend/cluster/cluster_multixact_current_wire.o
 $(CLUSTER_R4_RUNTIME_VIS_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
 
@@ -6046,9 +6049,11 @@ test_cluster_current_mx_local_sample.inc: $(top_srcdir)/src/backend/cluster/clus
 test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c unit_test.h \
 		test_cluster_current_mx_local_sample.inc \
 		$(CLUSTER_R4_RUNTIME_VIS_TEST_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O) \
+		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
 		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_RUNTIME_VIS_POLICY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_R4_RUNTIME_VIS_TEST_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O) \
+		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
 		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_RUNTIME_VIS_POLICY_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
@@ -7293,9 +7298,6 @@ test_cluster_multixact: test_cluster_multixact.c unit_test.h \
 			$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # spec-3.6b D1: pure current-DML descriptor/proof validators and compositor.
-CLUSTER_MULTIXACT_CURRENT_O = $(top_builddir)/src/backend/cluster/cluster_multixact_current.o
-CLUSTER_MULTIXACT_CURRENT_WIRE_O = \
-	$(top_builddir)/src/backend/cluster/cluster_multixact_current_wire.o
 CLUSTER_MULTIXACT_CURRENT_STATS_O = \
 	$(top_builddir)/src/backend/cluster/cluster_multixact_current_stats.o
 CLUSTER_MULTIXACT_MATERIALIZER_TEST_O = \

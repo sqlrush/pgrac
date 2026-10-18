@@ -20,10 +20,13 @@
 #include "postgres.h"
 
 #include "access/clog.h"
+#include "access/xact.h"
 #include "access/subtrans.h"
 #include "access/twophase.h"
 #include "access/xlog.h"
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_multixact_current_stats.h"
+#include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_slot.h"
@@ -61,6 +64,9 @@ UT_DEFINE_GLOBALS();
 #define TEST_TT_OFFSET ((uint16)3)
 
 int cluster_node_id = 0;
+BackendId MyBackendId = 7;
+int cluster_gcs_reply_timeout_ms = 1000;
+int cluster_subtrans_max_chain_depth = 32;
 bool cluster_crossnode_runtime_visibility = true;
 TransactionId TransactionXmin = FirstNormalTransactionId;
 volatile sig_atomic_t InterruptPending = false;
@@ -168,6 +174,11 @@ static ClusterCtrcParticipantIdentity test_ctrc_touched_participant;
 static bool test_ctrc_touch_generation_drift;
 static bool test_ctrc_revoke_on_release;
 static bool test_ctrc_grant_revoked;
+static TimestampTz test_now;
+static bool test_mx_batch_enabled;
+static int test_mx_remote_calls;
+static bool test_mx_remote_failed;
+static bool test_mx_remote_revokes_grant;
 static uint32 test_current_segment;
 static bool test_current_segment_drift_on_recheck;
 static int test_current_segment_calls;
@@ -410,6 +421,8 @@ cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node, TransactionId 
 int
 cluster_xid_origin_slot(TransactionId xid)
 {
+	if (test_mx_batch_enabled && xid == TEST_ORIGIN_XID + 1)
+		return 1;
 	UT_ASSERT_EQ((int)xid, (int)TEST_ORIGIN_XID);
 	return 0;
 }
@@ -430,7 +443,60 @@ GetSystemIdentifier(void)
 TimestampTz
 GetCurrentTimestamp(void)
 {
-	return 0;
+	return test_now;
+}
+
+bool
+TransactionIdIsCurrentTransactionId(TransactionId xid)
+{
+	UT_ASSERT(test_mx_batch_enabled);
+	UT_ASSERT_EQ(xid, TEST_ORIGIN_XID);
+	return false;
+}
+
+void
+cluster_multixact_current_stats_bump(ClusterCurrentMxStatId stat pg_attribute_unused())
+{}
+
+/* Only the foreign transport boundary is supplied here. Local members and
+ * updater provenance execute the real runtime and batch implementations. */
+ClusterMxResolveResult
+cluster_gcs_current_mx_member_proof_fetch_and_wait(
+	int32 origin_node, ClusterCurrentMxProofForwardV2 *request, ClusterCurrentMemberProof *proofs,
+	uint16 proofs_cap, uint16 *proof_count, ClusterCurrentUpdaterProof *updater_proof,
+	uint32 *requester_capability_generation_out, TimestampTz deadline)
+{
+	ClusterCurrentMxProofForwardV2 decoded;
+	ClusterCurrentMemberProof *proof = &proofs[0];
+
+	UT_ASSERT(test_mx_batch_enabled);
+	UT_ASSERT_EQ(origin_node, 1);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+	UT_ASSERT_EQ(test_ctrc_touch_calls, 1);
+	UT_ASSERT(deadline > test_now);
+	UT_ASSERT(proofs_cap > 0);
+	UT_ASSERT(cluster_multixact_current_wire_validate_proof_forward(
+		request, sizeof(*request), cluster_node_id, origin_node, test_formation_epoch, &decoded));
+	UT_ASSERT_EQ(decoded.prefix.body_kind, CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS);
+	UT_ASSERT_EQ(decoded.prefix.entry_count, 1);
+	UT_ASSERT_EQ(decoded.trailer.body.asks[0].xid, TEST_ORIGIN_XID + 1);
+	test_mx_remote_calls++;
+	*proof_count = 0;
+	*requester_capability_generation_out = 0;
+	memset(updater_proof, 0, sizeof(*updater_proof));
+	updater_proof->verdict = CUCP_UNKNOWN;
+	if (test_mx_remote_failed)
+		return CMX_RESOLVE_UNKNOWN;
+	memset(proof, 0, sizeof(*proof));
+	proof->member_xid = decoded.trailer.body.asks[0].xid;
+	proof->member_ordinal = decoded.trailer.body.asks[0].member_ordinal;
+	proof->member_status = decoded.trailer.body.asks[0].member_status;
+	proof->state = CCM_COMMITTED;
+	proof->commit_scn = scn_encode(1, 50);
+	*proof_count = 1;
+	if (test_mx_remote_revokes_grant)
+		test_ctrc_grant_revoked = true;
+	return CMX_RESOLVE_OK;
 }
 
 uint64
@@ -1168,6 +1234,11 @@ reset_exact_origin_fixture(void)
 	test_ctrc_touch_generation_drift = false;
 	test_ctrc_revoke_on_release = false;
 	test_ctrc_grant_revoked = false;
+	test_now = 0;
+	test_mx_batch_enabled = false;
+	test_mx_remote_calls = 0;
+	test_mx_remote_failed = false;
+	test_mx_remote_revokes_grant = false;
 	test_current_segment = TEST_TT_SEGMENT + 1;
 	test_current_segment_drift_on_recheck = false;
 	test_current_segment_calls = 0;
@@ -1869,6 +1940,191 @@ reset_rolled_updater_fixture(bool cross_segment)
 	test_origin_record.tt_slot_segment_id = cross_segment ? TEST_TT_SEGMENT : TEST_RECORD_SEGMENT;
 	test_ctrc_touch_segment = cross_segment ? TEST_TT_SEGMENT : TEST_RECORD_SEGMENT;
 	test_ctrc_touch_generation = cross_segment ? 23 : 17;
+}
+
+static ClusterMxResolveResult
+resolve_rolled_mx_batch(bool updater, bool foreign_member, ClusterCurrentMemberProof *proofs,
+						ClusterCurrentUpdaterProof *updater_proof, uint32 *capabilities,
+						TimestampTz *deadline)
+{
+	ClusterCurrentMxKey key = { 0 };
+	ClusterCurrentMxMemberDesc members[2] = { 0 };
+	ClusterCurrentUpdaterChallenge challenge = { 0 };
+	uint16 count = foreign_member ? 2 : 1;
+	uint64 hash;
+
+	UT_ASSERT(!updater || !foreign_member);
+	test_mx_batch_enabled = true;
+	key.multixact_id = 17;
+	key.cluster_epoch = (uint32)test_formation_epoch;
+	members[0].xid = TEST_ORIGIN_XID;
+	members[0].member_status = updater ? MultiXactStatusNoKeyUpdate : MultiXactStatusForShare;
+	if (foreign_member) {
+		members[1].xid = TEST_ORIGIN_XID + 1;
+		members[1].member_status = MultiXactStatusForKeyShare;
+	}
+	challenge.candidate_next_xmin_alias.undo_record_segment_id = TEST_RECORD_SEGMENT;
+	challenge.candidate_next_xmin_alias.tt_slot_id = cluster_tt_slot_offset_to_id(TEST_TT_OFFSET);
+	challenge.candidate_next_xmin_alias.cluster_epoch = key.cluster_epoch;
+	challenge.candidate_next_xmin_alias.local_xid = TEST_ORIGIN_XID;
+	challenge.candidate_next_xmin_locator = test_origin_locator;
+	challenge.updater_xid = TEST_ORIGIN_XID;
+	hash = cluster_multixact_current_descriptor_hash(&key, members, count);
+	memset(proofs, 0xa5, sizeof(*proofs) * count);
+	memset(updater_proof, 0xa5, sizeof(*updater_proof));
+	memset(capabilities, 0xa5, sizeof(*capabilities) * count);
+	return cluster_multixact_current_members_resolve_until(&key, members, count, hash,
+														   updater ? &challenge : NULL, proofs,
+														   updater_proof, capabilities, deadline);
+}
+
+static void
+assert_mx_batch_unknown(const ClusterCurrentMemberProof *proofs, uint16 count,
+						const ClusterCurrentUpdaterProof *updater, const uint32 *capabilities)
+{
+	ClusterCurrentMemberProof empty_proof = { 0 };
+	ClusterCurrentUpdaterProof empty_updater = { 0 };
+	uint16 i;
+
+	empty_proof.state = CCM_UNKNOWN;
+	empty_updater.verdict = CUCP_UNKNOWN;
+	for (i = 0; i < count; i++) {
+		UT_ASSERT(memcmp(&proofs[i], &empty_proof, sizeof(empty_proof)) == 0);
+		UT_ASSERT_EQ(capabilities[i], 0);
+	}
+	UT_ASSERT(memcmp(updater, &empty_updater, sizeof(empty_updater)) == 0);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+	UT_ASSERT_EQ(test_xact_lock_depth, 0);
+	UT_ASSERT_EQ(test_native_fence_depth, 0);
+}
+
+UT_TEST(test_retained_active_identity_reaches_real_mx_batch)
+{
+	int updater;
+	int cross_segment;
+
+	for (updater = 0; updater < 2; updater++) {
+		for (cross_segment = 0; cross_segment < (updater ? 2 : 1); cross_segment++) {
+			ClusterCurrentMemberProof proof;
+			ClusterCurrentUpdaterProof updater_proof;
+			ClusterTTStatusKey status_key;
+			uint32 capability;
+			uint32 generation;
+			uint16 wrap;
+			TimestampTz deadline = 0;
+
+			if (updater)
+				reset_rolled_updater_fixture(cross_segment != 0);
+			else
+				reset_rolled_active_fixture();
+			UT_ASSERT_EQ(resolve_rolled_mx_batch(updater != 0, false, &proof, &updater_proof,
+												 &capability, &deadline),
+						 CMX_RESOLVE_OK);
+			UT_ASSERT_EQ(proof.state, CCM_ACTIVE);
+			UT_ASSERT_EQ(proof.member_xid, TEST_ORIGIN_XID);
+			UT_ASSERT_EQ(proof.member_ordinal, 0);
+			UT_ASSERT_EQ(proof.commit_scn, InvalidScn);
+			UT_ASSERT_EQ(ClusterCurrentMemberProofGetCtrcGrant(&proof), test_ctrc_touch_grant);
+			UT_ASSERT(
+				ClusterCurrentMemberProofGetStatusKey(&proof, &status_key, &generation, &wrap));
+			UT_ASSERT_EQ(status_key.origin_node_id, 0);
+			UT_ASSERT_EQ(status_key.undo_segment_id, test_ctrc_touch_segment);
+			UT_ASSERT_EQ(status_key.tt_slot_id, cluster_tt_slot_offset_to_id(TEST_TT_OFFSET));
+			UT_ASSERT_EQ(status_key.cluster_epoch, test_formation_epoch);
+			UT_ASSERT_EQ(status_key.local_xid, TEST_ORIGIN_XID);
+			UT_ASSERT_EQ(generation, test_ctrc_touch_generation);
+			UT_ASSERT_EQ(wrap, TEST_ORIGIN_WRAP);
+			UT_ASSERT_EQ(capability, 77);
+			UT_ASSERT_EQ(updater_proof.verdict, updater ? CUCP_MATCH : CUCP_UNKNOWN);
+			if (updater) {
+				UT_ASSERT_EQ(updater_proof.candidate_next_xmin_locator.tt_wrap, TEST_ORIGIN_WRAP);
+				UT_ASSERT(memcmp(&updater_proof.candidate_next_xmin_locator.uba,
+								 &test_origin_locator.uba, sizeof(test_origin_locator.uba))
+						  == 0);
+				UT_ASSERT_EQ(test_durable_locator_calls, 0);
+			} else
+				UT_ASSERT_EQ(test_durable_locator_calls, 1);
+			UT_ASSERT_EQ(test_ctrc_touch_calls, 1);
+			UT_ASSERT_EQ(test_mx_remote_calls, 0);
+			UT_ASSERT_EQ(test_candidate_held_count, 0);
+			UT_ASSERT_EQ(test_candidate_acquire_calls, test_candidate_release_calls);
+			UT_ASSERT_EQ(test_native_fence_depth, 0);
+			UT_ASSERT_EQ(test_xact_lock_depth, 0);
+		}
+	}
+}
+
+UT_TEST(test_retained_active_mx_batch_scrubs_earlier_local_proof)
+{
+	int failure;
+
+	for (failure = 0; failure < 3; failure++) {
+		ClusterCurrentMemberProof proofs[2];
+		ClusterCurrentUpdaterProof updater;
+		uint32 capabilities[2];
+		TimestampTz deadline = 0;
+
+		reset_rolled_active_fixture();
+		test_mx_remote_failed = failure == 1;
+		test_mx_remote_revokes_grant = failure == 2;
+		UT_ASSERT_EQ(
+			resolve_rolled_mx_batch(false, true, proofs, &updater, capabilities, &deadline),
+			failure == 0 ? CMX_RESOLVE_OK
+						 : (failure == 1 ? CMX_RESOLVE_UNKNOWN : CMX_RESOLVE_RETRY));
+		UT_ASSERT_EQ(test_mx_remote_calls, 1);
+		if (failure != 0)
+			assert_mx_batch_unknown(proofs, 2, &updater, capabilities);
+		else {
+			UT_ASSERT_EQ(proofs[0].state, CCM_ACTIVE);
+			UT_ASSERT_EQ(ClusterCurrentMemberProofGetCtrcGrant(&proofs[0]), test_ctrc_touch_grant);
+			UT_ASSERT_EQ(capabilities[0], 77);
+			UT_ASSERT_EQ(proofs[1].state, CCM_COMMITTED);
+			UT_ASSERT_EQ(ClusterCurrentMemberProofGetCtrcGrant(&proofs[1]), 0);
+			UT_ASSERT_EQ(capabilities[1], 0);
+		}
+		UT_ASSERT_EQ(test_candidate_acquire_calls, test_candidate_release_calls);
+	}
+}
+
+UT_TEST(test_retained_mx_precommit_retries_preserve_batch_deadline)
+{
+	int updater;
+
+	for (updater = 0; updater < 2; updater++) {
+		ClusterCurrentMemberProof proof;
+		ClusterCurrentUpdaterProof updater_proof;
+		uint32 capability;
+		TimestampTz deadline = 0;
+		int acquire_calls;
+
+		if (updater)
+			reset_rolled_updater_fixture(true);
+		else
+			reset_rolled_active_fixture();
+		test_tt_slot.status = TT_SLOT_COMMITTED;
+		test_tt_slot.commit_scn = test_commit_scn;
+		test_now = 1000000;
+		UT_ASSERT_EQ(resolve_rolled_mx_batch(updater != 0, false, &proof, &updater_proof,
+											 &capability, &deadline),
+					 CMX_RESOLVE_RETRY);
+		assert_mx_batch_unknown(&proof, 1, &updater_proof, &capability);
+		UT_ASSERT_EQ(deadline, 2000000);
+		test_now = 1500000;
+		UT_ASSERT_EQ(resolve_rolled_mx_batch(updater != 0, false, &proof, &updater_proof,
+											 &capability, &deadline),
+					 CMX_RESOLVE_RETRY);
+		assert_mx_batch_unknown(&proof, 1, &updater_proof, &capability);
+		UT_ASSERT_EQ(deadline, 2000000);
+		acquire_calls = test_candidate_acquire_calls;
+		test_now = deadline;
+		UT_ASSERT_EQ(resolve_rolled_mx_batch(updater != 0, false, &proof, &updater_proof,
+											 &capability, &deadline),
+					 CMX_RESOLVE_TIMEOUT);
+		assert_mx_batch_unknown(&proof, 1, &updater_proof, &capability);
+		UT_ASSERT_EQ(deadline, 2000000);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, acquire_calls);
+		UT_ASSERT_EQ(test_ctrc_touch_calls, 0);
+	}
 }
 
 static void
@@ -5281,7 +5537,10 @@ UT_TEST(test_self_fresh_role_does_not_inherit_ordinary_abort_permission)
 int
 main(void)
 {
-	UT_PLAN(154);
+	UT_PLAN(157);
+	UT_RUN(test_retained_active_identity_reaches_real_mx_batch);
+	UT_RUN(test_retained_active_mx_batch_scrubs_earlier_local_proof);
+	UT_RUN(test_retained_mx_precommit_retries_preserve_batch_deadline);
 	UT_RUN(test_local_updater_rolled_active_preserves_original_identity);
 	UT_RUN(test_local_updater_rolled_active_requires_canonical_slot);
 	UT_RUN(test_local_updater_rolled_active_rechecks_touch_and_original_data);
