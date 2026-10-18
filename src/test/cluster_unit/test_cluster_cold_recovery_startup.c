@@ -1411,6 +1411,54 @@ UT_TEST(test_history_side_capture_refusals_keep_original_boundaries)
 	}
 }
 
+static void
+ready_history_capture(int fault)
+{
+	ClusterColdTypedV1 *typed;
+	ClusterColdHandshakeV1 all = { true, true, true, true, true, true };
+	char reason[256];
+	bool ready;
+
+	fixture();
+	history_generation(2, 9, 0x40, 0x80);
+	side_fault = fault;
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(typed->replay_count, NROOTS);
+	UT_ASSERT_EQ(typed->participant_count, NROOTS + 1);
+	UT_ASSERT_EQ(census_releases, 1);
+	/* The native history cut remains valid input even when SIDE capture
+	 * failed. Startup must refuse before acquiring the execution IR set. */
+	ready = cluster_cold_typed_ready_v1(typed, &all, reason, sizeof(reason));
+	if (fault == 0) {
+		UT_ASSERT(ready);
+		UT_ASSERT_EQ(reason[0], '\0');
+	} else {
+		UT_ASSERT(!ready);
+		UT_ASSERT(strstr(reason, "thread 2 has no complete SIDE capture") != NULL);
+		UT_ASSERT_NULL(typed->side_plans[NROOTS]);
+		UT_ASSERT_EQ(typed->side_capture_detail[NROOTS],
+					 fault == 10 ? RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE
+								 : RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED);
+	}
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(typed->participants[NROOTS].owner_incarnation, 9);
+	UT_ASSERT_EQ(typed->participants[NROOTS].native_redo, 0x80);
+	cluster_cold_typed_destroy_v1(&typed);
+	UT_ASSERT_EQ(side_destroys, side_creates);
+}
+
+UT_TEST(test_ready_refuses_incomplete_history_capture_before_ir)
+{
+	ready_history_capture(0);
+	ready_history_capture(10);
+}
+
+UT_TEST(test_ready_refuses_unsupported_history_capture_before_ir)
+{
+	ready_history_capture(11);
+}
+
 UT_TEST(test_side_capture_failure_never_exposes_a_partial_plan)
 {
 	for (int fault = 1; fault <= 5; fault++) {
@@ -3056,7 +3104,7 @@ UT_TEST(test_checkpoint_export_clears_unsealed_and_failed_output)
 int
 main(void)
 {
-	UT_PLAN(107);
+	UT_PLAN(109);
 	UT_RUN(test_endpoints_capture_and_recheck_post_redo_tt_before_publication);
 	UT_RUN(test_endpoints_incomplete_replay_never_captures_post_redo_tt);
 	UT_RUN(test_endpoints_inventory_refusal_discards_all_attempt_inputs);
@@ -3091,6 +3139,8 @@ main(void)
 	UT_RUN(test_census_recheck_refuses_missing_or_execution_state);
 
 	UT_RUN(test_history_side_capture_refusals_keep_original_boundaries);
+	UT_RUN(test_ready_refuses_incomplete_history_capture_before_ir);
+	UT_RUN(test_ready_refuses_unsupported_history_capture_before_ir);
 	UT_RUN(test_checkpoint_inputs_survive_census_for_every_generation);
 	UT_RUN(test_checkpoint_input_mismatch_stops_before_capture_and_scan);
 	UT_RUN(test_checkpoint_export_clears_unsealed_and_failed_output);
