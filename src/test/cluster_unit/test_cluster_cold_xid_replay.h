@@ -1,8 +1,12 @@
 /* Real Startup adapter and accumulator; checkpoint/reader/decoder/drain
- * owners are boundaries. This fixture never applies WAL or mutates storage. */
+ * and completion owners are boundaries. This fixture never applies WAL,
+ * publishes a ROOT, or mutates storage. */
+#include <setjmp.h>
+#include <stdarg.h>
 #include "access/xlogreader.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_wal_tail.h"
+#include "cluster/cluster_write_fence.h"
 
 static ClusterColdTypedV1 replay_typed;
 static ClusterWalRecoveryCheckpointV1 replay_checkpoints[3];
@@ -19,10 +23,139 @@ static uint8 replay_fence;
 static unsigned replay_barrier_calls, replay_endpoint_calls;
 static bool replay_endpoint_ok, replay_barrier_ok;
 
+/* The original publish function must stop before handing off any failed cut. */
+static bool replay_ready_ok, replay_fatal_armed;
+static unsigned replay_ready_calls, replay_complete_calls, replay_external_calls;
+static unsigned replay_fatal_calls, replay_log_calls;
+static int replay_error_level, replay_sqlstate;
+static ClusterRecoveryFenceCompleteV1 replay_complete_result;
+static jmp_buf replay_fatal;
+static char replay_events[16], replay_message[256];
+static unsigned replay_event_count;
+
+static void
+replay_event(char event)
+{
+	if (replay_event_count + 1 >= sizeof(replay_events))
+		abort();
+	replay_events[replay_event_count++] = event;
+	replay_events[replay_event_count] = '\0';
+}
+
+bool
+errstart(int elevel, const char *domain)
+{
+	(void)domain;
+	replay_error_level = elevel;
+	return true;
+}
+
+bool
+errstart_cold(int elevel, const char *domain)
+{
+	return errstart(elevel, domain);
+}
+
+int
+errcode(int sqlerrcode)
+{
+	replay_sqlstate = sqlerrcode;
+	return 0;
+}
+
+int
+errmsg(const char *fmt, ...)
+{
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(replay_message, sizeof(replay_message), fmt, args);
+	va_end(args);
+	return 0;
+}
+
+int
+errdetail(const char *fmt, ...)
+{
+	(void)fmt;
+	return 0;
+}
+
+int
+errdetail_log(const char *fmt, ...)
+{
+	(void)fmt;
+	return 0;
+}
+
+int
+errhint(const char *fmt, ...)
+{
+	(void)fmt;
+	return 0;
+}
+
+void
+errfinish(const char *filename, int lineno, const char *funcname)
+{
+	(void)filename;
+	(void)lineno;
+	(void)funcname;
+	if (replay_error_level >= ERROR) {
+		replay_fatal_calls++;
+		if (!replay_fatal_armed)
+			abort();
+		longjmp(replay_fatal, 1);
+	}
+	replay_log_calls++;
+}
+
+uint16
+cluster_recovery_merge_fence_plan_origin_count(const ClusterRecoveryFencePlan *plan)
+{
+	UT_ASSERT(plan == (const ClusterRecoveryFencePlan *)&replay_fence);
+	return 2;
+}
+
+bool
+cluster_cold_completion_ready_v1(const ClusterColdTypedV1 *typed,
+								 const ClusterRecoveryFencePlan *fence,
+								 const ClusterColdReplayResultV1 *result,
+								 ClusterColdTouchedV1 *touched, uint16 *thread)
+{
+	UT_ASSERT(typed == &replay_typed);
+	UT_ASSERT(fence == (const ClusterRecoveryFencePlan *)&replay_fence);
+	UT_ASSERT(result != NULL && touched != NULL && thread != NULL);
+	replay_event('C');
+	replay_ready_calls++;
+	*thread = 3;
+	return replay_ready_ok;
+}
+
+ClusterRecoveryFenceCompleteV1
+cluster_recovery_merge_fence_plan_complete_v1(ClusterRecoveryFencePlan *plan, uint16 *failed_thread,
+											  int *failed_detail)
+{
+	UT_ASSERT(plan == (ClusterRecoveryFencePlan *)&replay_fence);
+	UT_ASSERT(failed_thread != NULL && failed_detail != NULL);
+	replay_event('H');
+	replay_complete_calls++;
+	*failed_thread = 3;
+	*failed_detail = 17;
+	return replay_complete_result;
+}
+
+void
+cluster_write_fence_note_external_publish_gate_blocked(void)
+{
+	replay_event('F');
+	replay_external_calls++;
+}
+
 bool
 cluster_cold_durable_barrier_v1(const ClusterColdTouchedV1 *touched)
 {
 	UT_ASSERT(touched != NULL);
+	replay_event('B');
 	replay_barrier_calls++;
 	return replay_barrier_ok;
 }
@@ -37,6 +170,7 @@ cluster_cold_typed_xid_endpoints_v1(ClusterColdTypedV1 *typed,
 	UT_ASSERT(fence == (struct ClusterRecoveryFencePlan *)&replay_fence);
 	UT_ASSERT(result != NULL && progress != NULL);
 	UT_ASSERT_EQ(replay_barrier_calls, 1);
+	replay_event('X');
 	replay_endpoint_calls++;
 	return replay_endpoint_ok;
 }
@@ -144,6 +278,16 @@ replay_xid_reset(int count)
 	replay_input.payload_xid = 114;
 	replay_checkpoint_ok = replay_decode_ok = replay_drain_ok = true;
 	replay_drain_calls = 0;
+
+	replay_barrier_calls = replay_endpoint_calls = 0;
+	replay_ready_calls = replay_complete_calls = replay_external_calls = 0;
+	replay_fatal_calls = replay_log_calls = 0;
+	replay_error_level = replay_sqlstate = 0;
+	replay_ready_ok = replay_barrier_ok = replay_endpoint_ok = true;
+	replay_fatal_armed = false;
+	replay_complete_result = CLUSTER_RECOVERY_FENCE_COMPLETE_OK;
+	replay_event_count = 0;
+	replay_events[0] = replay_message[0] = '\0';
 }
 
 static ClusterColdReplayResultV1
@@ -284,4 +428,82 @@ UT_TEST(test_replay_endpoints_follow_durability_and_propagate_refusal)
 			UT_ASSERT_EQ(replay_barrier_calls, 1);
 			UT_ASSERT_EQ(replay_endpoint_calls, barrier_ok);
 		}
+}
+
+
+UT_TEST(test_startup_publish_stops_before_handoff_on_incomplete_inputs)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		ClusterColdReplayResultV1 result = { .detail = CLUSTER_COLD_REPLAY_OK };
+		replay_xid_reset(1);
+		if (fault == 0)
+			replay_ready_ok = false;
+		if (fault == 1)
+			replay_barrier_ok = false;
+		if (fault == 2)
+			replay_endpoint_ok = false;
+		replay_fatal_armed = true;
+		if (setjmp(replay_fatal) == 0) {
+			cluster_typed_replay_publish(&replay_adapter, &result);
+			UT_ASSERT(false);
+		}
+		replay_fatal_armed = false;
+		UT_ASSERT_EQ(replay_error_level, FATAL);
+		UT_ASSERT_EQ(replay_sqlstate, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+		UT_ASSERT_EQ(replay_fatal_calls, 1);
+		UT_ASSERT_EQ(replay_log_calls, 0);
+		UT_ASSERT_EQ(replay_ready_calls, 1);
+		UT_ASSERT_EQ(replay_barrier_calls, fault > 0);
+		UT_ASSERT_EQ(replay_endpoint_calls, fault > 1);
+		UT_ASSERT_EQ(replay_complete_calls, 0);
+		UT_ASSERT_EQ(replay_external_calls, 0);
+		UT_ASSERT(strcmp(replay_events, fault == 0 ? "C" : fault == 1 ? "CB" : "CBX") == 0);
+		UT_ASSERT(strstr(replay_message, "could not publish thread 3 recovered") != NULL);
+	}
+}
+
+UT_TEST(test_startup_publish_propagates_all_completion_refusals)
+{
+	/* Every original completion failure, including unknown results, is fatal. */
+	for (int failure = CLUSTER_RECOVERY_FENCE_COMPLETE_INVALID;
+		 failure <= CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_RELEASE + 1; failure++) {
+		ClusterColdReplayResultV1 result = { .detail = CLUSTER_COLD_REPLAY_OK };
+		replay_xid_reset(1);
+		replay_complete_result = (ClusterRecoveryFenceCompleteV1)failure;
+		replay_fatal_armed = true;
+		if (setjmp(replay_fatal) == 0) {
+			cluster_typed_replay_publish(&replay_adapter, &result);
+			UT_ASSERT(false);
+		}
+		replay_fatal_armed = false;
+		UT_ASSERT_EQ(replay_error_level, FATAL);
+		UT_ASSERT_EQ(replay_sqlstate, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+		UT_ASSERT_EQ(replay_fatal_calls, 1);
+		UT_ASSERT_EQ(replay_log_calls, 0);
+		UT_ASSERT_EQ(replay_complete_calls, 1);
+		UT_ASSERT_EQ(replay_external_calls, failure == CLUSTER_RECOVERY_FENCE_COMPLETE_AUTHORITY);
+		UT_ASSERT(strcmp(replay_events,
+						 failure == CLUSTER_RECOVERY_FENCE_COMPLETE_AUTHORITY ? "CBXHF" : "CBXH")
+				  == 0);
+		if (failure == CLUSTER_RECOVERY_FENCE_COMPLETE_IR_RELEASE)
+			UT_ASSERT(strstr(replay_message, "serialization release was not confirmed") != NULL);
+		else
+			UT_ASSERT(strstr(replay_message, "could not publish thread 3 recovered") != NULL);
+	}
+}
+
+UT_TEST(test_startup_publish_hands_off_only_after_native_durability_and_endpoints)
+{
+	ClusterColdReplayResultV1 result = { .detail = CLUSTER_COLD_REPLAY_OK };
+	replay_xid_reset(1);
+	cluster_typed_replay_publish(&replay_adapter, &result);
+	UT_ASSERT_EQ(replay_ready_calls, 1);
+	UT_ASSERT_EQ(replay_barrier_calls, 1);
+	UT_ASSERT_EQ(replay_endpoint_calls, 1);
+	UT_ASSERT_EQ(replay_complete_calls, 1);
+	UT_ASSERT_EQ(replay_external_calls, 0);
+	UT_ASSERT_EQ(replay_fatal_calls, 0);
+	UT_ASSERT_EQ(replay_log_calls, 1);
+	UT_ASSERT(strcmp(replay_events, "CBXH") == 0);
+	UT_ASSERT(strstr(replay_message, "2 fenced writer generations published recovered") != NULL);
 }

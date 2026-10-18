@@ -9077,7 +9077,8 @@ test_cluster_cold_recovery_xid_core.o: $(top_srcdir)/src/backend/cluster/cluster
 test_cluster_cold_xid_replay.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile
 	awk '/^typedef struct ClusterColdTypedReplay$$/ { emit=1; count++ } \
 	     /^cluster_typed_replay_(xid_begin|next|source_drained|durable_endpoints)\(/ { print "static bool"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 5) exit 1 }' $< > $@.tmp
+	     /^cluster_typed_replay_(unpublished|publish)\(/ { print "static void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 7) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_cold_recovery_xid: test_cluster_cold_recovery_xid.c unit_test.h \
