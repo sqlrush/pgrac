@@ -2657,10 +2657,295 @@ UT_TEST(tt_readback_retains_final_recheck_failure_and_clears_bad_outputs)
 	tt_redo_destroy(&f);
 }
 
+static void
+tt_post_readback_empty_original(TtRedoFixture *f)
+{
+	char path[MAXPGPATH];
+
+	cluster_cold_tt_base_destroy_v1(&f->typed);
+	snprintf(path, sizeof(path), "%s/513", tt_redo_dir);
+	UT_ASSERT_EQ(unlink(path), 0);
+	UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(&f->typed, (Size)1024 * 1024), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_tt_base_count_v1(&f->typed), 0);
+}
+
+static void
+tt_post_readback_init(TtRedoFixture *f, XLogRecPtr begin)
+{
+	FakeXactRecord fake;
+	struct {
+		xl_cluster_undo_segment_init record;
+		uint8 page[BLCKSZ];
+	} init = { 0 };
+
+	init.record.instance = 3;
+	init.record.segment_id = 513;
+	cluster_undo_segment_make_header_bytes(513, 3, (char *)init.page);
+	make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_INIT, &init, sizeof(init));
+	undo_header_feed(f->typed.side_plans[0], &fake, begin);
+}
+
+static void
+tt_post_readback_refuses(const ClusterColdTypedV1 *typed, uint32 participant, uint32 index)
+{
+	RfSideUndoHeaderImageV1 out, zero = { 0 };
+
+	memset(&out, 0xa9, sizeof(out));
+	UT_ASSERT(!cluster_cold_typed_tt_after_redo_readback_v1(typed, participant, index, &out));
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+}
+
+static void
+tt_post_readback_new(TtRedoFixture *f, PGAlignedBlock *expected, bool terminal)
+{
+	FakeXactRecord fake;
+	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)expected->data;
+
+	tt_redo_fixture(f, terminal ? 400 : 300, RF_SIDE_PLAN_RECOVERY);
+	tt_post_readback_empty_original(f);
+	tt_post_readback_init(f, 100);
+	undo_header_bind(&fake, 0);
+	undo_header_feed(f->typed.side_plans[0], &fake, 200);
+	cluster_undo_segment_make_header_bytes(513, 3, expected->data);
+	header->tt_slots[4].xid = 802;
+	header->tt_slots[4].wrap = 7;
+	header->tt_slots[4].status = terminal ? TT_SLOT_COMMITTED : TT_SLOT_ACTIVE;
+	header->tt_slots[4].first_undo_block = (UBA)InvalidUba_init;
+	if (terminal) {
+		undo_header_commit(&fake, 0, 802);
+		undo_header_feed(f->typed.side_plans[0], &fake, 300);
+		header->tt_slots[4].commit_scn = 999;
+	}
+	tt_redo_seal(f);
+	tt_readback_write(513, expected, true);
+}
+
+UT_TEST(tt_post_readback_reconstructs_new_init_bind_and_commit_without_base)
+{
+	for (int mode = 0; mode < 3; mode++) {
+		TtRedoFixture f;
+		PGAlignedBlock expected, foreign;
+		RfSideUndoHeaderImageV1 out;
+		bool terminal = mode != 0;
+		uint32 post_index = mode == 2 ? 1 : 0;
+		char path[MAXPGPATH];
+
+		tt_post_readback_new(&f, &expected, terminal);
+		if (mode == 2) {
+			/* An unrelated captured original is not a base for this new file. */
+			cluster_cold_tt_base_destroy_v1(&f.typed);
+			snprintf(path, sizeof(path), "%s/513", tt_redo_dir);
+			UT_ASSERT_EQ(unlink(path), 0);
+			cluster_undo_segment_make_header_bytes(257, 2, foreign.data);
+			tt_readback_write(257, &foreign, true);
+			UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(&f.typed, (Size)1024 * 1024),
+						 CLUSTER_COLD_OK);
+			tt_readback_write(513, &expected, true);
+		}
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(cluster_cold_typed_tt_after_redo_readback_v1(&f.typed, 0, post_index, &out));
+		UT_ASSERT(memcmp(out.page.data, expected.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(out.has_full_image, true);
+		UT_ASSERT_EQ(out.operation_count, terminal ? 3 : 2);
+		UT_ASSERT_EQ(out.source_index, terminal ? 2 : 1);
+		UT_ASSERT_EQ(cluster_cold_tt_base_count_v1(&f.typed), mode == 2 ? 1 : 0);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_recheck_v1(&f.typed), CLUSTER_COLD_OK);
+		if (mode == 2) {
+			snprintf(path, sizeof(path), "%s/257", tt_redo_dir);
+			UT_ASSERT_EQ(unlink(path), 0);
+		}
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_post_readback_selects_existing_base_by_physical_identity)
+{
+	TtRedoFixture f;
+	PGAlignedBlock foreign, expected;
+	FakeXactRecord fake;
+	RfSideUndoHeaderImageV1 out;
+	char path[MAXPGPATH];
+
+	tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+	undo_header_commit(&fake, 0, 802);
+	undo_header_feed(f.typed.side_plans[0], &fake, 100);
+	tt_redo_seal(&f);
+	expected = f.base;
+	((UndoSegmentHeaderData *)expected.data)->tt_slots[4].status = TT_SLOT_COMMITTED;
+	((UndoSegmentHeaderData *)expected.data)->tt_slots[4].commit_scn = 999;
+	tt_readback_write(513, &expected, false);
+	cluster_undo_segment_make_header_bytes(257, 2, foreign.data);
+	tt_readback_write(257, &foreign, true);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_count_v1(&f.typed), 2);
+	tt_post_readback_refuses(&f.typed, 0, 0); /* Another source cannot authorize owner 2. */
+	UT_ASSERT(cluster_cold_typed_tt_after_redo_readback_v1(&f.typed, 0, 1, &out));
+	UT_ASSERT(memcmp(out.page.data, expected.data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(out.has_full_image, false);
+	UT_ASSERT_EQ(out.operation_count, 1);
+	UT_ASSERT(memcmp(cluster_cold_tt_base_header_v1(&f.typed, 0, &(uint8){ 0 }, &(uint32){ 0 }),
+					 f.base.data, BLCKSZ)
+			  == 0);
+	snprintf(path, sizeof(path), "%s/257", tt_redo_dir);
+	UT_ASSERT_EQ(unlink(path), 0);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_post_readback_never_seeds_missing_base_from_observed_bytes)
+{
+	for (int carrier = 0; carrier < 3; carrier++) {
+		TtRedoFixture f;
+		FakeXactRecord fake;
+
+		tt_redo_fixture(&f, carrier == 0 ? 100 : 200, RF_SIDE_PLAN_RECOVERY);
+		tt_post_readback_empty_original(&f);
+		if (carrier != 0) {
+			if (carrier == 1)
+				undo_header_bind(&fake, 0);
+			else
+				undo_header_commit(&fake, 0, 802);
+			undo_header_feed(f.typed.side_plans[0], &fake, 100);
+		}
+		tt_redo_seal(&f);
+		tt_readback_write(513, &f.base, true);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		tt_post_readback_refuses(&f.typed, 0, 0);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_post_readback_new_header_requires_every_slot_and_untouched_byte)
+{
+	TtRedoFixture f;
+	PGAlignedBlock expected, changed;
+
+	tt_post_readback_new(&f, &expected, true);
+	for (uint32 fault = 0; fault < TT_SLOTS_PER_SEGMENT + 3; fault++) {
+		UndoSegmentHeaderData *header;
+
+		changed = expected;
+		header = (UndoSegmentHeaderData *)changed.data;
+		if (fault < TT_SLOTS_PER_SEGMENT)
+			header->tt_slots[fault].commit_scn++;
+		else if (fault == TT_SLOTS_PER_SEGMENT)
+			header->wrap_count++;
+		else if (fault == TT_SLOTS_PER_SEGMENT + 1)
+			header->tt_slots[4].status = TT_SLOT_ACTIVE;
+		else
+			changed.data[BLCKSZ - 1] ^= 1;
+		tt_readback_write(513, &changed, false);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		tt_post_readback_refuses(&f.typed, 0, 0);
+		cluster_cold_tt_after_redo_reset_v1(&f.typed);
+	}
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_post_readback_new_header_retains_original_source_and_namespace_guards)
+{
+	for (int fault = 0; fault < 8; fault++) {
+		TtRedoFixture f;
+		PGAlignedBlock expected;
+
+		tt_post_readback_new(&f, &expected, true);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		switch (fault) {
+		case 0:
+			f.typed.system_identifier++;
+			break;
+		case 1:
+			f.typed.observer.database_incarnation++;
+			break;
+		case 2:
+			f.typed.participants[0].native_redo++;
+			break;
+		case 3:
+			f.typed.participants[0].tail_end++;
+			break;
+		case 4:
+			f.typed.sources[0].claim.claim_sha256[0] ^= 1;
+			break;
+		case 5:
+			f.typed.side_capture_detail[0] = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			break;
+		case 6:
+			f.typed.refusal = CLUSTER_COLD_SOURCE_GAP;
+			break;
+		case 7:
+			f.typed.replay_count = 0;
+			break;
+		}
+		tt_post_readback_refuses(&f.typed, 0, 0);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_post_readback_new_header_retains_native_lifecycle_refusals)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		TtRedoFixture f;
+		FakeXactRecord fake;
+		PGAlignedBlock observed;
+
+		tt_redo_fixture(&f, 300, RF_SIDE_PLAN_RECOVERY);
+		tt_post_readback_empty_original(&f);
+		if (fault == 0) {
+			undo_header_bind(&fake, 0);
+			undo_header_feed(f.typed.side_plans[0], &fake, 100);
+			tt_post_readback_init(&f, 200);
+		} else {
+			tt_post_readback_init(&f, 100);
+			if (fault == 1)
+				tt_post_readback_init(&f, 200);
+			else {
+				undo_header_bind(&fake, 1);
+				undo_header_feed(f.typed.side_plans[0], &fake, 200);
+			}
+		}
+		tt_redo_seal(&f);
+		cluster_undo_segment_make_header_bytes(513, 3, observed.data);
+		tt_readback_write(513, &observed, true);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		tt_post_readback_refuses(&f.typed, 0, 0);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_post_readback_requires_valid_post_capture_and_keeps_final_refusal)
+{
+	TtRedoFixture f;
+	PGAlignedBlock expected, changed;
+
+	tt_post_readback_new(&f, &expected, true);
+	tt_post_readback_refuses(&f.typed, 0, 0);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+	tt_post_readback_refuses(NULL, 0, 0);
+	tt_post_readback_refuses(&f.typed, 1, 0);
+	tt_post_readback_refuses(&f.typed, UINT32_MAX, 0);
+	tt_post_readback_refuses(&f.typed, 0, UINT32_MAX);
+	UT_ASSERT(!cluster_cold_typed_tt_after_redo_readback_v1(&f.typed, 0, 0, NULL));
+	changed = expected;
+	changed.data[BLCKSZ - 1] ^= 1;
+	tt_readback_write(513, &changed, false);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_recheck_v1(&f.typed), CLUSTER_COLD_SOURCE_GAP);
+	tt_post_readback_refuses(&f.typed, 0, 0);
+	tt_readback_write(513, &expected, false);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_recheck_v1(&f.typed), CLUSTER_COLD_SOURCE_GAP);
+	tt_post_readback_refuses(&f.typed, 0, 0);
+	tt_redo_destroy(&f);
+}
+
 int
 main(void)
 {
-	UT_PLAN(61);
+	UT_PLAN(68);
+	UT_RUN(tt_post_readback_reconstructs_new_init_bind_and_commit_without_base);
+	UT_RUN(tt_post_readback_selects_existing_base_by_physical_identity);
+	UT_RUN(tt_post_readback_never_seeds_missing_base_from_observed_bytes);
+	UT_RUN(tt_post_readback_new_header_requires_every_slot_and_untouched_byte);
+	UT_RUN(tt_post_readback_new_header_retains_original_source_and_namespace_guards);
+	UT_RUN(tt_post_readback_new_header_retains_native_lifecycle_refusals);
+	UT_RUN(tt_post_readback_requires_valid_post_capture_and_keeps_final_refusal);
 	UT_RUN(tt_readback_matches_physical_commit_and_preserves_original);
 	UT_RUN(tt_readback_matches_exact_abort_and_unchanged_active_slots);
 	UT_RUN(tt_readback_refuses_every_slot_and_non_slot_byte_mismatch);

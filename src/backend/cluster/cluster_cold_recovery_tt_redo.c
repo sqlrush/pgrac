@@ -168,6 +168,58 @@ cluster_cold_typed_tt_redo_readback_v1(const ClusterColdTypedV1 *typed, uint32 p
 }
 
 bool
+cluster_cold_typed_tt_after_redo_readback_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+											 uint32 post_segment_index,
+											 RfSideUndoHeaderImageV1 *out)
+{
+	const UndoSegmentHeaderData *observed;
+	RfSideUndoHeaderImageV1 folded;
+	uint8 owner;
+	uint32 segment, count, original_index = UINT32_MAX;
+	bool has_header_work;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (typed == NULL
+		|| !cluster_cold_tt_base_namespace_matches_v1(typed, typed->system_identifier,
+													  typed->observer.database_incarnation))
+		return false;
+	observed = cluster_cold_tt_after_redo_header_v1(typed, post_segment_index, &owner, &segment);
+	if (observed == NULL)
+		return false;
+	count = cluster_cold_tt_base_count_v1(typed);
+	for (uint32 i = 0; i < count; i++) {
+		uint8 base_owner;
+		uint32 base_segment;
+
+		if (cluster_cold_tt_base_header_v1(typed, i, &base_owner, &base_segment) == NULL)
+			return false;
+		if (base_owner == owner && base_segment == segment) {
+			original_index = i;
+			break;
+		}
+	}
+	if (original_index != UINT32_MAX) {
+		if (!cluster_cold_typed_tt_redo_header_v1(typed, participant, original_index, &folded))
+			return false;
+	} else {
+		/* A new physical file supplies no predecessor. Only the existing
+		 * native full-image/lifecycle proof may reconstruct it from redo. */
+		if (!cold_tt_redo_source(typed, participant, owner, segment, &has_header_work)
+			|| !has_header_work
+			|| rf_side_online_plan_prepare_undo_header_v1(typed->side_plans[participant], owner,
+														  segment, NULL, &folded)
+				   != RF_PAGE_PROOF_DETAIL_OK)
+			return false;
+	}
+	if (memcmp(observed, folded.page.data, BLCKSZ) != 0)
+		return false;
+	*out = folded;
+	return true;
+}
+
+bool
 cluster_cold_typed_tt_redo_slot_v1(const ClusterColdTypedV1 *typed, uint32 participant,
 								   uint32 segment_index, uint32 slot_offset,
 								   ClusterColdTtSlotInputV1 *out)

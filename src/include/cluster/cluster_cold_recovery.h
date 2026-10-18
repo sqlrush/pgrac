@@ -936,6 +936,16 @@ extern bool cluster_cold_typed_tt_redo_readback_v1(const ClusterColdTypedV1 *typ
 												   uint32 participant, uint32 segment_index,
 												   struct RfSideUndoHeaderImageV1 *out);
 
+/* Select a physical post-redo header, including one absent from the original
+ * inventory. Such a header requires the sealed native full-image fold with
+ * no base; observed post bytes never supply missing input. Exact full-block
+ * equality and the original-source guards still apply. Failure clears out.
+ * This is selected-header input, not global inventory or recovery authority. */
+extern bool cluster_cold_typed_tt_after_redo_readback_v1(const ClusterColdTypedV1 *typed,
+														 uint32 participant,
+														 uint32 post_segment_index,
+														 struct RfSideUndoHeaderImageV1 *out);
+
 /* Copy any physical slot after the same selected source's sealed ordinary
  * redo, or match its resulting physical key. No status is filtered during
  * enumeration, and generation zero is valid. A pre-redo key is insufficient
