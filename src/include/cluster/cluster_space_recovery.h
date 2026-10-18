@@ -47,6 +47,14 @@ extern bool cluster_space_recovery_cold_drop_already_v1(const ClusterSpaceIdenti
 extern bool cluster_space_recovery_cold_abort_preflight_v1(const RfSideOnlinePlanV1 *side,
 														   uint32 index, uint32 relation);
 
+/* Execute only the original ABORT's qualified native pending-delete group.
+ * Sync the retained source before native unlink, retain occupied MAIN and
+ * verify/sync the complete physical result and directory. No TT/CLOG or
+ * terminal completion is granted; an absent SPACE proof cannot be retried
+ * as success. All original cold authorities must remain held throughout. */
+extern bool cluster_space_recovery_cold_abort_delete_v1(const RfSideOnlinePlanV1 *side,
+														uint32 index);
+
 extern bool cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *plan,
 												const ClusterThreadRecoveryAuthorityV1 *sources,
 												uint32 count, ClusterSpaceRecoveryBatchV1 **out);
