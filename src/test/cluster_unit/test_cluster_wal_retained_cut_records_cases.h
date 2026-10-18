@@ -210,7 +210,7 @@ UT_TEST(test_records_cold_ordered_counter_candidate)
 				UT_ASSERT_EQ(progress.next_xid,
 							 U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(8, 115)));
 				UT_ASSERT_EQ(decoded.record.record_flags,
-							 foreign ? CLUSTER_COLD_RECORD_SIDE_UNOWNED : 0);
+							 foreign ? CLUSTER_COLD_RECORD_FOREIGN_SIDE : 0);
 			}
 			if (i == 4)
 				UT_ASSERT_EQ(progress.next_xid,
@@ -275,7 +275,8 @@ UT_TEST(test_records_cold_terminal_counter_inputs)
 	}
 }
 
-UT_TEST(test_records_cold_abort_children_require_native_tree_shape)
+static void
+rec_check_cold_terminal_children(bool abort)
 {
 	for (int wrap = 0; wrap < 2; wrap++)
 		for (int invalid = 0; invalid < 2; invalid++) {
@@ -285,15 +286,17 @@ UT_TEST(test_records_cold_abort_children_require_native_tree_shape)
 			int count = lengthof(children);
 			RealRecord *r;
 			xl_xact_xinfo xinfo;
-			Size offset = MinSizeOfXactAbort + sizeof(xinfo);
+			Size header = abort ? MinSizeOfXactAbort : MinSizeOfXactCommit;
+			Size offset = header + sizeof(xinfo);
 			Size added = sizeof(count) + sizeof(children);
 			ClusterColdDecodedV1 decoded = { 0 };
 
 			rec_two_writers(&self, &peer);
-			r = rec_abort(self, 0x2000, 0x2100, top, NULL, 0);
-			memcpy(&xinfo, r->data + MinSizeOfXactAbort, sizeof(xinfo));
+			r = abort ? rec_abort(self, 0x2000, 0x2100, top, NULL, 0)
+					  : rec_commit(self, 0x2000, 0x2100, top, NULL, 0, false, 0);
+			memcpy(&xinfo, r->data + header, sizeof(xinfo));
 			xinfo.xinfo |= XACT_XINFO_HAS_SUBXACTS;
-			memcpy(r->data + MinSizeOfXactAbort, &xinfo, sizeof(xinfo));
+			memcpy(r->data + header, &xinfo, sizeof(xinfo));
 			if (invalid)
 				children[1] = children[0];
 			memmove(r->data + offset + added, r->data + offset,
@@ -309,6 +312,16 @@ UT_TEST(test_records_cold_abort_children_require_native_tree_shape)
 															  : CLUSTER_COLD_RECORD_FOREIGN_SIDE);
 			cluster_cold_decoded_release_v1(&decoded);
 		}
+}
+
+UT_TEST(test_records_cold_abort_children_require_native_tree_shape)
+{
+	rec_check_cold_terminal_children(true);
+}
+
+UT_TEST(test_records_cold_commit_children_require_native_tree_shape)
+{
+	rec_check_cold_terminal_children(false);
 }
 
 UT_TEST(test_records_cold_multixact_counter_inputs)

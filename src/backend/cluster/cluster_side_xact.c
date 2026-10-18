@@ -411,6 +411,29 @@ side_xact_cold_stats_valid(int count, const xl_xact_stats_item *items, uint32 xi
  * SPACE version. Preserve every message and its scope; inspection never
  * asserts that the original cache owner delivered it. SMGR/RELMAP messages
  * are nontransactional and need a separate dependency classification. */
+/* Match the native CLOG tree contract before any terminal mutation. The
+ * bounded parser already proved the complete list fits its original record;
+ * terminal membership does not prove an immediate SUBTRANS parent edge. */
+static bool
+side_xact_cold_children_valid(TransactionId top, int count, const TransactionId *children)
+{
+	TransactionId previous = top;
+
+	if (count < 0 || (count > 0 && children == NULL))
+		return false;
+	for (int i = 0; i < count; i++) {
+		TransactionId child;
+
+		/* The original reader may provide unaligned main data. */
+		memcpy(&child, (const uint8 *)children + i * sizeof(child), sizeof(child));
+		if (!TransactionIdIsNormal(child) || (int32)(child - previous) <= 0
+			|| (int32)(child - top) <= 0)
+			return false;
+		previous = child;
+	}
+	return true;
+}
+
 static bool
 side_xact_pi_effects_valid(const xl_xact_parsed_commit *parsed, uint64 system_identifier,
 						   bool cold_completion, RfSideXactOperationV1 *out)
@@ -418,7 +441,7 @@ side_xact_pi_effects_valid(const xl_xact_parsed_commit *parsed, uint64 system_id
 	uint32 kinds = 0;
 
 	/* These additional transaction owners are not proved by this consumer. */
-	if (parsed->nsubxacts != 0
+	if ((!cold_completion && parsed->nsubxacts != 0)
 		|| (cold_completion ? !side_xact_cold_stats_valid(parsed->nstats, parsed->stats,
 														  parsed->xinfo, parsed->dbId)
 							: parsed->nstats != 0)
@@ -761,6 +784,8 @@ side_xact_decode(XLogReaderState *record, uint64 system_identifier, uint16 origi
 														&candidate)
 						  : (!side_xact_no_commit_effects(&parsed)
 							 && !side_xact_space_drops_valid(&parsed, system_identifier)))
+			|| (cold_completion
+				&& !side_xact_cold_children_valid(xid, parsed.nsubxacts, parsed.subxacts))
 			|| (parsed.xinfo & XACT_XINFO_HAS_TWOPHASE) != 0 || !SCN_VALID(parsed.scn)
 			|| side_xact_commit_timestamp(&parsed) == 0 || !parsed.has_tt_commit
 			|| !side_xact_tt_delta_valid(&parsed.tt_commit, origin_thread, xid, parsed.scn))
@@ -897,29 +922,6 @@ rf_side_xact_inspect_pi_v1(XLogReaderState *record, uint64 system_identifier, ui
 
 /* Ordinary ABORT carries no TT locator. Retain its bounded native effects;
  * only the cold plan can bind the exact preceding TT_ABORT and apply them. */
-/* Match the native CLOG tree contract before any terminal mutation. The
- * bounded parser already proved the complete list fits its original record;
- * terminal membership does not prove an immediate SUBTRANS parent edge. */
-static bool
-side_xact_cold_children_valid(TransactionId top, int count, const TransactionId *children)
-{
-	TransactionId previous = top;
-
-	if (count < 0 || (count > 0 && children == NULL))
-		return false;
-	for (int i = 0; i < count; i++) {
-		TransactionId child;
-
-		/* The original reader may provide unaligned main data. */
-		memcpy(&child, (const uint8 *)children + i * sizeof(child), sizeof(child));
-		if (!TransactionIdIsNormal(child) || (int32)(child - previous) <= 0
-			|| (int32)(child - top) <= 0)
-			return false;
-		previous = child;
-	}
-	return true;
-}
-
 static bool
 side_xact_decode_cold_abort(XLogReaderState *record, uint64 system_identifier, uint16 origin_thread,
 							RfSideXactOperationV1 *out)
@@ -971,7 +973,7 @@ rf_side_xact_decode_recovery_v1(XLogReaderState *record, uint64 system_identifie
 							 | XACT_XINFO_HAS_INVALS | XACT_COMPLETION_UPDATE_RELCACHE_FILE
 							 | XACT_XINFO_HAS_DROPPED_STATS | XACT_COMPLETION_FORCE_SYNC_COMMIT
 							 | XACT_XINFO_HAS_AE_LOCKS | XACT_XINFO_HAS_RELFILELOCATORS
-							 | XACT_XINFO_HAS_SPACE_DROP;
+							 | XACT_XINFO_HAS_SPACE_DROP | XACT_XINFO_HAS_SUBXACTS;
 
 	if (out == NULL)
 		return false;
@@ -992,7 +994,7 @@ rf_side_xact_decode_recovery_v1(XLogReaderState *record, uint64 system_identifie
 		|| (candidate.invalidation_count == 0 && candidate.space_drop_count == 0
 			&& (candidate.xinfo
 				& (XACT_XINFO_HAS_DROPPED_STATS | XACT_COMPLETION_FORCE_SYNC_COMMIT
-				   | XACT_XINFO_HAS_AE_LOCKS))
+				   | XACT_XINFO_HAS_AE_LOCKS | XACT_XINFO_HAS_SUBXACTS))
 				   == 0))
 		return false;
 	candidate.pi_read_only = false;
@@ -1187,7 +1189,20 @@ side_xact_apply_cold_completion(const RfSideXactOperationV1 *operation, const ui
 			&& (structural_record == NULL
 				|| cluster_undo_recovery_cold_source_synced_v1(operation->origin_thread - 1))
 			&& verify(arg, operation)
-			&& cluster_undo_recovery_cold_origin_authorized_v1(operation->origin_thread - 1)) {
+			&& cluster_undo_recovery_cold_origin_authorized_v1(operation->origin_thread - 1)
+			&& cluster_undo_recovery_cold_source_synced_v1(operation->origin_thread - 1)
+			/* Exact canonical TT coverage precedes native terminal completion.
+			 * Reuse this aligned complete payload for the entire CLOG tree;
+			 * a top-only status cannot discharge its original children. */
+			&& cluster_clog_native_recovery_apply_v1(operation->origin_thread - 1, operation->xid,
+													 parsed.nsubxacts, parsed.subxacts,
+													 TRANSACTION_STATUS_COMMITTED)
+			&& cluster_undo_recovery_cold_source_synced_v1(operation->origin_thread - 1)
+			&& cluster_clog_native_recovery_verify_v1(operation->origin_thread - 1, operation->xid,
+													  parsed.nsubxacts, parsed.subxacts,
+													  TRANSACTION_STATUS_COMMITTED)
+			&& cluster_undo_recovery_cold_origin_authorized_v1(operation->origin_thread - 1)
+			&& cluster_undo_recovery_cold_source_synced_v1(operation->origin_thread - 1)) {
 			/* Native CLOG and the canonical TT are already durable. Replay
 			 * every local message and init-file effect before the derived
 			 * terminal entry. This does not certify all-cohort RESET or OPEN. */

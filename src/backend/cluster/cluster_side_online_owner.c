@@ -213,12 +213,16 @@ side_owner_commit_covered(void *arg, const RfSideXactOperationV1 *operation)
 				return false;
 			if (!side_owner_cold_formed(owner))
 				return true;
-			/* This original coverage callback runs before the derived terminal
-			 * projection. A durable header alone is not native CLOG completion. */
-			return side_owner_cold_commit_ready(owner, operation)
-				   && cluster_clog_native_recovery_apply_v1(operation->origin_thread - 1,
-															operation->xid, 0, NULL,
-															TRANSACTION_STATUS_COMMITTED)
+			/* Complete-payload replay writes and verifies the native CLOG tree
+			 * after this exact TT proof, using its single aligned payload.
+			 * Strict plain COMMIT still completes top-only CLOG here. */
+			if (!side_owner_cold_commit_ready(owner, operation))
+				return false;
+			if (operation->cold_completion_effects)
+				return side_owner_authority_fresh(owner);
+			return cluster_clog_native_recovery_apply_v1(operation->origin_thread - 1,
+														 operation->xid, 0, NULL,
+														 TRANSACTION_STATUS_COMMITTED)
 				   && cluster_clog_native_recovery_verify_v1(operation->origin_thread - 1,
 															 operation->xid, 0, NULL,
 															 TRANSACTION_STATUS_COMMITTED)

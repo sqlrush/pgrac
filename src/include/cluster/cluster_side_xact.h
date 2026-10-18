@@ -141,7 +141,7 @@ rf_side_xact_apply_cold_completion_v1(const RfSideXactOperationV1 *operation, co
 									  uint32 length, void *arg,
 									  RfSideXactVerifyCommitCoverageV1 verify);
 /* Selected immutable cold foreign COMMIT only. The structural proof runs
- * before verify installs canonical TT/CLOG; actual deletion/sync completes
+ * before canonical TT coverage and native CLOG; actual deletion/sync completes
  * before stats/derived terminal. Not the generic/whole-source consumer. */
 extern RfSideXactApplyResultV1
 rf_side_xact_apply_cold_drop_completion_v1(const RfSideXactOperationV1 *operation,
