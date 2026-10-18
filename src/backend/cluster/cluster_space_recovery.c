@@ -25,6 +25,7 @@
 #include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_wal_tail.h"
 #include "cluster/storage/cluster_smgr.h"
+#include "cluster/storage/cluster_shared_fs.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/buf_internals.h"
@@ -334,13 +335,16 @@ space_native_create(ClusterSpaceRecoveryBatchV1 *batch, SpaceRecoveryTarget *tar
 					SMgrRelation rel, bool apply)
 {
 	ClusterSpaceReservation before;
+	const ClusterSharedFsOps *ops;
 	uint64 token;
 	BlockNumber blocks;
 	bool present;
 
 	if (!target->native_create)
 		return true;
-	if (batch->cold_fence == NULL || !space_sources_fresh(batch))
+	ops = cluster_shared_fs_get_active_ops();
+	if (batch->cold_fence == NULL || !space_sources_fresh(batch) || ops == NULL
+		|| ops->id != CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS)
 		return false;
 	present = smgrexists(rel, MAIN_FORKNUM);
 	if (!present && !PageIsNew(target->before[1].data)
@@ -358,7 +362,9 @@ space_native_create(ClusterSpaceRecoveryBatchV1 *batch, SpaceRecoveryTarget *tar
 		return false;
 	smgrimmedsync(rel, MAIN_FORKNUM);
 	return space_sources_fresh(batch) && smgrexists(rel, MAIN_FORKNUM)
-		   && smgrnblocks(rel, MAIN_FORKNUM) == blocks && space_sources_fresh(batch);
+		   && smgrnblocks(rel, MAIN_FORKNUM) == blocks && space_sources_fresh(batch)
+		   && cluster_shared_fs_sharedfs_sync_create_result(target->key.locator, MAIN_FORKNUM)
+		   && space_sources_fresh(batch);
 }
 
 static bool
@@ -548,6 +554,13 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, u
 		ok = space_sources_fresh(batch) && space_disk_matches(rel, 0, prepared.pages[0].data)
 			 && space_disk_matches(rel, 1, prepared.pages[1].data);
 	done:;
+		/* File sync alone does not persist a newly created directory entry.
+		 * This also applies when native redo adopted an existing/open file. */
+		if (ok && apply && target->native_create && !batch->cold_drop_already)
+			ok = space_sources_fresh(batch)
+				 && cluster_shared_fs_sharedfs_sync_create_result(target->key.locator,
+																  SPACE_FORKNUM)
+				 && space_sources_fresh(batch);
 	}
 	PG_FINALLY();
 	{

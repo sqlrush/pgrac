@@ -14,6 +14,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/storage/cluster_shared_fs.h"
 #include "cluster/cluster_page_wal.h"
 #include <unistd.h>
 
@@ -86,6 +87,9 @@ static bool creating;
 static FILE *main_file;
 static bool main_exists, stale_after_main_create, stale_after_main_sync, hide_main_after_sync;
 static unsigned main_creates, main_syncs, create_source_syncs;
+static unsigned create_namespace_syncs[2];
+static int fail_create_namespace, stale_create_namespace;
+static bool wrong_create_backend;
 static bool fail_create_source_sync, wrong_create_source_sync;
 static unsigned source_sync_mask, required_source_sync_mask;
 static uint16 source_sync_fault_thread;
@@ -420,6 +424,29 @@ int
 cluster_smgr_which_for(RelFileLocator r, BackendId b)
 {
 	return 1;
+}
+
+const ClusterSharedFsOps *
+cluster_shared_fs_get_active_ops(void)
+{
+	static const ClusterSharedFsOps ops = { .id = CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS };
+	return wrong_create_backend ? NULL : &ops;
+}
+
+bool
+cluster_shared_fs_sharedfs_sync_create_result(RelFileLocator locator, ForkNumber fork)
+{
+	int index = fork == MAIN_FORKNUM ? 0 : 1;
+	UT_ASSERT(RelFileLocatorEquals(locator, key.locator));
+	UT_ASSERT(cold_protected() && CurrentResourceOwner == child_owner);
+	UT_ASSERT(fork == MAIN_FORKNUM || fork == SPACE_FORKNUM);
+	UT_ASSERT(main_exists && main_syncs != 0);
+	if (index == 1)
+		UT_ASSERT(exists && syncs != 0);
+	create_namespace_syncs[index]++;
+	if (stale_create_namespace == index)
+		stale = true;
+	return fail_create_namespace != index;
 }
 SMgrRelation
 smgropen(RelFileLocator r, BackendId b)
@@ -878,6 +905,9 @@ reset(void)
 	creating = false;
 	main_exists = true;
 	main_creates = main_syncs = create_source_syncs = 0;
+	memset(create_namespace_syncs, 0, sizeof(create_namespace_syncs));
+	fail_create_namespace = stale_create_namespace = -1;
+	wrong_create_backend = false;
 	source_sync_mask = required_source_sync_mask = 0;
 	source_sync_fault_thread = 0;
 	source_sync_fault = 0;
@@ -1812,6 +1842,53 @@ UT_TEST(test_cold_native_create_refuses_lost_data_and_wrong_execution_owner)
 		UT_ASSERT_EQ(writes + main_creates + main_syncs, 0);
 		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
 	}
+}
+
+UT_TEST(test_cold_native_create_namespace_sync_is_required_and_retryable)
+{
+	for (int variant = 0; variant < 6; variant++) {
+		ClusterSpaceRecoveryBatchV1 *batch = NULL;
+		RfSideOnlineOperationV1 op;
+
+		create_input(0);
+		main_exists = variant == 5;
+		UT_ASSERT(native_create_plan(0));
+		UT_ASSERT(create_preflight(true, &batch));
+		UT_ASSERT_EQ(create_namespace_syncs[0] + create_namespace_syncs[1], 0);
+		if (batch == NULL)
+			continue;
+		UT_ASSERT(rf_side_online_plan_operation_v1(side, 0, &op));
+		if (variant < 2)
+			fail_create_namespace = variant;
+		else if (variant < 4)
+			stale_create_namespace = variant - 2;
+		if (variant < 4) {
+			UT_ASSERT(!cluster_space_recovery_apply_v1(batch));
+			UT_ASSERT(!cluster_space_recovery_applied_operation_v1(batch, &op));
+			if (variant == 0 || variant == 2)
+				UT_ASSERT_EQ(writes + creates + extensions, 0);
+			UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+			stale = false;
+			fail_create_namespace = stale_create_namespace = -1;
+		}
+		UT_ASSERT(cluster_space_recovery_apply_v1(batch));
+		UT_ASSERT(create_namespace_syncs[0] != 0 && create_namespace_syncs[1] != 0);
+		UT_ASSERT(cluster_space_recovery_applied_operation_v1(batch, &op));
+		cluster_space_recovery_destroy_v1(&batch);
+	}
+}
+
+UT_TEST(test_cold_native_create_unknown_storage_backend_refuses_before_io)
+{
+	ClusterSpaceRecoveryBatchV1 *batch = NULL;
+
+	create_input(0);
+	main_exists = false;
+	UT_ASSERT(native_create_plan(0));
+	wrong_create_backend = true;
+	UT_ASSERT(!create_preflight(true, &batch));
+	UT_ASSERT_NULL(batch);
+	UT_ASSERT_EQ(main_creates + main_syncs + writes + creates + extensions, 0);
 }
 
 UT_TEST(test_cold_native_create_failed_sync_or_expiry_keeps_responsibility)
@@ -2866,7 +2943,9 @@ UT_TEST(test_cold_drop_already_is_read_only_even_with_source_sync_fault)
 int
 main(void)
 {
-	UT_PLAN(58);
+	UT_PLAN(60);
+	UT_RUN(test_cold_native_create_namespace_sync_is_required_and_retryable);
+	UT_RUN(test_cold_native_create_unknown_storage_backend_refuses_before_io);
 	UT_RUN(test_compact_cold_syncs_complete_chain_before_prefix_or_shrink);
 	UT_RUN(test_compact_cold_sync_refusal_leaves_space_and_data_untouched);
 	UT_RUN(test_compact_cold_sync_before_creating_missing_space);

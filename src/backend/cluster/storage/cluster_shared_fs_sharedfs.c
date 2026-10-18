@@ -719,6 +719,118 @@ done:
 	return synced;
 }
 
+typedef struct SharedFsCreateDirectory {
+	int fd;
+	char *name;
+	struct stat identity;
+} SharedFsCreateDirectory;
+
+static bool
+sharedfs_create_namespace_matches(const SharedFsCreateDirectory *dirs, unsigned count,
+								  const char *name, const struct stat *file)
+{
+	struct stat current;
+
+	for (unsigned i = 0; i < count; i++) {
+		int rc = i == 0 ? lstat(dirs[i].name, &current)
+						: fstatat(dirs[i - 1].fd, dirs[i].name, &current, AT_SYMLINK_NOFOLLOW);
+
+		if (rc != 0 || !S_ISDIR(current.st_mode)
+			|| !sharedfs_drop_same_file(&dirs[i].identity, &current))
+			return false;
+	}
+	return fstatat(dirs[count - 1].fd, name, &current, AT_SYMLINK_NOFOLLOW) == 0
+		   && S_ISREG(current.st_mode) && current.st_nlink == 1
+		   && sharedfs_drop_same_file(file, &current) && file->st_size == current.st_size;
+}
+
+/* mkdir-p can introduce ancestors as well as the final file. The original
+ * cold owner excludes writers; sync its existing result leaf-to-root without
+ * adopting a changed namespace. Allocate before opening any raw descriptors,
+ * then use non-throwing I/O and close every descriptor on every exit. The
+ * configured shared root is pre-existing deployment state; its parent is not
+ * a directory created by relation redo. No bytes or directory entries change. */
+bool
+cluster_shared_fs_sharedfs_sync_create_result(RelFileLocator locator, ForkNumber forknum)
+{
+	SharedFsCreateDirectory *dirs;
+	struct stat file_identity;
+	char *relative, *root, *name, *next;
+	unsigned count = 1, index = 1;
+	Size root_length;
+	int file = -1, saved_errno;
+	bool synced = false;
+
+	if (!enableFsync || !OidIsValid(locator.relNumber)
+		|| (forknum != MAIN_FORKNUM && forknum != SPACE_FORKNUM) || cluster_shared_data_dir == NULL
+		|| cluster_shared_data_dir[0] != '/') {
+		errno = EINVAL;
+		return false;
+	}
+	relative = relpathperm(locator, forknum);
+	root = pstrdup(cluster_shared_data_dir);
+	root_length = strlen(root);
+	while (root_length > 1 && root[root_length - 1] == '/')
+		root[--root_length] = '\0';
+	for (name = relative; *name != '\0'; name++)
+		if (*name == '/')
+			count++;
+	dirs = palloc0(sizeof(*dirs) * count);
+	for (unsigned i = 0; i < count; i++)
+		dirs[i].fd = -1;
+	dirs[0].name = root;
+	name = relative;
+	while ((next = strchr(name, '/')) != NULL) {
+		*next = '\0';
+		dirs[index++].name = name;
+		name = next + 1;
+	}
+	/* Native locator paths cannot climb out of, or alias, the shared root. */
+	for (unsigned i = 1; i < count; i++)
+		if (dirs[i].name[0] == '\0' || strcmp(dirs[i].name, ".") == 0
+			|| strcmp(dirs[i].name, "..") == 0)
+			goto done;
+	if (name[0] == '\0')
+		goto done;
+	for (unsigned i = 0; i < count; i++) {
+		dirs[i].fd = i == 0 ? open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | PG_BINARY)
+							: openat(dirs[i - 1].fd, dirs[i].name,
+									 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | PG_BINARY);
+		if (dirs[i].fd < 0 || fstat(dirs[i].fd, &dirs[i].identity) != 0
+			|| !S_ISDIR(dirs[i].identity.st_mode))
+			goto done;
+	}
+	file = openat(dirs[count - 1].fd, name, O_RDWR | O_NOFOLLOW | O_NONBLOCK | PG_BINARY);
+	if (file < 0 || fstat(file, &file_identity) != 0 || !S_ISREG(file_identity.st_mode)
+		|| file_identity.st_nlink != 1
+		|| !sharedfs_create_namespace_matches(dirs, count, name, &file_identity)
+		|| pg_fsync(file) != 0
+		|| !sharedfs_create_namespace_matches(dirs, count, name, &file_identity))
+		goto done;
+	for (unsigned i = count; i > 0; i--)
+		if (pg_fsync(dirs[i - 1].fd) != 0
+			|| !sharedfs_create_namespace_matches(dirs, count, name, &file_identity))
+			goto done;
+	synced = true;
+
+done:
+	saved_errno = errno != 0 ? errno : EIO;
+	if (file >= 0 && close(file) != 0) {
+		synced = false;
+		saved_errno = errno;
+	}
+	for (unsigned i = count; i > 0; i--)
+		if (dirs[i - 1].fd >= 0 && close(dirs[i - 1].fd) != 0) {
+			synced = false;
+			saved_errno = errno;
+		}
+	pfree(dirs);
+	pfree(relative);
+	pfree(root);
+	errno = synced ? 0 : saved_errno;
+	return synced;
+}
+
 /* Original checkpointer work owns these raw descriptors across ERROR cleanup.
  * No pointer into a transaction/checkpointer scratch context is retained. */
 typedef struct SharedFsDropWorkFork {
