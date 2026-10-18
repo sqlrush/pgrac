@@ -2442,7 +2442,7 @@ test_cluster_space_recovery: test_cluster_space_recovery.c unit_test.h test_clus
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_recovery_product.o test_cluster_space_storage_product.o $(CLUSTER_HW_O) \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
-		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
+		$(CLUSTER_REMOTE_XACT_IDENTITY_O) $(CLUSTER_WAL_CLAIM_O) \
 		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
@@ -2979,7 +2979,7 @@ test_cluster_page_data test_cluster_sync_error: $(CLUSTER_THREAD_RECOVERY_FABRIC
 		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O)
 test_cluster_space_recovery: $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_XACT_O) \
-		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
+		$(CLUSTER_REMOTE_XACT_IDENTITY_O) $(CLUSTER_WAL_CLAIM_O) \
 		$(SIDE_XACT_XACTDESC_O) $(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O)
 SIDE_OWNER_TEST_CPPFLAGS = -DRF_SIDE_OWNER_TESTING \

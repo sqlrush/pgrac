@@ -143,6 +143,11 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
  * immutable dependency lookup, never an execution or file-existence proof. */
 extern bool rf_side_online_plan_native_creation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 												   ClusterSpaceStructureChange *change);
+/* Original native ABORT pending-delete ordinal -> exact preceding typed
+ * CREATE operation. Reuses the complete sealed same-source/xid proof;
+ * duplicates may select the same CREATE. Not permission to delete files. */
+extern bool rf_side_online_plan_abort_creation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+												  uint32 relation, uint32 *creation_index);
 /* Check retained native creation boundaries against an exact PAGE graph.
  * This is a read-only dependency check, never replay eligibility. */
 extern bool rf_side_online_plan_page_lifecycle_v1(const RfSideOnlinePlanV1 *plan,

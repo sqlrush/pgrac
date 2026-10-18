@@ -74,7 +74,7 @@ struct ClusterSpaceRecoveryBatchV1 {
 	ResourceOwner source_owner;
 	ResourceOwner io_owner;
 	ResourceOwner previous_owner;
-	bool cold_drop_already;
+	bool cold_result_already;
 	bool preflight_complete;
 	bool installed;
 };
@@ -108,8 +108,10 @@ space_sources_fresh_current_owner(const ClusterSpaceRecoveryBatchV1 *batch)
 		ClusterWalRetentionPin *pin = NULL;
 		uint16 count = 0;
 
-		if (!space_cold_phase() || batch->fabric != NULL || batch->side != NULL
-			|| batch->cold_fence != NULL || batch->cold_origins == NULL
+		if (!space_cold_phase() || batch->fabric != NULL || batch->cold_fence != NULL
+			|| batch->cold_origins == NULL
+			|| (batch->side != NULL
+				&& batch->source_count != rf_side_online_plan_participant_count_v1(batch->side))
 			|| cluster_wal_retention_pin_borrow_cold_v1(&pin, guards, lengthof(guards), &count)
 				   != CLUSTER_WAL_PIN_OK
 			|| count != batch->source_count || pin != batch->sources[0].retention_pin)
@@ -147,10 +149,10 @@ space_sources_fresh_current_owner(const ClusterSpaceRecoveryBatchV1 *batch)
 				.scan_begin_inclusive = a->root_snapshot->checkpoint_lower_lsn,
 				.scan_end_exclusive = a->root_snapshot->validated_tail_lsn_exclusive
 			};
-			if (batch->cold_inputs == NULL
-				&& (!rf_side_online_plan_source_matches_v1(batch->side, a->duty->system_identifier,
-														   a->duty->storage_uuid, &cut)
-					|| !rf_side_online_plan_source_matches_v1(
+			if (batch->side != NULL
+				&& (!rf_side_online_plan_recovery_source_matches_v1(
+						batch->side, a->duty->system_identifier, a->duty->storage_uuid, &cut)
+					|| !rf_side_online_plan_recovery_source_matches_v1(
 						batch->side, a->root_snapshot->identity.system_identifier,
 						a->root_snapshot->identity.storage_uuid, &cut)))
 				return false;
@@ -469,12 +471,13 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, u
 		 * it with the previously prepared lower HWM. Rollback uses this
 		 * apply's own original bytes, not the earlier preflight snapshot. */
 		target->final = prepared;
-		if (batch->cold_drop_already) {
-			/* COMMIT may delete only its exact installed result, never a
-			 * LIVE predecessor or a reused locator. This is a read-only
-			 * proof: a cached result cannot be made durable on this path. */
+		if (batch->cold_result_already) {
+			/* COMMIT needs its exact tombstone; native ABORT needs its
+			 * exact CREATE/ADVANCE result. Neither may borrow a predecessor
+			 * or successor, or make cached-only bytes durable here. */
 			if (apply || prepared.apply_mask != 0 || prepared.covered_by_successor_mask != 0
-				|| prepared.source_index[0] != 0 || prepared.source_index[1] != 0)
+				|| prepared.source_index[0] >= batch->operation_count
+				|| prepared.source_index[1] >= batch->operation_count)
 				goto done;
 			for (int i = 0; i < 2; i++)
 				if (memcmp(target->before[i].data, prepared.pages[i].data, BLCKSZ) != 0
@@ -556,7 +559,7 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, u
 	done:;
 		/* File sync alone does not persist a newly created directory entry.
 		 * This also applies when native redo adopted an existing/open file. */
-		if (ok && apply && target->native_create && !batch->cold_drop_already)
+		if (ok && apply && target->native_create && !batch->cold_result_already)
 			ok = space_sources_fresh(batch)
 				 && cluster_shared_fs_sharedfs_sync_create_result(target->key.locator,
 																  SPACE_FORKNUM)
@@ -806,7 +809,8 @@ space_cold_relation_sync(ClusterSpaceRecoveryBatchV1 *batch)
 static bool
 space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRecoveryInput *inputs,
 						const ClusterSpaceColdSourceV1 *origins, uint32 count, uint32 through,
-						uint8 shrink_forks, bool drop_already)
+						uint8 shrink_forks, bool drop_already, const RfSideOnlinePlanV1 *abort_side,
+						const ClusterSpaceColdSourceV1 *abort_source, Size budget)
 {
 	ClusterRecoverySerialGuard *guards[CLUSTER_WAL_RETENTION_MAX_THREADS];
 	ClusterWalRetentionPin *pin = NULL;
@@ -816,6 +820,26 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 	uint16 source_count = 0;
 	Size bytes, scratch;
 	bool ok = false;
+	bool abort_already = abort_side != NULL;
+
+	if (budget > MaxAllocSize || (abort_side == NULL) != (abort_source == NULL))
+		return false;
+	if (abort_already) {
+		ClusterSpaceStructureChange create;
+
+		if (inputs == NULL || count == 0 || through != count - 1 || drop_already
+			|| shrink_forks != 0
+			|| !cluster_space_structure_wal_decode(inputs[0].data, inputs[0].length, &create)
+			|| create.identity.action != CLUSTER_SPACE_WAL_CREATE)
+			return false;
+		for (uint32 i = 1; i < count; i++) {
+			ClusterSpaceReservationChange advance;
+
+			if (!cluster_space_reservation_wal_decode(inputs[i].data, inputs[i].length, &advance)
+				|| advance.action != CLUSTER_SPACE_RESERVATION_ADVANCE)
+				return false;
+		}
+	}
 
 	if (shrink_forks != 0) {
 		ClusterSpaceStructureChange change;
@@ -843,8 +867,8 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 		return false;
 	bytes = sizeof(*batch) + sizeof(SpaceRecoveryTarget)
 			+ (Size)source_count * (sizeof(*authorities) + sizeof(*owners));
-	if (scratch > MaxAllocSize - bytes - 4 * BLCKSZ
-		|| count > (MaxAllocSize - bytes - scratch - 4 * BLCKSZ) / sizeof(uint32))
+	if (bytes > budget || 4 * BLCKSZ > budget - bytes || scratch > budget - bytes - 4 * BLCKSZ
+		|| count > (budget - bytes - scratch - 4 * BLCKSZ) / sizeof(uint32))
 		return false;
 	bytes += (Size)count * sizeof(uint32);
 	batch = space_alloc(bytes);
@@ -856,7 +880,8 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 	batch->order = (uint32 *)(batch->targets + 1);
 	batch->sources = authorities;
 	batch->cold_inputs = inputs;
-	batch->cold_drop_already = drop_already;
+	batch->side = abort_side;
+	batch->cold_result_already = drop_already || abort_already;
 	batch->cold_shrink_step = through;
 	batch->cold_shrink_forks = shrink_forks;
 	batch->cold_origins = origins;
@@ -890,7 +915,13 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 				|| memcmp(source.claim.identity.storage_uuid, key->storage_uuid, 16) != 0
 				|| source.claim.database_incarnation != key->database_incarnation
 				|| owners[i].native_redo < owners[i].root.checkpoint_lower_lsn
-				|| owners[i].native_redo > owners[i].root.validated_tail_lsn_exclusive)
+				|| owners[i].native_redo > owners[i].root.validated_tail_lsn_exclusive
+				|| (abort_already
+					&& (!rf_side_online_plan_recovery_claim_matches_v1(abort_side, &source)
+						|| !rf_side_online_plan_replay_start_matches_v1(
+							abort_side, guard->duty.origin_thread_id,
+							guard->duty.origin_owner_incarnation, key->database_incarnation,
+							owners[i].native_redo))))
 				goto done;
 			authorities[i]
 				= (ClusterThreadRecoveryAuthorityV1){ .duty = &guard->duty,
@@ -906,10 +937,24 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 		if (!space_sources_fresh(batch)
 			|| !cluster_space_recovery_order(inputs, count, key, batch->order))
 			goto done;
+		if (abort_already) {
+			uint16 source;
+
+			for (source = 0; source < source_count; source++)
+				if (abort_source->origin_thread == authorities[source].duty->origin_thread_id)
+					break;
+			if (source == source_count || abort_source->end_rec_ptr <= owners[source].native_redo
+				|| abort_source->end_rec_ptr > owners[source].root.validated_tail_lsn_exclusive)
+				goto done;
+		}
 		for (uint32 i = 0; i < count; i++) {
 			uint16 source;
 
 			if (batch->order[i] != i)
+				goto done;
+			if (abort_already
+				&& (origins[i].origin_thread != abort_source->origin_thread
+					|| origins[i].end_rec_ptr >= abort_source->end_rec_ptr))
 				goto done;
 			for (source = 0; source < source_count; source++)
 				if (origins[i].origin_thread == authorities[source].duty->origin_thread_id)
@@ -930,7 +975,7 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 		}
 		if (!space_target_run(batch, 0, false, UINT32_MAX) || !space_sources_fresh(batch))
 			goto done;
-		if (drop_already) {
+		if (batch->cold_result_already) {
 			ok = true;
 			goto done;
 		}
@@ -964,7 +1009,8 @@ cluster_space_recovery_cold_relation_install_v1(const ClusterSpaceIdentityKey *k
 												const ClusterSpaceColdSourceV1 *origins,
 												uint32 count, uint32 through, uint8 shrink_forks)
 {
-	return space_cold_relation_run(key, inputs, origins, count, through, shrink_forks, false);
+	return space_cold_relation_run(key, inputs, origins, count, through, shrink_forks, false, NULL,
+								   NULL, MaxAllocSize);
 }
 
 bool
@@ -972,7 +1018,81 @@ cluster_space_recovery_cold_drop_already_v1(const ClusterSpaceIdentityKey *key,
 											const ClusterSpaceRecoveryInput *input,
 											const ClusterSpaceColdSourceV1 *source)
 {
-	return space_cold_relation_run(key, input, source, 1, 0, 0, true);
+	return space_cold_relation_run(key, input, source, 1, 0, 0, true, NULL, NULL, MaxAllocSize);
+}
+
+bool
+cluster_space_recovery_cold_abort_preflight_v1(const RfSideOnlinePlanV1 *side, uint32 index,
+											   uint32 relation)
+{
+	RfSideOnlineOperationV1 abort, create;
+	ClusterSpaceRecoveryInput *inputs;
+	ClusterSpaceColdSourceV1 *origins;
+	ClusterSpaceColdSourceV1 terminal;
+	uint32 creation, count = 0;
+	Size bytes, budget = rf_side_online_plan_scratch_available_v1(side);
+	bool ok = false;
+
+	if (!space_cold_phase()
+		|| !rf_side_online_plan_abort_creation_v1(side, index, relation, &creation)
+		|| !rf_side_online_plan_operation_v1(side, index, &abort)
+		|| !rf_side_online_plan_operation_v1(side, creation, &create))
+		return false;
+	/* Count and then borrow every immutable SPACE edge for this locator.
+	 * Do not omit an intervening transition or merge another source/key. */
+	for (uint32 i = creation; i < index; i++) {
+		RfSideOnlineOperationV1 op;
+
+		if (!rf_side_online_plan_operation_v1(side, i, &op))
+			return false;
+		if (op.kind != RF_SIDE_ONLINE_OPERATION_SPACE
+			|| !RelFileLocatorEquals(op.space_key.locator, create.space_key.locator))
+			continue;
+		if (op.identity.participant_index != abort.identity.participant_index
+			|| op.space_key.system_identifier != create.space_key.system_identifier
+			|| op.space_key.database_incarnation != create.space_key.database_incarnation
+			|| memcmp(op.space_key.storage_uuid, create.space_key.storage_uuid, 16) != 0
+			|| op.identity.record.end_rec_ptr > abort.identity.record.read_rec_ptr)
+			return false;
+		count++;
+	}
+	if (count == 0 || count > budget / (sizeof(*inputs) + sizeof(*origins)))
+		return false;
+	bytes = (Size)count * (sizeof(*inputs) + sizeof(*origins));
+	inputs = space_alloc(bytes);
+	if (inputs == NULL)
+		return false;
+	origins = (ClusterSpaceColdSourceV1 *)(inputs + count);
+	terminal = (ClusterSpaceColdSourceV1){ abort.identity.record.origin_thread,
+										   abort.identity.record.end_rec_ptr };
+	PG_TRY();
+	{
+		uint32 n = 0;
+
+		for (uint32 i = creation; i < index; i++) {
+			RfSideOnlineOperationV1 op;
+
+			if (!rf_side_online_plan_operation_v1(side, i, &op))
+				goto done;
+			if (op.kind != RF_SIDE_ONLINE_OPERATION_SPACE
+				|| !RelFileLocatorEquals(op.space_key.locator, create.space_key.locator))
+				continue;
+			inputs[n] = (ClusterSpaceRecoveryInput){ op.owned_payload, op.owned_payload_length };
+			origins[n++] = (ClusterSpaceColdSourceV1){ op.identity.record.origin_thread,
+													   op.identity.record.end_rec_ptr };
+		}
+		if (n != count)
+			goto done;
+		ok = space_cold_relation_run(&create.space_key, inputs, origins, count, count - 1, 0, false,
+									 side, &terminal, budget - bytes);
+	done:;
+	}
+	PG_FINALLY();
+	{
+		space_free(inputs);
+	}
+	PG_END_TRY();
+	return ok;
 }
 
 bool

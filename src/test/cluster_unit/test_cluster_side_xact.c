@@ -4846,6 +4846,24 @@ UT_TEST(test_cold_abort_delete_plan_binds_every_locator_and_owns_original_bytes)
 		UT_ASSERT_EQ(operation.xact.relation_count, shape + 1);
 		UT_ASSERT_EQ(operation.owned_payload_length, length);
 		UT_ASSERT(memcmp(operation.owned_payload, original, length) == 0);
+		for (uint32 r = 0; r <= (uint32)shape; r++) {
+			uint32 creation = UINT32_MAX;
+			RfSideOnlineOperationV1 bound;
+			UT_ASSERT(rf_side_online_plan_abort_creation_v1(plan, pairs * 2, r, &creation));
+			UT_ASSERT_EQ(creation, r == 2 ? 3 : 1);
+			UT_ASSERT(rf_side_online_plan_operation_v1(plan, creation, &bound));
+			UT_ASSERT(RelFileLocatorEquals(bound.space_key.locator, locators[r]));
+		}
+		{
+			uint32 creation = 0;
+			UT_ASSERT(
+				!rf_side_online_plan_abort_creation_v1(plan, pairs * 2, shape + 1, &creation));
+			UT_ASSERT_EQ(creation, UINT32_MAX);
+			creation = 0;
+			UT_ASSERT(!rf_side_online_plan_abort_creation_v1(plan, 0, 0, &creation));
+			UT_ASSERT_EQ(creation, UINT32_MAX);
+			UT_ASSERT(!rf_side_online_plan_abort_creation_v1(plan, pairs * 2, 0, NULL));
+		}
 		UT_ASSERT(rf_side_online_plan_contribution_owners_v1(plan, pairs * 2, &owners));
 		UT_ASSERT((owners.owners & RF_SIDE_CONTRIBUTION_NATIVE_STRUCTURE) != 0);
 		UT_ASSERT((owners.owners & RF_SIDE_CONTRIBUTION_COMPLETION) != 0);

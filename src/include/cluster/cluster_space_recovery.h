@@ -39,6 +39,14 @@ extern bool cluster_space_recovery_cold_drop_already_v1(const ClusterSpaceIdenti
 														const ClusterSpaceRecoveryInput *input,
 														const ClusterSpaceColdSourceV1 *source);
 
+/* Physical preflight of one original native ABORT pending-delete item.
+ * The sealed source supplies its CREATE incarnation and complete preceding
+ * CREATE/ADVANCE chain. Both exact SPACE pages must already be durable;
+ * borrow the original whole cold owner set and retained ABORT endpoint.
+ * Never installs bytes, deletes storage, changes TT/CLOG or seals recovery. */
+extern bool cluster_space_recovery_cold_abort_preflight_v1(const RfSideOnlinePlanV1 *side,
+														   uint32 index, uint32 relation);
+
 extern bool cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *plan,
 												const ClusterThreadRecoveryAuthorityV1 *sources,
 												uint32 count, ClusterSpaceRecoveryBatchV1 **out);

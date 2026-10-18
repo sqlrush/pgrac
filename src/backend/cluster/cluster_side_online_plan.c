@@ -2241,6 +2241,49 @@ rf_side_online_plan_native_creation_v1(const RfSideOnlinePlanV1 *plan, uint32 in
  * tied to a unique earlier CREATE pair in this original source and xid.
  * This proves the input binding, not permission to delete any storage. */
 static bool
+side_native_abort_creation(const RfSideOnlinePlanV1 *plan, uint32 index, RelFileLocator locator,
+						   uint32 *typed_index)
+{
+	const RfSideOnlineOperationV1 *op = &plan->operations[index];
+	bool found = false;
+	uint32 matched = UINT32_MAX;
+
+	for (uint32 j = 0; j < plan->operation_count; j++) {
+		const RfSideOnlineOperationV1 *create = &plan->operations[j];
+		ClusterSpaceStructureChange change;
+		xl_smgr_create native;
+		uint32 typed;
+
+		if (create->kind != RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE)
+			continue;
+		memcpy(&native, plan->owned_payload + create->owned_payload_offset, sizeof(native));
+		if (!RelFileLocatorEquals(native.rlocator, locator))
+			continue;
+		if (found || j >= index || create->source_xid != op->source_xid
+			|| create->identity.participant_index != op->identity.participant_index
+			|| create->identity.record.end_rec_ptr > op->identity.record.read_rec_ptr
+			|| !side_native_creation(plan, j, &change, &typed) || typed >= index
+			|| plan->operations[typed].identity.record.end_rec_ptr
+				   > op->identity.record.read_rec_ptr)
+			return false;
+		/* A completed raw xid cannot lend its CREATE to a later reuse. */
+		for (uint32 k = j + 1; k < index; k++) {
+			const RfSideOnlineOperationV1 *between = &plan->operations[k];
+
+			if (between->identity.participant_index == op->identity.participant_index
+				&& between->kind == RF_SIDE_ONLINE_OPERATION_XACT
+				&& between->xact.xid == op->xact.xid)
+				return false;
+		}
+		matched = typed;
+		found = true;
+	}
+	if (found)
+		*typed_index = matched;
+	return found;
+}
+
+static bool
 side_native_abort_deletes_covered(const RfSideOnlinePlanV1 *plan, uint32 index)
 {
 	const RfSideOnlineOperationV1 *op = &plan->operations[index];
@@ -2262,45 +2305,50 @@ side_native_abort_deletes_covered(const RfSideOnlinePlanV1 *plan, uint32 index)
 	memcpy(copy, plan->owned_payload + op->owned_payload_offset, op->owned_payload_length);
 	ParseAbortRecord(XLOG_XACT_ABORT | XLOG_XACT_HAS_INFO, (xl_xact_abort *)copy, &parsed);
 	for (int r = 0; r < parsed.nrels; r++) {
-		bool found = false;
+		uint32 typed;
 
-		for (uint32 j = 0; j < plan->operation_count; j++) {
-			const RfSideOnlineOperationV1 *create = &plan->operations[j];
-			ClusterSpaceStructureChange change;
-			xl_smgr_create native;
-			uint32 typed;
-
-			if (create->kind != RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE)
-				continue;
-			memcpy(&native, plan->owned_payload + create->owned_payload_offset, sizeof(native));
-			if (!RelFileLocatorEquals(native.rlocator, parsed.xlocators[r]))
-				continue;
-			if (found || j >= index || create->source_xid != op->source_xid
-				|| create->identity.participant_index != op->identity.participant_index
-				|| create->identity.record.end_rec_ptr > op->identity.record.read_rec_ptr
-				|| !side_native_creation(plan, j, &change, &typed) || typed >= index
-				|| plan->operations[typed].identity.record.end_rec_ptr
-					   > op->identity.record.read_rec_ptr)
-				goto done;
-			/* A completed raw xid cannot lend its CREATE to a later reuse. */
-			for (uint32 k = j + 1; k < index; k++) {
-				const RfSideOnlineOperationV1 *between = &plan->operations[k];
-
-				if (between->identity.participant_index == op->identity.participant_index
-					&& between->kind == RF_SIDE_ONLINE_OPERATION_XACT
-					&& between->xact.xid == op->xact.xid)
-					goto done;
-			}
-			found = true;
-		}
 		/* Native pending-delete duplicates may share this same exact pair. */
-		if (!found)
+		if (!side_native_abort_creation(plan, index, parsed.xlocators[r], &typed))
 			goto done;
 	}
 	result = true;
 done:
 	side_free(copy);
 	return result;
+}
+
+bool
+rf_side_online_plan_abort_creation_v1(const RfSideOnlinePlanV1 *plan, uint32 index, uint32 relation,
+									  uint32 *creation_index)
+{
+	const RfSideOnlineOperationV1 *op;
+	xl_xact_parsed_abort parsed;
+	uint8 *copy;
+	bool ok;
+
+	if (creation_index != NULL)
+		*creation_index = UINT32_MAX;
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || plan->failed
+		|| plan->purpose != RF_SIDE_PLAN_RECOVERY || creation_index == NULL
+		|| index >= plan->operation_count)
+		return false;
+	op = &plan->operations[index];
+	if (op->kind != RF_SIDE_ONLINE_OPERATION_XACT || op->xact.kind != RF_SIDE_XACT_ABORT
+		|| relation >= op->xact.relation_count || !op->xact.cold_completion_effects
+		|| op->source_xid != op->xact.xid || op->owned_payload_offset > plan->owned_payload_bytes
+		|| op->owned_payload_length > plan->owned_payload_bytes - op->owned_payload_offset
+		|| !rf_side_xact_cold_completion_payload_v1(
+			&op->xact, plan->owned_payload + op->owned_payload_offset, op->owned_payload_length))
+		return false;
+	copy = side_alloc0(op->owned_payload_length);
+	if (copy == NULL)
+		return false;
+	memcpy(copy, plan->owned_payload + op->owned_payload_offset, op->owned_payload_length);
+	ParseAbortRecord(XLOG_XACT_ABORT | XLOG_XACT_HAS_INFO, (xl_xact_abort *)copy, &parsed);
+	ok = relation < parsed.nrels
+		 && side_native_abort_creation(plan, index, parsed.xlocators[relation], creation_index);
+	side_free(copy);
+	return ok;
 }
 
 static bool
