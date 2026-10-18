@@ -3734,9 +3734,9 @@ static bool
 cluster_typed_replay_durable_endpoints(ClusterColdTypedReplay *rep,
 									   const ClusterColdReplayResultV1 *result)
 {
-	cluster_cold_durable_barrier_v1(&rep->touched);
-	return cluster_cold_typed_xid_endpoints_v1(rep->typed, *rep->fence_plan, result,
-											   rep->xid_progress);
+	return cluster_cold_durable_barrier_v1(&rep->touched)
+		   && cluster_cold_typed_xid_endpoints_v1(rep->typed, *rep->fence_plan, result,
+												  rep->xid_progress);
 }
 
 /*
@@ -3758,8 +3758,9 @@ cluster_typed_replay_publish(ClusterColdTypedReplay *rep, const ClusterColdRepla
 		cluster_typed_replay_unpublished(thread, "Replay did not end at its sealed tail",
 										 (int) result->detail);
 	if (!cluster_typed_replay_durable_endpoints(rep, result))
-		cluster_typed_replay_unpublished(thread, "Original-source counter endpoints are incomplete",
-										 (int)rep->typed->refusal);
+		cluster_typed_replay_unpublished(
+			thread, "Native durability or source counter endpoints are incomplete",
+			(int)rep->typed->refusal);
 	switch (cluster_recovery_merge_fence_plan_complete_v1(plan, &thread, &detail))
 	{
 		case CLUSTER_RECOVERY_FENCE_COMPLETE_OK:

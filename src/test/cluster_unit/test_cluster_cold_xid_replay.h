@@ -17,13 +17,14 @@ static bool replay_decode_foreign;
 static unsigned replay_drain_calls;
 static uint8 replay_fence;
 static unsigned replay_barrier_calls, replay_endpoint_calls;
-static bool replay_endpoint_ok;
+static bool replay_endpoint_ok, replay_barrier_ok;
 
-void
+bool
 cluster_cold_durable_barrier_v1(const ClusterColdTouchedV1 *touched)
 {
 	UT_ASSERT(touched != NULL);
 	replay_barrier_calls++;
+	return replay_barrier_ok;
 }
 
 bool
@@ -271,13 +272,16 @@ UT_TEST(test_replay_xid_bad_checkpoint_or_source)
 
 UT_TEST(test_replay_endpoints_follow_durability_and_propagate_refusal)
 {
-	for (int ok = 0; ok <= 1; ok++) {
-		ClusterColdReplayResultV1 result = { 0 };
-		replay_xid_reset(1);
-		replay_barrier_calls = replay_endpoint_calls = 0;
-		replay_endpoint_ok = ok;
-		UT_ASSERT_EQ(cluster_typed_replay_durable_endpoints(&replay_adapter, &result), ok);
-		UT_ASSERT_EQ(replay_barrier_calls, 1);
-		UT_ASSERT_EQ(replay_endpoint_calls, 1);
-	}
+	for (int barrier_ok = 0; barrier_ok <= 1; barrier_ok++)
+		for (int endpoint_ok = 0; endpoint_ok <= 1; endpoint_ok++) {
+			ClusterColdReplayResultV1 result = { 0 };
+			replay_xid_reset(1);
+			replay_barrier_calls = replay_endpoint_calls = 0;
+			replay_barrier_ok = barrier_ok;
+			replay_endpoint_ok = endpoint_ok;
+			UT_ASSERT_EQ(cluster_typed_replay_durable_endpoints(&replay_adapter, &result),
+						 barrier_ok && endpoint_ok);
+			UT_ASSERT_EQ(replay_barrier_calls, 1);
+			UT_ASSERT_EQ(replay_endpoint_calls, barrier_ok);
+		}
 }

@@ -1918,7 +1918,8 @@ cluster_cold_typed_ready_v1(const ClusterColdTypedV1 *typed,
 	if (!handshake->side_owners)
 		cold_reason_append(reason, reason_size,
 						   "no typed side owners or XID/OID/MX/SCN bound merge (R-A5)");
-	for (i = 0; i < typed->replay_count; i++) {
+	/* Required retained history must also have complete capture before replay. */
+	for (i = 0; i < typed->participant_count; i++) {
 		if (typed->side_capture_detail[i] != 0 || typed->side_plans[i] == NULL) {
 			char text[128];
 			(void)snprintf(text, sizeof(text),

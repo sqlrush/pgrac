@@ -9089,8 +9089,10 @@ test_cluster_cold_dependency.inc: $(top_srcdir)/src/backend/access/transam/xlogr
 
 # The effect matrix runs the real route/preflight and complete native parsers.
 test_cluster_cold_recovery_effects: test_cluster_cold_recovery_effects.c unit_test.h test_cluster_cold_dependency.inc \
+		test_cluster_cold_abort_replay.inc \
 		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
-		test_cluster_cold_recovery_replay_core.o \
+		test_cluster_cold_recovery_replay_core.o test_cluster_cold_recovery_replay_plan_core.o \
+		$(CLUSTER_COLD_PLAN_SPLIT_O) \
 		$(CLUSTER_COLD_DECODE_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) \
 		$(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
@@ -9098,7 +9100,8 @@ test_cluster_cold_recovery_effects: test_cluster_cold_recovery_effects.c unit_te
 		$(SIDE_XACT_TT_2PC_RECORD_O) \
 		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_DECODE_O) \
-		test_cluster_cold_recovery_replay_core.o \
+		test_cluster_cold_recovery_replay_core.o test_cluster_cold_recovery_replay_plan_core.o \
+		$(CLUSTER_COLD_PLAN_SPLIT_O) \
 		$(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) $(CLUSTER_SIDE_XACT_O) \
 		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O) \

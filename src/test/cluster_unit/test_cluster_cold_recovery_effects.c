@@ -16,6 +16,7 @@
 #include "access/commit_ts.h"
 #include "access/clog.h"
 #include "access/multixact.h"
+#include "access/twophase.h"
 #include "access/xact.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
@@ -25,6 +26,9 @@
 #include "cluster/cluster_block_apply.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_page_detached.h"
+#include "cluster/cluster_side_online_plan.h"
+#include "cluster/cluster_tt_durable.h"
+#include "cluster/cluster_xid_stripe.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_recovery_tt_record.h"
@@ -2840,10 +2844,15 @@ UT_TEST(test_foreign_terminals_refuse_unconsumed_frame_before_dispatch)
 			}
 }
 
+#include "test_cluster_cold_abort_replay.inc"
+
 int
 main(void)
 {
-	UT_PLAN(75);
+	UT_PLAN(78);
+	UT_RUN(test_relation_abort_capture_replays_and_drains_complete_cut);
+	UT_RUN(test_relation_abort_capture_refuses_missing_creation);
+	UT_RUN(test_relation_abort_replay_failure_keeps_final_drain_closed);
 	UT_RUN(test_foreign_terminals_refuse_unconsumed_frame_before_dispatch);
 	UT_RUN(test_smgr_native_carriers_keep_existing_effect_owners);
 	UT_RUN(test_smgr_create_rejects_incomplete_or_nonproducer_carriers);

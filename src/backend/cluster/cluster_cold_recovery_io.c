@@ -43,6 +43,10 @@
 
 #include <unistd.h>
 
+#include "access/clog.h"
+#include "access/commit_ts.h"
+#include "access/multixact.h"
+#include "access/subtrans.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
@@ -56,7 +60,9 @@
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_wal_restart_read.h"
 #include "cluster/cluster_wal_tail.h"
+#include "cluster/storage/cluster_undo_buf.h"
 #include "pgstat.h"
+#include "postmaster/bgwriter.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/smgr.h"
@@ -781,28 +787,40 @@ cluster_cold_touched_add_record_v1(ClusterColdTouchedV1 *touched, XLogReaderStat
 	}
 }
 
-/* Write every dirty buffer of the touched relations in one pass, then fsync
- * each touched fork that exists (smgrDoPendingSyncs' pattern). */
-void
+/* Keep relation write/fsync order, then the native checkpoint write/sync
+ * order for the founder's redo caches. Foreign SIDE consumers retain their
+ * own origin-scoped durable readback. This publishes no checkpoint or ROOT. */
+bool
 cluster_cold_durable_barrier_v1(const ClusterColdTouchedV1 *touched)
 {
 	SMgrRelation *smgrs;
 	uint32 i;
 
-	if (touched == NULL || touched->count == 0)
-		return;
-	smgrs = palloc(sizeof(SMgrRelation) * touched->count);
-	for (i = 0; i < touched->count; i++)
-		smgrs[i] = smgropen(touched->rels[i].locator, InvalidBackendId);
-	FlushRelationsAllBuffers(smgrs, (int)touched->count);
-	for (i = 0; i < touched->count; i++) {
-		ForkNumber fork;
+	if (touched != NULL && touched->count != 0) {
+		smgrs = palloc(sizeof(SMgrRelation) * touched->count);
+		for (i = 0; i < touched->count; i++)
+			smgrs[i] = smgropen(touched->rels[i].locator, InvalidBackendId);
+		FlushRelationsAllBuffers(smgrs, (int)touched->count);
+		for (i = 0; i < touched->count; i++) {
+			ForkNumber fork;
 
-		for (fork = 0; fork <= MAX_FORKNUM; fork++)
-			if ((touched->rels[i].forks & (UINT32_C(1) << fork)) != 0 && smgrexists(smgrs[i], fork))
-				smgrimmedsync(smgrs[i], fork);
+			for (fork = 0; fork <= MAX_FORKNUM; fork++)
+				if ((touched->rels[i].forks & (UINT32_C(1) << fork)) != 0
+					&& smgrexists(smgrs[i], fork))
+					smgrimmedsync(smgrs[i], fork);
+		}
+		pfree(smgrs);
 	}
-	pfree(smgrs);
+	/* A transaction-only source can leave dirty native caches with no
+	 * touched relation at all. Writes can enqueue fsync requests, so none
+	 * of these calls alone proves durability. Use the existing startup
+	 * handshake after all writes; an unconfirmed sync is not completion. */
+	CheckPointCLOG();
+	CheckPointCommitTs();
+	CheckPointSUBTRANS();
+	CheckPointMultiXact();
+	cluster_undo_buf_flush_all(true);
+	return RequestStartupSync();
 }
 
 #endif /* USE_PGRAC_CLUSTER */
