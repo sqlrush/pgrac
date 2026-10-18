@@ -1336,6 +1336,50 @@ rf_side_online_plan_recovery_source_matches_v1(const RfSideOnlinePlanV1 *plan,
 		   && plan->purpose == RF_SIDE_PLAN_RECOVERY;
 }
 
+bool
+rf_side_online_plan_recovery_claim_matches_v1(const RfSideOnlinePlanV1 *plan,
+											  const ClusterWalSourceRef *source)
+{
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || plan->failed
+		|| plan->purpose != RF_SIDE_PLAN_RECOVERY || plan->sources == NULL || source == NULL
+		|| !cluster_wal_claim_v2_ref_valid(&source->claim) || source->timeline == 0
+		|| plan->database_incarnation != source->claim.database_incarnation)
+		return false;
+	for (uint32 i = 0; i < plan->participant_count; i++) {
+		const RfContributorStreamCutV1 *cut = &plan->physical_cuts[i];
+		const ClusterWalSourceRef *bound;
+		const ClusterControlRootIdentity *left, *right;
+		uint32 index;
+
+		if (cut->failed_thread != source->claim.identity.origin_thread_id
+			|| cut->origin_owner_incarnation != source->claim.identity.origin_owner_incarnation
+			|| cut->timeline_id != source->timeline)
+			continue;
+		index = side_cut_source(cut, plan->sources, plan->source_count);
+		if (index == UINT32_MAX)
+			return false;
+		bound = &plan->sources[index];
+		left = &bound->claim.identity;
+		right = &source->claim.identity;
+		/* Compare logical fields, never native-struct padding. Both reserved
+		 * fields were checked by bind_sources and ref_valid respectively. */
+		return left->system_identifier == right->system_identifier
+			   && memcmp(left->storage_uuid, right->storage_uuid, 16) == 0
+			   && memcmp(left->authority_uuid, right->authority_uuid, 16) == 0
+			   && left->origin_thread_id == right->origin_thread_id
+			   && left->origin_node_id == right->origin_node_id
+			   && left->thread_claim_created_at == right->thread_claim_created_at
+			   && left->thread_claim_crc32c == right->thread_claim_crc32c
+			   && left->origin_owner_incarnation == right->origin_owner_incarnation
+			   && left->root_lineage_seq == right->root_lineage_seq
+			   && bound->claim.database_incarnation == source->claim.database_incarnation
+			   && bound->claim.max_config_generation == source->claim.max_config_generation
+			   && memcmp(bound->claim.claim_sha256, source->claim.claim_sha256, 32) == 0
+			   && bound->timeline == source->timeline;
+	}
+	return false;
+}
+
 static RfPageProofDetailV1
 side_plan_prepare_space(const RfSideOnlinePlanV1 *plan, const ClusterSpaceIdentityKey *expected,
 						const void *identity_page, const void *reservation_page, uint32 *order,

@@ -50,6 +50,7 @@ cold_tt_redo_source(const ClusterColdTypedV1 *typed, uint32 participant, uint8 o
 		  | (source->physical_lower == source->tail_end ? RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY : 0);
 	if (!rf_side_online_plan_recovery_source_matches_v1(plan, typed->system_identifier,
 														typed->observer.storage_uuid, &cut)
+		|| !rf_side_online_plan_recovery_claim_matches_v1(plan, &typed->sources[participant])
 		|| !rf_side_online_plan_replay_start_matches_v1(
 			plan, source->thread_id, source->owner_incarnation,
 			typed->observer.database_incarnation, source->native_redo))

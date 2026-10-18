@@ -164,6 +164,11 @@ extern bool rf_side_online_plan_recovery_source_matches_v1(const RfSideOnlinePla
 														   uint64 system_identifier,
 														   const uint8 storage_uuid[16],
 														   const RfContributorStreamCutV1 *cut);
+/* Match the original bound ROOT/claim of a physical recovery participant.
+ * Retained-only inputs cannot match. Cut, redo coverage, checkpoint/base and
+ * final source revalidation remain separate owner obligations. */
+extern bool rf_side_online_plan_recovery_claim_matches_v1(const RfSideOnlinePlanV1 *plan,
+														  const ClusterWalSourceRef *source);
 /* UINT32_MAX for an invalid or unsealed plan. */
 extern uint32 rf_side_online_plan_participant_count_v1(const RfSideOnlinePlanV1 *plan);
 /* The physical lower alone must not authorize replay of retained history. */

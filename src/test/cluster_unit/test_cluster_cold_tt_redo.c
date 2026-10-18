@@ -307,6 +307,123 @@ UT_TEST(tt_redo_rejects_each_source_and_checkpoint_identity_drift)
 	tt_redo_destroy(&f);
 }
 
+UT_TEST(tt_redo_rejects_exact_root_claim_drift_with_unchanged_cut)
+{
+	TtRedoFixture f;
+	ClusterWalSourceRef saved;
+
+	tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+	tt_redo_seal(&f);
+	saved = f.typed.sources[0];
+	for (int fault = 0; fault < 15; fault++) {
+		ClusterWalThreadClaimRefV2 *ref = &f.typed.sources[0].claim;
+
+		f.typed.sources[0] = saved;
+		if (fault == 0)
+			ref->identity.system_identifier++;
+		if (fault == 1)
+			ref->identity.storage_uuid[0]++;
+		if (fault == 2)
+			ref->identity.authority_uuid[0]++;
+		if (fault == 3)
+			ref->identity.origin_thread_id = 2;
+		if (fault == 4)
+			ref->identity.reserved42 = 1;
+		if (fault == 5)
+			ref->identity.origin_node_id++;
+		if (fault == 6)
+			ref->identity.thread_claim_created_at++;
+		if (fault == 7)
+			ref->identity.thread_claim_crc32c++;
+		if (fault == 8)
+			ref->identity.reserved60 = 1;
+		if (fault == 9)
+			ref->identity.origin_owner_incarnation++;
+		if (fault == 10)
+			ref->identity.root_lineage_seq++;
+		if (fault == 11)
+			ref->database_incarnation++;
+		if (fault == 12)
+			ref->max_config_generation++;
+		if (fault == 13)
+			ref->claim_sha256[0]++;
+		if (fault == 14)
+			f.typed.sources[0].timeline++;
+		tt_redo_refuses(&f, 0, 0);
+	}
+	f.typed.sources[0] = saved;
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_redo_claim_matches_bound_copy_in_any_order_not_history)
+{
+	TtRedoFixture f;
+	RfSideOnlinePlanRequestV1 request = { 0 };
+	RfSideOnlinePlanV1 *plan = NULL;
+	ClusterWalSourceRef bound[2];
+	RfSideUndoHeaderImageV1 out;
+
+	tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+	bound[0] = f.typed.sources[1];
+	bound[1] = f.typed.sources[0];
+	request.system_identifier = f.typed.system_identifier;
+	memcpy(request.storage_uuid, f.typed.observer.storage_uuid, 16);
+	request.physical_cuts = &f.cut;
+	request.participant_count = 1;
+	request.purpose = RF_SIDE_PLAN_RECOVERY;
+	request.redo_starts = &f.typed.participants[0].native_redo;
+	UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_side_online_plan_bind_sources_v1(plan, bound, 2));
+	UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+	UT_ASSERT(!rf_side_online_plan_recovery_claim_matches_v1(plan, &f.typed.sources[0]));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	bound[1].claim.claim_sha256[0]++; /* The plan must own its original copy. */
+	UT_ASSERT(rf_side_online_plan_recovery_claim_matches_v1(plan, &f.typed.sources[0]));
+	UT_ASSERT(!rf_side_online_plan_recovery_claim_matches_v1(plan, &bound[1]));
+	UT_ASSERT(!rf_side_online_plan_recovery_claim_matches_v1(plan, &f.typed.sources[1]));
+	rf_side_online_plan_destroy_v1(&f.typed.side_plans[0]);
+	f.typed.side_plans[0] = plan;
+	UT_ASSERT(cluster_cold_typed_tt_redo_header_v1(&f.typed, 0, 0, &out));
+	UT_ASSERT(memcmp(out.page.data, f.base.data, BLCKSZ) == 0);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_redo_claim_match_refuses_unbound_pi_and_bad_arguments)
+{
+	for (int scenario = 0; scenario < 2; scenario++) {
+		TtRedoFixture f;
+		RfSideOnlinePlanRequestV1 request = { 0 };
+		RfSideOnlinePlanV1 *plan = NULL;
+
+		tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+		request.system_identifier = f.typed.system_identifier;
+		memcpy(request.storage_uuid, f.typed.observer.storage_uuid, 16);
+		request.physical_cuts = &f.cut;
+		request.participant_count = 1;
+		request.purpose = scenario == 0 ? RF_SIDE_PLAN_RECOVERY : RF_SIDE_PLAN_PI_CONTRIBUTIONS;
+		request.redo_starts = scenario == 0 ? &f.typed.participants[0].native_redo : NULL;
+		UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
+		if (scenario == 1)
+			UT_ASSERT(rf_side_online_plan_bind_sources_v1(plan, f.typed.sources, 2));
+		UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+		UT_ASSERT(!rf_side_online_plan_recovery_claim_matches_v1(plan, &f.typed.sources[0]));
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(!rf_side_online_plan_recovery_claim_matches_v1(plan, &f.typed.sources[0]));
+		UT_ASSERT(!rf_side_online_plan_recovery_claim_matches_v1(NULL, &f.typed.sources[0]));
+		UT_ASSERT(!rf_side_online_plan_recovery_claim_matches_v1(plan, NULL));
+		if (scenario == 0) {
+			/* An unchanged, complete cut and redo cannot replace the claim. */
+			UT_ASSERT(rf_side_online_plan_recovery_source_matches_v1(
+				plan, f.typed.system_identifier, f.typed.observer.storage_uuid, &f.cut));
+			UT_ASSERT(rf_side_online_plan_replay_start_matches_v1(plan, 3, 33, 42, 100));
+		}
+		rf_side_online_plan_destroy_v1(&f.typed.side_plans[0]);
+		f.typed.side_plans[0] = plan;
+		tt_redo_refuses(&f, 0, 0);
+		tt_redo_destroy(&f);
+	}
+}
+
 UT_TEST(tt_redo_rejects_incomplete_capture_plan_and_invalid_bounds)
 {
 	TtRedoFixture f;
@@ -2208,6 +2325,40 @@ UT_TEST(tt_redo_base_graph_verification_detects_full_block_drift_and_stays_faile
 	tt_redo_destroy(&f);
 }
 
+UT_TEST(tt_redo_base_graph_rejects_claim_drift_during_verification)
+{
+	TtRedoFixture f;
+	PGAlignedBlock page;
+	ClusterWalSourceRef saved;
+	ClusterColdTtBaseRedoGraphInputV1 input = { &f.typed, 0 };
+	ClusterRecoveryReferenceGraph *graph = NULL;
+	ClusterRecoveryGraphRecord out;
+	ClusterRecoveryGraphResult result = CLUSTER_RECOVERY_GRAPH_MORE;
+	unsigned records = 0;
+
+	tt_redo_base_graph_fixture(&f, 100, &page);
+	tt_redo_seal(&f);
+	saved = f.typed.sources[0];
+	UT_ASSERT_EQ(cluster_cold_typed_tt_base_redo_graph_begin_v1(&input, 1024 * 1024, &graph),
+				 CLUSTER_RECOVERY_GRAPH_MORE);
+	for (unsigned i = 0; i < 32; i++) {
+		result = cluster_recovery_reference_graph_step(graph, &out);
+		if (result == CLUSTER_RECOVERY_GRAPH_RECORD) {
+			records++;
+			f.typed.sources[0].claim.claim_sha256[0]++;
+		} else if (result != CLUSTER_RECOVERY_GRAPH_MORE)
+			break;
+	}
+	UT_ASSERT_EQ(records, 1);
+	UT_ASSERT_EQ(result, CLUSTER_RECOVERY_GRAPH_IDENTITY);
+	UT_ASSERT_NULL(out.record);
+	UT_ASSERT(!cluster_recovery_reference_graph_observed(graph));
+	f.typed.sources[0] = saved;
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_step(graph, &out), result);
+	cluster_recovery_reference_graph_destroy(graph);
+	tt_redo_destroy(&f);
+}
+
 UT_TEST(tt_redo_base_graph_never_treats_refused_record_as_empty_chain)
 {
 	for (int fault = 0; fault < 5; fault++) {
@@ -2287,11 +2438,12 @@ UT_TEST(tt_redo_base_graph_factory_clears_failures_and_requires_source_with_empt
 int
 main(void)
 {
-	UT_PLAN(51);
+	UT_PLAN(55);
 	UT_RUN(tt_redo_base_graph_walks_original_chain_across_physical_generations);
 	UT_RUN(tt_redo_base_graph_seeds_all_segments_slot_edges_and_terminal_heads_after_redo);
 	UT_RUN(tt_redo_base_graph_rejects_exact_key_source_and_bad_arguments);
 	UT_RUN(tt_redo_base_graph_verification_detects_full_block_drift_and_stays_failed);
+	UT_RUN(tt_redo_base_graph_rejects_claim_drift_during_verification);
 	UT_RUN(tt_redo_base_graph_never_treats_refused_record_as_empty_chain);
 	UT_RUN(tt_redo_base_graph_factory_clears_failures_and_requires_source_with_empty_inventory);
 	UT_RUN(tt_redo_base_only_retains_precheckpoint_records_and_owned_bytes);
@@ -2307,6 +2459,9 @@ main(void)
 	UT_RUN(tt_redo_empty_cut_preserves_input_and_requires_canonical_flags);
 	UT_RUN(tt_redo_exact_abort_uses_original_active_slot_without_bind);
 	UT_RUN(tt_redo_rejects_each_source_and_checkpoint_identity_drift);
+	UT_RUN(tt_redo_rejects_exact_root_claim_drift_with_unchanged_cut);
+	UT_RUN(tt_redo_claim_matches_bound_copy_in_any_order_not_history);
+	UT_RUN(tt_redo_claim_match_refuses_unbound_pi_and_bad_arguments);
 	UT_RUN(tt_redo_rejects_incomplete_capture_plan_and_invalid_bounds);
 	UT_RUN(tt_redo_refuses_native_commit_identity_mismatch_without_output);
 	UT_RUN(tt_redo_refuses_pi_purpose);
