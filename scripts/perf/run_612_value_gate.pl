@@ -120,12 +120,17 @@ my $VG_OUT = $ENV{VG_OUT}
 sub run_leg
 {
     my ($leg, $extra_guc) = @_;
+    # The product default for wave c is ON.  Keep the value-gate baseline a
+    # real OFF leg so its delta remains attributable to the memo switch.
+    my $leg_guc = $extra_guc;
+    $leg_guc = 'cluster.page_scn_shortcut = off'
+      if $leg eq 'off' && $wave eq 'c';
     my $tsv = File::Spec->catfile($outdir, "612-$wave-$leg-$stamp.tsv");
     my $md  = File::Spec->catfile($outdir, "612-$wave-$leg-$stamp.md");
 
     local $ENV{XP_TSV_OUT}   = $tsv;
     local $ENV{XP_OUT}       = $md;
-    local $ENV{XP_EXTRA_GUC} = $extra_guc;
+    local $ENV{XP_EXTRA_GUC} = $leg_guc;
     local $ENV{XP_SECS}      = $ENV{VG_SECS}   if defined $ENV{VG_SECS};
     local $ENV{XP_ROUNDS}    = $ENV{VG_ROUNDS} if defined $ENV{VG_ROUNDS};
     local $ENV{XP_SCALE}     = $ENV{VG_SCALE}  if defined $ENV{VG_SCALE};
@@ -135,7 +140,7 @@ sub run_leg
     my %wave_env = ($leg eq 'on' && $WAVE_ENV{$wave}) ? %{ $WAVE_ENV{$wave} } : ();
     local @ENV{keys %wave_env} = values %wave_env if %wave_env;
 
-    print "== value-gate $wave: running $leg leg (extra_guc='$extra_guc')\n";
+    print "== value-gate $wave: running $leg leg (extra_guc='$leg_guc')\n";
     system($^X, $RUNNER) == 0
       or die "value-gate: $leg leg runner failed ($?)\n";
     die "value-gate: $leg leg produced no TSV ($tsv)\n" unless -s $tsv;

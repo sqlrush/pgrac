@@ -185,7 +185,7 @@ extern int cluster_adg_lease_takeover_grace_ms;
 extern int cluster_adg_barrier_interval_ms;
 extern int cluster_wal_sender_timeout_sec;
 extern int cluster_wal_receiver_timeout_sec;
-/* spec-6.12c: resolver terminal memo switch (default off). */
+/* spec-6.12c: resolver terminal memo switch (default on; off for compatibility or diagnostics). */
 extern bool cluster_page_scn_shortcut;
 
 /* spec-6.12a: quiescent S-cache switch (default off). */
