@@ -357,8 +357,9 @@ extern RfPageProofDetailV1 rf_side_record_census_v1(const RfDetachedRecordPlanV1
 
 /* Validate one record-local CLOG/MultiXact/commit_ts projection with the same
  * decoder used by the retained plan. Shape only: no plan, authority, or
- * execution permission is created. */
-extern bool rf_side_online_projection_record_shape_v1(XLogReaderState *record);
+ * execution permission is created. bounded_members retains the SIDE consumer
+ * member-count profile; native redo does not have that profile limit. */
+extern bool rf_side_online_projection_record_shape_v1(XLogReaderState *record, bool bounded_members);
 
 /* Reuse the retained plan's complete native standby shape validation.
  * Shape only: grants no source, no-effect or execution authority. */

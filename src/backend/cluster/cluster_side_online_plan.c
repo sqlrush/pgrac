@@ -485,7 +485,7 @@ side_operation_space_input(const RfSideOnlinePlanV1 *plan, const RfSideOnlineOpe
 static bool
 side_projection_decode(const RfDetachedRecordPlanV1 *record_plan,
 					   RfSideOnlineOperationV1 *candidate, uint32 *payload_offset,
-					   uint32 *payload_length)
+					   uint32 *payload_length, bool bounded_members)
 {
 	const XLogReaderState *record = record_plan->source_record;
 	const char *data = XLogRecGetData(record);
@@ -555,18 +555,18 @@ side_projection_decode(const RfDetachedRecordPlanV1 *record_plan,
 		}
 		if (info == XLOG_MULTIXACT_CREATE_ID) {
 			xl_multixact_create header;
-			Size expected;
 			int i;
 
 			if (data_length < SizeOfMultiXactCreate)
 				return false;
 			memset(&header, 0, sizeof(header));
 			memcpy(&header, data, SizeOfMultiXactCreate);
-			if (header.nmembers <= 0 || header.nmembers > 256 || !MultiXactIdIsValid(header.mid)
-				|| header.moff == 0)
+			if (header.nmembers <= 0 || (bounded_members && header.nmembers > 256)
+				|| !MultiXactIdIsValid(header.mid) || header.moff == 0)
 				return false;
-			expected = SizeOfMultiXactCreate + (Size)header.nmembers * sizeof(MultiXactMember);
-			if (expected != data_length)
+			if ((data_length - SizeOfMultiXactCreate) % sizeof(MultiXactMember) != 0
+				|| (data_length - SizeOfMultiXactCreate) / sizeof(MultiXactMember)
+					   != (Size)header.nmembers)
 				return false;
 			for (i = 0; i < header.nmembers; i++) {
 				MultiXactMember member;
@@ -605,7 +605,7 @@ side_projection_decode(const RfDetachedRecordPlanV1 *record_plan,
 }
 
 bool
-rf_side_online_projection_record_shape_v1(XLogReaderState *record)
+rf_side_online_projection_record_shape_v1(XLogReaderState *record, bool bounded_members)
 {
 	RfDetachedRecordPlanV1 record_plan = { 0 };
 	RfSideOnlineOperationV1 candidate = { 0 };
@@ -614,7 +614,8 @@ rf_side_online_projection_record_shape_v1(XLogReaderState *record)
 	uint8 rmid;
 
 	if (record == NULL || record->record == NULL || XLogRecMaxBlockId(record) >= 0
-		|| (XLogRecGetInfo(record) & XLR_INFO_MASK) != 0)
+		|| XLogRecGetData(record) == NULL
+		|| (XLogRecGetInfo(record) & XLR_INFO_MASK & ~XLR_CHECK_CONSISTENCY) != 0)
 		return false;
 	rmid = XLogRecGetRmid(record);
 	if (rmid != RM_CLOG_ID && rmid != RM_MULTIXACT_ID && rmid != RM_COMMIT_TS_ID)
@@ -624,7 +625,8 @@ rf_side_online_projection_record_shape_v1(XLogReaderState *record)
 	record_plan.route.normalized_info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 	record_plan.route.record_owner = RF_ROUTE_OWNER_SIDE_TYPED;
 	record_plan.route.codec_id = RF_ROUTE_CODEC_SIDE_STANDARD;
-	return side_projection_decode(&record_plan, &candidate, &payload_offset, &payload_length);
+	return side_projection_decode(&record_plan, &candidate, &payload_offset, &payload_length,
+								  bounded_members);
 }
 
 static bool
@@ -1182,7 +1184,7 @@ side_decode_record(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *recor
 					|| record_plan->route.rmid == RM_COMMIT_TS_ID)
 				   && record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_STANDARD) {
 			uint32 offset, length;
-			if (!side_projection_decode(record_plan, candidate, &offset, &length))
+			if (!side_projection_decode(record_plan, candidate, &offset, &length, true))
 				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 			candidate->kind = RF_SIDE_ONLINE_OPERATION_PROJECTION;
 			candidate->owned_payload_length = length;

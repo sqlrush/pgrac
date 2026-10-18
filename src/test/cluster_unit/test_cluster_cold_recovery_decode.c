@@ -617,8 +617,11 @@ UT_TEST(test_foreign_projection_requires_complete_payload_shape)
 		preflight_plan.route.codec_id = RF_ROUTE_CODEC_SIDE_STANDARD;
 		record.storage.decoded.main_data_len = 0;
 		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
-					 CLUSTER_COLD_OK);
-		UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+					 CLUSTER_COLD_COMPONENT_INVALID);
+		UT_ASSERT_EQ(out.effects.required | out.effects.native_apply | out.effects.no_effect
+						 | out.effects.refused,
+					 0);
+		UT_ASSERT(!out.xid_input.complete);
 		memcpy(record.data, &page, sizeof(page));
 		record.storage.decoded.main_data_len = sizeof(page);
 		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),

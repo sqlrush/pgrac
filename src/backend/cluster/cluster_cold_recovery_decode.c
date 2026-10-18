@@ -467,6 +467,13 @@ cold_record_flags(XLogReaderState *reader, uint64 system_identifier, const uint8
 		return cold_xlog_control_shape(reader) ? CLUSTER_COLD_OK : CLUSTER_COLD_COMPONENT_INVALID;
 	case RM_XACT_ID:
 		return cold_xact_flags(reader, system_identifier, storage_uuid, out, flags, effects);
+	case RM_CLOG_ID:
+	case RM_MULTIXACT_ID:
+		/* Native completeness precedes ownership. The bounded foreign SIDE
+		 * consumer is selected separately; it cannot narrow native redo. */
+		return rf_side_online_projection_record_shape_v1(reader, false)
+				   ? CLUSTER_COLD_OK
+				   : CLUSTER_COLD_COMPONENT_INVALID;
 	case RM_CLUSTER_UNDO_ID:
 		if (info == XLOG_UNDO_TT_SLOT_COMMIT || info == XLOG_UNDO_TT_SLOT_SET_HEAD
 			|| info == XLOG_UNDO_TT_SLOT_ABORT) {
@@ -627,11 +634,11 @@ cold_foreign_side(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan,
 	switch (XLogRecGetRmid(reader)) {
 	case RM_CLOG_ID:
 		return (info == CLOG_ZEROPAGE || info == CLOG_TRUNCATE)
-			   && rf_side_online_projection_record_shape_v1(reader);
+			   && rf_side_online_projection_record_shape_v1(reader, true);
 	case RM_MULTIXACT_ID:
 		return (info == XLOG_MULTIXACT_ZERO_OFF_PAGE || info == XLOG_MULTIXACT_ZERO_MEM_PAGE
 				|| info == XLOG_MULTIXACT_CREATE_ID || info == XLOG_MULTIXACT_TRUNCATE_ID)
-			   && rf_side_online_projection_record_shape_v1(reader);
+			   && rf_side_online_projection_record_shape_v1(reader, true);
 	case RM_XACT_ID:
 		/* Ordinary COMMIT and ABORT are record-local native consumers only
 		 * after the recovery decoder has validated the complete payload. A

@@ -637,10 +637,13 @@ UT_TEST(test_records_cold_counter_incomplete_clears_inputs)
 			r->u.decoded.main_data_len--;
 		if (fault == 7)
 			record_append(r, &extra, sizeof(extra));
-		UT_ASSERT_EQ(rec_counter_decode(r, false, &decoded), CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(rec_counter_decode(r, false, &decoded), CLUSTER_COLD_COMPONENT_INVALID);
 		UT_ASSERT(!decoded.xid_input.complete);
 		UT_ASSERT_EQ(decoded.xid_input.record_xid, InvalidTransactionId);
 		UT_ASSERT_EQ(decoded.xid_input.payload_xid, InvalidTransactionId);
+		UT_ASSERT_EQ(decoded.effects.required | decoded.effects.native_apply | decoded.effects.no_effect
+						 | decoded.effects.refused,
+					 0);
 	}
 	r = record_new(self, RM_XACT_ID, XLOG_XACT_PREPARE, 800, 0x2400, 0x2500);
 	UT_ASSERT_EQ(rec_counter_decode(r, false, &decoded), CLUSTER_COLD_OK);

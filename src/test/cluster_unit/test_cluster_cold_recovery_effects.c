@@ -1138,7 +1138,8 @@ UT_TEST(test_dispatch_standalone_space_and_original_refusal_flags)
 }
 
 
-UT_TEST(test_foreign_clog_and_multixact_use_native_side_consumer)
+static void
+slru_record(EffectRecord *r, uint32 kind)
 {
 	const uint8 rmids[] = { RM_CLOG_ID,		 RM_CLOG_ID,	  RM_MULTIXACT_ID,
 							RM_MULTIXACT_ID, RM_MULTIXACT_ID, RM_MULTIXACT_ID };
@@ -1148,28 +1149,35 @@ UT_TEST(test_foreign_clog_and_multixact_use_native_side_consumer)
 							XLOG_MULTIXACT_ZERO_MEM_PAGE,
 							XLOG_MULTIXACT_CREATE_ID,
 							XLOG_MULTIXACT_TRUNCATE_ID };
-	for (uint32 i = 0; i < lengthof(rmids); i++) {
+	int page = 0;
+	xl_clog_truncate clog = { .pageno = 0, .oldestXact = 100, .oldestXactDb = 5 };
+	xl_multixact_create create = { .mid = 5, .moff = 20, .nmembers = 1 };
+	MultiXactMember member = { .xid = 100, .status = MultiXactStatusForUpdate };
+	xl_multixact_truncate truncate = { .oldestMultiDB = 5,
+									   .startTruncOff = 1,
+									   .endTruncOff = 5,
+									   .startTruncMemb = 1,
+									   .endTruncMemb = 20 };
+
+	record_init(r, rmids[kind], infos[kind]);
+	if (kind == 1)
+		append(r, &clog, sizeof(clog));
+	else if (kind == 4) {
+		append(r, &create, SizeOfMultiXactCreate);
+		append(r, &member, sizeof(member));
+	} else if (kind == 5)
+		append(r, &truncate, SizeOfMultiXactTruncate);
+	else
+		append(r, &page, sizeof(page));
+}
+
+UT_TEST(test_foreign_clog_and_multixact_use_native_side_consumer)
+{
+	for (uint32 i = 0; i < 6; i++) {
 		EffectRecord r;
 		ClusterColdDecodedV1 out = { 0 };
-		int page = 0;
-		xl_clog_truncate clog = { .pageno = 0, .oldestXact = 100, .oldestXactDb = 5 };
-		xl_multixact_create create = { .mid = 5, .moff = 20, .nmembers = 1 };
-		MultiXactMember member = { .xid = 100, .status = MultiXactStatusForUpdate };
-		xl_multixact_truncate truncate = { .oldestMultiDB = 5,
-										   .startTruncOff = 1,
-										   .endTruncOff = 5,
-										   .startTruncMemb = 1,
-										   .endTruncMemb = 20 };
-		record_init(&r, rmids[i], infos[i]);
-		if (i == 1)
-			append(&r, &clog, sizeof(clog));
-		else if (i == 4) {
-			append(&r, &create, SizeOfMultiXactCreate);
-			append(&r, &member, sizeof(member));
-		} else if (i == 5)
-			append(&r, &truncate, SizeOfMultiXactTruncate);
-		else
-			append(&r, &page, sizeof(page));
+
+		slru_record(&r, i);
 		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
 					 CLUSTER_COLD_OK);
 		UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
@@ -1185,20 +1193,188 @@ UT_TEST(test_foreign_clog_and_multixact_use_native_side_consumer)
 					 CLUSTER_COLD_OK);
 		UT_ASSERT_EQ(out.record.record_flags, 0);
 		UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, true));
+	}
+}
 
-		/* The same real decoder must refuse every missing suffix and trailing
-		 * byte; a known opcode alone is not a complete foreign effect. */
-		for (uint32 length = 0, complete_length = r.decoded.main_data_len;
-			 length <= complete_length; length++) {
-			r.decoded.main_data_len = length == complete_length ? length + 1 : length;
-			UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
-						 CLUSTER_COLD_OK);
-			UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
-			UT_ASSERT_EQ(out.effects.refused, out.effects.required);
-			UT_ASSERT_EQ(out.effects.native_apply | out.effects.no_effect, 0);
-			UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&out.record), CLUSTER_COLD_UNSCHEDULED_REFUSE);
-			UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
-			r.decoded.main_data_len = complete_length;
+UT_TEST(test_slru_native_carriers_preserve_consistency_and_member_range)
+{
+	for (uint32 kind = 0; kind < 6; kind++) {
+		EffectRecord r;
+		ClusterColdDecodedV1 out = { 0 };
+
+		slru_record(&r, kind);
+		r.decoded.header.xl_info |= XLR_CHECK_CONSISTENCY;
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+					 CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.record.record_flags, 0);
+		UT_ASSERT_EQ(out.effects.native_apply, CLUSTER_COLD_EFFECT_RECORD);
+		UT_ASSERT_EQ(out.effects.refused | out.effects.no_effect, 0);
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+					 CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+		UT_ASSERT_EQ(out.effects.refused, out.effects.required);
+	}
+	for (int count = 256; count <= 257; count++) {
+		EffectRecord r;
+		ClusterColdDecodedV1 out = { 0 };
+		xl_multixact_create create = { .mid = 5, .moff = 20, .nmembers = count };
+		MultiXactMember member = { .xid = 101, .status = MultiXactStatusForKeyShare };
+
+		record_init(&r, RM_MULTIXACT_ID, XLOG_MULTIXACT_CREATE_ID);
+		append(&r, &create, SizeOfMultiXactCreate);
+		for (int i = 0; i < count; i++)
+			append(&r, &member, sizeof(member));
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+					 CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.effects.native_apply, CLUSTER_COLD_EFFECT_RECORD);
+		UT_ASSERT_EQ(out.record.record_flags, 0);
+		UT_ASSERT(out.xid_input.complete);
+		UT_ASSERT_EQ(out.xid_input.payload_xid, 101);
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+					 CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.record.record_flags,
+					 count == 256 ? CLUSTER_COLD_RECORD_FOREIGN_SIDE
+								  : CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+	}
+}
+
+UT_TEST(test_slru_carriers_reject_incomplete_envelopes)
+{
+	for (int foreign = 0; foreign <= 1; foreign++) {
+		for (uint32 kind = 0; kind < 6; kind++) {
+			EffectRecord complete;
+
+			slru_record(&complete, kind);
+			/* Every missing suffix, a trailing byte, missing storage, and
+			 * nonproducer flags must fail before native effect ownership. */
+			for (uint32 fault = 0; fault <= complete.decoded.main_data_len + 4; fault++) {
+				EffectRecord r;
+				ClusterColdDecodedV1 out = { 0 };
+				ClusterColdDetailV1 detail;
+				uint32 length = complete.decoded.main_data_len;
+				union {
+					DecodedXLogRecord decoded;
+					char bytes[sizeof(DecodedXLogRecord) + sizeof(DecodedBkpBlock)];
+				} blocked = { 0 };
+
+				slru_record(&r, kind);
+				if (fault < length)
+					r.decoded.main_data_len = fault;
+				else if (fault == length)
+					r.decoded.main_data_len++;
+				else if (fault == length + 1)
+					r.decoded.main_data = NULL;
+				else if (fault == length + 2)
+					r.decoded.header.xl_info |= XLR_SPECIAL_REL_UPDATE;
+				else if (fault == length + 3)
+					r.decoded.header.xl_info |= 0x08;
+				else {
+					memcpy(&blocked.decoded, &r.decoded, sizeof(r.decoded));
+					blocked.decoded.max_block_id = 0;
+					blocked.decoded.blocks[0].in_use = true;
+					r.reader.record = &blocked.decoded;
+				}
+				detail = cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, foreign, &out);
+				UT_ASSERT(detail != CLUSTER_COLD_OK);
+				if (detail == CLUSTER_COLD_OK)
+					return;
+				UT_ASSERT_EQ(out.effects.required | out.effects.native_apply | out.effects.no_effect
+								 | out.effects.refused,
+							 0);
+				UT_ASSERT(!out.xid_input.complete);
+			}
+		}
+	}
+}
+
+UT_TEST(test_slru_carriers_reject_invalid_native_fields)
+{
+	for (int foreign = 0; foreign <= 1; foreign++) {
+		for (uint32 kind = 0; kind < 6; kind++) {
+			const int faults[] = { 1, 3, 1, 1, 10, 3 };
+
+			for (int fault = 0; fault < faults[kind]; fault++) {
+				EffectRecord r;
+				ClusterColdDecodedV1 out = { 0 };
+				ClusterColdDetailV1 detail;
+
+				slru_record(&r, kind);
+				if (kind == 1) {
+					xl_clog_truncate clog;
+
+					memcpy(&clog, r.data.bytes, sizeof(clog));
+					if (fault == 0)
+						clog.pageno = -1;
+					else if (fault == 1)
+						clog.oldestXact = FrozenTransactionId;
+					else
+						clog.oldestXactDb = InvalidOid;
+					memcpy(r.data.bytes, &clog, sizeof(clog));
+				} else if (kind == 4) {
+					xl_multixact_create create;
+					MultiXactMember member;
+
+					memcpy(&create, r.data.bytes, SizeOfMultiXactCreate);
+					memcpy(&member, r.data.bytes + SizeOfMultiXactCreate, sizeof(member));
+					switch (fault) {
+					case 0:
+						create.nmembers = 0;
+						break;
+					case 1:
+						create.nmembers = -1;
+						break;
+					case 2:
+						create.nmembers = INT_MAX;
+						break;
+					case 3:
+						create.mid = InvalidMultiXactId;
+						break;
+					case 4:
+						create.moff = 0;
+						break;
+					case 5:
+						member.xid = InvalidTransactionId;
+						break;
+					case 6:
+						member.xid = FrozenTransactionId;
+						break;
+					case 7:
+						member.status = -1;
+						break;
+					case 8:
+						member.status = MaxMultiXactStatus + 1;
+						break;
+					case 9:
+						create.nmembers = 2;
+						break;
+					}
+					memcpy(r.data.bytes, &create, SizeOfMultiXactCreate);
+					memcpy(r.data.bytes + SizeOfMultiXactCreate, &member, sizeof(member));
+				} else if (kind == 5) {
+					xl_multixact_truncate truncate;
+
+					memcpy(&truncate, r.data.bytes, SizeOfMultiXactTruncate);
+					if (fault == 0)
+						truncate.oldestMultiDB = InvalidOid;
+					else if (fault == 1)
+						truncate.startTruncOff = InvalidMultiXactId;
+					else
+						truncate.endTruncOff = InvalidMultiXactId;
+					memcpy(r.data.bytes, &truncate, SizeOfMultiXactTruncate);
+				} else {
+					int page = -1;
+
+					memcpy(r.data.bytes, &page, sizeof(page));
+				}
+				detail = cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, foreign, &out);
+				UT_ASSERT_EQ(detail, CLUSTER_COLD_COMPONENT_INVALID);
+				if (detail != CLUSTER_COLD_COMPONENT_INVALID)
+					return;
+				UT_ASSERT_EQ(out.effects.required | out.effects.native_apply | out.effects.no_effect
+								 | out.effects.refused,
+							 0);
+				UT_ASSERT(!out.xid_input.complete);
+			}
 		}
 	}
 }
@@ -2170,7 +2346,7 @@ UT_TEST(test_original_startup_dependency_leaves_non_c0_with_existing_dispatch)
 int
 main(void)
 {
-	UT_PLAN(56);
+	UT_PLAN(59);
 	UT_RUN(test_smgr_native_carriers_keep_existing_effect_owners);
 	UT_RUN(test_smgr_create_rejects_incomplete_or_nonproducer_carriers);
 	UT_RUN(test_smgr_truncate_rejects_incomplete_or_nonproducer_carriers);
@@ -2197,6 +2373,9 @@ main(void)
 	UT_RUN(test_logical_xact_invalidations_keep_physical_no_effect);
 	UT_RUN(test_logical_xact_invalidations_do_not_hide_bad_shape);
 	UT_RUN(test_foreign_clog_and_multixact_use_native_side_consumer);
+	UT_RUN(test_slru_native_carriers_preserve_consistency_and_member_range);
+	UT_RUN(test_slru_carriers_reject_incomplete_envelopes);
+	UT_RUN(test_slru_carriers_reject_invalid_native_fields);
 	UT_RUN(test_foreign_assignment_keeps_native_parent_effect);
 	UT_RUN(test_foreign_side_dispatch_rejects_mixed_flags_and_unowned_xact);
 	UT_RUN(test_whole_commit_effects_keep_native_owner);
