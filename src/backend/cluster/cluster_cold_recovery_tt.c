@@ -434,6 +434,26 @@ cluster_cold_tt_after_redo_count_v1(const ClusterColdTypedV1 *typed)
 	return typed->tt_after_redo->count;
 }
 
+const UndoSegmentHeaderData *
+cluster_cold_tt_after_redo_header_v1(const ClusterColdTypedV1 *typed, uint32 index, uint8 *owner,
+									 uint32 *segment)
+{
+	const ColdTtInputV1 *input;
+
+	if (owner != NULL)
+		*owner = 0;
+	if (segment != NULL)
+		*segment = 0;
+	if (owner == NULL || segment == NULL || index >= cluster_cold_tt_after_redo_count_v1(typed))
+		return NULL;
+	input = typed->tt_after_redo->first;
+	while (index-- > 0)
+		input = input->next;
+	*owner = input->owner;
+	*segment = input->segment;
+	return (const UndoSegmentHeaderData *)input->block.data;
+}
+
 static void
 cold_tt_slot_copy(const ColdTtInputV1 *input, uint32 slot_offset, ClusterColdTtSlotInputV1 *out)
 {

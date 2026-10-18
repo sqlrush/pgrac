@@ -869,6 +869,11 @@ extern ClusterColdDetailV1 cluster_cold_tt_after_redo_capture_v1(ClusterColdType
 extern ClusterColdDetailV1 cluster_cold_tt_after_redo_recheck_v1(ClusterColdTypedV1 *typed);
 extern void cluster_cold_tt_after_redo_reset_v1(ClusterColdTypedV1 *typed);
 extern uint32 cluster_cold_tt_after_redo_count_v1(const ClusterColdTypedV1 *typed);
+/* Complete retained post-redo header input, indexed in its own inventory.
+ * Failure clears available identity outputs. No original-base coverage. */
+extern const struct UndoSegmentHeaderData *
+cluster_cold_tt_after_redo_header_v1(const ClusterColdTypedV1 *typed, uint32 index, uint8 *owner,
+									 uint32 *segment);
 extern bool cluster_cold_tt_after_redo_slot_v1(const ClusterColdTypedV1 *typed,
 											   uint32 segment_index, uint32 slot_offset,
 											   ClusterColdTtSlotInputV1 *out);
@@ -920,6 +925,16 @@ struct RfSideUndoHeaderImageV1;
 extern bool cluster_cold_typed_tt_redo_header_v1(const ClusterColdTypedV1 *typed,
 												 uint32 participant, uint32 segment_index,
 												 struct RfSideUndoHeaderImageV1 *out);
+
+/* Match this original header's complete sealed ordinary fold against the
+ * separately captured physical post-redo header, by owner/segment rather
+ * than inventory index. Copies the folded image only on exact equality;
+ * failure clears out. This is selected-header readback input, not global
+ * inventory, checkpoint/base qualification, top, loser or C0 authority.
+ * Original source isolation and final freshness/readback owners still apply. */
+extern bool cluster_cold_typed_tt_redo_readback_v1(const ClusterColdTypedV1 *typed,
+												   uint32 participant, uint32 segment_index,
+												   struct RfSideUndoHeaderImageV1 *out);
 
 /* Copy any physical slot after the same selected source's sealed ordinary
  * redo, or match its resulting physical key. No status is filtered during

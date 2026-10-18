@@ -126,6 +126,48 @@ cluster_cold_typed_tt_redo_header_v1(const ClusterColdTypedV1 *typed, uint32 par
 }
 
 bool
+cluster_cold_typed_tt_redo_readback_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+									   uint32 segment_index, RfSideUndoHeaderImageV1 *out)
+{
+	RfSideUndoHeaderImageV1 folded;
+	uint8 owner;
+	uint32 segment, count;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (typed == NULL
+		|| !cluster_cold_tt_base_namespace_matches_v1(typed, typed->system_identifier,
+													  typed->observer.database_incarnation)
+		|| cluster_cold_tt_base_header_v1(typed, segment_index, &owner, &segment) == NULL
+		|| !cluster_cold_typed_tt_redo_header_v1(typed, participant, segment_index, &folded))
+		return false;
+	/* Redo may add/remove files, so the independently captured inventories
+	 * need not share indices. This comparison covers only this original
+	 * physical header; it does not certify the remaining inventory. */
+	count = cluster_cold_tt_after_redo_count_v1(typed);
+	for (uint32 i = 0; i < count; i++) {
+		const UndoSegmentHeaderData *observed;
+		uint8 observed_owner;
+		uint32 observed_segment;
+
+		observed
+			= cluster_cold_tt_after_redo_header_v1(typed, i, &observed_owner, &observed_segment);
+		if (observed == NULL)
+			return false;
+		if (observed_owner != owner || observed_segment != segment)
+			continue;
+		/* Include all slots, generation, header metadata and untouched bytes.
+		 * Matching one ACTIVE key or terminal status is insufficient. */
+		if (memcmp(observed, folded.page.data, BLCKSZ) != 0)
+			return false;
+		*out = folded;
+		return true;
+	}
+	return false;
+}
+
+bool
 cluster_cold_typed_tt_redo_slot_v1(const ClusterColdTypedV1 *typed, uint32 participant,
 								   uint32 segment_index, uint32 slot_offset,
 								   ClusterColdTtSlotInputV1 *out)
