@@ -527,6 +527,8 @@ SIMPLE_TESTS := $(filter-out test_cluster_service_observe,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_catalog_manifest test_cluster_catalog_init test_cluster_catalog_startup,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_init,$(SIMPLE_TESTS))
+TESTS += test_cluster_relmap_xid_order
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_xid_order,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_v2
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_v2_storage
@@ -535,6 +537,11 @@ TESTS += test_cluster_relmap_retention
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_retention,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_retention_census
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_retention_census,$(SIMPLE_TESTS))
+
+test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
+		$(top_srcdir)/src/backend/utils/cache/relmapper.c $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
 		test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c \

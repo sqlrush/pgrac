@@ -1313,6 +1313,7 @@ cluster_perform_relmap_update(bool shared, const RelMapFile *updates)
 	ClusterRelmapAuthorityHeader hdr;
 	ClusterRelmapOwner owner;
 	ClusterRelmapPublishArm *arm = &cluster_relmap_publish_arms[shared ? 0 : 1];
+	FullTransactionId top_full_xid;
 	uint64		newgen;
 	XLogRecPtr	lsn;
 	xl_relmap_update xlrec;
@@ -1353,6 +1354,9 @@ cluster_perform_relmap_update(bool shared, const RelMapFile *updates)
 						(int) hdr.owner_node, hdr.owner_xid),
 				 errhint("A relation-map writer died before publishing; recovery "
 						 "arbitration resolves the pending image.")));
+
+	/* Assign the WAL owner before taking the local lock or writing any WAL. */
+	top_full_xid = GetTopFullTransactionId();
 
 	LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
 
@@ -1398,7 +1402,7 @@ cluster_perform_relmap_update(bool shared, const RelMapFile *updates)
 	 * which arbitration discards.
 	 */
 	owner.owner_node = (int16) cluster_node_id;
-	owner.owner_xid = GetTopTransactionId();
+	owner.owner_xid = XidFromFullTransactionId(top_full_xid);
 	owner.owner_epoch = cluster_reconfig_get_observed_epoch(cluster_node_id);
 	owner.relmap_lsn = (uint64) lsn;
 	cluster_relmap_authority_write_pending(shared, dbid, (const char *) &newmap,
