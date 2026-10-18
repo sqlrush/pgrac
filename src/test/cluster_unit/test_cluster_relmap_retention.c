@@ -439,13 +439,12 @@ UT_TEST(test_invalid_build_identity_key_and_cut_cannot_grant_permission)
 													   BASE + 1000), OK);
 	UT_ASSERT_NE(cluster_relmap_retention_build_finish(&d), OK);
 	ready(&d);
-	for (int field = 0; field < 4; field++) {
+	for (int field = 0; field < 3; field++) {
 		wrong = key;
 		switch (field) {
-		case 0: wrong.membership_epoch = 0; break;
-		case 1: wrong.admitted_incarnation = 0; break;
-		case 2: wrong.boot_incarnation = 0; break;
-		case 3: wrong.generation = 1; break;
+		case 0: wrong.admitted_incarnation = 0; break;
+		case 1: wrong.boot_incarnation = 0; break;
+		case 2: wrong.generation = 1; break;
 		}
 		UT_ASSERT_NE(cluster_relmap_retention_begin(&d, &wrong), OK);
 	}
@@ -459,10 +458,25 @@ UT_TEST(test_invalid_build_identity_key_and_cut_cannot_grant_permission)
 	UT_ASSERT_EQ(cluster_relmap_retention_begin(&d, &key), OK);
 }
 
+UT_TEST(test_epoch_zero_is_exact_identity_not_missing_admission)
+{
+	ClusterRelmapRetentionDirectory d;
+	ClusterRelmapRetentionKey key = key_for(42, BASE + 100), different;
+
+	ready(&d);
+	key.membership_epoch = 0;
+	UT_ASSERT_EQ(cluster_relmap_retention_begin(&d, &key), OK);
+	different = key;
+	different.membership_epoch = 1;
+	UT_ASSERT_NE(cluster_relmap_retention_stage_start(&d, &different, 900), OK);
+	UT_ASSERT_EQ(cluster_relmap_retention_stage_start(&d, &key, 900), OK);
+	UT_ASSERT_EQ(cluster_relmap_retention_cancel_prepare(&d, &key), CLUSTER_RELMAP_RETENTION_RETAINED);
+}
+
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(25);
 	UT_RUN(test_unknown_and_building_cannot_authorize_consumers);
 	UT_RUN(test_complete_empty_census_allows_normal_progress);
 	UT_RUN(test_begin_first_clamps_native_truncate_to_pin);
@@ -487,6 +501,7 @@ main(void)
 	UT_RUN(test_multiple_namespace_pins_keep_the_earliest_full_xid);
 	UT_RUN(test_output_alias_cannot_erase_live_truncate_reservation);
 	UT_RUN(test_invalid_build_identity_key_and_cut_cannot_grant_permission);
+	UT_RUN(test_epoch_zero_is_exact_identity_not_missing_admission);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

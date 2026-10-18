@@ -40,9 +40,11 @@ check_key(const ClusterRelmapRetentionDirectory *directory,
 		|| key->identity.database_incarnation != directory->database_incarnation
 		|| key->identity.shared != (key->identity.dbid == InvalidOid)
 		|| key->generation < 2 || key->origin != directory->origin
-		|| !normal_full_xid(key->top_full_xid) || key->membership_epoch == 0
+		|| !normal_full_xid(key->top_full_xid)
 		|| key->admitted_incarnation == 0 || key->boot_incarnation == 0)
 		return CLUSTER_RELMAP_RETENTION_INVALID;
+	/* Membership epoch zero is a real original admission value, not a missing
+	 * sample. same_key still compares it exactly across all transitions. */
 	if (key->top_full_xid < directory->native_floor
 		|| (directory->inflight.serial != 0 && key->top_full_xid < directory->inflight.cutoff))
 		return CLUSTER_RELMAP_RETENTION_NATIVE_GONE;

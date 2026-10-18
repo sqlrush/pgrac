@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include "cluster/cluster_relmap_authority.h"
+#include "cluster/cluster_relmap_retention_restore.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
 
@@ -853,10 +854,343 @@ UT_TEST(test_pending_reader_preserves_base_for_cold_finish)
 	UT_ASSERT(clean_pair(true));
 }
 
+#define RESTORE_BASE UINT64CONST(0x200000000)
+#define RESTORE_OK CLUSTER_RELMAP_RETENTION_OK
+
+static void
+restore_builders(ClusterRelmapRetentionDirectory storage[2],
+	ClusterRelmapRetentionDirectory *directories[2])
+{
+	memset(storage, 0, 2 * sizeof(*storage));
+	for (int i = 0; i < 2; i++) {
+		directories[i] = &storage[i];
+		if (cluster_relmap_retention_build_start(directories[i], identity.system_identifier,
+			identity.database_incarnation, i == 0 ? 7 : owner.node, 99,
+			RESTORE_BASE + 3, RESTORE_BASE + 1000) != RESTORE_OK)
+			abort();
+	}
+}
+
+static size_t
+pin_count(const ClusterRelmapRetentionDirectory *directory)
+{
+	size_t count = 0;
+
+	for (size_t i = 0; i < lengthof(directory->pins); i++)
+		count += directory->pins[i].occupied;
+	return count;
+}
+
+static bool
+restore_refused(ClusterRelmapRetentionDirectory storage[2])
+{
+	ClusterRelmapRetentionTruncate cut;
+
+	for (int i = 0; i < 2; i++)
+		if (storage[i].state != CLUSTER_RELMAP_RETENTION_UNKNOWN
+			|| cluster_relmap_retention_build_finish(&storage[i]) == RESTORE_OK
+			|| cluster_relmap_retention_allocation_check(&storage[i], RESTORE_BASE + 1001)
+				== RESTORE_OK
+			|| cluster_relmap_retention_truncate_begin(&storage[i], RESTORE_BASE + 500, &cut)
+				== RESTORE_OK)
+			return false;
+	return true;
+}
+
+UT_TEST(test_restore_clean_pair_is_only_one_building_observation)
+{
+	ClusterRelmapRetentionDirectory storage[2], *directories[2];
+	ClusterRelmapRetentionTruncate cut;
+
+	setup(&identity);
+	restore_builders(storage, directories);
+	UT_ASSERT_EQ(cluster_relmap_retention_restore_namespace(&identity, directories, 2), RESTORE_OK);
+	UT_ASSERT_EQ(reads, 2);
+	UT_ASSERT_EQ(writes, 0);
+	for (int i = 0; i < 2; i++) {
+		UT_ASSERT_EQ(storage[i].state, CLUSTER_RELMAP_RETENTION_BUILDING);
+		UT_ASSERT_EQ(pin_count(&storage[i]), 0);
+		UT_ASSERT_NE(cluster_relmap_retention_allocation_check(&storage[i], RESTORE_BASE + 1001), RESTORE_OK);
+		UT_ASSERT_NE(cluster_relmap_retention_truncate_begin(&storage[i], RESTORE_BASE + 500, &cut), RESTORE_OK);
+	}
+}
+
+UT_TEST(test_restore_exact_original_origin_and_epoch_zero)
+{
+	ClusterRelmapRetentionDirectory storage[2], *directories[2];
+	ClusterRelmapRetentionPin *pin;
+
+	setup(&identity);
+	UT_ASSERT(stage(&identity));
+	reset_io();
+	restore_builders(storage, directories);
+	UT_ASSERT_EQ(cluster_relmap_retention_restore_namespace(&identity, directories, 2), RESTORE_OK);
+	UT_ASSERT_EQ(pin_count(&storage[0]), 0);
+	UT_ASSERT_EQ(pin_count(&storage[1]), 1);
+	pin = &storage[1].pins[0];
+	UT_ASSERT_EQ(pin->key.identity.system_identifier, identity.system_identifier);
+	UT_ASSERT_EQ(pin->key.identity.database_incarnation, identity.database_incarnation);
+	UT_ASSERT(pin->key.identity.shared && pin->key.identity.dbid == InvalidOid);
+	UT_ASSERT_EQ(pin->key.origin, owner.node);
+	UT_ASSERT_EQ(pin->key.generation, 8);
+	UT_ASSERT_EQ(pin->key.top_full_xid, owner.top_full_xid);
+	UT_ASSERT_EQ(pin->key.membership_epoch, owner.membership_epoch);
+	UT_ASSERT_EQ(pin->key.admitted_incarnation, owner.admitted_incarnation);
+	UT_ASSERT_EQ(pin->key.boot_incarnation, owner.boot_incarnation);
+	UT_ASSERT_EQ(pin->wal_end, owner.wal_end);
+	UT_ASSERT(pin->occupied && pin->may_be_staged);
+	UT_ASSERT_EQ(storage[0].state, CLUSTER_RELMAP_RETENTION_BUILDING);
+	UT_ASSERT_EQ(storage[1].state, CLUSTER_RELMAP_RETENTION_BUILDING);
+	UT_ASSERT_EQ(writes, 0);
+}
+
+UT_TEST(test_restore_legal_stage_publish_discard_cuts_keep_pending)
+{
+	ClusterRelmapV2Image image = staged_image();
+	ClusterRelmapRetentionDirectory storage[2], *directories[2];
+
+	for (int kind = 0; kind < 3; kind++) {
+		setup(&identity);
+		if (kind == 0) {
+			fail_rename = 2;
+			UT_ASSERT(!stage(&identity));
+		} else {
+			UT_ASSERT(stage(&identity));
+			reset_io();
+			fail_rename = 2;
+			UT_ASSERT_EQ(finish(&image, kind == 1), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+		}
+		reset_io();
+		restore_builders(storage, directories);
+		UT_ASSERT_EQ(cluster_relmap_retention_restore_namespace(&identity, directories, 2), RESTORE_OK);
+		UT_ASSERT_EQ(pin_count(&storage[1]), 1);
+		UT_ASSERT_EQ(storage[1].pins[0].key.top_full_xid, owner.top_full_xid);
+		UT_ASSERT_EQ(storage[1].pins[0].wal_end, owner.wal_end);
+	}
+}
+
+UT_TEST(test_restore_incomplete_corrupt_foreign_and_conflicting_pairs_poison_build)
+{
+	ClusterRelmapRetentionDirectory storage[2], *directories[2];
+	unsigned char bytes[2176];
+	char path[MAXPGPATH];
+
+	for (int kind = 0; kind < 5; kind++) {
+		ClusterRelmapV2Image image = staged_image();
+
+		setup(&identity);
+		UT_ASSERT(stage(&identity));
+		read_copy(1, bytes);
+		if (kind == 0) {
+			snprintf(path, sizeof(path), "%s/%s", directory, names[1]);
+			UT_ASSERT_EQ(unlink(path), 0);
+		} else if (kind == 1)
+			write_copy(1, bytes, 40);
+		else if (kind == 2) {
+			bytes[128] ^= 1;
+			write_copy(1, bytes, sizeof(bytes));
+		} else {
+			if (kind == 3)
+				image.identity.database_incarnation++;
+			else
+				image.pending_owner.boot_incarnation++;
+			UT_ASSERT_EQ(cluster_relmap_v2_encode(&image, bytes, sizeof(bytes)), CLUSTER_RELMAP_V2_VALID);
+			write_copy(1, bytes, sizeof(bytes));
+		}
+		restore_builders(storage, directories);
+		UT_ASSERT_NE(cluster_relmap_retention_restore_namespace(&identity, directories, 2), RESTORE_OK);
+		UT_ASSERT(restore_refused(storage));
+	}
+}
+
+UT_TEST(test_restore_requires_qualified_distinct_original_origin_builders)
+{
+	ClusterRelmapRetentionDirectory storage[2], *directories[2];
+
+	for (int kind = 0; kind < 6; kind++) {
+		setup(&identity);
+		UT_ASSERT(stage(&identity));
+		reset_io();
+		restore_builders(storage, directories);
+		switch (kind) {
+		case 0: storage[1].origin = 8; break;
+		case 1: storage[1].origin = storage[0].origin; break;
+		case 2: storage[1].system_identifier++; break;
+		case 3: storage[0].database_incarnation++; break;
+		case 4: storage[0].state = CLUSTER_RELMAP_RETENTION_COMPLETE; break;
+		case 5: storage[1].origin = CLUSTER_RELMAP_RETENTION_MAX_ORIGINS; break;
+		}
+		UT_ASSERT_NE(cluster_relmap_retention_restore_namespace(&identity, directories, 2), RESTORE_OK);
+		UT_ASSERT(restore_refused(storage));
+		if (kind != 0)
+			UT_ASSERT_EQ(reads, 0);
+	}
+}
+
+UT_TEST(test_restore_checks_original_native_floor_issued_and_half_space)
+{
+	ClusterRelmapRetentionDirectory storage[2], *directories[2];
+
+	for (int kind = 0; kind < 3; kind++) {
+		setup(&identity);
+		UT_ASSERT(stage(&identity));
+		restore_builders(storage, directories);
+		if (kind == 0)
+			storage[1].native_floor = owner.top_full_xid + 1;
+		else if (kind == 1)
+			storage[1].last_issued = owner.top_full_xid - 1;
+		else
+			storage[1].last_issued = owner.top_full_xid + UINT64CONST(0x80000000);
+		UT_ASSERT_EQ(cluster_relmap_retention_restore_namespace(&identity, directories, 2),
+			kind == 0 ? CLUSTER_RELMAP_RETENTION_NATIVE_GONE :
+			kind == 1 ? CLUSTER_RELMAP_RETENTION_INVALID : CLUSTER_RELMAP_RETENTION_XID_WINDOW);
+		UT_ASSERT(restore_refused(storage));
+	}
+}
+
+UT_TEST(test_restore_failure_after_prior_namespace_retains_pins)
+{
+	ClusterRelmapRetentionDirectory storage[2], *directories[2];
+	ClusterRelmapV2Namespace other = identity;
+
+	setup(&identity);
+	UT_ASSERT(stage(&identity));
+	restore_builders(storage, directories);
+	UT_ASSERT_EQ(cluster_relmap_retention_restore_namespace(&identity, directories, 2), RESTORE_OK);
+	other.shared = false;
+	other.dbid = 42; /* Actual selected directory exists, but neither authority copy does. */
+	UT_ASSERT_NE(cluster_relmap_retention_restore_namespace(&other, directories, 2), RESTORE_OK);
+	UT_ASSERT(restore_refused(storage));
+	UT_ASSERT_EQ(pin_count(&storage[1]), 1);
+	UT_ASSERT_EQ(storage[1].pins[0].key.top_full_xid, owner.top_full_xid);
+	UT_ASSERT_NE(cluster_relmap_retention_restore_namespace(&identity, directories, 2), RESTORE_OK);
+	UT_ASSERT_EQ(pin_count(&storage[1]), 1);
+}
+
+UT_TEST(test_restore_exact_retry_is_idempotent_but_changed_owner_conflicts)
+{
+	ClusterRelmapRetentionDirectory storage[2], *directories[2];
+	ClusterRelmapV2Image image = staged_image();
+	unsigned char bytes[2176];
+
+	setup(&identity);
+	UT_ASSERT(stage(&identity));
+	restore_builders(storage, directories);
+	UT_ASSERT_EQ(cluster_relmap_retention_restore_namespace(&identity, directories, 2), RESTORE_OK);
+	UT_ASSERT_EQ(cluster_relmap_retention_restore_namespace(&identity, directories, 2), RESTORE_OK);
+	UT_ASSERT_EQ(pin_count(&storage[1]), 1);
+	image.pending_owner.boot_incarnation++;
+	UT_ASSERT_EQ(cluster_relmap_v2_encode(&image, bytes, sizeof(bytes)), CLUSTER_RELMAP_V2_VALID);
+	write_copy(0, bytes, sizeof(bytes));
+	write_copy(1, bytes, sizeof(bytes));
+	UT_ASSERT_EQ(cluster_relmap_retention_restore_namespace(&identity, directories, 2),
+		CLUSTER_RELMAP_RETENTION_CONFLICT);
+	UT_ASSERT(restore_refused(storage));
+	UT_ASSERT_EQ(storage[1].pins[0].key.boot_incarnation, owner.boot_incarnation);
+}
+
+UT_TEST(test_restore_io_identity_and_close_failure_cannot_authorize_emptiness)
+{
+	ClusterRelmapRetentionDirectory storage[2], *directories[2];
+	char path[MAXPGPATH];
+
+	for (int kind = 0; kind < 3; kind++) {
+		setup(&identity);
+		restore_builders(storage, directories);
+		if (kind == 0) {
+			snprintf(path, sizeof(path), "%s/%s", directory, names[1]);
+			UT_ASSERT_EQ(unlink(path), 0);
+			UT_ASSERT_EQ(symlink(names[0], path), 0);
+		} else if (kind == 1)
+			replace_during_read = true;
+		else
+			fail_directory_close = true;
+		UT_ASSERT_NE(cluster_relmap_retention_restore_namespace(&identity, directories, 2), RESTORE_OK);
+		UT_ASSERT(restore_refused(storage));
+	}
+}
+
+UT_TEST(test_restore_capacity_failure_keeps_all_previously_restored_pins)
+{
+	ClusterRelmapRetentionDirectory storage[2], *directories[2];
+	ClusterRelmapRetentionKey key = { 0 };
+
+	setup(&identity);
+	UT_ASSERT(stage(&identity));
+	restore_builders(storage, directories);
+	key.identity = identity;
+	key.identity.shared = false;
+	key.generation = 8;
+	key.origin = owner.node;
+	key.top_full_xid = owner.top_full_xid;
+	key.membership_epoch = 1;
+	key.admitted_incarnation = owner.admitted_incarnation;
+	key.boot_incarnation = owner.boot_incarnation;
+	for (int i = 0; i < CLUSTER_RELMAP_RETENTION_CAPACITY; i++) {
+		key.identity.dbid = 100 + i;
+		UT_ASSERT_EQ(cluster_relmap_retention_build_add(&storage[1], &key, owner.wal_end), RESTORE_OK);
+	}
+	UT_ASSERT_EQ(cluster_relmap_retention_restore_namespace(&identity, directories, 2),
+		CLUSTER_RELMAP_RETENTION_CAPACITY_EXCEEDED);
+	UT_ASSERT(restore_refused(storage));
+	UT_ASSERT_EQ(pin_count(&storage[1]), CLUSTER_RELMAP_RETENTION_CAPACITY);
+}
+
+UT_TEST(test_restore_allows_distinct_global_and_database_pending)
+{
+	ClusterRelmapRetentionDirectory storage[2], *directories[2];
+	ClusterRelmapV2Image image = staged_image();
+	unsigned char bytes[2176];
+
+	setup(&identity);
+	UT_ASSERT(stage(&identity));
+	restore_builders(storage, directories);
+	UT_ASSERT_EQ(cluster_relmap_retention_restore_namespace(&identity, directories, 2), RESTORE_OK);
+	image.identity.shared = false;
+	image.identity.dbid = 42;
+	snprintf(directory, sizeof(directory), "%s/base/42", root);
+	UT_ASSERT_EQ(cluster_relmap_v2_encode(&image, bytes, sizeof(bytes)), CLUSTER_RELMAP_V2_VALID);
+	write_copy(0, bytes, sizeof(bytes));
+	write_copy(1, bytes, sizeof(bytes));
+	UT_ASSERT_EQ(cluster_relmap_retention_restore_namespace(&image.identity, directories, 2), RESTORE_OK);
+	UT_ASSERT_EQ(pin_count(&storage[0]), 0);
+	UT_ASSERT_EQ(pin_count(&storage[1]), 2);
+	UT_ASSERT(storage[1].pins[0].key.identity.shared);
+	UT_ASSERT(!storage[1].pins[1].key.identity.shared);
+	UT_ASSERT_EQ(storage[1].pins[1].key.identity.dbid, 42);
+	UT_ASSERT_EQ(storage[1].state, CLUSTER_RELMAP_RETENTION_BUILDING);
+}
+
+UT_TEST(test_restore_invalid_arguments_cannot_leave_build_publishable)
+{
+	ClusterRelmapRetentionDirectory storage[2], *directories[2];
+	ClusterRelmapV2Namespace wrong;
+
+	setup(&identity);
+	for (int kind = 0; kind < 4; kind++) {
+		restore_builders(storage, directories);
+		wrong = identity;
+		if (kind == 0)
+			wrong.dbid = 42;
+		else if (kind == 1)
+			wrong.system_identifier = 0;
+		else if (kind == 2)
+			wrong.database_incarnation = 0;
+		UT_ASSERT_EQ(cluster_relmap_retention_restore_namespace(kind == 3 ? NULL : &wrong,
+			directories, 2), CLUSTER_RELMAP_RETENTION_INVALID);
+		UT_ASSERT(restore_refused(storage));
+	}
+	restore_builders(storage, directories);
+	UT_ASSERT_EQ(cluster_relmap_retention_restore_namespace(&identity, NULL, 2), CLUSTER_RELMAP_RETENTION_INVALID);
+	UT_ASSERT_EQ(cluster_relmap_retention_restore_namespace(&identity, directories,
+		CLUSTER_RELMAP_RETENTION_MAX_ORIGINS + 1), CLUSTER_RELMAP_RETENTION_INVALID);
+	UT_ASSERT_EQ(reads, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(33);
 	UT_RUN(test_stage_both_copies_before_success);
 	UT_RUN(test_per_database_namespace);
 	UT_RUN(test_missing_authority_is_never_seeded);
@@ -878,6 +1212,18 @@ main(void)
 	UT_RUN(test_directory_close_failure_cannot_acknowledge_clean_pair);
 	UT_RUN(test_clean_unstaged_pair_cannot_fabricate_publish);
 	UT_RUN(test_pending_reader_preserves_base_for_cold_finish);
+	UT_RUN(test_restore_clean_pair_is_only_one_building_observation);
+	UT_RUN(test_restore_exact_original_origin_and_epoch_zero);
+	UT_RUN(test_restore_legal_stage_publish_discard_cuts_keep_pending);
+	UT_RUN(test_restore_incomplete_corrupt_foreign_and_conflicting_pairs_poison_build);
+	UT_RUN(test_restore_requires_qualified_distinct_original_origin_builders);
+	UT_RUN(test_restore_checks_original_native_floor_issued_and_half_space);
+	UT_RUN(test_restore_failure_after_prior_namespace_retains_pins);
+	UT_RUN(test_restore_exact_retry_is_idempotent_but_changed_owner_conflicts);
+	UT_RUN(test_restore_io_identity_and_close_failure_cannot_authorize_emptiness);
+	UT_RUN(test_restore_capacity_failure_keeps_all_previously_restored_pins);
+	UT_RUN(test_restore_allows_distinct_global_and_database_pending);
+	UT_RUN(test_restore_invalid_arguments_cannot_leave_build_publishable);
 	cleanup();
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

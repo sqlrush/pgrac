@@ -9,7 +9,9 @@
 #define CLUSTER_RELMAP_RETENTION_CAPACITY 64
 
 /* Volatile coordination only, never a substitute for either durable copy.
- * All access, including checks, requires ONE caller-held retention lock.
+ * All access to published storage, including checks, requires ONE caller-held
+ * retention lock. Startup may build exclusively owned, unpublished storage
+ * without that lock; it must never do disk I/O under the runtime lock.
  * No function takes another lock, allocates, performs I/O or raises ERROR.
  * Future allocation callers hold XidGenLock before that retention lock and
  * check BOTH their first and recomputed stripe/herding candidates. */
