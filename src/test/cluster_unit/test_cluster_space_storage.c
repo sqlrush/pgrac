@@ -1045,6 +1045,18 @@ GetCurrentTransactionNestLevel(void)
 {
 	return nest_level;
 }
+
+/* Execute the actual native transaction gates against explicit backend state.
+ * Only the state carrier is a fixture; no policy verdict is substituted. */
+#include "test_cluster_storage_xact_types.inc"
+typedef struct StorageGateTransactionState
+{
+	TBlockState blockState;
+} *TransactionState;
+static struct StorageGateTransactionState storage_gate_xact = {TBLOCK_STARTED};
+static TransactionState CurrentTransactionState = &storage_gate_xact;
+#include "test_cluster_storage_xact_gate.inc"
+
 void *
 MemoryContextAlloc(MemoryContext context, Size size)
 {
@@ -1463,6 +1475,8 @@ errcode(int code)
 static void
 reset(void)
 {
+	storage_gate_xact.blockState = TBLOCK_STARTED;
+	MyXactFlags = 0;
 	data_sync_retry = false;
 	create_refused = create_scope_live = create_scope_armed = false;
 	create_revoke_on_io = create_throw_on_read = false;

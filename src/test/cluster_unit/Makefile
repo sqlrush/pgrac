@@ -2579,6 +2579,16 @@ test_cluster_storage_owned_gate.inc: $(top_srcdir)/src/backend/catalog/pg_shdepe
 	     END { if (found != 3 || done != 3 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_storage_xact_types.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
+	awk '/^typedef enum TBlockState/ { emit=1; found++ } emit { print } /^} TBlockState;/ { emit=0; done++ } END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_storage_xact_gate.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
+	awk '/^(IsTransactionBlock|IsInTransactionBlock|PreventInTransactionBlock)\(/ { print ($$0 ~ /^Prevent/ ? "void" : "bool"); emit=1; found++ } emit { print } emit && /^}/ { emit=0; done++ } END { if (found != 3 || done != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_space_storage test_cluster_storage_subtransaction test_cluster_space_committed_drop: test_cluster_storage_xact_types.inc test_cluster_storage_xact_gate.inc
+
 test_cluster_storage_subtransaction: test_cluster_storage_delete_gate.inc test_cluster_storage_truncate_gate.inc test_cluster_storage_truncate_apply.inc test_cluster_storage_owned_gate.inc $(top_srcdir)/src/backend/nodes/list.c
 
 test_cluster_space_storage test_cluster_storage_subtransaction test_cluster_space_committed_drop: %: %.c test_cluster_space_storage.c test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc unit_test.h test_cluster_space_catalog_product.o test_cluster_space_smgrdesc_product.o test_cluster_side_xact_xactdesc.o \
@@ -2586,7 +2596,7 @@ test_cluster_space_storage test_cluster_storage_subtransaction test_cluster_spac
 		test_cluster_space_xlogutils_product.o \
 		test_cluster_space_storage_product.o $(CLUSTER_HW_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		test_cluster_space_storage_product.o test_cluster_space_catalog_product.o test_cluster_space_smgrdesc_product.o \
 		$(top_builddir)/src/backend/storage/page/checksum.o \
 		test_cluster_space_xlogutils_product.o test_cluster_side_xact_xactdesc.o $(CLUSTER_HW_O) \

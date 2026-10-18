@@ -1297,7 +1297,7 @@ storeObjectDescription(StringInfo descs,
  * interdependent objects in the wrong order.
  */
 static void
-shdepDropOwnedInternal(List *roleids, DropBehavior behavior, bool check_storage_only)
+shdepDropOwnedInternal(List *roleids, DropBehavior behavior, bool check_storage_only, int flags)
 {
 	Relation	sdepRel;
 	ListCell   *cell;
@@ -1313,7 +1313,10 @@ shdepDropOwnedInternal(List *roleids, DropBehavior behavior, bool check_storage_
 
 #ifdef USE_PGRAC_CLUSTER
 	check_storage
-		|= cluster_storage_mode_enabled() && cluster_interconnect_tier != CLUSTER_IC_TIER_1;
+		|= cluster_storage_mode_enabled()
+		   && (cluster_interconnect_tier != CLUSTER_IC_TIER_1
+			   || ((flags & PERFORM_DELETION_USER_COMMAND)
+				   && IsInTransactionBlock((flags & PERFORM_DELETION_TOPLEVEL) != 0)));
 #endif
 	deleteobjs = new_object_addresses();
 	if (check_storage)
@@ -1483,7 +1486,7 @@ shdepDropOwnedInternal(List *roleids, DropBehavior behavior, bool check_storage_
 	if (check_storage) {
 		sort_object_addresses(checkobjs);
 		performMultipleDeletions(checkobjs, behavior,
-								 PERFORM_DELETION_CHECK_STORAGE_ONLY | PERFORM_DELETION_QUIETLY);
+								 flags | PERFORM_DELETION_CHECK_STORAGE_ONLY | PERFORM_DELETION_QUIETLY);
 		if (!check_storage_only) {
 			foreach (cell, effects) {
 				DropOwnedEffect *effect = lfirst(cell);
@@ -1510,7 +1513,7 @@ shdepDropOwnedInternal(List *roleids, DropBehavior behavior, bool check_storage_
 
 	/* the dependency mechanism does the actual work */
 	if (!check_storage_only)
-		performMultipleDeletions(deleteobjs, behavior, 0);
+		performMultipleDeletions(deleteobjs, behavior, flags);
 
 	table_close(sdepRel, RowExclusiveLock);
 
@@ -1518,15 +1521,15 @@ shdepDropOwnedInternal(List *roleids, DropBehavior behavior, bool check_storage_
 }
 
 void
-shdepCheckOwnedStorageDrop(List *roleids, DropBehavior behavior)
+shdepCheckOwnedStorageDrop(List *roleids, DropBehavior behavior, int flags)
 {
-	shdepDropOwnedInternal(roleids, behavior, true);
+	shdepDropOwnedInternal(roleids, behavior, true, flags);
 }
 
 void
-shdepDropOwned(List *roleids, DropBehavior behavior)
+shdepDropOwned(List *roleids, DropBehavior behavior, int flags)
 {
-	shdepDropOwnedInternal(roleids, behavior, false);
+	shdepDropOwnedInternal(roleids, behavior, false, flags);
 }
 
 

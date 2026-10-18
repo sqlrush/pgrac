@@ -198,6 +198,31 @@ RelationStorageUsesClusterSharedPath(RelFileLocator rlocator, BackendId backend,
 #endif
 }
 
+/* User DROP/TRUNCATE must finish as one native top-level command. Classify
+ * the exact storage path, not relisshared or an OID/tablespace approximation.
+ * Internal storage cleanup is not a new user DDL command. */
+void
+RelationCheckStorageDDLTransaction(Relation rel, bool isTopLevel, const char *command)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (!RelationStorageUsesClusterSharedPath(rel->rd_locator, rel->rd_backend,
+											rel->rd_rel->relpersistence))
+		return;
+
+	if (IsInTransactionBlock(isTopLevel))
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("shared relation %s requires a standalone top-level statement", command),
+				 errhint("Execute shared DROP or TRUNCATE outside a transaction block, "
+						 "function, or DO block. Send it as a single statement, "
+						 "separate from other commands.")));
+
+	/* Retain the native pipeline check and post-command immediate-commit flag.
+	 * This does not commit any preceding work or open an internal transaction. */
+	PreventInTransactionBlock(isTopLevel, command);
+#endif
+}
+
 /*
  * RelationCreateStorage
  *		Create physical storage for a relation.

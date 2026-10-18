@@ -32,8 +32,8 @@ extern Oid	AlterRoleSet(AlterRoleSetStmt *stmt);
 extern void DropRole(DropRoleStmt *stmt);
 extern void GrantRole(ParseState *pstate, GrantRoleStmt *stmt);
 extern ObjectAddress RenameRole(const char *oldname, const char *newname);
-extern void DropOwnedObjects(DropOwnedStmt *stmt);
-extern void CheckOwnedObjectsStorageDrop(DropOwnedStmt *stmt);
+extern void DropOwnedObjects(DropOwnedStmt *stmt, bool isTopLevel);
+extern void CheckOwnedObjectsStorageDrop(DropOwnedStmt *stmt, bool isTopLevel);
 extern void ReassignOwnedObjects(ReassignOwnedStmt *stmt);
 extern List *roleSpecsToIds(List *memberNames);
 

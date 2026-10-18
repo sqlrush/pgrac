@@ -1376,7 +1376,7 @@ DropErrorMsgWrongType(const char *relname, char wrongkind, char rightkind)
  *		DROP MATERIALIZED VIEW, DROP FOREIGN TABLE
  */
 static void
-RemoveRelationsInternal(DropStmt *drop, bool check_storage_only)
+RemoveRelationsInternal(DropStmt *drop, bool check_storage_only, bool isTopLevel)
 {
 	ObjectAddresses *objects;
 	char		relkind;
@@ -1384,6 +1384,10 @@ RemoveRelationsInternal(DropStmt *drop, bool check_storage_only)
 	int flags
 		= check_storage_only ? PERFORM_DELETION_CHECK_STORAGE_ONLY | PERFORM_DELETION_QUIETLY : 0;
 	LOCKMODE	lockmode = AccessExclusiveLock;
+
+	flags |= PERFORM_DELETION_USER_COMMAND;
+	if (isTopLevel)
+		flags |= PERFORM_DELETION_TOPLEVEL;
 
 	/* DROP CONCURRENTLY uses a weaker lock, and has some restrictions */
 	if (drop->concurrent)
@@ -1536,15 +1540,15 @@ RemoveRelationsInternal(DropStmt *drop, bool check_storage_only)
 }
 
 void
-RemoveRelations(DropStmt *drop)
+RemoveRelations(DropStmt *drop, bool isTopLevel)
 {
-	RemoveRelationsInternal(drop, false);
+	RemoveRelationsInternal(drop, false, isTopLevel);
 }
 
 void
-CheckRelationsStorageDrop(DropStmt *drop)
+CheckRelationsStorageDrop(DropStmt *drop, bool isTopLevel)
 {
-	RemoveRelationsInternal(drop, true);
+	RemoveRelationsInternal(drop, true, isTopLevel);
 }
 
 /*
@@ -1713,7 +1717,7 @@ RangeVarCallbackForDropRelation(const RangeVar *rel, Oid relOid, Oid oldRelOid,
  * are truncated and reindexed.
  */
 void
-ExecuteTruncate(TruncateStmt *stmt)
+ExecuteTruncate(TruncateStmt *stmt, bool isTopLevel)
 {
 	List	   *rels = NIL;
 	List	   *relids = NIL;
@@ -1812,7 +1816,7 @@ ExecuteTruncate(TruncateStmt *stmt)
 	}
 
 	ExecuteTruncateGuts(rels, relids, relids_logged,
-						stmt->behavior, stmt->restart_seqs, false);
+						stmt->behavior, stmt->restart_seqs, false, isTopLevel);
 
 	/* And close the rels */
 	foreach(cell, rels)
@@ -1841,7 +1845,7 @@ ExecuteTruncateGuts(List *explicit_rels,
 					List *relids,
 					List *relids_logged,
 					DropBehavior behavior, bool restart_seqs,
-					bool run_as_table_owner)
+					bool run_as_table_owner, bool isTopLevel)
 {
 	List	   *rels;
 	List	   *seq_relids = NIL;
@@ -1902,8 +1906,10 @@ ExecuteTruncateGuts(List *explicit_rels,
 	foreach (cell, rels) {
 		Relation rel = lfirst(cell);
 
-		if (RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
+		if (RELKIND_HAS_STORAGE(rel->rd_rel->relkind)) {
+			RelationCheckStorageDDLTransaction(rel, isTopLevel, "TRUNCATE");
 			RelationCheckStorageDrain(rel->rd_locator, rel->rd_rel->relpersistence, "truncation");
+		}
 	}
 
 	/*
@@ -1939,6 +1945,7 @@ ExecuteTruncateGuts(List *explicit_rels,
 
 				seq_rel = relation_open(seq_relid, AccessExclusiveLock);
 
+				RelationCheckStorageDDLTransaction(seq_rel, isTopLevel, "TRUNCATE");
 				RelationCheckStorageDrain(seq_rel->rd_locator, seq_rel->rd_rel->relpersistence,
 										  "truncation");
 

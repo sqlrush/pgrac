@@ -55,10 +55,16 @@ static bool type_in_list_does_not_exist_skipping(List *typenames,
  * errors if there are dependencies between them.
  */
 static void
-RemoveObjectsInternal(DropStmt *stmt, bool check_storage_only)
+RemoveObjectsInternal(DropStmt *stmt, bool check_storage_only, bool isTopLevel)
 {
 	ObjectAddresses *objects;
 	ListCell   *cell1;
+	int flags = PERFORM_DELETION_USER_COMMAND;
+
+	if (isTopLevel)
+		flags |= PERFORM_DELETION_TOPLEVEL;
+	if (check_storage_only)
+		flags |= PERFORM_DELETION_CHECK_STORAGE_ONLY | PERFORM_DELETION_QUIETLY;
 
 	objects = new_object_addresses();
 
@@ -126,23 +132,21 @@ RemoveObjectsInternal(DropStmt *stmt, bool check_storage_only)
 	}
 
 	/* Here we really delete them. */
-	performMultipleDeletions(
-		objects, stmt->behavior,
-		check_storage_only ? PERFORM_DELETION_CHECK_STORAGE_ONLY | PERFORM_DELETION_QUIETLY : 0);
+	performMultipleDeletions(objects, stmt->behavior, flags);
 
 	free_object_addresses(objects);
 }
 
 void
-RemoveObjects(DropStmt *stmt)
+RemoveObjects(DropStmt *stmt, bool isTopLevel)
 {
-	RemoveObjectsInternal(stmt, false);
+	RemoveObjectsInternal(stmt, false, isTopLevel);
 }
 
 void
-CheckObjectsStorageDrop(DropStmt *stmt)
+CheckObjectsStorageDrop(DropStmt *stmt, bool isTopLevel)
 {
-	RemoveObjectsInternal(stmt, true);
+	RemoveObjectsInternal(stmt, true, isTopLevel);
 }
 
 

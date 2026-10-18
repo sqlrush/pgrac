@@ -483,7 +483,7 @@ UT_TEST(test_rdma_truncate_preflights_explicit_and_cascade_before_triggers)
 		PG_TRY();
 		{
 			ExecuteTruncateGuts(rels, ids, NIL, cascade ? DROP_CASCADE : DROP_RESTRICT, false,
-								false);
+								false, true);
 		}
 		PG_CATCH();
 		{
@@ -497,7 +497,7 @@ UT_TEST(test_rdma_truncate_preflights_explicit_and_cascade_before_triggers)
 		expecting_error = false;
 		shared = false;
 		fk_steps = 0;
-		ExecuteTruncateGuts(rels, ids, NIL, cascade ? DROP_CASCADE : DROP_RESTRICT, false, false);
+		ExecuteTruncateGuts(rels, ids, NIL, cascade ? DROP_CASCADE : DROP_RESTRICT, false, false, true);
 		UT_ASSERT_EQ(truncate_preflight_exits, 1);
 		list_free(rels);
 		list_free(ids);
@@ -638,7 +638,7 @@ UT_TEST(test_rdma_drop_owned_refuses_before_acl_or_policy_changes)
 		expecting_error = true;
 		PG_TRY();
 		{
-			shdepDropOwned(roles, DROP_CASCADE);
+			shdepDropOwned(roles, DROP_CASCADE, 0);
 		}
 		PG_CATCH();
 		{
@@ -652,7 +652,7 @@ UT_TEST(test_rdma_drop_owned_refuses_before_acl_or_policy_changes)
 		/* Private objects keep the original ACL, policy and deletion work. */
 		shared = false;
 		expecting_error = false;
-		shdepDropOwned(roles, DROP_CASCADE);
+		shdepDropOwned(roles, DROP_CASCADE, 0);
 		UT_ASSERT_EQ(owned_acl_effects, 1);
 		UT_ASSERT_EQ(owned_policy_effects, 1);
 		UT_ASSERT_EQ(deletion_effects, 2);
@@ -673,7 +673,7 @@ UT_TEST(test_drop_owned_executes_only_its_checked_workset)
 	expecting_error = true;
 	PG_TRY();
 	{
-		shdepDropOwned(roles, DROP_CASCADE);
+		shdepDropOwned(roles, DROP_CASCADE, 0);
 	}
 	PG_CATCH();
 	{
@@ -921,11 +921,194 @@ UT_TEST(test_failed_shared_replacement_never_falls_back_to_inplace)
 	locator.relNumber = 16384;
 }
 
+UT_TEST(test_shared_drop_transaction_context_refuses_before_whole_closure)
+{
+	for (int context = 0; context < 5; context++) {
+		ObjectAddress refs[2] = {{RelationRelationId, 9100, 0},
+								 {RelationRelationId, 9101, 0}};
+		ObjectAddressExtra extras[2] = {{0}, {0}};
+		ObjectAddresses objects = {.refs = refs, .extras = extras, .numrefs = 2};
+		volatile bool caught = false;
+		int flags = PERFORM_DELETION_USER_COMMAND | PERFORM_DELETION_CHECK_STORAGE_ONLY;
+
+		reset();
+		shared = native_owner = expecting_error = true;
+		cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+		deletion_events = deletion_effects = 0;
+		refusal_code = 0;
+		refusal_hint[0] = '\0';
+		memset(deletion_relations, 0, sizeof(deletion_relations));
+		memset(deletion_forms, 0, sizeof(deletion_forms));
+		for (int i = 0; i < 2; i++) {
+			deletion_relations[i].rd_locator = locator;
+			deletion_relations[i].rd_backend = InvalidBackendId;
+			deletion_relations[i].rd_rel = &deletion_forms[i];
+			deletion_forms[i].relkind = RELKIND_RELATION;
+			deletion_forms[i].relpersistence
+				= i == 0 ? RELPERSISTENCE_TEMP : RELPERSISTENCE_PERMANENT;
+		}
+		if (context != 2)
+			flags |= PERFORM_DELETION_TOPLEVEL;
+		if (context == 0)
+			storage_gate_xact.blockState = TBLOCK_INPROGRESS;
+		else if (context == 1)
+			storage_gate_xact.blockState = TBLOCK_IMPLICIT_INPROGRESS;
+		else if (context == 3)
+			MyXactFlags |= XACT_FLAGS_PIPELINING;
+		else if (context == 4)
+			nest_level = 2;
+		PG_TRY();
+		{
+			deleteObjectsInList(&objects, NULL, flags);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(refusal_code, ERRCODE_ACTIVE_SQL_TRANSACTION);
+		UT_ASSERT(refusal_hint[0] != '\0');
+		UT_ASSERT_EQ(deletion_events + deletion_effects + io_calls + wal_calls + ko_calls, 0);
+		UT_ASSERT_EQ(MyXactFlags & XACT_FLAGS_NEEDIMMEDIATECOMMIT, 0);
+	}
+}
+
+UT_TEST(test_shared_drop_top_level_and_local_exception_use_native_commit_gate)
+{
+	ObjectAddress ref = {RelationRelationId, 9101, 0};
+	ObjectAddressExtra extra = {0};
+	ObjectAddresses objects = {.refs = &ref, .extras = &extra, .numrefs = 1};
+	int flags = PERFORM_DELETION_USER_COMMAND | PERFORM_DELETION_TOPLEVEL;
+
+	reset();
+	shared = true;
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+	deletion_events = deletion_effects = 0;
+	memset(deletion_relations, 0, sizeof(deletion_relations));
+	memset(deletion_forms, 0, sizeof(deletion_forms));
+	deletion_relations[1].rd_locator = locator;
+	deletion_relations[1].rd_backend = InvalidBackendId;
+	deletion_relations[1].rd_rel = &deletion_forms[1];
+	deletion_forms[1].relkind = RELKIND_RELATION;
+	deletion_forms[1].relpersistence = RELPERSISTENCE_PERMANENT;
+	deleteObjectsInList(&objects, NULL, flags | PERFORM_DELETION_CHECK_STORAGE_ONLY);
+	UT_ASSERT(MyXactFlags & XACT_FLAGS_NEEDIMMEDIATECOMMIT);
+	UT_ASSERT_EQ(deletion_events + deletion_effects, 0);
+	deleteObjectsInList(&objects, NULL, flags);
+	UT_ASSERT_EQ(deletion_events, 1);
+	UT_ASSERT_EQ(deletion_effects, 1);
+
+	/* Internal cleanup carries no user-command context and is not reclassified
+	 * as a new DDL statement inside an existing transaction. */
+	MyXactFlags = 0;
+	storage_gate_xact.blockState = TBLOCK_INPROGRESS;
+	deleteObjectsInList(&objects, NULL, 0);
+	UT_ASSERT_EQ(MyXactFlags & XACT_FLAGS_NEEDIMMEDIATECOMMIT, 0);
+
+	deletion_forms[1].relpersistence = RELPERSISTENCE_TEMP;
+	deleteObjectsInList(&objects, NULL, flags);
+	UT_ASSERT_EQ(MyXactFlags & XACT_FLAGS_NEEDIMMEDIATECOMMIT, 0);
+	deletion_forms[1].relpersistence = RELPERSISTENCE_PERMANENT;
+	shared = false;
+	deleteObjectsInList(&objects, NULL, flags);
+	UT_ASSERT_EQ(MyXactFlags & XACT_FLAGS_NEEDIMMEDIATECOMMIT, 0);
+}
+
+UT_TEST(test_shared_truncate_context_preflights_explicit_and_cascade_targets)
+{
+	for (int cascade = 0; cascade < 2; cascade++) {
+		for (int context = 0; context < 3; context++) {
+			List *rels, *ids;
+			volatile bool caught = false;
+
+			reset();
+			shared = expecting_error = true;
+			cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+			fk_steps = truncate_preflight_exits = 0;
+			add_fk_target = cascade;
+			refusal_code = 0;
+			refusal_hint[0] = '\0';
+			memset(deletion_relations, 0, sizeof(deletion_relations));
+			memset(deletion_forms, 0, sizeof(deletion_forms));
+			for (int i = 0; i < 2; i++) {
+				deletion_relations[i].rd_id = 9100 + i;
+				deletion_relations[i].rd_locator = locator;
+				deletion_relations[i].rd_backend = InvalidBackendId;
+				deletion_relations[i].rd_rel = &deletion_forms[i];
+				deletion_forms[i].relkind = RELKIND_RELATION;
+				deletion_forms[i].relpersistence
+					= i == 0 ? RELPERSISTENCE_TEMP : RELPERSISTENCE_PERMANENT;
+			}
+			rels = list_make1(&deletion_relations[0]);
+			ids = list_make1_oid(9100);
+			if (!cascade) {
+				rels = lappend(rels, &deletion_relations[1]);
+				ids = lappend_oid(ids, 9101);
+			}
+			storage_gate_xact.blockState
+				= context == 0 ? TBLOCK_INPROGRESS : TBLOCK_IMPLICIT_INPROGRESS;
+			if (context == 2)
+				storage_gate_xact.blockState = TBLOCK_STARTED;
+			PG_TRY();
+			{
+				ExecuteTruncateGuts(rels, ids, NIL, cascade ? DROP_CASCADE : DROP_RESTRICT,
+									false, false, context != 2);
+			}
+			PG_CATCH();
+			{
+				caught = true;
+			}
+			PG_END_TRY();
+			UT_ASSERT(caught);
+			UT_ASSERT_EQ(refusal_code, ERRCODE_ACTIVE_SQL_TRANSACTION);
+			UT_ASSERT(refusal_hint[0] != '\0');
+			UT_ASSERT_EQ(truncate_preflight_exits + io_calls + wal_calls + ko_calls, 0);
+			UT_ASSERT_EQ(MyXactFlags & XACT_FLAGS_NEEDIMMEDIATECOMMIT, 0);
+			list_free(rels);
+			list_free(ids);
+		}
+	}
+}
+
+UT_TEST(test_shared_drop_owned_context_refuses_before_acl_policy_or_deletion)
+{
+	List *roles = list_make1_oid(9200);
+	volatile bool caught = false;
+
+	reset();
+	shared = expecting_error = true;
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+	storage_gate_xact.blockState = TBLOCK_INPROGRESS;
+	owned_acl_effects = owned_policy_effects = deletion_effects = deletion_events = 0;
+	reset_owned_rows();
+	deletion_relations[1].rd_backend = InvalidBackendId;
+	refusal_code = 0;
+	refusal_hint[0] = '\0';
+	PG_TRY();
+	{
+		shdepDropOwned(roles, DROP_CASCADE,
+					   PERFORM_DELETION_USER_COMMAND | PERFORM_DELETION_TOPLEVEL);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(refusal_code, ERRCODE_ACTIVE_SQL_TRANSACTION);
+	UT_ASSERT(refusal_hint[0] != '\0');
+	UT_ASSERT_EQ(owned_acl_effects + owned_policy_effects + deletion_events + deletion_effects,
+				 0);
+	UT_ASSERT_EQ(io_calls + wal_calls + ko_calls, 0);
+	list_free(roles);
+}
+
 int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(19);
+	UT_PLAN(23);
 	UT_RUN(test_child_create_refuses_before_storage_or_abort_owner);
 	UT_RUN(test_child_drop_refuses_before_ko_or_pending_delete);
 	UT_RUN(test_child_truncate_refuses_before_flush_or_structure);
@@ -945,6 +1128,10 @@ main(void)
 	UT_RUN(test_native_truncate_retains_its_original_local_transaction_choice);
 	UT_RUN(test_shared_route_keeps_toast_indexes_and_mixed_relation_ownership);
 	UT_RUN(test_failed_shared_replacement_never_falls_back_to_inplace);
+	UT_RUN(test_shared_drop_transaction_context_refuses_before_whole_closure);
+	UT_RUN(test_shared_drop_top_level_and_local_exception_use_native_commit_gate);
+	UT_RUN(test_shared_truncate_context_preflights_explicit_and_cascade_targets);
+	UT_RUN(test_shared_drop_owned_context_refuses_before_acl_policy_or_deletion);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

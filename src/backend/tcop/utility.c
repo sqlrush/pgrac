@@ -29,6 +29,7 @@
 #include "catalog/toasting.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_mode.h"
 #include "cluster/cluster_semantic_activation.h"
 #endif
 #include "commands/alter.h"
@@ -85,15 +86,19 @@ ProcessUtility_hook_type ProcessUtility_hook = NULL;
  * Internal btree rebuilds (for example TRUNCATE) do not use a ReindexStmt.
  * Author: SqlRush <sqlrush@gmail.com> */
 static void
-CheckClusterSharedUtilitySupport(Node *statement)
+CheckClusterSharedUtilitySupport(Node *statement, bool isTopLevel)
 {
 	const char *unsupported = NULL;
 	ObjectType object_type = OBJECT_TABLE;
 	ListCell *lc;
 
-	if (statement == NULL || (!cluster_shared_config && !cluster_shared_catalog))
+	if (statement == NULL)
 		return;
 	check_stack_depth();
+	/* User relations may use shared smgr with both shared_* switches off.
+	 * Keep the unsupported-operation matrix scoped to its original modes. */
+	if (!cluster_shared_config && !cluster_shared_catalog)
+		goto storage_preflight;
 	switch (nodeTag(statement))
 	{
 		case T_TransactionStmt:
@@ -180,7 +185,7 @@ CheckClusterSharedUtilitySupport(Node *statement)
 				unsupported = "materialized views";
 			else
 				foreach(lc, ((AlterTableStmt *) statement)->cmds)
-					CheckClusterSharedUtilitySupport((Node *) lfirst(lc));
+					CheckClusterSharedUtilitySupport((Node *) lfirst(lc), false);
 			break;
 		case T_AlterTableCmd:
 			if (((AlterTableCmd *) statement)->subtype == AT_SetUnLogged)
@@ -214,7 +219,7 @@ CheckClusterSharedUtilitySupport(Node *statement)
 			break;
 		case T_CreateSchemaStmt:
 			foreach(lc, ((CreateSchemaStmt *) statement)->schemaElts)
-				CheckClusterSharedUtilitySupport((Node *) lfirst(lc));
+				CheckClusterSharedUtilitySupport((Node *) lfirst(lc), false);
 			break;
 		default:
 			break;
@@ -244,10 +249,14 @@ CheckClusterSharedUtilitySupport(Node *statement)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("%s is not supported in shared mode", unsupported),
 				 errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+storage_preflight:
+	if (!cluster_storage_mode_enabled())
+		return;
 	/* Resolve the original roots and complete dependency closure before
 	 * ddl_command_start can run. The final deletion pass rechecks its own
 	 * closure because a trigger may change dependencies in this transaction. */
-	if (cluster_interconnect_tier != CLUSTER_IC_TIER_1 && IsA(statement, DropStmt)) {
+	if ((cluster_interconnect_tier != CLUSTER_IC_TIER_1 || IsInTransactionBlock(isTopLevel))
+		&& IsA(statement, DropStmt)) {
 		DropStmt *drop = (DropStmt *)statement;
 
 		switch (drop->removeType) {
@@ -257,15 +266,16 @@ CheckClusterSharedUtilitySupport(Node *statement)
 		case OBJECT_VIEW:
 		case OBJECT_MATVIEW:
 		case OBJECT_FOREIGN_TABLE:
-			CheckRelationsStorageDrop(drop);
+			CheckRelationsStorageDrop(drop, isTopLevel);
 			break;
 		default:
-			CheckObjectsStorageDrop(drop);
+			CheckObjectsStorageDrop(drop, isTopLevel);
 			break;
 		}
 	}
-	if (cluster_interconnect_tier != CLUSTER_IC_TIER_1 && IsA(statement, DropOwnedStmt))
-		CheckOwnedObjectsStorageDrop((DropOwnedStmt *)statement);
+	if ((cluster_interconnect_tier != CLUSTER_IC_TIER_1 || IsInTransactionBlock(isTopLevel))
+		&& IsA(statement, DropOwnedStmt))
+		CheckOwnedObjectsStorageDrop((DropOwnedStmt *)statement, isTopLevel);
 }
 #endif
 
@@ -798,7 +808,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC: reject unsupported index AMs/constraints before event triggers.
 	 * Author: SqlRush <sqlrush@gmail.com> */
-	CheckClusterSharedUtilitySupport(parsetree);
+	CheckClusterSharedUtilitySupport(parsetree, isTopLevel);
 	CheckClusterIndexSupport(parsetree);
 	if (IsA(parsetree, AlterTableStmt))
 		CheckClusterSharedAlterTable((AlterTableStmt *) parsetree, queryString);
@@ -962,7 +972,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			break;
 
 		case T_TruncateStmt:
-			ExecuteTruncate((TruncateStmt *) parsetree);
+			ExecuteTruncate((TruncateStmt *) parsetree, isTopLevel);
 			break;
 
 		case T_CopyStmt:
@@ -2061,7 +2071,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_DropOwnedStmt:
-				DropOwnedObjects((DropOwnedStmt *) parsetree);
+				DropOwnedObjects((DropOwnedStmt *) parsetree, isTopLevel);
 				/* no commands stashed for DROP */
 				commandCollected = true;
 				break;
@@ -2253,10 +2263,10 @@ ExecDropStmt(DropStmt *stmt, bool isTopLevel)
 		case OBJECT_VIEW:
 		case OBJECT_MATVIEW:
 		case OBJECT_FOREIGN_TABLE:
-			RemoveRelations(stmt);
+		RemoveRelations(stmt, isTopLevel);
 			break;
 		default:
-			RemoveObjects(stmt);
+		RemoveObjects(stmt, isTopLevel);
 			break;
 	}
 }

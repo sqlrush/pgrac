@@ -141,6 +141,8 @@ typedef enum ObjectClass
 #define PERFORM_DELETION_CONCURRENT_LOCK	0x0020	/* normal drop with
 													 * concurrent lock mode */
 #define PERFORM_DELETION_CHECK_STORAGE_ONLY 0x0040	/* lock/check, never delete */
+#define PERFORM_DELETION_USER_COMMAND 0x0080 /* user DROP storage policy */
+#define PERFORM_DELETION_TOPLEVEL 0x0100 /* exact ProcessUtility context */
 
 
 /* in dependency.c */
@@ -266,8 +268,8 @@ extern void copyTemplateDependencies(Oid templateDbId, Oid newDbId);
 
 extern void dropDatabaseDependencies(Oid databaseId);
 
-extern void shdepDropOwned(List *roleids, DropBehavior behavior);
-extern void shdepCheckOwnedStorageDrop(List *roleids, DropBehavior behavior);
+extern void shdepDropOwned(List *roleids, DropBehavior behavior, int flags);
+extern void shdepCheckOwnedStorageDrop(List *roleids, DropBehavior behavior, int flags);
 
 extern void shdepReassignOwned(List *roleids, Oid newrole);
 

@@ -253,7 +253,9 @@ deleteObjectsInList(ObjectAddresses *targetObjects, Relation *depRel,
 #ifdef USE_PGRAC_CLUSTER
 	/* Check the complete dependency closure before deleting even its first
 	 * object. Dependency discovery already owns each deletion lock. */
-	if (cluster_storage_mode_enabled() && cluster_interconnect_tier != CLUSTER_IC_TIER_1) {
+	if (cluster_storage_mode_enabled()
+		&& (cluster_interconnect_tier != CLUSTER_IC_TIER_1
+			|| (flags & PERFORM_DELETION_USER_COMMAND))) {
 		for (i = 0; i < targetObjects->numrefs; i++) {
 			const ObjectAddress *obj = &targetObjects->refs[i];
 			Relation rel;
@@ -263,8 +265,12 @@ deleteObjectsInList(ObjectAddresses *targetObjects, Relation *depRel,
 				|| obj->classId != RelationRelationId || obj->objectSubId != 0)
 				continue;
 			rel = relation_open(obj->objectId, NoLock);
-			if (RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
+			if (RELKIND_HAS_STORAGE(rel->rd_rel->relkind)) {
+				if (flags & PERFORM_DELETION_USER_COMMAND)
+					RelationCheckStorageDDLTransaction(
+						rel, (flags & PERFORM_DELETION_TOPLEVEL) != 0, "DROP");
 				RelationCheckStorageDrain(rel->rd_locator, rel->rd_rel->relpersistence, "deletion");
+			}
 			relation_close(rel, NoLock);
 		}
 	}
