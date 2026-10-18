@@ -182,6 +182,7 @@ static bool test_mx_remote_failed;
 static bool test_mx_remote_revokes_grant;
 static bool test_mx_remote_epoch_drift;
 static bool test_mx_remote_identity_mismatch;
+static bool test_mx_remote_omits_proof;
 static int test_undo_pending_prepare_calls;
 static int test_undo_pending_cancel_calls;
 static ClusterCtrcTxnKeyV1 test_undo_pending_key;
@@ -496,6 +497,8 @@ cluster_gcs_current_mx_member_proof_fetch_and_wait(
 	updater_proof->verdict = CUCP_UNKNOWN;
 	if (test_mx_remote_failed)
 		return CMX_RESOLVE_UNKNOWN;
+	if (test_mx_remote_omits_proof)
+		return CMX_RESOLVE_OK;
 	memset(proof, 0, sizeof(*proof));
 	proof->member_xid = decoded.trailer.body.asks[0].xid;
 	proof->member_ordinal = decoded.trailer.body.asks[0].member_ordinal;
@@ -1289,6 +1292,7 @@ reset_exact_origin_fixture(void)
 	test_mx_remote_revokes_grant = false;
 	test_mx_remote_epoch_drift = false;
 	test_mx_remote_identity_mismatch = false;
+	test_mx_remote_omits_proof = false;
 	test_undo_pending_prepare_calls = 0;
 	test_undo_pending_cancel_calls = 0;
 	memset(&test_undo_pending_key, 0, sizeof(test_undo_pending_key));
@@ -2385,6 +2389,28 @@ UT_TEST(test_retained_active_mx_batch_rejects_remote_identity_mismatch)
 	 * matches the descriptor that the requester sent for that ordinal. */
 	reset_rolled_active_fixture();
 	test_mx_remote_identity_mismatch = true;
+	UT_ASSERT_EQ(
+		resolve_rolled_mx_batch(false, true, proofs, &updater, capabilities, &deadline),
+		CMX_RESOLVE_UNKNOWN);
+	UT_ASSERT_EQ(test_mx_remote_calls, 1);
+	assert_mx_batch_unknown(proofs, 2, &updater, capabilities);
+	UT_ASSERT_EQ(test_formation_epoch, 42);
+	UT_ASSERT_EQ(test_ctrc_touch_calls, 1);
+	UT_ASSERT_EQ(test_durable_locator_calls, 1);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, test_candidate_release_calls);
+}
+
+UT_TEST(test_retained_active_mx_batch_rejects_missing_remote_proof)
+{
+	ClusterCurrentMemberProof proofs[2];
+	ClusterCurrentUpdaterProof updater;
+	uint32 capabilities[2];
+	TimestampTz deadline = 0;
+
+	/* A successful transport response without the requested member proof is
+	 * incomplete and cannot publish the earlier local proof either. */
+	reset_rolled_active_fixture();
+	test_mx_remote_omits_proof = true;
 	UT_ASSERT_EQ(
 		resolve_rolled_mx_batch(false, true, proofs, &updater, capabilities, &deadline),
 		CMX_RESOLVE_UNKNOWN);
@@ -6013,7 +6039,7 @@ UT_TEST(test_self_fresh_role_does_not_inherit_ordinary_abort_permission)
 int
 main(void)
 {
-	UT_PLAN(170);
+	UT_PLAN(171);
 	UT_RUN(test_retained_active_identity_reaches_real_undo_pending);
 	UT_RUN(test_retained_undo_pending_requires_matching_active_tt_receipt);
 	UT_RUN(test_retained_undo_pending_guard_drift_cannot_publish);
@@ -6021,6 +6047,7 @@ main(void)
 	UT_RUN(test_retained_active_mx_batch_scrubs_earlier_local_proof);
 	UT_RUN(test_retained_active_mx_batch_rechecks_remote_epoch);
 	UT_RUN(test_retained_active_mx_batch_rejects_remote_identity_mismatch);
+	UT_RUN(test_retained_active_mx_batch_rejects_missing_remote_proof);
 	UT_RUN(test_retained_mx_precommit_retries_preserve_batch_deadline);
 	UT_RUN(test_local_updater_rolled_active_preserves_original_identity);
 	UT_RUN(test_local_updater_rolled_active_accepts_duplicate_ctrc_touch);
