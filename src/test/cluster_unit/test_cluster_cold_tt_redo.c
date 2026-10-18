@@ -1907,10 +1907,393 @@ UT_TEST(tt_redo_base_refuses_bad_arguments_with_cleared_outputs)
 	tt_redo_destroy(&f);
 }
 
+
+/* Explicit original-base graph fixtures retain real DATA and sealed redo. */
+static void
+tt_redo_base_graph_page(uint32 segment, uint32 block, const PGAlignedBlock *page)
+{
+	char path[MAXPGPATH];
+	int fd;
+
+	snprintf(path, sizeof(path), "%s/%u", tt_redo_dir, segment);
+	fd = open(path, O_RDWR);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(pwrite(fd, page->data, BLCKSZ, (off_t)block * BLCKSZ), BLCKSZ);
+	UT_ASSERT_EQ(close(fd), 0);
+}
+
+static void
+tt_redo_base_graph_record(PGAlignedBlock *page, TransactionId xid, uint32 segment, uint16 slot,
+						  uint16 wrap, UBA previous)
+{
+	UndoSlotDirEntry directory;
+	UndoRecordHeader header;
+
+	tt_redo_record_page(page, xid);
+	((UndoBlockHeader *)page->data)->block_lsn = 90;
+	memcpy(&directory, page->data + UNDO_SLOT_DIR_OFFSET(0), sizeof(directory));
+	memcpy(&header, page->data + directory.record_offset, sizeof(header));
+	header.tt_slot_segment_id = segment;
+	header.tt_slot_id = slot + 1;
+	header.tt_wrap_plus1 = wrap + 1;
+	header.prev_uba = previous;
+	if (!UBA_is_invalid(previous))
+		header.flags &= ~UNDO_REC_FLAG_FIRST_IN_TX;
+	directory.flags = header.flags;
+	memcpy(page->data + directory.record_offset, &header, sizeof(header));
+	memcpy(page->data + UNDO_SLOT_DIR_OFFSET(0), &directory, sizeof(directory));
+}
+
+static void
+tt_redo_base_graph_fixture(TtRedoFixture *f, XLogRecPtr end, PGAlignedBlock *page)
+{
+	UndoSegmentHeaderData *header;
+
+	tt_redo_fixture(f, end, RF_SIDE_PLAN_RECOVERY);
+	header = (UndoSegmentHeaderData *)f->base.data;
+	header->tt_slots[4].first_undo_block = tt_redo_record_address(513, 9, 0);
+	header->tt_slots[47].first_undo_block = (UBA)InvalidUba_init;
+	tt_redo_seed_header(513, &f->base);
+	tt_redo_seed_recapture(f);
+	tt_redo_base_graph_record(page, 802, 513, 4, 7, (UBA)InvalidUba_init);
+	tt_redo_base_page(page);
+}
+
+static void
+tt_redo_base_graph_refuses(ClusterColdTtBaseRedoGraphInputV1 *input,
+						   const ClusterRecoveryTxnKey *key, UBA address,
+						   ClusterRecoveryGraphResult expected)
+{
+	ClusterRecoveryUndoRecord out, zero = { 0 };
+	uint32 generation = UINT32_MAX;
+
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT_EQ(
+		cluster_cold_typed_tt_base_redo_graph_read_v1(input, key, address, &out, &generation),
+		expected);
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	UT_ASSERT_EQ(generation, 0);
+}
+
+UT_TEST(tt_redo_base_graph_walks_original_chain_across_physical_generations)
+{
+	TtRedoFixture f;
+	PGAlignedBlock page, second;
+	ClusterColdTtBaseRedoGraphInputV1 input = { &f.typed, 0 };
+	ClusterColdTtRedoGraphInputV1 fpi = { &f.typed, 0 };
+	ClusterRecoveryReferenceGraph *graph = NULL;
+	ClusterRecoveryGraphRecord out;
+	ClusterRecoveryGraphResult result = CLUSTER_RECOVERY_GRAPH_MORE;
+	ClusterRecoveryTxnKey key;
+	unsigned seen = 0;
+	char path[MAXPGPATH];
+
+	tt_redo_base_graph_fixture(&f, 100, &page);
+	cluster_undo_segment_make_header_bytes(514, 3, second.data);
+	((UndoSegmentHeaderData *)second.data)->wrap_count = 91;
+	tt_redo_seed_header(514, &second);
+	tt_redo_seed_recapture(&f);
+	tt_redo_base_graph_record(&page, 802, 513, 4, 7, tt_redo_record_address(514, 9, 0));
+	tt_redo_base_page(&page);
+	tt_redo_base_graph_record(&page, 802, 513, 4, 7, (UBA)InvalidUba_init);
+	tt_redo_base_graph_page(514, 9, &page);
+	tt_redo_seal(&f);
+	key = tt_redo_graph_key(&f);
+	tt_redo_graph_refuses(&fpi, &key, tt_redo_record_address(513, 9, 0),
+						  CLUSTER_RECOVERY_GRAPH_INVALID);
+	UT_ASSERT_EQ(cluster_cold_typed_tt_base_redo_graph_begin_v1(&input, 1024 * 1024, &graph),
+				 CLUSTER_RECOVERY_GRAPH_MORE);
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_count(graph), 1);
+	for (unsigned i = 0; i < 64; i++) {
+		result = cluster_recovery_reference_graph_step(graph, &out);
+		if (result == CLUSTER_RECOVERY_GRAPH_RECORD) {
+			UT_ASSERT_EQ(out.transaction.segment_id, 513);
+			UT_ASSERT_EQ(out.transaction.segment_generation, 0);
+			UT_ASSERT_EQ(out.record->header.xid, 802);
+			UT_ASSERT_EQ(out.record_segment_generation, seen == 0 ? 0 : 91);
+			seen++;
+		} else if (result != CLUSTER_RECOVERY_GRAPH_MORE)
+			break;
+	}
+	UT_ASSERT_EQ(seen, 2);
+	UT_ASSERT_EQ(result, CLUSTER_RECOVERY_GRAPH_DRAINED);
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_count(graph), 2);
+	UT_ASSERT(cluster_recovery_reference_graph_observed(graph));
+	UT_ASSERT_EQ(cluster_cold_tt_base_recheck_v1(&f.typed), CLUSTER_COLD_OK);
+	cluster_recovery_reference_graph_destroy(graph);
+	snprintf(path, sizeof(path), "%s/514", tt_redo_dir);
+	UT_ASSERT_EQ(unlink(path), 0);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_redo_base_graph_seeds_all_segments_slot_edges_and_terminal_heads_after_redo)
+{
+	TtRedoFixture f;
+	PGAlignedBlock page, second, original;
+	UndoSegmentHeaderData *header;
+	UndoSlotDirEntry directory;
+	UndoRecordHeader changed;
+	FakeXactRecord fake;
+	ClusterColdTtBaseRedoGraphInputV1 input = { &f.typed, 0 };
+	ClusterRecoveryReferenceGraph *graph = NULL;
+	ClusterRecoveryGraphRecord out;
+	ClusterRecoveryGraphResult result = CLUSTER_RECOVERY_GRAPH_MORE;
+	unsigned seen = 0;
+	uint32 generation = UINT32_MAX;
+	char path[MAXPGPATH];
+
+	tt_redo_fixture(&f, 300, RF_SIDE_PLAN_RECOVERY);
+	header = (UndoSegmentHeaderData *)f.base.data;
+	header->tt_slots[0] = (TTSlot){ .xid = 800,
+									.wrap = 0,
+									.status = TT_SLOT_ACTIVE,
+									.first_undo_block = tt_redo_seed_address(513, 9, 0) };
+	header->tt_slots[47].status = TT_SLOT_ABORTED;
+	header->tt_slots[47].first_undo_block = tt_redo_seed_address(513, 10, 47);
+	tt_redo_seed_header(513, &f.base);
+	cluster_undo_segment_make_header_bytes(514, 3, second.data);
+	header = (UndoSegmentHeaderData *)second.data;
+	header->wrap_count = 91;
+	header->tt_slots[47] = (TTSlot){ .xid = 900,
+									 .wrap = 9,
+									 .status = TT_SLOT_COMMITTED,
+									 .commit_scn = 777,
+									 .first_undo_block = tt_redo_seed_address(514, 9, 47) };
+	tt_redo_seed_header(514, &second);
+	tt_redo_seed_recapture(&f);
+	tt_redo_base_graph_record(&page, 804, 513, 47, 5, (UBA)InvalidUba_init);
+	tt_redo_base_graph_page(513, 10, &page);
+	tt_redo_base_graph_record(&page, 900, 514, 47, 9, (UBA)InvalidUba_init);
+	tt_redo_base_graph_page(514, 9, &page);
+	tt_redo_base_graph_record(&page, 800, 513, 0, 0, (UBA)InvalidUba_init);
+	tt_redo_base_page(&page);
+	original = page;
+	memcpy(&directory, page.data + UNDO_SLOT_DIR_OFFSET(0), sizeof(directory));
+	memcpy(&changed, page.data + directory.record_offset, sizeof(changed));
+	changed.target_offset = 2;
+	memcpy(page.data + directory.record_offset, &changed, sizeof(changed));
+	tt_redo_feed_record_page(&f, 100, &page, false);
+	undo_header_commit(&fake, 0, 802);
+	undo_header_feed(f.typed.side_plans[0], &fake, 200);
+	tt_redo_seal(&f);
+	UT_ASSERT_EQ(cluster_cold_typed_tt_base_redo_graph_begin_v1(&input, 1024 * 1024, &graph),
+				 CLUSTER_RECOVERY_GRAPH_MORE);
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_count(graph), 3);
+	for (unsigned i = 0; i < 64; i++) {
+		result = cluster_recovery_reference_graph_step(graph, &out);
+		if (result == CLUSTER_RECOVERY_GRAPH_RECORD) {
+			if (out.transaction.xid == 800) {
+				UT_ASSERT_EQ(out.transaction.slot_offset, 0);
+				UT_ASSERT_EQ(out.record->header.target_offset, 2);
+				UT_ASSERT_EQ(out.record->block_header.block_lsn, 200);
+				seen |= 1;
+			} else if (out.transaction.xid == 804) {
+				UT_ASSERT_EQ(out.transaction.slot_offset, 47);
+				seen |= 2;
+			} else {
+				UT_ASSERT_EQ(out.transaction.xid, 900);
+				UT_ASSERT_EQ(out.transaction.segment_id, 514);
+				UT_ASSERT_EQ(out.record_segment_generation, 91);
+				seen |= 4;
+			}
+		} else if (result != CLUSTER_RECOVERY_GRAPH_MORE)
+			break;
+	}
+	UT_ASSERT_EQ(seen, 7);
+	UT_ASSERT_EQ(result, CLUSTER_RECOVERY_GRAPH_DRAINED);
+	UT_ASSERT_EQ(cluster_cold_tt_base_recheck_v1(&f.typed), CLUSTER_COLD_OK);
+	/* Full original DATA still matches after graph traversal and verification. */
+	UT_ASSERT(cluster_cold_tt_base_block_v1(&f.typed, 0, 9, &page, &generation));
+	UT_ASSERT_EQ(generation, 0);
+	UT_ASSERT(memcmp(page.data, original.data, BLCKSZ) == 0);
+	cluster_recovery_reference_graph_destroy(graph);
+	snprintf(path, sizeof(path), "%s/514", tt_redo_dir);
+	UT_ASSERT_EQ(unlink(path), 0);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_redo_base_graph_rejects_exact_key_source_and_bad_arguments)
+{
+	TtRedoFixture f;
+	PGAlignedBlock page;
+	ClusterRecoveryTxnKey key, changed;
+	ClusterColdTtBaseRedoGraphInputV1 input = { &f.typed, 0 };
+	ClusterRecoveryUndoRecord out, zero = { 0 };
+	uint32 generation = UINT32_MAX;
+	UBA address = tt_redo_record_address(513, 9, 0);
+
+	tt_redo_base_graph_fixture(&f, 100, &page);
+	tt_redo_seal(&f);
+	key = tt_redo_graph_key(&f);
+	for (int fault = 0; fault < 8; fault++) {
+		changed = key;
+		switch (fault) {
+		case 0:
+			changed.system_identifier++;
+			break;
+		case 1:
+			changed.database_incarnation++;
+			break;
+		case 2:
+			changed.origin_node_id++;
+			break;
+		case 3:
+			changed.segment_id++;
+			break;
+		case 4:
+			changed.segment_generation++;
+			break;
+		case 5:
+			changed.slot_offset++;
+			break;
+		case 6:
+			changed.xid++;
+			break;
+		case 7:
+			changed.slot_wrap++;
+			break;
+		}
+		tt_redo_base_graph_refuses(&input, &changed, address, CLUSTER_RECOVERY_GRAPH_IDENTITY);
+	}
+	f.typed.participants[0].native_redo++;
+	tt_redo_base_graph_refuses(&input, &key, address, CLUSTER_RECOVERY_GRAPH_IDENTITY);
+	f.typed.participants[0].native_redo--;
+	input.participant = 1;
+	tt_redo_base_graph_refuses(&input, &key, address, CLUSTER_RECOVERY_GRAPH_IDENTITY);
+	input.participant = 0;
+	tt_redo_base_graph_refuses(NULL, &key, address, CLUSTER_RECOVERY_GRAPH_INVALID);
+	tt_redo_base_graph_refuses(&input, NULL, address, CLUSTER_RECOVERY_GRAPH_INVALID);
+	tt_redo_base_graph_refuses(&input, &key, (UBA)InvalidUba_init, CLUSTER_RECOVERY_GRAPH_INVALID);
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT_EQ(cluster_cold_typed_tt_base_redo_graph_read_v1(&input, &key, address, &out, NULL),
+				 CLUSTER_RECOVERY_GRAPH_INVALID);
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	UT_ASSERT_EQ(
+		cluster_cold_typed_tt_base_redo_graph_read_v1(&input, &key, address, NULL, &generation),
+		CLUSTER_RECOVERY_GRAPH_INVALID);
+	UT_ASSERT_EQ(generation, 0);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_redo_base_graph_verification_detects_full_block_drift_and_stays_failed)
+{
+	TtRedoFixture f;
+	PGAlignedBlock page;
+	ClusterColdTtBaseRedoGraphInputV1 input = { &f.typed, 0 };
+	ClusterRecoveryReferenceGraph *graph = NULL;
+	ClusterRecoveryGraphRecord out;
+	ClusterRecoveryGraphResult result = CLUSTER_RECOVERY_GRAPH_MORE;
+	unsigned records = 0;
+
+	tt_redo_base_graph_fixture(&f, 100, &page);
+	tt_redo_seal(&f);
+	UT_ASSERT_EQ(cluster_cold_typed_tt_base_redo_graph_begin_v1(&input, 1024 * 1024, &graph),
+				 CLUSTER_RECOVERY_GRAPH_MORE);
+	for (unsigned i = 0; i < 32; i++) {
+		result = cluster_recovery_reference_graph_step(graph, &out);
+		if (result == CLUSTER_RECOVERY_GRAPH_RECORD) {
+			records++;
+			page.data[BLCKSZ / 2] ^= 1;
+			tt_redo_base_page(&page);
+		} else if (result != CLUSTER_RECOVERY_GRAPH_MORE)
+			break;
+	}
+	UT_ASSERT_EQ(records, 1);
+	UT_ASSERT_EQ(result, CLUSTER_RECOVERY_GRAPH_INVALID);
+	UT_ASSERT_NULL(out.record);
+	UT_ASSERT(!cluster_recovery_reference_graph_observed(graph));
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_step(graph, &out), result);
+	UT_ASSERT_EQ(cluster_cold_tt_base_recheck_v1(&f.typed), CLUSTER_COLD_SOURCE_GAP);
+	cluster_recovery_reference_graph_destroy(graph);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_redo_base_graph_never_treats_refused_record_as_empty_chain)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		TtRedoFixture f;
+		PGAlignedBlock page;
+		ClusterColdTtBaseRedoGraphInputV1 input = { &f.typed, 0 };
+		ClusterRecoveryReferenceGraph *graph = NULL;
+		ClusterRecoveryGraphRecord out;
+		ClusterRecoveryGraphResult result = CLUSTER_RECOVERY_GRAPH_MORE;
+
+		tt_redo_base_graph_fixture(&f, 100, &page);
+		if (fault == 0)
+			f.typed.tt_base->budget = f.typed.tt_base->used;
+		else if (fault == 1)
+			((UndoBlockHeader *)page.data)->block_lsn = 0;
+		else if (fault == 2)
+			((UndoBlockHeader *)page.data)->block_lsn = 101;
+		else if (fault == 3)
+			memset(&page, 0, sizeof(page));
+		else
+			tt_redo_base_graph_record(&page, 999, 513, 4, 7, (UBA)InvalidUba_init);
+		tt_redo_base_page(&page);
+		tt_redo_seal(&f);
+		UT_ASSERT_EQ(cluster_cold_typed_tt_base_redo_graph_begin_v1(&input, 1024 * 1024, &graph),
+					 CLUSTER_RECOVERY_GRAPH_MORE);
+		for (unsigned i = 0; i < 16 && result == CLUSTER_RECOVERY_GRAPH_MORE; i++)
+			result = cluster_recovery_reference_graph_step(graph, &out);
+		UT_ASSERT_EQ(result,
+					 fault == 4 ? CLUSTER_RECOVERY_GRAPH_IDENTITY : CLUSTER_RECOVERY_GRAPH_INVALID);
+		UT_ASSERT_NULL(out.record);
+		UT_ASSERT(!cluster_recovery_reference_graph_observed(graph));
+		UT_ASSERT_EQ(cluster_recovery_reference_graph_step(graph, &out), result);
+		if (fault == 0)
+			UT_ASSERT_EQ(cluster_cold_tt_base_recheck_v1(&f.typed), CLUSTER_COLD_CAPACITY);
+		cluster_recovery_reference_graph_destroy(graph);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_redo_base_graph_factory_clears_failures_and_requires_source_with_empty_inventory)
+{
+	TtRedoFixture f;
+	PGAlignedBlock page;
+	ClusterColdTtBaseRedoGraphInputV1 input = { &f.typed, 0 };
+	ClusterRecoveryReferenceGraph *graph = (ClusterRecoveryReferenceGraph *)(uintptr_t)1;
+	char path[MAXPGPATH];
+
+	tt_redo_base_graph_fixture(&f, 100, &page);
+	tt_redo_seal(&f);
+	UT_ASSERT_EQ(cluster_cold_typed_tt_base_redo_graph_begin_v1(NULL, 1024 * 1024, &graph),
+				 CLUSTER_RECOVERY_GRAPH_INVALID);
+	UT_ASSERT_NULL(graph);
+	UT_ASSERT_EQ(cluster_cold_typed_tt_base_redo_graph_begin_v1(&input, 0, &graph),
+				 CLUSTER_RECOVERY_GRAPH_CAPACITY);
+	UT_ASSERT_NULL(graph);
+	UT_ASSERT_EQ(cluster_cold_typed_tt_base_redo_graph_begin_v1(&input, 1024 * 1024, NULL),
+				 CLUSTER_RECOVERY_GRAPH_INVALID);
+	snprintf(path, sizeof(path), "%s/513", tt_redo_dir);
+	UT_ASSERT_EQ(unlink(path), 0);
+	tt_redo_seed_recapture(&f);
+	UT_ASSERT_EQ(cluster_cold_tt_base_count_v1(&f.typed), 0);
+	f.typed.participants[0].owner_incarnation++;
+	UT_ASSERT_EQ(cluster_cold_typed_tt_base_redo_graph_begin_v1(&input, 1024 * 1024, &graph),
+				 CLUSTER_RECOVERY_GRAPH_IDENTITY);
+	UT_ASSERT_NULL(graph);
+	f.typed.participants[0].owner_incarnation--;
+	UT_ASSERT_EQ(cluster_cold_typed_tt_base_redo_graph_begin_v1(&input, 1024 * 1024, &graph),
+				 CLUSTER_RECOVERY_GRAPH_MORE);
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_count(graph), 0);
+	cluster_recovery_reference_graph_destroy(graph);
+	/* Restore only for the existing fixture cleanup, after dropping capture. */
+	cluster_cold_tt_base_destroy_v1(&f.typed);
+	tt_redo_seed_header(513, &f.base);
+	tt_redo_destroy(&f);
+}
+
 int
 main(void)
 {
-	UT_PLAN(45);
+	UT_PLAN(51);
+	UT_RUN(tt_redo_base_graph_walks_original_chain_across_physical_generations);
+	UT_RUN(tt_redo_base_graph_seeds_all_segments_slot_edges_and_terminal_heads_after_redo);
+	UT_RUN(tt_redo_base_graph_rejects_exact_key_source_and_bad_arguments);
+	UT_RUN(tt_redo_base_graph_verification_detects_full_block_drift_and_stays_failed);
+	UT_RUN(tt_redo_base_graph_never_treats_refused_record_as_empty_chain);
+	UT_RUN(tt_redo_base_graph_factory_clears_failures_and_requires_source_with_empty_inventory);
 	UT_RUN(tt_redo_base_only_retains_precheckpoint_records_and_owned_bytes);
 	UT_RUN(tt_redo_base_delta_and_fpi_preserve_order_untouched_rows_and_disk);
 	UT_RUN(tt_redo_base_refuses_zero_ahead_malformed_and_missing_original);

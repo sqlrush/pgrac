@@ -913,6 +913,29 @@ extern ClusterRecoveryGraphResult
 cluster_cold_typed_tt_redo_graph_read_v1(void *arg, const ClusterRecoveryTxnKey *key, UBA address,
 										 struct ClusterRecoveryUndoRecord *out, uint32 *generation);
 
+/* Explicit original-base alternative, never an FPI-only graph fallback.
+ * The original bounded block cache is mutable; retain this context and typed
+ * through graph destruction. Roots and exact after-redo key checks have the
+ * same contract as the FPI-only graph above. Records use the separate
+ * same-generation/no-lifecycle original-base reader and its full-byte reread.
+ * Cache/source/parse refusal returns GRAPH_INVALID and clears outputs; graph
+ * allocation still returns GRAPH_CAPACITY. Final base/source checks and
+ * isolation remain owner duties. No qualified checkpoint/source coverage,
+ * FullXid/epoch/top, loser, C0 or OPEN authority, even after DRAINED. */
+typedef struct ClusterColdTtBaseRedoGraphInputV1 {
+	ClusterColdTypedV1 *typed;
+	uint32 participant;
+} ClusterColdTtBaseRedoGraphInputV1;
+
+extern ClusterRecoveryGraphResult
+cluster_cold_typed_tt_base_redo_graph_begin_v1(ClusterColdTtBaseRedoGraphInputV1 *input,
+											   size_t memory_budget,
+											   struct ClusterRecoveryReferenceGraph **out);
+extern ClusterRecoveryGraphResult
+cluster_cold_typed_tt_base_redo_graph_read_v1(void *arg, const ClusterRecoveryTxnKey *key,
+											  UBA address, struct ClusterRecoveryUndoRecord *out,
+											  uint32 *generation);
+
 /* Sync the selected crashed sources before pass-2 mutations. No replay or
  * completion authority is created; a refusal invalidates this typed attempt. */
 extern bool cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed,

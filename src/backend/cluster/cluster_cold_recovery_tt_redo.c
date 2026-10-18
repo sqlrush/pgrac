@@ -287,31 +287,23 @@ cluster_cold_typed_undo_base_redo_record_v1(ClusterColdTypedV1 *typed, uint32 pa
 	return true;
 }
 
-ClusterRecoveryGraphResult
-cluster_cold_typed_tt_redo_graph_read_v1(void *arg, const ClusterRecoveryTxnKey *key, UBA address,
-										 ClusterRecoveryUndoRecord *out, uint32 *generation)
+/* Both explicit views require the same after-redo canonical TT key, while
+ * the record can reside in another captured physical segment. */
+static ClusterRecoveryGraphResult
+cold_tt_redo_graph_match(const ClusterColdTypedV1 *typed, uint32 participant,
+						 const ClusterRecoveryTxnKey *key, UBA address, uint32 *physical_index_out)
 {
-	const ClusterColdTtRedoGraphInputV1 *input = arg;
-	const ClusterColdTypedV1 *typed;
 	ClusterColdTtSlotKeyV1 expected = { 0 };
 	ClusterColdTtSlotInputV1 slot;
-	ClusterRecoveryGraphResult result = CLUSTER_RECOVERY_GRAPH_INVALID;
 	uint32 physical_segment, block, canonical_index = UINT32_MAX, physical_index = UINT32_MAX;
 	uint16 tt_slot, row;
 
-	if (out != NULL)
-		memset(out, 0, sizeof(*out));
-	if (generation != NULL)
-		*generation = 0;
-	if (input == NULL || input->typed == NULL || key == NULL || out == NULL || generation == NULL)
-		return result;
-	typed = input->typed;
 	if (!cluster_cold_tt_base_namespace_matches_v1(typed, key->system_identifier,
 												   key->database_incarnation)
 		|| key->origin_node_id >= UNDO_OWNER_INSTANCE_MAX)
 		return CLUSTER_RECOVERY_GRAPH_IDENTITY;
 	if (!uba_decode_record(address, &physical_segment, &block, &tt_slot, &row))
-		return result;
+		return CLUSTER_RECOVERY_GRAPH_INVALID;
 	expected.owner_instance = key->origin_node_id + 1;
 	expected.segment_id = key->segment_id;
 	expected.segment_generation = key->segment_generation;
@@ -323,7 +315,7 @@ cluster_cold_typed_tt_redo_graph_read_v1(void *arg, const ClusterRecoveryTxnKey 
 		uint32 segment;
 
 		if (cluster_cold_tt_base_header_v1(typed, i, &owner, &segment) == NULL)
-			return result;
+			return CLUSTER_RECOVERY_GRAPH_INVALID;
 		if (owner != expected.owner_instance)
 			continue;
 		if (segment == expected.segment_id)
@@ -332,12 +324,34 @@ cluster_cold_typed_tt_redo_graph_read_v1(void *arg, const ClusterRecoveryTxnKey 
 			physical_index = i;
 	}
 	if (canonical_index == UINT32_MAX || physical_index == UINT32_MAX
-		|| !cluster_cold_typed_tt_redo_match_v1(typed, input->participant, canonical_index,
-												&expected, &slot))
+		|| !cluster_cold_typed_tt_redo_match_v1(typed, participant, canonical_index, &expected,
+												&slot))
 		return CLUSTER_RECOVERY_GRAPH_IDENTITY;
-	if (!cluster_cold_typed_undo_redo_record_v1(typed, input->participant, physical_index, address,
-												out, generation))
+	*physical_index_out = physical_index;
+	return CLUSTER_RECOVERY_GRAPH_MORE;
+}
+
+ClusterRecoveryGraphResult
+cluster_cold_typed_tt_redo_graph_read_v1(void *arg, const ClusterRecoveryTxnKey *key, UBA address,
+										 ClusterRecoveryUndoRecord *out, uint32 *generation)
+{
+	const ClusterColdTtRedoGraphInputV1 *input = arg;
+	ClusterRecoveryGraphResult result;
+	uint32 physical_index;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (generation != NULL)
+		*generation = 0;
+	if (input == NULL || input->typed == NULL || key == NULL || out == NULL || generation == NULL)
+		return CLUSTER_RECOVERY_GRAPH_INVALID;
+	result
+		= cold_tt_redo_graph_match(input->typed, input->participant, key, address, &physical_index);
+	if (result != CLUSTER_RECOVERY_GRAPH_MORE)
 		return result;
+	if (!cluster_cold_typed_undo_redo_record_v1(input->typed, input->participant, physical_index,
+												address, out, generation))
+		return CLUSTER_RECOVERY_GRAPH_INVALID;
 	result = cluster_recovery_tx_record_check(key, address, out, *generation);
 	if (result == CLUSTER_RECOVERY_GRAPH_MORE)
 		return CLUSTER_RECOVERY_GRAPH_RECORD;
@@ -347,26 +361,54 @@ cluster_cold_typed_tt_redo_graph_read_v1(void *arg, const ClusterRecoveryTxnKey 
 }
 
 ClusterRecoveryGraphResult
-cluster_cold_typed_tt_redo_graph_begin_v1(ClusterColdTtRedoGraphInputV1 *input,
-										  size_t memory_budget, ClusterRecoveryReferenceGraph **out)
+cluster_cold_typed_tt_base_redo_graph_read_v1(void *arg, const ClusterRecoveryTxnKey *key,
+											  UBA address, ClusterRecoveryUndoRecord *out,
+											  uint32 *generation)
 {
-	const ClusterColdTypedV1 *typed;
+	ClusterColdTtBaseRedoGraphInputV1 *input = arg;
+	ClusterRecoveryGraphResult result;
+	uint32 physical_index;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (generation != NULL)
+		*generation = 0;
+	if (input == NULL || input->typed == NULL || key == NULL || out == NULL || generation == NULL)
+		return CLUSTER_RECOVERY_GRAPH_INVALID;
+	result
+		= cold_tt_redo_graph_match(input->typed, input->participant, key, address, &physical_index);
+	if (result != CLUSTER_RECOVERY_GRAPH_MORE)
+		return result;
+	if (!cluster_cold_typed_undo_base_redo_record_v1(input->typed, input->participant,
+													 physical_index, address, out, generation))
+		return CLUSTER_RECOVERY_GRAPH_INVALID;
+	result = cluster_recovery_tx_record_check(key, address, out, *generation);
+	if (result == CLUSTER_RECOVERY_GRAPH_MORE)
+		return CLUSTER_RECOVERY_GRAPH_RECORD;
+	memset(out, 0, sizeof(*out));
+	*generation = 0;
+	return result;
+}
+
+static ClusterRecoveryGraphResult
+cold_tt_redo_graph_begin(const ClusterColdTypedV1 *typed, uint32 participant,
+						 ClusterRecoveryGraphRead read, void *input, size_t memory_budget,
+						 ClusterRecoveryReferenceGraph **out)
+{
 	ClusterRecoveryReferenceGraph *graph = NULL;
 	ClusterRecoveryGraphResult result;
 	bool unused_header_work;
 
 	if (out != NULL)
 		*out = NULL;
-	if (out == NULL || input == NULL || input->typed == NULL)
+	if (out == NULL || typed == NULL)
 		return CLUSTER_RECOVERY_GRAPH_INVALID;
-	typed = input->typed;
 	/* The source must be valid even when its owner has no TT files. */
 	if (!cluster_cold_tt_base_namespace_matches_v1(typed, typed->system_identifier,
 												   typed->observer.database_incarnation)
-		|| !cold_tt_redo_source(typed, input->participant, 0, 0, &unused_header_work))
+		|| !cold_tt_redo_source(typed, participant, 0, 0, &unused_header_work))
 		return CLUSTER_RECOVERY_GRAPH_IDENTITY;
-	result = cluster_recovery_reference_graph_begin(
-		memory_budget, cluster_cold_typed_tt_redo_graph_read_v1, input, &graph);
+	result = cluster_recovery_reference_graph_begin(memory_budget, read, input, &graph);
 	if (result != CLUSTER_RECOVERY_GRAPH_MORE)
 		return result;
 	for (uint32 i = 0; i < cluster_cold_tt_base_count_v1(typed); i++) {
@@ -377,9 +419,9 @@ cluster_cold_typed_tt_redo_graph_begin_v1(ClusterColdTtRedoGraphInputV1 *input,
 
 		if (cluster_cold_tt_base_header_v1(typed, i, &owner, &segment) == NULL)
 			goto identity_failure;
-		if (owner != typed->participants[input->participant].thread_id)
+		if (owner != typed->participants[participant].thread_id)
 			continue;
-		if (!cluster_cold_typed_tt_redo_header_v1(typed, input->participant, i, &image))
+		if (!cluster_cold_typed_tt_redo_header_v1(typed, participant, i, &image))
 			goto identity_failure;
 		header = (const UndoSegmentHeaderData *)image.page.data;
 		for (uint16 offset = 0; offset < TT_SLOTS_PER_SEGMENT; offset++) {
@@ -411,4 +453,23 @@ identity_failure:
 failure:
 	cluster_recovery_reference_graph_destroy(graph);
 	return result;
+}
+
+ClusterRecoveryGraphResult
+cluster_cold_typed_tt_redo_graph_begin_v1(ClusterColdTtRedoGraphInputV1 *input,
+										  size_t memory_budget, ClusterRecoveryReferenceGraph **out)
+{
+	return cold_tt_redo_graph_begin(
+		input == NULL ? NULL : input->typed, input == NULL ? 0 : input->participant,
+		cluster_cold_typed_tt_redo_graph_read_v1, input, memory_budget, out);
+}
+
+ClusterRecoveryGraphResult
+cluster_cold_typed_tt_base_redo_graph_begin_v1(ClusterColdTtBaseRedoGraphInputV1 *input,
+											   size_t memory_budget,
+											   ClusterRecoveryReferenceGraph **out)
+{
+	return cold_tt_redo_graph_begin(
+		input == NULL ? NULL : input->typed, input == NULL ? 0 : input->participant,
+		cluster_cold_typed_tt_base_redo_graph_read_v1, input, memory_budget, out);
 }
