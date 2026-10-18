@@ -2168,6 +2168,105 @@ UT_TEST(test_foreign_native_xact_requires_bound_source_identity)
 		}
 }
 
+UT_TEST(test_native_completion_rejects_invalid_stats_kinds_before_routing)
+{
+	const PgStat_Kind invalid[]
+		= { PGSTAT_KIND_INVALID,  (PgStat_Kind)-1,			PGSTAT_KIND_ARCHIVER,
+			PGSTAT_KIND_BGWRITER, PGSTAT_KIND_CHECKPOINTER, PGSTAT_KIND_IO,
+			PGSTAT_KIND_SLRU,	  PGSTAT_KIND_WAL,			(PgStat_Kind)(PGSTAT_KIND_LAST + 1),
+			(PgStat_Kind)INT_MAX };
+
+	for (int commit = 0; commit <= 1; commit++)
+		for (int foreign = 0; foreign <= 1; foreign++)
+			for (uint32 i = 0; i < lengthof(invalid); i++)
+				for (int item = 0; item < 2; item++) {
+					EffectRecord r;
+					ClusterColdDecodedV1 out = { 0 };
+					xl_xact_stats_item stats;
+					uint32 xinfo = XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_DROPPED_STATS;
+					Size offset = (commit ? MinSizeOfXactCommit : MinSizeOfXactAbort)
+								  + sizeof(xl_xact_xinfo) + MinSizeOfXactStatsItems
+								  + item * sizeof(stats);
+
+					if (commit)
+						xinfo |= XACT_XINFO_HAS_TT_COMMIT;
+					completion(&r, commit, xinfo);
+					memcpy(&stats, r.data.bytes + offset, sizeof(stats));
+					stats.kind = invalid[i];
+					memcpy(r.data.bytes + offset, &stats, sizeof(stats));
+					UT_ASSERT_EQ(
+						cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, foreign, &out),
+						CLUSTER_COLD_COMPONENT_INVALID);
+					UT_ASSERT_EQ(out.effects.required, 0);
+					UT_ASSERT_EQ(out.effects.native_apply | out.effects.page_apply
+									 | out.effects.space_apply | out.effects.no_effect
+									 | out.effects.refused,
+								 0);
+				}
+}
+
+UT_TEST(test_native_completion_preserves_variable_stats_kinds)
+{
+	const xl_xact_stats_item items[]
+		= { { .kind = PGSTAT_KIND_DATABASE, .dboid = 5, .objoid = InvalidOid },
+			{ .kind = PGSTAT_KIND_RELATION, .dboid = 5, .objoid = 123 },
+			{ .kind = PGSTAT_KIND_FUNCTION, .dboid = 5, .objoid = 123 },
+			{ .kind = PGSTAT_KIND_REPLSLOT, .dboid = InvalidOid, .objoid = 123 },
+			{ .kind = PGSTAT_KIND_SUBSCRIPTION, .dboid = InvalidOid, .objoid = 123 } };
+
+	for (int commit = 0; commit <= 1; commit++)
+		for (uint32 i = 0; i < lengthof(items); i++) {
+			EffectRecord r;
+			ClusterColdDecodedV1 out = { 0 };
+			uint8 original[sizeof(r.data.bytes)];
+			uint32 xinfo = XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_DROPPED_STATS;
+			Size offset = (commit ? MinSizeOfXactCommit : MinSizeOfXactAbort)
+						  + sizeof(xl_xact_xinfo) + MinSizeOfXactStatsItems;
+
+			if (commit)
+				xinfo |= XACT_XINFO_HAS_TT_COMMIT;
+			completion(&r, commit, xinfo);
+			memcpy(r.data.bytes + offset, &items[i], sizeof(items[i]));
+			memcpy(original, r.data.bytes, r.decoded.main_data_len);
+			UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+						 CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(out.record.record_flags, 0);
+			UT_ASSERT((out.effects.required & CLUSTER_COLD_EFFECT_STATS) != 0);
+			UT_ASSERT_EQ(out.effects.native_apply, out.effects.required);
+			UT_ASSERT_EQ(out.effects.refused | out.effects.no_effect, 0);
+			UT_ASSERT(partitioned(&out.effects));
+			UT_ASSERT_EQ(memcmp(original, r.data.bytes, r.decoded.main_data_len), 0);
+		}
+}
+
+UT_TEST(test_native_stats_kind_validation_does_not_expand_foreign_owner)
+{
+	const PgStat_Kind kinds[]
+		= { PGSTAT_KIND_DATABASE, PGSTAT_KIND_REPLSLOT, PGSTAT_KIND_SUBSCRIPTION };
+
+	for (int commit = 0; commit <= 1; commit++)
+		for (uint32 i = 0; i < lengthof(kinds); i++) {
+			EffectRecord r;
+			ClusterColdDecodedV1 out = { 0 };
+			xl_xact_stats_item stats = { .kind = kinds[i], .dboid = 5, .objoid = 123 };
+			uint32 xinfo = XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_DROPPED_STATS;
+			Size offset = (commit ? MinSizeOfXactCommit : MinSizeOfXactAbort)
+						  + sizeof(xl_xact_xinfo) + MinSizeOfXactStatsItems;
+
+			if (commit)
+				xinfo |= XACT_XINFO_HAS_TT_COMMIT;
+			completion(&r, commit, xinfo);
+			memcpy(r.data.bytes + offset, &stats, sizeof(stats));
+			UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+						 CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+			UT_ASSERT_EQ(out.effects.refused, out.effects.required);
+			UT_ASSERT_EQ(out.effects.native_apply | out.effects.no_effect, 0);
+			UT_ASSERT(partitioned(&out.effects));
+			UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+		}
+}
+
 UT_TEST(test_foreign_native_abort_rejects_commit_flags_and_unknown_stats)
 {
 	EffectRecord r;
@@ -2185,10 +2284,11 @@ UT_TEST(test_foreign_native_abort_rejects_commit_flags_and_unknown_stats)
 	completion(&r, false, XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_DROPPED_STATS);
 	memcpy(r.data.bytes + stats_offset, invalid, sizeof(invalid));
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
-				 CLUSTER_COLD_OK);
-	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
-	UT_ASSERT_EQ(out.effects.refused, out.effects.required);
-	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+				 CLUSTER_COLD_COMPONENT_INVALID);
+	UT_ASSERT_EQ(out.effects.required, 0);
+	UT_ASSERT_EQ(out.effects.native_apply | out.effects.page_apply | out.effects.space_apply
+					 | out.effects.no_effect | out.effects.refused,
+				 0);
 }
 
 UT_TEST(test_foreign_native_xact_origin_effect_has_no_consumer)
@@ -2625,7 +2725,7 @@ UT_TEST(test_original_startup_dependency_leaves_non_c0_with_existing_dispatch)
 int
 main(void)
 {
-	UT_PLAN(69);
+	UT_PLAN(72);
 	UT_RUN(test_smgr_native_carriers_keep_existing_effect_owners);
 	UT_RUN(test_smgr_create_rejects_incomplete_or_nonproducer_carriers);
 	UT_RUN(test_smgr_truncate_rejects_incomplete_or_nonproducer_carriers);
@@ -2640,6 +2740,9 @@ main(void)
 	UT_RUN(test_foreign_ctrc_release_requires_original_complete_carrier);
 	UT_RUN(test_foreign_native_abort_keeps_complete_record_effects);
 	UT_RUN(test_foreign_native_xact_requires_bound_source_identity);
+	UT_RUN(test_native_completion_rejects_invalid_stats_kinds_before_routing);
+	UT_RUN(test_native_completion_preserves_variable_stats_kinds);
+	UT_RUN(test_native_stats_kind_validation_does_not_expand_foreign_owner);
 	UT_RUN(test_foreign_native_abort_rejects_commit_flags_and_unknown_stats);
 	UT_RUN(test_foreign_native_xact_origin_effect_has_no_consumer);
 	UT_RUN(test_foreign_native_abort_unsupported_effects_are_not_consumers);

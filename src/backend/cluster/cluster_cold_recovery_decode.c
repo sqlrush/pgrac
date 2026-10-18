@@ -54,6 +54,7 @@
 #include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/storage/cluster_undo_xlog.h"
+#include "pgstat.h"
 #include "replication/message.h"
 #include "replication/origin.h"
 #include "storage/standbydefs.h"
@@ -215,6 +216,25 @@ cold_completion_effects(uint32 xinfo, int children, int relations, int stats, in
 	return effects;
 }
 
+/* Native transactional drops address variable-numbered pgstat objects.
+ * Bound each kind before any native/history route: the original consumer
+ * does not reject an unknown kind.  Keep its full variable-kind domain;
+ * the foreign SIDE consumer has its own narrower ownership checks. */
+static bool
+cold_completion_stats_valid(int count, const xl_xact_stats_item *items)
+{
+	if (count < 0 || (count != 0 && items == NULL))
+		return false;
+	for (int i = 0; i < count; i++) {
+		xl_xact_stats_item item;
+
+		memcpy(&item, &items[i], sizeof(item));
+		if (item.kind < PGSTAT_KIND_FIRST_VALID || item.kind >= PGSTAT_KIND_ARCHIVER)
+			return false;
+	}
+	return true;
+}
+
 /*
  * A commit's relation drops become SPACE effects; the native commit redo
  * still owns the files.  Relations dropped by an abort have no SPACE
@@ -238,6 +258,8 @@ cold_xact_flags(XLogReaderState *reader, uint64 system_identifier, const uint8 s
 		 * child identity check even when no optional SIDE plan is captured. */
 		if (!rf_side_xact_children_preflight_v1(XLogRecGetXid(reader), parsed.nsubxacts,
 												parsed.subxacts))
+			return CLUSTER_COLD_COMPONENT_INVALID;
+		if (!cold_completion_stats_valid(parsed.nstats, parsed.stats))
 			return CLUSTER_COLD_COMPONENT_INVALID;
 		/* Native parsing bounds the delta but does not validate its version.
 		 * An unknown delta must not reach the original exact-slot writer. */
@@ -272,6 +294,8 @@ cold_xact_flags(XLogReaderState *reader, uint64 system_identifier, const uint8 s
 		ParseAbortRecord(info, (xl_xact_abort *)XLogRecGetData(reader), &parsed);
 		if (!rf_side_xact_children_preflight_v1(XLogRecGetXid(reader), parsed.nsubxacts,
 												parsed.subxacts))
+			return CLUSTER_COLD_COMPONENT_INVALID;
+		if (!cold_completion_stats_valid(parsed.nstats, parsed.stats))
 			return CLUSTER_COLD_COMPONENT_INVALID;
 		*flags = parsed.nrels > 0 ? CLUSTER_COLD_RECORD_STRUCTURAL : 0;
 		*effects |= cold_completion_effects(parsed.xinfo, parsed.nsubxacts, parsed.nrels,
