@@ -863,6 +863,8 @@ typedef struct ClusterColdTtSlotInputV1 {
 
 /* Re-enumerate physical TT after complete redo and the original durability
  * barrier, without overwriting the pre-redo base. Share its remaining budget.
+ * Retain post-redo images of UNDO blocks already cached in the original base;
+ * recheck them against disk along with the post-redo headers.
  * The original cold owner must revalidate all sources around capture/readback.
  * These raw bytes grant no checkpoint, top, loser, FullXid or C0 authority. */
 extern ClusterColdDetailV1 cluster_cold_tt_after_redo_capture_v1(ClusterColdTypedV1 *typed);

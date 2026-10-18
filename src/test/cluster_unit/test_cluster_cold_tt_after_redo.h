@@ -3,6 +3,117 @@
  * post-redo images. File writes model completed redo; no top/loser proof.
  * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md
  */
+static void
+after_redo_write_block(uint32 segment, uint32 block, const PGAlignedBlock *bytes)
+{
+	char path[MAXPGPATH];
+	int fd;
+
+	file_path(segment, path);
+	fd = open(path, O_RDWR);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(pwrite(fd, bytes->data, BLCKSZ, (off_t)block * BLCKSZ), BLCKSZ);
+	UT_ASSERT_EQ(close(fd), 0);
+}
+
+static void
+after_redo_cached_blocks(ClusterColdTypedV1 *typed, PGAlignedBlock *original)
+{
+	UndoSegmentHeaderData header = header_for(1, 1);
+	uint32 generation;
+
+	fixture(typed);
+	typed->system_identifier = typed->observer.database_incarnation = 1;
+	write_header(1, &header, true);
+	write_record_block(1, 1, 3, false);
+	write_record_block(1, 1, 7, false);
+	UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(typed, INPUT_BUDGET), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_tt_base_block_v1(typed, 0, 3, original, &generation));
+	UT_ASSERT(cluster_cold_tt_base_block_v1(typed, 0, 7, original, &generation));
+}
+
+UT_TEST(test_after_redo_retains_changed_undo_blocks_separately)
+{
+	ClusterColdTypedV1 typed;
+	PGAlignedBlock original, changed;
+	UndoSegmentHeaderData header;
+	uint32 count = 0;
+
+	after_redo_cached_blocks(&typed, &original);
+	changed = original;
+	changed.data[BLCKSZ - 1] ^= 0x55;
+	after_redo_write_block(1, 7, &changed);
+	header = *(const UndoSegmentHeaderData *)typed.tt_base->first->block.data;
+	header.tt_slots[0].status = TT_SLOT_COMMITTED;
+	write_header(1, &header, false);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&typed), CLUSTER_COLD_OK);
+	for (const ColdTtBlockV1 *block = typed.tt_after_redo->blocks; block; block = block->next) {
+		UT_ASSERT(block->file == typed.tt_after_redo->first);
+		UT_ASSERT(block->block == 3 || block->block == 7);
+		UT_ASSERT_EQ(
+			memcmp(block->bytes.data,
+				   block->block == 7 ? changed.data : typed.tt_base->blocks->next->bytes.data,
+				   BLCKSZ),
+			0);
+		count++;
+	}
+	UT_ASSERT_EQ(count, 2);
+	UT_ASSERT_EQ(memcmp(typed.tt_base->blocks->bytes.data, original.data, BLCKSZ), 0);
+	UT_ASSERT(typed.tt_base->used + typed.tt_after_redo->used <= typed.tt_base->budget);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_recheck_v1(&typed), CLUSTER_COLD_OK);
+	cluster_cold_tt_base_destroy_v1(&typed);
+	UT_ASSERT_EQ(allocations, 0);
+}
+
+UT_TEST(test_after_redo_undo_only_drift_invalidates_post_input)
+{
+	for (uint32 block = 3; block <= 7; block += 4) {
+		ClusterColdTypedV1 typed;
+		PGAlignedBlock original, changed;
+		uint32 generation;
+
+		after_redo_cached_blocks(&typed, &original);
+		UT_ASSERT(cluster_cold_tt_base_block_v1(&typed, 0, block, &original, &generation));
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&typed), CLUSTER_COLD_OK);
+		changed = original;
+		changed.data[BLCKSZ - 1] ^= 0x55;
+		after_redo_write_block(1, block, &changed);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_recheck_v1(&typed), CLUSTER_COLD_SOURCE_GAP);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_count_v1(&typed), 0);
+		UT_ASSERT_EQ(cluster_cold_tt_base_count_v1(&typed), 1);
+		after_redo_write_block(1, block, &original);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_recheck_v1(&typed), CLUSTER_COLD_SOURCE_GAP);
+		cluster_cold_tt_base_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_after_redo_undo_capture_failure_discards_partial_post_input)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		ClusterColdTypedV1 typed;
+		PGAlignedBlock original;
+
+		after_redo_cached_blocks(&typed, &original);
+		if (fault == 0)
+			read_fault = 4; /* Block-zero reads still succeed. */
+		else if (fault == 1)
+			typed.tt_base->budget = typed.tt_base->used + sizeof(ClusterColdTtBaseV1)
+									+ sizeof(ColdTtInputV1) + 2 * sizeof(ColdTtBlockV1) - 1;
+		else
+			alloc_fail = alloc_calls + 4; /* Post container, header, first block, then OOM. */
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&typed),
+					 fault == 0	  ? CLUSTER_COLD_SOURCE_GAP
+					 : fault == 1 ? CLUSTER_COLD_CAPACITY
+								  : CLUSTER_COLD_OOM);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_count_v1(&typed), 0);
+		UT_ASSERT(typed.tt_after_redo->blocks == NULL);
+		UT_ASSERT_EQ(typed.tt_after_redo->count, 0);
+		UT_ASSERT_EQ(cluster_cold_tt_base_count_v1(&typed), 1);
+		cluster_cold_tt_base_destroy_v1(&typed);
+		UT_ASSERT_EQ(allocations, 0);
+	}
+}
+
 UT_TEST(test_after_redo_reads_changed_slots_without_overwriting_original_base)
 {
 	ClusterColdTypedV1 typed;

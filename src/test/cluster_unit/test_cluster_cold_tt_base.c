@@ -1392,8 +1392,11 @@ UT_TEST(test_graph_invalid_arguments_clear_available_outputs)
 int
 main(void)
 {
-	UT_PLAN(42);
+	UT_PLAN(45);
 	UT_RUN(test_after_redo_reads_changed_slots_without_overwriting_original_base);
+	UT_RUN(test_after_redo_retains_changed_undo_blocks_separately);
+	UT_RUN(test_after_redo_undo_only_drift_invalidates_post_input);
+	UT_RUN(test_after_redo_undo_capture_failure_discards_partial_post_input);
 	UT_RUN(test_after_redo_reenumerates_created_removed_and_history_origin_segments);
 	UT_RUN(test_after_redo_readback_drift_is_sticky_and_keeps_original_input);
 	UT_RUN(test_after_redo_shares_original_tt_budget_and_discards_partial_capture);

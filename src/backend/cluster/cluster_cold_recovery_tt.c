@@ -398,6 +398,8 @@ ClusterColdDetailV1
 cluster_cold_tt_after_redo_capture_v1(ClusterColdTypedV1 *typed)
 {
 	const ClusterColdTtBaseV1 *base;
+	ClusterColdTtBaseV1 *after;
+	ClusterColdDetailV1 detail;
 
 	/* The caller temporarily marks the attempt incomplete while checking all
 	 * original sources. Namespace and pre-redo input must remain intact. */
@@ -408,7 +410,48 @@ cluster_cold_tt_after_redo_capture_v1(ClusterColdTypedV1 *typed)
 		return CLUSTER_COLD_STATE;
 	if (base->used > base->budget)
 		return CLUSTER_COLD_CAPACITY;
-	return cold_tt_capture(typed, base->budget - base->used, &typed->tt_after_redo);
+	detail = cold_tt_capture(typed, base->budget - base->used, &typed->tt_after_redo);
+	if (detail != CLUSTER_COLD_OK)
+		return detail;
+	after = typed->tt_after_redo;
+	after->captured = false;
+	after->detail = CLUSTER_COLD_SOURCE_GAP;
+	/* Retain a separate post-redo image of each already cached UNDO block.
+	 * Bind it to the new header and file identity; preserve the preimage. */
+	for (const ColdTtBlockV1 *before = base->blocks; before != NULL; before = before->next) {
+		const ColdTtInputV1 *file;
+		ColdTtBlockV1 *saved;
+
+		for (file = after->first; file != NULL; file = file->next)
+			if (file->owner == before->file->owner && file->segment == before->file->segment)
+				break;
+		if (file == NULL)
+			goto refused;
+		if (sizeof(*saved) > after->budget - after->used) {
+			after->detail = CLUSTER_COLD_CAPACITY;
+			goto refused;
+		}
+		saved = palloc_extended(sizeof(*saved), MCXT_ALLOC_NO_OOM);
+		if (saved == NULL) {
+			after->detail = CLUSTER_COLD_OOM;
+			goto refused;
+		}
+		if (!cold_tt_read_data(file, before->block, saved->bytes.data)) {
+			pfree(saved);
+			goto refused;
+		}
+		saved->file = file;
+		saved->block = before->block;
+		saved->next = after->blocks;
+		after->blocks = saved;
+		after->used += sizeof(*saved);
+	}
+	after->captured = true;
+	after->detail = CLUSTER_COLD_OK;
+	return CLUSTER_COLD_OK;
+refused:
+	cold_tt_clear(after);
+	return after->detail;
 }
 
 ClusterColdDetailV1
