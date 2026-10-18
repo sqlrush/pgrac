@@ -328,6 +328,16 @@ extern bool rf_side_online_plan_space_terminal_v1(const RfSideOnlinePlanV1 *plan
 												  const ClusterSpaceIdentityKey *key,
 												  BlockNumber block, RfSideSpaceTerminalV1 *out);
 
+/* Classify the terminal current CREATE/ADVANCE prefix in the original sealed
+ * recovery plan. UINT32_MAX in both outputs means no native ABORT closes it;
+ * otherwise select the exact original ABORT and its first matching native
+ * pending-delete ordinal (duplicates share that binding). Refusal preserves
+ * outputs. This is an immutable input lookup, never proof of execution,
+ * durable deletion, file absence, source authority or replay completion. */
+extern bool rf_side_online_plan_space_abort_v1(const RfSideOnlinePlanV1 *plan,
+											   uint32 space_operation, uint32 *abort_operation,
+											   uint32 *abort_relation);
+
 typedef struct RfSideSpaceIncarnationEndV1 {
 	uint32 operation;
 	ClusterSpaceStructureChange change;

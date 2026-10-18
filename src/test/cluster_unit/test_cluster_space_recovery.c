@@ -3011,7 +3011,7 @@ UT_TEST(test_cold_drop_already_is_read_only_even_with_source_sync_fault)
 /* Complete native records and the original sealed SIDE plan, with only
  * ROOT/retention/buffer/storage I/O replaced by this file's normal fixture. */
 static uint32
-abort_create_plan(bool advance)
+abort_create_plan_mode(bool advance, bool with_abort, bool after_abort)
 {
 	RfSideOnlinePlanRequestV1 request = { .system_identifier = 17,
 										  .physical_cuts = cuts,
@@ -3080,13 +3080,13 @@ abort_create_plan(bool advance)
 			   abort_second_target && r == 1 ? &other_native.rlocator : &key.locator,
 			   sizeof(key.locator));
 	memcpy(abort_bytes + offset, &scn, sizeof(scn));
-	for (uint32 i = 0; i <= abort_index + 1; i++) {
+	for (uint32 i = 0; i <= abort_index + (after_abort ? 2 : 1); i++) {
 		XLogReaderState reader = { 0 };
 		DecodedXLogRecord decoded = { 0 };
 		RfDetachedRecordPlanV1 record = { 0 };
 		RfPageOnlineRecordIdentityV1 identity = operations[0].identity;
-		bool terminal = i == abort_index;
-		bool other = i > abort_index;
+		bool terminal = i == abort_index && with_abort;
+		bool other = i > abort_index && !(after_abort && i == abort_index + 1);
 
 		identity.record.read_rec_ptr = 100 + 20 * i;
 		identity.record.end_rec_ptr = identity.record.read_rec_ptr + 20;
@@ -3110,8 +3110,14 @@ abort_create_plan(bool advance)
 			decoded.main_data = i == first_other ? (char *)&other_native : (char *)other_typed;
 			decoded.main_data_len = i == first_other ? sizeof(other_native) : sizeof(other_typed);
 		}
-		if (terminal)
+		if ((!after_abort && i == abort_index) || (after_abort && i == abort_index + 1))
 			identity.record.end_rec_ptr = 200;
+		if (i == abort_index && !with_abort) {
+			identity.record.rmid = RM_XLOG_ID;
+			identity.record.info = XLOG_NEXTOID;
+			decoded.main_data = (char *)&next_oid;
+			decoded.main_data_len = sizeof(next_oid);
+		}
 		if (other) {
 			identity = operations[1].identity;
 			identity.record.rmid = RM_XLOG_ID;
@@ -3145,6 +3151,12 @@ abort_create_plan(bool advance)
 	UT_ASSERT(rf_side_online_plan_bind_database_v1(side, 42));
 	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(side), RF_PAGE_PROOF_DETAIL_OK);
 	return abort_index;
+}
+
+static uint32
+abort_create_plan(bool advance)
+{
+	return abort_create_plan_mode(advance, true, false);
 }
 
 static bool
@@ -3228,6 +3240,130 @@ abort_before(void *arg, const RfSideOnlinePlanV1 *plan, uint32 index)
 	if (abort_finish_fault == 4)
 		pg_re_throw();
 	return abort_finish_fault != 1;
+}
+
+UT_TEST(test_space_final_abort_selects_original_terminal_prefix)
+{
+	for (int advance = 0; advance < 2; advance++) {
+		uint32 operation = 19, relation_index = 23;
+		uint32 index;
+
+		create_input(0);
+		index = abort_create_plan(advance);
+		/* The original plan is sufficient for this input lookup even before
+		 * replay installs SPACE or the native consumer deletes anything. */
+		UT_ASSERT(
+			rf_side_online_plan_space_abort_v1(side, advance ? 2 : 1, &operation, &relation_index));
+		UT_ASSERT_EQ(operation, index);
+		UT_ASSERT_EQ(relation_index, 0);
+		UT_ASSERT_EQ(writes + creates + extensions + abort_deletes + abort_directory_syncs, 0);
+		UT_ASSERT(!pins && !locks && !hw_held);
+	}
+}
+
+UT_TEST(test_space_final_abort_keeps_distinct_native_pending_ordinals)
+{
+	uint32 index = abort_create_installed_targets(false, true);
+
+	for (uint32 target = 0; target < 2; target++) {
+		uint32 operation = 19, relation_index = 23;
+
+		UT_ASSERT(
+			rf_side_online_plan_space_abort_v1(side, target ? 3 : 1, &operation, &relation_index));
+		UT_ASSERT_EQ(operation, index);
+		UT_ASSERT_EQ(relation_index, target);
+	}
+	UT_ASSERT_EQ(abort_deletes + abort_directory_syncs, 0);
+}
+
+UT_TEST(test_space_final_abort_without_native_terminal_has_no_delete_binding)
+{
+	for (int advance = 0; advance < 2; advance++) {
+		uint32 operation = 19, relation_index = 23;
+
+		create_input(0);
+		(void)abort_create_plan_mode(advance, false, false);
+		UT_ASSERT(
+			rf_side_online_plan_space_abort_v1(side, advance ? 2 : 1, &operation, &relation_index));
+		UT_ASSERT_EQ(operation, UINT32_MAX);
+		UT_ASSERT_EQ(relation_index, UINT32_MAX);
+		UT_ASSERT_EQ(writes + creates + extensions + abort_deletes + abort_directory_syncs, 0);
+	}
+}
+
+UT_TEST(test_space_final_abort_refusal_preserves_outputs)
+{
+	uint32 index = abort_create_installed(true);
+	uint32 invalid[] = { 0, 1, index, index + 1, UINT32_MAX };
+	uint32 operation = 19, relation_index = 23;
+
+	for (uint32 i = 0; i < lengthof(invalid); i++) {
+		UT_ASSERT(
+			!rf_side_online_plan_space_abort_v1(side, invalid[i], &operation, &relation_index));
+		UT_ASSERT_EQ(operation, 19);
+		UT_ASSERT_EQ(relation_index, 23);
+	}
+	UT_ASSERT(!rf_side_online_plan_space_abort_v1(NULL, 2, &operation, &relation_index));
+	UT_ASSERT(!rf_side_online_plan_space_abort_v1(side, 2, NULL, &relation_index));
+	UT_ASSERT(!rf_side_online_plan_space_abort_v1(side, 2, &operation, NULL));
+	UT_ASSERT(!rf_side_online_plan_space_abort_v1(side, 2, &operation, &operation));
+	UT_ASSERT_EQ(operation, 19);
+	UT_ASSERT_EQ(relation_index, 23);
+	UT_ASSERT_EQ(abort_deletes + abort_directory_syncs, 0);
+}
+
+UT_TEST(test_space_final_abort_lookup_cannot_authorize_absence_retry)
+{
+	uint32 index = abort_create_installed(true);
+	uint32 operation = 19, relation_index = 23;
+	unsigned prior_writes, prior_syncs;
+
+	UT_ASSERT(cluster_space_recovery_cold_abort_delete_v1(side, index));
+	UT_ASSERT(!exists && main_exists && smgrnblocks(&relation, MAIN_FORKNUM) == 0);
+	prior_writes = writes;
+	prior_syncs = create_source_syncs;
+	UT_ASSERT(rf_side_online_plan_space_abort_v1(side, 2, &operation, &relation_index));
+	UT_ASSERT_EQ(operation, index);
+	UT_ASSERT_EQ(relation_index, 0);
+	/* An immutable binding survives deletion; it cannot let the original
+	 * consumer retry from missing SPACE or manufacture durable completion. */
+	UT_ASSERT(!cluster_space_recovery_cold_abort_delete_v1(side, index));
+	UT_ASSERT_EQ(abort_deletes, 1);
+	UT_ASSERT_EQ(abort_directory_syncs, 1);
+	UT_ASSERT_EQ(writes, prior_writes);
+	UT_ASSERT_EQ(create_source_syncs, prior_syncs);
+	UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+}
+
+UT_TEST(test_space_final_abort_refuses_prefix_advanced_after_native_abort)
+{
+	uint32 operation = 19, relation_index = 23;
+
+	create_input(0);
+	(void)abort_create_plan_mode(false, true, true);
+	UT_ASSERT(!rf_side_online_plan_space_abort_v1(side, 3, &operation, &relation_index));
+	UT_ASSERT_EQ(operation, 19);
+	UT_ASSERT_EQ(relation_index, 23);
+	UT_ASSERT_EQ(writes + creates + extensions + abort_deletes + abort_directory_syncs, 0);
+}
+
+UT_TEST(test_space_final_abort_does_not_promote_history_to_current_input)
+{
+	for (int advance = 0; advance < 2; advance++) {
+		uint32 operation = 19, relation_index = 23;
+		RfSideOnlineOperationV1 creation;
+
+		create_input(0);
+		native_redo[0] = 140;
+		(void)abort_create_plan(advance);
+		UT_ASSERT(rf_side_online_plan_operation_v1(side, 1, &creation));
+		UT_ASSERT(creation.history_only);
+		UT_ASSERT(!rf_side_online_plan_space_abort_v1(side, advance ? 2 : 1, &operation,
+													  &relation_index));
+		UT_ASSERT_EQ(operation, 19);
+		UT_ASSERT_EQ(relation_index, 23);
+		UT_ASSERT_EQ(writes + creates + extensions + abort_deletes + abort_directory_syncs, 0);
+	}
 }
 
 UT_TEST(test_cold_abort_before_hook_precedes_unlink_under_original_owner)
@@ -3864,7 +4000,14 @@ UT_TEST(test_cold_abort_preflight_io_error_unwinds_original_owner_for_retry)
 int
 main(void)
 {
-	UT_PLAN(83);
+	UT_PLAN(90);
+	UT_RUN(test_space_final_abort_selects_original_terminal_prefix);
+	UT_RUN(test_space_final_abort_keeps_distinct_native_pending_ordinals);
+	UT_RUN(test_space_final_abort_without_native_terminal_has_no_delete_binding);
+	UT_RUN(test_space_final_abort_refusal_preserves_outputs);
+	UT_RUN(test_space_final_abort_lookup_cannot_authorize_absence_retry);
+	UT_RUN(test_space_final_abort_refuses_prefix_advanced_after_native_abort);
+	UT_RUN(test_space_final_abort_does_not_promote_history_to_current_input);
 	UT_RUN(test_cold_abort_consumed_space_requires_original_prefix_before_retry);
 	UT_RUN(test_cold_abort_original_prefix_partial_write_cannot_complete_delete);
 	UT_RUN(test_cold_abort_replayed_prefix_refuses_missing_main_or_foreign_space);
