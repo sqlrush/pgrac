@@ -111,7 +111,8 @@ cluster_tt_slot_recyclable(uint8 cts_status, SCN commit_scn, SCN horizon)
  *	In peer mode, every terminal slot additionally requires the exact durable
  *	CTRC release bit.  COMMITTED retains its valid folded-horizon gate; ABORTED
  *	requires no invented time horizon.  Unknown/illegal flags or status shapes
- *	retain the whole segment.
+ *	retain the whole segment.  Both modes retain ACTIVE slots, unknown status
+ *	and terminal slots without a valid transaction identity.
  */
 bool
 cluster_undo_segment_recyclable_for_mode(const struct UndoSegmentHeaderData *hdr, SCN horizon,
@@ -143,6 +144,27 @@ cluster_undo_segment_recyclable_for_mode(const struct UndoSegmentHeaderData *hdr
 		if (!SCN_VALID(seal) || !SCN_VALID(drain) || !SCN_VALID(horizon)
 			|| scn_time_cmp(drain, seal) < 0 || scn_time_cmp(drain, horizon) >= 0)
 			return false;
+	}
+
+	/* Segment state does not prove that every bound transaction has ended.
+	 * In particular, ACTIVE precedes its first undo write and must retain the
+	 * segment even when record seal/drain and the other slots permit reuse. */
+	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		const TTSlot *s = &hdr->tt_slots[i];
+
+		switch (s->status) {
+		case TT_SLOT_COMMITTED:
+		case TT_SLOT_ABORTED:
+			if (!TransactionIdIsNormal(s->xid) || s->wrap == TT_WRAP_INVALID)
+				return false;
+			break;
+		case TT_SLOT_UNUSED:
+		case TT_SLOT_RECYCLABLE:
+			break;
+		case TT_SLOT_ACTIVE:
+		default:
+			return false;
+		}
 	}
 
 	if (peer_mode) {
@@ -203,7 +225,7 @@ cluster_undo_segment_recyclable_for_mode(const struct UndoSegmentHeaderData *hdr
 }
 
 
-/* Preserve the existing single-node C7 API and behavior. */
+/* Single-node C7 policy with the common live-slot and identity protection. */
 bool
 cluster_undo_segment_recyclable(const struct UndoSegmentHeaderData *hdr, SCN horizon)
 {

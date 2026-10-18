@@ -104,6 +104,8 @@ init_header(UndoSegmentHeaderData *hdr, uint8 state)
 static void
 set_committed_slot(UndoSegmentHeaderData *hdr, int idx, SCN commit_scn)
 {
+	hdr->tt_slots[idx].xid = FirstNormalTransactionId + idx;
+	hdr->tt_slots[idx].wrap = TT_WRAP_INITIAL;
 	hdr->tt_slots[idx].status = TT_SLOT_COMMITTED;
 	hdr->tt_slots[idx].commit_scn = commit_scn;
 }
@@ -217,6 +219,8 @@ UT_TEST(test_u5_peer_mode_segment_with_aborted_slot_retained)
 	UndoSegmentHeaderData hdr;
 
 	init_header(&hdr, SEGMENT_COMMITTED);
+	hdr.tt_slots[0].xid = (TransactionId)100;
+	hdr.tt_slots[0].wrap = TT_WRAP_INITIAL;
 	hdr.tt_slots[0].status = TT_SLOT_ABORTED;
 
 	/* Preserve the single-node C7 policy while peer mode retains the exact
@@ -267,9 +271,100 @@ UT_TEST(test_u5_segment_committed_invalid_commit_scn_retained)
 	/* rule 8.A: a COMMITTED-status on-disk slot with InvalidScn commit_scn
 	 * (partial write) cannot be resolved -> retain the whole segment. */
 	init_header(&hdr, SEGMENT_COMMITTED);
-	hdr.tt_slots[0].status = TT_SLOT_COMMITTED;
-	hdr.tt_slots[0].commit_scn = InvalidScn;
+	set_committed_slot(&hdr, 0, InvalidScn);
 	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable(&hdr, mk_scn(10)), 0);
+}
+
+UT_TEST(test_segment_active_without_undo_retained_in_every_slot)
+{
+	UndoSegmentHeaderData hdr;
+	int slot;
+	int peer;
+
+	for (slot = 0; slot < TT_SLOTS_PER_SEGMENT; slot++) {
+		init_header(&hdr, SEGMENT_COMMITTED);
+		hdr.tt_slots[slot].xid = FirstNormalTransactionId + slot;
+		hdr.tt_slots[slot].wrap = TT_WRAP_INITIAL;
+		hdr.tt_slots[slot].status = TT_SLOT_ACTIVE;
+		/* Binding precedes the first undo write; an empty anchor is not idle. */
+		UT_ASSERT(UBA_is_invalid(hdr.tt_slots[slot].first_undo_block));
+		for (peer = 0; peer < 2; peer++)
+			UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(&hdr, mk_scn(10),
+																	 peer != 0),
+						 0);
+	}
+}
+
+UT_TEST(test_segment_active_retained_despite_other_release_proofs)
+{
+	UndoSegmentHeaderData hdr;
+	int peer;
+
+	init_header(&hdr, SEGMENT_COMMITTED);
+	set_committed_slot(&hdr, 0, mk_scn(7));
+	hdr.tt_slots[0].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+	hdr.tail_block = 1;
+	UndoSegmentHeader_set_record_seal_upper_scn(&hdr, mk_scn(5));
+	hdr.commit_horizon_scn = mk_scn(6);
+	for (peer = 0; peer < 2; peer++)
+		UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(&hdr, mk_scn(10), peer != 0), 1);
+
+	hdr.tt_slots[TT_SLOTS_PER_SEGMENT - 1].xid = (TransactionId)100;
+	hdr.tt_slots[TT_SLOTS_PER_SEGMENT - 1].status = TT_SLOT_ACTIVE;
+	for (peer = 0; peer < 2; peer++)
+		UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(&hdr, mk_scn(10), peer != 0), 0);
+}
+
+UT_TEST(test_segment_unknown_slot_status_retained_in_both_modes)
+{
+	const uint8 statuses[] = { TT_SLOT_RECYCLABLE + 1, UINT8_C(0x80), TT_SLOT_INVALID };
+	UndoSegmentHeaderData hdr;
+	unsigned int i;
+	int peer;
+
+	for (i = 0; i < lengthof(statuses); i++) {
+		init_header(&hdr, SEGMENT_COMMITTED);
+		hdr.tt_slots[TT_SLOTS_PER_SEGMENT - 1].status = statuses[i];
+		for (peer = 0; peer < 2; peer++)
+			UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(&hdr, mk_scn(10),
+																		 peer != 0),
+						 0);
+	}
+}
+
+UT_TEST(test_segment_terminal_identity_required_in_both_modes)
+{
+	const uint8 statuses[] = { TT_SLOT_COMMITTED, TT_SLOT_ABORTED };
+	const TransactionId xids[] = { InvalidTransactionId, BootstrapTransactionId,
+								   FrozenTransactionId, FirstNormalTransactionId };
+	const uint16 wraps[] = { TT_WRAP_INITIAL, TT_WRAP_MAX, TT_WRAP_INVALID };
+	UndoSegmentHeaderData hdr;
+	unsigned int status;
+	unsigned int xid;
+	unsigned int wrap;
+	int peer;
+
+	for (status = 0; status < lengthof(statuses); status++) {
+		for (xid = 0; xid < lengthof(xids); xid++) {
+			for (wrap = 0; wrap < lengthof(wraps); wrap++) {
+				bool expected = xids[xid] == FirstNormalTransactionId
+								&& wraps[wrap] != TT_WRAP_INVALID;
+				TTSlot *slot;
+
+				init_header(&hdr, SEGMENT_COMMITTED);
+				slot = &hdr.tt_slots[TT_SLOTS_PER_SEGMENT - 1];
+				slot->xid = xids[xid];
+				slot->wrap = wraps[wrap];
+				slot->status = statuses[status];
+				slot->flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+				slot->commit_scn = slot->status == TT_SLOT_COMMITTED ? mk_scn(7) : InvalidScn;
+				for (peer = 0; peer < 2; peer++)
+					UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(&hdr, mk_scn(10),
+																				 peer != 0),
+								 (int)expected);
+			}
+		}
+	}
 }
 
 UT_TEST(test_u8_segment_invalid_horizon_retained)
@@ -624,6 +719,10 @@ main(void)
 	UT_RUN(test_u5_peer_mode_segment_with_aborted_slot_retained);
 	UT_RUN(test_u5_peer_mode_segment_requires_release_for_every_terminal_slot);
 	UT_RUN(test_u5_segment_committed_invalid_commit_scn_retained);
+	UT_RUN(test_segment_active_without_undo_retained_in_every_slot);
+	UT_RUN(test_segment_active_retained_despite_other_release_proofs);
+	UT_RUN(test_segment_unknown_slot_status_retained_in_both_modes);
+	UT_RUN(test_segment_terminal_identity_required_in_both_modes);
 	UT_RUN(test_u8_segment_invalid_horizon_retained);
 	UT_RUN(test_u10_segment_non_committed_state_never_recyclable);
 	UT_RUN(test_u10_segment_null_header_not_recyclable);
