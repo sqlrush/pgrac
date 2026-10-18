@@ -22,6 +22,7 @@
 
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_recovery_undo_scan.h"
+#include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/storage/cluster_shared_fs.h"
@@ -61,6 +62,9 @@ typedef struct ClusterColdTtBaseV1 {
 	ClusterColdDetailV1 detail;
 	bool captured;
 } ClusterColdTtBaseV1;
+
+static const ColdTtBlockV1 *cold_tt_undo_block(const ClusterColdTypedV1 *typed, bool after_redo,
+											   uint32 segment, uint32 blockno, bool fresh);
 
 typedef enum ColdTtReadV1 { COLD_TT_ABSENT, COLD_TT_PRESENT, COLD_TT_UNREADABLE } ColdTtReadV1;
 
@@ -483,10 +487,18 @@ cluster_cold_tt_after_redo_namespace_matches_v1(const ClusterColdTypedV1 *typed)
 		   && cold_tt_namespace_matches(typed, typed->tt_after_redo);
 }
 
+static bool
+cold_tt_block_write(const RfSideOnlineOperationV1 *operation)
+{
+	return operation->kind == RF_SIDE_ONLINE_OPERATION_UNDO
+		   && (operation->undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
+			   || operation->undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI);
+}
+
 bool
 cluster_cold_tt_after_redo_undo_matches_v1(const ClusterColdTypedV1 *typed)
 {
-	Size originals = 0, posts = 0;
+	Size originals = 0, uncached = 0, posts = 0;
 
 	if (!cluster_cold_tt_after_redo_namespace_matches_v1(typed) || typed->replay_count == 0
 		|| typed->replay_count > typed->participant_count)
@@ -519,10 +531,65 @@ cluster_cold_tt_after_redo_undo_matches_v1(const ClusterColdTypedV1 *typed)
 			return false;
 		originals++;
 	}
+	/* A replayed write is an effect even when no TT chain read cached its
+	 * predecessor. Only the original native FPI fold can supply those expected
+	 * bytes; observed DATA must never become its own missing predecessor. */
+	for (uint32 p = 0; p < typed->replay_count; p++) {
+		const RfSideOnlinePlanV1 *plan = typed->side_plans[p];
+		uint32 count = rf_side_online_plan_operation_count_v1(plan);
+
+		if (count == UINT32_MAX)
+			return false;
+		for (uint32 i = 0; i < count; i++) {
+			RfSideOnlineOperationV1 operation;
+			const ColdTtBlockV1 *before, *after;
+			RfSideUndoBlockImageV1 expected;
+			bool duplicate = false;
+
+			if (!rf_side_online_plan_operation_v1(plan, i, &operation))
+				return false;
+			if (operation.history_only || !cold_tt_block_write(&operation))
+				continue;
+			if (operation.undo.instance != typed->participants[p].thread_id)
+				return false;
+			for (before = typed->tt_base->blocks; before != NULL; before = before->next)
+				if (before->file->owner == operation.undo.instance
+					&& before->file->segment == operation.undo.segment_id
+					&& before->block == operation.undo.block_no)
+					break;
+			if (before != NULL)
+				continue; /* Already compared with its retained original above. */
+			for (uint32 j = 0; j < i; j++) {
+				RfSideOnlineOperationV1 prior;
+
+				if (!rf_side_online_plan_operation_v1(plan, j, &prior))
+					return false;
+				if (!prior.history_only && cold_tt_block_write(&prior)
+					&& prior.undo.instance == operation.undo.instance
+					&& prior.undo.segment_id == operation.undo.segment_id
+					&& prior.undo.block_no == operation.undo.block_no) {
+					duplicate = true;
+					break;
+				}
+			}
+			if (duplicate)
+				continue;
+			if (rf_side_online_plan_prepare_undo_block_v1(plan, operation.undo.instance,
+														  operation.undo.segment_id,
+														  operation.undo.block_no, &expected)
+				!= RF_PAGE_PROOF_DETAIL_OK)
+				return false;
+			after = cold_tt_undo_block(typed, true, operation.undo.segment_id,
+									   operation.undo.block_no, true);
+			if (after == NULL || memcmp(after->bytes.data, expected.page.data, BLCKSZ) != 0)
+				return false;
+			uncached++;
+		}
+	}
 	for (const ColdTtBlockV1 *after = typed->tt_after_redo->blocks; after != NULL;
 		 after = after->next)
 		posts++;
-	return originals == posts;
+	return originals + uncached == posts;
 }
 
 const UndoSegmentHeaderData *
@@ -656,16 +723,18 @@ cluster_cold_tt_base_match_v1(const ClusterColdTypedV1 *typed,
 }
 
 static const ColdTtBlockV1 *
-cold_tt_undo_block(ClusterColdTypedV1 *typed, uint32 segment, uint32 blockno, bool fresh)
+cold_tt_undo_block(const ClusterColdTypedV1 *typed, bool after_redo, uint32 segment, uint32 blockno,
+				   bool fresh)
 {
 	ClusterColdTtBaseV1 *base;
 	const ColdTtInputV1 *file;
 	ColdTtBlockV1 *block, *allocated = NULL;
 	bool owners[COLD_TT_MAX_ORIGINS + 1];
 
-	if (typed == NULL || typed->tt_base == NULL)
+	if (typed == NULL || typed->tt_base == NULL
+		|| (after_redo && !cluster_cold_tt_after_redo_namespace_matches_v1(typed)))
 		return NULL;
-	base = typed->tt_base;
+	base = after_redo ? typed->tt_after_redo : typed->tt_base;
 	if (!base->captured || base->detail != CLUSTER_COLD_OK)
 		return NULL;
 	base->detail = CLUSTER_COLD_SOURCE_GAP;
@@ -683,13 +752,14 @@ cold_tt_undo_block(ClusterColdTypedV1 *typed, uint32 segment, uint32 blockno, bo
 			break;
 	if (block == NULL) {
 		Size remaining = base->used <= base->budget ? base->budget - base->used : 0;
+		Size shared = typed->tt_base->used <= typed->tt_base->budget
+						  ? typed->tt_base->budget - typed->tt_base->used
+						  : 0;
 
-		/* Later raw UNDO reads share the same budget with the post-redo TT. */
+		/* Both captures and later UNDO reads share the original one budget. */
 		if (typed->tt_after_redo != NULL)
-			remaining = typed->tt_after_redo->used <= remaining
-							? remaining - typed->tt_after_redo->used
-							: 0;
-		if (sizeof(*block) > remaining) {
+			shared = typed->tt_after_redo->used <= shared ? shared - typed->tt_after_redo->used : 0;
+		if (sizeof(*block) > remaining || sizeof(*block) > shared) {
 			base->detail = CLUSTER_COLD_CAPACITY;
 			return NULL;
 		}
@@ -749,7 +819,7 @@ cluster_cold_tt_base_block_v1(ClusterColdTypedV1 *typed, uint32 segment_index, u
 		typed->tt_base->detail = CLUSTER_COLD_SOURCE_GAP;
 		return false;
 	}
-	block = cold_tt_undo_block(typed, segment, blockno, true);
+	block = cold_tt_undo_block(typed, false, segment, blockno, true);
 	if (block == NULL)
 		return false;
 	*out = block->bytes;
@@ -777,7 +847,7 @@ cold_tt_undo_record(ClusterColdTypedV1 *typed, UBA address, ClusterRecoveryUndoR
 			typed->tt_base->detail = CLUSTER_COLD_SOURCE_GAP;
 		return false;
 	}
-	block = cold_tt_undo_block(typed, segment, blockno, fresh);
+	block = cold_tt_undo_block(typed, false, segment, blockno, fresh);
 	if (block == NULL)
 		return false;
 	if (cluster_recovery_undo_record_read(block->bytes.data, BLCKSZ, segment, blockno,

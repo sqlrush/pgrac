@@ -964,7 +964,9 @@ extern bool cluster_cold_typed_tt_after_redo_readback_v1(const ClusterColdTypedV
  * target. Current origins use the sealed native fold; history-only origins
  * must retain their original full header bytes and are never replayed here.
  * Every already-cached UNDO data block also needs the exact native after
- * image, including unchanged bytes and history-only blocks.
+ * image, including unchanged bytes and history-only blocks. Every actual
+ * current WAL block-write target absent from that cache needs the complete
+ * native FPI fold and a separate retained post image; no observed-base fallback.
  * This read-only comparison grants no checkpoint/base, history-effect, top,
  * loser or C0 authority. Original source isolation and final rechecks remain
  * the caller's obligations; no completion flag is stored. */

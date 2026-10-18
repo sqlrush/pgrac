@@ -53,7 +53,7 @@ typedef struct TtRedoFixture {
 } TtRedoFixture;
 
 static void
-tt_redo_fixture(TtRedoFixture *f, XLogRecPtr end, RfSidePlanPurposeV1 purpose)
+tt_redo_fixture_at(TtRedoFixture *f, XLogRecPtr end, RfSidePlanPurposeV1 purpose, XLogRecPtr redo)
 {
 	RfSideOnlinePlanRequestV1 request = { 0 };
 	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)f->base.data;
@@ -89,7 +89,7 @@ tt_redo_fixture(TtRedoFixture *f, XLogRecPtr end, RfSidePlanPurposeV1 purpose)
 														   .timeline = 7,
 														   .owner_incarnation = 33,
 														   .physical_lower = 100,
-														   .native_redo = 100,
+														   .native_redo = redo,
 														   .tail_end = end };
 	f->typed.participants[1] = (ClusterColdParticipantV1){ .thread_id = 2,
 														   .timeline = 7,
@@ -134,6 +134,12 @@ tt_redo_fixture(TtRedoFixture *f, XLogRecPtr end, RfSidePlanPurposeV1 purpose)
 				 RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT(rf_side_online_plan_bind_sources_v1(f->typed.side_plans[0], f->typed.sources, 2));
 	UT_ASSERT(rf_side_online_plan_bind_database_v1(f->typed.side_plans[0], 42));
+}
+
+static void
+tt_redo_fixture(TtRedoFixture *f, XLogRecPtr end, RfSidePlanPurposeV1 purpose)
+{
+	tt_redo_fixture_at(f, end, purpose, 100);
 }
 
 static void
@@ -876,8 +882,8 @@ tt_redo_record_page(PGAlignedBlock *page, TransactionId xid)
 }
 
 static void
-tt_redo_feed_record_page(TtRedoFixture *f, XLogRecPtr begin, const PGAlignedBlock *page,
-						 bool full_image)
+tt_redo_feed_record_page_at(TtRedoFixture *f, XLogRecPtr begin, uint32 segment, uint32 block,
+							const PGAlignedBlock *page, bool full_image)
 {
 	FakeXactRecord fake;
 	xl_undo_block_write carrier = { 0 };
@@ -885,8 +891,8 @@ tt_redo_feed_record_page(TtRedoFixture *f, XLogRecPtr begin, const PGAlignedBloc
 	uint32 length = sizeof(carrier);
 
 	carrier.instance = 3;
-	carrier.segment_id = 513;
-	carrier.block_no = 9;
+	carrier.segment_id = segment;
+	carrier.block_no = block;
 	carrier.has_fpi = full_image;
 	if (full_image) {
 		memcpy(bytes + length, page->data, BLCKSZ);
@@ -908,6 +914,13 @@ tt_redo_feed_record_page(TtRedoFixture *f, XLogRecPtr begin, const PGAlignedBloc
 	memcpy(bytes, &carrier, sizeof(carrier));
 	make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE, bytes, length);
 	undo_header_feed(f->typed.side_plans[0], &fake, begin);
+}
+
+static void
+tt_redo_feed_record_page(TtRedoFixture *f, XLogRecPtr begin, const PGAlignedBlock *page,
+						 bool full_image)
+{
+	tt_redo_feed_record_page_at(f, begin, 513, 9, page, full_image);
 }
 
 static void
@@ -3353,10 +3366,191 @@ UT_TEST(tt_inventory_undo_refuses_unusable_base_or_missing_post_pair)
 	}
 }
 
+static void
+tt_undo_uncached_expected(TtRedoFixture *f, uint32 segment, uint32 block, PGAlignedBlock *expected)
+{
+	RfSideUndoBlockImageV1 image;
+
+	UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_block_v1(f->typed.side_plans[0], 3, segment,
+														   block, &image),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	*expected = image.page;
+}
+
+UT_TEST(tt_inventory_undo_retains_uncached_fpi_target_once)
+{
+	TtRedoFixture f;
+	PGAlignedBlock page, expected;
+	Size used;
+
+	tt_redo_fixture(&f, 300, RF_SIDE_PLAN_RECOVERY);
+	tt_redo_record_page(&page, 900);
+	tt_redo_feed_record_page(&f, 100, &page, true);
+	tt_redo_record_page(&page, 901);
+	tt_redo_feed_record_page(&f, 200, &page, false);
+	tt_redo_seal(&f);
+	tt_undo_uncached_expected(&f, 513, 9, &expected);
+	tt_undo_readback_write(513, 9, &expected);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+	UT_ASSERT(f.typed.tt_base->blocks == NULL);
+	UT_ASSERT_NOT_NULL(f.typed.tt_after_redo->blocks);
+	if (f.typed.tt_after_redo->blocks == NULL) {
+		tt_redo_destroy(&f);
+		return;
+	}
+	UT_ASSERT(f.typed.tt_after_redo->blocks->next == NULL);
+	UT_ASSERT(memcmp(f.typed.tt_after_redo->blocks->bytes.data, expected.data, BLCKSZ) == 0);
+	used = f.typed.tt_after_redo->used;
+	UT_ASSERT(cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+	UT_ASSERT_EQ(f.typed.tt_after_redo->used, used);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_recheck_v1(&f.typed), CLUSTER_COLD_OK);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_inventory_undo_refuses_uncached_missing_or_corrupt_fpi_effects)
+{
+	for (int fault = 0; fault < 4; fault++) {
+		TtRedoFixture f;
+		PGAlignedBlock page, expected;
+
+		tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+		tt_redo_record_page(&page, 900);
+		tt_redo_feed_record_page(&f, 100, &page, true);
+		tt_redo_seal(&f);
+		tt_undo_uncached_expected(&f, 513, 9, &expected);
+		if (fault == 0)
+			memset(expected.data, 0, BLCKSZ);
+		else if (fault == 1)
+			expected = page; /* Original FPI bytes lack the native redo LSN. */
+		else
+			expected.data[fault == 2 ? sizeof(UndoBlockHeader) : BLCKSZ - 1] ^= 1;
+		tt_undo_readback_write(513, 9, &expected);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+		UT_ASSERT(f.typed.tt_base->blocks == NULL);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_inventory_undo_refuses_uncached_delta_before_any_fpi)
+{
+	for (int later_fpi = 0; later_fpi < 2; later_fpi++) {
+		TtRedoFixture f;
+		PGAlignedBlock base, page, expected;
+		RfSideOnlineOperationV1 operation;
+
+		tt_redo_fixture(&f, later_fpi ? 300 : 200, RF_SIDE_PLAN_RECOVERY);
+		tt_redo_record_page(&base, 802);
+		((UndoBlockHeader *)base.data)->block_lsn = 90;
+		tt_redo_record_page(&page, 900);
+		tt_redo_feed_record_page(&f, 100, &page, false);
+		if (later_fpi)
+			tt_redo_feed_record_page(&f, 200, &page, true);
+		tt_redo_seal(&f);
+		UT_ASSERT(rf_side_online_plan_operation_v1(f.typed.side_plans[0], later_fpi, &operation));
+		UT_ASSERT(cluster_undo_prepare_block_v1(
+			&operation.undo, operation.owned_payload, operation.owned_payload_length,
+			operation.identity.record.end_rec_ptr, later_fpi ? NULL : base.data, expected.data));
+		tt_undo_readback_write(513, 9, &expected);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_inventory_undo_checks_uncached_targets_in_every_segment)
+{
+	for (int fault = -1; fault < 2; fault++) {
+		TtRedoFixture f;
+		PGAlignedBlock extra, page, expected;
+
+		tt_redo_fixture(&f, 300, RF_SIDE_PLAN_RECOVERY);
+		tt_inventory_extra(514, 3, &extra);
+		tt_redo_seed_recapture(&f);
+		tt_redo_record_page(&page, 900);
+		tt_redo_feed_record_page_at(&f, 100, 513, 9, &page, true);
+		tt_redo_feed_record_page_at(&f, 200, 514, 10, &page, true);
+		tt_redo_seal(&f);
+		for (int i = 0; i < 2; i++) {
+			tt_undo_uncached_expected(&f, 513 + i, 9 + i, &expected);
+			if (fault == i)
+				expected.data[BLCKSZ - 1] ^= 1;
+			tt_undo_readback_write(513 + i, 9 + i, &expected);
+		}
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(cluster_cold_typed_tt_redo_inventory_v1(&f.typed) == (fault == -1));
+		tt_inventory_remove(514);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_inventory_undo_history_is_not_an_actual_target_but_can_anchor_native_fold)
+{
+	for (int replayed = 0; replayed < 2; replayed++) {
+		TtRedoFixture f;
+		PGAlignedBlock page, expected;
+		RfSideOnlineOperationV1 operation;
+
+		tt_redo_fixture_at(&f, replayed ? 300 : 200, RF_SIDE_PLAN_RECOVERY, 200);
+		tt_redo_record_page(&page, 900);
+		tt_redo_feed_record_page(&f, 100, &page, true);
+		if (replayed)
+			tt_redo_feed_record_page(&f, 200, &page, false);
+		tt_redo_seal(&f);
+		UT_ASSERT(rf_side_online_plan_operation_v1(f.typed.side_plans[0], 0, &operation));
+		UT_ASSERT(operation.history_only);
+		if (replayed) {
+			tt_undo_uncached_expected(&f, 513, 9, &expected);
+			tt_undo_readback_write(513, 9, &expected);
+		}
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+		UT_ASSERT((f.typed.tt_after_redo->blocks != NULL) == (replayed != 0));
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_inventory_undo_uncached_readback_preserves_budget_and_sticky_reread_failure)
+{
+	for (int capacity = 0; capacity < 2; capacity++) {
+		TtRedoFixture f;
+		PGAlignedBlock page, expected;
+
+		tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+		tt_redo_record_page(&page, 900);
+		tt_redo_feed_record_page(&f, 100, &page, true);
+		tt_redo_seal(&f);
+		tt_undo_uncached_expected(&f, 513, 9, &expected);
+		tt_undo_readback_write(513, 9, &expected);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		if (capacity) {
+			f.typed.tt_after_redo->budget = f.typed.tt_after_redo->used;
+			UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+			UT_ASSERT(f.typed.tt_after_redo->blocks == NULL);
+		} else {
+			UT_ASSERT(cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+			page = expected;
+			page.data[BLCKSZ - 1] ^= 1;
+			tt_undo_readback_write(513, 9, &page);
+			UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+			tt_undo_readback_write(513, 9, &expected);
+			UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+		}
+		tt_redo_destroy(&f);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(83);
+	UT_PLAN(89);
+	UT_RUN(tt_inventory_undo_retains_uncached_fpi_target_once);
+	UT_RUN(tt_inventory_undo_refuses_uncached_missing_or_corrupt_fpi_effects);
+	UT_RUN(tt_inventory_undo_refuses_uncached_delta_before_any_fpi);
+	UT_RUN(tt_inventory_undo_checks_uncached_targets_in_every_segment);
+	UT_RUN(tt_inventory_undo_history_is_not_an_actual_target_but_can_anchor_native_fold);
+	UT_RUN(tt_inventory_undo_uncached_readback_preserves_budget_and_sticky_reread_failure);
 	UT_RUN(tt_inventory_undo_matches_native_delta_and_fpi_without_changing_base);
 	UT_RUN(tt_inventory_undo_refuses_missing_redo_and_any_post_block_byte_mismatch);
 	UT_RUN(tt_inventory_undo_checks_all_cached_current_and_history_blocks);

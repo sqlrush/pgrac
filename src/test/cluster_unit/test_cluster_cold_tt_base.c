@@ -19,6 +19,7 @@
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_recovery_reference_graph.h"
 #include "cluster/cluster_recovery_undo_scan.h"
+#include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/storage/cluster_shared_fs.h"
 #include "cluster/storage/cluster_undo_alloc.h"
@@ -128,6 +129,38 @@ cluster_cold_typed_undo_base_redo_block_v1(const ClusterColdTypedV1 *typed, uint
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
 	return false;
+}
+
+uint32
+rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan)
+{
+	(void)plan;
+	return UINT32_MAX;
+}
+
+bool
+rf_side_online_plan_operation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+								 RfSideOnlineOperationV1 *out_operation)
+{
+	(void)plan;
+	(void)index;
+	if (out_operation != NULL)
+		memset(out_operation, 0, sizeof(*out_operation));
+	return false;
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_block_v1(const RfSideOnlinePlanV1 *plan, uint8 instance,
+										  uint32 segment_id, uint32 block_no,
+										  RfSideUndoBlockImageV1 *out)
+{
+	(void)plan;
+	(void)instance;
+	(void)segment_id;
+	(void)block_no;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 }
 
 #undef pg_pread
