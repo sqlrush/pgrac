@@ -1,16 +1,18 @@
 # Catalog diagnostics
 
-`cluster.catalog_trace_relation` logs visibility and descriptor inputs for one relation OID. It is a superuser session setting. The default `0` disables logging; accepted values are 0 through 2147483647.
+`cluster.trace_visibility_relids` is a superuser session setting containing a comma-separated list of relation OIDs. The default empty string disables tracing. It accepts up to 64 distinct OIDs from 1 through 4294967295; duplicate OIDs are ignored and invalid lists are rejected. The list is parsed and cached on assignment. Disabled diagnostic hooks only test the cached enable flag.
 
-Find the table OID before reproducing an operation, then set its numeric OID:
+Find the table OID and include the catalogs involved in the operation:
 
 ```sql
 SELECT 'my_table'::regclass::oid;
-SET cluster.catalog_trace_relation = 16385;
--- Run the operation in this session.
-RESET cluster.catalog_trace_relation;
+SET cluster.trace_visibility_relids = '1259,1249,1247,16385';
+-- Replace 16385 with the table OID returned above, then reproduce the operation.
+RESET cluster.trace_visibility_relids;
 ```
 
-Server LOG records use `PGRAC_CATALOG_TRACE`. Visibility records carry a per-process `call` number; combine it with the server-log process ID. Records include matching pg_class and pg_attribute rows, raw command IDs, snapshot command IDs, selected ITL and CR fields, return source locations, descriptor bounds and default type inputs. Decoded command IDs are recorded when the visibility code evaluates them.
+1259, 1249 and 1247 select pg_class, pg_attribute and pg_type. Selecting a table also selects its pg_class and pg_attribute rows.
 
-Tracing does not change visibility decisions. Enable it only for a focused diagnostic session because it can produce many log records.
+Server LOG records use `PGRAC_CATALOG_TRACE`. Combine the process ID with the per-process `call` number. `input_kind` distinguishes a live tuple from an already reconstructed FULL scratch input. Records include actual return locations, raw/combo command IDs, snapshot curcid, selected ITL origin/generation, catalog versions, descriptor bounds and default column/type inputs. An effective xmax is marked unknown until the original visibility code has determined it; tracing performs no additional MultiXact lookup.
+
+The setting preserves visibility verdicts. Enable it for a focused diagnostic session because selected catalog scans can produce many log records.

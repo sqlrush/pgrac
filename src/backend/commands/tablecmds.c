@@ -7307,7 +7307,7 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 
 	CatalogTupleUpdate(pgclass, &reltup->t_self, reltup);
 #ifdef USE_PGRAC_CLUSTER
-	if (unlikely(cluster_catalog_trace_relation != 0))
+	if (unlikely(cluster_trace_visibility_enabled))
 		cluster_catalog_trace_catalog("alter.pg_class_update", myrelid, reltup,
 									  GetCurrentCommandId(false));
 #endif
@@ -7323,7 +7323,7 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	/* Make the attribute's catalog entry visible */
 	CommandCounterIncrement();
 #ifdef USE_PGRAC_CLUSTER
-	if (unlikely(cluster_catalog_trace_relation != 0))
+	if (unlikely(cluster_trace_visibility_enabled))
 		cluster_catalog_trace_descriptor("alter.after_cci", rel, newattnum,
 										 GetCurrentCommandId(false));
 #endif

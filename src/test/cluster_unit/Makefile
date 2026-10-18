@@ -9414,8 +9414,8 @@ test_cluster_bgwriter_snapshot_cut.inc: $(top_srcdir)/src/backend/postmaster/bgw
 test_cluster_pi_writeback: test_cluster_bgwriter_snapshot_cut.inc
 
 # Passive logger linked with native fixtures; all legacy fixtures default off.
-cluster_catalog_trace_test.o: $(top_srcdir)/src/backend/cluster/cluster_catalog_trace.c $(top_srcdir)/src/include/cluster/cluster_catalog_trace.h
+cluster_catalog_trace_test.o: $(top_srcdir)/src/backend/cluster/cluster_catalog_trace.c $(top_srcdir)/src/include/cluster/cluster_catalog_trace.h $(top_srcdir)/src/include/cluster/cluster_visibility_trace_filter.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
-test_cluster_catalog_trace: test_cluster_catalog_trace.c cluster_catalog_trace_test.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< cluster_catalog_trace_test.o -o $@
+test_cluster_catalog_trace: test_cluster_catalog_trace.c cluster_catalog_trace_test.o $(CLUSTER_UBA_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< cluster_catalog_trace_test.o $(CLUSTER_UBA_O) -o $@

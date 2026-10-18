@@ -35,6 +35,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_visibility_trace_filter.h"
 
 #include <limits.h>
 #include <sys/stat.h>
@@ -114,7 +115,9 @@ int cluster_recovery_merge_wait_timeout = 10000;
 bool cluster_xnode_profile_enabled = false;
 /* Diagnostic per-storage-UPDATE phase trace; default OFF. */
 bool cluster_update_trace_enabled = false;
-int cluster_catalog_trace_relation = 0;
+char *cluster_trace_visibility_relids = NULL;
+bool cluster_trace_visibility_enabled = false;
+ClusterVisibilityTraceFilter cluster_trace_visibility_filter = { 0 };
 /* spec-6.4: ADG physical standby / read-only service knobs. */
 int cluster_dg_role = CLUSTER_DG_ROLE_PRIMARY;
 int cluster_dg_mode = CLUSTER_DG_MODE_ASYNC;
@@ -1085,6 +1088,24 @@ check_cluster_sinval_ack_mode(int *newval, void **extra, GucSource source)
 }
 
 static bool
+check_trace_visibility_relids(char **newval, void **extra pg_attribute_unused(),
+							  GucSource source pg_attribute_unused())
+{
+	ClusterVisibilityTraceFilter parsed;
+	return cluster_visibility_trace_parse(*newval, &parsed);
+}
+
+static void
+assign_trace_visibility_relids(const char *newval, void *extra pg_attribute_unused())
+{
+	ClusterVisibilityTraceFilter parsed;
+	if (!cluster_visibility_trace_parse(newval, &parsed))
+		return;
+	cluster_trace_visibility_filter = parsed;
+	cluster_trace_visibility_enabled = parsed.count != 0;
+}
+
+static bool
 check_cluster_shared_catalog(bool *newval, void **extra, GucSource source)
 {
 	if (*newval && cluster_sinval_ack_mode == CLUSTER_SINVAL_ACK_MODE_NONE) {
@@ -1706,11 +1727,12 @@ cluster_init_guc(void)
 		gettext_noop("A full diagnostic capture drops new records, never overwrites."),
 		&cluster_update_trace_enabled, false, PGC_SUSET, 0, NULL, NULL, NULL);
 
-	DefineCustomIntVariable(
-		"cluster.catalog_trace_relation",
-		gettext_noop("Trace catalog visibility and descriptors for one relation OID."),
-		gettext_noop("Zero disables diagnostic logging."), &cluster_catalog_trace_relation, 0, 0,
-		INT_MAX, PGC_SUSET, 0, NULL, NULL, NULL);
+	DefineCustomStringVariable(
+		"cluster.trace_visibility_relids",
+		gettext_noop("Trace visibility and descriptors for a comma-separated relation OID list."),
+		gettext_noop("An empty list disables diagnostic logging; at most 64 distinct OIDs."),
+		&cluster_trace_visibility_relids, "", PGC_SUSET, 0, check_trace_visibility_relids,
+		assign_trace_visibility_relids, NULL);
 
 	/*
 	 * spec-6.4 ADG role and read-only service knobs.  Defaults keep existing

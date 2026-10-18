@@ -3726,7 +3726,7 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 	bool remote_materialized = false;
 	int32 remote_origin = -1;
 
-	if (unlikely(cluster_catalog_trace_relation != 0))
+	if (unlikely(cluster_trace_visibility_enabled))
 		cluster_catalog_trace_event("legacy_cr.entry", "gate_enabled", cluster_cr_mvcc_gate);
 
 	/*
@@ -3743,7 +3743,7 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 		CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_NOT_APPLICABLE);
 
 	page = BufferGetPage(buffer);
-	if (unlikely(cluster_catalog_trace_relation != 0)) {
+	if (unlikely(cluster_trace_visibility_enabled)) {
 		cluster_catalog_trace_event("legacy_cr.page", "has_itl", PageHasItl(page));
 		cluster_catalog_trace_event("legacy_cr.page", "block_scn",
 									((PageHeader)page)->pd_block_scn);
@@ -3769,7 +3769,7 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 		CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_NOT_APPLICABLE);
 
 	slot = &ClusterPageGetItlSlots(page)[itl_idx];
-	if (unlikely(cluster_catalog_trace_relation != 0))
+	if (unlikely(cluster_trace_visibility_enabled))
 		cluster_catalog_trace_slot("legacy_cr.selected", slot);
 
 	/* This shortcut derives creator authority from the selected DATA slot.
@@ -3938,7 +3938,7 @@ cluster_cr_verdict_on_image(const char *cr_page, OffsetNumber offnum,
 		CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_DECIDED);
 	}
 
-	if (unlikely(cluster_catalog_trace_relation != 0))
+	if (unlikely(cluster_trace_visibility_enabled))
 		cluster_catalog_trace_header("legacy_cr.image", cr_htup.t_data, snapshot);
 
 	/*
@@ -4029,6 +4029,9 @@ cluster_cr_verdict_on_image(const char *cr_page, OffsetNumber offnum,
 			cr_xmax = HeapTupleGetUpdateXid(cr_tup);
 		else
 			cr_xmax = HeapTupleHeaderGetRawXmax(cr_tup);
+		if (unlikely(cluster_trace_visibility_enabled))
+			cluster_catalog_trace_event("legacy_cr.image", "effective_xmax", cr_xmax);
+
 
 		if (!TransactionIdIsValid(cr_xmax)) {
 			/* lockers-only multi: no update xid -> never a delete. */
@@ -4081,7 +4084,7 @@ cluster_cr_verdict_on_image(const char *cr_page, OffsetNumber offnum,
 		/* Own-instance authoritative classification of the deleting xact
 		 * (tier-3: chain UBA origin == self, so the raw xid is alias-free). */
 		else if (TransactionIdIsCurrentTransactionId(cr_xmax)) {
-			if (unlikely(cluster_catalog_trace_relation != 0))
+			if (unlikely(cluster_trace_visibility_enabled))
 				cluster_catalog_trace_event("legacy_cr.xmax", "self", cr_xmax);
 			/* our own delete (native handles self) */
 			*out_visible = true;

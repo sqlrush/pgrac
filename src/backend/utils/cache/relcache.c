@@ -388,7 +388,7 @@ ScanPgRelation(Oid targetRelId, bool indexOK, bool force_non_historic)
 
 	pg_class_tuple = systable_getnext(pg_class_scan);
 #ifdef USE_PGRAC_CLUSTER
-	if (unlikely(cluster_catalog_trace_relation != 0))
+	if (unlikely(cluster_trace_visibility_enabled))
 		cluster_catalog_trace_catalog("relcache.pg_class", targetRelId, pg_class_tuple,
 									  GetCurrentCommandId(false));
 #endif
@@ -587,7 +587,7 @@ RelationBuildTupleDesc(Relation relation)
 
 		attnum = attp->attnum;
 #ifdef USE_PGRAC_CLUSTER
-		if (unlikely(cluster_catalog_trace_relation != 0)) {
+		if (unlikely(cluster_trace_visibility_enabled)) {
 			cluster_catalog_trace_catalog("relcache.pg_attribute", RelationGetRelid(relation),
 										  pg_attribute_tuple, GetCurrentCommandId(false));
 			cluster_catalog_trace_descriptor("relcache.before_attribute", relation, attnum,
@@ -602,7 +602,7 @@ RelationBuildTupleDesc(Relation relation)
 			   attp,
 			   ATTRIBUTE_FIXED_PART_SIZE);
 #ifdef USE_PGRAC_CLUSTER
-		if (unlikely(cluster_catalog_trace_relation != 0))
+		if (unlikely(cluster_trace_visibility_enabled))
 			cluster_catalog_trace_descriptor("relcache.after_attribute", relation, attnum,
 											 GetCurrentCommandId(false));
 #endif
@@ -1151,7 +1151,7 @@ retry:
 	 */
 	RelationGetRelid(relation) = relid;
 #ifdef USE_PGRAC_CLUSTER
-	if (unlikely(cluster_catalog_trace_relation != 0))
+	if (unlikely(cluster_trace_visibility_enabled))
 		cluster_catalog_trace_descriptor("relcache.allocate", relation, 0,
 										 GetCurrentCommandId(false));
 #endif

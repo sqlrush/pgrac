@@ -13,6 +13,8 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_visibility_trace_filter.h"
+#include "cluster/cluster_uba.h"
 #include "cluster/cluster_update_trace.h"
 #include "cluster/cluster_xnode_profile.h"
 #include "cluster/cluster_storage_quorum.h"
@@ -20,7 +22,13 @@
 /* Profiling-aware product objects can link without a diagnostic backend.
  * Dedicated trace tests override these defaults with the real collector. */
 bool cluster_update_trace_enabled __attribute__((weak)) = false;
-int cluster_catalog_trace_relation __attribute__((weak)) = 0;
+bool cluster_trace_visibility_enabled __attribute__((weak)) = false;
+ClusterVisibilityTraceFilter cluster_trace_visibility_filter __attribute__((weak)) = { 0 };
+NodeId __attribute__((weak))
+uba_origin_node_id(UBA uba pg_attribute_unused())
+{
+	abort();
+}
 bool cluster_xnode_profile_enabled __attribute__((weak)) = false;
 ClusterXnodeProfileShared *ClusterXnodeProfileCtl __attribute__((weak)) = NULL;
 

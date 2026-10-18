@@ -2239,7 +2239,7 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 			cluster_r4_scratch_visibility_unknown(raw_xmin, "scratch xmin has no DATA ITL slot");
 
 		itl_slot = &ClusterPageGetItlSlots(page)[creator_index];
-		if (unlikely(cluster_catalog_trace_relation != 0))
+		if (unlikely(cluster_trace_visibility_enabled))
 			cluster_catalog_trace_slot("scratch.creator_slot", itl_slot);
 		if (itl_slot->flags < ITL_FLAG_ACTIVE || itl_slot->flags > ITL_FLAG_LOCK_ONLY_ABORTED
 			|| (ITL_FLAG_IS_LOCK_ONLY(itl_slot->flags) && itl_slot->xid == raw_xmin)
@@ -2249,7 +2249,7 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 
 		cluster_visibility_resolve_scratch_scn(page, creator_index, raw_xmin, snapshot->read_scn,
 											   &resolved);
-		if (unlikely(cluster_catalog_trace_relation != 0)) {
+		if (unlikely(cluster_trace_visibility_enabled)) {
 			cluster_catalog_trace_event("scratch.authority", "status", resolved.status);
 			cluster_catalog_trace_event("scratch.authority", "evidence", resolved.evidence);
 			cluster_catalog_trace_event("scratch.authority", "commit_scn", resolved.commit_scn);
@@ -2311,7 +2311,7 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 		|| tuple->t_itl_slot_idx >= CLUSTER_ITL_INITRANS_DEFAULT)
 		cluster_r4_scratch_visibility_unknown(raw_xmax, "scratch xmax has no DATA ITL slot");
 	itl_slot = &ClusterPageGetItlSlots(page)[tuple->t_itl_slot_idx];
-	if (unlikely(cluster_catalog_trace_relation != 0))
+	if (unlikely(cluster_trace_visibility_enabled))
 		cluster_catalog_trace_slot("scratch.deleter_slot", itl_slot);
 	if (itl_slot->flags < ITL_FLAG_ACTIVE || itl_slot->flags > ITL_FLAG_LOCK_ONLY_ABORTED
 		|| (ITL_FLAG_IS_LOCK_ONLY(itl_slot->flags) && itl_slot->xid == raw_xmax)
@@ -2321,7 +2321,7 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 
 	cluster_visibility_resolve_scratch_scn(page, tuple->t_itl_slot_idx, raw_xmax,
 										   snapshot->read_scn, &resolved);
-	if (unlikely(cluster_catalog_trace_relation != 0)) {
+	if (unlikely(cluster_trace_visibility_enabled)) {
 		cluster_catalog_trace_event("scratch.authority", "status", resolved.status);
 		cluster_catalog_trace_event("scratch.authority", "evidence", resolved.evidence);
 		cluster_catalog_trace_event("scratch.authority", "commit_scn", resolved.commit_scn);
@@ -2380,8 +2380,8 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 #ifdef USE_PGRAC_CLUSTER
 	ClusterSnapshotReadScopeV1 scope;
 	bool result;
-	bool tracing = cluster_catalog_trace_relation != 0;
-	uint64 previous_trace = 0;
+	bool tracing = cluster_trace_visibility_enabled;
+	ClusterCatalogTraceScope previous_trace = { 0 };
 
 	cluster_snapshot_read_enter_v1(&scope, snapshot);
 	if (tracing)
@@ -2389,7 +2389,7 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 	PG_TRY();
 	{
 		if (tracing) {
-			cluster_catalog_trace_begin(htup, snapshot);
+			cluster_catalog_trace_begin(htup, snapshot, "full_scratch");
 			cluster_catalog_trace_event("visibility.entry", "scratch", 1);
 		}
 		result = HeapTupleSatisfiesMVCCScratchInternal(htup, snapshot, context);
@@ -2551,6 +2551,8 @@ HeapTupleSatisfiesMVCCInternal(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 				 */
 				switch (cluster_cr_satisfies_mvcc(htup, snapshot, buffer, &cr_visible)) {
 				case CLUSTER_CR_DECIDED:
+					if (unlikely(cluster_trace_visibility_enabled))
+						cluster_catalog_trace_event("mvcc.branch", "CR_DECIDED", cr_visible);
 					CLUSTER_CATALOG_TRACE_RETURN(cr_visible);
 				case CLUSTER_CR_FAILCLOSED:
 					/*
@@ -3171,12 +3173,12 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 {
 #ifdef USE_PGRAC_CLUSTER
 	if (snapshot->cluster_source == SNAPSHOT_SOURCE_CLUSTER
-		|| unlikely(cluster_catalog_trace_relation != 0)) {
+		|| unlikely(cluster_trace_visibility_enabled)) {
 		ClusterSnapshotReadScopeV1 scope;
 		bool result;
 		bool read_scope = snapshot->cluster_source == SNAPSHOT_SOURCE_CLUSTER;
-		bool tracing = cluster_catalog_trace_relation != 0;
-		uint64 previous_trace = 0;
+		bool tracing = cluster_trace_visibility_enabled;
+		ClusterCatalogTraceScope previous_trace = { 0 };
 
 		if (read_scope)
 			cluster_snapshot_read_enter_v1(&scope, snapshot);
@@ -3185,7 +3187,7 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 		PG_TRY();
 		{
 			if (tracing)
-				cluster_catalog_trace_begin(htup, snapshot);
+				cluster_catalog_trace_begin(htup, snapshot, "live");
 			if (tracing)
 				cluster_catalog_trace_event("visibility.entry", "live", buffer);
 			result = HeapTupleSatisfiesMVCCInternal(htup, snapshot, buffer);

@@ -2392,16 +2392,32 @@ AddRelationNewConstraints(Relation rel,
 		Form_pg_attribute atp;
 		Oid defOid;
 #ifdef USE_PGRAC_CLUSTER
-		if (unlikely(cluster_catalog_trace_relation != 0))
+		if (unlikely(cluster_trace_visibility_enabled))
 			cluster_catalog_trace_descriptor("default.before_attribute", rel, colDef->attnum,
 											 GetCurrentCommandId(false));
 #endif
 		atp = TupleDescAttr(rel->rd_att, colDef->attnum - 1);
 
-		expr = cookDefault(pstate, colDef->raw_default,
-						   atp->atttypid, atp->atttypmod,
-						   NameStr(atp->attname),
-						   atp->attgenerated);
+#ifdef USE_PGRAC_CLUSTER
+		if (unlikely(cluster_trace_visibility_enabled)) {
+			ClusterCatalogTraceScope trace_scope
+				= cluster_catalog_trace_default_enter(RelationGetRelid(rel), colDef->attnum);
+			PG_TRY();
+			{
+				expr = cookDefault(pstate, colDef->raw_default, atp->atttypid, atp->atttypmod,
+								   NameStr(atp->attname), atp->attgenerated);
+			}
+			PG_FINALLY();
+			{
+				cluster_catalog_trace_leave(trace_scope);
+			}
+			PG_END_TRY();
+		} else
+#endif
+		{
+			expr = cookDefault(pstate, colDef->raw_default, atp->atttypid, atp->atttypmod,
+							   NameStr(atp->attname), atp->attgenerated);
+		}
 
 		/*
 		 * If the expression is just a NULL constant, we do not bother to make
@@ -2885,12 +2901,13 @@ cookDefault(ParseState *pstate,
 	{
 		Oid			type_id = exprType(expr);
 #ifdef USE_PGRAC_CLUSTER
-		if (unlikely(cluster_catalog_trace_relation != 0)) {
+		if (unlikely(cluster_trace_visibility_enabled)) {
 			ListCell *trace_cell;
 			foreach (trace_cell, pstate->p_rtable) {
 				RangeTblEntry *trace_rte = lfirst_node(RangeTblEntry, trace_cell);
 				if (trace_rte->rtekind == RTE_RELATION
-					&& trace_rte->relid == (Oid)cluster_catalog_trace_relation)
+					&& cluster_visibility_trace_contains(&cluster_trace_visibility_filter,
+														 trace_rte->relid))
 					cluster_catalog_trace_type(trace_rte->relid, atttypid, atttypmod, type_id,
 											   GetCurrentCommandId(false));
 			}

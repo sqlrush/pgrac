@@ -1,15 +1,22 @@
-/* Relation-scoped, passive catalog diagnostics. Zero disables tracing. */
+/* Relation-scoped, passive catalog diagnostics. An empty list disables tracing. */
 #ifndef CLUSTER_CATALOG_TRACE_H
 #define CLUSTER_CATALOG_TRACE_H
 #include "access/htup.h"
 #include "utils/snapshot.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_visibility_trace_filter.h"
 #include "cluster/cluster_itl_slot.h"
 #include "utils/rel.h"
-extern uint64 cluster_catalog_trace_enter(HeapTuple tuple);
-extern void cluster_catalog_trace_begin(HeapTuple tuple, Snapshot snapshot);
-extern void cluster_catalog_trace_leave(uint64 previous);
+typedef struct ClusterCatalogTraceScope {
+	uint64 call;
+	Oid relation;
+	int attnum;
+} ClusterCatalogTraceScope;
+extern ClusterCatalogTraceScope cluster_catalog_trace_enter(HeapTuple tuple);
+extern ClusterCatalogTraceScope cluster_catalog_trace_default_enter(Oid relation, int attnum);
+extern void cluster_catalog_trace_begin(HeapTuple tuple, Snapshot snapshot, const char *input_kind);
+extern void cluster_catalog_trace_leave(ClusterCatalogTraceScope previous);
 extern void cluster_catalog_trace_header(const char *stage, HeapTupleHeader tuple,
 										 Snapshot snapshot);
 extern void cluster_catalog_trace_slot(const char *stage, const ClusterItlSlotData *slot);
@@ -23,12 +30,12 @@ extern void cluster_catalog_trace_descriptor(const char *stage, Relation relatio
 extern void cluster_catalog_trace_type(Oid relation, Oid target, int32 typmod, Oid source,
 									   CommandId curcid);
 #define CLUSTER_CATALOG_TRACE_RETURN(value)                                                        \
-	return (unlikely(cluster_catalog_trace_relation != 0)                                          \
+	return (unlikely(cluster_trace_visibility_enabled)                                             \
 				? cluster_catalog_trace_result(__func__, __LINE__, (value))                        \
 				: (value))
 #define CLUSTER_CATALOG_TRACE_CID(kind, value)                                                     \
-	(unlikely(cluster_catalog_trace_relation != 0) ? cluster_catalog_trace_cid((kind), (value))    \
-												   : (value))
+	(unlikely(cluster_trace_visibility_enabled) ? cluster_catalog_trace_cid((kind), (value))       \
+												: (value))
 #else
 #define CLUSTER_CATALOG_TRACE_RETURN(value) return (value)
 #define CLUSTER_CATALOG_TRACE_CID(kind, value) (value)
