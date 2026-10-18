@@ -537,7 +537,7 @@ test_cluster_relmap_v2_storage_product.o: $(top_srcdir)/src/backend/cluster/clus
 		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
 		$(top_srcdir)/src/include/common/cluster_relmap_v2.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Dwrite=relmap_test_write -Dread=relmap_test_read \
-		-Drenameat=relmap_test_renameat -c $< -o $@
+		-Drenameat=relmap_test_renameat -Dclose=relmap_test_close -c $< -o $@
 
 test_cluster_relmap_v2_storage: test_cluster_relmap_v2_storage.c unit_test.h \
 		test_cluster_relmap_v2_storage_product.o $(top_builddir)/src/common/libpgcommon_srv.a \

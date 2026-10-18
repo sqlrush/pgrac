@@ -237,4 +237,27 @@ extern bool cluster_relmap_authority_v2_write_pending(const ClusterRelmapV2Names
 													uint64 generation, const ClusterRelmapV2Owner *owner,
 													const RelMapFile *pending);
 
+typedef enum ClusterRelmapV2ClearResult {
+	CLUSTER_RELMAP_V2_CLEARED_POSTREAD,
+	CLUSTER_RELMAP_V2_RETAINED_UNKNOWN
+} ClusterRelmapV2ClearResult;
+
+/*
+ * Finish exactly the original staged image under the same namespace X lock.
+ * The caller must independently prove its owner's matching commit/abort; this
+ * storage primitive supplies no terminal authority and never releases a pin.
+ * Both copies must be valid and match the original stage or its legal clean
+ * cuts.  CLEARED_POSTREAD requires both final clean copies to be written,
+ * synced and read back in this call, including an already-clean retry.
+ *
+ * Any I/O/sync/close failure returns RETAINED_UNKNOWN with no internal retry,
+ * even if both names now read clean.  Retain the original obligation and PG
+ * failure polarity (postcommit fail-stop); a later successful call cannot
+ * erase that failure.  Missing/degraded/foreign copies are never repaired.
+ */
+extern ClusterRelmapV2ClearResult
+cluster_relmap_authority_v2_publish(const ClusterRelmapV2Image *staged);
+extern ClusterRelmapV2ClearResult
+cluster_relmap_authority_v2_discard_pending(const ClusterRelmapV2Image *staged);
+
 #endif /* CLUSTER_RELMAP_AUTHORITY_H */

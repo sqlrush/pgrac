@@ -293,6 +293,8 @@ cluster_relmap_v2_read_pair(const void *primary, size_t primary_length, const vo
 		output->pending_generation = pending->pending_generation;
 		output->pending_owner = pending->pending_owner;
 		output->pending = pending->pending;
+		output->pending_committed_generation = pending->committed_generation;
+		output->pending_committed = pending->committed;
 	}
 	return complete ? CLUSTER_RELMAP_V2_PAIR_VALID : CLUSTER_RELMAP_V2_PAIR_DEGRADED;
 }

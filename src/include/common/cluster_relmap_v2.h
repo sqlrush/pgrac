@@ -85,6 +85,9 @@ typedef struct ClusterRelmapV2View {
 	uint64 pending_generation;
 	ClusterRelmapV2Owner pending_owner;
 	RelMapFile pending;
+	/* Original base from the pending copy, even after primary has published. */
+	uint64 pending_committed_generation;
+	RelMapFile pending_committed;
 } ClusterRelmapV2View;
 
 /* Decode checks shape and namespace; it does not authenticate an owner/WAL. */

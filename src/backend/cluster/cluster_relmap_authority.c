@@ -635,6 +635,23 @@ cleanup:
 	return ok;
 }
 
+static bool
+relmap_v2_store_pair(const RelmapV2Directory *dirs, const ClusterRelmapV2Namespace *expected,
+					const unsigned char bytes[CLUSTER_RELMAP_V2_FILE_SIZE], RelmapV2Copy copies[2])
+{
+	RelmapV2Copy final[2];
+	ClusterRelmapV2View view;
+
+	if (!relmap_v2_install(dirs, 0, bytes, copies) || !relmap_v2_install(dirs, 1, bytes, copies))
+		return false;
+	/* Recheck both after the second install, not just each one in isolation. */
+	return relmap_v2_load(dirs, expected, final, &view) == CLUSTER_RELMAP_V2_PAIR_VALID
+		   && relmap_v2_same_inode(&final[0].stat, &copies[0].stat)
+		   && relmap_v2_same_inode(&final[1].stat, &copies[1].stat)
+		   && memcmp(final[0].bytes, bytes, CLUSTER_RELMAP_V2_FILE_SIZE) == 0
+		   && memcmp(final[1].bytes, bytes, CLUSTER_RELMAP_V2_FILE_SIZE) == 0;
+}
+
 bool
 cluster_relmap_authority_v2_write_pending(const ClusterRelmapV2Namespace *expected,
 										uint64 generation, const ClusterRelmapV2Owner *owner,
@@ -642,7 +659,6 @@ cluster_relmap_authority_v2_write_pending(const ClusterRelmapV2Namespace *expect
 {
 	RelmapV2Directory dirs;
 	RelmapV2Copy copies[2];
-	RelmapV2Copy final[2];
 	ClusterRelmapV2View view;
 	ClusterRelmapV2Image image;
 	unsigned char bytes[CLUSTER_RELMAP_V2_FILE_SIZE];
@@ -666,16 +682,74 @@ cluster_relmap_authority_v2_write_pending(const ClusterRelmapV2Namespace *expect
 	image.pending = *pending;
 	if (cluster_relmap_v2_encode(&image, bytes, sizeof(bytes)) != CLUSTER_RELMAP_V2_VALID)
 		goto done;
-	if (!relmap_v2_install(&dirs, 0, bytes, copies) || !relmap_v2_install(&dirs, 1, bytes, copies))
-		goto done;
-	/* Recheck both after the second install, not just each one in isolation. */
-	ok = relmap_v2_load(&dirs, expected, final, &view) == CLUSTER_RELMAP_V2_PAIR_VALID
-		 && relmap_v2_same_inode(&final[0].stat, &copies[0].stat)
-		 && relmap_v2_same_inode(&final[1].stat, &copies[1].stat)
-		 && memcmp(final[0].bytes, bytes, sizeof(bytes)) == 0
-		 && memcmp(final[1].bytes, bytes, sizeof(bytes)) == 0;
+	ok = relmap_v2_store_pair(&dirs, expected, bytes, copies);
 done:
 	if (!relmap_v2_close_dirs(&dirs))
 		ok = false;
 	return ok;
+}
+
+static ClusterRelmapV2ClearResult
+relmap_v2_finish(const ClusterRelmapV2Image *staged, bool publish)
+{
+	RelmapV2Directory dirs;
+	RelmapV2Copy copies[2];
+	ClusterRelmapV2View view;
+	ClusterRelmapV2Image clean;
+	unsigned char staged_bytes[CLUSTER_RELMAP_V2_FILE_SIZE];
+	unsigned char original_bytes[CLUSTER_RELMAP_V2_FILE_SIZE];
+	unsigned char final_bytes[CLUSTER_RELMAP_V2_FILE_SIZE];
+	bool ok = false;
+
+	if (!enableFsync || staged == NULL || staged->pending_generation == 0
+		|| cluster_relmap_v2_encode(staged, staged_bytes, sizeof(staged_bytes))
+			   != CLUSTER_RELMAP_V2_VALID)
+		return CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+	clean = *staged;
+	clean.pending_generation = 0;
+	memset(&clean.pending_owner, 0, sizeof(clean.pending_owner));
+	memset(&clean.pending, 0, sizeof(clean.pending));
+	if (cluster_relmap_v2_encode(&clean, original_bytes, sizeof(original_bytes))
+		!= CLUSTER_RELMAP_V2_VALID)
+		return CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+	if (publish) {
+		clean.committed_generation = staged->pending_generation;
+		clean.committed = staged->pending;
+	}
+	if (cluster_relmap_v2_encode(&clean, final_bytes, sizeof(final_bytes))
+		!= CLUSTER_RELMAP_V2_VALID)
+		return CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+	if (!relmap_v2_open_dirs(&staged->identity, &dirs))
+		goto done;
+	if (relmap_v2_load(&dirs, &staged->identity, copies, &view) != CLUSTER_RELMAP_V2_PAIR_VALID)
+		goto done;
+	for (int i = 0; i < 2; i++) {
+		/* No other owner, old image, generation or pending payload may be cleared. */
+		if (memcmp(copies[i].bytes, staged_bytes, sizeof(staged_bytes)) != 0
+			&& memcmp(copies[i].bytes, original_bytes, sizeof(original_bytes)) != 0
+			&& memcmp(copies[i].bytes, final_bytes, sizeof(final_bytes)) != 0)
+			goto done;
+		/* A clean old pair is not evidence that a new map was staged. */
+		if (!view.has_pending
+			&& memcmp(copies[i].bytes, final_bytes, sizeof(final_bytes)) != 0)
+			goto done;
+	}
+	/* Even a clean retry must establish sync and postread in this call. */
+	ok = relmap_v2_store_pair(&dirs, &staged->identity, final_bytes, copies);
+done:
+	if (!relmap_v2_close_dirs(&dirs))
+		ok = false;
+	return ok ? CLUSTER_RELMAP_V2_CLEARED_POSTREAD : CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+}
+
+ClusterRelmapV2ClearResult
+cluster_relmap_authority_v2_publish(const ClusterRelmapV2Image *staged)
+{
+	return relmap_v2_finish(staged, true);
+}
+
+ClusterRelmapV2ClearResult
+cluster_relmap_authority_v2_discard_pending(const ClusterRelmapV2Image *staged)
+{
+	return relmap_v2_finish(staged, false);
 }

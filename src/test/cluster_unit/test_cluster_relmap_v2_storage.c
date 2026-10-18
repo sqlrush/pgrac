@@ -39,6 +39,8 @@ static char directory[MAXPGPATH];
 static unsigned int writes, renames, file_syncs, dir_syncs, reads;
 static unsigned int fail_write, fail_rename, fail_file_sync, fail_dir_sync;
 static bool corrupt_after_rename, replace_during_read, replace_after_rename;
+static unsigned int fault_rename;
+static bool fail_directory_close;
 static const char *const names[] = {
 	"pgrac_relmap_authority", "pgrac_relmap_authority.bak",
 	"pgrac_relmap_authority.tmp", "pgrac_relmap_authority.bak.tmp", "replacement"
@@ -131,6 +133,26 @@ pg_fsync(int fd)
 ssize_t relmap_test_write(int fd, const void *bytes, size_t len);
 ssize_t relmap_test_read(int fd, void *bytes, size_t len);
 int relmap_test_renameat(int olddir, const char *old, int newdir, const char *new);
+int relmap_test_close(int fd);
+
+int
+relmap_test_close(int fd)
+{
+	struct stat st;
+	bool directory;
+	int rc;
+
+	if (fstat(fd, &st) != 0)
+		abort();
+	directory = S_ISDIR(st.st_mode);
+	rc = close(fd);
+	if (directory && fail_directory_close) {
+		fail_directory_close = false;
+		errno = EIO;
+		return -1;
+	}
+	return rc;
+}
 
 ssize_t
 relmap_test_write(int fd, const void *bytes, size_t len)
@@ -182,10 +204,11 @@ relmap_test_renameat(int olddir, const char *old, int newdir, const char *new)
 		return -1;
 	}
 	rc = renameat(olddir, old, newdir, new);
-	if (rc == 0 && renames == 1 && replace_after_rename)
+	if (rc == 0 && renames == fault_rename && replace_after_rename)
 		replace_primary();
-	if (rc == 0 && renames == 1 && corrupt_after_rename) {
-		int fd = openat(newdir, new, O_WRONLY);
+	if (rc == 0 && renames == fault_rename && corrupt_after_rename) {
+		/* Also exercise the final recheck of primary after backup installation. */
+		int fd = openat(newdir, names[0], O_WRONLY);
 		unsigned char bad = 0xff;
 
 		if (fd < 0 || pwrite(fd, &bad, 1, 128) != 1 || close(fd) != 0)
@@ -259,6 +282,16 @@ read_copy(int copy, unsigned char bytes[2176])
 }
 
 static void
+reset_io(void)
+{
+	writes = renames = file_syncs = dir_syncs = reads = 0;
+	fail_write = fail_rename = fail_file_sync = fail_dir_sync = 0;
+	corrupt_after_rename = replace_during_read = replace_after_rename = false;
+	fault_rename = 1;
+	fail_directory_close = false;
+}
+
+static void
 setup(const ClusterRelmapV2Namespace *ns)
 {
 	ClusterRelmapV2Image image;
@@ -281,9 +314,7 @@ setup(const ClusterRelmapV2Namespace *ns)
 	snprintf(directory, sizeof(directory), "%s/%s", root, ns->shared ? "global" : "base/42");
 	cluster_shared_data_dir = root;
 	enableFsync = true;
-	writes = renames = file_syncs = dir_syncs = reads = 0;
-	fail_write = fail_rename = fail_file_sync = fail_dir_sync = 0;
-	corrupt_after_rename = replace_during_read = replace_after_rename = false;
+	reset_io();
 	memset(&image, 0, sizeof(image));
 	image.identity = *ns;
 	image.committed_generation = 7;
@@ -497,10 +528,335 @@ UT_TEST(test_corrupt_or_replaced_readback_never_acknowledges_stage)
 	UT_ASSERT_EQ(renames, 1);
 }
 
+static ClusterRelmapV2Image
+staged_image(void)
+{
+	ClusterRelmapV2Image image;
+
+	memset(&image, 0, sizeof(image));
+	image.identity = identity;
+	image.committed_generation = 7;
+	image.committed = map_image(40000);
+	image.pending_generation = 8;
+	image.pending_owner = owner;
+	image.pending = map_image(40001);
+	return image;
+}
+
+static ClusterRelmapV2ClearResult
+finish(const ClusterRelmapV2Image *image, bool publish)
+{
+	return publish ? cluster_relmap_authority_v2_publish(image)
+				   : cluster_relmap_authority_v2_discard_pending(image);
+}
+
+static bool
+clean_pair(bool published)
+{
+	unsigned char primary[2176];
+	unsigned char backup[2176];
+	ClusterRelmapV2Image disk;
+	RelMapFile expected = map_image(published ? 40001 : 40000);
+
+	read_copy(0, primary);
+	read_copy(1, backup);
+	if (memcmp(primary, backup, sizeof(primary)) != 0
+		|| cluster_relmap_v2_decode(primary, sizeof(primary), &identity, &disk)
+			   != CLUSTER_RELMAP_V2_VALID
+		|| disk.committed_generation != (published ? 8 : 7) || disk.pending_generation != 0
+		|| memcmp(&disk.committed, &expected, sizeof(expected)) != 0)
+		return false;
+	for (int i = 54; i < 96; i++)
+		if (primary[i] != 0)
+			return false;
+	for (int i = 1152; i < 2176; i++)
+		if (primary[i] != 0)
+			return false;
+	return true;
+}
+
+UT_TEST(test_publish_and_discard_clear_both_copies)
+{
+	ClusterRelmapV2Image image = staged_image();
+	ClusterRelmapV2View view;
+
+	for (int publish = 0; publish <= 1; publish++) {
+		setup(&identity);
+		UT_ASSERT(stage(&identity));
+		reset_io();
+		UT_ASSERT_EQ(finish(&image, publish), CLUSTER_RELMAP_V2_CLEARED_POSTREAD);
+		UT_ASSERT(clean_pair(publish));
+		UT_ASSERT_EQ(cluster_relmap_authority_v2_read(&identity, &view),
+					 CLUSTER_RELMAP_V2_PAIR_VALID);
+		UT_ASSERT(view.pending_complete && !view.has_pending);
+		UT_ASSERT_EQ(file_syncs, 2);
+		UT_ASSERT_EQ(dir_syncs, 2);
+	}
+}
+
+UT_TEST(test_partial_stage_can_be_discarded)
+{
+	ClusterRelmapV2Image image = staged_image();
+	ClusterRelmapV2View view;
+
+	setup(&identity);
+	fail_write = 2;
+	UT_ASSERT(!stage(&identity));
+	UT_ASSERT_EQ(cluster_relmap_authority_v2_read(&identity, &view), CLUSTER_RELMAP_V2_PAIR_VALID);
+	UT_ASSERT(view.has_pending && view.pending_complete);
+	reset_io();
+	UT_ASSERT_EQ(finish(&image, false), CLUSTER_RELMAP_V2_CLEARED_POSTREAD);
+	UT_ASSERT(clean_pair(false));
+}
+
+UT_TEST(test_primary_done_keeps_backup_pending_until_distinct_retry)
+{
+	ClusterRelmapV2Image image = staged_image();
+	ClusterRelmapV2View view;
+
+	for (int publish = 0; publish <= 1; publish++) {
+		setup(&identity);
+		UT_ASSERT(stage(&identity));
+		reset_io();
+		fail_rename = 2;
+		UT_ASSERT_EQ(finish(&image, publish), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+		UT_ASSERT_EQ(cluster_relmap_authority_v2_read(&identity, &view),
+					 CLUSTER_RELMAP_V2_PAIR_VALID);
+		UT_ASSERT(view.has_pending && view.pending_complete);
+		UT_ASSERT_EQ(view.pending_owner.top_full_xid, UINT64CONST(0x200000123));
+		UT_ASSERT_EQ(view.committed_generation, publish ? 8 : 7);
+		/* A new recovery attempt, never success for the original failed call. */
+		reset_io();
+		UT_ASSERT_EQ(finish(&image, publish), CLUSTER_RELMAP_V2_CLEARED_POSTREAD);
+		UT_ASSERT(clean_pair(publish));
+	}
+}
+
+UT_TEST(test_exact_stage_identity_and_images_required_before_writes)
+{
+	ClusterRelmapV2Image image = staged_image();
+	ClusterRelmapV2Image wrong;
+	unsigned char before[2176];
+	unsigned char after[2176];
+
+	setup(&identity);
+	UT_ASSERT(stage(&identity));
+	read_copy(0, before);
+	reset_io();
+	for (int change = 0; change < 15; change++) {
+		wrong = image;
+		switch (change) {
+		case 0: wrong.identity.system_identifier++; break;
+		case 1: wrong.identity.database_incarnation++; break;
+		case 2: wrong.identity.dbid = 42; wrong.identity.shared = false; break;
+		case 3: wrong.pending_owner.node++; break;
+		case 4: wrong.pending_owner.top_full_xid += UINT64CONST(0x100000000); break;
+		case 5: wrong.pending_owner.membership_epoch++; break;
+		case 6: wrong.pending_owner.admitted_incarnation++; break;
+		case 7: wrong.pending_owner.boot_incarnation++; break;
+		case 8: wrong.pending_owner.wal_end++; break;
+		case 9: wrong.committed_generation++; wrong.pending_generation++; break;
+		case 10: wrong.committed = map_image(41000); break;
+		case 11: wrong.pending = map_image(41001); break;
+		case 12: wrong.pending_owner.boot_incarnation = 0; break;
+		case 13: wrong.pending_generation = 0; break;
+		case 14: wrong.committed_generation = PG_UINT64_MAX; wrong.pending_generation = 0; break;
+		}
+		for (int publish = 0; publish <= 1; publish++)
+			UT_ASSERT_EQ(finish(&wrong, publish), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+	}
+	UT_ASSERT_EQ(finish(NULL, false), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+	UT_ASSERT_EQ(finish(NULL, true), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+	UT_ASSERT_EQ(writes, 0);
+	read_copy(0, after);
+	UT_ASSERT(memcmp(before, after, sizeof(before)) == 0);
+	read_copy(1, after);
+	UT_ASSERT(memcmp(before, after, sizeof(before)) == 0);
+}
+
+UT_TEST(test_unknown_or_conflicting_copy_never_grants_cleanup)
+{
+	ClusterRelmapV2Image image = staged_image();
+	ClusterRelmapV2Image wrong;
+	unsigned char bytes[2176];
+	char path[MAXPGPATH];
+
+	for (int kind = 0; kind < 6; kind++) {
+		setup(&identity);
+		UT_ASSERT(stage(&identity));
+		read_copy(1, bytes);
+		if (kind == 0)
+			bytes[128] ^= 1;
+		else if (kind == 1) {
+			snprintf(path, sizeof(path), "%s/%s", directory, names[1]);
+			UT_ASSERT_EQ(unlink(path), 0);
+		} else if (kind == 2)
+			bytes[3] = 0x01;
+		else {
+			wrong = image;
+			if (kind == 3)
+				wrong.pending_owner.boot_incarnation++;
+			else if (kind == 4)
+				wrong.committed = map_image(41000);
+			else
+				wrong.identity.database_incarnation++;
+			UT_ASSERT_EQ(cluster_relmap_v2_encode(&wrong, bytes, sizeof(bytes)),
+						 CLUSTER_RELMAP_V2_VALID);
+		}
+		if (kind != 1)
+			write_copy(1, bytes, sizeof(bytes));
+		reset_io();
+		UT_ASSERT_EQ(finish(&image, false), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+		UT_ASSERT_EQ(finish(&image, true), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+		UT_ASSERT_EQ(writes, 0);
+	}
+}
+
+UT_TEST(test_each_finish_io_failure_is_retained_unknown)
+{
+	ClusterRelmapV2Image image = staged_image();
+	ClusterRelmapV2View view;
+
+	for (int publish = 0; publish <= 1; publish++) {
+		for (int kind = 0; kind < 4; kind++) {
+			for (int copy = 1; copy <= 2; copy++) {
+				setup(&identity);
+				UT_ASSERT(stage(&identity));
+				reset_io();
+				if (kind == 0)
+					fail_write = copy;
+				else if (kind == 1)
+					fail_file_sync = copy;
+				else if (kind == 2)
+					fail_rename = copy;
+				else
+					fail_dir_sync = copy;
+				UT_ASSERT_EQ(finish(&image, publish), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+				UT_ASSERT_EQ(cluster_relmap_authority_v2_read(&identity, &view),
+							 CLUSTER_RELMAP_V2_PAIR_VALID);
+				UT_ASSERT_EQ(view.committed_generation,
+							 publish && (copy == 2 || kind == 3) ? 8 : 7);
+				UT_ASSERT_EQ(view.has_pending, !(copy == 2 && kind == 3));
+			}
+		}
+	}
+}
+
+UT_TEST(test_already_clean_call_requires_new_sync_and_postread)
+{
+	ClusterRelmapV2Image image = staged_image();
+
+	for (int publish = 0; publish <= 1; publish++) {
+		setup(&identity);
+		UT_ASSERT(stage(&identity));
+		reset_io();
+		/* Both names are clean but the second directory sync failed. */
+		fail_dir_sync = 2;
+		UT_ASSERT_EQ(finish(&image, publish), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+		UT_ASSERT(clean_pair(publish));
+		reset_io();
+		fail_file_sync = 1;
+		UT_ASSERT_EQ(finish(&image, publish), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+		UT_ASSERT_EQ(renames, 0);
+		reset_io();
+		enableFsync = false;
+		UT_ASSERT_EQ(finish(&image, publish), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+		UT_ASSERT_EQ(writes, 0);
+		enableFsync = true;
+		UT_ASSERT_EQ(finish(&image, publish), CLUSTER_RELMAP_V2_CLEARED_POSTREAD);
+		UT_ASSERT(clean_pair(publish));
+		UT_ASSERT_EQ(file_syncs, 2);
+		UT_ASSERT_EQ(dir_syncs, 2);
+	}
+}
+
+UT_TEST(test_finish_rechecks_primary_after_backup_install)
+{
+	ClusterRelmapV2Image image = staged_image();
+
+	for (int publish = 0; publish <= 1; publish++) {
+		for (int copy = 1; copy <= 2; copy++) {
+			for (int replace = 0; replace <= 1; replace++) {
+				setup(&identity);
+				UT_ASSERT(stage(&identity));
+				reset_io();
+				fault_rename = copy;
+				corrupt_after_rename = !replace;
+				replace_after_rename = replace;
+				UT_ASSERT_EQ(finish(&image, publish), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+			}
+		}
+	}
+}
+
+UT_TEST(test_directory_close_failure_cannot_acknowledge_clean_pair)
+{
+	ClusterRelmapV2Image image = staged_image();
+
+	for (int publish = 0; publish <= 1; publish++) {
+		setup(&identity);
+		UT_ASSERT(stage(&identity));
+		reset_io();
+		fail_directory_close = true;
+		UT_ASSERT_EQ(finish(&image, publish), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+		UT_ASSERT(clean_pair(publish));
+	}
+}
+
+UT_TEST(test_clean_unstaged_pair_cannot_fabricate_publish)
+{
+	ClusterRelmapV2Image image = staged_image();
+	ClusterRelmapV2Image later = image;
+
+	setup(&identity);
+	UT_ASSERT_EQ(finish(&image, true), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+	UT_ASSERT_EQ(writes, 0);
+	UT_ASSERT(stage(&identity));
+	UT_ASSERT_EQ(finish(&image, true), CLUSTER_RELMAP_V2_CLEARED_POSTREAD);
+	reset_io();
+	/* A stale discard must never undo the already-published committed map. */
+	UT_ASSERT_EQ(finish(&image, false), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+	later.committed_generation = 8;
+	later.committed = map_image(40001);
+	later.pending_generation = 9;
+	later.pending = map_image(40002);
+	UT_ASSERT_EQ(finish(&later, true), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+	UT_ASSERT_EQ(writes, 0);
+	UT_ASSERT(clean_pair(true));
+}
+
+UT_TEST(test_pending_reader_preserves_base_for_cold_finish)
+{
+	ClusterRelmapV2Image original = staged_image();
+	ClusterRelmapV2Image recovered;
+	ClusterRelmapV2View view;
+
+	setup(&identity);
+	UT_ASSERT(stage(&identity));
+	reset_io();
+	fail_rename = 2;
+	UT_ASSERT_EQ(finish(&original, true), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+	UT_ASSERT_EQ(cluster_relmap_authority_v2_read(&identity, &view), CLUSTER_RELMAP_V2_PAIR_VALID);
+	UT_ASSERT_EQ(view.committed_generation, 8);
+	UT_ASSERT_EQ(view.committed.mappings[0].mapfilenumber, 40001);
+	UT_ASSERT_EQ(view.pending_committed_generation, 7);
+	UT_ASSERT_EQ(view.pending_committed.mappings[0].mapfilenumber, 40000);
+	memset(&recovered, 0, sizeof(recovered));
+	recovered.identity = identity;
+	recovered.committed_generation = view.pending_committed_generation;
+	recovered.committed = view.pending_committed;
+	recovered.pending_generation = view.pending_generation;
+	recovered.pending_owner = view.pending_owner;
+	recovered.pending = view.pending;
+	reset_io();
+	UT_ASSERT_EQ(finish(&recovered, true), CLUSTER_RELMAP_V2_CLEARED_POSTREAD);
+	UT_ASSERT(clean_pair(true));
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(21);
 	UT_RUN(test_stage_both_copies_before_success);
 	UT_RUN(test_per_database_namespace);
 	UT_RUN(test_missing_authority_is_never_seeded);
@@ -511,6 +867,17 @@ main(void)
 	UT_RUN(test_inode_replaced_during_read_is_not_accepted);
 	UT_RUN(test_each_io_failure_retains_the_obligation);
 	UT_RUN(test_corrupt_or_replaced_readback_never_acknowledges_stage);
+	UT_RUN(test_publish_and_discard_clear_both_copies);
+	UT_RUN(test_partial_stage_can_be_discarded);
+	UT_RUN(test_primary_done_keeps_backup_pending_until_distinct_retry);
+	UT_RUN(test_exact_stage_identity_and_images_required_before_writes);
+	UT_RUN(test_unknown_or_conflicting_copy_never_grants_cleanup);
+	UT_RUN(test_each_finish_io_failure_is_retained_unknown);
+	UT_RUN(test_already_clean_call_requires_new_sync_and_postread);
+	UT_RUN(test_finish_rechecks_primary_after_backup_install);
+	UT_RUN(test_directory_close_failure_cannot_acknowledge_clean_pair);
+	UT_RUN(test_clean_unstaged_pair_cannot_fabricate_publish);
+	UT_RUN(test_pending_reader_preserves_base_for_cold_finish);
 	cleanup();
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
