@@ -1354,29 +1354,39 @@ rf_side_online_plan_recovery_source_matches_v1(const RfSideOnlinePlanV1 *plan,
 		   && plan->purpose == RF_SIDE_PLAN_RECOVERY;
 }
 
-bool
-rf_side_online_plan_recovery_claim_matches_v1(const RfSideOnlinePlanV1 *plan,
-											  const ClusterWalSourceRef *source)
+static bool
+side_recovery_claim_matches(const RfSideOnlinePlanV1 *plan, const ClusterWalSourceRef *source,
+							bool physical)
 {
 	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || plan->failed
 		|| plan->purpose != RF_SIDE_PLAN_RECOVERY || plan->sources == NULL || source == NULL
 		|| !cluster_wal_claim_v2_ref_valid(&source->claim) || source->timeline == 0
 		|| plan->database_incarnation != source->claim.database_incarnation)
 		return false;
-	for (uint32 i = 0; i < plan->participant_count; i++) {
-		const RfContributorStreamCutV1 *cut = &plan->physical_cuts[i];
+	for (uint32 i = 0; i < (physical ? plan->participant_count : plan->source_count); i++) {
 		const ClusterWalSourceRef *bound;
 		const ClusterControlRootIdentity *left, *right;
-		uint32 index;
 
-		if (cut->failed_thread != source->claim.identity.origin_thread_id
-			|| cut->origin_owner_incarnation != source->claim.identity.origin_owner_incarnation
-			|| cut->timeline_id != source->timeline)
-			continue;
-		index = side_cut_source(cut, plan->sources, plan->source_count);
-		if (index == UINT32_MAX)
-			return false;
-		bound = &plan->sources[index];
+		if (physical) {
+			const RfContributorStreamCutV1 *cut = &plan->physical_cuts[i];
+			uint32 index;
+
+			if (cut->failed_thread != source->claim.identity.origin_thread_id
+				|| cut->origin_owner_incarnation != source->claim.identity.origin_owner_incarnation
+				|| cut->timeline_id != source->timeline)
+				continue;
+			index = side_cut_source(cut, plan->sources, plan->source_count);
+			if (index == UINT32_MAX)
+				return false;
+			bound = &plan->sources[index];
+		} else {
+			bound = &plan->sources[i];
+			if (bound->claim.identity.origin_thread_id != source->claim.identity.origin_thread_id
+				|| bound->claim.identity.origin_owner_incarnation
+					   != source->claim.identity.origin_owner_incarnation
+				|| bound->timeline != source->timeline)
+				continue;
+		}
 		left = &bound->claim.identity;
 		right = &source->claim.identity;
 		/* Compare logical fields, never native-struct padding. Both reserved
@@ -1396,6 +1406,20 @@ rf_side_online_plan_recovery_claim_matches_v1(const RfSideOnlinePlanV1 *plan,
 			   && bound->timeline == source->timeline;
 	}
 	return false;
+}
+
+bool
+rf_side_online_plan_recovery_claim_matches_v1(const RfSideOnlinePlanV1 *plan,
+											  const ClusterWalSourceRef *source)
+{
+	return side_recovery_claim_matches(plan, source, true);
+}
+
+bool
+rf_side_online_plan_recovery_bound_claim_matches_v1(const RfSideOnlinePlanV1 *plan,
+													const ClusterWalSourceRef *source)
+{
+	return side_recovery_claim_matches(plan, source, false);
 }
 
 static RfPageProofDetailV1

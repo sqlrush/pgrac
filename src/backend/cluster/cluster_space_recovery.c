@@ -842,6 +842,7 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 	ClusterThreadRecoveryAuthorityV1 *authorities;
 	SpaceColdAuthority *owners;
 	uint16 source_count = 0;
+	uint32 physical_sources = 0;
 	Size bytes, scratch;
 	bool ok = false;
 	bool abort_already = abort_side != NULL;
@@ -906,9 +907,10 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 	batch->order = (uint32 *)(batch->targets + 1);
 	batch->sources = authorities;
 	batch->cold_inputs = inputs;
-	/* A final result uses one captured stream and the independent, complete
-	 * original cold owner. Other held ROOTs are not SIDE participants. */
-	batch->side = abort_result ? NULL : abort_side;
+	/* The borrowed pin supplies the complete original cold owner. A SIDE
+	 * capture may contain only one physical stream; validate its bound claims
+	 * and every physical cut below without promoting other held ROOTs. */
+	batch->side = NULL;
 	batch->cold_result_already = drop_already || abort_already;
 	batch->cold_shrink_step = through;
 	batch->cold_shrink_forks = shrink_forks;
@@ -945,25 +947,34 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 				|| owners[i].native_redo < owners[i].root.checkpoint_lower_lsn
 				|| owners[i].native_redo > owners[i].root.validated_tail_lsn_exclusive)
 				goto done;
-			if (abort_already
-				&& (!abort_result || guard->duty.origin_thread_id == abort_source->origin_thread)) {
-				RfContributorStreamCutV1 cut
-					= { .failed_thread = guard->duty.origin_thread_id,
-						.origin_owner_incarnation = guard->duty.origin_owner_incarnation,
-						.timeline_id = owners[i].root.checkpoint_tli,
-						.flags = RF_CONTRIBUTOR_CUT_COMPLETE,
-						.scan_begin_inclusive = owners[i].root.checkpoint_lower_lsn,
-						.scan_end_exclusive = owners[i].root.validated_tail_lsn_exclusive };
+			if (abort_already) {
+				bool physical = rf_side_online_plan_recovery_claim_matches_v1(abort_side, &source);
+				bool terminal = guard->duty.origin_thread_id == abort_source->origin_thread;
 
-				if (!rf_side_online_plan_recovery_claim_matches_v1(abort_side, &source)
-					|| !rf_side_online_plan_replay_start_matches_v1(
-						abort_side, guard->duty.origin_thread_id,
-						guard->duty.origin_owner_incarnation, key->database_incarnation,
-						owners[i].native_redo)
-					|| (abort_result
-						&& !rf_side_online_plan_recovery_source_matches_v1(
-							abort_side, key->system_identifier, key->storage_uuid, &cut)))
+				if ((terminal && !physical)
+					|| (!abort_result
+						&& !rf_side_online_plan_recovery_bound_claim_matches_v1(abort_side,
+																				&source)))
 					goto done;
+				if (!abort_result && physical)
+					physical_sources++;
+				if (physical && (!abort_result || terminal)) {
+					RfContributorStreamCutV1 cut
+						= { .failed_thread = guard->duty.origin_thread_id,
+							.origin_owner_incarnation = guard->duty.origin_owner_incarnation,
+							.timeline_id = owners[i].root.checkpoint_tli,
+							.flags = RF_CONTRIBUTOR_CUT_COMPLETE,
+							.scan_begin_inclusive = owners[i].root.checkpoint_lower_lsn,
+							.scan_end_exclusive = owners[i].root.validated_tail_lsn_exclusive };
+
+					if (!rf_side_online_plan_replay_start_matches_v1(
+							abort_side, guard->duty.origin_thread_id,
+							guard->duty.origin_owner_incarnation, key->database_incarnation,
+							owners[i].native_redo)
+						|| !rf_side_online_plan_recovery_source_matches_v1(
+							abort_side, key->system_identifier, key->storage_uuid, &cut))
+						goto done;
+				}
 			}
 			authorities[i]
 				= (ClusterThreadRecoveryAuthorityV1){ .duty = &guard->duty,
@@ -976,7 +987,9 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 													  .retention_pin = pin,
 													  .serial_guard = guard };
 		}
-		if (!space_sources_fresh(batch)
+		if ((abort_already && !abort_result
+			 && physical_sources != rf_side_online_plan_participant_count_v1(abort_side))
+			|| !space_sources_fresh(batch)
 			|| !cluster_space_recovery_order(inputs, count, key, batch->order))
 			goto done;
 		if (abort_already) {

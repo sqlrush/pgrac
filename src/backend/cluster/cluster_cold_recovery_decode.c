@@ -297,6 +297,9 @@ cold_xact_flags(XLogReaderState *reader, uint64 system_identifier, const uint8 s
 			return CLUSTER_COLD_COMPONENT_INVALID;
 		if (!cold_completion_stats_valid(parsed.nstats, parsed.stats))
 			return CLUSTER_COLD_COMPONENT_INVALID;
+		/* Raw pending-delete locators require the selected original cold
+		 * owner. Only its complete foreign classification below may clear
+		 * this structural default; own native redo remains refused. */
 		*flags = parsed.nrels > 0 ? CLUSTER_COLD_RECORD_STRUCTURAL : 0;
 		*effects |= cold_completion_effects(parsed.xinfo, parsed.nsubxacts, parsed.nrels,
 											parsed.nstats, 0);
@@ -643,7 +646,8 @@ cold_foreign_side(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan,
 
 	if (XLogRecMaxBlockId(reader) >= 0
 		|| ((XLogRecGetInfo(reader) & XLR_INFO_MASK) != 0
-			&& !(XLogRecGetRmid(reader) == RM_XACT_ID && info == XLOG_XACT_COMMIT
+			&& !(XLogRecGetRmid(reader) == RM_XACT_ID
+				 && (info == XLOG_XACT_COMMIT || info == XLOG_XACT_ABORT)
 				 && (XLogRecGetInfo(reader) & XLR_INFO_MASK) == XLR_SPECIAL_REL_UPDATE))
 		|| plan->route.record_owner != RF_ROUTE_OWNER_SIDE_TYPED)
 		return false;
@@ -702,6 +706,12 @@ cold_foreign_side(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan,
 						&& (XLogRecGetInfo(reader) & XLR_INFO_MASK) == 0)
 					   || (info == XLOG_XACT_COMMIT && operation.relation_count > 0
 						   && operation.space_drop_count > 0
+						   && !reader->record->has_page_version_edge
+						   && XLogRecGetOrigin(reader) == InvalidRepOriginId
+						   && !TransactionIdIsValid(reader->record->toplevel_xid))
+					   || (info == XLOG_XACT_ABORT && operation.cold_completion_effects
+						   && operation.relation_count > 0 && operation.space_drop_count == 0
+						   && (XLogRecGetInfo(reader) & XLR_INFO_MASK) == XLR_SPECIAL_REL_UPDATE
 						   && !reader->record->has_page_version_edge
 						   && XLogRecGetOrigin(reader) == InvalidRepOriginId
 						   && !TransactionIdIsValid(reader->record->toplevel_xid)));
@@ -951,9 +961,16 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 	if (foreign && plan.route.record_owner != RF_ROUTE_OWNER_PAGE_CODEC && !has_owner) {
 		if (cold_foreign_control(reader, &plan))
 			out->record.record_flags |= CLUSTER_COLD_RECORD_FOREIGN_CONTROL;
-		else if (cold_foreign_side(reader, &plan, system_identifier))
+		else if (cold_foreign_side(reader, &plan, system_identifier)) {
+			/* The original recovery decoder proved this complete foreign
+			 * ABORT has a selected cold structural consumer. No other flags
+			 * or own-native structural records may borrow that owner. */
+			if (out->record.record_flags == CLUSTER_COLD_RECORD_STRUCTURAL
+				&& XLogRecGetRmid(reader) == RM_XACT_ID
+				&& (XLogRecGetInfo(reader) & XLOG_XACT_OPMASK) == XLOG_XACT_ABORT)
+				out->record.record_flags = 0;
 			out->record.record_flags |= CLUSTER_COLD_RECORD_FOREIGN_SIDE;
-		else
+		} else
 			out->record.record_flags |= CLUSTER_COLD_RECORD_SIDE_UNOWNED;
 	}
 	detail = cold_map_components(reader, &plan, system_identifier, storage_uuid, out);

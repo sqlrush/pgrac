@@ -174,6 +174,10 @@ extern bool rf_side_online_plan_recovery_source_matches_v1(const RfSideOnlinePla
  * final source revalidation remain separate owner obligations. */
 extern bool rf_side_online_plan_recovery_claim_matches_v1(const RfSideOnlinePlanV1 *plan,
 														  const ClusterWalSourceRef *source);
+/* Match any original bound recovery claim, including retained-only inputs.
+ * This supplies neither physical participation nor cut/base/owner authority. */
+extern bool rf_side_online_plan_recovery_bound_claim_matches_v1(const RfSideOnlinePlanV1 *plan,
+																const ClusterWalSourceRef *source);
 /* UINT32_MAX for an invalid or unsealed plan. */
 extern uint32 rf_side_online_plan_participant_count_v1(const RfSideOnlinePlanV1 *plan);
 /* The physical lower alone must not authorize replay of retained history. */
