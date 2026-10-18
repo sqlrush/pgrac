@@ -129,6 +129,19 @@ UT_TEST(test_completion_proof)
 	result.steps_done = 1; /* the plan has none */
 	UT_ASSERT(!cluster_cold_completion_proven_v1(plan, &root, &result, 0));
 	result.steps_done = 0;
+	/* Tail equality and step count do not certify the aggregate effect route. */
+	result.pages_applied = 1;
+	UT_ASSERT(!cluster_cold_completion_proven_v1(plan, &root, &result, 0));
+	result.pages_applied = 0;
+	result.pages_skipped = 1;
+	UT_ASSERT(!cluster_cold_completion_proven_v1(plan, &root, &result, 0));
+	result.pages_skipped = 0;
+	result.space_steps = 1;
+	UT_ASSERT(!cluster_cold_completion_proven_v1(plan, &root, &result, 0));
+	result.space_steps = 0;
+	result.space_relations_finished = 1;
+	UT_ASSERT(!cluster_cold_completion_proven_v1(plan, &root, &result, 0));
+	result.space_relations_finished = 0;
 	/* a participant the plan does not have, whatever its slot holds */
 	result.last_read[1] = result.last_read[0];
 	result.last_crc[1] = result.last_crc[0];

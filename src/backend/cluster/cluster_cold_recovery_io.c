@@ -704,13 +704,44 @@ cluster_cold_completion_proven_v1(const ClusterColdPlanV1 *plan,
 								  const ClusterControlRootSnapshot *root,
 								  const ClusterColdReplayResultV1 *result, uint32 participant)
 {
-	return plan != NULL && root != NULL && result != NULL
-		   && participant < cluster_cold_plan_participant_count_v1(plan)
-		   && result->detail == CLUSTER_COLD_REPLAY_OK
-		   && result->steps_done == cluster_cold_plan_step_count_v1(plan)
-		   && root->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
-		   && (root->root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID) != 0
-		   && root->tail_last_record_lsn != InvalidXLogRecPtr
+	uint32 expected_space_steps = 0;
+	uint32 expected_space_relations;
+	uint64 expected_pages_skipped = 0;
+	uint64 expected_pages_applied = 0;
+	uint32 i;
+
+	if (plan == NULL || root == NULL || result == NULL
+		|| participant >= cluster_cold_plan_participant_count_v1(plan)
+		|| result->detail != CLUSTER_COLD_REPLAY_OK
+		|| result->steps_done != cluster_cold_plan_step_count_v1(plan)
+		|| root->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+		|| (root->root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID) == 0
+		|| root->tail_last_record_lsn == InvalidXLogRecPtr)
+		return false;
+	for (i = 0; i < cluster_cold_plan_step_count_v1(plan); i++) {
+		ClusterColdStepV1 step;
+
+		if (!cluster_cold_plan_step_v1(plan, i, &step))
+			return false;
+		switch (step.step_kind) {
+			case CLUSTER_COLD_STEP_PAGE:
+				if (step.all_skip)
+					expected_pages_skipped++;
+				else
+					expected_pages_applied++;
+				break;
+			case CLUSTER_COLD_STEP_SPACE:
+				expected_space_steps++;
+				break;
+			default:
+				return false;
+		}
+	}
+	expected_space_relations = cluster_cold_plan_space_relation_count_v1(plan);
+	return result->space_steps == expected_space_steps
+		   && result->space_relations_finished == expected_space_relations
+		   && result->pages_skipped == expected_pages_skipped
+		   && result->pages_applied == expected_pages_applied
 		   && result->last_read[participant] == root->tail_last_record_lsn
 		   && result->last_crc[participant] == root->tail_last_record_crc32c
 		   && result->last_end[participant] == root->validated_tail_lsn_exclusive;
