@@ -31,6 +31,8 @@ static int holder_probe_sends;
 static int holder_si_wakes;
 static bool holder_probe_send_ok = true;
 static TimestampTz holder_probe_clock = 1;
+static ClusterPcmPiRelationScanV2 (*local_relation_scan_boundary)(RelFileLocator,
+	uint64, uint32, uint32 *);
 static ClusterGesHolderProbe holder_probe_sent;
 bool
 cluster_ges_holder_probe_send(int32 master, const ClusterGesHolderProbe *probe)
@@ -164,13 +166,17 @@ static bool ko_offer_ack_fixture(const ClusterPiWritebackJobV1 *, uint32, uint64
 								 ClusterWalWriterToken *);
 static bool ko_drop_poll_fixture(uint32 *, bool *);
 static bool (*ko_drop_poll_boundary)(uint32 *, bool *);
+#ifndef Z_REAL_WB_PROOF
 static bool ko_local_closed_fixture(RelFileLocator, uint64, uint64 *);
 static bool ko_local_revision_fixture(uint64);
+#endif
 #define cluster_smgr_drop_work_poll ko_drop_poll_fixture
 #define cluster_pi_writeback_structure_offer_read_v2 ko_offer_notice_fixture
 #define cluster_pi_writeback_structure_offer_ack_v2 ko_offer_ack_fixture
+#ifndef Z_REAL_WB_PROOF
 #define cluster_pi_writeback_local_relation_closed_v3 ko_local_closed_fixture
 #define cluster_pi_writeback_local_revision_current_v3 ko_local_revision_fixture
+#endif
 #include "../../backend/cluster/cluster_ko_lock.c"
 #undef cluster_smgr_drop_work_poll
 #undef cluster_pi_writeback_structure_offer_read_v2
@@ -399,6 +405,8 @@ cluster_pcm_lock_ko_local_relation_scan_v3(RelFileLocator locator, uint64 epoch,
 	local_relation_scan_input = *cursor;
 	if (local_relation_scan_hook != NULL)
 		local_relation_scan_hook(locator);
+	if (local_relation_scan_boundary != NULL)
+		return local_relation_scan_boundary(locator, epoch, budget, cursor);
 	UT_ASSERT_EQ(locator.relNumber, local_scan_rel_number);
 	*cursor += local_relation_scan_advance;
 	if (local_relation_scan_drift == 1)
@@ -468,6 +476,7 @@ cluster_pcm_lock_ko_local_relation_scan_v3_identity(RelFileLocator locator, uint
 	return result;
 }
 
+#ifndef Z_REAL_WB_PROOF
 bool
 cluster_pi_writeback_local_relation_closed_v3(RelFileLocator locator, uint64 formation,
 											  uint64 *revision)
@@ -491,6 +500,7 @@ cluster_pi_writeback_local_revision_current_v3(uint64 revision)
 }
 #undef cluster_pi_writeback_local_relation_closed_v3
 #undef cluster_pi_writeback_local_revision_current_v3
+#endif
 
 static void (*exit_callback)(int, Datum);
 static ResourceReleaseCallback resource_callback;
@@ -1252,8 +1262,28 @@ LWLockInitialize(LWLock *lock, int tranche)
 void
 cluster_shmem_register_region(const ClusterShmemRegion *region)
 {
+#ifdef Z_REAL_WB_PROOF
+	UT_ASSERT(strcmp(region->name, "pgrac PI writeback") == 0);
+	region->init_fn();
+#else
 	abort();
+#endif
 }
+
+static bool ko_stop_requested;
+static bool ko_continue_allowed = true;
+#ifndef Z_REAL_STOP_GATE
+bool
+cluster_normal_stop_requested(void)
+{
+	return ko_stop_requested;
+}
+bool
+cluster_normal_stop_continuation_allowed(void)
+{
+	return !ko_stop_requested || ko_continue_allowed;
+}
+#endif
 
 bool
 cluster_normal_stop_service_new_work(bool modifies_data)
@@ -1279,6 +1309,16 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 void *
 ShmemInitStruct(const char *name, Size size, bool *found)
 {
+#ifdef Z_REAL_WB_PROOF
+	static void *wb_memory;
+	if (strcmp(name, "pgrac PI writeback") == 0) {
+		free(wb_memory);
+		wb_memory = calloc(1, size);
+		UT_ASSERT(wb_memory != NULL);
+		*found = false;
+		return wb_memory;
+	}
+#endif
 	Assert(size == cluster_ko_shmem_size());
 	*found = false;
 	return &storage;

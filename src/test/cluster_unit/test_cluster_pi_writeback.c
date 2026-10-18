@@ -42,6 +42,12 @@ static unsigned wb_offer_complete_calls;
 static ClusterPiWritebackFactV2 wb_offer_observed;
 static int wb_cap_samples, wb_cap_drift, wb_route;
 static bool wb_quorum = true, wb_stop, wb_input_current = true, wb_input_wait;
+static bool wb_continue = true;
+void
+cluster_ko_origin_discard_detail_v1(const ClusterKoDiscardDetailV1 *detail)
+{
+	(void)detail; /* Diagnostic sink; never an admission or completion result. */
+}
 static bool wb_reconfig, wb_scan_paused;
 static ClusterWalSourceRef wb_sources[3];
 static ClusterPcmPiStorageCutV1 wb_storage_cut;
@@ -409,6 +415,11 @@ bool
 cluster_normal_stop_requested(void)
 {
 	return wb_stop;
+}
+bool
+cluster_normal_stop_continuation_allowed(void)
+{
+	return !wb_stop || wb_continue;
 }
 bool
 cluster_reconfig_has_pending_prebump_stage(void)
@@ -1029,6 +1040,7 @@ wb_setup(void)
 	wb_recovered_boot = 9;
 	wb_quorum = wb_input_current = true;
 	wb_stop = wb_input_wait = false;
+	wb_continue = true;
 	wb_reconfig = wb_scan_paused = false;
 	wb_plan_failure_wait = false;
 	rebuild_plan_failure = RF_PAGE_PROOF_DETAIL_OK;
@@ -2599,11 +2611,268 @@ UT_TEST(writeback_local_closure_classifies_all_original_fact_kinds)
 	}
 }
 
+UT_TEST(writeback_stop_empty_proof_remains_passive_and_new_work_is_rejected)
+{
+	ClusterPageDataReceiptV1 *data = wb_setup();
+	ClusterPiWritebackJobV1 *job = NULL;
+	uint64 revision = 0;
+	wb_stop = true;
+	UT_ASSERT(cluster_pi_writeback_local_relation_closed_v3(target.identity.locator, 1, &revision));
+	UT_ASSERT(cluster_pi_writeback_local_revision_current_v3(revision));
+	UT_ASSERT_NE(cluster_pi_writeback_begin_v1((const ClusterPageDataReceiptV1 **)&data, 1,
+		&wb_sources[1], &job), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT(job == NULL);
+	UT_ASSERT_EQ(wb_shared->outbound_pid, 0);
+	/* Observing EMPTY remains legal after the service cut; execution does not. */
+	wb_continue = false;
+	UT_ASSERT(cluster_pi_writeback_local_relation_closed_v3(target.identity.locator, 1, &revision));
+	cluster_page_data_receipt_free_v1(&data);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+UT_TEST(writeback_stop_existing_reply_completes_only_before_original_cut)
+{
+	ClusterPageDataReceiptV1 *data = wb_setup();
+	ClusterPiWritebackJobV1 *job = wb_start(data);
+	uint64 revision;
+	const char *reason;
+	physical_pi_from_source(&wb_sources[1], 19);
+	wb_deliver(0, 1, wb_wire, wb_length);
+	wb_select(1, B_BG_WRITER);
+	UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+	UT_ASSERT(wb_shared->reply_pending);
+	wb_stop = true;
+	wb_continue = false;
+	wb_select(1, B_LMON);
+	cluster_pi_writeback_lmon_tick_v1();
+	UT_ASSERT(wb_shared->reply_pending);
+	UT_ASSERT_EQ(cluster_pi_writeback_normal_stop_poll_v1(&reason), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(!cluster_pi_writeback_local_relation_closed_v3(target.identity.locator, 1, &revision));
+	wb_continue = true;
+	wb_now += WB_RETRY_US;
+	cluster_pi_writeback_lmon_tick_v1();
+	UT_ASSERT(!wb_shared->reply_pending);
+	UT_ASSERT(cluster_pi_writeback_local_relation_closed_v3(target.identity.locator, 1, &revision));
+	wb_select(0, B_CHECKPOINTER);
+	cluster_pi_writeback_release_v1(&job);
+	cluster_page_data_receipt_free_v1(&data);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+UT_TEST(writeback_stop_entered_io_retries_and_sends_bound_reply)
+{
+ for (unsigned version=1;version<=2;version++) {
+  ClusterPageDataReceiptV1 *data=wb_setup();
+  ClusterPiWritebackJobV1 *job;
+  volatile bool caught=false;
+  const char *reason;
+  uint64 revision;
+  if(version==2) wb_local_caps=wb_peer_caps=PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+  job=wb_start(data);
+  physical_pi_from_source(&wb_sources[1],19);
+  wb_deliver(0,1,wb_wire,wb_length);
+  revision=wb_shared->inbound_revision;
+  wb_select(1,B_BG_WRITER);
+  wb_error_after_physical=true;
+  PG_TRY(); { (void)cluster_pi_writeback_bgwriter_tick_v1(); }
+  PG_CATCH(); {
+   caught=true;
+   wb_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS,false,true,NULL);
+   wb_inputs_pinned[1]=false;
+  } PG_END_TRY();
+  UT_ASSERT(caught);
+  UT_ASSERT_EQ(pi_discards,1);
+  UT_ASSERT(wb_shared->physical_started);
+  UT_ASSERT_EQ(wb_shared->inbound_state,WB_QUEUED);
+  wb_stop=true;
+  wb_select(1,B_LMON);
+  cluster_pi_writeback_lmon_tick_v1();
+  UT_ASSERT_EQ(wb_shared->inbound_state,WB_QUEUED);
+  UT_ASSERT_EQ(wb_shared->inbound_revision,revision);
+  UT_ASSERT_EQ(cluster_pi_writeback_normal_stop_poll_v1(&reason),CLUSTER_NORMAL_STOP_PENDING);
+  wb_select(1,B_BG_WRITER);
+  wb_continue=false;
+  UT_ASSERT(!cluster_pi_writeback_bgwriter_tick_v1());
+  UT_ASSERT_EQ(wb_shared->inbound_state,WB_QUEUED);
+  wb_continue=true;
+  wb_resume_wait=true;
+  UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+  UT_ASSERT_EQ(wb_shared->inbound_state,WB_RUNNING);
+  UT_ASSERT(cluster_pi_writeback_retained_read_current_v1(&wb_sources[0]));
+  {
+   ClusterWalSourceRef changed=wb_sources[0];
+   changed.claim.identity.storage_uuid[0]^=1;
+   UT_ASSERT(!cluster_pi_writeback_retained_read_current_v1(&changed));
+   changed=wb_sources[0];changed.claim.database_incarnation++;
+   UT_ASSERT(!cluster_pi_writeback_retained_read_current_v1(&changed));
+   wb_shared->inbound_revision++;
+   UT_ASSERT(!cluster_pi_writeback_retained_read_current_v1(&wb_sources[0]));
+   wb_shared->inbound_revision--;
+   wb_continue=false;
+   UT_ASSERT(!cluster_pi_writeback_retained_read_current_v1(&wb_sources[0]));
+   wb_continue=true;
+  }
+  wb_resume_wait=false;
+  UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+  UT_ASSERT_EQ(pi_discards,1);
+  UT_ASSERT_EQ(wb_shared->inbound_state,WB_REPLIED);
+  UT_ASSERT(wb_shared->reply_pending);
+  wb_select(1,B_LMON);
+  wb_boots[0]++;
+  cluster_pi_writeback_lmon_tick_v1();
+  UT_ASSERT(wb_shared->reply_pending);
+  wb_boots[0]--;
+  wb_now+=WB_RETRY_US;
+  cluster_pi_writeback_lmon_tick_v1();
+  UT_ASSERT(!wb_shared->reply_pending);
+  wb_deliver(1,0,wb_wire,wb_length);
+  UT_ASSERT(wb_shared->outbound_complete);
+  wb_select(0,B_CHECKPOINTER);
+  cluster_pi_writeback_release_v1(&job);
+  cluster_page_data_receipt_free_v1(&data);
+  rf_page_online_plan_destroy_v1(&wb_page_plan);
+  clean();
+ }
+}
+
+UT_TEST(writeback_stop_rejects_new_inbound_notice_in_both_versions)
+{
+ for(unsigned version=1;version<=2;version++) {
+  ClusterPageDataReceiptV1 *data=wb_setup();
+  ClusterPiWritebackJobV1 *job;
+  if(version==2) wb_local_caps=wb_peer_caps=PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+  job=wb_start(data);
+  wb_stop=true;
+  wb_deliver(0,1,wb_wire,wb_length);
+  UT_ASSERT_EQ(wb_shared->inbound_state,WB_EMPTY);
+  UT_ASSERT_EQ(wb_shared->inbound_revision,0);
+  wb_select(1,B_BG_WRITER);
+  (void)cluster_pi_writeback_bgwriter_tick_v1();
+  UT_ASSERT_EQ(pi_discards,0);
+  wb_select(0,B_CHECKPOINTER);
+  cluster_pi_writeback_release_v1(&job);
+  cluster_page_data_receipt_free_v1(&data);
+  rf_page_online_plan_destroy_v1(&wb_page_plan);
+  clean();
+ }
+}
+
+UT_TEST(writeback_stop_unknown_state_never_certifies_idle)
+{
+ ClusterPageDataReceiptV1 *data=wb_setup();
+ const char *reason;
+ uint64 revision;
+ wb_stop=true;
+ wb_shared->inbound_state=WB_REPLIED+1;
+ wb_select(0,B_LMON);
+ cluster_pi_writeback_lmon_tick_v1();
+ UT_ASSERT_EQ(wb_shared->inbound_state,WB_REPLIED+1);
+ UT_ASSERT_EQ(cluster_pi_writeback_normal_stop_poll_v1(&reason),CLUSTER_NORMAL_STOP_INVALID);
+ UT_ASSERT(!cluster_pi_writeback_local_relation_closed_v3(target.identity.locator,1,&revision));
+ cluster_page_data_receipt_free_v1(&data);
+ rf_page_online_plan_destroy_v1(&wb_page_plan);
+ clean();
+}
+
+static unsigned wb_normal_flushes;
+static bool wb_normal_flush(WritebackContext *context)
+{
+ (void)context;wb_normal_flushes++;
+ UT_ASSERT(!wb_shared->bgwriter_flush_quiesced);
+ return false;
+}
+UT_TEST(writeback_original_bg_flush_stops_before_quiescence_is_reported)
+{
+ ClusterPageDataReceiptV1 *data=wb_setup();
+ WritebackContext wb_context;
+ bool can_hibernate;
+ const char *reason;
+ wb_select(0,B_BG_WRITER);wb_normal_flushes=0;
+#define BgBufferSync wb_normal_flush
+#include "test_cluster_bgwriter_flush_cut.inc"
+ UT_ASSERT_EQ(wb_normal_flushes,1);
+ UT_ASSERT(!wb_shared->bgwriter_flush_quiesced);
+ wb_stop=true;
+ UT_ASSERT_EQ(cluster_pi_writeback_normal_stop_poll_v1(&reason),CLUSTER_NORMAL_STOP_PENDING);
+#include "test_cluster_bgwriter_flush_cut.inc"
+#undef BgBufferSync
+ UT_ASSERT(can_hibernate);
+ UT_ASSERT_EQ(wb_normal_flushes,1);
+ UT_ASSERT(wb_shared->bgwriter_flush_quiesced);
+ UT_ASSERT_EQ(cluster_pi_writeback_normal_stop_poll_v1(&reason),CLUSTER_NORMAL_STOP_READY);
+ cluster_page_data_receipt_free_v1(&data);
+ rf_page_online_plan_destroy_v1(&wb_page_plan);
+ clean();
+}
+
+UT_TEST(retained_bgwriter_stops_ordinary_snapshot_wal_before_service_seal)
+{
+ ClusterPageDataReceiptV1 *data=wb_setup();
+ unsigned snapshot_writes=0;
+ TimestampTz last_snapshot_ts=wb_now-15000000;
+ XLogRecPtr last_snapshot_lsn=1;
+#undef XLogStandbyInfoActive
+#define XLogStandbyInfoActive() true
+#define RecoveryInProgress() false
+#define GetLastImportantRecPtr() ((XLogRecPtr)0x200)
+#define LogStandbySnapshot() (++snapshot_writes,(XLogRecPtr)0x400)
+#define LOG_SNAPSHOT_INTERVAL_MS 15000
+#include "test_cluster_bgwriter_snapshot_cut.inc"
+ UT_ASSERT_EQ(snapshot_writes,1);
+ wb_stop=true;
+ for(unsigned cut=0;cut<2;cut++) {
+  wb_continue=cut==0;
+  last_snapshot_ts=wb_now-15000000;last_snapshot_lsn=1;
+#include "test_cluster_bgwriter_snapshot_cut.inc"
+  UT_ASSERT_EQ(snapshot_writes,1);
+ }
+#undef LOG_SNAPSHOT_INTERVAL_MS
+#undef LogStandbySnapshot
+#undef GetLastImportantRecPtr
+#undef RecoveryInProgress
+#undef XLogStandbyInfoActive
+#define XLogStandbyInfoActive() (wal_level >= WAL_LEVEL_REPLICA)
+ cluster_page_data_receipt_free_v1(&data);
+ rf_page_online_plan_destroy_v1(&wb_page_plan);
+ clean();
+}
+
+UT_TEST(retained_bgwriter_cancels_only_original_rebuild_input_scope_on_stop)
+{
+ ClusterPageDataReceiptV1 *data=rebuild_setup();
+ wb_census_tail_bad=true;
+ UT_ASSERT_EQ(cluster_pi_rebuild_bgwriter_tick_v1(),CLUSTER_PI_REBUILD_WAIT);
+ UT_ASSERT(pi_rebuild_job!=NULL);
+ UT_ASSERT_EQ(rebuild_completions,0);
+ wb_stop=true;
+ UT_ASSERT_EQ(cluster_pi_rebuild_bgwriter_tick_v1(),CLUSTER_PI_REBUILD_IDLE);
+ UT_ASSERT(pi_rebuild_job==NULL);
+ UT_ASSERT_EQ(rebuild_completions,0);
+ UT_ASSERT(rebuild_needed);
+ UT_ASSERT(!wb_inputs_pinned[0]);
+ pi_rebuild_release();
+ cluster_page_data_receipt_free_v1(&data);
+ rf_page_online_plan_destroy_v1(&wb_page_plan);
+ clean();
+ wb_census_tail_bad=false;
+ wb_stop=false;
+}
+
 int
 main(void)
 {
 	printf("# sizeof_WritebackShared=%zu\n", sizeof(WritebackShared));
-	UT_PLAN(85);
+	UT_PLAN(93);
+	UT_RUN(retained_bgwriter_stops_ordinary_snapshot_wal_before_service_seal);
+	UT_RUN(retained_bgwriter_cancels_only_original_rebuild_input_scope_on_stop);
+	UT_RUN(writeback_original_bg_flush_stops_before_quiescence_is_reported);
+	UT_RUN(writeback_stop_entered_io_retries_and_sends_bound_reply);
+	UT_RUN(writeback_stop_rejects_new_inbound_notice_in_both_versions);
+	UT_RUN(writeback_stop_unknown_state_never_certifies_idle);
+	UT_RUN(writeback_stop_empty_proof_remains_passive_and_new_work_is_rejected);
+	UT_RUN(writeback_stop_existing_reply_completes_only_before_original_cut);
 	UT_RUN(writeback_local_closure_tracks_exact_original_notice_and_reply);
 	UT_RUN(writeback_unknown_send_and_stop_never_close_local_ack);
 	UT_RUN(writeback_local_closure_rejects_bad_shape_or_exhausted_revision);

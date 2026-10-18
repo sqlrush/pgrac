@@ -6466,22 +6466,23 @@ test_cluster_ko_native_capability.inc: $(top_srcdir)/src/backend/cluster/cluster
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_ko_stop test_cluster_ko_cancel test_cluster_ko_ready_owner test_cluster_ko_drop_io test_cluster_ko_source_io test_cluster_ko_sync_io test_cluster_ko_writeback_io test_cluster_ko_origin_marker test_cluster_ko_native_route test_cluster_ko_origin_checkpoint test_cluster_ko_registration test_cluster_ko_runtime_wire test_cluster_drop_work test_cluster_drop_z: test_cluster_ko_native_capability.inc
+test_cluster_ko_stop test_cluster_ko_cancel test_cluster_ko_ready_owner test_cluster_ko_drop_io test_cluster_ko_source_io test_cluster_ko_sync_io test_cluster_ko_writeback_io test_cluster_ko_origin_marker test_cluster_ko_native_route test_cluster_ko_origin_checkpoint test_cluster_ko_registration test_cluster_ko_runtime_wire test_cluster_drop_work test_cluster_drop_z test_cluster_drop_z_wb test_cluster_drop_z_full: test_cluster_ko_native_capability.inc
 
 # Actual original KO owner and storage consumer; syscall faults use real files.
-test_cluster_drop_work test_cluster_drop_z: %: %.c test_cluster_drop_work.c test_cluster_ko_space.inc test_cluster_ko_abandon.h test_cluster_ko_stop.c test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h \
+test_cluster_drop_work test_cluster_drop_z test_cluster_drop_z_wb test_cluster_drop_z_full: %: %.c test_cluster_drop_work.c test_cluster_ko_space.inc test_cluster_ko_abandon.h test_cluster_ko_stop.c test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h \
 		$(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_ko_lock.c \
 		$(top_srcdir)/src/backend/cluster/storage/cluster_smgr.c \
 		$(top_srcdir)/src/backend/cluster/storage/cluster_shared_fs_sharedfs.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
-		test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) \
+		test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) $(DROP_CHAIN_EXTRA_OBJS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) \
 		$(top_builddir)/src/common/libpgcommon.a $(filter -lcrypto,$(LIBS)) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-TESTS += test_cluster_drop_z
-all: test_cluster_drop_z
+TESTS += test_cluster_drop_z test_cluster_drop_z_wb test_cluster_drop_z_full
+all: test_cluster_drop_z test_cluster_drop_z_wb test_cluster_drop_z_full
+test_cluster_drop_z_wb: test_cluster_drop_z.c
 
 test_cluster_storage_quorum: test_cluster_storage_quorum.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_storage_quorum.c
@@ -9384,3 +9385,29 @@ clean distclean maintainer-clean: clean-space-close-policy
 clean-space-close-policy:
 	rm -f test_cluster_space_close_policy.inc test_cluster_space_close_policy.inc.tmp
 	rm -f test_cluster_space_drop_state.inc test_cluster_space_drop_state.inc.tmp
+
+# Link the original PCM and kernel fixture in a private symbol namespace.
+test_cluster_z_pcm_probe.o: test_cluster_drop_z_pcm.c test_cluster_pcm_lock.c test_cluster_pcm_object_retire
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' -DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' -c $< -o $@
+test_cluster_z_pcm_symbols.inc: test_cluster_z_pcm_probe.o test_cluster_pcm_lock_clock_product.o cluster_drop_pcm_symbols.py
+	python3 cluster_drop_pcm_symbols.py $@ test_cluster_z_pcm_probe.o test_cluster_pcm_lock_clock_product.o
+test_cluster_z_pcm_runtime.o: $(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c test_cluster_z_pcm_symbols.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) -include test_cluster_z_pcm_symbols.inc -Dclock_gettime=cluster_test_pcm_clock_gettime -ffunction-sections -fdata-sections -c $< -o $@
+test_cluster_z_pcm_fixture.o: test_cluster_drop_z_pcm.c test_cluster_pcm_lock.c test_cluster_z_pcm_symbols.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) -include test_cluster_z_pcm_symbols.inc -DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' -DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' -ffunction-sections -fdata-sections -c $< -o $@
+test_cluster_drop_lmon_observe.inc: $(top_srcdir)/src/backend/cluster/cluster_lmon.c Makefile
+	awk '/^lmon_normal_stop_observe\(/ { print "static ClusterNormalStopPollResult"; emit=1; n++ } emit { print } /^}/ { emit=0 } END { if(n!=1 || emit) exit 1 }' $< > $@
+test_cluster_drop_z_full: DROP_CHAIN_EXTRA_OBJS = test_cluster_z_pcm_runtime.o test_cluster_z_pcm_fixture.o $(CLUSTER_VERSION_O) test_cluster_page_wal_product.o test_cluster_page_data_stable.o $(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O)
+test_cluster_drop_z_full: test_cluster_drop_z_wb.c test_cluster_drop_z.c test_cluster_drop_lmon_observe.inc test_cluster_z_pcm_runtime.o test_cluster_z_pcm_fixture.o $(CLUSTER_VERSION_O) test_cluster_page_wal_product.o test_cluster_page_data_stable.o $(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O)
+
+test_cluster_drop_stop_gate.inc: $(top_srcdir)/src/backend/cluster/cluster_clean_leave.c Makefile
+	awk '/^cluster_normal_stop_requested\(/ { print "bool"; emit=1; n++ } /^cluster_normal_stop_failure\(/ { print "ClusterNormalStopFailure"; emit=1; n++ } /^cluster_normal_stop_fail\(/ { print "void"; emit=1; n++ } /^cluster_normal_stop_continuation_allowed\(/ { print "bool"; emit=1; n++ } emit { print } /^}/ { emit=0 } END { if(n!=4 || emit) exit 1 }' $< > $@
+test_cluster_drop_z_full: test_cluster_drop_stop_gate.inc
+
+test_cluster_bgwriter_flush_cut.inc: $(top_srcdir)/src/backend/postmaster/bgwriter.c Makefile
+	awk '/^\t\tif \(cluster_normal_stop_requested\(\)\) \{/ { emit=1; n++ } emit && !/^#endif/ { print } /can_hibernate = BgBufferSync\(&wb_context\);/ { emit=0 } END { if(n!=1 || emit) exit 1 }' $< > $@
+test_cluster_pi_writeback: test_cluster_bgwriter_flush_cut.inc
+
+test_cluster_bgwriter_snapshot_cut.inc: $(top_srcdir)/src/backend/postmaster/bgwriter.c Makefile
+	awk '/^\t\tif \(XLogStandbyInfoActive\(/ { emit=1; n++ } emit { print } /^\t\t}/ { emit=0 } END { if(n!=1 || emit) exit 1 }' $< > $@
+test_cluster_pi_writeback: test_cluster_bgwriter_snapshot_cut.inc

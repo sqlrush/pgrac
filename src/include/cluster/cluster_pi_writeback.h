@@ -93,6 +93,12 @@ extern bool cluster_pi_writeback_ack_matches_v2(const ClusterPiWritebackMessageV
  * Requires the separate v2 capability, which is not yet advertised. */
 extern bool cluster_pi_writeback_request_current_v2(const ClusterPiWritebackMessageV2 *request,
 													bool sending);
+/* Original BG loop's normal flush has completed and will not restart.
+ * Does not certify WB I/O, reply ownership, or a producer seal. */
+extern void cluster_pi_writeback_bgwriter_quiesced_v1(void);
+/* Derived WAL input read only, bound to this original BG notice. This
+ * neither admits a new WB request nor proves any physical completion. */
+extern bool cluster_pi_writeback_retained_read_current_v1(const ClusterWalSourceRef *source);
 
 typedef struct ClusterPiWritebackNoticeV1 ClusterPiWritebackNoticeV1;
 typedef struct ClusterPiWritebackJobV1 ClusterPiWritebackJobV1;

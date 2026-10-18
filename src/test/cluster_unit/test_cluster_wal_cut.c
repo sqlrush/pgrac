@@ -33,6 +33,8 @@ MemoryContext TopMemoryContext = (void *)1;
 static uint64 epoch = 17, incarnations[2] = { 31, 41 }, random_counter;
 static bool quorum = true, pending, native_ready = true;
 static bool flush_ready = true, stop_requested, flush_error;
+static bool continuation_window, retained_read, send_error;
+static ClusterICSendResult send_result=CLUSTER_IC_SEND_DONE;
 static unsigned force_flushes;
 PGPROC *MyProc;
 PROC_HDR *ProcGlobal;
@@ -78,6 +80,16 @@ bool
 cluster_normal_stop_requested(void)
 {
 	return stop_requested;
+}
+bool
+cluster_normal_stop_continuation_allowed(void)
+{
+ return !stop_requested || continuation_window;
+}
+bool
+cluster_pi_writeback_retained_read_current_v1(const ClusterWalSourceRef *source)
+{
+ return source!=NULL && retained_read && cluster_normal_stop_continuation_allowed();
 }
 
 void
@@ -192,7 +204,8 @@ cluster_ic_send_envelope(uint8 kind, int32 dest, const void *p, uint32 n)
 	memcpy(sent, p, n);
 	destination = dest;
 	sends++;
-	return CLUSTER_IC_SEND_DONE;
+	if(send_error) siglongjmp(*PG_exception_stack,1);
+	return send_result;
 }
 ClusterControlRootResult
 cluster_wal_writer_sample_v1(ClusterWalWriterSampleV1 *out)
@@ -265,6 +278,8 @@ reset(void)
 	quorum = native_ready = true;
 	flush_ready = true;
 	stop_requested = flush_error = false;
+ continuation_window=retained_read=send_error=false;
+ send_result=CLUSTER_IC_SEND_DONE;
 	force_flushes = 0;
 	CritSectionCount = 0;
 	memset(shared_found, 0, sizeof(shared_found));
@@ -778,10 +793,67 @@ UT_TEST(completion_retry_respects_owner_gates_and_cancellation)
 	}
 }
 
+UT_TEST(stop_accepts_only_derived_old_wb_read_and_finishes_original_cut)
+{
+ ClusterWalCutV1 *cut=NULL;
+ ClusterWalWriterFlushV1 out;
+ reset();stop_requested=true;continuation_window=true;
+ UT_ASSERT_EQ(cluster_wal_cut_begin_v1(&sources[1],&cut),CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+ UT_ASSERT(cut==NULL);
+ retained_read=true;
+ UT_ASSERT_EQ(cluster_wal_cut_begin_v1(&sources[1],&cut),CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+ if(cut==NULL) return;
+ for(unsigned i=0;i<4 && cluster_wal_cut_poll_v1(cut,&out)!=CLUSTER_CONTROL_ROOT_OK_PRIMARY;i++) roundtrip();
+ UT_ASSERT_EQ(cluster_wal_cut_poll_v1(cut,&out),CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+ UT_ASSERT_EQ(out.complete_end,0x1200);
+ cluster_wal_cut_release_v1(&cut);
+ continuation_window=false;
+ UT_ASSERT_NE(cluster_wal_cut_begin_v1(&sources[1],&cut),CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+ UT_ASSERT(cut==NULL);
+}
+UT_TEST(stop_source_reply_is_owned_until_transport_accepts)
+{
+ ClusterWalCutV1 *cut=NULL;
+ uint8 wire[CLUSTER_WAL_CUT_BYTES];
+ const char *reason;
+ volatile bool caught=false;
+ reset();
+ UT_ASSERT_EQ(cluster_wal_cut_begin_v1(&sources[1],&cut),CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+ MyBackendType=B_LMON;cluster_wal_cut_lmon_tick_v1();
+ memcpy(wire,sent,sizeof(wire));deliver(0,1,wire);
+ stop_requested=true;continuation_window=true;
+ MyBackendType=B_BG_WRITER;
+ UT_ASSERT(cluster_wal_cut_bgwriter_tick_v1());
+ UT_ASSERT(cut_shared->source_reply_pending);
+ MyBackendType=B_LMON;send_error=true;
+ PG_TRY(); { cluster_wal_cut_lmon_tick_v1(); }
+ PG_CATCH(); { caught=true; } PG_END_TRY();
+ UT_ASSERT(caught);
+ UT_ASSERT(cut_shared->source_reply_pending);
+ UT_ASSERT_EQ(cluster_wal_cut_normal_stop_poll_v1(&reason),CLUSTER_NORMAL_STOP_PENDING);
+ send_error=false;send_result=CLUSTER_IC_SEND_HARD_ERROR;
+ cluster_wal_cut_lmon_tick_v1();UT_ASSERT(cut_shared->source_reply_pending);
+ send_result=CLUSTER_IC_SEND_DONE;cluster_wal_cut_lmon_tick_v1();
+ UT_ASSERT(!cut_shared->source_reply_pending);
+ UT_ASSERT_EQ(cluster_wal_cut_normal_stop_poll_v1(&reason),CLUSTER_NORMAL_STOP_READY);
+ select_node(0);MyBackendType=B_BG_WRITER;cluster_wal_cut_release_v1(&cut);
+}
+UT_TEST(stop_unknown_source_state_is_never_empty)
+{
+ const char *reason;
+ reset();stop_requested=true;continuation_window=true;
+ cut_shared->source_state=(WalCutSourceState)(WAL_CUT_SOURCE_REPLIED+1);
+ MyBackendType=B_LMON;cluster_wal_cut_lmon_tick_v1();
+ UT_ASSERT_EQ(cluster_wal_cut_normal_stop_poll_v1(&reason),CLUSTER_NORMAL_STOP_INVALID);
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(15);
+ UT_RUN(stop_accepts_only_derived_old_wb_read_and_finishes_original_cut);
+ UT_RUN(stop_source_reply_is_owned_until_transport_accepts);
+ UT_RUN(stop_unknown_source_state_is_never_empty);
 	UT_RUN(fixed_remote_cut_actively_flushes_idle_original_writer);
 	UT_RUN(old_reply_and_other_owner_cannot_complete_new_job);
 	UT_RUN(cancellation_releases_mailbox_without_inventing_completion);

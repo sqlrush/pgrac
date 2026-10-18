@@ -4146,6 +4146,32 @@ cluster_normal_stop_service_data_sealed(void)
 }
 
 bool
+cluster_normal_stop_continuation_allowed(void)
+{
+	uint32 phase;
+	uint64 now, deadline;
+	bool allowed;
+
+	if (!cluster_normal_stop_requested())
+		return true;
+	if (!IsUnderPostmaster || !cluster_enabled || cl_state == NULL || cl_normal_stop == NULL)
+		return false;
+	now = (uint64)GetCurrentTimestamp();
+	/* Called outside module locks. This only bounds an existing owner's
+	 * execution; it neither admits work nor replaces its exact authority. */
+	LWLockAcquire(&cl_state->lock, LW_SHARED);
+	phase = pg_atomic_read_u32(&cl_normal_stop->phase);
+	deadline = cl_state->barrier_deadline_us;
+	allowed = cluster_normal_stop_failure() == CLUSTER_NORMAL_STOP_FAILURE_NONE
+		&& pg_atomic_read_u32(&cl_normal_stop->identity_published) == 1
+		&& phase >= CLUSTER_NORMAL_STOP_DRAIN && phase < CLUSTER_NORMAL_STOP_CHECKPOINT
+		&& pg_atomic_read_u32(&cl_normal_stop->service_seal) == 0
+		&& now != 0 && deadline != 0 && deadline != UINT64_MAX && now < deadline;
+	LWLockRelease(&cl_state->lock);
+	return allowed;
+}
+
+bool
 cluster_normal_stop_service_control_sealed(void)
 {
 	uint32 seal;

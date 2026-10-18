@@ -63,6 +63,11 @@ z_setup(bool second)
 	Oid database;
 	static unsigned sequence;
 	char name[64];
+	ko_stop_requested = false;
+	ko_continue_allowed = true;
+#ifdef Z_REAL_WB_PROOF
+	cluster_pi_writeback_shmem_register_v1();
+#endif
 
 	snprintf(name, sizeof(name), "z_%u_%u", second, ++sequence);
 	if (!work_setup_v3(name))
@@ -273,6 +278,7 @@ UT_TEST(test_z_pending_observation_binds_original_context_and_local_prefix)
 	UT_ASSERT_EQ(trace.io_error, 0);
 }
 
+#ifndef Z_DROP_NO_MAIN
 int
 main(void)
 {
@@ -326,3 +332,4 @@ main(void)
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
+#endif

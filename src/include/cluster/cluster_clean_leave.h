@@ -729,6 +729,9 @@ cluster_normal_stop_service_idle(ClusterNormalStopPollResult modules);
 extern ClusterNormalStopPollResult cluster_normal_stop_service_seal(uint32 expected_services,
 																	uint32 next_seal);
 extern bool cluster_normal_stop_service_new_work(bool modifies_data);
+/* Scheduling only: existing exact owners still validate their own authority.
+ * Passive EMPTY/revision/census observations do not use this execution gate. */
+extern bool cluster_normal_stop_continuation_allowed(void);
 /* Proactive maintenance stops minting new work after the first cut. This is
  * not admission for a received frame or permission to retire owned work. */
 extern bool cluster_normal_stop_service_data_sealed(void);

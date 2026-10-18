@@ -3979,7 +3979,13 @@ ko_native_attach(void)
 static bool
 ko_native_reserve(ClusterKoCompletionV2 *completion)
 {
-	dsa_area *area = ko_native_attach();
+	dsa_area *area;
+
+	/* New reservations stop at admission. Publication of an already durable
+	 * registration below remains preservation of its original responsibility. */
+	if (cluster_normal_stop_requested())
+		return false;
+	area = ko_native_attach();
 
 	Assert(!DsaPointerIsValid(completion->native_allocation));
 	completion->native_allocation = dsa_allocate_extended(area, sizeof(ClusterKoNativeContinuation),
@@ -5543,6 +5549,8 @@ cluster_ko_shared_native_promote_v2(void)
 	if (ko_state == NULL || MyBackendType != B_CHECKPOINTER || CurrentResourceOwner == NULL
 		|| CritSectionCount != 0 || !cluster_enabled || !cluster_shared_config)
 		return CLUSTER_KO_STRUCTURE_INVALID;
+	if (!cluster_normal_stop_continuation_allowed())
+		return CLUSTER_KO_STRUCTURE_PENDING;
 	SpinLockAcquire(&ko_state->shared_lock);
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
 		if (!ko_state->contexts[i].used) {
@@ -5632,6 +5640,7 @@ cluster_ko_shared_native_poll_v2(void)
 
 	if (ko_state == NULL || !cluster_enabled || !cluster_shared_config
 		|| MyBackendType != B_CHECKPOINTER || CurrentResourceOwner == NULL || CritSectionCount != 0
+		|| !cluster_normal_stop_continuation_allowed()
 		|| (!ko_native_capable(false, false) && !ko_native_capable(true, false)
 			&& !ko_native_capable(true, true)))
 		return false;
@@ -5690,7 +5699,7 @@ ko_drop_actor_current(void)
 {
 	return ko_state != NULL && cluster_enabled && cluster_shared_config
 		   && MyBackendType == B_CHECKPOINTER && MyProcPid > 0 && CurrentResourceOwner != NULL
-		   && CritSectionCount == 0;
+		   && CritSectionCount == 0 && cluster_normal_stop_continuation_allowed();
 }
 
 static bool

@@ -736,12 +736,13 @@ StaticAssertDecl(CLUSTER_LMS_MAX_WORKERS == 8,
  * Postmaster-private process ledger. Never shared, durable or a protocol
  * authority. Slots 0..9 are the immutable service-bit layout; the remaining
  * original lock/lease/cleaner actors are retained but do not sign idle bits. */
-#define NORMAL_STOP_AUX_COUNT 22
+#define NORMAL_STOP_AUX_COUNT 23
 typedef struct NormalStopPostmaster {
 	bool selected;
 	bool exit_released;
 	bool checkpoint_exited;
 	bool lmd_enabled;
+	bool bgwriter_retained;
 	int lms_workers;
 	uint32 expected, reaped;
 	pid_t pids[NORMAL_STOP_AUX_COUNT];
@@ -763,6 +764,7 @@ NormalStopPostmasterPids(pid_t pids[NORMAL_STOP_AUX_COUNT])
 	pids[13] = CssdPID;
 	for (int worker = 0; worker < 8; worker++)
 		pids[14 + worker] = UndoCleanerPIDs[worker];
+	pids[22] = cluster_shared_config ? BgWriterPID : 0;
 }
 
 static bool NormalStopPostmasterRosterMatches(void);
@@ -801,7 +803,8 @@ NormalStopPostmasterPreselectReady(void)
 	NormalStopPostmasterPids(pids);
 	for (int i = 0; i < NORMAL_STOP_AUX_COUNT; i++) {
 		bool expected
-			= !(i >= 1 && i <= 8 && i > cluster_lms_workers) && !(i == 11 && !cluster_lmd_enabled);
+			= !(i >= 1 && i <= 8 && i > cluster_lms_workers) && !(i == 11 && !cluster_lmd_enabled)
+			&& !(i == 22 && !cluster_shared_config);
 		if (expected ? pids[i] <= 0 : pids[i] != 0)
 			return false;
 		if (expected)
@@ -834,12 +837,14 @@ NormalStopPostmasterBegin(void)
 	normal_stop_pm.selected = true;
 	normal_stop_pm.lms_workers = cluster_lms_workers;
 	normal_stop_pm.lmd_enabled = cluster_lmd_enabled;
+	normal_stop_pm.bgwriter_retained = cluster_shared_config;
 	NormalStopPostmasterPids(normal_stop_pm.pids);
 	normal_stop_pm.checkpointer = CheckpointerPID;
 	/* Requirements come from the boot configuration, NEVER from which
 	 * child happens to remain alive when shutdown was requested. */
 	for (int i = 0; i < NORMAL_STOP_AUX_COUNT; i++)
-		if (!(i >= 1 && i <= 8 && i > cluster_lms_workers) && !(i == 11 && !cluster_lmd_enabled))
+		if (!(i >= 1 && i <= 8 && i > cluster_lms_workers) && !(i == 11 && !cluster_lmd_enabled)
+			&& !(i == 22 && !normal_stop_pm.bgwriter_retained))
 			normal_stop_pm.expected |= UINT32_C(1) << i;
 	if (!cluster_normal_stop_postmaster_request())
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
@@ -855,6 +860,8 @@ NormalStopPostmasterRosterMatches(void)
 	if (normal_stop_pm.lms_workers < 1 || normal_stop_pm.lms_workers > 8 || !cluster_lms_enabled
 		|| cluster_lms_workers != normal_stop_pm.lms_workers
 		|| cluster_lmd_enabled != normal_stop_pm.lmd_enabled || LmsWorkerPIDs[0] != 0)
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_CHILD_EXIT);
+	if (normal_stop_pm.bgwriter_retained != cluster_shared_config)
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_CHILD_EXIT);
 	NormalStopPostmasterPids(current);
 	for (int i = 0; i < NORMAL_STOP_AUX_COUNT; i++) {
@@ -4598,9 +4605,10 @@ PostmasterStateMachine(void)
 		/* and the autovac launcher too */
 		if (AutoVacPID != 0)
 			signal_child(AutoVacPID, SIGTERM);
-		/* and the bgwriter too */
+#ifndef USE_PGRAC_CLUSTER
 		if (BgWriterPID != 0)
 			signal_child(BgWriterPID, SIGTERM);
+#endif
 		/* and the walwriter too */
 		if (WalWriterPID != 0)
 			signal_child(WalWriterPID, SIGTERM);
@@ -4612,6 +4620,10 @@ PostmasterStateMachine(void)
 											  && cluster_clean_leave_phase1_full_stop_candidate();
 			bool retain_shutdown_coordination
 				= retain_normal_stop || retain_rf_a1_coordination || retain_phase1_coordination;
+			/* Its old WB I/O/replies remain this original process's duty.
+			 * Normal flushes quiesce before the module can grant producer seal. */
+			if ((!retain_normal_stop || !normal_stop_pm.bgwriter_retained) && BgWriterPID != 0)
+				signal_child(BgWriterPID, SIGTERM);
 
 			/*
 			 * A formed RF A1 registry stops Stats first so W4 cannot race
@@ -4715,7 +4727,12 @@ PostmasterStateMachine(void)
 		 * after writing the checkpoint record.
 		 */
 		if (CountChildren(BACKEND_TYPE_ALL - BACKEND_TYPE_WALSND) == 0 && StartupPID == 0
-			&& WalReceiverPID == 0 && BgWriterPID == 0
+			&& WalReceiverPID == 0
+#ifdef USE_PGRAC_CLUSTER
+			&& ((retain_normal_stop && normal_stop_pm.bgwriter_retained) || BgWriterPID == 0)
+#else
+			&& BgWriterPID == 0
+#endif
 			&& (CheckpointerPID == 0 || (!FatalError && Shutdown < ImmediateShutdown))
 			&& WalWriterPID == 0 &&
 #ifdef USE_PGRAC_CLUSTER
@@ -4834,7 +4851,7 @@ PostmasterStateMachine(void)
 		 * left by now anyway; what we're really waiting for is walsenders and
 		 * archiver.
 		 */
-		if (PgArchPID == 0 && CountChildren(BACKEND_TYPE_ALL) == 0
+		if (PgArchPID == 0 && BgWriterPID == 0 && CountChildren(BACKEND_TYPE_ALL) == 0
 #ifdef USE_PGRAC_CLUSTER
 			&& LmonPID == 0 && CssdPID == 0 && QvotecPID == 0 && LmsPID == 0
 			&& LmsWorkersAllReaped() && LckPID == 0 && LmdPID == 0 && SinvalBcastPID == 0

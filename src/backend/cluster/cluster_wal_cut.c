@@ -4,11 +4,13 @@
 #include <unistd.h>
 
 #include "access/xlog.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_membership.h"
+#include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_shmem.h"
@@ -36,6 +38,7 @@ typedef struct WalCutShared {
 	int32 owner_pid;
 	int32 owner_procno;
 	bool completion_pending;
+	bool retained_read;
 	uint64 revision;
 	ClusterControlRootResult result;
 	ClusterWalCutMessageV1 request;
@@ -58,6 +61,7 @@ struct ClusterWalCutV1 {
 	uint64 revision;
 	bool stale;
 	bool complete;
+	bool retained_read;
 	ClusterWalCutMessageV1 requested;
 	ClusterWalWriterFlushV1 accepted;
 };
@@ -205,7 +209,7 @@ cut_current(const ClusterWalCutMessageV1 *m, bool collector)
 	int32 source = m->source.claim.identity.origin_node_id;
 	uint64 boot
 		= collector ? m->collector_incarnation : m->source.claim.identity.origin_owner_incarnation;
-	return cluster_enabled && cluster_shared_config && !cluster_normal_stop_requested()
+	return cluster_enabled && cluster_shared_config
 		   && cut_message_valid(m) && cluster_node_id == (collector ? (int32)m->collector : source)
 		   && GetSystemIdentifier() == m->source.claim.identity.system_identifier
 		   && cluster_qvotec_get_self_incarnation() == boot && cluster_qvotec_in_quorum()
@@ -217,6 +221,13 @@ cut_current(const ClusterWalCutMessageV1 *m, bool collector)
 		   && cluster_membership_get_state(source) == CLUSTER_MEMBER_MEMBER
 		   && cluster_membership_get_last_admitted_incarnation(source)
 				  == m->source.claim.identity.origin_owner_incarnation;
+}
+
+static bool
+cut_collector_current(const ClusterWalCutMessageV1 *request, bool retained_read)
+{
+	return (!cluster_normal_stop_requested() || retained_read)
+		&& cluster_normal_stop_continuation_allowed() && cut_current(request, true);
 }
 
 static bool
@@ -320,17 +331,20 @@ cluster_wal_cut_begin_v1(const ClusterWalSourceRef *source, ClusterWalCutV1 **ou
 	ClusterWalCutV1 *cut;
 	int32 procno = cut_collector_procno();
 	bool acquired = false;
+	bool retained_read;
 	if (source == NULL || out == NULL || *out != NULL || !cut_background()
 		|| CurrentResourceOwner == NULL || cut_shared == NULL || procno < 0)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	if (active_cut != NULL)
 		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	retained_read = cluster_pi_writeback_retained_read_current_v1(source);
 	request.verb = CLUSTER_WAL_CUT_SAMPLE;
 	request.collector = cluster_node_id;
 	request.collector_incarnation = cluster_qvotec_get_self_incarnation();
 	request.epoch = cluster_epoch_get_current();
 	request.source = *source;
-	if (!pg_strong_random(&request.nonce, sizeof(request.nonce)) || !cut_current(&request, true))
+	if (!pg_strong_random(&request.nonce, sizeof(request.nonce))
+		|| !cut_collector_current(&request, retained_read))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	/* The input scope keeps its ResourceOwner/current memory context alive.
 	 * Native ERROR cleanup releases that owner before resetting its context. */
@@ -339,13 +353,16 @@ cluster_wal_cut_begin_v1(const ClusterWalSourceRef *source, ClusterWalCutV1 **ou
 	cut->procno = procno;
 	cut->owner = CurrentResourceOwner;
 	cut->requested = request;
+	cut->retained_read = retained_read;
 	cut_register_cleanup();
 	SpinLockAcquire(&cut_shared->lock);
-	if (cut_shared->owner_pid == 0 && cut_shared->revision != UINT64_MAX) {
+	if (cut_shared->owner_pid == 0 && cut_shared->revision != UINT64_MAX
+		&& (!cluster_normal_stop_requested() || retained_read)) {
 		cut->revision = ++cut_shared->revision;
 		cut_shared->owner_pid = MyProcPid;
 		cut_shared->owner_procno = procno;
 		cut_shared->completion_pending = false;
+		cut_shared->retained_read = retained_read;
 		cut_shared->request = request;
 		memset(&cut_shared->reply, 0, sizeof(cut_shared->reply));
 		cut_shared->result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
@@ -373,7 +390,7 @@ cluster_wal_cut_poll_v1(ClusterWalCutV1 *cut, ClusterWalWriterFlushV1 *out)
 	if (cut == NULL || cut->pid != getpid() || cut->owner != CurrentResourceOwner
 		|| !cut_background())
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	if (cut->stale || !cut_current(&cut->requested, true)) {
+	if (cut->stale || !cut_collector_current(&cut->requested, cut->retained_read)) {
 		cut_cancel(cut);
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	}
@@ -421,7 +438,7 @@ cluster_wal_cut_consume_completion_v1(void)
 		|| cut->owner != CurrentResourceOwner || !cut_background()
 		|| cut_collector_procno() != cut->procno)
 		return false;
-	current = cut_current(&cut->requested, true);
+	current = cut_collector_current(&cut->requested, cut->retained_read);
 	SpinLockAcquire(&cut_shared->lock);
 	if (cut_shared->owner_pid == MyProcPid && cut_shared->owner_procno == cut->procno
 		&& cut_shared->revision == cut->revision && cut_shared->completion_pending) {
@@ -477,7 +494,7 @@ cut_source_enqueue(const ClusterWalCutMessageV1 *request)
 		}
 	}
 	SpinLockRelease(&cut_shared->lock);
-	if (same || state == WAL_CUT_SOURCE_QUEUED || state == WAL_CUT_SOURCE_RUNNING
+	if (same || (state != WAL_CUT_SOURCE_EMPTY && state != WAL_CUT_SOURCE_REPLIED)
 		|| revision == UINT64_MAX)
 		return;
 	if (request->verb == CLUSTER_WAL_CUT_SAMPLE) {
@@ -496,7 +513,8 @@ cut_source_enqueue(const ClusterWalCutMessageV1 *request)
 	SpinLockAcquire(&cut_shared->lock);
 	if (cut_shared->source_revision == revision
 		&& (cut_shared->source_state == WAL_CUT_SOURCE_EMPTY
-			|| cut_shared->source_state == WAL_CUT_SOURCE_REPLIED)) {
+			|| (cut_shared->source_state == WAL_CUT_SOURCE_REPLIED
+				&& !cut_shared->source_reply_pending))) {
 		cut_shared->source_revision++;
 		cut_shared->source_request = *request;
 		cut_shared->source_sample = sample;
@@ -517,6 +535,7 @@ cluster_wal_cut_ingress_v1(const ClusterICEnvelope *env, const void *payload)
 	ClusterWalCutMessageV1 m;
 	int32 procno = -1, pid = 0;
 	if (MyBackendType != B_LMON || env == NULL || env->msg_type != PGRAC_IC_MSG_WAL_CUT
+		|| !cluster_normal_stop_continuation_allowed()
 		|| env->dest_node_id != (uint32)cluster_node_id
 		|| !cluster_wal_cut_decode_v1(payload, env->payload_length, &m) || env->epoch != m.epoch)
 		return;
@@ -567,10 +586,12 @@ cluster_wal_cut_bgwriter_tick_v1(void)
 	ClusterWalWriterSampleV1 sample;
 	ClusterWalWriterFlushV1 flushed;
 	volatile ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	volatile bool completed = false;
 	uint64 revision;
 	bool queued;
 	if (MyBackendType != B_BG_WRITER || cut_shared == NULL || !cluster_enabled
-		|| !cluster_shared_config || CurrentResourceOwner == NULL || CritSectionCount != 0)
+		|| !cluster_shared_config || CurrentResourceOwner == NULL || CritSectionCount != 0
+		|| !cluster_normal_stop_continuation_allowed())
 		return false;
 	cut_register_cleanup();
 	SpinLockAcquire(&cut_shared->lock);
@@ -603,6 +624,7 @@ cluster_wal_cut_bgwriter_tick_v1(void)
 			if (!cut_current(&reply, false))
 				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		}
+		completed = true;
 	}
 	PG_FINALLY();
 	{
@@ -617,7 +639,7 @@ cluster_wal_cut_bgwriter_tick_v1(void)
 				cut_shared->source_reply = reply;
 				cut_shared->source_state = WAL_CUT_SOURCE_REPLIED;
 			} else
-				cut_shared->source_state = result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+				cut_shared->source_state = !completed || result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
 											   ? WAL_CUT_SOURCE_QUEUED
 											   : WAL_CUT_SOURCE_EMPTY;
 		}
@@ -636,22 +658,23 @@ cluster_wal_cut_lmon_tick_v1(void)
 	uint64 revision, source_revision;
 	int32 owner;
 	bool reply_pending;
-	bool stopping;
+	bool retained_read;
+	bool continuation_allowed;
 	uint8 wire[CLUSTER_WAL_CUT_BYTES];
 	TimestampTz now;
 	if (MyBackendType != B_LMON || cut_shared == NULL)
 		return;
-	stopping = cluster_normal_stop_requested();
+	continuation_allowed = cluster_normal_stop_continuation_allowed();
 	SpinLockAcquire(&cut_shared->lock);
-	if (stopping) {
+	if (cluster_normal_stop_requested() && !cut_shared->retained_read) {
 		cut_shared->owner_pid = 0;
 		cut_shared->owner_procno = -1;
 		cut_shared->completion_pending = false;
 		cut_shared->result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-		if (cut_shared->source_state != WAL_CUT_SOURCE_RUNNING) {
-			cut_shared->source_state = WAL_CUT_SOURCE_EMPTY;
-			cut_shared->source_reply_pending = false;
-		}
+	}
+	/* Cancelling an ordinary read-only collector grants no DATA/PI proof.
+	 * Source flushes and replies remain independently owned, even on refusal. */
+	if (!continuation_allowed) {
 		SpinLockRelease(&cut_shared->lock);
 		return;
 	}
@@ -659,27 +682,26 @@ cluster_wal_cut_lmon_tick_v1(void)
 	revision = cut_shared->revision;
 	result = cut_shared->result;
 	request = cut_shared->request;
+	retained_read = cut_shared->retained_read;
 	source_revision = cut_shared->source_revision;
 	reply_pending
 		= cut_shared->source_state == WAL_CUT_SOURCE_REPLIED && cut_shared->source_reply_pending;
 	reply = cut_shared->source_reply;
-	if (reply_pending)
-		cut_shared->source_reply_pending = false;
 	SpinLockRelease(&cut_shared->lock);
 	if (reply_pending && cut_current(&reply, false) && cluster_wal_cut_encode_v1(&reply, wire)) {
 		ClusterICSendResult sent
 			= cluster_ic_send_envelope(PGRAC_IC_MSG_WAL_CUT, reply.collector, wire, sizeof(wire));
-		if (sent != CLUSTER_IC_SEND_DONE && sent != CLUSTER_IC_SEND_WOULD_BLOCK) {
+		if (sent == CLUSTER_IC_SEND_DONE || sent == CLUSTER_IC_SEND_WOULD_BLOCK) {
 			SpinLockAcquire(&cut_shared->lock);
 			if (cut_shared->source_revision == source_revision
 				&& cut_shared->source_state == WAL_CUT_SOURCE_REPLIED)
-				cut_shared->source_reply_pending = true;
+				cut_shared->source_reply_pending = false;
 			SpinLockRelease(&cut_shared->lock);
 		}
 	}
 	if (owner == 0 || result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
 		return;
-	if (!cut_current(&request, true)) {
+	if (!cut_collector_current(&request, retained_read)) {
 		SpinLockAcquire(&cut_shared->lock);
 		if (cut_shared->owner_pid == owner && cut_shared->revision == revision) {
 			cut_shared->result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
@@ -705,7 +727,7 @@ cluster_wal_cut_lmon_tick_v1(void)
 ClusterNormalStopPollResult
 cluster_wal_cut_normal_stop_poll_v1(const char **reason)
 {
-	bool active;
+	bool active, invalid;
 	if (reason != NULL)
 		*reason = NULL;
 	if (!cluster_shared_config)
@@ -716,9 +738,19 @@ cluster_wal_cut_normal_stop_poll_v1(const char **reason)
 		return CLUSTER_NORMAL_STOP_INVALID;
 	}
 	SpinLockAcquire(&cut_shared->lock);
+	invalid = cut_shared->source_state < WAL_CUT_SOURCE_EMPTY
+		|| cut_shared->source_state > WAL_CUT_SOURCE_REPLIED
+		|| (cut_shared->source_state == WAL_CUT_SOURCE_EMPTY
+			&& (cut_shared->source_pid != 0 || cut_shared->source_reply_pending));
 	active = cut_shared->owner_pid != 0 || cut_shared->source_state == WAL_CUT_SOURCE_QUEUED
-			 || cut_shared->source_state == WAL_CUT_SOURCE_RUNNING;
+			 || cut_shared->source_state == WAL_CUT_SOURCE_RUNNING
+			 || cut_shared->source_reply_pending;
 	SpinLockRelease(&cut_shared->lock);
+	if (invalid) {
+		if (reason != NULL)
+			*reason = "WAL_CUT_OWNER_STATE_INVALID";
+		return CLUSTER_NORMAL_STOP_INVALID;
+	}
 	if (active && reason != NULL)
 		*reason = "WAL_CUT_NATIVE_FLUSH_PENDING";
 	return active ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_READY;

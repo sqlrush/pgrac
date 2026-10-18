@@ -6350,6 +6350,25 @@ UT_TEST(test_precheckpoint_wait_drives_its_own_cf_retirement)
 	checkpoint_cf_retirement_pending = 0;
 }
 
+UT_TEST(test_original_continuation_gate_ends_at_seal_or_original_deadline)
+{
+ for (unsigned mutation=0;mutation<6;mutation++) {
+  seed_module_drain();
+  UT_ASSERT(cluster_normal_stop_continuation_allowed());
+  switch(mutation) {
+   case 0: pg_atomic_write_u32(&cl_normal_stop->service_seal,1); break;
+   case 1: fixture_now=cl_state->barrier_deadline_us; break;
+   case 2: pg_atomic_write_u32(&cl_normal_stop->identity_published,0); break;
+   case 3: pg_atomic_write_u32(&cl_normal_stop->phase,CLUSTER_NORMAL_STOP_CHECKPOINT); break;
+   case 4: cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_SERVICE); break;
+   case 5: pg_atomic_write_u32(&cl_normal_stop->phase,CLUSTER_NORMAL_STOP_IDLE); break;
+  }
+  UT_ASSERT(!cluster_normal_stop_continuation_allowed());
+ }
+ reset_identity();
+ UT_ASSERT(cluster_normal_stop_continuation_allowed());
+}
+
 int
 main(void)
 {
@@ -6359,7 +6378,8 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(160);
+	UT_PLAN(161);
+	UT_RUN(test_original_continuation_gate_ends_at_seal_or_original_deadline);
 	UT_RUN(test_actual_prepare_never_starts_native_work_after_producer_seal);
 	UT_RUN(test_actual_prepare_does_not_start_owner_work_after_original_deadline);
 	UT_RUN(test_actual_prepare_keeps_failed_native_work_and_rejects_stop);

@@ -464,6 +464,7 @@ static bool object_origin_discard;
 static RelFileLocator object_drop_locator;
 static unsigned object_drop_queries;
 bool cluster_ko_directory_drop_retired_v3(RelFileLocator locator);
+#ifndef Z_PCM_ORIGINAL_KO
 bool
 cluster_ko_directory_drop_retired_v3(RelFileLocator locator)
 {
@@ -478,6 +479,7 @@ cluster_ko_local_drop_discard_current_v4(RelFileLocator locator)
 	return cluster_ko_directory_drop_retired_v3(locator)
 		|| (object_origin_discard && RelFileLocatorEquals(locator, object_drop_locator));
 }
+#endif
 
 /* Backend-local diagnostics are not KO authority in this PCM fixture. */
 void
