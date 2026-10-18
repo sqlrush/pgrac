@@ -409,13 +409,15 @@ cold_tt_undo_base_redo_plan(const ClusterColdTypedV1 *typed, uint32 participant,
 		|| base_header->wrap_count != ((const UndoSegmentHeaderData *)header.page.data)->wrap_count)
 		return NULL;
 	plan = typed->side_plans[participant];
-	/* A later FPI cannot give captured DATA ancestry after INIT or REUSE. */
+	/* Prefix history is already represented by the captured base. Only a
+	 * lifecycle operation in the replay interval breaks its DATA ancestry;
+	 * a later FPI cannot restore that ancestry after INIT or REUSE. */
 	for (uint32 i = 0; i < rf_side_online_plan_operation_count_v1(plan); i++) {
 		RfSideOnlineOperationV1 operation;
 
 		if (!rf_side_online_plan_operation_v1(plan, i, &operation)
-			|| (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO && operation.undo.instance == *owner
-				&& operation.undo.segment_id == *segment
+			|| (!operation.history_only && operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
+				&& operation.undo.instance == *owner && operation.undo.segment_id == *segment
 				&& (operation.undo.kind == CLUSTER_UNDO_KIND_SEGMENT_INIT
 					|| operation.undo.kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE)))
 			return NULL;
