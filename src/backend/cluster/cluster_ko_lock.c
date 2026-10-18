@@ -7833,7 +7833,7 @@ ko_origin_discard_record(ClusterKoOriginDiscardReason reason, bool wait,
 	previous = pg_atomic_fetch_or_u64(&ko_state->origin_discard_logged_mask, bit);
 	if ((previous & bit) == 0)
 		ereport(LOG,
-			(errmsg("native DROP origin discard %s reason=%s locator=%u/%u/%u batch=" UINT64_FORMAT " serial=" UINT64_FORMAT " phase=%u cursor=%u revision=" UINT64_FORMAT " saved_revision=" UINT64_FORMAT " wb_revision=" UINT64_FORMAT " gate_phase=%u gate_formation=" UINT64_FORMAT " gate_freeze=" UINT64_FORMAT " subpredicate=%u detail_valid=%u source=%u projection=0x%X x_holder=%d s_holders=0x%X s_refs=%u local_owner=%u detail_locator=%u/%u/%u fork=%d block=%u slot=%u owner_pid=%d state=%u refs=%u flags=0x%08X predicate_mask=0x%08X detail_revision=" UINT64_FORMAT " value=" UINT64_FORMAT " value2=" UINT64_FORMAT,
+			(errmsg("native DROP origin discard %s reason=%s locator=%u/%u/%u batch=" UINT64_FORMAT " serial=" UINT64_FORMAT " phase=%u cursor=%u revision=" UINT64_FORMAT " saved_revision=" UINT64_FORMAT " wb_revision=" UINT64_FORMAT " gate_phase=%u gate_formation=" UINT64_FORMAT " gate_freeze=" UINT64_FORMAT " subpredicate=%u detail_valid=%u source=%u projection=0x%X x_holder=%d s_holders=0x%X s_refs=%u local_owner=%u detail_locator=%u/%u/%u fork=%d block=%u slot=%u owner_pid=%d state=%u refs=%u flags=0x%08X predicate_mask=0x%08X detail_revision=" UINT64_FORMAT " value=" UINT64_FORMAT " value2=" UINT64_FORMAT " round_phase=%u send_pending=%u delivery_buffer=%u delivery_purpose=" UINT64_FORMAT,
 				wait ? "wait" : "restart", cluster_ko_origin_discard_reason_name(reason),
 				locator.spcOid, locator.dbOid, locator.relNumber,
 				owned->barrier_request_v3.base.batch_id, owned->serial, phase, cursor,
@@ -7844,7 +7844,8 @@ ko_origin_discard_record(ClusterKoOriginDiscardReason reason, bool wait,
 				detail.locator.spcOid, detail.locator.dbOid, detail.locator.relNumber,
 				detail.forknum, detail.blocknum, detail.slot, detail.pid, detail.state,
 				detail.refs, detail.flags, detail.predicate_mask, detail.revision,
-				detail.value, detail.value2)));
+				detail.value, detail.value2, detail.round_phase, detail.send_pending,
+				detail.delivery_buffer_id_plus_one, detail.delivery_executor_purpose)));
 }
 
 static bool

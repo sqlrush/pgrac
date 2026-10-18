@@ -773,6 +773,10 @@ typedef struct ClusterKoDiscardDetailV1 {
 	uint32 s_holders;
 	uint32 s_holder_refs;
 	uint32 local_owner_state;
+	uint32 round_phase;
+	uint32 send_pending;
+	uint32 delivery_buffer_id_plus_one;
+	uint64 delivery_executor_purpose;
 	uint64 revision;
 	uint64 value;
 	uint64 value2;

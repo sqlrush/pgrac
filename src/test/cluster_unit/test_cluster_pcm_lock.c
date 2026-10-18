@@ -477,6 +477,13 @@ cluster_ko_local_drop_discard_current_v4(RelFileLocator locator)
 		|| (object_origin_discard && RelFileLocatorEquals(locator, object_drop_locator));
 }
 
+/* Backend-local diagnostics are not KO authority in this PCM fixture. */
+void
+cluster_ko_origin_discard_detail_v1(const ClusterKoDiscardDetailV1 *detail)
+{
+	(void)detail;
+}
+
 /* PGRAC: spec-2.31 D1 v0.4 — ConditionVariable stub counters (declared
  * here so reset_fake_pcm_runtime() can clear them;  definitions of the
  * stub functions themselves live below LWLockHeldByMeInMode). */
