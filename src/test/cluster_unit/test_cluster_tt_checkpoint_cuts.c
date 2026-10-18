@@ -29,6 +29,7 @@ static int coverage_waits, coverage_absorbs, coverage_guts, coverage_commits;
 static int coverage_redo_applies;
 static int coverage_finish_after;
 static bool coverage_premature;
+static void (*coverage_wait_resume)(void);
 
 static XLogRecPtr
 coverage_flush_ptr(TimeLineID *timeline)
@@ -135,7 +136,9 @@ coverage_sleep(long delay)
 	(void)delay;
 	coverage_waits++;
 	if (coverage_waits == coverage_finish_after) {
-		if (tt_commit_stage.armed)
+		if (coverage_wait_resume != NULL)
+			coverage_wait_resume();
+		else if (tt_commit_stage.armed)
 			coverage_finish_commit();
 		else
 			MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
@@ -199,6 +202,7 @@ coverage_setup(void)
 	coverage_redo_applies = 0;
 	coverage_finish_after = 1;
 	coverage_premature = false;
+	coverage_wait_resume = NULL;
 	coverage_commit_end = coverage_flush = 100;
 	MyProc->lxid = 1;
 	MyProc->delayChkptFlags = DELAY_CHKPT_START;
@@ -413,8 +417,11 @@ UT_TEST(test_active_base_survives_multiple_checkpoints_without_terminal_inferenc
 	UT_ASSERT_EQ(coverage_waits, 0);
 }
 
+#ifndef TT_CHECKPOINT_TEST_MAIN
+#define TT_CHECKPOINT_TEST_MAIN main
+#endif
 int
-main(void)
+TT_CHECKPOINT_TEST_MAIN(void)
 {
 	UT_PLAN(8);
 	UT_RUN(test_pre_redo_commit_waits_for_apply_and_header_sync);
