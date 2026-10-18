@@ -84,6 +84,26 @@ static ClusterControlRootReadToken tokens[NROOTS + 1];
 static XLogRecPtr native_redo[NROOTS + 1];
 static ClusterWalRecoveryCheckpointV1 native_checkpoint[NROOTS + 1];
 static ClusterControlRootResult source_result[NROOTS + 1];
+char *cluster_shared_data_dir = "fixture-shared";
+static ClusterControlRootResult commit_ts_profile_result[NROOTS];
+static unsigned commit_ts_profile_calls[NROOTS], commit_ts_profile_fail_after[NROOTS];
+
+ClusterControlRootResult cluster_control_native_commit_ts_profile_v1(const char *shared_root,
+																   uint32 node);
+
+/* Physical I/O remains a fixture here; control-root tests exercise the actual
+ * bounded directory reader. Each failure models an observation at this call. */
+ClusterControlRootResult
+cluster_control_native_commit_ts_profile_v1(const char *shared_root, uint32 node)
+{
+	if (shared_root == NULL || strcmp(shared_root, cluster_shared_data_dir) != 0 || node >= NROOTS)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	commit_ts_profile_calls[node]++;
+	return commit_ts_profile_calls[node] > commit_ts_profile_fail_after[node]
+			   ? commit_ts_profile_result[node]
+			   : CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
 static uint16 fence_count;
 static ClusterColdDetailV1 scan_result[NROOTS + 1];
 static uint64 data_token;
@@ -1277,6 +1297,9 @@ fixture(void)
 	memset(roots, 0, sizeof(roots));
 	memset(tokens, 0, sizeof(tokens));
 	memset(native_checkpoint, 0, sizeof(native_checkpoint));
+	memset(commit_ts_profile_result, 0, sizeof(commit_ts_profile_result));
+	memset(commit_ts_profile_calls, 0, sizeof(commit_ts_profile_calls));
+	memset(commit_ts_profile_fail_after, 0, sizeof(commit_ts_profile_fail_after));
 	for (thread = 1; thread <= NROOTS; thread++) {
 		ClusterControlRootIdentity *id = &roots[thread].identity;
 		ClusterWalThreadClaim claim;

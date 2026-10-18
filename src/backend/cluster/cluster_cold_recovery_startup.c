@@ -50,6 +50,7 @@
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_control_root.h"
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_page_cold_redo.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_recovery_merge.h"
@@ -59,6 +60,7 @@
 #include "storage/bufpage.h"
 #include "storage/checksum.h"
 #include "utils/memutils.h"
+#include "cluster_control_bootstrap_private.h"
 
 /* cluster.cold_recovery_plan_memory, kB; registered with the cluster GUCs. */
 int cluster_cold_recovery_plan_memory = CLUSTER_COLD_PLAN_MEMORY_DEFAULT_KB;
@@ -720,6 +722,30 @@ cold_side_create(ClusterColdTypedV1 *typed)
 	return true;
 }
 
+/* Bootstrap's unsupported physical-profile check is provisional. Recheck
+ * each original origin, including history-only inputs, under this owner;
+ * generations share one physical directory and confer no new authority. */
+static bool
+cold_native_profiles_match(const ClusterColdTypedV1 *typed)
+{
+	bool seen[CLUSTER_CONTROL_ROOT_RECORD_COUNT] = { false };
+
+	for (uint32 p = 0; p < typed->participant_count; p++) {
+		uint32 node = typed->sources[p].claim.identity.origin_node_id;
+
+		if (node >= CLUSTER_CONTROL_ROOT_RECORD_COUNT
+			|| typed->participants[p].thread_id != node + 1)
+			return false;
+		if (seen[node])
+			continue;
+		if (cluster_control_native_commit_ts_profile_v1(cluster_shared_data_dir, node)
+			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return false;
+		seen[node] = true;
+	}
+	return true;
+}
+
 static bool
 cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots,
 				   ClusterRecoveryFencePlan *fence)
@@ -728,6 +754,11 @@ cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots,
 	ClusterColdDetailV1 detail;
 	uint32 i;
 
+	if (!cold_native_profiles_match(typed)) {
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
+					"original commit_ts physical profile is unsupported or unavailable");
+		return false;
+	}
 	if (!cold_space_namespace(typed))
 		return false;
 	detail = cluster_cold_tt_base_capture_v1(typed, cold_tt_budget());
@@ -952,7 +983,7 @@ cold_sources_match(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
 				   != 0)
 			return false;
 	}
-	return true;
+	return cold_native_profiles_match(typed);
 }
 
 /* Re-read history metadata using the caller's original execution retention

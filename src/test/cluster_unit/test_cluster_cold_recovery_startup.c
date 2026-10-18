@@ -66,6 +66,81 @@ ExceptionalCondition(const char *condition_name, const char *file_name, int line
 #include "test_cluster_cold_source_completion.inc"
 #include "test_cluster_cold_endpoints.h"
 
+UT_TEST(test_prepare_rechecks_physical_profiles_of_every_original_origin)
+{
+	const ClusterControlRootResult faults[] = { CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED,
+												   CLUSTER_CONTROL_ROOT_IO_ERROR,
+												   CLUSTER_CONTROL_ROOT_STALE_TOKEN };
+
+	for (unsigned node = 0; node < NROOTS; node++)
+		for (unsigned fault = 0; fault < lengthof(faults); fault++)
+			for (unsigned after = 0; after < 3; after++) {
+				ClusterColdTypedV1 *typed;
+
+				fixture();
+				fence_count = 1;
+				history_generation(3, 9, 0x40, 0x80);
+				commit_ts_profile_result[node] = faults[fault];
+				commit_ts_profile_fail_after[node] = after;
+				typed = prepare(0x800);
+				UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+				UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+				if (after == 0) {
+					UT_ASSERT_EQ(tt_base_captures, 0);
+					UT_ASSERT_EQ(side_creates, 0);
+				}
+				cluster_cold_typed_destroy_v1(&typed);
+			}
+}
+
+UT_TEST(test_prepare_checks_empty_physical_profiles_including_history_only_origin)
+{
+	ClusterColdTypedV1 *typed;
+
+	fixture();
+	fence_count = 1;
+	history_generation(3, 9, 0x40, 0x80);
+	history_generation(3, 10, 0x80, 0xc0);
+	history_generation(2, 8, 0x20, 0x60);
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(typed->replay_count, 2);
+	UT_ASSERT_EQ(typed->participant_count, 5);
+	for (unsigned node = 0; node < NROOTS; node++) {
+		UT_ASSERT(commit_ts_profile_calls[node] > 0);
+		UT_ASSERT_EQ(commit_ts_profile_calls[node], commit_ts_profile_calls[0]);
+	}
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
+UT_TEST(test_endpoints_recheck_physical_profiles_and_discard_stale_inputs)
+{
+	const ClusterControlRootResult faults[] = { CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED,
+												   CLUSTER_CONTROL_ROOT_IO_ERROR,
+												   CLUSTER_CONTROL_ROOT_STALE_TOKEN };
+
+	for (unsigned node = 0; node < NROOTS; node++)
+		for (unsigned fault = 0; fault < lengthof(faults); fault++)
+			for (unsigned published = 0; published < 2; published++) {
+				ClusterColdTypedV1 *typed = endpoint_fixture(true);
+
+				if (published)
+					UT_ASSERT(endpoint_finish(typed));
+				commit_ts_profile_result[node] = faults[fault];
+				UT_ASSERT(!endpoint_finish(typed));
+				UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+				UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+				UT_ASSERT(!tt_after_captured);
+				for (uint32 p = 0; p < typed->participant_count; p++) {
+					UT_ASSERT_EQ(typed->xid_next_at_drain[p], 0);
+					UT_ASSERT_EQ(typed->history_xid[p].next_xid, 0);
+				}
+				commit_ts_profile_result[node] = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+				UT_ASSERT(!endpoint_finish(typed));
+				endpoint_destroy(&typed);
+			}
+}
+
 UT_TEST(test_prepare_seals_own_and_fenced_generations)
 {
 	ClusterColdTypedV1 *typed;
@@ -3104,7 +3179,10 @@ UT_TEST(test_checkpoint_export_clears_unsealed_and_failed_output)
 int
 main(void)
 {
-	UT_PLAN(109);
+	UT_PLAN(112);
+	UT_RUN(test_prepare_rechecks_physical_profiles_of_every_original_origin);
+	UT_RUN(test_prepare_checks_empty_physical_profiles_including_history_only_origin);
+	UT_RUN(test_endpoints_recheck_physical_profiles_and_discard_stale_inputs);
 	UT_RUN(test_endpoints_capture_and_recheck_post_redo_tt_before_publication);
 	UT_RUN(test_endpoints_incomplete_replay_never_captures_post_redo_tt);
 	UT_RUN(test_endpoints_inventory_refusal_discards_all_attempt_inputs);

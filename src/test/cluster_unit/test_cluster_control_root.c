@@ -15979,6 +15979,7 @@ UT_TEST(test_bootstrap_refuses_old_commit_ts_with_disabled_profile)
 							 0);
 				if (out.config_bytes != NULL)
 					pfree(out.config_bytes);
+				UT_ASSERT_EQ(cluster_control_native_commit_ts_profile_v1(test_root, origin), 0);
 				snprintf(dir, sizeof(dir), "%s/native_side/origin_%u/pg_commit_ts", test_root,
 						 origin);
 				snprintf(entry, sizeof(entry), "%s/%s", dir, shape < 2 ? "0000" : "unknown");
@@ -15994,6 +15995,8 @@ UT_TEST(test_bootstrap_refuses_old_commit_ts_with_disabled_profile)
 				UT_ASSERT_EQ(lstat(entry, &before), 0);
 				UT_ASSERT_EQ(bootstrap_read_refused(local),
 							 CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED);
+				UT_ASSERT_EQ(cluster_control_native_commit_ts_profile_v1(test_root, origin),
+							 CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED);
 				UT_ASSERT_EQ(lstat(entry, &after), 0);
 				UT_ASSERT_EQ(before.st_dev, after.st_dev);
 				UT_ASSERT_EQ(before.st_ino, after.st_ino);
@@ -16003,6 +16006,7 @@ UT_TEST(test_bootstrap_refuses_old_commit_ts_with_disabled_profile)
 					UT_ASSERT_EQ(rmdir(entry), 0);
 				else
 					UT_ASSERT_EQ(unlink(entry), 0);
+				UT_ASSERT_EQ(cluster_control_native_commit_ts_profile_v1(test_root, origin), 0);
 				UT_ASSERT_EQ(test_cf_lock_calls, 0);
 				v2_assert_primary_unchanged(f.before);
 			}
@@ -16020,6 +16024,12 @@ UT_TEST(test_bootstrap_refuses_unknown_commit_ts_routes)
 		= { "native_side", "native_side/origin_127", "native_side/origin_127/pg_commit_ts" };
 	int fds_before = 0, fds_after = 0;
 
+	UT_ASSERT_EQ(cluster_control_native_commit_ts_profile_v1(NULL, 0),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(cluster_control_native_commit_ts_profile_v1("relative", 0),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(cluster_control_native_commit_ts_profile_v1(test_root, 128),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
 	for (int fd = 0; fd < 256; fd++)
 		if (fcntl(fd, F_GETFD) >= 0)
 			fds_before++;
@@ -16036,6 +16046,7 @@ UT_TEST(test_bootstrap_refuses_unknown_commit_ts_routes)
 					UT_ASSERT_EQ(symlink(saved, path), 0);
 			}
 			bootstrap_read_refused(0);
+			UT_ASSERT(cluster_control_native_commit_ts_profile_v1(test_root, 127) != 0);
 			if (shape == 2)
 				UT_ASSERT_EQ(chmod(path, 0700), 0);
 			else {
@@ -16043,6 +16054,7 @@ UT_TEST(test_bootstrap_refuses_unknown_commit_ts_routes)
 					UT_ASSERT_EQ(unlink(path), 0);
 				UT_ASSERT_EQ(rename(saved, path), 0);
 			}
+			UT_ASSERT_EQ(cluster_control_native_commit_ts_profile_v1(test_root, 127), 0);
 			v2_assert_primary_unchanged(f.before);
 			UT_ASSERT_EQ(test_cf_lock_calls, 0);
 		}
