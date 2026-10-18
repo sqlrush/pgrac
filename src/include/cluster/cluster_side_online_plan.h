@@ -360,6 +360,10 @@ extern RfPageProofDetailV1 rf_side_record_census_v1(const RfDetachedRecordPlanV1
  * execution permission is created. */
 extern bool rf_side_online_projection_record_shape_v1(XLogReaderState *record);
 
+/* Reuse the retained plan's complete native standby shape validation.
+ * Shape only: grants no source, no-effect or execution authority. */
+extern bool rf_side_online_standby_record_shape_v1(XLogReaderState *record);
+
 /* Complete sorted unique namespace/locator set for typed SPACE, including
  * each original COMMIT-DROP participant. Sealing checks every source chain;
  * enumeration grants no target, lifecycle or durability authority.

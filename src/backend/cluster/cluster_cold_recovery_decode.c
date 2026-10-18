@@ -392,13 +392,13 @@ cold_record_flags(XLogReaderState *reader, uint64 system_identifier, const uint8
 		*flags = CLUSTER_COLD_RECORD_UNSUPPORTED;
 		return CLUSTER_COLD_OK;
 	case RM_STANDBY_ID:
+		/* A primary-context no-effect route still needs complete native
+		 * bytes, including retained history and our own source. */
+		if (!rf_side_online_standby_record_shape_v1(reader))
+			return CLUSTER_COLD_COMPONENT_INVALID;
 		if (info == XLOG_INVALIDATIONS) {
 			xl_invalidations invalidations;
 
-			if (!cold_counted_shape(reader, MinSizeOfInvalidations,
-									offsetof(xl_invalidations, nmsgs),
-									sizeof(SharedInvalidationMessage)))
-				return CLUSTER_COLD_COMPONENT_INVALID;
 			memcpy(&invalidations, XLogRecGetData(reader), MinSizeOfInvalidations);
 			*effects |= CLUSTER_COLD_EFFECT_INVALIDATIONS;
 			if (invalidations.relcacheInitFileInval)

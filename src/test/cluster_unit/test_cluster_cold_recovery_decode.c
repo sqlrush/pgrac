@@ -26,6 +26,7 @@
 #define USE_PGRAC_CLUSTER 1
 
 #include "postgres.h"
+#include <limits.h>
 
 #include "access/clog.h"
 #include "access/multixact.h"
@@ -224,6 +225,60 @@ plan_component(uint32 index, uint8 owner, uint8 page_class, uint64 before, uint6
 	preflight_plan.result_token = result;
 }
 
+static void
+standby_append(FakeRecord *r, const void *bytes, Size len)
+{
+	memcpy(r->data + r->storage.decoded.main_data_len, bytes, len);
+	r->storage.decoded.main_data_len += len;
+}
+
+static void
+standby_record(FakeRecord *r, uint8 info, bool empty)
+{
+	fake_record(r, RM_STANDBY_ID, info, 0);
+	preflight_plan.route.codec_id = RF_ROUTE_CODEC_SIDE_STANDARD;
+	r->storage.decoded.main_data_len = 0;
+	if (info == XLOG_STANDBY_LOCK) {
+		xl_standby_locks locks = { .nlocks = empty ? 0 : 1 };
+		xl_standby_lock lock = { .xid = 100, .dbOid = InvalidOid, .relOid = 123 };
+		standby_append(r, &locks, offsetof(xl_standby_locks, locks));
+		if (!empty)
+			standby_append(r, &lock, sizeof(lock));
+	} else if (info == XLOG_RUNNING_XACTS) {
+		xl_running_xacts running = { .xcnt = empty ? 0 : 1,
+									 .subxcnt = empty ? 0 : 1,
+									 .subxid_overflow = !empty,
+									 .nextXid = 4,
+									 .oldestRunningXid = empty ? 4 : UINT32_MAX,
+									 .latestCompletedXid = empty ? FrozenTransactionId : UINT32_MAX - 1 };
+		TransactionId xids[2] = { UINT32_MAX, FirstNormalTransactionId };
+		standby_append(r, &running, offsetof(xl_running_xacts, xids));
+		if (!empty)
+			standby_append(r, xids, sizeof(xids));
+	} else {
+		xl_invalidations inval = { .dbId = 5, .tsId = 1663,
+								   .relcacheInitFileInval = !empty, .nmsgs = empty ? 0 : 1 };
+		SharedInvalidationMessage msg = { 0 };
+		standby_append(r, &inval, MinSizeOfInvalidations);
+		if (!empty)
+			standby_append(r, &msg, sizeof(msg));
+	}
+}
+
+static bool
+standby_refused(FakeRecord *r)
+{
+	ClusterColdDecodedV1 out = { 0 };
+	for (unsigned foreign = 0; foreign < 2; foreign++) {
+		if (cluster_cold_recovery_decode_v1(&r->reader, 99, UUID, true, foreign != 0, &out)
+				== CLUSTER_COLD_OK
+			|| out.effects.required != 0 || out.effects.native_apply != 0
+			|| out.effects.no_effect != 0)
+			return false;
+	}
+	return true;
+}
+
 UT_TEST(test_page_record_maps_ordinary_components)
 {
 	FakeRecord record;
@@ -371,11 +426,14 @@ UT_TEST(test_storage_lifecycle_classification)
 				  { RM_CLUSTER_XID_STRIPE_ID, 0x00, CLUSTER_COLD_RECORD_STRUCTURAL },
 				  { RM_CLUSTER_XID_STRIPE_ID, 0x10, CLUSTER_COLD_RECORD_STRUCTURAL },
 				  { RM_XLOG_ID, 0x30, 0 },
-				  { RM_STANDBY_ID, 0x10, 0 } };
+				  { RM_STANDBY_ID, XLOG_RUNNING_XACTS, 0 } };
 	Size i;
 
 	for (i = 0; i < lengthof(cases); i++) {
-		fake_record(&record, cases[i].rmid, cases[i].info, 0);
+		if (cases[i].rmid == RM_STANDBY_ID)
+			standby_record(&record, cases[i].info, true);
+		else
+			fake_record(&record, cases[i].rmid, cases[i].info, 0);
 		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
 					 CLUSTER_COLD_OK);
 		if (out.record.record_flags != cases[i].flags)
@@ -437,8 +495,8 @@ UT_TEST(test_foreign_side_records_have_no_cold_owner)
 	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
 	fake_record(&record, RM_STANDBY_ID, 0x30, 0);
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
-				 CLUSTER_COLD_OK);
-	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+				 CLUSTER_COLD_COMPONENT_INVALID);
+	UT_ASSERT_EQ(out.effects.required, 0);
 	fake_record(&record, RM_XLOG_ID, XLOG_NOOP, 0);
 	record.storage.decoded.header.xl_info |= XLR_SPECIAL_REL_UPDATE;
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
@@ -553,6 +611,123 @@ UT_TEST(test_foreign_projection_requires_complete_payload_shape)
  * crash recovery does with them: nothing.  Only their native shape is
  * accepted; the founder's own keep their native owner.
  */
+UT_TEST(test_complete_standby_payloads_keep_original_effect_routes)
+{
+	static const uint8 infos[] = { XLOG_STANDBY_LOCK, XLOG_RUNNING_XACTS, XLOG_INVALIDATIONS };
+	FakeRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	for (Size i = 0; i < lengthof(infos); i++)
+		for (unsigned empty = 0; empty < 2; empty++)
+			for (unsigned foreign = 0; foreign < 2; foreign++) {
+				uint32 expected = CLUSTER_COLD_EFFECT_RECORD;
+				standby_record(&r, infos[i], empty != 0);
+				UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, UUID, true,
+															foreign != 0, &out), CLUSTER_COLD_OK);
+				if (infos[i] == XLOG_INVALIDATIONS) {
+					expected |= CLUSTER_COLD_EFFECT_INVALIDATIONS;
+					if (!empty)
+						expected |= CLUSTER_COLD_EFFECT_RELCACHE;
+					UT_ASSERT_EQ(out.record.record_flags,
+								 foreign ? CLUSTER_COLD_RECORD_FOREIGN_SIDE : 0);
+				} else {
+					UT_ASSERT_EQ(out.record.record_flags,
+								 foreign ? CLUSTER_COLD_RECORD_FOREIGN_CONTROL : 0);
+				}
+				UT_ASSERT_EQ(out.effects.required, expected);
+				UT_ASSERT_EQ(out.effects.no_effect,
+							 foreign && infos[i] != XLOG_INVALIDATIONS ? expected : 0);
+				UT_ASSERT_EQ(out.effects.native_apply, out.effects.no_effect ? 0 : expected);
+			}
+}
+
+UT_TEST(test_standby_lock_bad_payload_never_gets_effect_route)
+{
+	FakeRecord r;
+	static const struct { Size offset; int value; } bad[] = {
+		{ offsetof(xl_standby_locks, nlocks), -1 },
+		{ offsetof(xl_standby_locks, nlocks), INT_MAX },
+		{ offsetof(xl_standby_locks, locks) + offsetof(xl_standby_lock, xid), InvalidTransactionId },
+		{ offsetof(xl_standby_locks, locks) + offsetof(xl_standby_lock, xid), FrozenTransactionId },
+		{ offsetof(xl_standby_locks, locks) + offsetof(xl_standby_lock, relOid), InvalidOid }
+	};
+	uint32 full;
+	standby_record(&r, XLOG_STANDBY_LOCK, false);
+	full = r.storage.decoded.main_data_len;
+	for (uint32 len = 0; len < full; len++) {
+		r.storage.decoded.main_data_len = len;
+		UT_ASSERT(standby_refused(&r));
+	}
+	r.storage.decoded.main_data_len = full + 1;
+	UT_ASSERT(standby_refused(&r));
+	for (Size i = 0; i < lengthof(bad); i++) {
+		standby_record(&r, XLOG_STANDBY_LOCK, false);
+		memcpy(r.data + bad[i].offset, &bad[i].value, sizeof(bad[i].value));
+		UT_ASSERT(standby_refused(&r));
+	}
+	r.storage.decoded.main_data = NULL;
+	UT_ASSERT(standby_refused(&r));
+}
+
+UT_TEST(test_running_xacts_bad_payload_never_gets_effect_route)
+{
+	FakeRecord r;
+	static const struct { Size offset; int value; } bad[] = {
+		{ offsetof(xl_running_xacts, xcnt), -1 },
+		{ offsetof(xl_running_xacts, subxcnt), -1 },
+		{ offsetof(xl_running_xacts, xcnt), 0 },
+		{ offsetof(xl_running_xacts, xcnt), INT_MAX },
+		{ offsetof(xl_running_xacts, subxcnt), INT_MAX },
+		{ offsetof(xl_running_xacts, nextXid), FrozenTransactionId },
+		{ offsetof(xl_running_xacts, oldestRunningXid), InvalidTransactionId },
+		{ offsetof(xl_running_xacts, latestCompletedXid), InvalidTransactionId },
+		{ offsetof(xl_running_xacts, xids), FrozenTransactionId },
+		{ offsetof(xl_running_xacts, xids) + sizeof(TransactionId), InvalidTransactionId }
+	};
+	uint32 full;
+	standby_record(&r, XLOG_RUNNING_XACTS, false);
+	full = r.storage.decoded.main_data_len;
+	for (uint32 len = 0; len < full; len++) {
+		r.storage.decoded.main_data_len = len;
+		UT_ASSERT(standby_refused(&r));
+	}
+	r.storage.decoded.main_data_len = full + 1;
+	UT_ASSERT(standby_refused(&r));
+	for (Size i = 0; i < lengthof(bad); i++) {
+		standby_record(&r, XLOG_RUNNING_XACTS, false);
+		memcpy(r.data + bad[i].offset, &bad[i].value, sizeof(bad[i].value));
+		UT_ASSERT(standby_refused(&r));
+	}
+	standby_record(&r, XLOG_RUNNING_XACTS, false);
+	r.data[offsetof(xl_running_xacts, subxid_overflow)] = 2;
+	UT_ASSERT(standby_refused(&r));
+	r.storage.decoded.main_data = NULL;
+	UT_ASSERT(standby_refused(&r));
+}
+
+UT_TEST(test_standby_invalidations_bad_payload_never_gets_effect_route)
+{
+	FakeRecord r;
+	uint32 full;
+	standby_record(&r, XLOG_INVALIDATIONS, false);
+	full = r.storage.decoded.main_data_len;
+	for (uint32 len = 0; len < full; len++) {
+		r.storage.decoded.main_data_len = len;
+		UT_ASSERT(standby_refused(&r));
+	}
+	r.storage.decoded.main_data_len = full + 1;
+	UT_ASSERT(standby_refused(&r));
+	for (int count = -1; count <= 2; count += 3) {
+		standby_record(&r, XLOG_INVALIDATIONS, false);
+		memcpy(r.data + offsetof(xl_invalidations, nmsgs), &count, sizeof(count));
+		UT_ASSERT(standby_refused(&r));
+	}
+	standby_record(&r, XLOG_INVALIDATIONS, false);
+	r.data[offsetof(xl_invalidations, relcacheInitFileInval)] = 2;
+	UT_ASSERT(standby_refused(&r));
+	r.storage.decoded.main_data = NULL;
+	UT_ASSERT(standby_refused(&r));
+}
+
 UT_TEST(test_foreign_native_control_is_typed_noop)
 {
 	FakeRecord record;
@@ -572,13 +747,15 @@ UT_TEST(test_foreign_native_control_is_typed_noop)
 				  { RM_XLOG_ID, XLOG_FPW_CHANGE, sizeof(bool) },
 				  { RM_XLOG_ID, XLOG_END_OF_RECOVERY, sizeof(xl_end_of_recovery) },
 				  { RM_XLOG_ID, XLOG_OVERWRITE_CONTRECORD, sizeof(xl_overwrite_contrecord) },
-				  { RM_STANDBY_ID, XLOG_STANDBY_LOCK, 0 },
-				  { RM_STANDBY_ID, XLOG_RUNNING_XACTS, 0 } };
+				  { RM_STANDBY_ID, XLOG_STANDBY_LOCK, offsetof(xl_standby_locks, locks) },
+				  { RM_STANDBY_ID, XLOG_RUNNING_XACTS, offsetof(xl_running_xacts, xids) } };
 	Size i;
 
 	for (i = 0; i < lengthof(cases); i++) {
 		fake_record(&record, cases[i].rmid, cases[i].info, 0);
 		record.storage.decoded.main_data_len = cases[i].length;
+		if (cases[i].rmid == RM_STANDBY_ID)
+			standby_record(&record, cases[i].info, true);
 		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
 					 CLUSTER_COLD_OK);
 		if (out.record.record_flags != CLUSTER_COLD_RECORD_FOREIGN_CONTROL)
@@ -867,7 +1044,11 @@ UT_TEST(test_detached_capture_borrows_only_a_complete_decode)
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(19);
+	UT_RUN(test_complete_standby_payloads_keep_original_effect_routes);
+	UT_RUN(test_standby_lock_bad_payload_never_gets_effect_route);
+	UT_RUN(test_running_xacts_bad_payload_never_gets_effect_route);
+	UT_RUN(test_standby_invalidations_bad_payload_never_gets_effect_route);
 	UT_RUN(test_detached_capture_borrows_only_a_complete_decode);
 	UT_RUN(test_page_record_maps_ordinary_components);
 	UT_RUN(test_registry_refusal_is_opcode_unsupported);

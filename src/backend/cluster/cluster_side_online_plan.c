@@ -846,6 +846,22 @@ side_native_standby_valid(const uint8 *data, uint32 length, uint8 info)
 	}
 }
 
+bool
+rf_side_online_standby_record_shape_v1(XLogReaderState *record)
+{
+	uint32 length;
+	const uint8 *data;
+
+	if (record == NULL || record->record == NULL || XLogRecGetRmid(record) != RM_STANDBY_ID
+		|| XLogRecMaxBlockId(record) >= 0 || record->record->has_page_version_edge
+		|| (XLogRecGetInfo(record) & XLR_INFO_MASK) != 0)
+		return false;
+	length = XLogRecGetDataLen(record);
+	data = (const uint8 *)XLogRecGetData(record);
+	return (length == 0 || data != NULL)
+		   && side_native_standby_valid(data, length, XLogRecGetInfo(record) & ~XLR_INFO_MASK);
+}
+
 /* Stripe knowledge belongs to its native owner, not a PCM page. JOIN is
  * emitted by the joining source; RETIRE is emitted by the removal coordinator
  * and can name another slot. Neither shape alone authorizes replay. */
