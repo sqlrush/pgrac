@@ -315,6 +315,23 @@ static bool decode_saw_space_active;
 static uint64 decode_saw_system;
 static uint8 decode_saw_uuid0;
 static int decode_releases;
+static ClusterWalRecoveryCheckpointV1 selected_checkpoint;
+static ClusterControlRootResult checkpoint_result;
+static XLogRecord visit_headers[MAX_VISIT];
+static CheckPoint visit_checkpoints[MAX_VISIT];
+static uint32 visit_lengths[MAX_VISIT];
+static int visit_blocks[MAX_VISIT];
+
+ClusterControlRootResult
+cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *expected,
+											const ClusterControlRootReadToken *token,
+											ClusterWalRecoveryCheckpointV1 *out)
+{
+	(void)expected;
+	(void)token;
+	*out = selected_checkpoint;
+	return checkpoint_result;
+}
 
 
 static int side_capture_token, side_capture_calls, side_capture_fail_at;
@@ -342,21 +359,28 @@ cluster_control_root_recovery_visit(const ClusterControlRootSnapshot *expected,
 									ClusterWalTailObservation *out)
 {
 	XLogReaderState reader;
+	DecodedXLogRecord *record = calloc(1, sizeof(*record));
 	int i;
 
 	(void)expected;
 	(void)token;
 	memset(out, 0, sizeof(*out));
 	memset(&reader, 0, sizeof(reader));
+	reader.record = record;
 	for (i = 0; i < visit_count; i++) {
 		reader.ReadRecPtr = visit_read[i];
 		reader.EndRecPtr = visit_end[i];
+		record->header = visit_headers[i];
+		record->main_data = (char *)&visit_checkpoints[i];
+		record->main_data_len = visit_lengths[i];
+		record->max_block_id = visit_blocks[i];
 		out->records++;
 		if (!visitor(&reader, arg))
 			break;
 	}
 	out->records += observed_records_delta;
 	out->complete_end = observed_end;
+	free(record);
 	return visit_result;
 }
 

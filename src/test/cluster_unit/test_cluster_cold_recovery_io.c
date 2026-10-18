@@ -315,6 +315,9 @@ scan(ClusterColdScanResultV1 *result, bool foreign)
 	memset(&root, 0, sizeof(root));
 	memset(&token, 0, sizeof(token));
 	root.identity.system_identifier = 77;
+	root.identity.origin_thread_id = 2;
+	root.checkpoint_tli = 1;
+	root.checkpoint_lower_lsn = 0x1000;
 	memset(root.identity.storage_uuid, 5, 16);
 	root.validated_tail_lsn_exclusive = 0x1300;
 	detail = cluster_cold_scan_root_v1(plan, 0, &root, &token, !foreign, foreign, NULL, result);
@@ -336,6 +339,122 @@ scan_reset(void)
 	memset(decode_refusal_at, 0, sizeof(decode_refusal_at));
 	memset(decode_xid_input, 0, sizeof(decode_xid_input));
 	decode_releases = 0;
+	memset(&selected_checkpoint, 0, sizeof(selected_checkpoint));
+	selected_checkpoint.checkpoint_start = 0x1000;
+	selected_checkpoint.checkpoint.redo = 0x1000;
+	selected_checkpoint.checkpoint.ThisTimeLineID = 1;
+	selected_checkpoint.checkpoint.PrevTimeLineID = 1;
+	selected_checkpoint.checkpoint.nextXid = FullTransactionIdFromEpochAndXid(8, 100);
+	checkpoint_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	memset(visit_headers, 0, sizeof(visit_headers));
+	memset(visit_checkpoints, 0, sizeof(visit_checkpoints));
+	for (int i = 0; i < MAX_VISIT; i++) {
+		visit_headers[i].xl_rmid = RM_XLOG_ID;
+		visit_headers[i].xl_info = XLOG_CHECKPOINT_ONLINE;
+		visit_checkpoints[i] = selected_checkpoint.checkpoint;
+		visit_lengths[i] = sizeof(CheckPoint);
+		visit_blocks[i] = -1;
+	}
+}
+
+UT_TEST(test_root_checkpoint_copy_matches_every_native_byte)
+{
+	ClusterColdScanResultV1 result;
+
+	scan_reset();
+	UT_ASSERT_EQ(scan(&result, true), CLUSTER_COLD_OK);
+	for (size_t i = 0; i < sizeof(CheckPoint); i++) {
+		scan_reset();
+		((uint8 *)&visit_checkpoints[0])[i] ^= 1;
+		UT_ASSERT_EQ(scan(&result, true), CLUSTER_COLD_SOURCE_GAP);
+		UT_ASSERT_EQ(result.failed_read_rec_ptr, 0x1000);
+		UT_ASSERT_EQ(result.records, 0);
+	}
+}
+
+UT_TEST(test_root_checkpoint_requires_exact_native_record_and_address)
+{
+	ClusterColdScanResultV1 result;
+
+	scan_reset();
+	visit_headers[0].xl_info = XLOG_CHECKPOINT_SHUTDOWN;
+	UT_ASSERT_EQ(scan(&result, true), CLUSTER_COLD_OK);
+	scan_reset();
+	selected_checkpoint.checkpoint_start = 0x1100;
+	UT_ASSERT_EQ(scan(&result, true), CLUSTER_COLD_OK);
+	for (int fault = 0; fault < 9; fault++) {
+		scan_reset();
+		switch (fault) {
+		case 0:
+			visit_headers[0].xl_rmid = RM_HEAP_ID;
+			break;
+		case 1:
+			visit_headers[0].xl_info = XLOG_NEXTOID;
+			break;
+		case 2:
+			visit_headers[0].xl_info |= XLR_SPECIAL_REL_UPDATE;
+			break;
+		case 3:
+			visit_headers[0].xl_xid = 100;
+			break;
+		case 4:
+			visit_lengths[0]--;
+			break;
+		case 5:
+			visit_lengths[0]++;
+			break;
+		case 6:
+			visit_blocks[0] = 0;
+			break;
+		case 7:
+			selected_checkpoint.checkpoint_start = 0x1080;
+			break;
+		case 8:
+			selected_checkpoint.checkpoint_start = 0x1100;
+			visit_checkpoints[1].nextOid++;
+			break;
+		}
+		UT_ASSERT_EQ(scan(&result, true), CLUSTER_COLD_SOURCE_GAP);
+	}
+}
+
+UT_TEST(test_root_checkpoint_selection_failure_does_not_feed_records)
+{
+	ClusterColdScanResultV1 result;
+
+	for (int fault = 0; fault < 8; fault++) {
+		scan_reset();
+		switch (fault) {
+		case 0:
+			checkpoint_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			break;
+		case 1:
+			selected_checkpoint.checkpoint_start = InvalidXLogRecPtr;
+			break;
+		case 2:
+			selected_checkpoint.checkpoint_start = 0x0f00;
+			break;
+		case 3:
+			selected_checkpoint.checkpoint_start = 0x1300;
+			break;
+		case 4:
+			selected_checkpoint.checkpoint.redo = InvalidXLogRecPtr;
+			break;
+		case 5:
+			selected_checkpoint.checkpoint.redo = 0x0f00;
+			break;
+		case 6:
+			selected_checkpoint.checkpoint.redo = 0x1100;
+			break;
+		case 7:
+			selected_checkpoint.checkpoint.ThisTimeLineID++;
+			break;
+		}
+		UT_ASSERT_EQ(scan(&result, true), CLUSTER_COLD_SOURCE_GAP);
+		UT_ASSERT_EQ(result.root_result, checkpoint_result);
+		UT_ASSERT_EQ(result.records, 0);
+		UT_ASSERT_EQ(decode_releases, 0);
+	}
 }
 
 /* Every visited record is decoded in the root's namespace and fed; the scan
@@ -487,9 +606,23 @@ generation(uint16 thread, uint64 incarnation, bool current, uint32 lifecycle, XL
 	i->checkpoint.validated_tail_lsn_exclusive = tail;
 	i->native_redo = redo;
 	i->checkpoint_start = redo;
+	i->native_checkpoint.redo = redo;
+	i->native_checkpoint.ThisTimeLineID = 1;
+	i->native_checkpoint.PrevTimeLineID = 1;
+	i->native_checkpoint.nextXid = FullTransactionIdFromEpochAndXid(8, 100);
 	i->source.claim.identity = i->checkpoint.identity;
 	i->source.timeline = 1;
 	return i;
+}
+
+/* The retained owner and decoder are fixtures. Supply the selected native
+ * body at its own WAL address; other records keep their independent bodies. */
+static void
+scoped_checkpoint_wal(const ClusterWalInputV1 *input)
+{
+	for (int i = 0; i < visit_count; i++)
+		if (visit_read[i] == input->checkpoint_start)
+			visit_checkpoints[i] = input->native_checkpoint;
 }
 
 static ClusterWalInputV1 *
@@ -671,11 +804,13 @@ UT_TEST(test_scan_input_proves_the_cut)
 {
 	ClusterColdScanResultV1 result;
 	ClusterColdPlanV1 *plan;
+	ClusterWalInputV1 *input;
 
 	scope_reset();
 	generation(1, 11, true, REQUIRED, 0x500, 0x800, 0x2000);
-	generation(2, 12, false, CLOSED, 0x1000, 0x1300, 0x1300);
+	input = generation(2, 12, false, CLOSED, 0x1000, 0x1100, 0x1300);
 	scan_reset();
+	scoped_checkpoint_wal(input);
 	plan = scan_plan();
 	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 1, false, true, NULL, &result),
 				 CLUSTER_COLD_OK);
@@ -688,6 +823,7 @@ UT_TEST(test_scan_input_proves_the_cut)
 	cluster_cold_plan_destroy_v1(&plan);
 
 	scan_reset();
+	scoped_checkpoint_wal(input);
 	plan = scan_plan();
 	retained_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 1, false, true, NULL, &result),
@@ -696,6 +832,7 @@ UT_TEST(test_scan_input_proves_the_cut)
 	retained_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 
 	scan_reset();
+	scoped_checkpoint_wal(input);
 	plan = scan_plan();
 	observed_end = 0x1200;
 	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 1, false, true, NULL, &result),
@@ -704,6 +841,7 @@ UT_TEST(test_scan_input_proves_the_cut)
 
 	/* no such input, a terminal, or no scope */
 	scan_reset();
+	scoped_checkpoint_wal(input);
 	plan = scan_plan();
 	terminal(3, 0);
 	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 7, false, true, NULL, &result),
@@ -723,9 +861,7 @@ history_counter_input(XLogRecPtr redo)
 	scope_reset();
 	scan_reset();
 	input = generation(2, 12, false, CLOSED, 0x1000, redo, 0x1300);
-	input->native_checkpoint.redo = redo;
-	input->native_checkpoint.ThisTimeLineID = 1;
-	input->native_checkpoint.nextXid = FullTransactionIdFromEpochAndXid(8, 100);
+	scoped_checkpoint_wal(input);
 	for (int i = 0; i < visit_count; i++) {
 		decode_xid_input[i].complete = true;
 		decode_xid_input[i].record_xid = 110 + i;
@@ -747,6 +883,132 @@ history_counter_plan(void)
 	cut.native_redo = cut.tail_end = 0x1300;
 	UT_ASSERT_EQ(cluster_cold_plan_create_v1(&cut, 1, 1024 * 1024, &plan), CLUSTER_COLD_OK);
 	return plan;
+}
+
+UT_TEST(test_scoped_checkpoint_copy_matches_every_native_byte)
+{
+	for (int current = 0; current < 2; current++) {
+		for (size_t byte = 0; byte < sizeof(CheckPoint); byte++) {
+			ClusterColdScanResultV1 result;
+			ClusterColdPlanV1 *plan = history_counter_plan();
+			ClusterWalInputV1 *input = history_counter_input(0x1100);
+			uint64 next = 99;
+
+			input->current = current;
+			((uint8 *)&visit_checkpoints[1])[byte] ^= 1;
+			UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 0, false, true, NULL, &result),
+						 CLUSTER_COLD_SOURCE_GAP);
+			UT_ASSERT_EQ(result.failed_read_rec_ptr, 0x1100);
+			UT_ASSERT_EQ(result.records, 1);
+			UT_ASSERT(!cluster_cold_xid_candidate_v1(&result.history_xid,
+													 &result.history_xid.source, &next));
+			UT_ASSERT_EQ(next, 0);
+			cluster_cold_plan_destroy_v1(&plan);
+		}
+	}
+}
+
+UT_TEST(test_scoped_checkpoint_requires_exact_native_record_and_address)
+{
+	for (int current = 0; current < 2; current++) {
+		for (int fault = -2; fault < 9; fault++) {
+			ClusterColdScanResultV1 result;
+			ClusterColdPlanV1 *plan = history_counter_plan();
+			ClusterWalInputV1 *input = history_counter_input(0x1000);
+
+			input->current = current;
+			switch (fault) {
+			case -2:
+				visit_headers[0].xl_info = XLOG_CHECKPOINT_SHUTDOWN;
+				break;
+			case -1:
+				input->checkpoint_start = 0x1100;
+				scoped_checkpoint_wal(input);
+				break;
+			case 0:
+				visit_headers[0].xl_rmid = RM_HEAP_ID;
+				break;
+			case 1:
+				visit_headers[0].xl_info = XLOG_NEXTOID;
+				break;
+			case 2:
+				visit_headers[0].xl_info |= XLR_SPECIAL_REL_UPDATE;
+				break;
+			case 3:
+				visit_headers[0].xl_xid = 100;
+				break;
+			case 4:
+				visit_lengths[0]--;
+				break;
+			case 5:
+				visit_lengths[0]++;
+				break;
+			case 6:
+				visit_blocks[0] = 0;
+				break;
+			case 7:
+				input->checkpoint_start = 0x1080;
+				break;
+			case 8:
+				input->checkpoint_start = 0x1100;
+				scoped_checkpoint_wal(input);
+				visit_checkpoints[1].nextOid++;
+				break;
+			}
+			UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 0, false, true, NULL, &result),
+						 fault < 0 ? CLUSTER_COLD_OK : CLUSTER_COLD_SOURCE_GAP);
+			if (fault >= 0)
+				UT_ASSERT_EQ(result.history_xid.next_xid, 0);
+			cluster_cold_plan_destroy_v1(&plan);
+		}
+	}
+}
+
+UT_TEST(test_scoped_checkpoint_selection_failure_does_not_feed_records)
+{
+	for (int current = 0; current < 2; current++) {
+		for (int fault = 0; fault < 8; fault++) {
+			ClusterColdScanResultV1 result;
+			ClusterColdPlanV1 *plan = history_counter_plan();
+			ClusterWalInputV1 *input = history_counter_input(0x1000);
+
+			input->current = current;
+			switch (fault) {
+			case 0:
+				input->checkpoint_start = InvalidXLogRecPtr;
+				break;
+			case 1:
+				input->checkpoint_start = 0x0f00;
+				break;
+			case 2:
+				input->checkpoint_start = 0x1300;
+				break;
+			case 3:
+				input->native_checkpoint.redo = InvalidXLogRecPtr;
+				break;
+			case 4:
+				input->native_checkpoint.redo = 0x0f00;
+				break;
+			case 5:
+				input->native_checkpoint.redo = 0x1100;
+				break;
+			case 6:
+				input->native_checkpoint.ThisTimeLineID++;
+				break;
+			case 7:
+				input->checkpoint_start = 0x1400;
+				break;
+			}
+			retained_index_seen = UINT32_MAX;
+			UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 0, false, true, NULL, &result),
+						 CLUSTER_COLD_SOURCE_GAP);
+			UT_ASSERT_EQ(retained_index_seen, UINT32_MAX);
+			UT_ASSERT_EQ(result.records, 0);
+			UT_ASSERT_EQ(decode_releases, 0);
+			UT_ASSERT_EQ(result.history_xid.next_xid, 0);
+			cluster_cold_plan_destroy_v1(&plan);
+		}
+	}
 }
 
 UT_TEST(test_history_counter_native_seed_and_post_redo_cut)
@@ -781,6 +1043,7 @@ UT_TEST(test_history_counter_wrap_and_native_checkpoint_order)
 	uint64 next;
 
 	input->native_checkpoint.nextXid = FullTransactionIdFromEpochAndXid(7, UINT32_MAX - 1);
+	scoped_checkpoint_wal(input);
 	decode_xid_input[0].record_xid = UINT32_MAX;
 	decode_xid_input[0].payload_xid = InvalidTransactionId;
 	decode_xid_input[1].record_xid = 4;
@@ -796,7 +1059,7 @@ UT_TEST(test_history_counter_wrap_and_native_checkpoint_order)
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
-UT_TEST(test_history_counter_empty_native_cut_uses_checkpoint)
+UT_TEST(test_history_checkpoint_at_exclusive_tail_is_not_a_scanned_seed)
 {
 	ClusterColdScanResultV1 result;
 	ClusterColdPlanV1 *plan = history_counter_plan();
@@ -804,11 +1067,11 @@ UT_TEST(test_history_counter_empty_native_cut_uses_checkpoint)
 
 	history_counter_input(0x1300);
 	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 0, false, true, NULL, &result),
-				 CLUSTER_COLD_OK);
+				 CLUSTER_COLD_SOURCE_GAP);
 	UT_ASSERT(
-		cluster_cold_xid_candidate_v1(&result.history_xid, &result.history_xid.source, &next));
-	UT_ASSERT_EQ(next, U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(8, 100)));
-	UT_ASSERT_EQ(result.history_xid.records, 0);
+		!cluster_cold_xid_candidate_v1(&result.history_xid, &result.history_xid.source, &next));
+	UT_ASSERT_EQ(next, 0);
+	UT_ASSERT_EQ(result.records, 0);
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
@@ -838,8 +1101,11 @@ UT_TEST(test_history_counter_missing_or_conflicting_inputs_stay_missing)
 			input->native_redo = input->native_checkpoint.redo = 0x1400;
 		if (fault == 8)
 			input->native_redo = input->native_checkpoint.redo = 0x800;
+		scoped_checkpoint_wal(input);
 		UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 0, false, true, NULL, &result),
-					 CLUSTER_COLD_OK);
+					 fault == 1 || fault == 2 || fault == 3 || fault == 7 || fault == 8
+						 ? CLUSTER_COLD_SOURCE_GAP
+						 : CLUSTER_COLD_OK);
 		UT_ASSERT(
 			!cluster_cold_xid_candidate_v1(&result.history_xid, &result.history_xid.source, &next));
 		UT_ASSERT_EQ(next, 0);
@@ -882,10 +1148,14 @@ UT_TEST(test_history_scan_captures_its_original_source_and_whole_refusal)
 		ClusterColdScanResultV1 result;
 		ClusterColdPlanV1 *plan;
 		ClusterColdDetailV1 detail;
+		ClusterWalInputV1 *input;
 		scope_reset();
-		generation(2, 12, false, CLOSED, 0x1000, 0x1300, 0x1300);
-		scope_inputs[0].checkpoint.checkpoint_tli = 7;
+		input = generation(2, 12, false, CLOSED, 0x1000, 0x1100, 0x1300);
+		input->checkpoint.checkpoint_tli = 7;
+		input->source.timeline = 7;
+		input->native_checkpoint.ThisTimeLineID = 7;
 		scan_reset();
+		scoped_checkpoint_wal(input);
 		side_capture_calls = 0;
 		side_capture_fail_at = fault == 1 || fault == 2 ? 1 : 0;
 		side_capture_refusal
@@ -939,6 +1209,7 @@ UT_TEST(test_root_scan_captures_original_identity_and_refuses_side_failure)
 		memset(root.identity.storage_uuid, 5, 16);
 		root.identity.origin_thread_id = 2;
 		root.checkpoint_tli = 1;
+		root.checkpoint_lower_lsn = 0x1000;
 		root.validated_tail_lsn_exclusive = 0x1300;
 		if (fault == 2)
 			decode_refusal_at[1] = CLUSTER_COLD_OPCODE_UNSUPPORTED;
@@ -978,10 +1249,16 @@ UT_TEST(test_root_scan_captures_original_identity_and_refuses_side_failure)
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(24);
+	UT_RUN(test_root_checkpoint_copy_matches_every_native_byte);
+	UT_RUN(test_root_checkpoint_requires_exact_native_record_and_address);
+	UT_RUN(test_root_checkpoint_selection_failure_does_not_feed_records);
+	UT_RUN(test_scoped_checkpoint_copy_matches_every_native_byte);
+	UT_RUN(test_scoped_checkpoint_requires_exact_native_record_and_address);
+	UT_RUN(test_scoped_checkpoint_selection_failure_does_not_feed_records);
 	UT_RUN(test_history_counter_native_seed_and_post_redo_cut);
 	UT_RUN(test_history_counter_wrap_and_native_checkpoint_order);
-	UT_RUN(test_history_counter_empty_native_cut_uses_checkpoint);
+	UT_RUN(test_history_checkpoint_at_exclusive_tail_is_not_a_scanned_seed);
 	UT_RUN(test_history_counter_missing_or_conflicting_inputs_stay_missing);
 	UT_RUN(test_history_counter_failed_whole_visit_discards_capture);
 	UT_RUN(test_history_scan_captures_its_original_source_and_whole_refusal);

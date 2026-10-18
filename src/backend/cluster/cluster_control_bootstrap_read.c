@@ -1408,9 +1408,9 @@ read_terminal_capacity(BootstrapReadWork *work, const char *shared_root, const c
 }
 
 /* Disabled tracking does not erase an older physical source. This bounded
- * bootstrap observation grants no replay/NO_EFFECT or OPEN authority. */
+ * physical observation grants no replay/NO_EFFECT or OPEN authority. */
 static ClusterControlRootResult
-read_commit_ts_profile(BootstrapReadWork *work, const char *shared_root, uint32 node)
+read_commit_ts_profile(const struct stat *expected_shared, const char *shared_root, uint32 node)
 {
 	int dirs[] = { -1, -1, -1, -1 };
 	char origin[32];
@@ -1419,8 +1419,8 @@ read_commit_ts_profile(BootstrapReadWork *work, const char *shared_root, uint32 
 
 	snprintf(origin, sizeof(origin), "origin_%u", node);
 	result = read_dir(-1, shared_root, &dirs[0]);
-	if (result == 0)
-		result = read_dir_identity(dirs[0], &work->shared_dir);
+	if (result == 0 && expected_shared != NULL)
+		result = read_dir_identity(dirs[0], expected_shared);
 	for (size_t i = 0; result == 0 && i < lengthof(names); i++)
 		result = read_dir(dirs[i], names[i], &dirs[i + 1]);
 	for (int pass = 0; result == 0 && pass < 2; pass++) {
@@ -1454,7 +1454,7 @@ read_capacities(BootstrapReadWork *work, const char *shared_root, const char *wa
 			return result;
 		/* All selected current/retained/pending writers of an origin share
 		 * its original physical family. Check even retired/non-serving nodes. */
-		result = read_commit_ts_profile(work, shared_root, node);
+		result = read_commit_ts_profile(&work->shared_dir, shared_root, node);
 		if (result != 0)
 			return result;
 		required->current_sources++;
@@ -1526,6 +1526,18 @@ read_capacities(BootstrapReadWork *work, const char *shared_root, const char *wa
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 #endif
+
+ClusterControlRootResult
+cluster_control_native_commit_ts_profile_v1(const char *shared_root, uint32 node)
+{
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+#if !defined(WIN32) && defined(O_NOFOLLOW) && defined(O_DIRECTORY) && defined(O_CLOEXEC)           \
+	&& defined(AT_SYMLINK_NOFOLLOW)
+	if (read_path_valid(shared_root, NULL) && node < CLUSTER_CONTROL_ROOT_RECORD_COUNT)
+		result = read_commit_ts_profile(NULL, shared_root, node);
+#endif
+	return result;
+}
 
 ClusterControlRootResult
 cluster_control_bootstrap_read(const char *pgdata, const char *shared_root, const char *wal_root,

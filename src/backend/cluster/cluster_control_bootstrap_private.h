@@ -170,6 +170,11 @@ extern ClusterControlRootResult cluster_control_native_side_sync(const char *sha
 extern ClusterControlRootResult cluster_control_bootstrap_native_inputs(const char *pgdata);
 extern void cluster_control_bootstrap_native_inputs_require(const char *pgdata);
 
+/* Read-only physical unsupported-input observation. Caller owns original
+ * source/isolation checks; an empty observation is not successful recovery. */
+extern ClusterControlRootResult
+cluster_control_native_commit_ts_profile_v1(const char *shared_root, uint32 node);
+
 /* Process-local preparation and native control/geometry initialization only,
  * before shared memory or WAL startup. Not admission, physical qualification
  * or final CF validation. Reset has LocalProcessControlFile's native semantics.

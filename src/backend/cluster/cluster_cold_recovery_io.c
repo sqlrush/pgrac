@@ -313,6 +313,9 @@ typedef struct ColdScanWork {
 	ClusterColdDetailV1 detail;
 	ClusterColdScanResultV1 *result;
 	ClusterColdXidProgressV1 history_xid;
+	ClusterWalRecoveryCheckpointV1 checkpoint;
+	bool checkpoint_required;
+	bool checkpoint_seen;
 	ClusterColdDecodedV1 decoded;
 } ColdScanWork;
 
@@ -322,6 +325,25 @@ cold_scan_visit(XLogReaderState *reader, void *arg)
 	ColdScanWork *work = (ColdScanWork *)arg;
 
 	CHECK_FOR_INTERRUPTS();
+	/*
+	 * The selected control-file copy must describe this exact native WAL
+	 * record. Keep every field, including counters, bound to its source.
+	 */
+	if (work->checkpoint_required && reader->ReadRecPtr == work->checkpoint.checkpoint_start) {
+		uint8 info = XLogRecGetInfo(reader);
+
+		if (work->checkpoint_seen || XLogRecGetRmid(reader) != RM_XLOG_ID
+			|| (info != XLOG_CHECKPOINT_ONLINE && info != XLOG_CHECKPOINT_SHUTDOWN)
+			|| XLogRecGetXid(reader) != InvalidTransactionId || XLogRecMaxBlockId(reader) >= 0
+			|| XLogRecGetDataLen(reader) != sizeof(CheckPoint) || XLogRecGetData(reader) == NULL
+			|| memcmp(XLogRecGetData(reader), &work->checkpoint.checkpoint, sizeof(CheckPoint))
+				   != 0) {
+			work->detail = CLUSTER_COLD_SOURCE_GAP;
+			work->result->failed_read_rec_ptr = reader->ReadRecPtr;
+			return false;
+		}
+		work->checkpoint_seen = true;
+	}
 	work->detail
 		= cluster_cold_recovery_decode_v1(reader, work->system_identifier, work->storage_uuid,
 										  work->space_active, work->foreign, &work->decoded);
@@ -413,7 +435,8 @@ cold_scan_finish(ColdScanWork *work, ClusterControlRootResult visit,
 	result->root_result = (int)visit;
 	if (detail == CLUSTER_COLD_OK
 		&& (visit != CLUSTER_CONTROL_ROOT_OK_PRIMARY || observed->records != result->records
-			|| observed->complete_end != tail))
+			|| observed->complete_end != tail
+			|| (work->checkpoint_required && !work->checkpoint_seen)))
 		detail = CLUSTER_COLD_SOURCE_GAP;
 	if (detail == CLUSTER_COLD_OK && work->history_xid.begun && !work->history_xid.failed) {
 		ClusterColdXidProgressV1 *xid = &work->history_xid;
@@ -460,6 +483,19 @@ cold_scan_history_xid_begin(ColdScanWork *work, const ClusterWalInputV1 *input)
 									source.tail_end - source.native_redo);
 }
 
+static bool
+cold_scan_checkpoint_valid(const ClusterControlRootSnapshot *root,
+						   const ClusterWalRecoveryCheckpointV1 *checkpoint)
+{
+	return !XLogRecPtrIsInvalid(checkpoint->checkpoint_start)
+		   && checkpoint->checkpoint_start >= root->checkpoint_lower_lsn
+		   && checkpoint->checkpoint_start < root->validated_tail_lsn_exclusive
+		   && !XLogRecPtrIsInvalid(checkpoint->checkpoint.redo)
+		   && checkpoint->checkpoint.redo >= root->checkpoint_lower_lsn
+		   && checkpoint->checkpoint.redo <= checkpoint->checkpoint_start
+		   && checkpoint->checkpoint.ThisTimeLineID == root->checkpoint_tli;
+}
+
 ClusterColdDetailV1
 cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 						  const ClusterControlRootSnapshot *root,
@@ -469,13 +505,20 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 	ColdScanWork *work;
 	ClusterWalTailObservation observed;
 	ClusterControlRootResult visit;
+	ClusterWalRecoveryCheckpointV1 checkpoint;
 
 	if (result == NULL)
 		return CLUSTER_COLD_INVALID_ARGUMENT;
 	memset(result, 0, sizeof(*result));
 	if (plan == NULL || root == NULL || token == NULL)
 		return CLUSTER_COLD_INVALID_ARGUMENT;
+	visit = cluster_control_root_recovery_checkpoint_v1(root, token, &checkpoint);
+	result->root_result = (int)visit;
+	if (visit != CLUSTER_CONTROL_ROOT_OK_PRIMARY || !cold_scan_checkpoint_valid(root, &checkpoint))
+		return CLUSTER_COLD_SOURCE_GAP;
 	work = cold_scan_work(plan, participant, &root->identity, space_active, foreign, result);
+	work->checkpoint = checkpoint;
+	work->checkpoint_required = true;
 	work->side_plan = side_plan;
 	work->source_thread = root->identity.origin_thread_id;
 	work->timeline = root->checkpoint_tli;
@@ -493,6 +536,7 @@ cluster_cold_scan_input_v1(ClusterColdPlanV1 *plan, uint32 participant, ClusterW
 	ColdScanWork *work;
 	ClusterWalTailObservation observed;
 	ClusterControlRootResult visit;
+	ClusterWalRecoveryCheckpointV1 checkpoint = { 0 };
 
 	if (result == NULL)
 		return CLUSTER_COLD_INVALID_ARGUMENT;
@@ -500,8 +544,15 @@ cluster_cold_scan_input_v1(ClusterColdPlanV1 *plan, uint32 participant, ClusterW
 	input = inputs != NULL ? cluster_wal_inputs_at_v1(inputs, index) : NULL;
 	if (plan == NULL || input == NULL || input->kind != CLUSTER_WAL_INPUT_CHECKPOINT)
 		return CLUSTER_COLD_INVALID_ARGUMENT;
+	checkpoint.checkpoint_start = input->checkpoint_start;
+	memcpy(&checkpoint.checkpoint, &input->native_checkpoint, sizeof(checkpoint.checkpoint));
+	if (!cold_scan_checkpoint_valid(&input->checkpoint, &checkpoint))
+		return CLUSTER_COLD_SOURCE_GAP;
 	work = cold_scan_work(plan, participant, &input->checkpoint.identity, space_active, foreign,
 						  result);
+	/* Bind the immutable scope copy in the original retained WAL visit. */
+	work->checkpoint = checkpoint;
+	work->checkpoint_required = true;
 	work->side_plan = side_plan;
 	work->source_thread = input->checkpoint.identity.origin_thread_id;
 	work->timeline = input->checkpoint.checkpoint_tli;

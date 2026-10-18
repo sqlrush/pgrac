@@ -9155,6 +9155,7 @@ test_cluster_cold_tt_base: test_cluster_cold_tt_base.c unit_test.h test_cluster_
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 test_cluster_cold_recovery_startup_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_bootstrap_private.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_census.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
