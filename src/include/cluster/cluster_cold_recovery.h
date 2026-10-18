@@ -778,6 +778,7 @@ typedef struct ClusterColdTypedV1 {
 	struct ClusterColdReplayRootV1 *replay_roots;
 	uint32 replay_root_count;
 	struct ClusterColdTtBaseV1 *tt_base; /* raw original-owner input, no outcome authority */
+	struct ClusterColdTtBaseV1 *tt_after_redo; /* separate physical input, same TT budget */
 	bool source_drained[CLUSTER_COLD_MAX_PARTICIPANTS]; /* this pass-2 attempt only */
 	/* Provisional native counters after counted pass-2 drain. Zero means
 	 * missing; these do not prove global effects/durability or all-thread N. */
@@ -859,6 +860,18 @@ typedef struct ClusterColdTtSlotInputV1 {
 	ClusterColdTtSlotKeyV1 key;
 	TTSlot slot;
 } ClusterColdTtSlotInputV1;
+
+/* Re-enumerate physical TT after complete redo and the original durability
+ * barrier, without overwriting the pre-redo base. Share its remaining budget.
+ * The original cold owner must revalidate all sources around capture/readback.
+ * These raw bytes grant no checkpoint, top, loser, FullXid or C0 authority. */
+extern ClusterColdDetailV1 cluster_cold_tt_after_redo_capture_v1(ClusterColdTypedV1 *typed);
+extern ClusterColdDetailV1 cluster_cold_tt_after_redo_recheck_v1(ClusterColdTypedV1 *typed);
+extern void cluster_cold_tt_after_redo_reset_v1(ClusterColdTypedV1 *typed);
+extern uint32 cluster_cold_tt_after_redo_count_v1(const ClusterColdTypedV1 *typed);
+extern bool cluster_cold_tt_after_redo_slot_v1(const ClusterColdTypedV1 *typed,
+											   uint32 segment_index, uint32 slot_offset,
+											   ClusterColdTtSlotInputV1 *out);
 
 /* Enumerate every physical slot without filtering status, then optionally
  * match an expected physical key. Both copy input only and clear output on

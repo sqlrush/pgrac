@@ -104,6 +104,44 @@ static uint32 tt_base_participants;
 static Size tt_base_budget;
 static ClusterColdDetailV1 tt_base_capture_result, tt_base_recheck_result;
 static bool tt_base_captured;
+static int tt_after_captures, tt_after_rechecks, tt_after_resets, tt_after_fault;
+static uint32 tt_after_participants;
+static bool tt_after_captured;
+static ClusterColdDetailV1 tt_after_capture_result, tt_after_recheck_result;
+
+ClusterColdDetailV1
+cluster_cold_tt_after_redo_capture_v1(ClusterColdTypedV1 *typed)
+{
+	tt_after_captures++;
+	tt_after_participants = typed->participant_count;
+	tt_after_captured = tt_after_capture_result == CLUSTER_COLD_OK;
+	if (tt_after_fault == 1)
+		tokens[3].file_txn_seq++;
+	if (tt_after_fault == 3)
+		siglongjmp(*PG_exception_stack, 1);
+	return tt_after_capture_result;
+}
+
+ClusterColdDetailV1
+cluster_cold_tt_after_redo_recheck_v1(ClusterColdTypedV1 *typed)
+{
+	(void)typed;
+	tt_after_rechecks++;
+	if (tt_after_fault == 2)
+		tokens[3].file_txn_seq++;
+	if (tt_after_fault == 4)
+		siglongjmp(*PG_exception_stack, 1);
+	return tt_after_recheck_result;
+}
+
+void
+cluster_cold_tt_after_redo_reset_v1(ClusterColdTypedV1 *typed)
+{
+	(void)typed;
+	if (tt_after_captured)
+		tt_after_resets++;
+	tt_after_captured = false;
+}
 
 ClusterColdDetailV1
 cluster_cold_tt_base_capture_v1(ClusterColdTypedV1 *typed, Size budget)
@@ -126,7 +164,7 @@ cluster_cold_tt_base_recheck_v1(ClusterColdTypedV1 *typed)
 void
 cluster_cold_tt_base_destroy_v1(ClusterColdTypedV1 *typed)
 {
-	(void)typed;
+	cluster_cold_tt_after_redo_reset_v1(typed);
 	if (tt_base_captured)
 		tt_base_destroys++;
 	tt_base_captured = false;
@@ -1206,6 +1244,10 @@ fixture(void)
 	tt_base_budget = 0;
 	tt_base_capture_result = tt_base_recheck_result = CLUSTER_COLD_OK;
 	tt_base_captured = false;
+	tt_after_captures = tt_after_rechecks = tt_after_resets = tt_after_fault = 0;
+	tt_after_participants = 0;
+	tt_after_captured = false;
+	tt_after_capture_result = tt_after_recheck_result = CLUSTER_COLD_OK;
 	c0_mode = false;
 	memset(side_fixture, 0, sizeof(side_fixture));
 	side_creates = side_seals = side_destroys = side_fault = 0;

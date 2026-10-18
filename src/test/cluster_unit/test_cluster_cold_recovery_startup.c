@@ -2992,7 +2992,12 @@ UT_TEST(test_checkpoint_export_clears_unsealed_and_failed_output)
 int
 main(void)
 {
-	UT_PLAN(99);
+	UT_PLAN(104);
+	UT_RUN(test_endpoints_capture_and_recheck_post_redo_tt_before_publication);
+	UT_RUN(test_endpoints_incomplete_replay_never_captures_post_redo_tt);
+	UT_RUN(test_endpoints_post_redo_tt_refusal_discards_all_attempt_inputs);
+	UT_RUN(test_endpoints_post_redo_tt_rechecks_sources_and_cleans_error);
+	UT_RUN(test_endpoints_prior_refusal_resets_previous_post_redo_snapshot);
 	UT_RUN(test_endpoints_maximum_uses_complete_full_width_inputs);
 	UT_RUN(test_endpoints_include_every_history_generation_original_checkpoint_cut);
 	UT_RUN(test_endpoints_reject_partial_or_conflicting_replay_counters);

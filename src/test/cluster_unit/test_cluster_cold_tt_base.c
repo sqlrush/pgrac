@@ -1387,10 +1387,20 @@ UT_TEST(test_graph_invalid_arguments_clear_available_outputs)
 	}
 }
 
+#include "test_cluster_cold_tt_after_redo.h"
+
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(42);
+	UT_RUN(test_after_redo_reads_changed_slots_without_overwriting_original_base);
+	UT_RUN(test_after_redo_reenumerates_created_removed_and_history_origin_segments);
+	UT_RUN(test_after_redo_readback_drift_is_sticky_and_keeps_original_input);
+	UT_RUN(test_after_redo_shares_original_tt_budget_and_discards_partial_capture);
+	UT_RUN(test_after_redo_requires_original_namespace_and_base);
+	UT_RUN(test_after_redo_failed_io_never_exports_partial_slots);
+	UT_RUN(test_after_redo_reset_and_bounds_clear_only_post_redo_outputs);
+	UT_RUN(test_after_redo_namespace_drift_hides_captured_outputs);
 	UT_RUN(test_absence_scans_all_addresses_and_deduplicates_history_origins);
 	UT_RUN(test_all_slots_noncurrent_segments_and_generation_zero_are_retained);
 	UT_RUN(test_history_origin_last_segment_is_captured);

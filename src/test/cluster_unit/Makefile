@@ -9013,6 +9013,7 @@ test_cluster_cold_recovery_effects: test_cluster_cold_recovery_effects.c unit_te
 CLUSTER_COLD_STARTUP_O = test_cluster_cold_recovery_startup_core.o test_cluster_cold_recovery_startup_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)
 
 test_cluster_cold_tt_base: test_cluster_cold_tt_base.c unit_test.h test_cluster_heap_small_scn.inc \
+		test_cluster_cold_tt_after_redo.h \
 		$(top_srcdir)/src/backend/cluster/cluster_cold_recovery_tt.c \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h $(CLUSTER_SIDE_HEAD_READER_O) \

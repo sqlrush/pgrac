@@ -91,7 +91,7 @@ UT_TEST(test_endpoints_include_every_history_generation_original_checkpoint_cut)
 	ClusterColdTypedV1 *typed = endpoint_fixture(true);
 	UT_ASSERT(endpoint_finish(typed));
 	UT_ASSERT_EQ(typed->xid_next_after_redo, UINT64_C(0x900000009));
-	UT_ASSERT_EQ(history_checkpoint_reads, 6);
+	UT_ASSERT_EQ(history_checkpoint_reads, 12); /* before/after endpoints and each TT read */
 	UT_ASSERT_EQ(endpoint_progress[3].next_xid, 0);
 	UT_ASSERT_EQ(typed->xid_next_at_drain[3], 0);
 	UT_ASSERT_EQ(source_sync_calls, 3);
@@ -307,10 +307,105 @@ UT_TEST(test_endpoints_new_sync_invalidates_previous_aggregate)
 {
 	ClusterColdTypedV1 *typed = endpoint_fixture(false);
 	UT_ASSERT(endpoint_finish(typed));
+	UT_ASSERT(tt_after_captured);
 	UT_ASSERT(
 		cluster_cold_typed_sync_sources_v1(typed, (ClusterRecoveryFencePlan *)&fixture_context));
 	UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+	UT_ASSERT(!tt_after_captured);
+	UT_ASSERT_EQ(tt_after_resets, 1);
 	UT_ASSERT(!endpoint_finish(typed));
 	UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+	endpoint_destroy(&typed);
+}
+
+UT_TEST(test_endpoints_capture_and_recheck_post_redo_tt_before_publication)
+{
+	ClusterColdTypedV1 *typed = endpoint_fixture(true);
+
+	UT_ASSERT_EQ(tt_after_captures, 0);
+	UT_ASSERT(endpoint_finish(typed));
+	UT_ASSERT_EQ(tt_after_captures, 1);
+	UT_ASSERT_EQ(tt_after_rechecks, 1);
+	UT_ASSERT_EQ(tt_after_participants, typed->participant_count);
+	UT_ASSERT(tt_after_captured && tt_base_captured);
+	UT_ASSERT_EQ(typed->xid_next_after_redo, UINT64_C(0x900000009));
+	endpoint_destroy(&typed);
+	UT_ASSERT_EQ(tt_after_resets, 1);
+}
+
+UT_TEST(test_endpoints_incomplete_replay_never_captures_post_redo_tt)
+{
+	ClusterColdTypedV1 *typed = endpoint_fixture(false);
+
+	endpoint_result.steps_done--;
+	UT_ASSERT(!endpoint_finish(typed));
+	UT_ASSERT_EQ(tt_after_captures, 0);
+	UT_ASSERT_EQ(tt_after_rechecks, 0);
+	endpoint_destroy(&typed);
+}
+
+UT_TEST(test_endpoints_post_redo_tt_refusal_discards_all_attempt_inputs)
+{
+	for (int fault = 0; fault < 4; fault++) {
+		ClusterColdTypedV1 *typed = endpoint_fixture(true);
+
+		if (fault == 0)
+			tt_after_capture_result = CLUSTER_COLD_SOURCE_GAP;
+		if (fault == 1)
+			tt_after_capture_result = CLUSTER_COLD_CAPACITY;
+		if (fault == 2)
+			tt_after_capture_result = CLUSTER_COLD_OOM;
+		if (fault == 3)
+			tt_after_recheck_result = CLUSTER_COLD_SOURCE_GAP;
+		UT_ASSERT(!endpoint_finish(typed));
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
+		UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+		UT_ASSERT_EQ(typed->xid_next_at_drain[0], 0);
+		UT_ASSERT_EQ(typed->history_xid[3].next_xid, 0);
+		UT_ASSERT(!tt_after_captured && !typed->census_root_captured);
+		UT_ASSERT(tt_base_captured);
+		UT_ASSERT(!endpoint_finish(typed));
+		UT_ASSERT_EQ(tt_after_captures, 1);
+		endpoint_destroy(&typed);
+	}
+}
+
+UT_TEST(test_endpoints_post_redo_tt_rechecks_sources_and_cleans_error)
+{
+	for (int fault = 1; fault <= 4; fault++) {
+		ClusterColdTypedV1 *typed = endpoint_fixture(true);
+		volatile bool caught = false, ready = false;
+
+		tt_after_fault = fault;
+		PG_TRY();
+		{
+			ready = endpoint_finish(typed);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault >= 3);
+		UT_ASSERT(!ready);
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
+		UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+		UT_ASSERT_EQ(typed->history_xid[3].next_xid, 0);
+		UT_ASSERT(!tt_after_captured && !typed->census_root_captured);
+		UT_ASSERT_EQ(tt_after_resets, 1);
+		endpoint_destroy(&typed);
+	}
+}
+
+UT_TEST(test_endpoints_prior_refusal_resets_previous_post_redo_snapshot)
+{
+	ClusterColdTypedV1 *typed = endpoint_fixture(false);
+
+	UT_ASSERT(endpoint_finish(typed));
+	typed->refusal = CLUSTER_COLD_SPACE_REFUSED;
+	UT_ASSERT(!endpoint_finish(typed));
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SPACE_REFUSED);
+	UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+	UT_ASSERT(!tt_after_captured);
 	endpoint_destroy(&typed);
 }

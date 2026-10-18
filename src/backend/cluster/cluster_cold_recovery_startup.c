@@ -988,6 +988,7 @@ cold_history_sources_match(ClusterColdTypedV1 *typed)
 static void
 cold_execution_inputs_failed(ClusterColdTypedV1 *typed)
 {
+	cluster_cold_tt_after_redo_reset_v1(typed);
 	if (typed->refusal == CLUSTER_COLD_OK)
 		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "pass-2 original input freshness is incomplete");
 	memset(typed->history_xid, 0, sizeof(typed->history_xid));
@@ -1029,6 +1030,7 @@ cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFen
 		return false;
 	/* ERROR from an original source owner must not leave a reusable OK plan. */
 	cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "pass-2 source durability is incomplete");
+	cluster_cold_tt_after_redo_reset_v1(typed);
 	typed->xid_next_after_redo = 0;
 	memset(typed->source_drained, 0, sizeof(typed->source_drained));
 	memset(typed->xid_next_at_drain, 0, sizeof(typed->xid_next_at_drain));
@@ -1146,6 +1148,7 @@ cluster_cold_typed_xid_endpoints_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFe
 
 	if (typed == NULL)
 		return false;
+	cluster_cold_tt_after_redo_reset_v1(typed);
 	typed->xid_next_after_redo = 0;
 	if (typed->refusal != CLUSTER_COLD_OK)
 		return false;
@@ -1176,6 +1179,15 @@ cluster_cold_typed_xid_endpoints_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFe
 		}
 		if (ready)
 			ready = cold_replay_sources_current(typed, fence);
+		/* The original executor has completed redo and its physical durability
+		 * barrier. Retain separate raw TT bytes, then recheck both files and
+		 * every original ROOT/claim/checkpoint before exposing attempt inputs. */
+		if (ready)
+			ready = cluster_cold_tt_after_redo_capture_v1(typed) == CLUSTER_COLD_OK
+					&& cold_replay_sources_current(typed, fence);
+		if (ready)
+			ready = cluster_cold_tt_after_redo_recheck_v1(typed) == CLUSTER_COLD_OK
+					&& cold_replay_sources_current(typed, fence);
 	}
 	PG_CATCH();
 	{
