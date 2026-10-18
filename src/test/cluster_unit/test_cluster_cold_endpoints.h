@@ -326,6 +326,8 @@ UT_TEST(test_endpoints_capture_and_recheck_post_redo_tt_before_publication)
 	UT_ASSERT(endpoint_finish(typed));
 	UT_ASSERT_EQ(tt_after_captures, 1);
 	UT_ASSERT_EQ(tt_after_rechecks, 1);
+	UT_ASSERT_EQ(tt_inventory_calls, 1);
+	UT_ASSERT(tt_inventory_inputs_ready);
 	UT_ASSERT_EQ(tt_after_participants, typed->participant_count);
 	UT_ASSERT(tt_after_captured && tt_base_captured);
 	UT_ASSERT_EQ(typed->xid_next_after_redo, UINT64_C(0x900000009));
@@ -341,7 +343,61 @@ UT_TEST(test_endpoints_incomplete_replay_never_captures_post_redo_tt)
 	UT_ASSERT(!endpoint_finish(typed));
 	UT_ASSERT_EQ(tt_after_captures, 0);
 	UT_ASSERT_EQ(tt_after_rechecks, 0);
+	UT_ASSERT_EQ(tt_inventory_calls, 0);
 	endpoint_destroy(&typed);
+}
+
+UT_TEST(test_endpoints_inventory_refusal_discards_all_attempt_inputs)
+{
+	ClusterColdTypedV1 *typed = endpoint_fixture(true);
+
+	tt_inventory_result = false;
+	UT_ASSERT(!endpoint_finish(typed));
+	UT_ASSERT_EQ(tt_inventory_calls, 1);
+	UT_ASSERT(tt_inventory_inputs_ready);
+	UT_ASSERT_EQ(tt_after_rechecks, 0);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
+	UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+	UT_ASSERT_EQ(typed->xid_next_at_drain[0], 0);
+	UT_ASSERT_EQ(typed->history_xid[3].next_xid, 0);
+	UT_ASSERT(!tt_after_captured && !typed->census_root_captured);
+	UT_ASSERT(tt_base_captured);
+	UT_ASSERT_EQ(tt_after_resets, 1);
+	UT_ASSERT(!endpoint_finish(typed));
+	UT_ASSERT_EQ(tt_inventory_calls, 1);
+	endpoint_destroy(&typed);
+}
+
+UT_TEST(test_endpoints_inventory_rechecks_files_sources_and_cleans_error)
+{
+	for (int fault = 1; fault <= 3; fault++) {
+		ClusterColdTypedV1 *typed = endpoint_fixture(true);
+		volatile bool caught = false, ready = false;
+
+		tt_inventory_fault = fault;
+		PG_TRY();
+		{
+			ready = endpoint_finish(typed);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 3);
+		UT_ASSERT(!ready);
+		UT_ASSERT_EQ(tt_inventory_calls, 1);
+		UT_ASSERT(tt_inventory_inputs_ready);
+		UT_ASSERT_EQ(tt_after_rechecks, fault == 3 ? 0 : 1);
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
+		UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+		UT_ASSERT_EQ(typed->xid_next_at_drain[0], 0);
+		UT_ASSERT_EQ(typed->history_xid[3].next_xid, 0);
+		UT_ASSERT(!tt_after_captured && !typed->census_root_captured);
+		UT_ASSERT(tt_base_captured);
+		UT_ASSERT_EQ(tt_after_resets, 1);
+		endpoint_destroy(&typed);
+	}
 }
 
 UT_TEST(test_endpoints_post_redo_tt_refusal_discards_all_attempt_inputs)
@@ -407,5 +463,6 @@ UT_TEST(test_endpoints_prior_refusal_resets_previous_post_redo_snapshot)
 	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SPACE_REFUSED);
 	UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
 	UT_ASSERT(!tt_after_captured);
+	UT_ASSERT_EQ(tt_inventory_calls, 1);
 	endpoint_destroy(&typed);
 }

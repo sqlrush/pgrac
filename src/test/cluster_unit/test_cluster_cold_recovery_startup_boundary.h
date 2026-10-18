@@ -108,6 +108,24 @@ static int tt_after_captures, tt_after_rechecks, tt_after_resets, tt_after_fault
 static uint32 tt_after_participants;
 static bool tt_after_captured;
 static ClusterColdDetailV1 tt_after_capture_result, tt_after_recheck_result;
+static int tt_inventory_calls, tt_inventory_fault;
+static bool tt_inventory_result, tt_inventory_inputs_ready;
+
+bool
+cluster_cold_typed_tt_redo_inventory_v1(const ClusterColdTypedV1 *typed)
+{
+	tt_inventory_calls++;
+	tt_inventory_inputs_ready = typed->refusal == CLUSTER_COLD_OK && tt_base_captured
+								&& tt_after_captured && tt_after_rechecks == 0
+								&& typed->xid_next_after_redo == 0;
+	if (tt_inventory_fault == 1)
+		tokens[3].file_txn_seq++;
+	if (tt_inventory_fault == 2)
+		tt_after_recheck_result = CLUSTER_COLD_SOURCE_GAP;
+	if (tt_inventory_fault == 3)
+		siglongjmp(*PG_exception_stack, 1);
+	return tt_inventory_result && tt_inventory_inputs_ready;
+}
 
 ClusterColdDetailV1
 cluster_cold_tt_after_redo_capture_v1(ClusterColdTypedV1 *typed)
@@ -1248,6 +1266,9 @@ fixture(void)
 	tt_after_participants = 0;
 	tt_after_captured = false;
 	tt_after_capture_result = tt_after_recheck_result = CLUSTER_COLD_OK;
+	tt_inventory_calls = tt_inventory_fault = 0;
+	tt_inventory_result = true;
+	tt_inventory_inputs_ready = false;
 	c0_mode = false;
 	memset(side_fixture, 0, sizeof(side_fixture));
 	side_creates = side_seals = side_destroys = side_fault = 0;

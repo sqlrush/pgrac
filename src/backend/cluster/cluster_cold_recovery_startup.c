@@ -1185,6 +1185,15 @@ cluster_cold_typed_xid_endpoints_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFe
 		if (ready)
 			ready = cluster_cold_tt_after_redo_capture_v1(typed) == CLUSTER_COLD_OK
 					&& cold_replay_sources_current(typed, fence);
+		if (ready) {
+			/* Guarded capture readers require OK. Scope that access to this
+			 * original owner's inventory check; final readback is still due.
+			 * ERROR takes the same attempt-input cleanup path below. */
+			typed->refusal = CLUSTER_COLD_OK;
+			ready = cluster_cold_typed_tt_redo_inventory_v1(typed);
+			cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
+						"pass-2 TT inventory final readback is incomplete");
+		}
 		if (ready)
 			ready = cluster_cold_tt_after_redo_recheck_v1(typed) == CLUSTER_COLD_OK
 					&& cold_replay_sources_current(typed, fence);

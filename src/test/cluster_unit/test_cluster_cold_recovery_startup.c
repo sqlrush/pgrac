@@ -2992,9 +2992,11 @@ UT_TEST(test_checkpoint_export_clears_unsealed_and_failed_output)
 int
 main(void)
 {
-	UT_PLAN(104);
+	UT_PLAN(106);
 	UT_RUN(test_endpoints_capture_and_recheck_post_redo_tt_before_publication);
 	UT_RUN(test_endpoints_incomplete_replay_never_captures_post_redo_tt);
+	UT_RUN(test_endpoints_inventory_refusal_discards_all_attempt_inputs);
+	UT_RUN(test_endpoints_inventory_rechecks_files_sources_and_cleans_error);
 	UT_RUN(test_endpoints_post_redo_tt_refusal_discards_all_attempt_inputs);
 	UT_RUN(test_endpoints_post_redo_tt_rechecks_sources_and_cleans_error);
 	UT_RUN(test_endpoints_prior_refusal_resets_previous_post_redo_snapshot);
