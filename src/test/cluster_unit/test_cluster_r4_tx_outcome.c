@@ -2717,6 +2717,34 @@ UT_TEST(test_retained_active_mx_batch_rechecks_local_grant_after_release)
 	UT_ASSERT_EQ(test_candidate_acquire_calls, test_candidate_release_calls);
 }
 
+UT_TEST(test_retained_active_mx_batch_rechecks_admission_and_epoch_after_release)
+{
+	int fault;
+
+	for (fault = 0; fault < 2; fault++) {
+		ClusterCurrentMemberProof proof;
+		ClusterCurrentUpdaterProof updater_proof;
+		uint32 capability;
+		TimestampTz deadline = 0;
+
+		/* The local ACTIVE proof remains provisional until its candidate guard
+		 * is released.  Either admission revocation or a formation epoch change
+		 * must clear the proof and leave the terminal fallback unproven. */
+		reset_rolled_active_fixture();
+		if (fault == 0)
+			test_candidate_release_admission_drift = true;
+		else
+			test_candidate_release_epoch_drift = true;
+		UT_ASSERT_EQ(resolve_rolled_mx_batch(false, false, &proof, &updater_proof, &capability,
+									 &deadline),
+						 CMX_RESOLVE_UNKNOWN);
+		assert_mx_batch_unknown(&proof, 1, &updater_proof, &capability);
+		UT_ASSERT_EQ(test_ctrc_touch_calls, 1);
+		UT_ASSERT_EQ(test_durable_locator_calls, fault == 0 ? 1 : 2);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, test_candidate_release_calls);
+	}
+}
+
 UT_TEST(test_other_backend_rolled_terminal_uses_canonical_status)
 {
 	ClusterTTStatusKey key;
@@ -5932,7 +5960,7 @@ UT_TEST(test_self_fresh_role_does_not_inherit_ordinary_abort_permission)
 int
 main(void)
 {
-	UT_PLAN(167);
+	UT_PLAN(168);
 	UT_RUN(test_retained_active_identity_reaches_real_undo_pending);
 	UT_RUN(test_retained_undo_pending_requires_matching_active_tt_receipt);
 	UT_RUN(test_retained_undo_pending_guard_drift_cannot_publish);
@@ -6008,6 +6036,7 @@ main(void)
 	UT_RUN(test_retained_active_mx_batch_accepts_duplicate_ctrc_touch);
 	UT_RUN(test_retained_active_mx_batch_refuses_ctrc_touch);
 	UT_RUN(test_retained_active_mx_batch_rechecks_local_grant_after_release);
+	UT_RUN(test_retained_active_mx_batch_rechecks_admission_and_epoch_after_release);
 	UT_RUN(test_other_backend_rolled_terminal_uses_canonical_status);
 	UT_RUN(test_other_backend_rolled_locator_failures_do_not_acquire);
 	UT_RUN(test_other_backend_rolled_locator_requires_native_retained_era);
