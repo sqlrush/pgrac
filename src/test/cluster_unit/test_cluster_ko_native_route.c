@@ -214,6 +214,8 @@ UT_TEST(test_native_publication_rejects_changed_committed_purpose)
 	cluster_ko_shared_native_publication_v3();
 	UT_ASSERT(work->recovery_required && storage.native_recovery_required);
 	UT_ASSERT_EQ(cluster_ko_native_failure_count("publication"), 1);
+	UT_ASSERT_EQ(work->first_failure.site, CLUSTER_KO_NATIVE_SITE_PUBLICATION);
+	UT_ASSERT_EQ(work->first_failure.stage, CLUSTER_KO_NATIVE_STAGE_PUBLICATION);
 	UT_ASSERT_EQ(identity->state, KO_DROP_IDENTITY_RESERVED);
 	UT_ASSERT(!work->buffers_released && !work->predelete_ready);
 	native_fixture_shared_memory_end();
@@ -238,6 +240,10 @@ UT_TEST(test_native_private_publish_records_qualification_or_identity_first)
 		UT_ASSERT(owner->native_handed_off);
 		UT_ASSERT(work->recovery_required && storage.native_recovery_required);
 		UT_ASSERT(cluster_ko_native_failure_first(reason, &first));
+		UT_ASSERT_EQ(first.site, fault == 0 ? CLUSTER_KO_NATIVE_SITE_PUBLISH
+			: CLUSTER_KO_NATIVE_SITE_PUBLISH_IDENTITY);
+		UT_ASSERT_EQ(first.stage, fault == 0 ? CLUSTER_KO_NATIVE_STAGE_PUBLISH
+			: CLUSTER_KO_NATIVE_STAGE_PUBLISH_IDENTITY);
 		UT_ASSERT_EQ(first.serial, work->context.serial);
 		UT_ASSERT_EQ(first.batch, work->context.request.batch_id);
 		UT_ASSERT(RelFileLocatorEquals(first.locator, work->context.request.key.locator));

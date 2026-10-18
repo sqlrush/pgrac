@@ -1571,6 +1571,14 @@ geterrcode(void)
 	return edata->sqlerrcode;
 }
 
+/* Borrow the active primary message without allocating in an error handler.
+ * The caller must copy it before FlushErrorState() or another error report. */
+const char *
+geterrmsg(void)
+{
+	return errordata_stack_depth >= 0 ? errordata[errordata_stack_depth].message : NULL;
+}
+
 /*
  * geterrlevel --- return the currently set SQLSTATE error level
  *

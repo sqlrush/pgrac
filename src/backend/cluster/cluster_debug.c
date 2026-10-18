@@ -4028,6 +4028,7 @@ dump_ko(ReturnSetInfo *rsinfo)
 			snprintf(key, sizeof(key), "native_failure_%s_first_" #field, reason); \
 			emit_row(rsinfo, "ko", key, fmt_int64((int64)first.field))
 			KO_NATIVE_FIRST_FIELD(stage);
+			KO_NATIVE_FIRST_FIELD(site);
 			KO_NATIVE_FIRST_FIELD(captured_pg_us);
 			KO_NATIVE_FIRST_FIELD(serial);
 			KO_NATIVE_FIRST_FIELD(batch);
@@ -4044,6 +4045,8 @@ dump_ko(ReturnSetInfo *rsinfo)
 			snprintf(key, sizeof(key), "native_failure_%s_first_locator", reason);
 			emit_row(rsinfo, "ko", key, psprintf("%u/%u/%u", first.locator.spcOid,
 				first.locator.dbOid, first.locator.relNumber));
+			snprintf(key, sizeof(key), "native_failure_%s_first_error_message", reason);
+			emit_row(rsinfo, "ko", key, first.error_message);
 		}
 	}
 	for (int i = 0; i < CLUSTER_KO_ORIGIN_REASON_COUNT; i++) {

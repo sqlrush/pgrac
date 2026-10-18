@@ -1090,6 +1090,8 @@ cluster_ko_native_failure_first(const char *reason, ClusterKoNativeFailureV1 *ou
 		return false;
 	memset(out, 0, sizeof(*out));
 	out->stage = CLUSTER_KO_NATIVE_STAGE_CLOSE;
+	out->site = CLUSTER_KO_NATIVE_SITE_WINDOW;
+	strlcpy(out->error_message, "saved native error summary", sizeof(out->error_message));
 	out->locator = (RelFileLocator){1663, 5, 16385};
 	out->serial = 29;
 	out->batch = 12;
@@ -5597,8 +5599,10 @@ UT_TEST(test_debug_dump_exposes_origin_discard_reason_counters)
 	{
 		const char *const keys[] = { "native_failure_window_close_count",
 			"native_failure_window_close_first_stage", "native_failure_window_close_first_locator",
-			"native_failure_window_close_first_serial" };
-		const char *const values[] = { "23", "5", "1663/5/16385", "29" };
+			"native_failure_window_close_first_serial", "native_failure_window_close_first_site",
+			"native_failure_window_close_first_error_message" };
+		const char *const values[] = { "23", "5", "1663/5/16385", "29", "7",
+			"saved native error summary" };
 
 		for (unsigned i = 0; i < lengthof(keys); i++) {
 			UT_ASSERT_EQ(captured_dump_count("ko", keys[i]), 1);

@@ -295,6 +295,10 @@ static bool drive_shared_ack;
 static bool expecting_error;
 static int reported_sqlstate;
 static char reported_hint[256];
+static char reported_message[2048];
+static char last_native_failure_log[2048];
+static unsigned native_failure_log_events;
+static unsigned native_fixture_error_multibyte_offset;
 static ClusterKoSharedMessageV2 last_shared_request, last_shared_ack;
 static ClusterPiWritebackFactV2 offered_structure;
 static bool offer_notice_live;
@@ -988,10 +992,43 @@ geterrcode(void)
 {
 	return reported_sqlstate;
 }
+const char *
+geterrmsg(void)
+{
+	return reported_message;
+}
+/* Standalone database-encoding boundary: fixture messages use UTF-8 and
+ * the real common encoding character widths. Production uses mbutils.c. */
+int
+pg_mbcliplen(const char *message, int len, int limit)
+{
+	int bytes = 0;
+
+	while (bytes < len && message[bytes] != '\0') {
+		int width = pg_encoding_mblen(PG_UTF8, message + bytes);
+
+		if (bytes + width > Min(len, limit))
+			break;
+		bytes += width;
+	}
+	return bytes;
+}
+static void
+native_fixture_error(void)
+{
+	memset(reported_message, 'x', sizeof(reported_message) - 1);
+	memcpy(reported_message, "fixture native ERROR\nsummary ", 28);
+	if (native_fixture_error_multibyte_offset != 0)
+		memcpy(reported_message + native_fixture_error_multibyte_offset, "\xe4\xb8\xad", 3);
+	reported_message[sizeof(reported_message) - 1] = '\0';
+	reported_sqlstate = ERRCODE_INTERNAL_ERROR;
+	pg_re_throw();
+}
 void
 FlushErrorState(void)
 {
 	native_window_errors_flushed++;
+	strlcpy(reported_message, "fixture error state flushed", sizeof(reported_message));
 }
 void
 pg_re_throw(void)
@@ -1027,13 +1064,23 @@ errstart_cold(int level, const char *domain)
 int
 errmsg(const char *format, ...)
 {
+	va_list args;
+
 	Assert(expecting_error || fixture_error_level == LOG);
+	va_start(args, format);
+	vsnprintf(reported_message, sizeof(reported_message), format, args);
+	va_end(args);
 	return 0;
 }
 int
 errmsg_internal(const char *format, ...)
 {
+	va_list args;
+
 	Assert(expecting_error || fixture_error_level == LOG);
+	va_start(args, format);
+	vsnprintf(reported_message, sizeof(reported_message), format, args);
+	va_end(args);
 	return 0;
 }
 int
@@ -1047,6 +1094,10 @@ errfinish(const char *file, int line, const char *function)
 {
 	if (fixture_error_level == LOG) {
 		fixture_log_events++;
+		if (strstr(reported_message, "native committed producer failure") != NULL) {
+			native_failure_log_events++;
+			strlcpy(last_native_failure_log, reported_message, sizeof(last_native_failure_log));
+		}
 		return;
 	}
 	if (expecting_error)
@@ -1486,6 +1537,9 @@ reset_test(void)
 	origin_wait_hook = NULL;
 	ko_drop_poll_boundary = NULL;
 	fixture_log_events = 0;
+	native_failure_log_events = 0;
+	native_fixture_error_multibyte_offset = 0;
+	last_native_failure_log[0] = '\0';
 	ko_drop_scan = 0;
 	ko_native_report_serial = 0;
 	memset(ko_drop_report_serial, 0, sizeof(ko_drop_report_serial));
@@ -1555,6 +1609,7 @@ reset_test(void)
 	expecting_error = false;
 	reported_sqlstate = 0;
 	reported_hint[0] = '\0';
+	reported_message[0] = '\0';
 	InterruptPending = false;
 	space_reads = send_calls = lock_calls = boot_change_phase = 0;
 	member_generation = 2;

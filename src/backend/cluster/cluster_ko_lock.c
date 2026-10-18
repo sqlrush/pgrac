@@ -77,6 +77,7 @@
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "miscadmin.h"
+#include "mb/pg_wchar.h"
 #include "port/atomics.h"
 #include "storage/backendid.h"
 #include "storage/bufmgr.h"
@@ -275,6 +276,7 @@ typedef struct ClusterKoShared {
 	pg_atomic_uint64 origin_discard_logged_mask;
 	pg_atomic_uint64 native_failure_count[CLUSTER_KO_NATIVE_FAIL_COUNT];
 	ClusterKoNativeFailureV1 native_failure_first[CLUSTER_KO_NATIVE_FAIL_COUNT];
+	bool native_failure_stop_logged[CLUSTER_KO_NATIVE_FAIL_COUNT];
 	ClusterKoOriginCheckpointPendingV1 origin_checkpoint_pending;
 	pg_atomic_uint32 inbound_head;		 /* consumer (SI Broadcaster aux) */
 	pg_atomic_uint32 inbound_tail;		 /* producer (LMON IC handler) */
@@ -544,6 +546,7 @@ cluster_ko_shmem_init(void)
 		for (int i = 0; i < CLUSTER_KO_NATIVE_FAIL_COUNT; i++)
 			pg_atomic_init_u64(&ko_state->native_failure_count[i], 0);
 		memset(ko_state->native_failure_first, 0, sizeof(ko_state->native_failure_first));
+		memset(ko_state->native_failure_stop_logged, 0, sizeof(ko_state->native_failure_stop_logged));
 		memset(&ko_state->origin_checkpoint_pending, 0,
 			   sizeof(ko_state->origin_checkpoint_pending));
 		ko_state->origin_checkpoint_pending.registry_slot = UINT32_MAX;
@@ -680,7 +683,8 @@ cluster_ko_native_failure_reason_name(int reason)
 const char *
 cluster_ko_native_failure_stage_name(int stage)
 {
-	static const char *const names[] = { "none", "owner", "wait", "discard", "space", "close" };
+	static const char *const names[] = { "none", "owner", "wait", "discard", "space", "close",
+		"abandon", "publish", "publish_identity", "registration_publication", "publication", "promote" };
 
 	return stage >= 0 && stage < lengthof(names) ? names[stage] : "unknown";
 }
@@ -733,8 +737,8 @@ cluster_ko_origin_discard_count(const char *reason)
 
 
 /* These copies never participate in a protocol predicate. Capture immediately
- * before the original failure write; only CP emits the saved LOG, so logging
- * cannot escape the committed producer's non-throwing window. */
+ * before the original failure write; only CP and normal-stop emit saved LOGs,
+ * so logging cannot escape the committed producer's non-throwing window. */
 static uint32
 ko_native_context_diagnostic_flags(const ClusterKoSharedContext *c)
 {
@@ -749,7 +753,8 @@ ko_native_context_diagnostic_flags(const ClusterKoSharedContext *c)
 static void
 ko_native_failure_capture_locked(ClusterKoNativeContinuation *work,
 	const ClusterKoCompletionV2 *owned, const ClusterKoSharedContext *before,
-	ClusterKoNativeFailureReason reason, uint32 stage, int sqlerrcode)
+	ClusterKoNativeFailureReason reason, uint32 stage, int sqlerrcode,
+	uint32 site, const char *error_message)
 {
 	ClusterKoNativeFailureV1 f = {0};
 	const ClusterKoSharedContext *c = &work->context;
@@ -761,6 +766,9 @@ ko_native_failure_capture_locked(ClusterKoNativeContinuation *work,
 		reason = CLUSTER_KO_NATIVE_FAIL_UNTRACKED;
 	f.reason = reason;
 	f.stage = stage;
+	f.site = site;
+	if (error_message != NULL)
+		strlcpy(f.error_message, error_message, sizeof(f.error_message));
 	f.sqlerrcode = sqlerrcode;
 	f.pid = MyProcPid;
 	f.producer_pid = c->pid;
@@ -820,26 +828,26 @@ ko_native_failure_capture_locked(ClusterKoNativeContinuation *work,
 }
 
 static void
-ko_native_failure_log(const ClusterKoNativeFailureV1 *f)
+ko_native_failure_log(const ClusterKoNativeFailureV1 *f, const char *consumer)
 {
 	if (f->reason == CLUSTER_KO_NATIVE_FAIL_NONE)
 		return;
-	elog(LOG, "native committed producer failure reason=%s stage=%s captured_pg_us=" INT64_FORMAT
+	elog(LOG, "native committed producer failure consumer=%s site=%u reason=%s stage=%s captured_pg_us=" INT64_FORMAT
 		 " locator=%u/%u/%u operation=%u serial=" UINT64_FORMAT " batch=" UINT64_FORMAT
 		 " epoch=" UINT64_FORMAT " producer_pid=%d captured_pid=%d slot=%u sqlerrcode=%d"
 		 " work_flags=0x%x owner_flags=0x%x context_flags=0x%x entry_flags=0x%x matches=0x%x handoff=0x%x"
 		 " drop_identity=%u fence=" UINT64_FORMAT " identity_state=%u revision=" UINT64_FORMAT
 		 " sent=0x%x sending=0x%x uncertain=0x%x done=0x%x failed=0x%x"
 		 " terminal=" UINT64_FORMAT "/" UINT64_FORMAT " source_thread=" UINT64_FORMAT
-		 " source_boot=" UINT64_FORMAT " timeline=%u mutation=" UINT64_FORMAT,
-		 cluster_ko_native_failure_reason_name(f->reason), cluster_ko_native_failure_stage_name(f->stage),
+		 " source_boot=" UINT64_FORMAT " timeline=%u mutation=" UINT64_FORMAT " error_summary=\"%s\"",
+		 consumer, f->site, cluster_ko_native_failure_reason_name(f->reason), cluster_ko_native_failure_stage_name(f->stage),
 		 f->captured_pg_us, f->locator.spcOid, f->locator.dbOid, f->locator.relNumber, f->operation,
 		 f->serial, f->batch, f->epoch, f->producer_pid, f->pid, f->slot, f->sqlerrcode,
 		 f->work_flags, f->owner_flags, f->context_flags, f->entry_flags, f->matches, f->handoff,
 		 f->drop_identity, f->drop_identity_serial, f->identity_state, f->revision,
 		 f->sent_peers, f->sending_peers, f->uncertain_peers, f->done_peers, f->failed_peers,
 		 f->terminal_start, f->terminal_end, f->source_thread, f->source_boot,
-		 f->source_timeline, f->mutation_token);
+		 f->source_timeline, f->mutation_token, f->error_message);
 }
 
 /* Backend-local scratch, never read by a correctness predicate. */
@@ -3997,7 +4005,8 @@ ko_native_abandon_unready(ClusterKoCompletionV2 *completion)
 	if (work->context.pid == completion->pid && work->context.serial == completion->serial
 		&& !work->buffers_released) {
 		ko_native_failure_capture_locked(work, completion, NULL,
-			CLUSTER_KO_NATIVE_FAIL_ABANDON, CLUSTER_KO_NATIVE_STAGE_NONE, 0);
+			CLUSTER_KO_NATIVE_FAIL_ABANDON, CLUSTER_KO_NATIVE_STAGE_ABANDON, 0,
+			CLUSTER_KO_NATIVE_SITE_ABANDON, NULL);
 		work->recovery_required = true;
 		ko_state->native_recovery_required = true;
 	}
@@ -5145,7 +5154,7 @@ ko_native_publish(ClusterKoCompletionV2 *owned, bool from_commit_tail)
 	if (!qualified) {
 		SpinLockAcquire(&ko_state->shared_lock);
 		ko_native_failure_capture_locked(work, owned, NULL, CLUSTER_KO_NATIVE_FAIL_PUBLISH,
-			CLUSTER_KO_NATIVE_STAGE_NONE, 0);
+			CLUSTER_KO_NATIVE_STAGE_PUBLISH, 0, CLUSTER_KO_NATIVE_SITE_PUBLISH, NULL);
 		SpinLockRelease(&ko_state->shared_lock);
 	}
 	work->recovery_required = !qualified;
@@ -5170,7 +5179,7 @@ ko_native_publish(ClusterKoCompletionV2 *owned, bool from_commit_tail)
 			|| origin->drop_identity_serial != owned->drop_identity_serial
 			|| identity == NULL || identity->state != KO_DROP_IDENTITY_RESERVED) {
 			ko_native_failure_capture_locked(work, owned, NULL, CLUSTER_KO_NATIVE_FAIL_PUBLISH_IDENTITY,
-				CLUSTER_KO_NATIVE_STAGE_NONE, 0);
+				CLUSTER_KO_NATIVE_STAGE_PUBLISH_IDENTITY, 0, CLUSTER_KO_NATIVE_SITE_PUBLISH_IDENTITY, NULL);
 			work->recovery_required = true;
 			work->context.structure_owned = false;
 		} else {
@@ -5276,7 +5285,7 @@ ko_native_registration_published(ClusterKoCompletionV2 *owned,
 			work->diagnostic_handoff |= 32u;
 		} else {
 			ko_native_failure_capture_locked(work, owned, before, CLUSTER_KO_NATIVE_FAIL_REGISTRATION,
-				CLUSTER_KO_NATIVE_STAGE_NONE, 0);
+				CLUSTER_KO_NATIVE_STAGE_REGISTRATION, 0, CLUSTER_KO_NATIVE_SITE_REGISTRATION, NULL);
 			work->recovery_required = true;
 			ko_state->native_recovery_required = true;
 		}
@@ -5362,7 +5371,7 @@ cluster_ko_shared_native_publication_v3(void)
 				/* A completed publication does not repair an incomplete/stale
 				 * local carrier. Preserve it for the original recovery owner. */
 				ko_native_failure_capture_locked(work, owned, &before, CLUSTER_KO_NATIVE_FAIL_PUBLICATION,
-					CLUSTER_KO_NATIVE_STAGE_NONE, 0);
+					CLUSTER_KO_NATIVE_STAGE_PUBLICATION, 0, CLUSTER_KO_NATIVE_SITE_PUBLICATION, NULL);
 				work->recovery_required = true;
 				ko_state->native_recovery_required = true;
 			}
@@ -5558,7 +5567,8 @@ cluster_ko_shared_native_promote_v2(void)
 		SpinLockAcquire(&ko_state->shared_lock);
 		if (ko_state->native_ready == selected && ko_state->native_waiting != 0) {
 			ko_native_failure_capture_locked(work, NULL, &before,
-				CLUSTER_KO_NATIVE_FAIL_PROMOTION_CUT, CLUSTER_KO_NATIVE_STAGE_NONE, 0);
+				CLUSTER_KO_NATIVE_FAIL_PROMOTION_CUT, CLUSTER_KO_NATIVE_STAGE_PROMOTE, 0,
+				CLUSTER_KO_NATIVE_SITE_PROMOTE, NULL);
 			if (!work->diagnostic_logged) {
 				failure = work->first_failure;
 				work->diagnostic_logged = true;
@@ -5571,7 +5581,7 @@ cluster_ko_shared_native_promote_v2(void)
 			ko_state->native_waiting--;
 		}
 		SpinLockRelease(&ko_state->shared_lock);
-		ko_native_failure_log(&failure);
+		ko_native_failure_log(&failure, "promote");
 		ko_native_deferred(&before, &ko_native_report_serial,
 						   failed ? "PRODUCER_INCOMPLETE" : "PROMOTION_CUT");
 		return CLUSTER_KO_STRUCTURE_INVALID;
@@ -7136,6 +7146,7 @@ cluster_ko_shared_normal_stop_poll_v2(const char **reason)
 {
 	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
 	const char *why = "KO_SHARED_EMPTY";
+	ClusterKoNativeFailureV1 failures[CLUSTER_KO_NATIVE_FAIL_COUNT] = {0};
 
 	if (ko_state == NULL) {
 		if (reason != NULL)
@@ -7152,6 +7163,14 @@ cluster_ko_shared_normal_stop_poll_v2(const char **reason)
 	} else if (ko_state->native_recovery_required || DsaPointerIsValid(ko_state->native_failed)) {
 		result = CLUSTER_NORMAL_STOP_INVALID;
 		why = "KO_SHARED_COMMITTED_RECOVERY_REQUIRED";
+		/* The producer has already saved this snapshot; CP promotion is
+		 * not a prerequisite. Copy only diagnostics under the original lock. */
+		for (int i = 1; i < CLUSTER_KO_NATIVE_FAIL_COUNT; i++)
+			if (!ko_state->native_failure_stop_logged[i]
+				&& ko_state->native_failure_first[i].reason != CLUSTER_KO_NATIVE_FAIL_NONE) {
+				failures[i] = ko_state->native_failure_first[i];
+				ko_state->native_failure_stop_logged[i] = true;
+			}
 	} else if (ko_state->native_waiting != 0 || DsaPointerIsValid(ko_state->native_incoming)
 			   || DsaPointerIsValid(ko_state->native_ready)) {
 		result = CLUSTER_NORMAL_STOP_PENDING;
@@ -7227,6 +7246,8 @@ cluster_ko_shared_normal_stop_poll_v2(const char **reason)
 		}
 	}
 	SpinLockRelease(&ko_state->shared_lock);
+	for (int i = 1; i < CLUSTER_KO_NATIVE_FAIL_COUNT; i++)
+		ko_native_failure_log(&failures[i], "normal_stop");
 	if (reason != NULL)
 		*reason = why;
 	return result;
@@ -8537,6 +8558,7 @@ cluster_ko_shared_native_window_v4(const ClusterSpaceDropState *space_drop)
 		volatile bool ready = false, caught = false;
 		volatile uint32 stage = CLUSTER_KO_NATIVE_STAGE_OWNER;
 		volatile int sqlerrcode = ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE;
+		char error_message[CLUSTER_KO_NATIVE_ERROR_SUMMARY_BYTES] = {0};
 
 		if (!owned->native_transaction || !owned->postcommit || !owned->native_handed_off
 			|| owned->native_pending || !owned->barrier_v3 || !owned->barrier_committed_discard
@@ -8567,6 +8589,8 @@ cluster_ko_shared_native_window_v4(const ClusterSpaceDropState *space_drop)
 		}
 		PG_CATCH();
 		{
+			const char *message = geterrmsg();
+
 			/* ERROR clears both counts. This handler remains inside the
 			 * native committed window; its caller owns the matching resume. */
 			caught = true;
@@ -8575,6 +8599,18 @@ cluster_ko_shared_native_window_v4(const ClusterSpaceDropState *space_drop)
 			QueryCancelHoldoffCount = query_cancel_holdoff;
 			if (geterrcode() != 0)
 				sqlerrcode = geterrcode();
+			if (message != NULL) {
+				int length = pg_mbcliplen(message, sizeof(error_message) - 1,
+					sizeof(error_message) - 1);
+
+				/* Existing error text uses the database encoding. Clip at a
+				 * complete character without allocating in this handler. */
+				memcpy(error_message, message, length);
+				error_message[length] = '\0';
+				for (char *p = error_message; *p != '\0'; p++)
+					if ((unsigned char)*p < ' ' || *p == '\177')
+						*p = ' ';
+			}
 			MemoryContextSwitchTo(oldcontext);
 			FlushErrorState();
 		}
@@ -8586,7 +8622,7 @@ cluster_ko_shared_native_window_v4(const ClusterSpaceDropState *space_drop)
 			ko_native_failure_capture_locked(work, owned, NULL,
 				caught ? CLUSTER_KO_NATIVE_FAIL_WINDOW_ERROR
 				: (ClusterKoNativeFailureReason)(CLUSTER_KO_NATIVE_FAIL_WINDOW_OWNER + stage - 1),
-				stage, sqlerrcode);
+				stage, sqlerrcode, CLUSTER_KO_NATIVE_SITE_WINDOW, error_message);
 			work->recovery_required = true;
 			ko_state->native_recovery_required = true;
 			if (owned->slot < CLUSTER_KO_SHARED_CAPACITY) {

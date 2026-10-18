@@ -1057,6 +1057,8 @@ UT_TEST(test_pending_publication_rejects_changed_active_operation)
 		UT_ASSERT(work->recovery_required && storage.native_recovery_required);
 		UT_ASSERT_EQ(cluster_ko_native_failure_count(fault == 12
 			? "producer_untracked" : "registration_publication"), 1);
+		UT_ASSERT_EQ(work->first_failure.site, CLUSTER_KO_NATIVE_SITE_REGISTRATION);
+		UT_ASSERT_EQ(work->first_failure.stage, CLUSTER_KO_NATIVE_STAGE_REGISTRATION);
 		UT_ASSERT(!work->publication_observed);
 		UT_ASSERT(!work->buffers_released && !work->predelete_ready);
 		UT_ASSERT(!cluster_ko_directory_drop_committed_v3(work->context.request.key.locator));
@@ -1138,6 +1140,7 @@ static unsigned window_close_case, window_close_samples;
 /* Only the new directed diagnostics tests enable this observer. */
 static const char *native_observation_reason;
 static uint32 native_observation_stage;
+static unsigned native_observation_multibyte_offset;
 
 static ClusterKoDirectoryIoV3 window_entered;
 static uint32 window_interrupt_holdoff, window_query_cancel_holdoff;
@@ -1182,7 +1185,7 @@ window_close_fault(void)
 	case 9: pg_atomic_fetch_add_u64(&storage.peer_admission_revision, 1); break;
 	case 10: local_writeback_closed = false; break;
 	case 11: relation_gate_ok = false; break;
-	case 12: pg_re_throw(); break;
+	case 12: native_fixture_error(); break;
 	case 13: postcommit_owner->terminal.record_end++; break;
 	case 14: identity->fence_serial++; break;
 	case 15: committed_origin_missing_caps = PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1; break;
@@ -1227,7 +1230,7 @@ window_origin_discard(void)
 	case 9: storage.contexts[window_slot].serial++; break;
 	case 10:
 		InterruptHoldoffCount = QueryCancelHoldoffCount = CritSectionCount = 0;
-		pg_re_throw();
+		native_fixture_error();
 		break;
 	case 13: {
 		ClusterKoCompletionV2 saved = *postcommit_owner;
@@ -1299,7 +1302,7 @@ window_send(uint8 type, int32 dest, const void *bytes, uint32 length)
 		/* Native errfinish(ERROR) clears these before PG_RE_THROW. A plain
 		 * fixture longjmp would miss the committed caller's restore duty. */
 		InterruptHoldoffCount = QueryCancelHoldoffCount = CritSectionCount = 0;
-		pg_re_throw();
+		native_fixture_error();
 	}
 	if (window_mode == 2 || window_mode == 6) {
 		/* A wait-table notification is not an exact operation result. */
@@ -1405,7 +1408,7 @@ window_final_space_fixture(const ClusterKoCompletionV2 *owner,
 	case 12: entry->serial++; break;
 	case 13: v3_local_ax = false; break;
 	case 14: relation_gate_ok = false; break;
-	case 15: pg_re_throw(); break;
+	case 15: native_fixture_error(); break;
 	case 16: ((uint8 *)wal)[0] ^= 1; break;
 	case 17: terminal->identity.system_identifier++; break;
 	case 18: terminal->identity.storage_uuid[0]++; break;
@@ -1500,6 +1503,7 @@ run_committed_window(uint16 operation, unsigned mode, bool held, unsigned origin
 	native_window_space = mode == 7 ? NULL : (ClusterSpaceDropState *)&window_request;
 	native_window_space_owner = mode == 8 ? NULL : owner;
 	native_window_space_finish_hook = window_final_case == 0 ? NULL : window_final_space_fixture;
+	native_fixture_error_multibyte_offset = native_observation_multibyte_offset;
 	window_expect_ready = held && mode < 3;
 	window_expect_closed = window_expect_ready
 		&& (origin_case < 8 || (origin_case > 11 && origin_case < 16));
@@ -1688,17 +1692,47 @@ run_committed_window(uint16 operation, unsigned mode, bool held, unsigned origin
 				UT_ASSERT_EQ(cluster_ko_native_failure_count(
 					cluster_ko_native_failure_reason_name(i)), 0);
 		} else {
+			const char *stop_reason = NULL;
+			unsigned logs = native_failure_log_events;
+
+			memset(&first, 0, sizeof(first));
 			UT_ASSERT(cluster_ko_native_failure_first(native_observation_reason, &first));
+			UT_ASSERT_EQ(first.site, CLUSTER_KO_NATIVE_SITE_WINDOW);
 			UT_ASSERT_EQ(first.stage, native_observation_stage);
 			UT_ASSERT(RelFileLocatorEquals(first.locator, space_identity.key.locator));
 			UT_ASSERT_EQ(first.serial, window_work->context.serial);
 			UT_ASSERT_EQ(first.batch, window_work->context.request.batch_id);
 			UT_ASSERT_EQ(first.producer_pid, window_work->context.pid);
 			UT_ASSERT_EQ(cluster_ko_native_failure_count(native_observation_reason), 1);
+			if (strcmp(native_observation_reason, "window_error") == 0) {
+				UT_ASSERT_EQ(first.sqlerrcode, ERRCODE_INTERNAL_ERROR);
+				UT_ASSERT_EQ(strlen(first.error_message), native_observation_multibyte_offset == 190
+					? 190 : CLUSTER_KO_NATIVE_ERROR_SUMMARY_BYTES - 1);
+				if (native_observation_multibyte_offset == 188)
+					UT_ASSERT(memcmp(first.error_message + 188, "\xe4\xb8\xad", 3) == 0);
+				UT_ASSERT(strncmp(first.error_message, "fixture native ERROR summary ", 28) == 0);
+				UT_ASSERT(strchr(first.error_message, '\n') == NULL);
+			} else
+				UT_ASSERT_STR_EQ(first.error_message, "");
+			/* Stop must carry the saved first failure even before CP runs. */
+			UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&stop_reason), CLUSTER_NORMAL_STOP_INVALID);
+			UT_ASSERT_STR_EQ(stop_reason, "KO_SHARED_COMMITTED_RECOVERY_REQUIRED");
+			UT_ASSERT_EQ(native_failure_log_events, logs + 1);
+			UT_ASSERT(strstr(last_native_failure_log, "consumer=normal_stop") != NULL);
+			UT_ASSERT(strstr(last_native_failure_log, "site=7") != NULL);
+			UT_ASSERT(strstr(last_native_failure_log, "serial=") != NULL);
+			UT_ASSERT(strstr(last_native_failure_log, "batch=") != NULL);
+			if (strcmp(native_observation_reason, "window_error") == 0)
+				UT_ASSERT(strstr(last_native_failure_log,
+					"error_summary=\"fixture native ERROR summary") != NULL);
+			UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&stop_reason), CLUSTER_NORMAL_STOP_INVALID);
+			UT_ASSERT_EQ(native_failure_log_events, logs + 1);
 			/* Secondary CP failure and producer exit must retain the original
 			 * snapshot rather than naming promotion as the first cause. */
 			MyBackendType = B_CHECKPOINTER;
 			UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_INVALID);
+			UT_ASSERT_EQ(native_failure_log_events, logs + 2);
+			UT_ASSERT(strstr(last_native_failure_log, "consumer=promote") != NULL);
 			UT_ASSERT(cluster_ko_native_failure_first(native_observation_reason, &after));
 			UT_ASSERT(memcmp(&first, &after, sizeof(first)) == 0);
 			UT_ASSERT_EQ(cluster_ko_native_failure_count(native_observation_reason), 1);
@@ -1732,6 +1766,17 @@ UT_TEST(test_native_window_first_failure_has_exact_stage_and_work)
 	window_final_case = window_close_case = 1;
 	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 0);
 	window_final_case = window_close_case = 0;
+	/* A character crossing the byte limit must be omitted; one ending
+	 * exactly at that limit must survive intact through work/log/dump. */
+	native_observation_reason = "window_error";
+	native_observation_stage = CLUSTER_KO_NATIVE_STAGE_SPACE;
+	window_final_case = 15;
+	native_observation_multibyte_offset = 190;
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 0);
+	native_observation_multibyte_offset = 188;
+	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 0);
+	native_observation_multibyte_offset = 0;
+	window_final_case = 0;
 	native_observation_reason = NULL;
 }
 
@@ -1759,6 +1804,33 @@ UT_TEST(test_native_healthy_window_has_no_first_failure)
 	run_committed_window(CLUSTER_KO_SHARED_V3_OPERATION_DROP, 0, true, 0);
 	window_final_case = 0;
 	native_observation_reason = NULL;
+}
+
+UT_TEST(test_native_abandon_and_promotion_have_distinct_write_ids)
+{
+	ClusterKoCompletionV2 *owner = claimed_registration(CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+	ClusterKoNativeContinuation *work = owner->native_reserved;
+	ClusterKoNativeFailureV1 first;
+
+	UT_ASSERT(commit_registration());
+	ko_native_abandon_unready(owner);
+	UT_ASSERT(cluster_ko_native_failure_first("abandon", &first));
+	UT_ASSERT_EQ(first.site, CLUSTER_KO_NATIVE_SITE_ABANDON);
+	UT_ASSERT_EQ(first.stage, CLUSTER_KO_NATIVE_STAGE_ABANDON);
+	UT_ASSERT(memcmp(&first, &work->first_failure, sizeof(first)) == 0);
+	native_fixture_shared_memory_end();
+
+	prepare_postcommit(false);
+	UT_ASSERT(cluster_ko_shared_observe_truncate_v2(postcommit_owner));
+	native_commit_active = true;
+	cluster_ko_shared_native_commit_v2();
+	current_epoch++;
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_INVALID);
+	UT_ASSERT(cluster_ko_native_failure_first("promotion_cut", &first));
+	UT_ASSERT_EQ(first.site, CLUSTER_KO_NATIVE_SITE_PROMOTE);
+	UT_ASSERT_EQ(first.stage, CLUSTER_KO_NATIVE_STAGE_PROMOTE);
+	native_fixture_shared_memory_end();
 }
 
 UT_TEST(test_committed_window_final_space_keeps_original_owner_and_negative_identity)
@@ -1952,7 +2024,8 @@ UT_TEST(test_prepared_mode_keeps_original_completed_legacy_owner)
 int
 main(void)
 {
-	UT_PLAN(58);
+	UT_PLAN(59);
+	UT_RUN(test_native_abandon_and_promotion_have_distinct_write_ids);
 	UT_RUN(test_native_window_first_failure_has_exact_stage_and_work);
 	UT_RUN(test_native_window_caught_error_retains_evaluating_stage);
 	UT_RUN(test_native_healthy_window_has_no_first_failure);
