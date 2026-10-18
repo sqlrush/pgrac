@@ -1247,7 +1247,10 @@ cluster_cold_typed_xid_endpoints_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFe
 	}
 	PG_TRY();
 	{
-		ready = cold_replay_sources_current(typed, fence);
+		/* Endpoint consumers run after source sync. Revalidate the retained
+		 * original TT base before deriving post-redo endpoint inputs. */
+		ready = cluster_cold_tt_base_recheck_v1(typed) == CLUSTER_COLD_OK
+				&& cold_replay_sources_current(typed, fence);
 		for (uint32 p = 0; ready && p < typed->participant_count; p++) {
 			uint64 next;
 			ready = cold_xid_endpoint(typed, result, progress, p, &next);

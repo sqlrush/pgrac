@@ -3117,6 +3117,24 @@ UT_TEST(test_tt_base_drift_refuses_pass_two_stickily)
 	cluster_cold_typed_destroy_v1(&typed);
 }
 
+UT_TEST(test_tt_base_drift_refuses_later_pass_two_consumer)
+{
+	ClusterColdTypedV1 *typed = endpoint_fixture(false);
+
+	/* Source sync must have checked the retained original TT base once. */
+	UT_ASSERT_EQ(tt_base_rechecks, 1);
+	tt_base_recheck_result = CLUSTER_COLD_SOURCE_GAP;
+	/* A later endpoint consumer must not use a stale base snapshot. */
+	UT_ASSERT(!endpoint_finish(typed));
+	UT_ASSERT_EQ(tt_base_rechecks, 2);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
+	UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+	tt_base_recheck_result = CLUSTER_COLD_OK;
+	UT_ASSERT(!endpoint_finish(typed));
+	UT_ASSERT_EQ(tt_base_rechecks, 2);
+	endpoint_destroy(&typed);
+}
+
 UT_TEST(test_checkpoint_inputs_survive_census_for_every_generation)
 {
 	ClusterColdTypedV1 *typed;
@@ -3247,6 +3265,7 @@ main(void)
 	UT_RUN(test_tt_base_capture_includes_history_before_wal_scan);
 	UT_RUN(test_tt_base_capture_failure_stops_before_side_and_scan);
 	UT_RUN(test_tt_base_drift_refuses_pass_two_stickily);
+	UT_RUN(test_tt_base_drift_refuses_later_pass_two_consumer);
 	UT_RUN(test_source_barrier_rechecks_complete_native_checkpoint);
 	UT_RUN(test_source_barrier_final_native_checkpoint_change_is_sticky);
 	UT_RUN(test_source_drain_before_unrelated_steps_is_not_global_completion);
