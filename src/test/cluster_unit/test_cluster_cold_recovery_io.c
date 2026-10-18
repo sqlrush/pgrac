@@ -315,6 +315,9 @@ scan(ClusterColdScanResultV1 *result, bool foreign)
 	memset(&root, 0, sizeof(root));
 	memset(&token, 0, sizeof(token));
 	root.identity.system_identifier = 77;
+	root.identity.origin_thread_id = 2;
+	root.checkpoint_tli = 1;
+	root.checkpoint_lower_lsn = 0x1000;
 	memset(root.identity.storage_uuid, 5, 16);
 	root.validated_tail_lsn_exclusive = 0x1300;
 	detail = cluster_cold_scan_root_v1(plan, 0, &root, &token, !foreign, foreign, NULL, result);
@@ -336,6 +339,122 @@ scan_reset(void)
 	memset(decode_refusal_at, 0, sizeof(decode_refusal_at));
 	memset(decode_xid_input, 0, sizeof(decode_xid_input));
 	decode_releases = 0;
+	memset(&selected_checkpoint, 0, sizeof(selected_checkpoint));
+	selected_checkpoint.checkpoint_start = 0x1000;
+	selected_checkpoint.checkpoint.redo = 0x1000;
+	selected_checkpoint.checkpoint.ThisTimeLineID = 1;
+	selected_checkpoint.checkpoint.PrevTimeLineID = 1;
+	selected_checkpoint.checkpoint.nextXid = FullTransactionIdFromEpochAndXid(8, 100);
+	checkpoint_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	memset(visit_headers, 0, sizeof(visit_headers));
+	memset(visit_checkpoints, 0, sizeof(visit_checkpoints));
+	for (int i = 0; i < MAX_VISIT; i++) {
+		visit_headers[i].xl_rmid = RM_XLOG_ID;
+		visit_headers[i].xl_info = XLOG_CHECKPOINT_ONLINE;
+		visit_checkpoints[i] = selected_checkpoint.checkpoint;
+		visit_lengths[i] = sizeof(CheckPoint);
+		visit_blocks[i] = -1;
+	}
+}
+
+UT_TEST(test_root_checkpoint_copy_matches_every_native_byte)
+{
+	ClusterColdScanResultV1 result;
+
+	scan_reset();
+	UT_ASSERT_EQ(scan(&result, true), CLUSTER_COLD_OK);
+	for (size_t i = 0; i < sizeof(CheckPoint); i++) {
+		scan_reset();
+		((uint8 *)&visit_checkpoints[0])[i] ^= 1;
+		UT_ASSERT_EQ(scan(&result, true), CLUSTER_COLD_SOURCE_GAP);
+		UT_ASSERT_EQ(result.failed_read_rec_ptr, 0x1000);
+		UT_ASSERT_EQ(result.records, 0);
+	}
+}
+
+UT_TEST(test_root_checkpoint_requires_exact_native_record_and_address)
+{
+	ClusterColdScanResultV1 result;
+
+	scan_reset();
+	visit_headers[0].xl_info = XLOG_CHECKPOINT_SHUTDOWN;
+	UT_ASSERT_EQ(scan(&result, true), CLUSTER_COLD_OK);
+	scan_reset();
+	selected_checkpoint.checkpoint_start = 0x1100;
+	UT_ASSERT_EQ(scan(&result, true), CLUSTER_COLD_OK);
+	for (int fault = 0; fault < 9; fault++) {
+		scan_reset();
+		switch (fault) {
+		case 0:
+			visit_headers[0].xl_rmid = RM_HEAP_ID;
+			break;
+		case 1:
+			visit_headers[0].xl_info = XLOG_NEXTOID;
+			break;
+		case 2:
+			visit_headers[0].xl_info |= XLR_SPECIAL_REL_UPDATE;
+			break;
+		case 3:
+			visit_headers[0].xl_xid = 100;
+			break;
+		case 4:
+			visit_lengths[0]--;
+			break;
+		case 5:
+			visit_lengths[0]++;
+			break;
+		case 6:
+			visit_blocks[0] = 0;
+			break;
+		case 7:
+			selected_checkpoint.checkpoint_start = 0x1080;
+			break;
+		case 8:
+			selected_checkpoint.checkpoint_start = 0x1100;
+			visit_checkpoints[1].nextOid++;
+			break;
+		}
+		UT_ASSERT_EQ(scan(&result, true), CLUSTER_COLD_SOURCE_GAP);
+	}
+}
+
+UT_TEST(test_root_checkpoint_selection_failure_does_not_feed_records)
+{
+	ClusterColdScanResultV1 result;
+
+	for (int fault = 0; fault < 8; fault++) {
+		scan_reset();
+		switch (fault) {
+		case 0:
+			checkpoint_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			break;
+		case 1:
+			selected_checkpoint.checkpoint_start = InvalidXLogRecPtr;
+			break;
+		case 2:
+			selected_checkpoint.checkpoint_start = 0x0f00;
+			break;
+		case 3:
+			selected_checkpoint.checkpoint_start = 0x1300;
+			break;
+		case 4:
+			selected_checkpoint.checkpoint.redo = InvalidXLogRecPtr;
+			break;
+		case 5:
+			selected_checkpoint.checkpoint.redo = 0x0f00;
+			break;
+		case 6:
+			selected_checkpoint.checkpoint.redo = 0x1100;
+			break;
+		case 7:
+			selected_checkpoint.checkpoint.ThisTimeLineID++;
+			break;
+		}
+		UT_ASSERT_EQ(scan(&result, true), CLUSTER_COLD_SOURCE_GAP);
+		UT_ASSERT_EQ(result.root_result, checkpoint_result);
+		UT_ASSERT_EQ(result.records, 0);
+		UT_ASSERT_EQ(decode_releases, 0);
+	}
 }
 
 /* Every visited record is decoded in the root's namespace and fed; the scan
@@ -939,6 +1058,7 @@ UT_TEST(test_root_scan_captures_original_identity_and_refuses_side_failure)
 		memset(root.identity.storage_uuid, 5, 16);
 		root.identity.origin_thread_id = 2;
 		root.checkpoint_tli = 1;
+		root.checkpoint_lower_lsn = 0x1000;
 		root.validated_tail_lsn_exclusive = 0x1300;
 		if (fault == 2)
 			decode_refusal_at[1] = CLUSTER_COLD_OPCODE_UNSUPPORTED;
@@ -978,7 +1098,10 @@ UT_TEST(test_root_scan_captures_original_identity_and_refuses_side_failure)
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(21);
+	UT_RUN(test_root_checkpoint_copy_matches_every_native_byte);
+	UT_RUN(test_root_checkpoint_requires_exact_native_record_and_address);
+	UT_RUN(test_root_checkpoint_selection_failure_does_not_feed_records);
 	UT_RUN(test_history_counter_native_seed_and_post_redo_cut);
 	UT_RUN(test_history_counter_wrap_and_native_checkpoint_order);
 	UT_RUN(test_history_counter_empty_native_cut_uses_checkpoint);
