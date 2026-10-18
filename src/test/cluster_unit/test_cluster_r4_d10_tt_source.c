@@ -732,6 +732,145 @@ UT_TEST(test_parent_chain_follow_counter_is_admitted)
 	UT_ASSERT_EQ(fake_leave_count, 1);
 }
 
+UT_TEST(test_prepared_commit_resolves_local_origin_entries)
+{
+	ClusterTTStatusKey active = make_key((TransactionId)620);
+	ClusterTTStatusKey committed = active;
+	ClusterTTStatusKey aborted = active;
+	ClusterTTStatusKey foreign = active;
+	ClusterTTStatusSourceRequest request;
+	ClusterTTStatusSourceResult result;
+
+	committed.undo_segment_id = 4;
+	committed.tt_slot_id = 5;
+	aborted.undo_segment_id = 6;
+	aborted.tt_slot_id = 7;
+	foreign.origin_node_id = 2;
+	foreign.undo_segment_id = 8;
+	foreign.tt_slot_id = 9;
+
+	reset_fixture();
+	memset(&request, 0, sizeof(request));
+	request.status = CLUSTER_TT_STATUS_IN_PROGRESS;
+	request.commit_scn = InvalidScn;
+	request.key = &active;
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	request.status = CLUSTER_TT_STATUS_COMMITTED;
+	request.commit_scn = UINT64_C(9004);
+	request.key = &committed;
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	request.status = CLUSTER_TT_STATUS_ABORTED;
+	request.commit_scn = InvalidScn;
+	request.key = &aborted;
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	request.status = CLUSTER_TT_STATUS_IN_PROGRESS;
+	request.key = &foreign;
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT_EQ(cluster_tt_status_get_install_count(), 4);
+
+	memset(&request, 0, sizeof(request));
+	request.xid = active.local_xid;
+	request.commit_scn = UINT64_C(9100);
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
+					 CLUSTER_TT_SOURCE_RESOLVE_PREPARED_COMMIT, &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT_EQ(result.int_value, 2);
+	UT_ASSERT_EQ(cluster_vis_get_recovery_overlay_rebuild_count(), 2);
+
+	request.key = &active;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT(result.lookup.authoritative);
+	UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_COMMITTED);
+	UT_ASSERT_EQ(result.lookup.commit_scn, UINT64_C(9100));
+
+	request.key = &committed;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT(result.lookup.authoritative);
+	UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_COMMITTED);
+	UT_ASSERT_EQ(result.lookup.commit_scn, UINT64_C(9100));
+
+	request.key = &aborted;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT(result.lookup.authoritative);
+	UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_ABORTED);
+	UT_ASSERT_EQ(result.lookup.commit_scn, InvalidScn);
+
+	request.key = &foreign;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT(result.lookup.authoritative);
+	UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_IN_PROGRESS);
+	UT_ASSERT_EQ(result.lookup.commit_scn, InvalidScn);
+}
+
+UT_TEST(test_prepared_commit_rejects_invalid_arguments)
+{
+	ClusterTTStatusKey key = make_key((TransactionId)621);
+	ClusterTTStatusSourceRequest request;
+	ClusterTTStatusSourceResult result;
+
+	reset_fixture();
+	memset(&request, 0, sizeof(request));
+	request.key = &key;
+	request.status = CLUSTER_TT_STATUS_IN_PROGRESS;
+	request.commit_scn = InvalidScn;
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+
+	memset(&request, 0, sizeof(request));
+	request.xid = InvalidTransactionId;
+	request.commit_scn = UINT64_C(9101);
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
+					 CLUSTER_TT_SOURCE_RESOLVE_PREPARED_COMMIT, &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(bytes_are_zero(&result, sizeof(result)));
+
+	request.xid = key.local_xid;
+	request.commit_scn = InvalidScn;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
+					 CLUSTER_TT_SOURCE_RESOLVE_PREPARED_COMMIT, &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(bytes_are_zero(&result, sizeof(result)));
+	UT_ASSERT_EQ(cluster_vis_get_recovery_overlay_rebuild_count(), 0);
+
+	request.key = &key;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT(result.lookup.authoritative);
+	UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_IN_PROGRESS);
+	UT_ASSERT_EQ(result.lookup.commit_scn, InvalidScn);
+}
+
 UT_TEST(test_missing_required_pointer_closes_after_admission)
 {
 	ClusterTTStatusSourceRequest request;
@@ -1126,7 +1265,7 @@ UT_TEST(test_error_path_runs_single_leave_funnel)
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(18);
 	UT_RUN(test_frozen_tt_source_operation_domain);
 	UT_RUN(test_active_refuses_before_request_inspection_and_mutation);
 	UT_RUN(test_disabled_source_executes_matching_counter_arm);
@@ -1134,6 +1273,8 @@ main(void)
 	UT_RUN(test_subcommitted_source_preserves_parent_identity);
 	UT_RUN(test_subcommitted_source_requires_parent_pointer);
 	UT_RUN(test_parent_chain_follow_counter_is_admitted);
+	UT_RUN(test_prepared_commit_resolves_local_origin_entries);
+	UT_RUN(test_prepared_commit_rejects_invalid_arguments);
 	UT_RUN(test_missing_required_pointer_closes_after_admission);
 	UT_RUN(test_unknown_operation_closes_after_admission);
 	UT_RUN(test_generation_drift_discards_fixed_result);
