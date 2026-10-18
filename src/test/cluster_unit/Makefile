@@ -143,6 +143,7 @@ TESTS = test_cluster_vm_read_visibility test_cluster_heap_maintenance test_clust
 		test_cluster_recovery_merge_seal test_cluster_recovery_merge_complete \
 		test_cluster_cold_recovery_space test_cluster_cold_recovery_space_refail \
 		test_cluster_cold_recovery_decode test_cluster_cold_recovery_effects \
+		test_cluster_cold_recovery_xid \
 		test_cluster_cold_recovery_startup test_cluster_cold_tt_base test_cluster_cold_tt_redo \
 		test_cluster_cold_recovery_refail \
 		test_cluster_cold_recovery_replay \
@@ -459,6 +460,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_producer test_cluster_space_fork 
 SIMPLE_TESTS := $(filter-out test_cluster_generic_version test_cluster_generic_redo,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_wal_checkpoint_sample,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_wal_retained_cut test_cluster_wal_retained_cut_records,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_cold_recovery_xid,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_inplace_version test_cluster_heap_maintenance_version,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_vm_visible_version,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_btree_build_version,$(SIMPLE_TESTS))
@@ -3307,9 +3309,10 @@ test_cluster_wal_retained_cut_records: test_cluster_wal_retained_cut_records.c u
 		$(top_srcdir)/src/backend/cluster/cluster_wal_retained_cut_internal.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_retained_cut.h \
 		$(RETAINED_RECORD_OBJS) test_cluster_cold_recovery_decode_core.o \
+		test_cluster_cold_recovery_xid_core.o \
 		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(RETAINED_RECORD_OBJS) \
-		$(CLUSTER_COLD_DECODE_O) \
+		$(CLUSTER_COLD_DECODE_O) test_cluster_cold_recovery_xid_core.o \
 		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
@@ -8946,6 +8949,16 @@ test_cluster_cold_recovery_space_refail: test_cluster_cold_recovery_space_refail
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 CLUSTER_COLD_DECODE_O = test_cluster_cold_recovery_decode_core.o
+
+test_cluster_cold_recovery_xid_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_xid.c \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
+
+test_cluster_cold_recovery_xid: test_cluster_cold_recovery_xid.c unit_test.h \
+		test_cluster_cold_recovery_xid_core.o \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< test_cluster_cold_recovery_xid_core.o \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 $(CLUSTER_COLD_DECODE_O): $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_decode.c \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \

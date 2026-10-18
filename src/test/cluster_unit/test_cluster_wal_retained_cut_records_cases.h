@@ -155,6 +155,79 @@ rec_counter_decode(RealRecord *r, bool foreign, ClusterColdDecodedV1 *decoded)
 										 false, foreign, decoded);
 }
 
+UT_TEST(test_records_cold_ordered_counter_candidate)
+{
+	for (int foreign = 0; foreign < 2; foreign++) {
+		uint32 self, peer;
+		ClusterColdParticipantV1 source = { 0 };
+		ClusterColdXidProgressV1 progress;
+		RealRecord *stream[6];
+		CheckPoint checkpoint = { 0 };
+		xl_xact_xinfo xinfo;
+		TransactionId children[2] = { 111, 114 };
+		int count = lengthof(children);
+		Size offset = MinSizeOfXactCommit + sizeof(xinfo);
+		Size extra = sizeof(count) + sizeof(children);
+		uint64 candidate = 99;
+
+		rec_two_writers(&self, &peer);
+		stream[0] = record_new(self, RM_XLOG_ID, XLOG_NOOP, 105, 0x2000, 0x2100);
+		stream[1] = rec_commit(self, 0x2100, 0x2200, 110, NULL, 0, false, 0);
+		memcpy(&xinfo, stream[1]->data + offset - sizeof(xinfo), sizeof(xinfo));
+		xinfo.xinfo |= XACT_XINFO_HAS_SUBXACTS;
+		memcpy(stream[1]->data + offset - sizeof(xinfo), &xinfo, sizeof(xinfo));
+		memmove(stream[1]->data + offset + extra, stream[1]->data + offset,
+				stream[1]->u.decoded.main_data_len - offset);
+		memcpy(stream[1]->data + offset, &count, sizeof(count));
+		memcpy(stream[1]->data + offset + sizeof(count), children, sizeof(children));
+		stream[1]->u.decoded.main_data_len += extra;
+		checkpoint.nextXid = FullTransactionIdFromEpochAndXid(9, 90);
+		stream[2] = record_new(self, RM_XLOG_ID, XLOG_CHECKPOINT_ONLINE, InvalidTransactionId,
+							   0x2200, 0x2300);
+		record_append(stream[2], &checkpoint, sizeof(checkpoint));
+		stream[3] = record_new(self, RM_XLOG_ID, XLOG_NOOP, 99, 0x2300, 0x2400);
+		checkpoint.nextXid = FullTransactionIdFromEpochAndXid(9, 70);
+		stream[4] = record_new(self, RM_XLOG_ID, XLOG_CHECKPOINT_SHUTDOWN, InvalidTransactionId,
+							   0x2400, 0x2500);
+		record_append(stream[4], &checkpoint, sizeof(checkpoint));
+		stream[5] = rec_abort(self, 0x2500, 0x2600, 80, NULL, 0);
+		source.thread_id = 1;
+		source.timeline = 7;
+		source.owner_incarnation = 19;
+		source.physical_lower = 0x1000;
+		source.native_redo = 0x2000;
+		source.tail_end = 0x2600;
+		UT_ASSERT(cluster_cold_xid_begin_v1(&progress, &source,
+										   U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(8, 100)),
+										   lengthof(stream)));
+		for (int i = 0; i < lengthof(stream); i++) {
+			ClusterColdDecodedV1 decoded = { 0 };
+			stream[i]->u.decoded.header.xl_prev = i == 0 ? 0x1000 : stream[i - 1]->reader.ReadRecPtr;
+			UT_ASSERT_EQ(rec_counter_decode(stream[i], foreign, &decoded), CLUSTER_COLD_OK);
+			UT_ASSERT(cluster_cold_xid_record_v1(&progress, &source, &decoded.record,
+												 &decoded.xid_input));
+			if (i == 1) {
+				UT_ASSERT_EQ(progress.next_xid,
+							 U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(8, 115)));
+				UT_ASSERT_EQ(decoded.record.record_flags,
+							 foreign ? CLUSTER_COLD_RECORD_SIDE_UNOWNED : 0);
+			}
+			if (i == 4)
+				UT_ASSERT_EQ(progress.next_xid,
+							 U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(9, 70)));
+			if (i < lengthof(stream) - 1) {
+				candidate = 99;
+				UT_ASSERT(!cluster_cold_xid_candidate_v1(&progress, &source, &candidate));
+				UT_ASSERT_EQ(candidate, 0);
+			}
+			cluster_cold_decoded_release_v1(&decoded);
+		}
+		UT_ASSERT(cluster_cold_xid_candidate_v1(&progress, &source, &candidate));
+		UT_ASSERT_EQ(candidate,
+					 U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(9, 81)));
+	}
+}
+
 UT_TEST(test_records_cold_terminal_counter_inputs)
 {
 	for (int abort_record = 0; abort_record < 2; abort_record++) {

@@ -553,6 +553,31 @@ typedef struct ClusterColdXidInputV1 {
 	bool complete;
 } ClusterColdXidInputV1;
 
+/* Pure counter fold over one original source's post-checkpoint input cut.
+ * A finished value is only an input-derived candidate. The original owner
+ * must still prove actual effect replay, freshness and all-thread coverage
+ * before using any endpoint; this state grants no allocator/loser authority. */
+typedef struct ClusterColdXidProgressV1 {
+	ClusterColdParticipantV1 source;
+	uint64 next_xid;
+	uint64 expected_records;
+	uint64 records;
+	XLogRecPtr last_read;
+	XLogRecPtr last_end;
+	bool begun;
+	bool failed;
+} ClusterColdXidProgressV1;
+
+extern bool cluster_cold_xid_begin_v1(ClusterColdXidProgressV1 *progress,
+									 const ClusterColdParticipantV1 *source,
+									 uint64 checkpoint_next_xid, uint64 expected_records);
+extern bool cluster_cold_xid_record_v1(ClusterColdXidProgressV1 *progress,
+									  const ClusterColdParticipantV1 *source,
+									  const ClusterColdRecordV1 *record,
+									  const ClusterColdXidInputV1 *input);
+extern bool cluster_cold_xid_candidate_v1(const ClusterColdXidProgressV1 *progress,
+										 const ClusterColdParticipantV1 *source, uint64 *next_xid);
+
 /*
  * One native record mapped to plan input by the shared closed route
  * registry.  record.components points into components[] and

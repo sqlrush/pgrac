@@ -110,6 +110,7 @@ OBJS = \
 	cluster_cold_recovery_plan_space.o \
 	cluster_cold_recovery_plan_schedule.o \
 	cluster_cold_recovery_decode.o \
+	cluster_cold_recovery_xid.o \
 	cluster_cold_recovery_io.o \
 	cluster_recovery_namespace.o \
 	cluster_recovery_root_set.o \
