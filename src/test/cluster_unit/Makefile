@@ -527,6 +527,15 @@ SIMPLE_TESTS := $(filter-out test_cluster_service_observe,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_catalog_manifest test_cluster_catalog_init test_cluster_catalog_startup,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_init,$(SIMPLE_TESTS))
+TESTS += test_cluster_relmap_v2
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2,$(SIMPLE_TESTS))
+
+test_cluster_relmap_v2: test_cluster_relmap_v2.c unit_test.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_srcdir)/src/include/common/relmap.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a -o $@
 
 # Fresh image constructor must link as a frontend, without backend services.
 test_cluster_relmap_init: test_cluster_relmap_init.c unit_test.h \
