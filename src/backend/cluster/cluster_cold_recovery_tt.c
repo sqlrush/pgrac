@@ -50,6 +50,8 @@ typedef struct ColdTtBlockV1 {
 
 typedef struct ClusterColdTtBaseV1 {
 	bool owners[COLD_TT_MAX_ORIGINS + 1];
+	uint64 system_identifier;
+	uint64 database_incarnation;
 	ColdTtInputV1 *first;
 	ColdTtInputV1 *last;
 	ColdTtBlockV1 *blocks;
@@ -211,6 +213,8 @@ cluster_cold_tt_base_capture_v1(ClusterColdTypedV1 *typed, Size budget)
 	base->used = sizeof(*base);
 	base->budget = budget;
 	base->detail = CLUSTER_COLD_SOURCE_GAP;
+	base->system_identifier = typed->system_identifier;
+	base->database_incarnation = typed->observer.database_incarnation;
 	memcpy(base->owners, owners, sizeof(owners));
 	for (uint16 owner = 1; owner <= COLD_TT_MAX_ORIGINS; owner++) {
 		if (!owners[owner])
@@ -411,9 +415,9 @@ cluster_cold_tt_base_match_v1(const ClusterColdTypedV1 *typed,
 	return false;
 }
 
-bool
-cluster_cold_tt_undo_record_v1(ClusterColdTypedV1 *typed, UBA address,
-							   ClusterRecoveryUndoRecord *out, uint32 *generation)
+static bool
+cold_tt_undo_record(ClusterColdTypedV1 *typed, UBA address, ClusterRecoveryUndoRecord *out,
+					uint32 *generation, bool fresh)
 {
 	ClusterColdTtBaseV1 *base;
 	const ColdTtInputV1 *file;
@@ -460,6 +464,14 @@ cluster_cold_tt_undo_record_v1(ClusterColdTypedV1 *typed, UBA address,
 		block->block = blockno;
 		if (!cold_tt_read_data(file, blockno, block->bytes.data))
 			goto refused;
+	} else if (fresh) {
+		PGAlignedBlock observed;
+
+		/* The graph verifies each record in a second read. A cache hit
+		 * must retain the original source's full-byte stability check. */
+		if (!cold_tt_read_data(file, blockno, observed.data)
+			|| memcmp(observed.data, block->bytes.data, BLCKSZ) != 0)
+			goto refused;
 	}
 	if (cluster_recovery_undo_record_read(block->bytes.data, BLCKSZ, segment, blockno, file->owner,
 										  address, &record)
@@ -478,4 +490,67 @@ refused:
 	if (allocated != NULL)
 		pfree(allocated);
 	return false;
+}
+
+bool
+cluster_cold_tt_undo_record_v1(ClusterColdTypedV1 *typed, UBA address,
+							   ClusterRecoveryUndoRecord *out, uint32 *generation)
+{
+	return cold_tt_undo_record(typed, address, out, generation, false);
+}
+
+ClusterRecoveryGraphResult
+cluster_cold_tt_graph_read_v1(void *arg, const ClusterRecoveryTxnKey *key, UBA address,
+							  ClusterRecoveryUndoRecord *out, uint32 *generation)
+{
+	ClusterColdTypedV1 *typed = arg;
+	ClusterColdTtBaseV1 *base;
+	ClusterColdTtSlotKeyV1 expected = { 0 };
+	ClusterColdTtSlotInputV1 input;
+	ClusterRecoveryGraphResult result = CLUSTER_RECOVERY_GRAPH_INVALID;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (generation != NULL)
+		*generation = 0;
+	if (typed == NULL || typed->tt_base == NULL)
+		return result;
+	base = typed->tt_base;
+	if (!base->captured || base->detail != CLUSTER_COLD_OK)
+		goto refused;
+	if (key == NULL || out == NULL || generation == NULL)
+		goto refused;
+	result = CLUSTER_RECOVERY_GRAPH_IDENTITY;
+	if (base->system_identifier == 0 || base->database_incarnation == 0
+		|| typed->system_identifier != base->system_identifier
+		|| typed->observer.database_incarnation != base->database_incarnation
+		|| key->system_identifier != base->system_identifier
+		|| key->database_incarnation != base->database_incarnation
+		|| key->origin_node_id >= COLD_TT_MAX_ORIGINS)
+		goto refused;
+	expected.owner_instance = (uint8)(key->origin_node_id + 1);
+	expected.segment_id = key->segment_id;
+	expected.segment_generation = key->segment_generation;
+	expected.slot_offset = key->slot_offset;
+	expected.xid = key->xid;
+	expected.slot_wrap = key->slot_wrap;
+	if (!cluster_cold_tt_base_match_v1(typed, &expected, &input))
+		goto refused;
+	result = CLUSTER_RECOVERY_GRAPH_INVALID;
+	if (!cold_tt_undo_record(typed, address, out, generation, true))
+		goto refused;
+	result = cluster_recovery_tx_record_check(key, address, out, *generation);
+	if (result != CLUSTER_RECOVERY_GRAPH_MORE)
+		goto refused;
+	return CLUSTER_RECOVERY_GRAPH_RECORD;
+refused:
+	if (base->detail == CLUSTER_COLD_CAPACITY || base->detail == CLUSTER_COLD_OOM)
+		result = CLUSTER_RECOVERY_GRAPH_CAPACITY;
+	else if (base->detail == CLUSTER_COLD_OK)
+		base->detail = CLUSTER_COLD_SOURCE_GAP;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (generation != NULL)
+		*generation = 0;
+	return result;
 }

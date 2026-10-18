@@ -2934,6 +2934,7 @@ test_cluster_pi_contribution: test_cluster_page_data_stable.o
 test_cluster_recovery_c0_plan test_cluster_cold_tt_redo: $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
 
 test_cluster_cold_tt_redo: test_cluster_cold_tt_redo_product.o \
+		$(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o \
 		$(top_srcdir)/src/backend/cluster/cluster_cold_recovery_tt.c
 test_cluster_cold_tt_redo_product.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_tt_redo.c \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
@@ -2957,7 +2958,7 @@ test_cluster_side_xact test_cluster_pi_contribution test_cluster_recovery_c0_pla
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
 		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
-		$(filter test_cluster_page_data_stable.o test_cluster_cold_tt_redo_product.o $(CLUSTER_WAL_CLAIM_O),$^) \
+		$(filter test_cluster_page_data_stable.o test_cluster_cold_tt_redo_product.o $(CLUSTER_WAL_CLAIM_O) $(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o,$^) \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) -lssl -lcrypto -o $@
@@ -8993,8 +8994,10 @@ test_cluster_cold_tt_base: test_cluster_cold_tt_base.c unit_test.h test_cluster_
 		$(top_srcdir)/src/backend/cluster/cluster_cold_recovery_tt.c \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h $(CLUSTER_SIDE_HEAD_READER_O) \
+		$(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o \
 		cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_SIDE_HEAD_READER_O) \
+		$(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 test_cluster_cold_recovery_startup_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c \

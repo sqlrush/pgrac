@@ -53,6 +53,7 @@
 #include "cluster/cluster_page_detached.h"
 #include "cluster/cluster_wal_source.h"
 #include "cluster/cluster_tt_slot.h"
+#include "cluster/cluster_recovery_reference_graph.h"
 
 #define CLUSTER_COLD_RECOVERY_INTERFACE_V1 1
 #define CLUSTER_COLD_MAX_PARTICIPANTS RF_PAGE_STABLE_MAX_PARTICIPANTS
@@ -803,6 +804,18 @@ struct ClusterRecoveryUndoRecord;
 extern bool cluster_cold_tt_undo_record_v1(ClusterColdTypedV1 *typed, UBA address,
 										   struct ClusterRecoveryUndoRecord *out,
 										   uint32 *generation);
+
+/* Read callback for the existing reference graph over an exact captured
+ * namespace and canonical physical TT slot key. Reread cached source bytes
+ * on every call, including graph verification. The original cold owner must
+ * still provide isolation and final base_recheck; neither a matching raw key
+ * nor a drained supplied graph proves FullXid/epoch/top binding, complete
+ * producer coverage, loser eligibility or C0/OPEN authority. Source/parse
+ * refusals return GRAPH_INVALID, allocation refusals GRAPH_CAPACITY; every
+ * refusal clears available outputs and invalidates the retained TT input. */
+extern ClusterRecoveryGraphResult
+cluster_cold_tt_graph_read_v1(void *arg, const ClusterRecoveryTxnKey *key, UBA address,
+							  struct ClusterRecoveryUndoRecord *out, uint32 *generation);
 
 struct RfSideUndoHeaderImageV1;
 /* Fold one selected original source's ordinary redo into a private copy of

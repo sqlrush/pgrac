@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_recovery_reference_graph.h"
 #include "cluster/cluster_recovery_undo_scan.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/storage/cluster_shared_fs.h"
@@ -1033,10 +1034,363 @@ UT_TEST(test_record_invalid_address_and_missing_source_clear_outputs)
 	}
 }
 
+static ClusterRecoveryTxnKey
+graph_fixture(ClusterColdTypedV1 *typed, uint8 owner)
+{
+	uint32 segment = (owner - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	UndoSegmentHeaderData canonical = header_for(owner, segment);
+	UndoSegmentHeaderData physical = header_for(owner, segment + 1);
+	ClusterRecoveryTxnKey key = { 0 };
+
+	fixture(typed);
+	typed->system_identifier = 1234;
+	typed->observer.database_incarnation = 5678;
+	typed->participant_count = 2;
+	typed->replay_count = 1;
+	typed->participants[1].thread_id = owner; /* A retained history origin. */
+	canonical.tt_slots[6].xid = 43;
+	canonical.tt_slots[6].wrap = 0;
+	canonical.tt_slots[6].status = TT_SLOT_ACTIVE;
+	physical.wrap_count = 91;
+	write_header(segment, &canonical, true);
+	write_header(segment + 1, &physical, true);
+	write_record_block(owner, segment, 3, false);
+	write_record_block(owner, segment + 1, 3, false);
+	UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(typed, INPUT_BUDGET), CLUSTER_COLD_OK);
+	key.system_identifier = typed->system_identifier;
+	key.database_incarnation = typed->observer.database_incarnation;
+	key.segment_id = segment;
+	key.xid = 43;
+	key.origin_node_id = owner - 1;
+	key.slot_offset = 6;
+	return key;
+}
+
+/* Fixture edits use original on-disk directory offsets, without the adapter. */
+static UndoRecordHeader
+graph_record_header(uint32 segment, bool replace, const UndoRecordHeader *replacement)
+{
+	UndoRecordHeader header;
+	UndoSlotDirEntry directory;
+	char path[MAXPGPATH];
+	int fd;
+
+	file_path(segment, path);
+	fd = open(path, O_RDWR);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(pread(fd, &directory, sizeof(directory), 3 * BLCKSZ + UNDO_SLOT_DIR_OFFSET(1)),
+				 sizeof(directory));
+	UT_ASSERT_EQ(pread(fd, &header, sizeof(header), 3 * BLCKSZ + directory.record_offset),
+				 sizeof(header));
+	if (replace) {
+		directory.flags = replacement->flags;
+		UT_ASSERT_EQ(
+			pwrite(fd, replacement, sizeof(*replacement), 3 * BLCKSZ + directory.record_offset),
+			sizeof(*replacement));
+		UT_ASSERT_EQ(
+			pwrite(fd, &directory, sizeof(directory), 3 * BLCKSZ + UNDO_SLOT_DIR_OFFSET(1)),
+			sizeof(directory));
+	}
+	UT_ASSERT_EQ(close(fd), 0);
+	return header;
+}
+
+static void
+graph_change_padding(uint32 segment)
+{
+	char path[MAXPGPATH];
+	char changed = 1;
+	int fd;
+
+	file_path(segment, path);
+	fd = open(path, O_RDWR);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(pwrite(fd, &changed, 1, 3 * BLCKSZ + BLCKSZ / 2), 1);
+	UT_ASSERT_EQ(close(fd), 0);
+}
+
+UT_TEST(test_graph_read_binds_history_key_and_retains_physical_generation)
+{
+	for (uint16 owner = 1; owner <= 128; owner += 127) {
+		ClusterColdTypedV1 typed;
+		ClusterRecoveryTxnKey key = graph_fixture(&typed, owner);
+		ClusterRecoveryUndoRecord record;
+		uint32 generation;
+		int calls;
+
+		UT_ASSERT_EQ(cluster_cold_tt_graph_read_v1(&typed, &key,
+												   record_address(key.segment_id + 1, 3, 1),
+												   &record, &generation),
+					 CLUSTER_RECOVERY_GRAPH_RECORD);
+		UT_ASSERT_EQ(generation, 91);
+		UT_ASSERT_EQ(record.header.tt_slot_segment_id, key.segment_id);
+		UT_ASSERT_EQ(record.block_header.crc64, 0); /* No checksum authority. */
+		calls = alloc_calls;
+		typed.tt_base->budget = typed.tt_base->used;
+		alloc_fail = alloc_calls + 1;
+		UT_ASSERT_EQ(cluster_cold_tt_graph_read_v1(&typed, &key,
+												   record_address(key.segment_id + 1, 3, 1),
+												   &record, &generation),
+					 CLUSTER_RECOVERY_GRAPH_RECORD);
+		UT_ASSERT_EQ(alloc_calls, calls);
+		UT_ASSERT_EQ(cluster_cold_tt_base_recheck_v1(&typed), CLUSTER_COLD_OK);
+		cluster_cold_tt_base_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_graph_key_and_captured_namespace_mismatches_are_sticky)
+{
+	for (int fault = 0; fault < 15; fault++) {
+		ClusterColdTypedV1 typed;
+		ClusterRecoveryTxnKey key = graph_fixture(&typed, 1), changed = key;
+		ClusterRecoveryUndoRecord record;
+		uint32 generation = UINT32_MAX;
+
+		switch (fault) {
+		case 0:
+			changed.system_identifier++;
+			break;
+		case 1:
+			changed.database_incarnation++;
+			break;
+		case 2:
+			changed.segment_id++;
+			break;
+		case 3:
+			changed.segment_generation++;
+			break;
+		case 4:
+			changed.xid++;
+			break;
+		case 5:
+			changed.origin_node_id++;
+			break;
+		case 6:
+			changed.slot_offset++;
+			break;
+		case 7:
+			changed.slot_wrap++;
+			break;
+		case 8:
+			changed.system_identifier = ++typed.system_identifier;
+			break;
+		case 9:
+			changed.database_incarnation = ++typed.observer.database_incarnation;
+			break;
+		case 10:
+			changed.system_identifier = 0;
+			break;
+		case 11:
+			changed.database_incarnation = 0;
+			break;
+		case 12:
+			changed.xid = InvalidTransactionId;
+			break;
+		case 13:
+			changed.origin_node_id = UINT16_MAX;
+			break;
+		case 14:
+			changed.slot_offset = UINT16_MAX;
+			break;
+		}
+		memset(&record, 0xA5, sizeof(record));
+		UT_ASSERT_EQ(cluster_cold_tt_graph_read_v1(&typed, &changed, record_address(2, 3, 1),
+												   &record, &generation),
+					 CLUSTER_RECOVERY_GRAPH_IDENTITY);
+		assert_record_cleared(&record, generation);
+		UT_ASSERT_EQ(cluster_cold_tt_base_count_v1(&typed), 0);
+		UT_ASSERT(cluster_cold_tt_graph_read_v1(&typed, &key, record_address(2, 3, 1), &record,
+												&generation)
+				  != CLUSTER_RECOVERY_GRAPH_RECORD);
+		assert_record_cleared(&record, generation);
+		cluster_cold_tt_base_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_graph_record_identity_and_unknown_wrap_refuse)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		ClusterColdTypedV1 typed;
+		ClusterRecoveryTxnKey key = graph_fixture(&typed, 1);
+		UndoRecordHeader header = graph_record_header(2, false, NULL);
+		ClusterRecoveryUndoRecord record;
+		uint32 generation = UINT32_MAX;
+
+		switch (fault) {
+		case 0:
+			header.tt_slot_segment_id++;
+			break;
+		case 1:
+			header.origin_node_id++;
+			break;
+		case 2:
+			header.xid++;
+			break;
+		case 3:
+			header.tt_slot_id++;
+			break;
+		case 4:
+			header.tt_wrap_plus1 = 0;
+			break;
+		case 5:
+			header.tt_wrap_plus1++;
+			break;
+		}
+		graph_record_header(2, true, &header);
+		memset(&record, 0xA5, sizeof(record));
+		UT_ASSERT(cluster_cold_tt_graph_read_v1(&typed, &key, record_address(2, 3, 1), &record,
+												&generation)
+				  != CLUSTER_RECOVERY_GRAPH_RECORD);
+		assert_record_cleared(&record, generation);
+		UT_ASSERT_EQ(cluster_cold_tt_base_count_v1(&typed), 0);
+		cluster_cold_tt_base_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_graph_cached_reads_recheck_all_source_bytes)
+{
+	for (int fault = 0; fault < 4; fault++) {
+		ClusterColdTypedV1 typed;
+		ClusterRecoveryTxnKey key = graph_fixture(&typed, 1);
+		ClusterRecoveryUndoRecord record;
+		uint32 generation;
+
+		UT_ASSERT_EQ(cluster_cold_tt_graph_read_v1(&typed, &key, record_address(2, 3, 1), &record,
+												   &generation),
+					 CLUSTER_RECOVERY_GRAPH_RECORD);
+		if (fault == 0)
+			graph_change_padding(2);
+		else if (fault == 1) {
+			UndoSegmentHeaderData changed = header_for(1, 2);
+			changed.wrap_count = 92;
+			write_header(2, &changed, false);
+		} else if (fault == 2)
+			read_fault = 4;
+		else {
+			char path[MAXPGPATH];
+			file_path(2, path);
+			UT_ASSERT_EQ(unlink(path), 0);
+		}
+		memset(&record, 0xA5, sizeof(record));
+		generation = UINT32_MAX;
+		UT_ASSERT_EQ(cluster_cold_tt_graph_read_v1(&typed, &key, record_address(2, 3, 1), &record,
+												   &generation),
+					 CLUSTER_RECOVERY_GRAPH_INVALID);
+		assert_record_cleared(&record, generation);
+		UT_ASSERT_EQ(cluster_cold_tt_base_count_v1(&typed), 0);
+		cluster_cold_tt_base_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_graph_record_allocation_refusals_keep_capacity_detail)
+{
+	for (int fault = 0; fault < 2; fault++) {
+		ClusterColdTypedV1 typed;
+		ClusterRecoveryTxnKey key = graph_fixture(&typed, 1);
+		ClusterRecoveryUndoRecord record;
+		uint32 generation = UINT32_MAX;
+
+		if (fault == 0)
+			typed.tt_base->budget = typed.tt_base->used;
+		else
+			alloc_fail = alloc_calls + 1;
+		memset(&record, 0xA5, sizeof(record));
+		UT_ASSERT_EQ(cluster_cold_tt_graph_read_v1(&typed, &key, record_address(2, 3, 1), &record,
+												   &generation),
+					 CLUSTER_RECOVERY_GRAPH_CAPACITY);
+		assert_record_cleared(&record, generation);
+		UT_ASSERT_EQ(cluster_cold_tt_base_recheck_v1(&typed),
+					 fault == 0 ? CLUSTER_COLD_CAPACITY : CLUSTER_COLD_OOM);
+		UT_ASSERT_EQ(cluster_cold_tt_base_count_v1(&typed), 0);
+		cluster_cold_tt_base_destroy_v1(&typed);
+	}
+}
+
+static void
+graph_traverse(bool change_before_verify)
+{
+	ClusterColdTypedV1 typed;
+	ClusterRecoveryTxnKey key = graph_fixture(&typed, 128);
+	ClusterRecoveryReferenceGraph *graph = NULL;
+	ClusterRecoveryGraphRecord out;
+	ClusterRecoveryGraphResult result = CLUSTER_RECOVERY_GRAPH_MORE;
+	UndoRecordHeader head = graph_record_header(key.segment_id + 1, false, NULL);
+	unsigned records = 0;
+
+	head.prev_uba = record_address(key.segment_id, 3, 1);
+	head.flags = 0;
+	head.target_locator.relNumber++; /* prev is a transaction edge across relations. */
+	graph_record_header(key.segment_id + 1, true, &head);
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_begin(INPUT_BUDGET, cluster_cold_tt_graph_read_v1,
+														&typed, &graph),
+				 CLUSTER_RECOVERY_GRAPH_MORE);
+	UT_ASSERT_EQ(
+		cluster_recovery_reference_graph_add(graph, &key, record_address(key.segment_id + 1, 3, 1)),
+		CLUSTER_RECOVERY_GRAPH_MORE);
+	for (unsigned i = 0; i < 32; i++) {
+		result = cluster_recovery_reference_graph_step(graph, &out);
+		if (result == CLUSTER_RECOVERY_GRAPH_RECORD) {
+			UT_ASSERT_NOT_NULL(out.record);
+			UT_ASSERT_EQ(out.record_segment_generation, records == 0 ? 91 : 0);
+			records++;
+			if (change_before_verify && records == 2)
+				graph_change_padding(key.segment_id + 1);
+		} else if (result != CLUSTER_RECOVERY_GRAPH_MORE)
+			break;
+	}
+	UT_ASSERT_EQ(records, 2);
+	UT_ASSERT_EQ(result, change_before_verify ? CLUSTER_RECOVERY_GRAPH_INVALID
+											  : CLUSTER_RECOVERY_GRAPH_DRAINED);
+	UT_ASSERT_NULL(out.record);
+	UT_ASSERT_EQ(cluster_recovery_reference_graph_step(graph, &out), result);
+	if (change_before_verify)
+		UT_ASSERT_EQ(cluster_cold_tt_base_count_v1(&typed), 0);
+	else {
+		UT_ASSERT_EQ(cluster_recovery_reference_graph_count(graph), 2);
+		UT_ASSERT_EQ(cluster_cold_tt_base_recheck_v1(&typed), CLUSTER_COLD_OK);
+	}
+	cluster_recovery_reference_graph_destroy(graph);
+	cluster_cold_tt_base_destroy_v1(&typed);
+}
+
+UT_TEST(test_original_graph_traverses_cross_segment_cross_relation_prev)
+{
+	graph_traverse(false);
+}
+
+UT_TEST(test_original_graph_second_pass_refuses_cached_byte_changes)
+{
+	graph_traverse(true);
+}
+
+UT_TEST(test_graph_invalid_arguments_clear_available_outputs)
+{
+	for (int fault = 0; fault < 4; fault++) {
+		ClusterColdTypedV1 typed;
+		ClusterRecoveryTxnKey key = graph_fixture(&typed, 1);
+		ClusterRecoveryUndoRecord record, zero = { 0 };
+		uint32 generation = UINT32_MAX;
+
+		memset(&record, 0xA5, sizeof(record));
+		UT_ASSERT_EQ(
+			cluster_cold_tt_graph_read_v1(fault == 0 ? NULL : &typed, fault == 1 ? NULL : &key,
+										  record_address(2, 3, 1), fault == 2 ? NULL : &record,
+										  fault == 3 ? NULL : &generation),
+			CLUSTER_RECOVERY_GRAPH_INVALID);
+		if (fault != 2)
+			UT_ASSERT_EQ(memcmp(&record, &zero, sizeof(zero)), 0);
+		if (fault != 3)
+			UT_ASSERT_EQ(generation, 0);
+		if (fault != 0)
+			UT_ASSERT_EQ(cluster_cold_tt_base_count_v1(&typed), 0);
+		cluster_cold_tt_base_destroy_v1(&typed);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(34);
 	UT_RUN(test_absence_scans_all_addresses_and_deduplicates_history_origins);
 	UT_RUN(test_all_slots_noncurrent_segments_and_generation_zero_are_retained);
 	UT_RUN(test_history_origin_last_segment_is_captured);
@@ -1063,6 +1417,14 @@ main(void)
 	UT_RUN(test_complete_block_refuses_bad_unselected_row);
 	UT_RUN(test_record_capacity_and_allocation_failure_discard_the_capture);
 	UT_RUN(test_record_invalid_address_and_missing_source_clear_outputs);
+	UT_RUN(test_graph_read_binds_history_key_and_retains_physical_generation);
+	UT_RUN(test_graph_key_and_captured_namespace_mismatches_are_sticky);
+	UT_RUN(test_graph_record_identity_and_unknown_wrap_refuse);
+	UT_RUN(test_graph_cached_reads_recheck_all_source_bytes);
+	UT_RUN(test_graph_record_allocation_refusals_keep_capacity_detail);
+	UT_RUN(test_original_graph_traverses_cross_segment_cross_relation_prev);
+	UT_RUN(test_original_graph_second_pass_refuses_cached_byte_changes);
+	UT_RUN(test_graph_invalid_arguments_clear_available_outputs);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
