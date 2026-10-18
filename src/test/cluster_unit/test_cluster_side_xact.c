@@ -11743,10 +11743,96 @@ UT_TEST(test_cold_compound_capture_rejects_original_origin_or_top_frame)
 	}
 }
 
+static void
+cold_terminal_frame(FakeXactRecord *fake, bool abort, bool completion, int field)
+{
+	if (abort) {
+		if (completion)
+			cold_completion_abort(fake);
+		else
+			make_abort(fake, 802);
+	} else if (completion)
+		cold_completion_commit(fake, true, true, true);
+	else
+		make_commit(fake, 802, 12345, 123456, false);
+	fake->u.decoded.max_block_id = -1;
+	if (field == 0)
+		fake->u.decoded.record_origin = 1;
+	else if (field == 1)
+		fake->u.decoded.toplevel_xid = 674;
+	else if (field == 2)
+		fake->u.decoded.has_page_version_edge = true;
+}
+
+static void
+check_cold_terminal_frame(bool completion)
+{
+	const RfSideXactOperationV1 zero = { 0 };
+
+	for (int abort = 0; abort < 2; abort++)
+		for (int field = 0; field < 3; field++) {
+			FakeXactRecord fake;
+			RfSideXactOperationV1 operation;
+
+			cold_terminal_frame(&fake, abort, completion, -1);
+			UT_ASSERT(
+				rf_side_xact_decode_recovery_v1(&fake.reader, UINT64_C(0x11223344), 3, &operation));
+			UT_ASSERT_EQ(operation.cold_completion_effects, completion);
+			cold_terminal_frame(&fake, abort, completion, field);
+			memset(&operation, 0x5a, sizeof(operation));
+			UT_ASSERT(!rf_side_xact_decode_recovery_v1(&fake.reader, UINT64_C(0x11223344), 3,
+													   &operation));
+			UT_ASSERT(memcmp(&operation, &zero, sizeof(operation)) == 0);
+		}
+}
+
+UT_TEST(test_cold_strict_terminals_refuse_unconsumed_frame)
+{
+	check_cold_terminal_frame(false);
+}
+
+UT_TEST(test_cold_effectful_terminals_refuse_unconsumed_frame)
+{
+	check_cold_terminal_frame(true);
+}
+
+UT_TEST(test_cold_terminal_capture_keeps_unconsumed_frame_out_of_history_and_replay)
+{
+	for (int history = 0; history < 2; history++)
+		for (int abort = 0; abort < 2; abort++)
+			for (int completion = 0; completion < 2; completion++)
+				for (int field = 0; field < 3; field++) {
+					XLogRecPtr redo = history ? 200 : 100;
+					RfSideOnlinePlanV1 *plan = space_online_plan_redo(200, &redo);
+					FakeXactRecord fake;
+
+					cold_terminal_frame(&fake, abort, completion, field);
+					UT_ASSERT_NE(space_commit_feed(plan, &fake, 100), RF_PAGE_PROOF_DETAIL_OK);
+					UT_ASSERT_NE(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+					rf_side_online_plan_destroy_v1(&plan);
+				}
+}
+
+UT_TEST(test_cold_terminal_frame_refusal_preserves_pi_inspection)
+{
+	for (int field = 0; field < 3; field++) {
+		FakeXactRecord fake;
+		RfSideXactOperationV1 operation;
+
+		cold_terminal_frame(&fake, false, false, field);
+		UT_ASSERT(rf_side_xact_inspect_pi_v1(&fake.reader, UINT64_C(0x11223344), 3, &operation));
+		UT_ASSERT(operation.pi_read_only && !operation.cold_completion_effects);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(172);
+	UT_PLAN(176);
+	UT_RUN(test_cold_strict_terminals_refuse_unconsumed_frame);
+	UT_RUN(test_cold_effectful_terminals_refuse_unconsumed_frame);
+	UT_RUN(test_cold_terminal_capture_keeps_unconsumed_frame_out_of_history_and_replay);
+	UT_RUN(test_cold_terminal_frame_refusal_preserves_pi_inspection);
 	UT_RUN(test_cold_ctrc_record_changes_only_selected_release_bit);
 	UT_RUN(test_cold_ctrc_record_requires_prior_terminal_and_leaves_future_unapplied);
 	UT_RUN(test_cold_ctrc_record_refuses_unproved_target_before_mutation);

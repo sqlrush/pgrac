@@ -2722,10 +2722,53 @@ UT_TEST(test_original_startup_dependency_leaves_non_c0_with_existing_dispatch)
 	UT_ASSERT_EQ(dependency_calls, 0);
 }
 
+UT_TEST(test_foreign_terminals_refuse_unconsumed_frame_before_dispatch)
+{
+	for (int commit = 0; commit < 2; commit++)
+		for (int extras = 0; extras < 2; extras++)
+			for (int field = 0; field < 3; field++) {
+				EffectRecord r;
+				ClusterColdDecodedV1 out = { 0 };
+				ClusterColdDetailV1 detail;
+				uint32 xinfo = XACT_XINFO_HAS_SCN;
+
+				if (commit)
+					xinfo |= XACT_XINFO_HAS_TT_COMMIT;
+				if (extras)
+					xinfo |= XACT_XINFO_HAS_DROPPED_STATS | XACT_XINFO_HAS_AE_LOCKS
+							 | XACT_XINFO_HAS_SUBXACTS;
+				completion(&r, commit, xinfo);
+				UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+							 CLUSTER_COLD_OK);
+				UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
+				UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, false));
+				cluster_cold_decoded_release_v1(&out);
+				if (field == 0)
+					r.decoded.record_origin = 1;
+				else if (field == 1)
+					r.decoded.toplevel_xid = 101;
+				else
+					r.decoded.has_page_version_edge = true;
+				detail = cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out);
+				if (detail == CLUSTER_COLD_OK) {
+					UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+					UT_ASSERT_EQ(out.effects.refused, out.effects.required);
+					UT_ASSERT_EQ(out.effects.native_apply | out.effects.page_apply
+									 | out.effects.space_apply | out.effects.no_effect,
+								 0);
+					UT_ASSERT(partitioned(&out.effects));
+					UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+				} else
+					UT_ASSERT_EQ(detail, CLUSTER_COLD_OPCODE_UNSUPPORTED);
+				cluster_cold_decoded_release_v1(&out);
+			}
+}
+
 int
 main(void)
 {
-	UT_PLAN(72);
+	UT_PLAN(73);
+	UT_RUN(test_foreign_terminals_refuse_unconsumed_frame_before_dispatch);
 	UT_RUN(test_smgr_native_carriers_keep_existing_effect_owners);
 	UT_RUN(test_smgr_create_rejects_incomplete_or_nonproducer_carriers);
 	UT_RUN(test_smgr_truncate_rejects_incomplete_or_nonproducer_carriers);

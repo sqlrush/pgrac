@@ -981,6 +981,16 @@ rf_side_xact_decode_recovery_v1(XLogReaderState *record, uint64 system_identifie
 
 	if (out == NULL)
 		return false;
+	memset(out, 0, sizeof(*out));
+	/* Neither the normalized terminal nor retained main data carries these
+	 * frame effects. Refuse them before recovery capture loses the frame. */
+	if (record != NULL && record->record != NULL && XLogRecGetRmid(record) == RM_XACT_ID
+		&& ((XLogRecGetInfo(record) & XLOG_XACT_OPMASK) == XLOG_XACT_COMMIT
+			|| (XLogRecGetInfo(record) & XLOG_XACT_OPMASK) == XLOG_XACT_ABORT)
+		&& (XLogRecGetOrigin(record) != InvalidRepOriginId
+			|| TransactionIdIsValid(record->record->toplevel_xid)
+			|| record->record->has_page_version_edge))
+		return false;
 	if (rf_side_xact_decode_v1(record, system_identifier, origin_thread, out)) {
 		if ((out->kind != RF_SIDE_XACT_COMMIT && out->kind != RF_SIDE_XACT_ABORT)
 			|| ((out->xinfo & XACT_XINFO_HAS_AE_LOCKS) == 0 && out->space_drop_count == 0))
