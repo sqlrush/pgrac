@@ -90,6 +90,7 @@
  */
 
 #include "postgres.h"
+#include "cluster/cluster_catalog_trace.h"
 
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -1986,7 +1987,7 @@ cluster_remote_live_xmax_keeps_visible(Buffer buffer, HeapTupleHeader tuple, Sna
 		/* Our own in-progress delete of the (remote-origin) row: native
 		 * command-id semantics apply -- deleted before this scan started
 		 * means invisible. */
-		if (HeapTupleHeaderGetCmax(tuple) >= snapshot->curcid)
+		if (CLUSTER_CATALOG_TRACE_CID("Cmax", HeapTupleHeaderGetCmax(tuple)) >= snapshot->curcid)
 			return 1; /* deleted after scan started */
 		return 0;	  /* deleted before scan started */
 	case CLUSTER_VIS_ROUTE_NATIVE:
@@ -2238,6 +2239,8 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 			cluster_r4_scratch_visibility_unknown(raw_xmin, "scratch xmin has no DATA ITL slot");
 
 		itl_slot = &ClusterPageGetItlSlots(page)[creator_index];
+		if (unlikely(cluster_catalog_trace_relation != 0))
+			cluster_catalog_trace_slot("scratch.creator_slot", itl_slot);
 		if (itl_slot->flags < ITL_FLAG_ACTIVE || itl_slot->flags > ITL_FLAG_LOCK_ONLY_ABORTED
 			|| (ITL_FLAG_IS_LOCK_ONLY(itl_slot->flags) && itl_slot->xid == raw_xmin)
 			|| !cluster_itl_get_tt_ref(page, creator_index, &ref) || ref.tt_slot_id == 0)
@@ -2246,6 +2249,11 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 
 		cluster_visibility_resolve_scratch_scn(page, creator_index, raw_xmin, snapshot->read_scn,
 											   &resolved);
+		if (unlikely(cluster_catalog_trace_relation != 0)) {
+			cluster_catalog_trace_event("scratch.authority", "status", resolved.status);
+			cluster_catalog_trace_event("scratch.authority", "evidence", resolved.evidence);
+			cluster_catalog_trace_event("scratch.authority", "commit_scn", resolved.commit_scn);
+		}
 		if (observation != NULL)
 			cluster_r4_scratch_observe_verdict(&observation->creator, &resolved);
 		if (resolved.evidence != CLUSTER_VIS_EVIDENCE_REMOTE)
@@ -2262,14 +2270,14 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 		case CLUSTER_TT_STATUS_ABORTED:
 		case CLUSTER_TT_STATUS_IN_PROGRESS:
 		case CLUSTER_TT_STATUS_SUBCOMMITTED:
-			return cluster_r4_scratch_return(observation, false);
+			CLUSTER_CATALOG_TRACE_RETURN(cluster_r4_scratch_return(observation, false));
 
 		case CLUSTER_TT_STATUS_COMMITTED:
 		case CLUSTER_TT_STATUS_CLEANED_OUT:
 			decision = cluster_visibility_decide_by_scn(resolved.commit_scn,
 													 snapshot->read_scn);
 			if (decision == CLUSTER_VISIBILITY_INVISIBLE)
-				return cluster_r4_scratch_return(observation, false);
+				CLUSTER_CATALOG_TRACE_RETURN(cluster_r4_scratch_return(observation, false));
 			if (decision != CLUSTER_VISIBILITY_VISIBLE)
 				cluster_r4_scratch_visibility_unknown(raw_xmin,
 											  "scratch xmin commit SCN is not comparable to the read SCN");
@@ -2282,11 +2290,11 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 
 	/* A reconstructed pre-update image normally has no deleting xmax. */
 	if ((tuple->t_infomask & HEAP_XMAX_INVALID) != 0)
-		return cluster_r4_scratch_return(observation, true);
+		CLUSTER_CATALOG_TRACE_RETURN(cluster_r4_scratch_return(observation, true));
 
 	/* Row locks do not delete the tuple and need no native MultiXact lookup. */
 	if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
-		return cluster_r4_scratch_return(observation, true);
+		CLUSTER_CATALOG_TRACE_RETURN(cluster_r4_scratch_return(observation, true));
 
 	raw_xmax = HeapTupleHeaderGetRawXmax(tuple);
 	if (!TransactionIdIsNormal(raw_xmax)
@@ -2303,6 +2311,8 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 		|| tuple->t_itl_slot_idx >= CLUSTER_ITL_INITRANS_DEFAULT)
 		cluster_r4_scratch_visibility_unknown(raw_xmax, "scratch xmax has no DATA ITL slot");
 	itl_slot = &ClusterPageGetItlSlots(page)[tuple->t_itl_slot_idx];
+	if (unlikely(cluster_catalog_trace_relation != 0))
+		cluster_catalog_trace_slot("scratch.deleter_slot", itl_slot);
 	if (itl_slot->flags < ITL_FLAG_ACTIVE || itl_slot->flags > ITL_FLAG_LOCK_ONLY_ABORTED
 		|| (ITL_FLAG_IS_LOCK_ONLY(itl_slot->flags) && itl_slot->xid == raw_xmax)
 		|| !cluster_itl_get_tt_ref(page, tuple->t_itl_slot_idx, &ref) || ref.tt_slot_id == 0)
@@ -2311,6 +2321,11 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 
 	cluster_visibility_resolve_scratch_scn(page, tuple->t_itl_slot_idx, raw_xmax,
 										   snapshot->read_scn, &resolved);
+	if (unlikely(cluster_catalog_trace_relation != 0)) {
+		cluster_catalog_trace_event("scratch.authority", "status", resolved.status);
+		cluster_catalog_trace_event("scratch.authority", "evidence", resolved.evidence);
+		cluster_catalog_trace_event("scratch.authority", "commit_scn", resolved.commit_scn);
+	}
 	if (observation != NULL)
 		cluster_r4_scratch_observe_verdict(&observation->deleter, &resolved);
 	if (resolved.evidence != CLUSTER_VIS_EVIDENCE_REMOTE)
@@ -2328,16 +2343,16 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 		case CLUSTER_TT_STATUS_ABORTED:
 		case CLUSTER_TT_STATUS_IN_PROGRESS:
 		case CLUSTER_TT_STATUS_SUBCOMMITTED:
-			return cluster_r4_scratch_return(observation, true);
+			CLUSTER_CATALOG_TRACE_RETURN(cluster_r4_scratch_return(observation, true));
 
 		case CLUSTER_TT_STATUS_COMMITTED:
 		case CLUSTER_TT_STATUS_CLEANED_OUT:
 			decision = cluster_visibility_decide_by_scn(resolved.commit_scn,
 													 snapshot->read_scn);
 			if (decision == CLUSTER_VISIBILITY_VISIBLE)
-				return cluster_r4_scratch_return(observation, false);
+				CLUSTER_CATALOG_TRACE_RETURN(cluster_r4_scratch_return(observation, false));
 			if (decision == CLUSTER_VISIBILITY_INVISIBLE)
-				return cluster_r4_scratch_return(observation, true);
+				CLUSTER_CATALOG_TRACE_RETURN(cluster_r4_scratch_return(observation, true));
 			break;
 
 		default:
@@ -2353,7 +2368,7 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("R4 scratch visibility requires a cluster build")));
-	return false;
+	CLUSTER_CATALOG_TRACE_RETURN(false);
 #endif
 }
 
@@ -2365,14 +2380,24 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 #ifdef USE_PGRAC_CLUSTER
 	ClusterSnapshotReadScopeV1 scope;
 	bool result;
+	bool tracing = cluster_catalog_trace_relation != 0;
+	uint64 previous_trace = 0;
 
 	cluster_snapshot_read_enter_v1(&scope, snapshot);
+	if (tracing)
+		previous_trace = cluster_catalog_trace_enter(htup);
 	PG_TRY();
 	{
+		if (tracing) {
+			cluster_catalog_trace_begin(htup, snapshot);
+			cluster_catalog_trace_event("visibility.entry", "scratch", 1);
+		}
 		result = HeapTupleSatisfiesMVCCScratchInternal(htup, snapshot, context);
 	}
 	PG_FINALLY();
 	{
+		if (tracing)
+			cluster_catalog_trace_leave(previous_trace);
 		cluster_snapshot_read_exit_v1(&scope);
 	}
 	PG_END_TRY();
@@ -2526,7 +2551,7 @@ HeapTupleSatisfiesMVCCInternal(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 				 */
 				switch (cluster_cr_satisfies_mvcc(htup, snapshot, buffer, &cr_visible)) {
 				case CLUSTER_CR_DECIDED:
-					return cr_visible;
+					CLUSTER_CATALOG_TRACE_RETURN(cr_visible);
 				case CLUSTER_CR_FAILCLOSED:
 					/*
 						 * spec-4.5a G5 complete: the per-origin authority IS
@@ -2583,9 +2608,9 @@ HeapTupleSatisfiesMVCCInternal(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 			|| TransactionIdEquals(raw_xmin, BootstrapTransactionId)) {
 			switch (cluster_remote_live_xmax_keeps_visible(buffer, tuple, snapshot)) {
 			case 1:
-				return true;
+				CLUSTER_CATALOG_TRACE_RETURN(true);
 			case 0:
-				return false;
+				CLUSTER_CATALOG_TRACE_RETURN(false);
 			default:
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
@@ -2643,12 +2668,12 @@ HeapTupleSatisfiesMVCCInternal(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 			if (res.evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
 				switch (res.status) {
 				case CLUSTER_TT_STATUS_ABORTED:
-					return false;
+					CLUSTER_CATALOG_TRACE_RETURN(false);
 				case CLUSTER_TT_STATUS_IN_PROGRESS:
 				case CLUSTER_TT_STATUS_SUBCOMMITTED:
 					/* Remote in-progress (or parent still in-progress after
 					 * lazy follow) -- snapshot can't see it. */
-					return false;
+					CLUSTER_CATALOG_TRACE_RETURN(false);
 				case CLUSTER_TT_STATUS_COMMITTED:
 				case CLUSTER_TT_STATUS_CLEANED_OUT: {
 					ClusterVisibilityDecision decision;
@@ -2691,9 +2716,9 @@ HeapTupleSatisfiesMVCCInternal(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 						 */
 						switch (cluster_remote_live_xmax_keeps_visible(buffer, tuple, snapshot)) {
 						case 1:
-							return true;
+							CLUSTER_CATALOG_TRACE_RETURN(true);
 						case 0:
-							return false;
+							CLUSTER_CATALOG_TRACE_RETURN(false);
 						default:
 							ereport(
 								ERROR,
@@ -2707,10 +2732,10 @@ HeapTupleSatisfiesMVCCInternal(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 									 "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 									 cluster_node_id)));
 						}
-						return true; /* unreachable */
+						CLUSTER_CATALOG_TRACE_RETURN(true); /* unreachable */
 					}
 					case CLUSTER_VISIBILITY_INVISIBLE:
-						return false;
+						CLUSTER_CATALOG_TRACE_RETURN(false);
 					case CLUSTER_VISIBILITY_UNKNOWN:
 						break; /* fall through to 53R97 */
 					}
@@ -2756,7 +2781,7 @@ HeapTupleSatisfiesMVCCInternal(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 								/* origin proved ABORTED -> this xmin was never
 								 * visible to any snapshot. */
 								cluster_vis53r97_note_xmin_overlay_verdict_hit();
-								return false;
+								CLUSTER_CATALOG_TRACE_RETURN(false);
 							}
 							switch (cluster_visibility_decide_by_scn(d1_scn, snapshot->read_scn)) {
 							case CLUSTER_VISIBILITY_VISIBLE:
@@ -2768,16 +2793,16 @@ HeapTupleSatisfiesMVCCInternal(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 								switch (cluster_remote_live_xmax_keeps_visible(buffer, tuple,
 																			   snapshot)) {
 								case 1:
-									return true;
+									CLUSTER_CATALOG_TRACE_RETURN(true);
 								case 0:
-									return false;
+									CLUSTER_CATALOG_TRACE_RETURN(false);
 								default:
 									break; /* xmax unprovable -> fall to 53R97 */
 								}
 								break;
 							case CLUSTER_VISIBILITY_INVISIBLE:
 								cluster_vis53r97_note_xmin_overlay_verdict_hit();
-								return false;
+								CLUSTER_CATALOG_TRACE_RETURN(false);
 							case CLUSTER_VISIBILITY_UNKNOWN:
 								break; /* undecidable at this read_scn -> 53R97 */
 							}
@@ -2891,9 +2916,9 @@ HeapTupleSatisfiesMVCCInternal(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 
 					switch (mx_decision) {
 					case CLUSTER_VISIBILITY_VISIBLE:
-						return true;
+						CLUSTER_CATALOG_TRACE_RETURN(true);
 					case CLUSTER_VISIBILITY_INVISIBLE:
-						return false;
+						CLUSTER_CATALOG_TRACE_RETURN(false);
 					case CLUSTER_VISIBILITY_UNKNOWN:
 					default:
 						if (!mx_hit)
@@ -2957,18 +2982,18 @@ HeapTupleSatisfiesMVCCInternal(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 
 	if (!HeapTupleHeaderXminCommitted(tuple)) {
 		if (HeapTupleHeaderXminInvalid(tuple))
-			return false;
+			CLUSTER_CATALOG_TRACE_RETURN(false);
 
 		/* Used by pre-9.0 binary upgrades */
 		if (tuple->t_infomask & HEAP_MOVED_OFF) {
 			TransactionId xvac = HeapTupleHeaderGetXvac(tuple);
 
 			if (TransactionIdIsCurrentTransactionId(xvac))
-				return false;
+				CLUSTER_CATALOG_TRACE_RETURN(false);
 			if (!XidInMVCCSnapshot(xvac, snapshot)) {
 				if (TransactionIdDidCommit(xvac)) {
 					SetHintBits(tuple, buffer, HEAP_XMIN_INVALID, InvalidTransactionId);
-					return false;
+					CLUSTER_CATALOG_TRACE_RETURN(false);
 				}
 				SetHintBits(tuple, buffer, HEAP_XMIN_COMMITTED, InvalidTransactionId);
 			}
@@ -2979,23 +3004,24 @@ HeapTupleSatisfiesMVCCInternal(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 
 			if (!TransactionIdIsCurrentTransactionId(xvac)) {
 				if (XidInMVCCSnapshot(xvac, snapshot))
-					return false;
+					CLUSTER_CATALOG_TRACE_RETURN(false);
 				if (TransactionIdDidCommit(xvac))
 					SetHintBits(tuple, buffer, HEAP_XMIN_COMMITTED, InvalidTransactionId);
 				else {
 					SetHintBits(tuple, buffer, HEAP_XMIN_INVALID, InvalidTransactionId);
-					return false;
+					CLUSTER_CATALOG_TRACE_RETURN(false);
 				}
 			}
 		} else if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmin(tuple))) {
-			if (HeapTupleHeaderGetCmin(tuple) >= snapshot->curcid)
-				return false; /* inserted after scan started */
+			if (CLUSTER_CATALOG_TRACE_CID("Cmin", HeapTupleHeaderGetCmin(tuple))
+				>= snapshot->curcid)
+				CLUSTER_CATALOG_TRACE_RETURN(false); /* inserted after scan started */
 
 			if (tuple->t_infomask & HEAP_XMAX_INVALID) /* xid invalid */
-				return true;
+				CLUSTER_CATALOG_TRACE_RETURN(true);
 
 			if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask)) /* not deleter */
-				return true;
+				CLUSTER_CATALOG_TRACE_RETURN(true);
 
 			if (tuple->t_infomask & HEAP_XMAX_IS_MULTI) {
 				TransactionId xmax;
@@ -3007,37 +3033,39 @@ HeapTupleSatisfiesMVCCInternal(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 
 				/* updating subtransaction must have aborted */
 				if (!TransactionIdIsCurrentTransactionId(xmax))
-					return true;
-				else if (HeapTupleHeaderGetCmax(tuple) >= snapshot->curcid)
-					return true; /* updated after scan started */
+					CLUSTER_CATALOG_TRACE_RETURN(true);
+				else if (CLUSTER_CATALOG_TRACE_CID("Cmax", HeapTupleHeaderGetCmax(tuple))
+						 >= snapshot->curcid)
+					CLUSTER_CATALOG_TRACE_RETURN(true); /* updated after scan started */
 				else
-					return false; /* updated before scan started */
+					CLUSTER_CATALOG_TRACE_RETURN(false); /* updated before scan started */
 			}
 
 			if (!TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmax(tuple))) {
 				/* deleting subtransaction must have aborted */
 				SetHintBits(tuple, buffer, HEAP_XMAX_INVALID, InvalidTransactionId);
-				return true;
+				CLUSTER_CATALOG_TRACE_RETURN(true);
 			}
 
-			if (HeapTupleHeaderGetCmax(tuple) >= snapshot->curcid)
-				return true; /* deleted after scan started */
+			if (CLUSTER_CATALOG_TRACE_CID("Cmax", HeapTupleHeaderGetCmax(tuple))
+				>= snapshot->curcid)
+				CLUSTER_CATALOG_TRACE_RETURN(true); /* deleted after scan started */
 			else
-				return false; /* deleted before scan started */
+				CLUSTER_CATALOG_TRACE_RETURN(false); /* deleted before scan started */
 		} else if (XidInMVCCSnapshot(HeapTupleHeaderGetRawXmin(tuple), snapshot))
-			return false;
+			CLUSTER_CATALOG_TRACE_RETURN(false);
 		else if (TransactionIdDidCommit(HeapTupleHeaderGetRawXmin(tuple)))
 			SetHintBits(tuple, buffer, HEAP_XMIN_COMMITTED, HeapTupleHeaderGetRawXmin(tuple));
 		else {
 			/* it must have aborted or crashed */
 			SetHintBits(tuple, buffer, HEAP_XMIN_INVALID, InvalidTransactionId);
-			return false;
+			CLUSTER_CATALOG_TRACE_RETURN(false);
 		}
 	} else {
 		/* xmin is committed, but maybe not according to our snapshot */
 		if (!HeapTupleHeaderXminFrozen(tuple)
 			&& XidInMVCCSnapshot(HeapTupleHeaderGetRawXmin(tuple), snapshot))
-			return false; /* treat as still in progress */
+			CLUSTER_CATALOG_TRACE_RETURN(false); /* treat as still in progress */
 	}
 
 	/* by here, the inserting transaction has committed */
@@ -3047,10 +3075,10 @@ HeapTupleSatisfiesMVCCInternal(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 	 * banner); never trust it: route to the cluster resolver below. */
 	if ((tuple->t_infomask & HEAP_XMAX_INVALID) /* xid invalid or aborted */
 		&& !cluster_plain_xmax_provably_foreign(tuple))
-		return true;
+		CLUSTER_CATALOG_TRACE_RETURN(true);
 
 	if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
-		return true;
+		CLUSTER_CATALOG_TRACE_RETURN(true);
 
 	if (tuple->t_infomask & HEAP_XMAX_IS_MULTI) {
 		TransactionId xmax;
@@ -3064,17 +3092,18 @@ HeapTupleSatisfiesMVCCInternal(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 		Assert(TransactionIdIsValid(xmax));
 
 		if (TransactionIdIsCurrentTransactionId(xmax)) {
-			if (HeapTupleHeaderGetCmax(tuple) >= snapshot->curcid)
-				return true; /* deleted after scan started */
+			if (CLUSTER_CATALOG_TRACE_CID("Cmax", HeapTupleHeaderGetCmax(tuple))
+				>= snapshot->curcid)
+				CLUSTER_CATALOG_TRACE_RETURN(true); /* deleted after scan started */
 			else
-				return false; /* deleted before scan started */
+				CLUSTER_CATALOG_TRACE_RETURN(false); /* deleted before scan started */
 		}
 		if (XidInMVCCSnapshot(xmax, snapshot))
-			return true;
+			CLUSTER_CATALOG_TRACE_RETURN(true);
 		if (TransactionIdDidCommit(xmax))
-			return false; /* updating transaction committed */
+			CLUSTER_CATALOG_TRACE_RETURN(false); /* updating transaction committed */
 		/* it must have aborted or crashed */
-		return true;
+		CLUSTER_CATALOG_TRACE_RETURN(true);
 	}
 
 #ifdef USE_PGRAC_CLUSTER
@@ -3088,9 +3117,9 @@ HeapTupleSatisfiesMVCCInternal(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 	if (cluster_plain_xmax_provably_foreign(tuple)) {
 		switch (cluster_remote_live_xmax_keeps_visible(buffer, tuple, snapshot)) {
 		case 1:
-			return true;
+			CLUSTER_CATALOG_TRACE_RETURN(true);
 		case 0:
-			return false;
+			CLUSTER_CATALOG_TRACE_RETURN(false);
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
@@ -3107,19 +3136,20 @@ HeapTupleSatisfiesMVCCInternal(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 
 	if (!(tuple->t_infomask & HEAP_XMAX_COMMITTED)) {
 		if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmax(tuple))) {
-			if (HeapTupleHeaderGetCmax(tuple) >= snapshot->curcid)
-				return true; /* deleted after scan started */
+			if (CLUSTER_CATALOG_TRACE_CID("Cmax", HeapTupleHeaderGetCmax(tuple))
+				>= snapshot->curcid)
+				CLUSTER_CATALOG_TRACE_RETURN(true); /* deleted after scan started */
 			else
-				return false; /* deleted before scan started */
+				CLUSTER_CATALOG_TRACE_RETURN(false); /* deleted before scan started */
 		}
 
 		if (XidInMVCCSnapshot(HeapTupleHeaderGetRawXmax(tuple), snapshot))
-			return true;
+			CLUSTER_CATALOG_TRACE_RETURN(true);
 
 		if (!TransactionIdDidCommit(HeapTupleHeaderGetRawXmax(tuple))) {
 			/* it must have aborted or crashed */
 			SetHintBits(tuple, buffer, HEAP_XMAX_INVALID, InvalidTransactionId);
-			return true;
+			CLUSTER_CATALOG_TRACE_RETURN(true);
 		}
 
 		/* xmax transaction committed */
@@ -3127,12 +3157,12 @@ HeapTupleSatisfiesMVCCInternal(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 	} else {
 		/* xmax is committed, but maybe not according to our snapshot */
 		if (XidInMVCCSnapshot(HeapTupleHeaderGetRawXmax(tuple), snapshot))
-			return true; /* treat as still in progress */
+			CLUSTER_CATALOG_TRACE_RETURN(true); /* treat as still in progress */
 	}
 
 	/* xmax transaction committed */
 
-	return false;
+	CLUSTER_CATALOG_TRACE_RETURN(false);
 }
 
 
@@ -3140,19 +3170,32 @@ static bool
 HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 {
 #ifdef USE_PGRAC_CLUSTER
-	if (snapshot->cluster_source == SNAPSHOT_SOURCE_CLUSTER)
-	{
+	if (snapshot->cluster_source == SNAPSHOT_SOURCE_CLUSTER
+		|| unlikely(cluster_catalog_trace_relation != 0)) {
 		ClusterSnapshotReadScopeV1 scope;
 		bool result;
+		bool read_scope = snapshot->cluster_source == SNAPSHOT_SOURCE_CLUSTER;
+		bool tracing = cluster_catalog_trace_relation != 0;
+		uint64 previous_trace = 0;
 
-		cluster_snapshot_read_enter_v1(&scope, snapshot);
+		if (read_scope)
+			cluster_snapshot_read_enter_v1(&scope, snapshot);
+		if (tracing)
+			previous_trace = cluster_catalog_trace_enter(htup);
 		PG_TRY();
 		{
+			if (tracing)
+				cluster_catalog_trace_begin(htup, snapshot);
+			if (tracing)
+				cluster_catalog_trace_event("visibility.entry", "live", buffer);
 			result = HeapTupleSatisfiesMVCCInternal(htup, snapshot, buffer);
 		}
 		PG_FINALLY();
 		{
-			cluster_snapshot_read_exit_v1(&scope);
+			if (tracing)
+				cluster_catalog_trace_leave(previous_trace);
+			if (read_scope)
+				cluster_snapshot_read_exit_v1(&scope);
 		}
 		PG_END_TRY();
 		return result;

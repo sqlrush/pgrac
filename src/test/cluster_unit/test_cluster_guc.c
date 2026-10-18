@@ -100,6 +100,11 @@ static int cold_plan_min_value = -1;
 static int cold_plan_max_value = -1;
 static GucContext cold_plan_context = PGC_INTERNAL;
 static int cold_plan_flags = 0;
+static int *catalog_trace_value_addr = NULL;
+static int catalog_trace_boot = -1;
+static int catalog_trace_min = -1;
+static int catalog_trace_max = -1;
+static GucContext catalog_trace_context = PGC_INTERNAL;
 
 static int *undo_buffers_value_addr = NULL;
 static int undo_buffers_boot_value = -1;
@@ -155,7 +160,13 @@ DefineCustomIntVariable(const char *name, const char *short_desc pg_attribute_un
 						GucShowHook show_hook pg_attribute_unused())
 {
 	/* Capture the exact R4A capacity contract; real impl lives in PG backend. */
-	if (strcmp(name, "cluster.undo_buffers") == 0) {
+	if (strcmp(name, "cluster.catalog_trace_relation") == 0) {
+		catalog_trace_value_addr = valueAddr;
+		catalog_trace_boot = bootValue;
+		catalog_trace_min = minValue;
+		catalog_trace_max = maxValue;
+		catalog_trace_context = context;
+	} else if (strcmp(name, "cluster.undo_buffers") == 0) {
 		undo_buffers_value_addr = valueAddr;
 		undo_buffers_boot_value = bootValue;
 		undo_buffers_min_value = minValue;
@@ -789,14 +800,27 @@ UT_TEST(test_shared_catalog_requires_durable_checkpoint_publication)
 	cluster_shared_catalog = false;
 }
 
+UT_TEST(test_catalog_trace_is_off_and_superuser_scoped)
+{
+	cluster_init_guc();
+	UT_ASSERT_NOT_NULL(catalog_trace_value_addr);
+	UT_ASSERT_EQ(catalog_trace_boot, 0);
+	UT_ASSERT_EQ(catalog_trace_min, 0);
+	UT_ASSERT_EQ(catalog_trace_max, INT_MAX);
+	UT_ASSERT_EQ(catalog_trace_context, PGC_SUSET);
+	if (catalog_trace_value_addr != NULL)
+		UT_ASSERT_EQ(*catalog_trace_value_addr, 0);
+}
+
 int
 main(void)
 {
 #ifdef ENABLE_INJECTION
-	UT_PLAN(12);
+	UT_PLAN(13);
 #else
-	UT_PLAN(11);
+	UT_PLAN(12);
 #endif
+	UT_RUN(test_catalog_trace_is_off_and_superuser_scoped);
 	UT_RUN(test_cluster_node_id_default_is_minus_one);
 	UT_RUN(test_cluster_node_id_address_stable);
 	UT_RUN(test_cluster_init_guc_symbol_is_linkable);

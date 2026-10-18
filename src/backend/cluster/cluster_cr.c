@@ -30,6 +30,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_catalog_trace.h"
 
 #include "access/htup_details.h"
 #include "access/transam.h"	   /* spec-3.11 D6/C1b: TransactionIdDidCommit, TransactionIdIsNormal */
@@ -3725,6 +3726,9 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 	bool remote_materialized = false;
 	int32 remote_origin = -1;
 
+	if (unlikely(cluster_catalog_trace_relation != 0))
+		cluster_catalog_trace_event("legacy_cr.entry", "gate_enabled", cluster_cr_mvcc_gate);
+
 	/*
 	 * Master switch (default on after spec-3.9 Hardening v1.0.1).  Turning it
 	 * off is a diagnostic escape hatch; normal cluster snapshots take the CR
@@ -3732,19 +3736,24 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 	 * read_scn.
 	 */
 	if (!cluster_cr_mvcc_gate)
-		return CLUSTER_CR_NOT_APPLICABLE;
+		CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_NOT_APPLICABLE);
 
 	if (!cluster_enabled || !BufferIsValid(buffer)
 		|| snapshot->cluster_source != (uint8)SNAPSHOT_SOURCE_CLUSTER)
-		return CLUSTER_CR_NOT_APPLICABLE;
+		CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_NOT_APPLICABLE);
 
 	page = BufferGetPage(buffer);
+	if (unlikely(cluster_catalog_trace_relation != 0)) {
+		cluster_catalog_trace_event("legacy_cr.page", "has_itl", PageHasItl(page));
+		cluster_catalog_trace_event("legacy_cr.page", "block_scn",
+									((PageHeader)page)->pd_block_scn);
+	}
 	if (!PageHasItl(page))
-		return CLUSTER_CR_NOT_APPLICABLE;
+		CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_NOT_APPLICABLE);
 
 	itl_idx = tup->t_itl_slot_idx;
 	if (itl_idx == CLUSTER_ITL_SLOT_UNALLOCATED || itl_idx >= CLUSTER_ITL_INITRANS_DEFAULT)
-		return CLUSTER_CR_NOT_APPLICABLE;
+		CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_NOT_APPLICABLE);
 
 	phdr = (PageHeader)page;
 
@@ -3753,13 +3762,15 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 	 * against read_scn. Continue to the existing exact creator/ITL/origin
 	 * checks; removing a coarse shortcut does not grant visibility. */
 	if (!SCN_VALID(snapshot->read_scn))
-		return CLUSTER_CR_NOT_APPLICABLE;
+		CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_NOT_APPLICABLE);
 	if (!cluster_shared_config
 		&& (!SCN_VALID(phdr->pd_block_scn)
 			|| scn_time_cmp(phdr->pd_block_scn, snapshot->read_scn) <= 0))
-		return CLUSTER_CR_NOT_APPLICABLE;
+		CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_NOT_APPLICABLE);
 
 	slot = &ClusterPageGetItlSlots(page)[itl_idx];
+	if (unlikely(cluster_catalog_trace_relation != 0))
+		cluster_catalog_trace_slot("legacy_cr.selected", slot);
 
 	/* This shortcut derives creator authority from the selected DATA slot.
 	 * After an update or slot reuse the tuple index can name another writer,
@@ -3769,13 +3780,13 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 	if (!TransactionIdIsNormal(HeapTupleHeaderGetRawXmin(tup)) || slot->flags < ITL_FLAG_ACTIVE
 		|| slot->flags > ITL_FLAG_NEEDS_CLEANOUT
 		|| !TransactionIdEquals(slot->xid, HeapTupleHeaderGetRawXmin(tup)))
-		return CLUSTER_CR_NOT_APPLICABLE;
+		CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_NOT_APPLICABLE);
 
 	/* Tier 2 (ITL gate): this tuple's own change is already in the snapshot. */
 	if (!SCN_VALID(slot->write_scn))
-		return CLUSTER_CR_NOT_APPLICABLE;
+		CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_NOT_APPLICABLE);
 	if (scn_time_cmp(slot->write_scn, snapshot->read_scn) <= 0)
-		return CLUSTER_CR_NOT_APPLICABLE;
+		CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_NOT_APPLICABLE);
 
 	/* Tier 3 (spec-4.5a D8): own-instance, OR a remote instance whose undo
 	 * this node MATERIALIZED during merged recovery (persistent
@@ -3783,13 +3794,13 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 	 * keeps today's fall-through to the spec-3.2/3.3 remote-xid block;
 	 * runtime warm cross-instance CR stays 4.6/4.7. */
 	if (UBA_is_invalid(slot->undo_segment_head))
-		return CLUSTER_CR_NOT_APPLICABLE;
+		CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_NOT_APPLICABLE);
 	{
 		int32 tuple_origin = (int32)uba_origin_node_id(slot->undo_segment_head);
 
 		if (tuple_origin != cluster_node_id) {
 			if (!cluster_merged_instance_is_materialized((int)tuple_origin))
-				return CLUSTER_CR_NOT_APPLICABLE;
+				CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_NOT_APPLICABLE);
 			remote_materialized = true;
 			remote_origin = tuple_origin;
 			/* spec-5.14 D2 class 4: this CR verdict consumes the remote origin's
@@ -3853,17 +3864,17 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 				break; /* finished creator -> construct CR image below */
 			case CLUSTER_REMOTE_XACT_ABORTED:
 				*out_visible = false;
-				return CLUSTER_CR_DECIDED;
+				CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_DECIDED);
 			case CLUSTER_REMOTE_XACT_INDOUBT:
 			default:
-				return CLUSTER_CR_FAILCLOSED;
+				CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_FAILCLOSED);
 			}
 		} else if (TransactionIdIsNormal(live_xmin)
 				   && !TransactionIdIsCurrentTransactionId(live_xmin)
 				   && (TransactionIdIsInProgress(live_xmin)
 					   || !TransactionIdDidCommit(live_xmin))) {
 			*out_visible = false;
-			return CLUSTER_CR_DECIDED;
+			CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_DECIDED);
 		}
 	}
 
@@ -3899,7 +3910,8 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 
 			cluster_cr_tuple_stat_bump(fp_reason);
 			if (fp_v != CLUSTER_CR_NOT_APPLICABLE)
-				return fp_v; /* DECIDED -> bit-equivalent to full-block (INV-T1) */
+				CLUSTER_CATALOG_TRACE_RETURN(
+					fp_v); /* DECIDED -> bit-equivalent to full-block (INV-T1) */
 		} else {
 			cluster_cr_tuple_stat_bump(fp_reason);
 		}
@@ -3923,8 +3935,11 @@ cluster_cr_verdict_on_image(const char *cr_page, OffsetNumber offnum,
 		/* CR-removed (inverse-INSERT made it LP_UNUSED): the row did not
 		 * exist at read_scn -> invisible. */
 		*out_visible = false;
-		return CLUSTER_CR_DECIDED;
+		CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_DECIDED);
 	}
+
+	if (unlikely(cluster_catalog_trace_relation != 0))
+		cluster_catalog_trace_header("legacy_cr.image", cr_htup.t_data, snapshot);
 
 	/*
 	 * spec-3.9 Hardening (L214): xmin-side (creation) visibility.
@@ -3967,7 +3982,7 @@ cluster_cr_verdict_on_image(const char *cr_page, OffsetNumber offnum,
 
 		if (TransactionIdIsValid(cr_xmin) && cr_xmin == slot->xid) {
 			*out_visible = false;
-			return CLUSTER_CR_DECIDED;
+			CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_DECIDED);
 		}
 	}
 
@@ -3975,7 +3990,7 @@ cluster_cr_verdict_on_image(const char *cr_page, OffsetNumber offnum,
 	if (decision == CLUSTER_VISIBILITY_VISIBLE) {
 		/* xmax invalid -> the row was never deleted -> visible. */
 		*out_visible = true;
-		return CLUSTER_CR_DECIDED;
+		CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_DECIDED);
 	}
 
 	/*
@@ -4005,7 +4020,7 @@ cluster_cr_verdict_on_image(const char *cr_page, OffsetNumber offnum,
 		 */
 		if (HEAP_XMAX_IS_LOCKED_ONLY(cr_infomask)) {
 			*out_visible = true;
-			return CLUSTER_CR_DECIDED;
+			CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_DECIDED);
 		}
 
 		/* MultiXact: decode the UPDATE member; a lockers-only multi has no
@@ -4018,7 +4033,7 @@ cluster_cr_verdict_on_image(const char *cr_page, OffsetNumber offnum,
 		if (!TransactionIdIsValid(cr_xmax)) {
 			/* lockers-only multi: no update xid -> never a delete. */
 			*out_visible = true;
-			return CLUSTER_CR_DECIDED;
+			CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_DECIDED);
 		}
 
 		/*
@@ -4060,15 +4075,17 @@ cluster_cr_verdict_on_image(const char *cr_page, OffsetNumber offnum,
 				break;
 			case CLUSTER_REMOTE_XACT_INDOUBT:
 			default:
-				return CLUSTER_CR_FAILCLOSED;
+				CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_FAILCLOSED);
 			}
 		}
 		/* Own-instance authoritative classification of the deleting xact
 		 * (tier-3: chain UBA origin == self, so the raw xid is alias-free). */
 		else if (TransactionIdIsCurrentTransactionId(cr_xmax)) {
+			if (unlikely(cluster_catalog_trace_relation != 0))
+				cluster_catalog_trace_event("legacy_cr.xmax", "self", cr_xmax);
 			/* our own delete (native handles self) */
 			*out_visible = true;
-			return CLUSTER_CR_DECIDED;
+			CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_DECIDED);
 		} else if (TransactionIdIsInProgress(cr_xmax))
 			xmax_status = CLUSTER_TT_STATUS_IN_PROGRESS;
 		else if (!TransactionIdDidCommit(cr_xmax))
@@ -4089,7 +4106,7 @@ cluster_cr_verdict_on_image(const char *cr_page, OffsetNumber offnum,
 			 */
 			if (slot->xid == cr_xmax) {
 				*out_visible = true;
-				return CLUSTER_CR_DECIDED;
+				CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_DECIDED);
 			}
 
 			/*
@@ -4124,7 +4141,7 @@ cluster_cr_verdict_on_image(const char *cr_page, OffsetNumber offnum,
 					 * be false-visible (规则 8.A).  Q5 strict fallback applies; forward. */
 					cluster_tt_recovery_count_recycled_liveness_relaxed();
 					*out_visible = false; /* deleter proven below horizon -> invisible */
-					return CLUSTER_CR_DECIDED;
+					CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_DECIDED);
 				}
 				cluster_cr_count_xmax_scan_unavail_or_no_proof();
 				ereport(
@@ -4161,10 +4178,10 @@ cluster_cr_verdict_on_image(const char *cr_page, OffsetNumber offnum,
 		switch (cluster_vis_cr_xmax_verdict(xmax_status, scn_decision)) {
 		case CVV_VISIBLE:
 			*out_visible = true;
-			return CLUSTER_CR_DECIDED;
+			CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_DECIDED);
 		case CVV_INVISIBLE:
 			*out_visible = false;
-			return CLUSTER_CR_DECIDED;
+			CLUSTER_CATALOG_TRACE_RETURN(CLUSTER_CR_DECIDED);
 		case CVV_FAILCLOSED_UNKNOWN:
 		default:
 			/*

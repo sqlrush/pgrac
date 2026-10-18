@@ -13,6 +13,9 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_catalog_trace.h"
+#endif
 
 #include "access/attmap.h"
 #include "access/genam.h"
@@ -7303,6 +7306,12 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	((Form_pg_class) GETSTRUCT(reltup))->relnatts = newattnum;
 
 	CatalogTupleUpdate(pgclass, &reltup->t_self, reltup);
+#ifdef USE_PGRAC_CLUSTER
+	if (unlikely(cluster_catalog_trace_relation != 0))
+		cluster_catalog_trace_catalog("alter.pg_class_update", myrelid, reltup,
+									  GetCurrentCommandId(false));
+#endif
+
 
 	heap_freetuple(reltup);
 
@@ -7313,6 +7322,12 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 
 	/* Make the attribute's catalog entry visible */
 	CommandCounterIncrement();
+#ifdef USE_PGRAC_CLUSTER
+	if (unlikely(cluster_catalog_trace_relation != 0))
+		cluster_catalog_trace_descriptor("alter.after_cci", rel, newattnum,
+										 GetCurrentCommandId(false));
+#endif
+
 
 	/*
 	 * Store the DEFAULT, if any, in the catalogs

@@ -28,6 +28,9 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_catalog_trace.h"
+#endif
 
 #include "access/genam.h"
 #include "access/multixact.h"
@@ -2386,8 +2389,14 @@ AddRelationNewConstraints(Relation rel,
 	foreach(cell, newColDefaults)
 	{
 		RawColumnDefault *colDef = (RawColumnDefault *) lfirst(cell);
-		Form_pg_attribute atp = TupleDescAttr(rel->rd_att, colDef->attnum - 1);
-		Oid			defOid;
+		Form_pg_attribute atp;
+		Oid defOid;
+#ifdef USE_PGRAC_CLUSTER
+		if (unlikely(cluster_catalog_trace_relation != 0))
+			cluster_catalog_trace_descriptor("default.before_attribute", rel, colDef->attnum,
+											 GetCurrentCommandId(false));
+#endif
+		atp = TupleDescAttr(rel->rd_att, colDef->attnum - 1);
 
 		expr = cookDefault(pstate, colDef->raw_default,
 						   atp->atttypid, atp->atttypmod,
@@ -2875,6 +2884,19 @@ cookDefault(ParseState *pstate,
 	if (OidIsValid(atttypid))
 	{
 		Oid			type_id = exprType(expr);
+#ifdef USE_PGRAC_CLUSTER
+		if (unlikely(cluster_catalog_trace_relation != 0)) {
+			ListCell *trace_cell;
+			foreach (trace_cell, pstate->p_rtable) {
+				RangeTblEntry *trace_rte = lfirst_node(RangeTblEntry, trace_cell);
+				if (trace_rte->rtekind == RTE_RELATION
+					&& trace_rte->relid == (Oid)cluster_catalog_trace_relation)
+					cluster_catalog_trace_type(trace_rte->relid, atttypid, atttypmod, type_id,
+											   GetCurrentCommandId(false));
+			}
+		}
+#endif
+
 
 		expr = coerce_to_target_type(pstate, expr, type_id,
 									 atttypid, atttypmod,

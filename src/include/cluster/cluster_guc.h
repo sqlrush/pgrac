@@ -156,6 +156,9 @@ extern bool cluster_xnode_profile_enabled;
 /* Diagnostic per-storage-UPDATE phase trace (default off). */
 extern bool cluster_update_trace_enabled;
 
+/* Relation OID for passive catalog logging; zero disables it. */
+extern int cluster_catalog_trace_relation;
+
 /* spec-6.4: ADG physical standby / read-only service configuration. */
 #define CLUSTER_DG_ROLE_PRIMARY 0
 #define CLUSTER_DG_ROLE_STANDBY 1

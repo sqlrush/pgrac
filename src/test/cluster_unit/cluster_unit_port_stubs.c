@@ -20,6 +20,7 @@
 /* Profiling-aware product objects can link without a diagnostic backend.
  * Dedicated trace tests override these defaults with the real collector. */
 bool cluster_update_trace_enabled __attribute__((weak)) = false;
+int cluster_catalog_trace_relation __attribute__((weak)) = 0;
 bool cluster_xnode_profile_enabled __attribute__((weak)) = false;
 ClusterXnodeProfileShared *ClusterXnodeProfileCtl __attribute__((weak)) = NULL;
 
