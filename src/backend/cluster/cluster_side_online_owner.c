@@ -356,7 +356,10 @@ side_owner_preflight_xact_selected(void *arg, const RfSideOnlineOperationV1 *ope
 	 * selected record validates structural targets before its first TT write. */
 	if ((operation->xact.relation_count != 0 || operation->xact.space_drop_count != 0)
 		&& (!selected_record || !operation->xact.cold_completion_effects
-			|| operation->xact.relation_count == 0 || operation->xact.space_drop_count == 0))
+			|| operation->xact.relation_count == 0
+			|| (operation->xact.kind == RF_SIDE_XACT_ABORT
+					? operation->xact.space_drop_count != 0
+					: operation->xact.space_drop_count == 0)))
 		return false;
 	if (side_owner_cold_formed(owner) && operation->xact.kind == RF_SIDE_XACT_ABORT) {
 		ClusterUndoDecoded target;
@@ -557,6 +560,28 @@ side_owner_apply_xact(void *arg, const RfSideOnlineOperationV1 *operation)
 }
 
 static bool
+side_owner_abort_record_tt_covered(void *arg, const RfSideXactOperationV1 *operation)
+{
+	SideAbortCoverage *coverage = arg;
+	RfSideOnlineProductionOwnerV1 *owner = coverage->owner;
+	ClusterUndoDecoded aborted;
+	SideUndoHeader *target;
+	PGAlignedBlock current;
+
+	if (!owner->protected_set_active || !side_owner_authority_fresh(owner)
+		|| memcmp(operation, &coverage->operation->xact, sizeof(*operation)) != 0
+		|| !side_owner_cold_abort_ready(owner, coverage->operation, &aborted))
+		return false;
+	target = side_owner_undo_target(owner, aborted.instance, aborted.segment_id, 0);
+	return target != NULL && side_owner_install_target(owner, target)
+		   && cluster_undo_smgr_recovery_read_block_v1(aborted.segment_id, aborted.instance, 0,
+													   &target->file, current.data)
+		   && memcmp(current.data, target->final.page.data, BLCKSZ) == 0
+		   && side_owner_cold_abort_ready(owner, coverage->operation, &aborted)
+		   && side_owner_authority_fresh(owner);
+}
+
+static bool
 side_owner_apply_abort_record(RfSideOnlineProductionOwnerV1 *owner, uint32 index,
 							  const RfSideOnlineOperationV1 *operation)
 {
@@ -583,6 +608,20 @@ side_owner_apply_abort_record(RfSideOnlineProductionOwnerV1 *owner, uint32 index
 		|| memcmp(current.data, target->base.data, BLCKSZ) != 0)
 		return false;
 	target->final = prefix;
+	if (operation->xact.relation_count != 0) {
+		Size available = rf_side_online_plan_scratch_available_v1(owner->protected_plan);
+		SideAbortCoverage coverage = { owner, operation };
+
+		/* Include every live SIDE allocation (and borrowed scratch), plus the
+		 * conservative native stack peak, before SPACE grants its first hook. */
+		if (owner->undo_bytes_remaining > available)
+			return false;
+		return rf_side_xact_apply_cold_abort_delete_completion_v1(
+				   owner->protected_plan, index,
+				   available - owner->undo_bytes_remaining + 8 * BLCKSZ, &coverage,
+				   side_owner_abort_record_tt_covered)
+			   == RF_SIDE_XACT_APPLY_OK;
+	}
 	return side_owner_install_target(owner, target)
 		   && cluster_undo_smgr_recovery_read_block_v1(aborted.segment_id, aborted.instance, 0,
 													   &target->file, current.data)

@@ -17,6 +17,8 @@
 #include "access/xlog.h"
 #include "access/xlogutils.h"
 #include "cluster/cluster_side_xact.h"
+#include "cluster/cluster_side_online_plan.h"
+#include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_scn.h"
@@ -1067,10 +1069,6 @@ rf_side_xact_cold_completion_preflight_v1(const RfSideXactOperationV1 *operation
 		|| (operation->kind != RF_SIDE_XACT_COMMIT && operation->kind != RF_SIDE_XACT_ABORT)
 		|| payload == NULL || length == 0 || length != operation->completion_payload_length)
 		return false;
-	/* Captured ABORT-delete inputs do not yet have an executable structural
-	 * consumer. Refuse before TT coverage, native CLOG or completion effects. */
-	if (operation->kind == RF_SIDE_XACT_ABORT && operation->relation_count != 0)
-		return false;
 	return operation->system_identifier == GetSystemIdentifier()
 		   && cluster_xid_origin_slot(operation->xid) == (int)operation->origin_thread - 1
 		   && ((operation->xinfo & XACT_XINFO_HAS_AE_LOCKS) == 0
@@ -1345,6 +1343,27 @@ rf_side_xact_apply_covered_abort_v1(const RfSideXactOperationV1 *operation, void
 	return side_xact_project_abort(operation);
 }
 
+static bool
+side_xact_abort_source_fresh(const RfSideXactOperationV1 *operation)
+{
+	return cluster_undo_recovery_cold_origin_authorized_v1(operation->origin_thread - 1)
+		   && cluster_undo_recovery_cold_source_synced_v1(operation->origin_thread - 1);
+}
+
+static bool
+side_xact_abort_clog(const RfSideXactOperationV1 *operation, xl_xact_parsed_abort *parsed)
+{
+	return side_xact_abort_source_fresh(operation)
+		   && cluster_clog_native_recovery_apply_v1(operation->origin_thread - 1, operation->xid,
+													parsed->nsubxacts, parsed->subxacts,
+													TRANSACTION_STATUS_ABORTED)
+		   && cluster_undo_recovery_cold_source_synced_v1(operation->origin_thread - 1)
+		   && cluster_clog_native_recovery_verify_v1(operation->origin_thread - 1, operation->xid,
+													 parsed->nsubxacts, parsed->subxacts,
+													 TRANSACTION_STATUS_ABORTED)
+		   && side_xact_abort_source_fresh(operation);
+}
+
 /* Exact TT coverage calls this original-thread CLOG owner before lock,
  * statistics or derived terminal effects. No local SLRU or parent edge is
  * touched. Keep the aligned payload within the plan's one-copy reservation. */
@@ -1357,7 +1376,7 @@ rf_side_xact_cold_abort_clog_v1(const RfSideXactOperationV1 *operation, const ui
 	volatile bool result = false;
 
 	if (!rf_side_xact_cold_completion_preflight_v1(operation, payload, length)
-		|| operation->kind != RF_SIDE_XACT_ABORT
+		|| operation->kind != RF_SIDE_XACT_ABORT || operation->relation_count != 0
 		|| !cluster_undo_recovery_cold_origin_authorized_v1(operation->origin_thread - 1)
 		|| !cluster_undo_recovery_cold_source_synced_v1(operation->origin_thread - 1))
 		return false;
@@ -1367,15 +1386,7 @@ rf_side_xact_cold_abort_clog_v1(const RfSideXactOperationV1 *operation, const ui
 	PG_TRY();
 	{
 		ParseAbortRecord(XLOG_XACT_ABORT | XLOG_XACT_HAS_INFO, (xl_xact_abort *)copy, &parsed);
-		result = cluster_clog_native_recovery_apply_v1(operation->origin_thread - 1, operation->xid,
-													   parsed.nsubxacts, parsed.subxacts,
-													   TRANSACTION_STATUS_ABORTED)
-				 && cluster_undo_recovery_cold_source_synced_v1(operation->origin_thread - 1)
-				 && cluster_clog_native_recovery_verify_v1(
-					 operation->origin_thread - 1, operation->xid, parsed.nsubxacts,
-					 parsed.subxacts, TRANSACTION_STATUS_ABORTED)
-				 && cluster_undo_recovery_cold_origin_authorized_v1(operation->origin_thread - 1)
-				 && cluster_undo_recovery_cold_source_synced_v1(operation->origin_thread - 1);
+		result = side_xact_abort_clog(operation, &parsed);
 	}
 	PG_FINALLY();
 	{
@@ -1395,7 +1406,7 @@ rf_side_xact_apply_cold_abort_completion_v1(const RfSideXactOperationV1 *operati
 	volatile RfSideXactApplyResultV1 result = RF_SIDE_XACT_APPLY_BLOCKED;
 
 	if (!rf_side_xact_cold_completion_preflight_v1(operation, payload, length)
-		|| operation->kind != RF_SIDE_XACT_ABORT || verify == NULL
+		|| operation->kind != RF_SIDE_XACT_ABORT || operation->relation_count != 0 || verify == NULL
 		|| !cluster_undo_recovery_cold_source_synced_v1(operation->origin_thread - 1))
 		return RF_SIDE_XACT_APPLY_BLOCKED;
 	/* Coverage reparses the exact owned record. Finish it before retaining
@@ -1426,6 +1437,97 @@ rf_side_xact_apply_cold_abort_completion_v1(const RfSideXactOperationV1 *operati
 	}
 	PG_END_TRY();
 	return result;
+}
+
+typedef struct SideAbortDeleteCompletion {
+	const RfSideOnlinePlanV1 *plan;
+	uint32 index;
+	const RfSideOnlineOperationV1 *operation;
+	void *arg;
+	RfSideXactVerifyAbortCoverageV1 verify;
+} SideAbortDeleteCompletion;
+
+static bool
+side_xact_abort_delete_hook(void *arg, const RfSideOnlinePlanV1 *plan, uint32 index,
+							bool before_delete)
+{
+	SideAbortDeleteCompletion *work = arg;
+	const RfSideOnlineOperationV1 *op = work->operation;
+	xl_xact_parsed_abort parsed;
+	uint8 *copy;
+	volatile bool ok = false;
+
+	if (plan != work->plan || index != work->index || !side_xact_abort_source_fresh(&op->xact))
+		return false;
+	/* TT verification may reparse the immutable carrier. Finish it before
+	 * retaining this callback's one aligned native payload, and release that
+	 * payload before SPACE requalifies the entire original group again. */
+	if (before_delete
+		&& (!work->verify(work->arg, &op->xact) || !side_xact_abort_source_fresh(&op->xact)))
+		return false;
+	copy = side_xact_payload_copy(op->owned_payload, op->owned_payload_length);
+	if (copy == NULL)
+		return false;
+	PG_TRY();
+	{
+		ParseAbortRecord(XLOG_XACT_ABORT | XLOG_XACT_HAS_INFO, (xl_xact_abort *)copy, &parsed);
+		if (before_delete)
+			ok = side_xact_abort_clog(&op->xact, &parsed)
+				 && side_xact_cold_release_locks(&op->xact, parsed.nsubxacts, parsed.subxacts)
+				 && side_xact_abort_source_fresh(&op->xact);
+		else if (side_xact_abort_source_fresh(&op->xact)) {
+			if (parsed.nstats > 0)
+				pgstat_execute_transactional_drops(parsed.nstats, parsed.stats, true);
+			ok = side_xact_abort_source_fresh(&op->xact)
+				 && side_xact_project_abort(&op->xact) == RF_SIDE_XACT_APPLY_OK;
+		}
+	}
+	PG_FINALLY();
+	{
+		side_xact_payload_free(copy);
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+static bool
+side_xact_abort_before_delete(void *arg, const RfSideOnlinePlanV1 *plan, uint32 index)
+{
+	return side_xact_abort_delete_hook(arg, plan, index, true);
+}
+
+static bool
+side_xact_abort_after_delete(void *arg, const RfSideOnlinePlanV1 *plan, uint32 index)
+{
+	return side_xact_abort_delete_hook(arg, plan, index, false);
+}
+
+RfSideXactApplyResultV1
+rf_side_xact_apply_cold_abort_delete_completion_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+												   Size owner_bytes, void *arg,
+												   RfSideXactVerifyAbortCoverageV1 verify)
+{
+	RfSideOnlineOperationV1 operation;
+	SideAbortDeleteCompletion work = { plan, index, &operation, arg, verify };
+	Size available = rf_side_online_plan_scratch_available_v1(plan);
+
+	/* Fetch the exact sealed operation: no caller-owned locator list, payload,
+	 * mutable XLogReaderState or retained deletion receipt grants this path. */
+	if (verify == NULL || DatabasePath != NULL
+		|| !rf_side_online_plan_operation_v1(plan, index, &operation)
+		|| operation.kind != RF_SIDE_ONLINE_OPERATION_XACT
+		|| operation.xact.kind != RF_SIDE_XACT_ABORT || operation.xact.relation_count == 0
+		|| operation.xact.space_drop_count != 0
+		|| !rf_side_xact_cold_completion_preflight_v1(&operation.xact, operation.owned_payload,
+													  operation.owned_payload_length)
+		|| !side_xact_abort_source_fresh(&operation.xact) || owner_bytes > available
+		|| MAXALIGN(operation.owned_payload_length) > available - owner_bytes)
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+	return cluster_space_recovery_cold_abort_finish_v1(
+			   plan, index, owner_bytes + MAXALIGN(operation.owned_payload_length), &work,
+			   side_xact_abort_before_delete, side_xact_abort_after_delete)
+			   ? RF_SIDE_XACT_APPLY_OK
+			   : RF_SIDE_XACT_APPLY_BLOCKED;
 }
 
 static RfSideXactApplyResultV1

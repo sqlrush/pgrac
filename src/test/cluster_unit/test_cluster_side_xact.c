@@ -26,6 +26,7 @@
 #include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_side_online_owner.h"
+#include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_tt_durable.h"
@@ -4948,8 +4949,8 @@ UT_TEST(test_cold_abort_delete_input_cannot_enter_tt_clog_or_native_completion)
 	canonical_scope = &scope;
 	cold_clog_test = cold_source_ready = cold_abort_test = true;
 	cold_clog_applies = cold_clog_verifies = cold_stats_calls = 0;
-	UT_ASSERT(!rf_side_xact_cold_completion_preflight_v1(&operation, fake.data,
-														 fake.u.decoded.main_data_len));
+	UT_ASSERT(rf_side_xact_cold_completion_preflight_v1(&operation, fake.data,
+														fake.u.decoded.main_data_len));
 	UT_ASSERT(
 		!rf_side_xact_cold_abort_clog_v1(&operation, fake.data, fake.u.decoded.main_data_len));
 	UT_ASSERT_EQ(rf_side_xact_apply_cold_abort_completion_v1(
@@ -10795,6 +10796,243 @@ native_abort_record_close(RfSideOnlineProductionOwnerV1 *owner)
 	cold_undo_block_record_close(owner);
 }
 
+/* The native SPACE boundary is a fixture here. Its original batch, physical
+ * qualification and I/O are exercised independently by SPACE owner tests. */
+static const RfSideOnlinePlanV1 *abort_terminal_plan;
+static int abort_terminal_fault;
+static unsigned abort_terminal_entries, abort_terminal_deletes, abort_terminal_order;
+static bool abort_terminal_consumed;
+
+bool
+cluster_space_recovery_cold_abort_finish_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+											Size bytes, void *arg,
+											ClusterSpaceColdAbortFinishV1 before_delete,
+											ClusterSpaceColdAbortFinishV1 finish)
+{
+	UT_ASSERT(plan == abort_terminal_plan && index == 5 && canonical_scope != NULL);
+	UT_ASSERT(before_delete != NULL && finish != NULL);
+	UT_ASSERT(bytes >= 8 * BLCKSZ && bytes < rf_side_online_plan_scratch_available_v1(plan));
+	UT_ASSERT_EQ(cold_stats_calls + prepare_apply.terminal_projection_stores, 0);
+	abort_terminal_entries++;
+	if (abort_terminal_consumed || abort_terminal_fault == 1)
+		return false;
+	UT_ASSERT_EQ(cold_clog_applies + cold_clog_verifies + cold_locks_calls, 0);
+	if (!before_delete(arg, plan, index))
+		return false;
+	UT_ASSERT_EQ(cold_clog_verifies, 1);
+	UT_ASSERT_EQ(cold_locks_calls, cold_locks_test ? 1 : 0);
+	UT_ASSERT_EQ(cold_stats_calls + prepare_apply.terminal_projection_stores, 0);
+	abort_terminal_deletes++;
+	abort_terminal_order = ++prepare_apply.next_order;
+	abort_terminal_consumed = true;
+	if (abort_terminal_fault == 4)
+		pg_re_throw();
+	if (abort_terminal_fault == 5)
+		cold_clog_denied = true;
+	if (abort_terminal_fault == 3)
+		return false;
+	return finish(arg, plan, index) && abort_terminal_fault != 19;
+}
+
+static RfSideOnlinePlanV1 *
+abort_terminal_build(bool combined)
+{
+	RfSideOnlinePlanV1 *plan = space_online_plan(900);
+	RelFileLocator locators[] = { { DEFAULTTABLESPACE_OID, 5, 16384 },
+								  { DEFAULTTABLESPACE_OID, 5, 16384 },
+								  { DEFAULTTABLESPACE_OID, 5, 16385 } };
+	FakeXactRecord fake;
+	xl_undo_tt_slot_bind later = { .segment_id = 513,
+								   .instance = 3,
+								   .slot_offset = 5,
+								   .xid = 818,
+								   .wrap = 8,
+								   .format_version = CLUSTER_UNDO_TT_BIND_VERSION };
+
+	undo_header_abort(&fake, 4);
+	undo_header_feed(plan, &fake, 100);
+	for (uint32 i = 0; i < 4; i++) {
+		cold_abort_create_record(&fake, locators[i < 2 ? 0 : 2], i % 2 == 0, 802);
+		UT_ASSERT_EQ(cold_abort_delete_feed(plan, &fake, (i + 2) * 100, 0),
+					 RF_PAGE_PROOF_DETAIL_OK);
+	}
+	cold_abort_deletes(&fake, locators, lengthof(locators), combined);
+	if (combined) {
+		uint32 xinfo;
+		cold_terminal_children(&fake, true);
+		memcpy(&xinfo, fake.data + MinSizeOfXactAbort, sizeof(xinfo));
+		xinfo |= XACT_XINFO_HAS_AE_LOCKS;
+		memcpy(fake.data + MinSizeOfXactAbort, &xinfo, sizeof(xinfo));
+	}
+	UT_ASSERT_EQ(cold_abort_delete_feed(plan, &fake, 600, 0), RF_PAGE_PROOF_DETAIL_OK);
+	record_prefix_fpi(plan, 700, 0x31);
+	make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND, &later,
+						   sizeof(later));
+	undo_header_feed(plan, &fake, 800);
+	UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	return plan;
+}
+
+static bool
+abort_terminal_space_preflight(void *arg, const RfSideOnlineOperationV1 *op)
+{
+	UT_ASSERT(arg == abort_terminal_plan && canonical_scope != NULL);
+	UT_ASSERT(op->kind == RF_SIDE_ONLINE_OPERATION_SPACE
+			  || op->kind == RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE);
+	return true; /* No physical permission: the finish boundary proves that. */
+}
+
+static bool
+abort_terminal_space_apply(void *arg pg_attribute_unused(),
+						   const RfSideOnlineOperationV1 *op pg_attribute_unused())
+{
+	UT_ASSERT(false); /* A selected ABORT must never replay earlier CREATEs. */
+	return false;
+}
+
+static void
+abort_terminal_setup(RfSideOnlineProductionOwnerV1 *owner, RfSideOnlinePlanV1 *plan, bool combined)
+{
+	abort_terminal_plan = plan;
+	owner->preflight_space = abort_terminal_space_preflight;
+	owner->apply_space = abort_terminal_space_apply;
+	owner->space_arg = plan;
+	abort_terminal_fault = 0;
+	abort_terminal_entries = abort_terminal_deletes = abort_terminal_order = 0;
+	abort_terminal_consumed = false;
+	cold_expected_children = combined ? lengthof(cold_child_xids) : 0;
+	cold_locks_test = combined;
+	cold_locks_calls = cold_locks_order = 0;
+	standbyState = combined ? STANDBY_INITIALIZED : STANDBY_DISABLED;
+	payload_tracking = true;
+	payload_bytes = payload_peak = 0;
+}
+
+static void
+abort_terminal_cleanup(RfSideOnlineProductionOwnerV1 *owner, RfSideOnlinePlanV1 **plan)
+{
+	UT_ASSERT_EQ(payload_bytes, 0);
+	UT_ASSERT(!owner->protected_set_complete && !owner->protected_set_active
+			  && owner->undo_headers == NULL && owner->protected_plan == NULL);
+	payload_tracking = false;
+	cold_locks_test = cold_locks_throw = cold_locks_expire = false;
+	standbyState = STANDBY_DISABLED;
+	cold_expected_children = 0;
+	native_abort_record_close(owner);
+	rf_side_online_plan_destroy_v1(plan);
+	abort_terminal_plan = NULL;
+}
+
+UT_TEST(test_cold_selected_abort_delete_preserves_native_order_and_exact_prefix)
+{
+	for (int combined = 0; combined < 2; combined++) {
+		RfSideOnlinePlanV1 *plan = abort_terminal_build(combined);
+		ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
+		ClusterThreadRecoveryAuthorityV1 authority
+			= { .duty = &canonical_duty, .serial_guard = &guard };
+		RfSideOnlineProductionOwnerV1 owner;
+		RfSideOnlineOperationV1 operation;
+		PGAlignedBlock header, after, zero = { 0 };
+
+		native_abort_record_open(&header, &owner, &authority, true);
+		abort_terminal_setup(&owner, plan, combined);
+		UT_ASSERT(rf_side_online_plan_operation_v1(plan, 5, &operation));
+		/* Earlier CREATEs require their ordered owner; full-source apply cannot
+		 * substitute for this selected terminal consumer. */
+		UT_ASSERT_NE(rf_side_online_production_apply_v1(plan, &owner), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(abort_terminal_entries + cold_clog_applies + cold_stats_calls
+						 + prepare_apply.terminal_projection_stores + canonical_writes,
+					 0);
+		UT_ASSERT_EQ(
+			rf_side_online_production_apply_record_v1(plan, 5, &operation.identity, &owner),
+			RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(abort_terminal_entries, 1);
+		UT_ASSERT_EQ(abort_terminal_deletes, 1);
+		UT_ASSERT_EQ(canonical_writes, 0);
+		UT_ASSERT_EQ(cold_clog_applies, 1);
+		UT_ASSERT_EQ(cold_clog_verifies, 1);
+		UT_ASSERT(cold_clog_verified_order < abort_terminal_order);
+		if (combined) {
+			UT_ASSERT(cold_clog_verified_order < cold_locks_order
+					  && cold_locks_order < abort_terminal_order
+					  && abort_terminal_order < cold_stats_order);
+			UT_ASSERT_EQ(cold_stats_calls, 3);
+		}
+		UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 1);
+		UT_ASSERT(abort_terminal_order < prepare_apply.terminal_projection_order);
+		UT_ASSERT(payload_peak <= operation.owned_payload_length);
+		UT_ASSERT(pread(fileno(canonical_file), after.data, BLCKSZ, 0) == BLCKSZ);
+		UT_ASSERT(memcmp(header.data, after.data, BLCKSZ) == 0);
+		UT_ASSERT(pread(fileno(canonical_file), after.data, BLCKSZ, 9 * BLCKSZ) == BLCKSZ);
+		UT_ASSERT(memcmp(zero.data, after.data, BLCKSZ) == 0);
+		/* A consumed SPACE proof cannot be replaced by already-terminal TT. */
+		cold_stats_calls = prepare_apply.terminal_projection_stores = 0;
+		UT_ASSERT_NE(
+			rf_side_online_production_apply_record_v1(plan, 5, &operation.identity, &owner),
+			RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(abort_terminal_deletes, 1);
+		UT_ASSERT_EQ(cold_stats_calls + prepare_apply.terminal_projection_stores, 0);
+		abort_terminal_cleanup(&owner, &plan);
+	}
+}
+
+UT_TEST(test_cold_selected_abort_delete_failure_or_error_cannot_complete)
+{
+	for (int fault = 1; fault < 20; fault++) {
+		RfSideOnlinePlanV1 *plan = abort_terminal_build(true);
+		ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
+		ClusterThreadRecoveryAuthorityV1 authority
+			= { .duty = &canonical_duty, .serial_guard = &guard };
+		RfSideOnlineProductionOwnerV1 owner;
+		RfSideOnlineOperationV1 operation;
+		PGAlignedBlock header;
+		volatile bool caught = false;
+		volatile RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_INTERNAL;
+
+		native_abort_record_open(&header, &owner, &authority, true);
+		abort_terminal_setup(&owner, plan, true);
+		abort_terminal_fault = fault;
+		UT_ASSERT(rf_side_online_plan_operation_v1(plan, 5, &operation));
+		cold_clog_apply_fail = fault == 6;
+		cold_clog_verify_fail = fault == 7;
+		cold_clog_throw = fault == 8;
+		cold_locks_throw = fault == 9;
+		cold_locks_expire = fault == 10;
+		cold_stats_throw = fault == 11;
+		cold_stats_expire = fault == 12;
+		if (fault == 13)
+			((UndoSegmentHeaderData *)header.data)->tt_slots[4].status = TT_SLOT_ACTIVE;
+		if (fault == 14)
+			((UndoSegmentHeaderData *)header.data)->tt_slots[4].xid++;
+		UT_ASSERT(pwrite(fileno(canonical_file), header.data, BLCKSZ, 0) == BLCKSZ);
+		record_sync_failure = fault == 2 || fault == 15;
+		cold_source_fail = fault == 16;
+		cold_source_throw = fault == 17;
+		if (fault == 18)
+			owner.borrowed_scratch_bytes = rf_side_online_plan_scratch_available_v1(plan);
+		PG_TRY();
+		{
+			detail
+				= rf_side_online_production_apply_record_v1(plan, 5, &operation.identity, &owner);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_NE(detail, RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(caught, fault == 4 || fault == 8 || fault == 9 || fault == 11 || fault == 17);
+		UT_ASSERT_EQ(canonical_writes, 0);
+		UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, fault == 19 ? 1 : 0);
+		if (fault == 1 || fault == 2 || (fault >= 6 && fault <= 10) || (fault >= 13 && fault <= 18))
+			UT_ASSERT_EQ(abort_terminal_deletes + cold_stats_calls, 0);
+		if (fault == 1 || (fault >= 13 && fault <= 18))
+			UT_ASSERT_EQ(cold_clog_applies, 0);
+		abort_terminal_cleanup(&owner, &plan);
+	}
+}
+
 UT_TEST(test_cold_native_abort_record_requires_installed_tt_before_exact_effects)
 {
 	for (int completion = 0; completion < 2; completion++) {
@@ -12108,7 +12346,7 @@ UT_TEST(test_cold_terminal_frame_refusal_preserves_pi_inspection)
 int
 main(void)
 {
-	UT_PLAN(180);
+	UT_PLAN(182);
 	UT_RUN(test_cold_strict_terminals_refuse_unconsumed_frame);
 	UT_RUN(test_cold_effectful_terminals_refuse_unconsumed_frame);
 	UT_RUN(test_cold_terminal_capture_keeps_unconsumed_frame_out_of_history_and_replay);
@@ -12129,6 +12367,8 @@ main(void)
 	UT_RUN(test_cold_native_commit_record_keeps_ordered_undo_data);
 	UT_RUN(test_cold_native_commit_record_failures_never_publish_completion);
 	UT_RUN(test_cold_native_commit_record_idempotence_requires_sync);
+	UT_RUN(test_cold_selected_abort_delete_preserves_native_order_and_exact_prefix);
+	UT_RUN(test_cold_selected_abort_delete_failure_or_error_cannot_complete);
 	UT_RUN(test_cold_native_abort_record_requires_installed_tt_before_exact_effects);
 	UT_RUN(test_cold_native_abort_record_refuses_unproved_prefix_and_native_failures);
 	UT_RUN(test_cold_exact_abort_record_installs_only_its_terminal_header);

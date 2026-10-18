@@ -2817,6 +2817,78 @@ rf_side_online_plan_space_terminal_v1(const RfSideOnlinePlanV1 *plan,
 }
 
 bool
+rf_side_online_plan_space_abort_v1(const RfSideOnlinePlanV1 *plan, uint32 space_operation,
+								   uint32 *abort_operation, uint32 *abort_relation)
+{
+	const RfSideOnlineOperationV1 *space;
+	RfSideSpaceTerminalV1 terminal;
+	uint32 selected = UINT32_MAX, ordinal = UINT32_MAX;
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || plan->failed
+		|| plan->purpose != RF_SIDE_PLAN_RECOVERY || space_operation >= plan->operation_count
+		|| abort_operation == NULL || abort_relation == NULL || abort_operation == abort_relation)
+		return false;
+	space = &plan->operations[space_operation];
+	if (space->kind != RF_SIDE_ONLINE_OPERATION_SPACE || space->history_only
+		|| !rf_side_online_plan_space_terminal_v1(plan, &space->space_key, 1, &terminal)
+		|| terminal.operation != space_operation)
+		return false;
+	if (space->route.normalized_info == XLOG_SMGR_SPACE_IDENTITY) {
+		ClusterSpaceStructureChange change;
+
+		if (!cluster_space_structure_wal_decode(plan->owned_payload + space->owned_payload_offset,
+												space->owned_payload_length, &change)
+			|| change.identity.action != CLUSTER_SPACE_WAL_CREATE)
+			return false;
+	} else if (space->route.normalized_info != XLOG_SMGR_SPACE_RESERVATION)
+		return false;
+	for (uint32 i = 0; i < plan->operation_count; i++) {
+		const RfSideOnlineOperationV1 *op = &plan->operations[i];
+
+		if (op->kind != RF_SIDE_ONLINE_OPERATION_XACT || op->xact.kind != RF_SIDE_XACT_ABORT)
+			continue;
+		for (uint32 r = 0; r < op->xact.relation_count; r++) {
+			uint32 creation;
+
+			/* Reuse the original complete payload, unique native CREATE pair,
+			 * source/xid and raw-xid-reuse checks; never match naked locators. */
+			if (!rf_side_online_plan_abort_creation_v1(plan, i, r, &creation))
+				return false;
+			if (!RelFileLocatorEquals(plan->operations[creation].space_key.locator,
+									  space->space_key.locator))
+				continue;
+			if (creation > space_operation || i <= space_operation || op->history_only
+				|| op->identity.participant_index != space->identity.participant_index
+				|| space->identity.record.end_rec_ptr > op->identity.record.read_rec_ptr
+				|| (selected != UINT32_MAX && selected != i))
+				return false;
+			/* Only the same original current CREATE/ADVANCE prefix may lend
+			 * this final binding. Structural transitions need their own owner. */
+			for (uint32 j = creation; j < i; j++) {
+				const RfSideOnlineOperationV1 *prefix = &plan->operations[j];
+
+				if (prefix->kind != RF_SIDE_ONLINE_OPERATION_SPACE
+					|| !RelFileLocatorEquals(prefix->space_key.locator, space->space_key.locator))
+					continue;
+				if (prefix->history_only || j > space_operation
+					|| prefix->identity.participant_index != op->identity.participant_index
+					|| prefix->identity.record.end_rec_ptr > op->identity.record.read_rec_ptr
+					|| (j != creation
+						&& prefix->route.normalized_info != XLOG_SMGR_SPACE_RESERVATION))
+					return false;
+			}
+			if (selected == UINT32_MAX) {
+				selected = i;
+				ordinal = r;
+			}
+		}
+	}
+	*abort_operation = selected;
+	*abort_relation = ordinal;
+	return true;
+}
+
+bool
 rf_side_online_plan_space_target_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 									ClusterSpaceIdentityKey *out)
 {
