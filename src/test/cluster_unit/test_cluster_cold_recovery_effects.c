@@ -2117,6 +2117,82 @@ UT_TEST(test_foreign_native_abort_keeps_complete_record_effects)
 	}
 }
 
+UT_TEST(test_foreign_relation_abort_routes_complete_native_record)
+{
+	for (int variant = 0; variant < 8; variant++) {
+		EffectRecord r;
+		ClusterColdDecodedV1 out = { 0 };
+		uint32 xinfo = XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_RELFILELOCATORS;
+
+		if (variant & 1)
+			xinfo |= XACT_XINFO_HAS_DROPPED_STATS;
+		if (variant & 2)
+			xinfo |= XACT_XINFO_HAS_AE_LOCKS;
+		if (variant & 4)
+			xinfo |= XACT_XINFO_HAS_SUBXACTS;
+		completion(&r, false, xinfo);
+		/* The original native producer sets this flag for pending deletes. */
+		r.decoded.header.xl_info |= XLR_SPECIAL_REL_UPDATE;
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+					 CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
+		UT_ASSERT_EQ(out.record.space_count, 0);
+		UT_ASSERT_EQ(out.effects.native_apply, out.effects.required);
+		UT_ASSERT_EQ(out.effects.refused | out.effects.no_effect | out.effects.space_apply, 0);
+		UT_ASSERT(partitioned(&out.effects));
+		UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, false));
+		UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&out.record),
+					 CLUSTER_COLD_UNSCHEDULED_FOREIGN_SIDE);
+		/* Own native redo has no selected cold deletion owner. */
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+					 CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_STRUCTURAL);
+		UT_ASSERT_EQ(out.effects.refused, out.effects.required);
+		UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, true));
+	}
+}
+
+UT_TEST(test_foreign_relation_abort_refuses_unowned_frame_and_effects)
+{
+	for (int fault = 0; fault < 11; fault++) {
+		EffectRecord r;
+		ClusterColdDecodedV1 out = { 0 };
+		ClusterColdDetailV1 detail;
+		uint32 xinfo = XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_RELFILELOCATORS;
+
+		if (fault == 6)
+			xinfo |= XACT_XINFO_HAS_ORIGIN;
+		if (fault == 7)
+			xinfo |= XACT_XINFO_HAS_TWOPHASE;
+		completion(&r, false, xinfo);
+		r.decoded.header.xl_info |= XLR_SPECIAL_REL_UPDATE;
+		if (fault == 0)
+			r.decoded.header.xl_info &= ~XLR_SPECIAL_REL_UPDATE;
+		if (fault == 1)
+			r.decoded.header.xl_info |= 0x02;
+		if (fault == 2)
+			r.decoded.has_page_version_edge = true;
+		if (fault == 3)
+			r.decoded.record_origin = 1;
+		if (fault == 4)
+			r.decoded.toplevel_xid = 100;
+		if (fault == 5)
+			r.reader.cluster_expected_thread_id = 0;
+		if (fault == 8)
+			r.decoded.main_data_len--;
+		if (fault == 9)
+			r.decoded.main_data_len++;
+		if (fault == 10)
+			r.decoded.main_data = NULL;
+		detail = cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out);
+		if (detail == CLUSTER_COLD_OK) {
+			UT_ASSERT_EQ(out.record.record_flags & CLUSTER_COLD_RECORD_FOREIGN_SIDE, 0);
+			UT_ASSERT_EQ(out.effects.refused, out.effects.required);
+		} else
+			UT_ASSERT_EQ(out.effects.required, 0);
+	}
+}
+
 UT_TEST(test_foreign_native_xact_requires_bound_source_identity)
 {
 	for (uint16 origin = 1; origin <= 2; origin++)
@@ -2767,7 +2843,7 @@ UT_TEST(test_foreign_terminals_refuse_unconsumed_frame_before_dispatch)
 int
 main(void)
 {
-	UT_PLAN(73);
+	UT_PLAN(75);
 	UT_RUN(test_foreign_terminals_refuse_unconsumed_frame_before_dispatch);
 	UT_RUN(test_smgr_native_carriers_keep_existing_effect_owners);
 	UT_RUN(test_smgr_create_rejects_incomplete_or_nonproducer_carriers);
@@ -2782,6 +2858,8 @@ main(void)
 	UT_RUN(test_foreign_compound_rejects_unconsumed_frame_and_payload);
 	UT_RUN(test_foreign_ctrc_release_requires_original_complete_carrier);
 	UT_RUN(test_foreign_native_abort_keeps_complete_record_effects);
+	UT_RUN(test_foreign_relation_abort_routes_complete_native_record);
+	UT_RUN(test_foreign_relation_abort_refuses_unowned_frame_and_effects);
 	UT_RUN(test_foreign_native_xact_requires_bound_source_identity);
 	UT_RUN(test_native_completion_rejects_invalid_stats_kinds_before_routing);
 	UT_RUN(test_native_completion_preserves_variable_stats_kinds);

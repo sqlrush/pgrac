@@ -2098,6 +2098,70 @@ UT_TEST(test_native_abort_dispatch_matches_exact_captured_kind)
 	}
 }
 
+UT_TEST(test_relation_abort_dispatch_requires_original_complete_selected_input)
+{
+	/* Payload parsing/deletion are tested with their real owners elsewhere;
+	 * this boundary keeps the original Startup selection and refusal checks. */
+	static const uint8 payload[16] = { 1 };
+	for (int fault = 0; fault < 16; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = control_fixture_mode(&record, true);
+		RfSideOnlineOperationV1 *op = &side_fixture[1].operations[1];
+
+		side_record_fixture(&record, RM_XACT_ID,
+							XLOG_XACT_ABORT | XLOG_XACT_HAS_INFO | XLR_SPECIAL_REL_UPDATE,
+							RF_SIDE_ONLINE_OPERATION_XACT);
+		op->purpose = RF_SIDE_PLAN_RECOVERY;
+		op->xact.kind = RF_SIDE_XACT_ABORT;
+		op->xact.cold_completion_effects = true;
+		op->xact.relation_count = 2;
+		op->xact.completion_payload_length = sizeof(payload);
+		op->owned_payload = payload;
+		op->owned_payload_length = sizeof(payload);
+		if (fault == 1)
+			op->xact.cold_completion_effects = false;
+		if (fault == 2)
+			op->xact.space_drop_count = 1;
+		if (fault == 3)
+			op->xact.kind = RF_SIDE_XACT_COMMIT;
+		if (fault == 4)
+			op->owned_payload = NULL;
+		if (fault == 5)
+			op->owned_payload_length--;
+		if (fault == 6)
+			op->xact.completion_payload_length = op->owned_payload_length = 0;
+		if (fault == 7)
+			op->history_only = true;
+		if (fault == 8)
+			op->purpose = RF_SIDE_PLAN_PI_CONTRIBUTIONS;
+		if (fault == 9)
+			record.space_count = 1;
+		if (fault == 10)
+			record.info |= 0x02;
+		if (fault == 11)
+			record.record_crc++;
+		if (fault == 12)
+			op->xact.relation_count = 0;
+		if (fault == 13)
+			record.info = op->identity.record.info = XLOG_XACT_ABORT | XLOG_XACT_HAS_INFO;
+		if (fault == 14)
+			control_authority_ok = false;
+		if (fault == 15)
+			control_cover_ok = false;
+		UT_ASSERT_EQ(consume_control(typed, &record), fault == 0);
+		UT_ASSERT_EQ(control_calls, fault == 0 ? 1 : 0);
+		UT_ASSERT_EQ(control_selected, fault == 0 ? 1 : UINT32_MAX);
+		UT_ASSERT_EQ(typed->refusal,
+					 fault == 0 ? CLUSTER_COLD_OK : CLUSTER_COLD_SIDE_OWNER_MISSING);
+		if (fault != 0) {
+			UT_ASSERT(!consume_control(typed, &record));
+			UT_ASSERT_EQ(control_calls, 0);
+		}
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
 UT_TEST(test_native_commit_dispatch_selects_exact_consumer)
 {
 	ClusterColdRecordV1 record;
@@ -2992,7 +3056,7 @@ UT_TEST(test_checkpoint_export_clears_unsealed_and_failed_output)
 int
 main(void)
 {
-	UT_PLAN(106);
+	UT_PLAN(107);
 	UT_RUN(test_endpoints_capture_and_recheck_post_redo_tt_before_publication);
 	UT_RUN(test_endpoints_incomplete_replay_never_captures_post_redo_tt);
 	UT_RUN(test_endpoints_inventory_refusal_discards_all_attempt_inputs);
@@ -3056,6 +3120,7 @@ main(void)
 	UT_RUN(test_compound_final_rebinds_scope_and_rejects_failure_stickily);
 	UT_RUN(test_native_commit_dispatch_selects_exact_consumer);
 	UT_RUN(test_native_abort_dispatch_matches_exact_captured_kind);
+	UT_RUN(test_relation_abort_dispatch_requires_original_complete_selected_input);
 	UT_RUN(test_undo_dispatch_selects_exact_record_and_keeps_space_proof);
 	UT_RUN(test_undo_dispatch_rejects_wrong_identity_or_unowned_effect);
 	UT_RUN(test_undo_block_dispatch_owner_failure_and_drift_stay_refused);

@@ -1391,7 +1391,9 @@ cold_record_side_kind(const ClusterColdRecordV1 *record)
 		return RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL;
 	if (record->record_flags != CLUSTER_COLD_RECORD_FOREIGN_SIDE
 		|| ((record->info & XLR_INFO_MASK) != 0
-			&& !(record->rmid == RM_XACT_ID && info == XLOG_XACT_COMMIT && record->space_count > 0
+			&& !(record->rmid == RM_XACT_ID
+				 && ((info == XLOG_XACT_COMMIT && record->space_count > 0)
+					 || (info == XLOG_XACT_ABORT && record->space_count == 0))
 				 && (record->info & XLR_INFO_MASK) == XLR_SPECIAL_REL_UPDATE)))
 		return RF_SIDE_ONLINE_OPERATION_INVALID;
 	if (record->rmid == RM_CLUSTER_UNDO_ID && info == XLOG_UNDO_RECOVERY_TT_ABORT)
@@ -1687,15 +1689,30 @@ cold_recovery_abort_record(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *
 }
 
 /* A compound dispatch must retain every originally decoded SPACE payload.
- * No partial array, newly reconstructed COMMIT, or bare physical absence
+ * No partial array, newly reconstructed terminal, or bare physical absence
  * can substitute for the selected full captured operation. */
 static bool
 cold_record_drops_match(const ClusterColdRecordV1 *record, const RfSideOnlineOperationV1 *operation)
 {
 	uint32 offset = operation->xact.space_drop_offset;
-	if (record->space_count == 0)
-		return operation->kind != RF_SIDE_ONLINE_OPERATION_XACT
-			   || (operation->xact.space_drop_count == 0 && operation->xact.relation_count == 0);
+	if (record->space_count == 0) {
+		if (operation->kind != RF_SIDE_ONLINE_OPERATION_XACT)
+			return true;
+		if (operation->xact.space_drop_count != 0)
+			return false;
+		if (operation->xact.relation_count == 0)
+			return (record->info & XLR_INFO_MASK) == 0;
+		/* Native ABORT has raw pending-delete locators, not typed SPACE
+		 * tombstones. Only the original complete recovery operation may
+		 * reach its selected cold owner and native deletion continuation. */
+		return operation->purpose == RF_SIDE_PLAN_RECOVERY
+			   && operation->xact.kind == RF_SIDE_XACT_ABORT
+			   && operation->xact.cold_completion_effects && record->rmid == RM_XACT_ID
+			   && (record->info & XLOG_XACT_OPMASK) == XLOG_XACT_ABORT
+			   && (record->info & XLR_INFO_MASK) == XLR_SPECIAL_REL_UPDATE
+			   && operation->owned_payload != NULL && operation->owned_payload_length > 0
+			   && operation->owned_payload_length == operation->xact.completion_payload_length;
+	}
 	if (operation->kind != RF_SIDE_ONLINE_OPERATION_XACT
 		|| operation->xact.kind != RF_SIDE_XACT_COMMIT || !operation->xact.cold_completion_effects
 		|| record->space_ops == NULL || operation->xact.space_drop_count != record->space_count
