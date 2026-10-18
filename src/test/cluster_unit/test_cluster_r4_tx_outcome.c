@@ -3089,6 +3089,30 @@ UT_TEST(test_local_terminal_scope_drift_clears_precommit_retry)
 	}
 }
 
+UT_TEST(test_local_terminal_precommit_window_requests_retry)
+{
+	ClusterTTStatusKey key;
+	ClusterTTStatusResult result;
+	bool retry = false;
+
+	reset_exact_origin_fixture();
+	test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+	test_twophase_xid = TEST_ORIGIN_XID;
+
+	/* A retained TT COMMITTED stamp with a live native xid is a precommit
+	 * window, not a terminal result.  Preserve the retry handoff after the
+	 * physical bracket releases so the caller can observe publication. */
+	UT_ASSERT(!cluster_runtime_visibility_local_terminal_lookup_exact(TEST_ORIGIN_XID, &key,
+																		 &result, &retry));
+	UT_ASSERT(retry);
+	UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_UNKNOWN);
+	UT_ASSERT(!result.authoritative);
+	UT_ASSERT_EQ(test_durable_locator_calls, 1);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 1);
+	UT_ASSERT_EQ(test_candidate_release_calls, 1);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+}
+
 UT_TEST(test_local_terminal_retained_boundary_and_counter_advance_stay_valid)
 {
 	ClusterTTStatusKey key;
@@ -5736,7 +5760,7 @@ UT_TEST(test_self_fresh_role_does_not_inherit_ordinary_abort_permission)
 int
 main(void)
 {
-	UT_PLAN(160);
+	UT_PLAN(161);
 	UT_RUN(test_retained_active_identity_reaches_real_undo_pending);
 	UT_RUN(test_retained_undo_pending_requires_matching_active_tt_receipt);
 	UT_RUN(test_retained_undo_pending_guard_drift_cannot_publish);
@@ -5822,6 +5846,7 @@ main(void)
 	UT_RUN(test_local_terminal_locator_rechecks_native_scope_after_scan);
 	UT_RUN(test_local_terminal_rechecks_scope_and_root_after_release);
 	UT_RUN(test_local_terminal_scope_drift_clears_precommit_retry);
+	UT_RUN(test_local_terminal_precommit_window_requests_retry);
 	UT_RUN(test_local_terminal_retained_boundary_and_counter_advance_stay_valid);
 	UT_RUN(test_current_mx_terminal_fallback_cannot_bypass_native_era);
 	UT_RUN(test_current_member_active_on_current_segment_requires_live_owner_index);
