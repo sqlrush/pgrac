@@ -265,12 +265,16 @@ side_owner_abort_covered(void *arg, const RfSideXactOperationV1 *operation)
 		if (header->block_no == 0 && header->instance == target.instance
 			&& header->segment_id == target.segment_id)
 			return header->installed && side_owner_install_target(owner, header)
-				   && cluster_clog_native_recovery_apply_v1(operation->origin_thread - 1,
-															operation->xid, 0, NULL,
-															TRANSACTION_STATUS_ABORTED)
-				   && cluster_clog_native_recovery_verify_v1(operation->origin_thread - 1,
-															 operation->xid, 0, NULL,
-															 TRANSACTION_STATUS_ABORTED)
+				   && (operation->cold_completion_effects
+						   ? rf_side_xact_cold_abort_clog_v1(
+								 operation, coverage->operation->owned_payload,
+								 coverage->operation->owned_payload_length)
+						   : (cluster_clog_native_recovery_apply_v1(operation->origin_thread - 1,
+																	operation->xid, 0, NULL,
+																	TRANSACTION_STATUS_ABORTED)
+							  && cluster_clog_native_recovery_verify_v1(
+								  operation->origin_thread - 1, operation->xid, 0, NULL,
+								  TRANSACTION_STATUS_ABORTED)))
 				   && side_owner_cold_abort_ready(owner, coverage->operation, &target)
 				   && side_owner_authority_fresh(owner);
 	return false;

@@ -59,9 +59,10 @@ UT_DEFINE_GLOBALS();
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(19);
 	UT_RUN(test_records_cold_ordered_counter_candidate);
 	UT_RUN(test_records_cold_terminal_counter_inputs);
+	UT_RUN(test_records_cold_abort_children_require_native_tree_shape);
 	UT_RUN(test_records_cold_multixact_counter_inputs);
 	UT_RUN(test_records_cold_checkpoint_counter_inputs);
 	UT_RUN(test_records_cold_counter_header_and_assignment);

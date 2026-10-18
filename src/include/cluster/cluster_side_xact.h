@@ -154,6 +154,10 @@ typedef bool (*RfSideXactVerifyAbortCoverageV1)(void *arg, const RfSideXactOpera
 extern RfSideXactApplyResultV1
 rf_side_xact_apply_covered_abort_v1(const RfSideXactOperationV1 *operation, void *arg,
 									RfSideXactVerifyAbortCoverageV1 verify);
+/* Native complete ABORT tree only; caller must first install its exact TT
+ * carrier. Source durability and cold-origin authority remain mandatory. */
+extern bool rf_side_xact_cold_abort_clog_v1(const RfSideXactOperationV1 *operation,
+											const uint8 *payload, uint32 length);
 extern RfSideXactApplyResultV1
 rf_side_xact_apply_cold_abort_completion_v1(const RfSideXactOperationV1 *operation,
 											const uint8 *payload, uint32 length, void *arg,

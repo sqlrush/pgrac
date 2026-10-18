@@ -265,14 +265,50 @@ UT_TEST(test_records_cold_terminal_counter_inputs)
 				UT_ASSERT_EQ(decoded.xid_input.record_xid, top);
 				UT_ASSERT_EQ(decoded.xid_input.payload_xid, wrap ? 4 : 803);
 				UT_ASSERT_EQ(decoded.xid_input.checkpoint_next_xid, 0);
-				/* Child terminal effects still lack a foreign record-local
-				 * consumer; counter evidence cannot supply that owner. */
+				/* This unsorted child list fails the native terminal-tree
+				 * contract; valid counter evidence cannot supply that owner. */
 				UT_ASSERT_EQ(decoded.record.record_flags,
 							 foreign ? CLUSTER_COLD_RECORD_SIDE_UNOWNED : 0);
 				cluster_cold_decoded_release_v1(&decoded);
 			}
 		}
 	}
+}
+
+UT_TEST(test_records_cold_abort_children_require_native_tree_shape)
+{
+	for (int wrap = 0; wrap < 2; wrap++)
+		for (int invalid = 0; invalid < 2; invalid++) {
+			uint32 self, peer;
+			TransactionId top = wrap ? UINT32_MAX - 2 : 800;
+			TransactionId children[] = { wrap ? UINT32_MAX : 801, wrap ? 3 : 802, wrap ? 4 : 803 };
+			int count = lengthof(children);
+			RealRecord *r;
+			xl_xact_xinfo xinfo;
+			Size offset = MinSizeOfXactAbort + sizeof(xinfo);
+			Size added = sizeof(count) + sizeof(children);
+			ClusterColdDecodedV1 decoded = { 0 };
+
+			rec_two_writers(&self, &peer);
+			r = rec_abort(self, 0x2000, 0x2100, top, NULL, 0);
+			memcpy(&xinfo, r->data + MinSizeOfXactAbort, sizeof(xinfo));
+			xinfo.xinfo |= XACT_XINFO_HAS_SUBXACTS;
+			memcpy(r->data + MinSizeOfXactAbort, &xinfo, sizeof(xinfo));
+			if (invalid)
+				children[1] = children[0];
+			memmove(r->data + offset + added, r->data + offset,
+					r->u.decoded.main_data_len - offset);
+			memcpy(r->data + offset, &count, sizeof(count));
+			memcpy(r->data + offset + sizeof(count), children, sizeof(children));
+			r->u.decoded.main_data_len += added;
+			memmove(r->data + 1, r->data, r->u.decoded.main_data_len);
+			r->u.decoded.main_data = (char *)r->data + 1;
+			UT_ASSERT_EQ(rec_counter_decode(r, true, &decoded), CLUSTER_COLD_OK);
+			UT_ASSERT(decoded.xid_input.complete);
+			UT_ASSERT_EQ(decoded.record.record_flags, invalid ? CLUSTER_COLD_RECORD_SIDE_UNOWNED
+															  : CLUSTER_COLD_RECORD_FOREIGN_SIDE);
+			cluster_cold_decoded_release_v1(&decoded);
+		}
 }
 
 UT_TEST(test_records_cold_multixact_counter_inputs)

@@ -204,6 +204,8 @@ static bool cold_source_barrier_test, cold_source_drift;
 HotStandbyState standbyState = STANDBY_DISABLED;
 static bool cold_locks_test, cold_locks_throw, cold_locks_expire;
 static unsigned cold_locks_calls, cold_locks_order;
+static int cold_expected_children;
+static const TransactionId cold_child_xids[] = { 930, 1058, 1186 };
 
 static bool cold_assignment_test, assignment_refuse, assignment_throw, assignment_expire;
 static unsigned assignment_preflights, assignment_applies, assignment_verifies;
@@ -252,8 +254,11 @@ StandbyReleaseLockTree(TransactionId xid, int count, TransactionId *children)
 	UT_ASSERT(cold_locks_test && canonical_scope != NULL);
 	UT_ASSERT(standbyState >= STANDBY_INITIALIZED && standbyState <= STANDBY_SNAPSHOT_READY);
 	UT_ASSERT_EQ(xid, 802);
-	UT_ASSERT_EQ(count, 0);
-	UT_ASSERT(children == NULL);
+	UT_ASSERT_EQ(count, cold_expected_children);
+	UT_ASSERT(count == 0
+				  ? children == NULL
+				  : children != NULL
+						&& memcmp(children, cold_child_xids, count * sizeof(TransactionId)) == 0);
 	UT_ASSERT_EQ(cold_clog_verifies, 1);
 	UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 0);
 	cold_locks_calls++;
@@ -477,8 +482,11 @@ cluster_clog_native_recovery_apply_v1(int origin, TransactionId xid, int count,
 	UT_ASSERT(cold_clog_test && canonical_scope != NULL && canonical_syncs > 0);
 	UT_ASSERT_EQ(origin, 2);
 	UT_ASSERT_EQ(xid, 802);
-	UT_ASSERT_EQ(count, 0);
-	UT_ASSERT(children == NULL);
+	UT_ASSERT_EQ(count, cold_expected_children);
+	UT_ASSERT(count == 0
+				  ? children == NULL
+				  : children != NULL
+						&& memcmp(children, cold_child_xids, count * sizeof(TransactionId)) == 0);
 	UT_ASSERT_EQ(status,
 				 cold_abort_test ? TRANSACTION_STATUS_ABORTED : TRANSACTION_STATUS_COMMITTED);
 	UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 0);
@@ -497,8 +505,11 @@ cluster_clog_native_recovery_verify_v1(int origin, TransactionId xid, int count,
 	UT_ASSERT_EQ(cold_clog_applies, 1);
 	UT_ASSERT_EQ(origin, 2);
 	UT_ASSERT_EQ(xid, 802);
-	UT_ASSERT_EQ(count, 0);
-	UT_ASSERT(children == NULL);
+	UT_ASSERT_EQ(count, cold_expected_children);
+	UT_ASSERT(count == 0
+				  ? children == NULL
+				  : children != NULL
+						&& memcmp(children, cold_child_xids, count * sizeof(TransactionId)) == 0);
 	UT_ASSERT_EQ(status,
 				 cold_abort_test ? TRANSACTION_STATUS_ABORTED : TRANSACTION_STATUS_COMMITTED);
 	UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 0);
@@ -4348,6 +4359,87 @@ done:
 	rf_side_online_plan_destroy_v1(&plan);
 }
 
+/* Insert the complete native terminal list; it records top membership, not
+ * immediate SUBTRANS parents. Keep stats/SCN and every other section intact. */
+static void
+cold_abort_children(FakeXactRecord *fake)
+{
+	uint32 offset = MinSizeOfXactAbort + sizeof(xl_xact_xinfo) + sizeof(xl_xact_dbinfo);
+	uint32 xinfo;
+	int count = lengthof(cold_child_xids);
+	uint32 added = sizeof(count) + sizeof(cold_child_xids);
+
+	memmove(fake->data + offset + added, fake->data + offset,
+			fake->u.decoded.main_data_len - offset);
+	memcpy(fake->data + offset, &count, sizeof(count));
+	memcpy(fake->data + offset + sizeof(count), cold_child_xids, sizeof(cold_child_xids));
+	memcpy(&xinfo, fake->data + MinSizeOfXactAbort, sizeof(xinfo));
+	xinfo |= XACT_XINFO_HAS_SUBXACTS;
+	memcpy(fake->data + MinSizeOfXactAbort, &xinfo, sizeof(xinfo));
+	fake->u.decoded.main_data_len += added;
+}
+
+UT_TEST(test_cold_abort_children_require_complete_supported_native_carrier)
+{
+	for (int fault = 0; fault < 12; fault++) {
+		FakeXactRecord fake;
+		RfSideXactOperationV1 operation, rejected;
+		uint8 unaligned[1024];
+		uint32 offset = MinSizeOfXactAbort + sizeof(xl_xact_xinfo) + sizeof(xl_xact_dbinfo);
+		uint32 length;
+		TransactionId bad = fault == 1	 ? FrozenTransactionId
+							: fault == 2 ? 802
+							: fault == 3 ? 674
+							: fault == 4 ? 930
+										 : 1200;
+
+		make_abort(&fake, 802);
+		fake.u.decoded.max_block_id = -1;
+		cold_abort_children(&fake);
+		length = fake.u.decoded.main_data_len;
+		if (fault >= 1 && fault <= 4)
+			memcpy(fake.data + offset + sizeof(int) + sizeof(TransactionId), &bad, sizeof(bad));
+		else if (fault == 5) {
+			int count = PG_INT32_MAX;
+			memcpy(fake.data + offset, &count, sizeof(count));
+		} else if (fault == 6)
+			fake.u.decoded.main_data_len--;
+		else if (fault == 7)
+			fake.data[fake.u.decoded.main_data_len++] = 0;
+		else if (fault == 8)
+			fake.u.decoded.max_block_id = 0;
+		else if (fault == 9) {
+			uint32 flags;
+			memcpy(&flags, fake.data + MinSizeOfXactAbort, sizeof(flags));
+			flags |= XACT_XINFO_HAS_ORIGIN;
+			memcpy(fake.data + MinSizeOfXactAbort, &flags, sizeof(flags));
+		} else if (fault == 10) {
+			int count = 0;
+			memcpy(fake.data + offset, &count, sizeof(count));
+		} else if (fault == 11) {
+			int count = -1;
+			memcpy(fake.data + offset, &count, sizeof(count));
+		}
+		memmove(unaligned + 1, fake.data, fake.u.decoded.main_data_len);
+		fake.u.decoded.main_data = (char *)unaligned + 1;
+		reset_prepare_apply();
+		UT_ASSERT(!rf_side_xact_decode_v1(&fake.reader, UINT64_C(0x11223344), 3, &rejected));
+		UT_ASSERT(!rf_side_xact_inspect_pi_v1(&fake.reader, UINT64_C(0x11223344), 3, &rejected));
+		UT_ASSERT_EQ(
+			rf_side_xact_decode_recovery_v1(&fake.reader, UINT64_C(0x11223344), 3, &operation),
+			fault == 0);
+		if (fault == 0) {
+			UT_ASSERT(operation.cold_completion_effects && !operation.pi_read_only);
+			UT_ASSERT_EQ(operation.completion_payload_length, length);
+			UT_ASSERT(rf_side_xact_cold_completion_payload_v1(&operation, unaligned + 1, length));
+			UT_ASSERT_EQ(rf_side_xact_apply_v1(&operation), RF_SIDE_XACT_APPLY_BLOCKED);
+			UT_ASSERT(
+				!rf_side_xact_cold_completion_payload_v1(&operation, unaligned + 1, length - 1));
+		}
+		UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 0);
+	}
+}
+
 UT_TEST(test_cold_lock_completion_retains_whole_native_record)
 {
 	for (int abort = 0; abort < 2; abort++)
@@ -4388,7 +4480,7 @@ UT_TEST(test_cold_lock_completion_retains_whole_native_record)
 
 UT_TEST(test_cold_lock_completion_uses_exact_tt_clog_and_native_owner)
 {
-	for (int abort = 0; abort < 2; abort++)
+	for (int variant = 0; variant < 3; variant++)
 		for (int fault = 0; fault < 15; fault++) {
 			RfSideOnlinePlanV1 *plan;
 			ClusterRecoverySerialGuard guard = { 0 };
@@ -4400,10 +4492,14 @@ UT_TEST(test_cold_lock_completion_uses_exact_tt_clog_and_native_owner)
 			PGAlignedBlock initial;
 			volatile bool caught = false;
 			RfPageProofDetailV1 result = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			bool abort = variant != 0;
+			bool children = variant == 2;
 			bool combined = fault == 4;
 			bool success = fault <= 4 || fault == 11;
 
 			cold_lock_completion(&fake, abort, combined);
+			if (children)
+				cold_abort_children(&fake);
 			if (!rf_side_xact_decode_recovery_v1(&fake.reader, UINT64_C(0x11223344), 3, &op)
 				|| !op.cold_completion_effects) {
 				UT_ASSERT(false);
@@ -4420,6 +4516,8 @@ UT_TEST(test_cold_lock_completion_uses_exact_tt_clog_and_native_owner)
 				undo_header_feed(plan, &fake, 200);
 			}
 			cold_lock_completion(&fake, abort, combined);
+			if (children)
+				cold_abort_children(&fake);
 			undo_header_feed(plan, &fake, abort ? 300 : 200);
 			UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
 			if (fault == 14) {
@@ -4444,6 +4542,7 @@ UT_TEST(test_cold_lock_completion_uses_exact_tt_clog_and_native_owner)
 			canonical_writes = canonical_syncs = 0;
 			canonical_expected_xid = 802;
 			canonical_expected_wrap = 7;
+			cold_expected_children = children ? lengthof(cold_child_xids) : 0;
 			cold_completion_test = cold_clog_test = cold_locks_test = true;
 			cold_abort_test = abort;
 			cold_cache_test = combined && !abort;
@@ -4523,6 +4622,7 @@ UT_TEST(test_cold_lock_completion_uses_exact_tt_clog_and_native_owner)
 				= cold_clog_stale_after_verify = false;
 			cold_locks_test = cold_locks_throw = cold_locks_expire = false;
 			standbyState = STANDBY_DISABLED;
+			cold_expected_children = 0;
 			canonical_expected_xid = 818;
 			canonical_expected_wrap = 8;
 			rf_side_online_plan_destroy_v1(&plan);
@@ -10310,7 +10410,8 @@ UT_TEST(test_cold_exact_abort_record_idempotence_still_requires_sync)
 
 
 static RfSideOnlinePlanV1 *
-native_abort_record_plan(bool completion, bool missing, bool conflict, bool include_future)
+native_abort_record_plan_children(bool completion, bool missing, bool conflict, bool include_future,
+								  bool children)
 {
 	RfSideOnlinePlanV1 *plan = space_online_plan(include_future ? 500 : 300);
 	FakeXactRecord fake;
@@ -10327,6 +10428,10 @@ native_abort_record_plan(bool completion, bool missing, bool conflict, bool incl
 		cold_completion_abort(&fake);
 	else
 		make_abort(&fake, 802);
+	if (children) {
+		fake.u.decoded.max_block_id = -1;
+		cold_abort_children(&fake);
+	}
 	undo_header_feed(plan, &fake, 200);
 	if (include_future) {
 		record_prefix_fpi(plan, 300, 0x31);
@@ -10338,6 +10443,12 @@ native_abort_record_plan(bool completion, bool missing, bool conflict, bool incl
 	}
 	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
 	return plan;
+}
+
+static RfSideOnlinePlanV1 *
+native_abort_record_plan(bool completion, bool missing, bool conflict, bool include_future)
+{
+	return native_abort_record_plan_children(completion, missing, conflict, include_future, false);
 }
 
 static void
@@ -10792,10 +10903,10 @@ UT_TEST(test_cold_native_commit_record_idempotence_requires_sync)
 
 UT_TEST(test_cold_selected_abort_completes_only_its_native_effects)
 {
-	for (int completion = 0; completion < 2; completion++) {
+	for (int completion = 0; completion < 4; completion++) {
 		for (int future = 0; future < 3; future++) {
-			RfSideOnlinePlanV1 *plan
-				= native_abort_record_plan(completion != 0, false, future == 2, future != 0);
+			RfSideOnlinePlanV1 *plan = native_abort_record_plan_children(
+				(completion & 1) != 0, false, future == 2, future != 0, completion >= 2);
 			ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
 			ClusterThreadRecoveryAuthorityV1 authority
 				= { .duty = &canonical_duty, .serial_guard = &guard };
@@ -10803,7 +10914,8 @@ UT_TEST(test_cold_selected_abort_completes_only_its_native_effects)
 			RfSideOnlineOperationV1 operation;
 			PGAlignedBlock header, after, zero = { 0 };
 
-			native_abort_record_open(&header, &owner, &authority, completion != 0);
+			native_abort_record_open(&header, &owner, &authority, (completion & 1) != 0);
+			cold_expected_children = completion >= 2 ? lengthof(cold_child_xids) : 0;
 			UT_ASSERT(rf_side_online_plan_operation_v1(plan, 1, &operation));
 			for (int repeat = 0; repeat < 2; repeat++) {
 				reset_prepare_apply();
@@ -10817,12 +10929,12 @@ UT_TEST(test_cold_selected_abort_completes_only_its_native_effects)
 				UT_ASSERT(canonical_syncs > 0 && cold_source_calls == 1);
 				UT_ASSERT_EQ(cold_clog_applies, 1);
 				UT_ASSERT_EQ(cold_clog_verifies, 1);
-				UT_ASSERT_EQ(cold_stats_calls, completion ? 3 : 0);
+				UT_ASSERT_EQ(cold_stats_calls, (completion & 1) ? 3 : 0);
 				UT_ASSERT_EQ(cold_cache_calls, 0);
 				UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 1);
 				UT_ASSERT(cold_source_order < cold_clog_verified_order
 						  && cold_clog_verified_order < prepare_apply.terminal_projection_order);
-				if (completion)
+				if (completion & 1)
 					UT_ASSERT(cold_clog_verified_order < cold_stats_order
 							  && cold_stats_order < prepare_apply.terminal_projection_order);
 				UT_ASSERT(pread(fileno(canonical_file), after.data, BLCKSZ, 0) == BLCKSZ);
@@ -10832,6 +10944,7 @@ UT_TEST(test_cold_selected_abort_completes_only_its_native_effects)
 				UT_ASSERT(!owner.protected_set_complete && !owner.protected_set_active
 						  && owner.undo_headers == NULL && owner.protected_plan == NULL);
 			}
+			cold_expected_children = 0;
 			native_abort_record_close(&owner);
 			rf_side_online_plan_destroy_v1(&plan);
 		}
@@ -11585,7 +11698,7 @@ UT_TEST(test_cold_compound_capture_rejects_original_origin_or_top_frame)
 int
 main(void)
 {
-	UT_PLAN(170);
+	UT_PLAN(171);
 	UT_RUN(test_cold_ctrc_record_changes_only_selected_release_bit);
 	UT_RUN(test_cold_ctrc_record_requires_prior_terminal_and_leaves_future_unapplied);
 	UT_RUN(test_cold_ctrc_record_refuses_unproved_target_before_mutation);
@@ -11653,6 +11766,7 @@ main(void)
 	UT_RUN(test_initial_ctrc_release_keeps_exact_header_transition);
 	UT_RUN(test_cold_initial_ctrc_release_installs_exact_durable_header);
 	UT_RUN(test_cold_initial_ctrc_release_preserves_failed_io_and_scope_responsibility);
+	UT_RUN(test_cold_abort_children_require_complete_supported_native_carrier);
 	UT_RUN(test_cold_lock_completion_retains_whole_native_record);
 	UT_RUN(test_cold_lock_completion_uses_exact_tt_clog_and_native_owner);
 	UT_RUN(test_cold_native_stats_retain_completion_owner);
