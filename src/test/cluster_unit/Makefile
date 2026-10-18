@@ -3306,8 +3306,10 @@ test_cluster_wal_retained_cut_records: test_cluster_wal_retained_cut_records.c u
 		$(top_srcdir)/src/backend/cluster/cluster_wal_retained_generation.c \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_retained_cut_internal.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_retained_cut.h \
-		$(RETAINED_RECORD_OBJS) $(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS)
+		$(RETAINED_RECORD_OBJS) test_cluster_cold_recovery_decode_core.o \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(RETAINED_RECORD_OBJS) \
+		$(CLUSTER_COLD_DECODE_O) \
 		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 

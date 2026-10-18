@@ -5,8 +5,9 @@
  *
  *	  The product census source is compiled into this test and linked with
  *	  the actual page route and detached preflight, the typed SIDE planner
- *	  and transaction decoder, the SPACE codecs and xactdesc parsing.  Only
- *	  the retained input scope is a fixture: it feeds decoded records built
+ *	  and transaction decoder, the cold classifier, the SPACE codecs and
+ *	  xactdesc parsing. Only the retained input scope is a fixture: it feeds
+ *	  decoded records built
  *	  from real record layouts (xl_xact_commit/abort with their xinfo
  *	  sections, xl_smgr_create/truncate, typed SPACE drops) as if read from
  *	  each source, so every classification below comes from the real
@@ -39,8 +40,10 @@
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_block_apply.h"
+#include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/storage/cluster_undo_xlog.h"
+#include "storage/proc.h"
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
@@ -52,7 +55,9 @@ UT_DEFINE_GLOBALS();
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(12);
+	UT_RUN(test_records_cold_assignment_rejects_malformed_xids);
+	UT_RUN(test_records_cold_assignment_keeps_valid_wrap_and_ownership);
 	UT_RUN(test_records_commit_tombstone_pins_its_source);
 	UT_RUN(test_records_commit_with_invalidations_is_classified);
 	UT_RUN(test_records_abort_with_relations_pins_its_source);

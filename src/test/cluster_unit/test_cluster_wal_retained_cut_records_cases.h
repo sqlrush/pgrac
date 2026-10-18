@@ -45,6 +45,106 @@ expect_cut(uint32 source, XLogRecPtr lower, ClusterWalRetainedPinV1 pin, uint32 
 	UT_ASSERT_EQ(cut.side_classes, side);
 }
 
+/* Exercise the cold classifier and original SIDE validator together. The
+ * optional SIDE capture is not the owner of native/history acceptance. */
+UT_TEST(test_records_cold_assignment_rejects_malformed_xids)
+{
+	for (int fault = 0; fault < 10; fault++) {
+		uint32 self, peer;
+		RealRecord *r;
+		PGAlignedBlock payload = { 0 };
+		xl_xact_assignment *a = (xl_xact_assignment *)payload.data;
+		uint32 length = MinSizeOfXactAssignment + 2 * sizeof(TransactionId);
+
+		rec_two_writers(&self, &peer);
+		a->xtop = 800;
+		a->nsubxacts = 2;
+		a->xsub[0] = 801;
+		a->xsub[1] = 802;
+		switch (fault) {
+		case 0:
+			a->xtop = FrozenTransactionId;
+			break;
+		case 1:
+			a->xsub[1] = a->xsub[0];
+			break;
+		case 2:
+			a->xsub[1] = 799;
+			break;
+		case 3:
+			a->xsub[1] = InvalidTransactionId;
+			break;
+		case 4:
+			a->xsub[1] = a->xtop + UINT32_C(0x80000000);
+			break;
+		case 5:
+			a->nsubxacts = 0;
+			length = MinSizeOfXactAssignment;
+			break;
+		case 6:
+			a->nsubxacts = PGPROC_MAX_CACHED_SUBXIDS + 1;
+			for (int i = 0; i < a->nsubxacts; i++)
+				a->xsub[i] = 801 + i;
+			length = MinSizeOfXactAssignment + a->nsubxacts * sizeof(TransactionId);
+			break;
+		case 7:
+			length--;
+			break;
+		case 8:
+			length++;
+			break;
+		case 9:
+			a->nsubxacts = -1;
+			break;
+		}
+		r = record_new(self, RM_XACT_ID, XLOG_XACT_ASSIGNMENT, InvalidTransactionId, 0x2000,
+					   0x2100);
+		record_append(r, payload.data, length);
+		UT_ASSERT(!rf_side_xact_assignment_preflight_v1(r->data, length));
+		for (int foreign = 0; foreign < 2; foreign++) {
+			ClusterColdDecodedV1 decoded = { 0 };
+			ClusterColdDetailV1 detail = cluster_cold_recovery_decode_v1(
+				&r->reader, REC_SYSID, items[self].source.claim.identity.storage_uuid, false,
+				foreign, &decoded);
+
+			cluster_cold_decoded_release_v1(&decoded);
+			if (detail != CLUSTER_COLD_COMPONENT_INVALID)
+				printf("# assignment fault %d foreign %d accepted as %d\n", fault, foreign, detail);
+			UT_ASSERT_EQ(detail, CLUSTER_COLD_COMPONENT_INVALID);
+		}
+	}
+}
+
+UT_TEST(test_records_cold_assignment_keeps_valid_wrap_and_ownership)
+{
+	for (int wrap = 0; wrap < 2; wrap++) {
+		uint32 self, peer;
+		RealRecord *r;
+		xl_xact_assignment a = { wrap ? UINT32_MAX - 1 : 800, 3 };
+		TransactionId children[3] = { wrap ? UINT32_MAX : 801, wrap ? 3 : 802, wrap ? 4 : 803 };
+
+		rec_two_writers(&self, &peer);
+		r = record_new(self, RM_XACT_ID, XLOG_XACT_ASSIGNMENT, InvalidTransactionId, 0x2000,
+					   0x2100);
+		record_append(r, &a, MinSizeOfXactAssignment);
+		record_append(r, children, sizeof(children));
+		/* The original retained input need not be aligned. */
+		memmove(r->data + 1, r->data, r->reader.record->main_data_len);
+		r->reader.record->main_data = (char *)r->data + 1;
+		for (int foreign = 0; foreign < 2; foreign++) {
+			ClusterColdDecodedV1 decoded = { 0 };
+
+			UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(
+							 &r->reader, REC_SYSID, items[self].source.claim.identity.storage_uuid,
+							 false, foreign, &decoded),
+						 CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(decoded.record.record_flags,
+						 foreign ? CLUSTER_COLD_RECORD_FOREIGN_SIDE : 0);
+			cluster_cold_decoded_release_v1(&decoded);
+		}
+	}
+}
+
 /* A COMMIT whose typed tombstones the SIDE decoder accepts: the DROP ends an
  * incarnation, so in history it holds its source (CR20).  The same COMMIT
  * still an obligation, or a plain COMMIT in history, holds nothing (no

@@ -265,8 +265,10 @@ cold_xact_flags(XLogReaderState *reader, uint64 system_identifier, const uint8 s
 		return CLUSTER_COLD_OK;
 	}
 	case XLOG_XACT_ASSIGNMENT:
-		if (!cold_counted_shape(reader, MinSizeOfXactAssignment,
-								offsetof(xl_xact_assignment, nsubxacts), sizeof(TransactionId)))
+		/* Native/history acceptance must validate the original top/child
+		 * set itself; a rejected optional SIDE capture cannot do it later. */
+		if (!rf_side_xact_assignment_preflight_v1((const uint8 *)XLogRecGetData(reader),
+												  XLogRecGetDataLen(reader)))
 			return CLUSTER_COLD_COMPONENT_INVALID;
 		*effects |= CLUSTER_COLD_EFFECT_CHILDREN;
 		return CLUSTER_COLD_OK;

@@ -100,6 +100,16 @@ ParseCommitRecord(uint8 info, xl_xact_commit *xlrec, Size len, xl_xact_parsed_co
  * test_cluster_wal_retained_cut_records; here only its verdict is used. */
 static bool abort_shape_ok;
 
+/* The original assignment validator is linked with real records in
+ * test_cluster_wal_retained_cut_records; no assignment is mocked here. */
+bool
+rf_side_xact_assignment_preflight_v1(const uint8 *payload, uint32 length)
+{
+	(void)payload;
+	(void)length;
+	abort();
+}
+
 bool
 rf_side_xact_completion_shape_v1(XLogReaderState *record, bool commit)
 {
