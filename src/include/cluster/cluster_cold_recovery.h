@@ -540,6 +540,19 @@ typedef struct ClusterColdEffectRoutesV1 {
 	uint32 refused;
 } ClusterColdEffectRoutesV1;
 
+/* Original-thread native cold-replay counter inputs, applied in this order:
+ * advance past record_xid, advance past payload_xid (if present), then apply
+ * checkpoint_next_xid as an ONLINE minimum or a SHUTDOWN exact value.
+ * complete only describes this record's inputs. It proves no replay cut,
+ * per-thread endpoint, allocator authority, FullXid epoch or loser identity. */
+typedef struct ClusterColdXidInputV1 {
+	TransactionId record_xid;
+	TransactionId payload_xid;
+	uint64 checkpoint_next_xid; /* Native FullTransactionId value; zero if absent. */
+	bool checkpoint_shutdown;
+	bool complete;
+} ClusterColdXidInputV1;
+
 /*
  * One native record mapped to plan input by the shared closed route
  * registry.  record.components points into components[] and
@@ -552,6 +565,7 @@ typedef struct ClusterColdDecodedV1 {
 	ClusterColdRecordV1 record;
 	ClusterColdComponentV1 components[CLUSTER_COLD_MAX_COMPONENTS];
 	ClusterColdEffectRoutesV1 effects;
+	ClusterColdXidInputV1 xid_input;
 	/* Borrowed from this decode only; capture before advancing the reader. */
 	RfDetachedRecordPlanV1 detached;
 	uint8 route_owner;	/* RfRecordRouteOwnerV1 */

@@ -145,6 +145,253 @@ UT_TEST(test_records_cold_assignment_keeps_valid_wrap_and_ownership)
 	}
 }
 
+static ClusterColdDetailV1
+rec_counter_decode(RealRecord *r, bool foreign, ClusterColdDecodedV1 *decoded)
+{
+	r->reader.cluster_expected_thread_id
+		= items[r->source].source.claim.identity.origin_thread_id;
+	return cluster_cold_recovery_decode_v1(&r->reader, REC_SYSID,
+										 items[r->source].source.claim.identity.storage_uuid,
+										 false, foreign, decoded);
+}
+
+UT_TEST(test_records_cold_terminal_counter_inputs)
+{
+	for (int abort_record = 0; abort_record < 2; abort_record++) {
+		for (int wrap = 0; wrap < 2; wrap++) {
+			uint32 self, peer;
+			TransactionId top = wrap ? UINT32_MAX - 2 : 800;
+			TransactionId children[3] = { wrap ? 4 : 803, wrap ? UINT32_MAX : 801,
+										 wrap ? 3 : 802 };
+			int count = lengthof(children);
+			RealRecord *r;
+			xl_xact_xinfo xinfo;
+			Size offset = (abort_record ? MinSizeOfXactAbort : MinSizeOfXactCommit)
+						  + sizeof(xinfo);
+			Size extra = sizeof(count) + sizeof(children);
+
+			rec_two_writers(&self, &peer);
+			r = abort_record ? rec_abort(self, 0x2000, 0x2100, top, NULL, 0)
+							 : rec_commit(self, 0x2000, 0x2100, top, NULL, 0, false, 0);
+			memcpy(&xinfo, r->data + offset - sizeof(xinfo), sizeof(xinfo));
+			xinfo.xinfo |= XACT_XINFO_HAS_SUBXACTS;
+			memcpy(r->data + offset - sizeof(xinfo), &xinfo, sizeof(xinfo));
+			memmove(r->data + offset + extra, r->data + offset,
+					r->u.decoded.main_data_len - offset);
+			memcpy(r->data + offset, &count, sizeof(count));
+			memcpy(r->data + offset + sizeof(count), children, sizeof(children));
+			r->u.decoded.main_data_len += extra;
+			/* Original readers need not supply aligned main data. */
+			memmove(r->data + 1, r->data, r->u.decoded.main_data_len);
+			r->u.decoded.main_data = (char *)r->data + 1;
+			for (int foreign = 0; foreign < 2; foreign++) {
+				ClusterColdDecodedV1 decoded = { 0 };
+
+				UT_ASSERT_EQ(rec_counter_decode(r, foreign, &decoded), CLUSTER_COLD_OK);
+				UT_ASSERT(decoded.xid_input.complete);
+				UT_ASSERT_EQ(decoded.xid_input.record_xid, top);
+				UT_ASSERT_EQ(decoded.xid_input.payload_xid, wrap ? 4 : 803);
+				UT_ASSERT_EQ(decoded.xid_input.checkpoint_next_xid, 0);
+				/* Child terminal effects still lack a foreign record-local
+				 * consumer; counter evidence cannot supply that owner. */
+				UT_ASSERT_EQ(decoded.record.record_flags,
+							 foreign ? CLUSTER_COLD_RECORD_SIDE_UNOWNED : 0);
+				cluster_cold_decoded_release_v1(&decoded);
+			}
+		}
+	}
+}
+
+UT_TEST(test_records_cold_multixact_counter_inputs)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		bool wrap = variant == 1;
+		uint32 self, peer;
+		xl_multixact_create header = { 1, 1, 3 };
+		MultiXactMember members[3] = {
+			{ wrap ? 4 : 903, MultiXactStatusForShare },
+			{ wrap ? UINT32_MAX : 901, MultiXactStatusForKeyShare },
+			{ wrap ? 3 : 902, MultiXactStatusForUpdate }
+		};
+		TransactionId xid = variant == 2 ? InvalidTransactionId
+											: (variant == 3 ? 1000 : (wrap ? UINT32_MAX - 2 : 900));
+		RealRecord *r;
+
+		rec_two_writers(&self, &peer);
+		r = record_new(self, RM_MULTIXACT_ID, XLOG_MULTIXACT_CREATE_ID, xid, 0x2000, 0x2100);
+		record_append(r, &header, SizeOfMultiXactCreate);
+		record_append(r, members, sizeof(members));
+		memmove(r->data + 1, r->data, r->u.decoded.main_data_len);
+		r->u.decoded.main_data = (char *)r->data + 1;
+		for (int foreign = 0; foreign < 2; foreign++) {
+			ClusterColdDecodedV1 decoded = { 0 };
+
+			UT_ASSERT_EQ(rec_counter_decode(r, foreign, &decoded), CLUSTER_COLD_OK);
+			UT_ASSERT(decoded.xid_input.complete);
+			UT_ASSERT_EQ(decoded.xid_input.record_xid, xid);
+			UT_ASSERT_EQ(decoded.xid_input.payload_xid, variant == 3 ? 1000 : (wrap ? 4 : 903));
+			UT_ASSERT_EQ(decoded.record.record_flags,
+						 foreign ? CLUSTER_COLD_RECORD_FOREIGN_SIDE : 0);
+			cluster_cold_decoded_release_v1(&decoded);
+		}
+	}
+}
+
+UT_TEST(test_records_cold_checkpoint_counter_inputs)
+{
+	for (int shutdown = 0; shutdown < 2; shutdown++) {
+		uint32 self, peer;
+		CheckPoint checkpoint = { 0 };
+		RealRecord *r;
+
+		rec_two_writers(&self, &peer);
+		checkpoint.nextXid = FullTransactionIdFromEpochAndXid(7, 50);
+		r = record_new(self, RM_XLOG_ID,
+					   shutdown ? XLOG_CHECKPOINT_SHUTDOWN : XLOG_CHECKPOINT_ONLINE,
+					   InvalidTransactionId, 0x2000, 0x2100);
+		record_append(r, &checkpoint, sizeof(checkpoint));
+		memmove(r->data + 1, r->data, r->u.decoded.main_data_len);
+		r->u.decoded.main_data = (char *)r->data + 1;
+		for (int foreign = 0; foreign < 2; foreign++) {
+			ClusterColdDecodedV1 decoded = { 0 };
+
+			UT_ASSERT_EQ(rec_counter_decode(r, foreign, &decoded), CLUSTER_COLD_OK);
+			UT_ASSERT(decoded.xid_input.complete);
+			UT_ASSERT_EQ(decoded.xid_input.record_xid, InvalidTransactionId);
+			UT_ASSERT_EQ(decoded.xid_input.payload_xid, InvalidTransactionId);
+			UT_ASSERT_EQ(decoded.xid_input.checkpoint_next_xid,
+						 U64FromFullTransactionId(checkpoint.nextXid));
+			UT_ASSERT_EQ(decoded.xid_input.checkpoint_shutdown, shutdown);
+			UT_ASSERT_EQ(decoded.record.record_flags,
+						 foreign ? CLUSTER_COLD_RECORD_FOREIGN_CONTROL : 0);
+			cluster_cold_decoded_release_v1(&decoded);
+		}
+	}
+}
+
+UT_TEST(test_records_cold_counter_header_and_assignment)
+{
+	uint32 self, peer;
+	xl_xact_assignment assignment = { 800, 1 };
+	TransactionId child = 900;
+	RealRecord *r;
+	ClusterColdDecodedV1 decoded = { 0 };
+
+	rec_two_writers(&self, &peer);
+	r = record_new(self, RM_XLOG_ID, XLOG_NOOP, 700, 0x2000, 0x2100);
+	UT_ASSERT_EQ(rec_counter_decode(r, false, &decoded), CLUSTER_COLD_OK);
+	UT_ASSERT(decoded.xid_input.complete);
+	UT_ASSERT_EQ(decoded.xid_input.record_xid, 700);
+	UT_ASSERT_EQ(decoded.xid_input.payload_xid, InvalidTransactionId);
+	cluster_cold_decoded_release_v1(&decoded);
+	r = record_new(self, RM_XACT_ID, XLOG_XACT_ASSIGNMENT, InvalidTransactionId, 0x2200, 0x2300);
+	record_append(r, &assignment, MinSizeOfXactAssignment);
+	record_append(r, &child, sizeof(child));
+	for (int foreign = 0; foreign < 2; foreign++) {
+		UT_ASSERT_EQ(rec_counter_decode(r, foreign, &decoded), CLUSTER_COLD_OK);
+		UT_ASSERT(decoded.xid_input.complete);
+		UT_ASSERT_EQ(decoded.xid_input.record_xid, InvalidTransactionId);
+		/* The assignment's cache population is hot-standby-only. */
+		UT_ASSERT_EQ(decoded.xid_input.payload_xid, InvalidTransactionId);
+		cluster_cold_decoded_release_v1(&decoded);
+	}
+	{
+		xl_running_xacts running = { 0 };
+
+		running.xcnt = 1;
+		running.nextXid = 5000;
+		running.oldestRunningXid = 800;
+		running.latestCompletedXid = 799;
+		r = record_new(self, RM_STANDBY_ID, XLOG_RUNNING_XACTS, InvalidTransactionId,
+					   0x2400, 0x2500);
+		record_append(r, &running, offsetof(xl_running_xacts, xids));
+		record_append(r, &child, sizeof(child));
+		for (int foreign = 0; foreign < 2; foreign++) {
+			UT_ASSERT_EQ(rec_counter_decode(r, foreign, &decoded), CLUSTER_COLD_OK);
+			UT_ASSERT(decoded.xid_input.complete);
+			UT_ASSERT_EQ(decoded.xid_input.record_xid, InvalidTransactionId);
+			UT_ASSERT_EQ(decoded.xid_input.payload_xid, InvalidTransactionId);
+			UT_ASSERT_EQ(decoded.xid_input.checkpoint_next_xid, 0);
+			cluster_cold_decoded_release_v1(&decoded);
+		}
+	}
+}
+
+UT_TEST(test_records_cold_counter_incomplete_clears_inputs)
+{
+	uint32 self, peer;
+	ClusterColdDecodedV1 decoded = { 0 };
+	CheckPoint checkpoint = { 0 };
+	RealRecord *r;
+
+	rec_two_writers(&self, &peer);
+	r = record_new(self, RM_XLOG_ID, XLOG_NOOP, 700, 0x2000, 0x2100);
+	UT_ASSERT_EQ(rec_counter_decode(r, false, &decoded), CLUSTER_COLD_OK);
+	UT_ASSERT(decoded.xid_input.complete);
+	/* Existing native classification stays unchanged. A short counter
+	 * payload must nevertheless never furnish complete counter inputs. */
+	r = record_new(self, RM_XLOG_ID, XLOG_CHECKPOINT_ONLINE, 0, 0x2200, 0x2300);
+	record_append(r, &checkpoint, sizeof(checkpoint) - 1);
+	UT_ASSERT_EQ(rec_counter_decode(r, false, &decoded), CLUSTER_COLD_OK);
+	UT_ASSERT(!decoded.xid_input.complete);
+	UT_ASSERT_EQ(decoded.xid_input.checkpoint_next_xid, 0);
+	r->u.decoded.main_data_len++;
+	/* A full checkpoint with an invalid nextXid is also unavailable. */
+	UT_ASSERT_EQ(rec_counter_decode(r, false, &decoded), CLUSTER_COLD_OK);
+	UT_ASSERT(!decoded.xid_input.complete);
+	UT_ASSERT_EQ(decoded.xid_input.record_xid, InvalidTransactionId);
+	for (int fault = 0; fault < 8; fault++) {
+		xl_multixact_create header = { 1, 1, 2 };
+		MultiXactMember members[2] = { { 801, MultiXactStatusForShare },
+									   { 802, MultiXactStatusForUpdate } };
+		uint8 extra = 0;
+
+		switch (fault) {
+		case 0:
+			header.nmembers = -1;
+			break;
+		case 1:
+			header.nmembers = 0;
+			break;
+		case 2:
+			members[1].xid = FrozenTransactionId;
+			break;
+		case 3:
+			members[1].status = MaxMultiXactStatus + 1;
+			break;
+		case 5:
+			header.mid = InvalidMultiXactId;
+			break;
+		case 6:
+			header.moff = 0;
+			break;
+		}
+		r = record_new(self, RM_MULTIXACT_ID, XLOG_MULTIXACT_CREATE_ID, 800,
+					   0x2400, 0x2500);
+		record_append(r, &header, SizeOfMultiXactCreate);
+		record_append(r, members, sizeof(members));
+		if (fault == 4)
+			r->u.decoded.main_data_len--;
+		if (fault == 7)
+			record_append(r, &extra, sizeof(extra));
+		UT_ASSERT_EQ(rec_counter_decode(r, false, &decoded), CLUSTER_COLD_OK);
+		UT_ASSERT(!decoded.xid_input.complete);
+		UT_ASSERT_EQ(decoded.xid_input.record_xid, InvalidTransactionId);
+		UT_ASSERT_EQ(decoded.xid_input.payload_xid, InvalidTransactionId);
+	}
+	r = record_new(self, RM_XACT_ID, XLOG_XACT_PREPARE, 800, 0x2400, 0x2500);
+	UT_ASSERT_EQ(rec_counter_decode(r, false, &decoded), CLUSTER_COLD_OK);
+	UT_ASSERT(!decoded.xid_input.complete);
+	UT_ASSERT_EQ(decoded.xid_input.payload_xid, InvalidTransactionId);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(NULL, REC_SYSID,
+												  items[self].source.claim.identity.storage_uuid,
+												  false, false, &decoded),
+				 CLUSTER_COLD_INVALID_ARGUMENT);
+	UT_ASSERT(!decoded.xid_input.complete);
+	UT_ASSERT_EQ(decoded.xid_input.record_xid, InvalidTransactionId);
+	cluster_cold_decoded_release_v1(&decoded);
+}
+
 /* A COMMIT whose typed tombstones the SIDE decoder accepts: the DROP ends an
  * incarnation, so in history it holds its source (CR20).  The same COMMIT
  * still an obligation, or a plain COMMIT in history, holds nothing (no

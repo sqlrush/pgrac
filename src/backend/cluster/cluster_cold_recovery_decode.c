@@ -649,6 +649,100 @@ cold_effect_routes(const RfDetachedRecordPlanV1 *plan, uint32 required, ClusterC
 		routes->native_apply = remaining;
 }
 
+/* TransactionIdLatest's reverse scan and native wrap-aware comparison,
+ * reading bounded children without assuming main-data alignment. Invalid
+ * raw XIDs cannot furnish a counter input. This does not classify losers. */
+static bool
+cold_counter_latest(TransactionId xid, int count, const TransactionId *children,
+					TransactionId *latest)
+{
+	if (!TransactionIdIsNormal(xid))
+		return false;
+	*latest = xid;
+	while (--count >= 0) {
+		TransactionId child;
+
+		memcpy(&child, (const char *)children + (Size)count * sizeof(child), sizeof(child));
+		if (!TransactionIdIsNormal(child))
+			return false;
+		if (NormalTransactionIdPrecedes(*latest, child))
+			*latest = child;
+	}
+	return true;
+}
+
+/* Describe the original thread's native cold-replay counter effects. The
+ * founder deliberately does not apply foreign inputs to its own allocator.
+ * Record-local completeness is independent of effect ownership: an unowned
+ * terminal's inputs never close its missing consumer or prove an endpoint. */
+static void
+cold_xid_input(XLogReaderState *reader, ClusterColdDecodedV1 *out)
+{
+	ClusterColdXidInputV1 input = { 0 };
+	uint8 rmid = XLogRecGetRmid(reader);
+	uint8 info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+
+	if (out->record.record_flags
+		& (CLUSTER_COLD_RECORD_UNSUPPORTED | CLUSTER_COLD_RECORD_STRUCTURAL))
+		return;
+	input.record_xid = XLogRecGetXid(reader);
+	if (rmid == RM_XACT_ID && (info & XLOG_XACT_OPMASK) == XLOG_XACT_COMMIT) {
+		xl_xact_parsed_commit parsed;
+
+		if (!ParseCommitRecord(XLogRecGetInfo(reader), (xl_xact_commit *)XLogRecGetData(reader),
+							   XLogRecGetDataLen(reader), &parsed)
+			|| !cold_counter_latest(input.record_xid, parsed.nsubxacts, parsed.subxacts,
+									&input.payload_xid))
+			return;
+	} else if (rmid == RM_XACT_ID && (info & XLOG_XACT_OPMASK) == XLOG_XACT_ABORT) {
+		xl_xact_parsed_abort parsed;
+
+		/* cold_xact_flags has already bounded every section. */
+		ParseAbortRecord(XLogRecGetInfo(reader), (xl_xact_abort *)XLogRecGetData(reader), &parsed);
+		if (!cold_counter_latest(input.record_xid, parsed.nsubxacts, parsed.subxacts,
+								 &input.payload_xid))
+			return;
+	} else if (rmid == RM_MULTIXACT_ID && info == XLOG_MULTIXACT_CREATE_ID) {
+		xl_multixact_create header;
+
+		if (!cold_counted_shape(reader, SizeOfMultiXactCreate,
+								offsetof(xl_multixact_create, nmembers), sizeof(MultiXactMember)))
+			return;
+		memcpy(&header, XLogRecGetData(reader), SizeOfMultiXactCreate);
+		if (header.nmembers <= 0 || !MultiXactIdIsValid(header.mid) || header.moff == 0)
+			return;
+		input.payload_xid = input.record_xid;
+		for (int i = 0; i < header.nmembers; i++) {
+			MultiXactMember member;
+
+			memcpy(&member, XLogRecGetData(reader) + SizeOfMultiXactCreate
+							+ (Size)i * sizeof(member),
+				   sizeof(member));
+			if (!TransactionIdIsNormal(member.xid) || member.status < MultiXactStatusForKeyShare
+				|| member.status > MaxMultiXactStatus)
+				return;
+			if (!TransactionIdIsNormal(input.payload_xid)
+				|| NormalTransactionIdPrecedes(input.payload_xid, member.xid))
+				input.payload_xid = member.xid;
+		}
+	} else if (rmid == RM_XLOG_ID
+			   && (info == XLOG_CHECKPOINT_SHUTDOWN || info == XLOG_CHECKPOINT_ONLINE)) {
+		CheckPoint checkpoint;
+
+		if (XLogRecGetData(reader) == NULL || XLogRecGetDataLen(reader) != sizeof(checkpoint))
+			return;
+		memcpy(&checkpoint, XLogRecGetData(reader), sizeof(checkpoint));
+		if (!TransactionIdIsNormal(XidFromFullTransactionId(checkpoint.nextXid)))
+			return;
+		input.checkpoint_next_xid = U64FromFullTransactionId(checkpoint.nextXid);
+		input.checkpoint_shutdown = info == XLOG_CHECKPOINT_SHUTDOWN;
+	}
+	/* Assignment and standby cache population are hot-standby-only. All
+	 * other admitted cold records advance only past their header xid. */
+	input.complete = true;
+	out->xid_input = input;
+}
+
 ClusterColdDetailV1
 cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_identifier,
 								const uint8 storage_uuid[16], bool space_active, bool foreign,
@@ -717,6 +811,7 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 	if (detail == CLUSTER_COLD_OK) {
 		cold_effect_routes(&plan, effects, out);
 		out->detached = plan;
+		cold_xid_input(reader, out);
 	}
 	return detail;
 }

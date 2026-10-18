@@ -37,6 +37,9 @@
 #include "../../backend/cluster/cluster_wal_retained_generation.c"
 
 #include "access/xact.h"
+#include "access/multixact.h"
+#include "access/xlog_internal.h"
+#include "catalog/pg_control.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_block_apply.h"
@@ -44,6 +47,7 @@
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "storage/proc.h"
+#include "storage/standbydefs.h"
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
@@ -55,7 +59,12 @@ UT_DEFINE_GLOBALS();
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(17);
+	UT_RUN(test_records_cold_terminal_counter_inputs);
+	UT_RUN(test_records_cold_multixact_counter_inputs);
+	UT_RUN(test_records_cold_checkpoint_counter_inputs);
+	UT_RUN(test_records_cold_counter_header_and_assignment);
+	UT_RUN(test_records_cold_counter_incomplete_clears_inputs);
 	UT_RUN(test_records_cold_assignment_rejects_malformed_xids);
 	UT_RUN(test_records_cold_assignment_keeps_valid_wrap_and_ownership);
 	UT_RUN(test_records_commit_tombstone_pins_its_source);
