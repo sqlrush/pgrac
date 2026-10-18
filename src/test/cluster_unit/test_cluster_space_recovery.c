@@ -3709,6 +3709,106 @@ UT_TEST(test_cold_abort_before_hook_requires_full_proof_and_upfront_budget)
 	}
 }
 
+UT_TEST(test_cold_abort_per_source_preflight_and_delete_keep_complete_owner)
+{
+	for (int advance = 0; advance < 2; advance++) {
+		uint32 index = abort_create_installed(advance);
+		unsigned prior_syncs = create_source_syncs, prior_writes = writes;
+
+		UT_ASSERT_EQ(abort_create_plan_sources(advance, true, false, true), index);
+		UT_ASSERT_EQ(rf_side_online_plan_participant_count_v1(side), 1);
+		/* An original retained claim does not become a physical participant. */
+		UT_ASSERT(!rf_side_online_plan_recovery_claim_matches_v1(side, &source_claims[1]));
+		UT_ASSERT(cluster_space_recovery_cold_abort_preflight_v1(side, index, 0));
+		UT_ASSERT_EQ(create_source_syncs, prior_syncs);
+		UT_ASSERT_EQ(writes, prior_writes);
+		UT_ASSERT(cluster_space_recovery_cold_abort_delete_v1(side, index));
+		UT_ASSERT_EQ(create_source_syncs, prior_syncs + 1);
+		UT_ASSERT_EQ(source_sync_mask, 1);
+		UT_ASSERT_EQ(abort_deletes, 1);
+		UT_ASSERT_EQ(abort_directory_syncs, 1);
+		UT_ASSERT(cluster_space_recovery_cold_abort_result_v1(side, index, 0));
+		UT_ASSERT(!cluster_space_recovery_cold_abort_delete_v1(side, index));
+		UT_ASSERT_EQ(abort_deletes, 1);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_per_source_finish_preserves_native_callback_order)
+{
+	for (int advance = 0; advance < 2; advance++) {
+		uint32 index = abort_create_installed(advance);
+		AbortFinishExpected expected;
+
+		UT_ASSERT_EQ(abort_create_plan_sources(advance, true, false, true), index);
+		expected = (AbortFinishExpected){ side, index };
+		UT_ASSERT(cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected,
+															  abort_before, abort_finish));
+		UT_ASSERT_EQ(abort_before_calls, 1);
+		UT_ASSERT_EQ(abort_finishes, 1);
+		UT_ASSERT_EQ(abort_deletes, 1);
+		UT_ASSERT_EQ(abort_directory_syncs, 1);
+		UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected,
+															   abort_before, abort_finish));
+		UT_ASSERT_EQ(abort_before_calls, 1);
+		UT_ASSERT_EQ(abort_finishes, 1);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_per_source_refuses_unbound_owner_or_physical_cut_before_sync)
+{
+	for (int fault = 0; fault < 16; fault++) {
+		uint32 index = abort_create_installed(true);
+		unsigned prior_syncs = create_source_syncs, prior_writes = writes;
+		AbortFinishExpected expected;
+
+		UT_ASSERT_EQ(abort_create_plan_sources(true, true, false, true), index);
+		expected = (AbortFinishExpected){ side, index };
+		if (fault == 0)
+			serials[1].held = false;
+		if (fault == 1)
+			duties[1].origin_owner_incarnation++;
+		if (fault == 2)
+			source_claims[1].claim.claim_sha256[0]++;
+		if (fault == 3)
+			source_claims[1].claim.max_config_generation++;
+		if (fault == 4)
+			duties[1].authority_uuid[0]++;
+		if (fault == 5)
+			duties[1].root_lineage_seq++;
+		if (fault == 6)
+			duties[1].thread_claim_created_at++;
+		if (fault == 7)
+			duties[1].thread_claim_crc32c++;
+		if (fault == 8)
+			source_redo[1] = 201;
+		if (fault == 9)
+			roots[0].checkpoint_lower_lsn = 90;
+		if (fault == 10)
+			source_redo[0] = 110;
+		if (fault == 11)
+			cold_window = false;
+		if (fault == 12)
+			roots[1].checkpoint_tli++;
+		if (fault == 13)
+			source_database[1]++;
+		if (fault == 14)
+			roots[0].validated_tail_lsn_exclusive = 240;
+		if (fault == 15)
+			cold_current = false;
+		roots[1].identity = serials[1].duty = duties[1];
+		UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected,
+															   abort_before, abort_finish));
+		UT_ASSERT_EQ(create_source_syncs, prior_syncs);
+		UT_ASSERT_EQ(writes, prior_writes);
+		UT_ASSERT_EQ(abort_before_calls + abort_deletes + abort_directory_syncs + abort_finishes,
+					 0);
+		UT_ASSERT(exists && main_exists);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
 UT_TEST(test_cold_abort_finish_holds_original_owner_after_durable_native_result)
 {
 	for (int advance = 0; advance < 2; advance++) {
@@ -4287,7 +4387,7 @@ UT_TEST(test_cold_abort_preflight_io_error_unwinds_original_owner_for_retry)
 int
 main(void)
 {
-	UT_PLAN(98);
+	UT_PLAN(101);
 	UT_RUN(test_cold_final_abort_binds_original_input_before_result_check);
 	UT_RUN(test_cold_final_abort_accepts_actual_per_source_capture);
 	UT_RUN(test_cold_final_per_source_capture_keeps_complete_owner_and_exact_cut);
@@ -4310,6 +4410,9 @@ main(void)
 	UT_RUN(test_cold_abort_before_hook_precedes_unlink_under_original_owner);
 	UT_RUN(test_cold_abort_before_refusal_drift_or_error_prevents_unlink);
 	UT_RUN(test_cold_abort_before_hook_requires_full_proof_and_upfront_budget);
+	UT_RUN(test_cold_abort_per_source_preflight_and_delete_keep_complete_owner);
+	UT_RUN(test_cold_abort_per_source_finish_preserves_native_callback_order);
+	UT_RUN(test_cold_abort_per_source_refuses_unbound_owner_or_physical_cut_before_sync);
 	UT_RUN(test_cold_abort_finish_holds_original_owner_after_durable_native_result);
 	UT_RUN(test_cold_abort_finish_reserves_scratch_and_requires_callback_before_mutation);
 	UT_RUN(test_cold_abort_finish_never_runs_before_complete_source_and_physical_result);
