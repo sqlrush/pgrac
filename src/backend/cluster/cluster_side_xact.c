@@ -519,11 +519,12 @@ rf_side_standby_invalidation_preflight_v1(const uint8 *payload, uint32 length)
 	return valid;
 }
 
-static bool
-side_xact_tt_delta_valid(const xl_xact_tt_commit *delta, uint16 origin_thread, TransactionId xid,
-						 SCN scn)
+bool
+rf_side_xact_tt_commit_preflight_v1(const xl_xact_tt_commit *delta, uint16 origin_thread,
+									TransactionId xid, SCN scn)
 {
-	return delta != NULL && delta->instance == origin_thread && delta->segment_id != 0
+	return delta != NULL && origin_thread > 0 && origin_thread <= 128 && TransactionIdIsNormal(xid)
+		   && SCN_VALID(scn) && delta->instance == origin_thread && delta->segment_id != 0
 		   && ((delta->segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1 == origin_thread
 		   && delta->segment_generation != UINT32_MAX && delta->slot_offset < TT_SLOTS_PER_SEGMENT
 		   && delta->wrap != TT_WRAP_INVALID && delta->xid == xid
@@ -695,8 +696,9 @@ side_xact_structural_preflight(const RfSideXactOperationV1 *operation, bool pi_r
 	case RF_SIDE_XACT_COMMIT:
 		return SCN_VALID(operation->terminal_scn) && operation->terminal_timestamp != 0
 			   && operation->has_tt_delta
-			   && side_xact_tt_delta_valid(&operation->tt_delta, operation->origin_thread,
-										   operation->xid, operation->terminal_scn)
+			   && rf_side_xact_tt_commit_preflight_v1(&operation->tt_delta,
+													  operation->origin_thread, operation->xid,
+													  operation->terminal_scn)
 			   && binding_seen == 0 && operation->prepared_owner == InvalidOid
 			   && operation->prepare_payload_length == 0 && operation->prepared_at == 0
 			   && operation->prepare_gid[0] == '\0';
@@ -788,7 +790,8 @@ side_xact_decode(XLogReaderState *record, uint64 system_identifier, uint16 origi
 				&& !rf_side_xact_children_preflight_v1(xid, parsed.nsubxacts, parsed.subxacts))
 			|| (parsed.xinfo & XACT_XINFO_HAS_TWOPHASE) != 0 || !SCN_VALID(parsed.scn)
 			|| side_xact_commit_timestamp(&parsed) == 0 || !parsed.has_tt_commit
-			|| !side_xact_tt_delta_valid(&parsed.tt_commit, origin_thread, xid, parsed.scn))
+			|| !rf_side_xact_tt_commit_preflight_v1(&parsed.tt_commit, origin_thread, xid,
+													parsed.scn))
 			return false;
 		candidate.kind = RF_SIDE_XACT_COMMIT;
 		candidate.xid = xid;

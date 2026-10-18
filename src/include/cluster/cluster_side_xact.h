@@ -91,6 +91,10 @@ extern bool rf_side_xact_completion_shape_v1(XLogReaderState *record, bool commi
  * its XID half-circle. This proves neither immediate parents nor replay authority. */
 extern bool rf_side_xact_children_preflight_v1(TransactionId top, int count,
 											   const TransactionId *children);
+/* A folded TT commit identifies an exact physical owner and carries the
+ * same normal xid and valid SCN as its native commit. No replay authority. */
+extern bool rf_side_xact_tt_commit_preflight_v1(const xl_xact_tt_commit *delta,
+												uint16 origin_thread, TransactionId xid, SCN scn);
 
 typedef enum RfSideXactApplyResultV1 {
 	RF_SIDE_XACT_APPLY_OK = 0,

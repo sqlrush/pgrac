@@ -128,6 +128,19 @@ rf_side_xact_children_preflight_v1(TransactionId top, int count, const Transacti
 	return true;
 }
 
+bool
+rf_side_xact_tt_commit_preflight_v1(const xl_xact_tt_commit *delta, uint16 origin_thread,
+									TransactionId xid, SCN scn)
+{
+	/* Real TT carriers are exercised in the effects test. This parser stub
+	 * never supplies a folded TT delta. */
+	(void)delta;
+	(void)origin_thread;
+	(void)xid;
+	(void)scn;
+	abort();
+}
+
 void
 ParseAbortRecord(uint8 info, xl_xact_abort *xlrec, xl_xact_parsed_abort *parsed)
 {

@@ -1027,6 +1027,159 @@ UT_TEST(test_folded_tt_unknown_format_is_not_native_apply)
 	}
 }
 
+static void
+check_bad_terminal_tt_delta(bool foreign)
+{
+	for (int field = 0; field < 16; field++) {
+		EffectRecord r;
+		ClusterColdDecodedV1 out = { 0 };
+		xl_xact_tt_commit tt;
+		bool missing_scn = field == 13 || field == 14;
+		Size offset
+			= MinSizeOfXactCommit + sizeof(xl_xact_xinfo) + (missing_scn ? 0 : sizeof(xl_xact_scn));
+
+		completion(&r, true, XACT_XINFO_HAS_TT_COMMIT | (missing_scn ? 0 : XACT_XINFO_HAS_SCN));
+		memcpy(&tt, r.data.bytes + offset, sizeof(tt));
+		switch (field) {
+		case 0:
+			tt.instance = 0;
+			break;
+		case 1:
+			tt.instance = 2;
+			break;
+		case 2:
+			tt.segment_id = 0;
+			break;
+		case 3:
+			tt.segment_id = CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+			break;
+		case 4:
+			tt.segment_generation = UINT32_MAX;
+			break;
+		case 5:
+			tt.slot_offset = TT_SLOTS_PER_SEGMENT;
+			break;
+		case 6:
+			tt.wrap = TT_WRAP_INVALID;
+			break;
+		case 7:
+			tt.xid++;
+			break;
+		case 8:
+			tt.commit_scn++;
+			break;
+		case 9:
+			tt.xid = r.decoded.header.xl_xid = InvalidTransactionId;
+			break;
+		case 10:
+			tt.xid = r.decoded.header.xl_xid = BootstrapTransactionId;
+			break;
+		case 11:
+			tt.xid = r.decoded.header.xl_xid = FrozenTransactionId;
+			break;
+		case 12: {
+			xl_xact_scn scn = { .scn = InvalidScn };
+
+			memcpy(r.data.bytes + MinSizeOfXactCommit + sizeof(xl_xact_xinfo), &scn, sizeof(scn));
+			tt.commit_scn = InvalidScn;
+			break;
+		}
+		case 13:
+			break; /* A valid delta cannot supply the missing record SCN. */
+		case 14:
+			tt.commit_scn = InvalidScn;
+			break;
+		case 15:
+			r.reader.cluster_expected_thread_id = tt.instance = 129;
+			tt.segment_id = 128 * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+			break;
+		}
+		memcpy(r.data.bytes + offset, &tt, sizeof(tt));
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, foreign, &out),
+					 CLUSTER_COLD_COMPONENT_INVALID);
+		UT_ASSERT_EQ(out.effects.required, 0);
+		UT_ASSERT_EQ(out.effects.native_apply | out.effects.page_apply | out.effects.space_apply
+						 | out.effects.no_effect | out.effects.refused,
+					 0);
+	}
+}
+
+UT_TEST(test_own_commit_rejects_invalid_tt_delta_binding)
+{
+	check_bad_terminal_tt_delta(false);
+}
+
+UT_TEST(test_foreign_commit_rejects_invalid_tt_delta_binding)
+{
+	check_bad_terminal_tt_delta(true);
+}
+
+UT_TEST(test_terminal_tt_delta_preserves_valid_physical_boundaries)
+{
+	for (int foreign = 0; foreign <= 1; foreign++) {
+		for (int field = 0; field < 8; field++) {
+			EffectRecord r;
+			ClusterColdDecodedV1 out = { 0 };
+			xl_xact_tt_commit tt;
+			Size offset = MinSizeOfXactCommit + sizeof(xl_xact_xinfo) + sizeof(xl_xact_scn);
+
+			completion(&r, true, XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_TT_COMMIT);
+			memcpy(&tt, r.data.bytes + offset, sizeof(tt));
+			switch (field) {
+			case 0:
+				break; /* Generation zero is a valid original segment. */
+			case 1:
+				tt.segment_generation = UINT32_MAX - 1;
+				break;
+			case 2:
+				tt.wrap = 0;
+				break;
+			case 3:
+				tt.wrap = TT_WRAP_INVALID - 1;
+				break;
+			case 4:
+				tt.slot_offset = 0;
+				break;
+			case 5:
+				tt.slot_offset = TT_SLOTS_PER_SEGMENT - 1;
+				break;
+			case 6:
+				r.reader.cluster_expected_thread_id = tt.instance = 128;
+				tt.segment_id = 128 * CLUSTER_UNDO_SEGS_PER_INSTANCE;
+				break;
+			case 7:
+				tt.xid = r.decoded.header.xl_xid = UINT32_MAX;
+				break;
+			}
+			memcpy(r.data.bytes + offset, &tt, sizeof(tt));
+			UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, foreign, &out),
+						 CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(out.record.record_flags, foreign ? CLUSTER_COLD_RECORD_FOREIGN_SIDE : 0);
+			UT_ASSERT(out.effects.native_apply & CLUSTER_COLD_EFFECT_TT);
+			UT_ASSERT_EQ(out.effects.refused | out.effects.no_effect, 0);
+			UT_ASSERT(partitioned(&out.effects));
+		}
+	}
+}
+
+UT_TEST(test_own_commit_without_folded_tt_keeps_native_route)
+{
+	uint32 variants[] = { 0, XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_SUBXACTS };
+
+	for (Size i = 0; i < lengthof(variants); i++) {
+		EffectRecord r;
+		ClusterColdDecodedV1 out = { 0 };
+
+		completion(&r, true, variants[i]);
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out),
+					 CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.record.record_flags, 0);
+		UT_ASSERT(out.effects.native_apply & CLUSTER_COLD_EFFECT_TERMINAL);
+		UT_ASSERT_EQ(out.effects.required & CLUSTER_COLD_EFFECT_TT, 0);
+		UT_ASSERT(partitioned(&out.effects));
+	}
+}
+
 UT_TEST(test_truncation_at_every_compound_boundary_refuses)
 {
 	EffectRecord r;
@@ -1995,6 +2148,17 @@ UT_TEST(test_foreign_native_xact_requires_bound_source_identity)
 				r.reader.cluster_expected_thread_id = fault == 0   ? 0
 													  : fault == 1 ? 129
 																   : 3 - origin;
+				if (commit) {
+					UT_ASSERT_EQ(
+						cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
+						CLUSTER_COLD_COMPONENT_INVALID);
+					UT_ASSERT_EQ(out.effects.required, 0);
+					UT_ASSERT_EQ(out.effects.native_apply | out.effects.page_apply
+									 | out.effects.space_apply | out.effects.no_effect
+									 | out.effects.refused,
+								 0);
+					continue;
+				}
 				UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out),
 							 CLUSTER_COLD_OK);
 				UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
@@ -2461,7 +2625,7 @@ UT_TEST(test_original_startup_dependency_leaves_non_c0_with_existing_dispatch)
 int
 main(void)
 {
-	UT_PLAN(65);
+	UT_PLAN(69);
 	UT_RUN(test_smgr_native_carriers_keep_existing_effect_owners);
 	UT_RUN(test_smgr_create_rejects_incomplete_or_nonproducer_carriers);
 	UT_RUN(test_smgr_truncate_rejects_incomplete_or_nonproducer_carriers);
@@ -2518,6 +2682,10 @@ main(void)
 	UT_RUN(test_logical_message_rejects_nonproducer_carriers);
 	UT_RUN(test_registry_unknown_and_blocks_still_refuse);
 	UT_RUN(test_folded_tt_unknown_format_is_not_native_apply);
+	UT_RUN(test_own_commit_rejects_invalid_tt_delta_binding);
+	UT_RUN(test_foreign_commit_rejects_invalid_tt_delta_binding);
+	UT_RUN(test_terminal_tt_delta_preserves_valid_physical_boundaries);
+	UT_RUN(test_own_commit_without_folded_tt_keeps_native_route);
 	UT_RUN(test_truncation_at_every_compound_boundary_refuses);
 	UT_RUN(test_dispatch_whole_native_and_refused_compound);
 	UT_RUN(test_dispatch_partition_must_be_complete_known_and_disjoint);

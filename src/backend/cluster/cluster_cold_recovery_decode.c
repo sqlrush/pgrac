@@ -245,6 +245,13 @@ cold_xact_flags(XLogReaderState *reader, uint64 system_identifier, const uint8 s
 			&& (parsed.tt_commit.format_version != CLUSTER_XACT_TT_COMMIT_VERSION
 				|| parsed.tt_commit.flags != 0 || parsed.tt_commit.reserved != 0))
 			return CLUSTER_COLD_OPCODE_UNSUPPORTED;
+		/* Native redo stamps the delta before applying this record's xid.
+		 * Bind both effects before any native or retained-history routing. */
+		if (parsed.has_tt_commit
+			&& !rf_side_xact_tt_commit_preflight_v1(&parsed.tt_commit,
+													reader->cluster_expected_thread_id,
+													XLogRecGetXid(reader), parsed.scn))
+			return CLUSTER_COLD_COMPONENT_INVALID;
 		*flags = 0;
 		*effects |= cold_completion_effects(parsed.xinfo, parsed.nsubxacts, parsed.nrels,
 											parsed.nstats, parsed.nmsgs);
