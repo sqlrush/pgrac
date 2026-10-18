@@ -139,6 +139,11 @@ typedef struct ClusterTxResolution {
 	SCN commit_scn;
 	SCN horizon_scn;
 	ClusterLiveAuthority authority;
+	/* Process-local origin projection only; never serialized or accepted
+	 * from a peer. DATA and canonical TT may be in different segments. */
+	ClusterTTSlotPhysicalLocator local_canonical;
+	uint32 local_canonical_generation;
+	bool local_canonical_valid;
 } ClusterTxResolution;
 
 /* A page-derived request carries TT_WRAP_INVALID until the origin reads the

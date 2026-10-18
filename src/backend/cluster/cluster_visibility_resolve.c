@@ -34,6 +34,7 @@
 #include "access/clog.h" /* GCS-race round-3b P0-2: inline native-prehistory status */
 #include "access/htup_details.h"
 #include "access/transam.h"
+#include "access/xact.h"
 #include "access/xlog.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
@@ -42,6 +43,7 @@
 #include "utils/snapmgr.h"
 #include "utils/wait_event.h" /* spec-6.14 D10b ClusterCatalogVisResolve */
 
+#include "cluster/cluster_catalog_trace.h"
 #include "cluster/cluster_catalog_stats.h" /* spec-6.14 D10b counters */
 #include "cluster/cluster_cr.h"			   /* spec-6.15 D4: underivable counter */
 #include "cluster/cluster_epoch.h"
@@ -52,6 +54,7 @@
 #include "cluster/cluster_remote_xact.h"		/* spec-4.5a G6: wrap-checked authority */
 #include "cluster/cluster_runtime_visibility.h" /* spec-6.12i CP3: active-runtime resolve */
 #include "cluster/cluster_subtrans.h"			/* SUBCOMMITTED parent follow */
+#include "cluster/cluster_tt_local.h"
 #include "cluster/cluster_tt_durable.h"			/* spec-4.8 D2 remote_active_failclosed counter */
 #include "cluster/cluster_tt_status.h"			/* lookup_exact / Key / Result */
 #include "cluster/cluster_touched_peers.h"		/* spec-5.14 D2 class 4 */
@@ -1240,6 +1243,59 @@ cluster_visibility_resolve_from_ref_scn(TransactionId raw_xid, const ClusterUndo
 	classify_ref(raw_xid, ref, anchor_lsn, read_scn, NULL, out);
 }
 
+/* The exact origin service has already validated DATA -> canonical TT,
+ * generation, wrap, incarnation/admission and ACTIVE/native status. Project
+ * SELF only when that result still names our current transaction and this
+ * backend owns its published canonical receipt. The receipt alone is not
+ * authority. Recycled/history, foreign origins and terminal memos never enter. */
+static bool
+vis_scratch_self_proven(const ClusterUndoTTSlotRef *ref, const ClusterTxLocator *locator,
+						const ClusterTxResolution *resolution, uint64 epoch)
+{
+	ClusterCanonicalTxnBinding binding;
+
+	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| ref->origin_node_id != cluster_node_id || ref->local_xid != locator->xid
+		|| epoch > UINT32_MAX || ref->cluster_epoch != (uint32) epoch
+		|| resolution->authority.origin_epoch != epoch
+		|| !SCN_VALID(resolution->authority.authority_scn)
+		|| uba_origin_node_id(locator->uba) != cluster_node_id
+		|| resolution->outcome != CLUSTER_TX_IN_PROGRESS
+		|| resolution->proof_kind != CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG
+		|| !cluster_tx_locator_reply_matches(locator, &resolution->locator_echo)
+		|| !resolution->local_canonical_valid
+		|| resolution->local_canonical.xid != locator->xid
+		|| resolution->local_canonical.wrap != resolution->locator_echo.tt_wrap
+		|| !TransactionIdIsCurrentTransactionId(locator->xid)
+		|| !TransactionIdIsCurrentTransactionId(resolution->top_xid)
+		|| !cluster_tt_local_get_published_binding(resolution->top_xid, &binding))
+		return false;
+
+	if (unlikely(cluster_trace_visibility_enabled)) {
+		cluster_catalog_trace_event("scratch.self.binding", "canonical_segment", resolution->local_canonical.segment_id);
+		cluster_catalog_trace_event("scratch.self.binding", "canonical_generation", resolution->local_canonical_generation);
+		cluster_catalog_trace_event("scratch.self.binding", "canonical_offset", resolution->local_canonical.slot_offset);
+		cluster_catalog_trace_event("scratch.self.binding", "canonical_wrap", resolution->local_canonical.wrap);
+		cluster_catalog_trace_event("scratch.self.binding", "published_segment", binding.segment_id);
+		cluster_catalog_trace_event("scratch.self.binding", "published_generation", binding.segment_generation);
+		cluster_catalog_trace_event("scratch.self.binding", "published_offset", binding.slot_offset);
+		cluster_catalog_trace_event("scratch.self.binding", "published_wrap", binding.slot_wrap);
+	}
+
+	return binding.xid == resolution->top_xid && binding.segment_id != 0
+		&& binding.segment_id <= UINT16_MAX && binding.segment_generation != UINT32_MAX
+		&& binding.segment_id == resolution->local_canonical.segment_id
+		&& binding.segment_generation == resolution->local_canonical_generation
+		&& binding.slot_offset == resolution->local_canonical.slot_offset
+		&& binding.slot_offset < TT_SLOTS_PER_SEGMENT
+		&& binding.slot_wrap != TT_WRAP_INVALID
+		&& binding.slot_wrap == resolution->locator_echo.tt_wrap
+		&& binding.origin_instance == cluster_node_id + 1
+		&& binding.publish_state == CLUSTER_CANONICAL_TXN_PUBLISHED
+		&& binding.reserved16 == 0 && !XLogRecPtrIsInvalid(binding.active_lsn)
+		&& cluster_epoch_get_current() == epoch;
+}
+
 void
 cluster_visibility_resolve_scratch_scn(Page page, uint8 slot_index, TransactionId raw_xid,
 									   SCN read_scn, ClusterVisResolve *out)
@@ -1414,6 +1470,7 @@ cluster_visibility_resolve_scratch_scn(Page page, uint8 slot_index, TransactionI
 		VisScratchProofKey before;
 		VisScratchProofKey after;
 		bool eligible = vis_scratch_proof_key(&ref, &locator, slot, read_scn, &before);
+		uint64 self_epoch = cluster_epoch_get_current();
 
 		if (eligible && vis_scratch_proof.valid
 			&& memcmp(&before, &vis_scratch_proof.key, sizeof(before)) == 0) {
@@ -1476,7 +1533,18 @@ cluster_visibility_resolve_scratch_scn(Page page, uint8 slot_index, TransactionI
 				reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
 				outcome = cluster_tx_resolve_exact(&locator, CLUSTER_TX_RESOLVE_VISIBILITY,
 												   &resolution, &reason);
-				if (!cluster_vis_from_exact_tx_resolution(outcome, &resolution, out)) {
+				if (cluster_vis_from_exact_tx_resolution(outcome, &resolution, out)) {
+					if (outcome == CLUSTER_TX_IN_PROGRESS
+						&& TransactionIdIsCurrentTransactionId(raw_xid)) {
+						if (vis_scratch_self_proven(&ref, &locator, &resolution, self_epoch))
+							out->scratch_self = true;
+						else {
+							out->evidence = CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS;
+							out->status = CLUSTER_TT_STATUS_UNKNOWN;
+							out->diagnostic_reason = "SCRATCH_SELF_BINDING_UNPROVEN";
+						}
+					}
+				} else {
 					out->diagnostic_reason = cluster_tx_resolve_reason_name(reason);
 					cluster_vis_log_freshref_unproven(raw_xid, &ref, pair, retained, &locator,
 													  outcome, reason);

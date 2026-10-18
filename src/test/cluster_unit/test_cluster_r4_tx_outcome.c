@@ -4320,6 +4320,14 @@ UT_TEST(test_origin_tx_plan_preserves_strict_zero_and_final_generation_recheck)
 						 &plan, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, &data_guard, &data_root,
 						 &resolution, &reason),
 					 variant == 1 ? CLUSTER_TX_COMMITTED : CLUSTER_TX_UNKNOWN);
+		if (variant == 1) {
+			UT_ASSERT(resolution.local_canonical_valid);
+			UT_ASSERT_EQ(resolution.local_canonical.segment_id, TEST_TT_SEGMENT);
+			UT_ASSERT(resolution.local_canonical.segment_id != TEST_RECORD_SEGMENT);
+			UT_ASSERT_EQ(resolution.local_canonical.xid, resolution.locator_echo.xid);
+			UT_ASSERT_EQ(resolution.local_canonical.wrap, resolution.locator_echo.tt_wrap);
+			UT_ASSERT_EQ(resolution.local_canonical_generation, test_candidate_tt_generation);
+		}
 	}
 }
 

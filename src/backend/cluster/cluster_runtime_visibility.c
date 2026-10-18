@@ -1726,6 +1726,13 @@ cluster_runtime_visibility_origin_plan_freeze_data_internal(
 		reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
 		goto failed;
 	}
+	/* Already sampled canonical identity; no extra lookup or authority. */
+	plan_data->candidate.local_canonical.segment_id = plan_data->tt_logical.segment_id;
+	plan_data->candidate.local_canonical.xid = plan_data->canonical_locator.xid;
+	plan_data->candidate.local_canonical.slot_offset = plan_data->tt_slot_offset;
+	plan_data->candidate.local_canonical.wrap = plan_data->canonical_locator.tt_wrap;
+	plan_data->candidate.local_canonical_generation = generation.value;
+	plan_data->candidate.local_canonical_valid = true;
 	*out = plan_data->candidate;
 	plan_data->candidate_valid = true;
 	if (reason_out != NULL)
@@ -1941,6 +1948,13 @@ cluster_runtime_visibility_origin_plan_sample_canonical_held(
 	}
 	plan_data->canonical_diagnostic.first_failure
 		= CLUSTER_RUNTIME_VISIBILITY_CANONICAL_FAILURE_NONE;
+	/* Already sampled canonical identity; no extra lookup or authority. */
+	plan_data->candidate.local_canonical.segment_id = plan_data->tt_logical.segment_id;
+	plan_data->candidate.local_canonical.xid = plan_data->canonical_locator.xid;
+	plan_data->candidate.local_canonical.slot_offset = plan_data->tt_slot_offset;
+	plan_data->candidate.local_canonical.wrap = plan_data->canonical_locator.tt_wrap;
+	plan_data->candidate.local_canonical_generation = generation.value;
+	plan_data->candidate.local_canonical_valid = true;
 	plan_data->candidate_valid = true;
 	if (reason_out != NULL)
 		*reason_out = CLUSTER_TX_RESOLVE_NONE;
@@ -2509,6 +2523,10 @@ cluster_runtime_visibility_resolve_exact_origin_admitted(
 	if (origin != (NodeId)cluster_node_id) {
 		outcome = cluster_gcs_block_r4_tx_resolve_fetch_and_wait(
 			(int32)origin, locator, UINT32_MAX, admission->formation_epoch, out, &reason);
+		/* This metadata belongs to an in-process origin call, never a peer. */
+		memset(&out->local_canonical, 0, sizeof(out->local_canonical));
+		out->local_canonical_generation = 0;
+		out->local_canonical_valid = false;
 		goto recheck;
 	}
 	logical.owner_instance = (uint8)((uint32)origin + 1);

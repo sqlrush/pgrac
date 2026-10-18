@@ -122,3 +122,18 @@ errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_un
 {
 	abort();
 }
+
+/* Old default-non-SELF fixtures cannot manufacture command ownership.
+ * The dedicated FULL/SELF test links the real CID module and publication edge. */
+#include "access/htup.h"
+#include "cluster/cluster_tt_local.h"
+__attribute__((weak)) bool
+cluster_tt_local_get_published_binding(TransactionId xid, ClusterCanonicalTxnBinding *out)
+{
+	abort();
+}
+__attribute__((weak)) bool
+HeapTupleHeaderCommandIdIsAvailable(HeapTupleHeader tuple)
+{
+	abort();
+}

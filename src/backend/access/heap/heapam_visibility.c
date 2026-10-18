@@ -2266,25 +2266,38 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 				|| scn_time_cmp(resolved.commit_scn, snapshot->read_scn) > 0))
 			cluster_r4_scratch_visibility_unknown(raw_xmin, "scratch xmin bound is not admissible");
 
-		switch (resolved.status) {
-		case CLUSTER_TT_STATUS_ABORTED:
-		case CLUSTER_TT_STATUS_IN_PROGRESS:
-		case CLUSTER_TT_STATUS_SUBCOMMITTED:
-			CLUSTER_CATALOG_TRACE_RETURN(cluster_r4_scratch_return(observation, false));
+		if (resolved.scratch_self) {
+			CommandId cmin;
 
-		case CLUSTER_TT_STATUS_COMMITTED:
-		case CLUSTER_TT_STATUS_CLEANED_OUT:
-			decision = cluster_visibility_decide_by_scn(resolved.commit_scn,
-													 snapshot->read_scn);
-			if (decision == CLUSTER_VISIBILITY_INVISIBLE)
-				CLUSTER_CATALOG_TRACE_RETURN(cluster_r4_scratch_return(observation, false));
-			if (decision != CLUSTER_VISIBILITY_VISIBLE)
+			if (!HeapTupleHeaderCommandIdIsAvailable(tuple))
 				cluster_r4_scratch_visibility_unknown(raw_xmin,
-											  "scratch xmin commit SCN is not comparable to the read SCN");
-			break;
+													 "scratch SELF cmin mapping is unavailable");
+			cmin = HeapTupleHeaderGetCmin(tuple);
+			if (unlikely(cluster_trace_visibility_enabled))
+				cluster_catalog_trace_event("scratch.self", "cmin", cmin);
+			if (cmin >= snapshot->curcid)
+				CLUSTER_CATALOG_TRACE_RETURN(cluster_r4_scratch_return(observation, false));
+		} else {
+			switch (resolved.status) {
+			case CLUSTER_TT_STATUS_ABORTED:
+			case CLUSTER_TT_STATUS_IN_PROGRESS:
+			case CLUSTER_TT_STATUS_SUBCOMMITTED:
+				CLUSTER_CATALOG_TRACE_RETURN(cluster_r4_scratch_return(observation, false));
 
-		default:
-			cluster_r4_scratch_visibility_unknown(raw_xmin, "scratch xmin outcome is not terminal");
+			case CLUSTER_TT_STATUS_COMMITTED:
+			case CLUSTER_TT_STATUS_CLEANED_OUT:
+				decision = cluster_visibility_decide_by_scn(resolved.commit_scn,
+														 snapshot->read_scn);
+				if (decision == CLUSTER_VISIBILITY_INVISIBLE)
+					CLUSTER_CATALOG_TRACE_RETURN(cluster_r4_scratch_return(observation, false));
+				if (decision != CLUSTER_VISIBILITY_VISIBLE)
+					cluster_r4_scratch_visibility_unknown(raw_xmin,
+												  "scratch xmin commit SCN is not comparable to the read SCN");
+				break;
+
+			default:
+				cluster_r4_scratch_visibility_unknown(raw_xmin, "scratch xmin outcome is not terminal");
+			}
 		}
 	}
 
@@ -2337,6 +2350,18 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 		&& (!SCN_VALID(resolved.commit_scn)
 			|| scn_time_cmp(resolved.commit_scn, snapshot->read_scn) > 0))
 		cluster_r4_scratch_visibility_unknown(raw_xmax, "scratch xmax bound is not admissible");
+
+	if (resolved.scratch_self) {
+		CommandId cmax;
+
+		if (!HeapTupleHeaderCommandIdIsAvailable(tuple))
+			cluster_r4_scratch_visibility_unknown(raw_xmax,
+												 "scratch SELF cmax mapping is unavailable");
+		cmax = HeapTupleHeaderGetCmax(tuple);
+		if (unlikely(cluster_trace_visibility_enabled))
+			cluster_catalog_trace_event("scratch.self", "cmax", cmax);
+		CLUSTER_CATALOG_TRACE_RETURN(cluster_r4_scratch_return(observation, cmax >= snapshot->curcid));
+	}
 
 	switch (resolved.status)
 	{

@@ -7891,6 +7891,19 @@ $(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O): \
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		-DCLUSTER_CTRC_UNIT_TEST=1 -c $< -o $@
 
+# Real FULL/SELF evaluator and original raw/combo CID getters; origin I/O is fixture-owned.
+TESTS += test_cluster_scratch_self
+all: test_cluster_scratch_self
+test_cluster_scratch_self: test_cluster_scratch_self.c test_cluster_r4_scratch_resolver.c \
+        test_cluster_native_prehistory_proof.inc cluster_snapshot_test_stubs.h unit_test.h \
+        $(top_srcdir)/src/backend/utils/time/combocid.c \
+        $(top_srcdir)/src/backend/cluster/cluster_uba.c \
+        $(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O) $(CLUSTER_VIS_VERDICT_O) $(CLUSTER_R4_HOT_VIS_TEST_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+        $(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O) $(CLUSTER_VIS_VERDICT_O) $(CLUSTER_R4_HOT_VIS_TEST_O) \
+        $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(top_builddir)/src/common/libpgcommon_srv.a \
+        $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
 test_cluster_r4_scratch_resolver: test_cluster_r4_scratch_resolver.c unit_test.h \
 		test_cluster_native_prehistory_proof.inc \
 		cluster_snapshot_test_stubs.h \
