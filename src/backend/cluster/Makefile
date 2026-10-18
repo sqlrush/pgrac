@@ -134,6 +134,7 @@ OBJS = \
 	cluster_cold_recovery_space.o \
 	cluster_cold_recovery_startup.o \
 	cluster_cold_recovery_tt.o \
+	cluster_cold_recovery_tt_redo.o \
 	cluster_cold_recovery_replay.o \
 	cluster_recovery_duty.o \
 	cluster_cf_enqueue.o \

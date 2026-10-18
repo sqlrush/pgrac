@@ -1301,6 +1301,7 @@ rf_side_online_plan_source_matches_v1(const RfSideOnlinePlanV1 *plan, uint64 sys
 									  const RfContributorStreamCutV1 *cut)
 {
 	const RfContributorStreamCutV1 *source;
+	uint32 flags;
 
 	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed
 		|| plan->database_incarnation == 0 || system_identifier != plan->system_identifier
@@ -1315,7 +1316,11 @@ rf_side_online_plan_source_matches_v1(const RfSideOnlinePlanV1 *plan, uint64 sys
 		}
 	if (source == NULL)
 		return false;
-	return cut->flags == RF_CONTRIBUTOR_CUT_COMPLETE && cut->flags == source->flags
+	flags = RF_CONTRIBUTOR_CUT_COMPLETE
+			| (cut->scan_begin_inclusive == cut->scan_end_exclusive
+				   ? RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY
+				   : 0);
+	return cut->flags == flags && cut->flags == source->flags
 		   && cut->failed_thread == source->failed_thread && cut->timeline_id == source->timeline_id
 		   && cut->scan_begin_inclusive == source->scan_begin_inclusive
 		   && cut->scan_end_exclusive == source->scan_end_exclusive;

@@ -793,6 +793,15 @@ extern bool cluster_cold_tt_base_match_v1(const ClusterColdTypedV1 *typed,
 										  const ClusterColdTtSlotKeyV1 *expected,
 										  ClusterColdTtSlotInputV1 *out);
 
+struct RfSideUndoHeaderImageV1;
+/* Fold one selected original source's ordinary redo into a private copy of
+ * its captured TT header. This is input reconstruction, not FullXid/epoch,
+ * top binding, checkpoint coverage, loser or completion authority. C0 and
+ * prepared transactions are unsupported here. Failure leaves out unchanged. */
+extern bool cluster_cold_typed_tt_redo_header_v1(const ClusterColdTypedV1 *typed,
+												 uint32 participant, uint32 segment_index,
+												 struct RfSideUndoHeaderImageV1 *out);
+
 /* Sync the selected crashed sources before pass-2 mutations. No replay or
  * completion authority is created; a refusal invalidates this typed attempt. */
 extern bool cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed,
