@@ -1227,6 +1227,114 @@ cluster_wal_inputs_cold_begin_v1(const uint8 storage_uuid[16], uint64 system_ide
 	return inputs_begin(storage_uuid, system_identifier, true, out);
 }
 
+/* Reject aliasing before clearing a failed read's output. */
+static bool
+inputs_overlap(const void *a, Size a_size, const void *b, Size b_size)
+{
+	uintptr_t left = (uintptr_t)a, right = (uintptr_t)b;
+
+	return a != NULL && b != NULL
+		   && (left <= right ? right - left < a_size : left - right < b_size);
+}
+
+/* CF is already held on the exact whole ROOT. This scratch selection owns
+ * no WALR locks; retention belongs to the caller's original execution pin. */
+static ClusterControlRootResult
+inputs_cold_checkpoint_select(ClusterWalInputsV1 *scratch, WalInputsWork *work,
+							 const ClusterControlRootSnapshot *expected)
+{
+	const ClusterWalHistoryRecord *selected = NULL;
+	uint32 node = expected->identity.origin_node_id;
+	ClusterControlRootResult result;
+
+	if (!work->root.present[node])
+		return CLUSTER_CONTROL_ROOT_ABSENT;
+	result = cluster_wal_origin_inputs_read_locked(&work->root, node, &work->origin);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (work->origin.has_pending)
+		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	for (uint32 i = 0; i <= work->origin.history.count; i++) {
+		const ClusterWalHistoryRecord *record = i == work->origin.history.count
+												   ? &work->origin.current
+												   : &work->origin.history.records[i];
+		if (!cluster_control_root_identity_equal(&record->snapshot.identity, &expected->identity))
+			continue;
+		if (selected != NULL || memcmp(&record->snapshot, expected, sizeof(*expected)) != 0)
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		selected = record;
+	}
+	if (selected == NULL)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	return inputs_checkpoint(scratch, work, selected, selected == &work->origin.current);
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_cold_checkpoint_v1(const ClusterControlRootSnapshot *expected,
+									const ClusterControlRootFileToken *root_token,
+									ClusterWalRecoveryCheckpointV1 *out)
+{
+	ClusterWalInputsV1 *scratch;
+	WalInputsWork *work;
+	ClusterControlRootResult result;
+
+	if (inputs_overlap(expected, sizeof(*expected), out, sizeof(*out))
+		|| inputs_overlap(root_token, sizeof(*root_token), out, sizeof(*out)))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (expected == NULL || root_token == NULL || out == NULL
+		|| expected->identity.origin_node_id < 0
+		|| expected->identity.origin_node_id >= CLUSTER_MAX_NODES
+		|| expected->identity.origin_thread_id != expected->identity.origin_node_id + 1
+		|| (expected->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
+			&& expected->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+			&& expected->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!cluster_enabled || !cluster_shared_config || !cluster_controlfile_shared_authority
+		|| CritSectionCount != 0 || CurrentResourceOwner == NULL || !inputs_io_role(true)
+		|| expected->identity.system_identifier != GetSystemIdentifier())
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	scratch = palloc0(sizeof(*scratch));
+	scratch->system_identifier = expected->identity.system_identifier;
+	memcpy(scratch->storage_uuid, expected->identity.storage_uuid, 16);
+	scratch->token = *root_token;
+	work = palloc0(sizeof(*work));
+	PG_TRY();
+	{
+		ClusterWalThreadClaimV2 claim;
+
+		result = inputs_root(scratch, work, false);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = inputs_cold_checkpoint_select(scratch, work, expected);
+		inputs_unlock(work);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cluster_wal_claim_v2_read(cluster_wal_threads_dir,
+											   &scratch->items[0].source.claim, &claim);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = inputs_root(scratch, work, false);
+		inputs_unlock(work);
+	}
+	PG_CATCH();
+	{
+		inputs_unlock(work);
+		pfree(work);
+		pfree(scratch);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		out->source = scratch->items[0].source;
+		out->checkpoint_start = scratch->items[0].checkpoint_start;
+		memcpy(&out->checkpoint, &scratch->items[0].native_checkpoint, sizeof(out->checkpoint));
+	}
+	pfree(work);
+	pfree(scratch);
+	return result;
+}
+
 ClusterControlRootResult
 cluster_wal_inputs_revalidate_v1(ClusterWalInputsV1 *inputs)
 {

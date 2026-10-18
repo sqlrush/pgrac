@@ -20914,6 +20914,7 @@ static unsigned inputs_peer_begins, inputs_peer_releases;
 static bool inputs_claim_observe;
 static unsigned inputs_claim_calls, inputs_claim_under_cf, inputs_claim_unpinned;
 static unsigned inputs_claim_fault;
+static bool inputs_checkpoint_observe;
 
 /* Observe the call site without replacing physical claim validation. */
 extern ClusterControlRootResult test_wal_inputs_claim_read(const char *path,
@@ -20930,7 +20931,7 @@ test_wal_inputs_claim_read(const char *path, const ClusterWalThreadClaimRefV2 *r
 		inputs_claim_unpinned += !inputs_pin_held || !inputs_pin_current;
 	}
 	result = cluster_wal_claim_v2_read(path, ref, out);
-	if (inputs_claim_observe && inputs_claim_calls == 2) {
+	if (inputs_claim_observe && inputs_claim_calls == (inputs_checkpoint_observe ? 1 : 2)) {
 		if (inputs_claim_fault == 1)
 			v2_checkpoint_root_race();
 		else if (inputs_claim_fault == 2)
@@ -22350,6 +22351,223 @@ UT_TEST(test_wal_inputs_installed_predecessor_needs_exact_original_exit)
 	MyBackendType = B_INVALID;
 }
 
+/* Capture a real native census, release its own read owner, then model only
+ * the already-held execution retention grant. The new metadata reader must
+ * not acquire or release a second WALR pin while that grant is held. */
+static bool
+inputs_cold_checkpoint_fixture(ClusterControlRootFileToken *token, ClusterWalInputV1 items[3])
+{
+	uint8 bytes[66048];
+	ClusterPhase1FullStopPlan plan;
+	ClusterWalHistoryImage history;
+	ClusterWalHistoryStage stage;
+	ClusterWalInputsV1 *inputs = NULL;
+
+	v2_close_history_fixture(bytes, &plan, &history, &stage, 2);
+	root_fixture_version3(bytes);
+	v2_write_roots(bytes);
+	test_actual_cf = test_cf_mode = NoLock;
+	test_cf_local_caller = NULL;
+	test_cf_grant = test_cf_release_confirmed = true;
+	inputs_pin_held = inputs_pin_refuse = inputs_pin_race = inputs_pin_throw = false;
+	inputs_claim_observe = inputs_checkpoint_observe = false;
+	cluster_shared_config = true;
+	test_inputs_startup_cf = true;
+	if (inputs_begin_for_role(true, &inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return false;
+	UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), 3);
+	UT_ASSERT_EQ(cluster_wal_inputs_root_token_v1(inputs, token), 0);
+	for (unsigned i = 0; i < 3; i++)
+		items[i] = *cluster_wal_inputs_at_v1(inputs, i);
+	cluster_wal_inputs_release_v1(&inputs);
+	inputs_pin_held = inputs_pin_current = true;
+	inputs_pin_refuse = true;
+	return true;
+}
+
+static void
+inputs_cold_checkpoint_done(void)
+{
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT(inputs_pin_held && inputs_pin_refuse);
+	inputs_pin_held = inputs_pin_refuse = false;
+	inputs_native_recovery = test_inputs_startup_cf = false;
+	inputs_claim_observe = inputs_checkpoint_observe = false;
+	MyBackendType = B_INVALID;
+}
+
+UT_TEST(test_cold_checkpoint_selects_exact_retained_native_input_without_read_pin)
+{
+	ClusterControlRootFileToken token;
+	ClusterWalInputV1 items[3];
+	ClusterWalRecoveryCheckpointV1 observed;
+
+	if (!inputs_cold_checkpoint_fixture(&token, items)) {
+		UT_ASSERT(false);
+		return;
+	}
+	inputs_claim_observe = true;
+	inputs_claim_calls = inputs_claim_under_cf = inputs_claim_unpinned = 0;
+	inputs_claim_fault = 0;
+	for (unsigned i = 0; i < 2; i++) {
+		UT_ASSERT(!items[i].current);
+		UT_ASSERT_EQ(cluster_wal_inputs_cold_checkpoint_v1(&items[i].checkpoint, &token, &observed), 0);
+		UT_ASSERT_EQ(memcmp(&observed.source, &items[i].source, sizeof(observed.source)), 0);
+		UT_ASSERT_EQ(observed.checkpoint_start, items[i].checkpoint_start);
+		UT_ASSERT_EQ(memcmp(&observed.checkpoint, &items[i].native_checkpoint,
+							sizeof(observed.checkpoint)), 0);
+	}
+	UT_ASSERT_EQ(inputs_claim_calls, 2);
+	UT_ASSERT_EQ(inputs_claim_under_cf, 0);
+	UT_ASSERT_EQ(inputs_claim_unpinned, 0);
+	inputs_cold_checkpoint_done();
+	{
+		uint8 bytes[66048];
+		ClusterRecoveryAnchorV2 anchors[2];
+		ClusterWalInputsV1 *inputs = NULL;
+		ClusterWalInputV1 current;
+
+		inputs_closed_wal_fixture(bytes, anchors);
+		test_inputs_startup_cf = true;
+		UT_ASSERT_EQ(inputs_begin_for_role(true, &inputs), 0);
+		if (inputs == NULL)
+			return;
+		current = *cluster_wal_inputs_at_v1(inputs, 0);
+		UT_ASSERT(current.current);
+		UT_ASSERT_EQ(current.checkpoint.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED);
+		UT_ASSERT_EQ(cluster_wal_inputs_root_token_v1(inputs, &token), 0);
+		cluster_wal_inputs_release_v1(&inputs);
+		inputs_pin_held = inputs_pin_current = inputs_pin_refuse = true;
+		UT_ASSERT_EQ(cluster_wal_inputs_cold_checkpoint_v1(&current.checkpoint, &token, &observed), 0);
+		UT_ASSERT_EQ(memcmp(&observed.source, &current.source, sizeof(observed.source)), 0);
+		UT_ASSERT_EQ(observed.checkpoint_start, current.checkpoint_start);
+		UT_ASSERT_EQ(memcmp(&observed.checkpoint, &current.native_checkpoint,
+							sizeof(observed.checkpoint)), 0);
+		inputs_cold_checkpoint_done();
+	}
+}
+
+UT_TEST(test_cold_checkpoint_rejects_changed_root_snapshot_and_role_without_output)
+{
+	ClusterControlRootFileToken token, changed;
+	ClusterWalInputV1 items[3];
+	ClusterWalRecoveryCheckpointV1 observed, zero = { 0 };
+	ClusterControlRootSnapshot expected;
+
+	if (!inputs_cold_checkpoint_fixture(&token, items)) {
+		UT_ASSERT(false);
+		return;
+	}
+	for (unsigned i = 0; i < sizeof(token); i++) {
+		changed = token;
+		((uint8 *)&changed)[i] ^= 1;
+		memset(&observed, 0xa5, sizeof(observed));
+		UT_ASSERT(cluster_wal_inputs_cold_checkpoint_v1(&items[0].checkpoint, &changed, &observed) != 0);
+		UT_ASSERT_EQ(memcmp(&observed, &zero, sizeof(zero)), 0);
+	}
+	for (unsigned fault = 0; fault < 4; fault++) {
+		expected = items[0].checkpoint;
+		if (fault == 0)
+			expected.identity.origin_owner_incarnation++;
+		else if (fault == 1)
+			expected.validated_tail_lsn_exclusive++;
+		else if (fault == 2)
+			expected.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+		else
+			MyBackendType = B_BG_WORKER;
+		memset(&observed, 0xa5, sizeof(observed));
+		UT_ASSERT(cluster_wal_inputs_cold_checkpoint_v1(&expected, &token, &observed) != 0);
+		UT_ASSERT_EQ(memcmp(&observed, &zero, sizeof(zero)), 0);
+	}
+	MyBackendType = B_STARTUP;
+	{
+		union {
+			ClusterControlRootSnapshot expected;
+			ClusterWalRecoveryCheckpointV1 out;
+		} alias;
+		alias.expected = items[0].checkpoint;
+		expected = alias.expected;
+		UT_ASSERT_EQ(cluster_wal_inputs_cold_checkpoint_v1(&alias.expected, &token, &alias.out),
+					 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+		UT_ASSERT_EQ(memcmp(&alias.expected, &expected, sizeof(expected)), 0);
+	}
+	memset(&observed, 0xa5, sizeof(observed));
+	UT_ASSERT_EQ(cluster_wal_inputs_cold_checkpoint_v1(NULL, &token, &observed),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(memcmp(&observed, &zero, sizeof(zero)), 0);
+	inputs_cold_checkpoint_done();
+}
+
+UT_TEST(test_cold_checkpoint_requires_physical_claim_and_anchor)
+{
+	for (unsigned fault = 0; fault < 2; fault++) {
+		ClusterControlRootFileToken token;
+		ClusterWalInputV1 items[3];
+		ClusterWalRecoveryCheckpointV1 observed, zero = { 0 };
+		char path[MAXPGPATH];
+		if (!inputs_cold_checkpoint_fixture(&token, items)) {
+			UT_ASSERT(false);
+			return;
+		}
+		if (fault == 0)
+			v2_claim_path(&items[0].source.claim.identity, path);
+		else {
+			/* The actual anchor directory is generation-local. Leave ROOT and
+			 * claim intact but remove the selected native immutable anchor. */
+			snprintf(path, sizeof(path), "%s/global/anchor_images/thread_1/generation_" UINT64_FORMAT,
+					 cluster_shared_data_dir, items[0].source.claim.identity.origin_owner_incarnation);
+			UT_ASSERT(rmtree(path, true));
+			path[0] = '\0';
+		}
+		if (fault == 0)
+			UT_ASSERT_EQ(unlink(path), 0);
+		memset(&observed, 0xa5, sizeof(observed));
+		UT_ASSERT(cluster_wal_inputs_cold_checkpoint_v1(&items[0].checkpoint, &token, &observed) != 0);
+		UT_ASSERT_EQ(memcmp(&observed, &zero, sizeof(zero)), 0);
+		inputs_cold_checkpoint_done();
+	}
+}
+
+UT_TEST(test_cold_checkpoint_rechecks_root_after_claim_and_cleans_error)
+{
+	for (unsigned fault = 1; fault <= 4; fault++) {
+		ClusterControlRootFileToken token;
+		ClusterWalInputV1 items[3];
+		ClusterWalRecoveryCheckpointV1 observed, zero = { 0 };
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		volatile bool caught = false;
+		if (fault == 2)
+			continue;
+		if (!inputs_cold_checkpoint_fixture(&token, items)) {
+			UT_ASSERT(false);
+			return;
+		}
+		inputs_claim_observe = inputs_checkpoint_observe = true;
+		inputs_claim_calls = inputs_claim_under_cf = inputs_claim_unpinned = 0;
+		inputs_claim_fault = fault;
+		test_throw_root_read = fault == 4;
+		memset(&observed, 0xa5, sizeof(observed));
+		PG_TRY();
+		{
+			result = cluster_wal_inputs_cold_checkpoint_v1(&items[0].checkpoint, &token, &observed);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		test_throw_root_read = false;
+		UT_ASSERT_EQ(caught, fault != 1);
+		if (!caught)
+			UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+		UT_ASSERT_EQ(inputs_claim_calls, fault == 4 ? 0 : 1);
+		UT_ASSERT_EQ(inputs_claim_under_cf, 0);
+		UT_ASSERT_EQ(inputs_claim_unpinned, 0);
+		UT_ASSERT_EQ(memcmp(&observed, &zero, sizeof(zero)), 0);
+		inputs_cold_checkpoint_done();
+	}
+}
+
 static void
 inputs_check_retained_generations_remain_distinct(bool cold)
 {
@@ -23006,6 +23224,15 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
+	if (getenv("PGRAC_PRE2_TEST_COLD_CHECKPOINT") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_cold_checkpoint_selects_exact_retained_native_input_without_read_pin);
+		UT_RUN(test_cold_checkpoint_rejects_changed_root_snapshot_and_role_without_output);
+		UT_RUN(test_cold_checkpoint_requires_physical_claim_and_anchor);
+		UT_RUN(test_cold_checkpoint_rechecks_root_after_claim_and_cleans_error);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_COLD_CENSUS") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(test_cold_census_visits_all_selected_sources_twice);
@@ -23075,7 +23302,11 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(461);
+	UT_PLAN(465);
+	UT_RUN(test_cold_checkpoint_selects_exact_retained_native_input_without_read_pin);
+	UT_RUN(test_cold_checkpoint_rejects_changed_root_snapshot_and_role_without_output);
+	UT_RUN(test_cold_checkpoint_requires_physical_claim_and_anchor);
+	UT_RUN(test_cold_checkpoint_rechecks_root_after_claim_and_cleans_error);
 	UT_RUN(test_recovery_checkpoint_selects_native_not_common_counters);
 	UT_RUN(test_recovery_checkpoint_refusal_does_not_export_input);
 	UT_RUN(test_exact_recovery_source_sync_never_publishes_stale_input);

@@ -955,14 +955,68 @@ cold_sources_match(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
 	return true;
 }
 
+/* Re-read history metadata using the caller's original execution retention
+ * owner. Do not acquire a census read set from inside the execution IR set. */
+static bool
+cold_history_sources_match(ClusterColdTypedV1 *typed)
+{
+	if (!typed->census_root_captured || typed->inputs != NULL)
+		return false;
+	for (uint32 i = typed->replay_count; i < typed->participant_count; i++) {
+		const ColdRoot *selected = &typed->replay_roots[i];
+		const ClusterColdParticipantV1 *participant = &typed->participants[i];
+		ClusterWalRecoveryCheckpointV1 observed;
+
+		if (!selected->checkpoint_captured
+			|| participant->thread_id != selected->root.identity.origin_thread_id
+			|| participant->owner_incarnation != selected->root.identity.origin_owner_incarnation
+			|| participant->timeline != selected->root.checkpoint_tli
+			|| participant->physical_lower != selected->root.checkpoint_lower_lsn
+			|| participant->tail_end != selected->root.validated_tail_lsn_exclusive
+			|| participant->native_redo != participant->tail_end
+			|| cluster_wal_inputs_cold_checkpoint_v1(&selected->root, &typed->census_root, &observed)
+				   != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			|| memcmp(&observed.source, &typed->sources[i], sizeof(observed.source)) != 0
+			|| observed.checkpoint_start != selected->checkpoint_start
+			|| memcmp(&observed.checkpoint, &selected->native_checkpoint,
+					  sizeof(observed.checkpoint)) != 0)
+			return false;
+	}
+	return true;
+}
+
+static void
+cold_execution_inputs_failed(ClusterColdTypedV1 *typed)
+{
+	if (typed->refusal == CLUSTER_COLD_OK)
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "pass-2 original input freshness is incomplete");
+	memset(typed->history_xid, 0, sizeof(typed->history_xid));
+	memset(typed->xid_next_at_drain, 0, sizeof(typed->xid_next_at_drain));
+	typed->census_root_captured = false;
+}
+
 /* Pass 1 has not acquired the serial set. Execution revalidation belongs
  * only to pass 2, around the same complete original-source comparison. */
 static bool
 cold_replay_sources_current(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
 {
-	return cluster_recovery_merge_fence_plan_revalidate_nowait(fence)
-		   && cold_sources_match(typed, fence)
-		   && cluster_recovery_merge_fence_plan_revalidate_nowait(fence);
+	bool matched = false;
+
+	PG_TRY();
+	{
+		matched = cluster_recovery_merge_fence_plan_revalidate_nowait(fence)
+				  && cold_sources_match(typed, fence) && cold_history_sources_match(typed)
+				  && cluster_recovery_merge_fence_plan_revalidate_nowait(fence);
+	}
+	PG_CATCH();
+	{
+		cold_execution_inputs_failed(typed);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!matched)
+		cold_execution_inputs_failed(typed);
+	return matched;
 }
 
 bool

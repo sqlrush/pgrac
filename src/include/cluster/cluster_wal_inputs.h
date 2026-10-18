@@ -70,6 +70,15 @@ extern ClusterControlRootResult cluster_wal_inputs_begin_v1(const uint8 storage_
 extern ClusterControlRootResult cluster_wal_inputs_cold_begin_v1(const uint8 storage_uuid[16],
 																 uint64 system_identifier,
 																 ClusterWalInputsV1 **out);
+/* Startup in recovery, under the caller's existing execution WALR retention
+ * owner. Select one exact CLOSED/RECOVERY_REQUIRED/RECOVERY_COMPLETE checkpoint
+ * from the original whole ROOT, validate its native anchor and physical claim,
+ * and recheck ROOT after claim I/O outside CF. Acquires no WALR scope or recovery
+ * permission. The caller must revalidate its original execution owner before
+ * and after the call; output is provisional metadata, never an endpoint proof. */
+extern ClusterControlRootResult cluster_wal_inputs_cold_checkpoint_v1(
+	const ClusterControlRootSnapshot *expected, const ClusterControlRootFileToken *root_token,
+	ClusterWalRecoveryCheckpointV1 *out);
 /* Metadata token of the whole selected ROOT, not a publication capability.
  * Like at_v1, this requires the same live scope/owner; call revalidate_v1
  * before consuming provisional results. Invalid scopes produce no token. */
