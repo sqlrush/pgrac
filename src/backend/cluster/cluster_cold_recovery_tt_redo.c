@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_cold_recovery_tt_redo.c
- *    Read-only ordinary redo of one original captured TT base input.
+ *    Read-only ordinary redo inputs from original captured TT and UNDO.
  *
  * Portions Copyright (c) 2026, pgrac contributors
  * Author: SqlRush <sqlrush@gmail.com>
@@ -17,7 +17,9 @@
 #include "postgres.h"
 
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_recovery_undo_scan.h"
 #include "cluster/cluster_side_online_plan.h"
+#include "cluster/cluster_uba.h"
 
 bool
 cluster_cold_typed_tt_redo_header_v1(const ClusterColdTypedV1 *typed, uint32 participant,
@@ -156,5 +158,40 @@ cluster_cold_typed_tt_redo_match_v1(const ClusterColdTypedV1 *typed, uint32 part
 		|| input.key.slot_wrap != key.slot_wrap)
 		return false;
 	*out = input;
+	return true;
+}
+
+bool
+cluster_cold_typed_undo_redo_record_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+									   uint32 segment_index, UBA address,
+									   ClusterRecoveryUndoRecord *out, uint32 *generation)
+{
+	RfSideUndoHeaderImageV1 header;
+	RfSideUndoBlockImageV1 block;
+	uint8 owner;
+	uint32 segment, address_segment, block_no;
+	uint16 tt_slot, row;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (generation != NULL)
+		*generation = 0;
+	if (out == NULL || generation == NULL
+		|| cluster_cold_tt_base_header_v1(typed, segment_index, &owner, &segment) == NULL
+		|| !uba_decode_record(address, &address_segment, &block_no, &tt_slot, &row)
+		|| address_segment != segment || block_no == 0
+		|| !cluster_cold_typed_tt_redo_header_v1(typed, participant, segment_index, &header))
+		return false;
+	/* Use the same sealed source in its entirety. The original block fold
+	 * requires an FPI after the last INIT/REUSE, and refuses an earlier
+	 * unanchored delta rather than borrowing a future FPI or target DATA. */
+	if (rf_side_online_plan_prepare_undo_block_v1(typed->side_plans[participant], owner, segment,
+												  block_no, &block)
+			!= RF_PAGE_PROOF_DETAIL_OK
+		|| cluster_recovery_undo_record_read(block.page.data, BLCKSZ, segment, block_no, owner,
+											 address, out)
+			   != CLUSTER_RECOVERY_UNDO_ENTRY)
+		return false;
+	*generation = ((const UndoSegmentHeaderData *)header.page.data)->wrap_count;
 	return true;
 }

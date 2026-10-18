@@ -1,4 +1,4 @@
-/* Original TT capture plus the real sealed SIDE planner and native TT fold.
+/* Original TT capture plus real sealed SIDE, native TT/UNDO folds and parser.
  * Only temporary path resolution, allocation and the inherited native-runtime
  * boundaries are fixtures. This does not execute Startup or classify losers.
  * Author: SqlRush <sqlrush@gmail.com>
@@ -713,10 +713,278 @@ UT_TEST(tt_redo_slots_use_reused_binding_instead_of_captured_key)
 	tt_redo_destroy(&f);
 }
 
+static UBA
+tt_redo_record_address(uint32 segment, uint32 block, uint16 row)
+{
+	UBA address = { { ((uint64)block << 32) | segment, ((uint64)row << 16) | (4 + row) } };
+
+	return address;
+}
+
+static void
+tt_redo_record_page(PGAlignedBlock *page, TransactionId xid)
+{
+	UndoBlockHeader block = { 0 };
+
+	memset(page, 0, sizeof(*page));
+	block.magic = PGRAC_UNDO_BLOCK_MAGIC;
+	block.block_version = UNDO_BLOCK_VERSION_1;
+	block.free_offset = sizeof(block);
+	for (uint16 row = 0; row < 2; row++) {
+		UndoRecordHeader header = { 0 };
+		UndoSlotDirEntry directory = { 0 };
+		UndoInsertPayload payload = { 32 + row, 0 };
+
+		header.record_type = UNDO_RECORD_INSERT;
+		header.flags = UNDO_REC_FLAG_FIRST_IN_TX;
+		header.payload_length = sizeof(payload);
+		header.xid = xid + row;
+		header.origin_node_id = 2;
+		header.tt_slot_segment_id = 513 + row;
+		header.tt_slot_id = 5 + row;
+		header.tt_wrap_plus1 = row == 0 ? 8 : 0;
+		header.target_locator = (RelFileLocator){ 1663, 5, 16385 };
+		header.target_offset = 1;
+		directory.record_offset = block.free_offset;
+		directory.record_length = sizeof(header) + sizeof(payload);
+		directory.record_type = header.record_type;
+		directory.flags = header.flags;
+		memcpy(page->data + block.free_offset, &header, sizeof(header));
+		memcpy(page->data + block.free_offset + sizeof(header), &payload, sizeof(payload));
+		memcpy(page->data + UNDO_SLOT_DIR_OFFSET(row), &directory, sizeof(directory));
+		block.slot_count++;
+		block.free_offset += directory.record_length;
+	}
+	memcpy(page->data, &block, sizeof(block));
+}
+
+static void
+tt_redo_feed_record_page(TtRedoFixture *f, XLogRecPtr begin, const PGAlignedBlock *page,
+						 bool full_image)
+{
+	FakeXactRecord fake;
+	xl_undo_block_write carrier = { 0 };
+	uint8 bytes[sizeof(carrier) + BLCKSZ];
+	uint32 length = sizeof(carrier);
+
+	carrier.instance = 3;
+	carrier.segment_id = 513;
+	carrier.block_no = 9;
+	carrier.has_fpi = full_image;
+	if (full_image) {
+		memcpy(bytes + length, page->data, BLCKSZ);
+		length += BLCKSZ;
+	} else {
+		UndoSlotDirEntry directory;
+
+		memcpy(&directory, page->data + UNDO_SLOT_DIR_OFFSET(0), sizeof(directory));
+		carrier.rec_off = directory.record_offset;
+		carrier.rec_len = directory.record_length;
+		carrier.slot_off = UNDO_SLOT_DIR_OFFSET(0);
+		memcpy(bytes + length, page->data, UNDO_BLOCK_HDR_PREFIX_LEN);
+		length += UNDO_BLOCK_HDR_PREFIX_LEN;
+		memcpy(bytes + length, page->data + directory.record_offset, directory.record_length);
+		length += directory.record_length;
+		memcpy(bytes + length, &directory, sizeof(directory));
+		length += sizeof(directory);
+	}
+	memcpy(bytes, &carrier, sizeof(carrier));
+	make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE, bytes, length);
+	undo_header_feed(f->typed.side_plans[0], &fake, begin);
+}
+
+static void
+tt_redo_record_refuses(const ClusterColdTypedV1 *typed, uint32 participant, uint32 segment,
+					   UBA address)
+{
+	ClusterRecoveryUndoRecord out, zero = { 0 };
+	uint32 generation = UINT32_MAX;
+
+	memset(&out, 0xa9, sizeof(out));
+	UT_ASSERT(!cluster_cold_typed_undo_redo_record_v1(typed, participant, segment, address, &out,
+													  &generation));
+	UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+	UT_ASSERT_EQ(generation, 0);
+}
+
+UT_TEST(tt_redo_undo_uses_latest_fpi_and_delta_without_installing_or_borrowing)
+{
+	TtRedoFixture f;
+	PGAlignedBlock page, disk, zero = { 0 };
+	ClusterRecoveryUndoRecord out, saved;
+	UBA address = tt_redo_record_address(513, 9, 0);
+	uint32 generation = UINT32_MAX;
+	uint32 segment;
+	uint8 owner;
+	char path[MAXPGPATH];
+	int fd;
+
+	tt_redo_fixture(&f, 400, RF_SIDE_PLAN_RECOVERY);
+	tt_redo_record_page(&page, 802);
+	tt_redo_feed_record_page(&f, 100, &page, true);
+	tt_redo_record_page(&page, 882);
+	tt_redo_feed_record_page(&f, 200, &page, true);
+	tt_redo_record_page(&page, 892);
+	tt_redo_feed_record_page(&f, 300, &page, false);
+	tt_redo_seal(&f);
+	UT_ASSERT(cluster_cold_typed_undo_redo_record_v1(&f.typed, 0, 0, address, &out, &generation));
+	UT_ASSERT_EQ(generation, 0);
+	UT_ASSERT_EQ(out.header.xid, 892);
+	UT_ASSERT_EQ(out.block_header.block_lsn, 400);
+	UT_ASSERT_EQ(out.header.tt_wrap_plus1, 8);
+	saved = out;
+	memset(&out, 0x6b, sizeof(out));
+	UT_ASSERT(cluster_cold_typed_undo_redo_record_v1(&f.typed, 0, 0, address, &out, &generation));
+	UT_ASSERT_EQ(memcmp(&out, &saved, sizeof(out)), 0);
+	address = tt_redo_record_address(513, 9, 1);
+	UT_ASSERT(cluster_cold_typed_undo_redo_record_v1(&f.typed, 0, 0, address, &out, &generation));
+	UT_ASSERT_EQ(out.header.xid, 883); /* The row untouched by the final delta. */
+	UT_ASSERT_EQ(out.header.tt_slot_segment_id, 514);
+	UT_ASSERT_EQ(out.header.tt_slot_id, 6);
+	UT_ASSERT_EQ(out.header.tt_wrap_plus1, 0); /* Unknown stays unknown. */
+	UT_ASSERT_EQ(
+		memcmp(cluster_cold_tt_base_header_v1(&f.typed, 0, &owner, &segment), f.base.data, BLCKSZ),
+		0);
+	snprintf(path, sizeof(path), "%s/513", tt_redo_dir);
+	fd = open(path, O_RDONLY);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(pread(fd, disk.data, BLCKSZ, (off_t)9 * BLCKSZ), BLCKSZ);
+	UT_ASSERT_EQ(memcmp(disk.data, zero.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(close(fd), 0);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_redo_undo_refuses_missing_or_late_anchor_even_with_valid_data)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		TtRedoFixture f;
+		PGAlignedBlock page;
+		char path[MAXPGPATH];
+		int fd;
+
+		tt_redo_fixture(&f, 100 + fault * 100, RF_SIDE_PLAN_RECOVERY);
+		tt_redo_record_page(&page, 802);
+		snprintf(path, sizeof(path), "%s/513", tt_redo_dir);
+		fd = open(path, O_RDWR);
+		UT_ASSERT(fd >= 0);
+		UT_ASSERT_EQ(pwrite(fd, page.data, BLCKSZ, (off_t)9 * BLCKSZ), BLCKSZ);
+		UT_ASSERT_EQ(close(fd), 0);
+		if (fault > 0)
+			tt_redo_feed_record_page(&f, 100, &page, false);
+		if (fault > 1)
+			tt_redo_feed_record_page(&f, 200, &page, true);
+		tt_redo_seal(&f);
+		tt_redo_record_refuses(&f.typed, 0, 0, tt_redo_record_address(513, 9, 0));
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_redo_undo_refuses_bad_bounds_source_and_arguments_with_cleared_outputs)
+{
+	TtRedoFixture f;
+	PGAlignedBlock page;
+	UBA address = tt_redo_record_address(513, 9, 0);
+	ClusterRecoveryUndoRecord out, zero = { 0 };
+	uint32 generation = UINT32_MAX;
+
+	tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+	tt_redo_record_page(&page, 802);
+	tt_redo_feed_record_page(&f, 100, &page, true);
+	tt_redo_record_refuses(&f.typed, 0, 0, address); /* Unsealed. */
+	tt_redo_seal(&f);
+	tt_redo_record_refuses(NULL, 0, 0, address);
+	tt_redo_record_refuses(&f.typed, 1, 0, address); /* History only. */
+	tt_redo_record_refuses(&f.typed, 0, 1, address);
+	tt_redo_record_refuses(&f.typed, 0, 0, (UBA)InvalidUba_init);
+	tt_redo_record_refuses(&f.typed, 0, 0, tt_redo_record_address(514, 9, 0));
+	tt_redo_record_refuses(&f.typed, 0, 0, tt_redo_record_address(513, 0, 0));
+	tt_redo_record_refuses(&f.typed, 0, 0, tt_redo_record_address(513, 9, 2));
+	f.typed.observer.database_incarnation++;
+	tt_redo_record_refuses(&f.typed, 0, 0, address);
+	f.typed.observer.database_incarnation--;
+	UT_ASSERT(!cluster_cold_typed_undo_redo_record_v1(&f.typed, 0, 0, address, NULL, &generation));
+	UT_ASSERT_EQ(generation, 0);
+	memset(&out, 0xa9, sizeof(out));
+	UT_ASSERT(!cluster_cold_typed_undo_redo_record_v1(&f.typed, 0, 0, address, &out, NULL));
+	UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_redo_undo_refuses_malformed_fpi_record)
+{
+	TtRedoFixture f;
+	PGAlignedBlock page;
+	UndoSlotDirEntry directory;
+
+	tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+	tt_redo_record_page(&page, 802);
+	memcpy(&directory, page.data + UNDO_SLOT_DIR_OFFSET(0), sizeof(directory));
+	directory.record_offset = sizeof(UndoBlockHeader) - 1;
+	memcpy(page.data + UNDO_SLOT_DIR_OFFSET(0), &directory, sizeof(directory));
+	tt_redo_feed_record_page(&f, 100, &page, true);
+	tt_redo_seal(&f);
+	tt_redo_record_refuses(&f.typed, 0, 0, tt_redo_record_address(513, 9, 0));
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_redo_undo_requires_new_fpi_after_segment_reuse_and_returns_new_generation)
+{
+	for (int fresh = 0; fresh < 2; fresh++) {
+		TtRedoFixture f;
+		FakeXactRecord fake;
+		PGAlignedBlock page;
+		RfSideUndoHeaderImageV1 header;
+		ClusterRecoveryUndoRecord out;
+		uint32 generation = UINT32_MAX;
+		char path[MAXPGPATH];
+		int fd;
+		struct {
+			xl_undo_segment_reuse record;
+			char page[BLCKSZ];
+		} reuse = { 0 };
+
+		tt_redo_fixture(&f, fresh ? 400 : 300, RF_SIDE_PLAN_RECOVERY);
+		/* Capture a genuinely unused base, before starting this source. */
+		cluster_cold_tt_base_destroy_v1(&f.typed);
+		cluster_undo_segment_make_header_bytes(513, 3, f.base.data);
+		snprintf(path, sizeof(path), "%s/513", tt_redo_dir);
+		fd = open(path, O_RDWR);
+		UT_ASSERT(fd >= 0);
+		UT_ASSERT_EQ(pwrite(fd, f.base.data, BLCKSZ, 0), BLCKSZ);
+		UT_ASSERT_EQ(close(fd), 0);
+		UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(&f.typed, (Size)1024 * 1024), CLUSTER_COLD_OK);
+		tt_redo_record_page(&page, 802);
+		tt_redo_feed_record_page(&f, 100, &page, true);
+		reuse.record.instance = 3;
+		reuse.record.segment_id = 513;
+		reuse.record.new_generation = 1;
+		cluster_undo_segment_make_header_bytes(513, 3, reuse.page);
+		((UndoSegmentHeaderData *)reuse.page)->wrap_count = 1;
+		make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_REUSE, &reuse,
+							   sizeof(reuse));
+		undo_header_feed(f.typed.side_plans[0], &fake, 200);
+		if (fresh) {
+			tt_redo_record_page(&page, 882);
+			tt_redo_feed_record_page(&f, 300, &page, true);
+		}
+		tt_redo_seal(&f);
+		UT_ASSERT(cluster_cold_typed_tt_redo_header_v1(&f.typed, 0, 0, &header));
+		UT_ASSERT_EQ(((UndoSegmentHeaderData *)header.page.data)->wrap_count, 1);
+		if (fresh) {
+			UT_ASSERT(cluster_cold_typed_undo_redo_record_v1(
+				&f.typed, 0, 0, tt_redo_record_address(513, 9, 0), &out, &generation));
+			UT_ASSERT_EQ(generation, 1);
+			UT_ASSERT_EQ(out.header.xid, 882);
+		} else
+			tt_redo_record_refuses(&f.typed, 0, 0, tt_redo_record_address(513, 9, 0));
+		tt_redo_destroy(&f);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(24);
 	UT_RUN(tt_redo_commit_without_bind_keeps_original_all_slots_and_heads);
 	UT_RUN(tt_redo_unrelated_terminal_preserves_active_input);
 	UT_RUN(tt_redo_empty_cut_preserves_input_and_requires_canonical_flags);
@@ -736,6 +1004,11 @@ main(void)
 	UT_RUN(tt_redo_slots_reject_unsealed_history_bounds_and_invalid_arguments);
 	UT_RUN(tt_redo_slots_refuse_source_drift_and_unsupported_prepared_input);
 	UT_RUN(tt_redo_slots_use_reused_binding_instead_of_captured_key);
+	UT_RUN(tt_redo_undo_uses_latest_fpi_and_delta_without_installing_or_borrowing);
+	UT_RUN(tt_redo_undo_refuses_missing_or_late_anchor_even_with_valid_data);
+	UT_RUN(tt_redo_undo_refuses_bad_bounds_source_and_arguments_with_cleared_outputs);
+	UT_RUN(tt_redo_undo_refuses_malformed_fpi_record);
+	UT_RUN(tt_redo_undo_requires_new_fpi_after_segment_reuse_and_returns_new_generation);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

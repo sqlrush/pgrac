@@ -843,6 +843,21 @@ extern bool cluster_cold_typed_tt_redo_match_v1(const ClusterColdTypedV1 *typed,
 												const ClusterColdTtSlotKeyV1 *expected,
 												ClusterColdTtSlotInputV1 *out);
 
+/* Copy one raw record from a sealed ordinary source's final FPI-backed UNDO
+ * block image and return its folded physical segment generation (zero is
+ * valid). segment_index selects the captured physical segment, which may
+ * differ from the canonical TT segment. No DATA fallback is attempted when
+ * that incarnation lacks an FPI or has an unanchored delta. Original source
+ * isolation and final rechecks remain required. This creates no canonical
+ * transaction, FullXid/epoch/top, checkpoint coverage, complete-chain, loser
+ * or C0/OPEN proof. History, C0 and prepared inputs retain the header fold's
+ * refusal. Failure clears available outputs; successful output owns bytes. */
+extern bool cluster_cold_typed_undo_redo_record_v1(const ClusterColdTypedV1 *typed,
+												   uint32 participant, uint32 segment_index,
+												   UBA address,
+												   struct ClusterRecoveryUndoRecord *out,
+												   uint32 *generation);
+
 /* Sync the selected crashed sources before pass-2 mutations. No replay or
  * completion authority is created; a refusal invalidates this typed attempt. */
 extern bool cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed,
