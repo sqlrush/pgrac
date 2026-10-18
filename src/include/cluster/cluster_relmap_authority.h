@@ -49,6 +49,7 @@
 
 #include "c.h"
 
+#include "common/cluster_relmap_v2.h"
 #include "port/pg_crc32c.h"
 
 /* Authority header magic + version. */
@@ -211,5 +212,29 @@ extern void cluster_relmap_authority_publish(bool shared_map, Oid dbid, uint64 g
  *	not throw.
  */
 extern void cluster_relmap_authority_discard_pending(bool shared_map, Oid dbid, uint64 generation);
+
+/*
+ * V2 storage primitives; not wired into the live v1 publisher.  The caller
+ * serializes the namespace with its relmap lock and binds expected to the
+ * selected authority.  Read exposes committed data and pending obligations
+ * separately.  A degraded read never proves the pending set complete.
+ */
+extern ClusterRelmapV2PairResult
+cluster_relmap_authority_v2_read(const ClusterRelmapV2Namespace *expected,
+								ClusterRelmapV2View *output);
+
+/*
+ * Stage into an initialized, clean v2 pair, primary before backup, with both
+ * copies synced and read back before returning true.  Never initializes or
+ * repairs a missing/foreign/degraded authority, nor replaces an old pending.
+ * The original owner must have sampled its real FullXid and admission before
+ * WAL and registered retention before calling.  This API cannot prove that
+ * provenance.  False may leave durable pending in either copy: retain the
+ * obligation and propagate the original failure; it is not commit/release
+ * permission.  No caller may infer cancellation merely from a false return.
+ */
+extern bool cluster_relmap_authority_v2_write_pending(const ClusterRelmapV2Namespace *expected,
+													uint64 generation, const ClusterRelmapV2Owner *owner,
+													const RelMapFile *pending);
 
 #endif /* CLUSTER_RELMAP_AUTHORITY_H */

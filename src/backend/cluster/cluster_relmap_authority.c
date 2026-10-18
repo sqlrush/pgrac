@@ -33,10 +33,12 @@
 #include "postgres.h"
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "cluster/cluster_guc.h" /* cluster_shared_data_dir */
 #include "cluster/cluster_relmap_authority.h"
+#include "miscadmin.h"
 #include "storage/fd.h"
 
 #define COMMITTED_SLOT_OFFSET CLUSTER_RELMAP_COMMITTED_OFFSET
@@ -378,4 +380,302 @@ cluster_relmap_authority_discard_pending(bool shared_map, Oid dbid, uint64 gener
 
 	finalize_header_crc(image);
 	store_authority(shared_map, dbid, image);
+}
+
+/*
+ * V2 storage.  Keep descriptors bounded and process no interrupts or ereports
+ * while they are open.  All exits close them; the caller supplies the original
+ * precommit/postcommit error polarity and retains any unresolved obligation.
+ *
+ * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md
+ */
+typedef struct RelmapV2Directory {
+	int root;
+	int base;
+	int map;
+	struct stat root_stat;
+	struct stat base_stat;
+	struct stat map_stat;
+	char dbname[32];
+	bool shared;
+} RelmapV2Directory;
+
+typedef struct RelmapV2Copy {
+	bool present;
+	struct stat stat;
+	size_t length;
+	unsigned char bytes[CLUSTER_RELMAP_V2_FILE_SIZE];
+} RelmapV2Copy;
+
+static const char *const relmap_v2_names[] = { AUTHORITY_BASENAME, AUTHORITY_BASENAME ".bak" };
+static const char *const relmap_v2_temps[] = { AUTHORITY_BASENAME ".tmp",
+											AUTHORITY_BASENAME ".bak.tmp" };
+
+static bool
+relmap_v2_same_inode(const struct stat *a, const struct stat *b)
+{
+	return a->st_dev == b->st_dev && a->st_ino == b->st_ino;
+}
+
+static bool
+relmap_v2_regular(const struct stat *st)
+{
+	return S_ISREG(st->st_mode) && st->st_nlink == 1;
+}
+
+static bool
+relmap_v2_entry(int dir, const char *name, const struct stat *expected)
+{
+	struct stat st;
+
+	return fstatat(dir, name, &st, AT_SYMLINK_NOFOLLOW) == 0 && relmap_v2_regular(&st)
+		   && relmap_v2_same_inode(&st, expected);
+}
+
+static bool
+relmap_v2_dirs_current(const RelmapV2Directory *dirs)
+{
+	struct stat st;
+
+	if (lstat(cluster_shared_data_dir, &st) != 0 || !S_ISDIR(st.st_mode)
+		|| !relmap_v2_same_inode(&st, &dirs->root_stat))
+		return false;
+	if (dirs->shared)
+		return fstatat(dirs->root, "global", &st, AT_SYMLINK_NOFOLLOW) == 0
+			   && S_ISDIR(st.st_mode) && relmap_v2_same_inode(&st, &dirs->map_stat);
+	return fstatat(dirs->root, "base", &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(st.st_mode)
+		   && relmap_v2_same_inode(&st, &dirs->base_stat)
+		   && fstatat(dirs->base, dirs->dbname, &st, AT_SYMLINK_NOFOLLOW) == 0
+		   && S_ISDIR(st.st_mode) && relmap_v2_same_inode(&st, &dirs->map_stat);
+}
+
+static bool
+relmap_v2_close_dirs(RelmapV2Directory *dirs)
+{
+	bool ok = true;
+
+	if (dirs->map >= 0 && close(dirs->map) != 0)
+		ok = false;
+	if (dirs->base >= 0 && close(dirs->base) != 0)
+		ok = false;
+	if (dirs->root >= 0 && close(dirs->root) != 0)
+		ok = false;
+	return ok;
+}
+
+static bool
+relmap_v2_open_dirs(const ClusterRelmapV2Namespace *expected, RelmapV2Directory *dirs)
+{
+	const int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+
+	memset(dirs, 0, sizeof(*dirs));
+	dirs->root = dirs->base = dirs->map = -1;
+	if (expected == NULL || expected->system_identifier == 0
+		|| expected->database_incarnation == 0 || expected->shared != (expected->dbid == InvalidOid)
+		|| cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] != '/')
+		return false;
+	dirs->shared = expected->shared;
+	dirs->root = open(cluster_shared_data_dir, flags);
+	if (dirs->root < 0 || fstat(dirs->root, &dirs->root_stat) != 0)
+		return false;
+	if (expected->shared)
+		dirs->map = openat(dirs->root, "global", flags);
+	else {
+		dirs->base = openat(dirs->root, "base", flags);
+		if (dirs->base < 0 || fstat(dirs->base, &dirs->base_stat) != 0)
+			return false;
+		snprintf(dirs->dbname, sizeof(dirs->dbname), "%u", expected->dbid);
+		dirs->map = openat(dirs->base, dirs->dbname, flags);
+	}
+	return dirs->map >= 0 && fstat(dirs->map, &dirs->map_stat) == 0 && relmap_v2_dirs_current(dirs);
+}
+
+/* A missing or short copy can only yield a degraded view.  Unsafe paths and
+ * inode replacement are refusals, even when the other copy is valid. */
+static bool
+relmap_v2_read_copy(int dir, int which, RelmapV2Copy *copy)
+{
+	struct stat opened;
+	struct stat after;
+	int fd;
+	size_t done = 0;
+	bool ok = false;
+
+	memset(copy, 0, sizeof(*copy));
+	if (fstatat(dir, relmap_v2_names[which], &copy->stat, AT_SYMLINK_NOFOLLOW) != 0)
+		return errno == ENOENT;
+	if (!relmap_v2_regular(&copy->stat) || copy->stat.st_size < 0)
+		return false;
+	copy->present = true;
+	fd = openat(dir, relmap_v2_names[which], O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | PG_BINARY);
+	if (fd < 0)
+		return false;
+	if (fstat(fd, &opened) != 0 || !relmap_v2_regular(&opened)
+		|| !relmap_v2_same_inode(&opened, &copy->stat) || opened.st_size != copy->stat.st_size)
+		goto done;
+	/* Keep an overlength marker without reading outside the bounded buffer. */
+	copy->length = Min((uint64)opened.st_size, (uint64)sizeof(copy->bytes) + 1);
+	while (done < Min(copy->length, sizeof(copy->bytes))) {
+		ssize_t n = read(fd, copy->bytes + done, Min(copy->length, sizeof(copy->bytes)) - done);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			goto done;
+		done += n;
+	}
+	ok = fstat(fd, &after) == 0 && after.st_size == opened.st_size
+		 && relmap_v2_same_inode(&after, &opened)
+		 && relmap_v2_entry(dir, relmap_v2_names[which], &opened);
+done:
+	if (close(fd) != 0)
+		ok = false;
+	return ok;
+}
+
+static bool
+relmap_v2_copies_current(int dir, const RelmapV2Copy copies[2])
+{
+	struct stat st;
+
+	for (int i = 0; i < 2; i++) {
+		if (copies[i].present) {
+			if (!relmap_v2_entry(dir, relmap_v2_names[i], &copies[i].stat))
+				return false;
+		} else if (fstatat(dir, relmap_v2_names[i], &st, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT)
+			return false;
+	}
+	return true;
+}
+
+static ClusterRelmapV2PairResult
+relmap_v2_load(const RelmapV2Directory *dirs, const ClusterRelmapV2Namespace *expected,
+			   RelmapV2Copy copies[2], ClusterRelmapV2View *view)
+{
+	if (!relmap_v2_read_copy(dirs->map, 0, &copies[0])
+		|| !relmap_v2_read_copy(dirs->map, 1, &copies[1]) || !relmap_v2_dirs_current(dirs)
+		|| !relmap_v2_copies_current(dirs->map, copies))
+		return CLUSTER_RELMAP_V2_PAIR_INVALID;
+	return cluster_relmap_v2_read_pair(copies[0].bytes, copies[0].length,
+									 copies[1].bytes, copies[1].length, expected, view);
+}
+
+ClusterRelmapV2PairResult
+cluster_relmap_authority_v2_read(const ClusterRelmapV2Namespace *expected,
+								ClusterRelmapV2View *output)
+{
+	RelmapV2Directory dirs;
+	RelmapV2Copy copies[2];
+	ClusterRelmapV2View view;
+	ClusterRelmapV2PairResult result = CLUSTER_RELMAP_V2_PAIR_INVALID;
+
+	if (output == NULL)
+		return result;
+	memset(output, 0, sizeof(*output));
+	if (relmap_v2_open_dirs(expected, &dirs))
+		result = relmap_v2_load(&dirs, expected, copies, &view);
+	if (!relmap_v2_close_dirs(&dirs))
+		result = CLUSTER_RELMAP_V2_PAIR_INVALID;
+	if (result == CLUSTER_RELMAP_V2_PAIR_VALID || result == CLUSTER_RELMAP_V2_PAIR_DEGRADED)
+		*output = view;
+	return result;
+}
+
+/* Each replacement is file sync -> rename -> directory sync -> exact inode
+ * and full byte readback.  Never roll the old primary into backup: the backup
+ * must receive the same new pending obligation before stage can succeed. */
+static bool
+relmap_v2_install(const RelmapV2Directory *dirs, int which,
+				  const unsigned char bytes[CLUSTER_RELMAP_V2_FILE_SIZE], RelmapV2Copy copies[2])
+{
+	RelmapV2Copy actual;
+	struct stat temp_stat;
+	int fd = -1;
+	size_t done = 0;
+	bool own_temp = false;
+	bool installed = false;
+	bool ok = false;
+
+	fd = openat(dirs->map, relmap_v2_temps[which],
+				O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC | PG_BINARY, 0600);
+	if (fd < 0 || fstat(fd, &temp_stat) != 0 || !relmap_v2_regular(&temp_stat))
+		goto cleanup;
+	own_temp = true;
+	while (done < CLUSTER_RELMAP_V2_FILE_SIZE) {
+		ssize_t n = write(fd, bytes + done, CLUSTER_RELMAP_V2_FILE_SIZE - done);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			goto cleanup;
+		done += n;
+	}
+	if (pg_fsync(fd) != 0 || !relmap_v2_dirs_current(dirs)
+		|| !relmap_v2_copies_current(dirs->map, copies)
+		|| !relmap_v2_entry(dirs->map, relmap_v2_temps[which], &temp_stat))
+		goto cleanup;
+	if (renameat(dirs->map, relmap_v2_temps[which], dirs->map, relmap_v2_names[which]) != 0)
+		goto cleanup;
+	installed = true;
+	if (pg_fsync(dirs->map) != 0 || !relmap_v2_dirs_current(dirs)
+		|| !relmap_v2_read_copy(dirs->map, which, &actual) || !actual.present
+		|| actual.length != CLUSTER_RELMAP_V2_FILE_SIZE
+		|| !relmap_v2_same_inode(&actual.stat, &temp_stat)
+		|| memcmp(actual.bytes, bytes, CLUSTER_RELMAP_V2_FILE_SIZE) != 0)
+		goto cleanup;
+	copies[which] = actual;
+	ok = true;
+cleanup:
+	if (fd >= 0 && close(fd) != 0)
+		ok = false;
+	/* A preexisting or replaced temp belongs to somebody else. */
+	if (own_temp && !installed && relmap_v2_entry(dirs->map, relmap_v2_temps[which], &temp_stat))
+		if (unlinkat(dirs->map, relmap_v2_temps[which], 0) != 0)
+			ok = false;
+	return ok;
+}
+
+bool
+cluster_relmap_authority_v2_write_pending(const ClusterRelmapV2Namespace *expected,
+										uint64 generation, const ClusterRelmapV2Owner *owner,
+										const RelMapFile *pending)
+{
+	RelmapV2Directory dirs;
+	RelmapV2Copy copies[2];
+	RelmapV2Copy final[2];
+	ClusterRelmapV2View view;
+	ClusterRelmapV2Image image;
+	unsigned char bytes[CLUSTER_RELMAP_V2_FILE_SIZE];
+	bool ok = false;
+
+	/* No I/O can turn a disabled sync policy into durable stage permission. */
+	if (!enableFsync || owner == NULL || pending == NULL)
+		return false;
+	if (!relmap_v2_open_dirs(expected, &dirs))
+		goto done;
+	if (relmap_v2_load(&dirs, expected, copies, &view) != CLUSTER_RELMAP_V2_PAIR_VALID
+		|| view.has_pending || view.committed_generation == PG_UINT64_MAX
+		|| generation != view.committed_generation + 1)
+		goto done;
+	memset(&image, 0, sizeof(image));
+	image.identity = *expected;
+	image.committed_generation = view.committed_generation;
+	image.committed = view.committed;
+	image.pending_generation = generation;
+	image.pending_owner = *owner;
+	image.pending = *pending;
+	if (cluster_relmap_v2_encode(&image, bytes, sizeof(bytes)) != CLUSTER_RELMAP_V2_VALID)
+		goto done;
+	if (!relmap_v2_install(&dirs, 0, bytes, copies) || !relmap_v2_install(&dirs, 1, bytes, copies))
+		goto done;
+	/* Recheck both after the second install, not just each one in isolation. */
+	ok = relmap_v2_load(&dirs, expected, final, &view) == CLUSTER_RELMAP_V2_PAIR_VALID
+		 && relmap_v2_same_inode(&final[0].stat, &copies[0].stat)
+		 && relmap_v2_same_inode(&final[1].stat, &copies[1].stat)
+		 && memcmp(final[0].bytes, bytes, sizeof(bytes)) == 0
+		 && memcmp(final[1].bytes, bytes, sizeof(bytes)) == 0;
+done:
+	if (!relmap_v2_close_dirs(&dirs))
+		ok = false;
+	return ok;
 }

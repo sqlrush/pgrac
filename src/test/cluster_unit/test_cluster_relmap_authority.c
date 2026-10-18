@@ -43,6 +43,7 @@
 
 #include "cluster/cluster_relmap_authority.h"
 #include "common/relmap.h"
+#include "miscadmin.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
 #include "utils/elog.h"
@@ -58,6 +59,7 @@
 UT_DEFINE_GLOBALS();
 
 char *cluster_shared_data_dir = NULL;
+bool enableFsync = true;
 
 /* ---- Assert + ereport machinery ---- */
 void

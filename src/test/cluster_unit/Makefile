@@ -529,6 +529,21 @@ SIMPLE_TESTS := $(filter-out test_cluster_catalog_manifest test_cluster_catalog_
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_init,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_v2
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2,$(SIMPLE_TESTS))
+TESTS += test_cluster_relmap_v2_storage
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2_storage,$(SIMPLE_TESTS))
+
+# Compile the real storage module with pass-through syscall fault boundaries.
+test_cluster_relmap_v2_storage_product.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_authority.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Dwrite=relmap_test_write -Dread=relmap_test_read \
+		-Drenameat=relmap_test_renameat -c $< -o $@
+
+test_cluster_relmap_v2_storage: test_cluster_relmap_v2_storage.c unit_test.h \
+		test_cluster_relmap_v2_storage_product.o $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_relmap_v2_storage_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_relmap_v2: test_cluster_relmap_v2.c unit_test.h \
 		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
@@ -4792,6 +4807,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_typed_redo_reader.inc test_cluster_typed_redo_fpi.inc test_cluster_cold_init_native.inc
 	rm -f test_cluster_current_mx_local_sample.inc test_cluster_current_mx_reply_builder.inc
 	rm -f test_cluster_page_cold_redo_product.o
+	rm -f test_cluster_relmap_v2_storage_product.o
 	rm -f $(CLUSTER_COLD_PLAN_O) $(CLUSTER_COLD_DECODE_O) $(CLUSTER_COLD_STARTUP_O) test_cluster_cold_recovery_io_core.o
 	rm -f $(D_COLD_REFAIL_O) $(D_COLD_REPLAY_O)
 	rm -f test_cluster_block_redeclare_scan.inc
