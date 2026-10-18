@@ -80,11 +80,14 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 	uint16 opcode;
 	ClusterUndoDecodedKind kind;
 
-	if (record == NULL || out == NULL)
+	if (record == NULL || record->record == NULL || out == NULL)
 		return false;
 	memset(out, 0, sizeof(*out));
 	if (XLogRecGetRmid(record) != RM_CLUSTER_UNDO_ID)
 		return false; /* not a cluster-undo record */
+	/* Every supported kind requires a nonempty main payload. */
+	if (XLogRecGetData(record) == NULL)
+		return false;
 	opcode = XLogRecGetInfo(record) & XLR_RMGR_INFO_MASK;
 	kind = cluster_undo_kind_for_opcode(opcode);
 	if (kind == CLUSTER_UNDO_KIND_UNKNOWN)

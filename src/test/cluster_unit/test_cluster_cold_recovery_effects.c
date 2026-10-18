@@ -978,10 +978,18 @@ undo_header_effect_record(EffectRecord *r, uint8 info)
 										  .xid = 802,
 										  .wrap = 7,
 										  .format_version = CLUSTER_UNDO_TT_ABORT_EXACT_VERSION };
+	xl_undo_tt_slot_commit commit = { .segment_id = 257,
+									 .instance = 2,
+									 .slot_offset = 4,
+									 .xid = 802,
+									 .wrap = 7,
+									 .commit_scn = 23 };
 
 	record_init(r, RM_CLUSTER_UNDO_ID, info);
 	if (info == XLOG_UNDO_TT_SLOT_ABORT)
 		append(r, &abort, sizeof(abort));
+	else if (info == XLOG_UNDO_TT_SLOT_COMMIT)
+		append(r, &commit, sizeof(commit));
 	else if (info == XLOG_UNDO_TT_SLOT_SET_HEAD)
 		append(r, &head, sizeof(head));
 	else if (info == XLOG_UNDO_SEGMENT_INIT)
@@ -1000,7 +1008,7 @@ UT_TEST(test_foreign_undo_header_routes_only_connected_record_consumers)
 {
 	const uint8 infos[]
 		= { XLOG_UNDO_SEGMENT_INIT, XLOG_UNDO_SEGMENT_REUSE,	XLOG_UNDO_SEGMENT_RECYCLE,
-			XLOG_UNDO_TT_SLOT_BIND, XLOG_UNDO_TT_SLOT_SET_HEAD, XLOG_UNDO_TT_SLOT_ABORT };
+			XLOG_UNDO_TT_SLOT_BIND, XLOG_UNDO_TT_SLOT_ABORT };
 	for (uint32 i = 0; i < lengthof(infos); i++) {
 		EffectRecord r;
 		ClusterColdDecodedV1 out = { 0 };
@@ -1016,6 +1024,34 @@ UT_TEST(test_foreign_undo_header_routes_only_connected_record_consumers)
 		UT_ASSERT_EQ(out.record.record_flags, 0);
 		UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, true));
 	}
+}
+
+UT_TEST(test_standalone_prepared_carriers_remain_refused)
+{
+	const uint8 infos[] = { XLOG_UNDO_TT_SLOT_COMMIT, XLOG_UNDO_TT_SLOT_SET_HEAD,
+		XLOG_UNDO_TT_SLOT_ABORT };
+
+	for (uint32 i = 0; i < lengthof(infos); i++)
+		for (int foreign = 0; foreign <= 1; foreign++) {
+			EffectRecord r;
+			ClusterColdDecodedV1 out = { 0 };
+			undo_header_effect_record(&r, infos[i]);
+			if (infos[i] == XLOG_UNDO_TT_SLOT_ABORT) {
+				xl_undo_tt_slot_abort legacy
+					= { .segment_id = 257, .instance = 2, .slot_offset = 4, .xid = 802, .wrap = 7 };
+				record_init(&r, RM_CLUSTER_UNDO_ID, infos[i]);
+				append(&r, &legacy, sizeof(legacy));
+			}
+			UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, foreign, &out),
+						 CLUSTER_COLD_OK);
+			UT_ASSERT((out.record.record_flags & CLUSTER_COLD_RECORD_UNSUPPORTED) != 0);
+			UT_ASSERT_EQ(out.effects.required, CLUSTER_COLD_EFFECT_RECORD);
+			UT_ASSERT_EQ(out.effects.refused, out.effects.required);
+			UT_ASSERT_EQ(out.effects.native_apply | out.effects.no_effect, 0);
+			UT_ASSERT(partitioned(&out.effects));
+			UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&out.record), CLUSTER_COLD_UNSCHEDULED_REFUSE);
+			UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, !foreign));
+		}
 }
 
 UT_TEST(test_foreign_undo_header_malformed_carriers_remain_refused)
@@ -1050,7 +1086,12 @@ UT_TEST(test_foreign_undo_header_malformed_carriers_remain_refused)
 			}
 			if (cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out)
 				== CLUSTER_COLD_OK) {
-				UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+				UT_ASSERT((out.record.record_flags & CLUSTER_COLD_RECORD_SIDE_UNOWNED) != 0);
+				UT_ASSERT_EQ(out.effects.required, CLUSTER_COLD_EFFECT_RECORD);
+				UT_ASSERT_EQ(out.effects.refused, out.effects.required);
+				UT_ASSERT_EQ(out.effects.native_apply | out.effects.no_effect, 0);
+				UT_ASSERT(partitioned(&out.effects));
+				UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&out.record), CLUSTER_COLD_UNSCHEDULED_REFUSE);
 				UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
 			}
 		}
@@ -1082,7 +1123,12 @@ UT_TEST(test_foreign_abort_requires_exact_version_and_complete_carrier)
 		}
 		if (cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out)
 			== CLUSTER_COLD_OK) {
-			UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+			UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED
+							| (fault == 0 ? CLUSTER_COLD_RECORD_UNSUPPORTED : 0));
+			UT_ASSERT_EQ(out.effects.required, CLUSTER_COLD_EFFECT_RECORD);
+			UT_ASSERT_EQ(out.effects.refused, out.effects.required);
+			UT_ASSERT_EQ(out.effects.native_apply | out.effects.no_effect, 0);
+			UT_ASSERT(partitioned(&out.effects));
 			UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
 		}
 	}
@@ -1091,7 +1137,7 @@ UT_TEST(test_foreign_abort_requires_exact_version_and_complete_carrier)
 
 UT_TEST(test_foreign_native_abort_keeps_complete_record_effects)
 {
-	for (int variant = 0; variant < 4; variant++) {
+	for (int variant = 0; variant < 8; variant++) {
 		EffectRecord r;
 		ClusterColdDecodedV1 out = { 0 };
 		uint32 xinfo = XACT_XINFO_HAS_SCN;
@@ -1099,15 +1145,22 @@ UT_TEST(test_foreign_native_abort_keeps_complete_record_effects)
 			xinfo |= XACT_XINFO_HAS_DROPPED_STATS;
 		if (variant & 2)
 			xinfo |= XACT_XINFO_HAS_AE_LOCKS;
+		if (variant & 4)
+			xinfo |= XACT_XINFO_HAS_SUBXACTS;
 		completion(&r, false, xinfo);
 		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out), CLUSTER_COLD_OK);
 		UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
+		UT_ASSERT_EQ(out.effects.required & CLUSTER_COLD_EFFECT_CHILDREN,
+					 (variant & 4) ? CLUSTER_COLD_EFFECT_CHILDREN : 0);
 		UT_ASSERT_EQ(out.effects.native_apply, out.effects.required);
 		UT_ASSERT_EQ(out.effects.refused | out.effects.no_effect, 0);
 		UT_ASSERT(partitioned(&out.effects));
 		UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, false));
 		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, false, &out), CLUSTER_COLD_OK);
 		UT_ASSERT_EQ(out.record.record_flags, 0);
+		UT_ASSERT_EQ(out.effects.native_apply, out.effects.required);
+		UT_ASSERT_EQ(out.effects.refused | out.effects.no_effect, 0);
+		UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, true));
 	}
 }
 
@@ -1200,7 +1253,7 @@ UT_TEST(test_foreign_native_xact_origin_effect_has_no_consumer)
 
 UT_TEST(test_foreign_native_abort_unsupported_effects_are_not_consumers)
 {
-	const uint32 extra[] = { XACT_XINFO_HAS_SUBXACTS, XACT_XINFO_HAS_RELFILELOCATORS,
+	const uint32 extra[] = { XACT_XINFO_HAS_RELFILELOCATORS,
 		XACT_XINFO_HAS_TWOPHASE, XACT_XINFO_HAS_ORIGIN };
 	for (uint32 i = 0; i < lengthof(extra); i++) {
 		EffectRecord r;
@@ -1608,7 +1661,7 @@ UT_TEST(test_original_startup_dependency_leaves_non_c0_with_existing_dispatch)
 int
 main(void)
 {
-	UT_PLAN(46);
+	UT_PLAN(47);
 	UT_RUN(test_original_startup_dependency_decodes_before_target_owner);
 	UT_RUN(test_original_startup_dependency_leaves_non_c0_with_existing_dispatch);
 	UT_RUN(test_foreign_c0_routes_whole_record_to_exact_side_consumer);
@@ -1625,6 +1678,7 @@ main(void)
 	UT_RUN(test_foreign_native_abort_unsupported_effects_are_not_consumers);
 	UT_RUN(test_foreign_abort_requires_exact_version_and_complete_carrier);
 	UT_RUN(test_foreign_undo_header_routes_only_connected_record_consumers);
+	UT_RUN(test_standalone_prepared_carriers_remain_refused);
 	UT_RUN(test_foreign_undo_header_malformed_carriers_remain_refused);
 	UT_RUN(test_foreign_undo_blocks_require_real_record_consumer);
 	UT_RUN(test_foreign_undo_blocks_reject_malformed_or_unowned_shapes);

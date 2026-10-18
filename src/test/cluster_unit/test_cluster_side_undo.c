@@ -347,6 +347,34 @@ UT_TEST(test_decode_malformed_and_unknown_blocked)
 	UT_ASSERT(!cluster_undo_decode(rec, NULL));
 }
 
+UT_TEST(test_decode_missing_carrier_blocked)
+{
+	const struct {
+		uint8 info;
+		uint32 len;
+	} carriers[] = {
+		{ XLOG_UNDO_TT_SLOT_COMMIT, sizeof(xl_undo_tt_slot_commit) },
+		{ XLOG_UNDO_TT_SLOT_SET_HEAD, sizeof(xl_undo_tt_slot_set_head) },
+		{ XLOG_UNDO_TT_SLOT_ABORT, sizeof(xl_undo_tt_slot_abort) },
+		{ XLOG_UNDO_TT_SLOT_ABORT, sizeof(xl_undo_tt_slot_abort_exact) },
+		{ XLOG_UNDO_TT_SLOT_BIND, sizeof(xl_undo_tt_slot_bind) },
+	};
+	FakeRecord fr;
+	ClusterUndoDecoded out;
+	XLogReaderState *record;
+
+	for (uint32 i = 0; i < lengthof(carriers); i++) {
+		record = make_record(&fr, RM_CLUSTER_UNDO_ID, carriers[i].info, NULL, 0);
+		/* A reported complete length cannot replace the missing bytes. */
+		fr.u.dec.main_data_len = carriers[i].len;
+		UT_ASSERT(!cluster_undo_decode(record, &out));
+		fr.u.dec.main_data_len = 0;
+		UT_ASSERT(!cluster_undo_decode(record, &out));
+	}
+	memset(&fr, 0, sizeof(fr));
+	UT_ASSERT(!cluster_undo_decode(&fr.st, &out));
+}
+
 UT_TEST(test_preflight_field_integrity_and_route)
 {
 	FakeRecord fr;
@@ -707,11 +735,12 @@ UT_TEST(test_recovery_abort_codec_does_not_authorize_ordinary_side)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 
 	UT_RUN(test_decode_tt_commit_fields);
 	UT_RUN(test_decode_tt_bind_exact_shape_and_reserved_bytes);
 	UT_RUN(test_decode_malformed_and_unknown_blocked);
+	UT_RUN(test_decode_missing_carrier_blocked);
 	UT_RUN(test_preflight_field_integrity_and_route);
 	UT_RUN(test_decode_block_write_fields);
 	UT_RUN(test_decode_set_head_and_multi_exact_shape);
