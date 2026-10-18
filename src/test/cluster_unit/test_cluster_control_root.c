@@ -15413,6 +15413,18 @@ bootstrap_read_fixture(BootstrapFixture *f, int node)
 	bootstrap_race_at = 2;
 	bootstrap_close_calls = bootstrap_close_fail_at = 0;
 	bootstrap_fixture(f, node);
+	/* Real empty unsupported-family routes for every selected origin. */
+	snprintf(path, sizeof(path), "%s/native_side", test_root);
+	if (mkdir(path, 0700) != 0 && errno != EEXIST)
+		abort();
+	for (uint32 origin = 0; origin <= 127; origin += 127) {
+		snprintf(path, sizeof(path), "%s/native_side/origin_%u", test_root, origin);
+		if (mkdir(path, 0700) != 0 && errno != EEXIST)
+			abort();
+		snprintf(path, sizeof(path), "%s/native_side/origin_%u/pg_commit_ts", test_root, origin);
+		if (mkdir(path, 0700) != 0 && errno != EEXIST)
+			abort();
+	}
 	if (bootstrap_local[0] == '\0') {
 		strlcpy(bootstrap_local, "/tmp/pgrac-bootstrap-local.XXXXXX", sizeof(bootstrap_local));
 		if (mkdtemp(bootstrap_local) == NULL)
@@ -15942,6 +15954,102 @@ static void
 bootstrap_history_files(BootstrapFixture *f, uint32 node, uint32 count, char paths[3][MAXPGPATH])
 {
 	bootstrap_history_files_profile(f, node, count, paths, false);
+}
+
+UT_TEST(test_bootstrap_refuses_old_commit_ts_with_disabled_profile)
+{
+	BootstrapFixture f;
+	ClusterControlBootstrapObservation out;
+	char paths[3][MAXPGPATH], dir[MAXPGPATH], entry[MAXPGPATH];
+	uint8 page[BLCKSZ] = { 0 };
+	struct stat before, after;
+	int fds_before = 0, fds_after = 0;
+
+	for (int fd = 0; fd < 256; fd++)
+		if (fcntl(fd, F_GETFD) >= 0)
+			fds_before++;
+	for (uint32 local = 0; local <= 127; local += 127)
+		for (uint32 origin = 0; origin <= 127; origin += 127)
+			for (int shape = 0; shape < 6; shape++) {
+				bootstrap_read_fixture(&f, local);
+				bootstrap_history_files(&f, 127, 2, paths);
+				UT_ASSERT(!f.local_anchor.track_commit_timestamp);
+				UT_ASSERT_EQ(cluster_control_bootstrap_read(bootstrap_local, test_root,
+															test_wal_root, local, &out),
+							 0);
+				if (out.config_bytes != NULL)
+					pfree(out.config_bytes);
+				snprintf(dir, sizeof(dir), "%s/native_side/origin_%u/pg_commit_ts", test_root,
+						 origin);
+				snprintf(entry, sizeof(entry), "%s/%s", dir, shape < 2 ? "0000" : "unknown");
+				page[0] = shape == 1 ? 0xa5 : 0;
+				if (shape < 3)
+					write_all_or_abort(entry, page, shape == 2 ? 0 : sizeof(page));
+				else if (shape == 3)
+					UT_ASSERT_EQ(mkdir(entry, 0700), 0);
+				else if (shape == 4)
+					UT_ASSERT_EQ(symlink("/does-not-exist", entry), 0);
+				else
+					UT_ASSERT_EQ(mkfifo(entry, 0600), 0);
+				UT_ASSERT_EQ(lstat(entry, &before), 0);
+				UT_ASSERT_EQ(bootstrap_read_refused(local),
+							 CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED);
+				UT_ASSERT_EQ(lstat(entry, &after), 0);
+				UT_ASSERT_EQ(before.st_dev, after.st_dev);
+				UT_ASSERT_EQ(before.st_ino, after.st_ino);
+				UT_ASSERT_EQ(before.st_mode, after.st_mode);
+				UT_ASSERT_EQ(before.st_size, after.st_size);
+				if (shape == 3)
+					UT_ASSERT_EQ(rmdir(entry), 0);
+				else
+					UT_ASSERT_EQ(unlink(entry), 0);
+				UT_ASSERT_EQ(test_cf_lock_calls, 0);
+				v2_assert_primary_unchanged(f.before);
+			}
+	for (int fd = 0; fd < 256; fd++)
+		if (fcntl(fd, F_GETFD) >= 0)
+			fds_after++;
+	UT_ASSERT_EQ(fds_before, fds_after);
+}
+
+UT_TEST(test_bootstrap_refuses_unknown_commit_ts_routes)
+{
+	BootstrapFixture f;
+	char path[MAXPGPATH], saved[MAXPGPATH];
+	const char *routes[]
+		= { "native_side", "native_side/origin_127", "native_side/origin_127/pg_commit_ts" };
+	int fds_before = 0, fds_after = 0;
+
+	for (int fd = 0; fd < 256; fd++)
+		if (fcntl(fd, F_GETFD) >= 0)
+			fds_before++;
+	for (size_t route = 0; route < lengthof(routes); route++)
+		for (int shape = 0; shape < 3; shape++) {
+			bootstrap_read_fixture(&f, 0);
+			path_for(path, sizeof(path), routes[route]);
+			snprintf(saved, sizeof(saved), "%s.saved", path);
+			if (shape == 2)
+				UT_ASSERT_EQ(chmod(path, 0777), 0);
+			else {
+				UT_ASSERT_EQ(rename(path, saved), 0);
+				if (shape == 1)
+					UT_ASSERT_EQ(symlink(saved, path), 0);
+			}
+			bootstrap_read_refused(0);
+			if (shape == 2)
+				UT_ASSERT_EQ(chmod(path, 0700), 0);
+			else {
+				if (shape == 1)
+					UT_ASSERT_EQ(unlink(path), 0);
+				UT_ASSERT_EQ(rename(saved, path), 0);
+			}
+			v2_assert_primary_unchanged(f.before);
+			UT_ASSERT_EQ(test_cf_lock_calls, 0);
+		}
+	for (int fd = 0; fd < 256; fd++)
+		if (fcntl(fd, F_GETFD) >= 0)
+			fds_after++;
+	UT_ASSERT_EQ(fds_before, fds_after);
 }
 
 UT_TEST(test_bootstrap_capacity_refuses_foreign_retained_commit_ts)
@@ -23292,7 +23400,11 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_BOOTSTRAP_OBSERVE") != NULL) {
-		UT_PLAN(12);
+		UT_PLAN(16);
+		UT_RUN(test_bootstrap_refuses_old_commit_ts_with_disabled_profile);
+		UT_RUN(test_bootstrap_refuses_unknown_commit_ts_routes);
+		UT_RUN(test_bootstrap_capacity_refuses_foreign_retained_commit_ts);
+		UT_RUN(test_bootstrap_capacity_includes_every_current_and_retained_source);
 		UT_RUN(test_bootstrap_read_exact_files_and_owned_config);
 		UT_RUN(test_bootstrap_read_requires_independent_binding_and_node);
 		UT_RUN(test_bootstrap_read_never_falls_back_to_valid_bak);
@@ -23430,7 +23542,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(468);
+	UT_PLAN(470);
 	UT_RUN(test_cold_sync_retained_files_under_original_owner_without_cf);
 	UT_RUN(test_cold_sync_each_io_failure_root_race_and_error_discard_output);
 	UT_RUN(test_cold_sync_requires_exact_root_fsync_role_and_disjoint_output);
@@ -23895,6 +24007,8 @@ main(int argc, char **argv)
 	UT_RUN(test_bootstrap_read_pinned_directory_is_not_replacement);
 	UT_RUN(test_bootstrap_read_close_failure_never_returns_partial_success);
 	UT_RUN(test_bootstrap_capacity_includes_every_current_and_retained_source);
+	UT_RUN(test_bootstrap_refuses_old_commit_ts_with_disabled_profile);
+	UT_RUN(test_bootstrap_refuses_unknown_commit_ts_routes);
 	UT_RUN(test_bootstrap_capacity_refuses_foreign_retained_commit_ts);
 	UT_RUN(test_bootstrap_capacity_does_not_skip_retired_or_unconfigured_origin);
 	UT_RUN(test_bootstrap_capacity_requires_nonlocal_and_history_objects);

@@ -1407,6 +1407,36 @@ read_terminal_capacity(BootstrapReadWork *work, const char *shared_root, const c
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
+/* Disabled tracking does not erase an older physical source. This bounded
+ * bootstrap observation grants no replay/NO_EFFECT or OPEN authority. */
+static ClusterControlRootResult
+read_commit_ts_profile(BootstrapReadWork *work, const char *shared_root, uint32 node)
+{
+	int dirs[] = { -1, -1, -1, -1 };
+	char origin[32];
+	const char *names[] = { "native_side", origin, "pg_commit_ts" };
+	ClusterControlRootResult result;
+
+	snprintf(origin, sizeof(origin), "origin_%u", node);
+	result = read_dir(-1, shared_root, &dirs[0]);
+	if (result == 0)
+		result = read_dir_identity(dirs[0], &work->shared_dir);
+	for (size_t i = 0; result == 0 && i < lengthof(names); i++)
+		result = read_dir(dirs[i], names[i], &dirs[i + 1]);
+	for (int pass = 0; result == 0 && pass < 2; pass++) {
+		result = read_empty(dirs[3]);
+		if (result == CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID)
+			result = CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED;
+	}
+	if (result == 0)
+		result = read_same_dir(AT_FDCWD, shared_root, dirs[0]);
+	for (size_t i = 0; result == 0 && i < lengthof(names); i++)
+		result = read_same_dir(dirs[i], names[i], dirs[i + 1]);
+	for (size_t i = 0; i < lengthof(dirs); i++)
+		read_close(dirs[i], &result);
+	return result;
+}
+
 static ClusterControlRootResult
 read_capacities(BootstrapReadWork *work, const char *shared_root, const char *wal_root,
 				ClusterControlRecoveryCapacity *required, ClusterControlBootstrapSnapshot *snapshot)
@@ -1420,6 +1450,11 @@ read_capacities(BootstrapReadWork *work, const char *shared_root, const char *wa
 			continue;
 		result = read_source_capacity(work, shared_root, wal_root, &root->records[node],
 									  &root->refs[node], required);
+		if (result != 0)
+			return result;
+		/* All selected current/retained/pending writers of an origin share
+		 * its original physical family. Check even retired/non-serving nodes. */
+		result = read_commit_ts_profile(work, shared_root, node);
 		if (result != 0)
 			return result;
 		required->current_sources++;
