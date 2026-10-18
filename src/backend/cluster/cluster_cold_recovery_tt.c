@@ -433,49 +433,41 @@ cluster_cold_tt_base_match_v1(const ClusterColdTypedV1 *typed,
 	return false;
 }
 
-static bool
-cold_tt_undo_record(ClusterColdTypedV1 *typed, UBA address, ClusterRecoveryUndoRecord *out,
-					uint32 *generation, bool fresh)
+static const ColdTtBlockV1 *
+cold_tt_undo_block(ClusterColdTypedV1 *typed, uint32 segment, uint32 blockno, bool fresh)
 {
 	ClusterColdTtBaseV1 *base;
 	const ColdTtInputV1 *file;
 	ColdTtBlockV1 *block, *allocated = NULL;
-	ClusterRecoveryUndoRecord record;
 	bool owners[COLD_TT_MAX_ORIGINS + 1];
-	uint32 segment, blockno;
-	uint16 slot, row;
 
-	if (out != NULL)
-		memset(out, 0, sizeof(*out));
-	if (generation != NULL)
-		*generation = 0;
-	if (typed == NULL || out == NULL || generation == NULL || typed->tt_base == NULL)
-		return false;
+	if (typed == NULL || typed->tt_base == NULL)
+		return NULL;
 	base = typed->tt_base;
 	if (!base->captured || base->detail != CLUSTER_COLD_OK)
-		return false;
+		return NULL;
 	base->detail = CLUSTER_COLD_SOURCE_GAP;
 	if (typed->refusal != CLUSTER_COLD_OK || !cold_tt_owners(typed, owners)
-		|| memcmp(owners, base->owners, sizeof(owners)) != 0
-		|| !uba_decode_record(address, &segment, &blockno, &slot, &row))
-		return false;
+		|| memcmp(owners, base->owners, sizeof(owners)) != 0 || segment == 0 || blockno == 0
+		|| blockno >= UNDO_BLOCKS_PER_SEGMENT)
+		return NULL;
 	for (file = base->first; file != NULL; file = file->next)
 		if (file->segment == segment)
 			break;
 	if (file == NULL)
-		return false;
+		return NULL;
 	for (block = base->blocks; block != NULL; block = block->next)
 		if (block->file == file && block->block == blockno)
 			break;
 	if (block == NULL) {
 		if (sizeof(*block) > base->budget - base->used) {
 			base->detail = CLUSTER_COLD_CAPACITY;
-			return false;
+			return NULL;
 		}
 		allocated = palloc_extended(sizeof(*block), MCXT_ALLOC_NO_OOM);
 		if (allocated == NULL) {
 			base->detail = CLUSTER_COLD_OOM;
-			return false;
+			return NULL;
 		}
 		block = allocated;
 		block->file = file;
@@ -491,23 +483,83 @@ cold_tt_undo_record(ClusterColdTypedV1 *typed, UBA address, ClusterRecoveryUndoR
 			|| memcmp(observed.data, block->bytes.data, BLCKSZ) != 0)
 			goto refused;
 	}
-	if (cluster_recovery_undo_record_read(block->bytes.data, BLCKSZ, segment, blockno, file->owner,
-										  address, &record)
-		!= CLUSTER_RECOVERY_UNDO_ENTRY)
-		goto refused;
 	if (allocated != NULL) {
 		block->next = base->blocks;
 		base->blocks = block;
 		base->used += sizeof(*block);
 	}
 	base->detail = CLUSTER_COLD_OK;
-	*out = record;
-	*generation = ((const UndoSegmentHeaderData *)file->block.data)->wrap_count;
-	return true;
+	return block;
 refused:
 	if (allocated != NULL)
 		pfree(allocated);
-	return false;
+	return NULL;
+}
+
+/* Keep raw DATA capture separate from record parsing: a valid redo delta may
+ * introduce the requested record into an already retained original block. */
+bool
+cluster_cold_tt_base_block_v1(ClusterColdTypedV1 *typed, uint32 segment_index, uint32 blockno,
+							  PGAlignedBlock *out, uint32 *generation)
+{
+	const UndoSegmentHeaderData *header;
+	const ColdTtBlockV1 *block;
+	uint8 owner;
+	uint32 segment;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (generation != NULL)
+		*generation = 0;
+	if (out == NULL || generation == NULL
+		|| (header = cluster_cold_tt_base_header_v1(typed, segment_index, &owner, &segment))
+			   == NULL)
+		return false;
+	if (typed->system_identifier != typed->tt_base->system_identifier
+		|| typed->observer.database_incarnation != typed->tt_base->database_incarnation) {
+		typed->tt_base->detail = CLUSTER_COLD_SOURCE_GAP;
+		return false;
+	}
+	block = cold_tt_undo_block(typed, segment, blockno, true);
+	if (block == NULL)
+		return false;
+	*out = block->bytes;
+	*generation = header->wrap_count;
+	return true;
+}
+
+static bool
+cold_tt_undo_record(ClusterColdTypedV1 *typed, UBA address, ClusterRecoveryUndoRecord *out,
+					uint32 *generation, bool fresh)
+{
+	const ColdTtBlockV1 *block;
+	ClusterRecoveryUndoRecord record;
+	uint32 segment, blockno;
+	uint16 slot, row;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (generation != NULL)
+		*generation = 0;
+	if (typed == NULL || out == NULL || generation == NULL || typed->tt_base == NULL)
+		return false;
+	if (!uba_decode_record(address, &segment, &blockno, &slot, &row)) {
+		if (typed->tt_base->detail == CLUSTER_COLD_OK)
+			typed->tt_base->detail = CLUSTER_COLD_SOURCE_GAP;
+		return false;
+	}
+	block = cold_tt_undo_block(typed, segment, blockno, fresh);
+	if (block == NULL)
+		return false;
+	if (cluster_recovery_undo_record_read(block->bytes.data, BLCKSZ, segment, blockno,
+										  block->file->owner, address, &record)
+		!= CLUSTER_RECOVERY_UNDO_ENTRY) {
+		typed->tt_base->detail = CLUSTER_COLD_SOURCE_GAP;
+		return false;
+	}
+	*out = record;
+	*generation = ((const UndoSegmentHeaderData *)block->file->block.data)->wrap_count;
+	return true;
 }
 
 bool

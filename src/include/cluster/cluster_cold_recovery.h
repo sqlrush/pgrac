@@ -801,6 +801,13 @@ extern bool cluster_cold_tt_base_match_v1(const ClusterColdTypedV1 *typed,
 										  ClusterColdTtSlotInputV1 *out);
 
 struct ClusterRecoveryUndoRecord;
+/* Retain and copy a whole original physical UNDO block within the TT budget,
+ * bound to its captured namespace, file identity and complete block zero.
+ * Reread on every call and in final base_recheck. Raw bytes and generation
+ * alone prove no record validity, LSN coverage or transaction authority.
+ * Failure clears outputs; source/allocation refusal invalidates TT input. */
+extern bool cluster_cold_tt_base_block_v1(ClusterColdTypedV1 *typed, uint32 segment_index,
+										  uint32 blockno, PGAlignedBlock *out, uint32 *generation);
 /* Copy raw original UNDO from a captured physical segment, which may differ
  * from its canonical TT segment. Retain each whole block once within the TT
  * budget and reread it in base_recheck before pass-2. No canonical transaction,
@@ -863,6 +870,18 @@ extern bool cluster_cold_typed_undo_redo_record_v1(const ClusterColdTypedV1 *typ
 												   UBA address,
 												   struct ClusterRecoveryUndoRecord *out,
 												   uint32 *generation);
+
+/* Distinct original-base input: same captured generation, no INIT/REUSE,
+ * and a nonzero base block LSN no later than this source's native redo start.
+ * Cache and reread the entire original block, fold ordinary sealed redo in a
+ * private copy, then parse. No fallback or change to the FPI-only reader or
+ * graph. Final base/source checks, isolation and all transaction proofs remain
+ * the original owner's duty. Failure clears available outputs. */
+extern bool cluster_cold_typed_undo_base_redo_record_v1(ClusterColdTypedV1 *typed,
+														uint32 participant, uint32 segment_index,
+														UBA address,
+														struct ClusterRecoveryUndoRecord *out,
+														uint32 *generation);
 
 /* One explicitly selected original replay participant, never a history or
  * owner-id shortcut. The caller retains this context throughout graph use. */
