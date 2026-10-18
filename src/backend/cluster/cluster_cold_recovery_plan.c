@@ -684,6 +684,24 @@ cluster_cold_plan_participant_count_v1(const ClusterColdPlanV1 *plan)
 	return plan_valid(plan) && plan->phase == COLD_PHASE_SEALED ? plan->participant_count : 0;
 }
 
+bool
+cluster_cold_plan_participant_matches_v1(const ClusterColdPlanV1 *plan, uint32 participant,
+										 const ClusterColdParticipantV1 *cut)
+{
+	const ClusterColdParticipantV1 *expected;
+
+	if (!plan_valid(plan) || plan->phase != COLD_PHASE_SEALED || cut == NULL
+		|| participant >= plan->participant_count)
+		return false;
+	/* canonical[] maps create()'s caller order to our immutable sorted copy. */
+	expected = &plan->participants[plan->canonical[participant]].cut;
+	return cut->thread_id == expected->thread_id && cut->reserved_zero == 0
+		   && cut->timeline == expected->timeline
+		   && cut->owner_incarnation == expected->owner_incarnation
+		   && cut->physical_lower == expected->physical_lower
+		   && cut->native_redo == expected->native_redo && cut->tail_end == expected->tail_end;
+}
+
 uint64
 cluster_cold_plan_replay_record_count_v1(const ClusterColdPlanV1 *plan, uint32 participant)
 {

@@ -367,6 +367,11 @@ extern ClusterColdDetailV1 cluster_cold_plan_set_space_check_v1(ClusterColdPlanV
 /* Participants of a sealed plan; 0 unless seal() succeeded. */
 extern uint32 cluster_cold_plan_participant_count_v1(const ClusterColdPlanV1 *plan);
 
+/* Exact native cut of a sealed participant, in create()'s caller order. */
+extern bool cluster_cold_plan_participant_matches_v1(const ClusterColdPlanV1 *plan,
+													 uint32 participant,
+													 const ClusterColdParticipantV1 *cut);
+
 /* Pass-2 action for one scheduled page record.  A fully skipped record of
  * the founder's own thread still advances nextXid past its xid. */
 typedef enum ClusterColdPageActionV1 {
@@ -421,7 +426,7 @@ typedef enum ClusterColdReplayDetailV1 {
 	CLUSTER_COLD_REPLAY_TARGET_PASSED = 4, /* the scheduled record start was passed */
 	CLUSTER_COLD_REPLAY_IDENTITY = 5,	   /* the scheduled record identity differs */
 	CLUSTER_COLD_REPLAY_PAST_TAIL = 6,	   /* a record lies past the validated tail */
-	CLUSTER_COLD_REPLAY_CUT_DIFFERS = 7,   /* end or record count differs from pass 1 */
+	CLUSTER_COLD_REPLAY_CUT_DIFFERS = 7,   /* source, cut or record count differs from pass 1 */
 	CLUSTER_COLD_REPLAY_CALLBACK = 8	   /* a callback refused the record */
 } ClusterColdReplayDetailV1;
 
@@ -473,8 +478,8 @@ typedef struct ClusterColdReplayResultV1 {
 	uint32 last_crc[CLUSTER_COLD_MAX_PARTICIPANTS];
 } ClusterColdReplayResultV1;
 
-/* participants/participant_count must be the plan's caller-order cuts; own
- * is the founder's caller index. */
+/* participants/participant_count must be the plan's caller-order cuts,
+ * verified before the first callback; own is the founder's caller index. */
 extern ClusterColdReplayDetailV1
 cluster_cold_replay_run_v1(const ClusterColdPlanV1 *plan,
 						   const ClusterColdParticipantV1 *participants, uint32 participant_count,

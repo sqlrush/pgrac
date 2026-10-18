@@ -390,6 +390,11 @@ cluster_cold_replay_run_v1(const ClusterColdPlanV1 *plan,
 	run.ops = ops;
 	run.arg = arg;
 	for (i = 0; i < participant_count; i++) {
+		/* Count equality cannot bind an empty/history-only source. Rebind
+		 * every original cut before any owner callback can consume effects. */
+		if (!cluster_cold_plan_participant_matches_v1(plan, i, &participants[i]))
+			return replay_stop(&run, CLUSTER_COLD_REPLAY_CUT_DIFFERS, i,
+							   participants[i].native_redo);
 		run.last_end[i] = participants[i].native_redo;
 		drain_order[i] = ops->source_order != NULL ? UINT32_MAX : i;
 	}

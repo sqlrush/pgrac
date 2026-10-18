@@ -81,6 +81,7 @@ typedef struct Harness {
 	bool refuse_space_final;
 	bool refuse_source_drained;
 	int order_mode;
+	uint32 order_calls;
 	XLogRecPtr target_gated_read;
 	bool dependency_enabled;
 	bool dependency_cycle;
@@ -366,6 +367,7 @@ static bool
 op_source_order(void *arg, uint32 *order, uint32 count)
 {
 	Harness *h = arg;
+	h->order_calls++;
 	UT_ASSERT_EQ(count, 2);
 	order[0] = h->order_mode == 1 ? 1 : 0;
 	if (h->order_mode != 4)
@@ -711,6 +713,101 @@ UT_TEST(test_replay_drop_final_requires_execution_and_all_source_drains)
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
+UT_TEST(test_replay_rebinds_every_original_cut_before_callbacks)
+{
+	static const Size fields[] = { offsetof(ClusterColdParticipantV1, thread_id),
+								   offsetof(ClusterColdParticipantV1, reserved_zero),
+								   offsetof(ClusterColdParticipantV1, timeline),
+								   offsetof(ClusterColdParticipantV1, owner_incarnation),
+								   offsetof(ClusterColdParticipantV1, physical_lower),
+								   offsetof(ClusterColdParticipantV1, native_redo),
+								   offsetof(ClusterColdParticipantV1, tail_end) };
+
+	for (unsigned empty = 0; empty < 2; empty++) {
+		ClusterColdPlanV1 *plan;
+		fixture(false);
+		if (empty) {
+			for (unsigned p = 0; p < 2; p++) {
+				cuts[p].tail_end = cuts[p].native_redo;
+				fix_count[p] = 0;
+			}
+		}
+		plan = seal();
+		for (unsigned p = 0; p < 2; p++) {
+			for (unsigned field = 0; field < lengthof(fields); field++) {
+				ClusterColdParticipantV1 passed[2];
+				ClusterColdReplayResultV1 result;
+				Harness h;
+				memcpy(passed, cuts, sizeof(passed));
+				((unsigned char *)&passed[p])[fields[field]] ^= 1;
+				harness_init(&h);
+				UT_ASSERT_EQ(cluster_cold_replay_run_v1(plan, passed, 2, 0, &ops, &h, &result),
+							 CLUSTER_COLD_REPLAY_CUT_DIFFERS);
+				UT_ASSERT_EQ(result.participant, p);
+				UT_ASSERT_EQ(result.steps_done, 0);
+				UT_ASSERT_EQ(h.order_calls, 0);
+				UT_ASSERT_EQ(h.events, 0);
+				UT_ASSERT_EQ(h.stream[0].next + h.stream[1].next, 0);
+				UT_ASSERT_EQ(h.drain_calls[0] + h.drain_calls[1], 0);
+			}
+		}
+		cluster_cold_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_replay_rebinds_history_only_cut_before_scheduled_work)
+{
+	ClusterColdPlanV1 *plan;
+	ClusterColdReplayResultV1 result;
+	Harness h;
+	fixture(false);
+	cuts[1].native_redo = cuts[1].tail_end;
+	data_token[0] = 3;
+	plan = seal();
+	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 1), 0);
+	cuts[1].owner_incarnation++;
+	harness_init(&h);
+	h.stream[1].count = 0;
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_CUT_DIFFERS);
+	UT_ASSERT_EQ(result.participant, 1);
+	UT_ASSERT_EQ(h.order_calls, 0);
+	UT_ASSERT_EQ(h.events, 0);
+	UT_ASSERT_EQ(h.drain_calls[0] + h.drain_calls[1], 0);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_replay_cut_binding_uses_sealed_caller_order_and_value)
+{
+	ClusterColdPlanV1 *plan;
+	ClusterColdParticipantV1 passed[2];
+	ClusterColdParticipantV1 first;
+	ClusterColdReplayResultV1 result;
+	Harness h;
+	fixture(false);
+	/* The plan's canonical thread order now differs from its caller order. */
+	cuts[0].thread_id = 9;
+	plan = seal();
+	memcpy(passed, cuts, sizeof(passed));
+	/* Neither the create() input address nor its current bytes are authority. */
+	cuts[0].thread_id++;
+	harness_init(&h);
+	UT_ASSERT_EQ(cluster_cold_replay_run_v1(plan, passed, 2, 0, &ops, &h, &result),
+				 CLUSTER_COLD_REPLAY_OK);
+	UT_ASSERT_EQ(h.order_calls, 1);
+	UT_ASSERT_EQ(h.drain_calls[0], 1);
+	UT_ASSERT_EQ(h.drain_calls[1], 1);
+	/* Reordering the caller's sources must fail before the first consumer. */
+	first = passed[0];
+	passed[0] = passed[1];
+	passed[1] = first;
+	harness_init(&h);
+	UT_ASSERT_EQ(cluster_cold_replay_run_v1(plan, passed, 2, 0, &ops, &h, &result),
+				 CLUSTER_COLD_REPLAY_CUT_DIFFERS);
+	UT_ASSERT_EQ(h.order_calls, 0);
+	UT_ASSERT_EQ(h.events, 0);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
 UT_TEST(test_replay_argument_checks)
 {
 	ClusterColdPlanV1 *plan;
@@ -1036,7 +1133,10 @@ UT_TEST(test_dependency_cycle_is_bounded_without_consuming_waiting_record)
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(22);
+	UT_RUN(test_replay_rebinds_every_original_cut_before_callbacks);
+	UT_RUN(test_replay_rebinds_history_only_cut_before_scheduled_work);
+	UT_RUN(test_replay_cut_binding_uses_sealed_caller_order_and_value);
 	UT_RUN(test_prefix_dependency_drains_ready_target_once);
 	UT_RUN(test_prefix_dependency_never_skips_future_steps_or_failed_cut);
 	UT_RUN(test_dependency_cycle_is_bounded_without_consuming_waiting_record);
