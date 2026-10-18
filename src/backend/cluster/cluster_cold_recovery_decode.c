@@ -370,6 +370,50 @@ cold_logical_message_shape(XLogReaderState *reader)
 		   == data + SizeOfLogicalMessage + prefix_size - 1;
 }
 
+/* Native control records need the same complete frame before either native
+ * redo or a foreign no-effect route. Padding and parameter values retain
+ * their native meaning; inspect bool bytes without loading invalid bools. */
+static bool
+cold_xlog_control_shape(XLogReaderState *reader)
+{
+	const char *data = XLogRecGetData(reader);
+	uint32 length = XLogRecGetDataLen(reader);
+	uint8 info = XLogRecGetInfo(reader);
+
+	if ((info & XLR_INFO_MASK) != 0 || XLogRecHasAnyBlockRefs(reader)
+		|| (length != 0 && data == NULL))
+		return false;
+	switch (info) {
+	case XLOG_CHECKPOINT_SHUTDOWN:
+	case XLOG_CHECKPOINT_ONLINE:
+		return length == sizeof(CheckPoint)
+			   && (unsigned char)data[offsetof(CheckPoint, fullPageWrites)] <= 1;
+	case XLOG_NEXTOID:
+		return length == sizeof(Oid);
+	case XLOG_PARAMETER_CHANGE:
+		return length == sizeof(xl_parameter_change)
+			   && (unsigned char)data[offsetof(xl_parameter_change, wal_log_hints)] <= 1
+			   && (unsigned char)data[offsetof(xl_parameter_change, track_commit_timestamp)] <= 1;
+	case XLOG_FPW_CHANGE:
+		return length == sizeof(bool) && (unsigned char)data[0] <= 1;
+	case XLOG_SWITCH:
+		return length == 0;
+	case XLOG_NOOP:
+		return true;
+	case XLOG_BACKUP_END:
+		return length == sizeof(XLogRecPtr);
+	case XLOG_RESTORE_POINT:
+		return length == sizeof(xl_restore_point)
+			   && memchr(data + offsetof(xl_restore_point, rp_name), '\0', MAXFNAMELEN) != NULL;
+	case XLOG_END_OF_RECOVERY:
+		return length == sizeof(xl_end_of_recovery);
+	case XLOG_OVERWRITE_CONTRECORD:
+		return length == sizeof(xl_overwrite_contrecord);
+	default:
+		return false;
+	}
+}
+
 static ClusterColdDetailV1
 cold_record_flags(XLogReaderState *reader, uint64 system_identifier, const uint8 storage_uuid[16],
 				  bool foreign, ClusterColdDecodedV1 *out, uint8 *flags, uint32 *effects)
@@ -378,6 +422,11 @@ cold_record_flags(XLogReaderState *reader, uint64 system_identifier, const uint8
 
 	*flags = 0;
 	switch (XLogRecGetRmid(reader)) {
+	case RM_XLOG_ID:
+		/* Page/FPI records retain the detached page preflight below. */
+		if (info == XLOG_FPI || info == XLOG_FPI_FOR_HINT)
+			return CLUSTER_COLD_OK;
+		return cold_xlog_control_shape(reader) ? CLUSTER_COLD_OK : CLUSTER_COLD_COMPONENT_INVALID;
 	case RM_XACT_ID:
 		return cold_xact_flags(reader, system_identifier, storage_uuid, out, flags, effects);
 	case RM_CLUSTER_UNDO_ID:
@@ -473,7 +522,6 @@ cold_record_flags(XLogReaderState *reader, uint64 system_identifier, const uint8
 static bool
 cold_foreign_control(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan)
 {
-	uint32 length = XLogRecGetDataLen(reader);
 	uint8 info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
 
 	if (XLogRecMaxBlockId(reader) >= 0 || (XLogRecGetInfo(reader) & XLR_INFO_MASK) != 0)
@@ -493,33 +541,7 @@ cold_foreign_control(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan
 		/* INVALIDATIONS includes persistent relcache-init work. A foreign
 		 * adapter must perform it; a fresh process is not its completion. */
 		return info == XLOG_STANDBY_LOCK || info == XLOG_RUNNING_XACTS;
-	if (XLogRecGetRmid(reader) != RM_XLOG_ID)
-		return false;
-	switch (info) {
-	case XLOG_CHECKPOINT_SHUTDOWN:
-	case XLOG_CHECKPOINT_ONLINE:
-		return length == sizeof(CheckPoint);
-	case XLOG_NEXTOID:
-		return length == sizeof(Oid);
-	case XLOG_PARAMETER_CHANGE:
-		return length == sizeof(xl_parameter_change);
-	case XLOG_FPW_CHANGE:
-		return length == sizeof(bool);
-	case XLOG_SWITCH:
-		return length == 0;
-	case XLOG_NOOP:
-		return true;
-	case XLOG_BACKUP_END:
-		return length == sizeof(XLogRecPtr);
-	case XLOG_RESTORE_POINT:
-		return length == sizeof(xl_restore_point);
-	case XLOG_END_OF_RECOVERY:
-		return length == sizeof(xl_end_of_recovery);
-	case XLOG_OVERWRITE_CONTRECORD:
-		return length == sizeof(xl_overwrite_contrecord);
-	default:
-		return false;
-	}
+	return XLogRecGetRmid(reader) == RM_XLOG_ID && cold_xlog_control_shape(reader);
 }
 
 /* Only existing record-local native consumers may enter this route. The

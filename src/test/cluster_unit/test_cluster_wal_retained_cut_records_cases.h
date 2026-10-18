@@ -590,11 +590,12 @@ UT_TEST(test_records_cold_counter_incomplete_clears_inputs)
 	r = record_new(self, RM_XLOG_ID, XLOG_NOOP, 700, 0x2000, 0x2100);
 	UT_ASSERT_EQ(rec_counter_decode(r, false, &decoded), CLUSTER_COLD_OK);
 	UT_ASSERT(decoded.xid_input.complete);
-	/* Existing native classification stays unchanged. A short counter
-	 * payload must nevertheless never furnish complete counter inputs. */
+	/* A short control frame refuses before effect classification and
+	 * must never furnish complete counter inputs. */
 	r = record_new(self, RM_XLOG_ID, XLOG_CHECKPOINT_ONLINE, 0, 0x2200, 0x2300);
 	record_append(r, &checkpoint, sizeof(checkpoint) - 1);
-	UT_ASSERT_EQ(rec_counter_decode(r, false, &decoded), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(rec_counter_decode(r, false, &decoded), CLUSTER_COLD_COMPONENT_INVALID);
+	UT_ASSERT_EQ(decoded.effects.required, 0);
 	UT_ASSERT(!decoded.xid_input.complete);
 	UT_ASSERT_EQ(decoded.xid_input.checkpoint_next_xid, 0);
 	r->u.decoded.main_data_len++;

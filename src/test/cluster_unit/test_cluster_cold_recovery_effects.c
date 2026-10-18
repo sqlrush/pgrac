@@ -17,6 +17,7 @@
 #include "access/clog.h"
 #include "access/multixact.h"
 #include "access/xact.h"
+#include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "catalog/pg_control.h"
 #include "catalog/storage_xlog.h"
@@ -364,6 +365,209 @@ UT_TEST(test_exact_foreign_noop_stays_no_effect)
 				 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.effects.no_effect, CLUSTER_COLD_EFFECT_RECORD);
 	UT_ASSERT(partitioned(&out.effects));
+}
+
+/* These are the original XLOG control carriers, not page/FPI records. */
+static const struct {
+	uint8 info;
+	Size length;
+} xlog_controls[] = { { XLOG_CHECKPOINT_SHUTDOWN, sizeof(CheckPoint) },
+					  { XLOG_CHECKPOINT_ONLINE, sizeof(CheckPoint) },
+					  { XLOG_NEXTOID, sizeof(Oid) },
+					  { XLOG_PARAMETER_CHANGE, sizeof(xl_parameter_change) },
+					  { XLOG_FPW_CHANGE, sizeof(bool) },
+					  { XLOG_SWITCH, 0 },
+					  { XLOG_NOOP, 4 },
+					  { XLOG_BACKUP_END, sizeof(XLogRecPtr) },
+					  { XLOG_RESTORE_POINT, sizeof(xl_restore_point) },
+					  { XLOG_END_OF_RECOVERY, sizeof(xl_end_of_recovery) },
+					  { XLOG_OVERWRITE_CONTRECORD, sizeof(xl_overwrite_contrecord) } };
+
+static void
+xlog_control(EffectRecord *r, Size index, int variant)
+{
+	union {
+		CheckPoint checkpoint;
+		xl_parameter_change params;
+		xl_restore_point restore;
+		xl_end_of_recovery end;
+		xl_overwrite_contrecord overwrite;
+		Oid oid;
+		XLogRecPtr lsn;
+		bool fpw;
+		char bytes[sizeof(CheckPoint)];
+	} payload = { 0 };
+	bool enabled = (variant & 1) != 0;
+	uint8 info = xlog_controls[index].info;
+
+	record_init(r, RM_XLOG_ID, info);
+	switch (info) {
+	case XLOG_CHECKPOINT_SHUTDOWN:
+	case XLOG_CHECKPOINT_ONLINE:
+		payload.checkpoint = (CheckPoint){ .redo = 0x900,
+										   .ThisTimeLineID = 2,
+										   .PrevTimeLineID = 2,
+										   .fullPageWrites = enabled,
+										   .nextXid = FullTransactionIdFromU64(300),
+										   .nextOid = 18000,
+										   .nextMulti = 10,
+										   .nextMultiOffset = 20,
+										   .oldestXid = 100,
+										   .oldestMulti = 1 };
+		/* Native padding is not a new persistent field. */
+		memset(payload.bytes + offsetof(CheckPoint, fullPageWrites) + sizeof(bool), 0xa5,
+			   offsetof(CheckPoint, nextXid) - offsetof(CheckPoint, fullPageWrites) - sizeof(bool));
+		break;
+	case XLOG_NEXTOID:
+		payload.oid = 18000;
+		break;
+	case XLOG_PARAMETER_CHANGE:
+		payload.params = (xl_parameter_change){ .MaxConnections = 100,
+												.max_worker_processes = 8,
+												.max_wal_senders = 10,
+												.max_prepared_xacts = 0,
+												.max_locks_per_xact = 64,
+												.wal_level = 1,
+												.wal_log_hints = enabled,
+												.track_commit_timestamp = !enabled };
+		memset(payload.bytes + offsetof(xl_parameter_change, track_commit_timestamp) + sizeof(bool),
+			   0xa5,
+			   sizeof(xl_parameter_change) - offsetof(xl_parameter_change, track_commit_timestamp)
+				   - sizeof(bool));
+		break;
+	case XLOG_FPW_CHANGE:
+		payload.fpw = enabled;
+		break;
+	case XLOG_NOOP:
+		memcpy(payload.bytes, "\0\xff\x01\x80", 4);
+		break;
+	case XLOG_BACKUP_END:
+		payload.lsn = 0x900;
+		break;
+	case XLOG_RESTORE_POINT:
+		payload.restore.rp_time = 123;
+		memset(payload.restore.rp_name, 'r', sizeof(payload.restore.rp_name));
+		payload.restore.rp_name[enabled ? MAXFNAMELEN - 1 : 0] = '\0';
+		break;
+	case XLOG_END_OF_RECOVERY:
+		payload.end
+			= (xl_end_of_recovery){ .end_time = 123, .ThisTimeLineID = 2, .PrevTimeLineID = 1 };
+		break;
+	case XLOG_OVERWRITE_CONTRECORD:
+		payload.overwrite
+			= (xl_overwrite_contrecord){ .overwritten_lsn = 0x900, .overwrite_time = 123 };
+		break;
+	}
+	append(r, payload.bytes, xlog_controls[index].length);
+	if (variant & 2) {
+		memmove(r->data.bytes + 1, r->data.bytes, r->decoded.main_data_len);
+		r->decoded.main_data = r->data.bytes + 1;
+	} else if (r->decoded.main_data_len == 0)
+		r->decoded.main_data = NULL;
+}
+
+static bool
+xlog_control_refused(EffectRecord *r)
+{
+	ClusterColdDecodedV1 out = { 0 };
+	for (int foreign = 0; foreign <= 1; foreign++) {
+		if (cluster_cold_recovery_decode_v1(&r->reader, 99, uuid, true, foreign, &out)
+				== CLUSTER_COLD_OK
+			|| out.effects.required != 0 || out.effects.no_effect != 0
+			|| out.effects.native_apply != 0
+			|| cluster_cold_replay_effects_v1(&out, NULL, !foreign))
+			return false;
+	}
+	return true;
+}
+
+UT_TEST(test_xlog_controls_keep_native_and_no_effect_routes)
+{
+	EffectRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	for (Size i = 0; i < lengthof(xlog_controls); i++) {
+		for (int variant = 0; variant < 4; variant++) {
+			xlog_control(&r, i, variant);
+			for (int foreign = 0; foreign <= 1; foreign++) {
+				UT_ASSERT_EQ(
+					cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, foreign, &out),
+					CLUSTER_COLD_OK);
+				UT_ASSERT_EQ(out.record.record_flags,
+							 foreign ? CLUSTER_COLD_RECORD_FOREIGN_CONTROL : 0);
+				UT_ASSERT_EQ(out.effects.required, CLUSTER_COLD_EFFECT_RECORD);
+				UT_ASSERT_EQ(out.effects.no_effect, foreign ? CLUSTER_COLD_EFFECT_RECORD : 0);
+				UT_ASSERT_EQ(out.effects.native_apply, foreign ? 0 : CLUSTER_COLD_EFFECT_RECORD);
+				UT_ASSERT_EQ(out.effects.refused, 0);
+				UT_ASSERT(partitioned(&out.effects));
+				UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, !foreign));
+				UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, foreign));
+			}
+		}
+	}
+}
+
+UT_TEST(test_xlog_controls_reject_incomplete_envelopes)
+{
+	EffectRecord r;
+	for (Size i = 0; i < lengthof(xlog_controls); i++) {
+		if (xlog_controls[i].info != XLOG_NOOP) {
+			for (Size length = 0; length <= xlog_controls[i].length + 1; length++) {
+				if (length == xlog_controls[i].length)
+					continue;
+				xlog_control(&r, i, 0);
+				r.decoded.main_data_len = length;
+				UT_ASSERT(xlog_control_refused(&r));
+			}
+		}
+		for (int fault = 0; fault < 6; fault++) {
+			union {
+				DecodedXLogRecord decoded;
+				char bytes[sizeof(DecodedXLogRecord) + sizeof(DecodedBkpBlock)];
+			} blocked = { 0 };
+			xlog_control(&r, i, 0);
+			if (fault == 0) {
+				if (r.decoded.main_data_len == 0)
+					continue;
+				r.decoded.main_data = NULL;
+			} else if (fault <= 4)
+				r.decoded.header.xl_info |= 1 << (fault - 1);
+			else {
+				memcpy(&blocked.decoded, &r.decoded, sizeof(r.decoded));
+				blocked.decoded.max_block_id = 0;
+				blocked.decoded.blocks[0].in_use = true;
+				r.reader.record = &blocked.decoded;
+			}
+			UT_ASSERT(xlog_control_refused(&r));
+		}
+	}
+	record_init(&r, RM_XLOG_ID, 0xc0);
+	UT_ASSERT(xlog_control_refused(&r));
+}
+
+UT_TEST(test_xlog_controls_reject_invalid_native_fields)
+{
+	EffectRecord r;
+	static const struct {
+		Size index;
+		Size offset;
+	} bools[] = { { 0, offsetof(CheckPoint, fullPageWrites) },
+				  { 1, offsetof(CheckPoint, fullPageWrites) },
+				  { 3, offsetof(xl_parameter_change, wal_log_hints) },
+				  { 3, offsetof(xl_parameter_change, track_commit_timestamp) },
+				  { 4, 0 } };
+	static const unsigned char invalid[] = { 2, 128, 255 };
+	for (int variant = 0; variant < 4; variant++) {
+		for (Size i = 0; i < lengthof(bools); i++) {
+			for (Size v = 0; v < lengthof(invalid); v++) {
+				xlog_control(&r, bools[i].index, variant);
+				r.decoded.main_data[bools[i].offset] = invalid[v];
+				UT_ASSERT(xlog_control_refused(&r));
+			}
+		}
+		xlog_control(&r, 8, variant);
+		memset(r.decoded.main_data + offsetof(xl_restore_point, rp_name), 'x', MAXFNAMELEN);
+		UT_ASSERT(xlog_control_refused(&r));
+	}
 }
 
 static void
@@ -1798,7 +2002,7 @@ UT_TEST(test_original_startup_dependency_leaves_non_c0_with_existing_dispatch)
 int
 main(void)
 {
-	UT_PLAN(50);
+	UT_PLAN(53);
 	UT_RUN(test_original_startup_dependency_decodes_before_target_owner);
 	UT_RUN(test_original_startup_dependency_leaves_non_c0_with_existing_dispatch);
 	UT_RUN(test_foreign_c0_routes_whole_record_to_exact_side_consumer);
@@ -1835,6 +2039,9 @@ main(void)
 	UT_RUN(test_abort_routes_all_native_effects);
 	UT_RUN(test_unknown_or_truncated_commit_clears_routes);
 	UT_RUN(test_exact_foreign_noop_stays_no_effect);
+	UT_RUN(test_xlog_controls_keep_native_and_no_effect_routes);
+	UT_RUN(test_xlog_controls_reject_incomplete_envelopes);
+	UT_RUN(test_xlog_controls_reject_invalid_native_fields);
 	UT_RUN(test_logical_message_keeps_complete_native_no_effect_carrier);
 	UT_RUN(test_logical_message_requires_every_native_payload_byte);
 	UT_RUN(test_logical_message_rejects_nonproducer_carriers);

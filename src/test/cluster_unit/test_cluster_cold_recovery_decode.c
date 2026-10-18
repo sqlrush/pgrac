@@ -425,7 +425,7 @@ UT_TEST(test_storage_lifecycle_classification)
 				  { RM_HEAP2_ID, XLOG_HEAP2_REWRITE, CLUSTER_COLD_RECORD_STRUCTURAL },
 				  { RM_CLUSTER_XID_STRIPE_ID, 0x00, CLUSTER_COLD_RECORD_STRUCTURAL },
 				  { RM_CLUSTER_XID_STRIPE_ID, 0x10, CLUSTER_COLD_RECORD_STRUCTURAL },
-				  { RM_XLOG_ID, 0x30, 0 },
+				  { RM_XLOG_ID, XLOG_NEXTOID, 0 },
 				  { RM_STANDBY_ID, XLOG_RUNNING_XACTS, 0 } };
 	Size i;
 
@@ -434,6 +434,8 @@ UT_TEST(test_storage_lifecycle_classification)
 			standby_record(&record, cases[i].info, true);
 		else
 			fake_record(&record, cases[i].rmid, cases[i].info, 0);
+		if (cases[i].rmid == RM_XLOG_ID)
+			record.storage.decoded.main_data_len = sizeof(Oid);
 		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
 					 CLUSTER_COLD_OK);
 		if (out.record.record_flags != cases[i].flags)
@@ -474,11 +476,11 @@ UT_TEST(test_foreign_side_records_have_no_cold_owner)
 	fake_record(&record, RM_XLOG_ID, XLOG_CHECKPOINT_ONLINE, 0);
 	record.storage.decoded.main_data_len = sizeof(CheckPoint) + 1; /* not a checkpoint */
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
-				 CLUSTER_COLD_OK);
-	UT_ASSERT_EQ(out.record.record_flags, 0);
+				 CLUSTER_COLD_COMPONENT_INVALID);
+	UT_ASSERT_EQ(out.effects.required, 0);
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
-				 CLUSTER_COLD_OK);
-	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+				 CLUSTER_COLD_COMPONENT_INVALID);
+	UT_ASSERT_EQ(out.effects.required, 0);
 
 	fake_record(&record, RM_XACT_ID, XLOG_XACT_COMMIT, 0);
 	commit_nrels = 1;
@@ -486,13 +488,12 @@ UT_TEST(test_foreign_side_records_have_no_cold_owner)
 				 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
 
-	/* An XLOG record outside the native control set (or with blocks) is no
-	 * control record. */
+	/* Malformed controls fail before effect classification. */
 	fake_record(&record, RM_XLOG_ID, 0xE0, 0);
 	record.storage.decoded.main_data_len = 0;
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
-				 CLUSTER_COLD_OK);
-	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+				 CLUSTER_COLD_COMPONENT_INVALID);
+	UT_ASSERT_EQ(out.effects.required, 0);
 	fake_record(&record, RM_STANDBY_ID, 0x30, 0);
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
 				 CLUSTER_COLD_COMPONENT_INVALID);
@@ -500,15 +501,15 @@ UT_TEST(test_foreign_side_records_have_no_cold_owner)
 	fake_record(&record, RM_XLOG_ID, XLOG_NOOP, 0);
 	record.storage.decoded.header.xl_info |= XLR_SPECIAL_REL_UPDATE;
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
-				 CLUSTER_COLD_OK);
-	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
-	/* a side record routed with block references, or not routed as a side
-	 * record at all, is no control record */
+				 CLUSTER_COLD_COMPONENT_INVALID);
+	UT_ASSERT_EQ(out.effects.required, 0);
+	/* Block references invalidate a control frame. A valid control with
+	 * no matching side owner retains the existing unowned route. */
 	fake_record(&record, RM_XLOG_ID, XLOG_NOOP, 1);
 	preflight_plan.route.record_owner = RF_ROUTE_OWNER_SIDE_TYPED;
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
-				 CLUSTER_COLD_OK);
-	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+				 CLUSTER_COLD_COMPONENT_INVALID);
+	UT_ASSERT_EQ(out.effects.required, 0);
 	fake_record(&record, RM_XLOG_ID, XLOG_NOOP, 0);
 	preflight_plan.route.record_owner = 0;
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
@@ -772,8 +773,8 @@ UT_TEST(test_foreign_native_control_is_typed_noop)
 			record.storage.decoded.main_data_len = cases[i].length + 1;
 			UT_ASSERT_EQ(
 				cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
-				CLUSTER_COLD_OK);
-			UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+				CLUSTER_COLD_COMPONENT_INVALID);
+			UT_ASSERT_EQ(out.effects.required, 0);
 		}
 	}
 
