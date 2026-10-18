@@ -21,28 +21,24 @@
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_uba.h"
 
-bool
-cluster_cold_typed_tt_redo_header_v1(const ClusterColdTypedV1 *typed, uint32 participant,
-									 uint32 segment_index, RfSideUndoHeaderImageV1 *out)
+static bool
+cold_tt_redo_source(const ClusterColdTypedV1 *typed, uint32 participant, uint8 owner,
+					uint32 segment, bool *has_header_work)
 {
 	const ClusterColdParticipantV1 *source;
-	const UndoSegmentHeaderData *base;
 	const RfSideOnlinePlanV1 *plan;
 	RfContributorStreamCutV1 cut = { 0 };
-	RfSideUndoHeaderImageV1 image = { 0 };
-	uint8 owner;
-	uint32 segment, count;
-	bool has_header_work = false;
+	uint32 count;
 
-	if (typed == NULL || out == NULL || typed->refusal != CLUSTER_COLD_OK
-		|| typed->participant_count == 0 || typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+	*has_header_work = false;
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK || typed->participant_count == 0
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
 		|| typed->replay_count > typed->participant_count || participant >= typed->replay_count
 		|| typed->side_capture_detail[participant] != RF_PAGE_PROOF_DETAIL_OK)
 		return false;
-	base = cluster_cold_tt_base_header_v1(typed, segment_index, &owner, &segment);
 	source = &typed->participants[participant];
 	plan = typed->side_plans[participant];
-	if (base == NULL || owner != source->thread_id)
+	if (owner != 0 && owner != source->thread_id)
 		return false;
 	cut.failed_thread = source->thread_id;
 	cut.origin_owner_incarnation = source->owner_incarnation;
@@ -84,13 +80,33 @@ cluster_cold_typed_tt_redo_header_v1(const ClusterColdTypedV1 *typed, uint32 par
 			return false;
 		if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO && operation.undo.instance == owner
 			&& operation.undo.segment_id == segment)
-			has_header_work = true;
+			*has_header_work = true;
 		if (operation.kind == RF_SIDE_ONLINE_OPERATION_XACT
 			&& operation.xact.kind == RF_SIDE_XACT_COMMIT && operation.xact.has_tt_delta
 			&& operation.xact.tt_delta.instance == owner
 			&& operation.xact.tt_delta.segment_id == segment)
-			has_header_work = true;
+			*has_header_work = true;
 	}
+	return true;
+}
+
+bool
+cluster_cold_typed_tt_redo_header_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+									 uint32 segment_index, RfSideUndoHeaderImageV1 *out)
+{
+	const UndoSegmentHeaderData *base;
+	const RfSideOnlinePlanV1 *plan;
+	RfSideUndoHeaderImageV1 image = { 0 };
+	uint8 owner;
+	uint32 segment;
+	bool has_header_work;
+
+	if (out == NULL)
+		return false;
+	base = cluster_cold_tt_base_header_v1(typed, segment_index, &owner, &segment);
+	if (base == NULL || !cold_tt_redo_source(typed, participant, owner, segment, &has_header_work))
+		return false;
+	plan = typed->side_plans[participant];
 	if (has_header_work) {
 		/* Preserve native lifecycle, generation, slot and source-membership
 		 * checks in the existing fold; no duplicate TT replay implementation. */
@@ -252,5 +268,72 @@ cluster_cold_typed_tt_redo_graph_read_v1(void *arg, const ClusterRecoveryTxnKey 
 		return CLUSTER_RECOVERY_GRAPH_RECORD;
 	memset(out, 0, sizeof(*out));
 	*generation = 0;
+	return result;
+}
+
+ClusterRecoveryGraphResult
+cluster_cold_typed_tt_redo_graph_begin_v1(ClusterColdTtRedoGraphInputV1 *input,
+										  size_t memory_budget, ClusterRecoveryReferenceGraph **out)
+{
+	const ClusterColdTypedV1 *typed;
+	ClusterRecoveryReferenceGraph *graph = NULL;
+	ClusterRecoveryGraphResult result;
+	bool unused_header_work;
+
+	if (out != NULL)
+		*out = NULL;
+	if (out == NULL || input == NULL || input->typed == NULL)
+		return CLUSTER_RECOVERY_GRAPH_INVALID;
+	typed = input->typed;
+	/* The source must be valid even when its owner has no TT files. */
+	if (!cluster_cold_tt_base_namespace_matches_v1(typed, typed->system_identifier,
+												   typed->observer.database_incarnation)
+		|| !cold_tt_redo_source(typed, input->participant, 0, 0, &unused_header_work))
+		return CLUSTER_RECOVERY_GRAPH_IDENTITY;
+	result = cluster_recovery_reference_graph_begin(
+		memory_budget, cluster_cold_typed_tt_redo_graph_read_v1, input, &graph);
+	if (result != CLUSTER_RECOVERY_GRAPH_MORE)
+		return result;
+	for (uint32 i = 0; i < cluster_cold_tt_base_count_v1(typed); i++) {
+		RfSideUndoHeaderImageV1 image;
+		const UndoSegmentHeaderData *header;
+		uint8 owner;
+		uint32 segment;
+
+		if (cluster_cold_tt_base_header_v1(typed, i, &owner, &segment) == NULL)
+			goto identity_failure;
+		if (owner != typed->participants[input->participant].thread_id)
+			continue;
+		if (!cluster_cold_typed_tt_redo_header_v1(typed, input->participant, i, &image))
+			goto identity_failure;
+		header = (const UndoSegmentHeaderData *)image.page.data;
+		for (uint16 offset = 0; offset < TT_SLOTS_PER_SEGMENT; offset++) {
+			const TTSlot *slot = &header->tt_slots[offset];
+			ClusterRecoveryTxnKey key = { 0 };
+
+			/* Retention survives terminal status. A zero head is merely absent
+			 * from this TX forest, never proof that other effects are absent. */
+			if (UBA_is_invalid(slot->first_undo_block))
+				continue;
+			key.system_identifier = typed->system_identifier;
+			key.database_incarnation = typed->observer.database_incarnation;
+			key.origin_node_id = owner - 1;
+			key.segment_id = segment;
+			key.segment_generation = header->wrap_count;
+			key.slot_offset = offset;
+			key.slot_wrap = slot->wrap;
+			key.xid = slot->xid;
+			result = cluster_recovery_reference_graph_add(graph, &key, slot->first_undo_block);
+			if (result != CLUSTER_RECOVERY_GRAPH_MORE)
+				goto failure;
+		}
+	}
+	*out = graph;
+	return CLUSTER_RECOVERY_GRAPH_MORE;
+
+identity_failure:
+	result = CLUSTER_RECOVERY_GRAPH_IDENTITY;
+failure:
+	cluster_recovery_reference_graph_destroy(graph);
 	return result;
 }

@@ -871,6 +871,18 @@ typedef struct ClusterColdTtRedoGraphInputV1 {
 	uint32 participant;
 } ClusterColdTtRedoGraphInputV1;
 
+/* Create an input graph with every nonzero after-redo TT head in every
+ * captured segment of this participant's physical owner. Terminal status
+ * does not retire a dependency. No BIND inventory or zero-head inference.
+ * The caller retains input and typed through graph destruction. Failure
+ * clears out and destroys any partially seeded graph. MORE only means the
+ * TT roots were supplied; traversal, page/native roots, all-source and final
+ * base/source checks remain required. No top/loser/C0 or OPEN authority. */
+extern ClusterRecoveryGraphResult
+cluster_cold_typed_tt_redo_graph_begin_v1(ClusterColdTtRedoGraphInputV1 *input,
+										  size_t memory_budget,
+										  struct ClusterRecoveryReferenceGraph **out);
+
 /* Existing reference-graph callback over an exact after-redo TT key and the
  * same source's final FPI-backed records. No DATA fallback or install. Every
  * call, including graph verification, repeats the source and identity checks;
