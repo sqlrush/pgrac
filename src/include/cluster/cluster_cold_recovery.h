@@ -984,6 +984,9 @@ extern bool cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
  * gates remain independent and required. An older ACTIVE without a retained
  * BIND remains blocked pending the original qualified canonical-base producer;
  * this does not introduce a BIND lifetime retention requirement.
+ * Reject exact native COMMIT/TT_ABORT conflicts in every sealed source,
+ * including history-only retained incarnations of the same thread. Absence
+ * of those conflicts does not supply the independent terminal_match proof.
  * Target incarnation/claim remain bound to the original source.  A new
  * header with no original base requires the native full-image proof.
  * The original endpoint receipt must cover the unchanged complete source

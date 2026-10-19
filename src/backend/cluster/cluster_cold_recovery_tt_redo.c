@@ -491,6 +491,56 @@ cold_top_tx_native_bind_v1(const RfSideOnlinePlanV1 *plan, const ClusterColdTtSl
 	return false;
 }
 
+/* A retained incarnation is not folded into the current owner's header,
+ * but its exact terminal still contradicts the same physical ACTIVE key.
+ * Neither a different claim/epoch nor history_only erases that conflict.
+ * Absence of these carriers does not supply the independent terminal proof. */
+static bool
+cold_top_tx_terminals_compatible_v1(const ClusterColdTypedV1 *typed,
+									const ClusterColdTtSlotKeyV1 *key)
+{
+	for (uint32 p = 0; p < typed->participant_count; p++) {
+		const RfSideOnlinePlanV1 *plan = typed->side_plans[p];
+		uint32 count = rf_side_online_plan_operation_count_v1(plan);
+
+		if (count == UINT32_MAX)
+			return false;
+		for (uint32 i = 0; i < count; i++) {
+			RfSideOnlineOperationV1 operation;
+			ClusterColdTtSlotKeyV1 terminal = { 0 };
+
+			if (!rf_side_online_plan_operation_v1(plan, i, &operation))
+				return false;
+			if (operation.kind == RF_SIDE_ONLINE_OPERATION_XACT
+				&& operation.xact.kind == RF_SIDE_XACT_COMMIT && operation.xact.has_tt_delta) {
+				const xl_xact_tt_commit *delta = &operation.xact.tt_delta;
+
+				terminal.owner_instance = delta->instance;
+				terminal.segment_id = delta->segment_id;
+				terminal.segment_generation = delta->segment_generation;
+				terminal.slot_offset = delta->slot_offset;
+				terminal.slot_wrap = delta->wrap;
+				terminal.xid = delta->xid;
+			} else if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
+					   && operation.undo.kind == CLUSTER_UNDO_KIND_TT_ABORT
+					   && operation.undo.format_version == CLUSTER_UNDO_TT_ABORT_EXACT_VERSION) {
+				const ClusterUndoDecoded *abort = &operation.undo;
+
+				terminal.owner_instance = abort->instance;
+				terminal.segment_id = abort->segment_id;
+				terminal.segment_generation = abort->expected_generation;
+				terminal.slot_offset = abort->slot_offset;
+				terminal.slot_wrap = abort->wrap;
+				terminal.xid = abort->xid;
+			} else
+				continue;
+			if (cold_top_tx_key_equal_v1(&terminal, key))
+				return false;
+		}
+	}
+	return true;
+}
+
 /* Consume the original owner's selected native checkpoint, not a caller's
  * checkpoint number. This binds the source and replay cut only; it does not
  * establish that any captured TT base is covered by that checkpoint. */
@@ -571,6 +621,8 @@ cluster_cold_typed_top_tx_c0_producer_v1(const ClusterColdTypedV1 *typed, uint32
 	 * its observed bytes can never supply a missing predecessor. */
 	if (!cluster_cold_typed_tt_after_redo_readback_v1(typed, participant, post_segment_index,
 													  &post_image))
+		return false;
+	if (!cold_top_tx_terminals_compatible_v1(typed, &post_slot.key))
 		return false;
 	/* The caller's producer_top bit is not an original producer fact. Only
 	 * this source's exact native BIND currently qualifies this gate here. */
