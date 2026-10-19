@@ -5,6 +5,7 @@ int heap_horizon_stripe_fixture_main(void);
 #include "test_cluster_xid_stripe.c"
 #undef main
 #include "cluster/cluster_heap_horizon.h"
+#include "cluster/cluster_undo_horizon.h"
 #include "access/multixact.h"
 #include "utils/rel.h"
 
@@ -161,8 +162,8 @@ make_freeze_report_v2(void)
 	report.formation_epoch = UINT64CONST(0x2122232425262728);
 	report.incarnation = UINT64CONST(0x3132333435363738);
 	report.report_sequence = UINT64CONST(0x4142434445464748);
-	report.future_full_xid = UINT64CONST(0x5152535455565758);
-	report.active_full_xid_min = UINT64CONST(0x6162636465666768);
+	report.future_full_xid = UINT64CONST(0x6162636465666768);
+	report.active_full_xid_min = UINT64CONST(0x5152535455565758);
 	report.horizon_scn = UINT64CONST(0x7172737475767778);
 	report.requested_full_xid = UINT64CONST(0x8182838485868788);
 	report.origin = 0xA1B2C3D4;
@@ -268,10 +269,83 @@ UT_TEST(freeze_report_v2_rejects_unknown_contributor_kind)
 	UT_ASSERT(!cluster_heap_freeze_report_v2_decode(bytes, sizeof(bytes), &output));
 }
 
+UT_TEST(freeze_report_v2_rejects_missing_identity_and_sample)
+{
+	ClusterHeapFreezeReportV2 input = make_freeze_report_v2();
+	uint8 bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES];
+
+	input.sysid = 0;
+	UT_ASSERT(!cluster_heap_freeze_report_v2_encode(&input, bytes));
+	input = make_freeze_report_v2();
+	input.record_generation = 0;
+	UT_ASSERT(!cluster_heap_freeze_report_v2_encode(&input, bytes));
+	input = make_freeze_report_v2();
+	input.formation_epoch = 0;
+	UT_ASSERT(!cluster_heap_freeze_report_v2_encode(&input, bytes));
+	input = make_freeze_report_v2();
+	input.incarnation = 0;
+	UT_ASSERT(!cluster_heap_freeze_report_v2_encode(&input, bytes));
+	input = make_freeze_report_v2();
+	input.report_sequence = 0;
+	UT_ASSERT(!cluster_heap_freeze_report_v2_encode(&input, bytes));
+	input = make_freeze_report_v2();
+	input.f_sample_id = 0;
+	UT_ASSERT(!cluster_heap_freeze_report_v2_encode(&input, bytes));
+	input = make_freeze_report_v2();
+	input.horizon_scn = 0;
+	UT_ASSERT(!cluster_heap_freeze_report_v2_encode(&input, bytes));
+	input = make_freeze_report_v2();
+	input.h_sample_clock_scn = 0;
+	UT_ASSERT(!cluster_heap_freeze_report_v2_encode(&input, bytes));
+	input = make_freeze_report_v2();
+	input.horizon_scn = CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED;
+	UT_ASSERT(!cluster_heap_freeze_report_v2_encode(&input, bytes));
+}
+
+UT_TEST(freeze_report_v2_rejects_invalid_full_xid_window)
+{
+	ClusterHeapFreezeReportV2 input = make_freeze_report_v2();
+	uint8 bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES];
+
+	input.future_full_xid = UINT64CONST(0x6162636400000000);
+	UT_ASSERT(!cluster_heap_freeze_report_v2_encode(&input, bytes));
+	input = make_freeze_report_v2();
+	input.active_full_xid_min = UINT64CONST(0x5152535400000000);
+	UT_ASSERT(!cluster_heap_freeze_report_v2_encode(&input, bytes));
+	input = make_freeze_report_v2();
+	input.active_full_xid_min = UINT64CONST(0x6162636465666769);
+	UT_ASSERT(!cluster_heap_freeze_report_v2_encode(&input, bytes));
+	input = make_freeze_report_v2();
+	input.requested_full_xid = UINT64CONST(0x8182838400000000);
+	UT_ASSERT(!cluster_heap_freeze_report_v2_encode(&input, bytes));
+	input = make_freeze_report_v2();
+	input.requested_full_xid = 0;
+	UT_ASSERT(cluster_heap_freeze_report_v2_encode(&input, bytes));
+}
+
+UT_TEST(freeze_report_v2_decode_rejects_invalid_payload)
+{
+	ClusterHeapFreezeReportV2 input = make_freeze_report_v2();
+	ClusterHeapFreezeReportV2 output = input;
+	uint8 bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES];
+
+	UT_ASSERT(cluster_heap_freeze_report_v2_encode(&input, bytes));
+	bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_SYSID] = 0;
+	bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_SYSID + 1] = 0;
+	bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_SYSID + 2] = 0;
+	bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_SYSID + 3] = 0;
+	bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_SYSID + 4] = 0;
+	bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_SYSID + 5] = 0;
+	bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_SYSID + 6] = 0;
+	bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_SYSID + 7] = 0;
+	UT_ASSERT(!cluster_heap_freeze_report_v2_decode(bytes, sizeof(bytes), &output));
+	assert_freeze_report_v2_equal(&input, &output);
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(13);
 	UT_RUN(slower_writer_can_issue_below_local_freeze_proposal);
 	UT_RUN(older_local_cutoff_is_never_advanced);
 	UT_RUN(missing_or_invalid_authority_preserves_output);
@@ -282,6 +356,9 @@ main(void)
 	UT_RUN(freeze_report_v2_roundtrips_exact_little_endian_layout);
 	UT_RUN(freeze_report_v2_rejects_bad_header_reserved_and_interval);
 	UT_RUN(freeze_report_v2_rejects_unknown_contributor_kind);
+	UT_RUN(freeze_report_v2_rejects_missing_identity_and_sample);
+	UT_RUN(freeze_report_v2_rejects_invalid_full_xid_window);
+	UT_RUN(freeze_report_v2_decode_rejects_invalid_payload);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

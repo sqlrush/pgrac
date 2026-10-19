@@ -64,14 +64,36 @@ heap_freeze_report_v2_kind_valid(uint32 kind)
 }
 
 static bool
+heap_freeze_report_v2_full_xid_valid(uint64 value)
+{
+	return FullTransactionIdIsValid(FullTransactionIdFromU64(value));
+}
+
+static bool
 heap_freeze_report_v2_valid(const ClusterHeapFreezeReportV2 *report)
 {
-	return report != NULL && report->version == CLUSTER_HEAP_FREEZE_REPORT_V2_VERSION
-		   && report->length == CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES && report->flags == 0
-		   && report->reserved0 == 0
-		   && heap_freeze_report_v2_kind_valid(report->h_contributor_kind)
-		   && report->sender_interval_ms >= CLUSTER_UNDO_HORIZON_INTERVAL_MIN_MS
-		   && report->sender_interval_ms <= CLUSTER_UNDO_HORIZON_INTERVAL_MAX_MS;
+	if (report == NULL || report->version != CLUSTER_HEAP_FREEZE_REPORT_V2_VERSION
+		|| report->length != CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES || report->flags != 0
+		|| report->reserved0 != 0
+		|| !heap_freeze_report_v2_kind_valid(report->h_contributor_kind)
+		|| report->sender_interval_ms < CLUSTER_UNDO_HORIZON_INTERVAL_MIN_MS
+		|| report->sender_interval_ms > CLUSTER_UNDO_HORIZON_INTERVAL_MAX_MS)
+		return false;
+	if (report->sysid == 0 || report->record_generation == 0 || report->formation_epoch == 0
+		|| report->incarnation == 0 || report->report_sequence == 0 || report->f_sample_id == 0)
+		return false;
+	if (!SCN_VALID((SCN)report->horizon_scn)
+		|| report->horizon_scn == CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED
+		|| !SCN_VALID((SCN)report->h_sample_clock_scn))
+		return false;
+	if (!heap_freeze_report_v2_full_xid_valid(report->future_full_xid)
+		|| !heap_freeze_report_v2_full_xid_valid(report->active_full_xid_min)
+		|| report->active_full_xid_min > report->future_full_xid)
+		return false;
+	if (report->requested_full_xid != 0
+		&& !heap_freeze_report_v2_full_xid_valid(report->requested_full_xid))
+		return false;
+	return true;
 }
 
 bool
