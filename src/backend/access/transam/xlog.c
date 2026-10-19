@@ -7924,6 +7924,7 @@ StartupXLOG(void)
 					 errdetail("reason=%s",
 							   normal_failure != NULL ? normal_failure : "INVALID_STARTUP_STATE")));
 	}
+	ClusterReleaseColdRecoveryInputs(endOfRecoveryInfo);
 #endif
 }
 
