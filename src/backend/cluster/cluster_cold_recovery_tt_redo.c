@@ -361,6 +361,32 @@ cluster_cold_typed_tt_redo_match_v1(const ClusterColdTypedV1 *typed, uint32 part
 }
 
 bool
+cluster_cold_typed_tt_active_identity_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+										 uint32 segment_index,
+										 const ClusterColdTtSlotKeyV1 *expected,
+										 ClusterColdTtActiveIdentityV1 *out)
+{
+	ClusterColdTtSlotKeyV1 key;
+	ClusterColdTtSlotInputV1 input;
+
+	if (expected != NULL)
+		key = *expected;
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (expected == NULL
+		|| !cluster_cold_typed_tt_redo_match_v1(typed, participant, segment_index, &key, &input)
+		|| input.slot.status != TT_SLOT_ACTIVE
+		|| input.key.xid != input.slot.xid
+		|| input.key.slot_wrap != input.slot.wrap)
+		return false;
+	/* The returned value is just the physical key. All source, base, effects,
+	 * old-writer, top and C0 gates remain with their respective owners. */
+	out->key = input.key;
+	return true;
+}
+
+bool
 cluster_cold_typed_undo_redo_record_v1(const ClusterColdTypedV1 *typed, uint32 participant,
 									   uint32 segment_index, UBA address,
 									   ClusterRecoveryUndoRecord *out, uint32 *generation)

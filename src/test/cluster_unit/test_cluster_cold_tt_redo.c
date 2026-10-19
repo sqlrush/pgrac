@@ -745,6 +745,48 @@ UT_TEST(tt_redo_slot_reads_exact_abort_without_loser_inference)
 	tt_redo_destroy(&f);
 }
 
+UT_TEST(tt_redo_active_identity_requires_post_redo_active_physical_slot)
+{
+	TtRedoFixture f;
+	FakeXactRecord fake;
+	ClusterColdTtSlotInputV1 input;
+	ClusterColdTtActiveIdentityV1 identity, zero = { 0 };
+
+	/* An ACTIVE slot yields only its physical key. No FullXid or epoch input
+	 * exists on this path, so a later TopTxProof can add those gates. */
+	tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+	tt_redo_seal(&f);
+	UT_ASSERT(cluster_cold_typed_tt_redo_slot_v1(&f.typed, 0, 0, 47, &input));
+	memset(&identity, 0xa9, sizeof(identity));
+	UT_ASSERT(cluster_cold_typed_tt_active_identity_v1(&f.typed, 0, 0, &input.key,
+										 &identity));
+	UT_ASSERT_EQ(identity.key.owner_instance, input.key.owner_instance);
+	UT_ASSERT_EQ(identity.key.segment_id, input.key.segment_id);
+	UT_ASSERT_EQ(identity.key.segment_generation, input.key.segment_generation);
+	UT_ASSERT_EQ(identity.key.slot_offset, input.key.slot_offset);
+	UT_ASSERT_EQ(identity.key.xid, input.key.xid);
+	UT_ASSERT_EQ(identity.key.slot_wrap, input.key.slot_wrap);
+	tt_redo_destroy(&f);
+
+	/* Terminal status is a physical refusal, regardless of the raw key still
+	 * matching the captured slot identity. */
+	for (int terminal = 0; terminal < 2; terminal++) {
+		tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+		UT_ASSERT(cluster_cold_tt_base_slot_v1(&f.typed, 0, 4, &input));
+		if (terminal == 0)
+			undo_header_commit(&fake, 0, 802);
+		else
+			undo_header_abort(&fake, 4);
+		undo_header_feed(f.typed.side_plans[0], &fake, 100);
+		tt_redo_seal(&f);
+		memset(&identity, 0xa9, sizeof(identity));
+		UT_ASSERT(!cluster_cold_typed_tt_active_identity_v1(&f.typed, 0, 0, &input.key,
+											&identity));
+		UT_ASSERT(memcmp(&identity, &zero, sizeof(identity)) == 0);
+		tt_redo_destroy(&f);
+	}
+}
+
 UT_TEST(tt_redo_match_refuses_each_stale_key_field_and_clears_output)
 {
 	TtRedoFixture f;
@@ -3916,7 +3958,7 @@ UT_TEST(tt_inventory_refuses_unsupported_historical_tt_carriers)
 int
 main(void)
 {
-	UT_PLAN(96);
+	UT_PLAN(97);
 	UT_RUN(tt_inventory_requires_sealed_exact_history_sources_even_without_headers);
 	UT_RUN(tt_inventory_accepts_ordinary_history_with_reused_or_absent_old_target);
 	UT_RUN(tt_inventory_refuses_unsupported_historical_tt_carriers);
@@ -3991,6 +4033,7 @@ main(void)
 	UT_RUN(tt_redo_slots_enumerate_every_status_and_preserve_generation_zero);
 	UT_RUN(tt_redo_slot_reads_commit_and_matches_after_image_independently);
 	UT_RUN(tt_redo_slot_reads_exact_abort_without_loser_inference);
+	UT_RUN(tt_redo_active_identity_requires_post_redo_active_physical_slot);
 	UT_RUN(tt_redo_match_refuses_each_stale_key_field_and_clears_output);
 	UT_RUN(tt_redo_slots_reject_unsealed_history_bounds_and_invalid_arguments);
 	UT_RUN(tt_redo_slots_refuse_source_drift_and_unsupported_prepared_input);

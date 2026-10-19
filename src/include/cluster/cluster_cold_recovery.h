@@ -865,6 +865,13 @@ typedef struct ClusterColdTtSlotInputV1 {
 	TTSlot slot;
 } ClusterColdTtSlotInputV1;
 
+/* Physical identity of a slot that remains ACTIVE after sealed redo. The
+ * key already carries the raw xid; this value deliberately has no FullXid,
+ * cluster epoch, top proof, effects coverage or mutation authority. */
+typedef struct ClusterColdTtActiveIdentityV1 {
+	ClusterColdTtSlotKeyV1 key;
+} ClusterColdTtActiveIdentityV1;
+
 /* Re-enumerate physical TT after complete redo and the original durability
  * barrier, without overwriting the pre-redo base. Share its remaining budget.
  * Retain post-redo images of UNDO blocks already cached in the original base;
@@ -992,6 +999,15 @@ extern bool cluster_cold_typed_tt_redo_match_v1(const ClusterColdTypedV1 *typed,
 												uint32 segment_index,
 												const ClusterColdTtSlotKeyV1 *expected,
 												ClusterColdTtSlotInputV1 *out);
+/* Retain only the exact physical key of a post-redo ACTIVE slot. Terminal
+ * status, raw xid and wrap must agree with that key. This is an input fact
+ * for a later TopTxProof/loser consumer, never a loser decision itself; no
+ * FullXid high bits or bind-time epoch are read. Failure clears out. */
+extern bool cluster_cold_typed_tt_active_identity_v1(const ClusterColdTypedV1 *typed,
+															uint32 participant,
+															uint32 segment_index,
+															const ClusterColdTtSlotKeyV1 *expected,
+															ClusterColdTtActiveIdentityV1 *out);
 
 /* Copy one raw record from a sealed ordinary source's final FPI-backed UNDO
  * block image and return its folded physical segment generation (zero is
