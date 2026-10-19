@@ -38,6 +38,9 @@ struct ClusterRelmapRetentionCensus {
 	bool reading;
 	unsigned copy;
 	size_t offset;
+	/* Valid only between an emitted namespace and the next cursor advance. */
+	ClusterRelmapV2View rebuild_view;
+	bool rebuild_ready;
 };
 
 static ClusterRelmapCensusResult
@@ -56,6 +59,8 @@ static ClusterRelmapCensusResult
 census_failed(ClusterRelmapRetentionCensus *census, ClusterRelmapCensusResult result)
 {
 	census->result = result;
+	census->rebuild_ready = false;
+	memset(&census->rebuild_view, 0, sizeof(census->rebuild_view));
 	for (size_t i = 0; i < census->origin_count; i++)
 		cluster_relmap_retention_invalidate(census->origins[census->nodes[i]].directory);
 	cluster_recovery_root_set_invalidate(census->roots);
@@ -215,6 +220,8 @@ census_namespace_finish(ClusterRelmapRetentionCensus *census, ClusterRelmapCensu
 				? CLUSTER_RELMAP_CENSUS_CAPACITY : CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
 	}
 	if (out != NULL) {
+		census->rebuild_view = view;
+		census->rebuild_ready = true;
 		out->identity = census->identity;
 		out->generation = view.committed_generation;
 		out->map = view.committed;
@@ -239,6 +246,8 @@ cluster_relmap_retention_census_next_committed(ClusterRelmapRetentionCensus *cen
 		memset(out, 0, sizeof(*out));
 	if (census == NULL)
 		return CLUSTER_RELMAP_CENSUS_INVALID;
+	census->rebuild_ready = false;
+	memset(&census->rebuild_view, 0, sizeof(census->rebuild_view));
 	if (census->result > CLUSTER_RELMAP_CENSUS_DRAINED)
 		return census->result;
 	if (census->checked || census->result == CLUSTER_RELMAP_CENSUS_DRAINED) {
@@ -341,6 +350,40 @@ ClusterRelmapCensusResult
 cluster_relmap_retention_census_next(ClusterRelmapRetentionCensus *census)
 {
 	return cluster_relmap_retention_census_next_committed(census, NULL);
+}
+
+ClusterRelmapPendingResult
+cluster_relmap_retention_census_rebuild_pending(ClusterRelmapRetentionCensus *census,
+	ClusterRelmapPendingSet *pending_out, const ClusterRelmapPendingDescriptor *descriptors,
+	size_t descriptor_count)
+{
+	ClusterRelmapPendingResult result;
+
+	if (census == NULL)
+		return CLUSTER_RELMAP_PENDING_INVALID_INPUT;
+	if (census->result != CLUSTER_RELMAP_CENSUS_MORE || !census->rebuild_ready)
+		return CLUSTER_RELMAP_PENDING_NOT_READY;
+	/* No I/O: the whole physical ROOT recheck is still required before adopting
+	 * any copied set. Recheck all borrowed qualifications between the two calls. */
+	if (!census_root_same(census)) {
+		census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
+		return CLUSTER_RELMAP_PENDING_NOT_READY;
+	}
+	for (size_t i = 0; i < census->origin_count; i++)
+		if (!census_origin_same(census, census->nodes[i])) {
+			census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
+			return CLUSTER_RELMAP_PENDING_NOT_READY;
+		}
+	/* Only the original full legal pair reaches rebuild_ready. Never use the
+	 * externally copied map or reconstruct a view from its generation alone. */
+	result = cluster_relmap_pending_rebuild_from_committed(pending_out, &census->identity,
+		CLUSTER_RELMAP_V2_PAIR_VALID, &census->rebuild_view, descriptors, descriptor_count);
+	census->rebuild_ready = false;
+	memset(&census->rebuild_view, 0, sizeof(census->rebuild_view));
+	if (result != CLUSTER_RELMAP_PENDING_OK)
+		census_failed(census, result == CLUSTER_RELMAP_PENDING_CAPACITY_EXCEEDED
+			? CLUSTER_RELMAP_CENSUS_CAPACITY : CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+	return result;
 }
 
 void

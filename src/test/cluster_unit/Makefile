@@ -570,17 +570,20 @@ test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_pending.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_restore.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h \
 		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention_census.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_pending.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_CRYPTOHASH_O) cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention_census.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_pending.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(LDFLAGS) $(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \

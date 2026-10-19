@@ -4,6 +4,7 @@
 #define RECOVERY_ROOT_SET_FIXTURE_ONLY
 #include "test_cluster_recovery_root_set.c"
 #include "cluster/cluster_relmap_retention_census.h"
+#include "cluster/cluster_relmap_pending.h"
 
 #define CENSUS_BUDGET (128 * 1024)
 #define CENSUS_FULL UINT64CONST(0x200000123)
@@ -648,10 +649,250 @@ UT_TEST(test_committed_reader_invalid_cursor_clears_output)
 		CLUSTER_RELMAP_CENSUS_INVALID);
 }
 
+static ClusterRelmapPendingDescriptor
+census_descriptor(Oid dbid, ClusterRelmapPendingKind kind, RelFileNumber number)
+{
+	ClusterRelmapPendingDescriptor descriptor = { 0 };
+
+	descriptor.kind = kind;
+	descriptor.identity.system_identifier = 817;
+	descriptor.identity.database_incarnation = 91;
+	memcpy(descriptor.identity.storage_uuid, root_uuid, 16);
+	descriptor.identity.locator = (RelFileLocator){ dbid == InvalidOid
+		? GLOBALTABLESPACE_OID : DEFAULTTABLESPACE_OID, dbid, number };
+	return descriptor;
+}
+
+static bool
+census_until_committed(CensusFixture *f, Oid dbid)
+{
+	ClusterRelmapCensusResult result = CLUSTER_RELMAP_CENSUS_MORE;
+
+	for (unsigned tick = 0; tick < 20000 && result == CLUSTER_RELMAP_CENSUS_MORE; tick++) {
+		ClusterRelmapCensusCommitted out;
+
+		result = cluster_relmap_retention_census_next_committed(f->census, &out);
+		if (out.present && out.identity.dbid == dbid)
+			return true;
+	}
+	UT_ASSERT(false);
+	return false;
+}
+
+UT_TEST(test_root_committed_rebuild_uses_exact_view_and_preserves_all_obligations)
+{
+	for (unsigned cut = 0; cut < 5; cut++) {
+		CensusFixture f;
+		ClusterRelmapCensusResult result = CLUSTER_RELMAP_CENSUS_MORE;
+		unsigned seen = 0;
+
+		census_fixture(&f, cut != 0);
+		census_pair(f.fd, 5, 3, cut == 1 || cut == 4,
+			cut == 2 || cut == 3 || cut == 4, cut == 3);
+		if (census_observe_begin(&f)) {
+			for (unsigned tick = 0; tick < 20000 && result == CLUSTER_RELMAP_CENSUS_MORE;
+				tick++) {
+				ClusterRelmapCensusCommitted out;
+				ClusterRelmapPendingSet set;
+				ClusterRelmapPendingDescriptor descriptors[2];
+				size_t count;
+
+				result = cluster_relmap_retention_census_next_committed(f.census, &out);
+				if (!out.present)
+					continue;
+				descriptors[0] = census_descriptor(out.identity.dbid, CLUSTER_RELMAP_PENDING_DROP, 70000);
+				descriptors[1] = census_descriptor(out.identity.dbid, CLUSTER_RELMAP_PENDING_TRUNCATE, 70001);
+				/* An empty structural stream is independent of a clean relmap pair. */
+				count = out.identity.shared && cut == 0 ? 0 : 2;
+				cluster_relmap_pending_init(&set);
+				UT_ASSERT_EQ(cluster_relmap_retention_census_rebuild_pending(f.census,
+					&set, count == 0 ? NULL : descriptors, count), CLUSTER_RELMAP_PENDING_OK);
+				for (size_t i = 0; i < count; i++) {
+					ClusterSpaceIdentityKey alias = descriptors[i].identity;
+
+					UT_ASSERT(cluster_relmap_pending_contains(&set, descriptors[i].kind,
+						&descriptors[i].identity));
+					alias.storage_uuid[0]++;
+					UT_ASSERT(cluster_relmap_pending_rel_number_reserved(&set, &alias));
+					UT_ASSERT(set.entries[i].main_placeholder);
+					UT_ASSERT(!set.entries[i].copies_cleared_readback);
+					UT_ASSERT(!set.entries[i].native_terminal);
+					UT_ASSERT(!set.entries[i].tt_complete);
+					UT_ASSERT(!set.entries[i].space_complete);
+					UT_ASSERT(!cluster_relmap_pending_can_release(&set, descriptors[i].kind,
+						&descriptors[i].identity));
+				}
+				seen |= out.identity.shared ? 1 : 2;
+				UT_ASSERT_EQ(out.map.mappings[0].mapfilenumber,
+					!out.identity.shared && cut == 3 ? 40001 : 40000);
+			}
+			UT_ASSERT_EQ(result, CLUSTER_RELMAP_CENSUS_DRAINED);
+			UT_ASSERT_EQ(seen, 3);
+			UT_ASSERT_EQ(census_pin(&f.origin[0], 5) != NULL, cut != 0);
+			for (unsigned i = 0; i < 2; i++)
+				UT_ASSERT_EQ(f.origin[i].state, CLUSTER_RELMAP_RETENTION_BUILDING);
+		}
+		census_cleanup(&f);
+	}
+}
+
+UT_TEST(test_root_rebuild_window_is_current_emission_only_and_single_use)
+{
+	for (unsigned window = 0; window < 6; window++) {
+		CensusFixture f;
+		ClusterRelmapPendingSet set, before;
+		ClusterRelmapPendingDescriptor descriptor = census_descriptor(5,
+			CLUSTER_RELMAP_PENDING_DROP, 70000);
+
+		census_fixture(&f, true);
+		cluster_relmap_pending_init(&set);
+		if (census_observe_begin(&f)) {
+			if (window != 0)
+				UT_ASSERT(census_until_committed(&f, 5));
+			if (window == 1 || window == 2) {
+				UT_ASSERT_EQ(window == 1 ? cluster_relmap_retention_census_next(f.census)
+					: cluster_relmap_retention_census_next_committed(f.census, NULL),
+					CLUSTER_RELMAP_CENSUS_MORE);
+			} else if (window == 3) {
+				UT_ASSERT_EQ(cluster_relmap_retention_census_rebuild_pending(f.census,
+					&set, &descriptor, 1), CLUSTER_RELMAP_PENDING_OK);
+			} else if (window == 4)
+				UT_ASSERT_EQ(census_drain(&f), CLUSTER_RELMAP_CENSUS_DRAINED);
+			else if (window == 5) {
+				/* A non-emitting MORE call also expires the previous namespace. */
+				ClusterRelmapCensusCommitted out;
+
+				UT_ASSERT_EQ(cluster_relmap_retention_census_next_committed(f.census, &out),
+					CLUSTER_RELMAP_CENSUS_MORE);
+				UT_ASSERT(!out.present);
+			}
+			before = set;
+			UT_ASSERT_EQ(cluster_relmap_retention_census_rebuild_pending(f.census,
+				&set, &descriptor, 1), CLUSTER_RELMAP_PENDING_NOT_READY);
+			UT_ASSERT_EQ(memcmp(&set, &before, sizeof(set)), 0);
+			UT_ASSERT_EQ(census_drain(&f), CLUSTER_RELMAP_CENSUS_DRAINED);
+			UT_ASSERT(census_pin(&f.origin[0], 5) != NULL);
+			UT_ASSERT_EQ(f.origin[0].state, CLUSTER_RELMAP_RETENTION_BUILDING);
+		}
+		census_cleanup(&f);
+	}
+}
+
+UT_TEST(test_root_rebuild_descriptor_refusal_is_atomic_and_poisoned_with_pins_retained)
+{
+	for (unsigned bad = 0; bad < 11; bad++) {
+		CensusFixture f;
+		ClusterRelmapPendingSet set, before;
+		ClusterRelmapPendingDescriptor descriptors[2] = {
+			census_descriptor(5, CLUSTER_RELMAP_PENDING_DROP, 70000),
+			census_descriptor(5, CLUSTER_RELMAP_PENDING_TRUNCATE, 70001)
+		};
+		ClusterRelmapPendingResult expected = CLUSTER_RELMAP_PENDING_CONFLICT;
+
+		census_fixture(&f, true);
+		cluster_relmap_pending_init(&set);
+		if (census_observe_begin(&f) && census_until_committed(&f, 5)) {
+			switch (bad) {
+				case 0: descriptors[1].identity.system_identifier++; break;
+				case 1: descriptors[1].identity.database_incarnation++; break;
+				case 2: descriptors[1].identity.locator.dbOid++; break;
+				case 3: descriptors[1].identity.locator.spcOid = GLOBALTABLESPACE_OID; break;
+				case 4: descriptors[1].kind = CLUSTER_RELMAP_PENDING_INVALID;
+					expected = CLUSTER_RELMAP_PENDING_INVALID_INPUT; break;
+				case 5: memset(descriptors[1].identity.storage_uuid, 0, 16);
+					expected = CLUSTER_RELMAP_PENDING_INVALID_INPUT; break;
+				case 6: descriptors[1].identity.locator = descriptors[0].identity.locator;
+					descriptors[1].identity.storage_uuid[0]++; break;
+				case 7: expected = CLUSTER_RELMAP_PENDING_CAPACITY_EXCEEDED; break;
+				case 8: UT_ASSERT_EQ(cluster_relmap_pending_add(&set, descriptors[0].kind,
+					&descriptors[0].identity, true), CLUSTER_RELMAP_PENDING_OK); break;
+				case 9: case 10: expected = CLUSTER_RELMAP_PENDING_INVALID_INPUT; break;
+			}
+			before = set;
+			UT_ASSERT_EQ(cluster_relmap_retention_census_rebuild_pending(f.census,
+				bad == 10 ? NULL : &set, bad == 9 ? NULL : descriptors,
+				bad == 7 ? CLUSTER_RELMAP_PENDING_CAPACITY + 1 : 2), expected);
+			UT_ASSERT_EQ(memcmp(&set, &before, sizeof(set)), 0);
+			UT_ASSERT_EQ(cluster_relmap_retention_census_next(f.census), bad == 7
+				? CLUSTER_RELMAP_CENSUS_CAPACITY : CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+			UT_ASSERT(census_pin(&f.origin[0], 5) != NULL);
+			census_refused(&f);
+		}
+		census_cleanup(&f);
+	}
+}
+
+UT_TEST(test_root_rebuild_rechecks_borrowed_qualification_before_consuming)
+{
+	for (unsigned change = 0; change < 3; change++) {
+		CensusFixture f;
+		ClusterRelmapPendingSet set, before;
+		ClusterRelmapPendingDescriptor descriptor = census_descriptor(5,
+			CLUSTER_RELMAP_PENDING_DROP, 70000);
+
+		census_fixture(&f, true);
+		cluster_relmap_pending_init(&set);
+		before = set;
+		if (census_observe_begin(&f) && census_until_committed(&f, 5)) {
+			if (change == 0)
+				cluster_recovery_root_set_invalidate(f.roots);
+			else if (change == 1)
+				f.origin[1].last_issued++;
+			else
+				cluster_relmap_retention_invalidate(&f.origin[0]);
+			UT_ASSERT_EQ(cluster_relmap_retention_census_rebuild_pending(f.census,
+				&set, &descriptor, 1), CLUSTER_RELMAP_PENDING_NOT_READY);
+			UT_ASSERT_EQ(memcmp(&set, &before, sizeof(set)), 0);
+			UT_ASSERT_EQ(cluster_relmap_retention_census_next(f.census),
+				CLUSTER_RELMAP_CENSUS_CHANGED);
+			UT_ASSERT(census_pin(&f.origin[0], 5) != NULL);
+			census_refused(&f);
+		}
+		census_cleanup(&f);
+	}
+}
+
+UT_TEST(test_root_rebuild_remains_provisional_until_whole_set_recheck)
+{
+	CensusFixture f;
+	ClusterRelmapPendingSet set;
+	ClusterRelmapPendingDescriptor descriptor = census_descriptor(5,
+		CLUSTER_RELMAP_PENDING_DROP, 70000);
+
+	census_fixture(&f, true);
+	cluster_relmap_pending_init(&set);
+	if (census_observe_begin(&f) && census_until_committed(&f, 5)) {
+		UT_ASSERT_EQ(cluster_relmap_retention_census_rebuild_pending(f.census,
+			&set, &descriptor, 1), CLUSTER_RELMAP_PENDING_OK);
+		UT_ASSERT_EQ(unlinkat(f.fd, "global/pgrac_relmap_authority.bak", 0), 0);
+		UT_ASSERT(census_drain(&f) > CLUSTER_RELMAP_CENSUS_DRAINED);
+		UT_ASSERT(census_pin(&f.origin[0], 5) != NULL);
+		census_refused(&f);
+		/* Like a previously copied map, the cursor cannot revoke a caller's
+		 * set. The owner discards it; no terminal or release proof was given. */
+		UT_ASSERT(cluster_relmap_pending_contains(&set, descriptor.kind, &descriptor.identity));
+		UT_ASSERT(!cluster_relmap_pending_can_release(&set, descriptor.kind, &descriptor.identity));
+		cluster_relmap_pending_init(&set);
+		UT_ASSERT(!cluster_relmap_pending_rel_number_reserved(&set, &descriptor.identity));
+	}
+	census_cleanup(&f);
+}
+
+UT_TEST(test_root_rebuild_null_cursor_preserves_destination)
+{
+	ClusterRelmapPendingSet set, before;
+
+	cluster_relmap_pending_init(&set);
+	before = set;
+	UT_ASSERT_EQ(cluster_relmap_retention_census_rebuild_pending(NULL, &set, NULL, 0),
+		CLUSTER_RELMAP_PENDING_INVALID_INPUT);
+	UT_ASSERT_EQ(memcmp(&set, &before, sizeof(set)), 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(25);
 	UT_RUN(test_all_physical_namespaces_and_original_backup_only_pending);
 	UT_RUN(test_all_legal_pair_cuts_keep_pending_without_publishing_complete);
 	UT_RUN(test_clean_census_stays_unpublished);
@@ -671,6 +912,12 @@ main(void)
 	UT_RUN(test_committed_reader_io_refusal_clears_output);
 	UT_RUN(test_committed_reader_legacy_and_optional_output_share_one_cursor);
 	UT_RUN(test_committed_reader_invalid_cursor_clears_output);
+	UT_RUN(test_root_committed_rebuild_uses_exact_view_and_preserves_all_obligations);
+	UT_RUN(test_root_rebuild_window_is_current_emission_only_and_single_use);
+	UT_RUN(test_root_rebuild_descriptor_refusal_is_atomic_and_poisoned_with_pins_retained);
+	UT_RUN(test_root_rebuild_rechecks_borrowed_qualification_before_consuming);
+	UT_RUN(test_root_rebuild_remains_provisional_until_whole_set_recheck);
+	UT_RUN(test_root_rebuild_null_cursor_preserves_destination);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -5,6 +5,7 @@
 #define CLUSTER_RELMAP_RETENTION_CENSUS_H
 
 #include "cluster/cluster_recovery_root_set.h"
+#include "cluster/cluster_relmap_pending.h"
 #include "cluster/cluster_relmap_retention_restore.h"
 
 #ifdef USE_PGRAC_CLUSTER
@@ -70,6 +71,28 @@ cluster_relmap_retention_census_next(ClusterRelmapRetentionCensus *census);
  * Use this API throughout a scan when every namespace image is required. */
 extern ClusterRelmapCensusResult cluster_relmap_retention_census_next_committed(
 	ClusterRelmapRetentionCensus *census, ClusterRelmapCensusCommitted *out);
+
+/* Rebuild structural pending from the actual pair behind the last committed
+ * emission, without a configured-path reread or a caller-constructed view.
+ * Usable once, immediately after next_committed returned MORE with present;
+ * any next call (including legacy/NULL-output next) expires this window.
+ * No current emission returns NOT_READY without changing the cursor or set.
+ *
+ * The original cold owner must supply this namespace's complete, qualified
+ * DROP/TRUNCATE descriptors from its exact stream. Nothing is inferred from
+ * the pending image. The destination must be freshly initialized and empty;
+ * each entry represents MAIN/relNumber obligations with all proof bits clear.
+ * Descriptor refusal poisons the census, preserving every retention pin and
+ * leaving the destination unchanged. Borrowed qualification drift does too.
+ * Work is bounded by the origin limit and pending capacity; no I/O is added.
+ *
+ * This set, like the emitted map, is provisional until whole-ROOT DRAINED.
+ * The caller must discard ALL earlier sets/maps on any later census refusal.
+ * It supplies no physical completion, native/TT/SPACE proof, COMPLETE, floor,
+ * issued/nonreuse qualification, release, allocation or activation authority. */
+extern ClusterRelmapPendingResult cluster_relmap_retention_census_rebuild_pending(
+	ClusterRelmapRetentionCensus *census, ClusterRelmapPendingSet *pending_out,
+	const ClusterRelmapPendingDescriptor *descriptors, size_t descriptor_count);
 
 /* Interrupted scans invalidate the borrowed build and ROOT set, retaining
  * every restored pin. No directory, pin or ROOT ownership is freed here. */
