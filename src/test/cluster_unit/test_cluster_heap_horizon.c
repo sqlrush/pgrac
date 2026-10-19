@@ -149,10 +149,129 @@ UT_TEST(new_permanent_relation_is_not_exempt_as_transaction_local)
 	UT_ASSERT_EQ(activation_reads, 0);
 }
 
+static ClusterHeapFreezeReportV2
+make_freeze_report_v2(void)
+{
+	ClusterHeapFreezeReportV2 report = {0};
+
+	report.version = CLUSTER_HEAP_FREEZE_REPORT_V2_VERSION;
+	report.length = CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES;
+	report.sysid = UINT64CONST(0x0102030405060708);
+	report.record_generation = UINT64CONST(0x1112131415161718);
+	report.formation_epoch = UINT64CONST(0x2122232425262728);
+	report.incarnation = UINT64CONST(0x3132333435363738);
+	report.report_sequence = UINT64CONST(0x4142434445464748);
+	report.future_full_xid = UINT64CONST(0x5152535455565758);
+	report.active_full_xid_min = UINT64CONST(0x6162636465666768);
+	report.horizon_scn = UINT64CONST(0x7172737475767778);
+	report.requested_full_xid = UINT64CONST(0x8182838485868788);
+	report.origin = 0xA1B2C3D4;
+	report.sender_interval_ms = 1234;
+	report.f_sample_id = UINT64CONST(0x9192939495969798);
+	report.h_sample_clock_scn = UINT64CONST(0xA1A2A3A4A5A6A7A8);
+	report.h_contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_PREPARED;
+	report.h_contributor_token = UINT64CONST(0xB1B2B3B4B5B6B7B8);
+	return report;
+}
+
+static void
+assert_freeze_report_v2_equal(const ClusterHeapFreezeReportV2 *left,
+							  const ClusterHeapFreezeReportV2 *right)
+{
+	UT_ASSERT_EQ(left->version, right->version);
+	UT_ASSERT_EQ(left->length, right->length);
+	UT_ASSERT_EQ(left->flags, right->flags);
+	UT_ASSERT_EQ(left->sysid, right->sysid);
+	UT_ASSERT_EQ(left->record_generation, right->record_generation);
+	UT_ASSERT_EQ(left->formation_epoch, right->formation_epoch);
+	UT_ASSERT_EQ(left->incarnation, right->incarnation);
+	UT_ASSERT_EQ(left->report_sequence, right->report_sequence);
+	UT_ASSERT_EQ(left->future_full_xid, right->future_full_xid);
+	UT_ASSERT_EQ(left->active_full_xid_min, right->active_full_xid_min);
+	UT_ASSERT_EQ(left->horizon_scn, right->horizon_scn);
+	UT_ASSERT_EQ(left->requested_full_xid, right->requested_full_xid);
+	UT_ASSERT_EQ(left->origin, right->origin);
+	UT_ASSERT_EQ(left->sender_interval_ms, right->sender_interval_ms);
+	UT_ASSERT_EQ(left->f_sample_id, right->f_sample_id);
+	UT_ASSERT_EQ(left->h_sample_clock_scn, right->h_sample_clock_scn);
+	UT_ASSERT_EQ(left->h_contributor_kind, right->h_contributor_kind);
+	UT_ASSERT_EQ(left->reserved0, right->reserved0);
+	UT_ASSERT_EQ(left->h_contributor_token, right->h_contributor_token);
+}
+
+UT_TEST(freeze_report_v2_roundtrips_exact_little_endian_layout)
+{
+	ClusterHeapFreezeReportV2 input = make_freeze_report_v2();
+	ClusterHeapFreezeReportV2 output = {0};
+	uint8 bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES];
+
+	memset(bytes, 0xA5, sizeof(bytes));
+	UT_ASSERT(cluster_heap_freeze_report_v2_encode(&input, bytes));
+	UT_ASSERT_EQ(bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_VERSION], 2);
+	UT_ASSERT_EQ(bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_VERSION + 1], 0);
+	UT_ASSERT_EQ(bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_LENGTH], 120);
+	UT_ASSERT_EQ(bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_LENGTH + 1], 0);
+	UT_ASSERT_EQ(bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_SYSID], 0x08);
+	UT_ASSERT_EQ(bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_SYSID + 7], 0x01);
+	UT_ASSERT_EQ(bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_ORIGIN], 0xD4);
+	UT_ASSERT_EQ(bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_ORIGIN + 3], 0xA1);
+	UT_ASSERT_EQ(bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_H_CONTRIBUTOR_KIND],
+					CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_PREPARED);
+	UT_ASSERT_EQ(bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_H_CONTRIBUTOR_TOKEN], 0xB8);
+	UT_ASSERT_EQ(bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_H_CONTRIBUTOR_TOKEN + 7], 0xB1);
+	UT_ASSERT(cluster_heap_freeze_report_v2_decode(bytes, sizeof(bytes), &output));
+	assert_freeze_report_v2_equal(&input, &output);
+}
+
+UT_TEST(freeze_report_v2_rejects_bad_header_reserved_and_interval)
+{
+	ClusterHeapFreezeReportV2 input = make_freeze_report_v2();
+	ClusterHeapFreezeReportV2 output;
+	uint8 bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES];
+
+	UT_ASSERT(cluster_heap_freeze_report_v2_encode(&input, bytes));
+	output = input;
+	bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_VERSION]++;
+	UT_ASSERT(!cluster_heap_freeze_report_v2_decode(bytes, sizeof(bytes), &output));
+	assert_freeze_report_v2_equal(&input, &output);
+
+	UT_ASSERT(cluster_heap_freeze_report_v2_encode(&input, bytes));
+	bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_LENGTH]--;
+	UT_ASSERT(!cluster_heap_freeze_report_v2_decode(bytes, sizeof(bytes), &output));
+
+	UT_ASSERT(cluster_heap_freeze_report_v2_encode(&input, bytes));
+	bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_FLAGS] = 1;
+	UT_ASSERT(!cluster_heap_freeze_report_v2_decode(bytes, sizeof(bytes), &output));
+
+	UT_ASSERT(cluster_heap_freeze_report_v2_encode(&input, bytes));
+	bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_RESERVED0] = 1;
+	UT_ASSERT(!cluster_heap_freeze_report_v2_decode(bytes, sizeof(bytes), &output));
+
+	UT_ASSERT(cluster_heap_freeze_report_v2_encode(&input, bytes));
+	bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_SENDER_INTERVAL_MS] = 0;
+	bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_SENDER_INTERVAL_MS + 1] = 0;
+	UT_ASSERT(!cluster_heap_freeze_report_v2_decode(bytes, sizeof(bytes), &output));
+	UT_ASSERT(!cluster_heap_freeze_report_v2_decode(bytes, sizeof(bytes) - 1, &output));
+}
+
+UT_TEST(freeze_report_v2_rejects_unknown_contributor_kind)
+{
+	ClusterHeapFreezeReportV2 input = make_freeze_report_v2();
+	ClusterHeapFreezeReportV2 output;
+	uint8 bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES];
+
+	input.h_contributor_kind = 5;
+	UT_ASSERT(!cluster_heap_freeze_report_v2_encode(&input, bytes));
+	input = make_freeze_report_v2();
+	UT_ASSERT(cluster_heap_freeze_report_v2_encode(&input, bytes));
+	bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_H_CONTRIBUTOR_KIND] = 5;
+	UT_ASSERT(!cluster_heap_freeze_report_v2_decode(bytes, sizeof(bytes), &output));
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(10);
 	UT_RUN(slower_writer_can_issue_below_local_freeze_proposal);
 	UT_RUN(older_local_cutoff_is_never_advanced);
 	UT_RUN(missing_or_invalid_authority_preserves_output);
@@ -160,6 +279,9 @@ main(void)
 	UT_RUN(wrap_crossing_uses_full_identity_and_skips_special_floor);
 	UT_RUN(nonshared_mode_preserves_native_without_activation_read);
 	UT_RUN(new_permanent_relation_is_not_exempt_as_transaction_local);
+	UT_RUN(freeze_report_v2_roundtrips_exact_little_endian_layout);
+	UT_RUN(freeze_report_v2_rejects_bad_header_reserved_and_interval);
+	UT_RUN(freeze_report_v2_rejects_unknown_contributor_kind);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

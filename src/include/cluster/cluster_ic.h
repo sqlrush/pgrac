@@ -423,11 +423,13 @@ typedef enum ClusterICPlane {
 /* PKO4 committed old-incarnation discard; advertised only by shared tier1.
  * Admission still requires the matching peer capability and exact owner. */
 #define PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1 UINT32_C(0x10000000)
+/* 2.14 M1 exact heap-freeze waterline report V2 codec. */
+#define PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2 UINT32_C(0x20000000)
 
 /* Stage 8 R10 D10-03: complete capability allocation census.  Sum equals OR
  * iff no separately named single-bit allocation collides.  Keep the two
  * intentionally reserved holes (0x00004000 and 0x00040000) outside the mask. */
-#define PGRAC_IC_HELLO_CAP_DEFINED_COUNT 27
+#define PGRAC_IC_HELLO_CAP_DEFINED_COUNT 28
 #define PGRAC_IC_HELLO_CAP_DEFINED_MASK                                                            \
 	(PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2 | PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1         \
 	 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1 | PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1                       \
@@ -442,7 +444,7 @@ typedef enum ClusterICPlane {
 	 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1 | PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V3                 \
 	 | PGRAC_IC_HELLO_CAP_KO_SHARED_V2 | PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2                       \
 	 | PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3 | PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1                 \
-	 | PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1)
+	 | PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1 | PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2)
 #define PGRAC_IC_HELLO_CAP_DEFINED_SUM                                                             \
 	(PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2 + PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1         \
 	 + PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1 + PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1                       \
@@ -457,7 +459,7 @@ typedef enum ClusterICPlane {
 	 + PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1 + PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V3                 \
 	 + PGRAC_IC_HELLO_CAP_KO_SHARED_V2 + PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2                       \
 	 + PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3 + PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1                 \
-	 + PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1)
+	 + PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1 + PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2)
 #define PGRAC_IC_HELLO_CAP_IS_SINGLE_BIT(cap) ((cap) != 0 && (((cap) & ((cap) - 1)) == 0))
 StaticAssertDecl(PGRAC_IC_HELLO_CAP_DEFINED_SUM == PGRAC_IC_HELLO_CAP_DEFINED_MASK,
 				 "PGRAC HELLO capability allocations collide");
@@ -490,7 +492,8 @@ StaticAssertDecl(
 		&& PGRAC_IC_HELLO_CAP_IS_SINGLE_BIT(PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2)
 		&& PGRAC_IC_HELLO_CAP_IS_SINGLE_BIT(PGRAC_IC_HELLO_CAP_KO_OBJECT_DRAIN_V3)
 		&& PGRAC_IC_HELLO_CAP_IS_SINGLE_BIT(PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1)
-		&& PGRAC_IC_HELLO_CAP_IS_SINGLE_BIT(PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1),
+		&& PGRAC_IC_HELLO_CAP_IS_SINGLE_BIT(PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1)
+		&& PGRAC_IC_HELLO_CAP_IS_SINGLE_BIT(PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2),
 	"PGRAC HELLO capabilities must each allocate one bit");
 #undef PGRAC_IC_HELLO_CAP_IS_SINGLE_BIT
 /*

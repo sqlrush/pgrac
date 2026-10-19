@@ -604,6 +604,7 @@ cluster_ic_local_capability_word(void)
 		  | PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1 | PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1
 		  | PGRAC_IC_HELLO_CAP_CONTROL_ROOT_V1 | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
 		  | PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
+	capabilities |= PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2;
 
 	/* PGRAC: codec support only; never an application/admission assertion.
 	 * Author: SqlRush <sqlrush@gmail.com> */
