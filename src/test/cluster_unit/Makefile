@@ -529,6 +529,8 @@ SIMPLE_TESTS := $(filter-out test_cluster_catalog_manifest test_cluster_catalog_
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_init,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_xid_order
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_xid_order,$(SIMPLE_TESTS))
+TESTS += test_cluster_relmap_arb
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_arb,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_v2
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_v2_storage
@@ -539,6 +541,15 @@ TESTS += test_cluster_relmap_retention_census
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_retention_census,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_pending
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_pending,$(SIMPLE_TESTS))
+
+test_cluster_relmap_arb: test_cluster_relmap_arb.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_arb.c \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_authority.c \
+		$(top_srcdir)/src/backend/access/transam/transam.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_arb.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		$(top_srcdir)/src/backend/utils/cache/relmapper.c \

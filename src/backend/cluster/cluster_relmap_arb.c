@@ -35,6 +35,7 @@
 
 #include <ctype.h>
 
+#include "access/clog.h"
 #include "access/transam.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_mode.h"
@@ -106,15 +107,26 @@ arbitrate_one(bool shared_map, Oid dbid)
 
 	if ((int)hdr.owner_node == cluster_node_id) {
 		/*
-		 * Own pending: the local pg_xact is authoritative for own xids
-		 * (merged replay diverts foreign XACT/CLOG records away from it,
-		 * so no raw-xid aliasing pollutes it).  An owner that never
-		 * reached its commit record is crashed-in-flight = aborted.
+		 * Own pending: require an explicit terminal CLOG status for the
+		 * owner itself.  No commit record does not prove abort, and a
+		 * SUB_COMMITTED slot cannot supply the top owner's terminal status
+		 * through a parent lookup.  Leave either case unresolved.
 		 */
 		if (TransactionIdIsNormal(hdr.owner_xid)
 			&& TransactionIdPrecedes(hdr.owner_xid, ReadNextTransactionId())) {
-			committed = TransactionIdDidCommit(hdr.owner_xid);
-			known = true;
+			XLogRecPtr lsn;
+
+			switch (TransactionIdGetStatus(hdr.owner_xid, &lsn)) {
+			case TRANSACTION_STATUS_COMMITTED:
+				committed = true;
+				known = true;
+				break;
+			case TRANSACTION_STATUS_ABORTED:
+				known = true;
+				break;
+			default:
+				break;
+			}
 		}
 	} else {
 		/*
@@ -162,7 +174,7 @@ arbitrate_one(bool shared_map, Oid dbid)
 	} else {
 		cluster_relmap_authority_discard_pending(shared_map, dbid, hdr.pending_generation);
 		ereport(LOG, (errmsg("cluster relmap arbitration discarded pending generation "
-							 "%llu for %s (owner node %d, xid %u did not commit)",
+							 "%llu for %s (owner node %d, xid %u aborted)",
 							 (unsigned long long)hdr.pending_generation,
 							 shared_map ? "the shared map" : psprintf("database %u", dbid),
 							 (int)hdr.owner_node, hdr.owner_xid)));

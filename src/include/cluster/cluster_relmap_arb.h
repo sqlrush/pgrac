@@ -19,12 +19,12 @@
  *	                        fail-closed, reads are unaffected (committed
  *	                        image only, INV-14-7)
  *
- *	  The owner's terminal status is thread-scoped by construction: an OWN
- *	  owner_xid reads the local pg_xact (merged replay diverts every foreign
- *	  XACT/CLOG record away from it, spec-4.5a D10b F1), and a FOREIGN
+ *	  Status lookup is routed by origin: an OWN owner_xid requires an
+ *	  explicit COMMITTED or ABORTED slot in local pg_xact, and a FOREIGN
  *	  owner_xid reads the per-origin remote-xact store, durable-checked.
- *	  No raw-xid cross-thread lookup is ever made, so the arbitration is
- *	  correct even without xid-space striping (spec-6.15).
+ *	  Missing commit evidence and SUBTRANS parent inference cannot resolve
+ *	  an own owner.  Origin routing and this v1 identity do not establish a
+ *	  FullTransactionId era or retention bounds.
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
