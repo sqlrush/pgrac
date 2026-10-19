@@ -1419,7 +1419,7 @@ UT_TEST(test_requested_flush_rejects_foreign_or_unsafe_context_without_io)
 int
 main(void)
 {
-	UT_PLAN(59);
+	UT_PLAN(68);
 	UT_RUN(test_clean_writer_requires_selected_exit_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_requires_selected_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_keeps_runtime_fence_and_exact_owner_refusals);
@@ -1479,6 +1479,15 @@ main(void)
 	UT_RUN(test_relmap_runtime_active_rechecks_original_full_and_native_writer_after_receipt);
 	UT_RUN(test_relmap_runtime_active_same_raw_in_another_era_never_attaches_old_pins);
 	UT_RUN(test_relmap_runtime_active_refuses_a_foreign_directory_identity);
+	UT_RUN(test_relmap_runtime_stage_routes_original_owner_namespace_and_lock);
+	UT_RUN(test_relmap_runtime_stage_keeps_original_mapping_lock_order);
+	UT_RUN(test_relmap_runtime_stage_refuses_unattached_unknown_and_building);
+	UT_RUN(test_relmap_runtime_stage_rejects_wrong_inputs_before_storage);
+	UT_RUN(test_relmap_runtime_stage_rejects_nulls_and_reentrant_lock);
+	UT_RUN(test_relmap_runtime_stage_needs_matching_directory_and_exact_pin);
+	UT_RUN(test_relmap_runtime_stage_failure_preserves_marker_before_cancel);
+	UT_RUN(test_relmap_runtime_stage_rechecks_owner_after_storage_success);
+	UT_RUN(test_relmap_runtime_cancel_only_exact_unstaged_preparation);
 	free(relmap_runtime_allocation);
 	if (scratch[0] && !rmtree(scratch, true))
 		abort();

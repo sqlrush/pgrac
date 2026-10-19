@@ -20,6 +20,27 @@ extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_begin_v2(
 	const ClusterRelmapOwnerSampleV2 *sample, const ClusterRelmapV2Namespace *identity,
 	uint64 generation);
 
+/* Dormant original-producer stage after its original relmap WAL insert/flush.
+ * The caller supplies that exact durable record end, which this adapter does
+ * not independently authenticate. The original relmap X must remain held;
+ * RelationMappingLock may remain held after CRIT as in the original producer.
+ * Revalidates the sample/namespace and routes the existing dual-copy writer
+ * through the private original-origin directory and sole runtime lock. Its
+ * stage marker precedes every possible pending write; I/O stays outside the
+ * retention lock. True also requires a final original-owner recheck. False
+ * never cancels a pin and may leave pending in either copy. No live caller. */
+extern bool cluster_relmap_retention_runtime_write_pending_v2(
+	const ClusterRelmapOwnerSampleV2 *sample, const ClusterRelmapV2Namespace *identity,
+	uint64 generation, XLogRecPtr wal_end, const RelMapFile *pending);
+
+/* Original owner cleanup for an exact preparation with no possible pending
+ * write. A staged pin returns RETAINED even after an unsuccessful stage call.
+ * Never clears ACTIVE/BIND, authenticates a terminal outcome or releases a
+ * staged obligation; it supplies no terminal/pin-release permission. */
+extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_cancel_prepare_v2(
+	const ClusterRelmapOwnerSampleV2 *sample, const ClusterRelmapV2Namespace *identity,
+	uint64 generation);
+
 /* Dormant original ACTIVE-owner adapter, after actual publication and before
  * terminal/release work. Reads the current real FullXid without assignment and
  * the original TT owner's published receipt, then rechecks both the full era

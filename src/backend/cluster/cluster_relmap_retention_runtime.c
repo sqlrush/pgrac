@@ -6,6 +6,7 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_relmap_authority.h"
 #include "cluster/cluster_relmap_retention_runtime.h"
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h"
@@ -93,6 +94,93 @@ cluster_relmap_retention_runtime_begin_v2(const ClusterRelmapOwnerSampleV2 *samp
 	 * published TT receipt outside the lock. Only its pure core runs inside. */
 	return cluster_relmap_owner_retention_begin_v2(sample, identity, generation,
 		&relmap_runtime_shmem->directories[sample->owner.node], &relmap_runtime_shmem->lock);
+}
+
+static ClusterRelmapRetentionResult
+relmap_runtime_producer_key(const ClusterRelmapOwnerSampleV2 *sample,
+	const ClusterRelmapV2Namespace *identity, uint64 generation, ClusterRelmapRetentionKey *key)
+{
+	if (sample == NULL || identity == NULL || generation == 0
+		|| sample->owner.node >= CLUSTER_MAX_NODES)
+		return CLUSTER_RELMAP_RETENTION_INVALID;
+	if (relmap_runtime_shmem == NULL || LWLockHeldByMe(&relmap_runtime_shmem->lock)
+		|| !cluster_relmap_owner_matches_v2(sample))
+		return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
+	if (identity->system_identifier != sample->writer.ref.claim.identity.system_identifier
+		|| identity->database_incarnation != sample->writer.ref.claim.database_incarnation
+		|| (identity->shared ? identity->dbid != InvalidOid
+			: !OidIsValid(MyDatabaseId) || identity->dbid != MyDatabaseId))
+		return CLUSTER_RELMAP_RETENTION_INVALID;
+	key->identity = *identity;
+	key->generation = generation;
+	key->origin = sample->owner.node;
+	key->top_full_xid = sample->owner.top_full_xid;
+	key->membership_epoch = sample->owner.membership_epoch;
+	key->admitted_incarnation = sample->owner.admitted_incarnation;
+	key->boot_incarnation = sample->owner.boot_incarnation;
+	return CLUSTER_RELMAP_RETENTION_OK;
+}
+
+/* Caller holds the one runtime lock. This observation alone is never stage
+ * permission: the storage writer must still mark the exact pin under it. */
+static ClusterRelmapRetentionResult
+relmap_runtime_directory_matches(const ClusterRelmapRetentionDirectory *directory,
+	const ClusterRelmapRetentionKey *key)
+{
+	if (directory->state != CLUSTER_RELMAP_RETENTION_COMPLETE)
+		return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
+	if (directory->origin != key->origin
+		|| directory->system_identifier != key->identity.system_identifier
+		|| directory->database_incarnation != key->identity.database_incarnation)
+		return CLUSTER_RELMAP_RETENTION_INVALID;
+	return CLUSTER_RELMAP_RETENTION_OK;
+}
+
+bool
+cluster_relmap_retention_runtime_write_pending_v2(const ClusterRelmapOwnerSampleV2 *sample,
+	const ClusterRelmapV2Namespace *identity, uint64 generation, XLogRecPtr wal_end,
+	const RelMapFile *pending)
+{
+	ClusterRelmapRetentionKey key = { 0 };
+	ClusterRelmapRetentionDirectory *directory;
+	ClusterRelmapV2Owner owner;
+	ClusterRelmapRetentionResult result;
+
+	if (pending == NULL || wal_end == InvalidXLogRecPtr
+		|| relmap_runtime_producer_key(sample, identity, generation, &key) != CLUSTER_RELMAP_RETENTION_OK)
+		return false;
+	directory = &relmap_runtime_shmem->directories[key.origin];
+	LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
+	result = relmap_runtime_directory_matches(directory, &key);
+	LWLockRelease(&relmap_runtime_shmem->lock);
+	if (result != CLUSTER_RELMAP_RETENTION_OK)
+		return false;
+	owner = sample->owner;
+	owner.wal_end = wal_end;
+	/* Never cancel here, including a false return before the caller arms its
+	 * ordinary cleanup. The storage writer owns the pre-write stage marker. */
+	return cluster_relmap_authority_v2_write_pending(identity, generation, &owner, pending,
+		directory, &relmap_runtime_shmem->lock) && cluster_relmap_owner_matches_v2(sample);
+}
+
+ClusterRelmapRetentionResult
+cluster_relmap_retention_runtime_cancel_prepare_v2(const ClusterRelmapOwnerSampleV2 *sample,
+	const ClusterRelmapV2Namespace *identity, uint64 generation)
+{
+	ClusterRelmapRetentionKey key = { 0 };
+	ClusterRelmapRetentionDirectory *directory;
+	ClusterRelmapRetentionResult result;
+
+	result = relmap_runtime_producer_key(sample, identity, generation, &key);
+	if (result != CLUSTER_RELMAP_RETENTION_OK)
+		return result;
+	directory = &relmap_runtime_shmem->directories[key.origin];
+	LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
+	result = relmap_runtime_directory_matches(directory, &key);
+	if (result == CLUSTER_RELMAP_RETENTION_OK)
+		result = cluster_relmap_retention_cancel_prepare(directory, &key);
+	LWLockRelease(&relmap_runtime_shmem->lock);
+	return result;
 }
 
 static bool

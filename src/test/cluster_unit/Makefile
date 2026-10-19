@@ -8592,6 +8592,7 @@ test_cluster_wal_writer: test_cluster_wal_writer.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_writer.h \
 		test_cluster_relmap_owner.inc \
 		test_cluster_relmap_retention_runtime.inc \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \

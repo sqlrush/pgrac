@@ -15,6 +15,7 @@ static unsigned relmap_assign_calls;
 static bool relmap_advance_epoch_on_assign;
 static bool relmap_have_binding, relmap_binding_drift;
 static bool relmap_active_owner;
+static bool relmap_stage_lock_window;
 static unsigned relmap_binding_owner_fault;
 static unsigned relmap_binding_reads;
 static ClusterCanonicalTxnBinding relmap_binding;
@@ -22,7 +23,8 @@ static ClusterCanonicalTxnBinding relmap_binding;
 static void
 relmap_retention_lock_enter(void)
 {
-	if ((!relmap_global_x && !relmap_active_owner) || relmap_local_lock || CritSectionCount != 0)
+	if ((!relmap_global_x && !relmap_active_owner)
+		|| (relmap_local_lock && !relmap_stage_lock_window) || CritSectionCount != 0)
 		abort();
 }
 
@@ -109,6 +111,7 @@ relmap_owner_fixture(void)
 	relmap_top_full = UINT64CONST(0x400000123);
 	relmap_retention_held = relmap_have_binding = relmap_binding_drift = false;
 	relmap_active_owner = false;
+	relmap_stage_lock_window = false;
 	relmap_binding_owner_fault = 0;
 	relmap_retention_acquires = relmap_binding_reads = 0;
 	memset(&relmap_binding, 0, sizeof(relmap_binding));
