@@ -6176,6 +6176,28 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("frozen insertion is not supported for shared heaps"),
 				 errhint("Use COPY or INSERT without freezing tuples.")));
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * Direct/catalog callers also need BIND before bulk acquisition or TOAST,
+	 * which can recursively write shared tuples. Retain this exact binding for
+	 * the original undo preparation below. Reject children before assigning XID.
+	 */
+	cluster_heap_itl_require_supported_xact(relation, "INSERT");
+	if (cluster_itl_write_path_enabled(relation))
+	{
+		/* A worker may already have inherited a valid top XID. */
+		if (IsParallelWorker())
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+					 errmsg("cannot insert tuples in a parallel worker")));
+		canonical_xid = GetTopTransactionId();
+		if (!cluster_tt_local_prepare_canonical_active(
+				canonical_xid, &canonical_binding))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("canonical ACTIVE publication failed before heap insert")));
+	}
+#endif
 	xid = GetCurrentTransactionId();
 
 	/* Cheap, simplistic check that the tuple matches the rel's rowtype. */
@@ -6192,7 +6214,6 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	 * -> LockRelationForExtension.  No-op for a regular insert (bistate == NULL ->
 	 * HW alone) or after the lease is already held.
 	 */
-	cluster_heap_itl_require_supported_xact(relation, "INSERT");
 	cluster_dl_bulk_acquire(relation, bistate);
 #endif
 
@@ -6215,13 +6236,6 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 			elog(ERROR, "shared heap insert requires a live SPACE identity");
 		cluster_page_versioned = true;
 	}
-	canonical_xid = GetTopTransactionId();
-	if (cluster_itl_write_path_enabled(relation)
-		&& !cluster_tt_local_prepare_canonical_active(
-			canonical_xid, &canonical_binding))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("canonical ACTIVE publication failed before heap insert")));
 	if (cluster_itl_write_path_enabled(relation))
 		undo_prepare_deadline_us = cluster_undo_record_prepare_deadline_us();
 	if (cluster_itl_write_path_enabled(relation)
@@ -6935,6 +6949,18 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("frozen insertion is not supported for shared heaps"),
 				 errhint("Use COPY or INSERT without freezing tuples.")));
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * Bind the shared batch before its lease or slot materialization. Each
+	 * delegated heap_insert reuses the top binding and owns its own receipt.
+	 * Preserve the worker refusal before BIND even with an inherited XID.
+	 */
+	if (cluster_itl_write_path_enabled(relation) && IsParallelWorker())
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				 errmsg("cannot insert tuples in a parallel worker")));
+	cluster_heap_preflight_write(relation, "MULTI INSERT");
+#endif
 	xid = GetCurrentTransactionId();
 
 	/* currently not needed (thus unsupported) for heap_multi_insert() */

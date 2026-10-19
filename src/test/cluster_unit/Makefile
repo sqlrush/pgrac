@@ -510,6 +510,7 @@ test_cluster_relmap_init: test_cluster_relmap_init.c unit_test.h \
 # PGRAC: execute original entry-point prologues before any native mutation.
 TESTS += test_cluster_storage_subtransaction
 TESTS += test_cluster_write_preflight
+TESTS += test_cluster_heap_insert_preflight
 TESTS += test_cluster_fresh_scope
 
 # Include tests registered after the initial all prerequisite expansion.
@@ -9308,6 +9309,34 @@ test_cluster_write_preflight: test_cluster_write_preflight.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
+# Native preparation boundaries, including shared batch delegation. The prefix
+# ends before the first main heap pin / native batch allocation, respectively.
+test_cluster_heap_insert_preflight.inc: $(top_srcdir)/src/backend/access/heap/heapam.c \
+		$(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
+	awk '/^(cluster_heap_itl_relation_route|cluster_itl_write_path_enabled)\(/ \
+	     { print "static bool"; emit=1; n++ } \
+	     /^cluster_heap_preflight_write\(/ { print "bool"; emit=1; n++ } \
+	     /^(cluster_heap_itl_require_top_xact|cluster_heap_itl_require_supported_xact)\(/ \
+	     { print "static void"; emit=1; n++ } \
+	     /^cluster_heap_multi_insert_route\(/ { print "static ClusterHeapMultiInsertRoute"; emit=1; n++ } \
+	     /^heap_prepare_insert\(/ { print "static HeapTuple"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if(n!=7) exit 1 }' $< > $@.tmp
+	awk '/^cluster_heap_maintenance_restricted\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if(n!=1) exit 1 }' $(word 2,$^) >> $@.tmp
+	awk '/^heap_insert\(/ { print "void"; emit=1; n++ } \
+	     emit && /^\tbuffer = RelationGetBufferForTuple/ { print "}"; emit=0; done++ } \
+	     emit { print } END { if(n!=1 || done!=1 || emit) exit 1 }' $< >> $@.tmp
+	awk '/^heap_multi_insert\(/ { print "void"; emit=1; n++ } \
+	     emit && /^\tneedwal = RelationNeedsWAL/ { print "}"; emit=0; done++ } \
+	     emit { print } END { if(n!=1 || done!=1 || emit) exit 1 }' $< >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_insert_preflight: test_cluster_heap_insert_preflight.c unit_test.h \
+		test_cluster_heap_insert_preflight.inc \
+		$(top_srcdir)/src/backend/access/heap/heapam_r4_private.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
 test_cluster_storage_sql_route.inc: $(top_srcdir)/src/backend/tcop/postgres.c \
 		$(top_srcdir)/src/backend/executor/execMain.c
 	awk '/^start_xact_command\(void\)/ { print "static void"; emit=1; n++ } \
@@ -9614,6 +9643,7 @@ clean-pgproc-active-sample:
 	rm -f test_cluster_pgproc_active_types.inc test_cluster_pgproc_active_types.inc.tmp
 	rm -f test_cluster_pgproc_active_sample.inc test_cluster_pgproc_active_sample.inc.tmp
 	rm -f test_cluster_write_preflight.inc test_cluster_write_preflight.inc.tmp
+	rm -f test_cluster_heap_insert_preflight.inc test_cluster_heap_insert_preflight.inc.tmp
 
 clean distclean maintainer-clean: clean-active-sample-fence
 .PHONY: clean-active-sample-fence
