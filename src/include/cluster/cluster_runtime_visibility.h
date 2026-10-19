@@ -58,6 +58,18 @@ typedef struct ClusterUndoBlock0LogicalKey ClusterUndoBlock0LogicalKey;
 typedef struct ClusterUndoBlock0ResolvedRoot ClusterUndoBlock0ResolvedRoot;
 typedef struct ClusterTTSlotCurrentOwner ClusterTTSlotCurrentOwner;
 
+/* Backend-local terminal memo diagnostics. Hits select a candidate only;
+ * the origin continuation still performs its final identity checks. */
+typedef struct ClusterRuntimeVisibilityCounters {
+	uint64 local_memo_hits;
+	uint64 local_memo_publishes;
+} ClusterRuntimeVisibilityCounters;
+
+/* Reset both the memo and its counters for a new measurement scope. */
+extern void cluster_runtime_visibility_exact_counters_reset(void);
+extern void
+cluster_runtime_visibility_exact_counters_snapshot(ClusterRuntimeVisibilityCounters *out);
+
 /* Stack-only locator for one canonical physical TT slot.  It carries no
  * status or transaction verdict: callers must acquire exact block-zero SCUR
  * and sample the physical bytes before producing authority. */

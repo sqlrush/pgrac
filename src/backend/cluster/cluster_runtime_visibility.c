@@ -1538,6 +1538,183 @@ done:
 	return true;
 }
 
+/* The memo stores proven terminal outcomes, never raw TT commit stamps or
+ * row locators. Every consumer must sample its current DATA and exact TT
+ * carrier under the ordinary origin guards before consulting this cache. */
+#define CLUSTER_RUNTIME_VISIBILITY_TERMINAL_MEMO_SLOTS 64
+
+typedef struct ClusterRuntimeVisibilityTerminalKey {
+	int32 origin_node;
+	uint32 segment_id;
+	uint32 segment_generation;
+	uint16 slot_offset;
+	uint16 wrap;
+	TransactionId xid;
+	uint64 epoch;
+	ClusterUndoBlock0ResolvedRoot root;
+} ClusterRuntimeVisibilityTerminalKey;
+
+typedef struct ClusterRuntimeVisibilityTerminalEntry {
+	bool valid;
+	ClusterRuntimeVisibilityTerminalKey key;
+	ClusterTxOutcome outcome;
+	ClusterTxProofKind proof_kind;
+	TransactionId top_xid;
+	SCN commit_scn;
+} ClusterRuntimeVisibilityTerminalEntry;
+
+static ClusterRuntimeVisibilityTerminalEntry
+	rtvis_terminal_memo[CLUSTER_RUNTIME_VISIBILITY_TERMINAL_MEMO_SLOTS];
+static ClusterRuntimeVisibilityCounters rtvis_exact_counters;
+
+void
+cluster_runtime_visibility_exact_counters_reset(void)
+{
+	memset(rtvis_terminal_memo, 0, sizeof(rtvis_terminal_memo));
+	memset(&rtvis_exact_counters, 0, sizeof(rtvis_exact_counters));
+}
+
+void
+cluster_runtime_visibility_exact_counters_snapshot(ClusterRuntimeVisibilityCounters *out)
+{
+	if (out != NULL)
+		*out = rtvis_exact_counters;
+}
+
+static bool
+cluster_runtime_visibility_terminal_key(const ClusterTxLocator *locator, uint32 segment_id,
+										uint32 generation, uint16 slot_offset,
+										const ClusterUndoBlock0ResolvedRoot *root,
+										ClusterRuntimeVisibilityTerminalKey *out)
+{
+	if (locator == NULL || root == NULL || out == NULL || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES
+		|| uba_origin_node_id(locator->uba) != (NodeId)cluster_node_id
+		|| !TransactionIdIsNormal(locator->xid) || segment_id == 0 || segment_id > UINT16_MAX
+		|| ((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) != (uint32)cluster_node_id
+		|| generation == UINT32_MAX || slot_offset >= TT_SLOTS_PER_SEGMENT
+		|| locator->tt_wrap == TT_WRAP_INVALID || locator->tt_wrap > TT_WRAP_MAX)
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->origin_node = cluster_node_id;
+	out->segment_id = segment_id;
+	out->segment_generation = generation;
+	out->slot_offset = slot_offset;
+	out->wrap = locator->tt_wrap;
+	out->xid = locator->xid;
+	out->epoch = cluster_epoch_get_current();
+	out->root = *root;
+	return true;
+}
+
+static bool
+cluster_runtime_visibility_terminal_key_matches(const ClusterRuntimeVisibilityTerminalKey *left,
+												const ClusterRuntimeVisibilityTerminalKey *right)
+{
+	return left->origin_node == right->origin_node && left->segment_id == right->segment_id
+		   && left->segment_generation == right->segment_generation
+		   && left->slot_offset == right->slot_offset && left->wrap == right->wrap
+		   && left->xid == right->xid && left->epoch == right->epoch
+		   && cluster_runtime_visibility_candidate_root_matches(&left->root, &right->root);
+}
+
+static ClusterRuntimeVisibilityTerminalEntry *
+cluster_runtime_visibility_terminal_entry(const ClusterRuntimeVisibilityTerminalKey *key)
+{
+	uint64 hash = key->xid ^ ((uint64)key->segment_id << 32)
+				  ^ ((uint64)key->segment_generation << 16) ^ ((uint64)key->wrap << 48)
+				  ^ key->slot_offset ^ key->epoch ^ key->root.root_id ^ key->root.root_generation;
+
+	hash ^= hash >> 33;
+	hash *= UINT64CONST(0xff51afd7ed558ccd);
+	hash ^= hash >> 33;
+	return &rtvis_terminal_memo[hash % CLUSTER_RUNTIME_VISIBILITY_TERMINAL_MEMO_SLOTS];
+}
+
+static ClusterTxOutcome
+cluster_runtime_visibility_origin_candidate_decide(
+	const ClusterTxLocator *locator, ClusterTxResolveMode mode, uint32 segment_id,
+	uint32 generation, uint16 slot_offset, const ClusterUndoBlock0ResolvedRoot *root,
+	const TTSlot *exact_slot, TransactionId *top_xid_out, ClusterTxProofKind *proof_kind_out,
+	SCN *commit_scn_out, ClusterTxResolveReason *reason_out,
+	ClusterRuntimeVisibilityCanonicalDiagnostic *diagnostic)
+{
+	ClusterRuntimeVisibilityTerminalKey key;
+	ClusterRuntimeVisibilityTerminalEntry *entry;
+
+	if (cluster_runtime_visibility_terminal_key(locator, segment_id, generation, slot_offset, root,
+												&key)) {
+		entry = cluster_runtime_visibility_terminal_entry(&key);
+		if (entry->valid && cluster_runtime_visibility_terminal_key_matches(&entry->key, &key)
+			&& exact_slot->xid == locator->xid && exact_slot->wrap == locator->tt_wrap
+			&& ((entry->outcome == CLUSTER_TX_COMMITTED && exact_slot->status == TT_SLOT_COMMITTED
+				 && exact_slot->commit_scn == entry->commit_scn)
+				|| (entry->outcome == CLUSTER_TX_ABORTED
+					&& (exact_slot->status == TT_SLOT_ACTIVE
+						|| exact_slot->status == TT_SLOT_ABORTED)))) {
+			*top_xid_out = entry->top_xid;
+			*proof_kind_out = entry->proof_kind;
+			*commit_scn_out = entry->commit_scn;
+			if (diagnostic != NULL) {
+				diagnostic->locator_xid = locator->xid;
+				diagnostic->locator_wrap = locator->tt_wrap;
+				diagnostic->slot_status = exact_slot->status;
+				diagnostic->slot_xid = exact_slot->xid;
+				diagnostic->slot_wrap = exact_slot->wrap;
+				diagnostic->slot_commit_scn = exact_slot->commit_scn;
+			}
+			rtvis_exact_counters.local_memo_hits++;
+			return entry->outcome;
+		}
+	}
+	return cluster_runtime_visibility_candidate_decide(locator, mode, exact_slot, top_xid_out,
+													   proof_kind_out, commit_scn_out, reason_out,
+													   diagnostic);
+}
+
+/* Called only once the continuation's DATA/TT identity checks have passed.
+ * The recycled-abort fallback has no exact current slot and cannot publish. */
+static void
+cluster_runtime_visibility_terminal_publish(const ClusterTxResolution *candidate,
+											const ClusterUndoBlock0ResolvedRoot *root,
+											bool recycled_abort)
+{
+	ClusterRuntimeVisibilityTerminalKey key;
+	ClusterRuntimeVisibilityTerminalEntry *entry;
+
+	if (recycled_abort || !candidate->local_canonical_valid
+		|| candidate->local_canonical.xid != candidate->locator_echo.xid
+		|| candidate->local_canonical.wrap != candidate->locator_echo.tt_wrap
+		|| !TransactionIdIsNormal(candidate->top_xid)
+		|| !cluster_tx_outcome_proof_is_valid(candidate->outcome, candidate->proof_kind)
+		|| !((candidate->outcome == CLUSTER_TX_COMMITTED && SCN_VALID(candidate->commit_scn))
+			 || (candidate->outcome == CLUSTER_TX_ABORTED && candidate->commit_scn == InvalidScn))
+		|| !((candidate->proof_kind == CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG
+			  && candidate->top_xid == candidate->locator_echo.xid)
+			 || (candidate->proof_kind == CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP
+				 && candidate->outcome == CLUSTER_TX_ABORTED))
+		|| candidate->authority.origin_epoch != cluster_epoch_get_current()
+		|| XLogRecPtrIsInvalid(candidate->authority.live_hwm_lsn)
+		|| !SCN_VALID(candidate->authority.authority_scn)
+		|| !cluster_runtime_visibility_terminal_key(
+			&candidate->locator_echo, candidate->local_canonical.segment_id,
+			candidate->local_canonical_generation, candidate->local_canonical.slot_offset, root,
+			&key))
+		return;
+	entry = cluster_runtime_visibility_terminal_entry(&key);
+	if (entry->valid && cluster_runtime_visibility_terminal_key_matches(&entry->key, &key)
+		&& entry->outcome == candidate->outcome && entry->proof_kind == candidate->proof_kind
+		&& entry->top_xid == candidate->top_xid && entry->commit_scn == candidate->commit_scn)
+		return;
+	entry->key = key;
+	entry->outcome = candidate->outcome;
+	entry->proof_kind = candidate->proof_kind;
+	entry->top_xid = candidate->top_xid;
+	entry->commit_scn = candidate->commit_scn;
+	entry->valid = true;
+	rtvis_exact_counters.local_memo_publishes++;
+}
+
 #define CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_MAGIC UINT32_C(0x52564f50)
 
 typedef struct ClusterRuntimeVisibilityOriginPlanData {
@@ -1551,6 +1728,7 @@ typedef struct ClusterRuntimeVisibilityOriginPlanData {
 	ClusterUndoBlock0LogicalKey data_logical;
 	ClusterUndoBlock0LogicalKey tt_logical;
 	ClusterUndoBlock0ResolvedRoot data_root;
+	ClusterUndoBlock0ResolvedRoot canonical_root;
 	ClusterUndoBlock0Generation data_generation;
 	uint32 data_block_no;
 	uint16 tt_slot_offset;
@@ -1809,8 +1987,9 @@ cluster_runtime_visibility_origin_plan_freeze_data_internal(
 
 	header = (const UndoSegmentHeaderData *)block0.data;
 	exact_slot = header->tt_slots[tt_slot_offset];
-	outcome = cluster_runtime_visibility_candidate_decide(
-		&canonical_locator, mode, &exact_slot, &top_xid, &proof_kind, &commit_scn, &reason, NULL);
+	outcome = cluster_runtime_visibility_origin_candidate_decide(
+		&canonical_locator, mode, tt_segment_id, generation.value, tt_slot_offset, root,
+		&exact_slot, &top_xid, &proof_kind, &commit_scn, &reason, NULL);
 	if (outcome == CLUSTER_TX_UNKNOWN
 		&& cluster_runtime_visibility_origin_recycled_abort_candidate(
 			&canonical_locator, mode, &exact_slot, generation.value, NULL)) {
@@ -1849,6 +2028,9 @@ cluster_runtime_visibility_origin_plan_freeze_data_internal(
 	plan_data->candidate.local_canonical.wrap = plan_data->canonical_locator.tt_wrap;
 	plan_data->candidate.local_canonical_generation = generation.value;
 	plan_data->candidate.local_canonical_valid = true;
+	plan_data->canonical_root = *root;
+	cluster_runtime_visibility_terminal_publish(&plan_data->candidate, &plan_data->canonical_root,
+												 plan_data->candidate_recycled_abort);
 	*out = plan_data->candidate;
 	plan_data->candidate_valid = true;
 	if (reason_out != NULL)
@@ -2001,9 +2183,10 @@ cluster_runtime_visibility_origin_plan_sample_canonical_held(
 	}
 	header = (const UndoSegmentHeaderData *)block0.data;
 	exact_slot = header->tt_slots[plan_data->tt_slot_offset];
-	outcome = cluster_runtime_visibility_candidate_decide(
-		&plan_data->canonical_locator, mode, &exact_slot, &top_xid, &proof_kind, &commit_scn,
-		&reason, &plan_data->canonical_diagnostic);
+	outcome = cluster_runtime_visibility_origin_candidate_decide(
+		&plan_data->canonical_locator, mode, plan_data->tt_logical.segment_id, generation.value,
+		plan_data->tt_slot_offset, root, &exact_slot, &top_xid, &proof_kind, &commit_scn, &reason,
+		&plan_data->canonical_diagnostic);
 	if (outcome == CLUSTER_TX_UNKNOWN
 		&& cluster_runtime_visibility_origin_recycled_abort_candidate(
 			&plan_data->canonical_locator, mode, &exact_slot, generation.value,
@@ -2071,6 +2254,7 @@ cluster_runtime_visibility_origin_plan_sample_canonical_held(
 	plan_data->candidate.local_canonical.wrap = plan_data->canonical_locator.tt_wrap;
 	plan_data->candidate.local_canonical_generation = generation.value;
 	plan_data->candidate.local_canonical_valid = true;
+	plan_data->canonical_root = *root;
 	plan_data->candidate_valid = true;
 	if (reason_out != NULL)
 		*reason_out = CLUSTER_TX_RESOLVE_NONE;
@@ -2161,6 +2345,8 @@ cluster_runtime_visibility_origin_plan_recheck_data_internal(
 		&& !cluster_runtime_visibility_origin_recycled_abort_sample(
 			&plan_data->canonical_locator, &plan_data->canonical_diagnostic))
 		goto failed;
+	cluster_runtime_visibility_terminal_publish(&plan_data->candidate, &plan_data->canonical_root,
+												 plan_data->candidate_recycled_abort);
 	*out = plan_data->candidate;
 	if (data_out != NULL)
 		memcpy(data_out, data_page.data, BLCKSZ);
