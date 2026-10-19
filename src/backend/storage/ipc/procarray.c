@@ -83,6 +83,7 @@
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_undo_retention.h" /* spec-3.12 D1: retention horizon */
+#include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D5d: standby skip-fill */
 #endif
 
@@ -3173,6 +3174,83 @@ GetOldestActiveTransactionId(void)
 
 	return oldestRunningXid;
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * Capture one FullXid reference before scanning the complete native top-XID
+ * array. GetNewTransactionId publishes its assigned XID before releasing
+ * XidGenLock, so no pre-N allocation can remain private at this cut.
+ * ProcArrayLock stabilizes membership, including prepared dummy PGPROCs.
+ * As in GetOldestActiveTransactionId, include VACUUM and every database;
+ * each parent's XID precedes its children, including overflowed subxids.
+ *
+ * This is one input to the cluster active scan, not freeze authority. An
+ * exited PGPROC may still have census protection, which must be scanned
+ * afterwards. N is not a promise about future allocation, and recovery's
+ * unclaimed transactions cannot be proved from this native array.
+ */
+bool
+ProcArrayGetActiveFullXidSample(FullTransactionId *reference_full,
+							   FullTransactionId *active_min)
+{
+	FullTransactionId reference;
+	FullTransactionId minimum;
+	bool		valid = true;
+	int			index;
+
+	if (reference_full != NULL)
+		*reference_full = InvalidFullTransactionId;
+	if (active_min != NULL)
+		*active_min = InvalidFullTransactionId;
+	if (reference_full == NULL || active_min == NULL || reference_full == active_min ||
+		RecoveryInProgress() || procArray == NULL || ProcGlobal == NULL ||
+		ProcGlobal->xids == NULL || ShmemVariableCache == NULL)
+		return false;
+
+	/* The reader releases XidGenLock before we acquire ProcArrayLock. */
+	reference = ReadNextFullTransactionId();
+	if (!FullTransactionIdIsValid(reference) ||
+		!TransactionIdIsNormal(XidFromFullTransactionId(reference)))
+		return false;
+	minimum = reference;
+
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	if (procArray->numProcs < 0 || procArray->numProcs > procArray->maxProcs)
+		valid = false;
+	for (index = 0; valid && index < procArray->numProcs; index++)
+	{
+		TransactionId xid = UINT32_ACCESS_ONCE(ProcGlobal->xids[index]);
+		uint32		distance;
+		FullTransactionId full;
+
+		if (!TransactionIdIsValid(xid))
+			continue;
+		distance = xid - XidFromFullTransactionId(reference);
+		if (!TransactionIdIsNormal(xid) || distance == UINT32_C(0x80000000) ||
+			(distance < UINT32_C(0x80000000) &&
+			 U64FromFullTransactionId(reference) > UINT64_MAX - distance))
+		{
+			valid = false;
+			break;
+		}
+		full = cluster_xid_widen(xid, reference);
+		if (!FullTransactionIdIsValid(full))
+		{
+			valid = false;
+			break;
+		}
+		if (FullTransactionIdPrecedes(full, minimum))
+			minimum = full;
+	}
+	LWLockRelease(ProcArrayLock);
+	if (!valid)
+		return false;
+
+	*reference_full = reference;
+	*active_min = minimum;
+	return true;
+}
+#endif
 
 /*
  * GetOldestSafeDecodingTransactionId -- lowest xid not affected by vacuum

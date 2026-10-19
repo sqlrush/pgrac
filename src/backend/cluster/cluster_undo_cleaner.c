@@ -55,6 +55,7 @@
 #include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
+#include "storage/procarray.h"
 #include "storage/procsignal.h"
 #include "storage/shmem.h"
 #include "tcop/tcopprot.h"
@@ -603,11 +604,19 @@ undo_cleaner_run_pass(bool *out_work_remaining, bool maintenance_due)
 		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
 		return false;
 	}
-	/* This reference only widens census keys; it grants no freeze authority.
-	 * Keep an incomplete cursor across slices, including a busy entry lock. */
-	if (undo_cleaner_active_scan.status != CTRC_ACTIVE_SCAN_INCOMPLETE)
-		(void)cluster_ctrc_active_scan_begin(&undo_cleaner_active_scan,
-											 ReadNextFullTransactionId());
+	/* Capture N then all top/prepared PGPROCs before the census. Neither
+	 * input grants freeze authority. Keep this N and minimum throughout an
+	 * incomplete round, including continuations at a busy census entry. */
+	if (undo_cleaner_active_scan.status != CTRC_ACTIVE_SCAN_INCOMPLETE) {
+		FullTransactionId reference;
+		FullTransactionId active_min;
+
+		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
+		undo_cleaner_active_scan.status = CTRC_ACTIVE_SCAN_INVALID;
+		if (ProcArrayGetActiveFullXidSample(&reference, &active_min)
+			&& cluster_ctrc_active_scan_begin(&undo_cleaner_active_scan, reference))
+			undo_cleaner_active_scan.min_full = active_min;
+	}
 	cluster_ctrc_active_scan_step(&undo_cleaner_active_scan);
 	undo_cleaner_active_scan_pending
 		= undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_INCOMPLETE;

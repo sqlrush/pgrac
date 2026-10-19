@@ -57,6 +57,14 @@ extern bool TransactionIdIsActive(TransactionId xid);
 extern TransactionId GetOldestNonRemovableTransactionId(Relation rel);
 extern TransactionId GetOldestTransactionIdConsideredRunning(void);
 extern TransactionId GetOldestActiveTransactionId(void);
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * Observation only: N is a widening anchor, not a legal allocation future.
+ * Includes every top/prepared xid. Failure invalidates both outputs.
+ */
+extern bool ProcArrayGetActiveFullXidSample(FullTransactionId *reference_full,
+										FullTransactionId *active_min);
+#endif
 extern TransactionId GetOldestSafeDecodingTransactionId(bool catalogOnly);
 extern void GetReplicationHorizons(TransactionId *xmin, TransactionId *catalog_xmin);
 

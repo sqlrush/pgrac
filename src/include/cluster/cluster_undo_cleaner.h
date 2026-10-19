@@ -107,7 +107,8 @@ typedef struct UndoCleanerWorkerState {
 	int64 main_loop_iters;			   /* monotone; observable liveness proof */
 	uint64 local_completed_passes;
 	uint64 local_progress_events;
-	ClusterCtrcActiveScan active_census; /* observation only; worker0 owns the local cursor */
+	/* Census plus captured native active minimum; observation only, not F. */
+	ClusterCtrcActiveScan active_census; /* worker0 owns the local cursor */
 
 	/*
 	 * Pressure-wakeup channel (Q8).  Points at the cleaner's own

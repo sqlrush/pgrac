@@ -64,7 +64,9 @@ static unsigned test_inventory_scans;
 static uint64 test_gc_reclaimed;
 static ClusterUndoSegTryRecycle test_recycle_result;
 static unsigned test_census_begins, test_census_steps, test_reference_reads;
-static FullTransactionId test_reference;
+static FullTransactionId test_reference, test_pgproc_min;
+static unsigned test_pgproc_samples;
+static bool test_pgproc_invalid;
 static bool test_census_busy, test_census_invalid;
 bool cluster_undo_record_segment_commit_on_rollover;
 int cluster_undo_cleaner_batch_segments = 8;
@@ -96,6 +98,22 @@ ReadNextFullTransactionId(void)
 	return test_reference;
 }
 
+/* The actual native sampler is executed in test_cluster_pgproc_active_sample. */
+bool
+ProcArrayGetActiveFullXidSample(FullTransactionId *reference, FullTransactionId *minimum)
+{
+	if (test_lock_depth != 0 || test_ctrc_passes <= test_pgproc_samples)
+		abort();
+	test_pgproc_samples++;
+	*reference = ReadNextFullTransactionId();
+	*minimum = FullTransactionIdIsValid(test_pgproc_min) ? test_pgproc_min : *reference;
+	if (test_pgproc_invalid) {
+		*reference = *minimum = InvalidFullTransactionId;
+		return false;
+	}
+	return true;
+}
+
 bool
 cluster_ctrc_active_scan_begin(ClusterCtrcActiveScan *scan, FullTransactionId reference)
 {
@@ -112,6 +130,8 @@ cluster_ctrc_active_scan_begin(ClusterCtrcActiveScan *scan, FullTransactionId re
 void
 cluster_ctrc_active_scan_step(ClusterCtrcActiveScan *scan)
 {
+	if (scan->status != CTRC_ACTIVE_SCAN_INCOMPLETE)
+		return;
 	if (test_lock_depth != 0 || test_ctrc_passes <= test_census_steps)
 		abort();
 	test_census_steps++;
@@ -487,7 +507,9 @@ reset_wait_fixture(void)
 	test_gc_reclaimed = 0;
 	test_recycle_result = CLUSTER_SEG_RECYCLE_ALREADY;
 	test_ctrc_passes = test_gc_passes = test_modifier_entries = test_modifier_leaves = 0;
-	test_census_begins = test_census_steps = test_reference_reads = 0;
+	test_census_begins = test_census_steps = test_reference_reads = test_pgproc_samples = 0;
+	test_pgproc_min = InvalidFullTransactionId;
+	test_pgproc_invalid = false;
 	test_census_busy = test_census_invalid = test_maintenance_cut = test_ctrc_progress = false;
 	test_reference = FullTransactionIdFromEpochAndXid(7, 100);
 	MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
@@ -868,10 +890,67 @@ UT_TEST(test_census_invalid_sample_and_respawn_start_from_fresh_reference)
 				 U64FromFullTransactionId(test_reference));
 }
 
+UT_TEST(test_pgproc_min_is_captured_once_for_the_whole_census_round)
+{
+	bool remaining;
+
+	reset_wait_fixture();
+	undo_cleaner_worker = 0;
+	test_pgproc_min = FullTransactionIdFromEpochAndXid(6, UINT32_MAX - 10);
+	(void)undo_cleaner_run_pass(&remaining, true);
+	UT_ASSERT_EQ(test_pgproc_samples, 1);
+	UT_ASSERT_EQ(U64FromFullTransactionId(undo_cleaner_active_scan.min_full),
+				 (UINT64CONST(6) << 32) + UINT32_MAX - 10);
+	test_pgproc_min = FullTransactionIdFromEpochAndXid(7, 99);
+	test_reference = FullTransactionIdFromEpochAndXid(7, 200);
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT_EQ(test_pgproc_samples, 1);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(U64FromFullTransactionId(undo_cleaner_active_scan.reference_full),
+				 (UINT64CONST(7) << 32) + 100);
+	UT_ASSERT_EQ(U64FromFullTransactionId(undo_cleaner_active_scan.min_full),
+				 (UINT64CONST(6) << 32) + UINT32_MAX - 10);
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT_EQ(test_pgproc_samples, 2);
+	UT_ASSERT_EQ(U64FromFullTransactionId(undo_cleaner_active_scan.min_full),
+				 U64FromFullTransactionId(test_pgproc_min));
+}
+
+UT_TEST(test_pgproc_failure_invalidates_old_sample_without_skipping_mandatory_work)
+{
+	bool remaining;
+
+	reset_wait_fixture();
+	undo_cleaner_worker = 0;
+	(void)undo_cleaner_run_pass(&remaining, true);
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	test_pgproc_invalid = true;
+	test_ctrc_progress = true;
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT_EQ(test_ctrc_passes, 3);
+	UT_ASSERT(remaining);
+	UT_ASSERT_EQ(test_pgproc_samples, 2);
+	UT_ASSERT_EQ(test_census_begins, 1);
+	UT_ASSERT_EQ(test_census_steps, 2);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.status, CTRC_ACTIVE_SCAN_INVALID);
+	UT_ASSERT(!FullTransactionIdIsValid(undo_cleaner_active_scan.min_full));
+	UT_ASSERT(!FullTransactionIdIsValid(undo_cleaner_active_scan.reference_full));
+	UT_ASSERT(!undo_cleaner_active_scan_pending);
+	UT_ASSERT_EQ(test_modifier_entries, 1);
+	test_pgproc_invalid = false;
+	test_pgproc_min = FullTransactionIdFromEpochAndXid(7, 80);
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT_EQ(test_pgproc_samples, 3);
+	UT_ASSERT_EQ(test_census_begins, 2);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.status, CTRC_ACTIVE_SCAN_INCOMPLETE);
+	UT_ASSERT_EQ(XidFromFullTransactionId(undo_cleaner_active_scan.min_full), 80);
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(14);
 	UT_RUN(test_capacity_wait_retries_signals_and_cadence_without_authorizing_free);
 	UT_RUN(test_capacity_every_blocking_hold_refuses_without_sleep);
 	UT_RUN(test_heavyweight_lock_identity_and_mode_are_exact);
@@ -884,6 +963,8 @@ main(void)
 	UT_RUN(test_census_continuations_keep_cursor_without_accelerating_gc);
 	UT_RUN(test_census_has_one_worker_and_no_shutdown_or_disabled_continuation);
 	UT_RUN(test_census_invalid_sample_and_respawn_start_from_fresh_reference);
+	UT_RUN(test_pgproc_min_is_captured_once_for_the_whole_census_round);
+	UT_RUN(test_pgproc_failure_invalidates_old_sample_without_skipping_mandatory_work);
 	free(undo_cleaner_state);
 	UT_DONE();
 	return ut_failed_count != 0;
