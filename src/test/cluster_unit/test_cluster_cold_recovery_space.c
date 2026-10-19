@@ -769,9 +769,56 @@ UT_TEST(test_space_effect_validation)
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
+UT_TEST(test_space_record_frames_preserve_each_record_once)
+{
+	int history;
+
+	for (history = 0; history < 2; history++) {
+		ClusterColdParticipantV1 participant = part(1, 11, 0x100, history ? 0x200 : 0x100, 0x200);
+		ClusterColdPlanV1 *plan = make_plan(&participant, 1);
+		ClusterColdSpaceOpV1 drops[2] = { space_op(CLUSTER_COLD_SPACE_DROP, REL_R, INC_OLD, 0, 0),
+										  space_op(CLUSTER_COLD_SPACE_DROP, REL_S, INC_C, 0, 0) };
+		ClusterColdRecordV1 record = { 0 };
+		ClusterColdRecordFrameV1 frame;
+		ObserveTable table = { 0 };
+		ClusterColdDiagV1 diag;
+		uint32 count = 99;
+
+		record.read_rec_ptr = 0x100;
+		record.end_rec_ptr = 0x200;
+		record.prev_rec_ptr = 0xC0;
+		record.record_crc = 55;
+		record.source_xid = 802;
+		record.source_top_xid = 802;
+		record.rmid = RM_XACT_ID;
+		record.space_count = 2;
+		record.space_ops = drops;
+		UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 0, &record), CLUSTER_COLD_OK);
+		memset(&record, 0, sizeof(record));
+		UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+		UT_ASSERT(cluster_cold_plan_record_frame_count_v1(plan, &count));
+		UT_ASSERT_EQ(count, 1);
+		UT_ASSERT(cluster_cold_plan_record_frame_v1(plan, 0, &frame));
+		UT_ASSERT_EQ(frame.participant, 0);
+		UT_ASSERT_EQ(frame.read_rec_ptr, 0x100);
+		UT_ASSERT_EQ(frame.end_rec_ptr, 0x200);
+		UT_ASSERT_EQ(frame.record_crc, 55);
+		UT_ASSERT_EQ(frame.source_xid, 802);
+		UT_ASSERT_EQ(frame.source_top_xid, 802);
+		UT_ASSERT_EQ(frame.rmid, RM_XACT_ID);
+		UT_ASSERT_EQ(frame.info, 0);
+		UT_ASSERT_EQ(frame.page_components, 0);
+		UT_ASSERT_EQ(frame.space_effects, 2);
+		UT_ASSERT_EQ(frame.history, history != 0);
+		UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), history ? 0 : 1);
+		cluster_cold_plan_destroy_v1(&plan);
+	}
+}
+
 int
 main(void)
 {
+	UT_PLAN(16);
 	UT_RUN(test_space_advance_collected_not_scheduled);
 	UT_RUN(test_space_create_orders_new_relation_pages);
 	UT_RUN(test_space_truncate_boundary_rebase_and_retire);
@@ -787,6 +834,7 @@ main(void)
 	UT_RUN(test_space_owner_check_required);
 	UT_RUN(test_space_created_relation_without_identity);
 	UT_RUN(test_space_effect_validation);
+	UT_RUN(test_space_record_frames_preserve_each_record_once);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

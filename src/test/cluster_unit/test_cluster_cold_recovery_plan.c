@@ -986,10 +986,137 @@ UT_TEST(test_c0_replay_range_retains_full_record_obligation)
 	destroy_plan(&plan);
 }
 
+/* Caller order differs from canonical order; history is not a replay step. */
+UT_TEST(test_record_frames_preserve_page_and_history_inputs)
+{
+	ClusterColdParticipantV1 parts[2]
+		= { part(2, 22, 0x1000, 0x1000, 0x1200), part(1, 11, 0x100, 0x180, 0x180) };
+	ClusterColdPlanV1 *plan = make_plan(parts, 2);
+	ClusterColdComponentV1 current = delta(0, 100, 0, 2, 3);
+	ClusterColdComponentV1 history = delta(0, 100, 0, 1, 2);
+	ClusterColdRecordV1 record = { 0 };
+	ClusterColdRecordFrameV1 frame;
+	ClusterColdRecordFrameV1 zero = { 0 };
+	ObserveTable table = { 0 };
+	ClusterColdDiagV1 diag;
+	uint32 count = 99;
+
+	record.read_rec_ptr = 0x1000;
+	record.end_rec_ptr = 0x1100;
+	record.prev_rec_ptr = 0xFC0;
+	record.record_crc = 111;
+	record.source_xid = 804;
+	/* An absent top stays absent; the accessor does not invent a proof. */
+	record.source_top_xid = InvalidTransactionId;
+	record.rmid = RM_HEAP_ID;
+	record.info = 0x20;
+	record.component_count = 1;
+	record.components = &current;
+	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 0, &record), CLUSTER_COLD_OK);
+	record.source_xid = 999;
+	record.source_top_xid = 999;
+	/* A cursor-only record is not included in the retained frame census. */
+	record.read_rec_ptr = 0x1100;
+	record.end_rec_ptr = 0x1200;
+	record.prev_rec_ptr = 0x1000;
+	record.component_count = 0;
+	record.components = NULL;
+	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 0, &record), CLUSTER_COLD_OK);
+	record.read_rec_ptr = 0x100;
+	record.end_rec_ptr = 0x180;
+	record.prev_rec_ptr = 0xC0;
+	record.record_crc = 222;
+	record.source_xid = 803;
+	/* Even a conflicting frame is preserved for the later ownership check. */
+	record.source_top_xid = 802;
+	record.info = 0x40;
+	record.component_count = 1;
+	record.components = &history;
+	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 1, &record), CLUSTER_COLD_OK);
+	memset(&record, 0, sizeof(record));
+	observe_set(&table, 100, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 2));
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_plan_record_frame_count_v1(plan, &count));
+	UT_ASSERT_EQ(count, 2);
+	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 0), 2);
+	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 1);
+	UT_ASSERT(cluster_cold_plan_record_frame_v1(plan, 0, &frame));
+	UT_ASSERT_EQ(frame.participant, 0);
+	UT_ASSERT_EQ(frame.read_rec_ptr, 0x1000);
+	UT_ASSERT_EQ(frame.end_rec_ptr, 0x1100);
+	UT_ASSERT_EQ(frame.record_crc, 111);
+	UT_ASSERT_EQ(frame.source_xid, 804);
+	UT_ASSERT_EQ(frame.source_top_xid, InvalidTransactionId);
+	UT_ASSERT_EQ(frame.rmid, RM_HEAP_ID);
+	UT_ASSERT_EQ(frame.info, 0x20);
+	UT_ASSERT_EQ(frame.page_components, 1);
+	UT_ASSERT_EQ(frame.space_effects, 0);
+	UT_ASSERT(!frame.history);
+	UT_ASSERT(cluster_cold_plan_record_frame_v1(plan, 1, &frame));
+	UT_ASSERT_EQ(frame.participant, 1);
+	UT_ASSERT_EQ(frame.read_rec_ptr, 0x100);
+	UT_ASSERT_EQ(frame.end_rec_ptr, 0x180);
+	UT_ASSERT_EQ(frame.record_crc, 222);
+	UT_ASSERT_EQ(frame.source_xid, 803);
+	UT_ASSERT_EQ(frame.source_top_xid, 802);
+	UT_ASSERT_EQ(frame.info, 0x40);
+	UT_ASSERT_EQ(frame.page_components, 1);
+	UT_ASSERT_EQ(frame.space_effects, 0);
+	UT_ASSERT(frame.history);
+	UT_ASSERT(!cluster_cold_plan_record_frame_v1(plan, count, &frame));
+	UT_ASSERT(memcmp(&frame, &zero, sizeof(frame)) == 0);
+	destroy_plan(&plan);
+}
+
+UT_TEST(test_record_frames_refuse_unsealed_failed_and_invalid_inputs)
+{
+	ClusterColdParticipantV1 participant = part(1, 11, 0x100, 0x100, 0x200);
+	ClusterColdPlanV1 *plan = make_plan(&participant, 1);
+	ClusterColdRecordFrameV1 frame;
+	ClusterColdRecordFrameV1 zero = { 0 };
+	ObserveTable table = { 0 };
+	ClusterColdDiagV1 diag;
+	uint32 count = 99;
+
+	memset(&frame, 0xA5, sizeof(frame));
+	UT_ASSERT(!cluster_cold_plan_record_frame_count_v1(NULL, &count));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT(!cluster_cold_plan_record_frame_v1(NULL, 0, &frame));
+	UT_ASSERT(memcmp(&frame, &zero, sizeof(frame)) == 0);
+	count = 99;
+	memset(&frame, 0xA5, sizeof(frame));
+	UT_ASSERT(!cluster_cold_plan_record_frame_count_v1(plan, &count));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT(!cluster_cold_plan_record_frame_v1(plan, 0, &frame));
+	UT_ASSERT(memcmp(&frame, &zero, sizeof(frame)) == 0);
+	UT_ASSERT_EQ(feed_plain(plan, 0, 0x100, 0x200), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	count = 99;
+	UT_ASSERT(cluster_cold_plan_record_frame_count_v1(plan, &count));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 0), 1);
+	UT_ASSERT(!cluster_cold_plan_record_frame_count_v1(plan, NULL));
+	UT_ASSERT(!cluster_cold_plan_record_frame_v1(plan, 0, NULL));
+	memset(&frame, 0xA5, sizeof(frame));
+	UT_ASSERT(!cluster_cold_plan_record_frame_v1(plan, UINT32_MAX, &frame));
+	UT_ASSERT(memcmp(&frame, &zero, sizeof(frame)) == 0);
+	destroy_plan(&plan);
+	plan = make_plan(&participant, 1);
+	UT_ASSERT_EQ(feed_plain(plan, 0, 0x100, 0x180), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_plan_seal_v1(plan, observe, &table, &diag) != CLUSTER_COLD_OK);
+	count = 99;
+	memset(&frame, 0xA5, sizeof(frame));
+	UT_ASSERT(!cluster_cold_plan_record_frame_count_v1(plan, &count));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT(!cluster_cold_plan_record_frame_v1(plan, 0, &frame));
+	UT_ASSERT(memcmp(&frame, &zero, sizeof(frame)) == 0);
+	destroy_plan(&plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(36);
 	UT_RUN(test_c0_history_is_not_checkpoint_coverage);
 	UT_RUN(test_c0_replay_range_retains_full_record_obligation);
 	UT_RUN(test_lower_lag_old_fpi_cannot_overwrite_newer_durable);
@@ -1024,6 +1151,8 @@ main(void)
 	UT_RUN(test_unowned_side_records_refused_after_native_redo);
 	UT_RUN(test_unverified_content_needs_an_anchor);
 	UT_RUN(test_compact_plan_capacity);
+	UT_RUN(test_record_frames_preserve_page_and_history_inputs);
+	UT_RUN(test_record_frames_refuse_unsealed_failed_and_invalid_inputs);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

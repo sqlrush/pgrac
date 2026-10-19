@@ -171,6 +171,9 @@ typedef struct ClusterColdRecordV1 {
 	XLogRecPtr prev_rec_ptr; /* xl_prev: must equal the previous fed read_rec_ptr */
 	uint64 scn;				 /* xl_scn; deterministic tie-break only */
 	uint32 record_crc;
+	/* Original frame values, not a derived canonical ownership proof. */
+	TransactionId source_xid;
+	TransactionId source_top_xid;
 	uint8 rmid;
 	uint8 info;
 	uint8 record_flags; /* CLUSTER_COLD_RECORD_* */
@@ -180,6 +183,21 @@ typedef struct ClusterColdRecordV1 {
 	uint32 space_count; /* a record has SPACE effects or page components, not both */
 	const ClusterColdSpaceOpV1 *space_ops;
 } ClusterColdRecordV1;
+
+/* Original frame of one retained PAGE/SPACE record, not an ownership proof. */
+typedef struct ClusterColdRecordFrameV1 {
+	XLogRecPtr read_rec_ptr;
+	XLogRecPtr end_rec_ptr;
+	uint32 record_crc;
+	uint32 participant; /* create()'s caller index */
+	TransactionId source_xid;
+	TransactionId source_top_xid;
+	uint32 page_components;
+	uint32 space_effects;
+	uint8 rmid;
+	uint8 info;
+	bool history;
+} ClusterColdRecordFrameV1;
 
 typedef enum ClusterColdDataKindV1 {
 	CLUSTER_COLD_DATA_INVALID = 0, /* unreadable or failed verification */
@@ -302,6 +320,17 @@ extern bool cluster_cold_plan_step_v1(const ClusterColdPlanV1 *plan, uint32 inde
 extern bool cluster_cold_plan_step_space_v1(const ClusterColdPlanV1 *plan, uint32 index,
 											uint32 effect, uint32 *relation, uint32 *input);
 
+/* Sealed-only, by-value frames in feed order, including retained history.
+ * These enumerate only records stored for PAGE/SPACE planning: records with
+ * no such component and historical SPACE ADVANCEs are omitted.  The count
+ * proves neither all-record coverage nor ordinary-effects completion.
+ * source_top_xid may be absent; neither field establishes canonical ownership.
+ * No replay, loser, C0 or write authority is granted by reading these inputs.
+ * Both accessors clear their output on failure (including unsealed plans). */
+extern bool cluster_cold_plan_record_frame_count_v1(const ClusterColdPlanV1 *plan,
+													uint32 *out_count);
+extern bool cluster_cold_plan_record_frame_v1(const ClusterColdPlanV1 *plan, uint32 index,
+											  ClusterColdRecordFrameV1 *out);
 
 /* Records at or after the participant's native redo start (pass-2 input),
  * page or not, as fed; pass 2 must consume exactly this many. */

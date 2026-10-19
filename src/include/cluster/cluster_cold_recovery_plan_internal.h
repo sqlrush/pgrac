@@ -80,6 +80,8 @@ typedef struct ColdRecord {
 	XLogRecPtr end_rec_ptr;
 	uint64 scn;
 	uint32 record_crc;
+	TransactionId source_xid;
+	TransactionId source_top_xid;
 	uint32 first_component;
 	uint8 participant; /* canonical index */
 	uint8 component_count;
