@@ -51,6 +51,9 @@
 
 #include "common/cluster_relmap_v2.h"
 #include "port/pg_crc32c.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_relmap_pending.h"
+#endif
 
 /* Authority header magic + version. */
 #define CLUSTER_RELMAP_AUTHORITY_MAGIC 0x0140DEA9 /* relmap authority tag */
@@ -248,6 +251,26 @@ cluster_relmap_authority_v2_read(const ClusterRelmapV2Namespace *expected,
 extern bool cluster_relmap_authority_v2_read_committed(const ClusterRelmapV2Namespace *expected,
 												RelMapFile *map_out,
 												uint64 *generation_out);
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * Dormant cold-reader wiring.  Read one complete, identical v2 pair and
+ * rebuild structural DROP/TRUNCATE obligations from the caller's exact cold
+ * stream.  Only the committed RelMapFile and generation are returned; the
+ * durable v2 pending image is never exposed as a structural directory.  The
+ * pending destination must already be initialized and empty.  A degraded,
+ * incomplete, or wrong-namespace pair returns a fail-closed result without
+ * changing the destination or committed outputs.  This is reader/rebuild
+ * substrate only: it does not authorize CLOG/CTRC/SPACE release, issuance,
+ * or live v2 activation.
+ */
+extern ClusterRelmapPendingResult
+cluster_relmap_authority_v2_read_rebuild_pending(
+	const ClusterRelmapV2Namespace *expected,
+	const ClusterRelmapPendingDescriptor *descriptors, size_t descriptor_count,
+	ClusterRelmapPendingSet *pending_out, RelMapFile *committed_out,
+	uint64 *generation_out);
+#endif
 
 /*
  * Stage into an initialized, clean v2 pair, primary before backup, with both

@@ -602,6 +602,37 @@ cluster_relmap_authority_v2_read_committed(const ClusterRelmapV2Namespace *expec
 	return true;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+ClusterRelmapPendingResult
+cluster_relmap_authority_v2_read_rebuild_pending(
+	const ClusterRelmapV2Namespace *expected,
+	const ClusterRelmapPendingDescriptor *descriptors, size_t descriptor_count,
+	ClusterRelmapPendingSet *pending_out, RelMapFile *committed_out,
+	uint64 *generation_out)
+{
+	ClusterRelmapV2View view;
+	ClusterRelmapV2PairResult pair_result;
+	ClusterRelmapPendingResult rebuild_result;
+
+	if (expected == NULL || pending_out == NULL || committed_out == NULL ||
+		generation_out == NULL)
+		return CLUSTER_RELMAP_PENDING_INVALID_INPUT;
+	memset(committed_out, 0, sizeof(*committed_out));
+	*generation_out = 0;
+	pair_result = cluster_relmap_authority_v2_read(expected, &view);
+	if (pair_result != CLUSTER_RELMAP_V2_PAIR_VALID || !view.pending_complete ||
+		view.committed_generation == 0)
+		return CLUSTER_RELMAP_PENDING_NOT_READY;
+	rebuild_result = cluster_relmap_pending_rebuild_from_committed(
+		pending_out, expected, pair_result, &view, descriptors, descriptor_count);
+	if (rebuild_result != CLUSTER_RELMAP_PENDING_OK)
+		return rebuild_result;
+	*committed_out = view.committed;
+	*generation_out = view.committed_generation;
+	return CLUSTER_RELMAP_PENDING_OK;
+}
+#endif
+
 /* Each replacement is file sync -> rename -> directory sync -> exact inode
  * and full byte readback.  Never roll the old primary into backup: the backup
  * must receive the same new pending obligation before stage can succeed. */

@@ -13,6 +13,8 @@
  *    Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md
  *-------------------------------------------------------------------------
  */
+#define USE_PGRAC_CLUSTER 1
+
 #include "postgres.h"
 
 #include <fcntl.h>
@@ -21,6 +23,7 @@
 
 #include "cluster/cluster_relmap_authority.h"
 #include "cluster/cluster_relmap_lock.h"
+#include "cluster/cluster_relmap_pending.h"
 #include "cluster/cluster_relmap_retention_restore.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
@@ -506,6 +509,58 @@ UT_TEST(test_committed_reader_hides_pending_and_rejects_degraded_pair)
 	UT_ASSERT(!cluster_relmap_authority_v2_read_committed(&identity, &map, &generation));
 	UT_ASSERT_EQ(generation, UINT64CONST(0));
 	UT_ASSERT_EQ(memcmp(&map, &zero, sizeof(map)) == 0, true);
+}
+
+UT_TEST(test_committed_reader_rebuilds_exact_structural_pending)
+{
+	ClusterRelmapPendingDescriptor descriptor;
+	ClusterRelmapPendingSet pending;
+	RelMapFile map;
+	RelMapFile zero;
+	unsigned char bytes[2176];
+	ClusterRelmapPendingResult result;
+	uint64 generation;
+
+	memset(&descriptor, 0, sizeof(descriptor));
+	descriptor.kind = CLUSTER_RELMAP_PENDING_DROP;
+	descriptor.identity.system_identifier = identity.system_identifier;
+	descriptor.identity.database_incarnation = identity.database_incarnation;
+	memset(descriptor.identity.storage_uuid, 0xd1,
+		   sizeof(descriptor.identity.storage_uuid));
+	descriptor.identity.locator.spcOid = 1663;
+	descriptor.identity.locator.dbOid = 42;
+	descriptor.identity.locator.relNumber = 12001;
+
+	setup(&identity);
+	UT_ASSERT(stage(&identity));
+	cluster_relmap_pending_init(&pending);
+	memset(&map, 0xa5, sizeof(map));
+	generation = UINT64CONST(99);
+	result = cluster_relmap_authority_v2_read_rebuild_pending(
+		&identity, &descriptor, 1, &pending, &map, &generation);
+	UT_ASSERT_EQ(result, CLUSTER_RELMAP_PENDING_OK);
+	UT_ASSERT_EQ(generation, UINT64CONST(7));
+	UT_ASSERT_EQ(map.mappings[0].mapfilenumber, 40000);
+	UT_ASSERT(cluster_relmap_pending_contains(&pending, CLUSTER_RELMAP_PENDING_DROP,
+									 &descriptor.identity));
+	UT_ASSERT(!cluster_relmap_pending_can_release(&pending, CLUSTER_RELMAP_PENDING_DROP,
+									 &descriptor.identity));
+
+	read_copy(0, bytes);
+	bytes[128] ^= 1;
+	write_copy(0, bytes, sizeof(bytes));
+	memset(&pending, 0xa5, sizeof(pending));
+	memset(&map, 0xa5, sizeof(map));
+	generation = UINT64CONST(99);
+	cluster_relmap_pending_init(&pending);
+	result = cluster_relmap_authority_v2_read_rebuild_pending(
+		&identity, &descriptor, 1, &pending, &map, &generation);
+	UT_ASSERT_EQ(result, CLUSTER_RELMAP_PENDING_NOT_READY);
+	memset(&zero, 0, sizeof(zero));
+	UT_ASSERT_EQ(generation, UINT64CONST(0));
+	UT_ASSERT_EQ(memcmp(&map, &zero, sizeof(map)) == 0, true);
+	UT_ASSERT(!cluster_relmap_pending_contains(&pending, CLUSTER_RELMAP_PENDING_DROP,
+									 &descriptor.identity));
 }
 
 UT_TEST(test_per_database_namespace)
@@ -1482,9 +1537,10 @@ UT_TEST(test_changed_wal_cannot_rebind_staged_pin)
 int
 main(void)
 {
-	UT_PLAN(42);
+	UT_PLAN(43);
 	UT_RUN(test_stage_both_copies_before_success);
 	UT_RUN(test_committed_reader_hides_pending_and_rejects_degraded_pair);
+	UT_RUN(test_committed_reader_rebuilds_exact_structural_pending);
 	UT_RUN(test_per_database_namespace);
 	UT_RUN(test_missing_authority_is_never_seeded);
 	UT_RUN(test_fallback_is_incomplete_and_cannot_stage);
