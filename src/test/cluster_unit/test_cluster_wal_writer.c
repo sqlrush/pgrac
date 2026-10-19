@@ -1419,7 +1419,7 @@ UT_TEST(test_requested_flush_rejects_foreign_or_unsafe_context_without_io)
 int
 main(void)
 {
-	UT_PLAN(50);
+	UT_PLAN(59);
 	UT_RUN(test_clean_writer_requires_selected_exit_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_requires_selected_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_keeps_runtime_fence_and_exact_owner_refusals);
@@ -1470,6 +1470,15 @@ main(void)
 	UT_RUN(test_relmap_runtime_preserves_pins_and_reservation_on_attach);
 	UT_RUN(test_relmap_runtime_rejects_incompatible_attachment);
 	UT_RUN(test_relmap_runtime_keeps_original_owner_refusals);
+	UT_RUN(test_relmap_runtime_active_binds_all_existing_namespaces_and_staged_pin);
+	UT_RUN(test_relmap_runtime_active_retry_is_idempotent_and_conflict_is_atomic);
+	UT_RUN(test_relmap_runtime_active_empty_set_has_no_new_duty);
+	UT_RUN(test_relmap_runtime_active_refuses_unattached_unknown_and_building);
+	UT_RUN(test_relmap_runtime_active_refuses_unsafe_context_before_receipt_read);
+	UT_RUN(test_relmap_runtime_active_refuses_invalid_top_or_missing_and_invalid_receipt);
+	UT_RUN(test_relmap_runtime_active_rechecks_original_full_and_native_writer_after_receipt);
+	UT_RUN(test_relmap_runtime_active_same_raw_in_another_era_never_attaches_old_pins);
+	UT_RUN(test_relmap_runtime_active_refuses_a_foreign_directory_identity);
 	free(relmap_runtime_allocation);
 	if (scratch[0] && !rmtree(scratch, true))
 		abort();

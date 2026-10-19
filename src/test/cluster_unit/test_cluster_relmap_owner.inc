@@ -14,13 +14,15 @@ static uint64 relmap_top_full;
 static unsigned relmap_assign_calls;
 static bool relmap_advance_epoch_on_assign;
 static bool relmap_have_binding, relmap_binding_drift;
+static bool relmap_active_owner;
+static unsigned relmap_binding_owner_fault;
 static unsigned relmap_binding_reads;
 static ClusterCanonicalTxnBinding relmap_binding;
 
 static void
 relmap_retention_lock_enter(void)
 {
-	if (!relmap_global_x || relmap_local_lock || CritSectionCount != 0)
+	if ((!relmap_global_x && !relmap_active_owner) || relmap_local_lock || CritSectionCount != 0)
 		abort();
 }
 
@@ -66,7 +68,7 @@ LWLockHeldByMe(LWLock *lock)
 bool
 cluster_tt_local_get_published_binding(TransactionId top_xid, ClusterCanonicalTxnBinding *out)
 {
-	if (relmap_retention_held || relmap_local_lock || !relmap_global_x
+	if (relmap_retention_held || relmap_local_lock || (!relmap_global_x && !relmap_active_owner)
 		|| CritSectionCount != 0 || top_xid != (uint32) relmap_top_full)
 		abort();
 	relmap_binding_reads++;
@@ -75,6 +77,13 @@ cluster_tt_local_get_published_binding(TransactionId top_xid, ClusterCanonicalTx
 		*out = relmap_binding;
 	if (relmap_binding_drift)
 		relmap_top_full += UINT64CONST(0x100000000);
+	if (relmap_binding_owner_fault == 1) epoch++;
+	if (relmap_binding_owner_fault == 2) ref.claim.claim_sha256[0]++;
+	if (relmap_binding_owner_fault == 3) native_ctl.InsertTimeLineID++;
+	if (relmap_binding_owner_fault == 4) ShutdownRequestPending = true;
+	if (relmap_binding_owner_fault == 5) cluster_node_id++;
+	if (relmap_binding_owner_fault == 6) have_ref = false;
+	if (relmap_binding_owner_fault == 7) relmap_admission_delta = 1;
 	return relmap_have_binding;
 }
 
@@ -99,6 +108,8 @@ relmap_owner_fixture(void)
 	relmap_advance_epoch_on_assign = false;
 	relmap_top_full = UINT64CONST(0x400000123);
 	relmap_retention_held = relmap_have_binding = relmap_binding_drift = false;
+	relmap_active_owner = false;
+	relmap_binding_owner_fault = 0;
 	relmap_retention_acquires = relmap_binding_reads = 0;
 	memset(&relmap_binding, 0, sizeof(relmap_binding));
 	relmap_binding.segment_id = 12;

@@ -264,3 +264,213 @@ UT_TEST(test_relmap_runtime_keeps_original_owner_refusals)
 		UT_ASSERT_EQ(relmap_assign_calls, 1);
 	}
 }
+
+static ClusterRelmapRetentionDirectory *
+relmap_runtime_binding_fixture(unsigned origin)
+{
+	ClusterRelmapOwnerSampleV2 sample;
+	ClusterRelmapV2Namespace identity;
+	ClusterRelmapRetentionDirectory *directory;
+	ClusterRelmapRetentionKey other;
+
+	relmap_runtime_fixture(true);
+	cluster_node_id = ref.claim.identity.origin_node_id = origin;
+	ref.claim.identity.origin_thread_id = origin + 1;
+	relmap_binding.origin_instance = origin + 1;
+	UT_ASSERT(cluster_relmap_owner_capture_v2(&sample));
+	identity = relmap_owner_namespace();
+	relmap_runtime_qualified_fixture(origin);
+	directory = &relmap_runtime_shmem->directories[origin];
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_begin_v2(&sample, &identity, 8),
+		CLUSTER_RELMAP_RETENTION_OK);
+	identity.shared = true;
+	identity.dbid = InvalidOid;
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_begin_v2(&sample, &identity, 9),
+		CLUSTER_RELMAP_RETENTION_OK);
+	LWLockAcquire(relmap_runtime_test_lock, LW_EXCLUSIVE);
+	UT_ASSERT_EQ(cluster_relmap_retention_stage_start(directory, &directory->pins[0].key, 900),
+		CLUSTER_RELMAP_RETENTION_OK);
+	other = directory->pins[0].key;
+	other.identity.dbid++;
+	other.top_full_xid++;
+	UT_ASSERT_EQ(cluster_relmap_retention_begin(directory, &other), CLUSTER_RELMAP_RETENTION_OK);
+	LWLockRelease(relmap_runtime_test_lock);
+	relmap_global_x = false; /* ACTIVE is an original owner without the relmap X lock. */
+	relmap_active_owner = relmap_have_binding = true;
+	relmap_retention_acquires = relmap_binding_reads = relmap_assign_calls = 0;
+	return directory;
+}
+
+UT_TEST(test_relmap_runtime_active_binds_all_existing_namespaces_and_staged_pin)
+{
+	for (unsigned origin = 0; origin < CLUSTER_MAX_NODES; origin += CLUSTER_MAX_NODES - 1) {
+		ClusterRelmapRetentionDirectory *directory = relmap_runtime_binding_fixture(origin);
+		ClusterRelmapRetentionPin other = directory->pins[2];
+
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_bind_current_v2(), CLUSTER_RELMAP_RETENTION_OK);
+		for (unsigned i = 0; i < 2; i++) {
+			UT_ASSERT(directory->pins[i].has_tt_binding);
+			UT_ASSERT_EQ(memcmp(&directory->pins[i].binding, &relmap_binding, sizeof(relmap_binding)), 0);
+		}
+		UT_ASSERT(directory->pins[0].may_be_staged && !directory->pins[1].may_be_staged);
+		UT_ASSERT_EQ(directory->pins[0].wal_end, 900);
+		UT_ASSERT_EQ(memcmp(&other, &directory->pins[2], sizeof(other)), 0);
+		UT_ASSERT_EQ(relmap_runtime_shmem->directories[origin == 0 ? 1 : 0].state,
+			CLUSTER_RELMAP_RETENTION_UNKNOWN);
+		UT_ASSERT_EQ(relmap_binding_reads, 1);
+		UT_ASSERT_EQ(relmap_retention_acquires, 1);
+		UT_ASSERT_EQ(relmap_assign_calls + sync_calls + rename_calls, 0);
+		UT_ASSERT(!relmap_retention_held && !relmap_global_x);
+	}
+}
+
+UT_TEST(test_relmap_runtime_active_retry_is_idempotent_and_conflict_is_atomic)
+{
+	ClusterRelmapRetentionDirectory *directory = relmap_runtime_binding_fixture(0);
+	ClusterRelmapRetentionDirectory before;
+	ClusterCanonicalTxnBinding receipt;
+
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_bind_current_v2(), CLUSTER_RELMAP_RETENTION_OK);
+	before = *directory;
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_bind_current_v2(), CLUSTER_RELMAP_RETENTION_OK);
+	UT_ASSERT_EQ(memcmp(&before, directory, sizeof(before)), 0);
+	/* A conflict in the later pin must leave the earlier unbound pin untouched. */
+	directory->pins[0].has_tt_binding = false;
+	memset(&directory->pins[0].binding, 0, sizeof(directory->pins[0].binding));
+	before = *directory;
+	relmap_binding.slot_offset++;
+	receipt = relmap_binding;
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_bind_current_v2(), CLUSTER_RELMAP_RETENTION_CONFLICT);
+	UT_ASSERT_EQ(memcmp(&before, directory, sizeof(before)), 0);
+	UT_ASSERT_EQ(memcmp(&receipt, &relmap_binding, sizeof(receipt)), 0);
+	UT_ASSERT_EQ(relmap_assign_calls, 0);
+}
+
+UT_TEST(test_relmap_runtime_active_empty_set_has_no_new_duty)
+{
+	ClusterRelmapRetentionDirectory before;
+	relmap_runtime_fixture(true);
+	relmap_runtime_qualified_fixture(0);
+	before = relmap_runtime_shmem->directories[0];
+	relmap_global_x = false;
+	relmap_active_owner = relmap_have_binding = true;
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_bind_current_v2(), CLUSTER_RELMAP_RETENTION_OK);
+	UT_ASSERT_EQ(memcmp(&before, &relmap_runtime_shmem->directories[0], sizeof(before)), 0);
+	UT_ASSERT_EQ(relmap_binding_reads, 1);
+	UT_ASSERT_EQ(relmap_retention_acquires, 1);
+	UT_ASSERT_EQ(relmap_assign_calls, 0);
+}
+
+UT_TEST(test_relmap_runtime_active_refuses_unattached_unknown_and_building)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterRelmapRetentionDirectory before;
+		relmap_runtime_fixture(fault != 0);
+		relmap_global_x = false;
+		relmap_active_owner = relmap_have_binding = true;
+		if (fault == 2)
+			UT_ASSERT_EQ(cluster_relmap_retention_build_start(&relmap_runtime_shmem->directories[0],
+				ref.claim.identity.system_identifier, ref.claim.database_incarnation, 0, 7,
+				relmap_top_full - 100, relmap_top_full + 100), CLUSTER_RELMAP_RETENTION_OK);
+		if (fault != 0) before = relmap_runtime_shmem->directories[0];
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_bind_current_v2(), CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+		if (fault != 0)
+			UT_ASSERT_EQ(memcmp(&before, &relmap_runtime_shmem->directories[0], sizeof(before)), 0);
+		UT_ASSERT_EQ(relmap_binding_reads, fault == 0 ? 0 : 1);
+		UT_ASSERT_EQ(relmap_retention_acquires, fault == 0 ? 0 : 1);
+		UT_ASSERT_EQ(relmap_assign_calls, 0);
+	}
+}
+
+UT_TEST(test_relmap_runtime_active_refuses_unsafe_context_before_receipt_read)
+{
+	for (unsigned fault = 0; fault < 12; fault++) {
+		ClusterRelmapRetentionDirectory *directory = relmap_runtime_binding_fixture(0);
+		ClusterRelmapRetentionDirectory before = *directory;
+		if (fault == 0) cluster_enabled = false;
+		if (fault == 1) cluster_shared_config = false;
+		if (fault == 2) cluster_node_id = -1;
+		if (fault == 3) cluster_node_id = CLUSTER_MAX_NODES;
+		if (fault == 4) MyBackendType = B_BG_WRITER;
+		if (fault == 5) MyProcPid = 0;
+		if (fault == 6) CritSectionCount = 1;
+		if (fault == 7) relmap_in_transaction = false;
+		if (fault == 8) ShutdownRequestPending = true;
+		if (fault == 9) flush_probe_recovery = true;
+		if (fault == 10) relmap_local_lock = true;
+		if (fault == 11) relmap_retention_held = true;
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_bind_current_v2(), CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+		UT_ASSERT_EQ(memcmp(&before, directory, sizeof(before)), 0);
+		UT_ASSERT_EQ(relmap_binding_reads + relmap_retention_acquires + relmap_assign_calls, 0);
+	}
+}
+
+UT_TEST(test_relmap_runtime_active_refuses_invalid_top_or_missing_and_invalid_receipt)
+{
+	for (unsigned fault = 0; fault < 11; fault++) {
+		ClusterRelmapRetentionDirectory *directory = relmap_runtime_binding_fixture(0);
+		ClusterRelmapRetentionDirectory before = *directory;
+		ClusterCanonicalTxnBinding receipt;
+		if (fault == 0) relmap_top_full = 0;
+		if (fault == 1) relmap_top_full = UINT64CONST(0x400000002);
+		if (fault == 2) relmap_have_binding = false;
+		if (fault == 3) relmap_binding.publish_state = CLUSTER_CANONICAL_TXN_PUBLISHING;
+		if (fault == 4) relmap_binding.xid++;
+		if (fault == 5) relmap_binding.origin_instance++;
+		if (fault == 6) relmap_binding.segment_id = 0;
+		if (fault == 7) relmap_binding.segment_generation = UINT32_MAX;
+		if (fault == 8) relmap_binding.slot_wrap = TT_WRAP_INVALID;
+		if (fault == 9) relmap_binding.active_lsn = InvalidXLogRecPtr;
+		if (fault == 10) relmap_binding.reserved16 = 1;
+		receipt = relmap_binding;
+		UT_ASSERT_NE(cluster_relmap_retention_runtime_bind_current_v2(), CLUSTER_RELMAP_RETENTION_OK);
+		UT_ASSERT_EQ(memcmp(&before, directory, sizeof(before)), 0);
+		UT_ASSERT_EQ(memcmp(&receipt, &relmap_binding, sizeof(receipt)), 0);
+		UT_ASSERT_EQ(relmap_assign_calls, 0);
+		UT_ASSERT_EQ(relmap_binding_reads, fault < 2 ? 0 : 1);
+		UT_ASSERT_EQ(relmap_retention_acquires, fault < 3 ? 0 : 1);
+	}
+}
+
+UT_TEST(test_relmap_runtime_active_rechecks_original_full_and_native_writer_after_receipt)
+{
+	for (unsigned fault = 0; fault < 8; fault++) {
+		ClusterRelmapRetentionDirectory *directory = relmap_runtime_binding_fixture(0);
+		ClusterRelmapRetentionDirectory before = *directory;
+		if (fault == 0) relmap_binding_drift = true;
+		else relmap_binding_owner_fault = fault;
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_bind_current_v2(), CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+		UT_ASSERT_EQ(memcmp(&before, directory, sizeof(before)), 0);
+		UT_ASSERT_EQ(relmap_binding_reads, 1);
+		UT_ASSERT_EQ(relmap_retention_acquires + relmap_assign_calls, 0);
+	}
+}
+
+UT_TEST(test_relmap_runtime_active_same_raw_in_another_era_never_attaches_old_pins)
+{
+	ClusterRelmapRetentionDirectory *directory = relmap_runtime_binding_fixture(0);
+	ClusterRelmapRetentionDirectory before = *directory;
+	relmap_top_full += UINT64CONST(0x100000000);
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_bind_current_v2(), CLUSTER_RELMAP_RETENTION_OK);
+	UT_ASSERT_EQ(memcmp(&before, directory, sizeof(before)), 0);
+	UT_ASSERT_EQ(relmap_binding_reads, 1);
+	UT_ASSERT_EQ(relmap_retention_acquires, 1);
+	UT_ASSERT_EQ(relmap_assign_calls, 0);
+}
+
+UT_TEST(test_relmap_runtime_active_refuses_a_foreign_directory_identity)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterRelmapRetentionDirectory *directory = relmap_runtime_binding_fixture(0);
+		ClusterRelmapRetentionDirectory before;
+		if (fault == 0) directory->system_identifier++;
+		if (fault == 1) directory->database_incarnation++;
+		if (fault == 2) directory->origin++;
+		before = *directory;
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_bind_current_v2(), CLUSTER_RELMAP_RETENTION_INVALID);
+		UT_ASSERT_EQ(memcmp(&before, directory, sizeof(before)), 0);
+		UT_ASSERT_EQ(relmap_binding_reads, 1);
+		UT_ASSERT_EQ(relmap_retention_acquires, 1);
+		UT_ASSERT_EQ(relmap_assign_calls, 0);
+	}
+}
