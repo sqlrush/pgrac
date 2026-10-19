@@ -1195,6 +1195,7 @@ side_decode_record(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *recor
 		candidate->route = record_plan->route;
 		candidate->purpose = plan->purpose;
 		candidate->source_xid = XLogRecGetXid(record_plan->source_record);
+		candidate->source_top_xid = record_plan->source_record->record->toplevel_xid;
 		candidate->history_only
 			= identity->record.end_rec_ptr <= plan->redo_starts[identity->participant_index];
 	} else if (record_plan->route.record_owner != RF_ROUTE_OWNER_PAGE_CODEC

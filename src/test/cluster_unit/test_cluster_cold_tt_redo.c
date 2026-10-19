@@ -1183,8 +1183,9 @@ tt_redo_record_page(PGAlignedBlock *page, TransactionId xid)
 }
 
 static void
-tt_redo_feed_record_page_at(TtRedoFixture *f, XLogRecPtr begin, uint32 segment, uint32 block,
-							const PGAlignedBlock *page, bool full_image)
+tt_redo_feed_record_page_frame_at(TtRedoFixture *f, XLogRecPtr begin, uint32 segment, uint32 block,
+								  const PGAlignedBlock *page, bool full_image, TransactionId actor,
+								  TransactionId top)
 {
 	FakeXactRecord fake;
 	xl_undo_block_write carrier = { 0 };
@@ -1214,7 +1215,17 @@ tt_redo_feed_record_page_at(TtRedoFixture *f, XLogRecPtr begin, uint32 segment, 
 	}
 	memcpy(bytes, &carrier, sizeof(carrier));
 	make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE, bytes, length);
+	fake.u.decoded.header.xl_xid = actor;
+	fake.u.decoded.toplevel_xid = top;
 	undo_header_feed(f->typed.side_plans[0], &fake, begin);
+}
+
+static void
+tt_redo_feed_record_page_at(TtRedoFixture *f, XLogRecPtr begin, uint32 segment, uint32 block,
+							const PGAlignedBlock *page, bool full_image)
+{
+	tt_redo_feed_record_page_frame_at(f, begin, segment, block, page, full_image,
+									  InvalidTransactionId, InvalidTransactionId);
 }
 
 static void
@@ -3692,6 +3703,114 @@ UT_TEST(tt_top_tx_c0_producer_derives_top_from_native_bind)
 	}
 }
 
+/* Capture the actual original WAL frame; no producer proof bit supplies it. */
+static void
+tt_top_tx_frame_bind(FakeXactRecord *fake, uint16 slot, TransactionId xid, TransactionId source_xid,
+					 TransactionId top_xid)
+{
+	xl_undo_tt_slot_bind bind = { 0 };
+
+	bind.instance = 3;
+	bind.segment_id = 513;
+	bind.slot_offset = slot;
+	bind.wrap = slot == 4 ? 7 : 5;
+	bind.xid = xid;
+	bind.format_version = CLUSTER_UNDO_TT_BIND_VERSION;
+	make_projection_record(fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND, &bind, sizeof(bind));
+	fake->u.decoded.header.xl_xid = source_xid;
+	fake->u.decoded.toplevel_xid = top_xid;
+}
+
+static void
+tt_top_tx_frame_expect(TtRedoFixture *f, bool accepted)
+{
+	ClusterColdTtSlotInputV1 input;
+	ClusterColdTopTxProofV1 proof;
+	ClusterRecoveryTTAbortV1 shape;
+	ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
+
+	tt_redo_seal(f);
+	tt_top_tx_write_fold(f);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f->typed), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f->typed, 0, 4, &input));
+	UT_ASSERT(cluster_cold_typed_tt_redo_inventory_v1(&f->typed));
+	f->typed.xid_next_after_redo = UINT64_C(0x700400200);
+	tt_top_tx_c0_inputs(f, &input, &proof, &shape);
+	tt_top_tx_effects_complete(f);
+	tt_top_tx_endpoints_complete(f);
+	memset(&out, 0xa9, sizeof(out));
+	UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f->typed, TT_C0_FENCE, 0, &proof, &shape,
+														  false, InvalidTransactionId,
+														  UINT64_C(0x12345678), &out),
+				 accepted);
+	if (!accepted)
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+}
+
+UT_TEST(tt_top_tx_c0_producer_checks_original_native_bind_frame)
+{
+	for (int mode = 0; mode < 8; mode++) {
+		TtRedoFixture f;
+		FakeXactRecord fake;
+		TransactionId actor = 802, top = InvalidTransactionId;
+
+		if (mode == 1 || mode == 2 || mode == 5)
+			top = 802;
+		if (mode == 2 || mode == 3)
+			actor = 803;
+		if (mode == 4)
+			top = 803;
+		if (mode == 5)
+			actor = InvalidTransactionId;
+		if (mode == 6)
+			top = FrozenTransactionId;
+		if (mode == 7)
+			actor = FrozenTransactionId;
+		tt_top_tx_initialized_fixture(&f, 200, 100, 2);
+		tt_top_tx_frame_bind(&fake, 4, 802, actor, top);
+		undo_header_feed(f.typed.side_plans[0], &fake, 200);
+		/* A later reader buffer cannot repair the immutable captured frame. */
+		fake.u.decoded.header.xl_xid = fake.u.decoded.toplevel_xid = 802;
+		tt_top_tx_frame_expect(&f, mode < 2);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_top_tx_c0_producer_checks_each_operations_own_top)
+{
+	for (int fault = 0; fault < 2; fault++) {
+		TtRedoFixture f;
+		FakeXactRecord fake;
+
+		tt_top_tx_initialized_fixture(&f, 300, 100, 2);
+		tt_top_tx_frame_bind(&fake, 4, 802, 802, 802);
+		undo_header_feed(f.typed.side_plans[0], &fake, 200);
+		/* This operation belongs to 804, not the candidate's 802. */
+		tt_top_tx_frame_bind(&fake, 47, 804, 804, fault ? 803 : 804);
+		undo_header_feed(f.typed.side_plans[0], &fake, 300);
+		tt_top_tx_frame_expect(&f, fault == 0);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_top_tx_c0_producer_checks_retained_history_frame)
+{
+	for (int fault = 0; fault < 2; fault++) {
+		TtRedoFixture f;
+		FakeXactRecord fake;
+
+		tt_top_tx_initialized_fixture(&f, 200, 100, 3);
+		tt_redo_history_plan(&f, 100, 200, 200, RF_SIDE_PLAN_RECOVERY, false);
+		tt_top_tx_frame_bind(&fake, 47, 804, 804, fault ? 803 : 804);
+		tt_redo_history_feed(&f, &fake);
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(f.typed.side_plans[1]), RF_PAGE_PROOF_DETAIL_OK);
+		tt_top_tx_frame_bind(&fake, 4, 802, 802, 802);
+		undo_header_feed(f.typed.side_plans[0], &fake, 200);
+		tt_top_tx_frame_expect(&f, fault == 0);
+		tt_redo_destroy(&f);
+	}
+}
+
 UT_TEST(tt_top_tx_c0_producer_refuses_conflicting_bind_history)
 {
 	for (int field = 0; field < 4; field++) {
@@ -5169,7 +5288,7 @@ UT_TEST(tt_top_tx_c0_producer_requires_all_original_sources)
 
 UT_TEST(tt_top_tx_c0_producer_checks_unselected_undo_effects)
 {
-	for (int fault = 0; fault < 3; fault++) {
+	for (int fault = 0; fault < 5; fault++) {
 		TtRedoFixture f;
 		PGAlignedBlock page, expected;
 		ClusterColdTtSlotInputV1 input;
@@ -5180,7 +5299,13 @@ UT_TEST(tt_top_tx_c0_producer_checks_unselected_undo_effects)
 
 		tt_top_tx_initialized_fixture(&f, 300, 100, 2);
 		tt_redo_record_page(&page, 900);
-		tt_redo_feed_record_page(&f, 200, &page, true);
+		if (fault < 3)
+			tt_redo_feed_record_page(&f, 200, &page, true);
+		else
+			/* The writing actor's top is operation-local. The FPI's retained
+			 * record actors 900/901 are neither 804 nor the candidate's 802. */
+			tt_redo_feed_record_page_frame_at(&f, 200, 513, 9, &page, true, 804,
+											  fault == 3 ? 804 : 803);
 		tt_top_tx_seal_bound(&f, 200);
 		tt_undo_uncached_expected(&f, 513, 9, &expected);
 		if (fault == 1)
@@ -5201,8 +5326,8 @@ UT_TEST(tt_top_tx_c0_producer_checks_unselected_undo_effects)
 		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
 															  &shape, false, InvalidTransactionId,
 															  UINT64_C(0x12345678), &out),
-					 fault == 0);
-		if (fault != 0)
+					 fault == 0 || fault == 3);
+		if (fault != 0 && fault != 3)
 			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 		tt_redo_destroy(&f);
 	}
@@ -5374,7 +5499,7 @@ UT_TEST(tt_top_tx_c0_producer_rechecks_before_output)
 int
 main(void)
 {
-	UT_PLAN(119);
+	UT_PLAN(122);
 	UT_RUN(tt_top_tx_c0_producer_derives_base_from_native_full_image);
 	UT_RUN(tt_top_tx_c0_producer_derives_base_from_native_reuse);
 	UT_RUN(tt_top_tx_c0_producer_refuses_unqualified_raw_base);
@@ -5386,6 +5511,9 @@ main(void)
 	UT_RUN(tt_top_tx_c0_producer_refuses_exact_historical_terminal);
 	UT_RUN(tt_top_tx_c0_producer_requires_original_checkpoint);
 	UT_RUN(tt_top_tx_c0_producer_derives_top_from_native_bind);
+	UT_RUN(tt_top_tx_c0_producer_checks_original_native_bind_frame);
+	UT_RUN(tt_top_tx_c0_producer_checks_each_operations_own_top);
+	UT_RUN(tt_top_tx_c0_producer_checks_retained_history_frame);
 	UT_RUN(tt_top_tx_c0_producer_refuses_conflicting_bind_history);
 	UT_RUN(tt_top_tx_c0_producer_refuses_unproved_endpoint_coverage);
 	UT_RUN(tt_top_tx_c0_producer_derives_redo_from_original_coverage);

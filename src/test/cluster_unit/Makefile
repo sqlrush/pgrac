@@ -2891,12 +2891,14 @@ CLUSTER_SIDE_XACT_O = test_cluster_side_xact_product.o
 CLUSTER_REMOTE_XACT_IDENTITY_O = \
 	$(top_builddir)/src/backend/cluster/cluster_remote_xact_identity.o
 $(CLUSTER_SIDE_XACT_O): $(top_srcdir)/src/backend/cluster/cluster_side_xact.c \
+		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_xact.h \
 		$(top_srcdir)/src/include/cluster/cluster_space_storage.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DRF_SIDE_XACT_TESTING \
 		-ffunction-sections -fdata-sections -c $< -o $@
 # Track only this native payload allocator in the full XACT owner fixture.
 test_cluster_side_xact_budget_product.o: $(top_srcdir)/src/backend/cluster/cluster_side_xact.c \
+		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_xact.h \
 		$(top_srcdir)/src/include/cluster/cluster_space_storage.h Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DRF_SIDE_XACT_TESTING \

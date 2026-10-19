@@ -1017,7 +1017,10 @@ extern bool cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
  * a caller assertion for missing authority. Derive terminal_match from the
  * complete native lifecycle, sealed redo and exact physical ACTIVE readback,
  * together with the retained terminal checks below. The caller's terminal
- * bit is ignored. This does not discharge ordinary_effects.
+ * bit is ignored. Check original SIDE frame actor/top consistency in every
+ * retained source, including history, and any present native BIND actor
+ * against that BIND's own durable xid. These checks do not establish PAGE
+ * ownership, reconstruct a parent graph or discharge ordinary_effects.
  * Other proof/shape gates remain independent and required. An older ACTIVE
  * without a retained BIND remains blocked pending the original qualified
  * canonical-base producer;

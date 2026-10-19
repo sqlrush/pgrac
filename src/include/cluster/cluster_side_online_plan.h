@@ -69,6 +69,9 @@ typedef struct RfSideOnlineOperationV1 {
 	SCN control_scn;
 	RfSidePlanPurposeV1 purpose;
 	TransactionId source_xid;
+	/* Original WAL frame metadata, owned before the reader is reused.
+	 * An absent top is not proof of canonical operation ownership. */
+	TransactionId source_top_xid;
 	ClusterRecoveryTTAbortV1 recovery_abort;
 	uint16 recovery_target_source; /* retained source-set index, not streamed participant */
 } RfSideOnlineOperationV1;
