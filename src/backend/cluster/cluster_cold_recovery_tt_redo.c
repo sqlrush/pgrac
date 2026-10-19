@@ -581,7 +581,7 @@ cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
 {
 	ClusterColdTopTxC0ProducerResultV1 result = { 0 };
 	ClusterColdTopTxProofV1 qualified;
-	RfSideUndoHeaderImageV1 post_image;
+	RfSideUndoHeaderImageV1 post_image, base_image;
 	ClusterColdTtSlotInputV1 post_slot;
 	uint32 post_segment_index;
 	uint64 next_xid;
@@ -636,6 +636,17 @@ cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
 	qualified = *proof;
 	qualified.producer_top
 		= cold_top_tx_native_bind_v1(typed->side_plans[participant], &post_slot.key);
+	/* Reconstruct the complete generation from its retained native INIT or
+	 * REUSE, with no captured TT predecessor. A raw page and a caller's bit
+	 * cannot establish checkpoint coverage. Older ACTIVE generations without
+	 * this full lifecycle remain blocked until their original base owner can
+	 * supply the independent checkpoint coverage proof. */
+	qualified.qualified_base = rf_side_online_plan_prepare_undo_header_v1(
+								   typed->side_plans[participant], post_slot.key.owner_instance,
+								   post_slot.key.segment_id, NULL, &base_image)
+								   == RF_PAGE_PROOF_DETAIL_OK
+							   && base_image.has_full_image
+							   && memcmp(base_image.page.data, post_image.page.data, BLCKSZ) == 0;
 	result.active.key = post_slot.key;
 	if (!cluster_cold_top_tx_loser_v1(&result.active, &qualified, &result.loser)
 		|| !cluster_cold_top_tx_c0_v1(&result.loser, shape, next_xid, true, has_oldest_xid,

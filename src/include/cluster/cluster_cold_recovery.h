@@ -985,7 +985,7 @@ extern bool cluster_cold_typed_sources_current_v1(ClusterColdTypedV1 *typed,
  * and all original sources, then verify the selected sealed fold and exact
  * slot before-image. Require this original owner's captured native checkpoint
  * to agree with its exact source, ROOT and selected redo interval. This input
- * check does not qualify TT base coverage; qualified_base remains independent.
+ * check alone does not qualify TT base coverage.
  * Recheck the original post-redo physical namespace, inode identities and
  * retained TT/UNDO bytes before consuming cached images and before publishing
  * output. A mismatch invalidates that snapshot and leaves output zero. These
@@ -994,9 +994,15 @@ extern bool cluster_cold_typed_sources_current_v1(ClusterColdTypedV1 *typed,
  * still-held execution fence before reading cached inputs and before publishing
  * the candidate. This produces only an input descriptor, not C0 write authority.
  * Derive producer_top from this source's exact native
- * canonical BIND; the caller's producer_top bit is ignored. Other proof/shape
- * gates remain independent and required. An older ACTIVE without a retained
- * BIND remains blocked pending the original qualified canonical-base producer;
+ * canonical BIND; the caller's producer_top bit is ignored. Derive
+ * qualified_base from the same source's complete native INIT/REUSE header
+ * fold with no captured predecessor, requiring full-page agreement with the
+ * verified post-redo image. The caller's qualified_base bit is ignored.
+ * Older ACTIVE generations without this retained lifecycle remain blocked
+ * pending their original canonical checkpoint-base coverage producer.
+ * Other proof/shape gates remain independent and required. An older ACTIVE
+ * without a retained BIND remains blocked pending the original qualified
+ * canonical-base producer;
  * this does not introduce a BIND lifetime retention requirement.
  * Reject exact native COMMIT/TT_ABORT conflicts in every sealed source,
  * including history-only retained incarnations of the same thread. Absence
