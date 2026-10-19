@@ -623,11 +623,14 @@ WaitLatch(struct Latch *latch pg_attribute_unused(), int wakeEvents pg_attribute
 }
 static int injected_sleeps;
 static long injected_sleep_us;
+static void (*ready_sleep_interleave)(long);
 void
 pg_usleep(long microsec)
 {
 	injected_sleeps++;
 	injected_sleep_us = microsec;
+	if (ready_sleep_interleave != NULL)
+		ready_sleep_interleave(microsec);
 	if (admission_sleep_interleave != NULL) {
 		void (*callback)(void) = admission_sleep_interleave;
 
@@ -5296,10 +5299,69 @@ UT_TEST(test_whole_admission_has_one_wait_budget_and_keeps_real_loss)
 	cluster_shared_config = saved_shared;
 }
 
+static int ready_clock_case;
+static unsigned ready_clock_sleeps;
+
+static void
+ready_clock_step(long microsec)
+{
+	ready_clock_sleeps++;
+	mock_now += microsec;
+	fence_mock_storage_us += microsec;
+	if (ready_clock_sleeps == 1) {
+		if (ready_clock_case == 1)
+			mock_now -= 200000;
+		else if (ready_clock_case == 2)
+			mock_now += 200000;
+		else if (ready_clock_case == 4)
+			fence_mock_storage_us = 999999;
+	}
+	/* A late READY bounds the old wall-clock loop without letting a test
+	 * hang. It must not extend a 20ms wait to this 100ms completion. */
+	if (ready_clock_sleeps == 10)
+		pg_atomic_write_u32((pg_atomic_uint32 *)shmem_storage, CLUSTER_QVOTEC_READY);
+}
+
+UT_TEST(test_ready_wait_budget_uses_elapsed_monotonic_time)
+{
+	TimestampTz saved_wall = mock_now;
+	uint64 saved_mono = fence_mock_storage_us;
+
+	for (ready_clock_case = 0; ready_clock_case < 5; ready_clock_case++) {
+		mock_now = 1700000000000000LL;
+		fence_mock_storage_us = 1000000;
+		storage_clock_unavailable = ready_clock_case == 3;
+		ready_clock_sleeps = 0;
+		ready_sleep_interleave = ready_clock_step;
+		pg_atomic_write_u32((pg_atomic_uint32 *)shmem_storage, CLUSTER_QVOTEC_STARTING);
+		UT_ASSERT(!cluster_qvotec_wait_for_ready(20));
+		UT_ASSERT_EQ(ready_clock_sleeps, ready_clock_case == 3 ? 0 : ready_clock_case == 4 ? 1 : 2);
+	}
+	ready_sleep_interleave = NULL;
+	storage_clock_unavailable = false;
+	fence_mock_storage_us = saved_mono;
+	mock_now = saved_wall;
+}
+
+UT_TEST(test_ready_wait_keeps_terminal_and_zero_budget_decisions)
+{
+	const uint32 states[] = { CLUSTER_QVOTEC_READY, CLUSTER_QVOTEC_FAILED,
+		CLUSTER_QVOTEC_DOWN, CLUSTER_QVOTEC_STARTING };
+
+	for (unsigned i = 0; i < lengthof(states); i++) {
+		pg_atomic_write_u32((pg_atomic_uint32 *)shmem_storage, states[i]);
+		storage_clock_unavailable = true;
+		injected_sleeps = 0;
+		UT_ASSERT_EQ(cluster_qvotec_wait_for_ready(0), states[i] == CLUSTER_QVOTEC_READY);
+		UT_ASSERT_EQ(injected_sleeps, 0);
+	}
+	storage_clock_unavailable = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(105);
+	UT_PLAN(107);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
 	UT_RUN(test_qvotec_preserves_replacement_request_per_disk_fail_closed);
@@ -5405,6 +5467,8 @@ main(void)
 	UT_RUN(test_interleaved_timely_renewal_is_not_a_published_lease_loss);
 	UT_RUN(test_whole_admission_waits_for_publication_without_extending_lease);
 	UT_RUN(test_whole_admission_has_one_wait_budget_and_keeps_real_loss);
+	UT_RUN(test_ready_wait_budget_uses_elapsed_monotonic_time);
+	UT_RUN(test_ready_wait_keeps_terminal_and_zero_budget_decisions);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

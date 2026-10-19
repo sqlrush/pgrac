@@ -5160,23 +5160,36 @@ ClusterQvotecMain(void)
 bool
 cluster_qvotec_wait_for_ready(int timeout_ms)
 {
-	TimestampTz deadline;
+	uint64 started = 0;
+	uint64 previous = 0;
+	uint64 budget_us = timeout_ms > 0 ? (uint64)timeout_ms * 1000 : 0;
 
 	if (QvotecShmem == NULL)
 		return false;
 
-	deadline = GetCurrentTimestamp() + (TimestampTz)timeout_ms * 1000;
-
 	for (;;) {
 		uint32 s = pg_atomic_read_u32(&QvotecShmem->state);
+		uint64 now;
 
 		if (s == CLUSTER_QVOTEC_READY)
 			return true;
 		if (s == CLUSTER_QVOTEC_FAILED || s == CLUSTER_QVOTEC_DOWN)
 			return false;
 
-		if (GetCurrentTimestamp() >= deadline)
+		if (budget_us == 0)
 			return false;
+		/* This process-local wait budget is not the published voting lease.
+		 * Wall-clock corrections must neither extend it nor expire it early.
+		 * An unavailable or regressing elapsed clock cannot prove a budget.
+		 * Author: SqlRush <sqlrush@gmail.com> */
+		now = cluster_storage_quorum_now_us();
+		if (now == 0 || now < previous)
+			return false;
+		if (started == 0)
+			started = now;
+		if (now - started >= budget_us)
+			return false;
+		previous = now;
 
 		pg_usleep(10 * 1000); /* 10 ms */
 	}
