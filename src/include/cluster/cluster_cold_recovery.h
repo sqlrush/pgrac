@@ -1014,15 +1014,19 @@ extern bool cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
  * sealed_redo bit is ignored. Derive old_writer_isolated from the original
  * exact foreign target authority above and recheck it before output. The
  * caller's isolation bit is ignored; an own/history target cannot substitute
- * a caller assertion for missing authority. This does not discharge
- * ordinary_effects or terminal_match.
+ * a caller assertion for missing authority. Derive terminal_match from the
+ * complete native lifecycle, sealed redo and exact physical ACTIVE readback,
+ * together with the retained terminal checks below. The caller's terminal
+ * bit is ignored. This does not discharge ordinary_effects.
  * Other proof/shape gates remain independent and required. An older ACTIVE
  * without a retained BIND remains blocked pending the original qualified
  * canonical-base producer;
  * this does not introduce a BIND lifetime retention requirement.
  * Reject exact native COMMIT/TT_ABORT conflicts in every sealed source,
  * including history-only retained incarnations of the same thread. Absence
- * of those conflicts does not supply the independent terminal_match proof.
+ * of those conflicts alone does not supply the terminal proof. A native
+ * ABORT with this origin/raw xid additionally requires its original unique
+ * exact TT_ABORT pairing; an unqualified history-only ABORT remains blocked.
  * Target incarnation/claim remain bound to the original source.  A new
  * header with no original base requires the native full-image proof.
  * The original endpoint receipt must cover the unchanged complete source

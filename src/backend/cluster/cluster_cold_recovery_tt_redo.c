@@ -494,7 +494,9 @@ cold_top_tx_native_bind_v1(const RfSideOnlinePlanV1 *plan, const ClusterColdTtSl
 /* A retained incarnation is not folded into the current owner's header,
  * but its exact terminal still contradicts the same physical ACTIVE key.
  * Neither a different claim/epoch nor history_only erases that conflict.
- * Absence of these carriers does not supply the independent terminal proof. */
+ * A native ABORT has no physical TT key: require its original exact carrier
+ * when it could name this transaction. Absence of conflicting carriers alone
+ * is insufficient without the complete native lifecycle and redo below. */
 static bool
 cold_top_tx_terminals_compatible_v1(const ClusterColdTypedV1 *typed,
 									const ClusterColdTtSlotKeyV1 *key)
@@ -532,6 +534,25 @@ cold_top_tx_terminals_compatible_v1(const ClusterColdTypedV1 *typed,
 				terminal.slot_offset = abort->slot_offset;
 				terminal.slot_wrap = abort->wrap;
 				terminal.xid = abort->xid;
+			} else if (operation.kind == RF_SIDE_ONLINE_OPERATION_XACT
+					   && operation.xact.kind == RF_SIDE_XACT_ABORT) {
+				ClusterUndoDecoded abort;
+
+				if (operation.xact.origin_thread != key->owner_instance
+					|| operation.xact.xid != key->xid)
+					continue;
+				/* Never assign raw xid to a physical slot ourselves. The
+				 * original owner requires the unique immutable preceding
+				 * exact TT_ABORT and excludes intervening reuse/mutation.
+				 * It cannot qualify history-only ABORTs, which stay blocked. */
+				if (!rf_side_online_plan_abort_target_v1(plan, &operation, &abort))
+					return false;
+				terminal.owner_instance = abort.instance;
+				terminal.segment_id = abort.segment_id;
+				terminal.segment_generation = abort.expected_generation;
+				terminal.slot_offset = abort.slot_offset;
+				terminal.slot_wrap = abort.wrap;
+				terminal.xid = abort.xid;
 			} else
 				continue;
 			if (cold_top_tx_key_equal_v1(&terminal, key))
@@ -629,8 +650,6 @@ cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
 	if (!cluster_cold_typed_tt_after_redo_readback_v1(typed, participant, post_segment_index,
 													  &post_image))
 		return false;
-	if (!cold_top_tx_terminals_compatible_v1(typed, &post_slot.key))
-		return false;
 	/* The caller's producer_top bit is not an original producer fact. Only
 	 * this source's exact native BIND currently qualifies this gate here. */
 	qualified = *proof;
@@ -652,6 +671,13 @@ cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
 	 * establish completed sealed redo. The caller's bit cannot add or revoke
 	 * that fact. Atomic transaction effects remain an independent proof. */
 	qualified.sealed_redo = true;
+	/* The whole retained INIT/REUSE lifecycle reaches this exact physical
+	 * ACTIVE image after completed all-record redo. Together with the full
+	 * retained terminal check, this supplies the terminal proof on either
+	 * side of the selected redo cut. A missing lifecycle/coverage or an
+	 * ambiguous ABORT cannot be replaced by the caller's terminal bit. */
+	qualified.terminal_match = qualified.qualified_base && qualified.sealed_redo
+							   && cold_top_tx_terminals_compatible_v1(typed, &post_slot.key);
 	/* Only the original target owner can supply real old-writer isolation.
 	 * Its current pass-2 authority remains distinct from a C0 write grant. */
 	qualified.old_writer_isolated
