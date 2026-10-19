@@ -4256,6 +4256,100 @@ gcs_block_stage_forward_wait(ClusterGcsBlockOutstandingSlot *slot, int32 destina
 	return admitted;
 }
 
+/* A process-local observation of this legacy read-image operation, not a
+ * grant, a transport receipt or a replacement for the slot's authority. */
+typedef struct GcsReadImageTrace {
+	BufferTag tag;
+	PcmAuthoritySnapshot authority;
+	GcsBlockReplyHeader reply;
+	uint64 operation_request_id;
+	uint64 request_id;
+	uint64 request_epoch;
+	SCN pi_watermark;
+	TimestampTz deadline;
+	int attempt;
+	int32 holder_node;
+	bool image_only;
+	bool reply_known;
+	bool checksum_known;
+	uint32 checksum_actual;
+	bool installed;
+	bool durable_s;
+	bool retry_denied;
+} GcsReadImageTrace;
+
+static void
+gcs_block_read_image_trace(const volatile GcsReadImageTrace *trace, const char *event)
+{
+	static uint64 event_seq;
+	static uint64 critical_skipped;
+	GcsBlockReplyHeader reply_copy = trace->reply;
+	const GcsBlockReplyHeader *reply = &reply_copy;
+
+	if (!cluster_trace_normal_stop)
+		return;
+	/* Never allocate a LOG in a critical section.  Missing observations are
+	 * disclosed by the next safe event and cannot prove absent work. */
+	if (CritSectionCount != 0) {
+		if (critical_skipped != UINT64_MAX)
+			critical_skipped++;
+		return;
+	}
+	if (event_seq != UINT64_MAX)
+		event_seq++;
+	ereport(LOG,
+			(errmsg_internal(
+				 "PGRAC_FAMILY=READ_IMAGE event=%s event_seq=%llu sequence_scope=process "
+				 "sequence_domain=READ_IMAGE "
+				 "node_id=%d pid=%d procno=%d backend_id=%d wall_us=%lld monotonic_us=%llu "
+				 "identity_source=run_manifest run_id_known=0 process_incarnation_known=0 "
+				 "backend_type_known=0 transaction_identity_known=0 "
+				 "role=requester master_node=%d holder_node=%d holder_procno=%u "
+				 "holder_epoch=%llu holder_request_id=%llu "
+				 "transition_count=%llu pending_x_since_lsn=%llu "
+				 "authority_state=%d authority_x_holder=%d authority_s_bitmap=%u "
+				 "authority_pending_x_requester=%d authoritative=0 "
+				 "operation_request_id=%llu request_id=%llu request_epoch=%llu "
+				 "attempt=%d transition_id=%u spc=%u db=%u rel=%u fork=%d block=%u "
+				 "image_only=%d expected_pi_watermark=%llu deadline_wall_us=%lld "
+				 "reply_known=%d status=%d status_source=%s "
+				 "reply_request_id=%llu reply_epoch=%llu reply_sender=%d forwarding_master=%d "
+				 "reply_backend=%d reply_transition=%u page_lsn=%llu page_scn_known=0 read_scn_known=0 "
+				 "checksum_known=%d checksum_expected=%u checksum_actual=%u "
+				 "installed=%d durable_s=%d retry_denied=%d "
+				 "trace_critical_skipped=%llu trace_sequence_exhausted=%d",
+				 event, (unsigned long long)event_seq, cluster_node_id, (int)getpid(),
+				 MyProc != NULL ? MyProc->pgprocno : -1, (int)MyBackendId,
+				 (long long)GetCurrentTimestamp(),
+				 (unsigned long long)gcs_block_pcm_x_monotonic_us(), cluster_node_id,
+				 trace->holder_node, trace->authority.master_holder.procno,
+				 (unsigned long long)trace->authority.master_holder.cluster_epoch,
+				 (unsigned long long)trace->authority.master_holder.request_id,
+				 (unsigned long long)trace->authority.transition_count,
+				 (unsigned long long)trace->authority.pending_x_since_lsn,
+				 (int)trace->authority.state, trace->authority.x_holder_node,
+				 trace->authority.s_holders_bitmap, trace->authority.pending_x_requester_node,
+				 (unsigned long long)trace->operation_request_id,
+				 (unsigned long long)trace->request_id, (unsigned long long)trace->request_epoch,
+				 trace->attempt, (unsigned int)PCM_TRANS_N_TO_S,
+				 trace->tag.spcOid, trace->tag.dbOid, (unsigned int)trace->tag.relNumber,
+				 (int)trace->tag.forkNum, (unsigned int)trace->tag.blockNum,
+				 trace->image_only, (unsigned long long)trace->pi_watermark,
+				 (long long)trace->deadline, trace->reply_known,
+				 trace->reply_known ? (int)reply->status : -1,
+				 trace->reply_known ? "accepted_reply_header" : "requester_observation",
+				 trace->reply_known ? (unsigned long long)reply->request_id : 0,
+				 trace->reply_known ? (unsigned long long)reply->epoch : 0,
+				 trace->reply_known ? reply->sender_node : -1,
+				 trace->reply_known ? GcsBlockReplyHeaderGetForwardingMasterNode(reply) : -1,
+				 trace->reply_known ? reply->requester_backend_id : -1,
+				 trace->reply_known ? (unsigned int)reply->transition_id : 0,
+				 trace->reply_known ? (unsigned long long)reply->page_lsn : 0,
+				 trace->checksum_known, trace->reply_known ? reply->checksum : 0,
+				 trace->checksum_actual, trace->installed, trace->durable_s, trace->retry_denied,
+				 (unsigned long long)critical_skipped, event_seq == UINT64_MAX)));
+}
+
 bool
 cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthoritySnapshot *expected,
 											 bool force_one_shot, bool *out_retry_denied)
@@ -4273,6 +4367,8 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 	bool durable_s = false; /* spec-6.12a ㉕ — holder downgraded, we registered */
 	bool image_only;
 	int32 holder_node;
+	bool trace_enabled = cluster_trace_normal_stop;
+	volatile GcsReadImageTrace trace;
 
 	Assert(out_retry_denied != NULL);
 	if (buf == NULL || expected == NULL || out_retry_denied == NULL)
@@ -4294,12 +4390,22 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 						   cluster_node_id)));
 
 	tag = buf->tag;
+	if (trace_enabled) {
+		memset((void *)&trace, 0, sizeof(trace));
+		trace.tag = tag;
+		trace.authority = *expected;
+		trace.holder_node = holder_node;
+	}
 	/* P0-21 residual: the holder is an exact authority identity, not a route
 	 * hint.  A queue winner may have displaced a caller's optimistic sample
 	 * before this helper starts; let bufmgr abort/rearm GRANT_PENDING and
 	 * drive the new authority rather than sending to the stale node. */
 	if (!cluster_pcm_lock_authority_matches(tag, expected)) {
 		*out_retry_denied = true;
+		if (trace_enabled) {
+			trace.retry_denied = true;
+			gcs_block_read_image_trace(&trace, "authority.displaced");
+		}
 		return false;
 	}
 	image_only = force_one_shot || cluster_gcs_block_resource_x_local_s_barrier_active(tag);
@@ -4307,6 +4413,10 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 	/* expected_master == self:  the holder's reply carries forwarding_master =
 	 * self, which the HC108 authorized chain validates against this slot. */
 	slot = gcs_block_reserve_slot(tag, (uint8)PCM_TRANS_N_TO_S, cluster_node_id, &request_id);
+	if (trace_enabled) {
+		trace.operation_request_id = trace.request_id = request_id;
+		trace.image_only = image_only;
+	}
 	max_retries = cluster_gcs_block_retransmit_max_retries >= 0
 					  ? cluster_gcs_block_retransmit_max_retries
 					  : 4;
@@ -4315,6 +4425,9 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 	{
 		ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
 		TimestampTz deadline;
+
+		if (trace_enabled)
+			gcs_block_read_image_trace(&trace, "request.reserved");
 
 		for (retry_attempt = 0; retry_attempt <= max_retries; retry_attempt++) {
 			attempts = retry_attempt + 1;
@@ -4357,6 +4470,14 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 			slot->request_epoch = cluster_epoch_get_current();
 			slot->expected_master_node = cluster_node_id;
 			slot->stale = false;
+			if (trace_enabled) {
+				trace.request_id = request_id;
+				trace.request_epoch = slot->request_epoch;
+				trace.attempt = attempts;
+				trace.reply_known = trace.checksum_known = false;
+				trace.checksum_actual = 0;
+				trace.deadline = 0;
+			}
 			LWLockRelease(&blk->lock.lock);
 
 			memset(&fwd, 0, sizeof(fwd));
@@ -4376,6 +4497,10 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 		 * the registration is a local transition apply — no ACK wire. */
 			if (cluster_read_scache && !image_only)
 				GcsBlockForwardPayloadSetDowngradeRequest(&fwd, true);
+			if (trace_enabled) {
+				trace.pi_watermark = GcsBlockForwardPayloadGetExpectedPiWatermarkScn(&fwd);
+				gcs_block_read_image_trace(&trace, "attempt.armed");
+			}
 
 			if (retry_attempt > 0)
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->retransmit_send_count, 1);
@@ -4383,6 +4508,10 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
 			if (!gcs_block_stage_forward_wait(slot, holder_node, &fwd, expected,
 											  out_retry_denied)) {
+				if (trace_enabled) {
+					trace.retry_denied = *out_retry_denied;
+					gcs_block_read_image_trace(&trace, "forward.refused");
+				}
 				if (*out_retry_denied)
 					break;
 				ereport(
@@ -4396,9 +4525,15 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 						 "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 						 cluster_node_id)));
 			}
+			if (trace_enabled)
+				gcs_block_read_image_trace(&trace, "forward.enqueued");
 
 			deadline = GetCurrentTimestamp()
 					   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
+			if (trace_enabled) {
+				trace.deadline = deadline;
+				gcs_block_read_image_trace(&trace, "wait.begin");
+			}
 
 			ConditionVariablePrepareToSleep(&slot->reply_cv);
 			for (;;) {
@@ -4424,6 +4559,12 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 			}
 			ConditionVariableCancelSleep();
 			last_status = got_reply ? (int)slot->reply_header.status : -1;
+			if (trace_enabled) {
+				trace.reply_known = got_reply;
+				if (got_reply)
+					trace.reply = slot->reply_header;
+				gcs_block_read_image_trace(&trace, got_reply ? "wait.reply" : "wait.timeout");
+			}
 
 			if (got_reply
 				&& (slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
@@ -4432,10 +4573,22 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 							   == (uint8)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE))) {
 				uint32 expected = slot->reply_header.checksum;
 				uint32 got = gcs_block_compute_checksum(slot->reply_block_data);
+				if (trace_enabled) {
+					trace.checksum_known = true;
+					trace.checksum_actual = got;
+					gcs_block_read_image_trace(&trace,
+											   expected == got ? "checksum.accept" : "checksum.reject");
+				}
 
 				if (expected == got) {
+					if (trace_enabled)
+						gcs_block_read_image_trace(&trace, "install.begin");
 					gcs_block_install_reply_block(buf, slot->reply_block_data,
 												  (XLogRecPtr)slot->reply_header.page_lsn, slot);
+					if (trace_enabled) {
+						trace.installed = true;
+						gcs_block_read_image_trace(&trace, "install.end");
+					}
 					/* spec-5.14 D2 class 2: this node (local master) consumed the
 				 * remote holder's volatile image. */
 					gcs_block_stamp_touched(holder_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
@@ -4505,11 +4658,20 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 	PG_CATCH();
 	{
 		gcs_block_release_slot(slot);
+		if (trace_enabled)
+			gcs_block_read_image_trace(&trace, "slot.released.error");
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
 	gcs_block_release_slot(slot);
+	if (trace_enabled) {
+		trace.retry_denied = *out_retry_denied;
+		trace.installed = installed;
+		trace.durable_s = durable_s;
+		gcs_block_read_image_trace(&trace, "slot.released");
+		gcs_block_read_image_trace(&trace, "request.finish");
+	}
 
 	if (*out_retry_denied)
 		return false;
