@@ -3596,7 +3596,7 @@ UT_TEST(tt_top_tx_c0_producer_requires_original_checkpoint)
 			owner->checkpoint.checkpoint.redo = 200;
 			break;
 		case 17:
-			proof.sealed_redo = false;
+			f.typed.effects_receipt.proof.invalid = true;
 			break;
 		}
 		memset(&out, 0xa9, sizeof(out));
@@ -3819,7 +3819,7 @@ UT_TEST(tt_top_tx_c0_producer_refuses_unproved_endpoint_coverage)
 	tt_redo_destroy(&f);
 }
 
-UT_TEST(tt_top_tx_c0_producer_refuses_unproved_effect_coverage)
+UT_TEST(tt_top_tx_c0_producer_derives_redo_from_original_coverage)
 {
 	TtRedoFixture f;
 	ClusterColdTtSlotInputV1 input;
@@ -3842,9 +3842,12 @@ UT_TEST(tt_top_tx_c0_producer_refuses_unproved_effect_coverage)
 	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 	tt_top_tx_effects_complete(&f);
 	tt_top_tx_endpoints_complete(&f);
+	/* Original completion, not the caller's bit, proves sealed redo. */
+	proof.sealed_redo = false;
 	UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof, &shape,
 													   false, InvalidTransactionId,
 													   UINT64_C(0x12345678), &out));
+	proof.sealed_redo = true;
 	for (int fault = 0; fault < 4; fault++) {
 		ClusterColdEffectsReceiptV1 saved = f.typed.effects_receipt;
 
@@ -5223,7 +5226,7 @@ main(void)
 	UT_RUN(tt_top_tx_c0_producer_derives_top_from_native_bind);
 	UT_RUN(tt_top_tx_c0_producer_refuses_conflicting_bind_history);
 	UT_RUN(tt_top_tx_c0_producer_refuses_unproved_endpoint_coverage);
-	UT_RUN(tt_top_tx_c0_producer_refuses_unproved_effect_coverage);
+	UT_RUN(tt_top_tx_c0_producer_derives_redo_from_original_coverage);
 	UT_RUN(tt_top_tx_c0_producer_requires_complete_tt_inventory);
 	UT_RUN(tt_top_tx_c0_producer_requires_all_original_sources);
 	UT_RUN(tt_top_tx_c0_producer_checks_unselected_undo_effects);

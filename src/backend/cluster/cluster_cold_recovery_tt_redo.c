@@ -647,6 +647,11 @@ cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
 								   == RF_PAGE_PROOF_DETAIL_OK
 							   && base_image.has_full_image
 							   && memcmp(base_image.page.data, post_image.page.data, BLCKSZ) == 0;
+	/* The original all-record effects receipt, bound by the endpoint receipt
+	 * to this exact plan and source set, and the verified ordinary inventory
+	 * establish completed sealed redo. The caller's bit cannot add or revoke
+	 * that fact. Atomic transaction effects remain an independent proof. */
+	qualified.sealed_redo = true;
 	result.active.key = post_slot.key;
 	if (!cluster_cold_top_tx_loser_v1(&result.active, &qualified, &result.loser)
 		|| !cluster_cold_top_tx_c0_v1(&result.loser, shape, next_xid, true, has_oldest_xid,

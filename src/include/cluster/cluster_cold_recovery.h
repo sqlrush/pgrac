@@ -1000,6 +1000,11 @@ extern bool cluster_cold_typed_sources_current_v1(ClusterColdTypedV1 *typed,
  * verified post-redo image. The caller's qualified_base bit is ignored.
  * Older ACTIVE generations without this retained lifecycle remain blocked
  * pending their original canonical checkpoint-base coverage producer.
+ * Derive sealed_redo from the original all-record completion receipt,
+ * bound to this exact plan and complete source set by the all-thread
+ * endpoint receipt, with the verified ordinary inventory. The caller's
+ * sealed_redo bit is ignored. This does not discharge ordinary_effects,
+ * terminal_match or old_writer_isolated.
  * Other proof/shape gates remain independent and required. An older ACTIVE
  * without a retained BIND remains blocked pending the original qualified
  * canonical-base producer;
