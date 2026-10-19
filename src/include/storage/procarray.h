@@ -59,10 +59,11 @@ extern TransactionId GetOldestTransactionIdConsideredRunning(void);
 extern TransactionId GetOldestActiveTransactionId(void);
 #ifdef USE_PGRAC_CLUSTER
 /*
- * Observation only: N is a widening anchor, not a legal allocation future.
- * Includes every top/prepared xid. Failure invalidates both outputs.
+ * Observation only: capture N and a durable-lease future under XidGenLock,
+ * then include every top/prepared xid. Failure invalidates all three outputs.
  */
 extern bool ProcArrayGetActiveFullXidSample(FullTransactionId *reference_full,
+										FullTransactionId *future_full,
 										FullTransactionId *active_min);
 #endif
 extern TransactionId GetOldestSafeDecodingTransactionId(bool catalogOnly);

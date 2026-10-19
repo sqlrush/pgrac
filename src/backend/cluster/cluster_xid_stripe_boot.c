@@ -94,6 +94,7 @@ typedef enum StripeMailboxOp {
 typedef struct ClusterXidStripeLease {
 	pg_atomic_uint64 floor_full;
 	pg_atomic_uint64 limit_full;
+	pg_atomic_uint64 published_incarnation; /* durable lease observation */
 	pg_atomic_uint32 failed;
 	ConditionVariable changed;
 	uint64 publisher_incarnation; /* QVOTEC-only; zero on a fresh shmem boot */
@@ -203,6 +204,7 @@ cluster_xid_stripe_shmem_init(void)
 		LWLockInitialize(&StripeBootShmem->lock, LWTRANCHE_CLUSTER_XID_STRIPE);
 		pg_atomic_init_u64(&StripeLease->floor_full, 0);
 		pg_atomic_init_u64(&StripeLease->limit_full, 0);
+		pg_atomic_init_u64(&StripeLease->published_incarnation, 0);
 		pg_atomic_init_u32(&StripeLease->failed, 0);
 		ConditionVariableInit(&StripeLease->changed);
 		StripeBootShmem->disk_state = CLUSTER_XID_STRIPE_DISK_UNKNOWN;
@@ -657,6 +659,77 @@ cluster_xid_stripe_lease_ready(FullTransactionId candidate)
 	return floor != 0 && value >= floor && value < limit;
 }
 
+/*
+ * Read the existing allocation promises at the same XidGenLock cut as N.
+ * This neither allocates nor advances a promise. Claim ownership persists
+ * across boots; only the durable lease publisher must match this incarnation.
+ * The returned lower bound is an input, not a complete freeze certificate.
+ */
+bool
+cluster_xid_stripe_sample_future(FullTransactionId reference, FullTransactionId *future)
+{
+	uint64 incarnation, floor, limit, base, value;
+	bool claimed;
+	int slot;
+	FullTransactionId candidate;
+
+	if (future != NULL)
+		*future = InvalidFullTransactionId;
+	if (future == NULL || !LWLockHeldByMe(XidGenLock) || !cluster_enabled || !cluster_shared_catalog
+		|| !cluster_xid_striping || StripeBootShmem == NULL || StripeLease == NULL
+		|| !FullTransactionIdIsValid(reference)
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(reference))
+		|| !cluster_qvotec_in_quorum())
+		return false;
+	slot = cluster_xid_allocation_slot();
+	incarnation = cluster_qvotec_get_self_incarnation();
+	if (slot < 0 || slot >= CLUSTER_XID_STRIDE || incarnation == 0)
+		return false;
+
+	LWLockAcquire(&StripeBootShmem->lock, LW_SHARED);
+	claimed = StripeBootShmem->disk_state == CLUSTER_XID_STRIPE_DISK_PUBLISHED
+			  && StripeBootShmem->floor_full != 0 && StripeBootShmem->epoch != 0
+			  && StripeBootShmem->generation != 0
+			  && StripeBootShmem->slot_state == CLUSTER_XID_STRIPE_SLOT_MINE
+			  && StripeBootShmem->my_slot_claimed && StripeBootShmem->my_slot_floor_full != 0
+			  && StripeBootShmem->my_owner_incarnation != 0;
+	base = Max(U64FromFullTransactionId(reference), StripeBootShmem->floor_full);
+	base = Max(base, StripeBootShmem->my_slot_floor_full);
+	LWLockRelease(&StripeBootShmem->lock);
+	if (!claimed)
+		return false;
+
+	/* QVOTEC publishes floor/identity before limit, after majority durability.
+	 * A fresh publisher revokes the old limit before changing that floor. */
+	limit = pg_atomic_read_u64(&StripeLease->limit_full);
+	pg_read_barrier();
+	floor = pg_atomic_read_u64(&StripeLease->floor_full);
+	if (floor == 0 || limit <= floor
+		|| pg_atomic_read_u64(&StripeLease->published_incarnation) != incarnation)
+		return false;
+	base = Max(base, floor);
+	base = Max(base, pg_atomic_read_u64(&StripeBootShmem->herding_floor_full));
+	candidate = cluster_xid_next_striped_full(FullTransactionIdFromU64(base), slot);
+	value = U64FromFullTransactionId(candidate);
+	if (value < base || !FullTransactionIdIsValid(candidate)
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(candidate)) || value >= limit
+		|| cluster_xid_stripe_window_exceeded(candidate)
+		|| (EpochFromFullTransactionId(candidate) > 0 && !cluster_xid_wrap_barrier_passed()))
+		return false;
+
+	/* Reject a revocation or incarnation change observed during this read.
+	 * Later sample completion still needs its own full identity fence. */
+	pg_read_barrier();
+	if (pg_atomic_read_u32(&StripeLease->failed) != 0
+		|| pg_atomic_read_u64(&StripeLease->limit_full) != limit
+		|| pg_atomic_read_u64(&StripeLease->floor_full) != floor
+		|| pg_atomic_read_u64(&StripeLease->published_incarnation) != incarnation
+		|| cluster_qvotec_get_self_incarnation() != incarnation || !cluster_qvotec_in_quorum())
+		return false;
+	*future = candidate;
+	return true;
+}
+
 /* Sole writer: the existing QVOTEC poll. A failed partial write retains the
  * exact proposed interval; a new process burns it instead of reissuing it.
  * The caller supplies its latest native/herding minimum, never a grant.
@@ -680,8 +753,10 @@ stripe_lease_tick(const int *fds, int n_disks, uint64 minimum)
 		return;
 	fresh = StripeLease->publisher_incarnation != incarnation;
 	limit = pg_atomic_read_u64(&StripeLease->limit_full);
-	if (fresh)
+	if (fresh) {
 		pg_atomic_write_u64(&StripeLease->limit_full, 0);
+		pg_write_barrier();
+	}
 	state = stripe_read_slot_all(fds, n_disks, cluster_node_id, &rec, STRIPE_READ_UPDATE);
 	if (state == STRIPE_READ_UNREADABLE) {
 		/* A partial first CLAIM may already have published MINE. Complete
@@ -773,6 +848,7 @@ stripe_lease_tick(const int *fds, int n_disks, uint64 minimum)
 	if (written < n_disks / 2 + 1)
 		return;
 	pg_atomic_write_u64(&StripeLease->floor_full, pending_floor);
+	pg_atomic_write_u64(&StripeLease->published_incarnation, incarnation);
 	pg_write_barrier();
 	pg_atomic_write_u64(&StripeLease->limit_full, pending_limit);
 	StripeLease->publisher_incarnation = incarnation;

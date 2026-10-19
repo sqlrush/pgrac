@@ -153,6 +153,10 @@ extern void cluster_mxid_stripe_lazy_latch(void);
  */
 extern FullTransactionId cluster_xid_stripe_my_slot_floor(void);
 
+/* Read-only future input. Caller holds XidGenLock while capturing reference;
+ * false clears *future. No allocation, waiting for a lease, or F publication. */
+extern bool cluster_xid_stripe_sample_future(FullTransactionId reference,
+											 FullTransactionId *future);
 /* Shared allocation consumes only majority-durable reservations. Waiting
  * callers must release XidGenLock and rederive the candidate on return. */
 extern bool cluster_xid_stripe_lease_ready(FullTransactionId candidate);

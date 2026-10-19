@@ -3186,33 +3186,46 @@ GetOldestActiveTransactionId(void)
  *
  * This is one input to the cluster active scan, not freeze authority. An
  * exited PGPROC may still have census protection, which must be scanned
- * afterwards. N is not a promise about future allocation, and recovery's
+ * afterwards. The existing durable lease supplies the future input at the
+ * same XidGenLock cut as N; N alone is only a widening anchor. Recovery's
  * unclaimed transactions cannot be proved from this native array.
  */
 bool
 ProcArrayGetActiveFullXidSample(FullTransactionId *reference_full,
+							   FullTransactionId *future_full,
 							   FullTransactionId *active_min)
 {
 	FullTransactionId reference;
+	FullTransactionId future;
 	FullTransactionId minimum;
 	bool		valid = true;
 	int			index;
 
 	if (reference_full != NULL)
 		*reference_full = InvalidFullTransactionId;
+	if (future_full != NULL)
+		*future_full = InvalidFullTransactionId;
 	if (active_min != NULL)
 		*active_min = InvalidFullTransactionId;
-	if (reference_full == NULL || active_min == NULL || reference_full == active_min ||
+	if (reference_full == NULL || future_full == NULL || active_min == NULL ||
+		reference_full == future_full || reference_full == active_min || future_full == active_min ||
 		RecoveryInProgress() || procArray == NULL || ProcGlobal == NULL ||
 		ProcGlobal->xids == NULL || ShmemVariableCache == NULL)
 		return false;
 
-	/* The reader releases XidGenLock before we acquire ProcArrayLock. */
-	reference = ReadNextFullTransactionId();
-	if (!FullTransactionIdIsValid(reference) ||
-		!TransactionIdIsNormal(XidFromFullTransactionId(reference)))
+	/* Capture both inputs before releasing XidGenLock. Raising a floor after
+	 * this cut must not hide an older allocation from the PGPROC scan. */
+	LWLockAcquire(XidGenLock, LW_SHARED);
+	reference = ShmemVariableCache->nextXid;
+	valid = FullTransactionIdIsValid(reference) &&
+		TransactionIdIsNormal(XidFromFullTransactionId(reference)) &&
+		cluster_xid_stripe_sample_future(reference, &future);
+	LWLockRelease(XidGenLock);
+	if (!valid || !FullTransactionIdIsValid(future) ||
+		!TransactionIdIsNormal(XidFromFullTransactionId(future)) ||
+		FullTransactionIdPrecedes(future, reference))
 		return false;
-	minimum = reference;
+	minimum = future;
 
 	LWLockAcquire(ProcArrayLock, LW_SHARED);
 	if (procArray->numProcs < 0 || procArray->numProcs > procArray->maxProcs)
@@ -3247,6 +3260,7 @@ ProcArrayGetActiveFullXidSample(FullTransactionId *reference_full,
 		return false;
 
 	*reference_full = reference;
+	*future_full = future;
 	*active_min = minimum;
 	return true;
 }

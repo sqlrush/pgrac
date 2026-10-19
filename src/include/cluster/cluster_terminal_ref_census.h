@@ -753,6 +753,8 @@ typedef enum ClusterCtrcActiveScanStatus {
 typedef struct ClusterCtrcActiveScan {
 	ClusterCtrcActiveScanStatus status;
 	FullTransactionId reference_full;
+	/* Worker input; zero for a standalone census-only scan. */
+	FullTransactionId future_full;
 	FullTransactionId min_full;
 	uint64 next_index;
 	uint64 total_entries;

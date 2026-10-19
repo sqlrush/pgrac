@@ -8737,9 +8737,12 @@ test_cluster_xid_stripe_evidence.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     /^cluster_xid_stripe_herding_tick\(/ { print "void"; emit=1; herd++ } \
 	     /^cluster_xid_stripe_herding_floor\(/ { print "FullTransactionId"; emit=1; floor++ } \
 	     /^cluster_xid_stripe_lease_ready\(/ { print "bool"; emit=1; ready++ } \
+	     /^cluster_xid_stripe_sample_future\(/ { print "bool"; emit=1; future++ } \
+	     /^cluster_xid_stripe_window_exceeded\(/ { print "bool"; emit=1; window++ } \
+	     /^cluster_xid_wrap_barrier_passed\(/ { print "bool"; emit=1; wrap++ } \
 	     /^cluster_xid_stripe_wait_lease\(/ { print "void"; emit=1; wait++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (history != 5 || lookup != 1 || types != 2 || zero != 1 || reads != 2 || leases != 1 || pointer != 1 || actions != 2 || ready != 1 || boots != 1 || bootptr != 1 || writers != 2 || herd != 1 || floor != 1 || wait != 1) exit 1 }' $< > $@.tmp
+	     END { if (history != 5 || lookup != 1 || types != 2 || zero != 1 || reads != 2 || leases != 1 || pointer != 1 || actions != 2 || ready != 1 || future != 1 || window != 1 || wrap != 1 || boots != 1 || bootptr != 1 || writers != 2 || herd != 1 || floor != 1 || wait != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_xid_stripe_evidence: test_cluster_xid_stripe_evidence.c unit_test.h \

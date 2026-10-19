@@ -604,18 +604,21 @@ undo_cleaner_run_pass(bool *out_work_remaining, bool maintenance_due)
 		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
 		return false;
 	}
-	/* Capture N then all top/prepared PGPROCs before the census. Neither
-	 * input grants freeze authority. Keep this N and minimum throughout an
+	/* Capture N/future then all top/prepared PGPROCs before the census. No
+	 * input grants freeze authority. Keep these inputs throughout an
 	 * incomplete round, including continuations at a busy census entry. */
 	if (undo_cleaner_active_scan.status != CTRC_ACTIVE_SCAN_INCOMPLETE) {
 		FullTransactionId reference;
+		FullTransactionId future;
 		FullTransactionId active_min;
 
 		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
 		undo_cleaner_active_scan.status = CTRC_ACTIVE_SCAN_INVALID;
-		if (ProcArrayGetActiveFullXidSample(&reference, &active_min)
-			&& cluster_ctrc_active_scan_begin(&undo_cleaner_active_scan, reference))
+		if (ProcArrayGetActiveFullXidSample(&reference, &future, &active_min)
+			&& cluster_ctrc_active_scan_begin(&undo_cleaner_active_scan, reference)) {
+			undo_cleaner_active_scan.future_full = future;
 			undo_cleaner_active_scan.min_full = active_min;
+		}
 	}
 	cluster_ctrc_active_scan_step(&undo_cleaner_active_scan);
 	undo_cleaner_active_scan_pending
