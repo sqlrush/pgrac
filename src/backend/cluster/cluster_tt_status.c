@@ -67,6 +67,7 @@
 #include "cluster/cluster_tt_durable.h" /* spec-3.11 D5: overlay-miss durable lookup */
 #include "cluster/cluster_tt_slot.h"	/* cluster_tt_slot_id_to_offset, TT_SLOTS_PER_SEGMENT */
 #include "cluster/cluster_tt_status.h"
+#include "cluster/cluster_tx_identity_trace.h"
 #include "cluster/cluster_xid_stripe.h"
 
 #ifdef USE_PGRAC_CLUSTER
@@ -911,8 +912,16 @@ cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus s
 	 * only after the exact holder status is visible.  The prepared-commit
 	 * resolver below follows the same ordering for its batch of exact keys.
 	 */
-	if (status == CLUSTER_TT_STATUS_COMMITTED || status == CLUSTER_TT_STATUS_ABORTED)
+	if (status == CLUSTER_TT_STATUS_COMMITTED || status == CLUSTER_TT_STATUS_ABORTED) {
+		if (cluster_trace_tx_identity) {
+			ClusterTxIdentityTrace row;
+
+			cluster_tx_identity_trace_source(&row, key);
+			row.status = status;
+			cluster_tx_identity_trace_emit(CLTXID_TERMINAL, &row);
+		}
 		cluster_txw_wake_waiters(key);
+	}
 
 	pg_atomic_fetch_add_u64(&ClusterTTStatusState->install_count, 1);
 	return true;
@@ -1016,8 +1025,16 @@ cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
 	}
 	LWLockRelease(ClusterTTStatusLock);
 
-	for (int i = 0; i < resolved; i++)
+	for (int i = 0; i < resolved; i++) {
+		if (cluster_trace_tx_identity) {
+			ClusterTxIdentityTrace row;
+
+			cluster_tx_identity_trace_source(&row, &wake_keys[i]);
+			row.status = CLUSTER_TT_STATUS_COMMITTED;
+			cluster_tx_identity_trace_emit(CLTXID_TERMINAL, &row);
+		}
 		cluster_txw_wake_waiters(&wake_keys[i]);
+	}
 	pfree(wake_keys);
 
 	if (resolved > 0)

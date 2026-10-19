@@ -58,6 +58,7 @@
 #include "cluster/cluster_undo_cleaner.h"	 /* S3 forensics — cleaner stall state in errdetail */
 #include "cluster/cluster_undo_record_api.h" /* spec-3.12 D2b cluster_undo_tt_rollover_locked */
 #include "cluster/cluster_tt_status.h"
+#include "cluster/cluster_tx_identity_trace.h"
 #include "cluster/cluster_tt_status_hint.h"		/* spec-3.2 D4 wire emit append */
 #include "cluster/cluster_uba.h"				/* P0-33 exact data-ref alias */
 #include "cluster/storage/cluster_undo_alloc.h" /* cluster_undo_active_segment_for_node_or_create */
@@ -179,6 +180,33 @@ static uint32 cluster_tt_local_binding_count = 0;
 static uint32 cluster_tt_local_binding_capacity = 0;
 /* Modifier admission held from the commit stamp's stage to its apply. */
 static ClusterSemanticAdmissionToken cluster_tt_local_commit_admission;
+
+/* Observe the captured binding, never look up CURRENT to fill missing identity. */
+static void
+trace_binding(ClusterTxIdentityTraceKind kind, const ClusterTTLocalBinding *binding,
+			  uint32 source_segment, const UBA *uba, ClusterTTStatus status)
+{
+	ClusterTxIdentityTrace row;
+
+	if (!cluster_trace_tx_identity)
+		return;
+	cluster_tx_identity_trace_canonical(
+		&row, cluster_node_id, binding->top_xid, binding->segment_id,
+		binding->slot_offset, binding->wrap, binding->segment_generation,
+		binding->publish_state == CLUSTER_CANONICAL_TXN_PUBLISHED, binding->cluster_epoch);
+	if (source_segment != 0) {
+		row.source_known = true;
+		row.source_segment = source_segment;
+		row.source_slot_id = cluster_tt_slot_offset_to_id(binding->slot_offset);
+	}
+	if (uba != NULL) {
+		row.uba_known = true;
+		row.uba0 = uba->raw[0];
+		row.uba1 = uba->raw[1];
+	}
+	row.status = status;
+	cluster_tx_identity_trace_emit(kind, &row);
+}
 
 static int
 cluster_tt_local_find_binding(TransactionId xid)
@@ -387,6 +415,7 @@ cluster_tt_local_reserve_binding(TransactionId top_xid, uint32 *out_segment_id,
 		b->wrap = wrap;
 		b->publish_state = CLUSTER_CANONICAL_TXN_RESERVED;
 		b->cluster_epoch = (uint32)cluster_epoch_get_current();
+		trace_binding(CLTXID_RESERVE, b, 0, NULL, CLUSTER_TT_STATUS_UNKNOWN);
 
 		*out_segment_id = seg;
 		*out_slot_offset = off;
@@ -546,7 +575,8 @@ build_local_key(TransactionId xid, ClusterTTStatusKey *out)
 
 /* Install and emit one already-minted exact key. */
 static void
-install_key(const ClusterTTStatusKey *key, ClusterTTStatus status, SCN commit_scn)
+install_key(const ClusterTTLocalBinding *binding, const ClusterTTStatusKey *key,
+			ClusterTTStatus status, SCN commit_scn)
 {
 	ClusterTTStatusSourceRequest source_request;
 	ClusterTTStatusSourceResult source_result;
@@ -564,6 +594,8 @@ install_key(const ClusterTTStatusKey *key, ClusterTTStatus status, SCN commit_sc
 
 	if (!installed)
 		return;
+	if (status == CLUSTER_TT_STATUS_COMMITTED || status == CLUSTER_TT_STATUS_ABORTED)
+		trace_binding(CLTXID_LOCAL_TERMINAL, binding, key->undo_segment_id, NULL, status);
 
 #ifdef USE_ASSERT_CHECKING
 	{
@@ -613,7 +645,7 @@ install_binding_aliases(const ClusterTTLocalBinding *binding, ClusterTTStatus st
 		ClusterTTStatusKey key;
 
 		if (build_binding_key(binding, binding->active_alias_segments[i], &key))
-			install_key(&key, status, commit_scn);
+			install_key(binding, &key, status, commit_scn);
 	}
 }
 
@@ -655,7 +687,7 @@ install_status(TransactionId xid, ClusterTTStatus status, SCN commit_scn)
 	 * carries commit_scn to (a) self-consumer N7 lookup and (b) the wire
 	 * emit path which will ship it to peers in V2 hints (D8).
 	 */
-	install_key(&key, status, commit_scn);
+	install_key(binding, &key, status, commit_scn);
 	install_binding_aliases(binding, status, commit_scn);
 }
 
@@ -746,6 +778,7 @@ cluster_tt_local_forget_unpublished_reservation(TransactionId top_xid)
 		|| binding->active_alias_count != 0 || binding->active_alias_capacity != 0)
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cannot discard a published or unproved canonical reservation")));
+	trace_binding(CLTXID_RETRY, binding, 0, NULL, CLUSTER_TT_STATUS_UNKNOWN);
 	memmove(binding, binding + 1,
 			(cluster_tt_local_binding_count - (uint32)idx - 1) * sizeof(*binding));
 	cluster_tt_local_binding_count--;
@@ -861,6 +894,7 @@ cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 					binding->segment_generation = segment_generation;
 					binding->active_lsn = active_lsn;
 					binding->publish_state = CLUSTER_CANONICAL_TXN_PUBLISHED;
+					trace_binding(CLTXID_ACTIVE, binding, 0, NULL, CLUSTER_TT_STATUS_IN_PROGRESS);
 					if (!cluster_tt_local_copy_published(binding, binding_out))
 						ereport(ERROR,
 								(errcode(ERRCODE_DATA_CORRUPTED),
@@ -1217,6 +1251,7 @@ cluster_tt_local_record_data_active(TransactionId xid, UBA uba)
 			}
 			MemoryContextSwitchTo(oldcxt);
 			binding->active_alias_segments[binding->active_alias_count++] = (uint16)record_segment;
+			trace_binding(CLTXID_ALIAS, binding, record_segment, &uba, CLUSTER_TT_STATUS_IN_PROGRESS);
 		}
 	}
 

@@ -74,6 +74,7 @@
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_xnode_profile.h" /* spec-5.59 D2/D3/D4 profiling buckets */
 #include "cluster/cluster_update_trace.h"
+#include "cluster/cluster_tx_identity_trace.h"
 #include "cluster/cluster_xnode_lever.h" /* spec-6.12a — downgrade counters */
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_guc.h"
@@ -8584,8 +8585,13 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 			gcs_block_current_mx_origin_prepare_reply(context);
 		else if (context->undo_data_fetch)
 			reply_size = gcs_block_r4_undo_origin_prepare_reply(context);
-		else
+		else {
+			/* The origin already resolved this DATA locator and released its
+			 * block-zero guard. Never enrich a foreign requester by raw xid. */
+			cluster_tx_identity_trace_origin(&context->locator, &context->resolution,
+				cluster_node_id, request_epoch);
 			gcs_block_r4_tx_origin_prepare_reply(context);
+		}
 		send_result = gcs_block_send_envelope_or_loopback(
 			PGRAC_IC_MSG_GCS_BLOCK_REPLY, requester_node, context->reply_frame, reply_size);
 		cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY, send_result);

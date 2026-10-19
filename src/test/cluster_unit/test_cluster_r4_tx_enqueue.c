@@ -138,6 +138,20 @@ static bool test_cancel_token_pending;
 static uint64 test_current_mx_stats[CMX_STAT_COUNT];
 static sigjmp_buf test_fail_stop_stack;
 
+bool cluster_trace_tx_identity = false;
+static ClusterTxIdentityTraceKind test_trace_kinds[16];
+static ClusterTxIdentityTrace test_trace_rows[16];
+static unsigned test_trace_count;
+
+void
+cluster_tx_identity_trace_emit(ClusterTxIdentityTraceKind kind, const ClusterTxIdentityTrace *row)
+{
+	UT_ASSERT(cluster_trace_tx_identity);
+	UT_ASSERT(test_trace_count < lengthof(test_trace_rows));
+	test_trace_kinds[test_trace_count] = kind;
+	test_trace_rows[test_trace_count++] = *row;
+}
+
 PGPROC *MyProc;
 PROC_HDR *ProcGlobal;
 Latch *MyLatch;
@@ -551,6 +565,8 @@ reset_fixture(void)
 {
 	ClusterTxwShmem *state = (ClusterTxwShmem *)test_txw_storage;
 
+	cluster_trace_tx_identity = false;
+	test_trace_count = 0;
 	memset(test_txw_storage, 0, sizeof(test_txw_storage));
 	state->nslots = TEST_NSLOTS;
 	pg_atomic_init_u32(&state->active_waiters, 0);
@@ -769,6 +785,7 @@ UT_TEST(test_live_post_registration_terminal_race_resolves)
 	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
 
 	reset_fixture();
+	cluster_trace_tx_identity = true;
 	script_resolve(0, CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_RESOLVE_NONE);
 	script_resolve(1, CLUSTER_TX_ABORTED, CLUSTER_TX_RESOLVE_NONE);
 	UT_ASSERT_EQ(cluster_tx_enqueue_wait_exact(&locator, 1000, &reason), CLUSTER_TXW_RESOLVED);
@@ -789,6 +806,17 @@ UT_TEST(test_live_post_registration_terminal_race_resolves)
 	UT_ASSERT_EQ(test_wfg_blocker.cluster_epoch, TEST_EPOCH);
 	UT_ASSERT_EQ((int)test_wfg_blocker.xid, (int)locator.xid);
 	UT_ASSERT_EQ(test_wait_latch_calls, 0);
+	UT_ASSERT_EQ(test_trace_count, 2);
+	UT_ASSERT_EQ(test_trace_kinds[0], CLTXID_WAIT_TARGET);
+	UT_ASSERT_EQ(test_trace_kinds[1], CLTXID_WAIT_END);
+	UT_ASSERT(test_trace_rows[0].target_known);
+	UT_ASSERT(!test_trace_rows[0].tt_known);
+	UT_ASSERT(!test_trace_rows[0].generation_known);
+	UT_ASSERT_EQ(test_trace_rows[0].uba0, locator.uba.raw[0]);
+	UT_ASSERT_EQ(test_trace_rows[0].uba1, locator.uba.raw[1]);
+	UT_ASSERT_EQ(test_trace_rows[0].itl_wrap, locator.tt_wrap);
+	UT_ASSERT_EQ(test_trace_rows[0].wait_seq, test_trace_rows[1].wait_seq);
+	UT_ASSERT_EQ(test_trace_rows[1].status, CLUSTER_TXW_RESOLVED);
 	assert_slot_clean();
 }
 
@@ -1143,6 +1171,7 @@ UT_TEST(test_hint_waker_matches_source_discriminant_only)
 	ClusterTTStatusKey source = test_source_key();
 
 	reset_fixture();
+	cluster_trace_tx_identity = true;
 	memcpy(&ClusterTxw->slots[0], &source, sizeof(source));
 	ClusterTxw->slots[0].waiting = 1;
 	memcpy(&ClusterTxw->slots[1], &source, sizeof(source));
@@ -1152,6 +1181,16 @@ UT_TEST(test_hint_waker_matches_source_discriminant_only)
 	UT_ASSERT_EQ(test_set_latch_calls[0], 1);
 	UT_ASSERT_EQ(test_set_latch_calls[1], 0);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterTxw->wakeup_count), 1);
+	UT_ASSERT_EQ(test_trace_count, 2);
+	UT_ASSERT_EQ(test_trace_kinds[0], CLTXID_WAKE);
+	UT_ASSERT_EQ(test_trace_rows[0].peer_procno, 0);
+	UT_ASSERT_EQ(test_trace_rows[0].source_segment, source.undo_segment_id);
+	UT_ASSERT_EQ(test_trace_rows[0].source_slot_id, source.tt_slot_id);
+	UT_ASSERT(!test_trace_rows[0].tt_known);
+	UT_ASSERT_EQ(test_trace_kinds[1], CLTXID_WAKE_SUMMARY);
+	UT_ASSERT_EQ(test_trace_rows[1].count, 1);
+	UT_ASSERT_EQ(test_trace_rows[1].skipped_targets, 1);
+	UT_ASSERT_EQ(test_trace_rows[1].omitted, 0);
 }
 
 UT_TEST(test_current_mx_waker_counts_only_current_source)
@@ -1159,6 +1198,7 @@ UT_TEST(test_current_mx_waker_counts_only_current_source)
 	ClusterTTStatusKey source = test_source_key();
 
 	reset_fixture();
+	cluster_trace_tx_identity = true;
 	UT_ASSERT(txw_slot_set(0, &source, true));
 	UT_ASSERT(txw_slot_set(1, &source, false));
 	cluster_txw_wake_waiters(&source);
@@ -1166,6 +1206,13 @@ UT_TEST(test_current_mx_waker_counts_only_current_source)
 	UT_ASSERT_EQ(test_set_latch_calls[1], 1);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterTxw->wakeup_count), 2);
 	UT_ASSERT_EQ(test_current_mx_stats[CMX_STAT_WAKEUP], 1);
+	UT_ASSERT_EQ(test_trace_count, 3);
+	UT_ASSERT_EQ(test_trace_rows[0].peer_procno, 0);
+	UT_ASSERT_EQ(test_trace_rows[1].peer_procno, 1);
+	UT_ASSERT_EQ(test_trace_rows[0].status, CLUSTER_TXW_SLOT_SOURCE_CURRENT_MX);
+	UT_ASSERT_EQ(test_trace_rows[1].status, CLUSTER_TXW_SLOT_SOURCE);
+	UT_ASSERT_EQ(test_trace_kinds[2], CLTXID_WAKE_SUMMARY);
+	UT_ASSERT_EQ(test_trace_rows[2].count, 2);
 }
 
 UT_TEST(test_current_mx_source_wait_consumes_deadlock_token_after_cleanup)

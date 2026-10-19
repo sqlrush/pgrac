@@ -16,12 +16,20 @@
 #include "cluster/cluster_visibility_trace_filter.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_update_trace.h"
+#include "cluster/cluster_tx_identity_trace.h"
 #include "cluster/cluster_xnode_profile.h"
 #include "cluster/cluster_storage_quorum.h"
 
 /* Profiling-aware product objects can link without a diagnostic backend.
  * Dedicated trace tests override these defaults with the real collector. */
 bool cluster_update_trace_enabled __attribute__((weak)) = false;
+bool cluster_trace_tx_identity __attribute__((weak)) = false;
+void __attribute__((weak))
+cluster_tx_identity_trace_emit(ClusterTxIdentityTraceKind kind pg_attribute_unused(),
+								const ClusterTxIdentityTrace *row pg_attribute_unused())
+{
+	abort();
+}
 bool cluster_trace_visibility_enabled __attribute__((weak)) = false;
 ClusterVisibilityTraceFilter cluster_trace_visibility_filter __attribute__((weak)) = { 0 };
 NodeId __attribute__((weak))

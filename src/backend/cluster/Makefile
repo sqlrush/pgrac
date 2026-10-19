@@ -363,6 +363,7 @@ OBJS = \
 	cluster_xnode_lever.o \
 	cluster_xnode_profile.o \
 	cluster_update_trace.o \
+	cluster_tx_identity_trace.o \
 	storage/cluster_shared_fs.o \
 	storage/cluster_shared_fs_stub.o \
 	storage/cluster_shared_fs_local.o \

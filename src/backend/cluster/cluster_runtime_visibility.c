@@ -71,6 +71,7 @@
 #include "cluster/cluster_tt_local.h"
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_tt_status.h"
+#include "cluster/cluster_tx_identity_trace.h"
 #include "cluster/cluster_tx_resolve.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_authority.h" /* dead-owner serve authority (D4-4) */
@@ -2574,6 +2575,7 @@ recheck:
 		}
 		if (reason_out != NULL)
 			*reason_out = CLUSTER_TX_RESOLVE_NONE;
+		cluster_tx_identity_trace_origin(locator, out, origin, admission->formation_epoch);
 		return outcome;
 	}
 

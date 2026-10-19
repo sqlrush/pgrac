@@ -57,6 +57,7 @@
 #include "cluster/cluster_multixact_current_stats.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_status.h"
+#include "cluster/cluster_tx_identity_trace.h"
 #include "cluster/cluster_tx_enqueue.h"
 #include "cluster/cluster_xnode_profile.h" /* diagnostic wait phase trace */
 
@@ -498,6 +499,14 @@ cluster_tx_enqueue_wait_internal(const ClusterTTStatusKey *holder_key, int effec
 	 */
 	PG_TRY();
 	{
+		if (cluster_trace_tx_identity) {
+			ClusterTxIdentityTrace row;
+
+			cluster_tx_identity_trace_source(&row, holder_key);
+			row.wait_seq = tx_wfg_waiter.wait_seq;
+			row.status = slot_kind;
+			cluster_tx_identity_trace_emit(CLTXID_WAIT_SOURCE, &row);
+		}
 		for (;;) {
 			long wait_ms;
 
@@ -601,6 +610,14 @@ cluster_tx_enqueue_wait_internal(const ClusterTTStatusKey *holder_key, int effec
 		txw_exact_wfg_cancel(&tx_wfg_waiter);
 	cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
 	txw_slot_clear(procno, slot_kind);
+	if (cluster_trace_tx_identity) {
+		ClusterTxIdentityTrace row;
+
+		cluster_tx_identity_trace_source(&row, holder_key);
+		row.wait_seq = tx_wfg_waiter.wait_seq;
+		row.status = result;
+		cluster_tx_identity_trace_emit(CLTXID_WAIT_END, &row);
+	}
 	return result;
 }
 
@@ -721,6 +738,13 @@ cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator, int effective_tim
 				break;
 			}
 			wfg_registered = true;
+			if (cluster_trace_tx_identity) {
+				ClusterTxIdentityTrace row;
+
+				cluster_tx_identity_trace_target(&row, &target_locator, blocker_node, formation_epoch);
+				row.wait_seq = (uint64)wait_seq;
+				cluster_tx_identity_trace_emit(CLTXID_WAIT_TARGET, &row);
+			}
 			if (cluster_epoch_get_current() != formation_epoch) {
 				final_reason = CLUSTER_TX_RESOLVE_RF_DEFERRED;
 				break;
@@ -803,6 +827,14 @@ cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator, int effective_tim
 		txw_exact_cleanup(procno, CLUSTER_TXW_SLOT_TARGET, (bool)slot_registered,
 						  (bool)wait_state_published, (bool)wfg_registered, formation_epoch, my_xid,
 						  (uint64)wait_seq);
+		if (slot_registered && cluster_trace_tx_identity) {
+			ClusterTxIdentityTrace row;
+
+			cluster_tx_identity_trace_target(&row, &target_locator, blocker_node, formation_epoch);
+			row.wait_seq = (uint64)wait_seq;
+			row.status = result;
+			cluster_tx_identity_trace_emit(CLTXID_WAIT_END, &row);
+		}
 	}
 	PG_END_TRY();
 
@@ -843,30 +875,60 @@ cluster_tx_enqueue_wait_current_mx(const ClusterTTStatusKey *holder_key, int eff
 void
 cluster_txw_wake_waiters(const ClusterTTStatusKey *holder_key)
 {
+	/* Snapshot actual latch recipients, then log outside the original lock.
+	 * A bounded snapshot never invents a recipient or changes wake matching. */
+	struct { uint32 procno; uint32 kind; } recipients[128];
+	uint32 copied = 0;
+	uint32 matched = 0;
+	uint32 skipped_targets = 0;
+	bool trace = cluster_trace_tx_identity;
 	int i;
 	int nslots;
 
 	if (ClusterTxw == NULL || holder_key == NULL)
 		return;
 
-	/* Fast path: this runs on every terminal TT install (commit/abort hot
-	 * path) — skip the LWLock + scan entirely when nobody is waiting. */
-	if (pg_atomic_read_u32(&ClusterTxw->active_waiters) == 0)
-		return;
-
-	LWLockAcquire(&ClusterTxw->lock, LW_SHARED);
-	nslots = ClusterTxw->nslots;
-	for (i = 0; i < nslots; i++) {
-		if ((ClusterTxw->slots[i].waiting == CLUSTER_TXW_SLOT_SOURCE
-			 || ClusterTxw->slots[i].waiting == CLUSTER_TXW_SLOT_SOURCE_CURRENT_MX)
-			&& txw_key_equal(&ClusterTxw->slots[i].identity.source_key, holder_key)) {
-			pg_atomic_fetch_add_u64(&ClusterTxw->wakeup_count, 1);
-			if (ClusterTxw->slots[i].waiting == CLUSTER_TXW_SLOT_SOURCE_CURRENT_MX)
-				cluster_multixact_current_stats_bump(CMX_STAT_WAKEUP);
-			SetLatch(&GetPGProcByNumber(i)->procLatch);
+	/* Preserve the original no-waiter fast path, including with trace on. */
+	if (pg_atomic_read_u32(&ClusterTxw->active_waiters) != 0) {
+		LWLockAcquire(&ClusterTxw->lock, LW_SHARED);
+		nslots = ClusterTxw->nslots;
+		for (i = 0; i < nslots; i++) {
+			if (trace && ClusterTxw->slots[i].waiting == CLUSTER_TXW_SLOT_TARGET)
+				skipped_targets++;
+			if ((ClusterTxw->slots[i].waiting == CLUSTER_TXW_SLOT_SOURCE
+				 || ClusterTxw->slots[i].waiting == CLUSTER_TXW_SLOT_SOURCE_CURRENT_MX)
+				&& txw_key_equal(&ClusterTxw->slots[i].identity.source_key, holder_key)) {
+				pg_atomic_fetch_add_u64(&ClusterTxw->wakeup_count, 1);
+				if (ClusterTxw->slots[i].waiting == CLUSTER_TXW_SLOT_SOURCE_CURRENT_MX)
+					cluster_multixact_current_stats_bump(CMX_STAT_WAKEUP);
+				SetLatch(&GetPGProcByNumber(i)->procLatch);
+				if (trace) {
+					matched++;
+					if (copied < lengthof(recipients)) {
+						recipients[copied].procno = i;
+						recipients[copied++].kind = ClusterTxw->slots[i].waiting;
+					}
+				}
+			}
 		}
+		LWLockRelease(&ClusterTxw->lock);
 	}
-	LWLockRelease(&ClusterTxw->lock);
+	if (trace) {
+		ClusterTxIdentityTrace row;
+
+		cluster_tx_identity_trace_source(&row, holder_key);
+		for (i = 0; i < copied; i++) {
+			row.peer_procno = recipients[i].procno;
+			row.status = recipients[i].kind;
+			cluster_tx_identity_trace_emit(CLTXID_WAKE, &row);
+		}
+		row.peer_procno = UINT32_MAX;
+		row.status = 0;
+		row.count = matched;
+		row.skipped_targets = skipped_targets;
+		row.omitted = matched - copied;
+		cluster_tx_identity_trace_emit(CLTXID_WAKE_SUMMARY, &row);
+	}
 }
 
 
