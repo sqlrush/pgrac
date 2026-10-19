@@ -1,16 +1,17 @@
 /*-------------------------------------------------------------------------
  * test_cluster_write_preflight.c
- *    Run native executor and COPY entries before child work can write or lock.
+ *    Run native write entries before child work can write or lock.
  *
  * Portions Copyright (c) 2026, pgrac contributors
  * Author: SqlRush <sqlrush@gmail.com>
  * IDENTIFICATION
  *    src/test/cluster_unit/test_cluster_write_preflight.c
  *
- * The complete InitPlan, DoCopy, BeginCopyFrom and heap preflight/guard bodies are
- * extracted verbatim. Relation lookup, canonical publication, COPY options,
- * default planning and input are explicit boundaries. This fixture does not
- * execute the COPY row loop or simulate BIND durability/transaction cleanup.
+ * Complete InitPlan, DoCopy, BeginCopyFrom, ExecSimpleRelation* and heap
+ * preflight/guard bodies are extracted verbatim. Relation lookup, canonical
+ * publication, COPY planning/input, triggers, expressions and tuple/index writes
+ * are explicit boundaries. This fixture does not execute the COPY row loop or
+ * simulate BIND durability, replication admission or transaction cleanup.
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -19,8 +20,10 @@
 #include "access/heapam.h"
 #include "access/sysattr.h"
 #include "access/table.h"
+#include "access/tableam.h"
 #include "access/visibilitymap.h"
 #include "access/xact.h"
+#include "catalog/catalog.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_class.h"
@@ -29,7 +32,9 @@
 #include "cluster/cluster_tt_local.h"
 #include "commands/copyfrom_internal.h"
 #include "commands/progress.h"
+#include "commands/trigger.h"
 #include "executor/executor.h"
+#include "executor/nodeModifyTable.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -82,6 +87,12 @@ static Expr copy_where_expr;
 static List *copy_where_list;
 static ParseNamespaceItem copy_namespace;
 static RTEPermissionInfo copy_permission;
+static bool replica_expect_binding, replica_identity_ok, replica_skip, replica_trigger_error;
+static unsigned replica_identity_checks, replica_before, replica_generated, replica_constraints;
+static unsigned replica_partitions, replica_tuples, replica_indexes, replica_after, replica_unbound;
+static TupleConstr replica_tuple_constraints;
+static TriggerDesc replica_triggers;
+static const CmdType replica_commands[] = { CMD_INSERT, CMD_UPDATE, CMD_DELETE };
 
 void *
 palloc(Size size)
@@ -623,6 +634,128 @@ EndCopyTo(CopyToState copy)
 	abort();
 }
 
+/* User work and storage are boundaries; all must see the early shared BIND. */
+static void
+replica_work(unsigned *counter)
+{
+	(*counter)++;
+	if (replica_expect_binding && bindings != 1)
+		replica_unbound++;
+}
+
+bool
+IsCatalogRelation(Relation rel)
+{
+	return RelationGetRelid(rel) < FirstNormalObjectId;
+}
+
+void
+CheckCmdReplicaIdentity(Relation rel, CmdType cmd)
+{
+	replica_identity_checks++;
+	if (!replica_identity_ok)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("fixture replica identity failure")));
+}
+
+static bool
+replica_before_trigger(void)
+{
+	replica_work(&replica_before);
+	if (replica_trigger_error)
+		ereport(ERROR, (errcode(ERRCODE_RAISE_EXCEPTION), errmsg("fixture trigger failure")));
+	return !replica_skip;
+}
+
+bool
+ExecBRInsertTriggers(EState *es, ResultRelInfo *info, TupleTableSlot *slot)
+{
+	return replica_before_trigger();
+}
+
+bool
+ExecBRUpdateTriggers(EState *es, EPQState *epq, ResultRelInfo *info, ItemPointer tid, HeapTuple old,
+					 TupleTableSlot *slot, TM_Result *result, TM_FailureData *failure)
+{
+	return replica_before_trigger();
+}
+
+bool
+ExecBRDeleteTriggers(EState *es, EPQState *epq, ResultRelInfo *info, ItemPointer tid, HeapTuple old,
+					 TupleTableSlot **slot, TM_Result *result, TM_FailureData *failure)
+{
+	return replica_before_trigger();
+}
+
+void
+ExecComputeStoredGenerated(ResultRelInfo *info, EState *es, TupleTableSlot *slot, CmdType cmd)
+{
+	replica_work(&replica_generated);
+}
+
+void
+ExecConstraints(ResultRelInfo *info, TupleTableSlot *slot, EState *es)
+{
+	replica_work(&replica_constraints);
+}
+
+bool
+ExecPartitionCheck(ResultRelInfo *info, TupleTableSlot *slot, EState *es, bool emit)
+{
+	replica_work(&replica_partitions);
+	return true;
+}
+
+void
+simple_table_tuple_insert(Relation rel, TupleTableSlot *slot)
+{
+	replica_work(&replica_tuples);
+}
+
+void
+simple_table_tuple_update(Relation rel, ItemPointer tid, TupleTableSlot *slot, Snapshot snapshot,
+						  TU_UpdateIndexes *indexes)
+{
+	replica_work(&replica_tuples);
+	*indexes = TU_All;
+}
+
+void
+simple_table_tuple_delete(Relation rel, ItemPointer tid, Snapshot snapshot)
+{
+	replica_work(&replica_tuples);
+}
+
+List *
+ExecInsertIndexTuples(ResultRelInfo *info, TupleTableSlot *slot, EState *es, bool update,
+					  bool no_dup, bool *conflict, List *arbiters, bool summarizing)
+{
+	replica_work(&replica_indexes);
+	return list_make1_oid(123);
+}
+
+void
+ExecARInsertTriggers(EState *es, ResultRelInfo *info, TupleTableSlot *slot, List *indexes,
+					 TransitionCaptureState *capture)
+{
+	replica_work(&replica_after);
+}
+
+void
+ExecARUpdateTriggers(EState *es, ResultRelInfo *info, ResultRelInfo *src, ResultRelInfo *dst,
+					 ItemPointer tid, HeapTuple old, TupleTableSlot *slot, List *indexes,
+					 TransitionCaptureState *capture, bool cross_partition)
+{
+	replica_work(&replica_after);
+}
+
+void
+ExecARDeleteTriggers(EState *es, ResultRelInfo *info, ItemPointer tid, HeapTuple old,
+					 TransitionCaptureState *capture, bool cross_partition)
+{
+	replica_work(&replica_after);
+}
+
 #include "../../backend/nodes/list.c"
 #include "test_cluster_write_preflight.inc"
 
@@ -668,6 +801,65 @@ reset(void)
 	MemSet(&copy_permission, 0, sizeof(copy_permission));
 	relations[0].rd_att = palloc0(offsetof(TupleDescData, attrs) + sizeof(FormData_pg_attribute));
 	relations[0].rd_att->natts = 1;
+}
+
+static void
+replica_reset(void)
+{
+	reset();
+	replica_expect_binding = replica_identity_ok = true;
+	replica_skip = replica_trigger_error = false;
+	replica_identity_checks = replica_before = replica_generated = replica_constraints = 0;
+	replica_partitions = replica_tuples = replica_indexes = replica_after = replica_unbound = 0;
+	MemSet(&replica_tuple_constraints, 0, sizeof(replica_tuple_constraints));
+	replica_tuple_constraints.has_generated_stored = true;
+	relations[0].rd_att->constr = &replica_tuple_constraints;
+	forms[0].relispartition = true;
+	MemSet(&replica_triggers, 0, sizeof(replica_triggers));
+	replica_triggers.trig_insert_before_row = true;
+	replica_triggers.trig_update_before_row = true;
+	replica_triggers.trig_delete_before_row = true;
+}
+
+static void
+replica_run(CmdType cmd)
+{
+	ResultRelInfo info = { .ri_RelationDesc = &relations[0],
+						   .ri_TrigDesc = &replica_triggers,
+						   .ri_NumIndices = 1 };
+	TupleTableSlot slot = { 0 }, search = { 0 };
+	EPQState epq = { 0 };
+
+	switch (cmd) {
+	case CMD_INSERT:
+		ExecSimpleRelationInsert(&info, &estate, &slot);
+		break;
+	case CMD_UPDATE:
+		ExecSimpleRelationUpdate(&info, &estate, &epq, &search, &slot);
+		break;
+	case CMD_DELETE:
+		ExecSimpleRelationDelete(&info, &estate, &epq, &search);
+		break;
+	default:
+		abort();
+	}
+}
+
+static bool
+replica_refused(CmdType cmd)
+{
+	volatile bool refused = false;
+
+	PG_TRY();
+	{
+		replica_run(cmd);
+	}
+	PG_CATCH();
+	{
+		refused = true;
+	}
+	PG_END_TRY();
+	return refused;
 }
 
 static bool
@@ -1179,11 +1371,161 @@ UT_TEST(copy_sql_where_error_retains_original_binding)
 	UT_ASSERT_EQ(copy_unbound_work + copy_runs, 0);
 }
 
+UT_TEST(replica_entries_bind_before_all_user_and_storage_work)
+{
+	for (unsigned i = 0; i < lengthof(replica_commands); ++i) {
+		CmdType cmd = replica_commands[i];
+
+		replica_reset();
+		replica_run(cmd);
+		UT_ASSERT_EQ(replica_identity_checks, 1);
+		UT_ASSERT_EQ(allocations, 1);
+		UT_ASSERT_EQ(prepares, 1);
+		UT_ASSERT_EQ(bindings, 1);
+		UT_ASSERT_EQ(replica_before, 1);
+		UT_ASSERT_EQ(replica_generated, cmd == CMD_DELETE ? 0 : 1);
+		UT_ASSERT_EQ(replica_constraints, cmd == CMD_DELETE ? 0 : 1);
+		UT_ASSERT_EQ(replica_partitions, cmd == CMD_DELETE ? 0 : 1);
+		UT_ASSERT_EQ(replica_tuples, 1);
+		UT_ASSERT_EQ(replica_indexes, cmd == CMD_DELETE ? 0 : 1);
+		UT_ASSERT_EQ(replica_after, 1);
+		UT_ASSERT_EQ(replica_unbound, 0);
+	}
+}
+
+UT_TEST(replica_trigger_skipped_rows_still_have_original_binding)
+{
+	for (unsigned i = 0; i < lengthof(replica_commands); ++i) {
+		CmdType cmd = replica_commands[i];
+
+		replica_reset();
+		replica_skip = true;
+		replica_run(cmd);
+		UT_ASSERT_EQ(bindings, 1);
+		UT_ASSERT_EQ(replica_before, 1);
+		UT_ASSERT_EQ(replica_generated + replica_constraints + replica_partitions + replica_tuples
+						 + replica_indexes + replica_after,
+					 0);
+		UT_ASSERT_EQ(replica_unbound, 0);
+	}
+}
+
+UT_TEST(replica_subtransactions_refuse_before_bind_or_user_work)
+{
+	for (unsigned i = 0; i < lengthof(replica_commands); ++i) {
+		CmdType cmd = replica_commands[i];
+
+		replica_reset();
+		in_child = true;
+		UT_ASSERT(replica_refused(cmd));
+		UT_ASSERT_EQ(reported_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+		UT_ASSERT_EQ(allocations + prepares + bindings + replica_before + replica_tuples, 0);
+	}
+}
+
+UT_TEST(replica_bind_failure_prevents_user_work)
+{
+	for (unsigned i = 0; i < lengthof(replica_commands); ++i) {
+		CmdType cmd = replica_commands[i];
+
+		replica_reset();
+		publish_ok = false;
+		UT_ASSERT(replica_refused(cmd));
+		UT_ASSERT_EQ(reported_code, ERRCODE_DATA_CORRUPTED);
+		UT_ASSERT_EQ(prepares, 1);
+		UT_ASSERT_EQ(bindings + replica_before + replica_generated + replica_tuples, 0);
+	}
+}
+
+UT_TEST(replica_private_temp_and_disabled_targets_keep_native_path)
+{
+	for (unsigned i = 0; i < lengthof(replica_commands); ++i) {
+		CmdType cmd = replica_commands[i];
+
+		for (unsigned kind = 0; kind < 3; ++kind) {
+			replica_reset();
+			replica_expect_binding = false;
+			if (kind == 0)
+				relations[0].rd_locator.relNumber = 1249;
+			else if (kind == 1)
+				forms[0].relpersistence = RELPERSISTENCE_TEMP;
+			else
+				cluster_enabled = false;
+			replica_run(cmd);
+			UT_ASSERT_EQ(allocations + prepares + bindings, 0);
+			UT_ASSERT_EQ(replica_before, 1);
+			UT_ASSERT_EQ(replica_tuples, 1);
+			UT_ASSERT_EQ(replica_after, 1);
+		}
+	}
+}
+
+UT_TEST(replica_existing_top_xid_reuses_original_binding)
+{
+	for (unsigned i = 0; i < lengthof(replica_commands); ++i) {
+		CmdType cmd = replica_commands[i];
+
+		replica_reset();
+		top_xid = current_xid = 400;
+		bindings = 1;
+		replica_run(cmd);
+		UT_ASSERT_EQ(allocations, 0);
+		UT_ASSERT_EQ(prepares, 1);
+		UT_ASSERT_EQ(bindings, 1);
+		UT_ASSERT_EQ(replica_unbound, 0);
+	}
+}
+
+UT_TEST(replica_identity_refuses_before_bind_and_user_work)
+{
+	for (unsigned i = 0; i < lengthof(replica_commands); ++i) {
+		CmdType cmd = replica_commands[i];
+
+		replica_reset();
+		replica_identity_ok = false;
+		UT_ASSERT(replica_refused(cmd));
+		UT_ASSERT_EQ(reported_code, ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE);
+		UT_ASSERT_EQ(replica_identity_checks, 1);
+		UT_ASSERT_EQ(allocations + prepares + bindings + replica_before + replica_tuples, 0);
+	}
+}
+
+UT_TEST(replica_trigger_error_retains_original_transaction_binding)
+{
+	for (unsigned i = 0; i < lengthof(replica_commands); ++i) {
+		CmdType cmd = replica_commands[i];
+
+		replica_reset();
+		replica_trigger_error = true;
+		UT_ASSERT(replica_refused(cmd));
+		UT_ASSERT_EQ(reported_code, ERRCODE_RAISE_EXCEPTION);
+		UT_ASSERT_EQ(top_xid, 400);
+		UT_ASSERT_EQ(current_xid, 400);
+		UT_ASSERT_EQ(bindings, 1);
+		UT_ASSERT_EQ(replica_before, 1);
+		UT_ASSERT_EQ(replica_unbound + replica_tuples + replica_after, 0);
+	}
+}
+
+UT_TEST(replica_mismatched_xid_refuses_before_prepare_or_user_work)
+{
+	for (unsigned i = 0; i < lengthof(replica_commands); ++i) {
+		CmdType cmd = replica_commands[i];
+
+		replica_reset();
+		top_xid = 400;
+		current_xid = 401;
+		UT_ASSERT(replica_refused(cmd));
+		UT_ASSERT_EQ(reported_code, ERRCODE_INTERNAL_ERROR);
+		UT_ASSERT_EQ(allocations + prepares + bindings + replica_before + replica_tuples, 0);
+	}
+}
+
 int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(37);
+	UT_PLAN(46);
 	UT_RUN(zero_row_dml_binds_before_the_child_plan);
 	UT_RUN(modifying_cte_binds_before_any_subplan);
 	UT_RUN(row_locks_bind_before_rowmark_and_child_initialization);
@@ -1221,6 +1563,15 @@ main(void)
 	UT_RUN(copy_sql_where_readonly_refuses_before_folding_or_bind);
 	UT_RUN(copy_sql_where_bind_failure_prevents_folding);
 	UT_RUN(copy_sql_where_error_retains_original_binding);
+	UT_RUN(replica_entries_bind_before_all_user_and_storage_work);
+	UT_RUN(replica_trigger_skipped_rows_still_have_original_binding);
+	UT_RUN(replica_subtransactions_refuse_before_bind_or_user_work);
+	UT_RUN(replica_bind_failure_prevents_user_work);
+	UT_RUN(replica_private_temp_and_disabled_targets_keep_native_path);
+	UT_RUN(replica_existing_top_xid_reuses_original_binding);
+	UT_RUN(replica_identity_refuses_before_bind_and_user_work);
+	UT_RUN(replica_trigger_error_retains_original_transaction_binding);
+	UT_RUN(replica_mismatched_xid_refuses_before_prepare_or_user_work);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

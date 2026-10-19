@@ -9283,7 +9283,8 @@ test_cluster_write_preflight.inc: $(top_srcdir)/src/backend/access/heap/heapam.c
 		$(top_srcdir)/src/backend/executor/execMain.c \
 		$(top_srcdir)/src/backend/commands/copyfrom.c \
 		$(top_srcdir)/src/backend/access/heap/visibilitymap.c \
-		$(top_srcdir)/src/backend/commands/copy.c Makefile
+		$(top_srcdir)/src/backend/commands/copy.c \
+		$(top_srcdir)/src/backend/executor/execReplication.c Makefile
 	awk '/^(cluster_heap_itl_relation_route|cluster_itl_write_path_enabled)\(/ \
 	     { print "static bool"; emit=1; n++ } \
 	     /^cluster_heap_preflight_write\(/ { print "bool"; emit=1; n++ } \
@@ -9297,6 +9298,9 @@ test_cluster_write_preflight.inc: $(top_srcdir)/src/backend/access/heap/heapam.c
 	     emit { print } /^}/ { emit=0 } END { if(n!=1) exit 1 }' $(word 4,$^) >> $@.tmp
 	awk '/^DoCopy\(/ { print "void"; emit=1; n++ } \
 	     emit { print } /^}/ { emit=0 } END { if(n!=1) exit 1 }' $(word 5,$^) >> $@.tmp
+	awk '/^(ExecSimpleRelationInsert|ExecSimpleRelationUpdate|ExecSimpleRelationDelete)\(/ \
+	     { print "void"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if(n!=3) exit 1 }' $(word 6,$^) >> $@.tmp
 	mv $@.tmp $@
 
 test_cluster_write_preflight: test_cluster_write_preflight.c unit_test.h \
