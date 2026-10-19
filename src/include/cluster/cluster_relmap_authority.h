@@ -229,24 +229,28 @@ cluster_relmap_authority_v2_init_image(const ClusterRelmapV2Namespace *identity,
 									 void *output, size_t output_len);
 
 /*
- * V2 storage primitives; not wired into the live v1 publisher.  The caller
- * serializes the namespace with its relmap lock; entry checks that lock and
- * binds expected to the selected authority.  Read exposes committed data and
- * pending obligations separately.  A degraded read never proves the pending
- * set complete.
+ * V2 storage primitives; not wired into the live v1 publisher.  The full-pair
+ * read is a raw substrate for exclusively owned, unpublished cold BUILDING
+ * restore and exposes committed data and pending obligations separately; it
+ * does not establish runtime serialization by itself.  Published runtime
+ * readers must use the committed-only facade below, which checks the caller's
+ * namespace relmap X lock.  A degraded read never proves the pending set
+ * complete.
  */
 extern ClusterRelmapV2PairResult
 cluster_relmap_authority_v2_read(const ClusterRelmapV2Namespace *expected,
 								ClusterRelmapV2View *output);
 
 /*
- * Dormant committed-only v2 reader facade.  A complete, identical pair is
- * required; on success only the committed image and generation are copied to
- * the outputs.  Pending obligations are intentionally not exposed through
- * this API, while retention/recovery callers that need them must use the full
- * v2 read above.  A degraded or incomplete pair clears both outputs and
- * returns false.  There is no live v2 caller or activation through this
- * primitive.
+ * Dormant committed-only v2 reader facade.  The caller must hold the
+ * namespace relmap X lock for the entire call; the entry check prevents a
+ * runtime reader from racing a publication or terminal cleanup.  A complete,
+ * identical pair is required; on success only the committed image and
+ * generation are copied to the outputs.  Pending obligations are intentionally
+ * not exposed through this API, while cold BUILDING restore callers that need
+ * them must use the full v2 read above.  A degraded or incomplete pair clears
+ * both outputs and returns false.  There is no live v2 caller or activation
+ * through this primitive.
  */
 extern bool cluster_relmap_authority_v2_read_committed(const ClusterRelmapV2Namespace *expected,
 												RelMapFile *map_out,

@@ -590,10 +590,14 @@ cluster_relmap_authority_v2_read_committed(const ClusterRelmapV2Namespace *expec
 {
 	ClusterRelmapV2View view;
 
-	if (expected == NULL || map_out == NULL || generation_out == NULL)
+	if (map_out == NULL || generation_out == NULL)
 		return false;
 	memset(map_out, 0, sizeof(*map_out));
 	*generation_out = 0;
+	/* The full pair reader is also used by unpublished cold BUILDING restore.
+	 * Only this committed runtime facade requires the namespace X lock. */
+	if (expected == NULL || !cluster_relmap_authority_x_held())
+		return false;
 	if (cluster_relmap_authority_v2_read(expected, &view) != CLUSTER_RELMAP_V2_PAIR_VALID
 		|| !view.pending_complete)
 		return false;

@@ -451,6 +451,19 @@ stage(const ClusterRelmapV2Namespace *ns)
 	return stage_request(ns, 8, &owner);
 }
 
+static bool
+read_committed_under_x(const ClusterRelmapV2Namespace *ns, RelMapFile *map,
+		uint64 *generation)
+{
+	bool was_held = relmap_x_held;
+	bool result;
+
+	relmap_x_held = true;
+	result = cluster_relmap_authority_v2_read_committed(ns, map, generation);
+	relmap_x_held = was_held;
+	return result;
+}
+
 UT_TEST(test_stage_both_copies_before_success)
 {
 	ClusterRelmapV2View view;
@@ -492,7 +505,7 @@ UT_TEST(test_committed_reader_hides_pending_and_rejects_degraded_pair)
 	UT_ASSERT(stage(&identity));
 	memset(&map, 0xa5, sizeof(map));
 	generation = UINT64CONST(99);
-	UT_ASSERT(cluster_relmap_authority_v2_read_committed(&identity, &map, &generation));
+	UT_ASSERT(read_committed_under_x(&identity, &map, &generation));
 	UT_ASSERT_EQ(generation, UINT64CONST(7));
 	UT_ASSERT_EQ(map.mappings[0].mapfilenumber, 40000);
 	memset(&zero, 0, sizeof(zero));
@@ -506,9 +519,35 @@ UT_TEST(test_committed_reader_hides_pending_and_rejects_degraded_pair)
 	write_copy(0, bytes, sizeof(bytes));
 	memset(&map, 0xa5, sizeof(map));
 	generation = UINT64CONST(99);
+	UT_ASSERT(!read_committed_under_x(&identity, &map, &generation));
+	UT_ASSERT_EQ(generation, UINT64CONST(0));
+	UT_ASSERT_EQ(memcmp(&map, &zero, sizeof(map)) == 0, true);
+}
+
+UT_TEST(test_committed_reader_requires_namespace_x_lock)
+{
+	RelMapFile map;
+	RelMapFile zero;
+	uint64 generation;
+	unsigned int reads_before;
+
+	setup(&identity);
+	UT_ASSERT(stage(&identity));
+	reads_before = reads;
+	memset(&map, 0xa5, sizeof(map));
+	memset(&zero, 0, sizeof(zero));
+	generation = UINT64CONST(99);
+	relmap_x_held = false;
 	UT_ASSERT(!cluster_relmap_authority_v2_read_committed(&identity, &map, &generation));
 	UT_ASSERT_EQ(generation, UINT64CONST(0));
 	UT_ASSERT_EQ(memcmp(&map, &zero, sizeof(map)) == 0, true);
+	UT_ASSERT_EQ(reads, reads_before);
+
+	relmap_x_held = true;
+	UT_ASSERT(cluster_relmap_authority_v2_read_committed(&identity, &map, &generation));
+	relmap_x_held = false;
+	UT_ASSERT_EQ(generation, UINT64CONST(7));
+	UT_ASSERT_EQ(map.mappings[0].mapfilenumber, 40000);
 }
 
 UT_TEST(test_committed_reader_rebuilds_exact_structural_pending)
@@ -1537,9 +1576,10 @@ UT_TEST(test_changed_wal_cannot_rebind_staged_pin)
 int
 main(void)
 {
-	UT_PLAN(43);
+	UT_PLAN(44);
 	UT_RUN(test_stage_both_copies_before_success);
 	UT_RUN(test_committed_reader_hides_pending_and_rejects_degraded_pair);
+	UT_RUN(test_committed_reader_requires_namespace_x_lock);
 	UT_RUN(test_committed_reader_rebuilds_exact_structural_pending);
 	UT_RUN(test_per_database_namespace);
 	UT_RUN(test_missing_authority_is_never_seeded);
