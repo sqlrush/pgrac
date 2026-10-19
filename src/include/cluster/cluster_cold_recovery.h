@@ -976,7 +976,11 @@ extern bool cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
 /* Producer boundary for one original TT owner.  Locate the post-redo header
  * by physical owner/segment, require the complete ordinary TT/UNDO inventory
  * and all original sources, then verify the selected sealed fold and exact
- * slot before-image and consume the original producer's TopTxProof/shape gates.
+ * slot before-image. Derive producer_top from this source's exact native
+ * canonical BIND; the caller's producer_top bit is ignored. Other proof/shape
+ * gates remain independent and required. An older ACTIVE without a retained
+ * BIND remains blocked pending the original qualified canonical-base producer;
+ * this does not introduce a BIND lifetime retention requirement.
  * Target incarnation/claim remain bound to the original source.  A new
  * header with no original base requires the native full-image proof.
  * The original endpoint receipt must cover the unchanged complete source

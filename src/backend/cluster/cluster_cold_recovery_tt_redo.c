@@ -11,7 +11,8 @@
  *
  * NOTES
  *    PGRAC-original. Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md
- *    No original bytes are installed and no transaction proof is created.
+ *    No original bytes are installed. Canonical top qualification consumes
+ *    the native BIND producer; all other transaction gates remain separate.
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -458,6 +459,37 @@ cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
 										  oldest_xid, recoverer_epoch, out);
 }
 
+/* The current native BIND has one production emitter, called by canonical
+ * ACTIVE publication with the original owner's top XID. Its exact physical
+ * identity can qualify top ownership, including retained pre-redo input from
+ * this same source. This is not a lifetime BIND retention requirement: an
+ * older ACTIVE without this input still needs a qualified canonical base.
+ * Neither raw ACTIVE bytes nor another slot's BIND can supply that fact. */
+static bool
+cold_top_tx_native_bind_v1(const RfSideOnlinePlanV1 *plan, const ClusterColdTtSlotKeyV1 *key)
+{
+	uint32 count = rf_side_online_plan_operation_count_v1(plan);
+
+	if (count == UINT32_MAX)
+		return false;
+	for (uint32 i = 0; i < count; i++) {
+		RfSideOnlineOperationV1 operation;
+		const ClusterUndoDecoded *bind = &operation.undo;
+
+		if (!rf_side_online_plan_operation_v1(plan, i, &operation))
+			return false;
+		if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
+			&& bind->kind == CLUSTER_UNDO_KIND_TT_BIND
+			&& bind->format_version == CLUSTER_UNDO_TT_BIND_VERSION
+			&& bind->instance == key->owner_instance && bind->segment_id == key->segment_id
+			&& bind->expected_generation == key->segment_generation
+			&& bind->slot_offset == key->slot_offset && bind->wrap == key->slot_wrap
+			&& bind->xid == key->xid)
+			return true;
+	}
+	return false;
+}
+
 bool
 cluster_cold_typed_top_tx_c0_producer_v1(const ClusterColdTypedV1 *typed, uint32 participant,
 										 const ClusterColdTopTxProofV1 *proof,
@@ -466,6 +498,7 @@ cluster_cold_typed_top_tx_c0_producer_v1(const ClusterColdTypedV1 *typed, uint32
 										 ClusterColdTopTxC0ProducerResultV1 *out)
 {
 	ClusterColdTopTxC0ProducerResultV1 result = { 0 };
+	ClusterColdTopTxProofV1 qualified;
 	RfSideUndoHeaderImageV1 post_image;
 	ClusterColdTtSlotInputV1 post_slot;
 	uint32 post_segment_index;
@@ -497,8 +530,8 @@ cluster_cold_typed_top_tx_c0_producer_v1(const ClusterColdTypedV1 *typed, uint32
 	/* A valid target alone cannot discharge missing/unsupported retained
 	 * sources, another TT header, or an uncached native UNDO effect. Reuse
 	 * the complete ordinary inventory rather than trusting the proof flags
-	 * for those inputs. This does not establish checkpoint coverage, top
-	 * ownership, atomic transaction effects or old-writer isolation. */
+	 * for those inputs. This does not establish checkpoint coverage,
+	 * atomic transaction effects or old-writer isolation. */
 	if (!cluster_cold_typed_tt_redo_inventory_v1(typed))
 		return false;
 	/* Compare the whole selected header with its sealed original fold.  A
@@ -507,8 +540,13 @@ cluster_cold_typed_top_tx_c0_producer_v1(const ClusterColdTypedV1 *typed, uint32
 	if (!cluster_cold_typed_tt_after_redo_readback_v1(typed, participant, post_segment_index,
 													  &post_image))
 		return false;
+	/* The caller's producer_top bit is not an original producer fact. Only
+	 * this source's exact native BIND currently qualifies this gate here. */
+	qualified = *proof;
+	qualified.producer_top
+		= cold_top_tx_native_bind_v1(typed->side_plans[participant], &post_slot.key);
 	result.active.key = post_slot.key;
-	if (!cluster_cold_top_tx_loser_v1(&result.active, proof, &result.loser)
+	if (!cluster_cold_top_tx_loser_v1(&result.active, &qualified, &result.loser)
 		|| !cluster_cold_top_tx_c0_v1(&result.loser, shape, next_xid, true, has_oldest_xid,
 									  oldest_xid, recoverer_epoch, &result.c0)
 		|| cluster_recovery_tt_abort_match_v1(&result.c0.record, post_slot.key.segment_generation,

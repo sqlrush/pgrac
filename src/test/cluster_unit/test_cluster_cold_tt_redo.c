@@ -3229,6 +3229,128 @@ tt_top_tx_endpoints_complete(TtRedoFixture *f)
 	}
 }
 
+/* Retain a real native canonical BIND, then install its native header fold.
+ * This replaces the old fixtures' caller-supplied producer_top assertion. */
+static void
+tt_top_tx_bind(TtRedoFixture *f, XLogRecPtr begin, uint16 slot)
+{
+	const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)f->base.data;
+	xl_undo_tt_slot_bind bind = { 0 };
+	FakeXactRecord fake;
+
+	bind.instance = header->owner_instance;
+	bind.segment_id = header->segment_id;
+	bind.segment_generation = header->wrap_count;
+	bind.slot_offset = slot;
+	bind.wrap = header->tt_slots[slot].wrap;
+	bind.xid = header->tt_slots[slot].xid;
+	bind.format_version = CLUSTER_UNDO_TT_BIND_VERSION;
+	make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND, &bind, sizeof(bind));
+	undo_header_feed(f->typed.side_plans[0], &fake, begin);
+}
+
+static void
+tt_top_tx_seal_bound(TtRedoFixture *f, XLogRecPtr begin)
+{
+	RfSideUndoHeaderImageV1 folded;
+	uint32 index;
+
+	tt_top_tx_bind(f, begin, 4);
+	tt_redo_seal(f);
+	UT_ASSERT_NOT_NULL(cluster_cold_tt_header_find_v1(&f->typed, false, 3, 513, &index));
+	UT_ASSERT(cluster_cold_typed_tt_redo_header_v1(&f->typed, 0, index, &folded));
+	tt_readback_write(513, &folded.page, false);
+}
+
+UT_TEST(tt_top_tx_c0_producer_derives_top_from_native_bind)
+{
+	for (int mode = 0; mode < 5; mode++) {
+		TtRedoFixture f;
+		ClusterColdTtSlotInputV1 input;
+		ClusterColdTopTxProofV1 proof;
+		ClusterRecoveryTTAbortV1 shape;
+		ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
+
+		/* A retained pre-redo BIND is usable input, not a retention rule. */
+		tt_redo_fixture_at(&f, mode == 0 ? 100 : (mode == 4 ? 300 : 200), RF_SIDE_PLAN_RECOVERY,
+						   mode == 3 ? 200 : 100);
+		if (mode == 1) {
+			RfSideUndoHeaderImageV1 folded;
+
+			tt_top_tx_bind(&f, 100, 4); /* Another slot's top does not prove slot 47. */
+			tt_redo_seal(&f);
+			UT_ASSERT(cluster_cold_typed_tt_redo_header_v1(&f.typed, 0, 0, &folded));
+			tt_readback_write(513, &folded.page, false);
+		} else if (mode == 0)
+			tt_redo_seal(&f); /* Exact ACTIVE bytes alone cannot establish top. */
+		else {
+			if (mode == 4)
+				tt_top_tx_bind(&f, 100, 4); /* Idempotent republication is legal. */
+			tt_top_tx_seal_bound(&f, mode == 4 ? 200 : 100);
+		}
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, mode < 2 ? 47 : 4, &input));
+		f.typed.xid_next_after_redo = UINT64_C(0x700400200);
+		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+		proof.producer_top = mode < 2; /* Neither true nor false supplies this fact. */
+		tt_top_tx_effects_complete(&f);
+		tt_top_tx_endpoints_complete(&f);
+		memset(&out, 0xa9, sizeof(out));
+		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, false,
+															  InvalidTransactionId,
+															  UINT64_C(0x12345678), &out),
+					 mode >= 2);
+		if (mode < 2)
+			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		else {
+			UT_ASSERT_EQ(out.loser.key.xid, input.key.xid);
+			UT_ASSERT_EQ(out.c0.record.exact.xid, input.key.xid);
+		}
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_top_tx_c0_producer_refuses_conflicting_bind_history)
+{
+	for (int field = 0; field < 4; field++) {
+		TtRedoFixture f;
+		UndoSegmentHeaderData *header;
+		PGAlignedBlock saved;
+		ClusterColdTtSlotInputV1 input;
+		ClusterColdTopTxProofV1 proof;
+		ClusterRecoveryTTAbortV1 shape;
+		ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
+
+		tt_redo_fixture_at(&f, 200, RF_SIDE_PLAN_RECOVERY, 200);
+		saved = f.base;
+		header = (UndoSegmentHeaderData *)f.base.data;
+		/* A future generation, conflicting ACTIVE key, or BIND over an
+		 * existing head cannot be reconciled with this captured base. */
+		if (field == 0)
+			header->wrap_count++;
+		if (field == 1)
+			header->tt_slots[4].wrap++;
+		if (field == 2)
+			header->tt_slots[4].xid++;
+		tt_top_tx_bind(&f, 100, field == 3 ? 47 : 4);
+		f.base = saved;
+		tt_redo_seal(&f);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &input));
+		f.typed.xid_next_after_redo = UINT64_C(0x700400200);
+		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+		tt_top_tx_effects_complete(&f);
+		tt_top_tx_endpoints_complete(&f);
+		/* Native inventory refuses these before top qualification. */
+		UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+		memset(&out, 0xa9, sizeof(out));
+		UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(
+			&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out));
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		tt_redo_destroy(&f);
+	}
+}
+
 UT_TEST(tt_top_tx_c0_producer_refuses_unproved_endpoint_coverage)
 {
 	TtRedoFixture f;
@@ -3237,10 +3359,10 @@ UT_TEST(tt_top_tx_c0_producer_refuses_unproved_endpoint_coverage)
 	ClusterRecoveryTTAbortV1 shape;
 	ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
 
-	tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
-	tt_redo_seal(&f);
+	tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+	tt_top_tx_seal_bound(&f, 100);
 	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
-	UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 47, &input));
+	UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &input));
 	f.typed.xid_next_after_redo = UINT64_C(0x700400200);
 	tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
 	tt_top_tx_effects_complete(&f);
@@ -3299,10 +3421,10 @@ UT_TEST(tt_top_tx_c0_producer_refuses_unproved_effect_coverage)
 	ClusterRecoveryTTAbortV1 shape;
 	ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
 
-	tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
-	tt_redo_seal(&f);
+	tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+	tt_top_tx_seal_bound(&f, 100);
 	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
-	UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 47, &input));
+	UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &input));
 	f.typed.xid_next_after_redo = UINT64_C(0x700400200);
 	tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
 	/* A caller's true ordinary_effects flag cannot replace pass-2 coverage. */
@@ -3345,13 +3467,13 @@ UT_TEST(tt_top_tx_c0_producer_requires_original_owner_and_exact_post_redo)
 		ClusterRecoveryTTAbortV1 shape = { 0 };
 		ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
 		uint64 next_xid = UINT64_C(0x700400200);
-		uint32 offset = new_header ? 4 : 47;
+		uint32 offset = 4;
 
 		if (new_header)
 			tt_post_readback_new(&f, &expected, false);
 		else {
-			tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
-			tt_redo_seal(&f);
+			tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+			tt_top_tx_seal_bound(&f, 100);
 		}
 		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
 		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, offset, &input));
@@ -4382,7 +4504,7 @@ UT_TEST(tt_top_tx_c0_producer_requires_complete_tt_inventory)
 			RfSideUndoHeaderImageV1 target;
 			uint32 segment = history ? 257 : 514, index = UINT32_MAX;
 
-			tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+			tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
 			if (fault != 4) {
 				tt_inventory_extra(segment, history ? 2 : 3, &extra);
 				if (fault == 3) {
@@ -4392,7 +4514,7 @@ UT_TEST(tt_top_tx_c0_producer_requires_complete_tt_inventory)
 				}
 				tt_redo_seed_recapture(&f);
 			}
-			tt_redo_seal(&f);
+			tt_top_tx_seal_bound(&f, 100);
 			if (fault == 1)
 				tt_inventory_remove(segment);
 			else if (fault == 2) {
@@ -4402,7 +4524,7 @@ UT_TEST(tt_top_tx_c0_producer_requires_complete_tt_inventory)
 				tt_inventory_extra(segment, history ? 2 : 3, &extra);
 			UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
 			UT_ASSERT_NOT_NULL(cluster_cold_tt_header_find_v1(&f.typed, true, 3, 513, &index));
-			UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, index, 47, &input));
+			UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, index, 4, &input));
 			/* Every negative case still has an exact, fully folded target header. */
 			UT_ASSERT(cluster_cold_typed_tt_after_redo_readback_v1(&f.typed, 0, index, &target));
 			f.typed.xid_next_after_redo = UINT64_C(0x700400200);
@@ -4432,10 +4554,10 @@ UT_TEST(tt_top_tx_c0_producer_requires_all_original_sources)
 		ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
 		RfSideUndoHeaderImageV1 target;
 
-		tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
-		tt_redo_seal(&f);
+		tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+		tt_top_tx_seal_bound(&f, 100);
 		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
-		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 47, &input));
+		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &input));
 		f.typed.xid_next_after_redo = UINT64_C(0x700400200);
 		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
 		tt_top_tx_effects_complete(&f);
@@ -4481,10 +4603,10 @@ UT_TEST(tt_top_tx_c0_producer_checks_unselected_undo_effects)
 		ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
 		RfSideUndoHeaderImageV1 target;
 
-		tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+		tt_redo_fixture(&f, 300, RF_SIDE_PLAN_RECOVERY);
 		tt_redo_record_page(&page, 900);
 		tt_redo_feed_record_page(&f, 100, &page, true);
-		tt_redo_seal(&f);
+		tt_top_tx_seal_bound(&f, 200);
 		tt_undo_uncached_expected(&f, 513, 9, &expected);
 		if (fault == 1)
 			expected = page; /* Missing native replay LSN, despite an exact TT header. */
@@ -4494,7 +4616,7 @@ UT_TEST(tt_top_tx_c0_producer_checks_unselected_undo_effects)
 		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
 		UT_ASSERT(f.typed.tt_base->blocks == NULL);
 		UT_ASSERT(f.typed.tt_after_redo->blocks == NULL);
-		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 47, &input));
+		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &input));
 		UT_ASSERT(cluster_cold_typed_tt_after_redo_readback_v1(&f.typed, 0, 0, &target));
 		f.typed.xid_next_after_redo = UINT64_C(0x700400200);
 		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
@@ -4514,7 +4636,9 @@ UT_TEST(tt_top_tx_c0_producer_checks_unselected_undo_effects)
 int
 main(void)
 {
-	UT_PLAN(105);
+	UT_PLAN(107);
+	UT_RUN(tt_top_tx_c0_producer_derives_top_from_native_bind);
+	UT_RUN(tt_top_tx_c0_producer_refuses_conflicting_bind_history);
 	UT_RUN(tt_top_tx_c0_producer_refuses_unproved_endpoint_coverage);
 	UT_RUN(tt_top_tx_c0_producer_refuses_unproved_effect_coverage);
 	UT_RUN(tt_top_tx_c0_producer_requires_complete_tt_inventory);
