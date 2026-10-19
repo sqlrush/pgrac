@@ -4,6 +4,7 @@
 #ifndef CLUSTER_RELMAP_RETENTION_H
 #define CLUSTER_RELMAP_RETENTION_H
 
+#include "cluster/cluster_tt_local.h"
 #include "common/cluster_relmap_v2.h"
 
 #define CLUSTER_RELMAP_RETENTION_CAPACITY 64
@@ -46,7 +47,10 @@ typedef struct ClusterRelmapRetentionKey {
 typedef struct ClusterRelmapRetentionPin {
 	ClusterRelmapRetentionKey key;
 	uint64 wal_end;
+	/* Original published receipt, volatile only; never fabricate a TT slot. */
+	ClusterCanonicalTxnBinding binding;
 	bool occupied;
+	bool has_tt_binding;
 	/* Set BEFORE a pending file write can start; ERROR cannot cancel it. */
 	bool may_be_staged;
 } ClusterRelmapRetentionPin;
@@ -94,15 +98,40 @@ extern void cluster_relmap_retention_invalidate(ClusterRelmapRetentionDirectory 
 
 /* Original global relmap X holder, AFTER real top assignment/admission and
  * BEFORE RelationMappingLock, relmap WAL and all pending-file I/O. Refusal
- * grants no stage permission. No TT binding is created by this native pin.
- * Caller must separately retain exact existing/later TT and WAL/claim edges. */
+ * grants no stage permission. begin is the no-new-binding wrapper; it inherits
+ * an actual binding already enrolled for this same FullXid, if any. The owner
+ * must use begin_bound when a real published binding predates this pin.
+ * WAL/claim edges and original TT duties remain independent requirements. */
 extern ClusterRelmapRetentionResult cluster_relmap_retention_begin(
 	ClusterRelmapRetentionDirectory *directory, const ClusterRelmapRetentionKey *key);
+extern ClusterRelmapRetentionResult cluster_relmap_retention_begin_bound(
+	ClusterRelmapRetentionDirectory *directory, const ClusterRelmapRetentionKey *key,
+	const ClusterCanonicalTxnBinding *binding);
+
+/* The original ACTIVE owner supplies its actual published receipt and original
+ * top FullXid, never an era reconstructed from raw xid. Enroll ALL extant pins
+ * for that FullXid atomically, including staged pins; a no-pin call adds none.
+ * Exact retries are idempotent; a differing receipt never replaces one.
+ * Refusal must retain the original published ACTIVE/BIND and follow its ERROR
+ * path. These pure checks do not authenticate the supplied receipt or owner. */
+extern ClusterRelmapRetentionResult cluster_relmap_retention_bind(
+	ClusterRelmapRetentionDirectory *directory, uint64 top_full_xid,
+	const ClusterCanonicalTxnBinding *binding);
+
+/* One relmap conjunct only, NOT TT recycle/reuse permission. A matching exact
+ * physical key is retained irrespective of the query's ACTIVE LSN. An unbound
+ * same-raw obligation is unresolved and refuses, not evidence of no TT edge.
+ * Ordinary A0/GC and recovery D0 must also satisfy their original owner gates. */
+extern ClusterRelmapRetentionResult cluster_relmap_retention_tt_release_check(
+	const ClusterRelmapRetentionDirectory *directory,
+	const ClusterCanonicalTxnBinding *binding);
 extern ClusterRelmapRetentionResult cluster_relmap_retention_stage_start(
 	ClusterRelmapRetentionDirectory *directory, const ClusterRelmapRetentionKey *key,
 	uint64 wal_end);
 extern ClusterRelmapRetentionResult cluster_relmap_retention_cancel_prepare(
 	ClusterRelmapRetentionDirectory *directory, const ClusterRelmapRetentionKey *key);
+/* cancel_prepare removes only the unstaged relmap edge. It neither cancels nor
+ * releases the original TT ACTIVE/BIND even when this pin carried a binding. */
 
 /* Register BEFORE any native cut publication/I/O; cutoff is a qualified
  * FullXid boundary supplied by the original truncation owner. Clamp to pins

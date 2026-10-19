@@ -586,9 +586,11 @@ test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
 
 test_cluster_relmap_retention: test_cluster_relmap_retention.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
-		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o $(top_builddir)/src/port/libpgport.a
-	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
-		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o $(top_builddir)/src/port/libpgport.a -o $@
+		$(top_srcdir)/src/include/cluster/cluster_tt_local.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_relmap_pending: test_cluster_relmap_pending.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_pending.h \

@@ -4,6 +4,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_relmap_retention.h"
+#include "cluster/cluster_tt_slot.h"
 
 /* Strictly less than half of the raw-XID space, using full-width identities. */
 #define RELMAP_XID_HALF UINT64CONST(0x80000000)
@@ -30,6 +31,79 @@ same_key(const ClusterRelmapRetentionKey *a, const ClusterRelmapRetentionKey *b)
 		&& a->membership_epoch == b->membership_epoch
 		&& a->admitted_incarnation == b->admitted_incarnation
 		&& a->boot_incarnation == b->boot_incarnation;
+}
+
+static bool
+valid_binding(const ClusterRelmapRetentionDirectory *directory,
+	const ClusterCanonicalTxnBinding *binding)
+{
+	return binding != NULL && binding->publish_state == CLUSTER_CANONICAL_TXN_PUBLISHED
+		&& binding->reserved16 == 0 && binding->segment_id != 0
+		&& binding->segment_generation != UINT32_MAX
+		&& binding->slot_offset < TT_SLOTS_PER_SEGMENT && binding->slot_wrap != TT_WRAP_INVALID
+		&& TransactionIdIsNormal(binding->xid)
+		&& binding->origin_instance == directory->origin + 1
+		&& !XLogRecPtrIsInvalid(binding->active_lsn);
+}
+
+static bool
+same_tt_key(const ClusterCanonicalTxnBinding *a, const ClusterCanonicalTxnBinding *b)
+{
+	return a->segment_id == b->segment_id && a->segment_generation == b->segment_generation
+		&& a->xid == b->xid && a->slot_offset == b->slot_offset && a->slot_wrap == b->slot_wrap
+		&& a->origin_instance == b->origin_instance;
+}
+
+static bool
+same_binding(const ClusterCanonicalTxnBinding *a, const ClusterCanonicalTxnBinding *b)
+{
+	return same_tt_key(a, b) && a->active_lsn == b->active_lsn
+		&& a->publish_state == b->publish_state && a->reserved16 == b->reserved16;
+}
+
+/* Validate the complete same-FullXid set before changing any namespace. */
+static ClusterRelmapRetentionResult
+select_binding(const ClusterRelmapRetentionDirectory *directory, uint64 full,
+	const ClusterCanonicalTxnBinding *binding, ClusterCanonicalTxnBinding *selected,
+	bool *found)
+{
+	int i;
+
+	*found = false;
+	if (binding != NULL) {
+		if (!valid_binding(directory, binding) || binding->xid != (uint32) full)
+			return CLUSTER_RELMAP_RETENTION_INVALID;
+		*selected = *binding;
+		*found = true;
+	}
+	for (i = 0; i < CLUSTER_RELMAP_RETENTION_CAPACITY; i++) {
+		const ClusterRelmapRetentionPin *pin = &directory->pins[i];
+
+		if (!pin->occupied || pin->key.top_full_xid != full || !pin->has_tt_binding)
+			continue;
+		if (!valid_binding(directory, &pin->binding) || pin->binding.xid != (uint32) full
+			|| (*found && !same_binding(selected, &pin->binding)))
+			return CLUSTER_RELMAP_RETENTION_CONFLICT;
+		*selected = pin->binding;
+		*found = true;
+	}
+	return CLUSTER_RELMAP_RETENTION_OK;
+}
+
+static void
+enroll_binding(ClusterRelmapRetentionDirectory *directory, uint64 full,
+	const ClusterCanonicalTxnBinding *binding)
+{
+	int i;
+
+	for (i = 0; i < CLUSTER_RELMAP_RETENTION_CAPACITY; i++) {
+		ClusterRelmapRetentionPin *pin = &directory->pins[i];
+
+		if (pin->occupied && pin->key.top_full_xid == full) {
+			pin->binding = *binding;
+			pin->has_tt_binding = true;
+		}
+	}
 }
 
 static ClusterRelmapRetentionResult
@@ -113,6 +187,8 @@ add_pin(ClusterRelmapRetentionDirectory *directory, const ClusterRelmapRetention
 		return CLUSTER_RELMAP_RETENTION_CAPACITY_EXCEEDED;
 	free_pin->key = *key;
 	free_pin->wal_end = wal_end;
+	memset(&free_pin->binding, 0, sizeof(free_pin->binding));
+	free_pin->has_tt_binding = false;
 	free_pin->may_be_staged = restoring;
 	free_pin->occupied = true;
 	return CLUSTER_RELMAP_RETENTION_OK;
@@ -187,9 +263,76 @@ ClusterRelmapRetentionResult
 cluster_relmap_retention_begin(ClusterRelmapRetentionDirectory *directory,
 	const ClusterRelmapRetentionKey *key)
 {
+	return cluster_relmap_retention_begin_bound(directory, key, NULL);
+}
+
+ClusterRelmapRetentionResult
+cluster_relmap_retention_begin_bound(ClusterRelmapRetentionDirectory *directory,
+	const ClusterRelmapRetentionKey *key, const ClusterCanonicalTxnBinding *binding)
+{
+	ClusterCanonicalTxnBinding selected;
+	ClusterRelmapRetentionResult result;
+	bool found;
+
 	if (directory == NULL || directory->state != CLUSTER_RELMAP_RETENTION_COMPLETE)
 		return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
-	return add_pin(directory, key, 0, false);
+	result = check_key(directory, key);
+	if (result != CLUSTER_RELMAP_RETENTION_OK)
+		return result;
+	result = select_binding(directory, key->top_full_xid, binding, &selected, &found);
+	if (result != CLUSTER_RELMAP_RETENTION_OK)
+		return result;
+	result = add_pin(directory, key, 0, false);
+	if (result == CLUSTER_RELMAP_RETENTION_OK && found)
+		enroll_binding(directory, key->top_full_xid, &selected);
+	return result;
+}
+
+ClusterRelmapRetentionResult
+cluster_relmap_retention_bind(ClusterRelmapRetentionDirectory *directory,
+	uint64 top_full_xid, const ClusterCanonicalTxnBinding *binding)
+{
+	ClusterCanonicalTxnBinding selected;
+	ClusterRelmapRetentionResult result;
+	bool found;
+
+	if (directory == NULL || directory->state != CLUSTER_RELMAP_RETENTION_COMPLETE)
+		return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
+	if (!normal_full_xid(top_full_xid) || binding == NULL)
+		return CLUSTER_RELMAP_RETENTION_INVALID;
+	result = select_binding(directory, top_full_xid, binding, &selected, &found);
+	if (result == CLUSTER_RELMAP_RETENTION_OK)
+		enroll_binding(directory, top_full_xid, &selected);
+	return result;
+}
+
+ClusterRelmapRetentionResult
+cluster_relmap_retention_tt_release_check(const ClusterRelmapRetentionDirectory *directory,
+	const ClusterCanonicalTxnBinding *binding)
+{
+	int i;
+
+	if (directory == NULL || directory->state != CLUSTER_RELMAP_RETENTION_COMPLETE)
+		return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
+	if (!valid_binding(directory, binding))
+		return CLUSTER_RELMAP_RETENTION_INVALID;
+	for (i = 0; i < CLUSTER_RELMAP_RETENTION_CAPACITY; i++) {
+		const ClusterRelmapRetentionPin *pin = &directory->pins[i];
+
+		if (!pin->occupied)
+			continue;
+		if (!pin->has_tt_binding) {
+			if ((uint32) pin->key.top_full_xid == binding->xid)
+				return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
+			continue;
+		}
+		if (!valid_binding(directory, &pin->binding)
+			|| pin->binding.xid != (uint32) pin->key.top_full_xid)
+			return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
+		if (same_tt_key(&pin->binding, binding))
+			return CLUSTER_RELMAP_RETENTION_RETAINED;
+	}
+	return CLUSTER_RELMAP_RETENTION_OK;
 }
 
 ClusterRelmapRetentionResult
