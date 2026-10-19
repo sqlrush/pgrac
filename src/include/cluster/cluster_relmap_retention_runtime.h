@@ -10,6 +10,17 @@
  * origin; attachment never rebuilds, clears pins or cancels reservations. */
 extern void cluster_relmap_retention_runtime_shmem_register(void);
 
+/* Original Startup only, before its first ROOT/census/retained-source scan.
+ * Under the sole runtime lock revoke ALL origins to UNKNOWN, preserving every
+ * pin, TT binding, staged marker, identity, floor/issued observation and native
+ * truncate reservation. Retry/attach never makes an old generation available.
+ * Requires attached shmem, no CRIT/shutdown, and no caller-held mapping,
+ * XidGenLock or retention lock. Refusal changes nothing and releases no caller
+ * lock. No allocation, native owner query or I/O occurs under retention.
+ * This grants no rebuild/COMPLETE publication or floor/issued qualification;
+ * live v2 and destructive-consumer activation remain separate gates. */
+extern bool cluster_relmap_retention_runtime_recovery_invalidate_v2(void);
+
 /* Dormant original-backend preparation, with the same lock/context contract
  * as owner_retention_begin_v2. Supplies the one real runtime retention lock
  * and the original sample's origin directory; callers cannot substitute an

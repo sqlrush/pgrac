@@ -19,6 +19,7 @@ int cluster_node_id;
 int MyProcPid = 79;
 Oid MyDatabaseId = 42;
 BackendType MyBackendType = B_BACKEND;
+AuxProcType MyAuxProcType = NotAnAuxProcess;
 volatile sig_atomic_t ShutdownRequestPending;
 volatile uint32 CritSectionCount;
 static LWLockPadded runtime_storage_native_locks[NUM_INDIVIDUAL_LWLOCKS];

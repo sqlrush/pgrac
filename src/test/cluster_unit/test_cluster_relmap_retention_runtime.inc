@@ -122,6 +122,7 @@ relmap_runtime_fixture(bool attach)
 {
 	cluster_node_id = 0;
 	relmap_owner_fixture();
+	MyAuxProcType = NotAnAuxProcess;
 	relmap_xidgen_held = false;
 	free(relmap_runtime_allocation);
 	relmap_runtime_allocation = NULL;
@@ -1650,4 +1651,174 @@ UT_TEST(test_relmap_runtime_allocation_error_reacquire_cannot_release_an_unrelat
 	UT_ASSERT_EQ(publication.calls, 1);
 	LWLockRelease(relmap_runtime_test_lock);
 	LWLockRelease(XidGenLock);
+}
+
+
+/* Compare all origins, including retained provenance, staged obligations and
+ * reservations. Controlled providers also reject native queries under lock. */
+static void
+relmap_runtime_recovery_expect(bool accepted)
+{
+	Size bytes = sizeof(relmap_runtime_shmem->directories);
+	ClusterRelmapRetentionDirectory *expected = malloc(bytes);
+	unsigned acquires = relmap_retention_acquires;
+	unsigned reads = relmap_binding_reads, assignments = relmap_assign_calls;
+	unsigned stages = relmap_runtime_stage_calls, writes = relmap_runtime_stage_writes;
+	int syncs = sync_calls, renames = rename_calls;
+	int holdoff = InterruptHoldoffCount;
+	bool held = relmap_retention_held, xidgen = relmap_xidgen_held;
+
+	UT_ASSERT_NOT_NULL(expected);
+	memcpy(expected, relmap_runtime_shmem->directories, bytes);
+	if (accepted)
+		for (unsigned origin = 0; origin < CLUSTER_MAX_NODES; origin++)
+			expected[origin].state = CLUSTER_RELMAP_RETENTION_UNKNOWN;
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_recovery_invalidate_v2(), accepted);
+	UT_ASSERT_EQ(memcmp(expected, relmap_runtime_shmem->directories, bytes), 0);
+	UT_ASSERT_EQ(relmap_retention_acquires, acquires + (accepted ? 1 : 0));
+	UT_ASSERT_EQ(relmap_binding_reads, reads);
+	UT_ASSERT_EQ(relmap_assign_calls, assignments);
+	UT_ASSERT_EQ(relmap_runtime_stage_calls, stages);
+	UT_ASSERT_EQ(relmap_runtime_stage_writes, writes);
+	UT_ASSERT_EQ(sync_calls, syncs);
+	UT_ASSERT_EQ(rename_calls, renames);
+	UT_ASSERT_EQ(relmap_retention_held, held);
+	UT_ASSERT_EQ(relmap_xidgen_held, xidgen);
+	UT_ASSERT_EQ(InterruptHoldoffCount, holdoff);
+	free(expected);
+}
+
+UT_TEST(test_relmap_runtime_recovery_invalidates_every_origin_preserving_obligations)
+{
+	ClusterRelmapRetentionDirectory *directory =
+		relmap_runtime_binding_fixture(CLUSTER_MAX_NODES - 1);
+
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_bind_current_v2(), CLUSTER_RELMAP_RETENTION_OK);
+	UT_ASSERT(directory->pins[0].may_be_staged && directory->pins[0].has_tt_binding);
+	UT_ASSERT(directory->pins[1].occupied && directory->pins[1].has_tt_binding);
+	UT_ASSERT(directory->pins[2].occupied && !directory->pins[2].has_tt_binding);
+	for (unsigned origin = 0; origin < CLUSTER_MAX_NODES - 1; origin++) {
+		relmap_runtime_qualified_fixture(origin);
+		/* Existing incomplete origins are revoked too, never treated as empty. */
+		relmap_runtime_shmem->directories[origin].state = origin % 3;
+	}
+	MyAuxProcType = StartupProcess;
+	MyBackendType = B_STARTUP;
+	cluster_node_id = -1; /* Every origin, without an ordinary backend owner. */
+	relmap_global_x = relmap_active_owner = relmap_in_transaction = false;
+	have_ref = relmap_have_binding = false;
+	relmap_runtime_recovery_expect(true);
+}
+
+UT_TEST(test_relmap_runtime_recovery_keeps_inflight_across_retry_and_attach)
+{
+	ClusterRelmapRetentionDirectory *directory =
+		relmap_runtime_binding_fixture(CLUSTER_MAX_NODES - 1);
+	ClusterRelmapRetentionRuntimeTruncateV2 receipt =
+		relmap_runtime_truncate_receipt(directory->origin);
+	ClusterRelmapRetentionDirectory before;
+
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_bind_current_v2(), CLUSTER_RELMAP_RETENTION_OK);
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_truncate_begin_v2(receipt.system_identifier,
+		receipt.database_incarnation, receipt.origin, relmap_top_full + 20, &receipt),
+		CLUSTER_RELMAP_RETENTION_OK);
+	UT_ASSERT_NE(directory->inflight.serial, 0);
+	before = *directory;
+	before.state = CLUSTER_RELMAP_RETENTION_UNKNOWN;
+	MyAuxProcType = StartupProcess;
+	relmap_runtime_recovery_expect(true);
+	relmap_runtime_recovery_expect(true);
+	relmap_runtime_shmem = NULL;
+	relmap_runtime_registered->init_fn();
+	UT_ASSERT_EQ(memcmp(&before,
+		&relmap_runtime_shmem->directories[CLUSTER_MAX_NODES - 1], sizeof(before)), 0);
+	UT_ASSERT_EQ(relmap_runtime_lock_inits, 1);
+	for (unsigned operation = 0; operation < 3; operation++)
+		relmap_runtime_truncate_refusal(operation, &receipt, relmap_top_full + 20,
+			CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+}
+
+UT_TEST(test_relmap_runtime_recovery_refuses_before_attachment)
+{
+	relmap_runtime_fixture(false);
+	MyAuxProcType = StartupProcess;
+	UT_ASSERT(!cluster_relmap_retention_runtime_recovery_invalidate_v2());
+	UT_ASSERT_NULL(relmap_runtime_shmem);
+	UT_ASSERT_NULL(relmap_runtime_allocation);
+	UT_ASSERT_EQ(relmap_retention_acquires + relmap_runtime_new_tranches, 0);
+	/* A fresh attached UNKNOWN registry is safe to revoke, not to certify. */
+	relmap_runtime_registered->init_fn();
+	relmap_runtime_recovery_expect(true);
+}
+
+UT_TEST(test_relmap_runtime_recovery_refuses_other_roles_and_unsafe_locks)
+{
+	relmap_runtime_binding_fixture(0);
+	for (int role = NotAnAuxProcess; role < NUM_AUXPROCTYPES; role++) {
+		if (role == StartupProcess)
+			continue;
+		MyAuxProcType = (AuxProcType) role;
+		MyBackendType = B_STARTUP; /* This label alone is not native Startup. */
+		relmap_runtime_recovery_expect(false);
+	}
+	MyBackendType = B_BACKEND;
+	MyAuxProcType = StartupProcess;
+	CritSectionCount = 1;
+	relmap_runtime_recovery_expect(false);
+	CritSectionCount = 0;
+	ShutdownRequestPending = true;
+	relmap_runtime_recovery_expect(false);
+	ShutdownRequestPending = false;
+	relmap_local_lock = true;
+	relmap_runtime_recovery_expect(false);
+	UT_ASSERT(relmap_local_lock);
+	relmap_local_lock = false;
+	for (unsigned mode = 0; mode < 2; mode++) {
+		LWLockAcquire(XidGenLock, mode == 0 ? LW_SHARED : LW_EXCLUSIVE);
+		relmap_runtime_recovery_expect(false);
+		LWLockRelease(XidGenLock);
+	}
+	LWLockAcquire(relmap_runtime_test_lock, LW_EXCLUSIVE);
+	relmap_runtime_recovery_expect(false);
+	LWLockRelease(relmap_runtime_test_lock);
+}
+
+UT_TEST(test_relmap_runtime_recovery_never_makes_old_consumers_available)
+{
+	ClusterRelmapOwnerSampleV2 sample;
+	ClusterRelmapV2Namespace identity;
+	ClusterRelmapRetentionRuntimeTruncateV2 receipt;
+	ClusterRelmapRetentionDirectory *directory;
+	ClusterRelmapRetentionDirectory before;
+
+	relmap_runtime_prepare_stage(&sample, &identity, 0, true);
+	relmap_active_owner = relmap_have_binding = true;
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_bind_current_v2(), CLUSTER_RELMAP_RETENTION_OK);
+	directory = &relmap_runtime_shmem->directories[0];
+	before = *directory;
+	before.state = CLUSTER_RELMAP_RETENTION_UNKNOWN;
+	receipt = relmap_runtime_truncate_receipt(0);
+	MyAuxProcType = StartupProcess;
+	relmap_runtime_recovery_expect(true);
+	MyAuxProcType = NotAnAuxProcess;
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_begin_v2(&sample, &identity, 8),
+		CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+	UT_ASSERT(!cluster_relmap_retention_runtime_write_pending_v2(
+		&sample, &identity, 8, 456, &relmap_runtime_stage_map));
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_cancel_prepare_v2(&sample, &identity, 8),
+		CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_bind_current_v2(),
+		CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+	relmap_runtime_tt_expect(identity.system_identifier, identity.database_incarnation,
+		&relmap_binding, CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+	relmap_runtime_truncate_refusal(0, &receipt, relmap_top_full + 20,
+		CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+	LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
+	for (unsigned publish = 0; publish < 2; publish++)
+		relmap_runtime_allocation_unchanged(publish, identity.system_identifier,
+			identity.database_incarnation, 0, before.last_issued + 1,
+			CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+	LWLockRelease(XidGenLock);
+	UT_ASSERT_EQ(memcmp(&before, directory, sizeof(before)), 0);
+	UT_ASSERT_EQ(relmap_runtime_stage_calls + relmap_runtime_stage_writes, 0);
 }

@@ -83,6 +83,24 @@ cluster_relmap_retention_runtime_shmem_register(void)
 	cluster_shmem_register_region(&region);
 }
 
+bool
+cluster_relmap_retention_runtime_recovery_invalidate_v2(void)
+{
+	if (!AmStartupProcess() || relmap_runtime_shmem == NULL || CritSectionCount != 0
+		|| ShutdownRequestPending || LWLockHeldByMe(RelationMappingLock)
+		|| LWLockHeldByMe(XidGenLock) || LWLockHeldByMe(&relmap_runtime_shmem->lock))
+		return false;
+
+	/* Revoke the old recovery generation as one cut before observing any new
+	 * source set. Invalidation preserves obligations and inflight native cuts;
+	 * it neither rebuilds a directory nor authorizes a destructive consumer. */
+	LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
+	for (unsigned origin = 0; origin < CLUSTER_MAX_NODES; origin++)
+		cluster_relmap_retention_invalidate(&relmap_runtime_shmem->directories[origin]);
+	LWLockRelease(&relmap_runtime_shmem->lock);
+	return true;
+}
+
 ClusterRelmapRetentionResult
 cluster_relmap_retention_runtime_begin_v2(const ClusterRelmapOwnerSampleV2 *sample,
 	const ClusterRelmapV2Namespace *identity, uint64 generation)

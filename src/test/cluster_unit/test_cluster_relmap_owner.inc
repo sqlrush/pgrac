@@ -23,7 +23,7 @@ static ClusterCanonicalTxnBinding relmap_binding;
 static void
 relmap_retention_lock_enter(void)
 {
-	if ((!relmap_global_x && !relmap_active_owner
+	if ((!relmap_global_x && !relmap_active_owner && !AmStartupProcess()
 		 && !(relmap_xidgen_held && relmap_xidgen_mode == LW_EXCLUSIVE))
 		|| (relmap_local_lock && !relmap_stage_lock_window) || CritSectionCount != 0)
 		abort();
@@ -63,6 +63,8 @@ GetWALInsertionTimeLine(void)
 bool
 LWLockHeldByMe(LWLock *lock)
 {
+	if (lock == XidGenLock)
+		return relmap_xidgen_held;
 	if (lock == &relmap_retention_lock || lock == relmap_runtime_test_lock)
 		return relmap_retention_held;
 	return lock == RelationMappingLock && relmap_local_lock;

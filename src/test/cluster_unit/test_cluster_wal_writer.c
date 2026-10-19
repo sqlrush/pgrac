@@ -43,6 +43,7 @@ char *cluster_wal_threads_dir, *DataDir;
 int MyProcPid = 79;
 Oid MyDatabaseId = 42;
 BackendType MyBackendType = B_BACKEND;
+AuxProcType MyAuxProcType = NotAnAuxProcess;
 volatile sig_atomic_t ShutdownRequestPending;
 volatile uint32 CritSectionCount = 1;
 volatile uint32 InterruptHoldoffCount;
@@ -1450,7 +1451,7 @@ UT_TEST(test_requested_flush_rejects_foreign_or_unsafe_context_without_io)
 int
 main(void)
 {
-	UT_PLAN(98);
+	UT_PLAN(103);
 	UT_RUN(test_clean_writer_requires_selected_exit_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_requires_selected_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_keeps_runtime_fence_and_exact_owner_refusals);
@@ -1549,6 +1550,11 @@ main(void)
 	UT_RUN(test_relmap_runtime_allocation_requires_original_exclusive_lock_and_own_window);
 	UT_RUN(test_relmap_runtime_allocation_error_cleanup_never_rewinds_observation);
 	UT_RUN(test_relmap_runtime_allocation_error_reacquire_cannot_release_an_unrelated_lock);
+	UT_RUN(test_relmap_runtime_recovery_invalidates_every_origin_preserving_obligations);
+	UT_RUN(test_relmap_runtime_recovery_keeps_inflight_across_retry_and_attach);
+	UT_RUN(test_relmap_runtime_recovery_refuses_before_attachment);
+	UT_RUN(test_relmap_runtime_recovery_refuses_other_roles_and_unsafe_locks);
+	UT_RUN(test_relmap_runtime_recovery_never_makes_old_consumers_available);
 	free(relmap_runtime_allocation);
 	if (scratch[0] && !rmtree(scratch, true))
 		abort();
