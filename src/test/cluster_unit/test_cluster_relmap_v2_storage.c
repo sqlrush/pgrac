@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include "cluster/cluster_relmap_authority.h"
+#include "cluster/cluster_relmap_lock.h"
 #include "cluster/cluster_relmap_retention_restore.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
@@ -44,7 +45,7 @@ static bool corrupt_after_rename, replace_during_read, replace_after_rename;
 static unsigned int fault_rename;
 static bool fail_directory_close;
 static LWLock retention_lock;
-static bool retention_held, observing_stage;
+static bool retention_held, observing_stage, relmap_x_held;
 static bool cancel_on_read, invalidate_on_read, cancel_on_write;
 static unsigned int io_under_retention_lock, writes_without_pin;
 static unsigned int retention_acquires, retention_releases;
@@ -82,6 +83,12 @@ bool
 LWLockHeldByMe(LWLock *lock)
 {
 	return lock == &retention_lock && retention_held;
+}
+
+bool
+cluster_relmap_authority_x_held(void)
+{
+	return relmap_x_held;
 }
 
 static void
@@ -358,7 +365,7 @@ reset_io(void)
 	corrupt_after_rename = replace_during_read = replace_after_rename = false;
 	fault_rename = 1;
 	fail_directory_close = false;
-	retention_held = observing_stage = false;
+	retention_held = observing_stage = relmap_x_held = false;
 	cancel_on_read = invalidate_on_read = cancel_on_write = false;
 	io_under_retention_lock = writes_without_pin = 0;
 	retention_acquires = retention_releases = 0;
@@ -426,10 +433,12 @@ stage_request(const ClusterRelmapV2Namespace *ns, uint64 generation,
 	RelMapFile map = map_image(40001);
 	bool result;
 
+	relmap_x_held = true;
 	observing_stage = true;
 	result = cluster_relmap_authority_v2_write_pending(ns, generation, request_owner, &map,
 		&writer_retention, &retention_lock);
 	observing_stage = false;
+	relmap_x_held = false;
 	return result;
 }
 
@@ -660,8 +669,31 @@ staged_image(void)
 static ClusterRelmapV2ClearResult
 finish(const ClusterRelmapV2Image *image, bool publish)
 {
-	return publish ? cluster_relmap_authority_v2_publish(image)
-				   : cluster_relmap_authority_v2_discard_pending(image);
+	ClusterRelmapV2ClearResult result;
+
+	relmap_x_held = true;
+	result = publish ? cluster_relmap_authority_v2_publish(image)
+					 : cluster_relmap_authority_v2_discard_pending(image);
+	relmap_x_held = false;
+	return result;
+}
+
+UT_TEST(test_v2_mutations_require_namespace_x_lock)
+{
+	RelMapFile map = map_image(40001);
+	ClusterRelmapV2Image image = staged_image();
+
+	setup(&identity);
+	observing_stage = true;
+	UT_ASSERT(!cluster_relmap_authority_v2_write_pending(&identity, 8, &owner, &map,
+		&writer_retention, &retention_lock));
+	observing_stage = false;
+	UT_ASSERT_EQ(reads, 0);
+	UT_ASSERT_EQ(writes, 0);
+	UT_ASSERT_EQ(cluster_relmap_authority_v2_publish(&image), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+	UT_ASSERT_EQ(cluster_relmap_authority_v2_discard_pending(&image), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+	UT_ASSERT_EQ(reads, 0);
+	UT_ASSERT_EQ(writes, 0);
 }
 
 static bool
@@ -1419,7 +1451,7 @@ UT_TEST(test_changed_wal_cannot_rebind_staged_pin)
 int
 main(void)
 {
-	UT_PLAN(40);
+	UT_PLAN(41);
 	UT_RUN(test_stage_both_copies_before_success);
 	UT_RUN(test_per_database_namespace);
 	UT_RUN(test_missing_authority_is_never_seeded);
@@ -1430,6 +1462,7 @@ main(void)
 	UT_RUN(test_inode_replaced_during_read_is_not_accepted);
 	UT_RUN(test_each_io_failure_retains_the_obligation);
 	UT_RUN(test_corrupt_or_replaced_readback_never_acknowledges_stage);
+	UT_RUN(test_v2_mutations_require_namespace_x_lock);
 	UT_RUN(test_publish_and_discard_clear_both_copies);
 	UT_RUN(test_partial_stage_can_be_discarded);
 	UT_RUN(test_primary_done_keeps_backup_pending_until_distinct_retry);

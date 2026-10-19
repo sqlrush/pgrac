@@ -227,9 +227,10 @@ cluster_relmap_authority_v2_init_image(const ClusterRelmapV2Namespace *identity,
 
 /*
  * V2 storage primitives; not wired into the live v1 publisher.  The caller
- * serializes the namespace with its relmap lock and binds expected to the
- * selected authority.  Read exposes committed data and pending obligations
- * separately.  A degraded read never proves the pending set complete.
+ * serializes the namespace with its relmap lock; entry checks that lock and
+ * binds expected to the selected authority.  Read exposes committed data and
+ * pending obligations separately.  A degraded read never proves the pending
+ * set complete.
  */
 extern ClusterRelmapV2PairResult
 cluster_relmap_authority_v2_read(const ClusterRelmapV2Namespace *expected,
@@ -244,8 +245,9 @@ cluster_relmap_authority_v2_read(const ClusterRelmapV2Namespace *expected,
  * SAME lock used for all access to its published state, not held on entry.
  * After read-only preflight this function marks the exact pin may_be_staged
  * under that lock, releases it, then writes. Missing/unknown/mismatching pins
- * cannot stage. The namespace X lock serializes the whole call with terminal
- * cleanup and generation replacement. No disk I/O runs under retention_lock.
+ * cannot stage. The namespace X lock is required and serializes the whole call
+ * with terminal cleanup and generation replacement. No disk I/O runs under
+ * retention_lock.
  *
  * This does not authenticate a complete census, producer provenance, WAL
  * durability or TT/claim retention. False may leave durable pending in either
@@ -268,7 +270,8 @@ typedef enum ClusterRelmapV2ClearResult {
 } ClusterRelmapV2ClearResult;
 
 /*
- * Finish exactly the original staged image under the same namespace X lock.
+ * Finish exactly the original staged image under the same namespace X lock,
+ * which is checked at entry.
  * The caller must independently prove its owner's matching commit/abort; this
  * storage primitive supplies no terminal authority and never releases a pin.
  * Both copies must be valid and match the original stage or its legal clean

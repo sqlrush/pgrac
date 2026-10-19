@@ -42,6 +42,7 @@
 #include <unistd.h>
 
 #include "cluster/cluster_relmap_authority.h"
+#include "cluster/cluster_relmap_lock.h"
 #include "common/relmap.h"
 #include "miscadmin.h"
 #include "port/pg_crc32c.h"
@@ -131,6 +132,12 @@ bool
 LWLockHeldByMe(LWLock *lock pg_attribute_unused())
 {
 	abort();
+}
+
+bool
+cluster_relmap_authority_x_held(void)
+{
+	return false;
 }
 
 /* Use the actual mapper consumer, with only backend lock/wait boundaries stubbed. */

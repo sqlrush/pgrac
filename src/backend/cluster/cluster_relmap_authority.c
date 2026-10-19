@@ -38,6 +38,7 @@
 
 #include "cluster/cluster_guc.h" /* cluster_shared_data_dir */
 #include "cluster/cluster_relmap_authority.h"
+#include "cluster/cluster_relmap_lock.h"
 #include "cluster/cluster_relmap_retention.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
@@ -672,7 +673,8 @@ cluster_relmap_authority_v2_write_pending(const ClusterRelmapV2Namespace *expect
 
 	/* No I/O can turn a disabled sync policy into durable stage permission. */
 	if (!enableFsync || owner == NULL || pending == NULL || retention == NULL
-		|| retention_lock == NULL || LWLockHeldByMe(retention_lock))
+		|| retention_lock == NULL || LWLockHeldByMe(retention_lock)
+		|| !cluster_relmap_authority_x_held())
 		return false;
 	if (!relmap_v2_open_dirs(expected, &dirs))
 		goto done;
@@ -727,6 +729,7 @@ relmap_v2_finish(const ClusterRelmapV2Image *staged, bool publish)
 	bool ok = false;
 
 	if (!enableFsync || staged == NULL || staged->pending_generation == 0
+		|| !cluster_relmap_authority_x_held()
 		|| cluster_relmap_v2_encode(staged, staged_bytes, sizeof(staged_bytes))
 			   != CLUSTER_RELMAP_V2_VALID)
 		return CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
