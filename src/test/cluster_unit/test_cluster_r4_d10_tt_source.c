@@ -95,6 +95,8 @@ static bool fake_recheck;
 static int fake_enter_count;
 static int fake_recheck_count;
 static int fake_leave_count;
+static int fake_wake_count;
+static ClusterTTStatusKey fake_wake_key;
 
 
 void
@@ -427,6 +429,15 @@ void
 cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unused())
 {}
 
+void
+cluster_txw_wake_waiters(const ClusterTTStatusKey *holder_key)
+{
+	fake_wake_count++;
+	UT_ASSERT_NOT_NULL(holder_key);
+	if (holder_key != NULL)
+		fake_wake_key = *holder_key;
+}
+
 static void
 reset_fixture(void)
 {
@@ -452,6 +463,8 @@ reset_fixture(void)
 	fake_enter_count = 0;
 	fake_recheck_count = 0;
 	fake_leave_count = 0;
+	fake_wake_count = 0;
+	memset(&fake_wake_key, 0, sizeof(fake_wake_key));
 	cluster_tt_status_shmem_init();
 }
 
@@ -544,6 +557,8 @@ UT_TEST(test_install_lookup_and_delete_publish_only_after_recheck)
 		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
 		CLUSTER_SEMANTIC_ADMISSION_OK);
 	UT_ASSERT(result.bool_value);
+	UT_ASSERT_EQ(fake_wake_count, 1);
+	UT_ASSERT_EQ(memcmp(&fake_wake_key, &key, sizeof(key)), 0);
 
 	memset(&result, 0xA5, sizeof(result));
 	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &request, &result),

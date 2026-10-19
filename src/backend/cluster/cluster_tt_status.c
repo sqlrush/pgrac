@@ -69,6 +69,10 @@
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_xid_stripe.h"
 
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_tx_enqueue.h"
+#endif
+
 /*
  * ClusterTTOverlayEntry -- HTAB value type.
  *
@@ -901,6 +905,15 @@ cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus s
 	memset(&e->parent_key, 0, sizeof(e->parent_key));
 
 	LWLockRelease(ClusterTTStatusLock);
+
+	/*
+	 * Publish-before-wake: this local terminal-install path is the single
+	 * completion point for waiters on this exact holder identity.  Keeping
+	 * it here covers both hint and direct source installs without making
+	 * either caller guess which path performed the install.
+	 */
+	if (status == CLUSTER_TT_STATUS_COMMITTED || status == CLUSTER_TT_STATUS_ABORTED)
+		cluster_txw_wake_waiters(key);
 
 	pg_atomic_fetch_add_u64(&ClusterTTStatusState->install_count, 1);
 	return true;
