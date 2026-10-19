@@ -9280,7 +9280,10 @@ test_cluster_initdb_tree: test_cluster_initdb_tree.c unit_test.h \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 # Compile the actual native entry bodies; no duplicated routing predicate.
 test_cluster_write_preflight.inc: $(top_srcdir)/src/backend/access/heap/heapam.c \
-		$(top_srcdir)/src/backend/executor/execMain.c
+		$(top_srcdir)/src/backend/executor/execMain.c \
+		$(top_srcdir)/src/backend/commands/copyfrom.c \
+		$(top_srcdir)/src/backend/access/heap/visibilitymap.c \
+		$(top_srcdir)/src/backend/commands/copy.c Makefile
 	awk '/^(cluster_heap_itl_relation_route|cluster_itl_write_path_enabled)\(/ \
 	     { print "static bool"; emit=1; n++ } \
 	     /^cluster_heap_preflight_write\(/ { print "bool"; emit=1; n++ } \
@@ -9288,6 +9291,12 @@ test_cluster_write_preflight.inc: $(top_srcdir)/src/backend/access/heap/heapam.c
 	     emit { print } /^}/ { emit=0 } END { if(n!=4) exit 1 }' $(word 1,$^) > $@.tmp
 	awk '/^(cluster_executor_preflight_write|InitPlan)\(/ { print "static void"; emit=1; n++ } \
 	     emit { print } /^}/ { emit=0 } END { if(n!=2) exit 1 }' $(word 2,$^) >> $@.tmp
+	awk '/^BeginCopyFrom\(/ { print "CopyFromState"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if(n!=1) exit 1 }' $(word 3,$^) >> $@.tmp
+	awk '/^cluster_heap_maintenance_restricted\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if(n!=1) exit 1 }' $(word 4,$^) >> $@.tmp
+	awk '/^DoCopy\(/ { print "void"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if(n!=1) exit 1 }' $(word 5,$^) >> $@.tmp
 	mv $@.tmp $@
 
 test_cluster_write_preflight: test_cluster_write_preflight.c unit_test.h \

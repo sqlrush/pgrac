@@ -49,6 +49,7 @@
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "optimizer/optimizer.h"
 #include "pgstat.h"
 #include "rewrite/rewriteHandler.h"
@@ -902,8 +903,8 @@ CopyFrom(CopyFromState cstate)
 		 * expressions in WHERE clause.  Similarly to the trigger case above,
 		 * such expressions may query the table we're inserting into.
 		 *
-		 * Note: the whereClause was already preprocessed in DoCopy(), so it's
-		 * okay to use contain_volatile_functions() directly.
+		 * Note: the whereClause was already preprocessed in BeginCopyFrom(),
+		 * so it's okay to use contain_volatile_functions() directly.
 		 */
 		insertMethod = CIM_SINGLE;
 	}
@@ -1338,7 +1339,7 @@ CopyFrom(CopyFromState cstate)
  * Setup to read tuples from a file for COPY FROM.
  *
  * 'rel': Used as a template for the tuples
- * 'whereClause': WHERE clause from the COPY FROM command
+ * 'whereClause': transformed WHERE expression from the COPY FROM command
  * 'filename': Name of server-local file to read, NULL for STDIN
  * 'is_program': true if 'filename' is program to execute
  * 'data_source_cb': callback that provides the input data
@@ -1398,6 +1399,28 @@ BeginCopyFrom(ParseState *pstate,
 
 	/* Process the target relation */
 	cstate->rel = rel;
+
+	/*
+	 * Bind supported shared writes before default planning or input handling
+	 * can run user code, even when the input is empty.  Keep the shared FREEZE
+	 * refusal ahead of BIND; CopyFrom retains the full native target checks.
+	 */
+	if (rel->rd_rel->relkind == RELKIND_RELATION ||
+		rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		if (cstate->opts.freeze)
+		{
+			if (cluster_heap_maintenance_restricted(rel))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("COPY FREEZE is not supported for shared heaps"),
+						 errhint("Use COPY without FREEZE.")));
+		}
+#ifdef USE_PGRAC_CLUSTER
+		else
+			(void) cluster_heap_preflight_write(rel, "COPY FROM");
+#endif
+	}
 
 	tupDesc = RelationGetDescr(cstate->rel);
 
@@ -1508,6 +1531,13 @@ BeginCopyFrom(ParseState *pstate,
 
 	cstate->copy_src = COPY_FILE;	/* default */
 
+	/* Constant folding can run user functions; the write preflight is done. */
+	if (whereClause)
+	{
+		whereClause = eval_const_expressions(NULL, whereClause);
+		whereClause = (Node *) canonicalize_qual((Expr *) whereClause, false);
+		whereClause = (Node *) make_ands_implicit((Expr *) whereClause);
+	}
 	cstate->whereClause = whereClause;
 
 	/* Initialize state variables */

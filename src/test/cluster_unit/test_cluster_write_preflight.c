@@ -1,28 +1,50 @@
 /*-------------------------------------------------------------------------
  * test_cluster_write_preflight.c
- *    Run the native plan initialization before any child can write or lock.
+ *    Run native executor and COPY entries before child work can write or lock.
  *
  * Portions Copyright (c) 2026, pgrac contributors
  * Author: SqlRush <sqlrush@gmail.com>
  * IDENTIFICATION
  *    src/test/cluster_unit/test_cluster_write_preflight.c
  *
- * The complete InitPlan body and heap preflight/guard bodies are extracted
- * verbatim. Relation lookup, canonical publication and child execution are
- * explicit boundaries; this fixture does not simulate BIND durability.
+ * The complete InitPlan, DoCopy, BeginCopyFrom and heap preflight/guard bodies are
+ * extracted verbatim. Relation lookup, canonical publication, COPY options,
+ * default planning and input are explicit boundaries. This fixture does not
+ * execute the COPY row loop or simulate BIND durability/transaction cleanup.
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include <sys/stat.h>
+#include <unistd.h>
 #include "access/heapam.h"
+#include "access/sysattr.h"
+#include "access/table.h"
+#include "access/visibilitymap.h"
 #include "access/xact.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_class.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_tt_local.h"
+#include "commands/copyfrom_internal.h"
+#include "commands/progress.h"
 #include "executor/executor.h"
+#include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
+#include "optimizer/optimizer.h"
+#include "parser/parse_coerce.h"
+#include "parser/parse_collate.h"
+#include "parser/parse_expr.h"
+#include "parser/parse_relation.h"
+#include "rewrite/rewriteHandler.h"
+#include "storage/fd.h"
+#include "utils/lsyscache.h"
+#include "utils/acl.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/rls.h"
 
 #undef printf
 #undef fprintf
@@ -34,6 +56,9 @@ bool cluster_shared_catalog;
 int cluster_node_id;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
+MemoryContext CurrentMemoryContext;
+CommandDest whereToSendOutput = DestNone;
+bool XactReadOnly;
 static RelationData relations[4];
 static FormData_pg_class forms[4];
 static RangeTblEntry ranges[4];
@@ -46,6 +71,17 @@ static TransactionId top_xid, current_xid;
 static bool in_child, publish_ok, permissions_ok, child_error;
 static unsigned allocations, prepares, bindings, child_calls, unbound_children;
 static int reported_code;
+static CopyFormatOptions copy_options;
+static bool copy_default, copy_default_error, copy_option_error;
+static unsigned default_plans, binary_headers, copy_unbound_work, input_reads;
+static Expr copy_default_expr;
+static ExprState copy_default_state;
+static bool copy_where_error;
+static unsigned where_folds, where_canonicalizations, where_lists, copy_runs;
+static Expr copy_where_expr;
+static List *copy_where_list;
+static ParseNamespaceItem copy_namespace;
+static RTEPermissionInfo copy_permission;
 
 void *
 palloc(Size size)
@@ -88,6 +124,12 @@ void *
 MemoryContextAlloc(MemoryContext context, Size size)
 {
 	return palloc(size);
+}
+
+void *
+MemoryContextAllocZeroAligned(MemoryContext context, Size size)
+{
+	return palloc0(size);
 }
 
 void
@@ -259,6 +301,328 @@ bms_is_member(int member, const Bitmapset *set)
 	return false;
 }
 
+/* COPY catalog, memory, option and input boundaries. No rows are consumed. */
+MemoryContext
+AllocSetContextCreateInternal(MemoryContext parent, const char *name, Size min, Size init, Size max)
+{
+	return NULL;
+}
+
+void
+ProcessCopyOptions(ParseState *pstate, CopyFormatOptions *opts, bool is_from, List *options)
+{
+	if (copy_option_error)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("fixture COPY option error")));
+	*opts = copy_options;
+}
+
+List *
+CopyGetAttnums(TupleDesc desc, Relation rel, List *names)
+{
+	return copy_default ? NIL : list_make1_int(1);
+}
+
+int
+pg_get_client_encoding(void)
+{
+	return PG_SQL_ASCII;
+}
+
+int
+GetDatabaseEncoding(void)
+{
+	return PG_SQL_ASCII;
+}
+
+Oid
+FindDefaultConversionProc(int32 from, int32 to)
+{
+	abort();
+}
+
+const char *
+pg_encoding_to_char(int encoding)
+{
+	abort();
+}
+
+void
+initStringInfo(StringInfo str)
+{
+	MemSet(str, 0, sizeof(*str));
+}
+
+void
+getTypeInputInfo(Oid type, Oid *input, Oid *param)
+{
+	*input = *param = 1;
+}
+
+void
+getTypeBinaryInputInfo(Oid type, Oid *input, Oid *param)
+{
+	getTypeInputInfo(type, input, param);
+}
+
+void
+fmgr_info(Oid oid, FmgrInfo *info)
+{
+	MemSet(info, 0, sizeof(*info));
+}
+
+Node *
+build_column_default(Relation rel, int attr)
+{
+	return (Node *)&copy_default_expr;
+}
+
+Expr *
+expression_planner(Expr *expr)
+{
+	default_plans++;
+	if (bindings == 0)
+		copy_unbound_work++;
+	if (copy_default_error)
+		ereport(ERROR,
+				(errcode(ERRCODE_RAISE_EXCEPTION), errmsg("fixture default planning error")));
+	return expr;
+}
+
+ExprState *
+ExecInitExpr(Expr *expr, PlanState *parent)
+{
+	return &copy_default_state;
+}
+
+bool
+contain_volatile_functions_not_nextval(Node *expr)
+{
+	return false;
+}
+
+void
+pgstat_progress_start_command(ProgressCommandType command, Oid oid)
+{}
+
+void
+pgstat_progress_update_multi_param(int nparam, const int *index, const int64 *value)
+{}
+
+void
+ReceiveCopyBegin(CopyFromState cstate)
+{
+	abort();
+}
+
+void
+ReceiveCopyBinaryHeader(CopyFromState cstate)
+{
+	binary_headers++;
+	if (bindings == 0)
+		copy_unbound_work++;
+}
+
+char *
+pstrdup(const char *str)
+{
+	return strdup(str);
+}
+
+FILE *
+OpenPipeStream(const char *command, const char *mode)
+{
+	abort();
+}
+
+FILE *
+AllocateFile(const char *name, const char *mode)
+{
+	abort();
+}
+
+int
+errcode_for_file_access(void)
+{
+	abort();
+}
+
+static int
+empty_copy_input(void *outbuf, int minread, int maxread)
+{
+	input_reads++;
+	return 0;
+}
+
+/* Execute the complete SQL caller with parser/catalog and row-loop boundaries. */
+Oid
+GetUserId(void)
+{
+	return 1;
+}
+
+bool
+has_privs_of_role(Oid member, Oid role)
+{
+	return true;
+}
+
+Relation
+table_openrv(const RangeVar *relation, LOCKMODE lockmode)
+{
+	return &relations[0];
+}
+
+void
+table_close(Relation relation, LOCKMODE lockmode)
+{}
+
+ParseNamespaceItem *
+addRangeTableEntryForRelation(ParseState *pstate, Relation relation, int lockmode, Alias *alias,
+							  bool inh, bool in_from)
+{
+	copy_namespace.p_perminfo = &copy_permission;
+	return &copy_namespace;
+}
+
+void
+addNSItemToQuery(ParseState *pstate, ParseNamespaceItem *item, bool join, bool rel, bool var)
+{}
+
+Node *
+transformExpr(ParseState *pstate, Node *expr, ParseExprKind kind)
+{
+	return expr;
+}
+
+Node *
+coerce_to_boolean(ParseState *pstate, Node *expr, const char *construct)
+{
+	return expr;
+}
+
+void
+assign_expr_collations(ParseState *pstate, Node *expr)
+{}
+
+void
+pull_varattnos(Node *expr, Index varno, Bitmapset **attrs)
+{
+	*attrs = NULL;
+}
+
+Bitmapset *
+bms_add_range(Bitmapset *set, int lower, int upper)
+{
+	abort();
+}
+
+Bitmapset *
+bms_del_member(Bitmapset *set, int member)
+{
+	abort();
+}
+
+int
+bms_next_member(const Bitmapset *set, int previous)
+{
+	return -1;
+}
+
+Bitmapset *
+bms_add_member(Bitmapset *set, int member)
+{
+	return set;
+}
+
+char *
+get_attname(Oid relation, AttrNumber attr, bool missing_ok)
+{
+	abort();
+}
+
+char *
+get_namespace_name(Oid namespace)
+{
+	abort();
+}
+
+RangeVar *
+makeRangeVar(char *schema, char *relation, int location)
+{
+	abort();
+}
+
+int
+check_enable_rls(Oid relation, Oid user, bool no_error)
+{
+	return RLS_NONE;
+}
+
+void
+PreventCommandIfReadOnly(const char *command)
+{
+	ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("fixture read-only")));
+}
+
+Node *
+eval_const_expressions(PlannerInfo *root, Node *expr)
+{
+	where_folds++;
+	if (bindings == 0)
+		copy_unbound_work++;
+	if (copy_where_error)
+		ereport(ERROR, (errcode(ERRCODE_RAISE_EXCEPTION), errmsg("fixture WHERE function error")));
+	return expr;
+}
+
+Expr *
+canonicalize_qual(Expr *expr, bool is_check)
+{
+	where_canonicalizations++;
+	return expr;
+}
+
+List *
+make_ands_implicit(Expr *expr)
+{
+	where_lists++;
+	copy_where_list = list_make1(expr);
+	return copy_where_list;
+}
+
+uint64
+CopyFrom(CopyFromState copy)
+{
+	copy_runs++;
+	if (copy->whereClause)
+		UT_ASSERT(copy->whereClause == (Node *)copy_where_list);
+	return 0;
+}
+
+void
+EndCopyFrom(CopyFromState copy)
+{}
+
+CopyToState
+BeginCopyTo(ParseState *pstate, Relation rel, RawStmt *query, Oid oid, const char *filename,
+			bool program, copy_data_dest_cb callback, List *attrs, List *options)
+{
+	abort();
+}
+
+uint64
+DoCopyTo(CopyToState copy)
+{
+	abort();
+}
+
+void
+EndCopyTo(CopyToState copy)
+{
+	abort();
+}
+
 #include "../../backend/nodes/list.c"
 #include "test_cluster_write_preflight.inc"
 
@@ -294,6 +658,16 @@ reset(void)
 	query.estate = &estate;
 	query.operation = CMD_UPDATE;
 	statement.resultRelations = list_make1_int(1);
+	MemSet(&copy_options, 0, sizeof(copy_options));
+	copy_default = copy_default_error = copy_option_error = false;
+	default_plans = binary_headers = copy_unbound_work = input_reads = 0;
+	copy_where_error = XactReadOnly = false;
+	where_folds = where_canonicalizations = where_lists = copy_runs = 0;
+	copy_where_list = NIL;
+	MemSet(&copy_namespace, 0, sizeof(copy_namespace));
+	MemSet(&copy_permission, 0, sizeof(copy_permission));
+	relations[0].rd_att = palloc0(offsetof(TupleDescData, attrs) + sizeof(FormData_pg_attribute));
+	relations[0].rd_att->natts = 1;
 }
 
 static bool
@@ -507,11 +881,309 @@ UT_TEST(child_error_preserves_original_transaction_ownership)
 	UT_ASSERT_EQ(top_xid, 400);
 }
 
+static CopyFromState
+begin_copy(void)
+{
+	return BeginCopyFrom(NULL, &relations[0], NULL, NULL, false, empty_copy_input, NIL, NIL);
+}
+
+static bool
+copy_refused(void)
+{
+	volatile bool refused = false;
+
+	PG_TRY();
+	{
+		(void)begin_copy();
+	}
+	PG_CATCH();
+	{
+		refused = true;
+	}
+	PG_END_TRY();
+	return refused;
+}
+
+UT_TEST(copy_entry_binds_without_reading_any_input)
+{
+	CopyFromState copy;
+
+	reset();
+	copy = begin_copy();
+	UT_ASSERT(copy != NULL);
+	UT_ASSERT_EQ(copy->copy_src, COPY_CALLBACK);
+	UT_ASSERT_EQ(allocations, 1);
+	UT_ASSERT_EQ(prepares, 1);
+	UT_ASSERT_EQ(bindings, 1);
+	UT_ASSERT_EQ(input_reads, 0);
+}
+
+UT_TEST(copy_defaults_are_planned_after_bind)
+{
+	reset();
+	copy_default = true;
+	(void)begin_copy();
+	UT_ASSERT_EQ(default_plans, 1);
+	UT_ASSERT_EQ(bindings, 1);
+	UT_ASSERT_EQ(copy_unbound_work, 0);
+}
+
+UT_TEST(copy_binary_header_is_read_after_bind)
+{
+	reset();
+	copy_options.binary = true;
+	(void)begin_copy();
+	UT_ASSERT_EQ(binary_headers, 1);
+	UT_ASSERT_EQ(bindings, 1);
+	UT_ASSERT_EQ(copy_unbound_work, 0);
+}
+
+UT_TEST(copy_partition_root_binds_before_any_partition_is_selected)
+{
+	reset();
+	forms[0].relkind = RELKIND_PARTITIONED_TABLE;
+	relations[0].rd_locator.relNumber = 0;
+	(void)begin_copy();
+	UT_ASSERT_EQ(allocations, 1);
+	UT_ASSERT_EQ(prepares, 1);
+	UT_ASSERT_EQ(bindings, 1);
+}
+
+UT_TEST(copy_shared_catalog_uses_original_binding)
+{
+	reset();
+	cluster_shared_catalog = true;
+	relations[0].rd_locator.relNumber = 1249;
+	(void)begin_copy();
+	UT_ASSERT_EQ(prepares, 1);
+	UT_ASSERT_EQ(bindings, 1);
+}
+
+UT_TEST(copy_private_temp_and_disabled_targets_remain_lazy)
+{
+	for (unsigned kind = 0; kind < 5; ++kind) {
+		reset();
+		if (kind == 0)
+			forms[0].relpersistence = RELPERSISTENCE_TEMP;
+		else if (kind == 1)
+			relations[0].rd_locator.relNumber = 1249;
+		else if (kind == 2)
+			cluster_enabled = false;
+		else if (kind == 3)
+			cluster_node_id = -1;
+		else {
+			forms[0].relkind = RELKIND_PARTITIONED_TABLE;
+			forms[0].relpersistence = RELPERSISTENCE_TEMP;
+		}
+		(void)begin_copy();
+		UT_ASSERT_EQ(allocations + prepares, 0);
+	}
+}
+
+UT_TEST(copy_nonwrite_target_kinds_do_not_bind)
+{
+	char kinds[] = { RELKIND_VIEW, RELKIND_FOREIGN_TABLE, RELKIND_MATVIEW, RELKIND_SEQUENCE };
+
+	for (unsigned i = 0; i < lengthof(kinds); ++i) {
+		reset();
+		forms[0].relkind = kinds[i];
+		cluster_shared_catalog = true;
+		(void)begin_copy();
+		UT_ASSERT_EQ(allocations + prepares, 0);
+	}
+}
+
+UT_TEST(copy_subtransaction_rejects_before_bind_defaults_or_input)
+{
+	reset();
+	in_child = copy_default = copy_options.binary = true;
+	UT_ASSERT(copy_refused());
+	UT_ASSERT_EQ(reported_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+	UT_ASSERT_EQ(allocations + prepares + default_plans + binary_headers, 0);
+}
+
+UT_TEST(copy_bind_failure_prevents_defaults_and_input)
+{
+	reset();
+	copy_default = copy_options.binary = true;
+	publish_ok = false;
+	UT_ASSERT(copy_refused());
+	UT_ASSERT_EQ(reported_code, ERRCODE_DATA_CORRUPTED);
+	UT_ASSERT_EQ(allocations, 1);
+	UT_ASSERT_EQ(prepares, 1);
+	UT_ASSERT_EQ(bindings + default_plans + binary_headers, 0);
+}
+
+UT_TEST(copy_shared_freeze_rejects_before_bind_defaults_or_input)
+{
+	char kinds[] = { RELKIND_RELATION, RELKIND_PARTITIONED_TABLE };
+
+	for (unsigned i = 0; i < lengthof(kinds); ++i) {
+		reset();
+		forms[0].relkind = kinds[i];
+		copy_options.freeze = copy_default = copy_options.binary = true;
+		UT_ASSERT(copy_refused());
+		UT_ASSERT_EQ(reported_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+		UT_ASSERT_EQ(allocations + prepares + default_plans + binary_headers, 0);
+	}
+}
+
+UT_TEST(copy_existing_binding_does_not_allocate_a_new_xid)
+{
+	reset();
+	top_xid = current_xid = 400;
+	bindings = 1;
+	copy_default = true;
+	(void)begin_copy();
+	UT_ASSERT_EQ(allocations, 0);
+	UT_ASSERT_EQ(prepares, 1);
+	UT_ASSERT_EQ(bindings, 1);
+	UT_ASSERT_EQ(copy_unbound_work, 0);
+}
+
+UT_TEST(copy_default_error_retains_original_transaction_ownership)
+{
+	reset();
+	copy_default = copy_default_error = true;
+	UT_ASSERT(copy_refused());
+	UT_ASSERT_EQ(reported_code, ERRCODE_RAISE_EXCEPTION);
+	UT_ASSERT_EQ(prepares, 1);
+	UT_ASSERT_EQ(bindings, 1);
+	UT_ASSERT_EQ(copy_unbound_work, 0);
+	UT_ASSERT_EQ(top_xid, 400);
+}
+
+UT_TEST(copy_invalid_options_reject_before_bind)
+{
+	reset();
+	copy_option_error = true;
+	UT_ASSERT(copy_refused());
+	UT_ASSERT_EQ(reported_code, ERRCODE_INVALID_PARAMETER_VALUE);
+	UT_ASSERT_EQ(allocations + prepares + default_plans + binary_headers, 0);
+}
+
+UT_TEST(copy_identity_mismatch_rejects_before_prepare)
+{
+	reset();
+	top_xid = 400;
+	current_xid = 401;
+	copy_default = copy_options.binary = true;
+	UT_ASSERT(copy_refused());
+	UT_ASSERT_EQ(reported_code, ERRCODE_INTERNAL_ERROR);
+	UT_ASSERT_EQ(allocations + prepares + default_plans + binary_headers, 0);
+}
+
+UT_TEST(copy_temp_freeze_does_not_bind)
+{
+	reset();
+	forms[0].relpersistence = RELPERSISTENCE_TEMP;
+	copy_options.freeze = true;
+	(void)begin_copy();
+	UT_ASSERT_EQ(allocations + prepares, 0);
+}
+
+static bool
+sql_copy_where_refused(void)
+{
+	ParseState pstate = { 0 };
+	RangeVar target = { 0 };
+	CopyStmt stmt = { 0 };
+	uint64 processed;
+	volatile bool refused = false;
+
+	stmt.relation = &target;
+	stmt.is_from = true;
+	stmt.whereClause = (Node *)&copy_where_expr;
+	PG_TRY();
+	{
+		DoCopy(&pstate, &stmt, 0, 0, &processed);
+	}
+	PG_CATCH();
+	{
+		refused = true;
+	}
+	PG_END_TRY();
+	return refused;
+}
+
+UT_TEST(copy_sql_where_folds_after_bind)
+{
+	reset();
+	copy_default = copy_options.binary = true;
+	UT_ASSERT(!sql_copy_where_refused());
+	UT_ASSERT_EQ(bindings, 1);
+	UT_ASSERT_EQ(where_folds, 1);
+	UT_ASSERT_EQ(where_canonicalizations, 1);
+	UT_ASSERT_EQ(where_lists, 1);
+	UT_ASSERT_EQ(default_plans, 1);
+	UT_ASSERT_EQ(binary_headers, 1);
+	UT_ASSERT_EQ(copy_unbound_work, 0);
+	UT_ASSERT_EQ(copy_runs, 1);
+}
+
+UT_TEST(copy_sql_where_subtransaction_refuses_before_folding)
+{
+	reset();
+	in_child = true;
+	UT_ASSERT(sql_copy_where_refused());
+	UT_ASSERT_EQ(reported_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+	UT_ASSERT_EQ(allocations + prepares + where_folds + copy_runs, 0);
+}
+
+UT_TEST(copy_sql_where_freeze_refuses_before_folding)
+{
+	reset();
+	copy_options.freeze = true;
+	UT_ASSERT(sql_copy_where_refused());
+	UT_ASSERT_EQ(reported_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+	UT_ASSERT_EQ(allocations + prepares + where_folds + copy_runs, 0);
+}
+
+UT_TEST(copy_sql_where_permission_refuses_before_folding_or_bind)
+{
+	reset();
+	permissions_ok = false;
+	copy_where_error = true;
+	UT_ASSERT(sql_copy_where_refused());
+	UT_ASSERT_EQ(reported_code, ERRCODE_INSUFFICIENT_PRIVILEGE);
+	UT_ASSERT_EQ(allocations + prepares + where_folds + copy_runs, 0);
+}
+
+UT_TEST(copy_sql_where_readonly_refuses_before_folding_or_bind)
+{
+	reset();
+	XactReadOnly = copy_where_error = true;
+	UT_ASSERT(sql_copy_where_refused());
+	UT_ASSERT_EQ(reported_code, ERRCODE_READ_ONLY_SQL_TRANSACTION);
+	UT_ASSERT_EQ(allocations + prepares + where_folds + copy_runs, 0);
+}
+
+UT_TEST(copy_sql_where_bind_failure_prevents_folding)
+{
+	reset();
+	publish_ok = false;
+	UT_ASSERT(sql_copy_where_refused());
+	UT_ASSERT_EQ(reported_code, ERRCODE_DATA_CORRUPTED);
+	UT_ASSERT_EQ(prepares, 1);
+	UT_ASSERT_EQ(bindings + where_folds + copy_runs, 0);
+}
+
+UT_TEST(copy_sql_where_error_retains_original_binding)
+{
+	reset();
+	copy_where_error = true;
+	UT_ASSERT(sql_copy_where_refused());
+	UT_ASSERT_EQ(reported_code, ERRCODE_RAISE_EXCEPTION);
+	UT_ASSERT_EQ(where_folds, 1);
+	UT_ASSERT_EQ(bindings, 1);
+	UT_ASSERT_EQ(copy_unbound_work + copy_runs, 0);
+}
+
 int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(15);
+	UT_PLAN(37);
 	UT_RUN(zero_row_dml_binds_before_the_child_plan);
 	UT_RUN(modifying_cte_binds_before_any_subplan);
 	UT_RUN(row_locks_bind_before_rowmark_and_child_initialization);
@@ -527,6 +1199,28 @@ main(void)
 	UT_RUN(bind_failure_prevents_child_work);
 	UT_RUN(permissions_reject_before_bind);
 	UT_RUN(child_error_preserves_original_transaction_ownership);
+	UT_RUN(copy_entry_binds_without_reading_any_input);
+	UT_RUN(copy_defaults_are_planned_after_bind);
+	UT_RUN(copy_binary_header_is_read_after_bind);
+	UT_RUN(copy_partition_root_binds_before_any_partition_is_selected);
+	UT_RUN(copy_shared_catalog_uses_original_binding);
+	UT_RUN(copy_private_temp_and_disabled_targets_remain_lazy);
+	UT_RUN(copy_nonwrite_target_kinds_do_not_bind);
+	UT_RUN(copy_subtransaction_rejects_before_bind_defaults_or_input);
+	UT_RUN(copy_bind_failure_prevents_defaults_and_input);
+	UT_RUN(copy_shared_freeze_rejects_before_bind_defaults_or_input);
+	UT_RUN(copy_existing_binding_does_not_allocate_a_new_xid);
+	UT_RUN(copy_default_error_retains_original_transaction_ownership);
+	UT_RUN(copy_invalid_options_reject_before_bind);
+	UT_RUN(copy_identity_mismatch_rejects_before_prepare);
+	UT_RUN(copy_temp_freeze_does_not_bind);
+	UT_RUN(copy_sql_where_folds_after_bind);
+	UT_RUN(copy_sql_where_subtransaction_refuses_before_folding);
+	UT_RUN(copy_sql_where_freeze_refuses_before_folding);
+	UT_RUN(copy_sql_where_permission_refuses_before_folding_or_bind);
+	UT_RUN(copy_sql_where_readonly_refuses_before_folding_or_bind);
+	UT_RUN(copy_sql_where_bind_failure_prevents_folding);
+	UT_RUN(copy_sql_where_error_retains_original_binding);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

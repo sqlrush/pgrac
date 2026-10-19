@@ -183,11 +183,7 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 							errdetail("Column \"%s\" is a generated column.",
 									  get_attname(RelationGetRelid(rel), attno, false)));
 			}
-
-			whereClause = eval_const_expressions(NULL, whereClause);
-
-			whereClause = (Node *) canonicalize_qual((Expr *) whereClause, false);
-			whereClause = (Node *) make_ands_implicit((Expr *) whereClause);
+			/* Executable preprocessing follows the BIND in BeginCopyFrom. */
 		}
 
 		tupDesc = RelationGetDescr(rel);
