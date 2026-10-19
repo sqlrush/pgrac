@@ -122,6 +122,7 @@ relmap_runtime_fixture(bool attach)
 {
 	cluster_node_id = 0;
 	relmap_owner_fixture();
+	relmap_xidgen_held = false;
 	free(relmap_runtime_allocation);
 	relmap_runtime_allocation = NULL;
 	relmap_runtime_registered = NULL;
@@ -1262,4 +1263,391 @@ UT_TEST(test_relmap_runtime_active_refuses_a_foreign_directory_identity)
 		UT_ASSERT_EQ(relmap_retention_acquires, 1);
 		UT_ASSERT_EQ(relmap_assign_calls, 0);
 	}
+}
+
+/* Candidate inputs and nofail native publication below are controlled models,
+ * not certified origin floors/issuance or concurrent native allocator tests. */
+static void
+relmap_runtime_allocation_count(void *argument)
+{
+	unsigned *calls = argument;
+	UT_ASSERT(LWLockHeldByMeInMode(XidGenLock, LW_EXCLUSIVE));
+	UT_ASSERT(LWLockHeldByMeInMode(relmap_runtime_test_lock, LW_EXCLUSIVE));
+	(*calls)++;
+}
+
+static ClusterRelmapRetentionResult
+relmap_runtime_allocation_call(bool publish, uint64 sysid, uint64 dbinc,
+	uint16 origin, uint64 candidate)
+{
+	unsigned calls = 0;
+	ClusterRelmapRetentionResult result = publish
+		? cluster_relmap_retention_runtime_allocation_publish_v2(sysid, dbinc, origin,
+			candidate, relmap_runtime_allocation_count, &calls)
+		: cluster_relmap_retention_runtime_allocation_check_v2(sysid, dbinc, origin, candidate);
+	UT_ASSERT_EQ(calls, publish && result == CLUSTER_RELMAP_RETENTION_OK ? 1 : 0);
+	return result;
+}
+
+/* Stores and fault injection are controlled; the native allocator is not called. */
+typedef struct RelmapRuntimePublication {
+	ClusterRelmapOwnerSampleV2 sample;
+	ClusterRelmapV2Namespace identity;
+	uint64 candidate, native_next;
+	TransactionId proc_xid;
+	unsigned calls;
+	unsigned fault;
+	bool probes;
+} RelmapRuntimePublication;
+
+static void
+relmap_runtime_allocation_stores(void *argument)
+{
+	RelmapRuntimePublication *publication = argument;
+	ClusterRelmapRetentionRuntimeTruncateV2 receipt = { 0 };
+	unsigned reads = relmap_binding_reads, acquisitions = relmap_retention_acquires;
+
+	UT_ASSERT(relmap_retention_held && relmap_xidgen_held);
+	UT_ASSERT_EQ(InterruptHoldoffCount, 2);
+	UT_ASSERT_EQ(relmap_runtime_shmem->directories[0].last_issued, publication->candidate);
+	publication->calls++;
+	if (publication->fault == 1)
+		ereport(ERROR, (errmsg("controlled failure before native stores")));
+	if (publication->probes) {
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_begin_v2(&publication->sample,
+			&publication->identity, 9), CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_truncate_begin_v2(
+			publication->identity.system_identifier, publication->identity.database_incarnation,
+			0, publication->candidate, &receipt), CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+		for (unsigned publish = 0; publish < 2; publish++)
+			UT_ASSERT_EQ(relmap_runtime_allocation_call(publish,
+				publication->identity.system_identifier, publication->identity.database_incarnation,
+				0, publication->candidate + 1), CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+		UT_ASSERT_EQ(relmap_binding_reads, reads);
+		UT_ASSERT_EQ(relmap_retention_acquires, acquisitions);
+	}
+	/* A real caller supplies only these original nofail stores, without probes. */
+	publication->native_next = publication->candidate + 1;
+	publication->proc_xid = (uint32) publication->candidate;
+	if (publication->fault == 2)
+		ereport(ERROR, (errmsg("controlled failure after native stores")));
+}
+
+static void
+relmap_runtime_allocation_unchanged(bool begin, uint64 sysid, uint64 dbinc,
+	uint16 origin, uint64 candidate, ClusterRelmapRetentionResult expected)
+{
+	Size bytes = sizeof(relmap_runtime_shmem->directories);
+	void *before = relmap_runtime_shmem == NULL ? NULL : malloc(bytes);
+	unsigned reads = relmap_binding_reads, assignments = relmap_assign_calls;
+	unsigned stages = relmap_runtime_stage_calls;
+	int syncs = sync_calls, renames = rename_calls;
+	bool held = relmap_retention_held, xid_held = relmap_xidgen_held;
+
+	UT_ASSERT(before != NULL || relmap_runtime_shmem == NULL);
+	if (before != NULL)
+		memcpy(before, relmap_runtime_shmem->directories, bytes);
+	UT_ASSERT_EQ(relmap_runtime_allocation_call(begin, sysid, dbinc, origin, candidate), expected);
+	if (before != NULL) {
+		UT_ASSERT_EQ(memcmp(before, relmap_runtime_shmem->directories, bytes), 0);
+		free(before);
+	}
+	UT_ASSERT_EQ(relmap_retention_held, held);
+	UT_ASSERT_EQ(relmap_xidgen_held, xid_held);
+	UT_ASSERT_EQ(relmap_binding_reads, reads);
+	UT_ASSERT_EQ(relmap_assign_calls, assignments);
+	UT_ASSERT_EQ(relmap_runtime_stage_calls, stages);
+	UT_ASSERT_EQ(sync_calls, syncs);
+	UT_ASSERT_EQ(rename_calls, renames);
+}
+
+UT_TEST(test_relmap_runtime_allocation_snapshot_routes_original_origin_without_mutation)
+{
+	for (unsigned origin = 0; origin < CLUSTER_MAX_NODES; origin += CLUSTER_MAX_NODES - 1) {
+		relmap_runtime_fixture(true);
+		relmap_runtime_qualified_fixture(origin);
+		cluster_node_id = origin == 0 ? CLUSTER_MAX_NODES - 1 : 0;
+		relmap_global_x = false; /* Allocation must not require a relmap owner query. */
+		LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
+		relmap_runtime_allocation_unchanged(false, ref.claim.identity.system_identifier,
+			ref.claim.database_incarnation, origin, relmap_top_full + 101, CLUSTER_RELMAP_RETENTION_OK);
+		UT_ASSERT_EQ(relmap_retention_acquires, 1);
+		LWLockRelease(XidGenLock);
+	}
+}
+
+UT_TEST(test_relmap_runtime_allocation_holds_final_window_until_original_stores)
+{
+	RelmapRuntimePublication publication = { 0 };
+	ClusterRelmapRetentionDirectory before;
+	unsigned reads;
+
+	relmap_runtime_prepare_stage(&publication.sample, &publication.identity, 0, true);
+	before = relmap_runtime_shmem->directories[0];
+	publication.candidate = before.last_issued + 1;
+	publication.probes = true;
+	LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
+	reads = relmap_binding_reads;
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_allocation_publish_v2(
+		publication.identity.system_identifier, publication.identity.database_incarnation,
+		0, publication.candidate, relmap_runtime_allocation_stores, &publication),
+		CLUSTER_RELMAP_RETENTION_OK);
+	UT_ASSERT(!relmap_retention_held && relmap_xidgen_held);
+	UT_ASSERT_EQ(InterruptHoldoffCount, 1);
+	before.last_issued = publication.candidate;
+	UT_ASSERT_EQ(memcmp(&before, &relmap_runtime_shmem->directories[0], sizeof(before)), 0);
+	UT_ASSERT_EQ(publication.calls, 1);
+	UT_ASSERT_EQ(publication.native_next, publication.candidate + 1);
+	UT_ASSERT_EQ(publication.proc_xid, (uint32) publication.candidate);
+	UT_ASSERT_EQ(relmap_binding_reads, reads);
+	relmap_runtime_allocation_unchanged(true, publication.identity.system_identifier,
+		publication.identity.database_incarnation, 0, publication.candidate,
+		CLUSTER_RELMAP_RETENTION_INVALID);
+	LWLockRelease(XidGenLock);
+}
+
+UT_TEST(test_relmap_runtime_allocation_checks_each_namespace_and_stage_halfspace)
+{
+	for (unsigned shared = 0; shared < 2; shared++)
+		for (unsigned staged = 0; staged < 2; staged++) {
+			ClusterRelmapOwnerSampleV2 sample;
+			ClusterRelmapV2Namespace identity;
+			uint64 edge;
+
+			relmap_runtime_prepare_stage(&sample, &identity, 0, shared);
+			if (staged)
+				UT_ASSERT(cluster_relmap_retention_runtime_write_pending_v2(
+					&sample, &identity, 8, 456, &relmap_runtime_stage_map));
+			edge = sample.owner.top_full_xid + UINT64CONST(0x80000000);
+			LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
+			relmap_runtime_allocation_unchanged(false, identity.system_identifier,
+				identity.database_incarnation, 0, edge - 1, CLUSTER_RELMAP_RETENTION_OK);
+			for (unsigned begin = 0; begin < 2; begin++)
+				relmap_runtime_allocation_unchanged(begin, identity.system_identifier,
+					identity.database_incarnation, 0, edge, CLUSTER_RELMAP_RETENTION_XID_WINDOW);
+			UT_ASSERT_EQ(relmap_runtime_allocation_call(true, identity.system_identifier,
+				identity.database_incarnation, 0, edge - 1), CLUSTER_RELMAP_RETENTION_OK);
+			LWLockRelease(XidGenLock);
+		}
+}
+
+UT_TEST(test_relmap_runtime_allocation_rechecks_changed_pin_and_final_candidate)
+{
+	ClusterRelmapOwnerSampleV2 sample;
+	ClusterRelmapV2Namespace identity;
+	uint64 edge;
+
+	relmap_runtime_fixture(true);
+	relmap_runtime_qualified_fixture(0);
+	UT_ASSERT(cluster_relmap_owner_capture_v2(&sample));
+	identity = relmap_owner_namespace();
+	edge = sample.owner.top_full_xid + UINT64CONST(0x80000000);
+	LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
+	relmap_runtime_allocation_unchanged(false, identity.system_identifier,
+		identity.database_incarnation, 0, edge, CLUSTER_RELMAP_RETENTION_OK);
+	/* Deterministic interleaving: an existing old top adds its pin after check. */
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_begin_v2(&sample, &identity, 8),
+		CLUSTER_RELMAP_RETENTION_OK);
+	relmap_runtime_allocation_unchanged(true, identity.system_identifier,
+		identity.database_incarnation, 0, edge, CLUSTER_RELMAP_RETENTION_XID_WINDOW);
+	/* A new candidate after stripe/herding recomputation also needs final check. */
+	relmap_runtime_allocation_unchanged(false, identity.system_identifier,
+		identity.database_incarnation, 0, edge - 1, CLUSTER_RELMAP_RETENTION_OK);
+	relmap_runtime_allocation_unchanged(true, identity.system_identifier,
+		identity.database_incarnation, 0, edge + 1, CLUSTER_RELMAP_RETENTION_XID_WINDOW);
+	LWLockRelease(XidGenLock);
+}
+
+UT_TEST(test_relmap_runtime_allocation_refuses_unattached_unknown_and_building)
+{
+	for (unsigned state = 0; state < 3; state++) {
+		relmap_runtime_fixture(state != 0);
+		if (state == 2)
+			relmap_runtime_shmem->directories[0].state = CLUSTER_RELMAP_RETENTION_BUILDING;
+		LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
+		for (unsigned begin = 0; begin < 2; begin++)
+			relmap_runtime_allocation_unchanged(begin, ref.claim.identity.system_identifier,
+				ref.claim.database_incarnation, 0, relmap_top_full + 101,
+				CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+		UT_ASSERT_EQ(relmap_retention_acquires, state == 0 ? 0 : 2);
+		LWLockRelease(XidGenLock);
+	}
+}
+
+UT_TEST(test_relmap_runtime_allocation_rejects_identity_and_origin_before_indexing)
+{
+	for (unsigned fault = 0; fault < 9; fault++) {
+		uint64 sysid, dbinc;
+		uint16 origin = 0;
+
+		relmap_runtime_fixture(true);
+		relmap_runtime_qualified_fixture(0);
+		sysid = ref.claim.identity.system_identifier;
+		dbinc = ref.claim.database_incarnation;
+		if (fault == 0) sysid = 0;
+		if (fault == 1) dbinc = 0;
+		if (fault == 2) origin = CLUSTER_MAX_NODES;
+		if (fault == 3) origin = UINT16_MAX;
+		if (fault == 4) relmap_runtime_shmem->directories[0].origin++;
+		if (fault == 5) relmap_runtime_shmem->directories[0].system_identifier++;
+		if (fault == 6) relmap_runtime_shmem->directories[0].database_incarnation++;
+		if (fault == 7) sysid++;
+		if (fault == 8) dbinc++;
+		LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
+		for (unsigned begin = 0; begin < 2; begin++)
+			relmap_runtime_allocation_unchanged(begin, sysid, dbinc, origin,
+				relmap_top_full + 101, CLUSTER_RELMAP_RETENTION_INVALID);
+		UT_ASSERT_EQ(relmap_retention_acquires, fault < 4 ? 0 : 2);
+		LWLockRelease(XidGenLock);
+	}
+}
+
+UT_TEST(test_relmap_runtime_allocation_preserves_core_candidate_refusals)
+{
+	for (unsigned fault = 0; fault < 8; fault++) {
+		ClusterRelmapRetentionDirectory *directory;
+		uint64 candidate;
+
+		relmap_runtime_fixture(true);
+		relmap_runtime_qualified_fixture(0);
+		directory = &relmap_runtime_shmem->directories[0];
+		candidate = directory->last_issued + 1;
+		if (fault == 0) candidate = 0;
+		if (fault == 1) candidate = UINT64CONST(0x500000002);
+		if (fault == 2) candidate = PG_UINT64_MAX;
+		if (fault == 3) candidate = directory->last_issued;
+		if (fault == 4) candidate = directory->last_issued - 1;
+		if (fault == 5) directory->native_floor = candidate + 1;
+		if (fault == 6) {
+			/* Overflow fixture: never wrap the pin's upper bound to a small era. */
+			directory->native_floor = PG_UINT64_MAX - 300;
+			directory->last_issued = PG_UINT64_MAX - 200;
+			directory->pins[0].occupied = true;
+			directory->pins[0].key.top_full_xid = PG_UINT64_MAX - 150;
+			candidate = PG_UINT64_MAX - 1;
+		}
+		if (fault == 7) candidate = UINT64CONST(0x500000000);
+		LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
+		for (unsigned begin = 0; begin < 2; begin++)
+			relmap_runtime_allocation_unchanged(begin, ref.claim.identity.system_identifier,
+				ref.claim.database_incarnation, 0, candidate, fault == 6
+					? CLUSTER_RELMAP_RETENTION_XID_WINDOW : CLUSTER_RELMAP_RETENTION_INVALID);
+		LWLockRelease(XidGenLock);
+	}
+}
+
+UT_TEST(test_relmap_runtime_allocation_requires_original_exclusive_lock_and_own_window)
+{
+	uint64 sysid, dbinc, candidate;
+
+	relmap_runtime_fixture(true);
+	relmap_runtime_qualified_fixture(0);
+	sysid = ref.claim.identity.system_identifier;
+	dbinc = ref.claim.database_incarnation;
+	candidate = relmap_top_full + 101;
+	for (unsigned mode = 0; mode < 2; mode++) {
+		if (mode == 1) LWLockAcquire(XidGenLock, LW_SHARED);
+		for (unsigned publish = 0; publish < 2; publish++)
+			relmap_runtime_allocation_unchanged(publish, sysid, dbinc, 0, candidate,
+				CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+		if (mode == 1) LWLockRelease(XidGenLock);
+	}
+	UT_ASSERT_EQ(relmap_retention_acquires, 0);
+	LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
+	LWLockAcquire(relmap_runtime_test_lock, LW_EXCLUSIVE);
+	for (unsigned publish = 0; publish < 2; publish++)
+		relmap_runtime_allocation_unchanged(publish, sysid, dbinc, 0, candidate,
+			CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+	UT_ASSERT(relmap_retention_held && relmap_xidgen_held);
+	LWLockRelease(relmap_runtime_test_lock);
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_allocation_publish_v2(sysid, dbinc,
+		0, candidate, NULL, NULL), CLUSTER_RELMAP_RETENTION_INVALID);
+	UT_ASSERT(!relmap_retention_held && relmap_xidgen_held);
+	UT_ASSERT_EQ(relmap_retention_acquires, 1);
+	UT_ASSERT_EQ(relmap_runtime_allocation_call(true, sysid, dbinc, 0, candidate),
+		CLUSTER_RELMAP_RETENTION_OK);
+	UT_ASSERT_EQ(relmap_retention_acquires, 2);
+	LWLockRelease(XidGenLock);
+}
+
+static void
+relmap_runtime_allocation_inject_error(RelmapRuntimePublication *publication)
+{
+	volatile bool caught = false;
+	expect_panic = true;
+	PG_TRY();
+	{
+		(void) cluster_relmap_retention_runtime_allocation_publish_v2(
+			publication->identity.system_identifier, publication->identity.database_incarnation,
+			0, publication->candidate, relmap_runtime_allocation_stores, publication);
+		UT_ASSERT(false);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	expect_panic = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+	UT_ASSERT(PG_exception_stack == NULL);
+	UT_ASSERT(!relmap_retention_held && relmap_xidgen_held);
+	UT_ASSERT_EQ(publication->calls, 1);
+	UT_ASSERT_EQ(relmap_runtime_shmem->directories[0].last_issued, publication->candidate);
+}
+
+UT_TEST(test_relmap_runtime_allocation_error_cleanup_never_rewinds_observation)
+{
+	for (unsigned fault = 1; fault <= 2; fault++) {
+		RelmapRuntimePublication publication = { 0 };
+
+		relmap_runtime_prepare_stage(&publication.sample, &publication.identity, 0, true);
+		publication.candidate = relmap_runtime_shmem->directories[0].last_issued + 1;
+		publication.fault = fault;
+		LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
+		relmap_runtime_allocation_inject_error(&publication);
+		UT_ASSERT_EQ(publication.native_next, fault == 1 ? 0 : publication.candidate + 1);
+		UT_ASSERT_EQ(publication.proc_xid, fault == 1 ? 0 : (uint32) publication.candidate);
+		/* Match native LWLockReleaseAll: ERROR reset the holdoff count. */
+		HOLD_INTERRUPTS();
+		LWLockRelease(XidGenLock);
+		UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+		LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
+		relmap_runtime_allocation_unchanged(true, publication.identity.system_identifier,
+			publication.identity.database_incarnation, 0, publication.candidate,
+			CLUSTER_RELMAP_RETENTION_INVALID);
+		UT_ASSERT_EQ(relmap_runtime_allocation_call(true, publication.identity.system_identifier,
+			publication.identity.database_incarnation, 0, publication.candidate + 1),
+			CLUSTER_RELMAP_RETENTION_OK);
+		UT_ASSERT_EQ(relmap_runtime_shmem->directories[0].last_issued, publication.candidate + 1);
+		LWLockRelease(XidGenLock);
+	}
+}
+
+UT_TEST(test_relmap_runtime_allocation_error_reacquire_cannot_release_an_unrelated_lock)
+{
+	RelmapRuntimePublication publication = { 0 };
+	ClusterRelmapRetentionDirectory before;
+
+	relmap_runtime_prepare_stage(&publication.sample, &publication.identity, 0, true);
+	publication.candidate = relmap_runtime_shmem->directories[0].last_issued + 1;
+	publication.fault = 1;
+	LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
+	relmap_runtime_allocation_inject_error(&publication);
+	HOLD_INTERRUPTS(); /* Original LWLockReleaseAll owns the remaining XidGenLock. */
+	LWLockRelease(XidGenLock);
+	UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+	LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
+	LWLockAcquire(relmap_runtime_test_lock, LW_EXCLUSIVE);
+	before = relmap_runtime_shmem->directories[0];
+	/* No end/marker survives ERROR; neither adapter can release this acquisition. */
+	for (unsigned publish = 0; publish < 2; publish++)
+		relmap_runtime_allocation_unchanged(publish, publication.identity.system_identifier,
+			publication.identity.database_incarnation, 0, publication.candidate + 1,
+			CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+	UT_ASSERT(relmap_retention_held && relmap_xidgen_held);
+	UT_ASSERT_EQ(memcmp(&before, &relmap_runtime_shmem->directories[0], sizeof(before)), 0);
+	UT_ASSERT_EQ(publication.calls, 1);
+	LWLockRelease(relmap_runtime_test_lock);
+	LWLockRelease(XidGenLock);
 }

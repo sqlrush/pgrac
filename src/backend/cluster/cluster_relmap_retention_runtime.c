@@ -11,6 +11,7 @@
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h"
 #include "postmaster/interrupt.h"
+#include "storage/lwlock.h"
 #include "storage/shmem.h"
 
 #define RELMAP_RETENTION_RUNTIME_NAME "pgrac relmap retention"
@@ -268,9 +269,9 @@ cluster_relmap_retention_runtime_tt_release_check_v2(uint64 system_identifier,
 
 /* Caller holds the sole runtime lock; no ordinary owner can publish COMPLETE
  * through these adapters. The receipt identifies the original directory even
- * when this backend's current node differs from the truncation's origin. */
+ * when this backend's current node differs from the original owner's origin. */
 static ClusterRelmapRetentionResult
-relmap_runtime_truncate_matches(const ClusterRelmapRetentionDirectory *directory,
+relmap_runtime_origin_matches(const ClusterRelmapRetentionDirectory *directory,
 	uint64 system_identifier, uint64 database_incarnation, uint16 origin)
 {
 	if (directory->state != CLUSTER_RELMAP_RETENTION_COMPLETE)
@@ -300,7 +301,7 @@ cluster_relmap_retention_runtime_truncate_begin_v2(uint64 system_identifier,
 	prepared.database_incarnation = database_incarnation;
 	prepared.origin = origin;
 	LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
-	result = relmap_runtime_truncate_matches(directory, system_identifier, database_incarnation, origin);
+	result = relmap_runtime_origin_matches(directory, system_identifier, database_incarnation, origin);
 	if (result == CLUSTER_RELMAP_RETENTION_OK)
 		result = cluster_relmap_retention_truncate_begin(directory, requested_cutoff, &prepared.reservation);
 	/* The pure core clears its output on refusal. Keep that local so a BUSY
@@ -325,7 +326,7 @@ relmap_runtime_truncate_finish(const ClusterRelmapRetentionRuntimeTruncateV2 *re
 		return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
 	directory = &relmap_runtime_shmem->directories[reservation->origin];
 	LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
-	result = relmap_runtime_truncate_matches(directory, reservation->system_identifier,
+	result = relmap_runtime_origin_matches(directory, reservation->system_identifier,
 		reservation->database_incarnation, reservation->origin);
 	if (result == CLUSTER_RELMAP_RETENTION_OK)
 		result = uncertain
@@ -347,4 +348,66 @@ cluster_relmap_retention_runtime_truncate_uncertain_v2(
 	const ClusterRelmapRetentionRuntimeTruncateV2 *reservation)
 {
 	return relmap_runtime_truncate_finish(reservation, true);
+}
+
+static ClusterRelmapRetentionResult
+relmap_runtime_allocation_guard(uint64 system_identifier, uint64 database_incarnation,
+	uint16 origin, uint64 candidate, ClusterRelmapRetentionAllocationPublishV2 publish,
+	void *argument)
+{
+	ClusterRelmapRetentionDirectory *directory;
+	ClusterRelmapRetentionResult result;
+
+	if (system_identifier == 0 || database_incarnation == 0 || origin >= CLUSTER_MAX_NODES)
+		return CLUSTER_RELMAP_RETENTION_INVALID;
+	if (relmap_runtime_shmem == NULL || !LWLockHeldByMeInMode(XidGenLock, LW_EXCLUSIVE)
+		|| LWLockHeldByMe(&relmap_runtime_shmem->lock))
+		return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
+	directory = &relmap_runtime_shmem->directories[origin];
+	LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
+	result = relmap_runtime_origin_matches(directory, system_identifier, database_incarnation, origin);
+	if (result == CLUSTER_RELMAP_RETENTION_OK)
+		result = publish != NULL ? cluster_relmap_retention_allocation_observe(directory, candidate)
+			: cluster_relmap_retention_allocation_check(directory, candidate);
+	if (publish != NULL && result == CLUSTER_RELMAP_RETENTION_OK) {
+		/* Do not escape this acquisition or unlock before the original nofail
+		 * stores: a previous top could otherwise add a pin after the final cut.
+		 * Keep cleanup lexical so ERROR cannot leave a stale begin/end marker
+		 * that later releases some unrelated acquisition by this backend. */
+		PG_TRY();
+		{
+			publish(argument);
+		}
+		PG_CATCH();
+		{
+			/* ERROR resets InterruptHoldoffCount. Match LWLockReleaseAll
+			 * before the release resumes interrupts; never rewind even a
+			 * partial publication. Native cleanup still owns XidGenLock. */
+			HOLD_INTERRUPTS();
+			LWLockRelease(&relmap_runtime_shmem->lock);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+	}
+	LWLockRelease(&relmap_runtime_shmem->lock);
+	return result;
+}
+
+ClusterRelmapRetentionResult
+cluster_relmap_retention_runtime_allocation_check_v2(uint64 system_identifier,
+	uint64 database_incarnation, uint16 origin, uint64 candidate)
+{
+	return relmap_runtime_allocation_guard(system_identifier, database_incarnation,
+		origin, candidate, NULL, NULL);
+}
+
+ClusterRelmapRetentionResult
+cluster_relmap_retention_runtime_allocation_publish_v2(uint64 system_identifier,
+	uint64 database_incarnation, uint16 origin, uint64 candidate,
+	ClusterRelmapRetentionAllocationPublishV2 publish, void *argument)
+{
+	if (publish == NULL)
+		return CLUSTER_RELMAP_RETENTION_INVALID;
+	return relmap_runtime_allocation_guard(system_identifier, database_incarnation,
+		origin, candidate, publish, argument);
 }

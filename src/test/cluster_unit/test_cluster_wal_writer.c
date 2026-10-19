@@ -45,6 +45,7 @@ Oid MyDatabaseId = 42;
 BackendType MyBackendType = B_BACKEND;
 volatile sig_atomic_t ShutdownRequestPending;
 volatile uint32 CritSectionCount = 1;
+volatile uint32 InterruptHoldoffCount;
 MemoryContext CurrentMemoryContext, TopMemoryContext;
 ResourceOwner CurrentResourceOwner;
 sigjmp_buf *PG_exception_stack;
@@ -52,6 +53,8 @@ ErrorContextCallback *error_context_stack;
 void
 pg_re_throw(void)
 {
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
 	abort();
 }
 static LWLockPadded test_lwlocks[NUM_INDIVIDUAL_LWLOCKS];
@@ -60,6 +63,8 @@ static LWLock relmap_retention_lock;
 static LWLock *relmap_runtime_test_lock;
 static bool relmap_retention_held;
 static unsigned relmap_retention_acquires;
+static bool relmap_xidgen_held;
+static LWLockMode relmap_xidgen_mode;
 static void relmap_retention_lock_enter(void);
 static bool held = true, mapping_held, active = true, member = true, fence = true, prebump,
 			have_ref = true;
@@ -84,6 +89,10 @@ static char segment_path[MAXPGPATH];
 bool
 LWLockHeldByMeInMode(LWLock *l, LWLockMode m)
 {
+	if (l == XidGenLock)
+		return relmap_xidgen_held && m == relmap_xidgen_mode;
+	if (l == relmap_runtime_test_lock)
+		return relmap_retention_held && m == LW_EXCLUSIVE;
 	return m == LW_EXCLUSIVE
 		   && ((l == WALWriteLock && held) || (l == WALBufMappingLock && mapping_held));
 }
@@ -223,6 +232,11 @@ errfinish(const char *f pg_attribute_unused(), int l pg_attribute_unused(),
 {
 	if (!expect_panic)
 		abort();
+	if (PG_exception_stack != NULL) {
+		/* Match native errfinish(ERROR) before its handler longjmp. */
+		InterruptHoldoffCount = 0;
+		siglongjmp(*PG_exception_stack, 1);
+	}
 	siglongjmp(native_error, 1);
 }
 
@@ -368,12 +382,21 @@ LWLockAcquire(LWLock *l, LWLockMode mode)
 {
 	bool *state = l == WALWriteLock ? &held : &mapping_held;
 
+	if (l == XidGenLock) {
+		if (relmap_xidgen_held || relmap_retention_held)
+			abort();
+		relmap_xidgen_held = true;
+		relmap_xidgen_mode = mode;
+		HOLD_INTERRUPTS();
+		return true;
+	}
 	if (l == &relmap_retention_lock || l == relmap_runtime_test_lock) {
 		if (mode != LW_EXCLUSIVE || relmap_retention_held)
 			abort();
 		relmap_retention_lock_enter();
 		relmap_retention_held = true;
 		relmap_retention_acquires++;
+		HOLD_INTERRUPTS();
 		return true;
 	}
 	Assert((l == WALWriteLock || l == WALBufMappingLock) && mode == LW_EXCLUSIVE && !*state);
@@ -395,10 +418,18 @@ LWLockRelease(LWLock *l)
 {
 	bool *state = l == WALWriteLock ? &held : &mapping_held;
 
+	if (l == XidGenLock) {
+		if (!relmap_xidgen_held)
+			abort();
+		relmap_xidgen_held = false;
+		RESUME_INTERRUPTS();
+		return;
+	}
 	if (l == &relmap_retention_lock || l == relmap_runtime_test_lock) {
 		if (!relmap_retention_held)
 			abort();
 		relmap_retention_held = false;
+		RESUME_INTERRUPTS();
 		return;
 	}
 	Assert((l == WALWriteLock || l == WALBufMappingLock) && *state);
@@ -1419,7 +1450,7 @@ UT_TEST(test_requested_flush_rejects_foreign_or_unsafe_context_without_io)
 int
 main(void)
 {
-	UT_PLAN(88);
+	UT_PLAN(98);
 	UT_RUN(test_clean_writer_requires_selected_exit_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_requires_selected_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_keeps_runtime_fence_and_exact_owner_refusals);
@@ -1508,6 +1539,16 @@ main(void)
 	UT_RUN(test_relmap_runtime_truncate_rejects_foreign_directory_or_receipt_identity);
 	UT_RUN(test_relmap_runtime_truncate_preserves_core_cut_and_serial_refusals);
 	UT_RUN(test_relmap_runtime_truncate_never_reacquires_or_releases_callers_lock);
+	UT_RUN(test_relmap_runtime_allocation_snapshot_routes_original_origin_without_mutation);
+	UT_RUN(test_relmap_runtime_allocation_holds_final_window_until_original_stores);
+	UT_RUN(test_relmap_runtime_allocation_checks_each_namespace_and_stage_halfspace);
+	UT_RUN(test_relmap_runtime_allocation_rechecks_changed_pin_and_final_candidate);
+	UT_RUN(test_relmap_runtime_allocation_refuses_unattached_unknown_and_building);
+	UT_RUN(test_relmap_runtime_allocation_rejects_identity_and_origin_before_indexing);
+	UT_RUN(test_relmap_runtime_allocation_preserves_core_candidate_refusals);
+	UT_RUN(test_relmap_runtime_allocation_requires_original_exclusive_lock_and_own_window);
+	UT_RUN(test_relmap_runtime_allocation_error_cleanup_never_rewinds_observation);
+	UT_RUN(test_relmap_runtime_allocation_error_reacquire_cannot_release_an_unrelated_lock);
 	free(relmap_runtime_allocation);
 	if (scratch[0] && !rmtree(scratch, true))
 		abort();

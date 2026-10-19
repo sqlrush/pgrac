@@ -98,4 +98,33 @@ extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_truncate_co
 extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_truncate_uncertain_v2(
 	const ClusterRelmapRetentionRuntimeTruncateV2 *reservation);
 
+/* Dormant original allocator only, with its original XidGenLock EXCLUSIVE.
+ * The caller authenticates the original 0-based origin, sys/DB incarnation and
+ * qualified COMPLETE floor/issued inputs, and preserves every original wrap,
+ * StopLimit and lease gate. No current-node or raw-xid era substitution.
+ * Check is a read-only candidate snapshot for first/recomputed candidates;
+ * it is NOT a reservation. Publish rechecks the FINAL candidate under the
+ * sole retention lock and observes a conservative issued upper bound. On OK
+ * it invokes the original caller's nofail publication callback ONCE UNDER
+ * THAT LOCK, then releases retention while leaving XidGenLock held. Refusal
+ * never invokes the callback and releases only its own acquisition.
+ *
+ * Complete all fallible SLRU extension, allocation, I/O and owner queries
+ * BEFORE publish. The callback does ONLY the original nofail nextXid/ProcArray
+ * stores, retaining both locks; no ERROR, wait, lock acquisition/release or
+ * other work belongs in it. An unexpected ERROR releases this retention
+ * acquisition before rethrow to original native cleanup; it never rewinds
+ * the observation, which can conservatively refuse a skipped candidate.
+ * No begin/end capability or backend-local marker escapes the invocation;
+ * later calls cannot release an unrelated caller-held retention lock.
+ * Observation is not proof of actual issuance/birth or a source certificate.
+ * No live caller, qualified COMPLETE publisher or native issuance authority
+ * is installed here; no I/O/native owner query occurs under retention. */
+extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_allocation_check_v2(
+	uint64 system_identifier, uint64 database_incarnation, uint16 origin, uint64 candidate);
+typedef void (*ClusterRelmapRetentionAllocationPublishV2)(void *argument);
+extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_allocation_publish_v2(
+	uint64 system_identifier, uint64 database_incarnation, uint16 origin, uint64 candidate,
+	ClusterRelmapRetentionAllocationPublishV2 publish, void *argument);
+
 #endif

@@ -23,7 +23,8 @@ static ClusterCanonicalTxnBinding relmap_binding;
 static void
 relmap_retention_lock_enter(void)
 {
-	if ((!relmap_global_x && !relmap_active_owner)
+	if ((!relmap_global_x && !relmap_active_owner
+		 && !(relmap_xidgen_held && relmap_xidgen_mode == LW_EXCLUSIVE))
 		|| (relmap_local_lock && !relmap_stage_lock_window) || CritSectionCount != 0)
 		abort();
 }

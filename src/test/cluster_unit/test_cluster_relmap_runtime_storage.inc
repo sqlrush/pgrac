@@ -24,6 +24,13 @@ volatile uint32 CritSectionCount;
 static LWLockPadded runtime_storage_native_locks[NUM_INDIVIDUAL_LWLOCKS];
 LWLockPadded *MainLWLockArray = runtime_storage_native_locks;
 
+/* No allocation owner runs in this storage composition fixture. */
+bool
+LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
+{
+	return mode == LW_EXCLUSIVE && LWLockHeldByMe(lock);
+}
+
 static void *runtime_storage_allocation;
 static const ClusterShmemRegion *runtime_storage_region;
 static ClusterWalWriterToken runtime_storage_writer;
