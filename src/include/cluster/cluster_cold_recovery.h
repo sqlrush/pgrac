@@ -619,6 +619,28 @@ extern void cluster_cold_decoded_release_v1(ClusterColdDecodedV1 *decoded);
 extern bool cluster_cold_replay_effects_v1(const ClusterColdDecodedV1 *decoded,
 										   const ClusterColdStepV1 *step, bool own);
 
+/* Attempt-local proof that every pass-2 record reached the same complete
+ * effect matrix that the original owner classified.  This is neither a WAL
+ * field nor a completion authority: the caller still owns source, freshness,
+ * durability and fence checks. */
+typedef struct ClusterColdEffectsProofV1 {
+	uint64 records_seen[CLUSTER_COLD_MAX_PARTICIPANTS];
+	uint64 records_routed;
+	uint32 required_union;
+	uint32 routed_union;
+	bool invalid;
+} ClusterColdEffectsProofV1;
+
+extern void cluster_cold_effects_proof_init_v1(ClusterColdEffectsProofV1 *proof);
+extern bool cluster_cold_effects_proof_record_v1(ClusterColdEffectsProofV1 *proof,
+										 uint32 participant,
+										 const ClusterColdDecodedV1 *decoded,
+										 const ClusterColdStepV1 *step, bool own);
+extern bool cluster_cold_effects_proof_finish_v1(const ClusterColdEffectsProofV1 *proof,
+										 const ClusterColdPlanV1 *plan,
+										 const ClusterColdReplayResultV1 *result,
+										 uint32 participant_count);
+
 /*
  * Pass-2 reader over one ROOT-selected writer generation.  Segments are
  * opened through the selected restart-input opener (claim, namespace and

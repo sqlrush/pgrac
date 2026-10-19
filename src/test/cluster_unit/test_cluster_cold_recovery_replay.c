@@ -415,6 +415,87 @@ run(ClusterColdPlanV1 *plan, Harness *h, ClusterColdReplayResultV1 *result)
 	return cluster_cold_replay_run_v1(plan, cuts, 2, 0, &ops, h, result);
 }
 
+static bool
+proof_step_for(const ClusterColdPlanV1 *plan, uint32 participant, const FixRecord *record,
+			   ClusterColdStepV1 *out)
+{
+	uint32 i;
+
+	for (i = 0; i < cluster_cold_plan_step_count_v1(plan); i++) {
+		ClusterColdStepV1 step;
+
+		if (!cluster_cold_plan_step_v1(plan, i, &step))
+			return false;
+		if (step.participant == participant && step.read_rec_ptr == record->read
+			&& step.end_rec_ptr == record->end)
+			{
+				*out = step;
+				return true;
+			}
+	}
+	return false;
+}
+
+static void
+proof_decoded(const FixRecord *record, ClusterColdDecodedV1 *decoded,
+			  ClusterColdComponentV1 *page_component)
+{
+	memset(decoded, 0, sizeof(*decoded));
+	decoded->record.read_rec_ptr = record->read;
+	decoded->record.end_rec_ptr = record->end;
+	decoded->record.record_crc = (uint32)(record->read ^ record->end);
+	decoded->record.rmid = identity(record).rmid;
+	decoded->record.record_flags = 0;
+	decoded->effects.required = CLUSTER_COLD_EFFECT_RECORD;
+	if (!record->page) {
+		decoded->effects.native_apply = decoded->effects.required;
+		return;
+	}
+	*page_component = record->component;
+	decoded->record.component_count = 1;
+	decoded->record.components = page_component;
+	decoded->effects.required |= CLUSTER_COLD_EFFECT_PAGE;
+	decoded->effects.page_apply = decoded->effects.required;
+}
+
+/* Every pass-2 record must be admitted to the attempt-local effect proof;
+ * matching the plan count is what prevents a partial route matrix from
+ * reaching the completion consumer. */
+UT_TEST(test_effect_proof_requires_every_plan_record)
+{
+	ClusterColdPlanV1 *plan;
+	ClusterColdEffectsProofV1 proof;
+	ClusterColdReplayResultV1 result = { 0 };
+
+	fixture(false);
+	plan = seal();
+	cluster_cold_effects_proof_init_v1(&proof);
+	result.detail = CLUSTER_COLD_REPLAY_OK;
+	result.steps_done = cluster_cold_plan_step_count_v1(plan);
+	UT_ASSERT(!cluster_cold_effects_proof_finish_v1(&proof, plan, &result, 2));
+	for (uint32 p = 0; p < 2; p++) {
+		for (int i = 0; i < fix_count[p]; i++) {
+			ClusterColdDecodedV1 decoded;
+			ClusterColdComponentV1 page_component;
+			ClusterColdStepV1 step;
+			ClusterColdStepV1 *step_ptr = NULL;
+
+			proof_decoded(&fix[p][i], &decoded, &page_component);
+			if (fix[p][i].page) {
+				UT_ASSERT(proof_step_for(plan, p, &fix[p][i], &step));
+				step_ptr = &step;
+			}
+			/* This fixture models both streams as the original native owner; the
+			 * production caller supplies the real per-participant ownership bit. */
+			UT_ASSERT(cluster_cold_effects_proof_record_v1(&proof, p, &decoded, step_ptr, true));
+		}
+	}
+	UT_ASSERT(cluster_cold_effects_proof_finish_v1(&proof, plan, &result, 2));
+	proof.records_seen[1]--;
+	UT_ASSERT(!cluster_cold_effects_proof_finish_v1(&proof, plan, &result, 2));
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
 /*
  * Records before each scheduled record replay in stream order, the schedule
  * order crosses generations by dependency, and every stream is drained to
@@ -1133,7 +1214,8 @@ UT_TEST(test_dependency_cycle_is_bounded_without_consuming_waiting_record)
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(23);
+	UT_RUN(test_effect_proof_requires_every_plan_record);
 	UT_RUN(test_replay_rebinds_every_original_cut_before_callbacks);
 	UT_RUN(test_replay_rebinds_history_only_cut_before_scheduled_work);
 	UT_RUN(test_replay_cut_binding_uses_sealed_caller_order_and_value);

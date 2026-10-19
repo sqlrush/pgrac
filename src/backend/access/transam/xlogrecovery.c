@@ -3216,6 +3216,7 @@ typedef struct ClusterColdTypedReplay
 	ClusterColdXidProgressV1 xid_progress[CLUSTER_COLD_MAX_PARTICIPANTS];
 	bool		foreign_mutation_started;
 	bool		apply_foreign;	/* the record being applied is another generation's */
+	ClusterColdEffectsProofV1 effects;	/* complete pass-2 ordinary-effect coverage */
 	ClusterColdDecodedV1 decoded;	/* scratch for unscheduled records */
 	ClusterColdTouchedV1 touched;	/* files pass 2 changed, made durable before completion */
 } ClusterColdTypedReplay;
@@ -3368,7 +3369,8 @@ cluster_typed_replay_unscheduled(void *arg, uint32 participant)
 										&rep->decoded) != CLUSTER_COLD_OK)
 		cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
 									  "an unscheduled record no longer decodes");
-	if (!cluster_cold_replay_effects_v1(&rep->decoded, NULL, is_own))
+	if (!cluster_cold_effects_proof_record_v1(&rep->effects, participant, &rep->decoded, NULL,
+												 is_own))
 		cluster_typed_replay_mismatch(
 			rep, participant, r->ReadRecPtr,
 			"an unscheduled record has effects without a replay consumer");
@@ -3553,7 +3555,8 @@ cluster_typed_replay_scheduled(void *arg, uint32 participant, const ClusterColdS
 										source->claim.identity.storage_uuid, false, !is_own,
 										&rep->decoded)
 			!= CLUSTER_COLD_OK
-		|| !cluster_cold_replay_effects_v1(&rep->decoded, step, is_own)
+		|| !cluster_cold_effects_proof_record_v1(&rep->effects, participant, &rep->decoded, step,
+															 is_own)
 		|| action != cluster_cold_page_action_v1(step, is_own))
 		cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
 									  "a scheduled record has effects without a replay consumer");
@@ -3754,6 +3757,11 @@ cluster_typed_replay_publish(ClusterColdTypedReplay *rep, const ClusterColdRepla
 	uint16		thread = 0;
 	int			detail = 0;
 
+	if (!cluster_cold_effects_proof_finish_v1(&rep->effects, rep->typed->plan, result,
+												 rep->typed->participant_count))
+		cluster_typed_replay_unpublished(
+			rep->typed->participants[rep->typed->own_participant].thread_id,
+			"Complete ordinary effect coverage is missing or inconsistent", (int) result->detail);
 	if (!cluster_cold_completion_ready_v1(rep->typed, plan, result, &rep->touched, &thread))
 		cluster_typed_replay_unpublished(thread, "Replay did not end at its sealed tail",
 										 (int) result->detail);
@@ -3848,6 +3856,7 @@ cluster_recovery_typed_replay(ClusterColdTypedV1 **typed_address, TimeLineID *re
 	rep->typed = typed;
 	rep->fence_plan = fence_plan;
 	rep->replayTLI = replayTLI;
+	cluster_cold_effects_proof_init_v1(&rep->effects);
 	for (i = 0; i < typed->participant_count; i++)
 	{
 		rep->readers[i] = cluster_cold_reader_open_v1(&typed->sources[i],

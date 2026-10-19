@@ -161,6 +161,74 @@ cluster_cold_replay_effects_v1(const ClusterColdDecodedV1 *decoded, const Cluste
 		   && step->space_kind <= CLUSTER_COLD_SPACE_ADVANCE && e->space_apply == e->required;
 }
 
+void
+cluster_cold_effects_proof_init_v1(ClusterColdEffectsProofV1 *proof)
+{
+	if (proof != NULL)
+		memset(proof, 0, sizeof(*proof));
+}
+
+bool
+cluster_cold_effects_proof_record_v1(ClusterColdEffectsProofV1 *proof, uint32 participant,
+										 const ClusterColdDecodedV1 *decoded,
+										 const ClusterColdStepV1 *step, bool own)
+{
+	uint32 routed;
+
+	if (proof == NULL || decoded == NULL || participant >= CLUSTER_COLD_MAX_PARTICIPANTS
+		|| proof->invalid || !cluster_cold_replay_effects_v1(decoded, step, own)) {
+		if (proof != NULL)
+			proof->invalid = true;
+		return false;
+	}
+	routed = decoded->effects.native_apply | decoded->effects.page_apply
+			  | decoded->effects.space_apply | decoded->effects.no_effect;
+	proof->records_seen[participant]++;
+	proof->records_routed++;
+	proof->required_union |= decoded->effects.required;
+	proof->routed_union |= routed;
+	return true;
+}
+
+bool
+cluster_cold_effects_proof_finish_v1(const ClusterColdEffectsProofV1 *proof,
+										 const ClusterColdPlanV1 *plan,
+										 const ClusterColdReplayResultV1 *result,
+										 uint32 participant_count)
+{
+	uint64 expected_records = 0;
+	uint32 expected_steps;
+	uint32 expected_space_steps = 0;
+	uint32 i;
+
+	if (proof == NULL || plan == NULL || result == NULL || proof->invalid || participant_count == 0
+		|| participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| participant_count != cluster_cold_plan_participant_count_v1(plan)
+		|| result->detail != CLUSTER_COLD_REPLAY_OK)
+		return false;
+	for (i = 0; i < participant_count; i++) {
+		uint64 expected = cluster_cold_plan_replay_record_count_v1(plan, i);
+
+		if (proof->records_seen[i] != expected)
+			return false;
+		expected_records += expected;
+	}
+	expected_steps = cluster_cold_plan_step_count_v1(plan);
+	for (i = 0; i < expected_steps; i++) {
+		ClusterColdStepV1 step;
+
+		if (!cluster_cold_plan_step_v1(plan, i, &step))
+			return false;
+		if (step.step_kind == CLUSTER_COLD_STEP_SPACE)
+			expected_space_steps++;
+	}
+	return proof->records_routed == expected_records
+		   && proof->required_union == proof->routed_union
+		   && result->steps_done == expected_steps
+		   && result->space_steps == expected_space_steps
+		   && result->space_relations_finished == cluster_cold_plan_space_relation_count_v1(plan);
+}
+
 ClusterColdPageActionV1
 cluster_cold_page_action_v1(const ClusterColdStepV1 *step, bool own)
 {
