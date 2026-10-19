@@ -41,6 +41,7 @@ bool cluster_enabled = true, cluster_shared_config = true;
 int cluster_node_id = 0;
 char *cluster_wal_threads_dir, *DataDir;
 int MyProcPid = 79;
+Oid MyDatabaseId = 42;
 BackendType MyBackendType = B_BACKEND;
 volatile sig_atomic_t ShutdownRequestPending;
 volatile uint32 CritSectionCount = 1;
@@ -55,6 +56,10 @@ pg_re_throw(void)
 }
 static LWLockPadded test_lwlocks[NUM_INDIVIDUAL_LWLOCKS];
 LWLockPadded *MainLWLockArray = test_lwlocks;
+static LWLock relmap_retention_lock;
+static bool relmap_retention_held;
+static unsigned relmap_retention_acquires;
+static void relmap_retention_lock_enter(void);
 static bool held = true, mapping_held, active = true, member = true, fence = true, prebump,
 			have_ref = true;
 static bool fence_epoch_lag, fence_lease_zero, fence_expired, self_fenced;
@@ -361,6 +366,15 @@ bool
 LWLockAcquire(LWLock *l, LWLockMode mode)
 {
 	bool *state = l == WALWriteLock ? &held : &mapping_held;
+
+	if (l == &relmap_retention_lock) {
+		if (mode != LW_EXCLUSIVE || relmap_retention_held)
+			abort();
+		relmap_retention_lock_enter();
+		relmap_retention_held = true;
+		relmap_retention_acquires++;
+		return true;
+	}
 	Assert((l == WALWriteLock || l == WALBufMappingLock) && mode == LW_EXCLUSIVE && !*state);
 	*state = true;
 	if (l == WALWriteLock && lag_on_lock) {
@@ -379,6 +393,13 @@ void
 LWLockRelease(LWLock *l)
 {
 	bool *state = l == WALWriteLock ? &held : &mapping_held;
+
+	if (l == &relmap_retention_lock) {
+		if (!relmap_retention_held)
+			abort();
+		relmap_retention_held = false;
+		return;
+	}
 	Assert((l == WALWriteLock || l == WALBufMappingLock) && *state);
 	*state = false;
 }
@@ -1396,7 +1417,7 @@ UT_TEST(test_requested_flush_rejects_foreign_or_unsafe_context_without_io)
 int
 main(void)
 {
-	UT_PLAN(37);
+	UT_PLAN(43);
 	UT_RUN(test_clean_writer_requires_selected_exit_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_requires_selected_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_keeps_runtime_fence_and_exact_owner_refusals);
@@ -1434,6 +1455,12 @@ main(void)
 	UT_RUN(test_relmap_invalid_top_or_unqualified_writer_cannot_be_captured);
 	UT_RUN(test_relmap_revalidation_never_adopts_new_writer_or_reassigns_top);
 	UT_RUN(test_relmap_sample_fields_and_original_lock_context_are_exact);
+	UT_RUN(test_relmap_owner_retention_uses_original_key_and_published_receipt);
+	UT_RUN(test_relmap_owner_retention_absent_binding_stays_unresolved);
+	UT_RUN(test_relmap_owner_retention_refuses_stale_or_unsafe_owner);
+	UT_RUN(test_relmap_owner_retention_rejects_foreign_namespace_and_arguments);
+	UT_RUN(test_relmap_owner_retention_rechecks_after_original_binding_read);
+	UT_RUN(test_relmap_owner_retention_preserves_core_refusals);
 	if (scratch[0] && !rmtree(scratch, true))
 		abort();
 	pfree(cluster_wal_threads_dir);

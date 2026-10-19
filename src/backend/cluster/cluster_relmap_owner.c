@@ -84,3 +84,47 @@ cluster_relmap_owner_matches_v2(const ClusterRelmapOwnerSampleV2 *sample)
 		return false;
 	return cluster_wal_writer_check(&sample->writer) == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
+
+ClusterRelmapRetentionResult
+cluster_relmap_owner_retention_begin_v2(const ClusterRelmapOwnerSampleV2 *sample,
+	const ClusterRelmapV2Namespace *identity, uint64 generation,
+	ClusterRelmapRetentionDirectory *directory, LWLock *retention_lock)
+{
+	ClusterRelmapRetentionKey key = { 0 };
+	ClusterCanonicalTxnBinding binding;
+	ClusterRelmapRetentionResult result;
+	bool has_binding;
+
+	if (sample == NULL || identity == NULL || directory == NULL || retention_lock == NULL
+		|| retention_lock == RelationMappingLock)
+		return CLUSTER_RELMAP_RETENTION_INVALID;
+	if (LWLockHeldByMe(RelationMappingLock) || LWLockHeldByMe(retention_lock)
+		|| !cluster_relmap_owner_matches_v2(sample))
+		return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
+	if (identity->system_identifier != sample->writer.ref.claim.identity.system_identifier
+		|| identity->database_incarnation != sample->writer.ref.claim.database_incarnation
+		|| (identity->shared ? identity->dbid != InvalidOid
+							: !OidIsValid(MyDatabaseId) || identity->dbid != MyDatabaseId))
+		return CLUSTER_RELMAP_RETENTION_INVALID;
+
+	/* Read only: neither reserve a new slot nor reconstruct the original era.
+	 * A later ACTIVE owner must enroll any pin which is still unbound. */
+	has_binding = cluster_tt_local_get_published_binding(
+		XidFromFullTransactionId(FullTransactionIdFromU64(sample->owner.top_full_xid)), &binding);
+	if (!cluster_relmap_owner_matches_v2(sample))
+		return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
+	key.identity = *identity;
+	key.generation = generation;
+	key.origin = sample->owner.node;
+	key.top_full_xid = sample->owner.top_full_xid;
+	key.membership_epoch = sample->owner.membership_epoch;
+	key.admitted_incarnation = sample->owner.admitted_incarnation;
+	key.boot_incarnation = sample->owner.boot_incarnation;
+
+	/* XID/native authority providers and TT publication stay outside this lock.
+	 * The existing core checks COMPLETE, native retention and issuance bounds. */
+	LWLockAcquire(retention_lock, LW_EXCLUSIVE);
+	result = cluster_relmap_retention_begin_bound(directory, &key, has_binding ? &binding : NULL);
+	LWLockRelease(retention_lock);
+	return result;
+}

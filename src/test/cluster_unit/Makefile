@@ -8586,15 +8586,20 @@ test_cluster_wal_cut: test_cluster_wal_cut.c unit_test.h \
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # PGRAC: writer runtime checks with native caller boundaries. Author: SqlRush <sqlrush@gmail.com>
-test_cluster_wal_writer: unit_test.h \
+test_cluster_wal_writer: test_cluster_wal_writer.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_writer.c \
 		$(top_srcdir)/src/include/cluster/cluster_wal_writer.h \
 		test_cluster_relmap_owner.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_local.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(CLUSTER_WAL_CLAIM_O) xlogreader_fs.o \
 		test_cluster_wal_publish_tail.inc test_cluster_wal_publish_callers.inc test_cluster_wal_publish_entry.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(srcdir)/$@.c $(CLUSTER_WAL_CLAIM_O) \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		xlogreader_fs.o $(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 

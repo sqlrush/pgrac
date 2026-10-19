@@ -5,7 +5,9 @@
 #define CLUSTER_RELMAP_OWNER_H
 
 #include "cluster/cluster_wal_writer.h"
+#include "cluster/cluster_relmap_retention.h"
 #include "common/cluster_relmap_v2.h"
+#include "storage/lwlock.h"
 
 /* Process-local preparation only. Keep the complete native writer reference;
  * the on-disk relmap header cannot substitute for its WAL/claim retention.
@@ -26,5 +28,19 @@ extern bool cluster_relmap_owner_capture_v2(ClusterRelmapOwnerSampleV2 *out);
  * keeps the global X lock; RelationMappingLock may now be held. This rechecks
  * provenance only, never proves retention, WAL durability, stage or release. */
 extern bool cluster_relmap_owner_matches_v2(const ClusterRelmapOwnerSampleV2 *sample);
+
+/* Dormant preparation adapter, BEFORE RelationMappingLock/WAL/critical work.
+ * Recheck this original sample, read the original TT owner's published receipt
+ * (if any), and enroll its exact key under the supplied retention lock. Inputs
+ * are stable process-local copies; the caller keeps global relmap X throughout.
+ * No new XID, binding, native floor/issued proof or COMPLETE publication here.
+ * The caller must supply the real qualified directory and its one runtime lock,
+ * held in neither mode on entry. Only the pure core runs under that lock.
+ * Refusal preserves pins; OK is preparation, not WAL/stage/release authority.
+ * A later original writer recheck and independent WAL/claim duties still apply.
+ * No live caller or shared directory is registered by this interface. */
+extern ClusterRelmapRetentionResult cluster_relmap_owner_retention_begin_v2(
+	const ClusterRelmapOwnerSampleV2 *sample, const ClusterRelmapV2Namespace *identity,
+	uint64 generation, ClusterRelmapRetentionDirectory *directory, LWLock *retention_lock);
 
 #endif
