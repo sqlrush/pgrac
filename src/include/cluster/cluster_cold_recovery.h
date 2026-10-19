@@ -53,6 +53,7 @@
 #include "cluster/cluster_page_detached.h"
 #include "cluster/cluster_wal_source.h"
 #include "cluster/cluster_tt_slot.h"
+#include "cluster/cluster_recovery_tt_record.h"
 #include "cluster/cluster_recovery_reference_graph.h"
 
 #define CLUSTER_COLD_RECOVERY_INTERFACE_V1 1
@@ -893,6 +894,39 @@ typedef struct ClusterColdTtSlotInputV1 {
 typedef struct ClusterColdTtActiveIdentityV1 {
 	ClusterColdTtSlotKeyV1 key;
 } ClusterColdTtActiveIdentityV1;
+
+/* Attempt-local top proof assembled by the original source/effects owners.
+ * The six gates are deliberately independent: a physical ACTIVE slot alone
+ * never proves that it is the original top transaction.  FullXid, nextXid,
+ * and cluster epoch are absent because they are not loser gates. */
+typedef struct ClusterColdTopTxProofV1 {
+	ClusterColdTtSlotKeyV1 key;
+	bool producer_top;
+	bool qualified_base;
+	bool sealed_redo;
+	bool ordinary_effects;
+	bool old_writer_isolated;
+	bool terminal_match;
+} ClusterColdTopTxProofV1;
+
+/* Physical E1 loser identity. This is not a persistent record or authority
+ * grant; C0 derivation consumes it only after all physical fields match. */
+typedef struct ClusterColdLoserIdentityV1 {
+	ClusterColdTtSlotKeyV1 key;
+} ClusterColdLoserIdentityV1;
+
+/* The loser gate is independent from FullXid/epoch derivation. C0 refuses
+ * incomplete all-thread endpoints or any exact physical mismatch, while a
+ * C0 derivation failure never turns an already-proven physical loser into an
+ * abort. These are attempt-local helpers and add no persistent ABI. */
+extern bool cluster_cold_top_tx_loser_v1(const ClusterColdTtActiveIdentityV1 *active,
+										 const ClusterColdTopTxProofV1 *proof,
+										 ClusterColdLoserIdentityV1 *out);
+extern bool cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
+									 const ClusterRecoveryTTAbortV1 *shape, uint64 next_xid,
+									 bool all_endpoints_complete, bool has_oldest_xid,
+									 TransactionId oldest_xid, uint64 recoverer_epoch,
+									 ClusterRecoveryTTAbortDerivationV1 *out);
 
 /* Re-enumerate physical TT after complete redo and the original durability
  * barrier, without overwriting the pre-redo base. Share its remaining budget.

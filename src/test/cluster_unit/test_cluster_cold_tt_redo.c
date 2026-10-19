@@ -787,6 +787,129 @@ UT_TEST(tt_redo_active_identity_requires_post_redo_active_physical_slot)
 	}
 }
 
+UT_TEST(tt_top_tx_loser_requires_all_proof_gates_and_ignores_full_xid)
+{
+	TtRedoFixture f;
+	ClusterColdTtSlotInputV1 input;
+	ClusterColdTtActiveIdentityV1 active;
+	ClusterColdTopTxProofV1 proof = { 0 };
+	ClusterColdLoserIdentityV1 loser, zero = { 0 };
+
+	tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+	tt_redo_seal(&f);
+	UT_ASSERT(cluster_cold_typed_tt_redo_slot_v1(&f.typed, 0, 0, 47, &input));
+	UT_ASSERT(cluster_cold_typed_tt_active_identity_v1(&f.typed, 0, 0, &input.key,
+									 &active));
+	proof.key = active.key;
+	proof.producer_top = true;
+	proof.qualified_base = true;
+	proof.sealed_redo = true;
+	proof.ordinary_effects = true;
+	proof.old_writer_isolated = true;
+	proof.terminal_match = true;
+	/* No FullXid, nextXid or epoch is an input to the physical loser gate. */
+	UT_ASSERT(cluster_cold_top_tx_loser_v1(&active, &proof, &loser));
+	UT_ASSERT(memcmp(&loser.key, &active.key, sizeof(loser.key)) == 0);
+
+	for (int gate = 0; gate < 6; gate++) {
+		ClusterColdTopTxProofV1 rejected = proof;
+
+		switch (gate) {
+			case 0:
+				rejected.producer_top = false;
+				break;
+			case 1:
+				rejected.qualified_base = false;
+				break;
+			case 2:
+				rejected.sealed_redo = false;
+				break;
+			case 3:
+				rejected.ordinary_effects = false;
+				break;
+			case 4:
+				rejected.old_writer_isolated = false;
+				break;
+			case 5:
+				rejected.terminal_match = false;
+				break;
+		}
+		memset(&loser, 0xa9, sizeof(loser));
+		UT_ASSERT(!cluster_cold_top_tx_loser_v1(&active, &rejected, &loser));
+		UT_ASSERT(memcmp(&loser, &zero, sizeof(loser)) == 0);
+	}
+	proof.key.slot_offset++;
+	memset(&loser, 0xa9, sizeof(loser));
+	UT_ASSERT(!cluster_cold_top_tx_loser_v1(&active, &proof, &loser));
+	UT_ASSERT(memcmp(&loser, &zero, sizeof(loser)) == 0);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_top_tx_c0_requires_physical_loser_and_complete_endpoints)
+{
+	TtRedoFixture f;
+	ClusterColdTtSlotInputV1 input;
+	ClusterColdTtActiveIdentityV1 active;
+	ClusterColdTopTxProofV1 proof = { 0 };
+	ClusterColdLoserIdentityV1 loser;
+	ClusterRecoveryTTAbortV1 shape = { 0 };
+	ClusterRecoveryTTAbortDerivationV1 derived, zero = { 0 };
+	uint64 next_xid = UINT64_C(0x700400200);
+
+	tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+	tt_redo_seal(&f);
+	UT_ASSERT(cluster_cold_typed_tt_redo_slot_v1(&f.typed, 0, 0, 47, &input));
+	UT_ASSERT(cluster_cold_typed_tt_active_identity_v1(&f.typed, 0, 0, &input.key,
+									 &active));
+	proof.key = active.key;
+	proof.producer_top = true;
+	proof.qualified_base = true;
+	proof.sealed_redo = true;
+	proof.ordinary_effects = true;
+	proof.old_writer_isolated = true;
+	proof.terminal_match = true;
+	UT_ASSERT(cluster_cold_top_tx_loser_v1(&active, &proof, &loser));
+
+	shape.version = CLUSTER_RECOVERY_TT_ABORT_VERSION;
+	shape.length = CLUSTER_RECOVERY_TT_ABORT_BYTES;
+	shape.flags = CLUSTER_RECOVERY_TT_ABORT_TOP_KNOWN;
+	shape.target_thread = loser.key.owner_instance;
+	shape.writer_thread = 1;
+	shape.target_incarnation = 11;
+	shape.writer_incarnation = 12;
+	shape.recovery_serial = 13;
+	shape.target_epoch = 1;
+	memset(shape.target_claim_sha256, 0x5a, sizeof(shape.target_claim_sha256));
+	shape.exact.segment_id = loser.key.segment_id;
+	shape.exact.segment_generation = loser.key.segment_generation;
+	shape.exact.xid = loser.key.xid;
+	shape.exact.slot_offset = loser.key.slot_offset;
+	shape.exact.wrap = loser.key.slot_wrap;
+	shape.exact.instance = loser.key.owner_instance;
+	shape.exact.format_version = CLUSTER_UNDO_TT_ABORT_EXACT_VERSION;
+	shape.before.xid = loser.key.xid;
+	shape.before.wrap = loser.key.slot_wrap;
+	shape.before.status = TT_SLOT_ACTIVE;
+	shape.before.flags = TT_FLAGS_RESERVED;
+	shape.before.first_undo_block = (UBA) InvalidUba_init;
+	UT_ASSERT(cluster_recovery_tt_abort_shape_valid_v1(&shape));
+	UT_ASSERT(cluster_cold_top_tx_c0_v1(&loser, &shape, next_xid, true, false,
+								 InvalidTransactionId, UINT64_C(0x12345678), &derived));
+	UT_ASSERT_EQ(derived.record.target_epoch, UINT64_C(0x12345678));
+	UT_ASSERT_EQ(derived.record.target_full_xid, derived.record.top_full_xid);
+	UT_ASSERT_EQ((uint32) derived.record.target_full_xid, loser.key.xid);
+	UT_ASSERT(derived.oldest_xid_dependency);
+
+	memset(&derived, 0xa9, sizeof(derived));
+	UT_ASSERT(!cluster_cold_top_tx_c0_v1(&loser, &shape, next_xid, false, false,
+								  InvalidTransactionId, UINT64_C(0x12345678), &derived));
+	UT_ASSERT(memcmp(&derived, &zero, sizeof(derived)) == 0);
+	shape.exact.slot_offset++;
+	UT_ASSERT(!cluster_cold_top_tx_c0_v1(&loser, &shape, next_xid, true, false,
+								  InvalidTransactionId, UINT64_C(0x12345678), &derived));
+	tt_redo_destroy(&f);
+}
+
 UT_TEST(tt_redo_match_refuses_each_stale_key_field_and_clears_output)
 {
 	TtRedoFixture f;
@@ -3958,7 +4081,7 @@ UT_TEST(tt_inventory_refuses_unsupported_historical_tt_carriers)
 int
 main(void)
 {
-	UT_PLAN(97);
+	UT_PLAN(99);
 	UT_RUN(tt_inventory_requires_sealed_exact_history_sources_even_without_headers);
 	UT_RUN(tt_inventory_accepts_ordinary_history_with_reused_or_absent_old_target);
 	UT_RUN(tt_inventory_refuses_unsupported_historical_tt_carriers);
@@ -4034,6 +4157,8 @@ main(void)
 	UT_RUN(tt_redo_slot_reads_commit_and_matches_after_image_independently);
 	UT_RUN(tt_redo_slot_reads_exact_abort_without_loser_inference);
 	UT_RUN(tt_redo_active_identity_requires_post_redo_active_physical_slot);
+	UT_RUN(tt_top_tx_loser_requires_all_proof_gates_and_ignores_full_xid);
+	UT_RUN(tt_top_tx_c0_requires_physical_loser_and_complete_endpoints);
 	UT_RUN(tt_redo_match_refuses_each_stale_key_field_and_clears_output);
 	UT_RUN(tt_redo_slots_reject_unsealed_history_bounds_and_invalid_arguments);
 	UT_RUN(tt_redo_slots_refuse_source_drift_and_unsupported_prepared_input);
