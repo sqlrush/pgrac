@@ -966,6 +966,20 @@ typedef struct ClusterColdPageCreatorV1 {
 extern bool cluster_cold_typed_page_creator_v1(const ClusterColdTypedV1 *typed, uint32 frame_index,
 											   ClusterColdPageCreatorV1 *out);
 
+/* Read-only canonical input for this record's own DELETE/LOCK/LOCK_UPDATED
+ * actor. Payload xmax, old tuple creators and individual MX members are not
+ * identified by this value and require their own effect input proofs. */
+typedef struct ClusterColdPageActorV1 {
+	ClusterColdRecordFrameV1 frame;
+	ClusterColdTtSlotKeyV1 key;
+} ClusterColdPageActorV1;
+
+/* Match the original WAL header raw actor to its canonical ACTIVE TT prefix,
+ * with the same source and refusal guarantees as the creator input above.
+ * This grants no complete effects, loser/C0 or mutation authority. */
+extern bool cluster_cold_typed_page_actor_v1(const ClusterColdTypedV1 *typed, uint32 frame_index,
+											 ClusterColdPageActorV1 *out);
+
 typedef struct ClusterColdTtSlotInputV1 {
 	ClusterColdTtSlotKeyV1 key;
 	TTSlot slot;
