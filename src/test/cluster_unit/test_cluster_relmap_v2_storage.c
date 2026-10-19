@@ -49,12 +49,17 @@ static unsigned int fault_rename;
 static int fault_copy;
 static bool fail_directory_close;
 static LWLock retention_lock;
+static LWLock *runtime_test_lock, *held_retention_lock;
 static bool retention_held, observing_stage, relmap_x_held;
+static bool mapping_held;
 static bool drop_relmap_x_on_read;
 static bool cancel_on_read, invalidate_on_read, cancel_on_write;
 static unsigned int io_under_retention_lock, writes_without_pin;
 static unsigned int retention_acquires, retention_releases;
 static ClusterRelmapRetentionDirectory writer_retention;
+static ClusterRelmapRetentionDirectory *stage_directory = &writer_retention;
+static LWLock *stage_lock = &retention_lock;
+static void (*post_sync_hook)(bool is_directory);
 static ClusterRelmapRetentionKey writer_key;
 static ClusterRelmapRetentionResult cancelled;
 static const char *const names[] = {
@@ -68,9 +73,11 @@ static const ClusterRelmapV2Owner owner = { 3, UINT64CONST(0x200000123), 0, 101,
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
-	if (lock != &retention_lock || mode != LW_EXCLUSIVE || retention_held)
+	if ((lock != &retention_lock && lock != runtime_test_lock)
+		|| mode != LW_EXCLUSIVE || retention_held)
 		abort();
 	retention_held = true;
+	held_retention_lock = lock;
 	retention_acquires++;
 	return true;
 }
@@ -78,16 +85,18 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 void
 LWLockRelease(LWLock *lock)
 {
-	if (lock != &retention_lock || !retention_held)
+	if (lock != held_retention_lock || !retention_held)
 		abort();
 	retention_held = false;
+	held_retention_lock = NULL;
 	retention_releases++;
 }
 
 bool
 LWLockHeldByMe(LWLock *lock)
 {
-	return lock == &retention_lock && retention_held;
+	return (lock == held_retention_lock && retention_held)
+		|| (lock == RelationMappingLock && mapping_held);
 }
 
 bool
@@ -167,6 +176,7 @@ pg_fsync(int fd)
 	struct stat st;
 	unsigned int call;
 	unsigned int fail;
+	int rc;
 
 	observe_io();
 	if (fstat(fd, &st) != 0)
@@ -182,7 +192,10 @@ pg_fsync(int fd)
 		errno = EIO;
 		return -1;
 	}
-	return fsync(fd);
+	rc = fsync(fd);
+	if (rc == 0 && post_sync_hook != NULL)
+		post_sync_hook(S_ISDIR(st.st_mode));
+	return rc;
 }
 
 /* Same product source compiled with syscall names redirected, no body copy. */
@@ -216,15 +229,15 @@ relmap_test_write(int fd, const void *bytes, size_t len)
 {
 	observe_io();
 	if (observing_stage) {
-		const ClusterRelmapRetentionPin *pin = &writer_retention.pins[0];
+		const ClusterRelmapRetentionPin *pin = &stage_directory->pins[0];
 
 		if (!pin->occupied || !pin->may_be_staged || pin->wal_end != owner.wal_end)
 			writes_without_pin++;
 		if (cancel_on_write) {
 			cancel_on_write = false;
-			LWLockAcquire(&retention_lock, LW_EXCLUSIVE);
-			cancelled = cluster_relmap_retention_cancel_prepare(&writer_retention, &writer_key);
-			LWLockRelease(&retention_lock);
+			LWLockAcquire(stage_lock, LW_EXCLUSIVE);
+			cancelled = cluster_relmap_retention_cancel_prepare(stage_directory, &writer_key);
+			LWLockRelease(stage_lock);
 		}
 	}
 	if (++writes == fail_write) {
@@ -264,12 +277,12 @@ relmap_test_read(int fd, void *bytes, size_t len)
 		relmap_x_held = false;
 	}
 	if (observing_stage && (cancel_on_read || invalidate_on_read)) {
-		LWLockAcquire(&retention_lock, LW_EXCLUSIVE);
+		LWLockAcquire(stage_lock, LW_EXCLUSIVE);
 		if (cancel_on_read)
-			cancelled = cluster_relmap_retention_cancel_prepare(&writer_retention, &writer_key);
+			cancelled = cluster_relmap_retention_cancel_prepare(stage_directory, &writer_key);
 		if (invalidate_on_read)
-			cluster_relmap_retention_invalidate(&writer_retention);
-		LWLockRelease(&retention_lock);
+			cluster_relmap_retention_invalidate(stage_directory);
+		LWLockRelease(stage_lock);
 		cancel_on_read = invalidate_on_read = false;
 	}
 	reads++;
@@ -376,6 +389,9 @@ reset_io(void)
 	fault_copy = 0;
 	fail_directory_close = false;
 	retention_held = observing_stage = relmap_x_held = false;
+	held_retention_lock = NULL;
+	mapping_held = false;
+	post_sync_hook = NULL;
 	drop_relmap_x_on_read = false;
 	cancel_on_read = invalidate_on_read = cancel_on_write = false;
 	io_under_retention_lock = writes_without_pin = 0;
@@ -391,6 +407,8 @@ setup(const ClusterRelmapV2Namespace *ns)
 	char path[MAXPGPATH];
 
 	cleanup();
+	stage_directory = &writer_retention;
+	stage_lock = &retention_lock;
 	strcpy(root, "/tmp/pgrac_relmap_v2_XXXXXX");
 	if (mkdtemp(root) == NULL)
 		abort();
@@ -1965,10 +1983,12 @@ UT_TEST(test_changed_wal_cannot_rebind_staged_pin)
 	UT_ASSERT(writer_retention.pins[0].occupied && writer_retention.pins[0].may_be_staged);
 }
 
+#include "test_cluster_relmap_runtime_storage.inc"
+
 int
 main(void)
 {
-	UT_PLAN(57);
+	UT_PLAN(65);
 	UT_RUN(test_stage_both_copies_before_success);
 	UT_RUN(test_committed_reader_hides_pending_and_rejects_degraded_pair);
 	UT_RUN(test_committed_reader_requires_namespace_x_lock);
@@ -2026,7 +2046,16 @@ main(void)
 	UT_RUN(test_preflight_cancellation_prevents_pending_write);
 	UT_RUN(test_preflight_invalidation_prevents_pending_write);
 	UT_RUN(test_changed_wal_cannot_rebind_staged_pin);
+	UT_RUN(test_runtime_storage_original_namespace_origin_and_committed_reader);
+	UT_RUN(test_runtime_storage_first_write_failure_keeps_shared_pin);
+	UT_RUN(test_runtime_storage_later_io_failures_keep_shared_pin);
+	UT_RUN(test_runtime_storage_bad_preflight_allows_only_unstaged_cancel);
+	UT_RUN(test_runtime_storage_unknown_building_never_reach_files);
+	UT_RUN(test_runtime_storage_preflight_cancel_and_invalidate);
+	UT_RUN(test_runtime_storage_final_native_drift_keeps_pending_and_pin);
+	UT_RUN(test_runtime_storage_clear_pair_keeps_shared_pin);
 	cleanup();
+	free(runtime_storage_allocation);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

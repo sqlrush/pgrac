@@ -623,6 +623,13 @@ test_cluster_relmap_v2_storage_product.o: $(top_srcdir)/src/backend/cluster/clus
 		-Drenameat=relmap_test_renameat -Dclose=relmap_test_close -c $< -o $@
 
 test_cluster_relmap_v2_storage: test_cluster_relmap_v2_storage.c unit_test.h \
+		test_cluster_relmap_runtime_storage.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_writer.h \
+		$(top_srcdir)/src/include/cluster/cluster_shmem.h \
 		test_cluster_relmap_v2_storage_product.o $(top_builddir)/src/common/libpgcommon_srv.a \
 		test_cluster_relmap_pending_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention_restore.o \
