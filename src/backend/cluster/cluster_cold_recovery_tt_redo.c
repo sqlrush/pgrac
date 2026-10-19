@@ -624,14 +624,34 @@ cold_top_tx_native_bind_v1(const RfSideOnlinePlanV1 *plan, const ClusterColdTtSl
 	return false;
 }
 
-/* Preserve operation-local frame evidence, including retained history. A
+static bool
+cold_top_tx_frame_xids_v1(TransactionId xid, TransactionId top)
+{
+	return (!TransactionIdIsValid(xid) || TransactionIdIsNormal(xid))
+		   && (!TransactionIdIsValid(top)
+			   || (TransactionIdIsNormal(top) && TransactionIdIsNormal(xid) && top == xid));
+}
+
+/* Preserve operation-local SIDE/PAGE/SPACE evidence, including retained history. A
  * known child frame cannot become canonical just because the candidate's
  * BIND is top. Conversely an unrelated operation names its own actor, not
  * this candidate. These checks do not prove PAGE ownership or inspect old
  * tuple xmin/undo before-images; ordinary_effects remains independent. */
 static bool
-cold_top_tx_side_frames_v1(const ClusterColdTypedV1 *typed)
+cold_top_tx_frames_v1(const ClusterColdTypedV1 *typed)
 {
+	uint32 count;
+
+	if (!cluster_cold_plan_record_frame_count_v1(typed->plan, &count))
+		return false;
+	for (uint32 i = 0; i < count; i++) {
+		ClusterColdRecordFrameV1 frame;
+
+		if (!cluster_cold_plan_record_frame_v1(typed->plan, i, &frame)
+			|| frame.participant >= typed->participant_count
+			|| !cold_top_tx_frame_xids_v1(frame.source_xid, frame.source_top_xid))
+			return false;
+	}
 	for (uint32 p = 0; p < typed->participant_count; p++) {
 		const RfSideOnlinePlanV1 *plan = typed->side_plans[p];
 		uint32 count = rf_side_online_plan_operation_count_v1(plan);
@@ -642,12 +662,7 @@ cold_top_tx_side_frames_v1(const ClusterColdTypedV1 *typed)
 			RfSideOnlineOperationV1 operation;
 
 			if (!rf_side_online_plan_operation_v1(plan, i, &operation)
-				|| (TransactionIdIsValid(operation.source_xid)
-					&& !TransactionIdIsNormal(operation.source_xid))
-				|| (TransactionIdIsValid(operation.source_top_xid)
-					&& (!TransactionIdIsNormal(operation.source_top_xid)
-						|| !TransactionIdIsNormal(operation.source_xid)
-						|| operation.source_top_xid != operation.source_xid)))
+				|| !cold_top_tx_frame_xids_v1(operation.source_xid, operation.source_top_xid))
 				return false;
 			/* The original native BIND emitter receives canonical top xid.
 			 * A present record actor must agree with that operation's durable
@@ -813,7 +828,7 @@ cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
 	 * the complete ordinary inventory rather than trusting the proof flags
 	 * for those inputs. This does not establish checkpoint coverage,
 	 * atomic transaction effects or old-writer isolation. */
-	if (!cluster_cold_typed_tt_redo_inventory_v1(typed) || !cold_top_tx_side_frames_v1(typed))
+	if (!cluster_cold_typed_tt_redo_inventory_v1(typed) || !cold_top_tx_frames_v1(typed))
 		return false;
 	/* Compare the whole selected header with its sealed original fold.  A
 	 * newly-created segment requires the existing native full-image proof;

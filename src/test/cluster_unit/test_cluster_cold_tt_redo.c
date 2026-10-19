@@ -4302,6 +4302,227 @@ UT_TEST(tt_top_tx_c0_producer_checks_retained_history_frame)
 	}
 }
 
+static bool
+tt_top_tx_frame_space_check(void *arg, const RelFileLocator *locator,
+							const ClusterColdSpaceInputV1 *inputs, uint32 count, uint32 *order)
+{
+	const ClusterColdSpaceOpV1 *space = arg;
+
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT(memcmp(locator, &space->locator, sizeof(*locator)) == 0);
+	UT_ASSERT_EQ(inputs[0].kind, space->kind);
+	order[0] = 0;
+	return true;
+}
+
+/* Native INIT/BIND and both sealed planners are real. PAGE preflight, DATA,
+ * SPACE owner and physical effect application are boundaries. In particular,
+ * an otherwise good SIDE capture must not hide a conflicting SPACE frame
+ * supplied by the PAGE/SPACE decoder. This tests the C0 consumer's rejection,
+ * not whole ordinary-effects completion or canonical tuple/MX ownership. */
+static void
+tt_top_tx_page_space_frame_expect(bool space, bool history, int mode)
+{
+	TtRedoFixture f;
+	FakeXactRecord fake;
+	RfDetachedRecordPlanV1 detached;
+	RfPageOnlineRecordIdentityV1 identity;
+	ClusterColdDecodedV1 decoded = { 0 };
+	ClusterColdComponentV1 component = { 0 };
+	ClusterColdSpaceOpV1 space_op = { .kind = CLUSTER_COLD_SPACE_CREATE };
+	ClusterColdEffectsProofV1 effects = { 0 };
+	ClusterColdReplayResultV1 result = { .detail = CLUSTER_COLD_REPLAY_OK };
+	ClusterColdDiagV1 diag;
+	ClusterColdStepV1 step;
+	ClusterColdRecordFrameV1 captured;
+	ClusterColdTtSlotInputV1 input;
+	ClusterColdTopTxProofV1 proof;
+	ClusterRecoveryTTAbortV1 shape;
+	ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
+	xl_heap_insert insert = { 0 };
+	RelFileLocator locator = { 1663, 5, 100 };
+	uint32 participant = history ? 1 : 0;
+	XLogRecPtr begin = history ? 100 : 300;
+	TransactionId xid = mode == 2 ? 802 : 804;
+	TransactionId top = mode == 1 ? InvalidTransactionId : xid;
+	bool accepted = mode < 3 || mode == 8;
+	uint32 frames;
+
+	if (mode == 3)
+		xid = 805; /* Known child of the operation's own 804, not candidate 802. */
+	if (mode == 4)
+		xid = InvalidTransactionId;
+	if (mode == 5) {
+		xid = FrozenTransactionId;
+		top = InvalidTransactionId;
+	}
+	if (mode == 6)
+		top = FrozenTransactionId;
+	if (mode == 7)
+		xid = top = BootstrapTransactionId;
+	if (mode == 8)
+		xid = top = InvalidTransactionId; /* Nontransactional SPACE record. */
+	tt_top_tx_initialized_fixture(&f, history ? 200 : 300, 100, 2);
+	if (history)
+		tt_redo_history_plan(&f, 100, 200, 200, RF_SIDE_PLAN_RECOVERY, false);
+	tt_top_tx_frame_bind(&fake, 4, 802, 802, 802);
+	undo_header_feed(f.typed.side_plans[0], &fake, 200);
+	if (space) {
+		/* A typed CREATE is complete on its own; native SMGR CREATE
+		 * additionally requires its later typed incarnation record. */
+		cold_abort_create_record(&fake, locator, false, accepted ? xid : 804);
+		detached = make_projection_record_plan(&fake);
+		/* Keep the independently retained SIDE frame canonical. */
+		fake.u.decoded.header.xl_xid = accepted ? xid : 804;
+		fake.u.decoded.toplevel_xid = accepted ? top : 804;
+		space_op.locator = locator;
+		memset(space_op.result_incarnation, 0x17, 16);
+		space_op.payload = fake.data;
+		space_op.payload_length = fake.u.decoded.main_data_len;
+		decoded.record.space_ops = &space_op;
+		decoded.record.space_count = 1;
+	} else {
+		make_projection_record(&fake, RM_HEAP_ID, XLOG_HEAP_INSERT, &insert, sizeof(insert));
+		fake.u.decoded.header.xl_xid = xid;
+		fake.u.decoded.toplevel_xid = top;
+		memset(&detached, 0, sizeof(detached));
+		detached.source_record = &fake.reader;
+		detached.preflight_complete = true;
+		detached.route.record_owner = RF_ROUTE_OWNER_PAGE_CODEC;
+		detached.route.rmid = RM_HEAP_ID;
+		component.page.system_identifier = f.typed.system_identifier;
+		memcpy(component.page.storage_uuid, f.typed.observer.storage_uuid, 16);
+		component.page.locator = locator;
+		component.page.forknum = MAIN_FORKNUM;
+		component.page_class = RF_PAGE_CLASS_ORDINARY;
+		component.before_kind = component.result_kind = RF_PAGE_STATE_PRESENT;
+		memset(component.before.segment_incarnation, 0x66, 16);
+		component.before.mutation_token = 1;
+		component.result = component.before;
+		component.result.mutation_token = 2;
+		decoded.record.components = &component;
+		decoded.record.component_count = 1;
+	}
+	identity = make_identity(&fake, f.typed.observer.storage_uuid);
+	identity.record.origin_thread = f.typed.participants[participant].thread_id;
+	set_identity_range(&fake, &identity, begin, begin + 100);
+	UT_ASSERT_EQ(
+		rf_side_online_plan_feed_record_v1(f.typed.side_plans[participant], &detached, &identity),
+		RF_PAGE_PROOF_DETAIL_OK);
+	tt_redo_seal(&f);
+	if (history)
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(f.typed.side_plans[1]), RF_PAGE_PROOF_DETAIL_OK);
+	tt_top_tx_write_fold(&f);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &input));
+	UT_ASSERT_EQ(
+		cluster_cold_plan_create_v1(f.typed.participants, 2, (Size)1024 * 1024, &f.typed.plan),
+		CLUSTER_COLD_OK);
+	for (uint32 p = 0; p < 2; p++) {
+		XLogRecPtr prev = InvalidXLogRecPtr;
+		uint32 count = rf_side_online_plan_operation_count_v1(f.typed.side_plans[p]);
+
+		UT_ASSERT(count != UINT32_MAX);
+		for (uint32 i = 0; i < count; i++) {
+			RfSideOnlineOperationV1 op;
+			ClusterColdDecodedV1 native = { 0 };
+
+			UT_ASSERT(rf_side_online_plan_operation_v1(f.typed.side_plans[p], i, &op));
+			if (p == participant && op.identity.record.read_rec_ptr == begin)
+				continue; /* Feed this SPACE operation once, with its typed effects. */
+			native.record.read_rec_ptr = op.identity.record.read_rec_ptr;
+			native.record.end_rec_ptr = op.identity.record.end_rec_ptr;
+			native.record.prev_rec_ptr = prev;
+			native.record.record_crc = op.identity.record.record_crc;
+			native.record.rmid = op.identity.record.rmid;
+			native.record.info = op.identity.record.info;
+			native.record.scn = op.control_scn;
+			UT_ASSERT_EQ(cluster_cold_plan_feed_v1(f.typed.plan, p, &native.record),
+						 CLUSTER_COLD_OK);
+			prev = native.record.read_rec_ptr;
+			native.effects.required = native.effects.native_apply = CLUSTER_COLD_EFFECT_RECORD;
+			UT_ASSERT(cluster_cold_effects_proof_record_v1(&effects, p, &native, NULL, true));
+		}
+		if (p != participant)
+			continue;
+		decoded.record.read_rec_ptr = begin;
+		decoded.record.end_rec_ptr = begin + 100;
+		decoded.record.prev_rec_ptr = prev;
+		decoded.record.record_crc = identity.record.record_crc;
+		decoded.record.rmid = identity.record.rmid;
+		decoded.record.info = identity.record.info;
+		decoded.record.source_xid = xid;
+		decoded.record.source_top_xid = top;
+		UT_ASSERT_EQ(cluster_cold_plan_feed_v1(f.typed.plan, p, &decoded.record), CLUSTER_COLD_OK);
+	}
+	if (space)
+		UT_ASSERT_EQ(cluster_cold_plan_set_space_check_v1(f.typed.plan, tt_top_tx_frame_space_check,
+														  &space_op),
+					 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(
+		cluster_cold_plan_seal_v1(f.typed.plan, tt_page_creator_observe, &component, &diag),
+		CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_plan_record_frame_count_v1(f.typed.plan, &frames));
+	UT_ASSERT_EQ(frames, 1);
+	UT_ASSERT(cluster_cold_plan_record_frame_v1(f.typed.plan, 0, &captured));
+	UT_ASSERT_EQ(captured.history, history);
+	UT_ASSERT_EQ(captured.participant, participant);
+	UT_ASSERT_EQ(captured.source_xid, xid);
+	UT_ASSERT_EQ(captured.source_top_xid, top);
+	if (!history) {
+		UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(f.typed.plan), 1);
+		UT_ASSERT(cluster_cold_plan_step_v1(f.typed.plan, 0, &step));
+		decoded.effects.required = CLUSTER_COLD_EFFECT_RECORD
+								   | (space ? CLUSTER_COLD_EFFECT_SPACE : CLUSTER_COLD_EFFECT_PAGE);
+		if (space)
+			decoded.effects.space_apply = decoded.effects.required;
+		else
+			decoded.effects.page_apply = decoded.effects.required;
+		UT_ASSERT(
+			cluster_cold_effects_proof_record_v1(&effects, participant, &decoded, &step, true));
+		result.steps_done = 1;
+		result.space_steps = space ? 1 : 0;
+	}
+	result.space_relations_finished = cluster_cold_plan_space_relation_count_v1(f.typed.plan);
+	UT_ASSERT(cluster_cold_typed_effects_complete_v1(&f.typed, &effects, &result));
+	f.typed.xid_next_after_redo = UINT64_C(0x700400200);
+	tt_top_tx_endpoints_complete(&f);
+	tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+	UT_ASSERT(proof.ordinary_effects);
+	memset(&out, 0xa9, sizeof(out));
+	UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof, &shape,
+														  false, InvalidTransactionId,
+														  UINT64_C(0x12345678), &out),
+				 accepted);
+	if (!accepted)
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_top_tx_c0_producer_checks_page_frames)
+{
+	for (int mode = 0; mode < 8; mode++)
+		tt_top_tx_page_space_frame_expect(false, false, mode);
+}
+
+UT_TEST(tt_top_tx_c0_producer_checks_history_page_frames)
+{
+	for (int mode = 0; mode < 8; mode++)
+		tt_top_tx_page_space_frame_expect(false, true, mode);
+}
+
+UT_TEST(tt_top_tx_c0_producer_checks_space_frames)
+{
+	for (int mode = 0; mode < 9; mode++)
+		tt_top_tx_page_space_frame_expect(true, false, mode);
+}
+
+UT_TEST(tt_top_tx_c0_producer_checks_history_space_frames)
+{
+	for (int mode = 0; mode < 9; mode++)
+		tt_top_tx_page_space_frame_expect(true, true, mode);
+}
+
 UT_TEST(tt_top_tx_c0_producer_refuses_conflicting_bind_history)
 {
 	for (int field = 0; field < 4; field++) {
@@ -5990,7 +6211,11 @@ UT_TEST(tt_top_tx_c0_producer_rechecks_before_output)
 int
 main(void)
 {
-	UT_PLAN(130);
+	UT_PLAN(134);
+	UT_RUN(tt_top_tx_c0_producer_checks_page_frames);
+	UT_RUN(tt_top_tx_c0_producer_checks_history_page_frames);
+	UT_RUN(tt_top_tx_c0_producer_checks_space_frames);
+	UT_RUN(tt_top_tx_c0_producer_checks_history_space_frames);
 	UT_RUN(tt_page_actor_uses_own_header_not_payload_xmax);
 	UT_RUN(tt_page_actor_requires_its_causal_canonical_prefix);
 	UT_RUN(tt_page_actor_refuses_unproved_actor_and_non_actor_records);
