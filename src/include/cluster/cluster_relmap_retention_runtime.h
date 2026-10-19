@@ -53,4 +53,19 @@ extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_cancel_prep
  * OK grants no stage, terminal, TT reuse or pin release permission. */
 extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_bind_current_v2(void);
 
+/* Dormant read-only relmap conjunct for an original TT release/reuse consumer
+ * (ordinary A0/GC or recovery D0). The original caller authenticates the
+ * system/DB incarnation and published receipt; this does not mint provenance.
+ * Selects the binding's original origin, never the current node's directory,
+ * under the sole runtime lock. All namespaces count, including unstaged pins;
+ * an unbound same-raw obligation refuses. UNKNOWN/BUILDING is never empty.
+ * OK is a snapshot, not a reservation or permission to mutate/reuse TT,
+ * release a pin or certify a terminal outcome. The eventual destructive
+ * consumer must serialize its mutation with the original owner/retention
+ * gates and satisfy every other original gate; unlocking here grants none.
+ * No native/TT owner query, allocation or I/O occurs under the lock. No live
+ * caller or qualified COMPLETE publisher is installed by this interface. */
+extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_tt_release_check_v2(
+	uint64 system_identifier, uint64 database_incarnation, const ClusterCanonicalTxnBinding *binding);
+
 #endif

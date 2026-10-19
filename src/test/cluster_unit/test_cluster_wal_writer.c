@@ -1419,7 +1419,7 @@ UT_TEST(test_requested_flush_rejects_foreign_or_unsafe_context_without_io)
 int
 main(void)
 {
-	UT_PLAN(68);
+	UT_PLAN(78);
 	UT_RUN(test_clean_writer_requires_selected_exit_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_requires_selected_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_keeps_runtime_fence_and_exact_owner_refusals);
@@ -1488,6 +1488,16 @@ main(void)
 	UT_RUN(test_relmap_runtime_stage_failure_preserves_marker_before_cancel);
 	UT_RUN(test_relmap_runtime_stage_rechecks_owner_after_storage_success);
 	UT_RUN(test_relmap_runtime_cancel_only_exact_unstaged_preparation);
+	UT_RUN(test_relmap_runtime_tt_empty_complete_is_only_a_readonly_conjunct);
+	UT_RUN(test_relmap_runtime_tt_keeps_staged_and_unstaged_pins_in_every_namespace);
+	UT_RUN(test_relmap_runtime_tt_distinguishes_each_physical_key_component);
+	UT_RUN(test_relmap_runtime_tt_unbound_raw_alias_never_implies_an_empty_set);
+	UT_RUN(test_relmap_runtime_tt_routes_binding_origin_instead_of_current_node);
+	UT_RUN(test_relmap_runtime_tt_refuses_unattached_unknown_and_building);
+	UT_RUN(test_relmap_runtime_tt_rejects_missing_identity_and_origin_before_indexing);
+	UT_RUN(test_relmap_runtime_tt_rejects_a_foreign_directory_identity);
+	UT_RUN(test_relmap_runtime_tt_preserves_original_core_receipt_refusals);
+	UT_RUN(test_relmap_runtime_tt_refuses_corrupt_pins_and_recursive_lock);
 	free(relmap_runtime_allocation);
 	if (scratch[0] && !rmtree(scratch, true))
 		abort();

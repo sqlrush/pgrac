@@ -238,3 +238,30 @@ cluster_relmap_retention_runtime_bind_current_v2(void)
 	LWLockRelease(&relmap_runtime_shmem->lock);
 	return result;
 }
+
+ClusterRelmapRetentionResult
+cluster_relmap_retention_runtime_tt_release_check_v2(uint64 system_identifier,
+	uint64 database_incarnation, const ClusterCanonicalTxnBinding *binding)
+{
+	ClusterRelmapRetentionDirectory *directory;
+	ClusterRelmapRetentionResult result;
+	int origin;
+
+	if (system_identifier == 0 || database_incarnation == 0 || binding == NULL
+		|| binding->origin_instance == 0 || binding->origin_instance > CLUSTER_MAX_NODES)
+		return CLUSTER_RELMAP_RETENTION_INVALID;
+	if (relmap_runtime_shmem == NULL || LWLockHeldByMe(&relmap_runtime_shmem->lock))
+		return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
+	origin = binding->origin_instance - 1;
+	directory = &relmap_runtime_shmem->directories[origin];
+	LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
+	if (directory->state != CLUSTER_RELMAP_RETENTION_COMPLETE)
+		result = CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
+	else if (directory->origin != origin || directory->system_identifier != system_identifier
+		|| directory->database_incarnation != database_incarnation)
+		result = CLUSTER_RELMAP_RETENTION_INVALID;
+	else
+		result = cluster_relmap_retention_tt_release_check(directory, binding);
+	LWLockRelease(&relmap_runtime_shmem->lock);
+	return result;
+}

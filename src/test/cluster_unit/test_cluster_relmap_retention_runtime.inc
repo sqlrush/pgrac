@@ -591,6 +591,206 @@ relmap_runtime_binding_fixture(unsigned origin)
 	return directory;
 }
 
+/* The query owns no native/TT receipt producer. Preserve every origin, not
+ * merely the selected pin, across both positive and refusing observations. */
+static void
+relmap_runtime_tt_expect(uint64 system_identifier, uint64 database_incarnation,
+	const ClusterCanonicalTxnBinding *binding, ClusterRelmapRetentionResult expected)
+{
+	Size bytes = sizeof(relmap_runtime_shmem->directories);
+	void *before = relmap_runtime_shmem == NULL ? NULL : malloc(bytes);
+	unsigned reads = relmap_binding_reads, assignments = relmap_assign_calls;
+	unsigned stages = relmap_runtime_stage_calls;
+	int syncs = sync_calls, renames = rename_calls;
+	bool lock_held = relmap_retention_held;
+
+	if (relmap_runtime_shmem != NULL) {
+		UT_ASSERT_NOT_NULL(before);
+		memcpy(before, relmap_runtime_shmem->directories, bytes);
+	}
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_tt_release_check_v2(
+		system_identifier, database_incarnation, binding), expected);
+	if (before != NULL) {
+		UT_ASSERT_EQ(memcmp(before, relmap_runtime_shmem->directories, bytes), 0);
+		free(before);
+	}
+	UT_ASSERT_EQ(relmap_binding_reads, reads);
+	UT_ASSERT_EQ(relmap_assign_calls, assignments);
+	UT_ASSERT_EQ(relmap_runtime_stage_calls, stages);
+	UT_ASSERT_EQ(sync_calls, syncs);
+	UT_ASSERT_EQ(rename_calls, renames);
+	UT_ASSERT_EQ(relmap_retention_held, lock_held);
+}
+
+UT_TEST(test_relmap_runtime_tt_empty_complete_is_only_a_readonly_conjunct)
+{
+	for (unsigned origin = 0; origin < CLUSTER_MAX_NODES; origin += CLUSTER_MAX_NODES - 1) {
+		relmap_runtime_fixture(true);
+		relmap_runtime_qualified_fixture(origin);
+		relmap_binding.origin_instance = origin + 1;
+		relmap_global_x = false;
+		relmap_active_owner = true; /* Controlled original consumer lock context. */
+		relmap_have_binding = have_ref = false; /* Query must not ask either producer. */
+		relmap_runtime_tt_expect(ref.claim.identity.system_identifier,
+			ref.claim.database_incarnation, &relmap_binding, CLUSTER_RELMAP_RETENTION_OK);
+		UT_ASSERT_EQ(relmap_retention_acquires, 1);
+	}
+}
+
+UT_TEST(test_relmap_runtime_tt_keeps_staged_and_unstaged_pins_in_every_namespace)
+{
+	for (unsigned selected = 0; selected < 2; selected++) {
+		ClusterRelmapRetentionDirectory *directory = relmap_runtime_binding_fixture(0);
+
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_bind_current_v2(), CLUSTER_RELMAP_RETENTION_OK);
+		/* Each namespace independently blocks, including before any stage. */
+		directory->pins[1 - selected].occupied = false;
+		relmap_binding.active_lsn++; /* Receipt address is not the physical TT key. */
+		relmap_runtime_tt_expect(ref.claim.identity.system_identifier,
+			ref.claim.database_incarnation, &relmap_binding, CLUSTER_RELMAP_RETENTION_RETAINED);
+		UT_ASSERT_EQ(directory->pins[selected].may_be_staged, selected == 0);
+	}
+}
+
+UT_TEST(test_relmap_runtime_tt_distinguishes_each_physical_key_component)
+{
+	for (unsigned field = 0; field < 5; field++) {
+		ClusterRelmapRetentionDirectory *directory = relmap_runtime_binding_fixture(0);
+		ClusterCanonicalTxnBinding other = relmap_binding;
+
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_bind_current_v2(), CLUSTER_RELMAP_RETENTION_OK);
+		directory->pins[2].occupied = false; /* No unrelated unresolved raw alias. */
+		if (field == 0) other.segment_id++;
+		if (field == 1) other.segment_generation++;
+		if (field == 2) other.xid++;
+		if (field == 3) other.slot_offset++;
+		if (field == 4) other.slot_wrap++;
+		relmap_runtime_tt_expect(ref.claim.identity.system_identifier,
+			ref.claim.database_incarnation, &other, CLUSTER_RELMAP_RETENTION_OK);
+	}
+}
+
+UT_TEST(test_relmap_runtime_tt_unbound_raw_alias_never_implies_an_empty_set)
+{
+	ClusterRelmapRetentionDirectory *directory = relmap_runtime_binding_fixture(0);
+	ClusterCanonicalTxnBinding other = relmap_binding;
+
+	UT_ASSERT(!directory->pins[0].has_tt_binding && !directory->pins[1].has_tt_binding);
+	other.segment_id++;
+	other.slot_wrap++;
+	relmap_runtime_tt_expect(ref.claim.identity.system_identifier,
+		ref.claim.database_incarnation, &other, CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+	other.xid += 2; /* Distinct raw identity does not acquire an invented TT pin. */
+	relmap_runtime_tt_expect(ref.claim.identity.system_identifier,
+		ref.claim.database_incarnation, &other, CLUSTER_RELMAP_RETENTION_OK);
+}
+
+UT_TEST(test_relmap_runtime_tt_routes_binding_origin_instead_of_current_node)
+{
+	ClusterCanonicalTxnBinding local;
+
+	relmap_runtime_binding_fixture(CLUSTER_MAX_NODES - 1);
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_bind_current_v2(), CLUSTER_RELMAP_RETENTION_OK);
+	relmap_runtime_qualified_fixture(0);
+	cluster_node_id = 0; /* Current origin is qualified and empty, foreign one is pinned. */
+	relmap_runtime_tt_expect(ref.claim.identity.system_identifier,
+		ref.claim.database_incarnation, &relmap_binding, CLUSTER_RELMAP_RETENTION_RETAINED);
+	local = relmap_binding;
+	local.origin_instance = 1;
+	relmap_runtime_tt_expect(ref.claim.identity.system_identifier,
+		ref.claim.database_incarnation, &local, CLUSTER_RELMAP_RETENTION_OK);
+	UT_ASSERT_EQ(relmap_retention_acquires, 2);
+}
+
+UT_TEST(test_relmap_runtime_tt_refuses_unattached_unknown_and_building)
+{
+	for (unsigned state = 0; state < 3; state++) {
+		relmap_runtime_fixture(state != 0);
+		if (state == 2)
+			relmap_runtime_shmem->directories[0].state = CLUSTER_RELMAP_RETENTION_BUILDING;
+		relmap_runtime_tt_expect(ref.claim.identity.system_identifier,
+			ref.claim.database_incarnation, &relmap_binding, CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+		UT_ASSERT_EQ(relmap_retention_acquires, state == 0 ? 0 : 1);
+	}
+}
+
+UT_TEST(test_relmap_runtime_tt_rejects_missing_identity_and_origin_before_indexing)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		uint64 system_identifier, database_incarnation;
+
+		relmap_runtime_fixture(true);
+		relmap_runtime_qualified_fixture(0);
+		system_identifier = ref.claim.identity.system_identifier;
+		database_incarnation = ref.claim.database_incarnation;
+		if (fault == 0) system_identifier = 0;
+		if (fault == 1) database_incarnation = 0;
+		if (fault == 2) relmap_binding.origin_instance = 0;
+		if (fault == 3) relmap_binding.origin_instance = CLUSTER_MAX_NODES + 1;
+		if (fault == 4) relmap_binding.origin_instance = UINT8_MAX;
+		relmap_runtime_tt_expect(system_identifier, database_incarnation,
+			fault == 5 ? NULL : &relmap_binding, CLUSTER_RELMAP_RETENTION_INVALID);
+		UT_ASSERT_EQ(relmap_retention_acquires, 0);
+	}
+}
+
+UT_TEST(test_relmap_runtime_tt_rejects_a_foreign_directory_identity)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		ClusterRelmapRetentionDirectory *directory;
+		uint64 system_identifier, database_incarnation;
+
+		relmap_runtime_fixture(true);
+		relmap_runtime_qualified_fixture(0);
+		directory = &relmap_runtime_shmem->directories[0];
+		system_identifier = ref.claim.identity.system_identifier;
+		database_incarnation = ref.claim.database_incarnation;
+		if (fault == 0) directory->origin++;
+		if (fault == 1) directory->system_identifier++;
+		if (fault == 2) directory->database_incarnation++;
+		if (fault == 3) system_identifier++;
+		if (fault == 4) database_incarnation++;
+		relmap_runtime_tt_expect(system_identifier, database_incarnation,
+			&relmap_binding, CLUSTER_RELMAP_RETENTION_INVALID);
+		UT_ASSERT_EQ(relmap_retention_acquires, 1);
+	}
+}
+
+UT_TEST(test_relmap_runtime_tt_preserves_original_core_receipt_refusals)
+{
+	for (unsigned fault = 0; fault < 8; fault++) {
+		relmap_runtime_fixture(true);
+		relmap_runtime_qualified_fixture(0);
+		if (fault == 0) relmap_binding.publish_state = CLUSTER_CANONICAL_TXN_NONE;
+		if (fault == 1) relmap_binding.reserved16 = 1;
+		if (fault == 2) relmap_binding.segment_id = 0;
+		if (fault == 3) relmap_binding.segment_generation = UINT32_MAX;
+		if (fault == 4) relmap_binding.slot_offset = TT_SLOTS_PER_SEGMENT;
+		if (fault == 5) relmap_binding.slot_wrap = TT_WRAP_INVALID;
+		if (fault == 6) relmap_binding.xid = BootstrapTransactionId;
+		if (fault == 7) relmap_binding.active_lsn = InvalidXLogRecPtr;
+		relmap_runtime_tt_expect(ref.claim.identity.system_identifier,
+			ref.claim.database_incarnation, &relmap_binding, CLUSTER_RELMAP_RETENTION_INVALID);
+	}
+}
+
+UT_TEST(test_relmap_runtime_tt_refuses_corrupt_pins_and_recursive_lock)
+{
+	ClusterRelmapRetentionDirectory *directory = relmap_runtime_binding_fixture(0);
+	unsigned acquisitions;
+
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_bind_current_v2(), CLUSTER_RELMAP_RETENTION_OK);
+	directory->pins[0].binding.xid++; /* An invalid unrelated pin is not silently skipped. */
+	relmap_runtime_tt_expect(ref.claim.identity.system_identifier,
+		ref.claim.database_incarnation, &relmap_binding, CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+	LWLockAcquire(relmap_runtime_test_lock, LW_EXCLUSIVE);
+	acquisitions = relmap_retention_acquires;
+	relmap_runtime_tt_expect(ref.claim.identity.system_identifier,
+		ref.claim.database_incarnation, &relmap_binding, CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+	UT_ASSERT_EQ(relmap_retention_acquires, acquisitions);
+	LWLockRelease(relmap_runtime_test_lock);
+}
+
 UT_TEST(test_relmap_runtime_active_binds_all_existing_namespaces_and_staged_pin)
 {
 	for (unsigned origin = 0; origin < CLUSTER_MAX_NODES; origin += CLUSTER_MAX_NODES - 1) {
