@@ -37,6 +37,8 @@
  *   Modified by: SqlRush <sqlrush@gmail.com>
  *   Opt-in whole UPDATE execution timing, including scan and retry work.
  *   Check storage eligibility at executor entry, including parallel workers.
+ *   Bind shared write/row-lock targets before initializing child plans.
+ *   See 2026-10-18-pre2-m1-design-integration.md.
  *   See spec-s9p2-06-online-membership.md.
  *
  *-------------------------------------------------------------------------
@@ -44,6 +46,7 @@
 #include "postgres.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_mode.h"
 #include "cluster/cluster_storage_quorum.h"
 #endif
 
@@ -859,6 +862,35 @@ ExecCheckXactReadOnly(PlannedStmt *plannedstmt)
 }
 
 
+#ifdef USE_PGRAC_CLUSTER
+static void
+cluster_executor_preflight_write(PlannedStmt *plannedstmt, EState *estate, int eflags)
+{
+	ListCell   *l;
+
+	if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) || !cluster_storage_mode_enabled())
+		return;
+
+	/* Includes modifying CTEs and targets whose child plan returns no rows. */
+	foreach(l, plannedstmt->resultRelations)
+	{
+		Relation	relation = ExecGetRangeTableRelation(estate, lfirst_int(l));
+
+		if (cluster_heap_preflight_write(relation, "DML"))
+			return;
+	}
+	foreach(l, plannedstmt->rowMarks)
+	{
+		PlanRowMark *mark = lfirst_node(PlanRowMark, l);
+
+		if (RowMarkRequiresRowShareLock(mark->markType)
+			&& cluster_heap_preflight_write(
+				ExecGetRangeTableRelation(estate, mark->rti), "row locking"))
+			return;
+	}
+}
+#endif
+
 /* ----------------------------------------------------------------
  *		InitPlan
  *
@@ -890,6 +922,11 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 	ExecInitRangeTable(estate, rangeTable, plannedstmt->permInfos);
 
 	estate->es_plannedstmt = plannedstmt;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Before any child tuple, trigger or data-page pin, including zero rows. */
+	cluster_executor_preflight_write(plannedstmt, estate, eflags);
+#endif
 
 	/*
 	 * Next, build the ExecRowMark array from the PlanRowMark(s), if any.

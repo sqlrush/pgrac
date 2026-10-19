@@ -509,6 +509,7 @@ test_cluster_relmap_init: test_cluster_relmap_init.c unit_test.h \
 
 # PGRAC: execute original entry-point prologues before any native mutation.
 TESTS += test_cluster_storage_subtransaction
+TESTS += test_cluster_write_preflight
 TESTS += test_cluster_fresh_scope
 
 # Include tests registered after the initial all prerequisite expansion.
@@ -9278,6 +9279,22 @@ test_cluster_initdb_tree: test_cluster_initdb_tree.c unit_test.h \
 		$(LDFLAGS) $(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 # Compile the actual native entry bodies; no duplicated routing predicate.
+test_cluster_write_preflight.inc: $(top_srcdir)/src/backend/access/heap/heapam.c \
+		$(top_srcdir)/src/backend/executor/execMain.c
+	awk '/^(cluster_heap_itl_relation_route|cluster_itl_write_path_enabled)\(/ \
+	     { print "static bool"; emit=1; n++ } \
+	     /^cluster_heap_preflight_write\(/ { print "bool"; emit=1; n++ } \
+	     /^cluster_heap_itl_require_top_xact\(/ { print "static void"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if(n!=4) exit 1 }' $(word 1,$^) > $@.tmp
+	awk '/^(cluster_executor_preflight_write|InitPlan)\(/ { print "static void"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if(n!=2) exit 1 }' $(word 2,$^) >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_write_preflight: test_cluster_write_preflight.c unit_test.h \
+		test_cluster_write_preflight.inc $(top_srcdir)/src/backend/nodes/list.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
 test_cluster_storage_sql_route.inc: $(top_srcdir)/src/backend/tcop/postgres.c \
 		$(top_srcdir)/src/backend/executor/execMain.c
 	awk '/^start_xact_command\(void\)/ { print "static void"; emit=1; n++ } \
@@ -9583,6 +9600,7 @@ clean distclean maintainer-clean: clean-pgproc-active-sample
 clean-pgproc-active-sample:
 	rm -f test_cluster_pgproc_active_types.inc test_cluster_pgproc_active_types.inc.tmp
 	rm -f test_cluster_pgproc_active_sample.inc test_cluster_pgproc_active_sample.inc.tmp
+	rm -f test_cluster_write_preflight.inc test_cluster_write_preflight.inc.tmp
 
 clean distclean maintainer-clean: clean-active-sample-fence
 .PHONY: clean-active-sample-fence

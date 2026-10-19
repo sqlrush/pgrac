@@ -36,6 +36,8 @@
  *   Keep cluster-only VM acquisition plans out of non-cluster builds.
  *   Bind inplace WAL private images and visible pages to one exact version.
  *   Reject unsupported shared-heap subtransactions before creating receipts.
+ *   Preflight canonical binding before executor child work and row locking.
+ *   See 2026-10-18-pre2-m1-design-integration.md.
  */
 #include "postgres.h"
 
@@ -165,15 +167,13 @@ cluster_itl_write_path_enabled(Relation relation)
 		cluster_shared_catalog, relation->rd_locator.relNumber);
 }
 
-/* PGRAC: reject before canonical, undo or CTRC preparation.  A row-lock
- * operation can enter a subtransaction before it has an assigned child XID. */
+/* PGRAC: a row-lock operation can enter a subtransaction before it has an
+ * assigned child XID. Call only after classifying the target as shared. */
 static void
-cluster_heap_itl_require_supported_xact(Relation relation, const char *operation)
+cluster_heap_itl_require_top_xact(Relation relation, const char *operation)
 {
 	TransactionId current_xid;
 
-	if (!cluster_itl_write_path_enabled(relation))
-		return;
 	if (IsSubTransaction())
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -191,6 +191,47 @@ cluster_heap_itl_require_supported_xact(Relation relation, const char *operation
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("shared-heap top-level transaction identity mismatch")));
+}
+
+/* Reject before canonical, undo or CTRC preparation at native heap entries. */
+static void
+cluster_heap_itl_require_supported_xact(Relation relation, const char *operation)
+{
+	if (cluster_itl_write_path_enabled(relation))
+		cluster_heap_itl_require_top_xact(relation, operation);
+}
+
+bool
+cluster_heap_preflight_write(Relation relation, const char *operation)
+{
+	ClusterCanonicalTxnBinding binding;
+	bool		shared_target;
+
+	switch (relation->rd_rel->relkind)
+	{
+		case RELKIND_RELATION:
+		case RELKIND_MATVIEW:
+		case RELKIND_TOASTVALUE:
+			shared_target = cluster_itl_write_path_enabled(relation);
+			break;
+		case RELKIND_PARTITIONED_TABLE:
+			/* The logical target has no relfilenumber until tuple routing. */
+			shared_target = cluster_heap_itl_relation_route(
+				cluster_storage_mode_enabled(), RelationUsesLocalBuffers(relation),
+				cluster_shared_catalog, RelationGetRelid(relation));
+			break;
+		default:
+			return false;
+	}
+	if (!shared_target)
+		return false;
+
+	cluster_heap_itl_require_top_xact(relation, operation);
+	if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared %s", operation)));
+	return true;
 }
 
 typedef struct ClusterHeapItlTerminalCensus
