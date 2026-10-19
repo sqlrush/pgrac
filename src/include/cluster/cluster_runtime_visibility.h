@@ -388,6 +388,34 @@ extern ClusterVisTtProof cluster_vis_tt_block_positive_proof(const char *block,
 															 uint16 *out_wrap);
 
 /*
+ * Level-3 authority-separated proof (2.14 M1 §6.2/§8): validate one
+ * exact TT carrier from an undo-segment header fetched by the transaction's
+ * owning instance.  Unlike the legacy by-xid scan, this predicate binds the
+ * segment generation, slot offset, xid, and slot wrap supplied by the caller;
+ * a recycled carrier therefore refuses instead of being amortized by a raw-xid
+ * memo.  Pure; the runtime wrapper performs the single ordinary CR fetch.
+ */
+extern ClusterVisTtProof cluster_vis_tt_block_exact_proof(
+	const char *block, uint32 expected_segment_id, uint8 expected_owner_instance,
+	uint32 expected_segment_generation, uint16 expected_slot_offset,
+	TransactionId expected_xid, uint16 expected_wrap, SCN *out_commit_scn);
+
+/*
+ * 2.14 M1 level-3 authority-separated proof.  Fetch the transaction owner's
+ * TT/undo segment header with one ordinary CR request (or the same-epoch
+ * cached pair), then validate the caller's exact segment generation and slot
+ * identity.  A false result is fail-closed; no raw-xid terminal memo is
+ * installed here.  The owner/authority is the origin node, and the returned
+ * authority is co-sampled with the fetched bytes.  The caller supplies the
+ * physical carrier identity because a recycled carrier is not equivalent to
+ * a raw xid recurrence.
+ */
+extern bool cluster_runtime_visibility_remote_exact_tt_proof(
+	int origin_node, uint32 segment_id, uint32 segment_generation, uint16 slot_offset,
+	TransactionId xid, uint16 slot_wrap, ClusterVisTtProof *proof_out, SCN *commit_scn_out,
+	ClusterLiveAuthority *auth_out);
+
+/*
  * spec-5.22d A1 (D4-8): the scan CORE under the positive-proof wrapper.
  * Same parse discipline, exposed for the dead-owner complete-scan prove:
  * the per-block match COUNT is reported (cross-segment uniqueness is the

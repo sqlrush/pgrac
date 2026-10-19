@@ -257,6 +257,89 @@ cluster_vis_tt_block_positive_proof(const char *block, uint32 expected_segment_i
 }
 
 /*
+ * cluster_vis_tt_block_exact_proof
+ *
+ * 2.14 M1 level-3 proof for the authority-separated path.  The caller has
+ * already carried the exact physical binding (segment generation, slot
+ * offset, xid, and slot wrap) from the tuple/ITL identity.  This predicate
+ * checks that binding against one owner-served undo segment header.  It never
+ * scans by raw xid, so a recycled carrier cannot satisfy an old reference.
+ * Pure; no I/O, locks, shmem, or terminal memo side effects.
+ */
+ClusterVisTtProof
+cluster_vis_tt_block_exact_proof(const char *block, uint32 expected_segment_id,
+								 uint8 expected_owner_instance,
+								 uint32 expected_segment_generation,
+								 uint16 expected_slot_offset, TransactionId expected_xid,
+								 uint16 expected_wrap, SCN *out_commit_scn)
+{
+	const UndoSegmentHeaderData *hdr;
+	const TTSlot *slot;
+
+	if (out_commit_scn != NULL)
+		*out_commit_scn = InvalidScn;
+
+	/* These are the wire/ref domains.  Refuse widened or sentinel values. */
+	if (block == NULL || expected_segment_id == 0 || expected_segment_id > UINT16_MAX
+		|| expected_owner_instance == UNDO_OWNER_INSTANCE_INVALID
+		|| expected_owner_instance > UNDO_OWNER_INSTANCE_MAX
+		|| expected_segment_generation == UINT32_MAX
+		|| expected_slot_offset >= TT_SLOTS_PER_SEGMENT
+		|| !TransactionIdIsNormal(expected_xid) || expected_wrap > TT_WRAP_MAX)
+		return CLUSTER_VIS_TT_PROOF_NONE;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (!UndoSegmentHeader_identity_matches(block, expected_segment_id, expected_owner_instance))
+		return CLUSTER_VIS_TT_PROOF_NONE;
+#else
+	/* Standalone policy builds retain the same page/identity refusal. */
+	{
+		const PageHeader ph = (PageHeader)block;
+		const UndoSegmentHeaderData *candidate = (const UndoSegmentHeaderData *)block;
+
+		if ((ph->pd_flags & PD_UNDO_SEG_HEADER) == 0
+			|| PageGetPageSize((Page)block) != BLCKSZ
+			|| PageGetPageLayoutVersion((Page)block) != PG_PAGE_LAYOUT_VERSION
+			|| candidate->segment_id != expected_segment_id
+			|| candidate->segment_size_bytes != UNDO_SEGMENT_SIZE_BYTES
+			|| candidate->owner_instance != expected_owner_instance
+			|| candidate->tt_slots_count != TT_SLOTS_PER_SEGMENT
+			|| (candidate->segment_state != SEGMENT_ALLOCATED
+				&& candidate->segment_state != SEGMENT_ACTIVE
+				&& candidate->segment_state != SEGMENT_COMMITTED
+				&& candidate->segment_state != SEGMENT_RECYCLABLE))
+			return CLUSTER_VIS_TT_PROOF_NONE;
+	}
+#endif
+
+	hdr = (const UndoSegmentHeaderData *)block;
+	if (hdr->wrap_count != expected_segment_generation)
+		return CLUSTER_VIS_TT_PROOF_NONE;
+
+	slot = &hdr->tt_slots[expected_slot_offset];
+	if (slot->xid != expected_xid || slot->wrap != expected_wrap
+		|| (slot->flags & (uint8)~TT_SLOT_FLAGS_KNOWN) != 0
+		|| slot->status > TT_SLOT_RECYCLABLE)
+		return CLUSTER_VIS_TT_PROOF_NONE;
+
+	switch (slot->status) {
+	case TT_SLOT_COMMITTED:
+		if (!SCN_VALID(slot->commit_scn))
+			return CLUSTER_VIS_TT_PROOF_NONE;
+		if (out_commit_scn != NULL)
+			*out_commit_scn = slot->commit_scn;
+		return CLUSTER_VIS_TT_PROOF_COMMITTED;
+	case TT_SLOT_ABORTED:
+		/* An abort carries no commit SCN; any residue is ambiguous. */
+		return SCN_VALID(slot->commit_scn) ? CLUSTER_VIS_TT_PROOF_NONE
+										 : CLUSTER_VIS_TT_PROOF_ABORTED;
+	default:
+		/* UNUSED / ACTIVE / RECYCLABLE are non-terminal or unbound. */
+		return CLUSTER_VIS_TT_PROOF_NONE;
+	}
+}
+
+/*
  * cluster_vis_undo_verdict_page_usable
  *
  * CP5 (D-i4) pure structural validation of a shipped verdict page.  See the

@@ -3150,6 +3150,60 @@ cluster_undo_block_fetch_for_visibility(int origin_node, UBA uba, char *out_page
 }
 
 /*
+ * cluster_runtime_visibility_remote_exact_tt_proof
+ *
+ * 2.14 M1 level-3 authority-separated leg.  The transaction owner serves
+ * its undo segment header through the ordinary block-0 CR path above; that
+ * path already pairs one wire fetch (or one same-epoch cache hit) with the
+ * live authority trailer.  We then validate the exact segment generation and
+ * TT slot identity supplied by the caller.  No raw-xid scan or terminal memo
+ * is used, so a recycled carrier cannot alias an old reference.  The caller
+ * still applies the authority/SCN gate and any lazy cleanout policy.
+ */
+bool
+cluster_runtime_visibility_remote_exact_tt_proof(
+	int origin_node, uint32 segment_id, uint32 segment_generation, uint16 slot_offset,
+	TransactionId xid, uint16 slot_wrap, ClusterVisTtProof *proof_out, SCN *commit_scn_out,
+	ClusterLiveAuthority *auth_out)
+{
+	PGAlignedBlock page;
+	ClusterLiveAuthority auth;
+	ClusterVisTtProof proof;
+	SCN commit_scn = InvalidScn;
+
+	if (proof_out != NULL)
+		*proof_out = CLUSTER_VIS_TT_PROOF_NONE;
+	if (commit_scn_out != NULL)
+		*commit_scn_out = InvalidScn;
+	if (auth_out != NULL)
+		memset(auth_out, 0, sizeof(*auth_out));
+
+	if (proof_out == NULL || commit_scn_out == NULL || auth_out == NULL
+		|| !cluster_crossnode_runtime_visibility || origin_node < 0
+		|| origin_node >= CLUSTER_MAX_NODES || origin_node == cluster_node_id
+		|| segment_id == 0 || segment_id > UINT16_MAX
+		|| segment_generation == UINT32_MAX || slot_offset >= TT_SLOTS_PER_SEGMENT
+		|| !TransactionIdIsNormal(xid) || slot_wrap > TT_WRAP_MAX)
+		return false;
+
+	memset(&auth, 0, sizeof(auth));
+	if (!cluster_undo_block_fetch_for_visibility(
+			origin_node, uba_encode(segment_id, 0, 0, 0), page.data, &auth))
+		return false;
+
+	proof = cluster_vis_tt_block_exact_proof(
+		page.data, segment_id, (uint8)((uint32)origin_node + 1), segment_generation,
+		slot_offset, xid, slot_wrap, &commit_scn);
+	if (proof == CLUSTER_VIS_TT_PROOF_NONE)
+		return false;
+
+	*proof_out = proof;
+	*commit_scn_out = commit_scn;
+	*auth_out = auth;
+	return true;
+}
+
+/*
  * rtvis_try_origin_verdict — CP5 (D-i4 / spec-6.15 D4) verdict fallback leg.
  *
  *	Reached when the single-block positive proof came back NONE (0-match /

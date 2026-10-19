@@ -30,6 +30,7 @@
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_undo_segment.h" /* fake TT header blocks (CP3) */
 #include "cluster/cluster_undo_verdict.h" /* ClusterUndoVerdictResult (D4-6) */
+#include "storage/bufpage.h"
 
 #include "unit_test.h"
 
@@ -325,6 +326,7 @@ UT_TEST(test_undo_auth_trailer_roundtrip)
 #define PROOF_OWNER 2 /* origin node 1 -> owner_instance 2 */
 
 static PGAlignedBlock proof_block;
+static PGAlignedBlock exact_proof_block;
 
 static UndoSegmentHeaderData *
 mk_header(uint32 segment_id, uint8 owner, uint16 nslots)
@@ -345,6 +347,105 @@ set_slot(UndoSegmentHeaderData *hdr, int i, TransactionId xid, uint16 wrap, uint
 	hdr->tt_slots[i].wrap = wrap;
 	hdr->tt_slots[i].status = status;
 	hdr->tt_slots[i].commit_scn = scn;
+}
+
+static UndoSegmentHeaderData *
+mk_exact_header(uint32 segment_id, uint8 owner, uint32 generation)
+{
+	PageHeader ph = (PageHeader)exact_proof_block.data;
+	UndoSegmentHeaderData *hdr = (UndoSegmentHeaderData *)exact_proof_block.data;
+
+	memset(exact_proof_block.data, 0, BLCKSZ);
+	ph->pd_flags = PD_UNDO_SEG_HEADER;
+	ph->pd_lower = SizeOfPageHeaderData;
+	ph->pd_upper = BLCKSZ;
+	ph->pd_special = BLCKSZ;
+	PageSetPageSizeAndVersion((Page)exact_proof_block.data, BLCKSZ, PG_PAGE_LAYOUT_VERSION);
+	hdr->segment_id = segment_id;
+	hdr->segment_size_bytes = UNDO_SEGMENT_SIZE_BYTES;
+	hdr->segment_state = SEGMENT_ACTIVE;
+	hdr->owner_instance = owner;
+	hdr->tt_slots_count = TT_SLOTS_PER_SEGMENT;
+	hdr->wrap_count = generation;
+	return hdr;
+}
+
+/* Level-3 proof accepts only the exact segment era and TT carrier. */
+UT_TEST(test_ttproof_exact_identity)
+{
+	UndoSegmentHeaderData *hdr = mk_exact_header(PROOF_SEG, PROOF_OWNER, 41);
+	SCN scn = InvalidScn;
+
+	set_slot(hdr, 6, 1000, 12, (uint8)TT_SLOT_COMMITTED, (SCN)777);
+	UT_ASSERT_EQ(cluster_vis_tt_block_exact_proof(exact_proof_block.data, PROOF_SEG, PROOF_OWNER,
+											 41, 6, 1000, 12, &scn),
+				 CLUSTER_VIS_TT_PROOF_COMMITTED);
+	UT_ASSERT_EQ(scn, (SCN)777);
+
+	scn = (SCN)1;
+	set_slot(hdr, 7, 2000, 3, (uint8)TT_SLOT_ABORTED, InvalidScn);
+	UT_ASSERT_EQ(cluster_vis_tt_block_exact_proof(exact_proof_block.data, PROOF_SEG, PROOF_OWNER,
+											 41, 7, 2000, 3, &scn),
+				 CLUSTER_VIS_TT_PROOF_ABORTED);
+	UT_ASSERT_EQ(scn, InvalidScn);
+}
+
+/* Any identity drift, malformed page, or non-terminal slot refuses the proof. */
+UT_TEST(test_ttproof_exact_identity_failclosed)
+{
+	UndoSegmentHeaderData *hdr = mk_exact_header(PROOF_SEG, PROOF_OWNER, 41);
+	SCN scn = (SCN)999;
+
+	set_slot(hdr, 6, 1000, 12, (uint8)TT_SLOT_COMMITTED, (SCN)777);
+	UT_ASSERT_EQ(cluster_vis_tt_block_exact_proof(exact_proof_block.data, PROOF_SEG, PROOF_OWNER,
+											 42, 6, 1000, 12, &scn),
+				 CLUSTER_VIS_TT_PROOF_NONE);
+	UT_ASSERT_EQ(scn, InvalidScn);
+	UT_ASSERT_EQ(cluster_vis_tt_block_exact_proof(exact_proof_block.data, PROOF_SEG, PROOF_OWNER,
+											 41, 6, 1000, 13, NULL),
+				 CLUSTER_VIS_TT_PROOF_NONE);
+	UT_ASSERT_EQ(cluster_vis_tt_block_exact_proof(exact_proof_block.data, PROOF_SEG, PROOF_OWNER,
+											 41, 6, 1001, 12, NULL),
+				 CLUSTER_VIS_TT_PROOF_NONE);
+	UT_ASSERT_EQ(cluster_vis_tt_block_exact_proof(exact_proof_block.data, PROOF_SEG + 1, PROOF_OWNER,
+											 41, 6, 1000, 12, NULL),
+				 CLUSTER_VIS_TT_PROOF_NONE);
+	UT_ASSERT_EQ(cluster_vis_tt_block_exact_proof(exact_proof_block.data, PROOF_SEG, PROOF_OWNER + 1,
+											 41, 6, 1000, 12, NULL),
+				 CLUSTER_VIS_TT_PROOF_NONE);
+	UT_ASSERT_EQ(cluster_vis_tt_block_exact_proof(exact_proof_block.data, PROOF_SEG, PROOF_OWNER,
+											 41, TT_SLOTS_PER_SEGMENT, 1000, 12, NULL),
+				 CLUSTER_VIS_TT_PROOF_NONE);
+	UT_ASSERT_EQ(cluster_vis_tt_block_exact_proof(exact_proof_block.data, PROOF_SEG, PROOF_OWNER,
+											 41, 6, 1000, TT_WRAP_INVALID, NULL),
+				 CLUSTER_VIS_TT_PROOF_NONE);
+
+	/* The slot flags/status and page identity are part of the proof boundary. */
+	hdr->tt_slots[6].flags = (uint8)(TT_SLOT_FLAGS_KNOWN | 0x80);
+	UT_ASSERT_EQ(cluster_vis_tt_block_exact_proof(exact_proof_block.data, PROOF_SEG, PROOF_OWNER,
+											 41, 6, 1000, 12, NULL),
+				 CLUSTER_VIS_TT_PROOF_NONE);
+	hdr->tt_slots[6].flags = 0;
+	hdr->tt_slots[6].status = (uint8)7;
+	UT_ASSERT_EQ(cluster_vis_tt_block_exact_proof(exact_proof_block.data, PROOF_SEG, PROOF_OWNER,
+											 41, 6, 1000, 12, NULL),
+				 CLUSTER_VIS_TT_PROOF_NONE);
+	hdr->tt_slots[6].status = (uint8)TT_SLOT_ACTIVE;
+	UT_ASSERT_EQ(cluster_vis_tt_block_exact_proof(exact_proof_block.data, PROOF_SEG, PROOF_OWNER,
+											 41, 6, 1000, 12, NULL),
+				 CLUSTER_VIS_TT_PROOF_NONE);
+	hdr->tt_slots[6].status = (uint8)TT_SLOT_COMMITTED;
+	hdr->tt_slots[6].commit_scn = InvalidScn;
+	UT_ASSERT_EQ(cluster_vis_tt_block_exact_proof(exact_proof_block.data, PROOF_SEG, PROOF_OWNER,
+											 41, 6, 1000, 12, NULL),
+				 CLUSTER_VIS_TT_PROOF_NONE);
+
+	/* A recycled/invalid page header cannot be accepted as the same carrier. */
+	hdr->tt_slots[6].commit_scn = (SCN)777;
+	((PageHeader)exact_proof_block.data)->pd_flags = 0;
+	UT_ASSERT_EQ(cluster_vis_tt_block_exact_proof(exact_proof_block.data, PROOF_SEG, PROOF_OWNER,
+											 41, 6, 1000, 12, NULL),
+				 CLUSTER_VIS_TT_PROOF_NONE);
 }
 
 /* Exactly-one terminal match resolves; UNUSED same-xid bytes are ignored. */
@@ -1236,7 +1337,7 @@ UT_TEST(test_page_exact_locator_preserves_selected_slot)
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(32);
 	UT_RUN(test_covers_when_epoch_match_and_scn_ge_demand);
 	UT_RUN(test_covers_ignores_cross_thread_lsn);
 	UT_RUN(test_failclosed_when_epoch_differs);
@@ -1249,6 +1350,8 @@ main(void)
 	UT_RUN(test_committed_bound_admission_terminal_vs_snapshot);
 	UT_RUN(test_freshref_c1b_pair_request_eligibility);
 	UT_RUN(test_ttproof_committed_and_aborted);
+	UT_RUN(test_ttproof_exact_identity);
+	UT_RUN(test_ttproof_exact_identity_failclosed);
 	UT_RUN(test_ttproof_committed_is_evidence_not_verdict);
 	UT_RUN(test_ttproof_recycled_same_xid_reports_bumped_wrap_not_gated);
 	UT_RUN(test_ttproof_zero_match_active_invalid_scn);
