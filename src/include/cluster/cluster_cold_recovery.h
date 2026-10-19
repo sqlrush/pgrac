@@ -938,8 +938,9 @@ extern bool cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
 									 ClusterRecoveryTTAbortDerivationV1 *out);
 
 /* Producer boundary for one original TT owner.  Locate the post-redo header
- * by physical owner/segment, verify its complete sealed fold and exact slot
- * before-image, then consume the original producer's TopTxProof/shape gates.
+ * by physical owner/segment, require the complete ordinary TT/UNDO inventory
+ * and all original sources, then verify the selected sealed fold and exact
+ * slot before-image and consume the original producer's TopTxProof/shape gates.
  * Target incarnation/claim remain bound to the original source.  A new
  * header with no original base requires the native full-image proof.
  * The aggregate endpoint is the already-computed typed->xid_next_after_redo;

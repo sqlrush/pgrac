@@ -493,6 +493,13 @@ cluster_cold_typed_top_tx_c0_producer_v1(const ClusterColdTypedV1 *typed, uint32
 		|| post_slot.slot.status != TT_SLOT_ACTIVE
 		|| !cold_top_tx_key_equal_v1(&post_slot.key, &proof->key))
 		return false;
+	/* A valid target alone cannot discharge missing/unsupported retained
+	 * sources, another TT header, or an uncached native UNDO effect. Reuse
+	 * the complete ordinary inventory rather than trusting the proof flags
+	 * for those inputs. This does not establish checkpoint coverage, top
+	 * ownership, atomic transaction effects or old-writer isolation. */
+	if (!cluster_cold_typed_tt_redo_inventory_v1(typed))
+		return false;
 	/* Compare the whole selected header with its sealed original fold.  A
 	 * newly-created segment requires the existing native full-image proof;
 	 * its observed bytes can never supply a missing predecessor. */
