@@ -11,6 +11,7 @@
  */
 #include "postgres.h"
 
+#include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_relmap_pending.h"
 
 #ifdef USE_PGRAC_CLUSTER
@@ -141,7 +142,10 @@ cluster_relmap_pending_rebuild_from_committed(
 		ClusterRelmapPendingResult result;
 
 		if (descriptors[i].identity.system_identifier != expected->system_identifier ||
-			descriptors[i].identity.database_incarnation != expected->database_incarnation)
+			descriptors[i].identity.database_incarnation != expected->database_incarnation ||
+			descriptors[i].identity.locator.dbOid != expected->dbid ||
+			(descriptors[i].identity.locator.spcOid == GLOBALTABLESPACE_OID) !=
+			expected->shared)
 			return CLUSTER_RELMAP_PENDING_CONFLICT;
 		result = cluster_relmap_pending_add(&rebuilt, descriptors[i].kind,
 														&descriptors[i].identity, true);

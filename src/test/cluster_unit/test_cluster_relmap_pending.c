@@ -15,6 +15,7 @@
 
 #include "postgres_fe.h"
 
+#include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_relmap_pending.h"
 #include "common/cluster_relmap_v2.h"
 #include "unit_test.h"
@@ -30,7 +31,7 @@ pending_key(uint64 database_incarnation, uint8 uuid_tag, RelFileNumber rel_numbe
 	key.system_identifier = UINT64CONST(0x0102030405060708);
 	key.database_incarnation = database_incarnation;
 	memset(key.storage_uuid, uuid_tag, sizeof(key.storage_uuid));
-	key.locator.spcOid = 1663; /* DEFAULTTABLESPACE_OID */
+	key.locator.spcOid = DEFAULTTABLESPACE_OID;
 	key.locator.dbOid = 42;
 	key.locator.relNumber = rel_number;
 	return key;
@@ -66,12 +67,13 @@ static const ClusterRelmapV2Namespace pending_v2_identity = {
 };
 
 static void
-pending_v2_pair(unsigned char *primary, unsigned char *backup)
+pending_v2_pair(const ClusterRelmapV2Namespace *identity,
+				unsigned char *primary, unsigned char *backup)
 {
 	ClusterRelmapV2Image image;
 
 	memset(&image, 0, sizeof(image));
-	image.identity = pending_v2_identity;
+	image.identity = *identity;
 	image.committed_generation = 7;
 	image.pending_generation = 8;
 	image.pending_owner.node = 3;
@@ -242,7 +244,7 @@ UT_TEST(test_pending_rebuild_requires_committed_pair)
 	descriptor.kind = CLUSTER_RELMAP_PENDING_TRUNCATE;
 	descriptor.identity = key;
 
-	pending_v2_pair(primary, backup);
+	pending_v2_pair(&pending_v2_identity, primary, backup);
 	pair_result = cluster_relmap_v2_read_pair(primary, sizeof(primary), backup,
 												 sizeof(backup), &pending_v2_identity, &view);
 	UT_ASSERT_EQ(pair_result, CLUSTER_RELMAP_V2_PAIR_VALID);
@@ -292,10 +294,114 @@ UT_TEST(test_pending_rebuild_requires_committed_pair)
 	}
 }
 
+UT_TEST(test_pending_rebuild_accepts_global_and_local_tablespaces)
+{
+	const Oid tablespaces[] = {
+		GLOBALTABLESPACE_OID, DEFAULTTABLESPACE_OID, 9000
+	};
+
+	for (size_t i = 0; i < lengthof(tablespaces); i++)
+	{
+		ClusterRelmapV2Namespace ns = pending_v2_identity;
+		unsigned char primary[CLUSTER_RELMAP_V2_FILE_SIZE];
+		unsigned char backup[CLUSTER_RELMAP_V2_FILE_SIZE];
+		ClusterRelmapV2View view;
+		ClusterRelmapV2PairResult pair_result;
+
+		ns.shared = tablespaces[i] == GLOBALTABLESPACE_OID;
+		ns.dbid = ns.shared ? InvalidOid : 42;
+		pending_v2_pair(&ns, primary, backup);
+		pair_result = cluster_relmap_v2_read_pair(primary, sizeof(primary),
+			backup, sizeof(backup), &ns, &view);
+		UT_ASSERT_EQ(pair_result, CLUSTER_RELMAP_V2_PAIR_VALID);
+		for (int kind = CLUSTER_RELMAP_PENDING_DROP;
+			 kind <= CLUSTER_RELMAP_PENDING_TRUNCATE; kind++)
+		{
+			ClusterRelmapPendingSet set;
+			ClusterRelmapPendingDescriptor descriptor;
+
+			descriptor.kind = (ClusterRelmapPendingKind) kind;
+			descriptor.identity = pending_key(ns.database_incarnation, 0xe1, 12002);
+			descriptor.identity.system_identifier = ns.system_identifier;
+			descriptor.identity.locator.spcOid = tablespaces[i];
+			descriptor.identity.locator.dbOid = ns.dbid;
+			cluster_relmap_pending_init(&set);
+			UT_ASSERT_EQ(cluster_relmap_pending_rebuild_from_committed(
+				&set, &ns, pair_result, &view, &descriptor, 1),
+				CLUSTER_RELMAP_PENDING_OK);
+			UT_ASSERT(cluster_relmap_pending_contains(&set, descriptor.kind,
+				&descriptor.identity));
+			UT_ASSERT(cluster_relmap_pending_rel_number_reserved(&set,
+				&descriptor.identity));
+			UT_ASSERT(!cluster_relmap_pending_can_release(&set, descriptor.kind,
+				&descriptor.identity));
+		}
+	}
+}
+
+UT_TEST(test_pending_rebuild_rejects_foreign_physical_namespace_atomically)
+{
+	const struct {
+		bool shared;
+		Oid tablespace;
+		Oid database;
+	} cases[] = {
+		{ true, DEFAULTTABLESPACE_OID, 42 },
+		{ true, GLOBALTABLESPACE_OID, 42 },
+		{ true, DEFAULTTABLESPACE_OID, InvalidOid },
+		{ true, 9000, InvalidOid },
+		{ false, DEFAULTTABLESPACE_OID, 43 },
+		{ false, DEFAULTTABLESPACE_OID, InvalidOid },
+		{ false, GLOBALTABLESPACE_OID, 42 },
+		{ false, GLOBALTABLESPACE_OID, InvalidOid },
+		{ false, 9000, 43 }
+	};
+
+	for (size_t i = 0; i < lengthof(cases); i++)
+	{
+		ClusterRelmapV2Namespace ns = pending_v2_identity;
+		unsigned char primary[CLUSTER_RELMAP_V2_FILE_SIZE];
+		unsigned char backup[CLUSTER_RELMAP_V2_FILE_SIZE];
+		ClusterRelmapV2View view;
+		ClusterRelmapV2PairResult pair_result;
+
+		ns.shared = cases[i].shared;
+		ns.dbid = ns.shared ? InvalidOid : 42;
+		pending_v2_pair(&ns, primary, backup);
+		pair_result = cluster_relmap_v2_read_pair(primary, sizeof(primary),
+			backup, sizeof(backup), &ns, &view);
+		UT_ASSERT_EQ(pair_result, CLUSTER_RELMAP_V2_PAIR_VALID);
+		for (int kind = CLUSTER_RELMAP_PENDING_DROP;
+			 kind <= CLUSTER_RELMAP_PENDING_TRUNCATE; kind++)
+		{
+			ClusterRelmapPendingSet set;
+			ClusterRelmapPendingSet before;
+			ClusterRelmapPendingDescriptor descriptors[2];
+
+			descriptors[0].kind = (ClusterRelmapPendingKind) kind;
+			descriptors[0].identity = pending_key(ns.database_incarnation, 0xe2, 12003);
+			descriptors[0].identity.system_identifier = ns.system_identifier;
+			descriptors[0].identity.locator.spcOid = ns.shared
+				? GLOBALTABLESPACE_OID : DEFAULTTABLESPACE_OID;
+			descriptors[0].identity.locator.dbOid = ns.dbid;
+			descriptors[1] = descriptors[0];
+			descriptors[1].identity.locator.relNumber++;
+			descriptors[1].identity.locator.spcOid = cases[i].tablespace;
+			descriptors[1].identity.locator.dbOid = cases[i].database;
+			cluster_relmap_pending_init(&set);
+			memcpy(&before, &set, sizeof(before));
+			UT_ASSERT_EQ(cluster_relmap_pending_rebuild_from_committed(
+				&set, &ns, pair_result, &view, descriptors, lengthof(descriptors)),
+				CLUSTER_RELMAP_PENDING_CONFLICT);
+			UT_ASSERT_EQ(memcmp(&set, &before, sizeof(set)), 0);
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(9);
 	UT_RUN(test_pending_add_requires_main_placeholder_and_reserves_locator);
 	UT_RUN(test_pending_release_requires_all_terminal_proofs);
 	UT_RUN(test_pending_proof_marks_are_idempotent_but_exact);
@@ -303,6 +409,8 @@ main(void)
 	UT_RUN(test_pending_identity_and_kind_validation);
 	UT_RUN(test_pending_set_is_bounded);
 	UT_RUN(test_pending_rebuild_requires_committed_pair);
+	UT_RUN(test_pending_rebuild_accepts_global_and_local_tablespaces);
+	UT_RUN(test_pending_rebuild_rejects_foreign_physical_namespace_atomically);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

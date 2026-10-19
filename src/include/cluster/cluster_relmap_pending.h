@@ -85,6 +85,9 @@ extern void cluster_relmap_pending_init(ClusterRelmapPendingSet *set);
  * image is deliberately ignored: structural DROP/TRUNCATE descriptors come
  * from the exact cold-recovery stream, and every resulting entry starts with
  * all terminal proof bits clear.
+ * Each descriptor must match the reader's database OID and shared/global
+ * tablespace namespace; local databases may use any valid non-global
+ * tablespace.
  *
  * The destination must be freshly initialized and empty.  On any failure it
  * is left unchanged.

@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_relmap_authority.h"
 #include "cluster/cluster_relmap_lock.h"
 #include "cluster/cluster_relmap_pending.h"
@@ -611,8 +612,8 @@ UT_TEST(test_committed_reader_rebuilds_exact_structural_pending)
 	descriptor.identity.database_incarnation = identity.database_incarnation;
 	memset(descriptor.identity.storage_uuid, 0xd1,
 		   sizeof(descriptor.identity.storage_uuid));
-	descriptor.identity.locator.spcOid = 1663;
-	descriptor.identity.locator.dbOid = 42;
+	descriptor.identity.locator.spcOid = GLOBALTABLESPACE_OID;
+	descriptor.identity.locator.dbOid = InvalidOid;
 	descriptor.identity.locator.relNumber = 12001;
 
 	setup(&identity);
@@ -645,6 +646,111 @@ UT_TEST(test_committed_reader_rebuilds_exact_structural_pending)
 	UT_ASSERT_EQ(memcmp(&map, &zero, sizeof(map)) == 0, true);
 	UT_ASSERT(!cluster_relmap_pending_contains(&pending, CLUSTER_RELMAP_PENDING_DROP,
 									 &descriptor.identity));
+}
+
+UT_TEST(test_committed_rebuild_accepts_local_default_and_custom_tablespaces)
+{
+	ClusterRelmapV2Namespace local = identity;
+	ClusterRelmapPendingDescriptor descriptors[2];
+	ClusterRelmapPendingSet pending;
+	RelMapFile map;
+	uint64 generation;
+
+	local.shared = false;
+	local.dbid = 42;
+	memset(descriptors, 0, sizeof(descriptors));
+	for (size_t i = 0; i < lengthof(descriptors); i++) {
+		descriptors[i].kind = i == 0
+			? CLUSTER_RELMAP_PENDING_DROP : CLUSTER_RELMAP_PENDING_TRUNCATE;
+		descriptors[i].identity.system_identifier = local.system_identifier;
+		descriptors[i].identity.database_incarnation = local.database_incarnation;
+		memset(descriptors[i].identity.storage_uuid, 0xd2 + i,
+			   sizeof(descriptors[i].identity.storage_uuid));
+		descriptors[i].identity.locator.spcOid = i == 0 ? DEFAULTTABLESPACE_OID : 9000;
+		descriptors[i].identity.locator.dbOid = local.dbid;
+		descriptors[i].identity.locator.relNumber = 12002 + i;
+	}
+	setup(&local);
+	UT_ASSERT(stage(&local));
+	cluster_relmap_pending_init(&pending);
+	UT_ASSERT_EQ(cluster_relmap_authority_v2_read_rebuild_pending(
+		&local, descriptors, lengthof(descriptors), &pending, &map, &generation),
+		CLUSTER_RELMAP_PENDING_OK);
+	UT_ASSERT_EQ(generation, UINT64CONST(7));
+	UT_ASSERT_EQ(map.mappings[0].mapfilenumber, 40000);
+	for (size_t i = 0; i < lengthof(descriptors); i++) {
+		UT_ASSERT(cluster_relmap_pending_contains(&pending, descriptors[i].kind,
+			&descriptors[i].identity));
+		UT_ASSERT(cluster_relmap_pending_rel_number_reserved(&pending,
+			&descriptors[i].identity));
+		UT_ASSERT(!cluster_relmap_pending_can_release(&pending, descriptors[i].kind,
+			&descriptors[i].identity));
+	}
+}
+
+UT_TEST(test_committed_rebuild_rejects_foreign_physical_namespace_atomically)
+{
+	const struct {
+		bool shared;
+		Oid tablespace;
+		Oid database;
+	} cases[] = {
+		{ true, DEFAULTTABLESPACE_OID, 42 },
+		{ true, GLOBALTABLESPACE_OID, 42 },
+		{ true, DEFAULTTABLESPACE_OID, InvalidOid },
+		{ true, 9000, InvalidOid },
+		{ false, DEFAULTTABLESPACE_OID, 43 },
+		{ false, DEFAULTTABLESPACE_OID, InvalidOid },
+		{ false, GLOBALTABLESPACE_OID, 42 },
+		{ false, GLOBALTABLESPACE_OID, InvalidOid },
+		{ false, 9000, 43 }
+	};
+
+	for (size_t i = 0; i < lengthof(cases); i++) {
+		ClusterRelmapV2Namespace ns = identity;
+		ClusterRelmapPendingDescriptor descriptors[2];
+		RelMapFile zero;
+
+		ns.shared = cases[i].shared;
+		ns.dbid = ns.shared ? InvalidOid : 42;
+		setup(&ns);
+		UT_ASSERT(stage(&ns));
+		reset_io();
+		memset(descriptors, 0, sizeof(descriptors));
+		descriptors[0].identity.system_identifier = ns.system_identifier;
+		descriptors[0].identity.database_incarnation = ns.database_incarnation;
+		memset(descriptors[0].identity.storage_uuid, 0xd4,
+			   sizeof(descriptors[0].identity.storage_uuid));
+		descriptors[0].identity.locator.spcOid = ns.shared
+			? GLOBALTABLESPACE_OID : DEFAULTTABLESPACE_OID;
+		descriptors[0].identity.locator.dbOid = ns.dbid;
+		descriptors[0].identity.locator.relNumber = 12004;
+		descriptors[1] = descriptors[0];
+		descriptors[1].identity.locator.relNumber++;
+		descriptors[1].identity.locator.spcOid = cases[i].tablespace;
+		descriptors[1].identity.locator.dbOid = cases[i].database;
+		memset(&zero, 0, sizeof(zero));
+		for (int kind = CLUSTER_RELMAP_PENDING_DROP;
+			 kind <= CLUSTER_RELMAP_PENDING_TRUNCATE; kind++) {
+			ClusterRelmapPendingSet pending;
+			ClusterRelmapPendingSet before;
+			RelMapFile map;
+			uint64 generation = UINT64CONST(99);
+
+			descriptors[0].kind = descriptors[1].kind = (ClusterRelmapPendingKind) kind;
+			cluster_relmap_pending_init(&pending);
+			memcpy(&before, &pending, sizeof(before));
+			memset(&map, 0xa5, sizeof(map));
+			UT_ASSERT_EQ(cluster_relmap_authority_v2_read_rebuild_pending(
+				&ns, descriptors, lengthof(descriptors), &pending, &map, &generation),
+				CLUSTER_RELMAP_PENDING_CONFLICT);
+			UT_ASSERT_EQ(memcmp(&pending, &before, sizeof(pending)), 0);
+			UT_ASSERT_EQ(generation, UINT64CONST(0));
+			UT_ASSERT_EQ(memcmp(&map, &zero, sizeof(map)), 0);
+		}
+		UT_ASSERT_EQ(writes, 0);
+		UT_ASSERT_EQ(renames, 0);
+	}
 }
 
 UT_TEST(test_per_database_namespace)
@@ -1988,12 +2094,14 @@ UT_TEST(test_changed_wal_cannot_rebind_staged_pin)
 int
 main(void)
 {
-	UT_PLAN(65);
+	UT_PLAN(67);
 	UT_RUN(test_stage_both_copies_before_success);
 	UT_RUN(test_committed_reader_hides_pending_and_rejects_degraded_pair);
 	UT_RUN(test_committed_reader_requires_namespace_x_lock);
 	UT_RUN(test_committed_reader_rechecks_namespace_x_lock_after_io);
 	UT_RUN(test_committed_reader_rebuilds_exact_structural_pending);
+	UT_RUN(test_committed_rebuild_accepts_local_default_and_custom_tablespaces);
+	UT_RUN(test_committed_rebuild_rejects_foreign_physical_namespace_atomically);
 	UT_RUN(test_per_database_namespace);
 	UT_RUN(test_missing_authority_is_never_seeded);
 	UT_RUN(test_fallback_is_incomplete_and_cannot_stage);
