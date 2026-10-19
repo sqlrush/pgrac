@@ -973,6 +973,13 @@ extern bool cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
 									 TransactionId oldest_xid, uint64 recoverer_epoch,
 									 ClusterRecoveryTTAbortDerivationV1 *out);
 
+/* Revalidate the original selected ROOTs, sources, checkpoints and retained
+ * history inside the caller's still-held pass-2 fence/serial set. No refresh
+ * or authority acquisition: failure invalidates this attempt's cached input.
+ * This is not a post-EOR recovery-writer grant. */
+extern bool cluster_cold_typed_sources_current_v1(ClusterColdTypedV1 *typed,
+												  struct ClusterRecoveryFencePlan *fence);
+
 /* Producer boundary for one original TT owner.  Locate the post-redo header
  * by physical owner/segment, require the complete ordinary TT/UNDO inventory
  * and all original sources, then verify the selected sealed fold and exact
@@ -982,7 +989,10 @@ extern bool cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
  * Recheck the original post-redo physical namespace, inode identities and
  * retained TT/UNDO bytes before consuming cached images and before publishing
  * output. A mismatch invalidates that snapshot and leaves output zero. These
- * checks do not establish source/ROOT freshness or old-writer isolation.
+ * checks alone do not establish source/ROOT freshness or old-writer isolation.
+ * Require the original owner to revalidate every selected source/ROOT and its
+ * still-held execution fence before reading cached inputs and before publishing
+ * the candidate. This produces only an input descriptor, not C0 write authority.
  * Derive producer_top from this source's exact native
  * canonical BIND; the caller's producer_top bit is ignored. Other proof/shape
  * gates remain independent and required. An older ACTIVE without a retained
@@ -998,12 +1008,11 @@ extern bool cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
  * post-redo image, proof gate or exact shape refuses.
  * No proof bit is synthesized from source-drained state, current epoch or
  * graph shape, and no old C0 replay consumer is called here. */
-extern bool cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed, uint32 participant,
-													 const ClusterColdTopTxProofV1 *proof,
-													 const ClusterRecoveryTTAbortV1 *shape,
-													 bool has_oldest_xid, TransactionId oldest_xid,
-													 uint64 recoverer_epoch,
-													 ClusterColdTopTxC0ProducerResultV1 *out);
+extern bool cluster_cold_typed_top_tx_c0_producer_v1(
+	ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence, uint32 participant,
+	const ClusterColdTopTxProofV1 *proof, const ClusterRecoveryTTAbortV1 *shape,
+	bool has_oldest_xid, TransactionId oldest_xid, uint64 recoverer_epoch,
+	ClusterColdTopTxC0ProducerResultV1 *out);
 
 /* Re-enumerate physical TT after complete redo and the original durability
  * barrier, without overwriting the pre-redo base. Share its remaining budget.

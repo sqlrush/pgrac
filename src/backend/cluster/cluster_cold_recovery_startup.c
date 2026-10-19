@@ -1100,6 +1100,25 @@ cold_replay_sources_current(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan 
 	return matched;
 }
 
+/* C0 input consumption must use the original execution owner, not a cached
+ * source receipt or a caller's isolation flag. It cannot outlive pass 2. */
+bool
+cluster_cold_typed_sources_current_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
+{
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK)
+		return false;
+	if (fence == NULL || !cluster_cold_replay_window_active_v1() || typed->plan == NULL
+		|| typed->replay_roots == NULL || typed->own_participant != 0 || typed->replay_count == 0
+		|| typed->replay_count > typed->participant_count
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->replay_root_count != typed->replay_count
+		|| cluster_cold_plan_participant_count_v1(typed->plan) != typed->participant_count) {
+		cold_execution_inputs_failed(typed);
+		return false;
+	}
+	return cold_replay_sources_current(typed, fence);
+}
+
 bool
 cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
 {

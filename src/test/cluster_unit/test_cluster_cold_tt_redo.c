@@ -19,6 +19,24 @@ int side_xact_fixture_main(void);
 static char tt_redo_dir[MAXPGPATH];
 static void (*tt_redo_path_hook)(uint8 owner, uint32 segment);
 
+/* Original execution owner is a boundary here; the Startup suite exercises
+ * ROOT/source/history validation. These faults cover the producer's brackets. */
+static unsigned tt_c0_owner_calls;
+static int tt_c0_fence_tag;
+#define TT_C0_FENCE ((struct ClusterRecoveryFencePlan *)&tt_c0_fence_tag)
+static unsigned tt_c0_owner_fail_at;
+
+bool
+cluster_cold_typed_sources_current_v1(ClusterColdTypedV1 *typed,
+									  struct ClusterRecoveryFencePlan *fence)
+{
+	UT_ASSERT_NOT_NULL(typed);
+	UT_ASSERT(fence == TT_C0_FENCE);
+	tt_c0_owner_calls++;
+	return tt_c0_owner_calls != tt_c0_owner_fail_at;
+}
+
+
 void *
 palloc_extended(Size size, int flags)
 {
@@ -3375,9 +3393,9 @@ UT_TEST(tt_top_tx_c0_producer_refuses_exact_historical_terminal)
 			tt_top_tx_effects_complete(&f);
 			tt_top_tx_endpoints_complete(&f);
 			memset(&out, 0xa9, sizeof(out));
-			UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape,
-																  false, InvalidTransactionId,
-																  UINT64_C(0x12345678), &out),
+			UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(
+							 &f.typed, TT_C0_FENCE, 0, &proof, &shape, false, InvalidTransactionId,
+							 UINT64_C(0x12345678), &out),
 						 field != 0);
 			if (field == 0)
 				UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
@@ -3461,8 +3479,8 @@ UT_TEST(tt_top_tx_c0_producer_requires_original_checkpoint)
 			break;
 		}
 		memset(&out, 0xa9, sizeof(out));
-		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, false,
-															  InvalidTransactionId,
+		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
+															  &shape, false, InvalidTransactionId,
 															  UINT64_C(0x12345678), &out),
 					 fault == 0);
 		if (fault != 0)
@@ -3525,8 +3543,8 @@ UT_TEST(tt_top_tx_c0_producer_derives_top_from_native_bind)
 		tt_top_tx_effects_complete(&f);
 		tt_top_tx_endpoints_complete(&f);
 		memset(&out, 0xa9, sizeof(out));
-		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, false,
-															  InvalidTransactionId,
+		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
+															  &shape, false, InvalidTransactionId,
 															  UINT64_C(0x12345678), &out),
 					 mode >= 2);
 		if (mode < 2)
@@ -3573,9 +3591,44 @@ UT_TEST(tt_top_tx_c0_producer_refuses_conflicting_bind_history)
 		/* Native inventory refuses these before top qualification. */
 		UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
 		memset(&out, 0xa9, sizeof(out));
-		UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(
-			&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out));
+		UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
+															&shape, false, InvalidTransactionId,
+															UINT64_C(0x12345678), &out));
 		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_top_tx_c0_producer_requires_current_execution_owner)
+{
+	for (unsigned fail_at = 1; fail_at <= 2; fail_at++) {
+		TtRedoFixture f;
+		ClusterColdTtSlotInputV1 input;
+		ClusterColdTopTxProofV1 proof;
+		ClusterRecoveryTTAbortV1 shape;
+		ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
+
+		tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+		tt_top_tx_seal_bound(&f, 100);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &input));
+		f.typed.xid_next_after_redo = UINT64_C(0x700400200);
+		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+		tt_top_tx_effects_complete(&f);
+		tt_top_tx_endpoints_complete(&f);
+		tt_c0_owner_fail_at = 0;
+		UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof, &shape,
+														   false, InvalidTransactionId,
+														   UINT64_C(0x12345678), &out));
+		tt_c0_owner_calls = 0;
+		tt_c0_owner_fail_at = fail_at;
+		memset(&out, 0xa9, sizeof(out));
+		UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
+															&shape, false, InvalidTransactionId,
+															UINT64_C(0x12345678), &out));
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		UT_ASSERT_EQ(tt_c0_owner_calls, fail_at);
+		tt_c0_owner_fail_at = 0;
 		tt_redo_destroy(&f);
 	}
 }
@@ -3597,12 +3650,14 @@ UT_TEST(tt_top_tx_c0_producer_refuses_unproved_endpoint_coverage)
 	tt_top_tx_effects_complete(&f);
 	/* A nonzero aggregate cannot replace the original owner's complete per-source counter endpoints. */
 	memset(&out, 0xa9, sizeof(out));
-	UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(
-		&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out));
+	UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof, &shape,
+														false, InvalidTransactionId,
+														UINT64_C(0x12345678), &out));
 	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 	tt_top_tx_endpoints_complete(&f);
-	UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(
-		&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out));
+	UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof, &shape,
+													   false, InvalidTransactionId,
+													   UINT64_C(0x12345678), &out));
 	for (int fault = 0; fault < 8; fault++) {
 		ClusterColdXidReceiptV1 saved = f.typed.xid_receipt;
 		uint32 last = f.typed.participant_count - 1;
@@ -3634,8 +3689,9 @@ UT_TEST(tt_top_tx_c0_producer_refuses_unproved_endpoint_coverage)
 			break;
 		}
 		memset(&out, 0xa9, sizeof(out));
-		UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(
-			&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out));
+		UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
+															&shape, false, InvalidTransactionId,
+															UINT64_C(0x12345678), &out));
 		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 		f.typed.xid_receipt = saved;
 	}
@@ -3659,13 +3715,15 @@ UT_TEST(tt_top_tx_c0_producer_refuses_unproved_effect_coverage)
 	/* A caller's true ordinary_effects flag cannot replace pass-2 coverage. */
 	UT_ASSERT_NULL(f.typed.plan);
 	memset(&out, 0xa9, sizeof(out));
-	UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(
-		&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out));
+	UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof, &shape,
+														false, InvalidTransactionId,
+														UINT64_C(0x12345678), &out));
 	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 	tt_top_tx_effects_complete(&f);
 	tt_top_tx_endpoints_complete(&f);
-	UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(
-		&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out));
+	UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof, &shape,
+													   false, InvalidTransactionId,
+													   UINT64_C(0x12345678), &out));
 	for (int fault = 0; fault < 4; fault++) {
 		ClusterColdEffectsReceiptV1 saved = f.typed.effects_receipt;
 
@@ -3678,8 +3736,9 @@ UT_TEST(tt_top_tx_c0_producer_refuses_unproved_effect_coverage)
 		if (fault == 3)
 			f.typed.effects_receipt.result.space_relations_finished++;
 		memset(&out, 0xa9, sizeof(out));
-		UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(
-			&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out));
+		UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
+															&shape, false, InvalidTransactionId,
+															UINT64_C(0x12345678), &out));
 		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 		f.typed.effects_receipt = saved;
 	}
@@ -3711,8 +3770,9 @@ UT_TEST(tt_top_tx_c0_producer_requires_original_owner_and_exact_post_redo)
 		tt_top_tx_effects_complete(&f);
 		tt_top_tx_endpoints_complete(&f);
 		UT_ASSERT(cluster_recovery_tt_abort_shape_valid_v1(&shape));
-		UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(
-			&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out));
+		UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof, &shape,
+														   false, InvalidTransactionId,
+														   UINT64_C(0x12345678), &out));
 		UT_ASSERT(memcmp(&out.active.key, &input.key, sizeof(input.key)) == 0);
 		UT_ASSERT(memcmp(&out.loser.key, &input.key, sizeof(input.key)) == 0);
 		UT_ASSERT_EQ(out.c0.record.target_epoch, UINT64_C(0x12345678));
@@ -3746,15 +3806,16 @@ UT_TEST(tt_top_tx_c0_producer_requires_original_owner_and_exact_post_redo)
 				missing_proof.ordinary_effects = false;
 			memset(&out, 0xa9, sizeof(out));
 			UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(
-				&f.typed, participant, &missing_proof, &rejected, false, InvalidTransactionId,
-				UINT64_C(0x12345678), &out));
+				&f.typed, TT_C0_FENCE, participant, &missing_proof, &rejected, false,
+				InvalidTransactionId, UINT64_C(0x12345678), &out));
 			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 		}
 		f.typed.xid_next_after_redo = next_xid;
 		cluster_cold_tt_after_redo_reset_v1(&f.typed);
 		memset(&out, 0xa9, sizeof(out));
-		UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(
-			&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out));
+		UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
+															&shape, false, InvalidTransactionId,
+															UINT64_C(0x12345678), &out));
 		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 		tt_redo_destroy(&f);
 	}
@@ -4761,9 +4822,9 @@ UT_TEST(tt_top_tx_c0_producer_requires_complete_tt_inventory)
 			tt_top_tx_effects_complete(&f);
 			tt_top_tx_endpoints_complete(&f);
 			memset(&out, 0xa9, sizeof(out));
-			UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape,
-																  false, InvalidTransactionId,
-																  UINT64_C(0x12345678), &out),
+			UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(
+							 &f.typed, TT_C0_FENCE, 0, &proof, &shape, false, InvalidTransactionId,
+							 UINT64_C(0x12345678), &out),
 						 fault == 0);
 			if (fault != 0)
 				UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
@@ -4811,8 +4872,8 @@ UT_TEST(tt_top_tx_c0_producer_requires_all_original_sources)
 		}
 		UT_ASSERT(cluster_cold_typed_tt_after_redo_readback_v1(&f.typed, 0, 0, &target));
 		memset(&out, 0xa9, sizeof(out));
-		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, false,
-															  InvalidTransactionId,
+		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
+															  &shape, false, InvalidTransactionId,
 															  UINT64_C(0x12345678), &out),
 					 fault == 0);
 		if (fault != 0)
@@ -4852,8 +4913,8 @@ UT_TEST(tt_top_tx_c0_producer_checks_unselected_undo_effects)
 		tt_top_tx_effects_complete(&f);
 		tt_top_tx_endpoints_complete(&f);
 		memset(&out, 0xa9, sizeof(out));
-		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, false,
-															  InvalidTransactionId,
+		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
+															  &shape, false, InvalidTransactionId,
 															  UINT64_C(0x12345678), &out),
 					 fault == 0);
 		if (fault != 0)
@@ -4887,8 +4948,9 @@ UT_TEST(tt_top_tx_c0_producer_rechecks_physical_header_inventory)
 		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
 		tt_top_tx_effects_complete(&f);
 		tt_top_tx_endpoints_complete(&f);
-		UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(
-			&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out));
+		UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof, &shape,
+														   false, InvalidTransactionId,
+														   UINT64_C(0x12345678), &out));
 		if (fault >= 1 && fault <= 3) {
 			changed = fault == 1 ? target.page : fault == 2 ? current : history;
 			changed.data[BLCKSZ - 1] ^= 1;
@@ -4910,8 +4972,8 @@ UT_TEST(tt_top_tx_c0_producer_rechecks_physical_header_inventory)
 		/* The cached target and its sealed fold still agree after every disk fault. */
 		UT_ASSERT(cluster_cold_typed_tt_after_redo_readback_v1(&f.typed, 0, index, &target));
 		memset(&out, 0xa9, sizeof(out));
-		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, false,
-															  InvalidTransactionId,
+		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
+															  &shape, false, InvalidTransactionId,
 															  UINT64_C(0x12345678), &out),
 					 fault == 0);
 		if (fault != 0) {
@@ -4953,13 +5015,15 @@ UT_TEST(tt_top_tx_c0_producer_rechecks_cached_undo_bytes)
 	tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
 	tt_top_tx_effects_complete(&f);
 	tt_top_tx_endpoints_complete(&f);
-	UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(
-		&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out));
+	UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof, &shape,
+													   false, InvalidTransactionId,
+													   UINT64_C(0x12345678), &out));
 	expected.data[BLCKSZ - 1] ^= 1;
 	tt_undo_readback_write(513, 9, &expected);
 	memset(&out, 0xa9, sizeof(out));
-	UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(
-		&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out));
+	UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof, &shape,
+														false, InvalidTransactionId,
+														UINT64_C(0x12345678), &out));
 	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 	UT_ASSERT_EQ(f.typed.tt_after_redo->detail, CLUSTER_COLD_SOURCE_GAP);
 	tt_redo_destroy(&f);
@@ -4997,13 +5061,15 @@ UT_TEST(tt_top_tx_c0_producer_rechecks_before_output)
 	tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
 	tt_top_tx_effects_complete(&f);
 	tt_top_tx_endpoints_complete(&f);
-	UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(
-		&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out));
+	UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof, &shape,
+													   false, InvalidTransactionId,
+													   UINT64_C(0x12345678), &out));
 	tt_top_tx_late_header = target.page;
 	tt_redo_path_hook = tt_top_tx_late_drift;
 	memset(&out, 0xa9, sizeof(out));
-	accepted = cluster_cold_typed_top_tx_c0_producer_v1(
-		&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out);
+	accepted = cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof, &shape,
+														false, InvalidTransactionId,
+														UINT64_C(0x12345678), &out);
 	fired = tt_redo_path_hook == NULL;
 	tt_redo_path_hook = NULL;
 	UT_ASSERT(fired);
@@ -5016,7 +5082,8 @@ UT_TEST(tt_top_tx_c0_producer_rechecks_before_output)
 int
 main(void)
 {
-	UT_PLAN(112);
+	UT_PLAN(113);
+	UT_RUN(tt_top_tx_c0_producer_requires_current_execution_owner);
 	UT_RUN(tt_top_tx_c0_producer_rechecks_physical_header_inventory);
 	UT_RUN(tt_top_tx_c0_producer_rechecks_cached_undo_bytes);
 	UT_RUN(tt_top_tx_c0_producer_rechecks_before_output);

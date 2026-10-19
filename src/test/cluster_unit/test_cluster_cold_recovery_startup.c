@@ -3139,6 +3139,129 @@ UT_TEST(test_tt_base_drift_refuses_later_pass_two_consumer)
 	endpoint_destroy(&typed);
 }
 
+UT_TEST(test_c0_sources_current_uses_original_owner_without_refresh)
+{
+	ClusterColdTypedV1 *typed = endpoint_fixture(true);
+	ClusterColdXidReceiptV1 receipt;
+	uint64 maximum;
+	unsigned syncs, history_syncs;
+
+	UT_ASSERT(endpoint_finish(typed));
+	receipt = typed->xid_receipt;
+	maximum = typed->xid_next_after_redo;
+	syncs = source_sync_calls;
+	history_syncs = history_sync_calls;
+	UT_ASSERT_NULL(typed->inputs);
+	UT_ASSERT(
+		cluster_cold_typed_sources_current_v1(typed, (ClusterRecoveryFencePlan *)&fixture_context));
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(typed->xid_next_after_redo, maximum);
+	UT_ASSERT(memcmp(&receipt, &typed->xid_receipt, sizeof(receipt)) == 0);
+	UT_ASSERT_EQ(source_sync_calls, syncs);
+	UT_ASSERT_EQ(history_sync_calls, history_syncs);
+	endpoint_destroy(&typed);
+}
+
+UT_TEST(test_c0_sources_current_refuses_lost_original_inputs_stickily)
+{
+	for (int fault = 0; fault < 12; fault++) {
+		ClusterColdTypedV1 *typed = endpoint_fixture(true);
+		ClusterRecoveryFencePlan *fence = (ClusterRecoveryFencePlan *)&fixture_context;
+		uint32 participant_count = typed->participant_count;
+		uint32 root_count = typed->replay_root_count;
+
+		UT_ASSERT(endpoint_finish(typed));
+		UT_ASSERT(cluster_cold_typed_sources_current_v1(typed, fence));
+		typed->effects_receipt.plan = typed->plan;
+		switch (fault) {
+		case 0:
+			fence = NULL;
+			break;
+		case 1:
+			fence_current = false;
+			break;
+		case 2:
+			cluster_cold_replay_window_leave_v1();
+			break;
+		case 3:
+			census_token.file_txn_seq++;
+			break;
+		case 4:
+			native_checkpoint[1].checkpoint.oldestXid++;
+			break;
+		case 5:
+			typed->sources[typed->replay_count].claim.claim_sha256[31]++;
+			break;
+		case 6:
+			typed->own_participant = 1;
+			break;
+		case 7:
+			typed->participant_count--;
+			break;
+		case 8:
+			typed->replay_root_count--;
+			break;
+		case 9:
+			history_checkpoint_fault = 1;
+			break;
+		case 10:
+			((uint8 *)&tokens[2])[0] ^= 1;
+			break;
+		case 11:
+			typed->side_capture_detail[typed->replay_count] = 1;
+			break;
+		}
+		UT_ASSERT(!cluster_cold_typed_sources_current_v1(typed, fence));
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
+		UT_ASSERT_NULL(typed->xid_receipt.plan);
+		UT_ASSERT_NULL(typed->effects_receipt.plan);
+		UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+		UT_ASSERT_EQ(typed->xid_next_at_drain[0], 0);
+		UT_ASSERT_EQ(typed->history_xid[typed->replay_count].next_xid, 0);
+		UT_ASSERT(!typed->census_root_captured);
+		/* Restoring inputs cannot revive a refused attempt. */
+		fence_current = true;
+		typed->own_participant = 0;
+		typed->participant_count = participant_count;
+		typed->replay_root_count = root_count;
+		UT_ASSERT(!cluster_cold_typed_sources_current_v1(
+			typed, (ClusterRecoveryFencePlan *)&fixture_context));
+		endpoint_destroy(&typed);
+	}
+	UT_ASSERT(!cluster_cold_typed_sources_current_v1(NULL, NULL));
+}
+
+UT_TEST(test_c0_sources_current_error_clears_inputs_and_preserves_prior_refusal)
+{
+	ClusterColdTypedV1 *typed = endpoint_fixture(true);
+	volatile bool caught = false;
+
+	UT_ASSERT(endpoint_finish(typed));
+	typed->effects_receipt.plan = typed->plan;
+	history_checkpoint_fault = 2;
+	PG_TRY();
+	{
+		(void)cluster_cold_typed_sources_current_v1(typed,
+													(ClusterRecoveryFencePlan *)&fixture_context);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
+	UT_ASSERT_NULL(typed->xid_receipt.plan);
+	UT_ASSERT_NULL(typed->effects_receipt.plan);
+	UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+	UT_ASSERT(!typed->census_root_captured);
+	typed->refusal = CLUSTER_COLD_SPACE_REFUSED;
+	UT_ASSERT(!cluster_cold_typed_sources_current_v1(typed,
+													 (ClusterRecoveryFencePlan *)&fixture_context));
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SPACE_REFUSED);
+	endpoint_destroy(&typed);
+}
+
 UT_TEST(test_checkpoint_inputs_survive_census_for_every_generation)
 {
 	ClusterColdTypedV1 *typed;
@@ -3223,7 +3346,7 @@ UT_TEST(test_checkpoint_export_clears_unsealed_and_failed_output)
 int
 main(void)
 {
-	UT_PLAN(116);
+	UT_PLAN(119);
 	UT_RUN(test_prepare_rechecks_physical_profiles_of_every_original_origin);
 	UT_RUN(test_prepare_checks_empty_physical_profiles_including_history_only_origin);
 	UT_RUN(test_endpoints_recheck_physical_profiles_and_discard_stale_inputs);
@@ -3265,6 +3388,9 @@ main(void)
 	UT_RUN(test_history_side_capture_refusals_keep_original_boundaries);
 	UT_RUN(test_ready_refuses_incomplete_history_capture_before_ir);
 	UT_RUN(test_ready_refuses_unsupported_history_capture_before_ir);
+	UT_RUN(test_c0_sources_current_uses_original_owner_without_refresh);
+	UT_RUN(test_c0_sources_current_refuses_lost_original_inputs_stickily);
+	UT_RUN(test_c0_sources_current_error_clears_inputs_and_preserves_prior_refusal);
 	UT_RUN(test_checkpoint_inputs_survive_census_for_every_generation);
 	UT_RUN(test_checkpoint_input_mismatch_stops_before_capture_and_scan);
 	UT_RUN(test_checkpoint_export_clears_unsealed_and_failed_output);
