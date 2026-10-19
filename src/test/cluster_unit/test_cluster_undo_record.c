@@ -125,7 +125,8 @@ static bool undo_test_publish_tt_after_block0_read;
 static TimestampTz receipt_clock_us;
 static TimestampTz receipt_clock_after_unref;
 static bool receipt_log_enabled;
-static char receipt_last_log[1024];
+static char receipt_last_log[4096];
+static int receipt_owner_probe_case;
 static TimestampTz receipt_clock_after_lock;
 static bool receipt_modifier_valid;
 static bool receipt_block0_valid;
@@ -154,6 +155,8 @@ char *DataDir = NULL;
 bool cluster_enabled = false;
 bool IsUnderPostmaster = false;
 bool cluster_undo_gcs_coherence = false;
+bool cluster_trace_normal_stop = false;
+volatile uint32 CritSectionCount = 0;
 int cluster_node_id = 0;
 int cluster_undo_segments_max_per_instance = CLUSTER_UNDO_SEGS_PER_INSTANCE;
 int cluster_undo_extent_blocks = 1;
@@ -438,6 +441,16 @@ cluster_runtime_visibility_current_owner_lookup_exact_ctrc_full(
 	memset(participant, 0, sizeof(*participant));
 	participant->boot_incarnation = 1;
 	participant->capability_record_generation = 1;
+	if (receipt_owner_probe_case == 1)
+		return false;
+	if (receipt_owner_probe_case == 2)
+		result->status = CLUSTER_TT_STATUS_UNKNOWN;
+	if (receipt_owner_probe_case == 3)
+		*grant = 0;
+	if (receipt_owner_probe_case == 4)
+		key->undo_segment_id = 2;
+	if (receipt_owner_probe_case == 5)
+		key->tt_slot_id = 2;
 	return true;
 }
 
@@ -2580,6 +2593,9 @@ receipt_fixture_ready(uint8 record_type, ClusterUndoRecordPrepareReceipt *receip
 	receipt_clock_us = 99;
 	receipt_clock_after_unref = 0;
 	receipt_log_enabled = false;
+	receipt_owner_probe_case = 0;
+	cluster_trace_normal_stop = false;
+	CritSectionCount = 0;
 	receipt_last_log[0] = '\0';
 	receipt_clock_after_lock = 0;
 	receipt_modifier_valid = true;
@@ -3786,10 +3802,115 @@ UT_TEST(test_a148_undo_stop_does_not_confuse_extent_and_cursor_cache_with_writer
 	undo_stop_fixture_done();
 }
 
+UT_TEST(test_ctrc_prepare_diagnostic_is_off_by_default_and_observation_only)
+{
+	ClusterUndoRecordPrepareReceipt receipt, before;
+
+	receipt_fixture_ready(UNDO_RECORD_UPDATE, &receipt);
+	receipt.ctrc_pending_mask = 1;
+	UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
+	before = receipt;
+	receipt_owner_probe_case = 3;
+	receipt_log_enabled = true;
+	UT_ASSERT(!cluster_undo_record_ctrc_prepare_pending(&receipt, 0));
+	UT_ASSERT_EQ(receipt_last_log[0], '\0');
+	cluster_trace_normal_stop = true;
+	UT_ASSERT(!cluster_undo_record_ctrc_prepare_pending(&receipt, 0));
+	UT_ASSERT(strstr(receipt_last_log, "predicate=owner.grant_nonzero") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "expected=1 current=0") != NULL);
+	UT_ASSERT_EQ(memcmp(&before, &receipt, sizeof(before)), 0);
+	UT_ASSERT_EQ(receipt_prepare_calls + receipt_cancel_calls, 0);
+	UT_ASSERT_EQ(strcmp(cluster_undo_record_receipt_last_reason(),
+						"CTRC_PENDING_IDENTITY_MISMATCH"), 0);
+	cluster_trace_normal_stop = false;
+}
+
+UT_TEST(test_ctrc_prepare_reports_first_actual_predicate_and_available_identity)
+{
+	const char *predicates[] = { "receipt.present", "target.ordinal", "mask.pending",
+		"mask.prepared_zero", "reservation.active", "reservation.sequence",
+		"extent.cur_block", "owner.lookup_exact", "owner.in_progress",
+		"owner.grant_nonzero", "owner.tt_segment", "owner.tt_slot", "reservation.image_byte" };
+
+	for (unsigned i = 0; i < lengthof(predicates); i++) {
+		ClusterUndoRecordPrepareReceipt receipt;
+		uint8 ordinal = 0;
+
+		receipt_fixture_ready(UNDO_RECORD_UPDATE, &receipt);
+		receipt.ctrc_pending_mask = 1;
+		receipt.ctrc_pending_targets[0].spc_oid = 1663;
+		receipt.ctrc_pending_targets[0].db_oid = 5;
+		receipt.ctrc_pending_targets[0].rel_number = 16388;
+		receipt.ctrc_pending_targets[0].block_number = 137;
+		UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
+		if (i == 1)
+			ordinal = CLUSTER_UNDO_RECORD_CTRC_TARGETS;
+		if (i == 2)
+			receipt.ctrc_pending_mask = 0;
+		if (i == 3) {
+			receipt.ctrc_prepared_mask = 1;
+			receipt.ctrc_handles[0].valid = true;
+		}
+		if (i == 4)
+			cluster_undo_record_reservation.active = false;
+		if (i == 5)
+			receipt.reservation_sequence++;
+		if (i == 6)
+			cluster_undo_current_extent.cur_block++;
+		if (i >= 7 && i <= 11)
+			receipt_owner_probe_case = i - 6;
+		if (i == 12)
+			receipt.payload_capacity++;
+		receipt_log_enabled = cluster_trace_normal_stop = true;
+		UT_ASSERT(!cluster_undo_record_ctrc_prepare_pending(i == 0 ? NULL : &receipt, ordinal));
+		UT_ASSERT(strstr(receipt_last_log, "PGRAC_FAMILY=CTRC_RECEIPT") != NULL);
+		UT_ASSERT(strstr(receipt_last_log, predicates[i]) != NULL);
+		UT_ASSERT(strstr(receipt_last_log, "event=prepare.reject") != NULL);
+		UT_ASSERT(strstr(receipt_last_log, "authoritative=0") != NULL);
+		UT_ASSERT(strstr(receipt_last_log, "canonical_key_known=") != NULL);
+		UT_ASSERT(strstr(receipt_last_log, "ref_slot=7") != NULL);
+		UT_ASSERT(strstr(receipt_last_log, "event_seq=") != NULL);
+		if (i == 12) {
+			UT_ASSERT(strstr(receipt_last_log, "expected=128 current=129") != NULL);
+			UT_ASSERT(strstr(receipt_last_log, "receipt_byte_offset_known=1") != NULL);
+		}
+		UT_ASSERT_EQ(receipt_prepare_calls, 0);
+	}
+	cluster_trace_normal_stop = false;
+}
+
+UT_TEST(test_ctrc_diagnostic_skips_critical_output_without_changing_decisions)
+{
+	ClusterUndoRecordPrepareReceipt receipt;
+
+	receipt_fixture_ready(UNDO_RECORD_UPDATE, &receipt);
+	receipt.ctrc_pending_mask = 1;
+	UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
+	receipt_owner_probe_case = 3;
+	receipt_log_enabled = cluster_trace_normal_stop = true;
+	CritSectionCount = 1;
+	UT_ASSERT(!cluster_undo_record_ctrc_prepare_pending(&receipt, 0));
+	UT_ASSERT_EQ(receipt_last_log[0], '\0');
+	CritSectionCount = 0;
+	UT_ASSERT(!cluster_undo_record_ctrc_prepare_pending(&receipt, 0));
+	UT_ASSERT(strstr(receipt_last_log, "trace_critical_skipped=1") != NULL);
+	UT_ASSERT_EQ(receipt_prepare_calls, 0);
+	/* Success remains quiet: this slice reports first rejection, not every
+	 * successful DML row or a made-up canonical publication event. */
+	receipt_fixture_ready(UNDO_RECORD_UPDATE, &receipt);
+	receipt.ctrc_pending_mask = 1;
+	UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
+	receipt_log_enabled = cluster_trace_normal_stop = true;
+	UT_ASSERT(cluster_undo_record_ctrc_prepare_pending(&receipt, 0));
+	UT_ASSERT_EQ(receipt_last_log[0], '\0');
+	UT_ASSERT_EQ(receipt_prepare_calls, 1);
+	cluster_trace_normal_stop = false;
+}
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(77);
+	UT_PLAN(80);
 	UT_RUN(test_abort_prepared_after_lock_release_is_idempotent);
 	UT_RUN(test_abort_prepared_cancel_failure_and_borrowed_owner_do_not_panic);
 	UT_RUN(test_abort_attempted_or_applied_retains_debt_and_panics);
@@ -3868,6 +3989,9 @@ main(int argc, char **argv)
 	UT_RUN(test_cancel_before_snapshot_violation_counter_is_live);
 	UT_RUN(test_update_toast_releases_outer_receipt_before_nested_producers);
 	UT_RUN(test_update_itl_wait_returns_through_receipt_and_page_requalification);
+	UT_RUN(test_ctrc_prepare_diagnostic_is_off_by_default_and_observation_only);
+	UT_RUN(test_ctrc_prepare_reports_first_actual_predicate_and_available_identity);
+	UT_RUN(test_ctrc_diagnostic_skips_critical_output_without_changing_decisions);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;
