@@ -3271,6 +3271,7 @@ cluster_typed_replay_xid_begin(ClusterColdTypedReplay *rep)
 {
 	ClusterColdTypedV1 *typed = rep->typed;
 
+	memset(&typed->xid_receipt, 0, sizeof(typed->xid_receipt));
 	memset(&typed->effects_receipt, 0, sizeof(typed->effects_receipt));
 	memset(rep->xid_progress, 0, sizeof(rep->xid_progress));
 	memset(typed->xid_next_at_drain, 0, sizeof(typed->xid_next_at_drain));

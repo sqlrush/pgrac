@@ -461,8 +461,7 @@ cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
 bool
 cluster_cold_typed_top_tx_c0_producer_v1(const ClusterColdTypedV1 *typed, uint32 participant,
 										 const ClusterColdTopTxProofV1 *proof,
-										 const ClusterRecoveryTTAbortV1 *shape,
-										 bool all_endpoints_complete, bool has_oldest_xid,
+										 const ClusterRecoveryTTAbortV1 *shape, bool has_oldest_xid,
 										 TransactionId oldest_xid, uint64 recoverer_epoch,
 										 ClusterColdTopTxC0ProducerResultV1 *out)
 {
@@ -470,6 +469,7 @@ cluster_cold_typed_top_tx_c0_producer_v1(const ClusterColdTypedV1 *typed, uint32
 	RfSideUndoHeaderImageV1 post_image;
 	ClusterColdTtSlotInputV1 post_slot;
 	uint32 post_segment_index;
+	uint64 next_xid;
 
 	if (out == NULL)
 		return false;
@@ -484,7 +484,7 @@ cluster_cold_typed_top_tx_c0_producer_v1(const ClusterColdTypedV1 *typed, uint32
 		|| memcmp(shape->target_claim_sha256, typed->sources[participant].claim.claim_sha256,
 				  sizeof(shape->target_claim_sha256))
 			   != 0
-		|| typed->xid_next_after_redo == 0
+		|| !cluster_cold_typed_xid_maximum_v1(typed, &next_xid)
 		|| !cluster_cold_typed_effects_ready_v1(typed)
 		|| cluster_cold_tt_header_find_v1(typed, true, proof->key.owner_instance,
 										  proof->key.segment_id, &post_segment_index)
@@ -509,9 +509,8 @@ cluster_cold_typed_top_tx_c0_producer_v1(const ClusterColdTypedV1 *typed, uint32
 		return false;
 	result.active.key = post_slot.key;
 	if (!cluster_cold_top_tx_loser_v1(&result.active, proof, &result.loser)
-		|| !cluster_cold_top_tx_c0_v1(&result.loser, shape, typed->xid_next_after_redo,
-									  all_endpoints_complete, has_oldest_xid, oldest_xid,
-									  recoverer_epoch, &result.c0)
+		|| !cluster_cold_top_tx_c0_v1(&result.loser, shape, next_xid, true, has_oldest_xid,
+									  oldest_xid, recoverer_epoch, &result.c0)
 		|| cluster_recovery_tt_abort_match_v1(&result.c0.record, post_slot.key.segment_generation,
 											  &post_slot.slot)
 			   != CLUSTER_RECOVERY_TT_ABORT_APPLY)

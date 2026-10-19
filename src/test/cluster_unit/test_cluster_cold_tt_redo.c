@@ -3210,6 +3210,87 @@ tt_top_tx_effects_complete(TtRedoFixture *f)
 	UT_ASSERT(cluster_cold_typed_effects_complete_v1(&f->typed, &proof, &result));
 }
 
+/* Counter completion is a boundary for this TT-only fixture. The Startup
+ * suite publishes and checks this receipt through the actual original owner. */
+static void
+tt_top_tx_endpoints_complete(TtRedoFixture *f)
+{
+	ClusterColdXidReceiptV1 *receipt = &f->typed.xid_receipt;
+
+	UT_ASSERT_NOT_NULL(f->typed.plan);
+	memset(receipt, 0, sizeof(*receipt));
+	receipt->plan = f->typed.plan;
+	receipt->system_identifier = f->typed.system_identifier;
+	receipt->participant_count = f->typed.participant_count;
+	receipt->replay_count = f->typed.replay_count;
+	for (uint32 p = 0; p < receipt->participant_count; p++) {
+		receipt->sources[p] = f->typed.sources[p];
+		receipt->next_xid[p] = f->typed.xid_next_after_redo;
+	}
+}
+
+UT_TEST(tt_top_tx_c0_producer_refuses_unproved_endpoint_coverage)
+{
+	TtRedoFixture f;
+	ClusterColdTtSlotInputV1 input;
+	ClusterColdTopTxProofV1 proof;
+	ClusterRecoveryTTAbortV1 shape;
+	ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
+
+	tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+	tt_redo_seal(&f);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 47, &input));
+	f.typed.xid_next_after_redo = UINT64_C(0x700400200);
+	tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+	tt_top_tx_effects_complete(&f);
+	/* A nonzero aggregate cannot replace the original owner's complete per-source counter endpoints. */
+	memset(&out, 0xa9, sizeof(out));
+	UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(
+		&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out));
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	tt_top_tx_endpoints_complete(&f);
+	UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(
+		&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out));
+	for (int fault = 0; fault < 8; fault++) {
+		ClusterColdXidReceiptV1 saved = f.typed.xid_receipt;
+		uint32 last = f.typed.participant_count - 1;
+
+		switch (fault) {
+		case 0:
+			f.typed.xid_receipt.plan = NULL;
+			break;
+		case 1:
+			f.typed.xid_receipt.participant_count--;
+			break;
+		case 2:
+			f.typed.xid_receipt.replay_count++;
+			break;
+		case 3:
+			f.typed.xid_receipt.next_xid[last] = 0;
+			break;
+		case 4:
+			f.typed.xid_receipt.sources[last].claim.claim_sha256[0] ^= 1;
+			break;
+		case 5:
+			f.typed.xid_receipt.sources[last].timeline++;
+			break;
+		case 6:
+			f.typed.xid_receipt.next_xid[0]++;
+			break;
+		case 7:
+			f.typed.xid_receipt.system_identifier++;
+			break;
+		}
+		memset(&out, 0xa9, sizeof(out));
+		UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(
+			&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out));
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		f.typed.xid_receipt = saved;
+	}
+	tt_redo_destroy(&f);
+}
+
 UT_TEST(tt_top_tx_c0_producer_refuses_unproved_effect_coverage)
 {
 	TtRedoFixture f;
@@ -3227,14 +3308,13 @@ UT_TEST(tt_top_tx_c0_producer_refuses_unproved_effect_coverage)
 	/* A caller's true ordinary_effects flag cannot replace pass-2 coverage. */
 	UT_ASSERT_NULL(f.typed.plan);
 	memset(&out, 0xa9, sizeof(out));
-	UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, true,
-														false, InvalidTransactionId,
-														UINT64_C(0x12345678), &out));
+	UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(
+		&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out));
 	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 	tt_top_tx_effects_complete(&f);
-	UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, true,
-													   false, InvalidTransactionId,
-													   UINT64_C(0x12345678), &out));
+	tt_top_tx_endpoints_complete(&f);
+	UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(
+		&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out));
 	for (int fault = 0; fault < 4; fault++) {
 		ClusterColdEffectsReceiptV1 saved = f.typed.effects_receipt;
 
@@ -3247,9 +3327,8 @@ UT_TEST(tt_top_tx_c0_producer_refuses_unproved_effect_coverage)
 		if (fault == 3)
 			f.typed.effects_receipt.result.space_relations_finished++;
 		memset(&out, 0xa9, sizeof(out));
-		UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, true,
-															false, InvalidTransactionId,
-															UINT64_C(0x12345678), &out));
+		UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(
+			&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out));
 		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 		f.typed.effects_receipt = saved;
 	}
@@ -3279,10 +3358,10 @@ UT_TEST(tt_top_tx_c0_producer_requires_original_owner_and_exact_post_redo)
 		f.typed.xid_next_after_redo = next_xid;
 		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
 		tt_top_tx_effects_complete(&f);
+		tt_top_tx_endpoints_complete(&f);
 		UT_ASSERT(cluster_recovery_tt_abort_shape_valid_v1(&shape));
-		UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, true, false,
-														   InvalidTransactionId,
-														   UINT64_C(0x12345678), &out));
+		UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(
+			&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out));
 		UT_ASSERT(memcmp(&out.active.key, &input.key, sizeof(input.key)) == 0);
 		UT_ASSERT(memcmp(&out.loser.key, &input.key, sizeof(input.key)) == 0);
 		UT_ASSERT_EQ(out.c0.record.target_epoch, UINT64_C(0x12345678));
@@ -3296,6 +3375,7 @@ UT_TEST(tt_top_tx_c0_producer_requires_original_owner_and_exact_post_redo)
 			uint32 participant = 0;
 
 			f.typed.xid_next_after_redo = fault == 1 ? 0 : next_xid;
+			f.typed.xid_receipt.plan = fault == 0 ? NULL : f.typed.plan;
 			if (fault == 2)
 				participant = 1; /* A different/history owner cannot produce this C0. */
 			if (fault == 3)
@@ -3315,16 +3395,15 @@ UT_TEST(tt_top_tx_c0_producer_requires_original_owner_and_exact_post_redo)
 				missing_proof.ordinary_effects = false;
 			memset(&out, 0xa9, sizeof(out));
 			UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(
-				&f.typed, participant, &missing_proof, &rejected, fault != 0, false,
-				InvalidTransactionId, UINT64_C(0x12345678), &out));
+				&f.typed, participant, &missing_proof, &rejected, false, InvalidTransactionId,
+				UINT64_C(0x12345678), &out));
 			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 		}
 		f.typed.xid_next_after_redo = next_xid;
 		cluster_cold_tt_after_redo_reset_v1(&f.typed);
 		memset(&out, 0xa9, sizeof(out));
-		UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, true,
-															false, InvalidTransactionId,
-															UINT64_C(0x12345678), &out));
+		UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(
+			&f.typed, 0, &proof, &shape, false, InvalidTransactionId, UINT64_C(0x12345678), &out));
 		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 		tt_redo_destroy(&f);
 	}
@@ -4329,8 +4408,9 @@ UT_TEST(tt_top_tx_c0_producer_requires_complete_tt_inventory)
 			f.typed.xid_next_after_redo = UINT64_C(0x700400200);
 			tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
 			tt_top_tx_effects_complete(&f);
+			tt_top_tx_endpoints_complete(&f);
 			memset(&out, 0xa9, sizeof(out));
-			UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, true,
+			UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape,
 																  false, InvalidTransactionId,
 																  UINT64_C(0x12345678), &out),
 						 fault == 0);
@@ -4359,6 +4439,7 @@ UT_TEST(tt_top_tx_c0_producer_requires_all_original_sources)
 		f.typed.xid_next_after_redo = UINT64_C(0x700400200);
 		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
 		tt_top_tx_effects_complete(&f);
+		tt_top_tx_endpoints_complete(&f);
 		/* Retained generations matter even when none of their TT files survive. */
 		switch (fault) {
 		case 1:
@@ -4379,8 +4460,8 @@ UT_TEST(tt_top_tx_c0_producer_requires_all_original_sources)
 		}
 		UT_ASSERT(cluster_cold_typed_tt_after_redo_readback_v1(&f.typed, 0, 0, &target));
 		memset(&out, 0xa9, sizeof(out));
-		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, true,
-															  false, InvalidTransactionId,
+		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, false,
+															  InvalidTransactionId,
 															  UINT64_C(0x12345678), &out),
 					 fault == 0);
 		if (fault != 0)
@@ -4418,9 +4499,10 @@ UT_TEST(tt_top_tx_c0_producer_checks_unselected_undo_effects)
 		f.typed.xid_next_after_redo = UINT64_C(0x700400200);
 		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
 		tt_top_tx_effects_complete(&f);
+		tt_top_tx_endpoints_complete(&f);
 		memset(&out, 0xa9, sizeof(out));
-		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, true,
-															  false, InvalidTransactionId,
+		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, false,
+															  InvalidTransactionId,
 															  UINT64_C(0x12345678), &out),
 					 fault == 0);
 		if (fault != 0)
@@ -4432,7 +4514,8 @@ UT_TEST(tt_top_tx_c0_producer_checks_unselected_undo_effects)
 int
 main(void)
 {
-	UT_PLAN(104);
+	UT_PLAN(105);
+	UT_RUN(tt_top_tx_c0_producer_refuses_unproved_endpoint_coverage);
 	UT_RUN(tt_top_tx_c0_producer_refuses_unproved_effect_coverage);
 	UT_RUN(tt_top_tx_c0_producer_requires_complete_tt_inventory);
 	UT_RUN(tt_top_tx_c0_producer_requires_all_original_sources);

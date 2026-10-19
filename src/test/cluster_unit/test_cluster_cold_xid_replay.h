@@ -320,8 +320,12 @@ UT_TEST(test_replay_xid_original_seeds_and_reset)
 	replay_xid_reset(1);
 	replay_typed.xid_next_at_drain[0] = 99;
 	replay_typed.effects_receipt.plan = replay_typed.plan;
+	replay_typed.xid_receipt.plan = replay_typed.plan;
+	replay_typed.xid_receipt.next_xid[0] = full(19, 100);
 	UT_ASSERT(cluster_typed_replay_xid_begin(&replay_adapter));
 	UT_ASSERT_NULL(replay_typed.effects_receipt.plan);
+	UT_ASSERT_NULL(replay_typed.xid_receipt.plan);
+	UT_ASSERT_EQ(replay_typed.xid_receipt.next_xid[0], 0);
 	for (uint32 i = 0; i < 3; i++) {
 		UT_ASSERT_EQ(replay_adapter.xid_progress[i].next_xid, full(8 + i, 100));
 		UT_ASSERT_EQ(replay_adapter.xid_progress[i].expected_records, 1);

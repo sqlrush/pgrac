@@ -569,6 +569,19 @@ typedef struct ClusterColdXidProgressV1 {
 	bool failed;
 } ClusterColdXidProgressV1;
 
+/* Attempt-local counter inputs published only by the original endpoint
+ * owner after every source and the post-redo inventory pass their final
+ * readback. The sealed plan binds the physical cuts; the copied sources
+ * bind the selected claims/namespaces. This is not fresh execution authority. */
+typedef struct ClusterColdXidReceiptV1 {
+	const ClusterColdPlanV1 *plan;
+	uint64 system_identifier;
+	uint32 participant_count;
+	uint32 replay_count;
+	ClusterWalSourceRef sources[CLUSTER_COLD_MAX_PARTICIPANTS];
+	uint64 next_xid[CLUSTER_COLD_MAX_PARTICIPANTS];
+} ClusterColdXidReceiptV1;
+
 extern bool cluster_cold_xid_begin_v1(ClusterColdXidProgressV1 *progress,
 									 const ClusterColdParticipantV1 *source,
 									 uint64 checkpoint_next_xid, uint64 expected_records);
@@ -822,6 +835,7 @@ typedef struct ClusterColdTypedV1 {
 	/* Full-width maximum of every original counter endpoint after replay
 	 * and the caller's durability barrier. No TT/top/loser authority. */
 	uint64 xid_next_after_redo;
+	ClusterColdXidReceiptV1 xid_receipt;
 	ClusterColdEffectsReceiptV1 effects_receipt;
 	/* Read-only pass-1 inputs for history generations. Their source redo is
 	 * the original checkpoint's, not the history mutation cut at tail. No
@@ -843,6 +857,11 @@ typedef struct ClusterColdTypedV1 {
 	ClusterColdParticipantV1 participants[CLUSTER_COLD_MAX_PARTICIPANTS];
 	ClusterWalSourceRef sources[CLUSTER_COLD_MAX_PARTICIPANTS];
 } ClusterColdTypedV1;
+
+/* Read the retained original all-source counter maximum. Refuse a missing,
+ * partial or mismatched receipt and zero the output. This only checks the
+ * retained inputs; it does not reacquire a fence or revalidate disk sources. */
+extern bool cluster_cold_typed_xid_maximum_v1(const ClusterColdTypedV1 *typed, uint64 *next_xid);
 
 extern ClusterColdTypedV1 *cluster_cold_typed_prepare_v1(struct ClusterRecoveryFencePlan *fence,
 														 uint16 own_thread, XLogRecPtr own_redo);
@@ -960,14 +979,15 @@ extern bool cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
  * slot before-image and consume the original producer's TopTxProof/shape gates.
  * Target incarnation/claim remain bound to the original source.  A new
  * header with no original base requires the native full-image proof.
- * The aggregate endpoint is the already-computed typed->xid_next_after_redo;
- * a missing endpoint, post-redo image, proof gate or exact shape refuses.
+ * The original endpoint receipt must cover the unchanged complete source
+ * set and agree with typed->xid_next_after_redo; a missing endpoint,
+ * post-redo image, proof gate or exact shape refuses.
  * No proof bit is synthesized from source-drained state, current epoch or
  * graph shape, and no old C0 replay consumer is called here. */
 extern bool cluster_cold_typed_top_tx_c0_producer_v1(
 	const ClusterColdTypedV1 *typed, uint32 participant, const ClusterColdTopTxProofV1 *proof,
-	const ClusterRecoveryTTAbortV1 *shape, bool all_endpoints_complete, bool has_oldest_xid,
-	TransactionId oldest_xid, uint64 recoverer_epoch, ClusterColdTopTxC0ProducerResultV1 *out);
+	const ClusterRecoveryTTAbortV1 *shape, bool has_oldest_xid, TransactionId oldest_xid,
+	uint64 recoverer_epoch, ClusterColdTopTxC0ProducerResultV1 *out);
 
 /* Re-enumerate physical TT after complete redo and the original durability
  * barrier, without overwriting the pre-redo base. Share its remaining budget.

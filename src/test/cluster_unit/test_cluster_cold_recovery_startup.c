@@ -3223,7 +3223,7 @@ UT_TEST(test_checkpoint_export_clears_unsealed_and_failed_output)
 int
 main(void)
 {
-	UT_PLAN(113);
+	UT_PLAN(116);
 	UT_RUN(test_prepare_rechecks_physical_profiles_of_every_original_origin);
 	UT_RUN(test_prepare_checks_empty_physical_profiles_including_history_only_origin);
 	UT_RUN(test_endpoints_recheck_physical_profiles_and_discard_stale_inputs);
@@ -3234,6 +3234,8 @@ main(void)
 	UT_RUN(test_endpoints_post_redo_tt_refusal_discards_all_attempt_inputs);
 	UT_RUN(test_endpoints_post_redo_tt_rechecks_sources_and_cleans_error);
 	UT_RUN(test_endpoints_prior_refusal_resets_previous_post_redo_snapshot);
+	UT_RUN(test_endpoints_receipt_requires_original_completion);
+	UT_RUN(test_endpoints_receipt_refuses_changed_retained_inputs);
 	UT_RUN(test_endpoints_maximum_uses_complete_full_width_inputs);
 	UT_RUN(test_endpoints_include_every_history_generation_original_checkpoint_cut);
 	UT_RUN(test_endpoints_reject_partial_or_conflicting_replay_counters);
