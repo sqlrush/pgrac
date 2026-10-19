@@ -12,6 +12,8 @@
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_sf_dep.h"
+#include "cluster/cluster_heap_horizon.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_undo_horizon.h"
 #include "../../backend/utils/time/snapmgr.c"
 #include "test_cluster_snapshot_admission_horizon.inc"

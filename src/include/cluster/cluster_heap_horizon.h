@@ -78,4 +78,17 @@ extern bool cluster_heap_freeze_report_v2_encode(
 extern bool cluster_heap_freeze_report_v2_decode(
 	const uint8 *bytes, size_t length, ClusterHeapFreezeReportV2 *out);
 
+/* Volatile receive observation only, not permission to advance a floor.
+ * F has no age expiry; consumers must still enforce H freshness, backward
+ * clock and regression checks and capture/recheck the full fixed cohort.
+ * A failed bounded read zeroes out. Original semantic/connection publishers
+ * retire the identity; reconnect alone cannot reset sequence monotonicity. */
+typedef struct ClusterHeapFreezeReportV2View {
+	ClusterHeapFreezeReportV2 report;
+	uint64 recv_at_us;
+	bool horizon_regression_flagged;
+} ClusterHeapFreezeReportV2View;
+
+extern bool cluster_heap_freeze_report_v2_sample(int32 peer, ClusterHeapFreezeReportV2View *out);
+
 #endif

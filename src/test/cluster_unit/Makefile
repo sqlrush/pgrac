@@ -8826,11 +8826,10 @@ test_cluster_undo_authority: test_cluster_undo_authority.c unit_test.h \
 # spec-5.22e D5-1: test_cluster_undo_horizon — cluster-wide undo retention
 # horizon pure fold (required-MEMBER report views -> recycle floor, U1-U16
 # truth table: every unproven edge STALLS with attribution, never a local
-# fallback).  Pure decision layer; scn_time_cmp is a byte-faithful local
-# stub in the test (test_cluster_cr_tuple.c pattern) so cluster_scn.o's
-# shmem/lwlock deps stay out.  The seqlock slot sampling, wire handler
-# validation and the LMON tick live in the heavy path (D5-2/D5-3) and are
-# covered by the t/370 TAP.
+# fallback). The test also compiles the actual V1/V2 receiver, bounded
+# slot sampler and LMON sender with explicit process-boundary fixtures.
+# scn_time_cmp is a byte-faithful local stub (test_cluster_cr_tuple.c
+# pattern); unused backend paths are discarded at link time.
 CLUSTER_UNDO_HORIZON_O = $(top_builddir)/src/backend/cluster/cluster_undo_horizon.o
 test_cluster_snapshot_admission_horizon.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c Makefile
 	@awk '/^typedef struct ClusterUndoHorizonSlotShmem / { shmem=1 } \
@@ -8869,11 +8868,14 @@ test_cluster_undo_horizon_sender.inc: $(top_srcdir)/src/backend/cluster/cluster_
 		emit && /^\/\* ---------------- cleaner-side/ { done=1; exit } emit { print } \
 		END { if (!done || starts != 1) exit 1 }' $< > $@
 
-test_cluster_undo_horizon: test_cluster_undo_horizon.c unit_test.h test_cluster_undo_horizon_sender.inc \
+test_cluster_undo_horizon: test_cluster_undo_horizon.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c \
+		$(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_HORIZON_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_HORIZON_O) \
-		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # spec-5.22b D2-1/D2-3: test_cluster_undo_gcs — owner-as-master routing layer
 # (D2-1: cluster_undo_block_lookup_master / _master_is_self) + the pure reader

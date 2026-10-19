@@ -24,6 +24,9 @@
  *	  (the undo cleaner pass) snapshot the slots through the seqlock
  *	  double-read protocol into plain ClusterUndoHorizonReportView
  *	  structs and hand them to the pure fold (cluster_undo_horizon.c).
+ *	  Exact-length V2 reports use separate slots bound to the current
+ *	  CONTROL connection and local admission identity. Their readonly
+ *	  sampler returns observations for a separately guarded cohort fold.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -46,16 +49,20 @@
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_heap_horizon.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_mrp.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_undo_horizon.h"
 #include "cluster/cluster_undo_retention.h"
+#include "miscadmin.h"
 #include "storage/shmem.h"
 #include "utils/snapmgr.h" /* Actual snapshot lifetime and retention evidence. */
 #include "utils/timestamp.h"
@@ -84,8 +91,22 @@ typedef struct ClusterUndoHorizonSlotShmem {
 	bool accepted_any;
 } ClusterUndoHorizonSlotShmem;
 
+/* Separate from the V1 SCN lane. LMON is still the only writer. The full
+ * local admission/cohort cut and actual CONTROL generation bind the wire
+ * identity to its receive authority; neither is supplied by the payload. */
+typedef struct ClusterHeapFreezeReportV2SlotShmem {
+	pg_atomic_uint32 seq;
+	ClusterHeapFreezeReportV2View view;
+	ClusterSemanticActiveSampleFence fence;
+	uint32 capability_generation;
+	/* LMON-private replay base, including an identity-proven H regression. */
+	uint64 last_report_sequence;
+	bool valid;
+} ClusterHeapFreezeReportV2SlotShmem;
+
 typedef struct ClusterUndoHorizonShmem {
 	ClusterUndoHorizonSlotShmem slots[CLUSTER_MAX_NODES];
+	ClusterHeapFreezeReportV2SlotShmem freeze_slots[CLUSTER_MAX_NODES];
 	/* observability (D5-5); bumped via the note_* helpers below */
 	pg_atomic_uint64 stall_count;
 	pg_atomic_uint64 peer_stale_count;
@@ -121,8 +142,10 @@ cluster_undo_horizon_shmem_init(void)
 		int i;
 
 		memset(shmem, 0, sizeof(*shmem));
-		for (i = 0; i < CLUSTER_MAX_NODES; i++)
+		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 			pg_atomic_init_u32(&shmem->slots[i].seq, 0);
+			pg_atomic_init_u32(&shmem->freeze_slots[i].seq, 0);
+		}
 		pg_atomic_init_u64(&shmem->stall_count, 0);
 		pg_atomic_init_u64(&shmem->peer_stale_count, 0);
 		pg_atomic_init_u64(&shmem->pass_abort_count, 0);
@@ -191,20 +214,150 @@ undo_horizon_slot_publish(ClusterUndoHorizonSlotShmem *slot, const ClusterUndoHo
 }
 
 static void
+undo_horizon_v2_publish(ClusterHeapFreezeReportV2SlotShmem *slot,
+						const ClusterHeapFreezeReportV2 *report,
+						const ClusterSemanticActiveSampleFence *fence, uint32 generation,
+						uint64 now_us, bool regression)
+{
+	uint32 seq = pg_atomic_read_u32(&slot->seq);
+
+	/* Do not start publication over an in-progress update. */
+	if (seq & 1)
+		return;
+	pg_atomic_write_u32(&slot->seq, seq + 1);
+	pg_write_barrier();
+	slot->last_report_sequence = report->report_sequence;
+	if (!regression) {
+		slot->view.report = *report;
+		slot->view.recv_at_us = now_us;
+		slot->fence = *fence;
+		slot->capability_generation = generation;
+		slot->valid = true;
+	}
+	slot->view.horizon_regression_flagged = regression;
+	pg_write_barrier();
+	pg_atomic_write_u32(&slot->seq, seq + 2);
+}
+
+static void
+undo_horizon_v2_receive(const ClusterICEnvelope *env, const void *payload)
+{
+	ClusterHeapFreezeReportV2 report;
+	ClusterSemanticActiveSampleFence fence;
+	ClusterICControlIngress ingress;
+	ClusterICTier1Stream stream;
+	ClusterHeapFreezeReportV2SlotShmem *slot;
+	const ClusterHeapFreezeReportV2 *old;
+	uint32 sender = env->source_node_id;
+	uint32 word, generation;
+	TimestampTz now;
+	bool same_identity;
+	bool regression = false;
+
+	if (!cluster_enabled || cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| sender >= CLUSTER_MAX_NODES || (int32)sender == cluster_node_id
+		|| env->dest_node_id != cluster_node_id
+		|| !cluster_heap_freeze_report_v2_decode(payload, env->payload_length, &report)
+		|| report.origin != sender || !TransactionIdIsNormal((TransactionId)report.future_full_xid)
+		|| !TransactionIdIsNormal((TransactionId)report.active_full_xid_min)
+		|| (report.requested_full_xid != 0
+			&& !TransactionIdIsNormal((TransactionId)report.requested_full_xid))
+		|| scn_time_cmp(report.horizon_scn, report.h_sample_clock_scn) > 0) {
+		undo_horizon_reject("invalid v2 report", sender);
+		return;
+	}
+	if (!cluster_ic_dispatch_control_ingress(env, &ingress)
+		|| ingress.carrier != CLUSTER_IC_CONTROL_TCP || ingress.owner_pid != MyProcPid
+		|| ingress.source_node != (int32)sender || ingress.epoch != env->epoch
+		|| ingress.epoch != report.formation_epoch) {
+		undo_horizon_reject("unproven v2 control ingress", sender);
+		return;
+	}
+	/* The private stream serial spans peers, whereas HELLO's shared
+	 * generation is per peer. Validate each through its original owner. */
+	stream = (ClusterICTier1Stream){ .serial = ingress.serial,
+									 .epoch = ingress.epoch,
+									 .owner_pid = ingress.owner_pid,
+									 .peer = (int32)sender,
+									 .plane = CLUSTER_IC_PLANE_CONTROL,
+									 .channel = -1 };
+	if (!cluster_ic_tier1_stream_current(&stream)
+		|| !cluster_sf_peer_capability_word_sample(sender, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2,
+												   &word, &generation)
+		|| (word & PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2) == 0 || generation == 0
+		|| !cluster_semantic_activation_active_sample_capture(&fence)
+		|| fence.local_node_id != cluster_node_id || report.sysid != fence.system_identifier
+		|| report.record_generation != fence.record_generation
+		|| report.formation_epoch != fence.formation_epoch
+		|| ((sender < 64 ? fence.admitted_members_lo : fence.admitted_members_hi)
+			& (UINT64CONST(1) << (sender % 64)))
+			   == 0
+		|| report.incarnation != fence.admitted_incarnation[sender]) {
+		undo_horizon_reject("unproven v2 receive identity", sender);
+		return;
+	}
+
+	slot = &UndoHorizonShmem->freeze_slots[sender];
+	old = &slot->view.report;
+	/* Retain the base even across CONTROL reconnect or local republish.
+	 * Only an actually changed wire identity permits sequence restart. */
+	same_identity = slot->valid && old->sysid == report.sysid
+					&& old->record_generation == report.record_generation
+					&& old->formation_epoch == report.formation_epoch
+					&& old->incarnation == report.incarnation;
+	if (same_identity) {
+		if (report.report_sequence <= slot->last_report_sequence
+			|| report.f_sample_id < old->f_sample_id
+			|| report.future_full_xid < old->future_full_xid
+			|| report.active_full_xid_min < old->active_full_xid_min
+			|| (report.f_sample_id == old->f_sample_id
+				&& (report.future_full_xid != old->future_full_xid
+					|| report.active_full_xid_min != old->active_full_xid_min))) {
+			undo_horizon_reject("v2 replay or f regression", sender);
+			return;
+		}
+		regression = scn_time_cmp(report.horizon_scn, old->horizon_scn) < 0
+					 || scn_time_cmp(report.h_sample_clock_scn, old->h_sample_clock_scn) < 0;
+	}
+	now = GetCurrentTimestamp();
+	if (now <= 0 || !cluster_ic_tier1_stream_current(&stream)
+		|| !cluster_sf_peer_capability_generation_matches(
+			sender, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2, generation)
+		|| !cluster_semantic_activation_active_sample_current(&fence)) {
+		undo_horizon_reject("v2 identity changed before publish", sender);
+		return;
+	}
+	if (regression)
+		undo_horizon_reject("v2 h regression", sender);
+	/* A contradictory H blocks H without destroying the conservative F
+	 * or refreshing its receive timestamp. A conforming report clears it. */
+	undo_horizon_v2_publish(slot, &report, &fence, generation, (uint64)now, regression);
+}
+
+static void
 cluster_undo_horizon_report_handler(const ClusterICEnvelope *env, const void *payload)
 {
 	ClusterUndoHorizonWire wire;
 	ClusterUndoHorizonSlotShmem *slot;
-	uint32 sender = env->source_node_id;
+	uint32 sender;
 	uint64 now_us;
 
 	if (UndoHorizonShmem == NULL)
 		return;
+	if (env == NULL || payload == NULL) {
+		undo_horizon_reject("missing envelope or payload", 0);
+		return;
+	}
+	sender = env->source_node_id;
 
 	/* t/370 L2: force-drop the report before publish (stall leg). */
 	CLUSTER_INJECTION_POINT("cluster-undo-horizon-report-drop");
 	if (cluster_injection_should_skip("cluster-undo-horizon-report-drop"))
 		return;
+	if (env->payload_length == CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES) {
+		undo_horizon_v2_receive(env, payload);
+		return;
+	}
 
 	/*
 	 * Strict wire validation (Q5' amend): exact length, sender within the
@@ -380,6 +533,46 @@ cluster_undo_horizon_lmon_tick(void)
 /* ---------------- cleaner-side sampling (reader) ---------------------- */
 
 #define UNDO_HORIZON_SEQLOCK_RETRIES 3
+
+bool
+cluster_heap_freeze_report_v2_sample(int32 peer, ClusterHeapFreezeReportV2View *out)
+{
+	ClusterHeapFreezeReportV2SlotShmem *slot;
+	int attempt;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (UndoHorizonShmem == NULL || !cluster_enabled || peer < 0 || peer >= CLUSTER_MAX_NODES
+		|| peer == cluster_node_id)
+		return false;
+	slot = &UndoHorizonShmem->freeze_slots[peer];
+	for (attempt = 0; attempt < UNDO_HORIZON_SEQLOCK_RETRIES; attempt++) {
+		uint32 seq = pg_atomic_read_u32(&slot->seq);
+		ClusterHeapFreezeReportV2View view;
+		ClusterSemanticActiveSampleFence fence;
+		uint32 generation;
+		bool valid;
+
+		if (seq & 1)
+			continue;
+		pg_read_barrier();
+		view = slot->view;
+		fence = slot->fence;
+		generation = slot->capability_generation;
+		valid = slot->valid;
+		pg_read_barrier();
+		if (seq != pg_atomic_read_u32(&slot->seq))
+			continue;
+		if (!valid || !cluster_semantic_activation_active_sample_current(&fence)
+			|| !cluster_sf_peer_capability_generation_matches(
+				peer, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2, generation))
+			return false;
+		*out = view;
+		return true;
+	}
+	return false;
+}
 
 /*
  * Snapshot every peer slot into plain views for the pure fold.  Returns
