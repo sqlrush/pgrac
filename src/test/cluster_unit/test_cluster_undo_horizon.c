@@ -92,6 +92,11 @@ static bool test_sender_sample_valid, test_sender_sample_current = true;
 static bool test_sender_change_on_recheck;
 static unsigned test_v2_sends;
 static ClusterHeapFreezeReportV2 test_v2_sent;
+static bool test_cohort_all_caps;
+static uint32 test_cohort_generations[CLUSTER_MAX_NODES];
+static int32 test_cohort_trigger_peer = -1, test_cohort_changed_peer = -1;
+static int test_cohort_change;
+static int64 test_cohort_clock_shift;
 
 bool
 cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out)
@@ -134,13 +139,28 @@ cluster_sf_peer_capability_word_sample(int32 peer, uint32 required, uint32 *word
 									   uint32 *generation)
 {
 	*word = test_horizon_capable ? PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2 : 0;
-	*generation = test_v2_cap_generation;
-	return peer == test_v2_peer && (*word & required) == required;
+	*generation = test_cohort_all_caps ? test_cohort_generations[peer] : test_v2_cap_generation;
+	return (test_cohort_all_caps || peer == test_v2_peer) && (*word & required) == required;
 }
 
 bool
 cluster_sf_peer_capability_generation_matches(int32 peer, uint32 required, uint32 generation)
 {
+	if (test_cohort_all_caps) {
+		if (peer == test_cohort_trigger_peer) {
+			int32 changed = test_cohort_changed_peer;
+
+			test_cohort_trigger_peer = -1;
+			if (test_cohort_change == 1)
+				test_cohort_generations[changed]++;
+			else if (test_cohort_change == 2)
+				pg_atomic_fetch_add_u32(&test_horizon_store.freeze_slots[changed].seq, 2);
+			else if (test_cohort_change == 3)
+				test_v2_fence.admission_publication_seq += 2;
+		}
+		return required == PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2 && test_horizon_capable
+			   && generation == test_cohort_generations[peer];
+	}
 	if (test_v2_cap_change_on_recheck) {
 		test_v2_cap_generation++;
 		test_v2_cap_change_on_recheck = false;
@@ -232,6 +252,8 @@ cluster_undo_retention_horizon_sample(ClusterUndoRetentionSample *out)
 {
 	test_retention_sample_calls++;
 	*out = test_retention_sample;
+	test_horizon_now += test_cohort_clock_shift;
+	test_cohort_clock_shift = 0;
 	return test_retention_sample_valid;
 }
 bool
@@ -313,6 +335,10 @@ reset_v2_receiver(void)
 	test_v2_cap_change_on_recheck = false;
 	test_v2_peer = 1;
 	test_v2_cap_generation = 19;
+	test_cohort_all_caps = false;
+	test_cohort_trigger_peer = test_cohort_changed_peer = -1;
+	test_cohort_change = 0;
+	test_cohort_clock_shift = 0;
 	test_v2_source = (ClusterICControlIngress){ .serial = 19,
 												.epoch = 7,
 												.owner_pid = MyProcPid,
@@ -1497,10 +1523,299 @@ UT_TEST(test_reason_names)
 					 "stale");
 }
 
+UT_TEST(test_v2_summary_observes_complete_fixed_cohort)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_receiver();
+	const char *summary;
+
+	reset_v2_sender();
+	report.active_full_xid_min = UINT64CONST(0x100000080);
+	report.horizon_scn = 300;
+	receive_v2_report(&report);
+	summary = cluster_undo_horizon_peer_reports_summary();
+	UT_ASSERT(strstr(summary, "v2_observation=READY,f=4294967424,h=300") != NULL);
+	/* Preserve the original V1 diagnostic consumer too. */
+	UT_ASSERT(strstr(summary, "n1:v=") != NULL);
+}
+
+static void
+cohort_receive(int32 peer, ClusterHeapFreezeReportV2 report)
+{
+	test_v2_peer = peer;
+	test_v2_source.source_node = peer;
+	report.origin = peer;
+	report.incarnation = test_v2_fence.admitted_incarnation[peer];
+	receive_v2_report(&report);
+}
+
+static ClusterHeapFreezeReportV2
+reset_v2_cohort(bool high_member)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_receiver();
+	int peer;
+
+	reset_v2_sender();
+	test_cohort_all_caps = true;
+	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++)
+		test_cohort_generations[peer] = 19;
+	if (high_member) {
+		test_v2_fence.admitted_members_hi = UINT64CONST(1) << 1;
+		test_v2_fence.admitted_incarnation[65] = 105;
+		test_sender_sample.admission_fence = test_v2_fence;
+	}
+	report.active_full_xid_min = UINT64CONST(0x100000080);
+	report.horizon_scn = 300;
+	cohort_receive(1, report);
+	return report;
+}
+
+static void
+assert_cohort_refusal(ClusterHeapFreezeCohortStatus expected)
+{
+	ClusterHeapFreezeCohortObservation out, unchanged;
+	ClusterHeapFreezeCohortStatus actual;
+
+	memset(&out, 0xa5, sizeof(out));
+	unchanged = out;
+	actual = cluster_heap_freeze_cohort_observe(&out);
+	UT_ASSERT_EQ(actual, expected);
+	UT_ASSERT(memcmp(&out, &unchanged, sizeof(out)) == 0);
+}
+
+UT_TEST(test_v2_cohort_requires_both_mask_halves_and_keeps_domains_separate)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
+	ClusterHeapFreezeCohortObservation out;
+	unsigned cuts = test_retention_sample_calls;
+
+	assert_cohort_refusal(CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE);
+	UT_ASSERT_EQ(test_retention_sample_calls, cuts + 1);
+	report.active_full_xid_min = UINT64CONST(0x100000040);
+	report.horizon_scn = (UINT64CONST(65) << SCN_NODE_ID_SHIFT) | 250;
+	cohort_receive(65, report);
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	UT_ASSERT_EQ(out.active_full_xid_min, UINT64CONST(0x100000040));
+	UT_ASSERT_EQ(out.horizon_scn, report.horizon_scn);
+	UT_ASSERT_EQ(out.record_generation, 8);
+	UT_ASSERT_EQ(out.formation_epoch, 7);
+	UT_ASSERT_EQ(out.admitted_members_lo, 3);
+	UT_ASSERT_EQ(out.admitted_members_hi, 2);
+	/* Membership, not the configured-peer enumeration, determines the AND. */
+	UT_ASSERT(cluster_conf_lookup_node(65) == NULL);
+}
+
+UT_TEST(test_v2_cohort_missing_members_never_shrink_required_set)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		(void)reset_v2_cohort(false);
+		if (fault == 0)
+			test_horizon_store.freeze_slots[1].valid = false;
+		else if (fault == 1) {
+			test_v2_fence.admitted_members_lo |= UINT64CONST(1) << 63;
+			test_v2_fence.admitted_incarnation[63] = 103;
+			test_sender_sample.admission_fence = test_v2_fence;
+			/* Existing reports belong to the former full cohort. */
+			test_horizon_store.freeze_slots[1].fence = test_v2_fence;
+		} else {
+			test_v2_fence.admitted_members_hi = UINT64CONST(1) << 63;
+			test_v2_fence.admitted_incarnation[127] = 167;
+			test_sender_sample.admission_fence = test_v2_fence;
+			test_horizon_store.freeze_slots[1].fence = test_v2_fence;
+		}
+		assert_cohort_refusal(CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE);
+	}
+}
+
+UT_TEST(test_v2_cohort_h_freshness_does_not_expire_f_sample)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_cohort(false);
+	ClusterHeapFreezeCohortObservation out;
+	uint64 old_sample = report.f_sample_id;
+
+	test_horizon_now += 3000000;
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	test_horizon_now++;
+	assert_cohort_refusal(CLUSTER_HEAP_FREEZE_COHORT_H_STALE);
+	/* Arbitrarily old completed F becomes observable with a new, fresh H. */
+	test_horizon_now += INT64CONST(86400000000);
+	report.report_sequence++;
+	report.horizon_scn = 350;
+	report.h_sample_clock_scn = 800;
+	cohort_receive(1, report);
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	UT_ASSERT_EQ(out.active_full_xid_min, report.active_full_xid_min);
+	UT_ASSERT_EQ(out.horizon_scn, 350);
+	UT_ASSERT_EQ(test_horizon_store.freeze_slots[1].view.report.f_sample_id, old_sample);
+	/* The original max(sender, local) freshness window is retained. */
+	report.report_sequence++;
+	report.sender_interval_ms = 60000;
+	cohort_receive(1, report);
+	test_horizon_now += 180000000;
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	test_horizon_now++;
+	assert_cohort_refusal(CLUSTER_HEAP_FREEZE_COHORT_H_STALE);
+}
+
+UT_TEST(test_v2_cohort_uses_end_clock_and_rejects_rollback)
+{
+	(void)reset_v2_cohort(false);
+	test_cohort_clock_shift = 3000001;
+	assert_cohort_refusal(CLUSTER_HEAP_FREEZE_COHORT_H_STALE);
+	(void)reset_v2_cohort(false);
+	test_horizon_now += 100;
+	test_cohort_clock_shift = -1;
+	/* Even a rollback that leaves recv_at in the past is rejected. */
+	assert_cohort_refusal(CLUSTER_HEAP_FREEZE_COHORT_H_STALE);
+	(void)reset_v2_cohort(false);
+	test_horizon_now--;
+	assert_cohort_refusal(CLUSTER_HEAP_FREEZE_COHORT_H_STALE);
+}
+
+UT_TEST(test_v2_cohort_rechecks_earlier_peers_after_later_reads)
+{
+	for (int fault = 1; fault <= 3; fault++) {
+		ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
+
+		cohort_receive(65, report);
+		test_cohort_trigger_peer = 65;
+		test_cohort_changed_peer = 1;
+		test_cohort_change = fault;
+		assert_cohort_refusal(fault == 2 ? CLUSTER_HEAP_FREEZE_COHORT_BUSY_PUBLISH
+										 : CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED);
+	}
+	(void)reset_v2_cohort(false);
+	pg_atomic_write_u32(&test_horizon_store.freeze_slots[1].seq, 3);
+	assert_cohort_refusal(CLUSTER_HEAP_FREEZE_COHORT_BUSY_PUBLISH);
+}
+
+UT_TEST(test_v2_cohort_rejects_local_sample_and_admission_changes)
+{
+	for (int fault = 0; fault < 9; fault++) {
+		ClusterHeapFreezeCohortStatus expected = CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
+
+		(void)reset_v2_cohort(false);
+		if (fault == 0)
+			test_sender_change_on_recheck = true;
+		else if (fault == 1)
+			test_sender_sample_current = false;
+		else if (fault == 2)
+			test_v2_change_on_recheck = true;
+		else if (fault == 3)
+			test_v2_identity = false;
+		else if (fault == 4) {
+			test_sender_sample_valid = false;
+			expected = CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE;
+		} else if (fault == 5) {
+			test_retention_sample_valid = false;
+			expected = CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE;
+		} else if (fault == 6)
+			test_v2_fence.admitted_members_lo &= ~UINT64CONST(1);
+		else if (fault == 7)
+			test_v2_fence.admitted_incarnation[0]++;
+		else
+			test_cohort_generations[1]++;
+		assert_cohort_refusal(expected);
+	}
+}
+
+UT_TEST(test_v2_cohort_defends_against_malformed_slots)
+{
+	for (int fault = 0; fault < 13; fault++) {
+		ClusterHeapFreezeReportV2 *r;
+		ClusterHeapFreezeCohortStatus expected = CLUSTER_HEAP_FREEZE_COHORT_INVALID;
+
+		(void)reset_v2_cohort(false);
+		r = &test_horizon_store.freeze_slots[1].view.report;
+		switch (fault) {
+		case 0:
+			r->active_full_xid_min = UINT64CONST(0x100000001);
+			break;
+		case 1:
+			r->future_full_xid = 2;
+			break;
+		case 2:
+			r->active_full_xid_min = r->future_full_xid + 1;
+			break;
+		case 3:
+			r->horizon_scn = r->h_sample_clock_scn + 1;
+			break;
+		case 4:
+			r->horizon_scn = CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED;
+			break;
+		case 5:
+			r->sender_interval_ms = 0;
+			break;
+		case 6:
+			r->f_sample_id = 0;
+			break;
+		case 7:
+			r->flags = 1;
+			break;
+		case 8:
+			r->requested_full_xid = UINT64CONST(0x100000002);
+			break;
+		case 9:
+			test_horizon_store.freeze_slots[1].view.horizon_regression_flagged = true;
+			break;
+		case 10:
+			r->h_contributor_kind = 5;
+			break;
+		case 11:
+			r->incarnation++;
+			expected = CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
+			break;
+		case 12:
+			r->origin = 2;
+			expected = CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
+			break;
+		}
+		assert_cohort_refusal(expected);
+	}
+}
+
+UT_TEST(test_v2_cohort_single_member_still_requires_local_evidence)
+{
+	ClusterHeapFreezeCohortObservation out;
+
+	(void)reset_v2_cohort(false);
+	test_v2_fence.admitted_members_lo = 1;
+	test_sender_sample.admission_fence = test_v2_fence;
+	test_retention_sample.contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_UNKNOWN;
+	test_retention_sample.contributor_token = 0;
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	UT_ASSERT_EQ(out.active_full_xid_min,
+				 U64FromFullTransactionId(test_sender_sample.scan.min_full));
+	UT_ASSERT_EQ(out.horizon_scn, 400);
+	UT_ASSERT_EQ(out.admitted_members_lo, 1);
+	test_sender_sample.scan.min_full = FullTransactionIdFromEpochAndXid(1, 8192);
+	assert_cohort_refusal(CLUSTER_HEAP_FREEZE_COHORT_INVALID);
+	test_sender_sample.scan.min_full = FullTransactionIdFromEpochAndXid(1, 1);
+	assert_cohort_refusal(CLUSTER_HEAP_FREEZE_COHORT_INVALID);
+	test_sender_sample.scan.min_full = FullTransactionIdFromEpochAndXid(1, 256);
+	test_retention_sample.horizon_scn = test_retention_sample.clock_scn + 1;
+	assert_cohort_refusal(CLUSTER_HEAP_FREEZE_COHORT_INVALID);
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(NULL), CLUSTER_HEAP_FREEZE_COHORT_INVALID);
+}
+
+UT_TEST(test_v2_summary_refusal_does_not_reuse_observed_values)
+{
+	const char *summary;
+
+	(void)reset_v2_cohort(false);
+	UT_ASSERT(strstr(cluster_undo_horizon_peer_reports_summary(), "v2_observation=READY,f=")
+			  != NULL);
+	test_horizon_store.freeze_slots[1].valid = false;
+	summary = cluster_undo_horizon_peer_reports_summary();
+	UT_ASSERT(strstr(summary, "v2_observation=INCOMPLETE ") != NULL);
+	UT_ASSERT(strstr(summary, ",f=") == NULL);
+	UT_ASSERT(strstr(summary, ",h=") == NULL);
+	UT_ASSERT(strstr(summary, "n1:v=") != NULL);
+}
+
 int
 main(void)
 {
-	UT_PLAN(47);
+	UT_PLAN(57);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -1550,6 +1865,16 @@ main(void)
 	UT_RUN(test_v2_sender_uses_complete_worker_sample_and_same_typed_h_cut);
 	UT_RUN(test_v2_sender_rechecks_capability_and_original_sample_without_stalling_v1);
 	UT_RUN(test_v2_sender_capability_is_independent_of_v1_and_sequence_is_shared);
+	UT_RUN(test_v2_summary_observes_complete_fixed_cohort);
+	UT_RUN(test_v2_cohort_requires_both_mask_halves_and_keeps_domains_separate);
+	UT_RUN(test_v2_cohort_missing_members_never_shrink_required_set);
+	UT_RUN(test_v2_cohort_h_freshness_does_not_expire_f_sample);
+	UT_RUN(test_v2_cohort_uses_end_clock_and_rejects_rollback);
+	UT_RUN(test_v2_cohort_rechecks_earlier_peers_after_later_reads);
+	UT_RUN(test_v2_cohort_rejects_local_sample_and_admission_changes);
+	UT_RUN(test_v2_cohort_defends_against_malformed_slots);
+	UT_RUN(test_v2_cohort_single_member_still_requires_local_evidence);
+	UT_RUN(test_v2_summary_refusal_does_not_reuse_observed_values);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

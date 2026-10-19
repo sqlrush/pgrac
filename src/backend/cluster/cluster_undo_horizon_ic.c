@@ -600,19 +600,13 @@ cluster_undo_horizon_lmon_tick(void)
 
 #define UNDO_HORIZON_SEQLOCK_RETRIES 3
 
-bool
-cluster_heap_freeze_report_v2_sample(int32 peer, ClusterHeapFreezeReportV2View *out)
+static ClusterHeapFreezeCohortStatus
+undo_horizon_v2_slot_sample(int32 peer, ClusterHeapFreezeReportV2View *out, uint32 *out_generation,
+							uint32 *out_seq)
 {
-	ClusterHeapFreezeReportV2SlotShmem *slot;
+	ClusterHeapFreezeReportV2SlotShmem *slot = &UndoHorizonShmem->freeze_slots[peer];
 	int attempt;
 
-	if (out == NULL)
-		return false;
-	memset(out, 0, sizeof(*out));
-	if (UndoHorizonShmem == NULL || !cluster_enabled || peer < 0 || peer >= CLUSTER_MAX_NODES
-		|| peer == cluster_node_id)
-		return false;
-	slot = &UndoHorizonShmem->freeze_slots[peer];
 	for (attempt = 0; attempt < UNDO_HORIZON_SEQLOCK_RETRIES; attempt++) {
 		uint32 seq = pg_atomic_read_u32(&slot->seq);
 		ClusterHeapFreezeReportV2View view;
@@ -630,14 +624,181 @@ cluster_heap_freeze_report_v2_sample(int32 peer, ClusterHeapFreezeReportV2View *
 		pg_read_barrier();
 		if (seq != pg_atomic_read_u32(&slot->seq))
 			continue;
-		if (!valid || !cluster_semantic_activation_active_sample_current(&fence)
+		if (!valid)
+			return CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE;
+		if (!cluster_semantic_activation_active_sample_current(&fence)
 			|| !cluster_sf_peer_capability_generation_matches(
 				peer, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2, generation))
-			return false;
+			return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
 		*out = view;
-		return true;
+		*out_generation = generation;
+		*out_seq = seq;
+		return CLUSTER_HEAP_FREEZE_COHORT_READY;
 	}
-	return false;
+	return CLUSTER_HEAP_FREEZE_COHORT_BUSY_PUBLISH;
+}
+
+bool
+cluster_heap_freeze_report_v2_sample(int32 peer, ClusterHeapFreezeReportV2View *out)
+{
+	uint32 generation, seq;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (UndoHorizonShmem == NULL || !cluster_enabled || peer < 0 || peer >= CLUSTER_MAX_NODES
+		|| peer == cluster_node_id)
+		return false;
+	return undo_horizon_v2_slot_sample(peer, out, &generation, &seq)
+		   == CLUSTER_HEAP_FREEZE_COHORT_READY;
+}
+
+typedef struct UndoHorizonV2PeerObservation {
+	uint64 recv_at_us;
+	uint32 interval_ms;
+	uint32 generation;
+	uint32 seq;
+} UndoHorizonV2PeerObservation;
+
+static bool
+undo_horizon_v2_required(const ClusterSemanticActiveSampleFence *fence, int32 peer)
+{
+	return ((peer < 64 ? fence->admitted_members_lo : fence->admitted_members_hi)
+			& (UINT64CONST(1) << (peer % 64)))
+		   != 0;
+}
+
+static ClusterHeapFreezeCohortStatus
+undo_horizon_v2_observe_peer(int32 peer, const ClusterSemanticActiveSampleFence *fence,
+							 UndoHorizonV2PeerObservation *identity,
+							 ClusterHeapFreezeCohortObservation *candidate)
+{
+	ClusterHeapFreezeReportV2View view;
+	ClusterHeapFreezeReportV2 *report = &view.report;
+	ClusterHeapFreezeCohortStatus status;
+	uint8 image[CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES];
+
+	status = undo_horizon_v2_slot_sample(peer, &view, &identity->generation, &identity->seq);
+	if (status != CLUSTER_HEAP_FREEZE_COHORT_READY)
+		return status;
+	if (report->origin != peer || report->sysid != fence->system_identifier
+		|| report->record_generation != fence->record_generation
+		|| report->formation_epoch != fence->formation_epoch
+		|| report->incarnation != fence->admitted_incarnation[peer])
+		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
+	if (view.horizon_regression_flagged || !cluster_heap_freeze_report_v2_encode(report, image)
+		|| !TransactionIdIsNormal((TransactionId)report->future_full_xid)
+		|| !TransactionIdIsNormal((TransactionId)report->active_full_xid_min)
+		|| (report->requested_full_xid != 0
+			&& !TransactionIdIsNormal((TransactionId)report->requested_full_xid))
+		|| scn_time_cmp(report->horizon_scn, report->h_sample_clock_scn) > 0)
+		return CLUSTER_HEAP_FREEZE_COHORT_INVALID;
+	identity->recv_at_us = view.recv_at_us;
+	identity->interval_ms = report->sender_interval_ms;
+	candidate->active_full_xid_min
+		= Min(candidate->active_full_xid_min, report->active_full_xid_min);
+	if (scn_time_cmp(report->horizon_scn, candidate->horizon_scn) < 0)
+		candidate->horizon_scn = report->horizon_scn;
+	return CLUSTER_HEAP_FREEZE_COHORT_READY;
+}
+
+/* Second collection brackets every required peer, including ones already
+ * copied before a later peer reconnected or published a contradictory H.
+ * H is checked against the END clock, not a pre-lock/pre-traversal clock. */
+static ClusterHeapFreezeCohortStatus
+undo_horizon_v2_cohort_current(const ClusterSemanticActiveSampleFence *fence,
+							   const UndoHorizonV2PeerObservation *peers, TimestampTz started)
+{
+	TimestampTz now = GetCurrentTimestamp();
+	uint32 local_ms
+		= Max(CLUSTER_UNDO_HORIZON_INTERVAL_MIN_MS,
+			  Min(cluster_lmon_main_loop_interval, CLUSTER_UNDO_HORIZON_INTERVAL_MAX_MS));
+	int32 peer;
+
+	if (now <= 0 || now < started)
+		return CLUSTER_HEAP_FREEZE_COHORT_H_STALE;
+	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+		const UndoHorizonV2PeerObservation *p = &peers[peer];
+		uint64 window;
+
+		if (peer == fence->local_node_id || !undo_horizon_v2_required(fence, peer))
+			continue;
+		pg_read_barrier();
+		if (p->seq != pg_atomic_read_u32(&UndoHorizonShmem->freeze_slots[peer].seq))
+			return CLUSTER_HEAP_FREEZE_COHORT_BUSY_PUBLISH;
+		if (!cluster_sf_peer_capability_generation_matches(
+				peer, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2, p->generation))
+			return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
+		window
+			= (uint64)CLUSTER_UNDO_HORIZON_FRESHNESS_FACTOR * Max(p->interval_ms, local_ms) * 1000;
+		if (p->recv_at_us == 0 || (uint64)now < p->recv_at_us
+			|| (uint64)now - p->recv_at_us > window)
+			return CLUSTER_HEAP_FREEZE_COHORT_H_STALE;
+	}
+	return CLUSTER_HEAP_FREEZE_COHORT_READY;
+}
+
+ClusterHeapFreezeCohortStatus
+cluster_heap_freeze_cohort_observe(ClusterHeapFreezeCohortObservation *out)
+{
+	ClusterHeapFreezeCohortObservation candidate = { 0 };
+	ClusterSemanticActiveSampleFence fence;
+	ClusterUndoCleanerActiveSample active;
+	ClusterUndoRetentionSample history;
+	UndoHorizonV2PeerObservation peers[CLUSTER_MAX_NODES] = { { 0 } };
+	ClusterHeapFreezeCohortStatus status;
+	TimestampTz started;
+	int32 peer;
+
+	if (out == NULL || !cluster_enabled || UndoHorizonShmem == NULL || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES)
+		return CLUSTER_HEAP_FREEZE_COHORT_INVALID;
+	if (!cluster_semantic_activation_active_sample_capture(&fence))
+		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
+	if (fence.local_node_id != cluster_node_id || !undo_horizon_v2_required(&fence, cluster_node_id)
+		|| fence.local_boot_incarnation == 0
+		|| fence.admitted_incarnation[cluster_node_id] != fence.local_boot_incarnation)
+		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
+	started = GetCurrentTimestamp();
+	if (started <= 0)
+		return CLUSTER_HEAP_FREEZE_COHORT_H_STALE;
+	if (!cluster_undo_cleaner_active_sample(&active) || !undo_horizon_sample_local_report(&history))
+		return CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE;
+	if (active.scan.status != CTRC_ACTIVE_SCAN_COMPLETE || active.sample_id == 0
+		|| active.worker_pid <= 0 || !FullTransactionIdIsValid(active.scan.future_full)
+		|| !FullTransactionIdIsValid(active.scan.min_full)
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(active.scan.future_full))
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(active.scan.min_full))
+		|| FullTransactionIdFollows(active.scan.min_full, active.scan.future_full)
+		|| !SCN_VALID(history.horizon_scn) || !SCN_VALID(history.clock_scn)
+		|| history.horizon_scn == CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED
+		|| scn_time_cmp(history.horizon_scn, history.clock_scn) > 0)
+		return CLUSTER_HEAP_FREEZE_COHORT_INVALID;
+	candidate.active_full_xid_min = U64FromFullTransactionId(active.scan.min_full);
+	candidate.horizon_scn = history.horizon_scn;
+	candidate.record_generation = fence.record_generation;
+	candidate.formation_epoch = fence.formation_epoch;
+	candidate.admitted_members_lo = fence.admitted_members_lo;
+	candidate.admitted_members_hi = fence.admitted_members_hi;
+	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+		if (!undo_horizon_v2_required(&fence, peer))
+			continue;
+		if (fence.admitted_incarnation[peer] == 0)
+			return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
+		if (peer == cluster_node_id)
+			continue;
+		status = undo_horizon_v2_observe_peer(peer, &fence, &peers[peer], &candidate);
+		if (status != CLUSTER_HEAP_FREEZE_COHORT_READY)
+			return status;
+	}
+	status = undo_horizon_v2_cohort_current(&fence, peers, started);
+	if (status != CLUSTER_HEAP_FREEZE_COHORT_READY)
+		return status;
+	if (!cluster_undo_cleaner_active_sample_current(&active)
+		|| !cluster_semantic_activation_active_sample_current(&fence))
+		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
+	*out = candidate;
+	return CLUSTER_HEAP_FREEZE_COHORT_READY;
 }
 
 /*
@@ -889,7 +1050,11 @@ cluster_undo_horizon_epoch_fence_tripped(uint64 expected_epoch)
 const char *
 cluster_undo_horizon_peer_reports_summary(void)
 {
-	static char buf[CLUSTER_MAX_NODES * 96];
+	static const char *const names[]
+		= { "READY", "INCOMPLETE", "H_STALE", "BUSY_PUBLISH", "IDENTITY_CHANGED", "INVALID" };
+	static char buf[256 + CLUSTER_MAX_NODES * 96];
+	ClusterHeapFreezeCohortObservation observation;
+	ClusterHeapFreezeCohortStatus status;
 	uint64 now_us = (uint64)GetCurrentTimestamp();
 	size_t off = 0;
 	int i;
@@ -897,6 +1062,12 @@ cluster_undo_horizon_peer_reports_summary(void)
 	buf[0] = '\0';
 	if (UndoHorizonShmem == NULL)
 		return buf;
+	status = cluster_heap_freeze_cohort_observe(&observation);
+	off = (size_t)snprintf(buf, sizeof(buf), "v2_observation=%s", names[status]);
+	if (status == CLUSTER_HEAP_FREEZE_COHORT_READY)
+		off += (size_t)snprintf(buf + off, sizeof(buf) - off,
+								",f=" UINT64_FORMAT ",h=" UINT64_FORMAT,
+								observation.active_full_xid_min, observation.horizon_scn);
 	for (i = 0; i < CLUSTER_MAX_NODES && off + 96 < sizeof(buf); i++) {
 		ClusterUndoHorizonSlotShmem *slot = &UndoHorizonShmem->slots[i];
 		int64 age_ms;

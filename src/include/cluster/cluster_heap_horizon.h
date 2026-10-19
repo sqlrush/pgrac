@@ -40,8 +40,7 @@ extern bool cluster_heap_freeze_cutoff_v1(TransactionId proposed, TransactionId 
 #define CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_RESERVED0 108
 #define CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_H_CONTRIBUTOR_TOKEN 112
 
-typedef enum ClusterHeapFreezeReportV2ContributorKind
-{
+typedef enum ClusterHeapFreezeReportV2ContributorKind {
 	CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_UNKNOWN = 0,
 	CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK = 1,
 	CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT = 2,
@@ -49,8 +48,7 @@ typedef enum ClusterHeapFreezeReportV2ContributorKind
 	CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_REPLICATION = 4
 } ClusterHeapFreezeReportV2ContributorKind;
 
-typedef struct ClusterHeapFreezeReportV2
-{
+typedef struct ClusterHeapFreezeReportV2 {
 	uint16 version;
 	uint16 length;
 	uint32 flags;
@@ -72,11 +70,10 @@ typedef struct ClusterHeapFreezeReportV2
 	uint64 h_contributor_token;
 } ClusterHeapFreezeReportV2;
 
-extern bool cluster_heap_freeze_report_v2_encode(
-	const ClusterHeapFreezeReportV2 *report,
-	uint8 out[CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES]);
-extern bool cluster_heap_freeze_report_v2_decode(
-	const uint8 *bytes, size_t length, ClusterHeapFreezeReportV2 *out);
+extern bool cluster_heap_freeze_report_v2_encode(const ClusterHeapFreezeReportV2 *report,
+												 uint8 out[CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES]);
+extern bool cluster_heap_freeze_report_v2_decode(const uint8 *bytes, size_t length,
+												 ClusterHeapFreezeReportV2 *out);
 
 /* Volatile receive observation only, not permission to advance a floor.
  * F has no age expiry; consumers must still enforce H freshness, backward
@@ -90,5 +87,33 @@ typedef struct ClusterHeapFreezeReportV2View {
 } ClusterHeapFreezeReportV2View;
 
 extern bool cluster_heap_freeze_report_v2_sample(int32 peer, ClusterHeapFreezeReportV2View *out);
+
+typedef enum ClusterHeapFreezeCohortStatus {
+	CLUSTER_HEAP_FREEZE_COHORT_READY = 0,
+	CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE,
+	CLUSTER_HEAP_FREEZE_COHORT_H_STALE,
+	CLUSTER_HEAP_FREEZE_COHORT_BUSY_PUBLISH,
+	CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED,
+	CLUSTER_HEAP_FREEZE_COHORT_INVALID
+} ClusterHeapFreezeCohortStatus;
+
+/* Read-only observation of the entire admitted cohort, never a freeze or
+ * truncation certificate. Producer protection closure is still required
+ * before these values may authorize a global floor. F and H use different
+ * domains: F is a FullXid lower bound, H is an SCN history bound. */
+typedef struct ClusterHeapFreezeCohortObservation {
+	uint64 active_full_xid_min;
+	uint64 horizon_scn;
+	uint64 record_generation;
+	uint64 formation_epoch;
+	uint64 admitted_members_lo;
+	uint64 admitted_members_hi;
+} ClusterHeapFreezeCohortObservation;
+
+/* Bounded reads, fixed required set, current connection/admission rechecks.
+ * Only READY writes out; every refusal preserves it. An old completed F
+ * remains usable with fresh H; F itself has no age expiry. */
+extern ClusterHeapFreezeCohortStatus
+cluster_heap_freeze_cohort_observe(ClusterHeapFreezeCohortObservation *out);
 
 #endif
