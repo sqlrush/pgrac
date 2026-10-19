@@ -603,6 +603,33 @@ UT_TEST(test_install_lookup_and_delete_publish_only_after_recheck)
 	UT_ASSERT_EQ(fake_leave_count, 3);
 }
 
+UT_TEST(test_abort_install_publishes_then_wakes_once)
+{
+	ClusterTTStatusKey key = make_key((TransactionId)606);
+	ClusterTTStatusSourceRequest request;
+	ClusterTTStatusSourceResult result;
+
+	reset_fixture();
+	memset(&request, 0, sizeof(request));
+	request.key = &key;
+	request.status = CLUSTER_TT_STATUS_ABORTED;
+	request.commit_scn = InvalidScn;
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT_EQ(fake_wake_count, 1);
+	UT_ASSERT_EQ(memcmp(&fake_wake_key, &key, sizeof(key)), 0);
+
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_ABORTED);
+	UT_ASSERT_EQ(result.lookup.commit_scn, InvalidScn);
+}
+
 UT_TEST(test_prepared_commit_publishes_then_wakes_each_exact_holder)
 {
 	ClusterTTStatusKey key = make_key((TransactionId)607);
@@ -865,11 +892,12 @@ UT_TEST(test_error_path_runs_single_leave_funnel)
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
 	UT_RUN(test_frozen_tt_source_operation_domain);
 	UT_RUN(test_active_refuses_before_request_inspection_and_mutation);
 	UT_RUN(test_disabled_source_executes_matching_counter_arm);
 	UT_RUN(test_install_lookup_and_delete_publish_only_after_recheck);
+	UT_RUN(test_abort_install_publishes_then_wakes_once);
 	UT_RUN(test_prepared_commit_publishes_then_wakes_each_exact_holder);
 	UT_RUN(test_missing_required_pointer_closes_after_admission);
 	UT_RUN(test_unknown_operation_closes_after_admission);
