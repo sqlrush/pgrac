@@ -5370,14 +5370,15 @@ test_cluster_advisory: test_cluster_advisory.c unit_test.h \
 # cluster_node_id / cluster_shmem_register_region / cluster_injection_*).
 # Test stubs all of these and drives a tiny fake shared HTAB so the real
 # acquire/release/upgrade/downgrade/query paths are exercised standalone.
-# Compile the unchanged product source with only its clock dependency redirected.
-# No test clock or test-only branch enters the production object.
+# Redirect clock and byte comparisons only in the test object. The comparison
+# observer delegates to libc and counts the bytes read by the real scans.
 test_cluster_pcm_lock_clock_product.o: \
 		$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c \
 		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \
-		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h
+		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
-		-Dclock_gettime=cluster_test_pcm_clock_gettime -c $< -o $@
+		-Dclock_gettime=cluster_test_pcm_clock_gettime \
+		-Dmemcmp=cluster_test_pcm_memcmp -c $< -o $@
 
 test_cluster_pcm_wait_consumer.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/if \(action != RESOURCE_X_BOOTSTRAP_ROUND_WAIT\)/ { emit=1; begin++ } \

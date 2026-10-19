@@ -722,6 +722,30 @@ typedef struct ClusterPcmResourceXMasterState {
 	ResourceXIntentSlot holder_image_intent;
 } ClusterPcmResourceXMasterState;
 
+/* Inactive bodies are zeroed before their registry state is published. Bounded
+ * scans check only the fixed prefix, never the large request/image arrays. */
+StaticAssertDecl(offsetof(ClusterPcmResourceXMasterState, bootstrap_priority) == 304,
+				 "inactive master scan must retain its fixed 304-byte read bound");
+
+static bool
+pcm_resource_x_inactive_header_zero(const ClusterPcmResourceXMasterState *state)
+{
+	static const unsigned char
+		empty_header[offsetof(ClusterPcmResourceXMasterState, bootstrap_priority)];
+
+	return memcmp(state, empty_header, sizeof(empty_header)) == 0;
+}
+
+static void
+pcm_resource_x_assert_zero_body(const ClusterPcmResourceXMasterState *state pg_attribute_unused())
+{
+#ifdef USE_ASSERT_CHECKING
+	static const ClusterPcmResourceXMasterState empty_state;
+
+	Assert(memcmp(state, &empty_state, sizeof(*state)) == 0);
+#endif
+}
+
 StaticAssertDecl(sizeof(ClusterPcmResourceXMasterRequest) == 352,
 				 "Resource-X master request must retain exact grant physical lineage");
 StaticAssertDecl(sizeof(ClusterPcmResourceXTerminalTombstone) == 360,
@@ -2345,6 +2369,7 @@ pcm_entry_try_retire_exact(const BufferTag *tag, uint64 binding_generation, PcmR
 		provenance_slot->state = PCM_SIDECAR_TOMBSTONE;
 	}
 	memset(state, 0, sizeof(*state));
+	pcm_resource_x_assert_zero_body(state);
 	registry_slot->retired_authority_generation = authority_generation;
 	pg_write_barrier();
 	registry_slot->state = PCM_REGISTRY_TOMBSTONE;
@@ -9093,7 +9118,6 @@ pcm_normal_stop_scan(bool require_pi_retired, bool retire_pi, BufferTag *tag_out
 					 const char **reason_out)
 {
 	static const ClusterPcmResourceXSlot empty_slot;
-	static const ClusterPcmResourceXMasterState empty_state;
 	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
 	BufferTag observed = { 0 };
 	uint32 observed_slot = PG_UINT32_MAX;
@@ -9106,6 +9130,8 @@ pcm_normal_stop_scan(bool require_pi_retired, bool retire_pi, BufferTag *tag_out
 	bool additional_invalid = false;
 	bool durable_stop_cut;
 	uint32 gate;
+	bool trace = cluster_trace_normal_stop;
+	TimestampTz trace_started = trace ? GetCurrentTimestamp() : 0;
 
 	if (!IsUnderPostmaster || !cluster_enabled || ClusterPcm == NULL || cluster_pcm_htab == NULL
 		|| cluster_pcm_resource_x_slots == NULL || cluster_pcm_resource_x_master_states == NULL
@@ -9265,13 +9291,13 @@ pcm_normal_stop_scan(bool require_pi_retired, bool retire_pi, BufferTag *tag_out
 							  || entry->binding_generation != registry->binding_generation));
 		} else if (registry->state == PCM_REGISTRY_EMPTY) {
 			invalid = memcmp(registry, &empty_slot, sizeof(*registry)) != 0
-					  || memcmp(state, &empty_state, sizeof(*state)) != 0;
+					  || !pcm_resource_x_inactive_header_zero(state);
 		} else if (registry->state == PCM_REGISTRY_TOMBSTONE) {
 			invalid = registry->reserved != 0 || registry->binding_generation == 0
 					  || registry->binding_generation == UINT64_MAX
 					  || registry->retired_authority_generation == 0
 					  || registry->retired_authority_generation == UINT64_MAX
-					  || memcmp(state, &empty_state, sizeof(*state)) != 0;
+					  || !pcm_resource_x_inactive_header_zero(state);
 		} else
 			invalid = true;
 		if (invalid && result == CLUSTER_NORMAL_STOP_INVALID)
@@ -9303,6 +9329,16 @@ done:
 		*slot_out = observed_slot;
 	if (reason_out != NULL)
 		*reason_out = reason;
+	if (trace && CritSectionCount == 0) {
+		bool trace_held_lock = false;
+
+		ForEachLWLockHeldByMe(pcm_normal_stop_note_held_lock, &trace_held_lock);
+		if (!trace_held_lock)
+			ereport(LOG, (errmsg("PCM normal-stop census node=%d post_checkpoint=%d retire_pi=%d"
+								 " result=%d slots=%d elapsed_us=" INT64_FORMAT,
+								 cluster_node_id, require_pi_retired, retire_pi, result,
+								 pcm_grd_effective, GetCurrentTimestamp() - trace_started)));
+	}
 	return result;
 }
 
@@ -9630,6 +9666,11 @@ cluster_pcm_grd_init(void)
 		 * by HC60 apply-fail-closed.
 		 */
 		memset(ClusterPcm, 0, header_size);
+#ifdef USE_ASSERT_CHECKING
+		/* Establish EMPTY once; do not revalidate whole bodies in scans. */
+		for (int slot = 0; slot < pcm_grd_effective; slot++)
+			pcm_resource_x_assert_zero_body(&cluster_pcm_resource_x_master_states[slot]);
+#endif
 		SpinLockInit(&ClusterPcm->trace_lock);
 		pg_atomic_init_u64(&ClusterPcm->trace_active_epoch, 0);
 		ClusterPcm->trace.capacity = pcm_rx_trace_capacity(pcm_grd_effective);
@@ -11540,7 +11581,6 @@ pcm_pi_relation_scan_role(RelFileLocator locator, uint64 formation, uint32 budge
 											 ClusterPcmPiPendingIdentityV1 *pending_out)
 {
 	static const ClusterPcmResourceXSlot empty_slot;
-	static const ClusterPcmResourceXMasterState empty_state;
 	ResourceXGateSnapshot before, after;
 	ClusterPcmPiRelationScanV2 result = CLUSTER_PCM_PI_RELATION_MORE;
 	uint32 position, end;
@@ -11579,7 +11619,7 @@ pcm_pi_relation_scan_role(RelFileLocator locator, uint64 formation, uint32 budge
 
 		if (slot->state == PCM_REGISTRY_EMPTY) {
 			if (memcmp(slot, &empty_slot, sizeof(*slot)) != 0
-				|| memcmp(state, &empty_state, sizeof(*state)) != 0)
+				|| !pcm_resource_x_inactive_header_zero(state))
 				goto invalid;
 			continue;
 		}
@@ -11589,7 +11629,7 @@ pcm_pi_relation_scan_role(RelFileLocator locator, uint64 formation, uint32 budge
 		if (slot->state == PCM_REGISTRY_TOMBSTONE) {
 			if (slot->retired_authority_generation == 0
 				|| slot->retired_authority_generation == UINT64_MAX
-				|| memcmp(state, &empty_state, sizeof(*state)) != 0)
+				|| !pcm_resource_x_inactive_header_zero(state))
 				goto invalid;
 			continue;
 		}
