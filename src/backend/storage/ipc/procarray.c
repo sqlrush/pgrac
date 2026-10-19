@@ -2228,7 +2228,7 @@ ClusterSnapshotRefreshFields(Snapshot snapshot)
 }
 
 /*
- * cluster_undo_retention_horizon -- spec-3.12 D1.
+ * cluster_undo_retention_horizon_sample -- spec-3.12 D1, typed H observation.
  *
  * Own-instance undo/TT-slot retention lower bound: the min CLUSTER-source
  * read_scn over all backends' live snapshots (each backend publishes its min
@@ -2251,35 +2251,77 @@ ClusterSnapshotRefreshFields(Snapshot snapshot)
  * publication; callers must NOT hold seg->lock / undo lifecycle_lock
  * when calling (C17 lock ordering: compute horizon first).
  */
-SCN
-cluster_undo_retention_horizon(void)
+bool
+cluster_undo_retention_horizon_sample(ClusterUndoRetentionSample *out)
 {
 	ProcArrayStruct *arrayP = procArray;
-	SCN min;
+	ClusterUndoRetentionSample sample = {0};
 	int			index;
 
-	if (cluster_node_id < 0)
-		return InvalidScn;		/* cluster disabled */
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (cluster_node_id < 0 || arrayP == NULL || allProcs == NULL)
+		return false;
 
 	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
 	/* Snapshot xmin is published under this lock before read_scn is chosen.
 	 * Sample the clock first: a later snapshot cannot precede this value.
 	 * Existing unpublished snapshots refuse below; there is no post-scan
 	 * clock sample that could run ahead of a concurrently created reader. */
-	min = cluster_scn_current();
+	sample.clock_scn = cluster_scn_current();
+	sample.horizon_scn = sample.clock_scn;
+	sample.contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK;
 	for (index = 0; index < arrayP->numProcs; index++)
 	{
 		int			pgprocno = arrayP->pgprocnos[index];
 		PGPROC	   *proc = &allProcs[pgprocno];
 		SCN			r = (SCN) pg_atomic_read_u64(&proc->cluster_read_scn_atomic);
+		SCN			previous = sample.horizon_scn;
 
-		min = cluster_undo_retention_sample_min(min, UINT32_ACCESS_ONCE(proc->xmin), r);
-		if (!SCN_VALID(min))
+		sample.horizon_scn = cluster_undo_retention_sample_min(previous,
+															UINT32_ACCESS_ONCE(proc->xmin), r);
+		if (!SCN_VALID(sample.horizon_scn))
 			break;
+		if (SCN_VALID(r))
+		{
+			int			cmp = scn_time_cmp(r, previous);
+			ClusterHeapFreezeReportV2ContributorKind kind;
+			bool		prefer;
+
+			kind = proc->pid > 0
+				? CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT
+				: CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_UNKNOWN;
+			prefer = sample.contributor_kind == CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK ||
+				(sample.contributor_kind == CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_UNKNOWN &&
+				 kind == CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+
+			/* Attribute the minimum in this same cut. Equal-time protection
+			 * wins over CLOCK; an unexplained dummy entry is never promoted
+			 * to a prepared-transaction SCN proof. Keep the scalar SCN bits. */
+			if (cmp < 0 || (cmp == 0 && prefer))
+			{
+				sample.contributor_kind = kind;
+				sample.contributor_token = kind == CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT
+					? (uint64) pgprocno + 1 : 0;
+			}
+		}
 	}
 	LWLockRelease(ProcArrayLock);
 
-	return min;
+	if (!SCN_VALID(sample.horizon_scn))
+		return false;
+	*out = sample;
+	return true;
+}
+
+/* Compatibility entry point: preserve the original numeric H and refusal. */
+SCN
+cluster_undo_retention_horizon(void)
+{
+	ClusterUndoRetentionSample sample;
+
+	return cluster_undo_retention_horizon_sample(&sample) ? sample.horizon_scn : InvalidScn;
 }
 
 /*

@@ -65,6 +65,15 @@ static bool test_horizon_cut;
 static bool test_horizon_seal;
 static bool test_horizon_capable = true;
 static ClusterUndoHorizonWire test_horizon_last;
+static ClusterUndoRetentionSample test_retention_sample
+	= { .horizon_scn = 500,
+		.clock_scn = 500,
+		.contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK };
+static unsigned test_retention_scalar_calls;
+static unsigned test_retention_sample_calls;
+static bool test_retention_sample_valid = true;
+static bool test_retention_mrp;
+static SCN test_retention_mrp_bound;
 static ClusterSemanticActiveSampleFence test_v2_fence;
 static bool test_v2_identity = true;
 static bool test_v2_ingress = true;
@@ -189,17 +198,25 @@ cluster_epoch_get_current(void)
 SCN
 cluster_undo_retention_horizon(void)
 {
+	test_retention_scalar_calls++;
 	return (SCN)500;
+}
+bool
+cluster_undo_retention_horizon_sample(ClusterUndoRetentionSample *out)
+{
+	test_retention_sample_calls++;
+	*out = test_retention_sample;
+	return test_retention_sample_valid;
 }
 bool
 cluster_mrp_should_start(void)
 {
-	return false;
+	return test_retention_mrp;
 }
 SCN
 cluster_mrp_standby_consistent_scn(void)
 {
-	return InvalidScn;
+	return test_retention_mrp_bound;
 }
 bool
 cluster_normal_stop_pi_retirement_allowed(void)
@@ -727,6 +744,100 @@ UT_TEST(test_original_horizon_sender_stops_only_after_all_checkpoint_cut)
 	UT_ASSERT_EQ(test_horizon_sends, 6);
 }
 
+UT_TEST(test_lmon_uses_one_typed_retention_cut)
+{
+	unsigned sends = test_horizon_sends;
+	unsigned scalar_calls = test_retention_scalar_calls;
+	unsigned sample_calls = test_retention_sample_calls;
+
+	test_horizon_capable = true;
+	test_retention_sample.horizon_scn = 400;
+	test_retention_sample.clock_scn = 700;
+	test_retention_sample.contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT;
+	test_retention_sample.contributor_token = 9;
+	test_horizon_now += 1000001;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_horizon_sends, sends + 3);
+	UT_ASSERT_EQ(test_horizon_last.horizon_scn, 400);
+	UT_ASSERT_EQ(test_retention_scalar_calls, scalar_calls);
+	UT_ASSERT_EQ(test_retention_sample_calls, sample_calls + 1);
+}
+
+UT_TEST(test_lmon_refuses_missing_typed_retention_sample)
+{
+	unsigned sends = test_horizon_sends;
+
+	test_retention_sample_valid = false;
+	test_horizon_now += 1000001;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_horizon_sends, sends);
+	test_retention_sample_valid = true;
+}
+
+UT_TEST(test_local_report_preserves_same_cut_metadata)
+{
+	ClusterUndoRetentionSample sample;
+	unsigned calls = test_retention_sample_calls;
+
+	UT_ASSERT(undo_horizon_sample_local_report(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 400);
+	UT_ASSERT_EQ(sample.clock_scn, 700);
+	UT_ASSERT_EQ(sample.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+	UT_ASSERT_EQ(sample.contributor_token, 9);
+	UT_ASSERT_EQ(test_retention_sample_calls, calls + 1);
+}
+
+UT_TEST(test_local_report_attributes_mrp_clamp_and_clock_ties)
+{
+	ClusterUndoRetentionSample sample;
+
+	test_retention_mrp = true;
+	test_retention_mrp_bound = 300;
+	UT_ASSERT(undo_horizon_sample_local_report(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 300);
+	UT_ASSERT_EQ(sample.clock_scn, 700);
+	UT_ASSERT_EQ(sample.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_REPLICATION);
+	UT_ASSERT_EQ(sample.contributor_token, 0);
+
+	/* A protected snapshot wins an equal-time tie, including different
+	 * origin bits; CLOCK/UNKNOWN must not hide a real MRP bound. */
+	test_retention_mrp_bound = (UINT64CONST(3) << SCN_NODE_ID_SHIFT) | 400;
+	UT_ASSERT(undo_horizon_sample_local_report(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 400);
+	UT_ASSERT_EQ(sample.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+	UT_ASSERT_EQ(sample.contributor_token, 9);
+	for (int i = 0; i < 2; i++) {
+		test_retention_sample.contributor_kind
+			= i == 0 ? CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK
+					 : CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_UNKNOWN;
+		UT_ASSERT(undo_horizon_sample_local_report(&sample));
+		UT_ASSERT_EQ(sample.contributor_kind,
+					 CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_REPLICATION);
+		UT_ASSERT_EQ(sample.contributor_token, 0);
+	}
+	test_retention_sample.contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT;
+	test_retention_mrp = false;
+}
+
+UT_TEST(test_local_report_refusal_clears_metadata_and_stalls_sender)
+{
+	ClusterUndoRetentionSample sample;
+	unsigned sends = test_horizon_sends;
+
+	test_retention_mrp = true;
+	test_retention_mrp_bound = InvalidScn;
+	MemSet(&sample, 0xa5, sizeof(sample));
+	UT_ASSERT(!undo_horizon_sample_local_report(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, InvalidScn);
+	UT_ASSERT_EQ(sample.clock_scn, InvalidScn);
+	UT_ASSERT_EQ(sample.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_UNKNOWN);
+	UT_ASSERT_EQ(sample.contributor_token, 0);
+	test_horizon_now += 1000001;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_horizon_sends, sends);
+	test_retention_mrp = false;
+}
+
 void
 ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
 {
@@ -1228,7 +1339,7 @@ UT_TEST(test_reason_names)
 int
 main(void)
 {
-	UT_PLAN(39);
+	UT_PLAN(44);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -1253,6 +1364,11 @@ main(void)
 	UT_RUN(test_u17b_idle_sentinel_still_proven);
 	UT_RUN(test_reason_names);
 	UT_RUN(test_original_horizon_sender_stops_only_after_all_checkpoint_cut);
+	UT_RUN(test_lmon_uses_one_typed_retention_cut);
+	UT_RUN(test_lmon_refuses_missing_typed_retention_sample);
+	UT_RUN(test_local_report_preserves_same_cut_metadata);
+	UT_RUN(test_local_report_attributes_mrp_clamp_and_clock_ties);
+	UT_RUN(test_local_report_refusal_clears_metadata_and_stalls_sender);
 	UT_RUN(test_v2_actual_ingress_accepts_current_report);
 	UT_RUN(test_v2_replay_does_not_refresh_h_or_rewind_f);
 	UT_RUN(test_v2_new_h_can_reuse_old_f_sample);

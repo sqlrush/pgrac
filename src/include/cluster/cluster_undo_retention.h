@@ -38,6 +38,20 @@
 #define CLUSTER_UNDO_RETENTION_H
 
 #include "cluster/cluster_scn.h" /* SCN */
+#include "cluster/cluster_heap_horizon.h"
+
+/* One ProcArray cut, with the clock sampled before reading any PGPROC.
+ * Contributor identity is diagnostic only, never a retention release proof.
+ * A nonzero snapshot token is pgprocno + 1 and may be reused after exit. */
+typedef struct ClusterUndoRetentionSample {
+	SCN horizon_scn;
+	SCN clock_scn;
+	ClusterHeapFreezeReportV2ContributorKind contributor_kind;
+	uint64 contributor_token;
+} ClusterUndoRetentionSample;
+
+/* Same locking/ordering as the scalar wrapper below; refusal clears out. */
+extern bool cluster_undo_retention_horizon_sample(ClusterUndoRetentionSample *out);
 
 /*
  * cluster_undo_retention_horizon -- own-instance retention lower bound:

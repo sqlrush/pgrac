@@ -64,7 +64,7 @@ TESTS = test_cluster_relation_size test_cluster_vm_read_visibility test_cluster_
         test_cluster_heap_prepare_diagnostic test_cluster_generic_version test_cluster_generic_redo \
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
         test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_ctrc_successor_fence test_cluster_ctrc_dispatch test_cluster_heap_receipt \
-        test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_pgproc_active_sample test_cluster_active_sample_fence test_cluster_ctrc_itl_reuse test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_ges_holder test_cluster_ko_relation_scan test_cluster_ko_current_admission test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop \
+        test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_pgproc_active_sample test_cluster_retention_sample test_cluster_active_sample_fence test_cluster_ctrc_itl_reuse test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_ges_holder test_cluster_ko_relation_scan test_cluster_ko_current_admission test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop \
         test_cluster_bufmgr_stop test_cluster_allocation_stop test_cluster_hw_cold test_cluster_hw_initdb test_cluster_shared_parameters test_cluster_shared_config_alter test_cluster_checkpoint_pi_tick test_cluster_native_wal_stop test_cluster_checkpointer_stop test_cluster_postmaster_stop test_cluster_xnode_profile test_cluster_adg \
         test_cluster_xnode_lever test_cluster_ges_handoff \
         test_cluster_reverse_key test_cluster_hw_lease test_cluster_pi_shadow \
@@ -418,7 +418,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_heap_cr_reuse test_cluster_snapshot_ad
 SIMPLE_TESTS := $(filter-out test_cluster_native_wal_stop test_cluster_hw_initdb test_cluster_hw_cold test_cluster_cr_inline_stop test_cluster_mrp_stop test_cluster_backup_stop test_cluster_recovery_stop test_cluster_node_remove_stop test_cluster_postmaster_stop test_cluster_checkpointer_stop test_cluster_allocation_stop test_cluster_raw_device_capacity test_cluster_replacement_wire \
 		test_cluster_external_fence test_pgrac_external_fence_protocol \
 		test_cluster_wal_retention test_cluster_terminal_ref_census test_cluster_ctrc_cleaner test_cluster_ctrc_successor_fence test_cluster_ctrc_dispatch test_cluster_heap_receipt \
-		test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_pgproc_active_sample test_cluster_active_sample_fence test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_ges_holder test_cluster_ko_relation_scan test_cluster_ko_current_admission test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop,$(SIMPLE_TESTS))
+		test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_pgproc_active_sample test_cluster_retention_sample test_cluster_active_sample_fence test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_ges_holder test_cluster_ko_relation_scan test_cluster_ko_current_admission test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop,$(SIMPLE_TESTS))
 
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 		test_pgrac_fenced_journal test_pgrac_fenced_provider \
@@ -3929,7 +3929,7 @@ test_cluster_retention: test_cluster_retention.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_UNDO_RETENTION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
 
 # spec-3.17 D6: test_cluster_stage3_acceptance — 8 static contract tests
 # (L1-L8) pinning the Stage 3 MVCC final surface (catversion / undo opcodes
@@ -8110,6 +8110,22 @@ test_cluster_pgproc_active_sample: test_cluster_pgproc_active_sample.c unit_test
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
 
+# Native retention scan: one clock and contributor from the same locked cut.
+test_cluster_retention_sample.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
+	awk '/^cluster_undo_retention_horizon_sample\(/ { print "bool"; emit=1; count++ } \
+	     /^cluster_undo_retention_horizon\(void\)$$/ { print "SCN"; emit=1; count++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (count != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_retention_sample: test_cluster_retention_sample.c unit_test.h \
+		test_cluster_pgproc_active_types.inc test_cluster_retention_sample.inc \
+		$(top_srcdir)/src/include/cluster/cluster_undo_retention.h \
+		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h $(CLUSTER_UNDO_RETENTION_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_UNDO_RETENTION_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+
 # Execute the actual admission seqlock/policy and read-only census fence.
 test_cluster_active_sample_types.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
 	awk '/^#define CLUSTER_SEMANTIC_ADMISSION_SNAPSHOT_TRIES / { print; count++ } \
@@ -8864,12 +8880,13 @@ test_cluster_snapshot_admission: test_cluster_snapshot_admission.c unit_test.h \
 
 # PGRAC: original sender and finite local report sampler, not a model of them.
 test_cluster_undo_horizon_sender.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c Makefile
-	@awk '/^static SCN$$/ { emit=1; starts++ } \
+	@awk '/^undo_horizon_sample_local_report\(/ { print "static bool"; emit=1; starts++ } \
 		emit && /^\/\* ---------------- cleaner-side/ { done=1; exit } emit { print } \
 		END { if (!done || starts != 1) exit 1 }' $< > $@
 
 test_cluster_undo_horizon: test_cluster_undo_horizon.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c \
+		$(top_srcdir)/src/include/cluster/cluster_undo_retention.h \
 		$(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_HORIZON_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
@@ -9572,3 +9589,8 @@ clean distclean maintainer-clean: clean-active-sample-fence
 clean-active-sample-fence:
 	rm -f test_cluster_active_sample_types.inc test_cluster_active_sample_types.inc.tmp
 	rm -f test_cluster_active_sample_fence.inc test_cluster_active_sample_fence.inc.tmp
+
+clean distclean maintainer-clean: clean-retention-sample
+.PHONY: clean-retention-sample
+clean-retention-sample:
+	rm -f test_cluster_retention_sample.inc test_cluster_retention_sample.inc.tmp

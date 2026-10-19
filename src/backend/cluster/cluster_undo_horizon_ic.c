@@ -452,22 +452,38 @@ cluster_undo_horizon_register_ic_msg_types(void)
  * yet rebuilt after a restart) => no report this tick: peers stall on
  * staleness, which is the conservative direction.
  */
-static SCN
-undo_horizon_sample_local_report(void)
+static bool
+undo_horizon_sample_local_report(ClusterUndoRetentionSample *out)
 {
-	SCN floor = cluster_undo_retention_horizon();
+	ClusterUndoRetentionSample sample;
 
-	if (floor == InvalidScn)
-		return InvalidScn;
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!cluster_undo_retention_horizon_sample(&sample))
+		return false;
 	if (cluster_mrp_should_start()) {
 		SCN bound = cluster_mrp_standby_consistent_scn();
+		int cmp;
 
 		if (bound == InvalidScn)
-			return InvalidScn;
-		if (scn_time_cmp(bound, floor) < 0)
-			floor = bound;
+			return false;
+		cmp = scn_time_cmp(bound, sample.horizon_scn);
+		if (cmp < 0)
+			sample.horizon_scn = bound;
+		if (cmp < 0
+			|| (cmp == 0
+				&& (sample.contributor_kind == CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK
+					|| sample.contributor_kind
+						   == CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_UNKNOWN))) {
+			sample.contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_REPLICATION;
+			/* No stable per-consumer identity is exposed by the MRP bound.
+			 * A zero diagnostic token must not become a release certificate. */
+			sample.contributor_token = 0;
+		}
 	}
-	return floor;
+	*out = sample;
+	return true;
 }
 
 void
@@ -475,8 +491,8 @@ cluster_undo_horizon_lmon_tick(void)
 {
 	static uint64 last_sent_us = 0;
 	ClusterUndoHorizonWire wire;
+	ClusterUndoRetentionSample sample;
 	uint64 now_us;
-	SCN report;
 	int pi;
 
 	if (!cluster_enabled || cluster_node_id < 0 || UndoHorizonShmem == NULL)
@@ -492,8 +508,7 @@ cluster_undo_horizon_lmon_tick(void)
 	if (last_sent_us != 0 && now_us - last_sent_us < (uint64)cluster_lmon_main_loop_interval * 1000)
 		return;
 
-	report = undo_horizon_sample_local_report();
-	if (report == InvalidScn)
+	if (!undo_horizon_sample_local_report(&sample))
 		return;
 	last_sent_us = now_us;
 
@@ -521,7 +536,7 @@ cluster_undo_horizon_lmon_tick(void)
 		if (!cluster_sf_peer_supports_undo_horizon(pi))
 			continue;
 
-		wire.horizon_scn = (uint64)report;
+		wire.horizon_scn = (uint64)sample.horizon_scn;
 
 		(void)cluster_ic_send_envelope(PGRAC_IC_MSG_UNDO_HORIZON, pi, &wire, sizeof(wire));
 		/* fire-and-forget (L456): transport retention / errors surface
