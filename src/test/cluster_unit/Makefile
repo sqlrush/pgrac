@@ -4369,7 +4369,8 @@ test_cluster_guc: test_cluster_guc.c unit_test.h $(CLUSTER_VERSION_O) \
 # cluster_elog.o (the test stubs RequestAddinShmemSpace, ShmemInitStruct,
 # GetCurrentTimestamp, and elog so no PG backend is needed).
 test_cluster_shmem: test_cluster_shmem.c unit_test.h $(CLUSTER_VERSION_O) \
-		$(CLUSTER_SHMEM_O) $(CLUSTER_GUC_O) $(CLUSTER_ELOG_O)
+		$(CLUSTER_SHMEM_O) $(CLUSTER_GUC_O) $(CLUSTER_ELOG_O) \
+		../../../src/include/cluster/cluster_relmap_retention_runtime.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_SHMEM_O) $(CLUSTER_GUC_O) $(CLUSTER_ELOG_O) -o $@
 
@@ -8590,6 +8591,9 @@ test_cluster_wal_writer: test_cluster_wal_writer.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_writer.c \
 		$(top_srcdir)/src/include/cluster/cluster_wal_writer.h \
 		test_cluster_relmap_owner.inc \
+		test_cluster_relmap_retention_runtime.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \

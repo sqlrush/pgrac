@@ -109,6 +109,7 @@
 #include "cluster/cluster_sinval.h"			 /* cluster_sinval_module_init (spec-2.38 D2/D3) */
 #include "cluster/cluster_tt_status.h"		 /* cluster_tt_status_shmem_register (spec-3.1 D2) */
 #include "cluster/cluster_tt_local.h"		 /* cluster_tt_local_shmem_register (spec-3.1 D5) */
+#include "cluster/cluster_relmap_retention_runtime.h"
 #include "cluster/cluster_tt_slot.h"		 /* cluster_tt_slot_shmem_register (spec-3.4b D3) */
 #include "cluster/cluster_tt_status_hint.h" /* cluster_tt_status_hint_shmem_register (spec-3.2 D3) */
 #include "cluster/cluster_tx_enqueue.h"		/* cluster_tx_enqueue_shmem_register (spec-5.2 D4/D6) */
@@ -491,6 +492,10 @@ cluster_init_shmem_module(void)
 	 */
 	if (cluster_shmem_lookup_region("pgrac cluster tt local seq") == NULL)
 		cluster_tt_local_shmem_register();
+
+	/* D3: volatile original-origin pending coordination, born UNKNOWN. */
+	if (cluster_shmem_lookup_region("pgrac relmap retention") == NULL)
+		cluster_relmap_retention_runtime_shmem_register();
 
 	/*
 	 * spec-3.4b D3:  register per-segment TT slot allocator shmem

@@ -1,0 +1,266 @@
+/* PGRAC: actual shared retention birth/attach and original-owner routing.
+ * Shmem, LWLock, native authority and TT publication are controlled providers.
+ * COMPLETE/floor/issued values below are fixtures, not runtime certification.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+#include "cluster/cluster_relmap_retention_runtime.h"
+#include "cluster/cluster_shmem.h"
+#include "storage/shmem.h"
+
+static const ClusterShmemRegion *relmap_runtime_registered;
+static void *relmap_runtime_allocation;
+static Size relmap_runtime_bytes;
+static unsigned relmap_runtime_new_tranches, relmap_runtime_lock_inits;
+static unsigned relmap_runtime_tranche_registrations;
+
+#include "../../backend/cluster/cluster_relmap_retention_runtime.c"
+
+void
+cluster_shmem_register_region(const ClusterShmemRegion *region)
+{
+	relmap_runtime_registered = region;
+}
+
+void *
+ShmemInitStruct(const char *name, Size size, bool *found)
+{
+	if (relmap_retention_held || !relmap_runtime_registered
+		|| strcmp(name, relmap_runtime_registered->name) != 0
+		|| size != relmap_runtime_registered->size_fn())
+		abort();
+	*found = relmap_runtime_allocation != NULL;
+	if (!*found) {
+		relmap_runtime_allocation = malloc(size);
+		if (!relmap_runtime_allocation)
+			abort();
+		relmap_runtime_bytes = size;
+		memset(relmap_runtime_allocation, 0xa5, size);
+	} else if (size != relmap_runtime_bytes)
+		abort();
+	return relmap_runtime_allocation;
+}
+
+int
+LWLockNewTrancheId(void)
+{
+	relmap_runtime_new_tranches++;
+	return 201;
+}
+
+void
+LWLockInitialize(LWLock *lock, int tranche)
+{
+	if (tranche != 201 || relmap_runtime_lock_inits != 0)
+		abort();
+	relmap_runtime_lock_inits++;
+	memset(lock, 0, sizeof(*lock));
+	lock->tranche = tranche;
+	relmap_runtime_test_lock = lock;
+}
+
+void
+LWLockRegisterTranche(int tranche, const char *name)
+{
+	if (tranche != 201 || strcmp(name, "ClusterRelmapRetention") != 0)
+		abort();
+	relmap_runtime_tranche_registrations++;
+}
+
+static void
+relmap_runtime_fixture(bool attach)
+{
+	cluster_node_id = 0;
+	relmap_owner_fixture();
+	free(relmap_runtime_allocation);
+	relmap_runtime_allocation = NULL;
+	relmap_runtime_registered = NULL;
+	relmap_runtime_shmem = NULL;
+	relmap_runtime_test_lock = NULL;
+	relmap_runtime_bytes = 0;
+	relmap_runtime_new_tranches = relmap_runtime_lock_inits = 0;
+	relmap_runtime_tranche_registrations = 0;
+	cluster_relmap_retention_runtime_shmem_register();
+	if (attach)
+		relmap_runtime_registered->init_fn();
+}
+
+static void
+relmap_runtime_qualified_fixture(unsigned origin)
+{
+	ClusterRelmapRetentionDirectory *directory = &relmap_runtime_shmem->directories[origin];
+	/* Only test setup supplies a qualified COMPLETE origin; no product API does. */
+	LWLockAcquire(relmap_runtime_test_lock, LW_EXCLUSIVE);
+	UT_ASSERT_EQ(cluster_relmap_retention_build_start(directory,
+		ref.claim.identity.system_identifier, ref.claim.database_incarnation, origin, 7,
+		relmap_top_full - 100, relmap_top_full + 100), CLUSTER_RELMAP_RETENTION_OK);
+	UT_ASSERT_EQ(cluster_relmap_retention_build_finish(directory), CLUSTER_RELMAP_RETENTION_OK);
+	LWLockRelease(relmap_runtime_test_lock);
+	relmap_retention_acquires = 0;
+}
+
+UT_TEST(test_relmap_runtime_refuses_before_attachment)
+{
+	ClusterRelmapOwnerSampleV2 sample;
+	ClusterRelmapV2Namespace identity;
+	relmap_runtime_fixture(false);
+	UT_ASSERT(cluster_relmap_owner_capture_v2(&sample));
+	identity = relmap_owner_namespace();
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_begin_v2(&sample, &identity, 8),
+		CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+	UT_ASSERT_EQ(relmap_binding_reads + relmap_retention_acquires, 0);
+	UT_ASSERT_EQ(relmap_assign_calls, 1);
+}
+
+UT_TEST(test_relmap_runtime_birth_is_unknown_and_one_lock)
+{
+	ClusterRelmapRetentionDirectory zero = { 0 };
+	relmap_runtime_fixture(true);
+	UT_ASSERT_EQ(relmap_runtime_registered->lwlock_count, 1);
+	UT_ASSERT_EQ(relmap_runtime_registered->reserved_flags, 0);
+	UT_ASSERT_EQ(relmap_runtime_bytes, MAXALIGN(sizeof(*relmap_runtime_shmem)));
+	UT_ASSERT_EQ(relmap_runtime_new_tranches, 1);
+	UT_ASSERT_EQ(relmap_runtime_lock_inits, 1);
+	UT_ASSERT_EQ(relmap_runtime_tranche_registrations, 1);
+	UT_ASSERT(relmap_runtime_test_lock == &relmap_runtime_shmem->lock);
+	for (unsigned i = 0; i < CLUSTER_MAX_NODES; i++)
+		UT_ASSERT_EQ(memcmp(&relmap_runtime_shmem->directories[i], &zero, sizeof(zero)), 0);
+}
+
+UT_TEST(test_relmap_runtime_unknown_never_adds_pin)
+{
+	ClusterRelmapOwnerSampleV2 sample;
+	ClusterRelmapV2Namespace identity;
+	ClusterRelmapRetentionDirectory before;
+	relmap_runtime_fixture(true);
+	UT_ASSERT(cluster_relmap_owner_capture_v2(&sample));
+	identity = relmap_owner_namespace();
+	before = relmap_runtime_shmem->directories[0];
+	relmap_have_binding = true;
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_begin_v2(&sample, &identity, 8),
+		CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+	UT_ASSERT_EQ(memcmp(&before, &relmap_runtime_shmem->directories[0], sizeof(before)), 0);
+	UT_ASSERT_EQ(relmap_retention_acquires, 1);
+	UT_ASSERT_EQ(relmap_binding_reads, 1);
+	UT_ASSERT(!relmap_retention_held);
+}
+
+UT_TEST(test_relmap_runtime_routes_original_origin_and_inherits_binding)
+{
+	for (unsigned origin = 0; origin < CLUSTER_MAX_NODES; origin += CLUSTER_MAX_NODES - 1) {
+		ClusterRelmapOwnerSampleV2 sample;
+		ClusterRelmapV2Namespace identity;
+		ClusterRelmapRetentionDirectory *directory;
+		relmap_runtime_fixture(true);
+		cluster_node_id = ref.claim.identity.origin_node_id = origin;
+		ref.claim.identity.origin_thread_id = origin + 1;
+		UT_ASSERT(cluster_relmap_owner_capture_v2(&sample));
+		identity = relmap_owner_namespace();
+		relmap_binding.origin_instance = origin + 1;
+		relmap_runtime_qualified_fixture(origin);
+		directory = &relmap_runtime_shmem->directories[origin];
+		relmap_have_binding = true;
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_begin_v2(&sample, &identity, 8),
+			CLUSTER_RELMAP_RETENTION_OK);
+		relmap_have_binding = false; /* same full's existing original receipt survives */
+		identity.shared = true;
+		identity.dbid = InvalidOid; /* a distinct namespace, not a competing generation */
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_begin_v2(&sample, &identity, 9),
+			CLUSTER_RELMAP_RETENTION_OK);
+		UT_ASSERT_EQ(directory->pins[0].key.origin, origin);
+		UT_ASSERT_EQ(directory->pins[0].key.top_full_xid, sample.owner.top_full_xid);
+		UT_ASSERT_EQ(directory->pins[1].key.generation, 9);
+		UT_ASSERT(directory->pins[0].has_tt_binding && directory->pins[1].has_tt_binding);
+		UT_ASSERT_EQ(memcmp(&directory->pins[1].binding, &relmap_binding, sizeof(relmap_binding)), 0);
+		UT_ASSERT_EQ(relmap_runtime_shmem->directories[origin == 0 ? 1 : 0].state,
+			CLUSTER_RELMAP_RETENTION_UNKNOWN);
+		UT_ASSERT_EQ(relmap_retention_acquires, 2);
+		UT_ASSERT_EQ(relmap_assign_calls, 1);
+		UT_ASSERT_EQ(sync_calls + rename_calls, 0);
+	}
+}
+
+UT_TEST(test_relmap_runtime_preserves_pins_and_reservation_on_attach)
+{
+	ClusterRelmapOwnerSampleV2 sample;
+	ClusterRelmapV2Namespace identity;
+	ClusterRelmapRetentionTruncate reservation;
+	ClusterRelmapRetentionDirectory *directory;
+	void *before;
+	relmap_runtime_fixture(true);
+	UT_ASSERT(cluster_relmap_owner_capture_v2(&sample));
+	identity = relmap_owner_namespace();
+	relmap_runtime_qualified_fixture(0);
+	relmap_have_binding = true;
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_begin_v2(&sample, &identity, 8),
+		CLUSTER_RELMAP_RETENTION_OK);
+	directory = &relmap_runtime_shmem->directories[0];
+	LWLockAcquire(relmap_runtime_test_lock, LW_EXCLUSIVE);
+	UT_ASSERT_EQ(cluster_relmap_retention_stage_start(directory, &directory->pins[0].key, 900),
+		CLUSTER_RELMAP_RETENTION_OK);
+	UT_ASSERT_EQ(cluster_relmap_retention_truncate_begin(directory, relmap_top_full + 10,
+		&reservation), CLUSTER_RELMAP_RETENTION_OK);
+	LWLockRelease(relmap_runtime_test_lock);
+	before = malloc(relmap_runtime_bytes);
+	UT_ASSERT_NOT_NULL(before);
+	memcpy(before, relmap_runtime_shmem, relmap_runtime_bytes);
+	relmap_runtime_shmem = NULL; /* EXEC_BACKEND-like process-local rebind */
+	relmap_runtime_registered->init_fn();
+	UT_ASSERT(relmap_runtime_shmem == relmap_runtime_allocation);
+	UT_ASSERT_EQ(memcmp(before, relmap_runtime_shmem, relmap_runtime_bytes), 0);
+	UT_ASSERT_EQ(relmap_runtime_new_tranches, 1);
+	UT_ASSERT_EQ(relmap_runtime_lock_inits, 1);
+	UT_ASSERT_EQ(relmap_runtime_tranche_registrations, 2);
+	free(before);
+}
+
+UT_TEST(test_relmap_runtime_rejects_incompatible_attachment)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		void *before;
+		relmap_runtime_fixture(true);
+		if (fault == 0) relmap_runtime_shmem->magic++;
+		if (fault == 1) relmap_runtime_shmem->version++;
+		if (fault == 2) relmap_runtime_shmem->bytes++;
+		if (fault == 3) relmap_runtime_shmem->tranche = 0;
+		before = malloc(relmap_runtime_bytes);
+		UT_ASSERT_NOT_NULL(before);
+		memcpy(before, relmap_runtime_shmem, relmap_runtime_bytes);
+		expect_panic = true;
+		if (sigsetjmp(native_error, 1) == 0) {
+			relmap_runtime_registered->init_fn();
+			UT_ASSERT(false);
+		}
+		expect_panic = false;
+		UT_ASSERT(relmap_runtime_shmem == NULL);
+		UT_ASSERT_EQ(memcmp(before, relmap_runtime_allocation, relmap_runtime_bytes), 0);
+		UT_ASSERT_EQ(relmap_runtime_lock_inits, 1);
+		UT_ASSERT_EQ(relmap_runtime_tranche_registrations, 1);
+		free(before);
+	}
+}
+
+UT_TEST(test_relmap_runtime_keeps_original_owner_refusals)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		ClusterRelmapOwnerSampleV2 sample;
+		ClusterRelmapV2Namespace identity;
+		ClusterRelmapRetentionDirectory before;
+		relmap_runtime_fixture(true);
+		UT_ASSERT(cluster_relmap_owner_capture_v2(&sample));
+		identity = relmap_owner_namespace();
+		relmap_runtime_qualified_fixture(0);
+		before = relmap_runtime_shmem->directories[0];
+		if (fault == 0) sample.owner.node = CLUSTER_MAX_NODES;
+		if (fault == 1) sample.owner.node = 1;
+		if (fault == 2) identity.database_incarnation++;
+		if (fault == 3) relmap_local_lock = true;
+		if (fault == 4) relmap_retention_held = true;
+		if (fault == 5) epoch++;
+		if (fault == 6) relmap_binding_drift = true;
+		UT_ASSERT_NE(cluster_relmap_retention_runtime_begin_v2(&sample, &identity, 8),
+			CLUSTER_RELMAP_RETENTION_OK);
+		UT_ASSERT_EQ(memcmp(&before, &relmap_runtime_shmem->directories[0], sizeof(before)), 0);
+		UT_ASSERT_EQ(relmap_retention_acquires, 0);
+		UT_ASSERT_EQ(relmap_assign_calls, 1);
+	}
+}

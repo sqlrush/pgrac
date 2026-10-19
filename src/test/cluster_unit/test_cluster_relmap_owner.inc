@@ -58,7 +58,7 @@ GetWALInsertionTimeLine(void)
 bool
 LWLockHeldByMe(LWLock *lock)
 {
-	if (lock == &relmap_retention_lock)
+	if (lock == &relmap_retention_lock || lock == relmap_runtime_test_lock)
 		return relmap_retention_held;
 	return lock == RelationMappingLock && relmap_local_lock;
 }

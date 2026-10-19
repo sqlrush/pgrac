@@ -57,6 +57,7 @@ pg_re_throw(void)
 static LWLockPadded test_lwlocks[NUM_INDIVIDUAL_LWLOCKS];
 LWLockPadded *MainLWLockArray = test_lwlocks;
 static LWLock relmap_retention_lock;
+static LWLock *relmap_runtime_test_lock;
 static bool relmap_retention_held;
 static unsigned relmap_retention_acquires;
 static void relmap_retention_lock_enter(void);
@@ -207,7 +208,7 @@ errstart(int level, const char *domain pg_attribute_unused())
 {
 	if (level == DEBUG1)
 		return false;
-	if (!expect_panic || (level != PANIC && level != ERROR))
+	if (!expect_panic || (level != PANIC && level != ERROR && level != FATAL))
 		abort();
 	return true;
 }
@@ -367,7 +368,7 @@ LWLockAcquire(LWLock *l, LWLockMode mode)
 {
 	bool *state = l == WALWriteLock ? &held : &mapping_held;
 
-	if (l == &relmap_retention_lock) {
+	if (l == &relmap_retention_lock || l == relmap_runtime_test_lock) {
 		if (mode != LW_EXCLUSIVE || relmap_retention_held)
 			abort();
 		relmap_retention_lock_enter();
@@ -394,7 +395,7 @@ LWLockRelease(LWLock *l)
 {
 	bool *state = l == WALWriteLock ? &held : &mapping_held;
 
-	if (l == &relmap_retention_lock) {
+	if (l == &relmap_retention_lock || l == relmap_runtime_test_lock) {
 		if (!relmap_retention_held)
 			abort();
 		relmap_retention_held = false;
@@ -1413,11 +1414,12 @@ UT_TEST(test_requested_flush_rejects_foreign_or_unsafe_context_without_io)
 }
 
 #include "test_cluster_relmap_owner.inc"
+#include "test_cluster_relmap_retention_runtime.inc"
 
 int
 main(void)
 {
-	UT_PLAN(43);
+	UT_PLAN(50);
 	UT_RUN(test_clean_writer_requires_selected_exit_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_requires_selected_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_keeps_runtime_fence_and_exact_owner_refusals);
@@ -1461,6 +1463,14 @@ main(void)
 	UT_RUN(test_relmap_owner_retention_rejects_foreign_namespace_and_arguments);
 	UT_RUN(test_relmap_owner_retention_rechecks_after_original_binding_read);
 	UT_RUN(test_relmap_owner_retention_preserves_core_refusals);
+	UT_RUN(test_relmap_runtime_refuses_before_attachment);
+	UT_RUN(test_relmap_runtime_birth_is_unknown_and_one_lock);
+	UT_RUN(test_relmap_runtime_unknown_never_adds_pin);
+	UT_RUN(test_relmap_runtime_routes_original_origin_and_inherits_binding);
+	UT_RUN(test_relmap_runtime_preserves_pins_and_reservation_on_attach);
+	UT_RUN(test_relmap_runtime_rejects_incompatible_attachment);
+	UT_RUN(test_relmap_runtime_keeps_original_owner_refusals);
+	free(relmap_runtime_allocation);
 	if (scratch[0] && !rmtree(scratch, true))
 		abort();
 	pfree(cluster_wal_threads_dir);
