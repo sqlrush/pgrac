@@ -144,6 +144,7 @@ TESTS = test_cluster_vm_read_visibility test_cluster_heap_maintenance test_clust
 		test_cluster_cold_recovery_space test_cluster_cold_recovery_space_refail \
 		test_cluster_cold_recovery_decode test_cluster_cold_recovery_effects \
 		test_cluster_cold_recovery_xid \
+		test_cluster_cold_recovery_eor \
 		test_cluster_cold_recovery_startup test_cluster_cold_tt_base test_cluster_cold_tt_redo \
 		test_cluster_cold_recovery_refail \
 		test_cluster_cold_recovery_replay \
@@ -463,6 +464,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_generic_version test_cluster_generic_r
 SIMPLE_TESTS := $(filter-out test_cluster_wal_checkpoint_sample,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_wal_retained_cut test_cluster_wal_retained_cut_records,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_cold_recovery_xid,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_cold_recovery_eor,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_inplace_version test_cluster_heap_maintenance_version,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_vm_visible_version,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_btree_build_version,$(SIMPLE_TESTS))
@@ -9176,6 +9178,19 @@ test_cluster_cold_recovery_decode: test_cluster_cold_recovery_decode.c unit_test
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
+# Exercise Startup's original replay-input lifetime across EOR and exit.
+test_cluster_cold_eor_inputs.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile
+	awk '/^cluster_recovery_cold_inputs_(cleanup|retain|handoff)\(/ { print "static void"; emit=1; count++ } \
+	     /^ClusterReleaseColdRecoveryInputs\(/ { print "void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 4) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cold_recovery_eor: test_cluster_cold_recovery_eor.c unit_test.h \
+		test_cluster_cold_eor_inputs.inc $(top_srcdir)/src/include/access/xlogrecovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
 # Exercise the original Startup C0 dependency adapter with real decoding.
 test_cluster_cold_dependency.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile
 	awk '/^cluster_typed_replay_dependency\(/ { print "static bool"; emit=1; count++ } emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
@@ -9237,6 +9252,7 @@ test_cluster_cold_source_completion.inc: $(top_srcdir)/src/backend/cluster/clust
 test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_test.h $(CLUSTER_COLD_STARTUP_O) \
 		test_cluster_cold_source_completion.inc \
 		test_cluster_cold_endpoints.h test_cluster_cold_recovery_xid_core.o \
+		test_cluster_cold_recovery_replay_core.o \
 		test_cluster_cold_recovery_startup_boundary.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
@@ -9244,7 +9260,7 @@ test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_te
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_census.h \
 		cluster_unit_port_stubs.o $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_STARTUP_O) \
-		test_cluster_cold_recovery_xid_core.o \
+		test_cluster_cold_recovery_xid_core.o test_cluster_cold_recovery_replay_core.o \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 D_COLD_REFAIL_O = test_cluster_cold_recovery_refail_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)

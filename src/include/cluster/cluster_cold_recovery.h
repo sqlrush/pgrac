@@ -569,6 +569,19 @@ typedef struct ClusterColdXidProgressV1 {
 	bool failed;
 } ClusterColdXidProgressV1;
 
+/* Attempt-local counter inputs published only by the original endpoint
+ * owner after every source and the post-redo inventory pass their final
+ * readback. The sealed plan binds the physical cuts; the copied sources
+ * bind the selected claims/namespaces. This is not fresh execution authority. */
+typedef struct ClusterColdXidReceiptV1 {
+	const ClusterColdPlanV1 *plan;
+	uint64 system_identifier;
+	uint32 participant_count;
+	uint32 replay_count;
+	ClusterWalSourceRef sources[CLUSTER_COLD_MAX_PARTICIPANTS];
+	uint64 next_xid[CLUSTER_COLD_MAX_PARTICIPANTS];
+} ClusterColdXidReceiptV1;
+
 extern bool cluster_cold_xid_begin_v1(ClusterColdXidProgressV1 *progress,
 									 const ClusterColdParticipantV1 *source,
 									 uint64 checkpoint_next_xid, uint64 expected_records);
@@ -822,6 +835,7 @@ typedef struct ClusterColdTypedV1 {
 	/* Full-width maximum of every original counter endpoint after replay
 	 * and the caller's durability barrier. No TT/top/loser authority. */
 	uint64 xid_next_after_redo;
+	ClusterColdXidReceiptV1 xid_receipt;
 	ClusterColdEffectsReceiptV1 effects_receipt;
 	/* Read-only pass-1 inputs for history generations. Their source redo is
 	 * the original checkpoint's, not the history mutation cut at tail. No
@@ -843,6 +857,11 @@ typedef struct ClusterColdTypedV1 {
 	ClusterColdParticipantV1 participants[CLUSTER_COLD_MAX_PARTICIPANTS];
 	ClusterWalSourceRef sources[CLUSTER_COLD_MAX_PARTICIPANTS];
 } ClusterColdTypedV1;
+
+/* Read the retained original all-source counter maximum. Refuse a missing,
+ * partial or mismatched receipt and zero the output. This only checks the
+ * retained inputs; it does not reacquire a fence or revalidate disk sources. */
+extern bool cluster_cold_typed_xid_maximum_v1(const ClusterColdTypedV1 *typed, uint64 *next_xid);
 
 extern ClusterColdTypedV1 *cluster_cold_typed_prepare_v1(struct ClusterRecoveryFencePlan *fence,
 														 uint16 own_thread, XLogRecPtr own_redo);
@@ -954,20 +973,57 @@ extern bool cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
 									 TransactionId oldest_xid, uint64 recoverer_epoch,
 									 ClusterRecoveryTTAbortDerivationV1 *out);
 
+/* Revalidate the original selected ROOTs, sources, checkpoints and retained
+ * history inside the caller's still-held pass-2 fence/serial set. No refresh
+ * or authority acquisition: failure invalidates this attempt's cached input.
+ * This is not a post-EOR recovery-writer grant. */
+extern bool cluster_cold_typed_sources_current_v1(ClusterColdTypedV1 *typed,
+												  struct ClusterRecoveryFencePlan *fence);
+
 /* Producer boundary for one original TT owner.  Locate the post-redo header
  * by physical owner/segment, require the complete ordinary TT/UNDO inventory
  * and all original sources, then verify the selected sealed fold and exact
- * slot before-image and consume the original producer's TopTxProof/shape gates.
+ * slot before-image. Require this original owner's captured native checkpoint
+ * to agree with its exact source, ROOT and selected redo interval. This input
+ * check alone does not qualify TT base coverage.
+ * Recheck the original post-redo physical namespace, inode identities and
+ * retained TT/UNDO bytes before consuming cached images and before publishing
+ * output. A mismatch invalidates that snapshot and leaves output zero. These
+ * checks alone do not establish source/ROOT freshness or old-writer isolation.
+ * Require the original owner to revalidate every selected source/ROOT and its
+ * still-held execution fence before reading cached inputs and before publishing
+ * the candidate. This produces only an input descriptor, not C0 write authority.
+ * Derive producer_top from this source's exact native
+ * canonical BIND; the caller's producer_top bit is ignored. Derive
+ * qualified_base from the same source's complete native INIT/REUSE header
+ * fold with no captured predecessor, requiring full-page agreement with the
+ * verified post-redo image. The caller's qualified_base bit is ignored.
+ * Older ACTIVE generations without this retained lifecycle remain blocked
+ * pending their original canonical checkpoint-base coverage producer.
+ * Derive sealed_redo from the original all-record completion receipt,
+ * bound to this exact plan and complete source set by the all-thread
+ * endpoint receipt, with the verified ordinary inventory. The caller's
+ * sealed_redo bit is ignored. This does not discharge ordinary_effects,
+ * terminal_match or old_writer_isolated.
+ * Other proof/shape gates remain independent and required. An older ACTIVE
+ * without a retained BIND remains blocked pending the original qualified
+ * canonical-base producer;
+ * this does not introduce a BIND lifetime retention requirement.
+ * Reject exact native COMMIT/TT_ABORT conflicts in every sealed source,
+ * including history-only retained incarnations of the same thread. Absence
+ * of those conflicts does not supply the independent terminal_match proof.
  * Target incarnation/claim remain bound to the original source.  A new
  * header with no original base requires the native full-image proof.
- * The aggregate endpoint is the already-computed typed->xid_next_after_redo;
- * a missing endpoint, post-redo image, proof gate or exact shape refuses.
+ * The original endpoint receipt must cover the unchanged complete source
+ * set and agree with typed->xid_next_after_redo; a missing endpoint,
+ * post-redo image, proof gate or exact shape refuses.
  * No proof bit is synthesized from source-drained state, current epoch or
  * graph shape, and no old C0 replay consumer is called here. */
 extern bool cluster_cold_typed_top_tx_c0_producer_v1(
-	const ClusterColdTypedV1 *typed, uint32 participant, const ClusterColdTopTxProofV1 *proof,
-	const ClusterRecoveryTTAbortV1 *shape, bool all_endpoints_complete, bool has_oldest_xid,
-	TransactionId oldest_xid, uint64 recoverer_epoch, ClusterColdTopTxC0ProducerResultV1 *out);
+	ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence, uint32 participant,
+	const ClusterColdTopTxProofV1 *proof, const ClusterRecoveryTTAbortV1 *shape,
+	bool has_oldest_xid, TransactionId oldest_xid, uint64 recoverer_epoch,
+	ClusterColdTopTxC0ProducerResultV1 *out);
 
 /* Re-enumerate physical TT after complete redo and the original durability
  * barrier, without overwriting the pre-redo base. Share its remaining budget.

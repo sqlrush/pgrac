@@ -261,6 +261,40 @@ cluster_cold_typed_effects_ready_v1(const ClusterColdTypedV1 *typed)
 													 typed->participant_count);
 }
 
+bool
+cluster_cold_typed_xid_maximum_v1(const ClusterColdTypedV1 *typed, uint64 *next_xid)
+{
+	const ClusterColdXidReceiptV1 *receipt;
+	uint64 maximum = 0;
+
+	if (next_xid == NULL)
+		return false;
+	*next_xid = 0;
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK || typed->plan == NULL
+		|| typed->own_participant != 0 || typed->replay_count == 0
+		|| typed->replay_count > typed->participant_count
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS)
+		return false;
+	receipt = &typed->xid_receipt;
+	if (receipt->plan != typed->plan || receipt->participant_count != typed->participant_count
+		|| receipt->replay_count != typed->replay_count
+		|| receipt->system_identifier != typed->system_identifier
+		|| cluster_cold_plan_participant_count_v1(typed->plan) != typed->participant_count)
+		return false;
+	for (uint32 p = 0; p < typed->participant_count; p++) {
+		if (!cluster_cold_plan_participant_matches_v1(typed->plan, p, &typed->participants[p])
+			|| memcmp(&receipt->sources[p], &typed->sources[p], sizeof(receipt->sources[p])) != 0
+			|| !TransactionIdIsNormal((TransactionId)receipt->next_xid[p]))
+			return false;
+		if (receipt->next_xid[p] > maximum)
+			maximum = receipt->next_xid[p];
+	}
+	if (maximum != typed->xid_next_after_redo)
+		return false;
+	*next_xid = maximum;
+	return true;
+}
+
 ClusterColdPageActionV1
 cluster_cold_page_action_v1(const ClusterColdStepV1 *step, bool own)
 {

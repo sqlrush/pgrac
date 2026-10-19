@@ -99,6 +99,101 @@ UT_TEST(test_endpoints_include_every_history_generation_original_checkpoint_cut)
 	endpoint_destroy(&typed);
 }
 
+UT_TEST(test_endpoints_receipt_requires_original_completion)
+{
+	ClusterColdTypedV1 *typed = endpoint_fixture(true);
+	uint64 next = UINT64_MAX;
+
+	/* A retained aggregate alone does not prove all-source completion. */
+	typed->xid_next_after_redo = UINT64_C(0x900000009);
+	UT_ASSERT(!cluster_cold_typed_xid_maximum_v1(typed, &next));
+	UT_ASSERT_EQ(next, 0);
+	UT_ASSERT(endpoint_finish(typed));
+	UT_ASSERT(cluster_cold_typed_xid_maximum_v1(typed, &next));
+	UT_ASSERT_EQ(next, UINT64_C(0x900000009));
+	UT_ASSERT_EQ(typed->xid_receipt.next_xid[0], UINT64_C(0x200000100));
+	UT_ASSERT_EQ(typed->xid_receipt.next_xid[2], UINT64_C(0x300000005));
+	UT_ASSERT_EQ(typed->xid_receipt.next_xid[3], UINT64_C(0x900000009));
+	/* EOR may retain these inputs after releasing the execution window.
+	 * Reading them neither reacquires a fence nor grants write authority. */
+	cluster_cold_replay_window_leave_v1();
+	UT_ASSERT(cluster_cold_typed_xid_maximum_v1(typed, &next));
+	UT_ASSERT_EQ(next, UINT64_C(0x900000009));
+	cluster_cold_replay_window_enter_v1();
+	endpoint_destroy(&typed);
+}
+
+UT_TEST(test_endpoints_receipt_refuses_changed_retained_inputs)
+{
+	ClusterColdTypedV1 *typed = endpoint_fixture(true);
+	ClusterColdPlanV1 *plan = typed->plan;
+	uint32 count = typed->participant_count, replay_count = typed->replay_count;
+	ClusterColdParticipantV1 source = typed->participants[count - 1];
+	ClusterWalSourceRef claim = typed->sources[count - 1];
+	uint64 system_identifier = typed->system_identifier;
+
+	UT_ASSERT(endpoint_finish(typed));
+	for (int fault = 0; fault < 12; fault++) {
+		uint64 next = UINT64_MAX;
+		uint64 endpoint = typed->xid_receipt.next_xid[count - 1];
+
+		switch (fault) {
+		case 0:
+			typed->plan = NULL;
+			break;
+		case 1:
+			typed->participant_count--;
+			break;
+		case 2:
+			typed->participant_count = CLUSTER_COLD_MAX_PARTICIPANTS + 1;
+			break;
+		case 3:
+			typed->replay_count = 0;
+			break;
+		case 4:
+			typed->replay_count--;
+			break;
+		case 5:
+			typed->own_participant = 1;
+			break;
+		case 6:
+			typed->system_identifier++;
+			break;
+		case 7:
+			typed->participants[count - 1].tail_end++;
+			break;
+		case 8:
+			typed->sources[count - 1].claim.claim_sha256[0] ^= 1;
+			break;
+		case 9:
+			typed->xid_next_after_redo++;
+			break;
+		case 10:
+			typed->refusal = CLUSTER_COLD_SOURCE_GAP;
+			break;
+		case 11:
+			typed->xid_receipt.next_xid[count - 1] = 0;
+			break;
+		}
+		UT_ASSERT(!cluster_cold_typed_xid_maximum_v1(typed, &next));
+		UT_ASSERT_EQ(next, 0);
+		typed->plan = plan;
+		typed->participant_count = count;
+		typed->replay_count = replay_count;
+		typed->own_participant = 0;
+		typed->system_identifier = system_identifier;
+		typed->participants[count - 1] = source;
+		typed->sources[count - 1] = claim;
+		typed->xid_next_after_redo = UINT64_C(0x900000009);
+		typed->refusal = CLUSTER_COLD_OK;
+		typed->xid_receipt.next_xid[count - 1] = endpoint;
+		UT_ASSERT(cluster_cold_typed_xid_maximum_v1(typed, &next));
+		UT_ASSERT_EQ(next, UINT64_C(0x900000009));
+	}
+	UT_ASSERT(!cluster_cold_typed_xid_maximum_v1(typed, NULL));
+	endpoint_destroy(&typed);
+}
+
 UT_TEST(test_endpoints_reject_partial_or_conflicting_replay_counters)
 {
 	for (int fault = 0; fault < 11; fault++) {
@@ -142,6 +237,8 @@ UT_TEST(test_endpoints_reject_partial_or_conflicting_replay_counters)
 		typed->xid_next_after_redo = 99;
 		UT_ASSERT(!endpoint_finish(typed));
 		UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+		UT_ASSERT_NULL(typed->xid_receipt.plan);
+		UT_ASSERT_EQ(typed->xid_receipt.next_xid[0], 0);
 		UT_ASSERT_EQ(typed->xid_next_at_drain[0], 0);
 		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
 		UT_ASSERT(!endpoint_finish(typed));
@@ -188,6 +285,8 @@ UT_TEST(test_endpoints_reject_missing_or_tail_only_history_inputs)
 		}
 		UT_ASSERT(!endpoint_finish(typed));
 		UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+		UT_ASSERT_NULL(typed->xid_receipt.plan);
+		UT_ASSERT_EQ(typed->xid_receipt.next_xid[0], 0);
 		UT_ASSERT_EQ(typed->history_xid[3].next_xid, 0);
 		UT_ASSERT(!typed->census_root_captured);
 		endpoint_destroy(&typed);
@@ -229,6 +328,8 @@ UT_TEST(test_endpoints_require_whole_sequencer_completion_and_exact_tails)
 		}
 		UT_ASSERT(!endpoint_finish(typed));
 		UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+		UT_ASSERT_NULL(typed->xid_receipt.plan);
+		UT_ASSERT_EQ(typed->xid_receipt.next_xid[0], 0);
 		endpoint_destroy(&typed);
 	}
 }
@@ -262,6 +363,8 @@ UT_TEST(test_endpoints_require_current_original_owner_and_all_sources)
 		}
 		UT_ASSERT(!endpoint_finish(typed));
 		UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+		UT_ASSERT_NULL(typed->xid_receipt.plan);
+		UT_ASSERT_EQ(typed->xid_receipt.next_xid[0], 0);
 		UT_ASSERT_EQ(typed->history_xid[3].next_xid, 0);
 		endpoint_destroy(&typed);
 	}
@@ -273,6 +376,8 @@ UT_TEST(test_endpoints_recheck_original_sources_before_publishing_maximum)
 	history_checkpoint_fault = 3;
 	UT_ASSERT(!endpoint_finish(typed));
 	UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+	UT_ASSERT_NULL(typed->xid_receipt.plan);
+	UT_ASSERT_EQ(typed->xid_receipt.next_xid[0], 0);
 	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
 	endpoint_destroy(&typed);
 }
@@ -295,6 +400,8 @@ UT_TEST(test_endpoints_error_discards_group_and_preserves_prior_refusal)
 	PG_END_TRY();
 	UT_ASSERT(caught);
 	UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+	UT_ASSERT_NULL(typed->xid_receipt.plan);
+	UT_ASSERT_EQ(typed->xid_receipt.next_xid[0], 0);
 	UT_ASSERT_EQ(typed->xid_next_at_drain[0], 0);
 	UT_ASSERT_EQ(typed->history_xid[3].next_xid, 0);
 	typed->refusal = CLUSTER_COLD_SPACE_REFUSED;
@@ -311,10 +418,14 @@ UT_TEST(test_endpoints_new_sync_invalidates_previous_aggregate)
 	UT_ASSERT(
 		cluster_cold_typed_sync_sources_v1(typed, (ClusterRecoveryFencePlan *)&fixture_context));
 	UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+	UT_ASSERT_NULL(typed->xid_receipt.plan);
+	UT_ASSERT_EQ(typed->xid_receipt.next_xid[0], 0);
 	UT_ASSERT(!tt_after_captured);
 	UT_ASSERT_EQ(tt_after_resets, 1);
 	UT_ASSERT(!endpoint_finish(typed));
 	UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+	UT_ASSERT_NULL(typed->xid_receipt.plan);
+	UT_ASSERT_EQ(typed->xid_receipt.next_xid[0], 0);
 	endpoint_destroy(&typed);
 }
 
@@ -358,6 +469,8 @@ UT_TEST(test_endpoints_inventory_refusal_discards_all_attempt_inputs)
 	UT_ASSERT_EQ(tt_after_rechecks, 0);
 	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
 	UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+	UT_ASSERT_NULL(typed->xid_receipt.plan);
+	UT_ASSERT_EQ(typed->xid_receipt.next_xid[0], 0);
 	UT_ASSERT_EQ(typed->xid_next_at_drain[0], 0);
 	UT_ASSERT_EQ(typed->history_xid[3].next_xid, 0);
 	UT_ASSERT(!tt_after_captured && !typed->census_root_captured);
@@ -391,6 +504,8 @@ UT_TEST(test_endpoints_inventory_rechecks_files_sources_and_cleans_error)
 		UT_ASSERT_EQ(tt_after_rechecks, fault == 3 ? 0 : 1);
 		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
 		UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+		UT_ASSERT_NULL(typed->xid_receipt.plan);
+		UT_ASSERT_EQ(typed->xid_receipt.next_xid[0], 0);
 		UT_ASSERT_EQ(typed->xid_next_at_drain[0], 0);
 		UT_ASSERT_EQ(typed->history_xid[3].next_xid, 0);
 		UT_ASSERT(!tt_after_captured && !typed->census_root_captured);
@@ -416,6 +531,8 @@ UT_TEST(test_endpoints_post_redo_tt_refusal_discards_all_attempt_inputs)
 		UT_ASSERT(!endpoint_finish(typed));
 		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
 		UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+		UT_ASSERT_NULL(typed->xid_receipt.plan);
+		UT_ASSERT_EQ(typed->xid_receipt.next_xid[0], 0);
 		UT_ASSERT_EQ(typed->xid_next_at_drain[0], 0);
 		UT_ASSERT_EQ(typed->history_xid[3].next_xid, 0);
 		UT_ASSERT(!tt_after_captured && !typed->census_root_captured);
@@ -446,6 +563,8 @@ UT_TEST(test_endpoints_post_redo_tt_rechecks_sources_and_cleans_error)
 		UT_ASSERT(!ready);
 		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
 		UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+		UT_ASSERT_NULL(typed->xid_receipt.plan);
+		UT_ASSERT_EQ(typed->xid_receipt.next_xid[0], 0);
 		UT_ASSERT_EQ(typed->history_xid[3].next_xid, 0);
 		UT_ASSERT(!tt_after_captured && !typed->census_root_captured);
 		UT_ASSERT_EQ(tt_after_resets, 1);
@@ -462,6 +581,8 @@ UT_TEST(test_endpoints_prior_refusal_resets_previous_post_redo_snapshot)
 	UT_ASSERT(!endpoint_finish(typed));
 	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SPACE_REFUSED);
 	UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+	UT_ASSERT_NULL(typed->xid_receipt.plan);
+	UT_ASSERT_EQ(typed->xid_receipt.next_xid[0], 0);
 	UT_ASSERT(!tt_after_captured);
 	UT_ASSERT_EQ(tt_inventory_calls, 1);
 	endpoint_destroy(&typed);

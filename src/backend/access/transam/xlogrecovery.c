@@ -662,6 +662,48 @@ static ClusterColdTypedV1 *cluster_recovery_typed_begin(ClusterRecoveryFencePlan
 static XLogRecPtr cluster_recovery_typed_replay(ClusterColdTypedV1 **typed,
 												TimeLineID *replayTLI,
 												ClusterRecoveryFencePlan **fence_plan);
+static ClusterColdTypedV1 *cluster_recovery_cold_inputs;
+
+static void
+cluster_recovery_cold_inputs_cleanup(int code, Datum arg)
+{
+	(void)code;
+	(void)arg;
+	cluster_cold_typed_destroy_v1(&cluster_recovery_cold_inputs);
+}
+
+/* Keep only original read-only inputs across EOR, never a live read scope.
+ * The fence plan's execution guards and retention pin are released normally.
+ * Any later consumer must obtain fresh source and writer authorization. */
+static void
+cluster_recovery_cold_inputs_retain(ClusterColdTypedV1 **typed)
+{
+	if (typed == NULL || *typed == NULL || (*typed)->inputs != NULL
+		|| cluster_recovery_cold_inputs != NULL)
+		ereport(FATAL, (errmsg("could not retain original cold recovery inputs")));
+	before_shmem_exit(cluster_recovery_cold_inputs_cleanup, (Datum)0);
+	cluster_recovery_cold_inputs = *typed;
+	*typed = NULL;
+}
+
+static void
+cluster_recovery_cold_inputs_handoff(EndOfWalRecoveryInfo *info)
+{
+	info->cluster_cold_inputs = cluster_recovery_cold_inputs;
+}
+
+void
+ClusterReleaseColdRecoveryInputs(EndOfWalRecoveryInfo *info)
+{
+	if (info == NULL || info->cluster_cold_inputs != cluster_recovery_cold_inputs)
+		ereport(FATAL, (errmsg("cold recovery input handoff belongs to another attempt")));
+	info->cluster_cold_inputs = NULL;
+	if (cluster_recovery_cold_inputs != NULL) {
+		cluster_recovery_cold_inputs_cleanup(0, (Datum)0);
+		cancel_before_shmem_exit(cluster_recovery_cold_inputs_cleanup, (Datum)0);
+	}
+}
+
 static bool cluster_backup_recovery_have_manifest = false;
 static ClusterBackupManifest cluster_backup_recovery_manifest;
 static bool cluster_backup_recovery_target_active = false;
@@ -2390,6 +2432,9 @@ FinishWalRecovery(void)
 
 	result->standby_signal_file_found = standby_signal_file_found;
 	result->recovery_signal_file_found = recovery_signal_file_found;
+#ifdef USE_PGRAC_CLUSTER
+	cluster_recovery_cold_inputs_handoff(result);
+#endif
 
 	return result;
 }
@@ -3226,6 +3271,7 @@ cluster_typed_replay_xid_begin(ClusterColdTypedReplay *rep)
 {
 	ClusterColdTypedV1 *typed = rep->typed;
 
+	memset(&typed->xid_receipt, 0, sizeof(typed->xid_receipt));
 	memset(&typed->effects_receipt, 0, sizeof(typed->effects_receipt));
 	memset(rep->xid_progress, 0, sizeof(rep->xid_progress));
 	memset(typed->xid_next_at_drain, 0, sizeof(typed->xid_next_at_drain));
@@ -3898,7 +3944,7 @@ cluster_recovery_typed_replay(ClusterColdTypedV1 **typed_address, TimeLineID *re
 	if (rep->touched.rels != NULL)
 		pfree(rep->touched.rels);
 	pfree(rep);
-	cluster_cold_typed_destroy_v1(typed_address);
+	cluster_recovery_cold_inputs_retain(typed_address);
 	return own_end;
 }
 

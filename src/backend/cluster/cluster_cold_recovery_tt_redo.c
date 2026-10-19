@@ -11,7 +11,8 @@
  *
  * NOTES
  *    PGRAC-original. Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md
- *    No original bytes are installed and no transaction proof is created.
+ *    No original bytes are installed. Canonical top qualification consumes
+ *    the native BIND producer; all other transaction gates remain separate.
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -20,6 +21,7 @@
 #include "cluster/cluster_recovery_undo_scan.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_uba.h"
+#include "cluster/cluster_wal_tail.h"
 
 static bool
 cold_tt_source(const ClusterColdTypedV1 *typed, uint32 participant, uint8 owner, uint32 segment,
@@ -458,18 +460,131 @@ cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
 										  oldest_xid, recoverer_epoch, out);
 }
 
+/* The current native BIND has one production emitter, called by canonical
+ * ACTIVE publication with the original owner's top XID. Its exact physical
+ * identity can qualify top ownership, including retained pre-redo input from
+ * this same source. This is not a lifetime BIND retention requirement: an
+ * older ACTIVE without this input still needs a qualified canonical base.
+ * Neither raw ACTIVE bytes nor another slot's BIND can supply that fact. */
+static bool
+cold_top_tx_native_bind_v1(const RfSideOnlinePlanV1 *plan, const ClusterColdTtSlotKeyV1 *key)
+{
+	uint32 count = rf_side_online_plan_operation_count_v1(plan);
+
+	if (count == UINT32_MAX)
+		return false;
+	for (uint32 i = 0; i < count; i++) {
+		RfSideOnlineOperationV1 operation;
+		const ClusterUndoDecoded *bind = &operation.undo;
+
+		if (!rf_side_online_plan_operation_v1(plan, i, &operation))
+			return false;
+		if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
+			&& bind->kind == CLUSTER_UNDO_KIND_TT_BIND
+			&& bind->format_version == CLUSTER_UNDO_TT_BIND_VERSION
+			&& bind->instance == key->owner_instance && bind->segment_id == key->segment_id
+			&& bind->expected_generation == key->segment_generation
+			&& bind->slot_offset == key->slot_offset && bind->wrap == key->slot_wrap
+			&& bind->xid == key->xid)
+			return true;
+	}
+	return false;
+}
+
+/* A retained incarnation is not folded into the current owner's header,
+ * but its exact terminal still contradicts the same physical ACTIVE key.
+ * Neither a different claim/epoch nor history_only erases that conflict.
+ * Absence of these carriers does not supply the independent terminal proof. */
+static bool
+cold_top_tx_terminals_compatible_v1(const ClusterColdTypedV1 *typed,
+									const ClusterColdTtSlotKeyV1 *key)
+{
+	for (uint32 p = 0; p < typed->participant_count; p++) {
+		const RfSideOnlinePlanV1 *plan = typed->side_plans[p];
+		uint32 count = rf_side_online_plan_operation_count_v1(plan);
+
+		if (count == UINT32_MAX)
+			return false;
+		for (uint32 i = 0; i < count; i++) {
+			RfSideOnlineOperationV1 operation;
+			ClusterColdTtSlotKeyV1 terminal = { 0 };
+
+			if (!rf_side_online_plan_operation_v1(plan, i, &operation))
+				return false;
+			if (operation.kind == RF_SIDE_ONLINE_OPERATION_XACT
+				&& operation.xact.kind == RF_SIDE_XACT_COMMIT && operation.xact.has_tt_delta) {
+				const xl_xact_tt_commit *delta = &operation.xact.tt_delta;
+
+				terminal.owner_instance = delta->instance;
+				terminal.segment_id = delta->segment_id;
+				terminal.segment_generation = delta->segment_generation;
+				terminal.slot_offset = delta->slot_offset;
+				terminal.slot_wrap = delta->wrap;
+				terminal.xid = delta->xid;
+			} else if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
+					   && operation.undo.kind == CLUSTER_UNDO_KIND_TT_ABORT
+					   && operation.undo.format_version == CLUSTER_UNDO_TT_ABORT_EXACT_VERSION) {
+				const ClusterUndoDecoded *abort = &operation.undo;
+
+				terminal.owner_instance = abort->instance;
+				terminal.segment_id = abort->segment_id;
+				terminal.segment_generation = abort->expected_generation;
+				terminal.slot_offset = abort->slot_offset;
+				terminal.slot_wrap = abort->wrap;
+				terminal.xid = abort->xid;
+			} else
+				continue;
+			if (cold_top_tx_key_equal_v1(&terminal, key))
+				return false;
+		}
+	}
+	return true;
+}
+
+/* Consume the original owner's selected native checkpoint, not a caller's
+ * checkpoint number. This binds the source and replay cut only; it does not
+ * establish that any captured TT base is covered by that checkpoint. */
+static bool
+cold_top_tx_checkpoint_v1(const ClusterColdTypedV1 *typed, uint32 participant)
+{
+	const ClusterColdParticipantV1 *cut = &typed->participants[participant];
+	const ClusterWalSourceRef *source = &typed->sources[participant];
+	ClusterControlRootSnapshot root;
+	ClusterWalRecoveryCheckpointV1 selected;
+
+	if (!cluster_cold_typed_checkpoint_v1(typed, participant, &root, &selected))
+		return false;
+	return memcmp(&selected.source, source, sizeof(*source)) == 0
+		   && memcmp(&root.identity, &source->claim.identity, sizeof(root.identity)) == 0
+		   && root.identity.origin_thread_id == cut->thread_id
+		   && root.identity.origin_owner_incarnation == cut->owner_incarnation
+		   && root.checkpoint_tli == cut->timeline && source->timeline == cut->timeline
+		   && selected.checkpoint.ThisTimeLineID == cut->timeline
+		   && root.checkpoint_lower_lsn == cut->physical_lower
+		   && root.validated_tail_lsn_exclusive == cut->tail_end
+		   && !XLogRecPtrIsInvalid(selected.checkpoint_start)
+		   && selected.checkpoint_start >= cut->physical_lower
+		   && selected.checkpoint_start < cut->tail_end
+		   && !XLogRecPtrIsInvalid(selected.checkpoint.redo)
+		   && selected.checkpoint.redo == cut->native_redo
+		   && selected.checkpoint.redo >= cut->physical_lower
+		   && selected.checkpoint.redo <= selected.checkpoint_start;
+}
+
 bool
-cluster_cold_typed_top_tx_c0_producer_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
+										 struct ClusterRecoveryFencePlan *fence, uint32 participant,
 										 const ClusterColdTopTxProofV1 *proof,
-										 const ClusterRecoveryTTAbortV1 *shape,
-										 bool all_endpoints_complete, bool has_oldest_xid,
+										 const ClusterRecoveryTTAbortV1 *shape, bool has_oldest_xid,
 										 TransactionId oldest_xid, uint64 recoverer_epoch,
 										 ClusterColdTopTxC0ProducerResultV1 *out)
 {
 	ClusterColdTopTxC0ProducerResultV1 result = { 0 };
-	RfSideUndoHeaderImageV1 post_image;
+	ClusterColdTopTxProofV1 qualified;
+	RfSideUndoHeaderImageV1 post_image, base_image;
 	ClusterColdTtSlotInputV1 post_slot;
 	uint32 post_segment_index;
+	uint64 next_xid;
 
 	if (out == NULL)
 		return false;
@@ -484,8 +599,15 @@ cluster_cold_typed_top_tx_c0_producer_v1(const ClusterColdTypedV1 *typed, uint32
 		|| memcmp(shape->target_claim_sha256, typed->sources[participant].claim.claim_sha256,
 				  sizeof(shape->target_claim_sha256))
 			   != 0
-		|| typed->xid_next_after_redo == 0
+		|| !cold_top_tx_checkpoint_v1(typed, participant)
+		|| !cluster_cold_typed_xid_maximum_v1(typed, &next_xid)
 		|| !cluster_cold_typed_effects_ready_v1(typed)
+		|| !cluster_cold_typed_sources_current_v1(typed, fence))
+		return false;
+	/* Cached TT/UNDO bytes cannot attest to their own physical freshness.
+	 * Reuse the original owner's full namespace, inode and byte recheck;
+	 * refusal invalidates the post-redo snapshot rather than refreshing it. */
+	if (cluster_cold_tt_after_redo_recheck_v1(typed) != CLUSTER_COLD_OK
 		|| cluster_cold_tt_header_find_v1(typed, true, proof->key.owner_instance,
 										  proof->key.segment_id, &post_segment_index)
 			   == NULL
@@ -497,8 +619,8 @@ cluster_cold_typed_top_tx_c0_producer_v1(const ClusterColdTypedV1 *typed, uint32
 	/* A valid target alone cannot discharge missing/unsupported retained
 	 * sources, another TT header, or an uncached native UNDO effect. Reuse
 	 * the complete ordinary inventory rather than trusting the proof flags
-	 * for those inputs. This does not establish checkpoint coverage, top
-	 * ownership, atomic transaction effects or old-writer isolation. */
+	 * for those inputs. This does not establish checkpoint coverage,
+	 * atomic transaction effects or old-writer isolation. */
 	if (!cluster_cold_typed_tt_redo_inventory_v1(typed))
 		return false;
 	/* Compare the whole selected header with its sealed original fold.  A
@@ -507,14 +629,42 @@ cluster_cold_typed_top_tx_c0_producer_v1(const ClusterColdTypedV1 *typed, uint32
 	if (!cluster_cold_typed_tt_after_redo_readback_v1(typed, participant, post_segment_index,
 													  &post_image))
 		return false;
+	if (!cold_top_tx_terminals_compatible_v1(typed, &post_slot.key))
+		return false;
+	/* The caller's producer_top bit is not an original producer fact. Only
+	 * this source's exact native BIND currently qualifies this gate here. */
+	qualified = *proof;
+	qualified.producer_top
+		= cold_top_tx_native_bind_v1(typed->side_plans[participant], &post_slot.key);
+	/* Reconstruct the complete generation from its retained native INIT or
+	 * REUSE, with no captured TT predecessor. A raw page and a caller's bit
+	 * cannot establish checkpoint coverage. Older ACTIVE generations without
+	 * this full lifecycle remain blocked until their original base owner can
+	 * supply the independent checkpoint coverage proof. */
+	qualified.qualified_base = rf_side_online_plan_prepare_undo_header_v1(
+								   typed->side_plans[participant], post_slot.key.owner_instance,
+								   post_slot.key.segment_id, NULL, &base_image)
+								   == RF_PAGE_PROOF_DETAIL_OK
+							   && base_image.has_full_image
+							   && memcmp(base_image.page.data, post_image.page.data, BLCKSZ) == 0;
+	/* The original all-record effects receipt, bound by the endpoint receipt
+	 * to this exact plan and source set, and the verified ordinary inventory
+	 * establish completed sealed redo. The caller's bit cannot add or revoke
+	 * that fact. Atomic transaction effects remain an independent proof. */
+	qualified.sealed_redo = true;
 	result.active.key = post_slot.key;
-	if (!cluster_cold_top_tx_loser_v1(&result.active, proof, &result.loser)
-		|| !cluster_cold_top_tx_c0_v1(&result.loser, shape, typed->xid_next_after_redo,
-									  all_endpoints_complete, has_oldest_xid, oldest_xid,
-									  recoverer_epoch, &result.c0)
+	if (!cluster_cold_top_tx_loser_v1(&result.active, &qualified, &result.loser)
+		|| !cluster_cold_top_tx_c0_v1(&result.loser, shape, next_xid, true, has_oldest_xid,
+									  oldest_xid, recoverer_epoch, &result.c0)
 		|| cluster_recovery_tt_abort_match_v1(&result.c0.record, post_slot.key.segment_generation,
 											  &post_slot.slot)
 			   != CLUSTER_RECOVERY_TT_ABORT_APPLY)
+		return false;
+	/* The inventory may read additional UNDO blocks. Recheck every retained
+	 * physical input again before publishing this candidate descriptor.
+	 * This is not a substitute for the independent old-writer isolation. */
+	if (cluster_cold_tt_after_redo_recheck_v1(typed) != CLUSTER_COLD_OK
+		|| !cluster_cold_typed_sources_current_v1(typed, fence))
 		return false;
 	*out = result;
 	return true;

@@ -1065,6 +1065,7 @@ cold_history_sources_match(ClusterColdTypedV1 *typed)
 static void
 cold_execution_inputs_failed(ClusterColdTypedV1 *typed)
 {
+	memset(&typed->xid_receipt, 0, sizeof(typed->xid_receipt));
 	memset(&typed->effects_receipt, 0, sizeof(typed->effects_receipt));
 	cluster_cold_tt_after_redo_reset_v1(typed);
 	if (typed->refusal == CLUSTER_COLD_OK)
@@ -1099,6 +1100,25 @@ cold_replay_sources_current(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan 
 	return matched;
 }
 
+/* C0 input consumption must use the original execution owner, not a cached
+ * source receipt or a caller's isolation flag. It cannot outlive pass 2. */
+bool
+cluster_cold_typed_sources_current_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
+{
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK)
+		return false;
+	if (fence == NULL || !cluster_cold_replay_window_active_v1() || typed->plan == NULL
+		|| typed->replay_roots == NULL || typed->own_participant != 0 || typed->replay_count == 0
+		|| typed->replay_count > typed->participant_count
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->replay_root_count != typed->replay_count
+		|| cluster_cold_plan_participant_count_v1(typed->plan) != typed->participant_count) {
+		cold_execution_inputs_failed(typed);
+		return false;
+	}
+	return cold_replay_sources_current(typed, fence);
+}
+
 bool
 cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
 {
@@ -1108,6 +1128,7 @@ cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFen
 		return false;
 	/* ERROR from an original source owner must not leave a reusable OK plan. */
 	cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "pass-2 source durability is incomplete");
+	memset(&typed->xid_receipt, 0, sizeof(typed->xid_receipt));
 	memset(&typed->effects_receipt, 0, sizeof(typed->effects_receipt));
 	cluster_cold_tt_after_redo_reset_v1(typed);
 	typed->xid_next_after_redo = 0;
@@ -1227,6 +1248,7 @@ cluster_cold_typed_xid_endpoints_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFe
 
 	if (typed == NULL)
 		return false;
+	memset(&typed->xid_receipt, 0, sizeof(typed->xid_receipt));
 	cluster_cold_tt_after_redo_reset_v1(typed);
 	typed->xid_next_after_redo = 0;
 	if (typed->refusal != CLUSTER_COLD_OK)
@@ -1256,8 +1278,11 @@ cluster_cold_typed_xid_endpoints_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFe
 		for (uint32 p = 0; ready && p < typed->participant_count; p++) {
 			uint64 next;
 			ready = cold_xid_endpoint(typed, result, progress, p, &next);
-			if (ready && next > maximum)
-				maximum = next;
+			if (ready) {
+				typed->xid_receipt.next_xid[p] = next;
+				if (next > maximum)
+					maximum = next;
+			}
 		}
 		if (ready)
 			ready = cold_replay_sources_current(typed, fence);
@@ -1291,6 +1316,14 @@ cluster_cold_typed_xid_endpoints_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFe
 		return false;
 	}
 	typed->xid_next_after_redo = maximum;
+	memcpy(typed->xid_receipt.sources, typed->sources,
+		   typed->participant_count * sizeof(typed->sources[0]));
+	typed->xid_receipt.system_identifier = typed->system_identifier;
+	typed->xid_receipt.participant_count = typed->participant_count;
+	typed->xid_receipt.replay_count = typed->replay_count;
+	/* Publish last, after the original owner's final source/TT readback.
+	 * The receipt survives EOR only as input, without the released fence. */
+	typed->xid_receipt.plan = typed->plan;
 	typed->refusal = CLUSTER_COLD_OK;
 	return true;
 }

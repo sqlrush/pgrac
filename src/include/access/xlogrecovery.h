@@ -129,10 +129,18 @@ typedef struct
 	 */
 	bool		standby_signal_file_found;
 	bool		recovery_signal_file_found;
+#ifdef USE_PGRAC_CLUSTER
+	/* Borrowed, attempt-local replay inputs until Startup's final close.
+	 * No retained execution pin, current source proof, or C0 write authority. */
+	const struct ClusterColdTypedV1 *cluster_cold_inputs;
+#endif
 } EndOfWalRecoveryInfo;
 
 extern EndOfWalRecoveryInfo *FinishWalRecovery(void);
 extern void ShutdownWalRecovery(void);
+#ifdef USE_PGRAC_CLUSTER
+extern void ClusterReleaseColdRecoveryInputs(EndOfWalRecoveryInfo *info);
+#endif
 extern void RemovePromoteSignalFiles(void);
 
 extern bool HotStandbyActive(void);
