@@ -3529,6 +3529,57 @@ cl_normal_stop_trace_pre_front_buffer(void)
 		observed.delivery);
 }
 
+/* Each instance emits its own owner state; peer records are joined offline
+ * by the original stop nonces and KO operation identity. No new RPC, atomic
+ * cross-node snapshot, or completion proof is implied by this diagnostic.
+ * Copy under the leave lock, then release it before observing KO/logging.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+cl_normal_stop_trace_peer_acks(void)
+{
+	static TimestampTz last_trace, changed[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
+	static uint32 previous_ack, previous_sent, previous_pending;
+	uint64 nonce, epoch, peer_nonce[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
+	uint32 ack, sent, pending, phase;
+	TimestampTz now;
+
+	if (!cluster_trace_normal_stop || cl_normal_stop == NULL || cl_state == NULL)
+		return;
+	now = GetCurrentTimestamp();
+	if (last_trace != 0 && now >= last_trace && now - last_trace < INT64CONST(1000000))
+		return;
+	LWLockAcquire(&cl_state->lock, LW_SHARED);
+	epoch = cl_normal_stop->epoch;
+	nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
+	ack = cl_state->ack_bitmap[0];
+	sent = cl_normal_stop->peer_reply_sent;
+	pending = cl_normal_stop->peer_reply_pending;
+	phase = pg_atomic_read_u32(&cl_normal_stop->phase);
+	memcpy(peer_nonce, cl_normal_stop->peer_request_nonce, sizeof(peer_nonce));
+	LWLockRelease(&cl_state->lock);
+	for (int peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
+		uint32 bit = UINT32_C(1) << peer;
+
+		if (peer == cluster_node_id)
+			continue;
+		if (last_trace == 0 || now < last_trace
+			|| (((ack ^ previous_ack) | (sent ^ previous_sent)
+				 | (pending ^ previous_pending)) & bit) != 0)
+			changed[peer] = now;
+		ereport(LOG, (errmsg("normal-stop producer peer diagnostic"),
+			errdetail("node=%d peer=%d epoch=" UINT64_FORMAT " nonce=" UINT64_FORMAT
+				" peer_nonce=" UINT64_FORMAT " phase=%u ack=%u reply_sent=%u reply_pending=%u"
+				" last_change_pg_us=" INT64_FORMAT " peer_owner=peer_local_log",
+				cluster_node_id, peer, epoch, nonce, peer_nonce[peer], phase,
+				(ack & bit) != 0, (sent & bit) != 0, (pending & bit) != 0, changed[peer])));
+	}
+	previous_ack = ack;
+	previous_sent = sent;
+	previous_pending = pending;
+	last_trace = now;
+	cluster_ko_normal_stop_trace_v1();
+}
+
 static ClusterNormalStopPollResult
 cl_normal_stop_checkpoint_poll(uint32 expected_services, ClusterPhase1FullStopPlan *plan_out,
 							   ClusterNormalStopModuleObservation *observation,
@@ -3743,6 +3794,7 @@ cl_normal_stop_checkpoint_run(ClusterPhase1FullStopPlan *plan,
 		 * remains visible. READY is consumed once, never repolled as a new
 		 * checkpoint or a new post-STOPPED nonce. */
 		ResetLatch(MyLatch);
+		cl_normal_stop_trace_peer_acks();
 		cluster_cf_retirement_poll();
 		cluster_lock_owners_service_poll();
 		if (step == 0 && !after_checkpoint
@@ -3764,8 +3816,16 @@ cl_normal_stop_checkpoint_run(ClusterPhase1FullStopPlan *plan,
 					&& retired.examined_count != 0
 					&& (!retired.complete_wrap || retired.retired_count != 0))
 					owner_progress = true;
-				if (owner_progress)
-					SetLatch(MyLatch);
+				if (owner_progress) {
+					/* Finish productive bounded continuations before repeating the
+					 * full-pool passive census. A census after every 128 slots
+					 * makes a retained DROP quadratic in the pool size. The next
+					 * pass rechecks the same deadline, failure, phase and seal;
+					 * only the final fresh census can authorize the producer cut.
+					 * Author: SqlRush <sqlrush@gmail.com> */
+					CHECK_FOR_INTERRUPTS();
+					continue;
+				}
 			}
 		}
 		if (step == 0)
