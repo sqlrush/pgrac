@@ -49,6 +49,7 @@ static unsigned int fault_rename;
 static bool fail_directory_close;
 static LWLock retention_lock;
 static bool retention_held, observing_stage, relmap_x_held;
+static bool drop_relmap_x_on_read;
 static bool cancel_on_read, invalidate_on_read, cancel_on_write;
 static unsigned int io_under_retention_lock, writes_without_pin;
 static unsigned int retention_acquires, retention_releases;
@@ -257,6 +258,10 @@ relmap_test_read(int fd, void *bytes, size_t len)
 	ssize_t n = read(fd, bytes, len);
 
 	observe_io();
+	if (drop_relmap_x_on_read) {
+		drop_relmap_x_on_read = false;
+		relmap_x_held = false;
+	}
 	if (observing_stage && (cancel_on_read || invalidate_on_read)) {
 		LWLockAcquire(&retention_lock, LW_EXCLUSIVE);
 		if (cancel_on_read)
@@ -369,6 +374,7 @@ reset_io(void)
 	fault_rename = 1;
 	fail_directory_close = false;
 	retention_held = observing_stage = relmap_x_held = false;
+	drop_relmap_x_on_read = false;
 	cancel_on_read = invalidate_on_read = cancel_on_write = false;
 	io_under_retention_lock = writes_without_pin = 0;
 	retention_acquires = retention_releases = 0;
@@ -548,6 +554,25 @@ UT_TEST(test_committed_reader_requires_namespace_x_lock)
 	relmap_x_held = false;
 	UT_ASSERT_EQ(generation, UINT64CONST(7));
 	UT_ASSERT_EQ(map.mappings[0].mapfilenumber, 40000);
+}
+
+UT_TEST(test_committed_reader_rechecks_namespace_x_lock_after_io)
+{
+	RelMapFile map;
+	RelMapFile zero;
+	uint64 generation;
+
+	setup(&identity);
+	UT_ASSERT(stage(&identity));
+	memset(&map, 0xa5, sizeof(map));
+	memset(&zero, 0, sizeof(zero));
+	generation = UINT64CONST(99);
+	relmap_x_held = true;
+	drop_relmap_x_on_read = true;
+	UT_ASSERT(!cluster_relmap_authority_v2_read_committed(&identity, &map, &generation));
+	relmap_x_held = false;
+	UT_ASSERT_EQ(generation, UINT64CONST(0));
+	UT_ASSERT_EQ(memcmp(&map, &zero, sizeof(map)) == 0, true);
 }
 
 UT_TEST(test_committed_reader_rebuilds_exact_structural_pending)
@@ -1576,10 +1601,11 @@ UT_TEST(test_changed_wal_cannot_rebind_staged_pin)
 int
 main(void)
 {
-	UT_PLAN(44);
+	UT_PLAN(45);
 	UT_RUN(test_stage_both_copies_before_success);
 	UT_RUN(test_committed_reader_hides_pending_and_rejects_degraded_pair);
 	UT_RUN(test_committed_reader_requires_namespace_x_lock);
+	UT_RUN(test_committed_reader_rechecks_namespace_x_lock_after_io);
 	UT_RUN(test_committed_reader_rebuilds_exact_structural_pending);
 	UT_RUN(test_per_database_namespace);
 	UT_RUN(test_missing_authority_is_never_seeded);

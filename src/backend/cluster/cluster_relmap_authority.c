@@ -601,6 +601,10 @@ cluster_relmap_authority_v2_read_committed(const ClusterRelmapV2Namespace *expec
 	if (cluster_relmap_authority_v2_read(expected, &view) != CLUSTER_RELMAP_V2_PAIR_VALID
 		|| !view.pending_complete)
 		return false;
+	/* The raw pair read performs disk I/O; do not publish its result if the
+	 * caller dropped the runtime serialization lock during that call. */
+	if (!cluster_relmap_authority_x_held())
+		return false;
 	*map_out = view.committed;
 	*generation_out = view.committed_generation;
 	return true;

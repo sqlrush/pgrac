@@ -243,14 +243,14 @@ cluster_relmap_authority_v2_read(const ClusterRelmapV2Namespace *expected,
 
 /*
  * Dormant committed-only v2 reader facade.  The caller must hold the
- * namespace relmap X lock for the entire call; the entry check prevents a
- * runtime reader from racing a publication or terminal cleanup.  A complete,
- * identical pair is required; on success only the committed image and
- * generation are copied to the outputs.  Pending obligations are intentionally
- * not exposed through this API, while cold BUILDING restore callers that need
- * them must use the full v2 read above.  A degraded or incomplete pair clears
- * both outputs and returns false.  There is no live v2 caller or activation
- * through this primitive.
+ * namespace relmap X lock for the entire call; entry and post-read checks
+ * prevent a runtime reader from publishing a pair observed after that lock was
+ * dropped.  A complete, identical pair is required; on success only the
+ * committed image and generation are copied to the outputs.  Pending
+ * obligations are intentionally not exposed through this API, while cold
+ * BUILDING restore callers that need them must use the full v2 read above.  A
+ * degraded or incomplete pair clears both outputs and returns false.  There is
+ * no live v2 caller or activation through this primitive.
  */
 extern bool cluster_relmap_authority_v2_read_committed(const ClusterRelmapV2Namespace *expected,
 												RelMapFile *map_out,
