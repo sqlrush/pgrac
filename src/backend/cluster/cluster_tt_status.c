@@ -907,10 +907,9 @@ cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus s
 	LWLockRelease(ClusterTTStatusLock);
 
 	/*
-	 * Publish-before-wake: this local terminal-install path is the single
-	 * completion point for waiters on this exact holder identity.  Keeping
-	 * it here covers both hint and direct source installs without making
-	 * either caller guess which path performed the install.
+	 * Publish-before-wake: this local terminal-install path wakes waiters
+	 * only after the exact holder status is visible.  The prepared-commit
+	 * resolver below follows the same ordering for its batch of exact keys.
 	 */
 	if (status == CLUSTER_TT_STATUS_COMMITTED || status == CLUSTER_TT_STATUS_ABORTED)
 		cluster_txw_wake_waiters(key);
@@ -929,6 +928,8 @@ cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
 	bool have_match = false;
 	uint16 match_origin = 0;
 	uint32 match_epoch = 0;
+	int wake_key_capacity;
+	ClusterTTStatusKey *wake_keys;
 	int resolved = 0;
 
 	if (!TransactionIdIsValid(xid) || !SCN_VALID(commit_scn))
@@ -938,6 +939,14 @@ cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
 
 	now = GetCurrentTimestamp();
 	adg_standby = cluster_tt_status_adg_standby_overlay_enabled();
+	/*
+	 * The overlay capacity is fixed when the hash is created, so reserve one
+	 * exact key slot per possible entry before taking the TT lock.  Keeping
+	 * allocation outside the critical section preserves the publish-before-
+	 * wake ordering even if memory pressure raises an ERROR.
+	 */
+	wake_key_capacity = Max(cluster_tt_status_overlay_max_entries, 1);
+	wake_keys = palloc0(mul_size(sizeof(*wake_keys), wake_key_capacity));
 
 	LWLockAcquire(ClusterTTStatusLock, LW_EXCLUSIVE);
 
@@ -967,6 +976,7 @@ cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
 		if (ambiguous) {
 			hash_seq_term(&seq);
 			LWLockRelease(ClusterTTStatusLock);
+			pfree(wake_keys);
 			ereport(LOG,
 					(errmsg("cluster standby skipped ambiguous prepared-transaction TT overlay "
 							"resolve for xid %u",
@@ -1000,9 +1010,15 @@ cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
 		e->install_ts = now;
 		e->has_parent_key = false;
 		memset(&e->parent_key, 0, sizeof(e->parent_key));
+		Assert(resolved < wake_key_capacity);
+		wake_keys[resolved] = e->key;
 		resolved++;
 	}
 	LWLockRelease(ClusterTTStatusLock);
+
+	for (int i = 0; i < resolved; i++)
+		cluster_txw_wake_waiters(&wake_keys[i]);
+	pfree(wake_keys);
 
 	if (resolved > 0)
 		pg_atomic_fetch_add_u64(&ClusterTTStatusState->recovery_overlay_rebuild_count,

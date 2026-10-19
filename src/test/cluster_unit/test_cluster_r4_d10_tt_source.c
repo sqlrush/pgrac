@@ -52,6 +52,7 @@
 
 #include "unit_test.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 
@@ -97,6 +98,7 @@ static int fake_recheck_count;
 static int fake_leave_count;
 static int fake_wake_count;
 static ClusterTTStatusKey fake_wake_key;
+static ClusterTTStatusKey fake_wake_keys[4];
 
 
 void
@@ -429,13 +431,36 @@ void
 cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unused())
 {}
 
+void *
+palloc0(Size bytes)
+{
+	return calloc(1, bytes);
+}
+
+void
+pfree(void *pointer)
+{
+	free(pointer);
+}
+
+Size
+mul_size(Size s1, Size s2)
+{
+	if (s2 != 0 && s1 > ((Size) -1) / s2)
+		abort();
+	return s1 * s2;
+}
+
 void
 cluster_txw_wake_waiters(const ClusterTTStatusKey *holder_key)
 {
 	fake_wake_count++;
 	UT_ASSERT_NOT_NULL(holder_key);
-	if (holder_key != NULL)
+	if (holder_key != NULL) {
 		fake_wake_key = *holder_key;
+		if (fake_wake_count <= (int) lengthof(fake_wake_keys))
+			fake_wake_keys[fake_wake_count - 1] = *holder_key;
+	}
 }
 
 static void
@@ -465,6 +490,7 @@ reset_fixture(void)
 	fake_leave_count = 0;
 	fake_wake_count = 0;
 	memset(&fake_wake_key, 0, sizeof(fake_wake_key));
+	memset(fake_wake_keys, 0, sizeof(fake_wake_keys));
 	cluster_tt_status_shmem_init();
 }
 
@@ -575,6 +601,52 @@ UT_TEST(test_install_lookup_and_delete_publish_only_after_recheck)
 	UT_ASSERT_EQ(fake_enter_count, 3);
 	UT_ASSERT_EQ(fake_recheck_count, 3);
 	UT_ASSERT_EQ(fake_leave_count, 3);
+}
+
+UT_TEST(test_prepared_commit_publishes_then_wakes_each_exact_holder)
+{
+	ClusterTTStatusKey key = make_key((TransactionId)607);
+	ClusterTTStatusKey sibling = key;
+	ClusterTTStatusSourceRequest request;
+	ClusterTTStatusSourceResult result;
+
+	reset_fixture();
+	sibling.undo_segment_id = 4;
+	sibling.tt_slot_id = 5;
+	memset(&request, 0, sizeof(request));
+	request.status = CLUSTER_TT_STATUS_IN_PROGRESS;
+	request.commit_scn = InvalidScn;
+	request.key = &key;
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	request.key = &sibling;
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT_EQ(fake_wake_count, 0);
+
+	memset(&request, 0, sizeof(request));
+	request.xid = key.local_xid;
+	request.commit_scn = UINT64_C(9007);
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(
+						 CLUSTER_TT_SOURCE_RESOLVE_PREPARED_COMMIT, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT_EQ(result.int_value, 2);
+	UT_ASSERT_EQ(fake_wake_count, 2);
+	UT_ASSERT_EQ(memcmp(&fake_wake_keys[0], &key, sizeof(key)), 0);
+	UT_ASSERT_EQ(memcmp(&fake_wake_keys[1], &sibling, sizeof(sibling)), 0);
+
+	request.key = &key;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_COMMITTED);
+	UT_ASSERT_EQ(result.lookup.commit_scn, UINT64_C(9007));
 }
 
 UT_TEST(test_missing_required_pointer_closes_after_admission)
@@ -793,11 +865,12 @@ UT_TEST(test_error_path_runs_single_leave_funnel)
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_frozen_tt_source_operation_domain);
 	UT_RUN(test_active_refuses_before_request_inspection_and_mutation);
 	UT_RUN(test_disabled_source_executes_matching_counter_arm);
 	UT_RUN(test_install_lookup_and_delete_publish_only_after_recheck);
+	UT_RUN(test_prepared_commit_publishes_then_wakes_each_exact_holder);
 	UT_RUN(test_missing_required_pointer_closes_after_admission);
 	UT_RUN(test_unknown_operation_closes_after_admission);
 	UT_RUN(test_generation_drift_discards_fixed_result);
