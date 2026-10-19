@@ -1844,7 +1844,7 @@ cl_normal_stop_modules_poll(bool post_checkpoint, bool require_pi_retired,
 {
 	static const char *const names[]
 		= { "ACTIVE_WRITE", "TT_SLOT", "UNDO_BLOCK0", "CTRC", "PCM",	  "GCS", "SF",
-			"GES_REPLY",	"GRD",	   "BUFMGR",	  "OID",  "SEQUENCE", "HW",	 "CF" };
+			"GES_REPLY",	"GRD",	   "BUFMGR",	  "OID",  "SEQUENCE", "HW",	 "CF", "KO" };
 	ClusterNormalStopModuleObservation ignored;
 	ClusterPhase1FullStopPlan identity;
 	ClusterNormalStopPollResult result, aggregate = CLUSTER_NORMAL_STOP_READY;
@@ -1981,6 +1981,18 @@ cl_normal_stop_modules_poll(bool post_checkpoint, bool require_pi_retired,
 		case 13:
 			result = cluster_cf_normal_stop_poll(post_checkpoint, &current.reason);
 			strlcpy(current.object, "cf-local-and-shared", sizeof(current.object));
+			break;
+		case 14:
+			/* LMON's published idle bit can precede an accepted native
+			 * handoff or promotion. Observe its original KO owner again in
+			 * the same fresh census used before and after the producer seal.
+			 * This is passive even after seal; it never executes a DROP,
+			 * admits new work, retires a peer or extends the stop deadline.
+			 * Author: SqlRush <sqlrush@gmail.com> */
+			result = cluster_shared_config
+				? cluster_ko_shared_normal_stop_poll_v2(&current.reason)
+				: CLUSTER_NORMAL_STOP_READY;
+			strlcpy(current.object, "native-context-peer-send-directory", sizeof(current.object));
 			break;
 		default:
 			result = CLUSTER_NORMAL_STOP_INVALID;

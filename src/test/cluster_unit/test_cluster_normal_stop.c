@@ -96,11 +96,16 @@ static unsigned checkpoint_native_remaining, checkpoint_retire_remaining;
 static unsigned checkpoint_native_calls, checkpoint_retire_calls;
 static unsigned checkpoint_censuses_during_native;
 static bool checkpoint_native_fail, checkpoint_native_failed;
+/* Default-off scheduler hook: accepted MORE work can wait while the
+ * previously published actor-idle image is still visible. */
+static bool checkpoint_native_paused;
 bool
 cluster_ko_shared_native_poll_v2(void)
 {
 	UT_ASSERT(AmCheckpointerProcess() && lock_holds == 0);
 	checkpoint_native_calls++;
+	if (checkpoint_native_paused)
+		return false;
 	if (checkpoint_native_fail) {
 		checkpoint_native_failed = true;
 		return false;
@@ -4989,6 +4994,81 @@ UT_TEST(test_actual_prepare_finishes_productive_batches_before_full_census)
 	checkpoint_native_remaining = 0;
 }
 
+static void
+checkpoint_paused_native_wait(void)
+{
+	uint32 phase = pg_atomic_read_u32(&cl_normal_stop->phase);
+
+	if (checkpoint_native_remaining != 0 && checkpoint_waits >= 3)
+		checkpoint_native_paused = false;
+	else if (phase == CLUSTER_NORMAL_STOP_QUIESCE
+			 || phase == CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK)
+		checkpoint_pre_wait();
+}
+
+UT_TEST(test_actual_census_observes_native_owner_despite_idle_actor_image)
+{
+	ClusterNormalStopModuleObservation observed;
+
+	seed_module_drain();
+	cluster_shared_config = true;
+	identity_pre2_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	idle_original_actors();
+	checkpoint_native_remaining = 1;
+	UT_ASSERT_EQ(cluster_normal_stop_modules_poll(false, &observed), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(strcmp(observed.module, "KO") == 0);
+	UT_ASSERT(strcmp(observed.reason, "KO_SHARED_COMMITTED_OWNED") == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_seal), 0);
+	checkpoint_native_remaining = 0;
+}
+
+UT_TEST(test_actual_prepare_cannot_seal_while_accepted_more_owner_is_paused)
+{
+	ClusterPhase1FullStopPlan plan = {0};
+	uint64 deadline;
+
+	seed_module_drain();
+	cluster_shared_config = true;
+	identity_pre2_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	idle_original_actors();
+	deadline = cl_state->barrier_deadline_us;
+	checkpoint_native_remaining = 1;
+	checkpoint_native_paused = true;
+	start_checkpoint_wait(checkpoint_paused_native_wait);
+	UT_ASSERT(cluster_normal_stop_checkpoint_prepare(&plan, NULL));
+	checkpoint_wait_action = NULL;
+	UT_ASSERT_EQ(checkpoint_native_remaining, 0);
+	UT_ASSERT(checkpoint_waits >= 3);
+	UT_ASSERT_EQ(plan.absolute_deadline_us, deadline);
+	checkpoint_native_paused = false;
+	checkpoint_native_remaining = 0;
+}
+
+UT_TEST(test_actual_ko_census_stays_passive_after_seal_and_keeps_failures)
+{
+	ClusterNormalStopModuleObservation observed;
+	unsigned calls;
+
+	seed_module_drain();
+	cluster_shared_config = true;
+	identity_pre2_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	idle_original_actors();
+	checkpoint_native_remaining = 1;
+	pg_atomic_write_u32(&cl_normal_stop->service_seal, 1);
+	calls = checkpoint_native_calls;
+	UT_ASSERT_EQ(cluster_normal_stop_modules_poll(false, &observed), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(strcmp(observed.module, "KO") == 0);
+	UT_ASSERT_EQ(checkpoint_native_calls, calls);
+	UT_ASSERT_EQ(checkpoint_native_remaining, 1);
+	checkpoint_native_remaining = 0;
+	checkpoint_native_failed = true;
+	UT_ASSERT_EQ(cluster_normal_stop_modules_poll(false, &observed), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT(strcmp(observed.reason, "KO_SHARED_COMMITTED_RECOVERY_REQUIRED") == 0);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+	UT_ASSERT_EQ(checkpoint_native_calls, calls);
+	checkpoint_native_failed = false;
+}
+
 UT_TEST(test_actual_prepare_keeps_failed_native_work_and_rejects_stop)
 {
 	ClusterPhase1FullStopPlan plan = {0};
@@ -6503,6 +6583,9 @@ main(void)
 	UT_RUN(test_actual_prepare_keeps_failed_native_work_and_rejects_stop);
 	UT_RUN(test_actual_prepare_services_original_native_and_am03_with_same_deadline);
 	UT_RUN(test_actual_prepare_finishes_productive_batches_before_full_census);
+	UT_RUN(test_actual_census_observes_native_owner_despite_idle_actor_image);
+	UT_RUN(test_actual_prepare_cannot_seal_while_accepted_more_owner_is_paused);
+	UT_RUN(test_actual_ko_census_stays_passive_after_seal_and_keeps_failures);
 	UT_RUN(test_tail_timer_never_consumes_stopped_or_early_peer_acks);
 	UT_RUN(test_post_arm_cannot_start_or_reset_the_checkpoint_tail);
 	UT_RUN(test_precheckpoint_wait_drives_its_own_cf_retirement);
