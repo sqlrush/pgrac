@@ -10,6 +10,7 @@ int side_xact_fixture_main(void);
 
 #include <fcntl.h>
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_wal_tail.h"
 #include "cluster/storage/cluster_shared_fs.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "storage/fd.h"
@@ -46,10 +47,41 @@ BasicOpenFile(const char *path, int flags)
 
 #include "../../backend/cluster/cluster_cold_recovery_tt.c"
 
+/* Original checkpoint export is a boundary here. The Startup suite exercises
+ * its real owner; these independently mutable copies test the C0 consumer. */
+typedef struct TtCheckpointOwnerFixtureV1 {
+	ClusterControlRootSnapshot root;
+	ClusterWalRecoveryCheckpointV1 checkpoint;
+	bool captured;
+} TtCheckpointOwnerFixtureV1;
+
+bool
+cluster_cold_typed_checkpoint_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+								 ClusterControlRootSnapshot *out_root,
+								 ClusterWalRecoveryCheckpointV1 *out_checkpoint)
+{
+	const TtCheckpointOwnerFixtureV1 *owners;
+
+	if (out_root != NULL)
+		memset(out_root, 0, sizeof(*out_root));
+	if (out_checkpoint != NULL)
+		memset(out_checkpoint, 0, sizeof(*out_checkpoint));
+	if (typed == NULL || typed->replay_roots == NULL || out_root == NULL || out_checkpoint == NULL
+		|| participant >= typed->participant_count || participant >= 2)
+		return false;
+	owners = (const TtCheckpointOwnerFixtureV1 *)typed->replay_roots;
+	if (!owners[participant].captured)
+		return false;
+	*out_root = owners[participant].root;
+	*out_checkpoint = owners[participant].checkpoint;
+	return true;
+}
+
 typedef struct TtRedoFixture {
 	ClusterColdTypedV1 typed;
 	RfContributorStreamCutV1 cut;
 	PGAlignedBlock base;
+	TtCheckpointOwnerFixtureV1 checkpoints[2];
 } TtRedoFixture;
 
 static void
@@ -132,6 +164,7 @@ tt_redo_fixture_at(TtRedoFixture *f, XLogRecPtr end, RfSidePlanPurposeV1 purpose
 	f->typed.observer.database_incarnation = 42;
 	f->typed.participant_count = 2;
 	f->typed.replay_count = 1;
+	f->typed.replay_roots = (struct ClusterColdReplayRootV1 *)f->checkpoints;
 	f->typed.participants[0] = (ClusterColdParticipantV1){ .thread_id = 3,
 														   .timeline = 7,
 														   .owner_incarnation = 33,
@@ -146,6 +179,8 @@ tt_redo_fixture_at(TtRedoFixture *f, XLogRecPtr end, RfSidePlanPurposeV1 purpose
 														   .tail_end = 100 };
 	for (uint32 i = 0; i < 2; i++) {
 		ClusterWalThreadClaimRefV2 *ref = &f->typed.sources[i].claim;
+		TtCheckpointOwnerFixtureV1 *owner = &f->checkpoints[i];
+		const ClusterColdParticipantV1 *participant = &f->typed.participants[i];
 
 		ref->identity.system_identifier = f->typed.system_identifier;
 		memcpy(ref->identity.storage_uuid, f->typed.observer.storage_uuid, 16);
@@ -159,6 +194,15 @@ tt_redo_fixture_at(TtRedoFixture *f, XLogRecPtr end, RfSidePlanPurposeV1 purpose
 		ref->max_config_generation = 9;
 		memset(ref->claim_sha256, 0x20 + i, 32);
 		f->typed.sources[i].timeline = 7;
+		owner->root.identity = ref->identity;
+		owner->root.checkpoint_tli = participant->timeline;
+		owner->root.checkpoint_lower_lsn = participant->physical_lower;
+		owner->root.validated_tail_lsn_exclusive = participant->tail_end;
+		owner->checkpoint.source = f->typed.sources[i];
+		owner->checkpoint.checkpoint_start = end - 1;
+		owner->checkpoint.checkpoint.redo = participant->native_redo;
+		owner->checkpoint.checkpoint.ThisTimeLineID = participant->timeline;
+		owner->captured = true;
 	}
 	UT_ASSERT_EQ(cluster_cold_tt_base_capture_v1(&f->typed, (Size)1024 * 1024), CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(cluster_cold_tt_base_count_v1(&f->typed), 1);
@@ -3262,6 +3306,91 @@ tt_top_tx_seal_bound(TtRedoFixture *f, XLogRecPtr begin)
 	tt_readback_write(513, &folded.page, false);
 }
 
+UT_TEST(tt_top_tx_c0_producer_requires_original_checkpoint)
+{
+	for (int fault = 0; fault < 18; fault++) {
+		TtRedoFixture f;
+		TtCheckpointOwnerFixtureV1 *owner;
+		ClusterColdTtSlotInputV1 input;
+		ClusterColdTopTxProofV1 proof;
+		ClusterRecoveryTTAbortV1 shape;
+		ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
+
+		tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+		tt_top_tx_seal_bound(&f, 100);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &input));
+		f.typed.xid_next_after_redo = UINT64_C(0x700400200);
+		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+		tt_top_tx_effects_complete(&f);
+		tt_top_tx_endpoints_complete(&f);
+		owner = &f.checkpoints[0];
+		switch (fault) {
+		case 0:
+			break;
+		case 1:
+			f.typed.replay_roots = NULL;
+			break;
+		case 2:
+			owner->captured = false;
+			break;
+		case 3:
+			owner->checkpoint.source.claim.claim_sha256[0] ^= 1;
+			break;
+		case 4:
+			owner->root.identity.origin_owner_incarnation++;
+			break;
+		case 5:
+			owner->root.checkpoint_tli++;
+			break;
+		case 6:
+			owner->root.checkpoint_lower_lsn++;
+			break;
+		case 7:
+			owner->root.validated_tail_lsn_exclusive++;
+			break;
+		case 8:
+			owner->checkpoint.checkpoint.ThisTimeLineID++;
+			break;
+		case 9:
+			owner->checkpoint.checkpoint.redo++;
+			break;
+		case 10:
+			owner->checkpoint.checkpoint_start = InvalidXLogRecPtr;
+			break;
+		case 11:
+			owner->checkpoint.checkpoint_start = 99;
+			break;
+		case 12:
+			owner->checkpoint.checkpoint_start = 200;
+			break;
+		case 13:
+			owner->checkpoint.checkpoint_start = 201;
+			break;
+		case 14:
+			owner->checkpoint.checkpoint.redo = InvalidXLogRecPtr;
+			break;
+		case 15:
+			owner->checkpoint.checkpoint.redo = 99;
+			break;
+		case 16:
+			owner->checkpoint.checkpoint.redo = 200;
+			break;
+		case 17:
+			proof.qualified_base = false;
+			break;
+		}
+		memset(&out, 0xa9, sizeof(out));
+		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, false,
+															  InvalidTransactionId,
+															  UINT64_C(0x12345678), &out),
+					 fault == 0);
+		if (fault != 0)
+			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		tt_redo_destroy(&f);
+	}
+}
+
 UT_TEST(tt_top_tx_c0_producer_derives_top_from_native_bind)
 {
 	for (int mode = 0; mode < 5; mode++) {
@@ -3272,7 +3401,7 @@ UT_TEST(tt_top_tx_c0_producer_derives_top_from_native_bind)
 		ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
 
 		/* A retained pre-redo BIND is usable input, not a retention rule. */
-		tt_redo_fixture_at(&f, mode == 0 ? 100 : (mode == 4 ? 300 : 200), RF_SIDE_PLAN_RECOVERY,
+		tt_redo_fixture_at(&f, mode == 0 ? 100 : (mode >= 3 ? 300 : 200), RF_SIDE_PLAN_RECOVERY,
 						   mode == 3 ? 200 : 100);
 		if (mode == 1) {
 			RfSideUndoHeaderImageV1 folded;
@@ -3283,7 +3412,27 @@ UT_TEST(tt_top_tx_c0_producer_derives_top_from_native_bind)
 			tt_readback_write(513, &folded.page, false);
 		} else if (mode == 0)
 			tt_redo_seal(&f); /* Exact ACTIVE bytes alone cannot establish top. */
-		else {
+		else if (mode == 3) {
+			RfSideUndoHeaderImageV1 folded;
+			FakeXactRecord fake;
+			RfPageOnlineRecordIdentityV1 identity;
+			RfDetachedRecordPlanV1 record;
+
+			/* Leave room after redo for the selected checkpoint. The only
+			 * BIND remains in history; the replay suffix has no TT effect. */
+			tt_top_tx_bind(&f, 100, 4);
+			make_projection_record(&fake, RM_XLOG_ID, XLOG_NOOP, NULL, 0);
+			fake.u.decoded.max_block_id = -1;
+			identity = make_identity(&fake, f.typed.observer.storage_uuid);
+			set_identity_range(&fake, &identity, 200, 300);
+			record = make_projection_record_plan(&fake);
+			UT_ASSERT_EQ(
+				rf_side_online_plan_feed_record_v1(f.typed.side_plans[0], &record, &identity),
+				RF_PAGE_PROOF_DETAIL_OK);
+			tt_redo_seal(&f);
+			UT_ASSERT(cluster_cold_typed_tt_redo_header_v1(&f.typed, 0, 0, &folded));
+			tt_readback_write(513, &folded.page, false);
+		} else {
 			if (mode == 4)
 				tt_top_tx_bind(&f, 100, 4); /* Idempotent republication is legal. */
 			tt_top_tx_seal_bound(&f, mode == 4 ? 200 : 100);
@@ -4636,7 +4785,8 @@ UT_TEST(tt_top_tx_c0_producer_checks_unselected_undo_effects)
 int
 main(void)
 {
-	UT_PLAN(107);
+	UT_PLAN(108);
+	UT_RUN(tt_top_tx_c0_producer_requires_original_checkpoint);
 	UT_RUN(tt_top_tx_c0_producer_derives_top_from_native_bind);
 	UT_RUN(tt_top_tx_c0_producer_refuses_conflicting_bind_history);
 	UT_RUN(tt_top_tx_c0_producer_refuses_unproved_endpoint_coverage);

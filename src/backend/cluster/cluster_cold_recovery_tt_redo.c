@@ -21,6 +21,7 @@
 #include "cluster/cluster_recovery_undo_scan.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_uba.h"
+#include "cluster/cluster_wal_tail.h"
 
 static bool
 cold_tt_source(const ClusterColdTypedV1 *typed, uint32 participant, uint8 owner, uint32 segment,
@@ -490,6 +491,36 @@ cold_top_tx_native_bind_v1(const RfSideOnlinePlanV1 *plan, const ClusterColdTtSl
 	return false;
 }
 
+/* Consume the original owner's selected native checkpoint, not a caller's
+ * checkpoint number. This binds the source and replay cut only; it does not
+ * establish that any captured TT base is covered by that checkpoint. */
+static bool
+cold_top_tx_checkpoint_v1(const ClusterColdTypedV1 *typed, uint32 participant)
+{
+	const ClusterColdParticipantV1 *cut = &typed->participants[participant];
+	const ClusterWalSourceRef *source = &typed->sources[participant];
+	ClusterControlRootSnapshot root;
+	ClusterWalRecoveryCheckpointV1 selected;
+
+	if (!cluster_cold_typed_checkpoint_v1(typed, participant, &root, &selected))
+		return false;
+	return memcmp(&selected.source, source, sizeof(*source)) == 0
+		   && memcmp(&root.identity, &source->claim.identity, sizeof(root.identity)) == 0
+		   && root.identity.origin_thread_id == cut->thread_id
+		   && root.identity.origin_owner_incarnation == cut->owner_incarnation
+		   && root.checkpoint_tli == cut->timeline && source->timeline == cut->timeline
+		   && selected.checkpoint.ThisTimeLineID == cut->timeline
+		   && root.checkpoint_lower_lsn == cut->physical_lower
+		   && root.validated_tail_lsn_exclusive == cut->tail_end
+		   && !XLogRecPtrIsInvalid(selected.checkpoint_start)
+		   && selected.checkpoint_start >= cut->physical_lower
+		   && selected.checkpoint_start < cut->tail_end
+		   && !XLogRecPtrIsInvalid(selected.checkpoint.redo)
+		   && selected.checkpoint.redo == cut->native_redo
+		   && selected.checkpoint.redo >= cut->physical_lower
+		   && selected.checkpoint.redo <= selected.checkpoint_start;
+}
+
 bool
 cluster_cold_typed_top_tx_c0_producer_v1(const ClusterColdTypedV1 *typed, uint32 participant,
 										 const ClusterColdTopTxProofV1 *proof,
@@ -517,6 +548,7 @@ cluster_cold_typed_top_tx_c0_producer_v1(const ClusterColdTypedV1 *typed, uint32
 		|| memcmp(shape->target_claim_sha256, typed->sources[participant].claim.claim_sha256,
 				  sizeof(shape->target_claim_sha256))
 			   != 0
+		|| !cold_top_tx_checkpoint_v1(typed, participant)
 		|| !cluster_cold_typed_xid_maximum_v1(typed, &next_xid)
 		|| !cluster_cold_typed_effects_ready_v1(typed)
 		|| cluster_cold_tt_header_find_v1(typed, true, proof->key.owner_instance,
