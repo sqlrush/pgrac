@@ -915,6 +915,15 @@ typedef struct ClusterColdLoserIdentityV1 {
 	ClusterColdTtSlotKeyV1 key;
 } ClusterColdLoserIdentityV1;
 
+/* Attempt-local producer result.  The source owner supplies the proof and
+ * shape; this value only records the exact post-redo physical fact, the
+ * resulting loser key and the derived C0 fields.  It is never persisted. */
+typedef struct ClusterColdTopTxC0ProducerResultV1 {
+	ClusterColdTtActiveIdentityV1 active;
+	ClusterColdLoserIdentityV1 loser;
+	ClusterRecoveryTTAbortDerivationV1 c0;
+} ClusterColdTopTxC0ProducerResultV1;
+
 /* The loser gate is independent from FullXid/epoch derivation. C0 refuses
  * incomplete all-thread endpoints or any exact physical mismatch, while a
  * C0 derivation failure never turns an already-proven physical loser into an
@@ -927,6 +936,20 @@ extern bool cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
 									 bool all_endpoints_complete, bool has_oldest_xid,
 									 TransactionId oldest_xid, uint64 recoverer_epoch,
 									 ClusterRecoveryTTAbortDerivationV1 *out);
+
+/* Producer boundary for one original TT owner.  Locate the post-redo header
+ * by physical owner/segment, verify its complete sealed fold and exact slot
+ * before-image, then consume the original producer's TopTxProof/shape gates.
+ * Target incarnation/claim remain bound to the original source.  A new
+ * header with no original base requires the native full-image proof.
+ * The aggregate endpoint is the already-computed typed->xid_next_after_redo;
+ * a missing endpoint, post-redo image, proof gate or exact shape refuses.
+ * No proof bit is synthesized from source-drained state, current epoch or
+ * graph shape, and no old C0 replay consumer is called here. */
+extern bool cluster_cold_typed_top_tx_c0_producer_v1(
+	const ClusterColdTypedV1 *typed, uint32 participant, const ClusterColdTopTxProofV1 *proof,
+	const ClusterRecoveryTTAbortV1 *shape, bool all_endpoints_complete, bool has_oldest_xid,
+	TransactionId oldest_xid, uint64 recoverer_epoch, ClusterColdTopTxC0ProducerResultV1 *out);
 
 /* Re-enumerate physical TT after complete redo and the original durability
  * barrier, without overwriting the pre-redo base. Share its remaining budget.

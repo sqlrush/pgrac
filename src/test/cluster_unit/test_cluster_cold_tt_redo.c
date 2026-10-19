@@ -3118,6 +3118,104 @@ tt_post_readback_new(TtRedoFixture *f, PGAlignedBlock *expected, bool terminal)
 	tt_readback_write(513, expected, true);
 }
 
+UT_TEST(tt_top_tx_c0_producer_requires_original_owner_and_exact_post_redo)
+{
+	for (int new_header = 0; new_header < 2; new_header++) {
+		TtRedoFixture f;
+		PGAlignedBlock expected;
+		ClusterColdTtSlotInputV1 input;
+		ClusterColdTopTxProofV1 proof = { 0 };
+		ClusterRecoveryTTAbortV1 shape = { 0 };
+		ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
+		uint64 next_xid = UINT64_C(0x700400200);
+		uint32 offset = new_header ? 4 : 47;
+
+		if (new_header)
+			tt_post_readback_new(&f, &expected, false);
+		else {
+			tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+			tt_redo_seal(&f);
+		}
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, offset, &input));
+		f.typed.xid_next_after_redo = next_xid;
+		proof.key = input.key;
+		proof.producer_top = true;
+		proof.qualified_base = true;
+		proof.sealed_redo = true;
+		proof.ordinary_effects = true;
+		proof.old_writer_isolated = true;
+		proof.terminal_match = true;
+		shape.version = CLUSTER_RECOVERY_TT_ABORT_VERSION;
+		shape.length = CLUSTER_RECOVERY_TT_ABORT_BYTES;
+		shape.flags = CLUSTER_RECOVERY_TT_ABORT_TOP_KNOWN;
+		shape.target_thread = input.key.owner_instance;
+		shape.writer_thread = 1;
+		shape.target_incarnation = f.typed.participants[0].owner_incarnation;
+		shape.writer_incarnation = 12;
+		shape.recovery_serial = 13;
+		shape.target_epoch = 1;
+		memcpy(shape.target_claim_sha256, f.typed.sources[0].claim.claim_sha256,
+			   sizeof(shape.target_claim_sha256));
+		shape.exact.segment_id = input.key.segment_id;
+		shape.exact.segment_generation = input.key.segment_generation;
+		shape.exact.xid = input.key.xid;
+		shape.exact.slot_offset = input.key.slot_offset;
+		shape.exact.wrap = input.key.slot_wrap;
+		shape.exact.instance = input.key.owner_instance;
+		shape.exact.format_version = CLUSTER_UNDO_TT_ABORT_EXACT_VERSION;
+		shape.before = input.slot;
+		UT_ASSERT(cluster_recovery_tt_abort_shape_valid_v1(&shape));
+		UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, true, false,
+														   InvalidTransactionId,
+														   UINT64_C(0x12345678), &out));
+		UT_ASSERT(memcmp(&out.active.key, &input.key, sizeof(input.key)) == 0);
+		UT_ASSERT(memcmp(&out.loser.key, &input.key, sizeof(input.key)) == 0);
+		UT_ASSERT_EQ(out.c0.record.target_epoch, UINT64_C(0x12345678));
+		UT_ASSERT_EQ(out.c0.record.target_full_xid, out.c0.record.top_full_xid);
+		UT_ASSERT_EQ((uint32)out.c0.record.target_full_xid, input.key.xid);
+		UT_ASSERT(memcmp(&out.c0.record.before, &input.slot, sizeof(input.slot)) == 0);
+
+		for (int fault = 0; fault < 7; fault++) {
+			ClusterRecoveryTTAbortV1 rejected = shape;
+			ClusterColdTopTxProofV1 missing_proof = proof;
+			uint32 participant = 0;
+
+			f.typed.xid_next_after_redo = fault == 1 ? 0 : next_xid;
+			if (fault == 2)
+				participant = 1; /* A different/history owner cannot produce this C0. */
+			if (fault == 3)
+				rejected.target_incarnation++;
+			if (fault == 4)
+				rejected.target_claim_sha256[0] ^= 1;
+			if (fault == 5) {
+				if (UBA_is_invalid(input.slot.first_undo_block)) {
+					rejected.before.first_undo_block.raw[0] = (UINT64_C(5) << 32) | 513;
+					rejected.before.first_undo_block.raw[1] = offset;
+				} else
+					rejected.before.first_undo_block = (UBA)InvalidUba_init;
+				/* Both heads are valid shapes, but only one is the real before-image. */
+				UT_ASSERT(cluster_recovery_tt_abort_shape_valid_v1(&rejected));
+			}
+			if (fault == 6)
+				missing_proof.ordinary_effects = false;
+			memset(&out, 0xa9, sizeof(out));
+			UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(
+				&f.typed, participant, &missing_proof, &rejected, fault != 0, false,
+				InvalidTransactionId, UINT64_C(0x12345678), &out));
+			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		}
+		f.typed.xid_next_after_redo = next_xid;
+		cluster_cold_tt_after_redo_reset_v1(&f.typed);
+		memset(&out, 0xa9, sizeof(out));
+		UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, true,
+															false, InvalidTransactionId,
+															UINT64_C(0x12345678), &out));
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		tt_redo_destroy(&f);
+	}
+}
+
 UT_TEST(tt_post_readback_reconstructs_new_init_bind_and_commit_without_base)
 {
 	for (int mode = 0; mode < 3; mode++) {
@@ -4159,6 +4257,7 @@ main(void)
 	UT_RUN(tt_redo_active_identity_requires_post_redo_active_physical_slot);
 	UT_RUN(tt_top_tx_loser_requires_all_proof_gates_and_ignores_full_xid);
 	UT_RUN(tt_top_tx_c0_requires_physical_loser_and_complete_endpoints);
+	UT_RUN(tt_top_tx_c0_producer_requires_original_owner_and_exact_post_redo);
 	UT_RUN(tt_redo_match_refuses_each_stale_key_field_and_clears_output);
 	UT_RUN(tt_redo_slots_reject_unsealed_history_bounds_and_invalid_arguments);
 	UT_RUN(tt_redo_slots_refuse_source_drift_and_unsupported_prepared_input);

@@ -459,6 +459,60 @@ cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
 }
 
 bool
+cluster_cold_typed_top_tx_c0_producer_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+										 const ClusterColdTopTxProofV1 *proof,
+										 const ClusterRecoveryTTAbortV1 *shape,
+										 bool all_endpoints_complete, bool has_oldest_xid,
+										 TransactionId oldest_xid, uint64 recoverer_epoch,
+										 ClusterColdTopTxC0ProducerResultV1 *out)
+{
+	ClusterColdTopTxC0ProducerResultV1 result = { 0 };
+	RfSideUndoHeaderImageV1 post_image;
+	ClusterColdTtSlotInputV1 post_slot;
+	uint32 post_segment_index;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->replay_count > typed->participant_count || participant >= typed->replay_count
+		|| proof == NULL || shape == NULL
+		|| proof->key.owner_instance != typed->participants[participant].thread_id
+		|| !cluster_recovery_tt_abort_shape_valid_v1(shape)
+		|| shape->target_incarnation != typed->participants[participant].owner_incarnation
+		|| memcmp(shape->target_claim_sha256, typed->sources[participant].claim.claim_sha256,
+				  sizeof(shape->target_claim_sha256))
+			   != 0
+		|| typed->xid_next_after_redo == 0
+		|| cluster_cold_tt_header_find_v1(typed, true, proof->key.owner_instance,
+										  proof->key.segment_id, &post_segment_index)
+			   == NULL
+		|| !cluster_cold_tt_after_redo_slot_v1(typed, post_segment_index, proof->key.slot_offset,
+											   &post_slot)
+		|| post_slot.slot.status != TT_SLOT_ACTIVE
+		|| !cold_top_tx_key_equal_v1(&post_slot.key, &proof->key))
+		return false;
+	/* Compare the whole selected header with its sealed original fold.  A
+	 * newly-created segment requires the existing native full-image proof;
+	 * its observed bytes can never supply a missing predecessor. */
+	if (!cluster_cold_typed_tt_after_redo_readback_v1(typed, participant, post_segment_index,
+													  &post_image))
+		return false;
+	result.active.key = post_slot.key;
+	if (!cluster_cold_top_tx_loser_v1(&result.active, proof, &result.loser)
+		|| !cluster_cold_top_tx_c0_v1(&result.loser, shape, typed->xid_next_after_redo,
+									  all_endpoints_complete, has_oldest_xid, oldest_xid,
+									  recoverer_epoch, &result.c0)
+		|| cluster_recovery_tt_abort_match_v1(&result.c0.record, post_slot.key.segment_generation,
+											  &post_slot.slot)
+			   != CLUSTER_RECOVERY_TT_ABORT_APPLY)
+		return false;
+	*out = result;
+	return true;
+}
+
+bool
 cluster_cold_typed_undo_redo_record_v1(const ClusterColdTypedV1 *typed, uint32 participant,
 									   uint32 segment_index, UBA address,
 									   ClusterRecoveryUndoRecord *out, uint32 *generation)
