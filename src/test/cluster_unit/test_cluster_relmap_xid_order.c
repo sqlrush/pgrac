@@ -15,6 +15,9 @@
 
 /* Keep the producer, committed-image validation and merge unchanged. */
 #include "../../backend/utils/cache/relmapper.c"
+#include "../../backend/cluster/cluster_relmap_owner.c"
+#include "../../backend/cluster/cluster_wal_writer.c"
+#include "../../backend/cluster/cluster_wal_claim.c"
 
 #undef printf
 #undef fprintf
@@ -25,7 +28,13 @@
 UT_DEFINE_GLOBALS();
 
 bool cluster_shared_catalog = true;
+bool cluster_enabled = true, cluster_shared_config = true, enableFsync = true;
 int cluster_node_id = 3;
+int MyProcPid = 79;
+BackendType MyBackendType = B_BACKEND;
+volatile sig_atomic_t ShutdownRequestPending;
+int wal_segment_size = 1024 * 1024;
+char *cluster_wal_threads_dir = "/fixture-wal", *DataDir = "/fixture-data";
 int cluster_injection_armed_count;
 bool allowSystemTableMods;
 Oid MyDatabaseId = 12345;
@@ -56,6 +65,84 @@ static RelMapFile committed, updates, wal_image, staged_image[2];
 static ClusterRelmapOwner staged_owner[2];
 static bool staged_shared[2];
 static Oid staged_dbid[2];
+static uint64 writer_epoch, boot_incarnation, admitted_incarnation;
+static ClusterWalSourceRef writer_ref;
+static bool writer_available;
+static TimeLineID insert_timeline;
+static unsigned int writer_reads, observed_epoch_reads;
+static unsigned int drift_at, drift_kind;
+
+/* Original runtime providers are explicit fixtures; token checks are real. */
+uint64 GetSystemIdentifier(void) { return UINT64CONST(0x1122334455667788); }
+uint64 cluster_epoch_get_current(void) { return writer_epoch; }
+uint64 cluster_qvotec_get_self_incarnation(void) { return boot_incarnation; }
+uint64
+cluster_membership_get_last_admitted_incarnation(int32 node)
+{
+	UT_ASSERT_EQ(node, cluster_node_id);
+	return admitted_incarnation;
+}
+ClusterMembershipState
+cluster_membership_get_state(int32 node)
+{
+	UT_ASSERT_EQ(node, cluster_node_id);
+	return CLUSTER_MEMBER_MEMBER;
+}
+bool cluster_external_fence_runtime_active(void) { return true; }
+bool cluster_reconfig_has_pending_prebump_stage(void) { return false; }
+bool
+cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
+{
+	writer_reads++;
+	*out = writer_ref;
+	return writer_available;
+}
+bool
+cluster_wal_thread_initialized_writer_matches(const ClusterWalSourceRef *ref pg_attribute_unused(),
+											 uint64 epoch pg_attribute_unused())
+{
+	return false;
+}
+bool
+cluster_wal_thread_clean_writer_matches(const ClusterWalSourceRef *ref pg_attribute_unused(),
+									   uint64 epoch pg_attribute_unused())
+{
+	return false;
+}
+void
+cluster_write_fence_observe(ClusterWriteFenceObservation *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->enforcing = out->attached = out->engaged = out->allowed = true;
+	out->epoch_current = out->authorized_epoch = writer_epoch;
+	out->now_us = 100;
+	out->expiry_us = 10000;
+}
+bool IsTransactionState(void) { return true; }
+bool RecoveryInProgress(void) { return false; }
+TimeLineID GetWALInsertionTimeLine(void) { return insert_timeline; }
+bool LWLockHeldByMe(LWLock *lock) { return lock == RelationMappingLock && local_held; }
+FullTransactionId GetTopFullTransactionIdIfAny(void) { return assigned_xid; }
+
+static void
+change_original_owner(void)
+{
+	switch (drift_kind)
+	{
+		case 0: writer_epoch++; break;
+		case 1: boot_incarnation++; break;
+		case 2: admitted_incarnation++; break;
+		case 3: writer_ref.claim.claim_sha256[0]++; break;
+		case 4:
+			assigned_xid = FullTransactionIdFromU64(U64FromFullTransactionId(assigned_xid)
+												 + UINT64CONST(0x100000000));
+			break;
+		case 5: authority_held = false; break;
+		case 6: insert_timeline++; break;
+		case 7: ShutdownRequestPending = true; break;
+		default: abort();
+	}
+}
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -189,6 +276,8 @@ cluster_relmap_authority_read_committed(bool shared, Oid dbid,
 	UT_ASSERT_EQ(dbid, shared ? InvalidOid : MyDatabaseId);
 	memcpy(out, &committed, sizeof(committed));
 	*len = sizeof(committed);
+	if (drift_at == 1)
+		change_original_owner();
 	return true;
 }
 
@@ -248,12 +337,15 @@ XLogFlush(XLogRecPtr lsn)
 	UT_ASSERT_EQ(lsn, 1000 + inserts);
 	UT_ASSERT(local_held && CritSectionCount == 1);
 	flushes++;
+	if (drift_at == 2)
+		change_original_owner();
 }
 
 uint64
 cluster_reconfig_get_observed_epoch(int32 node)
 {
 	UT_ASSERT_EQ(node, cluster_node_id);
+	observed_epoch_reads++;
 	return 909;
 }
 
@@ -317,6 +409,25 @@ reset(bool preassigned)
 	xid_under_lock = xid_in_crit = local_acquires = 0;
 	begins = inserts = flushes = stages = preserves = sync_commits = 0;
 	CritSectionCount = 0;
+	ShutdownRequestPending = false;
+	writer_available = true;
+	writer_epoch = UINT64CONST(0x100000123);
+	boot_incarnation = admitted_incarnation = 99;
+	insert_timeline = 1;
+	writer_reads = observed_epoch_reads = drift_at = drift_kind = 0;
+	memset(&writer_ref, 0, sizeof(writer_ref));
+	writer_ref.timeline = insert_timeline;
+	writer_ref.claim.identity.system_identifier = GetSystemIdentifier();
+	memset(writer_ref.claim.identity.storage_uuid, 3, 16);
+	memset(writer_ref.claim.identity.authority_uuid, 5, 16);
+	writer_ref.claim.identity.origin_thread_id = cluster_node_id + 1;
+	writer_ref.claim.identity.origin_node_id = cluster_node_id;
+	writer_ref.claim.identity.origin_owner_incarnation = boot_incarnation;
+	writer_ref.claim.identity.root_lineage_seq = 9;
+	writer_ref.claim.identity.thread_claim_created_at = 23;
+	writer_ref.claim.database_incarnation = 7;
+	writer_ref.claim.max_config_generation = 1;
+	writer_ref.claim.claim_sha256[0] = 1;
 	memset(cluster_relmap_publish_arms, 0, sizeof(cluster_relmap_publish_arms));
 	memset(&shared_map, 0, sizeof(shared_map));
 	memset(&local_map, 0, sizeof(local_map));
@@ -359,7 +470,9 @@ check_success(bool shared, bool preassigned)
 	UT_ASSERT_EQ(staged_dbid[0], shared ? InvalidOid : MyDatabaseId);
 	UT_ASSERT_EQ(staged_owner[0].owner_node, cluster_node_id);
 	UT_ASSERT_EQ(staged_owner[0].owner_xid, xid_at_wal[0]);
-	UT_ASSERT_EQ(staged_owner[0].owner_epoch, 909);
+	UT_ASSERT_EQ(staged_owner[0].owner_epoch, UINT64CONST(0x100000123));
+	UT_ASSERT_EQ(observed_epoch_reads, 0);
+	UT_ASSERT(writer_reads > 0);
 	UT_ASSERT_EQ(staged_owner[0].relmap_lsn, 1001);
 	UT_ASSERT_EQ(staged_image[0].mappings[0].mapfilenumber, 501);
 	UT_ASSERT(memcmp(shared ? &shared_map : &local_map,
@@ -433,6 +546,66 @@ UT_TEST(unavailable_authority_lock_rejects_before_assignment)
 	check_error(true, false);
 }
 
+UT_TEST(unqualified_original_writer_rejects_before_local_effects)
+{
+	for (unsigned fault = 0; fault < 3; fault++)
+	{
+		reset(false);
+		if (fault == 0)
+			writer_available = false;
+		if (fault == 1)
+			admitted_incarnation++;
+		if (fault == 2)
+			writer_epoch = 0;
+		error_expected = true;
+		if (sigsetjmp(error_target, 1) == 0)
+		{
+			cluster_perform_relmap_update(fault != 1, &updates);
+			UT_ASSERT(false);
+		}
+		error_expected = false;
+		UT_ASSERT_EQ(error_level, ERROR);
+		UT_ASSERT_EQ(full_requests, 1);
+		UT_ASSERT_EQ(assignments, 1);
+		UT_ASSERT_EQ(local_acquires + begins + inserts + flushes + stages, 0);
+		UT_ASSERT_EQ(preserves + sync_commits + observed_epoch_reads, 0);
+		UT_ASSERT(!local_held && CritSectionCount == 0);
+		UT_ASSERT(!cluster_relmap_publish_arms[0].armed && !cluster_relmap_publish_arms[1].armed);
+	}
+}
+
+static void
+check_owner_drift(unsigned point)
+{
+	for (unsigned fault = 0; fault < 8; fault++)
+	{
+		reset(false);
+		drift_at = point;
+		drift_kind = fault;
+		error_expected = true;
+		if (sigsetjmp(error_target, 1) == 0)
+		{
+			cluster_perform_relmap_update((fault % 2) != 0, &updates);
+			UT_ASSERT(false);
+		}
+		error_expected = false;
+		UT_ASSERT_EQ(error_level, ERROR);
+		UT_ASSERT_EQ(full_requests, 1);
+		UT_ASSERT_EQ(assignments, 1);
+		UT_ASSERT_EQ(raw_requests + xid_under_lock + xid_in_crit, 0);
+		UT_ASSERT_EQ(local_acquires, 1);
+		UT_ASSERT_EQ(begins, point == 2 ? 1 : 0);
+		UT_ASSERT_EQ(inserts, point == 2 ? 1 : 0);
+		UT_ASSERT_EQ(flushes, point == 2 ? 1 : 0);
+		UT_ASSERT_EQ(stages + preserves + sync_commits + observed_epoch_reads, 0);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT(!cluster_relmap_publish_arms[0].armed && !cluster_relmap_publish_arms[1].armed);
+	}
+}
+
+UT_TEST(original_owner_drift_during_map_read_refuses_before_wal) { check_owner_drift(1); }
+UT_TEST(original_owner_drift_during_flush_refuses_before_pending) { check_owner_drift(2); }
+
 UT_TEST(both_namespaces_share_one_transaction_birth)
 {
 	reset(false);
@@ -454,7 +627,7 @@ UT_TEST(both_namespaces_share_one_transaction_birth)
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(13);
 	UT_RUN(shared_assigns_before_lock_and_wal);
 	UT_RUN(database_assigns_before_lock_and_wal);
 	UT_RUN(shared_reuses_existing_full_xid);
@@ -464,6 +637,9 @@ main(void)
 	UT_RUN(unresolved_pending_rejects_before_assignment);
 	UT_RUN(unavailable_header_rejects_before_assignment);
 	UT_RUN(unavailable_authority_lock_rejects_before_assignment);
+	UT_RUN(unqualified_original_writer_rejects_before_local_effects);
+	UT_RUN(original_owner_drift_during_map_read_refuses_before_wal);
+	UT_RUN(original_owner_drift_during_flush_refuses_before_pending);
 	UT_RUN(both_namespaces_share_one_transaction_birth);
 	UT_DONE();
 	return ut_failed_count != 0;

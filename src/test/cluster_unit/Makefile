@@ -541,7 +541,13 @@ TESTS += test_cluster_relmap_pending
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_pending,$(SIMPLE_TESTS))
 
 test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
-		$(top_srcdir)/src/backend/utils/cache/relmapper.c $(CLUSTER_UNIT_PORT_LIBS)
+		$(top_srcdir)/src/backend/utils/cache/relmapper.c \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_writer.c \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_writer.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_claim.h $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 

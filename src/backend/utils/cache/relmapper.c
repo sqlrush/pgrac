@@ -134,9 +134,9 @@
 #include "cluster/cluster_guc.h"		  /* cluster_enabled + cluster_smgr_user_relations */
 #include "cluster/cluster_inject.h"	  /* crash-window test levers (D5) */
 #include "cluster/cluster_mode.h"		  /* cluster_peer_mode_enabled (D5) */
-#include "cluster/cluster_reconfig.h"	  /* observed epoch for the owner header */
 #include "cluster/cluster_relmap_authority.h" /* shared relmap authority (D5) */
 #include "cluster/cluster_relmap_lock.h"  /* singleton relmap X lock (D5) */
+#include "cluster/cluster_relmap_owner.h" /* immutable producer identity */
 #include "cluster/cluster_sinval.h"		  /* cross-node inval ack barrier (2.39) */
 #include "cluster/storage/cluster_smgr.h" /* cluster_smgr_invalidate_relmap */
 #include "storage/sinval.h"				  /* SendSharedInvalidMessages */
@@ -1313,7 +1313,7 @@ cluster_perform_relmap_update(bool shared, const RelMapFile *updates)
 	ClusterRelmapAuthorityHeader hdr;
 	ClusterRelmapOwner owner;
 	ClusterRelmapPublishArm *arm = &cluster_relmap_publish_arms[shared ? 0 : 1];
-	FullTransactionId top_full_xid;
+	ClusterRelmapOwnerSampleV2 owner_sample;
 	uint64		newgen;
 	XLogRecPtr	lsn;
 	xl_relmap_update xlrec;
@@ -1355,8 +1355,11 @@ cluster_perform_relmap_update(bool shared, const RelMapFile *updates)
 				 errhint("A relation-map writer died before publishing; recovery "
 						 "arbitration resolves the pending image.")));
 
-	/* Assign the WAL owner before taking the local lock or writing any WAL. */
-	top_full_xid = GetTopFullTransactionId();
+	/* Fix the WAL owner before taking the local lock or writing relmap WAL. */
+	if (!cluster_relmap_owner_capture_v2(&owner_sample))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+				 errmsg("could not capture the cluster relation map writer identity")));
 
 	LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
 
@@ -1378,6 +1381,11 @@ cluster_perform_relmap_update(bool shared, const RelMapFile *updates)
 	COMP_CRC32C(newmap.crc, (char *) &newmap, offsetof(RelMapFile, crc));
 	FIN_CRC32C(newmap.crc);
 
+	if (!cluster_relmap_owner_matches_v2(&owner_sample))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+				 errmsg("cluster relation map writer identity changed before WAL insertion")));
+
 	/*
 	 * WAL first (same record as the vanilla path, so off-mode PITR and the
 	 * per-thread merged replay see identical history); the record LSN goes
@@ -1394,6 +1402,11 @@ cluster_perform_relmap_update(bool shared, const RelMapFile *updates)
 	XLogFlush(lsn);
 	END_CRIT_SECTION();
 
+	if (!cluster_relmap_owner_matches_v2(&owner_sample))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+				 errmsg("cluster relation map writer identity changed before staging")));
+
 	/*
 	 * Stage the pending image (durable, torn-safe; the substrate PANICs on
 	 * I/O failure -- fail-stop, same posture as the CF authority write).
@@ -1401,9 +1414,9 @@ cluster_perform_relmap_update(bool shared, const RelMapFile *updates)
 	 * between leaves an unpublished pending whose owner never committed,
 	 * which arbitration discards.
 	 */
-	owner.owner_node = (int16) cluster_node_id;
-	owner.owner_xid = XidFromFullTransactionId(top_full_xid);
-	owner.owner_epoch = cluster_reconfig_get_observed_epoch(cluster_node_id);
+	owner.owner_node = (int16) owner_sample.owner.node;
+	owner.owner_xid = XidFromFullTransactionId(FullTransactionIdFromU64(owner_sample.owner.top_full_xid));
+	owner.owner_epoch = owner_sample.owner.membership_epoch;
 	owner.relmap_lsn = (uint64) lsn;
 	cluster_relmap_authority_write_pending(shared, dbid, (const char *) &newmap,
 										   (uint32) sizeof(RelMapFile),
