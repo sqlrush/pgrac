@@ -6574,7 +6574,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(165);
+	UT_PLAN(168);
 	UT_RUN(test_normal_stop_peer_trace_is_default_off_and_observes_exact_bits);
 	UT_RUN(test_pre_front_buffer_observation_never_advances_cut);
 	UT_RUN(test_original_continuation_gate_ends_at_seal_or_original_deadline);
