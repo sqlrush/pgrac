@@ -88,6 +88,8 @@
  */
 static UndoCleanerSharedState *undo_cleaner_state = NULL;
 static int undo_cleaner_worker = -1;
+static ClusterCtrcActiveScan undo_cleaner_active_scan;
+static bool undo_cleaner_active_scan_pending;
 
 StaticAssertDecl(CLUSTER_UNDO_CLEANER_WORKER_TYPES == CLUSTER_CTRC_CLEANER_WORKERS,
 				 "each terminal-supply shard needs one distinct auxiliary process");
@@ -479,6 +481,8 @@ undo_cleaner_publish_status(UndoCleanerStatus status)
 	 * respawn.
 	 */
 	if (status == UNDO_CLEANER_SPAWNING) {
+		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
+		undo_cleaner_active_scan_pending = false;
 		MemSet(worker, 0, sizeof(*worker));
 		worker->pid = MyProcPid;
 		worker->spawned_at = now;
@@ -561,7 +565,7 @@ undo_cleaner_advance_liveness_tick(void)
  *	false, so the continuous mode can never busy-spin.
  */
 static bool
-undo_cleaner_run_pass(bool *out_work_remaining)
+undo_cleaner_run_pass(bool *out_work_remaining, bool maintenance_due)
 {
 	ClusterUndoCleanerPassStats stats;
 	ClusterSemanticAdmissionToken modifier_token;
@@ -570,11 +574,12 @@ undo_cleaner_run_pass(bool *out_work_remaining)
 	bool ctrc_local_progress;
 
 	*out_work_remaining = false;
+	undo_cleaner_active_scan_pending = false;
 
-	if (!cluster_undo_cleaner_enabled)
+	if (!cluster_undo_cleaner_enabled || !cluster_storage_mode_enabled()) {
+		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
 		return false;
-	if (!cluster_storage_mode_enabled())
-		return false;
+	}
 
 	/* Each bound worker advances only its canonical TT segment shard.
 	 * The helper holds no cleaner lock while sampling or doing physical work. */
@@ -594,7 +599,20 @@ undo_cleaner_run_pass(bool *out_work_remaining)
 	 * coordinator waits for their real owners to become idle before park.
 	 * An already admitted maintenance pass still completes and releases its
 	 * modifier normally; this observation grants no shutdown/park authority. */
-	if (cluster_normal_stop_maintenance_cut())
+	if (cluster_normal_stop_maintenance_cut()) {
+		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
+		return false;
+	}
+	/* This reference only widens census keys; it grants no freeze authority.
+	 * Keep an incomplete cursor across slices, including a busy entry lock. */
+	if (undo_cleaner_active_scan.status != CTRC_ACTIVE_SCAN_INCOMPLETE)
+		(void)cluster_ctrc_active_scan_begin(&undo_cleaner_active_scan,
+											 ReadNextFullTransactionId());
+	cluster_ctrc_active_scan_step(&undo_cleaner_active_scan);
+	undo_cleaner_active_scan_pending
+		= undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_INCOMPLETE;
+	/* Census continuation must not accelerate optional segment maintenance. */
+	if (!maintenance_due)
 		return false;
 	writable_admission = cluster_reconfig_self_join_gate_verdict() == CLUSTER_JOIN_GATE_ALLOW;
 	if (cluster_semantic_activation_modifier_enter(writable_admission, &modifier_token)
@@ -874,6 +892,9 @@ undo_cleaner_normal_stop_park(void)
 void
 UndoCleanerMain(void)
 {
+	TimestampTz maintenance_at = 0;
+	bool maintenance_due = true;
+
 	/* HC1 reverse defense: we must be a postmaster child. */
 	Assert(IsUnderPostmaster);
 	undo_cleaner_worker = ClusterUndoCleanerWorkerIdForType(MyAuxProcType);
@@ -948,12 +969,14 @@ UndoCleanerMain(void)
 
 		CLUSTER_INJECTION_POINT("undo-cleaner-main-loop-iter");
 
-		floor_retry = undo_cleaner_run_pass(&work_remaining);
+		floor_retry = undo_cleaner_run_pass(&work_remaining, maintenance_due);
 		LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
 		undo_cleaner_state->workers[undo_cleaner_worker].local_completed_passes
 			= cluster_ctrc_cleaner_local_passes();
 		undo_cleaner_state->workers[undo_cleaner_worker].local_progress_events
 			= cluster_ctrc_cleaner_local_progress();
+		if (undo_cleaner_worker == 0)
+			undo_cleaner_state->workers[0].active_census = undo_cleaner_active_scan;
 		LWLockRelease(&undo_cleaner_state->lwlock);
 		/* The complete outer pass, including worker0 GC/segment work and
 		 * modifier release, has returned. Cover the fast-continue edge too. */
@@ -970,8 +993,10 @@ UndoCleanerMain(void)
 		 * and the signal requires PROGRESS, so a pinned or stalled floor
 		 * always falls through to the waits below.
 		 */
-		if (work_remaining)
+		if (work_remaining) {
+			maintenance_due = true;
 			continue;
+		}
 
 		/*
 		 * interval 0 = pressure-wakeup only (Q8): block without
@@ -988,12 +1013,24 @@ UndoCleanerMain(void)
 		 * bounds the interval=0 mode, whose stalled pass previously
 		 * waited on a latch nobody was obliged to set.
 		 */
-		timeout_ms = cluster_undo_cleaner_interval_ms;
-		if (floor_retry) {
-			int retry_ms = Max(cluster_lmon_main_loop_interval, 200);
+		if (maintenance_due) {
+			timeout_ms = cluster_undo_cleaner_interval_ms;
+			if (floor_retry) {
+				int retry_ms = Max(cluster_lmon_main_loop_interval, 200);
 
-			if (timeout_ms <= 0 || retry_ms < timeout_ms)
-				timeout_ms = retry_ms;
+				if (timeout_ms <= 0 || retry_ms < timeout_ms)
+					timeout_ms = retry_ms;
+			}
+			maintenance_at = timeout_ms > 0
+								 ? TimestampTzPlusMilliseconds(GetCurrentTimestamp(), timeout_ms)
+								 : 0;
+		} else if (maintenance_at != 0) {
+			TimestampTz now = GetCurrentTimestamp();
+			int64 remaining_ms = maintenance_at > now ? (maintenance_at - now + 999) / 1000 : 1;
+
+			timeout_ms = (int)Min(remaining_ms, PG_INT32_MAX);
+		} else {
+			timeout_ms = 0;
 		}
 		/* A DRAIN wake is not proof that the terminal census can succeed
 		 * in that pass. Retry retained responsibilities within the original
@@ -1001,11 +1038,17 @@ UndoCleanerMain(void)
 		 * park and completion checks above remain the sole exit authority. */
 		if (cluster_normal_stop_requested() && (timeout_ms <= 0 || timeout_ms > 200))
 			timeout_ms = 200;
+		if (undo_cleaner_active_scan_pending && (timeout_ms <= 0 || timeout_ms > 10))
+			timeout_ms = 10;
 		rc = WaitLatch(
 			MyLatch, WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | (timeout_ms > 0 ? WL_TIMEOUT : 0),
 			timeout_ms > 0 ? timeout_ms : -1L, WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP);
 		if (rc & WL_LATCH_SET)
 			ResetLatch(MyLatch);
+		/* Preserve the original maintenance deadline across census-only wakes.
+		 * Pressure/signals still request a complete pass immediately. */
+		maintenance_due = (rc & WL_LATCH_SET) != 0
+						  || (maintenance_at != 0 && GetCurrentTimestamp() >= maintenance_at);
 	}
 
 	CLUSTER_INJECTION_POINT("undo-cleaner-shutdown-pre");

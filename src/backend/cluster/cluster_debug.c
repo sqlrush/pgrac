@@ -997,6 +997,19 @@ dump_undo_cleaner(ReturnSetInfo *rsinfo)
 		emit_row(rsinfo, prefix, "main_loop_iters", fmt_int64(row.main_loop_iters));
 		emit_row(rsinfo, prefix, "local_completed_passes", fmt_int64(row.local_completed_passes));
 		emit_row(rsinfo, prefix, "local_progress_events", fmt_int64(row.local_progress_events));
+		if (i == 0) {
+			emit_row(rsinfo, prefix, "active_census_status", fmt_int32(row.active_census.status));
+			emit_row(rsinfo, prefix, "active_census_position",
+					 fmt_int64(row.active_census.next_index));
+			emit_row(rsinfo, prefix, "active_census_entries",
+					 fmt_int64(row.active_census.total_entries));
+			emit_row(rsinfo, prefix, "active_census_reference_full",
+					 fmt_int64(U64FromFullTransactionId(row.active_census.reference_full)));
+			emit_row(rsinfo, prefix, "active_census_min_full",
+					 fmt_int64(U64FromFullTransactionId(row.active_census.min_full)));
+			emit_row(rsinfo, prefix, "active_census_lock_busy",
+					 row.active_census.lock_busy ? "true" : "false");
+		}
 		if (cluster_ctrc_cleaner_worker_observation(i, &observation)) {
 			emit_row(rsinfo, prefix, "dispatch_backlog", fmt_int64(observation.dispatch_backlog));
 			emit_row(rsinfo, prefix, "certificate_backlog",

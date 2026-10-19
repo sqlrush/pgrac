@@ -1090,6 +1090,8 @@ UT_TEST(test_service_lmd_participation_is_frozen_not_live_pid_dependent)
 static UndoCleanerSharedState cleaner_region;
 static UndoCleanerSharedState *undo_cleaner_state = &cleaner_region;
 static int undo_cleaner_worker = -1;
+static ClusterCtrcActiveScan undo_cleaner_active_scan;
+static bool undo_cleaner_active_scan_pending;
 static pg_on_exit_callback exit_callback;
 static sigjmp_buf main_exit;
 static unsigned main_passes, main_waits, main_bindings;
@@ -1098,6 +1100,9 @@ static bool main_early_shutdown, main_pass_failure;
 static bool main_progress;
 static bool main_drain_probe, main_probe_without_stop, main_probe_floor_retry;
 static long main_observed_timeout;
+static bool main_census_probe, main_census_latch;
+static bool main_census_maintenance_due[2];
+static long main_census_timeouts[2];
 static bool sinval_main_test;
 static bool lms_main_test;
 static int test_lms_wait(void);
@@ -1234,6 +1239,19 @@ int
 WaitLatch(Latch *latch pg_attribute_unused(), int events, long timeout pg_attribute_unused(),
 		  uint32 event pg_attribute_unused())
 {
+	if (main_census_probe) {
+		UT_ASSERT_EQ(lock_holds, 0);
+		UT_ASSERT(!modifier_held);
+		UT_ASSERT_EQ(main_passes, main_waits + 1);
+		UT_ASSERT_EQ((events & WL_TIMEOUT) != 0, timeout > 0);
+		if (main_waits >= lengthof(main_census_timeouts))
+			abort();
+		main_census_timeouts[main_waits++] = timeout;
+		if (main_waits == 2)
+			siglongjmp(main_exit, 1);
+		fixture_now += timeout * 1000;
+		return main_census_latch ? WL_LATCH_SET : WL_TIMEOUT;
+	}
 	if (main_drain_probe) {
 		UT_ASSERT_EQ(lock_holds, 0);
 		UT_ASSERT(!modifier_held);
@@ -1336,10 +1354,21 @@ undo_cleaner_shutdown_requested(void)
 }
 
 static bool
-undo_cleaner_run_pass(bool *work_remaining)
+undo_cleaner_run_pass(bool *work_remaining, bool maintenance_due)
 {
 	modifier_held = true;
 	main_passes++;
+	if (main_census_probe) {
+		if (main_passes > lengthof(main_census_maintenance_due))
+			abort();
+		main_census_maintenance_due[main_passes - 1] = maintenance_due;
+		undo_cleaner_active_scan_pending = main_passes == 1;
+		undo_cleaner_active_scan.status
+			= main_passes == 1 ? CTRC_ACTIVE_SCAN_INCOMPLETE : CTRC_ACTIVE_SCAN_COMPLETE;
+		modifier_held = false;
+		*work_remaining = false;
+		return false;
+	}
 	if (main_drain_probe) {
 		/* A terminal sample can still refuse after a wakeup; the original
 		 * owner must get another pass, without signing park or completion. */
@@ -1375,7 +1404,8 @@ run_actual_cleaner_main(unsigned worker, bool request_before, bool progress, boo
 {
 	sinval_main_test = false;
 	seed_drain_boundary();
-	if (main_drain_probe && main_probe_without_stop)
+	undo_cleaner_active_scan_pending = false;
+	if ((main_drain_probe && main_probe_without_stop) || main_census_probe)
 		pg_atomic_write_u32(&cl_normal_stop->requested, 0);
 	MyAuxProcType = ClusterUndoCleanerTypeForWorker(worker);
 	if (request_before) {
@@ -1466,6 +1496,30 @@ UT_TEST(test_actual_cleaner_without_stop_preserves_idle_cadence)
 		UT_ASSERT_EQ(main_waits, 1);
 	}
 	main_drain_probe = main_probe_without_stop = false;
+	cluster_undo_cleaner_interval_ms = saved_interval;
+}
+
+UT_TEST(test_actual_cleaner_census_wakes_keep_original_maintenance_deadline)
+{
+	static const int intervals[] = { 0, 1000, 5, 1000 };
+	static const long second_waits[] = { -1, 990, 5, 1000 };
+	int saved_interval = cluster_undo_cleaner_interval_ms;
+
+	main_census_probe = true;
+	for (unsigned i = 0; i < lengthof(intervals); i++) {
+		cluster_undo_cleaner_interval_ms = intervals[i];
+		main_census_latch = i == 3;
+		run_actual_cleaner_main(0, false, false, false, false);
+		UT_ASSERT_EQ(main_passes, 2);
+		UT_ASSERT_EQ(main_waits, 2);
+		UT_ASSERT(main_census_maintenance_due[0]);
+		UT_ASSERT_EQ(main_census_maintenance_due[1], intervals[i] == 5 || main_census_latch);
+		UT_ASSERT_EQ(main_census_timeouts[0], intervals[i] == 5 ? 5 : 10);
+		UT_ASSERT_EQ(main_census_timeouts[1], second_waits[i]);
+		UT_ASSERT_EQ(cleaner_region.workers[0].active_census.status, CTRC_ACTIVE_SCAN_COMPLETE);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->cleaner_quiesced_mask), 0);
+	}
+	main_census_probe = main_census_latch = false;
 	cluster_undo_cleaner_interval_ms = saved_interval;
 }
 
@@ -6417,7 +6471,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(162);
+	UT_PLAN(163);
 	UT_RUN(test_pre_front_buffer_observation_never_advances_cut);
 	UT_RUN(test_original_continuation_gate_ends_at_seal_or_original_deadline);
 	UT_RUN(test_actual_prepare_never_starts_native_work_after_producer_seal);
@@ -6429,6 +6483,7 @@ main(void)
 	UT_RUN(test_precheckpoint_wait_drives_its_own_cf_retirement);
 	UT_RUN(test_actual_cleaner_pending_stop_retries_before_recycle_interval);
 	UT_RUN(test_actual_cleaner_without_stop_preserves_idle_cadence);
+	UT_RUN(test_actual_cleaner_census_wakes_keep_original_maintenance_deadline);
 	UT_RUN(test_pre2_stop_clean_restart_binds_current_epoch_and_original_record);
 	UT_RUN(test_pre2_stop_refuses_unqualified_or_changed_current_epoch);
 	UT_RUN(test_clean_restart_terminal_receipt_uses_saved_current_epoch_without_recursion);

@@ -739,6 +739,30 @@ typedef struct ClusterCtrcCapacity {
 	Size total_bytes;
 } ClusterCtrcCapacity;
 
+#define CLUSTER_CTRC_ACTIVE_SCAN_SLICE 64
+
+typedef enum ClusterCtrcActiveScanStatus {
+	CTRC_ACTIVE_SCAN_NOT_STARTED = 0,
+	CTRC_ACTIVE_SCAN_INCOMPLETE,
+	CTRC_ACTIVE_SCAN_COMPLETE,
+	CTRC_ACTIVE_SCAN_INVALID
+} ClusterCtrcActiveScanStatus;
+
+/* Process-local read-only census component. Completion alone grants no
+ * freeze/truncation authority or protection against later registration. */
+typedef struct ClusterCtrcActiveScan {
+	ClusterCtrcActiveScanStatus status;
+	FullTransactionId reference_full;
+	FullTransactionId min_full;
+	uint64 next_index;
+	uint64 total_entries;
+	bool lock_busy;
+} ClusterCtrcActiveScan;
+
+extern bool cluster_ctrc_active_scan_begin(ClusterCtrcActiveScan *scan,
+										   FullTransactionId reference_full);
+extern void cluster_ctrc_active_scan_step(ClusterCtrcActiveScan *scan);
+
 typedef struct ClusterCtrcDebugSnapshot {
 	uint64 origin_open;
 	uint64 origin_sealing;

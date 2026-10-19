@@ -8116,10 +8116,11 @@ test_cluster_ctrc_capacity: test_cluster_ctrc_capacity.c test_cluster_ctrc_clean
 test_cluster_undo_cleaner: $(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
 	$(top_srcdir)/src/include/miscadmin.h
 
-test_cluster_ctrc_cleaner: test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc unit_test.h $(CLUSTER_SCN_O) \
+test_cluster_ctrc_cleaner: test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc unit_test.h $(CLUSTER_SCN_O) $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_SCN_O) \
+		$(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@

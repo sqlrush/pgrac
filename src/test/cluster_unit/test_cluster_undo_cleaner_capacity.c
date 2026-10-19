@@ -63,6 +63,9 @@ static uint32 test_inventory_max;
 static unsigned test_inventory_scans;
 static uint64 test_gc_reclaimed;
 static ClusterUndoSegTryRecycle test_recycle_result;
+static unsigned test_census_begins, test_census_steps, test_reference_reads;
+static FullTransactionId test_reference;
+static bool test_census_busy, test_census_invalid;
 bool cluster_undo_record_segment_commit_on_rollover;
 int cluster_undo_cleaner_batch_segments = 8;
 
@@ -80,6 +83,46 @@ cluster_ctrc_cleaner_run_pass(void)
 {
 	test_ctrc_passes++;
 	return test_ctrc_progress;
+}
+
+/* Original shared-array coverage is tested in test_cluster_ctrc_cleaner.
+ * These boundary inputs test the actual outer pass's owner and cadence. */
+FullTransactionId
+ReadNextFullTransactionId(void)
+{
+	if (test_lock_depth != 0)
+		abort();
+	test_reference_reads++;
+	return test_reference;
+}
+
+bool
+cluster_ctrc_active_scan_begin(ClusterCtrcActiveScan *scan, FullTransactionId reference)
+{
+	if (test_lock_depth != 0)
+		abort();
+	test_census_begins++;
+	MemSet(scan, 0, sizeof(*scan));
+	scan->reference_full = scan->min_full = reference;
+	scan->total_entries = 128;
+	scan->status = CTRC_ACTIVE_SCAN_INCOMPLETE;
+	return true;
+}
+
+void
+cluster_ctrc_active_scan_step(ClusterCtrcActiveScan *scan)
+{
+	if (test_lock_depth != 0 || test_ctrc_passes <= test_census_steps)
+		abort();
+	test_census_steps++;
+	if (test_census_invalid) {
+		scan->status = CTRC_ACTIVE_SCAN_INVALID;
+		scan->min_full = InvalidFullTransactionId;
+	} else if ((scan->lock_busy = test_census_busy) == false) {
+		scan->next_index += 64;
+		if (scan->next_index == scan->total_entries)
+			scan->status = CTRC_ACTIVE_SCAN_COMPLETE;
+	}
 }
 
 ClusterJoinGateVerdict
@@ -443,6 +486,12 @@ reset_wait_fixture(void)
 	test_inventory_scans = 0;
 	test_gc_reclaimed = 0;
 	test_recycle_result = CLUSTER_SEG_RECYCLE_ALREADY;
+	test_ctrc_passes = test_gc_passes = test_modifier_entries = test_modifier_leaves = 0;
+	test_census_begins = test_census_steps = test_reference_reads = 0;
+	test_census_busy = test_census_invalid = test_maintenance_cut = test_ctrc_progress = false;
+	test_reference = FullTransactionIdFromEpochAndXid(7, 100);
+	MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
+	undo_cleaner_active_scan_pending = false;
 	for (unsigned i = 0; i < CLUSTER_UNDO_CLEANER_WORKER_TYPES; i++) {
 		undo_cleaner_state->workers[i].status = UNDO_CLEANER_READY;
 		undo_cleaner_state->workers[i].latch = &test_proc.procLatch;
@@ -652,7 +701,7 @@ UT_TEST(test_outer_pass_keeps_terminal_supply_but_cuts_new_optional_maintenance)
 			test_maintenance_cut = cut != 0;
 			test_ctrc_progress = progress != 0;
 			test_ctrc_passes = test_gc_passes = test_modifier_entries = test_modifier_leaves = 0;
-			(void)undo_cleaner_run_pass(&remaining);
+			(void)undo_cleaner_run_pass(&remaining, true);
 			UT_ASSERT_EQ(test_ctrc_passes, 1);
 			UT_ASSERT_EQ(remaining, progress != 0);
 			UT_ASSERT_EQ(test_gc_passes, cut ? 0 : 1);
@@ -679,7 +728,7 @@ UT_TEST(test_full_history_batch_without_reclaim_yields)
 				= retained ? CLUSTER_SEG_RECYCLE_RETAINED : CLUSTER_SEG_RECYCLE_ALREADY;
 			test_ctrc_progress = test_maintenance_cut = false;
 			for (int pass = 0; pass < 3; pass++) {
-				UT_ASSERT(!undo_cleaner_run_pass(&remaining));
+				UT_ASSERT(!undo_cleaner_run_pass(&remaining, true));
 				UT_ASSERT(!remaining);
 			}
 			UT_ASSERT_EQ(test_inventory_scans, 24);
@@ -703,22 +752,126 @@ UT_TEST(test_real_recycle_progress_continues_then_yields)
 		test_ctrc_progress = test_maintenance_cut = false;
 		test_recycle_result = gc ? CLUSTER_SEG_RECYCLE_ALREADY : CLUSTER_SEG_RECYCLE_ADVANCED;
 		test_gc_reclaimed = gc ? 1 : 0;
-		UT_ASSERT(!undo_cleaner_run_pass(&remaining));
+		UT_ASSERT(!undo_cleaner_run_pass(&remaining, true));
 		UT_ASSERT(remaining);
 		UT_ASSERT_EQ(undo_cleaner_state->segments_marked_recyclable, gc ? 0 : 8);
 		UT_ASSERT_EQ(undo_cleaner_state->shmem_tt_slots_gcd, gc ? 1 : 0);
 		test_recycle_result = CLUSTER_SEG_RECYCLE_ALREADY;
 		test_gc_reclaimed = 0;
-		UT_ASSERT(!undo_cleaner_run_pass(&remaining));
+		UT_ASSERT(!undo_cleaner_run_pass(&remaining, true));
 		UT_ASSERT(!remaining);
 		UT_ASSERT_EQ(test_lock_depth, 0);
 	}
 }
 
+UT_TEST(test_worker_zero_starts_readonly_census_after_mandatory_work)
+{
+	bool remaining = true;
+
+	reset_wait_fixture();
+	undo_cleaner_worker = 0;
+	(void)undo_cleaner_run_pass(&remaining, true);
+	UT_ASSERT_EQ(test_ctrc_passes, 1);
+	UT_ASSERT_EQ(test_census_begins, 1);
+	UT_ASSERT_EQ(test_reference_reads, 1);
+	UT_ASSERT_EQ(test_census_steps, 1);
+	UT_ASSERT(undo_cleaner_active_scan_pending);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.next_index, 64);
+	UT_ASSERT(!remaining);
+	UT_ASSERT_EQ(test_lock_depth, 0);
+}
+
+UT_TEST(test_census_continuations_keep_cursor_without_accelerating_gc)
+{
+	bool remaining;
+
+	reset_wait_fixture();
+	undo_cleaner_worker = 0;
+	(void)undo_cleaner_run_pass(&remaining, true);
+	UT_ASSERT_EQ(test_modifier_entries, 1);
+	test_census_busy = true;
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT_EQ(test_census_begins, 1);
+	UT_ASSERT_EQ(test_reference_reads, 1);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.next_index, 64);
+	UT_ASSERT(undo_cleaner_active_scan_pending);
+	UT_ASSERT(!remaining);
+	test_census_busy = false;
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT_EQ(test_ctrc_passes, 3);
+	UT_ASSERT_EQ(test_census_steps, 3);
+	UT_ASSERT_EQ(test_census_begins, 1);
+	UT_ASSERT_EQ(test_modifier_entries, 1);
+	UT_ASSERT_EQ(test_modifier_leaves, 1);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT(!undo_cleaner_active_scan_pending);
+	UT_ASSERT(!remaining);
+}
+
+UT_TEST(test_census_has_one_worker_and_no_shutdown_or_disabled_continuation)
+{
+	bool remaining;
+
+	for (unsigned worker = 0; worker < CLUSTER_UNDO_CLEANER_WORKER_TYPES; worker++) {
+		reset_wait_fixture();
+		undo_cleaner_worker = worker;
+		(void)undo_cleaner_run_pass(&remaining, true);
+		UT_ASSERT_EQ(test_ctrc_passes, 1);
+		UT_ASSERT_EQ(test_census_begins, worker == 0 ? 1 : 0);
+		UT_ASSERT_EQ(test_census_steps, worker == 0 ? 1 : 0);
+		UT_ASSERT_EQ(undo_cleaner_active_scan_pending, worker == 0);
+	}
+	for (int disabled = 0; disabled < 2; disabled++) {
+		reset_wait_fixture();
+		undo_cleaner_worker = 0;
+		(void)undo_cleaner_run_pass(&remaining, true);
+		test_maintenance_cut = !disabled;
+		cluster_undo_cleaner_enabled = !disabled;
+		(void)undo_cleaner_run_pass(&remaining, false);
+		UT_ASSERT_EQ(test_census_steps, 1);
+		UT_ASSERT_EQ(test_ctrc_passes, disabled ? 1 : 2);
+		UT_ASSERT(!undo_cleaner_active_scan_pending);
+		UT_ASSERT_EQ(undo_cleaner_active_scan.status, CTRC_ACTIVE_SCAN_NOT_STARTED);
+	}
+}
+
+UT_TEST(test_census_invalid_sample_and_respawn_start_from_fresh_reference)
+{
+	bool remaining;
+	UndoCleanerWorkerState row;
+
+	reset_wait_fixture();
+	undo_cleaner_worker = 0;
+	test_census_invalid = true;
+	(void)undo_cleaner_run_pass(&remaining, true);
+	UT_ASSERT(!undo_cleaner_active_scan_pending);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.status, CTRC_ACTIVE_SCAN_INVALID);
+	test_census_invalid = false;
+	test_reference = FullTransactionIdFromEpochAndXid(8, 200);
+	(void)undo_cleaner_run_pass(&remaining, true);
+	UT_ASSERT_EQ(test_census_begins, 2);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.next_index, 64);
+	UT_ASSERT_EQ(U64FromFullTransactionId(undo_cleaner_active_scan.reference_full),
+				 U64FromFullTransactionId(test_reference));
+	undo_cleaner_state->workers[0].active_census = undo_cleaner_active_scan;
+	undo_cleaner_publish_status(UNDO_CLEANER_SPAWNING);
+	UT_ASSERT(!undo_cleaner_active_scan_pending);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.status, CTRC_ACTIVE_SCAN_NOT_STARTED);
+	UT_ASSERT(cluster_undo_cleaner_worker_snapshot(0, &row));
+	UT_ASSERT_EQ(row.active_census.status, CTRC_ACTIVE_SCAN_NOT_STARTED);
+	test_reference = FullTransactionIdFromEpochAndXid(9, 300);
+	(void)undo_cleaner_run_pass(&remaining, true);
+	UT_ASSERT_EQ(test_census_begins, 3);
+	UT_ASSERT_EQ(test_reference_reads, 3);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.next_index, 64);
+	UT_ASSERT_EQ(U64FromFullTransactionId(undo_cleaner_active_scan.min_full),
+				 U64FromFullTransactionId(test_reference));
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(12);
 	UT_RUN(test_capacity_wait_retries_signals_and_cadence_without_authorizing_free);
 	UT_RUN(test_capacity_every_blocking_hold_refuses_without_sleep);
 	UT_RUN(test_heavyweight_lock_identity_and_mode_are_exact);
@@ -727,6 +880,10 @@ main(void)
 	UT_RUN(test_outer_pass_keeps_terminal_supply_but_cuts_new_optional_maintenance);
 	UT_RUN(test_full_history_batch_without_reclaim_yields);
 	UT_RUN(test_real_recycle_progress_continues_then_yields);
+	UT_RUN(test_worker_zero_starts_readonly_census_after_mandatory_work);
+	UT_RUN(test_census_continuations_keep_cursor_without_accelerating_gc);
+	UT_RUN(test_census_has_one_worker_and_no_shutdown_or_disabled_continuation);
+	UT_RUN(test_census_invalid_sample_and_respawn_start_from_fresh_reference);
 	free(undo_cleaner_state);
 	UT_DONE();
 	return ut_failed_count != 0;

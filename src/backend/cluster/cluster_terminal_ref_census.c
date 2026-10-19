@@ -1749,6 +1749,107 @@ ctrc_participant_locks_release(uint32 mask)
 			LWLockRelease(&CtrcShared->participant_locks[i].lock);
 }
 
+/* A sample scans the original fixed arrays without consuming cleaner budgets.
+ * The captured reference is only the widening anchor, not a legal future xid. */
+bool
+cluster_ctrc_active_scan_begin(ClusterCtrcActiveScan *scan, FullTransactionId reference_full)
+{
+	if (scan == NULL)
+		return false;
+	MemSet(scan, 0, sizeof(*scan));
+	scan->status = CTRC_ACTIVE_SCAN_INVALID;
+	if (!FullTransactionIdIsValid(reference_full)
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(reference_full))
+		|| !cluster_ctrc_shmem_ready()
+		|| CtrcShared->origin_key_entries > UINT64_MAX - CtrcShared->participant_key_entries)
+		return false;
+	scan->reference_full = reference_full;
+	scan->min_full = reference_full;
+	scan->total_entries = CtrcShared->origin_key_entries + CtrcShared->participant_key_entries;
+	scan->status = CTRC_ACTIVE_SCAN_INCOMPLETE;
+	return true;
+}
+
+void
+cluster_ctrc_active_scan_step(ClusterCtrcActiveScan *scan)
+{
+	if (scan == NULL || scan->status != CTRC_ACTIVE_SCAN_INCOMPLETE)
+		return;
+	scan->lock_busy = false;
+	if (!ctrc_runtime_attached()
+		|| CtrcShared->origin_key_entries > UINT64_MAX - CtrcShared->participant_key_entries
+		|| scan->total_entries
+			   != CtrcShared->origin_key_entries + CtrcShared->participant_key_entries
+		|| scan->next_index >= scan->total_entries
+		|| !FullTransactionIdIsValid(scan->reference_full)
+		|| !FullTransactionIdIsValid(scan->min_full))
+		goto invalid;
+
+	for (unsigned visited = 0;
+		 visited < CLUSTER_CTRC_ACTIVE_SCAN_SLICE && scan->next_index < scan->total_entries;
+		 visited++) {
+		ClusterCtrcTxnKeyV1 key;
+		FullTransactionId full;
+		LWLock *lock;
+		uint64 index = scan->next_index;
+		bool occupied, valid;
+
+		if (index < CtrcShared->origin_key_entries) {
+			ClusterCtrcOriginEntry *entry = &ctrc_origin_entries()[index];
+
+			lock = &CtrcShared->origin_lock;
+			if (!LWLockConditionalAcquire(lock, LW_SHARED)) {
+				scan->lock_busy = true;
+				return;
+			}
+			occupied = !ctrc_bytes_zero(entry, sizeof(*entry));
+			key = entry->key;
+			valid = entry->state <= CTRC_ORIGIN_BLOCKED;
+		} else {
+			ClusterCtrcParticipantEntry *entry;
+			uint32 mask;
+			unsigned shard = 0;
+
+			index -= CtrcShared->origin_key_entries;
+			mask = ctrc_participant_lock_mask(index);
+			while ((mask & (UINT32_C(1) << shard)) == 0)
+				shard++;
+			lock = &CtrcShared->participant_locks[shard].lock;
+			if (!LWLockConditionalAcquire(lock, LW_SHARED)) {
+				scan->lock_busy = true;
+				return;
+			}
+			entry = &ctrc_participant_entries()[index];
+			occupied = !ctrc_bytes_zero(entry, sizeof(*entry));
+			key = entry->key;
+			valid = entry->state <= CTRC_PARTICIPANT_BLOCKED;
+		}
+		LWLockRelease(lock);
+		if (occupied) {
+			uint32 distance = key.xid - XidFromFullTransactionId(scan->reference_full);
+
+			if (!valid || !ctrc_txn_key_valid(&key) || !TransactionIdIsNormal(key.xid)
+				|| distance == UINT32_C(0x80000000)
+				|| (distance < UINT32_C(0x80000000)
+					&& U64FromFullTransactionId(scan->reference_full) > UINT64_MAX - distance))
+				goto invalid;
+			full = cluster_xid_widen(key.xid, scan->reference_full);
+			if (!FullTransactionIdIsValid(full))
+				goto invalid;
+			if (FullTransactionIdPrecedes(full, scan->min_full))
+				scan->min_full = full;
+		}
+		scan->next_index++;
+	}
+	if (scan->next_index == scan->total_entries)
+		scan->status = CTRC_ACTIVE_SCAN_COMPLETE;
+	return;
+
+invalid:
+	scan->min_full = InvalidFullTransactionId;
+	scan->status = CTRC_ACTIVE_SCAN_INVALID;
+}
+
 /*
  * ctrc_receipt_chain_exact_locked -- Validate a bounded physical locator chain.
  *

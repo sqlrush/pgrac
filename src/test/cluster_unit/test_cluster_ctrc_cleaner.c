@@ -31,6 +31,7 @@
 static unsigned spin_acquisitions;
 static unsigned sleepable_acquisitions;
 static unsigned held_count;
+static unsigned conditional_calls, conditional_refuse_call;
 static const void *held_locks[10];
 static const void *last_participant_lock;
 static LWLockMode last_pool_mode;
@@ -358,6 +359,15 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 	return true;
 }
 
+bool
+LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
+{
+	conditional_calls++;
+	if (conditional_refuse_call != 0 && conditional_calls == conditional_refuse_call)
+		return false;
+	return LWLockAcquire(lock, mode);
+}
+
 void
 LWLockRelease(LWLock *lock)
 {
@@ -459,6 +469,7 @@ reset_fixture(void)
 	CtrcShared = NULL;
 	cluster_ctrc_shmem_init();
 	wake_count = 0;
+	conditional_calls = conditional_refuse_call = 0;
 	test_now_us = UINT64_C(1000000);
 	spin_acquisitions = 0;
 	sleepable_acquisitions = 0;
@@ -2884,6 +2895,183 @@ UT_TEST(test_normal_stop_close_validation_and_local_caller_are_not_service_admis
 	UT_ASSERT_EQ(held_count, 0);
 }
 
+/* Exercise the original fixed tables and real scanner, not a copied reducer. */
+static void
+finish_active_scan(ClusterCtrcActiveScan *scan)
+{
+	unsigned slices = 0;
+
+	while (scan->status == CTRC_ACTIVE_SCAN_INCOMPLETE) {
+		cluster_ctrc_active_scan_step(scan);
+		if (++slices > 1000)
+			abort();
+	}
+}
+
+UT_TEST(test_active_scan_covers_fixed_arrays_in_bounded_slices)
+{
+	ClusterCtrcActiveScan scan;
+	uint64 before, slices = 0;
+	FullTransactionId reference = FullTransactionIdFromEpochAndXid(7, 10000);
+
+	reset_fixture();
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, reference));
+	UT_ASSERT_EQ(scan.total_entries, UINT64_C(61440));
+	do {
+		before = scan.next_index;
+		cluster_ctrc_active_scan_step(&scan);
+		UT_ASSERT_EQ(scan.next_index - before, 64);
+		UT_ASSERT_EQ(held_count, 0);
+		slices++;
+	} while (scan.status == CTRC_ACTIVE_SCAN_INCOMPLETE);
+	UT_ASSERT_EQ(slices, 960);
+	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(U64FromFullTransactionId(scan.min_full), U64FromFullTransactionId(reference));
+	before = conditional_calls;
+	cluster_ctrc_active_scan_step(&scan);
+	UT_ASSERT_EQ(conditional_calls, before);
+	UT_ASSERT_EQ(wake_count, 0);
+	UT_ASSERT_EQ(flush_calls, 0);
+	UT_ASSERT_EQ(durability_calls, 0);
+}
+
+UT_TEST(test_active_scan_keeps_reserved_and_all_unretired_origin_states)
+{
+	ClusterCtrcActiveScan scan;
+	ClusterCtrcOriginReservation reservation;
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcOriginEntry *origin;
+
+	reset_fixture();
+	origin = seed_origin(0, 0);
+	key = origin->key;
+	MemSet(origin, 0, sizeof(*origin));
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_entry(origin, &key, 0, 31, &reservation),
+				 CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	UT_ASSERT_EQ(origin->state, CTRC_ORIGIN_EMPTY);
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(7, 10000)));
+	finish_active_scan(&scan);
+	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(U64FromFullTransactionId(scan.min_full),
+				 U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(7, key.xid)));
+	for (unsigned state = CTRC_ORIGIN_OPEN; state <= CTRC_ORIGIN_BLOCKED; state++) {
+		origin->state = state;
+		UT_ASSERT(
+			cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(7, 10000)));
+		finish_active_scan(&scan);
+		UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+		UT_ASSERT_EQ(XidFromFullTransactionId(scan.min_full), key.xid);
+	}
+}
+
+UT_TEST(test_active_scan_keeps_participants_outside_worker_zero_shard)
+{
+	ClusterCtrcActiveScan scan;
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcParticipantEntry *last;
+
+	reset_fixture();
+	UT_ASSERT(cluster_ctrc_cleaner_bind_worker(0));
+	origin = seed_origin(0, 0);
+	last = &ctrc_participant_entries()[CtrcShared->participant_key_entries - 1];
+	last->key = origin->key;
+	last->key.xid = 6017;
+	MemSet(origin, 0, sizeof(*origin));
+	UT_ASSERT_NE(ctrc_participant_lock_mask(CtrcShared->participant_key_entries - 1), 1);
+	for (unsigned state = CTRC_PARTICIPANT_OPEN; state <= CTRC_PARTICIPANT_BLOCKED; state++) {
+		last->state = state;
+		UT_ASSERT(
+			cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(7, 10000)));
+		finish_active_scan(&scan);
+		UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+		UT_ASSERT_EQ(XidFromFullTransactionId(scan.min_full), 6017);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_active_scan_busy_lock_retains_exact_position_and_minimum)
+{
+	ClusterCtrcActiveScan scan;
+
+	reset_fixture();
+	seed_origin(0, 0);
+	seed_origin(1, 0)->key.xid = 6001;
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(7, 10000)));
+	conditional_refuse_call = 2;
+	cluster_ctrc_active_scan_step(&scan);
+	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_INCOMPLETE);
+	UT_ASSERT(scan.lock_busy);
+	UT_ASSERT_EQ(scan.next_index, 1);
+	UT_ASSERT_EQ(XidFromFullTransactionId(scan.min_full), 7001);
+	UT_ASSERT_EQ(held_count, 0);
+	conditional_refuse_call = 0;
+	cluster_ctrc_active_scan_step(&scan);
+	UT_ASSERT(!scan.lock_busy);
+	UT_ASSERT_EQ(scan.next_index, 65);
+	UT_ASSERT_EQ(XidFromFullTransactionId(scan.min_full), 6001);
+	finish_active_scan(&scan);
+	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+}
+
+UT_TEST(test_active_scan_corrupt_empty_entry_invalidates_sample)
+{
+	ClusterCtrcActiveScan scan;
+
+	reset_fixture();
+	ctrc_origin_entries()[1].reservation_generation = 9;
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(7, 10000)));
+	cluster_ctrc_active_scan_step(&scan);
+	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_INVALID);
+	UT_ASSERT_EQ(scan.next_index, 1);
+	UT_ASSERT(!FullTransactionIdIsValid(scan.min_full));
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_active_scan_fresh_begin_discards_previous_partial_sample)
+{
+	ClusterCtrcActiveScan scan;
+
+	reset_fixture();
+	seed_origin(0, 0);
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(7, 10000)));
+	cluster_ctrc_active_scan_step(&scan);
+	UT_ASSERT_EQ(scan.next_index, 64);
+	MemSet(&ctrc_origin_entries()[0], 0, sizeof(ClusterCtrcOriginEntry));
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(7, 11000)));
+	UT_ASSERT_EQ(scan.next_index, 0);
+	finish_active_scan(&scan);
+	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(XidFromFullTransactionId(scan.min_full), 11000);
+}
+
+UT_TEST(test_active_scan_widens_old_epoch_and_rejects_unrepresentable_xids)
+{
+	ClusterCtrcActiveScan scan;
+	ClusterCtrcOriginEntry *origin;
+
+	reset_fixture();
+	origin = seed_origin(0, 0);
+	origin->key.xid = UINT32_MAX - 5;
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(7, 100)));
+	finish_active_scan(&scan);
+	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(U64FromFullTransactionId(scan.min_full),
+				 U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(6, UINT32_MAX - 5)));
+	origin->key.xid = UINT32_C(0x80000000) + 100;
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(7, 100)));
+	cluster_ctrc_active_scan_step(&scan);
+	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_INVALID);
+	UT_ASSERT(!FullTransactionIdIsValid(scan.min_full));
+	UT_ASSERT_EQ(held_count, 0);
+	origin->key.xid = 5;
+	UT_ASSERT(cluster_ctrc_active_scan_begin(
+		&scan, FullTransactionIdFromEpochAndXid(UINT32_MAX, UINT32_MAX - 10)));
+	cluster_ctrc_active_scan_step(&scan);
+	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_INVALID);
+	UT_ASSERT(!FullTransactionIdIsValid(scan.min_full));
+	UT_ASSERT_EQ(held_count, 0);
+}
+
 int
 main(void)
 {
@@ -2891,7 +3079,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(63);
+	UT_PLAN(70);
 	printf("# CTRC header_bytes=%zu total_bytes=%zu\n", sizeof(ClusterCtrcSharedHeader),
 		   capacity.total_bytes);
 	UT_RUN(test_new_seals_do_not_starve_old_pending);
@@ -2957,6 +3145,13 @@ main(void)
 	UT_RUN(test_object_fence_refuses_new_receipt_without_publishing_participant);
 	UT_RUN(test_object_fence_retains_exact_duplicate_and_original_cancel);
 	UT_RUN(test_object_receipt_gate_does_not_change_private_or_other_tier);
+	UT_RUN(test_active_scan_covers_fixed_arrays_in_bounded_slices);
+	UT_RUN(test_active_scan_keeps_reserved_and_all_unretired_origin_states);
+	UT_RUN(test_active_scan_keeps_participants_outside_worker_zero_shard);
+	UT_RUN(test_active_scan_busy_lock_retains_exact_position_and_minimum);
+	UT_RUN(test_active_scan_corrupt_empty_entry_invalidates_sample);
+	UT_RUN(test_active_scan_fresh_begin_discards_previous_partial_sample);
+	UT_RUN(test_active_scan_widens_old_epoch_and_rejects_unrepresentable_xids);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
