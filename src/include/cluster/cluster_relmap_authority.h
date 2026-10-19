@@ -237,6 +237,19 @@ cluster_relmap_authority_v2_read(const ClusterRelmapV2Namespace *expected,
 								ClusterRelmapV2View *output);
 
 /*
+ * Dormant committed-only v2 reader facade.  A complete, identical pair is
+ * required; on success only the committed image and generation are copied to
+ * the outputs.  Pending obligations are intentionally not exposed through
+ * this API, while retention/recovery callers that need them must use the full
+ * v2 read above.  A degraded or incomplete pair clears both outputs and
+ * returns false.  There is no live v2 caller or activation through this
+ * primitive.
+ */
+extern bool cluster_relmap_authority_v2_read_committed(const ClusterRelmapV2Namespace *expected,
+												RelMapFile *map_out,
+												uint64 *generation_out);
+
+/*
  * Stage into an initialized, clean v2 pair, primary before backup, with both
  * copies synced and read back before returning true.  Never initializes or
  * repairs a missing/foreign/degraded authority, nor replaces an old pending.

@@ -584,6 +584,24 @@ cluster_relmap_authority_v2_read(const ClusterRelmapV2Namespace *expected,
 	return result;
 }
 
+bool
+cluster_relmap_authority_v2_read_committed(const ClusterRelmapV2Namespace *expected,
+										RelMapFile *map_out, uint64 *generation_out)
+{
+	ClusterRelmapV2View view;
+
+	if (expected == NULL || map_out == NULL || generation_out == NULL)
+		return false;
+	memset(map_out, 0, sizeof(*map_out));
+	*generation_out = 0;
+	if (cluster_relmap_authority_v2_read(expected, &view) != CLUSTER_RELMAP_V2_PAIR_VALID
+		|| !view.pending_complete)
+		return false;
+	*map_out = view.committed;
+	*generation_out = view.committed_generation;
+	return true;
+}
+
 /* Each replacement is file sync -> rename -> directory sync -> exact inode
  * and full byte readback.  Never roll the old primary into backup: the backup
  * must receive the same new pending obligation before stage can succeed. */

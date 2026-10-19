@@ -477,6 +477,37 @@ UT_TEST(test_stage_both_copies_before_success)
 	UT_ASSERT_EQ(dir_syncs, 2);
 }
 
+UT_TEST(test_committed_reader_hides_pending_and_rejects_degraded_pair)
+{
+	ClusterRelmapV2View view;
+	RelMapFile map;
+	RelMapFile zero;
+	unsigned char bytes[2176];
+	uint64 generation;
+
+	setup(&identity);
+	UT_ASSERT(stage(&identity));
+	memset(&map, 0xa5, sizeof(map));
+	generation = UINT64CONST(99);
+	UT_ASSERT(cluster_relmap_authority_v2_read_committed(&identity, &map, &generation));
+	UT_ASSERT_EQ(generation, UINT64CONST(7));
+	UT_ASSERT_EQ(map.mappings[0].mapfilenumber, 40000);
+	memset(&zero, 0, sizeof(zero));
+	UT_ASSERT_EQ(memcmp(&map, &zero, sizeof(map)) == 0, false);
+	UT_ASSERT_EQ(cluster_relmap_authority_v2_read(&identity, &view), CLUSTER_RELMAP_V2_PAIR_VALID);
+	UT_ASSERT(view.pending_complete && view.has_pending);
+	UT_ASSERT_EQ(view.pending.mappings[0].mapfilenumber, 40001);
+
+	read_copy(0, bytes);
+	bytes[128] ^= 1;
+	write_copy(0, bytes, sizeof(bytes));
+	memset(&map, 0xa5, sizeof(map));
+	generation = UINT64CONST(99);
+	UT_ASSERT(!cluster_relmap_authority_v2_read_committed(&identity, &map, &generation));
+	UT_ASSERT_EQ(generation, UINT64CONST(0));
+	UT_ASSERT_EQ(memcmp(&map, &zero, sizeof(map)) == 0, true);
+}
+
 UT_TEST(test_per_database_namespace)
 {
 	ClusterRelmapV2Namespace local = identity;
@@ -1451,8 +1482,9 @@ UT_TEST(test_changed_wal_cannot_rebind_staged_pin)
 int
 main(void)
 {
-	UT_PLAN(41);
+	UT_PLAN(42);
 	UT_RUN(test_stage_both_copies_before_success);
+	UT_RUN(test_committed_reader_hides_pending_and_rejects_degraded_pair);
 	UT_RUN(test_per_database_namespace);
 	UT_RUN(test_missing_authority_is_never_seeded);
 	UT_RUN(test_fallback_is_incomplete_and_cannot_stage);
