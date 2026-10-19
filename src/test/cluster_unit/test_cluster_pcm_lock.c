@@ -20823,6 +20823,40 @@ UT_TEST(test_resource_x_trace_is_exact_bounded_and_cannot_erase_unexported_evide
 	UT_ASSERT_EQ(cluster_pcm_grd_count(), 0);
 }
 
+UT_TEST(test_resource_x_trace_reserves_capacity_for_high_signal_events)
+{
+	BufferTag tag = make_tag(493);
+	ResourceXTraceStats stats;
+	ResourceXTraceEvent event = {0};
+	ResourceXTraceEvent exported[64];
+	uint64 cursor = 0;
+
+	reset_fake_pcm_runtime(16);
+	event.assertion.resource = tag;
+	event.assertion.requester_node = 0;
+	event.kind = RESOURCE_X_TRACE_PREUSE;
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_begin(&tag, 1));
+	for (uint32 i = 0; i < 16 * 64; i++)
+		cluster_pcm_lock_resource_x_trace_note(&event);
+	event.kind = RESOURCE_X_TRACE_SEND;
+	for (uint32 i = 0; i < 4 * 64; i++)
+		cluster_pcm_lock_resource_x_trace_note(&event);
+	cluster_pcm_lock_resource_x_trace_note(&event);
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_seal(1));
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_snapshot(&stats));
+	UT_ASSERT_EQ(stats.count, 16 * 64);
+	UT_ASSERT_EQ(stats.overflow, 1);
+	UT_ASSERT_EQ(stats.suppressed, 16 * 64 / 4);
+	while (cursor < stats.count)
+	{
+		uint32 copied = cluster_pcm_lock_resource_x_trace_read(1, cursor,
+													exported, lengthof(exported));
+		UT_ASSERT_EQ(copied, Min((uint64) lengthof(exported), stats.count - cursor));
+		cursor += copied;
+	}
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_release(1));
+}
+
 
 static void
 pi_relation_scan_setup(void)
@@ -23954,7 +23988,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(363);
+	UT_PLAN(364);
 	/* Observe the actual startup state before any runtime fixture overrides
 	 * the postmaster GUC or initializes shared PCM state and counters. */
 	UT_RUN(test_pcm_grd_max_entries_default_is_minus_one);
@@ -23984,6 +24018,7 @@ main(void)
 	UT_RUN(test_pcm_illegal_transition_validator_rejects);
 	UT_RUN(test_pcm_wait_margin_keeps_each_ratio_pair_and_separate_lifetimes);
 	UT_RUN(test_resource_x_trace_is_exact_bounded_and_cannot_erase_unexported_evidence);
+	UT_RUN(test_resource_x_trace_reserves_capacity_for_high_signal_events);
 	UT_RUN(test_resource_x_trace_observes_actual_head_and_same_ref_waiters);
 	UT_RUN(test_resource_x_trace_preserves_physical_authority_image_flags);
 	UT_RUN(test_pcm_vm_metrics_distinguish_requests_completions_and_latency);

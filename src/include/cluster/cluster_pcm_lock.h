@@ -1032,6 +1032,7 @@ typedef struct ResourceXTraceStats {
 	uint64 epoch;
 	uint64 count;
 	uint64 overflow;
+	uint64 suppressed;
 	uint64 late_events;
 	uint64 exported;
 	uint64 started_us;

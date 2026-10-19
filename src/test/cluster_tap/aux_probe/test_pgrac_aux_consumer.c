@@ -590,13 +590,14 @@ test_pgrac_rx_trace_stats(PG_FUNCTION_ARGS)
 	if (!cluster_pcm_lock_resource_x_trace_snapshot(&stats))
 		ereport(ERROR, (errmsg("bounded observation is unavailable")));
 	result = psprintf("{\"tag\":[%u,%u,%u,%d,%u],\"state\":%u,\"epoch\":%llu,"
-					  "\"count\":%llu,\"overflow\":%llu,\"late_events\":%llu,\"exported\":%llu,"
+					  "\"count\":%llu,\"overflow\":%llu,\"suppressed\":%llu,\"late_events\":%llu,\"exported\":%llu,"
 					  "\"started_us\":%llu,\"sealed_us\":%llu,\"capacity\":%u,\"owner_pid\":%d,"
 					  "\"record_bytes\":%zu}",
 					  stats.tag.spcOid, stats.tag.dbOid, stats.tag.relNumber, stats.tag.forkNum,
 					  stats.tag.blockNum, stats.state, (unsigned long long)stats.epoch,
 					  (unsigned long long)stats.count, (unsigned long long)stats.overflow,
-					  (unsigned long long)stats.late_events, (unsigned long long)stats.exported,
+					  (unsigned long long)stats.suppressed, (unsigned long long)stats.late_events,
+					  (unsigned long long)stats.exported,
 					  (unsigned long long)stats.started_us, (unsigned long long)stats.sealed_us,
 					  stats.capacity, stats.owner_pid, sizeof(ResourceXTraceEvent));
 	PG_RETURN_TEXT_P(cstring_to_text(result));

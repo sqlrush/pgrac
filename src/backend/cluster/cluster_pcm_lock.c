@@ -4466,6 +4466,29 @@ pcm_rx_trace_capacity(int entries)
 	return (uint32)Min((uint64)entries * 64, (uint64)RESOURCE_X_TRACE_MAX_EVENTS);
 }
 
+/* PREUSE/UNLOCK/FOLLOWER_JOIN are useful for coarse accounting but can be
+ * emitted at a much higher rate than the send/receive/apply/head/retire and
+ * operation boundary events needed to explain a stuck transfer.  Keep the
+ * historical bounded behavior for small fixtures; production-sized traces
+ * reserve one quarter of the ring for those high-signal events. */
+static bool
+pcm_rx_trace_low_signal(uint16 kind)
+{
+	return kind == RESOURCE_X_TRACE_PREUSE || kind == RESOURCE_X_TRACE_UNLOCK
+		|| kind == RESOURCE_X_TRACE_FOLLOWER_JOIN;
+}
+
+static bool
+pcm_rx_trace_reserve_high_signal(const ResourceXTraceStats *trace, uint16 kind)
+{
+	uint64 reserve;
+
+	if (trace->capacity < UINT32_C(1024) || !pcm_rx_trace_low_signal(kind))
+		return false;
+	reserve = trace->capacity / 4;
+	return reserve > 0 && trace->count >= trace->capacity - reserve;
+}
+
 bool
 cluster_pcm_lock_resource_x_trace_begin(const BufferTag *tag, uint64 epoch)
 {
@@ -4600,7 +4623,9 @@ cluster_pcm_lock_resource_x_trace_note(const ResourceXTraceEvent *event)
 	if (trace->state != RESOURCE_X_TRACE_RECORDING || trace->epoch != epoch)
 		trace->late_events++;
 	else if (BufferTagsEqual(&trace->tag, &value.assertion.resource)) {
-		if (trace->count == trace->capacity)
+		if (pcm_rx_trace_reserve_high_signal(trace, value.kind))
+			trace->suppressed++;
+		else if (trace->count == trace->capacity)
 			trace->overflow++;
 		else
 			pcm_rx_trace_events[trace->count++] = value;
