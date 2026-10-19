@@ -66,6 +66,7 @@
 #include "storage/backendid.h" /* PGRAC: spec-6.14 D9 amend — no-backend-identity guard */
 #include "storage/buf_internals.h"
 #include "storage/condition_variable.h" /* PGRAC: spec-2.31 D1 — wait_cv */
+#include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "storage/spin.h"
@@ -5108,6 +5109,7 @@ pcm_entry_wait_context_cleanup(PcmEntryWaitContext *context)
  * but retain only the exact pinned handle and logical Resource-X identity. */
 static PcmEntryWaitContext pcm_resource_x_executor_wait_context;
 static ResourceXAcquisitionRef pcm_resource_x_executor_wait_ref;
+static bool pcm_resource_x_executor_exit_hook_registered;
 
 static bool
 pcm_resource_x_executor_wait_ref_exact(const ResourceXAcquisitionRef *ref)
@@ -5125,6 +5127,26 @@ pcm_resource_x_executor_wait_cleanup(void)
 {
 	pcm_entry_wait_context_cleanup(&pcm_resource_x_executor_wait_context);
 	memset(&pcm_resource_x_executor_wait_ref, 0, sizeof(pcm_resource_x_executor_wait_ref));
+}
+
+static void
+pcm_resource_x_executor_before_shmem_exit(int code pg_attribute_unused(),
+									  Datum arg pg_attribute_unused())
+{
+	/* FATAL/proc_exit bypasses the PG_TRY/PG_FINALLY around the timed wait. */
+	pcm_resource_x_executor_wait_cleanup();
+}
+
+void
+cluster_pcm_lock_register_backend_exit_hook(void)
+{
+	bool backend_or_lms = MyBackendId > 0 || MyBackendType == B_LMS
+												|| MyBackendType == B_LMS_WORKER;
+
+	if (pcm_resource_x_executor_exit_hook_registered || !IsUnderPostmaster || !backend_or_lms)
+		return;
+	before_shmem_exit(pcm_resource_x_executor_before_shmem_exit, (Datum)0);
+	pcm_resource_x_executor_exit_hook_registered = true;
 }
 
 ResourceXApplyResult

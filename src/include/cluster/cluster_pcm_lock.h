@@ -2348,6 +2348,9 @@ extern uint64 cluster_pcm_get_trans_s_to_x_cleanout_count(void);
  */
 extern void cluster_pcm_lock_module_init(void);
 
+/* Register the backend-exit cleanup for an exact Resource-X executor wait. */
+extern void cluster_pcm_lock_register_backend_exit_hook(void);
+
 /* ============================================================
  * PGRAC: spec-2.36 D5 HC117 + HC124 — S barrier helpers.
  *

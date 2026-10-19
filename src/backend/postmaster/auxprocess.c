@@ -41,6 +41,7 @@
 #include "cluster/cluster_cssd.h"		  /* CssdMain (stage 2.5 Sprint A) */
 #include "cluster/cluster_qvotec.h"		  /* ClusterQvotecMain (spec-2.6 Sprint A Step 3 D7) */
 #include "cluster/cluster_lms.h"		  /* LmsMain (spec-2.18 Sprint A Step 1) */
+#include "cluster/cluster_pcm_lock.h" /* Resource-X executor exit cleanup */
 #include "cluster/cluster_lmd.h"		  /* LmdMain (spec-2.19 Sprint A Step 1) */
 #include "cluster/cluster_mrp.h"		  /* MrpMain (spec-6.4 D1) */
 #include "cluster/cluster_rfs.h"		  /* RfsMain (spec-6.4 D3) */
@@ -296,6 +297,13 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 
 	/* register a before-shutdown callback for LWLock cleanup */
 	before_shmem_exit(ShutdownAuxiliaryProcess, 0);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Register after ShutdownAuxiliaryProcess so LIFO runs this exact wait
+	 * cleanup before the generic auxiliary-process teardown. */
+	if (MyBackendType == B_LMS || MyBackendType == B_LMS_WORKER)
+		cluster_pcm_lock_register_backend_exit_hook();
+#endif
 
 	SetProcessingMode(NormalProcessing);
 

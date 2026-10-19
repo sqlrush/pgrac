@@ -69,6 +69,7 @@
 #include "miscadmin.h"
 #include "storage/backendid.h"	   /* spec-6.14 D9 amend — MyBackendId stub */
 #include "storage/buf_internals.h" /* BufferTag */
+#include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/spin.h"
 #include "utils/hsearch.h"
@@ -161,6 +162,16 @@ static ClusterPcmPiWriteCutV1 structural_master_write_cut;
 static ClusterPcmPiStorageCutV1 structural_master_storage_cut;
 static void (*structural_master_ack_hook)(void);
 static int fake_lwlock_depth = 0;
+static int fake_pcm_exit_hook_registrations = 0;
+
+extern void cluster_pcm_lock_register_backend_exit_hook(void);
+
+void
+before_shmem_exit(pg_on_exit_callback function pg_attribute_unused(),
+				  Datum arg pg_attribute_unused())
+{
+	fake_pcm_exit_hook_registrations++;
+}
 /* Object admission is a boundary fixture; PCM round/caller transitions below
  * remain the real product object. Tests may race the original entry lock. */
 int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
@@ -1378,6 +1389,25 @@ UT_TEST(test_pcm_lock_mode_constant_aliases_match_pcm_state)
 	UT_ASSERT_EQ((int)PCM_LOCK_MODE_N, (int)PCM_STATE_N);
 	UT_ASSERT_EQ((int)PCM_LOCK_MODE_S, (int)PCM_STATE_S);
 	UT_ASSERT_EQ((int)PCM_LOCK_MODE_X, (int)PCM_STATE_X);
+}
+
+UT_TEST(test_pcm_executor_exit_hook_registration_is_idempotent)
+{
+	bool saved_under_postmaster = IsUnderPostmaster;
+	BackendType saved_backend_type = MyBackendType;
+	BackendId saved_backend_id = MyBackendId;
+
+	fake_pcm_exit_hook_registrations = 0;
+	IsUnderPostmaster = true;
+	MyBackendType = B_LMS;
+	MyBackendId = InvalidBackendId;
+	cluster_pcm_lock_register_backend_exit_hook();
+	MyBackendId = 1;
+	cluster_pcm_lock_register_backend_exit_hook();
+	UT_ASSERT_EQ(fake_pcm_exit_hook_registrations, 1);
+	IsUnderPostmaster = saved_under_postmaster;
+	MyBackendType = saved_backend_type;
+	MyBackendId = saved_backend_id;
 }
 
 UT_TEST(test_pcm_lock_transition_count_is_9)
@@ -23954,7 +23984,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(363);
+	UT_PLAN(364);
 	/* Observe the actual startup state before any runtime fixture overrides
 	 * the postmaster GUC or initializes shared PCM state and counters. */
 	UT_RUN(test_pcm_grd_max_entries_default_is_minus_one);
@@ -23968,6 +23998,7 @@ main(void)
 	UT_RUN(test_resource_x_master_work_duplicate_and_error_leave_original_owner);
 
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
+	UT_RUN(test_pcm_executor_exit_hook_registration_is_idempotent);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
 	UT_RUN(test_pcm_buffer_desc_invariants_hold_at_stage_2_30);

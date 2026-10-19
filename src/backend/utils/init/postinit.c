@@ -70,6 +70,7 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_grd.h" /* spec-2.24 D7 cleanup_on_backend_exit_callback */
 #include "cluster/cluster_gcs_block_dedup.h" /* spec-6.14 D11 eager exit-hook registration */
+#include "cluster/cluster_pcm_lock.h" /* Resource-X executor wait exit cleanup */
 #include "cluster/cluster_tx_enqueue.h" /* spec-8.4 D9 exact wait exit cleanup */
 #endif
 
@@ -876,6 +877,14 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 * their calls as no-op backstops for processes that skip InitPostgres.
 	 */
 	cluster_gcs_block_dedup_register_backend_exit_hook();
+
+	/*
+	 * A FATAL or administrator-driven backend exit bypasses the PG_TRY/
+	 * PG_FINALLY around the exact Resource-X wait.  Register this after the
+	 * other backend hooks so its LIFO callback releases the pinned PCM entry
+	 * and wait reference before the lower-level GRD cleanup runs.
+	 */
+	cluster_pcm_lock_register_backend_exit_hook();
 #endif
 
 	/* The autovacuum launcher is done here */
