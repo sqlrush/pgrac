@@ -17,6 +17,7 @@
  */
 #include "postgres.h"
 
+#include "access/heapam_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_recovery_undo_scan.h"
 #include "cluster/cluster_side_online_plan.h"
@@ -409,6 +410,115 @@ cold_top_tx_key_equal_v1(const ClusterColdTtSlotKeyV1 *left,
 		   && left->segment_generation == right->segment_generation
 		   && left->slot_offset == right->slot_offset && left->xid == right->xid
 		   && left->slot_wrap == right->slot_wrap;
+}
+
+bool
+cluster_cold_typed_page_creator_v1(const ClusterColdTypedV1 *typed, uint32 frame_index,
+								   ClusterColdPageCreatorV1 *out)
+{
+	ClusterColdPageCreatorV1 result = { 0 };
+	const ClusterColdParticipantV1 *source;
+	const RfSideOnlinePlanV1 *plan;
+	RfSideOnlineOperationV1 prefix;
+	RfSideUndoHeaderImageV1 image;
+	const UndoSegmentHeaderData *header;
+	const TTSlot *slot;
+	uint32 count, prefix_index = UINT32_MAX;
+	bool has_header_work, found = false;
+	uint8 opcode;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK || typed->participant_count == 0
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->replay_count > typed->participant_count
+		|| cluster_cold_plan_participant_count_v1(typed->plan) != typed->participant_count
+		|| !cluster_cold_plan_record_frame_v1(typed->plan, frame_index, &result.frame)
+		|| result.frame.participant >= typed->replay_count || result.frame.history
+		|| result.frame.page_components == 0 || result.frame.space_effects != 0
+		|| !TransactionIdIsNormal(result.frame.source_xid)
+		|| (TransactionIdIsValid(result.frame.source_top_xid)
+			&& result.frame.source_top_xid != result.frame.source_xid))
+		return false;
+	opcode = result.frame.info & XLOG_HEAP_OPMASK;
+	if (!((result.frame.rmid == RM_HEAP_ID
+		   && (opcode == XLOG_HEAP_INSERT || opcode == XLOG_HEAP_UPDATE
+			   || opcode == XLOG_HEAP_HOT_UPDATE))
+		  || (result.frame.rmid == RM_HEAP2_ID && opcode == XLOG_HEAP2_MULTI_INSERT)))
+		return false;
+	source = &typed->participants[result.frame.participant];
+	if (!cluster_cold_plan_participant_matches_v1(typed->plan, result.frame.participant, source)
+		|| !cold_tt_redo_source(typed, result.frame.participant, 0, 0, &has_header_work))
+		return false;
+	plan = typed->side_plans[result.frame.participant];
+	count = rf_side_online_plan_operation_count_v1(plan);
+	/* The native publisher accepts only its original top xid. An absent
+	 * xl_top_xid is not itself top proof: the matching BIND supplies it. */
+	for (uint32 i = 0; i < count; i++) {
+		RfSideOnlineOperationV1 operation;
+		const ClusterUndoDecoded *bind = &operation.undo;
+
+		if (!rf_side_online_plan_operation_v1(plan, i, &operation))
+			return false;
+		if (operation.identity.record.read_rec_ptr >= result.frame.end_rec_ptr)
+			continue;
+		if (operation.identity.record.end_rec_ptr > result.frame.read_rec_ptr)
+			return false;
+		if (operation.kind != RF_SIDE_ONLINE_OPERATION_UNDO
+			|| bind->kind != CLUSTER_UNDO_KIND_TT_BIND || bind->xid != result.frame.source_xid)
+			continue;
+		if (found || bind->format_version != CLUSTER_UNDO_TT_BIND_VERSION
+			|| bind->instance != source->thread_id
+			|| (TransactionIdIsValid(operation.source_xid) && operation.source_xid != bind->xid)
+			|| (TransactionIdIsValid(operation.source_top_xid)
+				&& operation.source_top_xid != bind->xid))
+			return false;
+		result.key.owner_instance = bind->instance;
+		result.key.segment_id = bind->segment_id;
+		result.key.segment_generation = bind->expected_generation;
+		result.key.slot_offset = bind->slot_offset;
+		result.key.slot_wrap = bind->wrap;
+		result.key.xid = bind->xid;
+		found = true;
+	}
+	if (!found || !cold_top_tx_key_valid_v1(&result.key))
+		return false;
+	/* Fold only the causal prefix of this physical segment. Later COMMIT,
+	 * ABORT or reuse cannot erase the creator's earlier ACTIVE input. */
+	for (uint32 i = 0; i < count; i++) {
+		RfSideOnlineOperationV1 operation;
+		bool same_segment;
+
+		if (!rf_side_online_plan_operation_v1(plan, i, &operation))
+			return false;
+		if (operation.identity.record.end_rec_ptr > result.frame.read_rec_ptr)
+			continue;
+		same_segment = operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
+					   && operation.undo.instance == result.key.owner_instance
+					   && operation.undo.segment_id == result.key.segment_id;
+		if (operation.kind == RF_SIDE_ONLINE_OPERATION_XACT
+			&& operation.xact.kind == RF_SIDE_XACT_COMMIT && operation.xact.has_tt_delta)
+			same_segment = operation.xact.tt_delta.instance == result.key.owner_instance
+						   && operation.xact.tt_delta.segment_id == result.key.segment_id;
+		if (same_segment) {
+			prefix_index = i;
+			prefix = operation;
+		}
+	}
+	if (prefix_index == UINT32_MAX
+		|| rf_side_online_plan_prepare_undo_record_input_header_v1(plan, prefix_index,
+																   &prefix.identity, NULL, &image)
+			   != RF_PAGE_PROOF_DETAIL_OK
+		|| !image.has_full_image)
+		return false;
+	header = (const UndoSegmentHeaderData *)image.page.data;
+	slot = &header->tt_slots[result.key.slot_offset];
+	if (header->wrap_count != result.key.segment_generation || slot->status != TT_SLOT_ACTIVE
+		|| slot->xid != result.key.xid || slot->wrap != result.key.slot_wrap)
+		return false;
+	*out = result;
+	return true;
 }
 
 bool

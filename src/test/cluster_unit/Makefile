@@ -2952,6 +2952,7 @@ test_cluster_cold_tt_redo: test_cluster_cold_tt_redo_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o \
 		$(top_srcdir)/src/backend/cluster/cluster_cold_recovery_tt.c
 test_cluster_cold_tt_redo_product.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_tt_redo.c \
+		$(top_srcdir)/src/include/access/heapam_xlog.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@

@@ -2003,7 +2003,7 @@ rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan, uint8
 static RfPageProofDetailV1
 side_plan_prepare_undo_record(const RfSideOnlinePlanV1 *plan, uint32 index,
 							  const RfPageOnlineRecordIdentityV1 *identity, const char *base,
-							  bool header_only, RfSideUndoHeaderImageV1 *out)
+							  bool header_only, bool allow_history, RfSideUndoHeaderImageV1 *out)
 {
 	const RfSideOnlineOperationV1 *operation;
 	uint8 instance;
@@ -2014,7 +2014,7 @@ side_plan_prepare_undo_record(const RfSideOnlinePlanV1 *plan, uint32 index,
 		|| index >= plan->operation_count)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	operation = &plan->operations[index];
-	if (operation->history_only || operation->purpose != RF_SIDE_PLAN_RECOVERY
+	if ((operation->history_only && !allow_history) || operation->purpose != RF_SIDE_PLAN_RECOVERY
 		|| identity->reserved_zero != 0
 		|| identity->participant_index != operation->identity.participant_index
 		|| memcmp(&identity->record, &operation->identity.record, sizeof(identity->record)) != 0
@@ -2060,7 +2060,7 @@ rf_side_online_plan_prepare_undo_record_v1(const RfSideOnlinePlanV1 *plan, uint3
 										   const RfPageOnlineRecordIdentityV1 *identity,
 										   const char *base, RfSideUndoHeaderImageV1 *out)
 {
-	return side_plan_prepare_undo_record(plan, index, identity, base, false, out);
+	return side_plan_prepare_undo_record(plan, index, identity, base, false, false, out);
 }
 
 RfPageProofDetailV1
@@ -2068,7 +2068,15 @@ rf_side_online_plan_prepare_undo_record_header_v1(const RfSideOnlinePlanV1 *plan
 												  const RfPageOnlineRecordIdentityV1 *identity,
 												  const char *base, RfSideUndoHeaderImageV1 *out)
 {
-	return side_plan_prepare_undo_record(plan, index, identity, base, true, out);
+	return side_plan_prepare_undo_record(plan, index, identity, base, true, false, out);
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_record_input_header_v1(
+	const RfSideOnlinePlanV1 *plan, uint32 index, const RfPageOnlineRecordIdentityV1 *identity,
+	const char *base, RfSideUndoHeaderImageV1 *out)
+{
+	return side_plan_prepare_undo_record(plan, index, identity, base, true, true, out);
 }
 
 RfPageProofDetailV1

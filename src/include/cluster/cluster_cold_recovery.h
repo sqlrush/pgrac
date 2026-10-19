@@ -948,6 +948,24 @@ typedef struct ClusterColdTtSlotKeyV1 {
 	uint16 slot_wrap;
 } ClusterColdTtSlotKeyV1;
 
+/* Read-only canonical input for the new creator of one retained heap record.
+ * This covers INSERT/UPDATE/HOT_UPDATE and MULTI_INSERT only, not old tuple
+ * xmin/xmax, DELETE/LOCK actors or individual MX members. */
+typedef struct ClusterColdPageCreatorV1 {
+	ClusterColdRecordFrameV1 frame;
+	ClusterColdTtSlotKeyV1 key;
+} ClusterColdPageCreatorV1;
+
+/* Match this record's own raw creator to the original same-source native
+ * canonical BIND and an exact ACTIVE TT prefix before the PAGE record.
+ * Requires sealed matching recovery inputs and a native lifecycle full image;
+ * missing/ambiguous input refuses and clears out. A qualified older canonical
+ * base is a separate producer, not a new BIND retention requirement.
+ * This supplies neither complete ordinary_effects nor post-redo loser/C0,
+ * isolation, durability, source revalidation or permission to apply anything. */
+extern bool cluster_cold_typed_page_creator_v1(const ClusterColdTypedV1 *typed, uint32 frame_index,
+											   ClusterColdPageCreatorV1 *out);
+
 typedef struct ClusterColdTtSlotInputV1 {
 	ClusterColdTtSlotKeyV1 key;
 	TTSlot slot;
