@@ -3226,6 +3226,7 @@ cluster_typed_replay_xid_begin(ClusterColdTypedReplay *rep)
 {
 	ClusterColdTypedV1 *typed = rep->typed;
 
+	memset(&typed->effects_receipt, 0, sizeof(typed->effects_receipt));
 	memset(rep->xid_progress, 0, sizeof(rep->xid_progress));
 	memset(typed->xid_next_at_drain, 0, sizeof(typed->xid_next_at_drain));
 	typed->xid_next_after_redo = 0;
@@ -3757,8 +3758,7 @@ cluster_typed_replay_publish(ClusterColdTypedReplay *rep, const ClusterColdRepla
 	uint16		thread = 0;
 	int			detail = 0;
 
-	if (!cluster_cold_effects_proof_finish_v1(&rep->effects, rep->typed->plan, result,
-												 rep->typed->participant_count))
+	if (!cluster_cold_typed_effects_complete_v1(rep->typed, &rep->effects, result))
 		cluster_typed_replay_unpublished(
 			rep->typed->participants[rep->typed->own_participant].thread_id,
 			"Complete ordinary effect coverage is missing or inconsistent", (int) result->detail);

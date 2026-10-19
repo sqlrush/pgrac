@@ -485,6 +485,7 @@ cluster_cold_typed_top_tx_c0_producer_v1(const ClusterColdTypedV1 *typed, uint32
 				  sizeof(shape->target_claim_sha256))
 			   != 0
 		|| typed->xid_next_after_redo == 0
+		|| !cluster_cold_typed_effects_ready_v1(typed)
 		|| cluster_cold_tt_header_find_v1(typed, true, proof->key.owner_instance,
 										  proof->key.segment_id, &post_segment_index)
 			   == NULL

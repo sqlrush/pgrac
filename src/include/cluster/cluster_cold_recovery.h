@@ -632,6 +632,15 @@ typedef struct ClusterColdEffectsProofV1 {
 	bool invalid;
 } ClusterColdEffectsProofV1;
 
+/* Volatile pass-2 output owned by the original typed context. The copied
+ * counts/result remain tied to its sealed plan; this is not durability,
+ * checkpoint coverage, top ownership or old-writer isolation authority. */
+typedef struct ClusterColdEffectsReceiptV1 {
+	const ClusterColdPlanV1 *plan;
+	ClusterColdEffectsProofV1 proof;
+	ClusterColdReplayResultV1 result;
+} ClusterColdEffectsReceiptV1;
+
 extern void cluster_cold_effects_proof_init_v1(ClusterColdEffectsProofV1 *proof);
 extern bool cluster_cold_effects_proof_record_v1(ClusterColdEffectsProofV1 *proof,
 										 uint32 participant,
@@ -813,6 +822,7 @@ typedef struct ClusterColdTypedV1 {
 	/* Full-width maximum of every original counter endpoint after replay
 	 * and the caller's durability barrier. No TT/top/loser authority. */
 	uint64 xid_next_after_redo;
+	ClusterColdEffectsReceiptV1 effects_receipt;
 	/* Read-only pass-1 inputs for history generations. Their source redo is
 	 * the original checkpoint's, not the history mutation cut at tail. No
 	 * pass-2 endpoint: final source freshness/durability still needs proof. */
@@ -837,6 +847,13 @@ typedef struct ClusterColdTypedV1 {
 extern ClusterColdTypedV1 *cluster_cold_typed_prepare_v1(struct ClusterRecoveryFencePlan *fence,
 														 uint16 own_thread, XLogRecPtr own_redo);
 extern void cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed);
+
+/* Capture actual pass-2 coverage before its adapter is released. A failed
+ * completion clears the previous output; consumers recheck the same plan. */
+extern bool cluster_cold_typed_effects_complete_v1(ClusterColdTypedV1 *typed,
+													const ClusterColdEffectsProofV1 *proof,
+													const ClusterColdReplayResultV1 *result);
+extern bool cluster_cold_typed_effects_ready_v1(const ClusterColdTypedV1 *typed);
 
 /* Startup before execution pin/IR only. Reopen the original cold input owner,
  * compare the complete selected ROOT and history checkpoints, then release

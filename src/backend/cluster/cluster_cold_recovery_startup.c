@@ -1065,6 +1065,7 @@ cold_history_sources_match(ClusterColdTypedV1 *typed)
 static void
 cold_execution_inputs_failed(ClusterColdTypedV1 *typed)
 {
+	memset(&typed->effects_receipt, 0, sizeof(typed->effects_receipt));
 	cluster_cold_tt_after_redo_reset_v1(typed);
 	if (typed->refusal == CLUSTER_COLD_OK)
 		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "pass-2 original input freshness is incomplete");
@@ -1107,6 +1108,7 @@ cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFen
 		return false;
 	/* ERROR from an original source owner must not leave a reusable OK plan. */
 	cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "pass-2 source durability is incomplete");
+	memset(&typed->effects_receipt, 0, sizeof(typed->effects_receipt));
 	cluster_cold_tt_after_redo_reset_v1(typed);
 	typed->xid_next_after_redo = 0;
 	memset(typed->source_drained, 0, sizeof(typed->source_drained));

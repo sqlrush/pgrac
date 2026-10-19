@@ -229,6 +229,38 @@ cluster_cold_effects_proof_finish_v1(const ClusterColdEffectsProofV1 *proof,
 		   && result->space_relations_finished == cluster_cold_plan_space_relation_count_v1(plan);
 }
 
+bool
+cluster_cold_typed_effects_complete_v1(ClusterColdTypedV1 *typed,
+									  const ClusterColdEffectsProofV1 *proof,
+									  const ClusterColdReplayResultV1 *result)
+{
+	ClusterColdEffectsReceiptV1 completed = { 0 };
+	bool ready = false;
+
+	if (typed == NULL)
+		return false;
+	if (typed->refusal == CLUSTER_COLD_OK
+		&& cluster_cold_effects_proof_finish_v1(proof, typed->plan, result,
+													typed->participant_count)) {
+		completed.proof = *proof;
+		completed.result = *result;
+		completed.plan = typed->plan;
+		ready = true;
+	}
+	typed->effects_receipt = completed;
+	return ready;
+}
+
+bool
+cluster_cold_typed_effects_ready_v1(const ClusterColdTypedV1 *typed)
+{
+	return typed != NULL && typed->refusal == CLUSTER_COLD_OK && typed->plan != NULL
+		   && typed->effects_receipt.plan == typed->plan
+		   && cluster_cold_effects_proof_finish_v1(&typed->effects_receipt.proof, typed->plan,
+													 &typed->effects_receipt.result,
+													 typed->participant_count);
+}
+
 ClusterColdPageActionV1
 cluster_cold_page_action_v1(const ClusterColdStepV1 *step, bool own)
 {

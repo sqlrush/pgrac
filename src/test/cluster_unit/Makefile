@@ -3082,7 +3082,7 @@ test_cluster_side_xact test_cluster_pi_contribution test_cluster_recovery_c0_pla
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
 		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
-		$(filter test_cluster_page_data_stable.o test_cluster_cold_tt_redo_product.o $(CLUSTER_WAL_CLAIM_O) $(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o,$^) \
+		$(filter test_cluster_page_data_stable.o test_cluster_cold_tt_redo_product.o test_cluster_cold_recovery_%.o $(CLUSTER_WAL_CLAIM_O) $(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o,$^) \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) -lssl -lcrypto -o $@
@@ -9241,6 +9241,8 @@ test_cluster_cold_recovery_refail: test_cluster_cold_recovery_refail.c unit_test
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 D_COLD_REPLAY_O = test_cluster_cold_recovery_replay_core.o test_cluster_cold_recovery_replay_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)
+
+test_cluster_cold_tt_redo: $(D_COLD_REPLAY_O)
 
 test_cluster_cold_recovery_replay_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_replay.c \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
