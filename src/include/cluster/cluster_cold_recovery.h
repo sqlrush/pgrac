@@ -1080,8 +1080,12 @@ extern bool cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
  * together with the retained terminal checks below. The caller's terminal
  * bit is ignored. Check original SIDE/PAGE/SPACE frame actor/top consistency
  * in every retained source, including history, and any present native BIND actor
- * against that BIND's own durable xid. These checks do not establish PAGE
- * ownership, reconstruct a parent graph or discharge ordinary_effects.
+ * against that BIND's own durable xid. Replay PAGE INSERT/UPDATE/HOT/MULTI
+ * additionally require their original creator input; DELETE/LOCK/LOCK_UPDATED
+ * require their actor input, each from its own BIND and ACTIVE causal prefix.
+ * History frames retain the consistency check; the replay-only PAGE producers
+ * do not qualify them. Old tuple/MX ownership, a parent graph and complete
+ * ordinary_effects remain independent requirements.
  * Other proof/shape gates remain independent and required. An older ACTIVE
  * without a retained BIND remains blocked pending the original qualified
  * canonical-base producer;

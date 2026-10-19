@@ -4212,6 +4212,129 @@ UT_TEST(tt_page_actor_requires_sealed_original_sources_and_clears_output)
 	tt_redo_destroy(&f);
 }
 
+/* Use the original PAGE/TT producers and actual C0 consumer. PAGE codec,
+ * DATA observation and completed physical application remain boundaries;
+ * a caller's true ordinary_effects bit must not conceal missing ownership. */
+static void
+tt_top_tx_page_binding_expect(uint8 rmid, uint8 info, int variant, TransactionId xid,
+							  TransactionId top, bool accepted)
+{
+	TtRedoFixture f;
+	ClusterColdEffectsProofV1 effects = { 0 };
+	ClusterColdReplayResultV1 result = { .detail = CLUSTER_COLD_REPLAY_OK, .steps_done = 1 };
+	ClusterColdComponentV1 component = { 0 };
+	ClusterColdDecodedV1 page = { 0 };
+	ClusterColdStepV1 step;
+	ClusterColdTtSlotInputV1 input;
+	ClusterColdTopTxProofV1 proof;
+	ClusterRecoveryTTAbortV1 shape;
+	ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
+	uint16 candidate_slot = variant == TT_PAGE_CREATOR_LATE_BIND
+									|| variant == TT_PAGE_CREATOR_LATE_COMMIT
+									|| variant == TT_PAGE_CREATOR_HISTORY_PREFIX_LATE_COMMIT
+								? 47
+								: 6;
+	TransactionId candidate_xid = candidate_slot == 47 ? 804 : 806;
+	uint32 count;
+
+	tt_page_input_fixture(&f, rmid, info, xid, top, variant, false, 999, XLHL_XMAX_IS_MULTI);
+	/* The complete retained INIT creates this segment; the original disk
+	 * snapshot must be empty rather than the input-only fixture's old TT. */
+	tt_post_readback_empty_original(&f);
+	tt_top_tx_write_fold(&f);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, candidate_slot, &input));
+	UT_ASSERT_EQ(input.key.xid, candidate_xid);
+	UT_ASSERT_EQ(input.slot.status, TT_SLOT_ACTIVE);
+	UT_ASSERT(cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+	count = rf_side_online_plan_operation_count_v1(f.typed.side_plans[0]);
+	UT_ASSERT(count != UINT32_MAX);
+	for (uint32 i = 0; i < count; i++) {
+		RfSideOnlineOperationV1 op;
+		ClusterColdDecodedV1 native = { 0 };
+
+		UT_ASSERT(rf_side_online_plan_operation_v1(f.typed.side_plans[0], i, &op));
+		if (op.history_only)
+			continue;
+		native.record.read_rec_ptr = op.identity.record.read_rec_ptr;
+		native.record.end_rec_ptr = op.identity.record.end_rec_ptr;
+		native.record.record_crc = op.identity.record.record_crc;
+		native.record.rmid = op.identity.record.rmid;
+		native.record.info = op.identity.record.info;
+		native.effects.required = native.effects.native_apply = CLUSTER_COLD_EFFECT_RECORD;
+		UT_ASSERT(cluster_cold_effects_proof_record_v1(&effects, 0, &native, NULL, true));
+	}
+	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(f.typed.plan), 1);
+	UT_ASSERT(cluster_cold_plan_step_v1(f.typed.plan, 0, &step));
+	page.record.read_rec_ptr = step.read_rec_ptr;
+	page.record.end_rec_ptr = step.end_rec_ptr;
+	page.record.record_crc = step.record_crc;
+	page.record.rmid = step.rmid;
+	page.record.info = step.info;
+	page.record.components = &component;
+	page.record.component_count = 1;
+	page.effects.required = page.effects.page_apply
+		= CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_PAGE;
+	UT_ASSERT(cluster_cold_effects_proof_record_v1(&effects, 0, &page, &step, true));
+	UT_ASSERT(cluster_cold_typed_effects_complete_v1(&f.typed, &effects, &result));
+	f.typed.xid_next_after_redo = UINT64_C(0x700400200);
+	tt_top_tx_endpoints_complete(&f);
+	tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+	UT_ASSERT(proof.ordinary_effects);
+	memset(&out, 0xa9, sizeof(out));
+	UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof, &shape,
+														  false, InvalidTransactionId,
+														  UINT64_C(0x12345678), &out),
+				 accepted);
+	if (accepted) {
+		UT_ASSERT_EQ(out.c0.record.exact.xid, candidate_xid);
+		UT_ASSERT_EQ(out.c0.record.exact.slot_offset, candidate_slot);
+	} else
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	tt_redo_destroy(&f);
+}
+
+static void
+tt_top_tx_page_binding_cases(uint8 rmid, uint8 info)
+{
+	static const struct {
+		int variant;
+		bool accepted;
+	} cases[] = {
+		{ TT_PAGE_CREATOR_NORMAL, true },
+		{ TT_PAGE_CREATOR_NO_BIND, false },
+		{ TT_PAGE_CREATOR_LATE_BIND, false },
+		{ TT_PAGE_CREATOR_EARLY_COMMIT, false },
+		{ TT_PAGE_CREATOR_LATE_COMMIT, true },
+		{ TT_PAGE_CREATOR_DUPLICATE_BIND, false },
+		{ TT_PAGE_CREATOR_HISTORY_PREFIX, true },
+		{ TT_PAGE_CREATOR_HISTORY_PREFIX_LATE_COMMIT, true },
+	};
+
+	for (uint32 i = 0; i < lengthof(cases); i++)
+		tt_top_tx_page_binding_expect(rmid, info, cases[i].variant, 802,
+									  i % 2 == 0 ? 802 : InvalidTransactionId, cases[i].accepted);
+	/* This operation's creator/actor is neither the selected 806 nor payload
+	 * xmax 999. Its own 804 BIND supplies top even with no top metadata. */
+	tt_top_tx_page_binding_expect(rmid, info, TT_PAGE_CREATOR_NORMAL, 804, InvalidTransactionId,
+								  true);
+}
+
+UT_TEST(tt_top_tx_c0_producer_requires_each_replay_page_creator)
+{
+	tt_top_tx_page_binding_cases(RM_HEAP_ID, XLOG_HEAP_INSERT);
+	tt_top_tx_page_binding_cases(RM_HEAP_ID, XLOG_HEAP_UPDATE);
+	tt_top_tx_page_binding_cases(RM_HEAP_ID, XLOG_HEAP_HOT_UPDATE);
+	tt_top_tx_page_binding_cases(RM_HEAP2_ID, XLOG_HEAP2_MULTI_INSERT);
+}
+
+UT_TEST(tt_top_tx_c0_producer_requires_each_replay_page_actor)
+{
+	tt_top_tx_page_binding_cases(RM_HEAP_ID, XLOG_HEAP_DELETE);
+	tt_top_tx_page_binding_cases(RM_HEAP_ID, XLOG_HEAP_LOCK);
+	tt_top_tx_page_binding_cases(RM_HEAP2_ID, XLOG_HEAP2_LOCK_UPDATED);
+}
+
 static void
 tt_top_tx_frame_expect(TtRedoFixture *f, bool accepted)
 {
@@ -4342,7 +4465,7 @@ tt_top_tx_page_space_frame_expect(bool space, bool history, int mode)
 	xl_heap_insert insert = { 0 };
 	RelFileLocator locator = { 1663, 5, 100 };
 	uint32 participant = history ? 1 : 0;
-	XLogRecPtr begin = history ? 100 : 300;
+	XLogRecPtr begin = history ? 100 : space ? 300 : 400;
 	TransactionId xid = mode == 2 ? 802 : 804;
 	TransactionId top = mode == 1 ? InvalidTransactionId : xid;
 	bool accepted = mode < 3 || mode == 8;
@@ -4362,11 +4485,15 @@ tt_top_tx_page_space_frame_expect(bool space, bool history, int mode)
 		xid = top = BootstrapTransactionId;
 	if (mode == 8)
 		xid = top = InvalidTransactionId; /* Nontransactional SPACE record. */
-	tt_top_tx_initialized_fixture(&f, history ? 200 : 300, 100, 2);
+	tt_top_tx_initialized_fixture(&f, history ? 200 : space ? 300 : 400, 100, 2);
 	if (history)
 		tt_redo_history_plan(&f, 100, 200, 200, RF_SIDE_PLAN_RECOVERY, false);
 	tt_top_tx_frame_bind(&fake, 4, 802, 802, 802);
 	undo_header_feed(f.typed.side_plans[0], &fake, 200);
+	if (!space && !history) {
+		tt_top_tx_frame_bind(&fake, 47, 804, 804, 804);
+		undo_header_feed(f.typed.side_plans[0], &fake, 300);
+	}
 	if (space) {
 		/* A typed CREATE is complete on its own; native SMGR CREATE
 		 * additionally requires its later typed incarnation record. */
@@ -6211,7 +6338,9 @@ UT_TEST(tt_top_tx_c0_producer_rechecks_before_output)
 int
 main(void)
 {
-	UT_PLAN(134);
+	UT_PLAN(136);
+	UT_RUN(tt_top_tx_c0_producer_requires_each_replay_page_creator);
+	UT_RUN(tt_top_tx_c0_producer_requires_each_replay_page_actor);
 	UT_RUN(tt_top_tx_c0_producer_checks_page_frames);
 	UT_RUN(tt_top_tx_c0_producer_checks_history_page_frames);
 	UT_RUN(tt_top_tx_c0_producer_checks_space_frames);

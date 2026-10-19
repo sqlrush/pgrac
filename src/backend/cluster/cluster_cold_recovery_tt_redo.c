@@ -635,8 +635,9 @@ cold_top_tx_frame_xids_v1(TransactionId xid, TransactionId top)
 /* Preserve operation-local SIDE/PAGE/SPACE evidence, including retained history. A
  * known child frame cannot become canonical just because the candidate's
  * BIND is top. Conversely an unrelated operation names its own actor, not
- * this candidate. These checks do not prove PAGE ownership or inspect old
- * tuple xmin/undo before-images; ordinary_effects remains independent. */
+ * this candidate. Replay DML additionally needs its own canonical creator
+ * or actor prefix. Old tuple xmin/undo before-images and individual MX
+ * members are not qualified here; ordinary_effects remains independent. */
 static bool
 cold_top_tx_frames_v1(const ClusterColdTypedV1 *typed)
 {
@@ -646,11 +647,38 @@ cold_top_tx_frames_v1(const ClusterColdTypedV1 *typed)
 		return false;
 	for (uint32 i = 0; i < count; i++) {
 		ClusterColdRecordFrameV1 frame;
+		uint8 opcode;
+		bool creator, actor;
 
 		if (!cluster_cold_plan_record_frame_v1(typed->plan, i, &frame)
 			|| frame.participant >= typed->participant_count
 			|| !cold_top_tx_frame_xids_v1(frame.source_xid, frame.source_top_xid))
 			return false;
+		if (frame.history || frame.page_components == 0)
+			continue;
+		/* Raw/top equality alone does not prove a replay DML's canonical
+		 * owner. Use that record's original BIND and ACTIVE causal prefix,
+		 * independently of the selected loser's identity or final status
+		 * of this other actor. Old tuple and MX inputs remain separate. */
+		opcode = frame.info & XLOG_HEAP_OPMASK;
+		creator = (frame.rmid == RM_HEAP_ID
+				   && (opcode == XLOG_HEAP_INSERT || opcode == XLOG_HEAP_UPDATE
+					   || opcode == XLOG_HEAP_HOT_UPDATE))
+				  || (frame.rmid == RM_HEAP2_ID && opcode == XLOG_HEAP2_MULTI_INSERT);
+		actor
+			= (frame.rmid == RM_HEAP_ID && (opcode == XLOG_HEAP_DELETE || opcode == XLOG_HEAP_LOCK))
+			  || (frame.rmid == RM_HEAP2_ID && opcode == XLOG_HEAP2_LOCK_UPDATED);
+		if (creator) {
+			ClusterColdPageCreatorV1 input;
+
+			if (!cluster_cold_typed_page_creator_v1(typed, i, &input))
+				return false;
+		} else if (actor) {
+			ClusterColdPageActorV1 input;
+
+			if (!cluster_cold_typed_page_actor_v1(typed, i, &input))
+				return false;
+		}
 	}
 	for (uint32 p = 0; p < typed->participant_count; p++) {
 		const RfSideOnlinePlanV1 *plan = typed->side_plans[p];
