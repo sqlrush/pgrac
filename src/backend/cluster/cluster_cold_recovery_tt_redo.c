@@ -652,6 +652,10 @@ cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
 	 * establish completed sealed redo. The caller's bit cannot add or revoke
 	 * that fact. Atomic transaction effects remain an independent proof. */
 	qualified.sealed_redo = true;
+	/* Only the original target owner can supply real old-writer isolation.
+	 * Its current pass-2 authority remains distinct from a C0 write grant. */
+	qualified.old_writer_isolated
+		= cluster_cold_typed_old_writer_isolated_v1(typed, fence, participant);
 	result.active.key = post_slot.key;
 	if (!cluster_cold_top_tx_loser_v1(&result.active, &qualified, &result.loser)
 		|| !cluster_cold_top_tx_c0_v1(&result.loser, shape, next_xid, true, has_oldest_xid,
@@ -661,10 +665,11 @@ cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
 			   != CLUSTER_RECOVERY_TT_ABORT_APPLY)
 		return false;
 	/* The inventory may read additional UNDO blocks. Recheck every retained
-	 * physical input again before publishing this candidate descriptor.
-	 * This is not a substitute for the independent old-writer isolation. */
+	 * physical input and original target isolation again before publishing
+	 * this candidate descriptor. Neither check grants C0 write authority. */
 	if (cluster_cold_tt_after_redo_recheck_v1(typed) != CLUSTER_COLD_OK
-		|| !cluster_cold_typed_sources_current_v1(typed, fence))
+		|| !cluster_cold_typed_sources_current_v1(typed, fence)
+		|| !cluster_cold_typed_old_writer_isolated_v1(typed, fence, participant))
 		return false;
 	*out = result;
 	return true;

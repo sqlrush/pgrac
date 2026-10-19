@@ -1563,6 +1563,19 @@ cold_participant_authority(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *
 			   authority, source->thread_id, source->physical_lower, source->tail_end);
 }
 
+bool
+cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
+										  ClusterRecoveryFencePlan *fence, uint32 participant)
+{
+	ClusterThreadRecoveryAuthorityV1 authority = { 0 };
+
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK)
+		return false;
+	/* Reuse the original real isolation authority, never self-seal or a
+	 * source-current receipt. This borrows no authority for own/history. */
+	return cold_participant_authority(typed, fence, participant, &authority);
+}
+
 /* Rebind the same immutable whole-source authority for record execution
  * and for the sequencer's post-drain physical durability check. */
 static bool

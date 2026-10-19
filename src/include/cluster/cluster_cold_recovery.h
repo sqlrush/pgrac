@@ -980,6 +980,14 @@ extern bool cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
 extern bool cluster_cold_typed_sources_current_v1(ClusterColdTypedV1 *typed,
 												  struct ClusterRecoveryFencePlan *fence);
 
+/* Read-only pass-2 isolation input from the original exact foreign target's
+ * COLD_FORMED authority, including its current real NeedSet/AdmissionSet,
+ * ROOT/token, serial and retained window. Own/history-only participants
+ * without that original authority refuse. No new grant or post-EOR authority. */
+extern bool cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
+													  struct ClusterRecoveryFencePlan *fence,
+													  uint32 participant);
+
 /* Producer boundary for one original TT owner.  Locate the post-redo header
  * by physical owner/segment, require the complete ordinary TT/UNDO inventory
  * and all original sources, then verify the selected sealed fold and exact
@@ -1003,8 +1011,11 @@ extern bool cluster_cold_typed_sources_current_v1(ClusterColdTypedV1 *typed,
  * Derive sealed_redo from the original all-record completion receipt,
  * bound to this exact plan and complete source set by the all-thread
  * endpoint receipt, with the verified ordinary inventory. The caller's
- * sealed_redo bit is ignored. This does not discharge ordinary_effects,
- * terminal_match or old_writer_isolated.
+ * sealed_redo bit is ignored. Derive old_writer_isolated from the original
+ * exact foreign target authority above and recheck it before output. The
+ * caller's isolation bit is ignored; an own/history target cannot substitute
+ * a caller assertion for missing authority. This does not discharge
+ * ordinary_effects or terminal_match.
  * Other proof/shape gates remain independent and required. An older ACTIVE
  * without a retained BIND remains blocked pending the original qualified
  * canonical-base producer;

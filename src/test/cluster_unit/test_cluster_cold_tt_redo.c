@@ -25,6 +25,8 @@ static unsigned tt_c0_owner_calls;
 static int tt_c0_fence_tag;
 #define TT_C0_FENCE ((struct ClusterRecoveryFencePlan *)&tt_c0_fence_tag)
 static unsigned tt_c0_owner_fail_at;
+static unsigned tt_c0_isolation_calls;
+static unsigned tt_c0_isolation_fail_at;
 
 bool
 cluster_cold_typed_sources_current_v1(ClusterColdTypedV1 *typed,
@@ -34,6 +36,18 @@ cluster_cold_typed_sources_current_v1(ClusterColdTypedV1 *typed,
 	UT_ASSERT(fence == TT_C0_FENCE);
 	tt_c0_owner_calls++;
 	return tt_c0_owner_calls != tt_c0_owner_fail_at;
+}
+
+bool
+cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
+										  struct ClusterRecoveryFencePlan *fence,
+										  uint32 participant)
+{
+	UT_ASSERT_NOT_NULL(typed);
+	UT_ASSERT(fence == TT_C0_FENCE);
+	UT_ASSERT_EQ(participant, 0);
+	tt_c0_isolation_calls++;
+	return tt_c0_isolation_calls != tt_c0_isolation_fail_at;
 }
 
 
@@ -3720,6 +3734,43 @@ UT_TEST(tt_top_tx_c0_producer_refuses_conflicting_bind_history)
 	}
 }
 
+UT_TEST(tt_top_tx_c0_producer_derives_current_original_isolation)
+{
+	for (unsigned fail_at = 0; fail_at <= 2; fail_at++) {
+		TtRedoFixture f;
+		ClusterColdTtSlotInputV1 input;
+		ClusterColdTopTxProofV1 proof;
+		ClusterRecoveryTTAbortV1 shape;
+		ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
+		bool accepted;
+
+		tt_top_tx_initialized_fixture(&f, 200, 100, 2);
+		tt_top_tx_seal_bound(&f, 100);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &input));
+		f.typed.xid_next_after_redo = UINT64_C(0x700400200);
+		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+		tt_top_tx_effects_complete(&f);
+		tt_top_tx_endpoints_complete(&f);
+		/* Neither a false caller bit nor a true one replaces original authority. */
+		proof.old_writer_isolated = fail_at != 0;
+		tt_c0_isolation_calls = 0;
+		tt_c0_isolation_fail_at = fail_at;
+		memset(&out, 0xa9, sizeof(out));
+		accepted = cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
+															&shape, false, InvalidTransactionId,
+															UINT64_C(0x12345678), &out);
+		tt_c0_isolation_fail_at = 0;
+		UT_ASSERT_EQ(accepted, fail_at == 0);
+		UT_ASSERT_EQ(tt_c0_isolation_calls, fail_at == 0 ? 2 : fail_at);
+		if (fail_at != 0)
+			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		else
+			UT_ASSERT_EQ(out.loser.key.xid, input.key.xid);
+		tt_redo_destroy(&f);
+	}
+}
+
 UT_TEST(tt_top_tx_c0_producer_requires_current_execution_owner)
 {
 	for (unsigned fail_at = 1; fail_at <= 2; fail_at++) {
@@ -5213,10 +5264,11 @@ UT_TEST(tt_top_tx_c0_producer_rechecks_before_output)
 int
 main(void)
 {
-	UT_PLAN(116);
+	UT_PLAN(117);
 	UT_RUN(tt_top_tx_c0_producer_derives_base_from_native_full_image);
 	UT_RUN(tt_top_tx_c0_producer_derives_base_from_native_reuse);
 	UT_RUN(tt_top_tx_c0_producer_refuses_unqualified_raw_base);
+	UT_RUN(tt_top_tx_c0_producer_derives_current_original_isolation);
 	UT_RUN(tt_top_tx_c0_producer_requires_current_execution_owner);
 	UT_RUN(tt_top_tx_c0_producer_rechecks_physical_header_inventory);
 	UT_RUN(tt_top_tx_c0_producer_rechecks_cached_undo_bytes);
