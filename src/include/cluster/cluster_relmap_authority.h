@@ -242,6 +242,23 @@ cluster_relmap_authority_v2_read(const ClusterRelmapV2Namespace *expected,
 								ClusterRelmapV2View *output);
 
 /*
+ * Dormant clean v1 conversion under the namespace X lock. The original owner
+ * must authenticate expected's namespace/incarnation and keep publishers
+ * disabled until this call succeeds. Both v1 copies must be valid, identical
+ * and have no pending generation. A retry may observe a clean v1 primary and
+ * the matching clean v2 backup, or two matching clean v2 copies; no other mixed
+ * cut or pending is adopted. Inactive v1 owner/pending bytes are not promoted.
+ *
+ * Installs and syncs backup before primary, then reads both back. Even an
+ * already-v2 retry establishes sync/readback in this call. False retains the
+ * conversion obligation, including on sync/close failure after replacement;
+ * it never permits new pending, pin release or runtime activation. The caller
+ * owns the original failure polarity and must not infer rollback from false.
+ * This primitive supplies no native/SIDE qualification or terminal proof.
+ */
+extern bool cluster_relmap_authority_v2_convert_clean(const ClusterRelmapV2Namespace *expected);
+
+/*
  * Dormant committed-only v2 reader facade.  The caller must hold the
  * namespace relmap X lock for the entire call; entry and post-read checks
  * prevent a runtime reader from publishing a pair observed after that lock was

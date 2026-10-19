@@ -46,6 +46,7 @@ static unsigned int writes, renames, file_syncs, dir_syncs, reads;
 static unsigned int fail_write, fail_rename, fail_file_sync, fail_dir_sync;
 static bool corrupt_after_rename, replace_during_read, replace_after_rename;
 static unsigned int fault_rename;
+static int fault_copy;
 static bool fail_directory_close;
 static LWLock retention_lock;
 static bool retention_held, observing_stage, relmap_x_held;
@@ -292,7 +293,7 @@ relmap_test_renameat(int olddir, const char *old, int newdir, const char *new)
 		replace_primary();
 	if (rc == 0 && renames == fault_rename && corrupt_after_rename) {
 		/* Also exercise the final recheck of primary after backup installation. */
-		int fd = openat(newdir, names[0], O_WRONLY);
+		int fd = openat(newdir, names[fault_copy], O_WRONLY);
 		unsigned char bad = 0xff;
 
 		if (fd < 0 || pwrite(fd, &bad, 1, 128) != 1 || close(fd) != 0)
@@ -372,6 +373,7 @@ reset_io(void)
 	fail_write = fail_rename = fail_file_sync = fail_dir_sync = 0;
 	corrupt_after_rename = replace_during_read = replace_after_rename = false;
 	fault_rename = 1;
+	fault_copy = 0;
 	fail_directory_close = false;
 	retention_held = observing_stage = relmap_x_held = false;
 	drop_relmap_x_on_read = false;
@@ -1149,6 +1151,371 @@ UT_TEST(test_pending_reader_preserves_base_for_cold_finish)
 	UT_ASSERT(clean_pair(true));
 }
 
+static void
+v1_header_crc(unsigned char *bytes, const ClusterRelmapAuthorityHeader *header)
+{
+	ClusterRelmapAuthorityHeader hdr = *header;
+
+	memcpy(bytes, &hdr, sizeof(hdr));
+	INIT_CRC32C(hdr.crc);
+	COMP_CRC32C(hdr.crc, bytes, offsetof(ClusterRelmapAuthorityHeader, crc));
+	FIN_CRC32C(hdr.crc);
+	memcpy(bytes, &hdr, sizeof(hdr));
+}
+
+static void
+v1_image(const ClusterRelmapV2Namespace *ns, unsigned char *bytes)
+{
+	ClusterRelmapAuthorityHeader hdr = { 0 };
+	RelMapFile map = map_image(40000);
+
+	memset(bytes, 0, CLUSTER_RELMAP_AUTHORITY_FILE_SIZE);
+	hdr.magic = CLUSTER_RELMAP_AUTHORITY_MAGIC;
+	hdr.version = 1;
+	hdr.committed_generation = 7;
+	hdr.dbid = ns->dbid;
+	hdr.shared_map = ns->shared;
+	hdr.image_size = sizeof(map);
+	v1_header_crc(bytes, &hdr);
+	memcpy(bytes + CLUSTER_RELMAP_COMMITTED_OFFSET, &map, sizeof(map));
+}
+
+static void
+setup_v1(const ClusterRelmapV2Namespace *ns)
+{
+	unsigned char bytes[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE];
+
+	setup(ns);
+	v1_image(ns, bytes);
+	write_copy(0, bytes, sizeof(bytes));
+	write_copy(1, bytes, sizeof(bytes));
+	relmap_x_held = true;
+}
+
+static bool
+conversion_pair_clean(const ClusterRelmapV2Namespace *ns)
+{
+	ClusterRelmapV2View view;
+	unsigned char a[2176], b[2176];
+
+	if (cluster_relmap_authority_v2_read(ns, &view) != CLUSTER_RELMAP_V2_PAIR_VALID
+		|| view.has_pending || !view.pending_complete || view.committed_generation != 7
+		|| view.committed.mappings[0].mapfilenumber != 40000)
+		return false;
+	read_copy(0, a);
+	read_copy(1, b);
+	return memcmp(a, b, sizeof(a)) == 0
+		&& cluster_relmap_authority_classify((char *)a, sizeof(a))
+			!= CLUSTER_RELMAP_AUTHORITY_VALID
+		&& cluster_relmap_authority_classify((char *)b, sizeof(b))
+			!= CLUSTER_RELMAP_AUTHORITY_VALID;
+}
+
+UT_TEST(test_conversion_syncs_both_and_disables_old_reader)
+{
+	char old_map[CLUSTER_RELMAP_IMAGE_MAX];
+	uint32 old_length;
+	RelMapFile map;
+	uint64 generation;
+
+	setup_v1(&identity);
+	UT_ASSERT(cluster_relmap_authority_v2_convert_clean(&identity));
+	UT_ASSERT_EQ(renames, 2);
+	UT_ASSERT_EQ(file_syncs, 2);
+	UT_ASSERT_EQ(dir_syncs, 2);
+	UT_ASSERT(conversion_pair_clean(&identity));
+	UT_ASSERT(!cluster_relmap_authority_read_committed(true, InvalidOid, old_map, &old_length));
+	UT_ASSERT(cluster_relmap_authority_v2_read_committed(&identity, &map, &generation));
+	UT_ASSERT_EQ(generation, UINT64CONST(7));
+	UT_ASSERT_EQ(map.mappings[0].mapfilenumber, 40000);
+}
+
+UT_TEST(test_conversion_local_namespace_and_inactive_v1_bytes)
+{
+	ClusterRelmapV2Namespace local = identity;
+	ClusterRelmapAuthorityHeader hdr;
+	unsigned char bytes[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE];
+
+	local.shared = false;
+	local.dbid = 42;
+	setup_v1(&local);
+	v1_image(&local, bytes);
+	memcpy(&hdr, bytes, sizeof(hdr));
+	/* The old publish leaves these inactive bytes behind at pending_gen=0. */
+	hdr.owner_node = 3;
+	hdr.owner_xid = 291;
+	hdr.owner_epoch = 101;
+	hdr.relmap_lsn = 909;
+	v1_header_crc(bytes, &hdr);
+	memset(bytes + CLUSTER_RELMAP_PENDING_OFFSET, 0xd1, CLUSTER_RELMAP_IMAGE_MAX);
+	write_copy(0, bytes, sizeof(bytes));
+	write_copy(1, bytes, sizeof(bytes));
+	UT_ASSERT(cluster_relmap_authority_v2_convert_clean(&local));
+	UT_ASSERT(conversion_pair_clean(&local));
+}
+
+UT_TEST(test_conversion_never_resolves_v1_pending)
+{
+	unsigned char bytes[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE];
+	ClusterRelmapAuthorityHeader hdr;
+
+	for (int which = 0; which < 3; which++) {
+		setup_v1(&identity);
+		v1_image(&identity, bytes);
+		memcpy(&hdr, bytes, sizeof(hdr));
+		hdr.pending_generation = 8;
+		hdr.owner_node = 3;
+		hdr.owner_xid = 291;
+		v1_header_crc(bytes, &hdr);
+		write_copy(which == 1 ? 1 : 0, bytes, sizeof(bytes));
+		if (which == 2)
+			write_copy(1, bytes, sizeof(bytes));
+		UT_ASSERT(!cluster_relmap_authority_v2_convert_clean(&identity));
+		UT_ASSERT_EQ(writes, 0);
+	}
+}
+
+UT_TEST(test_conversion_validates_exact_v1_header_and_native_image)
+{
+	unsigned char bytes[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE];
+	ClusterRelmapAuthorityHeader hdr;
+	RelMapFile map;
+
+	for (int change = 0; change < 12; change++) {
+		setup_v1(&identity);
+		v1_image(&identity, bytes);
+		memcpy(&hdr, bytes, sizeof(hdr));
+		switch (change) {
+		case 0: hdr.version = 2; break;
+		case 1: hdr.magic++; break;
+		case 2: hdr.image_size--; break;
+		case 3: hdr.dbid = 42; break;
+		case 4: hdr.shared_map = 2; break;
+		case 5: hdr.committed_generation = 0; break;
+		case 6: hdr.pad0 = 1; break;
+		case 7: hdr.pad1 = 1; break;
+		case 8: bytes[CLUSTER_RELMAP_COMMITTED_OFFSET] ^= 1; break;
+		case 9:
+			map = map_image(40000);
+			map.mappings[0].mapoid = InvalidOid;
+			INIT_CRC32C(map.crc);
+			COMP_CRC32C(map.crc, &map, offsetof(RelMapFile, crc));
+			FIN_CRC32C(map.crc);
+			memcpy(bytes + CLUSTER_RELMAP_COMMITTED_OFFSET, &map, sizeof(map));
+			break;
+		case 10: bytes[CLUSTER_RELMAP_COMMITTED_OFFSET + sizeof(RelMapFile)] = 1; break;
+		case 11: break;
+		}
+		v1_header_crc(bytes, &hdr);
+		if (change == 11)
+			bytes[offsetof(ClusterRelmapAuthorityHeader, crc)] ^= 1;
+		write_copy(0, bytes, sizeof(bytes));
+		write_copy(1, bytes, sizeof(bytes));
+		UT_ASSERT(!cluster_relmap_authority_v2_convert_clean(&identity));
+		UT_ASSERT_EQ(writes, 0);
+	}
+}
+
+UT_TEST(test_conversion_rejects_conflicting_v1_copies)
+{
+	unsigned char bytes[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE];
+	ClusterRelmapAuthorityHeader hdr;
+	RelMapFile map;
+
+	for (int change = 0; change < 3; change++) {
+		setup_v1(&identity);
+		v1_image(&identity, bytes);
+		memcpy(&hdr, bytes, sizeof(hdr));
+		if (change == 0)
+			hdr.committed_generation++;
+		else if (change == 1) {
+			map = map_image(40001);
+			memcpy(bytes + CLUSTER_RELMAP_COMMITTED_OFFSET, &map, sizeof(map));
+		} else
+			hdr.owner_xid = 291;
+		v1_header_crc(bytes, &hdr);
+		write_copy(1, bytes, sizeof(bytes));
+		UT_ASSERT(!cluster_relmap_authority_v2_convert_clean(&identity));
+		UT_ASSERT_EQ(writes, 0);
+	}
+}
+
+UT_TEST(test_conversion_backup_is_replaced_before_primary)
+{
+	char old_map[CLUSTER_RELMAP_IMAGE_MAX];
+	uint32 old_length;
+	RelMapFile map;
+	unsigned char backup[2176];
+	ClusterRelmapV2Image converted;
+	ClusterRelmapV2View view;
+	uint64 generation = 99;
+
+	setup_v1(&identity);
+	fail_write = 2;
+	UT_ASSERT(!cluster_relmap_authority_v2_convert_clean(&identity));
+	UT_ASSERT_EQ(renames, 1);
+	UT_ASSERT_EQ(file_syncs, 1);
+	UT_ASSERT_EQ(dir_syncs, 1);
+	if (renames != 1)
+		return;
+	read_copy(1, backup);
+	UT_ASSERT_EQ(cluster_relmap_v2_decode(backup, sizeof(backup), &identity, &converted),
+		CLUSTER_RELMAP_V2_VALID);
+	UT_ASSERT(!converted.pending_generation);
+	UT_ASSERT(cluster_relmap_authority_read_committed(true, InvalidOid, old_map, &old_length));
+	memcpy(&map, old_map, sizeof(map));
+	UT_ASSERT_EQ(map.mappings[0].mapfilenumber, 40000);
+	/* Raw inspection can report a degraded backup, but no committed runtime
+	 * reader or publisher may consume this mixed conversion cut. */
+	UT_ASSERT_EQ(cluster_relmap_authority_v2_read(&identity, &view), CLUSTER_RELMAP_V2_PAIR_DEGRADED);
+	UT_ASSERT(view.used_backup && !view.pending_complete);
+	UT_ASSERT(!cluster_relmap_authority_v2_read_committed(&identity, &map, &generation));
+	UT_ASSERT_EQ(generation, 0);
+	UT_ASSERT_EQ(map.magic, 0);
+	UT_ASSERT(!stage(&identity));
+	reset_io();
+	relmap_x_held = true;
+	UT_ASSERT(cluster_relmap_authority_v2_convert_clean(&identity));
+	UT_ASSERT(conversion_pair_clean(&identity));
+}
+
+UT_TEST(test_conversion_mixed_pair_requires_exact_clean_matching_state)
+{
+	ClusterRelmapV2Image image;
+	unsigned char bytes[2176];
+
+	for (int change = 0; change < 7; change++) {
+		setup_v1(&identity);
+		memset(&image, 0, sizeof(image));
+		image.identity = identity;
+		image.committed_generation = 7;
+		image.committed = map_image(40000);
+		if (change == 1)
+			image.committed_generation++;
+		else if (change == 2)
+			image.committed = map_image(40001);
+		else if (change == 3)
+			image.identity.database_incarnation++;
+		else if (change == 4)
+			image.identity.system_identifier++;
+		else if (change == 5) {
+			image.pending_generation = 8;
+			image.pending_owner = owner;
+			image.pending = map_image(40001);
+		}
+		UT_ASSERT_EQ(cluster_relmap_v2_encode(&image, bytes, sizeof(bytes)), CLUSTER_RELMAP_V2_VALID);
+		if (change == 6)
+			bytes[128] ^= 1;
+		/* A v2 primary/v1 backup cannot be made by backup-first conversion. */
+		write_copy(change == 0 ? 0 : 1, bytes, sizeof(bytes));
+		UT_ASSERT(!cluster_relmap_authority_v2_convert_clean(&identity));
+		UT_ASSERT_EQ(writes, 0);
+	}
+}
+
+UT_TEST(test_conversion_io_failures_require_a_distinct_successful_retry)
+{
+	for (int kind = 0; kind < 4; kind++) {
+		for (int copy = 1; copy <= 2; copy++) {
+			setup_v1(&identity);
+			if (kind == 0) fail_write = copy;
+			else if (kind == 1) fail_file_sync = copy;
+			else if (kind == 2) fail_rename = copy;
+			else fail_dir_sync = copy;
+			UT_ASSERT(!cluster_relmap_authority_v2_convert_clean(&identity));
+			reset_io();
+			relmap_x_held = true;
+			UT_ASSERT(cluster_relmap_authority_v2_convert_clean(&identity));
+			UT_ASSERT(conversion_pair_clean(&identity));
+			UT_ASSERT_EQ(file_syncs, 2);
+			UT_ASSERT_EQ(dir_syncs, 2);
+		}
+	}
+}
+
+UT_TEST(test_conversion_already_v2_retry_still_requires_sync)
+{
+	setup(&identity);
+	relmap_x_held = true;
+	fail_file_sync = 1;
+	UT_ASSERT(!cluster_relmap_authority_v2_convert_clean(&identity));
+	UT_ASSERT_EQ(renames, 0);
+	reset_io();
+	relmap_x_held = true;
+	UT_ASSERT(cluster_relmap_authority_v2_convert_clean(&identity));
+	UT_ASSERT(conversion_pair_clean(&identity));
+	UT_ASSERT_EQ(file_syncs, 2);
+	UT_ASSERT_EQ(dir_syncs, 2);
+}
+
+UT_TEST(test_conversion_refuses_missing_short_overlong_and_unsafe_files)
+{
+	unsigned char bytes[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE + 1];
+	char path[MAXPGPATH];
+
+	for (int change = 0; change < 7; change++) {
+		setup_v1(&identity);
+		snprintf(path, sizeof(path), "%s/%s", directory, names[change == 0 ? 0 : 1]);
+		if (change < 2)
+			UT_ASSERT_EQ(unlink(path), 0);
+		else if (change < 4) {
+			v1_image(&identity, bytes);
+			bytes[sizeof(bytes) - 1] = 0;
+			write_copy(1, bytes, change == 2 ? 100 : sizeof(bytes));
+		} else if (change == 4) {
+			UT_ASSERT_EQ(unlink(path), 0);
+			UT_ASSERT_EQ(symlink(names[0], path), 0);
+		} else if (change == 5) {
+			UT_ASSERT_EQ(unlink(path), 0);
+			UT_ASSERT_EQ(mkfifo(path, 0600), 0);
+		} else {
+			snprintf(path, sizeof(path), "%s/%s", directory, names[3]);
+			UT_ASSERT_EQ(symlink(names[0], path), 0);
+		}
+		UT_ASSERT(!cluster_relmap_authority_v2_convert_clean(&identity));
+		UT_ASSERT_EQ(writes, 0);
+	}
+}
+
+UT_TEST(test_conversion_requires_identity_sync_policy_and_continuous_namespace_lock)
+{
+	ClusterRelmapV2Namespace invalid = identity;
+
+	for (int change = 0; change < 6; change++) {
+		setup_v1(&identity);
+		invalid = identity;
+		if (change == 0) relmap_x_held = false;
+		else if (change == 1) enableFsync = false;
+		else if (change == 2) invalid.system_identifier = 0;
+		else if (change == 3) invalid.dbid = 42;
+		else if (change == 4) drop_relmap_x_on_read = true;
+		UT_ASSERT(!cluster_relmap_authority_v2_convert_clean(change == 5 ? NULL : &invalid));
+		UT_ASSERT_EQ(writes, 0);
+	}
+}
+
+UT_TEST(test_conversion_postread_corruption_replacement_and_close_cannot_acknowledge)
+{
+	for (int change = 0; change < 4; change++) {
+		setup_v1(&identity);
+		fault_rename = 2;
+		if (change < 2) {
+			corrupt_after_rename = true;
+			fault_copy = change;
+		} else if (change == 2)
+			replace_after_rename = true;
+		else
+			fail_directory_close = true;
+		UT_ASSERT(!cluster_relmap_authority_v2_convert_clean(&identity));
+		if (change == 3) {
+			UT_ASSERT(conversion_pair_clean(&identity));
+			reset_io();
+			relmap_x_held = true;
+			UT_ASSERT(cluster_relmap_authority_v2_convert_clean(&identity));
+		}
+	}
+}
+
 #define RESTORE_BASE UINT64CONST(0x200000000)
 #define RESTORE_OK CLUSTER_RELMAP_RETENTION_OK
 
@@ -1601,7 +1968,7 @@ UT_TEST(test_changed_wal_cannot_rebind_staged_pin)
 int
 main(void)
 {
-	UT_PLAN(45);
+	UT_PLAN(57);
 	UT_RUN(test_stage_both_copies_before_success);
 	UT_RUN(test_committed_reader_hides_pending_and_rejects_degraded_pair);
 	UT_RUN(test_committed_reader_requires_namespace_x_lock);
@@ -1628,6 +1995,18 @@ main(void)
 	UT_RUN(test_directory_close_failure_cannot_acknowledge_clean_pair);
 	UT_RUN(test_clean_unstaged_pair_cannot_fabricate_publish);
 	UT_RUN(test_pending_reader_preserves_base_for_cold_finish);
+	UT_RUN(test_conversion_syncs_both_and_disables_old_reader);
+	UT_RUN(test_conversion_local_namespace_and_inactive_v1_bytes);
+	UT_RUN(test_conversion_never_resolves_v1_pending);
+	UT_RUN(test_conversion_validates_exact_v1_header_and_native_image);
+	UT_RUN(test_conversion_rejects_conflicting_v1_copies);
+	UT_RUN(test_conversion_backup_is_replaced_before_primary);
+	UT_RUN(test_conversion_mixed_pair_requires_exact_clean_matching_state);
+	UT_RUN(test_conversion_io_failures_require_a_distinct_successful_retry);
+	UT_RUN(test_conversion_already_v2_retry_still_requires_sync);
+	UT_RUN(test_conversion_refuses_missing_short_overlong_and_unsafe_files);
+	UT_RUN(test_conversion_requires_identity_sync_policy_and_continuous_namespace_lock);
+	UT_RUN(test_conversion_postread_corruption_replacement_and_close_cannot_acknowledge);
 	UT_RUN(test_restore_clean_pair_is_only_one_building_observation);
 	UT_RUN(test_restore_exact_original_origin_and_epoch_zero);
 	UT_RUN(test_restore_legal_stage_publish_discard_cuts_keep_pending);

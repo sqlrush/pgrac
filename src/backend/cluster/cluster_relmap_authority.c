@@ -712,6 +712,97 @@ relmap_v2_store_pair(const RelmapV2Directory *dirs, const ClusterRelmapV2Namespa
 		   && memcmp(final[1].bytes, bytes, CLUSTER_RELMAP_V2_FILE_SIZE) == 0;
 }
 
+/* Decode only clean conversion inputs. V1 has no FullXid or namespace
+ * incarnation: the original owner authenticates expected, and no inactive
+ * owner or pending bytes are promoted into a v2 obligation. */
+static bool
+relmap_v2_conversion_image(const RelmapV2Copy *copy, const ClusterRelmapV2Namespace *expected,
+						   unsigned char bytes[CLUSTER_RELMAP_V2_FILE_SIZE])
+{
+	ClusterRelmapV2Image image;
+	ClusterRelmapAuthorityHeader hdr;
+
+	StaticAssertDecl(CLUSTER_RELMAP_AUTHORITY_FILE_SIZE < CLUSTER_RELMAP_V2_FILE_SIZE,
+					 "v1 conversion input must fit the bounded v2 copy buffer");
+	if (!copy->present)
+		return false;
+	if (copy->length == CLUSTER_RELMAP_V2_FILE_SIZE) {
+		if (cluster_relmap_v2_decode(copy->bytes, copy->length, expected, &image)
+				!= CLUSTER_RELMAP_V2_VALID
+			|| image.pending_generation != 0)
+			return false;
+		memcpy(bytes, copy->bytes, CLUSTER_RELMAP_V2_FILE_SIZE);
+		return true;
+	}
+	if (copy->length != CLUSTER_RELMAP_AUTHORITY_FILE_SIZE
+		|| cluster_relmap_authority_classify((const char *)copy->bytes, copy->length)
+			   != CLUSTER_RELMAP_AUTHORITY_VALID)
+		return false;
+	memcpy(&hdr, copy->bytes, sizeof(hdr));
+	if (hdr.version != 1 || hdr.committed_generation == 0 || hdr.pending_generation != 0
+		|| hdr.dbid != expected->dbid || hdr.shared_map != (uint8)expected->shared
+		|| hdr.pad0 != 0 || hdr.pad1 != 0 || hdr.image_size != sizeof(RelMapFile))
+		return false;
+	/* Encoding validates the native image, but must not silently discard
+	 * nonzero bytes beyond that image in the original committed slot. */
+	for (size_t i = sizeof(RelMapFile); i < CLUSTER_RELMAP_IMAGE_MAX; i++)
+		if (copy->bytes[COMMITTED_SLOT_OFFSET + i] != 0)
+			return false;
+	memset(&image, 0, sizeof(image));
+	image.identity = *expected;
+	image.committed_generation = hdr.committed_generation;
+	memcpy(&image.committed, copy->bytes + COMMITTED_SLOT_OFFSET, sizeof(RelMapFile));
+	return cluster_relmap_v2_encode(&image, bytes, CLUSTER_RELMAP_V2_FILE_SIZE)
+		   == CLUSTER_RELMAP_V2_VALID;
+}
+
+bool
+cluster_relmap_authority_v2_convert_clean(const ClusterRelmapV2Namespace *expected)
+{
+	RelmapV2Directory dirs;
+	RelmapV2Copy copies[2];
+	RelmapV2Copy final[2];
+	ClusterRelmapV2View view;
+	unsigned char bytes[2][CLUSTER_RELMAP_V2_FILE_SIZE];
+	bool ok = false;
+
+	if (!enableFsync || !cluster_relmap_authority_x_held())
+		return false;
+	if (!relmap_v2_open_dirs(expected, &dirs))
+		goto done;
+	if (!relmap_v2_read_copy(dirs.map, 0, &copies[0])
+		|| !relmap_v2_read_copy(dirs.map, 1, &copies[1]) || !relmap_v2_dirs_current(&dirs)
+		|| !relmap_v2_copies_current(dirs.map, copies)
+		|| !relmap_v2_conversion_image(&copies[0], expected, bytes[0])
+		|| !relmap_v2_conversion_image(&copies[1], expected, bytes[1])
+		|| memcmp(bytes[0], bytes[1], sizeof(bytes[0])) != 0)
+		goto done;
+	/* The sole mixed retry cut is v1 primary / v2 backup with the exact same
+	 * clean committed image. Two v1 inputs must agree even in inactive bytes. */
+	if (copies[1].length == CLUSTER_RELMAP_AUTHORITY_FILE_SIZE
+		&& (copies[0].length != CLUSTER_RELMAP_AUTHORITY_FILE_SIZE
+			|| memcmp(copies[0].bytes, copies[1].bytes, copies[0].length) != 0))
+		goto done;
+	if (!cluster_relmap_authority_x_held())
+		goto done;
+	/* Frozen conversion order differs from ordinary v2 stage/publish: sync
+	 * backup first, retaining the v1 primary until its v2 copy is durable.
+	 * Already-v2 retries also sync both copies; byte equality is not a receipt. */
+	if (!relmap_v2_install(&dirs, 1, bytes[0], copies)
+		|| !relmap_v2_install(&dirs, 0, bytes[0], copies))
+		goto done;
+	ok = relmap_v2_load(&dirs, expected, final, &view) == CLUSTER_RELMAP_V2_PAIR_VALID
+		 && relmap_v2_same_inode(&final[0].stat, &copies[0].stat)
+		 && relmap_v2_same_inode(&final[1].stat, &copies[1].stat)
+		 && memcmp(final[0].bytes, bytes[0], sizeof(bytes[0])) == 0
+		 && memcmp(final[1].bytes, bytes[0], sizeof(bytes[0])) == 0
+		 && cluster_relmap_authority_x_held();
+done:
+	if (!relmap_v2_close_dirs(&dirs))
+		ok = false;
+	return ok;
+}
+
 bool
 cluster_relmap_authority_v2_write_pending(const ClusterRelmapV2Namespace *expected,
 										uint64 generation, const ClusterRelmapV2Owner *owner,
