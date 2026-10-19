@@ -1657,6 +1657,7 @@ cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer
 	volatile bool terminal = false;
 	volatile bool active = false;
 	volatile bool unprovable = false;
+	volatile bool census_current = false;
 	uint8 i;
 	int remaining_ms;
 	uint64 wait_deadline;
@@ -1757,28 +1758,36 @@ cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer
 			} else
 				unprovable = true;
 		}
-		if (!cluster_semantic_activation_recheck_r4_terminal_census(&census.admission))
-			unprovable = true;
+		census_current = cluster_semantic_activation_recheck_r4_terminal_census(&census.admission);
 	}
 	PG_FINALLY();
 	{
 		cluster_heap_itl_finish_terminal_census(&census);
 	}
 	PG_END_TRY();
-	if (unprovable) {
+	if (!census_current) {
 		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_UNPROVABLE);
 		cluster_heap_itl_capacity_diagnostic(&census, capture_result, "RESOLVE");
 		return CLUSTER_TXW_UNPROVABLE;
 	}
 	if (terminal) {
+		/* Only ask the caller to recapture and apply exact terminal proofs.
+		 * An unrelated unknown slot is neither changed nor made reusable. */
 		*diagnostic_reason = "ITL_FRESH_REQUALIFY";
 		return CLUSTER_TXW_RETRY;
 	}
 	if (!active) {
+		if (unprovable) {
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_UNPROVABLE);
+			cluster_heap_itl_capacity_diagnostic(&census, capture_result, "RESOLVE");
+			return CLUSTER_TXW_UNPROVABLE;
+		}
 		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_PROTECTED);
 		*diagnostic_reason = "ITL_PROTECTED_HISTORY_CAPACITY";
 		return CLUSTER_TXW_UNPROVABLE;
 	}
+	/* Waiting for one independently proven blocker does not consume any
+	 * other slot's outcome. Every wakeup restarts full page qualification. */
 	cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_SELECTED);
 	remaining_ms = cluster_heap_itl_remaining_wait_ms(deadline_us, cluster_heap_itl_now_us(),
 													  cluster_ges_request_timeout_ms);

@@ -6452,7 +6452,8 @@ UT_TEST(test_itl_wait_negative_boundaries_preserve_page_and_close_owners)
 		for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
 			ut_itl_census_outcomes[i] = CLUSTER_TX_IN_PROGRESS;
 		if (leg == 0)
-			ut_itl_census_outcomes[0] = CLUSTER_TX_UNKNOWN;
+			for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+				ut_itl_census_outcomes[i] = CLUSTER_TX_UNKNOWN;
 		if (leg == 1 || leg == 2) {
 			expected = CLUSTER_TXW_TIMEOUT;
 			ut_itl_wait_result = CLUSTER_TXW_TIMEOUT;
@@ -6515,7 +6516,8 @@ UT_TEST(test_itl_refusal_reports_capture_or_exact_slot_without_new_reads)
 		const char *reason;
 		ut_itl_census_begin(&fixture, &result, false);
 		ut_itl_census_force_pcm_n = leg == 0;
-		ut_itl_census_outcomes[0] = CLUSTER_TX_UNKNOWN;
+		for (int i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+			ut_itl_census_outcomes[i] = CLUSTER_TX_UNKNOWN;
 		ut_capture_miss_log = true;
 		ut_itl_capacity_log[0] = '\0';
 		UT_ASSERT_EQ(cluster_heap_test_itl_wait_capacity(1, 1, 1, 9900, &deadline, &reason),
