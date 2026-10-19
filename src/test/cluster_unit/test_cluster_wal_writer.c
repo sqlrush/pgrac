@@ -1419,7 +1419,7 @@ UT_TEST(test_requested_flush_rejects_foreign_or_unsafe_context_without_io)
 int
 main(void)
 {
-	UT_PLAN(78);
+	UT_PLAN(88);
 	UT_RUN(test_clean_writer_requires_selected_exit_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_requires_selected_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_keeps_runtime_fence_and_exact_owner_refusals);
@@ -1498,6 +1498,16 @@ main(void)
 	UT_RUN(test_relmap_runtime_tt_rejects_a_foreign_directory_identity);
 	UT_RUN(test_relmap_runtime_tt_preserves_original_core_receipt_refusals);
 	UT_RUN(test_relmap_runtime_tt_refuses_corrupt_pins_and_recursive_lock);
+	UT_RUN(test_relmap_runtime_truncate_routes_original_origin_and_completes_exact_cut);
+	UT_RUN(test_relmap_runtime_truncate_clamps_to_each_staged_or_unstaged_namespace);
+	UT_RUN(test_relmap_runtime_truncate_reserves_against_original_begin_and_busy_retry);
+	UT_RUN(test_relmap_runtime_truncate_uncertain_preserves_reservation_and_pins_on_attach);
+	UT_RUN(test_relmap_runtime_truncate_rejects_stale_or_changed_receipts);
+	UT_RUN(test_relmap_runtime_truncate_refuses_unattached_unknown_and_building);
+	UT_RUN(test_relmap_runtime_truncate_checks_identity_origin_and_null_before_indexing);
+	UT_RUN(test_relmap_runtime_truncate_rejects_foreign_directory_or_receipt_identity);
+	UT_RUN(test_relmap_runtime_truncate_preserves_core_cut_and_serial_refusals);
+	UT_RUN(test_relmap_runtime_truncate_never_reacquires_or_releases_callers_lock);
 	free(relmap_runtime_allocation);
 	if (scratch[0] && !rmtree(scratch, true))
 		abort();

@@ -68,4 +68,34 @@ extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_bind_curren
 extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_tt_release_check_v2(
 	uint64 system_identifier, uint64 database_incarnation, const ClusterCanonicalTxnBinding *binding);
 
+/* Volatile original-owner routing receipt, not a persistent ABI or an
+ * authenticated capability. Origin is 0-based, as in the retention directory. */
+typedef struct ClusterRelmapRetentionRuntimeTruncateV2 {
+	uint64 system_identifier;
+	uint64 database_incarnation;
+	uint16 origin;
+	ClusterRelmapRetentionTruncate reservation;
+} ClusterRelmapRetentionRuntimeTruncateV2;
+
+/* Dormant original native-truncation owner only. That owner authenticates the
+ * origin, system/DB incarnation and qualified FullXid cut, and satisfies every
+ * existing native retention gate. Raw xid, nextXid or another origin's empty
+ * directory cannot supply that qualification. Under the sole runtime lock,
+ * begin clamps the cut to ALL pending pins and reserves it against new begin;
+ * on refusal the caller's receipt is unchanged. No owner query, allocation or
+ * I/O occurs under this lock. The original owner must use the RETURNED cutoff
+ * (never the wider requested cut) for its original I/O after unlocking.
+ * Complete is called only after successful corresponding original I/O;
+ * uncertain retains the reservation/pins and invalidates the directory. It
+ * cannot be undone by ERROR cleanup or a later complete. These interfaces
+ * neither release pins nor authorize native mutation by themselves. No live
+ * caller, COMPLETE publisher or floor/issued certification is installed. */
+extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_truncate_begin_v2(
+	uint64 system_identifier, uint64 database_incarnation, uint16 origin,
+	uint64 requested_cutoff, ClusterRelmapRetentionRuntimeTruncateV2 *reservation);
+extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_truncate_complete_v2(
+	const ClusterRelmapRetentionRuntimeTruncateV2 *reservation);
+extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_truncate_uncertain_v2(
+	const ClusterRelmapRetentionRuntimeTruncateV2 *reservation);
+
 #endif

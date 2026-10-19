@@ -791,6 +791,305 @@ UT_TEST(test_relmap_runtime_tt_refuses_corrupt_pins_and_recursive_lock)
 	LWLockRelease(relmap_runtime_test_lock);
 }
 
+static ClusterRelmapRetentionRuntimeTruncateV2
+relmap_runtime_truncate_receipt(unsigned origin)
+{
+	ClusterRelmapRetentionRuntimeTruncateV2 receipt = { 0 };
+
+	receipt.system_identifier = ref.claim.identity.system_identifier;
+	receipt.database_incarnation = ref.claim.database_incarnation;
+	receipt.origin = origin;
+	return receipt;
+}
+
+/* Refusals must preserve every origin and the caller's last usable receipt,
+ * including a second begin using the original output variable while BUSY. */
+static void
+relmap_runtime_truncate_refusal(unsigned operation,
+	ClusterRelmapRetentionRuntimeTruncateV2 *receipt, uint64 cutoff,
+	ClusterRelmapRetentionResult expected)
+{
+	Size bytes = sizeof(relmap_runtime_shmem->directories);
+	void *before = relmap_runtime_shmem == NULL ? NULL : malloc(bytes);
+	ClusterRelmapRetentionRuntimeTruncateV2 saved = { 0 };
+	ClusterRelmapRetentionResult result;
+	unsigned reads = relmap_binding_reads, assignments = relmap_assign_calls;
+	unsigned stages = relmap_runtime_stage_calls;
+	int syncs = sync_calls, renames = rename_calls;
+	bool held = relmap_retention_held;
+
+	if (before != NULL)
+		memcpy(before, relmap_runtime_shmem->directories, bytes);
+	else
+		UT_ASSERT(relmap_runtime_shmem == NULL);
+	if (receipt != NULL)
+		saved = *receipt;
+	if (operation == 0)
+		result = cluster_relmap_retention_runtime_truncate_begin_v2(saved.system_identifier,
+			saved.database_incarnation, saved.origin, cutoff, receipt);
+	else if (operation == 1)
+		result = cluster_relmap_retention_runtime_truncate_complete_v2(receipt);
+	else
+		result = cluster_relmap_retention_runtime_truncate_uncertain_v2(receipt);
+	UT_ASSERT_EQ(result, expected);
+	if (before != NULL) {
+		UT_ASSERT_EQ(memcmp(before, relmap_runtime_shmem->directories, bytes), 0);
+		free(before);
+	}
+	if (receipt != NULL)
+		UT_ASSERT_EQ(memcmp(&saved, receipt, sizeof(saved)), 0);
+	UT_ASSERT_EQ(relmap_binding_reads, reads);
+	UT_ASSERT_EQ(relmap_assign_calls, assignments);
+	UT_ASSERT_EQ(relmap_runtime_stage_calls, stages);
+	UT_ASSERT_EQ(sync_calls, syncs);
+	UT_ASSERT_EQ(rename_calls, renames);
+	UT_ASSERT_EQ(relmap_retention_held, held);
+}
+
+static void
+relmap_runtime_truncate_quiet(void)
+{
+	UT_ASSERT(!relmap_retention_held);
+	UT_ASSERT_EQ(relmap_binding_reads + relmap_assign_calls, 0);
+	UT_ASSERT_EQ(relmap_runtime_stage_calls + relmap_runtime_stage_writes, 0);
+	UT_ASSERT_EQ(sync_calls + rename_calls, 0);
+}
+
+UT_TEST(test_relmap_runtime_truncate_routes_original_origin_and_completes_exact_cut)
+{
+	for (unsigned origin = 0; origin < CLUSTER_MAX_NODES; origin += CLUSTER_MAX_NODES - 1) {
+		ClusterRelmapRetentionRuntimeTruncateV2 receipt = { 0 }, saved;
+		ClusterRelmapRetentionDirectory *directory, before;
+		Size bytes;
+		void *others;
+
+		relmap_runtime_fixture(true);
+		relmap_runtime_qualified_fixture(origin);
+		directory = &relmap_runtime_shmem->directories[origin];
+		before = *directory;
+		bytes = sizeof(relmap_runtime_shmem->directories);
+		others = malloc(bytes);
+		UT_ASSERT_NOT_NULL(others);
+		memcpy(others, relmap_runtime_shmem->directories, bytes);
+		cluster_node_id = -1; /* Never select an implicit current-node directory. */
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_truncate_begin_v2(
+			before.system_identifier, before.database_incarnation, origin,
+			before.last_issued + 1, &receipt), CLUSTER_RELMAP_RETENTION_OK);
+		UT_ASSERT_EQ(receipt.origin, origin);
+		UT_ASSERT_EQ(receipt.system_identifier, before.system_identifier);
+		UT_ASSERT_EQ(receipt.database_incarnation, before.database_incarnation);
+		UT_ASSERT_EQ(receipt.reservation.cutoff, before.last_issued + 1);
+		UT_ASSERT_EQ(receipt.reservation.generation, before.generation);
+		UT_ASSERT_EQ(receipt.reservation.serial, 1);
+		UT_ASSERT_EQ(directory->native_floor, before.native_floor);
+		UT_ASSERT_EQ(relmap_retention_acquires, 1);
+		saved = receipt;
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_truncate_complete_v2(&receipt),
+			CLUSTER_RELMAP_RETENTION_OK);
+		UT_ASSERT_EQ(directory->native_floor, before.last_issued + 1);
+		UT_ASSERT_EQ(directory->inflight.serial, 0);
+		UT_ASSERT_EQ(directory->state, CLUSTER_RELMAP_RETENTION_COMPLETE);
+		UT_ASSERT_EQ(memcmp(directory->pins, before.pins, sizeof(before.pins)), 0);
+		UT_ASSERT_EQ(memcmp(&receipt, &saved, sizeof(saved)), 0);
+		/* Ignore only the selected origin when checking foreign directories. */
+		memcpy((char *) others + origin * sizeof(*directory), directory, sizeof(*directory));
+		UT_ASSERT_EQ(memcmp(others, relmap_runtime_shmem->directories, bytes), 0);
+		free(others);
+		UT_ASSERT_EQ(relmap_retention_acquires, 2);
+		relmap_runtime_truncate_quiet();
+	}
+}
+
+UT_TEST(test_relmap_runtime_truncate_clamps_to_each_staged_or_unstaged_namespace)
+{
+	for (unsigned selected = 0; selected < 2; selected++) {
+		ClusterRelmapRetentionDirectory *directory = relmap_runtime_binding_fixture(CLUSTER_MAX_NODES - 1);
+		ClusterRelmapRetentionPin pins[CLUSTER_RELMAP_RETENTION_CAPACITY];
+		ClusterRelmapRetentionRuntimeTruncateV2 receipt = relmap_runtime_truncate_receipt(directory->origin);
+
+		directory->pins[1 - selected].occupied = false;
+		memcpy(pins, directory->pins, sizeof(pins));
+		cluster_node_id = 0; /* An empty local origin cannot replace this one. */
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_truncate_begin_v2(receipt.system_identifier,
+			receipt.database_incarnation, receipt.origin, relmap_top_full + 20, &receipt),
+			CLUSTER_RELMAP_RETENTION_OK);
+		UT_ASSERT_EQ(receipt.reservation.cutoff, relmap_top_full);
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_truncate_complete_v2(&receipt),
+			CLUSTER_RELMAP_RETENTION_OK);
+		UT_ASSERT_EQ(directory->native_floor, relmap_top_full);
+		UT_ASSERT_EQ(memcmp(pins, directory->pins, sizeof(pins)), 0);
+		UT_ASSERT_EQ(relmap_retention_acquires, 2);
+		relmap_runtime_truncate_quiet();
+	}
+}
+
+UT_TEST(test_relmap_runtime_truncate_reserves_against_original_begin_and_busy_retry)
+{
+	ClusterRelmapOwnerSampleV2 sample;
+	ClusterRelmapV2Namespace identity;
+	ClusterRelmapRetentionRuntimeTruncateV2 receipt;
+
+	relmap_runtime_fixture(true);
+	relmap_runtime_qualified_fixture(0);
+	UT_ASSERT(cluster_relmap_owner_capture_v2(&sample));
+	identity = relmap_owner_namespace();
+	receipt = relmap_runtime_truncate_receipt(0);
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_truncate_begin_v2(receipt.system_identifier,
+		receipt.database_incarnation, 0, relmap_top_full + 10, &receipt), CLUSTER_RELMAP_RETENTION_OK);
+	relmap_runtime_truncate_refusal(0, &receipt, relmap_top_full + 20, CLUSTER_RELMAP_RETENTION_BUSY);
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_begin_v2(&sample, &identity, 8),
+		CLUSTER_RELMAP_RETENTION_NATIVE_GONE);
+	relmap_top_full += 10; /* Equality with the reserved first-retained cut is safe. */
+	UT_ASSERT(cluster_relmap_owner_capture_v2(&sample));
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_begin_v2(&sample, &identity, 8),
+		CLUSTER_RELMAP_RETENTION_OK);
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_truncate_complete_v2(&receipt), CLUSTER_RELMAP_RETENTION_OK);
+	UT_ASSERT(relmap_runtime_shmem->directories[0].pins[0].occupied);
+	UT_ASSERT(!relmap_retention_held);
+}
+
+UT_TEST(test_relmap_runtime_truncate_uncertain_preserves_reservation_and_pins_on_attach)
+{
+	ClusterRelmapRetentionDirectory *directory = relmap_runtime_binding_fixture(0);
+	ClusterRelmapRetentionDirectory before;
+	ClusterRelmapRetentionRuntimeTruncateV2 receipt = relmap_runtime_truncate_receipt(0);
+
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_truncate_begin_v2(receipt.system_identifier,
+		receipt.database_incarnation, 0, relmap_top_full + 20, &receipt), CLUSTER_RELMAP_RETENTION_OK);
+	before = *directory;
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_truncate_uncertain_v2(&receipt), CLUSTER_RELMAP_RETENTION_OK);
+	UT_ASSERT_EQ(directory->state, CLUSTER_RELMAP_RETENTION_UNKNOWN);
+	before.state = CLUSTER_RELMAP_RETENTION_UNKNOWN;
+	UT_ASSERT_EQ(memcmp(&before, directory, sizeof(before)), 0);
+	relmap_runtime_shmem = NULL;
+	relmap_runtime_registered->init_fn();
+	UT_ASSERT_EQ(memcmp(&before, &relmap_runtime_shmem->directories[0], sizeof(before)), 0);
+	for (unsigned operation = 0; operation < 3; operation++)
+		relmap_runtime_truncate_refusal(operation, &receipt, relmap_top_full + 20,
+			CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+	relmap_runtime_truncate_quiet();
+}
+
+UT_TEST(test_relmap_runtime_truncate_rejects_stale_or_changed_receipts)
+{
+	ClusterRelmapRetentionRuntimeTruncateV2 receipt, stale, changed;
+
+	relmap_runtime_fixture(true);
+	relmap_runtime_qualified_fixture(0);
+	receipt = relmap_runtime_truncate_receipt(0);
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_truncate_begin_v2(receipt.system_identifier,
+		receipt.database_incarnation, 0, relmap_top_full, &receipt), CLUSTER_RELMAP_RETENTION_OK);
+	stale = receipt;
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_truncate_complete_v2(&receipt), CLUSTER_RELMAP_RETENTION_OK);
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_truncate_begin_v2(receipt.system_identifier,
+		receipt.database_incarnation, 0, relmap_top_full, &receipt), CLUSTER_RELMAP_RETENTION_OK);
+	for (unsigned operation = 1; operation < 3; operation++) {
+		relmap_runtime_truncate_refusal(operation, &stale, 0, CLUSTER_RELMAP_RETENTION_CONFLICT);
+		for (unsigned field = 0; field < 4; field++) {
+			changed = receipt;
+			if (field == 0) changed.reservation.generation++;
+			if (field == 1) changed.reservation.serial++;
+			if (field == 2) changed.reservation.cutoff++;
+			if (field == 3) changed.reservation.serial = 0;
+			relmap_runtime_truncate_refusal(operation, &changed, 0, CLUSTER_RELMAP_RETENTION_CONFLICT);
+		}
+	}
+	relmap_runtime_truncate_quiet();
+}
+
+UT_TEST(test_relmap_runtime_truncate_refuses_unattached_unknown_and_building)
+{
+	for (unsigned state = 0; state < 3; state++) {
+		ClusterRelmapRetentionRuntimeTruncateV2 receipt;
+
+		relmap_runtime_fixture(state != 0);
+		if (state == 2)
+			relmap_runtime_shmem->directories[0].state = CLUSTER_RELMAP_RETENTION_BUILDING;
+		receipt = relmap_runtime_truncate_receipt(0);
+		for (unsigned operation = 0; operation < 3; operation++)
+			relmap_runtime_truncate_refusal(operation, &receipt, relmap_top_full,
+				CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+		UT_ASSERT_EQ(relmap_retention_acquires, state == 0 ? 0 : 3);
+	}
+}
+
+UT_TEST(test_relmap_runtime_truncate_checks_identity_origin_and_null_before_indexing)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		ClusterRelmapRetentionRuntimeTruncateV2 receipt;
+
+		relmap_runtime_fixture(true);
+		receipt = relmap_runtime_truncate_receipt(0);
+		if (fault == 0) receipt.system_identifier = 0;
+		if (fault == 1) receipt.database_incarnation = 0;
+		if (fault == 2) receipt.origin = CLUSTER_MAX_NODES;
+		if (fault == 3) receipt.origin = UINT16_MAX;
+		for (unsigned operation = 0; operation < 3; operation++)
+			relmap_runtime_truncate_refusal(operation, fault == 4 ? NULL : &receipt,
+				relmap_top_full, CLUSTER_RELMAP_RETENTION_INVALID);
+		UT_ASSERT_EQ(relmap_retention_acquires, 0);
+	}
+}
+
+UT_TEST(test_relmap_runtime_truncate_rejects_foreign_directory_or_receipt_identity)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		ClusterRelmapRetentionDirectory *directory;
+		ClusterRelmapRetentionRuntimeTruncateV2 receipt;
+
+		relmap_runtime_fixture(true);
+		relmap_runtime_qualified_fixture(0);
+		directory = &relmap_runtime_shmem->directories[0];
+		receipt = relmap_runtime_truncate_receipt(0);
+		if (fault == 0) directory->origin++;
+		if (fault == 1) directory->system_identifier++;
+		if (fault == 2) directory->database_incarnation++;
+		if (fault == 3) receipt.system_identifier++;
+		if (fault == 4) receipt.database_incarnation++;
+		for (unsigned operation = 0; operation < 3; operation++)
+			relmap_runtime_truncate_refusal(operation, &receipt, relmap_top_full,
+				CLUSTER_RELMAP_RETENTION_INVALID);
+		UT_ASSERT_EQ(relmap_retention_acquires, 3);
+	}
+}
+
+UT_TEST(test_relmap_runtime_truncate_preserves_core_cut_and_serial_refusals)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		ClusterRelmapRetentionDirectory *directory;
+		ClusterRelmapRetentionRuntimeTruncateV2 receipt;
+		uint64 cutoff;
+
+		relmap_runtime_fixture(true);
+		relmap_runtime_qualified_fixture(0);
+		directory = &relmap_runtime_shmem->directories[0];
+		receipt = relmap_runtime_truncate_receipt(0);
+		cutoff = relmap_top_full;
+		if (fault == 0) cutoff = directory->native_floor - 1;
+		if (fault == 1) cutoff = directory->last_issued + 2;
+		if (fault == 2) cutoff = UINT64CONST(0x500000001); /* Special raw xid in a later era. */
+		if (fault == 3) cutoff = PG_UINT64_MAX;
+		if (fault == 4) directory->truncate_serial = PG_UINT64_MAX;
+		relmap_runtime_truncate_refusal(0, &receipt, cutoff, fault == 4
+			? CLUSTER_RELMAP_RETENTION_UNAVAILABLE : CLUSTER_RELMAP_RETENTION_INVALID);
+	}
+}
+
+UT_TEST(test_relmap_runtime_truncate_never_reacquires_or_releases_callers_lock)
+{
+	ClusterRelmapRetentionRuntimeTruncateV2 receipt;
+
+	relmap_runtime_fixture(true);
+	relmap_runtime_qualified_fixture(0);
+	receipt = relmap_runtime_truncate_receipt(0);
+	LWLockAcquire(relmap_runtime_test_lock, LW_EXCLUSIVE);
+	for (unsigned operation = 0; operation < 3; operation++)
+		relmap_runtime_truncate_refusal(operation, &receipt, relmap_top_full,
+			CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+	UT_ASSERT_EQ(relmap_retention_acquires, 1);
+	LWLockRelease(relmap_runtime_test_lock);
+}
+
 UT_TEST(test_relmap_runtime_active_binds_all_existing_namespaces_and_staged_pin)
 {
 	for (unsigned origin = 0; origin < CLUSTER_MAX_NODES; origin += CLUSTER_MAX_NODES - 1) {

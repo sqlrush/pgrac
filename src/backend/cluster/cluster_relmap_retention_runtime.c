@@ -265,3 +265,86 @@ cluster_relmap_retention_runtime_tt_release_check_v2(uint64 system_identifier,
 	LWLockRelease(&relmap_runtime_shmem->lock);
 	return result;
 }
+
+/* Caller holds the sole runtime lock; no ordinary owner can publish COMPLETE
+ * through these adapters. The receipt identifies the original directory even
+ * when this backend's current node differs from the truncation's origin. */
+static ClusterRelmapRetentionResult
+relmap_runtime_truncate_matches(const ClusterRelmapRetentionDirectory *directory,
+	uint64 system_identifier, uint64 database_incarnation, uint16 origin)
+{
+	if (directory->state != CLUSTER_RELMAP_RETENTION_COMPLETE)
+		return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
+	if (directory->origin != origin || directory->system_identifier != system_identifier
+		|| directory->database_incarnation != database_incarnation)
+		return CLUSTER_RELMAP_RETENTION_INVALID;
+	return CLUSTER_RELMAP_RETENTION_OK;
+}
+
+ClusterRelmapRetentionResult
+cluster_relmap_retention_runtime_truncate_begin_v2(uint64 system_identifier,
+	uint64 database_incarnation, uint16 origin, uint64 requested_cutoff,
+	ClusterRelmapRetentionRuntimeTruncateV2 *reservation)
+{
+	ClusterRelmapRetentionRuntimeTruncateV2 prepared = { 0 };
+	ClusterRelmapRetentionDirectory *directory;
+	ClusterRelmapRetentionResult result;
+
+	if (system_identifier == 0 || database_incarnation == 0 || origin >= CLUSTER_MAX_NODES
+		|| reservation == NULL)
+		return CLUSTER_RELMAP_RETENTION_INVALID;
+	if (relmap_runtime_shmem == NULL || LWLockHeldByMe(&relmap_runtime_shmem->lock))
+		return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
+	directory = &relmap_runtime_shmem->directories[origin];
+	prepared.system_identifier = system_identifier;
+	prepared.database_incarnation = database_incarnation;
+	prepared.origin = origin;
+	LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
+	result = relmap_runtime_truncate_matches(directory, system_identifier, database_incarnation, origin);
+	if (result == CLUSTER_RELMAP_RETENTION_OK)
+		result = cluster_relmap_retention_truncate_begin(directory, requested_cutoff, &prepared.reservation);
+	/* The pure core clears its output on refusal. Keep that local so a BUSY
+	 * retry cannot erase the original owner's still-live routing receipt. */
+	if (result == CLUSTER_RELMAP_RETENTION_OK)
+		*reservation = prepared;
+	LWLockRelease(&relmap_runtime_shmem->lock);
+	return result;
+}
+
+static ClusterRelmapRetentionResult
+relmap_runtime_truncate_finish(const ClusterRelmapRetentionRuntimeTruncateV2 *reservation,
+	bool uncertain)
+{
+	ClusterRelmapRetentionDirectory *directory;
+	ClusterRelmapRetentionResult result;
+
+	if (reservation == NULL || reservation->system_identifier == 0
+		|| reservation->database_incarnation == 0 || reservation->origin >= CLUSTER_MAX_NODES)
+		return CLUSTER_RELMAP_RETENTION_INVALID;
+	if (relmap_runtime_shmem == NULL || LWLockHeldByMe(&relmap_runtime_shmem->lock))
+		return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
+	directory = &relmap_runtime_shmem->directories[reservation->origin];
+	LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
+	result = relmap_runtime_truncate_matches(directory, reservation->system_identifier,
+		reservation->database_incarnation, reservation->origin);
+	if (result == CLUSTER_RELMAP_RETENTION_OK)
+		result = uncertain
+			? cluster_relmap_retention_truncate_uncertain(directory, &reservation->reservation)
+			: cluster_relmap_retention_truncate_complete(directory, &reservation->reservation);
+	LWLockRelease(&relmap_runtime_shmem->lock);
+	return result;
+}
+
+ClusterRelmapRetentionResult
+cluster_relmap_retention_runtime_truncate_complete_v2(
+	const ClusterRelmapRetentionRuntimeTruncateV2 *reservation)
+{
+	return relmap_runtime_truncate_finish(reservation, false);
+}
+
+ClusterRelmapRetentionResult
+cluster_relmap_retention_runtime_truncate_uncertain_v2(
+	const ClusterRelmapRetentionRuntimeTruncateV2 *reservation)
+{
+	return relmap_runtime_truncate_finish(reservation, true);
+}
