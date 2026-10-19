@@ -3177,6 +3177,30 @@ ko_peer_physical_cut_current_v3(const ClusterKoPeerFenceV3 *before, uint64 revis
 		   && memcmp(gate, &after, sizeof(after)) == 0;
 }
 
+/* Diagnostic only. Call after the original bounded operation, outside the
+ * KO/PCM locks; the timestamps never participate in READY or a deadline.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+ko_peer_stage_timing_v3(const ClusterKoPeerFenceV3 *before,
+	const ResourceXGateSnapshot *gate, uint64 revision, const char *stage,
+	uint32 start, uint32 cursor, int result, TimestampTz started)
+{
+	if (cluster_trace_normal_stop)
+		ereport(LOG, (errmsg("KO peer stage timing"),
+			errdetail("stage=%s locator=%u/%u/%u serial=" UINT64_FORMAT
+				" batch=" UINT64_FORMAT " origin=%u origin_boot=" UINT64_FORMAT
+				" peer=%u peer_boot=" UINT64_FORMAT " epoch=" UINT64_FORMAT
+				" cursor=%u->%u result=%d revision=" UINT64_FORMAT
+				" gate_phase=%u formation=" UINT64_FORMAT " elapsed_us=" INT64_FORMAT,
+				stage, before->request.base.key.locator.spcOid,
+				before->request.base.key.locator.dbOid, before->request.base.key.locator.relNumber,
+				before->serial, before->request.base.batch_id, before->request.base.origin_node,
+				before->request.base.origin_boot, before->request.base.peer_node,
+				before->request.base.peer_boot, before->request.base.epoch,
+				start, cursor, result, revision, gate->phase, gate->formation,
+				GetCurrentTimestamp() - started)));
+}
+
 static bool
 ko_peer_fence_physical_tick_v3(ClusterKoPeerFenceV3 *before,
 							   const ClusterKoPeerFenceHandleV3 *handle)
@@ -3226,18 +3250,24 @@ ko_peer_fence_physical_tick_v3(ClusterKoPeerFenceV3 *before,
 	smgr = smgropen(before->request.base.key.locator, InvalidBackendId);
 	while (phase < 3 && budget > 0) {
 		if (phase == 1) {
+			TimestampTz started = cluster_trace_normal_stop ? GetCurrentTimestamp() : 0;
+
 			for (ForkNumber fork = MAIN_FORKNUM; fork <= MAX_FORKNUM; fork++) {
 				if (smgrexists(smgr, fork))
 					smgrimmedsync(smgr, fork);
 				if (!ko_peer_physical_cut_current_v3(before, revision, &gate))
 					return false;
 			}
+			ko_peer_stage_timing_v3(before, &gate, revision, "physical-sync", 0, 0, 0, started);
 			phase = 2;
 		} else {
 			uint32 start = cursor, remaining = budget;
+			TimestampTz started = cluster_trace_normal_stop ? GetCurrentTimestamp() : 0;
 			ClusterBufferDrainResult result
 				= cluster_bufmgr_drain_relation_v3(smgr, phase == 0, &budget, &cursor);
 
+			ko_peer_stage_timing_v3(before, &gate, revision,
+				phase == 0 ? "physical-flush" : "physical-verify", start, cursor, result, started);
 			if (budget > remaining || cursor < start || cursor - start > remaining - budget
 				|| !ko_peer_physical_cut_current_v3(before, revision, &gate))
 				return false;
@@ -3340,6 +3370,7 @@ ko_peer_fence_discard_tick_v4(ClusterKoPeerFenceV3 *before,
 	uint64 revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
 	uint32 cursor = 0, budget = 128, start;
 	bool applied = false;
+	TimestampTz started;
 
 	if (revision == 0 || revision >= UINT64_MAX - 1
 		|| !cluster_pcm_lock_resource_x_gate_snapshot(&gate)
@@ -3369,7 +3400,10 @@ ko_peer_fence_discard_tick_v4(ClusterKoPeerFenceV3 *before,
 	ko_peer_fence_physical_reset_locked(entry);
 	SpinLockRelease(&ko_state->shared_lock);
 	start = cursor;
+	started = cluster_trace_normal_stop ? GetCurrentTimestamp() : 0;
 	result = cluster_bufmgr_discard_relation_v4(before->request.base.key.locator, &budget, &cursor);
+	ko_peer_stage_timing_v3(before, &gate, revision, "committed-buffer", start, cursor,
+		result, started);
 	if (budget > 128 || cursor < start || cursor - start > 128 - budget
 		|| (result != CLUSTER_BUFFER_DRAIN_EMPTY && result != CLUSTER_BUFFER_DRAIN_MORE
 			&& result != CLUSTER_BUFFER_DRAIN_WAIT)
@@ -3406,6 +3440,7 @@ ko_peer_fence_local_scan_v3(const ClusterKoPeerFenceV3 *before,
 	uint64 revision, writeback_revision = 0;
 	uint32 cursor, start;
 	bool complete = false;
+	TimestampTz started;
 
 	revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
 	if (revision == 0 || revision == UINT64_MAX || !cluster_pcm_lock_resource_x_gate_snapshot(&gate)
@@ -3422,15 +3457,24 @@ ko_peer_fence_local_scan_v3(const ClusterKoPeerFenceV3 *before,
 	 * cleared without taking the KO lock from an unwinding directory stack.
 	 * Only the fully revalidated return below publishes a new hint. */
 	ko_peer_fence_scan_reset_v3(handle);
+	started = cluster_trace_normal_stop ? GetCurrentTimestamp() : 0;
 	scan = before->committed_discard
 		? cluster_pcm_lock_ko_local_relation_discard_v4(before->request.base.key.locator,
 			gate.formation, 128, &cursor)
 		: cluster_pcm_lock_ko_local_relation_scan_v3(before->request.base.key.locator,
 			gate.formation, 128, &cursor);
-	if (scan == CLUSTER_PCM_PI_RELATION_EMPTY
-		&& !cluster_pi_writeback_local_relation_closed_v3(
-			before->request.base.key.locator, before->request.base.epoch, &writeback_revision))
-		scan = CLUSTER_PCM_PI_RELATION_PENDING;
+	ko_peer_stage_timing_v3(before, &gate, revision, "local-grd", start, cursor, scan, started);
+	if (scan == CLUSTER_PCM_PI_RELATION_EMPTY) {
+		bool closed;
+
+		started = cluster_trace_normal_stop ? GetCurrentTimestamp() : 0;
+		closed = cluster_pi_writeback_local_relation_closed_v3(
+			before->request.base.key.locator, before->request.base.epoch, &writeback_revision);
+		ko_peer_stage_timing_v3(before, &gate, revision, "local-writeback", cursor, cursor,
+			closed, started);
+		if (!closed)
+			scan = CLUSTER_PCM_PI_RELATION_PENDING;
+	}
 	if ((scan != CLUSTER_PCM_PI_RELATION_MORE && scan != CLUSTER_PCM_PI_RELATION_PENDING
 		 && scan != CLUSTER_PCM_PI_RELATION_EMPTY)
 		|| cursor < start || !cluster_pcm_lock_resource_x_gate_snapshot(&after)

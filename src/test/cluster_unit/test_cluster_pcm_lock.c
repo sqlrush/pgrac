@@ -456,6 +456,7 @@ static union {
 } fake_pcm_entries;
 
 static char fake_pcm_htab_token;
+static uint64 fake_pcm_hash_find_calls;
 static bool fake_pcm_header_found = false;
 static Size fake_pcm_header_requested_size = 0;
 static long fake_pcm_entry_count = 0;
@@ -880,6 +881,8 @@ hash_search(HTAB *hashp pg_attribute_unused(), const void *keyPtr pg_attribute_u
 	Assert(hashp == (HTAB *)&fake_pcm_htab_token);
 	Assert(fake_pcm_keysize > 0);
 	Assert(fake_pcm_entrysize > 0);
+	if (action == HASH_FIND)
+		fake_pcm_hash_find_calls++;
 
 	for (i = 0; i < fake_pcm_entry_count; i++) {
 		char *entry = fake_pcm_entries.data[i];
@@ -20863,6 +20866,117 @@ pi_relation_scan_setup(void)
 	cluster_shared_config = true;
 }
 
+/* Count real production scan lookups, after constructing the registry. */
+UT_TEST(test_relation_scan_hashes_only_the_target_in_every_role)
+{
+	ClusterPcmPiRelationScanV2 (*scans[])(RelFileLocator, uint64, uint32, uint32 *) = {
+		cluster_pcm_lock_pi_relation_scan_v2,
+		cluster_pcm_lock_ko_relation_scan_v3,
+		cluster_pcm_lock_ko_local_relation_scan_v3,
+		cluster_pcm_lock_ko_directory_relation_scan_v3,
+	};
+
+	for (unsigned role = 0; role < lengthof(scans); role++) {
+		BufferTag target = make_tag(6811);
+		RelFileLocator locator = BufTagGetRelFileLocator(&target);
+		PcmEntryAcquireResult acquired;
+		PcmEntryRef ref;
+		uint32 cursor = 0;
+
+		pi_relation_scan_setup();
+		for (unsigned index = 0; index < 4; index++) {
+			BufferTag tag = target;
+
+			if (index != 3)
+				tag.relNumber += index + 1;
+			UT_ASSERT(pcm_entry_ref_acquire(&tag, true, &ref, &acquired));
+			pcm_entry_ref_release(&ref);
+		}
+		fake_pcm_hash_find_calls = 0;
+		UT_ASSERT_EQ(scans[role](locator, 17, 4, &cursor), CLUSTER_PCM_PI_RELATION_EMPTY);
+		UT_ASSERT_EQ(cursor, 4);
+		UT_ASSERT_EQ(fake_pcm_hash_find_calls, 1);
+		cluster_shared_config = false;
+	}
+}
+
+UT_TEST(test_relation_scan_non_target_hash_orphan_is_outside_object_proof)
+{
+	BufferTag other = make_tag(6812), target = other;
+	RelFileLocator locator;
+	PcmEntryAcquireResult acquired;
+	PcmEntryRef ref;
+	uint32 cursor = 0;
+	bool found;
+
+	pi_relation_scan_setup();
+	target.relNumber++;
+	locator = BufTagGetRelFileLocator(&target);
+	UT_ASSERT(pcm_entry_ref_acquire(&other, true, &ref, &acquired));
+	pcm_entry_ref_release(&ref);
+	(void)hash_search((HTAB *)&fake_pcm_htab_token, &other, HASH_REMOVE, &found);
+	UT_ASSERT(found);
+	UT_ASSERT(pcm_entry_ref_acquire(&target, true, &ref, &acquired));
+	pcm_entry_ref_release(&ref);
+	fake_pcm_hash_find_calls = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_ko_relation_scan_v3(locator, 17, 4, &cursor),
+				 CLUSTER_PCM_PI_RELATION_EMPTY);
+	UT_ASSERT_EQ(cursor, 4);
+	UT_ASSERT_EQ(fake_pcm_hash_find_calls, 1);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_pi_scan_filters_excluded_fork_but_ko_keeps_target_validation)
+{
+	BufferTag tag = make_tag(6813);
+	RelFileLocator locator = BufTagGetRelFileLocator(&tag);
+	PcmEntryAcquireResult acquired;
+	PcmEntryRef ref;
+	uint32 cursor = 0;
+	bool found;
+
+	pi_relation_scan_setup();
+	tag.forkNum = FSM_FORKNUM;
+	UT_ASSERT(pcm_entry_ref_acquire(&tag, true, &ref, &acquired));
+	pcm_entry_ref_release(&ref);
+	(void)hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_REMOVE, &found);
+	UT_ASSERT(found);
+	fake_pcm_hash_find_calls = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_pi_relation_scan_v2(locator, 17, 4, &cursor),
+				 CLUSTER_PCM_PI_RELATION_EMPTY);
+	UT_ASSERT_EQ(cursor, 4);
+	UT_ASSERT_EQ(fake_pcm_hash_find_calls, 0);
+	cursor = 0;
+	fake_pcm_hash_find_calls = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_ko_relation_scan_v3(locator, 17, 4, &cursor),
+				 CLUSTER_PCM_PI_RELATION_INVALID);
+	UT_ASSERT_EQ(cursor, 0);
+	UT_ASSERT_EQ(fake_pcm_hash_find_calls, 1);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_relation_scan_target_hash_binding_mismatch_remains_invalid)
+{
+	BufferTag tag = make_tag(6814);
+	RelFileLocator locator = BufTagGetRelFileLocator(&tag);
+	PcmEntryAcquireResult acquired;
+	PcmEntryRef ref;
+	struct StopPcmEntryLayout *entry;
+	uint32 cursor = 0;
+
+	pi_relation_scan_setup();
+	UT_ASSERT(pcm_entry_ref_acquire(&tag, true, &ref, &acquired));
+	pcm_entry_ref_release(&ref);
+	entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+	entry->binding_generation++;
+	fake_pcm_hash_find_calls = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_ko_relation_scan_v3(locator, 17, 4, &cursor),
+				 CLUSTER_PCM_PI_RELATION_INVALID);
+	UT_ASSERT_EQ(cursor, 0);
+	UT_ASSERT_EQ(fake_pcm_hash_find_calls, 1);
+	cluster_shared_config = false;
+}
+
 UT_TEST(test_pi_relation_empty_requires_complete_bounded_scan)
 {
 	BufferTag tag = make_tag(6801);
@@ -24348,6 +24462,10 @@ main(void)
 	UT_RUN(test_real_lms_wait_retains_quiet_retry_deadline);
 	UT_RUN(test_real_pcm_pump_continues_past_sixteenth_delivery);
 	UT_RUN(test_requester_transport_owner_bounds_both_dispatch_roots);
+	UT_RUN(test_relation_scan_hashes_only_the_target_in_every_role);
+	UT_RUN(test_relation_scan_non_target_hash_orphan_is_outside_object_proof);
+	UT_RUN(test_pi_scan_filters_excluded_fork_but_ko_keeps_target_validation);
+	UT_RUN(test_relation_scan_target_hash_binding_mismatch_remains_invalid);
 	UT_RUN(test_pi_relation_empty_requires_complete_bounded_scan);
 	UT_RUN(test_pi_relation_scan_checks_main_vm_and_original_references);
 	UT_RUN(test_pi_relation_scan_never_retires_master_or_local_pi);

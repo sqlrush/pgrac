@@ -481,6 +481,7 @@ UT_TEST(test_peer_stop_trace_default_off_and_exact_passive_owner_fields)
 	UT_ASSERT(fixture_peer_drain());
 	UT_ASSERT(storage.peer_fences[0].last_progress_pg_us > 0);
 	before = storage.peer_fences[0];
+	logs = fixture_log_events;
 	cluster_ko_normal_stop_trace_v1();
 	UT_ASSERT_EQ(fixture_log_events, logs + 1);
 	UT_ASSERT(memcmp(&before, &storage.peer_fences[0], sizeof(before)) == 0);
@@ -488,6 +489,31 @@ UT_TEST(test_peer_stop_trace_default_off_and_exact_passive_owner_fields)
 	UT_ASSERT(strstr(stop_owner_trace_detail, "cursor=128") != NULL);
 	UT_ASSERT(strstr(stop_owner_trace_detail, "origin_boot=") != NULL);
 	UT_ASSERT(strstr(stop_owner_trace_detail, "last_progress_pg_us=") != NULL);
+	cluster_trace_normal_stop = false;
+}
+
+UT_TEST(test_peer_stage_timing_default_off_and_covers_real_continuations)
+{
+	for (unsigned enabled = 0; enabled <= 1; enabled++) {
+		ClusterKoSharedMessageV4 request = committed_peer(1710 + enabled);
+
+		receive_committed(&request, 0);
+		cluster_trace_normal_stop = enabled;
+		UT_ASSERT(fixture_peer_drain());
+		UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
+		UT_ASSERT_EQ(peer_stage_trace_events, enabled ? 3 : 0);
+		UT_ASSERT_EQ(peer_stage_trace_mask, enabled ? 0x38 : 0);
+	}
+	for (unsigned enabled = 0; enabled <= 1; enabled++) {
+		ClusterKoSharedMessageV3 request = peer_fence_fixture(1720 + enabled);
+
+		enqueue_shared_v3(&request);
+		cluster_trace_normal_stop = enabled;
+		UT_ASSERT(fixture_peer_drain());
+		UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
+		UT_ASSERT_EQ(peer_stage_trace_events, enabled ? 5 : 0);
+		UT_ASSERT_EQ(peer_stage_trace_mask, enabled ? 0x37 : 0);
+	}
 	cluster_trace_normal_stop = false;
 }
 
@@ -685,6 +711,7 @@ main(void)
 {
 	UT_PLAN(28);
 	UT_RUN(test_peer_stop_trace_default_off_and_exact_passive_owner_fields);
+	UT_RUN(test_peer_stage_timing_default_off_and_covers_real_continuations);
 	UT_RUN(test_committed_more_reports_each_batch_then_local_progress);
 	UT_RUN(test_committed_real_wait_and_entered_io_do_not_report_progress);
 	UT_RUN(test_live_physical_more_retains_progress_across_inout_snapshot);

@@ -11596,10 +11596,10 @@ pcm_pi_relation_scan_role(RelFileLocator locator, uint64 formation, uint32 budge
 		if (slot->state != PCM_REGISTRY_LIVE || slot->retired_authority_generation != 0
 			|| state->binding_generation != slot->binding_generation)
 			goto invalid;
-		entry = hash_search(cluster_pcm_htab, &slot->tag, HASH_FIND, NULL);
-		if (entry == NULL || entry->registry_slot != position
-			|| entry->binding_generation != slot->binding_generation)
-			goto invalid;
+		/* The registry tag is stable under htab_lock. This is an object
+		 * proof, not a global hash-association census: unrelated LIVE slots
+		 * need no hash lookup. Every selected member retains the full binding
+		 * and owner checks below, including all forks for object drain. */
 		if (!BufTagMatchesRelFileLocator(&slot->tag, &locator))
 			continue;
 		if (object_drain) {
@@ -11607,6 +11607,10 @@ pcm_pi_relation_scan_role(RelFileLocator locator, uint64 formation, uint32 budge
 				goto invalid;
 		} else if (slot->tag.forkNum != MAIN_FORKNUM && slot->tag.forkNum != VISIBILITYMAP_FORKNUM)
 			continue;
+		entry = hash_search(cluster_pcm_htab, &slot->tag, HASH_FIND, NULL);
+		if (entry == NULL || entry->registry_slot != position
+			|| entry->binding_generation != slot->binding_generation)
+			goto invalid;
 		LWLockAcquire(&entry->entry_lock.lock, discard_local ? LW_EXCLUSIVE : LW_SHARED);
 		/* True only admits a terminal N history after its PI has already
 		 * been retired by its original owner. This read never retires it

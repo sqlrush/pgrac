@@ -282,6 +282,8 @@ static void (*origin_wait_hook)(void);
 static int fixture_error_level;
 static unsigned fixture_log_events;
 static char stop_owner_trace_detail[2048];
+static unsigned peer_stage_trace_events;
+static uint32 peer_stage_trace_mask;
 
 static bool
 ko_drop_poll_fixture(uint32 *cursor, bool *completed)
@@ -1120,6 +1122,26 @@ errfinish(const char *file, int line, const char *function)
 {
 	if (fixture_error_level == LOG) {
 		fixture_log_events++;
+		if (strcmp(reported_message, "KO peer stage timing") == 0) {
+			const char *stages[] = { "stage=physical-flush ", "stage=physical-sync ",
+				"stage=physical-verify ", "stage=committed-buffer ",
+				"stage=local-grd ", "stage=local-writeback " };
+
+			UT_ASSERT(SpinLockFree(&storage.shared_lock));
+			peer_stage_trace_events++;
+			for (unsigned i = 0; i < lengthof(stages); i++)
+				if (strstr(stop_owner_trace_detail, stages[i]) != NULL)
+					peer_stage_trace_mask |= 1u << i;
+			UT_ASSERT(strstr(stop_owner_trace_detail, "locator=") != NULL);
+			UT_ASSERT(strstr(stop_owner_trace_detail, "serial=") != NULL);
+			UT_ASSERT(strstr(stop_owner_trace_detail, "batch=") != NULL);
+			UT_ASSERT(strstr(stop_owner_trace_detail, "origin_boot=") != NULL);
+			UT_ASSERT(strstr(stop_owner_trace_detail, "cursor=") != NULL);
+			UT_ASSERT(strstr(stop_owner_trace_detail, "result=") != NULL);
+			UT_ASSERT(strstr(stop_owner_trace_detail, "revision=") != NULL);
+			UT_ASSERT(strstr(stop_owner_trace_detail, "formation=") != NULL);
+			UT_ASSERT(strstr(stop_owner_trace_detail, "elapsed_us=") != NULL);
+		}
 		if (strstr(reported_message, "native committed producer failure") != NULL) {
 			native_failure_log_events++;
 			strlcpy(last_native_failure_log, reported_message, sizeof(last_native_failure_log));
@@ -1593,6 +1615,8 @@ reset_test(void)
 	origin_wait_hook = NULL;
 	ko_drop_poll_boundary = NULL;
 	fixture_log_events = 0;
+	peer_stage_trace_events = peer_stage_trace_mask = 0;
+	cluster_trace_normal_stop = false;
 	native_failure_log_events = 0;
 	native_fixture_error_multibyte_offset = 0;
 	last_native_failure_log[0] = '\0';
