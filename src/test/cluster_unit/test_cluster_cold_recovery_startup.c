@@ -3104,12 +3104,14 @@ UT_TEST(test_tt_base_drift_refuses_pass_two_stickily)
 	fixture();
 	typed = prepare(0x800);
 	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	typed->effects_receipt.plan = typed->plan;
 	tt_base_recheck_result = CLUSTER_COLD_SOURCE_GAP;
 	cluster_cold_replay_window_enter_v1();
 	UT_ASSERT(!sync_sources(typed));
 	UT_ASSERT_EQ(source_sync_calls, NROOTS);
 	UT_ASSERT_EQ(tt_base_rechecks, 1);
 	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
+	UT_ASSERT_NULL(typed->effects_receipt.plan);
 	tt_base_recheck_result = CLUSTER_COLD_OK;
 	UT_ASSERT(!sync_sources(typed));
 	UT_ASSERT_EQ(tt_base_rechecks, 1);
@@ -3123,12 +3125,14 @@ UT_TEST(test_tt_base_drift_refuses_later_pass_two_consumer)
 
 	/* Source sync must have checked the retained original TT base once. */
 	UT_ASSERT_EQ(tt_base_rechecks, 1);
+	typed->effects_receipt.plan = typed->plan;
 	tt_base_recheck_result = CLUSTER_COLD_SOURCE_GAP;
 	/* A later endpoint consumer must not use a stale base snapshot. */
 	UT_ASSERT(!endpoint_finish(typed));
 	UT_ASSERT_EQ(tt_base_rechecks, 2);
 	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
 	UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+	UT_ASSERT_NULL(typed->effects_receipt.plan);
 	tt_base_recheck_result = CLUSTER_COLD_OK;
 	UT_ASSERT(!endpoint_finish(typed));
 	UT_ASSERT_EQ(tt_base_rechecks, 2);

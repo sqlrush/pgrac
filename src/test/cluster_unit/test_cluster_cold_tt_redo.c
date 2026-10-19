@@ -198,6 +198,7 @@ tt_redo_destroy(TtRedoFixture *f)
 	rf_side_online_plan_destroy_v1(&f->typed.side_plans[0]);
 	rf_side_online_plan_destroy_v1(&f->typed.side_plans[1]);
 	cluster_cold_tt_base_destroy_v1(&f->typed);
+	cluster_cold_plan_destroy_v1(&f->typed.plan);
 	snprintf(path, sizeof(path), "%s/513", tt_redo_dir);
 	UT_ASSERT_EQ(unlink(path), 0);
 	UT_ASSERT_EQ(rmdir(tt_redo_dir), 0);
@@ -3152,6 +3153,109 @@ tt_top_tx_c0_inputs(const TtRedoFixture *f, const ClusterColdTtSlotInputV1 *inpu
 	shape->before = input->slot;
 }
 
+static bool
+tt_top_tx_unexpected_page(void *arg, const RfPageIdentityV1 *page, ClusterColdDataV1 *out)
+{
+	(void)arg;
+	(void)page;
+	(void)out;
+	UT_ASSERT(false);
+	return false;
+}
+
+/* These TT-only streams have no ordinary page/SPACE steps. Feed their real
+ * sealed record identities to the ordinary plan and coverage accumulator;
+ * physical application and the original TT readback remain separate. */
+static void
+tt_top_tx_effects_complete(TtRedoFixture *f)
+{
+	ClusterColdEffectsProofV1 proof = { 0 };
+	ClusterColdReplayResultV1 result = { .detail = CLUSTER_COLD_REPLAY_OK };
+	ClusterColdDiagV1 diag;
+
+	UT_ASSERT_NULL(f->typed.plan);
+	UT_ASSERT_EQ(cluster_cold_plan_create_v1(f->typed.participants, f->typed.participant_count,
+												  (Size)1024 * 1024, &f->typed.plan), CLUSTER_COLD_OK);
+	for (uint32 p = 0; p < f->typed.participant_count; p++) {
+		XLogRecPtr prev = InvalidXLogRecPtr;
+		uint32 count = rf_side_online_plan_operation_count_v1(f->typed.side_plans[p]);
+
+		UT_ASSERT(count != UINT32_MAX);
+		for (uint32 i = 0; i < count; i++) {
+			RfSideOnlineOperationV1 op;
+			ClusterColdDecodedV1 decoded = { 0 };
+
+			UT_ASSERT(rf_side_online_plan_operation_v1(f->typed.side_plans[p], i, &op));
+			decoded.record.read_rec_ptr = op.identity.record.read_rec_ptr;
+			decoded.record.end_rec_ptr = op.identity.record.end_rec_ptr;
+			decoded.record.prev_rec_ptr = prev;
+			decoded.record.record_crc = op.identity.record.record_crc;
+			decoded.record.rmid = op.identity.record.rmid;
+			decoded.record.info = op.identity.record.info;
+			decoded.record.scn = op.control_scn;
+			UT_ASSERT_EQ(cluster_cold_plan_feed_v1(f->typed.plan, p, &decoded.record), CLUSTER_COLD_OK);
+			prev = decoded.record.read_rec_ptr;
+			if (op.history_only)
+				continue;
+			/* TT-only fixture: native application is a boundary. The complete
+			 * decoder/effect matrix is exercised by the effects suite. */
+			UT_ASSERT_EQ(p, f->typed.own_participant);
+			decoded.effects.required = CLUSTER_COLD_EFFECT_RECORD;
+			decoded.effects.native_apply = decoded.effects.required;
+			UT_ASSERT(cluster_cold_effects_proof_record_v1(&proof, p, &decoded, NULL, true));
+		}
+	}
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(f->typed.plan, tt_top_tx_unexpected_page, NULL, &diag),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_typed_effects_complete_v1(&f->typed, &proof, &result));
+}
+
+UT_TEST(tt_top_tx_c0_producer_refuses_unproved_effect_coverage)
+{
+	TtRedoFixture f;
+	ClusterColdTtSlotInputV1 input;
+	ClusterColdTopTxProofV1 proof;
+	ClusterRecoveryTTAbortV1 shape;
+	ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
+
+	tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+	tt_redo_seal(&f);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 47, &input));
+	f.typed.xid_next_after_redo = UINT64_C(0x700400200);
+	tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+	/* A caller's true ordinary_effects flag cannot replace pass-2 coverage. */
+	UT_ASSERT_NULL(f.typed.plan);
+	memset(&out, 0xa9, sizeof(out));
+	UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, true,
+														false, InvalidTransactionId,
+														UINT64_C(0x12345678), &out));
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	tt_top_tx_effects_complete(&f);
+	UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, true,
+													   false, InvalidTransactionId,
+													   UINT64_C(0x12345678), &out));
+	for (int fault = 0; fault < 4; fault++) {
+		ClusterColdEffectsReceiptV1 saved = f.typed.effects_receipt;
+
+		if (fault == 0)
+			f.typed.effects_receipt.plan = NULL;
+		if (fault == 1)
+			f.typed.effects_receipt.proof.invalid = true;
+		if (fault == 2)
+			f.typed.effects_receipt.proof.records_seen[1]++;
+		if (fault == 3)
+			f.typed.effects_receipt.result.space_relations_finished++;
+		memset(&out, 0xa9, sizeof(out));
+		UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, true,
+															false, InvalidTransactionId,
+															UINT64_C(0x12345678), &out));
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		f.typed.effects_receipt = saved;
+	}
+	tt_redo_destroy(&f);
+}
+
 UT_TEST(tt_top_tx_c0_producer_requires_original_owner_and_exact_post_redo)
 {
 	for (int new_header = 0; new_header < 2; new_header++) {
@@ -3174,6 +3278,7 @@ UT_TEST(tt_top_tx_c0_producer_requires_original_owner_and_exact_post_redo)
 		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, offset, &input));
 		f.typed.xid_next_after_redo = next_xid;
 		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+		tt_top_tx_effects_complete(&f);
 		UT_ASSERT(cluster_recovery_tt_abort_shape_valid_v1(&shape));
 		UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, true, false,
 														   InvalidTransactionId,
@@ -4223,6 +4328,7 @@ UT_TEST(tt_top_tx_c0_producer_requires_complete_tt_inventory)
 			UT_ASSERT(cluster_cold_typed_tt_after_redo_readback_v1(&f.typed, 0, index, &target));
 			f.typed.xid_next_after_redo = UINT64_C(0x700400200);
 			tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+			tt_top_tx_effects_complete(&f);
 			memset(&out, 0xa9, sizeof(out));
 			UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, true,
 																  false, InvalidTransactionId,
@@ -4252,6 +4358,7 @@ UT_TEST(tt_top_tx_c0_producer_requires_all_original_sources)
 		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 47, &input));
 		f.typed.xid_next_after_redo = UINT64_C(0x700400200);
 		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+		tt_top_tx_effects_complete(&f);
 		/* Retained generations matter even when none of their TT files survive. */
 		switch (fault) {
 		case 1:
@@ -4310,6 +4417,7 @@ UT_TEST(tt_top_tx_c0_producer_checks_unselected_undo_effects)
 		UT_ASSERT(cluster_cold_typed_tt_after_redo_readback_v1(&f.typed, 0, 0, &target));
 		f.typed.xid_next_after_redo = UINT64_C(0x700400200);
 		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+		tt_top_tx_effects_complete(&f);
 		memset(&out, 0xa9, sizeof(out));
 		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, 0, &proof, &shape, true,
 															  false, InvalidTransactionId,
@@ -4324,7 +4432,8 @@ UT_TEST(tt_top_tx_c0_producer_checks_unselected_undo_effects)
 int
 main(void)
 {
-	UT_PLAN(103);
+	UT_PLAN(104);
+	UT_RUN(tt_top_tx_c0_producer_refuses_unproved_effect_coverage);
 	UT_RUN(tt_top_tx_c0_producer_requires_complete_tt_inventory);
 	UT_RUN(tt_top_tx_c0_producer_requires_all_original_sources);
 	UT_RUN(tt_top_tx_c0_producer_checks_unselected_undo_effects);

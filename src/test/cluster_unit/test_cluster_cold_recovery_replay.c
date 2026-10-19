@@ -491,6 +491,58 @@ UT_TEST(test_effect_proof_requires_every_plan_record)
 		}
 	}
 	UT_ASSERT(cluster_cold_effects_proof_finish_v1(&proof, plan, &result, 2));
+	{
+		ClusterColdTypedV1 typed = { .plan = plan, .participant_count = 2 };
+		ClusterColdEffectsReceiptV1 empty = { 0 };
+		ClusterColdPlanV1 *other = seal();
+
+		UT_ASSERT(!cluster_cold_typed_effects_ready_v1(NULL));
+		UT_ASSERT(!cluster_cold_typed_effects_complete_v1(NULL, &proof, &result));
+		UT_ASSERT(!cluster_cold_typed_effects_ready_v1(&typed));
+		UT_ASSERT(cluster_cold_typed_effects_complete_v1(&typed, &proof, &result));
+		UT_ASSERT(cluster_cold_typed_effects_ready_v1(&typed));
+		UT_ASSERT(cluster_cold_typed_effects_complete_v1(&typed, &typed.effects_receipt.proof,
+														   &typed.effects_receipt.result));
+		UT_ASSERT(cluster_cold_typed_effects_ready_v1(&typed));
+		/* The adapter can release its scratch; the typed owner copied it. */
+		proof.records_seen[0]--;
+		result.steps_done++;
+		UT_ASSERT(cluster_cold_typed_effects_ready_v1(&typed));
+		proof.records_seen[0]++;
+		result.steps_done--;
+		/* Even an equivalent replacement plan is another attempt. */
+		typed.plan = other;
+		UT_ASSERT(!cluster_cold_typed_effects_ready_v1(&typed));
+		typed.plan = plan;
+		typed.participant_count++;
+		UT_ASSERT(!cluster_cold_typed_effects_ready_v1(&typed));
+		typed.participant_count--;
+		typed.refusal = CLUSTER_COLD_SOURCE_GAP;
+		UT_ASSERT(!cluster_cold_typed_effects_ready_v1(&typed));
+		UT_ASSERT(!cluster_cold_typed_effects_complete_v1(&typed, &proof, &result));
+		UT_ASSERT(memcmp(&typed.effects_receipt, &empty, sizeof(empty)) == 0);
+		typed.refusal = CLUSTER_COLD_OK;
+		for (int fault = 0; fault < 4; fault++) {
+			UT_ASSERT(cluster_cold_typed_effects_complete_v1(&typed, &proof, &result));
+			if (fault == 0)
+				proof.records_seen[1]--;
+			if (fault == 1)
+				proof.invalid = true;
+			if (fault == 2)
+				result.steps_done++;
+			UT_ASSERT(!cluster_cold_typed_effects_complete_v1(&typed, fault == 3 ? NULL : &proof,
+																	 &result));
+			UT_ASSERT(memcmp(&typed.effects_receipt, &empty, sizeof(empty)) == 0);
+			UT_ASSERT(!cluster_cold_typed_effects_ready_v1(&typed));
+			if (fault == 0)
+				proof.records_seen[1]++;
+			if (fault == 1)
+				proof.invalid = false;
+			if (fault == 2)
+				result.steps_done--;
+		}
+		cluster_cold_plan_destroy_v1(&other);
+	}
 	proof.records_seen[1]--;
 	UT_ASSERT(!cluster_cold_effects_proof_finish_v1(&proof, plan, &result, 2));
 	cluster_cold_plan_destroy_v1(&plan);
