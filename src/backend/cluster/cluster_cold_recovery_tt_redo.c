@@ -572,7 +572,7 @@ cold_top_tx_checkpoint_v1(const ClusterColdTypedV1 *typed, uint32 participant)
 }
 
 bool
-cluster_cold_typed_top_tx_c0_producer_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed, uint32 participant,
 										 const ClusterColdTopTxProofV1 *proof,
 										 const ClusterRecoveryTTAbortV1 *shape, bool has_oldest_xid,
 										 TransactionId oldest_xid, uint64 recoverer_epoch,
@@ -600,7 +600,12 @@ cluster_cold_typed_top_tx_c0_producer_v1(const ClusterColdTypedV1 *typed, uint32
 			   != 0
 		|| !cold_top_tx_checkpoint_v1(typed, participant)
 		|| !cluster_cold_typed_xid_maximum_v1(typed, &next_xid)
-		|| !cluster_cold_typed_effects_ready_v1(typed)
+		|| !cluster_cold_typed_effects_ready_v1(typed))
+		return false;
+	/* Cached TT/UNDO bytes cannot attest to their own physical freshness.
+	 * Reuse the original owner's full namespace, inode and byte recheck;
+	 * refusal invalidates the post-redo snapshot rather than refreshing it. */
+	if (cluster_cold_tt_after_redo_recheck_v1(typed) != CLUSTER_COLD_OK
 		|| cluster_cold_tt_header_find_v1(typed, true, proof->key.owner_instance,
 										  proof->key.segment_id, &post_segment_index)
 			   == NULL
@@ -636,6 +641,11 @@ cluster_cold_typed_top_tx_c0_producer_v1(const ClusterColdTypedV1 *typed, uint32
 		|| cluster_recovery_tt_abort_match_v1(&result.c0.record, post_slot.key.segment_generation,
 											  &post_slot.slot)
 			   != CLUSTER_RECOVERY_TT_ABORT_APPLY)
+		return false;
+	/* The inventory may read additional UNDO blocks. Recheck every retained
+	 * physical input again before publishing this candidate descriptor.
+	 * This is not a substitute for the independent old-writer isolation. */
+	if (cluster_cold_tt_after_redo_recheck_v1(typed) != CLUSTER_COLD_OK)
 		return false;
 	*out = result;
 	return true;

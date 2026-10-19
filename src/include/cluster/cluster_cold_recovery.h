@@ -979,6 +979,10 @@ extern bool cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
  * slot before-image. Require this original owner's captured native checkpoint
  * to agree with its exact source, ROOT and selected redo interval. This input
  * check does not qualify TT base coverage; qualified_base remains independent.
+ * Recheck the original post-redo physical namespace, inode identities and
+ * retained TT/UNDO bytes before consuming cached images and before publishing
+ * output. A mismatch invalidates that snapshot and leaves output zero. These
+ * checks do not establish source/ROOT freshness or old-writer isolation.
  * Derive producer_top from this source's exact native
  * canonical BIND; the caller's producer_top bit is ignored. Other proof/shape
  * gates remain independent and required. An older ACTIVE without a retained
@@ -994,10 +998,12 @@ extern bool cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
  * post-redo image, proof gate or exact shape refuses.
  * No proof bit is synthesized from source-drained state, current epoch or
  * graph shape, and no old C0 replay consumer is called here. */
-extern bool cluster_cold_typed_top_tx_c0_producer_v1(
-	const ClusterColdTypedV1 *typed, uint32 participant, const ClusterColdTopTxProofV1 *proof,
-	const ClusterRecoveryTTAbortV1 *shape, bool has_oldest_xid, TransactionId oldest_xid,
-	uint64 recoverer_epoch, ClusterColdTopTxC0ProducerResultV1 *out);
+extern bool cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed, uint32 participant,
+													 const ClusterColdTopTxProofV1 *proof,
+													 const ClusterRecoveryTTAbortV1 *shape,
+													 bool has_oldest_xid, TransactionId oldest_xid,
+													 uint64 recoverer_epoch,
+													 ClusterColdTopTxC0ProducerResultV1 *out);
 
 /* Re-enumerate physical TT after complete redo and the original durability
  * barrier, without overwriting the pre-redo base. Share its remaining budget.
