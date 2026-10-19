@@ -1031,6 +1031,28 @@ UT_TEST(test_source_barrier_all_selected_generations)
 	cluster_cold_typed_destroy_v1(&typed);
 }
 
+UT_TEST(test_history_source_barrier_rejects_non_history_side_effect)
+{
+	ClusterColdTypedV1 *typed;
+	RfSideOnlinePlanV1 *history;
+
+	fixture();
+	history_generation(2, 9, 0x40, 0x80);
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	history = typed->side_plans[typed->replay_count];
+	UT_ASSERT_NOT_NULL(history);
+	history->operation_count = 1;
+	memset(&history->operations[0], 0, sizeof(history->operations[0]));
+	history->operations[0].purpose = RF_SIDE_PLAN_RECOVERY;
+	cluster_cold_replay_window_enter_v1();
+	UT_ASSERT(!sync_sources(typed));
+	UT_ASSERT_EQ(source_sync_calls, 0);
+	UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+	cluster_cold_replay_window_leave_v1();
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
 UT_TEST(test_history_execution_freshness_refuses_changed_input_before_sync)
 {
 	for (int fault = 0; fault <= 9; fault++) {
@@ -3095,6 +3117,24 @@ UT_TEST(test_tt_base_drift_refuses_pass_two_stickily)
 	cluster_cold_typed_destroy_v1(&typed);
 }
 
+UT_TEST(test_tt_base_drift_refuses_later_pass_two_consumer)
+{
+	ClusterColdTypedV1 *typed = endpoint_fixture(false);
+
+	/* Source sync must have checked the retained original TT base once. */
+	UT_ASSERT_EQ(tt_base_rechecks, 1);
+	tt_base_recheck_result = CLUSTER_COLD_SOURCE_GAP;
+	/* A later endpoint consumer must not use a stale base snapshot. */
+	UT_ASSERT(!endpoint_finish(typed));
+	UT_ASSERT_EQ(tt_base_rechecks, 2);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
+	UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+	tt_base_recheck_result = CLUSTER_COLD_OK;
+	UT_ASSERT(!endpoint_finish(typed));
+	UT_ASSERT_EQ(tt_base_rechecks, 2);
+	endpoint_destroy(&typed);
+}
+
 UT_TEST(test_checkpoint_inputs_survive_census_for_every_generation)
 {
 	ClusterColdTypedV1 *typed;
@@ -3179,7 +3219,7 @@ UT_TEST(test_checkpoint_export_clears_unsealed_and_failed_output)
 int
 main(void)
 {
-	UT_PLAN(112);
+	UT_PLAN(114);
 	UT_RUN(test_prepare_rechecks_physical_profiles_of_every_original_origin);
 	UT_RUN(test_prepare_checks_empty_physical_profiles_including_history_only_origin);
 	UT_RUN(test_endpoints_recheck_physical_profiles_and_discard_stale_inputs);
@@ -3225,6 +3265,7 @@ main(void)
 	UT_RUN(test_tt_base_capture_includes_history_before_wal_scan);
 	UT_RUN(test_tt_base_capture_failure_stops_before_side_and_scan);
 	UT_RUN(test_tt_base_drift_refuses_pass_two_stickily);
+	UT_RUN(test_tt_base_drift_refuses_later_pass_two_consumer);
 	UT_RUN(test_source_barrier_rechecks_complete_native_checkpoint);
 	UT_RUN(test_source_barrier_final_native_checkpoint_change_is_sticky);
 	UT_RUN(test_source_drain_before_unrelated_steps_is_not_global_completion);
@@ -3288,6 +3329,7 @@ main(void)
 	UT_RUN(test_refusal_hints);
 	UT_RUN(test_plan_memory_budget_parameter);
 	UT_RUN(test_source_barrier_all_selected_generations);
+	UT_RUN(test_history_source_barrier_rejects_non_history_side_effect);
 	UT_RUN(test_source_barrier_refuses_sync_or_tail_failure_stickily);
 	UT_RUN(test_source_barrier_final_whole_scope_recheck);
 	UT_RUN(test_source_barrier_whole_source_preflight_before_sync);

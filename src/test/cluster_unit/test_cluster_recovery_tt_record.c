@@ -252,6 +252,41 @@ UT_TEST(exact_binding_and_top_only)
 	}
 }
 
+UT_TEST(shape_and_full_xid_derivation)
+{
+	ClusterRecoveryTTAbortV1 shape = sample();
+	ClusterRecoveryTTAbortDerivationV1 derived;
+	uint64 next_xid = UINT64_C(0x700400200);
+
+	shape.target_full_xid = 0;
+	shape.top_full_xid = UINT64_C(0xdeadbeef);
+	UT_ASSERT(cluster_recovery_tt_abort_shape_valid_v1(&shape));
+	UT_ASSERT(!cluster_recovery_tt_abort_valid_v1(&shape));
+	UT_ASSERT(cluster_recovery_tt_abort_derive_fields_v1(&shape, next_xid, true, false,
+												 InvalidTransactionId, UINT64_C(0x12345678), &derived));
+	UT_ASSERT_EQ(derived.full_xid, UINT64_C(0x700400102));
+	UT_ASSERT_EQ(derived.record.target_full_xid, derived.full_xid);
+	UT_ASSERT_EQ(derived.record.top_full_xid, derived.full_xid);
+	UT_ASSERT_EQ(derived.record.target_epoch, UINT64_C(0x12345678));
+	UT_ASSERT(derived.oldest_xid_dependency);
+	UT_ASSERT(!derived.oldest_xid_checked);
+	UT_ASSERT(cluster_recovery_tt_abort_valid_v1(&derived.record));
+
+	shape = sample();
+	UT_ASSERT(cluster_recovery_tt_abort_derive_fields_v1(&shape, next_xid, true, true,
+												(TransactionId) 0x400050, UINT64_C(0x12345678),
+												&derived));
+	UT_ASSERT(derived.oldest_xid_checked);
+	UT_ASSERT(!derived.oldest_xid_dependency);
+	UT_ASSERT(!cluster_recovery_tt_abort_derive_fields_v1(&shape, next_xid, true, true,
+												(TransactionId) 0x400150, UINT64_C(0x12345678),
+												&derived));
+	UT_ASSERT(!cluster_recovery_tt_abort_derive_fields_v1(&shape, 0, true, false,
+												 InvalidTransactionId, UINT64_C(0x12345678), &derived));
+	UT_ASSERT(!cluster_recovery_tt_abort_derive_fields_v1(&shape, next_xid, false, false,
+												 InvalidTransactionId, UINT64_C(0x12345678), &derived));
+}
+
 UT_TEST(expected_active_slot)
 {
 	ClusterRecoveryTTAbortV1 r;
@@ -440,13 +475,14 @@ UT_TEST(real_wal_descriptor)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
 	UT_RUN(golden_encoding);
 	UT_RUN(golden_decoding_unaligned);
 	UT_RUN(exact_lengths_and_null);
 	UT_RUN(version_flags_reserved);
 	UT_RUN(source_and_target_fields);
 	UT_RUN(exact_binding_and_top_only);
+	UT_RUN(shape_and_full_xid_derivation);
 	UT_RUN(expected_active_slot);
 	UT_RUN(head_record_shape);
 	UT_RUN(valid_boundaries);

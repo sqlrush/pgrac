@@ -361,6 +361,165 @@ cluster_cold_typed_tt_redo_match_v1(const ClusterColdTypedV1 *typed, uint32 part
 }
 
 bool
+cluster_cold_typed_tt_active_identity_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+										 uint32 segment_index,
+										 const ClusterColdTtSlotKeyV1 *expected,
+										 ClusterColdTtActiveIdentityV1 *out)
+{
+	ClusterColdTtSlotKeyV1 key;
+	ClusterColdTtSlotInputV1 input;
+
+	if (expected != NULL)
+		key = *expected;
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (expected == NULL
+		|| !cluster_cold_typed_tt_redo_match_v1(typed, participant, segment_index, &key, &input)
+		|| input.slot.status != TT_SLOT_ACTIVE
+		|| input.key.xid != input.slot.xid
+		|| input.key.slot_wrap != input.slot.wrap)
+		return false;
+	/* The returned value is just the physical key. All source, base, effects,
+	 * old-writer, top and C0 gates remain with their respective owners. */
+	out->key = input.key;
+	return true;
+}
+
+static bool
+cold_top_tx_key_valid_v1(const ClusterColdTtSlotKeyV1 *key)
+{
+	return key != NULL && key->owner_instance != 0
+		   && key->owner_instance <= UNDO_OWNER_INSTANCE_MAX && key->segment_id != 0
+		   && (key->segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1
+				  == key->owner_instance
+		   && key->segment_generation != UINT32_MAX
+		   && key->slot_offset < TT_SLOTS_PER_SEGMENT && TransactionIdIsNormal(key->xid)
+		   && key->slot_wrap != TT_WRAP_INVALID;
+}
+
+static bool
+cold_top_tx_key_equal_v1(const ClusterColdTtSlotKeyV1 *left,
+							 const ClusterColdTtSlotKeyV1 *right)
+{
+	return left != NULL && right != NULL && left->owner_instance == right->owner_instance
+		   && left->segment_id == right->segment_id
+		   && left->segment_generation == right->segment_generation
+		   && left->slot_offset == right->slot_offset && left->xid == right->xid
+		   && left->slot_wrap == right->slot_wrap;
+}
+
+bool
+cluster_cold_top_tx_loser_v1(const ClusterColdTtActiveIdentityV1 *active,
+							 const ClusterColdTopTxProofV1 *proof,
+							 ClusterColdLoserIdentityV1 *out)
+{
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (active == NULL || proof == NULL || !cold_top_tx_key_valid_v1(&active->key)
+		|| !cold_top_tx_key_valid_v1(&proof->key)
+		|| !cold_top_tx_key_equal_v1(&active->key, &proof->key)
+		|| !proof->producer_top || !proof->qualified_base || !proof->sealed_redo
+		|| !proof->ordinary_effects || !proof->old_writer_isolated || !proof->terminal_match)
+		return false;
+	out->key = active->key;
+	return true;
+}
+
+bool
+cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
+						  const ClusterRecoveryTTAbortV1 *shape, uint64 next_xid,
+						  bool all_endpoints_complete, bool has_oldest_xid,
+						  TransactionId oldest_xid, uint64 recoverer_epoch,
+						  ClusterRecoveryTTAbortDerivationV1 *out)
+{
+	const ClusterColdTtSlotKeyV1 *key;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (loser == NULL || shape == NULL || !cold_top_tx_key_valid_v1(&loser->key))
+		return false;
+	key = &loser->key;
+	/* Exact physical identity is checked before any FullXid widening. */
+	if (shape->target_thread != key->owner_instance
+		|| shape->exact.segment_id != key->segment_id
+		|| shape->exact.segment_generation != key->segment_generation
+		|| shape->exact.xid != key->xid || shape->exact.slot_offset != key->slot_offset
+		|| shape->exact.wrap != key->slot_wrap || shape->exact.instance != key->owner_instance
+		|| shape->before.xid != key->xid || shape->before.wrap != key->slot_wrap
+		|| shape->before.status != TT_SLOT_ACTIVE)
+		return false;
+	/* This helper owns only C0 field derivation. The physical loser remains
+	 * valid if this call refuses because N, L, or epoch evidence is missing. */
+	return cluster_recovery_tt_abort_derive_fields_v1(shape, next_xid,
+										  all_endpoints_complete, has_oldest_xid,
+										  oldest_xid, recoverer_epoch, out);
+}
+
+bool
+cluster_cold_typed_top_tx_c0_producer_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+										 const ClusterColdTopTxProofV1 *proof,
+										 const ClusterRecoveryTTAbortV1 *shape,
+										 bool all_endpoints_complete, bool has_oldest_xid,
+										 TransactionId oldest_xid, uint64 recoverer_epoch,
+										 ClusterColdTopTxC0ProducerResultV1 *out)
+{
+	ClusterColdTopTxC0ProducerResultV1 result = { 0 };
+	RfSideUndoHeaderImageV1 post_image;
+	ClusterColdTtSlotInputV1 post_slot;
+	uint32 post_segment_index;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->replay_count > typed->participant_count || participant >= typed->replay_count
+		|| proof == NULL || shape == NULL
+		|| proof->key.owner_instance != typed->participants[participant].thread_id
+		|| !cluster_recovery_tt_abort_shape_valid_v1(shape)
+		|| shape->target_incarnation != typed->participants[participant].owner_incarnation
+		|| memcmp(shape->target_claim_sha256, typed->sources[participant].claim.claim_sha256,
+				  sizeof(shape->target_claim_sha256))
+			   != 0
+		|| typed->xid_next_after_redo == 0
+		|| cluster_cold_tt_header_find_v1(typed, true, proof->key.owner_instance,
+										  proof->key.segment_id, &post_segment_index)
+			   == NULL
+		|| !cluster_cold_tt_after_redo_slot_v1(typed, post_segment_index, proof->key.slot_offset,
+											   &post_slot)
+		|| post_slot.slot.status != TT_SLOT_ACTIVE
+		|| !cold_top_tx_key_equal_v1(&post_slot.key, &proof->key))
+		return false;
+	/* A valid target alone cannot discharge missing/unsupported retained
+	 * sources, another TT header, or an uncached native UNDO effect. Reuse
+	 * the complete ordinary inventory rather than trusting the proof flags
+	 * for those inputs. This does not establish checkpoint coverage, top
+	 * ownership, atomic transaction effects or old-writer isolation. */
+	if (!cluster_cold_typed_tt_redo_inventory_v1(typed))
+		return false;
+	/* Compare the whole selected header with its sealed original fold.  A
+	 * newly-created segment requires the existing native full-image proof;
+	 * its observed bytes can never supply a missing predecessor. */
+	if (!cluster_cold_typed_tt_after_redo_readback_v1(typed, participant, post_segment_index,
+													  &post_image))
+		return false;
+	result.active.key = post_slot.key;
+	if (!cluster_cold_top_tx_loser_v1(&result.active, proof, &result.loser)
+		|| !cluster_cold_top_tx_c0_v1(&result.loser, shape, typed->xid_next_after_redo,
+									  all_endpoints_complete, has_oldest_xid, oldest_xid,
+									  recoverer_epoch, &result.c0)
+		|| cluster_recovery_tt_abort_match_v1(&result.c0.record, post_slot.key.segment_generation,
+											  &post_slot.slot)
+			   != CLUSTER_RECOVERY_TT_ABORT_APPLY)
+		return false;
+	*out = result;
+	return true;
+}
+
+bool
 cluster_cold_typed_undo_redo_record_v1(const ClusterColdTypedV1 *typed, uint32 participant,
 									   uint32 segment_index, UBA address,
 									   ClusterRecoveryUndoRecord *out, uint32 *generation)

@@ -24,7 +24,8 @@ static unsigned replay_barrier_calls, replay_endpoint_calls;
 static bool replay_endpoint_ok, replay_barrier_ok;
 
 /* The original publish function must stop before handing off any failed cut. */
-static bool replay_ready_ok, replay_fatal_armed;
+static bool replay_proof_ok, replay_ready_ok, replay_fatal_armed;
+static unsigned replay_proof_calls;
 static unsigned replay_ready_calls, replay_complete_calls, replay_external_calls;
 static unsigned replay_fatal_calls, replay_log_calls;
 static int replay_error_level, replay_sqlstate;
@@ -114,6 +115,20 @@ cluster_recovery_merge_fence_plan_origin_count(const ClusterRecoveryFencePlan *p
 {
 	UT_ASSERT(plan == (const ClusterRecoveryFencePlan *)&replay_fence);
 	return 2;
+}
+
+/* Effect coverage is an original-owner boundary, like completion below. */
+bool
+cluster_cold_effects_proof_finish_v1(const ClusterColdEffectsProofV1 *proof,
+									 const ClusterColdPlanV1 *plan,
+									 const ClusterColdReplayResultV1 *result,
+									 uint32 participant_count)
+{
+	UT_ASSERT(proof != NULL && result != NULL);
+	UT_ASSERT(plan == replay_typed.plan);
+	UT_ASSERT_EQ(participant_count, replay_typed.participant_count);
+	replay_proof_calls++;
+	return replay_proof_ok;
 }
 
 bool
@@ -280,10 +295,11 @@ replay_xid_reset(int count)
 	replay_drain_calls = 0;
 
 	replay_barrier_calls = replay_endpoint_calls = 0;
+	replay_proof_calls = 0;
 	replay_ready_calls = replay_complete_calls = replay_external_calls = 0;
 	replay_fatal_calls = replay_log_calls = 0;
 	replay_error_level = replay_sqlstate = 0;
-	replay_ready_ok = replay_barrier_ok = replay_endpoint_ok = true;
+	replay_proof_ok = replay_ready_ok = replay_barrier_ok = replay_endpoint_ok = true;
 	replay_fatal_armed = false;
 	replay_complete_result = CLUSTER_RECOVERY_FENCE_COMPLETE_OK;
 	replay_event_count = 0;
@@ -433,14 +449,16 @@ UT_TEST(test_replay_endpoints_follow_durability_and_propagate_refusal)
 
 UT_TEST(test_startup_publish_stops_before_handoff_on_incomplete_inputs)
 {
-	for (int fault = 0; fault < 3; fault++) {
+	for (int fault = 0; fault < 4; fault++) {
 		ClusterColdReplayResultV1 result = { .detail = CLUSTER_COLD_REPLAY_OK };
 		replay_xid_reset(1);
 		if (fault == 0)
-			replay_ready_ok = false;
+			replay_proof_ok = false;
 		if (fault == 1)
-			replay_barrier_ok = false;
+			replay_ready_ok = false;
 		if (fault == 2)
+			replay_barrier_ok = false;
+		if (fault == 3)
 			replay_endpoint_ok = false;
 		replay_fatal_armed = true;
 		if (setjmp(replay_fatal) == 0) {
@@ -452,13 +470,16 @@ UT_TEST(test_startup_publish_stops_before_handoff_on_incomplete_inputs)
 		UT_ASSERT_EQ(replay_sqlstate, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
 		UT_ASSERT_EQ(replay_fatal_calls, 1);
 		UT_ASSERT_EQ(replay_log_calls, 0);
-		UT_ASSERT_EQ(replay_ready_calls, 1);
-		UT_ASSERT_EQ(replay_barrier_calls, fault > 0);
-		UT_ASSERT_EQ(replay_endpoint_calls, fault > 1);
+		UT_ASSERT_EQ(replay_proof_calls, 1);
+		UT_ASSERT_EQ(replay_ready_calls, fault > 0);
+		UT_ASSERT_EQ(replay_barrier_calls, fault > 1);
+		UT_ASSERT_EQ(replay_endpoint_calls, fault > 2);
 		UT_ASSERT_EQ(replay_complete_calls, 0);
 		UT_ASSERT_EQ(replay_external_calls, 0);
-		UT_ASSERT(strcmp(replay_events, fault == 0 ? "C" : fault == 1 ? "CB" : "CBX") == 0);
-		UT_ASSERT(strstr(replay_message, "could not publish thread 3 recovered") != NULL);
+		UT_ASSERT(strcmp(replay_events,
+						 fault == 0 ? "" : fault == 1 ? "C" : fault == 2 ? "CB" : "CBX") == 0);
+		UT_ASSERT(strstr(replay_message, fault == 0 ? "could not publish thread 1 recovered"
+													  : "could not publish thread 3 recovered") != NULL);
 	}
 }
 

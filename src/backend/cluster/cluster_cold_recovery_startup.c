@@ -986,6 +986,51 @@ cold_sources_match(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
 	return cold_native_profiles_match(typed);
 }
 
+/* A retained history participant has no native redo to apply.  Its sealed
+ * SIDE plan is still part of the original source qualification: every
+ * retained operation must remain history-only, and the plan must match the
+ * same physical cut and replay start before pass 2 can use that source. */
+static bool
+cold_history_side_effects_match(const ClusterColdTypedV1 *typed, uint32 participant)
+{
+	const ClusterColdParticipantV1 *source;
+	const RfSideOnlinePlanV1 *plan;
+	RfContributorStreamCutV1 cut = {0};
+	uint32 operations;
+
+	if (typed->plan == NULL || participant >= typed->participant_count
+		|| typed->side_capture_detail[participant] != 0
+		|| (plan = typed->side_plans[participant]) == NULL)
+		return false;
+	source = &typed->participants[participant];
+	cut.failed_thread = source->thread_id;
+	cut.timeline_id = source->timeline;
+	cut.origin_owner_incarnation = source->owner_incarnation;
+	cut.scan_begin_inclusive = source->physical_lower;
+	cut.scan_end_exclusive = source->tail_end;
+	cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE
+				| (source->physical_lower == source->tail_end
+					   ? RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY
+					   : 0);
+	if (!rf_side_online_plan_source_matches_v1(plan, typed->system_identifier,
+												  typed->observer.storage_uuid, &cut)
+		|| !rf_side_online_plan_replay_start_matches_v1(
+			plan, source->thread_id, source->owner_incarnation,
+			typed->observer.database_incarnation, source->native_redo)
+		|| !cluster_cold_plan_participant_matches_v1(typed->plan, participant, source)
+		|| cluster_cold_plan_replay_record_count_v1(typed->plan, participant) != 0)
+		return false;
+	operations = rf_side_online_plan_operation_count_v1(plan);
+	for (uint32 i = 0; i < operations; i++) {
+		RfSideOnlineOperationV1 operation;
+
+		if (!rf_side_online_plan_operation_v1(plan, i, &operation)
+			|| !operation.history_only || operation.purpose != RF_SIDE_PLAN_RECOVERY)
+			return false;
+	}
+	return true;
+}
+
 /* Re-read history metadata using the caller's original execution retention
  * owner. Do not acquire a census read set from inside the execution IR set. */
 static bool
@@ -1010,7 +1055,8 @@ cold_history_sources_match(ClusterColdTypedV1 *typed)
 			|| memcmp(&observed.source, &typed->sources[i], sizeof(observed.source)) != 0
 			|| observed.checkpoint_start != selected->checkpoint_start
 			|| memcmp(&observed.checkpoint, &selected->native_checkpoint,
-					  sizeof(observed.checkpoint)) != 0)
+						  sizeof(observed.checkpoint)) != 0
+			|| !cold_history_side_effects_match(typed, i))
 			return false;
 	}
 	return true;
@@ -1201,7 +1247,10 @@ cluster_cold_typed_xid_endpoints_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFe
 	}
 	PG_TRY();
 	{
-		ready = cold_replay_sources_current(typed, fence);
+		/* Endpoint consumers run after source sync. Revalidate the retained
+		 * original TT base before deriving post-redo endpoint inputs. */
+		ready = cluster_cold_tt_base_recheck_v1(typed) == CLUSTER_COLD_OK
+				&& cold_replay_sources_current(typed, fence);
 		for (uint32 p = 0; ready && p < typed->participant_count; p++) {
 			uint64 next;
 			ready = cold_xid_endpoint(typed, result, progress, p, &next);

@@ -53,6 +53,7 @@
 #include "cluster/cluster_page_detached.h"
 #include "cluster/cluster_wal_source.h"
 #include "cluster/cluster_tt_slot.h"
+#include "cluster/cluster_recovery_tt_record.h"
 #include "cluster/cluster_recovery_reference_graph.h"
 
 #define CLUSTER_COLD_RECOVERY_INTERFACE_V1 1
@@ -619,6 +620,28 @@ extern void cluster_cold_decoded_release_v1(ClusterColdDecodedV1 *decoded);
 extern bool cluster_cold_replay_effects_v1(const ClusterColdDecodedV1 *decoded,
 										   const ClusterColdStepV1 *step, bool own);
 
+/* Attempt-local proof that every pass-2 record reached the same complete
+ * effect matrix that the original owner classified.  This is neither a WAL
+ * field nor a completion authority: the caller still owns source, freshness,
+ * durability and fence checks. */
+typedef struct ClusterColdEffectsProofV1 {
+	uint64 records_seen[CLUSTER_COLD_MAX_PARTICIPANTS];
+	uint64 records_routed;
+	uint32 required_union;
+	uint32 routed_union;
+	bool invalid;
+} ClusterColdEffectsProofV1;
+
+extern void cluster_cold_effects_proof_init_v1(ClusterColdEffectsProofV1 *proof);
+extern bool cluster_cold_effects_proof_record_v1(ClusterColdEffectsProofV1 *proof,
+										 uint32 participant,
+										 const ClusterColdDecodedV1 *decoded,
+										 const ClusterColdStepV1 *step, bool own);
+extern bool cluster_cold_effects_proof_finish_v1(const ClusterColdEffectsProofV1 *proof,
+										 const ClusterColdPlanV1 *plan,
+										 const ClusterColdReplayResultV1 *result,
+										 uint32 participant_count);
+
 /*
  * Pass-2 reader over one ROOT-selected writer generation.  Segments are
  * opened through the selected restart-input opener (claim, namespace and
@@ -865,6 +888,70 @@ typedef struct ClusterColdTtSlotInputV1 {
 	TTSlot slot;
 } ClusterColdTtSlotInputV1;
 
+/* Physical identity of a slot that remains ACTIVE after sealed redo. The
+ * key already carries the raw xid; this value deliberately has no FullXid,
+ * cluster epoch, top proof, effects coverage or mutation authority. */
+typedef struct ClusterColdTtActiveIdentityV1 {
+	ClusterColdTtSlotKeyV1 key;
+} ClusterColdTtActiveIdentityV1;
+
+/* Attempt-local top proof assembled by the original source/effects owners.
+ * The six gates are deliberately independent: a physical ACTIVE slot alone
+ * never proves that it is the original top transaction.  FullXid, nextXid,
+ * and cluster epoch are absent because they are not loser gates. */
+typedef struct ClusterColdTopTxProofV1 {
+	ClusterColdTtSlotKeyV1 key;
+	bool producer_top;
+	bool qualified_base;
+	bool sealed_redo;
+	bool ordinary_effects;
+	bool old_writer_isolated;
+	bool terminal_match;
+} ClusterColdTopTxProofV1;
+
+/* Physical E1 loser identity. This is not a persistent record or authority
+ * grant; C0 derivation consumes it only after all physical fields match. */
+typedef struct ClusterColdLoserIdentityV1 {
+	ClusterColdTtSlotKeyV1 key;
+} ClusterColdLoserIdentityV1;
+
+/* Attempt-local producer result.  The source owner supplies the proof and
+ * shape; this value only records the exact post-redo physical fact, the
+ * resulting loser key and the derived C0 fields.  It is never persisted. */
+typedef struct ClusterColdTopTxC0ProducerResultV1 {
+	ClusterColdTtActiveIdentityV1 active;
+	ClusterColdLoserIdentityV1 loser;
+	ClusterRecoveryTTAbortDerivationV1 c0;
+} ClusterColdTopTxC0ProducerResultV1;
+
+/* The loser gate is independent from FullXid/epoch derivation. C0 refuses
+ * incomplete all-thread endpoints or any exact physical mismatch, while a
+ * C0 derivation failure never turns an already-proven physical loser into an
+ * abort. These are attempt-local helpers and add no persistent ABI. */
+extern bool cluster_cold_top_tx_loser_v1(const ClusterColdTtActiveIdentityV1 *active,
+										 const ClusterColdTopTxProofV1 *proof,
+										 ClusterColdLoserIdentityV1 *out);
+extern bool cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
+									 const ClusterRecoveryTTAbortV1 *shape, uint64 next_xid,
+									 bool all_endpoints_complete, bool has_oldest_xid,
+									 TransactionId oldest_xid, uint64 recoverer_epoch,
+									 ClusterRecoveryTTAbortDerivationV1 *out);
+
+/* Producer boundary for one original TT owner.  Locate the post-redo header
+ * by physical owner/segment, require the complete ordinary TT/UNDO inventory
+ * and all original sources, then verify the selected sealed fold and exact
+ * slot before-image and consume the original producer's TopTxProof/shape gates.
+ * Target incarnation/claim remain bound to the original source.  A new
+ * header with no original base requires the native full-image proof.
+ * The aggregate endpoint is the already-computed typed->xid_next_after_redo;
+ * a missing endpoint, post-redo image, proof gate or exact shape refuses.
+ * No proof bit is synthesized from source-drained state, current epoch or
+ * graph shape, and no old C0 replay consumer is called here. */
+extern bool cluster_cold_typed_top_tx_c0_producer_v1(
+	const ClusterColdTypedV1 *typed, uint32 participant, const ClusterColdTopTxProofV1 *proof,
+	const ClusterRecoveryTTAbortV1 *shape, bool all_endpoints_complete, bool has_oldest_xid,
+	TransactionId oldest_xid, uint64 recoverer_epoch, ClusterColdTopTxC0ProducerResultV1 *out);
+
 /* Re-enumerate physical TT after complete redo and the original durability
  * barrier, without overwriting the pre-redo base. Share its remaining budget.
  * Retain post-redo images of UNDO blocks already cached in the original base;
@@ -992,6 +1079,15 @@ extern bool cluster_cold_typed_tt_redo_match_v1(const ClusterColdTypedV1 *typed,
 												uint32 segment_index,
 												const ClusterColdTtSlotKeyV1 *expected,
 												ClusterColdTtSlotInputV1 *out);
+/* Retain only the exact physical key of a post-redo ACTIVE slot. Terminal
+ * status, raw xid and wrap must agree with that key. This is an input fact
+ * for a later TopTxProof/loser consumer, never a loser decision itself; no
+ * FullXid high bits or bind-time epoch are read. Failure clears out. */
+extern bool cluster_cold_typed_tt_active_identity_v1(const ClusterColdTypedV1 *typed,
+															uint32 participant,
+															uint32 segment_index,
+															const ClusterColdTtSlotKeyV1 *expected,
+															ClusterColdTtActiveIdentityV1 *out);
 
 /* Copy one raw record from a sealed ordinary source's final FPI-backed UNDO
  * block image and return its folded physical segment generation (zero is
