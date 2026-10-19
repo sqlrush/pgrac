@@ -2427,6 +2427,16 @@ UT_TEST(test_ctrc_existing_undo_cleaner_owns_terminal_seal_progress)
 	UT_ASSERT(source_file_contains("src/backend/cluster/cluster_terminal_ref_census.c",
 								   "ctrc_origin_ack_entries()"));
 	UT_ASSERT(source_file_contains("src/backend/cluster/cluster_terminal_ref_census.c",
+								   "#include \"utils/timestamp.h\""));
+	UT_ASSERT(source_file_contains("src/backend/cluster/cluster_terminal_ref_census.c",
+								   "TimestampTz operation_deadline = 0;"));
+	UT_ASSERT(source_file_contains(
+		"src/backend/cluster/cluster_terminal_ref_census.c",
+		"TimestampTzPlusMilliseconds(GetCurrentTimestamp(), cluster_gcs_reply_timeout_ms)"));
+	UT_ASSERT(source_file_contains(
+		"src/backend/cluster/cluster_terminal_ref_census.c",
+		"cluster_multixact_current_members_resolve_until("));
+	UT_ASSERT(source_file_contains("src/backend/cluster/cluster_terminal_ref_census.c",
 								   "CTRC_SEAL_CERTIFICATE_COMMITTED"));
 	UT_ASSERT(source_file_contains("src/backend/cluster/cluster_tt_slot.c",
 								   "cluster_undo_cleaner_wakeup()"));

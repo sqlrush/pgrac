@@ -80,6 +80,7 @@
 #include "portability/instr_time.h"
 #include "utils/memutils.h"
 #include "utils/palloc.h"
+#include "utils/timestamp.h"
 #endif
 
 #define CLUSTER_CTRC_SHMEM_MAGIC UINT32_C(0x43545243)
@@ -8084,6 +8085,7 @@ ctrc_cleaner_clean_current_mx_receipt(const ClusterCtrcParticipantEntry *partici
 	bool permanent;
 	const char *retain_stage = "input";
 	CtrcCleanerCurrentMxPresence capture_presence;
+	TimestampTz operation_deadline = 0;
 
 	if (participant == NULL || receipt == NULL
 		|| participant_index >= CtrcShared->participant_key_entries
@@ -8096,6 +8098,11 @@ ctrc_cleaner_clean_current_mx_receipt(const ClusterCtrcParticipantEntry *partici
 			&& receipt->target.relation_persistence != RELPERSISTENCE_UNLOGGED)
 		|| receipt->target.fork_number < 0 || receipt->target.fork_number > MAX_FORKNUM)
 		return false;
+	/* The cleaner owns one operation budget. Capture it before relation, page,
+	 * and proof work so a later proof call cannot restart the wait. */
+	if (cluster_gcs_reply_timeout_ms > 0)
+		operation_deadline
+			= TimestampTzPlusMilliseconds(GetCurrentTimestamp(), cluster_gcs_reply_timeout_ms);
 
 	MemSet(&admission, 0, sizeof(admission));
 	if (cluster_semantic_activation_enter_r4_terminal_census(&admission)
@@ -8227,9 +8234,9 @@ ctrc_cleaner_clean_current_mx_receipt(const ClusterCtrcParticipantEntry *partici
 		retain_stage = "descriptor-hash";
 		goto current_mx_retain_unlocked;
 	}
-	resolve_result = cluster_multixact_current_members_resolve(
+	resolve_result = cluster_multixact_current_members_resolve_until(
 		&descriptor_key, members, nmembers, descriptor_hash, NULL, proofs, &updater_proof,
-		proof_capability_generations);
+		proof_capability_generations, &operation_deadline);
 	if (resolve_result != CMX_RESOLVE_OK) {
 		retain_stage = "resolve";
 		goto current_mx_retain_unlocked;
