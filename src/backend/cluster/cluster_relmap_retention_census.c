@@ -183,7 +183,7 @@ census_namespace(const char *path, Oid *dbid)
 }
 
 static ClusterRelmapCensusResult
-census_namespace_finish(ClusterRelmapRetentionCensus *census)
+census_namespace_finish(ClusterRelmapRetentionCensus *census, ClusterRelmapCensusCommitted *out)
 {
 	ClusterRelmapV2View view;
 	ClusterRelmapRetentionKey key = { 0 };
@@ -214,6 +214,12 @@ census_namespace_finish(ClusterRelmapRetentionCensus *census)
 			return census_failed(census, result == CLUSTER_RELMAP_RETENTION_CAPACITY_EXCEEDED
 				? CLUSTER_RELMAP_CENSUS_CAPACITY : CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
 	}
+	if (out != NULL) {
+		out->identity = census->identity;
+		out->generation = view.committed_generation;
+		out->map = view.committed;
+		out->present = true;
+	}
 	census->namespace_path[0] = '\0';
 	census->present = 0;
 	memset(census->copies, 0, sizeof(census->copies));
@@ -221,13 +227,16 @@ census_namespace_finish(ClusterRelmapRetentionCensus *census)
 }
 
 ClusterRelmapCensusResult
-cluster_relmap_retention_census_next(ClusterRelmapRetentionCensus *census)
+cluster_relmap_retention_census_next_committed(ClusterRelmapRetentionCensus *census,
+	ClusterRelmapCensusCommitted *out)
 {
 	const ClusterRecoveryRootEntry *entry;
 	ClusterRecoveryRootsResult result;
 	Oid dbid;
 	bool directory;
 
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
 	if (census == NULL)
 		return CLUSTER_RELMAP_CENSUS_INVALID;
 	if (census->result > CLUSTER_RELMAP_CENSUS_DRAINED)
@@ -281,7 +290,7 @@ cluster_relmap_retention_census_next(ClusterRelmapRetentionCensus *census)
 
 		if (entry == NULL || strncmp(entry->file.path, census->namespace_path, length) != 0
 			|| entry->file.path[length] != '/')
-			return census_namespace_finish(census);
+			return census_namespace_finish(census, out);
 	}
 	if (entry == NULL) {
 		if (census->next_entry != census->count || !census->global_seen || !census->base_seen)
@@ -326,6 +335,12 @@ cluster_relmap_retention_census_next(ClusterRelmapRetentionCensus *census)
 	}
 	census->next_entry++;
 	return CLUSTER_RELMAP_CENSUS_MORE;
+}
+
+ClusterRelmapCensusResult
+cluster_relmap_retention_census_next(ClusterRelmapRetentionCensus *census)
+{
+	return cluster_relmap_retention_census_next_committed(census, NULL);
 }
 
 void

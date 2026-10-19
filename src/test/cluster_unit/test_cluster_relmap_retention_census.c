@@ -449,10 +449,209 @@ UT_TEST(test_invalid_begin_poisoning_and_oversized_array_bound)
 	}
 }
 
+static void
+census_committed_empty(const ClusterRelmapCensusCommitted *out)
+{
+	ClusterRelmapCensusCommitted empty = { 0 };
+
+	UT_ASSERT_EQ(memcmp(out, &empty, sizeof(empty)), 0);
+}
+
+UT_TEST(test_committed_reader_all_legal_cuts_and_original_pending_origin)
+{
+	for (unsigned cut = 0; cut < 5; cut++) {
+		CensusFixture f;
+		ClusterRelmapCensusResult result = CLUSTER_RELMAP_CENSUS_MORE;
+		ClusterRelmapCensusCommitted out;
+		unsigned seen = 0;
+		bool pending = cut != 0;
+
+		census_fixture(&f, pending);
+		census_pair(f.fd, 5, 3, cut == 1 || cut == 4,
+			cut == 2 || cut == 3 || cut == 4, cut == 3);
+		if (census_observe_begin(&f)) {
+			for (unsigned tick = 0; tick < 20000 && result == CLUSTER_RELMAP_CENSUS_MORE;
+				tick++) {
+				RelMapFile expected;
+				unsigned bit;
+
+				memset(&out, 0xa5, sizeof(out));
+				result = cluster_relmap_retention_census_next_committed(f.census, &out);
+				if (!out.present) {
+					census_committed_empty(&out);
+					continue;
+				}
+				UT_ASSERT_EQ(result, CLUSTER_RELMAP_CENSUS_MORE);
+				UT_ASSERT_EQ(out.identity.system_identifier, 817);
+				UT_ASSERT_EQ(out.identity.database_incarnation, 91);
+				UT_ASSERT(out.identity.dbid == 5 || out.identity.dbid == InvalidOid);
+				UT_ASSERT_EQ(out.identity.shared, out.identity.dbid == InvalidOid);
+				bit = out.identity.shared ? 1 : 2;
+				UT_ASSERT_EQ(seen & bit, 0);
+				seen |= bit;
+				expected = census_map(!out.identity.shared && cut == 3 ? 40001 : 40000);
+				UT_ASSERT_EQ(memcmp(&out.map, &expected, sizeof(expected)), 0);
+				UT_ASSERT_EQ(out.generation, !out.identity.shared && cut == 3 ? 2 : 1);
+				if (!out.identity.shared)
+					UT_ASSERT_EQ(census_pin(&f.origin[0], 5) != NULL, pending);
+				for (unsigned i = 0; i < 2; i++)
+					UT_ASSERT_EQ(f.origin[i].state, CLUSTER_RELMAP_RETENTION_BUILDING);
+			}
+			UT_ASSERT_EQ(result, CLUSTER_RELMAP_CENSUS_DRAINED);
+			UT_ASSERT_EQ(seen, 3);
+			memset(&out, 0xa5, sizeof(out));
+			UT_ASSERT_EQ(cluster_relmap_retention_census_next_committed(f.census, &out),
+				CLUSTER_RELMAP_CENSUS_DRAINED);
+			census_committed_empty(&out);
+			UT_ASSERT_EQ(census_pin(&f.origin[0], 5) != NULL, pending);
+			UT_ASSERT(census_pin(&f.origin[1], 5) == NULL);
+		}
+		census_cleanup(&f);
+	}
+}
+
+UT_TEST(test_committed_reader_requires_pending_restore_before_emission)
+{
+	for (unsigned failure = 0; failure < 2; failure++) {
+		CensusFixture f;
+		ClusterRelmapCensusResult result = CLUSTER_RELMAP_CENSUS_MORE;
+		ClusterRelmapCensusCommitted out;
+
+		census_fixture(&f, true);
+		if (failure == 0)
+			f.origin[0].native_floor = CENSUS_FULL + 1;
+		else
+			census_pair(f.fd, 5, 4, true, true, false);
+		if (census_observe_begin(&f)) {
+			for (unsigned tick = 0; tick < 20000 && result == CLUSTER_RELMAP_CENSUS_MORE;
+				tick++) {
+				memset(&out, 0xa5, sizeof(out));
+				result = cluster_relmap_retention_census_next_committed(f.census, &out);
+				if (out.present)
+					UT_ASSERT_NE(out.identity.dbid, 5);
+				else
+					census_committed_empty(&out);
+			}
+			UT_ASSERT_EQ(result, CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+			census_committed_empty(&out);
+			UT_ASSERT(census_pin(&f.origin[0], 5) == NULL);
+			census_refused(&f);
+		}
+		census_cleanup(&f);
+	}
+}
+
+UT_TEST(test_committed_reader_emitted_maps_are_provisional_until_whole_recheck)
+{
+	for (unsigned change = 0; change < 3; change++) {
+		CensusFixture f;
+		ClusterRelmapCensusResult result = CLUSTER_RELMAP_CENSUS_MORE;
+		ClusterRelmapCensusCommitted out;
+		bool emitted = false;
+
+		census_fixture(&f, true);
+		if (census_observe_begin(&f)) {
+			for (unsigned tick = 0; tick < 20000 && !emitted
+				&& result == CLUSTER_RELMAP_CENSUS_MORE; tick++) {
+				result = cluster_relmap_retention_census_next_committed(f.census, &out);
+				emitted = out.present && out.identity.dbid == 5;
+			}
+			UT_ASSERT(emitted);
+			UT_ASSERT(census_pin(&f.origin[0], 5) != NULL);
+			if (change == 0)
+				UT_ASSERT_EQ(unlinkat(f.fd, "global/pgrac_relmap_authority.bak", 0), 0);
+			else if (change == 1) {
+				UT_ASSERT_EQ(mkdirat(f.fd, "base/8", 0700), 0);
+				census_pair(f.fd, 8, 0, false, false, false);
+			} else
+				f.origin[0].last_issued++;
+			for (unsigned tick = 0; tick < 20000 && result == CLUSTER_RELMAP_CENSUS_MORE;
+				tick++) {
+				memset(&out, 0xa5, sizeof(out));
+				result = cluster_relmap_retention_census_next_committed(f.census, &out);
+				if (!out.present)
+					census_committed_empty(&out);
+			}
+			UT_ASSERT(result > CLUSTER_RELMAP_CENSUS_DRAINED);
+			census_committed_empty(&out);
+			memset(&out, 0xa5, sizeof(out));
+			UT_ASSERT_EQ(cluster_relmap_retention_census_next_committed(f.census, &out),
+				result);
+			census_committed_empty(&out);
+			UT_ASSERT(census_pin(&f.origin[0], 5) != NULL);
+			census_refused(&f);
+		}
+		census_cleanup(&f);
+	}
+}
+
+UT_TEST(test_committed_reader_io_refusal_clears_output)
+{
+	for (unsigned fault = 1; fault < 4; fault++) {
+		CensusFixture f;
+		ClusterRelmapCensusResult result = CLUSTER_RELMAP_CENSUS_MORE;
+		ClusterRelmapCensusCommitted out;
+
+		census_fixture(&f, true);
+		if (census_observe_begin(&f)) {
+			inject_pread_fault = fault < 3 ? fault : 0;
+			inject_read_corruption = fault == 3;
+			for (unsigned tick = 0; tick < 20000 && result == CLUSTER_RELMAP_CENSUS_MORE;
+				tick++) {
+				memset(&out, 0xa5, sizeof(out));
+				result = cluster_relmap_retention_census_next_committed(f.census, &out);
+				census_committed_empty(&out);
+			}
+			inject_pread_fault = 0;
+			inject_read_corruption = false;
+			UT_ASSERT(result > CLUSTER_RELMAP_CENSUS_DRAINED);
+			census_refused(&f);
+		}
+		census_cleanup(&f);
+	}
+}
+
+UT_TEST(test_committed_reader_legacy_and_optional_output_share_one_cursor)
+{
+	for (unsigned reader = 0; reader < 2; reader++) {
+		CensusFixture f;
+		ClusterRelmapCensusResult result = CLUSTER_RELMAP_CENSUS_MORE;
+		ClusterRelmapCensusCommitted out;
+
+		census_fixture(&f, true);
+		if (census_observe_begin(&f)) {
+			for (unsigned tick = 0; tick < 20000 && result == CLUSTER_RELMAP_CENSUS_MORE;
+				tick++)
+				result = reader == 0 ? cluster_relmap_retention_census_next(f.census)
+					: cluster_relmap_retention_census_next_committed(f.census, NULL);
+			UT_ASSERT_EQ(result, CLUSTER_RELMAP_CENSUS_DRAINED);
+			memset(&out, 0xa5, sizeof(out));
+			UT_ASSERT_EQ(cluster_relmap_retention_census_next_committed(f.census, &out),
+				CLUSTER_RELMAP_CENSUS_DRAINED);
+			census_committed_empty(&out);
+			UT_ASSERT(census_pin(&f.origin[0], 5) != NULL);
+			UT_ASSERT_EQ(f.origin[0].state, CLUSTER_RELMAP_RETENTION_BUILDING);
+		}
+		census_cleanup(&f);
+	}
+}
+
+UT_TEST(test_committed_reader_invalid_cursor_clears_output)
+{
+	ClusterRelmapCensusCommitted out;
+
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT_EQ(cluster_relmap_retention_census_next_committed(NULL, &out),
+		CLUSTER_RELMAP_CENSUS_INVALID);
+	census_committed_empty(&out);
+	UT_ASSERT_EQ(cluster_relmap_retention_census_next_committed(NULL, NULL),
+		CLUSTER_RELMAP_CENSUS_INVALID);
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(19);
 	UT_RUN(test_all_physical_namespaces_and_original_backup_only_pending);
 	UT_RUN(test_all_legal_pair_cuts_keep_pending_without_publishing_complete);
 	UT_RUN(test_clean_census_stays_unpublished);
@@ -466,6 +665,12 @@ main(void)
 	UT_RUN(test_interrupted_cursor_invalidates_without_losing_pending);
 	UT_RUN(test_read_io_short_read_and_corruption_never_drain);
 	UT_RUN(test_invalid_begin_poisoning_and_oversized_array_bound);
+	UT_RUN(test_committed_reader_all_legal_cuts_and_original_pending_origin);
+	UT_RUN(test_committed_reader_requires_pending_restore_before_emission);
+	UT_RUN(test_committed_reader_emitted_maps_are_provisional_until_whole_recheck);
+	UT_RUN(test_committed_reader_io_refusal_clears_output);
+	UT_RUN(test_committed_reader_legacy_and_optional_output_share_one_cursor);
+	UT_RUN(test_committed_reader_invalid_cursor_clears_output);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

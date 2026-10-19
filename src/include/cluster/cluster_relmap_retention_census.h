@@ -19,6 +19,14 @@ typedef enum ClusterRelmapCensusResult {
 	CLUSTER_RELMAP_CENSUS_CAPACITY
 } ClusterRelmapCensusResult;
 
+/* A copied committed image, never the pending slot or a terminal proof. */
+typedef struct ClusterRelmapCensusCommitted {
+	ClusterRelmapV2Namespace identity;
+	uint64 generation;
+	RelMapFile map;
+	bool present;
+} ClusterRelmapCensusCommitted;
+
 /* Borrow the original isolated, OBSERVED ROOT set, not the configured path.
  * Every supplied original-origin directory must be exclusive, unpublished and
  * BUILDING, with native/SIDE floor/last-issued and the complete origin set
@@ -46,6 +54,22 @@ extern ClusterRelmapCensusResult cluster_relmap_retention_census_begin(
  * owner performs its remaining qualification/publication steps. */
 extern ClusterRelmapCensusResult
 cluster_relmap_retention_census_next(ClusterRelmapRetentionCensus *census);
+
+/* Same cursor and bounded work as next. Clear output on every call, then set
+ * present only on the MORE tick that finishes a namespace's complete legal
+ * pair AND restores any pending obligation to its original-origin directory.
+ * Copies the selected committed image and exact namespace/generation; no
+ * configured-path reread, pending image, TT binding or release permission.
+ * NULL output discards that tick's image, as the legacy next API does.
+ *
+ * Every emitted image remains provisional until this cursor returns DRAINED
+ * after the whole ROOT recheck. On any refusal, the caller must discard ALL
+ * images from this cursor, including earlier copies; output clearing cannot
+ * revoke copies already held by the caller. DRAINED still leaves directories
+ * BUILDING and the original cold owner's remaining qualifications unchanged.
+ * Use this API throughout a scan when every namespace image is required. */
+extern ClusterRelmapCensusResult cluster_relmap_retention_census_next_committed(
+	ClusterRelmapRetentionCensus *census, ClusterRelmapCensusCommitted *out);
 
 /* Interrupted scans invalidate the borrowed build and ROOT set, retaining
  * every restored pin. No directory, pin or ROOT ownership is freed here. */
