@@ -1,15 +1,19 @@
 /*-------------------------------------------------------------------------
  * test_cluster_heap_insert_preflight.c
- *    Execute native insert preparation before the first main heap pin.
+ *    Execute native heap write preparation before the first main heap pin.
  *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2026, pgrac contributors
  * Author: SqlRush <sqlrush@gmail.com>
  * IDENTIFICATION
  *    src/test/cluster_unit/test_cluster_heap_insert_preflight.c
  *
- * Verbatim heap_insert / heap_multi_insert entry prefixes and complete routing,
- * guards and heap_prepare_insert bodies. Stop before main buffer acquisition
- * or native batch preparation. Canonical publication, lease, TOAST storage,
+ * NOTES
+ * This is a pgrac-original fixture with local test helpers. Verbatim insert,
+ * multi-insert, delete and update entry prefixes and complete routing, guards
+ * and heap_prepare_insert bodies stop before main buffer acquisition or native
+ * batch preparation. Canonical publication, lease, TOAST storage, relcache,
  * slot materialization and undo reservation are explicit boundaries. This does
  * not simulate BIND durability, receipt APPLY or transaction cleanup.
  *-------------------------------------------------------------------------
@@ -17,6 +21,7 @@
 #include "postgres.h"
 #include "access/heapam.h"
 #include "access/heaptoast.h"
+#include "access/multixact.h"
 #include "access/parallel.h"
 #include "access/visibilitymap.h"
 #include "access/xact.h"
@@ -27,13 +32,16 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_itl_slot.h"
 #include "cluster/cluster_mode.h"
+#include "cluster/cluster_multixact_current.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_tt_local.h"
 #include "cluster/cluster_undo_record_api.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "executor/tuptable.h"
 #include "utils/rel.h"
+#include "utils/relcache.h"
 #include "../../backend/access/heap/heapam_r4_private.h"
 #undef printf
 #include "unit_test.h"
@@ -44,6 +52,7 @@ bool cluster_enabled = true, cluster_shared_config = true, cluster_shared_catalo
 int cluster_node_id;
 int ParallelWorkerNumber = -1;
 int wal_level = WAL_LEVEL_REPLICA;
+int cluster_undo_record_inline_max_bytes = 2048;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 
@@ -53,9 +62,11 @@ static TupleDescData tuple_desc;
 static HeapTupleData tuple;
 static PGAlignedBlock tuple_bytes;
 static TransactionId top_xid, current_xid;
-static bool in_child, publish_ok, expect_binding, toast_error;
+static bool in_child, in_parallel, publish_ok, expect_binding, toast_error, bitmap_error;
 static unsigned allocations, current_allocations, prepares, reservations;
 static unsigned bulk_calls, toast_writes, slot_fetches, undo_reservations, unbound_work;
+static unsigned bitmap_reads;
+static uint8 expected_record_type;
 static int reported_code;
 
 void
@@ -116,6 +127,11 @@ bool
 IsSubTransaction(void)
 {
 	return in_child;
+}
+bool
+IsInParallelMode(void)
+{
+	return in_parallel;
 }
 bool
 IsCatalogRelation(Relation rel)
@@ -194,6 +210,30 @@ AssertHasSnapshotForToast(Relation relation)
 	/* Snapshot existence is outside this entry-order fixture. */
 }
 
+static void
+check_lock_if_inplace_updateable_rel(Relation relation, ItemPointer otid, HeapTuple newtup)
+{
+	/* The caller's preexisting relation lock is outside this entry fixture. */
+}
+
+Bitmapset *
+RelationGetIndexAttrBitmap(Relation relation, IndexAttrBitmapKind attr_kind)
+{
+	check_bound_work();
+	bitmap_reads++;
+	if (bitmap_error)
+		ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("fixture relcache error")));
+	return NULL;
+}
+
+Bitmapset *
+bms_add_members(Bitmapset *left, const Bitmapset *right)
+{
+	/* Relcache returned empty sets; no bitmap contents are under test. */
+	UT_ASSERT(left == NULL && right == NULL);
+	return NULL;
+}
+
 HeapTuple
 heap_toast_insert_or_update(Relation relation, HeapTuple newtup, HeapTuple oldtup, int options)
 {
@@ -240,8 +280,10 @@ cluster_heap_prepare_undo_record_exact(uint8 record_type, uint16 capacity, uint1
 									   uint16 slot, UBA prev, uint64 deadline,
 									   ClusterUndoRecordPrepareReceipt *receipt)
 {
-	UT_ASSERT_EQ(record_type, UNDO_RECORD_INSERT);
-	UT_ASSERT_EQ(capacity, sizeof(UndoInsertPayload));
+	UT_ASSERT_EQ(record_type, expected_record_type);
+	UT_ASSERT_EQ(capacity, record_type == UNDO_RECORD_INSERT
+							   ? sizeof(UndoInsertPayload)
+							   : cluster_undo_record_inline_max_bytes);
 	UT_ASSERT_EQ(segment, 7);
 	UT_ASSERT_EQ(slot, 3);
 	UT_ASSERT_EQ(deadline, 1000);
@@ -280,12 +322,14 @@ reset(void)
 	tuple.t_data = (HeapTupleHeader)tuple_bytes.data;
 	tuple.t_len = TOAST_TUPLE_THRESHOLD + 1;
 	cluster_enabled = cluster_shared_config = publish_ok = expect_binding = true;
-	cluster_shared_catalog = in_child = toast_error = false;
+	cluster_shared_catalog = in_child = in_parallel = toast_error = bitmap_error = false;
 	cluster_node_id = 0;
 	ParallelWorkerNumber = -1;
 	top_xid = current_xid = InvalidTransactionId;
 	allocations = current_allocations = prepares = reservations = 0;
 	bulk_calls = toast_writes = slot_fetches = undo_reservations = unbound_work = 0;
+	bitmap_reads = 0;
+	expected_record_type = UNDO_RECORD_INSERT;
 	reported_code = 0;
 }
 
@@ -462,10 +506,170 @@ UT_TEST(toast_error_retains_the_original_transaction_binding)
 	UT_ASSERT_EQ(unbound_work, 0);
 }
 
+/* Execute the actual entry through the statement immediately before ReadBuffer. */
+static bool
+run_dml(bool update)
+{
+	ItemPointerData tid;
+	TM_FailureData tmfd;
+	LockTupleMode lockmode;
+	TU_UpdateIndexes update_indexes;
+	bool failed = false;
+
+	ItemPointerSet(&tid, 1, 1);
+	expected_record_type = update ? UNDO_RECORD_UPDATE : UNDO_RECORD_DELETE;
+	PG_TRY();
+	{
+		if (update)
+			heap_update(&relation_data, &tid, &tuple, 0, NULL, true, &tmfd, &lockmode,
+						&update_indexes);
+		else
+			heap_delete(&relation_data, &tid, 0, NULL, true, &tmfd, false);
+	}
+	PG_CATCH();
+	{
+		failed = true;
+	}
+	PG_END_TRY();
+	return failed;
+}
+
+UT_TEST(dml_binds_before_relcache_and_original_undo_reservation)
+{
+	for (int update = 0; update < 2; ++update) {
+		reset();
+		UT_ASSERT(!run_dml(update));
+		UT_ASSERT_EQ(allocations, 1);
+		UT_ASSERT_EQ(prepares, 1);
+		UT_ASSERT_EQ(reservations, 1);
+		UT_ASSERT_EQ(undo_reservations, 1);
+		UT_ASSERT_EQ(bitmap_reads, update ? 4 : 0);
+		UT_ASSERT_EQ(unbound_work, 0);
+	}
+}
+
+UT_TEST(dml_subtransaction_refuses_before_any_xid_allocation_or_binding)
+{
+	for (int update = 0; update < 2; ++update)
+		for (int inherited = 0; inherited < 2; ++inherited) {
+			reset();
+			in_child = true;
+			if (inherited)
+				top_xid = current_xid = 400;
+			UT_ASSERT(run_dml(update));
+			UT_ASSERT_EQ(reported_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+			UT_ASSERT_EQ(allocations + current_allocations, 0);
+			UT_ASSERT_EQ(prepares + reservations + undo_reservations + bitmap_reads, 0);
+		}
+}
+
+UT_TEST(dml_mismatched_xid_refuses_before_publication_or_relcache)
+{
+	for (int update = 0; update < 2; ++update) {
+		reset();
+		top_xid = 400;
+		current_xid = 401;
+		UT_ASSERT(run_dml(update));
+		UT_ASSERT_EQ(reported_code, ERRCODE_INTERNAL_ERROR);
+		UT_ASSERT_EQ(allocations + current_allocations, 0);
+		UT_ASSERT_EQ(prepares + reservations + undo_reservations + bitmap_reads, 0);
+	}
+}
+
+UT_TEST(dml_bind_failure_stops_before_relcache_or_undo_reservation)
+{
+	for (int update = 0; update < 2; ++update) {
+		reset();
+		publish_ok = false;
+		UT_ASSERT(run_dml(update));
+		UT_ASSERT_EQ(reported_code, ERRCODE_DATA_CORRUPTED);
+		UT_ASSERT_EQ(prepares, 1);
+		UT_ASSERT_EQ(reservations + undo_reservations + bitmap_reads, 0);
+	}
+}
+
+UT_TEST(dml_reuses_one_existing_top_binding_for_original_receipts)
+{
+	reset();
+	top_xid = current_xid = 400;
+	reservations = 1;
+	UT_ASSERT(!run_dml(false));
+	UT_ASSERT(!run_dml(true));
+	UT_ASSERT_EQ(allocations + current_allocations, 0);
+	UT_ASSERT_EQ(prepares, 2);
+	UT_ASSERT_EQ(reservations, 1);
+	UT_ASSERT_EQ(undo_reservations, 2);
+	UT_ASSERT_EQ(unbound_work, 0);
+}
+
+UT_TEST(dml_native_routes_keep_subtransaction_and_binding_behavior)
+{
+	for (int update = 0; update < 2; ++update)
+		for (int route = 0; route < 4; ++route) {
+			reset();
+			expect_binding = publish_ok = false;
+			in_child = true;
+			if (route == 0)
+				cluster_enabled = false;
+			else if (route == 1)
+				cluster_node_id = -1;
+			else if (route == 2)
+				relform.relpersistence = RELPERSISTENCE_TEMP;
+			else
+				relation_data.rd_locator.relNumber = 1259;
+			UT_ASSERT(!run_dml(update));
+			UT_ASSERT_EQ(current_xid, 401);
+			UT_ASSERT_EQ(prepares + reservations + undo_reservations, 0);
+			UT_ASSERT_EQ(bitmap_reads, update ? 4 : 0);
+		}
+}
+
+UT_TEST(dml_parallel_rejection_precedes_xid_allocation_and_binding)
+{
+	for (int update = 0; update < 2; ++update)
+		for (int inherited = 0; inherited < 2; ++inherited) {
+			reset();
+			in_parallel = true;
+			if (inherited)
+				top_xid = current_xid = 400;
+			UT_ASSERT(run_dml(update));
+			UT_ASSERT_EQ(reported_code, ERRCODE_INVALID_TRANSACTION_STATE);
+			UT_ASSERT_EQ(allocations + current_allocations, 0);
+			UT_ASSERT_EQ(prepares + reservations + undo_reservations + bitmap_reads, 0);
+		}
+}
+
+UT_TEST(update_relcache_error_keeps_the_original_transaction_binding)
+{
+	reset();
+	bitmap_error = true;
+	UT_ASSERT(run_dml(true));
+	UT_ASSERT_EQ(reported_code, ERRCODE_DATA_EXCEPTION);
+	UT_ASSERT_EQ(prepares, 1);
+	UT_ASSERT_EQ(reservations, 1);
+	UT_ASSERT_EQ(bitmap_reads, 1);
+	UT_ASSERT_EQ(undo_reservations, 0);
+	UT_ASSERT_EQ(unbound_work, 0);
+}
+
+UT_TEST(dml_shared_catalog_uses_original_top_binding)
+{
+	for (int update = 0; update < 2; ++update) {
+		reset();
+		cluster_shared_catalog = true;
+		relation_data.rd_locator.relNumber = 1259;
+		UT_ASSERT(!run_dml(update));
+		UT_ASSERT_EQ(prepares, 1);
+		UT_ASSERT_EQ(reservations, 1);
+		UT_ASSERT_EQ(undo_reservations, 1);
+		UT_ASSERT_EQ(unbound_work, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(21);
 	UT_RUN(direct_insert_binds_before_lease_toast_and_undo);
 	UT_RUN(batch_binds_before_materialization_and_reuses_one_top_binding);
 	UT_RUN(empty_batch_still_binds_before_bulk_work);
@@ -478,6 +682,15 @@ main(void)
 	UT_RUN(shared_catalog_uses_the_original_top_binding);
 	UT_RUN(existing_binding_is_reused_without_a_new_xid_or_reservation);
 	UT_RUN(toast_error_retains_the_original_transaction_binding);
+	UT_RUN(dml_binds_before_relcache_and_original_undo_reservation);
+	UT_RUN(dml_subtransaction_refuses_before_any_xid_allocation_or_binding);
+	UT_RUN(dml_mismatched_xid_refuses_before_publication_or_relcache);
+	UT_RUN(dml_bind_failure_stops_before_relcache_or_undo_reservation);
+	UT_RUN(dml_reuses_one_existing_top_binding_for_original_receipts);
+	UT_RUN(dml_native_routes_keep_subtransaction_and_binding_behavior);
+	UT_RUN(dml_parallel_rejection_precedes_xid_allocation_and_binding);
+	UT_RUN(update_relcache_error_keeps_the_original_transaction_binding);
+	UT_RUN(dml_shared_catalog_uses_original_top_binding);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

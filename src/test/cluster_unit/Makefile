@@ -9309,10 +9309,13 @@ test_cluster_write_preflight: test_cluster_write_preflight.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
-# Native preparation boundaries, including shared batch delegation. The prefix
-# ends before the first main heap pin / native batch allocation, respectively.
+# Native preparation boundaries, including shared batch delegation. Prefixes
+# end before the first main heap pin / native batch allocation, respectively.
 test_cluster_heap_insert_preflight.inc: $(top_srcdir)/src/backend/access/heap/heapam.c \
 		$(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
+	awk '/^typedef struct (ClusterHeapItlTerminalCensus|ClusterHeapDmlAuthorityGuard|ClusterCurrentMxStampPlan|ClusterCurrentMxHeapFingerprint|ClusterCurrentMxDescriptorMemo|ClusterCurrentMxOperationState|ClusterCurrentMxHeapResult)$$/ \
+	     { emit=1; n++ } emit { print } /^} .*;/ { emit=0 } \
+	     END { if(n!=7) exit 1 }' $< > $@.tmp
 	awk '/^(cluster_heap_itl_relation_route|cluster_itl_write_path_enabled)\(/ \
 	     { print "static bool"; emit=1; n++ } \
 	     /^cluster_heap_preflight_write\(/ { print "bool"; emit=1; n++ } \
@@ -9320,7 +9323,7 @@ test_cluster_heap_insert_preflight.inc: $(top_srcdir)/src/backend/access/heap/he
 	     { print "static void"; emit=1; n++ } \
 	     /^cluster_heap_multi_insert_route\(/ { print "static ClusterHeapMultiInsertRoute"; emit=1; n++ } \
 	     /^heap_prepare_insert\(/ { print "static HeapTuple"; emit=1; n++ } \
-	     emit { print } /^}/ { emit=0 } END { if(n!=7) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if(n!=7) exit 1 }' $< >> $@.tmp
 	awk '/^cluster_heap_maintenance_restricted\(/ { print "bool"; emit=1; n++ } \
 	     emit { print } /^}/ { emit=0 } END { if(n!=1) exit 1 }' $(word 2,$^) >> $@.tmp
 	awk '/^heap_insert\(/ { print "void"; emit=1; n++ } \
@@ -9329,11 +9332,17 @@ test_cluster_heap_insert_preflight.inc: $(top_srcdir)/src/backend/access/heap/he
 	awk '/^heap_multi_insert\(/ { print "void"; emit=1; n++ } \
 	     emit && /^\tneedwal = RelationNeedsWAL/ { print "}"; emit=0; done++ } \
 	     emit { print } END { if(n!=1 || done!=1 || emit) exit 1 }' $< >> $@.tmp
+	awk '/^heap_(delete|update)\(/ { print "TM_Result"; emit=1; n++ } \
+	     emit && /^\tbuffer = ReadBuffer\(relation, block\);/ \
+	     { print "return TM_Ok; }"; emit=0; done++ } \
+	     emit { print } END { if(n!=2 || done!=2 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_insert_preflight: test_cluster_heap_insert_preflight.c unit_test.h \
 		test_cluster_heap_insert_preflight.inc \
-		$(top_srcdir)/src/backend/access/heap/heapam_r4_private.h
+		$(top_srcdir)/src/backend/access/heap/heapam_r4_private.h \
+		$(top_srcdir)/src/include/cluster/cluster_multixact_current.h \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
