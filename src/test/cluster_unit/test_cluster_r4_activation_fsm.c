@@ -39,6 +39,7 @@ extern bool cluster_semantic_activation_resolve_shared_undo_root_live_owner_sour
 	uint32 segment_id, ClusterUndoBlock0ResolvedRoot *out);
 #include "port/atomics.h"
 #include "storage/ipc.h"
+#include "storage/lwlock.h"
 #include "storage/shmem.h"
 
 #define TEST_SEMANTIC_GATE_SHMEM_BYTES 1104
@@ -157,6 +158,12 @@ static uint64 test_capability_missing_bitmap;
 static bool test_capture_activation_log;
 static unsigned test_activation_diag_logs;
 static char test_activation_last_diag[512];
+bool cluster_trace_normal_stop;
+static bool test_capture_stop_log;
+static bool test_stop_diag_held_lock;
+static bool test_stop_diag_unsafe_log;
+static unsigned test_stop_diag_reports;
+static char test_stop_diag_text[65536];
 static bool test_terminal_peer_record_enabled;
 static bool test_terminal_peer_eligible;
 static ClusterSfPeerCap test_terminal_peer_record;
@@ -1151,7 +1158,17 @@ test_read_barrier(void)
 bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
-	return test_capture_activation_log && elevel == LOG;
+	if (test_capture_stop_log && elevel == LOG
+		&& (test_stop_diag_held_lock || CritSectionCount != 0))
+		test_stop_diag_unsafe_log = true;
+	return (test_capture_activation_log || test_capture_stop_log) && elevel == LOG;
+}
+
+void
+ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *context)
+{
+	if (test_stop_diag_held_lock)
+		callback(NULL, LW_SHARED, context);
 }
 
 bool
@@ -1180,6 +1197,19 @@ errmsg(const char *fmt, ...)
 		va_start(args, fmt);
 		vsnprintf(test_activation_last_diag, sizeof(test_activation_last_diag), fmt, args);
 		va_end(args);
+	}
+	if (test_capture_stop_log && strstr(fmt, "semantic normal-stop") != NULL) {
+		size_t used = strlen(test_stop_diag_text);
+		if (strstr(fmt, "identity rejection") != NULL)
+			test_stop_diag_reports++;
+		va_start(args, fmt);
+		vsnprintf(test_stop_diag_text + used, sizeof(test_stop_diag_text) - used, fmt, args);
+		va_end(args);
+		used = strlen(test_stop_diag_text);
+		if (used + 1 < sizeof(test_stop_diag_text)) {
+			test_stop_diag_text[used] = '\n';
+			test_stop_diag_text[used + 1] = '\0';
+		}
 	}
 	return 0;
 }
@@ -1252,6 +1282,10 @@ static void
 test_gate_reset(void)
 {
 	cluster_shared_config = false;
+	cluster_trace_normal_stop = false;
+	test_capture_stop_log = test_stop_diag_held_lock = test_stop_diag_unsafe_log = false;
+	test_stop_diag_reports = 0;
+	test_stop_diag_text[0] = '\0';
 	test_capture_activation_log = false;
 	test_activation_diag_logs = 0;
 	test_activation_last_diag[0] = '\0';
@@ -10593,6 +10627,222 @@ UT_TEST(test_a148_stop_identity_matches_full_record_root_and_current_members)
 	test_gate_reset();
 }
 
+static void
+ut_stop_diag_setup(ClusterSemanticActivationRecord *open, uint8 *root)
+{
+	ut_a148_stop_identity(open, root, 7);
+	cluster_trace_normal_stop = test_capture_stop_log = true;
+	test_terminal_stop = false;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(open, root, NULL, NULL),
+				 CLUSTER_NORMAL_STOP_READY);
+	test_terminal_stop = true;
+}
+
+UT_TEST(test_stop_identity_trace_off_is_silent)
+{
+	ClusterSemanticActivationRecord open;
+	uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	ut_stop_diag_setup(&open, root);
+	cluster_trace_normal_stop = false;
+	open.phase = CLUSTER_SEMANTIC_PHASE_COMMIT;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, NULL, NULL),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(test_stop_diag_reports, 0);
+	UT_ASSERT_EQ(strlen(test_stop_diag_text), 0);
+	test_gate_reset();
+}
+
+UT_TEST(test_stop_identity_trace_keeps_first_predicate_and_full_identity)
+{
+	ClusterSemanticActivationRecord open;
+	uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	char expected[80];
+	ut_stop_diag_setup(&open, root);
+	pg_atomic_write_u64(&SemanticActivationShmem->active_bits, 0);
+	pg_atomic_write_u64(&SemanticActivationShmem->record_generation, 99);
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, NULL, NULL),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(test_stop_diag_reports, 1);
+	UT_ASSERT(strstr(test_stop_diag_text, "predicate=admission.active_bits") != NULL);
+	snprintf(expected, sizeof(expected), "expected=" UINT64_FORMAT, open.target_feature_bitmap);
+	UT_ASSERT(strstr(test_stop_diag_text, expected) != NULL);
+	UT_ASSERT(strstr(test_stop_diag_text, "current=0") != NULL);
+	UT_ASSERT(strstr(test_stop_diag_text, "open.record_generation=") != NULL);
+	UT_ASSERT(strstr(test_stop_diag_text, "root.expected") != NULL);
+	UT_ASSERT(strstr(test_stop_diag_text, "ack.before.round_nonce=") != NULL);
+	UT_ASSERT(strstr(test_stop_diag_text, "control_connection_generation=") != NULL);
+	UT_ASSERT(strstr(test_stop_diag_text, "restart_binding=") != NULL);
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, NULL, NULL),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(test_stop_diag_reports, 1);
+	test_gate_reset();
+}
+
+UT_TEST(test_stop_identity_pending_does_not_consume_first_rejection)
+{
+	ClusterSemanticActivationRecord open;
+	uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	ut_stop_diag_setup(&open, root);
+	test_capability_missing_peer = 3;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, NULL, NULL),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(test_stop_diag_reports, 0);
+	test_capability_missing_peer = -1;
+	pg_atomic_write_u64(&SemanticActivationShmem->active_bits, 0);
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, NULL, NULL),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(test_stop_diag_reports, 1);
+	test_gate_reset();
+}
+
+UT_TEST(test_stop_identity_trace_names_nested_peer_generation)
+{
+	ClusterSemanticActivationRecord open;
+	uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	ut_stop_diag_setup(&open, root);
+	test_peer_capability_generation++;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, NULL, NULL),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(test_stop_diag_reports, 1);
+	UT_ASSERT(strstr(test_stop_diag_text, "predicate=ack.peer.capability_generation") != NULL);
+	UT_ASSERT(strstr(test_stop_diag_text, "expected=19 current=20") != NULL);
+	UT_ASSERT(strstr(test_stop_diag_text, "member=1") != NULL);
+	test_gate_reset();
+}
+
+UT_TEST(test_stop_identity_trace_names_service_binding)
+{
+	ClusterSemanticActivationRecord open;
+	uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	ut_stop_diag_setup(&open, root);
+	SemanticActivationAckTable->restart_binding[0] = 1;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, NULL, NULL),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(test_stop_diag_reports, 1);
+	UT_ASSERT(strstr(test_stop_diag_text, "predicate=service.same_epoch_restart_binding") != NULL);
+	UT_ASSERT(strstr(test_stop_diag_text, "expected=00000000") != NULL);
+	UT_ASSERT(strstr(test_stop_diag_text, "current=01000000") != NULL);
+	test_gate_reset();
+}
+
+UT_TEST(test_stop_identity_trace_defers_original_snapshot_until_lock_free)
+{
+	ClusterSemanticActivationRecord open;
+	uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	ut_stop_diag_setup(&open, root);
+	test_stop_diag_held_lock = true;
+	pg_atomic_write_u64(&SemanticActivationShmem->active_bits, 0);
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, NULL, NULL),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(test_stop_diag_reports, 0);
+	test_stop_diag_held_lock = false;
+	CritSectionCount = 1;
+	pg_atomic_write_u64(&SemanticActivationShmem->active_bits, open.target_feature_bitmap);
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, NULL, NULL),
+				 CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(test_stop_diag_reports, 0);
+	CritSectionCount = 0;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, NULL, NULL),
+				 CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(test_stop_diag_reports, 1);
+	UT_ASSERT(strstr(test_stop_diag_text, "predicate=admission.active_bits") != NULL);
+	UT_ASSERT(strstr(test_stop_diag_text, "current=0") != NULL);
+	UT_ASSERT(!test_stop_diag_unsafe_log);
+	test_gate_reset();
+}
+
+static void
+ut_stop_diag_change_caps(void)
+{
+	test_local_capability_word ^= UINT32_C(0x80000000);
+}
+
+static void
+ut_stop_diag_change_caps_on_second_snapshot(void)
+{
+	test_membership_snapshot_hook = ut_stop_diag_change_caps;
+}
+
+static void
+ut_stop_diag_change_peer_generation(void)
+{
+	test_peer_capability_generation++;
+}
+
+static void
+ut_stop_diag_change_peer_generation_on_second_snapshot(void)
+{
+	test_membership_snapshot_hook = ut_stop_diag_change_peer_generation;
+}
+
+UT_TEST(test_stop_identity_trace_does_not_relabel_before_tuple_as_after)
+{
+	ClusterSemanticActivationRecord open;
+	uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	ut_stop_diag_setup(&open, root);
+	test_membership_snapshot_hook = ut_stop_diag_change_peer_generation_on_second_snapshot;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, NULL, NULL),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(test_stop_diag_reports, 1);
+	UT_ASSERT(strstr(test_stop_diag_text, "predicate=ack.peer.capability_generation stage=after")
+			  != NULL);
+	UT_ASSERT(strstr(test_stop_diag_text, "expected=19 current=20") != NULL);
+	UT_ASSERT(strstr(test_stop_diag_text, "sample=after ack.current node=0") != NULL);
+	UT_ASSERT(strstr(test_stop_diag_text, "sample=after ack.current node=1") == NULL);
+	UT_ASSERT(strstr(test_stop_diag_text,
+					 "service.sample_stage=after service.available=0 writer.available=0"
+					 " formation.available=0")
+			  != NULL);
+	test_gate_reset();
+}
+
+UT_TEST(test_stop_identity_trace_keeps_before_and_after_at_late_rejection)
+{
+	ClusterSemanticActivationRecord open;
+	uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	ut_stop_diag_setup(&open, root);
+	test_membership_snapshot_hook = ut_stop_diag_change_caps_on_second_snapshot;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, NULL, NULL),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(test_stop_diag_reports, 1);
+	UT_ASSERT(strstr(test_stop_diag_text, "predicate=capability.word_changed stage=after") != NULL);
+	UT_ASSERT(strstr(test_stop_diag_text, "ack.before.round_nonce=") != NULL);
+	UT_ASSERT(strstr(test_stop_diag_text, "ack.after.round_nonce=") != NULL);
+	UT_ASSERT(strstr(test_stop_diag_text, "after_available=1") != NULL);
+	UT_ASSERT(strstr(test_stop_diag_text, "service.sample_stage=before") != NULL);
+	test_gate_reset();
+}
+
+UT_TEST(test_stop_identity_trace_names_original_clean_writer_rejection)
+{
+	ClusterSemanticActivationRecord open;
+	uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	char operands[100];
+	ut_stop_diag_setup(&open, root);
+	cluster_shared_config = true;
+	SemanticActivationAckTable->transition_epoch++;
+	NormalStartCompletion = (ClusterNormalStartCompletion *)test_normal_start_completion.bytes;
+	memset(NormalStartCompletion, 0, sizeof(*NormalStartCompletion));
+	pg_atomic_init_u32(&NormalStartCompletion->state, CLUSTER_NORMAL_START_TARGET_READY);
+	NormalStartCompletion->node_id = cluster_node_id;
+	NormalStartCompletion->system_identifier = test_system_identifier;
+	NormalStartCompletion->boot_incarnation = cluster_qvotec_get_self_incarnation();
+	NormalStartCompletion->epoch = SemanticActivationAckTable->transition_epoch;
+	UT_ASSERT(cluster_semantic_activation_record_encode(&open, NormalStartCompletion->pgsa));
+	memcpy(NormalStartCompletion->pgrd, root, sizeof(root));
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, NULL, NULL),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(test_stop_diag_reports, 1);
+	UT_ASSERT(strstr(test_stop_diag_text, "predicate=service.writer.epoch") != NULL);
+	snprintf(operands, sizeof(operands), "expected=" UINT64_FORMAT " current=" UINT64_FORMAT,
+			 cluster_epoch_get_current(), NormalStartCompletion->epoch);
+	UT_ASSERT(strstr(test_stop_diag_text, operands) != NULL);
+	UT_ASSERT(strstr(test_stop_diag_text, "service.available=1") != NULL);
+	UT_ASSERT(strstr(test_stop_diag_text, "predecessor_root_sha256=") != NULL);
+	UT_ASSERT(strstr(test_stop_diag_text, "root.service") != NULL);
+	test_gate_reset();
+}
+
 UT_TEST(test_pre2_semantic_stop_accepts_exact_declared_pair)
 {
 	const uint64 sets[] = { 3, 9 };
@@ -11428,7 +11678,7 @@ static void test_serving_finish_root(void);
 int
 main(void)
 {
-	UT_PLAN(386);
+	UT_PLAN(395);
 	UT_RUN(test_member_commit_gap_before_all_peer_receipts);
 	UT_RUN(test_member_commit_request_waits_for_real_predecessor_receipts);
 	UT_RUN(test_member_commit_request_rejects_old_or_changed_identity);
@@ -11796,6 +12046,15 @@ main(void)
 	UT_RUN(test_a142_early_ack_duplicate_is_idempotent_but_conflict_refuses);
 	UT_RUN(test_a142_current_member_change_prevents_native_projection);
 	UT_RUN(test_a148_stop_identity_matches_full_record_root_and_current_members);
+	UT_RUN(test_stop_identity_trace_off_is_silent);
+	UT_RUN(test_stop_identity_trace_keeps_first_predicate_and_full_identity);
+	UT_RUN(test_stop_identity_pending_does_not_consume_first_rejection);
+	UT_RUN(test_stop_identity_trace_names_nested_peer_generation);
+	UT_RUN(test_stop_identity_trace_names_service_binding);
+	UT_RUN(test_stop_identity_trace_defers_original_snapshot_until_lock_free);
+	UT_RUN(test_stop_identity_trace_does_not_relabel_before_tuple_as_after);
+	UT_RUN(test_stop_identity_trace_keeps_before_and_after_at_late_rejection);
+	UT_RUN(test_stop_identity_trace_names_original_clean_writer_rejection);
 	UT_RUN(test_pre2_semantic_stop_accepts_exact_declared_pair);
 	UT_RUN(test_a148_stop_identity_rejects_record_and_namespace_contradictions);
 	UT_RUN(test_a148_stop_identity_observation_gaps_do_not_publish_partial_identity);
