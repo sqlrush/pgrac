@@ -14,9 +14,10 @@
  *
  * NOTES
  *    This is a pgrac-original file. No CLUSTER_CTRC_UNIT_TEST: the actual
- *    shared selectors and reply consumers are compiled. Only allocation,
- *    locks, error reporting and wakeup are process-boundary fixtures. This
- *    is not a disk or network end-to-end test.
+ *    shared selectors, reservations and reply consumers are compiled.
+ *    Native transaction state, allocation, locks, error reporting and wakeup
+ *    are process-boundary fixtures. This is not a disk or network end-to-end
+ *    test.
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -25,7 +26,9 @@
 #include <time.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include "access/xact.h"
 #include "storage/lwlock.h"
+#include "storage/proc.h"
 #include "storage/spin.h"
 
 static unsigned spin_acquisitions;
@@ -84,6 +87,10 @@ int cluster_node_id = 0;
 BackendType MyBackendType = B_BACKEND;
 AuxProcType MyAuxProcType = NotAnAuxProcess;
 int MyProcPid = 2901;
+static PGPROC test_my_proc;
+PGPROC *MyProc = &test_my_proc;
+static FullTransactionId test_top_full;
+static unsigned top_full_reads;
 static bool allow_new_service_participant = true;
 static unsigned new_service_participant_calls;
 static unsigned wake_count;
@@ -114,6 +121,14 @@ int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 static bool publication_fenced, fence_at_receipt_lock;
 static uint64 publication_revision = 1;
 static int publication_smgr = 1;
+
+FullTransactionId
+GetTopFullTransactionIdIfAny(void)
+{
+	UT_ASSERT_EQ(held_count, 0);
+	top_full_reads++;
+	return test_top_full;
+}
 
 int
 cluster_smgr_which_for(RelFileLocator locator pg_attribute_unused(),
@@ -460,6 +475,10 @@ static void
 reset_fixture(void)
 {
 	MyBackendType = B_BACKEND;
+	MemSet(&test_my_proc, 0, sizeof(test_my_proc));
+	MyProc = &test_my_proc;
+	test_top_full = InvalidFullTransactionId;
+	top_full_reads = 0;
 	allow_new_service_participant = true;
 	new_service_participant_calls = 0;
 	external_lock_hook = NULL;
@@ -535,6 +554,133 @@ seed_origin(unsigned index, unsigned participants)
 	if (!cluster_ctrc_origin_begin_seal_entry(origin, 41 + index))
 		abort();
 	return origin;
+}
+
+static ClusterCtrcTxnKeyV1
+fresh_origin_key(void)
+{
+	ClusterCtrcOriginEntry *origin = seed_origin(0, 0);
+	ClusterCtrcTxnKeyV1 key = origin->key;
+
+	MemSet(origin, 0, sizeof(*origin));
+	return key;
+}
+
+UT_TEST(test_origin_reserve_requires_published_local_top_protection)
+{
+	unsigned fault;
+
+	for (fault = 0; fault < 8; fault++) {
+		ClusterCtrcTxnKeyV1 key;
+		ClusterCtrcOriginReservation reservation;
+		ClusterCtrcSharedHeader before;
+
+		reset_fixture();
+		key = fresh_origin_key();
+		test_my_proc.xid = key.xid;
+		test_top_full = FullTransactionIdFromEpochAndXid(7, key.xid);
+		switch (fault) {
+		case 0:
+			MyProc = NULL;
+			break;
+		case 1:
+			test_my_proc.xid = InvalidTransactionId;
+			break;
+		case 2:
+			test_top_full = InvalidFullTransactionId;
+			break;
+		case 3:
+			test_top_full = FullTransactionIdFromEpochAndXid(7, key.xid + 1);
+			break;
+		case 4:
+			test_my_proc.xid = key.xid + 1;
+			break;
+		case 5:
+			key.xid = FrozenTransactionId;
+			test_my_proc.xid = key.xid;
+			test_top_full = FullTransactionIdFromEpochAndXid(7, key.xid);
+			break;
+		case 6:
+			key.xid = BootstrapTransactionId;
+			test_my_proc.xid = key.xid;
+			test_top_full = FullTransactionIdFromEpochAndXid(7, key.xid);
+			break;
+		case 7:
+			key.origin_node_id = 1;
+			key.owner_instance = 2;
+			key.segment_id = CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+			break;
+		}
+		before = *CtrcShared;
+		MemSet(&reservation, 0xa5, sizeof(reservation));
+		UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &reservation),
+					 CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED);
+		UT_ASSERT(ctrc_bytes_zero(&reservation, sizeof(reservation)));
+		UT_ASSERT(ctrc_bytes_zero(&ctrc_origin_entries()[0], sizeof(ClusterCtrcOriginEntry)));
+		UT_ASSERT(memcmp(CtrcShared, &before, sizeof(before)) == 0);
+		UT_ASSERT_EQ(sleepable_acquisitions, 0);
+		UT_ASSERT_EQ(spin_acquisitions, 0);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_origin_reserve_protected_pending_can_cancel)
+{
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcOriginReservation reservation;
+	ClusterCtrcOriginEntry *origin;
+
+	reset_fixture();
+	key = fresh_origin_key();
+	test_my_proc.xid = key.xid;
+	test_top_full = FullTransactionIdFromEpochAndXid(7, key.xid);
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &reservation),
+				 CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	origin = &ctrc_origin_entries()[0];
+	UT_ASSERT_EQ(top_full_reads, 1);
+	UT_ASSERT_EQ(sleepable_acquisitions, 1);
+	UT_ASSERT_EQ(spin_acquisitions, 0);
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT(reservation.valid);
+	UT_ASSERT_EQ(reservation.kind, CTRC_ORIGIN_RESERVATION_PENDING_OWNED);
+	UT_ASSERT_EQ(origin->state, CTRC_ORIGIN_EMPTY);
+	UT_ASSERT(origin->reservation_generation != 0);
+	UT_ASSERT(memcmp(&origin->key, &key, sizeof(key)) == 0);
+	UT_ASSERT(cluster_ctrc_origin_cancel_pre_bind(&reservation));
+	UT_ASSERT(ctrc_bytes_zero(origin, sizeof(*origin)));
+}
+
+UT_TEST(test_origin_reserve_open_replay_requires_live_original_protection)
+{
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcOriginReservation reservation, duplicate;
+	ClusterCtrcOriginEntry before;
+	ClusterCtrcSharedHeader header_before;
+	uint32 grant;
+
+	reset_fixture();
+	key = fresh_origin_key();
+	test_my_proc.xid = key.xid;
+	test_top_full = FullTransactionIdFromEpochAndXid(7, key.xid);
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &reservation),
+				 CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	UT_ASSERT(cluster_ctrc_origin_open_reserved(&reservation, &grant));
+	UT_ASSERT(grant != 0);
+	before = ctrc_origin_entries()[0];
+	header_before = *CtrcShared;
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &duplicate),
+				 CLUSTER_CTRC_ORIGIN_RESERVED_EXISTING_OPEN);
+	UT_ASSERT_EQ(duplicate.reservation_generation, reservation.reservation_generation);
+	UT_ASSERT(memcmp(&ctrc_origin_entries()[0], &before, sizeof(before)) == 0);
+	UT_ASSERT(memcmp(CtrcShared, &header_before, sizeof(header_before)) == 0);
+	test_my_proc.xid = InvalidTransactionId;
+	MemSet(&duplicate, 0xa5, sizeof(duplicate));
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &duplicate),
+				 CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED);
+	UT_ASSERT(ctrc_bytes_zero(&duplicate, sizeof(duplicate)));
+	UT_ASSERT(memcmp(&ctrc_origin_entries()[0], &before, sizeof(before)) == 0);
+	UT_ASSERT(memcmp(CtrcShared, &header_before, sizeof(header_before)) == 0);
+	UT_ASSERT_EQ(held_count, 0);
 }
 
 UT_TEST(test_new_seals_do_not_starve_old_pending)
@@ -3079,9 +3225,12 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(70);
+	UT_PLAN(73);
 	printf("# CTRC header_bytes=%zu total_bytes=%zu\n", sizeof(ClusterCtrcSharedHeader),
 		   capacity.total_bytes);
+	UT_RUN(test_origin_reserve_requires_published_local_top_protection);
+	UT_RUN(test_origin_reserve_protected_pending_can_cancel);
+	UT_RUN(test_origin_reserve_open_replay_requires_live_original_protection);
 	UT_RUN(test_new_seals_do_not_starve_old_pending);
 	UT_RUN(test_pending_participant_does_not_starve_peer);
 	UT_RUN(test_duplicate_pending_is_accepted_without_wakeup);

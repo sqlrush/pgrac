@@ -37,6 +37,7 @@
 #include "access/htup_details.h"
 #include "access/multixact.h"
 #include "access/transam.h"
+#include "access/xact.h"
 #include "access/xlog.h"
 #include "catalog/pg_class_d.h"
 #include "miscadmin.h"
@@ -74,6 +75,7 @@
 #include "storage/buf_internals.h"
 #include "storage/backendid.h"
 #include "storage/bufpage.h"
+#include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
 #include "storage/shmem.h"
@@ -2662,12 +2664,26 @@ cluster_ctrc_origin_reserve_active(const ClusterCtrcTxnKeyV1 *key,
 	ClusterCtrcOriginEntry *origin;
 	uint64 index;
 	uint64 reservation_generation;
+	FullTransactionId top_full;
 	ClusterCtrcOriginReserveResult result;
 
 	if (reservation == NULL)
 		return CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED;
 	MemSet(reservation, 0, sizeof(*reservation));
 	if (!cluster_ctrc_shmem_ready() || !ctrc_origin_index(key, &index))
+		return CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED;
+
+	/* Ordinary ACTIVE registration must retain its original top PGPROC
+	 * protection until the reservation is visible. GetNewTransactionId
+	 * publishes MyProc->xid before returning; this backend alone clears it.
+	 * Read the nonallocating top xid before origin_lock, without introducing
+	 * ProcArrayLock below the caller's block-0 authority. Exact TT slot and
+	 * incarnation validation remains the canonical publisher's contract. */
+	if (MyProc == NULL || key->origin_node_id != cluster_node_id || !TransactionIdIsNormal(key->xid)
+		|| MyProc->xid != key->xid)
+		return CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED;
+	top_full = GetTopFullTransactionIdIfAny();
+	if (!FullTransactionIdIsNormal(top_full) || XidFromFullTransactionId(top_full) != key->xid)
 		return CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED;
 
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
