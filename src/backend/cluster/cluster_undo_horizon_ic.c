@@ -61,6 +61,7 @@
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_undo_horizon.h"
+#include "cluster/cluster_undo_cleaner.h"
 #include "cluster/cluster_undo_retention.h"
 #include "miscadmin.h"
 #include "storage/shmem.h"
@@ -107,6 +108,7 @@ typedef struct ClusterHeapFreezeReportV2SlotShmem {
 typedef struct ClusterUndoHorizonShmem {
 	ClusterUndoHorizonSlotShmem slots[CLUSTER_MAX_NODES];
 	ClusterHeapFreezeReportV2SlotShmem freeze_slots[CLUSTER_MAX_NODES];
+	uint64 report_sequence; /* LMON only; survives a process restart; never wraps */
 	/* observability (D5-5); bumped via the note_* helpers below */
 	pg_atomic_uint64 stall_count;
 	pg_atomic_uint64 peer_stale_count;
@@ -486,12 +488,60 @@ undo_horizon_sample_local_report(ClusterUndoRetentionSample *out)
 	return true;
 }
 
+/* Separate observation lane: neither sending nor receiving V2 enables the
+ * global F fold or native freeze/truncation. V1 retains its original L2 path.
+ * Each attempted V2 send consumes a shared sequence even if transport fails. */
+static void
+undo_horizon_send_v2(int32 peer, const ClusterUndoCleanerActiveSample *active,
+					 const ClusterUndoRetentionSample *h)
+{
+	const ClusterSemanticActiveSampleFence *fence = &active->admission_fence;
+	ClusterHeapFreezeReportV2 report = { 0 };
+	uint8 bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES];
+	uint32 word, generation;
+	uint64 members = peer < 64 ? fence->admitted_members_lo : fence->admitted_members_hi;
+
+	if (active->scan.status != CTRC_ACTIVE_SCAN_COMPLETE || active->sample_id == 0
+		|| fence->local_node_id != cluster_node_id || (members & (UINT64_C(1) << (peer % 64))) == 0
+		|| fence->admitted_incarnation[peer] == 0 || scn_time_cmp(h->horizon_scn, h->clock_scn) > 0
+		|| UndoHorizonShmem->report_sequence == UINT64_MAX
+		|| !cluster_sf_peer_capability_word_sample(peer, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2,
+												   &word, &generation)
+		|| generation == 0)
+		return;
+	report.version = CLUSTER_HEAP_FREEZE_REPORT_V2_VERSION;
+	report.length = CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES;
+	report.sysid = fence->system_identifier;
+	report.record_generation = fence->record_generation;
+	report.formation_epoch = fence->formation_epoch;
+	report.incarnation = fence->local_boot_incarnation;
+	report.origin = (uint32)cluster_node_id;
+	report.report_sequence = UndoHorizonShmem->report_sequence + 1;
+	report.future_full_xid = U64FromFullTransactionId(active->scan.future_full);
+	report.active_full_xid_min = U64FromFullTransactionId(active->scan.min_full);
+	report.f_sample_id = active->sample_id;
+	report.horizon_scn = (uint64)h->horizon_scn;
+	report.h_sample_clock_scn = (uint64)h->clock_scn;
+	report.h_contributor_kind = h->contributor_kind;
+	report.h_contributor_token = h->contributor_token;
+	report.sender_interval_ms = (uint32)cluster_lmon_main_loop_interval;
+	if (!cluster_heap_freeze_report_v2_encode(&report, bytes)
+		|| !cluster_undo_cleaner_active_sample_current(active)
+		|| !cluster_sf_peer_capability_generation_matches(
+			peer, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2, generation))
+		return;
+	UndoHorizonShmem->report_sequence = report.report_sequence;
+	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_UNDO_HORIZON, peer, bytes, sizeof(bytes));
+}
+
 void
 cluster_undo_horizon_lmon_tick(void)
 {
 	static uint64 last_sent_us = 0;
 	ClusterUndoHorizonWire wire;
 	ClusterUndoRetentionSample sample;
+	ClusterUndoCleanerActiveSample active;
+	bool have_active;
 	uint64 now_us;
 	int pi;
 
@@ -519,6 +569,7 @@ cluster_undo_horizon_lmon_tick(void)
 
 	wire.epoch = cluster_epoch_get_current();
 	wire.sender_interval_ms = (uint32)cluster_lmon_main_loop_interval;
+	have_active = cluster_undo_cleaner_active_sample(&active);
 
 	for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
 		if (pi == cluster_node_id)
@@ -533,15 +584,15 @@ cluster_undo_horizon_lmon_tick(void)
 		 * (cluster_ic_router.c inbound contract), so a blind send per
 		 * tick would be a reconnect storm, not "ignored".
 		 */
-		if (!cluster_sf_peer_supports_undo_horizon(pi))
-			continue;
-
-		wire.horizon_scn = (uint64)sample.horizon_scn;
-
-		(void)cluster_ic_send_envelope(PGRAC_IC_MSG_UNDO_HORIZON, pi, &wire, sizeof(wire));
+		if (cluster_sf_peer_supports_undo_horizon(pi)) {
+			wire.horizon_scn = (uint64)sample.horizon_scn;
+			(void)cluster_ic_send_envelope(PGRAC_IC_MSG_UNDO_HORIZON, pi, &wire, sizeof(wire));
+		}
 		/* fire-and-forget (L456): transport retention / errors surface
 		 * through the transport's own paths; a lost report just ages the
 		 * peer's view of us into a stall. */
+		if (have_active)
+			undo_horizon_send_v2(pi, &active, &sample);
 	}
 }
 

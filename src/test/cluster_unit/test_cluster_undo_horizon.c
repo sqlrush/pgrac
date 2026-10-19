@@ -39,6 +39,7 @@
 #include "cluster/cluster_mrp.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_undo_retention.h"
+#include "cluster/cluster_undo_cleaner.h"
 #include "utils/timestamp.h"
 
 #undef printf
@@ -64,6 +65,7 @@ static unsigned test_horizon_sends;
 static bool test_horizon_cut;
 static bool test_horizon_seal;
 static bool test_horizon_capable = true;
+static bool test_v1_capable = true;
 static ClusterUndoHorizonWire test_horizon_last;
 static ClusterUndoRetentionSample test_retention_sample
 	= { .horizon_scn = 500,
@@ -85,6 +87,30 @@ static unsigned test_v2_stream_checks;
 static bool test_v2_stream_change_on_recheck;
 static bool test_v2_cap_change_on_recheck;
 static int32 test_v2_peer = 1;
+static ClusterUndoCleanerActiveSample test_sender_sample;
+static bool test_sender_sample_valid, test_sender_sample_current = true;
+static bool test_sender_change_on_recheck;
+static unsigned test_v2_sends;
+static ClusterHeapFreezeReportV2 test_v2_sent;
+
+bool
+cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out)
+{
+	MemSet(out, 0, sizeof(*out));
+	if (!test_sender_sample_valid)
+		return false;
+	*out = test_sender_sample;
+	return true;
+}
+
+bool
+cluster_undo_cleaner_active_sample_current(const ClusterUndoCleanerActiveSample *expected)
+{
+	if (test_sender_change_on_recheck)
+		test_sender_sample.sample_id++;
+	return test_sender_sample_current && expected->sample_id == test_sender_sample.sample_id
+		   && cluster_semantic_activation_active_sample_current(&expected->admission_fence);
+}
 
 bool
 cluster_semantic_activation_active_sample_capture(ClusterSemanticActiveSampleFence *out)
@@ -231,7 +257,7 @@ cluster_normal_stop_service_control_sealed(void)
 bool
 cluster_sf_peer_supports_undo_horizon(int32 peer_id)
 {
-	return test_horizon_capable && peer_id > 0 && peer_id < 4;
+	return test_v1_capable && test_horizon_capable && peer_id > 0 && peer_id < 4;
 }
 const ClusterNodeInfo *
 cluster_conf_lookup_node(int32 node_id)
@@ -243,9 +269,15 @@ ClusterICSendResult
 cluster_ic_send_envelope(uint8 type, int32 destination, const void *payload, uint32 length)
 {
 	Assert(type == PGRAC_IC_MSG_UNDO_HORIZON && destination > 0 && destination < 4);
-	Assert(length == sizeof(test_horizon_last));
-	memcpy(&test_horizon_last, payload, length);
-	test_horizon_sends++;
+	if (length == CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES) {
+		if (!cluster_heap_freeze_report_v2_decode(payload, length, &test_v2_sent))
+			abort();
+		test_v2_sends++;
+	} else {
+		Assert(length == sizeof(test_horizon_last));
+		memcpy(&test_horizon_last, payload, length);
+		test_horizon_sends++;
+	}
 	return CLUSTER_IC_SEND_DONE;
 }
 
@@ -838,6 +870,135 @@ UT_TEST(test_local_report_refusal_clears_metadata_and_stalls_sender)
 	test_retention_mrp = false;
 }
 
+static void
+reset_v2_sender(void)
+{
+	(void)reset_v2_receiver();
+	MemSet(&test_sender_sample, 0, sizeof(test_sender_sample));
+	test_sender_sample.scan.status = CTRC_ACTIVE_SCAN_COMPLETE;
+	test_sender_sample.scan.reference_full = FullTransactionIdFromEpochAndXid(1, 4096);
+	test_sender_sample.scan.future_full = FullTransactionIdFromEpochAndXid(1, 4096);
+	test_sender_sample.scan.min_full = FullTransactionIdFromEpochAndXid(1, 256);
+	test_sender_sample.admission_fence = test_v2_fence;
+	test_sender_sample.sample_id = 17;
+	test_sender_sample.worker_pid = 100;
+	test_sender_sample_valid = test_sender_sample_current = test_v1_capable = true;
+	test_sender_change_on_recheck = false;
+	test_horizon_cut = test_horizon_seal = test_retention_mrp = false;
+	test_retention_sample_valid = true;
+	test_retention_sample
+		= (ClusterUndoRetentionSample){ .horizon_scn = 400,
+										.clock_scn = 700,
+										.contributor_kind
+										= CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT,
+										.contributor_token = 9 };
+	test_v2_sends = 0;
+	test_horizon_now += 1000001;
+}
+
+UT_TEST(test_v2_sender_uses_complete_worker_sample_and_same_typed_h_cut)
+{
+	unsigned v1_sends = test_horizon_sends;
+	unsigned cuts = test_retention_sample_calls;
+
+	reset_v2_sender();
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_horizon_sends, v1_sends + 3);
+	UT_ASSERT_EQ(test_retention_sample_calls, cuts + 1);
+	UT_ASSERT_EQ(test_v2_sends, 1);
+	UT_ASSERT_EQ(test_v2_sent.sysid, 71);
+	UT_ASSERT_EQ(test_v2_sent.record_generation, 8);
+	UT_ASSERT_EQ(test_v2_sent.formation_epoch, 7);
+	UT_ASSERT_EQ(test_v2_sent.incarnation, 40);
+	UT_ASSERT_EQ(test_v2_sent.origin, 0);
+	UT_ASSERT_EQ(test_v2_sent.report_sequence, 1);
+	UT_ASSERT_EQ(test_v2_sent.f_sample_id, 17);
+	UT_ASSERT_EQ(test_v2_sent.future_full_xid,
+				 U64FromFullTransactionId(test_sender_sample.scan.future_full));
+	UT_ASSERT_EQ(test_v2_sent.active_full_xid_min,
+				 U64FromFullTransactionId(test_sender_sample.scan.min_full));
+	UT_ASSERT_EQ(test_v2_sent.horizon_scn, 400);
+	UT_ASSERT_EQ(test_v2_sent.h_sample_clock_scn, 700);
+	UT_ASSERT_EQ(test_v2_sent.h_contributor_kind,
+				 CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+	UT_ASSERT_EQ(test_v2_sent.h_contributor_token, 9);
+	UT_ASSERT_EQ(test_v2_sent.requested_full_xid, 0);
+
+	/* New H reuses exactly the older completed F, without a new census. */
+	test_retention_sample.horizon_scn = 450;
+	test_retention_sample.clock_scn = 750;
+	test_horizon_now += 1000001;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_v2_sends, 2);
+	UT_ASSERT_EQ(test_v2_sent.report_sequence, 2);
+	UT_ASSERT_EQ(test_v2_sent.f_sample_id, 17);
+	UT_ASSERT_EQ(test_v2_sent.horizon_scn, 450);
+	UT_ASSERT_EQ(test_v2_sent.h_sample_clock_scn, 750);
+	UT_ASSERT_EQ(test_v2_sent.active_full_xid_min,
+				 U64FromFullTransactionId(test_sender_sample.scan.min_full));
+}
+
+UT_TEST(test_v2_sender_rechecks_capability_and_original_sample_without_stalling_v1)
+{
+	for (int fault = 0; fault < 7; fault++) {
+		unsigned v1_sends = test_horizon_sends;
+
+		reset_v2_sender();
+		switch (fault) {
+		case 0:
+			test_sender_sample_valid = false;
+			break;
+		case 1:
+			test_sender_sample_current = false;
+			break;
+		case 2:
+			test_sender_change_on_recheck = true;
+			break;
+		case 3:
+			test_v2_change_on_recheck = true;
+			break;
+		case 4:
+			test_v2_cap_change_on_recheck = true;
+			break;
+		case 5:
+			test_sender_sample.scan.status = CTRC_ACTIVE_SCAN_INCOMPLETE;
+			break;
+		case 6:
+			test_sender_sample.sample_id = 0;
+			break;
+		}
+		cluster_undo_horizon_lmon_tick();
+		UT_ASSERT_EQ(test_horizon_sends, v1_sends + 3);
+		UT_ASSERT_EQ(test_v2_sends, 0);
+	}
+}
+
+UT_TEST(test_v2_sender_capability_is_independent_of_v1_and_sequence_is_shared)
+{
+	unsigned v1_sends = test_horizon_sends;
+
+	reset_v2_sender();
+	test_v1_capable = false;
+	test_horizon_store.report_sequence = 900;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_horizon_sends, v1_sends);
+	UT_ASSERT_EQ(test_v2_sends, 1);
+	UT_ASSERT_EQ(test_v2_sent.report_sequence, 901);
+	UT_ASSERT_EQ(test_horizon_store.report_sequence, 901);
+	test_horizon_now += 1000001;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_v2_sent.report_sequence, 902);
+
+	test_horizon_store.report_sequence = UINT64_MAX;
+	test_v1_capable = true;
+	test_horizon_now += 1000001;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_horizon_sends, v1_sends + 3);
+	UT_ASSERT_EQ(test_v2_sends, 2);
+	UT_ASSERT_EQ(test_horizon_store.report_sequence, UINT64_MAX);
+	test_sender_sample_valid = false;
+}
+
 void
 ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
 {
@@ -1339,7 +1500,7 @@ UT_TEST(test_reason_names)
 int
 main(void)
 {
-	UT_PLAN(44);
+	UT_PLAN(47);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -1386,6 +1547,9 @@ main(void)
 	UT_RUN(test_v2_requires_admitted_peer_in_both_bitmap_halves);
 	UT_RUN(test_v2_sampler_is_bounded_and_f_has_no_age_expiry);
 	UT_RUN(test_original_v1_receiver_remains_separate);
+	UT_RUN(test_v2_sender_uses_complete_worker_sample_and_same_typed_h_cut);
+	UT_RUN(test_v2_sender_rechecks_capability_and_original_sample_without_stalling_v1);
+	UT_RUN(test_v2_sender_capability_is_independent_of_v1_and_sequence_is_shared);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

@@ -67,7 +67,9 @@
 #include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "cluster/cluster_scn.h" /* SCN (pass-stats horizon plumbing) */
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_terminal_ref_census.h"
+#include "cluster/cluster_xid_stripe_boot.h"
 
 
 /*
@@ -85,6 +87,16 @@ typedef enum UndoCleanerStatus {
 } UndoCleanerStatus;
 
 #define UNDO_CLEANER_STATUS_LAST UNDO_CLEANER_EXITED
+
+/* Completed worker0 observation, not permission to freeze or reclaim. The
+ * saved fences belong to this scan; a newer scan cannot replace them. */
+typedef struct ClusterUndoCleanerActiveSample {
+	ClusterCtrcActiveScan scan;
+	ClusterXidStripeSampleFence lease_fence;
+	ClusterSemanticActiveSampleFence admission_fence;
+	uint64 sample_id;
+	pid_t worker_pid;
+} ClusterUndoCleanerActiveSample;
 
 
 /*
@@ -123,6 +135,8 @@ typedef struct UndoCleanerSharedState {
 	LWLock lwlock;
 	bool shutdown_requested;
 	UndoCleanerWorkerState workers[CLUSTER_UNDO_CLEANER_WORKER_TYPES];
+	ClusterUndoCleanerActiveSample active_sample;
+	uint64 active_sample_sequence; /* shared across worker0 respawns; never wraps */
 	ConditionVariable capacity_cv;
 	uint64 capacity_wait_entered;
 	uint64 capacity_wait_repolled;
@@ -224,6 +238,9 @@ extern TimestampTz cluster_undo_cleaner_ready_at(void);
 extern TimestampTz cluster_undo_cleaner_last_liveness_tick_at(void);
 extern int64 cluster_undo_cleaner_main_loop_iters(void);
 extern bool cluster_undo_cleaner_worker_snapshot(unsigned worker_id, UndoCleanerWorkerState *out);
+extern bool cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out);
+extern bool
+cluster_undo_cleaner_active_sample_current(const ClusterUndoCleanerActiveSample *expected);
 extern bool cluster_undo_cleaner_wait_for_capacity(uint32 segment_id,
 												   ClusterCtrcTxnKeyV1 *continuation);
 

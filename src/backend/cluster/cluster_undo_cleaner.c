@@ -223,6 +223,78 @@ cluster_undo_cleaner_worker_snapshot(unsigned worker_id, UndoCleanerWorkerState 
 	return true;
 }
 
+bool
+cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out)
+{
+	ClusterUndoCleanerActiveSample sample;
+
+	if (out == NULL)
+		return false;
+	MemSet(out, 0, sizeof(*out));
+	if (undo_cleaner_state == NULL)
+		return false;
+	LWLockAcquire(&undo_cleaner_state->lwlock, LW_SHARED);
+	sample = undo_cleaner_state->active_sample;
+	LWLockRelease(&undo_cleaner_state->lwlock);
+	if (!cluster_undo_cleaner_active_sample_current(&sample))
+		return false;
+	*out = sample;
+	return true;
+}
+
+bool
+cluster_undo_cleaner_active_sample_current(const ClusterUndoCleanerActiveSample *expected)
+{
+	bool current;
+
+	if (expected == NULL || undo_cleaner_state == NULL || expected->sample_id == 0
+		|| expected->scan.status != CTRC_ACTIVE_SCAN_COMPLETE || !cluster_undo_cleaner_enabled
+		|| !cluster_storage_mode_enabled() || cluster_normal_stop_maintenance_cut())
+		return false;
+	/* Never nest the cleaner lock with native, census, lease or admission
+	 * locks. Check the original scan's fences, then its shared publication. */
+	if (!cluster_xid_stripe_sample_fence_current(&expected->lease_fence)
+		|| !cluster_semantic_activation_active_sample_current(&expected->admission_fence))
+		return false;
+	LWLockAcquire(&undo_cleaner_state->lwlock, LW_SHARED);
+	current = !undo_cleaner_state->shutdown_requested
+			  && undo_cleaner_state->workers[0].status == UNDO_CLEANER_READY
+			  && expected->worker_pid > 0
+			  && undo_cleaner_state->workers[0].pid == expected->worker_pid
+			  && memcmp(&undo_cleaner_state->active_sample, expected, sizeof(*expected)) == 0;
+	LWLockRelease(&undo_cleaner_state->lwlock);
+	return current;
+}
+
+/* Worker0 is the sole publisher. Keep the last completed image while the
+ * next census is incomplete: fresh H may reuse this immutable F generation.
+ * Failure/revocation clears it. The sequence survives worker0 respawns. */
+static void
+undo_cleaner_publish_active_sample(void)
+{
+	ClusterUndoCleanerActiveSample *sample;
+
+	if (undo_cleaner_worker != 0 || undo_cleaner_state == NULL)
+		return;
+	if (undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_INCOMPLETE)
+		return;
+	LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
+	sample = &undo_cleaner_state->active_sample;
+	MemSet(sample, 0, sizeof(*sample));
+	if (undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_COMPLETE
+		&& !undo_cleaner_state->shutdown_requested
+		&& undo_cleaner_state->workers[0].status == UNDO_CLEANER_READY
+		&& undo_cleaner_state->workers[0].pid == MyProcPid
+		&& undo_cleaner_state->active_sample_sequence != UINT64_MAX) {
+		sample->scan = undo_cleaner_active_scan;
+		sample->lease_fence = undo_cleaner_active_lease_fence;
+		sample->admission_fence = undo_cleaner_active_admission_fence;
+		sample->sample_id = ++undo_cleaner_state->active_sample_sequence;
+		sample->worker_pid = MyProcPid;
+	}
+	LWLockRelease(&undo_cleaner_state->lwlock);
+}
+
 static void
 undo_cleaner_note_held_lwlock(LWLock *lock pg_attribute_unused(),
 							  LWLockMode mode pg_attribute_unused(), void *context)
@@ -490,6 +562,9 @@ undo_cleaner_publish_status(UndoCleanerStatus status)
 		MemSet(&undo_cleaner_active_admission_fence, 0,
 			   sizeof(undo_cleaner_active_admission_fence));
 		undo_cleaner_active_scan_pending = false;
+		if (undo_cleaner_worker == 0)
+			MemSet(&undo_cleaner_state->active_sample, 0,
+				   sizeof(undo_cleaner_state->active_sample));
 		MemSet(worker, 0, sizeof(*worker));
 		worker->pid = MyProcPid;
 		worker->spawned_at = now;
@@ -588,6 +663,7 @@ undo_cleaner_run_pass(bool *out_work_remaining, bool maintenance_due)
 		MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
 		MemSet(&undo_cleaner_active_admission_fence, 0,
 			   sizeof(undo_cleaner_active_admission_fence));
+		undo_cleaner_publish_active_sample();
 		return false;
 	}
 
@@ -614,6 +690,7 @@ undo_cleaner_run_pass(bool *out_work_remaining, bool maintenance_due)
 		MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
 		MemSet(&undo_cleaner_active_admission_fence, 0,
 			   sizeof(undo_cleaner_active_admission_fence));
+		undo_cleaner_publish_active_sample();
 		return false;
 	}
 	/* Capture N/future then all top/prepared PGPROCs before the census. No
@@ -653,6 +730,7 @@ undo_cleaner_run_pass(bool *out_work_remaining, bool maintenance_due)
 	}
 	undo_cleaner_active_scan_pending
 		= undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_INCOMPLETE;
+	undo_cleaner_publish_active_sample();
 	/* Census continuation must not accelerate optional segment maintenance. */
 	if (!maintenance_due)
 		return false;

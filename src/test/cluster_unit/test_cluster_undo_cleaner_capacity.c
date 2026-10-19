@@ -68,6 +68,7 @@ static FullTransactionId test_reference, test_pgproc_min, test_future;
 static unsigned test_pgproc_samples;
 static bool test_pgproc_invalid;
 static bool test_lease_current;
+static uint64 test_lease_identity;
 static bool test_sample_admission_current;
 static uint64 test_sample_admission_identity;
 static unsigned test_sample_admission_captures;
@@ -112,7 +113,7 @@ ProcArrayGetActiveFullXidSample(FullTransactionId *reference, FullTransactionId 
 		abort();
 	test_pgproc_samples++;
 	MemSet(fence, 0, sizeof(*fence));
-	fence->incarnation = test_pgproc_samples;
+	fence->incarnation = test_lease_identity;
 	*reference = ReadNextFullTransactionId();
 	if (test_change_admission_after_n)
 		test_sample_admission_identity++;
@@ -131,9 +132,9 @@ ProcArrayGetActiveFullXidSample(FullTransactionId *reference, FullTransactionId 
 bool
 cluster_xid_stripe_sample_fence_current(const ClusterXidStripeSampleFence *fence)
 {
-	if (test_lock_depth != 0 || fence == NULL || fence->incarnation != test_pgproc_samples)
+	if (test_lock_depth != 0 || fence == NULL)
 		abort();
-	return test_lease_current;
+	return test_lease_current && fence->incarnation == test_lease_identity;
 }
 
 /* The actual read-only publisher observers run in active_sample_fence. This
@@ -557,6 +558,7 @@ reset_wait_fixture(void)
 	test_pgproc_min = test_future = InvalidFullTransactionId;
 	test_pgproc_invalid = false;
 	test_lease_current = test_sample_admission_current = true;
+	test_lease_identity = 31;
 	test_sample_admission_identity = 2;
 	test_sample_admission_captures = 0;
 	test_change_admission_after_n = false;
@@ -566,6 +568,7 @@ reset_wait_fixture(void)
 	undo_cleaner_active_scan_pending = false;
 	for (unsigned i = 0; i < CLUSTER_UNDO_CLEANER_WORKER_TYPES; i++) {
 		undo_cleaner_state->workers[i].status = UNDO_CLEANER_READY;
+		undo_cleaner_state->workers[i].pid = MyProcPid;
 		undo_cleaner_state->workers[i].latch = &test_proc.procLatch;
 	}
 }
@@ -1115,10 +1118,127 @@ UT_TEST(test_admission_is_saved_before_n_and_rechecked_after_first_slice)
 	UT_ASSERT_EQ(test_modifier_entries, 0);
 }
 
+UT_TEST(test_complete_sample_is_shared_without_publishing_partial_round)
+{
+	ClusterUndoCleanerActiveSample first, again;
+	bool remaining;
+
+	reset_wait_fixture();
+	undo_cleaner_worker = 0;
+	UT_ASSERT(!cluster_undo_cleaner_active_sample(&first));
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT(!cluster_undo_cleaner_active_sample(&first));
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT(cluster_undo_cleaner_active_sample(&first));
+	UT_ASSERT_EQ(first.sample_id, 1);
+	UT_ASSERT_EQ(first.worker_pid, MyProcPid);
+	UT_ASSERT_EQ(first.scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(U64FromFullTransactionId(first.scan.min_full),
+				 U64FromFullTransactionId(test_reference));
+	UT_ASSERT_EQ(test_modifier_entries, 0);
+	UT_ASSERT(cluster_undo_cleaner_active_sample(&again));
+	UT_ASSERT_EQ(again.sample_id, first.sample_id);
+
+	/* A partial newer scan cannot invent a new F generation. */
+	test_reference = FullTransactionIdFromEpochAndXid(7, 200);
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT(cluster_undo_cleaner_active_sample(&again));
+	UT_ASSERT_EQ(again.sample_id, first.sample_id);
+	UT_ASSERT_EQ(U64FromFullTransactionId(again.scan.future_full),
+				 U64FromFullTransactionId(first.scan.future_full));
+	UT_ASSERT(cluster_undo_cleaner_active_sample_current(&first));
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT(cluster_undo_cleaner_active_sample(&again));
+	UT_ASSERT_EQ(again.sample_id, 2);
+	UT_ASSERT_EQ(U64FromFullTransactionId(again.scan.min_full),
+				 U64FromFullTransactionId(test_reference));
+	UT_ASSERT(!cluster_undo_cleaner_active_sample_current(&first));
+}
+
+UT_TEST(test_complete_sample_rechecks_original_fences_and_worker_lifecycle)
+{
+	for (int fault = 0; fault < 9; fault++) {
+		ClusterUndoCleanerActiveSample sample, rejected;
+		bool remaining;
+
+		reset_wait_fixture();
+		undo_cleaner_worker = 0;
+		(void)undo_cleaner_run_pass(&remaining, false);
+		(void)undo_cleaner_run_pass(&remaining, false);
+		UT_ASSERT(cluster_undo_cleaner_active_sample(&sample));
+		switch (fault) {
+		case 0:
+			test_lease_current = false;
+			break;
+		case 1:
+			test_lease_identity++;
+			break;
+		case 2:
+			test_sample_admission_identity += 2;
+			break;
+		case 3:
+			test_sample_admission_current = false;
+			break;
+		case 4:
+			undo_cleaner_state->shutdown_requested = true;
+			break;
+		case 5:
+			undo_cleaner_publish_status(UNDO_CLEANER_SHUTTING_DOWN);
+			break;
+		case 6:
+			cluster_undo_cleaner_enabled = false;
+			break;
+		case 7:
+			cluster_enabled = false;
+			break;
+		case 8:
+			test_maintenance_cut = true;
+			break;
+		}
+		UT_ASSERT(!cluster_undo_cleaner_active_sample_current(&sample));
+		MemSet(&rejected, 0xa5, sizeof(rejected));
+		UT_ASSERT(!cluster_undo_cleaner_active_sample(&rejected));
+		UT_ASSERT_EQ(rejected.sample_id, 0);
+		UT_ASSERT(!FullTransactionIdIsValid(rejected.scan.min_full));
+	}
+}
+
+UT_TEST(test_sample_sequence_survives_worker0_respawn_and_never_wraps)
+{
+	ClusterUndoCleanerActiveSample sample;
+	bool remaining;
+
+	reset_wait_fixture();
+	undo_cleaner_worker = 0;
+	(void)undo_cleaner_run_pass(&remaining, false);
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT(cluster_undo_cleaner_active_sample(&sample));
+	UT_ASSERT_EQ(sample.sample_id, 1);
+	undo_cleaner_worker = 1;
+	undo_cleaner_publish_status(UNDO_CLEANER_SPAWNING);
+	UT_ASSERT(cluster_undo_cleaner_active_sample_current(&sample));
+	undo_cleaner_worker = 0;
+	MyProcPid++;
+	undo_cleaner_publish_status(UNDO_CLEANER_SPAWNING);
+	UT_ASSERT(!cluster_undo_cleaner_active_sample(&sample));
+	undo_cleaner_publish_status(UNDO_CLEANER_READY);
+	(void)undo_cleaner_run_pass(&remaining, false);
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT(cluster_undo_cleaner_active_sample(&sample));
+	UT_ASSERT_EQ(sample.sample_id, 2);
+	UT_ASSERT_EQ(sample.worker_pid, MyProcPid);
+
+	undo_cleaner_state->active_sample_sequence = UINT64_MAX;
+	(void)undo_cleaner_run_pass(&remaining, false);
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT(!cluster_undo_cleaner_active_sample(&sample));
+	UT_ASSERT_EQ(undo_cleaner_state->active_sample_sequence, UINT64_MAX);
+}
+
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(22);
 	UT_RUN(test_capacity_wait_retries_signals_and_cadence_without_authorizing_free);
 	UT_RUN(test_capacity_every_blocking_hold_refuses_without_sleep);
 	UT_RUN(test_heavyweight_lock_identity_and_mode_are_exact);
@@ -1138,6 +1258,9 @@ main(void)
 	UT_RUN(test_open_admission_republication_discards_original_scan);
 	UT_RUN(test_admission_is_saved_before_n_and_rechecked_after_first_slice);
 	UT_RUN(test_pgproc_failure_invalidates_old_sample_without_skipping_mandatory_work);
+	UT_RUN(test_complete_sample_is_shared_without_publishing_partial_round);
+	UT_RUN(test_complete_sample_rechecks_original_fences_and_worker_lifecycle);
+	UT_RUN(test_sample_sequence_survives_worker0_respawn_and_never_wraps);
 	free(undo_cleaner_state);
 	UT_DONE();
 	return ut_failed_count != 0;
