@@ -58,6 +58,7 @@
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_tx_identity_trace.h"
+#include "cluster/cluster_wait_trace.h"
 #include "cluster/cluster_tx_enqueue.h"
 #include "cluster/cluster_xnode_profile.h" /* diagnostic wait phase trace */
 
@@ -506,6 +507,7 @@ cluster_tx_enqueue_wait_internal(const ClusterTTStatusKey *holder_key, int effec
 			row.wait_seq = tx_wfg_waiter.wait_seq;
 			row.status = slot_kind;
 			cluster_tx_identity_trace_emit(CLTXID_WAIT_SOURCE, &row);
+			cluster_buffer_trace_tx_wait(CLWAIT_SITE_TX_SOURCE, row.wait_seq, row.xid, 0);
 		}
 		for (;;) {
 			long wait_ms;
@@ -744,6 +746,7 @@ cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator, int effective_tim
 				cluster_tx_identity_trace_target(&row, &target_locator, blocker_node, formation_epoch);
 				row.wait_seq = (uint64)wait_seq;
 				cluster_tx_identity_trace_emit(CLTXID_WAIT_TARGET, &row);
+				cluster_buffer_trace_tx_wait(CLWAIT_SITE_TX_TARGET, row.wait_seq, row.xid, 0);
 			}
 			if (cluster_epoch_get_current() != formation_epoch) {
 				final_reason = CLUSTER_TX_RESOLVE_RF_DEFERRED;

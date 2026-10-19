@@ -65,6 +65,7 @@
 #include "cluster/cluster_resource_x_node_wire.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_wait_trace.h"
 #include "port/pg_crc32c.h"
 #include "miscadmin.h"
 #include "storage/backendid.h"	   /* spec-6.14 D9 amend — MyBackendId stub */
@@ -161,6 +162,25 @@ static ClusterPcmPiWriteCutV1 structural_master_write_cut;
 static ClusterPcmPiStorageCutV1 structural_master_storage_cut;
 static void (*structural_master_ack_hook)(void);
 static int fake_lwlock_depth = 0;
+static ClusterWaitTrace wait_trace_rows[128];
+static ClusterWaitTraceKind wait_trace_kinds[128];
+static unsigned wait_trace_count;
+
+uint64
+cluster_wait_trace_begin(ClusterWaitTraceKind kind pg_attribute_unused())
+{
+	return cluster_trace_tx_identity ? wait_trace_count + 1 : 0;
+}
+
+void
+cluster_wait_trace_emit(ClusterWaitTraceKind kind, const ClusterWaitTrace *row)
+{
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	UT_ASSERT(cluster_trace_tx_identity);
+	UT_ASSERT(wait_trace_count < lengthof(wait_trace_rows));
+	wait_trace_kinds[wait_trace_count] = kind;
+	wait_trace_rows[wait_trace_count++] = *row;
+}
 /* Object admission is a boundary fixture; PCM round/caller transitions below
  * remain the real product object. Tests may race the original entry lock. */
 int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
@@ -4215,6 +4235,44 @@ UT_TEST(test_resource_x_bootstrap_active_queue_rejects_ingress_drift)
 UT_TEST(test_resource_x_bootstrap_active_queue_rejects_outbound_drift)
 {
 	check_resource_x_bootstrap_active_queue(2);
+}
+
+UT_TEST(test_resource_x_wait_trace_keeps_exact_master_queue_and_unlocked_logging)
+{
+	BufferTag tag = make_tag(151);
+	bool admission = false;
+	bool priority = false;
+
+	UT_ASSERT_EQ(wait_trace_count, 0); /* Existing OFF paths emitted nothing. */
+	cluster_trace_tx_identity = true;
+	check_resource_x_bootstrap_active_queue(0);
+	cluster_trace_tx_identity = false;
+	for (unsigned i = 0; i < wait_trace_count; i++) {
+		const ClusterWaitTrace *row = &wait_trace_rows[i];
+
+		UT_ASSERT(row->tag_known);
+		UT_ASSERT(BufferTagsEqual(&row->tag, &tag));
+		UT_ASSERT(row->entry_known && row->master_view);
+		UT_ASSERT_EQ(row->mode, PCM_LOCK_MODE_X);
+		UT_ASSERT_EQ(row->expected_master, 0);
+		UT_ASSERT(row->binding != 0);
+		if (wait_trace_kinds[i] == CLWAIT_PCM_ADMISSION) {
+			admission = true;
+			UT_ASSERT(row->request_known);
+			UT_ASSERT_EQ(row->request_seq, 41);
+		}
+		if (wait_trace_kinds[i] == CLWAIT_PCM_QUEUE && row->queue_kind == 2
+			&& row->requester == 2) {
+			priority = true;
+			UT_ASSERT_EQ(row->formation, 17);
+			UT_ASSERT_EQ(row->master_session, 31);
+			UT_ASSERT_EQ(row->request_seq, 41);
+			UT_ASSERT_EQ(row->requester_connection, 52);
+			UT_ASSERT_EQ(row->ingress_connection, 62);
+		}
+	}
+	UT_ASSERT(admission && priority);
+	wait_trace_count = 0;
 }
 
 UT_TEST(test_resource_x_bootstrap_r8_clears_old_binding_not_attempt_floor)
@@ -23988,7 +24046,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(364);
+	UT_PLAN(365);
 	/* Observe the actual startup state before any runtime fixture overrides
 	 * the postmaster GUC or initializes shared PCM state and counters. */
 	UT_RUN(test_pcm_grd_max_entries_default_is_minus_one);
@@ -24079,6 +24137,7 @@ main(void)
 	UT_RUN(test_resource_x_bootstrap_receipt_drift_invalidates_but_keeps_floor);
 	UT_RUN(test_resource_x_bootstrap_terminal_retire_clears_binding_not_floor);
 	UT_RUN(test_resource_x_bootstrap_dispatches_one_current_base_at_a_time);
+	UT_RUN(test_resource_x_wait_trace_keeps_exact_master_queue_and_unlocked_logging);
 	UT_RUN(test_resource_x_bootstrap_active_queue_rejects_ingress_drift);
 	UT_RUN(test_resource_x_bootstrap_active_queue_rejects_outbound_drift);
 	UT_RUN(test_resource_x_bootstrap_r8_clears_old_binding_not_attempt_floor);

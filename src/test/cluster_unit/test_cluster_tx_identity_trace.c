@@ -2,6 +2,7 @@
 #define USE_PGRAC_CLUSTER 1
 #include "postgres.h"
 #include "cluster/cluster_tx_identity_trace.h"
+#include "cluster/cluster_wait_trace.h"
 #include "miscadmin.h"
 #include "storage/proc.h"
 #include <stdarg.h>
@@ -15,7 +16,7 @@ bool cluster_trace_tx_identity = false;
 int cluster_node_id = 2;
 int MyProcPid = 1234;
 PGPROC *MyProc = NULL;
-static char last[2048];
+static char last[4096];
 static unsigned logs;
 
 bool errstart(int level, const char *domain) { (void)domain; assert(level == LOG); return true; }
@@ -34,6 +35,7 @@ int main(void) {
 	ClusterTxIdentityTrace row = {0};
 	ClusterTTStatusKey key = {0};
 	ClusterTxLocator locator = {0};
+	ClusterWaitTrace resource = {0};
 	unsigned before;
 
 	/* Disabled instrumentation must not inspect an identity at all. */
@@ -83,6 +85,50 @@ int main(void) {
 	cluster_trace_tx_identity = false;
 	cluster_tx_identity_trace_emit(CLTXID_TERMINAL, NULL);
 	assert(logs == before + 1);
-	puts("tx identity trace: 14 checks PASS");
+
+	/* The new resource families are passive, independently bounded and OFF. */
+	before = logs;
+	assert(cluster_wait_trace_begin(CLWAIT_PCM_WAIT) == 0);
+	cluster_wait_trace_emit(CLWAIT_TX_BUFFER, NULL);
+	assert(logs == before);
+	cluster_trace_tx_identity = true;
+	resource.snapshot = cluster_wait_trace_begin(CLWAIT_PCM_WAIT);
+	resource.tag_known = true;
+	resource.tag.spcOid = 11; resource.tag.dbOid = 22;
+	resource.tag.relNumber = 33; resource.tag.forkNum = VISIBILITYMAP_FORKNUM;
+	resource.tag.blockNum = 44;
+	resource.site = CLWAIT_SITE_PCM_EXECUTOR;
+	resource.wait_seq = 77; resource.request_seq = 99;
+	resource.request_known = true; resource.requester = 2;
+	resource.mode = 2;
+	resource.expected_master = 1; resource.x_holder = 3;
+	resource.entry_known = true; resource.s_holders = 5; resource.pi_holders = 8;
+	resource.pending_requester = 2; resource.binding = 101;
+	resource.formation = 102; resource.master_session = 103;
+	resource.private_pins = 2; resource.shared_pins = 4;
+	resource.content_held = true; resource.ledger_phase = 3;
+	resource.omitted = 7;
+	cluster_wait_trace_emit(CLWAIT_PCM_WAIT, &resource);
+	assert(strstr(last, "event=PCM_WAIT") && strstr(last, "actor_node=2 pid=1234"));
+	assert(strstr(last, "tag_known=1 spc=11 db=22 rel=33 fork=2 block=44"));
+	assert(strstr(last, "wait_seq=77 tx_xid=0 request_known=1 request_seq=99"));
+	assert(strstr(last, "mode=2 master_view=0 expected_master=1 requester=2"));
+	assert(strstr(last, "x_holder=3 s_holders=00000005 pi_holders=00000008"));
+	assert(strstr(last, "private_pins=2 shared_pins=4 content_held=1 ledger_phase=3"));
+	assert(strstr(last, "omitted=7 atomic_graph=0"));
+	resource.master_view = true;
+	cluster_wait_trace_emit(CLWAIT_PCM_ADMISSION, &resource);
+	assert(strstr(last, "event=PCM_ADMISSION") && strstr(last, "master_view=1"));
+	for (unsigned i = 0; i < CLUSTER_WAIT_TRACE_LIMIT + 2; i++)
+		cluster_wait_trace_emit(CLWAIT_PCM_WAIT, &resource);
+	assert(strstr(last, "event=LIMIT family=PCM_WAIT") && strstr(last, "evidence_complete=0"));
+	assert(cluster_wait_trace_begin(CLWAIT_PCM_WAIT) == 0);
+	before = logs;
+	cluster_wait_trace_emit(CLWAIT_TX_SUMMARY, &resource);
+	assert(logs == before + 1 && strstr(last, "event=TX_SUMMARY"));
+	cluster_wait_trace_emit(CLWAIT_NKINDS, &resource);
+	cluster_wait_trace_emit(CLWAIT_TX_BUFFER, NULL);
+	assert(logs == before + 1);
+	puts("tx identity / wait resources trace: OFF, identities and independent budgets PASS");
 	return 0;
 }

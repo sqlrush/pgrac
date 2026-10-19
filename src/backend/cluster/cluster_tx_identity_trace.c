@@ -9,6 +9,7 @@
 #include "postgres.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_tx_identity_trace.h"
+#include "cluster/cluster_wait_trace.h"
 #include "miscadmin.h"
 #include "storage/proc.h"
 
@@ -19,6 +20,72 @@ static uint64 sequence;
 static ClusterTxIdentityTrace origin_seen[ORIGIN_DEDUP_SIZE];
 static uint32 origin_next;
 static uint32 origin_count;
+static uint32 wait_counts[CLWAIT_NKINDS];
+static uint64 wait_snapshot;
+
+uint64
+cluster_wait_trace_begin(ClusterWaitTraceKind kind)
+{
+	if (!cluster_trace_tx_identity || kind < 0 || kind >= CLWAIT_NKINDS
+		|| wait_counts[kind] > CLUSTER_WAIT_TRACE_LIMIT || wait_snapshot == UINT64_MAX)
+		return 0;
+	return ++wait_snapshot;
+}
+
+void
+cluster_wait_trace_emit(ClusterWaitTraceKind kind, const ClusterWaitTrace *row)
+{
+	static const char *const names[CLWAIT_NKINDS] = {
+		"PCM_WAIT", "PCM_QUEUE", "PCM_ADMISSION", "TX_BUFFER", "TX_LEDGER", "TX_SUMMARY"
+	};
+	uint32 *count;
+
+	if (!cluster_trace_tx_identity || row == NULL || kind < 0 || kind >= CLWAIT_NKINDS)
+		return;
+	count = &wait_counts[kind];
+	if (*count > CLUSTER_WAIT_TRACE_LIMIT)
+		return;
+	if ((*count)++ == CLUSTER_WAIT_TRACE_LIMIT) {
+		ereport(LOG, (errmsg_internal("WAIT_RESOURCE event=LIMIT family=%s actor_node=%d "
+			"pid=%d limit=%u evidence_complete=0", names[kind], cluster_node_id,
+			MyProcPid, CLUSTER_WAIT_TRACE_LIMIT)));
+		return;
+	}
+	ereport(LOG, (errmsg_internal(
+		"WAIT_RESOURCE event=%s actor_node=%d pid=%d proc=%u snapshot=" UINT64_FORMAT " site=%d "
+		"tag_known=%d spc=%u db=%u rel=%u fork=%d block=%u "
+		"wait_seq=" UINT64_FORMAT " tx_xid=%u request_known=%d request_seq=" UINT64_FORMAT " "
+		"mode=%d master_view=%d expected_master=%d requester=%d source=%d entry_known=%d "
+		"state=%d x_holder=%d s_holders=%08x pi_holders=%08x pending_requester=%d "
+		"pending_cookie=" UINT64_FORMAT " binding=" UINT64_FORMAT " formation=" UINT64_FORMAT " "
+		"master_session=" UINT64_FORMAT " r4=" UINT64_FORMAT " acquisition=" UINT64_FORMAT " "
+		"base=" UINT64_FORMAT " authority=" UINT64_FORMAT " head=" UINT64_FORMAT " "
+		"enqueue_order=" UINT64_FORMAT " requester_conn=" UINT64_FORMAT " ingress_conn=" UINT64_FORMAT " "
+		"queue_kind=%d phase=%d round_phase=%d owner_phase=%d progress=%08x incompatible=%08x blocked=%08x "
+		"round_request=" UINT64_FORMAT " round_requester=%d head_request=" UINT64_FORMAT " head_requester=%d "
+		"holder_node=%u holder_proc=%u holder_epoch=" UINT64_FORMAT " holder_request=" UINT64_FORMAT " "
+		"buffer=%d private_pins=%d shared_pins=%d content_held=%d ledger_phase=%d "
+		"buffer_state=%08x own_state=%d buffer_type=%d own_flags=%08x "
+		"own_generation=" UINT64_FORMAT " reservation=" UINT64_FORMAT " "
+		"writer_activation=" UINT64_FORMAT " rx_activation=" UINT64_FORMAT " "
+		"pins_seen=%u ledger_seen=%u local_pins=%u rows=%u omitted=%u atomic_graph=0",
+		names[kind], cluster_node_id, MyProcPid,
+		MyProc == NULL ? UINT32_MAX : (uint32)MyProc->pgprocno, row->snapshot, row->site,
+		row->tag_known, row->tag.spcOid, row->tag.dbOid, row->tag.relNumber,
+		(int)row->tag.forkNum, row->tag.blockNum, row->wait_seq, row->tx_xid, row->request_known, row->request_seq,
+		row->mode, row->master_view, row->expected_master, row->requester, row->source, row->entry_known,
+		row->state, row->x_holder, row->s_holders, row->pi_holders, row->pending_requester,
+		row->pending_cookie, row->binding, row->formation, row->master_session, row->r4,
+		row->acquisition, row->base, row->authority, row->head, row->enqueue_order,
+		row->requester_connection, row->ingress_connection, row->queue_kind, row->phase, row->round_phase,
+		row->owner_phase, row->progress, row->incompatible, row->blocked,
+		row->round_request, row->round_requester, row->head_request, row->head_requester,
+		row->holder_node, row->holder_proc, row->holder_epoch, row->holder_request,
+		row->buffer, row->private_pins, row->shared_pins, row->content_held, row->ledger_phase,
+		row->buffer_state, row->own_state, row->buffer_type, row->own_flags,
+		row->own_generation, row->reservation, row->writer_activation, row->rx_activation,
+		row->pins_seen, row->ledger_seen, row->local_pins, row->rows, row->omitted)));
+}
 
 void
 cluster_tx_identity_trace_emit(ClusterTxIdentityTraceKind kind, const ClusterTxIdentityTrace *row)

@@ -54,6 +54,7 @@
 #include "cluster/cluster_membership.h"		   /* RF-ROOT P6 diag */
 #include "cluster/cluster_native_lock_probe.h" /* spec-2.25 D5 — probe protocol handlers */
 #include "cluster/cluster_grd_work_queue.h"
+#include "cluster/cluster_wait_trace.h"
 #include "cluster/cluster_guc.h"		   /* cluster_node_id + cluster_ges_request_timeout_ms */
 #include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 class 1 */
 #include "cluster/cluster_wal_retention.h" /* RF-ROOT P6 WALR conditional convert */
@@ -2656,12 +2657,16 @@ ges_arm_local_request_grant(ClusterGesHwGrant *grant, const ClusterResId *resid,
  * a reply racing SIGTERM cannot turn a cancelled wait into further recovery.
  * Original proc_exit owns CV/native-lock cleanup and shared CONTROL transfer. */
 static bool
-ges_timed_sleep(ConditionVariable *cv, long timeout_ms, uint32 wait_event)
+ges_timed_sleep(ConditionVariable *cv, long timeout_ms, uint32 wait_event,
+				const ClusterResId *resid, uint64 request_id)
 {
 	bool timed_out;
 
 	if (AmStartupProcess() && !proc_exit_inprogress)
 		HandleStartupProcInterrupts();
+	if (cluster_trace_tx_identity && resid != NULL && resid->type == LOCKTAG_TRANSACTION)
+		cluster_buffer_trace_tx_wait(CLWAIT_SITE_GES_TX, ges_local_wait_seq(),
+								 resid->field1, request_id);
 	timed_out = ConditionVariableTimedSleep(cv, timeout_ms, wait_event);
 	if (AmStartupProcess() && !proc_exit_inprogress)
 		HandleStartupProcInterrupts();
@@ -2948,7 +2953,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 						sleep_ms = (int)remaining_ms;
 				}
 
-				(void)ges_timed_sleep(&entry->cv, sleep_ms, wait_ev);
+				(void)ges_timed_sleep(&entry->cv, sleep_ms, wait_ev, resid, request_id);
 				CHECK_FOR_INTERRUPTS();
 			}
 		}
@@ -3237,7 +3242,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 				sleep_ms = (int)remaining_ms;
 		}
 
-		if (!ges_timed_sleep(&entry->cv, sleep_ms, wait_ev)) {
+		if (!ges_timed_sleep(&entry->cv, sleep_ms, wait_ev, resid, request_id)) {
 			/* CV signaled — re-check loop predicate. */
 			continue;
 		}
@@ -3921,7 +3926,7 @@ ges_release_send_owned(const struct ClusterResId *resid, const struct ClusterGrd
 					sleep_ms = (int)remaining_ms;
 			}
 
-			if (!ges_timed_sleep(&entry->cv, sleep_ms, effective_wait_event))
+			if (!ges_timed_sleep(&entry->cv, sleep_ms, effective_wait_event, resid, holder->request_id))
 				continue;
 
 			if (pending)
@@ -4332,7 +4337,8 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 			remaining_ms = 1;
 		if (remaining_ms > 100)
 			remaining_ms = 100;
-		(void)ges_timed_sleep(&entry->cv, remaining_ms, WAIT_EVENT_GES_CONVERT_WAIT);
+		(void)ges_timed_sleep(&entry->cv, remaining_ms, WAIT_EVENT_GES_CONVERT_WAIT,
+							  resid, convert_request_id);
 	}
 	ConditionVariableCancelSleep();
 	cluster_xp_end(&xp_wait); /* PGRAC: spec-5.59 D2 profiling */

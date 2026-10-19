@@ -65,6 +65,7 @@
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_grd.h"		/* existing block-path fail-closed counter */
 #include "cluster/cluster_guc.h"		/* spec-4.7a D2 — cluster_gcs_block_local_cache */
+#include "cluster/cluster_wait_trace.h"
 #include "cluster/cluster_block_recovery.h" /* spec-4.10 D1 — online block recovery */
 #include "cluster/cluster_conf.h"			/* spec-5.7 HW — cluster_conf_node_count */
 #include "cluster/cluster_hw.h"				/* spec-5.7 HW — relation-extend authority */
@@ -4688,6 +4689,121 @@ cluster_buffer_backend_has_pins(void)
 		if (LocalRefCount == NULL || LocalRefCount[i] != 0)
 			return true;
 	return false;
+}
+
+/* The caller's private pin stabilizes this descriptor. Copy under the header
+ * lock, but do not log or take a PCM entry lock while holding it. */
+static void
+cluster_buffer_wait_trace_pin(const PrivateRefCountEntry *ref, ClusterWaitTrace *row)
+{
+	BufferDesc *buf = GetBufferDescriptor(ref->buffer - 1);
+	ClusterPcmOwnSnapshot own;
+	uint32 state = LockBufHdr(buf);
+
+	cluster_pcm_own_snapshot_post_state_locked(buf, state, &own);
+	UnlockBufHdr(buf, state);
+	row->tag = own.tag;
+	row->tag_known = (state & BM_TAG_VALID) != 0;
+	row->buffer = ref->buffer;
+	row->private_pins = ref->refcount;
+	row->shared_pins = BUF_STATE_GET_REFCOUNT(state);
+	row->buffer_state = own.semantic_buf_state;
+	row->own_state = own.pcm_state;
+	row->buffer_type = own.buffer_type;
+	row->own_flags = own.flags;
+	row->own_generation = own.generation;
+	row->reservation = own.reservation_token;
+	row->writer_activation = own.writer_activation_token;
+	row->rx_activation = own.resource_x_activation_generation;
+	row->content_held = LWLockHeldByMe(BufferDescriptorGetContentLock(buf));
+}
+
+/* Bounded backend-local inventory, not a shared-buffer-pool scan. A retained
+ * pin/cached X is an observation, never proof that a remote revoke is blocked.
+ * Copy the private hash before logging, so an ERROR cannot leak a hash scan. */
+void
+cluster_buffer_trace_tx_wait(ClusterWaitTraceSite site, uint64 wait_seq,
+							 uint32 tx_xid, uint64 request_seq)
+{
+	PrivateRefCountEntry refs[CLUSTER_WAIT_TRACE_RESOURCES];
+	ClusterWaitTrace summary = {0};
+	uint32 nrefs = 0;
+	uint32 rows = 0;
+
+	if (!cluster_trace_tx_identity)
+		return;
+	summary.snapshot = cluster_wait_trace_begin(CLWAIT_TX_SUMMARY);
+	if (summary.snapshot == 0)
+		return;
+	summary.site = site;
+	summary.wait_seq = wait_seq;
+	summary.tx_xid = tx_xid;
+	summary.request_seq = request_seq;
+	summary.request_known = request_seq != 0;
+	summary.expected_master = summary.requester = summary.source = -1;
+	summary.x_holder = summary.pending_requester = -1;
+	summary.round_requester = summary.head_requester = -1;
+	summary.holder_node = summary.holder_proc = UINT32_MAX;
+	for (unsigned i = 0; i < lengthof(PrivateRefCountArray); i++) {
+		const PrivateRefCountEntry *ref = &PrivateRefCountArray[i];
+		if (ref->refcount > 0) {
+			summary.pins_seen++;
+			refs[nrefs++] = *ref;
+		}
+	}
+	if (PrivateRefCountHash != NULL && PrivateRefCountOverflowed > 0) {
+		HASH_SEQ_STATUS scan;
+		PrivateRefCountEntry *ref;
+
+		summary.pins_seen += PrivateRefCountOverflowed;
+		hash_seq_init(&scan, PrivateRefCountHash);
+		while ((ref = hash_seq_search(&scan)) != NULL) {
+			if (nrefs < lengthof(refs))
+				refs[nrefs++] = *ref;
+			if (nrefs == lengthof(refs)) {
+				hash_seq_term(&scan);
+				break;
+			}
+		}
+	}
+	for (uint32 i = 0; i < nrefs; i++) {
+		ClusterWaitTrace row = summary;
+
+		cluster_buffer_wait_trace_pin(&refs[i], &row);
+		cluster_wait_trace_emit(CLWAIT_TX_BUFFER, &row);
+		rows++;
+	}
+	summary.omitted = summary.pins_seen - nrefs;
+	for (unsigned i = 0; i < lengthof(cluster_bufmgr_pcm_x_writer_ledger); i++) {
+		const ClusterPcmXWriterLedgerEntry *entry = &cluster_bufmgr_pcm_x_writer_ledger[i];
+		ClusterWaitTrace row = summary;
+
+		if (entry->phase == PCM_X_WRITER_LEDGER_UNUSED)
+			continue;
+		summary.ledger_seen++;
+		if (rows == CLUSTER_WAIT_TRACE_RESOURCES) {
+			summary.omitted++;
+			continue;
+		}
+		row.buffer = entry->buffer_id + 1;
+		row.ledger_phase = entry->phase;
+		row.content_held = entry->content_lock != NULL && LWLockHeldByMe(entry->content_lock);
+		row.tag = entry->granted.tag;
+		row.tag_known = entry->granted.generation != 0;
+		row.own_generation = entry->granted.generation;
+		row.reservation = entry->granted.reservation_token;
+		row.writer_activation = entry->authority.writer_activation_token;
+		row.rx_activation = entry->authority.resource_x_activation_generation;
+		row.formation = entry->authority.ref.formation;
+		row.acquisition = entry->authority.ref.acquisition_generation;
+		cluster_wait_trace_emit(CLWAIT_TX_LEDGER, &row);
+		rows++;
+	}
+	if (LocalRefCount != NULL)
+		for (int i = 0; i < NLocBuffer; i++)
+			summary.local_pins += LocalRefCount[i];
+	summary.rows = rows;
+	cluster_wait_trace_emit(CLWAIT_TX_SUMMARY, &summary);
 }
 #endif
 

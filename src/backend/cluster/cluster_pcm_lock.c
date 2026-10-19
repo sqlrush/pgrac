@@ -43,6 +43,7 @@
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_grd.h" /* PGRAC: spec-2.30 D1 — ClusterGrdHolderId 24B */
 #include "cluster/cluster_guc.h" /* PGRAC: spec-2.30 D3 — cluster_node_id */
+#include "cluster/cluster_wait_trace.h"
 #include "cluster/cluster_gcs.h" /* PGRAC: spec-2.32 D5 — master lookup + send_transition_and_wait */
 #include "cluster/cluster_gcs_block.h" /* PGRAC: spec-2.33 D7 — send_block_request_and_wait */
 #include "cluster/cluster_inject.h"
@@ -935,6 +936,9 @@ static ClusterPcmResourceXMasterState *
 pcm_resource_x_master_state_for_entry(const struct GrdEntry *entry);
 static ClusterPcmResourceXMasterRequest *
 pcm_resource_x_master_head(ClusterPcmResourceXMasterState *state, int32 *requester_node_out);
+static void pcm_trace_wait(struct GrdEntry *entry, ClusterWaitTraceSite site,
+	PcmLockMode mode, int32 expected_master, int32 requester, uint64 request_seq,
+	bool request_known, bool master_view);
 static bool pcm_resource_x_s_barrier_active_locked(struct GrdEntry *entry);
 static bool
 pcm_resource_x_local_owner_round_exact_locked(struct GrdEntry *entry,
@@ -5321,6 +5325,9 @@ cluster_pcm_lock_resource_x_executor_wait_exact(const ResourceXAcquisitionRef *r
 
 	PG_TRY();
 	{
+		if (cluster_trace_tx_identity)
+			pcm_trace_wait(entry, CLWAIT_SITE_PCM_EXECUTOR, PCM_LOCK_MODE_X,
+				-1, ref->assertion.requester_node, 0, false, false);
 		(void)ConditionVariableTimedSleep(&entry->wait_cv, timeout_ms,
 										  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
 		if (!pcm_entry_ref_identity_exact(&pcm_resource_x_executor_wait_context.ref)) {
@@ -7851,6 +7858,9 @@ pcm_lock_acquire_local_pinned(BufferTag tag, PcmLockMode mode, PcmAuthoritySnaps
 			wait_context->cv_prepared = true;
 		}
 		LWLockRelease(&entry->entry_lock.lock);
+		if (cluster_trace_tx_identity)
+			pcm_trace_wait(entry, CLWAIT_SITE_PCM_COMPATIBLE, mode, -1,
+				cluster_node_id, 0, false, false);
 		ConditionVariableSleep(&entry->wait_cv, WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
 		if (!pcm_entry_ref_identity_exact(&wait_context->ref)) {
 			pcm_resource_x_reconfig_block();
@@ -10274,6 +10284,141 @@ pcm_resource_x_master_head(ClusterPcmResourceXMasterState *state, int32 *request
 		}
 	}
 	return head;
+}
+
+/* Opt-in observations only. Callers retain their pinned entry, but have
+ * released entry_lock. Never wait for that lock or log while holding it.
+ * Local projections are not remote master truth; master_view is reserved
+ * for the authenticated admission path. Caller, local round and FIFO head
+ * request sequences are separate namespaces, even when they happen to match. */
+static void
+pcm_trace_wait(struct GrdEntry *entry, ClusterWaitTraceSite site, PcmLockMode mode,
+			   int32 expected_master, int32 requester, uint64 request_seq,
+			   bool request_known, bool master_view)
+{
+	ClusterWaitTrace row = {0};
+	ClusterWaitTrace queued[RESOURCE_X_PROTOCOL_NODE_LIMIT * 2];
+	ClusterWaitTraceKind kind = master_view ? CLWAIT_PCM_ADMISSION : CLWAIT_PCM_WAIT;
+	ClusterPcmResourceXMasterState *state;
+	ClusterPcmResourceXMasterRequest *head;
+	const ClusterPcmResourceXBootstrapRound *round;
+	uint32 nqueued = 0;
+	int32 head_node = -1;
+
+	row.snapshot = cluster_wait_trace_begin(kind);
+	if (row.snapshot == 0)
+		return;
+	row.site = site;
+	row.mode = mode;
+	row.expected_master = expected_master;
+	row.requester = requester;
+	row.request_seq = request_seq;
+	row.request_known = request_known;
+	row.master_view = master_view;
+	row.source = row.x_holder = row.pending_requester = -1;
+	row.state = row.phase = row.round_phase = row.owner_phase = -1;
+	row.round_requester = row.head_requester = -1;
+	row.holder_node = row.holder_proc = UINT32_MAX;
+	row.tag = entry->tag;
+	row.tag_known = true;
+	row.binding = entry->binding_generation;
+	if (!LWLockConditionalAcquire(&entry->entry_lock.lock, LW_SHARED))
+		goto emit;
+	row.entry_known = true;
+	row.state = pg_atomic_read_u32(&entry->master_state);
+	row.x_holder = entry->x_holder_node;
+	row.s_holders = pg_atomic_read_u32(&entry->s_holders_bitmap);
+	row.pi_holders = pg_atomic_read_u32(&entry->pi_holders_bitmap);
+	row.pending_requester = entry->pending_x_requester_node;
+	row.pending_cookie = entry->pending_x_since_lsn;
+	row.progress = entry->resource_x_progress_flags;
+	row.acquisition = entry->resource_x_acquisition_generation;
+	row.formation = entry->resource_x_formation;
+	row.base = entry->resource_x_requester_base_generation;
+	row.holder_node = entry->master_holder.node_id;
+	row.holder_proc = entry->master_holder.procno;
+	row.holder_epoch = entry->master_holder.cluster_epoch;
+	row.holder_request = entry->master_holder.request_id;
+	round = &entry->resource_x_bootstrap_round;
+	row.round_phase = round->phase;
+	row.owner_phase = entry->resource_x_local_owner.state;
+	if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_EMPTY) {
+		row.round_request = round->request.assertion_sequence;
+		row.round_requester = round->request.logical_assertion.requester_node;
+		row.master_session = round->master_session_incarnation;
+		row.r4 = round->r4_record_generation;
+		row.requester_connection = round->requester_sender_connection_generation;
+		row.ingress_connection = round->master_ingress_connection_generation;
+	}
+	state = pcm_resource_x_master_state_for_entry(entry);
+	if (state != NULL) {
+		row.authority = state->authority_generation;
+		head = pcm_resource_x_master_head(state, &head_node);
+		if (head != NULL) {
+			row.head_request = head->assertion_sequence;
+			row.head_requester = head_node;
+			row.head = head->head_transition_generation;
+			row.enqueue_order = head->enqueue_order;
+			row.phase = head->phase;
+			row.source = head->source_node;
+			row.incompatible = head->incompatible_holders_bitmap;
+			row.blocked = head->blocked_holders_bitmap;
+		}
+		for (int32 node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
+			const ClusterPcmResourceXMasterRequest *request = &state->requests[node];
+			const ClusterPcmResourceXBootstrapPriority *priority = &state->bootstrap_priority[node];
+			ClusterWaitTrace *q;
+
+			if (request->phase != RESOURCE_X_MASTER_NONE
+				&& request->phase != RESOURCE_X_MASTER_SETTLED
+				&& request->phase != RESOURCE_X_MASTER_RELEASED) {
+				q = &queued[nqueued++];
+				*q = row;
+				q->queue_kind = 1;
+				q->requester = node;
+				q->request_known = true;
+				q->request_seq = request->assertion_sequence;
+				q->formation = request->resource_formation;
+				q->master_session = request->master_session_incarnation;
+				q->r4 = 0; /* Canonical request has no R4 field. */
+				q->base = request->base_authority_generation;
+				q->authority = request->final_authority_generation;
+				q->head = request->head_transition_generation;
+				q->enqueue_order = request->enqueue_order;
+				q->requester_connection = request->requester_connection_generation;
+				q->ingress_connection = request->sender_connection_generation;
+				q->phase = request->phase;
+				q->source = request->source_node;
+				q->incompatible = request->incompatible_holders_bitmap;
+				q->blocked = request->blocked_holders_bitmap;
+			}
+			if (priority->state == RESOURCE_X_BOOTSTRAP_PRIORITY_NEXT_ADMISSION) {
+				q = &queued[nqueued++];
+				*q = row;
+				q->queue_kind = 2;
+				q->requester = node;
+				q->request_known = true;
+				q->request_seq = priority->request.assertion_sequence;
+				q->formation = priority->request.resource_formation;
+				q->master_session = priority->request.master_session_incarnation;
+				q->r4 = priority->r4_record_generation;
+				q->base = priority->request.base_authority_generation;
+				q->authority = q->head = 0;
+				q->enqueue_order = priority->enqueue_order;
+				q->requester_connection = priority->request.sender_connection_generation;
+				q->ingress_connection = priority->authenticated_ingress_connection_generation;
+				q->phase = priority->state;
+				q->source = -1;
+				q->incompatible = q->blocked = 0;
+			}
+		}
+	}
+	LWLockRelease(&entry->entry_lock.lock);
+	row.rows = nqueued;
+emit:
+	cluster_wait_trace_emit(kind, &row);
+	for (uint32 i = 0; i < nqueued; i++)
+		cluster_wait_trace_emit(CLWAIT_PCM_QUEUE, &queued[i]);
 }
 
 /*
@@ -15510,6 +15655,9 @@ round_wait_predicate_done:
 
 	PG_TRY();
 	{
+		if (cluster_trace_tx_identity)
+			pcm_trace_wait(entry, CLWAIT_SITE_PCM_BOOTSTRAP, PCM_LOCK_MODE_X,
+				current_master_node, assertion->requester_node, observed_attempt, true, false);
 		(void)ConditionVariableTimedSleep(&entry->wait_cv, timeout_ms,
 										  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
 		if (!pcm_entry_ref_identity_exact(&wait_context.ref)) {
@@ -15658,6 +15806,9 @@ cluster_pcm_lock_resource_x_predecessor_wait_exact(const BufferTag *tag, int32 c
 	timeout_ms = (long)Min((uint64)LONG_MAX, remaining_us / UINT64_C(1000));
 	PG_TRY();
 	{
+		if (cluster_trace_tx_identity)
+			pcm_trace_wait(entry, CLWAIT_SITE_PCM_PREDECESSOR, PCM_LOCK_MODE_X,
+				current_master_node, cluster_node_id, 0, false, false);
 		(void)ConditionVariableTimedSleep(&entry->wait_cv, timeout_ms,
 										  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
 		if (!pcm_entry_ref_identity_exact(&wait_context.ref)) {
@@ -16881,6 +17032,9 @@ cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
 
 	PG_TRY();
 	{
+		if (cluster_trace_tx_identity)
+			pcm_trace_wait(entry, CLWAIT_SITE_PCM_INSTALL, PCM_LOCK_MODE_X,
+				continuation->master_node, continuation->requester_node, 0, false, false);
 		(void)ConditionVariableTimedSleep(&entry->wait_cv, sleep_ms,
 										  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
 		if (!pcm_entry_ref_identity_exact(&wait_context.ref)) {
@@ -19285,7 +19439,19 @@ pcm_resource_x_bootstrap_request(
 		}
 	}
 	LWLockRelease(&entry->entry_lock.lock);
-	pcm_entry_ref_release(&entry_ref);
+	if (cluster_trace_tx_identity) {
+		PG_TRY();
+		{
+			pcm_trace_wait(entry, CLWAIT_SITE_PCM_ADMISSION, PCM_LOCK_MODE_X,
+				cluster_node_id, requester_node, request->common.assertion_sequence, true, true);
+		}
+		PG_FINALLY();
+		{
+			pcm_entry_ref_release(&entry_ref);
+		}
+		PG_END_TRY();
+	} else
+		pcm_entry_ref_release(&entry_ref);
 	return result;
 }
 
