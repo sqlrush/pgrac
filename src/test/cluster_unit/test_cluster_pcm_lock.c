@@ -20924,7 +20924,7 @@ pcm_scan_retire_fixture(BufferTag tag)
 	UT_ASSERT(pcm_entry_try_retire_exact(&tag, generation, PCM_RETIRE_REASON_HOLDER_RELEASE));
 }
 
-UT_TEST(test_relation_scan_inactive_slots_read_only_fixed_headers)
+UT_TEST(test_relation_scan_inactive_slots_read_only_registry)
 {
 	ClusterPcmPiRelationScanV2 (*scans[])(RelFileLocator, uint64, uint32, uint32 *) = {
 		cluster_pcm_lock_pi_relation_scan_v2,
@@ -20945,13 +20945,14 @@ UT_TEST(test_relation_scan_inactive_slots_read_only_fixed_headers)
 			fake_pcm_count_comparisons = false;
 			UT_ASSERT_EQ(cursor, 4);
 			UT_ASSERT_EQ(fake_pcm_full_state_compares, 0);
-			UT_ASSERT(fake_pcm_max_compare_bytes <= 304);
+			UT_ASSERT(fake_pcm_max_compare_bytes <= 48);
+			UT_ASSERT(fake_pcm_first_master_compare == NULL);
 		}
 	}
 	cluster_shared_config = false;
 }
 
-UT_TEST(test_normal_stop_inactive_slots_read_only_fixed_headers)
+UT_TEST(test_normal_stop_inactive_slots_read_only_registry)
 {
 	for (int retired = 0; retired < 2; retired++) {
 		pi_relation_scan_setup();
@@ -20961,38 +20962,46 @@ UT_TEST(test_normal_stop_inactive_slots_read_only_fixed_headers)
 		UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
 		fake_pcm_count_comparisons = false;
 		UT_ASSERT_EQ(fake_pcm_full_state_compares, 0);
-		UT_ASSERT(fake_pcm_max_compare_bytes <= 304);
+		UT_ASSERT(fake_pcm_max_compare_bytes <= 48);
+		UT_ASSERT(fake_pcm_first_master_compare == NULL);
 	}
 	cluster_shared_config = false;
 }
 
-UT_TEST(test_inactive_master_header_corruption_remains_invalid)
+UT_TEST(test_inactive_master_body_is_outside_scan_integrity_proof)
 {
+#ifdef USE_ASSERT_CHECKING
 	BufferTag tag = make_tag(6810);
 	RelFileLocator locator = BufTagGetRelFileLocator(&tag);
-	const unsigned header_bytes = 304;
 	for (int retired = 0; retired < 2; retired++) {
 		uint32 cursor = 0;
 		unsigned char *state;
-		pi_relation_scan_setup();
-		if (retired)
-			pcm_scan_retire_fixture(tag);
+		/* The original EMPTY publication validates every zero body.
+		 * Observe that real address before the scan counter is reset. */
 		pcm_comparison_count_begin();
-		UT_ASSERT_EQ(cluster_pcm_lock_ko_relation_scan_v3(locator, 17, 4, &cursor),
-					 CLUSTER_PCM_PI_RELATION_EMPTY);
+		pi_relation_scan_setup();
 		fake_pcm_count_comparisons = false;
 		state = (unsigned char *)fake_pcm_first_master_compare;
 		UT_ASSERT_NOT_NULL(state);
-		for (unsigned offset = 0; offset < header_bytes; offset += 4) {
-			state[offset] = 1;
-			cursor = 0;
-			UT_ASSERT_EQ(cluster_pcm_lock_ko_relation_scan_v3(locator, 17, 4, &cursor),
-						 CLUSTER_PCM_PI_RELATION_INVALID);
-			UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
-			state[offset] = 0;
-		}
+		if (state == NULL)
+			continue;
+		if (retired)
+			pcm_scan_retire_fixture(tag);
+		/* Deliberately damage only fixture-owned inactive storage. These
+		 * scans prove registry lifecycle, not inactive-body integrity. */
+		memset(state, 0xa5, 49960);
+		pcm_comparison_count_begin();
+		UT_ASSERT_EQ(cluster_pcm_lock_ko_relation_scan_v3(locator, 17, 4, &cursor),
+					 CLUSTER_PCM_PI_RELATION_EMPTY);
+		UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+		fake_pcm_count_comparisons = false;
+		UT_ASSERT_EQ(cursor, 4);
+		UT_ASSERT(fake_pcm_max_compare_bytes <= 48);
+		UT_ASSERT(fake_pcm_first_master_compare == NULL);
+		memset(state, 0, 49960);
 	}
 	cluster_shared_config = false;
+#endif
 }
 
 UT_TEST(test_retirement_establishes_and_checks_zero_inactive_body)
@@ -24637,9 +24646,9 @@ main(void)
 	UT_RUN(test_real_pcm_pump_continues_past_sixteenth_delivery);
 	UT_RUN(test_requester_transport_owner_bounds_both_dispatch_roots);
 	UT_RUN(test_relation_scan_hashes_only_the_target_in_every_role);
-	UT_RUN(test_relation_scan_inactive_slots_read_only_fixed_headers);
-	UT_RUN(test_normal_stop_inactive_slots_read_only_fixed_headers);
-	UT_RUN(test_inactive_master_header_corruption_remains_invalid);
+	UT_RUN(test_relation_scan_inactive_slots_read_only_registry);
+	UT_RUN(test_normal_stop_inactive_slots_read_only_registry);
+	UT_RUN(test_inactive_master_body_is_outside_scan_integrity_proof);
 	UT_RUN(test_retirement_establishes_and_checks_zero_inactive_body);
 	UT_RUN(test_normal_stop_census_timing_is_default_off_and_lock_free);
 	UT_RUN(test_relation_scan_non_target_hash_orphan_is_outside_object_proof);

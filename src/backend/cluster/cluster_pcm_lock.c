@@ -722,20 +722,9 @@ typedef struct ClusterPcmResourceXMasterState {
 	ResourceXIntentSlot holder_image_intent;
 } ClusterPcmResourceXMasterState;
 
-/* Inactive bodies are zeroed before their registry state is published. Bounded
- * scans check only the fixed prefix, never the large request/image arrays. */
-StaticAssertDecl(offsetof(ClusterPcmResourceXMasterState, bootstrap_priority) == 304,
-				 "inactive master scan must retain its fixed 304-byte read bound");
-
-static bool
-pcm_resource_x_inactive_header_zero(const ClusterPcmResourceXMasterState *state)
-{
-	static const unsigned char
-		empty_header[offsetof(ClusterPcmResourceXMasterState, bootstrap_priority)];
-
-	return memcmp(state, empty_header, sizeof(empty_header)) == 0;
-}
-
+/* Inactive bodies are zeroed and checked before registry publication. Bounded
+ * scans trust that lifecycle transition and read only the dense registry,
+ * avoiding one master-state page touch per inactive slot. */
 static void
 pcm_resource_x_assert_zero_body(const ClusterPcmResourceXMasterState *state pg_attribute_unused())
 {
@@ -9276,10 +9265,12 @@ pcm_normal_stop_scan(bool require_pi_retired, bool retire_pi, BufferTag *tag_out
 	 * No diagnostic slot count participates in this proof. */
 	for (uint32 slot = 0; slot < (uint32)pcm_grd_effective; slot++) {
 		const ClusterPcmResourceXSlot *registry = &cluster_pcm_resource_x_slots[slot];
-		const ClusterPcmResourceXMasterState *state = &cluster_pcm_resource_x_master_states[slot];
 		bool invalid = false;
 
 		if (registry->state == PCM_REGISTRY_LIVE) {
+			const ClusterPcmResourceXMasterState *state
+				= &cluster_pcm_resource_x_master_states[slot];
+
 			entry
 				= (struct GrdEntry *)hash_search(cluster_pcm_htab, &registry->tag, HASH_FIND, NULL);
 			invalid = entry == NULL || registry->reserved != 0 || registry->binding_generation == 0
@@ -9290,14 +9281,12 @@ pcm_normal_stop_scan(bool require_pi_retired, bool retire_pi, BufferTag *tag_out
 						  && (entry->registry_slot != slot
 							  || entry->binding_generation != registry->binding_generation));
 		} else if (registry->state == PCM_REGISTRY_EMPTY) {
-			invalid = memcmp(registry, &empty_slot, sizeof(*registry)) != 0
-					  || !pcm_resource_x_inactive_header_zero(state);
+			invalid = memcmp(registry, &empty_slot, sizeof(*registry)) != 0;
 		} else if (registry->state == PCM_REGISTRY_TOMBSTONE) {
 			invalid = registry->reserved != 0 || registry->binding_generation == 0
 					  || registry->binding_generation == UINT64_MAX
 					  || registry->retired_authority_generation == 0
-					  || registry->retired_authority_generation == UINT64_MAX
-					  || !pcm_resource_x_inactive_header_zero(state);
+					  || registry->retired_authority_generation == UINT64_MAX;
 		} else
 			invalid = true;
 		if (invalid && result == CLUSTER_NORMAL_STOP_INVALID)
@@ -11610,16 +11599,14 @@ pcm_pi_relation_scan_role(RelFileLocator locator, uint64 formation, uint32 budge
 	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
 	for (; position < end; position++) {
 		const ClusterPcmResourceXSlot *slot = &cluster_pcm_resource_x_slots[position];
-		const ClusterPcmResourceXMasterState *state
-			= &cluster_pcm_resource_x_master_states[position];
+		const ClusterPcmResourceXMasterState *state;
 		struct GrdEntry *entry;
 		bool active, retained, valid, pending = false, only_local_pi = false;
 		uint32 mode, s_holders, pi_holders;
 		uint32 predicate_mask = 0, pending_projection = 0;
 
 		if (slot->state == PCM_REGISTRY_EMPTY) {
-			if (memcmp(slot, &empty_slot, sizeof(*slot)) != 0
-				|| !pcm_resource_x_inactive_header_zero(state))
+			if (memcmp(slot, &empty_slot, sizeof(*slot)) != 0)
 				goto invalid;
 			continue;
 		}
@@ -11628,11 +11615,11 @@ pcm_pi_relation_scan_role(RelFileLocator locator, uint64 formation, uint32 budge
 			goto invalid;
 		if (slot->state == PCM_REGISTRY_TOMBSTONE) {
 			if (slot->retired_authority_generation == 0
-				|| slot->retired_authority_generation == UINT64_MAX
-				|| !pcm_resource_x_inactive_header_zero(state))
+				|| slot->retired_authority_generation == UINT64_MAX)
 				goto invalid;
 			continue;
 		}
+		state = &cluster_pcm_resource_x_master_states[position];
 		if (slot->state != PCM_REGISTRY_LIVE || slot->retired_authority_generation != 0
 			|| state->binding_generation != slot->binding_generation)
 			goto invalid;
