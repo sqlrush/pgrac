@@ -3193,8 +3193,10 @@ GetOldestActiveTransactionId(void)
 bool
 ProcArrayGetActiveFullXidSample(FullTransactionId *reference_full,
 							   FullTransactionId *future_full,
-							   FullTransactionId *active_min)
+							   FullTransactionId *active_min,
+							   ClusterXidStripeSampleFence *lease_fence)
 {
+	ClusterXidStripeSampleFence fence;
 	FullTransactionId reference;
 	FullTransactionId future;
 	FullTransactionId minimum;
@@ -3207,7 +3209,9 @@ ProcArrayGetActiveFullXidSample(FullTransactionId *reference_full,
 		*future_full = InvalidFullTransactionId;
 	if (active_min != NULL)
 		*active_min = InvalidFullTransactionId;
-	if (reference_full == NULL || future_full == NULL || active_min == NULL ||
+	if (lease_fence != NULL)
+		MemSet(lease_fence, 0, sizeof(*lease_fence));
+	if (reference_full == NULL || future_full == NULL || active_min == NULL || lease_fence == NULL ||
 		reference_full == future_full || reference_full == active_min || future_full == active_min ||
 		RecoveryInProgress() || procArray == NULL || ProcGlobal == NULL ||
 		ProcGlobal->xids == NULL || ShmemVariableCache == NULL)
@@ -3219,7 +3223,7 @@ ProcArrayGetActiveFullXidSample(FullTransactionId *reference_full,
 	reference = ShmemVariableCache->nextXid;
 	valid = FullTransactionIdIsValid(reference) &&
 		TransactionIdIsNormal(XidFromFullTransactionId(reference)) &&
-		cluster_xid_stripe_sample_future(reference, &future);
+		cluster_xid_stripe_sample_future(reference, &future, &fence);
 	LWLockRelease(XidGenLock);
 	if (!valid || !FullTransactionIdIsValid(future) ||
 		!TransactionIdIsNormal(XidFromFullTransactionId(future)) ||
@@ -3262,6 +3266,7 @@ ProcArrayGetActiveFullXidSample(FullTransactionId *reference_full,
 	*reference_full = reference;
 	*future_full = future;
 	*active_min = minimum;
+	*lease_fence = fence;
 	return true;
 }
 #endif

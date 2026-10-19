@@ -153,10 +153,27 @@ extern void cluster_mxid_stripe_lazy_latch(void);
  */
 extern FullTransactionId cluster_xid_stripe_my_slot_floor(void);
 
-/* Read-only future input. Caller holds XidGenLock while capturing reference;
- * false clears *future. No allocation, waiting for a lease, or F publication. */
-extern bool cluster_xid_stripe_sample_future(FullTransactionId reference,
-											 FullTransactionId *future);
+/* Volatile observation of the original activation/claim and durable lease.
+ * Same-incarnation extensions preserve the captured interval. This is only a
+ * component of the full admission/cohort fence, never freeze authority. */
+typedef struct ClusterXidStripeSampleFence {
+	uint64 activation_floor_full;
+	uint64 activation_epoch;
+	uint64 activation_generation;
+	uint64 slot_floor_full;
+	uint64 slot_owner_incarnation;
+	uint64 incarnation;
+	uint64 lease_floor_full;
+	uint64 lease_limit_full;
+	int slot;
+} ClusterXidStripeSampleFence;
+
+/* Caller holds XidGenLock while capturing reference. Failure clears both
+ * outputs. No allocation, lease wait, or F publication. */
+extern bool cluster_xid_stripe_sample_future(FullTransactionId reference, FullTransactionId *future,
+											 ClusterXidStripeSampleFence *fence);
+/* Call after releasing native/census locks; no XidGenLock is required. */
+extern bool cluster_xid_stripe_sample_fence_current(const ClusterXidStripeSampleFence *fence);
 /* Shared allocation consumes only majority-durable reservations. Waiting
  * callers must release XidGenLock and rederive the candidate on return. */
 extern bool cluster_xid_stripe_lease_ready(FullTransactionId candidate);

@@ -8102,6 +8102,7 @@ test_cluster_pgproc_active_sample.inc: $(top_srcdir)/src/backend/access/transam/
 
 test_cluster_pgproc_active_sample: test_cluster_pgproc_active_sample.c unit_test.h \
 		test_cluster_pgproc_active_types.inc test_cluster_pgproc_active_sample.inc \
+		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
 		$(top_srcdir)/src/include/storage/procarray.h \
 		$(top_builddir)/src/backend/cluster/cluster_xid_stripe.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
@@ -8114,6 +8115,7 @@ test_cluster_undo_cleaner_capacity: test_cluster_undo_cleaner_capacity.c test_cl
 		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
 		$(top_srcdir)/src/include/storage/procarray.h \
+		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
 		$(top_srcdir)/src/include/miscadmin.h unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
@@ -8738,15 +8740,17 @@ test_cluster_xid_stripe_evidence.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     /^cluster_xid_stripe_herding_floor\(/ { print "FullTransactionId"; emit=1; floor++ } \
 	     /^cluster_xid_stripe_lease_ready\(/ { print "bool"; emit=1; ready++ } \
 	     /^cluster_xid_stripe_sample_future\(/ { print "bool"; emit=1; future++ } \
+	     /^cluster_xid_stripe_sample_fence_current\(/ { print "bool"; emit=1; fence++ } \
 	     /^cluster_xid_stripe_window_exceeded\(/ { print "bool"; emit=1; window++ } \
 	     /^cluster_xid_wrap_barrier_passed\(/ { print "bool"; emit=1; wrap++ } \
 	     /^cluster_xid_stripe_wait_lease\(/ { print "void"; emit=1; wait++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (history != 5 || lookup != 1 || types != 2 || zero != 1 || reads != 2 || leases != 1 || pointer != 1 || actions != 2 || ready != 1 || future != 1 || window != 1 || wrap != 1 || boots != 1 || bootptr != 1 || writers != 2 || herd != 1 || floor != 1 || wait != 1) exit 1 }' $< > $@.tmp
+	     END { if (history != 5 || lookup != 1 || types != 2 || zero != 1 || reads != 2 || leases != 1 || pointer != 1 || actions != 2 || ready != 1 || future != 1 || fence != 1 || window != 1 || wrap != 1 || boots != 1 || bootptr != 1 || writers != 2 || herd != 1 || floor != 1 || wait != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_xid_stripe_evidence: test_cluster_xid_stripe_evidence.c unit_test.h \
-		test_cluster_xid_stripe_evidence.inc $(CLUSTER_XID_STRIPE_O)
+		test_cluster_xid_stripe_evidence.inc $(CLUSTER_XID_STRIPE_O) \
+		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_xid_stripe: test_cluster_xid_stripe.c unit_test.h \

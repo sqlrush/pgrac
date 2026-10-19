@@ -40,15 +40,22 @@ static unsigned lock_phase, lock_errors;
 static bool held, recovering, allocate_after_n;
 static FullTransactionId future_override;
 static bool future_unavailable;
+static ClusterXidStripeSampleFence sample_fence;
+static uint64 lease_incarnation;
+static bool change_lease_after_n;
 
 bool
-cluster_xid_stripe_sample_future(FullTransactionId reference, FullTransactionId *future)
+cluster_xid_stripe_sample_future(FullTransactionId reference, FullTransactionId *future,
+								 ClusterXidStripeSampleFence *fence)
 {
 	if (!held || lock_phase != 1)
 		lock_errors++;
 	*future = future_unavailable						  ? InvalidFullTransactionId
 			  : FullTransactionIdIsValid(future_override) ? future_override
 														  : reference;
+	MemSet(fence, 0, sizeof(*fence));
+	if (!future_unavailable)
+		fence->incarnation = lease_incarnation;
 	return !future_unavailable;
 }
 
@@ -76,6 +83,8 @@ LWLockRelease(LWLock *lock)
 		lock_errors++;
 	held = false;
 	lock_phase++;
+	if (lock == XidGenLock && change_lease_after_n)
+		lease_incarnation++;
 	if (lock == XidGenLock && allocate_after_n) {
 		/* A later allocation is visible at the ProcArray cut, but N stays fixed. */
 		visible_xids[0] = 101;
@@ -110,6 +119,9 @@ reset_fixture(void)
 	lock_phase = lock_errors = 0;
 	held = recovering = allocate_after_n = future_unavailable = false;
 	future_override = InvalidFullTransactionId;
+	MemSet(&sample_fence, 0, sizeof(sample_fence));
+	lease_incarnation = 31;
+	change_lease_after_n = false;
 }
 
 UT_TEST(test_empty_array_retains_one_captured_n)
@@ -117,7 +129,7 @@ UT_TEST(test_empty_array_retains_one_captured_n)
 	FullTransactionId n, future, minimum;
 
 	reset_fixture();
-	UT_ASSERT(ProcArrayGetActiveFullXidSample(&n, &future, &minimum));
+	UT_ASSERT(ProcArrayGetActiveFullXidSample(&n, &future, &minimum, &sample_fence));
 	UT_ASSERT_EQ(U64FromFullTransactionId(n), (UINT64CONST(7) << 32) + 100);
 	UT_ASSERT_EQ(U64FromFullTransactionId(minimum), U64FromFullTransactionId(n));
 	UT_ASSERT_EQ(lock_phase, 4);
@@ -139,7 +151,7 @@ UT_TEST(test_prepared_vacuum_and_other_database_top_xids_are_included)
 		entries[2].databaseId = 999;
 		for (int i = 0; i < 3; i++)
 			visible_xids[i] = i == oldest ? 50 : 90;
-		UT_ASSERT(ProcArrayGetActiveFullXidSample(&n, &future, &minimum));
+		UT_ASSERT(ProcArrayGetActiveFullXidSample(&n, &future, &minimum, &sample_fence));
 		UT_ASSERT_EQ(U64FromFullTransactionId(minimum), (UINT64CONST(7) << 32) + 50);
 		UT_ASSERT_EQ(lock_phase, 4);
 		UT_ASSERT_EQ(lock_errors, 0);
@@ -155,12 +167,12 @@ UT_TEST(test_previous_epoch_and_post_n_allocation_use_same_anchor)
 	array.numProcs = 2;
 	visible_xids[0] = UINT32_MAX - 20;
 	visible_xids[1] = 70;
-	UT_ASSERT(ProcArrayGetActiveFullXidSample(&n, &future, &minimum));
+	UT_ASSERT(ProcArrayGetActiveFullXidSample(&n, &future, &minimum, &sample_fence));
 	UT_ASSERT_EQ(U64FromFullTransactionId(minimum), (UINT64CONST(6) << 32) + UINT32_MAX - 20);
 	reset_fixture();
 	array.numProcs = 1;
 	allocate_after_n = true;
-	UT_ASSERT(ProcArrayGetActiveFullXidSample(&n, &future, &minimum));
+	UT_ASSERT(ProcArrayGetActiveFullXidSample(&n, &future, &minimum, &sample_fence));
 	UT_ASSERT_EQ(U64FromFullTransactionId(n), (UINT64CONST(7) << 32) + 100);
 	UT_ASSERT_EQ(U64FromFullTransactionId(minimum), U64FromFullTransactionId(n));
 	UT_ASSERT_EQ(XidFromFullTransactionId(variables.nextXid), 102);
@@ -189,7 +201,7 @@ UT_TEST(test_unprovable_xid_clears_whole_sample_and_releases_locks)
 			visible_xids[0] = UINT32_MAX - 20;
 			visible_xids[1] = 100;
 		}
-		UT_ASSERT(!ProcArrayGetActiveFullXidSample(&n, &future, &minimum));
+		UT_ASSERT(!ProcArrayGetActiveFullXidSample(&n, &future, &minimum, &sample_fence));
 		UT_ASSERT(!FullTransactionIdIsValid(n));
 		UT_ASSERT(!FullTransactionIdIsValid(future));
 		UT_ASSERT(!FullTransactionIdIsValid(minimum));
@@ -218,7 +230,7 @@ UT_TEST(test_invalid_reference_or_array_never_returns_a_sample)
 			ProcGlobal = NULL;
 		if (fault == 7)
 			procs.xids = NULL;
-		UT_ASSERT(!ProcArrayGetActiveFullXidSample(&n, &future, &minimum));
+		UT_ASSERT(!ProcArrayGetActiveFullXidSample(&n, &future, &minimum, &sample_fence));
 		UT_ASSERT(!FullTransactionIdIsValid(n));
 		UT_ASSERT(!FullTransactionIdIsValid(future));
 		UT_ASSERT(!FullTransactionIdIsValid(minimum));
@@ -234,18 +246,18 @@ UT_TEST(test_recovery_and_missing_outputs_do_not_sample)
 
 	reset_fixture();
 	recovering = true;
-	UT_ASSERT(!ProcArrayGetActiveFullXidSample(&n, &future, &minimum));
+	UT_ASSERT(!ProcArrayGetActiveFullXidSample(&n, &future, &minimum, &sample_fence));
 	UT_ASSERT(!FullTransactionIdIsValid(n));
 	UT_ASSERT(!FullTransactionIdIsValid(future));
 	UT_ASSERT(!FullTransactionIdIsValid(minimum));
 	UT_ASSERT_EQ(lock_phase, 0);
 	recovering = false;
-	UT_ASSERT(!ProcArrayGetActiveFullXidSample(NULL, &future, &minimum));
-	UT_ASSERT(!ProcArrayGetActiveFullXidSample(&n, &future, NULL));
-	UT_ASSERT(!ProcArrayGetActiveFullXidSample(&n, NULL, &minimum));
-	UT_ASSERT(!ProcArrayGetActiveFullXidSample(&n, &n, &minimum));
-	UT_ASSERT(!ProcArrayGetActiveFullXidSample(&n, &future, &future));
-	UT_ASSERT(!ProcArrayGetActiveFullXidSample(&n, &future, &n));
+	UT_ASSERT(!ProcArrayGetActiveFullXidSample(NULL, &future, &minimum, &sample_fence));
+	UT_ASSERT(!ProcArrayGetActiveFullXidSample(&n, &future, NULL, &sample_fence));
+	UT_ASSERT(!ProcArrayGetActiveFullXidSample(&n, NULL, &minimum, &sample_fence));
+	UT_ASSERT(!ProcArrayGetActiveFullXidSample(&n, &n, &minimum, &sample_fence));
+	UT_ASSERT(!ProcArrayGetActiveFullXidSample(&n, &future, &future, &sample_fence));
+	UT_ASSERT(!ProcArrayGetActiveFullXidSample(&n, &future, &n, &sample_fence));
 	UT_ASSERT_EQ(lock_phase, 0);
 }
 
@@ -255,7 +267,7 @@ UT_TEST(test_durable_future_advances_idle_minimum_but_retains_old_top)
 
 	reset_fixture();
 	future_override = FullTransactionIdFromEpochAndXid(7, 500);
-	UT_ASSERT(ProcArrayGetActiveFullXidSample(&n, &future, &minimum));
+	UT_ASSERT(ProcArrayGetActiveFullXidSample(&n, &future, &minimum, &sample_fence));
 	UT_ASSERT_EQ(XidFromFullTransactionId(n), 100);
 	UT_ASSERT_EQ(XidFromFullTransactionId(minimum), 500);
 	UT_ASSERT_EQ(U64FromFullTransactionId(future), U64FromFullTransactionId(future_override));
@@ -264,7 +276,7 @@ UT_TEST(test_durable_future_advances_idle_minimum_but_retains_old_top)
 	future_override = FullTransactionIdFromEpochAndXid(7, 500);
 	array.numProcs = 1;
 	visible_xids[0] = 90;
-	UT_ASSERT(ProcArrayGetActiveFullXidSample(&n, &future, &minimum));
+	UT_ASSERT(ProcArrayGetActiveFullXidSample(&n, &future, &minimum, &sample_fence));
 	UT_ASSERT_EQ(XidFromFullTransactionId(minimum), 90);
 	UT_ASSERT_EQ(lock_errors, 0);
 }
@@ -275,7 +287,7 @@ UT_TEST(test_unavailable_future_refuses_before_pgproc_scan)
 
 	reset_fixture();
 	future_unavailable = true;
-	UT_ASSERT(!ProcArrayGetActiveFullXidSample(&n, &future, &minimum));
+	UT_ASSERT(!ProcArrayGetActiveFullXidSample(&n, &future, &minimum, &sample_fence));
 	UT_ASSERT(!FullTransactionIdIsValid(n));
 	UT_ASSERT(!FullTransactionIdIsValid(future));
 	UT_ASSERT(!FullTransactionIdIsValid(minimum));
@@ -284,10 +296,39 @@ UT_TEST(test_unavailable_future_refuses_before_pgproc_scan)
 	UT_ASSERT(!held);
 }
 
+UT_TEST(test_lease_fence_is_from_same_n_cut_and_failure_clears_it)
+{
+	FullTransactionId n, future, minimum;
+	ClusterXidStripeSampleFence empty = { 0 };
+
+	reset_fixture();
+	change_lease_after_n = true;
+	UT_ASSERT(ProcArrayGetActiveFullXidSample(&n, &future, &minimum, &sample_fence));
+	UT_ASSERT_EQ(sample_fence.incarnation, 31);
+	UT_ASSERT_EQ(lease_incarnation, 32);
+	UT_ASSERT_EQ(lock_errors, 0);
+
+	reset_fixture();
+	sample_fence.incarnation = 99;
+	array.numProcs = 1;
+	visible_xids[0] = FrozenTransactionId;
+	UT_ASSERT(!ProcArrayGetActiveFullXidSample(&n, &future, &minimum, &sample_fence));
+	UT_ASSERT_EQ(memcmp(&sample_fence, &empty, sizeof(empty)), 0);
+	UT_ASSERT(!FullTransactionIdIsValid(n));
+	UT_ASSERT(!FullTransactionIdIsValid(future));
+	UT_ASSERT(!FullTransactionIdIsValid(minimum));
+	UT_ASSERT_EQ(lock_errors, 0);
+	UT_ASSERT(!held);
+
+	reset_fixture();
+	UT_ASSERT(!ProcArrayGetActiveFullXidSample(&n, &future, &minimum, NULL));
+	UT_ASSERT_EQ(lock_phase, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
 	UT_RUN(test_empty_array_retains_one_captured_n);
 	UT_RUN(test_prepared_vacuum_and_other_database_top_xids_are_included);
 	UT_RUN(test_previous_epoch_and_post_n_allocation_use_same_anchor);
@@ -296,6 +337,7 @@ main(void)
 	UT_RUN(test_recovery_and_missing_outputs_do_not_sample);
 	UT_RUN(test_durable_future_advances_idle_minimum_but_retains_old_top);
 	UT_RUN(test_unavailable_future_refuses_before_pgproc_scan);
+	UT_RUN(test_lease_fence_is_from_same_n_cut_and_failure_clears_it);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -55,6 +55,7 @@ static unsigned prepares, sleeps, cancels, wait_action;
 static bool postmaster_alive = true;
 static uint64 incarnation = 81;
 static bool outside_qvotec;
+static ClusterXidStripeSampleFence sample_fence;
 static bool in_quorum = true;
 static bool xid_lock_held, change_inc_on_release;
 static LWLockPadded locks[NUM_INDIVIDUAL_LWLOCKS];
@@ -986,23 +987,27 @@ UT_TEST(future_requires_majority_and_current_lease_incarnation)
 	UT_ASSERT_EQ(read_rows(&out, false), STRIPE_READ_VALID);
 	allowed_writes = 1;
 	stripe_lease_tick(disks, 3, local_next);
-	UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future));
+	UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+												&sample_fence));
 	UT_ASSERT(!FullTransactionIdIsValid(future));
 	allowed_writes = 3;
 	writes = 0;
 	stripe_lease_tick(disks, 3, local_next);
 	writes_before = writes;
-	UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future));
+	UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+											   &sample_fence));
 	UT_ASSERT_EQ(U64FromFullTransactionId(future), 2052);
 	UT_ASSERT_EQ(writes, writes_before);
 	UT_ASSERT_EQ(local_next, 2052);
 	UT_ASSERT(boot.my_owner_incarnation != incarnation);
 	incarnation++;
-	UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future));
+	UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+												&sample_fence));
 	UT_ASSERT(!FullTransactionIdIsValid(future));
 	writes = 0;
 	stripe_lease_tick(disks, 3, local_next);
-	UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future));
+	UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+											   &sample_fence));
 	UT_ASSERT_EQ(U64FromFullTransactionId(future), pg_atomic_read_u64(&lease.floor_full));
 }
 
@@ -1014,7 +1019,8 @@ UT_TEST(future_uses_shared_incarnation_outside_qvotec)
 	outside_qvotec = true;
 	UT_ASSERT_EQ(cluster_qvotec_self_incarnation_value(), 0);
 	UT_ASSERT_EQ(cluster_qvotec_get_self_incarnation(), incarnation);
-	UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future));
+	UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+											   &sample_fence));
 	UT_ASSERT_EQ(U64FromFullTransactionId(future), local_next);
 }
 
@@ -1026,15 +1032,19 @@ UT_TEST(future_clamps_original_floors_without_changing_allocation)
 	prepare_future_lease();
 	writes_before = writes;
 	boot.floor_full = 2055;
-	UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(2052), &future));
+	UT_ASSERT(
+		cluster_xid_stripe_sample_future(FullTransactionIdFromU64(2052), &future, &sample_fence));
 	UT_ASSERT_EQ(U64FromFullTransactionId(future), 2068);
 	boot.my_slot_floor_full = 2080;
-	UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(2052), &future));
+	UT_ASSERT(
+		cluster_xid_stripe_sample_future(FullTransactionIdFromU64(2052), &future, &sample_fence));
 	UT_ASSERT_EQ(U64FromFullTransactionId(future), 2084);
 	pg_atomic_write_u64(&boot.herding_floor_full, 2101);
-	UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(2052), &future));
+	UT_ASSERT(
+		cluster_xid_stripe_sample_future(FullTransactionIdFromU64(2052), &future, &sample_fence));
 	UT_ASSERT_EQ(U64FromFullTransactionId(future), 2116);
-	UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(2120), &future));
+	UT_ASSERT(
+		cluster_xid_stripe_sample_future(FullTransactionIdFromU64(2120), &future, &sample_fence));
 	UT_ASSERT_EQ(U64FromFullTransactionId(future), 2132);
 	UT_ASSERT_EQ(local_next, 2052);
 	UT_ASSERT_EQ(writes, writes_before);
@@ -1114,11 +1124,13 @@ UT_TEST(future_refuses_missing_or_changing_authority)
 			change_inc_on_release = true;
 			break;
 		}
-		UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future));
+		UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+													&sample_fence));
 		UT_ASSERT(!FullTransactionIdIsValid(future));
 	}
 	prepare_future_lease();
-	UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), NULL));
+	UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), NULL,
+												&sample_fence));
 }
 
 UT_TEST(future_retains_lease_bounds_wrap_and_window_guards)
@@ -1127,28 +1139,159 @@ UT_TEST(future_retains_lease_bounds_wrap_and_window_guards)
 
 	prepare_future_lease();
 	UT_ASSERT(!cluster_xid_stripe_sample_future(
-		FullTransactionIdFromU64(pg_atomic_read_u64(&lease.limit_full)), &future));
+		FullTransactionIdFromU64(pg_atomic_read_u64(&lease.limit_full)), &future, &sample_fence));
 	UT_ASSERT(!FullTransactionIdIsValid(future));
-	UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(UINT64_MAX), &future));
+	UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(UINT64_MAX), &future,
+												&sample_fence));
 	UT_ASSERT(!FullTransactionIdIsValid(future));
 	for (uint64 special = 0; special < FirstNormalTransactionId; special++) {
-		UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(special), &future));
+		UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(special), &future,
+													&sample_fence));
 		UT_ASSERT(!FullTransactionIdIsValid(future));
 	}
 	pg_atomic_write_u64(&boot.cluster_min_active_hwm, 1);
 	cluster_xid_herding_slack = 1;
-	UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future));
+	UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+												&sample_fence));
 	UT_ASSERT(!FullTransactionIdIsValid(future));
 	cluster_xid_herding_slack = 4194304;
 	pg_atomic_write_u64(&lease.floor_full, (uint64)UINT32_MAX - 32);
 	pg_atomic_write_u64(&lease.limit_full, (uint64)UINT32_MAX + 32);
 	pg_atomic_write_u32(&boot.wrap_barrier_done, 0);
-	UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(UINT32_MAX - 1), &future));
+	UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(UINT32_MAX - 1), &future,
+												&sample_fence));
 	UT_ASSERT(!FullTransactionIdIsValid(future));
 	pg_atomic_write_u32(&boot.wrap_barrier_done, 1);
 	pg_atomic_write_u64(&boot.cluster_min_active_hwm, 0);
-	UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(UINT32_MAX - 1), &future));
+	UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(UINT32_MAX - 1), &future,
+											   &sample_fence));
 	UT_ASSERT_EQ(U64FromFullTransactionId(future), (UINT64CONST(1) << 32) + 4);
+}
+
+UT_TEST(sample_fence_keeps_original_durable_interval_across_renewal)
+{
+	FullTransactionId future;
+	ClusterXidStripeSampleFence saved;
+	unsigned writes_before;
+
+	prepare_future_lease();
+	outside_qvotec = true;
+	UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+											   &sample_fence));
+	saved = sample_fence;
+	UT_ASSERT_EQ(saved.incarnation, incarnation);
+	UT_ASSERT_EQ(saved.activation_generation, boot.generation);
+	UT_ASSERT_EQ(saved.slot_owner_incarnation, boot.my_owner_incarnation);
+	UT_ASSERT_EQ(saved.lease_limit_full, pg_atomic_read_u64(&lease.limit_full));
+	writes_before = writes;
+	UT_ASSERT(cluster_xid_stripe_sample_fence_current(&saved));
+	UT_ASSERT_EQ(writes, writes_before);
+	/* Use the real sole publisher to extend the same durable promise. */
+	outside_qvotec = false;
+	writes = 0;
+	stripe_lease_tick(disks, 3, saved.lease_limit_full);
+	UT_ASSERT(pg_atomic_read_u64(&lease.limit_full) > saved.lease_limit_full);
+	UT_ASSERT(cluster_xid_stripe_sample_fence_current(&saved));
+	UT_ASSERT_EQ(memcmp(&sample_fence, &saved, sizeof(saved)), 0);
+}
+
+UT_TEST(sample_fence_rejects_replaced_or_revoked_authority)
+{
+	for (unsigned fault = 0; fault < 21; fault++) {
+		FullTransactionId future;
+		ClusterXidStripeSampleFence saved;
+
+		prepare_future_lease();
+		UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+												   &saved));
+		switch (fault) {
+		case 0:
+			incarnation++;
+			break;
+		case 1:
+			in_quorum = false;
+			break;
+		case 2:
+			pg_atomic_write_u32(&lease.failed, 1);
+			break;
+		case 3:
+			pg_atomic_write_u64(&lease.limit_full, 0);
+			break;
+		case 4:
+			pg_atomic_write_u64(&lease.limit_full, saved.lease_limit_full - 1);
+			break;
+		case 5:
+			pg_atomic_write_u64(&lease.floor_full, saved.lease_floor_full + 16);
+			break;
+		case 6:
+			pg_atomic_write_u64(&lease.published_incarnation, incarnation + 1);
+			break;
+		case 7:
+			boot.floor_full++;
+			break;
+		case 8:
+			boot.epoch++;
+			break;
+		case 9:
+			boot.generation++;
+			break;
+		case 10:
+			boot.my_slot_floor_full++;
+			break;
+		case 11:
+			boot.my_owner_incarnation++;
+			break;
+		case 12:
+			boot.my_slot_claimed = false;
+			break;
+		case 13:
+			boot.slot_state = CLUSTER_XID_STRIPE_SLOT_ABSENT;
+			break;
+		case 14:
+			boot.disk_state = CLUSTER_XID_STRIPE_DISK_ABSENT;
+			break;
+		case 15:
+			cluster_node_id++;
+			break;
+		case 16:
+			cluster_enabled = false;
+			break;
+		case 17:
+			cluster_shared_catalog = false;
+			break;
+		case 18:
+			cluster_xid_striping = false;
+			break;
+		case 19:
+			StripeBootShmem = NULL;
+			break;
+		case 20:
+			StripeLease = NULL;
+			break;
+		}
+		UT_ASSERT(!cluster_xid_stripe_sample_fence_current(&saved));
+	}
+}
+
+UT_TEST(sample_fence_failure_clears_outputs_and_refuses_empty_fence)
+{
+	FullTransactionId future;
+	ClusterXidStripeSampleFence empty = { 0 };
+
+	prepare_future_lease();
+	UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+											   &sample_fence));
+	in_quorum = false;
+	UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+												&sample_fence));
+	UT_ASSERT(!FullTransactionIdIsValid(future));
+	UT_ASSERT_EQ(memcmp(&sample_fence, &empty, sizeof(empty)), 0);
+	in_quorum = true;
+	UT_ASSERT(!cluster_xid_stripe_sample_fence_current(NULL));
+	UT_ASSERT(!cluster_xid_stripe_sample_fence_current(&empty));
+	UT_ASSERT(
+		!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future, NULL));
+	UT_ASSERT(!FullTransactionIdIsValid(future));
 }
 
 int
@@ -1160,7 +1303,7 @@ main(void)
 		if (disks[i] < 0 || unlink(path) != 0)
 			abort();
 	}
-	UT_PLAN(30);
+	UT_PLAN(33);
 	UT_RUN(coherent_tracking_and_retirement_choose_latest);
 	UT_RUN(equal_generation_disagreement_refuses_in_either_order);
 	UT_RUN(newer_record_cannot_replace_claim_identity);
@@ -1191,6 +1334,9 @@ main(void)
 	UT_RUN(future_clamps_original_floors_without_changing_allocation);
 	UT_RUN(future_refuses_missing_or_changing_authority);
 	UT_RUN(future_retains_lease_bounds_wrap_and_window_guards);
+	UT_RUN(sample_fence_keeps_original_durable_interval_across_renewal);
+	UT_RUN(sample_fence_rejects_replaced_or_revoked_authority);
+	UT_RUN(sample_fence_failure_clears_outputs_and_refuses_empty_fence);
 	for (int i = 0; i < 3; i++)
 		close(disks[i]);
 	UT_DONE();

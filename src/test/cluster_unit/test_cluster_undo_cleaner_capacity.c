@@ -67,6 +67,7 @@ static unsigned test_census_begins, test_census_steps, test_reference_reads;
 static FullTransactionId test_reference, test_pgproc_min, test_future;
 static unsigned test_pgproc_samples;
 static bool test_pgproc_invalid;
+static bool test_lease_current;
 static bool test_census_busy, test_census_invalid;
 bool cluster_undo_record_segment_commit_on_rollover;
 int cluster_undo_cleaner_batch_segments = 8;
@@ -101,19 +102,32 @@ ReadNextFullTransactionId(void)
 /* The actual native sampler is executed in test_cluster_pgproc_active_sample. */
 bool
 ProcArrayGetActiveFullXidSample(FullTransactionId *reference, FullTransactionId *future,
-								FullTransactionId *minimum)
+								FullTransactionId *minimum, ClusterXidStripeSampleFence *fence)
 {
 	if (test_lock_depth != 0 || test_ctrc_passes <= test_pgproc_samples)
 		abort();
 	test_pgproc_samples++;
+	MemSet(fence, 0, sizeof(*fence));
+	fence->incarnation = test_pgproc_samples;
 	*reference = ReadNextFullTransactionId();
 	*future = FullTransactionIdIsValid(test_future) ? test_future : *reference;
 	*minimum = FullTransactionIdIsValid(test_pgproc_min) ? test_pgproc_min : *future;
 	if (test_pgproc_invalid) {
 		*reference = *future = *minimum = InvalidFullTransactionId;
+		MemSet(fence, 0, sizeof(*fence));
 		return false;
 	}
 	return true;
+}
+
+/* The original stripe predicate is executed in test_cluster_xid_stripe_evidence.
+ * Here the boundary enforces the same start token and no overlapping locks. */
+bool
+cluster_xid_stripe_sample_fence_current(const ClusterXidStripeSampleFence *fence)
+{
+	if (test_lock_depth != 0 || fence == NULL || fence->incarnation != test_pgproc_samples)
+		abort();
+	return test_lease_current;
 }
 
 bool
@@ -512,6 +526,7 @@ reset_wait_fixture(void)
 	test_census_begins = test_census_steps = test_reference_reads = test_pgproc_samples = 0;
 	test_pgproc_min = test_future = InvalidFullTransactionId;
 	test_pgproc_invalid = false;
+	test_lease_current = true;
 	test_census_busy = test_census_invalid = test_maintenance_cut = test_ctrc_progress = false;
 	test_reference = FullTransactionIdFromEpochAndXid(7, 100);
 	MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
@@ -923,6 +938,35 @@ UT_TEST(test_pgproc_and_future_are_captured_once_for_the_whole_census_round)
 				 U64FromFullTransactionId(test_pgproc_min));
 }
 
+UT_TEST(test_changed_lease_cannot_complete_old_census_sample)
+{
+	bool remaining;
+
+	reset_wait_fixture();
+	undo_cleaner_worker = 0;
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.status, CTRC_ACTIVE_SCAN_INCOMPLETE);
+	test_lease_current = false;
+	test_ctrc_progress = true;
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT_EQ(test_ctrc_passes, 2);
+	UT_ASSERT(remaining);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.status, CTRC_ACTIVE_SCAN_INVALID);
+	UT_ASSERT(!FullTransactionIdIsValid(undo_cleaner_active_scan.min_full));
+	UT_ASSERT(!FullTransactionIdIsValid(undo_cleaner_active_scan.future_full));
+	UT_ASSERT(!undo_cleaner_active_scan_pending);
+	UT_ASSERT_EQ(test_pgproc_samples, 1);
+	UT_ASSERT_EQ(test_gc_passes, 0);
+
+	test_lease_current = true;
+	test_reference = FullTransactionIdFromEpochAndXid(8, 200);
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT_EQ(test_pgproc_samples, 2);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.status, CTRC_ACTIVE_SCAN_INCOMPLETE);
+	UT_ASSERT_EQ(U64FromFullTransactionId(undo_cleaner_active_scan.reference_full),
+				 U64FromFullTransactionId(test_reference));
+}
+
 UT_TEST(test_pgproc_failure_invalidates_old_sample_without_skipping_mandatory_work)
 {
 	bool remaining;
@@ -947,6 +991,7 @@ UT_TEST(test_pgproc_failure_invalidates_old_sample_without_skipping_mandatory_wo
 	UT_ASSERT(!undo_cleaner_active_scan_pending);
 	UT_ASSERT_EQ(test_modifier_entries, 1);
 	test_pgproc_invalid = false;
+	test_lease_current = true;
 	test_pgproc_min = FullTransactionIdFromEpochAndXid(7, 80);
 	(void)undo_cleaner_run_pass(&remaining, false);
 	UT_ASSERT_EQ(test_pgproc_samples, 3);
@@ -958,7 +1003,7 @@ UT_TEST(test_pgproc_failure_invalidates_old_sample_without_skipping_mandatory_wo
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(15);
 	UT_RUN(test_capacity_wait_retries_signals_and_cadence_without_authorizing_free);
 	UT_RUN(test_capacity_every_blocking_hold_refuses_without_sleep);
 	UT_RUN(test_heavyweight_lock_identity_and_mode_are_exact);
@@ -972,6 +1017,7 @@ main(void)
 	UT_RUN(test_census_has_one_worker_and_no_shutdown_or_disabled_continuation);
 	UT_RUN(test_census_invalid_sample_and_respawn_start_from_fresh_reference);
 	UT_RUN(test_pgproc_and_future_are_captured_once_for_the_whole_census_round);
+	UT_RUN(test_changed_lease_cannot_complete_old_census_sample);
 	UT_RUN(test_pgproc_failure_invalidates_old_sample_without_skipping_mandatory_work);
 	free(undo_cleaner_state);
 	UT_DONE();

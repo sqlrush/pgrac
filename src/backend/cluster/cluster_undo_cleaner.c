@@ -78,6 +78,7 @@
 #include "cluster/cluster_undo_record_api.h" /* active segment + advance (D3) */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_undo_cleaner.h"
+#include "cluster/cluster_xid_stripe_boot.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 
@@ -90,6 +91,7 @@
 static UndoCleanerSharedState *undo_cleaner_state = NULL;
 static int undo_cleaner_worker = -1;
 static ClusterCtrcActiveScan undo_cleaner_active_scan;
+static ClusterXidStripeSampleFence undo_cleaner_active_lease_fence;
 static bool undo_cleaner_active_scan_pending;
 
 StaticAssertDecl(CLUSTER_UNDO_CLEANER_WORKER_TYPES == CLUSTER_CTRC_CLEANER_WORKERS,
@@ -483,6 +485,7 @@ undo_cleaner_publish_status(UndoCleanerStatus status)
 	 */
 	if (status == UNDO_CLEANER_SPAWNING) {
 		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
+		MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
 		undo_cleaner_active_scan_pending = false;
 		MemSet(worker, 0, sizeof(*worker));
 		worker->pid = MyProcPid;
@@ -579,6 +582,7 @@ undo_cleaner_run_pass(bool *out_work_remaining, bool maintenance_due)
 
 	if (!cluster_undo_cleaner_enabled || !cluster_storage_mode_enabled()) {
 		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
+		MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
 		return false;
 	}
 
@@ -602,6 +606,7 @@ undo_cleaner_run_pass(bool *out_work_remaining, bool maintenance_due)
 	 * modifier normally; this observation grants no shutdown/park authority. */
 	if (cluster_normal_stop_maintenance_cut()) {
 		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
+		MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
 		return false;
 	}
 	/* Capture N/future then all top/prepared PGPROCs before the census. No
@@ -613,14 +618,25 @@ undo_cleaner_run_pass(bool *out_work_remaining, bool maintenance_due)
 		FullTransactionId active_min;
 
 		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
+		MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
 		undo_cleaner_active_scan.status = CTRC_ACTIVE_SCAN_INVALID;
-		if (ProcArrayGetActiveFullXidSample(&reference, &future, &active_min)
+		if (ProcArrayGetActiveFullXidSample(&reference, &future, &active_min,
+											&undo_cleaner_active_lease_fence)
 			&& cluster_ctrc_active_scan_begin(&undo_cleaner_active_scan, reference)) {
 			undo_cleaner_active_scan.future_full = future;
 			undo_cleaner_active_scan.min_full = active_min;
 		}
 	}
 	cluster_ctrc_active_scan_step(&undo_cleaner_active_scan);
+	/* Recheck after the slice has released every census lock. Never let a
+	 * replacement/revoked lease complete an old native/census observation. */
+	if ((undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_INCOMPLETE
+		 || undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_COMPLETE)
+		&& !cluster_xid_stripe_sample_fence_current(&undo_cleaner_active_lease_fence)) {
+		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
+		MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
+		undo_cleaner_active_scan.status = CTRC_ACTIVE_SCAN_INVALID;
+	}
 	undo_cleaner_active_scan_pending
 		= undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_INCOMPLETE;
 	/* Census continuation must not accelerate optional segment maintenance. */

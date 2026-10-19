@@ -660,14 +660,65 @@ cluster_xid_stripe_lease_ready(FullTransactionId candidate)
 }
 
 /*
+ * Recheck the original promise after a bounded census slice. Lease extensions
+ * keep the same incarnation/floor and contain the captured interval; they do
+ * not force an otherwise conservative sample to restart under allocation load.
+ * A changed activation, claim, publisher or revoked interval does. This is
+ * only the stripe component of the eventual full admission/cohort fence.
+ */
+bool
+cluster_xid_stripe_sample_fence_current(const ClusterXidStripeSampleFence *fence)
+{
+	uint64 limit;
+	bool current;
+
+	if (fence == NULL || !cluster_enabled || !cluster_shared_catalog || !cluster_xid_striping
+		|| StripeBootShmem == NULL || StripeLease == NULL || fence->activation_floor_full == 0
+		|| fence->activation_epoch == 0 || fence->activation_generation == 0
+		|| fence->slot_floor_full == 0 || fence->slot_owner_incarnation == 0
+		|| fence->incarnation == 0 || fence->lease_floor_full == 0
+		|| fence->lease_limit_full <= fence->lease_floor_full || fence->slot < 0
+		|| fence->slot >= CLUSTER_XID_STRIDE || cluster_xid_allocation_slot() != fence->slot
+		|| cluster_qvotec_get_self_incarnation() != fence->incarnation
+		|| !cluster_qvotec_in_quorum())
+		return false;
+
+	LWLockAcquire(&StripeBootShmem->lock, LW_SHARED);
+	current = StripeBootShmem->disk_state == CLUSTER_XID_STRIPE_DISK_PUBLISHED
+			  && StripeBootShmem->floor_full == fence->activation_floor_full
+			  && StripeBootShmem->epoch == fence->activation_epoch
+			  && StripeBootShmem->generation == fence->activation_generation
+			  && StripeBootShmem->slot_state == CLUSTER_XID_STRIPE_SLOT_MINE
+			  && StripeBootShmem->my_slot_claimed
+			  && StripeBootShmem->my_slot_floor_full == fence->slot_floor_full
+			  && StripeBootShmem->my_owner_incarnation == fence->slot_owner_incarnation;
+	limit = pg_atomic_read_u64(&StripeLease->limit_full);
+	pg_read_barrier();
+	current = current && limit >= fence->lease_limit_full
+			  && pg_atomic_read_u64(&StripeLease->floor_full) == fence->lease_floor_full
+			  && pg_atomic_read_u64(&StripeLease->published_incarnation) == fence->incarnation
+			  && pg_atomic_read_u32(&StripeLease->failed) == 0;
+	pg_read_barrier();
+	current = current && pg_atomic_read_u64(&StripeLease->limit_full) >= fence->lease_limit_full
+			  && pg_atomic_read_u64(&StripeLease->floor_full) == fence->lease_floor_full
+			  && pg_atomic_read_u64(&StripeLease->published_incarnation) == fence->incarnation
+			  && pg_atomic_read_u32(&StripeLease->failed) == 0;
+	LWLockRelease(&StripeBootShmem->lock);
+	return current && cluster_qvotec_get_self_incarnation() == fence->incarnation
+		   && cluster_qvotec_in_quorum();
+}
+
+/*
  * Read the existing allocation promises at the same XidGenLock cut as N.
  * This neither allocates nor advances a promise. Claim ownership persists
  * across boots; only the durable lease publisher must match this incarnation.
  * The returned lower bound is an input, not a complete freeze certificate.
  */
 bool
-cluster_xid_stripe_sample_future(FullTransactionId reference, FullTransactionId *future)
+cluster_xid_stripe_sample_future(FullTransactionId reference, FullTransactionId *future,
+								 ClusterXidStripeSampleFence *fence)
 {
+	ClusterXidStripeSampleFence captured = { 0 };
 	uint64 incarnation, floor, limit, base, value;
 	bool claimed;
 	int slot;
@@ -675,9 +726,11 @@ cluster_xid_stripe_sample_future(FullTransactionId reference, FullTransactionId 
 
 	if (future != NULL)
 		*future = InvalidFullTransactionId;
-	if (future == NULL || !LWLockHeldByMe(XidGenLock) || !cluster_enabled || !cluster_shared_catalog
-		|| !cluster_xid_striping || StripeBootShmem == NULL || StripeLease == NULL
-		|| !FullTransactionIdIsValid(reference)
+	if (fence != NULL)
+		MemSet(fence, 0, sizeof(*fence));
+	if (future == NULL || fence == NULL || !LWLockHeldByMe(XidGenLock) || !cluster_enabled
+		|| !cluster_shared_catalog || !cluster_xid_striping || StripeBootShmem == NULL
+		|| StripeLease == NULL || !FullTransactionIdIsValid(reference)
 		|| !TransactionIdIsNormal(XidFromFullTransactionId(reference))
 		|| !cluster_qvotec_in_quorum())
 		return false;
@@ -695,6 +748,11 @@ cluster_xid_stripe_sample_future(FullTransactionId reference, FullTransactionId 
 			  && StripeBootShmem->my_owner_incarnation != 0;
 	base = Max(U64FromFullTransactionId(reference), StripeBootShmem->floor_full);
 	base = Max(base, StripeBootShmem->my_slot_floor_full);
+	captured.activation_floor_full = StripeBootShmem->floor_full;
+	captured.activation_epoch = StripeBootShmem->epoch;
+	captured.activation_generation = StripeBootShmem->generation;
+	captured.slot_floor_full = StripeBootShmem->my_slot_floor_full;
+	captured.slot_owner_incarnation = StripeBootShmem->my_owner_incarnation;
 	LWLockRelease(&StripeBootShmem->lock);
 	if (!claimed)
 		return false;
@@ -717,8 +775,8 @@ cluster_xid_stripe_sample_future(FullTransactionId reference, FullTransactionId 
 		|| (EpochFromFullTransactionId(candidate) > 0 && !cluster_xid_wrap_barrier_passed()))
 		return false;
 
-	/* Reject a revocation or incarnation change observed during this read.
-	 * Later sample completion still needs its own full identity fence. */
+	/* Reject changes observed during this read, then retain the same start
+	 * identity for the worker's later completion check. */
 	pg_read_barrier();
 	if (pg_atomic_read_u32(&StripeLease->failed) != 0
 		|| pg_atomic_read_u64(&StripeLease->limit_full) != limit
@@ -726,7 +784,14 @@ cluster_xid_stripe_sample_future(FullTransactionId reference, FullTransactionId 
 		|| pg_atomic_read_u64(&StripeLease->published_incarnation) != incarnation
 		|| cluster_qvotec_get_self_incarnation() != incarnation || !cluster_qvotec_in_quorum())
 		return false;
+	captured.incarnation = incarnation;
+	captured.slot = slot;
+	captured.lease_floor_full = floor;
+	captured.lease_limit_full = limit;
+	if (!cluster_xid_stripe_sample_fence_current(&captured))
+		return false;
 	*future = candidate;
+	*fence = captured;
 	return true;
 }
 
