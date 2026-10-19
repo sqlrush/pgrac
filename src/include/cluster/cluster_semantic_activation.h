@@ -13,6 +13,7 @@
 #define CLUSTER_SEMANTIC_ACTIVATION_H
 
 #include "c.h"
+#include "cluster/cluster_conf.h"
 #include "common/sha2.h"				  /* PG_SHA256_DIGEST_LENGTH (contract seam) */
 #include "cluster/cluster_control_root.h" /* file token + round (contract seam) */
 #include "cluster/cluster_ic.h"
@@ -148,6 +149,23 @@ typedef struct ClusterSemanticAdmissionToken {
 	uint8 side;
 	bool entered;
 } ClusterSemanticAdmissionToken;
+
+/* Process-local observation only. No modifier debt, persistence, wire identity
+ * or permission to publish a floor. The original publishers retire the cuts;
+ * worker0 discards its sample whenever this saved identity ceases to match. */
+typedef struct ClusterSemanticActiveSampleFence {
+	uint64 system_identifier;
+	uint64 admission_publication_seq;
+	uint64 active_bits;
+	uint64 record_generation;
+	uint64 formation_epoch;
+	uint64 membership_cut_generation;
+	uint64 local_boot_incarnation;
+	uint64 admitted_members_lo;
+	uint64 admitted_members_hi;
+	uint64 admitted_incarnation[CLUSTER_MAX_NODES];
+	int32 local_node_id;
+} ClusterSemanticActiveSampleFence;
 
 StaticAssertDecl(offsetof(ClusterSemanticAdmissionToken, feature_bit) == 0,
 				 "semantic admission feature offset must remain stable");
@@ -398,6 +416,12 @@ cluster_semantic_activation_modifier_enter(bool writable_admission,
 										   ClusterSemanticAdmissionToken *token);
 extern bool cluster_semantic_activation_modifier_recheck(const ClusterSemanticAdmissionToken *token,
 														 bool writable_admission);
+/* Capture before the native N/PGPROC cut; recheck the same fence after every
+ * census slice releases its locks. Failure clears out. Neither enters a token. */
+extern bool
+cluster_semantic_activation_active_sample_capture(ClusterSemanticActiveSampleFence *out);
+extern bool
+cluster_semantic_activation_active_sample_current(const ClusterSemanticActiveSampleFence *expected);
 extern Size cluster_semantic_activation_shmem_size(void);
 extern void cluster_semantic_activation_shmem_init(void);
 /* RF-ROOT P7 (contract §B): the bit22 cutover reader latch — the dual-path

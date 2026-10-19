@@ -9377,6 +9377,78 @@ cluster_semantic_activation_modifier_recheck(const ClusterSemanticAdmissionToken
 											   snapshot.transition_closed);
 }
 
+/* Read the existing publishers without registering a modifier: a full census
+ * spans many outer passes and must not hold cutover debt between slices. */
+bool
+cluster_semantic_activation_active_sample_capture(ClusterSemanticActiveSampleFence *out)
+{
+	ClusterSemanticActiveSampleFence candidate;
+	SemanticActivationAdmissionSnapshot before, after;
+	ClusterR4MembershipSnapshot members;
+	uint64 self_bit;
+	int32 self = cluster_node_id;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || self < 0 || self >= CLUSTER_MAX_NODES || RecoveryInProgress()
+		|| cluster_normal_stop_maintenance_cut() || !normal_start_serving_allowed()
+		|| cluster_reconfig_self_join_gate_verdict() != CLUSTER_JOIN_GATE_ALLOW)
+		return false;
+	memset(&candidate, 0, sizeof(candidate));
+	candidate.membership_cut_generation = cluster_membership_cut_generation();
+	candidate.system_identifier = GetSystemIdentifier();
+	if (candidate.membership_cut_generation == 0 || candidate.system_identifier == 0
+		|| !semantic_activation_snapshot(&before) || before.seq == 0
+		|| !semantic_activation_modifier_policy(before.active_bits, before.record_generation,
+												before.transition_closed)
+		|| !cluster_reconfig_lmon_snapshot_r4_membership(&members))
+		return false;
+	/* The original membership observer validates the complete admitted set,
+	 * storage quorum and live receiver-local observations. Do not shrink it or
+	 * retain heartbeat generations as part of a multi-slice sample identity. */
+	self_bit = UINT64_C(1) << (self % 64);
+	if (before.formation_epoch == 0 || members.formation_epoch != before.formation_epoch
+		|| members.local_self_boot_incarnation == 0
+		|| ((self < 64 ? members.admitted_members_lo : members.admitted_members_hi) & self_bit) == 0
+		|| members.admitted_incarnation[self] != members.local_self_boot_incarnation)
+		return false;
+	candidate.local_node_id = self;
+	candidate.admission_publication_seq = before.seq;
+	candidate.active_bits = before.active_bits;
+	candidate.record_generation = before.record_generation;
+	candidate.formation_epoch = before.formation_epoch;
+	candidate.local_boot_incarnation = members.local_self_boot_incarnation;
+	candidate.admitted_members_lo = members.admitted_members_lo;
+	candidate.admitted_members_hi = members.admitted_members_hi;
+	memcpy(candidate.admitted_incarnation, members.admitted_incarnation,
+		   sizeof(candidate.admitted_incarnation));
+	/* Bracket the membership copy with the original publication cuts. A
+	 * close/reopen or remove/rejoin with identical payload is still a change. */
+	if (cluster_node_id != self || RecoveryInProgress() || cluster_normal_stop_maintenance_cut()
+		|| !normal_start_serving_allowed()
+		|| cluster_reconfig_self_join_gate_verdict() != CLUSTER_JOIN_GATE_ALLOW
+		|| !cluster_qvotec_in_quorum()
+		|| cluster_qvotec_get_self_incarnation() != candidate.local_boot_incarnation
+		|| cluster_epoch_get_current() != before.formation_epoch
+		|| !semantic_activation_snapshot(&after) || after.seq != before.seq
+		|| after.active_bits != before.active_bits
+		|| after.record_generation != before.record_generation
+		|| after.formation_epoch != before.formation_epoch || after.transition_closed
+		|| !cluster_membership_cut_generation_current(candidate.membership_cut_generation))
+		return false;
+	memcpy(out, &candidate, sizeof(candidate));
+	return true;
+}
+
+bool
+cluster_semantic_activation_active_sample_current(const ClusterSemanticActiveSampleFence *expected)
+{
+	ClusterSemanticActiveSampleFence current;
+
+	return expected != NULL && cluster_semantic_activation_active_sample_capture(&current)
+		   && memcmp(expected, &current, sizeof(current)) == 0;
+}
+
 bool
 cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 {

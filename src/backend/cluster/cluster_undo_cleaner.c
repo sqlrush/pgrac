@@ -92,6 +92,7 @@ static UndoCleanerSharedState *undo_cleaner_state = NULL;
 static int undo_cleaner_worker = -1;
 static ClusterCtrcActiveScan undo_cleaner_active_scan;
 static ClusterXidStripeSampleFence undo_cleaner_active_lease_fence;
+static ClusterSemanticActiveSampleFence undo_cleaner_active_admission_fence;
 static bool undo_cleaner_active_scan_pending;
 
 StaticAssertDecl(CLUSTER_UNDO_CLEANER_WORKER_TYPES == CLUSTER_CTRC_CLEANER_WORKERS,
@@ -486,6 +487,8 @@ undo_cleaner_publish_status(UndoCleanerStatus status)
 	if (status == UNDO_CLEANER_SPAWNING) {
 		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
 		MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
+		MemSet(&undo_cleaner_active_admission_fence, 0,
+			   sizeof(undo_cleaner_active_admission_fence));
 		undo_cleaner_active_scan_pending = false;
 		MemSet(worker, 0, sizeof(*worker));
 		worker->pid = MyProcPid;
@@ -583,6 +586,8 @@ undo_cleaner_run_pass(bool *out_work_remaining, bool maintenance_due)
 	if (!cluster_undo_cleaner_enabled || !cluster_storage_mode_enabled()) {
 		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
 		MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
+		MemSet(&undo_cleaner_active_admission_fence, 0,
+			   sizeof(undo_cleaner_active_admission_fence));
 		return false;
 	}
 
@@ -607,6 +612,8 @@ undo_cleaner_run_pass(bool *out_work_remaining, bool maintenance_due)
 	if (cluster_normal_stop_maintenance_cut()) {
 		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
 		MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
+		MemSet(&undo_cleaner_active_admission_fence, 0,
+			   sizeof(undo_cleaner_active_admission_fence));
 		return false;
 	}
 	/* Capture N/future then all top/prepared PGPROCs before the census. No
@@ -619,22 +626,29 @@ undo_cleaner_run_pass(bool *out_work_remaining, bool maintenance_due)
 
 		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
 		MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
+		MemSet(&undo_cleaner_active_admission_fence, 0,
+			   sizeof(undo_cleaner_active_admission_fence));
 		undo_cleaner_active_scan.status = CTRC_ACTIVE_SCAN_INVALID;
-		if (ProcArrayGetActiveFullXidSample(&reference, &future, &active_min,
-											&undo_cleaner_active_lease_fence)
+		if (cluster_semantic_activation_active_sample_capture(&undo_cleaner_active_admission_fence)
+			&& ProcArrayGetActiveFullXidSample(&reference, &future, &active_min,
+											   &undo_cleaner_active_lease_fence)
 			&& cluster_ctrc_active_scan_begin(&undo_cleaner_active_scan, reference)) {
 			undo_cleaner_active_scan.future_full = future;
 			undo_cleaner_active_scan.min_full = active_min;
 		}
 	}
 	cluster_ctrc_active_scan_step(&undo_cleaner_active_scan);
-	/* Recheck after the slice has released every census lock. Never let a
-	 * replacement/revoked lease complete an old native/census observation. */
+	/* Recheck the original admission/cohort and lease after the slice has
+	 * released every census lock. No replacement may complete an old sample. */
 	if ((undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_INCOMPLETE
 		 || undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_COMPLETE)
-		&& !cluster_xid_stripe_sample_fence_current(&undo_cleaner_active_lease_fence)) {
+		&& (!cluster_xid_stripe_sample_fence_current(&undo_cleaner_active_lease_fence)
+			|| !cluster_semantic_activation_active_sample_current(
+				&undo_cleaner_active_admission_fence))) {
 		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
 		MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
+		MemSet(&undo_cleaner_active_admission_fence, 0,
+			   sizeof(undo_cleaner_active_admission_fence));
 		undo_cleaner_active_scan.status = CTRC_ACTIVE_SCAN_INVALID;
 	}
 	undo_cleaner_active_scan_pending
