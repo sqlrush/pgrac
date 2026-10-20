@@ -623,6 +623,10 @@ static ClusterTxOutcome cluster_runtime_visibility_terminal_lookup(
 	const ClusterUndoBlock0ResolvedRoot *root, const TTSlot *exact_slot, TransactionId *top_xid_out,
 	ClusterTxProofKind *proof_kind_out, SCN *commit_scn_out,
 	ClusterRuntimeVisibilityCanonicalDiagnostic *diagnostic);
+static void cluster_runtime_visibility_terminal_publish_physical(
+	const ClusterTTSlotPhysicalLocator *locator, uint32 generation,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterTxOutcome outcome,
+	ClusterTxProofKind proof_kind, TransactionId top_xid, SCN commit_scn);
 
 bool
 cluster_runtime_visibility_physical_locator_sample_held(
@@ -740,6 +744,8 @@ cluster_runtime_visibility_physical_locator_sample_held(
 		|| !cluster_runtime_visibility_admission_current(CLUSTER_TX_RESOLVE_VISIBILITY, admission))
 		return false;
 
+	cluster_runtime_visibility_terminal_publish_physical(locator, generation.value, root, outcome,
+														 proof_kind, top_xid, commit_scn);
 	key_out->origin_node_id = (uint16)cluster_node_id;
 	key_out->undo_segment_id = (uint16)locator->segment_id;
 	key_out->tt_slot_id = cluster_tt_slot_offset_to_id(locator->slot_offset);
@@ -1550,7 +1556,8 @@ done:
 
 /* The memo stores proven terminal outcomes, never raw TT commit stamps or
  * row locators. Every consumer must sample its exact TT carrier under the
- * ordinary current guards. Publication also requires the origin DATA checks. */
+ * ordinary current guards. DATA publishers also check their DATA carrier;
+ * physical publishers require the final allocator/root/admission fences. */
 #define CLUSTER_RUNTIME_VISIBILITY_TERMINAL_MEMO_SLOTS 64
 
 typedef struct ClusterRuntimeVisibilityTerminalKey {
@@ -1639,6 +1646,49 @@ cluster_runtime_visibility_terminal_entry(const ClusterRuntimeVisibilityTerminal
 	return &rtvis_terminal_memo[hash % CLUSTER_RUNTIME_VISIBILITY_TERMINAL_MEMO_SLOTS];
 }
 
+static void
+cluster_runtime_visibility_terminal_store(const ClusterRuntimeVisibilityTerminalKey *key,
+										  ClusterTxOutcome outcome, ClusterTxProofKind proof_kind,
+										  TransactionId top_xid, SCN commit_scn)
+{
+	ClusterRuntimeVisibilityTerminalEntry *entry = cluster_runtime_visibility_terminal_entry(key);
+
+	if (entry->valid && cluster_runtime_visibility_terminal_key_matches(&entry->key, key)
+		&& entry->outcome == outcome && entry->proof_kind == proof_kind && entry->top_xid == top_xid
+		&& entry->commit_scn == commit_scn)
+		return;
+	entry->key = *key;
+	entry->outcome = outcome;
+	entry->proof_kind = proof_kind;
+	entry->top_xid = top_xid;
+	entry->commit_scn = commit_scn;
+	entry->valid = true;
+	rtvis_exact_counters.local_memo_publishes++;
+}
+
+/* The caller has rechecked its exact physical carrier, generation, current
+ * allocator owner, runtime root and admission. A TT commit stamp alone is
+ * still precommit; only a direct native terminal proof can be retained. */
+static void
+cluster_runtime_visibility_terminal_publish_physical(const ClusterTTSlotPhysicalLocator *locator,
+													 uint32 generation,
+													 const ClusterUndoBlock0ResolvedRoot *root,
+													 ClusterTxOutcome outcome,
+													 ClusterTxProofKind proof_kind,
+													 TransactionId top_xid, SCN commit_scn)
+{
+	ClusterRuntimeVisibilityTerminalKey key;
+
+	if (top_xid != locator->xid || proof_kind != CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG
+		|| !((outcome == CLUSTER_TX_COMMITTED && SCN_VALID(commit_scn))
+			 || (outcome == CLUSTER_TX_ABORTED && commit_scn == InvalidScn))
+		|| !cluster_runtime_visibility_terminal_key(locator->xid, locator->wrap,
+													locator->segment_id, generation,
+													locator->slot_offset, root, &key))
+		return;
+	cluster_runtime_visibility_terminal_store(&key, outcome, proof_kind, top_xid, commit_scn);
+}
+
 static ClusterTxOutcome
 cluster_runtime_visibility_terminal_lookup(TransactionId xid, uint16 wrap, uint32 segment_id,
 										   uint32 generation, uint16 slot_offset,
@@ -1707,7 +1757,6 @@ cluster_runtime_visibility_terminal_publish(const ClusterTxResolution *candidate
 											bool recycled_abort)
 {
 	ClusterRuntimeVisibilityTerminalKey key;
-	ClusterRuntimeVisibilityTerminalEntry *entry;
 
 	if (recycled_abort || !candidate->local_canonical_valid
 		|| candidate->local_canonical.xid != candidate->locator_echo.xid
@@ -1729,18 +1778,8 @@ cluster_runtime_visibility_terminal_publish(const ClusterTxResolution *candidate
 			candidate->local_canonical.segment_id, candidate->local_canonical_generation,
 			candidate->local_canonical.slot_offset, root, &key))
 		return;
-	entry = cluster_runtime_visibility_terminal_entry(&key);
-	if (entry->valid && cluster_runtime_visibility_terminal_key_matches(&entry->key, &key)
-		&& entry->outcome == candidate->outcome && entry->proof_kind == candidate->proof_kind
-		&& entry->top_xid == candidate->top_xid && entry->commit_scn == candidate->commit_scn)
-		return;
-	entry->key = key;
-	entry->outcome = candidate->outcome;
-	entry->proof_kind = candidate->proof_kind;
-	entry->top_xid = candidate->top_xid;
-	entry->commit_scn = candidate->commit_scn;
-	entry->valid = true;
-	rtvis_exact_counters.local_memo_publishes++;
+	cluster_runtime_visibility_terminal_store(&key, candidate->outcome, candidate->proof_kind,
+											  candidate->top_xid, candidate->commit_scn);
 }
 
 #define CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_MAGIC UINT32_C(0x52564f50)
