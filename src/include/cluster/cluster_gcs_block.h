@@ -81,6 +81,25 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+/* Backend-local observations of the ordinary undo TT-header CR fetch.
+ * request_enqueues counts accepted logical requests; matched_replies counts
+ * replies observed in the exact outstanding slot, including DENIED/corrupt
+ * replies. sync_exchanges counts admitted request/reply legs, even when they
+ * time out or raise ERROR. Local queue-FULL retries count none of these.
+ * These are not physical-transmission/retransmit counters or a whole current
+ * transfer budget. They grant no authority and change no waiting policy. */
+typedef struct ClusterGcsUndoHeaderPathCounters {
+	uint64 calls;
+	uint64 request_enqueues;
+	uint64 matched_replies;
+	uint64 sync_exchanges;
+	uint64 successful_fetches;
+} ClusterGcsUndoHeaderPathCounters;
+
+/* Only these diagnostic counters are reset; no memo/cache or shared state. */
+extern void cluster_gcs_block_undo_header_counters_reset(void);
+extern void cluster_gcs_block_undo_header_counters_snapshot(ClusterGcsUndoHeaderPathCounters *out);
+
 /* One bounded, local requester-delivery callback on the existing LMS loop.
  * No wire ownership or foreground success is implied by this result. */
 extern ResourceXApplyResult

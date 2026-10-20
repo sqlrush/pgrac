@@ -129,6 +129,7 @@ static bool retry_latch_epoch_drift;
 static bool reply_wait_epoch_drift;
 static bool reply_wait_admission_drift;
 static bool sync_forward_fixture;
+static int sync_forward_reply_mode;
 static int sync_forward_full_left;
 static int sync_forward_calls;
 static int sync_forward_admitted;
@@ -1495,6 +1496,8 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id, co
 		if (sync_forward_full_left-- > 0)
 			return false;
 		sync_forward_admitted++;
+		if (sync_forward_reply_mode == 1 || sync_forward_reply_mode == 4)
+			return true; /* Accepted request, no reply delivered. */
 		memset(&tt_reply, 0, sizeof(tt_reply));
 		tt_reply.header.request_id = forward->request_id;
 		tt_reply.header.epoch = forward->epoch;
@@ -1523,7 +1526,15 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id, co
 			memset(tt_reply.page, 0, sizeof(tt_reply.page));
 			reply_size = GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE;
 		}
+		if (sync_forward_reply_mode == 2) {
+			tt_reply.header.status = GCS_BLOCK_REPLY_DENIED_PENDING_X;
+			tt_reply.header.page_lsn = 0;
+			memset(tt_reply.page, 0, sizeof(tt_reply.page));
+			reply_size = GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE;
+		}
 		tt_reply.header.checksum = cluster_gcs_block_compute_checksum(tt_reply.page);
+		if (sync_forward_reply_mode == 3)
+			tt_reply.header.checksum ^= 1;
 		ClusterGcsUndoAuthTrailerSetTtGeneration(&tt_reply.trailer, UINT64_C(17));
 		ClusterGcsUndoAuthTrailerSetAuthorityScn(&tt_reply.trailer, UINT64_C(103));
 		env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, dest_node_id,
@@ -4275,6 +4286,7 @@ route_test_assert_public_target_slot_is_canonical(void)
 static void
 test_sync_undo_tt_admission(int refused, int kind)
 {
+	ClusterGcsUndoHeaderPathCounters counters;
 	char page[GCS_BLOCK_DATA_SIZE];
 	ClusterLiveAuthority authority;
 	ClusterGcsUndoVerdictPage verdict;
@@ -4287,6 +4299,7 @@ test_sync_undo_tt_admission(int refused, int kind)
 
 	cluster_node_id = UT_REQUESTER_NODE;
 	route_test_reset_public_target_requester();
+	cluster_gcs_block_undo_header_counters_reset();
 	sync_forward_fixture = true;
 	sync_forward_kind = kind;
 	sync_forward_full_left = refused;
@@ -4335,6 +4348,12 @@ test_sync_undo_tt_admission(int refused, int kind)
 	UT_ASSERT_EQ(sync_forward_calls, refused + 1);
 	UT_ASSERT_EQ(sync_forward_admitted, 1);
 	UT_ASSERT_EQ(retry_latch_wait_calls, refused);
+	cluster_gcs_block_undo_header_counters_snapshot(&counters);
+	UT_ASSERT_EQ(counters.calls, kind == 0 ? 1 : 0);
+	UT_ASSERT_EQ(counters.request_enqueues, kind == 0 ? 1 : 0);
+	UT_ASSERT_EQ(counters.matched_replies, kind == 0 ? 1 : 0);
+	UT_ASSERT_EQ(counters.sync_exchanges, kind == 0 ? 1 : 0);
+	UT_ASSERT_EQ(counters.successful_fetches, kind == 0 ? 1 : 0);
 	route_test_assert_public_target_slot_is_canonical();
 	cluster_node_id = saved_node;
 }
@@ -4369,11 +4388,104 @@ UT_TEST(test_read_image_full_waits_before_holder_retry)
 	test_sync_undo_tt_admission(2, 2);
 }
 
+/* Failed proof acquisition still costs its admitted request and synchronous
+ * exchange. A DENIED/corrupt matched reply is traffic, never success. */
+static void
+test_undo_header_cost_failure(int reply_mode)
+{
+	ClusterGcsUndoHeaderPathCounters counters;
+	char page[GCS_BLOCK_DATA_SIZE];
+	ClusterLiveAuthority authority;
+	volatile bool caught = false;
+	volatile bool fetched = false;
+	int saved_node = cluster_node_id;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	route_test_reset_public_target_requester();
+	cluster_gcs_block_undo_header_counters_reset();
+	sync_forward_fixture = true;
+	sync_forward_kind = sync_forward_full_left = 0;
+	sync_forward_calls = sync_forward_admitted = 0;
+	sync_forward_reply_mode = reply_mode;
+	reply_cv_timed_sleep_raise = reply_mode == 4;
+	route_ereport_armed = true;
+	memset(page, 0xa5, sizeof(page));
+	PG_TRY();
+	{
+		fetched = cluster_gcs_block_undo_tt_fetch_and_wait(UT_MASTER_NODE, 5, 0, page, &authority);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	route_ereport_armed = false;
+	reply_cv_timed_sleep_raise = false;
+	sync_forward_fixture = false;
+	sync_forward_reply_mode = 0;
+	UT_ASSERT_EQ(caught, reply_mode == 4);
+	UT_ASSERT(!fetched);
+	UT_ASSERT_EQ(sync_forward_admitted, 1);
+	cluster_gcs_block_undo_header_counters_snapshot(&counters);
+	UT_ASSERT_EQ(counters.calls, 1);
+	UT_ASSERT_EQ(counters.request_enqueues, 1);
+	UT_ASSERT_EQ(counters.matched_replies, reply_mode == 2 || reply_mode == 3 ? 1 : 0);
+	UT_ASSERT_EQ(counters.sync_exchanges, 1);
+	UT_ASSERT_EQ(counters.successful_fetches, 0);
+	for (int i = 0; i < sizeof(page); i++)
+		UT_ASSERT_EQ((unsigned char)page[i], 0xa5);
+	route_test_assert_public_target_slot_is_canonical();
+	cluster_node_id = saved_node;
+}
+
+UT_TEST(test_undo_header_timeout_preserves_request_cost)
+{
+	test_undo_header_cost_failure(1);
+}
+
+UT_TEST(test_undo_header_denied_reply_preserves_message_cost)
+{
+	test_undo_header_cost_failure(2);
+}
+
+UT_TEST(test_undo_header_corrupt_reply_preserves_message_cost)
+{
+	test_undo_header_cost_failure(3);
+}
+
+UT_TEST(test_undo_header_wait_error_preserves_request_cost)
+{
+	test_undo_header_cost_failure(4);
+}
+
+UT_TEST(test_undo_header_invalid_input_has_no_exchange_and_reset_is_local)
+{
+	ClusterGcsUndoHeaderPathCounters counters;
+	ClusterGcsUndoHeaderPathCounters zero = { 0 };
+	char page[GCS_BLOCK_DATA_SIZE];
+	ClusterLiveAuthority authority;
+	int saved_node = cluster_node_id;
+
+	test_sync_undo_tt_admission(0, 0);
+	cluster_gcs_block_undo_header_counters_reset();
+	cluster_node_id = UT_REQUESTER_NODE;
+	UT_ASSERT(!cluster_gcs_block_undo_tt_fetch_and_wait(UT_MASTER_NODE, 5, 0, NULL, &authority));
+	UT_ASSERT(!cluster_gcs_block_undo_tt_fetch_and_wait(UT_MASTER_NODE, 5, 0, page, NULL));
+	UT_ASSERT(!cluster_gcs_block_undo_tt_fetch_and_wait(-1, 5, 0, page, &authority));
+	UT_ASSERT(!cluster_gcs_block_undo_tt_fetch_and_wait(cluster_node_id, 5, 0, page, &authority));
+	cluster_gcs_block_undo_header_counters_snapshot(&counters);
+	UT_ASSERT_EQ(memcmp(&counters, &zero, sizeof(counters)), 0);
+	cluster_gcs_block_undo_header_counters_snapshot(NULL);
+	route_test_assert_public_target_slot_is_canonical();
+	cluster_node_id = saved_node;
+}
+
 /* Breaks caught: swallowing cancellation, adopting a new epoch/holder,
  * spinning on an invalid route, or parking the LMS that must free capacity. */
 static void
 test_sync_forward_wait_exit(int mode)
 {
+	ClusterGcsUndoHeaderPathCounters counters;
 	char page[GCS_BLOCK_DATA_SIZE];
 	ClusterLiveAuthority authority;
 	BufferDesc buffer;
@@ -4386,6 +4498,7 @@ test_sync_forward_wait_exit(int mode)
 
 	cluster_node_id = UT_REQUESTER_NODE;
 	route_test_reset_public_target_requester();
+	cluster_gcs_block_undo_header_counters_reset();
 	sync_forward_fixture = true;
 	sync_forward_kind = mode == 4 ? 2 : 0;
 	sync_forward_full_left = 3;
@@ -4428,6 +4541,12 @@ test_sync_forward_wait_exit(int mode)
 	UT_ASSERT(!fetched);
 	UT_ASSERT_EQ(sync_forward_calls, mode == 2 ? 0 : 1);
 	UT_ASSERT_EQ(sync_forward_admitted, 0);
+	cluster_gcs_block_undo_header_counters_snapshot(&counters);
+	UT_ASSERT_EQ(counters.calls, mode == 4 ? 0 : 1);
+	UT_ASSERT_EQ(counters.request_enqueues, 0);
+	UT_ASSERT_EQ(counters.matched_replies, 0);
+	UT_ASSERT_EQ(counters.sync_exchanges, 0);
+	UT_ASSERT_EQ(counters.successful_fetches, 0);
 	UT_ASSERT_EQ(retry_latch_wait_calls, mode == 2 || mode == 3 ? 0 : 1);
 	if (mode >= 5) {
 		UT_ASSERT(process_interrupt_calls > 0);
@@ -7065,7 +7184,7 @@ UT_TEST(test_internal_origin_refusals_do_not_enter_backend_reply_table)
 int
 main(void)
 {
-	UT_PLAN(136);
+	UT_PLAN(141);
 	UT_RUN(test_current_mx_updater_precommit_final_release_failure_is_unknown);
 	UT_RUN(test_current_mx_origin_retry_keeps_unknown_release_and_deadline_fences);
 	UT_RUN(test_current_mx_precommit_origin_releases_before_retry);
@@ -7195,6 +7314,11 @@ main(void)
 	UT_RUN(test_undo_verdict_full_waits_without_changing_proof);
 	UT_RUN(test_read_image_admission_preserves_holder_retry_not_install);
 	UT_RUN(test_read_image_full_waits_before_holder_retry);
+	UT_RUN(test_undo_header_timeout_preserves_request_cost);
+	UT_RUN(test_undo_header_denied_reply_preserves_message_cost);
+	UT_RUN(test_undo_header_corrupt_reply_preserves_message_cost);
+	UT_RUN(test_undo_header_wait_error_preserves_request_cost);
+	UT_RUN(test_undo_header_invalid_input_has_no_exchange_and_reset_is_local);
 	UT_RUN(test_sync_forward_full_cancellation_releases_exact_slot);
 	UT_RUN(test_sync_forward_full_epoch_change_never_submits);
 	UT_RUN(test_sync_forward_invalid_is_not_a_capacity_wait);

@@ -5578,6 +5578,21 @@ cluster_r4_source_cr_dispatch(ClusterR4SourceCrOp op, const ClusterR4SourceCrReq
 }
 
 
+static ClusterGcsUndoHeaderPathCounters gcs_undo_header_path_counters;
+
+void
+cluster_gcs_block_undo_header_counters_reset(void)
+{
+	memset(&gcs_undo_header_path_counters, 0, sizeof(gcs_undo_header_path_counters));
+}
+
+void
+cluster_gcs_block_undo_header_counters_snapshot(ClusterGcsUndoHeaderPathCounters *out)
+{
+	if (out != NULL)
+		*out = gcs_undo_header_path_counters;
+}
+
 /*
  * PGRAC: spec-6.12i D-i1 — requester-side undo-TT fetch.
  *
@@ -5610,6 +5625,7 @@ cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id, u
 	if (dst_page == NULL || auth_out == NULL || origin_node < 0 || origin_node == cluster_node_id)
 		return false;
 
+	gcs_undo_header_path_counters.calls++;
 	memset(auth_out, 0, sizeof(*auth_out));
 	tag = GcsBlockUndoFetchTagMake(segment_id, block_no);
 
@@ -5657,6 +5673,8 @@ cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id, u
 						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 						   cluster_node_id)));
 
+		gcs_undo_header_path_counters.request_enqueues++;
+		gcs_undo_header_path_counters.sync_exchanges++;
 		deadline = GetCurrentTimestamp()
 				   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
 
@@ -5670,6 +5688,7 @@ cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id, u
 			have_reply = slot->in_use && slot->reply_received;
 			LWLockRelease(&blk->lock.lock);
 			if (have_reply) {
+				gcs_undo_header_path_counters.matched_replies++;
 				got_reply = true;
 				break;
 			}
@@ -5698,6 +5717,7 @@ cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id, u
 				/* spec-5.14 D2: the authority is the origin's volatile
 				 * co-sample — depend on it for fail-stop (D-i3). */
 				gcs_block_stamp_touched(origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+				gcs_undo_header_path_counters.successful_fetches++;
 				fetched = true;
 			} else {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
