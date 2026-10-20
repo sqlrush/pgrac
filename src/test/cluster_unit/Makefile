@@ -1776,7 +1776,10 @@ test_cluster_btree_leaf_helpers.inc: $(top_srcdir)/src/backend/access/nbtree/nbt
 	awk '/^_bt_(upgrademetapage|get_version_identity)\(/ { print "void"; emit=1; found++ } \
 	     /^_bt_prepare_page_versions?\(/ { print "bool"; emit=1; found++ } \
 	     /^_bt_delitems_update\(/ { print "static char *"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 5) exit 1 }' $< > $@.tmp
+	     /^typedef struct BtDeleteTrace/ { print "#define BT_DELETE_TRACE_PRESENT 1"; emit=1 } \
+	     /^_bt_delete_trace_shape\(/ { print "static bool"; emit=1; diag++ } \
+	     /^_bt_delete_trace_(capture|item|emit)\(/ { print "static void"; emit=1; diag++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 5 || (diag && diag != 4) || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_btree_leaf_dedup_helpers.inc: $(top_srcdir)/src/backend/access/nbtree/nbtdedup.c Makefile

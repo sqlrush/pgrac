@@ -33,6 +33,8 @@
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "miscadmin.h"
+#include "storage/buf_internals.h"
+#include "storage/proc.h"
 #include "utils/rel.h"
 #include "unit_test.h"
 
@@ -42,6 +44,13 @@ int cluster_node_id = 0, wal_level = WAL_LEVEL_REPLICA, NBuffers = 1, NLocBuffer
 char *BufferBlocks;
 Block *LocalBufferBlockPointers;
 volatile uint32 CritSectionCount;
+bool cluster_trace_normal_stop;
+int MyProcPid = 4242;
+PGPROC *MyProc = NULL;
+BackendId MyBackendId = 7;
+BackendType MyBackendType = B_BACKEND;
+static BufferDescPadded trace_descriptors[1];
+BufferDescPadded *BufferDescriptors = trace_descriptors;
 bool cluster_recmerge_window_active, cluster_recmerge_apply_foreign;
 uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
 
@@ -56,6 +65,15 @@ static uint64 next_token, edge_token;
 static uint8 expected_info;
 static bool begun, expecting_error, content_locked;
 static jmp_buf error_jump;
+static bool capture_logs, finishing_log, log_throws, unsafe_log;
+static int trace_events;
+static char trace_log[32768];
+
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	return 1000001;
+}
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -67,6 +85,10 @@ bool
 errstart(int level, const char *domain)
 {
 	(void)domain;
+	if (capture_logs && level == LOG) {
+		finishing_log = true;
+		return true;
+	}
 	return level >= ERROR;
 }
 bool
@@ -77,7 +99,17 @@ errstart_cold(int level, const char *domain)
 int
 errmsg_internal(const char *format, ...)
 {
-	(void)format;
+	if (finishing_log) {
+		va_list args;
+		size_t used = strlen(trace_log);
+
+		unsafe_log |= CritSectionCount != 0 || !content_locked;
+		va_start(args, format);
+		vsnprintf(trace_log + used, sizeof(trace_log) - used, format, args);
+		va_end(args);
+		strlcat(trace_log, "\n", sizeof(trace_log));
+		trace_events++;
+	}
 	return 0;
 }
 int
@@ -95,6 +127,11 @@ errcode(int code)
 void
 errfinish(const char *file, int line, const char *function)
 {
+	if (finishing_log) {
+		finishing_log = false;
+		if (!log_throws)
+			return;
+	}
 	if (!expecting_error) {
 		printf("# unexpected error %s:%d %s\n", file, line, function);
 		abort();
@@ -357,6 +394,14 @@ reset(uint8 info, bool shared)
 	edge_token = 0;
 	expected_info = info;
 	begun = expecting_error = content_locked = false;
+	cluster_trace_normal_stop = false;
+	capture_logs = true;
+	finishing_log = log_throws = unsafe_log = false;
+	trace_events = 0;
+	trace_log[0] = '\0';
+	memset(trace_descriptors, 0, sizeof(trace_descriptors));
+	trace_descriptors[0].bufferdesc.tag = (BufferTag){ .spcOid = 1663, .dbOid = 5,
+		.relNumber = 900, .forkNum = MAIN_FORKNUM, .blockNum = 0 };
 	memset(&relation_data, 0, sizeof(relation_data));
 	memset(&relform, 0, sizeof(relform));
 	memset(&space_identity, 0, sizeof(space_identity));
@@ -680,10 +725,227 @@ UT_TEST(test_read_scan_hint_clears_scan_state_without_shared_mutation)
 		free(so);
 	}
 }
+UT_TEST(test_delete_trace_off_keeps_native_change_quiet)
+{
+	OffsetNumber remove = 2;
+	reset(XLOG_BTREE_DELETE, true);
+	run_delete(&relation_data, 1, 23, false, &remove, 1, NULL, 0, &space_identity);
+	check_version();
+	UT_ASSERT_EQ(trace_events, 0);
+}
+
+UT_TEST(test_delete_trace_on_binds_actual_tag_old_heap_tid_and_wal)
+{
+	OffsetNumber remove = 2;
+	reset(XLOG_BTREE_DELETE, true);
+	cluster_trace_normal_stop = true;
+	/* Controlled descriptor projection: ensure the logger does not guess rd_locator. */
+	trace_descriptors[0].bufferdesc.tag.relNumber = 901;
+	ItemIdMarkDead(PageGetItemId(current_page.data, 2));
+	before_page = current_page;
+	run_delete(&relation_data, 1, 23, false, &remove, 1, NULL, 0, &space_identity);
+	check_version();
+	UT_ASSERT_EQ(trace_events, 2);
+	UT_ASSERT(strstr(trace_log, "event=delete.applied") != NULL);
+	UT_ASSERT(strstr(trace_log, "actual_tag=1663/5/901/0/0") != NULL);
+	UT_ASSERT(strstr(trace_log, "requested_locator=1663/5/900") != NULL);
+	UT_ASSERT(strstr(trace_log, "before_maxoff=3 after_maxoff=2") != NULL);
+	UT_ASSERT(strstr(trace_log, "before_scn=77 after_scn=201") != NULL);
+	UT_ASSERT(strstr(trace_log, "after_lsn=36864") != NULL);
+	UT_ASSERT(strstr(trace_log, "conflict_horizon_known=1 conflict_horizon=23") != NULL);
+	UT_ASSERT(strstr(trace_log, "ndeleted=1 nupdated=0 captured=1 omitted=0") != NULL);
+	UT_ASSERT(strstr(trace_log, "old_index_offset=2 change=delete") != NULL);
+	UT_ASSERT(strstr(trace_log, "lp=3") != NULL);
+	UT_ASSERT(strstr(trace_log, "heap_tid_known=1 heap_tid=2/2") != NULL);
+	UT_ASSERT(strstr(trace_log, "new_offset_mapping_known=0") != NULL);
+	UT_ASSERT(strstr(trace_log, "caller_index_lock_retained=1") != NULL);
+	UT_ASSERT(strstr(trace_log, "authoritative=0 wal_flush_known=0") != NULL);
+	UT_ASSERT(!unsafe_log);
+	UT_ASSERT(content_locked);
+}
+
+UT_TEST(test_vacuum_trace_uses_original_native_result)
+{
+	OffsetNumber remove = 1;
+	reset(XLOG_BTREE_VACUUM, true);
+	cluster_trace_normal_stop = true;
+	run_vacuum(&relation_data, 1, &remove, 1, NULL, 0, &space_identity);
+	check_version();
+	UT_ASSERT_EQ(trace_events, 2);
+	UT_ASSERT(strstr(trace_log, "event=vacuum.applied") != NULL);
+	UT_ASSERT(strstr(trace_log, "conflict_horizon_known=0 conflict_horizon=0") != NULL);
+	UT_ASSERT(strstr(trace_log, "heap_tid_known=1 heap_tid=2/1") != NULL);
+	UT_ASSERT_EQ(BTPageGetOpaque(current_page.data)->btpo_cycleid, 0);
+	UT_ASSERT(!unsafe_log);
+}
+
+UT_TEST(test_posting_trace_maps_removed_positions_from_owned_before_image)
+{
+	for (int k = 0; k < 2; k++) {
+		ItemPointerData tids[3];
+		IndexTupleData base[2] = {0};
+		IndexTuple posting, remaining;
+		BTVacuumPosting update;
+		reset(k == 0 ? XLOG_BTREE_DELETE : XLOG_BTREE_VACUUM, true);
+		cluster_trace_normal_stop = true;
+		base[0].t_info = sizeof(base);
+		for (int i = 0; i < 3; i++)
+			ItemPointerSet(&tids[i], 2, i + 1);
+		posting = _bt_form_posting(base, tids, 3);
+		PageInit(current_page.data, BLCKSZ, sizeof(BTPageOpaqueData));
+		BTPageGetOpaque(current_page.data)->btpo_flags = BTP_LEAF;
+		PageAddItem(current_page.data, (Item)posting, IndexTupleSize(posting),
+					1, false, false);
+		pfree(posting);
+		((PageHeader)current_page.data)->pd_block_scn = 77;
+		before_page = current_page;
+		update = palloc0(sizeof(BTVacuumPostingData) + sizeof(uint16));
+		update->itup = (IndexTuple)PageGetItem(current_page.data,
+											 PageGetItemId(current_page.data, 1));
+		update->updatedoffset = 1;
+		update->ndeletedtids = 1;
+		update->deletetids[0] = 1;
+		if (k == 0)
+			run_delete(&relation_data, 1, 23, false, NULL, 0, &update, 1, &space_identity);
+		else
+			run_vacuum(&relation_data, 1, NULL, 0, &update, 1, &space_identity);
+		remaining = (IndexTuple)PageGetItem(current_page.data,
+										  PageGetItemId(current_page.data, 1));
+		UT_ASSERT_EQ(BTreeTupleGetNPosting(remaining), 2);
+		UT_ASSERT_EQ(ItemPointerGetOffsetNumber(BTreeTupleGetPostingN(remaining, 1)), 3);
+		check_version();
+		UT_ASSERT_EQ(trace_events, 2);
+		UT_ASSERT(strstr(trace_log, "old_index_offset=1 change=posting_update") != NULL);
+		UT_ASSERT(strstr(trace_log, "posting=1 posting_shape_known=1 posting_count=3") != NULL);
+		UT_ASSERT(strstr(trace_log, "removed_count=1 positions_captured=1 positions_omitted=0") != NULL);
+		UT_ASSERT(strstr(trace_log, "removed={1:2/2}") != NULL);
+		UT_ASSERT(!unsafe_log);
+		pfree(update);
+	}
+}
+
+UT_TEST(test_delete_trace_nonshared_remains_quiet)
+{
+	OffsetNumber remove = 2;
+	reset(XLOG_BTREE_DELETE, false);
+	cluster_trace_normal_stop = true;
+	run_delete(&relation_data, 1, 23, false, &remove, 1, NULL, 0, NULL);
+	UT_ASSERT_EQ(PageGetMaxOffsetNumber(current_page.data), 2);
+	UT_ASSERT_EQ(inserts, 1);
+	UT_ASSERT_EQ(edges, 0);
+	UT_ASSERT_EQ(trace_events, 0);
+}
+
+UT_TEST(test_delete_trace_critical_gap_is_reported_by_next_event)
+{
+	for (int k = 0; k < 2; k++) {
+		OffsetNumber remove = 2;
+#ifdef BT_DELETE_TRACE_PRESENT
+		BtDeleteTrace captured;
+#endif
+		reset(XLOG_BTREE_DELETE, true);
+		cluster_trace_normal_stop = true;
+		if (k == 0) {
+#ifdef BT_DELETE_TRACE_PRESENT
+			_bt_delete_trace_capture(&captured, &relation_data, 1, current_page.data,
+									 true, &space_identity, &remove, 1, NULL, 0);
+#endif
+			/* The native producer requires a noncritical entry. Test only
+			 * the real logger's critical refusal after a normal mutation. */
+			cluster_trace_normal_stop = false;
+		}
+		run_delete(&relation_data, 1, 23, false, &remove, 1, NULL, 0, &space_identity);
+		if (k == 0) {
+			CritSectionCount = 1;
+#ifdef BT_DELETE_TRACE_PRESENT
+			_bt_delete_trace_emit("delete.applied", &captured, current_page.data,
+								  true, true, 23);
+#endif
+		}
+		CritSectionCount = 0;
+		if (k == 0)
+			UT_ASSERT_EQ(trace_events, 0);
+		else {
+			UT_ASSERT_EQ(trace_events, 2);
+			UT_ASSERT(strstr(trace_log, "trace_critical_skipped=1") != NULL);
+		}
+		UT_ASSERT_EQ(PageGetMaxOffsetNumber(current_page.data), 2);
+		UT_ASSERT(!unsafe_log);
+	}
+}
+
+UT_TEST(test_delete_trace_log_error_is_after_native_wal_and_temporary_cleanup)
+{
+	OffsetNumber remove = 2;
+	reset(XLOG_BTREE_DELETE, true);
+	cluster_trace_normal_stop = log_throws = expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		run_delete(&relation_data, 1, 23, false, &remove, 1, NULL, 0, &space_identity);
+		UT_ASSERT(false);
+	}
+	expecting_error = log_throws = false;
+	check_version();
+	UT_ASSERT_EQ(trace_events, 1);
+	UT_ASSERT_EQ(PageGetMaxOffsetNumber(current_page.data), 2);
+	UT_ASSERT(content_locked); /* Caller ownership was not silently released. */
+	UT_ASSERT(!unsafe_log);
+}
+
+UT_TEST(test_delete_trace_cap_retains_actual_full_mutation)
+{
+	IndexTupleData tuple[2] = {0};
+	OffsetNumber remove[35];
+	reset(XLOG_BTREE_DELETE, true);
+	cluster_trace_normal_stop = true;
+	PageInit(current_page.data, BLCKSZ, sizeof(BTPageOpaqueData));
+	BTPageGetOpaque(current_page.data)->btpo_flags = BTP_LEAF;
+	tuple[0].t_info = sizeof(tuple);
+	for (int i = 1; i <= 40; i++) {
+		ItemPointerSet(&tuple[0].t_tid, 2, i);
+		UT_ASSERT_EQ(PageAddItem(current_page.data, (Item)tuple, sizeof(tuple),
+								i, false, false), i);
+	}
+	((PageHeader)current_page.data)->pd_block_scn = 77;
+	before_page = current_page;
+	for (int i = 0; i < 35; i++)
+		remove[i] = i + 1;
+	run_delete(&relation_data, 1, 23, false, remove, 35, NULL, 0, &space_identity);
+	check_version();
+	UT_ASSERT_EQ(PageGetMaxOffsetNumber(current_page.data), 5);
+	UT_ASSERT_EQ(trace_events, 33);
+	UT_ASSERT(strstr(trace_log, "ndeleted=35 nupdated=0 captured=32 omitted=3") != NULL);
+	UT_ASSERT(!unsafe_log);
+}
+
+UT_TEST(test_delete_trace_identity_error_does_not_emit_applied)
+{
+	OffsetNumber remove = 2;
+	reset(XLOG_BTREE_DELETE, true);
+	cluster_trace_normal_stop = expecting_error = true;
+	space_identity.key.locator.relNumber++;
+	if (setjmp(error_jump) == 0) {
+		run_delete(&relation_data, 1, 23, false, &remove, 1, NULL, 0, &space_identity);
+		UT_ASSERT(false);
+	}
+	expecting_error = false;
+	UT_ASSERT_EQ(trace_events, 0);
+	UT_ASSERT_EQ(inserts, 0);
+	UT_ASSERT_EQ(memcmp(current_page.data, before_page.data, BLCKSZ), 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(22);
+	UT_RUN(test_delete_trace_off_keeps_native_change_quiet);
+	UT_RUN(test_delete_trace_on_binds_actual_tag_old_heap_tid_and_wal);
+	UT_RUN(test_vacuum_trace_uses_original_native_result);
+	UT_RUN(test_posting_trace_maps_removed_positions_from_owned_before_image);
+	UT_RUN(test_delete_trace_nonshared_remains_quiet);
+	UT_RUN(test_delete_trace_critical_gap_is_reported_by_next_event);
+	UT_RUN(test_delete_trace_log_error_is_after_native_wal_and_temporary_cleanup);
+	UT_RUN(test_delete_trace_cap_retains_actual_full_mutation);
+	UT_RUN(test_delete_trace_identity_error_does_not_emit_applied);
 	UT_RUN(test_meta_cleanup_publishes_exact_version);
 	UT_RUN(test_vacuum_publishes_exact_version);
 	UT_RUN(test_delete_publishes_exact_version_preserves_cycle);
