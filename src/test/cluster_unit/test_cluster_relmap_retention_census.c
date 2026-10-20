@@ -889,6 +889,7 @@ UT_TEST(test_root_rebuild_null_cursor_preserves_destination)
 	UT_ASSERT_EQ(memcmp(&set, &before, sizeof(set)), 0);
 }
 
+#ifndef RELMAP_CENSUS_FIXTURE_ONLY
 int
 main(void)
 {
@@ -921,3 +922,4 @@ main(void)
 	UT_DONE();
 	return ut_failed_count != 0;
 }
+#endif

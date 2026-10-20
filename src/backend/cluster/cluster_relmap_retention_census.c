@@ -352,13 +352,9 @@ cluster_relmap_retention_census_next(ClusterRelmapRetentionCensus *census)
 	return cluster_relmap_retention_census_next_committed(census, NULL);
 }
 
-ClusterRelmapPendingResult
-cluster_relmap_retention_census_rebuild_pending(ClusterRelmapRetentionCensus *census,
-	ClusterRelmapPendingSet *pending_out, const ClusterRelmapPendingDescriptor *descriptors,
-	size_t descriptor_count)
+static ClusterRelmapPendingResult
+census_rebuild_ready(ClusterRelmapRetentionCensus *census)
 {
-	ClusterRelmapPendingResult result;
-
 	if (census == NULL)
 		return CLUSTER_RELMAP_PENDING_INVALID_INPUT;
 	if (census->result != CLUSTER_RELMAP_CENSUS_MORE || !census->rebuild_ready)
@@ -374,6 +370,18 @@ cluster_relmap_retention_census_rebuild_pending(ClusterRelmapRetentionCensus *ce
 			census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
 			return CLUSTER_RELMAP_PENDING_NOT_READY;
 		}
+	return CLUSTER_RELMAP_PENDING_OK;
+}
+
+ClusterRelmapPendingResult
+cluster_relmap_retention_census_rebuild_pending(ClusterRelmapRetentionCensus *census,
+	ClusterRelmapPendingSet *pending_out, const ClusterRelmapPendingDescriptor *descriptors,
+	size_t descriptor_count)
+{
+	ClusterRelmapPendingResult result = census_rebuild_ready(census);
+
+	if (result != CLUSTER_RELMAP_PENDING_OK)
+		return result;
 	/* Only the original full legal pair reaches rebuild_ready. Never use the
 	 * externally copied map or reconstruct a view from its generation alone. */
 	result = cluster_relmap_pending_rebuild_from_committed(pending_out, &census->identity,
@@ -384,6 +392,30 @@ cluster_relmap_retention_census_rebuild_pending(ClusterRelmapRetentionCensus *ce
 		census_failed(census, result == CLUSTER_RELMAP_PENDING_CAPACITY_EXCEEDED
 			? CLUSTER_RELMAP_CENSUS_CAPACITY : CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
 	return result;
+}
+
+ClusterRelmapPendingResult
+cluster_relmap_retention_census_rebuild_pending_side(ClusterRelmapRetentionCensus *census,
+	ClusterRelmapPendingSet *pending_out, const ClusterRelmapPendingSideSource *sources,
+	size_t source_count)
+{
+	ClusterRelmapPendingDescriptor descriptors[CLUSTER_RELMAP_PENDING_CAPACITY];
+	size_t count = 0;
+	ClusterRelmapPendingResult result = census_rebuild_ready(census);
+
+	if (result != CLUSTER_RELMAP_PENDING_OK)
+		return result;
+	/* Keep the original namespace/pair and SIDE selection together. A collector
+	 * refusal must not leave a valid ROOT census that could be treated as empty. */
+	result = cluster_relmap_pending_collect_side(&census->identity, census->storage_uuid,
+		sources, source_count, descriptors, lengthof(descriptors), &count);
+	if (result != CLUSTER_RELMAP_PENDING_OK) {
+		census_failed(census, result == CLUSTER_RELMAP_PENDING_CAPACITY_EXCEEDED
+			? CLUSTER_RELMAP_CENSUS_CAPACITY : CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+		return result;
+	}
+	/* The core installs atomically and consumes this exact pair window once. */
+	return cluster_relmap_retention_census_rebuild_pending(census, pending_out, descriptors, count);
 }
 
 void

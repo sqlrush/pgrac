@@ -6,6 +6,7 @@
 
 #include "cluster/cluster_recovery_root_set.h"
 #include "cluster/cluster_relmap_pending.h"
+#include "cluster/cluster_relmap_pending_side.h"
 #include "cluster/cluster_relmap_retention_restore.h"
 
 #ifdef USE_PGRAC_CLUSTER
@@ -93,6 +94,21 @@ extern ClusterRelmapCensusResult cluster_relmap_retention_census_next_committed(
 extern ClusterRelmapPendingResult cluster_relmap_retention_census_rebuild_pending(
 	ClusterRelmapRetentionCensus *census, ClusterRelmapPendingSet *pending_out,
 	const ClusterRelmapPendingDescriptor *descriptors, size_t descriptor_count);
+
+/* Same single-use window and provisional result, using the original sealed
+ * SIDE collector rather than caller-constructed descriptors. The census owns
+ * the exact namespace, storage UUID and legal committed pair used together.
+ * The caller still supplies ALL selected original plans/participants and owns
+ * their final retained-source recheck; this does not certify that selection.
+ * Missing input is not an explicitly empty sealed stream. Any SIDE refusal
+ * invalidates the whole census, preserving pins and the unchanged destination.
+ * This synchronous, read-only call scans retained plan operations (including
+ * history) for the current namespace, bounded by the original plan limits and
+ * pending capacity; it adds no I/O and is not a next_committed work tick.
+ * DRAINED and all independent owner qualifications remain necessary. */
+extern ClusterRelmapPendingResult cluster_relmap_retention_census_rebuild_pending_side(
+	ClusterRelmapRetentionCensus *census, ClusterRelmapPendingSet *pending_out,
+	const ClusterRelmapPendingSideSource *sources, size_t source_count);
 
 /* Interrupted scans invalidate the borrowed build and ROOT set, retaining
  * every restored pin. No directory, pin or ROOT ownership is freed here. */
