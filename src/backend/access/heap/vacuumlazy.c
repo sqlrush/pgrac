@@ -76,6 +76,7 @@
 /* PGRAC: native maintenance retains pre-lock relation version identity. */
 #include "catalog/pg_control.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_heap_horizon.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -404,6 +405,11 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 	if (vacrel->versioned && (!RelationNeedsWAL(rel)
 		|| !cluster_space_relation_get_identity(rel, &vacrel->identity)))
 		elog(ERROR, "PGRAC shared VACUUM requires exact SPACE identity");
+	/* Queue only an intent before heap content locks. Missing cohort evidence
+	 * defers the request; it cannot lift the existing shared freeze restriction. */
+	if (vacrel->versioned && vacrel->shared_maintenance_restricted
+		&& (params->options & VACOPT_FREEZE))
+		(void) cluster_heap_freeze_request_maintenance();
 #endif
 	vac_open_indexes(vacrel->rel, RowExclusiveLock, &vacrel->nindexes,
 					 &vacrel->indrels);

@@ -32,9 +32,11 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_control.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_heap_horizon.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
+#include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
@@ -549,6 +551,18 @@ UT_TEST(test_freeze_preserves_native_transaction_sanity_gate)
 
 static unsigned identity_reads;
 static bool identity_ready;
+static unsigned maintenance_requests;
+static bool maintenance_request_ready;
+
+bool
+cluster_heap_freeze_request_maintenance(void)
+{
+	UT_ASSERT_EQ(identity_reads, 1);
+	UT_ASSERT_EQ(CritSectionCount + inserts + dirties + edges, 0);
+	maintenance_requests++;
+	return maintenance_request_ready;
+}
+
 static bool
 maintenance_identity_io(Relation rel, ClusterSpaceIdentity *out)
 {
@@ -561,6 +575,7 @@ maintenance_identity_io(Relation rel, ClusterSpaceIdentity *out)
 
 UT_TEST(test_vacuum_native_entry_copies_prelock_identity)
 {
+	VacuumParams options = { .options = VACOPT_VACUUM }, *params = &options;
 	struct {
 		Relation rel;
 		bool versioned;
@@ -583,6 +598,7 @@ UT_TEST(test_vacuum_native_entry_copies_prelock_identity)
 
 UT_TEST(test_vacuum_native_entry_refuses_missing_identity)
 {
+	VacuumParams options = { .options = VACOPT_VACUUM | VACOPT_FREEZE }, *params = &options;
 	struct {
 		Relation rel;
 		bool versioned;
@@ -593,6 +609,7 @@ UT_TEST(test_vacuum_native_entry_refuses_missing_identity)
 	reset(XLOG_HEAP2_VACUUM, true);
 	identity_reads = 0;
 	identity_ready = false;
+	maintenance_requests = 0;
 	expecting_error = true;
 	if (setjmp(error_jump) == 0) {
 #define cluster_space_relation_get_identity maintenance_identity_io
@@ -602,14 +619,69 @@ UT_TEST(test_vacuum_native_entry_refuses_missing_identity)
 	}
 	expecting_error = false;
 	UT_ASSERT_EQ(identity_reads, 1);
+	UT_ASSERT_EQ(maintenance_requests, 0);
 	UT_ASSERT_EQ(CritSectionCount + inserts + dirties + edges, 0);
 	UT_ASSERT(memcmp(before_page.data, current_page.data, BLCKSZ) == 0);
+}
+
+static bool
+maintenance_entry(bits32 options)
+{
+	VacuumParams settings = { .options = options, .freeze_min_age = 0 }, *params = &settings;
+	struct {
+		Relation rel;
+		bool versioned;
+		bool shared_maintenance_restricted;
+		ClusterSpaceIdentity identity;
+	} state = { 0 }, *vacrel = &state;
+	Relation rel = &relation_data;
+
+	identity_reads = maintenance_requests = 0;
+	identity_ready = true;
+#define cluster_space_relation_get_identity maintenance_identity_io
+#include "test_cluster_heap_maintenance_identity.inc"
+#undef cluster_space_relation_get_identity
+	UT_ASSERT_EQ(CritSectionCount + inserts + dirties + edges, 0);
+	return vacrel->shared_maintenance_restricted;
+}
+
+UT_TEST(test_explicit_shared_freeze_requests_before_content_locks)
+{
+	reset(XLOG_HEAP2_VACUUM, true);
+	maintenance_request_ready = true;
+	UT_ASSERT(maintenance_entry(VACOPT_VACUUM | VACOPT_FREEZE));
+	UT_ASSERT_EQ(maintenance_requests, 1);
+}
+
+UT_TEST(test_ordinary_or_nonshared_vacuum_does_not_request)
+{
+	for (int scope = 0; scope < 5; scope++) {
+		reset(XLOG_HEAP2_VACUUM, true);
+		if (scope == 1)
+			cluster_shared_config = false;
+		else if (scope == 2)
+			cluster_enabled = false;
+		else if (scope == 3)
+			relform.relpersistence = RELPERSISTENCE_TEMP;
+		else if (scope == 4)
+			relform.relpersistence = RELPERSISTENCE_UNLOGGED;
+		(void)maintenance_entry(VACOPT_VACUUM | (scope == 0 ? 0 : VACOPT_FREEZE));
+		UT_ASSERT_EQ(maintenance_requests, 0);
+	}
+}
+
+UT_TEST(test_deferred_request_preserves_shared_freeze_restriction)
+{
+	reset(XLOG_HEAP2_VACUUM, true);
+	maintenance_request_ready = false;
+	UT_ASSERT(maintenance_entry(VACOPT_VACUUM | VACOPT_FREEZE));
+	UT_ASSERT_EQ(maintenance_requests, 1);
 }
 
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(15);
 	UT_RUN(test_prune_native_plan_and_version);
 	UT_RUN(test_shared_freeze_refuses_before_tuple_or_wal);
 	UT_RUN(test_vacuum_native_unused_and_version);
@@ -622,6 +694,9 @@ main(void)
 	UT_RUN(test_freeze_preserves_native_transaction_sanity_gate);
 	UT_RUN(test_vacuum_native_entry_copies_prelock_identity);
 	UT_RUN(test_vacuum_native_entry_refuses_missing_identity);
+	UT_RUN(test_explicit_shared_freeze_requests_before_content_locks);
+	UT_RUN(test_ordinary_or_nonshared_vacuum_does_not_request);
+	UT_RUN(test_deferred_request_preserves_shared_freeze_restriction);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

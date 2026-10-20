@@ -58,6 +58,9 @@ static ClusterUndoHorizonShmem test_horizon_store;
 bool cluster_enabled = true;
 int cluster_node_id = 0;
 int MyProcPid = 11;
+/* The actual spinlock slow path uses backend wait-event storage. */
+static uint32 test_wait_event;
+uint32 *my_wait_event_info = &test_wait_event;
 int cluster_injection_armed_count;
 int cluster_lmon_main_loop_interval = 1000;
 static TimestampTz test_horizon_now = INT64CONST(10000000);
@@ -333,6 +336,7 @@ reset_v2_receiver(void)
 
 	memset(&test_horizon_store, 0, sizeof(test_horizon_store));
 	UndoHorizonShmem = &test_horizon_store;
+	SpinLockInit(&test_horizon_store.maintenance_lock);
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		pg_atomic_init_u32(&test_horizon_store.slots[i].seq, 0);
 		pg_atomic_init_u32(&test_horizon_store.freeze_slots[i].seq, 0);
@@ -1626,6 +1630,141 @@ maintenance_cohort(bool high_member)
 	return report;
 }
 
+static ClusterHeapFreezeReportV2
+maintenance_source_cohort(void)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_cohort(false);
+
+	report.report_sequence++;
+	report.f_sample_id++;
+	report.future_full_xid = UINT64CONST(0x100002001);
+	test_sender_sample.lease_fence.slot = 0;
+	test_sender_sample.lease_fence.incarnation = test_v2_fence.local_boot_incarnation;
+	test_sender_sample.lease_fence.lease_limit_full = UINT64CONST(0x100100000);
+	cohort_receive(1, report);
+	return report;
+}
+
+UT_TEST(test_vacuum_intent_uses_complete_future_and_original_sender)
+{
+	ClusterHeapFreezeReportV2 report = maintenance_source_cohort();
+	ClusterHeapFreezeCohortObservation observation;
+
+	UT_ASSERT(cluster_heap_freeze_request_maintenance());
+	UT_ASSERT_EQ(test_maintenance_calls, 0);
+	UT_ASSERT(cluster_heap_freeze_cohort_observe(&observation) == CLUSTER_HEAP_FREEZE_COHORT_READY);
+	UT_ASSERT_EQ(observation.requested_full_xid_max, report.future_full_xid);
+	UT_ASSERT_EQ(observation.active_full_xid_min, UINT64CONST(0x100000080));
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_maintenance_calls, 1);
+	UT_ASSERT_EQ(test_maintenance_requested, UINT64CONST(0x100002000));
+	UT_ASSERT_EQ(test_v2_sends, 1);
+	UT_ASSERT_EQ(test_v2_sent.requested_full_xid, report.future_full_xid);
+	UT_ASSERT_EQ(test_v2_sent.future_full_xid, UINT64CONST(0x100001000));
+	UT_ASSERT_EQ(test_v2_sent.active_full_xid_min, UINT64CONST(0x100000100));
+}
+
+UT_TEST(test_vacuum_intent_refuses_incomplete_or_stale_cuts)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		(void)maintenance_source_cohort();
+		if (fault == 0)
+			test_horizon_store.freeze_slots[1].valid = false;
+		else if (fault == 1)
+			test_horizon_now += 10000001;
+		else if (fault == 2)
+			test_sender_sample_valid = false;
+		else if (fault == 3)
+			test_v2_identity = false;
+		else
+			test_sender_change_on_recheck = true;
+		UT_ASSERT(!cluster_heap_freeze_request_maintenance());
+		UT_ASSERT_EQ(test_horizon_store.maintenance.requested, 0);
+		UT_ASSERT_EQ(test_maintenance_calls, 0);
+	}
+}
+
+UT_TEST(test_vacuum_intents_coalesce_and_old_retirement_cannot_clear_new_intent)
+{
+	ClusterHeapFreezeReportV2 report = maintenance_source_cohort();
+	UndoHorizonMaintenanceIntent old;
+
+	UT_ASSERT(cluster_heap_freeze_request_maintenance());
+	old = test_horizon_store.maintenance;
+	UT_ASSERT(cluster_heap_freeze_request_maintenance());
+	UT_ASSERT_EQ(test_horizon_store.maintenance.sequence, old.sequence);
+	report.report_sequence++;
+	report.f_sample_id++;
+	report.future_full_xid += CLUSTER_XID_STRIDE;
+	cohort_receive(1, report);
+	UT_ASSERT(cluster_heap_freeze_request_maintenance());
+	UT_ASSERT_EQ(test_horizon_store.maintenance.requested, report.future_full_xid);
+	UT_ASSERT(test_horizon_store.maintenance.sequence > old.sequence);
+	undo_horizon_maintenance_retire(&old);
+	UT_ASSERT_EQ(test_horizon_store.maintenance.requested, report.future_full_xid);
+}
+
+UT_TEST(test_lmon_retires_intent_only_after_complete_stripe_future_coverage)
+{
+	ClusterHeapFreezeReportV2 report = maintenance_source_cohort();
+
+	UT_ASSERT(cluster_heap_freeze_request_maintenance());
+	/* The requester is covered, but the other origin still needs a jump. */
+	test_sender_sample.scan.future_full = FullTransactionIdFromU64(report.future_full_xid + 15);
+	test_sender_sample.sample_id++;
+	report.report_sequence++;
+	report.f_sample_id++;
+	report.future_full_xid -= CLUSTER_XID_STRIDE;
+	/* Inject an older, still exact physical observation: no authority is
+	 * derived from the requested value or the old ACTIVE minimum. */
+	test_horizon_store.freeze_slots[1].view.report = report;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT(test_horizon_store.maintenance.requested != 0);
+	UT_ASSERT(test_v2_sent.requested_full_xid != 0);
+	report.future_full_xid += CLUSTER_XID_STRIDE;
+	report.report_sequence++;
+	report.f_sample_id++;
+	cohort_receive(1, report);
+	test_horizon_now += 1000001;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_horizon_store.maintenance.requested, 0);
+	UT_ASSERT_EQ(test_v2_sent.requested_full_xid, 0);
+	UT_ASSERT_EQ(test_v2_sent.active_full_xid_min, UINT64CONST(0x100000100));
+}
+
+UT_TEST(test_lmon_keeps_intent_when_coverage_is_incomplete)
+{
+	(void)maintenance_source_cohort();
+	UT_ASSERT(cluster_heap_freeze_request_maintenance());
+	test_sender_sample.scan.future_full = FullTransactionIdFromU64(UINT64CONST(0x100003000));
+	test_sender_sample.sample_id++;
+	test_horizon_store.freeze_slots[1].valid = false;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_horizon_store.maintenance.requested, UINT64CONST(0x100002001));
+	UT_ASSERT_EQ(test_maintenance_calls, 0);
+}
+
+UT_TEST(test_lmon_retires_stale_identity_even_without_local_history)
+{
+	(void)maintenance_source_cohort();
+	UT_ASSERT(cluster_heap_freeze_request_maintenance());
+	test_v2_fence.admission_publication_seq += 2;
+	test_retention_sample_valid = false;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_horizon_store.maintenance.requested, 0);
+	UT_ASSERT_EQ(test_maintenance_calls, 0);
+	UT_ASSERT_EQ(test_v2_sends, 0);
+}
+
+UT_TEST(test_vacuum_intent_sequence_never_wraps)
+{
+	(void)maintenance_source_cohort();
+	test_horizon_store.maintenance.sequence = UINT64_MAX;
+	UT_ASSERT(!cluster_heap_freeze_request_maintenance());
+	UT_ASSERT_EQ(test_horizon_store.maintenance.sequence, UINT64_MAX);
+	UT_ASSERT_EQ(test_horizon_store.maintenance.requested, 0);
+}
+
 UT_TEST(test_v2_lmon_relays_bounded_intent_with_original_local_fences)
 {
 	(void)maintenance_cohort(false);
@@ -2095,7 +2234,7 @@ UT_TEST(test_v2_lmon_observes_clock_rollback_as_stale)
 int
 main(void)
 {
-	UT_PLAN(69);
+	UT_PLAN(76);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -2148,6 +2287,13 @@ main(void)
 	UT_RUN(test_v2_summary_observes_complete_fixed_cohort);
 	UT_RUN(test_v2_cohort_requires_both_mask_halves_and_keeps_domains_separate);
 	UT_RUN(test_v2_cohort_reports_only_complete_observed_future_ceiling);
+	UT_RUN(test_vacuum_intent_uses_complete_future_and_original_sender);
+	UT_RUN(test_vacuum_intent_refuses_incomplete_or_stale_cuts);
+	UT_RUN(test_vacuum_intents_coalesce_and_old_retirement_cannot_clear_new_intent);
+	UT_RUN(test_lmon_retires_intent_only_after_complete_stripe_future_coverage);
+	UT_RUN(test_lmon_keeps_intent_when_coverage_is_incomplete);
+	UT_RUN(test_lmon_retires_stale_identity_even_without_local_history);
+	UT_RUN(test_vacuum_intent_sequence_never_wraps);
 	UT_RUN(test_v2_lmon_relays_bounded_intent_with_original_local_fences);
 	UT_RUN(test_v2_lmon_ignores_absent_over_ceiling_or_covered_intents);
 	UT_RUN(test_v2_lmon_relays_only_complete_cohort_and_maximum_request);

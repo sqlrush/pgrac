@@ -118,4 +118,11 @@ typedef struct ClusterHeapFreezeCohortObservation {
 extern ClusterHeapFreezeCohortStatus
 cluster_heap_freeze_cohort_observe(ClusterHeapFreezeCohortObservation *out);
 
+/* Best-effort explicit FREEZE intent, selected from a complete current
+ * cohort's observed future maximum. One volatile, identity-scoped local
+ * slot coalesces requests; the original LMON V2 cadence carries it and the
+ * original QVOTEC consumer alone handles durability. No voting-disk IO or
+ * synchronous peer request here. True means queued, never freeze permission. */
+extern bool cluster_heap_freeze_request_maintenance(void);
+
 #endif

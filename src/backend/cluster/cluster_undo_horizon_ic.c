@@ -67,6 +67,7 @@
 #include "cluster/cluster_xid_stripe_boot.h"
 #include "miscadmin.h"
 #include "storage/shmem.h"
+#include "storage/spin.h"
 #include "utils/snapmgr.h" /* Actual snapshot lifetime and retention evidence. */
 #include "utils/timestamp.h"
 
@@ -109,11 +110,21 @@ typedef struct ClusterHeapFreezeReportV2SlotShmem {
 
 #define UNDO_HORIZON_V2_STATUS_COUNT (CLUSTER_HEAP_FREEZE_COHORT_INVALID + 1)
 
+/* One volatile intent for all local VACUUM requesters. It carries no floor
+ * authority. Only this short copy/coalesce section has multiple writers. */
+typedef struct UndoHorizonMaintenanceIntent {
+	ClusterSemanticActiveSampleFence fence;
+	uint64 sequence;
+	uint64 requested;
+} UndoHorizonMaintenanceIntent;
+
 typedef struct ClusterUndoHorizonShmem {
 	ClusterUndoHorizonSlotShmem slots[CLUSTER_MAX_NODES];
 	ClusterHeapFreezeReportV2SlotShmem freeze_slots[CLUSTER_MAX_NODES];
 	uint64 report_sequence;			/* LMON only; survives a process restart; never wraps */
 	uint64 freeze_last_observed_us; /* LMON only; rate limit refusals as well */
+	slock_t maintenance_lock;
+	UndoHorizonMaintenanceIntent maintenance;
 	/* Diagnostic outcomes only: no cached F/H or release authority. */
 	pg_atomic_uint64 freeze_observation_count[UNDO_HORIZON_V2_STATUS_COUNT];
 	/* observability (D5-5); bumped via the note_* helpers below */
@@ -133,9 +144,16 @@ typedef struct ClusterUndoHorizonShmem {
 
 static ClusterUndoHorizonShmem *UndoHorizonShmem = NULL;
 
+typedef struct UndoHorizonV2MaintenanceObservation {
+	ClusterSemanticActiveSampleFence fence;
+	UndoHorizonMaintenanceIntent intent;
+	uint64 covered;
+} UndoHorizonV2MaintenanceObservation;
+
 static ClusterHeapFreezeCohortStatus
 undo_horizon_v2_cohort_observe(ClusterHeapFreezeCohortObservation *out,
-							   const ClusterUndoRetentionSample *local_history);
+							   const ClusterUndoRetentionSample *local_history,
+							   UndoHorizonV2MaintenanceObservation *maintenance);
 
 static Size
 cluster_undo_horizon_shmem_size(void)
@@ -155,6 +173,7 @@ cluster_undo_horizon_shmem_init(void)
 		int i;
 
 		memset(shmem, 0, sizeof(*shmem));
+		SpinLockInit(&shmem->maintenance_lock);
 		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 			pg_atomic_init_u32(&shmem->slots[i].seq, 0);
 			pg_atomic_init_u32(&shmem->freeze_slots[i].seq, 0);
@@ -177,7 +196,7 @@ static const ClusterShmemRegion cluster_undo_horizon_region = {
 	.name = "pgrac cluster undo horizon",
 	.size_fn = cluster_undo_horizon_shmem_size,
 	.init_fn = cluster_undo_horizon_shmem_init,
-	.lwlock_count = 0, /* seqlock + atomics only */
+	.lwlock_count = 0, /* seqlock/atomics and a short local intent spinlock */
 	.owner_subsys = "cluster_undo_horizon",
 	.reserved_flags = 0,
 };
@@ -186,6 +205,43 @@ void
 cluster_undo_horizon_shmem_register(void)
 {
 	cluster_shmem_register_region(&cluster_undo_horizon_region);
+}
+
+static UndoHorizonMaintenanceIntent
+undo_horizon_maintenance_sample(void)
+{
+	UndoHorizonMaintenanceIntent intent;
+
+	SpinLockAcquire(&UndoHorizonShmem->maintenance_lock);
+	intent = UndoHorizonShmem->maintenance;
+	SpinLockRelease(&UndoHorizonShmem->maintenance_lock);
+	return intent;
+}
+
+/* LMON retires a source intent, never a QVOTEC promise. The sequence and
+ * identity comparison preserve a newer concurrent VACUUM publication. */
+static void
+undo_horizon_maintenance_retire(const UndoHorizonMaintenanceIntent *observed)
+{
+	UndoHorizonMaintenanceIntent *intent = &UndoHorizonShmem->maintenance;
+
+	SpinLockAcquire(&UndoHorizonShmem->maintenance_lock);
+	if (intent->sequence == observed->sequence
+		&& memcmp(&intent->fence, &observed->fence, sizeof(intent->fence)) == 0)
+		intent->requested = 0;
+	SpinLockRelease(&UndoHorizonShmem->maintenance_lock);
+}
+
+/* floor_to_origin(request) <= future iff request < future + stride. This
+ * is coverage of an intent, not the ACTIVE minimum or a global F proof.
+ * Non-stripe observations are retained conservatively without rounding. */
+static uint64
+undo_horizon_maintenance_coverage(int32 origin, uint64 future)
+{
+	if (origin >= 0 && origin < CLUSTER_XID_STRIDE && future % CLUSTER_XID_STRIDE == (uint64)origin
+		&& future <= UINT64_MAX - (CLUSTER_XID_STRIDE - 1))
+		return future + CLUSTER_XID_STRIDE - 1;
+	return future;
 }
 
 /* ---------------- wire handler (LMON dispatch context) --------------- */
@@ -531,6 +587,12 @@ undo_horizon_send_v2(int32 peer, const ClusterUndoCleanerActiveSample *active,
 	report.origin = (uint32)cluster_node_id;
 	report.report_sequence = UndoHorizonShmem->report_sequence + 1;
 	report.future_full_xid = U64FromFullTransactionId(active->scan.future_full);
+	{
+		UndoHorizonMaintenanceIntent intent = undo_horizon_maintenance_sample();
+
+		if (memcmp(&intent.fence, fence, sizeof(*fence)) == 0)
+			report.requested_full_xid = intent.requested;
+	}
 	report.active_full_xid_min = U64FromFullTransactionId(active->scan.min_full);
 	report.f_sample_id = active->sample_id;
 	report.horizon_scn = (uint64)h->horizon_scn;
@@ -591,19 +653,29 @@ undo_horizon_observe_v2(uint64 now_us, const ClusterUndoRetentionSample *history
 {
 	ClusterHeapFreezeCohortObservation observation;
 	ClusterHeapFreezeCohortStatus status;
+	UndoHorizonV2MaintenanceObservation maintenance;
+	UndoHorizonMaintenanceIntent pending;
 	uint64 last = UndoHorizonShmem->freeze_last_observed_us;
 
 	if (last != 0 && now_us >= last
 		&& now_us - last < (uint64)cluster_lmon_main_loop_interval * 1000)
 		return;
 	UndoHorizonShmem->freeze_last_observed_us = now_us;
+	pending = undo_horizon_maintenance_sample();
+	if (pending.requested != 0
+		&& !cluster_semantic_activation_active_sample_current(&pending.fence))
+		undo_horizon_maintenance_retire(&pending);
 	status = history == NULL ? CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE
-							 : undo_horizon_v2_cohort_observe(&observation, history);
+							 : undo_horizon_v2_cohort_observe(&observation, history, &maintenance);
 	if ((unsigned)status >= UNDO_HORIZON_V2_STATUS_COUNT)
 		status = CLUSTER_HEAP_FREEZE_COHORT_INVALID;
 	pg_atomic_fetch_add_u64(&UndoHorizonShmem->freeze_observation_count[status], 1);
-	if (status == CLUSTER_HEAP_FREEZE_COHORT_READY)
+	if (status == CLUSTER_HEAP_FREEZE_COHORT_READY) {
 		undo_horizon_relay_maintenance(&observation);
+		if (maintenance.intent.requested != 0
+			&& maintenance.covered >= maintenance.intent.requested)
+			undo_horizon_maintenance_retire(&maintenance.intent);
+	}
 }
 
 void
@@ -733,6 +805,7 @@ typedef struct UndoHorizonV2PeerObservation {
 	uint32 interval_ms;
 	uint32 generation;
 	uint32 seq;
+	uint64 covered;
 } UndoHorizonV2PeerObservation;
 
 static bool
@@ -770,6 +843,7 @@ undo_horizon_v2_observe_peer(int32 peer, const ClusterSemanticActiveSampleFence 
 		return CLUSTER_HEAP_FREEZE_COHORT_INVALID;
 	identity->recv_at_us = view.recv_at_us;
 	identity->interval_ms = report->sender_interval_ms;
+	identity->covered = undo_horizon_maintenance_coverage(peer, report->future_full_xid);
 	candidate->future_full_xid_max = Max(candidate->future_full_xid_max, report->future_full_xid);
 	candidate->requested_full_xid_max
 		= Max(candidate->requested_full_xid_max, report->requested_full_xid);
@@ -818,13 +892,15 @@ undo_horizon_v2_cohort_current(const ClusterSemanticActiveSampleFence *fence,
 
 static ClusterHeapFreezeCohortStatus
 undo_horizon_v2_cohort_observe(ClusterHeapFreezeCohortObservation *out,
-							   const ClusterUndoRetentionSample *local_history)
+							   const ClusterUndoRetentionSample *local_history,
+							   UndoHorizonV2MaintenanceObservation *maintenance)
 {
 	ClusterHeapFreezeCohortObservation candidate = { 0 };
 	ClusterSemanticActiveSampleFence fence;
 	ClusterUndoCleanerActiveSample active;
 	ClusterUndoRetentionSample history;
 	UndoHorizonV2PeerObservation peers[CLUSTER_MAX_NODES] = { { 0 } };
+	UndoHorizonV2MaintenanceObservation observed = { 0 };
 	ClusterHeapFreezeCohortStatus status;
 	TimestampTz started;
 	int32 peer;
@@ -858,6 +934,14 @@ undo_horizon_v2_cohort_observe(ClusterHeapFreezeCohortObservation *out,
 		|| scn_time_cmp(history.horizon_scn, history.clock_scn) > 0)
 		return CLUSTER_HEAP_FREEZE_COHORT_INVALID;
 	candidate.future_full_xid_max = U64FromFullTransactionId(active.scan.future_full);
+	observed.fence = fence;
+	observed.intent = undo_horizon_maintenance_sample();
+	if (memcmp(&observed.intent.fence, &fence, sizeof(fence)) == 0)
+		candidate.requested_full_xid_max = observed.intent.requested;
+	else
+		observed.intent.requested = 0;
+	observed.covered
+		= undo_horizon_maintenance_coverage(cluster_node_id, candidate.future_full_xid_max);
 	candidate.active_full_xid_min = U64FromFullTransactionId(active.scan.min_full);
 	candidate.horizon_scn = history.horizon_scn;
 	candidate.record_generation = fence.record_generation;
@@ -874,6 +958,7 @@ undo_horizon_v2_cohort_observe(ClusterHeapFreezeCohortObservation *out,
 		status = undo_horizon_v2_observe_peer(peer, &fence, &peers[peer], &candidate);
 		if (status != CLUSTER_HEAP_FREEZE_COHORT_READY)
 			return status;
+		observed.covered = Min(observed.covered, peers[peer].covered);
 	}
 	status = undo_horizon_v2_cohort_current(&fence, peers, started);
 	if (status != CLUSTER_HEAP_FREEZE_COHORT_READY)
@@ -882,13 +967,46 @@ undo_horizon_v2_cohort_observe(ClusterHeapFreezeCohortObservation *out,
 		|| !cluster_semantic_activation_active_sample_current(&fence))
 		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
 	*out = candidate;
+	if (maintenance != NULL)
+		*maintenance = observed;
 	return CLUSTER_HEAP_FREEZE_COHORT_READY;
 }
 
 ClusterHeapFreezeCohortStatus
 cluster_heap_freeze_cohort_observe(ClusterHeapFreezeCohortObservation *out)
 {
-	return undo_horizon_v2_cohort_observe(out, NULL);
+	return undo_horizon_v2_cohort_observe(out, NULL, NULL);
+}
+
+bool
+cluster_heap_freeze_request_maintenance(void)
+{
+	ClusterHeapFreezeCohortObservation cohort;
+	UndoHorizonV2MaintenanceObservation observed;
+	UndoHorizonMaintenanceIntent *intent;
+	bool queued = false;
+
+	if (undo_horizon_v2_cohort_observe(&cohort, NULL, &observed) != CLUSTER_HEAP_FREEZE_COHORT_READY
+		|| !cluster_semantic_activation_active_sample_current(&observed.fence))
+		return false;
+	intent = &UndoHorizonShmem->maintenance;
+	SpinLockAcquire(&UndoHorizonShmem->maintenance_lock);
+	/* An old cut must not replace a newer publication for another identity. */
+	if (intent->sequence != observed.intent.sequence
+		&& memcmp(&intent->fence, &observed.fence, sizeof(intent->fence)) != 0)
+		queued = false;
+	else if (intent->requested != 0
+			 && memcmp(&intent->fence, &observed.fence, sizeof(intent->fence)) == 0
+			 && intent->requested >= cohort.future_full_xid_max)
+		queued = true;
+	else if (intent->sequence != UINT64_MAX) {
+		intent->sequence++;
+		intent->fence = observed.fence;
+		intent->requested = cohort.future_full_xid_max;
+		queued = true;
+	}
+	SpinLockRelease(&UndoHorizonShmem->maintenance_lock);
+	return queued;
 }
 
 /*

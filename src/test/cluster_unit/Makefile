@@ -1951,6 +1951,7 @@ test_cluster_heap_maintenance_identity.inc: $(top_srcdir)/src/backend/access/hea
 	mv $@.tmp $@
 
 test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c test_cluster_heap_maintenance_policy.inc unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
 		test_cluster_heap_maintenance_identity.inc \
 		test_cluster_heap_prune_version.inc test_cluster_heap_prune_helpers.inc \
 		test_cluster_heap_freeze_body.inc test_cluster_heap_freeze_helpers.inc \
@@ -8895,6 +8896,8 @@ test_cluster_undo_horizon_sender.inc: $(top_srcdir)/src/backend/cluster/cluster_
 		END { if (!done || starts != 1) exit 1 }' $< > $@
 
 test_cluster_undo_horizon: test_cluster_undo_horizon.c unit_test.h \
+		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c \
 		$(top_srcdir)/src/include/cluster/cluster_undo_retention.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
@@ -8904,6 +8907,8 @@ test_cluster_undo_horizon: test_cluster_undo_horizon.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_HORIZON_O) \
+		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # spec-5.22b D2-1/D2-3: test_cluster_undo_gcs — owner-as-master routing layer
