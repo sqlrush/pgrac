@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_wait_events.h
- *	  pgrac cluster wait event class IDs (13 classes, 124 events).
+ *	  pgrac cluster wait event class IDs (13 classes, 125 registered events).
  *	  StartupPhase includes the postmaster publication wait in addition
  *	  to the five startup phase waits.
  *

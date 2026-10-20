@@ -53,7 +53,10 @@ static LOCALLOCK test_locks[4];
 static unsigned test_lock_count, test_lock_depth, test_scan_ends;
 static bool test_foreign_lwlock, test_floor, test_fence;
 static unsigned prepared, cancelled, slept, signalled, broadcasts;
+static uint32 test_wait_event, last_sleep_event;
+uint32 *my_wait_event_info = &test_wait_event;
 static bool subscribed, early_signal, test_cancel, test_pin_after_probe;
+static bool test_lock_wait;
 static ClusterCtrcCapacityProbeResult test_proof;
 static TransactionId test_xid = 100;
 static bool test_maintenance_cut, test_ctrc_progress;
@@ -330,6 +333,11 @@ LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_u
 {
 	if (test_lock_depth++ != 0)
 		abort();
+	/* A contended bookkeeping LWLock also clears its wait event. */
+	if (test_lock_wait) {
+		pgstat_report_wait_start(PG_WAIT_LWLOCK);
+		pgstat_report_wait_end();
+	}
 	return true;
 }
 
@@ -463,15 +471,18 @@ ConditionVariablePrepareToSleep(ConditionVariable *cv pg_attribute_unused())
 }
 
 bool
-ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(), long timeout,
-							uint32 event pg_attribute_unused())
+ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(), long timeout, uint32 event)
 {
 	if (!subscribed || test_lock_depth != 0 || timeout != Max(cluster_lmon_main_loop_interval, 200)
 		|| !undo_cleaner_capacity_context_safe())
 		abort();
 	slept++;
+	last_sleep_event = event;
+	/* The real CV's WaitLatch reports the supplied event and clears it. */
+	pgstat_report_wait_start(event);
 	if (test_cancel)
 		pg_re_throw();
+	pgstat_report_wait_end();
 	return !early_signal; /* Both actual signal and timed repoll must retry allocation. */
 }
 
@@ -546,7 +557,9 @@ reset_wait_fixture(void)
 	cluster_enabled = test_floor = true;
 	cluster_undo_cleaner_enabled = cluster_undo_retention_horizon_enabled = true;
 	subscribed = early_signal = test_cancel = test_pin_after_probe = false;
+	test_lock_wait = false;
 	prepared = cancelled = slept = signalled = broadcasts = 0;
+	test_wait_event = last_sleep_event = 0;
 	test_proof = CLUSTER_CTRC_CAPACITY_WAIT;
 	test_gc_complete = false;
 	test_inventory_max = 1;
@@ -601,6 +614,8 @@ UT_TEST(test_capacity_every_blocking_hold_refuses_without_sleep)
 		int32 local_pin = 1;
 
 		reset_wait_fixture();
+		test_lock_wait = true;
+		pgstat_report_wait_start(WAIT_EVENT_CLIENT_READ);
 		switch (fault) {
 		case 0:
 			CritSectionCount = 1;
@@ -648,8 +663,38 @@ UT_TEST(test_capacity_every_blocking_hold_refuses_without_sleep)
 		}
 		UT_ASSERT(!cluster_undo_cleaner_wait_for_capacity(1, &continuation));
 		UT_ASSERT_EQ(slept, 0);
+		UT_ASSERT_EQ(test_wait_event, WAIT_EVENT_CLIENT_READ);
 		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_context, 1);
 		UT_ASSERT(!subscribed);
+	}
+}
+
+UT_TEST(test_capacity_sleep_reports_frontend_undo_event)
+{
+	ClusterCtrcTxnKeyV1 continuation = { 0 };
+
+	reset_wait_fixture();
+	UT_ASSERT(cluster_undo_cleaner_wait_for_capacity(1, &continuation));
+	UT_ASSERT_EQ(last_sleep_event, PG_WAIT_CLUSTER_UNDO | 11U);
+}
+
+UT_TEST(test_capacity_sleep_restores_outer_event_on_normal_return)
+{
+	const uint32 outer_events[]
+		= { 0, WAIT_EVENT_CLIENT_READ, WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP };
+
+	for (unsigned i = 0; i < lengthof(outer_events); i++) {
+		for (int signal = 0; signal < 2; signal++) {
+			ClusterCtrcTxnKeyV1 continuation = { 0 };
+
+			reset_wait_fixture();
+			test_lock_wait = true;
+			early_signal = signal != 0;
+			pgstat_report_wait_start(outer_events[i]);
+			UT_ASSERT(cluster_undo_cleaner_wait_for_capacity(1, &continuation));
+			UT_ASSERT_EQ(slept, 1);
+			UT_ASSERT_EQ(test_wait_event, outer_events[i]);
+		}
 	}
 }
 
@@ -708,6 +753,8 @@ UT_TEST(test_capacity_cancellation_and_missing_supply_keep_original_outcome)
 	UT_ASSERT(!subscribed);
 	for (int fault = 0; fault < 6; fault++) {
 		reset_wait_fixture();
+		test_lock_wait = true;
+		pgstat_report_wait_start(WAIT_EVENT_CLIENT_READ);
 		if (fault == 0)
 			test_floor = false;
 		if (fault == 1)
@@ -722,6 +769,7 @@ UT_TEST(test_capacity_cancellation_and_missing_supply_keep_original_outcome)
 			undo_cleaner_state->workers[1].status = UNDO_CLEANER_EXITED;
 		UT_ASSERT(!cluster_undo_cleaner_wait_for_capacity(2, &continuation));
 		UT_ASSERT_EQ(slept, 0);
+		UT_ASSERT_EQ(test_wait_event, WAIT_EVENT_CLIENT_READ);
 		UT_ASSERT_EQ(cancelled, 1);
 		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_proof, 1);
 	}
@@ -1238,8 +1286,10 @@ UT_TEST(test_sample_sequence_survives_worker0_respawn_and_never_wraps)
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(24);
 	UT_RUN(test_capacity_wait_retries_signals_and_cadence_without_authorizing_free);
+	UT_RUN(test_capacity_sleep_reports_frontend_undo_event);
+	UT_RUN(test_capacity_sleep_restores_outer_event_on_normal_return);
 	UT_RUN(test_capacity_every_blocking_hold_refuses_without_sleep);
 	UT_RUN(test_heavyweight_lock_identity_and_mode_are_exact);
 	UT_RUN(test_capacity_cancellation_and_missing_supply_keep_original_outcome);

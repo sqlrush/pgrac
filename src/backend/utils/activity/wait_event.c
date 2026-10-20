@@ -1328,6 +1328,9 @@ pgstat_get_wait_cluster_undo(WaitEventCluster w)
 	case WAIT_EVENT_UNDO_BLOCK_REMASTER_WAIT:
 		event_name = "UndoBlockRemasterWait"; /* spec-5.22b D2-6 */
 		break;
+	case WAIT_EVENT_CLUSTER_UNDO_CAPACITY_WAIT:
+		event_name = "ClusterUndoCapacityWait";
+		break;
 	default:
 		break;
 	}

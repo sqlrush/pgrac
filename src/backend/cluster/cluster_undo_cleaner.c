@@ -385,6 +385,7 @@ bool
 cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *continuation)
 {
 	bool retry = false;
+	uint32 previous_wait_event = *my_wait_event_info;
 
 	if (undo_cleaner_state == NULL || continuation == NULL)
 		return false;
@@ -392,6 +393,7 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 		LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
 		undo_cleaner_state->capacity_wait_refused_context++;
 		LWLockRelease(&undo_cleaner_state->lwlock);
+		pgstat_report_wait_start(previous_wait_event);
 		return false;
 	}
 	ConditionVariablePrepareToSleep(&undo_cleaner_state->capacity_cv);
@@ -426,7 +428,7 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 				 * not a new failure deadline or a reason to assume FREE. */
 				(void)ConditionVariableTimedSleep(&undo_cleaner_state->capacity_cv,
 												  Max(cluster_lmon_main_loop_interval, 200),
-												  WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP);
+												  WAIT_EVENT_CLUSTER_UNDO_CAPACITY_WAIT);
 				LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
 				undo_cleaner_state->capacity_wait_repolled++;
 				LWLockRelease(&undo_cleaner_state->lwlock);
@@ -446,6 +448,8 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 		ConditionVariableCancelSleep();
 	}
 	PG_END_TRY();
+	/* CV and bookkeeping LWLock waits clear their events. Errors use PG cleanup. */
+	pgstat_report_wait_start(previous_wait_event);
 	return retry;
 }
 

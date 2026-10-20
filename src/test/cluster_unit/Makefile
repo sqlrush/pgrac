@@ -4245,10 +4245,11 @@ test_cluster_signal: test_cluster_signal.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_VERSION_O) $(CLUSTER_SIGNAL_O) -o $@
 
 # test_cluster_views links cluster_views.o.  cluster_views.c calls
-# fmgr / tuplestore / wait event lookup machinery; the test stubs all
-# of them since the unit test only takes the SRF address (never invokes).
+# fmgr / tuplestore boundaries capture the real SRF's rows, decoded by
+# the production wait_event.c included in the fixture.
 test_cluster_views: test_cluster_views.c unit_test.h ../../../src/include/cluster/cluster_views.h $(CLUSTER_VERSION_O) \
-		$(CLUSTER_VIEWS_O)
+		$(CLUSTER_VIEWS_O) $(top_srcdir)/src/backend/utils/activity/wait_event.c \
+		$(top_srcdir)/src/include/utils/wait_event.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_VIEWS_O) -o $@
 
@@ -8159,6 +8160,7 @@ test_cluster_undo_cleaner_capacity: test_cluster_undo_cleaner_capacity.c test_cl
 		$(top_srcdir)/src/include/storage/procarray.h \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
 		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
+		$(top_srcdir)/src/include/utils/wait_event.h \
 		$(top_srcdir)/src/include/miscadmin.h unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(top_builddir)/src/common/libpgcommon_srv.a \

@@ -1,6 +1,6 @@
 # Cluster wait events
 
-linkdb registers 124 cluster-specific wait events distributed across
+linkdb registers 125 cluster-specific wait events distributed across
 13 classes.  Each row in `pg_stat_cluster_wait_events` corresponds
 to one entry in this table.
 
@@ -140,7 +140,7 @@ Network transport layer.
 | `ClusterLmsDataRecv` | Waiting to receive an LMS data-plane frame |
 | `ClusterLmsDataSend` | Waiting to send an LMS data-plane frame |
 
-## Cluster: Undo (7 events)
+## Cluster: Undo (8 events)
 
 Undo segment access, durable transaction-table I/O, and the local undo buffer pool.
 
@@ -153,6 +153,7 @@ Undo segment access, durable transaction-table I/O, and the local undo buffer po
 | `UndoBlockGrantWait` | Waiting for an undo-block grant |
 | `UndoBlockInvalidateWait` | Waiting for undo-block invalidation to complete |
 | `UndoBlockRemasterWait` | Waiting for undo-block remastering |
+| `ClusterUndoCapacityWait` | Waiting for undo capacity before retrying allocation |
 
 ## Cluster: ADG (4 events)
 
@@ -233,7 +234,7 @@ waits.
 ## Querying
 
 ```sql
--- Total registered (124):
+-- Total registered (125):
 SELECT count(*) FROM pg_stat_cluster_wait_events;
 
 -- Per-class counts:

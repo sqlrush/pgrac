@@ -1,18 +1,17 @@
 /*-------------------------------------------------------------------------
  *
  * test_cluster_views.c
- *	  Compile-time invariants for the cluster views framework
+ *	  Registration invariants for the cluster views framework
  *	  introduced in stage 0.16.
  *
  *	  Stage 0.16 backs pg_stat_cluster_wait_events with the SRF
  *	  cluster_get_wait_events() in cluster_views.c, registered via
- *	  pg_proc.dat.  The actual SRF call requires the PG executor /
- *	  tuplestore machinery which cluster_unit deliberately does not
- *	  link.  This test asserts only the structural pieces a PG-free
- *	  binary can verify:
+ *	  pg_proc.dat.  Exercise its actual roster and wait-event decoder
+ *	  with text/tuplestore boundaries, without a PG executor:
  *
  *	  - CLUSTER_WAIT_EVENTS_COUNT matches the registered WaitEventCluster table.
  *	  - cluster_get_wait_events function symbol resolves at link time.
+ *	  - Its emitted rows name the frontend capacity event exactly once.
  *
  *	  Runtime behaviour (the view returns one row per registered wait
  *	  event with the correct type / name values) is validated by
@@ -30,9 +29,8 @@
  *
  * NOTES
  *	  This is a pgrac-original file.  cluster_views.c references PG
- *	  fmgr / tuplestore / wait_event lookup machinery; the test stubs
- *	  those out locally so the standalone unit binary does not need to
- *	  link the full backend.
+ *	  fmgr / tuplestore machinery; the test supplies explicit boundaries
+ *	  while using the production wait_event.c decoder.
  *
  *-------------------------------------------------------------------------
  */
@@ -44,6 +42,8 @@
 #include "cluster/cluster_views.h"
 #include "cluster/cluster_wait_events.h" /* PG_WAIT_CLUSTER_GES / ADG */
 #include "utils/wait_event.h"			 /* WAIT_EVENT_GES_ENQUEUE_ACQUIRE etc. */
+
+#include "../../backend/utils/activity/wait_event.c"
 
 /*
  * postgres.h transitively pulls in port.h which redirects printf etc.
@@ -67,14 +67,16 @@
 /* ----------
  * Stubs needed to link cluster_views.o standalone.
  *
- *	cluster_views.c calls PG executor / SRF machinery which would pull
- *	in the entire backend.  This test never invokes
- *	cluster_get_wait_events() (we only take its address); the stubs
- *	below exist purely so the linker can resolve the symbols.
+ *	Text Datums are opaque string pointers at this boundary; the actual
+ *	SRF emits its production roster using the production decoder.
  * ----------
  */
 #include "funcapi.h"
 #include "utils/builtins.h"
+
+static unsigned captured_rows;
+static const char *captured_types[CLUSTER_WAIT_EVENTS_COUNT];
+static const char *captured_names[CLUSTER_WAIT_EVENTS_COUNT];
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -93,31 +95,31 @@ InitMaterializedSRF(FunctionCallInfo fcinfo pg_attribute_unused(),
 
 void
 tuplestore_putvalues(Tuplestorestate *state pg_attribute_unused(),
-					 TupleDesc tdesc pg_attribute_unused(), Datum *values pg_attribute_unused(),
-					 bool *isnull pg_attribute_unused())
+					 TupleDesc tdesc pg_attribute_unused(), Datum *values, bool *isnull)
 {
-	/* Stub: real impl in src/backend/utils/sort/tuplestore.c */
+	if (captured_rows >= lengthof(captured_names) || isnull[0] || isnull[1])
+		abort();
+	captured_types[captured_rows] = (const char *)DatumGetPointer(values[0]);
+	captured_names[captured_rows] = (const char *)DatumGetPointer(values[1]);
+	captured_rows++;
 }
 
 text *
-cstring_to_text(const char *s pg_attribute_unused())
+cstring_to_text(const char *s)
 {
-	/* Stub: real impl in src/backend/utils/adt/varlena.c */
-	return NULL;
+	return (text *)s;
 }
 
 const char *
-pgstat_get_wait_event(uint32 wait_event_info pg_attribute_unused())
+GetLWLockIdentifier(uint32 classId pg_attribute_unused(), uint16 eventId pg_attribute_unused())
 {
-	/* Stub: real impl in src/backend/utils/activity/wait_event.c */
-	return "";
+	abort();
 }
 
 const char *
-pgstat_get_wait_event_type(uint32 wait_event_info pg_attribute_unused())
+GetLockNameFromTagType(uint16 locktag_type pg_attribute_unused())
 {
-	/* Stub: real impl in src/backend/utils/activity/wait_event.c */
-	return "";
+	abort();
 }
 
 /*
@@ -207,7 +209,7 @@ cluster_shmem_iter_regions(int *idx pg_attribute_unused(),
 UT_DEFINE_GLOBALS();
 
 
-UT_TEST(test_cluster_wait_events_count_is_124)
+UT_TEST(test_cluster_wait_events_count_is_125)
 {
 	/*
 	 * Cumulative registration roster: 61 prior + 3 added by spec-2.6 D11
@@ -241,7 +243,45 @@ UT_TEST(test_cluster_wait_events_count_is_124)
 	 * together, and this test number must be bumped in lockstep.
 	 */
 	/* spec-7.2 D6: +2 LMS data-plane -> 120. */
-	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 124);
+	/* Frontend undo capacity wait adds one registered event. */
+	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 125);
+}
+
+UT_TEST(test_capacity_wait_decoder_keeps_undo_and_background_names_distinct)
+{
+	UT_ASSERT_STR_EQ(pgstat_get_wait_event(PG_WAIT_CLUSTER_UNDO | 11U), "ClusterUndoCapacityWait");
+	UT_ASSERT_STR_EQ(pgstat_get_wait_event_type(PG_WAIT_CLUSTER_UNDO | 11U), "Cluster: Undo");
+	UT_ASSERT_STR_EQ(pgstat_get_wait_event(WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP),
+					 "ClusterBgProcUndoCleanerMainLoop");
+}
+
+UT_TEST(test_actual_srf_emits_capacity_once_in_undo_class)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	unsigned capacity_rows = 0, undo_rows = 0;
+
+	MemSet(fcinfo, 0, SizeForFunctionCallInfo(0));
+	MemSet(&rsinfo, 0, sizeof(rsinfo));
+	fcinfo->resultinfo = (Node *)&rsinfo;
+	captured_rows = 0;
+	UT_ASSERT_EQ(cluster_get_wait_events(fcinfo), 0);
+	UT_ASSERT_EQ(captured_rows, 125);
+	for (unsigned i = 0; i < captured_rows; i++) {
+		UT_ASSERT_NOT_NULL(captured_types[i]);
+		UT_ASSERT_NOT_NULL(captured_names[i]);
+		UT_ASSERT(strcmp(captured_names[i], "unknown wait event") != 0);
+		for (unsigned j = 0; j < i; j++)
+			UT_ASSERT(strcmp(captured_names[i], captured_names[j]) != 0);
+		if (strcmp(captured_types[i], "Cluster: Undo") == 0)
+			undo_rows++;
+		if (strcmp(captured_names[i], "ClusterUndoCapacityWait") == 0) {
+			capacity_rows++;
+			UT_ASSERT_STR_EQ(captured_types[i], "Cluster: Undo");
+		}
+	}
+	UT_ASSERT_EQ(capacity_rows, 1);
+	UT_ASSERT_EQ(undo_rows, 8);
 }
 
 
@@ -285,8 +325,10 @@ UT_TEST(test_adg_wal_receive_lag_in_adg_class)
 int
 main(void)
 {
-	UT_PLAN(5);
-	UT_RUN(test_cluster_wait_events_count_is_124);
+	UT_PLAN(7);
+	UT_RUN(test_cluster_wait_events_count_is_125);
+	UT_RUN(test_capacity_wait_decoder_keeps_undo_and_background_names_distinct);
+	UT_RUN(test_actual_srf_emits_capacity_once_in_undo_class);
 	UT_RUN(test_srf_symbol_linkable);
 	UT_RUN(test_adg_srf_symbol_linkable);
 	UT_RUN(test_first_event_is_ges_enqueue_acquire);
