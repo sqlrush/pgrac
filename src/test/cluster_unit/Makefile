@@ -8760,7 +8760,8 @@ test_cluster_xid_stripe_boot.inc: $(top_srcdir)/src/backend/cluster/cluster_xid_
 	     END { if (types != 3 || pointers != 1 || functions != 7) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_xid_stripe_boot: test_cluster_xid_stripe_boot.c unit_test.h test_cluster_xid_stripe_boot.inc
+test_cluster_xid_stripe_boot: test_cluster_xid_stripe_boot.c unit_test.h test_cluster_xid_stripe_boot.inc \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
 
 test_cluster_xid_stripe_evidence.inc: $(top_srcdir)/src/backend/cluster/cluster_xid_stripe_boot.c Makefile
@@ -8777,6 +8778,10 @@ test_cluster_xid_stripe_evidence.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     /^stripe_history_initial_capacity\(/ { print "static int"; emit=1; history++ } \
 	     /^stripe_read_slot_(one|all)\(/ { print "static StripeSlotReadClass"; emit=1; reads++ } \
 	     /^stripe_lease_(tick|fail)\(/ { print "static void"; emit=1; actions++ } \
+	     /^stripe_maintenance_validate\(/ { print "static ClusterXidStripeMaintenanceResult"; emit=1; maintenance++ } \
+	     /^cluster_xid_stripe_request_maintenance\(/ { print "ClusterXidStripeMaintenanceResult"; emit=1; maintenance++ } \
+	     /^stripe_maintenance_retire\(/ { print "static void"; emit=1; maintenance++ } \
+	     /^stripe_maintenance_tick\(/ { print "static bool"; emit=1; maintenance++ } \
 	     /^stripe_service_(claim|retire)\(/ { print "static uint32"; emit=1; writers++ } \
 	     /^cluster_xid_stripe_herding_tick\(/ { print "void"; emit=1; herd++ } \
 	     /^cluster_xid_stripe_herding_floor\(/ { print "FullTransactionId"; emit=1; floor++ } \
@@ -8787,12 +8792,14 @@ test_cluster_xid_stripe_evidence.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     /^cluster_xid_wrap_barrier_passed\(/ { print "bool"; emit=1; wrap++ } \
 	     /^cluster_xid_stripe_wait_lease\(/ { print "void"; emit=1; wait++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (history != 5 || lookup != 1 || types != 2 || zero != 1 || reads != 2 || leases != 1 || pointer != 1 || actions != 2 || ready != 1 || future != 1 || fence != 1 || window != 1 || wrap != 1 || boots != 1 || bootptr != 1 || writers != 2 || herd != 1 || floor != 1 || wait != 1) exit 1 }' $< > $@.tmp
+	     END { if (maintenance != 4 || history != 5 || lookup != 1 || types != 2 || zero != 1 || reads != 2 || leases != 1 || pointer != 1 || actions != 2 || ready != 1 || future != 1 || fence != 1 || window != 1 || wrap != 1 || boots != 1 || bootptr != 1 || writers != 2 || herd != 1 || floor != 1 || wait != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_xid_stripe_evidence: test_cluster_xid_stripe_evidence.c unit_test.h \
 		test_cluster_xid_stripe_evidence.inc $(CLUSTER_XID_STRIPE_O) \
-		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h
+		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
+		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_xid_stripe: test_cluster_xid_stripe.c unit_test.h \

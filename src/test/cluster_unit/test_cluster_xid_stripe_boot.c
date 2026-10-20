@@ -17,6 +17,7 @@
 #include "access/xloginsert.h"
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_xid_stripe_boot.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_xid_stripe_xlog.h"
 #include "cluster/cluster_mxid_stripe.h"
 #include "storage/condition_variable.h"

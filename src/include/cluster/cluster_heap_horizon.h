@@ -102,6 +102,7 @@ typedef enum ClusterHeapFreezeCohortStatus {
  * before these values may authorize a global floor. F and H use different
  * domains: F is a FullXid lower bound, H is an SCN history bound. */
 typedef struct ClusterHeapFreezeCohortObservation {
+	uint64 future_full_xid_max; /* request ceiling, never a freeze floor */
 	uint64 active_full_xid_min;
 	uint64 horizon_scn;
 	uint64 record_generation;

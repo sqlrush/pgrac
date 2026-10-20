@@ -1606,6 +1606,25 @@ UT_TEST(test_v2_cohort_requires_both_mask_halves_and_keeps_domains_separate)
 	UT_ASSERT(cluster_conf_lookup_node(65) == NULL);
 }
 
+UT_TEST(test_v2_cohort_reports_only_complete_observed_future_ceiling)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
+	ClusterHeapFreezeCohortObservation out;
+
+	/* No subset, including an origin's request, may supply the ceiling. */
+	assert_cohort_refusal(CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE);
+	report.future_full_xid = UINT64CONST(0x100003000);
+	report.requested_full_xid = UINT64CONST(0x100004000);
+	cohort_receive(65, report);
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	UT_ASSERT_EQ(out.future_full_xid_max, report.future_full_xid);
+	UT_ASSERT_EQ(out.active_full_xid_min, UINT64CONST(0x100000080));
+	/* The local completed sample participates even when every peer is lower. */
+	test_sender_sample.scan.future_full = FullTransactionIdFromU64(UINT64CONST(0x100005000));
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	UT_ASSERT_EQ(out.future_full_xid_max, UINT64CONST(0x100005000));
+}
+
 UT_TEST(test_v2_cohort_missing_members_never_shrink_required_set)
 {
 	for (int fault = 0; fault < 3; fault++) {
@@ -1935,7 +1954,7 @@ UT_TEST(test_v2_lmon_observes_clock_rollback_as_stale)
 int
 main(void)
 {
-	UT_PLAN(62);
+	UT_PLAN(63);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -1987,6 +2006,7 @@ main(void)
 	UT_RUN(test_v2_sender_capability_is_independent_of_v1_and_sequence_is_shared);
 	UT_RUN(test_v2_summary_observes_complete_fixed_cohort);
 	UT_RUN(test_v2_cohort_requires_both_mask_halves_and_keeps_domains_separate);
+	UT_RUN(test_v2_cohort_reports_only_complete_observed_future_ceiling);
 	UT_RUN(test_v2_cohort_missing_members_never_shrink_required_set);
 	UT_RUN(test_v2_cohort_h_freshness_does_not_expire_f_sample);
 	UT_RUN(test_v2_cohort_uses_end_clock_and_rejects_rollback);

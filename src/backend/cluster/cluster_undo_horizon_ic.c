@@ -730,6 +730,7 @@ undo_horizon_v2_observe_peer(int32 peer, const ClusterSemanticActiveSampleFence 
 		return CLUSTER_HEAP_FREEZE_COHORT_INVALID;
 	identity->recv_at_us = view.recv_at_us;
 	identity->interval_ms = report->sender_interval_ms;
+	candidate->future_full_xid_max = Max(candidate->future_full_xid_max, report->future_full_xid);
 	candidate->active_full_xid_min
 		= Min(candidate->active_full_xid_min, report->active_full_xid_min);
 	if (scn_time_cmp(report->horizon_scn, candidate->horizon_scn) < 0)
@@ -814,6 +815,7 @@ undo_horizon_v2_cohort_observe(ClusterHeapFreezeCohortObservation *out,
 		|| history.horizon_scn == CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED
 		|| scn_time_cmp(history.horizon_scn, history.clock_scn) > 0)
 		return CLUSTER_HEAP_FREEZE_COHORT_INVALID;
+	candidate.future_full_xid_max = U64FromFullTransactionId(active.scan.future_full);
 	candidate.active_full_xid_min = U64FromFullTransactionId(active.scan.min_full);
 	candidate.horizon_scn = history.horizon_scn;
 	candidate.record_generation = fence.record_generation;

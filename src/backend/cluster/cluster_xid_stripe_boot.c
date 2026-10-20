@@ -48,10 +48,12 @@
 #include "access/xlog.h" /* RecoveryInProgress (D5d gate hold) */
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_heap_horizon.h"
 #include "cluster/cluster_inject.h"		 /* herding-stall injection (D3, L408) */
 #include "cluster/cluster_mxid_stripe.h" /* mxid stripe face (spec-7.1 D3-a) */
 #include "cluster/cluster_qvotec.h"		 /* CLUSTER_MAX_VOTING_DISKS (mxid evidence bound) */
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_voting_disk_io.h"
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_xid_stripe_boot.h"
@@ -124,7 +126,7 @@ typedef struct ClusterXidStripeBootShmem {
 	bool my_slot_claimed;
 	uint64 my_slot_floor_full;
 	uint64 my_owner_incarnation;
-	uint64 my_hwm_on_disk; /* durable hwm last read/written (herding) */
+	uint64 my_hwm_on_disk; /* soft HWM cache; never a durable allocation promise */
 
 	/*
 	 * D3 counter herding (atomics: read on the GetNewTransactionId hot
@@ -138,6 +140,14 @@ typedef struct ClusterXidStripeBootShmem {
 	pg_atomic_uint64 herding_floor_full;
 	pg_atomic_uint64 cluster_min_active_hwm;
 	pg_atomic_uint64 cluster_max_active_hwm;
+
+	/* Volatile maintenance intent, consumed only by the original QVOTEC tick.
+	 * Sequence prevents completion of old IO from erasing a newer request. */
+	bool maintenance_pending;
+	uint64 maintenance_seq;
+	uint64 maintenance_requested_full;
+	ClusterSemanticActiveSampleFence maintenance_identity;
+	ClusterXidStripeSampleFence maintenance_stripe;
 
 	/*
 	 * GCS-race round-3 P0-1: xid wrap barrier (native raw reuse).
@@ -795,6 +805,115 @@ cluster_xid_stripe_sample_future(FullTransactionId reference, FullTransactionId 
 	return true;
 }
 
+/* Only a complete current report set supplies the maintenance ceiling. The
+ * request field on the wire is an intent, never authority to burn a range. */
+static ClusterXidStripeMaintenanceResult
+stripe_maintenance_validate(const ClusterSemanticActiveSampleFence *identity,
+							const ClusterXidStripeSampleFence *stripe, FullTransactionId requested)
+{
+	ClusterHeapFreezeCohortObservation cohort;
+	ClusterHeapFreezeCohortStatus status;
+	uint64 value = U64FromFullTransactionId(requested);
+	uint64 next;
+
+	if (identity == NULL || stripe == NULL || StripeBootShmem == NULL || StripeLease == NULL
+		|| !cluster_enabled || !cluster_shared_catalog || !cluster_xid_striping
+		|| LWLockHeldByMe(XidGenLock) || pg_atomic_read_u32(&StripeLease->failed) != 0
+		|| cluster_xid_herding_slack < 0 || !FullTransactionIdIsValid(requested)
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(requested))
+		|| value > UINT64_MAX - CLUSTER_XID_STRIPE_LEASE_SPAN - CLUSTER_XID_STRIDE)
+		return CLUSTER_XID_STRIPE_MAINTENANCE_UNAVAILABLE;
+	if (!cluster_semantic_activation_active_sample_current(identity)
+		|| !cluster_xid_stripe_sample_fence_current(stripe)
+		|| identity->local_node_id != stripe->slot
+		|| identity->local_boot_incarnation != stripe->incarnation)
+		return CLUSTER_XID_STRIPE_MAINTENANCE_IDENTITY_CHANGED;
+	if (value % CLUSTER_XID_STRIDE != (uint64)stripe->slot
+		|| cluster_xid_stripe_window_exceeded(requested)
+		|| (EpochFromFullTransactionId(requested) > 0 && !cluster_xid_wrap_barrier_passed()))
+		return CLUSTER_XID_STRIPE_MAINTENANCE_UNAVAILABLE;
+	next = U64FromFullTransactionId(ReadNextFullTransactionId());
+	if (value > next && value - next > (uint64)cluster_xid_herding_slack)
+		return CLUSTER_XID_STRIPE_MAINTENANCE_UNAVAILABLE;
+	status = cluster_heap_freeze_cohort_observe(&cohort);
+	if (status == CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED)
+		return CLUSTER_XID_STRIPE_MAINTENANCE_IDENTITY_CHANGED;
+	if (status != CLUSTER_HEAP_FREEZE_COHORT_READY)
+		return CLUSTER_XID_STRIPE_MAINTENANCE_UNAVAILABLE;
+	if (cohort.record_generation != identity->record_generation
+		|| cohort.formation_epoch != identity->formation_epoch
+		|| cohort.admitted_members_lo != identity->admitted_members_lo
+		|| cohort.admitted_members_hi != identity->admitted_members_hi
+		|| !cluster_semantic_activation_active_sample_current(identity)
+		|| !cluster_xid_stripe_sample_fence_current(stripe))
+		return CLUSTER_XID_STRIPE_MAINTENANCE_IDENTITY_CHANGED;
+	if (value > cohort.future_full_xid_max)
+		return CLUSTER_XID_STRIPE_MAINTENANCE_UNAVAILABLE;
+	return CLUSTER_XID_STRIPE_MAINTENANCE_PENDING;
+}
+
+ClusterXidStripeMaintenanceResult
+cluster_xid_stripe_request_maintenance(const ClusterSemanticActiveSampleFence *identity,
+									   const ClusterXidStripeSampleFence *stripe,
+									   FullTransactionId requested)
+{
+	ClusterXidStripeMaintenanceResult result;
+	uint64 value = U64FromFullTransactionId(requested);
+	bool same;
+
+	result = stripe_maintenance_validate(identity, stripe, requested);
+	if (result != CLUSTER_XID_STRIPE_MAINTENANCE_PENDING)
+		return result;
+	LWLockAcquire(&StripeBootShmem->lock, LW_EXCLUSIVE);
+	/* Only the armed original promise counts as DURABLE, never tracking HWM. */
+	if (pg_atomic_read_u64(&StripeBootShmem->herding_floor_full) >= value
+		|| pg_atomic_read_u64(&StripeLease->floor_full) >= value) {
+		result = CLUSTER_XID_STRIPE_MAINTENANCE_DURABLE;
+		goto release;
+	}
+	same = StripeBootShmem->maintenance_pending
+		   && memcmp(&StripeBootShmem->maintenance_identity, identity, sizeof(*identity)) == 0
+		   && StripeBootShmem->maintenance_stripe.activation_floor_full
+				  == stripe->activation_floor_full
+		   && StripeBootShmem->maintenance_stripe.activation_epoch == stripe->activation_epoch
+		   && StripeBootShmem->maintenance_stripe.activation_generation
+				  == stripe->activation_generation
+		   && StripeBootShmem->maintenance_stripe.slot_floor_full == stripe->slot_floor_full
+		   && StripeBootShmem->maintenance_stripe.slot_owner_incarnation
+				  == stripe->slot_owner_incarnation
+		   && StripeBootShmem->maintenance_stripe.incarnation == stripe->incarnation
+		   && StripeBootShmem->maintenance_stripe.lease_floor_full == stripe->lease_floor_full
+		   && StripeBootShmem->maintenance_stripe.slot == stripe->slot;
+	if (same && StripeBootShmem->maintenance_requested_full >= value) {
+		goto release;
+	}
+	if (StripeBootShmem->maintenance_seq == UINT64_MAX) {
+		result = CLUSTER_XID_STRIPE_MAINTENANCE_UNAVAILABLE;
+		goto release;
+	}
+	StripeBootShmem->maintenance_identity = *identity;
+	StripeBootShmem->maintenance_stripe = *stripe;
+	StripeBootShmem->maintenance_requested_full = value;
+	StripeBootShmem->maintenance_seq++;
+	StripeBootShmem->maintenance_pending = true;
+release:
+	LWLockRelease(&StripeBootShmem->lock);
+	if (result != CLUSTER_XID_STRIPE_MAINTENANCE_UNAVAILABLE
+		&& (!cluster_semantic_activation_active_sample_current(identity)
+			|| !cluster_xid_stripe_sample_fence_current(stripe)))
+		return CLUSTER_XID_STRIPE_MAINTENANCE_IDENTITY_CHANGED;
+	return result;
+}
+
+static void
+stripe_maintenance_retire(uint64 seq)
+{
+	LWLockAcquire(&StripeBootShmem->lock, LW_EXCLUSIVE);
+	if (StripeBootShmem->maintenance_seq == seq)
+		StripeBootShmem->maintenance_pending = false;
+	LWLockRelease(&StripeBootShmem->lock);
+}
+
 /* Sole writer: the existing QVOTEC poll. A failed partial write retains the
  * exact proposed interval; a new process burns it instead of reissuing it.
  * The caller supplies its latest native/herding minimum, never a grant.
@@ -919,6 +1038,112 @@ stripe_lease_tick(const int *fds, int n_disks, uint64 minimum)
 	StripeLease->publisher_incarnation = incarnation;
 	pending_limit = 0;
 	ConditionVariableBroadcast(&StripeLease->changed);
+}
+
+/* Original QVOTEC is the sole durable consumer. No native/content/census or
+ * semantic lock spans IO. A failed proof retains intent; identity change retires
+ * only this sequence. Bytes already written cannot be undone, and an armed
+ * floor never rolls back. None of these observations publishes global F. */
+static bool
+stripe_maintenance_tick(const int *fds, int n_disks)
+{
+	ClusterSemanticActiveSampleFence identity;
+	ClusterXidStripeSampleFence stripe;
+	ClusterXidStripeMaintenanceResult result;
+	ClusterXidStripeSlotRecord rec;
+	uint64 seq, requested;
+	char bytes[CLUSTER_VOTING_SLOT_BYTES] = { 0 };
+	int written = 0;
+
+	LWLockAcquire(&StripeBootShmem->lock, LW_SHARED);
+	if (!StripeBootShmem->maintenance_pending) {
+		LWLockRelease(&StripeBootShmem->lock);
+		return true;
+	}
+	identity = StripeBootShmem->maintenance_identity;
+	stripe = StripeBootShmem->maintenance_stripe;
+	seq = StripeBootShmem->maintenance_seq;
+	requested = StripeBootShmem->maintenance_requested_full;
+	LWLockRelease(&StripeBootShmem->lock);
+	if (n_disks > CLUSTER_MAX_VOTING_DISKS || n_disks % 2 == 0
+		|| cluster_qvotec_self_incarnation_value() == 0)
+		return false;
+	result = stripe_maintenance_validate(&identity, &stripe, FullTransactionIdFromU64(requested));
+	if (result != CLUSTER_XID_STRIPE_MAINTENANCE_PENDING) {
+		if (result == CLUSTER_XID_STRIPE_MAINTENANCE_IDENTITY_CHANGED)
+			stripe_maintenance_retire(seq);
+		return false;
+	}
+	if (U64FromFullTransactionId(cluster_xid_stripe_herding_floor()) >= requested) {
+		stripe_maintenance_retire(seq);
+		return true;
+	}
+	/* A bounded request may need a larger issued interval. Keep the original
+	 * lease/history writer and its meaning; only validated intent reaches it. */
+	if (!cluster_xid_stripe_lease_ready(FullTransactionIdFromU64(requested)))
+		stripe_lease_tick(fds, n_disks, requested);
+	if (!cluster_xid_stripe_sample_fence_current(&stripe)
+		|| !cluster_xid_stripe_lease_ready(FullTransactionIdFromU64(requested)))
+		return false;
+	if (stripe_read_slot_all(fds, n_disks, cluster_node_id, &rec, STRIPE_READ_UPDATE)
+			!= STRIPE_READ_VALID
+		|| rec.retired || rec.generation == UINT64_MAX
+		|| rec.owner_incarnation != stripe.slot_owner_incarnation
+		|| rec.floor_full != stripe.slot_floor_full
+		|| rec.stride_mode_epoch != stripe.activation_epoch
+		|| rec.lease_incarnation != stripe.incarnation
+		|| rec.lease_floor_full != stripe.lease_floor_full || rec.issued_limit_full <= requested
+		|| rec.issued_limit_full < pg_atomic_read_u64(&StripeLease->limit_full))
+		return false;
+	rec.next_xid_hwm_full = Max(rec.next_xid_hwm_full, requested);
+	rec.generation++;
+	cluster_xid_stripe_slot_record_compute_crc(&rec);
+	memcpy(bytes, &rec, sizeof(rec));
+	/* Even an equal/larger TRACKING HWM is not a durable promise. */
+	for (int i = 0; i < n_disks; i++)
+		if (cluster_voting_disk_write_stripe_slot_ex(fds[i], cluster_node_id, bytes, true)
+			== CLUSTER_VOTING_DISK_IO_OK)
+			written++;
+
+	LWLockAcquire(&StripeBootShmem->lock, LW_EXCLUSIVE);
+	/* Keep ordinary herding from adopting this attempted image as its own
+	 * JUMP after a proof refusal. This soft cache grants nothing; pending
+	 * maintenance still retries synchronous writes even when HWM covers it. */
+	if (StripeBootShmem->my_slot_claimed
+		&& StripeBootShmem->my_owner_incarnation == stripe.slot_owner_incarnation
+		&& StripeBootShmem->my_slot_floor_full == stripe.slot_floor_full)
+		StripeBootShmem->my_hwm_on_disk
+			= Max(StripeBootShmem->my_hwm_on_disk, rec.next_xid_hwm_full);
+	LWLockRelease(&StripeBootShmem->lock);
+	if (written < n_disks / 2 + 1)
+		return false;
+	result = stripe_maintenance_validate(&identity, &stripe, FullTransactionIdFromU64(requested));
+	if (result != CLUSTER_XID_STRIPE_MAINTENANCE_PENDING) {
+		if (result == CLUSTER_XID_STRIPE_MAINTENANCE_IDENTITY_CHANGED)
+			stripe_maintenance_retire(seq);
+		return false;
+	}
+	LWLockAcquire(&StripeBootShmem->lock, LW_EXCLUSIVE);
+	/* A replacement identity may have staged during IO. Never retire it or
+	 * publish the old request on its behalf. Same-identity larger intent can
+	 * coexist with this completed prefix. */
+	if (memcmp(&StripeBootShmem->maintenance_identity, &identity, sizeof(identity)) != 0
+		|| pg_atomic_read_u32(&StripeLease->failed) != 0
+		|| pg_atomic_read_u64(&StripeLease->published_incarnation) != stripe.incarnation
+		|| pg_atomic_read_u64(&StripeLease->floor_full) != stripe.lease_floor_full
+		|| pg_atomic_read_u64(&StripeLease->limit_full) <= requested
+		|| cluster_qvotec_get_self_incarnation() != stripe.incarnation
+		|| !cluster_qvotec_in_quorum()) {
+		LWLockRelease(&StripeBootShmem->lock);
+		return false;
+	}
+	if (requested > pg_atomic_read_u64(&StripeBootShmem->herding_floor_full))
+		pg_atomic_write_u64(&StripeBootShmem->herding_floor_full, requested);
+	if (StripeBootShmem->maintenance_seq == seq)
+		StripeBootShmem->maintenance_pending = false;
+	LWLockRelease(&StripeBootShmem->lock);
+	ConditionVariableBroadcast(&StripeLease->changed);
+	return true;
 }
 
 void
@@ -1906,6 +2131,9 @@ cluster_xid_stripe_herding_tick(const int *fds, int n_disks)
 		if (cluster_cr_injection_armed("cluster-xid-herding-stall", &dummy))
 			return;
 	}
+
+	if (!stripe_maintenance_tick(fds, n_disks))
+		return;
 
 	/* 1. peer hwm sweep (declared, valid, non-retired slots only). */
 	for (slot = 0; slot < CLUSTER_XID_STRIDE; slot++) {
