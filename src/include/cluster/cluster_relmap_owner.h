@@ -11,6 +11,7 @@
 
 struct XLogReaderState;
 struct ClusterWalInputsV1;
+struct ClusterRelmapPendingSideSource;
 
 /* Process-local preparation only. Keep the complete native writer reference;
  * the on-disk relmap header cannot substitute for its WAL/claim retention.
@@ -51,6 +52,19 @@ extern bool cluster_relmap_owner_wal_matches_v2(const ClusterRelmapV2Image *imag
  * duties. OK grants no terminal, COMPLETE, stage or release authority. */
 extern ClusterControlRootResult cluster_relmap_owner_retained_wal_v2(
 	const ClusterRelmapV2Image *image, struct ClusterWalInputsV1 *inputs);
+
+/* The same pending-record check, additionally matching the complete supplied
+ * sealed RECOVERY SIDE physical participant set to this original cold scope's
+ * actual full claims and cuts in ONE retained scan. Include every participant
+ * of each plan and every selected source, including explicit-empty terminals.
+ * Keep image, sources and plans immutable for the call. The caller owns the
+ * scope, including release on ERROR. No plan capture/completeness proof, redo
+ * eligibility, final SIDE revalidation or independent era/epoch/boot/floor/
+ * last-issued qualification here. OK grants no COMPLETE or release authority;
+ * no live caller is introduced. Graph component counts are not source proof. */
+extern ClusterControlRootResult cluster_relmap_owner_retained_side_wal_v2(
+	const ClusterRelmapV2Image *image, struct ClusterWalInputsV1 *inputs,
+	const struct ClusterRelmapPendingSideSource *sources, size_t source_count);
 
 /* Dormant preparation adapter, BEFORE RelationMappingLock/WAL/critical work.
  * Recheck this original sample, read the original TT owner's published receipt

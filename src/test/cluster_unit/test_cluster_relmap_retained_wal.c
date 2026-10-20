@@ -302,6 +302,253 @@ UT_TEST(test_retained_relmap_invalid_input_is_read_only)
 	cold_census_done(&inputs);
 }
 
+typedef struct RelmapRetainedSideFixture
+{
+	ClusterRelmapPendingSideSource sources[2];
+	RfSideOnlinePlanV1 *plans[2];
+} RelmapRetainedSideFixture;
+
+typedef struct RelmapRetainedSideFeed
+{
+	ClusterRelmapPendingSideSource *input;
+	uint32 participant;
+} RelmapRetainedSideFeed;
+
+/* Capture the real native NOOP suffix, using its original route and reader.
+ * This seals the source/cut fixture, not a complete recovery capture: RELMAP
+ * remains with its native owner. The API under test cannot certify omitted
+ * operations or independently qualify these plans for recovery execution. */
+static bool
+relmap_retained_side_feed(XLogReaderState *reader, void *arg)
+{
+	const RelmapRetainedSideFeed *feed = arg;
+	ClusterRelmapPendingSideSource *input = feed->input;
+	RfDetachedRecordPlanV1 record = { 0 };
+	RfPageOnlineRecordIdentityV1 identity = { 0 };
+	RfPageProofDetailV1 result;
+
+	if (XLogRecGetRmid(reader) != RM_XLOG_ID ||
+		(XLogRecGetInfo(reader) & ~XLR_INFO_MASK) != XLOG_NOOP)
+		return true;
+	if (reader->ReadRecPtr < input->cut.scan_begin_inclusive)
+		return true;
+	record.source_record = reader;
+	record.preflight_complete = true;
+	UT_ASSERT_EQ(rf_opcode_route_lookup_v1(XLogRecGetRmid(reader), XLogRecGetInfo(reader),
+		false, true, &record.route), RF_OPCODE_ROUTE_OK);
+	identity.record.system_identifier = reader->system_identifier;
+	memcpy(identity.record.storage_uuid, input->source.claim.identity.storage_uuid, 16);
+	identity.record.origin_thread = input->cut.failed_thread;
+	identity.record.timeline_id = input->cut.timeline_id;
+	identity.record.read_rec_ptr = reader->ReadRecPtr;
+	identity.record.end_rec_ptr = reader->EndRecPtr;
+	identity.record.record_crc = reader->record->header.xl_crc;
+	identity.record.rmid = XLogRecGetRmid(reader);
+	identity.record.info = XLogRecGetInfo(reader);
+	identity.participant_index = feed->participant;
+	result = rf_side_online_plan_feed_record_v1((RfSideOnlinePlanV1 *)input->plan,
+		&record, &identity);
+	UT_ASSERT_EQ(result, RF_PAGE_PROOF_DETAIL_OK);
+	return result == RF_PAGE_PROOF_DETAIL_OK;
+}
+
+/* fault mutates an internally consistent sealed input, so refusal must come
+ * from comparison with the held original source, not only self-validation. */
+static void
+relmap_retained_side(RelmapRetainedSideFixture *f, ClusterWalInputsV1 *inputs,
+	const ClusterRelmapV2Image *image, bool split, unsigned fault, bool seal)
+{
+	RfContributorStreamCutV1 cuts[2];
+	ClusterWalSourceRef sources[2];
+
+	memset(f, 0, sizeof(*f));
+	UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), 2);
+	for (unsigned i = 0; i < 2; i++) {
+		const ClusterWalInputV1 *item = cluster_wal_inputs_at_v1(inputs, i);
+		ClusterRelmapPendingSideSource *input = &f->sources[i];
+
+		UT_ASSERT(item != NULL && item->kind == CLUSTER_WAL_INPUT_CHECKPOINT);
+		if (item == NULL) return;
+		input->source = item->source;
+		input->cut.failed_thread = item->source.claim.identity.origin_thread_id;
+		input->cut.origin_owner_incarnation = item->source.claim.identity.origin_owner_incarnation;
+		input->cut.timeline_id = item->source.timeline;
+		input->cut.scan_begin_inclusive = item->checkpoint.checkpoint_lower_lsn;
+		input->cut.scan_end_exclusive = item->checkpoint.validated_tail_lsn_exclusive;
+		input->cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+		if (i == 1) {
+			if (fault == 1) input->cut.scan_begin_inclusive += MAXIMUM_ALIGNOF;
+			if (fault == 2) input->source.claim.claim_sha256[0] ^= 0x5a;
+			if (fault == 3) input->source.claim.max_config_generation++;
+			if (fault == 4) {
+				input->cut.scan_end_exclusive = input->cut.scan_begin_inclusive;
+				input->cut.flags |= RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY;
+			}
+		}
+		cuts[i] = input->cut;
+		sources[i] = input->source;
+	}
+	for (unsigned p = 0; p < (split ? 2 : 1); p++) {
+		RfSideOnlinePlanRequestV1 request = { 0 };
+		unsigned first = split ? p : 0, count = split ? 1 : 2;
+
+		request.system_identifier = image->identity.system_identifier;
+		memcpy(request.storage_uuid, sources[0].claim.identity.storage_uuid, 16);
+		request.physical_cuts = &cuts[first];
+		request.participant_count = count;
+		request.purpose = RF_SIDE_PLAN_RECOVERY;
+		UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &f->plans[p]), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(rf_side_online_plan_bind_sources_v1(f->plans[p], &sources[first], count));
+		for (unsigned j = 0; j < count; j++) {
+			ClusterRelmapPendingSideSource *input = &f->sources[first + j];
+			ClusterWalTailObservation observation;
+			RelmapRetainedSideFeed feed = { input, j };
+
+			input->plan = f->plans[p];
+			if (!(input->cut.flags & RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY))
+				UT_ASSERT_EQ(cluster_wal_inputs_visit_retained_v1(inputs, first + j,
+					relmap_retained_side_feed, &feed, &observation), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		}
+		if (seal) {
+			UT_ASSERT(rf_side_online_plan_bind_database_v1(f->plans[p], image->identity.database_incarnation));
+			UT_ASSERT_EQ(rf_side_online_plan_seal_v1(f->plans[p]), RF_PAGE_PROOF_DETAIL_OK);
+		}
+	}
+}
+
+static void
+relmap_retained_side_destroy(RelmapRetainedSideFixture *f)
+{
+	for (unsigned i = 0; i < 2; i++)
+		rf_side_online_plan_destroy_v1(&f->plans[i]);
+}
+
+UT_TEST(test_retained_side_exact_complete_and_permuted)
+{
+	for (unsigned mode = 0; mode < 4; mode++) {
+		ClusterRelmapV2Image image, before;
+		ClusterWalInputsV1 *inputs = relmap_test_fixture(&image, mode % 2, mode < 2, true, false);
+		RelmapRetainedSideFixture f;
+		ClusterRelmapPendingSideSource supplied[2], saved[2];
+
+		relmap_retained_side(&f, inputs, &image, mode % 2 != 0, 0, true);
+		before = image;
+		for (unsigned pass = 0; pass < 2; pass++) {
+			supplied[0] = f.sources[pass];
+			supplied[1] = f.sources[1 - pass];
+			/* Graph counts must not be mistaken for physical source identity. */
+			supplied[0].cut.contributor_count = 987;
+			memcpy(saved, supplied, sizeof(saved));
+			UT_ASSERT_EQ(cluster_relmap_owner_retained_side_wal_v2(&image, inputs,
+				supplied, 2), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+			UT_ASSERT_EQ(memcmp(&image, &before, sizeof(image)), 0);
+			UT_ASSERT_EQ(memcmp(supplied, saved, sizeof(saved)), 0);
+			UT_ASSERT_EQ(cluster_wal_inputs_revalidate_v1(inputs), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+			UT_ASSERT(inputs_pin_held && inputs_pin_current && test_actual_cf == NoLock);
+		}
+		UT_ASSERT_EQ(inputs_peer_begins + inputs_native_begin_calls + inputs_native_flush_calls, 0);
+		relmap_retained_side_destroy(&f);
+		cold_census_done(&inputs);
+	}
+}
+
+UT_TEST(test_retained_side_rejects_incomplete_or_invalid_vectors)
+{
+	for (unsigned fault = 0; fault < 11; fault++) {
+		ClusterRelmapV2Image image;
+		ClusterWalInputsV1 *inputs = relmap_test_fixture(&image, 0, true, true, false);
+		RelmapRetainedSideFixture f;
+		ClusterRelmapPendingSideSource supplied[3];
+		const ClusterRelmapPendingSideSource *argument = supplied;
+		size_t count = 2;
+
+		relmap_retained_side(&f, inputs, &image, fault != 0, 0, fault != 7);
+		memcpy(supplied, f.sources, sizeof(f.sources));
+		if (fault <= 1) count = 1; /* missing shared-plan participant / selected source */
+		if (fault == 2) supplied[1] = supplied[0];
+		if (fault == 3) { supplied[2] = supplied[0]; count = 3; }
+		if (fault == 4) supplied[1].cut.scan_end_exclusive++;
+		if (fault == 5) supplied[1].source.claim.claim_sha256[0] ^= 0x37;
+		if (fault == 6) supplied[1].plan = NULL;
+		if (fault == 8) argument = NULL;
+		if (fault == 9) count = 0;
+		if (fault == 10) count = CLUSTER_WAL_INPUTS_MAX + 1;
+		UT_ASSERT_NE(cluster_relmap_owner_retained_side_wal_v2(&image, inputs,
+			argument, count), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock);
+		UT_ASSERT_EQ(cluster_wal_inputs_revalidate_v1(inputs), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		relmap_retained_side_destroy(&f);
+		cold_census_done(&inputs);
+	}
+}
+
+UT_TEST(test_retained_side_checks_actual_cut_claim_and_empty_source)
+{
+	for (unsigned fault = 1; fault <= 4; fault++) {
+		ClusterRelmapV2Image image;
+		ClusterWalInputsV1 *inputs = relmap_test_fixture(&image, 0, false, true, false);
+		RelmapRetainedSideFixture f;
+
+		relmap_retained_side(&f, inputs, &image, true, fault, true);
+		for (unsigned i = 0; i < 2; i++) {
+			UT_ASSERT(rf_side_online_plan_recovery_source_matches_v1(f.sources[i].plan,
+				image.identity.system_identifier, v2_storage, &f.sources[i].cut));
+			UT_ASSERT(rf_side_online_plan_recovery_claim_matches_v1(f.sources[i].plan,
+				&f.sources[i].source));
+		}
+		UT_ASSERT_NE(cluster_relmap_owner_retained_side_wal_v2(&image, inputs,
+			f.sources, 2), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock);
+		relmap_retained_side_destroy(&f);
+		cold_census_done(&inputs);
+	}
+}
+
+UT_TEST(test_retained_side_preserves_native_scan_and_final_rechecks)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		ClusterRelmapV2Image image;
+		ClusterWalInputsV1 *inputs = relmap_test_fixture(&image, 0, true, fault != 3, fault == 2);
+		RelmapRetainedSideFixture f;
+
+		/* OPEN cannot be visited: build the otherwise valid sealed input from
+		 * its native tail fixture first, then restore the held OPEN scope. */
+		if (fault == 2) {
+			cold_census_done(&inputs);
+			inputs = relmap_test_fixture(&image, 0, true, true, false);
+		}
+		relmap_retained_side(&f, inputs, &image, false, 0, true);
+		if (fault == 2) {
+			cold_census_done(&inputs);
+			inputs = relmap_test_fixture(&image, 0, true, true, true);
+		}
+		if (fault <= 1) {
+			char path[MAXPGPATH];
+			uint8 bad = 0x5a;
+			int fd;
+
+			v2_checkpoint_wal_path(&relmap_test_source[fault].claim.identity,
+				relmap_test_record[fault].exclusive_end, relmap_test_source[fault].timeline, path);
+			fd = open(path, O_WRONLY);
+			UT_ASSERT(fd >= 0);
+			UT_ASSERT_EQ(pwrite(fd, &bad, 1, relmap_test_record[fault].exclusive_end % wal_segment_size + SizeOfXLogRecord + 2), 1);
+			UT_ASSERT_EQ(close(fd), 0);
+		}
+		if (fault >= 4) {
+			relmap_test_fault = fault - 3;
+			test_stop_share_call = test_cf_lock_calls + 6;
+			test_stop_share_hook = relmap_test_recheck_fault;
+		}
+		UT_ASSERT_NE(cluster_relmap_owner_retained_side_wal_v2(&image, inputs,
+			f.sources, 2), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		if (fault >= 4) UT_ASSERT(test_stop_share_hook == NULL);
+		test_stop_share_hook = NULL;
+		UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock);
+		relmap_retained_side_destroy(&f);
+		cold_census_done(&inputs);
+	}
+}
+
 typedef struct RelmapCensusWalFixture
 {
 	char path[MAXPGPATH];
@@ -1115,13 +1362,17 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(22);
+	UT_PLAN(26);
 	UT_RUN(test_retained_relmap_matches_each_selected_namespace);
 	UT_RUN(test_retained_relmap_requires_exact_pending);
 	UT_RUN(test_retained_relmap_scans_suffix_and_other_source);
 	UT_RUN(test_retained_relmap_waits_for_open_and_rejects_online);
 	UT_RUN(test_retained_relmap_original_recheck_and_error_keep_pin);
 	UT_RUN(test_retained_relmap_invalid_input_is_read_only);
+	UT_RUN(test_retained_side_exact_complete_and_permuted);
+	UT_RUN(test_retained_side_rejects_incomplete_or_invalid_vectors);
+	UT_RUN(test_retained_side_checks_actual_cut_claim_and_empty_source);
+	UT_RUN(test_retained_side_preserves_native_scan_and_final_rechecks);
 	UT_RUN(test_census_wal_rebuild_stage_and_publish_cuts);
 	UT_RUN(test_census_wal_mismatch_is_atomic_and_sticky);
 	UT_RUN(test_census_wal_wait_online_and_missing_scope_refuse);

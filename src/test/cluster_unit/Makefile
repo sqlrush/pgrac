@@ -3403,6 +3403,7 @@ test_cluster_relmap_retained_census.o: $(top_srcdir)/src/backend/cluster/cluster
 		-Dcluster_relmap_pending_collect_side=test_relmap_pending_collect_side -c $< -o $@
 test_cluster_relmap_retained_owner.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_pending_side.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
