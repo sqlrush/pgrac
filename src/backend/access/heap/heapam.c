@@ -5237,6 +5237,120 @@ heap_hot_r4_trace_item(Page page, OffsetNumber offnum, char *out, Size size)
 			 slot.undo_segment_head.raw[0], slot.undo_segment_head.raw[1]);
 }
 
+/* Private diagnostic projections, captured only under the original content
+ * locks.  Item strings own their bytes; no Page/Buffer/tuple pointer escapes. */
+typedef struct HeapHotR4UpdatePageTrace {
+	BufferTag tag;
+	OffsetNumber offset;
+	bool page_known;
+	XLogRecPtr lsn;
+	SCN scn;
+	char item[512];
+} HeapHotR4UpdatePageTrace;
+
+typedef struct HeapHotR4UpdateTrace {
+	bool enabled;
+	TransactionId raw_xid, canonical_xid;
+	CommandId command_id;
+	ItemPointerData requested_tid, old_tid, new_tid;
+	bool hot, cross_page;
+	UBA undo;
+	XLogRecPtr wal_lsn;
+	HeapHotR4UpdatePageTrace before_old, before_new, after_old, after_new;
+} HeapHotR4UpdateTrace;
+
+static void
+heap_hot_r4_update_capture(HeapHotR4UpdatePageTrace *out, const BufferTag *tag,
+						  Page page, OffsetNumber offset)
+{
+	/* No logging, clocks, allocation, lookup or I/O in the locked capture. */
+	memset(out, 0, sizeof(*out));
+	out->tag = *tag;
+	out->offset = offset;
+	out->page_known = heap_hot_r4_scratch_page_valid(page);
+	if (out->page_known) {
+		out->lsn = PageGetLSN(page);
+		out->scn = ((PageHeader)page)->pd_block_scn;
+	}
+	heap_hot_r4_trace_item(page, offset, out->item, sizeof(out->item));
+}
+
+static void
+heap_hot_r4_update_trace(const HeapHotR4UpdateTrace *view)
+{
+	static uint64 event_seq;
+	static uint64 critical_skipped;
+
+	if (!cluster_trace_normal_stop || !view->enabled)
+		return;
+	if (CritSectionCount != 0) {
+		if (critical_skipped != UINT64_MAX)
+			critical_skipped++;
+		return;
+	}
+	if (event_seq != UINT64_MAX)
+		event_seq++;
+	ereport(LOG,
+			(errmsg_internal(
+				 "PGRAC_FAMILY=R4_HEAP_UPDATE event=update.published "
+				 "event_seq=" UINT64_FORMAT " sequence_scope=process sequence_domain=R4_HEAP_UPDATE "
+				 "node_id=%d pid=%d procno=%d backend_id=%d backend_type=%d "
+				 "wall_us=" INT64_FORMAT " monotonic_us=" UINT64_FORMAT
+				 " identity_source=run_manifest run_id_known=0 boot_identity_known=0 "
+				 "process_incarnation_known=0 full_xid_known=0 "
+				 "request_id_known=0 root_identity_known=0 receipt_identity_known=0 "
+				 "authoritative=0 transport_receipt=0 commit_receipt=0 "
+				 "capture_scope=final_heap_update emission_scope=after_original_release "
+				 "raw_xid=%u canonical_xid=%u input_command_id=%u hot=%d cross_page=%d "
+				 "requested_tid=%u/%u old_tid=%u/%u new_tid=%u/%u "
+				 "undo_uba_raw=" UINT64_FORMAT "/" UINT64_FORMAT
+				 " wal_inserted=%d wal_lsn=" UINT64_FORMAT " wal_flush_known=0 "
+				 "old_tag=%u/%u/%u/%d/%u new_tag=%u/%u/%u/%d/%u "
+				 "after_old_tag=%u/%u/%u/%d/%u after_new_tag=%u/%u/%u/%d/%u "
+				 "before_old_page_known=%d before_old_offset=%u before_old_lsn=" UINT64_FORMAT
+				 " before_old_scn=" UINT64_FORMAT " before_old={%s} "
+				 "before_new_page_known=%d before_new_offset=%u before_new_lsn=" UINT64_FORMAT
+				 " before_new_scn=" UINT64_FORMAT " before_new={%s} "
+				 "after_old_page_known=%d after_old_offset=%u after_old_lsn=" UINT64_FORMAT
+				 " after_old_scn=" UINT64_FORMAT " after_old={%s} "
+				 "after_new_page_known=%d after_new_offset=%u after_new_lsn=" UINT64_FORMAT
+				 " after_new_scn=" UINT64_FORMAT " after_new={%s} "
+				 "trace_critical_skipped=" UINT64_FORMAT " trace_sequence_exhausted=%d",
+				 event_seq, cluster_node_id, MyProcPid, MyProc != NULL ? MyProc->pgprocno : -1,
+				 (int)MyBackendId, (int)MyBackendType,
+				 GetCurrentTimestamp(), cluster_heap_itl_now_us(),
+				 view->raw_xid, view->canonical_xid, view->command_id, view->hot, view->cross_page,
+				 ItemPointerGetBlockNumberNoCheck(&view->requested_tid),
+				 ItemPointerGetOffsetNumberNoCheck(&view->requested_tid),
+				 ItemPointerGetBlockNumberNoCheck(&view->old_tid),
+				 ItemPointerGetOffsetNumberNoCheck(&view->old_tid),
+				 ItemPointerGetBlockNumberNoCheck(&view->new_tid),
+				 ItemPointerGetOffsetNumberNoCheck(&view->new_tid),
+				 view->undo.raw[0], view->undo.raw[1], !XLogRecPtrIsInvalid(view->wal_lsn),
+				 (uint64)view->wal_lsn,
+				 view->before_old.tag.spcOid, view->before_old.tag.dbOid,
+				 (unsigned int)view->before_old.tag.relNumber, (int)view->before_old.tag.forkNum,
+				 (unsigned int)view->before_old.tag.blockNum,
+				 view->before_new.tag.spcOid, view->before_new.tag.dbOid,
+				 (unsigned int)view->before_new.tag.relNumber, (int)view->before_new.tag.forkNum,
+				 (unsigned int)view->before_new.tag.blockNum,
+				 view->after_old.tag.spcOid, view->after_old.tag.dbOid,
+				 (unsigned int)view->after_old.tag.relNumber, (int)view->after_old.tag.forkNum,
+				 (unsigned int)view->after_old.tag.blockNum,
+				 view->after_new.tag.spcOid, view->after_new.tag.dbOid,
+				 (unsigned int)view->after_new.tag.relNumber, (int)view->after_new.tag.forkNum,
+				 (unsigned int)view->after_new.tag.blockNum,
+				 view->before_old.page_known, view->before_old.offset, (uint64)view->before_old.lsn,
+				 (uint64)view->before_old.scn, view->before_old.item,
+				 view->before_new.page_known, view->before_new.offset, (uint64)view->before_new.lsn,
+				 (uint64)view->before_new.scn, view->before_new.item,
+				 view->after_old.page_known, view->after_old.offset, (uint64)view->after_old.lsn,
+				 (uint64)view->after_old.scn, view->after_old.item,
+				 view->after_new.page_known, view->after_new.offset, (uint64)view->after_new.lsn,
+				 (uint64)view->after_new.scn, view->after_new.item,
+				 critical_skipped, event_seq == UINT64_MAX)));
+}
+
 /* Original caller's stable_input and request-owned FULL scratch only. Never
  * inspect the live buffer while its SHARE lock is dropped. The unchanged
  * caller still revalidates the input after this cycle returns. */
@@ -12424,6 +12538,8 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 	ClusterUndoRecordPrepareReceipt undo_receipt = {0};
 	ClusterCtrcReceiptHandle cluster_itl_ctrc_handles[2] = {{0}};
 	uint64		undo_prepare_deadline_us = 0;
+	bool		cluster_update_trace_enabled = false;
+	HeapHotR4UpdateTrace cluster_update_trace;
 	TransactionId canonical_xid = InvalidTransactionId;
 	TransactionId creation_xmin = InvalidTransactionId;
 	int			cluster_current_mx_undo_diagnostic_budget = 8;
@@ -14931,6 +15047,30 @@ l_pgrac_reacquire:
 	}
 #endif
 
+#ifdef USE_PGRAC_CLUSTER
+	cluster_update_trace_enabled = cluster_trace_normal_stop && cluster_heap_read_needs_copy(relation);
+	if (cluster_update_trace_enabled)
+	{
+		BufferTag old_tag = heap_hot_r4_buffer_tag(buffer);
+		BufferTag new_tag = heap_hot_r4_buffer_tag(newbuf);
+
+		memset(&cluster_update_trace, 0, sizeof(cluster_update_trace));
+		cluster_update_trace.enabled = true;
+		cluster_update_trace.raw_xid = xid;
+		cluster_update_trace.canonical_xid = canonical_xid;
+		cluster_update_trace.command_id = pgrac_entry_cid;
+		cluster_update_trace.requested_tid = *otid;
+		cluster_update_trace.old_tid = oldtup.t_self;
+		cluster_update_trace.hot = use_hot_update;
+		cluster_update_trace.cross_page = newbuf != buffer;
+		heap_hot_r4_update_capture(&cluster_update_trace.before_old, &old_tag,
+			BufferGetPage(buffer), ItemPointerGetOffsetNumber(&oldtup.t_self));
+		/* The physical new item does not exist until RelationPutHeapTuple. */
+		heap_hot_r4_update_capture(&cluster_update_trace.before_new, &new_tag,
+			BufferGetPage(newbuf), InvalidOffsetNumber);
+	}
+#endif
+
 	/* NO EREPORT(ERROR) from here till changes are logged */
 	START_CRIT_SECTION();
 
@@ -15178,6 +15318,8 @@ l_pgrac_reacquire:
 		}
 		PageSetLSN(BufferGetPage(buffer), recptr);
 #ifdef USE_PGRAC_CLUSTER
+		if (cluster_update_trace_enabled)
+			cluster_update_trace.wal_lsn = recptr;
 		if (cluster_page_versioned)
 		{
 			if (vm_locked)
@@ -15189,6 +15331,21 @@ l_pgrac_reacquire:
 	}
 
 	END_CRIT_SECTION();
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_update_trace_enabled)
+	{
+		BufferTag old_tag = heap_hot_r4_buffer_tag(buffer);
+		BufferTag new_tag = heap_hot_r4_buffer_tag(newbuf);
+
+		cluster_update_trace.new_tid = heaptup->t_self;
+		cluster_update_trace.undo = cluster_itl_uba;
+		heap_hot_r4_update_capture(&cluster_update_trace.after_old, &old_tag,
+			BufferGetPage(buffer), ItemPointerGetOffsetNumber(&oldtup.t_self));
+		heap_hot_r4_update_capture(&cluster_update_trace.after_new, &new_tag,
+			BufferGetPage(newbuf), ItemPointerGetOffsetNumber(&heaptup->t_self));
+	}
+#endif
 
 #ifdef USE_PGRAC_CLUSTER
 	if (cluster_current_mx_recomposed)
@@ -15293,6 +15450,13 @@ l_pgrac_reacquire:
 	 */
 	if (have_tuple_lock)
 		UnlockTupleTuplock(relation, &(oldtup.t_self), *lockmode);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* No shared page pointer survives capture; diagnostic ERROR cannot strand
+	 * these original buffer/pin or tuple-lock responsibilities. */
+	if (cluster_update_trace_enabled)
+		heap_hot_r4_update_trace(&cluster_update_trace);
+#endif
 
 	pgstat_count_heap_update(relation, use_hot_update, newbuf != buffer);
 

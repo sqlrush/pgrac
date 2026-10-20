@@ -3,6 +3,7 @@
  * Author: SqlRush <sqlrush@gmail.com>
  */
 #include "postgres.h"
+#include "storage/proc.h"
 #include "access/heapam.h"
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_guc.h"
@@ -22,6 +23,9 @@ bool cluster_trace_normal_stop;
 bool cluster_shared_config, cluster_recmerge_window_active, cluster_recmerge_apply_foreign;
 uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
 int cluster_node_id = 2, MyProcPid = 4242;
+PGPROC *MyProc = NULL;
+BackendId MyBackendId = 0;
+BackendType MyBackendType = B_BACKEND;
 volatile uint32 CritSectionCount;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
@@ -302,9 +306,259 @@ UT_TEST(cycle_events_remain_before_unchanged_caller_revalidation)
 	UT_ASSERT(strstr(logs, "input_revalidated=0") && strstr(logs, "request_id_known=0"));
 }
 
+#ifdef HEAP_HOT_R4_UPDATE_TRACE_PRESENT
+static HeapHotR4UpdateTrace update_view;
+
+static void
+capture_update_fixture(bool cross_page)
+{
+	BufferTag next_tag;
+	memset(&update_view, 0, sizeof(update_view));
+	update_view.enabled = cluster_trace_normal_stop;
+	update_view.raw_xid = 31337;
+	update_view.canonical_xid = 31337;
+	update_view.command_id = 8;
+	update_view.requested_tid = root;
+	update_view.old_tid = root;
+	ItemPointerSet(&update_view.new_tid, cross_page ? 138 : 137, 3);
+	update_view.hot = !cross_page;
+	update_view.cross_page = cross_page;
+	update_view.undo = (UBA){{8589935105, 196613}};
+	next_tag = tag; next_tag.blockNum = cross_page ? 138 : 137;
+	heap_hot_r4_update_capture(&update_view.before_old, &tag, before.data, 3);
+	heap_hot_r4_update_capture(&update_view.before_new, &next_tag, before.data, InvalidOffsetNumber);
+	heap_hot_r4_update_capture(&update_view.after_old, &tag, full.data, 3);
+	heap_hot_r4_update_capture(&update_view.after_new, &next_tag, full.data, 3);
+	update_view.wal_lsn = 654321;
+}
+#endif
+
+UT_TEST(update_default_off_never_reads_view_or_clock)
+{
+#ifdef HEAP_HOT_R4_UPDATE_TRACE_PRESENT
+	reset_fixture(false); locked = 0;
+	heap_hot_r4_update_trace((const HeapHotR4UpdateTrace *)1);
+	UT_ASSERT(events == 0 && clock_reads == 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(update_capture_stores_owned_values_without_log_or_clock)
+{
+#ifdef HEAP_HOT_R4_UPDATE_TRACE_PRESENT
+	reset_fixture(true);
+	capture_update_fixture(false);
+	UT_ASSERT(events == 0 && clock_reads == 0 && locked == 1);
+	UT_ASSERT(update_view.before_old.page_known);
+	UT_ASSERT(update_view.before_old.lsn == 123456 && update_view.after_old.lsn == 654321);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(update_emission_does_not_read_released_pages)
+{
+#ifdef HEAP_HOT_R4_UPDATE_TRACE_PRESENT
+	reset_fixture(true); capture_update_fixture(false); locked = 0;
+	memset(&before, 0x7f, sizeof(before)); memset(&full, 0x7f, sizeof(full));
+	heap_hot_r4_update_trace(&update_view);
+	UT_ASSERT(events == 1);
+	UT_ASSERT(strstr(logs, "before_old_lsn=123456") != NULL);
+	UT_ASSERT(strstr(logs, "after_old_lsn=654321") != NULL);
+	UT_ASSERT(strstr(logs, "xmin=31337") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(update_records_actual_tags_and_same_page_hot_result)
+{
+#ifdef HEAP_HOT_R4_UPDATE_TRACE_PRESENT
+	reset_fixture(true); capture_update_fixture(false); locked = 0;
+	heap_hot_r4_update_trace(&update_view);
+	UT_ASSERT(strstr(logs, "hot=1 cross_page=0") != NULL);
+	UT_ASSERT(strstr(logs, "old_tag=1663/5/16388/0/137") != NULL);
+	UT_ASSERT(strstr(logs, "new_tag=1663/5/16388/0/137") != NULL);
+	UT_ASSERT(strstr(logs, "before_new_offset=0") != NULL);
+	UT_ASSERT(strstr(logs, "after_new_offset=3") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(update_cross_page_target_is_not_borrowed_from_old_page)
+{
+#ifdef HEAP_HOT_R4_UPDATE_TRACE_PRESENT
+	reset_fixture(true); capture_update_fixture(true); locked = 0;
+	heap_hot_r4_update_trace(&update_view);
+	UT_ASSERT(strstr(logs, "hot=0 cross_page=1") != NULL);
+	UT_ASSERT(strstr(logs, "old_tag=1663/5/16388/0/137") != NULL);
+	UT_ASSERT(strstr(logs, "new_tag=1663/5/16388/0/138") != NULL);
+	UT_ASSERT(strstr(logs, "new_tid=138/3") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(update_raw_cid_itl_and_uba_are_not_authority)
+{
+#ifdef HEAP_HOT_R4_UPDATE_TRACE_PRESENT
+	reset_fixture(true); capture_update_fixture(false); locked = 0;
+	heap_hot_r4_update_trace(&update_view);
+	UT_ASSERT(strstr(logs, "raw_cid=7 combo=1") != NULL);
+	UT_ASSERT(strstr(logs, "slot_xid=31337 wrap=9") != NULL);
+	UT_ASSERT(strstr(logs, "undo_uba_raw=8589935105/196613") != NULL);
+	UT_ASSERT(strstr(logs, "authoritative=0 transport_receipt=0 commit_receipt=0") != NULL);
+	UT_ASSERT(strstr(logs, "full_xid_known=0") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(update_non_wal_operation_does_not_claim_insert_or_durability)
+{
+#ifdef HEAP_HOT_R4_UPDATE_TRACE_PRESENT
+	reset_fixture(true); capture_update_fixture(false); locked = 0;
+	update_view.wal_lsn = InvalidXLogRecPtr;
+	heap_hot_r4_update_trace(&update_view);
+	UT_ASSERT(strstr(logs, "wal_inserted=0 wal_lsn=0") != NULL);
+	UT_ASSERT(strstr(logs, "wal_flush_known=0") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(update_unused_and_redirect_items_are_not_dereferenced)
+{
+#ifdef HEAP_HOT_R4_UPDATE_TRACE_PRESENT
+	reset_fixture(true); capture_update_fixture(false);
+	heap_hot_r4_update_capture(&update_view.before_old, &tag, before.data, 1);
+	heap_hot_r4_update_capture(&update_view.after_old, &tag, before.data, 2);
+	locked = 0; heap_hot_r4_update_trace(&update_view);
+	UT_ASSERT(strstr(logs, "before_old={item_known=1 lp=2 off=3 len=0 tuple_known=0}") != NULL);
+	UT_ASSERT(strstr(logs, "after_old={item_known=1 lp=0 off=0 len=0 tuple_known=0}") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(update_invalid_page_and_tuple_bounds_are_unknown_only)
+{
+#ifdef HEAP_HOT_R4_UPDATE_TRACE_PRESENT
+	reset_fixture(true); capture_update_fixture(false);
+	ItemIdSetNormal(PageGetItemId(before.data, 3), BLCKSZ - 1, 100);
+	heap_hot_r4_update_capture(&update_view.before_old, &tag, before.data, 3);
+	((PageHeader)full.data)->pd_special = 0;
+	heap_hot_r4_update_capture(&update_view.after_old, &tag, full.data, 3);
+	locked = 0; heap_hot_r4_update_trace(&update_view);
+	UT_ASSERT(strstr(logs, "before_old={item_known=1 lp=1 tuple_known=0}") != NULL);
+	UT_ASSERT(strstr(logs, "after_old_page_known=0") != NULL);
+	UT_ASSERT(strstr(logs, "after_old={item_known=0}") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(update_disabled_view_is_quiet_without_clock)
+{
+#ifdef HEAP_HOT_R4_UPDATE_TRACE_PRESENT
+	reset_fixture(true); capture_update_fixture(false); locked = 0; update_view.enabled = false;
+	heap_hot_r4_update_trace(&update_view);
+	UT_ASSERT(events == 0 && clock_reads == 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(update_critical_suppression_keeps_snapshot_and_discloses_gap)
+{
+#ifdef HEAP_HOT_R4_UPDATE_TRACE_PRESENT
+	reset_fixture(true); capture_update_fixture(false); locked = 0; CritSectionCount = 1;
+	heap_hot_r4_update_trace(&update_view);
+	UT_ASSERT(events == 0 && update_view.wal_lsn == 654321);
+	CritSectionCount = 0;
+	heap_hot_r4_update_trace(&update_view);
+	UT_ASSERT(strstr(logs, "trace_critical_skipped=1") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(update_log_error_happens_without_content_lock_or_page_access)
+{
+#ifdef HEAP_HOT_R4_UPDATE_TRACE_PRESENT
+	volatile bool caught = false;
+	reset_fixture(true); capture_update_fixture(false); locked = 0; log_error_event = 1;
+	PG_TRY(); { heap_hot_r4_update_trace(&update_view); }
+	PG_CATCH(); { caught = true; }
+	PG_END_TRY();
+	UT_ASSERT(caught && locked == 0 && update_view.wal_lsn == 654321);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(update_first_event_keeps_request_and_root_unknown)
+{
+#ifdef HEAP_HOT_R4_UPDATE_TRACE_PRESENT
+	reset_fixture(true); capture_update_fixture(false); locked = 0;
+	heap_hot_r4_update_trace(&update_view);
+	UT_ASSERT(strstr(logs, "request_id_known=0 root_identity_known=0") != NULL);
+	UT_ASSERT(strstr(logs, "sequence_domain=R4_HEAP_UPDATE") != NULL);
+	UT_ASSERT(strstr(logs, "emission_scope=after_original_release") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+/* Source binding only: not a full heap_update/real-WAL dynamic execution. */
+UT_TEST(update_integration_captures_locked_then_emits_after_original_release)
+{
+	FILE *file = fopen(HEAPAM_SOURCE_PATH, "rb");
+	char *source;
+	long length;
+	const char *update, *capture, *critical, *publish, *unlock, *release, *tuple_unlock, *emit, *stats;
+	UT_ASSERT(file != NULL); if (!file) return;
+	fseek(file, 0, SEEK_END); length = ftell(file); rewind(file);
+	source = malloc((size_t)length + 1);
+	UT_ASSERT(source != NULL); if (!source) { fclose(file); return; }
+	UT_ASSERT(fread(source, 1, (size_t)length, file) == (size_t)length);
+	fclose(file); source[length] = '\0';
+	update = strstr(source, "\nheap_update(Relation ");
+	capture = update ? strstr(update, "heap_hot_r4_update_capture(&cluster_update_trace.before_old") : NULL;
+	critical = capture ? strstr(capture, "START_CRIT_SECTION();") : NULL;
+	publish = critical ? strstr(critical, "heap_hot_r4_update_capture(&cluster_update_trace.after_old") : NULL;
+	unlock = publish ? strstr(publish, "LockBuffer(buffer, BUFFER_LOCK_UNLOCK);") : NULL;
+	release = unlock ? strstr(unlock, "ReleaseBuffer(buffer);") : NULL;
+	tuple_unlock = release ? strstr(release, "UnlockTupleTuplock(") : NULL;
+	emit = tuple_unlock ? strstr(tuple_unlock, "heap_hot_r4_update_trace(&cluster_update_trace)") : NULL;
+	stats = emit ? strstr(emit, "pgstat_count_heap_update(") : NULL;
+	UT_ASSERT(capture && critical && publish && unlock && release && tuple_unlock && emit && stats);
+	free(source);
+}
+
+/* Provenance contract plus real formatter; not an executed heap_update. */
+UT_TEST(update_input_cid_stays_distinct_from_combo_header_cid)
+{
+#ifdef HEAP_HOT_R4_UPDATE_TRACE_PRESENT
+	FILE *file;
+	char *source;
+	long length;
+	const char *update, *assignment;
+	reset_fixture(true);
+	HeapTupleHeaderSetCmin(tuple_at(before.data), 73);
+	tuple_at(before.data)->t_infomask |= HEAP_COMBOCID;
+	capture_update_fixture(false); locked = 0;
+	heap_hot_r4_update_trace(&update_view);
+	UT_ASSERT(strstr(logs, "input_command_id=8") != NULL);
+	UT_ASSERT(strstr(logs, "raw_cid=73 combo=1") != NULL);
+	file = fopen(HEAPAM_SOURCE_PATH, "rb");
+	UT_ASSERT(file != NULL); if (!file) return;
+	fseek(file, 0, SEEK_END); length = ftell(file); rewind(file);
+	source = malloc((size_t)length + 1);
+	UT_ASSERT(source != NULL); if (!source) { fclose(file); return; }
+	UT_ASSERT(fread(source, 1, (size_t)length, file) == (size_t)length);
+	fclose(file); source[length] = '\0';
+	update = strstr(source, "\nheap_update(Relation ");
+	assignment = update ? strstr(update, "cluster_update_trace.command_id = pgrac_entry_cid;") : NULL;
+	UT_ASSERT(assignment != NULL);
+	free(source);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
 int main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(33);
 	UT_RUN(default_off_has_no_log_or_clock_and_preserves_full);
 	UT_RUN(actual_tag_root_and_queried_item_are_distinct);
 	UT_RUN(owned_before_and_full_page_are_separate_observations);
@@ -323,6 +577,21 @@ int main(void)
 	UT_RUN(invalid_full_shape_is_unknown_even_after_controlled_fetch_success);
 	UT_RUN(critical_suppression_preserves_work_and_reports_gap_later);
 	UT_RUN(cycle_events_remain_before_unchanged_caller_revalidation);
+	UT_RUN(update_default_off_never_reads_view_or_clock);
+	UT_RUN(update_capture_stores_owned_values_without_log_or_clock);
+	UT_RUN(update_emission_does_not_read_released_pages);
+	UT_RUN(update_records_actual_tags_and_same_page_hot_result);
+	UT_RUN(update_cross_page_target_is_not_borrowed_from_old_page);
+	UT_RUN(update_raw_cid_itl_and_uba_are_not_authority);
+	UT_RUN(update_non_wal_operation_does_not_claim_insert_or_durability);
+	UT_RUN(update_unused_and_redirect_items_are_not_dereferenced);
+	UT_RUN(update_invalid_page_and_tuple_bounds_are_unknown_only);
+	UT_RUN(update_disabled_view_is_quiet_without_clock);
+	UT_RUN(update_critical_suppression_keeps_snapshot_and_discloses_gap);
+	UT_RUN(update_log_error_happens_without_content_lock_or_page_access);
+	UT_RUN(update_first_event_keeps_request_and_root_unknown);
+	UT_RUN(update_integration_captures_locked_then_emits_after_original_release);
+	UT_RUN(update_input_cid_stays_distinct_from_combo_header_cid);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

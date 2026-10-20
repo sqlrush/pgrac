@@ -9540,9 +9540,13 @@ test_cluster_heap_hot_full_trace.inc: $(top_srcdir)/src/backend/access/heap/heap
 	awk '/^typedef enum HeapHotR4CycleOutcome/ { emit=1; enums++ } \
 	     /^heap_hot_r4_scratch_page_valid\(/ { print "static bool"; emit=1; validators++ } \
 	     /^heap_hot_r4_trace_item\(/ { print "#define HEAP_HOT_R4_FULL_TRACE_PRESENT 1"; print "static void"; emit=1; items++ } \
+	     /^typedef struct HeapHotR4UpdatePageTrace/ { print "#define HEAP_HOT_R4_UPDATE_TRACE_PRESENT 1"; emit=1; } \
+	     /^typedef struct HeapHotR4UpdateTrace/ { emit=1; } \
+	     /^heap_hot_r4_update_capture\(/ { print "static void"; emit=1; } \
+	     /^heap_hot_r4_update_trace\(/ { print "static void"; emit=1; } \
 	     /^heap_hot_r4_full_trace\(/ { print "static void"; emit=1; loggers++ } \
 	     /^heap_hot_r4_full_cycle\(/ { print "static HeapHotR4CycleOutcome"; emit=1; cycles++ } \
-	     emit { print } emit && (/^}$$/ || /^} HeapHotR4CycleOutcome;$$/) { emit=0 } \
+	     emit { print } emit && (/^}$$/ || /^} HeapHotR4CycleOutcome;$$/ || /^} HeapHotR4Update(Page)?Trace;$$/) { emit=0 } \
 	     END { if (enums != 1 || validators != 1 || cycles != 1 || items > 1 || loggers > 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
@@ -9552,4 +9556,4 @@ test_cluster_heap_hot_full_trace_format.inc: $(top_srcdir)/src/backend/access/he
 	mv $@.tmp $@
 
 test_cluster_heap_hot_full_trace: test_cluster_heap_hot_full_trace.c unit_test.h test_cluster_heap_hot_full_trace.inc test_cluster_heap_hot_full_trace_format.inc
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DHEAPAM_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/access/heap/heapam.c"' $< -o $@
