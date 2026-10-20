@@ -1145,11 +1145,13 @@ extern bool cluster_cold_tt_after_redo_namespace_matches_v1(const ClusterColdTyp
  * Final source/header/block rechecks remain with the original owner. */
 extern bool cluster_cold_tt_after_redo_undo_matches_v1(const ClusterColdTypedV1 *typed);
 /* After the complete native inventory check, qualify the selected ACTIVE
- * slot's nonempty head using retained post-redo bytes and the original record
- * reader/transaction check. No I/O, cache refresh, allocation or traversal.
- * An empty head is neutral, not checkpoint, no-effect or C0 authority. */
-extern bool cluster_cold_tt_after_redo_undo_head_matches_v1(const ClusterColdTypedV1 *typed,
-															const ClusterColdTtSlotKeyV1 *key);
+ * slot's supplied prev-chain using retained post-redo bytes and the original
+ * raw reader/reference graph, including its order/cycle and second reads.
+ * Temporary graph storage shares the captures' remaining memory budget.
+ * No DATA I/O or cache refresh. Does not prove checkpoint/producer coverage,
+ * atomic transaction effects or C0 authority. An empty head is neutral. */
+extern bool cluster_cold_tt_after_redo_undo_chain_matches_v1(const ClusterColdTypedV1 *typed,
+															 const ClusterColdTtSlotKeyV1 *key);
 /* Exact physical lookup in one valid captured inventory. Clears index on
  * absence/refusal; no disk access, reconstruction or recovery authority. */
 extern const UndoSegmentHeaderData *cluster_cold_tt_header_find_v1(const ClusterColdTypedV1 *typed,

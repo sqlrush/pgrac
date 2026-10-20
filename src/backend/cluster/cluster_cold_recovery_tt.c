@@ -661,17 +661,55 @@ cluster_cold_tt_after_redo_undo_matches_v1(const ClusterColdTypedV1 *typed)
 	return originals + uncached == posts;
 }
 
+typedef struct ColdTtAfterRedoGraphInputV1 {
+	const ClusterColdTypedV1 *typed;
+} ColdTtAfterRedoGraphInputV1;
+
+static ClusterRecoveryGraphResult
+cold_tt_after_redo_graph_read(void *arg, const ClusterRecoveryTxnKey *key, UBA address,
+							  ClusterRecoveryUndoRecord *record, uint32 *generation)
+{
+	const ColdTtAfterRedoGraphInputV1 *input = arg;
+	const ColdTtBlockV1 *block;
+	uint32 segment, blockno;
+	uint16 offset, row;
+
+	if (record != NULL)
+		memset(record, 0, sizeof(*record));
+	if (generation != NULL)
+		*generation = 0;
+	if (input == NULL || input->typed == NULL || key == NULL || record == NULL || generation == NULL
+		|| !uba_decode_record(address, &segment, &blockno, &offset, &row))
+		return CLUSTER_RECOVERY_GRAPH_INVALID;
+	/* Only already retained, native-fold-verified post-redo blocks may supply
+	 * members. A miss cannot fetch DATA or refresh this immutable snapshot. */
+	for (block = input->typed->tt_after_redo->blocks; block != NULL; block = block->next)
+		if (block->file->owner == key->origin_node_id + 1 && block->file->segment == segment
+			&& block->block == blockno)
+			break;
+	if (block == NULL
+		|| cluster_recovery_undo_record_read(block->bytes.data, BLCKSZ, segment, blockno,
+											 block->file->owner, address, record)
+			   != CLUSTER_RECOVERY_UNDO_ENTRY)
+		return CLUSTER_RECOVERY_GRAPH_CORRUPT;
+	/* A spill segment has its own physical generation. The original graph
+	 * separately validates every record against the canonical TT key. */
+	*generation = ((const UndoSegmentHeaderData *)block->file->block.data)->wrap_count;
+	return CLUSTER_RECOVERY_GRAPH_RECORD;
+}
+
 bool
-cluster_cold_tt_after_redo_undo_head_matches_v1(const ClusterColdTypedV1 *typed,
-												const ClusterColdTtSlotKeyV1 *key)
+cluster_cold_tt_after_redo_undo_chain_matches_v1(const ClusterColdTypedV1 *typed,
+												 const ClusterColdTtSlotKeyV1 *key)
 {
 	const UndoSegmentHeaderData *header;
 	const TTSlot *slot;
-	const ColdTtBlockV1 *block;
+	ColdTtAfterRedoGraphInputV1 input = { typed };
 	ClusterRecoveryTxnKey transaction;
-	ClusterRecoveryUndoRecord record;
-	uint32 segment, blockno, generation;
-	uint16 offset, row;
+	ClusterRecoveryReferenceGraph *graph = NULL;
+	ClusterRecoveryGraphRecord record;
+	ClusterRecoveryGraphResult result;
+	Size remaining;
 
 	if (key == NULL || key->owner_instance == 0 || key->owner_instance > COLD_TT_MAX_ORIGINS
 		|| key->segment_id == 0
@@ -691,22 +729,16 @@ cluster_cold_tt_after_redo_undo_head_matches_v1(const ClusterColdTypedV1 *typed,
 	 * checkpoint base; the original C0 producer retains those separate gates. */
 	if (UBA_is_invalid(slot->first_undo_block))
 		return true;
-	if (!uba_decode_record(slot->first_undo_block, &segment, &blockno, &offset, &row)
-		|| offset != key->slot_offset
-		|| (segment - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 != key->owner_instance)
+	/* The graph is temporary, but shares the captures' original total budget.
+	 * Account for later base reads as well as the post-capture's own limit. */
+	if (typed->tt_base->used > typed->tt_base->budget
+		|| typed->tt_after_redo->used > typed->tt_after_redo->budget)
 		return false;
-	/* The complete inventory has already compared retained bytes with their
-	 * original native fold. Never read DATA to invent a missing predecessor. */
-	for (block = typed->tt_after_redo->blocks; block != NULL; block = block->next)
-		if (block->file->owner == key->owner_instance && block->file->segment == segment
-			&& block->block == blockno)
-			break;
-	if (block == NULL
-		|| cluster_recovery_undo_record_read(block->bytes.data, BLCKSZ, segment, blockno,
-											 block->file->owner, slot->first_undo_block, &record)
-			   != CLUSTER_RECOVERY_UNDO_ENTRY)
+	remaining = typed->tt_base->budget - typed->tt_base->used;
+	if (typed->tt_after_redo->used > remaining)
 		return false;
-	generation = ((const UndoSegmentHeaderData *)block->file->block.data)->wrap_count;
+	remaining -= typed->tt_after_redo->used;
+	remaining = Min(remaining, typed->tt_after_redo->budget - typed->tt_after_redo->used);
 	transaction
 		= (ClusterRecoveryTxnKey){ .system_identifier = typed->system_identifier,
 								   .database_incarnation = typed->observer.database_incarnation,
@@ -716,11 +748,17 @@ cluster_cold_tt_after_redo_undo_head_matches_v1(const ClusterColdTypedV1 *typed,
 								   .origin_node_id = key->owner_instance - 1,
 								   .slot_offset = key->slot_offset,
 								   .slot_wrap = key->slot_wrap };
-	/* The original checker keeps a physical spill segment's generation
-	 * independent of the canonical TT generation. This checks one root only. */
-	return cluster_recovery_tx_record_check(&transaction, slot->first_undo_block, &record,
-											generation)
-		   == CLUSTER_RECOVERY_GRAPH_MORE;
+	result = cluster_recovery_reference_graph_begin(remaining, cold_tt_after_redo_graph_read,
+													&input, &graph);
+	if (result != CLUSTER_RECOVERY_GRAPH_MORE)
+		return false;
+	result = cluster_recovery_reference_graph_add(graph, &transaction, slot->first_undo_block);
+	while (result == CLUSTER_RECOVERY_GRAPH_MORE || result == CLUSTER_RECOVERY_GRAPH_RECORD)
+		result = cluster_recovery_reference_graph_step(graph, &record);
+	/* DRAINED includes the original graph's second reads and order/cycle
+	 * checks. It qualifies this supplied chain, never all transaction effects. */
+	cluster_recovery_reference_graph_destroy(graph);
+	return result == CLUSTER_RECOVERY_GRAPH_DRAINED;
 }
 
 const UndoSegmentHeaderData *

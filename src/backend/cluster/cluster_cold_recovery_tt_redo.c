@@ -985,10 +985,10 @@ cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
 	 * atomic transaction effects or old-writer isolation. */
 	if (!cluster_cold_typed_tt_redo_inventory_v1(typed) || !cold_top_tx_frames_v1(typed))
 		return false;
-	/* Exact native bytes alone do not bind a nonempty ACTIVE head to this
-	 * physical TT slot. Reuse the original reader on the retained head;
+	/* Exact native bytes alone do not bind a nonempty ACTIVE chain to this
+	 * physical TT slot. Reuse the original reader/graph on retained members;
 	 * empty head supplies no transaction-effects or checkpoint authority. */
-	if (!cluster_cold_tt_after_redo_undo_head_matches_v1(typed, &post_slot.key))
+	if (!cluster_cold_tt_after_redo_undo_chain_matches_v1(typed, &post_slot.key))
 		return false;
 	/* Compare the whole selected header with its sealed original fold.  A
 	 * newly-created segment requires the existing native full-image proof;
