@@ -1508,7 +1508,8 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id, co
 		tt_reply.header.status = GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT;
 		GcsBlockReplyHeaderSetForwardingMasterNode(&tt_reply.header, cluster_node_id);
 		memset(tt_reply.page, 0x6d, sizeof(tt_reply.page));
-		if (sync_forward_kind == 1) {
+		if (sync_forward_kind == 1 || sync_forward_kind == 3 || sync_forward_kind == 4
+			|| sync_forward_kind == 5) {
 			ClusterGcsUndoVerdictPage verdict = { 0 };
 
 			tt_reply.header.status = GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT;
@@ -1519,6 +1520,12 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id, co
 			verdict.verdict = CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT;
 			verdict.commit_scn = 101;
 			verdict.wrap = 19;
+			if (sync_forward_kind == 4)
+				verdict.version = CLUSTER_GCS_UNDO_VERDICT_VERSION_AUTHORITY;
+			if (sync_forward_reply_mode == 5)
+				verdict.xid_echo++;
+			if (sync_forward_reply_mode == 6)
+				verdict.commit_scn++;
 			memcpy(tt_reply.page, &verdict, sizeof(verdict));
 		} else if (sync_forward_kind == 2) {
 			tt_reply.header.status = GCS_BLOCK_REPLY_DENIED_PENDING_X;
@@ -2009,6 +2016,16 @@ cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSi
 	token->side = (uint8)side;
 	token->entered = true;
 	return CLUSTER_SEMANTIC_ADMISSION_OK;
+}
+
+/* Admission is a fixture boundary; the nonzero-epoch pair tests below use
+ * the actual GCS pair wrapper, not this runtime admission implementation. */
+bool
+cluster_runtime_visibility_zero_epoch_pair_admission_enter(ClusterSemanticAdmissionToken *token)
+{
+	return cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+											 CLUSTER_SEMANTIC_TARGET_SIDE, token)
+		   == CLUSTER_SEMANTIC_ADMISSION_OK;
 }
 
 bool
@@ -4386,6 +4403,180 @@ UT_TEST(test_read_image_admission_preserves_holder_retry_not_install)
 UT_TEST(test_read_image_full_waits_before_holder_retry)
 {
 	test_sync_undo_tt_admission(2, 2);
+}
+
+/* Removing an increment in the real shared verdict exchange, or charging
+ * local queue-FULL retries as requests, must break these observations. The
+ * existing fixture transports replies through the actual slot/decoder. */
+static void
+test_undo_verdict_cost(int kind, int reply_mode, int refused, bool cancel_before_admission)
+{
+	ClusterGcsUndoVerdictPathCounters counters;
+	ClusterGcsUndoVerdictPathCounters expected = { 0 };
+	ClusterGcsUndoVerdictExchangeCounters *path;
+	ClusterGcsUndoHeaderPathCounters header_before;
+	ClusterGcsUndoHeaderPathCounters header_after;
+	ClusterGcsUndoVerdictPage verdict;
+	ClusterLiveAuthority authority;
+	ClusterUndoVerdictResult result;
+	volatile bool fetched = false;
+	volatile bool caught = false;
+	bool submitted = !cancel_before_admission;
+	bool verified = submitted && (reply_mode == 0 || reply_mode == 5 || reply_mode == 6);
+	int saved_node = cluster_node_id;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	route_test_reset_public_target_requester();
+	cluster_gcs_block_undo_header_counters_snapshot(&header_before);
+	cluster_gcs_block_undo_verdict_counters_reset();
+	sync_forward_fixture = true;
+	sync_forward_kind = kind;
+	sync_forward_reply_mode = reply_mode;
+	sync_forward_full_left = refused;
+	sync_forward_calls = sync_forward_admitted = 0;
+	reply_cv_timed_sleep_raise = reply_mode == 4;
+	retry_latch_cancel = cancel_before_admission;
+	route_ereport_armed = true;
+	PG_TRY();
+	{
+		if (kind == 1 || kind == 5)
+			fetched = cluster_gcs_block_undo_verdict_fetch_and_wait(
+				UT_MASTER_NODE, 5, 7, 798, kind == 5, &verdict, &authority);
+		else if (kind == 3)
+			fetched = cluster_gcs_block_undo_freshref_c1b_pair_fetch_and_wait(
+				UT_MASTER_NODE, 5, 7, 798, (uint32)route_test_epoch, 101, &verdict, &authority);
+		else
+			fetched = cluster_gcs_block_undo_authority_verdict_fetch_and_wait(
+				UT_MASTER_NODE, UT_HOLDER_NODE, 5, 798, &result);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	route_ereport_armed = false;
+	reply_cv_timed_sleep_raise = false;
+	sync_forward_fixture = false;
+	sync_forward_reply_mode = 0;
+	retry_latch_cancel = false;
+	UT_ASSERT_EQ(caught, reply_mode == 4 || cancel_before_admission);
+	UT_ASSERT_EQ(fetched, submitted && reply_mode == 0);
+	UT_ASSERT_EQ(sync_forward_admitted, submitted ? 1 : 0);
+	UT_ASSERT_EQ(sync_forward_calls, submitted ? refused + 1 : 1);
+	UT_ASSERT_EQ(retry_latch_wait_calls, cancel_before_admission ? 1 : refused);
+	if (fetched) {
+		if (kind == 4) {
+			UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+			UT_ASSERT_EQ(result.commit_scn, (SCN)101);
+			UT_ASSERT_EQ(result.wrap, 19);
+		} else {
+			UT_ASSERT_EQ(verdict.xid_echo, UINT64_C(798));
+			UT_ASSERT_EQ(verdict.commit_scn, (SCN)101);
+			UT_ASSERT_EQ(authority.tt_generation, UINT64_C(17));
+		}
+	}
+	path = kind == 1 || kind == 5 ? &expected.owner_verdict
+		   : kind == 3			  ? &expected.freshref_c1b_pair
+								  : &expected.authority_verdict;
+	path->calls = 1;
+	path->request_enqueues = submitted ? 1 : 0;
+	path->matched_replies = submitted && reply_mode != 1 && reply_mode != 4 ? 1 : 0;
+	path->sync_exchanges = submitted ? 1 : 0;
+	path->verified_replies = verified ? 1 : 0;
+	cluster_gcs_block_undo_verdict_counters_snapshot(&counters);
+	UT_ASSERT_EQ(memcmp(&counters, &expected, sizeof(counters)), 0);
+	cluster_gcs_block_undo_header_counters_snapshot(&header_after);
+	UT_ASSERT_EQ(memcmp(&header_before, &header_after, sizeof(header_before)), 0);
+	route_test_assert_public_target_slot_is_canonical();
+	cluster_node_id = saved_node;
+}
+
+UT_TEST(test_undo_proof_cost_separates_owner_pair_and_authority)
+{
+	for (int kind = 1; kind <= 5; kind++)
+		if (kind != 2)
+			test_undo_verdict_cost(kind, 0, 0, false);
+}
+
+UT_TEST(test_undo_proof_cost_ignores_unsent_full_retries)
+{
+	for (int kind = 1; kind <= 5; kind++)
+		if (kind != 2)
+			test_undo_verdict_cost(kind, 0, 2, false);
+}
+
+UT_TEST(test_undo_proof_timeout_preserves_spent_cost)
+{
+	for (int kind = 1; kind <= 5; kind++)
+		if (kind != 2)
+			test_undo_verdict_cost(kind, 1, 0, false);
+}
+
+UT_TEST(test_undo_proof_denied_reply_is_traffic)
+{
+	for (int kind = 1; kind <= 5; kind++)
+		if (kind != 2)
+			test_undo_verdict_cost(kind, 2, 0, false);
+}
+
+UT_TEST(test_undo_proof_corrupt_reply_is_traffic)
+{
+	for (int kind = 1; kind <= 5; kind++)
+		if (kind != 2)
+			test_undo_verdict_cost(kind, 3, 0, false);
+}
+
+UT_TEST(test_undo_proof_wait_error_preserves_spent_cost)
+{
+	for (int kind = 1; kind <= 5; kind++)
+		if (kind != 2)
+			test_undo_verdict_cost(kind, 4, 0, false);
+}
+
+UT_TEST(test_undo_proof_transport_verified_is_not_wrapper_authority)
+{
+	for (int kind = 1; kind <= 5; kind++)
+		if (kind != 2)
+			test_undo_verdict_cost(kind, 5, 0, false);
+	test_undo_verdict_cost(3, 6, 0, false);
+}
+
+UT_TEST(test_undo_proof_cancel_before_admission_counts_no_messages)
+{
+	for (int kind = 1; kind <= 5; kind++)
+		if (kind != 2)
+			test_undo_verdict_cost(kind, 0, 2, true);
+}
+
+UT_TEST(test_undo_proof_invalid_input_counts_no_exchange)
+{
+	ClusterGcsUndoVerdictPathCounters counters;
+	ClusterGcsUndoVerdictPathCounters zero = { 0 };
+	ClusterGcsUndoHeaderPathCounters before;
+	ClusterGcsUndoHeaderPathCounters after;
+	ClusterGcsUndoVerdictPage verdict;
+	ClusterLiveAuthority authority;
+	ClusterUndoVerdictResult result;
+	int saved_node = cluster_node_id;
+
+	test_sync_undo_tt_admission(0, 0);
+	cluster_gcs_block_undo_header_counters_snapshot(&before);
+	cluster_gcs_block_undo_verdict_counters_reset();
+	cluster_node_id = UT_REQUESTER_NODE;
+	UT_ASSERT(!cluster_gcs_block_undo_verdict_fetch_and_wait(UT_MASTER_NODE, 5, 7, 798, false, NULL,
+															 &authority));
+	UT_ASSERT(!cluster_gcs_block_undo_freshref_c1b_pair_fetch_and_wait(
+		UT_MASTER_NODE, 5, 7, 798, (uint32)route_test_epoch, InvalidScn, &verdict, &authority));
+	UT_ASSERT(!cluster_gcs_block_undo_freshref_c1b_pair_fetch_and_wait(
+		UT_MASTER_NODE, 5, 7, 798, (uint32)route_test_epoch + 1, 101, &verdict, &authority));
+	UT_ASSERT(!cluster_gcs_block_undo_authority_verdict_fetch_and_wait(
+		UT_MASTER_NODE, UT_MASTER_NODE, 5, 798, &result));
+	cluster_gcs_block_undo_verdict_counters_snapshot(&counters);
+	UT_ASSERT_EQ(memcmp(&counters, &zero, sizeof(counters)), 0);
+	cluster_gcs_block_undo_verdict_counters_snapshot(NULL);
+	cluster_gcs_block_undo_header_counters_snapshot(&after);
+	UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+	cluster_node_id = saved_node;
 }
 
 /* Failed proof acquisition still costs its admitted request and synchronous
@@ -7184,7 +7375,7 @@ UT_TEST(test_internal_origin_refusals_do_not_enter_backend_reply_table)
 int
 main(void)
 {
-	UT_PLAN(141);
+	UT_PLAN(150);
 	UT_RUN(test_current_mx_updater_precommit_final_release_failure_is_unknown);
 	UT_RUN(test_current_mx_origin_retry_keeps_unknown_release_and_deadline_fences);
 	UT_RUN(test_current_mx_precommit_origin_releases_before_retry);
@@ -7314,6 +7505,15 @@ main(void)
 	UT_RUN(test_undo_verdict_full_waits_without_changing_proof);
 	UT_RUN(test_read_image_admission_preserves_holder_retry_not_install);
 	UT_RUN(test_read_image_full_waits_before_holder_retry);
+	UT_RUN(test_undo_proof_cost_separates_owner_pair_and_authority);
+	UT_RUN(test_undo_proof_cost_ignores_unsent_full_retries);
+	UT_RUN(test_undo_proof_timeout_preserves_spent_cost);
+	UT_RUN(test_undo_proof_denied_reply_is_traffic);
+	UT_RUN(test_undo_proof_corrupt_reply_is_traffic);
+	UT_RUN(test_undo_proof_wait_error_preserves_spent_cost);
+	UT_RUN(test_undo_proof_transport_verified_is_not_wrapper_authority);
+	UT_RUN(test_undo_proof_cancel_before_admission_counts_no_messages);
+	UT_RUN(test_undo_proof_invalid_input_counts_no_exchange);
 	UT_RUN(test_undo_header_timeout_preserves_request_cost);
 	UT_RUN(test_undo_header_denied_reply_preserves_message_cost);
 	UT_RUN(test_undo_header_corrupt_reply_preserves_message_cost);

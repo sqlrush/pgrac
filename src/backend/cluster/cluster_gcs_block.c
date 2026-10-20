@@ -5579,6 +5579,7 @@ cluster_r4_source_cr_dispatch(ClusterR4SourceCrOp op, const ClusterR4SourceCrReq
 
 
 static ClusterGcsUndoHeaderPathCounters gcs_undo_header_path_counters;
+static ClusterGcsUndoVerdictPathCounters gcs_undo_verdict_path_counters;
 
 void
 cluster_gcs_block_undo_header_counters_reset(void)
@@ -5591,6 +5592,19 @@ cluster_gcs_block_undo_header_counters_snapshot(ClusterGcsUndoHeaderPathCounters
 {
 	if (out != NULL)
 		*out = gcs_undo_header_path_counters;
+}
+
+void
+cluster_gcs_block_undo_verdict_counters_reset(void)
+{
+	memset(&gcs_undo_verdict_path_counters, 0, sizeof(gcs_undo_verdict_path_counters));
+}
+
+void
+cluster_gcs_block_undo_verdict_counters_snapshot(ClusterGcsUndoVerdictPathCounters *out)
+{
+	if (out != NULL)
+		*out = gcs_undo_verdict_path_counters;
 }
 
 /*
@@ -5854,6 +5868,7 @@ gcs_block_undo_verdict_wire_exchange_trace_impl(
 	ClusterGcsUndoVerdictPage *page_out, uint64 *tt_generation_out, uint64 *authority_scn_out)
 {
 	ClusterGcsBlockOutstandingSlot *slot;
+	ClusterGcsUndoVerdictExchangeCounters *counters;
 	uint64 request_id = 0;
 	GcsBlockForwardPayload fwd;
 	bool got_reply = false;
@@ -5864,6 +5879,11 @@ gcs_block_undo_verdict_wire_exchange_trace_impl(
 
 	if (freshref_pair && (!authoritative || authority_kind))
 		return false;
+
+	counters = freshref_pair	? &gcs_undo_verdict_path_counters.freshref_c1b_pair
+			   : authority_kind ? &gcs_undo_verdict_path_counters.authority_verdict
+								: &gcs_undo_verdict_path_counters.owner_verdict;
+	counters->calls++;
 
 	cluster_gcs_block_dedup_register_backend_exit_hook();
 	slot = gcs_block_reserve_slot(tag, (uint8)PCM_TRANS_N_TO_S, cluster_node_id, &request_id);
@@ -5930,6 +5950,8 @@ gcs_block_undo_verdict_wire_exchange_trace_impl(
 						   cluster_node_id)));
 		}
 
+		counters->request_enqueues++;
+		counters->sync_exchanges++;
 		deadline = GetCurrentTimestamp()
 				   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
 
@@ -5948,6 +5970,7 @@ gcs_block_undo_verdict_wire_exchange_trace_impl(
 			}
 			LWLockRelease(&blk->lock.lock);
 			if (have_reply) {
+				counters->matched_replies++;
 				got_reply = true;
 				break;
 			}
@@ -5981,6 +6004,7 @@ gcs_block_undo_verdict_wire_exchange_trace_impl(
 				 * carriers (the acceptance policy stays in the wrappers). */
 				if (authority_scn_out != NULL)
 					*authority_scn_out = slot->reply_undo_authority_scn;
+				counters->verified_replies++;
 				fetched = true;
 			} else {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
