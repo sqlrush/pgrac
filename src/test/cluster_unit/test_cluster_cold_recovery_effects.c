@@ -38,6 +38,7 @@
 #include "replication/origin.h"
 #include "storage/standbydefs.h"
 #include "unit_test.h"
+#include "utils/syscache.h"
 
 UT_DEFINE_GLOBALS();
 
@@ -2881,12 +2882,115 @@ UT_TEST(test_foreign_terminals_refuse_unconsumed_frame_before_dispatch)
 			}
 }
 
+
+/* Exercise original WAL carriers, including the logical no-effect form. */
+static void
+invalidation_record(EffectRecord *r, int carrier, const SharedInvalidationMessage *messages)
+{
+	if (carrier == 0) {
+		xl_xact_parsed_commit parsed;
+
+		completion(r, true,
+				   XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_INVALS | XACT_XINFO_HAS_SCN
+					   | XACT_XINFO_HAS_TT_COMMIT);
+		UT_ASSERT(ParseCommitRecord(r->decoded.header.xl_info, (xl_xact_commit *)r->data.bytes,
+									r->decoded.main_data_len, &parsed));
+		memcpy((void *)parsed.msgs, messages, 2 * sizeof(*messages));
+	} else if (carrier == 1) {
+		xl_invalidations invals
+			= { .dbId = 5, .tsId = 1663, .nmsgs = 2, .relcacheInitFileInval = true };
+
+		record_init(r, RM_STANDBY_ID, XLOG_INVALIDATIONS);
+		append(r, &invals, MinSizeOfInvalidations);
+		append(r, messages, 2 * sizeof(*messages));
+	} else {
+		record_init(r, RM_XACT_ID, XLOG_XACT_INVALIDATIONS);
+		counted(r, messages, 2, sizeof(*messages));
+	}
+}
+
+UT_TEST(test_invalidation_inputs_preserve_all_transactional_message_kinds)
+{
+	const int ids[] = { 0, SysCacheSize - 1, SHAREDINVALCATALOG_ID, SHAREDINVALRELCACHE_ID,
+						SHAREDINVALSNAPSHOT_ID };
+
+	for (int carrier = 0; carrier < 3; carrier++)
+		for (int foreign = 0; foreign <= 1; foreign++)
+			for (Size i = 0; i < lengthof(ids); i++) {
+				EffectRecord r;
+				ClusterColdDecodedV1 out = { 0 };
+				SharedInvalidationMessage messages[2] = { { 0 } };
+
+				messages[0].cc.id = 0;
+				/* A shared cache and whole-relcache invalidation are legal. */
+				messages[1].cat.id = ids[i];
+				messages[1].cat.dbId = 5;
+				if (ids[i] == SHAREDINVALCATALOG_ID)
+					messages[1].cat.catId = 1259;
+				invalidation_record(&r, carrier, messages);
+				UT_ASSERT_EQ(
+					cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, foreign, &out),
+					CLUSTER_COLD_OK);
+				UT_ASSERT_EQ(out.effects.refused, 0);
+				UT_ASSERT(out.effects.required & CLUSTER_COLD_EFFECT_INVALIDATIONS);
+				UT_ASSERT_EQ(out.effects.no_effect,
+							 foreign && carrier == 2 ? out.effects.required : 0);
+				UT_ASSERT(partitioned(&out.effects));
+				UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, !foreign));
+				cluster_cold_decoded_release_v1(&out);
+			}
+}
+
+static void
+check_bad_invalidation_inputs(bool foreign)
+{
+	const int ids[]
+		= { SysCacheSize,		  INT8_MAX, INT8_MIN, -6, SHAREDINVALSMGR_ID, SHAREDINVALRELMAP_ID,
+			SHAREDINVALCATALOG_ID };
+
+	for (int carrier = 0; carrier < 3; carrier++)
+		for (int space_active = 0; space_active <= 1; space_active++)
+			for (Size i = 0; i < lengthof(ids); i++) {
+				EffectRecord r;
+				ClusterColdDecodedV1 out = { 0 };
+				SharedInvalidationMessage messages[2] = { { 0 } };
+
+				/* A valid prefix must not hide the final invalid input. */
+				messages[0].cc.id = 0;
+				messages[1].cat.id = ids[i];
+				messages[1].cat.dbId = 5;
+				invalidation_record(&r, carrier, messages);
+				UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, space_active,
+															 foreign, &out),
+							 CLUSTER_COLD_COMPONENT_INVALID);
+				UT_ASSERT_EQ(out.effects.required, 0);
+				UT_ASSERT_EQ(out.effects.native_apply | out.effects.page_apply
+								 | out.effects.space_apply | out.effects.no_effect
+								 | out.effects.refused,
+							 0);
+				cluster_cold_decoded_release_v1(&out);
+			}
+}
+
+UT_TEST(test_own_invalidation_inputs_reject_unknown_and_nontransactional_messages)
+{
+	check_bad_invalidation_inputs(false);
+}
+
+UT_TEST(test_foreign_invalidation_inputs_reject_before_effect_routing)
+{
+	check_bad_invalidation_inputs(true);
+}
+
 #include "test_cluster_cold_abort_replay.inc"
 
 int
 main(void)
 {
-	UT_PLAN(79);
+	UT_PLAN(82);
+	UT_RUN(test_invalidation_inputs_preserve_all_transactional_message_kinds);
+	UT_RUN(test_own_invalidation_inputs_reject_unknown_and_nontransactional_messages);
+	UT_RUN(test_foreign_invalidation_inputs_reject_before_effect_routing);
 	UT_RUN(test_relation_abort_capture_replays_and_drains_complete_cut);
 	UT_RUN(test_relation_abort_capture_refuses_missing_creation);
 	UT_RUN(test_relation_abort_replay_failure_keeps_final_drain_closed);

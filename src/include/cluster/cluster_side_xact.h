@@ -77,6 +77,11 @@ extern bool rf_side_xact_cold_completion_preflight_v1(const RfSideXactOperationV
 													  const uint8 *payload, uint32 length);
 /* Full bounded native ASSIGNMENT only, without terminal or parent-chain authority. */
 extern bool rf_side_xact_assignment_preflight_v1(const uint8 *payload, uint32 length);
+/* The caller first bounds the complete array in its native carrier. This
+ * checks original transactional message kinds only, not scope or delivery. */
+extern bool
+rf_side_xact_invalidation_messages_preflight_v1(int count,
+												const SharedInvalidationMessage *messages);
 /* Native standalone invalidations use the same message/scope rules as
  * transactional invalidations. Shape validation grants no replay authority. */
 extern bool rf_side_standby_invalidation_preflight_v1(const uint8 *payload, uint32 length);

@@ -261,6 +261,8 @@ cold_xact_flags(XLogReaderState *reader, uint64 system_identifier, const uint8 s
 			return CLUSTER_COLD_COMPONENT_INVALID;
 		if (!cold_completion_stats_valid(parsed.nstats, parsed.stats))
 			return CLUSTER_COLD_COMPONENT_INVALID;
+		if (!rf_side_xact_invalidation_messages_preflight_v1(parsed.nmsgs, parsed.msgs))
+			return CLUSTER_COLD_COMPONENT_INVALID;
 		/* Native parsing bounds the delta but does not validate its version.
 		 * An unknown delta must not reach the original exact-slot writer. */
 		if (parsed.has_tt_commit
@@ -315,12 +317,20 @@ cold_xact_flags(XLogReaderState *reader, uint64 system_identifier, const uint8 s
 			return CLUSTER_COLD_COMPONENT_INVALID;
 		*effects |= CLUSTER_COLD_EFFECT_CHILDREN;
 		return CLUSTER_COLD_OK;
-	case XLOG_XACT_INVALIDATIONS:
+	case XLOG_XACT_INVALIDATIONS: {
+		int count;
+		const uint8 *data = (const uint8 *)XLogRecGetData(reader);
+
 		if (!cold_counted_shape(reader, MinSizeOfXactInvals, offsetof(xl_xact_invals, nmsgs),
 								sizeof(SharedInvalidationMessage)))
 			return CLUSTER_COLD_COMPONENT_INVALID;
+		memcpy(&count, data + offsetof(xl_xact_invals, nmsgs), sizeof(count));
+		if (!rf_side_xact_invalidation_messages_preflight_v1(
+				count, (const SharedInvalidationMessage *)(data + MinSizeOfXactInvals)))
+			return CLUSTER_COLD_COMPONENT_INVALID;
 		*effects |= CLUSTER_COLD_EFFECT_INVALIDATIONS;
 		return CLUSTER_COLD_OK;
+	}
 	case XLOG_XACT_PREPARE:
 	case XLOG_XACT_COMMIT_PREPARED:
 	case XLOG_XACT_ABORT_PREPARED:
@@ -564,6 +574,11 @@ cold_record_flags(XLogReaderState *reader, uint64 system_identifier, const uint8
 			xl_invalidations invalidations;
 
 			memcpy(&invalidations, XLogRecGetData(reader), MinSizeOfInvalidations);
+			if (!rf_side_xact_invalidation_messages_preflight_v1(
+					invalidations.nmsgs,
+					(const SharedInvalidationMessage *)((const uint8 *)XLogRecGetData(reader)
+														+ MinSizeOfInvalidations)))
+				return CLUSTER_COLD_COMPONENT_INVALID;
 			*effects |= CLUSTER_COLD_EFFECT_INVALIDATIONS;
 			if (invalidations.relcacheInitFileInval)
 				*effects |= CLUSTER_COLD_EFFECT_RELCACHE;

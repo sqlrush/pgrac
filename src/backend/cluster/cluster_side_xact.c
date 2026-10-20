@@ -436,6 +436,45 @@ rf_side_xact_children_preflight_v1(TransactionId top, int count, const Transacti
 	return true;
 }
 
+/* The original transactional producer emits only these message kinds.
+ * SMGR and RELMAP invalidations have separate nontransactional owners. */
+static uint32
+side_xact_invalidation_message_kind(const SharedInvalidationMessage *message, Oid *database)
+{
+	if (message->id >= 0 && message->id < SysCacheSize) {
+		*database = message->cc.dbId;
+		return UINT32_C(1) << 0;
+	} else if (message->id == SHAREDINVALCATALOG_ID && OidIsValid(message->cat.catId)) {
+		*database = message->cat.dbId;
+		return UINT32_C(1) << 1;
+	} else if (message->id == SHAREDINVALRELCACHE_ID) {
+		*database = message->rc.dbId;
+		return UINT32_C(1) << 2;
+	} else if (message->id == SHAREDINVALSNAPSHOT_ID) {
+		*database = message->sn.dbId;
+		return UINT32_C(1) << 3;
+	}
+	return 0;
+}
+
+bool
+rf_side_xact_invalidation_messages_preflight_v1(int count,
+												const SharedInvalidationMessage *messages)
+{
+	if (count < 0 || (count > 0 && messages == NULL))
+		return false;
+	for (int i = 0; i < count; i++) {
+		SharedInvalidationMessage message;
+		Oid database;
+
+		/* Original native main data and retained carriers may be unaligned. */
+		memcpy(&message, (const uint8 *)messages + (Size)i * sizeof(message), sizeof(message));
+		if (side_xact_invalidation_message_kind(&message, &database) == 0)
+			return false;
+	}
+	return true;
+}
+
 static bool
 side_xact_pi_effects_valid(const xl_xact_parsed_commit *parsed, uint64 system_identifier,
 						   bool cold_completion, RfSideXactOperationV1 *out)
@@ -463,22 +502,13 @@ side_xact_pi_effects_valid(const xl_xact_parsed_commit *parsed, uint64 system_id
 	for (int i = 0; i < parsed->nmsgs; i++) {
 		SharedInvalidationMessage message;
 		Oid database;
+		uint32 kind;
 
 		memcpy(&message, &parsed->msgs[i], sizeof(message));
-		if (message.id >= 0 && message.id < SysCacheSize) {
-			kinds |= UINT32_C(1) << 0;
-			database = message.cc.dbId;
-		} else if (message.id == SHAREDINVALCATALOG_ID && OidIsValid(message.cat.catId)) {
-			kinds |= UINT32_C(1) << 1;
-			database = message.cat.dbId;
-		} else if (message.id == SHAREDINVALRELCACHE_ID) {
-			kinds |= UINT32_C(1) << 2;
-			database = message.rc.dbId;
-		} else if (message.id == SHAREDINVALSNAPSHOT_ID) {
-			kinds |= UINT32_C(1) << 3;
-			database = message.sn.dbId;
-		} else
+		kind = side_xact_invalidation_message_kind(&message, &database);
+		if (kind == 0)
 			return false;
+		kinds |= kind;
 		if (database != InvalidOid && database != parsed->dbId)
 			return false;
 	}
