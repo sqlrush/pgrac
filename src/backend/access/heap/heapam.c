@@ -5179,6 +5179,146 @@ heap_hot_r4_log_miss(Relation relation, Buffer buffer, Snapshot snapshot,
 					   current_last, full_root, full_last, trace_complete, decisions)));
 }
 
+/* Only bounded bytes from an owned image are described. Raw CID/UBA/ITL
+ * projections do not resolve combo CIDs or establish transaction identity. */
+static void
+heap_hot_r4_trace_item(Page page, OffsetNumber offnum, char *out, Size size)
+{
+	ItemId item;
+	PageHeader header;
+	HeapTupleHeaderData tuple;
+	ClusterItlSlotData slot = {0};
+	bool slot_known;
+	Size offset, length;
+
+	strlcpy(out, "item_known=0", size);
+	if (!heap_hot_r4_scratch_page_valid(page)
+		|| offnum < FirstOffsetNumber || offnum > PageGetMaxOffsetNumber(page))
+		return;
+	header = (PageHeader)page;
+	item = PageGetItemId(page, offnum);
+	offset = ItemIdGetOffset(item);
+	length = ItemIdGetLength(item);
+	if (!ItemIdIsNormal(item)) {
+		snprintf(out, size, "item_known=1 lp=%u off=%zu len=%zu tuple_known=0",
+				 item->lp_flags, offset, length);
+		return;
+	}
+	if (length < SizeofHeapTupleHeader || offset < header->pd_upper
+		|| offset > header->pd_special || length > header->pd_special - offset) {
+		snprintf(out, size, "item_known=1 lp=%u tuple_known=0", item->lp_flags);
+		return;
+	}
+	memset(&tuple, 0, sizeof(tuple));
+	memcpy(&tuple, page + offset, SizeofHeapTupleHeader);
+	if (tuple.t_hoff < SizeofHeapTupleHeader || tuple.t_hoff > length) {
+		snprintf(out, size, "item_known=1 lp=%u tuple_known=0", item->lp_flags);
+		return;
+	}
+	slot_known = tuple.t_itl_slot_idx < CLUSTER_ITL_INITRANS_DEFAULT;
+	if (slot_known)
+		memcpy(&slot, (char *)PageGetSpecialPointer(page)
+			   + tuple.t_itl_slot_idx * sizeof(slot), sizeof(slot));
+	snprintf(out, size,
+			 "item_known=1 lp=%u tuple_known=1 off=%zu len=%zu "
+			 "xmin=%u xmax=%u ctid=%u/%u mask=%u/%u raw_cid=%u combo=%d "
+			 "itl=%u slot_known=%d slot_xid=%u wrap=%u flags=%u "
+			 "write_scn=" UINT64_FORMAT " commit_scn=" UINT64_FORMAT
+			 " first_change_lsn=" UINT64_FORMAT " uba_raw=" UINT64_FORMAT "/" UINT64_FORMAT,
+			 item->lp_flags, offset, length,
+			 HeapTupleHeaderGetRawXmin(&tuple), HeapTupleHeaderGetRawXmax(&tuple),
+			 ItemPointerGetBlockNumberNoCheck(&tuple.t_ctid),
+			 ItemPointerGetOffsetNumberNoCheck(&tuple.t_ctid), tuple.t_infomask,
+			 tuple.t_infomask2, HeapTupleHeaderGetRawCommandId(&tuple),
+			 (tuple.t_infomask & HEAP_COMBOCID) != 0,
+			 tuple.t_itl_slot_idx, slot_known, slot.xid, slot.wrap, slot.flags,
+			 (uint64)slot.write_scn, (uint64)slot.commit_scn,
+			 (uint64)slot.first_change_lsn,
+			 slot.undo_segment_head.raw[0], slot.undo_segment_head.raw[1]);
+}
+
+/* Original caller's stable_input and request-owned FULL scratch only. Never
+ * inspect the live buffer while its SHARE lock is dropped. The unchanged
+ * caller still revalidates the input after this cycle returns. */
+static void
+heap_hot_r4_full_trace(Buffer buffer, const BufferTag *tag,
+					   const ItemPointerData *root, OffsetNumber queried, Page before,
+					   Snapshot snapshot, const HeapHotSearchResult *result,
+					   bool build_known, ClusterCrBuildResult build_result,
+					   ClusterCrBuildReason build_reason, bool search_known,
+					   uint64 *cycle, const char *event)
+{
+	static uint64 event_seq;
+	static uint64 critical_skipped;
+	Page full;
+	bool before_known, full_known, decisions_complete;
+	ClusterItlPageHeader before_itl = {0}, full_itl = {0};
+	char before_root[512], before_queried[512], full_root[512], full_queried[512];
+	char decisions[4096];
+	OffsetNumber root_off = ItemPointerGetOffsetNumberNoCheck(root);
+
+	if (!cluster_trace_normal_stop)
+		return;
+	if (CritSectionCount != 0) {
+		if (critical_skipped != UINT64_MAX)
+			critical_skipped++;
+		return;
+	}
+	if (event_seq != UINT64_MAX)
+		event_seq++;
+	if (*cycle == 0)
+		*cycle = event_seq;
+	full = build_known && build_result == CLUSTER_CR_BUILD_FULL
+		&& build_reason == CLUSTER_CR_BUILD_NONE ? (Page)result->scratch_page : NULL;
+	before_known = heap_hot_r4_scratch_page_valid(before);
+	full_known = heap_hot_r4_scratch_page_valid(full);
+	if (before_known)
+		memcpy(&before_itl, (char *)PageGetSpecialPointer(before)
+			   + CLUSTER_ITL_ARRAY_SIZE, sizeof(before_itl));
+	if (full_known)
+		memcpy(&full_itl, (char *)PageGetSpecialPointer(full)
+			   + CLUSTER_ITL_ARRAY_SIZE, sizeof(full_itl));
+	heap_hot_r4_trace_item(before, root_off, before_root, sizeof(before_root));
+	heap_hot_r4_trace_item(before, queried, before_queried, sizeof(before_queried));
+	heap_hot_r4_trace_item(full, root_off, full_root, sizeof(full_root));
+	heap_hot_r4_trace_item(full, queried, full_queried, sizeof(full_queried));
+	decisions_complete = cluster_heap_r4_trace_format(
+		search_known ? &result->visibility_trace : NULL, decisions, sizeof(decisions));
+	ereport(LOG, (errmsg_internal(
+		"PGRAC_FAMILY=HOT_FULL event=%s event_seq=" UINT64_FORMAT
+		" sequence_scope=process sequence_domain=HOT_FULL cycle=" UINT64_FORMAT
+		" node_id=%d pid=%d wall_us=" INT64_FORMAT " monotonic_us=" UINT64_FORMAT
+		" identity_source=run_manifest run_id_known=0 boot_identity_known=0 "
+		"process_incarnation_known=0 request_id_known=0 full_xid_known=0 "
+		"tx_origin_known=0 slot_incarnation_known=0 authoritative=0 "
+		"buffer=%d spc=%u db=%u rel=%u fork=%d block=%u "
+		"root_block=%u root_offset=%u queried_offset=%u "
+		"read_scn=" UINT64_FORMAT " read_epoch=" UINT64_FORMAT " snapshot_curcid=%u "
+		"image_scope=owned_copy input_revalidated=0 image_hash_known=0 page_generation_known=0 "
+		"build_known=%d build_result=%d build_reason=%d search_known=%d candidate_kind=%d "
+		"before_known=%d before_lsn=" UINT64_FORMAT " before_scn=" UINT64_FORMAT
+		" before_watermark=" UINT64_FORMAT " full_known=%d full_lsn=" UINT64_FORMAT
+		" full_scn=" UINT64_FORMAT " full_watermark=" UINT64_FORMAT
+		" before_root={%s} before_queried={%s} full_root={%s} full_queried={%s} "
+		"decision_text_complete=%d decisions={%s} trace_critical_skipped=" UINT64_FORMAT
+		" trace_sequence_exhausted=%d",
+		event, event_seq, *cycle, cluster_node_id, MyProcPid,
+		(int64)GetCurrentTimestamp(), cluster_heap_itl_now_us(),
+		buffer, tag->spcOid, tag->dbOid, tag->relNumber, tag->forkNum, tag->blockNum,
+		ItemPointerGetBlockNumberNoCheck(root), root_off, queried,
+		(uint64)snapshot->read_scn, (uint64)snapshot->read_epoch, snapshot->curcid,
+		build_known, build_known ? (int)build_result : -1,
+		build_known ? (int)build_reason : -1, search_known, (int)result->kind,
+		before_known, before_known ? (uint64)PageGetLSN(before) : 0,
+		before_known ? (uint64)((PageHeader)before)->pd_block_scn : 0,
+		(uint64)before_itl.itl_recycle_watermark_scn,
+		full_known, full_known ? (uint64)PageGetLSN(full) : 0,
+		full_known ? (uint64)((PageHeader)full)->pd_block_scn : 0,
+		(uint64)full_itl.itl_recycle_watermark_scn,
+		before_root, before_queried, full_root, full_queried,
+		decisions_complete, decisions, critical_skipped, event_seq == UINT64_MAX)));
+}
+
 /*
  * Drop SHARE before the TARGET fetch and restore it in PG_FINALLY.  A FULL
  * result is decided solely from result->scratch_page.  TARGET_DISABLED is the
@@ -5188,6 +5328,7 @@ heap_hot_r4_log_miss(Relation relation, Buffer buffer, Snapshot snapshot,
 static HeapHotR4CycleOutcome
 heap_hot_r4_full_cycle(Buffer buffer, const BufferTag *tag,
 					   const ItemPointerData *logical_root,
+					   OffsetNumber queried, Page before,
 					   Relation relation, Snapshot snapshot,
 					   HeapHotSearchResult *result,
 					   ClusterCrBuildResult *build_result_out,
@@ -5196,6 +5337,7 @@ heap_hot_r4_full_cycle(Buffer buffer, const BufferTag *tag,
 	ClusterCrBuildReason raw_reason = CLUSTER_CR_BUILD_PROTOCOL;
 	volatile ClusterCrBuildResult build_result = CLUSTER_CR_BUILD_FAIL_CLOSED;
 	volatile ClusterCrBuildReason build_reason = CLUSTER_CR_BUILD_PROTOCOL;
+	uint64 trace_cycle = 0;
 
 	memset(result, 0, sizeof(*result));
 	result->kind = HEAP_HOT_SEARCH_NOT_FOUND;
@@ -5203,16 +5345,25 @@ heap_hot_r4_full_cycle(Buffer buffer, const BufferTag *tag,
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 	PG_TRY();
 	{
+		heap_hot_r4_full_trace(buffer, tag, logical_root, queried, before,
+							   snapshot, result, false, build_result, build_reason,
+							   false, &trace_cycle, "full.fetch.begin");
 		build_result = cluster_gcs_block_cr_fetch_and_wait(
 			*tag, snapshot->read_scn, result->scratch_page,
 			&raw_reason);
 		build_reason = raw_reason;
+		heap_hot_r4_full_trace(buffer, tag, logical_root, queried, before,
+							   snapshot, result, true, build_result, build_reason,
+							   false, &trace_cycle, "full.fetch.end");
 		if (build_result == CLUSTER_CR_BUILD_FULL
 			&& build_reason == CLUSTER_CR_BUILD_NONE)
 		{
 			if (heap_hot_r4_search_scratch(tag, logical_root, relation,
 										 snapshot, result, false))
 				result->kind = HEAP_HOT_SEARCH_OWNED_SCRATCH;
+			heap_hot_r4_full_trace(buffer, tag, logical_root, queried, before,
+								   snapshot, result, true, build_result, build_reason,
+								   true, &trace_cycle, "full.search.end");
 		}
 	}
 	PG_FINALLY();
@@ -5609,6 +5760,7 @@ restart_live_search:
 
 				memcpy(stable_input, page, BLCKSZ);
 				outcome = heap_hot_r4_full_cycle(buffer, &tag, &logical_root,
+										 offnum, (Page)stable_input,
 										 relation, snapshot, result,
 										 &build_result, &build_reason);
 				revalidated_tag = heap_hot_r4_buffer_tag(buffer);

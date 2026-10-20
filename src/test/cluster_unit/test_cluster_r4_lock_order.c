@@ -117,6 +117,7 @@ UT_DEFINE_GLOBALS();
 
 static bool ut_capture_error;
 bool cluster_shared_config;
+bool cluster_trace_normal_stop = false;
 static bool ut_capture_miss_log;
 static bool ut_finishing_miss_log;
 static int ut_miss_log_count;
