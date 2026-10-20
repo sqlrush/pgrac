@@ -154,17 +154,23 @@ tt_redo_history_plan(TtRedoFixture *f, XLogRecPtr begin, XLogRecPtr end, XLogRec
 }
 
 static void
-tt_redo_history_feed(TtRedoFixture *f, FakeXactRecord *fake)
+tt_redo_history_feed_at(TtRedoFixture *f, FakeXactRecord *fake, XLogRecPtr begin)
 {
 	RfPageOnlineRecordIdentityV1 identity = make_identity(fake, f->typed.observer.storage_uuid);
 	RfDetachedRecordPlanV1 record;
 
 	identity.record.origin_thread = f->typed.participants[1].thread_id;
-	set_identity_range(fake, &identity, 100, 200);
+	set_identity_range(fake, &identity, begin, begin + 100);
 	record = XLogRecGetRmid(&fake->reader) == RM_CLUSTER_UNDO_ID ? make_undo_record_plan(fake)
 																 : make_record_plan(fake);
 	UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(f->typed.side_plans[1], &record, &identity),
 				 RF_PAGE_PROOF_DETAIL_OK);
+}
+
+static void
+tt_redo_history_feed(TtRedoFixture *f, FakeXactRecord *fake)
+{
+	tt_redo_history_feed_at(f, fake, 100);
 }
 
 static void
@@ -5067,6 +5073,131 @@ UT_TEST(tt_top_tx_c0_producer_requires_original_native_abort_pairing)
 	}
 }
 
+static void
+tt_top_tx_history_abort_identity(bool completion)
+{
+	for (int mode = 0; mode < 12; mode++) {
+		TtRedoFixture f;
+		FakeXactRecord fake;
+		xl_undo_tt_slot_bind bind = { 0 };
+		xl_undo_tt_slot_abort_exact abort = { 0 };
+		RfSideOnlineOperationV1 native;
+		ClusterColdTtSlotInputV1 input;
+		ClusterColdTopTxProofV1 proof;
+		ClusterRecoveryTTAbortV1 shape;
+		ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
+		uint32 records = (mode != 11) + (mode != 5) + 1 + (mode == 7 || mode == 9 || mode == 10);
+		XLogRecPtr begin = 100, end = 100 + records * 100;
+		uint32 native_index = records - 1;
+		bool compatible = (mode >= 1 && mode <= 4) || mode == 11;
+
+		/* This suite does not run the SIDE fixture's main. Initialize its
+		 * native system/origin preflight before inspecting an owned payload. */
+		reset_prepare_apply();
+		/* This old incarnation is retained input only. Its native raw xid
+		 * equals the current ACTIVE xid; its exact terminal identifies the
+		 * physical key without an epoch, FullXid era or historical BIND gate. */
+		tt_top_tx_initialized_fixture(&f, 200, 100, 3);
+		tt_redo_history_plan(&f, 100, end, end, RF_SIDE_PLAN_RECOVERY, false);
+		bind.instance = abort.instance = 3;
+		bind.segment_id = abort.segment_id = mode == 1 ? 514 : 513;
+		bind.segment_generation = abort.segment_generation = mode == 2 ? 1 : 0;
+		bind.slot_offset = abort.slot_offset = mode == 3 ? 5 : 4;
+		bind.wrap = abort.wrap = mode == 4 || mode == 11 ? 8 : 7;
+		bind.xid = abort.xid = 802;
+		bind.format_version = CLUSTER_UNDO_TT_BIND_VERSION;
+		abort.format_version = CLUSTER_UNDO_TT_ABORT_EXACT_VERSION;
+		if (mode != 11) {
+			if (mode == 6)
+				bind.segment_generation++;
+			make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND, &bind,
+								   sizeof(bind));
+			tt_redo_history_feed_at(&f, &fake, begin);
+			begin += 100;
+		}
+		if (mode == 8) {
+			if (completion)
+				cold_completion_abort(&fake);
+			else
+				make_abort(&fake, 802);
+			native_index = (begin - 100) / 100;
+			tt_redo_history_feed_at(&f, &fake, begin);
+			begin += 100;
+		}
+		if (mode != 5) {
+			make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_ABORT, &abort,
+								   sizeof(abort));
+			tt_redo_history_feed_at(&f, &fake, begin);
+			begin += 100;
+		}
+		if (mode == 7 || mode == 9 || mode == 10) {
+			if (mode == 7)
+				make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_ABORT, &abort,
+									   sizeof(abort));
+			if (mode == 9)
+				make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND, &bind,
+									   sizeof(bind));
+			if (mode == 10) {
+				xl_undo_segment_recycle recycle = { 0 };
+
+				recycle.instance = 3;
+				recycle.segment_id = 513;
+				recycle.old_state = SEGMENT_COMMITTED;
+				recycle.new_state = SEGMENT_RECYCLABLE;
+				make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_RECYCLE,
+									   &recycle, sizeof(recycle));
+			}
+			tt_redo_history_feed_at(&f, &fake, begin);
+			begin += 100;
+		}
+		if (mode != 8) {
+			if (completion)
+				cold_completion_abort(&fake);
+			else
+				make_abort(&fake, 802);
+			tt_redo_history_feed_at(&f, &fake, begin);
+			begin += 100;
+		}
+		UT_ASSERT_EQ(begin, end);
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(f.typed.side_plans[1]), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(rf_side_online_plan_operation_v1(f.typed.side_plans[1], native_index, &native));
+		UT_ASSERT(native.history_only);
+		UT_ASSERT_EQ(native.xact.kind, RF_SIDE_XACT_ABORT);
+		UT_ASSERT_EQ(native.xact.xid, 802);
+		tt_top_tx_seal_bound(&f, 100);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &input));
+		UT_ASSERT_EQ(input.slot.status, TT_SLOT_ACTIVE);
+		UT_ASSERT(cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+		f.typed.xid_next_after_redo = UINT64_C(0x700400200);
+		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+		tt_top_tx_effects_complete(&f);
+		tt_top_tx_endpoints_complete(&f);
+		memset(&out, 0xa9, sizeof(out));
+		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
+															  &shape, false, InvalidTransactionId,
+															  UINT64_C(0x12345678), &out),
+					 compatible);
+		if (compatible) {
+			UT_ASSERT_EQ(out.loser.key.xid, input.key.xid);
+			UT_ASSERT_EQ(out.loser.key.slot_wrap, input.key.slot_wrap);
+			UT_ASSERT_EQ(out.c0.record.exact.xid, input.key.xid);
+		} else
+			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_top_tx_c0_producer_reads_exact_historical_abort_identity)
+{
+	tt_top_tx_history_abort_identity(false);
+}
+
+UT_TEST(tt_top_tx_c0_producer_reads_exact_historical_abort_stats_identity)
+{
+	tt_top_tx_history_abort_identity(true);
+}
+
 UT_TEST(tt_top_tx_c0_producer_requires_original_owner_and_exact_post_redo)
 {
 	for (int new_header = 0; new_header < 2; new_header++) {
@@ -6782,7 +6913,7 @@ UT_TEST(tt_top_tx_c0_producer_rechecks_before_output)
 int
 main(void)
 {
-	UT_PLAN(146);
+	UT_PLAN(148);
 	UT_RUN(tt_top_tx_c0_producer_checks_undo_fpi_records);
 	UT_RUN(tt_top_tx_c0_producer_checks_undo_multi_fpi_records);
 	UT_RUN(tt_top_tx_c0_producer_checks_history_undo_fpi_records);
@@ -6826,6 +6957,8 @@ main(void)
 	UT_RUN(tt_top_tx_c0_producer_derives_redo_from_original_coverage);
 	UT_RUN(tt_top_tx_c0_producer_derives_terminal_from_complete_native_lifecycle);
 	UT_RUN(tt_top_tx_c0_producer_requires_original_native_abort_pairing);
+	UT_RUN(tt_top_tx_c0_producer_reads_exact_historical_abort_identity);
+	UT_RUN(tt_top_tx_c0_producer_reads_exact_historical_abort_stats_identity);
 	UT_RUN(tt_top_tx_c0_producer_requires_complete_tt_inventory);
 	UT_RUN(tt_top_tx_c0_producer_requires_all_original_sources);
 	UT_RUN(tt_top_tx_c0_producer_checks_unselected_undo_effects);

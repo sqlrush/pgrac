@@ -800,8 +800,8 @@ cold_top_tx_terminals_compatible_v1(const ClusterColdTypedV1 *typed,
 				/* Never assign raw xid to a physical slot ourselves. The
 				 * original owner requires the unique immutable preceding
 				 * exact TT_ABORT and excludes intervening reuse/mutation.
-				 * It cannot qualify history-only ABORTs, which stay blocked. */
-				if (!rf_side_online_plan_abort_target_v1(plan, &operation, &abort))
+				 * History supplies only identity, never replay authority. */
+				if (!rf_side_online_plan_abort_identity_v1(plan, &operation, &abort))
 					return false;
 				terminal.owner_instance = abort.instance;
 				terminal.segment_id = abort.segment_id;

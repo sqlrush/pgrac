@@ -1102,7 +1102,8 @@ extern bool cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
  * including history-only retained incarnations of the same thread. Absence
  * of those conflicts alone does not supply the terminal proof. A native
  * ABORT with this origin/raw xid additionally requires its original unique
- * exact TT_ABORT pairing; an unqualified history-only ABORT remains blocked.
+ * exact TT_ABORT pairing, including retained history. This read-only identity
+ * does not authorize historical replay. An unqualified ABORT remains blocked.
  * Target incarnation/claim remain bound to the original source.  A new
  * header with no original base requires the native full-image proof.
  * The original endpoint receipt must cover the unchanged complete source

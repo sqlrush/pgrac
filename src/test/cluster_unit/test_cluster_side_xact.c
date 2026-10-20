@@ -3274,9 +3274,10 @@ undo_header_abort(FakeXactRecord *fake, uint16 slot)
 
 /* The original strict decoder/planner retain each carrier and reject unknown
  * shapes. No target IO is used to infer a missing transaction identity. */
-UT_TEST(test_cold_abort_requires_exact_preceding_immutable_carrier)
+static void
+side_abort_carrier_identity(bool history)
 {
-	for (int fault = 0; fault < 13; fault++) {
+	for (int fault = 0; fault < 16; fault++) {
 		RfSideOnlinePlanV1 *plan;
 		RfSideOnlineOperationV1 operation;
 		ClusterUndoDecoded target, unchanged;
@@ -3285,10 +3286,12 @@ UT_TEST(test_cold_abort_requires_exact_preceding_immutable_carrier)
 		uint32 abort_index = 0;
 		unsigned records
 			= 3 + (fault == 4 || fault == 5 || fault == 6 || fault == 7 || fault == 11);
+		XLogRecPtr end;
 
 		if (fault == 1)
 			records--;
-		plan = space_online_plan(100 + records * 100);
+		end = 100 + records * 100;
+		plan = space_online_plan_redo(end, history ? &end : NULL);
 		undo_header_bind(&fake, fault == 10 ? 1 : 0);
 		undo_header_feed(plan, &fake, begin);
 		begin += 100;
@@ -3340,15 +3343,27 @@ UT_TEST(test_cold_abort_requires_exact_preceding_immutable_carrier)
 		}
 		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
 		UT_ASSERT(rf_side_online_plan_operation_v1(plan, abort_index, &operation));
+		UT_ASSERT_EQ(operation.history_only, history);
 		if (fault == 8)
 			operation.identity.record.origin_thread++;
 		if (fault == 9)
 			operation.xact.terminal_scn++;
 		if (fault == 12)
 			operation.purpose = RF_SIDE_PLAN_PI_CONTRIBUTIONS;
+		if (fault == 13)
+			operation.history_only = !operation.history_only;
+		if (fault == 14)
+			operation.identity.participant_index++;
+		if (fault == 15)
+			operation.identity.record.read_rec_ptr++;
 		memset(&unchanged, 0x93, sizeof(unchanged));
 		target = unchanged;
-		UT_ASSERT_EQ(rf_side_online_plan_abort_target_v1(plan, &operation, &target), fault == 0);
+		UT_ASSERT_EQ(rf_side_online_plan_abort_target_v1(plan, &operation, &target),
+					 fault == 0 && !history);
+		if (fault != 0 || history)
+			UT_ASSERT_EQ(memcmp(&target, &unchanged, sizeof(target)), 0);
+		target = unchanged;
+		UT_ASSERT_EQ(rf_side_online_plan_abort_identity_v1(plan, &operation, &target), fault == 0);
 		if (fault == 0) {
 			UT_ASSERT(target.instance == 3 && target.segment_id == 513
 					  && target.expected_generation == 0 && target.slot_offset == 4
@@ -3358,6 +3373,16 @@ UT_TEST(test_cold_abort_requires_exact_preceding_immutable_carrier)
 			UT_ASSERT_EQ(memcmp(&target, &unchanged, sizeof(target)), 0);
 		rf_side_online_plan_destroy_v1(&plan);
 	}
+}
+
+UT_TEST(test_cold_abort_requires_exact_preceding_immutable_carrier)
+{
+	side_abort_carrier_identity(false);
+}
+
+UT_TEST(test_cold_history_abort_identity_does_not_authorize_replay)
+{
+	side_abort_carrier_identity(true);
 }
 
 UT_TEST(test_cold_owner_abort_requires_durable_tt_and_native_clog_before_projection)
@@ -5048,22 +5073,24 @@ UT_TEST(test_cold_abort_stats_rejects_malformed_or_unowned_native_effects)
 	}
 }
 
-UT_TEST(test_cold_abort_stats_keeps_exact_native_record_and_tt_carrier)
+static void
+side_abort_stats_identity(bool history)
 {
-	for (int fault = 0; fault < 9; fault++) {
+	for (int fault = 0; fault < 10; fault++) {
 		FakeXactRecord fake;
 		RfSideXactOperationV1 decoded;
 		RfSideOnlineOperationV1 operation;
 		RfSideOnlinePlanV1 *plan;
 		ClusterUndoDecoded target, untouched;
 		uint8 copy[1024];
+		XLogRecPtr end = fault == 1 ? 300 : 400;
 
 		cold_completion_abort(&fake);
 		if (!rf_side_xact_decode_recovery_v1(&fake.reader, UINT64_C(0x11223344), 3, &decoded)) {
 			UT_ASSERT(false);
 			return;
 		}
-		plan = space_online_plan(fault == 1 ? 300 : 400);
+		plan = space_online_plan_redo(end, history ? &end : NULL);
 		undo_header_bind(&fake, 0);
 		undo_header_feed(plan, &fake, 100);
 		if (fault != 1) {
@@ -5074,6 +5101,7 @@ UT_TEST(test_cold_abort_stats_keeps_exact_native_record_and_tt_carrier)
 		undo_header_feed(plan, &fake, fault == 1 ? 200 : 300);
 		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
 		UT_ASSERT(rf_side_online_plan_operation_v1(plan, fault == 1 ? 1 : 2, &operation));
+		UT_ASSERT_EQ(operation.history_only, history);
 		if (fault == 3)
 			operation.owned_payload_length--;
 		if (fault == 4)
@@ -5092,9 +5120,16 @@ UT_TEST(test_cold_abort_stats_keeps_exact_native_record_and_tt_carrier)
 			xl_xact_stats_item item = { PGSTAT_KIND_WAL, 5, 16388 };
 			memcpy((uint8 *)operation.owned_payload + offset, &item, sizeof(item));
 		}
+		if (fault == 9)
+			operation.history_only = !operation.history_only;
 		memset(&untouched, 0x93, sizeof(untouched));
 		target = untouched;
-		UT_ASSERT_EQ(rf_side_online_plan_abort_target_v1(plan, &operation, &target), fault == 0);
+		UT_ASSERT_EQ(rf_side_online_plan_abort_target_v1(plan, &operation, &target),
+					 fault == 0 && !history);
+		if (fault != 0 || history)
+			UT_ASSERT_EQ(memcmp(&target, &untouched, sizeof(target)), 0);
+		target = untouched;
+		UT_ASSERT_EQ(rf_side_online_plan_abort_identity_v1(plan, &operation, &target), fault == 0);
 		if (fault == 0)
 			UT_ASSERT(target.instance == 3 && target.segment_id == 513 && target.slot_offset == 4
 					  && target.expected_generation == 0 && target.wrap == 7 && target.xid == 802);
@@ -5102,6 +5137,16 @@ UT_TEST(test_cold_abort_stats_keeps_exact_native_record_and_tt_carrier)
 			UT_ASSERT_EQ(memcmp(&target, &untouched, sizeof(target)), 0);
 		rf_side_online_plan_destroy_v1(&plan);
 	}
+}
+
+UT_TEST(test_cold_abort_stats_keeps_exact_native_record_and_tt_carrier)
+{
+	side_abort_stats_identity(false);
+}
+
+UT_TEST(test_cold_history_abort_stats_identity_does_not_authorize_replay)
+{
+	side_abort_stats_identity(true);
 }
 
 UT_TEST(test_cold_abort_stats_source_tt_clog_and_native_owner_precede_terminal)
@@ -12346,7 +12391,7 @@ UT_TEST(test_cold_terminal_frame_refusal_preserves_pi_inspection)
 int
 main(void)
 {
-	UT_PLAN(182);
+	UT_PLAN(184);
 	UT_RUN(test_cold_strict_terminals_refuse_unconsumed_frame);
 	UT_RUN(test_cold_effectful_terminals_refuse_unconsumed_frame);
 	UT_RUN(test_cold_terminal_capture_keeps_unconsumed_frame_out_of_history_and_replay);
@@ -12432,6 +12477,7 @@ main(void)
 	UT_RUN(test_cold_abort_completion_keeps_owned_stats_and_refuses_generic_apply);
 	UT_RUN(test_cold_abort_stats_rejects_malformed_or_unowned_native_effects);
 	UT_RUN(test_cold_abort_stats_keeps_exact_native_record_and_tt_carrier);
+	UT_RUN(test_cold_history_abort_stats_identity_does_not_authorize_replay);
 	UT_RUN(test_cold_abort_stats_source_tt_clog_and_native_owner_precede_terminal);
 	UT_RUN(test_cold_completion_keeps_stats_and_force_payload_owned);
 	UT_RUN(test_cold_stats_rejects_unknown_kinds_and_malformed_complete_batch);
@@ -12527,6 +12573,7 @@ main(void)
 	UT_RUN(test_space_commit_retains_all_native_side_effects_and_refuses_tt_only_owner);
 	UT_RUN(test_multixact_retired_page_requires_exact_later_sealed_truncate);
 	UT_RUN(test_cold_abort_requires_exact_preceding_immutable_carrier);
+	UT_RUN(test_cold_history_abort_identity_does_not_authorize_replay);
 	UT_RUN(test_cold_owner_abort_requires_durable_tt_and_native_clog_before_projection);
 	UT_RUN(test_cold_whole_source_barrier_precedes_every_native_effect);
 	UT_DONE();
