@@ -395,10 +395,11 @@ cluster_relmap_retention_census_rebuild_pending(ClusterRelmapRetentionCensus *ce
 	return result;
 }
 
-ClusterRelmapPendingResult
-cluster_relmap_retention_census_rebuild_pending_wal(ClusterRelmapRetentionCensus *census,
+static ClusterRelmapPendingResult
+census_rebuild_pending_wal(ClusterRelmapRetentionCensus *census,
 	ClusterRelmapPendingSet *pending_out, struct ClusterWalInputsV1 *inputs,
-	const ClusterRelmapPendingDescriptor *descriptors, size_t descriptor_count)
+	const ClusterRelmapPendingDescriptor *descriptors, size_t descriptor_count,
+	const ClusterRelmapPendingSideSource *sources, size_t source_count)
 {
 	ClusterRelmapPendingResult result = census_rebuild_ready(census);
 	ClusterRelmapV2Image image = { 0 };
@@ -417,8 +418,16 @@ cluster_relmap_retention_census_rebuild_pending_wal(ClusterRelmapRetentionCensus
 	}
 	PG_TRY();
 	{
-		if (image.pending_generation != 0 &&
-			cluster_relmap_owner_retained_wal_v2(&image, inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		ClusterControlRootResult retained = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+
+		if (image.pending_generation != 0) {
+			/* The combined path must bind its whole sealed participant vector
+			 * to the actual claims/cuts in this same original retained scan. */
+			retained = sources == NULL
+				? cluster_relmap_owner_retained_wal_v2(&image, inputs)
+				: cluster_relmap_owner_retained_side_wal_v2(&image, inputs, sources, source_count);
+		}
+		if (retained != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 			census_failed(census, CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
 			result = CLUSTER_RELMAP_PENDING_NOT_READY;
 		} else {
@@ -435,6 +444,15 @@ cluster_relmap_retention_census_rebuild_pending_wal(ClusterRelmapRetentionCensus
 	}
 	PG_END_TRY();
 	return result;
+}
+
+ClusterRelmapPendingResult
+cluster_relmap_retention_census_rebuild_pending_wal(ClusterRelmapRetentionCensus *census,
+	ClusterRelmapPendingSet *pending_out, struct ClusterWalInputsV1 *inputs,
+	const ClusterRelmapPendingDescriptor *descriptors, size_t descriptor_count)
+{
+	return census_rebuild_pending_wal(census, pending_out, inputs, descriptors,
+		descriptor_count, NULL, 0);
 }
 
 ClusterRelmapPendingResult
@@ -501,8 +519,8 @@ cluster_relmap_retention_census_rebuild_pending_side_wal(ClusterRelmapRetentionC
 	}
 	/* Original scope, final borrowed-state recheck and ERROR/pin ownership
 	 * remain in the existing WAL path; only its atomic core consumes the view. */
-	return cluster_relmap_retention_census_rebuild_pending_wal(census, pending_out,
-		inputs, descriptors, count);
+	return census_rebuild_pending_wal(census, pending_out, inputs, descriptors, count,
+		sources, source_count);
 }
 
 void
