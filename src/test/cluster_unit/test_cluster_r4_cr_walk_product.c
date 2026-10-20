@@ -5,7 +5,10 @@
  * Portions Copyright (c) 2026, pgrac contributors
  *-------------------------------------------------------------------------
  */
-#include "../../backend/cluster/cluster_cr.c"
+#ifndef CR_WALK_SOURCE
+#define CR_WALK_SOURCE "../../backend/cluster/cluster_cr.c"
+#endif
+#include CR_WALK_SOURCE
 
 bool cr_history_test_synchronous(char *page, SCN read_scn, const BufferTag *tag, bool server_mode,
 								 bool *partial, uint32 *steps);
