@@ -632,6 +632,40 @@ cold_top_tx_frame_xids_v1(TransactionId xid, TransactionId top)
 			   || (TransactionIdIsNormal(top) && TransactionIdIsNormal(xid) && top == xid));
 }
 
+/* A native FPI can retain records from several transactions. Select the first
+ * record only to address the existing reader, which checks the entire block
+ * before returning it. These raw identities need not name the WAL actor or
+ * selected loser and do not establish generation or terminal authority. */
+static bool
+cold_top_tx_undo_fpi_v1(const RfSideOnlineOperationV1 *operation)
+{
+	const ClusterUndoDecoded *undo = &operation->undo;
+	UndoBlockHeader block;
+	UndoSlotDirEntry slot;
+	UndoRecordHeader header;
+	ClusterRecoveryUndoRecord record;
+	UBA address;
+
+	if (operation->owned_payload == NULL || operation->owned_payload_length != BLCKSZ
+		|| undo->instance == 0 || undo->instance > UNDO_OWNER_INSTANCE_MAX || undo->segment_id == 0
+		|| undo->segment_id > UINT16_MAX || undo->block_no == 0)
+		return false;
+	memcpy(&block, operation->owned_payload, sizeof(block));
+	memcpy(&slot, operation->owned_payload + UNDO_SLOT_DIR_OFFSET(0), sizeof(slot));
+	if (!cluster_undo_record_slot_range_valid(block.slot_count, 0, slot.record_offset,
+											  slot.record_length)
+		|| slot.record_length < sizeof(header))
+		return false;
+	memcpy(&header, operation->owned_payload + slot.record_offset, sizeof(header));
+	if (header.tt_slot_id == 0 || header.tt_slot_id > TT_SLOTS_PER_SEGMENT)
+		return false;
+	address = uba_encode(undo->segment_id, undo->block_no, header.tt_slot_id - 1, 0);
+	return cluster_recovery_undo_record_read(operation->owned_payload,
+											 operation->owned_payload_length, undo->segment_id,
+											 undo->block_no, undo->instance, address, &record)
+		   == CLUSTER_RECOVERY_UNDO_ENTRY;
+}
+
 /* Preserve operation-local SIDE/PAGE/SPACE evidence, including retained history. A
  * known child frame cannot become canonical just because the candidate's
  * BIND is top. Conversely an unrelated operation names its own actor, not
@@ -702,6 +736,11 @@ cold_top_tx_frames_v1(const ClusterColdTypedV1 *typed)
 						&& operation.undo.format_version == CLUSTER_UNDO_TT_ABORT_EXACT_VERSION))
 				&& TransactionIdIsValid(operation.source_xid)
 				&& operation.source_xid != operation.undo.xid)
+				return false;
+			if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO && operation.undo.has_fpi
+				&& (operation.undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
+					|| operation.undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI)
+				&& !cold_top_tx_undo_fpi_v1(&operation))
 				return false;
 		}
 	}

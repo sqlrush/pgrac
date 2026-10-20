@@ -6204,6 +6204,157 @@ UT_TEST(tt_top_tx_c0_producer_requires_all_original_sources)
 	}
 }
 
+/* Byte-perfect native replay is not a substitute for decoding the original
+ * FPI. Historical records retain their own identities, not actor 804 or the
+ * selected loser 802. The existing full-block reader is the format oracle. */
+static void
+tt_top_tx_undo_fpi_records(bool history, bool multi)
+{
+	for (int fault = 0; fault < 15; fault++) {
+		TtRedoFixture f;
+		FakeXactRecord fake;
+		PGAlignedBlock page, expected;
+		UndoBlockHeader *block = (UndoBlockHeader *)page.data;
+		UndoSlotDirEntry directory;
+		UndoRecordHeader record;
+		xl_undo_block_write single = { 0 };
+		xl_undo_block_write_multi batch = { 0 };
+		uint8 bytes[sizeof(batch) + BLCKSZ];
+		Size prefix = multi ? sizeof(batch) : sizeof(single);
+		RfSideOnlineOperationV1 captured;
+		ClusterColdTtSlotInputV1 input;
+		ClusterColdTopTxProofV1 proof;
+		ClusterRecoveryTTAbortV1 shape;
+		ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
+
+		tt_top_tx_initialized_fixture(&f, history ? 200 : 300, 100, history ? 3 : 2);
+		tt_top_tx_frame_bind(&fake, 4, 802, 802, 802);
+		undo_header_feed(f.typed.side_plans[0], &fake, 200);
+		if (history)
+			tt_redo_history_plan(&f, 100, 200, 200, RF_SIDE_PLAN_RECOVERY, false);
+		tt_redo_record_page(&page, 900);
+		memcpy(&directory, page.data + UNDO_SLOT_DIR_OFFSET(fault == 14 ? 0 : 1),
+			   sizeof(directory));
+		memcpy(&record, page.data + directory.record_offset, sizeof(record));
+		switch (fault) {
+		case 1:
+			record.origin_node_id--;
+			break;
+		case 2:
+			record.tt_slot_segment_id = 257;
+			break;
+		case 3:
+			record.tt_slot_id = TT_SLOTS_PER_SEGMENT + 1;
+			break;
+		case 4:
+			record.record_type = UNDO_RECORD_INVALID;
+			break;
+		case 5:
+			record.payload_length++;
+			break;
+		case 6:
+			directory.record_length = sizeof(record) - 1;
+			break;
+		case 7:
+			directory.record_offset = sizeof(UndoBlockHeader);
+			break;
+		case 8:
+			block->slot_count = UINT16_MAX;
+			break;
+		case 9:
+			block->magic = 0;
+			break;
+		case 10:
+			directory.flags ^= UNDO_REC_FLAG_FIRST_IN_TX;
+			break;
+		case 11:
+			record.flags |= UNDO_REC_FLAG_CONTINUED;
+			directory.flags = record.flags;
+			break;
+		case 12:
+			record.tt_slot_segment_id = 0;
+			break;
+		case 13:
+			block->slot_count = 0;
+			break;
+		case 14:
+			record.tt_slot_id = 0;
+			break;
+		}
+		/* Write a modified header at the original offset even for the overlap
+		 * case; the directory change alone supplies that malformed shape. */
+		if (fault != 7)
+			memcpy(page.data + directory.record_offset, &record, sizeof(record));
+		memcpy(page.data + UNDO_SLOT_DIR_OFFSET(fault == 14 ? 0 : 1), &directory,
+			   sizeof(directory));
+		single.instance = batch.instance = 3;
+		single.segment_id = batch.segment_id = 513;
+		single.block_no = batch.block_no = 9;
+		single.has_fpi = batch.has_fpi = 1;
+		memcpy(bytes, multi ? (const void *)&batch : (const void *)&single, prefix);
+		memcpy(bytes + prefix, page.data, BLCKSZ);
+		make_projection_record(&fake, RM_CLUSTER_UNDO_ID,
+							   multi ? XLOG_UNDO_BLOCK_WRITE_MULTI : XLOG_UNDO_BLOCK_WRITE, bytes,
+							   prefix + BLCKSZ);
+		fake.u.decoded.header.xl_xid = fake.u.decoded.toplevel_xid = 804;
+		if (history) {
+			tt_redo_history_feed(&f, &fake);
+			UT_ASSERT_EQ(rf_side_online_plan_seal_v1(f.typed.side_plans[1]),
+						 RF_PAGE_PROOF_DETAIL_OK);
+		} else {
+			undo_header_feed(f.typed.side_plans[0], &fake, 300);
+			expected = page;
+			((UndoBlockHeader *)expected.data)->block_lsn = 400;
+		}
+		memset(fake.data, 0x5a, prefix + BLCKSZ);
+		tt_redo_seal(&f);
+		tt_top_tx_write_fold(&f);
+		if (!history)
+			tt_undo_readback_write(513, 9, &expected);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &input));
+		UT_ASSERT(cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+		f.typed.xid_next_after_redo = UINT64_C(0x700400200);
+		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+		tt_top_tx_effects_complete(&f);
+		tt_top_tx_endpoints_complete(&f);
+		memset(&out, 0xa9, sizeof(out));
+		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
+															  &shape, false, InvalidTransactionId,
+															  UINT64_C(0x12345678), &out),
+					 fault == 0);
+		if (fault != 0)
+			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		UT_ASSERT(rf_side_online_plan_operation_v1(f.typed.side_plans[history ? 1 : 0],
+												   history ? 0 : 2, &captured));
+		UT_ASSERT_EQ(captured.owned_payload_length, BLCKSZ);
+		UT_ASSERT(memcmp(captured.owned_payload, page.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(captured.source_xid, 804);
+		UT_ASSERT_EQ(captured.history_only, history);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_top_tx_c0_producer_checks_undo_fpi_records)
+{
+	tt_top_tx_undo_fpi_records(false, false);
+}
+
+UT_TEST(tt_top_tx_c0_producer_checks_undo_multi_fpi_records)
+{
+	tt_top_tx_undo_fpi_records(false, true);
+}
+
+UT_TEST(tt_top_tx_c0_producer_checks_history_undo_fpi_records)
+{
+	tt_top_tx_undo_fpi_records(true, false);
+}
+
+UT_TEST(tt_top_tx_c0_producer_checks_history_undo_multi_fpi_records)
+{
+	tt_top_tx_undo_fpi_records(true, true);
+}
+
 UT_TEST(tt_top_tx_c0_producer_checks_unselected_undo_effects)
 {
 	for (int fault = 0; fault < 5; fault++) {
@@ -6417,7 +6568,11 @@ UT_TEST(tt_top_tx_c0_producer_rechecks_before_output)
 int
 main(void)
 {
-	UT_PLAN(138);
+	UT_PLAN(142);
+	UT_RUN(tt_top_tx_c0_producer_checks_undo_fpi_records);
+	UT_RUN(tt_top_tx_c0_producer_checks_undo_multi_fpi_records);
+	UT_RUN(tt_top_tx_c0_producer_checks_history_undo_fpi_records);
+	UT_RUN(tt_top_tx_c0_producer_checks_history_undo_multi_fpi_records);
 	UT_RUN(tt_top_tx_c0_producer_requires_each_replay_page_creator);
 	UT_RUN(tt_top_tx_c0_producer_requires_each_replay_page_actor);
 	UT_RUN(tt_top_tx_c0_producer_checks_page_frames);
