@@ -208,6 +208,69 @@ UT_TEST(census_side_real_pair_history_and_every_commit_drop)
 	}
 }
 
+UT_TEST(census_side_abort_create_pair_reserves_without_terminal_authority)
+{
+	CensusFixture root;
+	CensusSideFixture side;
+	FakeXactRecord fake;
+	RelFileLocator locators[] = { { DEFAULTTABLESPACE_OID, 5, 16384 },
+		{ GLOBALTABLESPACE_OID, InvalidOid, 16385 } };
+	ClusterRelmapCensusResult result = CLUSTER_RELMAP_CENSUS_MORE;
+	unsigned seen = 0;
+
+	reset_prepare_apply();
+	census_fixture(&root, true);
+	census_pair(root.fd, 5, 3, true, false, false);
+	census_side_plan(&side, 600, true, RF_SIDE_PLAN_RECOVERY);
+	for (unsigned i = 0; i < lengthof(locators) * 2; i++) {
+		cold_abort_create_record(&fake, locators[i / 2], i % 2 == 0, 802);
+		if (i % 2 != 0) {
+			ClusterSpaceStructureChange create;
+
+			UT_ASSERT(cluster_space_structure_wal_decode(fake.data,
+				fake.u.decoded.main_data_len, &create));
+			create.identity.result.key = census_side_key(locators[i / 2].relNumber,
+				locators[i / 2].dbOid);
+			create.reservation.result.identity.key = create.identity.result.key;
+			UT_ASSERT(cluster_space_structure_wal_encode(&create, fake.data,
+				fake.u.decoded.main_data_len));
+		}
+		census_side_feed(&side, &fake, (i + 1) * 100, false);
+		memset(fake.data, 0xee, sizeof(fake.data));
+	}
+	cold_abort_deletes(&fake, locators, lengthof(locators), false);
+	census_side_feed(&side, &fake, 500, true);
+	memset(fake.data, 0xee, sizeof(fake.data));
+	census_side_seal(&side);
+	UT_ASSERT_EQ(rf_side_online_plan_space_target_count_v1(side.plan), 0);
+	if (census_observe_begin(&root)) {
+		for (unsigned tick = 0; tick < 20000 && result == CLUSTER_RELMAP_CENSUS_MORE; tick++) {
+			ClusterRelmapCensusCommitted out;
+			ClusterRelmapPendingSet set;
+
+			result = cluster_relmap_retention_census_next_committed(root.census, &out);
+			if (!out.present)
+				continue;
+			cluster_relmap_pending_init(&set);
+			UT_ASSERT_EQ(cluster_relmap_retention_census_rebuild_pending_side(root.census,
+				&set, &side.source, 1), CLUSTER_RELMAP_PENDING_OK);
+			census_side_entry(&set, 0, CLUSTER_RELMAP_PENDING_DROP,
+				out.identity.shared ? 16385 : 16384, out.identity.dbid);
+			UT_ASSERT(!set.entries[1].occupied);
+			seen |= out.identity.shared ? 1 : 2;
+		}
+		UT_ASSERT_EQ(result, CLUSTER_RELMAP_CENSUS_DRAINED);
+		UT_ASSERT_EQ(seen, 3);
+		UT_ASSERT(census_pin(&root.origin[0], 5) != NULL);
+		for (unsigned i = 0; i < 2; i++)
+			UT_ASSERT_EQ(root.origin[i].state, CLUSTER_RELMAP_RETENTION_BUILDING);
+	}
+	UT_ASSERT_EQ(prepare_apply.tt_stamps, 0);
+	UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 0);
+	rf_side_online_plan_destroy_v1(&side.plan);
+	census_cleanup(&root);
+}
+
 UT_TEST(census_side_missing_is_not_explicit_empty_and_refusal_preserves_pins)
 {
 	for (unsigned empty = 0; empty < 2; empty++) {
@@ -386,8 +449,9 @@ UT_TEST(census_side_invalid_destination_duplicate_and_capacity_keep_responsibili
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
 	UT_RUN(census_side_real_pair_history_and_every_commit_drop);
+	UT_RUN(census_side_abort_create_pair_reserves_without_terminal_authority);
 	UT_RUN(census_side_missing_is_not_explicit_empty_and_refusal_preserves_pins);
 	UT_RUN(census_side_rejects_original_source_drift_and_unsealed_plan_atomically);
 	UT_RUN(census_side_window_expiry_and_borrowed_drift);

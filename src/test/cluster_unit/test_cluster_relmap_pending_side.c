@@ -345,30 +345,120 @@ UT_TEST(side_pending_explicit_empty_is_not_missing_source)
 	rf_side_online_plan_destroy_v1(&f.plan);
 }
 
-UT_TEST(side_pending_relation_bearing_abort_is_not_silently_empty)
+UT_TEST(side_pending_abort_keeps_every_original_create_and_namespace)
 {
-	PendingSideFixture f;
-	FakeXactRecord fake;
-	RelFileLocator locator = { DEFAULTTABLESPACE_OID, 5, 16384 };
-	ClusterRelmapPendingDescriptor out, before;
-	size_t count = 999;
+	RelFileLocator locators[] = { { DEFAULTTABLESPACE_OID, 5, 16384 },
+		{ GLOBALTABLESPACE_OID, InvalidOid, 16385 },
+		{ DEFAULTTABLESPACE_OID, 6, 16386 } };
 
-	side_pending_plan(&f, 400, true, RF_SIDE_PLAN_RECOVERY, true);
-	/* The original seal requires the exact native/typed CREATE pair. */
-	for (uint32 i = 0; i < 2; i++)
+	for (unsigned history = 0; history < 2; history++)
 	{
-		cold_abort_create_record(&fake, locator, i == 0, 802);
-		UT_ASSERT_EQ(cold_abort_delete_feed(f.plan, &fake, (i + 1) * 100, 0), RF_PAGE_PROOF_DETAIL_OK);
+		PendingSideFixture f;
+		FakeXactRecord fake;
+
+		reset_prepare_apply();
+		side_pending_plan(&f, 800, history, RF_SIDE_PLAN_RECOVERY, true);
+		for (uint32 i = 0; i < lengthof(locators) * 2; i++)
+		{
+			cold_abort_create_record(&fake, locators[i / 2], i % 2 == 0, 802);
+			UT_ASSERT_EQ(cold_abort_delete_feed(f.plan, &fake, (i + 1) * 100, 0), RF_PAGE_PROOF_DETAIL_OK);
+			memset(fake.data, 0xee, sizeof(fake.data));
+		}
+		cold_abort_deletes(&fake, locators, lengthof(locators), false);
+		UT_ASSERT_EQ(space_commit_feed(f.plan, &fake, 700), RF_PAGE_PROOF_DETAIL_OK);
+		memset(fake.data, 0xee, sizeof(fake.data));
+		side_pending_seal(&f);
+		UT_ASSERT_EQ(rf_side_online_plan_space_target_count_v1(f.plan), history ? 0 : lengthof(locators));
+		for (unsigned i = 0; i < lengthof(locators); i++)
+		{
+			ClusterRelmapV2Namespace expected = side_pending_namespace;
+			ClusterRelmapPendingDescriptor out = { 0 };
+			size_t count = 999;
+
+			expected.dbid = locators[i].dbOid;
+			expected.shared = expected.dbid == InvalidOid;
+			UT_ASSERT_EQ(cluster_relmap_pending_collect_side(&expected,
+				f.source.source.claim.identity.storage_uuid, &f.source, 1, &out, 1,
+				&count), CLUSTER_RELMAP_PENDING_OK);
+			UT_ASSERT_EQ(count, 1);
+			UT_ASSERT_EQ(out.kind, CLUSTER_RELMAP_PENDING_DROP);
+			UT_ASSERT(RelFileLocatorEquals(out.identity.locator, locators[i]));
+			UT_ASSERT_EQ(out.identity.system_identifier, expected.system_identifier);
+			UT_ASSERT_EQ(out.identity.database_incarnation, expected.database_incarnation);
+			UT_ASSERT_EQ(memcmp(out.identity.storage_uuid,
+				f.source.source.claim.identity.storage_uuid, 16), 0);
+		}
+		UT_ASSERT_EQ(prepare_apply.tt_stamps, 0);
+		UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 0);
+		rf_side_online_plan_destroy_v1(&f.plan);
 	}
-	cold_abort_deletes(&fake, &locator, 1, false);
-	UT_ASSERT_EQ(space_commit_feed(f.plan, &fake, 300), RF_PAGE_PROOF_DETAIL_OK);
-	side_pending_seal(&f);
-	memset(&out, 0xa5, sizeof(out));
-	memcpy(&before, &out, sizeof(out));
-	UT_ASSERT_EQ(side_pending_collect(&f, &out, 1, &count), CLUSTER_RELMAP_PENDING_NOT_READY);
-	UT_ASSERT_EQ(count, 999);
-	UT_ASSERT_EQ(memcmp(&out, &before, sizeof(out)), 0);
-	rf_side_online_plan_destroy_v1(&f.plan);
+}
+
+UT_TEST(side_pending_abort_duplicate_and_capacity_refuse_atomically)
+{
+	for (unsigned duplicate = 0; duplicate < 2; duplicate++)
+	{
+		PendingSideFixture f;
+		FakeXactRecord fake;
+		RelFileLocator locators[] = { { DEFAULTTABLESPACE_OID, 5, 16384 },
+			{ DEFAULTTABLESPACE_OID, 5, 16385 } };
+		ClusterRelmapPendingDescriptor out[2], before[2];
+		unsigned pairs = duplicate ? 1 : 2;
+		size_t count = 999;
+
+		if (duplicate)
+			locators[1] = locators[0];
+		side_pending_plan(&f, (pairs * 2 + 2) * 100, true, RF_SIDE_PLAN_RECOVERY, true);
+		for (unsigned i = 0; i < pairs * 2; i++)
+		{
+			cold_abort_create_record(&fake, locators[i / 2], i % 2 == 0, 802);
+			UT_ASSERT_EQ(cold_abort_delete_feed(f.plan, &fake, (i + 1) * 100, 0), RF_PAGE_PROOF_DETAIL_OK);
+		}
+		cold_abort_deletes(&fake, locators, lengthof(locators), false);
+		UT_ASSERT_EQ(space_commit_feed(f.plan, &fake, (pairs * 2 + 1) * 100), RF_PAGE_PROOF_DETAIL_OK);
+		side_pending_seal(&f);
+		memset(out, 0xa5, sizeof(out));
+		memcpy(before, out, sizeof(out));
+		UT_ASSERT_EQ(side_pending_collect(&f, out, duplicate ? 2 : 1, &count), duplicate
+			? CLUSTER_RELMAP_PENDING_CONFLICT : CLUSTER_RELMAP_PENDING_CAPACITY_EXCEEDED);
+		UT_ASSERT_EQ(count, 999);
+		UT_ASSERT_EQ(memcmp(out, before, sizeof(out)), 0);
+		UT_ASSERT_EQ(side_pending_collect(&f, NULL, 0, &count), CLUSTER_RELMAP_PENDING_CAPACITY_EXCEEDED);
+		UT_ASSERT_EQ(count, 999);
+		rf_side_online_plan_destroy_v1(&f.plan);
+	}
+}
+
+UT_TEST(side_pending_abort_needs_the_original_native_create_proof)
+{
+	for (unsigned bad = 0; bad < 3; bad++)
+	{
+		PendingSideFixture f;
+		FakeXactRecord fake;
+		RelFileLocator locator = { DEFAULTTABLESPACE_OID, 5, 16384 };
+		ClusterRelmapPendingDescriptor out, before;
+		size_t count = 999;
+
+		side_pending_plan(&f, bad == 2 ? 300 : 400, true, RF_SIDE_PLAN_RECOVERY, true);
+		for (unsigned i = bad == 2 ? 1 : 0; i < 2; i++)
+		{
+			cold_abort_create_record(&fake, locator, i == 0, bad == 0 ? 803 : 802);
+			UT_ASSERT_EQ(cold_abort_delete_feed(f.plan, &fake,
+				(i + (bad == 2 ? 0 : 1)) * 100, 0), RF_PAGE_PROOF_DETAIL_OK);
+		}
+		if (bad == 1)
+			locator.relNumber++;
+		cold_abort_deletes(&fake, &locator, 1, false);
+		UT_ASSERT_EQ(space_commit_feed(f.plan, &fake, bad == 2 ? 200 : 300), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(rf_side_online_plan_bind_database_v1(f.plan, 42));
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(f.plan), RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+		memset(&out, 0xa5, sizeof(out));
+		before = out;
+		UT_ASSERT_EQ(side_pending_collect(&f, &out, 1, &count), CLUSTER_RELMAP_PENDING_NOT_READY);
+		UT_ASSERT_EQ(count, 999);
+		UT_ASSERT_EQ(memcmp(&out, &before, sizeof(out)), 0);
+		rf_side_online_plan_destroy_v1(&f.plan);
+	}
 }
 
 UT_TEST(side_pending_requires_all_participants_and_enumerates_plan_once)
@@ -491,7 +581,7 @@ UT_TEST(side_pending_create_and_advance_are_not_deletion_descriptors)
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(13);
 	UT_RUN(side_pending_retains_history_and_every_commit_locator);
 	UT_RUN(side_pending_namespace_selection_and_redo_independence);
 	UT_RUN(side_pending_refusal_preserves_outputs);
@@ -499,7 +589,9 @@ main(void)
 	UT_RUN(side_pending_duplicate_sources_and_locator_history_refuse);
 	UT_RUN(side_pending_is_bounded_without_partial_output);
 	UT_RUN(side_pending_explicit_empty_is_not_missing_source);
-	UT_RUN(side_pending_relation_bearing_abort_is_not_silently_empty);
+	UT_RUN(side_pending_abort_keeps_every_original_create_and_namespace);
+	UT_RUN(side_pending_abort_duplicate_and_capacity_refuse_atomically);
+	UT_RUN(side_pending_abort_needs_the_original_native_create_proof);
 	UT_RUN(side_pending_requires_all_participants_and_enumerates_plan_once);
 	UT_RUN(side_pending_retained_generations_keep_cross_plan_locator_conflicts);
 	UT_RUN(side_pending_create_and_advance_are_not_deletion_descriptors);

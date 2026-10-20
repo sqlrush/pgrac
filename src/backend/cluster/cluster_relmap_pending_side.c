@@ -47,6 +47,41 @@ pending_side_append(const ClusterRelmapV2Namespace *expected,
 }
 
 static ClusterRelmapPendingResult
+pending_side_abort(const ClusterRelmapV2Namespace *expected,
+				   const uint8 storage_uuid[16], const RfSideOnlinePlanV1 *plan,
+				   uint32 index, uint32 relation_count, ClusterRelmapPendingSet *seen,
+				   ClusterRelmapPendingDescriptor *descriptors, size_t *count,
+				   size_t capacity)
+{
+	for (uint32 j = 0; j < relation_count; j++)
+	{
+		RfSideOnlineOperationV1 creation;
+		ClusterSpaceStructureChange change;
+		ClusterRelmapPendingResult result;
+		uint32 creation_index;
+
+		/* The original owner binds each native pending-delete locator to its
+		 * earlier native MAIN/typed CREATE pair, exact source, xid and range. */
+		if (!rf_side_online_plan_abort_creation_v1(plan, index, j, &creation_index) ||
+			creation_index >= index ||
+			!rf_side_online_plan_operation_v1(plan, creation_index, &creation) ||
+			creation.kind != RF_SIDE_ONLINE_OPERATION_SPACE ||
+			creation.purpose != RF_SIDE_PLAN_RECOVERY ||
+			creation.route.normalized_info != XLOG_SMGR_SPACE_IDENTITY ||
+			!cluster_space_structure_wal_decode(creation.owned_payload,
+				creation.owned_payload_length, &change) ||
+			change.identity.action != CLUSTER_SPACE_WAL_CREATE)
+			return CLUSTER_RELMAP_PENDING_NOT_READY;
+		/* Reserve the original key; a CREATE is not a completed tombstone. */
+		result = pending_side_append(expected, storage_uuid, seen, descriptors,
+			count, capacity, CLUSTER_RELMAP_PENDING_DROP, &change.identity.result.key);
+		if (result != CLUSTER_RELMAP_PENDING_OK)
+			return result;
+	}
+	return CLUSTER_RELMAP_PENDING_OK;
+}
+
+static ClusterRelmapPendingResult
 pending_side_plan(const ClusterRelmapV2Namespace *expected,
 				  const uint8 storage_uuid[16], const RfSideOnlinePlanV1 *plan,
 				  ClusterRelmapPendingSet *seen,
@@ -71,13 +106,21 @@ pending_side_plan(const ClusterRelmapV2Namespace *expected,
 			return CLUSTER_RELMAP_PENDING_NOT_READY;
 		if (operation.kind == RF_SIDE_ONLINE_OPERATION_XACT)
 		{
-			/* ABORT deletions need their original native CREATE pairing;
-			 * PREPARED has its own retained structural obligations. */
-			if (operation.xact.kind != RF_SIDE_XACT_COMMIT &&
-				operation.xact.kind != RF_SIDE_XACT_ABORT)
-				return CLUSTER_RELMAP_PENDING_NOT_READY;
-			if (operation.xact.relation_count != locator_count ||
-				(operation.xact.kind != RF_SIDE_XACT_COMMIT && locator_count != 0))
+			if (operation.xact.kind == RF_SIDE_XACT_ABORT)
+			{
+				ClusterRelmapPendingResult result;
+
+				if (locator_count != 0)
+					return CLUSTER_RELMAP_PENDING_NOT_READY;
+				result = pending_side_abort(expected, storage_uuid, plan, i,
+					operation.xact.relation_count, seen, descriptors, count, capacity);
+				if (result != CLUSTER_RELMAP_PENDING_OK)
+					return result;
+				continue;
+			}
+			/* PREPARED retains its separate structural obligations. */
+			if (operation.xact.kind != RF_SIDE_XACT_COMMIT ||
+				operation.xact.relation_count != locator_count)
 				return CLUSTER_RELMAP_PENDING_NOT_READY;
 			kind = CLUSTER_RELMAP_PENDING_DROP;
 		}

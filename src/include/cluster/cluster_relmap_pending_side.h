@@ -24,8 +24,9 @@ typedef struct ClusterRelmapPendingSideSource
 } ClusterRelmapPendingSideSource;
 
 /*
- * Extract TRUNCATE and every native COMMIT's typed DROP from the complete
- * retained operation vector, including history before native redo. Require
+ * Extract TRUNCATE, every native COMMIT's typed DROP and native ABORT's
+ * original paired CREATE keys from the complete retained operation vector,
+ * including history before native redo. Require
  * all physical participants of each supplied sealed RECOVERY plan, matching
  * its original cut and full bound ROOT/claim. Inspect-only, unbound, repeated
  * origins and missing participants refuse; an absent input vector is not an
@@ -36,9 +37,11 @@ typedef struct ClusterRelmapPendingSideSource
  * Select the requested global/local database namespace; valid records for
  * other database namespaces remain the caller's separate obligations. CREATE
  * and ADVANCE are not DROP/TRUNCATE. Repeated physical locators are ambiguous
- * and refuse, never deduplicated or resolved by a new terminal owner. Native
- * relation-bearing ABORT and PREPARED are NOT_READY pending their original
- * structural owner; they must never become a successful empty directory.
+ * and refuse, never deduplicated or resolved by a new terminal owner. Each
+ * ABORT pending-delete locator requires the original sealed native/typed
+ * CREATE pairing; it contributes a DROP reservation, not a tombstone or
+ * completed deletion. Missing pairing and PREPARED remain NOT_READY; they
+ * must never become a successful empty directory.
  *
  * At most CLUSTER_RELMAP_PENDING_CAPACITY descriptors are returned. Outputs
  * and count are unchanged on any failure. Output may be NULL only at zero
