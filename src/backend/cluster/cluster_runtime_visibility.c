@@ -1224,12 +1224,21 @@ cluster_runtime_visibility_current_owner_lookup_internal(
 	}
 	PG_END_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
 								PointerGetDatum(&cleanup));
-	if (sampled && located_physical
-		&& (!cluster_runtime_visibility_locate_scope_current(xid, &admission, &locate_scope)
+	/* Release can wait: every source must still identify the sampled slot
+	 * before its verdict or ACTIVE grant escapes.  These checks stay local. */
+	if (sampled)
+		sampled
+			= located_physical
+				  ? cluster_runtime_visibility_locate_scope_current(xid, &admission, &locate_scope)
+				  : cluster_runtime_visibility_current_owner_recheck(xid, &owner, expected_binding);
+	if (sampled
+		&& (!cluster_runtime_visibility_admission_current(CLUSTER_TX_RESOLVE_VISIBILITY, &admission)
 			|| !cluster_runtime_visibility_resolve_root_admitted(
 				CLUSTER_TX_RESOLVE_VISIBILITY, &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
 				logical.owner_instance, logical.segment_id, &final_root)
-			|| !cluster_runtime_visibility_candidate_root_matches(&root, &final_root)))
+			|| !cluster_runtime_visibility_candidate_root_matches(&root, &final_root)
+			|| (ctrc_required
+				&& cluster_qvotec_get_self_incarnation() != ctrc_key.origin_boot_incarnation)))
 		sampled = false;
 
 done:

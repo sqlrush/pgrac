@@ -97,6 +97,7 @@ static FullTransactionId test_next_full_xid;
 static FullTransactionId test_next_full_on_locate;
 static TransactionId test_oldest_clog_on_locate;
 static int test_release_scope_drift;
+static int test_release_identity_drift;
 static uint64 test_system_identifier;
 static uint64 test_boot_incarnation;
 static bool test_candidate_copy_generation_drift;
@@ -1120,6 +1121,35 @@ cluster_undo_block0_current_release_begin(ClusterUndoBlock0CurrentGuard *guard
 	default:
 		break;
 	}
+	switch (test_release_identity_drift) {
+	case 1:
+		test_current_owner_available = false;
+		break;
+	case 2:
+		test_current_owner.wrap++;
+		break;
+	case 3:
+		test_current_owner.segment_id++;
+		break;
+	case 4:
+		test_current_owner.status = CTS_COMMITTED;
+		test_current_owner.commit_scn = test_commit_scn;
+		break;
+	case 5:
+		test_local_binding_available = false;
+		break;
+	case 6:
+		test_local_binding.slot_wrap++;
+		break;
+	case 7:
+		test_local_binding.segment_generation++;
+		break;
+	case 8:
+		test_local_binding.active_lsn++;
+		break;
+	default:
+		break;
+	}
 	if (test_candidate_release_failed)
 		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 	return CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED;
@@ -1200,6 +1230,7 @@ reset_exact_origin_fixture(void)
 	test_next_full_on_locate = InvalidFullTransactionId;
 	test_oldest_clog_on_locate = InvalidTransactionId;
 	test_release_scope_drift = 0;
+	test_release_identity_drift = 0;
 	test_system_identifier = UINT64_C(0x1122334455667788);
 	test_boot_incarnation = UINT64_C(9001);
 	test_candidate_copy_generation_drift = false;
@@ -1981,7 +2012,7 @@ UT_TEST(test_ctrc_current_owner_uses_published_binding_across_rollover)
 	UT_ASSERT_EQ(ctrc_key.segment_generation, test_local_binding.segment_generation);
 	UT_ASSERT_EQ(ctrc_key.slot_offset, TEST_TT_OFFSET);
 	UT_ASSERT_EQ(ctrc_key.slot_wrap, TEST_ORIGIN_WRAP);
-	UT_ASSERT_EQ(test_local_binding_calls, 2);
+	UT_ASSERT_EQ(test_local_binding_calls, 3); /* Initial, held, then released. */
 	UT_ASSERT_EQ(test_current_owner_calls, 0);
 	UT_ASSERT_EQ(test_ctrc_touch_calls, 1);
 
@@ -3081,6 +3112,115 @@ UT_TEST(test_other_backend_locator_does_not_expand_fast_paths)
 	test_current_owner.wrap = TT_WRAP_INVALID;
 	assert_rolled_lookup_unknown();
 	UT_ASSERT_EQ(test_durable_locator_calls, 0);
+}
+
+UT_TEST(test_current_owner_fast_paths_recheck_released_identity)
+{
+	int binding;
+	int fault;
+
+	for (binding = 0; binding < 2; binding++) {
+		for (fault = 1; fault <= 4; fault++) {
+			reset_rolled_active_fixture();
+			test_local_binding_available = binding != 0;
+			test_current_owner_available = binding == 0;
+			test_release_identity_drift = binding * 4 + fault;
+			assert_rolled_lookup_unknown();
+			/* Discard the sampled grant without repeating block acquisition or
+			 * replacing a changed fast-path identity through the disk locator. */
+			UT_ASSERT_EQ(test_ctrc_touch_calls, 1);
+			UT_ASSERT_EQ(test_durable_locator_calls, 0);
+			UT_ASSERT_EQ(test_candidate_acquire_calls, 1);
+			UT_ASSERT_EQ(test_candidate_block0_copy_calls, 1);
+			UT_ASSERT_EQ(test_candidate_release_calls, 1);
+		}
+	}
+}
+
+UT_TEST(test_current_owner_fast_paths_recheck_release_authority)
+{
+	int binding;
+	int fault;
+
+	for (binding = 0; binding < 2; binding++) {
+		for (fault = 0; fault < 5; fault++) {
+			reset_rolled_active_fixture();
+			test_local_binding_available = binding != 0;
+			test_current_owner_available = binding == 0;
+			switch (fault) {
+			case 0:
+				test_candidate_release_epoch_drift = true;
+				break;
+			case 1:
+				test_candidate_release_admission_drift = true;
+				break;
+			case 2:
+				test_release_scope_drift = 6; /* Root generation. */
+				break;
+			case 3:
+				test_release_scope_drift = 3; /* Origin boot incarnation. */
+				break;
+			case 4:
+				test_candidate_release_failed = true;
+				break;
+			}
+			assert_rolled_lookup_unknown();
+			UT_ASSERT_EQ(test_ctrc_touch_calls, 1);
+			UT_ASSERT_EQ(test_durable_locator_calls, 0);
+			UT_ASSERT_EQ(test_candidate_acquire_calls, 1);
+			UT_ASSERT_EQ(test_candidate_release_calls, 1);
+		}
+	}
+}
+
+UT_TEST(test_current_mx_fast_paths_reject_released_identity)
+{
+	ClusterTTStatusKey key;
+	ClusterTTStatusResult result;
+	ClusterCtrcTxnKeyV1 ctrc_key;
+	ClusterCtrcTxnKeyV1 empty_ctrc_key = { 0 };
+	ClusterTTStatusKey empty_key = { 0 };
+	uint32 grant;
+	uint32 capability;
+	int binding;
+	int changed;
+
+	for (binding = 0; binding < 2; binding++) {
+		for (changed = 0; changed < 2; changed++) {
+			reset_rolled_active_fixture();
+			test_local_binding_available = binding != 0;
+			test_current_owner_available = binding == 0;
+			if (changed)
+				test_release_identity_drift = binding ? 6 : 2; /* Exact wrap. */
+			memset(&key, 0xa5, sizeof(key));
+			memset(&result, 0xa5, sizeof(result));
+			memset(&ctrc_key, 0xa5, sizeof(ctrc_key));
+			grant = capability = 99;
+			UT_ASSERT_EQ(current_mx_local_member_sample_exact(TEST_ORIGIN_XID, &key, &result,
+															  &grant, &capability, &ctrc_key),
+						 changed ? CMX_RESOLVE_UNKNOWN : CMX_RESOLVE_OK);
+			if (changed) {
+				UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_UNKNOWN);
+				UT_ASSERT_EQ(result.commit_scn, InvalidScn);
+				UT_ASSERT(!result.authoritative);
+				UT_ASSERT_EQ(grant, 0);
+				UT_ASSERT_EQ(capability, 0);
+				UT_ASSERT(memcmp(&key, &empty_key, sizeof(key)) == 0);
+				UT_ASSERT(memcmp(&ctrc_key, &empty_ctrc_key, sizeof(ctrc_key)) == 0);
+			} else {
+				UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_IN_PROGRESS);
+				UT_ASSERT(result.authoritative);
+				UT_ASSERT_EQ(grant, test_ctrc_touch_grant);
+				UT_ASSERT(capability > 0);
+				UT_ASSERT_EQ(ctrc_key.slot_wrap, TEST_ORIGIN_WRAP);
+				UT_ASSERT_EQ(test_durable_locator_calls, 0);
+				UT_ASSERT_EQ(test_candidate_acquire_calls, 1);
+				UT_ASSERT_EQ(test_candidate_block0_copy_calls, 1);
+			}
+			UT_ASSERT_EQ(test_candidate_held_count, 0);
+			UT_ASSERT_EQ(test_candidate_release_calls, test_candidate_acquire_calls);
+		}
+	}
 }
 
 UT_TEST(test_current_mx_active_proof_reconstructs_exact_ctrc_identity)
@@ -6655,7 +6795,7 @@ UT_TEST(test_self_fresh_role_does_not_inherit_ordinary_abort_permission)
 int
 main(void)
 {
-	UT_PLAN(185);
+	UT_PLAN(188);
 	UT_RUN(test_retained_active_identity_reaches_real_undo_pending);
 	UT_RUN(test_retained_undo_pending_requires_matching_active_tt_receipt);
 	UT_RUN(test_retained_undo_pending_guard_drift_cannot_publish);
@@ -6744,6 +6884,9 @@ main(void)
 	UT_RUN(test_other_backend_rolled_locator_requires_exact_canonical_proof);
 	UT_RUN(test_other_backend_rolled_lookup_rechecks_after_release);
 	UT_RUN(test_other_backend_locator_does_not_expand_fast_paths);
+	UT_RUN(test_current_owner_fast_paths_recheck_released_identity);
+	UT_RUN(test_current_owner_fast_paths_recheck_release_authority);
+	UT_RUN(test_current_mx_fast_paths_reject_released_identity);
 	UT_RUN(test_current_mx_active_proof_reconstructs_exact_ctrc_identity);
 	UT_RUN(test_current_mx_active_proof_uses_origin_binding_without_foreign_storage);
 	UT_RUN(test_current_member_rolled_terminal_uses_locator_then_canonical_scur);
