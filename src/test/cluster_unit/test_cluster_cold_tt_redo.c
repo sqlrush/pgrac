@@ -6878,6 +6878,163 @@ UT_TEST(tt_top_tx_c0_producer_requires_undo_multi_delta_canonical_input)
 	tt_top_tx_undo_fold_records(false, true, TT_UNDO_DELTA_CANONICAL);
 }
 
+/* Native full before-images are independent of the WAL actor and loser.
+ * Keep both directory rows so the cold consumer must inspect the last too. */
+static void
+tt_top_tx_undo_tuple_page(PGAlignedBlock *page, uint8 owner, uint8 type, uint16 image_row,
+						  int fault)
+{
+	UndoBlockHeader block = { 0 };
+
+	memset(page, 0, sizeof(*page));
+	block.magic = PGRAC_UNDO_BLOCK_MAGIC;
+	block.block_version = UNDO_BLOCK_VERSION_1;
+	block.block_lsn = 90;
+	block.free_offset = sizeof(block);
+	for (uint16 row = 0; row < 2; row++) {
+		UndoRecordHeader header = { 0 };
+		UndoSlotDirEntry directory = { 0 };
+		UndoInsertPayload insert = { 32, 0 };
+		UndoUpdatePayload update = { 0 };
+		UndoDeletePayload deleted = { 0 };
+		HeapTupleHeaderData prior = { 0 };
+		uint8 payload[sizeof(update) + MAXALIGN(SizeofHeapTupleHeader) + 8] = { 0 };
+		uint16 image_length = fault == 1 ? SizeofHeapTupleHeader - 1 : SizeofHeapTupleHeader;
+		uint16 image_offset;
+
+		header.record_type = row == image_row ? type : UNDO_RECORD_INSERT;
+		header.flags = UNDO_REC_FLAG_FIRST_IN_TX;
+		header.xid = 900 + row;
+		header.origin_node_id = owner - 1;
+		header.tt_slot_segment_id = (owner - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 + row;
+		header.tt_slot_id = 5 + row;
+		header.tt_wrap_plus1 = 8;
+		header.target_locator = (RelFileLocator){ 1663, 5, 16385 };
+		header.target_block = 7;
+		header.target_offset = 1;
+		if (header.record_type == UNDO_RECORD_INSERT) {
+			header.payload_length = sizeof(insert);
+			memcpy(payload, &insert, sizeof(insert));
+		} else {
+			if (fault == 5)
+				image_length = MAXALIGN(SizeofHeapTupleHeader) + 8;
+			HeapTupleHeaderSetXmin(&prior, fault == 4 ? FrozenTransactionId : 17);
+			HeapTupleHeaderSetXmax(&prior, fault == 4 ? 321 : 19);
+			prior.t_infomask = fault == 4 ? HEAP_XMIN_FROZEN | HEAP_XMAX_IS_MULTI : 0;
+			prior.t_hoff = fault == 2	? SizeofHeapTupleHeader - 1
+						   : fault == 3 ? image_length + 1
+										: image_length;
+			if (fault == 6) {
+				HeapTupleHeaderSetXmin(&prior, 23);
+				HeapTupleHeaderSetXmax(&prior, 29);
+			}
+			if (type == UNDO_RECORD_UPDATE) {
+				update.new_block = 8;
+				update.new_offset = 2;
+				update.old_tuple_offset = sizeof(update);
+				update.old_tuple_length = image_length;
+				memcpy(payload, &update, sizeof(update));
+				image_offset = sizeof(update);
+			} else {
+				deleted.full_tuple_offset = sizeof(deleted);
+				deleted.full_tuple_length = image_length;
+				memcpy(payload, &deleted, sizeof(deleted));
+				image_offset = sizeof(deleted);
+			}
+			memcpy(payload + image_offset, &prior, Min(image_length, SizeofHeapTupleHeader));
+			header.payload_length = image_offset + image_length;
+		}
+		directory.record_offset = block.free_offset;
+		directory.record_length = sizeof(header) + header.payload_length;
+		directory.record_type = header.record_type;
+		directory.flags = header.flags;
+		memcpy(page->data + directory.record_offset, &header, sizeof(header));
+		memcpy(page->data + directory.record_offset + sizeof(header), payload,
+			   header.payload_length);
+		memcpy(page->data + UNDO_SLOT_DIR_OFFSET(row), &directory, sizeof(directory));
+		block.slot_count++;
+		block.free_offset += directory.record_length;
+	}
+	memcpy(page->data, &block, sizeof(block));
+}
+
+static void
+tt_top_tx_undo_tuple_inputs(bool inherited)
+{
+	for (uint8 type = UNDO_RECORD_UPDATE; type <= UNDO_RECORD_DELETE; type++) {
+		for (uint16 row = 0; row < 2; row++) {
+			for (int fault = 0; fault < 7; fault++) {
+				TtRedoFixture f;
+				PGAlignedBlock page, replay, expected, history;
+				ClusterRecoveryUndoRecord raw;
+				ClusterColdTtSlotInputV1 input;
+				ClusterColdTopTxProofV1 proof;
+				ClusterRecoveryTTAbortV1 shape;
+				ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
+				const ColdTtBlockV1 *retained;
+				uint32 index;
+				bool valid = fault == 0 || fault >= 4;
+
+				tt_top_tx_initialized_fixture(&f, 300, 100, 2);
+				tt_top_tx_undo_tuple_page(&page, inherited ? 2 : 3, type, row, fault);
+				/* The original raw reader deliberately accepts bounded opaque
+				 * tuple bytes; the cold effect consumer must qualify the image. */
+				UT_ASSERT_EQ(cluster_recovery_undo_record_read(
+								 page.data, BLCKSZ, inherited ? 257 : 513, 9, inherited ? 2 : 3,
+								 uba_encode(inherited ? 257 : 513, 9, 4 + row, row), &raw),
+							 CLUSTER_RECOVERY_UNDO_ENTRY);
+				if (inherited) {
+					tt_inventory_extra(257, 2, &history);
+					tt_redo_seed_recapture(&f);
+					tt_undo_readback_cache(&f, 2, 257, 9, &page);
+					tt_redo_record_page(&replay, 900);
+				} else
+					replay = page;
+				tt_redo_feed_record_page(&f, 200, &replay, true);
+				tt_top_tx_seal_bound(&f, 200);
+				tt_undo_uncached_expected(&f, 513, 9, &expected);
+				tt_undo_readback_write(513, 9, &expected);
+				UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+				UT_ASSERT_EQ(cluster_cold_tt_after_redo_recheck_v1(&f.typed), CLUSTER_COLD_OK);
+				UT_ASSERT_NOT_NULL(cluster_cold_tt_header_find_v1(&f.typed, true, 3, 513, &index));
+				UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, index, 4, &input));
+				f.typed.xid_next_after_redo = UINT64_C(0x700400200);
+				tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+				tt_top_tx_effects_complete(&f);
+				tt_top_tx_endpoints_complete(&f);
+				UT_ASSERT_EQ(cluster_cold_typed_tt_redo_inventory_v1(&f.typed), valid);
+				memset(&out, 0xa9, sizeof(out));
+				UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(
+								 &f.typed, TT_C0_FENCE, 0, &proof, &shape, false,
+								 InvalidTransactionId, UINT64_C(0x12345678), &out),
+							 valid);
+				if (!valid)
+					UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+				if (inherited) {
+					retained = cold_tt_undo_block(&f.typed, true, 257, 9, false);
+					UT_ASSERT_NOT_NULL(retained);
+					if (retained != NULL)
+						UT_ASSERT(memcmp(page.data, retained->bytes.data, BLCKSZ) == 0);
+				} else
+					UT_ASSERT(memcmp(page.data, replay.data, BLCKSZ) == 0);
+				if (inherited)
+					tt_inventory_remove(257);
+				tt_redo_destroy(&f);
+			}
+		}
+	}
+}
+
+UT_TEST(tt_top_tx_c0_producer_checks_replayed_undo_tuple_images)
+{
+	tt_top_tx_undo_tuple_inputs(false);
+}
+
+UT_TEST(tt_top_tx_c0_producer_checks_inherited_undo_tuple_images)
+{
+	tt_top_tx_undo_tuple_inputs(true);
+}
+
 UT_TEST(tt_top_tx_c0_producer_checks_unselected_undo_effects)
 {
 	for (int fault = 0; fault < 5; fault++) {
@@ -7091,9 +7248,11 @@ UT_TEST(tt_top_tx_c0_producer_rechecks_before_output)
 int
 main(void)
 {
-	UT_PLAN(154);
+	UT_PLAN(156);
 	UT_RUN(tt_top_tx_c0_producer_requires_undo_delta_canonical_input);
 	UT_RUN(tt_top_tx_c0_producer_requires_undo_multi_delta_canonical_input);
+	UT_RUN(tt_top_tx_c0_producer_checks_replayed_undo_tuple_images);
+	UT_RUN(tt_top_tx_c0_producer_checks_inherited_undo_tuple_images);
 	UT_RUN(tt_top_tx_c0_producer_checks_undo_fpi_records);
 	UT_RUN(tt_top_tx_c0_producer_checks_undo_multi_fpi_records);
 	UT_RUN(tt_top_tx_c0_producer_checks_history_undo_fpi_records);

@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/htup_details.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_recovery_undo_scan.h"
 #include "cluster/cluster_side_online_plan.h"
@@ -497,7 +498,8 @@ cold_tt_block_write(const RfSideOnlineOperationV1 *operation)
 
 /* Exact native fold/readback does not itself decode records. Address the
  * first record only to invoke the original reader's complete block checks,
- * including inherited records that a delta did not replace. Physical raw
+ * including inherited records that a delta did not replace. Then qualify
+ * each full before-image for the existing heap consumer. Physical raw
  * identities remain independent of any WAL actor or selected loser. */
 static bool
 cold_tt_undo_records(const ColdTtBlockV1 *after)
@@ -522,9 +524,41 @@ cold_tt_undo_records(const ColdTtBlockV1 *after)
 	if (header.tt_slot_id == 0 || header.tt_slot_id > TT_SLOTS_PER_SEGMENT)
 		return false;
 	address = uba_encode(file->segment, after->block, header.tt_slot_id - 1, 0);
-	return cluster_recovery_undo_record_read(after->bytes.data, BLCKSZ, file->segment, after->block,
-											 file->owner, address, &record)
-		   == CLUSTER_RECOVERY_UNDO_ENTRY;
+	if (cluster_recovery_undo_record_read(after->bytes.data, BLCKSZ, file->segment, after->block,
+										  file->owner, address, &record)
+		!= CLUSTER_RECOVERY_UNDO_ENTRY)
+		return false;
+	/* The original reader checked every range and payload in this immutable
+	 * block. Reuse those bounds without decoding the whole block per row. */
+	for (uint16 row = 0; row < block.slot_count; row++) {
+		const char *payload;
+		uint16 image_offset, image_length;
+		uint8 hoff;
+
+		memcpy(&slot, after->bytes.data + UNDO_SLOT_DIR_OFFSET(row), sizeof(slot));
+		memcpy(&header, after->bytes.data + slot.record_offset, sizeof(header));
+		payload = after->bytes.data + slot.record_offset + sizeof(header);
+		if (header.record_type == UNDO_RECORD_UPDATE) {
+			UndoUpdatePayload update;
+
+			memcpy(&update, payload, sizeof(update));
+			image_offset = update.old_tuple_offset;
+			image_length = update.old_tuple_length;
+		} else if (header.record_type == UNDO_RECORD_DELETE) {
+			UndoDeletePayload deleted;
+
+			memcpy(&deleted, payload, sizeof(deleted));
+			image_offset = deleted.full_tuple_offset;
+			image_length = deleted.full_tuple_length;
+		} else
+			continue;
+		if (image_length < SizeofHeapTupleHeader)
+			return false;
+		memcpy(&hoff, payload + image_offset + offsetof(HeapTupleHeaderData, t_hoff), sizeof(hoff));
+		if (hoff < SizeofHeapTupleHeader || hoff > image_length)
+			return false;
+	}
+	return true;
 }
 
 bool

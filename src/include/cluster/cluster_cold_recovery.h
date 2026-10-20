@@ -1140,8 +1140,9 @@ extern uint32 cluster_cold_tt_after_redo_count_v1(const ClusterColdTypedV1 *type
 extern bool cluster_cold_tt_after_redo_namespace_matches_v1(const ClusterColdTypedV1 *typed);
 /* Original inventory consumer: compare every retained UNDO block pair with
  * the sealed current source's native fold, or unchanged history-only bytes.
- * Does not reread disk or qualify base coverage. Final source/header/block
- * rechecks remain with the original owner. */
+ * Validate the original record layout and bounded full heap before-images.
+ * Does not reread disk, qualify base coverage or prove transaction membership.
+ * Final source/header/block rechecks remain with the original owner. */
 extern bool cluster_cold_tt_after_redo_undo_matches_v1(const ClusterColdTypedV1 *typed);
 /* Exact physical lookup in one valid captured inventory. Clears index on
  * absence/refusal; no disk access, reconstruction or recovery authority. */
