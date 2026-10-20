@@ -495,6 +495,38 @@ cold_tt_block_write(const RfSideOnlineOperationV1 *operation)
 			   || operation->undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI);
 }
 
+/* Exact native fold/readback does not itself decode records. Address the
+ * first record only to invoke the original reader's complete block checks,
+ * including inherited records that a delta did not replace. Physical raw
+ * identities remain independent of any WAL actor or selected loser. */
+static bool
+cold_tt_undo_records(const ColdTtBlockV1 *after)
+{
+	const ColdTtInputV1 *file = after->file;
+	UndoBlockHeader block;
+	UndoSlotDirEntry slot;
+	UndoRecordHeader header;
+	ClusterRecoveryUndoRecord record;
+	UBA address;
+
+	if (file->owner == 0 || file->owner > UNDO_OWNER_INSTANCE_MAX || file->segment == 0
+		|| file->segment > UINT16_MAX || after->block == 0)
+		return false;
+	memcpy(&block, after->bytes.data, sizeof(block));
+	memcpy(&slot, after->bytes.data + UNDO_SLOT_DIR_OFFSET(0), sizeof(slot));
+	if (!cluster_undo_record_slot_range_valid(block.slot_count, 0, slot.record_offset,
+											  slot.record_length)
+		|| slot.record_length < sizeof(header))
+		return false;
+	memcpy(&header, after->bytes.data + slot.record_offset, sizeof(header));
+	if (header.tt_slot_id == 0 || header.tt_slot_id > TT_SLOTS_PER_SEGMENT)
+		return false;
+	address = uba_encode(file->segment, after->block, header.tt_slot_id - 1, 0);
+	return cluster_recovery_undo_record_read(after->bytes.data, BLCKSZ, file->segment, after->block,
+											 file->owner, address, &record)
+		   == CLUSTER_RECOVERY_UNDO_ENTRY;
+}
+
 bool
 cluster_cold_tt_after_redo_undo_matches_v1(const ClusterColdTypedV1 *typed)
 {
@@ -587,8 +619,11 @@ cluster_cold_tt_after_redo_undo_matches_v1(const ClusterColdTypedV1 *typed)
 		}
 	}
 	for (const ColdTtBlockV1 *after = typed->tt_after_redo->blocks; after != NULL;
-		 after = after->next)
+		 after = after->next) {
+		if (!cold_tt_undo_records(after))
+			return false;
 		posts++;
+	}
 	return originals + uncached == posts;
 }
 

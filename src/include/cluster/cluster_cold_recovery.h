@@ -1083,6 +1083,9 @@ extern bool cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
  * ordinary exact TT_ABORT actor against that operation's own durable slot xid.
  * Original UNDO BLOCK_WRITE/MULTI FPIs also require complete native record
  * decoding, including historical records' own physical origin/TT locators.
+ * The inventory also decodes every complete retained post-redo UNDO block,
+ * including new delta records and inherited original-base records, after
+ * its existing exact native fold/readback checks.
  * These raw records need not name the WAL actor or this selected loser and
  * do not supply canonical generation or terminal authority.
  * Replay PAGE INSERT/UPDATE/HOT/MULTI
@@ -1219,6 +1222,9 @@ extern bool cluster_cold_typed_tt_after_redo_readback_v1(const ClusterColdTypedV
  * image, including unchanged bytes and history-only blocks. Every actual
  * current WAL block-write target absent from that cache needs the complete
  * native FPI fold and a separate retained post image; no observed-base fallback.
+ * After those checks, every retained post block needs complete native record
+ * decoding, including unchanged records' physical origin/TT locators. This
+ * does not qualify the base, per-operation prefixes or canonical history.
  * This read-only comparison grants no checkpoint/base, history-effect, top,
  * loser or C0 authority. Original source isolation and final rechecks remain
  * the caller's obligations; no completion flag is stored. */
