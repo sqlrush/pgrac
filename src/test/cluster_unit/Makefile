@@ -5576,12 +5576,26 @@ test_cluster_pcm_target_prepare.inc: $(top_srcdir)/src/backend/cluster/cluster_g
 	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Extract the real retained-drain refusal and common unwind blocks.
+test_cluster_pcm_retained_drain_consumer.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^\tif \(tagless_target_x && target_x_retain && !semantic_retained\)/ { emit=1; found++ } \
+	     /^\tif \(tagless_target_x && target_x_drop && !semantic_retained\)/ { emit=0 } \
+	     emit { print } END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pcm_pre_retained_cleanup.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^pre_retained_failure:/ { emit=1; found++ } \
+	     /^}/ { emit=0 } emit { print } \
+	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_pcm_source_finish_consumer.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
-	awk '/^gcs_block_pcm_trace_guard\(/ { print "static void"; emit=1; guard++ } \
+	awk '/^gcs_block_pcm_trace_guard_capture\(/ { print "static void"; emit=1; capture++ } \
+	     /^gcs_block_pcm_trace_guard\(/ { print "static void"; emit=1; guard++ } \
 	     /^gcs_block_pcm_trace_refusal\(/ { print "static ClusterWaitTraceGuard"; emit=1; refusal++ } \
 	     /^gcs_block_resource_x_source_finish_owned\(/ { print "static ResourceXApplyResult"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (found != 1 || guard != 1 || refusal != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (found != 1 || capture != 1 || guard != 1 || refusal != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # PGRAC: real bounded discard/PI owners, not copies of their decisions.
@@ -5756,6 +5770,7 @@ test_cluster_pcm_own: test_cluster_pcm_own.c unit_test.h \
 		test_cluster_pcm_eviction_owner.inc test_cluster_pcm_clock_sweep.inc \
 		test_cluster_pcm_leave_owner.inc \
 		test_cluster_pcm_source_finish_consumer.inc \
+		test_cluster_pcm_retained_drain_consumer.inc test_cluster_pcm_pre_retained_cleanup.inc \
 		test_cluster_pcm_target_prepare.inc \
 		test_cluster_pcm_s_prepare.inc \
 		test_cluster_pcm_source_finish_tick.inc \

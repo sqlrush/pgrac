@@ -9974,61 +9974,77 @@ gcs_block_resource_x_retained_pair_replay(const ResourceXAssertion *assertion, u
 /* Process-local observations only. The source frame identifies the logical
  * request, but its wire sender is the master, not the requester connection.
  * An acquisition ref alone has no request sequence or transport identity.
- * Call only after the original content/header/mapping locks are released. */
+ * Capture owns every field and cannot emit or allocate. Call the emitting
+ * wrapper only after content/header/mapping locks and service-pin/owner
+ * cleanup obligations have been released or handed to their exact owner. */
+static void
+gcs_block_pcm_trace_guard_capture(ClusterWaitTrace *row, ClusterWaitTraceSite site,
+	const ResourceXDecodedCommon *common, const ResourceXAcquisitionRef *ref,
+	int32 master_node, uint64 r4,
+	const ClusterPcmOwnSnapshot *own, ClusterWaitTraceGuard guard, int result,
+	const ClusterPcmOwnFinishRefusal *refusal)
+{
+	memset(row, 0, sizeof(*row));
+
+	if (!cluster_trace_tx_identity)
+		return;
+	row->snapshot = cluster_wait_trace_begin(CLWAIT_PCM_GUARD);
+	if (row->snapshot == 0)
+		return;
+	row->site = site;
+	row->guard = guard;
+	row->guard_result = result;
+	row->mode = PCM_STATE_X;
+	row->expected_master = master_node;
+	row->r4 = r4;
+	if (common != NULL) {
+		row->tag = common->logical_assertion.resource;
+		row->tag_known = true;
+		row->requester = common->logical_assertion.requester_node;
+		row->request_seq = common->assertion_sequence;
+		row->request_known = common->assertion_sequence != 0;
+		row->formation = common->resource_formation;
+		row->master_session = common->master_session_incarnation;
+		row->base = common->base_authority_generation;
+		row->wire_sender_connection = common->sender_connection_generation;
+	} else if (ref != NULL) {
+		row->tag = ref->assertion.resource;
+		row->tag_known = true;
+		row->requester = ref->assertion.requester_node;
+		row->formation = ref->formation;
+		row->acquisition = ref->acquisition_generation;
+	}
+	if (own != NULL) {
+		row->own_generation = own->generation;
+		row->reservation = own->reservation_token;
+		row->writer_activation = own->writer_activation_token;
+		row->rx_activation = own->resource_x_activation_generation;
+		row->own_flags = own->flags;
+		row->own_state = own->pcm_state;
+		row->buffer_type = own->buffer_type;
+		row->buffer_state = own->semantic_buf_state;
+	}
+	if (refusal != NULL) {
+		row->refusal_reason = refusal->reason;
+		row->refusal_token = refusal->live_token;
+		row->refusal_flags = refusal->live_flags;
+		row->refusal_pins = refusal->shared_refcount;
+		row->refusal_io = refusal->bm_io_in_progress;
+	}
+}
+
 static void
 gcs_block_pcm_trace_guard(ClusterWaitTraceSite site, const ResourceXDecodedCommon *common,
 	const ResourceXAcquisitionRef *ref, int32 master_node, uint64 r4,
 	const ClusterPcmOwnSnapshot *own, ClusterWaitTraceGuard guard, int result,
 	const ClusterPcmOwnFinishRefusal *refusal)
 {
-	ClusterWaitTrace row = { 0 };
+	ClusterWaitTrace row;
 
-	if (!cluster_trace_tx_identity)
-		return;
-	row.snapshot = cluster_wait_trace_begin(CLWAIT_PCM_GUARD);
-	if (row.snapshot == 0)
-		return;
-	row.site = site;
-	row.guard = guard;
-	row.guard_result = result;
-	row.mode = PCM_STATE_X;
-	row.expected_master = master_node;
-	row.r4 = r4;
-	if (common != NULL) {
-		row.tag = common->logical_assertion.resource;
-		row.tag_known = true;
-		row.requester = common->logical_assertion.requester_node;
-		row.request_seq = common->assertion_sequence;
-		row.request_known = common->assertion_sequence != 0;
-		row.formation = common->resource_formation;
-		row.master_session = common->master_session_incarnation;
-		row.base = common->base_authority_generation;
-		row.wire_sender_connection = common->sender_connection_generation;
-	} else if (ref != NULL) {
-		row.tag = ref->assertion.resource;
-		row.tag_known = true;
-		row.requester = ref->assertion.requester_node;
-		row.formation = ref->formation;
-		row.acquisition = ref->acquisition_generation;
-	}
-	if (own != NULL) {
-		row.own_generation = own->generation;
-		row.reservation = own->reservation_token;
-		row.writer_activation = own->writer_activation_token;
-		row.rx_activation = own->resource_x_activation_generation;
-		row.own_flags = own->flags;
-		row.own_state = own->pcm_state;
-		row.buffer_type = own->buffer_type;
-		row.buffer_state = own->semantic_buf_state;
-	}
-	if (refusal != NULL) {
-		row.refusal_reason = refusal->reason;
-		row.refusal_token = refusal->live_token;
-		row.refusal_flags = refusal->live_flags;
-		row.refusal_pins = refusal->shared_refcount;
-		row.refusal_io = refusal->bm_io_in_progress;
-	}
-	cluster_wait_trace_emit(CLWAIT_PCM_GUARD, &row);
+	gcs_block_pcm_trace_guard_capture(&row, site, common, ref, master_node, r4, own,
+		guard, result, refusal);
+	if (row.snapshot != 0)
+		cluster_wait_trace_emit(CLWAIT_PCM_GUARD, &row);
 }
 
 static ClusterWaitTraceGuard
@@ -10151,8 +10167,11 @@ gcs_block_resource_x_source_finish_owned(
 	PG_END_TRY();
 	if (finish_result != CLUSTER_PCM_OWN_OK || retained.pcm_state != (uint8)PCM_STATE_N
 		|| retained.generation != image->body.image_envelope.source_carrier_generation) {
-		gcs_block_pcm_trace_guard(CLWAIT_SITE_PCM_SOURCE_FINISH, &block->common, NULL,
-			authenticated_master_node, writer_r4_generation, &revoking,
+		ClusterWaitTrace trace;
+		ResourceXApplyResult refusal_result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+
+		gcs_block_pcm_trace_guard_capture(&trace, CLWAIT_SITE_PCM_SOURCE_FINISH,
+			&block->common, NULL, authenticated_master_node, writer_r4_generation, &revoking,
 			gcs_block_pcm_trace_refusal(&finish_refusal), finish_result, &finish_refusal);
 		/* Only a proved, reversible refusal may hand the continuous
 		 * service pin to the exact shared owner. No callback cleanup may run
@@ -10174,7 +10193,8 @@ gcs_block_resource_x_source_finish_owned(
 				memset(&target_revoke_owner, 0, sizeof(target_revoke_owner));
 				held_x_revoke_active = false;
 				target_revoke_owner_held = false;
-				return RESOURCE_X_APPLY_BAD_STATE;
+				refusal_result = RESOURCE_X_APPLY_BAD_STATE;
+				goto source_finish_refusal_done;
 			}
 			if (!tagless_target_x && !held_x_revoke_active && !target_revoke_owner_held) {
 				ClusterPcmOwnSnapshot live;
@@ -10193,8 +10213,10 @@ gcs_block_resource_x_source_finish_owned(
 					&& cluster_pcm_lock_resource_x_holder_pair_publish_needed_exact(
 						   &block->common.logical_assertion, block->common.assertion_sequence,
 						   authenticated_master_node, block->common.master_session_incarnation)
-						   == RESOURCE_X_APPLY_APPLIED)
-					return RESOURCE_X_APPLY_BAD_STATE;
+						   == RESOURCE_X_APPLY_APPLIED) {
+					refusal_result = RESOURCE_X_APPLY_BAD_STATE;
+					goto source_finish_refusal_done;
+				}
 			}
 		}
 		ereport(
@@ -10218,7 +10240,12 @@ gcs_block_resource_x_source_finish_owned(
 		}
 		(void)gcs_block_resource_x_terminal_owner_release(&target_revoke_owner,
 														  &target_revoke_owner_held);
-		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+source_finish_refusal_done:
+		/* Logging may ERROR. The exact shared owner now owns the service pin,
+		 * or the original fail-closed unwind has released our obligations. */
+		if (trace.snapshot != 0)
+			cluster_wait_trace_emit(CLWAIT_PCM_GUARD, &trace);
+		return refusal_result;
 	}
 	if (target_x_drop) {
 		/* VM/FSM DROP has already removed the exact descriptor mapping, so it
@@ -10269,6 +10296,7 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 	ClusterPcmOwnHeldXRevoke held_x_revoke;
 	ClusterPcmOwnResult own_result;
 	ClusterPcmOwnSourcePrepareRefusal source_prepare_refusal;
+	ClusterWaitTrace retained_drain_trace = { 0 };
 	ClusterPcmOwnSnapshot current;
 	ClusterPcmOwnSnapshot revoking;
 	ResourceXGateSnapshot resource_gate;
@@ -10624,7 +10652,8 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 		else
 			own_result = cluster_bufmgr_pcm_own_try_drain_held_x_revoke(&held_x_revoke);
 		if (own_result != CLUSTER_PCM_OWN_OK)
-			gcs_block_pcm_trace_guard(CLWAIT_SITE_PCM_RETAINED_DRAIN, &block->common, NULL,
+			gcs_block_pcm_trace_guard_capture(&retained_drain_trace,
+				CLWAIT_SITE_PCM_RETAINED_DRAIN, &block->common, NULL,
 				resource_master_node, writer_r4_generation, &revoking,
 				gcs_block_pcm_trace_refusal(&drain_refusal), own_result, &drain_refusal);
 		if (own_result == CLUSTER_PCM_OWN_BUSY) {
@@ -10639,7 +10668,8 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 					&held_x_revoke);
 				(void)gcs_block_resource_x_terminal_owner_release(&target_revoke_owner,
 																  &target_revoke_owner_held);
-				return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+				failure_result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+				goto pre_retained_done;
 			}
 			held_x_revoke_active = false;
 			revoke_started = false;
@@ -10651,11 +10681,13 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 					(void)cluster_pcm_lock_resource_x_terminal_x_revoke_release_exact(
 						&target_revoke_owner);
 				target_revoke_owner_held = false;
-				return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+				failure_result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+				goto pre_retained_done;
 			}
 			memset(&target_revoke_owner, 0, sizeof(target_revoke_owner));
 			target_revoke_owner_held = false;
-			return RESOURCE_X_APPLY_BAD_STATE;
+			failure_result = RESOURCE_X_APPLY_BAD_STATE;
+			goto pre_retained_done;
 		}
 		if (own_result != CLUSTER_PCM_OWN_OK) {
 			failure_result = own_result == CLUSTER_PCM_OWN_STALE
@@ -10849,19 +10881,26 @@ pre_retained_failure:
 					&held_x_revoke);
 				(void)gcs_block_resource_x_terminal_owner_release(&target_revoke_owner,
 																  &target_revoke_owner_held);
-				return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+				failure_result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+				goto pre_retained_done;
 			}
 			held_x_revoke_active = false;
 		} else if (!gcs_block_pcm_x_resource_x_abort_pre_arm(buf, &revoking)) {
 			(void)gcs_block_resource_x_terminal_owner_release(&target_revoke_owner,
 															  &target_revoke_owner_held);
-			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+			failure_result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+			goto pre_retained_done;
 		}
 	}
 	revoke_started = false;
 	if (!gcs_block_resource_x_terminal_owner_release(&target_revoke_owner,
 													 &target_revoke_owner_held))
-		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		failure_result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+pre_retained_done:
+	/* The row owns its original refusal fields. A diagnostic ERROR here
+	 * cannot skip the original abort/unpin and exact owner yield/release. */
+	if (retained_drain_trace.snapshot != 0)
+		cluster_wait_trace_emit(CLWAIT_PCM_GUARD, &retained_drain_trace);
 	return failure_result;
 }
 
