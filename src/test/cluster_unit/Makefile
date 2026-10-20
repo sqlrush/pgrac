@@ -547,6 +547,8 @@ TESTS += test_cluster_relmap_pending_side
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_pending_side,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_census_side
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_census_side,$(SIMPLE_TESTS))
+TESTS += test_cluster_relmap_retained_wal
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_retained_wal,$(SIMPLE_TESTS))
 
 test_cluster_relmap_arb: test_cluster_relmap_arb.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_arb.c \
@@ -660,6 +662,7 @@ test_cluster_relmap_v2_storage: test_cluster_relmap_v2_storage.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_writer.h \
 		$(top_srcdir)/src/include/cluster/cluster_shmem.h \
@@ -671,13 +674,13 @@ test_cluster_relmap_v2_storage: test_cluster_relmap_v2_storage.c unit_test.h \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_restore.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h $(CLUSTER_UNIT_PORT_LIBS)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER $< test_cluster_relmap_v2_storage_product.o \
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -ffunction-sections -fdata-sections $< test_cluster_relmap_v2_storage_product.o \
 		test_cluster_relmap_pending_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention_restore.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
-		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(filter -lcrypto,$(LIBS)) -o $@
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(filter -lcrypto,$(LIBS)) -o $@
 
 test_cluster_relmap_v2: test_cluster_relmap_v2.c unit_test.h \
 		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
@@ -3386,7 +3389,13 @@ test_cluster_recovery_native_inputs: test_cluster_recovery_manifest_inputs.inc t
 test_cluster_recovery_native_inputs: $(RECOVERY_CENSUS_TEST_OBJS) test_cluster_recovery_prepare_fixture.h test_cluster_recovery_prepare_inputs.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_xact_join_inputs.inc test_cluster_recovery_relmap_physical_inputs.inc test_cluster_recovery_relmap_inputs.inc test_cluster_recovery_relmap_fixture.h
 
-test_cluster_control_root test_cluster_recovery_native_inputs: %: %.c test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc test_cluster_control_root_serving.inc \
+test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o
+test_cluster_relmap_retained_owner.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relmap_retained_wal: %: %.c test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc test_cluster_control_root_serving.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_census.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_native_inventory.c \
@@ -3421,6 +3430,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs: %: %.c test_clust
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o \
 		$(top_srcdir)/src/include/cluster/cluster_wal_tail.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
+		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_owner.o) \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_root_set.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_namespace.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_wal_targets.o \
@@ -4966,6 +4976,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_current_mx_local_sample.inc test_cluster_current_mx_reply_builder.inc
 	rm -f test_cluster_page_cold_redo_product.o
 	rm -f test_cluster_relmap_v2_storage_product.o
+	rm -f test_cluster_relmap_retained_owner.o
 	rm -f $(CLUSTER_COLD_PLAN_O) $(CLUSTER_COLD_DECODE_O) $(CLUSTER_COLD_STARTUP_O) test_cluster_cold_recovery_io_core.o
 	rm -f $(D_COLD_REFAIL_O) $(D_COLD_REPLAY_O)
 	rm -f test_cluster_block_redeclare_scan.inc
@@ -8653,6 +8664,7 @@ test_cluster_wal_writer: test_cluster_wal_writer.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
 		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
 		$(top_srcdir)/src/include/common/relmap.h \
 		$(top_srcdir)/src/include/utils/relmapper.h \
@@ -8665,10 +8677,10 @@ test_cluster_wal_writer: test_cluster_wal_writer.c unit_test.h \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(CLUSTER_WAL_CLAIM_O) xlogreader_fs.o \
 		test_cluster_wal_publish_tail.inc test_cluster_wal_publish_callers.inc test_cluster_wal_publish_entry.inc
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(srcdir)/$@.c $(CLUSTER_WAL_CLAIM_O) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $(srcdir)/$@.c $(CLUSTER_WAL_CLAIM_O) \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		xlogreader_fs.o $(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
-		$(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 test_cluster_wal_thread: test_cluster_wal_thread.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_WAL_CLAIM_O)

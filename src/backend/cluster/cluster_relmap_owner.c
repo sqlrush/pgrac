@@ -12,6 +12,7 @@
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_relmap_lock.h"
 #include "cluster/cluster_relmap_owner.h"
+#include "cluster/cluster_wal_inputs.h"
 #include "miscadmin.h"
 #include "postmaster/interrupt.h"
 #include "storage/lwlock.h"
@@ -138,6 +139,68 @@ cluster_relmap_owner_wal_matches_v2(const ClusterRelmapV2Image *image,
 								 : !OidIsValid(update.tsid) || update.tsid == GLOBALTABLESPACE_OID))
 		return false;
 	return memcmp(data + MinSizeOfRelmapUpdate, &image->pending, sizeof(RelMapFile)) == 0;
+}
+
+typedef struct RelmapRetainedWalWork
+{
+	ClusterRelmapV2Image image;
+	bool found;
+} RelmapRetainedWalWork;
+
+static RfPageProofDetailV1
+relmap_retained_source(const ClusterWalSourceRef *source,
+	const RfContributorStreamCutV1 *cut, const ClusterWalTailObservation *completed, void *arg)
+{
+	const RelmapRetainedWalWork *work = arg;
+
+	if (source->claim.identity.system_identifier != work->image.identity.system_identifier
+		|| source->claim.database_incarnation != work->image.identity.database_incarnation)
+		return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+static RfPageProofDetailV1
+relmap_retained_record(XLogReaderState *reader, const ClusterWalSourceRef *source,
+	const RfContributorStreamCutV1 *cut, void *arg)
+{
+	RelmapRetainedWalWork *work = arg;
+	const ClusterRelmapV2Owner *owner = &work->image.pending_owner;
+
+	if (source->claim.identity.origin_node_id != owner->node
+		|| source->claim.identity.origin_owner_incarnation != owner->admitted_incarnation
+		|| reader->EndRecPtr != owner->wal_end)
+		return RF_PAGE_PROOF_DETAIL_OK;
+	if (!cluster_relmap_owner_wal_matches_v2(&work->image, source, reader))
+		return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+	if (work->found)
+		return RF_PAGE_PROOF_DETAIL_TERMINAL_AMBIGUOUS;
+	work->found = true;
+	/* Keep reading: neither this source's suffix nor other sources are proven. */
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+ClusterControlRootResult
+cluster_relmap_owner_retained_wal_v2(const ClusterRelmapV2Image *image,
+	struct ClusterWalInputsV1 *inputs)
+{
+	RelmapRetainedWalWork work = { 0 };
+	uint8 wire[CLUSTER_RELMAP_V2_FILE_SIZE];
+	uint64 records;
+	RfPageProofDetailV1 detail;
+	ClusterControlRootResult result;
+
+	if (image == NULL || inputs == NULL || image->pending_generation == 0
+		|| cluster_relmap_v2_encode(image, wire, sizeof(wire)) != CLUSTER_RELMAP_V2_VALID)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	work.image = *image;
+	result = cluster_wal_inputs_cold_census_v1(inputs, relmap_retained_record,
+		relmap_retained_source, &work, &records, &detail);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!work.found)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	/* Consume provisional callbacks only under the caller's original scope. */
+	return cluster_wal_inputs_revalidate_v1(inputs);
 }
 
 ClusterRelmapRetentionResult

@@ -10,6 +10,7 @@
 #include "storage/lwlock.h"
 
 struct XLogReaderState;
+struct ClusterWalInputsV1;
 
 /* Process-local preparation only. Keep the complete native writer reference;
  * the on-disk relmap header cannot substitute for its WAL/claim retention.
@@ -40,6 +41,16 @@ extern bool cluster_relmap_owner_matches_v2(const ClusterRelmapOwnerSampleV2 *sa
  * remain caller duties. True grants no terminal, stage or release authority. */
 extern bool cluster_relmap_owner_wal_matches_v2(const ClusterRelmapV2Image *image,
 	const ClusterWalSourceRef *source, const struct XLogReaderState *reader);
+
+/* Dormant read-only consumer of one decoded pending image and the caller's
+ * original held cold read scope. Read ALL selected sources through the native
+ * retained census and its final ROOT rechecks; require one exact native match.
+ * The caller owns/release-checks the scope, including on ERROR. OPEN returns
+ * WAIT, never partial success. No new scope, writer or retention owner here.
+ * Dual-copy union and independent era/epoch/boot qualification remain upstream
+ * duties. OK grants no terminal, COMPLETE, stage or release authority. */
+extern ClusterControlRootResult cluster_relmap_owner_retained_wal_v2(
+	const ClusterRelmapV2Image *image, struct ClusterWalInputsV1 *inputs);
 
 /* Dormant preparation adapter, BEFORE RelationMappingLock/WAL/critical work.
  * Recheck this original sample, read the original TT owner's published receipt
