@@ -661,6 +661,68 @@ cluster_cold_tt_after_redo_undo_matches_v1(const ClusterColdTypedV1 *typed)
 	return originals + uncached == posts;
 }
 
+bool
+cluster_cold_tt_after_redo_undo_head_matches_v1(const ClusterColdTypedV1 *typed,
+												const ClusterColdTtSlotKeyV1 *key)
+{
+	const UndoSegmentHeaderData *header;
+	const TTSlot *slot;
+	const ColdTtBlockV1 *block;
+	ClusterRecoveryTxnKey transaction;
+	ClusterRecoveryUndoRecord record;
+	uint32 segment, blockno, generation;
+	uint16 offset, row;
+
+	if (key == NULL || key->owner_instance == 0 || key->owner_instance > COLD_TT_MAX_ORIGINS
+		|| key->segment_id == 0
+		|| (key->segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 != key->owner_instance
+		|| key->slot_offset >= TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(key->xid)
+		|| key->slot_wrap == TT_WRAP_INVALID
+		|| (header = cluster_cold_tt_header_find_v1(typed, true, key->owner_instance,
+													key->segment_id, NULL))
+			   == NULL
+		|| typed->system_identifier == 0 || typed->observer.database_incarnation == 0)
+		return false;
+	slot = &header->tt_slots[key->slot_offset];
+	if (header->wrap_count != key->segment_generation || slot->status != TT_SLOT_ACTIVE
+		|| slot->xid != key->xid || slot->wrap != key->slot_wrap)
+		return false;
+	/* Empty is neutral here. It cannot qualify transaction effects or an old
+	 * checkpoint base; the original C0 producer retains those separate gates. */
+	if (UBA_is_invalid(slot->first_undo_block))
+		return true;
+	if (!uba_decode_record(slot->first_undo_block, &segment, &blockno, &offset, &row)
+		|| offset != key->slot_offset
+		|| (segment - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 != key->owner_instance)
+		return false;
+	/* The complete inventory has already compared retained bytes with their
+	 * original native fold. Never read DATA to invent a missing predecessor. */
+	for (block = typed->tt_after_redo->blocks; block != NULL; block = block->next)
+		if (block->file->owner == key->owner_instance && block->file->segment == segment
+			&& block->block == blockno)
+			break;
+	if (block == NULL
+		|| cluster_recovery_undo_record_read(block->bytes.data, BLCKSZ, segment, blockno,
+											 block->file->owner, slot->first_undo_block, &record)
+			   != CLUSTER_RECOVERY_UNDO_ENTRY)
+		return false;
+	generation = ((const UndoSegmentHeaderData *)block->file->block.data)->wrap_count;
+	transaction
+		= (ClusterRecoveryTxnKey){ .system_identifier = typed->system_identifier,
+								   .database_incarnation = typed->observer.database_incarnation,
+								   .segment_id = key->segment_id,
+								   .segment_generation = key->segment_generation,
+								   .xid = key->xid,
+								   .origin_node_id = key->owner_instance - 1,
+								   .slot_offset = key->slot_offset,
+								   .slot_wrap = key->slot_wrap };
+	/* The original checker keeps a physical spill segment's generation
+	 * independent of the canonical TT generation. This checks one root only. */
+	return cluster_recovery_tx_record_check(&transaction, slot->first_undo_block, &record,
+											generation)
+		   == CLUSTER_RECOVERY_GRAPH_MORE;
+}
+
 const UndoSegmentHeaderData *
 cluster_cold_tt_header_find_v1(const ClusterColdTypedV1 *typed, bool after_redo, uint8 owner,
 							   uint32 segment, uint32 *index)

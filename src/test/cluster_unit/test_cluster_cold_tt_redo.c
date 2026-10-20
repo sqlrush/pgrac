@@ -7035,6 +7035,124 @@ UT_TEST(tt_top_tx_c0_producer_checks_inherited_undo_tuple_images)
 	tt_top_tx_undo_tuple_inputs(true);
 }
 
+static void
+tt_top_tx_undo_head_inputs(bool spill)
+{
+	for (uint16 row = 0; row < 2; row++) {
+		for (int fault = 0; fault < 10; fault++) {
+			TtRedoFixture f;
+			PGAlignedBlock page, expected, extra;
+			UndoSlotDirEntry directory;
+			UndoRecordHeader record;
+			ClusterColdTtSlotInputV1 input;
+			const ColdTtBlockV1 *retained;
+			uint32 segment = spill ? 514 : 513, index;
+			UBA head = uba_encode(segment, 9, 4, row);
+			bool valid = fault == 0 || fault == 9;
+			Size used;
+
+			tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+			if (spill) {
+				tt_inventory_extra(segment, 3, &extra);
+				/* Physical spill generation is not the canonical TT generation. */
+				((UndoSegmentHeaderData *)extra.data)->wrap_count = 19;
+				tt_readback_write(segment, &extra, false);
+			}
+			if (fault == 1)
+				head = uba_encode(segment, 10, 4, row); /* No retained block. */
+			else if (fault == 2)
+				head = uba_encode(segment, 9, 4, 2); /* Past the last directory row. */
+			else if (fault == 3)
+				head = uba_encode(segment, 9, 5, row);
+			else if (fault == 8)
+				head = uba_encode(257, 9, 4, row); /* Another physical origin. */
+			else if (fault == 9)
+				head = (UBA)InvalidUba_init;
+			/* Capture a real pre-existing ACTIVE slot. Native SET_HEAD only
+			 * reattaches an ABORTED residual chain; it cannot create this input. */
+			((UndoSegmentHeaderData *)f.base.data)->tt_slots[4].first_undo_block = head;
+			tt_readback_write(513, &f.base, false);
+			tt_redo_seed_recapture(&f);
+			tt_redo_record_page(&page, 802);
+			memcpy(&directory, page.data + UNDO_SLOT_DIR_OFFSET(row), sizeof(directory));
+			memcpy(&record, page.data + directory.record_offset, sizeof(record));
+			record.xid = fault == 5 ? 900 : 802;
+			record.tt_slot_segment_id = fault == 4 ? 515 : 513;
+			record.tt_slot_id = 5;
+			record.tt_wrap_plus1 = fault == 6 ? 0 : fault == 7 ? 9 : 8;
+			memcpy(page.data + directory.record_offset, &record, sizeof(record));
+			tt_redo_feed_record_page_at(&f, 100, segment, 9, &page, true);
+			tt_redo_seal(&f);
+			tt_top_tx_write_fold(&f);
+			tt_undo_uncached_expected(&f, segment, 9, &expected);
+			tt_undo_readback_write(segment, 9, &expected);
+			UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+			/* The original fold and inventory qualify bytes, independently of
+			 * the selected head's physical transaction membership. */
+			UT_ASSERT(cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+			UT_ASSERT_NOT_NULL(cluster_cold_tt_header_find_v1(&f.typed, true, 3, 513, &index));
+			UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, index, 4, &input));
+			UT_ASSERT(cluster_undo_record_uba_equal(input.slot.first_undo_block, head));
+			if (spill)
+				UT_ASSERT(input.key.segment_generation != 19);
+			retained = f.typed.tt_after_redo->blocks;
+			used = f.typed.tt_after_redo->used;
+			UT_ASSERT_NOT_NULL(retained);
+			UT_ASSERT_EQ(cluster_cold_tt_after_redo_undo_head_matches_v1(&f.typed, &input.key),
+						 valid);
+			if (valid) {
+				for (int bad_key = 0; bad_key < 8; bad_key++) {
+					ClusterColdTtSlotKeyV1 key = input.key;
+
+					if (bad_key == 0)
+						key.owner_instance = 2;
+					else if (bad_key == 1)
+						key.segment_id = 514;
+					else if (bad_key == 2)
+						key.segment_generation++;
+					else if (bad_key == 3)
+						key.slot_offset = TT_SLOTS_PER_SEGMENT;
+					else if (bad_key == 4)
+						key.xid++;
+					else if (bad_key == 5)
+						key.slot_wrap++;
+					else if (bad_key == 6)
+						key.xid = InvalidTransactionId;
+					else
+						key.slot_wrap = TT_WRAP_INVALID;
+					UT_ASSERT(!cluster_cold_tt_after_redo_undo_head_matches_v1(&f.typed, &key));
+				}
+				UT_ASSERT(!cluster_cold_tt_after_redo_undo_head_matches_v1(NULL, &input.key));
+				UT_ASSERT(!cluster_cold_tt_after_redo_undo_head_matches_v1(&f.typed, NULL));
+				f.typed.system_identifier++;
+				UT_ASSERT(!cluster_cold_tt_after_redo_undo_head_matches_v1(&f.typed, &input.key));
+				f.typed.system_identifier--;
+			}
+			/* This guard must not allocate, retain a new DATA read or refresh. */
+			UT_ASSERT(f.typed.tt_after_redo->blocks == retained);
+			UT_ASSERT_EQ(f.typed.tt_after_redo->used, used);
+			if (retained != NULL) {
+				UT_ASSERT(retained->next == NULL);
+				UT_ASSERT(memcmp(retained->bytes.data, expected.data, BLCKSZ) == 0);
+			}
+			UT_ASSERT_EQ(cluster_cold_tt_after_redo_recheck_v1(&f.typed), CLUSTER_COLD_OK);
+			if (spill)
+				tt_inventory_remove(segment);
+			tt_redo_destroy(&f);
+		}
+	}
+}
+
+UT_TEST(tt_after_redo_checks_canonical_active_undo_head_input)
+{
+	tt_top_tx_undo_head_inputs(false);
+}
+
+UT_TEST(tt_after_redo_checks_spill_active_undo_head_input)
+{
+	tt_top_tx_undo_head_inputs(true);
+}
+
 UT_TEST(tt_top_tx_c0_producer_checks_unselected_undo_effects)
 {
 	for (int fault = 0; fault < 5; fault++) {
@@ -7248,7 +7366,9 @@ UT_TEST(tt_top_tx_c0_producer_rechecks_before_output)
 int
 main(void)
 {
-	UT_PLAN(156);
+	UT_PLAN(158);
+	UT_RUN(tt_after_redo_checks_canonical_active_undo_head_input);
+	UT_RUN(tt_after_redo_checks_spill_active_undo_head_input);
 	UT_RUN(tt_top_tx_c0_producer_requires_undo_delta_canonical_input);
 	UT_RUN(tt_top_tx_c0_producer_requires_undo_multi_delta_canonical_input);
 	UT_RUN(tt_top_tx_c0_producer_checks_replayed_undo_tuple_images);
