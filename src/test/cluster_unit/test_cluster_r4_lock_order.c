@@ -82,6 +82,9 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_u
 /* This lock-policy fixture does not install a native startup writer or
  * run its CLEAN formation owner. Retained ELF sections must still link. */
 AuxProcType MyAuxProcType = NotAnAuxProcess;
+BackendId MyBackendId = 1;
+BackendType MyBackendType = B_BACKEND;
+PGPROC *MyProc = NULL;
 
 bool
 cluster_write_fence_allowed(void)
@@ -123,6 +126,14 @@ static bool ut_finishing_miss_log;
 static int ut_miss_log_count;
 static char ut_miss_log[4096];
 static char ut_itl_capacity_log[16384];
+static bool ut_capture_prune_log;
+static bool ut_finishing_prune_log;
+static bool ut_prune_log_throws;
+static bool ut_prune_trace_other_lock;
+static bool ut_prune_trace_unsafe;
+static int ut_prune_trace_count;
+static char ut_prune_trace_log[32768];
+static void ut_prune_trace_record(const char *fmt, va_list args);
 static bool ut_pending_writer_route;
 static bool ut_writer_xid_collision;
 static bool ut_lock_selector_fixture;
@@ -132,6 +143,10 @@ static int ut_successor_proof_fault;
 bool
 errstart(int elevel, const char *domain)
 {
+	if (ut_capture_prune_log && elevel == LOG) {
+		ut_finishing_prune_log = true;
+		return true;
+	}
 	if (ut_capture_miss_log && elevel == LOG) {
 		ut_finishing_miss_log = true;
 		return true;
@@ -148,6 +163,12 @@ errstart_cold(int elevel, const char *domain)
 void
 errfinish(const char *filename, int lineno, const char *funcname)
 {
+	if (ut_finishing_prune_log) {
+		ut_finishing_prune_log = false;
+		if (ut_prune_log_throws)
+			pg_re_throw();
+		return;
+	}
 	if (ut_finishing_miss_log) {
 		ut_finishing_miss_log = false;
 		return;
@@ -441,6 +462,14 @@ static bool ut_itl_pair_active;
 static bool ut_itl_pair_content_lock_held[2];
 static Buffer ut_itl_pair_lock_buffers[4];
 static int ut_itl_pair_lock_calls;
+
+void
+ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *context)
+{
+	if (ut_prune_trace_other_lock || ut_hot_content_lock_held
+		|| ut_itl_pair_content_lock_held[0] || ut_itl_pair_content_lock_held[1])
+		callback(NULL, LW_SHARED, context);
+}
 
 bool
 LWLockHeldByMe(LWLock *lock)
@@ -1810,6 +1839,13 @@ toast_flatten_tuple_to_datum(HeapTupleHeader tuple pg_attribute_unused(),
 int
 errmsg_internal(const char *fmt pg_attribute_unused(), ...)
 {
+	if (ut_finishing_prune_log) {
+		va_list args;
+
+		va_start(args, fmt);
+		ut_prune_trace_record(fmt, args);
+		va_end(args);
+	}
 	return 0;
 }
 
@@ -6657,17 +6693,231 @@ ut_prune_begin(UtR4HotProductFixture *fixture, HeapHotSearchResult *hot, Relatio
 	ut_prune_refuse_cleanup_call = 0;
 	ut_prune_wal_records = 0;
 	ut_prune_wal_offset_bytes = 0;
+	cluster_trace_normal_stop = false;
+	ut_capture_prune_log = true;
+	ut_finishing_prune_log = false;
+	ut_prune_log_throws = false;
+	ut_prune_trace_other_lock = false;
+	ut_prune_trace_unsafe = false;
+	ut_prune_trace_count = 0;
+	ut_prune_trace_log[0] = '\0';
 	LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_UNLOCK);
+}
+
+static void
+ut_prune_trace_record(const char *fmt, va_list args)
+{
+	size_t used = strlen(ut_prune_trace_log);
+
+	if (ut_hot_content_lock_held || CritSectionCount != 0
+		|| semantic_activation_local_inflight[CLUSTER_SEMANTIC_TARGET_SIDE][0] != 0)
+		ut_prune_trace_unsafe = true;
+	if (strstr(fmt, "PGRAC_FAMILY=R4_HEAP_PRUNE") == NULL)
+		return;
+	ut_prune_trace_count++;
+	vsnprintf(ut_prune_trace_log + used, sizeof(ut_prune_trace_log) - used, fmt, args);
+	used = strlen(ut_prune_trace_log);
+	if (used + 1 < sizeof(ut_prune_trace_log))
+		strlcat(ut_prune_trace_log, "\n", sizeof(ut_prune_trace_log));
 }
 
 static void
 ut_prune_end(void)
 {
 	UT_ASSERT(!ut_hot_content_lock_held);
+	UT_ASSERT(!ut_prune_trace_unsafe);
+	cluster_trace_normal_stop = false;
+	ut_capture_prune_log = false;
 	cluster_shared_config = false;
 	ut_prune_fixture_active = false;
 	LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_EXCLUSIVE);
 	ut_itl_census_end();
+}
+
+UT_TEST(test_prune_trace_off_keeps_real_prune_quiet)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult hot;
+	RelationData relation;
+	FormData_pg_class form;
+
+	ut_prune_begin(&fixture, &hot, &relation, &form);
+	heap_page_prune_opt(&relation, UT_HOT_BUFFER);
+	UT_ASSERT_EQ(ut_prune_reclaimed, 2);
+	UT_ASSERT_EQ(ut_prune_wal_records, 1);
+	UT_ASSERT_EQ(ut_prune_trace_count, 0);
+	ut_prune_end();
+}
+
+UT_TEST(test_prune_trace_on_records_real_redirect_unused_and_actual_tag)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult hot;
+	RelationData relation;
+	FormData_pg_class form;
+	char actual_tag[128];
+
+	ut_prune_begin(&fixture, &hot, &relation, &form);
+	cluster_trace_normal_stop = true;
+	/* The actual buffer tag must not be invented from rd_locator. */
+	relation.rd_locator = (RelFileLocator){ 71, 72, 73 };
+	snprintf(actual_tag, sizeof(actual_tag), "actual_tag=%u/%u/%u/%d/%u",
+			 fixture.expected_tag.spcOid, fixture.expected_tag.dbOid,
+			 fixture.expected_tag.relNumber, fixture.expected_tag.forkNum,
+			 fixture.expected_tag.blockNum);
+	heap_page_prune_opt(&relation, UT_HOT_BUFFER);
+	UT_ASSERT_EQ(ut_prune_trace_count, 4);
+	UT_ASSERT(strstr(ut_prune_trace_log, "event=prune.result") != NULL);
+	UT_ASSERT(strstr(ut_prune_trace_log, "stage=pruned") != NULL);
+	UT_ASSERT(strstr(ut_prune_trace_log, actual_tag) != NULL);
+	UT_ASSERT(strstr(ut_prune_trace_log, "requested_locator=71/72/73") != NULL);
+	UT_ASSERT(strstr(ut_prune_trace_log, "before_known=1 after_known=1") != NULL);
+	UT_ASSERT(strstr(ut_prune_trace_log, "floor_known=1 floor_scn=300") != NULL);
+	UT_ASSERT(strstr(ut_prune_trace_log, "ndeleted=2 nnewlpdead=0 changed_items=3") != NULL);
+	UT_ASSERT(strstr(ut_prune_trace_log, "after_lsn=7901184") != NULL);
+	UT_ASSERT(strstr(ut_prune_trace_log, "offset=1 before={item_known=1 lp=1") != NULL);
+	UT_ASSERT(strstr(ut_prune_trace_log, "after={item_known=1 lp=2 redirect=3") != NULL);
+	UT_ASSERT(strstr(ut_prune_trace_log, "offset=2 before={item_known=1 lp=1") != NULL);
+	UT_ASSERT(strstr(ut_prune_trace_log, "after={item_known=1 lp=0") != NULL);
+	UT_ASSERT(strstr(ut_prune_trace_log, "xmin=901 xmax=902 ctid=17/2") != NULL);
+	UT_ASSERT(strstr(ut_prune_trace_log, "itl_wrap=12") != NULL);
+	UT_ASSERT(strstr(ut_prune_trace_log, "uba_raw=") != NULL);
+	UT_ASSERT(strstr(ut_prune_trace_log, "authoritative=0") != NULL);
+	UT_ASSERT(strstr(ut_prune_trace_log, "pin_scope=caller_retained") != NULL);
+	UT_ASSERT_EQ(ut_prune_wal_records, 1);
+	ut_prune_end();
+}
+
+UT_TEST(test_prune_trace_capture_refusal_never_reads_unknown_image)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult hot;
+	RelationData relation;
+	FormData_pg_class form;
+
+	ut_prune_begin(&fixture, &hot, &relation, &form);
+	cluster_trace_normal_stop = true;
+	ut_prune_refuse_cleanup_call = 1;
+	heap_page_prune_opt(&relation, UT_HOT_BUFFER);
+	UT_ASSERT_EQ(ut_prune_trace_count, 1);
+	UT_ASSERT(strstr(ut_prune_trace_log, "stage=capture_cleanup") != NULL);
+	UT_ASSERT(strstr(ut_prune_trace_log, "before_known=0 after_known=0") != NULL);
+	UT_ASSERT(strstr(ut_prune_trace_log, "actual_tag_known=0") != NULL);
+	UT_ASSERT(strstr(ut_prune_trace_log, "subpredicate_known=0") != NULL);
+	UT_ASSERT_EQ(ut_prune_reclaimed, 0);
+	UT_ASSERT_EQ(ut_prune_resolve_calls, 0);
+	ut_prune_end();
+}
+
+UT_TEST(test_prune_trace_drift_preserves_original_revalidation)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult hot;
+	RelationData relation;
+	FormData_pg_class form;
+
+	ut_prune_begin(&fixture, &hot, &relation, &form);
+	cluster_trace_normal_stop = true;
+	ut_prune_page_drift = true;
+	heap_page_prune_opt(&relation, UT_HOT_BUFFER);
+	UT_ASSERT_EQ(ut_prune_trace_count, 1);
+	UT_ASSERT(strstr(ut_prune_trace_log, "stage=revalidate_input") != NULL);
+	UT_ASSERT(strstr(ut_prune_trace_log, "before_known=1 after_known=0") != NULL);
+	UT_ASSERT_EQ(ut_prune_reclaimed, 0);
+	UT_ASSERT_EQ(ut_prune_wal_records, 0);
+	ut_prune_end();
+}
+
+UT_TEST(test_prune_trace_unknown_verdict_does_not_reclaim)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult hot;
+	RelationData relation;
+	FormData_pg_class form;
+
+	ut_prune_begin(&fixture, &hot, &relation, &form);
+	cluster_trace_normal_stop = true;
+	ut_prune_verdict_kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+	heap_page_prune_opt(&relation, UT_HOT_BUFFER);
+	UT_ASSERT_EQ(ut_prune_reclaimed, 0);
+	UT_ASSERT_EQ(ut_prune_trace_count, 1);
+	UT_ASSERT(strstr(ut_prune_trace_log, "ndeleted=0 nnewlpdead=0 changed_items=0") != NULL);
+	ut_prune_end();
+}
+
+UT_TEST(test_prune_trace_authority_error_uses_original_cleanup_without_success_event)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult hot;
+	RelationData relation;
+	FormData_pg_class form;
+	volatile bool caught = false;
+
+	ut_prune_begin(&fixture, &hot, &relation, &form);
+	cluster_trace_normal_stop = true;
+	ut_prune_resolve_throws = true;
+	ut_capture_error = true;
+	PG_TRY();
+	{ heap_page_prune_opt(&relation, UT_HOT_BUFFER); }
+	PG_CATCH();
+	{ caught = true; }
+	PG_END_TRY();
+	ut_capture_error = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(ut_prune_trace_count, 0);
+	UT_ASSERT_EQ(ut_prune_reclaimed, 0);
+	ut_prune_end();
+}
+
+UT_TEST(test_prune_trace_log_error_is_after_original_unlock_and_admission_leave)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult hot;
+	RelationData relation;
+	FormData_pg_class form;
+	volatile bool caught = false;
+
+	ut_prune_begin(&fixture, &hot, &relation, &form);
+	cluster_trace_normal_stop = true;
+	ut_prune_log_throws = true;
+	PG_TRY();
+	{ heap_page_prune_opt(&relation, UT_HOT_BUFFER); }
+	PG_CATCH();
+	{ caught = true; }
+	PG_END_TRY();
+	ut_prune_log_throws = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(ut_prune_trace_count, 1);
+	UT_ASSERT_EQ(ut_prune_reclaimed, 2);
+	UT_ASSERT_EQ(ut_prune_wal_records, 1);
+	ut_prune_end();
+}
+
+UT_TEST(test_prune_trace_critical_and_caller_lock_gaps_are_reported_later)
+{
+	for (int leg = 0; leg < 3; leg++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult hot;
+		RelationData relation;
+		FormData_pg_class form;
+
+		ut_prune_begin(&fixture, &hot, &relation, &form);
+		cluster_trace_normal_stop = true;
+		CritSectionCount = leg == 0 ? 1 : 0;
+		ut_prune_trace_other_lock = leg == 1;
+		heap_page_prune_opt(&relation, UT_HOT_BUFFER);
+		CritSectionCount = 0;
+		ut_prune_trace_other_lock = false;
+		UT_ASSERT_EQ(ut_prune_reclaimed, 2);
+		if (leg < 2)
+			UT_ASSERT_EQ(ut_prune_trace_count, 0);
+		else {
+			UT_ASSERT_EQ(ut_prune_trace_count, 4);
+			UT_ASSERT(strstr(ut_prune_trace_log,
+							"trace_critical_skipped=1 trace_lwlock_skipped=1") != NULL);
+		}
+		ut_prune_end();
+	}
 }
 
 UT_TEST(test_shared_hot_prune_captures_identity_before_cleanup)
@@ -7212,7 +7462,15 @@ UT_TEST(pinned_hot_slot_must_keep_selected_tuple_after_remote_image_replacement)
 int
 main(void)
 {
-	UT_PLAN(144);
+	UT_PLAN(152);
+	UT_RUN(test_prune_trace_off_keeps_real_prune_quiet);
+	UT_RUN(test_prune_trace_on_records_real_redirect_unused_and_actual_tag);
+	UT_RUN(test_prune_trace_capture_refusal_never_reads_unknown_image);
+	UT_RUN(test_prune_trace_drift_preserves_original_revalidation);
+	UT_RUN(test_prune_trace_unknown_verdict_does_not_reclaim);
+	UT_RUN(test_prune_trace_authority_error_uses_original_cleanup_without_success_event);
+	UT_RUN(test_prune_trace_log_error_is_after_original_unlock_and_admission_leave);
+	UT_RUN(test_prune_trace_critical_and_caller_lock_gaps_are_reported_later);
 	UT_RUN(test_shared_hot_prune_captures_identity_before_cleanup);
 	UT_RUN(test_live_miss_evidence_preserves_result_and_rejects_unreadable_metadata);
 	UT_RUN(pinned_hot_slot_must_keep_selected_tuple_after_remote_image_replacement);
