@@ -315,6 +315,8 @@ reset_v2_receiver(void)
 		pg_atomic_init_u32(&test_horizon_store.slots[i].seq, 0);
 		pg_atomic_init_u32(&test_horizon_store.freeze_slots[i].seq, 0);
 	}
+	for (i = 0; i < UNDO_HORIZON_V2_STATUS_COUNT; i++)
+		pg_atomic_init_u64(&test_horizon_store.freeze_observation_count[i], 0);
 	pg_atomic_init_u64(&test_horizon_store.wire_reject_count, 0);
 	memset(&test_v2_fence, 0, sizeof(test_v2_fence));
 	test_v2_fence.system_identifier = 71;
@@ -1812,10 +1814,128 @@ UT_TEST(test_v2_summary_refusal_does_not_reuse_observed_values)
 	UT_ASSERT(strstr(summary, "n1:v=") != NULL);
 }
 
+UT_TEST(test_v2_lmon_observes_once_per_interval_without_an_extra_retention_cut)
+{
+	unsigned cuts;
+
+	(void)reset_v2_cohort(false);
+	cuts = test_retention_sample_calls;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_retention_sample_calls, cuts + 1);
+	UT_ASSERT(strstr(cluster_undo_horizon_peer_reports_summary(), "v2_lmon=READY:1,INCOMPLETE:0")
+			  != NULL);
+	cluster_undo_horizon_lmon_tick();
+	test_horizon_now += 999999;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT(strstr(cluster_undo_horizon_peer_reports_summary(), "v2_lmon=READY:1,INCOMPLETE:0")
+			  != NULL);
+	test_horizon_now++;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT(strstr(cluster_undo_horizon_peer_reports_summary(), "v2_lmon=READY:2,INCOMPLETE:0")
+			  != NULL);
+}
+
+UT_TEST(test_v2_lmon_counts_missing_local_history_without_sending)
+{
+	unsigned sends;
+
+	(void)reset_v2_cohort(false);
+	sends = test_horizon_sends;
+	test_retention_sample_valid = false;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_horizon_sends, sends);
+	UT_ASSERT(strstr(cluster_undo_horizon_peer_reports_summary(), "v2_lmon=READY:0,INCOMPLETE:1")
+			  != NULL);
+	test_horizon_now += 10;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT(strstr(cluster_undo_horizon_peer_reports_summary(), "v2_lmon=READY:0,INCOMPLETE:1")
+			  != NULL);
+	test_retention_sample_valid = true;
+	test_horizon_now += 1000000;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT(strstr(cluster_undo_horizon_peer_reports_summary(), "v2_lmon=READY:1,INCOMPLETE:1")
+			  != NULL);
+}
+
+UT_TEST(test_v2_lmon_records_real_cohort_refusals)
+{
+	static const char *const outcomes[]
+		= { "v2_lmon=READY:0,INCOMPLETE:1,H_STALE:0,BUSY_PUBLISH:0,IDENTITY_CHANGED:0,INVALID:0",
+			"v2_lmon=READY:0,INCOMPLETE:0,H_STALE:1,BUSY_PUBLISH:0,IDENTITY_CHANGED:0,INVALID:0",
+			"v2_lmon=READY:0,INCOMPLETE:0,H_STALE:0,BUSY_PUBLISH:1,IDENTITY_CHANGED:0,INVALID:0",
+			"v2_lmon=READY:0,INCOMPLETE:0,H_STALE:0,BUSY_PUBLISH:0,IDENTITY_CHANGED:1,INVALID:0",
+			"v2_lmon=READY:0,INCOMPLETE:0,H_STALE:0,BUSY_PUBLISH:0,IDENTITY_CHANGED:0,INVALID:1" };
+	int i;
+
+	for (i = 0; i < lengthof(outcomes); i++) {
+		const char *summary;
+
+		(void)reset_v2_cohort(false);
+		switch (i) {
+		case 0:
+			test_horizon_store.freeze_slots[1].valid = false;
+			break;
+		case 1:
+			test_horizon_store.freeze_slots[1].view.recv_at_us = test_horizon_now - 3000001;
+			break;
+		case 2:
+			pg_atomic_write_u32(&test_horizon_store.freeze_slots[1].seq, 1);
+			break;
+		case 3:
+			test_v2_identity = false;
+			break;
+		case 4:
+			test_sender_sample.scan.min_full = FullTransactionIdFromEpochAndXid(1, 8192);
+			break;
+		}
+		cluster_undo_horizon_lmon_tick();
+		summary = cluster_undo_horizon_peer_reports_summary();
+		UT_ASSERT(strstr(summary, outcomes[i]) != NULL);
+		UT_ASSERT(strstr(summary, ",f=") == NULL);
+		UT_ASSERT(strstr(summary, ",h=") == NULL);
+	}
+}
+
+UT_TEST(test_v2_lmon_observation_respects_original_shutdown_and_enable_gates)
+{
+	unsigned sends;
+
+	(void)reset_v2_cohort(false);
+	sends = test_horizon_sends;
+	test_horizon_seal = true;
+	cluster_undo_horizon_lmon_tick();
+	test_horizon_seal = false;
+	test_horizon_cut = true;
+	cluster_undo_horizon_lmon_tick();
+	test_horizon_cut = false;
+	cluster_enabled = false;
+	cluster_undo_horizon_lmon_tick();
+	cluster_enabled = true;
+	UT_ASSERT_EQ(test_horizon_sends, sends);
+	UT_ASSERT(
+		strstr(cluster_undo_horizon_peer_reports_summary(),
+			   "v2_lmon=READY:0,INCOMPLETE:0,H_STALE:0,BUSY_PUBLISH:0,IDENTITY_CHANGED:0,INVALID:0")
+		!= NULL);
+}
+
+UT_TEST(test_v2_lmon_observes_clock_rollback_as_stale)
+{
+	const char *summary;
+
+	(void)reset_v2_cohort(false);
+	cluster_undo_horizon_lmon_tick();
+	test_horizon_now--;
+	cluster_undo_horizon_lmon_tick();
+	summary = cluster_undo_horizon_peer_reports_summary();
+	UT_ASSERT(strstr(summary, "v2_lmon=READY:1,INCOMPLETE:0,H_STALE:1") != NULL);
+	UT_ASSERT(strstr(summary, ",f=") == NULL);
+	UT_ASSERT(strstr(summary, ",h=") == NULL);
+}
+
 int
 main(void)
 {
-	UT_PLAN(57);
+	UT_PLAN(62);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -1875,6 +1995,11 @@ main(void)
 	UT_RUN(test_v2_cohort_defends_against_malformed_slots);
 	UT_RUN(test_v2_cohort_single_member_still_requires_local_evidence);
 	UT_RUN(test_v2_summary_refusal_does_not_reuse_observed_values);
+	UT_RUN(test_v2_lmon_observes_once_per_interval_without_an_extra_retention_cut);
+	UT_RUN(test_v2_lmon_counts_missing_local_history_without_sending);
+	UT_RUN(test_v2_lmon_records_real_cohort_refusals);
+	UT_RUN(test_v2_lmon_observation_respects_original_shutdown_and_enable_gates);
+	UT_RUN(test_v2_lmon_observes_clock_rollback_as_stale);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

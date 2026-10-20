@@ -105,10 +105,15 @@ typedef struct ClusterHeapFreezeReportV2SlotShmem {
 	bool valid;
 } ClusterHeapFreezeReportV2SlotShmem;
 
+#define UNDO_HORIZON_V2_STATUS_COUNT (CLUSTER_HEAP_FREEZE_COHORT_INVALID + 1)
+
 typedef struct ClusterUndoHorizonShmem {
 	ClusterUndoHorizonSlotShmem slots[CLUSTER_MAX_NODES];
 	ClusterHeapFreezeReportV2SlotShmem freeze_slots[CLUSTER_MAX_NODES];
-	uint64 report_sequence; /* LMON only; survives a process restart; never wraps */
+	uint64 report_sequence;			/* LMON only; survives a process restart; never wraps */
+	uint64 freeze_last_observed_us; /* LMON only; rate limit refusals as well */
+	/* Diagnostic outcomes only: no cached F/H or release authority. */
+	pg_atomic_uint64 freeze_observation_count[UNDO_HORIZON_V2_STATUS_COUNT];
 	/* observability (D5-5); bumped via the note_* helpers below */
 	pg_atomic_uint64 stall_count;
 	pg_atomic_uint64 peer_stale_count;
@@ -125,6 +130,10 @@ typedef struct ClusterUndoHorizonShmem {
 } ClusterUndoHorizonShmem;
 
 static ClusterUndoHorizonShmem *UndoHorizonShmem = NULL;
+
+static ClusterHeapFreezeCohortStatus
+undo_horizon_v2_cohort_observe(ClusterHeapFreezeCohortObservation *out,
+							   const ClusterUndoRetentionSample *local_history);
 
 static Size
 cluster_undo_horizon_shmem_size(void)
@@ -148,6 +157,8 @@ cluster_undo_horizon_shmem_init(void)
 			pg_atomic_init_u32(&shmem->slots[i].seq, 0);
 			pg_atomic_init_u32(&shmem->freeze_slots[i].seq, 0);
 		}
+		for (i = 0; i < UNDO_HORIZON_V2_STATUS_COUNT; i++)
+			pg_atomic_init_u64(&shmem->freeze_observation_count[i], 0);
 		pg_atomic_init_u64(&shmem->stall_count, 0);
 		pg_atomic_init_u64(&shmem->peer_stale_count, 0);
 		pg_atomic_init_u64(&shmem->pass_abort_count, 0);
@@ -534,6 +545,27 @@ undo_horizon_send_v2(int32 peer, const ClusterUndoCleanerActiveSample *active,
 	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_UNDO_HORIZON, peer, bytes, sizeof(bytes));
 }
 
+/* Observe the complete cohort on the original LMON cadence, including local
+ * evidence failures. Reuse the sender's H cut; only outcome counts survive.
+ * Producer protection must close before any global F can be published. */
+static void
+undo_horizon_observe_v2(uint64 now_us, const ClusterUndoRetentionSample *history)
+{
+	ClusterHeapFreezeCohortObservation observation;
+	ClusterHeapFreezeCohortStatus status;
+	uint64 last = UndoHorizonShmem->freeze_last_observed_us;
+
+	if (last != 0 && now_us >= last
+		&& now_us - last < (uint64)cluster_lmon_main_loop_interval * 1000)
+		return;
+	UndoHorizonShmem->freeze_last_observed_us = now_us;
+	status = history == NULL ? CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE
+							 : undo_horizon_v2_cohort_observe(&observation, history);
+	if ((unsigned)status >= UNDO_HORIZON_V2_STATUS_COUNT)
+		status = CLUSTER_HEAP_FREEZE_COHORT_INVALID;
+	pg_atomic_fetch_add_u64(&UndoHorizonShmem->freeze_observation_count[status], 1);
+}
+
 void
 cluster_undo_horizon_lmon_tick(void)
 {
@@ -558,9 +590,12 @@ cluster_undo_horizon_lmon_tick(void)
 	if (last_sent_us != 0 && now_us - last_sent_us < (uint64)cluster_lmon_main_loop_interval * 1000)
 		return;
 
-	if (!undo_horizon_sample_local_report(&sample))
+	if (!undo_horizon_sample_local_report(&sample)) {
+		undo_horizon_observe_v2(now_us, NULL);
 		return;
+	}
 	last_sent_us = now_us;
+	undo_horizon_observe_v2(now_us, &sample);
 
 	/* Idleness at this instant does not bound a future snapshot by infinity.
 	 * Publish only the finite pre-scan clock / retained-snapshot minimum.
@@ -738,8 +773,9 @@ undo_horizon_v2_cohort_current(const ClusterSemanticActiveSampleFence *fence,
 	return CLUSTER_HEAP_FREEZE_COHORT_READY;
 }
 
-ClusterHeapFreezeCohortStatus
-cluster_heap_freeze_cohort_observe(ClusterHeapFreezeCohortObservation *out)
+static ClusterHeapFreezeCohortStatus
+undo_horizon_v2_cohort_observe(ClusterHeapFreezeCohortObservation *out,
+							   const ClusterUndoRetentionSample *local_history)
 {
 	ClusterHeapFreezeCohortObservation candidate = { 0 };
 	ClusterSemanticActiveSampleFence fence;
@@ -762,7 +798,11 @@ cluster_heap_freeze_cohort_observe(ClusterHeapFreezeCohortObservation *out)
 	started = GetCurrentTimestamp();
 	if (started <= 0)
 		return CLUSTER_HEAP_FREEZE_COHORT_H_STALE;
-	if (!cluster_undo_cleaner_active_sample(&active) || !undo_horizon_sample_local_report(&history))
+	if (!cluster_undo_cleaner_active_sample(&active))
+		return CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE;
+	if (local_history != NULL)
+		history = *local_history;
+	else if (!undo_horizon_sample_local_report(&history))
 		return CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE;
 	if (active.scan.status != CTRC_ACTIVE_SCAN_COMPLETE || active.sample_id == 0
 		|| active.worker_pid <= 0 || !FullTransactionIdIsValid(active.scan.future_full)
@@ -799,6 +839,12 @@ cluster_heap_freeze_cohort_observe(ClusterHeapFreezeCohortObservation *out)
 		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
 	*out = candidate;
 	return CLUSTER_HEAP_FREEZE_COHORT_READY;
+}
+
+ClusterHeapFreezeCohortStatus
+cluster_heap_freeze_cohort_observe(ClusterHeapFreezeCohortObservation *out)
+{
+	return undo_horizon_v2_cohort_observe(out, NULL);
 }
 
 /*
@@ -1068,6 +1114,10 @@ cluster_undo_horizon_peer_reports_summary(void)
 		off += (size_t)snprintf(buf + off, sizeof(buf) - off,
 								",f=" UINT64_FORMAT ",h=" UINT64_FORMAT,
 								observation.active_full_xid_min, observation.horizon_scn);
+	for (i = 0; i < UNDO_HORIZON_V2_STATUS_COUNT; i++)
+		off += (size_t)snprintf(buf + off, sizeof(buf) - off, "%s%s:" UINT64_FORMAT,
+								i == 0 ? " v2_lmon=" : ",", names[i],
+								pg_atomic_read_u64(&UndoHorizonShmem->freeze_observation_count[i]));
 	for (i = 0; i < CLUSTER_MAX_NODES && off + 96 < sizeof(buf); i++) {
 		ClusterUndoHorizonSlotShmem *slot = &UndoHorizonShmem->slots[i];
 		int64 age_ms;
