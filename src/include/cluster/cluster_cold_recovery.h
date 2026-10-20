@@ -184,7 +184,7 @@ typedef struct ClusterColdRecordV1 {
 	const ClusterColdSpaceOpV1 *space_ops;
 } ClusterColdRecordV1;
 
-/* Original frame of one retained PAGE/SPACE record, not an ownership proof. */
+/* Original record frame metadata, not an ownership or effects proof. */
 typedef struct ClusterColdRecordFrameV1 {
 	XLogRecPtr read_rec_ptr;
 	XLogRecPtr end_rec_ptr;
@@ -331,6 +331,17 @@ extern bool cluster_cold_plan_record_frame_count_v1(const ClusterColdPlanV1 *pla
 													uint32 *out_count);
 extern bool cluster_cold_plan_record_frame_v1(const ClusterColdPlanV1 *plan, uint32 index,
 											  ClusterColdRecordFrameV1 *out);
+
+/* Every accepted input record, in feed order, including cursor-only records
+ * and historical SPACE ADVANCEs omitted by the planning-frame accessors.
+ * These sealed-only, by-value metadata inputs retain the original component
+ * counts; they do not retain all payloads or prove effects, base coverage,
+ * canonical ownership, replay completion, loser identity or C0 authority.
+ * Both accessors clear their output on failure. */
+extern bool cluster_cold_plan_input_frame_count_v1(const ClusterColdPlanV1 *plan,
+												   uint32 *out_count);
+extern bool cluster_cold_plan_input_frame_v1(const ClusterColdPlanV1 *plan, uint32 index,
+											 ClusterColdRecordFrameV1 *out);
 
 /* Records at or after the participant's native redo start (pass-2 input),
  * page or not, as fed; pass 2 must consume exactly this many. */

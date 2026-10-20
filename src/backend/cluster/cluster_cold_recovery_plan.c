@@ -436,6 +436,56 @@ space_record_store(ClusterColdPlanV1 *plan, uint32 canonical, const ClusterColdR
 	return CLUSTER_COLD_OK;
 }
 
+/* Planning keeps either every SPACE effect, or none for a lone historical
+ * ADVANCE. Reuse its frames; cursor-only and omitted ADVANCE inputs need only
+ * their metadata. Both stores share the original planner budget. */
+static ClusterColdDetailV1
+input_frame_store(ClusterColdPlanV1 *plan, uint32 participant, const ClusterColdRecordV1 *record,
+				  uint32 previous_records)
+{
+	bool planning_record = plan->record_count != previous_records;
+	ClusterColdDetailV1 detail;
+	ColdInputFrameRef *ref;
+	uint32 index = plan->input_frame_count;
+
+	detail = cold_plan_chunk_reserve(
+		plan, (void ***)&plan->input_frame_chunks, &plan->input_frame_chunk_count,
+		&plan->input_frame_chunk_capacity, (uint64)index + 1, sizeof(ColdInputFrameRef));
+	if (detail != CLUSTER_COLD_OK)
+		return detail;
+	if (!planning_record) {
+		ClusterColdRecordFrameV1 *frame;
+		uint32 omitted = plan->omitted_frame_count;
+
+		detail = cold_plan_chunk_reserve(plan, (void ***)&plan->omitted_frame_chunks,
+										 &plan->omitted_frame_chunk_count,
+										 &plan->omitted_frame_chunk_capacity, (uint64)omitted + 1,
+										 sizeof(ClusterColdRecordFrameV1));
+		if (detail != CLUSTER_COLD_OK)
+			return detail;
+		frame = &plan->omitted_frame_chunks[omitted >> COLD_CHUNK_SHIFT][omitted & COLD_CHUNK_MASK];
+		memset(frame, 0, sizeof(*frame));
+		frame->read_rec_ptr = record->read_rec_ptr;
+		frame->end_rec_ptr = record->end_rec_ptr;
+		frame->record_crc = record->record_crc;
+		frame->participant = participant;
+		frame->source_xid = record->source_xid;
+		frame->source_top_xid = record->source_top_xid;
+		frame->page_components = record->component_count;
+		frame->space_effects = record->space_count;
+		frame->rmid = record->rmid;
+		frame->info = record->info;
+		frame->history = record->end_rec_ptr
+						 <= plan->participants[plan->canonical[participant]].cut.native_redo;
+		plan->omitted_frame_count++;
+	}
+	ref = &plan->input_frame_chunks[index >> COLD_CHUNK_SHIFT][index & COLD_CHUNK_MASK];
+	ref->index = planning_record ? previous_records : plan->omitted_frame_count - 1;
+	ref->planning_record = planning_record;
+	plan->input_frame_count++;
+	return CLUSTER_COLD_OK;
+}
+
 ClusterColdDetailV1
 cluster_cold_plan_feed_v1(ClusterColdPlanV1 *plan, uint32 participant,
 						  const ClusterColdRecordV1 *record)
@@ -457,6 +507,8 @@ cluster_cold_plan_feed_v1(ClusterColdPlanV1 *plan, uint32 participant,
 	else if (record->space_count != 0 && record->component_count != 0)
 		detail = CLUSTER_COLD_COMPONENT_INVALID;
 	else {
+		uint32 previous_records = plan->record_count;
+
 		owner = &plan->participants[plan->canonical[participant]];
 		detail = record_cursor_check(owner, record);
 		/* C0 names a separate target. The writer's checkpoint is not
@@ -485,6 +537,8 @@ cluster_cold_plan_feed_v1(ClusterColdPlanV1 *plan, uint32 participant,
 			detail = space_record_store(plan, plan->canonical[participant], record);
 		if (detail == CLUSTER_COLD_OK && record->component_count != 0)
 			detail = record_store(plan, plan->canonical[participant], record);
+		if (detail == CLUSTER_COLD_OK)
+			detail = input_frame_store(plan, participant, record, previous_records);
 		if (detail == CLUSTER_COLD_OK) {
 			owner->seen = true;
 			owner->last_read = record->read_rec_ptr;
@@ -746,6 +800,38 @@ cluster_cold_plan_record_frame_v1(const ClusterColdPlanV1 *plan, uint32 index,
 	return true;
 }
 
+bool
+cluster_cold_plan_input_frame_count_v1(const ClusterColdPlanV1 *plan, uint32 *out_count)
+{
+	if (out_count == NULL)
+		return false;
+	*out_count = 0;
+	if (!plan_valid(plan) || plan->phase != COLD_PHASE_SEALED)
+		return false;
+	*out_count = plan->input_frame_count;
+	return true;
+}
+
+bool
+cluster_cold_plan_input_frame_v1(const ClusterColdPlanV1 *plan, uint32 index,
+								 ClusterColdRecordFrameV1 *out)
+{
+	const ColdInputFrameRef *ref;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!plan_valid(plan) || plan->phase != COLD_PHASE_SEALED || index >= plan->input_frame_count)
+		return false;
+	ref = &plan->input_frame_chunks[index >> COLD_CHUNK_SHIFT][index & COLD_CHUNK_MASK];
+	if (ref->planning_record)
+		return cluster_cold_plan_record_frame_v1(plan, ref->index, out);
+	if (ref->index >= plan->omitted_frame_count)
+		return false;
+	*out = plan->omitted_frame_chunks[ref->index >> COLD_CHUNK_SHIFT][ref->index & COLD_CHUNK_MASK];
+	return true;
+}
+
 uint64
 cluster_cold_plan_replay_record_count_v1(const ClusterColdPlanV1 *plan, uint32 participant)
 {
@@ -794,6 +880,14 @@ cluster_cold_plan_destroy_v1(ClusterColdPlanV1 **plan_address)
 		cold_free(plan->record_chunks[i]);
 	if (plan->record_chunks != NULL)
 		cold_free(plan->record_chunks);
+	for (i = 0; i < plan->input_frame_chunk_count; i++)
+		cold_free(plan->input_frame_chunks[i]);
+	if (plan->input_frame_chunks != NULL)
+		cold_free(plan->input_frame_chunks);
+	for (i = 0; i < plan->omitted_frame_chunk_count; i++)
+		cold_free(plan->omitted_frame_chunks[i]);
+	if (plan->omitted_frame_chunks != NULL)
+		cold_free(plan->omitted_frame_chunks);
 	cold_plan_intern_free(&plan->relations);
 	cold_plan_intern_free(&plan->segments);
 	cold_free(plan->canonical);

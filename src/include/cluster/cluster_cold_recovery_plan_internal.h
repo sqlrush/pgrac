@@ -90,6 +90,12 @@ typedef struct ColdRecord {
 	uint8 flags; /* COLD_RECORD_* */
 } ColdRecord;
 
+/* Input order reuses planning records and separately retains omitted frames. */
+typedef struct ColdInputFrameRef {
+	uint32 index;
+	bool planning_record;
+} ColdInputFrameRef;
+
 #define COLD_RECORD_HISTORY 0x01
 #define COLD_RECORD_SCHEDULED 0x02
 #define COLD_RECORD_SPACE 0x04		/* first_component is its first SPACE effect */
@@ -199,6 +205,14 @@ struct ClusterColdPlanV1 {
 	uint32 record_count;
 	uint32 record_chunk_count;
 	uint32 record_chunk_capacity;
+	ColdInputFrameRef **input_frame_chunks;
+	uint32 input_frame_count;
+	uint32 input_frame_chunk_count;
+	uint32 input_frame_chunk_capacity;
+	ClusterColdRecordFrameV1 **omitted_frame_chunks;
+	uint32 omitted_frame_count;
+	uint32 omitted_frame_chunk_count;
+	uint32 omitted_frame_chunk_capacity;
 	ColdComponent **component_chunks;
 	uint32 component_count;
 	uint32 component_chunk_count;
