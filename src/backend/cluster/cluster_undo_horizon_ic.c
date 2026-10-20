@@ -63,6 +63,8 @@
 #include "cluster/cluster_undo_horizon.h"
 #include "cluster/cluster_undo_cleaner.h"
 #include "cluster/cluster_undo_retention.h"
+#include "cluster/cluster_xid_stripe.h"
+#include "cluster/cluster_xid_stripe_boot.h"
 #include "miscadmin.h"
 #include "storage/shmem.h"
 #include "utils/snapmgr.h" /* Actual snapshot lifetime and retention evidence. */
@@ -545,6 +547,42 @@ undo_horizon_send_v2(int32 peer, const ClusterUndoCleanerActiveSample *active,
 	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_UNDO_HORIZON, peer, bytes, sizeof(bytes));
 }
 
+/* A V2 request is only an intent. Reuse the current local worker fences and
+ * round DOWN to this origin, so alignment cannot exceed either the request
+ * or the complete cohort's independent future ceiling. The original QVOTEC
+ * entry rechecks the cohort, slack/window/lease identity and durable promise;
+ * LMON performs no voting-disk IO and publishes no completion certificate. */
+static void
+undo_horizon_relay_maintenance(const ClusterHeapFreezeCohortObservation *cohort)
+{
+	ClusterUndoCleanerActiveSample active;
+	uint64 requested = cohort->requested_full_xid_max;
+	uint64 remainder;
+	int slot;
+
+	if (requested == 0 || requested > cohort->future_full_xid_max
+		|| !cluster_undo_cleaner_active_sample(&active))
+		return;
+	slot = active.lease_fence.slot;
+	if (slot < 0 || slot >= CLUSTER_XID_STRIDE || active.admission_fence.local_node_id != slot
+		|| active.admission_fence.record_generation != cohort->record_generation
+		|| active.admission_fence.formation_epoch != cohort->formation_epoch
+		|| active.admission_fence.admitted_members_lo != cohort->admitted_members_lo
+		|| active.admission_fence.admitted_members_hi != cohort->admitted_members_hi)
+		return;
+	remainder
+		= (requested % CLUSTER_XID_STRIDE + CLUSTER_XID_STRIDE - (uint64)slot) % CLUSTER_XID_STRIDE;
+	if (requested < remainder)
+		return;
+	requested -= remainder;
+	if (!TransactionIdIsNormal((TransactionId)requested)
+		|| requested <= U64FromFullTransactionId(active.scan.future_full)
+		|| !cluster_undo_cleaner_active_sample_current(&active))
+		return;
+	(void)cluster_xid_stripe_request_maintenance(&active.admission_fence, &active.lease_fence,
+												 FullTransactionIdFromU64(requested));
+}
+
 /* Observe the complete cohort on the original LMON cadence, including local
  * evidence failures. Reuse the sender's H cut; only outcome counts survive.
  * Producer protection must close before any global F can be published. */
@@ -564,6 +602,8 @@ undo_horizon_observe_v2(uint64 now_us, const ClusterUndoRetentionSample *history
 	if ((unsigned)status >= UNDO_HORIZON_V2_STATUS_COUNT)
 		status = CLUSTER_HEAP_FREEZE_COHORT_INVALID;
 	pg_atomic_fetch_add_u64(&UndoHorizonShmem->freeze_observation_count[status], 1);
+	if (status == CLUSTER_HEAP_FREEZE_COHORT_READY)
+		undo_horizon_relay_maintenance(&observation);
 }
 
 void
@@ -731,6 +771,8 @@ undo_horizon_v2_observe_peer(int32 peer, const ClusterSemanticActiveSampleFence 
 	identity->recv_at_us = view.recv_at_us;
 	identity->interval_ms = report->sender_interval_ms;
 	candidate->future_full_xid_max = Max(candidate->future_full_xid_max, report->future_full_xid);
+	candidate->requested_full_xid_max
+		= Max(candidate->requested_full_xid_max, report->requested_full_xid);
 	candidate->active_full_xid_min
 		= Min(candidate->active_full_xid_min, report->active_full_xid_min);
 	if (scn_time_cmp(report->horizon_scn, candidate->horizon_scn) < 0)

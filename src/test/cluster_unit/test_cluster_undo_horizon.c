@@ -97,10 +97,32 @@ static uint32 test_cohort_generations[CLUSTER_MAX_NODES];
 static int32 test_cohort_trigger_peer = -1, test_cohort_changed_peer = -1;
 static int test_cohort_change;
 static int64 test_cohort_clock_shift;
+static unsigned test_maintenance_calls;
+static uint64 test_maintenance_requested;
+static ClusterSemanticActiveSampleFence test_maintenance_identity;
+static ClusterXidStripeSampleFence test_maintenance_stripe;
+static ClusterXidStripeMaintenanceResult test_maintenance_result;
+static unsigned test_change_admission_on_capture;
+
+/* QVOTEC's original durable entry is a process-boundary double here. Its
+ * actual lease/majority-sync/arm behavior has the separate stripe fixture. */
+ClusterXidStripeMaintenanceResult
+cluster_xid_stripe_request_maintenance(const ClusterSemanticActiveSampleFence *identity,
+									   const ClusterXidStripeSampleFence *stripe,
+									   FullTransactionId requested)
+{
+	test_maintenance_calls++;
+	test_maintenance_identity = *identity;
+	test_maintenance_stripe = *stripe;
+	test_maintenance_requested = U64FromFullTransactionId(requested);
+	return test_maintenance_result;
+}
 
 bool
 cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out)
 {
+	if (test_change_admission_on_capture != 0 && --test_change_admission_on_capture == 0)
+		test_v2_fence.admission_publication_seq += 2;
 	MemSet(out, 0, sizeof(*out));
 	if (!test_sender_sample_valid)
 		return false;
@@ -921,6 +943,10 @@ reset_v2_sender(void)
 										= CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT,
 										.contributor_token = 9 };
 	test_v2_sends = 0;
+	test_maintenance_calls = 0;
+	test_maintenance_requested = 0;
+	test_maintenance_result = CLUSTER_XID_STRIPE_MAINTENANCE_PENDING;
+	test_change_admission_on_capture = 0;
 	test_horizon_now += 1000001;
 }
 
@@ -1584,6 +1610,121 @@ assert_cohort_refusal(ClusterHeapFreezeCohortStatus expected)
 	UT_ASSERT(memcmp(&out, &unchanged, sizeof(out)) == 0);
 }
 
+static ClusterHeapFreezeReportV2
+maintenance_cohort(bool high_member)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_cohort(high_member);
+
+	report.report_sequence++;
+	report.f_sample_id++;
+	report.future_full_xid = UINT64CONST(0x10000300f);
+	report.requested_full_xid = UINT64CONST(0x10000205b);
+	test_sender_sample.lease_fence.slot = 0;
+	test_sender_sample.lease_fence.incarnation = test_v2_fence.local_boot_incarnation;
+	test_sender_sample.lease_fence.lease_limit_full = UINT64CONST(0x100100000);
+	cohort_receive(1, report);
+	return report;
+}
+
+UT_TEST(test_v2_lmon_relays_bounded_intent_with_original_local_fences)
+{
+	(void)maintenance_cohort(false);
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_maintenance_calls, 1);
+	UT_ASSERT_EQ(test_maintenance_requested, UINT64CONST(0x100002050));
+	UT_ASSERT(memcmp(&test_maintenance_identity, &test_sender_sample.admission_fence,
+					 sizeof(test_maintenance_identity))
+			  == 0);
+	UT_ASSERT(memcmp(&test_maintenance_stripe, &test_sender_sample.lease_fence,
+					 sizeof(test_maintenance_stripe))
+			  == 0);
+	/* The maintenance intent never replaces either proven F or the ceiling. */
+	UT_ASSERT(strstr(cluster_undo_horizon_peer_reports_summary(),
+					 "v2_observation=READY,f=4294967424,h=300")
+			  != NULL);
+}
+
+UT_TEST(test_v2_lmon_ignores_absent_over_ceiling_or_covered_intents)
+{
+	for (int fault = 0; fault < 4; fault++) {
+		ClusterHeapFreezeReportV2 report = maintenance_cohort(false);
+
+		report.report_sequence++;
+		if (fault == 0)
+			report.requested_full_xid = 0;
+		else if (fault == 1)
+			report.requested_full_xid = report.future_full_xid + 1;
+		else
+			report.requested_full_xid
+				= U64FromFullTransactionId(test_sender_sample.scan.future_full)
+				  + (fault == 3 ? 15 : 0);
+		cohort_receive(1, report);
+		cluster_undo_horizon_lmon_tick();
+		UT_ASSERT_EQ(test_maintenance_calls, 0);
+	}
+}
+
+UT_TEST(test_v2_lmon_relays_only_complete_cohort_and_maximum_request)
+{
+	ClusterHeapFreezeReportV2 report = maintenance_cohort(true);
+
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_maintenance_calls, 0);
+	report.requested_full_xid = UINT64CONST(0x10000209f);
+	cohort_receive(65, report);
+	test_horizon_now += 1000000;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_maintenance_calls, 1);
+	UT_ASSERT_EQ(test_maintenance_requested, UINT64CONST(0x100002090));
+}
+
+UT_TEST(test_v2_lmon_refused_cohorts_cannot_relay_requests)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		(void)maintenance_cohort(false);
+		if (fault == 0)
+			test_horizon_store.freeze_slots[1].valid = false;
+		else if (fault == 1)
+			test_horizon_store.freeze_slots[1].view.recv_at_us = test_horizon_now - 3000001;
+		else if (fault == 2)
+			pg_atomic_write_u32(&test_horizon_store.freeze_slots[1].seq, 1);
+		else if (fault == 3)
+			test_v2_identity = false;
+		else
+			test_sender_sample.scan.min_full = FullTransactionIdFromEpochAndXid(1, 8192);
+		cluster_undo_horizon_lmon_tick();
+		UT_ASSERT_EQ(test_maintenance_calls, 0);
+	}
+}
+
+UT_TEST(test_v2_lmon_relay_rechecks_admission_before_handoff)
+{
+	(void)maintenance_cohort(false);
+	/* The complete cohort read succeeds, then the relay's capture loses
+	 * the admission cut. A READY result is not a cached handoff permit. */
+	test_change_admission_on_capture = 2;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_maintenance_calls, 0);
+}
+
+UT_TEST(test_v2_lmon_relay_uses_original_cadence_and_no_completion_cache)
+{
+	for (int result = CLUSTER_XID_STRIPE_MAINTENANCE_PENDING;
+		 result <= CLUSTER_XID_STRIPE_MAINTENANCE_UNAVAILABLE; result++) {
+		(void)maintenance_cohort(false);
+		test_maintenance_result = result;
+		cluster_undo_horizon_lmon_tick();
+		UT_ASSERT_EQ(test_maintenance_calls, 1);
+		cluster_undo_horizon_lmon_tick();
+		test_horizon_now += 999999;
+		cluster_undo_horizon_lmon_tick();
+		UT_ASSERT_EQ(test_maintenance_calls, 1);
+		test_horizon_now++;
+		cluster_undo_horizon_lmon_tick();
+		UT_ASSERT_EQ(test_maintenance_calls, 2);
+	}
+}
+
 UT_TEST(test_v2_cohort_requires_both_mask_halves_and_keeps_domains_separate)
 {
 	ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
@@ -1954,7 +2095,7 @@ UT_TEST(test_v2_lmon_observes_clock_rollback_as_stale)
 int
 main(void)
 {
-	UT_PLAN(63);
+	UT_PLAN(69);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -2007,6 +2148,12 @@ main(void)
 	UT_RUN(test_v2_summary_observes_complete_fixed_cohort);
 	UT_RUN(test_v2_cohort_requires_both_mask_halves_and_keeps_domains_separate);
 	UT_RUN(test_v2_cohort_reports_only_complete_observed_future_ceiling);
+	UT_RUN(test_v2_lmon_relays_bounded_intent_with_original_local_fences);
+	UT_RUN(test_v2_lmon_ignores_absent_over_ceiling_or_covered_intents);
+	UT_RUN(test_v2_lmon_relays_only_complete_cohort_and_maximum_request);
+	UT_RUN(test_v2_lmon_refused_cohorts_cannot_relay_requests);
+	UT_RUN(test_v2_lmon_relay_rechecks_admission_before_handoff);
+	UT_RUN(test_v2_lmon_relay_uses_original_cadence_and_no_completion_cache);
 	UT_RUN(test_v2_cohort_missing_members_never_shrink_required_set);
 	UT_RUN(test_v2_cohort_h_freshness_does_not_expire_f_sample);
 	UT_RUN(test_v2_cohort_uses_end_clock_and_rejects_rollback);
