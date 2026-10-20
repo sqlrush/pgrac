@@ -543,6 +543,8 @@ TESTS += test_cluster_relmap_retention_census
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_retention_census,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_pending
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_pending,$(SIMPLE_TESTS))
+TESTS += test_cluster_relmap_pending_side
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_pending_side,$(SIMPLE_TESTS))
 
 test_cluster_relmap_arb: test_cluster_relmap_arb.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_arb.c \
@@ -3069,7 +3071,16 @@ CLUSTER_SIDE_HEAD_READER_O = $(top_builddir)/src/backend/cluster/cluster_recover
 		$(top_builddir)/src/backend/cluster/cluster_uba.o
 
 test_cluster_pi_contribution: test_cluster_page_data_stable.o
-test_cluster_recovery_c0_plan test_cluster_cold_tt_redo: $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
+test_cluster_recovery_c0_plan test_cluster_cold_tt_redo test_cluster_relmap_pending_side: $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
+
+test_cluster_relmap_pending_side: test_cluster_relmap_pending_side_product.o \
+		test_cluster_relmap_pending_product.o test_cluster_relmap_v2_codec_product.o \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_pending_side.h
+test_cluster_relmap_pending_side_product.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_pending_side.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_pending_side.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_pending.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 test_cluster_cold_tt_redo: test_cluster_cold_tt_redo_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o \
@@ -3084,7 +3095,7 @@ test_cluster_side_xact_stats.inc: $(top_srcdir)/src/backend/utils/activity/pgsta
 	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_side_xact test_cluster_pi_contribution test_cluster_recovery_c0_plan test_cluster_cold_tt_redo: %: %.c unit_test.h test_cluster_side_xact.c test_cluster_side_xact_stats.inc test_cluster_undo_header_identity.inc test_cluster_heap_small_scn.inc \
+test_cluster_side_xact test_cluster_pi_contribution test_cluster_recovery_c0_plan test_cluster_cold_tt_redo test_cluster_relmap_pending_side: %: %.c unit_test.h test_cluster_side_xact.c test_cluster_side_xact_stats.inc test_cluster_undo_header_identity.inc test_cluster_heap_small_scn.inc \
 		test_cluster_side_online_owner_product.o $(CLUSTER_SIDE_HEAD_READER_O) \
 		test_cluster_side_xact_budget_product.o $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
@@ -3096,7 +3107,7 @@ test_cluster_side_xact test_cluster_pi_contribution test_cluster_recovery_c0_pla
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
 		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
-		$(filter test_cluster_page_data_stable.o test_cluster_cold_tt_redo_product.o test_cluster_cold_recovery_%.o $(CLUSTER_WAL_CLAIM_O) $(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o,$^) \
+		$(filter test_cluster_page_data_stable.o test_cluster_cold_tt_redo_product.o test_cluster_cold_recovery_%.o test_cluster_relmap_pending_side_product.o test_cluster_relmap_pending_product.o test_cluster_relmap_v2_codec_product.o $(CLUSTER_WAL_CLAIM_O) $(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o,$^) \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) -lssl -lcrypto -o $@
