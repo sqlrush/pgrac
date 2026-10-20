@@ -157,6 +157,7 @@ static int receipt_error_code;
 static char receipt_error_detail[1024];
 static ClusterCtrcApplyResult receipt_apply_result = CLUSTER_CTRC_APPLY_APPLIED;
 static bool receipt_fail_sync_after_apply;
+static bool receipt_throw_apply;
 
 
 char *DataDir = NULL;
@@ -401,7 +402,7 @@ cluster_undo_buf_install_ref_locked(int slot, uint32 segment_id, uint8 owner, ui
 	UT_ASSERT_EQ(owner, 1);
 	UT_ASSERT_EQ(block_no, 1);
 	UT_ASSERT(receipt_buffer_locked);
-	UT_ASSERT_EQ(receipt_apply_calls, 1);
+	UT_ASSERT_EQ(receipt_apply_calls, cluster_undo_record_reservation.receipt.ctrc_applied_mask == 3 ? 2 : 1);
 	UT_ASSERT_EQ(((const UndoBlockHeader *)image)->slot_count, 1);
 	receipt_install_calls++;
 }
@@ -526,6 +527,8 @@ cluster_ctrc_receipt_apply_shared(const ClusterCtrcReceiptHandle *handle,
 	UT_ASSERT(handle->valid);
 	memset(token, 0, sizeof(*token));
 	receipt_apply_calls++;
+	if (receipt_throw_apply)
+		siglongjmp(receipt_error_jump, 1);
 	if (receipt_fail_sync_after_apply)
 		cluster_undo_record_reservation.sequence++;
 	return receipt_apply_result;
@@ -2692,6 +2695,7 @@ receipt_fixture_ready(uint8 record_type, ClusterUndoRecordPrepareReceipt *receip
 	receipt_error_detail[0] = '\0';
 	receipt_apply_result = CLUSTER_CTRC_APPLY_APPLIED;
 	receipt_fail_sync_after_apply = false;
+	receipt_throw_apply = false;
 	receipt_clock_us = 99;
 	receipt_clock_after_unref = 0;
 	receipt_log_enabled = false;
@@ -2702,6 +2706,10 @@ receipt_fixture_ready(uint8 record_type, ClusterUndoRecordPrepareReceipt *receip
 	receipt_all_logs[0] = '\0'; receipt_log_count = receipt_owner_calls = 0;
 	receipt_observe_calls = 0;
 	receipt_observe_available = receipt_observe_throw = false;
+#ifdef CLUSTER_UNDO_RECEIPT_CONSUME_TRACE_PRESENT
+	memset(&undo_receipt_consumer_trace, 0, sizeof(undo_receipt_consumer_trace));
+	undo_receipt_consumer_overwritten = undo_receipt_consumer_critical_skipped = undo_receipt_consumer_lwlock_skipped = 0;
+#endif
 	receipt_trace_lwlock_held = receipt_lifecycle_controls = false;
 	receipt_fail_sync_after_prepare = false; receipt_fail_log_event = NULL;
 	receipt_prepare_result = CLUSTER_CTRC_PREPARE_READY;
@@ -4320,10 +4328,276 @@ UT_TEST(test_receipt_lifecycle_sample_error_keeps_registered_cleanup_owner)
 	UT_ASSERT(!cluster_undo_record_reservation.active);
 }
 
+
+/* Exercise real APPLY/consume with the existing explicit shared/storage
+ * boundaries. The native heap/ResourceOwner path is not simulated as proof. */
+static void
+receipt_consumer_fixture(ClusterUndoRecordPrepareReceipt *receipt, uint8 count, bool lock)
+{
+	receipt_fixture_ready(count == 2 ? UNDO_RECORD_UPDATE : UNDO_RECORD_INSERT, receipt);
+	receipt_lifecycle_controls = true;
+	receipt->ctrc_pending_mask = (UINT8_C(1) << count) - 1;
+	for (uint8 i = 0; i < count; i++) {
+		receipt->ctrc_pending_targets[i].kind = CTRC_TARGET_PAGE_PENDING_ITL_SLOT;
+		receipt->ctrc_pending_targets[i].spc_oid = 1663;
+		receipt->ctrc_pending_targets[i].db_oid = 5;
+		receipt->ctrc_pending_targets[i].rel_number = 16388;
+		receipt->ctrc_pending_targets[i].block_number = 137 + i;
+		receipt->ctrc_pending_targets[i].itl_slot_index = i;
+	}
+	UT_ASSERT(cluster_undo_record_receipt_sync(receipt));
+	for (uint8 i = 0; i < count; i++) {
+		UndoItlHistoryEntry history = {0};
+		UT_ASSERT(cluster_undo_record_ctrc_prepare_pending(receipt, i));
+		history.block = 137 + i; history.slot_index = i;
+		history.after_kind = ITL_FLAG_ACTIVE; history.after_write_scn = 999;
+		UT_ASSERT(cluster_undo_record_stage_history(receipt, i, &history));
+	}
+	if (lock)
+		UT_ASSERT_EQ(cluster_undo_record_consume_preflight(receipt, count == 2
+			? sizeof(UndoUpdatePayload) + 32 : sizeof(UndoInsertPayload)),
+					 CLUSTER_UNDO_RECORD_CONSUME_PREFLIGHT_READY);
+	receipt_log_enabled = cluster_trace_normal_stop = true;
+	receipt_last_log[0] = receipt_all_logs[0] = '\0'; receipt_log_count = 0;
+}
+
+static void
+receipt_consumer_apply(ClusterUndoRecordPrepareReceipt *receipt, uint8 ordinal)
+{
+	ClusterCtrcApplyToken token;
+	ClusterCtrcTargetV1 target = receipt->ctrc_pending_targets[ordinal];
+	UT_ASSERT_EQ(cluster_undo_record_ctrc_apply_prepared(receipt, ordinal, &target, &token),
+				 CLUSTER_CTRC_APPLY_APPLIED);
+}
+
+static void
+receipt_consumer_finish(ClusterUndoRecordPrepareReceipt *receipt, UBA *uba)
+{
+	ClusterUndoRecordTarget target = {0};
+	char payload[sizeof(UndoUpdatePayload) + 32] = {0};
+	uint16 payload_length = sizeof(UndoInsertPayload);
+	if (receipt->record_type == UNDO_RECORD_UPDATE) {
+		UndoUpdatePayload update = {138, 2, 32, sizeof(UndoUpdatePayload), 0};
+		memcpy(payload, &update, sizeof(update)); payload_length = sizeof(payload);
+	}
+	target.locator.spcOid = 1663; target.locator.dbOid = 5; target.locator.relNumber = 16388;
+	target.forknum = MAIN_FORKNUM; target.blockno = 137; target.offnum = 1;
+	UT_ASSERT_EQ(cluster_undo_record_consume_prepared(receipt, &target, payload, payload_length, uba),
+				 CLUSTER_UNDO_RECORD_CONSUME_APPLIED);
+}
+
+UT_TEST(test_receipt_consumer_observation_off_preserves_effects)
+{
+	ClusterUndoRecordPrepareReceipt receipt;
+	UBA uba;
+	for (uint8 count = 1; count <= 2; count++) {
+		receipt_consumer_fixture(&receipt, count, true); cluster_trace_normal_stop = false;
+		for (uint8 i = 0; i < count; i++)
+			receipt_consumer_apply(&receipt, i);
+		receipt_consumer_finish(&receipt, &uba);
+#ifdef CLUSTER_UNDO_RECEIPT_CONSUME_TRACE_PRESENT
+		undo_receipt_consumer_trace_flush("unit.off");
+#endif
+		UT_ASSERT_EQ(receipt_apply_calls, count); UT_ASSERT_EQ(receipt_install_calls, 1);
+		UT_ASSERT_EQ(receipt_log_count, 0); UT_ASSERT(!UBA_is_invalid(uba));
+	}
+}
+
+UT_TEST(test_receipt_consumer_observation_survives_original_erasure)
+{
+#ifdef CLUSTER_UNDO_RECEIPT_CONSUME_TRACE_PRESENT
+	ClusterUndoRecordPrepareReceipt receipt, zero = {0};
+	UBA uba;
+	receipt_consumer_fixture(&receipt, 1, true); CritSectionCount = 1;
+	receipt_consumer_apply(&receipt, 0); receipt_consumer_finish(&receipt, &uba);
+	UT_ASSERT_EQ(receipt_log_count, 0);
+	UT_ASSERT_EQ(memcmp(&receipt, &zero, sizeof(receipt)), 0);
+	UT_ASSERT(!cluster_undo_record_reservation.active && cluster_undo_pending.active);
+	CritSectionCount = 0; undo_receipt_consumer_trace_flush("unit.after_consume");
+	UT_ASSERT_EQ(receipt_log_count, 1);
+	UT_ASSERT(strstr(receipt_last_log, "PGRAC_FAMILY=CTRC_CONSUME") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "consumer_sequence=17") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "shared_result_known=1") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "local_sync_known=1 local_sync_ok=1") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "consume_succeeded=1") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "data_rel=16388 data_fork=0 data_block=137 data_offset=1") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "authoritative=0 shared_retired_known=0") != NULL);
+	UT_ASSERT(!undo_receipt_consumer_trace.valid);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_receipt_consumer_observation_unsafe_drain_retains_exact_sample)
+{
+#ifdef CLUSTER_UNDO_RECEIPT_CONSUME_TRACE_PRESENT
+	ClusterUndoRecordPrepareReceipt receipt;
+	UBA uba;
+	receipt_consumer_fixture(&receipt, 1, true);
+	receipt_consumer_apply(&receipt, 0); receipt_consumer_finish(&receipt, &uba);
+	CritSectionCount = 1; undo_receipt_consumer_trace_flush("unit.critical");
+	CritSectionCount = 0; receipt_trace_lwlock_held = true;
+	undo_receipt_consumer_trace_flush("unit.lock");
+	UT_ASSERT_EQ(receipt_log_count, 0); UT_ASSERT(undo_receipt_consumer_trace.valid);
+	receipt_trace_lwlock_held = false; undo_receipt_consumer_trace_flush("unit.safe");
+	UT_ASSERT_EQ(receipt_log_count, 1);
+	UT_ASSERT(strstr(receipt_last_log, "critical_skipped=1 lwlock_skipped=1") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_receipt_consumer_observation_two_targets_keep_borrowed_route)
+{
+#ifdef CLUSTER_UNDO_RECEIPT_CONSUME_TRACE_PRESENT
+	ClusterUndoRecordPrepareReceipt receipt;
+	UBA uba;
+	receipt_consumer_fixture(&receipt, 2, true);
+	receipt.ctrc_reuse_mask = 2;
+	UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
+	receipt_consumer_apply(&receipt, 0); receipt_consumer_apply(&receipt, 1);
+	receipt_consumer_finish(&receipt, &uba); undo_receipt_consumer_trace_flush("unit.two");
+	UT_ASSERT_EQ(receipt_apply_calls, 2); UT_ASSERT_EQ(receipt_log_count, 2);
+	UT_ASSERT(strstr(receipt_all_logs, "target_ordinal=0 route_retarget=0") != NULL);
+	UT_ASSERT(strstr(receipt_all_logs, "target_ordinal=1 route_retarget=1") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "final_block=138") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_receipt_consumer_observation_original_shared_refusal_is_not_success)
+{
+#ifdef CLUSTER_UNDO_RECEIPT_CONSUME_TRACE_PRESENT
+	ClusterUndoRecordPrepareReceipt receipt;
+	ClusterCtrcApplyToken token;
+	receipt_consumer_fixture(&receipt, 1, false);
+	receipt_apply_result = CLUSTER_CTRC_APPLY_FAIL_CLOSED;
+	UT_ASSERT_EQ(cluster_undo_record_ctrc_apply_prepared(&receipt, 0, &receipt.ctrc_pending_targets[0], &token),
+				 CLUSTER_CTRC_APPLY_FAIL_CLOSED);
+	undo_receipt_consumer_trace_flush("unit.refusal");
+	UT_ASSERT(strstr(receipt_last_log, "shared_result_known=1") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "local_sync_known=0 local_sync_ok=0") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "consume_succeeded=0") != NULL);
+	UT_ASSERT(cluster_undo_record_reservation.active && cluster_undo_record_reservation.apply_attempted);
+	UT_ASSERT_EQ(receipt_cancel_calls + receipt_unref_calls + receipt_install_calls, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_receipt_consumer_observation_shared_success_local_sync_failure_separate)
+{
+#ifdef CLUSTER_UNDO_RECEIPT_CONSUME_TRACE_PRESENT
+	ClusterUndoRecordPrepareReceipt receipt;
+	ClusterCtrcApplyToken token;
+	receipt_consumer_fixture(&receipt, 1, false); receipt_fail_sync_after_apply = true;
+	UT_ASSERT_EQ(cluster_undo_record_ctrc_apply_prepared(&receipt, 0, &receipt.ctrc_pending_targets[0], &token),
+				 CLUSTER_CTRC_APPLY_FAIL_CLOSED);
+	undo_receipt_consumer_trace_flush("unit.sync_failure");
+	UT_ASSERT(strstr(receipt_last_log, "local_sync_known=1 local_sync_ok=0") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "consume_succeeded=0") != NULL);
+	UT_ASSERT_EQ(receipt.ctrc_applied_mask, 1);
+	UT_ASSERT(cluster_undo_record_reservation.active && cluster_undo_record_reservation.apply_attempted);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_receipt_consumer_log_error_cannot_replay_or_change_pending_owner)
+{
+#ifdef CLUSTER_UNDO_RECEIPT_CONSUME_TRACE_PRESENT
+	ClusterUndoRecordPrepareReceipt receipt;
+	UBA uba;
+	ClusterUndoPendingBlock before;
+	receipt_consumer_fixture(&receipt, 1, true);
+	receipt_consumer_apply(&receipt, 0); receipt_consumer_finish(&receipt, &uba);
+	before = cluster_undo_pending; receipt_fail_log_event = "PGRAC_FAMILY=CTRC_CONSUME";
+	if (sigsetjmp(receipt_error_jump, 1) == 0) {
+		undo_receipt_consumer_trace_flush("unit.log_error"); UT_ASSERT(false);
+	}
+	UT_ASSERT(!undo_receipt_consumer_trace.valid);
+	UT_ASSERT_EQ(memcmp(&before, &cluster_undo_pending, sizeof(before)), 0);
+	UT_ASSERT(!cluster_undo_record_reservation.active);
+	receipt_fail_log_event = NULL; undo_receipt_consumer_trace_flush("unit.repeat");
+	UT_ASSERT_EQ(receipt_log_count, 1); UT_ASSERT_EQ(receipt_cancel_calls + receipt_unref_calls, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_receipt_consumer_safe_flush_wiring_precedes_new_effect_and_follows_pending_flush)
+{
+	char *source = read_undo_record_source();
+	const char *prepare, *new_effect, *flush, *precommit, *pending, *check, *early;
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL) return;
+	prepare = strstr(source, "\ncluster_undo_record_ctrc_prepare_pending(");
+	precommit = strstr(source, "\ncluster_undo_xact_precommit_flush(");
+	flush = prepare == NULL ? NULL : strstr(prepare, "undo_receipt_consumer_trace_flush(\"next_prepare\")");
+	new_effect = prepare == NULL ? NULL : strstr(prepare, "result = cluster_ctrc_receipt_prepare_shared(");
+	pending = precommit == NULL ? NULL : strstr(precommit, "cluster_undo_pending_flush_internal(true)");
+	check = precommit == NULL ? NULL : strstr(precommit, "undo_receipt_consumer_trace_flush(\"precommit_after_pending\")");
+	early = precommit == NULL ? NULL : strstr(precommit, "if (cluster_undo_touched_seg_count == 0)");
+	UT_ASSERT(prepare != NULL && flush != NULL && new_effect != NULL && flush < new_effect && new_effect < precommit);
+	UT_ASSERT(pending != NULL && check != NULL && early != NULL && pending < check && check < early);
+	free(source);
+#ifdef CLUSTER_UNDO_RECEIPT_CONSUME_TRACE_PRESENT
+	{
+		ClusterUndoRecordPrepareReceipt receipt;
+		UBA uba;
+		unsigned prior_prepare;
+		receipt_consumer_fixture(&receipt, 1, true);
+		receipt_consumer_apply(&receipt, 0); receipt_consumer_finish(&receipt, &uba);
+		prior_prepare = receipt_prepare_calls;
+		UT_ASSERT(!cluster_undo_record_ctrc_prepare_pending(NULL, CLUSTER_UNDO_RECORD_CTRC_TARGETS));
+		UT_ASSERT(strstr(receipt_all_logs, "emit_stage=next_prepare") != NULL);
+		UT_ASSERT_EQ(receipt_prepare_calls, prior_prepare);
+	}
+#endif
+}
+
+
+UT_TEST(test_receipt_consumer_later_apply_error_cannot_reuse_earlier_result)
+{
+#ifdef CLUSTER_UNDO_RECEIPT_CONSUME_TRACE_PRESENT
+	ClusterUndoRecordPrepareReceipt receipt;
+	ClusterCtrcApplyToken token;
+	receipt_consumer_fixture(&receipt, 1, false);
+	receipt_apply_result = CLUSTER_CTRC_APPLY_FAIL_CLOSED;
+	UT_ASSERT_EQ(cluster_undo_record_ctrc_apply_prepared(&receipt, 0,
+		&receipt.ctrc_pending_targets[0], &token), CLUSTER_CTRC_APPLY_FAIL_CLOSED);
+	receipt_throw_apply = true;
+	if (sigsetjmp(receipt_error_jump, 1) == 0) {
+		(void)cluster_undo_record_ctrc_apply_prepared(&receipt, 0,
+			&receipt.ctrc_pending_targets[0], &token);
+		UT_ASSERT(false);
+	}
+	receipt_throw_apply = false;
+	undo_receipt_consumer_trace_flush("unit.later_error");
+	UT_ASSERT(strstr(receipt_last_log, "apply_call_count=2 shared_result_known=0") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "local_sync_known=0 local_sync_ok=0") != NULL);
+	UT_ASSERT(cluster_undo_record_reservation.active && cluster_undo_record_reservation.apply_attempted);
+	UT_ASSERT_EQ(receipt_cancel_calls + receipt_unref_calls, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(98);
+	UT_PLAN(107);
+	UT_RUN(test_receipt_consumer_later_apply_error_cannot_reuse_earlier_result);
+	UT_RUN(test_receipt_consumer_observation_off_preserves_effects);
+	UT_RUN(test_receipt_consumer_observation_survives_original_erasure);
+	UT_RUN(test_receipt_consumer_observation_unsafe_drain_retains_exact_sample);
+	UT_RUN(test_receipt_consumer_observation_two_targets_keep_borrowed_route);
+	UT_RUN(test_receipt_consumer_observation_original_shared_refusal_is_not_success);
+	UT_RUN(test_receipt_consumer_observation_shared_success_local_sync_failure_separate);
+	UT_RUN(test_receipt_consumer_log_error_cannot_replay_or_change_pending_owner);
+	UT_RUN(test_receipt_consumer_safe_flush_wiring_precedes_new_effect_and_follows_pending_flush);
+
 	UT_RUN(test_receipt_lifecycle_shared_sample_uses_actual_publication_fields);
 	UT_RUN(test_receipt_lifecycle_shared_sample_after_original_local_retirement);
 	UT_RUN(test_receipt_lifecycle_unknown_shared_sample_does_not_borrow_expected_target);

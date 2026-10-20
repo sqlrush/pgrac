@@ -2467,6 +2467,199 @@ undo_receipt_lifecycle_trace(const char *event, const char *predicate,
 		critical_skipped, lwlock_skipped, event_seq == UINT64_MAX)));
 }
 
+/* Specific bounded APPLY/consume observation, not a shared obligation or
+ * general event queue. Capture has no LOG/IO/allocation/lock/clock calls. */
+#define CLUSTER_UNDO_RECEIPT_CONSUME_TRACE_PRESENT 1
+typedef struct UndoReceiptConsumerTrace {
+	ClusterCtrcReceiptHandle handles[CLUSTER_UNDO_RECORD_CTRC_TARGETS];
+	ClusterCtrcTargetV1 final_targets[CLUSTER_UNDO_RECORD_CTRC_TARGETS];
+	ClusterUndoRecordTarget data_target;
+	UBA uba;
+	uint64 sequence, sample_sequence;
+	uint32 attempt;
+	uint32 apply_calls[CLUSTER_UNDO_RECORD_CTRC_TARGETS];
+	int shared_result[CLUSTER_UNDO_RECORD_CTRC_TARGETS];
+	uint8 attempted, shared_known, sync_known, sync_ok, reuse_mask, applied_mask;
+	int ref_slot;
+	bool owns_ref, consume_locked, consume_succeeded, valid;
+} UndoReceiptConsumerTrace;
+
+static UndoReceiptConsumerTrace undo_receipt_consumer_trace;
+static uint64 undo_receipt_consumer_sequence;
+static uint64 undo_receipt_consumer_overwritten;
+static uint64 undo_receipt_consumer_critical_skipped;
+static uint64 undo_receipt_consumer_lwlock_skipped;
+
+static void
+undo_receipt_consumer_trace_begin(const ClusterUndoRecordPrepareReceipt *receipt,
+								 uint8 ordinal, const ClusterCtrcTargetV1 *target)
+{
+	UndoReceiptConsumerTrace *sample = &undo_receipt_consumer_trace;
+	const ClusterCtrcReceiptHandle *handle = &receipt->ctrc_handles[ordinal];
+
+	if (!sample->valid || sample->sequence != receipt->reservation_sequence
+		|| sample->attempt != receipt->ctrc_attempt_generation
+		|| memcmp(&sample->handles[ordinal].key, &handle->key, sizeof(handle->key)) != 0
+		|| sample->handles[ordinal].participant_index != handle->participant_index
+		|| sample->handles[ordinal].receipt_index != handle->receipt_index
+		|| sample->handles[ordinal].journal_slot_generation != handle->journal_slot_generation) {
+		if (sample->valid && undo_receipt_consumer_overwritten != UINT64_MAX)
+			undo_receipt_consumer_overwritten++;
+		MemSet(sample, 0, sizeof(*sample));
+		if (undo_receipt_consumer_sequence != UINT64_MAX)
+			undo_receipt_consumer_sequence++;
+		sample->sample_sequence = undo_receipt_consumer_sequence;
+		sample->sequence = receipt->reservation_sequence;
+		sample->attempt = receipt->ctrc_attempt_generation;
+		memcpy(sample->handles, receipt->ctrc_handles, sizeof(sample->handles));
+		sample->valid = true;
+	}
+	sample->attempted |= UINT8_C(1) << ordinal;
+	sample->shared_known &= ~(UINT8_C(1) << ordinal);
+	sample->sync_known &= ~(UINT8_C(1) << ordinal);
+	sample->sync_ok &= ~(UINT8_C(1) << ordinal);
+	sample->shared_result[ordinal] = 0;
+	if (sample->apply_calls[ordinal] != UINT32_MAX)
+		sample->apply_calls[ordinal]++;
+	sample->reuse_mask = receipt->ctrc_reuse_mask;
+	sample->applied_mask = receipt->ctrc_applied_mask;
+	sample->final_targets[ordinal] = *target;
+	sample->ref_slot = cluster_undo_record_reservation.ref_slot;
+	sample->owns_ref = cluster_undo_record_reservation.owns_ref;
+	sample->consume_locked = cluster_undo_record_reservation.consume_locked;
+}
+
+static void
+undo_receipt_consumer_trace_result(const ClusterUndoRecordPrepareReceipt *receipt,
+								  uint8 ordinal, ClusterCtrcApplyResult result, int synced)
+{
+	UndoReceiptConsumerTrace *sample = &undo_receipt_consumer_trace;
+	uint8 bit = UINT8_C(1) << ordinal;
+
+	if (!sample->valid || sample->sequence != receipt->reservation_sequence
+		|| sample->attempt != receipt->ctrc_attempt_generation)
+		return;
+	sample->shared_known |= bit;
+	sample->shared_result[ordinal] = (int)result;
+	if (synced >= 0) {
+		sample->sync_known |= bit;
+		if (synced != 0)
+			sample->sync_ok |= bit;
+	}
+	sample->applied_mask = receipt->ctrc_applied_mask;
+}
+
+static void
+undo_receipt_consumer_trace_consumed(const ClusterUndoRecordPrepareReceipt *receipt,
+									const ClusterUndoRecordTarget *target, UBA uba)
+{
+	UndoReceiptConsumerTrace *sample = &undo_receipt_consumer_trace;
+
+	if (!sample->valid || sample->sequence != receipt->reservation_sequence
+		|| sample->attempt != receipt->ctrc_attempt_generation)
+		return;
+	sample->data_target = *target;
+	sample->uba = uba;
+	sample->applied_mask = receipt->ctrc_applied_mask;
+	sample->consume_succeeded = true;
+}
+
+static void
+undo_receipt_consumer_trace_flush(const char *stage)
+{
+	UndoReceiptConsumerTrace sample;
+	bool held = false;
+	struct timespec now;
+	uint64 mono_us = 0;
+	char uba[2 * sizeof(sample.uba) + 1];
+	static const char hex[] = "0123456789abcdef";
+
+	if (!cluster_trace_normal_stop) {
+		/* Diagnostic state owns no reference or other retirement duty. */
+		if (undo_receipt_consumer_trace.valid)
+			MemSet(&undo_receipt_consumer_trace, 0, sizeof(undo_receipt_consumer_trace));
+		return;
+	}
+	if (!undo_receipt_consumer_trace.valid)
+		return;
+	if (CritSectionCount != 0) {
+		if (undo_receipt_consumer_critical_skipped != UINT64_MAX)
+			undo_receipt_consumer_critical_skipped++;
+		return;
+	}
+	ForEachLWLockHeldByMe(undo_receipt_trace_note_lwlock, &held);
+	if (held) {
+		if (undo_receipt_consumer_lwlock_skipped != UINT64_MAX)
+			undo_receipt_consumer_lwlock_skipped++;
+		return;
+	}
+	if (clock_gettime(CLOCK_MONOTONIC, &now) == 0 && now.tv_sec >= 0
+		&& (uint64)now.tv_sec <= (UINT64_MAX - 999999) / 1000000)
+		mono_us = (uint64)now.tv_sec * 1000000 + (uint64)now.tv_nsec / 1000;
+	sample = undo_receipt_consumer_trace;
+	/* LOG ERROR may truncate this output, but cannot replay it or change
+	 * the original reservation/pending/shared owner. No shared dereference. */
+	MemSet(&undo_receipt_consumer_trace, 0, sizeof(undo_receipt_consumer_trace));
+	for (unsigned i = 0; i < sizeof(sample.uba); i++) {
+		uint8 value = ((const uint8 *)&sample.uba)[i];
+		uba[2 * i] = hex[value >> 4]; uba[2 * i + 1] = hex[value & 15];
+	}
+	uba[sizeof(uba) - 1] = '\0';
+	for (uint8 ordinal = 0; ordinal < CLUSTER_UNDO_RECORD_CTRC_TARGETS; ordinal++) {
+		uint8 bit = UINT8_C(1) << ordinal;
+		const ClusterCtrcReceiptHandle *handle = &sample.handles[ordinal];
+		const ClusterCtrcTxnKeyV1 *key = &handle->key;
+		const ClusterCtrcTargetV1 *target = &sample.final_targets[ordinal];
+
+		if ((sample.attempted & bit) == 0)
+			continue;
+		ereport(LOG, (errmsg_internal(
+			"PGRAC_FAMILY=CTRC_CONSUME event=deferred_apply_consume emit_stage=%s "
+			"event_seq=" UINT64_FORMAT " sequence_scope=process sequence_domain=CTRC_CONSUME "
+			"node_id=%d pid=%d procno=%d backend_id=%d backend_type=%d wall_us=" INT64_FORMAT
+			" monotonic_us=" UINT64_FORMAT " capture_clock_known=0 identity_source=owned_handle_projection "
+			"run_id_known=0 process_incarnation_known=0 full_xid_known=0 "
+			"authoritative=0 shared_retired_known=0 shared_state_known=0 "
+			"consumer_sequence=" UINT64_FORMAT " attempt=%u target_ordinal=%u route_retarget=%d "
+			"key_known=%d system_identifier=" UINT64_FORMAT " origin_node_id=%u owner_instance=%u "
+			"origin_boot_incarnation=" UINT64_FORMAT " cluster_epoch=%u formation_epoch=" UINT64_FORMAT
+			" admission_record_generation=" UINT64_FORMAT " root_descriptor_incarnation=" UINT64_FORMAT
+			" root_id=" UINT64_FORMAT " root_generation=" UINT64_FORMAT
+			" segment_id=%u segment_generation=%u tt_slot_offset=%u tt_wrap=%u raw_xid=%u "
+			"participant_index=" UINT64_FORMAT " receipt_index=" UINT64_FORMAT
+			" journal_slot_generation=" UINT64_FORMAT
+			" apply_call_count=%u shared_result_known=%d shared_result=%d local_sync_known=%d local_sync_ok=%d "
+			"applied_mask=%u consume_result_known=%d consume_succeeded=%d consume_refusal_observed=0 "
+			"capture_ref_slot=%d capture_ref_owned=%d capture_consume_locked=%d "
+			"final_spc=%u final_db=%u final_rel=%u final_fork=%d final_block=%u "
+			"final_itl_slot=%u final_itl_wrap=%u final_itl_xid=%u final_page_lsn=" UINT64_FORMAT
+			" final_page_scn=" UINT64_FORMAT " data_target_known=%d "
+			"data_spc=%u data_db=%u data_rel=%u data_fork=%d data_block=%u data_offset=%u "
+			"consumed_uba_raw=%s overwritten=" UINT64_FORMAT " critical_skipped=" UINT64_FORMAT
+			" lwlock_skipped=" UINT64_FORMAT " sequence_exhausted=%d",
+			stage, sample.sample_sequence, cluster_node_id, (int)getpid(),
+			MyProc != NULL ? MyProc->pgprocno : -1, (int)MyBackendId, (int)MyBackendType,
+			GetCurrentTimestamp(), mono_us, sample.sequence, sample.attempt, ordinal, (sample.reuse_mask & bit) != 0,
+			handle->valid, key->system_identifier, key->origin_node_id, key->owner_instance,
+			key->origin_boot_incarnation, key->cluster_epoch, key->formation_epoch,
+			key->admission_record_generation, key->root_descriptor_incarnation, key->root_id,
+			key->root_generation, key->segment_id, key->segment_generation, key->slot_offset,
+			key->slot_wrap, key->xid, handle->participant_index, handle->receipt_index,
+			handle->journal_slot_generation, sample.apply_calls[ordinal],
+			(sample.shared_known & bit) != 0, sample.shared_result[ordinal],
+			(sample.sync_known & bit) != 0, (sample.sync_ok & bit) != 0, sample.applied_mask,
+			sample.consume_succeeded, sample.consume_succeeded, sample.ref_slot, sample.owns_ref, sample.consume_locked,
+			target->spc_oid, target->db_oid, target->rel_number, target->fork_number,
+			target->block_number, target->itl_slot_index, target->itl_slot_wrap, target->itl_xid,
+			target->predecessor_page_lsn, target->predecessor_page_scn, sample.consume_succeeded,
+			sample.data_target.locator.spcOid, sample.data_target.locator.dbOid,
+			sample.data_target.locator.relNumber, sample.data_target.forknum,
+			sample.data_target.blockno, sample.data_target.offnum, uba, undo_receipt_consumer_overwritten,
+			undo_receipt_consumer_critical_skipped, undo_receipt_consumer_lwlock_skipped,
+			sample.sample_sequence == UINT64_MAX)));
+	}
+}
+
 /* Explain the original short circuit only after it has refused. These inputs
  * are backend-local and unchanged between the predicate and this diagnostic. */
 static void
@@ -3022,6 +3215,7 @@ cluster_undo_record_ctrc_prepare_pending(ClusterUndoRecordPrepareReceipt *receip
 	uint8 target_bit;
 	bool owner_exact;
 
+	undo_receipt_consumer_trace_flush("next_prepare");
 	cluster_undo_receipt_reason = "CTRC_PENDING_IDENTITY_MISMATCH";
 	if (target_ordinal >= CLUSTER_UNDO_RECORD_CTRC_TARGETS) {
 		if (cluster_trace_normal_stop)
@@ -3147,17 +3341,26 @@ cluster_undo_record_ctrc_apply_prepared(ClusterUndoRecordPrepareReceipt *receipt
 	/* PGRAC: even a refusal or failed local mask sync cannot prove that
 	 * an attempted shared APPLY/retarget had no effect. */
 	cluster_undo_record_reservation.apply_attempted = true;
+	if (cluster_trace_normal_stop)
+		undo_receipt_consumer_trace_begin(receipt, target_ordinal, final_target);
 	result = (receipt->ctrc_reuse_mask & target_bit) != 0
 				 ? cluster_ctrc_receipt_retarget_itl_shared(
 					   &receipt->ctrc_handles[target_ordinal],
 					   &receipt->ctrc_pending_targets[target_ordinal], final_target, token)
 				 : cluster_ctrc_receipt_apply_shared(&receipt->ctrc_handles[target_ordinal],
 													 final_target, token);
+	if (cluster_trace_normal_stop)
+		undo_receipt_consumer_trace_result(receipt, target_ordinal, result, -1);
 	if (result != CLUSTER_CTRC_APPLY_APPLIED)
 		return result;
 	receipt->ctrc_applied_mask |= target_bit;
-	if (!cluster_undo_record_receipt_sync(receipt))
+	if (!cluster_undo_record_receipt_sync(receipt)) {
+		if (cluster_trace_normal_stop)
+			undo_receipt_consumer_trace_result(receipt, target_ordinal, result, 0);
 		return CLUSTER_CTRC_APPLY_FAIL_CLOSED;
+	}
+	if (cluster_trace_normal_stop)
+		undo_receipt_consumer_trace_result(receipt, target_ordinal, result, 1);
 	return CLUSTER_CTRC_APPLY_APPLIED;
 }
 
@@ -3701,6 +3904,8 @@ cluster_undo_record_consume_prepared(ClusterUndoRecordPrepareReceipt *receipt,
 						receipt->tt_slot_offset, new_slot_idx);
 	cluster_undo_local_heads[local_head_idx].head = result;
 	*out_uba = result;
+	if (cluster_trace_normal_stop)
+		undo_receipt_consumer_trace_consumed(receipt, target, result);
 	memset(&reservation->receipt, 0, sizeof(reservation->receipt));
 	memset(receipt, 0, sizeof(*receipt));
 	return CLUSTER_UNDO_RECORD_CONSUME_APPLIED;
@@ -3871,6 +4076,8 @@ cluster_undo_xact_precommit_flush(void)
 						errmsg("cluster undo block remained pending before transaction finish"),
 						errhint("Retry the transaction and inspect the server log for an undo WAL "
 								"flush failure.")));
+
+	undo_receipt_consumer_trace_flush("precommit_after_pending");
 
 	if (cluster_undo_touched_seg_count == 0)
 		return;
