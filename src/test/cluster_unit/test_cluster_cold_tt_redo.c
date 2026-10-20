@@ -4390,6 +4390,85 @@ UT_TEST(tt_top_tx_c0_producer_checks_original_native_bind_frame)
 	}
 }
 
+/* Exact ordinary abort belongs to its own physical slot, not the selected
+ * loser's BIND. Retained history has no surviving target to borrow either.
+ * Native abort may omit the WAL actor; a present actor must name its owner. */
+static void
+tt_top_tx_exact_abort_frame_cases(bool history)
+{
+	for (int mode = 0; mode < 9; mode++) {
+		TtRedoFixture f;
+		FakeXactRecord fake;
+		RfSideOnlineOperationV1 captured;
+		xl_undo_tt_slot_abort_exact abort = { 0 };
+		TransactionId actor = 804, top = InvalidTransactionId;
+
+		if (mode == 1)
+			top = 804;
+		if (mode == 2 || mode == 5)
+			actor = InvalidTransactionId;
+		if (mode == 3 || mode == 4 || mode == 8)
+			actor = 805;
+		if (mode == 3 || mode == 6)
+			top = 805;
+		if (mode == 5 || mode == 8)
+			top = 804;
+		if (mode == 7)
+			actor = FrozenTransactionId;
+
+		tt_top_tx_initialized_fixture(&f, history ? 200 : 400, 100, history ? 3 : 2);
+		tt_top_tx_frame_bind(&fake, 4, 802, 802, 802);
+		undo_header_feed(f.typed.side_plans[0], &fake, 200);
+		if (history)
+			tt_redo_history_plan(&f, 100, 200, 200, RF_SIDE_PLAN_RECOVERY, false);
+		else {
+			tt_top_tx_frame_bind(&fake, 47, 804, 804, 804);
+			undo_header_feed(f.typed.side_plans[0], &fake, 300);
+		}
+		abort.instance = 3;
+		abort.segment_id = 513;
+		abort.segment_generation = 0;
+		abort.slot_offset = 47;
+		abort.wrap = 5;
+		abort.xid = 804;
+		abort.format_version = CLUSTER_UNDO_TT_ABORT_EXACT_VERSION;
+		make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_ABORT, &abort,
+							   sizeof(abort));
+		fake.u.decoded.header.xl_xid = actor;
+		fake.u.decoded.toplevel_xid = top;
+		if (history) {
+			tt_redo_history_feed(&f, &fake);
+			UT_ASSERT_EQ(rf_side_online_plan_seal_v1(f.typed.side_plans[1]),
+						 RF_PAGE_PROOF_DETAIL_OK);
+		} else
+			undo_header_feed(f.typed.side_plans[0], &fake, 400);
+		/* A later reader buffer cannot repair the captured operation. */
+		fake.u.decoded.header.xl_xid = fake.u.decoded.toplevel_xid = 804;
+		/* frame_expect seals replay and checks exact physical TT readback
+		 * before exercising the real C0 producer and its zero-output refusal. */
+		tt_top_tx_frame_expect(&f, mode < 3);
+		UT_ASSERT(rf_side_online_plan_operation_v1(f.typed.side_plans[history ? 1 : 0],
+												   history ? 0 : 3, &captured));
+		UT_ASSERT_EQ(captured.undo.kind, CLUSTER_UNDO_KIND_TT_ABORT);
+		UT_ASSERT_EQ(captured.undo.format_version, CLUSTER_UNDO_TT_ABORT_EXACT_VERSION);
+		UT_ASSERT_EQ(captured.undo.xid, 804);
+		UT_ASSERT_EQ(captured.source_xid, actor);
+		UT_ASSERT_EQ(captured.source_top_xid, top);
+		UT_ASSERT_EQ(captured.history_only, history);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_top_tx_c0_producer_checks_original_exact_abort_frame)
+{
+	tt_top_tx_exact_abort_frame_cases(false);
+}
+
+UT_TEST(tt_top_tx_c0_producer_checks_retained_exact_abort_frame)
+{
+	tt_top_tx_exact_abort_frame_cases(true);
+}
+
 UT_TEST(tt_top_tx_c0_producer_checks_each_operations_own_top)
 {
 	for (int fault = 0; fault < 2; fault++) {
@@ -6338,7 +6417,7 @@ UT_TEST(tt_top_tx_c0_producer_rechecks_before_output)
 int
 main(void)
 {
-	UT_PLAN(136);
+	UT_PLAN(138);
 	UT_RUN(tt_top_tx_c0_producer_requires_each_replay_page_creator);
 	UT_RUN(tt_top_tx_c0_producer_requires_each_replay_page_actor);
 	UT_RUN(tt_top_tx_c0_producer_checks_page_frames);
@@ -6365,6 +6444,8 @@ main(void)
 	UT_RUN(tt_top_tx_c0_producer_requires_original_checkpoint);
 	UT_RUN(tt_top_tx_c0_producer_derives_top_from_native_bind);
 	UT_RUN(tt_top_tx_c0_producer_checks_original_native_bind_frame);
+	UT_RUN(tt_top_tx_c0_producer_checks_original_exact_abort_frame);
+	UT_RUN(tt_top_tx_c0_producer_checks_retained_exact_abort_frame);
 	UT_RUN(tt_top_tx_c0_producer_checks_each_operations_own_top);
 	UT_RUN(tt_top_tx_c0_producer_checks_retained_history_frame);
 	UT_RUN(tt_top_tx_c0_producer_refuses_conflicting_bind_history);

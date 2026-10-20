@@ -692,11 +692,14 @@ cold_top_tx_frames_v1(const ClusterColdTypedV1 *typed)
 			if (!rf_side_online_plan_operation_v1(plan, i, &operation)
 				|| !cold_top_tx_frame_xids_v1(operation.source_xid, operation.source_top_xid))
 				return false;
-			/* The original native BIND emitter receives canonical top xid.
-			 * A present record actor must agree with that operation's durable
-			 * binding, even when this frame omitted top metadata. */
+			/* Native BIND and ordinary exact TT_ABORT persist their own
+			 * slot owner. A present record actor must agree with that xid,
+			 * even when this frame omitted top metadata. An unrelated loser's
+			 * BIND cannot repair a conflicting abort actor. */
 			if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
-				&& operation.undo.kind == CLUSTER_UNDO_KIND_TT_BIND
+				&& (operation.undo.kind == CLUSTER_UNDO_KIND_TT_BIND
+					|| (operation.undo.kind == CLUSTER_UNDO_KIND_TT_ABORT
+						&& operation.undo.format_version == CLUSTER_UNDO_TT_ABORT_EXACT_VERSION))
 				&& TransactionIdIsValid(operation.source_xid)
 				&& operation.source_xid != operation.undo.xid)
 				return false;

@@ -1079,8 +1079,9 @@ extern bool cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
  * complete native lifecycle, sealed redo and exact physical ACTIVE readback,
  * together with the retained terminal checks below. The caller's terminal
  * bit is ignored. Check original SIDE/PAGE/SPACE frame actor/top consistency
- * in every retained source, including history, and any present native BIND actor
- * against that BIND's own durable xid. Replay PAGE INSERT/UPDATE/HOT/MULTI
+ * in every retained source, including history, and any present native BIND or
+ * ordinary exact TT_ABORT actor against that operation's own durable slot xid.
+ * Replay PAGE INSERT/UPDATE/HOT/MULTI
  * additionally require their original creator input; DELETE/LOCK/LOCK_UPDATED
  * require their actor input, each from its own BIND and ACTIVE causal prefix.
  * History frames retain the consistency check; the replay-only PAGE producers
