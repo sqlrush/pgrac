@@ -6524,6 +6524,100 @@ UT_TEST(test_real_source_finish_publishes_only_after_busy_clears_and_preserves_f
 	ClusterPcmOwnArray = saved;
 }
 
+/* Passive MAIN pins do not own a content lock or require a zero-pin drop.
+ * Exercise the actual type-17 begin/drain/unwind bodies with two or three
+ * preexisting pins; a content-lock conflict remains a separate refusal. */
+UT_TEST(test_real_main_revoke_drain_preserves_passive_pins)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot expected;
+	ClusterPcmOwnHeldXRevoke held;
+	PGIOAlignedBlock before;
+
+	for (int passive_pins = 2; passive_pins <= 3; passive_pins++) {
+		transition_fixture(&buf, &entry, &expected, false);
+		buf.pcm_state = PCM_STATE_X;
+		buf.buffer_type = BUF_TYPE_XCUR;
+		pg_atomic_write_u32(&entry.flags, 0);
+		transition_base_pins = transition_pin_count = passive_pins;
+		pg_atomic_fetch_add_u32(&buf.state, passive_pins * BUF_REFCOUNT_ONE);
+		(void)transition_lock_header(&buf);
+		cluster_pcm_own_snapshot_locked(&buf, &expected);
+		UnlockBufHdr(&buf, pg_atomic_read_u32(&buf.state));
+		memcpy(before.data, transition_page.data, BLCKSZ);
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_begin_x_revoke_held_by_tag(
+						 &expected.tag, &expected, &held), CLUSTER_PCM_OWN_OK);
+		UT_ASSERT_EQ(transition_pin_count, passive_pins + 1);
+		transition_content_busy = true;
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_try_drain_held_x_revoke(&held),
+					 CLUSTER_PCM_OWN_BUSY);
+		UT_ASSERT_EQ(transition_pin_count, passive_pins + 1);
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_validate_held_x_revoke(&held), CLUSTER_PCM_OWN_OK);
+		transition_content_busy = false;
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_try_drain_held_x_revoke(&held), CLUSTER_PCM_OWN_OK);
+		UT_ASSERT_EQ(transition_pin_count, passive_pins + 1);
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_abort_held_x_revoke(&held), CLUSTER_PCM_OWN_OK);
+		UT_ASSERT_EQ(held.flags, 0);
+		UT_ASSERT_EQ(transition_pin_count, passive_pins);
+		UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf.state)), passive_pins);
+		UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_X);
+		UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
+		UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), expected.generation);
+		UT_ASSERT(BufferTagsEqual(&buf.tag, &expected.tag));
+		UT_ASSERT_EQ(memcmp(before.data, transition_page.data, BLCKSZ), 0);
+		UT_ASSERT(!transition_mapping_held && !transition_content_held);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+/* This is the real retained completion, independently of the begin/unwind
+ * case above. It does not simulate a remote transfer or a sleeping TX. */
+UT_TEST(test_real_main_revoke_finish_retains_passive_pins)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot revoking;
+	ClusterPcmOwnSnapshot retained;
+	ClusterPcmOwnFinishRefusal refusal;
+	PGIOAlignedBlock before;
+
+	for (int passive_pins = 2; passive_pins <= 3; passive_pins++) {
+		transition_fixture(&buf, &entry, &revoking, false);
+		buf.pcm_state = PCM_STATE_X;
+		buf.buffer_type = BUF_TYPE_XCUR;
+		transition_base_pins = transition_pin_count = passive_pins;
+		pg_atomic_fetch_add_u32(&buf.state, passive_pins * BUF_REFCOUNT_ONE);
+		(void)transition_lock_header(&buf);
+		cluster_pcm_own_snapshot_locked(&buf, &revoking);
+		UnlockBufHdr(&buf, pg_atomic_read_u32(&buf.state));
+		memcpy(before.data, transition_page.data, BLCKSZ);
+		transition_content_busy = true;
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_finish_revoke_retain(
+						 &buf, &revoking, UINT64_C(0x12340), &retained, &refusal, NULL),
+					 CLUSTER_PCM_OWN_BUSY);
+		UT_ASSERT_EQ(refusal.reason, CLUSTER_PCM_OWN_FINISH_REFUSAL_CONTENT_LOCK);
+		UT_ASSERT_EQ(transition_pin_count, passive_pins);
+		transition_content_busy = false;
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_finish_revoke_retain(
+						 &buf, &revoking, UINT64_C(0x12340), &retained, &refusal, NULL),
+					 CLUSTER_PCM_OWN_OK);
+		UT_ASSERT_EQ(transition_pin_count, passive_pins);
+		UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf.state)), passive_pins);
+		UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_N);
+		UT_ASSERT_EQ(buf.buffer_type, BUF_TYPE_PI);
+		UT_ASSERT_EQ(retained.generation, revoking.generation + 1);
+		UT_ASSERT(BufferTagsEqual(&retained.tag, &revoking.tag));
+		UT_ASSERT((pg_atomic_read_u32(&buf.state) & (BM_VALID | BM_TAG_VALID))
+				  == (BM_VALID | BM_TAG_VALID));
+		UT_ASSERT_EQ(memcmp(before.data, transition_page.data, BLCKSZ), 0);
+		UT_ASSERT(!transition_mapping_held && !transition_content_held);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
 UT_TEST(test_real_source_pin_is_continuous_across_busy_and_owner_adoption)
 {
 	BufferDesc buf;
@@ -10562,7 +10656,7 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(172);
+	UT_PLAN(174);
 	UT_RUN(test_native_flush_refuses_cr_before_starting_io);
 	UT_RUN(test_shared_leave_releases_dirty_and_clean_x_through_exact_owner);
 	UT_RUN(test_shared_leave_write_and_sync_error_keep_x_and_mapping);
@@ -10628,6 +10722,8 @@ main(void)
 	UT_RUN(test_unbound_output_retry_keeps_native_and_pi_boundaries);
 	UT_RUN(test_real_finish_failed_flush_rethrows_without_losing_fence);
 	UT_RUN(test_real_source_finish_busy_is_owned_wait_not_global_failure);
+	UT_RUN(test_real_main_revoke_drain_preserves_passive_pins);
+	UT_RUN(test_real_main_revoke_finish_retains_passive_pins);
 	UT_RUN(test_real_source_pin_is_continuous_across_busy_and_owner_adoption);
 	UT_RUN(test_real_source_tick_observation_gap_keeps_same_pin_until_completion);
 	UT_RUN(test_real_selected_s_finish_wait_keeps_hard_refusals);
