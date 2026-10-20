@@ -128,6 +128,16 @@ rf_side_xact_children_preflight_v1(TransactionId top, int count, const Transacti
 	return true;
 }
 
+/* Native message kinds are exercised by the real validator in the effects
+ * test. This isolated decoder fixture supplies only its accepted verdict. */
+bool
+rf_side_xact_invalidation_messages_preflight_v1(int count,
+												const SharedInvalidationMessage *messages)
+{
+	UT_ASSERT(count >= 0 && (count == 0 || messages != NULL));
+	return true;
+}
+
 bool
 rf_side_xact_tt_commit_preflight_v1(const xl_xact_tt_commit *delta, uint16 origin_thread,
 									TransactionId xid, SCN scn)

@@ -942,6 +942,17 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 	if (reader == NULL || reader->record == NULL || storage_uuid == NULL || system_identifier == 0)
 		return CLUSTER_COLD_INVALID_ARGUMENT;
 	decoded = reader->record;
+	/* The frozen cold path has no child-to-top effects consumer. Refuse
+	 * conflicting frame identities before even a native/no-effect route can
+	 * export effects or counter inputs; C0 validation after redo is too late.
+	 * Missing top metadata remains neutral, never canonical ownership proof. */
+	if ((TransactionIdIsValid(decoded->header.xl_xid)
+		 && !TransactionIdIsNormal(decoded->header.xl_xid))
+		|| (TransactionIdIsValid(decoded->toplevel_xid)
+			&& (!TransactionIdIsNormal(decoded->toplevel_xid)
+				|| !TransactionIdIsNormal(decoded->header.xl_xid)
+				|| decoded->toplevel_xid != decoded->header.xl_xid)))
+		return CLUSTER_COLD_COMPONENT_INVALID;
 	out->record.read_rec_ptr = reader->ReadRecPtr;
 	out->record.end_rec_ptr = reader->EndRecPtr;
 	out->record.prev_rec_ptr = decoded->header.xl_prev;

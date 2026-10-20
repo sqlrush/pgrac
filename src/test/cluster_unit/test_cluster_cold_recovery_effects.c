@@ -1378,11 +1378,20 @@ UT_TEST(test_real_page_decoder_owns_original_transaction_frame)
 		edge = &r->decoded.page_version_edge.entries[0];
 		edge->page_class = RF_PAGE_CLASS_ORDINARY;
 		memset(edge->result_incarnation, 1, sizeof(edge->result_incarnation));
+		if (TransactionIdIsValid(tops[i]) && actors[i] != tops[i]) {
+			UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r->reader, 99, uuid, false, true, &out),
+						 CLUSTER_COLD_COMPONENT_INVALID);
+			UT_ASSERT_EQ(out.record.source_xid, InvalidTransactionId);
+			UT_ASSERT_EQ(out.record.source_top_xid, InvalidTransactionId);
+			UT_ASSERT_EQ(out.effects.required, 0);
+			UT_ASSERT(!out.xid_input.complete);
+			continue;
+		}
 		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r->reader, 99, uuid, false, true, &out),
 					 CLUSTER_COLD_OK);
 		UT_ASSERT_EQ(out.record.component_count, 1);
-		/* Reusing the reader cannot repair a conflicting frame, supply an
-		 * absent top or change this captured actor into another transaction. */
+		/* Reusing the reader cannot supply an absent top or change this
+		 * captured actor into another transaction. */
 		r->decoded.header.xl_xid = 999;
 		r->decoded.toplevel_xid = 999;
 		UT_ASSERT_EQ(out.record.source_xid, actors[i]);
@@ -2868,7 +2877,13 @@ UT_TEST(test_foreign_terminals_refuse_unconsumed_frame_before_dispatch)
 				else
 					r.decoded.has_page_version_edge = true;
 				detail = cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, true, &out);
-				if (detail == CLUSTER_COLD_OK) {
+				if (field == 1) {
+					/* Canonical frame conflicts now refuse before SIDE routing. */
+					UT_ASSERT_EQ(detail, CLUSTER_COLD_COMPONENT_INVALID);
+					UT_ASSERT_EQ(out.effects.required, 0);
+					UT_ASSERT(!out.xid_input.complete);
+					UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+				} else if (detail == CLUSTER_COLD_OK) {
 					UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
 					UT_ASSERT_EQ(out.effects.refused, out.effects.required);
 					UT_ASSERT_EQ(out.effects.native_apply | out.effects.page_apply
@@ -2982,12 +2997,84 @@ UT_TEST(test_foreign_invalidation_inputs_reject_before_effect_routing)
 	check_bad_invalidation_inputs(true);
 }
 
+UT_TEST(test_canonical_frame_inputs_refuse_before_effect_routing)
+{
+	const TransactionId bad[][2] = { { BootstrapTransactionId, InvalidTransactionId },
+									 { FrozenTransactionId, InvalidTransactionId },
+									 { 100, BootstrapTransactionId },
+									 { 100, FrozenTransactionId },
+									 { InvalidTransactionId, 100 },
+									 { BootstrapTransactionId, 100 },
+									 { FrozenTransactionId, 100 },
+									 { 100, 101 } };
+
+	for (int foreign = 0; foreign <= 1; foreign++)
+		for (uint32 family = 0; family < 3; family++)
+			for (uint32 i = 0; i < lengthof(bad); i++) {
+				EffectRecord r;
+				ClusterColdDecodedV1 out = { 0 };
+				ClusterColdDetailV1 detail;
+
+				if (family == 0)
+					completion(&r, true, 0);
+				else if (family == 1)
+					record_init(&r, RM_XLOG_ID, XLOG_NOOP);
+				else
+					slru_record(&r, 4);
+				/* Complete native payloads must be accepted first: the RED
+				 * concerns only the original frame's canonical input. */
+				UT_ASSERT_EQ(
+					cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, foreign, &out),
+					CLUSTER_COLD_OK);
+				r.decoded.header.xl_xid = bad[i][0];
+				r.decoded.toplevel_xid = bad[i][1];
+				detail = cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, foreign, &out);
+				UT_ASSERT_EQ(detail, CLUSTER_COLD_COMPONENT_INVALID);
+				if (detail != CLUSTER_COLD_COMPONENT_INVALID)
+					continue;
+				UT_ASSERT_EQ(out.effects.required | out.effects.native_apply
+								 | out.effects.page_apply | out.effects.space_apply
+								 | out.effects.no_effect | out.effects.refused,
+							 0);
+				UT_ASSERT(!out.xid_input.complete);
+				UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, !foreign));
+			}
+}
+
+UT_TEST(test_canonical_frame_inputs_keep_absent_and_exact_top_metadata)
+{
+	const TransactionId good[][2] = { { InvalidTransactionId, InvalidTransactionId },
+									  { 100, InvalidTransactionId },
+									  { 100, 100 },
+									  { UINT32_MAX, InvalidTransactionId },
+									  { UINT32_MAX, UINT32_MAX } };
+
+	for (int foreign = 0; foreign <= 1; foreign++)
+		for (uint32 i = 0; i < lengthof(good); i++) {
+			EffectRecord r;
+			ClusterColdDecodedV1 out = { 0 };
+
+			record_init(&r, RM_XLOG_ID, XLOG_NOOP);
+			r.decoded.header.xl_xid = good[i][0];
+			r.decoded.toplevel_xid = good[i][1];
+			UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, uuid, true, foreign, &out),
+						 CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(out.record.source_xid, good[i][0]);
+			UT_ASSERT_EQ(out.record.source_top_xid, good[i][1]);
+			UT_ASSERT_EQ(out.record.record_flags,
+						 foreign ? CLUSTER_COLD_RECORD_FOREIGN_CONTROL : 0);
+			UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, !foreign));
+		}
+}
+
 #include "test_cluster_cold_abort_replay.inc"
 
 int
 main(void)
 {
-	UT_PLAN(82);
+	UT_PLAN(84);
+	UT_RUN(test_canonical_frame_inputs_refuse_before_effect_routing);
+	UT_RUN(test_canonical_frame_inputs_keep_absent_and_exact_top_metadata);
 	UT_RUN(test_invalidation_inputs_preserve_all_transactional_message_kinds);
 	UT_RUN(test_own_invalidation_inputs_reject_unknown_and_nontransactional_messages);
 	UT_RUN(test_foreign_invalidation_inputs_reject_before_effect_routing);

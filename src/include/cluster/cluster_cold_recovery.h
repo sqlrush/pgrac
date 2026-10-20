@@ -653,8 +653,11 @@ typedef struct ClusterColdDecodedV1 {
 	uint32 space_capacity;
 } ClusterColdDecodedV1;
 
-/* Classify one decoded record of the exact source namespace.  Unsupported
- * opcodes and routed side components fail with OPCODE_UNSUPPORTED; SPACE
+/* Classify one decoded record of the exact source namespace. Reserved raw/top
+ * xids, top without raw, and a known child raw/top mismatch fail with
+ * COMPONENT_INVALID before any effect route or counter input is exported.
+ * Absent top metadata is allowed but never proves canonical ownership.
+ * Unsupported opcodes and routed side components fail with OPCODE_UNSUPPORTED; SPACE
  * identity and reservation changes and a commit's relation drops become
  * typed SPACE effects (SPACE_INVALID when malformed or of another
  * namespace); other lifecycle, prepared-transaction and (for another
