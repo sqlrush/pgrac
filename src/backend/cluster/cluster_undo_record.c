@@ -2287,6 +2287,8 @@ undo_receipt_lifecycle_trace(const char *event, const char *predicate,
 	static uint64 event_seq;
 	static uint64 critical_skipped;
 	static uint64 lwlock_skipped;
+	ClusterCtrcReceiptObservation shared;
+	bool shared_observed = false;
 	ClusterCtrcTxnKeyV1 empty_key = {0};
 	ClusterCtrcParticipantIdentity empty_participant = {0};
 	ClusterCtrcPublicationIdV1 empty_publication = {0};
@@ -2298,7 +2300,7 @@ undo_receipt_lifecycle_trace(const char *event, const char *predicate,
 	bool key_known, target_known, held = false;
 	struct timespec now;
 	uint64 mono_us = 0;
-	char uba[33];
+	char uba[33], shared_uba[33];
 	static const char hex[] = "0123456789abcdef";
 
 	if (!cluster_trace_normal_stop)
@@ -2314,6 +2316,12 @@ undo_receipt_lifecycle_trace(const char *event, const char *predicate,
 			lwlock_skipped++;
 		return;
 	}
+	MemSet(&shared, 0, sizeof(shared));
+	/* Original ready registration/local cancellation cleanup already finished.
+	 * Sample no other stage; never add LOG inside shared mutation owners. */
+	if (handle != NULL && handle->valid
+		&& (strcmp(event, "prepare.ready") == 0 || strcmp(event, "cancel.local_retired") == 0))
+		shared_observed = cluster_ctrc_receipt_observe_shared(handle, &shared);
 	key_known = (owner != NULL && owner->exact) || (handle != NULL && handle->valid);
 	key = owner != NULL && owner->exact ? owner->key
 		: handle != NULL && handle->valid ? &handle->key : &empty_key;
@@ -2324,8 +2332,11 @@ undo_receipt_lifecycle_trace(const char *event, const char *predicate,
 	for (unsigned i = 0; i < sizeof(target->uba); i++) {
 		uba[2 * i] = hex[target->uba[i] >> 4];
 		uba[2 * i + 1] = hex[target->uba[i] & 15];
+		shared_uba[2 * i] = hex[shared.target.uba[i] >> 4];
+		shared_uba[2 * i + 1] = hex[shared.target.uba[i] & 15];
 	}
 	uba[32] = '\0';
+	shared_uba[32] = '\0';
 	if (clock_gettime(CLOCK_MONOTONIC, &now) == 0 && now.tv_sec >= 0
 		&& (uint64)now.tv_sec <= (UINT64_MAX - 999999) / 1000000)
 		mono_us = (uint64)now.tv_sec * 1000000 + (uint64)now.tv_nsec / 1000;
@@ -2366,6 +2377,27 @@ undo_receipt_lifecycle_trace(const char *event, const char *predicate,
 		"target_known=%d spc=%u db=%u rel=%u fork=%d block=%u "
 		"page_lsn=" UINT64_FORMAT " page_scn=" UINT64_FORMAT
 		" itl_slot=%u itl_wrap=%u itl_xid=%u offset=%u itemid_flags=%u uba=%s "
+		"shared_sample_observed=%d shared_mutable_atomic=0 shared_sample_state_before=%u "
+		"shared_sample_state_after=%u shared_participant_state=%u shared_participant_boot=" UINT64_FORMAT
+		" shared_grant=%u shared_publication_grant=%u shared_journal_sequence=" UINT64_FORMAT
+		" shared_key_sequence=" UINT64_FORMAT " shared_journal_generation=" UINT64_FORMAT
+		" shared_operation=" UINT64_FORMAT " shared_receipt_count=" UINT64_FORMAT
+		" shared_prepared_count=" UINT64_FORMAT " shared_applied_count=" UINT64_FORMAT
+		" shared_cancelled_count=" UINT64_FORMAT " shared_cleaned_count=" UINT64_FORMAT
+		" shared_ack_frozen_count=" UINT64_FORMAT " shared_seal_generation=" UINT64_FORMAT
+		" shared_last_key_sequence=" UINT64_FORMAT " shared_disposition=%u shared_local_lsn=" UINT64_FORMAT
+		" shared_sample_kind=%u shared_sample_spc=%u shared_sample_db=%u shared_sample_rel=%u "
+		"shared_sample_fork=%d shared_sample_block=%u shared_sample_itl_wrap=%u shared_sample_itl_xid=%u "
+		"shared_key_matches_reported=%d shared_participant_node=%u shared_participant_capability=%u "
+		"shared_participant_formation=" UINT64_FORMAT " shared_participant_admission=" UINT64_FORMAT
+		" shared_wire_request=" UINT64_FORMAT " shared_attempt=%u shared_requester_backend=%d "
+		"shared_requester_node=%u shared_requester_boot=" UINT64_FORMAT
+		" shared_requester_capability=%u shared_descriptor_hash=" UINT64_FORMAT
+		" shared_member_ordinal=%u shared_member_role=%u shared_reference_kind=%u shared_publication_kind=%u "
+		"shared_sample_itl_slot=%u shared_sample_offset=%u shared_sample_itemid_flags=%u "
+		"shared_sample_page_lsn=" UINT64_FORMAT " shared_sample_page_scn=" UINT64_FORMAT
+		" shared_sample_own_generation=" UINT64_FORMAT " shared_sample_acquisition_epoch=" UINT64_FORMAT
+		" shared_sample_uba=%s "
 		"trace_critical_skipped=" UINT64_FORMAT " trace_lwlock_skipped=" UINT64_FORMAT
 		" trace_sequence_exhausted=%d",
 		event, predicate, event_seq, cluster_node_id, (int)getpid(),
@@ -2411,6 +2443,27 @@ undo_receipt_lifecycle_trace(const char *event, const char *predicate,
 		target->fork_number, target->block_number, target->predecessor_page_lsn,
 		target->predecessor_page_scn, target->itl_slot_index, target->itl_slot_wrap,
 		target->itl_xid, target->offset_number, target->itemid_flags, uba,
+		shared_observed, shared.state_before, shared.state_after, shared.participant_state,
+		shared.participant.boot_incarnation, shared.grant_generation, shared.publication.grant_generation,
+		shared.publication.journal_sequence, shared.publication.key_sequence,
+		shared.publication.journal_slot_generation, shared.publication.operation_id,
+		shared.receipt_count, shared.prepared_count, shared.applied_count, shared.cancelled_count,
+		shared.cleaned_count, shared.ack_frozen_count, shared.seal_generation, shared.last_key_sequence,
+		shared.disposition, (uint64)shared.highest_local_wal_lsn, shared.target.kind,
+		shared.target.spc_oid, shared.target.db_oid, shared.target.rel_number,
+		shared.target.fork_number, shared.target.block_number, shared.target.itl_slot_wrap,
+		shared.target.itl_xid,
+		shared_observed && key_known && memcmp(key, &shared.key, sizeof(*key)) == 0,
+		shared.participant.node_id, shared.participant.capability_record_generation,
+		shared.participant.formation_epoch, shared.participant.admission_record_generation,
+		shared.publication.wire_request_id, shared.publication.attempt_generation,
+		shared.publication.requester_backend_id, shared.publication.requester_node_id,
+		shared.publication.requester_boot_incarnation, shared.publication.capability_record_generation,
+		shared.publication.descriptor_hash, shared.publication.member_ordinal,
+		shared.publication.member_role, shared.publication.reference_kind, shared.publication.target_kind,
+		shared.target.itl_slot_index, shared.target.offset_number, shared.target.itemid_flags,
+		shared.target.predecessor_page_lsn, shared.target.predecessor_page_scn,
+		shared.target.publication_own_generation, shared.target.publication_acquisition_epoch, shared_uba,
 		critical_skipped, lwlock_skipped, event_seq == UINT64_MAX)));
 }
 

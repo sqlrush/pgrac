@@ -7994,7 +7994,7 @@ test_cluster_r4_scratch_resolver: test_cluster_r4_scratch_resolver.c unit_test.h
 
 # spec-3.7 D12: test_cluster_undo_record — 12 encode/decode round-trip
 # tests for UndoRecordHeader + 4 payloads + slot dir addressing.
-test_cluster_undo_ctrc_product.o: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
+test_cluster_undo_ctrc_product.o: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		-DCLUSTER_CTRC_UNIT_TEST=1 \
@@ -8002,6 +8002,7 @@ test_cluster_undo_ctrc_product.o: $(top_srcdir)/src/backend/cluster/cluster_term
 		-Dcluster_ctrc_receipt_apply_shared=undo_ctrc_unavailable_apply_shared \
 		-Dcluster_ctrc_receipt_retarget_itl_shared=undo_ctrc_unavailable_retarget_shared \
 		-Dcluster_ctrc_receipt_cancel_shared=undo_ctrc_unavailable_cancel_shared \
+		-Dcluster_ctrc_receipt_observe_shared=undo_ctrc_unavailable_observe_shared \
 		-c $< -o $@
 
 test_cluster_undo_record: test_cluster_undo_record.c unit_test.h \

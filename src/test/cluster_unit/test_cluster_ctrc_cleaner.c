@@ -28,6 +28,9 @@
 #include "storage/lwlock.h"
 #include "storage/spin.h"
 
+static int observe_busy_kind;
+static unsigned observe_conditional_calls;
+volatile uint32 CritSectionCount;
 static unsigned spin_acquisitions;
 static unsigned sleepable_acquisitions;
 static unsigned held_count;
@@ -366,6 +369,23 @@ LWLockRelease(LWLock *lock)
 	test_lock_leave(lock);
 }
 
+void
+ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *context)
+{
+	for (unsigned i = 0; i < held_count; i++)
+		callback((LWLock *)held_locks[i], LW_SHARED, context);
+}
+
+bool
+LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
+{
+	observe_conditional_calls++;
+	if ((observe_busy_kind == 1 && lock->tranche == LWTRANCHE_CLUSTER_CTRC_PARTICIPANT)
+		|| (observe_busy_kind == 2 && lock == &CtrcShared->receipt_lock))
+		return false;
+	return LWLockAcquire(lock, mode);
+}
+
 static int
 test_clock_gettime(clockid_t clock_id pg_attribute_unused(), struct timespec *ts)
 {
@@ -450,6 +470,9 @@ static void
 reset_fixture(void)
 {
 	MyBackendType = B_BACKEND;
+	observe_busy_kind = 0;
+	observe_conditional_calls = 0;
+	CritSectionCount = 0;
 	allow_new_service_participant = true;
 	new_service_participant_calls = 0;
 	external_lock_hook = NULL;
@@ -2884,6 +2907,186 @@ UT_TEST(test_normal_stop_close_validation_and_local_caller_are_not_service_admis
 	UT_ASSERT_EQ(held_count, 0);
 }
 
+UT_TEST(test_receipt_observation_exact_prepare_is_read_only)
+{
+#ifdef CLUSTER_CTRC_RECEIPT_OBSERVER_PRESENT
+	ClusterCtrcReceiptHandle h;
+	ClusterCtrcReceiptObservation seen;
+	ClusterCtrcParticipantEntry before_part;
+	ClusterCtrcReceipt before_receipt;
+	reset_fixture();
+	UT_ASSERT_EQ(prepare_fixture_receipt(seed_origin(0, 1), 123, &h), CLUSTER_CTRC_PREPARE_READY);
+	before_part = *h.participant; before_receipt = *h.receipt;
+	UT_ASSERT(cluster_ctrc_receipt_observe_shared(&h, &seen));
+	UT_ASSERT_EQ(seen.state_before, CTRC_RECEIPT_PREPARED);
+	UT_ASSERT_EQ(seen.state_after, CTRC_RECEIPT_PREPARED);
+	UT_ASSERT_EQ(seen.publication.operation_id, 123);
+	UT_ASSERT(seen.publication.journal_sequence != 0);
+	UT_ASSERT(seen.publication.key_sequence != 0);
+	UT_ASSERT_EQ(seen.publication.journal_slot_generation, h.journal_slot_generation);
+	UT_ASSERT_EQ(seen.prepared_count, 1);
+	UT_ASSERT_EQ(seen.target.rel_number, 9001);
+	UT_ASSERT_EQ(memcmp(&seen.key, &h.key, sizeof(h.key)), 0);
+	UT_ASSERT_EQ(memcmp(&seen.publication, &before_receipt.publication, sizeof(seen.publication)), 0);
+	UT_ASSERT_EQ(memcmp(&seen.participant, &before_part.identity, sizeof(seen.participant)), 0);
+	UT_ASSERT_EQ(memcmp(h.participant, &before_part, sizeof(before_part)), 0);
+	UT_ASSERT_EQ(memcmp(h.receipt, &before_receipt, sizeof(before_receipt)), 0);
+	UT_ASSERT_EQ(last_pool_mode, LW_SHARED);
+	UT_ASSERT_EQ(held_count, 0);
+#else
+	UT_ASSERT(false); /* Parent lacks the diagnostic, not a substitute verdict. */
+#endif
+}
+
+UT_TEST(test_receipt_observation_real_cancel_keeps_publication_binding)
+{
+#ifdef CLUSTER_CTRC_RECEIPT_OBSERVER_PRESENT
+	ClusterCtrcReceiptHandle h;
+	ClusterCtrcReceiptObservation seen;
+	reset_fixture();
+	UT_ASSERT_EQ(prepare_fixture_receipt(seed_origin(0, 1), 124, &h), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(cluster_ctrc_receipt_cancel_shared(&h));
+	UT_ASSERT(cluster_ctrc_receipt_observe_shared(&h, &seen));
+	UT_ASSERT_EQ(seen.state_before, CTRC_RECEIPT_CANCELLED);
+	UT_ASSERT_EQ(seen.state_after, CTRC_RECEIPT_CANCELLED);
+	UT_ASSERT_EQ(seen.prepared_count, 0);
+	UT_ASSERT_EQ(seen.cancelled_count, 1);
+	UT_ASSERT_EQ(seen.disposition, CTRC_RELEASE_CANCELLED_PREMUTATION);
+	UT_ASSERT_EQ(seen.publication.operation_id, 124);
+	UT_ASSERT_EQ(held_count, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_receipt_observation_duplicate_keeps_same_shared_sequence)
+{
+#ifdef CLUSTER_CTRC_RECEIPT_OBSERVER_PRESENT
+	ClusterCtrcReceiptHandle a, b;
+	ClusterCtrcReceiptObservation x, y;
+	ClusterCtrcOriginEntry *origin;
+	reset_fixture(); origin = seed_origin(0, 1);
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 125, &a), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(cluster_ctrc_receipt_observe_shared(&a, &x));
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 125, &b), CLUSTER_CTRC_PREPARE_DUPLICATE);
+	UT_ASSERT(cluster_ctrc_receipt_observe_shared(&b, &y));
+	UT_ASSERT_EQ(x.publication.journal_sequence, y.publication.journal_sequence);
+	UT_ASSERT_EQ(x.publication.key_sequence, y.publication.key_sequence);
+	UT_ASSERT_EQ(y.receipt_count, 1);
+	UT_ASSERT_EQ(held_count, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_receipt_observation_stale_or_foreign_handle_never_borrows_state)
+{
+#ifdef CLUSTER_CTRC_RECEIPT_OBSERVER_PRESENT
+	for (int leg = 0; leg < 4; leg++) {
+		ClusterCtrcReceiptHandle h, bad;
+		ClusterCtrcReceiptObservation seen, zero = {0};
+		reset_fixture();
+		UT_ASSERT_EQ(prepare_fixture_receipt(seed_origin(0, 1), 126, &h), CLUSTER_CTRC_PREPARE_READY);
+		bad = h;
+		if (leg == 0) bad.key.slot_wrap++;
+		if (leg == 1) bad.journal_slot_generation++;
+		if (leg == 2) bad.receipt = (ClusterCtrcReceipt *)(uintptr_t)1;
+		if (leg == 3) bad.participant_index = UINT64_MAX;
+		memset(&seen, 0x7f, sizeof(seen));
+		UT_ASSERT(!cluster_ctrc_receipt_observe_shared(&bad, &seen));
+		UT_ASSERT_EQ(memcmp(&seen, &zero, sizeof(seen)), 0);
+		UT_ASSERT_EQ(h.receipt->state, CTRC_RECEIPT_PREPARED);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_receipt_observation_busy_locks_return_unknown_without_wait)
+{
+#ifdef CLUSTER_CTRC_RECEIPT_OBSERVER_PRESENT
+	for (int leg = 1; leg <= 2; leg++) {
+		ClusterCtrcReceiptHandle h;
+		ClusterCtrcReceiptObservation seen, zero = {0};
+		reset_fixture();
+		UT_ASSERT_EQ(prepare_fixture_receipt(seed_origin(0, 1), 127, &h), CLUSTER_CTRC_PREPARE_READY);
+		observe_busy_kind = leg;
+		memset(&seen, 0x7f, sizeof(seen));
+		UT_ASSERT(!cluster_ctrc_receipt_observe_shared(&h, &seen));
+		UT_ASSERT_EQ(memcmp(&seen, &zero, sizeof(seen)), 0);
+		UT_ASSERT_EQ(held_count, 0);
+		observe_busy_kind = 0;
+		UT_ASSERT(cluster_ctrc_receipt_observe_shared(&h, &seen));
+		UT_ASSERT_EQ(held_count, 0);
+	}
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_receipt_observation_critical_or_held_lock_does_not_acquire)
+{
+#ifdef CLUSTER_CTRC_RECEIPT_OBSERVER_PRESENT
+	ClusterCtrcReceiptHandle h;
+	ClusterCtrcReceiptObservation seen;
+	reset_fixture();
+	UT_ASSERT_EQ(prepare_fixture_receipt(seed_origin(0, 1), 128, &h), CLUSTER_CTRC_PREPARE_READY);
+	observe_conditional_calls = 0;
+	CritSectionCount = 1;
+	UT_ASSERT(!cluster_ctrc_receipt_observe_shared(&h, &seen));
+	CritSectionCount = 0;
+	LWLockAcquire(&CtrcShared->origin_lock, LW_SHARED);
+	UT_ASSERT(!cluster_ctrc_receipt_observe_shared(&h, &seen));
+	UT_ASSERT_EQ(observe_conditional_calls, 0);
+	LWLockRelease(&CtrcShared->origin_lock);
+	UT_ASSERT_EQ(held_count, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_receipt_observation_does_not_turn_sample_into_apply_authority)
+{
+#ifdef CLUSTER_CTRC_RECEIPT_OBSERVER_PRESENT
+	ClusterCtrcReceiptHandle h;
+	ClusterCtrcReceiptObservation seen;
+	ClusterCtrcApplyToken token;
+	reset_fixture();
+	UT_ASSERT_EQ(prepare_fixture_receipt(seed_origin(0, 1), 129, &h), CLUSTER_CTRC_PREPARE_READY);
+	h.participant->grant_generation++;
+	UT_ASSERT(cluster_ctrc_receipt_observe_shared(&h, &seen));
+	UT_ASSERT(seen.grant_generation != seen.publication.grant_generation);
+	UT_ASSERT_EQ(cluster_ctrc_receipt_apply_shared(&h, &h.receipt->target, &token),
+				 CLUSTER_CTRC_APPLY_FAIL_CLOSED);
+	UT_ASSERT(!token.valid);
+	UT_ASSERT_EQ(h.receipt->state, CTRC_RECEIPT_PREPARED);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_receipt_observation_unattached_or_invalid_output_stays_unknown)
+{
+#ifdef CLUSTER_CTRC_RECEIPT_OBSERVER_PRESENT
+	ClusterCtrcReceiptHandle h;
+	ClusterCtrcReceiptObservation seen, zero = {0};
+	void *saved;
+	reset_fixture();
+	UT_ASSERT_EQ(prepare_fixture_receipt(seed_origin(0, 1), 130, &h), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(!cluster_ctrc_receipt_observe_shared(&h, NULL));
+	UT_ASSERT(!cluster_ctrc_receipt_observe_shared(NULL, &seen));
+	memset(&seen, 0x7f, sizeof(seen));
+	saved = CtrcShared; CtrcShared = NULL;
+	UT_ASSERT(!cluster_ctrc_receipt_observe_shared(&h, &seen));
+	CtrcShared = saved;
+	UT_ASSERT_EQ(memcmp(&seen, &zero, sizeof(seen)), 0);
+	UT_ASSERT_EQ(held_count, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
 int
 main(void)
 {
@@ -2891,7 +3094,16 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(63);
+	UT_PLAN(71);
+	UT_RUN(test_receipt_observation_exact_prepare_is_read_only);
+	UT_RUN(test_receipt_observation_real_cancel_keeps_publication_binding);
+	UT_RUN(test_receipt_observation_duplicate_keeps_same_shared_sequence);
+	UT_RUN(test_receipt_observation_stale_or_foreign_handle_never_borrows_state);
+	UT_RUN(test_receipt_observation_busy_locks_return_unknown_without_wait);
+	UT_RUN(test_receipt_observation_critical_or_held_lock_does_not_acquire);
+	UT_RUN(test_receipt_observation_does_not_turn_sample_into_apply_authority);
+	UT_RUN(test_receipt_observation_unattached_or_invalid_output_stays_unknown);
+
 	printf("# CTRC header_bytes=%zu total_bytes=%zu\n", sizeof(ClusterCtrcSharedHeader),
 		   capacity.total_bytes);
 	UT_RUN(test_new_seals_do_not_starve_old_pending);

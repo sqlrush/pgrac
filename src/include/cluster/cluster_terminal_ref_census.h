@@ -440,6 +440,28 @@ typedef struct ClusterCtrcReceiptHandle {
 	uint8 reserved8[7];
 } ClusterCtrcReceiptHandle;
 
+/* Passive, process-local diagnostic copy, never a receipt/authority token.
+ * Table locks qualify physical key/publication binding and prevent reuse.
+ * APPLY/cancel can update mutable fields without these locks: target/counts
+ * and the two state reads are NOT one atomic snapshot, even if states agree.
+ * No raw shared pointers, wire/shared ABI or persistent format. */
+typedef struct ClusterCtrcReceiptObservation {
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcParticipantIdentity participant;
+	ClusterCtrcPublicationIdV1 publication;
+	ClusterCtrcTargetV1 target;
+	uint32 state_before, state_after, grant_generation;
+	uint8 participant_state, disposition;
+	uint64 receipt_count, prepared_count, applied_count, cancelled_count;
+	uint64 cleaned_count, ack_frozen_count, seal_generation, last_key_sequence;
+	XLogRecPtr highest_local_wal_lsn;
+} ClusterCtrcReceiptObservation;
+
+/* Nonblocking: unknown/unsafe/lock-busy/stale bindings return false with
+ * zero output. Performs no LOG, allocation, state change or authority grant. */
+extern bool cluster_ctrc_receipt_observe_shared(const ClusterCtrcReceiptHandle *handle,
+											  ClusterCtrcReceiptObservation *out);
+
 typedef struct ClusterCtrcDurability {
 	XLogRecPtr highest_local_lsn;
 	XLogRecPtr local_flush_lsn;

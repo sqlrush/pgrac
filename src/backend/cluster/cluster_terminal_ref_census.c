@@ -5159,6 +5159,115 @@ ctrc_receipt_prepare_existing_locked(ClusterCtrcParticipantEntry *participant,
 }
 #endif
 
+/* Passive exact-handle observation for safe caller diagnostics. */
+#ifndef CLUSTER_CTRC_UNIT_TEST
+static void
+ctrc_receipt_observe_note_lock(LWLock *lock pg_attribute_unused(),
+							  LWLockMode mode pg_attribute_unused(), void *context)
+{
+	*(bool *)context = true;
+}
+#endif
+
+#define CLUSTER_CTRC_RECEIPT_OBSERVER_PRESENT 1
+bool
+cluster_ctrc_receipt_observe_shared(const ClusterCtrcReceiptHandle *handle,
+								  ClusterCtrcReceiptObservation *out)
+{
+	if (out == NULL)
+		return false;
+	MemSet(out, 0, sizeof(*out));
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	{
+		ClusterCtrcReceiptObservation sampled;
+		ClusterCtrcParticipantEntry *participant;
+		ClusterCtrcReceipt *receipt;
+		LWLock *participant_lock;
+		uint32 mask;
+		unsigned shard;
+		bool held = false, observed = false;
+		volatile bool participant_locked = false, receipt_locked = false;
+
+		if (CritSectionCount != 0 || !ctrc_runtime_attached() || handle == NULL
+			|| !handle->valid || handle->journal_slot_generation == 0
+			|| !ctrc_bytes_zero(handle->reserved8, sizeof(handle->reserved8))
+			|| CtrcShared->origin_key_entries == 0
+			|| CtrcShared->participant_key_entries < CtrcShared->origin_key_entries
+			|| handle->participant_index >= CtrcShared->participant_key_entries
+			|| handle->receipt_index >= CtrcShared->receipt_entries)
+			return false;
+		ForEachLWLockHeldByMe(ctrc_receipt_observe_note_lock, &held);
+		if (held)
+			return false;
+		participant = &ctrc_participant_entries()[handle->participant_index];
+		receipt = &ctrc_receipt_entries()[handle->receipt_index];
+		if (handle->participant != participant || handle->receipt != receipt)
+			return false;
+		mask = ctrc_participant_lock_mask(handle->participant_index);
+		for (shard = 0; shard < CLUSTER_CTRC_CLEANER_WORKERS; shard++)
+			if ((mask & (UINT32_C(1) << shard)) != 0)
+				break;
+		if (shard == CLUSTER_CTRC_CLEANER_WORKERS)
+			return false;
+		participant_lock = &CtrcShared->participant_locks[shard].lock;
+		MemSet(&sampled, 0, sizeof(sampled));
+		PG_TRY();
+		{
+			do {
+				if (!LWLockConditionalAcquire(participant_lock, LW_SHARED))
+					break;
+				participant_locked = true;
+				if (!LWLockConditionalAcquire(&CtrcShared->receipt_lock, LW_SHARED))
+					break;
+				receipt_locked = true;
+				/* Fixed storage/key/publication binding only. Do not repeat
+				 * cluster_ctrc_shmem_ready's whole-capacity validation here. */
+				if (receipt->publication.journal_slot_generation != handle->journal_slot_generation
+					|| memcmp(&participant->key, &handle->key, sizeof(handle->key)) != 0
+					|| memcmp(&receipt->key, &handle->key, sizeof(handle->key)) != 0)
+					break;
+				sampled.state_before = pg_atomic_read_u32((pg_atomic_uint32 *)&receipt->state);
+				sampled.key = receipt->key;
+				sampled.participant = participant->identity;
+				sampled.publication = receipt->publication;
+				/* APPLY/cancel need not take these table locks. These fixed
+				 * byte copies and individual atomic counters are projections,
+				 * not a coherent mutable-state cut or reusable permission. */
+				sampled.target = receipt->target;
+				sampled.participant_state = participant->state;
+				sampled.grant_generation = participant->grant_generation;
+				sampled.receipt_count = pg_atomic_read_u64((pg_atomic_uint64 *)&participant->receipt_count);
+				sampled.prepared_count = pg_atomic_read_u64((pg_atomic_uint64 *)&participant->prepared_count);
+				sampled.applied_count = pg_atomic_read_u64((pg_atomic_uint64 *)&participant->applied_count);
+				sampled.cancelled_count = pg_atomic_read_u64((pg_atomic_uint64 *)&participant->cancelled_count);
+				sampled.cleaned_count = pg_atomic_read_u64((pg_atomic_uint64 *)&participant->cleaned_count);
+				sampled.ack_frozen_count = pg_atomic_read_u64((pg_atomic_uint64 *)&participant->ack_frozen_count);
+				sampled.seal_generation = participant->seal_generation;
+				sampled.last_key_sequence = participant->last_key_sequence;
+				sampled.disposition = receipt->disposition;
+				sampled.highest_local_wal_lsn = receipt->highest_local_wal_lsn;
+				sampled.state_after = pg_atomic_read_u32((pg_atomic_uint32 *)&receipt->state);
+				observed = true;
+			} while (false);
+		}
+		PG_FINALLY();
+		{
+			if (receipt_locked)
+				LWLockRelease(&CtrcShared->receipt_lock);
+			if (participant_locked)
+				LWLockRelease(participant_lock);
+		}
+		PG_END_TRY();
+		if (observed)
+			*out = sampled;
+		return observed;
+	}
+#else
+	(void)handle;
+	return false;
+#endif
+}
+
 static ClusterCtrcPrepareResult
 ctrc_receipt_prepare_refused(bool invalid_namespace)
 {

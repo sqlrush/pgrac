@@ -125,9 +125,11 @@ static bool undo_test_publish_tt_after_block0_read;
 static TimestampTz receipt_clock_us;
 static TimestampTz receipt_clock_after_unref;
 static bool receipt_log_enabled;
-static char receipt_last_log[4096];
+static char receipt_last_log[8192];
 static char receipt_all_logs[32768];
 static int receipt_log_count, receipt_owner_calls;
+static unsigned receipt_observe_calls;
+static bool receipt_observe_available, receipt_observe_throw;
 static bool receipt_trace_lwlock_held, receipt_lifecycle_controls;
 static bool receipt_fail_sync_after_prepare;
 static const char *receipt_fail_log_event;
@@ -536,6 +538,53 @@ cluster_ctrc_receipt_retarget_itl_shared(const ClusterCtrcReceiptHandle *handle,
 										 ClusterCtrcApplyToken *token)
 {
 	return cluster_ctrc_receipt_apply_shared(handle, target, token);
+}
+
+bool
+cluster_ctrc_receipt_observe_shared(const ClusterCtrcReceiptHandle *handle,
+								  ClusterCtrcReceiptObservation *out)
+{
+	receipt_observe_calls++;
+	UT_ASSERT(CritSectionCount == 0);
+	UT_ASSERT(handle != NULL && handle->valid);
+	memset(out, 0, sizeof(*out));
+	if (receipt_observe_throw)
+		siglongjmp(receipt_error_jump, 1);
+	if (!receipt_observe_available)
+		return false;
+	/* Controlled shared boundary only; the real accessor has its own
+	 * NO-UNIT fixture. Never dereference the dummy handle's shared pointers. */
+	out->key = handle->key;
+	out->participant.node_id = 0;
+	out->participant.boot_incarnation = 1101;
+	out->participant.capability_record_generation = 19;
+	out->participant.formation_epoch = 1201;
+	out->participant.admission_record_generation = 1301;
+	out->publication.operation_id = 73;
+	out->publication.wire_request_id = 601;
+	out->publication.requester_backend_id = 77;
+	out->publication.requester_boot_incarnation = 1101;
+	out->publication.attempt_generation = 3;
+	out->publication.journal_sequence = 501;
+	out->publication.key_sequence = 17;
+	out->publication.journal_slot_generation = handle->journal_slot_generation;
+	out->grant_generation = 7;
+	out->participant_state = CTRC_PARTICIPANT_OPEN;
+	out->receipt_count = 1;
+	out->state_before = out->state_after = receipt_cancel_calls > 0
+		? CTRC_RECEIPT_CANCELLED : CTRC_RECEIPT_PREPARED;
+	out->prepared_count = receipt_cancel_calls == 0 ? 1 : 0;
+	out->cancelled_count = receipt_cancel_calls > 0 ? 1 : 0;
+	out->target.spc_oid = 1663;
+	out->target.db_oid = 1;
+	out->target.rel_number = 16388;
+	out->target.block_number = 137;
+	out->target.uba[0] = 0xab;
+	out->target.itl_slot_index = 2;
+	out->target.offset_number = 7;
+	if (receipt_cancel_calls > 0)
+		UT_ASSERT(!cluster_undo_record_reservation.active);
+	return true;
 }
 
 bool
@@ -2651,6 +2700,8 @@ receipt_fixture_ready(uint8 record_type, ClusterUndoRecordPrepareReceipt *receip
 	CritSectionCount = 0;
 	receipt_last_log[0] = '\0';
 	receipt_all_logs[0] = '\0'; receipt_log_count = receipt_owner_calls = 0;
+	receipt_observe_calls = 0;
+	receipt_observe_available = receipt_observe_throw = false;
 	receipt_trace_lwlock_held = receipt_lifecycle_controls = false;
 	receipt_fail_sync_after_prepare = false; receipt_fail_log_event = NULL;
 	receipt_prepare_result = CLUSTER_CTRC_PREPARE_READY;
@@ -3992,6 +4043,7 @@ UT_TEST(test_receipt_lifecycle_default_off_keeps_prepare_cancel_effects)
 	UT_ASSERT_EQ(receipt_unref_calls, 1);
 	UT_ASSERT_EQ(receipt_leave_calls, 1);
 	UT_ASSERT_EQ(receipt_log_count, 0);
+	UT_ASSERT_EQ(receipt_observe_calls, 0);
 }
 UT_TEST(test_receipt_lifecycle_owner_publication_ready_are_ordered)
 {
@@ -4204,10 +4256,79 @@ UT_TEST(test_receipt_lifecycle_cancel_is_idempotent_and_does_not_read_shared_poi
 	UT_ASSERT_EQ(receipt_cancel_calls, 1);
 }
 
+UT_TEST(test_receipt_lifecycle_shared_sample_uses_actual_publication_fields)
+{
+	ClusterUndoRecordPrepareReceipt receipt;
+	receipt_lifecycle_fixture(&receipt); receipt_observe_available = true;
+	UT_ASSERT(cluster_undo_record_ctrc_prepare_pending(&receipt, 0));
+	UT_ASSERT_EQ(receipt_observe_calls, 1);
+	UT_ASSERT(strstr(receipt_last_log, "event=prepare.ready") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "shared_sample_observed=1 shared_mutable_atomic=0") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "shared_journal_sequence=501 shared_key_sequence=17") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "shared_key_matches_reported=1") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "shared_wire_request=601 shared_attempt=3 shared_requester_backend=77") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "shared_participant_formation=1201 shared_participant_admission=1301") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "shared_sample_itl_slot=2 shared_sample_offset=7") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "shared_sample_uba=ab000000000000000000000000000000") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "trace_sequence_exhausted=0") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "shared_state_known=0 shared_retired_known=0") != NULL);
+	cluster_undo_record_cancel_prepared(&receipt);
+}
+
+UT_TEST(test_receipt_lifecycle_shared_sample_after_original_local_retirement)
+{
+	ClusterUndoRecordPrepareReceipt receipt;
+	receipt_lifecycle_fixture(&receipt); receipt_observe_available = true;
+	UT_ASSERT(cluster_undo_record_ctrc_prepare_pending(&receipt, 0));
+	cluster_undo_record_cancel_prepared(&receipt);
+	UT_ASSERT_EQ(receipt_observe_calls, 2);
+	UT_ASSERT(strstr(receipt_last_log, "event=cancel.local_retired") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "shared_sample_observed=1 shared_mutable_atomic=0") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "shared_prepared_count=0 shared_applied_count=0 shared_cancelled_count=1") != NULL);
+	UT_ASSERT(!cluster_undo_record_reservation.active);
+	UT_ASSERT_EQ(receipt_unref_calls, 1);
+}
+
+UT_TEST(test_receipt_lifecycle_unknown_shared_sample_does_not_borrow_expected_target)
+{
+	ClusterUndoRecordPrepareReceipt receipt;
+	receipt_lifecycle_fixture(&receipt);
+	UT_ASSERT(cluster_undo_record_ctrc_prepare_pending(&receipt, 0));
+	UT_ASSERT_EQ(receipt_observe_calls, 1);
+	UT_ASSERT(strstr(receipt_last_log, "shared_sample_observed=0 shared_mutable_atomic=0") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "shared_sample_rel=0") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "shared_journal_sequence=0 shared_key_sequence=0") != NULL);
+	cluster_undo_record_cancel_prepared(&receipt);
+}
+
+UT_TEST(test_receipt_lifecycle_sample_error_keeps_registered_cleanup_owner)
+{
+	ClusterUndoRecordPrepareReceipt receipt;
+	volatile bool caught = false;
+	receipt_lifecycle_fixture(&receipt); receipt_observe_throw = true;
+	if (sigsetjmp(receipt_error_jump, 1) == 0)
+		(void)cluster_undo_record_ctrc_prepare_pending(&receipt, 0);
+	else
+		caught = true;
+	UT_ASSERT(caught);
+	UT_ASSERT(cluster_undo_record_reservation.active);
+	UT_ASSERT_EQ(cluster_undo_record_reservation.receipt.ctrc_prepared_mask, 1);
+	receipt_observe_throw = false;
+	receipt_abort_after_lwlock_release();
+	UT_ASSERT_EQ(receipt_cancel_calls, 1);
+	UT_ASSERT_EQ(receipt_unref_calls, 1);
+	UT_ASSERT(!cluster_undo_record_reservation.active);
+}
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(94);
+	UT_PLAN(98);
+	UT_RUN(test_receipt_lifecycle_shared_sample_uses_actual_publication_fields);
+	UT_RUN(test_receipt_lifecycle_shared_sample_after_original_local_retirement);
+	UT_RUN(test_receipt_lifecycle_unknown_shared_sample_does_not_borrow_expected_target);
+	UT_RUN(test_receipt_lifecycle_sample_error_keeps_registered_cleanup_owner);
+
 	UT_RUN(test_abort_prepared_after_lock_release_is_idempotent);
 	UT_RUN(test_abort_prepared_cancel_failure_and_borrowed_owner_do_not_panic);
 	UT_RUN(test_abort_attempted_or_applied_retains_debt_and_panics);
