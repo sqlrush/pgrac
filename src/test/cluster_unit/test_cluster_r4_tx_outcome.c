@@ -5909,6 +5909,140 @@ UT_TEST(test_exact_origin_memo_reuses_only_proven_terminal_outcomes)
 	}
 }
 
+UT_TEST(test_local_terminal_consumes_exact_origin_memo)
+{
+	int aborted;
+
+	for (aborted = 0; aborted < 2; aborted++) {
+		ClusterTxResolution resolution;
+		ClusterTxResolveReason reason;
+		ClusterTTStatusKey key;
+		ClusterTTStatusResult result;
+		ClusterRuntimeVisibilityCounters counters;
+		bool retry = true;
+		int copies;
+
+		reset_exact_origin_fixture();
+		test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+		if (aborted) {
+			test_native_status = TRANSACTION_STATUS_ABORTED;
+			test_tt_slot.status = TT_SLOT_ABORTED;
+			test_tt_slot.commit_scn = InvalidScn;
+		} else
+			test_current_segment = TEST_TT_SEGMENT;
+		UT_ASSERT_EQ(test_resolve_memo_origin(CLUSTER_TX_RESOLVE_VISIBILITY, &resolution, &reason),
+					 aborted ? CLUSTER_TX_ABORTED : CLUSTER_TX_COMMITTED);
+		UT_ASSERT_EQ(test_native_status_calls, 1);
+		copies = test_candidate_block0_copy_calls;
+		UT_ASSERT(cluster_runtime_visibility_local_terminal_lookup_exact(TEST_ORIGIN_XID, &key,
+																		 &result, &retry));
+		UT_ASSERT_EQ(result.status,
+					 aborted ? CLUSTER_TT_STATUS_ABORTED : CLUSTER_TT_STATUS_COMMITTED);
+		UT_ASSERT_EQ(result.commit_scn, aborted ? InvalidScn : test_commit_scn);
+		UT_ASSERT(result.authoritative);
+		UT_ASSERT(!retry);
+		UT_ASSERT_EQ(key.undo_segment_id, TEST_TT_SEGMENT);
+		UT_ASSERT_EQ(key.tt_slot_id, cluster_tt_slot_offset_to_id(TEST_TT_OFFSET));
+		UT_ASSERT_EQ(test_native_status_calls, 1);
+		UT_ASSERT_EQ(test_candidate_block0_copy_calls, copies + 1);
+		UT_ASSERT_EQ(test_ctrc_touch_calls, 0);
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, test_candidate_release_calls);
+		cluster_runtime_visibility_exact_counters_snapshot(&counters);
+		UT_ASSERT_EQ(counters.local_memo_hits, 1);
+		UT_ASSERT_EQ(counters.local_memo_publishes, 1);
+	}
+}
+
+UT_TEST(test_local_terminal_memo_requires_current_physical_identity)
+{
+	int variant;
+
+	for (variant = 0; variant < 7; variant++) {
+		ClusterTxResolution resolution;
+		ClusterTxResolveReason reason;
+		ClusterTTStatusKey key;
+		ClusterTTStatusResult result;
+		ClusterRuntimeVisibilityCounters counters;
+		bool retry = true;
+		bool valid = variant != 3 && variant != 4;
+
+		reset_exact_origin_fixture();
+		test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+		UT_ASSERT_EQ(test_resolve_memo_origin(CLUSTER_TX_RESOLVE_VISIBILITY, &resolution, &reason),
+					 CLUSTER_TX_COMMITTED);
+		switch (variant) {
+		case 0:
+			test_formation_epoch++;
+			break;
+		case 1:
+			test_candidate_tt_generation++;
+			break;
+		case 2:
+			test_candidate_root_drift = true;
+			break;
+		case 3:
+			test_tt_slot.wrap++;
+			break;
+		case 4:
+			test_tt_slot.xid++;
+			break;
+		case 5:
+			test_tt_slot.commit_scn++;
+			break;
+		case 6:
+			test_tt_slot.status = TT_SLOT_ABORTED;
+			test_tt_slot.commit_scn = InvalidScn;
+			test_native_status = TRANSACTION_STATUS_ABORTED;
+			break;
+		}
+		UT_ASSERT_EQ(cluster_runtime_visibility_local_terminal_lookup_exact(TEST_ORIGIN_XID, &key,
+																			&result, &retry),
+					 valid);
+		UT_ASSERT_EQ(result.status, !valid		   ? CLUSTER_TT_STATUS_UNKNOWN
+									: variant == 6 ? CLUSTER_TT_STATUS_ABORTED
+												   : CLUSTER_TT_STATUS_COMMITTED);
+		UT_ASSERT_EQ(result.commit_scn,
+					 valid && variant != 6 ? test_tt_slot.commit_scn : InvalidScn);
+		UT_ASSERT_EQ(result.authoritative, valid);
+		UT_ASSERT(!retry);
+		UT_ASSERT_EQ(test_native_status_calls, valid ? 2 : 1);
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, test_candidate_release_calls);
+		cluster_runtime_visibility_exact_counters_snapshot(&counters);
+		UT_ASSERT_EQ(counters.local_memo_hits, 0);
+		UT_ASSERT_EQ(counters.local_memo_publishes, 1);
+	}
+}
+
+UT_TEST(test_local_terminal_memo_hit_preserves_final_fences)
+{
+	int fault;
+
+	for (fault = 0; fault < 4; fault++) {
+		ClusterTxResolution resolution;
+		ClusterTxResolveReason reason;
+		ClusterRuntimeVisibilityCounters counters;
+
+		reset_exact_origin_fixture();
+		test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+		UT_ASSERT_EQ(test_resolve_memo_origin(CLUSTER_TX_RESOLVE_VISIBILITY, &resolution, &reason),
+					 CLUSTER_TX_COMMITTED);
+		if (fault == 0)
+			test_candidate_copy_generation_drift = true;
+		else if (fault == 1)
+			test_candidate_release_admission_drift = true;
+		else
+			test_release_scope_drift = fault == 2 ? 6 : 2;
+		assert_local_terminal_unknown();
+		UT_ASSERT_EQ(test_native_status_calls, 1);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, test_candidate_release_calls);
+		cluster_runtime_visibility_exact_counters_snapshot(&counters);
+		UT_ASSERT_EQ(counters.local_memo_hits, 1);
+		UT_ASSERT_EQ(counters.local_memo_publishes, 1);
+	}
+}
+
 UT_TEST(test_exact_origin_memo_never_promotes_precommit_or_prepared)
 {
 	int variant;
@@ -6357,7 +6491,7 @@ UT_TEST(test_self_fresh_role_does_not_inherit_ordinary_abort_permission)
 int
 main(void)
 {
-	UT_PLAN(179);
+	UT_PLAN(182);
 	UT_RUN(test_retained_active_identity_reaches_real_undo_pending);
 	UT_RUN(test_retained_undo_pending_requires_matching_active_tt_receipt);
 	UT_RUN(test_retained_undo_pending_guard_drift_cannot_publish);
@@ -6532,6 +6666,9 @@ main(void)
 	UT_RUN(test_origin_export_copies_only_the_final_revalidated_resident_data_page);
 	UT_RUN(test_origin_tx_plan_preserves_strict_zero_and_final_generation_recheck);
 	UT_RUN(test_exact_origin_memo_reuses_only_proven_terminal_outcomes);
+	UT_RUN(test_local_terminal_consumes_exact_origin_memo);
+	UT_RUN(test_local_terminal_memo_requires_current_physical_identity);
+	UT_RUN(test_local_terminal_memo_hit_preserves_final_fences);
 	UT_RUN(test_exact_origin_memo_never_promotes_precommit_or_prepared);
 	UT_RUN(test_exact_origin_memo_isolates_epoch_generation_and_slot_identity);
 	UT_RUN(test_exact_origin_memo_rechecks_each_data_carrier);
