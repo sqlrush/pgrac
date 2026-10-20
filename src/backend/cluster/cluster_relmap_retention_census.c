@@ -449,9 +449,18 @@ cluster_relmap_retention_census_rebuild_pending_side(ClusterRelmapRetentionCensu
 	if (result != CLUSTER_RELMAP_PENDING_OK)
 		return result;
 	/* Keep the original namespace/pair and SIDE selection together. A collector
-	 * refusal must not leave a valid ROOT census that could be treated as empty. */
-	result = cluster_relmap_pending_collect_side(&census->identity, census->storage_uuid,
-		sources, source_count, descriptors, lengthof(descriptors), &count);
+	 * refusal or ERROR must not leave a reusable ROOT census. */
+	PG_TRY();
+	{
+		result = cluster_relmap_pending_collect_side(&census->identity, census->storage_uuid,
+			sources, source_count, descriptors, lengthof(descriptors), &count);
+	}
+	PG_CATCH();
+	{
+		census_failed(census, CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 	if (result != CLUSTER_RELMAP_PENDING_OK) {
 		census_failed(census, result == CLUSTER_RELMAP_PENDING_CAPACITY_EXCEEDED
 			? CLUSTER_RELMAP_CENSUS_CAPACITY : CLUSTER_RELMAP_CENSUS_UNAVAILABLE);

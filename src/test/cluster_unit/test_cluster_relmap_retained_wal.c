@@ -1059,6 +1059,55 @@ UT_TEST(test_census_side_wal_window_clean_pair_and_destination)
 	}
 }
 
+UT_TEST(test_census_side_collector_error_invalidates_window)
+{
+	ClusterRelmapV2Image image;
+	ClusterWalInputsV1 *inputs = relmap_test_fixture(&image, 0, false, true, false);
+	RelmapCensusWalFixture f;
+	RelmapCensusSideFixture side;
+	ClusterRelmapPendingSet pending, before;
+	volatile bool threw = false;
+
+	relmap_census_side(&side, &image, 0, true);
+	relmap_census_begin(&f, &image, false);
+	(void)relmap_census_emission(&f, image.identity.dbid);
+	cluster_relmap_pending_init(&pending);
+	UT_ASSERT_EQ(cluster_relmap_pending_add(&pending, CLUSTER_RELMAP_PENDING_DROP,
+		&side.key, true), CLUSTER_RELMAP_PENDING_OK);
+	before = pending;
+	inputs_claim_calls = relmap_test_side_errors = 0;
+	inputs_claim_observe = relmap_test_side_error = true;
+	test_last_error_level = 0;
+	test_capture_error_level = true;
+	PG_TRY();
+	{
+		(void)cluster_relmap_retention_census_rebuild_pending_side(f.census,
+			&pending, &side.source, 1);
+	}
+	PG_CATCH();
+	{
+		threw = true;
+	}
+	PG_END_TRY();
+	test_capture_error_level = false;
+	UT_ASSERT(threw && !relmap_test_side_error);
+	UT_ASSERT_EQ(test_last_error_level, ERROR);
+	UT_ASSERT_EQ(relmap_test_side_errors, 1);
+	UT_ASSERT_EQ(inputs_claim_calls, 0);
+	inputs_claim_observe = relmap_test_side_error = false;
+	UT_ASSERT_EQ(memcmp(&pending, &before, sizeof(pending)), 0);
+	relmap_census_pin_retained(&f, &image, true);
+	UT_ASSERT_EQ(cluster_relmap_retention_census_rebuild_pending(f.census,
+		&pending, NULL, 0), CLUSTER_RELMAP_PENDING_NOT_READY);
+	UT_ASSERT_EQ(cluster_relmap_retention_census_next(f.census), CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+	UT_ASSERT_EQ(memcmp(&pending, &before, sizeof(pending)), 0);
+	UT_ASSERT_EQ(cluster_wal_inputs_revalidate_v1(inputs), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT(inputs_pin_held && inputs_pin_current && test_actual_cf == NoLock);
+	rf_side_online_plan_destroy_v1(&side.plan);
+	relmap_census_end(&f);
+	cold_census_done(&inputs);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1066,7 +1115,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(21);
+	UT_PLAN(22);
 	UT_RUN(test_retained_relmap_matches_each_selected_namespace);
 	UT_RUN(test_retained_relmap_requires_exact_pending);
 	UT_RUN(test_retained_relmap_scans_suffix_and_other_source);
@@ -1088,6 +1137,7 @@ main(int argc, char **argv)
 	UT_RUN(test_census_side_wal_late_physical_root_rejects_provisional);
 	UT_RUN(test_census_side_wal_collector_error_invalidates_before_wal);
 	UT_RUN(test_census_side_wal_window_clean_pair_and_destination);
+	UT_RUN(test_census_side_collector_error_invalidates_window);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
