@@ -171,6 +171,9 @@ typedef struct ClusterColdRecordV1 {
 	XLogRecPtr prev_rec_ptr; /* xl_prev: must equal the previous fed read_rec_ptr */
 	uint64 scn;				 /* xl_scn; deterministic tie-break only */
 	uint32 record_crc;
+	/* Original frame values, not a derived canonical ownership proof. */
+	TransactionId source_xid;
+	TransactionId source_top_xid;
 	uint8 rmid;
 	uint8 info;
 	uint8 record_flags; /* CLUSTER_COLD_RECORD_* */
@@ -180,6 +183,21 @@ typedef struct ClusterColdRecordV1 {
 	uint32 space_count; /* a record has SPACE effects or page components, not both */
 	const ClusterColdSpaceOpV1 *space_ops;
 } ClusterColdRecordV1;
+
+/* Original frame of one retained PAGE/SPACE record, not an ownership proof. */
+typedef struct ClusterColdRecordFrameV1 {
+	XLogRecPtr read_rec_ptr;
+	XLogRecPtr end_rec_ptr;
+	uint32 record_crc;
+	uint32 participant; /* create()'s caller index */
+	TransactionId source_xid;
+	TransactionId source_top_xid;
+	uint32 page_components;
+	uint32 space_effects;
+	uint8 rmid;
+	uint8 info;
+	bool history;
+} ClusterColdRecordFrameV1;
 
 typedef enum ClusterColdDataKindV1 {
 	CLUSTER_COLD_DATA_INVALID = 0, /* unreadable or failed verification */
@@ -302,6 +320,17 @@ extern bool cluster_cold_plan_step_v1(const ClusterColdPlanV1 *plan, uint32 inde
 extern bool cluster_cold_plan_step_space_v1(const ClusterColdPlanV1 *plan, uint32 index,
 											uint32 effect, uint32 *relation, uint32 *input);
 
+/* Sealed-only, by-value frames in feed order, including retained history.
+ * These enumerate only records stored for PAGE/SPACE planning: records with
+ * no such component and historical SPACE ADVANCEs are omitted.  The count
+ * proves neither all-record coverage nor ordinary-effects completion.
+ * source_top_xid may be absent; neither field establishes canonical ownership.
+ * No replay, loser, C0 or write authority is granted by reading these inputs.
+ * Both accessors clear their output on failure (including unsealed plans). */
+extern bool cluster_cold_plan_record_frame_count_v1(const ClusterColdPlanV1 *plan,
+													uint32 *out_count);
+extern bool cluster_cold_plan_record_frame_v1(const ClusterColdPlanV1 *plan, uint32 index,
+											  ClusterColdRecordFrameV1 *out);
 
 /* Records at or after the participant's native redo start (pass-2 input),
  * page or not, as fed; pass 2 must consume exactly this many. */
@@ -919,6 +948,38 @@ typedef struct ClusterColdTtSlotKeyV1 {
 	uint16 slot_wrap;
 } ClusterColdTtSlotKeyV1;
 
+/* Read-only canonical input for the new creator of one retained heap record.
+ * This covers INSERT/UPDATE/HOT_UPDATE and MULTI_INSERT only, not old tuple
+ * xmin/xmax, DELETE/LOCK actors or individual MX members. */
+typedef struct ClusterColdPageCreatorV1 {
+	ClusterColdRecordFrameV1 frame;
+	ClusterColdTtSlotKeyV1 key;
+} ClusterColdPageCreatorV1;
+
+/* Match this record's own raw creator to the original same-source native
+ * canonical BIND and an exact ACTIVE TT prefix before the PAGE record.
+ * Requires sealed matching recovery inputs and a native lifecycle full image;
+ * missing/ambiguous input refuses and clears out. A qualified older canonical
+ * base is a separate producer, not a new BIND retention requirement.
+ * This supplies neither complete ordinary_effects nor post-redo loser/C0,
+ * isolation, durability, source revalidation or permission to apply anything. */
+extern bool cluster_cold_typed_page_creator_v1(const ClusterColdTypedV1 *typed, uint32 frame_index,
+											   ClusterColdPageCreatorV1 *out);
+
+/* Read-only canonical input for this record's own DELETE/LOCK/LOCK_UPDATED
+ * actor. Payload xmax, old tuple creators and individual MX members are not
+ * identified by this value and require their own effect input proofs. */
+typedef struct ClusterColdPageActorV1 {
+	ClusterColdRecordFrameV1 frame;
+	ClusterColdTtSlotKeyV1 key;
+} ClusterColdPageActorV1;
+
+/* Match the original WAL header raw actor to its canonical ACTIVE TT prefix,
+ * with the same source and refusal guarantees as the creator input above.
+ * This grants no complete effects, loser/C0 or mutation authority. */
+extern bool cluster_cold_typed_page_actor_v1(const ClusterColdTypedV1 *typed, uint32 frame_index,
+											 ClusterColdPageActorV1 *out);
+
 typedef struct ClusterColdTtSlotInputV1 {
 	ClusterColdTtSlotKeyV1 key;
 	TTSlot slot;
@@ -980,6 +1041,14 @@ extern bool cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
 extern bool cluster_cold_typed_sources_current_v1(ClusterColdTypedV1 *typed,
 												  struct ClusterRecoveryFencePlan *fence);
 
+/* Read-only pass-2 isolation input from the original exact foreign target's
+ * COLD_FORMED authority, including its current real NeedSet/AdmissionSet,
+ * ROOT/token, serial and retained window. Own/history-only participants
+ * without that original authority refuse. No new grant or post-EOR authority. */
+extern bool cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
+													  struct ClusterRecoveryFencePlan *fence,
+													  uint32 participant);
+
 /* Producer boundary for one original TT owner.  Locate the post-redo header
  * by physical owner/segment, require the complete ordinary TT/UNDO inventory
  * and all original sources, then verify the selected sealed fold and exact
@@ -1003,15 +1072,37 @@ extern bool cluster_cold_typed_sources_current_v1(ClusterColdTypedV1 *typed,
  * Derive sealed_redo from the original all-record completion receipt,
  * bound to this exact plan and complete source set by the all-thread
  * endpoint receipt, with the verified ordinary inventory. The caller's
- * sealed_redo bit is ignored. This does not discharge ordinary_effects,
- * terminal_match or old_writer_isolated.
+ * sealed_redo bit is ignored. Derive old_writer_isolated from the original
+ * exact foreign target authority above and recheck it before output. The
+ * caller's isolation bit is ignored; an own/history target cannot substitute
+ * a caller assertion for missing authority. Derive terminal_match from the
+ * complete native lifecycle, sealed redo and exact physical ACTIVE readback,
+ * together with the retained terminal checks below. The caller's terminal
+ * bit is ignored. Check original SIDE/PAGE/SPACE frame actor/top consistency
+ * in every retained source, including history, and any present native BIND or
+ * ordinary exact TT_ABORT actor against that operation's own durable slot xid.
+ * Original UNDO BLOCK_WRITE/MULTI FPIs also require complete native record
+ * decoding, including historical records' own physical origin/TT locators.
+ * The inventory also decodes every complete retained post-redo UNDO block,
+ * including new delta records and inherited original-base records, after
+ * its existing exact native fold/readback checks.
+ * These raw records need not name the WAL actor or this selected loser and
+ * do not supply canonical generation or terminal authority.
+ * Replay PAGE INSERT/UPDATE/HOT/MULTI
+ * additionally require their original creator input; DELETE/LOCK/LOCK_UPDATED
+ * require their actor input, each from its own BIND and ACTIVE causal prefix.
+ * History frames retain the consistency check; the replay-only PAGE producers
+ * do not qualify them. Old tuple/MX ownership, a parent graph and complete
+ * ordinary_effects remain independent requirements.
  * Other proof/shape gates remain independent and required. An older ACTIVE
  * without a retained BIND remains blocked pending the original qualified
  * canonical-base producer;
  * this does not introduce a BIND lifetime retention requirement.
  * Reject exact native COMMIT/TT_ABORT conflicts in every sealed source,
  * including history-only retained incarnations of the same thread. Absence
- * of those conflicts does not supply the independent terminal_match proof.
+ * of those conflicts alone does not supply the terminal proof. A native
+ * ABORT with this origin/raw xid additionally requires its original unique
+ * exact TT_ABORT pairing; an unqualified history-only ABORT remains blocked.
  * Target incarnation/claim remain bound to the original source.  A new
  * header with no original base requires the native full-image proof.
  * The original endpoint receipt must cover the unchanged complete source
@@ -1131,6 +1222,9 @@ extern bool cluster_cold_typed_tt_after_redo_readback_v1(const ClusterColdTypedV
  * image, including unchanged bytes and history-only blocks. Every actual
  * current WAL block-write target absent from that cache needs the complete
  * native FPI fold and a separate retained post image; no observed-base fallback.
+ * After those checks, every retained post block needs complete native record
+ * decoding, including unchanged records' physical origin/TT locators. This
+ * does not qualify the base, per-operation prefixes or canonical history.
  * This read-only comparison grants no checkpoint/base, history-effect, top,
  * loser or C0 authority. Original source isolation and final rechecks remain
  * the caller's obligations; no completion flag is stored. */

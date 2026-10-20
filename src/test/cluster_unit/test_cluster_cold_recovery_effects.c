@@ -1354,6 +1354,43 @@ UT_TEST(test_dispatch_real_page_decoder_at_pass_two)
 	free(r);
 }
 
+UT_TEST(test_real_page_decoder_owns_original_transaction_frame)
+{
+	const TransactionId actors[] = { 802, 804, 805, InvalidTransactionId };
+	const TransactionId tops[] = { InvalidTransactionId, 804, 804, InvalidTransactionId };
+	EffectRecord *r = calloc(1, sizeof(*r) + sizeof(DecodedBkpBlock));
+	ClusterColdDecodedV1 out = { 0 };
+
+	UT_ASSERT(r != NULL);
+	for (unsigned i = 0; i < lengthof(actors); i++) {
+		RfPageVersionEdgeEntryV1 *edge;
+
+		record_init(r, RM_XLOG_ID, XLOG_FPI);
+		r->decoded.header.xl_xid = actors[i];
+		r->decoded.toplevel_xid = tops[i];
+		r->decoded.max_block_id = 0;
+		r->decoded.blocks[0].in_use = true;
+		r->decoded.blocks[0].forknum = MAIN_FORKNUM;
+		r->decoded.has_page_version_edge = true;
+		r->decoded.page_version_edge.entry_count = 1;
+		r->decoded.page_version_edge.result_token = 9;
+		edge = &r->decoded.page_version_edge.entries[0];
+		edge->page_class = RF_PAGE_CLASS_ORDINARY;
+		memset(edge->result_incarnation, 1, sizeof(edge->result_incarnation));
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r->reader, 99, uuid, false, true, &out),
+					 CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.record.component_count, 1);
+		/* Reusing the reader cannot repair a conflicting frame, supply an
+		 * absent top or change this captured actor into another transaction. */
+		r->decoded.header.xl_xid = 999;
+		r->decoded.toplevel_xid = 999;
+		UT_ASSERT_EQ(out.record.source_xid, actors[i]);
+		UT_ASSERT_EQ(out.record.source_top_xid, tops[i]);
+	}
+	cluster_cold_decoded_release_v1(&out);
+	free(r);
+}
+
 UT_TEST(test_dispatch_space_drop_keeps_entire_native_commit)
 {
 	EffectRecord r;
@@ -2849,7 +2886,7 @@ UT_TEST(test_foreign_terminals_refuse_unconsumed_frame_before_dispatch)
 int
 main(void)
 {
-	UT_PLAN(78);
+	UT_PLAN(79);
 	UT_RUN(test_relation_abort_capture_replays_and_drains_complete_cut);
 	UT_RUN(test_relation_abort_capture_refuses_missing_creation);
 	UT_RUN(test_relation_abort_replay_failure_keeps_final_drain_closed);
@@ -2926,6 +2963,7 @@ main(void)
 	UT_RUN(test_dispatch_page_skip_does_not_skip_other_consumers);
 	UT_RUN(test_dispatch_fsm_only_uses_original_native_redo);
 	UT_RUN(test_dispatch_real_page_decoder_at_pass_two);
+	UT_RUN(test_real_page_decoder_owns_original_transaction_frame);
 	UT_RUN(test_dispatch_space_drop_keeps_entire_native_commit);
 	UT_RUN(test_dispatch_standalone_space_and_original_refusal_flags);
 	UT_DONE();

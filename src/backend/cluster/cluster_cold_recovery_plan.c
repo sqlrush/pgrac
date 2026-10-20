@@ -287,6 +287,8 @@ record_store(ClusterColdPlanV1 *plan, uint32 canonical, const ClusterColdRecordV
 	stored->end_rec_ptr = record->end_rec_ptr;
 	stored->scn = record->scn;
 	stored->record_crc = record->record_crc;
+	stored->source_xid = record->source_xid;
+	stored->source_top_xid = record->source_top_xid;
 	stored->participant = (uint8)canonical;
 	stored->first_component = plan->component_count;
 	stored->component_count = (uint8)record->component_count;
@@ -391,6 +393,8 @@ space_record_store(ClusterColdPlanV1 *plan, uint32 canonical, const ClusterColdR
 	stored->end_rec_ptr = record->end_rec_ptr;
 	stored->scn = record->scn;
 	stored->record_crc = record->record_crc;
+	stored->source_xid = record->source_xid;
+	stored->source_top_xid = record->source_top_xid;
 	stored->participant = (uint8)canonical;
 	stored->first_component = plan->space_count;
 	stored->rmid = record->rmid;
@@ -700,6 +704,46 @@ cluster_cold_plan_participant_matches_v1(const ClusterColdPlanV1 *plan, uint32 p
 		   && cut->owner_incarnation == expected->owner_incarnation
 		   && cut->physical_lower == expected->physical_lower
 		   && cut->native_redo == expected->native_redo && cut->tail_end == expected->tail_end;
+}
+
+bool
+cluster_cold_plan_record_frame_count_v1(const ClusterColdPlanV1 *plan, uint32 *out_count)
+{
+	if (out_count == NULL)
+		return false;
+	*out_count = 0;
+	if (!plan_valid(plan) || plan->phase != COLD_PHASE_SEALED)
+		return false;
+	*out_count = plan->record_count;
+	return true;
+}
+
+bool
+cluster_cold_plan_record_frame_v1(const ClusterColdPlanV1 *plan, uint32 index,
+								  ClusterColdRecordFrameV1 *out)
+{
+	const ColdRecord *record;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!plan_valid(plan) || plan->phase != COLD_PHASE_SEALED || index >= plan->record_count)
+		return false;
+	record = cold_record(plan, index);
+	out->read_rec_ptr = record->read_rec_ptr;
+	out->end_rec_ptr = record->end_rec_ptr;
+	out->record_crc = record->record_crc;
+	out->participant = plan->participants[record->participant].input_index;
+	out->source_xid = record->source_xid;
+	out->source_top_xid = record->source_top_xid;
+	if ((record->flags & COLD_RECORD_SPACE) != 0)
+		out->space_effects = cold_record_space_count(plan, index);
+	else
+		out->page_components = record->component_count;
+	out->rmid = record->rmid;
+	out->info = record->info;
+	out->history = (record->flags & COLD_RECORD_HISTORY) != 0;
+	return true;
 }
 
 uint64

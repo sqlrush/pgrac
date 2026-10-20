@@ -932,6 +932,8 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 	out->record.prev_rec_ptr = decoded->header.xl_prev;
 	out->record.scn = decoded->header.xl_scn;
 	out->record.record_crc = (uint32)decoded->header.xl_crc;
+	out->record.source_xid = decoded->header.xl_xid;
+	out->record.source_top_xid = decoded->toplevel_xid;
 	out->record.rmid = decoded->header.xl_rmid;
 	out->record.info = decoded->header.xl_info;
 

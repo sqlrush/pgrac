@@ -17,6 +17,7 @@
  */
 #include "postgres.h"
 
+#include "access/heapam_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_recovery_undo_scan.h"
 #include "cluster/cluster_side_online_plan.h"
@@ -411,6 +412,138 @@ cold_top_tx_key_equal_v1(const ClusterColdTtSlotKeyV1 *left,
 		   && left->slot_wrap == right->slot_wrap;
 }
 
+static bool
+cold_typed_page_binding_v1(const ClusterColdTypedV1 *typed, uint32 frame_index, bool new_creator,
+						   ClusterColdRecordFrameV1 *out_frame, ClusterColdTtSlotKeyV1 *out_key)
+{
+	ClusterColdRecordFrameV1 frame = { 0 };
+	ClusterColdTtSlotKeyV1 key = { 0 };
+	const ClusterColdParticipantV1 *source;
+	const RfSideOnlinePlanV1 *plan;
+	RfSideOnlineOperationV1 prefix;
+	RfSideUndoHeaderImageV1 image;
+	const UndoSegmentHeaderData *header;
+	const TTSlot *slot;
+	uint32 count, prefix_index = UINT32_MAX;
+	bool has_header_work, supported, found = false;
+	uint8 opcode;
+
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK || typed->participant_count == 0
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->replay_count > typed->participant_count
+		|| cluster_cold_plan_participant_count_v1(typed->plan) != typed->participant_count
+		|| !cluster_cold_plan_record_frame_v1(typed->plan, frame_index, &frame)
+		|| frame.participant >= typed->replay_count || frame.history || frame.page_components == 0
+		|| frame.space_effects != 0 || !TransactionIdIsNormal(frame.source_xid)
+		|| (TransactionIdIsValid(frame.source_top_xid) && frame.source_top_xid != frame.source_xid))
+		return false;
+	opcode = frame.info & XLOG_HEAP_OPMASK;
+	if (new_creator)
+		supported = (frame.rmid == RM_HEAP_ID
+					 && (opcode == XLOG_HEAP_INSERT || opcode == XLOG_HEAP_UPDATE
+						 || opcode == XLOG_HEAP_HOT_UPDATE))
+					|| (frame.rmid == RM_HEAP2_ID && opcode == XLOG_HEAP2_MULTI_INSERT);
+	else
+		supported
+			= (frame.rmid == RM_HEAP_ID && (opcode == XLOG_HEAP_DELETE || opcode == XLOG_HEAP_LOCK))
+			  || (frame.rmid == RM_HEAP2_ID && opcode == XLOG_HEAP2_LOCK_UPDATED);
+	if (!supported)
+		return false;
+	source = &typed->participants[frame.participant];
+	if (!cluster_cold_plan_participant_matches_v1(typed->plan, frame.participant, source)
+		|| !cold_tt_redo_source(typed, frame.participant, 0, 0, &has_header_work))
+		return false;
+	plan = typed->side_plans[frame.participant];
+	count = rf_side_online_plan_operation_count_v1(plan);
+	/* The native publisher accepts only its original top xid. An absent
+	 * xl_top_xid is not itself top proof: the matching BIND supplies it. */
+	for (uint32 i = 0; i < count; i++) {
+		RfSideOnlineOperationV1 operation;
+		const ClusterUndoDecoded *bind = &operation.undo;
+
+		if (!rf_side_online_plan_operation_v1(plan, i, &operation))
+			return false;
+		if (operation.identity.record.read_rec_ptr >= frame.end_rec_ptr)
+			continue;
+		if (operation.identity.record.end_rec_ptr > frame.read_rec_ptr)
+			return false;
+		if (operation.kind != RF_SIDE_ONLINE_OPERATION_UNDO
+			|| bind->kind != CLUSTER_UNDO_KIND_TT_BIND || bind->xid != frame.source_xid)
+			continue;
+		if (found || bind->format_version != CLUSTER_UNDO_TT_BIND_VERSION
+			|| bind->instance != source->thread_id
+			|| (TransactionIdIsValid(operation.source_xid) && operation.source_xid != bind->xid)
+			|| (TransactionIdIsValid(operation.source_top_xid)
+				&& operation.source_top_xid != bind->xid))
+			return false;
+		key.owner_instance = bind->instance;
+		key.segment_id = bind->segment_id;
+		key.segment_generation = bind->expected_generation;
+		key.slot_offset = bind->slot_offset;
+		key.slot_wrap = bind->wrap;
+		key.xid = bind->xid;
+		found = true;
+	}
+	if (!found || !cold_top_tx_key_valid_v1(&key))
+		return false;
+	/* Fold only the causal prefix of this physical segment. Later COMMIT,
+	 * ABORT or reuse cannot erase this operation's earlier ACTIVE input. */
+	for (uint32 i = 0; i < count; i++) {
+		RfSideOnlineOperationV1 operation;
+		bool same_segment;
+
+		if (!rf_side_online_plan_operation_v1(plan, i, &operation))
+			return false;
+		if (operation.identity.record.end_rec_ptr > frame.read_rec_ptr)
+			continue;
+		same_segment = operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
+					   && operation.undo.instance == key.owner_instance
+					   && operation.undo.segment_id == key.segment_id;
+		if (operation.kind == RF_SIDE_ONLINE_OPERATION_XACT
+			&& operation.xact.kind == RF_SIDE_XACT_COMMIT && operation.xact.has_tt_delta)
+			same_segment = operation.xact.tt_delta.instance == key.owner_instance
+						   && operation.xact.tt_delta.segment_id == key.segment_id;
+		if (same_segment) {
+			prefix_index = i;
+			prefix = operation;
+		}
+	}
+	if (prefix_index == UINT32_MAX
+		|| rf_side_online_plan_prepare_undo_record_input_header_v1(plan, prefix_index,
+																   &prefix.identity, NULL, &image)
+			   != RF_PAGE_PROOF_DETAIL_OK
+		|| !image.has_full_image)
+		return false;
+	header = (const UndoSegmentHeaderData *)image.page.data;
+	slot = &header->tt_slots[key.slot_offset];
+	if (header->wrap_count != key.segment_generation || slot->status != TT_SLOT_ACTIVE
+		|| slot->xid != key.xid || slot->wrap != key.slot_wrap)
+		return false;
+	*out_frame = frame;
+	*out_key = key;
+	return true;
+}
+
+bool
+cluster_cold_typed_page_creator_v1(const ClusterColdTypedV1 *typed, uint32 frame_index,
+								   ClusterColdPageCreatorV1 *out)
+{
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	return cold_typed_page_binding_v1(typed, frame_index, true, &out->frame, &out->key);
+}
+
+bool
+cluster_cold_typed_page_actor_v1(const ClusterColdTypedV1 *typed, uint32 frame_index,
+								 ClusterColdPageActorV1 *out)
+{
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	return cold_typed_page_binding_v1(typed, frame_index, false, &out->frame, &out->key);
+}
+
 bool
 cluster_cold_top_tx_loser_v1(const ClusterColdTtActiveIdentityV1 *active,
 							 const ClusterColdTopTxProofV1 *proof,
@@ -491,10 +624,135 @@ cold_top_tx_native_bind_v1(const RfSideOnlinePlanV1 *plan, const ClusterColdTtSl
 	return false;
 }
 
+static bool
+cold_top_tx_frame_xids_v1(TransactionId xid, TransactionId top)
+{
+	return (!TransactionIdIsValid(xid) || TransactionIdIsNormal(xid))
+		   && (!TransactionIdIsValid(top)
+			   || (TransactionIdIsNormal(top) && TransactionIdIsNormal(xid) && top == xid));
+}
+
+/* A native FPI can retain records from several transactions. Select the first
+ * record only to address the existing reader, which checks the entire block
+ * before returning it. These raw identities need not name the WAL actor or
+ * selected loser and do not establish generation or terminal authority. */
+static bool
+cold_top_tx_undo_fpi_v1(const RfSideOnlineOperationV1 *operation)
+{
+	const ClusterUndoDecoded *undo = &operation->undo;
+	UndoBlockHeader block;
+	UndoSlotDirEntry slot;
+	UndoRecordHeader header;
+	ClusterRecoveryUndoRecord record;
+	UBA address;
+
+	if (operation->owned_payload == NULL || operation->owned_payload_length != BLCKSZ
+		|| undo->instance == 0 || undo->instance > UNDO_OWNER_INSTANCE_MAX || undo->segment_id == 0
+		|| undo->segment_id > UINT16_MAX || undo->block_no == 0)
+		return false;
+	memcpy(&block, operation->owned_payload, sizeof(block));
+	memcpy(&slot, operation->owned_payload + UNDO_SLOT_DIR_OFFSET(0), sizeof(slot));
+	if (!cluster_undo_record_slot_range_valid(block.slot_count, 0, slot.record_offset,
+											  slot.record_length)
+		|| slot.record_length < sizeof(header))
+		return false;
+	memcpy(&header, operation->owned_payload + slot.record_offset, sizeof(header));
+	if (header.tt_slot_id == 0 || header.tt_slot_id > TT_SLOTS_PER_SEGMENT)
+		return false;
+	address = uba_encode(undo->segment_id, undo->block_no, header.tt_slot_id - 1, 0);
+	return cluster_recovery_undo_record_read(operation->owned_payload,
+											 operation->owned_payload_length, undo->segment_id,
+											 undo->block_no, undo->instance, address, &record)
+		   == CLUSTER_RECOVERY_UNDO_ENTRY;
+}
+
+/* Preserve operation-local SIDE/PAGE/SPACE evidence, including retained history. A
+ * known child frame cannot become canonical just because the candidate's
+ * BIND is top. Conversely an unrelated operation names its own actor, not
+ * this candidate. Replay DML additionally needs its own canonical creator
+ * or actor prefix. Old tuple xmin/undo before-images and individual MX
+ * members are not qualified here; ordinary_effects remains independent. */
+static bool
+cold_top_tx_frames_v1(const ClusterColdTypedV1 *typed)
+{
+	uint32 count;
+
+	if (!cluster_cold_plan_record_frame_count_v1(typed->plan, &count))
+		return false;
+	for (uint32 i = 0; i < count; i++) {
+		ClusterColdRecordFrameV1 frame;
+		uint8 opcode;
+		bool creator, actor;
+
+		if (!cluster_cold_plan_record_frame_v1(typed->plan, i, &frame)
+			|| frame.participant >= typed->participant_count
+			|| !cold_top_tx_frame_xids_v1(frame.source_xid, frame.source_top_xid))
+			return false;
+		if (frame.history || frame.page_components == 0)
+			continue;
+		/* Raw/top equality alone does not prove a replay DML's canonical
+		 * owner. Use that record's original BIND and ACTIVE causal prefix,
+		 * independently of the selected loser's identity or final status
+		 * of this other actor. Old tuple and MX inputs remain separate. */
+		opcode = frame.info & XLOG_HEAP_OPMASK;
+		creator = (frame.rmid == RM_HEAP_ID
+				   && (opcode == XLOG_HEAP_INSERT || opcode == XLOG_HEAP_UPDATE
+					   || opcode == XLOG_HEAP_HOT_UPDATE))
+				  || (frame.rmid == RM_HEAP2_ID && opcode == XLOG_HEAP2_MULTI_INSERT);
+		actor
+			= (frame.rmid == RM_HEAP_ID && (opcode == XLOG_HEAP_DELETE || opcode == XLOG_HEAP_LOCK))
+			  || (frame.rmid == RM_HEAP2_ID && opcode == XLOG_HEAP2_LOCK_UPDATED);
+		if (creator) {
+			ClusterColdPageCreatorV1 input;
+
+			if (!cluster_cold_typed_page_creator_v1(typed, i, &input))
+				return false;
+		} else if (actor) {
+			ClusterColdPageActorV1 input;
+
+			if (!cluster_cold_typed_page_actor_v1(typed, i, &input))
+				return false;
+		}
+	}
+	for (uint32 p = 0; p < typed->participant_count; p++) {
+		const RfSideOnlinePlanV1 *plan = typed->side_plans[p];
+		uint32 count = rf_side_online_plan_operation_count_v1(plan);
+
+		if (count == UINT32_MAX)
+			return false;
+		for (uint32 i = 0; i < count; i++) {
+			RfSideOnlineOperationV1 operation;
+
+			if (!rf_side_online_plan_operation_v1(plan, i, &operation)
+				|| !cold_top_tx_frame_xids_v1(operation.source_xid, operation.source_top_xid))
+				return false;
+			/* Native BIND and ordinary exact TT_ABORT persist their own
+			 * slot owner. A present record actor must agree with that xid,
+			 * even when this frame omitted top metadata. An unrelated loser's
+			 * BIND cannot repair a conflicting abort actor. */
+			if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
+				&& (operation.undo.kind == CLUSTER_UNDO_KIND_TT_BIND
+					|| (operation.undo.kind == CLUSTER_UNDO_KIND_TT_ABORT
+						&& operation.undo.format_version == CLUSTER_UNDO_TT_ABORT_EXACT_VERSION))
+				&& TransactionIdIsValid(operation.source_xid)
+				&& operation.source_xid != operation.undo.xid)
+				return false;
+			if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO && operation.undo.has_fpi
+				&& (operation.undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
+					|| operation.undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI)
+				&& !cold_top_tx_undo_fpi_v1(&operation))
+				return false;
+		}
+	}
+	return true;
+}
+
 /* A retained incarnation is not folded into the current owner's header,
  * but its exact terminal still contradicts the same physical ACTIVE key.
  * Neither a different claim/epoch nor history_only erases that conflict.
- * Absence of these carriers does not supply the independent terminal proof. */
+ * A native ABORT has no physical TT key: require its original exact carrier
+ * when it could name this transaction. Absence of conflicting carriers alone
+ * is insufficient without the complete native lifecycle and redo below. */
 static bool
 cold_top_tx_terminals_compatible_v1(const ClusterColdTypedV1 *typed,
 									const ClusterColdTtSlotKeyV1 *key)
@@ -532,6 +790,25 @@ cold_top_tx_terminals_compatible_v1(const ClusterColdTypedV1 *typed,
 				terminal.slot_offset = abort->slot_offset;
 				terminal.slot_wrap = abort->wrap;
 				terminal.xid = abort->xid;
+			} else if (operation.kind == RF_SIDE_ONLINE_OPERATION_XACT
+					   && operation.xact.kind == RF_SIDE_XACT_ABORT) {
+				ClusterUndoDecoded abort;
+
+				if (operation.xact.origin_thread != key->owner_instance
+					|| operation.xact.xid != key->xid)
+					continue;
+				/* Never assign raw xid to a physical slot ourselves. The
+				 * original owner requires the unique immutable preceding
+				 * exact TT_ABORT and excludes intervening reuse/mutation.
+				 * It cannot qualify history-only ABORTs, which stay blocked. */
+				if (!rf_side_online_plan_abort_target_v1(plan, &operation, &abort))
+					return false;
+				terminal.owner_instance = abort.instance;
+				terminal.segment_id = abort.segment_id;
+				terminal.segment_generation = abort.expected_generation;
+				terminal.slot_offset = abort.slot_offset;
+				terminal.slot_wrap = abort.wrap;
+				terminal.xid = abort.xid;
 			} else
 				continue;
 			if (cold_top_tx_key_equal_v1(&terminal, key))
@@ -621,15 +898,13 @@ cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
 	 * the complete ordinary inventory rather than trusting the proof flags
 	 * for those inputs. This does not establish checkpoint coverage,
 	 * atomic transaction effects or old-writer isolation. */
-	if (!cluster_cold_typed_tt_redo_inventory_v1(typed))
+	if (!cluster_cold_typed_tt_redo_inventory_v1(typed) || !cold_top_tx_frames_v1(typed))
 		return false;
 	/* Compare the whole selected header with its sealed original fold.  A
 	 * newly-created segment requires the existing native full-image proof;
 	 * its observed bytes can never supply a missing predecessor. */
 	if (!cluster_cold_typed_tt_after_redo_readback_v1(typed, participant, post_segment_index,
 													  &post_image))
-		return false;
-	if (!cold_top_tx_terminals_compatible_v1(typed, &post_slot.key))
 		return false;
 	/* The caller's producer_top bit is not an original producer fact. Only
 	 * this source's exact native BIND currently qualifies this gate here. */
@@ -652,6 +927,17 @@ cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
 	 * establish completed sealed redo. The caller's bit cannot add or revoke
 	 * that fact. Atomic transaction effects remain an independent proof. */
 	qualified.sealed_redo = true;
+	/* The whole retained INIT/REUSE lifecycle reaches this exact physical
+	 * ACTIVE image after completed all-record redo. Together with the full
+	 * retained terminal check, this supplies the terminal proof on either
+	 * side of the selected redo cut. A missing lifecycle/coverage or an
+	 * ambiguous ABORT cannot be replaced by the caller's terminal bit. */
+	qualified.terminal_match = qualified.qualified_base && qualified.sealed_redo
+							   && cold_top_tx_terminals_compatible_v1(typed, &post_slot.key);
+	/* Only the original target owner can supply real old-writer isolation.
+	 * Its current pass-2 authority remains distinct from a C0 write grant. */
+	qualified.old_writer_isolated
+		= cluster_cold_typed_old_writer_isolated_v1(typed, fence, participant);
 	result.active.key = post_slot.key;
 	if (!cluster_cold_top_tx_loser_v1(&result.active, &qualified, &result.loser)
 		|| !cluster_cold_top_tx_c0_v1(&result.loser, shape, next_xid, true, has_oldest_xid,
@@ -661,10 +947,11 @@ cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
 			   != CLUSTER_RECOVERY_TT_ABORT_APPLY)
 		return false;
 	/* The inventory may read additional UNDO blocks. Recheck every retained
-	 * physical input again before publishing this candidate descriptor.
-	 * This is not a substitute for the independent old-writer isolation. */
+	 * physical input and original target isolation again before publishing
+	 * this candidate descriptor. Neither check grants C0 write authority. */
 	if (cluster_cold_tt_after_redo_recheck_v1(typed) != CLUSTER_COLD_OK
-		|| !cluster_cold_typed_sources_current_v1(typed, fence))
+		|| !cluster_cold_typed_sources_current_v1(typed, fence)
+		|| !cluster_cold_typed_old_writer_isolated_v1(typed, fence, participant))
 		return false;
 	*out = result;
 	return true;

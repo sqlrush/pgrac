@@ -3190,6 +3190,87 @@ UT_TEST(test_tt_base_drift_refuses_later_pass_two_consumer)
 	endpoint_destroy(&typed);
 }
 
+UT_TEST(test_c0_isolation_uses_original_foreign_target_authority)
+{
+	ClusterColdRecordV1 record;
+	ClusterColdTypedV1 *typed = control_fixture(&record);
+	ClusterRecoveryFencePlan *fence = (ClusterRecoveryFencePlan *)&fixture_context;
+	unsigned syncs = source_sync_calls;
+
+	UT_ASSERT(!cluster_cold_typed_old_writer_isolated_v1(NULL, fence, 1));
+	UT_ASSERT(cluster_cold_typed_old_writer_isolated_v1(typed, fence, 1));
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(source_sync_calls, syncs);
+	UT_ASSERT_EQ(control_calls, 0);
+	UT_ASSERT_EQ(control_init_calls, 0);
+	cluster_cold_replay_window_leave_v1();
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
+UT_TEST(test_c0_isolation_refuses_missing_or_stale_original_target_authority)
+{
+	for (int fault = 0; fault < 15; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = control_fixture(&record);
+		ClusterRecoveryFencePlan *fence = (ClusterRecoveryFencePlan *)&fixture_context;
+		uint32 participant = 1;
+
+		UT_ASSERT(cluster_cold_typed_old_writer_isolated_v1(typed, fence, participant));
+		switch (fault) {
+		case 0:
+			fence = NULL;
+			break;
+		case 1:
+			participant = typed->own_participant;
+			break;
+		case 2:
+			participant = typed->replay_count;
+			break;
+		case 3:
+			control_borrow_ok = false;
+			break;
+		case 4:
+			control_authority_ok = false;
+			break;
+		case 5:
+			control_cover_ok = false;
+			break;
+		case 6:
+			control_serial.mode = 0;
+			break;
+		case 7:
+			control_root.validated_tail_lsn_exclusive++;
+			break;
+		case 8:
+			control_token.file_txn_seq++;
+			break;
+		case 9:
+			fence_current = false;
+			break;
+		case 10:
+			cluster_cold_replay_window_leave_v1();
+			break;
+		case 11:
+			typed->refusal = CLUSTER_COLD_SOURCE_GAP;
+			break;
+		case 12:
+			tokens[3].file_txn_seq++;
+			break;
+		case 13:
+			typed->sources[1].claim.claim_sha256[31]++;
+			break;
+		case 14:
+			typed->own_participant = 1;
+			break;
+		}
+		UT_ASSERT(!cluster_cold_typed_old_writer_isolated_v1(typed, fence, participant));
+		UT_ASSERT_EQ(control_calls, 0);
+		UT_ASSERT_EQ(control_init_calls, 0);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
 UT_TEST(test_c0_sources_current_uses_original_owner_without_refresh)
 {
 	ClusterColdTypedV1 *typed = endpoint_fixture(true);
@@ -3397,7 +3478,7 @@ UT_TEST(test_checkpoint_export_clears_unsealed_and_failed_output)
 int
 main(void)
 {
-	UT_PLAN(122);
+	UT_PLAN(124);
 	UT_RUN(test_prepare_invalidates_old_retention_before_first_root);
 	UT_RUN(test_prepare_retention_refusal_stops_before_any_recovery_input);
 	UT_RUN(test_prepare_input_refusal_and_retry_repeat_retention_invalidation);
@@ -3442,6 +3523,8 @@ main(void)
 	UT_RUN(test_history_side_capture_refusals_keep_original_boundaries);
 	UT_RUN(test_ready_refuses_incomplete_history_capture_before_ir);
 	UT_RUN(test_ready_refuses_unsupported_history_capture_before_ir);
+	UT_RUN(test_c0_isolation_uses_original_foreign_target_authority);
+	UT_RUN(test_c0_isolation_refuses_missing_or_stale_original_target_authority);
 	UT_RUN(test_c0_sources_current_uses_original_owner_without_refresh);
 	UT_RUN(test_c0_sources_current_refuses_lost_original_inputs_stickily);
 	UT_RUN(test_c0_sources_current_error_clears_inputs_and_preserves_prior_refusal);

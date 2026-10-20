@@ -69,6 +69,9 @@ typedef struct RfSideOnlineOperationV1 {
 	SCN control_scn;
 	RfSidePlanPurposeV1 purpose;
 	TransactionId source_xid;
+	/* Original WAL frame metadata, owned before the reader is reused.
+	 * An absent top is not proof of canonical operation ownership. */
+	TransactionId source_top_xid;
 	ClusterRecoveryTTAbortV1 recovery_abort;
 	uint16 recovery_target_source; /* retained source-set index, not streamed participant */
 } RfSideOnlineOperationV1;
@@ -262,6 +265,14 @@ extern RfPageProofDetailV1
 rf_side_online_plan_prepare_undo_record_header_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 												  const RfPageOnlineRecordIdentityV1 *identity,
 												  const char *base, RfSideUndoHeaderImageV1 *out);
+/* Read-only header input at the same exact prefix, also allowing a retained
+ * history record as its endpoint. Original source/identity and lifecycle/base
+ * checks still apply. This grants no apply, durability or coverage authority;
+ * the execution preparation APIs above continue to reject history endpoints.
+ * No output change on refusal. */
+extern RfPageProofDetailV1 rf_side_online_plan_prepare_undo_record_input_header_v1(
+	const RfSideOnlinePlanV1 *plan, uint32 index, const RfPageOnlineRecordIdentityV1 *identity,
+	const char *base, RfSideUndoHeaderImageV1 *out);
 extern uint32 rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan);
 typedef struct RfSideSpaceContributionV1 {
 	ClusterSpaceIdentity result;
