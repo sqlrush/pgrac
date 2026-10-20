@@ -10,16 +10,18 @@
  *	  reconstructs a CR image of the same recently-deleted row re-runs that whole
  *	  scan independently.  This memo caches the position the LAST scan matched --
  *	  (xid_epoch, raw_xid, origin) -> {seg, slot, wrap} -- so a peer backend can
- *	  RE-VALIDATE that one slot in O(1) (cluster_tt_slot_durable_lookup) instead
- *	  of re-searching every segment.
+ *	  RE-VALIDATE that one slot in O(1)
+ *	  (cluster_tt_slot_durable_lookup_committed_stable) instead of re-searching
+ *	  every segment.
  *
  *	  The cached {seg,slot,wrap} is a POSITION HINT, never an authoritative value
  *	  (spec-5.55 §3.1, all 8.A):
  *	   (1) memo non-authoritative: the commit_scn is ALWAYS a fresh durable
- *	       re-read (cluster_tt_slot_durable_lookup); commit_scn_debug is
- *	       observability only, never returned.
- *	   (2) exact-(xid,wrap) re-validation: a recycled / wrap-bumped slot fails the
- *	       lookup -> probe miss -> the caller re-scans (a pure search shortcut).
+ *	       re-read (cluster_tt_slot_durable_lookup_committed_stable).
+ *	       commit_scn_debug is observability only, never returned.
+ *	   (2) stable exact-(xid,wrap) + native C1b re-validation: require matching
+ *	       TT reads bracketing native commit proof.  A precommit-only, recycled,
+ *	       wrap-bumped or changing slot is a miss -> caller re-scans.
  *	   (3) acceptance same-segment rerun: a memo hit runs the SAME wrap_suspect
  *	       acceptance gate (cluster_cr_accept_resolved_scn: WRAP_ANY + the CURRENT
  *	       retention horizon + the sticky retention reliability) as a fresh scan
@@ -27,8 +29,8 @@
  *	       acceptance.
  *	   (4) xid_epoch fence: a single monotonic own-instance FullTransactionId
  *	       epoch (cluster_resolver_xid_epoch) makes a hint from epoch E a key MISS
- *	       in E+1, before raw_xid can be reused -- the cross-incarnation ambiguity
- *	       belt.  (pgrac segments the xid space by (origin_node_id, xid) compound
+ *	       in E+1; recheck after durable/native reads before returning a candidate.
+ *	       (pgrac segments the xid space by (origin_node_id, xid) compound
  *	       key, NOT by value-range, so own-instance raw-xid reuse period == one
  *	       own-node FullTransactionId epoch == this counter's granularity.)
  *	   (5) cross-instance fail-closed: own-instance scans only (CR Source 3).
@@ -116,11 +118,12 @@ extern uint64 cluster_resolver_xid_epoch(void);
 
 /*
  * cluster_resolver_cache_probe -- look up the memo for (current-epoch, raw_xid,
- *	origin) and, on a key match, LOCK-FREE re-validate the hint slot via
- *	cluster_tt_slot_durable_lookup (gate (1)+(2)+(4)).  Returns true and a
- *	CANDIDATE *out_scn (a fresh durable re-read) iff the slot STILL binds
- *	(raw_xid, hint.wrap) COMMITTED.  The CALLER MUST still run the SAME acceptance
- *	gate (cluster_cr_accept_resolved_scn, gate (3)) it runs on a fresh scan --
+ *	origin) and, on a key match, re-validate outside the cache partition lock via
+ *	cluster_tt_slot_durable_lookup_committed_stable (gate (1)+(2)+(4)).  Returns
+ *	true and a CANDIDATE *out_scn (a fresh durable re-read) iff the slot STILL binds
+ *	(raw_xid, hint.wrap) COMMITTED with native C1b and the epoch still matches.
+ *	The CALLER MUST still run the SAME acceptance gate
+ *	(cluster_cr_accept_resolved_scn, gate (3)) it runs on a fresh scan --
  *	probe does NO acceptance.  Returns false (no count) when the region is off.
  */
 extern bool cluster_resolver_cache_probe(uint16 origin_node, TransactionId raw_xid, SCN *out_scn);

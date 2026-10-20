@@ -3,8 +3,8 @@
  * test_cluster_resolver_cache.c
  *	  spec-5.55 unit tests for the shared resolver cache module
  *	  (cluster_resolver_cache.o), with malloc-backed shmem + no-op LWLock stubs
- *	  and a MOCKED cluster_tt_slot_durable_lookup (the gate (2) re-validation) +
- *	  MOCKED ReadNextFullTransactionId (the gate (4) own-instance xid epoch).
+ *	  and MOCKED durable TT lookups (the gate (2) re-validation) + native
+ *	  commit check and ReadNextFullTransactionId (gate (4) own xid epoch).
  *
  *	  Covers the module-local gates: (1) memo non-authoritative (probe returns the
  *	  mocked DURABLE scn, never the cached commit_scn_debug), (2) exact-(xid,wrap)
@@ -45,7 +45,7 @@
 #include "access/transam.h" /* FullTransactionId */
 #include "cluster/cluster_resolver_cache.h"
 #include "cluster/cluster_shmem.h"		/* ClusterShmemRegion */
-#include "cluster/cluster_tt_durable.h" /* cluster_tt_slot_durable_lookup proto */
+#include "cluster/cluster_tt_durable.h" /* durable lookup prototypes */
 #include "storage/lwlock.h"
 #include "storage/shmem.h" /* ShmemInitStruct proto */
 
@@ -129,17 +129,59 @@ static uint16 mock_lookup_seg = 0;
 static uint16 mock_lookup_slot = 0;
 static uint32 mock_lookup_wrap = 0;
 static TransactionId mock_lookup_xid = 0;
+static bool mock_commit_result = true;
+static int mock_commit_calls = 0;
+static TransactionId mock_commit_xid = InvalidTransactionId;
+static int mock_plain_lookup_calls = 0;
+static int mock_stable_lookup_calls = 0;
+static bool mock_advance_epoch_during_lookup = false;
+static ClusterTTDurableXidCommitCheck mock_commit_check = NULL;
 
-bool
-cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, TransactionId xid,
-							   uint32 expected_wrap, SCN *commit_scn)
+static bool
+mock_durable_lookup(uint32 segment_id, uint16 slot_offset, TransactionId xid, uint32 expected_wrap)
 {
 	mock_lookup_calls++;
 	mock_lookup_seg = (uint16)segment_id;
 	mock_lookup_slot = slot_offset;
 	mock_lookup_wrap = expected_wrap;
 	mock_lookup_xid = xid;
-	if (!mock_lookup_result)
+	if (mock_advance_epoch_during_lookup)
+		mock_epoch++;
+	return mock_lookup_result;
+}
+
+bool
+TransactionIdDidCommit(TransactionId xid)
+{
+	mock_commit_calls++;
+	mock_commit_xid = xid;
+	return mock_commit_result;
+}
+
+/* Keep the old lookup double so RED can execute the unchanged product. */
+bool
+cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, TransactionId xid,
+							   uint32 expected_wrap, SCN *commit_scn)
+{
+	mock_plain_lookup_calls++;
+	if (!mock_durable_lookup(segment_id, slot_offset, xid, expected_wrap))
+		return false;
+	if (commit_scn != NULL)
+		*commit_scn = mock_lookup_scn;
+	return true;
+}
+
+/* The real helper's two-read stability is covered by test_cluster_tt_durable. */
+bool
+cluster_tt_slot_durable_lookup_committed_stable(uint32 segment_id, uint16 slot_offset,
+												TransactionId xid, uint32 expected_wrap,
+												ClusterTTDurableXidCommitCheck xid_committed,
+												SCN *commit_scn)
+{
+	mock_stable_lookup_calls++;
+	mock_commit_check = xid_committed;
+	if (!mock_durable_lookup(segment_id, slot_offset, xid, expected_wrap) || xid_committed == NULL
+		|| !xid_committed(xid))
 		return false;
 	if (commit_scn != NULL)
 		*commit_scn = mock_lookup_scn;
@@ -167,6 +209,13 @@ mock_reset(void)
 	mock_lookup_seg = mock_lookup_slot = 0;
 	mock_lookup_wrap = 0;
 	mock_lookup_xid = 0;
+	mock_commit_result = true;
+	mock_commit_calls = 0;
+	mock_commit_xid = InvalidTransactionId;
+	mock_plain_lookup_calls = 0;
+	mock_stable_lookup_calls = 0;
+	mock_advance_epoch_during_lookup = false;
+	mock_commit_check = NULL;
 }
 
 /* =====================================================================
@@ -206,6 +255,57 @@ UT_TEST(test_probe_hit_returns_durable_not_debug)
 	UT_ASSERT_EQ((int)cluster_resolver_cache_hit_count(), 1);
 	UT_ASSERT_EQ((int)cluster_resolver_cache_key_present_count(), 1);
 	UT_ASSERT_EQ((int)cluster_resolver_cache_lookup_count(), 1);
+	UT_ASSERT_EQ(mock_stable_lookup_calls, 1);
+	UT_ASSERT_EQ(mock_plain_lookup_calls, 0);
+	UT_ASSERT_EQ(mock_commit_calls, 1);
+	UT_ASSERT_EQ((int)mock_commit_xid, 777);
+	UT_ASSERT(mock_commit_check == TransactionIdDidCommit);
+}
+
+/* A TT precommit stamp is not native commit proof, in TRUST or MEASURE mode. */
+UT_TEST(test_probe_requires_native_commit_proof)
+{
+	int measure;
+
+	for (measure = 0; measure < 2; measure++) {
+		SCN got = scn_encode(1, 999);
+
+		mock_reset();
+		rc_init(64, measure != 0, measure == 0);
+		mock_epoch = 5;
+		cluster_resolver_cache_install(0, 777, 3, 7, 2, scn_encode(1, 100));
+		mock_lookup_scn = scn_encode(1, 200);
+		mock_commit_result = false;
+		UT_ASSERT_EQ((int)cluster_resolver_cache_probe(0, 777, &got), 0);
+		UT_ASSERT_EQ((int)SCN_VALID(got), 0);
+		UT_ASSERT_EQ((int)cluster_resolver_cache_revalidate_miss_count(), 1);
+		UT_ASSERT_EQ((int)cluster_resolver_cache_hit_count(), 0);
+		UT_ASSERT_EQ(mock_commit_calls, 1);
+	}
+}
+
+/* The partition lock is released before I/O; the epoch must still match after. */
+UT_TEST(test_probe_epoch_changes_during_lookup)
+{
+	int measure;
+
+	for (measure = 0; measure < 2; measure++) {
+		SCN got = scn_encode(1, 999);
+
+		mock_reset();
+		rc_init(64, measure != 0, measure == 0);
+		mock_epoch = 5;
+		cluster_resolver_cache_install(0, 777, 3, 7, 2, scn_encode(1, 100));
+		mock_lookup_scn = scn_encode(1, 200);
+		mock_advance_epoch_during_lookup = true;
+		UT_ASSERT_EQ((int)cluster_resolver_cache_probe(0, 777, &got), 0);
+		UT_ASSERT_EQ((int)SCN_VALID(got), 0);
+		UT_ASSERT_EQ((int)cluster_resolver_cache_epoch_miss_count(), 1);
+		UT_ASSERT_EQ((int)cluster_resolver_cache_key_present_count(), 1);
+		UT_ASSERT_EQ((int)cluster_resolver_cache_revalidate_miss_count(), 0);
+		UT_ASSERT_EQ((int)cluster_resolver_cache_hit_count(), 0);
+		UT_ASSERT_EQ(mock_lookup_calls, 1);
+	}
 }
 
 /* U (gate 2): probe re-validates with the HINT WRAP (concrete), not WRAP_ANY. */
@@ -445,9 +545,11 @@ UT_TEST(test_measure_mode_region_live)
 int
 main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 {
-	UT_PLAN(18);
+	UT_PLAN(20);
 	UT_RUN(test_off_entries0_noop);
 	UT_RUN(test_probe_hit_returns_durable_not_debug);
+	UT_RUN(test_probe_requires_native_commit_proof);
+	UT_RUN(test_probe_epoch_changes_during_lookup);
 	UT_RUN(test_probe_uses_hint_wrap);
 	UT_RUN(test_probe_revalidate_miss);
 	UT_RUN(test_epoch_fence_miss);

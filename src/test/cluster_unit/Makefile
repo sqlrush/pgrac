@@ -8670,8 +8670,8 @@ test_cluster_cr_admit: test_cluster_cr_admit.c unit_test.h \
 
 # spec-5.55: test_cluster_resolver_cache — shared resolver cache module
 # (cluster_resolver_cache.o) with malloc-backed ShmemInitStruct + no-op LWLock
-# stubs and a MOCKED cluster_tt_slot_durable_lookup (gate 2 re-validation) +
-# MOCKED ReadNextFullTransactionId (gate 4 own-instance xid epoch).
+# stubs and MOCKED durable TT lookups/native commit (gate 2 re-validation) +
+# ReadNextFullTransactionId (gate 4 own-instance epoch before/after I/O).
 CLUSTER_RESOLVER_CACHE_O = $(top_builddir)/src/backend/cluster/cluster_resolver_cache.o
 test_cluster_resolver_cache: test_cluster_resolver_cache.c unit_test.h \
 		$(CLUSTER_RESOLVER_CACHE_O)
