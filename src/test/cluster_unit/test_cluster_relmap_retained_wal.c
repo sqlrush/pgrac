@@ -365,7 +365,7 @@ typedef struct RelmapRetainedSideFeed
 	uint32 participant;
 } RelmapRetainedSideFeed;
 
-/* Capture real native NOOP and typed TRUNCATE records with the original reader.
+/* Capture real native checkpoint/NOOP and typed TRUNCATE with the original reader.
  * This seals the source/cut fixture, not a complete recovery capture: RELMAP
  * remains with its native owner. The API under test cannot certify omitted
  * operations or independently qualify these plans for recovery execution. */
@@ -379,7 +379,9 @@ relmap_retained_side_feed(XLogReaderState *reader, void *arg)
 	RfPageProofDetailV1 result;
 
 	if (!((XLogRecGetRmid(reader) == RM_XLOG_ID &&
-		(XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_NOOP) ||
+		((XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_NOOP ||
+		 (XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_CHECKPOINT_SHUTDOWN ||
+		 (XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_CHECKPOINT_ONLINE)) ||
 		(XLogRecGetRmid(reader) == RM_SMGR_ID &&
 		(XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_SMGR_SPACE_IDENTITY)))
 		return true;
@@ -667,7 +669,8 @@ relmap_census_begin(RelmapCensusWalFixture *f, const ClusterRelmapV2Image *pendi
 		pending->identity.shared ? &clean : pending);
 	for (unsigned i = 0; i < 2; i++) {
 		UT_ASSERT_EQ(cluster_relmap_retention_build_start(&f->origin[i], TEST_SYSID,
-			pending->identity.database_incarnation, i == 0 ? 0 : 127, 1,
+			pending->identity.database_incarnation,
+			i == 0 ? 0 : (pending->pending_owner.node == 0 ? 127 : pending->pending_owner.node), 1,
 			UINT64CONST(0x100000003), UINT64CONST(0x100800000)), CLUSTER_RELMAP_RETENTION_OK);
 		f->directories[1 - i] = &f->origin[i];
 	}
@@ -1451,6 +1454,266 @@ UT_TEST(test_census_side_collector_error_invalidates_window)
 	cold_census_done(&inputs);
 }
 
+
+/* A genuine initializer terminal has a source completion but no records. Keep
+ * its original predecessor/history, and put RELMAP on independent origin 3.
+ * Transport, isolation and floor/issued qualification remain fixture inputs. */
+typedef struct RelmapEmptySideFixture
+{
+	ClusterRecoverySerialGuard serial;
+	ClusterRelmapPendingSideSource sources[3];
+	RfSideOnlinePlanV1 *plans[3];
+	unsigned empty;
+} RelmapEmptySideFixture;
+
+static ClusterWalInputsV1 *
+relmap_empty_initializer_fixture(RelmapEmptySideFixture *f,
+	ClusterRelmapV2Image *image, bool shared, bool split)
+{
+	ClusterThreadRecLaunchEligibility eligibility;
+	ClusterWalStartupImage op;
+	ClusterWalInputsV1 *inputs = NULL;
+	ControlRootImage root;
+	ControlFileData control;
+	ClusterControlRootFileToken token;
+	ClusterWalSourceRef source = { 0 }, sources[3];
+	RfContributorStreamCutV1 cuts[3];
+	XLogRecPtr redo[3];
+	uint32 input_index[3];
+	ClusterControlRootSnapshot *snapshot;
+	ClusterRecoveryAnchorRefV2 anchor_ref = { 0 };
+	ClusterRecoveryAnchorV2 anchor;
+	ControlFileData peer = { 0 };
+	uint8 anchor_bytes[512];
+	char path[MAXPGPATH], hex[65];
+	uint8 payload[MinSizeOfRelmapUpdate + sizeof(RelMapFile)];
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	xl_relmap_update update = { 0 };
+	WalTestRecord tail;
+	unsigned empty_count = 0, nonempty_count = 0;
+
+	memset(f, 0, sizeof(*f));
+	op = pending_worker_fixture(&f->serial, &eligibility);
+	if (ut_current_failed) return NULL;
+	test_worker_pin_held = false;
+	test_history_sync_count = 0;
+	test_history_fail_sync = UINT_MAX;
+	UT_ASSERT_EQ(thread_recovery_worker_run(&eligibility), CLUSTER_THREADREC_DONE);
+	test_history_fail_sync = 0;
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID,
+		&root, &control, &token), 0);
+	/* As in the original terminal visitor fixture, remove only the unrelated
+	 * uncompleted peer reservation. This edit grants no runtime admission. */
+	memset(&root.startup[3], 0, sizeof(root.startup[3]));
+	snapshot = &root.records[3];
+	UT_ASSERT_EQ(snapshot->identity.origin_node_id, 3);
+	UT_ASSERT_NE(snapshot->validated_tail_lsn_exclusive, InvalidXLogRecPtr);
+	/* The older peer fixture has nextXid zero. Before opening the cold scope,
+	 * seed a normal native checkpoint and matching anchor on this independent
+	 * peer only; the worker terminal and its predecessor remain untouched. */
+	anchor_ref.identity = snapshot->identity;
+	anchor_ref.database_incarnation = root.header.v2.database_incarnation;
+	anchor_ref.max_config_generation = root.header.v2.config_generation;
+	anchor_ref.anchor_generation = root.refs[3].anchor_generation;
+	memcpy(anchor_ref.anchor_sha256, root.refs[3].anchor_sha256, 32);
+	memcpy(anchor_ref.claim_sha256, root.refs[3].claim_sha256, 32);
+	for (unsigned i = 0; i < 32; i++)
+		snprintf(hex + i * 2, 3, "%02x", anchor_ref.anchor_sha256[i]);
+	snprintf(path, sizeof(path), "%s/global/anchor_images/thread_%u/generation_" UINT64_FORMAT
+		"/anchor_" UINT64_FORMAT "-%s.bin", test_root, snapshot->identity.origin_thread_id,
+		snapshot->identity.origin_owner_incarnation, anchor_ref.anchor_generation, hex);
+	read_all_or_abort(path, anchor_bytes, sizeof(anchor_bytes));
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(anchor_bytes, sizeof(anchor_bytes), &anchor_ref, &anchor), 0);
+	anchor.checkpoint_copy.nextXid = FullTransactionIdFromU64(103);
+	v2_anchor_object(root.bytes, &anchor, &snapshot->identity, path);
+	memcpy(root.refs[3].anchor_sha256, root.bytes + 512 + 3 * 512 + 264, 32);
+	peer.state = DB_SHUTDOWNED;
+	peer.checkPoint = anchor.checkpoint;
+	peer.checkPointCopy = anchor.checkpoint_copy;
+	v2_checkpoint_wal_record(&snapshot->identity, &peer, 0);
+	snapshot->checkpoint_record_crc32c = snapshot->tail_last_record_crc32c = test_checkpoint_crc;
+	snapshot->validated_tail_lsn_exclusive = test_checkpoint_end;
+	memset(image, 0, sizeof(*image));
+	image->identity.system_identifier = TEST_SYSID;
+	image->identity.database_incarnation = root.header.v2.database_incarnation;
+	image->identity.shared = shared;
+	image->identity.dbid = shared ? InvalidOid : 42;
+	image->committed_generation = 7;
+	image->pending_generation = 8;
+	image->pending_owner.node = snapshot->identity.origin_node_id;
+	image->pending_owner.admitted_incarnation = snapshot->identity.origin_owner_incarnation;
+	image->pending_owner.top_full_xid = UINT64CONST(0x100000000) + 4195136;
+	image->pending_owner.membership_epoch = 91;
+	image->pending_owner.boot_incarnation = 202;
+	image->committed.magic = RELMAPPER_FILEMAGIC;
+	image->committed.num_mappings = 1;
+	image->committed.mappings[0].mapoid = 1259;
+	image->committed.mappings[0].mapfilenumber = 40000;
+	relmap_test_crc(&image->committed);
+	image->pending = image->committed;
+	image->pending.mappings[0].mapfilenumber++;
+	relmap_test_crc(&image->pending);
+	source.claim.identity = snapshot->identity;
+	source.claim.database_incarnation = root.header.v2.database_incarnation;
+	source.claim.max_config_generation = root.header.v2.config_generation;
+	memcpy(source.claim.claim_sha256, root.refs[3].claim_sha256, 32);
+	source.timeline = snapshot->tail_tli;
+	update.dbid = image->identity.dbid;
+	update.tsid = shared ? GLOBALTABLESPACE_OID : DEFAULTTABLESPACE_OID;
+	update.nbytes = sizeof(RelMapFile);
+	memcpy(payload, &update, MinSizeOfRelmapUpdate);
+	memcpy(payload + MinSizeOfRelmapUpdate, &image->pending, sizeof(RelMapFile));
+	tail = relmap_test_append(&source, snapshot->validated_tail_lsn_exclusive,
+		snapshot->tail_last_record_lsn, RM_RELMAP_ID, payload, sizeof(payload));
+	image->pending_owner.wal_end = tail.exclusive_end;
+	relmap_test_truncate(image, wal);
+	tail = relmap_test_append(&source, tail.exclusive_end, tail.record_start,
+		RM_SMGR_ID, wal, sizeof(wal));
+	snapshot->tail_last_record_lsn = tail.record_start;
+	snapshot->tail_last_record_crc32c = tail.record_crc;
+	snapshot->validated_tail_lsn_exclusive = tail.exclusive_end;
+	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+	v2_write_roots(root.bytes);
+	test_actual_cf = test_cf_mode = NoLock;
+	test_inputs_startup_cf = true;
+	UT_ASSERT_EQ(inputs_begin_for_role(true, &inputs), 0);
+	if (inputs == NULL) return NULL;
+	UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), lengthof(f->sources));
+	if (cluster_wal_inputs_count_v1(inputs) != lengthof(f->sources)) return inputs;
+	for (unsigned i = 0; i < lengthof(f->sources); i++) {
+		const ClusterWalInputV1 *item = cluster_wal_inputs_at_v1(inputs, i);
+		unsigned target = item->kind == CLUSTER_WAL_INPUT_INITIALIZER_TERMINAL
+			? 2 : nonempty_count++;
+		ClusterRelmapPendingSideSource *input = &f->sources[target];
+
+		input_index[target] = i;
+		input->source = item->source;
+		input->cut.failed_thread = item->source.claim.identity.origin_thread_id;
+		input->cut.origin_owner_incarnation = item->source.claim.identity.origin_owner_incarnation;
+		input->cut.timeline_id = item->source.timeline;
+		input->cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+		if (item->kind == CLUSTER_WAL_INPUT_INITIALIZER_TERMINAL) {
+			UT_ASSERT_EQ(item->terminal.tail.records, 0);
+			UT_ASSERT(cluster_control_root_identity_equal(&item->source.claim.identity,
+				&op.claim.identity));
+			input->cut.scan_begin_inclusive = item->first_segment + SizeOfXLogLongPHD;
+			input->cut.scan_end_exclusive = input->cut.scan_begin_inclusive;
+			input->cut.flags |= RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY;
+			f->empty = target;
+			empty_count++;
+		} else {
+			UT_ASSERT_EQ(item->kind, CLUSTER_WAL_INPUT_CHECKPOINT);
+			input->cut.scan_begin_inclusive = item->checkpoint.checkpoint_lower_lsn;
+			input->cut.scan_end_exclusive = item->checkpoint.validated_tail_lsn_exclusive;
+		}
+		cuts[target] = input->cut;
+		sources[target] = input->source;
+		redo[target] = input->cut.scan_end_exclusive;
+	}
+	UT_ASSERT_EQ(empty_count, 1);
+	UT_ASSERT_EQ(nonempty_count, 2);
+	/* Keep the two checkpoint sources in thread order in a shared plan,
+	 * and the newer empty incarnation in its own plan. */
+	for (unsigned p = 0; p < (split ? lengthof(f->plans) : 2); p++) {
+		RfSideOnlinePlanRequestV1 request = { 0 };
+		unsigned first = split ? p : (p == 0 ? 0 : 2);
+		unsigned count = split || p != 0 ? 1 : 2;
+
+		request.system_identifier = TEST_SYSID;
+		memcpy(request.storage_uuid, v2_storage, 16);
+		request.physical_cuts = &cuts[first];
+		request.redo_starts = &redo[first];
+		request.participant_count = count;
+		request.purpose = RF_SIDE_PLAN_RECOVERY;
+		UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &f->plans[p]), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(rf_side_online_plan_bind_sources_v1(f->plans[p], &sources[first], count));
+		for (unsigned j = 0; j < count; j++) {
+			ClusterRelmapPendingSideSource *input = &f->sources[first + j];
+			RelmapRetainedSideFeed feed = { input, j };
+			ClusterWalTailObservation observation;
+
+			input->plan = f->plans[p];
+			if (!(input->cut.flags & RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY))
+				UT_ASSERT_EQ(cluster_wal_inputs_visit_retained_v1(inputs, input_index[first + j],
+					relmap_retained_side_feed, &feed, &observation), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		}
+		UT_ASSERT(rf_side_online_plan_bind_database_v1(f->plans[p], image->identity.database_incarnation));
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(f->plans[p]), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(rf_side_online_plan_space_target_count_v1(f->plans[p]), 0);
+	}
+	return inputs;
+}
+
+/* mode exercises both namespaces and shared/individual sealed plans. Refusal
+ * either omits the real empty source or replaces it with a nonempty duplicate. */
+static void
+relmap_empty_initializer_rebuild(bool refuse)
+{
+	int saved_node = cluster_node_id;
+	uint64 saved_incarnation = test_self_incarnation;
+
+	for (unsigned mode = 0; mode < 4; mode++) {
+		ClusterRelmapV2Image image = { 0 };
+		RelmapEmptySideFixture side;
+		ClusterWalInputsV1 *inputs = relmap_empty_initializer_fixture(&side, &image,
+			mode < 2, mode % 2 != 0);
+		RelmapCensusWalFixture f;
+		ClusterRelmapPendingSet pending, before;
+		ClusterRelmapPendingSideSource supplied[3];
+		ClusterRelmapPendingDescriptor key = relmap_census_descriptor(&image);
+		unsigned count = 0;
+
+		if (ut_current_failed || inputs == NULL) goto cleanup;
+		for (unsigned i = 0; i < lengthof(side.sources); i++)
+			if (!refuse || i != side.empty) supplied[count++] = side.sources[i];
+		if (refuse && mode >= 2) supplied[count++] = supplied[0];
+		UT_ASSERT_EQ(cluster_relmap_owner_retained_side_wal_v2(&image, inputs,
+			supplied, count), refuse ? CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH : CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(cluster_wal_inputs_revalidate_v1(inputs), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		relmap_census_begin(&f, &image, false);
+		(void)relmap_census_emission(&f, image.identity.dbid);
+		cluster_relmap_pending_init(&pending);
+		before = pending;
+		UT_ASSERT_EQ(cluster_relmap_retention_census_rebuild_pending_side_wal(f.census,
+			&pending, inputs, supplied, count), refuse ? CLUSTER_RELMAP_PENDING_NOT_READY
+			: CLUSTER_RELMAP_PENDING_OK);
+		if (refuse) {
+			UT_ASSERT_EQ(memcmp(&pending, &before, sizeof(pending)), 0);
+			UT_ASSERT_EQ(cluster_relmap_retention_census_next(f.census), CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+		} else {
+			UT_ASSERT(cluster_relmap_pending_contains(&pending, CLUSTER_RELMAP_PENDING_TRUNCATE, &key.identity));
+			UT_ASSERT(pending.entries[0].main_placeholder && !pending.entries[0].copies_cleared_readback
+				&& !pending.entries[0].native_terminal && !pending.entries[0].tt_complete
+				&& !pending.entries[0].space_complete);
+			UT_ASSERT(!cluster_relmap_pending_can_release(&pending, CLUSTER_RELMAP_PENDING_TRUNCATE, &key.identity));
+			UT_ASSERT_EQ(relmap_census_drain(&f), CLUSTER_RELMAP_CENSUS_DRAINED);
+		}
+		relmap_census_pin_retained(&f, &image, refuse);
+		UT_ASSERT_EQ(inputs_peer_begins + inputs_native_begin_calls + inputs_native_flush_calls, 0);
+		UT_ASSERT(inputs_pin_held && inputs_pin_current && test_actual_cf == NoLock);
+		relmap_census_end(&f);
+cleanup:
+		for (unsigned i = 0; i < lengthof(side.plans); i++)
+			rf_side_online_plan_destroy_v1(&side.plans[i]);
+		cold_census_done(&inputs);
+		test_reserve_mode = false;
+		cluster_node_id = saved_node;
+		test_self_incarnation = saved_incarnation;
+		if (ut_current_failed) return;
+	}
+}
+
+UT_TEST(test_census_side_wal_keeps_real_empty_initializer)
+{
+	relmap_empty_initializer_rebuild(false);
+}
+
+UT_TEST(test_census_side_wal_requires_real_empty_initializer)
+{
+	relmap_empty_initializer_rebuild(true);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1458,7 +1721,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(27);
+	UT_PLAN(29);
 	UT_RUN(test_retained_relmap_matches_each_selected_namespace);
 	UT_RUN(test_retained_relmap_requires_exact_pending);
 	UT_RUN(test_retained_relmap_scans_suffix_and_other_source);
@@ -1486,6 +1749,8 @@ main(int argc, char **argv)
 	UT_RUN(test_census_side_wal_window_clean_pair_and_destination);
 	UT_RUN(test_census_side_wal_checks_original_full_source_vector);
 	UT_RUN(test_census_side_collector_error_invalidates_window);
+	UT_RUN(test_census_side_wal_keeps_real_empty_initializer);
+	UT_RUN(test_census_side_wal_requires_real_empty_initializer);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
