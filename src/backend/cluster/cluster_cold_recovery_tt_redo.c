@@ -745,10 +745,10 @@ cold_top_tx_undo_delta_actor_v1(const ClusterColdTypedV1 *typed, uint32 particip
 	return true;
 }
 
-/* Preserve operation-local SIDE/PAGE/SPACE evidence, including retained history. A
- * known child frame cannot become canonical just because the candidate's
- * BIND is top. Conversely an unrelated operation names its own actor, not
- * this candidate. Replay DML additionally needs its own canonical creator
+/* Preserve every accepted record's local xid evidence, including cursor-only
+ * inputs and retained history. A known child frame cannot become canonical
+ * just because the candidate's BIND is top. Conversely an unrelated operation
+ * names its own actor, not this candidate. Replay DML additionally needs its own canonical creator
  * or actor prefix. Old tuple xmin/undo before-images and individual MX
  * members are not qualified here; ordinary_effects remains independent. */
 static bool
@@ -756,6 +756,18 @@ cold_top_tx_frames_v1(const ClusterColdTypedV1 *typed)
 {
 	uint32 count;
 
+	if (!cluster_cold_plan_input_frame_count_v1(typed->plan, &count))
+		return false;
+	for (uint32 i = 0; i < count; i++) {
+		ClusterColdRecordFrameV1 frame;
+
+		if (!cluster_cold_plan_input_frame_v1(typed->plan, i, &frame)
+			|| frame.participant >= typed->participant_count
+			|| !cold_top_tx_frame_xids_v1(frame.source_xid, frame.source_top_xid))
+			return false;
+	}
+	/* PAGE creator/actor helpers use the original PAGE/SPACE frame indices,
+	 * not the complete input transcript's indices. */
 	if (!cluster_cold_plan_record_frame_count_v1(typed->plan, &count))
 		return false;
 	for (uint32 i = 0; i < count; i++) {
@@ -764,8 +776,7 @@ cold_top_tx_frames_v1(const ClusterColdTypedV1 *typed)
 		bool creator, actor;
 
 		if (!cluster_cold_plan_record_frame_v1(typed->plan, i, &frame)
-			|| frame.participant >= typed->participant_count
-			|| !cold_top_tx_frame_xids_v1(frame.source_xid, frame.source_top_xid))
+			|| frame.participant >= typed->participant_count)
 			return false;
 		if (frame.history || frame.page_components == 0)
 			continue;

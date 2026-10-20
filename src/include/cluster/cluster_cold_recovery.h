@@ -1089,9 +1089,10 @@ extern bool cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
  * a caller assertion for missing authority. Derive terminal_match from the
  * complete native lifecycle, sealed redo and exact physical ACTIVE readback,
  * together with the retained terminal checks below. The caller's terminal
- * bit is ignored. Check original SIDE/PAGE/SPACE frame actor/top consistency
- * in every retained source, including history, and any present native BIND or
- * ordinary exact TT_ABORT actor against that operation's own durable slot xid.
+ * bit is ignored. Check original actor/top consistency in every accepted
+ * input record, including cursor-only records and retained history, and any
+ * present native BIND or ordinary exact TT_ABORT actor against that operation's
+ * own durable slot xid.
  * Original UNDO BLOCK_WRITE/MULTI FPIs also require complete native record
  * decoding, including historical records' own physical origin/TT locators.
  * The inventory also decodes every complete retained post-redo UNDO block,
