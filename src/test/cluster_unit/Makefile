@@ -667,13 +667,17 @@ test_cluster_relmap_v2_storage: test_cluster_relmap_v2_storage.c unit_test.h \
 		test_cluster_relmap_pending_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention_restore.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_restore.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER $< test_cluster_relmap_v2_storage_product.o \
 		test_cluster_relmap_pending_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention_restore.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
-		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(filter -lcrypto,$(LIBS)) -o $@
 
 test_cluster_relmap_v2: test_cluster_relmap_v2.c unit_test.h \
 		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
@@ -8649,6 +8653,12 @@ test_cluster_wal_writer: test_cluster_wal_writer.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_srcdir)/src/include/common/relmap.h \
+		$(top_srcdir)/src/include/utils/relmapper.h \
+		$(top_srcdir)/src/include/access/xlogreader.h \
+		$(top_srcdir)/src/include/catalog/pg_tablespace_d.h \
+		$(top_builddir)/src/common/libpgcommon.a \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
 		$(top_srcdir)/src/include/cluster/cluster_tt_local.h \
 		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \

@@ -9,6 +9,8 @@
 #include "common/cluster_relmap_v2.h"
 #include "storage/lwlock.h"
 
+struct XLogReaderState;
+
 /* Process-local preparation only. Keep the complete native writer reference;
  * the on-disk relmap header cannot substitute for its WAL/claim retention.
  * owner.wal_end is zero: this is not an encodable pending owner. */
@@ -28,6 +30,16 @@ extern bool cluster_relmap_owner_capture_v2(ClusterRelmapOwnerSampleV2 *out);
  * keeps the global X lock; RelationMappingLock may now be held. This rechecks
  * provenance only, never proves retention, WAL durability, stage or release. */
 extern bool cluster_relmap_owner_matches_v2(const ClusterRelmapOwnerSampleV2 *sample);
+
+/* Read-only, provisional match of a decoded pending image to the original
+ * selected source's current native RELMAP UPDATE. The retained visitor must
+ * have checked native CRC/source authority and supplied exact start/end LSNs.
+ * Neither a claim nor native WAL encodes the header's FullXid era, membership
+ * epoch or boot incarnation: qualify those independently, never reconstruct
+ * them here. Whole-source coverage and final retained-source/ROOT revalidation
+ * remain caller duties. True grants no terminal, stage or release authority. */
+extern bool cluster_relmap_owner_wal_matches_v2(const ClusterRelmapV2Image *image,
+	const ClusterWalSourceRef *source, const struct XLogReaderState *reader);
 
 /* Dormant preparation adapter, BEFORE RelationMappingLock/WAL/critical work.
  * Recheck this original sample, read the original TT owner's published receipt

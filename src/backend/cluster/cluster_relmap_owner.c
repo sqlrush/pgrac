@@ -5,6 +5,8 @@
 
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "access/xlogreader.h"
+#include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
@@ -13,6 +15,7 @@
 #include "miscadmin.h"
 #include "postmaster/interrupt.h"
 #include "storage/lwlock.h"
+#include "utils/relmapper.h"
 
 static bool
 relmap_owner_context(void)
@@ -83,6 +86,58 @@ cluster_relmap_owner_matches_v2(const ClusterRelmapOwnerSampleV2 *sample)
 		|| sample->writer.ref.timeline != GetWALInsertionTimeLine())
 		return false;
 	return cluster_wal_writer_check(&sample->writer) == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+bool
+cluster_relmap_owner_wal_matches_v2(const ClusterRelmapV2Image *image,
+	const ClusterWalSourceRef *source, const XLogReaderState *reader)
+{
+	uint8 wire[CLUSTER_RELMAP_V2_FILE_SIZE];
+	xl_relmap_update update;
+	TransactionId raw;
+	const char *data;
+
+	if (image == NULL || source == NULL || reader == NULL || reader->record == NULL
+		|| image->pending_generation == 0
+		|| cluster_relmap_v2_encode(image, wire, sizeof(wire)) != CLUSTER_RELMAP_V2_VALID
+		|| !cluster_wal_claim_v2_ref_valid(&source->claim) || source->timeline == 0)
+		return false;
+	if (image->identity.system_identifier != source->claim.identity.system_identifier
+		|| image->identity.database_incarnation != source->claim.database_incarnation
+		|| image->pending_owner.node != source->claim.identity.origin_node_id
+		|| image->pending_owner.admitted_incarnation
+			   != source->claim.identity.origin_owner_incarnation
+		|| reader->system_identifier != image->identity.system_identifier
+		|| reader->cluster_expected_thread_id != source->claim.identity.origin_thread_id
+		|| reader->seg.ws_tli != source->timeline)
+		return false;
+	if (reader->ReadRecPtr == InvalidXLogRecPtr || reader->EndRecPtr <= reader->ReadRecPtr
+		|| reader->record->lsn != reader->ReadRecPtr
+		|| reader->record->next_lsn != reader->EndRecPtr
+		|| reader->EndRecPtr != image->pending_owner.wal_end
+		|| XLogRecGetTotalLen(reader) > reader->EndRecPtr - reader->ReadRecPtr
+		|| XLogRecGetTotalLen(reader)
+			   < SizeOfXLogRecord + MinSizeOfRelmapUpdate + sizeof(RelMapFile)
+		|| XLogRecGetRmid(reader) != RM_RELMAP_ID
+		|| (XLogRecGetInfo(reader) & ~XLR_INFO_MASK) != XLOG_RELMAP_UPDATE
+		|| XLogRecHasAnyBlockRefs(reader) || XLogRecHasPageVersionEdge(reader)
+		|| XLogRecGetData(reader) == NULL
+		|| XLogRecGetDataLen(reader) != MinSizeOfRelmapUpdate + sizeof(RelMapFile))
+		return false;
+
+	/* This checks only the original raw XID. The era, membership epoch and
+	 * boot incarnation have no independent representation in these inputs. */
+	raw = XidFromFullTransactionId(FullTransactionIdFromU64(image->pending_owner.top_full_xid));
+	if (XLogRecGetXid(reader) != raw
+		|| (TransactionIdIsValid(XLogRecGetTopXid(reader)) && XLogRecGetTopXid(reader) != raw))
+		return false;
+	data = XLogRecGetData(reader);
+	memcpy(&update, data, MinSizeOfRelmapUpdate);
+	if (update.nbytes != sizeof(RelMapFile) || update.dbid != image->identity.dbid
+		|| (image->identity.shared ? update.tsid != GLOBALTABLESPACE_OID
+								 : !OidIsValid(update.tsid) || update.tsid == GLOBALTABLESPACE_OID))
+		return false;
+	return memcmp(data + MinSizeOfRelmapUpdate, &image->pending, sizeof(RelMapFile)) == 0;
 }
 
 ClusterRelmapRetentionResult

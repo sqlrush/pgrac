@@ -1451,7 +1451,7 @@ UT_TEST(test_requested_flush_rejects_foreign_or_unsafe_context_without_io)
 int
 main(void)
 {
-	UT_PLAN(103);
+	UT_PLAN(112);
 	UT_RUN(test_clean_writer_requires_selected_exit_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_requires_selected_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_keeps_runtime_fence_and_exact_owner_refusals);
@@ -1495,6 +1495,15 @@ main(void)
 	UT_RUN(test_relmap_owner_retention_rejects_foreign_namespace_and_arguments);
 	UT_RUN(test_relmap_owner_retention_rechecks_after_original_binding_read);
 	UT_RUN(test_relmap_owner_retention_preserves_core_refusals);
+	UT_RUN(test_relmap_native_wal_matches_shared_and_database_pending);
+	UT_RUN(test_relmap_native_wal_rejects_foreign_or_unqualified_source);
+	UT_RUN(test_relmap_native_wal_requires_exact_record_range_and_kind);
+	UT_RUN(test_relmap_native_wal_requires_original_raw_and_top_xid);
+	UT_RUN(test_relmap_native_wal_requires_exact_namespace_and_native_length);
+	UT_RUN(test_relmap_native_wal_compares_every_native_map_byte);
+	UT_RUN(test_relmap_native_wal_rejects_invalid_or_absent_pending_image);
+	UT_RUN(test_relmap_native_wal_null_inputs_never_match);
+	UT_RUN(test_relmap_native_wal_is_readonly_and_does_not_qualify_missing_era);
 	UT_RUN(test_relmap_runtime_refuses_before_attachment);
 	UT_RUN(test_relmap_runtime_birth_is_unknown_and_one_lock);
 	UT_RUN(test_relmap_runtime_unknown_never_adds_pin);
