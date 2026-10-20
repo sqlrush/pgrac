@@ -40,6 +40,8 @@
 #include "access/xlog.h"
 #include "catalog/pg_class_d.h"
 #include "miscadmin.h"
+#include "storage/proc.h"
+#include <unistd.h>
 
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_clean_leave.h"
@@ -4564,6 +4566,153 @@ ctrc_cleaner_publish_certificate(const ClusterCtrcOriginCertificateSnapshot *sna
 }
 #endif
 
+/* Passive one-row origin projection after the existing dispatch batch. */
+#ifndef CLUSTER_CTRC_UNIT_TEST
+#define CLUSTER_CTRC_ORIGIN_DISPATCH_TRACE_PRESENT 1
+static uint64 CtrcOriginTraceSequence;
+static uint64 CtrcOriginTraceCriticalSkipped;
+static uint64 CtrcOriginTraceLwlockSkipped;
+
+static void
+ctrc_origin_dispatch_trace_note_lock(LWLock *lock pg_attribute_unused(),
+								   LWLockMode mode pg_attribute_unused(), void *context)
+{
+	*(bool *)context = true;
+}
+
+static void
+ctrc_origin_dispatch_trace(const ClusterCtrcCloseDispatch *dispatch, Size ordinal, Size count)
+{
+	ClusterCtrcOriginEntry actual;
+	ClusterCtrcParticipantIdentity peer = {0};
+	const ClusterCtrcTxnKeyV1 *key;
+	const char *predicate = "snapshot.detached";
+	uint64 index = 0, actual_request = 0, mono_us = 0;
+	struct timespec now;
+	bool held = false, available = false, matches = false, peer_known = false;
+	volatile bool locked = false;
+
+	if (!cluster_trace_normal_stop || dispatch == NULL)
+		return;
+	if (CritSectionCount != 0) {
+		if (CtrcOriginTraceCriticalSkipped != UINT64_MAX)
+			CtrcOriginTraceCriticalSkipped++;
+		return;
+	}
+	ForEachLWLockHeldByMe(ctrc_origin_dispatch_trace_note_lock, &held);
+	if (held) {
+		if (CtrcOriginTraceLwlockSkipped != UINT64_MAX)
+			CtrcOriginTraceLwlockSkipped++;
+		return;
+	}
+	MemSet(&actual, 0, sizeof(actual));
+	key = &dispatch->key;
+	/* Fixed key-to-slot arithmetic, never a table scan/shmem_ready walk. */
+	if (ctrc_runtime_attached()) {
+		if (!ctrc_origin_index(key, &index))
+			predicate = "snapshot.key_shape";
+		else {
+			PG_TRY();
+			{
+				if (LWLockConditionalAcquire(&CtrcShared->origin_lock, LW_SHARED)) {
+					locked = true;
+					actual = ctrc_origin_entries()[index];
+					available = true;
+				} else
+					predicate = "snapshot.lock_busy";
+			}
+			PG_FINALLY();
+			{
+				if (locked)
+					LWLockRelease(&CtrcShared->origin_lock);
+			}
+			PG_END_TRY();
+		}
+	}
+	/* Validate this passive row's relation to the owned dispatch. This is
+	 * not the original mutation guard or a new permission/retirement proof. */
+	if (available) {
+		if (dispatch->participant.node_id < CLUSTER_CTRC_MAX_PARTICIPANTS) {
+			uint32 bit = UINT32_C(1) << dispatch->participant.node_id;
+			peer_known = (actual.touched_bitmap & bit) != 0;
+			peer = actual.touched[dispatch->participant.node_id];
+			actual_request = actual.close_request_id[dispatch->participant.node_id];
+		}
+		if (memcmp(&actual.key, key, sizeof(*key)) != 0)
+			predicate = "snapshot.key";
+		else if (actual.grant_generation != dispatch->grant_generation)
+			predicate = "snapshot.grant";
+		else if (actual.seal_generation != dispatch->seal_generation)
+			predicate = "snapshot.seal";
+		else if (!peer_known)
+			predicate = "snapshot.peer_absent";
+		else if (memcmp(&peer, &dispatch->participant, sizeof(peer)) != 0)
+			predicate = "snapshot.peer_identity";
+		else if (actual_request != dispatch->request_id)
+			predicate = "snapshot.request";
+		else {
+			predicate = "snapshot.matches";
+			matches = true;
+		}
+	}
+	if (clock_gettime(CLOCK_MONOTONIC, &now) == 0 && now.tv_sec >= 0
+		&& (uint64)now.tv_sec <= (UINT64_MAX - 999999) / 1000000)
+		mono_us = (uint64)now.tv_sec * 1000000 + (uint64)now.tv_nsec / 1000;
+	if (CtrcOriginTraceSequence != UINT64_MAX)
+		CtrcOriginTraceSequence++;
+	ereport(LOG, (errmsg_internal(
+		"PGRAC_FAMILY=CTRC_ORIGIN_DISPATCH event=dispatch.batch_return "
+		"event_seq=" UINT64_FORMAT " sequence_scope=process sequence_domain=CTRC_ORIGIN_DISPATCH "
+		"node_id=%d pid=%d procno=%d backend_id=%d backend_type=%d worker_id=%d "
+		"wall_us=" INT64_FORMAT " monotonic_us=" UINT64_FORMAT
+		" identity_source=owned_dispatch run_id_known=0 process_incarnation_known=0 full_xid_known=0 "
+		"delivery_known=0 ack_receipt_known=0 authoritative=0 shared_retired_known=0 shared_atomic_graph=0 "
+		"batch_ordinal=%zu batch_count=%zu request_id=" UINT64_FORMAT " suboperation=%u "
+		"expected_grant=%u expected_seal=" UINT64_FORMAT
+		" expected_system_identifier=" UINT64_FORMAT " expected_origin_node=%u expected_owner_instance=%u "
+		"expected_boot=" UINT64_FORMAT " expected_cluster_epoch=%u expected_formation=" UINT64_FORMAT
+		" expected_admission=" UINT64_FORMAT " expected_root_descriptor=" UINT64_FORMAT
+		" expected_root_id=" UINT64_FORMAT " expected_root_generation=" UINT64_FORMAT
+		" expected_segment=%u expected_segment_generation=%u expected_slot=%u expected_tt_wrap=%u expected_xid=%u "
+		"expected_peer=%u expected_peer_boot=" UINT64_FORMAT " expected_peer_capability=%u "
+		"expected_peer_formation=" UINT64_FORMAT " expected_peer_admission=" UINT64_FORMAT
+		" origin_sample_available=%d origin_binding_match=%d origin_predicate=%s origin_index=" UINT64_FORMAT
+		" origin_state=%u origin_reservation_generation=" UINT64_FORMAT
+		" origin_grant=%u origin_seal=" UINT64_FORMAT " origin_touched=%u origin_dispatched=%u "
+		"origin_close_confirmed=%u origin_ack=%u origin_touched_count=%u "
+		"actual_system_identifier=" UINT64_FORMAT " actual_origin_node=%u actual_owner_instance=%u "
+		"actual_boot=" UINT64_FORMAT " actual_cluster_epoch=%u actual_formation=" UINT64_FORMAT
+		" actual_admission=" UINT64_FORMAT " actual_root_descriptor=" UINT64_FORMAT
+		" actual_root_id=" UINT64_FORMAT " actual_root_generation=" UINT64_FORMAT
+		" actual_segment=%u actual_segment_generation=%u actual_slot=%u actual_tt_wrap=%u actual_xid=%u "
+		"actual_peer_known=%d actual_peer=%u actual_peer_boot=" UINT64_FORMAT " actual_peer_capability=%u "
+		"actual_peer_formation=" UINT64_FORMAT " actual_peer_admission=" UINT64_FORMAT
+		" actual_request_id=" UINT64_FORMAT " critical_skipped=" UINT64_FORMAT
+		" lwlock_skipped=" UINT64_FORMAT " sequence_exhausted=%d",
+		CtrcOriginTraceSequence, cluster_node_id, (int)getpid(), MyProc != NULL ? MyProc->pgprocno : -1,
+		(int)MyBackendId, (int)MyBackendType, CtrcWorkerId, GetCurrentTimestamp(), mono_us,
+		(size_t)ordinal, (size_t)count, dispatch->request_id, dispatch->suboperation,
+		dispatch->grant_generation, dispatch->seal_generation, key->system_identifier,
+		key->origin_node_id, key->owner_instance, key->origin_boot_incarnation, key->cluster_epoch,
+		key->formation_epoch, key->admission_record_generation, key->root_descriptor_incarnation,
+		key->root_id, key->root_generation, key->segment_id, key->segment_generation,
+		key->slot_offset, key->slot_wrap, key->xid, dispatch->participant.node_id,
+		dispatch->participant.boot_incarnation, dispatch->participant.capability_record_generation,
+		dispatch->participant.formation_epoch, dispatch->participant.admission_record_generation,
+		available, matches, predicate, index, actual.state, actual.reservation_generation,
+		actual.grant_generation, actual.seal_generation, actual.touched_bitmap, actual.close_dispatched_bitmap,
+		actual.close_confirmed_bitmap, actual.ack_bitmap, actual.touched_count,
+		actual.key.system_identifier, actual.key.origin_node_id, actual.key.owner_instance,
+		actual.key.origin_boot_incarnation, actual.key.cluster_epoch, actual.key.formation_epoch,
+		actual.key.admission_record_generation, actual.key.root_descriptor_incarnation, actual.key.root_id,
+		actual.key.root_generation, actual.key.segment_id, actual.key.segment_generation,
+		actual.key.slot_offset, actual.key.slot_wrap, actual.key.xid, peer_known, peer.node_id,
+		peer.boot_incarnation, peer.capability_record_generation, peer.formation_epoch,
+		peer.admission_record_generation, actual_request, CtrcOriginTraceCriticalSkipped,
+		CtrcOriginTraceLwlockSkipped, CtrcOriginTraceSequence == UINT64_MAX)));
+}
+#endif
+
 bool
 cluster_ctrc_cleaner_run_pass(void)
 {
@@ -4618,6 +4767,9 @@ cluster_ctrc_cleaner_run_pass(void)
 			/* An accepted duplicate and a remote enqueue are not progress.
 			 * Only the actual shared reply/participant edges record it. */
 			cluster_gcs_ctrc_dispatch_batch(dispatches, dispatch_count);
+			if (cluster_trace_normal_stop)
+				for (Size i = 0; i < dispatch_count; i++)
+					ctrc_origin_dispatch_trace(&dispatches[i], i, dispatch_count);
 		}
 		for (unsigned i = 0;
 			 i < CTRC_CLEANER_CERTIFICATE_BATCH && CtrcBatch.remaining[CTRC_SCAN_CERTIFICATE] != 0;

@@ -73,6 +73,7 @@ static void test_pool_upgrade(void);
 #define clock_gettime test_clock_gettime
 #include "../../backend/cluster/cluster_terminal_ref_census.c"
 #undef clock_gettime
+#include "storage/proc.h"
 
 #undef printf
 #undef fprintf
@@ -83,6 +84,13 @@ UT_DEFINE_GLOBALS();
 int NBuffers = 16;
 int MaxBackends = 8;
 int cluster_node_id = 0;
+bool cluster_trace_normal_stop;
+PGPROC *MyProc = NULL;
+BackendId MyBackendId = InvalidBackendId;
+static bool origin_log_enabled, origin_log_throw, origin_driver_pending, origin_require_dispatch_return;
+static bool origin_dispatch_returned;
+static unsigned origin_log_count, origin_dispatch_calls;
+static char origin_last_log[8192];
 BackendType MyBackendType = B_BACKEND;
 AuxProcType MyAuxProcType = NotAnAuxProcess;
 int MyProcPid = 2901;
@@ -381,7 +389,8 @@ LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
 {
 	observe_conditional_calls++;
 	if ((observe_busy_kind == 1 && lock->tranche == LWTRANCHE_CLUSTER_CTRC_PARTICIPANT)
-		|| (observe_busy_kind == 2 && lock == &CtrcShared->receipt_lock))
+		|| (observe_busy_kind == 2 && lock == &CtrcShared->receipt_lock)
+		|| (observe_busy_kind == 3 && lock == &CtrcShared->origin_lock))
 		return false;
 	return LWLockAcquire(lock, mode);
 }
@@ -392,6 +401,12 @@ test_clock_gettime(clockid_t clock_id pg_attribute_unused(), struct timespec *ts
 	ts->tv_sec = test_now_us / UINT64_C(1000000);
 	ts->tv_nsec = (test_now_us % UINT64_C(1000000)) * 1000;
 	return 0;
+}
+
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	return (TimestampTz)test_now_us;
 }
 
 int
@@ -423,9 +438,9 @@ cluster_undo_cleaner_wakeup(void)
 }
 
 bool
-errstart(int level pg_attribute_unused(), const char *domain pg_attribute_unused())
+errstart(int level, const char *domain pg_attribute_unused())
 {
-	return false;
+	return level == LOG && origin_log_enabled;
 }
 
 bool
@@ -447,8 +462,12 @@ errmsg(const char *fmt pg_attribute_unused(), ...)
 }
 
 int
-errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+errmsg_internal(const char *fmt, ...)
 {
+	va_list arguments;
+	va_start(arguments, fmt);
+	vsnprintf(origin_last_log, sizeof(origin_last_log), fmt, arguments);
+	va_end(arguments);
 	return 0;
 }
 
@@ -456,6 +475,13 @@ void
 errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused(),
 		  const char *func pg_attribute_unused())
 {
+	if (origin_log_enabled) {
+		UT_ASSERT_EQ(held_count, 0); UT_ASSERT_EQ(CritSectionCount, 0);
+		if (origin_require_dispatch_return) UT_ASSERT(origin_dispatch_returned);
+		origin_log_count++;
+		if (origin_log_throw) pg_re_throw();
+		return;
+	}
 	abort();
 }
 
@@ -472,6 +498,12 @@ reset_fixture(void)
 	MyBackendType = B_BACKEND;
 	observe_busy_kind = 0;
 	observe_conditional_calls = 0;
+	cluster_trace_normal_stop = origin_log_enabled = origin_log_throw = false;
+	origin_driver_pending = origin_require_dispatch_return = origin_dispatch_returned = false;
+	origin_log_count = origin_dispatch_calls = 0; origin_last_log[0] = '\0';
+#ifdef CLUSTER_CTRC_ORIGIN_DISPATCH_TRACE_PRESENT
+	CtrcOriginTraceCriticalSkipped = CtrcOriginTraceLwlockSkipped = 0;
+#endif
 	CritSectionCount = 0;
 	allow_new_service_participant = true;
 	new_service_participant_calls = 0;
@@ -2344,10 +2376,16 @@ static void
 driver_dispatch_boundary(const ClusterCtrcCloseDispatch *dispatches pg_attribute_unused(),
 						 Size count pg_attribute_unused())
 {
+	origin_dispatch_calls++;
+	if (origin_driver_pending)
+		for (Size i = 0; i < count; i++)
+			UT_ASSERT(cluster_ctrc_origin_note_close_reply_shared(dispatches[i].request_id,
+				dispatches[i].participant.node_id, CTRC_SEAL_REPLY_PENDING_DRAIN));
 	if (driver_other_progress)
 		cluster_ctrc_stat_bump(CTRC_STAT_SEMANTIC_PROGRESS);
 	if (driver_interrupt)
 		pg_re_throw();
+	origin_dispatch_returned = true;
 }
 
 bool ctrc_fixture_run_pass(void);
@@ -3087,6 +3125,167 @@ UT_TEST(test_receipt_observation_unattached_or_invalid_output_stays_unknown)
 #endif
 }
 
+
+static ClusterCtrcOriginEntry *
+origin_trace_fixture(ClusterCtrcCloseDispatch *dispatch)
+{
+	ClusterCtrcOriginEntry *origin;
+	reset_fixture(); origin = seed_origin(0, 1); UT_ASSERT(bind_test_worker(0));
+	UT_ASSERT(cluster_ctrc_origin_next_close_dispatch_shared(dispatch));
+	origin_log_enabled = cluster_trace_normal_stop = true;
+	return origin;
+}
+
+UT_TEST(test_origin_dispatch_trace_off_keeps_original_batch_effects)
+{
+	reset_fixture(); seed_origin(0, 1); UT_ASSERT(bind_test_worker(0));
+	origin_log_enabled = true; cluster_trace_normal_stop = false;
+	(void)ctrc_fixture_run_pass();
+	UT_ASSERT_EQ(origin_dispatch_calls, 1); UT_ASSERT_EQ(origin_log_count, 0);
+	UT_ASSERT_EQ(ctrc_origin_entries()[0].close_dispatched_bitmap, 1);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_origin_dispatch_trace_exact_row_is_passive_and_constant_scope)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_DISPATCH_TRACE_PRESENT
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcOriginEntry *origin = origin_trace_fixture(&dispatch), before = *origin;
+	uint64 visits[sizeof(table_visits) / sizeof(table_visits[0])];
+	uint64 progress = CtrcLocalProgress;
+	unsigned conditionals = observe_conditional_calls;
+	memcpy(visits, table_visits, sizeof(visits));
+	ctrc_origin_dispatch_trace(&dispatch, 0, 1);
+	UT_ASSERT_EQ(origin_log_count, 1);
+	UT_ASSERT_EQ(memcmp(origin, &before, sizeof(before)), 0);
+	UT_ASSERT_EQ(memcmp(visits, table_visits, sizeof(visits)), 0);
+	UT_ASSERT_EQ(CtrcLocalProgress, progress);
+	UT_ASSERT_EQ(observe_conditional_calls, conditionals + 1);
+	UT_ASSERT(strstr(origin_last_log, "origin_sample_available=1 origin_binding_match=1") != NULL);
+	UT_ASSERT(strstr(origin_last_log, "origin_predicate=snapshot.matches") != NULL);
+	UT_ASSERT(strstr(origin_last_log, "origin_ack=0") != NULL);
+	UT_ASSERT(strstr(origin_last_log, "delivery_known=0 ack_receipt_known=0 authoritative=0") != NULL);
+	UT_ASSERT_EQ(held_count, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_origin_dispatch_trace_busy_is_unknown_without_wait_or_write)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_DISPATCH_TRACE_PRESENT
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcOriginEntry *origin = origin_trace_fixture(&dispatch), before = *origin;
+	unsigned conditionals = observe_conditional_calls;
+	observe_busy_kind = 3;
+	ctrc_origin_dispatch_trace(&dispatch, 0, 1);
+	UT_ASSERT_EQ(origin_log_count, 1); UT_ASSERT_EQ(observe_conditional_calls, conditionals + 1);
+	UT_ASSERT(strstr(origin_last_log, "origin_sample_available=0 origin_binding_match=0") != NULL);
+	UT_ASSERT(strstr(origin_last_log, "origin_predicate=snapshot.lock_busy") != NULL);
+	UT_ASSERT_EQ(memcmp(origin, &before, sizeof(before)), 0); UT_ASSERT_EQ(held_count, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_origin_dispatch_trace_unsafe_gaps_do_not_touch_registry)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_DISPATCH_TRACE_PRESENT
+	ClusterCtrcCloseDispatch dispatch;
+	unsigned conditionals;
+	(void)origin_trace_fixture(&dispatch);
+	conditionals = observe_conditional_calls;
+	CritSectionCount = 1; ctrc_origin_dispatch_trace(&dispatch, 0, 1); CritSectionCount = 0;
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
+	ctrc_origin_dispatch_trace(&dispatch, 0, 1); LWLockRelease(&CtrcShared->receipt_lock);
+	UT_ASSERT_EQ(origin_log_count, 0); UT_ASSERT_EQ(observe_conditional_calls, conditionals);
+	ctrc_origin_dispatch_trace(&dispatch, 0, 1);
+	UT_ASSERT(strstr(origin_last_log, "critical_skipped=1 lwlock_skipped=1") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_origin_dispatch_trace_reused_key_is_not_bound_to_old_dispatch)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_DISPATCH_TRACE_PRESENT
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcOriginEntry *origin = origin_trace_fixture(&dispatch);
+	origin->key.slot_wrap++;
+	ctrc_origin_dispatch_trace(&dispatch, 0, 1);
+	UT_ASSERT(strstr(origin_last_log, "origin_sample_available=1 origin_binding_match=0") != NULL);
+	UT_ASSERT(strstr(origin_last_log, "origin_predicate=snapshot.key") != NULL);
+	UT_ASSERT(strstr(origin_last_log, "expected_tt_wrap=1") != NULL);
+	UT_ASSERT(strstr(origin_last_log, "actual_tt_wrap=2") != NULL);
+	UT_ASSERT_EQ(origin->key.slot_wrap, 2);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_origin_dispatch_trace_driver_returns_after_real_pending_landing)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_DISPATCH_TRACE_PRESENT
+	reset_fixture(); seed_origin(0, 1); UT_ASSERT(bind_test_worker(0));
+	origin_log_enabled = cluster_trace_normal_stop = true;
+	origin_driver_pending = origin_require_dispatch_return = true;
+	(void)ctrc_fixture_run_pass();
+	UT_ASSERT_EQ(origin_dispatch_calls, 1); UT_ASSERT(origin_dispatch_returned);
+	UT_ASSERT_EQ(origin_log_count, 1);
+	UT_ASSERT(strstr(origin_last_log, "event=dispatch.batch_return") != NULL);
+	UT_ASSERT(strstr(origin_last_log, "origin_close_confirmed=1 origin_ack=0") != NULL);
+	UT_ASSERT_EQ(ctrc_origin_entries()[0].close_confirmed_bitmap, 1);
+	UT_ASSERT(!CtrcBatch.active);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_origin_dispatch_trace_log_error_keeps_shared_owner_and_clears_hints)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_DISPATCH_TRACE_PRESENT
+	volatile bool caught = false;
+	reset_fixture(); seed_origin(0, 1); UT_ASSERT(bind_test_worker(0));
+	origin_log_enabled = cluster_trace_normal_stop = origin_log_throw = true;
+	PG_TRY();
+	{
+		(void)ctrc_fixture_run_pass();
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught); UT_ASSERT_EQ(origin_log_count, 1); UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT(ctrc_bytes_zero(&CtrcBatch, sizeof(CtrcBatch)));
+	UT_ASSERT_EQ(ctrc_origin_entries()[0].close_dispatched_bitmap, 1);
+	UT_ASSERT(ctrc_origin_entries()[0].close_request_id[0] != 0);
+	UT_ASSERT_EQ(CtrcLocalPasses, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_origin_dispatch_trace_detached_and_bad_namespace_stay_unknown)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_DISPATCH_TRACE_PRESENT
+	ClusterCtrcCloseDispatch dispatch;
+	void *saved;
+	(void)origin_trace_fixture(&dispatch);
+	saved = CtrcShared; CtrcShared = NULL;
+	ctrc_origin_dispatch_trace(&dispatch, 0, 1);
+	CtrcShared = saved;
+	UT_ASSERT(strstr(origin_last_log, "origin_predicate=snapshot.detached") != NULL);
+	UT_ASSERT(strstr(origin_last_log, "origin_sample_available=0") != NULL);
+	dispatch.key.owner_instance = 0;
+	ctrc_origin_dispatch_trace(&dispatch, 0, 1);
+	UT_ASSERT(strstr(origin_last_log, "origin_predicate=snapshot.key_shape") != NULL);
+	UT_ASSERT_EQ(held_count, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
 int
 main(void)
 {
@@ -3094,7 +3293,16 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(71);
+	UT_PLAN(79);
+	UT_RUN(test_origin_dispatch_trace_off_keeps_original_batch_effects);
+	UT_RUN(test_origin_dispatch_trace_exact_row_is_passive_and_constant_scope);
+	UT_RUN(test_origin_dispatch_trace_busy_is_unknown_without_wait_or_write);
+	UT_RUN(test_origin_dispatch_trace_unsafe_gaps_do_not_touch_registry);
+	UT_RUN(test_origin_dispatch_trace_reused_key_is_not_bound_to_old_dispatch);
+	UT_RUN(test_origin_dispatch_trace_driver_returns_after_real_pending_landing);
+	UT_RUN(test_origin_dispatch_trace_log_error_keeps_shared_owner_and_clears_hints);
+	UT_RUN(test_origin_dispatch_trace_detached_and_bad_namespace_stay_unknown);
+
 	UT_RUN(test_receipt_observation_exact_prepare_is_read_only);
 	UT_RUN(test_receipt_observation_real_cancel_keeps_publication_binding);
 	UT_RUN(test_receipt_observation_duplicate_keeps_same_shared_sequence);
