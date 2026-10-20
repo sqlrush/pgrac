@@ -9522,12 +9522,14 @@ test_cluster_gcs_read_image_trace: test_cluster_gcs_read_image_trace.c unit_test
 # Exact reply receiver plus optional module-local read-image hop observer.
 test_cluster_gcs_read_image_hops.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^typedef struct GcsReadImageHopTrace/ { print "#define GCS_READ_IMAGE_HOP_OBSERVER_PRESENT 1"; emit=1; types++ } \
+	     /^gcs_block_read_image_ingress_reject_trace\(/ { print "#define GCS_READ_IMAGE_INGRESS_REJECT_PRESENT 1"; print "static void"; emit=1; rejects++ } \
+	     /^gcs_block_decode_reply_payload\(/ { print "static bool"; emit=1; decoders++ } \
 	     /^gcs_block_read_image_hop_trace\(/ { print "static void"; emit=1; loggers++ } \
 	     /^gcs_block_read_image_hop_slot_capture\(/ { print "static void"; emit=1; captures++ } \
 	     /^cluster_gcs_handle_block_reply_envelope\(/ { print "void"; emit=1; receivers++ } \
 	     emit { print } \
 	     emit && (/^}$$/ || /^} GcsReadImageHopTrace;$$/) { emit=0 } \
-	     END { if (receivers != 1 || types > 1 || loggers > 1 || captures > 1) exit 1 }' $< > $@.tmp
+	     END { if (receivers != 1 || decoders != 1 || rejects > 1 || types > 1 || loggers > 1 || captures > 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_gcs_read_image_hops: test_cluster_gcs_read_image_hops.c unit_test.h test_cluster_gcs_read_image_hops.inc

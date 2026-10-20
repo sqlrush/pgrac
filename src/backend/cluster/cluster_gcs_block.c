@@ -4281,6 +4281,92 @@ typedef struct GcsReadImageTrace {
 /* Ordinary read-image forward/reply observations.  No shared pointers survive
  * a slot lock or a send: the view contains only copies of the inputs used by
  * the original operation.  It is not a receipt or fresh authority proof. */
+/*
+ * Rejected bytes have not acquired a reply/holder identity.  In particular,
+ * a copied header below is an unvalidated payload projection, not a receipt.
+ * Called only at the original ingress refusal points, before resource lookup.
+ */
+static void
+gcs_block_read_image_ingress_reject_trace(const ClusterICEnvelope *env, const void *payload,
+										bool is_forward, const char *event, const char *predicate)
+{
+	static uint64 event_seq;
+	static uint64 critical_skipped;
+	GcsBlockForwardPayload forward;
+	GcsBlockReplyHeader reply;
+	BufferTag tag;
+	bool header_known = false;
+	bool tag_known = false;
+
+	if (!cluster_trace_normal_stop)
+		return;
+	if (CritSectionCount != 0) {
+		if (critical_skipped != UINT64_MAX)
+			critical_skipped++;
+		return;
+	}
+	memset(&forward, 0, sizeof(forward));
+	memset(&reply, 0, sizeof(reply));
+	memset(&tag, 0, sizeof(tag));
+	/* The envelope length is the transport-owned payload bound.  Never read
+	 * an undersized/absent payload or reinterpret a short forward as a tag. */
+	if (env != NULL && payload != NULL) {
+		if (is_forward && env->payload_length == sizeof(forward)) {
+			memcpy(&forward, payload, sizeof(forward));
+			tag = forward.tag;
+			header_known = tag_known = true;
+		} else if (!is_forward && env->payload_length >= sizeof(reply)) {
+			memcpy(&reply, payload, sizeof(reply));
+			header_known = true;
+		}
+	}
+	if (event_seq != UINT64_MAX)
+		event_seq++;
+	ereport(LOG,
+			(errmsg_internal(
+				 "PGRAC_FAMILY=READ_IMAGE_INGRESS event=%s predicate=%s "
+				 "event_seq=%llu sequence_scope=process sequence_domain=READ_IMAGE_INGRESS "
+				 "node_id=%d pid=%d procno=%d backend_id=%d backend_type=%d "
+				 "wall_us=%lld monotonic_us=%llu identity_source=run_manifest "
+				 "run_id_known=0 process_incarnation_known=0 boot_identity_known=0 "
+				 "transaction_identity_known=0 root_identity_known=0 "
+				 "authoritative=0 transport_receipt=0 read_image_attribution=unknown "
+				 "ingress_leg=%s envelope_known=%d source_node=%u dest_node=%u envelope_epoch=%llu "
+				 "payload_present=%d payload_length_known=%d payload_length=%u "
+				 "expected_v1_size=%u expected_v2_size=%u expected_undo_size=%u expected_forward_size=%u "
+				 "payload_header_known=%d header_validated=0 "
+				 "request_id=%llu payload_epoch=%llu requester_node_known=%d requester_node=%d "
+				 "requester_backend=%d master_node=%d reply_sender=%d reply_status=%d transition=%u "
+				 "tag_source=%s tag_known=%d spc=%u db=%u rel=%u fork=%d block=%u "
+				 "page_lsn=%llu checksum=%u trace_critical_skipped=%llu trace_sequence_exhausted=%d",
+				 event, predicate, (unsigned long long)event_seq, cluster_node_id, (int)getpid(),
+				 MyProc != NULL ? MyProc->pgprocno : -1, (int)MyBackendId, (int)MyBackendType,
+				 (long long)GetCurrentTimestamp(),
+				 (unsigned long long)gcs_block_pcm_x_monotonic_us(),
+				 is_forward ? "forward" : "reply", env != NULL,
+				 env != NULL ? env->source_node_id : 0, env != NULL ? env->dest_node_id : 0,
+				 env != NULL ? (unsigned long long)env->epoch : 0, payload != NULL, env != NULL,
+				 env != NULL ? env->payload_length : 0,
+				 (uint32)(sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE),
+				 (uint32)(sizeof(GcsBlockReplyHeaderV2) + GCS_BLOCK_DATA_SIZE),
+				 (uint32)(sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE
+						  + sizeof(ClusterGcsUndoAuthTrailer)),
+				 (uint32)sizeof(GcsBlockForwardPayload), header_known,
+				 (unsigned long long)(is_forward ? forward.request_id : reply.request_id),
+				 (unsigned long long)(is_forward ? forward.epoch : reply.epoch),
+				 is_forward && header_known, is_forward && header_known ? forward.original_requester_node : -1,
+				 !header_known ? -1 : is_forward ? forward.requester_backend_id : reply.requester_backend_id,
+				 !header_known ? -1 : is_forward ? forward.master_node
+														 : GcsBlockReplyHeaderGetForwardingMasterNode(&reply),
+				 !is_forward && header_known ? reply.sender_node : -1,
+				 !is_forward && header_known ? (int)reply.status : -1,
+				 (unsigned int)(is_forward ? forward.transition_id : reply.transition_id),
+				 tag_known ? "unvalidated_forward" : "unknown", tag_known,
+				 tag.spcOid, tag.dbOid, (unsigned int)tag.relNumber, (int)tag.forkNum,
+				 (unsigned int)tag.blockNum, (unsigned long long)reply.page_lsn, reply.checksum,
+				 (unsigned long long)critical_skipped, event_seq == UINT64_MAX)));
+}
+
 typedef struct GcsReadImageHopTrace {
 	bool envelope_known, forward_known, reply_known, tag_known, slot_known;
 	uint32 envelope_source, envelope_dest;
@@ -18986,14 +19072,20 @@ gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const void *payload
 	if (out_undo_trailer != NULL)
 		*out_undo_trailer = NULL;
 
-	if (env == NULL || payload == NULL)
+	if (env == NULL || payload == NULL) {
+		gcs_block_read_image_ingress_reject_trace(env, payload, false, "reply.decode_refused",
+			env == NULL ? "reply.envelope_present" : "reply.payload_present");
 		return false;
+	}
 
 	if (env->payload_length == v1_size) {
 		const GcsBlockReplyHeader *h = (const GcsBlockReplyHeader *)payload;
 
-		if (!GcsBlockReplyStatusIsLegacy((GcsBlockReplyStatus)h->status))
+		if (!GcsBlockReplyStatusIsLegacy((GcsBlockReplyStatus)h->status)) {
+			gcs_block_read_image_ingress_reject_trace(env, payload, false, "reply.decode_refused",
+				"reply.v1.status_legacy");
 			return false;
+		}
 		if (out_hdr != NULL)
 			*out_hdr = h;
 		if (out_block_data != NULL)
@@ -19010,8 +19102,11 @@ gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const void *payload
 	if (env->payload_length == undo_size) {
 		const GcsBlockReplyHeader *h = (const GcsBlockReplyHeader *)payload;
 
-		if (!GcsBlockReplyStatusCarriesUndoAuthTrailer((GcsBlockReplyStatus)h->status))
+		if (!GcsBlockReplyStatusCarriesUndoAuthTrailer((GcsBlockReplyStatus)h->status)) {
+			gcs_block_read_image_ingress_reject_trace(env, payload, false, "reply.decode_refused",
+				"reply.undo.status_trailer");
 			return false;
+		}
 		if (out_hdr != NULL)
 			*out_hdr = h;
 		if (out_block_data != NULL)
@@ -19032,6 +19127,13 @@ gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const void *payload
 			|| !cluster_smart_fusion
 			|| !cluster_gcs_block_reply_v2_extract_dep_vec(hdrv2, &dep_vec)) {
 			cluster_sf_dep_note_lost_failclosed();
+			/* The dependency extractor ran at most once, in the original
+			 * short-circuit guard above.  Do not retry it for observation. */
+			gcs_block_read_image_ingress_reject_trace(env, payload, false, "reply.decode_refused",
+				!GcsBlockReplyStatusIsLegacy((GcsBlockReplyStatus)hdrv2->v1.status)
+					? "reply.v2.status_legacy"
+					: !cluster_smart_fusion ? "reply.v2.smart_fusion_enabled"
+									   : "reply.v2.dependency_vector");
 			return false;
 		}
 		if (out_hdr != NULL)
@@ -19047,6 +19149,8 @@ gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const void *payload
 		return true;
 	}
 
+	gcs_block_read_image_ingress_reject_trace(env, payload, false, "reply.decode_refused",
+		"reply.payload_size");
 	return false;
 }
 
@@ -20211,8 +20315,12 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		return;
 	if (gcs_block_try_r4_forward96(env, payload))
 		return;
-	if (env == NULL || payload == NULL || env->payload_length != sizeof(GcsBlockForwardPayload))
+	if (env == NULL || payload == NULL || env->payload_length != sizeof(GcsBlockForwardPayload)) {
+		gcs_block_read_image_ingress_reject_trace(env, payload, true, "holder.shape_refused",
+			env == NULL ? "forward.envelope_present"
+			: payload == NULL ? "forward.payload_present" : "forward.payload_size");
 		return;
+	}
 
 	cluster_sf_dep_vec_reset(&sf_dep_vec);
 	fwd = (const GcsBlockForwardPayload *)payload;
@@ -20238,9 +20346,11 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_received_count, 1);
 
 	/* HC75 transition_id range guard (same as request handler). */
-	if (fwd->transition_id < PCM_TRANS_N_TO_S || fwd->transition_id > PCM_TRANS_S_TO_X_CLEANOUT)
-		return; /* malformed, silently drop;  master
-								 * dedup TTL will sweep stale entry */
+	if (fwd->transition_id < PCM_TRANS_N_TO_S || fwd->transition_id > PCM_TRANS_S_TO_X_CLEANOUT) {
+		gcs_block_read_image_ingress_reject_trace(env, payload, true, "holder.transition_refused",
+			"forward.transition_range");
+		return; /* malformed; master dedup TTL will sweep stale entry */
+	}
 
 	/*
 	 * PGRAC: spec-6.12b + spec-7.3 D6 — CR-server request.  When the family is

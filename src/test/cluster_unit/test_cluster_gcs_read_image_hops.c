@@ -1,4 +1,4 @@
-/* Exact legacy reply receiver with controlled decoder/dispatch boundaries.
+/* Exact legacy decoder and reply receiver with controlled disjoint dispatch boundaries.
  * Slot storage is a private fixture projection, not a wire/authority model. */
 #include "postgres.h"
 
@@ -53,6 +53,7 @@ static ClusterGcsBlockBackendBlock blocks[4], *gcs_block_backend_blocks = blocks
 static struct { pg_atomic_uint64 stale_reply_drop_count; } counts, *ClusterGcsBlock = &counts;
 int cluster_node_id = 2, MaxBackends = 4;
 bool cluster_shared_config = false, cluster_trace_normal_stop = false;
+bool cluster_smart_fusion = false;
 volatile uint32 CritSectionCount = 0;
 BackendId MyBackendId = 0;
 BackendType MyBackendType = B_LMS_WORKER;
@@ -60,7 +61,9 @@ PGPROC *MyProc = NULL;
 sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
 static int locks, signals, event_count, injected_log_errors;
-static bool malformed, fail_log;
+static bool fail_log;
+static int lost_failclosed;
+void cluster_sf_dep_note_lost_failclosed(void) { lost_failclosed++; }
 static char logs[16384], message[4096];
 
 bool errstart(int level, const char *domain pg_attribute_unused()) { return level == LOG; }
@@ -104,22 +107,6 @@ static bool gcs_block_try_land_current_mx_reply(const ClusterICEnvelope *e pg_at
 											  const void *p pg_attribute_unused()) { return false; }
 static bool gcs_block_try_land_r4_terminal_reply(const ClusterICEnvelope *e pg_attribute_unused(),
 											   const void *p pg_attribute_unused()) { return false; }
-static bool
-gcs_block_decode_reply_payload(const ClusterICEnvelope *env pg_attribute_unused(), const void *p,
-							   const GcsBlockReplyHeader **hdr, const char **data,
-							   bool *sf_valid, uint8 *sf_flags, ClusterSfDepVec *sf,
-							   const ClusterGcsUndoAuthTrailer **undo)
-{
-	if (malformed)
-		return false;
-	*hdr = p;
-	*data = (const char *)p + sizeof(**hdr);
-	*sf_valid = false;
-	*sf_flags = 0;
-	memset(sf, 0, sizeof(*sf));
-	*undo = NULL;
-	return true;
-}
 bool
 cluster_cr_server_r4_land_foreign_undo(const ClusterICEnvelope *e pg_attribute_unused(),
 									 const GcsBlockReplyHeader *h pg_attribute_unused(),
@@ -158,7 +145,10 @@ reset_fixture(bool trace)
 	payload.data[0] = 42;
 	envelope.source_node_id = 1; envelope.dest_node_id = 2; envelope.epoch = 71;
 	locks = signals = event_count = injected_log_errors = 0;
-	malformed = fail_log = false;
+	fail_log = false;
+	cluster_smart_fusion = false;
+	lost_failclosed = 0;
+	envelope.payload_length = sizeof(payload);
 	CritSectionCount = 0;
 	cluster_trace_normal_stop = trace;
 	logs[0] = '\0';
@@ -246,11 +236,12 @@ UT_TEST(late_reply_does_not_borrow_a_nearby_slot_tag)
 	UT_ASSERT(strstr(logs, "event=reply.no_slot") != NULL);
 	UT_ASSERT(strstr(logs, "tag_known=0") != NULL);
 }
-UT_TEST(undecodable_payload_stays_silent)
+UT_TEST(undecodable_payload_reports_original_decoder_refusal)
 {
-	reset_fixture(true); malformed = true; receive();
+	reset_fixture(true); payload.hdr.status = 255; receive();
 	UT_ASSERT(!blocks[1].slots[0].reply_received && signals == 0);
-	UT_ASSERT_EQ(event_count, 0);
+	UT_ASSERT(strstr(logs, "event=reply.decode_refused predicate=reply.v1.status_legacy") != NULL);
+	UT_ASSERT(strstr(logs, "header_validated=0") != NULL);
 }
 UT_TEST(log_error_occurs_after_unlock_and_original_signal)
 {
@@ -343,10 +334,215 @@ UT_TEST(holder_final_event_follows_all_original_send_cleanup)
 	free(source);
 }
 
+static const GcsBlockReplyHeader *decoded_header;
+static const char *decoded_data;
+static const ClusterGcsUndoAuthTrailer *decoded_undo;
+static bool decoded_sf_valid;
+static uint8 decoded_sf_flags;
+static ClusterSfDepVec decoded_sf_vec;
+static union {
+	GcsBlockReplyHeaderV2 header;
+	char bytes[sizeof(GcsBlockReplyHeaderV2) + GCS_BLOCK_DATA_SIZE
+			   + sizeof(ClusterGcsUndoAuthTrailer)];
+} v2_payload;
+
+static bool
+decode(const ClusterICEnvelope *env, const void *data)
+{
+	decoded_header = (const GcsBlockReplyHeader *)1;
+	decoded_data = (const char *)1;
+	decoded_undo = (const ClusterGcsUndoAuthTrailer *)1;
+	decoded_sf_valid = true;
+	decoded_sf_flags = 255;
+	memset(&decoded_sf_vec, 1, sizeof(decoded_sf_vec));
+	return gcs_block_decode_reply_payload(env, data, &decoded_header, &decoded_data,
+										 &decoded_sf_valid, &decoded_sf_flags,
+										 &decoded_sf_vec, &decoded_undo);
+}
+static bool
+outputs_reset(void)
+{
+	return decoded_header == NULL && decoded_data == NULL && decoded_undo == NULL
+		&& !decoded_sf_valid && decoded_sf_flags == 0
+		&& cluster_sf_dep_vec_is_empty(&decoded_sf_vec);
+}
+static void
+v2_fixture(void)
+{
+	reset_fixture(true);
+	memset(&v2_payload, 0, sizeof(v2_payload));
+	v2_payload.header.v1 = payload.hdr;
+	envelope.payload_length = sizeof(GcsBlockReplyHeaderV2) + GCS_BLOCK_DATA_SIZE;
+	cluster_smart_fusion = true;
+}
+
+UT_TEST(null_envelope_resets_outputs_before_diagnostic)
+{
+	reset_fixture(true);
+	UT_ASSERT(!decode(NULL, &payload) && outputs_reset());
+	UT_ASSERT(strstr(logs, "predicate=reply.envelope_present") != NULL);
+	UT_ASSERT(strstr(logs, "envelope_known=0") != NULL);
+	UT_ASSERT(strstr(logs, "payload_header_known=0") != NULL);
+}
+UT_TEST(null_payload_does_not_borrow_header_or_tag)
+{
+	reset_fixture(true);
+	UT_ASSERT(!decode(&envelope, NULL) && outputs_reset());
+	UT_ASSERT(strstr(logs, "predicate=reply.payload_present") != NULL);
+	UT_ASSERT(strstr(logs, "payload_header_known=0") != NULL);
+	UT_ASSERT(strstr(logs, "tag_known=0") != NULL);
+}
+UT_TEST(short_declared_payload_does_not_read_header)
+{
+	char one_byte = 0;
+	reset_fixture(true); envelope.payload_length = sizeof(one_byte);
+	UT_ASSERT(!decode(&envelope, &one_byte) && outputs_reset());
+	UT_ASSERT(strstr(logs, "predicate=reply.payload_size") != NULL);
+	UT_ASSERT(strstr(logs, "payload_length=1") != NULL);
+	UT_ASSERT(strstr(logs, "payload_header_known=0") != NULL);
+}
+UT_TEST(unsupported_size_header_is_unvalidated_only)
+{
+	reset_fixture(true); envelope.payload_length = sizeof(payload) - 1;
+	UT_ASSERT(!decode(&envelope, &payload) && outputs_reset());
+	UT_ASSERT(strstr(logs, "predicate=reply.payload_size") != NULL);
+	UT_ASSERT(strstr(logs, "payload_header_known=1 header_validated=0") != NULL);
+	UT_ASSERT(strstr(logs, "request_id=51") != NULL);
+	UT_ASSERT(strstr(logs, "tag_known=0") != NULL);
+	UT_ASSERT(strstr(logs, "authoritative=0 transport_receipt=0") != NULL);
+}
+UT_TEST(undo_shape_requires_undo_status)
+{
+	v2_fixture();
+	envelope.payload_length = sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE
+		+ sizeof(ClusterGcsUndoAuthTrailer);
+	UT_ASSERT(!decode(&envelope, &v2_payload) && outputs_reset());
+	UT_ASSERT(strstr(logs, "predicate=reply.undo.status_trailer") != NULL);
+	UT_ASSERT_EQ(lost_failclosed, 0);
+}
+UT_TEST(v2_status_refusal_precedes_disabled_fusion)
+{
+	v2_fixture(); v2_payload.header.v1.status = 255; cluster_smart_fusion = false;
+	UT_ASSERT(!decode(&envelope, &v2_payload) && outputs_reset());
+	UT_ASSERT(strstr(logs, "predicate=reply.v2.status_legacy") != NULL);
+	UT_ASSERT_EQ(lost_failclosed, 1);
+}
+UT_TEST(v2_disabled_fusion_precedes_vector_validation)
+{
+	v2_fixture(); cluster_smart_fusion = false; v2_payload.header.reserved_0[0] = 1;
+	UT_ASSERT(!decode(&envelope, &v2_payload) && outputs_reset());
+	UT_ASSERT(strstr(logs, "predicate=reply.v2.smart_fusion_enabled") != NULL);
+	UT_ASSERT_EQ(lost_failclosed, 1);
+}
+UT_TEST(v2_invalid_vector_keeps_original_counter_and_refusal)
+{
+	v2_fixture(); v2_payload.header.reserved_0[0] = 1;
+	UT_ASSERT(!decode(&envelope, &v2_payload) && outputs_reset());
+	UT_ASSERT(strstr(logs, "predicate=reply.v2.dependency_vector") != NULL);
+	UT_ASSERT_EQ(lost_failclosed, 1);
+}
+UT_TEST(valid_v2_keeps_real_vector_and_is_quiet)
+{
+	v2_fixture();
+	v2_payload.header.sf_flags = GCS_BLOCK_REPLY_SF_HAS_DEP_VEC
+		| GCS_BLOCK_REPLY_SF_EARLY_TRANSFER;
+	v2_payload.header.sf_dep_count = 1;
+	v2_payload.header.sf_dep[0].origin_node = 1;
+	v2_payload.header.sf_dep[0].required_redo_lsn = 1234;
+	UT_ASSERT(decode(&envelope, &v2_payload));
+	UT_ASSERT(decoded_header == &v2_payload.header.v1);
+	UT_ASSERT(decoded_data == v2_payload.bytes + sizeof(GcsBlockReplyHeaderV2));
+	UT_ASSERT(decoded_sf_valid && decoded_sf_vec.required[1] == 1234);
+	UT_ASSERT_EQ(event_count, 0);
+	UT_ASSERT_EQ(lost_failclosed, 0);
+}
+UT_TEST(valid_undo_trailer_keeps_exact_original_offsets)
+{
+	v2_fixture();
+	v2_payload.header.v1.status = GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT;
+	envelope.payload_length = sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE
+		+ sizeof(ClusterGcsUndoAuthTrailer);
+	UT_ASSERT(decode(&envelope, &v2_payload));
+	UT_ASSERT(decoded_data == v2_payload.bytes + sizeof(GcsBlockReplyHeader));
+	UT_ASSERT((const char *)decoded_undo == decoded_data + GCS_BLOCK_DATA_SIZE);
+	UT_ASSERT_EQ(event_count, 0);
+}
+UT_TEST(default_off_invalid_decoder_has_no_diagnostic)
+{
+	reset_fixture(false); payload.hdr.status = 255;
+	UT_ASSERT(!decode(&envelope, &payload) && outputs_reset());
+	UT_ASSERT_EQ(event_count, 0);
+}
+UT_TEST(decoder_critical_gap_is_disclosed_by_next_safe_refusal)
+{
+	reset_fixture(true); payload.hdr.status = 255; CritSectionCount = 1;
+	UT_ASSERT(!decode(&envelope, &payload) && outputs_reset());
+	UT_ASSERT_EQ(event_count, 0);
+	CritSectionCount = 0;
+	UT_ASSERT(!decode(&envelope, &payload) && outputs_reset());
+	UT_ASSERT(strstr(logs, "trace_critical_skipped=1") != NULL);
+}
+UT_TEST(decoder_log_error_follows_original_reset_and_counter)
+{
+	sigjmp_buf trap;
+	bool caught = false;
+	v2_fixture(); v2_payload.header.reserved_0[0] = 1; fail_log = true;
+	PG_exception_stack = &trap;
+	if (sigsetjmp(trap, 0) == 0)
+		(void)decode(&envelope, &v2_payload);
+	else
+		caught = true;
+	PG_exception_stack = NULL;
+	UT_ASSERT(caught && outputs_reset() && lost_failclosed == 1 && locks == 0);
+}
+UT_TEST(forward_rejection_capture_is_bounded_and_non_authoritative)
+{
+#ifdef GCS_READ_IMAGE_INGRESS_REJECT_PRESENT
+	GcsBlockForwardPayload forward;
+	reset_fixture(true); memset(&forward, 0, sizeof(forward));
+	forward.request_id = 51; forward.epoch = 71; forward.tag = blocks[1].slots[0].tag;
+	forward.master_node = 0; forward.original_requester_node = 2;
+	forward.requester_backend_id = 2; forward.transition_id = 255;
+	envelope.payload_length = sizeof(forward);
+	gcs_block_read_image_ingress_reject_trace(&envelope, &forward, true,
+											"holder.transition_refused", "forward.transition_range");
+	UT_ASSERT(strstr(logs, "event=holder.transition_refused") != NULL);
+	UT_ASSERT(strstr(logs, "request_id=51") != NULL);
+	UT_ASSERT(strstr(logs, "tag_known=1") != NULL);
+	UT_ASSERT(strstr(logs, "header_validated=0") != NULL);
+	UT_ASSERT(strstr(logs, "authoritative=0 transport_receipt=0") != NULL);
+	logs[0] = '\0'; envelope.payload_length = 1;
+	gcs_block_read_image_ingress_reject_trace(&envelope, (const void *)1, true,
+											"holder.shape_refused", "forward.payload_size");
+	UT_ASSERT(strstr(logs, "payload_header_known=0") != NULL);
+	UT_ASSERT(strstr(logs, "tag_known=0") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(forward_refusal_logging_stays_inside_original_refusal_branches)
+{
+	char *source = read_holder_source();
+	const char *holder, *shape, *transition, *shape_event, *transition_event, *dispatch;
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL) return;
+	holder = strstr(source, "\ncluster_gcs_handle_block_forward_envelope(");
+	shape = holder ? strstr(holder, "if (env == NULL || payload == NULL") : NULL;
+	transition = shape ? strstr(shape, "if (fwd->transition_id < PCM_TRANS_N_TO_S") : NULL;
+	shape_event = shape ? strstr(shape, "\"holder.shape_refused\"") : NULL;
+	transition_event = transition ? strstr(transition, "\"holder.transition_refused\"") : NULL;
+	dispatch = transition ? strstr(transition, "if (GcsBlockForwardPayloadIsCrRequest(fwd))") : NULL;
+	UT_ASSERT(shape && transition && shape_event && transition_event && dispatch);
+	if (shape && transition && shape_event && transition_event && dispatch)
+		UT_ASSERT(shape < shape_event && shape_event < transition
+				  && transition < transition_event && transition_event < dispatch);
+	free(source);
+}
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(32);
 	UT_RUN(default_off_preserves_original_publish_and_signal);
 	UT_RUN(accepted_reply_logs_original_identity_after_unlock);
 	UT_RUN(epoch_refusal_keeps_result_bytes_unchanged);
@@ -358,12 +554,27 @@ main(void)
 	UT_RUN(authenticated_envelope_mismatch_does_not_touch_slot);
 	UT_RUN(bad_backend_never_indexes_or_guesses_tag);
 	UT_RUN(late_reply_does_not_borrow_a_nearby_slot_tag);
-	UT_RUN(undecodable_payload_stays_silent);
+	UT_RUN(undecodable_payload_reports_original_decoder_refusal);
 	UT_RUN(log_error_occurs_after_unlock_and_original_signal);
 	UT_RUN(critical_gap_is_disclosed_without_changing_reply_publish);
 	UT_RUN(holder_view_logs_only_copied_values_not_a_transport_receipt);
 	UT_RUN(holder_observation_waits_for_image_resource_handoff);
 	UT_RUN(holder_final_event_follows_all_original_send_cleanup);
+	UT_RUN(null_envelope_resets_outputs_before_diagnostic);
+	UT_RUN(null_payload_does_not_borrow_header_or_tag);
+	UT_RUN(short_declared_payload_does_not_read_header);
+	UT_RUN(unsupported_size_header_is_unvalidated_only);
+	UT_RUN(undo_shape_requires_undo_status);
+	UT_RUN(v2_status_refusal_precedes_disabled_fusion);
+	UT_RUN(v2_disabled_fusion_precedes_vector_validation);
+	UT_RUN(v2_invalid_vector_keeps_original_counter_and_refusal);
+	UT_RUN(valid_v2_keeps_real_vector_and_is_quiet);
+	UT_RUN(valid_undo_trailer_keeps_exact_original_offsets);
+	UT_RUN(default_off_invalid_decoder_has_no_diagnostic);
+	UT_RUN(decoder_critical_gap_is_disclosed_by_next_safe_refusal);
+	UT_RUN(decoder_log_error_follows_original_reset_and_counter);
+	UT_RUN(forward_rejection_capture_is_bounded_and_non_authoritative);
+	UT_RUN(forward_refusal_logging_stays_inside_original_refusal_branches);
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;
 }
