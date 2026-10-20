@@ -4754,6 +4754,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_resolver_cache_caller.inc test_cluster_resolver_cache_caller.inc.tmp
 	rm -f test_cluster_relation_size.inc
 	rm -f test_cluster_ko_writeback_io.inc test_cluster_ko_writeback_io.inc.tmp \
 		test_cluster_ko_writeback_smgr.inc test_cluster_ko_writeback_smgr.inc.tmp
@@ -8672,8 +8673,18 @@ test_cluster_cr_admit: test_cluster_cr_admit.c unit_test.h \
 # (cluster_resolver_cache.o) with malloc-backed ShmemInitStruct + no-op LWLock
 # stubs and MOCKED durable TT lookups/native commit (gate 2 re-validation) +
 # ReadNextFullTransactionId (gate 4 own-instance epoch before/after I/O).
+# Also executes the extracted real CR Source 3 caller to cover scan provenance.
 CLUSTER_RESOLVER_CACHE_O = $(top_builddir)/src/backend/cluster/cluster_resolver_cache.o
+# Execute the exact Source 3 function and its private result enum from current source.
+test_cluster_resolver_cache_caller.inc: $(top_srcdir)/src/backend/cluster/cluster_cr.c Makefile
+	awk '/^typedef enum ClusterCrXmaxResolve / { emit=1; enums++ } \
+	     /^cluster_cr_resolve_xmax_commit_scn\(/ { print "static ClusterCrXmaxResolve"; emit=1; funcs++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (enums != 1 || funcs != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_resolver_cache: test_cluster_resolver_cache.c unit_test.h \
+		test_cluster_resolver_cache_caller.inc $(top_srcdir)/src/include/cluster/cluster_resolver_cache.h \
 		$(CLUSTER_RESOLVER_CACHE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_RESOLVER_CACHE_O) \

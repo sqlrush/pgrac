@@ -3422,6 +3422,7 @@ cluster_cr_resolve_xmax_commit_scn(const char *cr_page, uint8 itl_idx, Transacti
 	uint16 resolved_seg = 0;
 	uint16 resolved_slot = 0;
 	uint16 resolved_wrap = 0;
+	uint64 resolver_scan_epoch;
 
 	*out_scn = InvalidScn;
 
@@ -3547,6 +3548,8 @@ cluster_cr_resolve_xmax_commit_scn(const char *cr_page, uint8 itl_idx, Transacti
 	 * provably below horizon, IF the gate's retention proof holds) is no longer
 	 * conflated with a delayed-cleanout / wrap / unreadable miss (all fail closed).
 	 */
+	/* Preserve scan provenance: a late result must not become a new-epoch hint. */
+	resolver_scan_epoch = cluster_resolver_xid_epoch();
 	switch (cluster_tt_slot_durable_resolve_by_xid(cr_xmax, expected_wrap, out_scn, &resolved_seg,
 												   &resolved_slot, &resolved_wrap)) {
 	case CLUSTER_TT_DURABLE_RESOLVED_SCN:
@@ -3568,7 +3571,7 @@ cluster_cr_resolve_xmax_commit_scn(const char *cr_page, uint8 itl_idx, Transacti
 		 * No-op unless the memo region is live.
 		 */
 		cluster_resolver_cache_install((uint16)cluster_node_id, cr_xmax, resolved_seg,
-									   resolved_slot, resolved_wrap, *out_scn);
+									   resolved_slot, resolved_wrap, *out_scn, resolver_scan_epoch);
 		return CLUSTER_CR_XMAX_RESOLVED_SCN; /* *out_scn set by the resolve */
 	case CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH:
 		*out_scn = InvalidScn;

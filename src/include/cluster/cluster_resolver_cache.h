@@ -130,12 +130,16 @@ extern bool cluster_resolver_cache_probe(uint16 origin_node, TransactionId raw_x
 
 /*
  * cluster_resolver_cache_install -- cache the matched {seg,slot,wrap} position
- *	hint for (current-epoch, raw_xid, origin).  The caller MUST pass an own-node
- *	(gate (5)) COMMITTED (gate (6)) RESOLVED result that PASSED acceptance
- *	(gate (3)).  No-op when the region is off.
+ *	hint for (scan_epoch, raw_xid, origin).  The caller MUST sample scan_epoch
+ *	BEFORE its fresh durable scan and pass an own-node (gate (5)) COMMITTED
+ *	(gate (6)) RESOLVED result that PASSED acceptance (gate (3)).  An already
+ *	stale epoch is not installed; an advance while taking the partition lock
+ *	leaves the hint labeled with its original epoch, so a later probe misses.
+ *	No-op when the region is off.  Epoch zero is valid.
  */
 extern void cluster_resolver_cache_install(uint16 origin_node, TransactionId raw_xid, uint16 seg,
-										   uint16 slot, uint16 wrap, SCN commit_scn);
+										   uint16 slot, uint16 wrap, SCN commit_scn,
+										   uint64 scan_epoch);
 
 /* count an acceptance outcome on a memo hit (run by the caller, gate (3)). */
 extern void cluster_resolver_cache_count_acceptance(bool passed);
