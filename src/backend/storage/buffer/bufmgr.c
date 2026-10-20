@@ -21069,27 +21069,47 @@ ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_try_drain_held_x_revoke(
 	const ClusterPcmOwnHeldXRevoke *held)
 {
+	return cluster_bufmgr_pcm_own_try_drain_held_x_revoke_observed(held, NULL);
+}
+
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_try_drain_held_x_revoke_observed(
+	const ClusterPcmOwnHeldXRevoke *held, ClusterPcmOwnFinishRefusal *out_refusal)
+{
 	BufferDesc *buf;
 	ClusterPcmOwnResult result = CLUSTER_PCM_OWN_OK;
 	LWLock *content_lock;
 	uint32 buf_state;
 
+	if (out_refusal != NULL)
+		memset(out_refusal, 0, sizeof(*out_refusal));
 	if (!cluster_bufmgr_pcm_own_held_x_revoke_valid(held))
 		return CLUSTER_PCM_OWN_INVALID;
 	buf = GetBufferDescriptor(held->buffer_id);
 	content_lock = BufferDescriptorGetContentLock(buf);
-	if (!LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE))
+	if (!LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)) {
+		if (out_refusal != NULL)
+			out_refusal->reason = CLUSTER_PCM_OWN_FINISH_REFUSAL_CONTENT_LOCK;
 		return CLUSTER_PCM_OWN_BUSY;
+	}
 
 	buf_state = LockBufHdr(buf);
+	if (out_refusal != NULL) {
+		out_refusal->live_token = cluster_pcm_own_reservation_token_get(buf->buf_id);
+		out_refusal->live_flags = cluster_pcm_own_flags_get(buf->buf_id);
+		out_refusal->shared_refcount = BUF_STATE_GET_REFCOUNT(buf_state);
+		out_refusal->bm_io_in_progress = (buf_state & BM_IO_IN_PROGRESS) != 0;
+	}
 	if (!cluster_pcm_own_fence_matches_locked(buf, &held->revoking)
 		|| (buf_state & BM_VALID) == 0)
 		result = CLUSTER_PCM_OWN_STALE;
 	else if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state))
 		result = CLUSTER_PCM_OWN_CORRUPT;
-	else if ((buf_state & BM_IO_IN_PROGRESS) != 0)
+	else if ((buf_state & BM_IO_IN_PROGRESS) != 0) {
+		if (out_refusal != NULL)
+			out_refusal->reason = CLUSTER_PCM_OWN_FINISH_REFUSAL_IO_IN_PROGRESS;
 		result = CLUSTER_PCM_OWN_BUSY;
-	else if ((buf_state & BM_IO_ERROR) != 0)
+	} else if ((buf_state & BM_IO_ERROR) != 0)
 		result = CLUSTER_PCM_OWN_CORRUPT;
 	UnlockBufHdr(buf, buf_state);
 	LWLockRelease(content_lock);

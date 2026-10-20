@@ -25,6 +25,7 @@
 #include "cluster/cluster_pi_write.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_wait_trace.h"
 #include "miscadmin.h"
 #include "executor/instrument.h"
 #include "pg_trace.h"
@@ -67,6 +68,26 @@ static LWLock transition_mapping_lock;
 static bool transition_mapping_held;
 static bool transition_content_held;
 static bool transition_content_busy;
+bool cluster_trace_tx_identity = false;
+static unsigned guard_trace_count;
+static ClusterWaitTrace guard_trace_last;
+
+uint64
+cluster_wait_trace_begin(ClusterWaitTraceKind kind)
+{
+	return cluster_trace_tx_identity && kind == CLWAIT_PCM_GUARD ? 1 : 0;
+}
+
+void
+cluster_wait_trace_emit(ClusterWaitTraceKind kind, const ClusterWaitTrace *row)
+{
+	UT_ASSERT_EQ(kind, CLWAIT_PCM_GUARD);
+	UT_ASSERT(!transition_mapping_held && !transition_content_held);
+	UT_ASSERT(transition_buf == NULL
+			  || (pg_atomic_read_u32(&transition_buf->state) & BM_LOCKED) == 0);
+	guard_trace_count++;
+	guard_trace_last = *row;
+}
 static LWLockMode transition_content_mode;
 static uint32 transition_capabilities;
 static unsigned transition_snapshots;
@@ -1067,6 +1088,52 @@ source_finish_release(ResourceXLocalOwnerHandle *owner pg_attribute_unused(), bo
 #undef CurrentMemoryContext
 #undef ereport
 
+/* The real target prepare refusal branches execute against the same real
+ * sidecar snapshots.  Unreached mutation/claim dependencies fail the test;
+ * they never stand in for successful authority or installation. */
+static int
+target_prepare_unexpected(void)
+{
+	UT_ASSERT(false);
+	return 0;
+}
+
+#define GetBufferDescriptor(id) ((void)(id), transition_buf)
+#define LWLockConditionalAcquire transition_lock_acquire
+#define LWLockRelease transition_lock_release
+#define LWLockHeldByMe(lock) ((void)(lock), transition_content_held)
+#define BufferGetPage(buffer) ((void)(buffer), (Page)transition_page.data)
+#define cluster_pcm_lock_resource_x_bootstrap_round_direct_init_snapshot_exact(...) \
+	(target_prepare_unexpected(), false)
+#define cluster_pcm_lock_resource_x_bootstrap_round_direct_init_matches_exact(...) \
+	(target_prepare_unexpected(), false)
+#define cluster_pcm_lock_resource_x_install_claim_snapshot_exact(...) \
+	(target_prepare_unexpected(), RESOURCE_X_APPLY_INVALID)
+#define cluster_pcm_lock_resource_x_install_claim_bind_t1_delivery_exact(...) \
+	(target_prepare_unexpected(), RESOURCE_X_APPLY_INVALID)
+#define gcs_block_pcm_x_resource_x_install_target_image_exact(...) \
+	(target_prepare_unexpected(), CLUSTER_PCM_OWN_CORRUPT)
+#define cluster_bufmgr_pcm_own_handoff_s_revoke_to_x_reservation(...) \
+	(target_prepare_unexpected(), CLUSTER_PCM_OWN_CORRUPT)
+#define cluster_bufmgr_pcm_own_handoff_revoke_to_x_reservation(...) \
+	(target_prepare_unexpected(), CLUSTER_PCM_OWN_CORRUPT)
+#define cluster_bufmgr_pcm_own_finish_x_commit(...) \
+	(target_prepare_unexpected(), CLUSTER_PCM_OWN_CORRUPT)
+#include "test_cluster_pcm_target_prepare.inc"
+#undef cluster_bufmgr_pcm_own_finish_x_commit
+#undef cluster_bufmgr_pcm_own_handoff_revoke_to_x_reservation
+#undef cluster_bufmgr_pcm_own_handoff_s_revoke_to_x_reservation
+#undef gcs_block_pcm_x_resource_x_install_target_image_exact
+#undef cluster_pcm_lock_resource_x_install_claim_bind_t1_delivery_exact
+#undef cluster_pcm_lock_resource_x_install_claim_snapshot_exact
+#undef cluster_pcm_lock_resource_x_bootstrap_round_direct_init_matches_exact
+#undef cluster_pcm_lock_resource_x_bootstrap_round_direct_init_snapshot_exact
+#undef BufferGetPage
+#undef LWLockHeldByMe
+#undef LWLockRelease
+#undef LWLockConditionalAcquire
+#undef GetBufferDescriptor
+
 static ResourceXApplyResult
 source_finish_consume(ClusterPcmOwnHeldXRevoke *input, bool held_source)
 {
@@ -1075,6 +1142,12 @@ source_finish_consume(ClusterPcmOwnHeldXRevoke *input, bool held_source)
 
 	frame.body.image_envelope.source_carrier_generation = input->revoking.generation + 1;
 	frame.common.logical_assertion.resource = input->revoking.tag;
+	frame.common.logical_assertion.requester_node = 2;
+	frame.common.assertion_sequence = 91;
+	frame.common.resource_formation = 17;
+	frame.common.master_session_incarnation = 31;
+	frame.common.base_authority_generation = 41;
+	frame.common.sender_connection_generation = 51;
 	PageSetLSNPreserveOrigin((Page)frame.body.image_envelope.page_bytes, UINT64_C(0x12340));
 	if (transition_pending_proof != NULL) {
 		memcpy(frame.body.image_envelope.page_bytes, transition_page.data, BLCKSZ);
@@ -6324,6 +6397,69 @@ UT_TEST(test_real_finish_failed_flush_rethrows_without_losing_fence)
 	ClusterPcmOwnArray = saved;
 }
 
+UT_TEST(test_real_target_prepare_traces_original_refusals_after_unlock)
+{
+	const ClusterWaitTraceGuard guards[] = {
+		CLWAIT_GUARD_CONTENT, CLWAIT_GUARD_ACTIVATION,
+		CLWAIT_GUARD_GENERATION, CLWAIT_GUARD_FLAGS
+	};
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot before;
+	ResourceXAcquisitionRef ref = { 0 };
+	ResourceXCurrentImage image;
+	PGAlignedBlock aligned;
+	unsigned enabled, scenario;
+
+	for (enabled = 0; enabled < 2; enabled++) {
+		for (scenario = 0; scenario < lengthof(guards); scenario++) {
+			uint64 expected, committed = UINT64_MAX;
+			ResourceXBufferActivationResult result;
+
+			transition_fixture(&buf, &entry, &before, false);
+			pg_atomic_write_u32(&entry.flags, 0);
+			expected = before.generation;
+			ref.assertion.resource = buf.tag;
+			ref.assertion.requester_node = 2;
+			ref.formation = 17;
+			ref.acquisition_generation = 23;
+			if (scenario == 0)
+				transition_content_busy = true;
+			else if (scenario == 1)
+				pg_atomic_write_u64(&entry.writer_activation_token, 97);
+			else if (scenario == 2)
+				expected++;
+			else
+				pg_atomic_write_u32(&entry.flags, PCM_OWN_FLAG_REVOKING);
+			cluster_trace_tx_identity = enabled != 0;
+			guard_trace_count = 0;
+			memset(&image, 0xff, sizeof(image));
+			result = gcs_block_pcm_x_resource_x_prepare_target_x(
+				&ref, expected, false, false, 0, false, false, NULL,
+				&aligned, &image, &committed, NULL);
+			UT_ASSERT_EQ(result, scenario == 2 ? RESOURCE_X_BUFFER_STALE : RESOURCE_X_BUFFER_BUSY);
+			UT_ASSERT_EQ(committed, 0);
+			UT_ASSERT(image.page_bytes == NULL && image.image_length == 0);
+			UT_ASSERT_EQ(guard_trace_count, enabled);
+			if (enabled) {
+				UT_ASSERT_EQ(guard_trace_last.site, CLWAIT_SITE_PCM_TARGET_PREPARE);
+				UT_ASSERT_EQ(guard_trace_last.guard, guards[scenario]);
+				UT_ASSERT(BufferTagsEqual(&guard_trace_last.tag, &buf.tag));
+				UT_ASSERT_EQ(guard_trace_last.formation, 17);
+				UT_ASSERT_EQ(guard_trace_last.acquisition, 23);
+				UT_ASSERT_EQ(guard_trace_last.own_generation, before.generation);
+				UT_ASSERT(!guard_trace_last.request_known && !guard_trace_last.master_view);
+			}
+			UT_ASSERT(!transition_content_held && !transition_mapping_held);
+			UT_ASSERT_EQ(transition_pin_count, 0);
+			UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), before.generation);
+		}
+	}
+	cluster_trace_tx_identity = false;
+	ClusterPcmOwnArray = saved;
+}
+
 UT_TEST(test_real_source_finish_busy_is_owned_wait_not_global_failure)
 {
 	BufferDesc buf;
@@ -6366,8 +6502,25 @@ UT_TEST(test_real_source_finish_busy_is_owned_wait_not_global_failure)
 			PageSetLSNPreserveOrigin((Page)transition_page.data, UINT64_C(0x12341));
 			memcpy(before.data, transition_page.data, BLCKSZ);
 		}
+		cluster_trace_tx_identity = scenario < 2;
+		guard_trace_count = 0;
 		UT_ASSERT_EQ(source_finish_consume(&held, true),
 					 scenario < 2 ? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+		UT_ASSERT_EQ(guard_trace_count, scenario < 2 ? 1 : 0);
+		if (scenario < 2) {
+			UT_ASSERT_EQ(guard_trace_last.site, CLWAIT_SITE_PCM_SOURCE_FINISH);
+			UT_ASSERT_EQ(guard_trace_last.guard,
+						 scenario == 0 ? CLWAIT_GUARD_CONTENT : CLWAIT_GUARD_IO);
+			UT_ASSERT_EQ(guard_trace_last.request_seq, 91);
+			UT_ASSERT_EQ(guard_trace_last.requester, 2);
+			UT_ASSERT_EQ(guard_trace_last.formation, 17);
+			UT_ASSERT_EQ(guard_trace_last.master_session, 31);
+			UT_ASSERT_EQ(guard_trace_last.r4, 77);
+			UT_ASSERT_EQ(guard_trace_last.base, 41);
+			UT_ASSERT_EQ(guard_trace_last.wire_sender_connection, 51);
+			UT_ASSERT(!guard_trace_last.transport_known && !guard_trace_last.master_view);
+		}
+		cluster_trace_tx_identity = false;
 		UT_ASSERT_EQ(source_finish_fuses, scenario < 2 ? 0 : 1);
 		UT_ASSERT_EQ(source_finish_owner_releases, scenario < 2 ? 0 : 1);
 		UT_ASSERT_EQ(source_finish_defer_calls, scenario < 3 ? 1 : 0);
@@ -6534,6 +6687,7 @@ UT_TEST(test_real_main_revoke_drain_preserves_passive_pins)
 	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
 	ClusterPcmOwnSnapshot expected;
 	ClusterPcmOwnHeldXRevoke held;
+	ClusterPcmOwnFinishRefusal refusal;
 	PGIOAlignedBlock before;
 
 	for (int passive_pins = 2; passive_pins <= 3; passive_pins++) {
@@ -6553,9 +6707,25 @@ UT_TEST(test_real_main_revoke_drain_preserves_passive_pins)
 		transition_content_busy = true;
 		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_try_drain_held_x_revoke(&held),
 					 CLUSTER_PCM_OWN_BUSY);
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_try_drain_held_x_revoke_observed(&held, &refusal),
+					 CLUSTER_PCM_OWN_BUSY);
+		UT_ASSERT_EQ(refusal.reason, CLUSTER_PCM_OWN_FINISH_REFUSAL_CONTENT_LOCK);
 		UT_ASSERT_EQ(transition_pin_count, passive_pins + 1);
 		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_validate_held_x_revoke(&held), CLUSTER_PCM_OWN_OK);
 		transition_content_busy = false;
+		pg_atomic_fetch_or_u32(&buf.state, BM_IO_IN_PROGRESS);
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_try_drain_held_x_revoke_observed(&held, &refusal),
+					 CLUSTER_PCM_OWN_BUSY);
+		UT_ASSERT_EQ(refusal.reason, CLUSTER_PCM_OWN_FINISH_REFUSAL_IO_IN_PROGRESS);
+		UT_ASSERT_EQ(refusal.shared_refcount, passive_pins + 1);
+		UT_ASSERT(refusal.bm_io_in_progress);
+		UT_ASSERT_EQ(refusal.live_token, cluster_pcm_own_reservation_token_get(0));
+		UT_ASSERT_EQ(refusal.live_flags, PCM_OWN_FLAG_REVOKING);
+		pg_atomic_fetch_and_u32(&buf.state, ~BM_IO_IN_PROGRESS);
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_try_drain_held_x_revoke_observed(&held, &refusal),
+					 CLUSTER_PCM_OWN_OK);
+		UT_ASSERT_EQ(refusal.reason, CLUSTER_PCM_OWN_FINISH_REFUSAL_NONE);
+		UT_ASSERT(!refusal.bm_io_in_progress);
 		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_try_drain_held_x_revoke(&held), CLUSTER_PCM_OWN_OK);
 		UT_ASSERT_EQ(transition_pin_count, passive_pins + 1);
 		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_abort_held_x_revoke(&held), CLUSTER_PCM_OWN_OK);
@@ -10656,7 +10826,7 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(174);
+	UT_PLAN(175);
 	UT_RUN(test_native_flush_refuses_cr_before_starting_io);
 	UT_RUN(test_shared_leave_releases_dirty_and_clean_x_through_exact_owner);
 	UT_RUN(test_shared_leave_write_and_sync_error_keep_x_and_mapping);
@@ -10721,6 +10891,7 @@ main(void)
 	UT_RUN(test_unbound_fsm_output_retries_after_eio_and_writes_bytes);
 	UT_RUN(test_unbound_output_retry_keeps_native_and_pi_boundaries);
 	UT_RUN(test_real_finish_failed_flush_rethrows_without_losing_fence);
+	UT_RUN(test_real_target_prepare_traces_original_refusals_after_unlock);
 	UT_RUN(test_real_source_finish_busy_is_owned_wait_not_global_failure);
 	UT_RUN(test_real_main_revoke_drain_preserves_passive_pins);
 	UT_RUN(test_real_main_revoke_finish_retains_passive_pins);

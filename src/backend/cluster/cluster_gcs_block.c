@@ -75,6 +75,7 @@
 #include "cluster/cluster_xnode_profile.h" /* spec-5.59 D2/D3/D4 profiling buckets */
 #include "cluster/cluster_update_trace.h"
 #include "cluster/cluster_tx_identity_trace.h"
+#include "cluster/cluster_wait_trace.h"
 #include "cluster/cluster_xnode_lever.h" /* spec-6.12a — downgrade counters */
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_guc.h"
@@ -9970,6 +9971,84 @@ gcs_block_resource_x_retained_pair_replay(const ResourceXAssertion *assertion, u
 	return result;
 }
 
+/* Process-local observations only. The source frame identifies the logical
+ * request, but its wire sender is the master, not the requester connection.
+ * An acquisition ref alone has no request sequence or transport identity.
+ * Call only after the original content/header/mapping locks are released. */
+static void
+gcs_block_pcm_trace_guard(ClusterWaitTraceSite site, const ResourceXDecodedCommon *common,
+	const ResourceXAcquisitionRef *ref, int32 master_node, uint64 r4,
+	const ClusterPcmOwnSnapshot *own, ClusterWaitTraceGuard guard, int result,
+	const ClusterPcmOwnFinishRefusal *refusal)
+{
+	ClusterWaitTrace row = { 0 };
+
+	if (!cluster_trace_tx_identity)
+		return;
+	row.snapshot = cluster_wait_trace_begin(CLWAIT_PCM_GUARD);
+	if (row.snapshot == 0)
+		return;
+	row.site = site;
+	row.guard = guard;
+	row.guard_result = result;
+	row.mode = PCM_STATE_X;
+	row.expected_master = master_node;
+	row.r4 = r4;
+	if (common != NULL) {
+		row.tag = common->logical_assertion.resource;
+		row.tag_known = true;
+		row.requester = common->logical_assertion.requester_node;
+		row.request_seq = common->assertion_sequence;
+		row.request_known = common->assertion_sequence != 0;
+		row.formation = common->resource_formation;
+		row.master_session = common->master_session_incarnation;
+		row.base = common->base_authority_generation;
+		row.wire_sender_connection = common->sender_connection_generation;
+	} else if (ref != NULL) {
+		row.tag = ref->assertion.resource;
+		row.tag_known = true;
+		row.requester = ref->assertion.requester_node;
+		row.formation = ref->formation;
+		row.acquisition = ref->acquisition_generation;
+	}
+	if (own != NULL) {
+		row.own_generation = own->generation;
+		row.reservation = own->reservation_token;
+		row.writer_activation = own->writer_activation_token;
+		row.rx_activation = own->resource_x_activation_generation;
+		row.own_flags = own->flags;
+		row.own_state = own->pcm_state;
+		row.buffer_type = own->buffer_type;
+		row.buffer_state = own->semantic_buf_state;
+	}
+	if (refusal != NULL) {
+		row.refusal_reason = refusal->reason;
+		row.refusal_token = refusal->live_token;
+		row.refusal_flags = refusal->live_flags;
+		row.refusal_pins = refusal->shared_refcount;
+		row.refusal_io = refusal->bm_io_in_progress;
+	}
+	cluster_wait_trace_emit(CLWAIT_PCM_GUARD, &row);
+}
+
+static ClusterWaitTraceGuard
+gcs_block_pcm_trace_refusal(const ClusterPcmOwnFinishRefusal *refusal)
+{
+	switch (refusal->reason) {
+	case CLUSTER_PCM_OWN_FINISH_REFUSAL_CONTENT_LOCK:
+		return CLWAIT_GUARD_CONTENT;
+	case CLUSTER_PCM_OWN_FINISH_REFUSAL_IO_IN_PROGRESS:
+	case CLUSTER_PCM_OWN_FINISH_REFUSAL_DATA_IO_RETRY:
+		return CLWAIT_GUARD_IO;
+	case CLUSTER_PCM_OWN_FINISH_REFUSAL_VM_FSM_PINNED:
+		return CLWAIT_GUARD_RETAINED;
+	case CLUSTER_PCM_OWN_FINISH_REFUSAL_LIVE_FLAGS:
+		return CLWAIT_GUARD_FLAGS;
+	default:
+		return CLWAIT_GUARD_FINISH;
+	}
+}
+
 /* The initial callback and the winning LMS retry use one finish/publish
  * boundary. Ownership of the supplied pin and local handle moves into this
  * call; the caller must return immediately and must not unwind them again.
@@ -10072,6 +10151,9 @@ gcs_block_resource_x_source_finish_owned(
 	PG_END_TRY();
 	if (finish_result != CLUSTER_PCM_OWN_OK || retained.pcm_state != (uint8)PCM_STATE_N
 		|| retained.generation != image->body.image_envelope.source_carrier_generation) {
+		gcs_block_pcm_trace_guard(CLWAIT_SITE_PCM_SOURCE_FINISH, &block->common, NULL,
+			authenticated_master_node, writer_r4_generation, &revoking,
+			gcs_block_pcm_trace_refusal(&finish_refusal), finish_result, &finish_refusal);
 		/* Only a proved, reversible refusal may hand the continuous
 		 * service pin to the exact shared owner. No callback cleanup may run
 		 * after APPLIED: a winning LMS claim can already own its release. */
@@ -10533,9 +10615,18 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 	}
 	if (tagless_target_x && target_x_retain && !semantic_retained) {
 		ResourceXApplyResult yield_result;
+		ClusterPcmOwnFinishRefusal drain_refusal = { 0 };
 
 		failure_stage = "terminal-content-drain";
-		own_result = cluster_bufmgr_pcm_own_try_drain_held_x_revoke(&held_x_revoke);
+		if (cluster_trace_tx_identity)
+			own_result = cluster_bufmgr_pcm_own_try_drain_held_x_revoke_observed(
+				&held_x_revoke, &drain_refusal);
+		else
+			own_result = cluster_bufmgr_pcm_own_try_drain_held_x_revoke(&held_x_revoke);
+		if (own_result != CLUSTER_PCM_OWN_OK)
+			gcs_block_pcm_trace_guard(CLWAIT_SITE_PCM_RETAINED_DRAIN, &block->common, NULL,
+				resource_master_node, writer_r4_generation, &revoking,
+				gcs_block_pcm_trace_refusal(&drain_refusal), own_result, &drain_refusal);
 		if (own_result == CLUSTER_PCM_OWN_BUSY) {
 			/* Do not wait in LMON: the pre-existing content-S holder may be
 			 * waiting for this same event loop to deliver a visibility reply.
@@ -10870,6 +10961,8 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 	ResourceXBufferActivationResult result = RESOURCE_X_BUFFER_STALE;
 	bool content_locked = false;
 	bool direct_init_remote_install;
+	bool trace_current_known = false;
+	ClusterWaitTraceGuard trace_guard = CLWAIT_GUARD_FINISH;
 
 	if (image_out != NULL)
 		memset(image_out, 0, sizeof(*image_out));
@@ -10907,11 +11000,14 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 	} else
 		own_result = cluster_bufmgr_pcm_own_snapshot_by_tag(&ref->assertion.resource, &buffer_id,
 															&current);
-	if (own_result != CLUSTER_PCM_OWN_OK || buffer_id < 0)
+	if (own_result != CLUSTER_PCM_OWN_OK || buffer_id < 0) {
+		gcs_block_pcm_trace_guard(CLWAIT_SITE_PCM_TARGET_PREPARE, NULL, ref, -1, 0,
+			NULL, CLWAIT_GUARD_SNAPSHOT, own_result, NULL);
 		return own_result == CLUSTER_PCM_OWN_BUSY		 ? RESOURCE_X_BUFFER_BUSY
 			   : own_result == CLUSTER_PCM_OWN_STALE	 ? RESOURCE_X_BUFFER_STALE
 			   : own_result == CLUSTER_PCM_OWN_NOT_READY ? RESOURCE_X_BUFFER_ABSENT
 														 : RESOURCE_X_BUFFER_CORRUPT;
+	}
 	if (direct_init_bound
 		&& !cluster_pcm_lock_resource_x_bootstrap_round_direct_init_matches_exact(
 			ref, expected_local_generation, direct_init_reservation_token))
@@ -10921,15 +11017,20 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 		&& delivery_claim->target.buffer_id_plus_one != (uint32)buffer_id + 1)
 		return RESOURCE_X_BUFFER_STALE;
 	content_lock = BufferDescriptorGetContentLock(buf);
-	if (!LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE))
+	if (!LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)) {
+		gcs_block_pcm_trace_guard(CLWAIT_SITE_PCM_TARGET_PREPARE, NULL, ref, -1, 0,
+			&current, CLWAIT_GUARD_CONTENT, RESOURCE_X_BUFFER_BUSY, NULL);
 		return RESOURCE_X_BUFFER_BUSY;
+	}
 	content_locked = true;
 
 	PG_TRY();
 	{
 		do {
 			own_result = cluster_bufmgr_pcm_own_snapshot(buf, &current);
+			trace_current_known = own_result == CLUSTER_PCM_OWN_OK;
 			if (own_result != CLUSTER_PCM_OWN_OK) {
+				trace_guard = CLWAIT_GUARD_SNAPSHOT;
 				result = own_result == CLUSTER_PCM_OWN_BUSY		   ? RESOURCE_X_BUFFER_BUSY
 						 : own_result == CLUSTER_PCM_OWN_STALE	   ? RESOURCE_X_BUFFER_STALE
 						 : own_result == CLUSTER_PCM_OWN_NOT_READY ? RESOURCE_X_BUFFER_ABSENT
@@ -10952,12 +11053,15 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 				committed_generation = current.generation;
 			} else if (current.writer_activation_token != 0
 					   || current.resource_x_activation_generation != 0) {
+				trace_guard = CLWAIT_GUARD_ACTIVATION;
 				result = RESOURCE_X_BUFFER_BUSY;
 				break;
 			} else if (current.generation != expected_local_generation) {
+				trace_guard = CLWAIT_GUARD_GENERATION;
 				result = current.flags != 0 ? RESOURCE_X_BUFFER_BUSY : RESOURCE_X_BUFFER_STALE;
 				break;
 			} else if (direct_init_bound && current.flags != PCM_OWN_FLAG_GRANT_PENDING) {
+				trace_guard = CLWAIT_GUARD_FLAGS;
 				result = RESOURCE_X_BUFFER_STALE;
 				break;
 			} else {
@@ -11018,6 +11122,7 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 					}
 					reservation_token = current.reservation_token;
 				} else if (current.flags != 0) {
+					trace_guard = CLWAIT_GUARD_FLAGS;
 					result = RESOURCE_X_BUFFER_BUSY;
 					break;
 				} else if (current.pcm_state == (uint8)PCM_STATE_N) {
@@ -11123,6 +11228,7 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 
 			if (capture_local_image) {
 				own_result = cluster_bufmgr_pcm_own_snapshot(buf, &current);
+				trace_current_known = own_result == CLUSTER_PCM_OWN_OK;
 				if (own_result != CLUSTER_PCM_OWN_OK || current.generation != committed_generation
 					|| !cluster_pcm_x_resource_x_t2_snapshot_exact(ref, &current)) {
 					result = own_result == CLUSTER_PCM_OWN_BUSY		   ? RESOURCE_X_BUFFER_BUSY
@@ -11155,6 +11261,9 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	if (result != RESOURCE_X_BUFFER_T2_INSTALLED)
+		gcs_block_pcm_trace_guard(CLWAIT_SITE_PCM_TARGET_PREPARE, NULL, ref, -1, 0,
+			trace_current_known ? &current : NULL, trace_guard, result, NULL);
 	return result;
 }
 

@@ -36,7 +36,7 @@ void
 cluster_wait_trace_emit(ClusterWaitTraceKind kind, const ClusterWaitTrace *row)
 {
 	static const char *const names[CLWAIT_NKINDS] = {
-		"PCM_WAIT", "PCM_QUEUE", "PCM_ADMISSION", "TX_BUFFER", "TX_LEDGER", "TX_SUMMARY"
+		"PCM_WAIT", "PCM_QUEUE", "PCM_ADMISSION", "TX_BUFFER", "TX_LEDGER", "TX_SUMMARY", "PCM_GUARD"
 	};
 	uint32 *count;
 
@@ -61,6 +61,7 @@ cluster_wait_trace_emit(ClusterWaitTraceKind kind, const ClusterWaitTrace *row)
 		"master_session=" UINT64_FORMAT " r4=" UINT64_FORMAT " acquisition=" UINT64_FORMAT " "
 		"base=" UINT64_FORMAT " authority=" UINT64_FORMAT " head=" UINT64_FORMAT " "
 		"enqueue_order=" UINT64_FORMAT " requester_conn=" UINT64_FORMAT " ingress_conn=" UINT64_FORMAT " "
+		"transport_known=%d wire_sender_conn=" UINT64_FORMAT " "
 		"queue_kind=%d phase=%d round_phase=%d owner_phase=%d progress=%08x incompatible=%08x blocked=%08x "
 		"round_request=" UINT64_FORMAT " round_requester=%d head_request=" UINT64_FORMAT " head_requester=%d "
 		"holder_node=%u holder_proc=%u holder_epoch=" UINT64_FORMAT " holder_request=" UINT64_FORMAT " "
@@ -68,6 +69,17 @@ cluster_wait_trace_emit(ClusterWaitTraceKind kind, const ClusterWaitTrace *row)
 		"buffer_state=%08x own_state=%d buffer_type=%d own_flags=%08x "
 		"own_generation=" UINT64_FORMAT " reservation=" UINT64_FORMAT " "
 		"writer_activation=" UINT64_FORMAT " rx_activation=" UINT64_FORMAT " "
+		"entry_formation=" UINT64_FORMAT " entry_acquisition=" UINT64_FORMAT " entry_base=" UINT64_FORMAT " "
+		"round_known=%d round_formation=" UINT64_FORMAT " round_session=" UINT64_FORMAT " "
+		"round_r4=" UINT64_FORMAT " round_base=" UINT64_FORMAT " round_master=%d "
+		"round_requester_conn=" UINT64_FORMAT " round_ingress_conn=" UINT64_FORMAT " caller_matches_round=%d "
+		"head_known=%d head_formation=" UINT64_FORMAT " head_session=" UINT64_FORMAT " head_base=" UINT64_FORMAT " "
+		"head_requester_conn=" UINT64_FORMAT " head_ingress_conn=" UINT64_FORMAT " caller_matches_head=%d "
+		"wait_head_change=" UINT64_FORMAT " head_change=" UINT64_FORMAT " continuation_known=%d "
+		"continuation_pending=" UINT64_FORMAT " continuation_expected_x=" UINT64_FORMAT " "
+		"continuation_reservation=" UINT64_FORMAT " continuation_claim_pending=" UINT64_FORMAT " "
+		"continuation_claim_reservation=" UINT64_FORMAT " guard=%d guard_result=%d refusal_reason=%d "
+		"refusal_token=" UINT64_FORMAT " refusal_flags=%08x refusal_pins=%u refusal_io=%d "
 		"pins_seen=%u ledger_seen=%u local_pins=%u rows=%u omitted=%u atomic_graph=0",
 		names[kind], cluster_node_id, MyProcPid,
 		MyProc == NULL ? UINT32_MAX : (uint32)MyProc->pgprocno, row->snapshot, row->site,
@@ -77,13 +89,25 @@ cluster_wait_trace_emit(ClusterWaitTraceKind kind, const ClusterWaitTrace *row)
 		row->state, row->x_holder, row->s_holders, row->pi_holders, row->pending_requester,
 		row->pending_cookie, row->binding, row->formation, row->master_session, row->r4,
 		row->acquisition, row->base, row->authority, row->head, row->enqueue_order,
-		row->requester_connection, row->ingress_connection, row->queue_kind, row->phase, row->round_phase,
+		row->requester_connection, row->ingress_connection, row->transport_known,
+		row->wire_sender_connection, row->queue_kind, row->phase, row->round_phase,
 		row->owner_phase, row->progress, row->incompatible, row->blocked,
 		row->round_request, row->round_requester, row->head_request, row->head_requester,
 		row->holder_node, row->holder_proc, row->holder_epoch, row->holder_request,
 		row->buffer, row->private_pins, row->shared_pins, row->content_held, row->ledger_phase,
 		row->buffer_state, row->own_state, row->buffer_type, row->own_flags,
 		row->own_generation, row->reservation, row->writer_activation, row->rx_activation,
+		row->entry_formation, row->entry_acquisition, row->entry_base,
+		row->round_request_known, row->round_formation, row->round_session,
+		row->round_r4, row->round_base, row->round_master,
+		row->round_requester_connection, row->round_ingress_connection, row->caller_matches_round,
+		row->head_request_known, row->head_formation, row->head_session, row->head_base,
+		row->head_requester_connection, row->head_ingress_connection, row->caller_matches_head,
+		row->wait_head_change, row->head_change, row->continuation_known,
+		row->continuation_pending, row->continuation_expected_x, row->continuation_reservation,
+		row->continuation_claim_pending, row->continuation_claim_reservation,
+		row->guard, row->guard_result, row->refusal_reason, row->refusal_token,
+		row->refusal_flags, row->refusal_pins, row->refusal_io,
 		row->pins_seen, row->ledger_seen, row->local_pins, row->rows, row->omitted)));
 }
 

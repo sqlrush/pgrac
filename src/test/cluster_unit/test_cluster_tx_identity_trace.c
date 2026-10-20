@@ -16,7 +16,7 @@ bool cluster_trace_tx_identity = false;
 int cluster_node_id = 2;
 int MyProcPid = 1234;
 PGPROC *MyProc = NULL;
-static char last[4096];
+static char last[8192];
 static unsigned logs;
 
 bool errstart(int level, const char *domain) { (void)domain; assert(level == LOG); return true; }
@@ -89,7 +89,9 @@ int main(void) {
 	/* The new resource families are passive, independently bounded and OFF. */
 	before = logs;
 	assert(cluster_wait_trace_begin(CLWAIT_PCM_WAIT) == 0);
+	assert(cluster_wait_trace_begin(CLWAIT_PCM_GUARD) == 0);
 	cluster_wait_trace_emit(CLWAIT_TX_BUFFER, NULL);
+	cluster_wait_trace_emit(CLWAIT_PCM_GUARD, NULL);
 	assert(logs == before);
 	cluster_trace_tx_identity = true;
 	resource.snapshot = cluster_wait_trace_begin(CLWAIT_PCM_WAIT);
@@ -108,6 +110,25 @@ int main(void) {
 	resource.private_pins = 2; resource.shared_pins = 4;
 	resource.content_held = true; resource.ledger_phase = 3;
 	resource.omitted = 7;
+	resource.wire_sender_connection = 104;
+	resource.entry_formation = 105; resource.entry_acquisition = 106; resource.entry_base = 107;
+	resource.round_request_known = true;
+	resource.round_formation = 108; resource.round_session = 109; resource.round_r4 = 110;
+	resource.round_base = 111; resource.round_requester_connection = 112;
+	resource.round_ingress_connection = 113; resource.round_master = 1;
+	resource.head_request_known = true;
+	resource.head_formation = 114; resource.head_session = 115; resource.head_base = 116;
+	resource.head_requester_connection = 117; resource.head_ingress_connection = 118;
+	resource.wait_head_change = 119; resource.head_change = 120;
+	resource.caller_matches_round = true; resource.caller_matches_head = false;
+	resource.continuation_known = true;
+	resource.continuation_pending = 121; resource.continuation_expected_x = 122;
+	resource.continuation_reservation = 123; resource.continuation_claim_pending = 124;
+	resource.continuation_claim_reservation = 125;
+	resource.guard = CLWAIT_GUARD_ACTIVATION; resource.guard_result = 2;
+	resource.refusal_reason = 3; resource.refusal_token = 126;
+	resource.refusal_flags = 4; resource.refusal_pins = 5; resource.refusal_io = true;
+	resource.transport_known = true;
 	cluster_wait_trace_emit(CLWAIT_PCM_WAIT, &resource);
 	assert(strstr(last, "event=PCM_WAIT") && strstr(last, "actor_node=2 pid=1234"));
 	assert(strstr(last, "tag_known=1 spc=11 db=22 rel=33 fork=2 block=44"));
@@ -116,6 +137,17 @@ int main(void) {
 	assert(strstr(last, "x_holder=3 s_holders=00000005 pi_holders=00000008"));
 	assert(strstr(last, "private_pins=2 shared_pins=4 content_held=1 ledger_phase=3"));
 	assert(strstr(last, "omitted=7 atomic_graph=0"));
+	assert(strstr(last, "transport_known=1 wire_sender_conn=104"));
+	assert(strstr(last, "entry_formation=105 entry_acquisition=106 entry_base=107"));
+	assert(strstr(last, "round_known=1 round_formation=108 round_session=109 round_r4=110 round_base=111 round_master=1"));
+	assert(strstr(last, "round_requester_conn=112 round_ingress_conn=113 caller_matches_round=1"));
+	assert(strstr(last, "head_known=1 head_formation=114 head_session=115 head_base=116"));
+	assert(strstr(last, "head_requester_conn=117 head_ingress_conn=118 caller_matches_head=0"));
+	assert(strstr(last, "wait_head_change=119 head_change=120"));
+	assert(strstr(last, "continuation_known=1 continuation_pending=121 continuation_expected_x=122"));
+	assert(strstr(last, "continuation_reservation=123 continuation_claim_pending=124 continuation_claim_reservation=125"));
+	assert(strstr(last, "guard=3 guard_result=2 refusal_reason=3 refusal_token=126"));
+	assert(strstr(last, "refusal_flags=00000004 refusal_pins=5 refusal_io=1"));
 	resource.master_view = true;
 	cluster_wait_trace_emit(CLWAIT_PCM_ADMISSION, &resource);
 	assert(strstr(last, "event=PCM_ADMISSION") && strstr(last, "master_view=1"));
@@ -123,6 +155,18 @@ int main(void) {
 		cluster_wait_trace_emit(CLWAIT_PCM_WAIT, &resource);
 	assert(strstr(last, "event=LIMIT family=PCM_WAIT") && strstr(last, "evidence_complete=0"));
 	assert(cluster_wait_trace_begin(CLWAIT_PCM_WAIT) == 0);
+	before = logs;
+	cluster_wait_trace_emit(CLWAIT_TX_SUMMARY, &resource);
+	assert(logs == before + 1 && strstr(last, "event=TX_SUMMARY"));
+	before = logs;
+	resource.snapshot = cluster_wait_trace_begin(CLWAIT_PCM_GUARD);
+	assert(resource.snapshot != 0);
+	cluster_wait_trace_emit(CLWAIT_PCM_GUARD, &resource);
+	assert(logs == before + 1 && strstr(last, "event=PCM_GUARD"));
+	for (unsigned i = 0; i < CLUSTER_WAIT_TRACE_LIMIT + 2; i++)
+		cluster_wait_trace_emit(CLWAIT_PCM_GUARD, &resource);
+	assert(strstr(last, "event=LIMIT family=PCM_GUARD") && strstr(last, "evidence_complete=0"));
+	assert(cluster_wait_trace_begin(CLWAIT_PCM_GUARD) == 0);
 	before = logs;
 	cluster_wait_trace_emit(CLWAIT_TX_SUMMARY, &resource);
 	assert(logs == before + 1 && strstr(last, "event=TX_SUMMARY"));

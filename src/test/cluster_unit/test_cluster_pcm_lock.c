@@ -13627,9 +13627,22 @@ UT_TEST(test_resource_x_predecessor_cv_observes_settlement_without_a_head)
 	retain_resource_x_test_settlement_pair(tag, PCM_STATE_S, 60, 61, 5,
 										   &predecessor_wait_settlement);
 	UT_ASSERT(resource_x_assertion_init(&tag, 1, &assertion));
+	wait_trace_count = 0;
+	cluster_trace_tx_identity = true;
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_predecessor_wait_exact(&tag, 0, 31, 17, 0, 102500, 10000),
 		RESOURCE_X_APPLY_APPLIED);
+	cluster_trace_tx_identity = false;
+	UT_ASSERT_EQ(wait_trace_count, 1);
+	UT_ASSERT_EQ(wait_trace_rows[0].site, CLWAIT_SITE_PCM_PREDECESSOR);
+	UT_ASSERT(wait_trace_rows[0].request_known);
+	UT_ASSERT_EQ(wait_trace_rows[0].request_seq,
+		predecessor_wait_settlement.common.assertion_sequence);
+	UT_ASSERT_EQ(wait_trace_rows[0].requester,
+		predecessor_wait_settlement.common.logical_assertion.requester_node);
+	UT_ASSERT_EQ(wait_trace_rows[0].base,
+		predecessor_wait_settlement.common.base_authority_generation);
+	wait_trace_count = 0;
 	UT_ASSERT_EQ(fake_cv_sleep_count, 1);
 	UT_ASSERT_EQ(fake_cv_timed_sleep_timeout, 10);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
@@ -15162,9 +15175,21 @@ UT_TEST(test_resource_x_terminal_delivery_holds_reference_until_release)
 				 RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
 	UT_ASSERT_EQ(memcmp(&terminal, &empty, sizeof(empty)), 0);
 	sleeps = fake_cv_sleep_count;
+	wait_trace_count = 0;
+	cluster_trace_tx_identity = true;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
 					 &fixture.assertion, 0, 17, 31, 77, 51, 61, 50, 4000, 1),
 				 RESOURCE_X_APPLY_APPLIED);
+	cluster_trace_tx_identity = false;
+	UT_ASSERT_EQ(wait_trace_count, 1);
+	UT_ASSERT_EQ(wait_trace_rows[0].site, CLWAIT_SITE_PCM_BOOTSTRAP);
+	UT_ASSERT(wait_trace_rows[0].request_known);
+	UT_ASSERT_EQ(wait_trace_rows[0].request_seq, fixture.ref.acquisition_generation);
+	UT_ASSERT_EQ(wait_trace_rows[0].formation, 17);
+	UT_ASSERT_EQ(wait_trace_rows[0].master_session, 31);
+	UT_ASSERT_EQ(wait_trace_rows[0].requester_connection, 51);
+	UT_ASSERT_EQ(wait_trace_rows[0].ingress_connection, 61);
+	wait_trace_count = 0;
 	UT_ASSERT_EQ(fake_cv_sleep_count, sleeps + 1);
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_delivery_complete_exact(&fixture.delivery, &fixture.installed),
@@ -15211,9 +15236,21 @@ UT_TEST(test_resource_x_install_follow_waits_for_delivery_release)
 					 &wrong, &fixture.installed, &terminal),
 				 RESOURCE_X_TARGET_INSTALL_STALE);
 	sleeps = fake_cv_sleep_count;
+	wait_trace_count = 0;
+	cluster_trace_tx_identity = true;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
 					 &follow, RESOURCE_X_TARGET_INSTALL_INFLIGHT, 1),
 				 RESOURCE_X_APPLY_APPLIED);
+	cluster_trace_tx_identity = false;
+	UT_ASSERT_EQ(wait_trace_count, 1);
+	UT_ASSERT_EQ(wait_trace_rows[0].site, CLWAIT_SITE_PCM_INSTALL);
+	UT_ASSERT(wait_trace_rows[0].request_known);
+	UT_ASSERT_EQ(wait_trace_rows[0].request_seq, fixture.ref.acquisition_generation);
+	UT_ASSERT_EQ(wait_trace_rows[0].formation, 17);
+	UT_ASSERT_EQ(wait_trace_rows[0].master_session, 31);
+	UT_ASSERT_EQ(wait_trace_rows[0].requester_connection, 51);
+	UT_ASSERT_EQ(wait_trace_rows[0].ingress_connection, 61);
+	wait_trace_count = 0;
 	UT_ASSERT_EQ(fake_cv_sleep_count, sleeps + 1);
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_delivery_complete_exact(&fixture.delivery, &fixture.installed),
@@ -15222,6 +15259,77 @@ UT_TEST(test_resource_x_install_follow_waits_for_delivery_release)
 					 &follow, &fixture.installed, &terminal),
 				 RESOURCE_X_TARGET_INSTALL_TERMINAL);
 	UT_ASSERT_EQ(terminal.acquisition_generation, fixture.ref.acquisition_generation);
+}
+
+UT_TEST(test_resource_x_install_trace_keeps_queue_continuations_separate)
+{
+	DeliveryObserverFixture fixture;
+	ResourceXTargetInstallContinuation follow;
+	ResourceXDecodedFrame first, next, ack, assertion;
+	ResourceXMasterSnapshot snapshot;
+	bool saw_install = false, saw_canonical = false, saw_priority = false;
+
+	setup_terminal_delivery_observer(&fixture);
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(
+			&fixture.assertion, 0, 17, 31, 77, 51, 61, 50, 4000, &fixture.installed, &follow),
+		RESOURCE_X_TARGET_INSTALL_INFLIGHT);
+	/* Independent master requests share the tag, never this waiter's
+	 * physical INSTALL continuation. Use the actual admission APIs. */
+	cluster_node_id = 0;
+	first = make_resource_x_bootstrap_request_values(fixture.assertion.resource, 1, 17, 31, 41, 51);
+	next = make_resource_x_bootstrap_request_values(fixture.assertion.resource, 3, 17, 31, 43, 53);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+					 &first, 1, 61, 77, 31, 71, &ack), RESOURCE_X_APPLY_APPLIED);
+	assertion = ack;
+	assertion.kind = RESOURCE_X_WIRE_ASSERT_X;
+	assertion.common.sender_connection_generation = 51;
+	assertion.common.authority_generation = assertion.common.base_authority_generation;
+	assertion.common.outcome = RESOURCE_X_OUTCOME_NONE;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
+					 &assertion, 1, 61, 77, 31, 71, &snapshot), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+					 &next, 3, 63, 77, 31, 73, &ack), RESOURCE_X_APPLY_BAD_STATE);
+	cluster_node_id = 2;
+	wait_trace_count = 0;
+	cluster_trace_tx_identity = true;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
+					 &follow, RESOURCE_X_TARGET_INSTALL_INFLIGHT, 1), RESOURCE_X_APPLY_APPLIED);
+	cluster_trace_tx_identity = false;
+	for (int i = 0; i < wait_trace_count; i++) {
+		const ClusterWaitTrace *row = &wait_trace_rows[i];
+
+		if (wait_trace_kinds[i] == CLWAIT_PCM_WAIT) {
+			UT_ASSERT_EQ(row->site, CLWAIT_SITE_PCM_INSTALL);
+			UT_ASSERT(row->continuation_known);
+			UT_ASSERT_EQ(row->requester, 2);
+			UT_ASSERT_EQ(row->request_seq, fixture.ref.acquisition_generation);
+			saw_install = true;
+		} else if (wait_trace_kinds[i] == CLWAIT_PCM_QUEUE) {
+			UT_ASSERT(row->request_known);
+			UT_ASSERT(!row->continuation_known);
+			UT_ASSERT_EQ(row->continuation_pending, 0);
+			UT_ASSERT_EQ(row->continuation_expected_x, 0);
+			UT_ASSERT_EQ(row->continuation_reservation, 0);
+			UT_ASSERT_EQ(row->continuation_claim_pending, 0);
+			UT_ASSERT_EQ(row->continuation_claim_reservation, 0);
+			UT_ASSERT_EQ(row->wait_head_change, 0);
+			UT_ASSERT_EQ(row->acquisition, 0);
+			if (row->queue_kind == 1) {
+				UT_ASSERT_EQ(row->requester, 1);
+				UT_ASSERT_EQ(row->request_seq, 41);
+				UT_ASSERT(row->caller_matches_head);
+				saw_canonical = true;
+			} else {
+				UT_ASSERT_EQ(row->queue_kind, 2);
+				UT_ASSERT_EQ(row->requester, 3);
+				UT_ASSERT_EQ(row->request_seq, 43);
+				saw_priority = true;
+			}
+		}
+	}
+	UT_ASSERT(saw_install && saw_canonical && saw_priority);
+	wait_trace_count = 0;
 }
 
 static DeliveryObserverFixture *delivery_release_on_enroll;
@@ -24046,7 +24154,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(365);
+	UT_PLAN(366);
 	/* Observe the actual startup state before any runtime fixture overrides
 	 * the postmaster GUC or initializes shared PCM state and counters. */
 	UT_RUN(test_pcm_grd_max_entries_default_is_minus_one);
@@ -24259,6 +24367,7 @@ main(void)
 	UT_RUN(test_resource_x_actual_wait_does_not_reject_own_terminal_delivery);
 	UT_RUN(test_resource_x_terminal_delivery_holds_reference_until_release);
 	UT_RUN(test_resource_x_install_follow_waits_for_delivery_release);
+	UT_RUN(test_resource_x_install_trace_keeps_queue_continuations_separate);
 	UT_RUN(test_resource_x_delivery_release_before_sleep_and_original_deadline);
 	UT_RUN(test_resource_x_observed_step_preserves_strict_successor_proof);
 	UT_RUN(test_resource_x_wait_threshold_does_not_fail_owned_delivery);
