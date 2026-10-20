@@ -132,6 +132,22 @@ extern ClusterRelmapPendingResult cluster_relmap_retention_census_rebuild_pendin
 	ClusterRelmapRetentionCensus *census, ClusterRelmapPendingSet *pending_out,
 	const ClusterRelmapPendingSideSource *sources, size_t source_count);
 
+/* Require both original sealed SIDE extraction and the retained native WAL
+ * check before consuming ONE committed emission window. No structural set is
+ * installed if either refuses. The SIDE and WAL APIs above cannot be called
+ * sequentially: each successful rebuild consumes that same private window.
+ *
+ * The original cold owner supplies the complete corresponding SIDE selection
+ * and held WAL scope, and owns SIDE final revalidation and all independent
+ * era/epoch/boot/floor/issued qualifications. This composition does not prove
+ * that selection or correspondence. Clean pairs still have no pending WAL
+ * assertion. Whole physical ROOT DRAINED, provisional results, BUILDING and
+ * ERROR/scope ownership follow the APIs above; no completion or release. */
+extern ClusterRelmapPendingResult cluster_relmap_retention_census_rebuild_pending_side_wal(
+	ClusterRelmapRetentionCensus *census, ClusterRelmapPendingSet *pending_out,
+	struct ClusterWalInputsV1 *inputs,
+	const ClusterRelmapPendingSideSource *sources, size_t source_count);
+
 /* Interrupted scans invalidate the borrowed build and ROOT set, retaining
  * every restored pin. No directory, pin or ROOT ownership is freed here. */
 extern void cluster_relmap_retention_census_destroy(ClusterRelmapRetentionCensus *census);

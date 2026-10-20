@@ -461,6 +461,41 @@ cluster_relmap_retention_census_rebuild_pending_side(ClusterRelmapRetentionCensu
 	return cluster_relmap_retention_census_rebuild_pending(census, pending_out, descriptors, count);
 }
 
+ClusterRelmapPendingResult
+cluster_relmap_retention_census_rebuild_pending_side_wal(ClusterRelmapRetentionCensus *census,
+	ClusterRelmapPendingSet *pending_out, struct ClusterWalInputsV1 *inputs,
+	const ClusterRelmapPendingSideSource *sources, size_t source_count)
+{
+	ClusterRelmapPendingDescriptor descriptors[CLUSTER_RELMAP_PENDING_CAPACITY];
+	size_t count = 0;
+	ClusterRelmapPendingResult result = census_rebuild_ready(census);
+
+	if (result != CLUSTER_RELMAP_PENDING_OK)
+		return result;
+	/* Neither extraction nor retained I/O may install a partial set. Both
+	 * gates must use this same private namespace view before it is consumed. */
+	PG_TRY();
+	{
+		result = cluster_relmap_pending_collect_side(&census->identity, census->storage_uuid,
+			sources, source_count, descriptors, lengthof(descriptors), &count);
+	}
+	PG_CATCH();
+	{
+		census_failed(census, CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (result != CLUSTER_RELMAP_PENDING_OK) {
+		census_failed(census, result == CLUSTER_RELMAP_PENDING_CAPACITY_EXCEEDED
+			? CLUSTER_RELMAP_CENSUS_CAPACITY : CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+		return result;
+	}
+	/* Original scope, final borrowed-state recheck and ERROR/pin ownership
+	 * remain in the existing WAL path; only its atomic core consumes the view. */
+	return cluster_relmap_retention_census_rebuild_pending_wal(census, pending_out,
+		inputs, descriptors, count);
+}
+
 void
 cluster_relmap_retention_census_destroy(ClusterRelmapRetentionCensus *census)
 {

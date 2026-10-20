@@ -3392,8 +3392,15 @@ test_cluster_recovery_native_inputs: $(RECOVERY_CENSUS_TEST_OBJS) test_cluster_r
 test_cluster_recovery_native_inputs: test_cluster_recovery_xact_join_inputs.inc test_cluster_recovery_relmap_physical_inputs.inc test_cluster_recovery_relmap_inputs.inc test_cluster_recovery_relmap_fixture.h
 
 test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
-		test_cluster_relmap_retention_census_product.o test_cluster_relmap_pending_product.o \
+		test_cluster_relmap_retained_census.o test_cluster_relmap_pending_product.o \
+		test_cluster_relmap_pending_side_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o
+# The collector executes normally; inject only its ERROR boundary in this fixture.
+test_cluster_relmap_retained_census.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_retention_census.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_pending_side.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		-Dcluster_relmap_pending_collect_side=test_relmap_pending_collect_side -c $< -o $@
 test_cluster_relmap_retained_owner.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h
@@ -3435,7 +3442,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relma
 		$(top_srcdir)/src/include/cluster/cluster_wal_tail.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_owner.o) \
-		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retention_census_product.o test_cluster_relmap_pending_product.o $(top_builddir)/src/backend/cluster/cluster_relmap_retention.o) \
+		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_census.o test_cluster_relmap_pending_product.o test_cluster_relmap_pending_side_product.o $(top_builddir)/src/backend/cluster/cluster_relmap_retention.o) \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_root_set.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_namespace.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_wal_targets.o \
