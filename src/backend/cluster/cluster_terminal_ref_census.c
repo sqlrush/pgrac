@@ -5287,6 +5287,26 @@ ctrc_receipt_prepare_refused(bool invalid_namespace)
 }
 
 #ifndef CLUSTER_CTRC_UNIT_TEST
+/* Caller holds origin_lock. Keep an already issued grant protected until
+ * its participant receipt is visible. SEALING alone does not close an
+ * in-flight grant: the participant CLOSE remains the publication barrier. */
+static bool
+ctrc_origin_protects_local_receipt_locked(const ClusterCtrcTxnKeyV1 *key,
+										  const ClusterCtrcParticipantIdentity *identity,
+										  uint32 grant_generation)
+{
+	const ClusterCtrcOriginEntry *origin;
+	uint64 index;
+
+	if (grant_generation == 0 || !ctrc_origin_index(key, &index))
+		return false;
+	origin = &ctrc_origin_entries()[index];
+	return origin->state >= CTRC_ORIGIN_OPEN && origin->state <= CTRC_ORIGIN_CERTIFYING
+		   && origin->grant_generation == grant_generation
+		   && memcmp(&origin->key, key, sizeof(*key)) == 0
+		   && cluster_ctrc_origin_has_exact_touch(origin, identity);
+}
+
 static ClusterCtrcPrepareResult
 ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 									 const ClusterCtrcParticipantIdentity *identity,
@@ -5306,6 +5326,7 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 	RelFileLocator locator;
 	bool check_object;
 	bool sampled = false;
+	bool local_origin;
 
 	if (handle != NULL)
 		MemSet(handle, 0, sizeof(*handle));
@@ -5334,6 +5355,19 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 	if ((!check_object || sampled) && !ctrc_allocate_journal_sequence(&journal_sequence))
 		return ctrc_receipt_prepare_refused(false);
 
+	/* The allocator above takes origin_lock exclusively. Recheck only after
+	 * it releases that lock, then hold local origin protection through the
+	 * original participant -> receipt publication. No reverse acquisition or
+	 * allocator call is allowed under these nested locks. Foreign origins
+	 * retain their existing distributed grant/CLOSE protocol. */
+	local_origin = key->origin_node_id == (uint16)cluster_node_id;
+	if (local_origin) {
+		LWLockAcquire(&CtrcShared->origin_lock, LW_SHARED);
+		if (!ctrc_origin_protects_local_receipt_locked(key, identity, grant_generation)) {
+			LWLockRelease(&CtrcShared->origin_lock);
+			return ctrc_receipt_prepare_refused(false);
+		}
+	}
 	participant = &ctrc_participant_entries()[participant_index];
 	receipts = ctrc_receipt_entries();
 	ctrc_participant_locks_acquire(ctrc_participant_lock_mask(participant_index));
@@ -5378,6 +5412,8 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 
 	LWLockRelease(&CtrcShared->receipt_lock);
 	ctrc_participant_locks_release(ctrc_participant_lock_mask(participant_index));
+	if (local_origin)
+		LWLockRelease(&CtrcShared->origin_lock);
 	if (result == CLUSTER_CTRC_PREPARE_READY)
 		cluster_ctrc_stat_bump(CTRC_STAT_RECEIPT_PREPARED);
 	else if (result == CLUSTER_CTRC_PREPARE_CAPACITY)

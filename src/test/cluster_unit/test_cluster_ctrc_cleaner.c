@@ -314,7 +314,9 @@ test_lock_enter(const void *lock, bool sleepable)
 		|| (held_count != 0
 			&& (held_locks[held_count - 1] == &CtrcShared->receipt_lock
 				|| (lock != &CtrcShared->receipt_lock
-					&& (previous_shard < 0 || shard <= previous_shard)))))
+					&& (shard < 0
+						|| (held_locks[held_count - 1] != &CtrcShared->origin_lock
+							&& (previous_shard < 0 || shard <= previous_shard)))))))
 		abort();
 	held_locks[held_count++] = lock;
 	if (sleepable)
@@ -1114,6 +1116,221 @@ prepare_fixture_receipt(ClusterCtrcOriginEntry *origin, uint64 operation_id,
 		&origin->key, &origin->touched[0], origin->grant_generation, &publication, &target, handle);
 }
 
+UT_TEST(test_local_receipt_refuses_missing_or_aliased_origin_protection)
+{
+	for (unsigned fault = 0; fault < 17; fault++) {
+		ClusterCtrcOriginEntry *origin;
+		ClusterCtrcOriginEntry request, before;
+		ClusterCtrcParticipantEntry participant;
+		ClusterCtrcReceiptHandle handle;
+		uint64 pi;
+
+		reset_fixture();
+		origin = seed_origin(0, 1);
+		request = *origin;
+		UT_ASSERT(ctrc_participant_index(&request.key, 0, &pi));
+		participant = ctrc_participant_entries()[pi];
+		switch (fault) {
+		case 0:
+			MemSet(origin, 0, sizeof(*origin));
+			break;
+		case 1:
+			origin->state = CTRC_ORIGIN_RELEASE_PROVEN;
+			break;
+		case 2:
+			origin->state = CTRC_ORIGIN_BLOCKED;
+			break;
+		case 3:
+			origin->state = UINT8_MAX;
+			break;
+		case 4:
+			origin->key.xid++;
+			break;
+		case 5:
+			origin->key.slot_wrap++;
+			break;
+		case 6:
+			origin->key.segment_generation++;
+			break;
+		case 7:
+			origin->key.origin_boot_incarnation++;
+			break;
+		case 8:
+			origin->key.root_generation++;
+			break;
+		case 9:
+			origin->grant_generation++;
+			break;
+		case 10:
+			origin->touched_bitmap = 0;
+			break;
+		case 11:
+			origin->touched[0].boot_incarnation++;
+			break;
+		case 12:
+			origin->touched[0].capability_record_generation++;
+			break;
+		case 13:
+			origin->touched[0].formation_epoch++;
+			break;
+		case 14:
+			origin->touched[0].admission_record_generation++;
+			break;
+		case 15:
+			origin->key.system_identifier++;
+			break;
+		case 16:
+			origin->key.cluster_epoch++;
+			break;
+		}
+		before = *origin;
+		MemSet(&handle, 0xa5, sizeof(handle));
+		UT_ASSERT_EQ(prepare_fixture_receipt(&request, 201, &handle), CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT(ctrc_bytes_zero(&handle, sizeof(handle)));
+		UT_ASSERT_EQ(memcmp(origin, &before, sizeof(before)), 0);
+		UT_ASSERT_EQ(memcmp(&participant, &ctrc_participant_entries()[pi], sizeof(participant)), 0);
+		UT_ASSERT_EQ(ctrc_participant_receipt_heads()[pi], 0);
+		for (uint64 i = 0; i < CtrcShared->receipt_entries; i++)
+			UT_ASSERT(ctrc_bytes_zero(&ctrc_receipt_entries()[i], sizeof(ClusterCtrcReceipt)));
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+static ClusterCtrcReceiptHandle *watched_receipt;
+static unsigned receipt_origin_guards, guarded_receipt_locks, guarded_receipt_publications;
+static bool retire_before_origin_guard;
+
+/* The lock fixture observes production acquisition/publication boundaries;
+ * it does not implement the identity check or keep the origin alive. */
+static bool
+observe_receipt_origin_guard(LWLock *lock, LWLockMode mode, bool acquiring)
+{
+	if (lock == &CtrcShared->origin_lock && acquiring && mode == LW_SHARED) {
+		receipt_origin_guards++;
+		if (retire_before_origin_guard)
+			ctrc_origin_entries()[0].state = CTRC_ORIGIN_RELEASE_PROVEN;
+	}
+	if (lock == &CtrcShared->receipt_lock && acquiring && held_count != 0
+		&& held_locks[0] == &CtrcShared->origin_lock)
+		guarded_receipt_locks++;
+	if (lock == &CtrcShared->origin_lock && !acquiring && watched_receipt != NULL
+		&& watched_receipt->valid && held_count == 1
+		&& watched_receipt->participant->receipt_count == 1
+		&& watched_receipt->receipt->state == CTRC_RECEIPT_PREPARED
+		&& ctrc_participant_receipt_heads()[watched_receipt->participant_index]
+			   == watched_receipt->receipt_index + 1)
+		guarded_receipt_publications++;
+	return false;
+}
+
+UT_TEST(test_local_origin_protection_spans_receipt_and_handle_publication)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcReceiptHandle handle;
+
+	reset_fixture();
+	origin = seed_origin(0, 1);
+	watched_receipt = &handle;
+	receipt_origin_guards = guarded_receipt_locks = guarded_receipt_publications = 0;
+	retire_before_origin_guard = false;
+	external_lock_hook = observe_receipt_origin_guard;
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 201, &handle), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT_EQ(receipt_origin_guards, 1);
+	UT_ASSERT_EQ(guarded_receipt_locks, 1);
+	UT_ASSERT_EQ(guarded_receipt_publications, 1);
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 201, &handle), CLUSTER_CTRC_PREPARE_DUPLICATE);
+	UT_ASSERT_EQ(guarded_receipt_publications, 2);
+	UT_ASSERT_EQ(held_count, 0);
+	cluster_shared_config = true;
+	publication_fenced = true;
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 202, &handle), CLUSTER_CTRC_PREPARE_REFUSED);
+	UT_ASSERT_EQ(receipt_origin_guards, 3);
+	UT_ASSERT_EQ(guarded_receipt_locks, 3);
+	UT_ASSERT_EQ(guarded_receipt_publications, 2);
+	UT_ASSERT_EQ(held_count, 0);
+	external_lock_hook = NULL;
+	watched_receipt = NULL;
+}
+
+UT_TEST(test_local_receipt_rechecks_origin_after_journal_allocation)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcReceiptHandle handle;
+	uint64 pi, journal;
+
+	reset_fixture();
+	origin = seed_origin(0, 1);
+	UT_ASSERT(ctrc_participant_index(&origin->key, 0, &pi));
+	journal = CtrcShared->global_journal_generation;
+	watched_receipt = NULL;
+	receipt_origin_guards = guarded_receipt_locks = 0;
+	retire_before_origin_guard = true;
+	external_lock_hook = observe_receipt_origin_guard;
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 201, &handle), CLUSTER_CTRC_PREPARE_REFUSED);
+	UT_ASSERT(!handle.valid);
+	UT_ASSERT_EQ(CtrcShared->global_journal_generation, journal + 1);
+	UT_ASSERT_EQ(receipt_origin_guards, 1);
+	UT_ASSERT_EQ(guarded_receipt_locks, 0);
+	UT_ASSERT(
+		ctrc_bytes_zero(&ctrc_participant_entries()[pi], sizeof(ClusterCtrcParticipantEntry)));
+	UT_ASSERT_EQ(ctrc_participant_receipt_heads()[pi], 0);
+	UT_ASSERT_EQ(held_count, 0);
+	external_lock_hook = NULL;
+	retire_before_origin_guard = false;
+}
+
+/* Sealing stops issuing new grants. The participant CLOSE, rather than the
+ * origin's SEALING transition, rejects an already issued in-flight grant. */
+UT_TEST(test_local_receipt_keeps_inflight_grant_until_participant_close)
+{
+	for (unsigned sealing = 0; sealing < 2; sealing++) {
+		ClusterCtrcOriginEntry *origin;
+		ClusterCtrcReceiptHandle handle, late;
+		ClusterCtrcReceipt before;
+
+		reset_fixture();
+		origin = seed_origin(0, 1);
+		if (!sealing) {
+			origin->state = CTRC_ORIGIN_OPEN;
+			origin->seal_generation = 0;
+		}
+		UT_ASSERT_EQ(prepare_fixture_receipt(origin, 201, &handle), CLUSTER_CTRC_PREPARE_READY);
+		UT_ASSERT_EQ(cluster_ctrc_receipt_cancel_shared(&handle), CLUSTER_CTRC_APPLY_APPLIED);
+		if (!sealing)
+			UT_ASSERT(cluster_ctrc_origin_begin_seal_entry(origin, 41));
+		UT_ASSERT_EQ(cluster_ctrc_participant_close(handle.participant, &origin->touched[0],
+													origin->grant_generation,
+													origin->seal_generation),
+					 CLUSTER_CTRC_CLOSE_ACK_READY);
+		before = *handle.receipt;
+		UT_ASSERT_EQ(prepare_fixture_receipt(origin, 202, &late), CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT(!late.valid);
+		UT_ASSERT_EQ(memcmp(handle.receipt, &before, sizeof(before)), 0);
+		UT_ASSERT_EQ(handle.participant->receipt_count, 1);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_remote_origin_receipt_does_not_require_local_origin_row)
+{
+	ClusterCtrcOriginEntry request;
+	ClusterCtrcReceiptHandle handle;
+
+	reset_fixture();
+	request = *seed_origin(0, 1);
+	MemSet(&ctrc_origin_entries()[0], 0, sizeof(ClusterCtrcOriginEntry));
+	request.key.owner_instance = 2;
+	request.key.origin_node_id = 1;
+	request.key.segment_id = CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	request.key.origin_boot_incarnation = 1102;
+	UT_ASSERT_EQ(prepare_fixture_receipt(&request, 201, &handle), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(handle.valid);
+	UT_ASSERT_EQ(memcmp(&handle.receipt->key, &request.key, sizeof(request.key)), 0);
+	UT_ASSERT(ctrc_bytes_zero(&ctrc_origin_entries()[0], sizeof(ClusterCtrcOriginEntry)));
+	UT_ASSERT_EQ(held_count, 0);
+}
+
 /* A closed object cannot acquire a new CTRC producer, including a caller
  * whose admission sample became stale while taking the original locks. */
 UT_TEST(test_object_fence_refuses_new_receipt_without_publishing_participant)
@@ -1500,7 +1717,7 @@ UT_TEST(test_shared_prepare_journal_uses_sleepable_exclusion)
 	UT_ASSERT_EQ(receipt.state, CTRC_RECEIPT_CANCELLED);
 	UT_ASSERT_EQ(snapshot.receipt_count, 1);
 	UT_ASSERT_EQ(spin_acquisitions, 0);
-	UT_ASSERT_EQ(sleepable_acquisitions, 3);
+	UT_ASSERT_EQ(sleepable_acquisitions, 4);
 }
 
 /* The real shared PREPARE must not serialize different canonical segments
@@ -3225,7 +3442,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(73);
+	UT_PLAN(78);
 	printf("# CTRC header_bytes=%zu total_bytes=%zu\n", sizeof(ClusterCtrcSharedHeader),
 		   capacity.total_bytes);
 	UT_RUN(test_origin_reserve_requires_published_local_top_protection);
@@ -3291,6 +3508,11 @@ main(void)
 	UT_RUN(test_cleaner_scope_current_is_local_and_expires_with_original_attempt);
 	UT_RUN(test_original_cleaner_driver_expires_read_scope_on_return_error_and_refusal);
 	UT_RUN(test_concurrent_original_discharge_does_not_end_running_cleaner_attempt);
+	UT_RUN(test_local_receipt_refuses_missing_or_aliased_origin_protection);
+	UT_RUN(test_local_origin_protection_spans_receipt_and_handle_publication);
+	UT_RUN(test_local_receipt_rechecks_origin_after_journal_allocation);
+	UT_RUN(test_local_receipt_keeps_inflight_grant_until_participant_close);
+	UT_RUN(test_remote_origin_receipt_does_not_require_local_origin_row);
 	UT_RUN(test_object_fence_refuses_new_receipt_without_publishing_participant);
 	UT_RUN(test_object_fence_retains_exact_duplicate_and_original_cancel);
 	UT_RUN(test_object_receipt_gate_does_not_change_private_or_other_tier);
