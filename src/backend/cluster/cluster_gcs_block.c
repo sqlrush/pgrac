@@ -4278,6 +4278,138 @@ typedef struct GcsReadImageTrace {
 	bool retry_denied;
 } GcsReadImageTrace;
 
+/* Ordinary read-image forward/reply observations.  No shared pointers survive
+ * a slot lock or a send: the view contains only copies of the inputs used by
+ * the original operation.  It is not a receipt or fresh authority proof. */
+typedef struct GcsReadImageHopTrace {
+	bool envelope_known, forward_known, reply_known, tag_known, slot_known;
+	uint32 envelope_source, envelope_dest;
+	uint64 envelope_epoch;
+	GcsBlockForwardPayload forward;
+	GcsBlockReplyHeader reply;
+	BufferTag tag;
+	int slot_index;
+	uint64 slot_request_id, expected_epoch;
+	int32 expected_master;
+	uint8 expected_transition, slot_domain, incoming_domain;
+	bool incoming_domain_known;
+	bool slot_in_use, slot_reply_received, slot_stale, signal_called;
+	ClusterGcsBlockDirectState direct_state;
+	uint32 direct_generation;
+	bool copy_known, ship_ok, page_scn_known, verdict_known, downgrade_known;
+	ClusterBufmgrGcsCopyRefusal copy_refusal;
+	ClusterBufmgrGcsDowngradeOutcome downgrade;
+	SCN page_scn, expected_scn, verdict_input_scn;
+	GcsLostWriteVerdict verdict;
+	bool send_known, direct_handled_known, direct_handled;
+	ClusterICSendResult send_result;
+} GcsReadImageHopTrace;
+
+static void
+gcs_block_read_image_hop_slot_capture(GcsReadImageHopTrace *view,
+									const ClusterGcsBlockOutstandingSlot *slot, int index)
+{
+	/* Caller holds the existing backend-block lock; no lookup or allocation. */
+	view->slot_known = view->tag_known = true;
+	view->tag = slot->tag;
+	view->slot_index = index;
+	view->slot_request_id = slot->request_id;
+	view->expected_epoch = slot->request_epoch;
+	view->expected_master = slot->expected_master_node;
+	view->expected_transition = slot->transition_id;
+	view->slot_domain = slot->reply_domain;
+	view->slot_in_use = slot->in_use;
+	view->slot_reply_received = slot->reply_received;
+	view->slot_stale = slot->stale;
+	view->direct_state = slot->direct_state;
+	view->direct_generation = slot->direct_generation;
+}
+
+static void
+gcs_block_read_image_hop_trace(const GcsReadImageHopTrace *view, const char *event,
+							 const char *predicate)
+{
+	static uint64 event_seq;
+	static uint64 critical_skipped;
+	const GcsBlockReplyHeader *r = &view->reply;
+	const GcsBlockForwardPayload *f = &view->forward;
+
+	if (!cluster_trace_normal_stop)
+		return;
+	if (CritSectionCount != 0) {
+		if (critical_skipped != UINT64_MAX)
+			critical_skipped++;
+		return;
+	}
+	if (event_seq != UINT64_MAX)
+		event_seq++;
+	ereport(LOG,
+			(errmsg_internal(
+				 "PGRAC_FAMILY=READ_IMAGE_HOP event=%s predicate=%s "
+				 "event_seq=%llu sequence_scope=process sequence_domain=READ_IMAGE_HOP "
+				 "node_id=%d pid=%d procno=%d backend_id=%d backend_type=%d "
+				 "wall_us=%lld monotonic_us=%llu identity_source=run_manifest "
+				 "run_id_known=0 process_incarnation_known=0 boot_identity_known=0 "
+				 "transaction_identity_known=0 root_identity_known=0 authoritative=0 "
+				 "transport_receipt=0 role=%s envelope_known=%d source_node=%u dest_node=%u "
+				 "envelope_epoch=%llu forward_known=%d request_id=%llu request_epoch=%llu "
+				 "requester_node=%d requester_backend=%d master_node=%d "
+				 "tag_source=%s tag_known=%d spc=%u db=%u rel=%u fork=%d block=%u "
+				 "slot_known=%d slot_index=%d slot_request_id=%llu expected_master=%d "
+				 "expected_epoch=%llu reply_epoch=%llu expected_transition=%u reply_transition=%u "
+				 "slot_domain=%u incoming_domain_known=%d incoming_domain=%d "
+				 "slot_in_use=%d slot_reply_received_before=%d slot_stale=%d "
+				 "direct_state=%d direct_generation=%u signal_called=%d "
+				 "reply_header_scope=%s reply_known=%d reply_sender=%d forwarding_master=%d reply_status=%d "
+				 "page_lsn=%llu checksum=%u copy_known=%d copy_refusal=%d copy_ship_ok=%d "
+				 "downgrade_known=%d downgrade_outcome=%d page_scn_known=%d page_scn=%llu "
+				 "verdict_known=%d expected_pi_watermark=%llu verdict_input_scn=%llu verdict=%d "
+				 "send_result_known=%d send_result=%d direct_handled_known=%d direct_handled=%d "
+				 "direct_wire_reply_known=0 "
+				 "trace_critical_skipped=%llu trace_sequence_exhausted=%d",
+				 event, predicate, (unsigned long long)event_seq, cluster_node_id, (int)getpid(),
+				 MyProc != NULL ? MyProc->pgprocno : -1, (int)MyBackendId, (int)MyBackendType,
+				 (long long)GetCurrentTimestamp(),
+				 (unsigned long long)gcs_block_pcm_x_monotonic_us(),
+				 view->forward_known ? "holder" : "reply_receiver", view->envelope_known,
+				 view->envelope_source, view->envelope_dest,
+				 (unsigned long long)view->envelope_epoch, view->forward_known,
+				 (unsigned long long)(view->reply_known ? r->request_id : f->request_id),
+				 (unsigned long long)(view->forward_known ? f->epoch : view->expected_epoch),
+				 view->forward_known ? f->original_requester_node : cluster_node_id,
+				 view->forward_known ? f->requester_backend_id : r->requester_backend_id,
+				 view->forward_known ? f->master_node : view->slot_known ? view->expected_master : -1,
+				 view->forward_known ? "forward_projection" : view->slot_known ? "slot_projection" : "unknown",
+				 view->tag_known, view->tag.spcOid, view->tag.dbOid,
+				 (unsigned int)view->tag.relNumber, (int)view->tag.forkNum,
+				 (unsigned int)view->tag.blockNum, view->slot_known,
+				 view->slot_known ? view->slot_index : -1,
+				 (unsigned long long)view->slot_request_id,
+				 view->slot_known ? view->expected_master : -1,
+				 (unsigned long long)view->expected_epoch,
+				 view->reply_known ? (unsigned long long)r->epoch : 0,
+				 (unsigned int)view->expected_transition,
+				 view->reply_known ? (unsigned int)r->transition_id : 0,
+				 (unsigned int)view->slot_domain, view->incoming_domain_known,
+				 view->incoming_domain_known ? (int)view->incoming_domain : -1,
+				 view->slot_in_use, view->slot_reply_received,
+				 view->slot_stale, (int)view->direct_state, view->direct_generation,
+				 view->signal_called, view->forward_known ? "prepared" : "decoded", view->reply_known,
+				 view->reply_known ? r->sender_node : -1,
+				 view->reply_known ? GcsBlockReplyHeaderGetForwardingMasterNode(r) : -1,
+				 view->reply_known ? (int)r->status : -1,
+				 view->reply_known ? (unsigned long long)r->page_lsn : 0,
+				 view->reply_known ? r->checksum : 0, view->copy_known,
+				 view->copy_known ? (int)view->copy_refusal : -1, view->ship_ok, view->downgrade_known,
+				 view->downgrade_known ? (int)view->downgrade : -1,
+				 view->page_scn_known, (unsigned long long)view->page_scn,
+				 view->verdict_known, (unsigned long long)view->expected_scn,
+				 (unsigned long long)view->verdict_input_scn, (int)view->verdict,
+				 view->send_known, view->send_known ? (int)view->send_result : -1, view->direct_handled_known,
+				 view->direct_handled, (unsigned long long)critical_skipped,
+				 event_seq == UINT64_MAX)));
+}
+
 static void
 gcs_block_read_image_trace(const volatile GcsReadImageTrace *trace, const char *event)
 {
@@ -19599,6 +19731,8 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 	int backend_idx;
 	ClusterGcsBlockBackendBlock *blk;
 	int i;
+	bool trace_enabled;
+	GcsReadImageHopTrace trace;
 
 	if (gcs_block_try_resource_x_frame(env, payload))
 		return;
@@ -19612,12 +19746,30 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 	if (!gcs_block_decode_reply_payload(env, payload, &hdr, &block_data, &sf_dep_valid, &sf_flags,
 										&sf_dep_vec, &undo_trailer))
 		return;
+	trace_enabled = cluster_trace_normal_stop
+		&& !GcsBlockReplyStatusIsR4((GcsBlockReplyStatus)hdr->status)
+		&& (hdr->transition_id == PCM_TRANS_N_TO_S
+			|| hdr->status == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
+			|| hdr->status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE);
+	if (trace_enabled) {
+		memset(&trace, 0, sizeof(trace));
+		trace.reply_known = trace.envelope_known = true;
+		trace.reply = *hdr;
+		trace.envelope_source = env->source_node_id;
+		trace.envelope_dest = env->dest_node_id;
+		trace.envelope_epoch = env->epoch;
+	}
 	/* Bind the payload's claimed sender to the authenticated DATA envelope.
 	 * The canonical PCM-X image-id path is direct holder -> requester, so
 	 * accepting a forged header source here would bypass its holder proof. */
 	if (env->source_node_id != (uint32)hdr->sender_node
-		|| env->dest_node_id != (uint32)cluster_node_id)
+		|| env->dest_node_id != (uint32)cluster_node_id) {
+		if (trace_enabled)
+			gcs_block_read_image_hop_trace(&trace, "reply.envelope_refused",
+				env->source_node_id != (uint32)hdr->sender_node
+					? "envelope.source_exact" : "envelope.destination_exact");
 		return;
+	}
 
 	/* D4 status 24 is a worker-0 internal response, never a backend-table
 	 * reply.  The decoder has already established its exact authenticated
@@ -19632,13 +19784,19 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 
 	if (cluster_shared_config && !GcsBlockReplyStatusIsR4((GcsBlockReplyStatus)hdr->status)
 		&& (!cluster_pcm_legacy_transition_allowed(true, (PcmLockTransition)hdr->transition_id)
-			|| hdr->status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER))
+			|| hdr->status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER)) {
+		if (trace_enabled)
+			gcs_block_read_image_hop_trace(&trace, "reply.legacy_refused", "legacy.transition_allowed");
 		return;
+	}
 
 	/* HC80: direct index by requester_backend_id (1..MaxBackends → 0..MaxBackends-1). */
 	backend_idx = hdr->requester_backend_id - 1;
-	if (backend_idx < 0 || backend_idx >= MaxBackends)
+	if (backend_idx < 0 || backend_idx >= MaxBackends) {
+		if (trace_enabled)
+			gcs_block_read_image_hop_trace(&trace, "reply.backend_refused", "backend.range");
 		return; /* malformed key; drop */
+	}
 
 	blk = &gcs_block_backend_blocks[backend_idx];
 
@@ -19653,11 +19811,20 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 									 ? CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR
 									 : CLUSTER_GCS_BLOCK_REPLY_DOMAIN_LEGACY_ACQUIRE;
 
+			if (trace_enabled) {
+				gcs_block_read_image_hop_slot_capture(&trace, slot, i);
+				trace.incoming_domain_known = true;
+				trace.incoming_domain = reply_domain;
+			}
+
 			/* Reply identity includes the closed slot domain.  Reject before
 			 * touching reply_received or any other slot-owned result byte. */
 			if (slot->reply_domain != reply_domain) {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
 				LWLockRelease(&blk->lock.lock);
+				if (trace_enabled)
+					gcs_block_read_image_hop_trace(&trace, "reply.domain_refused",
+						"reply.domain_exact");
 				return;
 			}
 
@@ -19675,6 +19842,9 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 			if (slot->reply_received) {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
 				LWLockRelease(&blk->lock.lock);
+				if (trace_enabled)
+					gcs_block_read_image_hop_trace(&trace, "reply.duplicate",
+						"reply.first_wins");
 				return;
 			}
 
@@ -19683,6 +19853,9 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 				|| slot->direct_state == GCS_BLOCK_DIRECT_ABORTING) {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
 				LWLockRelease(&blk->lock.lock);
+				if (trace_enabled)
+					gcs_block_read_image_hop_trace(&trace, "reply.direct_active",
+						"reply.direct_unarmed");
 				return;
 			}
 
@@ -19745,6 +19918,10 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 				|| hdr->transition_id != slot->transition_id) {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
 				LWLockRelease(&blk->lock.lock);
+				if (trace_enabled)
+					gcs_block_read_image_hop_trace(&trace, "reply.identity_refused",
+						!authorized ? "reply.authorized_chain"
+						: hdr->epoch < trace.expected_epoch ? "reply.epoch_minimum" : "reply.transition_exact");
 				return;
 			}
 			slot->reply_header = *hdr;
@@ -19762,10 +19939,16 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 			slot->reply_received = true;
 			ConditionVariableSignal(&slot->reply_cv);
 			LWLockRelease(&blk->lock.lock);
+			if (trace_enabled) {
+				trace.signal_called = true;
+				gcs_block_read_image_hop_trace(&trace, "reply.published", "none");
+			}
 			return;
 		}
 	}
 	LWLockRelease(&blk->lock.lock);
+	if (trace_enabled)
+		gcs_block_read_image_hop_trace(&trace, "reply.no_slot", "slot.exact_request");
 	/* No matching slot — stale/late reply; drop silently (HC74 semantics). */
 }
 
@@ -20012,6 +20195,8 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	bool sf_dep_valid = false;
 	bool sf_peer_v2 = false;
 	bool send_sf_dep = false;
+	bool trace_enabled = false;
+	GcsReadImageHopTrace trace;
 	uint32 header_len;
 	uint32 total;
 	char *buf;
@@ -20146,11 +20331,28 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	 * (e1 release-side) path untouched (§3.4b: never force the holder).
 	 * MUST branch before the ship-image copy below: a nudge ships nothing.
 	 */
+	/* Synthetic families returned above; this view is ordinary read-image only. */
+	trace_enabled = cluster_trace_normal_stop && GcsBlockForwardPayloadIsReadImage(fwd)
+		&& !GcsBlockForwardPayloadIsBastNudge(fwd);
+	if (trace_enabled) {
+		memset(&trace, 0, sizeof(trace));
+		trace.envelope_known = trace.forward_known = trace.tag_known = true;
+		trace.envelope_source = env->source_node_id;
+		trace.envelope_dest = env->dest_node_id;
+		trace.envelope_epoch = env->epoch;
+		trace.forward = *fwd;
+		trace.tag = fwd->tag;
+		trace.expected_scn = GcsBlockForwardPayloadGetExpectedPiWatermarkScn(fwd);
+		gcs_block_read_image_hop_trace(&trace, "holder.forward.received", "none");
+	}
+
 	if (cluster_shared_config
 		&& (GcsBlockForwardPayloadIsXTransfer(fwd)
 			|| !cluster_pcm_legacy_transition_allowed(true,
 													  (PcmLockTransition)fwd->transition_id))) {
 		gcs_block_forward_reply_immediate_deny(fwd);
+		if (trace_enabled)
+			gcs_block_read_image_hop_trace(&trace, "holder.legacy_refused", "legacy.transition_allowed");
 		return;
 	}
 
@@ -20211,9 +20413,16 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 				fwd->tag, fwd->master_node, &page_lsn, block_buf, &copy_refusal);
 		remote_downgraded = remote_downgrade_outcome == CLUSTER_BUFMGR_GCS_DOWNGRADE_COMMITTED;
 		cluster_lever_a_note_remote_downgrade(remote_downgraded);
+		if (trace_enabled) {
+			trace.downgrade_known = true;
+			trace.downgrade = remote_downgrade_outcome;
+		}
 	}
-	if (remote_downgrade_outcome == CLUSTER_BUFMGR_GCS_DOWNGRADE_FAILCLOSED_POST_NOTIFY)
+	if (remote_downgrade_outcome == CLUSTER_BUFMGR_GCS_DOWNGRADE_FAILCLOSED_POST_NOTIFY) {
+		if (trace_enabled)
+			gcs_block_read_image_hop_trace(&trace, "holder.post_notify_refused", "downgrade.post_notify");
 		return;
+	}
 
 	/* spec-2.35 D15 — SKIP simulates the evict race. */
 	if (holder_evicted_injected) {
@@ -20230,6 +20439,13 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 			fwd->tag, fwd->original_requester_node, true, &page_lsn, block_buf, &block_payload,
 			&block_payload_lkey, &block_payload_release_cb, &block_payload_release_arg, &sf_dep_vec,
 			&sf_dep_valid, &copy_refusal);
+
+	/* Copy results without logging while a ship-image callback may own a pin. */
+	if (trace_enabled) {
+		trace.copy_known = true;
+		trace.ship_ok = holder_ship_ok;
+		trace.copy_refusal = copy_refusal;
+	}
 
 	/* Build reply (header + 8KB block or zero pad) and direct-ship to
 	 * the original requester.  HC109 stores fwd->master_node in the
@@ -20273,6 +20489,13 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 			shipped_scn = InvalidScn;
 
 		verdict = gcs_block_lost_write_verdict(expected_scn, shipped_scn);
+		if (trace_enabled) {
+			trace.page_scn_known = trace.verdict_known = true;
+			trace.page_scn = ((PageHeader)block_payload)->pd_block_scn;
+			trace.expected_scn = expected_scn;
+			trace.verdict_input_scn = shipped_scn;
+			trace.verdict = verdict;
+		}
 
 		if (verdict == GCS_LOST_WRITE_FAIL_STALE || verdict == GCS_LOST_WRITE_FAIL_ANOMALY) {
 			/* S3 forensics step 1 — the (expected, shipped) verdict SCN pair is
@@ -20527,10 +20750,17 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		hdrv2->sf_dep_count = (uint8)n;
 	}
 
+	if (trace_enabled) {
+		trace.reply_known = true;
+		trace.reply = *hdr;
+	}
+
 	if (GcsBlockForwardPayloadIsDirectLandArmed(fwd)) {
+		bool direct_handled;
+
 		if (!GcsBlockReplyStatusIsDirectLandSendable((GcsBlockReplyStatus)hdr->status))
 			GCS_BLOCK_LOG_MASTER_NOT_HOLDER_FORWARD(fwd, "holder-direct-land-nonsendable");
-		(void)gcs_block_try_send_direct_reply(fwd->original_requester_node, true, hdr,
+		direct_handled = gcs_block_try_send_direct_reply(fwd->original_requester_node, true, hdr,
 											  holder_ship_ok ? block_payload : NULL,
 											  holder_ship_ok ? block_payload_lkey : 0,
 											  block_payload_release_cb, block_payload_release_arg);
@@ -20539,6 +20769,11 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		block_payload_release_cb = NULL;
 		block_payload_release_arg = NULL;
 		pfree(buf);
+		if (trace_enabled) {
+			trace.direct_handled_known = true;
+			trace.direct_handled = direct_handled;
+			gcs_block_read_image_hop_trace(&trace, "holder.reply.direct_return", "direct.handled");
+		}
 		return;
 	}
 
@@ -20570,20 +20805,31 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 			gcs_block_note_live_sge_send();
 		block_payload_release_cb = NULL;
 		block_payload_release_arg = NULL;
+		if (trace_enabled) {
+			trace.send_known = true;
+			trace.send_result = send_rc;
+		}
 	} else {
+		ClusterICSendResult send_rc;
+
 		gcs_block_release_ship_image(block_payload_release_cb, block_payload_release_arg);
 		block_payload_release_cb = NULL;
 		block_payload_release_arg = NULL;
-		cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY,
-											cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
-																	 fwd->original_requester_node,
-																	 buf, total));
+		send_rc = cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+										 fwd->original_requester_node, buf, total);
+		cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY, send_rc);
+		if (trace_enabled) {
+			trace.send_known = true;
+			trace.send_result = send_rc;
+		}
 	}
 	/* PGRAC: spec-5.59 D3 — close the holder-forward read-image ship scope
 	 * (no-op unless the read-image branch above started it). */
 	cluster_xp_end(&xp_fwd_ship);
 
 	pfree(buf);
+	if (trace_enabled)
+		gcs_block_read_image_hop_trace(&trace, "holder.reply.send_result", "none");
 }
 
 
