@@ -1021,7 +1021,7 @@ UT_TEST(actual_pretoast_vm_retry_refreshes_predecessor_before_l2)
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(24);
 	UT_RUN(actual_shared_hio_reads_identity_before_locks_and_versions_existing_zero);
 	UT_RUN(actual_shared_hio_missing_identity_stops_before_page_access);
 	UT_RUN(actual_vm_consumer_requalifies_both_stages_without_replaying_clear);
@@ -1036,6 +1036,7 @@ main(void)
 	UT_RUN(actual_update_shared_vm_loss_invalidates_both_aliases);
 	UT_RUN(actual_delete_vm_retry_refreshes_tuple_before_l1);
 	UT_RUN(actual_pretoast_vm_retry_refreshes_predecessor_before_l2);
+	UT_RUN(actual_hio_pair_repeated_misses_release_first_in_both_orders);
 	UT_RUN(actual_hio_single_relock_carries_no_vm_pin);
 	UT_RUN(actual_hio_pair_relock_carries_neither_vm_alias);
 	UT_RUN(actual_hio_repin_failure_releases_partial_result);

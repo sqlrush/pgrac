@@ -160,6 +160,25 @@ hio_reset(bool same_vm)
 	PageSetAllVisible(hio_pages[1].data);
 }
 
+/* Exercise the real helper in both caller orders. The controlled blocking
+ * boundary above rejects an acquire while either content lock remains held.
+ * Repeated conditional misses are local ordering evidence, not a concurrent
+ * two-backend progress or remote-grant proof. */
+UT_TEST(actual_hio_pair_repeated_misses_release_first_in_both_orders)
+{
+	int first;
+
+	for (first = 1; first <= 2; first++) {
+		hio_reset(false);
+		hio_pair_misses = 3;
+		cluster_hio_lock_buffer_pair(first, 3 - first);
+		UT_ASSERT_EQ(hio_pair_misses, 0);
+		UT_ASSERT_EQ(hio_waits, 7);
+		UT_ASSERT_EQ(hio_wait_pin_conflicts, 0);
+		UT_ASSERT(hio_locks[0] && hio_locks[1]);
+	}
+}
+
 UT_TEST(actual_hio_single_relock_carries_no_vm_pin)
 {
 	Buffer vm = InvalidBuffer;
