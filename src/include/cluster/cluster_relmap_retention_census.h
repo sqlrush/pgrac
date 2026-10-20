@@ -95,6 +95,28 @@ extern ClusterRelmapPendingResult cluster_relmap_retention_census_rebuild_pendin
 	ClusterRelmapRetentionCensus *census, ClusterRelmapPendingSet *pending_out,
 	const ClusterRelmapPendingDescriptor *descriptors, size_t descriptor_count);
 
+struct ClusterWalInputsV1;
+
+/* Same single-use window and provisional structural result. When either copy
+ * retains pending, validate that exact union image through the caller's held
+ * original cold WAL scope before rebuilding. Use the pending copy's original
+ * committed base even if primary has already published the new generation.
+ * The retained visitor scans ALL selected sources and rechecks its ROOT/pins.
+ * A clean pair has no pending WAL assertion to check and uses the structural
+ * rebuild directly; this does not prove WAL/source coverage for a clean pair.
+ *
+ * The caller still qualifies the complete descriptor selection, origin set,
+ * FullXid era, membership epoch, boot incarnation and floor/issued inputs.
+ * Refusal (including WAIT) invalidates the census, retaining pins and leaving
+ * the destination unchanged. ERROR does the same before rethrow; the caller
+ * owns and must release its original WAL scope on every exit. This synchronous
+ * retained scan is not a bounded next_committed tick. Whole physical ROOT
+ * DRAINED, BUILDING and all independent owner proof requirements still apply. */
+extern ClusterRelmapPendingResult cluster_relmap_retention_census_rebuild_pending_wal(
+	ClusterRelmapRetentionCensus *census, ClusterRelmapPendingSet *pending_out,
+	struct ClusterWalInputsV1 *inputs,
+	const ClusterRelmapPendingDescriptor *descriptors, size_t descriptor_count);
+
 /* Same single-use window and provisional result, using the original sealed
  * SIDE collector rather than caller-constructed descriptors. The census owns
  * the exact namespace, storage UUID and legal committed pair used together.

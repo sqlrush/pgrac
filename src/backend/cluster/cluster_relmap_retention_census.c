@@ -4,6 +4,7 @@
 #include "postgres.h"
 
 #include "catalog/pg_tablespace_d.h"
+#include "cluster/cluster_relmap_owner.h"
 #include "cluster/cluster_relmap_retention_census.h"
 
 #ifdef USE_PGRAC_CLUSTER
@@ -391,6 +392,48 @@ cluster_relmap_retention_census_rebuild_pending(ClusterRelmapRetentionCensus *ce
 	if (result != CLUSTER_RELMAP_PENDING_OK)
 		census_failed(census, result == CLUSTER_RELMAP_PENDING_CAPACITY_EXCEEDED
 			? CLUSTER_RELMAP_CENSUS_CAPACITY : CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+	return result;
+}
+
+ClusterRelmapPendingResult
+cluster_relmap_retention_census_rebuild_pending_wal(ClusterRelmapRetentionCensus *census,
+	ClusterRelmapPendingSet *pending_out, struct ClusterWalInputsV1 *inputs,
+	const ClusterRelmapPendingDescriptor *descriptors, size_t descriptor_count)
+{
+	ClusterRelmapPendingResult result = census_rebuild_ready(census);
+	ClusterRelmapV2Image image = { 0 };
+
+	if (result != CLUSTER_RELMAP_PENDING_OK)
+		return result;
+	if (census->rebuild_view.has_pending) {
+		/* A published primary can have a newer committed map than the backup
+		 * that still pins pending. Preserve that pending copy's original base. */
+		image.identity = census->identity;
+		image.committed_generation = census->rebuild_view.pending_committed_generation;
+		image.committed = census->rebuild_view.pending_committed;
+		image.pending_generation = census->rebuild_view.pending_generation;
+		image.pending_owner = census->rebuild_view.pending_owner;
+		image.pending = census->rebuild_view.pending;
+	}
+	PG_TRY();
+	{
+		if (image.pending_generation != 0 &&
+			cluster_relmap_owner_retained_wal_v2(&image, inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			census_failed(census, CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+			result = CLUSTER_RELMAP_PENDING_NOT_READY;
+		} else {
+			/* Recheck borrowed ROOT/origin qualifications after the retained I/O,
+			 * then let the original atomic core consume this one exact window. */
+			result = cluster_relmap_retention_census_rebuild_pending(census, pending_out,
+				descriptors, descriptor_count);
+		}
+	}
+	PG_CATCH();
+	{
+		census_failed(census, CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 	return result;
 }
 
