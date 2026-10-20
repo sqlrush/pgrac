@@ -6507,9 +6507,9 @@ UT_TEST(tt_top_tx_c0_producer_checks_history_undo_multi_fpi_records)
  * fold/readback must not hide malformed new or inherited records. A captured
  * original block and a source FPI exercise the two existing ancestry paths. */
 static void
-tt_top_tx_undo_fold_records(bool original_base, bool multi)
+tt_top_tx_undo_fold_records(bool original_base, bool multi, bool actor_cases)
 {
-	for (int fault = 0; fault < 11; fault++) {
+	for (int fault = 0; fault < (actor_cases ? (multi ? 6 : 5) : 11); fault++) {
 		TtRedoFixture f;
 		FakeXactRecord fake;
 		PGAlignedBlock base, page, expected;
@@ -6532,6 +6532,11 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi)
 		tt_redo_record_page(&page, 900);
 		memcpy(&old, page.data + UNDO_SLOT_DIR_OFFSET(0), sizeof(old));
 		memcpy(&added, page.data + UNDO_SLOT_DIR_OFFSET(1), sizeof(added));
+		/* The new span belongs to WAL actor 804. The inherited record
+		 * remains actor 900, independently of the selected loser 802. */
+		memcpy(&record, page.data + added.record_offset, sizeof(record));
+		record.xid = 804;
+		memcpy(page.data + added.record_offset, &record, sizeof(record));
 		base = page;
 		memset(base.data + old.record_offset + old.record_length, 0,
 			   BLCKSZ - old.record_offset - old.record_length);
@@ -6546,7 +6551,6 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi)
 			memcpy(page.data + third.record_offset, page.data + added.record_offset,
 				   added.record_length);
 			memcpy(&record, page.data + third.record_offset, sizeof(record));
-			record.xid++;
 			record.tt_slot_segment_id++;
 			record.tt_slot_id++;
 			memcpy(page.data + third.record_offset, &record, sizeof(record));
@@ -6575,40 +6579,53 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi)
 		} else
 			tt_redo_feed_record_page_frame_at(&f, 300, 513, 9, &base, true, 804, 804);
 		memcpy(&record, page.data + added.record_offset, sizeof(record));
-		switch (fault) {
-		case 1:
-			record.origin_node_id--;
-			break;
-		case 2:
-			record.tt_slot_segment_id = 257;
-			break;
-		case 3:
-			record.record_type = UNDO_RECORD_INVALID;
-			break;
-		case 4:
-			record.payload_length++;
-			break;
-		case 5:
-			added.flags ^= UNDO_REC_FLAG_FIRST_IN_TX;
-			break;
-		case 6:
-			((UndoBlockHeader *)page.data)->slot_count = UINT16_MAX;
-			break;
-		case 7:
-			record.tt_slot_id = TT_SLOTS_PER_SEGMENT + 1;
-			break;
-		case 8:
-			record.tt_slot_segment_id = 0;
-			break;
-		case 9:
-			((UndoBlockHeader *)page.data)->magic = 0;
-			break;
-		case 10:
-			/* The FPI path uses a zero slot in the new record. */
-			if (!original_base)
-				record.tt_slot_id = 0;
-			break;
-		}
+		if (actor_cases) {
+			if (fault == 1)
+				record.xid = 805;
+			if (fault == 5) {
+				UndoSlotDirEntry last;
+				UndoRecordHeader other;
+
+				memcpy(&last, page.data + UNDO_SLOT_DIR_OFFSET(2), sizeof(last));
+				memcpy(&other, page.data + last.record_offset, sizeof(other));
+				other.xid = 805;
+				memcpy(page.data + last.record_offset, &other, sizeof(other));
+			}
+		} else
+			switch (fault) {
+			case 1:
+				record.origin_node_id--;
+				break;
+			case 2:
+				record.tt_slot_segment_id = 257;
+				break;
+			case 3:
+				record.record_type = UNDO_RECORD_INVALID;
+				break;
+			case 4:
+				record.payload_length++;
+				break;
+			case 5:
+				added.flags ^= UNDO_REC_FLAG_FIRST_IN_TX;
+				break;
+			case 6:
+				((UndoBlockHeader *)page.data)->slot_count = UINT16_MAX;
+				break;
+			case 7:
+				record.tt_slot_id = TT_SLOTS_PER_SEGMENT + 1;
+				break;
+			case 8:
+				record.tt_slot_segment_id = 0;
+				break;
+			case 9:
+				((UndoBlockHeader *)page.data)->magic = 0;
+				break;
+			case 10:
+				/* The FPI path uses a zero slot in the new record. */
+				if (!original_base)
+					record.tt_slot_id = 0;
+				break;
+			}
 		memcpy(page.data + added.record_offset, &record, sizeof(record));
 		memcpy(page.data + UNDO_SLOT_DIR_OFFSET(1), &added, sizeof(added));
 		rec_off = old.record_offset + old.record_length;
@@ -6633,6 +6650,14 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi)
 							   multi ? XLOG_UNDO_BLOCK_WRITE_MULTI : XLOG_UNDO_BLOCK_WRITE, bytes,
 							   length);
 		fake.u.decoded.header.xl_xid = fake.u.decoded.toplevel_xid = 804;
+		if (actor_cases) {
+			if (fault == 2)
+				fake.u.decoded.header.xl_xid = fake.u.decoded.toplevel_xid = InvalidTransactionId;
+			else if (fault == 3)
+				fake.u.decoded.header.xl_xid = fake.u.decoded.toplevel_xid = 805;
+			else if (fault == 4)
+				fake.u.decoded.toplevel_xid = InvalidTransactionId;
+		}
 		undo_header_feed(f.typed.side_plans[0], &fake, 400);
 		memset(fake.data, 0x5a, length);
 		tt_redo_seal(&f);
@@ -6640,7 +6665,9 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi)
 		UT_ASSERT(rf_side_online_plan_operation_v1(f.typed.side_plans[0], original_base ? 2 : 3,
 												   &captured));
 		UT_ASSERT(!captured.undo.has_fpi && !captured.history_only);
-		UT_ASSERT_EQ(captured.source_xid, 804);
+		UT_ASSERT_EQ(captured.source_xid, actor_cases && fault == 2	  ? InvalidTransactionId
+										  : actor_cases && fault == 3 ? 805
+																	  : 804);
 		UT_ASSERT_EQ(captured.owned_payload_length, length - prefix);
 		UT_ASSERT(memcmp(captured.owned_payload, bytes + prefix, length - prefix) == 0);
 		UT_ASSERT(cluster_undo_prepare_block_v1(&captured.undo, captured.owned_payload,
@@ -6664,7 +6691,7 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi)
 		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
 		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &input));
 		UT_ASSERT_EQ(cluster_cold_tt_after_redo_recheck_v1(&f.typed), CLUSTER_COLD_OK);
-		UT_ASSERT_EQ(cluster_cold_typed_tt_redo_inventory_v1(&f.typed), fault == 0);
+		UT_ASSERT_EQ(cluster_cold_typed_tt_redo_inventory_v1(&f.typed), actor_cases || fault == 0);
 		f.typed.xid_next_after_redo = UINT64_C(0x700400200);
 		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
 		tt_top_tx_effects_complete(&f);
@@ -6673,8 +6700,8 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi)
 		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
 															  &shape, false, InvalidTransactionId,
 															  UINT64_C(0x12345678), &out),
-					 fault == 0);
-		if (fault != 0)
+					 actor_cases ? fault == 0 || fault == 4 : fault == 0);
+		if (actor_cases ? fault != 0 && fault != 4 : fault != 0)
 			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 		tt_redo_destroy(&f);
 	}
@@ -6682,22 +6709,44 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi)
 
 UT_TEST(tt_top_tx_c0_producer_checks_undo_delta_fold_records)
 {
-	tt_top_tx_undo_fold_records(false, false);
+	tt_top_tx_undo_fold_records(false, false, false);
 }
 
 UT_TEST(tt_top_tx_c0_producer_checks_undo_multi_delta_fold_records)
 {
-	tt_top_tx_undo_fold_records(false, true);
+	tt_top_tx_undo_fold_records(false, true, false);
 }
 
 UT_TEST(tt_top_tx_c0_producer_checks_original_undo_delta_fold_records)
 {
-	tt_top_tx_undo_fold_records(true, false);
+	tt_top_tx_undo_fold_records(true, false, false);
 }
 
 UT_TEST(tt_top_tx_c0_producer_checks_original_undo_multi_delta_fold_records)
 {
-	tt_top_tx_undo_fold_records(true, true);
+	tt_top_tx_undo_fold_records(true, true, false);
+}
+
+/* Valid byte-level folds cannot qualify a conflicting or absent WAL actor.
+ * Inspect only the appended directory span, including the last MULTI entry. */
+UT_TEST(tt_top_tx_c0_producer_checks_undo_delta_actor)
+{
+	tt_top_tx_undo_fold_records(false, false, true);
+}
+
+UT_TEST(tt_top_tx_c0_producer_checks_undo_multi_delta_actor)
+{
+	tt_top_tx_undo_fold_records(false, true, true);
+}
+
+UT_TEST(tt_top_tx_c0_producer_checks_original_undo_delta_actor)
+{
+	tt_top_tx_undo_fold_records(true, false, true);
+}
+
+UT_TEST(tt_top_tx_c0_producer_checks_original_undo_multi_delta_actor)
+{
+	tt_top_tx_undo_fold_records(true, true, true);
 }
 
 UT_TEST(tt_top_tx_c0_producer_checks_unselected_undo_effects)
@@ -6913,7 +6962,7 @@ UT_TEST(tt_top_tx_c0_producer_rechecks_before_output)
 int
 main(void)
 {
-	UT_PLAN(148);
+	UT_PLAN(152);
 	UT_RUN(tt_top_tx_c0_producer_checks_undo_fpi_records);
 	UT_RUN(tt_top_tx_c0_producer_checks_undo_multi_fpi_records);
 	UT_RUN(tt_top_tx_c0_producer_checks_history_undo_fpi_records);
@@ -6922,6 +6971,10 @@ main(void)
 	UT_RUN(tt_top_tx_c0_producer_checks_undo_multi_delta_fold_records);
 	UT_RUN(tt_top_tx_c0_producer_checks_original_undo_delta_fold_records);
 	UT_RUN(tt_top_tx_c0_producer_checks_original_undo_multi_delta_fold_records);
+	UT_RUN(tt_top_tx_c0_producer_checks_undo_delta_actor);
+	UT_RUN(tt_top_tx_c0_producer_checks_undo_multi_delta_actor);
+	UT_RUN(tt_top_tx_c0_producer_checks_original_undo_delta_actor);
+	UT_RUN(tt_top_tx_c0_producer_checks_original_undo_multi_delta_actor);
 	UT_RUN(tt_top_tx_c0_producer_requires_each_replay_page_creator);
 	UT_RUN(tt_top_tx_c0_producer_requires_each_replay_page_actor);
 	UT_RUN(tt_top_tx_c0_producer_checks_page_frames);

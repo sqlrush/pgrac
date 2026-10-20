@@ -666,6 +666,44 @@ cold_top_tx_undo_fpi_v1(const RfSideOnlineOperationV1 *operation)
 		   == CLUSTER_RECOVERY_UNDO_ENTRY;
 }
 
+/* Native deltas name only this transaction's newly appended records. The
+ * full-block reader separately validates their format and inherited records;
+ * byte-exact replay alone cannot prove agreement with the original actor.
+ * FPI has no appended-range metadata and must retain other actors' records. */
+static bool
+cold_top_tx_undo_delta_actor_v1(const RfSideOnlineOperationV1 *operation)
+{
+	const ClusterUndoDecoded *undo = &operation->undo;
+	uint32 records_end = (uint32)undo->rec_off + undo->rec_len;
+	uint32 directory_end = (uint32)undo->slot_off + undo->slot_len;
+	uint32 length = UNDO_BLOCK_HDR_PREFIX_LEN + undo->rec_len + undo->slot_len;
+	const uint8 *records, *directory;
+
+	if (operation->history_only || undo->has_fpi || !undo->has_payload
+		|| !TransactionIdIsNormal(operation->source_xid) || operation->owned_payload == NULL
+		|| operation->owned_payload_length != length || undo->rec_off < sizeof(UndoBlockHeader)
+		|| undo->rec_len < sizeof(UndoRecordHeader) || records_end > undo->slot_off
+		|| directory_end > BLCKSZ || undo->slot_len == 0
+		|| undo->slot_len % sizeof(UndoSlotDirEntry) != 0)
+		return false;
+	records = operation->owned_payload + UNDO_BLOCK_HDR_PREFIX_LEN;
+	directory = records + undo->rec_len;
+	for (uint32 offset = 0; offset < undo->slot_len; offset += sizeof(UndoSlotDirEntry)) {
+		UndoSlotDirEntry entry;
+		UndoRecordHeader record;
+
+		memcpy(&entry, directory + offset, sizeof(entry));
+		if (entry.record_offset < undo->rec_off || entry.record_offset > records_end
+			|| entry.record_length < sizeof(record)
+			|| entry.record_length > records_end - entry.record_offset)
+			return false;
+		memcpy(&record, records + entry.record_offset - undo->rec_off, sizeof(record));
+		if (record.xid != operation->source_xid)
+			return false;
+	}
+	return true;
+}
+
 /* Preserve operation-local SIDE/PAGE/SPACE evidence, including retained history. A
  * known child frame cannot become canonical just because the candidate's
  * BIND is top. Conversely an unrelated operation names its own actor, not
@@ -741,6 +779,12 @@ cold_top_tx_frames_v1(const ClusterColdTypedV1 *typed)
 				&& (operation.undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
 					|| operation.undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI)
 				&& !cold_top_tx_undo_fpi_v1(&operation))
+				return false;
+			if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO && !operation.history_only
+				&& !operation.undo.has_fpi
+				&& (operation.undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
+					|| operation.undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI)
+				&& !cold_top_tx_undo_delta_actor_v1(&operation))
 				return false;
 		}
 	}

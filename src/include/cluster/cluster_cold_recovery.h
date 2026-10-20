@@ -1104,6 +1104,10 @@ extern bool cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
  * ABORT with this origin/raw xid additionally requires its original unique
  * exact TT_ABORT pairing, including retained history. This read-only identity
  * does not authorize historical replay. An unqualified ABORT remains blocked.
+ * Replayed native UNDO deltas additionally require a normal original WAL
+ * actor matching every appended record in their persisted directory span.
+ * Inherited records and FPI history retain their own actors; this does not
+ * supply canonical TT generation or the independent ordinary_effects proof.
  * Target incarnation/claim remain bound to the original source.  A new
  * header with no original base requires the native full-image proof.
  * The original endpoint receipt must cover the unchanged complete source
