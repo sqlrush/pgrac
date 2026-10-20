@@ -91,6 +91,8 @@ static bool origin_log_enabled, origin_log_throw, origin_driver_pending, origin_
 static bool origin_dispatch_returned;
 static unsigned origin_log_count, origin_dispatch_calls;
 static char origin_last_log[8192];
+static unsigned reply_log_count;
+static char reply_last_log[8192];
 BackendType MyBackendType = B_BACKEND;
 AuxProcType MyAuxProcType = NotAnAuxProcess;
 int MyProcPid = 2901;
@@ -477,8 +479,13 @@ errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused()
 {
 	if (origin_log_enabled) {
 		UT_ASSERT_EQ(held_count, 0); UT_ASSERT_EQ(CritSectionCount, 0);
-		if (origin_require_dispatch_return) UT_ASSERT(origin_dispatch_returned);
-		origin_log_count++;
+		if (strstr(origin_last_log, "PGRAC_FAMILY=CTRC_ORIGIN_REPLY") != NULL) {
+			reply_log_count++;
+			strlcpy(reply_last_log, origin_last_log, sizeof(reply_last_log));
+		} else {
+			if (origin_require_dispatch_return) UT_ASSERT(origin_dispatch_returned);
+			origin_log_count++;
+		}
 		if (origin_log_throw) pg_re_throw();
 		return;
 	}
@@ -500,9 +507,13 @@ reset_fixture(void)
 	observe_conditional_calls = 0;
 	cluster_trace_normal_stop = origin_log_enabled = origin_log_throw = false;
 	origin_driver_pending = origin_require_dispatch_return = origin_dispatch_returned = false;
+	reply_log_count = 0; reply_last_log[0] = '\0';
 	origin_log_count = origin_dispatch_calls = 0; origin_last_log[0] = '\0';
 #ifdef CLUSTER_CTRC_ORIGIN_DISPATCH_TRACE_PRESENT
 	CtrcOriginTraceCriticalSkipped = CtrcOriginTraceLwlockSkipped = 0;
+#endif
+#ifdef CLUSTER_CTRC_ORIGIN_REPLY_TRACE_PRESENT
+	CtrcReplyTraceUnsafeSkipped = 0;
 #endif
 	CritSectionCount = 0;
 	allow_new_service_participant = true;
@@ -3286,6 +3297,150 @@ UT_TEST(test_origin_dispatch_trace_detached_and_bad_namespace_stay_unknown)
 #endif
 }
 
+static ClusterCtrcOriginEntry *
+reply_trace_fixture(ClusterCtrcLocalReleaseAckV1 *ack)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcParticipantEntry participant = {0};
+	ClusterCtrcLocalReleaseAckV1 summary = {0};
+	uint16 reason;
+	reset_fixture(); origin = seed_origin(0, 1);
+	UT_ASSERT(cluster_ctrc_origin_arm_close_entry(origin, 0, 701));
+	UT_ASSERT_EQ(cluster_ctrc_participant_request_apply(
+		&participant, &summary, &origin->key, &origin->touched[0],
+		origin->grant_generation, origin->seal_generation,
+		CTRC_SEAL_CLOSE_AND_CLEAN, &reason, ack), CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK);
+	origin_log_enabled = true;
+	return origin;
+}
+
+UT_TEST(test_reply_trace_off_preserves_ack)
+{
+	ClusterCtrcLocalReleaseAckV1 ack;
+	ClusterCtrcOriginEntry *origin = reply_trace_fixture(&ack);
+	UT_ASSERT(cluster_ctrc_origin_ack_land_shared(701, &ack));
+	UT_ASSERT_EQ(origin->ack_bitmap, 1); UT_ASSERT_EQ(reply_log_count, 0);
+}
+UT_TEST(test_reply_trace_ack_landing_is_original_locked_transition)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_REPLY_TRACE_PRESENT
+	ClusterCtrcLocalReleaseAckV1 ack;
+	ClusterCtrcOriginEntry *origin = reply_trace_fixture(&ack);
+	cluster_trace_normal_stop = true;
+	UT_ASSERT(cluster_ctrc_origin_ack_land_shared(701, &ack));
+	UT_ASSERT_EQ(reply_log_count, 1); UT_ASSERT_EQ(origin->ack_bitmap, 1);
+	UT_ASSERT(strstr(reply_last_log, "event=ack.land") != NULL);
+	UT_ASSERT(strstr(reply_last_log, "accepted=1 progressed=1") != NULL);
+	UT_ASSERT(strstr(reply_last_log, "before_ack=0 after_ack=1") != NULL);
+	UT_ASSERT(strstr(reply_last_log, "system_identifier=42") != NULL);
+	UT_ASSERT(strstr(reply_last_log, "authoritative=0") != NULL);
+	UT_ASSERT_EQ(held_count, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(test_reply_trace_duplicate_is_not_new_progress)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_REPLY_TRACE_PRESENT
+	ClusterCtrcLocalReleaseAckV1 ack;
+	unsigned wakes;
+	(void)reply_trace_fixture(&ack); cluster_trace_normal_stop = true;
+	UT_ASSERT(cluster_ctrc_origin_ack_land_shared(701, &ack)); wakes = wake_count;
+	UT_ASSERT(cluster_ctrc_origin_ack_land_shared(701, &ack));
+	UT_ASSERT_EQ(reply_log_count, 2); UT_ASSERT_EQ(wake_count, wakes);
+	UT_ASSERT(strstr(reply_last_log, "accepted=1 progressed=0") != NULL);
+	UT_ASSERT(strstr(reply_last_log, "before_ack=1 after_ack=1") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(test_reply_trace_refusal_does_not_become_ack)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_REPLY_TRACE_PRESENT
+	ClusterCtrcLocalReleaseAckV1 ack;
+	ClusterCtrcOriginEntry *origin = reply_trace_fixture(&ack);
+	cluster_trace_normal_stop = true; ack.seal_generation++;
+	UT_ASSERT(!cluster_ctrc_origin_ack_land_shared(701, &ack));
+	UT_ASSERT_EQ(origin->ack_bitmap, 0); UT_ASSERT_EQ(origin->state, CTRC_ORIGIN_BLOCKED);
+	UT_ASSERT(strstr(reply_last_log, "accepted=0 progressed=0") != NULL);
+	UT_ASSERT(strstr(reply_last_log, "input_key_matches_before=1") != NULL);
+	UT_ASSERT(strstr(reply_last_log, "input_seal_matches_before=0") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(test_reply_trace_pending_close_is_not_ack)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_REPLY_TRACE_PRESENT
+	ClusterCtrcLocalReleaseAckV1 ack;
+	(void)reply_trace_fixture(&ack); cluster_trace_normal_stop = true;
+	UT_ASSERT(cluster_ctrc_origin_note_close_reply_shared(701, 0, CTRC_SEAL_REPLY_PENDING_DRAIN));
+	UT_ASSERT_EQ(reply_log_count, 1);
+	UT_ASSERT(strstr(reply_last_log, "event=close.reply") != NULL);
+	UT_ASSERT(strstr(reply_last_log, "before_ack=0 after_ack=0") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(test_reply_trace_certificate_reclaim_keeps_before_identity)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_REPLY_TRACE_PRESENT
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcOriginCertificateSnapshot certificate;
+	ClusterCtrcSealReplyResult result;
+	uint64 participant, receipt;
+	ClusterCtrcOriginEntry *origin;
+	reset_fixture(); UT_ASSERT(seed_frozen_certificate(0, &dispatch, &participant, &receipt));
+	origin = &ctrc_origin_entries()[0];
+	UT_ASSERT(cluster_ctrc_origin_arm_close_entry(origin, 0, 501));
+	UT_ASSERT(cluster_ctrc_origin_ack_land_shared(501, &ctrc_participant_ack_entries()[participant]));
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	(void)ctrc_origin_dispatchable_locked(origin); LWLockRelease(&CtrcShared->origin_lock);
+	UT_ASSERT(ctrc_origin_certificate_snapshot_index_locked(0, &certificate));
+	UT_ASSERT(cluster_ctrc_origin_certificate_commit_entry(origin, &certificate));
+	UT_ASSERT(cluster_ctrc_origin_arm_certificate_entry(origin, 0, dispatch.request_id));
+	UT_ASSERT(cluster_ctrc_participant_certificate_batch_shared(&dispatch, 1, &result));
+	origin_log_enabled = cluster_trace_normal_stop = true;
+	UT_ASSERT(cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id, 0, result));
+	UT_ASSERT_EQ(reply_log_count, 1); UT_ASSERT(ctrc_bytes_zero(origin, sizeof(*origin)));
+	UT_ASSERT(strstr(reply_last_log, "event=certificate.reply") != NULL);
+	UT_ASSERT(strstr(reply_last_log, "after_row_zero=1") != NULL);
+	UT_ASSERT(strstr(reply_last_log, "system_identifier=42") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(test_reply_trace_unsafe_context_is_gap_not_log)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_REPLY_TRACE_PRESENT
+	ClusterCtrcLocalReleaseAckV1 ack;
+	(void)reply_trace_fixture(&ack); cluster_trace_normal_stop = true;
+	CritSectionCount = 1;
+	UT_ASSERT(cluster_ctrc_origin_ack_land_shared(701, &ack));
+	CritSectionCount = 0; UT_ASSERT_EQ(reply_log_count, 0);
+	UT_ASSERT(cluster_ctrc_origin_ack_land_shared(701, &ack));
+	UT_ASSERT(strstr(reply_last_log, "unsafe_skipped=1") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(test_reply_trace_log_error_does_not_undo_ack_or_hold_lock)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_REPLY_TRACE_PRESENT
+	ClusterCtrcLocalReleaseAckV1 ack;
+	ClusterCtrcOriginEntry *origin = reply_trace_fixture(&ack);
+	volatile bool caught = false;
+	cluster_trace_normal_stop = origin_log_throw = true;
+	PG_TRY(); { (void)cluster_ctrc_origin_ack_land_shared(701, &ack); }
+	PG_CATCH(); { caught = true; } PG_END_TRY();
+	origin_log_throw = false;
+	UT_ASSERT(caught); UT_ASSERT_EQ(origin->ack_bitmap, 1); UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT_EQ(reply_log_count, 1); UT_ASSERT(wake_count > 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
 int
 main(void)
 {
@@ -3293,7 +3448,16 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(79);
+	UT_PLAN(87);
+	UT_RUN(test_reply_trace_off_preserves_ack);
+	UT_RUN(test_reply_trace_ack_landing_is_original_locked_transition);
+	UT_RUN(test_reply_trace_duplicate_is_not_new_progress);
+	UT_RUN(test_reply_trace_refusal_does_not_become_ack);
+	UT_RUN(test_reply_trace_pending_close_is_not_ack);
+	UT_RUN(test_reply_trace_certificate_reclaim_keeps_before_identity);
+	UT_RUN(test_reply_trace_unsafe_context_is_gap_not_log);
+	UT_RUN(test_reply_trace_log_error_does_not_undo_ack_or_hold_lock);
+
 	UT_RUN(test_origin_dispatch_trace_off_keeps_original_batch_effects);
 	UT_RUN(test_origin_dispatch_trace_exact_row_is_passive_and_constant_scope);
 	UT_RUN(test_origin_dispatch_trace_busy_is_unknown_without_wait_or_write);
