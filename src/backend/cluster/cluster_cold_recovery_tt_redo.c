@@ -413,10 +413,11 @@ cold_top_tx_key_equal_v1(const ClusterColdTtSlotKeyV1 *left,
 }
 
 static bool
-cold_typed_page_binding_v1(const ClusterColdTypedV1 *typed, uint32 frame_index, bool new_creator,
-						   ClusterColdRecordFrameV1 *out_frame, ClusterColdTtSlotKeyV1 *out_key)
+cold_typed_actor_binding_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+							XLogRecPtr read_rec_ptr, XLogRecPtr end_rec_ptr,
+							TransactionId source_xid, TransactionId source_top_xid,
+							uint32 own_operation, ClusterColdTtSlotKeyV1 *out_key)
 {
-	ClusterColdRecordFrameV1 frame = { 0 };
 	ClusterColdTtSlotKeyV1 key = { 0 };
 	const ClusterColdParticipantV1 *source;
 	const RfSideOnlinePlanV1 *plan;
@@ -425,35 +426,21 @@ cold_typed_page_binding_v1(const ClusterColdTypedV1 *typed, uint32 frame_index, 
 	const UndoSegmentHeaderData *header;
 	const TTSlot *slot;
 	uint32 count, prefix_index = UINT32_MAX;
-	bool has_header_work, supported, found = false;
-	uint8 opcode;
+	XLogRecPtr commit_end = InvalidXLogRecPtr;
+	bool has_header_work, found = false;
 
 	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK || typed->participant_count == 0
 		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
 		|| typed->replay_count > typed->participant_count
 		|| cluster_cold_plan_participant_count_v1(typed->plan) != typed->participant_count
-		|| !cluster_cold_plan_record_frame_v1(typed->plan, frame_index, &frame)
-		|| frame.participant >= typed->replay_count || frame.history || frame.page_components == 0
-		|| frame.space_effects != 0 || !TransactionIdIsNormal(frame.source_xid)
-		|| (TransactionIdIsValid(frame.source_top_xid) && frame.source_top_xid != frame.source_xid))
+		|| participant >= typed->replay_count || !TransactionIdIsNormal(source_xid)
+		|| (TransactionIdIsValid(source_top_xid) && source_top_xid != source_xid))
 		return false;
-	opcode = frame.info & XLOG_HEAP_OPMASK;
-	if (new_creator)
-		supported = (frame.rmid == RM_HEAP_ID
-					 && (opcode == XLOG_HEAP_INSERT || opcode == XLOG_HEAP_UPDATE
-						 || opcode == XLOG_HEAP_HOT_UPDATE))
-					|| (frame.rmid == RM_HEAP2_ID && opcode == XLOG_HEAP2_MULTI_INSERT);
-	else
-		supported
-			= (frame.rmid == RM_HEAP_ID && (opcode == XLOG_HEAP_DELETE || opcode == XLOG_HEAP_LOCK))
-			  || (frame.rmid == RM_HEAP2_ID && opcode == XLOG_HEAP2_LOCK_UPDATED);
-	if (!supported)
+	source = &typed->participants[participant];
+	if (!cluster_cold_plan_participant_matches_v1(typed->plan, participant, source)
+		|| !cold_tt_redo_source(typed, participant, 0, 0, &has_header_work))
 		return false;
-	source = &typed->participants[frame.participant];
-	if (!cluster_cold_plan_participant_matches_v1(typed->plan, frame.participant, source)
-		|| !cold_tt_redo_source(typed, frame.participant, 0, 0, &has_header_work))
-		return false;
-	plan = typed->side_plans[frame.participant];
+	plan = typed->side_plans[participant];
 	count = rf_side_online_plan_operation_count_v1(plan);
 	/* The native publisher accepts only its original top xid. An absent
 	 * xl_top_xid is not itself top proof: the matching BIND supplies it. */
@@ -463,12 +450,19 @@ cold_typed_page_binding_v1(const ClusterColdTypedV1 *typed, uint32 frame_index, 
 
 		if (!rf_side_online_plan_operation_v1(plan, i, &operation))
 			return false;
-		if (operation.identity.record.read_rec_ptr >= frame.end_rec_ptr)
+		/* A SIDE delta is itself in this plan. Skip only that exact
+		 * operation; other overlaps still make the prefix unprovable. */
+		if (i == own_operation || operation.identity.record.read_rec_ptr >= end_rec_ptr)
 			continue;
-		if (operation.identity.record.end_rec_ptr > frame.read_rec_ptr)
+		if (operation.identity.record.end_rec_ptr > read_rec_ptr)
 			return false;
+		if ((operation.kind == RF_SIDE_ONLINE_OPERATION_XACT
+			 && operation.xact.kind == RF_SIDE_XACT_COMMIT && operation.xact.xid == source_xid)
+			|| (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
+				&& bind->kind == CLUSTER_UNDO_KIND_TT_COMMIT && bind->xid == source_xid))
+			commit_end = operation.identity.record.end_rec_ptr;
 		if (operation.kind != RF_SIDE_ONLINE_OPERATION_UNDO
-			|| bind->kind != CLUSTER_UNDO_KIND_TT_BIND || bind->xid != frame.source_xid)
+			|| bind->kind != CLUSTER_UNDO_KIND_TT_BIND || bind->xid != source_xid)
 			continue;
 		if (found || bind->format_version != CLUSTER_UNDO_TT_BIND_VERSION
 			|| bind->instance != source->thread_id
@@ -482,19 +476,27 @@ cold_typed_page_binding_v1(const ClusterColdTypedV1 *typed, uint32 frame_index, 
 		key.slot_offset = bind->slot_offset;
 		key.slot_wrap = bind->wrap;
 		key.xid = bind->xid;
+		prefix = operation;
+		prefix_index = i;
 		found = true;
 	}
 	if (!found || !cold_top_tx_key_valid_v1(&key))
 		return false;
-	/* Fold only the causal prefix of this physical segment. Later COMMIT,
-	 * ABORT or reuse cannot erase this operation's earlier ACTIVE input. */
-	for (uint32 i = 0; i < count; i++) {
+	/* Native UNDO records carry the binding stamped at append time, but
+	 * abort cleanup can flush their batch after TT_ABORT/native ABORT and
+	 * another slot reuse. Qualify their original BIND's ACTIVE image, not
+	 * the latest TT state at flush. COMMIT drains the batch at precommit,
+	 * so an intervening COMMIT is incompatible with that native producer.
+	 * PAGE still needs ACTIVE immediately before its own WAL record. */
+	if (own_operation != UINT32_MAX && commit_end > prefix.identity.record.end_rec_ptr)
+		return false;
+	for (uint32 i = 0; own_operation == UINT32_MAX && i < count; i++) {
 		RfSideOnlineOperationV1 operation;
 		bool same_segment;
 
 		if (!rf_side_online_plan_operation_v1(plan, i, &operation))
 			return false;
-		if (operation.identity.record.end_rec_ptr > frame.read_rec_ptr)
+		if (operation.identity.record.end_rec_ptr > read_rec_ptr)
 			continue;
 		same_segment = operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
 					   && operation.undo.instance == key.owner_instance
@@ -519,8 +521,37 @@ cold_typed_page_binding_v1(const ClusterColdTypedV1 *typed, uint32 frame_index, 
 	if (header->wrap_count != key.segment_generation || slot->status != TT_SLOT_ACTIVE
 		|| slot->xid != key.xid || slot->wrap != key.slot_wrap)
 		return false;
-	*out_frame = frame;
 	*out_key = key;
+	return true;
+}
+
+static bool
+cold_typed_page_binding_v1(const ClusterColdTypedV1 *typed, uint32 frame_index, bool new_creator,
+						   ClusterColdRecordFrameV1 *out_frame, ClusterColdTtSlotKeyV1 *out_key)
+{
+	ClusterColdRecordFrameV1 frame = { 0 };
+	bool supported;
+	uint8 opcode;
+
+	if (typed == NULL || !cluster_cold_plan_record_frame_v1(typed->plan, frame_index, &frame)
+		|| frame.history || frame.page_components == 0 || frame.space_effects != 0)
+		return false;
+	opcode = frame.info & XLOG_HEAP_OPMASK;
+	if (new_creator)
+		supported = (frame.rmid == RM_HEAP_ID
+					 && (opcode == XLOG_HEAP_INSERT || opcode == XLOG_HEAP_UPDATE
+						 || opcode == XLOG_HEAP_HOT_UPDATE))
+					|| (frame.rmid == RM_HEAP2_ID && opcode == XLOG_HEAP2_MULTI_INSERT);
+	else
+		supported
+			= (frame.rmid == RM_HEAP_ID && (opcode == XLOG_HEAP_DELETE || opcode == XLOG_HEAP_LOCK))
+			  || (frame.rmid == RM_HEAP2_ID && opcode == XLOG_HEAP2_LOCK_UPDATED);
+	if (!supported
+		|| !cold_typed_actor_binding_v1(typed, frame.participant, frame.read_rec_ptr,
+										frame.end_rec_ptr, frame.source_xid, frame.source_top_xid,
+										UINT32_MAX, out_key))
+		return false;
+	*out_frame = frame;
 	return true;
 }
 
@@ -671,9 +702,11 @@ cold_top_tx_undo_fpi_v1(const RfSideOnlineOperationV1 *operation)
  * byte-exact replay alone cannot prove agreement with the original actor.
  * FPI has no appended-range metadata and must retain other actors' records. */
 static bool
-cold_top_tx_undo_delta_actor_v1(const RfSideOnlineOperationV1 *operation)
+cold_top_tx_undo_delta_actor_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+								uint32 operation_index, const RfSideOnlineOperationV1 *operation)
 {
 	const ClusterUndoDecoded *undo = &operation->undo;
+	ClusterColdTtSlotKeyV1 key;
 	uint32 records_end = (uint32)undo->rec_off + undo->rec_len;
 	uint32 directory_end = (uint32)undo->slot_off + undo->slot_len;
 	uint32 length = UNDO_BLOCK_HDR_PREFIX_LEN + undo->rec_len + undo->slot_len;
@@ -685,6 +718,11 @@ cold_top_tx_undo_delta_actor_v1(const RfSideOnlineOperationV1 *operation)
 		|| undo->rec_len < sizeof(UndoRecordHeader) || records_end > undo->slot_off
 		|| directory_end > BLCKSZ || undo->slot_len == 0
 		|| undo->slot_len % sizeof(UndoSlotDirEntry) != 0)
+		return false;
+	if (!cold_typed_actor_binding_v1(typed, participant, operation->identity.record.read_rec_ptr,
+									 operation->identity.record.end_rec_ptr, operation->source_xid,
+									 operation->source_top_xid, operation_index, &key)
+		|| undo->instance != key.owner_instance)
 		return false;
 	records = operation->owned_payload + UNDO_BLOCK_HDR_PREFIX_LEN;
 	directory = records + undo->rec_len;
@@ -698,7 +736,10 @@ cold_top_tx_undo_delta_actor_v1(const RfSideOnlineOperationV1 *operation)
 			|| entry.record_length > records_end - entry.record_offset)
 			return false;
 		memcpy(&record, records + entry.record_offset - undo->rec_off, sizeof(record));
-		if (record.xid != operation->source_xid)
+		if (record.xid != key.xid || record.origin_node_id + 1 != key.owner_instance
+			|| record.tt_slot_segment_id != key.segment_id
+			|| record.tt_slot_id != key.slot_offset + 1 || record.tt_wrap_plus1 == 0
+			|| record.tt_wrap_plus1 - 1 != key.slot_wrap)
 			return false;
 	}
 	return true;
@@ -784,7 +825,7 @@ cold_top_tx_frames_v1(const ClusterColdTypedV1 *typed)
 				&& !operation.undo.has_fpi
 				&& (operation.undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
 					|| operation.undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI)
-				&& !cold_top_tx_undo_delta_actor_v1(&operation))
+				&& !cold_top_tx_undo_delta_actor_v1(typed, p, i, &operation))
 				return false;
 		}
 	}

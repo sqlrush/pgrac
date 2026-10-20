@@ -1104,10 +1104,15 @@ extern bool cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
  * ABORT with this origin/raw xid additionally requires its original unique
  * exact TT_ABORT pairing, including retained history. This read-only identity
  * does not authorize historical replay. An unqualified ABORT remains blocked.
- * Replayed native UNDO deltas additionally require a normal original WAL
- * actor matching every appended record in their persisted directory span.
- * Inherited records and FPI history retain their own actors; this does not
- * supply canonical TT generation or the independent ordinary_effects proof.
+ * Replayed native UNDO deltas additionally require their normal original
+ * WAL actor's own BIND and its inclusive ACTIVE prefix. Every appended record in
+ * their persisted directory span must match that actor's raw xid and
+ * physical origin/TT segment/slot/wrap. The prefix supplies the canonical
+ * segment generation. Abort cleanup may flush the batch after exact TT_ABORT,
+ * native ABORT or later slot reuse; none erases the original binding input.
+ * An intervening COMMIT is incompatible with the native precommit drain.
+ * Inherited records and FPI history retain their own actors and do not
+ * gain canonical identity or the independent ordinary_effects proof here.
  * Target incarnation/claim remain bound to the original source.  A new
  * header with no original base requires the native full-image proof.
  * The original endpoint receipt must cover the unchanged complete source
