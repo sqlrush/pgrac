@@ -5118,6 +5118,13 @@ pcm_entry_wait_context_cleanup(PcmEntryWaitContext *context)
 		pcm_entry_ref_release(&context->ref);
 }
 
+static void
+pcm_entry_wait_before_shmem_exit(int code pg_attribute_unused(), Datum arg)
+{
+	/* A FATAL interrupt does not unwind the wait's PG exception block. */
+	pcm_entry_wait_context_cleanup((PcmEntryWaitContext *)DatumGetPointer(arg));
+}
+
 /* One backend can have at most one ConditionVariable sleep registration.
  * Preserve that registration across the executor probe/wait API boundary,
  * but retain only the exact pinned handle and logical Resource-X identity. */
@@ -7923,15 +7930,12 @@ pcm_lock_acquire_local(BufferTag tag, PcmLockMode mode, PcmAuthoritySnapshot *re
 								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 								  cluster_node_id)));
 
-	PG_TRY();
+	PG_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
 	{
 		acquired = pcm_lock_acquire_local_pinned(tag, mode, remote_x_out, &wait_context);
 	}
-	PG_FINALLY();
-	{
-		pcm_entry_wait_context_cleanup(&wait_context);
-	}
-	PG_END_TRY();
+	PG_END_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
+	pcm_entry_wait_context_cleanup(&wait_context);
 	return acquired;
 }
 
@@ -15536,7 +15540,7 @@ round_wait_predicate_done:
 	remaining_us = Max(retry_slice_us, UINT64_C(1000));
 	timeout_ms = (long)Min((uint64)timeout_ms, remaining_us / UINT64_C(1000));
 
-	PG_TRY();
+	PG_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
 	{
 		(void)ConditionVariableTimedSleep(&entry->wait_cv, timeout_ms,
 										  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
@@ -15550,11 +15554,8 @@ round_wait_predicate_done:
 									  cluster_node_id)));
 		}
 	}
-	PG_FINALLY();
-	{
-		pcm_entry_wait_context_cleanup(&wait_context);
-	}
-	PG_END_TRY();
+	PG_END_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
+	pcm_entry_wait_context_cleanup(&wait_context);
 	return RESOURCE_X_APPLY_APPLIED;
 }
 
@@ -15684,7 +15685,7 @@ cluster_pcm_lock_resource_x_predecessor_wait_exact(const BufferTag *tag, int32 c
 	}
 	remaining_us = Max(requested_sleep_slice_us, UINT64_C(1000));
 	timeout_ms = (long)Min((uint64)LONG_MAX, remaining_us / UINT64_C(1000));
-	PG_TRY();
+	PG_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
 	{
 		(void)ConditionVariableTimedSleep(&entry->wait_cv, timeout_ms,
 										  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
@@ -15698,11 +15699,8 @@ cluster_pcm_lock_resource_x_predecessor_wait_exact(const BufferTag *tag, int32 c
 							   cluster_node_id)));
 		}
 	}
-	PG_FINALLY();
-	{
-		pcm_entry_wait_context_cleanup(&wait_context);
-	}
-	PG_END_TRY();
+	PG_END_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
+	pcm_entry_wait_context_cleanup(&wait_context);
 	return RESOURCE_X_APPLY_APPLIED;
 }
 
@@ -16907,7 +16905,7 @@ cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
 	if (deadline_ms < (uint64)sleep_ms)
 		sleep_ms = (long)deadline_ms;
 
-	PG_TRY();
+	PG_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
 	{
 		(void)ConditionVariableTimedSleep(&entry->wait_cv, sleep_ms,
 										  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
@@ -16921,11 +16919,8 @@ cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
 									  cluster_node_id)));
 		}
 	}
-	PG_FINALLY();
-	{
-		pcm_entry_wait_context_cleanup(&wait_context);
-	}
-	PG_END_TRY();
+	PG_END_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
+	pcm_entry_wait_context_cleanup(&wait_context);
 	return RESOURCE_X_APPLY_APPLIED;
 }
 

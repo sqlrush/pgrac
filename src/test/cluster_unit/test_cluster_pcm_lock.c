@@ -179,6 +179,12 @@ before_shmem_exit(pg_on_exit_callback function pg_attribute_unused(),
 {
 	fake_pcm_exit_hook_registrations++;
 }
+
+void
+cancel_before_shmem_exit(pg_on_exit_callback function pg_attribute_unused(),
+						 Datum arg pg_attribute_unused())
+{
+}
 /* Object admission is a boundary fixture; PCM round/caller transitions below
  * remain the real product object. Tests may race the original entry lock. */
 int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
