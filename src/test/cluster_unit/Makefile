@@ -9102,10 +9102,14 @@ test_cluster_cold_tt_base: test_cluster_cold_tt_base.c unit_test.h test_cluster_
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h $(CLUSTER_SIDE_HEAD_READER_O) \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o \
+		$(top_builddir)/src/common/libpgcommon.a \
 		cluster_unit_port_stubs.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_SIDE_HEAD_READER_O) \
+	# Capture-only fixture: semantic census/producer is exercised by tt_redo.
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections \
+		$< $(CLUSTER_SIDE_HEAD_READER_O) \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o \
-		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
 
 test_cluster_cold_recovery_startup_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_bootstrap_private.h \

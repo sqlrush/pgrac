@@ -3831,6 +3831,12 @@ cluster_typed_replay_publish(ClusterColdTypedReplay *rep, const ClusterColdRepla
 		cluster_typed_replay_unpublished(
 			thread, "Native durability, PAGE readback or source counter endpoints are incomplete",
 			(int)rep->typed->refusal);
+	/* Retain read-only ACTIVE inputs before the original pass-2 authority
+	 * is released. Unproven tops stay explicit; C0 requires its own later
+	 * TX_CLOSURE source/isolation and writer authority after native EOR. */
+	if (!cluster_cold_typed_top_tx_census_v1(rep->typed, plan))
+		cluster_typed_replay_unpublished(
+			thread, "Post-redo ACTIVE input census is incomplete", (int)rep->typed->refusal);
 	switch (cluster_recovery_merge_fence_plan_complete_v1(plan, &thread, &detail))
 	{
 		case CLUSTER_RECOVERY_FENCE_COMPLETE_OK:

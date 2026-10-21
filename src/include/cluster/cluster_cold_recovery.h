@@ -880,6 +880,9 @@ typedef struct ClusterColdTypedV1 {
 	uint32 replay_root_count;
 	struct ClusterColdTtBaseV1 *tt_base; /* raw original-owner input, no outcome authority */
 	struct ClusterColdTtBaseV1 *tt_after_redo; /* separate physical input, same TT budget */
+	/* Complete read-only ACTIVE input census from the still-held pass-2 cut.
+	 * It survives EOR as input only, never as execution or write authority. */
+	struct ClusterColdTopTxCensusV1 *top_tx_census;
 	bool source_drained[CLUSTER_COLD_MAX_PARTICIPANTS]; /* this pass-2 attempt only */
 	/* Provisional native counters after counted pass-2 drain. Zero means
 	 * missing; these do not prove global effects/durability or all-thread N. */
@@ -1054,6 +1057,27 @@ typedef struct ClusterColdTopTxLoserProducerResultV1 {
 extern bool cluster_cold_typed_top_tx_loser_producer_v1(
 	ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence, uint32 participant,
 	const ClusterColdTopTxProofV1 *proof, ClusterColdTopTxLoserProducerResultV1 *out);
+
+/* Every physical ACTIVE is retained, including unsupported/unproven tops.
+ * A proven loser is only a pass-2-local fact. Later consumers must reacquire
+ * their own source/isolation and TX_CLOSURE writer authority. */
+typedef struct ClusterColdTopTxCensusEntryV1 {
+	ClusterColdTtSlotInputV1 input;
+	bool loser_proven;
+	ClusterColdLoserIdentityV1 loser;
+} ClusterColdTopTxCensusEntryV1;
+
+typedef struct ClusterColdTopTxCensusV1 {
+	const ClusterColdPlanV1 *plan;
+	uint32 count;
+	uint32 proven_count;
+	ClusterColdTopTxCensusEntryV1 entries[FLEXIBLE_ARRAY_MEMBER];
+} ClusterColdTopTxCensusV1;
+
+/* No caller proof flags: only the original producer's independent gates
+ * can qualify a retained ACTIVE. NULL census means incomplete, not empty. */
+extern bool cluster_cold_typed_top_tx_census_v1(
+	ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence);
 
 /* Attempt-local producer result.  The source owner supplies the proof and
  * shape; this value only records the exact post-redo physical fact, the

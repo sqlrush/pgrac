@@ -53,9 +53,13 @@ cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
 }
 
 
+static Size tt_census_fail_alloc_size;
+
 void *
 palloc_extended(Size size, int flags)
 {
+	if (tt_census_fail_alloc_size != 0 && size == tt_census_fail_alloc_size)
+		return NULL;
 	return (flags & MCXT_ALLOC_ZERO) ? calloc(1, size) : malloc(size);
 }
 
@@ -8159,10 +8163,187 @@ UT_TEST(tt_top_tx_loser_producer_keeps_original_proof_gates)
 	}
 }
 
+UT_TEST(tt_top_tx_census_consumes_native_empty_loser_without_c0_fields)
+{
+	TtRedoFixture f;
+	ClusterColdTtSlotInputV1 input;
+
+	tt_top_tx_initialized_fixture(&f, 200, 100, 2);
+	tt_top_tx_seal_bound(&f, 100);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &input));
+	tt_top_tx_effects_complete(&f);
+	tt_top_tx_endpoints_complete(&f);
+	UT_ASSERT_EQ(f.typed.xid_next_after_redo, 0);
+	UT_ASSERT(cluster_cold_typed_top_tx_census_v1(&f.typed, TT_C0_FENCE));
+	if (f.typed.top_tx_census != NULL) {
+		const ClusterColdTopTxCensusV1 *census = f.typed.top_tx_census;
+
+		UT_ASSERT(census->plan == f.typed.plan);
+		UT_ASSERT_EQ(census->count, 1);
+		UT_ASSERT_EQ(census->proven_count, 1);
+		UT_ASSERT(census->entries[0].loser_proven);
+		UT_ASSERT(memcmp(&census->entries[0].input, &input, sizeof(input)) == 0);
+		UT_ASSERT(memcmp(&census->entries[0].loser.key, &input.key, sizeof(input.key)) == 0);
+	} else
+		UT_ASSERT_NOT_NULL(f.typed.top_tx_census);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_top_tx_census_retains_all_unproven_active_slots)
+{
+	TtRedoFixture f;
+	PGAlignedBlock extra;
+	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)extra.data;
+
+	tt_redo_fixture(&f, 100, RF_SIDE_PLAN_RECOVERY);
+	tt_inventory_extra(257, 2, &extra);
+	header->tt_slots[1].status = TT_SLOT_ACTIVE;
+	header->tt_slots[1].xid = 905;
+	header->tt_slots[1].wrap = 1;
+	tt_readback_write(257, &extra, false);
+	tt_redo_seed_recapture(&f);
+	tt_redo_seal(&f);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+	tt_top_tx_effects_complete(&f);
+	tt_top_tx_endpoints_complete(&f);
+	UT_ASSERT(cluster_cold_typed_top_tx_census_v1(&f.typed, TT_C0_FENCE));
+	if (f.typed.top_tx_census != NULL) {
+		const ClusterColdTopTxCensusV1 *census = f.typed.top_tx_census;
+		uint32 history_seen = 0;
+		bool found_last = false;
+
+		UT_ASSERT_EQ(census->count, 4);
+		UT_ASSERT_EQ(census->proven_count, 0);
+		for (uint32 i = 0; i < census->count; i++) {
+			const ClusterColdTopTxCensusEntryV1 *entry = &census->entries[i];
+			ClusterColdLoserIdentityV1 zero = { 0 };
+
+			UT_ASSERT_EQ(entry->input.slot.status, TT_SLOT_ACTIVE);
+			UT_ASSERT(!entry->loser_proven);
+			UT_ASSERT(memcmp(&entry->loser, &zero, sizeof(zero)) == 0);
+			if (entry->input.key.owner_instance == 2) {
+				UT_ASSERT_EQ(entry->input.key.segment_id, 257);
+				UT_ASSERT_EQ(entry->input.key.segment_generation, 0);
+				if (entry->input.key.slot_offset == 1) {
+					history_seen |= 1;
+					UT_ASSERT_EQ(entry->input.key.xid, 905);
+					UT_ASSERT_EQ(entry->input.key.slot_wrap, 1);
+				} else {
+					history_seen |= 2;
+					UT_ASSERT_EQ(entry->input.key.slot_offset, 47);
+					UT_ASSERT_EQ(entry->input.key.xid, 900);
+					UT_ASSERT_EQ(entry->input.key.slot_wrap, 9);
+				}
+			}
+			if (entry->input.key.owner_instance == 3 && entry->input.key.slot_offset == 47)
+				found_last = true;
+		}
+		UT_ASSERT_EQ(history_seen, 3);
+		UT_ASSERT(found_last);
+	} else
+		UT_ASSERT_NOT_NULL(f.typed.top_tx_census);
+	tt_inventory_remove(257);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_top_tx_census_clears_prior_input_on_incomplete_cut)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		TtRedoFixture f;
+
+		tt_top_tx_initialized_fixture(&f, 200, 100, 2);
+		tt_top_tx_seal_bound(&f, 100);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		tt_top_tx_effects_complete(&f);
+		tt_top_tx_endpoints_complete(&f);
+		UT_ASSERT(cluster_cold_typed_top_tx_census_v1(&f.typed, TT_C0_FENCE));
+		UT_ASSERT_NOT_NULL(f.typed.top_tx_census);
+		if (fault == 0)
+			f.typed.effects_receipt.plan = NULL;
+		else if (fault == 1)
+			f.typed.xid_receipt.plan = NULL;
+		else if (fault == 2)
+			tt_c0_owner_fail_at = tt_c0_owner_calls + 1;
+		else if (fault == 3)
+			tt_c0_owner_fail_at = tt_c0_owner_calls + 4; /* Final census bracket. */
+		else {
+			cluster_cold_tt_after_redo_reset_v1(&f.typed);
+			UT_ASSERT_NULL(f.typed.top_tx_census);
+		}
+		UT_ASSERT(!cluster_cold_typed_top_tx_census_v1(&f.typed, TT_C0_FENCE));
+		UT_ASSERT_NULL(f.typed.top_tx_census);
+		tt_c0_owner_fail_at = 0;
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_top_tx_census_distinguishes_complete_empty_from_missing)
+{
+	TtRedoFixture f;
+
+	tt_top_tx_initialized_fixture(&f, 100, 100, 2);
+	tt_redo_seal(&f);
+	tt_top_tx_write_fold(&f);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+	tt_top_tx_effects_complete(&f);
+	tt_top_tx_endpoints_complete(&f);
+	UT_ASSERT(cluster_cold_typed_top_tx_census_v1(&f.typed, TT_C0_FENCE));
+	if (f.typed.top_tx_census != NULL) {
+		UT_ASSERT_EQ(f.typed.top_tx_census->count, 0);
+		UT_ASSERT_EQ(f.typed.top_tx_census->proven_count, 0);
+	} else
+		UT_ASSERT_NOT_NULL(f.typed.top_tx_census);
+	cluster_cold_tt_after_redo_reset_v1(&f.typed);
+	UT_ASSERT_NULL(f.typed.top_tx_census);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_top_tx_census_budget_and_oom_never_publish_a_partial_list)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		TtRedoFixture f;
+		Size bytes = offsetof(ClusterColdTopTxCensusV1, entries)
+					 + sizeof(ClusterColdTopTxCensusEntryV1);
+		Size used, base_budget, after_budget;
+
+		tt_top_tx_initialized_fixture(&f, 200, 100, 2);
+		tt_top_tx_seal_bound(&f, 100);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		tt_top_tx_effects_complete(&f);
+		tt_top_tx_endpoints_complete(&f);
+		UT_ASSERT(cluster_cold_typed_top_tx_census_v1(&f.typed, TT_C0_FENCE));
+		used = f.typed.tt_after_redo->used;
+		base_budget = f.typed.tt_base->budget;
+		after_budget = f.typed.tt_after_redo->budget;
+		if (fault == 0)
+			f.typed.tt_base->budget = f.typed.tt_base->used + used - 1;
+		else if (fault == 1)
+			f.typed.tt_after_redo->budget = used - 1;
+		else
+			tt_census_fail_alloc_size = bytes;
+		UT_ASSERT(!cluster_cold_typed_top_tx_census_v1(&f.typed, TT_C0_FENCE));
+		UT_ASSERT_NULL(f.typed.top_tx_census);
+		UT_ASSERT_EQ(f.typed.tt_after_redo->used, used - bytes);
+		f.typed.tt_base->budget = base_budget;
+		f.typed.tt_after_redo->budget = after_budget;
+		tt_census_fail_alloc_size = 0;
+		UT_ASSERT(cluster_cold_typed_top_tx_census_v1(&f.typed, TT_C0_FENCE));
+		UT_ASSERT_EQ(f.typed.tt_after_redo->used, used);
+		UT_ASSERT_NOT_NULL(f.typed.top_tx_census);
+		tt_redo_destroy(&f);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(170);
+	UT_PLAN(175);
+	UT_RUN(tt_top_tx_census_consumes_native_empty_loser_without_c0_fields);
+	UT_RUN(tt_top_tx_census_retains_all_unproven_active_slots);
+	UT_RUN(tt_top_tx_census_clears_prior_input_on_incomplete_cut);
+	UT_RUN(tt_top_tx_census_distinguishes_complete_empty_from_missing);
+	UT_RUN(tt_top_tx_census_budget_and_oom_never_publish_a_partial_list);
 	UT_RUN(tt_top_tx_loser_producer_is_independent_of_c0_fields);
 	UT_RUN(tt_top_tx_loser_producer_keeps_original_proof_gates);
 	UT_RUN(tt_after_redo_checks_canonical_active_undo_chain_input);

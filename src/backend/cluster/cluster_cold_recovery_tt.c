@@ -347,8 +347,13 @@ cold_tt_destroy(ClusterColdTtBaseV1 **target)
 void
 cluster_cold_tt_after_redo_reset_v1(ClusterColdTypedV1 *typed)
 {
-	if (typed != NULL)
+	if (typed != NULL) {
+		if (typed->top_tx_census != NULL) {
+			pfree(typed->top_tx_census);
+			typed->top_tx_census = NULL;
+		}
 		cold_tt_destroy(&typed->tt_after_redo);
+	}
 }
 
 void
@@ -864,6 +869,127 @@ cluster_cold_tt_after_redo_slot_v1(const ClusterColdTypedV1 *typed, uint32 segme
 	return cold_tt_slot(typed == NULL ? NULL : typed->tt_after_redo,
 						cluster_cold_tt_after_redo_count_v1(typed), segment_index, slot_offset,
 						out);
+}
+
+/* Reserve census storage before a producer can allocate more TT input. */
+static ClusterColdTopTxCensusV1 *
+cold_tt_census_allocate(ClusterColdTypedV1 *typed, uint32 count, Size *allocated)
+{
+	ClusterColdTtBaseV1 *after = typed->tt_after_redo;
+	ClusterColdTopTxCensusV1 *census;
+	Size bytes, remaining;
+
+	if (count > (MaxAllocSize - offsetof(ClusterColdTopTxCensusV1, entries))
+					/ sizeof(ClusterColdTopTxCensusEntryV1)
+		|| typed->tt_base->used > typed->tt_base->budget || after->used > after->budget)
+		return NULL;
+	bytes = offsetof(ClusterColdTopTxCensusV1, entries)
+			+ sizeof(ClusterColdTopTxCensusEntryV1) * count;
+	remaining = typed->tt_base->budget - typed->tt_base->used;
+	if (after->used > remaining)
+		return NULL;
+	remaining = Min(remaining - after->used, after->budget - after->used);
+	if (bytes > remaining)
+		return NULL;
+	census = palloc_extended(bytes, MCXT_ALLOC_NO_OOM | MCXT_ALLOC_ZERO);
+	if (census != NULL) {
+		after->used += bytes;
+		*allocated = bytes;
+	}
+	return census;
+}
+
+/* The original inventory owner retains every ACTIVE, not just those the
+ * current physical producer can prove. This is an input census, never a
+ * TX_CLOSURE completion receipt or permission to reuse pass-2 authority. */
+bool
+cluster_cold_typed_top_tx_census_v1(ClusterColdTypedV1 *typed,
+									struct ClusterRecoveryFencePlan *fence)
+{
+	ClusterColdTtBaseV1 *after;
+	ClusterColdTopTxCensusV1 *census;
+	uint32 count = 0, next = 0;
+	Size bytes;
+
+	if (typed == NULL)
+		return false;
+	/* A refused retry cannot expose a preceding attempt's census. The
+	 * allocation is charged to the post-capture's original shared budget. */
+	if (typed->top_tx_census != NULL) {
+		bytes = offsetof(ClusterColdTopTxCensusV1, entries)
+				+ sizeof(ClusterColdTopTxCensusEntryV1) * typed->top_tx_census->count;
+		pfree(typed->top_tx_census);
+		typed->top_tx_census = NULL;
+		if (typed->tt_after_redo == NULL || typed->tt_after_redo->used < bytes)
+			return false;
+		typed->tt_after_redo->used -= bytes;
+	}
+	if (typed->refusal != CLUSTER_COLD_OK
+		|| !cluster_cold_typed_xid_sources_ready_v1(typed)
+		|| !cluster_cold_typed_effects_ready_v1(typed)
+		|| !cluster_cold_tt_after_redo_namespace_matches_v1(typed)
+		|| !cluster_cold_typed_sources_current_v1(typed, fence)
+		|| cluster_cold_tt_after_redo_recheck_v1(typed) != CLUSTER_COLD_OK
+		|| !cluster_cold_typed_tt_redo_inventory_v1(typed))
+		return false;
+	after = typed->tt_after_redo;
+	for (const ColdTtInputV1 *input = after->first; input != NULL; input = input->next) {
+		const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)input->block.data;
+
+		for (uint32 slot = 0; slot < TT_SLOTS_PER_SEGMENT; slot++)
+			if (header->tt_slots[slot].status == TT_SLOT_ACTIVE) {
+				if (count == UINT32_MAX)
+					return false;
+				count++;
+			}
+	}
+	census = cold_tt_census_allocate(typed, count, &bytes);
+	if (census == NULL)
+		return false;
+	census->plan = typed->plan;
+	census->count = count;
+	for (const ColdTtInputV1 *input = after->first; input != NULL; input = input->next) {
+		const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)input->block.data;
+
+		for (uint32 slot = 0; slot < TT_SLOTS_PER_SEGMENT; slot++) {
+			ClusterColdTopTxCensusEntryV1 *entry;
+			ClusterColdTopTxProofV1 proof = { 0 };
+			ClusterColdTopTxLoserProducerResultV1 loser;
+
+			if (header->tt_slots[slot].status != TT_SLOT_ACTIVE)
+				continue;
+			entry = &census->entries[next++];
+			cold_tt_slot_copy(input, slot, &entry->input);
+			proof.key = entry->input.key;
+			/* No aggregate effects count supplies a per-top effects flag.
+			 * History/unknown origins remain explicit unproven inputs. */
+			for (uint32 p = 0; p < typed->replay_count; p++) {
+				if (typed->participants[p].thread_id != input->owner)
+					continue;
+				if (cluster_cold_typed_top_tx_loser_producer_v1(typed, fence, p, &proof, &loser)) {
+					entry->loser_proven = true;
+					entry->loser = loser.loser;
+					census->proven_count++;
+				}
+				break;
+			}
+			if (typed->refusal != CLUSTER_COLD_OK || typed->tt_after_redo != after)
+				goto refused;
+		}
+	}
+	/* Bracket the entire census, including entries whose proof is absent.
+	 * No partial list can survive a failed physical/source recheck. */
+	if (cluster_cold_tt_after_redo_recheck_v1(typed) != CLUSTER_COLD_OK
+		|| !cluster_cold_typed_sources_current_v1(typed, fence))
+		goto refused;
+	typed->top_tx_census = census;
+	return true;
+
+refused:
+	if (typed->tt_after_redo == after)
+		after->used -= bytes;
+	pfree(census);
+	return false;
 }
 
 bool
