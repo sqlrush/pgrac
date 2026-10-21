@@ -56,6 +56,7 @@ static unsigned vacuum_cancels, vacuum_truncates, vacuum_snapshots;
 static bool vacuum_no_tables;
 static bool vacuum_class_returned;
 static TransactionId vacuum_next_xid;
+static TransactionId vacuum_oldest_xid;
 static TransactionId vacuum_inplace_frozenxid;
 static VariableCacheData vacuum_cache;
 VariableCache ShmemVariableCache = &vacuum_cache;
@@ -162,7 +163,7 @@ LockDatabaseFrozenIds(LOCKMODE mode)
 TransactionId
 GetOldestNonRemovableTransactionId(Relation relation)
 {
-	return 100;
+	return vacuum_oldest_xid;
 }
 
 MultiXactId
@@ -342,6 +343,7 @@ vacuum_reset(void)
 	vacuum_no_tables = false;
 	vacuum_class_returned = false;
 	vacuum_next_xid = 200;
+	vacuum_oldest_xid = 100;
 	vacuum_cache.nextXid = FullTransactionIdFromU64(200);
 	ShmemVariableCache = &vacuum_cache;
 	vacuum_legal_next = 200;
@@ -843,5 +845,153 @@ UT_TEST(vacuum_relstats_accepts_legal_next_boundary)
 	UT_ASSERT_EQ(relation->relfrozenxid, 200);
 	UT_ASSERT(updated);
 	UT_ASSERT_EQ(vacuum_finishes, 1);
+	vacuum_abort();
+}
+
+UT_TEST(vacuum_database_rejects_future_values)
+{
+	for (int future_current = 0; future_current < 2; future_current++) {
+		Form_pg_database database;
+
+		vacuum_reset();
+		/* Isolate the merge from the separate pg_class scan bound. */
+		vacuum_no_tables = true;
+		vacuum_oldest_xid = future_current ? 260 : 201;
+		vacuum_inplace_frozenxid = future_current ? 250 : 40;
+		database = (Form_pg_database)GETSTRUCT(&vacuum_database_tuple);
+		database->datminmxid = 100;
+		UT_ASSERT_EQ(vacuum_call(), 0);
+		UT_ASSERT_EQ(database->datfrozenxid, future_current ? 250 : 40);
+		UT_ASSERT_EQ(vacuum_finishes, 0);
+		UT_ASSERT_EQ(vacuum_cancels, 1);
+		UT_ASSERT_EQ(vacuum_truncates, 0);
+		vacuum_abort();
+	}
+}
+
+UT_TEST(vacuum_database_rejects_half_space_current)
+{
+	Form_pg_database database;
+
+	vacuum_reset();
+	vacuum_no_tables = true;
+	vacuum_oldest_xid = 0x800000c9U;
+	vacuum_legal_next = UINT64CONST(0x1000000c8);
+	vacuum_inplace_frozenxid = 0x800000c8U;
+	database = (Form_pg_database)GETSTRUCT(&vacuum_database_tuple);
+	database->datminmxid = 100;
+	UT_ASSERT_EQ(vacuum_call(), 0);
+	UT_ASSERT_EQ(database->datfrozenxid, 0x800000c8U);
+	UT_ASSERT_EQ(vacuum_cancels, 1);
+	UT_ASSERT_EQ(vacuum_truncates, 0);
+	vacuum_abort();
+}
+
+UT_TEST(vacuum_database_unavailable_promise_preserves_xid)
+{
+	for (int revoked = 0; revoked < 2; revoked++) {
+		Form_pg_database database;
+
+		vacuum_reset();
+		vacuum_promise_ready = revoked;
+		vacuum_revoke_on_release = revoked;
+		database = (Form_pg_database)GETSTRUCT(&vacuum_database_tuple);
+		database->datminmxid = 80;
+		UT_ASSERT_EQ(vacuum_call(), 0);
+		UT_ASSERT_EQ(database->datfrozenxid, 40);
+		UT_ASSERT_EQ(vacuum_sample_reads, 1);
+		UT_ASSERT_EQ(vacuum_fence_reads, revoked);
+		UT_ASSERT_EQ(vacuum_cancels, 1);
+		UT_ASSERT_EQ(vacuum_truncates, 0);
+		vacuum_abort();
+	}
+}
+
+UT_TEST(vacuum_database_invalid_window_preserves_xid)
+{
+	for (int invalid = 0; invalid < 6; invalid++) {
+		Form_pg_database database;
+
+		vacuum_reset();
+		database = (Form_pg_database)GETSTRUCT(&vacuum_database_tuple);
+		database->datminmxid = 80;
+		if (invalid == 0)
+			vacuum_legal_next = 0;
+		else if (invalid == 1)
+			vacuum_legal_next = UINT64CONST(0x100000002);
+		else if (invalid == 2)
+			vacuum_inplace_frozenxid = FrozenTransactionId;
+		else if (invalid == 3)
+			database->datfrozenxid = InvalidTransactionId;
+		else if (invalid == 4)
+			ShmemVariableCache = NULL;
+		else
+			cluster_xid_striping = false;
+		UT_ASSERT_EQ(vacuum_call(), 0);
+		UT_ASSERT_EQ(database->datfrozenxid, invalid == 2 ? FrozenTransactionId :
+					 invalid == 3 ? InvalidTransactionId : 40);
+		UT_ASSERT_EQ(vacuum_cancels, 1);
+		UT_ASSERT_EQ(vacuum_truncates, 0);
+		vacuum_abort();
+	}
+}
+
+UT_TEST(vacuum_database_accepts_durable_bound_and_next_boundary)
+{
+	for (int remote_ahead = 0; remote_ahead < 2; remote_ahead++) {
+		Form_pg_database database;
+
+		vacuum_reset();
+		vacuum_no_tables = true;
+		vacuum_oldest_xid = remote_ahead ? 9000 : 200;
+		vacuum_legal_next = remote_ahead ? 10000 : 200;
+		database = (Form_pg_database)GETSTRUCT(&vacuum_database_tuple);
+		database->datminmxid = 100;
+		UT_ASSERT_EQ(vacuum_call(), 0);
+		UT_ASSERT_EQ(database->datfrozenxid, remote_ahead ? 9000 : 200);
+		UT_ASSERT_EQ(vacuum_sample_reads, 1);
+		UT_ASSERT_EQ(vacuum_fence_reads, 1);
+		UT_ASSERT_EQ(vacuum_finishes, 1);
+		UT_ASSERT_EQ(vacuum_truncates, 1);
+		UT_ASSERT(!vacuum_xid_lock && !vacuum_inplace_lock);
+		vacuum_abort();
+	}
+}
+
+UT_TEST(vacuum_database_retains_full_xid_wrap_order)
+{
+	for (int advance = 0; advance < 2; advance++) {
+		Form_pg_database database;
+
+		vacuum_reset();
+		vacuum_no_tables = true;
+		vacuum_oldest_xid = advance ? 20 : 0xffffff00U;
+		vacuum_inplace_frozenxid = advance ? 0xffffff00U : 20;
+		vacuum_legal_next = UINT64CONST(0x10000001e);
+		database = (Form_pg_database)GETSTRUCT(&vacuum_database_tuple);
+		database->datminmxid = 100;
+		UT_ASSERT_EQ(vacuum_call(), 0);
+		UT_ASSERT_EQ(database->datfrozenxid, 20);
+		UT_ASSERT_EQ(vacuum_finishes, advance);
+		UT_ASSERT_EQ(vacuum_cancels, !advance);
+		UT_ASSERT_EQ(vacuum_truncates, advance);
+		vacuum_abort();
+	}
+}
+
+UT_TEST(vacuum_database_unknown_window_keeps_independent_mx)
+{
+	Form_pg_database database;
+
+	vacuum_reset();
+	vacuum_promise_ready = false;
+	database = (Form_pg_database)GETSTRUCT(&vacuum_database_tuple);
+	database->datminmxid = 300;
+	UT_ASSERT_EQ(vacuum_call(), 0);
+	UT_ASSERT_EQ(database->datfrozenxid, 40);
+	UT_ASSERT_EQ(database->datminmxid, 80);
+	UT_ASSERT_EQ(vacuum_finishes, 1);
+	UT_ASSERT_EQ(vacuum_cancels, 0);
+	UT_ASSERT_EQ(vacuum_truncates, 1);
 	vacuum_abort();
 }

@@ -740,7 +740,7 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(44);
+	UT_PLAN(51);
 	UT_RUN(registered_catalog_is_live_without_becoming_active);
 	UT_RUN(evaluated_registered_snapshot_overrides_an_unrelated_active_snapshot);
 	UT_RUN(forged_reference_counts_do_not_establish_liveness);
@@ -785,6 +785,13 @@ main(void)
 	UT_RUN(vacuum_relstats_uses_durable_legal_bound);
 	UT_RUN(vacuum_relstats_unknown_window_keeps_stats_and_mx);
 	UT_RUN(vacuum_relstats_accepts_legal_next_boundary);
+	UT_RUN(vacuum_database_rejects_future_values);
+	UT_RUN(vacuum_database_rejects_half_space_current);
+	UT_RUN(vacuum_database_unavailable_promise_preserves_xid);
+	UT_RUN(vacuum_database_invalid_window_preserves_xid);
+	UT_RUN(vacuum_database_accepts_durable_bound_and_next_boundary);
+	UT_RUN(vacuum_database_retains_full_xid_wrap_order);
+	UT_RUN(vacuum_database_unknown_window_keeps_independent_mx);
 	UT_ASSERT_EQ(remembered, 0);
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	UT_ASSERT(!ActiveSnapshotSet());

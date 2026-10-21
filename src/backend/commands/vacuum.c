@@ -24,7 +24,7 @@
  *	  - Validate shared heap freeze boundaries using cluster_heap_horizon.
  *	  - Retain a transaction snapshot during shared database maintenance.
  *	  - Use durable legal-next XID age for shared aggressive scans.
- *	  - Bound shared relfrozenxid merges by a durable FullXid window.
+ *	  - Bound shared rel/datfrozenxid merges by a durable FullXid window.
  *
  *-------------------------------------------------------------------------
  */
@@ -1746,7 +1746,12 @@ vac_update_datfrozenxid(void)
 #endif
 }
 
-/* PGRAC: retain the original maintenance decisions and conservative returns. */
+/*
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: validate shared database XID merges against a legal window.
+ * Why: local raw-XID ordering cannot validate a shared catalogue value.
+ * Retain the original maintenance decisions and conservative scan returns.
+ */
 static void
 vac_update_datfrozenxid_internal(void)
 {
@@ -1761,8 +1766,13 @@ vac_update_datfrozenxid_internal(void)
 	MultiXactId lastSaneMinMulti;
 	bool		bogus = false;
 	bool		dirty = false;
+	bool		update_frozen = false;
 	ScanKeyData key[1];
 	void	   *inplace_state;
+#ifdef USE_PGRAC_CLUSTER
+	bool		shared_xid = cluster_storage_mode_enabled() && cluster_shared_catalog;
+	FullTransactionId legal_next = InvalidFullTransactionId;
+#endif
 
 	/*
 	 * Restrict this task to one backend per database.  This avoids race
@@ -1882,6 +1892,22 @@ vac_update_datfrozenxid_internal(void)
 	Assert(TransactionIdIsNormal(newFrozenXid));
 	Assert(MultiXactIdIsValid(newMinMulti));
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: sample before taking the inplace update's content lock. */
+	if (shared_xid && cluster_xid_striping && ShmemVariableCache != NULL)
+	{
+		ClusterXidStripeSampleFence fence;
+		bool		sampled;
+
+		LWLockAcquire(XidGenLock, LW_SHARED);
+		sampled = cluster_xid_stripe_sample_future(ShmemVariableCache->nextXid,
+												 &legal_next, &fence);
+		LWLockRelease(XidGenLock);
+		if (!sampled || !cluster_xid_stripe_sample_fence_current(&fence))
+			legal_next = InvalidFullTransactionId;
+	}
+#endif
+
 	/* Now fetch the pg_database tuple we need to update. */
 	relation = table_open(DatabaseRelationId, RowExclusiveLock);
 
@@ -1912,16 +1938,43 @@ vac_update_datfrozenxid_internal(void)
 	 * PGRAC: another node may have advanced the shared tuple after our scan.
 	 * Preserve that locked value even when it exceeds our local scan bound.
 	 */
-	if (dbform->datfrozenxid != newFrozenXid
-		&& (TransactionIdPrecedes(dbform->datfrozenxid, newFrozenXid)
-			|| (
+	if (dbform->datfrozenxid != newFrozenXid)
+	{
 #ifdef USE_PGRAC_CLUSTER
-				!(cluster_storage_mode_enabled() && cluster_shared_catalog) &&
+		if (shared_xid)
+		{
+			/*
+			 * PGRAC: keep an unknown, future or ambiguous locked value.
+			 * Only merge two values inside the same proven legal window.
+			 */
+			FullTransactionId current = cluster_xid_widen(dbform->datfrozenxid,
+															 legal_next);
+			FullTransactionId proposed = cluster_xid_widen(newFrozenXid, legal_next);
+			uint64		next_value = U64FromFullTransactionId(legal_next);
+			uint64		current_value = U64FromFullTransactionId(current);
+			uint64		proposed_value = U64FromFullTransactionId(proposed);
+
+			if (FullTransactionIdIsValid(legal_next) &&
+				TransactionIdIsNormal(XidFromFullTransactionId(legal_next)) &&
+				FullTransactionIdIsValid(current) &&
+				FullTransactionIdIsValid(proposed) &&
+				current_value <= next_value && proposed_value <= next_value &&
+				next_value - current_value < UINT64CONST(0x80000000) &&
+				next_value - proposed_value < UINT64CONST(0x80000000))
+				update_frozen = current_value < proposed_value;
+		}
+		else
 #endif
-				TransactionIdPrecedes(lastSaneFrozenXid, dbform->datfrozenxid)))) {
+		if (TransactionIdPrecedes(dbform->datfrozenxid, newFrozenXid) ||
+			TransactionIdPrecedes(lastSaneFrozenXid, dbform->datfrozenxid))
+			update_frozen = true;
+	}
+	if (update_frozen)
+	{
 		dbform->datfrozenxid = newFrozenXid;
 		dirty = true;
-	} else
+	}
+	else
 		newFrozenXid = dbform->datfrozenxid;
 
 	/* Ditto for datminmxid */
