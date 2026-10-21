@@ -4125,7 +4125,14 @@ enum {
 	TT_PAGE_CREATOR_EARLY_REUSE,
 	TT_PAGE_CREATOR_HISTORY_PREFIX,
 	TT_PAGE_CREATOR_HISTORY_PREFIX_LATE_COMMIT,
-	TT_PAGE_CREATOR_NO_INIT
+	TT_PAGE_CREATOR_NO_INIT,
+	TT_PAGE_CHECKPOINT,
+	TT_PAGE_CHECKPOINT_LEGACY,
+	TT_PAGE_CHECKPOINT_CORRUPT,
+	TT_PAGE_CHECKPOINT_DUPLICATE,
+	TT_PAGE_CHECKPOINT_COMMIT,
+	TT_PAGE_CHECKPOINT_REUSE,
+	TT_PAGE_CHECKPOINT_LATE_COMMIT
 };
 
 static bool
@@ -4161,6 +4168,7 @@ tt_page_input_fixture(TtRedoFixture *f, uint8 rmid, uint8 info, TransactionId xi
 	RfDetachedRecordPlanV1 detached = { 0 };
 	XLogRecPtr prev = 0;
 	uint32 next = 0, count;
+	bool checkpoint = variant >= TT_PAGE_CHECKPOINT;
 
 	tt_redo_fixture_at(f, 600, RF_SIDE_PLAN_RECOVERY,
 					   history ? 500
@@ -4168,22 +4176,40 @@ tt_page_input_fixture(TtRedoFixture *f, uint8 rmid, uint8 info, TransactionId xi
 						  || variant == TT_PAGE_CREATOR_HISTORY_PREFIX_LATE_COMMIT)
 						   ? 400
 						   : 100);
-	if (variant == TT_PAGE_CREATOR_NO_INIT) {
+	if (checkpoint) {
+		UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)f->base.data;
+
+		/* This original checkpoint slot has no retained INIT or BIND. */
+		if (variant == TT_PAGE_CHECKPOINT_DUPLICATE) {
+			header->tt_slots[46] = header->tt_slots[4];
+			header->tt_slots[46].wrap++;
+		}
+		UT_ASSERT(cluster_undo_segment_header_seal(f->base.data));
+		if (variant == TT_PAGE_CHECKPOINT_LEGACY)
+			((PageHeader)f->base.data)->pd_checksum = 0;
+		else if (variant == TT_PAGE_CHECKPOINT_CORRUPT)
+			header->tt_slots[4].wrap++;
+		tt_readback_write(513, &f->base, false);
+		tt_redo_seed_recapture(f);
+	}
+	if (variant == TT_PAGE_CREATOR_NO_INIT || checkpoint) {
 		tt_top_tx_frame_bind(&fake, 7, 807, 807, 807);
 		undo_header_feed(f->typed.side_plans[0], &fake, 100);
 	} else
 		tt_post_readback_init(f, 100);
 	tt_top_tx_frame_bind(
-		&fake, variant == TT_PAGE_CREATOR_NO_BIND || variant == TT_PAGE_CREATOR_LATE_BIND ? 5 : 4,
-		variant == TT_PAGE_CREATOR_NO_BIND || variant == TT_PAGE_CREATOR_LATE_BIND ? 805 : 802,
+		&fake, checkpoint || variant == TT_PAGE_CREATOR_NO_BIND
+				   || variant == TT_PAGE_CREATOR_LATE_BIND ? 5 : 4,
+		checkpoint || variant == TT_PAGE_CREATOR_NO_BIND
+			|| variant == TT_PAGE_CREATOR_LATE_BIND ? 805 : 802,
 		variant == TT_PAGE_CREATOR_BIND_ACTOR_CONFLICT ? 803 : InvalidTransactionId,
 		variant == TT_PAGE_CREATOR_BIND_CHILD ? 803 : InvalidTransactionId);
 	undo_header_feed(f->typed.side_plans[0], &fake, 200);
-	if (variant == TT_PAGE_CREATOR_EARLY_COMMIT)
+	if (variant == TT_PAGE_CREATOR_EARLY_COMMIT || variant == TT_PAGE_CHECKPOINT_COMMIT)
 		undo_header_commit(&fake, 0, 802);
 	else if (variant == TT_PAGE_CREATOR_DUPLICATE_BIND)
 		tt_top_tx_frame_bind(&fake, 47, 802, 802, 802);
-	else if (variant == TT_PAGE_CREATOR_EARLY_REUSE) {
+	else if (variant == TT_PAGE_CREATOR_EARLY_REUSE || variant == TT_PAGE_CHECKPOINT_REUSE) {
 		struct {
 			xl_undo_segment_reuse record;
 			uint8 page[BLCKSZ];
@@ -4197,7 +4223,8 @@ tt_page_input_fixture(TtRedoFixture *f, uint8 rmid, uint8 info, TransactionId xi
 		make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_REUSE, &reuse,
 							   sizeof(reuse));
 	} else
-		tt_top_tx_frame_bind(&fake, 47, 804, 804, 804);
+		tt_top_tx_frame_bind(&fake, checkpoint ? 8 : 47, checkpoint ? 808 : 804,
+							 checkpoint ? 808 : 804, checkpoint ? 808 : 804);
 	undo_header_feed(f->typed.side_plans[0], &fake, 300);
 
 	if (rmid == RM_HEAP_ID && (info & XLOG_HEAP_OPMASK) == XLOG_HEAP_DELETE)
@@ -4244,7 +4271,8 @@ tt_page_input_fixture(TtRedoFixture *f, uint8 rmid, uint8 info, TransactionId xi
 	page.component_count = 1;
 	page.components = &component;
 	if (variant == TT_PAGE_CREATOR_LATE_COMMIT
-		|| variant == TT_PAGE_CREATOR_HISTORY_PREFIX_LATE_COMMIT)
+		|| variant == TT_PAGE_CREATOR_HISTORY_PREFIX_LATE_COMMIT
+		|| variant == TT_PAGE_CHECKPOINT_LATE_COMMIT)
 		undo_header_commit(&fake, 0, 802);
 	else if (variant == TT_PAGE_CREATOR_LATE_BIND)
 		tt_top_tx_frame_bind(&fake, 4, 802, 802, 802);
@@ -4468,6 +4496,70 @@ tt_page_actor_expect(const ClusterColdTypedV1 *typed, bool accepted, Transaction
 		UT_ASSERT_EQ(out.key.xid, xid);
 	} else
 		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+}
+
+/* Exercise the public PAGE entries, not an injected producer flag. These
+ * canonical actor inputs are still independent of whole ordinary effects. */
+UT_TEST(tt_page_checkpoint_active_supplies_actor_without_retained_bind)
+{
+	const uint8 rmids[] = { RM_HEAP_ID, RM_HEAP_ID, RM_HEAP_ID, RM_HEAP2_ID,
+							RM_HEAP_ID, RM_HEAP_ID, RM_HEAP_ID, RM_HEAP2_ID };
+	const uint8 infos[] = { XLOG_HEAP_INSERT, XLOG_HEAP_UPDATE, XLOG_HEAP_HOT_UPDATE,
+		XLOG_HEAP2_MULTI_INSERT, XLOG_HEAP_INSERT | XLOG_HEAP_INIT_PAGE,
+		XLOG_HEAP_DELETE, XLOG_HEAP_LOCK, XLOG_HEAP2_LOCK_UPDATED };
+
+	for (unsigned i = 0; i < lengthof(infos); i++) {
+		TtRedoFixture f;
+
+		tt_page_input_fixture(&f, rmids[i], infos[i], 802, InvalidTransactionId,
+							  TT_PAGE_CHECKPOINT, false, 905, 0);
+		if (i < 5)
+			tt_page_creator_expect(&f.typed, true, 802);
+		else
+			tt_page_actor_expect(&f.typed, true, 802);
+		UT_ASSERT_EQ(f.typed.xid_next_after_redo, 0);
+		UT_ASSERT(f.typed.top_tx_census == NULL);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_page_checkpoint_actor_preserves_prefix_and_integrity_refusals)
+{
+	for (int variant = TT_PAGE_CHECKPOINT_LEGACY;
+		 variant <= TT_PAGE_CHECKPOINT_LATE_COMMIT; variant++) {
+		TtRedoFixture f;
+
+		tt_page_creator_fixture(&f, RM_HEAP_ID, XLOG_HEAP_INSERT, 802, 802, variant, false);
+		tt_page_creator_expect(&f.typed, variant == TT_PAGE_CHECKPOINT_LATE_COMMIT, 802);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_page_checkpoint_actor_requires_original_selected_cut_and_top)
+{
+	TtRedoFixture f;
+	TtCheckpointOwnerFixtureV1 saved;
+
+	tt_page_creator_fixture(&f, RM_HEAP_ID, XLOG_HEAP_INSERT, 802, 802,
+							TT_PAGE_CHECKPOINT, false);
+	saved = f.checkpoints[0];
+	f.checkpoints[0].captured = false;
+	tt_page_creator_expect(&f.typed, false, 802);
+	f.checkpoints[0] = saved;
+	f.checkpoints[0].checkpoint.checkpoint.redo++;
+	tt_page_creator_expect(&f.typed, false, 802);
+	f.checkpoints[0] = saved;
+	f.checkpoints[0].checkpoint.source.timeline++;
+	tt_page_creator_expect(&f.typed, false, 802);
+	f.checkpoints[0] = saved;
+	tt_page_creator_expect(&f.typed, true, 802);
+	tt_redo_destroy(&f);
+	for (int fault = 0; fault < 2; fault++) {
+		tt_page_creator_fixture(&f, RM_HEAP_ID, XLOG_HEAP_INSERT, 802, fault ? 803 : 802,
+								TT_PAGE_CHECKPOINT, fault == 0);
+		tt_page_creator_expect(&f.typed, false, 802);
+		tt_redo_destroy(&f);
+	}
 }
 
 UT_TEST(tt_page_actor_uses_own_header_not_payload_xmax)
@@ -7027,7 +7119,10 @@ UT_TEST(tt_top_tx_c0_producer_checks_history_undo_multi_fpi_records)
 /* Append-shaped deltas keep the old record's own identity. An exact native
  * fold/readback must not hide malformed new or inherited records. A captured
  * original block and a source FPI exercise the two existing ancestry paths. */
-enum { TT_UNDO_DELTA_FORMAT, TT_UNDO_DELTA_RAW_ACTOR, TT_UNDO_DELTA_CANONICAL };
+enum {
+	TT_UNDO_DELTA_FORMAT, TT_UNDO_DELTA_RAW_ACTOR, TT_UNDO_DELTA_CANONICAL,
+	TT_UNDO_DELTA_CHECKPOINT
+};
 
 static void
 tt_undo_delta_actor_terminal(FakeXactRecord *fake, bool abort)
@@ -7061,8 +7156,10 @@ static void
 tt_top_tx_undo_fold_records(bool original_base, bool multi, int input_case)
 {
 	bool actor_cases = input_case == TT_UNDO_DELTA_RAW_ACTOR;
-	bool canonical_cases = input_case == TT_UNDO_DELTA_CANONICAL;
-	int fault_count = actor_cases ? (multi ? 6 : 5) : canonical_cases ? 17 : 11;
+	bool checkpoint_cases = input_case == TT_UNDO_DELTA_CHECKPOINT;
+	bool canonical_cases = input_case == TT_UNDO_DELTA_CANONICAL || checkpoint_cases;
+	int fault_count = checkpoint_cases ? 6
+					  : actor_cases ? (multi ? 6 : 5) : canonical_cases ? 17 : 11;
 
 	for (int fault = 0; fault < fault_count; fault++) {
 		TtRedoFixture f;
@@ -7082,30 +7179,40 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi, int input_case)
 		ClusterRecoveryTTAbortV1 shape;
 		ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
 		bool deferred_abort = canonical_cases && fault >= 14;
+		bool unrelated_bind = checkpoint_cases || (canonical_cases && (fault == 1 || fault == 2));
+		TransactionId bind_actor = unrelated_bind ? 805 : 804;
+		TransactionId bind_source = canonical_cases && fault == 12
+			? InvalidTransactionId : bind_actor;
 		XLogRecPtr delta_lsn = deferred_abort ? 800 : canonical_cases ? 600 : 500;
 		uint32 delta_index = original_base ? 3 : 4;
-		bool accepted = actor_cases		  ? fault == 0 || fault == 4
+		bool accepted = checkpoint_cases ? fault == 0 || fault == 5
+						: actor_cases		  ? fault == 0 || fault == 4
 						: canonical_cases ? fault == 0 || fault == 8 || fault == 10 || fault == 11
 												|| fault == 12 || fault == 14 || fault == 15
 										  : fault == 0;
 
 		if (canonical_cases)
 			printf("# UNDO delta canonical multi=%d fault=%d\n", multi, fault);
-		tt_top_tx_initialized_fixture(&f, canonical_cases ? delta_lsn + 100 : 500,
-									  original_base ? 400 : 100, 2);
+		if (checkpoint_cases) {
+			/* The retained prefix starts after this slot's lifecycle image.
+			 * An INIT here would require a retained BIND for every ACTIVE
+			 * slot in the checkpoint, defeating this original-base case. */
+			tt_redo_fixture_with_history_thread(&f, delta_lsn + 200, RF_SIDE_PLAN_RECOVERY,
+												500, 2);
+			tt_top_tx_frame_bind(&fake, 7, 808, 808, 808);
+			undo_header_feed(f.typed.side_plans[0], &fake, 100);
+		} else
+			tt_top_tx_initialized_fixture(&f, canonical_cases ? delta_lsn + 100 : 500,
+											  original_base ? 400 : 100, 2);
 		tt_top_tx_frame_bind(&fake, 4, 802, 802, 802);
 		undo_header_feed(f.typed.side_plans[0], &fake, 200);
-		tt_top_tx_frame_bind(&fake, canonical_cases && (fault == 1 || fault == 2) ? 46 : 47,
-							 canonical_cases && (fault == 1 || fault == 2) ? 805 : 804,
-							 canonical_cases && fault == 12					 ? InvalidTransactionId
-							 : canonical_cases && (fault == 1 || fault == 2) ? 805
-																			 : 804,
-							 canonical_cases && fault == 12					 ? InvalidTransactionId
-							 : canonical_cases && (fault == 1 || fault == 2) ? 805
-																			 : 804);
+		tt_top_tx_frame_bind(&fake, unrelated_bind ? 46 : 47, bind_actor,
+							 bind_source, bind_source);
 		undo_header_feed(f.typed.side_plans[0], &fake, 300);
 		if (canonical_cases) {
-			if (fault == 9)
+			if (checkpoint_cases && (fault == 2 || fault == 3))
+				tt_undo_delta_actor_terminal(&fake, fault == 2);
+			else if (fault == 9)
 				tt_top_tx_frame_bind(&fake, 46, 804, 804, 804);
 			else if (fault == 7 || fault == 10 || deferred_abort)
 				tt_undo_delta_actor_terminal(&fake, fault != 7);
@@ -7178,6 +7285,8 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi, int input_case)
 				memcpy(base.data + old.record_offset, &record, sizeof(record));
 			}
 			UT_ASSERT(cluster_undo_segment_header_seal(f.base.data));
+			if (checkpoint_cases && fault == 1)
+				((PageHeader)f.base.data)->pd_checksum = 0;
 			tt_redo_seed_header(513, &f.base);
 			tt_redo_seed_recapture(&f);
 			tt_undo_readback_cache(&f, 3, 513, 9, &base);
@@ -7196,6 +7305,9 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi, int input_case)
 				other.xid = 805;
 				memcpy(page.data + last.record_offset, &other, sizeof(other));
 			}
+		} else if (checkpoint_cases) {
+			if (fault == 4)
+				record.tt_wrap_plus1++;
 		} else if (canonical_cases) {
 			if (fault == 3)
 				record.tt_slot_segment_id = 514;
@@ -7288,7 +7400,12 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi, int input_case)
 		undo_header_feed(f.typed.side_plans[0], &fake, delta_lsn);
 		memset(fake.data, 0x5a, length);
 		if (canonical_cases) {
-			if (fault == 2)
+			if (checkpoint_cases) {
+				if (fault == 5)
+					tt_undo_delta_actor_terminal(&fake, true);
+				else
+					tt_top_tx_frame_bind(&fake, 44, 807, 807, 807);
+			} else if (fault == 2)
 				tt_top_tx_frame_bind(&fake, 47, 804, 804, 804);
 			else if (fault == 8 || fault == 11)
 				tt_undo_delta_actor_terminal(&fake, fault == 11);
@@ -7351,6 +7468,16 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi, int input_case)
 UT_TEST(tt_top_tx_c0_producer_checks_undo_delta_fold_records)
 {
 	tt_top_tx_undo_fold_records(false, false, TT_UNDO_DELTA_FORMAT);
+}
+
+UT_TEST(tt_top_tx_checkpoint_actor_accepts_only_active_single_delta_prefix)
+{
+	tt_top_tx_undo_fold_records(true, false, TT_UNDO_DELTA_CHECKPOINT);
+}
+
+UT_TEST(tt_top_tx_checkpoint_actor_accepts_only_active_multi_delta_prefix)
+{
+	tt_top_tx_undo_fold_records(true, true, TT_UNDO_DELTA_CHECKPOINT);
 }
 
 UT_TEST(tt_top_tx_c0_producer_checks_undo_multi_delta_fold_records)
@@ -8338,7 +8465,7 @@ UT_TEST(tt_top_tx_census_budget_and_oom_never_publish_a_partial_list)
 int
 main(void)
 {
-	UT_PLAN(175);
+	UT_PLAN(180);
 	UT_RUN(tt_top_tx_census_consumes_native_empty_loser_without_c0_fields);
 	UT_RUN(tt_top_tx_census_retains_all_unproven_active_slots);
 	UT_RUN(tt_top_tx_census_clears_prior_input_on_incomplete_cut);
@@ -8363,6 +8490,8 @@ main(void)
 	UT_RUN(tt_top_tx_c0_producer_checks_original_undo_delta_fold_records);
 	UT_RUN(tt_top_tx_c0_producer_checks_original_undo_multi_delta_fold_records);
 	UT_RUN(tt_top_tx_c0_producer_checks_undo_delta_actor);
+	UT_RUN(tt_top_tx_checkpoint_actor_accepts_only_active_single_delta_prefix);
+	UT_RUN(tt_top_tx_checkpoint_actor_accepts_only_active_multi_delta_prefix);
 	UT_RUN(tt_top_tx_c0_producer_checks_undo_multi_delta_actor);
 	UT_RUN(tt_top_tx_c0_producer_checks_original_undo_delta_actor);
 	UT_RUN(tt_top_tx_c0_producer_checks_original_undo_multi_delta_actor);
@@ -8375,6 +8504,9 @@ main(void)
 	UT_RUN(tt_top_tx_c0_producer_checks_space_frames);
 	UT_RUN(tt_top_tx_c0_producer_checks_history_space_frames);
 	UT_RUN(tt_page_actor_uses_own_header_not_payload_xmax);
+	UT_RUN(tt_page_checkpoint_active_supplies_actor_without_retained_bind);
+	UT_RUN(tt_page_checkpoint_actor_preserves_prefix_and_integrity_refusals);
+	UT_RUN(tt_page_checkpoint_actor_requires_original_selected_cut_and_top);
 	UT_RUN(tt_page_actor_requires_its_causal_canonical_prefix);
 	UT_RUN(tt_page_actor_refuses_unproved_actor_and_non_actor_records);
 	UT_RUN(tt_page_actor_requires_sealed_original_sources_and_clears_output);

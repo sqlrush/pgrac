@@ -12,7 +12,8 @@
  * NOTES
  *    PGRAC-original. Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md
  *    No original bytes are installed. Canonical top qualification consumes
- *    the native BIND producer; all other transaction gates remain separate.
+ *    the native BIND producer or verified original checkpoint ACTIVE input;
+ *    all other transaction gates remain separate.
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -419,6 +420,58 @@ cold_top_tx_key_equal_v1(const ClusterColdTtSlotKeyV1 *left,
 		   && left->slot_wrap == right->slot_wrap;
 }
 
+static bool cold_top_tx_checkpoint_v1(const ClusterColdTypedV1 *typed, uint32 participant);
+
+/* A native canonical ACTIVE slot can predate retained BIND. Only the original
+ * verified checkpoint input supplies this predecessor, never a newly sealed
+ * post-image. Raw xid must identify one ACTIVE slot in this origin; legacy
+ * or corrupt input cannot remove a competing slot from that census. These
+ * are actor inputs, not ordinary-effects or transaction-outcome authority. */
+static const UndoSegmentHeaderData *
+cold_typed_checkpoint_actor_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+							   TransactionId xid, XLogRecPtr read_rec_ptr,
+							   ClusterColdTtSlotKeyV1 *out_key)
+{
+	const UndoSegmentHeaderData *found = NULL;
+	uint32 count = cluster_cold_tt_base_count_v1(typed);
+
+	if (!cold_top_tx_checkpoint_v1(typed, participant)
+		|| read_rec_ptr < typed->participants[participant].native_redo
+		|| !cluster_cold_tt_base_namespace_matches_v1(typed, typed->system_identifier,
+													 typed->observer.database_incarnation))
+		return NULL;
+	for (uint32 i = 0; i < count; i++) {
+		uint8 owner;
+		uint32 segment;
+		const UndoSegmentHeaderData *header;
+		ClusterUndoHeaderIntegrity integrity;
+
+		header = cluster_cold_tt_base_header_v1(typed, i, &owner, &segment);
+		if (header == NULL)
+			return NULL;
+		if (owner != typed->participants[participant].thread_id)
+			continue;
+		integrity = cluster_undo_segment_header_integrity(header);
+		if (integrity == CLUSTER_UNDO_HEADER_CORRUPT
+			|| !UndoSegmentHeader_identity_matches((const char *)header, segment, owner))
+			return NULL;
+		for (uint32 slot = 0; slot < TT_SLOTS_PER_SEGMENT; slot++) {
+			ClusterColdTtSlotInputV1 input;
+
+			if (header->tt_slots[slot].status != TT_SLOT_ACTIVE
+				|| header->tt_slots[slot].xid != xid)
+				continue;
+			if (found != NULL || integrity != CLUSTER_UNDO_HEADER_VALID
+				|| !cluster_cold_tt_base_slot_v1(typed, i, slot, &input)
+				|| !cold_top_tx_key_valid_v1(&input.key))
+				return NULL;
+			*out_key = input.key;
+			found = header;
+		}
+	}
+	return found;
+}
+
 static bool
 cold_typed_actor_binding_v1(const ClusterColdTypedV1 *typed, uint32 participant,
 							XLogRecPtr read_rec_ptr, XLogRecPtr end_rec_ptr,
@@ -430,6 +483,7 @@ cold_typed_actor_binding_v1(const ClusterColdTypedV1 *typed, uint32 participant,
 	const RfSideOnlinePlanV1 *plan;
 	RfSideOnlineOperationV1 prefix;
 	RfSideUndoHeaderImageV1 image;
+	const UndoSegmentHeaderData *base = NULL;
 	const UndoSegmentHeaderData *header;
 	const TTSlot *slot;
 	uint32 count, prefix_index = UINT32_MAX;
@@ -450,7 +504,8 @@ cold_typed_actor_binding_v1(const ClusterColdTypedV1 *typed, uint32 participant,
 	plan = typed->side_plans[participant];
 	count = rf_side_online_plan_operation_count_v1(plan);
 	/* The native publisher accepts only its original top xid. An absent
-	 * xl_top_xid is not itself top proof: the matching BIND supplies it. */
+	 * xl_top_xid is not itself top proof: BIND or the original verified
+	 * checkpoint ACTIVE slot must supply that canonical producer input. */
 	for (uint32 i = 0; i < count; i++) {
 		RfSideOnlineOperationV1 operation;
 		const ClusterUndoDecoded *bind = &operation.undo;
@@ -487,17 +542,24 @@ cold_typed_actor_binding_v1(const ClusterColdTypedV1 *typed, uint32 participant,
 		prefix_index = i;
 		found = true;
 	}
-	if (!found || !cold_top_tx_key_valid_v1(&key))
+	if (!found) {
+		base = cold_typed_checkpoint_actor_v1(typed, participant, source_xid, read_rec_ptr, &key);
+		if (base == NULL)
+			return false;
+	}
+	if (!cold_top_tx_key_valid_v1(&key))
 		return false;
 	/* Native UNDO records carry the binding stamped at append time, but
 	 * abort cleanup can flush their batch after TT_ABORT/native ABORT and
 	 * another slot reuse. Qualify their original BIND's ACTIVE image, not
 	 * the latest TT state at flush. COMMIT drains the batch at precommit,
 	 * so an intervening COMMIT is incompatible with that native producer.
-	 * PAGE still needs ACTIVE immediately before its own WAL record. */
-	if (own_operation != UINT32_MAX && commit_end > prefix.identity.record.end_rec_ptr)
+	 * PAGE and checkpoint-only UNDO both need ACTIVE immediately before
+	 * their WAL record. A checkpoint alone cannot establish append-time
+	 * identity for a batch flushed after abort cleanup. */
+	if (found && own_operation != UINT32_MAX && commit_end > prefix.identity.record.end_rec_ptr)
 		return false;
-	for (uint32 i = 0; own_operation == UINT32_MAX && i < count; i++) {
+	for (uint32 i = 0; (own_operation == UINT32_MAX || !found) && i < count; i++) {
 		RfSideOnlineOperationV1 operation;
 		bool same_segment;
 
@@ -517,13 +579,18 @@ cold_typed_actor_binding_v1(const ClusterColdTypedV1 *typed, uint32 participant,
 			prefix = operation;
 		}
 	}
-	if (prefix_index == UINT32_MAX
-		|| rf_side_online_plan_prepare_undo_record_input_header_v1(plan, prefix_index,
-																   &prefix.identity, NULL, &image)
-			   != RF_PAGE_PROOF_DETAIL_OK
-		|| !image.has_full_image)
-		return false;
-	header = (const UndoSegmentHeaderData *)image.page.data;
+	if (prefix_index == UINT32_MAX) {
+		if (base == NULL)
+			return false;
+		header = base;
+	} else {
+		if (rf_side_online_plan_prepare_undo_record_input_header_v1(
+				plan, prefix_index, &prefix.identity, (const char *)base, &image)
+				!= RF_PAGE_PROOF_DETAIL_OK
+			|| (base == NULL && !image.has_full_image))
+			return false;
+		header = (const UndoSegmentHeaderData *)image.page.data;
+	}
 	slot = &header->tt_slots[key.slot_offset];
 	if (header->wrap_count != key.segment_generation || slot->status != TT_SLOT_ACTIVE
 		|| slot->xid != key.xid || slot->wrap != key.slot_wrap)
