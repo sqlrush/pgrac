@@ -53,6 +53,8 @@ static int error_level;
 static bool authority_held, authority_available, lock_available, local_held;
 static bool fail_assignment;
 static uint64 pending_generation;
+static uint64 authority_pending[2];
+static unsigned int discard_calls[2];
 static FullTransactionId assigned_xid, next_xid;
 static unsigned int sequence, xid_order, lock_order, wal_order, stage_order;
 static unsigned int full_requests, raw_requests, assignments;
@@ -245,7 +247,8 @@ cluster_relmap_authority_read_header(bool shared pg_attribute_unused(),
 	UT_ASSERT(authority_held);
 	memset(out, 0, sizeof(*out));
 	out->committed_generation = 7;
-	out->pending_generation = pending_generation;
+	out->pending_generation = pending_generation ? pending_generation :
+		authority_pending[shared ? 0 : 1];
 	return authority_available;
 }
 
@@ -366,8 +369,23 @@ cluster_relmap_authority_write_pending(bool shared, Oid dbid, const char *image,
 	staged_dbid[stages] = dbid;
 	staged_owner[stages] = *owner;
 	memcpy(&staged_image[stages], image, len);
+	authority_pending[shared ? 0 : 1] = generation;
 	stage_order = ++sequence;
 	stages++;
+}
+
+/* File I/O stays a fixture; the producer and abort callback are real. */
+void
+cluster_relmap_authority_discard_pending(bool shared, Oid dbid, uint64 generation)
+{
+	unsigned int slot = shared ? 0 : 1;
+
+	UT_ASSERT(authority_held && !local_held && CritSectionCount == 0);
+	UT_ASSERT_EQ(dbid, shared ? InvalidOid : MyDatabaseId);
+	UT_ASSERT_EQ(generation, 8);
+	UT_ASSERT_EQ(authority_pending[slot], generation);
+	authority_pending[slot] = 0;
+	discard_calls[slot]++;
 }
 
 void
@@ -403,6 +421,8 @@ reset(bool preassigned)
 	authority_held = local_held = fail_assignment = error_expected = false;
 	authority_available = lock_available = true;
 	pending_generation = 0;
+	memset(authority_pending, 0, sizeof(authority_pending));
+	memset(discard_calls, 0, sizeof(discard_calls));
 	error_level = 0;
 	sequence = xid_order = lock_order = wal_order = stage_order = 0;
 	full_requests = raw_requests = assignments = 0;
@@ -624,10 +644,124 @@ UT_TEST(both_namespaces_share_one_transaction_birth)
 	UT_ASSERT(cluster_relmap_publish_arms[0].armed && cluster_relmap_publish_arms[1].armed);
 }
 
+static void
+check_abort_cleanup(unsigned int expected_shared, unsigned int expected_database)
+{
+	/* AbortTransaction releases LW locks before the relmap abort callback. */
+	if (local_held)
+		LWLockRelease(RelationMappingLock);
+	AtAbort_ClusterRelmapPending();
+	UT_ASSERT_EQ(discard_calls[0], expected_shared);
+	UT_ASSERT_EQ(discard_calls[1], expected_database);
+	UT_ASSERT(!cluster_relmap_publish_arms[0].armed && !cluster_relmap_publish_arms[1].armed);
+	/* The original caller drops global X after pending cleanup returns. */
+	UT_ASSERT(authority_held && !local_held && CritSectionCount == 0);
+	AtAbort_ClusterRelmapPending();
+	UT_ASSERT_EQ(discard_calls[0], expected_shared);
+	UT_ASSERT_EQ(discard_calls[1], expected_database);
+}
+
+static void
+check_single_namespace_abort(bool shared)
+{
+	reset(false);
+	cluster_perform_relmap_update(shared, &updates);
+	UT_ASSERT_EQ(authority_pending[shared ? 0 : 1], 8);
+	check_abort_cleanup(shared ? 1 : 0, shared ? 0 : 1);
+	UT_ASSERT_EQ(authority_pending[0], 0);
+	UT_ASSERT_EQ(authority_pending[1], 0);
+	UT_ASSERT_EQ(stages, 1);
+	UT_ASSERT_EQ(inserts, 1);
+	UT_ASSERT_EQ(sync_commits, 1);
+}
+
+UT_TEST(shared_abort_discards_only_its_staged_namespace) { check_single_namespace_abort(true); }
+UT_TEST(database_abort_discards_only_its_staged_namespace) { check_single_namespace_abort(false); }
+
+UT_TEST(abort_discards_both_staged_namespaces_in_either_producer_order)
+{
+	for (unsigned int first = 0; first < 2; first++)
+	{
+		reset(false);
+		cluster_perform_relmap_update(first == 0, &updates);
+		cluster_perform_relmap_update(first != 0, &updates);
+		UT_ASSERT_EQ(authority_pending[0], 8);
+		UT_ASSERT_EQ(authority_pending[1], 8);
+		check_abort_cleanup(1, 1);
+		UT_ASSERT_EQ(authority_pending[0], 0);
+		UT_ASSERT_EQ(authority_pending[1], 0);
+		UT_ASSERT_EQ(assignments, 1);
+		UT_ASSERT_EQ(stages, 2);
+		UT_ASSERT_EQ(inserts, 2);
+		UT_ASSERT_EQ(sync_commits, 2);
+	}
+}
+
+static void
+check_second_namespace_error(bool first_shared)
+{
+	unsigned int first_slot = first_shared ? 0 : 1;
+	unsigned int second_slot = first_shared ? 1 : 0;
+
+	for (unsigned int fault = 0; fault < 3; fault++)
+	{
+		reset(false);
+		cluster_perform_relmap_update(first_shared, &updates);
+		if (fault == 0)
+			/* A different namespace already has another writer's residue. */
+			authority_pending[second_slot] = 19;
+		else
+		{
+			/* Real owner rejection before WAL, or after flush before stage. */
+			drift_at = fault;
+			drift_kind = 0;
+		}
+		error_expected = true;
+		if (sigsetjmp(error_target, 1) == 0)
+		{
+			cluster_perform_relmap_update(!first_shared, &updates);
+			UT_ASSERT(false);
+		}
+		error_expected = false;
+		UT_ASSERT_EQ(error_level, ERROR);
+		UT_ASSERT_EQ(stages, 1);
+		UT_ASSERT_EQ(preserves, 1);
+		UT_ASSERT_EQ(sync_commits, 1);
+		UT_ASSERT_EQ(inserts, fault == 2 ? 2 : 1);
+		UT_ASSERT_EQ(flushes, inserts);
+		UT_ASSERT(cluster_relmap_publish_arms[first_slot].armed);
+		UT_ASSERT(!cluster_relmap_publish_arms[second_slot].armed);
+		UT_ASSERT_EQ(authority_pending[first_slot], 8);
+		check_abort_cleanup(first_shared ? 1 : 0, first_shared ? 0 : 1);
+		UT_ASSERT_EQ(authority_pending[first_slot], 0);
+		UT_ASSERT_EQ(authority_pending[second_slot], fault == 0 ? 19 : 0);
+		UT_ASSERT_EQ(stages, 1);
+		UT_ASSERT_EQ(inserts, fault == 2 ? 2 : 1);
+		UT_ASSERT_EQ(sync_commits, 1);
+	}
+}
+
+UT_TEST(database_error_still_discards_prior_shared_stage) { check_second_namespace_error(true); }
+UT_TEST(shared_error_still_discards_prior_database_stage) { check_second_namespace_error(false); }
+
+UT_TEST(abort_before_stage_preserves_another_writers_pending)
+{
+	for (unsigned int slot = 0; slot < 2; slot++)
+	{
+		reset(false);
+		authority_pending[slot] = 19;
+		check_error(slot == 0, false);
+		check_abort_cleanup(0, 0);
+		UT_ASSERT_EQ(authority_pending[slot], 19);
+		UT_ASSERT_EQ(authority_pending[1 - slot], 0);
+		UT_ASSERT_EQ(stages, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(19);
 	UT_RUN(shared_assigns_before_lock_and_wal);
 	UT_RUN(database_assigns_before_lock_and_wal);
 	UT_RUN(shared_reuses_existing_full_xid);
@@ -641,6 +775,12 @@ main(void)
 	UT_RUN(original_owner_drift_during_map_read_refuses_before_wal);
 	UT_RUN(original_owner_drift_during_flush_refuses_before_pending);
 	UT_RUN(both_namespaces_share_one_transaction_birth);
+	UT_RUN(shared_abort_discards_only_its_staged_namespace);
+	UT_RUN(database_abort_discards_only_its_staged_namespace);
+	UT_RUN(abort_discards_both_staged_namespaces_in_either_producer_order);
+	UT_RUN(database_error_still_discards_prior_shared_stage);
+	UT_RUN(shared_error_still_discards_prior_database_stage);
+	UT_RUN(abort_before_stage_preserves_another_writers_pending);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
