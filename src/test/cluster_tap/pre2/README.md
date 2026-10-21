@@ -70,6 +70,58 @@ reader does not join processes, sort clocks or produce normalized workload
 events. All results retain `field_root=OPEN`, `identity_bound=false` and
 `ready_to_run=false`; a parsing exit code is not an acceptance verdict.
 
+### Read/image and HOT SQL operations
+
+`WorkloadSql.pm` uses four existing persistent `query_safe` sessions for node
+IDs 0 through 3 in one fresh shared database. Supply dedicated idle sessions
+with autocommit enabled, superuser access and finite query timeouts. The
+module does not form a cluster, open connections or enable trace settings.
+
+```perl
+use WorkloadSql; # add this pre2 directory to @INC
+my $driver = WorkloadSql->new(
+    sessions => \@sessions,
+    schema => 'read_hot_unique_run_name', # must not already exist
+    emit => sub { print {$journal} JSON::PP->new->canonical->encode($_[0]), "\n"
+                  or die "write SQL journal: $!"; },
+    between_lanes => sub { run_caller_owned_itt_barrier(); });
+my $result = $driver->run();
+```
+
+Flush and retain the journal on every attempt, including exceptions. Configure
+each `PostgreSQL::Test::BackgroundPsql` session's finite timeout and call
+`set_query_timer_restart()` before use. The caller closes the sessions and
+performs its cluster shutdown and evidence collection even when `run()` dies.
+The module tries one `ROLLBACK` for each reader it opened, preserves cleanup
+errors with the original failure, and leaves both relations for inspection.
+A failed connection can prevent cleanup acknowledgement; this is a failure,
+and the caller must retain it. The same driver object cannot be run twice.
+
+Node 0 mutates `r_img`, read by node 1; node 2 mutates the separate `h_hot`,
+read by node 3. Both readers hold read-only repeatable-read transactions.
+The module retains each exported snapshot's actual file contents, validates
+its cluster SCN/epoch and backend/database identity, and uses that SCN for
+`cluster_cr_test_image()`. It compares all visible `(id,v)` rows, retaining
+duplicates, across the baseline, ordinary read and FULL reconstruction over
+all relation blocks. H operations include nonindexed-column updates, indexed
+key changes, deletes and VACUUM. Their actual HOT/prune/index-delete decisions
+and remote request/serve paths require independent producer LOG evidence.
+
+The journal retains SQL bytes, raw successful output, hashes, SQL identities
+and client-local sequences. Client sequences are not producer trace sequences;
+SQL identities lack procno/incarnation/request bindings. Counter snapshots are
+node-wide observations, not attribution to this workload. The between-lanes
+hook schedules caller-owned I/TT work; it does not validate that work. Q/receipt,
+run/build/config identity, producer LOG joins and stop seals remain caller
+responsibilities. Results retain `field_root=OPEN`, `trigger_status=UNBOUND`
+and `ready_to_run=false`, including when SQL rows match.
+
+The SQL-boundary unit test uses no database:
+
+```sh
+perl src/test/cluster_tap/pre2/test_workload_sql.pl
+```
+
 ## TAP fixture entrance
 
 The `PostgreSQL::Test::ClusterPRE2` module defaults to the black-box adapter.
