@@ -11,6 +11,7 @@
 
 #include "access/htup_details.h"
 #include "cluster/cluster_space_identity.h"
+#include "cluster/cluster_tx_resolve.h"
 #include "storage/bufpage.h"
 
 /*
@@ -30,6 +31,19 @@ typedef struct ClusterHeapFreezePageInputV1
 	PGAlignedBlock image;
 } ClusterHeapFreezePageInputV1;
 
+#define CLUSTER_HEAP_FREEZE_NO_CARRIER_REQUEST UINT8_MAX
+
+/*
+ * A request about one physical carrier, not a creator or terminal proof.
+ * The page wrap remains in the full carrier witness. The existing origin
+ * resolver must derive the canonical TT wrap from the exact undo record.
+ */
+typedef struct ClusterHeapFreezeCarrierRequestV1
+{
+	ClusterTxLocator locator;
+	ClusterItlSlotData carrier;
+} ClusterHeapFreezeCarrierRequestV1;
+
 /*
  * Physical row inputs only. The tuple-named ITL can describe a later updater,
  * not the creator. Its bytes, including FREE state, never prove provenance.
@@ -47,6 +61,7 @@ typedef struct ClusterHeapFreezeTupleInputV1
 	uint16 infomask2;
 	uint8 header_length;
 	uint8 itl_slot_index;
+	uint8 carrier_request_index;
 	bool has_carrier;
 	ClusterItlSlotData carrier;
 } ClusterHeapFreezeTupleInputV1;
@@ -60,6 +75,8 @@ typedef struct ClusterHeapFreezePageBatchV1
 	SCN page_version;
 	uint16 tuple_count;
 	uint16 multi_tuples;
+	uint8 carrier_request_count;
+	ClusterHeapFreezeCarrierRequestV1 carrier_requests[CLUSTER_ITL_INITRANS_DEFAULT];
 	ClusterHeapFreezeTupleInputV1 tuples[MaxHeapTuplesPerPage];
 } ClusterHeapFreezePageBatchV1;
 
@@ -75,10 +92,13 @@ extern bool cluster_heap_freeze_capture_page_v1(const ClusterSpaceIdentity *iden
 											  ClusterHeapFreezePageInputV1 *out);
 
 /*
- * Expand the immutable image in physical offset order, without resolving or
- * coalescing raw XIDs. Input and output must not overlap. No allocation, I/O,
- * proof lookup or mutation occurs. Failure leaves output unchanged. Success
- * grants no transaction, retention, freeze or final identity-fence authority.
+ * Expand the immutable image in physical offset order. At most one canonical
+ * locator request is prepared for each tuple-named physical ITL slot, with
+ * per-row indexes or NO_CARRIER_REQUEST. No raw-XID coalescing or search occurs.
+ * Even a valid locator with equal raw xmin is not creator/FullXid provenance.
+ * Input and output must not overlap. No allocation, I/O, proof lookup or
+ * mutation occurs. Failure leaves output unchanged. Success grants no
+ * transaction, retention, freeze or final identity-fence authority.
  */
 extern bool cluster_heap_freeze_prepare_page_v1(const ClusterHeapFreezePageInputV1 *input,
 											  ClusterHeapFreezePageBatchV1 *out);

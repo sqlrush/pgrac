@@ -38,6 +38,8 @@
 
 UT_DEFINE_GLOBALS();
 
+#include "test_cluster_vacuum_freeze_locators.inc"
+
 /* Native wrap comparisons are not the consumer under test. */
 bool
 TransactionIdPrecedesOrEquals(TransactionId left, TransactionId right)
@@ -775,10 +777,287 @@ UT_TEST(real_scan_replaces_and_invalidates_prepared_batch)
 	UT_ASSERT(prepared_batch() == NULL);
 }
 
+static void
+make_valid_carrier(Page page, uint8 index, TransactionId xid, uint16 wrap)
+{
+	ClusterItlSlotData *slot = &ClusterPageGetItlSlots(page)[index];
+
+	memset(slot, 0, sizeof(*slot));
+	slot->xid = xid;
+	slot->wrap = wrap;
+	slot->flags = ITL_FLAG_ACTIVE;
+	slot->undo_segment_head = uba_encode(1 + index, 11 + index, 21 + index, 31 + index);
+	slot->write_scn = 100 + index;
+	slot->first_change_lsn = 200 + index;
+}
+
+static void
+name_three_carriers(Page page, uint8 first, uint8 second, uint8 third)
+{
+	const OffsetNumber offsets[] = { 1, 2, 5 };
+	const uint8 indexes[] = { first, second, third };
+
+	for (unsigned i = 0; i < lengthof(offsets); i++)
+		((HeapTupleHeader)PageGetItem(page, PageGetItemId(page, offsets[i])))->t_itl_slot_idx
+			= indexes[i];
+}
+
+UT_TEST(requests_share_only_the_same_physical_carrier)
+{
+	ClusterHeapFreezePageInputV1 input;
+	ClusterHeapFreezePageBatchV1 batch, before;
+	Page page;
+
+	setup(true);
+	make_itl_page();
+	page = (Page)fixture_pages[0].data;
+	name_three_carriers(page, 0, 0, 1);
+	make_valid_carrier(page, 0, 77, TT_WRAP_MAX);
+	make_valid_carrier(page, 1, 77, 2);
+	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&state.identity, 0, page, &input));
+	UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&input, &batch));
+	UT_ASSERT_EQ(batch.carrier_request_count, 2);
+	UT_ASSERT_EQ(batch.tuples[0].carrier_request_index, 0);
+	UT_ASSERT_EQ(batch.tuples[1].carrier_request_index, 0);
+	UT_ASSERT_EQ(batch.tuples[2].carrier_request_index, 1);
+	for (unsigned i = 0; i < 2; i++) {
+		const ClusterHeapFreezeCarrierRequestV1 *request = &batch.carrier_requests[i];
+		ClusterItlSlotData *slot = &ClusterPageGetItlSlots(page)[i];
+
+		UT_ASSERT_EQ(request->locator.xid, 77);
+		UT_ASSERT_EQ(request->locator.itl_slot_index, i);
+		UT_ASSERT_EQ(request->locator.itl_kind, slot->flags);
+		UT_ASSERT_EQ(request->locator.tt_wrap, TT_WRAP_INVALID);
+		UT_ASSERT_EQ(memcmp(&request->locator.uba, &slot->undo_segment_head, sizeof(UBA)), 0);
+		UT_ASSERT_EQ(memcmp(&request->carrier, slot, sizeof(*slot)), 0);
+	}
+	UT_ASSERT_EQ(batch.carrier_requests[0].carrier.wrap, TT_WRAP_MAX);
+	UT_ASSERT_EQ(batch.carrier_requests[1].carrier.wrap, 2);
+	before = batch;
+	memset(&input, 0, sizeof(input));
+	memset(page, 0, BLCKSZ);
+	UT_ASSERT_EQ(memcmp(&batch, &before, sizeof(batch)), 0);
+}
+
+UT_TEST(requests_keep_updater_and_lock_carriers_distinct_from_raw_xmin)
+{
+	ClusterHeapFreezePageInputV1 input;
+	ClusterHeapFreezePageBatchV1 batch;
+	Page page;
+
+	setup(true);
+	make_itl_page();
+	page = (Page)fixture_pages[0].data;
+	name_three_carriers(page, 0, 1, 2);
+	make_valid_carrier(page, 0, 99, 3);
+	make_valid_carrier(page, 1, 7, 4);
+	make_valid_carrier(page, 2, 7, 5);
+	ClusterPageGetItlSlots(page)[1].flags = ITL_FLAG_LOCK_ONLY_COMMITTED;
+	ClusterPageGetItlSlots(page)[2].flags = ITL_FLAG_COMMITTED;
+	ClusterPageGetItlSlots(page)[1].commit_scn = 123;
+	ClusterPageGetItlSlots(page)[2].commit_scn = 124;
+	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&state.identity, 0, page, &input));
+	UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&input, &batch));
+	UT_ASSERT_EQ(batch.carrier_request_count, 3);
+	for (unsigned i = 0; i < 3; i++) {
+		UT_ASSERT_EQ(batch.tuples[i].raw_xmin, 7);
+		UT_ASSERT_EQ(batch.tuples[i].carrier_request_index, i);
+		UT_ASSERT_EQ(batch.carrier_requests[i].locator.xid, i == 0 ? 99 : 7);
+		UT_ASSERT_EQ(batch.carrier_requests[i].locator.tt_wrap, TT_WRAP_INVALID);
+	}
+	UT_ASSERT_EQ(batch.carrier_requests[1].locator.itl_kind, ITL_FLAG_LOCK_ONLY_COMMITTED);
+	UT_ASSERT_EQ(batch.carrier_requests[2].locator.itl_kind, ITL_FLAG_COMMITTED);
+	UT_ASSERT_EQ(memcmp(page, input.image.data, BLCKSZ), 0);
+}
+
+UT_TEST(unusable_carriers_keep_rows_without_a_request)
+{
+	for (unsigned bad = 0; bad < 10; bad++) {
+		ClusterHeapFreezePageInputV1 input;
+		ClusterHeapFreezePageBatchV1 batch;
+		ClusterItlSlotData *slot;
+		Page page;
+
+		setup(true);
+		make_itl_page();
+		page = (Page)fixture_pages[0].data;
+		name_three_carriers(page, 0, 0, 0);
+		make_valid_carrier(page, 0, 77, 3);
+		slot = &ClusterPageGetItlSlots(page)[0];
+		switch (bad) {
+		case 0:
+			slot->flags = ITL_FLAG_FREE;
+			break;
+		case 1:
+			slot->wrap = TT_WRAP_INVALID;
+			break;
+		case 2:
+			memset(&slot->undo_segment_head, 0, sizeof(UBA));
+			break;
+		case 3:
+			slot->undo_segment_head.raw[1] |= UINT64CONST(1) << 32;
+			break;
+		case 4:
+			slot->undo_segment_head.raw[0] = UINT64CONST(11) << 32;
+			break;
+		case 5:
+			slot->undo_segment_head.raw[0] |= UINT32_MAX;
+			break;
+		case 6:
+			slot->undo_segment_head.raw[1] = TT_SLOTS_PER_SEGMENT;
+			break;
+		case 7:
+			slot->flags = ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI;
+			break;
+		case 8:
+			slot->xid = FrozenTransactionId;
+			break;
+		case 9:
+			slot->flags = 255;
+			break;
+		}
+		UT_ASSERT(cluster_heap_freeze_capture_page_v1(&state.identity, 0, page, &input));
+		UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&input, &batch));
+		UT_ASSERT_EQ(batch.tuple_count, 3);
+		UT_ASSERT_EQ(batch.carrier_request_count, 0);
+		for (unsigned i = 0; i < 3; i++) {
+			UT_ASSERT_EQ(batch.tuples[i].carrier_request_index,
+						 CLUSTER_HEAP_FREEZE_NO_CARRIER_REQUEST);
+			UT_ASSERT(batch.tuples[i].has_carrier);
+			UT_ASSERT_EQ(memcmp(&batch.tuples[i].carrier, slot, sizeof(*slot)), 0);
+		}
+	}
+}
+
+UT_TEST(missing_and_unused_carriers_cannot_supply_requests)
+{
+	for (unsigned mode = 0; mode < 3; mode++) {
+		ClusterHeapFreezePageInputV1 input;
+		ClusterHeapFreezePageBatchV1 batch;
+		Page page;
+
+		setup(true);
+		if (mode != 0)
+			make_itl_page();
+		page = (Page)fixture_pages[0].data;
+		if (mode != 0)
+			for (uint8 i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+				make_valid_carrier(page, i, 77, 3);
+		name_three_carriers(page, CLUSTER_ITL_SLOT_UNALLOCATED, CLUSTER_ITL_INITRANS_DEFAULT, 254);
+		/* No-ITL page with a superficially addressable index is still absent. */
+		if (mode == 0)
+			name_three_carriers(page, 0, 0, 0);
+		if (mode == 2)
+			((PageHeader)page)->pd_lower = SizeOfPageHeaderData;
+		UT_ASSERT(cluster_heap_freeze_capture_page_v1(&state.identity, 0, page, &input));
+		UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&input, &batch));
+		UT_ASSERT_EQ(batch.carrier_request_count, 0);
+		UT_ASSERT_EQ(batch.tuple_count, mode == 2 ? 0 : 3);
+		for (unsigned i = 0; i < batch.tuple_count; i++) {
+			UT_ASSERT(!batch.tuples[i].has_carrier);
+			UT_ASSERT_EQ(batch.tuples[i].carrier_request_index,
+						 CLUSTER_HEAP_FREEZE_NO_CARRIER_REQUEST);
+		}
+	}
+}
+
+UT_TEST(request_batch_is_bounded_by_eight_physical_slots)
+{
+	ClusterHeapFreezePageInputV1 input;
+	ClusterHeapFreezePageBatchV1 batch;
+	Page page;
+	PageHeader header;
+	unsigned count = (BLCKSZ - SizeOfPageHeaderData - CLUSTER_ITL_SPECIAL_SIZE)
+					 / (MAXALIGN(SizeofHeapTupleHeader) + sizeof(ItemIdData));
+
+	setup(true);
+	page = (Page)fixture_pages[0].data;
+	memset(page, 0, BLCKSZ);
+	header = (PageHeader)page;
+	header->pd_lower = SizeOfPageHeaderData + count * sizeof(ItemIdData);
+	header->pd_upper = BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE - count * MAXALIGN(SizeofHeapTupleHeader);
+	header->pd_special = BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE;
+	header->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
+	header->pd_flags = PD_HAS_ITL;
+	for (uint8 i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+		make_valid_carrier(page, i, 77, 3 + i);
+	for (OffsetNumber i = 1; i <= count; i++) {
+		ItemId item = PageGetItemId(page, i);
+		HeapTupleHeader tuple;
+
+		ItemIdSetNormal(item, header->pd_special - i * MAXALIGN(SizeofHeapTupleHeader),
+						SizeofHeapTupleHeader);
+		tuple = (HeapTupleHeader)PageGetItem(page, item);
+		tuple->t_hoff = SizeofHeapTupleHeader;
+		tuple->t_itl_slot_idx = (i - 1) % CLUSTER_ITL_INITRANS_DEFAULT;
+	}
+	UT_ASSERT(count <= MaxHeapTuplesPerPage);
+	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&state.identity, 0, page, &input));
+	UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&input, &batch));
+	UT_ASSERT_EQ(batch.tuple_count, count);
+	UT_ASSERT_EQ(batch.carrier_request_count, CLUSTER_ITL_INITRANS_DEFAULT);
+	for (unsigned i = 0; i < count; i++)
+		UT_ASSERT_EQ(batch.tuples[i].carrier_request_index, i % CLUSTER_ITL_INITRANS_DEFAULT);
+	for (unsigned i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		UT_ASSERT_EQ(batch.carrier_requests[i].locator.itl_slot_index, i);
+		UT_ASSERT_EQ(batch.carrier_requests[i].locator.tt_wrap, TT_WRAP_INVALID);
+		UT_ASSERT_EQ(batch.carrier_requests[i].carrier.wrap, 3 + i);
+	}
+}
+
+UT_TEST(real_scan_prepares_owned_requests_and_resets_next_page)
+{
+	for (unsigned cleanup = 0; cleanup < 2; cleanup++) {
+		const ClusterHeapFreezePageBatchV1 *batch;
+		PGAlignedBlock before;
+		Page page;
+
+		setup(cleanup);
+		make_itl_page();
+		page = (Page)fixture_pages[0].data;
+		name_three_carriers(page, 0, 0, 1);
+		make_valid_carrier(page, 0, 77, TT_WRAP_MAX);
+		make_valid_carrier(page, 1, 77, 2);
+		before = fixture_pages[0];
+		lazy_scan_heap(&state);
+		batch = prepared_batch();
+		UT_ASSERT(batch != NULL);
+		if (batch == NULL)
+			continue;
+		UT_ASSERT_EQ(batch->carrier_request_count, 2);
+		UT_ASSERT_EQ(batch->tuples[2].carrier_request_index, 1);
+		UT_ASSERT_EQ(batch->carrier_requests[0].carrier.wrap, TT_WRAP_MAX);
+		UT_ASSERT_EQ(batch->carrier_requests[0].locator.tt_wrap, TT_WRAP_INVALID);
+		UT_ASSERT_EQ(memcmp(&fixture_pages[0], &before, sizeof(before)), 0);
+		UT_ASSERT_EQ(fixture_prune + fixture_noprune + fixture_dirties, 0);
+		UT_ASSERT_EQ(fixture_locks + fixture_pins, 0);
+		fixture_publish_cutoffs(&state);
+		UT_ASSERT_EQ(state.NewRelfrozenXid, InvalidTransactionId);
+		UT_ASSERT_EQ(state.NewRelminMxid, InvalidMultiXactId);
+		state.rel_pages = 2;
+		make_page(1, true, 123);
+		lazy_scan_heap(&state);
+		batch = prepared_batch();
+		UT_ASSERT(batch != NULL);
+		if (batch != NULL) {
+			UT_ASSERT_EQ(batch->block, 1);
+			UT_ASSERT_EQ(batch->carrier_request_count, 0);
+			UT_ASSERT_EQ(batch->tuples[2].carrier_request_index,
+						 CLUSTER_HEAP_FREEZE_NO_CARRIER_REQUEST);
+		}
+		((PageHeader)fixture_pages[1].data)->pd_lower = SizeOfPageHeaderData;
+		lazy_scan_heap(&state);
+		UT_ASSERT(prepared_batch() == NULL);
+		fixture_peer = false;
+		lazy_scan_heap(&state);
+		UT_ASSERT(prepared_batch() == NULL);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(26);
 	UT_RUN(share_scan_preserves_every_reference_before_native_consumer);
 	UT_RUN(cleanup_scan_preserves_before_prune_and_freeze);
 	UT_RUN(raw_multi_value_never_selects_local_reader);
@@ -799,6 +1078,12 @@ main(void)
 	UT_RUN(prepare_rejects_inconsistent_inputs_without_partial_output);
 	UT_RUN(real_scan_consumes_prepared_rows_under_both_original_locks);
 	UT_RUN(real_scan_replaces_and_invalidates_prepared_batch);
+	UT_RUN(requests_share_only_the_same_physical_carrier);
+	UT_RUN(requests_keep_updater_and_lock_carriers_distinct_from_raw_xmin);
+	UT_RUN(unusable_carriers_keep_rows_without_a_request);
+	UT_RUN(missing_and_unused_carriers_cannot_supply_requests);
+	UT_RUN(request_batch_is_bounded_by_eight_physical_slots);
+	UT_RUN(real_scan_prepares_owned_requests_and_resets_next_page);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

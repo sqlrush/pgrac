@@ -9499,10 +9499,19 @@ test_cluster_heap_cr_reuse_scratch.inc: $(top_srcdir)/src/backend/access/heap/he
 test_cluster_vacuum_shared_mx.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c $(srcdir)/extract_vacuum_mx_fixture.py Makefile
 	python3 $(srcdir)/extract_vacuum_mx_fixture.py $< > $@
 
+# The real pure locator builders, including the existing UBA validation.
+test_cluster_vacuum_freeze_locators.inc: $(top_srcdir)/src/backend/cluster/cluster_tx_resolve.c Makefile
+	awk '/^(cluster_tx_locator_from_itl|cluster_tx_locator_from_itl_terminal_census)\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_vacuum_shared_mx: test_cluster_vacuum_shared_mx.c test_cluster_heap_maintenance_policy.inc unit_test.h \
-		$(srcdir)/cluster_vacuum_mx_test_stubs.h test_cluster_vacuum_shared_mx.inc \
+		$(srcdir)/cluster_vacuum_mx_test_stubs.h test_cluster_vacuum_shared_mx.inc test_cluster_vacuum_freeze_locators.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_heap_freeze.c \
 		$(top_srcdir)/src/include/cluster/cluster_heap_freeze.h \
+		$(top_srcdir)/src/include/cluster/cluster_tx_resolve.h \
+		$(top_srcdir)/src/include/cluster/cluster_uba.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
 		$(top_srcdir)/src/include/cluster/cluster_itl_slot.h \
 		$(top_srcdir)/src/include/access/htup_details.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) $< \
