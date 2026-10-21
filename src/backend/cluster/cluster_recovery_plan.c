@@ -42,6 +42,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "access/xloginsert.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_clean_leave.h"
 #include "miscadmin.h"
@@ -812,6 +813,24 @@ cluster_recovery_stamp_inserted_v1(const ClusterRecoveryStampHandleV1 *handle, X
 	return CritSectionCount > 0
 		   && stamp_transition(handle, CLUSTER_RECOVERY_STAMP_INSERTING,
 							   CLUSTER_RECOVERY_STAMP_INSERTED, start, end, false);
+}
+bool
+cluster_recovery_stamp_ctrc_inserted_v2(const ClusterRecoveryStampHandleV1 *handle, XLogRecPtr end)
+{
+	XLogRecPtr start;
+	XLogRecord record;
+
+	/* The native accessor only copies the immediate inserter's header and
+	 * actual positions. It cannot establish the prepared payload's identity
+	 * or the full raw record's CRC/SHA; those remain independent premises. */
+	if (CritSectionCount == 0 || handle == NULL || handle->kind != CLUSTER_RECOVERY_STAMP_D0
+		|| handle->payload_length != CLUSTER_RECOVERY_CTRC_BYTES
+		|| !XLogGetLastInsertRecord(end, &start, &record) || record.xl_rmid != RM_CLUSTER_UNDO_ID
+		|| record.xl_info != CLUSTER_RECOVERY_CTRC_WAL_INFO || TransactionIdIsValid(record.xl_xid)
+		|| record.xl_tot_len
+			   != SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + CLUSTER_RECOVERY_CTRC_BYTES)
+		return false;
+	return cluster_recovery_stamp_inserted_v1(handle, start, end);
 }
 bool
 cluster_recovery_stamp_durable_v1(const ClusterRecoveryStampHandleV1 *handle)

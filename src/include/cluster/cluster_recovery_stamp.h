@@ -86,6 +86,14 @@ extern bool cluster_recovery_stamp_prepare_v1(const ClusterRecoveryStampOwnerV1 
 extern bool cluster_recovery_stamp_inserting_v1(const ClusterRecoveryStampHandleV1 *handle);
 extern bool cluster_recovery_stamp_inserted_v1(const ClusterRecoveryStampHandleV1 *handle,
 											   XLogRecPtr start, XLogRecPtr end);
+/* Dormant D0 adapter: immediately after the original executor's XLogInsert,
+ * bind its returned end and original last-insert header/actual start to this
+ * exact INSERTING window. Refusal leaves the window unchanged and cannot
+ * cancel post-insert duty. The header checks do not prove payload identity,
+ * full raw-record SHA/CRC, owner/graph authority, flush or target durability;
+ * the original inserter and the remaining independent proofs are required. */
+extern bool cluster_recovery_stamp_ctrc_inserted_v2(const ClusterRecoveryStampHandleV1 *handle,
+													XLogRecPtr end);
 /* Only the original executor calls durable after real WAL flush and exact
  * target sync/postread. These APIs record completion, never prove it. */
 extern bool cluster_recovery_stamp_durable_v1(const ClusterRecoveryStampHandleV1 *handle);

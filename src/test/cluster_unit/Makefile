@@ -9912,7 +9912,14 @@ test_cluster_recovery_tt_io: test_cluster_recovery_tt_io.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # PGRAC: real shared stamp owner; immutable claim shape code is linked unchanged.
+test_cluster_recovery_stamp_insert.inc: $(top_srcdir)/src/backend/access/transam/xloginsert.c Makefile
+	awk '/^XLogGetLastInsertRecord\(/ { print "bool"; emit=1; functions++ } \
+         emit { print } /^}/ { emit=0 } \
+         END { if (functions != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_recovery_stamp: test_cluster_recovery_stamp.c unit_test.h \
+        test_cluster_recovery_stamp_insert.inc \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
         $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
@@ -9941,6 +9948,7 @@ test_cluster_checkpoint_stamp_boundary.inc: $(top_srcdir)/src/backend/access/tra
 
 test_cluster_checkpoint_stamp: test_cluster_checkpoint_stamp.c test_cluster_recovery_stamp.c unit_test.h \
         test_cluster_checkpoint_stamp.inc test_cluster_checkpoint_stamp_boundary.inc \
+        test_cluster_recovery_stamp_insert.inc \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
         $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
