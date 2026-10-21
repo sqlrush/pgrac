@@ -2244,11 +2244,16 @@ UT_TEST(test_changed_wal_cannot_rebind_staged_pin)
 }
 
 #include "test_cluster_relmap_runtime_storage.inc"
+#include "test_cluster_relmap_owner_conversion.inc"
 
 int
 main(void)
 {
-	UT_PLAN(75);
+	UT_PLAN(79);
+	UT_RUN(test_owner_conversion_real_pair_preserves_building_directory);
+	UT_RUN(test_owner_conversion_real_pending_refusal_preserves_both_copies);
+	UT_RUN(test_owner_conversion_real_mixed_cut_requires_distinct_retry);
+	UT_RUN(test_owner_conversion_real_final_owner_drift_is_not_rollback);
 	UT_RUN(test_stage_both_copies_before_success);
 	UT_RUN(test_committed_reader_hides_pending_and_rejects_degraded_pair);
 	UT_RUN(test_committed_reader_requires_namespace_x_lock);

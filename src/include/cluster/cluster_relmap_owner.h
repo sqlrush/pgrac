@@ -34,6 +34,18 @@ extern bool cluster_relmap_owner_capture_v2(ClusterRelmapOwnerSampleV2 *out);
  * provenance only, never proves retention, WAL durability, stage or release. */
 extern bool cluster_relmap_owner_matches_v2(const ClusterRelmapOwnerSampleV2 *sample);
 
+/* Dormant clean-v1 conversion, BEFORE RelationMappingLock/WAL/critical work.
+ * Keep this process-local sample immutable and the original transaction/global
+ * relmap X throughout. Derive identity from its qualified native claim and the
+ * actual database namespace; no assignment or caller-provided incarnation.
+ * Both copies must be clean. Conversion syncs backup before primary and then
+ * rechecks the exact original owner. False may follow durable conversion and
+ * is NOT rollback proof. Caller keeps original publishers disabled until the
+ * complete migration succeeds and owns failure handling. No live caller,
+ * retention COMPLETE, stage, release or floor/last-issued permission here. */
+extern bool cluster_relmap_owner_convert_clean_v2(
+	const ClusterRelmapOwnerSampleV2 *sample, bool shared_map);
+
 /* Dormant original terminal caller only, before top FullXid teardown. Same
  * exact backend, FullXid, native writer and global X checks, including during
  * postcommit when IsTransactionState is false. No assignment, terminal

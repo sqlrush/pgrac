@@ -5,6 +5,7 @@
  * Author: SqlRush <sqlrush@gmail.com>
  * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md */
 #include "access/xact.h"
+#include "cluster/cluster_relmap_authority.h"
 #include "cluster/cluster_relmap_lock.h"
 #include "cluster/cluster_relmap_owner.h"
 #include "cluster/cluster_relmap_retention.h"
@@ -22,6 +23,10 @@ static bool relmap_stage_lock_window;
 static unsigned relmap_binding_owner_fault;
 static unsigned relmap_binding_reads;
 static ClusterCanonicalTxnBinding relmap_binding;
+/* This fixture uses the real native writer, with controlled conversion I/O. */
+static ClusterRelmapV2Namespace relmap_conversion_identity;
+static unsigned relmap_conversion_calls, relmap_conversion_drift;
+static bool relmap_conversion_ok;
 
 static void
 relmap_retention_lock_enter(void)
@@ -99,6 +104,25 @@ bool
 cluster_relmap_authority_x_held(void)
 {
 	return relmap_global_x;
+}
+
+bool
+cluster_relmap_authority_v2_convert_clean(const ClusterRelmapV2Namespace *identity)
+{
+	if (relmap_local_lock || CritSectionCount != 0 || !relmap_global_x)
+		abort();
+	relmap_conversion_calls++;
+	relmap_conversion_identity = *identity;
+	if (relmap_conversion_drift == 1) epoch++;
+	if (relmap_conversion_drift == 2) relmap_top_full += UINT64CONST(0x100000000);
+	if (relmap_conversion_drift == 3) MyDatabaseId++;
+	if (relmap_conversion_drift == 4) relmap_global_x = false;
+	if (relmap_conversion_drift == 5) relmap_local_lock = true;
+	if (relmap_conversion_drift == 6) relmap_in_transaction = false;
+	if (relmap_conversion_drift == 7) ShutdownRequestPending = true;
+	if (relmap_conversion_drift == 8) relmap_admission_delta = 1;
+	if (relmap_conversion_drift == 9) ref.claim.claim_sha256[0]++;
+	return relmap_conversion_ok;
 }
 
 #include "../../backend/cluster/cluster_relmap_owner.c"
@@ -414,6 +438,7 @@ relmap_owner_fixture(void)
 	fixture();
 	CritSectionCount = 0;
 	MyProcPid = 79;
+	MyDatabaseId = 42;
 	native_ctl.InsertTimeLineID = 1;
 	relmap_global_x = relmap_in_transaction = true;
 	relmap_local_lock = flush_probe_recovery = false;
@@ -424,6 +449,9 @@ relmap_owner_fixture(void)
 	relmap_active_owner = false;
 	relmap_stage_lock_window = false;
 	relmap_binding_owner_fault = 0;
+	relmap_conversion_calls = relmap_conversion_drift = 0;
+	relmap_conversion_ok = true;
+	memset(&relmap_conversion_identity, 0, sizeof(relmap_conversion_identity));
 	relmap_retention_acquires = relmap_binding_reads = 0;
 	memset(&relmap_binding, 0, sizeof(relmap_binding));
 	relmap_binding.segment_id = 12;
@@ -432,6 +460,75 @@ relmap_owner_fixture(void)
 	relmap_binding.origin_instance = 1;
 	relmap_binding.publish_state = CLUSTER_CANONICAL_TXN_PUBLISHED;
 	relmap_binding.active_lsn = 456;
+}
+
+UT_TEST(test_relmap_conversion_uses_original_claim_and_actual_namespace)
+{
+	for (int shared = 0; shared < 2; shared++) {
+		ClusterRelmapOwnerSampleV2 sample, before;
+		relmap_owner_fixture();
+		/* Shared conversion has no dependency on an attached database. */
+		if (shared) MyDatabaseId = InvalidOid;
+		UT_ASSERT(cluster_relmap_owner_capture_v2(&sample));
+		before = sample;
+		UT_ASSERT(cluster_relmap_owner_convert_clean_v2(&sample, shared));
+		UT_ASSERT_EQ(relmap_conversion_calls, 1);
+		UT_ASSERT_EQ(relmap_conversion_identity.system_identifier,
+			sample.writer.ref.claim.identity.system_identifier);
+		UT_ASSERT_EQ(relmap_conversion_identity.database_incarnation,
+			sample.writer.ref.claim.database_incarnation);
+		UT_ASSERT_EQ(relmap_conversion_identity.dbid, shared ? InvalidOid : MyDatabaseId);
+		UT_ASSERT_EQ(relmap_conversion_identity.shared, shared);
+		UT_ASSERT_EQ(relmap_assign_calls, 1);
+		UT_ASSERT_EQ(memcmp(&sample, &before, sizeof(sample)), 0);
+	}
+}
+
+UT_TEST(test_relmap_conversion_refuses_before_storage_in_unsafe_or_changed_owner)
+{
+	for (unsigned fault = 0; fault < 12; fault++) {
+		ClusterRelmapOwnerSampleV2 sample;
+		relmap_owner_fixture();
+		UT_ASSERT(cluster_relmap_owner_capture_v2(&sample));
+		if (fault == 0) relmap_local_lock = true;
+		if (fault == 1) CritSectionCount = 1;
+		if (fault == 2) relmap_global_x = false;
+		if (fault == 3) relmap_in_transaction = false;
+		if (fault == 4) MyBackendType = B_BG_WRITER;
+		if (fault == 5) epoch++;
+		if (fault == 6) relmap_top_full += UINT64CONST(0x100000000);
+		if (fault == 7) flush_probe_recovery = true;
+		if (fault == 8) MyDatabaseId = InvalidOid;
+		if (fault == 9) relmap_admission_delta = 1;
+		if (fault == 10) sample.producer_pid++;
+		UT_ASSERT(!cluster_relmap_owner_convert_clean_v2(fault == 11 ? NULL : &sample, false));
+		UT_ASSERT_EQ(relmap_conversion_calls, 0);
+		UT_ASSERT_EQ(relmap_assign_calls, 1);
+	}
+}
+
+UT_TEST(test_relmap_conversion_storage_refusal_is_not_permission)
+{
+	ClusterRelmapOwnerSampleV2 sample;
+	relmap_owner_fixture();
+	UT_ASSERT(cluster_relmap_owner_capture_v2(&sample));
+	relmap_conversion_ok = false;
+	UT_ASSERT(!cluster_relmap_owner_convert_clean_v2(&sample, true));
+	UT_ASSERT_EQ(relmap_conversion_calls, 1);
+	UT_ASSERT_EQ(relmap_assign_calls, 1);
+}
+
+UT_TEST(test_relmap_conversion_rechecks_owner_and_database_after_storage)
+{
+	for (unsigned drift = 1; drift <= 9; drift++) {
+		ClusterRelmapOwnerSampleV2 sample;
+		relmap_owner_fixture();
+		UT_ASSERT(cluster_relmap_owner_capture_v2(&sample));
+		relmap_conversion_drift = drift;
+		UT_ASSERT(!cluster_relmap_owner_convert_clean_v2(&sample, false));
+		UT_ASSERT_EQ(relmap_conversion_calls, 1);
+		UT_ASSERT_EQ(relmap_assign_calls, 1);
+	}
 }
 
 UT_TEST(test_relmap_capture_preserves_original_full_identity)

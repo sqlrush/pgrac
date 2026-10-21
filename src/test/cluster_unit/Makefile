@@ -661,6 +661,7 @@ test_cluster_relmap_v2_storage_product.o: $(top_srcdir)/src/backend/cluster/clus
 
 test_cluster_relmap_v2_storage: test_cluster_relmap_v2_storage.c unit_test.h \
 		test_cluster_relmap_runtime_storage.inc \
+		test_cluster_relmap_owner_conversion.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \

@@ -1451,7 +1451,7 @@ UT_TEST(test_requested_flush_rejects_foreign_or_unsafe_context_without_io)
 int
 main(void)
 {
-	UT_PLAN(112);
+	UT_PLAN(116);
 	UT_RUN(test_clean_writer_requires_selected_exit_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_requires_selected_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_keeps_runtime_fence_and_exact_owner_refusals);
@@ -1484,6 +1484,10 @@ main(void)
 	UT_RUN(test_startup_binds_only_revalidated_actual_empty_owner);
 	UT_RUN(test_startup_rejects_changed_selection_route_or_owner);
 	UT_RUN(test_relmap_capture_preserves_original_full_identity);
+	UT_RUN(test_relmap_conversion_uses_original_claim_and_actual_namespace);
+	UT_RUN(test_relmap_conversion_refuses_before_storage_in_unsafe_or_changed_owner);
+	UT_RUN(test_relmap_conversion_storage_refusal_is_not_permission);
+	UT_RUN(test_relmap_conversion_rechecks_owner_and_database_after_storage);
 	UT_RUN(test_relmap_capture_refuses_unsafe_context_before_assigning);
 	UT_RUN(test_relmap_writer_is_sampled_after_original_top_assignment);
 	UT_RUN(test_relmap_invalid_top_or_unqualified_writer_cannot_be_captured);

@@ -10,6 +10,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_relmap_authority.h"
 #include "cluster/cluster_relmap_lock.h"
 #include "cluster/cluster_relmap_owner.h"
 #include "cluster/cluster_relmap_pending_side.h"
@@ -94,6 +95,26 @@ bool
 cluster_relmap_owner_matches_v2(const ClusterRelmapOwnerSampleV2 *sample)
 {
 	return relmap_owner_matches_v2(sample, true);
+}
+
+bool
+cluster_relmap_owner_convert_clean_v2(const ClusterRelmapOwnerSampleV2 *sample, bool shared_map)
+{
+	ClusterRelmapV2Namespace identity = { 0 };
+
+	if (LWLockHeldByMe(RelationMappingLock) || !cluster_relmap_owner_matches_v2(sample)
+		|| (!shared_map && !OidIsValid(MyDatabaseId)))
+		return false;
+	identity.system_identifier = sample->writer.ref.claim.identity.system_identifier;
+	identity.database_incarnation = sample->writer.ref.claim.database_incarnation;
+	identity.dbid = shared_map ? InvalidOid : MyDatabaseId;
+	identity.shared = shared_map;
+	if (!cluster_relmap_authority_v2_convert_clean(&identity))
+		return false;
+	/* I/O may have durably converted both files before an owner change is
+	 * observed. Refusal never proves rollback or enables either publisher. */
+	return !LWLockHeldByMe(RelationMappingLock) && cluster_relmap_owner_matches_v2(sample)
+		&& (shared_map || MyDatabaseId == identity.dbid);
 }
 
 bool
