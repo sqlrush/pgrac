@@ -24,6 +24,7 @@
  *	  - Validate shared heap freeze boundaries using cluster_heap_horizon.
  *	  - Retain a transaction snapshot during shared database maintenance.
  *	  - Use durable legal-next XID age for shared aggressive scans.
+ *	  - Bound shared relfrozenxid merges by a durable FullXid window.
  *
  *-------------------------------------------------------------------------
  */
@@ -57,6 +58,7 @@
 #include "postmaster/interrupt.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
+#include "storage/lwlock.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
@@ -72,6 +74,8 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_heap_horizon.h"
 #include "cluster/cluster_mode.h"
+#include "cluster/cluster_xid_stripe.h"
+#include "cluster/cluster_xid_stripe_boot.h"
 #endif
 
 
@@ -1500,6 +1504,30 @@ vac_update_relstats(Relation relation,
 				futuremxid;
 	TransactionId oldfrozenxid;
 	MultiXactId oldminmulti;
+#ifdef USE_PGRAC_CLUSTER
+	bool		shared_xid = cluster_storage_mode_enabled() && cluster_shared_catalog;
+	FullTransactionId legal_next = InvalidFullTransactionId;
+
+	/*
+	 * Capture the existing durable allocation bound before the inplace lock:
+	 * neither XidGenLock nor the stripe fence belongs under a content lock.
+	 * This retained bound only rejects unprovable catalogue advances.  It is
+	 * not F, a tuple-freeze certificate, or a new permission to advance one.
+	 */
+	if (shared_xid && TransactionIdIsNormal(frozenxid) && cluster_xid_striping &&
+		ShmemVariableCache != NULL)
+	{
+		ClusterXidStripeSampleFence fence;
+		bool		sampled;
+
+		LWLockAcquire(XidGenLock, LW_SHARED);
+		sampled = cluster_xid_stripe_sample_future(ShmemVariableCache->nextXid,
+												 &legal_next, &fence);
+		LWLockRelease(XidGenLock);
+		if (!sampled || !cluster_xid_stripe_sample_fence_current(&fence))
+			legal_next = InvalidFullTransactionId;
+	}
+#endif
 
 	rd = table_open(RelationRelationId, RowExclusiveLock);
 
@@ -1572,8 +1600,10 @@ vac_update_relstats(Relation relation,
 	 *
 	 * PGRAC: a shared catalogue value can legitimately exceed this node's
 	 * local nextXid.  Do not use that local bound to lower the value reread
-	 * under the original current-X/inplace lock.  Shared FullXid legality is
-	 * a separate check; this exception grants no new freeze permission.
+	 * under the original current-X/inplace lock.  Both shared values must
+	 * fit the captured durable FullXid window before a monotone merge.  A
+	 * missing or ambiguous window leaves the XID alone; statistics and MX
+	 * still follow their independent original paths.
 	 */
 	oldfrozenxid = pgcform->relfrozenxid;
 	futurexid = false;
@@ -1583,13 +1613,29 @@ vac_update_relstats(Relation relation,
 	{
 		bool		update = false;
 
+#ifdef USE_PGRAC_CLUSTER
+		if (shared_xid)
+		{
+			FullTransactionId current_full = cluster_xid_widen(oldfrozenxid, legal_next);
+			FullTransactionId proposed_full = cluster_xid_widen(frozenxid, legal_next);
+			uint64		next = U64FromFullTransactionId(legal_next);
+			uint64		current = U64FromFullTransactionId(current_full);
+			uint64		proposed = U64FromFullTransactionId(proposed_full);
+
+			if (FullTransactionIdIsValid(legal_next) &&
+				TransactionIdIsNormal(XidFromFullTransactionId(legal_next)) &&
+				FullTransactionIdIsValid(current_full) &&
+				FullTransactionIdIsValid(proposed_full) &&
+				current <= next && proposed <= next &&
+				next - current < UINT64CONST(0x80000000) &&
+				next - proposed < UINT64CONST(0x80000000))
+				update = current < proposed;
+		}
+		else
+#endif
 		if (TransactionIdPrecedes(oldfrozenxid, frozenxid))
 			update = true;
-		else if (
-#ifdef USE_PGRAC_CLUSTER
-			!(cluster_storage_mode_enabled() && cluster_shared_catalog) &&
-#endif
-			TransactionIdPrecedes(ReadNextTransactionId(), oldfrozenxid))
+		else if (TransactionIdPrecedes(ReadNextTransactionId(), oldfrozenxid))
 			futurexid = update = true;
 
 		if (update)

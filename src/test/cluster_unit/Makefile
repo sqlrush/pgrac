@@ -8913,10 +8913,12 @@ test_cluster_snapshot_admission_vacuum.inc: $(top_srcdir)/src/backend/commands/v
 test_cluster_snapshot_admission: test_cluster_snapshot_admission.c unit_test.h \
 		$(srcdir)/test_cluster_snapshot_vacuum_fixture.inc test_cluster_snapshot_admission_vacuum.inc \
 		test_cluster_snapshot_admission_horizon.inc test_cluster_snapshot_admission_refresh.inc \
+		$(top_srcdir)/src/include/cluster/cluster_xid_stripe.h \
+		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h $(CLUSTER_XID_STRIPE_O) \
 		$(top_srcdir)/src/backend/utils/time/snapmgr.c $(top_srcdir)/src/include/utils/snapmgr.h \
 		$(top_builddir)/src/backend/lib/pairingheap.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
-		$(top_builddir)/src/backend/lib/pairingheap.o \
+		$(top_builddir)/src/backend/lib/pairingheap.o $(CLUSTER_XID_STRIPE_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # PGRAC: original sender and finite local report sampler, not a model of them.

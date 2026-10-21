@@ -25,12 +25,16 @@
 #include "access/multixact.h"
 #include "access/table.h"
 #include "catalog/pg_database.h"
+#include "cluster/cluster_xid_stripe.h"
+#include "cluster/cluster_xid_stripe_boot.h"
 #include "commands/vacuum.h"
 #include "storage/lmgr.h"
+#include "storage/lwlock.h"
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
 
 bool cluster_shared_catalog = true;
+bool cluster_xid_striping = true;
 int XactIsoLevel = XACT_READ_COMMITTED;
 Oid MyDatabaseId = 42;
 
@@ -53,6 +57,14 @@ static bool vacuum_no_tables;
 static bool vacuum_class_returned;
 static TransactionId vacuum_next_xid;
 static TransactionId vacuum_inplace_frozenxid;
+static VariableCacheData vacuum_cache;
+VariableCache ShmemVariableCache = &vacuum_cache;
+static LWLockPadded vacuum_locks[NUM_INDIVIDUAL_LWLOCKS];
+LWLockPadded *MainLWLockArray = vacuum_locks;
+static bool vacuum_xid_lock, vacuum_inplace_lock;
+static bool vacuum_promise_ready, vacuum_promise_current, vacuum_revoke_on_release;
+static uint64 vacuum_legal_next;
+static unsigned vacuum_sample_reads, vacuum_fence_reads;
 static Snapshot vacuum_seen_active;
 static struct RelationData vacuum_relation;
 static HeapTupleData vacuum_class_tuple, vacuum_database_tuple;
@@ -64,6 +76,50 @@ static union {
 	max_align_t alignment;
 	char bytes[MAXALIGN(SizeofHeapTupleHeader) + sizeof(FormData_pg_database)];
 } vacuum_database_storage;
+
+/* Durable lease and locks are leaves; FullXid widening is linked product code. */
+bool
+LWLockAcquire(LWLock *lock, LWLockMode mode)
+{
+	UT_ASSERT(lock == XidGenLock && mode == LW_SHARED);
+	UT_ASSERT(!vacuum_xid_lock && !vacuum_inplace_lock);
+	vacuum_xid_lock = true;
+	return true;
+}
+
+void
+LWLockRelease(LWLock *lock)
+{
+	UT_ASSERT(lock == XidGenLock && vacuum_xid_lock);
+	vacuum_xid_lock = false;
+	if (vacuum_revoke_on_release)
+		vacuum_promise_current = false;
+}
+
+bool
+cluster_xid_stripe_sample_future(FullTransactionId reference, FullTransactionId *future,
+								 ClusterXidStripeSampleFence *fence)
+{
+	UT_ASSERT(vacuum_xid_lock && !vacuum_inplace_lock);
+	UT_ASSERT_EQ(U64FromFullTransactionId(reference), vacuum_next_xid);
+	vacuum_sample_reads++;
+	*future = InvalidFullTransactionId;
+	memset(fence, 0, sizeof(*fence));
+	if (!vacuum_promise_ready)
+		return false;
+	*future = FullTransactionIdFromU64(vacuum_legal_next);
+	fence->incarnation = 81;
+	return true;
+}
+
+bool
+cluster_xid_stripe_sample_fence_current(const ClusterXidStripeSampleFence *fence)
+{
+	UT_ASSERT(!vacuum_xid_lock && !vacuum_inplace_lock);
+	UT_ASSERT_EQ(fence->incarnation, 81);
+	vacuum_fence_reads++;
+	return vacuum_promise_current;
+}
 
 static void
 vacuum_inject(VacuumFault point)
@@ -205,6 +261,7 @@ systable_inplace_update_begin(Relation relation, Oid index, bool index_ok, Snaps
 			((Form_pg_database)GETSTRUCT(*tuple))->datfrozenxid = vacuum_inplace_frozenxid;
 	}
 	*state = &vacuum_relation;
+	vacuum_inplace_lock = true;
 }
 
 void
@@ -212,12 +269,14 @@ systable_inplace_update_finish(void *state, HeapTuple tuple)
 {
 	vacuum_inject(VAC_FAULT_FINISH);
 	vacuum_finishes++;
+	vacuum_inplace_lock = false;
 }
 
 void
 systable_inplace_update_cancel(void *state)
 {
 	vacuum_cancels++;
+	vacuum_inplace_lock = false;
 }
 
 void
@@ -275,7 +334,7 @@ vacuum_reset(void)
 	UT_ASSERT(!ActiveSnapshotSet());
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	AtEOXact_Snapshot(false, true);
-	cluster_enabled = cluster_shared_catalog = true;
+	cluster_enabled = cluster_shared_catalog = cluster_xid_striping = true;
 	vacuum_fault = VAC_FAULT_NONE;
 	vacuum_injected_code = ERRCODE_QUERY_CANCELED;
 	vacuum_pushes = vacuum_pops = vacuum_begins = vacuum_finishes = 0;
@@ -283,6 +342,13 @@ vacuum_reset(void)
 	vacuum_no_tables = false;
 	vacuum_class_returned = false;
 	vacuum_next_xid = 200;
+	vacuum_cache.nextXid = FullTransactionIdFromU64(200);
+	ShmemVariableCache = &vacuum_cache;
+	vacuum_legal_next = 200;
+	vacuum_xid_lock = vacuum_inplace_lock = false;
+	vacuum_promise_ready = vacuum_promise_current = true;
+	vacuum_revoke_on_release = false;
+	vacuum_sample_reads = vacuum_fence_reads = 0;
 	vacuum_inplace_frozenxid = InvalidTransactionId;
 	vacuum_seen_active = NULL;
 	memset(&vacuum_class_storage, 0, sizeof(vacuum_class_storage));
@@ -538,6 +604,8 @@ UT_TEST(vacuum_shared_relstats_retains_native_wrap_order)
 
 		vacuum_reset();
 		vacuum_next_xid = old_epoch ? 30 : 0xfffffff0U;
+		vacuum_cache.nextXid = FullTransactionIdFromU64(vacuum_next_xid);
+		vacuum_legal_next = old_epoch ? UINT64CONST(0x10000001e) : UINT64CONST(0xfffffff0);
 		vacuum_inplace_frozenxid = current;
 		relation = (Form_pg_class)GETSTRUCT(&vacuum_class_tuple);
 		vac_update_relstats(&vacuum_relation, 0, 0, 0, false, candidate, InvalidMultiXactId,
@@ -606,6 +674,174 @@ UT_TEST(vacuum_nontarget_frozen_merge_keeps_native_repair)
 		UT_ASSERT_EQ(database->datfrozenxid, 80);
 		UT_ASSERT_EQ(vacuum_finishes, 2);
 		UT_ASSERT_EQ(vacuum_truncates, 1);
+		UT_ASSERT_EQ(vacuum_sample_reads + vacuum_fence_reads, 0);
 		vacuum_abort();
 	}
+}
+
+UT_TEST(vacuum_relstats_rejects_future_candidate)
+{
+	bool updated = true;
+	Form_pg_class relation;
+
+	vacuum_reset();
+	relation = (Form_pg_class)GETSTRUCT(&vacuum_class_tuple);
+	vac_update_relstats(&vacuum_relation, 0, 0, 0, false, 201, InvalidMultiXactId,
+						&updated, NULL, false);
+	UT_ASSERT_EQ(relation->relfrozenxid, 80);
+	UT_ASSERT(!updated);
+	UT_ASSERT_EQ(vacuum_finishes, 0);
+	UT_ASSERT_EQ(vacuum_cancels, 1);
+	vacuum_abort();
+}
+
+UT_TEST(vacuum_relstats_rejects_future_locked_current)
+{
+	bool updated = true;
+	Form_pg_class relation;
+
+	vacuum_reset();
+	vacuum_inplace_frozenxid = 250;
+	relation = (Form_pg_class)GETSTRUCT(&vacuum_class_tuple);
+	vac_update_relstats(&vacuum_relation, 0, 0, 0, false, 260, InvalidMultiXactId,
+						&updated, NULL, false);
+	UT_ASSERT_EQ(relation->relfrozenxid, 250);
+	UT_ASSERT(!updated);
+	UT_ASSERT_EQ(vacuum_cancels, 1);
+	vacuum_abort();
+}
+
+UT_TEST(vacuum_relstats_rejects_half_space_current)
+{
+	bool updated = true;
+	Form_pg_class relation;
+
+	vacuum_reset();
+	vacuum_legal_next = UINT64CONST(0x1000000c8);
+	vacuum_inplace_frozenxid = 0x800000c8U;
+	relation = (Form_pg_class)GETSTRUCT(&vacuum_class_tuple);
+	vac_update_relstats(&vacuum_relation, 0, 0, 0, false, 0x800000c9U, InvalidMultiXactId,
+						&updated, NULL, false);
+	UT_ASSERT_EQ(relation->relfrozenxid, 0x800000c8U);
+	UT_ASSERT(!updated);
+	UT_ASSERT_EQ(vacuum_cancels, 1);
+	vacuum_abort();
+}
+
+UT_TEST(vacuum_relstats_missing_promise_preserves_xid)
+{
+	bool updated = true;
+	Form_pg_class relation;
+
+	vacuum_reset();
+	vacuum_promise_ready = false;
+	relation = (Form_pg_class)GETSTRUCT(&vacuum_class_tuple);
+	vac_update_relstats(&vacuum_relation, 0, 0, 0, false, 120, InvalidMultiXactId,
+						&updated, NULL, false);
+	UT_ASSERT_EQ(relation->relfrozenxid, 80);
+	UT_ASSERT(!updated);
+	UT_ASSERT_EQ(vacuum_sample_reads, 1);
+	UT_ASSERT_EQ(vacuum_fence_reads, 0);
+	UT_ASSERT_EQ(vacuum_cancels, 1);
+	vacuum_abort();
+}
+
+UT_TEST(vacuum_relstats_revoked_promise_preserves_xid)
+{
+	bool updated = true;
+	Form_pg_class relation;
+
+	vacuum_reset();
+	vacuum_revoke_on_release = true;
+	relation = (Form_pg_class)GETSTRUCT(&vacuum_class_tuple);
+	vac_update_relstats(&vacuum_relation, 0, 0, 0, false, 120, InvalidMultiXactId,
+						&updated, NULL, false);
+	UT_ASSERT_EQ(relation->relfrozenxid, 80);
+	UT_ASSERT(!updated);
+	UT_ASSERT_EQ(vacuum_sample_reads, 1);
+	UT_ASSERT_EQ(vacuum_fence_reads, 1);
+	UT_ASSERT_EQ(vacuum_cancels, 1);
+	vacuum_abort();
+}
+
+UT_TEST(vacuum_relstats_invalid_reference_and_current_preserve_xid)
+{
+	for (int invalid = 0; invalid < 4; invalid++) {
+		bool updated = true;
+		Form_pg_class relation;
+
+		vacuum_reset();
+		if (invalid == 0)
+			vacuum_legal_next = 0;
+		else if (invalid == 1)
+			vacuum_legal_next = UINT64CONST(0x100000002);
+		else if (invalid == 2)
+			vacuum_inplace_frozenxid = FrozenTransactionId;
+		else
+			ShmemVariableCache = NULL;
+		relation = (Form_pg_class)GETSTRUCT(&vacuum_class_tuple);
+		vac_update_relstats(&vacuum_relation, 0, 0, 0, false, 120, InvalidMultiXactId,
+							&updated, NULL, false);
+		UT_ASSERT_EQ(relation->relfrozenxid, invalid == 2 ? FrozenTransactionId : 80);
+		UT_ASSERT(!updated);
+		UT_ASSERT_EQ(vacuum_cancels, 1);
+		vacuum_abort();
+	}
+}
+
+UT_TEST(vacuum_relstats_uses_durable_legal_bound)
+{
+	bool updated = false;
+	Form_pg_class relation;
+
+	vacuum_reset();
+	vacuum_legal_next = 10000;
+	relation = (Form_pg_class)GETSTRUCT(&vacuum_class_tuple);
+	vac_update_relstats(&vacuum_relation, 0, 0, 0, false, 9000, InvalidMultiXactId,
+						&updated, NULL, false);
+	UT_ASSERT_EQ(relation->relfrozenxid, 9000);
+	UT_ASSERT(updated);
+	UT_ASSERT_EQ(vacuum_sample_reads, 1);
+	UT_ASSERT_EQ(vacuum_fence_reads, 1);
+	UT_ASSERT_EQ(vacuum_finishes, 1);
+	UT_ASSERT(!vacuum_xid_lock && !vacuum_inplace_lock);
+	vacuum_abort();
+}
+
+UT_TEST(vacuum_relstats_unknown_window_keeps_stats_and_mx)
+{
+	bool updated = true, multi_updated = false;
+	Form_pg_class relation;
+
+	vacuum_reset();
+	vacuum_promise_ready = false;
+	relation = (Form_pg_class)GETSTRUCT(&vacuum_class_tuple);
+	relation->relminmxid = 300;
+	vac_update_relstats(&vacuum_relation, 5, 20, 2, false, 120, 80, &updated,
+						&multi_updated, false);
+	UT_ASSERT_EQ(relation->relfrozenxid, 80);
+	UT_ASSERT(!updated && multi_updated);
+	UT_ASSERT_EQ(relation->relpages, 5);
+	UT_ASSERT_EQ(relation->reltuples, 20);
+	UT_ASSERT_EQ(relation->relallvisible, 2);
+	UT_ASSERT_EQ(relation->relminmxid, 80);
+	UT_ASSERT_EQ(vacuum_finishes, 1);
+	UT_ASSERT_EQ(vacuum_cancels, 0);
+	UT_ASSERT_EQ(vacuum_truncates, 0);
+	vacuum_abort();
+}
+
+UT_TEST(vacuum_relstats_accepts_legal_next_boundary)
+{
+	bool updated = false;
+	Form_pg_class relation;
+
+	vacuum_reset();
+	relation = (Form_pg_class)GETSTRUCT(&vacuum_class_tuple);
+	vac_update_relstats(&vacuum_relation, 0, 0, 0, false, 200, InvalidMultiXactId,
+						&updated, NULL, false);
+	UT_ASSERT_EQ(relation->relfrozenxid, 200);
+	UT_ASSERT(updated);
+	UT_ASSERT_EQ(vacuum_finishes, 1);
+	vacuum_abort();
 }
