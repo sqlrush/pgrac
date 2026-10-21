@@ -3412,26 +3412,78 @@ cluster_undo_block_fetch_for_visibility(int origin_node, UBA uba, char *out_page
 }
 
 /*
+ * Read a bounded set of exact slots from one owner-served header image.
+ * Keep results private until every item matches; a refused batch must not
+ * leak a preceding item's fact or an authority left by a failed fetch.
+ * COMMITTED is still precommit evidence, not C1b finalization.
+ */
+bool
+cluster_runtime_visibility_remote_exact_tt_batch(int origin_node, uint32 segment_id,
+												 uint32 segment_generation,
+												 const ClusterVisTtExactRequest *requests,
+												 uint32 request_count, ClusterVisTtExactBatch *out)
+{
+	PGAlignedBlock page;
+	ClusterVisTtExactBatch batch;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || requests == NULL || request_count == 0
+		|| request_count > CLUSTER_VIS_TT_EXACT_BATCH_MAX || !cluster_crossnode_runtime_visibility
+		|| origin_node < 0 || origin_node >= CLUSTER_MAX_NODES || origin_node == cluster_node_id
+		|| segment_id == 0 || segment_id > UINT16_MAX || segment_generation == UINT32_MAX)
+		return false;
+
+	/* Validate the whole bounded input before entering the CR provider. */
+	for (uint32 i = 0; i < request_count; i++) {
+		if (requests[i].slot_offset >= TT_SLOTS_PER_SEGMENT
+			|| !TransactionIdIsNormal(requests[i].xid) || requests[i].slot_wrap > TT_WRAP_MAX)
+			return false;
+	}
+
+	memset(&batch, 0, sizeof(batch));
+	if (!cluster_undo_block_fetch_for_visibility(origin_node, uba_encode(segment_id, 0, 0, 0),
+												 page.data, &batch.authority))
+		return false;
+
+	for (uint32 i = 0; i < request_count; i++) {
+		batch.proofs[i] = cluster_vis_tt_block_exact_proof(
+			page.data, segment_id, (uint8)((uint32)origin_node + 1), segment_generation,
+			requests[i].slot_offset, requests[i].xid, requests[i].slot_wrap, &batch.commit_scns[i]);
+		if (batch.proofs[i] == CLUSTER_VIS_TT_PROOF_NONE)
+			return false;
+	}
+
+	batch.count = request_count;
+	*out = batch;
+	return true;
+}
+
+/*
  * cluster_runtime_visibility_remote_exact_tt_proof
  *
  * 2.14 M1 level-3 authority-separated leg.  The transaction owner serves
  * its undo segment header through the ordinary block-0 CR path above; that
  * path already pairs one wire fetch (or one same-epoch cache hit) with the
  * live authority trailer.  We then validate the exact segment generation and
- * TT slot identity supplied by the caller.  No raw-xid scan or terminal memo
- * is used, so a recycled carrier cannot alias an old reference.  The caller
- * still applies the authority/SCN gate and any lazy cleanout policy.
+ * TT slot identity supplied by the caller through the bounded batch provider.
+ * No raw-xid scan or terminal memo is used.  The caller still establishes
+ * provenance and applies C1b finalization, authority/SCN and final identity
+ * gates before any lazy cleanout.
  */
 bool
-cluster_runtime_visibility_remote_exact_tt_proof(
-	int origin_node, uint32 segment_id, uint32 segment_generation, uint16 slot_offset,
-	TransactionId xid, uint16 slot_wrap, ClusterVisTtProof *proof_out, SCN *commit_scn_out,
-	ClusterLiveAuthority *auth_out)
+cluster_runtime_visibility_remote_exact_tt_proof(int origin_node, uint32 segment_id,
+												 uint32 segment_generation, uint16 slot_offset,
+												 TransactionId xid, uint16 slot_wrap,
+												 ClusterVisTtProof *proof_out, SCN *commit_scn_out,
+												 ClusterLiveAuthority *auth_out)
 {
-	PGAlignedBlock page;
-	ClusterLiveAuthority auth;
-	ClusterVisTtProof proof;
-	SCN commit_scn = InvalidScn;
+	const ClusterVisTtExactRequest request = {
+		.slot_offset = slot_offset,
+		.xid = xid,
+		.slot_wrap = slot_wrap,
+	};
+	ClusterVisTtExactBatch batch;
 
 	if (proof_out != NULL)
 		*proof_out = CLUSTER_VIS_TT_PROOF_NONE;
@@ -3440,28 +3492,16 @@ cluster_runtime_visibility_remote_exact_tt_proof(
 	if (auth_out != NULL)
 		memset(auth_out, 0, sizeof(*auth_out));
 
-	if (proof_out == NULL || commit_scn_out == NULL || auth_out == NULL
-		|| !cluster_crossnode_runtime_visibility || origin_node < 0
-		|| origin_node >= CLUSTER_MAX_NODES || origin_node == cluster_node_id
-		|| segment_id == 0 || segment_id > UINT16_MAX
-		|| segment_generation == UINT32_MAX || slot_offset >= TT_SLOTS_PER_SEGMENT
-		|| !TransactionIdIsNormal(xid) || slot_wrap > TT_WRAP_MAX)
+	if (proof_out == NULL || commit_scn_out == NULL || auth_out == NULL)
 		return false;
 
-	memset(&auth, 0, sizeof(auth));
-	if (!cluster_undo_block_fetch_for_visibility(
-			origin_node, uba_encode(segment_id, 0, 0, 0), page.data, &auth))
+	if (!cluster_runtime_visibility_remote_exact_tt_batch(origin_node, segment_id,
+														  segment_generation, &request, 1, &batch))
 		return false;
 
-	proof = cluster_vis_tt_block_exact_proof(
-		page.data, segment_id, (uint8)((uint32)origin_node + 1), segment_generation,
-		slot_offset, xid, slot_wrap, &commit_scn);
-	if (proof == CLUSTER_VIS_TT_PROOF_NONE)
-		return false;
-
-	*proof_out = proof;
-	*commit_scn_out = commit_scn;
-	*auth_out = auth;
+	*proof_out = batch.proofs[0];
+	*commit_scn_out = batch.commit_scns[0];
+	*auth_out = batch.authority;
 	return true;
 }
 

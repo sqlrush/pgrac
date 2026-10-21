@@ -412,6 +412,39 @@ extern ClusterVisTtProof cluster_vis_tt_block_exact_proof(
 	uint32 expected_segment_generation, uint16 expected_slot_offset,
 	TransactionId expected_xid, uint16 expected_wrap, SCN *out_commit_scn);
 
+/* A local, bounded same-header batch; no wire or persistent layout. */
+#define CLUSTER_VIS_TT_EXACT_BATCH_MAX CLUSTER_ITL_INITRANS_DEFAULT
+
+typedef struct ClusterVisTtExactRequest {
+	uint16 slot_offset;
+	TransactionId xid;
+	uint16 slot_wrap;
+} ClusterVisTtExactRequest;
+
+typedef struct ClusterVisTtExactBatch {
+	uint32 count;
+	ClusterVisTtProof proofs[CLUSTER_VIS_TT_EXACT_BATCH_MAX];
+	SCN commit_scns[CLUSTER_VIS_TT_EXACT_BATCH_MAX];
+	ClusterLiveAuthority authority;
+} ClusterVisTtExactBatch;
+
+/*
+ * Read 1..CLUSTER_VIS_TT_EXACT_BATCH_MAX exact slots from the same owner,
+ * segment and generation with one ordinary header CR fetch (or cache hit).
+ * Validate the entire request before fetching.  True publishes all results
+ * in request order; any missing/mismatching fact refuses the complete batch
+ * and zeroes out.  Input and output must not overlap.  Equal xids are never
+ * coalesced: each slot/wrap is checked independently against the same bytes.
+ *
+ * These are TT facts, not row terminal verdicts: COMMITTED remains precommit
+ * evidence requiring the origin's C1b finalization.  The caller must still
+ * establish canonical provenance, authority/admission, SCN and final identity
+ * fences.  No terminal memo, retention handoff or cleanout is performed here.
+ */
+extern bool cluster_runtime_visibility_remote_exact_tt_batch(
+	int origin_node, uint32 segment_id, uint32 segment_generation,
+	const ClusterVisTtExactRequest *requests, uint32 request_count, ClusterVisTtExactBatch *out);
+
 /*
  * 2.14 M1 level-3 authority-separated proof.  Fetch the transaction owner's
  * TT/undo segment header with one ordinary CR request (or the same-epoch

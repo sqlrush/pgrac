@@ -818,6 +818,26 @@ test_cluster_runtime_visibility: test_cluster_runtime_visibility.c unit_test.h $
 		$(CLUSTER_VERSION_O) $(CLUSTER_RUNTIME_VIS_POLICY_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+# Execute the actual bounded header provider and its single-entry consumer.
+TESTS += test_cluster_tt_exact_batch
+
+test_cluster_tt_exact_batch.inc: $(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c Makefile
+	awk '/^(cluster_runtime_visibility_remote_exact_tt_batch|cluster_runtime_visibility_remote_exact_tt_proof)\(/ \
+	     { print previous; emit=1; found++ } emit { print } /^}/ { emit=0 } \
+	     { previous=$$0 } END { if (found != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_tt_exact_batch: test_cluster_tt_exact_batch.c unit_test.h \
+		test_cluster_tt_exact_batch.inc $(CLUSTER_RUNTIME_VIS_POLICY_O) \
+		$(top_srcdir)/src/include/cluster/cluster_conf.h \
+		$(top_srcdir)/src/include/cluster/cluster_runtime_visibility.h \
+		$(top_srcdir)/src/include/cluster/cluster_itl_slot.h \
+		$(top_srcdir)/src/include/cluster/cluster_uba.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_RUNTIME_VIS_POLICY_O) \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
 # Exercise the original requester branch and live membership wrapper, with
 # proof/transport boundaries supplied by the fixture rather than copied logic.
 test_cluster_tt_terminal_route.inc: $(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c \
