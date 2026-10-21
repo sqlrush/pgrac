@@ -426,3 +426,49 @@ cluster_heap_freeze_validate_canonical_proof_v1(
 
 	return CLUSTER_HEAP_FREEZE_PROOF_PROVEN;
 }
+
+ClusterHeapFreezeProofStatusV1
+cluster_heap_freeze_validate_proof_batch_v1(
+	const ClusterHeapFreezeProofBatchV1 *batch)
+{
+	ClusterHeapFreezeProofStatusV1 status;
+	bool saw_retry = false;
+	bool saw_unproven = false;
+	const ClusterHeapFreezeCanonicalProofV1 *first;
+
+	if (batch == NULL)
+		return CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR;
+	if (batch->proof_count == 0)
+		return CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
+	if (batch->proof_count > CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH)
+		return CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR;
+
+	/* Validate every member before comparing the common fence. */
+	for (uint8 index = 0; index < batch->proof_count; index++)
+	{
+		status = cluster_heap_freeze_validate_canonical_proof_v1(&batch->proofs[index]);
+		if (status == CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR)
+			return status;
+		if (status == CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED)
+			saw_retry = true;
+		if (status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN)
+			saw_unproven = true;
+	}
+	if (saw_retry)
+		return CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
+	if (saw_unproven)
+		return CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
+
+	first = &batch->proofs[0];
+	for (uint8 index = 1; index < batch->proof_count; index++)
+	{
+		const ClusterHeapFreezeCanonicalProofV1 *proof = &batch->proofs[index];
+
+		/* Distinct final fences make a one-shot apply ambiguous. */
+		if (!freeze_final_fence_equal(&first->expected_fence, &proof->expected_fence)
+			|| !freeze_final_fence_equal(&first->current_fence, &proof->current_fence))
+			return CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR;
+	}
+
+	return CLUSTER_HEAP_FREEZE_PROOF_PROVEN;
+}

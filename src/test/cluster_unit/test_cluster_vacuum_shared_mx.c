@@ -1931,10 +1931,48 @@ UT_TEST(unproven_tt_and_snapshot_never_admit_freeze)
 					 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
 }
 
+UT_TEST(proof_batch_is_all_or_nothing_for_conditional_apply)
+{
+	ClusterHeapFreezeCanonicalProofV1 first;
+	ClusterHeapFreezeCanonicalProofV1 second;
+	ClusterHeapFreezeProofBatchV1 batch;
+
+	init_canonical_proof_fixture(&first);
+	second = first;
+	memset(&batch, 0, sizeof(batch));
+	batch.proof_count = 2;
+	batch.proofs[0] = first;
+	batch.proofs[1] = second;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_proof_batch_v1(&batch),
+					 CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+
+	/* One missing proof keeps the whole conditional apply blocked. */
+	batch.proofs[1].c1b_finalized = false;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_proof_batch_v1(&batch),
+					 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+
+	/* A changed current fence retries the whole batch, without partial apply. */
+	batch.proofs[1] = second;
+	batch.proofs[1].current_fence.holder_sequence++;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_proof_batch_v1(&batch),
+					 CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+
+	/* Individually valid proofs with different fences are ambiguous. */
+	batch.proofs[1] = second;
+	batch.proofs[1].expected_fence.block++;
+	batch.proofs[1].current_fence.block++;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_proof_batch_v1(&batch),
+					 CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR);
+
+	batch.proof_count = 0;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_proof_batch_v1(&batch),
+					 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+}
+
 int
 main(void)
 {
-	UT_PLAN(59);
+	UT_PLAN(60);
 	UT_RUN(share_scan_preserves_every_reference_before_native_consumer);
 	UT_RUN(cleanup_scan_preserves_before_prune_and_freeze);
 	UT_RUN(raw_multi_value_never_selects_local_reader);
@@ -1994,6 +2032,7 @@ main(void)
 	UT_RUN(canonical_proof_requires_exact_row_identity_and_c1b);
 	UT_RUN(final_fence_mismatch_retries_without_proof);
 	UT_RUN(unproven_tt_and_snapshot_never_admit_freeze);
+	UT_RUN(proof_batch_is_all_or_nothing_for_conditional_apply);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

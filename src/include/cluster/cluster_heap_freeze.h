@@ -146,6 +146,20 @@ typedef struct ClusterHeapFreezeCanonicalProofV1
 } ClusterHeapFreezeCanonicalProofV1;
 
 /*
+ * One bounded proof batch feeds one caller-owned conditional-apply attempt.
+ * Every member must describe the same final page fence; no member is merged
+ * by raw XID or treated as a page mutation permission.  The bound keeps the
+ * proof transport finite and matches the existing per-page ITL request bound.
+ */
+#define CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH CLUSTER_ITL_INITRANS_DEFAULT
+
+typedef struct ClusterHeapFreezeProofBatchV1
+{
+	uint8 proof_count;
+	ClusterHeapFreezeCanonicalProofV1 proofs[CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH];
+} ClusterHeapFreezeProofBatchV1;
+
+/*
  * Caller supplies a previously validated live SPACE identity and already
  * holds the source page's original share/cleanup content lock. Source and
  * output must not overlap. No allocation, I/O, buffer acquisition or proof
@@ -196,5 +210,18 @@ extern bool cluster_heap_freeze_prepare_page_v1(const ClusterHeapFreezePageInput
 extern ClusterHeapFreezeProofStatusV1
 cluster_heap_freeze_validate_canonical_proof_v1(
 	const ClusterHeapFreezeCanonicalProofV1 *proof);
+
+/*
+ * Validate a whole bounded batch before one conditional apply.  All members
+ * must independently be PROVEN and carry one identical expected/current
+ * fence.  A missing member keeps the caller unproven, a changed fence retries
+ * the whole batch, and an ambiguous or malformed batch is a hard error.
+ * This is a pure predicate: it performs no I/O, locking, WAL, page mutation,
+ * authority transfer or retention advance, and it never partially applies a
+ * batch.
+ */
+extern ClusterHeapFreezeProofStatusV1
+cluster_heap_freeze_validate_proof_batch_v1(
+	const ClusterHeapFreezeProofBatchV1 *batch);
 
 #endif /* CLUSTER_HEAP_FREEZE_H */
