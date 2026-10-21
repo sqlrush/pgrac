@@ -3510,6 +3510,119 @@ UT_TEST(tt_top_tx_c0_producer_refuses_unqualified_raw_base)
 	tt_redo_destroy(&f);
 }
 
+UT_TEST(tt_top_tx_checkpoint_does_not_qualify_old_active_without_bind)
+{
+	for (int older = 0; older < 2; older++) {
+		TtRedoFixture f;
+		FakeXactRecord fake;
+		RfPageOnlineRecordIdentityV1 identity;
+		RfDetachedRecordPlanV1 record;
+		PGAlignedBlock header;
+		RfSideUndoHeaderImageV1 folded;
+		ClusterColdTtSlotInputV1 before, after;
+		ClusterColdTopTxProofV1 proof;
+		ClusterRecoveryTTAbortV1 shape;
+		ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
+		uint32 segment = older ? 768 : 513;
+		uint32 index;
+		char path[MAXPGPATH];
+
+		tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+		if (older) {
+			/* A second physical file, not an allocator's current segment. */
+			header = f.base;
+			((UndoSegmentHeaderData *)header.data)->segment_id = segment;
+			((UndoSegmentHeaderData *)header.data)->wrap_count = 17;
+			((UndoSegmentHeaderData *)header.data)->tt_slots[47].first_undo_block
+				= (UBA)InvalidUba_init;
+			tt_readback_write(segment, &header, true);
+			tt_redo_seed_recapture(&f);
+		}
+		UT_ASSERT_NOT_NULL(cluster_cold_tt_header_find_v1(&f.typed, false, 3, segment, &index));
+		UT_ASSERT(cluster_cold_tt_base_slot_v1(&f.typed, index, 4, &before));
+		UT_ASSERT_EQ(before.key.segment_generation, older ? 17 : 0);
+		/* The original capture/fold/readback can preserve a pre-redo ACTIVE
+		 * without any lifecycle WAL. A NOOP fills the complete replay cut;
+		 * none of those APIs qualifies the old ACTIVE base. */
+		make_projection_record(&fake, RM_XLOG_ID, XLOG_NOOP, NULL, 0);
+		fake.u.decoded.max_block_id = -1;
+		fake.u.decoded.header.xl_xid = fake.u.decoded.toplevel_xid = InvalidTransactionId;
+		identity = make_identity(&fake, f.typed.observer.storage_uuid);
+		set_identity_range(&fake, &identity, 100, 200);
+		record = make_projection_record_plan(&fake);
+		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(f.typed.side_plans[0], &record, &identity),
+					 RF_PAGE_PROOF_DETAIL_OK);
+		tt_redo_seal(&f);
+		UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(f.typed.side_plans[0]), 1);
+		UT_ASSERT(cluster_cold_typed_tt_redo_header_v1(&f.typed, 0, index, &folded));
+		UT_ASSERT_EQ(folded.operation_count, 0);
+		UT_ASSERT(!folded.has_full_image);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT_NOT_NULL(cluster_cold_tt_header_find_v1(&f.typed, true, 3, segment, &index));
+		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, index, 4, &after));
+		UT_ASSERT(memcmp(&after, &before, sizeof(after)) == 0);
+		UT_ASSERT(cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+		f.typed.xid_next_after_redo = UINT64_C(0x700400200);
+		tt_top_tx_c0_inputs(&f, &after, &proof, &shape);
+		tt_top_tx_effects_complete(&f);
+		tt_top_tx_endpoints_complete(&f);
+		memset(&out, 0xa9, sizeof(out));
+		UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
+															&shape, false, InvalidTransactionId,
+															UINT64_C(0x12345678), &out));
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		if (older) {
+			snprintf(path, sizeof(path), "%s/%u", tt_redo_dir, segment);
+			UT_ASSERT_EQ(unlink(path), 0);
+		}
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_top_tx_checkpoint_source_does_not_authenticate_raw_base_bytes)
+{
+	for (int field = 0; field < 2; field++) {
+		TtRedoFixture f;
+		TtCheckpointOwnerFixtureV1 checkpoint;
+		UndoSegmentHeaderData *header;
+		ClusterColdTtSlotInputV1 input;
+		ClusterColdTopTxProofV1 proof;
+		ClusterRecoveryTTAbortV1 shape;
+		ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
+
+		tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+		checkpoint = f.checkpoints[0];
+		header = (UndoSegmentHeaderData *)f.base.data;
+		/* Deliberately change a byte before capture, keeping legal layout.
+		 * The original codec does not authenticate pd_checksum or an old
+		 * slot's xid. Stable file readback cannot detect this mutation. */
+		if (field == 0)
+			header->pd_checksum ^= 1;
+		else
+			header->tt_slots[47].xid ^= 1;
+		tt_readback_write(513, &f.base, false);
+		tt_redo_seed_recapture(&f);
+		tt_top_tx_seal_bound(&f, 100);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_recheck_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+		UT_ASSERT(memcmp(&checkpoint, &f.checkpoints[0], sizeof(checkpoint)) == 0);
+		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &input));
+		f.typed.xid_next_after_redo = UINT64_C(0x700400200);
+		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+		tt_top_tx_effects_complete(&f);
+		tt_top_tx_endpoints_complete(&f);
+		memset(&out, 0xa9, sizeof(out));
+		/* This is the existing unqualified-base refusal, not a claim that
+		 * the C0 producer detected the changed byte or verified a CRC. */
+		UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
+															&shape, false, InvalidTransactionId,
+															UINT64_C(0x12345678), &out));
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		tt_redo_destroy(&f);
+	}
+}
+
 UT_TEST(tt_top_tx_c0_producer_refuses_exact_historical_terminal)
 {
 	for (int carrier = 0; carrier < 2; carrier++) {
@@ -7636,7 +7749,7 @@ UT_TEST(tt_top_tx_c0_producer_rechecks_before_output)
 int
 main(void)
 {
-	UT_PLAN(162);
+	UT_PLAN(164);
 	UT_RUN(tt_after_redo_checks_canonical_active_undo_chain_input);
 	UT_RUN(tt_after_redo_checks_spill_active_undo_chain_input);
 	UT_RUN(tt_after_redo_checks_canonical_active_undo_head_input);
@@ -7676,6 +7789,8 @@ main(void)
 	UT_RUN(tt_top_tx_c0_producer_derives_base_from_native_full_image);
 	UT_RUN(tt_top_tx_c0_producer_derives_base_from_native_reuse);
 	UT_RUN(tt_top_tx_c0_producer_refuses_unqualified_raw_base);
+	UT_RUN(tt_top_tx_checkpoint_does_not_qualify_old_active_without_bind);
+	UT_RUN(tt_top_tx_checkpoint_source_does_not_authenticate_raw_base_bytes);
 	UT_RUN(tt_top_tx_c0_producer_derives_current_original_isolation);
 	UT_RUN(tt_top_tx_c0_producer_requires_current_execution_owner);
 	UT_RUN(tt_top_tx_c0_producer_rechecks_physical_header_inventory);
