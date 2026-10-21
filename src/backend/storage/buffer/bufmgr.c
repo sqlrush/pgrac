@@ -4749,6 +4749,15 @@ cluster_buffer_trace_tx_wait(ClusterWaitTraceSite site, uint64 wait_seq,
 	summary.x_holder = summary.pending_requester = -1;
 	summary.round_requester = summary.head_requester = -1;
 	summary.holder_node = summary.holder_proc = UINT32_MAX;
+	/* TX summaries do not have a PCM authority projection at this call site.
+	 * Keep the Oracle-shaped blocker fields explicitly unknown instead of
+	 * emitting zeroes that could be mistaken for a real session or request. */
+	summary.blocking_instance = summary.blocking_session = summary.blocking_pid = -1;
+	summary.final_blocking_instance = summary.final_blocking_session = summary.final_blocking_pid = -1;
+	summary.master_holder_instance = summary.master_holder_session = summary.master_holder_pid = -1;
+	summary.master_request = summary.master_head_request = 0;
+	summary.blocking_known = summary.final_blocking_known = summary.master_holder_known = false;
+	summary.master_head_known = summary.master_request_head_known = false;
 	for (unsigned i = 0; i < lengthof(PrivateRefCountArray); i++) {
 		const PrivateRefCountEntry *ref = &PrivateRefCountArray[i];
 		if (ref->refcount > 0) {

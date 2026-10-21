@@ -129,6 +129,14 @@ int main(void) {
 	resource.refusal_reason = 3; resource.refusal_token = 126;
 	resource.refusal_flags = 4; resource.refusal_pins = 5; resource.refusal_io = true;
 	resource.transport_known = true;
+	resource.blocking_instance = 4; resource.blocking_session = 9; resource.blocking_pid = 5555;
+	resource.blocking_known = true;
+	resource.final_blocking_instance = 5; resource.final_blocking_session = 10; resource.final_blocking_pid = 6666;
+	resource.final_blocking_known = true;
+	resource.master_holder_instance = 4; resource.master_holder_session = 9; resource.master_holder_pid = 5555;
+	resource.master_holder_known = true;
+	resource.master_request = 130; resource.master_head_request = 131;
+	resource.master_head_known = true; resource.master_request_head_known = true;
 	cluster_wait_trace_emit(CLWAIT_PCM_WAIT, &resource);
 	assert(strstr(last, "event=PCM_WAIT") && strstr(last, "actor_node=2 pid=1234"));
 	assert(strstr(last, "tag_known=1 spc=11 db=22 rel=33 fork=2 block=44"));
@@ -148,6 +156,20 @@ int main(void) {
 	assert(strstr(last, "continuation_reservation=123 continuation_claim_pending=124 continuation_claim_reservation=125"));
 	assert(strstr(last, "guard=3 guard_result=2 refusal_reason=3 refusal_token=126"));
 	assert(strstr(last, "refusal_flags=00000004 refusal_pins=5 refusal_io=1"));
+	assert(strstr(last, "blocking_instance=4 blocking_session=9 blocking_pid=5555 blocking_known=1"));
+	assert(strstr(last, "final_blocking_instance=5 final_blocking_session=10 final_blocking_pid=6666 final_blocking_known=1"));
+	assert(strstr(last, "master_holder_instance=4 master_holder_session=9 master_holder_pid=5555 master_holder_known=1"));
+	assert(strstr(last, "master_request=130 master_head_request=131 master_head_known=1 master_request_head_known=1"));
+	/* Unknown projections must remain explicit sentinels on every emitter. */
+	resource.blocking_known = resource.final_blocking_known = resource.master_holder_known = false;
+	resource.master_head_known = resource.master_request_head_known = false;
+	before = logs;
+	cluster_wait_trace_emit(CLWAIT_TX_SUMMARY, &resource);
+	assert(logs == before + 1);
+	assert(strstr(last, "blocking_instance=-1 blocking_session=-1 blocking_pid=-1 blocking_known=0"));
+	assert(strstr(last, "final_blocking_instance=-1 final_blocking_session=-1 final_blocking_pid=-1 final_blocking_known=0"));
+	assert(strstr(last, "master_holder_instance=-1 master_holder_session=-1 master_holder_pid=-1 master_holder_known=0"));
+	assert(strstr(last, "master_request=0 master_head_request=0 master_head_known=0 master_request_head_known=0"));
 	resource.master_view = true;
 	cluster_wait_trace_emit(CLWAIT_PCM_ADMISSION, &resource);
 	assert(strstr(last, "event=PCM_ADMISSION") && strstr(last, "master_view=1"));

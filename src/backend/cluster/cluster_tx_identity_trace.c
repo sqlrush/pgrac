@@ -65,6 +65,11 @@ cluster_wait_trace_emit(ClusterWaitTraceKind kind, const ClusterWaitTrace *row)
 		"queue_kind=%d phase=%d round_phase=%d owner_phase=%d progress=%08x incompatible=%08x blocked=%08x "
 		"round_request=" UINT64_FORMAT " round_requester=%d head_request=" UINT64_FORMAT " head_requester=%d "
 		"holder_node=%u holder_proc=%u holder_epoch=" UINT64_FORMAT " holder_request=" UINT64_FORMAT " "
+		"blocking_instance=%d blocking_session=%d blocking_pid=%d blocking_known=%d "
+		"final_blocking_instance=%d final_blocking_session=%d final_blocking_pid=%d final_blocking_known=%d "
+		"master_holder_instance=%d master_holder_session=%d master_holder_pid=%d master_holder_known=%d "
+		"master_request=" UINT64_FORMAT " master_head_request=" UINT64_FORMAT " master_head_known=%d "
+		"master_request_head_known=%d "
 		"buffer=%d private_pins=%d shared_pins=%d content_held=%d ledger_phase=%d "
 		"buffer_state=%08x own_state=%d buffer_type=%d own_flags=%08x "
 		"own_generation=" UINT64_FORMAT " reservation=" UINT64_FORMAT " "
@@ -94,6 +99,19 @@ cluster_wait_trace_emit(ClusterWaitTraceKind kind, const ClusterWaitTrace *row)
 		row->owner_phase, row->progress, row->incompatible, row->blocked,
 		row->round_request, row->round_requester, row->head_request, row->head_requester,
 		row->holder_node, row->holder_proc, row->holder_epoch, row->holder_request,
+		row->blocking_known ? row->blocking_instance : -1,
+		row->blocking_known ? row->blocking_session : -1,
+		row->blocking_known ? row->blocking_pid : -1, row->blocking_known,
+		row->final_blocking_known ? row->final_blocking_instance : -1,
+		row->final_blocking_known ? row->final_blocking_session : -1,
+		row->final_blocking_known ? row->final_blocking_pid : -1,
+		row->final_blocking_known,
+		row->master_holder_known ? row->master_holder_instance : -1,
+		row->master_holder_known ? row->master_holder_session : -1,
+		row->master_holder_known ? row->master_holder_pid : -1,
+		row->master_holder_known, row->master_holder_known ? row->master_request : 0,
+		row->master_head_known ? row->master_head_request : 0,
+		row->master_head_known, row->master_request_head_known,
 		row->buffer, row->private_pins, row->shared_pins, row->content_held, row->ledger_phase,
 		row->buffer_state, row->own_state, row->buffer_type, row->own_flags,
 		row->own_generation, row->reservation, row->writer_activation, row->rx_activation,

@@ -69,6 +69,7 @@
 #include "storage/buf_internals.h"
 #include "storage/condition_variable.h" /* PGRAC: spec-2.31 D1 — wait_cv */
 #include "storage/lwlock.h"
+#include "storage/proc.h"
 #include "storage/shmem.h"
 #include "storage/spin.h"
 #include "utils/elog.h"
@@ -10345,6 +10346,37 @@ pcm_trace_match_keys(ClusterWaitTrace *row)
 		&& row->ingress_connection == row->head_ingress_connection;
 }
 
+/* A holder projection is a blocker identity only when its full local key is
+ * present.  In particular, UINT32_MAX procno and zero/sentinel generations
+ * are placeholders from an incomplete cut, not Oracle-style blocker fields. */
+static bool
+pcm_trace_holder_identity_known(const ClusterGrdHolderId *holder)
+{
+	return holder != NULL
+		&& holder->node_id < RESOURCE_X_PROTOCOL_NODE_LIMIT
+		&& holder->procno != UINT32_MAX
+		&& holder->cluster_epoch != 0
+		&& holder->cluster_epoch != UINT64_MAX
+		&& holder->request_id != 0
+		&& holder->request_id != UINT64_MAX;
+}
+
+static int32
+pcm_trace_holder_pid(const ClusterGrdHolderId *holder)
+{
+	PGPROC *proc;
+
+	if (!pcm_trace_holder_identity_known(holder)
+		|| holder->node_id != (uint32) cluster_node_id
+		|| ProcGlobal == NULL
+		|| holder->procno >= ProcGlobal->allProcCount)
+		return -1;
+	proc = &ProcGlobal->allProcs[holder->procno];
+	if (proc->pgprocno != holder->procno || proc->pid <= 0)
+		return -1;
+	return (int32) proc->pid;
+}
+
 /* Opt-in observations only. Callers retain their pinned entry, but have
  * released entry_lock. Never wait for that lock or log while holding it.
  * Local projections are not remote master truth; master_view is reserved
@@ -10380,6 +10412,12 @@ pcm_trace_wait(struct GrdEntry *entry, ClusterWaitTraceSite site, PcmLockMode mo
 	row.state = row.phase = row.round_phase = row.owner_phase = -1;
 	row.round_requester = row.head_requester = row.round_master = -1;
 	row.holder_node = row.holder_proc = UINT32_MAX;
+	row.blocking_instance = row.blocking_session = row.blocking_pid = -1;
+	row.final_blocking_instance = row.final_blocking_session = row.final_blocking_pid = -1;
+	row.master_holder_instance = row.master_holder_session = row.master_holder_pid = -1;
+	row.master_request = row.master_head_request = 0;
+	row.blocking_known = row.final_blocking_known = row.master_holder_known = false;
+	row.master_head_known = row.master_request_head_known = false;
 	row.tag = entry->tag;
 	row.tag_known = true;
 	row.binding = entry->binding_generation;
@@ -10404,6 +10442,17 @@ pcm_trace_wait(struct GrdEntry *entry, ClusterWaitTraceSite site, PcmLockMode mo
 	row.holder_proc = entry->master_holder.procno;
 	row.holder_epoch = entry->master_holder.cluster_epoch;
 	row.holder_request = entry->master_holder.request_id;
+	if (pcm_trace_holder_identity_known(&entry->master_holder)) {
+		row.blocking_instance = (int32) entry->master_holder.node_id;
+		row.blocking_session = (int32) entry->master_holder.procno;
+		row.blocking_pid = pcm_trace_holder_pid(&entry->master_holder);
+		row.blocking_known = true;
+		row.master_holder_instance = (int32) entry->master_holder.node_id;
+		row.master_holder_session = (int32) entry->master_holder.procno;
+		row.master_holder_pid = row.blocking_pid;
+		row.master_holder_known = true;
+		row.master_request = entry->master_holder.request_id;
+	}
 	round = &entry->resource_x_bootstrap_round;
 	row.round_phase = round->phase;
 	row.owner_phase = entry->resource_x_local_owner.state;
@@ -10432,6 +10481,10 @@ pcm_trace_wait(struct GrdEntry *entry, ClusterWaitTraceSite site, PcmLockMode mo
 			row.head_requester_connection = head->requester_connection_generation;
 			row.head_ingress_connection = head->sender_connection_generation;
 			row.head_request = head->assertion_sequence;
+			row.master_head_request = head->assertion_sequence;
+			row.master_head_known = head->assertion_sequence != 0
+				&& head->assertion_sequence != UINT64_MAX;
+			row.master_request_head_known = row.master_holder_known && row.master_head_known;
 			row.head_requester = head_node;
 			row.head = head->head_transition_generation;
 			row.enqueue_order = head->enqueue_order;

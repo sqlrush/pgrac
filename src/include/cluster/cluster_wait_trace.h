@@ -47,6 +47,7 @@ typedef struct ClusterWaitTrace {
 	uint64 wire_sender_connection;
 	uint64 own_generation, reservation, writer_activation, rx_activation;
 	uint64 holder_epoch, holder_request;
+	uint64 master_request, master_head_request;
 	uint64 round_request, head_request;
 	/* Caller key above is captured with the wait predicate. The following
 	 * projections are sampled later and must never overwrite that key. */
@@ -69,10 +70,15 @@ typedef struct ClusterWaitTrace {
 	int32 state, x_holder, pending_requester, phase, round_phase, owner_phase;
 	int32 round_requester, head_requester;
 	int32 round_master, guard, guard_result, refusal_reason;
+	int32 blocking_instance, blocking_session, blocking_pid;
+	int32 final_blocking_instance, final_blocking_session, final_blocking_pid;
+	int32 master_holder_instance, master_holder_session, master_holder_pid;
 	int32 buffer, private_pins, shared_pins, ledger_phase, own_state, buffer_type;
 	bool tag_known, entry_known, request_known, master_view, content_held;
 	bool round_request_known, head_request_known, caller_matches_round, caller_matches_head;
 	bool continuation_known, refusal_io, transport_known;
+	bool blocking_known, final_blocking_known, master_holder_known;
+	bool master_head_known, master_request_head_known;
 } ClusterWaitTrace;
 
 extern uint64 cluster_wait_trace_begin(ClusterWaitTraceKind kind);
