@@ -1730,28 +1730,179 @@ UT_TEST(test_restore_exact_original_origin_and_epoch_zero)
 	UT_ASSERT_EQ(writes, 0);
 }
 
-UT_TEST(test_restore_legal_stage_publish_discard_cuts_keep_pending)
+UT_TEST(test_committed_rebuild_at_legal_stage_publish_discard_cuts)
 {
-	ClusterRelmapV2Image image = staged_image();
-	ClusterRelmapRetentionDirectory storage[2], *directories[2];
+	for (int shared = 0; shared <= 1; shared++) {
+		ClusterRelmapV2Namespace ns = identity;
+		ClusterRelmapV2Image image = staged_image();
+		ClusterRelmapPendingDescriptor descriptors[2];
 
-	for (int kind = 0; kind < 3; kind++) {
-		setup(&identity);
-		if (kind == 0) {
-			fail_rename = 2;
-			UT_ASSERT(!stage(&identity));
-		} else {
-			UT_ASSERT(stage(&identity));
-			reset_io();
-			fail_rename = 2;
-			UT_ASSERT_EQ(finish(&image, kind == 1), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+		ns.shared = shared;
+		ns.dbid = shared ? InvalidOid : 42;
+		image.identity = ns;
+		memset(descriptors, 0, sizeof(descriptors));
+		for (size_t i = 0; i < lengthof(descriptors); i++) {
+			descriptors[i].kind = i == 0
+				? CLUSTER_RELMAP_PENDING_DROP : CLUSTER_RELMAP_PENDING_TRUNCATE;
+			descriptors[i].identity.system_identifier = ns.system_identifier;
+			descriptors[i].identity.database_incarnation = ns.database_incarnation;
+			memset(descriptors[i].identity.storage_uuid, 0xd6 + i,
+				   sizeof(descriptors[i].identity.storage_uuid));
+			descriptors[i].identity.locator.spcOid = shared
+				? GLOBALTABLESPACE_OID : (i == 0 ? DEFAULTTABLESPACE_OID : 9000);
+			descriptors[i].identity.locator.dbOid = ns.dbid;
+			descriptors[i].identity.locator.relNumber = 12006 + i;
 		}
-		reset_io();
-		restore_builders(storage, directories);
-		UT_ASSERT_EQ(cluster_relmap_retention_restore_namespace(&identity, directories, 2), RESTORE_OK);
-		UT_ASSERT_EQ(pin_count(&storage[1]), 1);
-		UT_ASSERT_EQ(storage[1].pins[0].key.top_full_xid, owner.top_full_xid);
-		UT_ASSERT_EQ(storage[1].pins[0].wal_end, owner.wal_end);
+		for (int kind = 0; kind < 3; kind++) {
+			ClusterRelmapRetentionDirectory storage[2], *directories[2];
+			ClusterRelmapRetentionPin *pin;
+			ClusterRelmapV2View view;
+			ClusterRelmapPendingSet pending;
+			RelMapFile map;
+			RelMapFile expected = map_image(kind == 1 ? 40001 : 40000);
+			unsigned char before[2][2176], after[2176];
+			uint64 generation = UINT64CONST(99);
+
+			setup(&ns);
+			if (kind == 0) {
+				fail_rename = 2;
+				UT_ASSERT(!stage(&ns));
+			} else {
+				UT_ASSERT(stage(&ns));
+				reset_io();
+				fail_rename = 2;
+				UT_ASSERT_EQ(finish(&image, kind == 1), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+			}
+			/* Original I/O produced the cut; readers must not repair its files. */
+			read_copy(0, before[0]);
+			read_copy(1, before[1]);
+			UT_ASSERT_NE(memcmp(before[0], before[1], sizeof(before[0])), 0);
+			reset_io();
+			memset(&map, 0xa5, sizeof(map));
+			UT_ASSERT(read_committed_under_x(&ns, &map, &generation));
+			UT_ASSERT_EQ(generation, kind == 1 ? 8 : 7);
+			UT_ASSERT_EQ(memcmp(&map, &expected, sizeof(map)), 0);
+			UT_ASSERT_EQ(cluster_relmap_authority_v2_read(&ns, &view), CLUSTER_RELMAP_V2_PAIR_VALID);
+			UT_ASSERT(view.pending_complete && view.has_pending);
+			UT_ASSERT_EQ(view.pending_committed_generation, 7);
+			UT_ASSERT_EQ(view.pending_committed.mappings[0].mapfilenumber, 40000);
+			UT_ASSERT_EQ(view.pending_generation, 8);
+			UT_ASSERT_EQ(view.pending.mappings[0].mapfilenumber, 40001);
+
+			cluster_relmap_pending_init(&pending);
+			memset(&map, 0xa5, sizeof(map));
+			generation = UINT64CONST(99);
+			UT_ASSERT_EQ(cluster_relmap_authority_v2_read_rebuild_pending(
+				&ns, descriptors, lengthof(descriptors), &pending, &map, &generation),
+				CLUSTER_RELMAP_PENDING_OK);
+			UT_ASSERT_EQ(generation, kind == 1 ? 8 : 7);
+			UT_ASSERT_EQ(memcmp(&map, &expected, sizeof(map)), 0);
+			for (size_t i = 0; i < lengthof(descriptors); i++) {
+				UT_ASSERT(cluster_relmap_pending_contains(&pending, descriptors[i].kind,
+					&descriptors[i].identity));
+				UT_ASSERT(cluster_relmap_pending_rel_number_reserved(&pending,
+					&descriptors[i].identity));
+				UT_ASSERT(!cluster_relmap_pending_can_release(&pending, descriptors[i].kind,
+					&descriptors[i].identity));
+			}
+			for (size_t i = 0; i < lengthof(pending.entries); i++) {
+				const ClusterRelmapPendingEntry *entry = &pending.entries[i];
+
+				if (!entry->occupied)
+					continue;
+				UT_ASSERT(entry->main_placeholder);
+				UT_ASSERT(!entry->copies_cleared_readback && !entry->native_terminal
+					&& !entry->tt_complete && !entry->space_complete);
+			}
+			restore_builders(storage, directories);
+			UT_ASSERT_EQ(cluster_relmap_retention_restore_namespace(&ns, directories, 2), RESTORE_OK);
+			UT_ASSERT_EQ(pin_count(&storage[0]), 0);
+			UT_ASSERT_EQ(pin_count(&storage[1]), 1);
+			pin = &storage[1].pins[0];
+			UT_ASSERT(pin->occupied && pin->may_be_staged);
+			UT_ASSERT_EQ(pin->key.identity.shared, ns.shared);
+			UT_ASSERT_EQ(pin->key.identity.dbid, ns.dbid);
+			UT_ASSERT_EQ(pin->key.generation, 8);
+			UT_ASSERT_EQ(pin->key.origin, owner.node);
+			UT_ASSERT_EQ(pin->key.top_full_xid, owner.top_full_xid);
+			UT_ASSERT_EQ(pin->key.membership_epoch, owner.membership_epoch);
+			UT_ASSERT_EQ(pin->key.admitted_incarnation, owner.admitted_incarnation);
+			UT_ASSERT_EQ(pin->key.boot_incarnation, owner.boot_incarnation);
+			UT_ASSERT_EQ(pin->wal_end, owner.wal_end);
+			for (int i = 0; i < 2; i++) {
+				UT_ASSERT_EQ(storage[i].state, CLUSTER_RELMAP_RETENTION_BUILDING);
+				read_copy(i, after);
+				UT_ASSERT_EQ(memcmp(before[i], after, sizeof(after)), 0);
+			}
+			UT_ASSERT_EQ(writes, 0);
+			UT_ASSERT_EQ(renames, 0);
+			UT_ASSERT_EQ(file_syncs, 0);
+			UT_ASSERT_EQ(dir_syncs, 0);
+		}
+	}
+}
+
+UT_TEST(test_committed_rebuild_rejects_valid_crc_pair_conflicts)
+{
+	for (int shared = 0; shared <= 1; shared++) {
+		for (int change = 0; change < 5; change++) {
+			ClusterRelmapV2Namespace ns = identity;
+			ClusterRelmapV2Image other = staged_image();
+			ClusterRelmapV2Image checked;
+			ClusterRelmapV2View view;
+			ClusterRelmapPendingSet pending, before;
+			RelMapFile map, zero;
+			unsigned char copies[2][2176], after[2176];
+			uint64 generation = UINT64CONST(99);
+
+			ns.shared = shared;
+			ns.dbid = shared ? InvalidOid : 42;
+			other.identity = ns;
+			setup(&ns);
+			UT_ASSERT(stage(&ns));
+			switch (change) {
+			case 0: other.committed = map_image(40002); break;
+			case 1: other.pending_owner.top_full_xid += UINT64CONST(0x100000000); break;
+			case 2: other.pending_owner.boot_incarnation++; break;
+			case 3: other.pending = map_image(40002); break;
+			case 4:
+				/* Publish may advance primary first, never backup alone. */
+				other.committed_generation = 8;
+				other.committed = map_image(40001);
+				other.pending_generation = 0;
+				memset(&other.pending_owner, 0, sizeof(other.pending_owner));
+				memset(&other.pending, 0, sizeof(other.pending));
+				break;
+			}
+			UT_ASSERT_EQ(cluster_relmap_v2_encode(&other, copies[1], sizeof(copies[1])),
+				CLUSTER_RELMAP_V2_VALID);
+			UT_ASSERT_EQ(cluster_relmap_v2_decode(copies[1], sizeof(copies[1]), &ns, &checked),
+				CLUSTER_RELMAP_V2_VALID);
+			write_copy(1, copies[1], sizeof(copies[1]));
+			read_copy(0, copies[0]);
+			reset_io();
+			UT_ASSERT_EQ(cluster_relmap_authority_v2_read(&ns, &view), CLUSTER_RELMAP_V2_PAIR_CONFLICT);
+			memset(&map, 0xa5, sizeof(map));
+			memset(&zero, 0, sizeof(zero));
+			UT_ASSERT(!read_committed_under_x(&ns, &map, &generation));
+			UT_ASSERT_EQ(generation, UINT64CONST(0));
+			UT_ASSERT_EQ(memcmp(&map, &zero, sizeof(map)), 0);
+			cluster_relmap_pending_init(&pending);
+			memcpy(&before, &pending, sizeof(before));
+			memset(&map, 0xa5, sizeof(map));
+			generation = UINT64CONST(99);
+			UT_ASSERT_EQ(cluster_relmap_authority_v2_read_rebuild_pending(
+				&ns, NULL, 0, &pending, &map, &generation), CLUSTER_RELMAP_PENDING_NOT_READY);
+			UT_ASSERT_EQ(memcmp(&pending, &before, sizeof(pending)), 0);
+			UT_ASSERT_EQ(generation, UINT64CONST(0));
+			UT_ASSERT_EQ(memcmp(&map, &zero, sizeof(map)), 0);
+			for (int i = 0; i < 2; i++) {
+				read_copy(i, after);
+				UT_ASSERT_EQ(memcmp(copies[i], after, sizeof(after)), 0);
+			}
+			UT_ASSERT_EQ(writes, 0);
+			UT_ASSERT_EQ(renames, 0);
+		}
 	}
 }
 
@@ -2094,7 +2245,7 @@ UT_TEST(test_changed_wal_cannot_rebind_staged_pin)
 int
 main(void)
 {
-	UT_PLAN(67);
+	UT_PLAN(68);
 	UT_RUN(test_stage_both_copies_before_success);
 	UT_RUN(test_committed_reader_hides_pending_and_rejects_degraded_pair);
 	UT_RUN(test_committed_reader_requires_namespace_x_lock);
@@ -2137,7 +2288,8 @@ main(void)
 	UT_RUN(test_conversion_postread_corruption_replacement_and_close_cannot_acknowledge);
 	UT_RUN(test_restore_clean_pair_is_only_one_building_observation);
 	UT_RUN(test_restore_exact_original_origin_and_epoch_zero);
-	UT_RUN(test_restore_legal_stage_publish_discard_cuts_keep_pending);
+	UT_RUN(test_committed_rebuild_at_legal_stage_publish_discard_cuts);
+	UT_RUN(test_committed_rebuild_rejects_valid_crc_pair_conflicts);
 	UT_RUN(test_restore_incomplete_corrupt_foreign_and_conflicting_pairs_poison_build);
 	UT_RUN(test_restore_requires_qualified_distinct_original_origin_builders);
 	UT_RUN(test_restore_checks_original_native_floor_issued_and_half_space);
