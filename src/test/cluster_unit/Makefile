@@ -2861,6 +2861,7 @@ test_cluster_undo_recovery: test_cluster_undo_recovery.c unit_test.h \
 test_cluster_undo_native_lifecycle: test_cluster_undo_native_lifecycle.c unit_test.h \
 		test_cluster_undo_lifecycle_native.inc test_cluster_undo_header_identity.inc \
 		test_cluster_undo_bind_native.inc \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
 		test_cluster_side_xact_undo_product.o $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O)
@@ -2911,6 +2912,7 @@ $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O): \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_tt_record.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_xact.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_undo.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DRF_SIDE_ONLINE_TESTING -ffunction-sections -fdata-sections -c $< -o $@
 SIDE_XACT_XACTDESC_O = test_cluster_side_xact_xactdesc.o
@@ -3003,6 +3005,7 @@ $(CLUSTER_SIDE_ONLINE_OWNER_O): $(top_srcdir)/src/backend/cluster/cluster_side_o
 		$(top_srcdir)/src/include/cluster/cluster_side_online_owner.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_undo_scan.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_xact.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(SIDE_OWNER_TEST_CPPFLAGS) \
 		-ffunction-sections -fdata-sections -c $< -o $@
@@ -7521,8 +7524,8 @@ test_cluster_tt_checkpoint_cuts test_cluster_tt_checkpoint_native test_cluster_t
 # and runs typed final-path/no-replace behavior against a private temp dir.
 test_cluster_undo_smgr_publication: test_cluster_undo_smgr_publication.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
-		$(top_srcdir)/src/include/cluster/cluster_undo_smgr.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/include/cluster/cluster_undo_smgr.h cluster_unit_page_checksum.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< cluster_unit_page_checksum.o \
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
@@ -9351,6 +9354,10 @@ test_cluster_recovery_reference_graph: test_cluster_recovery_reference_graph.c u
 		test_cluster_heap_small_scn.inc cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+# Independent upstream checksum implementation for integrity fixtures.
+cluster_unit_page_checksum.o: $(top_srcdir)/src/backend/storage/page/checksum.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
 test_cluster_recovery_undo_scan: test_cluster_recovery_undo_scan.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_undo_scan.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_undo_scan.h \
@@ -9358,8 +9365,8 @@ test_cluster_recovery_undo_scan: test_cluster_recovery_undo_scan.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_format.h \
 		$(top_srcdir)/src/backend/cluster/cluster_uba.c \
 		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
-		test_cluster_heap_small_scn.inc cluster_unit_port_stubs.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+		test_cluster_heap_small_scn.inc cluster_unit_port_stubs.o cluster_unit_page_checksum.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< cluster_unit_page_checksum.o $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_recovery_heap_scan: test_cluster_recovery_heap_scan.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_heap_scan.c \

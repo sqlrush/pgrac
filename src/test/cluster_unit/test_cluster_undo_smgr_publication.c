@@ -20,6 +20,9 @@
 #include "common/file_perm.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "storage/checksum.h"
+#include "cluster/cluster_undo_segment_init.h"
+#include "cluster/storage/cluster_undo_block0.h"
 
 #undef printf
 #undef fprintf
@@ -47,6 +50,32 @@ static int product_close_fail_on_call = 0;
 static bool free_dir_forced_error = false;
 static bool basic_open_swap_to_symlink = false;
 static char basic_open_swap_target[MAXPGPATH];
+static bool header_locked, header_write_expected, pwrite_half;
+static unsigned header_writes;
+
+bool
+cluster_undo_block0_header_write_lock(uint32 segment pg_attribute_unused(),
+									 uint8 owner pg_attribute_unused(), uint32 *acquired)
+{
+	UT_ASSERT(!header_locked);
+	header_locked = true;
+	*acquired = 1;
+	return true;
+}
+void
+cluster_undo_block0_header_write_unlock(uint32 acquired)
+{
+	if (acquired == UINT32_MAX)
+		return;
+	UT_ASSERT(header_locked);
+	header_locked = false;
+}
+bool
+cluster_undo_block0_note_unsynced_header(uint32 segment pg_attribute_unused(),
+	uint8 owner pg_attribute_unused(), ClusterUndoPathIntent intent pg_attribute_unused())
+{
+	return false;
+}
 
 /* Backend path helpers are linked from libpgport_srv. An unexpected ERROR
  * must fail this standalone fixture, never become an accepted I/O result. */
@@ -143,11 +172,17 @@ pg_fsync(int fd)
 static ssize_t
 test_product_pwrite(int fd, const void *buf, size_t nbytes, off_t offset)
 {
+	if (header_write_expected) {
+		UT_ASSERT(header_locked);
+		UT_ASSERT_EQ(nbytes, BLCKSZ);
+		UT_ASSERT_EQ(offset, 0);
+		header_writes++;
+	}
 	if (pwrite_forced_error) {
 		errno = EIO;
 		return -1;
 	}
-	return pwrite(fd, buf, nbytes, offset);
+	return pwrite(fd, buf, pwrite_half ? nbytes / 2 : nbytes, offset);
 }
 
 static ssize_t
@@ -240,9 +275,10 @@ write_empty_file(const char *path)
 static void
 make_page(char page[BLCKSZ], unsigned char marker)
 {
-	memset(page, 0, BLCKSZ);
+	cluster_undo_segment_make_header_bytes(1, 1, page);
 	page[0] = (char)marker;
 	page[BLCKSZ - 1] = (char)(marker ^ 0xff);
+	((PageHeader)page)->pd_checksum = pg_checksum_page(page, 0);
 }
 
 static void
@@ -565,9 +601,11 @@ UT_TEST(test_eexist_loser_never_overwrites_final_and_drops_own_temp)
 	remove_if_present(final);
 	make_page(winner, 0xa5);
 	winner[1] = 0x11;
+	((PageHeader)winner)->pd_checksum = pg_checksum_page(winner, 0);
 	write_segment_file(final, winner, UNDO_SEGMENT_SIZE_BYTES);
 	make_page(loser, 0xa5);
 	loser[1] = 0x22;
+	((PageHeader)loser)->pd_checksum = pg_checksum_page(loser, 0);
 	UT_ASSERT(
 		cluster_undo_smgr_provision_temp_create(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1, temp));
 	UT_ASSERT_EQ(cluster_undo_smgr_provision_temp_publish(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1,
@@ -947,6 +985,107 @@ UT_TEST(test_recovery_file_requires_all_durability_barriers_and_preserves_bytes)
 	}
 }
 
+UT_TEST(test_published_header_has_whole_page_checksum)
+{
+	PGAlignedBlock page, observed;
+	char temp[MAXPGPATH], path[MAXPGPATH];
+	uint16 stored;
+
+	resolve_final(path);
+	remove_if_present(path);
+	cluster_undo_segment_make_header_bytes(1, 1, page.data);
+	/* Existing publication identity fixture only recognizes its marker. */
+	page.data[0] = (char)0xa5;
+	UT_ASSERT(cluster_undo_smgr_provision_temp_create(CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+		1, 1, temp));
+	UT_ASSERT_EQ(cluster_undo_smgr_provision_temp_publish(CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+		1, 1, temp, page.data), CLUSTER_UNDO_SMGR_PUBLISH_PUBLISHED);
+	UT_ASSERT_EQ(cluster_undo_smgr_probe_segment(CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+		1, 1, observed.data), CLUSTER_UNDO_SMGR_FINAL_EXACT);
+	stored = ((PageHeader)observed.data)->pd_checksum;
+	UT_ASSERT(stored != 0);
+	UT_ASSERT_EQ(stored, pg_checksum_page(observed.data, 0));
+	remove_if_present(path);
+}
+
+UT_TEST(test_header_range_writer_preserves_other_slots_under_whole_page_lock)
+{
+	PGAlignedBlock page, observed, expected;
+	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)page.data;
+	TTSlot terminal;
+	char path[MAXPGPATH];
+	int fd;
+
+	resolve_final(path);
+	cluster_undo_segment_make_header_bytes(1, 1, page.data);
+	header->tt_slots[4].xid = 802;
+	header->tt_slots[4].wrap = 7;
+	header->tt_slots[4].status = TT_SLOT_ACTIVE;
+	header->tt_slots[47].xid = 900;
+	header->tt_slots[47].wrap = 9;
+	header->tt_slots[47].status = TT_SLOT_ACTIVE;
+	/* A zero-checksum legacy page can be updated, never qualified by reading. */
+	write_segment_file(path, page.data, BLCKSZ);
+	fd = open(path, O_RDWR);
+	UT_ASSERT(fd >= 0);
+	terminal = header->tt_slots[4];
+	terminal.status = TT_SLOT_COMMITTED;
+	terminal.commit_scn = 999;
+	expected = page;
+	((UndoSegmentHeaderData *)expected.data)->tt_slots[4] = terminal;
+	((PageHeader)expected.data)->pd_checksum = pg_checksum_page(expected.data, 0);
+	header_write_expected = true;
+	header_writes = fsync_calls = 0;
+	UT_ASSERT(cluster_undo_smgr_header_writer_write(fd, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+		1, 1, offsetof(UndoSegmentHeaderData, tt_slots[4]), (char *)&terminal, sizeof(terminal)));
+	UT_ASSERT_EQ(header_writes, 1);
+	UT_ASSERT_EQ(fsync_calls, 1);
+	UT_ASSERT(!header_locked);
+	UT_ASSERT_EQ(pread(fd, observed.data, BLCKSZ, 0), BLCKSZ);
+	UT_ASSERT(memcmp(observed.data, expected.data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(cluster_undo_segment_header_integrity(observed.data), CLUSTER_UNDO_HEADER_VALID);
+	/* A protected corrupt predecessor is not resealed by a slot update. */
+	observed.data[BLCKSZ - 1] ^= 1;
+	UT_ASSERT_EQ(pwrite(fd, observed.data, BLCKSZ, 0), BLCKSZ);
+	UT_ASSERT(!cluster_undo_smgr_header_writer_write(fd, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+		1, 1, offsetof(UndoSegmentHeaderData, tt_slots[4]), (char *)&terminal, sizeof(terminal)));
+	UT_ASSERT_EQ(header_writes, 1);
+	UT_ASSERT(!header_locked);
+	header_write_expected = false;
+	UT_ASSERT_EQ(close(fd), 0);
+	remove_if_present(path);
+}
+
+UT_TEST(test_torn_header_range_write_remains_corrupt_and_blocks_next_patch)
+{
+	PGAlignedBlock page, observed;
+	char path[MAXPGPATH], tail = 0x31;
+	int fd;
+
+	resolve_final(path);
+	cluster_undo_segment_make_header_bytes(1, 1, page.data);
+	((PageHeader)page.data)->pd_checksum = pg_checksum_page(page.data, 0);
+	write_segment_file(path, page.data, BLCKSZ);
+	fd = open(path, O_RDWR);
+	UT_ASSERT(fd >= 0);
+	header_write_expected = pwrite_half = true;
+	header_writes = 0;
+	UT_ASSERT(!cluster_undo_smgr_header_writer_write(fd, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+		1, 1, BLCKSZ - 1, &tail, 1));
+	pwrite_half = false;
+	UT_ASSERT(!header_locked);
+	UT_ASSERT_EQ(header_writes, 1);
+	UT_ASSERT_EQ(pread(fd, observed.data, BLCKSZ, 0), BLCKSZ);
+	UT_ASSERT_EQ(cluster_undo_segment_header_integrity(observed.data), CLUSTER_UNDO_HEADER_CORRUPT);
+	UT_ASSERT(!cluster_undo_smgr_header_writer_write(fd, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+		1, 1, BLCKSZ - 1, &tail, 1));
+	UT_ASSERT_EQ(header_writes, 1);
+	UT_ASSERT(!header_locked);
+	header_write_expected = false;
+	UT_ASSERT_EQ(close(fd), 0);
+	remove_if_present(path);
+}
+
 int
 main(void)
 {
@@ -954,7 +1093,10 @@ main(void)
 
 	UT_ASSERT_NOT_NULL(mkdtemp(template));
 	strlcpy(publication_dir, template, sizeof(publication_dir));
-	UT_PLAN(29);
+	UT_PLAN(32);
+	UT_RUN(test_header_range_writer_preserves_other_slots_under_whole_page_lock);
+	UT_RUN(test_torn_header_range_write_remains_corrupt_and_blocks_next_patch);
+	UT_RUN(test_published_header_has_whole_page_checksum);
 	UT_RUN(test_recovery_file_materializes_absent_without_publishing_header);
 	UT_RUN(test_recovery_file_short_tail_and_errors_are_distinct);
 	UT_RUN(test_recovery_file_requires_all_durability_barriers_and_preserves_bytes);

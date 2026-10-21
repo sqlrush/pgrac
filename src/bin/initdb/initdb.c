@@ -3195,7 +3195,8 @@ initialize_data_directory(void)
 			pg_fatal("could not create undo seed segment \"%s\": %m",
 					 seed_path);
 
-		if (write(fd, page.data, BLCKSZ) != BLCKSZ)
+		if (!cluster_undo_segment_header_seal(page.data)
+			|| write(fd, page.data, BLCKSZ) != BLCKSZ)
 		{
 			(void) close(fd);
 			pg_fatal("could not write undo seed segment header to \"%s\"",

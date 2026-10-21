@@ -22,6 +22,7 @@
 #include "cluster/cluster_side_online_owner.h"
 #include "cluster/cluster_undo_format.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "storage/standbydefs.h"
@@ -703,6 +704,11 @@ side_owner_apply_commit_record(RfSideOnlineProductionOwnerV1 *owner, uint32 inde
 	result = cluster_undo_prepare_commit_v1(
 		delta->instance, delta->segment_id, delta->segment_generation, delta->slot_offset,
 		delta->wrap, delta->xid, delta->commit_scn, target->base.data, current.data);
+	/* Match the physical checksum of this record's changed whole-page write. */
+	if (result == CLUSTER_UNDO_HEADER_APPLY
+		&& memcmp(current.data, target->base.data, BLCKSZ) != 0
+		&& !cluster_undo_segment_header_seal(current.data))
+		return false;
 	/* Reconstruction is a check, not permission to replay missing earlier TT
 	 * steps here. Only the original single-record transition may change DATA. */
 	if ((result != CLUSTER_UNDO_HEADER_APPLY && result != CLUSTER_UNDO_HEADER_ALREADY)
@@ -849,6 +855,11 @@ side_owner_apply_undo_header_record(RfSideOnlineProductionOwnerV1 *owner, uint32
 		 * release cannot install a missing earlier terminal or another slot. */
 		current = target->base;
 		result = cluster_undo_prepare_header_v1(undo, NULL, 0, target->base.data, current.data);
+		/* Match the physical checksum of this record's changed whole-page write. */
+		if (result == CLUSTER_UNDO_HEADER_APPLY
+			&& memcmp(current.data, target->base.data, BLCKSZ) != 0
+			&& !cluster_undo_segment_header_seal(current.data))
+			return false;
 		if ((result != CLUSTER_UNDO_HEADER_APPLY && result != CLUSTER_UNDO_HEADER_ALREADY)
 			|| memcmp(current.data, prefix.page.data, BLCKSZ) != 0)
 			return false;

@@ -50,6 +50,7 @@
 #include "cluster/cluster_undo_record_api.h" /* smgr syscall counter bumps */
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_undo_segment.h"
+#include "cluster/cluster_undo_segment_init.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_block0.h"
 
@@ -64,7 +65,7 @@
  *	new).  Normal COMMIT preserves the cache; PREPARE/ABORT full teardown,
  *	cache-key mismatch, and before_shmem_exit close it.  Per-backend fds to a
  *	shared segment file are independent; each pwrites its own offset range, so
- *	there is no cross-backend hazard.
+ *	DATA writes remain disjoint; block-zero writes use its content lock.
  */
 static uint32 cached_fd_segment = 0; /* 0 = empty */
 static uint8 cached_fd_owner = 0;
@@ -447,24 +448,32 @@ cluster_undo_smgr_write_block(ClusterUndoPathIntent intent, uint32 segment_id, u
 	off_t offset;
 	ssize_t nwritten;
 	bool ok = true;
+	uint32 acquired = UINT32_MAX;
+	PGAlignedBlock header;
 
 	if (buf == NULL || block_no >= UNDO_BLOCKS_PER_SEGMENT)
 		return false;
-
 	fd = get_segment_fd(intent, segment_id, owner_instance);
 	if (fd < 0)
 		return false;
-
+	if (block_no == 0) {
+		memcpy(header.data, buf, BLCKSZ);
+		if (!cluster_undo_segment_header_seal(header.data)
+			|| !cluster_undo_block0_header_write_lock(segment_id, owner_instance, &acquired))
+			return false;
+		buf = header.data;
+	}
 	offset = (off_t)block_no * BLCKSZ;
 	nwritten = pg_pwrite(fd, buf, BLCKSZ, offset);
 	cluster_undo_record_note_smgr_pwrite();
 	if (nwritten != BLCKSZ)
 		ok = false;
-
-	if (ok && do_fsync) {
-		if (pg_fsync(fd) != 0)
-			ok = false;
-	}
+	if (ok && do_fsync)
+		ok = pg_fsync(fd) == 0;
+	if (ok && block_no == 0 && !do_fsync)
+		ok = header_write_recorded(fd, intent, segment_id, owner_instance);
+	if (block_no == 0)
+		cluster_undo_block0_header_write_unlock(acquired);
 	return ok;
 }
 
@@ -472,18 +481,13 @@ cluster_undo_smgr_write_block(ClusterUndoPathIntent intent, uint32 segment_id, u
 /*
  * cluster_undo_smgr_read_header_bytes / _write_header_bytes (spec-3.11 D2)
  *
- *   Targeted read/write of a byte range within segment header block 0 (e.g.
- *   one 32-byte TTSlot at offset 112 + slot*32).  Used by the durable TT slot
- *   commit/lookup path: each committing xact owns a DISTINCT slot, so per-slot
- *   writes hit non-overlapping byte ranges and need NO lock (POSIX concurrent
- *   pwrite to disjoint ranges is safe; lifecycle writes the header prefix at
- *   offset 32-111, also disjoint from the slot array).  The write does NOT
- *   fsync: the durable TT commit is WAL-protected (XLOG_UNDO_TT_SLOT_COMMIT),
- *   so a torn data-file write is recovered by redo (spec-3.11 C10).  That
- *   holds only until a checkpoint moves the redo pointer past the record, so
- *   a write to a path the checkpointer resolves itself is recorded for its
- *   fsync; any other write (a recovery-scoped path, or no block-zero region)
- *   is fsynced here.  offset+len must stay inside block 0 (BLCKSZ).
+ *   Reads preserve the caller's byte-range API. Writes serialize on the
+ *   existing block-zero content owner and perform a whole-page RMW, checksum
+ *   included. Holding the lock through checkpoint registration/fsync prevents
+ *   different slot/prefix writers from losing each other's changes.
+ *   A protected corrupt predecessor is never laundered by a partial update.
+ *   Zero-checksum legacy input is unverified; a successful write seals the
+ *   resulting whole page, without granting recovery qualification.
  */
 bool
 cluster_undo_smgr_read_header_bytes(ClusterUndoPathIntent intent, uint32 segment_id,
@@ -510,20 +514,12 @@ cluster_undo_smgr_write_header_bytes(ClusterUndoPathIntent intent, uint32 segmen
 									 uint32 len)
 {
 	int fd;
-	ssize_t nwritten;
 
-	if (buf == NULL || len == 0 || (uint64)offset + (uint64)len > (uint64)BLCKSZ)
+	if (buf == NULL || len == 0 || (uint64)offset + len > BLCKSZ)
 		return false;
-
 	fd = get_segment_fd(intent, segment_id, owner_instance);
-	if (fd < 0)
-		return false;
-
-	nwritten = pg_pwrite(fd, buf, len, (off_t)offset);
-	cluster_undo_record_note_smgr_pwrite();
-	if (nwritten != (ssize_t)len)
-		return false;
-	return header_write_recorded(fd, intent, segment_id, owner_instance);
+	return fd >= 0 && cluster_undo_smgr_header_writer_write(fd, intent, segment_id,
+		owner_instance, offset, buf, len);
 }
 
 /* Leave a written header range to the checkpoint's fsync, or fsync it now
@@ -551,15 +547,31 @@ cluster_undo_smgr_header_writer_write(int fd, ClusterUndoPathIntent intent, uint
 									  uint8 owner_instance, uint32 offset, const char *buf,
 									  uint32 len)
 {
-	ssize_t nwritten;
+	PGAlignedBlock page;
+	uint32 acquired;
+	bool ok = false;
 
-	if (fd < 0 || buf == NULL || len == 0 || (uint64)offset + (uint64)len > (uint64)BLCKSZ)
+	if (fd < 0 || buf == NULL || len == 0 || (uint64)offset + len > BLCKSZ
+		|| !cluster_undo_block0_header_write_lock(segment_id, owner_instance, &acquired))
 		return false;
-	nwritten = pg_pwrite(fd, buf, len, (off_t)offset);
+	if (pg_pread(fd, page.data, BLCKSZ, 0) != BLCKSZ) {
+		cluster_undo_record_note_smgr_pread();
+		goto done;
+	}
+	cluster_undo_record_note_smgr_pread();
+	if (cluster_undo_segment_header_integrity(page.data) == CLUSTER_UNDO_HEADER_CORRUPT
+		|| !UndoSegmentHeader_identity_matches(page.data, segment_id, owner_instance))
+		goto done;
+	memcpy(page.data + offset, buf, len);
+	if (!cluster_undo_segment_header_seal(page.data))
+		goto done;
+	ok = pg_pwrite(fd, page.data, BLCKSZ, 0) == BLCKSZ;
 	cluster_undo_record_note_smgr_pwrite();
-	if (nwritten != (ssize_t)len)
-		return false;
-	return header_write_recorded(fd, intent, segment_id, owner_instance);
+	if (ok)
+		ok = header_write_recorded(fd, intent, segment_id, owner_instance);
+ done:
+	cluster_undo_block0_header_write_unlock(acquired);
+	return ok;
 }
 
 void
@@ -674,7 +686,8 @@ cluster_undo_smgr_recovery_abort_prepare_v1(const ClusterRecoveryTTAbortV1 *reco
 		goto refused;
 	}
 	cluster_undo_record_note_smgr_pread();
-	if (!UndoSegmentHeader_identity_matches(stage->before.data, record->exact.segment_id,
+	if (cluster_undo_segment_header_integrity(stage->before.data) != CLUSTER_UNDO_HEADER_VALID
+		|| !UndoSegmentHeader_identity_matches(stage->before.data, record->exact.segment_id,
 											record->exact.instance)
 		|| cluster_recovery_tt_abort_match_v1(record, header->wrap_count,
 											  &header->tt_slots[record->exact.slot_offset])
@@ -686,6 +699,8 @@ cluster_undo_smgr_recovery_abort_prepare_v1(const ClusterRecoveryTTAbortV1 *reco
 	memcpy(stage->after.data, stage->before.data, BLCKSZ);
 	((UndoSegmentHeaderData *)stage->after.data)->tt_slots[record->exact.slot_offset].status
 		= TT_SLOT_ABORTED;
+	if (!cluster_undo_segment_header_seal(stage->after.data))
+		goto refused;
 	stage->token = ++recovery_header_stamp_serial;
 	out->token = stage->token;
 	return true;
@@ -702,10 +717,15 @@ cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 stamp)
 	PGAlignedBlock observed;
 	struct stat file;
 	ssize_t size;
+	uint32 acquired_slot = UINT32_MAX;
+	const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)stage->before.data;
 
 	if (stamp.token == 0 || stage->fd < 0 || stage->token != stamp.token
 		|| stage->owner != CurrentResourceOwner || stage->failed)
 		return false;
+	if (!cluster_undo_block0_header_write_lock(header->segment_id, header->owner_instance,
+												 &acquired_slot))
+		goto refused;
 	/* No allocation, path/scope resolution or checkpoint delegation here. */
 	if (fstat(stage->fd, &file) != 0 || !recovery_header_stamp_file_matches(&file))
 		goto refused;
@@ -714,10 +734,9 @@ cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 stamp)
 	if (size != BLCKSZ || memcmp(observed.data, stage->before.data, BLCKSZ) != 0)
 		goto refused;
 	if (memcmp(stage->before.data, stage->after.data, BLCKSZ) != 0) {
-		size = pg_pwrite(stage->fd, stage->after.data + stage->slot_offset, sizeof(TTSlot),
-						 stage->slot_offset);
+		size = pg_pwrite(stage->fd, stage->after.data, BLCKSZ, 0);
 		cluster_undo_record_note_smgr_pwrite();
-		if (size != sizeof(TTSlot))
+		if (size != BLCKSZ)
 			goto refused;
 	}
 	/* An already-result observation must also become durable. */
@@ -729,9 +748,11 @@ cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 stamp)
 		|| fstat(stage->fd, &file) != 0 || !recovery_header_stamp_file_matches(&file))
 		goto refused;
 	memcpy(stage->before.data, stage->after.data, BLCKSZ);
+	cluster_undo_block0_header_write_unlock(acquired_slot);
 	return true;
 
 refused:
+	cluster_undo_block0_header_write_unlock(acquired_slot);
 	stage->failed = true;
 	return false;
 }
@@ -804,6 +825,7 @@ cluster_undo_smgr_probe_segment(ClusterUndoPathIntent intent, uint32 segment_id,
 	if (close(fd) != 0)
 		return CLUSTER_UNDO_SMGR_FINAL_IO_ERROR;
 	if (nread != BLCKSZ
+		|| cluster_undo_segment_header_integrity(private_block.data) == CLUSTER_UNDO_HEADER_CORRUPT
 		|| !cluster_undo_segment_header_identity_ok(private_block.data, segment_id, owner_instance))
 		return CLUSTER_UNDO_SMGR_FINAL_INVALID;
 	if (!provision_fsync_parent(path))
@@ -1135,7 +1157,7 @@ cluster_undo_smgr_provision_temp_publish(ClusterUndoPathIntent intent, uint32 se
 										 const char block0[BLCKSZ])
 {
 	char final_path[MAXPGPATH];
-	PGAlignedBlock observed;
+	PGAlignedBlock observed, sealed;
 	ClusterUndoSmgrFinalState final_state;
 	ssize_t nwritten;
 	bool temp_ok = true;
@@ -1145,6 +1167,9 @@ cluster_undo_smgr_provision_temp_publish(ClusterUndoPathIntent intent, uint32 se
 	if (block0 == NULL
 		|| !cluster_undo_segment_header_identity_ok(block0, segment_id, owner_instance)
 		|| !provision_temp_owned(intent, segment_id, owner_instance, temp_path, final_path))
+		return CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR;
+	memcpy(sealed.data, block0, BLCKSZ);
+	if (!cluster_undo_segment_header_seal(sealed.data))
 		return CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR;
 	fd = BasicOpenFile(temp_path, O_RDWR | PG_BINARY);
 	if (fd < 0)
@@ -1157,7 +1182,7 @@ cluster_undo_smgr_provision_temp_publish(ClusterUndoPathIntent intent, uint32 se
 													   temp_path);
 		return CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR;
 	}
-	nwritten = pg_pwrite(fd, block0, BLCKSZ, 0);
+	nwritten = pg_pwrite(fd, sealed.data, BLCKSZ, 0);
 	cluster_undo_record_note_smgr_pwrite();
 	if (nwritten != BLCKSZ)
 		temp_ok = false;

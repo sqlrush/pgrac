@@ -8,6 +8,7 @@
  */
 #include "postgres.h"
 #include "cluster/cluster_recovery_undo_scan.h"
+#include "cluster/cluster_undo_segment_init.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 
 #ifdef USE_PGRAC_CLUSTER
@@ -22,6 +23,8 @@ recovery_undo_layout(const UndoSegmentHeaderData *header, uint32 segment, uint8 
 {
 	Page page = (Page)header;
 
+	if (cluster_undo_segment_header_integrity(header) == CLUSTER_UNDO_HEADER_CORRUPT)
+		return CLUSTER_RECOVERY_UNDO_CORRUPT;
 	if (PageGetPageSize(page) != BLCKSZ || PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION
 		|| (header->pd_flags & PD_UNDO_SEG_HEADER) == 0)
 		return CLUSTER_RECOVERY_UNDO_UNSUPPORTED;

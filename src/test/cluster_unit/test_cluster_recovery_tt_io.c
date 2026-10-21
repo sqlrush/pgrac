@@ -12,6 +12,8 @@
 #include <unistd.h>
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_undo_segment.h"
+#include "cluster/cluster_undo_segment_init.h"
+#include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/cluster_undo_record_api.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
@@ -37,6 +39,26 @@ static bool corrupt_postread;
 static int write_fd = -1;
 static ClusterRecoveryTTAbortV1 record;
 static PGAlignedBlock initial;
+static bool header_locked;
+
+bool
+cluster_undo_block0_header_write_lock(uint32 segment, uint8 owner, uint32 *acquired)
+{
+	UT_ASSERT_EQ(segment, 257);
+	UT_ASSERT_EQ(owner, 2);
+	UT_ASSERT(!header_locked);
+	header_locked = true;
+	*acquired = 1;
+	return true;
+}
+void
+cluster_undo_block0_header_write_unlock(uint32 acquired)
+{
+	if (acquired == UINT32_MAX)
+		return;
+	UT_ASSERT(header_locked);
+	header_locked = false;
+}
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -128,6 +150,9 @@ io_pwrite(int fd, const void *buffer, size_t size, off_t offset)
 {
 	writes++;
 	write_fd = fd;
+	UT_ASSERT(header_locked);
+	UT_ASSERT_EQ(size, BLCKSZ);
+	UT_ASSERT_EQ(offset, 0);
 	return pwrite(fd, buffer, write_short && size > 0 ? size - 1 : size, offset);
 }
 static int
@@ -172,6 +197,7 @@ reset_file(bool already)
 	if (release_callback != NULL)
 		release_callback(RESOURCE_RELEASE_AFTER_LOCKS, false, true, release_arg);
 	UT_ASSERT_EQ(external_fds, 0);
+	UT_ASSERT(!header_locked);
 	opens = resolves = reads = writes = syncs = closes = 0;
 	scope_current = capacity = true;
 	open_error = read_short = write_short = sync_error = close_error = stat_error = false;
@@ -201,7 +227,7 @@ reset_file(bool already)
 	record.before.status = TT_SLOT_ACTIVE;
 	record.before.first_undo_block.raw[0] = UINT64CONST(0x100000101);
 	record.before.first_undo_block.raw[1] = UINT64CONST(0x40003);
-	memset(initial.data, 0, BLCKSZ);
+	cluster_undo_segment_make_header_bytes(257, 2, initial.data);
 	header->pd_flags = PD_UNDO_SEG_HEADER;
 	header->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
 	header->segment_id = 257;
@@ -214,6 +240,7 @@ reset_file(bool already)
 	if (already)
 		header->tt_slots[3].status = TT_SLOT_ABORTED;
 	initial.data[BLCKSZ - 1] = 0x6a;
+	UT_ASSERT(cluster_undo_segment_header_seal(initial.data));
 	(void)unlink(test_file);
 	fd = open(test_file, O_RDWR | O_CREAT | O_EXCL, 0600);
 	UT_ASSERT(fd >= 0);
@@ -261,6 +288,7 @@ UT_TEST(test_exact_durable_slot_preserves_whole_header_and_head)
 	UT_ASSERT_EQ(syncs, 1);
 	memcpy(expected.data, initial.data, BLCKSZ);
 	((UndoSegmentHeaderData *)expected.data)->tt_slots[3].status = TT_SLOT_ABORTED;
+	UT_ASSERT(cluster_undo_segment_header_seal(expected.data));
 	fd = open(test_file, O_RDONLY);
 	UT_ASSERT(fd >= 0);
 	if (fd >= 0) {

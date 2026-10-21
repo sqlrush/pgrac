@@ -333,6 +333,7 @@ UT_TEST(tt_redo_commit_without_bind_keeps_original_all_slots_and_heads)
 	expected = f.base;
 	((UndoSegmentHeaderData *)expected.data)->tt_slots[4].status = TT_SLOT_COMMITTED;
 	((UndoSegmentHeaderData *)expected.data)->tt_slots[4].commit_scn = 999;
+	UT_ASSERT(cluster_undo_segment_header_seal(expected.data));
 	UT_ASSERT(cluster_cold_typed_tt_redo_header_v1(&f.typed, 0, 0, &out));
 	UT_ASSERT(memcmp(out.page.data, expected.data, BLCKSZ) == 0);
 	UT_ASSERT_EQ(out.operation_count, 1);
@@ -413,6 +414,7 @@ UT_TEST(tt_redo_exact_abort_uses_original_active_slot_without_bind)
 	tt_redo_seal(&f);
 	expected = f.base;
 	((UndoSegmentHeaderData *)expected.data)->tt_slots[4].status = TT_SLOT_ABORTED;
+	UT_ASSERT(cluster_undo_segment_header_seal(expected.data));
 	UT_ASSERT(cluster_cold_typed_tt_redo_header_v1(&f.typed, 0, 0, &out));
 	UT_ASSERT(memcmp(out.page.data, expected.data, BLCKSZ) == 0);
 	tt_redo_destroy(&f);
@@ -2981,6 +2983,7 @@ UT_TEST(tt_readback_matches_physical_commit_and_preserves_original)
 	expected = f.base;
 	((UndoSegmentHeaderData *)expected.data)->tt_slots[4].status = TT_SLOT_COMMITTED;
 	((UndoSegmentHeaderData *)expected.data)->tt_slots[4].commit_scn = 999;
+	UT_ASSERT(cluster_undo_segment_header_seal(expected.data));
 	tt_readback_write(513, &expected, false);
 	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
 	observed = cluster_cold_tt_after_redo_header_v1(&f.typed, 0, &owner, &segment);
@@ -3016,6 +3019,7 @@ UT_TEST(tt_readback_matches_exact_abort_and_unchanged_active_slots)
 			undo_header_abort(&fake, 4);
 			undo_header_feed(f.typed.side_plans[0], &fake, 100);
 			((UndoSegmentHeaderData *)expected.data)->tt_slots[4].status = TT_SLOT_ABORTED;
+			UT_ASSERT(cluster_undo_segment_header_seal(expected.data));
 		}
 		tt_redo_seal(&f);
 		tt_readback_write(513, &expected, false);
@@ -3220,6 +3224,7 @@ tt_post_readback_new(TtRedoFixture *f, PGAlignedBlock *expected, bool terminal)
 		undo_header_feed(f->typed.side_plans[0], &fake, 300);
 		header->tt_slots[4].commit_scn = 999;
 	}
+	UT_ASSERT(cluster_undo_segment_header_seal(expected->data));
 	tt_redo_seal(f);
 	tt_readback_write(513, expected, true);
 }
@@ -3484,6 +3489,105 @@ UT_TEST(tt_top_tx_c0_producer_derives_base_from_native_reuse)
 	tt_redo_destroy(&f);
 }
 
+UT_TEST(tt_top_tx_c0_rebuilds_damaged_base_only_from_sealed_full_lifecycle)
+{
+	for (int image = 0; image < 3; image++) {
+		for (int fault = 0; fault < 3; fault++) {
+			TtRedoFixture f;
+			FakeXactRecord fake;
+			PGAlignedBlock newer;
+			RfSideUndoHeaderImageV1 folded;
+			ClusterColdTtSlotInputV1 input;
+			ClusterColdTopTxProofV1 proof;
+			ClusterRecoveryTTAbortV1 shape;
+			ClusterColdTopTxC0ProducerResultV1 out;
+
+			tt_redo_fixture(&f, image == 0 ? 200 : 300, RF_SIDE_PLAN_RECOVERY);
+			UT_ASSERT(cluster_undo_segment_header_seal(f.base.data));
+			if (fault == 0)
+				((UndoSegmentHeaderData *)f.base.data)->segment_id ^= 1;
+			else if (fault == 1) {
+				/* First half from a newer whole-page write, old second half. */
+				newer = f.base;
+				newer.data[BLCKSZ - 1] ^= 1;
+				UT_ASSERT(cluster_undo_segment_header_seal(newer.data));
+				memcpy(f.base.data, newer.data, BLCKSZ / 2);
+			} else
+				((UndoSegmentHeaderData *)f.base.data)->pd_checksum = 0;
+			tt_readback_write(513, &f.base, false);
+			tt_redo_seed_recapture(&f);
+			if (image == 1)
+				tt_post_readback_init(&f, 100);
+			else if (image == 2) {
+				struct {
+					xl_undo_segment_reuse record;
+					uint8 page[BLCKSZ];
+				} reuse = { 0 };
+
+				reuse.record.instance = 3;
+				reuse.record.segment_id = 513;
+				reuse.record.new_generation = 1;
+				cluster_undo_segment_make_header_bytes(513, 3, (char *)reuse.page);
+				((UndoSegmentHeaderData *)reuse.page)->wrap_count = 1;
+				make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_REUSE,
+									   &reuse, sizeof(reuse));
+				undo_header_feed(f.typed.side_plans[0], &fake, 100);
+			}
+			undo_header_bind(&fake, image == 2 ? 1 : 0);
+			undo_header_feed(f.typed.side_plans[0], &fake, image == 0 ? 100 : 200);
+			tt_redo_seal(&f);
+			if (image == 0) {
+				/* Neither damaged bytes nor a legacy zero-checksum base
+				 * supply the missing full lifecycle/top proof. */
+				if (fault != 2) {
+					UT_ASSERT(!cluster_cold_typed_tt_redo_header_v1(&f.typed, 0, 0, &folded));
+					UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+				}
+				tt_redo_destroy(&f);
+				continue;
+			}
+			if (image == 1 && fault == 2) {
+				/* Legacy zero is unverified, not corrupt. INIT must not erase
+				 * slot 47, whose earlier BIND is absent from this retained cut. */
+				UT_ASSERT(!cluster_cold_typed_tt_redo_header_v1(&f.typed, 0, 0, &folded));
+				UT_ASSERT(!cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+				tt_redo_destroy(&f);
+				continue;
+			}
+			{
+				bool rebuilt = cluster_cold_typed_tt_redo_header_v1(&f.typed, 0, 0, &folded);
+
+				if (!rebuilt)
+					fprintf(stderr, "# full lifecycle rebuild refused: image=%d fault=%d\n", image,
+							fault);
+				UT_ASSERT(rebuilt);
+				if (!rebuilt) {
+					tt_redo_destroy(&f);
+					continue;
+				}
+			}
+			UT_ASSERT(folded.has_full_image);
+			UT_ASSERT_EQ(cluster_undo_segment_header_integrity(folded.page.data),
+						 CLUSTER_UNDO_HEADER_VALID);
+			tt_readback_write(513, &folded.page, false);
+			UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+			UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &input));
+			UT_ASSERT_EQ(input.key.segment_generation, image == 2 ? 1 : 0);
+			UT_ASSERT_EQ(input.key.xid, 802);
+			f.typed.xid_next_after_redo = UINT64_C(0x700400200);
+			tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+			proof.qualified_base = false;
+			tt_top_tx_effects_complete(&f);
+			tt_top_tx_endpoints_complete(&f);
+			UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(
+				&f.typed, TT_C0_FENCE, 0, &proof, &shape, false, InvalidTransactionId,
+				UINT64_C(0x12345678), &out));
+			UT_ASSERT(memcmp(&out.loser.key, &input.key, sizeof(input.key)) == 0);
+			tt_redo_destroy(&f);
+		}
+	}
+}
+
 UT_TEST(tt_top_tx_c0_producer_refuses_unqualified_raw_base)
 {
 	TtRedoFixture f;
@@ -3592,29 +3696,37 @@ UT_TEST(tt_top_tx_checkpoint_source_does_not_authenticate_raw_base_bytes)
 
 		tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
 		checkpoint = f.checkpoints[0];
+		UT_ASSERT(cluster_cold_tt_base_slot_v1(&f.typed, 0, 4, &input));
+		tt_top_tx_bind(&f, 100, 4);
 		header = (UndoSegmentHeaderData *)f.base.data;
-		/* Deliberately change a byte before capture, keeping legal layout.
-		 * The original codec does not authenticate pd_checksum or an old
-		 * slot's xid. Stable file readback cannot detect this mutation. */
+		/* A nonzero bad checksum is corrupt; zero is legacy unverified.
+		 * Neither observation can supply the missing qualified old base. */
 		if (field == 0)
 			header->pd_checksum ^= 1;
 		else
 			header->tt_slots[47].xid ^= 1;
 		tt_readback_write(513, &f.base, false);
 		tt_redo_seed_recapture(&f);
-		tt_top_tx_seal_bound(&f, 100);
+		tt_redo_seal(&f);
+		if (field != 0)
+			tt_top_tx_write_fold(&f);
 		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
 		UT_ASSERT_EQ(cluster_cold_tt_after_redo_recheck_v1(&f.typed), CLUSTER_COLD_OK);
-		UT_ASSERT(cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+		UT_ASSERT_EQ(cluster_cold_typed_tt_redo_inventory_v1(&f.typed), field != 0);
 		UT_ASSERT(memcmp(&checkpoint, &f.checkpoints[0], sizeof(checkpoint)) == 0);
-		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &input));
+		if (field == 0) {
+			ClusterColdTtSlotInputV1 rejected;
+			RfSideUndoHeaderImageV1 folded;
+
+			UT_ASSERT(!cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &rejected));
+			UT_ASSERT(!cluster_cold_typed_tt_redo_header_v1(&f.typed, 0, 0, &folded));
+		} else
+			UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &input));
 		f.typed.xid_next_after_redo = UINT64_C(0x700400200);
 		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
 		tt_top_tx_effects_complete(&f);
 		tt_top_tx_endpoints_complete(&f);
 		memset(&out, 0xa9, sizeof(out));
-		/* This is the existing unqualified-base refusal, not a claim that
-		 * the C0 producer detected the changed byte or verified a CRC. */
 		UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
 															&shape, false, InvalidTransactionId,
 															UINT64_C(0x12345678), &out));
@@ -5579,6 +5691,7 @@ UT_TEST(tt_post_readback_selects_existing_base_by_physical_identity)
 	expected = f.base;
 	((UndoSegmentHeaderData *)expected.data)->tt_slots[4].status = TT_SLOT_COMMITTED;
 	((UndoSegmentHeaderData *)expected.data)->tt_slots[4].commit_scn = 999;
+	UT_ASSERT(cluster_undo_segment_header_seal(expected.data));
 	tt_readback_write(513, &expected, false);
 	cluster_undo_segment_make_header_bytes(257, 2, foreign.data);
 	tt_readback_write(257, &foreign, true);
@@ -6908,6 +7021,7 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi, int input_case)
 				record.origin_node_id--;
 				memcpy(base.data + old.record_offset, &record, sizeof(record));
 			}
+			UT_ASSERT(cluster_undo_segment_header_seal(f.base.data));
 			tt_redo_seed_header(513, &f.base);
 			tt_redo_seed_recapture(&f);
 			tt_undo_readback_cache(&f, 3, 513, 9, &base);
@@ -7749,7 +7863,7 @@ UT_TEST(tt_top_tx_c0_producer_rechecks_before_output)
 int
 main(void)
 {
-	UT_PLAN(164);
+	UT_PLAN(165);
 	UT_RUN(tt_after_redo_checks_canonical_active_undo_chain_input);
 	UT_RUN(tt_after_redo_checks_spill_active_undo_chain_input);
 	UT_RUN(tt_after_redo_checks_canonical_active_undo_head_input);
@@ -7788,6 +7902,7 @@ main(void)
 	UT_RUN(tt_page_creator_requires_the_same_sealed_original_sources);
 	UT_RUN(tt_top_tx_c0_producer_derives_base_from_native_full_image);
 	UT_RUN(tt_top_tx_c0_producer_derives_base_from_native_reuse);
+	UT_RUN(tt_top_tx_c0_rebuilds_damaged_base_only_from_sealed_full_lifecycle);
 	UT_RUN(tt_top_tx_c0_producer_refuses_unqualified_raw_base);
 	UT_RUN(tt_top_tx_checkpoint_does_not_qualify_old_active_without_bind);
 	UT_RUN(tt_top_tx_checkpoint_source_does_not_authenticate_raw_base_bytes);

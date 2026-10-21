@@ -3792,6 +3792,8 @@ UT_TEST(test_undo_header_repeated_slot_exact_source_membership_without_init)
 		slot->status = TT_SLOT_COMMITTED;
 		slot->commit_scn = 999;
 		slot->first_undo_block = invalid_head;
+		if (state < 4)
+			UT_ASSERT(cluster_undo_segment_header_seal(expected.data));
 		memset(&unchanged, 0xc5, sizeof(unchanged));
 		out = unchanged;
 		UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_header_v1(plan, 3, 513, base.data, &out),
@@ -8709,6 +8711,8 @@ UT_TEST(test_cold_initial_ctrc_release_installs_exact_durable_header)
 		if (variant <= 1)
 			((UndoSegmentHeaderData *)expected.data)->tt_slots[4].flags
 				= TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+		if (variant <= 1)
+			UT_ASSERT(cluster_undo_segment_header_seal(expected.data));
 		canonical_file = tmpfile();
 		UT_ASSERT(canonical_file != NULL);
 		UT_ASSERT_EQ(ftruncate(fileno(canonical_file), UNDO_SEGMENT_SIZE_BYTES), 0);
@@ -8765,6 +8769,8 @@ UT_TEST(test_cold_initial_ctrc_release_preserves_failed_io_and_scope_responsibil
 		if (fault != 5)
 			((UndoSegmentHeaderData *)expected.data)->tt_slots[4].flags
 				= TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+		if (fault != 5)
+			UT_ASSERT(cluster_undo_segment_header_seal(expected.data));
 		canonical_file = tmpfile();
 		UT_ASSERT(canonical_file != NULL && owner != NULL);
 		UT_ASSERT_EQ(ftruncate(fileno(canonical_file), UNDO_SEGMENT_SIZE_BYTES), 0);
@@ -10229,6 +10235,7 @@ UT_TEST(test_cold_header_full_image_materializes_only_its_prefix)
 		UT_ASSERT_EQ(fstat(fileno(canonical_file), &st), 0);
 		UT_ASSERT_EQ(st.st_size, UNDO_SEGMENT_SIZE_BYTES);
 		cluster_undo_segment_make_header_bytes(513, 3, header.data);
+		UT_ASSERT(cluster_undo_segment_header_seal(header.data));
 		UT_ASSERT(pread(fileno(canonical_file), after.data, BLCKSZ, 0) == BLCKSZ);
 		UT_ASSERT(memcmp(after.data, header.data, BLCKSZ) == 0);
 		memset(header.data, 0, BLCKSZ);
@@ -10378,6 +10385,7 @@ UT_TEST(test_cold_head_record_requires_installed_exact_data_before_header)
 		UT_ASSERT(pread(fileno(canonical_file), after.data, BLCKSZ, 0) == BLCKSZ);
 		((UndoSegmentHeaderData *)header.data)->tt_slots[4].first_undo_block
 			= operation.undo.first_undo_block;
+		UT_ASSERT(cluster_undo_segment_header_seal(header.data));
 		UT_ASSERT(memcmp(after.data, header.data, BLCKSZ) == 0);
 		UT_ASSERT(pread(fileno(canonical_file), after.data, BLCKSZ, 9 * BLCKSZ) == BLCKSZ);
 		UT_ASSERT(memcmp(after.data, data.data, BLCKSZ) == 0);
@@ -10631,6 +10639,7 @@ UT_TEST(test_cold_exact_abort_record_installs_only_its_terminal_header)
 			 * flags; this is not an idempotent no-work or GC proof. */
 			if (repeat == 2) {
 				h->tt_slots[4].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+				UT_ASSERT(cluster_undo_segment_header_seal(header.data));
 				UT_ASSERT(pwrite(fileno(canonical_file), header.data, BLCKSZ, 0) == BLCKSZ);
 			}
 			canonical_writes = canonical_syncs = cold_source_calls = 0;
@@ -10642,6 +10651,7 @@ UT_TEST(test_cold_exact_abort_record_installs_only_its_terminal_header)
 			UT_ASSERT(pread(fileno(canonical_file), after.data, BLCKSZ, 0) == BLCKSZ);
 			h->tt_slots[4].status = TT_SLOT_ABORTED;
 			h->tt_slots[4].flags = TT_FLAGS_RESERVED;
+			UT_ASSERT(cluster_undo_segment_header_seal(header.data));
 			UT_ASSERT(memcmp(header.data, after.data, BLCKSZ) == 0);
 			UT_ASSERT(pread(fileno(canonical_file), after.data, BLCKSZ, 9 * BLCKSZ) == BLCKSZ);
 			UT_ASSERT(memcmp(data.data, after.data, BLCKSZ) == 0);
@@ -11281,6 +11291,7 @@ UT_TEST(test_cold_native_commit_record_installs_only_selected_terminal)
 						  && cold_stats_order < prepare_apply.terminal_projection_order);
 			((UndoSegmentHeaderData *)header.data)->tt_slots[4].status = TT_SLOT_COMMITTED;
 			((UndoSegmentHeaderData *)header.data)->tt_slots[4].commit_scn = 999;
+		UT_ASSERT(cluster_undo_segment_header_seal(header.data));
 			UT_ASSERT(pread(fileno(canonical_file), after.data, BLCKSZ, 0) == BLCKSZ);
 			UT_ASSERT(memcmp(header.data, after.data, BLCKSZ) == 0);
 			UT_ASSERT(pread(fileno(canonical_file), after.data, BLCKSZ, 9 * BLCKSZ) == BLCKSZ);
@@ -11801,7 +11812,9 @@ UT_TEST(test_cold_ctrc_record_changes_only_selected_release_bit)
 		UT_ASSERT(pwrite(fileno(canonical_file), header.data, BLCKSZ, 0) == BLCKSZ);
 		UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &operation));
 		for (int repeat = 0; repeat < 2; repeat++) {
-			canonical_writes = canonical_syncs = cold_source_calls = 0;
+			if (variant < 2)
+			UT_ASSERT(cluster_undo_segment_header_seal(expected.data));
+		canonical_writes = canonical_syncs = cold_source_calls = 0;
 			cold_source_ready = false;
 			UT_ASSERT_EQ(
 				rf_side_online_production_apply_record_v1(plan, 0, &operation.identity, &owner),
@@ -11839,6 +11852,7 @@ UT_TEST(test_cold_ctrc_record_requires_prior_terminal_and_leaves_future_unapplie
 	UT_ASSERT(pwrite(fileno(canonical_file), header.data, BLCKSZ, 0) == BLCKSZ);
 	expected = header;
 	((UndoSegmentHeaderData *)expected.data)->tt_slots[4].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+	UT_ASSERT(cluster_undo_segment_header_seal(expected.data));
 	cold_source_calls = 0;
 	cold_source_ready = false;
 	UT_ASSERT_EQ(rf_side_online_production_apply_record_v1(plan, 1, &operation.identity, &owner),
@@ -12123,6 +12137,7 @@ UT_TEST(test_cold_selected_compound_commit_preserves_all_effect_order)
 			UT_ASSERT(cold_locks_order < compound_order);
 		((UndoSegmentHeaderData *)header.data)->tt_slots[4].status = TT_SLOT_COMMITTED;
 		((UndoSegmentHeaderData *)header.data)->tt_slots[4].commit_scn = 999;
+		UT_ASSERT(cluster_undo_segment_header_seal(header.data));
 		UT_ASSERT(pread(fileno(canonical_file), after.data, BLCKSZ, 0) == BLCKSZ);
 		UT_ASSERT(memcmp(header.data, after.data, BLCKSZ) == 0);
 		UT_ASSERT(pread(fileno(canonical_file), after.data, BLCKSZ, 9 * BLCKSZ) == BLCKSZ);

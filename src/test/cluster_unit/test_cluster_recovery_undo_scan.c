@@ -5,6 +5,7 @@
 #include "cluster/cluster_recovery_undo_scan.h"
 #include "cluster/cluster_undo_segment_init.h"
 #include "unit_test.h"
+#include "storage/checksum.h"
 
 UT_DEFINE_GLOBALS();
 
@@ -539,10 +540,70 @@ UT_TEST(test_payload_unknown_flags_and_slot_header_disagreement_refuse)
 	}
 }
 
+/* Use the upstream checksum object, independently of the undo writer. */
+static void
+checksum_fixture(PGAlignedBlock *page)
+{
+	((PageHeader)page->data)->pd_checksum = pg_checksum_page(page->data, 0);
+}
+
+UT_TEST(test_protected_header_rejects_single_byte_damage_before_export)
+{
+	PGAlignedBlock original, changed;
+	const size_t offsets[] = { offsetof(UndoSegmentHeaderData, wrap_count),
+		offsetof(UndoSegmentHeaderData, tt_slots) + offsetof(TTSlot, xid), BLCKSZ - 1 };
+	ClusterRecoveryUndoScan *scan = NULL;
+
+	cluster_undo_segment_make_header_bytes(1, 1, original.data);
+	checksum_fixture(&original);
+	UT_ASSERT_EQ(cluster_recovery_undo_scan_begin(original.data, BLCKSZ, 1, 1, &scan),
+		CLUSTER_RECOVERY_UNDO_MORE);
+	cluster_recovery_undo_scan_destroy(scan);
+	for (unsigned i = 0; i < lengthof(offsets); i++) {
+		changed = original;
+		changed.data[offsets[i]] ^= 1;
+		scan = NULL;
+		UT_ASSERT_EQ(cluster_recovery_undo_scan_begin(changed.data, BLCKSZ, 1, 1, &scan),
+			CLUSTER_RECOVERY_UNDO_CORRUPT);
+		UT_ASSERT_NULL(scan);
+		cluster_recovery_undo_scan_destroy(scan);
+	}
+}
+
+UT_TEST(test_torn_header_is_not_a_stable_qualified_base)
+{
+	PGAlignedBlock old, newer, torn;
+	ClusterRecoveryUndoScan *scan = NULL;
+
+	cluster_undo_segment_make_header_bytes(1, 1, old.data);
+	checksum_fixture(&old);
+	newer = old;
+	((UndoSegmentHeaderData *)newer.data)->tt_slots[0].xid = 123;
+	newer.data[BLCKSZ - 1] = 42;
+	checksum_fixture(&newer);
+	for (int prefix = 0; prefix < 2; prefix++) {
+		torn = prefix ? newer : old;
+		memcpy(torn.data + BLCKSZ / 2,
+			(prefix ? old.data : newer.data) + BLCKSZ / 2, BLCKSZ / 2);
+		scan = NULL;
+		UT_ASSERT_EQ(cluster_recovery_undo_scan_begin(torn.data, BLCKSZ, 1, 1, &scan),
+			CLUSTER_RECOVERY_UNDO_CORRUPT);
+		UT_ASSERT_NULL(scan);
+		cluster_recovery_undo_scan_destroy(scan);
+	}
+	/* Legacy is unverified, not corruption. Raw scanning grants no top proof. */
+	((PageHeader)old.data)->pd_checksum = 0;
+	UT_ASSERT_EQ(cluster_recovery_undo_scan_begin(old.data, BLCKSZ, 1, 1, &scan),
+		CLUSTER_RECOVERY_UNDO_MORE);
+	cluster_recovery_undo_scan_destroy(scan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(14);
+	UT_RUN(test_protected_header_rejects_single_byte_damage_before_export);
+	UT_RUN(test_torn_header_is_not_a_stable_qualified_base);
 	UT_RUN(test_original_initializer_and_generation_zero);
 	UT_RUN(test_all_slots_and_raw_header_survive_without_terminal_decisions);
 	UT_RUN(test_mismatched_segment_and_owner_cannot_export_a_prefix);

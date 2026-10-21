@@ -237,6 +237,13 @@ extern void cluster_undo_block0_flush_sync(ClusterUndoBlock0Pin *pin, const char
 extern void cluster_undo_block0_unpin(ClusterUndoBlock0Pin *pin);
 extern void cluster_undo_block0_pin_downgrade(ClusterUndoBlock0Pin *pin);
 extern void cluster_undo_block0_release_reservation(ClusterUndoBlock0Pin *pin);
+/* Serialize physical header RMW with the existing content owner. Already-X
+ * callers retain their lock; SHARED cannot be upgraded. No authority granted.
+ * UINT32_MAX means no lock was acquired (already-X or single-user bootstrap). */
+extern bool cluster_undo_block0_header_write_lock(uint32 segment_id, uint8 owner_instance,
+	uint32 *acquired_slot);
+extern void cluster_undo_block0_header_write_unlock(uint32 acquired_slot);
+
 /* Checkpoint coverage of header bytes written without an fsync. */
 extern bool cluster_undo_block0_note_unsynced_header(uint32 segment_id, uint8 owner_instance,
 													 ClusterUndoPathIntent intent);
