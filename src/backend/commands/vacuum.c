@@ -25,6 +25,7 @@
  *	  - Retain a transaction snapshot during shared database maintenance.
  *	  - Use durable legal-next XID age for shared aggressive scans.
  *	  - Bound shared rel/datfrozenxid merges by a durable FullXid window.
+ *	  - Reject native maintenance outside that shared catalogue window.
  *
  *-------------------------------------------------------------------------
  */
@@ -2045,6 +2046,26 @@ vac_update_datfrozenxid_internal(void)
 						  lastSaneFrozenXid, lastSaneMinMulti);
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Check a raw catalogue XID against one captured legal allocation window. */
+static bool
+vacuum_xid_in_legal_window(TransactionId xid, FullTransactionId legal_next)
+{
+	FullTransactionId full;
+	uint64		next_value;
+	uint64		value;
+
+	if (!TransactionIdIsNormal(xid) || !FullTransactionIdIsValid(legal_next) ||
+		!TransactionIdIsNormal(XidFromFullTransactionId(legal_next)))
+		return false;
+
+	full = cluster_xid_widen(xid, legal_next);
+	next_value = U64FromFullTransactionId(legal_next);
+	value = U64FromFullTransactionId(full);
+	return FullTransactionIdIsValid(full) && value <= next_value &&
+		next_value - value < UINT64CONST(0x80000000);
+}
+#endif
 
 /*
  *	vac_truncate_clog() -- attempt to truncate the commit log
@@ -2069,7 +2090,7 @@ vac_truncate_clog(TransactionId frozenXID,
 				  TransactionId lastSaneFrozenXid,
 				  MultiXactId lastSaneMinMulti)
 {
-	TransactionId nextXID = ReadNextTransactionId();
+	TransactionId nextXID;
 	Relation	relation;
 	TableScanDesc scan;
 	HeapTuple	tuple;
@@ -2077,8 +2098,31 @@ vac_truncate_clog(TransactionId frozenXID,
 	Oid			minmulti_datoid;
 	bool		bogus = false;
 	bool		frozenAlreadyWrapped = false;
+#ifdef USE_PGRAC_CLUSTER
+	bool		shared_xid = cluster_storage_mode_enabled() && cluster_shared_catalog;
+	FullTransactionId legal_next = InvalidFullTransactionId;
+	ClusterXidStripeSampleFence fence;
 
-	/* Restrict task to one backend per cluster; see SimpleLruTruncate(). */
+	/* Sample before taking the native maintenance lock or doing catalogue I/O. */
+	if (shared_xid)
+	{
+		bool		sampled;
+
+		if (!cluster_xid_striping || ShmemVariableCache == NULL)
+			return;
+		LWLockAcquire(XidGenLock, LW_SHARED);
+		sampled = cluster_xid_stripe_sample_future(ShmemVariableCache->nextXid,
+												 &legal_next, &fence);
+		LWLockRelease(XidGenLock);
+		if (!sampled || !vacuum_xid_in_legal_window(frozenXID, legal_next) ||
+			!vacuum_xid_in_legal_window(lastSaneFrozenXid, legal_next))
+			return;
+	}
+#endif
+
+	nextXID = ReadNextTransactionId();
+
+	/* Restrict task to one backend in this instance; see SimpleLruTruncate(). */
 	LWLockAcquire(WrapLimitsVacuumLock, LW_EXCLUSIVE);
 
 	/* init oldest datoids to sync with my frozenXID/minMulti values */
@@ -2113,9 +2157,6 @@ vac_truncate_clog(TransactionId frozenXID,
 		TransactionId datfrozenxid = dbform->datfrozenxid;
 		TransactionId datminmxid = dbform->datminmxid;
 
-		Assert(TransactionIdIsNormal(datfrozenxid));
-		Assert(MultiXactIdIsValid(datminmxid));
-
 		/*
 		 * If database is in the process of getting dropped, or has been
 		 * interrupted while doing so, no connections to it are possible
@@ -2129,6 +2170,16 @@ vac_truncate_clog(TransactionId frozenXID,
 				 NameStr(dbform->datname));
 			continue;
 		}
+
+#ifdef USE_PGRAC_CLUSTER
+		if (shared_xid && !vacuum_xid_in_legal_window(datfrozenxid, legal_next))
+		{
+			bogus = true;
+			continue;
+		}
+#endif
+		Assert(TransactionIdIsNormal(datfrozenxid));
+		Assert(MultiXactIdIsValid(datminmxid));
 
 		/*
 		 * If things are working properly, no database should have a
@@ -2183,6 +2234,15 @@ vac_truncate_clog(TransactionId frozenXID,
 		LWLockRelease(WrapLimitsVacuumLock);
 		return;
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	/* This is an additional refusal, not a freeze certificate or a pin proof. */
+	if (shared_xid && !cluster_xid_stripe_sample_fence_current(&fence))
+	{
+		LWLockRelease(WrapLimitsVacuumLock);
+		return;
+	}
+#endif
 
 	/*
 	 * Freeze any old transaction IDs in the async notification queue before
