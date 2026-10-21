@@ -9,12 +9,46 @@
 #include "cluster/cluster_recovery_ctrc_record.h"
 #ifdef USE_PGRAC_CLUSTER
 
+#include "access/rmgr.h"
 #include "access/xlogrecord.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_segment_init.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "common/cryptohash.h"
 #include "port/pg_crc32c.h"
+#include "replication/origin.h"
+
+bool
+cluster_recovery_ctrc_read_v2(const XLogReaderState *reader, ClusterRecoveryCTRCReleaseV2 *out)
+{
+	ClusterRecoveryCTRCReleaseV2 record;
+
+	if (out == NULL)
+		return false;
+	/* Consume only the completed current record. EndRecPtr includes any WAL
+	 * page headers; neither byte count nor a readahead buffer supplies its end. */
+	if (reader == NULL || reader->record == NULL || reader->system_identifier == 0
+		|| reader->ReadRecPtr == InvalidXLogRecPtr || reader->EndRecPtr <= reader->ReadRecPtr
+		|| reader->record->lsn != reader->ReadRecPtr
+		|| reader->record->next_lsn != reader->EndRecPtr
+		|| XLogRecGetRmid(reader) != RM_CLUSTER_UNDO_ID
+		|| XLogRecGetInfo(reader) != CLUSTER_RECOVERY_CTRC_WAL_INFO
+		|| XLogRecHasAnyBlockRefs(reader) || XLogRecHasPageVersionEdge(reader)
+		|| TransactionIdIsValid(XLogRecGetXid(reader))
+		|| TransactionIdIsValid(XLogRecGetTopXid(reader))
+		|| XLogRecGetOrigin(reader) != InvalidRepOriginId
+		|| !cluster_recovery_ctrc_decode_v2((const uint8 *)XLogRecGetData(reader),
+											XLogRecGetDataLen(reader), reader->system_identifier,
+											&record)
+		|| record.writer_thread != reader->cluster_expected_thread_id)
+		goto refused;
+	*out = record;
+	return true;
+
+refused:
+	memset(out, 0, sizeof(*out));
+	return false;
+}
 
 ClusterRecoveryCTRCTargetMatchV2
 cluster_recovery_ctrc_target_match_v2(const uint8 *payload, size_t payload_length,

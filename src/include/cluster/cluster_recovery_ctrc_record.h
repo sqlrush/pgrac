@@ -12,9 +12,13 @@
 #include "cluster/cluster_tt_slot.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "access/xlogreader.h"
+
 #define CLUSTER_RECOVERY_CTRC_VERSION UINT16_C(2)
 #define CLUSTER_RECOVERY_CTRC_BYTES 320
 #define CLUSTER_RECOVERY_CTRC_RELEASE_PROVEN UINT32_C(1)
+/* Frozen encoding only; no resource-manager registration or live dispatch. */
+#define CLUSTER_RECOVERY_CTRC_WAL_INFO UINT8_C(0xD0)
 
 /* Logical fields, never an on-disk struct. Reserved bytes and the payload/
  * identity hashes are derived by the codec, not supplied by the caller. */
@@ -57,6 +61,16 @@ extern bool cluster_recovery_ctrc_encode_v2(const ClusterRecoveryCTRCReleaseV2 *
 extern bool cluster_recovery_ctrc_decode_v2(const uint8 *bytes, size_t length,
 											uint64 system_identifier,
 											ClusterRecoveryCTRCReleaseV2 *out);
+
+/* Read only the current record after a successful original native WAL read.
+ * Require its actual positions, standalone recovery frame and original
+ * system/expected-thread selection. Native reader CRC/framing, source/cut,
+ * retention and owner authority remain prerequisites, not proofs produced by
+ * this adapter. No raw-record SHA/reference, graph, target applicability or
+ * completion is derived here. Never treat the decoded header as complete raw
+ * bytes. On refusal clear *out; out must not overlap reader-owned storage. */
+extern bool cluster_recovery_ctrc_read_v2(const XLogReaderState *reader,
+										  ClusterRecoveryCTRCReleaseV2 *out);
 
 typedef enum ClusterRecoveryCTRCTargetMatchV2 {
 	CLUSTER_RECOVERY_CTRC_TARGET_REFUSED = 0,

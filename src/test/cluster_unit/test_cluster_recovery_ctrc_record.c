@@ -1,6 +1,8 @@
 /* Author: SqlRush <sqlrush@gmail.com> */
 #include "postgres.h"
 #include "access/xlogrecord.h"
+#include "access/xlog_internal.h"
+#include "access/rmgr.h"
 #include "port/pg_crc32c.h"
 #include "cluster/cluster_recovery_ctrc_record.h"
 #include "cluster/cluster_uba.h"
@@ -1052,10 +1054,408 @@ UT_TEST(target_legal_native_boundaries)
 	}
 }
 
+
+/* Original reader over two in-memory WAL pages. The fixture supplies bytes and
+ * selected system/thread, not a replacement decoder or completion proof. */
+#define NATIVE_SEG_SIZE (16 * 1024 * 1024)
+#define NATIVE_BASE ((XLogRecPtr)NATIVE_SEG_SIZE)
+#define NATIVE_BLOCK 1
+#define NATIVE_ORIGIN 2
+#define NATIVE_TOP_XID 4
+#define NATIVE_EDGE 8
+
+typedef union NativeRaw {
+	XLogRecord align;
+	uint8 bytes[1024];
+} NativeRaw;
+
+typedef struct NativePages {
+	PGAlignedXLogBlock pages[2];
+	unsigned reads;
+} NativePages;
+
+static void
+native_crc(NativeRaw *wire, size_t length)
+{
+	pg_crc32c crc;
+
+	wire->align.xl_tot_len = length;
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, wire->bytes + SizeOfXLogRecord, length - SizeOfXLogRecord);
+	COMP_CRC32C(crc, wire->bytes, offsetof(XLogRecord, xl_crc));
+	FIN_CRC32C(crc);
+	wire->align.xl_crc = crc;
+}
+
+static size_t
+native_wire(NativeRaw *wire, const uint8 *payload, uint32 length, unsigned extra)
+{
+	uint8 *next;
+	RepOriginId origin = 7;
+	TransactionId top = 123;
+
+	memset(wire, 0, sizeof(*wire));
+	wire->align.xl_rmid = RM_CLUSTER_UNDO_ID;
+	wire->align.xl_info = 0xD0; /* Frozen D2 encoding, independent of adapter. */
+	wire->align.xl_scn = 41;
+	next = wire->bytes + SizeOfXLogRecord;
+	if (extra & NATIVE_EDGE) {
+		/* One valid PageVersion edge for the following block, canonical LE. */
+		memset(next, 0, 64);
+		next[0] = XLR_BLOCK_ID_PAGE_VERSION_EDGE;
+		next[1] = 1;
+		next[2] = 1;
+		next[3] = 48;
+		next[8] = 99;
+		next[17] = RF_PAGE_CLASS_ORDINARY;
+		next[18] = next[19] = RF_PAGE_STATE_PRESENT;
+		for (unsigned i = 0; i < 16; i++)
+			next[24 + i] = next[48 + i] = 7 + i;
+		next[40] = 41;
+		next += 64;
+	}
+	if (extra & (NATIVE_BLOCK | NATIVE_EDGE)) {
+		XLogRecordBlockHeader block = { 0 };
+		RelFileLocator locator = { 1663, 5, 17 };
+		BlockNumber block_number = 23;
+
+		memcpy(next, &block, SizeOfXLogRecordBlockHeader);
+		next += SizeOfXLogRecordBlockHeader;
+		memcpy(next, &locator, sizeof(locator));
+		next += sizeof(locator);
+		memcpy(next, &block_number, sizeof(block_number));
+		next += sizeof(block_number);
+	}
+	if (extra & NATIVE_ORIGIN) {
+		*next++ = XLR_BLOCK_ID_ORIGIN;
+		memcpy(next, &origin, sizeof(origin));
+		next += sizeof(origin);
+	}
+	if (extra & NATIVE_TOP_XID) {
+		*next++ = XLR_BLOCK_ID_TOPLEVEL_XID;
+		memcpy(next, &top, sizeof(top));
+		next += sizeof(top);
+	}
+	*next++ = XLR_BLOCK_ID_DATA_LONG;
+	memcpy(next, &length, sizeof(length));
+	next += sizeof(length);
+	memcpy(next, payload, length);
+	next += length;
+	native_crc(wire, next - wire->bytes);
+	return next - wire->bytes;
+}
+
+static int
+native_page_read(XLogReaderState *reader, XLogRecPtr target, int required pg_attribute_unused(),
+				 XLogRecPtr record pg_attribute_unused(), char *buffer)
+{
+	NativePages *pages = reader->private_data;
+
+	pages->reads++;
+	if (target != NATIVE_BASE && target != NATIVE_BASE + XLOG_BLCKSZ)
+		return -1;
+	memcpy(buffer, pages->pages[(target - NATIVE_BASE) / XLOG_BLCKSZ].data, XLOG_BLCKSZ);
+	reader->seg.ws_tli = 1;
+	return XLOG_BLCKSZ;
+}
+
+static bool
+native_read(NativePages *pages, const NativeRaw *wire, size_t length, bool cross_page,
+			XLogReaderState **out)
+{
+	XLogReaderRoutine routine = { .page_read = native_page_read };
+	XLogLongPageHeader first;
+	XLogPageHeader second;
+	XLogRecPtr start;
+	size_t offset, available;
+	char *error = NULL;
+
+	memset(pages, 0, sizeof(*pages));
+	first = (XLogLongPageHeader)pages->pages[0].data;
+	first->std.xlp_magic = XLOG_PAGE_MAGIC;
+	first->std.xlp_info = XLP_LONG_HEADER;
+	first->std.xlp_tli = 1;
+	first->std.xlp_pageaddr = NATIVE_BASE;
+	first->std.xlp_thread_id = 3;
+	first->xlp_sysid = SYSTEM_ID;
+	first->xlp_seg_size = NATIVE_SEG_SIZE;
+	first->xlp_xlog_blcksz = XLOG_BLCKSZ;
+	offset = cross_page ? XLOG_BLCKSZ - 128 : SizeOfXLogLongPHD;
+	available = XLOG_BLCKSZ - offset;
+	memcpy(pages->pages[0].data + offset, wire->bytes, Min(length, available));
+	if (length > available) {
+		second = (XLogPageHeader)pages->pages[1].data;
+		second->xlp_magic = XLOG_PAGE_MAGIC;
+		second->xlp_info = XLP_FIRST_IS_CONTRECORD;
+		second->xlp_tli = 1;
+		second->xlp_pageaddr = NATIVE_BASE + XLOG_BLCKSZ;
+		second->xlp_thread_id = 3;
+		second->xlp_rem_len = length - available;
+		memcpy(pages->pages[1].data + SizeOfXLogShortPHD, wire->bytes + available,
+			   length - available);
+	}
+	*out = XLogReaderAllocate(NATIVE_SEG_SIZE, NULL, &routine, pages);
+	if (*out == NULL)
+		abort();
+	(*out)->system_identifier = SYSTEM_ID;
+	(*out)->cluster_expected_thread_id = 3;
+	start = NATIVE_BASE + offset;
+	XLogBeginRead(*out, start);
+	return XLogReadRecord(*out, &error) != NULL;
+}
+
+static bool
+reader_refused(const XLogReaderState *reader)
+{
+	struct {
+		uint64 before;
+		ClusterRecoveryCTRCReleaseV2 value;
+		uint64 after;
+	} out;
+
+	memset(&out, 0xa5, sizeof(out));
+	return !cluster_recovery_ctrc_read_v2(reader, &out.value)
+		   && all_zero(&out.value, sizeof(out.value)) && out.before == UINT64_C(0xa5a5a5a5a5a5a5a5)
+		   && out.after == UINT64_C(0xa5a5a5a5a5a5a5a5);
+}
+
+UT_TEST(reader_terminal_payloads_and_immutability)
+{
+	NativeRaw wire;
+	NativePages pages, saved_pages;
+	XLogReaderState *reader, saved_reader;
+	ClusterRecoveryCTRCReleaseV2 out, expected;
+	uint8 payload[320];
+
+	for (unsigned terminal = TT_SLOT_COMMITTED; terminal <= TT_SLOT_ABORTED; terminal++) {
+		size_t length;
+
+		expected = sample();
+		expected.terminal_outcome = expected.before.status = expected.after.status = terminal;
+		if (terminal == TT_SLOT_ABORTED)
+			expected.before.commit_scn = expected.after.commit_scn = InvalidScn;
+		UT_ASSERT(cluster_recovery_ctrc_encode_v2(&expected, SYSTEM_ID, payload, sizeof(payload)));
+		length = native_wire(&wire, payload, sizeof(payload), 0);
+		UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+		saved_pages = pages;
+		saved_reader = *reader;
+		UT_ASSERT(cluster_recovery_ctrc_read_v2(reader, &out));
+		UT_ASSERT(same_fields(&out, &expected));
+		UT_ASSERT(cluster_recovery_ctrc_read_v2(reader, &out));
+		UT_ASSERT(memcmp(&pages, &saved_pages, sizeof(pages)) == 0);
+		UT_ASSERT(memcmp(reader, &saved_reader, sizeof(*reader)) == 0);
+		UT_ASSERT(memcmp(XLogRecGetData(reader), payload, sizeof(payload)) == 0);
+		XLogReaderFree(reader);
+	}
+}
+
+UT_TEST(reader_cross_page_actual_positions)
+{
+	NativeRaw wire;
+	NativePages pages;
+	XLogReaderState *reader;
+	ClusterRecoveryCTRCReleaseV2 out, expected = sample();
+	size_t length = native_wire(&wire, golden, sizeof(golden), 0);
+
+	UT_ASSERT(native_read(&pages, &wire, length, true, &reader));
+	UT_ASSERT_EQ(reader->ReadRecPtr, NATIVE_BASE + XLOG_BLCKSZ - 128);
+	UT_ASSERT(reader->EndRecPtr - reader->ReadRecPtr > length);
+	UT_ASSERT(reader->record->lsn == reader->ReadRecPtr);
+	UT_ASSERT(reader->record->next_lsn == reader->EndRecPtr);
+	UT_ASSERT(cluster_recovery_ctrc_read_v2(reader, &out));
+	UT_ASSERT(same_fields(&out, &expected));
+	XLogReaderFree(reader);
+}
+
+UT_TEST(reader_exact_rmgr_and_info)
+{
+	NativeRaw wire;
+	NativePages pages;
+	XLogReaderState *reader;
+	ClusterRecoveryCTRCReleaseV2 out;
+
+	for (unsigned info = 0; info <= UINT8_MAX; info++) {
+		size_t length = native_wire(&wire, golden, sizeof(golden), 0);
+		wire.align.xl_info = info;
+		native_crc(&wire, length);
+		UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+		if (info == 0xD0)
+			UT_ASSERT(cluster_recovery_ctrc_read_v2(reader, &out));
+		else
+			UT_ASSERT(reader_refused(reader));
+		XLogReaderFree(reader);
+	}
+	for (unsigned rmid = RM_XLOG_ID; rmid <= RM_XACT_ID; rmid++) {
+		size_t length = native_wire(&wire, golden, sizeof(golden), 0);
+		wire.align.xl_rmid = rmid;
+		native_crc(&wire, length);
+		UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+		UT_ASSERT(reader_refused(reader));
+		XLogReaderFree(reader);
+	}
+}
+
+UT_TEST(reader_standalone_native_frame)
+{
+	NativeRaw wire;
+	NativePages pages;
+	XLogReaderState *reader;
+	const unsigned extras[] = { NATIVE_ORIGIN, NATIVE_TOP_XID, NATIVE_ORIGIN | NATIVE_TOP_XID };
+	const TransactionId xids[] = { BootstrapTransactionId, FrozenTransactionId, 123, UINT32_MAX };
+
+	for (unsigned i = 0; i < lengthof(extras); i++) {
+		size_t length = native_wire(&wire, golden, sizeof(golden), extras[i]);
+		UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+		UT_ASSERT(reader_refused(reader));
+		XLogReaderFree(reader);
+	}
+	for (unsigned i = 0; i < lengthof(xids); i++) {
+		size_t length = native_wire(&wire, golden, sizeof(golden), 0);
+		wire.align.xl_xid = xids[i];
+		native_crc(&wire, length);
+		UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+		UT_ASSERT(reader_refused(reader));
+		XLogReaderFree(reader);
+	}
+}
+
+UT_TEST(reader_extra_block_and_page_edge)
+{
+	NativeRaw wire;
+	NativePages pages;
+	XLogReaderState *reader;
+	const unsigned extras[] = { NATIVE_BLOCK, NATIVE_EDGE };
+
+	for (unsigned i = 0; i < lengthof(extras); i++) {
+		size_t length = native_wire(&wire, golden, sizeof(golden), extras[i]);
+		UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+		UT_ASSERT(XLogRecHasAnyBlockRefs(reader));
+		UT_ASSERT(XLogRecHasPageVersionEdge(reader) == (extras[i] == NATIVE_EDGE));
+		UT_ASSERT(reader_refused(reader));
+		XLogReaderFree(reader);
+	}
+}
+
+UT_TEST(reader_exact_payload_and_codec)
+{
+	NativeRaw wire;
+	NativePages pages;
+	XLogReaderState *reader;
+	uint8 payload[321];
+	const unsigned lengths[] = { 0, 192, 319, 321 };
+	const unsigned offsets[] = { 0, 56, 128, 192, 224, 256, 288 };
+
+	memcpy(payload, golden, sizeof(golden));
+	payload[320] = 0;
+	for (unsigned i = 0; i < lengthof(lengths); i++) {
+		size_t length = native_wire(&wire, payload, lengths[i], 0);
+		UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+		UT_ASSERT(reader_refused(reader));
+		XLogReaderFree(reader);
+	}
+	/* Native CRC is valid; payload digest and semantic/reserved checks remain
+	 * the existing codec's responsibility. */
+	for (unsigned i = 0; i < lengthof(offsets); i++) {
+		size_t length;
+
+		memcpy(payload, golden, sizeof(golden));
+		payload[offsets[i]] ^= 1;
+		length = native_wire(&wire, payload, sizeof(golden), 0);
+		UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+		UT_ASSERT(reader_refused(reader));
+		XLogReaderFree(reader);
+	}
+}
+
+UT_TEST(reader_system_and_selected_thread)
+{
+	NativeRaw wire;
+	NativePages pages;
+	XLogReaderState *reader;
+	ClusterRecoveryCTRCReleaseV2 expected = sample();
+	uint8 payload[320];
+	const uint16 threads[] = { 1, 2, 4 };
+	size_t length;
+
+	for (unsigned i = 0; i < lengthof(threads); i++) {
+		expected.writer_thread = threads[i];
+		UT_ASSERT(cluster_recovery_ctrc_encode_v2(&expected, SYSTEM_ID, payload, sizeof(payload)));
+		length = native_wire(&wire, payload, sizeof(payload), 0);
+		UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+		UT_ASSERT(reader_refused(reader));
+		XLogReaderFree(reader);
+	}
+	length = native_wire(&wire, golden, sizeof(golden), 0);
+	UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+	reader->system_identifier = 0;
+	UT_ASSERT(reader_refused(reader));
+	reader->system_identifier = SYSTEM_ID ^ UINT64_C(0x100000000);
+	UT_ASSERT(reader_refused(reader));
+	reader->system_identifier = SYSTEM_ID;
+	reader->cluster_expected_thread_id = XLP_THREAD_ID_INVALID;
+	UT_ASSERT(reader_refused(reader));
+	reader->cluster_expected_thread_id = XLP_THREAD_ID_LEGACY;
+	UT_ASSERT(reader_refused(reader));
+	XLogReaderFree(reader);
+}
+
+UT_TEST(reader_requires_current_completed_record)
+{
+	NativeRaw wire;
+	NativePages pages;
+	XLogReaderState *reader;
+	XLogReaderState empty = { 0 };
+	DecodedXLogRecord *record;
+	XLogRecPtr start, end;
+	size_t length = native_wire(&wire, golden, sizeof(golden), 0);
+
+	UT_ASSERT(reader_refused(NULL));
+	UT_ASSERT(reader_refused(&empty));
+	UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+	UT_ASSERT(!cluster_recovery_ctrc_read_v2(reader, NULL));
+	record = reader->record;
+	start = reader->ReadRecPtr;
+	end = reader->EndRecPtr;
+	reader->record = NULL;
+	UT_ASSERT(reader_refused(reader));
+	reader->record = record;
+	reader->ReadRecPtr = InvalidXLogRecPtr;
+	UT_ASSERT(reader_refused(reader));
+	reader->ReadRecPtr = start;
+	reader->EndRecPtr = start;
+	UT_ASSERT(reader_refused(reader));
+	reader->EndRecPtr = start - 1;
+	UT_ASSERT(reader_refused(reader));
+	reader->EndRecPtr = end;
+	record->lsn++;
+	UT_ASSERT(reader_refused(reader));
+	record->lsn = start;
+	record->next_lsn++;
+	UT_ASSERT(reader_refused(reader));
+	record->next_lsn = end;
+	record->main_data = NULL;
+	UT_ASSERT(reader_refused(reader));
+	XLogReaderFree(reader);
+}
+
+UT_TEST(reader_native_crc_refusal_is_not_completion)
+{
+	NativeRaw wire;
+	NativePages pages;
+	XLogReaderState *reader;
+	size_t length = native_wire(&wire, golden, sizeof(golden), 0);
+
+	wire.bytes[length - 1] ^= 1; /* Do not reseal native CRC. */
+	UT_ASSERT(!native_read(&pages, &wire, length, false, &reader));
+	UT_ASSERT(reader->record == NULL);
+	UT_ASSERT(reader_refused(reader));
+	XLogReaderFree(reader);
+}
+
 int
 main(void)
 {
-	UT_PLAN(44);
+	UT_PLAN(53);
 	UT_RUN(golden_encoding);
 	UT_RUN(golden_decoding);
 	UT_RUN(unaligned_buffers);
@@ -1100,6 +1500,15 @@ main(void)
 	UT_RUN(target_exact_lengths_and_nulls);
 	UT_RUN(target_unaligned_and_immutable);
 	UT_RUN(target_legal_native_boundaries);
+	UT_RUN(reader_terminal_payloads_and_immutability);
+	UT_RUN(reader_cross_page_actual_positions);
+	UT_RUN(reader_exact_rmgr_and_info);
+	UT_RUN(reader_standalone_native_frame);
+	UT_RUN(reader_extra_block_and_page_edge);
+	UT_RUN(reader_exact_payload_and_codec);
+	UT_RUN(reader_system_and_selected_thread);
+	UT_RUN(reader_requires_current_completed_record);
+	UT_RUN(reader_native_crc_refusal_is_not_completion);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

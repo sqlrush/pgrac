@@ -7557,13 +7557,16 @@ test_cluster_recovery_tt_record: test_cluster_recovery_tt_record.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_recovery_tt_desc.o \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-# D0 codec, raw-record hash and native target match, linked from production.
+# D0 codec, native reader, raw-record hash and native target match.
 test_cluster_recovery_ctrc_record_product.o: $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
 		$(top_srcdir)/src/include/access/xlogdefs.h \
 		$(top_srcdir)/src/include/access/xlogrecord.h \
+		$(top_srcdir)/src/include/access/xlogreader.h \
+		$(top_srcdir)/src/include/access/rmgr.h \
+		$(top_srcdir)/src/include/replication/origin.h \
 		$(top_srcdir)/src/include/port/pg_crc32c.h \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
 		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
@@ -7581,12 +7584,17 @@ test_cluster_recovery_ctrc_header.o: $(top_srcdir)/src/common/cluster_undo_segme
 
 test_cluster_recovery_ctrc_record: test_cluster_recovery_ctrc_record.c unit_test.h \
 		test_cluster_recovery_ctrc_record_product.o test_cluster_recovery_ctrc_header.o \
+		xlogreader_fs.o $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h \
 		$(top_srcdir)/src/include/access/xlogrecord.h \
+		$(top_srcdir)/src/include/access/xlogreader.h \
+		$(top_srcdir)/src/include/access/xlog_internal.h \
+		$(top_srcdir)/src/include/access/rmgr.h \
 		$(top_srcdir)/src/include/port/pg_crc32c.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_recovery_ctrc_record_product.o \
-		test_cluster_recovery_ctrc_header.o $(LDFLAGS) \
+		test_cluster_recovery_ctrc_header.o xlogreader_fs.o $(LDFLAGS) \
+		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
