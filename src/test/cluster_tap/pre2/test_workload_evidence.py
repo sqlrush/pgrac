@@ -232,7 +232,10 @@ class WorkloadEvidenceTests(unittest.TestCase):
                                  ["fields"]["process_incarnation_known"], "0")
 
     def test_unsupported_and_malformed_observations_keep_their_original_meaning(self):
-        raw = line("HOT_FULL", dict(read_scn="9")) + line("E_OTHER", {})
+        # The manifest fixture's default HOT_FULL records now have projections.
+        for node in range(1, 4):
+            self.fixture.put("stderr" + str(node), b"unrelated\n")
+        raw = line("READ_IMAGE_INGRESS", dict(read_scn="9")) + line("E_OTHER", {})
         result = self.read(raw)
         self.assertEqual(result["nodes"][0]["producer_fields"][0]["status"], "UNSUPPORTED")
         self.assertEqual(result["projection_status"], "NOT_OBSERVED")

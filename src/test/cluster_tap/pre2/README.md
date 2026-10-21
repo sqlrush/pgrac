@@ -134,6 +134,7 @@ Extract typed fields from a verified retained capture:
 ```sh
 python3 src/test/cluster_tap/pre2/workload_evidence.py /path/to/capture/manifest.json > evidence.json
 python3 -m unittest discover -s src/test/cluster_tap/pre2 -p test_workload_evidence.py
+python3 -m unittest discover -s src/test/cluster_tap/pre2 -p test_workload_hot_evidence.py
 ```
 
 This uses the manifest format above and preserves its file checks and raw trace
@@ -151,6 +152,9 @@ The supported projections are:
 | `CTRC_RECEIPT` | Canonical transaction key, local reservation, target |
 | `CTRC_RECEIPT_LIFECYCLE` | Canonical key, reservation, target, handle, publication |
 | `CTRC_CONSUME` | Canonical key, handle, consume scalars, final target, consumed data target |
+| `HOT_FULL` | Snapshot, build/search results, before/FULL pages and their root/queried ItemId, tuple and ITL snapshots |
+| `R4_HEAP_UPDATE` | Update scalars, requested/old/new TIDs, undo words, inserted WAL LSN and four page/ItemId snapshots |
+| `R4_UNDO` | Builder/route/walk scalars, locator, UBA words/decoded fields, record header/target, page/ITL and target ItemId/tuple |
 
 Each group has `source_fields`, `raw_values`, `guards`, `missing`, `invalid`
 and `status`. `values` contains a complete typed group only when its status is
@@ -160,6 +164,18 @@ yield `INVALID`. Raw values remain available in either case. Numeric checks
 cover the formatter's decimal representation and range, not protocol validity.
 `OBSERVED` means values appeared in one local diagnostic projection; it does
 not establish a transaction identity, delivered request or retired receipt.
+
+Native slash fields retain their component names: tags, TIDs and tuple masks
+are separate objects; raw UBA words are `word0`/`word1`, without conversion to a
+hex UBA or comparison with another projection. ItemId brace fields retain the
+original brace text in `raw_values` and use dotted `source_fields` paths such
+as `full_root.ctid`. Page, ItemId, tuple and slot known flags gate their own
+groups. A redirect or other non-tuple ItemId can expose its flags and storage
+without supplying a tuple or ITL slot. Raw command IDs are not resolved combo
+command IDs. Before/after pages and record targets stay separate. Inserted WAL
+does not establish flush or durability; the original flush flag remains in
+the trace. HOT decision text is retained raw. Legacy prune/index-delete
+envelopes remain unhandled by the raw reader.
 
 Request and reply IDs remain distinct. Receipt handles do not become receipt
 proofs, and final targets remain separate from consumed data targets after a
