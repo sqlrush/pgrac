@@ -854,7 +854,7 @@ cold_top_tx_frames_v1(const ClusterColdTypedV1 *typed)
  * Neither a different claim/epoch nor history_only erases that conflict.
  * A native ABORT has no physical TT key: require its original exact carrier
  * when it could name this transaction. Absence of conflicting carriers alone
- * is insufficient without the complete native lifecycle and redo below. */
+ * is insufficient without a qualified native base and complete redo below. */
 static bool
 cold_top_tx_terminals_compatible_v1(const ClusterColdTypedV1 *typed,
 									const ClusterColdTtSlotKeyV1 *key)
@@ -921,8 +921,8 @@ cold_top_tx_terminals_compatible_v1(const ClusterColdTypedV1 *typed,
 }
 
 /* Consume the original owner's selected native checkpoint, not a caller's
- * checkpoint number. This binds the source and replay cut only; it does not
- * establish that any captured TT base is covered by that checkpoint. */
+ * checkpoint number. This binds the source and replay cut. Base coverage
+ * also requires the original verified native header and complete redo below. */
 static bool
 cold_top_tx_checkpoint_v1(const ClusterColdTypedV1 *typed, uint32 participant)
 {
@@ -950,6 +950,32 @@ cold_top_tx_checkpoint_v1(const ClusterColdTypedV1 *typed, uint32 participant)
 		   && selected.checkpoint.redo <= selected.checkpoint_start;
 }
 
+/* Called only after the original checkpoint/source, complete inventory,
+ * sealed redo and whole post-redo readback checks. The supported canonical
+ * ACTIVE publisher stores the native top xid. Native COMMIT holds
+ * DELAY_CHKPT_START through its TT stamp, and checkpoint syncs registered
+ * headers before publishing its ROOT. Thus an integrity-checked original
+ * ACTIVE key supplies the pre-redo side of that coverage contract; later
+ * terminals must be supplied by the sealed redo. No lifetime BIND is needed.
+ * A newly checksummed post-image cannot qualify a legacy checksum-zero base,
+ * nor can another generation/slot/wrap/xid borrow this predecessor. */
+static bool
+cold_top_tx_checkpoint_base_v1(const ClusterColdTypedV1 *typed,
+								const ClusterColdTtSlotKeyV1 *key)
+{
+	const UndoSegmentHeaderData *base;
+	ClusterColdTtSlotInputV1 original;
+	uint32 index;
+
+	base = cluster_cold_tt_header_find_v1(typed, false, key->owner_instance, key->segment_id,
+										&index);
+	return base != NULL
+		   && cluster_undo_segment_header_integrity(base) == CLUSTER_UNDO_HEADER_VALID
+		   && cluster_cold_tt_base_slot_v1(typed, index, key->slot_offset, &original)
+		   && original.slot.status == TT_SLOT_ACTIVE
+		   && cold_top_tx_key_equal_v1(&original.key, key);
+}
+
 bool
 cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
 										 struct ClusterRecoveryFencePlan *fence, uint32 participant,
@@ -964,6 +990,7 @@ cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
 	ClusterColdTtSlotInputV1 post_slot;
 	uint32 post_segment_index;
 	uint64 next_xid;
+	bool checkpoint_base;
 
 	if (out == NULL)
 		return false;
@@ -1014,32 +1041,33 @@ cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
 													  &post_image)
 		|| cluster_undo_segment_header_integrity(post_image.page.data) != CLUSTER_UNDO_HEADER_VALID)
 		return false;
-	/* The caller's producer_top bit is not an original producer fact. Only
-	 * this source's exact native BIND currently qualifies this gate here. */
+	/* Either the verified original checkpoint base or this source's exact
+	 * native BIND proves the supported top-only producer format. The caller's
+	 * producer_top bit cannot supply or revoke that native producer fact. */
+	checkpoint_base = cold_top_tx_checkpoint_base_v1(typed, &post_slot.key);
 	qualified = *proof;
 	qualified.producer_top
-		= cold_top_tx_native_bind_v1(typed->side_plans[participant], &post_slot.key);
-	/* Reconstruct the complete generation from its retained native INIT or
-	 * REUSE, with no captured TT predecessor. A raw page and a caller's bit
-	 * cannot establish checkpoint coverage. Older ACTIVE generations without
-	 * this full lifecycle remain blocked until their original base owner can
-	 * supply the independent checkpoint coverage proof. */
-	qualified.qualified_base = rf_side_online_plan_prepare_undo_header_v1(
+		= checkpoint_base || cold_top_tx_native_bind_v1(typed->side_plans[participant], &post_slot.key);
+	/* Without a qualified checkpoint predecessor, retain the alternative
+	 * native INIT/REUSE reconstruction with complete physical agreement.
+	 * Integrity, a checkpoint number or a caller's bit alone is insufficient. */
+	qualified.qualified_base = checkpoint_base
+							   || (rf_side_online_plan_prepare_undo_header_v1(
 								   typed->side_plans[participant], post_slot.key.owner_instance,
 								   post_slot.key.segment_id, NULL, &base_image)
 								   == RF_PAGE_PROOF_DETAIL_OK
 							   && base_image.has_full_image
-							   && memcmp(base_image.page.data, post_image.page.data, BLCKSZ) == 0;
+							   && memcmp(base_image.page.data, post_image.page.data, BLCKSZ) == 0);
 	/* The original all-record effects receipt, bound by the endpoint receipt
 	 * to this exact plan and source set, and the verified ordinary inventory
 	 * establish completed sealed redo. The caller's bit cannot add or revoke
 	 * that fact. Atomic transaction effects remain an independent proof. */
 	qualified.sealed_redo = true;
-	/* The whole retained INIT/REUSE lifecycle reaches this exact physical
-	 * ACTIVE image after completed all-record redo. Together with the full
-	 * retained terminal check, this supplies the terminal proof on either
-	 * side of the selected redo cut. A missing lifecycle/coverage or an
-	 * ambiguous ABORT cannot be replaced by the caller's terminal bit. */
+	/* The qualified checkpoint base or retained INIT/REUSE lifecycle reaches
+	 * this exact physical ACTIVE image after completed all-record redo.
+	 * Together with the full retained terminal check, this supplies both
+	 * sides of the selected redo cut. Missing coverage or an ambiguous ABORT
+	 * cannot be replaced by the caller's terminal bit. */
 	qualified.terminal_match = qualified.qualified_base && qualified.sealed_redo
 							   && cold_top_tx_terminals_compatible_v1(typed, &post_slot.key);
 	/* Only the original target owner can supply real old-writer isolation.

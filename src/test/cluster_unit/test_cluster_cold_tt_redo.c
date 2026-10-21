@@ -3683,6 +3683,138 @@ UT_TEST(tt_top_tx_checkpoint_does_not_qualify_old_active_without_bind)
 	}
 }
 
+/* A complete native checkpoint's header-sync contract and a verified original
+ * base are independent inputs. No INIT/REUSE/BIND is retained in this cut. */
+static uint32
+tt_top_tx_verified_checkpoint_base(TtRedoFixture *f, int variant)
+{
+	FakeXactRecord fake;
+	RfPageOnlineRecordIdentityV1 identity;
+	RfDetachedRecordPlanV1 record;
+	PGAlignedBlock header, undo;
+	uint32 segment = variant == 1 ? 768 : 513;
+
+	if (variant == 2)
+		tt_redo_base_graph_fixture(f, 200, &undo);
+	else
+		tt_redo_fixture(f, 200, RF_SIDE_PLAN_RECOVERY);
+	((UndoSegmentHeaderData *)f->base.data)->tt_slots[47].first_undo_block
+		= (UBA)InvalidUba_init;
+	UT_ASSERT(cluster_undo_segment_header_seal(f->base.data));
+	tt_readback_write(513, &f->base, false);
+	if (variant == 1) {
+		header = f->base;
+		((UndoSegmentHeaderData *)header.data)->segment_id = segment;
+		((UndoSegmentHeaderData *)header.data)->wrap_count = 17;
+		UT_ASSERT(cluster_undo_segment_header_seal(header.data));
+		tt_readback_write(segment, &header, true);
+	}
+	tt_redo_seed_recapture(f);
+	make_projection_record(&fake, RM_XLOG_ID, XLOG_NOOP, NULL, 0);
+	fake.u.decoded.max_block_id = -1;
+	fake.u.decoded.header.xl_xid = fake.u.decoded.toplevel_xid = InvalidTransactionId;
+	identity = make_identity(&fake, f->typed.observer.storage_uuid);
+	set_identity_range(&fake, &identity, 100, 200);
+	record = make_projection_record_plan(&fake);
+	UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(f->typed.side_plans[0], &record, &identity),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	tt_redo_seal(f);
+	if (variant == 2) {
+		ClusterColdTtBaseRedoGraphInputV1 input = { &f->typed, 0 };
+		ClusterRecoveryReferenceGraph *graph = NULL;
+		ClusterRecoveryGraphRecord out;
+		ClusterRecoveryGraphResult result = CLUSTER_RECOVERY_GRAPH_MORE;
+		unsigned seen = 0;
+
+		/* Retain the actual original UNDO input before capturing its readback. */
+		UT_ASSERT_EQ(cluster_cold_typed_tt_base_redo_graph_begin_v1(
+			&input, 1024 * 1024, &graph), CLUSTER_RECOVERY_GRAPH_MORE);
+		if (graph != NULL) {
+			for (unsigned i = 0; i < 64; i++) {
+				result = cluster_recovery_reference_graph_step(graph, &out);
+				if (result == CLUSTER_RECOVERY_GRAPH_RECORD)
+					seen++;
+				else if (result != CLUSTER_RECOVERY_GRAPH_MORE)
+					break;
+			}
+			UT_ASSERT_EQ(seen, 1);
+			UT_ASSERT_EQ(result, CLUSTER_RECOVERY_GRAPH_DRAINED);
+			UT_ASSERT(cluster_recovery_reference_graph_observed(graph));
+			cluster_recovery_reference_graph_destroy(graph);
+		}
+	}
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f->typed), CLUSTER_COLD_OK);
+	f->typed.xid_next_after_redo = UINT64_C(0x700400200);
+	tt_top_tx_effects_complete(f);
+	tt_top_tx_endpoints_complete(f);
+	return segment;
+}
+
+UT_TEST(tt_top_tx_checkpoint_qualifies_verified_old_active_without_bind)
+{
+	for (int variant = 0; variant < 3; variant++) {
+		TtRedoFixture f;
+		ClusterColdTtSlotInputV1 input;
+		ClusterColdTopTxProofV1 proof;
+		ClusterRecoveryTTAbortV1 shape;
+		ClusterColdTopTxC0ProducerResultV1 out;
+		uint32 segment = tt_top_tx_verified_checkpoint_base(&f, variant);
+		uint32 index;
+		char path[MAXPGPATH];
+
+		UT_ASSERT_NOT_NULL(cluster_cold_tt_header_find_v1(&f.typed, true, 3, segment, &index));
+		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, index, 4, &input));
+		UT_ASSERT_EQ(input.key.segment_generation, variant == 1 ? 17 : 0);
+		UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(f.typed.side_plans[0]), 1);
+		UT_ASSERT(cluster_cold_typed_tt_redo_inventory_v1(&f.typed));
+		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+		proof.producer_top = proof.qualified_base = proof.sealed_redo = false;
+		proof.terminal_match = proof.old_writer_isolated = false;
+		UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(
+			&f.typed, TT_C0_FENCE, 0, &proof, &shape, false, InvalidTransactionId,
+			UINT64_C(0x12345678), &out));
+		UT_ASSERT(memcmp(&out.loser.key, &input.key, sizeof(input.key)) == 0);
+		UT_ASSERT_EQ(out.c0.record.exact.segment_generation, input.key.segment_generation);
+		UT_ASSERT_EQ(out.c0.record.exact.xid, input.key.xid);
+		if (variant == 1) {
+			snprintf(path, sizeof(path), "%s/%u", tt_redo_dir, segment);
+			UT_ASSERT_EQ(unlink(path), 0);
+		}
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_top_tx_verified_old_base_requires_original_checkpoint_and_effects)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		TtRedoFixture f;
+		ClusterColdTtSlotInputV1 input;
+		ClusterColdTopTxProofV1 proof;
+		ClusterRecoveryTTAbortV1 shape;
+		ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
+
+		(void)tt_top_tx_verified_checkpoint_base(&f, 0);
+		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &input));
+		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+		if (fault == 0)
+			f.checkpoints[0].captured = false;
+		else if (fault == 1)
+			f.checkpoints[0].checkpoint.source.claim.claim_sha256[0]++;
+		else if (fault == 2)
+			f.checkpoints[0].checkpoint.checkpoint.redo++;
+		else if (fault == 3)
+			f.typed.effects_receipt.proof.invalid = true;
+		else
+			proof.ordinary_effects = false;
+		memset(&out, 0xa9, sizeof(out));
+		UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(
+			&f.typed, TT_C0_FENCE, 0, &proof, &shape, false, InvalidTransactionId,
+			UINT64_C(0x12345678), &out));
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		tt_redo_destroy(&f);
+	}
+}
+
 UT_TEST(tt_top_tx_checkpoint_source_does_not_authenticate_raw_base_bytes)
 {
 	for (int field = 0; field < 2; field++) {
@@ -7863,7 +7995,7 @@ UT_TEST(tt_top_tx_c0_producer_rechecks_before_output)
 int
 main(void)
 {
-	UT_PLAN(165);
+	UT_PLAN(167);
 	UT_RUN(tt_after_redo_checks_canonical_active_undo_chain_input);
 	UT_RUN(tt_after_redo_checks_spill_active_undo_chain_input);
 	UT_RUN(tt_after_redo_checks_canonical_active_undo_head_input);
@@ -7905,6 +8037,8 @@ main(void)
 	UT_RUN(tt_top_tx_c0_rebuilds_damaged_base_only_from_sealed_full_lifecycle);
 	UT_RUN(tt_top_tx_c0_producer_refuses_unqualified_raw_base);
 	UT_RUN(tt_top_tx_checkpoint_does_not_qualify_old_active_without_bind);
+	UT_RUN(tt_top_tx_checkpoint_qualifies_verified_old_active_without_bind);
+	UT_RUN(tt_top_tx_verified_old_base_requires_original_checkpoint_and_effects);
 	UT_RUN(tt_top_tx_checkpoint_source_does_not_authenticate_raw_base_bytes);
 	UT_RUN(tt_top_tx_c0_producer_derives_current_original_isolation);
 	UT_RUN(tt_top_tx_c0_producer_requires_current_execution_owner);

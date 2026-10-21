@@ -1089,13 +1089,16 @@ extern bool cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
  * Require the original owner to revalidate every selected source/ROOT and its
  * still-held execution fence before reading cached inputs and before publishing
  * the candidate. This produces only an input descriptor, not C0 write authority.
- * Derive producer_top from this source's exact native
- * canonical BIND; the caller's producer_top bit is ignored. Derive
- * qualified_base from the same source's complete native INIT/REUSE header
- * fold with no captured predecessor, requiring full-page agreement with the
- * verified post-redo image. The caller's qualified_base bit is ignored.
- * Older ACTIVE generations without this retained lifecycle remain blocked
- * pending their original canonical checkpoint-base coverage producer.
+ * Derive producer_top/qualified_base from the original integrity-checked
+ * native checkpoint base with the exact ACTIVE generation/slot/wrap/xid.
+ * The supported ACTIVE publisher stores only canonical top xids; native
+ * COMMIT/checkpoint ordering covers pre-redo stamps. Complete sealed redo
+ * and whole physical readback cover the rest. A checksum-zero original base
+ * remains unqualified even if redo seals its post-image. Alternatively,
+ * require this source's exact canonical BIND and complete native INIT/REUSE
+ * fold with no captured predecessor, agreeing with the full post-redo page.
+ * The caller's producer_top/qualified_base bits are ignored; neither a CRC
+ * nor a checkpoint number alone supplies these native owner proofs.
  * Derive sealed_redo from the original all-record completion receipt,
  * bound to this exact plan and complete source set by the all-thread
  * endpoint receipt, with the verified ordinary inventory. The caller's
@@ -1103,7 +1106,7 @@ extern bool cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
  * exact foreign target authority above and recheck it before output. The
  * caller's isolation bit is ignored; an own/history target cannot substitute
  * a caller assertion for missing authority. Derive terminal_match from the
- * complete native lifecycle, sealed redo and exact physical ACTIVE readback,
+ * qualified native base, sealed redo and exact physical ACTIVE readback,
  * together with the retained terminal checks below. The caller's terminal
  * bit is ignored. Check original actor/top consistency in every accepted
  * input record, including cursor-only records and retained history, and any
@@ -1122,9 +1125,8 @@ extern bool cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
  * History frames retain the consistency check; the replay-only PAGE producers
  * do not qualify them. Old tuple/MX ownership, a parent graph and complete
  * ordinary_effects remain independent requirements.
- * Other proof/shape gates remain independent and required. An older ACTIVE
- * without a retained BIND remains blocked pending the original qualified
- * canonical-base producer;
+ * Other proof/shape gates remain independent and required. Older ACTIVE
+ * without a retained BIND requires the qualified original checkpoint base;
  * this does not introduce a BIND lifetime retention requirement.
  * Reject exact native COMMIT/TT_ABORT conflicts in every sealed source,
  * including history-only retained incarnations of the same thread. Absence
