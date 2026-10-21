@@ -46,6 +46,8 @@ static uint32 wait_event;
 uint32 *my_wait_event_info = &wait_event;
 static LWLockPadded locks[NUM_INDIVIDUAL_LWLOCKS];
 LWLockPadded *MainLWLockArray = locks;
+static ClusterConf peer_conf;
+ClusterConf *ClusterConfShmem;
 
 static sigjmp_buf error_target;
 static bool error_expected;
@@ -55,6 +57,15 @@ static bool fail_assignment;
 static uint64 pending_generation;
 static uint64 authority_pending[2];
 static unsigned int discard_calls[2];
+static unsigned int publish_calls[2], local_invalidations[2], ack_attempts[2];
+static unsigned int ack_failures[2], unlock_calls;
+enum PublishEvent
+{
+	PUBLISH_SHARED = 1, INVALIDATE_SHARED, ACK_SHARED,
+	PUBLISH_DATABASE, INVALIDATE_DATABASE, ACK_DATABASE, UNLOCK
+};
+static enum PublishEvent publish_trace[16];
+static unsigned int publish_events;
 static FullTransactionId assigned_xid, next_xid;
 static unsigned int sequence, xid_order, lock_order, wal_order, stage_order;
 static unsigned int full_requests, raw_requests, assignments;
@@ -184,6 +195,12 @@ errmsg(const char *fmt pg_attribute_unused(), ...)
 
 int
 errhint(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+int
+errdetail(const char *fmt pg_attribute_unused(), ...)
 {
 	return 0;
 }
@@ -374,7 +391,7 @@ cluster_relmap_authority_write_pending(bool shared, Oid dbid, const char *image,
 	stages++;
 }
 
-/* File I/O stays a fixture; the producer and abort callback are real. */
+/* File I/O stays a fixture; the producer and transaction callbacks are real. */
 void
 cluster_relmap_authority_discard_pending(bool shared, Oid dbid, uint64 generation)
 {
@@ -386,6 +403,72 @@ cluster_relmap_authority_discard_pending(bool shared, Oid dbid, uint64 generatio
 	UT_ASSERT_EQ(authority_pending[slot], generation);
 	authority_pending[slot] = 0;
 	discard_calls[slot]++;
+}
+
+static void
+record_publish_event(enum PublishEvent event)
+{
+	UT_ASSERT(publish_events < lengthof(publish_trace));
+	if (publish_events < lengthof(publish_trace))
+		publish_trace[publish_events++] = event;
+}
+
+void
+cluster_relmap_authority_publish(bool shared, Oid dbid, uint64 generation)
+{
+	unsigned int slot = shared ? 0 : 1;
+
+	UT_ASSERT(authority_held && !local_held && CritSectionCount == 0);
+	UT_ASSERT_EQ(dbid, shared ? InvalidOid : MyDatabaseId);
+	UT_ASSERT_EQ(generation, 8);
+	UT_ASSERT_EQ(authority_pending[slot], generation);
+	authority_pending[slot] = 0;
+	publish_calls[slot]++;
+	record_publish_event(shared ? PUBLISH_SHARED : PUBLISH_DATABASE);
+}
+
+void
+SendSharedInvalidMessages(const SharedInvalidationMessage *msgs, int n)
+{
+	unsigned int slot = msgs[0].rm.dbId == InvalidOid ? 0 : 1;
+
+	UT_ASSERT(authority_held && !local_held && CritSectionCount == 0);
+	UT_ASSERT_EQ(n, 1);
+	UT_ASSERT_EQ(msgs[0].rm.id, SHAREDINVALRELMAP_ID);
+	UT_ASSERT_EQ(msgs[0].rm.dbId, slot == 0 ? InvalidOid : MyDatabaseId);
+	local_invalidations[slot]++;
+	record_publish_event(slot == 0 ? INVALIDATE_SHARED : INVALIDATE_DATABASE);
+}
+
+/*
+ * Network boundary only.  The real shared-catalog API returns only DONE;
+ * injected failures exercise the callback's existing defensive branches.
+ */
+ClusterSinvalAckResult
+cluster_sinval_enqueue_and_wait_ack(const SharedInvalidationMessage *msgs, int n)
+{
+	unsigned int slot = msgs[0].rm.dbId == InvalidOid ? 0 : 1;
+
+	UT_ASSERT(authority_held && !local_held && CritSectionCount == 0);
+	UT_ASSERT_EQ(n, 1);
+	UT_ASSERT_EQ(msgs[0].rm.id, SHAREDINVALRELMAP_ID);
+	UT_ASSERT_EQ(msgs[0].rm.dbId, slot == 0 ? InvalidOid : MyDatabaseId);
+	UT_ASSERT(cluster_relmap_publish_arms[slot].armed);
+	ack_attempts[slot]++;
+	if (ack_attempts[slot] <= ack_failures[slot])
+		return ack_attempts[slot] % 2 ? CLUSTER_SINVAL_ACK_TIMEOUT :
+			CLUSTER_SINVAL_ACK_ENQUEUE_FAILED;
+	record_publish_event(slot == 0 ? ACK_SHARED : ACK_DATABASE);
+	return CLUSTER_SINVAL_ACK_DONE;
+}
+
+void
+cluster_relmap_authority_x_unlock(void)
+{
+	UT_ASSERT(authority_held && !local_held && CritSectionCount == 0);
+	unlock_calls++;
+	record_publish_event(UNLOCK);
+	authority_held = false;
 }
 
 void
@@ -423,6 +506,15 @@ reset(bool preassigned)
 	pending_generation = 0;
 	memset(authority_pending, 0, sizeof(authority_pending));
 	memset(discard_calls, 0, sizeof(discard_calls));
+	memset(publish_calls, 0, sizeof(publish_calls));
+	memset(local_invalidations, 0, sizeof(local_invalidations));
+	memset(ack_attempts, 0, sizeof(ack_attempts));
+	memset(ack_failures, 0, sizeof(ack_failures));
+	memset(publish_trace, 0, sizeof(publish_trace));
+	publish_events = unlock_calls = 0;
+	memset(&peer_conf, 0, sizeof(peer_conf));
+	peer_conf.node_count = 2;
+	ClusterConfShmem = NULL;
 	error_level = 0;
 	sequence = xid_order = lock_order = wal_order = stage_order = 0;
 	full_requests = raw_requests = assignments = 0;
@@ -758,10 +850,171 @@ UT_TEST(abort_before_stage_preserves_another_writers_pending)
 	}
 }
 
+static void
+check_publish_trace(const enum PublishEvent *expected, unsigned int count)
+{
+	UT_ASSERT_EQ(publish_events, count);
+	UT_ASSERT(memcmp(publish_trace, expected, count * sizeof(*expected)) == 0);
+}
+
+static void
+check_commit_cleanup(unsigned int shared, unsigned int database,
+					 unsigned int shared_acks, unsigned int database_acks)
+{
+	unsigned int events = publish_events;
+
+	UT_ASSERT_EQ(publish_calls[0], shared);
+	UT_ASSERT_EQ(publish_calls[1], database);
+	UT_ASSERT_EQ(local_invalidations[0], shared);
+	UT_ASSERT_EQ(local_invalidations[1], database);
+	UT_ASSERT_EQ(ack_attempts[0], shared_acks);
+	UT_ASSERT_EQ(ack_attempts[1], database_acks);
+	UT_ASSERT_EQ(unlock_calls, 1);
+	UT_ASSERT(!authority_held && !local_held && CritSectionCount == 0);
+	UT_ASSERT(!cluster_relmap_publish_arms[0].armed && !cluster_relmap_publish_arms[1].armed);
+	/* A repeated callback and a later abort callback must do no more work. */
+	AtEOXact_ClusterRelmapPublish();
+	AtAbort_ClusterRelmapPending();
+	UT_ASSERT_EQ(publish_calls[0], shared);
+	UT_ASSERT_EQ(publish_calls[1], database);
+	UT_ASSERT_EQ(local_invalidations[0], shared);
+	UT_ASSERT_EQ(local_invalidations[1], database);
+	UT_ASSERT_EQ(ack_attempts[0], shared_acks);
+	UT_ASSERT_EQ(ack_attempts[1], database_acks);
+	UT_ASSERT_EQ(unlock_calls, 1);
+	UT_ASSERT_EQ(publish_events, events);
+	UT_ASSERT_EQ(discard_calls[0] + discard_calls[1], 0);
+}
+
+static void
+check_single_namespace_commit(bool shared)
+{
+	const enum PublishEvent shared_peer[] = {PUBLISH_SHARED, INVALIDATE_SHARED, ACK_SHARED, UNLOCK};
+	const enum PublishEvent local_peer[] = {PUBLISH_DATABASE, INVALIDATE_DATABASE, ACK_DATABASE, UNLOCK};
+	const enum PublishEvent shared_solo[] = {PUBLISH_SHARED, INVALIDATE_SHARED, UNLOCK};
+	const enum PublishEvent local_solo[] = {PUBLISH_DATABASE, INVALIDATE_DATABASE, UNLOCK};
+
+	for (unsigned int peers = 0; peers < 2; peers++)
+	{
+		reset(false);
+		ClusterConfShmem = peers ? &peer_conf : NULL;
+		/* An unarmed namespace belongs to another writer. */
+		authority_pending[shared ? 1 : 0] = 19;
+		cluster_perform_relmap_update(shared, &updates);
+		AtEOXact_ClusterRelmapPublish();
+		check_publish_trace(peers ? (shared ? shared_peer : local_peer) :
+							(shared ? shared_solo : local_solo), peers ? 4 : 3);
+		check_commit_cleanup(shared ? 1 : 0, shared ? 0 : 1,
+							 shared ? peers : 0, shared ? 0 : peers);
+		UT_ASSERT_EQ(authority_pending[shared ? 0 : 1], 0);
+		UT_ASSERT_EQ(authority_pending[shared ? 1 : 0], 19);
+		UT_ASSERT_EQ(stages, 1);
+		UT_ASSERT_EQ(sync_commits, 1);
+	}
+}
+
+UT_TEST(shared_commit_publishes_invalidates_and_unlocks) { check_single_namespace_commit(true); }
+UT_TEST(database_commit_publishes_invalidates_and_unlocks) { check_single_namespace_commit(false); }
+
+UT_TEST(commit_publishes_both_namespaces_in_slot_order_after_either_producer_order)
+{
+	const enum PublishEvent expected[] = {PUBLISH_SHARED, INVALIDATE_SHARED, ACK_SHARED,
+		PUBLISH_DATABASE, INVALIDATE_DATABASE, ACK_DATABASE, UNLOCK};
+
+	for (unsigned int first = 0; first < 2; first++)
+	{
+		reset(false);
+		ClusterConfShmem = &peer_conf;
+		cluster_perform_relmap_update(first == 0, &updates);
+		cluster_perform_relmap_update(first != 0, &updates);
+		AtEOXact_ClusterRelmapPublish();
+		check_publish_trace(expected, lengthof(expected));
+		check_commit_cleanup(1, 1, 1, 1);
+		UT_ASSERT_EQ(authority_pending[0] + authority_pending[1], 0);
+		UT_ASSERT_EQ(assignments, 1);
+		UT_ASSERT_EQ(stages, 2);
+		UT_ASSERT_EQ(sync_commits, 2);
+	}
+}
+
+UT_TEST(commit_retries_ack_before_next_namespace_and_unlock)
+{
+	const enum PublishEvent expected[] = {PUBLISH_SHARED, INVALIDATE_SHARED, ACK_SHARED,
+		PUBLISH_DATABASE, INVALIDATE_DATABASE, ACK_DATABASE, UNLOCK};
+
+	reset(false);
+	ClusterConfShmem = &peer_conf;
+	ack_failures[0] = ack_failures[1] = 2;
+	cluster_perform_relmap_update(true, &updates);
+	cluster_perform_relmap_update(false, &updates);
+	AtEOXact_ClusterRelmapPublish();
+	check_publish_trace(expected, lengthof(expected));
+	check_commit_cleanup(1, 1, 3, 3);
+	UT_ASSERT_EQ(authority_pending[0] + authority_pending[1], 0);
+}
+
+static void
+check_ack_exhaustion(unsigned int failed_slot)
+{
+	const enum PublishEvent shared_failed[] = {PUBLISH_SHARED, INVALIDATE_SHARED};
+	const enum PublishEvent local_failed[] = {PUBLISH_SHARED, INVALIDATE_SHARED, ACK_SHARED,
+		PUBLISH_DATABASE, INVALIDATE_DATABASE};
+
+	reset(false);
+	ClusterConfShmem = &peer_conf;
+	ack_failures[failed_slot] = 10;
+	cluster_perform_relmap_update(true, &updates);
+	cluster_perform_relmap_update(false, &updates);
+	error_expected = true;
+	if (sigsetjmp(error_target, 1) == 0)
+	{
+		AtEOXact_ClusterRelmapPublish();
+		UT_ASSERT(false);
+	}
+	error_expected = false;
+	UT_ASSERT_EQ(error_level, PANIC);
+	check_publish_trace(failed_slot == 0 ? shared_failed : local_failed,
+						failed_slot == 0 ? lengthof(shared_failed) : lengthof(local_failed));
+	UT_ASSERT_EQ(publish_calls[0], 1);
+	UT_ASSERT_EQ(publish_calls[1], failed_slot == 1 ? 1 : 0);
+	UT_ASSERT_EQ(local_invalidations[0], 1);
+	UT_ASSERT_EQ(local_invalidations[1], failed_slot == 1 ? 1 : 0);
+	UT_ASSERT_EQ(ack_attempts[0], failed_slot == 0 ? 10 : 1);
+	UT_ASSERT_EQ(ack_attempts[1], failed_slot == 1 ? 10 : 0);
+	UT_ASSERT(cluster_relmap_publish_arms[1].armed);
+	UT_ASSERT_EQ(cluster_relmap_publish_arms[0].armed, failed_slot == 0);
+	UT_ASSERT_EQ(authority_pending[0], 0);
+	UT_ASSERT_EQ(authority_pending[1], failed_slot == 0 ? 8 : 0);
+	UT_ASSERT_EQ(unlock_calls, 0);
+	UT_ASSERT(authority_held && !local_held && CritSectionCount == 0);
+	UT_ASSERT_EQ(discard_calls[0] + discard_calls[1], 0);
+	/* PANIC is observed at the boundary; do not simulate an abort afterwards. */
+}
+
+UT_TEST(shared_ack_exhaustion_panics_with_both_arms_retained) { check_ack_exhaustion(0); }
+UT_TEST(database_ack_exhaustion_panics_with_remaining_arm_retained) { check_ack_exhaustion(1); }
+
+UT_TEST(unarmed_commit_preserves_other_writers_pending_and_global_lock)
+{
+	reset(false);
+	ClusterConfShmem = &peer_conf;
+	authority_held = true;
+	authority_pending[0] = authority_pending[1] = 19;
+	AtEOXact_ClusterRelmapPublish();
+	UT_ASSERT_EQ(publish_events, 0);
+	UT_ASSERT_EQ(publish_calls[0] + publish_calls[1], 0);
+	UT_ASSERT_EQ(local_invalidations[0] + local_invalidations[1], 0);
+	UT_ASSERT_EQ(ack_attempts[0] + ack_attempts[1], 0);
+	UT_ASSERT_EQ(unlock_calls, 0);
+	UT_ASSERT_EQ(authority_pending[0], 19);
+	UT_ASSERT_EQ(authority_pending[1], 19);
+	UT_ASSERT(authority_held && !local_held && CritSectionCount == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(26);
 	UT_RUN(shared_assigns_before_lock_and_wal);
 	UT_RUN(database_assigns_before_lock_and_wal);
 	UT_RUN(shared_reuses_existing_full_xid);
@@ -781,6 +1034,13 @@ main(void)
 	UT_RUN(database_error_still_discards_prior_shared_stage);
 	UT_RUN(shared_error_still_discards_prior_database_stage);
 	UT_RUN(abort_before_stage_preserves_another_writers_pending);
+	UT_RUN(shared_commit_publishes_invalidates_and_unlocks);
+	UT_RUN(database_commit_publishes_invalidates_and_unlocks);
+	UT_RUN(commit_publishes_both_namespaces_in_slot_order_after_either_producer_order);
+	UT_RUN(commit_retries_ack_before_next_namespace_and_unlock);
+	UT_RUN(shared_ack_exhaustion_panics_with_both_arms_retained);
+	UT_RUN(database_ack_exhaustion_panics_with_remaining_arm_retained);
+	UT_RUN(unarmed_commit_preserves_other_writers_pending_and_global_lock);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
