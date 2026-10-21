@@ -631,10 +631,10 @@ cluster_tt_twophase_postfinish(TransactionId xid)
 			key.local_xid = b->xid;
 
 			if (tt_2pc_stage.is_commit)
-				cluster_tt_slot_mark_committed(b->undo_segment_id, b->slot_offset, b->xid,
+				cluster_tt_slot_mark_committed(b->undo_segment_id, b->slot_offset, b->xid, b->wrap,
 											   commit_scn);
 			else
-				cluster_tt_slot_mark_aborted(b->undo_segment_id, b->slot_offset, b->xid);
+				cluster_tt_slot_mark_aborted(b->undo_segment_id, b->slot_offset, b->xid, b->wrap);
 			memset(&source_request, 0, sizeof(source_request));
 			source_request.key = &key;
 			source_request.status = status;

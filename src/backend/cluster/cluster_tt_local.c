@@ -518,13 +518,14 @@ cluster_tt_local_finish_bindings(bool committed, SCN commit_scn)
 			continue;
 		if (committed && b->publish_state == CLUSTER_CANONICAL_TXN_PUBLISHED
 			&& b->terminal_state == CLUSTER_TT_LOCAL_TERMINAL_COMMIT_STAGED)
-			cluster_tt_slot_mark_committed(b->segment_id, b->slot_offset, b->top_xid, commit_scn);
+			cluster_tt_slot_mark_committed(b->segment_id, b->slot_offset, b->top_xid, b->wrap,
+										   commit_scn);
 		else if (!committed
 				 && ((b->publish_state == CLUSTER_CANONICAL_TXN_RESERVED
 					  && b->terminal_state == CLUSTER_TT_LOCAL_TERMINAL_NONE)
 					 || (b->publish_state == CLUSTER_CANONICAL_TXN_PUBLISHED
 						 && b->terminal_state == CLUSTER_TT_LOCAL_TERMINAL_ABORT_DURABLE)))
-			cluster_tt_slot_mark_aborted(b->segment_id, b->slot_offset, b->top_xid);
+			cluster_tt_slot_mark_aborted(b->segment_id, b->slot_offset, b->top_xid, b->wrap);
 	}
 
 	cluster_tt_local_reset_binding();

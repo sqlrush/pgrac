@@ -684,10 +684,64 @@ UT_TEST(test_real_local_postbind_error_stays_failed_without_reallocation)
 	UT_ASSERT_EQ(modifier_leaves, 1);
 }
 
+/* Exercise the real finish consumer with an already-published binding. The
+ * terminal receipt is supplied by this fixture; durable commit/abort admission
+ * is covered separately. Never refresh the binding's identity from the slot. */
+static void
+check_terminal_binding_wrap(bool committed)
+{
+	for (unsigned drift = 0; drift < 6; drift++) {
+		ClusterTTLocalBinding *binding;
+		ClusterTTSlotAllocEntry *entry;
+		int wakeups;
+
+		reset_active_owner();
+		require_published_on(1);
+		binding = cluster_tt_local_bindings;
+		entry = &allocator_storage.per_node[0].slots[binding->slot_offset];
+		binding->terminal_state = committed ? CLUSTER_TT_LOCAL_TERMINAL_COMMIT_STAGED
+											: CLUSTER_TT_LOCAL_TERMINAL_ABORT_DURABLE;
+		if (drift == 1)
+			entry->wrap++;
+		else if (drift == 2)
+			binding->wrap = TT_WRAP_INVALID;
+		else if (drift == 3)
+			entry->xid++;
+		else if (drift == 4)
+			allocator_storage.per_node[0].segment_id = 2;
+		else if (drift == 5) {
+			binding->wrap = TT_WRAP_INVALID;
+			entry->wrap = TT_WRAP_INVALID;
+		}
+		wakeups = g_undo_cleaner_wakeup_calls;
+		cluster_tt_local_finish_bindings(committed, committed ? (SCN)91 : InvalidScn);
+		UT_ASSERT_EQ(entry->status,
+					 drift == 0 ? (committed ? CTS_COMMITTED : CTS_ABORTED) : CTS_ACTIVE);
+		UT_ASSERT_EQ(entry->commit_scn, committed && drift == 0 ? (SCN)91 : InvalidScn);
+		UT_ASSERT_EQ(g_undo_cleaner_wakeup_calls, wakeups + (drift == 0));
+		UT_ASSERT_EQ(entry->xid, drift == 3 ? 101 : 100);
+		UT_ASSERT_EQ(entry->wrap, drift == 5 ? TT_WRAP_INVALID : (drift == 1 ? 1 : 0));
+		UT_ASSERT_EQ(cluster_tt_local_binding_count, 0);
+		UT_ASSERT(cluster_tt_local_bindings == NULL);
+		UT_ASSERT_EQ(lock_depth, 0);
+		free(binding);
+	}
+}
+
+UT_TEST(test_real_local_commit_keeps_bound_wrap)
+{
+	check_terminal_binding_wrap(true);
+}
+
+UT_TEST(test_real_local_abort_keeps_bound_wrap)
+{
+	check_terminal_binding_wrap(false);
+}
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(19);
 	UT_RUN(test_binding_memory_error_precedes_allocator_and_cold_selection);
 	UT_RUN(test_binding_growth_error_preserves_existing_reservations);
 	UT_RUN(test_modifier_refusal_precedes_allocation_and_leaves_abort_without_effects);
@@ -705,6 +759,8 @@ main(void)
 	UT_RUN(test_cancel_after_unpublished_rollover_leaves_no_failed_binding);
 	UT_RUN(test_real_allocator_repeated_prebind_rollover_does_not_grow_bindings);
 	UT_RUN(test_real_local_postbind_error_stays_failed_without_reallocation);
+	UT_RUN(test_real_local_commit_keeps_bound_wrap);
+	UT_RUN(test_real_local_abort_keeps_bound_wrap);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

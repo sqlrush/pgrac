@@ -194,9 +194,12 @@ cluster_ctrc_terminal_release_sample_exact(uint32 segment_id, uint16 slot_offset
 		rebound = cluster_tt_slot_alloc(UINT32_C(1), (TransactionId)100);
 		UT_ASSERT_EQ(rebound, 0);
 		if (terminal_status == TT_SLOT_COMMITTED)
-			cluster_tt_slot_mark_committed(UINT32_C(1), rebound, (TransactionId)100, terminal_scn);
+			cluster_tt_slot_mark_committed(UINT32_C(1), rebound, (TransactionId)100,
+										   cluster_tt_slot_get_wrap(UINT32_C(1), rebound),
+										   terminal_scn);
 		else
-			cluster_tt_slot_mark_aborted(UINT32_C(1), rebound, (TransactionId)100);
+			cluster_tt_slot_mark_aborted(UINT32_C(1), rebound, (TransactionId)100,
+										 cluster_tt_slot_get_wrap(UINT32_C(1), rebound));
 	}
 	return mock_ctrc_release_proven;
 }
@@ -559,7 +562,8 @@ UT_TEST(test_t19_recycle_committed_bumps_wrap)
 	wrap_before = cluster_tt_slot_get_wrap(NODE0_SEG, first_off);
 
 	/* Mark slot 0 as COMMITTED with an actual finite retention proof. */
-	cluster_tt_slot_mark_committed(NODE0_SEG, first_off, (TransactionId)100, (SCN)5);
+	cluster_tt_slot_mark_committed(NODE0_SEG, first_off, (TransactionId)100,
+								   cluster_tt_slot_get_wrap(NODE0_SEG, first_off), (SCN)5);
 	mock_retention_horizon = (SCN)10;
 
 	/* Fill the remaining 47 slots with distinct ACTIVE xids so no FREE
@@ -729,7 +733,8 @@ UT_TEST(test_t31_mark_committed_below_horizon_recycled)
 	reset_allocator();
 	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
 	wrap_before = cluster_tt_slot_get_wrap(NODE0_SEG, off);
-	cluster_tt_slot_mark_committed(NODE0_SEG, off, (TransactionId)100, (SCN)5);
+	cluster_tt_slot_mark_committed(NODE0_SEG, off, (TransactionId)100,
+								   cluster_tt_slot_get_wrap(NODE0_SEG, off), (SCN)5);
 	mock_retention_horizon = (SCN)10;
 
 	for (i = 1; i < TT_SLOTS_PER_SEGMENT; i++)
@@ -751,7 +756,8 @@ UT_TEST(test_t32_mark_committed_above_horizon_retained)
 
 	reset_allocator();
 	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
-	cluster_tt_slot_mark_committed(NODE0_SEG, off, (TransactionId)100, (SCN)15);
+	cluster_tt_slot_mark_committed(NODE0_SEG, off, (TransactionId)100,
+								   cluster_tt_slot_get_wrap(NODE0_SEG, off), (SCN)15);
 	mock_retention_horizon = (SCN)10;
 
 	for (i = 1; i < TT_SLOTS_PER_SEGMENT; i++)
@@ -770,7 +776,8 @@ UT_TEST(test_t33_mark_aborted_recycled_regardless_of_horizon)
 
 	reset_allocator();
 	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
-	cluster_tt_slot_mark_aborted(NODE0_SEG, off, (TransactionId)100);
+	cluster_tt_slot_mark_aborted(NODE0_SEG, off, (TransactionId)100,
+								 cluster_tt_slot_get_wrap(NODE0_SEG, off));
 	mock_retention_horizon = (SCN)10;
 
 	for (i = 1; i < TT_SLOTS_PER_SEGMENT; i++)
@@ -788,7 +795,8 @@ UT_TEST(test_t34_guc_off_bypasses_retention)
 
 	reset_allocator();
 	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
-	cluster_tt_slot_mark_committed(NODE0_SEG, off, (TransactionId)100, (SCN)15);
+	cluster_tt_slot_mark_committed(NODE0_SEG, off, (TransactionId)100,
+								   cluster_tt_slot_get_wrap(NODE0_SEG, off), (SCN)15);
 	mock_retention_horizon = (SCN)10;
 	cluster_undo_retention_horizon_enabled = false;
 
@@ -857,14 +865,16 @@ UT_TEST(test_t37_rollover_rebinds_and_resets)
 UT_TEST(test_t38_mark_on_rolled_away_segment_is_noop)
 {
 	uint16 off;
+	uint16 wrap;
 
 	reset_allocator();
 	(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100); /* bind seg 1 */
-	cluster_tt_slot_rollover(0, 2, NULL);						/* roll node 0 to seg 2 */
+	wrap = cluster_tt_slot_get_wrap(NODE0_SEG, 0);
+	cluster_tt_slot_rollover(0, 2, NULL); /* roll node 0 to seg 2 */
 
 	/* A late commit on the OLD (rolled-away) segment must NOT touch the new
 	 * binding's slots -- it no-ops (old retention is durable). */
-	cluster_tt_slot_mark_committed(NODE0_SEG, 0, (TransactionId)100, (SCN)5);
+	cluster_tt_slot_mark_committed(NODE0_SEG, 0, (TransactionId)100, wrap, (SCN)5);
 
 	/* seg 2 slot 0 is still FREE: first alloc returns offset 0, wrap unchanged. */
 	off = cluster_tt_slot_alloc(2, (TransactionId)200);
@@ -882,7 +892,8 @@ UT_TEST(test_t39_rollover_reports_drained_when_no_active)
 
 	reset_allocator();
 	(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
-	cluster_tt_slot_mark_committed(NODE0_SEG, 0, (TransactionId)100, (SCN)5);
+	cluster_tt_slot_mark_committed(NODE0_SEG, 0, (TransactionId)100,
+								   cluster_tt_slot_get_wrap(NODE0_SEG, 0), (SCN)5);
 
 	cluster_tt_slot_rollover(0, 2, &old_had_active);
 	UT_ASSERT_EQ((int)old_had_active, 0);
@@ -907,8 +918,10 @@ UT_TEST(test_t40_gc_then_alloc_equals_direct_recycle)
 
 	sa = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
 	sb = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)101);
-	cluster_tt_slot_mark_committed(NODE0_SEG, sa, (TransactionId)100, (SCN)5);
-	cluster_tt_slot_mark_committed(NODE0_SEG, sb, (TransactionId)101, (SCN)5);
+	cluster_tt_slot_mark_committed(NODE0_SEG, sa, (TransactionId)100,
+								   cluster_tt_slot_get_wrap(NODE0_SEG, sa), (SCN)5);
+	cluster_tt_slot_mark_committed(NODE0_SEG, sb, (TransactionId)101,
+								   cluster_tt_slot_get_wrap(NODE0_SEG, sb), (SCN)5);
 
 	/* Burn every remaining FREE slot: Pass 2 recycle only triggers when
 	 * Pass 1 finds no FREE slot (FREE is always preferred). */
@@ -950,7 +963,8 @@ UT_TEST(test_t41_gc_respects_horizon_retained_slot_untouched)
 	cluster_tt_slot_rollover(0, NODE0_SEG, NULL);
 
 	sa = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
-	cluster_tt_slot_mark_committed(NODE0_SEG, sa, (TransactionId)100, (SCN)20);
+	cluster_tt_slot_mark_committed(NODE0_SEG, sa, (TransactionId)100,
+								   cluster_tt_slot_get_wrap(NODE0_SEG, sa), (SCN)20);
 
 	/* alloc_ext below consults the stubbed horizon provider. */
 	mock_retention_horizon = (SCN)20;
@@ -1019,7 +1033,8 @@ UT_TEST(test_t43_wrap_max_slot_is_retired_from_both_paths)
 
 	sa = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
 	UT_ASSERT_EQ((int)sa, 0);
-	cluster_tt_slot_mark_committed(NODE0_SEG, sa, (TransactionId)100, (SCN)5);
+	cluster_tt_slot_mark_committed(NODE0_SEG, sa, (TransactionId)100,
+								   cluster_tt_slot_get_wrap(NODE0_SEG, sa), (SCN)5);
 
 	/* Each gc+alloc pair bumps wrap by exactly 1 (T40 equivalence). */
 	for (cycles = 0; cycles < (uint32)TT_WRAP_MAX; cycles++) {
@@ -1028,7 +1043,8 @@ UT_TEST(test_t43_wrap_max_slot_is_retired_from_both_paths)
 		if (stats.shmem_tt_slots_gcd != 1)
 			break; /* retired: stop driving */
 		(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)(200 + cycles));
-		cluster_tt_slot_mark_committed(NODE0_SEG, sa, (TransactionId)(200 + cycles), (SCN)5);
+		cluster_tt_slot_mark_committed(NODE0_SEG, sa, (TransactionId)(200 + cycles),
+									   cluster_tt_slot_get_wrap(NODE0_SEG, sa), (SCN)5);
 	}
 	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, sa), (int)TT_WRAP_MAX);
 
@@ -1143,7 +1159,8 @@ UT_TEST(test_t48_peer_mode_committed_recycle_waits_for_cluster_floor_cleaner)
 	reset_allocator();
 	mock_cluster_conf.node_count = 2; /* cluster_peer_mode_enabled() */
 	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
-	cluster_tt_slot_mark_committed(NODE0_SEG, off, (TransactionId)100, (SCN)10);
+	cluster_tt_slot_mark_committed(NODE0_SEG, off, (TransactionId)100,
+								   cluster_tt_slot_get_wrap(NODE0_SEG, off), (SCN)10);
 	mock_retention_horizon = (SCN)100; /* local-only floor would recycle */
 
 	for (i = 1; i < TT_SLOTS_PER_SEGMENT; i++)
@@ -1195,7 +1212,8 @@ UT_TEST(test_t49_peer_mode_aborted_retains_canonical_slot)
 	reset_allocator();
 	mock_cluster_conf.node_count = 2;
 	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
-	cluster_tt_slot_mark_aborted(NODE0_SEG, off, (TransactionId)100);
+	cluster_tt_slot_mark_aborted(NODE0_SEG, off, (TransactionId)100,
+								 cluster_tt_slot_get_wrap(NODE0_SEG, off));
 
 	for (i = 1; i < TT_SLOTS_PER_SEGMENT; i++)
 		(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)(2000 + i));
@@ -1233,7 +1251,8 @@ UT_TEST(test_t54_peer_gc_rejects_exact_candidate_aba_after_release_sample)
 	mock_cluster_conf.node_count = 2;
 	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
 	UT_ASSERT_EQ(off, 0);
-	cluster_tt_slot_mark_committed(NODE0_SEG, off, (TransactionId)100, (SCN)10);
+	cluster_tt_slot_mark_committed(NODE0_SEG, off, (TransactionId)100,
+								   cluster_tt_slot_get_wrap(NODE0_SEG, off), (SCN)10);
 	mock_ctrc_release_proven = true;
 	mock_ctrc_rebind_during_sample = true;
 
@@ -1259,7 +1278,8 @@ UT_TEST(test_t50_peer_mode_guc_off_cannot_bypass_cluster_floor)
 	mock_cluster_conf.node_count = 2;
 	cluster_undo_retention_horizon_enabled = false;
 	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
-	cluster_tt_slot_mark_committed(NODE0_SEG, off, (TransactionId)100, (SCN)10);
+	cluster_tt_slot_mark_committed(NODE0_SEG, off, (TransactionId)100,
+								   cluster_tt_slot_get_wrap(NODE0_SEG, off), (SCN)10);
 
 	for (i = 1; i < TT_SLOTS_PER_SEGMENT; i++)
 		(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)(2000 + i));
@@ -1290,7 +1310,8 @@ UT_TEST(test_t51_current_owner_snapshot_is_exact_and_rollover_bounded)
 	UT_ASSERT_EQ((int)owner.reserved8[1], 0);
 	UT_ASSERT_EQ((int)owner.reserved8[2], 0);
 
-	cluster_tt_slot_mark_committed(NODE0_SEG, off, (TransactionId)100, (SCN)77);
+	cluster_tt_slot_mark_committed(NODE0_SEG, off, (TransactionId)100,
+								   cluster_tt_slot_get_wrap(NODE0_SEG, off), (SCN)77);
 	UT_ASSERT(cluster_tt_slot_current_owner_by_xid(0, (TransactionId)100, &owner));
 	UT_ASSERT_EQ((int)owner.status, (int)CTS_COMMITTED);
 	UT_ASSERT_EQ((int)owner.commit_scn, 77);
@@ -1354,7 +1375,8 @@ UT_TEST(test_t53_current_exact_alloc_captures_recycle_wrap_atomically)
 
 	reset_allocator();
 	first = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
-	cluster_tt_slot_mark_aborted(NODE0_SEG, first, (TransactionId)100);
+	cluster_tt_slot_mark_aborted(NODE0_SEG, first, (TransactionId)100,
+								 cluster_tt_slot_get_wrap(NODE0_SEG, first));
 	for (i = 1; i < TT_SLOTS_PER_SEGMENT; i++)
 		(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)(1000 + i));
 
@@ -1382,7 +1404,8 @@ UT_TEST(test_t55_unproven_horizon_retains_until_finite_sample)
 
 	reset_allocator();
 	first = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
-	cluster_tt_slot_mark_committed(NODE0_SEG, first, (TransactionId)100, (SCN)5);
+	cluster_tt_slot_mark_committed(NODE0_SEG, first, (TransactionId)100,
+								   cluster_tt_slot_get_wrap(NODE0_SEG, first), (SCN)5);
 	for (i = 1; i < TT_SLOTS_PER_SEGMENT; i++)
 		(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)(1000 + i));
 
@@ -1485,7 +1508,7 @@ UT_TEST(test_stop_tt_requires_original_owner_without_initializing_bindings)
 	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_READY);
 	UT_ASSERT_EQ(cluster_tt_slot_alloc(1, 991), 0);
 	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_PENDING);
-	cluster_tt_slot_mark_aborted(1, 0, 991);
+	cluster_tt_slot_mark_aborted(1, 0, 991, cluster_tt_slot_get_wrap(1, 0));
 	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_READY);
 	MyBackendType = B_BACKEND;
 	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_INVALID);
@@ -1513,9 +1536,12 @@ UT_TEST(test_stop_tt_all_current_slots_need_original_terminal_owner)
 			UT_ASSERT_EQ(stop_slot, i);
 			UT_ASSERT_STR_EQ(stop_reason, "TT_ALLOCATOR_ACTIVE");
 			if ((i & 1) == 0)
-				cluster_tt_slot_mark_committed(segment, slot, xid, scn_encode(node, 20000 + i));
+				cluster_tt_slot_mark_committed(segment, slot, xid,
+											   cluster_tt_slot_get_wrap(segment, slot),
+											   scn_encode(node, 20000 + i));
 			else
-				cluster_tt_slot_mark_aborted(segment, slot, xid);
+				cluster_tt_slot_mark_aborted(segment, slot, xid,
+											 cluster_tt_slot_get_wrap(segment, slot));
 			UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_READY);
 			if (ut_current_failed)
 				return;
@@ -1568,7 +1594,7 @@ UT_TEST(test_stop_tt_last_invalid_is_not_hidden_by_first_active)
 	UT_ASSERT_STR_EQ(stop_reason, "TT_ALLOCATOR_SLOT_INVALID");
 	cluster_tt_slot_test_force_status(32768, slot, CTS_ABORTED);
 	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_PENDING);
-	cluster_tt_slot_mark_aborted(1, 0, 700);
+	cluster_tt_slot_mark_aborted(1, 0, 700, cluster_tt_slot_get_wrap(1, 0));
 	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_READY);
 }
 

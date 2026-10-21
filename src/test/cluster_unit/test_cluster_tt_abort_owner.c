@@ -37,9 +37,11 @@ cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
 }
 
 void
-cluster_tt_slot_mark_aborted(uint32 segment_id, uint16 slot_offset, TransactionId xid)
+cluster_tt_slot_mark_aborted(uint32 segment_id, uint16 slot_offset, TransactionId xid,
+							 uint16 expected_wrap)
 {
 	UT_ASSERT(segment_id == 1 && slot_offset < TT_SLOTS_PER_SEGMENT && xid >= 100);
+	UT_ASSERT_EQ(expected_wrap, 5);
 	abort_marks++;
 }
 
@@ -47,6 +49,7 @@ void
 cluster_tt_slot_mark_committed(uint32 segment_id pg_attribute_unused(),
 							   uint16 slot_offset pg_attribute_unused(),
 							   TransactionId xid pg_attribute_unused(),
+							   uint16 expected_wrap pg_attribute_unused(),
 							   SCN scn pg_attribute_unused())
 {
 	UT_ASSERT(false);
