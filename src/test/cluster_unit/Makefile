@@ -224,6 +224,7 @@ TESTS += test_cluster_pcm_aux_consumer test_cluster_pcm_aux_reobserve test_clust
 TESTS += test_cluster_pcm_aux_mutation test_cluster_heap_extend_current
 TESTS += test_cluster_cr_inline_stop
 TESTS += test_cluster_sync_error
+TESTS += test_cluster_cold_tx_start
 
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
 
@@ -4124,7 +4125,7 @@ test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-$(filter-out test_cluster_postmaster_lwlock test_cluster_phase_publication test_cluster_checkpoint_cleanup test_cluster_checkpoint_wait_budget test_cluster_checkpoint_error test_cluster_sync_error test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
+$(filter-out test_cluster_cold_tx_start test_cluster_postmaster_lwlock test_cluster_phase_publication test_cluster_checkpoint_cleanup test_cluster_checkpoint_wait_budget test_cluster_checkpoint_error test_cluster_sync_error test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
 
 # Native CR metadata checks are inline in the shared descriptor definition.
@@ -9682,3 +9683,32 @@ test_cluster_checkpoint_stamp: test_cluster_checkpoint_stamp.c test_cluster_reco
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
         $(top_builddir)/src/common/libpgcommon_srv.a \
         $(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+
+# Original retained-input owner and installed native writer, without I/O grants.
+test_cluster_cold_tx_owner.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile
+	awk '/^static ClusterColdTypedV1 \*cluster_recovery_cold_inputs;/ { emit=1; count++ } \
+	     /^static bool cluster_backup_recovery_have_manifest/ { emit=0; done++ } \
+	     emit { print } END { if (count != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cold_tx_writer.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^ClusterStartupInstalledWriterV1\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cold_tx_start_boundary.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^StartupXLOG\(/ { owner=1 } \
+	     owner && /XLogCtl->SharedRecoveryState = RECOVERY_STATE_DONE;/ { done++ } \
+	     owner && done && /LWLockRelease\(ControlFileLock\)/ { unlocked++ } \
+	     owner && /Bind original TX inputs only after actual INSTALL and native DONE/ { emit=1; count++ } \
+	     emit { print } \
+	     emit && /errmsg\("could not bind original Startup transaction recovery inputs"\)/ { emit=0; last=1; exit } \
+	     END { if (count != 1 || done != 1 || unlocked != 1 || !last || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_owner.inc \
+        test_cluster_cold_tx_writer.inc test_cluster_cold_tx_start_boundary.inc unit_test.h \
+        $(top_srcdir)/src/include/access/xlogrecovery.h \
+        $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
+        $(top_srcdir)/src/include/cluster/cluster_wal_writer.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@

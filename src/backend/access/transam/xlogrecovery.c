@@ -204,6 +204,10 @@
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_wal_writer.h"
+#include "utils/memutils.h"
+#include "utils/resowner.h"
 #include "cluster/cluster_wal_tail.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_recovery_worker.h"
@@ -664,11 +668,62 @@ static XLogRecPtr cluster_recovery_typed_replay(ClusterColdTypedV1 **typed,
 												ClusterRecoveryFencePlan **fence_plan);
 static ClusterColdTypedV1 *cluster_recovery_cold_inputs;
 
+/* Input identity for the original post-EOR attempt. Old subject identities
+ * stay in inputs; writer is a separate, actual installed successor. No child
+ * read/flush/write scope can be obtained from this resource yet. */
+struct ClusterRecoveryStartV1 {
+	const ClusterColdTypedV1 *inputs;
+	const ClusterColdTopTxCensusV1 *census;
+	ResourceOwner owner;
+	int pid;
+	uint64 owner_boot;
+	uint64 generation;
+	uint64 serial;
+	ClusterWalWriterToken writer;
+	uint8 operation_uuid[16];
+	bool revoked;
+};
+static struct ClusterRecoveryStartV1 *cluster_recovery_cold_start;
+static uint64 cluster_recovery_cold_generation;
+static bool cluster_recovery_cold_callback_registered;
+
+static bool
+cluster_recovery_cold_writer_same(const ClusterWalWriterToken *a,
+								const ClusterWalWriterToken *b)
+{
+	return memcmp(&a->ref.claim.identity, &b->ref.claim.identity,
+				  sizeof(a->ref.claim.identity)) == 0
+		&& a->ref.claim.database_incarnation == b->ref.claim.database_incarnation
+		&& a->ref.claim.max_config_generation == b->ref.claim.max_config_generation
+		&& memcmp(a->ref.claim.claim_sha256, b->ref.claim.claim_sha256, 32) == 0
+		&& a->ref.timeline == b->ref.timeline && a->epoch == b->epoch
+		&& a->startup_first_lsn == b->startup_first_lsn;
+}
+
+/* ERROR/release invalidates only the process resource, never persistent debt.
+ * The original input owner remains responsible for its eventual destruction. */
+static void
+cluster_recovery_cold_resource_release(ResourceReleasePhase phase, bool isCommit,
+									   bool isTopLevel, void *arg)
+{
+	(void)isCommit;
+	(void)isTopLevel;
+	(void)arg;
+	if (phase == RESOURCE_RELEASE_BEFORE_LOCKS && cluster_recovery_cold_start != NULL
+		&& cluster_recovery_cold_start->owner == CurrentResourceOwner)
+		cluster_recovery_cold_start->revoked = true;
+}
+
 static void
 cluster_recovery_cold_inputs_cleanup(int code, Datum arg)
 {
 	(void)code;
 	(void)arg;
+	if (cluster_recovery_cold_start != NULL) {
+		cluster_recovery_cold_start->revoked = true;
+		pfree(cluster_recovery_cold_start);
+		cluster_recovery_cold_start = NULL;
+	}
 	cluster_cold_typed_destroy_v1(&cluster_recovery_cold_inputs);
 }
 
@@ -690,13 +745,98 @@ static void
 cluster_recovery_cold_inputs_handoff(EndOfWalRecoveryInfo *info)
 {
 	info->cluster_cold_inputs = cluster_recovery_cold_inputs;
+	info->cluster_tx_start = NULL;
+}
+
+bool
+ClusterColdRecoveryTxCurrent(const struct ClusterRecoveryStartV1 *start)
+{
+	ClusterWalWriterToken writer;
+	uint8 operation_uuid[16];
+
+	/* Compare the opaque pointer before any dereference, including stale ones. */
+	if (start == NULL || start != cluster_recovery_cold_start || start->revoked
+		|| start->generation == 0 || start->serial == 0 || start->pid != MyProcPid
+		|| start->owner != CurrentResourceOwner || start->owner_boot == 0
+		|| start->owner_boot != cluster_qvotec_get_self_incarnation()
+		|| start->inputs != cluster_recovery_cold_inputs || start->inputs == NULL
+		|| start->inputs->inputs != NULL || start->inputs->plan == NULL
+		|| start->census != start->inputs->top_tx_census || start->census == NULL
+		|| start->census->plan != start->inputs->plan
+		|| !ClusterStartupInstalledWriterV1(&writer, operation_uuid))
+		return false;
+	return cluster_recovery_cold_writer_same(&start->writer, &writer)
+		&& memcmp(start->operation_uuid, operation_uuid, 16) == 0;
+}
+
+const struct ClusterColdTypedV1 *
+ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start)
+{
+	return ClusterColdRecoveryTxCurrent(start) ? start->inputs : NULL;
+}
+
+bool
+ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
+{
+	struct ClusterRecoveryStartV1 *start;
+	ClusterWalWriterToken writer;
+	uint8 operation_uuid[16];
+	uint64 owner_boot;
+
+	if (info == NULL)
+		return false;
+	/* Non-cold/clean startup has no retained attempt and needs no resource. */
+	if (info->cluster_cold_inputs == NULL)
+		return cluster_recovery_cold_inputs == NULL && cluster_recovery_cold_start == NULL
+			&& info->cluster_tx_start == NULL;
+	if (info->cluster_cold_inputs != cluster_recovery_cold_inputs
+		|| cluster_recovery_cold_start != NULL || info->cluster_tx_start != NULL
+		|| cluster_recovery_cold_inputs->inputs != NULL
+		|| cluster_recovery_cold_inputs->plan == NULL
+		|| cluster_recovery_cold_inputs->participant_count == 0
+		|| cluster_recovery_cold_inputs->top_tx_census == NULL
+		|| cluster_recovery_cold_inputs->top_tx_census->plan != cluster_recovery_cold_inputs->plan
+		|| CurrentResourceOwner == NULL || MyProcPid <= 0
+		|| cluster_recovery_cold_generation == PG_UINT64_MAX
+		|| !ClusterStartupInstalledWriterV1(&writer, operation_uuid))
+		return false;
+	owner_boot = cluster_qvotec_get_self_incarnation();
+	if (owner_boot == 0 || owner_boot != writer.ref.claim.identity.origin_owner_incarnation)
+		return false;
+	if (!cluster_recovery_cold_callback_registered) {
+		RegisterResourceReleaseCallback(cluster_recovery_cold_resource_release, NULL);
+		cluster_recovery_cold_callback_registered = true;
+	}
+	start = MemoryContextAllocExtended(TopMemoryContext, sizeof(*start),
+										MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+	if (start == NULL)
+		return false;
+	start->inputs = cluster_recovery_cold_inputs;
+	start->census = cluster_recovery_cold_inputs->top_tx_census;
+	start->owner = CurrentResourceOwner;
+	start->pid = MyProcPid;
+	start->owner_boot = owner_boot;
+	start->generation = ++cluster_recovery_cold_generation;
+	start->serial = 1;
+	start->writer = writer;
+	memcpy(start->operation_uuid, operation_uuid, 16);
+	cluster_recovery_cold_start = start;
+	if (!ClusterColdRecoveryTxCurrent(start)) {
+		cluster_recovery_cold_start = NULL;
+		pfree(start);
+		return false;
+	}
+	info->cluster_tx_start = start;
+	return true;
 }
 
 void
 ClusterReleaseColdRecoveryInputs(EndOfWalRecoveryInfo *info)
 {
-	if (info == NULL || info->cluster_cold_inputs != cluster_recovery_cold_inputs)
+	if (info == NULL || info->cluster_cold_inputs != cluster_recovery_cold_inputs
+		|| info->cluster_tx_start != cluster_recovery_cold_start)
 		ereport(FATAL, (errmsg("cold recovery input handoff belongs to another attempt")));
+	info->cluster_tx_start = NULL;
 	info->cluster_cold_inputs = NULL;
 	if (cluster_recovery_cold_inputs != NULL) {
 		cluster_recovery_cold_inputs_cleanup(0, (Datum)0);

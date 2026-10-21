@@ -6621,6 +6621,39 @@ ClusterXLogStartupNativeEmptyMultiXactInput(void)
 												 input.first_segment_lsn);
 }
 
+/* Observe only this Startup's actual INSTALL/native DONE writer. The original
+ * INSTALL readback sets Installed; current native binding and writer checks
+ * remain mandatory. This observation grants neither I/O nor WAL insertion. */
+bool
+ClusterStartupInstalledWriterV1(ClusterWalWriterToken *writer, uint8 operation_uuid[16])
+{
+	ClusterWalWriterToken current;
+
+	if (writer != NULL)
+		memset(writer, 0, sizeof(*writer));
+	if (operation_uuid != NULL)
+		memset(operation_uuid, 0, 16);
+	if (writer == NULL || operation_uuid == NULL || MyBackendType != B_STARTUP
+		|| !cluster_enabled || !cluster_shared_config || CritSectionCount != 0
+		|| ShutdownRequestPending || RecoveryInProgress() || !clusterStartupWriterSelected
+		|| !clusterStartupWriterBound || !clusterStartupWriterInstalled
+		|| !cluster_wal_writer_startup_matches(&clusterStartupWriter.claim.identity,
+				clusterStartupWriter.operation_uuid, clusterStartupWriter.first_segment_lsn)
+		|| cluster_wal_writer_begin(clusterStartupWriter.timeline, &current)
+			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| memcmp(&current.ref.claim.identity, &clusterStartupWriter.claim.identity,
+				  sizeof(current.ref.claim.identity)) != 0
+		|| current.ref.claim.database_incarnation != clusterStartupWriter.database_incarnation
+		|| current.ref.claim.max_config_generation != clusterStartupWriter.config_generation
+		|| current.ref.timeline != clusterStartupWriter.timeline
+		|| current.epoch != clusterStartupWriter.formation_epoch
+		|| current.startup_first_lsn != clusterStartupWriter.first_segment_lsn)
+		return false;
+	*writer = current;
+	memcpy(operation_uuid, clusterStartupWriter.operation_uuid, 16);
+	return true;
+}
+
 #endif
 
 /*
@@ -7805,6 +7838,11 @@ StartupXLOG(void)
 	LWLockRelease(ControlFileLock);
 
 #ifdef USE_PGRAC_CLUSTER
+	/* Bind original TX inputs only after actual INSTALL and native DONE.
+	 * This resource is not a read scope, C0 grant or checkpoint permission. */
+	if (!ClusterBeginColdRecoveryTx(endOfRecoveryInfo))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("could not bind original Startup transaction recovery inputs")));
 
 	/*
 	 * PGRAC MODIFICATIONS (spec-4.8 D1): resolve crash-left undo TT slots.

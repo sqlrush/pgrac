@@ -133,6 +133,8 @@ typedef struct
 	/* Borrowed, attempt-local replay inputs until Startup's final close.
 	 * No retained execution pin, current source proof, or C0 write authority. */
 	const struct ClusterColdTypedV1 *cluster_cold_inputs;
+	/* Original post-EOR resource identity, not an I/O or C0 grant. */
+	struct ClusterRecoveryStartV1 *cluster_tx_start;
 #endif
 } EndOfWalRecoveryInfo;
 
@@ -140,6 +142,10 @@ extern EndOfWalRecoveryInfo *FinishWalRecovery(void);
 extern void ShutdownWalRecovery(void);
 #ifdef USE_PGRAC_CLUSTER
 extern void ClusterReleaseColdRecoveryInputs(EndOfWalRecoveryInfo *info);
+extern bool ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info);
+extern bool ClusterColdRecoveryTxCurrent(const struct ClusterRecoveryStartV1 *start);
+extern const struct ClusterColdTypedV1 *
+ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start);
 #endif
 extern void RemovePromoteSignalFiles(void);
 

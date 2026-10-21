@@ -10,6 +10,13 @@ typedef struct ClusterWalWriterToken {
 	XLogRecPtr startup_first_lsn;
 } ClusterWalWriterToken;
 
+/* Original Startup owner's installed-writer observation after native DONE.
+ * This is an input identity, never a role override, flush scope or write grant.
+ * Both outputs clear on refusal; callers supply separate nonoverlapping output
+ * objects. Ordinary writer sample/confirm/flushed role gates are unchanged. */
+extern bool ClusterStartupInstalledWriterV1(ClusterWalWriterToken *writer,
+										  uint8 operation_uuid[16]);
+
 typedef struct ClusterWalWriterFlushV1 {
 	ClusterWalWriterToken writer;
 	XLogRecPtr flushed_end;
