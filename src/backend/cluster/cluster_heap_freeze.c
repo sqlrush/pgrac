@@ -181,6 +181,16 @@ cluster_heap_freeze_prepare_page_v1(const ClusterHeapFreezePageInputV1 *input,
 		row->ctid = tuple->t_ctid;
 		row->infomask = tuple->t_infomask;
 		row->infomask2 = tuple->t_infomask2;
+		/*
+		 * KEEP until canonical proof and conditional apply exist. Native
+		 * FROZEN encoding exempts only xmin; it says nothing about xmax.
+		 * Raw special XIDs, commit hints and carrier equality are not proof.
+		 * All MX fields remain opaque, including stale INVALID/MULTI bits.
+		 */
+		if ((row->infomask & HEAP_XMIN_FROZEN) != HEAP_XMIN_FROZEN)
+			out->unproven_xmin_tuples++;
+		if (!(row->infomask & (HEAP_XMAX_INVALID | HEAP_XMAX_IS_MULTI)))
+			out->unproven_xmax_tuples++;
 		row->header_length = tuple->t_hoff;
 		row->itl_slot_index = tuple->t_itl_slot_idx;
 		row->carrier_request_index = CLUSTER_HEAP_FREEZE_NO_CARRIER_REQUEST;

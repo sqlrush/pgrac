@@ -82,6 +82,9 @@ typedef struct ClusterHeapFreezePageBatchV1
 	uint16 tuple_count;
 	uint16 multi_tuples;
 	uint8 carrier_request_count;
+	/* Negative work counts only; zero does not certify a page as all-frozen. */
+	uint16 unproven_xmin_tuples;
+	uint16 unproven_xmax_tuples;
 	ClusterHeapFreezeCarrierRequestV1 carrier_requests[CLUSTER_ITL_INITRANS_DEFAULT];
 	ClusterHeapFreezeTupleInputV1 tuples[MaxHeapTuplesPerPage];
 } ClusterHeapFreezePageBatchV1;

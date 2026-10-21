@@ -174,6 +174,9 @@ typedef struct LVRelState
 	bool		shared_freeze_input_valid;
 	BlockNumber shared_mx_deferred_pages;
 	int64		shared_mx_deferred_tuples;
+	int64		shared_xmin_deferred_tuples;
+	int64		shared_xmax_deferred_tuples;
+	BlockNumber shared_freeze_changed_pages;
 #endif
 
 	/* Buffer access strategy and parallel vacuum state */
@@ -614,8 +617,11 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 									   vacrel->cutoffs.relminmxid,
 									   vacrel->NewRelminMxid));
 #ifdef USE_PGRAC_CLUSTER
-	/* PGRAC: unexamined members cannot authorize either freeze cutoff. */
-	if (vacrel->shared_maintenance_restricted || vacrel->shared_mx_deferred_pages > 0)
+	/* PGRAC: retained or unexamined inputs cannot authorize either cutoff. */
+	if (vacrel->shared_maintenance_restricted || vacrel->shared_mx_deferred_pages > 0 ||
+		vacrel->shared_xmin_deferred_tuples > 0 ||
+		vacrel->shared_xmax_deferred_tuples > 0 ||
+		vacrel->shared_freeze_changed_pages > 0)
 	{
 		vacrel->NewRelfrozenXid = InvalidTransactionId;
 		vacrel->NewRelminMxid = InvalidMultiXactId;
@@ -760,6 +766,14 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 					_("shared MultiXact references retained: %u pages, %lld tuples; relfrozenxid and relminmxid not advanced\n"),
 					vacrel->shared_mx_deferred_pages,
 					(long long) vacrel->shared_mx_deferred_tuples);
+			if (vacrel->shared_xmin_deferred_tuples > 0 ||
+				vacrel->shared_xmax_deferred_tuples > 0 ||
+				vacrel->shared_freeze_changed_pages > 0)
+				appendStringInfo(&buf,
+					_("shared unproven references retained: %lld xmin, %lld ordinary xmax; %u changed page inputs discarded\n"),
+					(long long) vacrel->shared_xmin_deferred_tuples,
+					(long long) vacrel->shared_xmax_deferred_tuples,
+					vacrel->shared_freeze_changed_pages);
 #endif
 			if (vacrel->missed_dead_tuples > 0)
 				appendStringInfo(&buf,
@@ -1542,6 +1556,7 @@ lazy_validate_shared_freeze(LVRelState *vacrel, Page page, BlockNumber blkno)
 		case CLUSTER_HEAP_FREEZE_PAGE_CHANGED:
 			vacrel->shared_freeze_input_captured = false;
 			vacrel->shared_freeze_input_valid = false;
+			vacrel->shared_freeze_changed_pages++;
 			break;
 		default:
 			ereport(ERROR,
@@ -1573,6 +1588,9 @@ lazy_prepare_shared_freeze(LVRelState *vacrel, Buffer *vmbuffer)
 											   &vacrel->shared_freeze_batch))
 		elog(ERROR, "invalid shared heap freeze row inputs at block %u",
 			 vacrel->shared_freeze_input.block);
+	/* These negative counts survive per-page input replacement/invalidation. */
+	vacrel->shared_xmin_deferred_tuples += vacrel->shared_freeze_batch.unproven_xmin_tuples;
+	vacrel->shared_xmax_deferred_tuples += vacrel->shared_freeze_batch.unproven_xmax_tuples;
 	vacrel->shared_freeze_input_valid = true;
 }
 #endif

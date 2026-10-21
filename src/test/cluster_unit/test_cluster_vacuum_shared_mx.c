@@ -1472,10 +1472,181 @@ UT_TEST(physical_validation_distinguishes_invalid_arguments_and_layout)
 				 CLUSTER_HEAP_FREEZE_PAGE_INVALID);
 }
 
+/* Run the real capture/prepare without turning raw fields into proof. */
+static void
+prepare_retained_rows(ClusterHeapFreezePageBatchV1 *batch)
+{
+	ClusterHeapFreezePageInputV1 input;
+
+	if (!cluster_heap_freeze_capture_page_v1(&state.identity, 0, (Page)fixture_pages[0].data,
+											 &input)
+		|| !cluster_heap_freeze_prepare_page_v1(&input, batch))
+		abort();
+}
+
+static HeapTupleHeader
+retained_row(OffsetNumber offset)
+{
+	Page page = (Page)fixture_pages[0].data;
+
+	return (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, offset));
+}
+
+UT_TEST(retained_counts_cover_physical_rows_without_merging_raw_xids)
+{
+	ClusterHeapFreezePageBatchV1 batch;
+
+	setup(true);
+	make_page(0, false, 33);
+	prepare_retained_rows(&batch);
+	UT_ASSERT_EQ(batch.tuple_count, 3);
+	UT_ASSERT_EQ(batch.unproven_xmin_tuples, 3);
+	UT_ASSERT_EQ(batch.unproven_xmax_tuples, 3);
+	UT_ASSERT_EQ(batch.multi_tuples, 0);
+	UT_ASSERT_EQ(batch.carrier_request_count, 0);
+}
+
+UT_TEST(only_both_frozen_hint_bits_suppress_creator_work)
+{
+	ClusterHeapFreezePageBatchV1 batch;
+	const uint16 masks[] = { 0, HEAP_XMIN_COMMITTED, HEAP_XMIN_INVALID, HEAP_XMIN_FROZEN };
+	const TransactionId xids[] = { InvalidTransactionId, FrozenTransactionId, 7 };
+
+	for (unsigned xid = 0; xid < lengthof(xids); xid++)
+		for (unsigned mask = 0; mask < lengthof(masks); mask++) {
+			setup(true);
+			make_page(0, false, 33);
+			for (OffsetNumber off = 1; off <= 5; off++) {
+				if (off == 3 || off == 4)
+					continue;
+				HeapTupleHeaderSetXmin(retained_row(off), xids[xid]);
+				retained_row(off)->t_infomask = masks[mask] | HEAP_XMAX_INVALID;
+			}
+			prepare_retained_rows(&batch);
+			UT_ASSERT_EQ(batch.unproven_xmin_tuples, mask == 3 ? 0 : 3);
+			UT_ASSERT_EQ(batch.unproven_xmax_tuples, 0);
+		}
+}
+
+UT_TEST(frozen_creator_does_not_clear_committed_or_lock_only_xmax)
+{
+	ClusterHeapFreezePageBatchV1 batch;
+	const uint16 masks[] = { 0, HEAP_XMAX_COMMITTED, HEAP_XMAX_LOCK_ONLY, HEAP_XMAX_INVALID };
+
+	for (unsigned mask = 0; mask < lengthof(masks); mask++) {
+		setup(true);
+		make_page(0, false, 33);
+		for (OffsetNumber off = 1; off <= 5; off++) {
+			if (off == 3 || off == 4)
+				continue;
+			retained_row(off)->t_infomask = HEAP_XMIN_FROZEN | masks[mask];
+		}
+		prepare_retained_rows(&batch);
+		UT_ASSERT_EQ(batch.unproven_xmin_tuples, 0);
+		UT_ASSERT_EQ(batch.unproven_xmax_tuples, mask == 3 ? 0 : 3);
+	}
+}
+
+UT_TEST(multis_stay_opaque_and_special_raw_xmax_does_not_supply_proof)
+{
+	ClusterHeapFreezePageBatchV1 batch;
+
+	setup(true);
+	make_page(0, false, 33);
+	retained_row(1)->t_infomask = HEAP_XMIN_FROZEN | HEAP_XMAX_IS_MULTI | HEAP_XMAX_INVALID;
+	retained_row(2)->t_infomask = HEAP_XMIN_FROZEN;
+	HeapTupleHeaderSetXmax(retained_row(2), InvalidTransactionId);
+	retained_row(5)->t_infomask = HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID;
+	prepare_retained_rows(&batch);
+	UT_ASSERT_EQ(batch.multi_tuples, 1);
+	UT_ASSERT_EQ(batch.unproven_xmin_tuples, 0);
+	UT_ASSERT_EQ(batch.unproven_xmax_tuples, 1);
+}
+
+UT_TEST(real_scan_accumulates_retained_work_after_both_original_lock_paths)
+{
+	for (unsigned cleanup = 0; cleanup < 2; cleanup++)
+		for (unsigned multi = 0; multi < 2; multi++) {
+			setup(cleanup);
+			make_page(0, multi, 33);
+			lazy_scan_heap(&state);
+			UT_ASSERT_EQ(state.shared_xmin_deferred_tuples, 3);
+			UT_ASSERT_EQ(state.shared_xmax_deferred_tuples, multi ? 2 : 3);
+			UT_ASSERT_EQ(state.shared_freeze_changed_pages, 0);
+			UT_ASSERT_EQ(fixture_prepare_held_mask, 0);
+			UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
+		}
+}
+
+UT_TEST(retained_work_survives_replacement_and_empty_page_invalidation)
+{
+	setup(true);
+	make_page(1, false, 44);
+	make_page(2, false, 55);
+	((PageHeader)fixture_pages[2].data)->pd_lower = SizeOfPageHeaderData;
+	((PageHeader)fixture_pages[2].data)->pd_upper = BLCKSZ;
+	state.rel_pages = 3;
+	lazy_scan_heap(&state);
+	UT_ASSERT_EQ(state.shared_xmin_deferred_tuples, 6);
+	UT_ASSERT_EQ(state.shared_xmax_deferred_tuples, 5);
+	UT_ASSERT_EQ(state.shared_mx_deferred_pages, 1);
+	UT_ASSERT_EQ(fixture_prepares, 2);
+	UT_ASSERT(!state.shared_freeze_input_valid);
+}
+
+UT_TEST(changed_inputs_record_missing_coverage_without_counting_old_rows)
+{
+	for (unsigned cleanup = 0; cleanup < 2; cleanup++) {
+		setup(cleanup);
+		make_page(0, false, 33);
+		fixture_noprune_hint = !cleanup;
+		fixture_prune_change = cleanup ? 1 : 0;
+		lazy_scan_heap(&state);
+		UT_ASSERT_EQ(state.shared_freeze_changed_pages, 1);
+		UT_ASSERT_EQ(state.shared_xmin_deferred_tuples, 0);
+		UT_ASSERT_EQ(state.shared_xmax_deferred_tuples, 0);
+		UT_ASSERT_EQ(fixture_prepares, 0);
+		UT_ASSERT(!state.shared_freeze_input_valid);
+	}
+}
+
+UT_TEST(retained_or_changed_inputs_independently_prevent_catalog_publication)
+{
+	/* Isolate the new negative guards, without weakening the product policy. */
+	for (unsigned reason = 0; reason < 3; reason++) {
+		setup(true);
+		state.shared_maintenance_restricted = false;
+		state.shared_xmin_deferred_tuples = reason == 0;
+		state.shared_xmax_deferred_tuples = reason == 1;
+		state.shared_freeze_changed_pages = reason == 2;
+		fixture_publish_cutoffs(&state);
+		UT_ASSERT_EQ(state.NewRelfrozenXid, InvalidTransactionId);
+		UT_ASSERT_EQ(state.NewRelminMxid, InvalidMultiXactId);
+	}
+}
+
+UT_TEST(zero_retained_counts_never_remove_the_original_shared_restriction)
+{
+	setup(true);
+	fixture_publish_cutoffs(&state);
+	UT_ASSERT_EQ(state.NewRelfrozenXid, InvalidTransactionId);
+	UT_ASSERT_EQ(state.NewRelminMxid, InvalidMultiXactId);
+	setup(true);
+	state.versioned = false;
+	state.shared_maintenance_restricted = false;
+	lazy_scan_heap(&state);
+	UT_ASSERT_EQ(state.shared_xmin_deferred_tuples, 0);
+	UT_ASSERT_EQ(state.shared_xmax_deferred_tuples, 0);
+	UT_ASSERT_EQ(state.shared_freeze_changed_pages, 0);
+	fixture_publish_cutoffs(&state);
+	UT_ASSERT_EQ(state.NewRelfrozenXid, 100);
+	UT_ASSERT_EQ(state.NewRelminMxid, 100);
+}
+
 int
 main(void)
 {
-	UT_PLAN(42);
+	UT_PLAN(51);
 	UT_RUN(share_scan_preserves_every_reference_before_native_consumer);
 	UT_RUN(cleanup_scan_preserves_before_prune_and_freeze);
 	UT_RUN(raw_multi_value_never_selects_local_reader);
@@ -1518,6 +1689,15 @@ main(void)
 	UT_RUN(physical_validation_rejects_each_space_and_block_identity_change);
 	UT_RUN(physical_validation_covers_all_page_bytes_and_itl_carriers);
 	UT_RUN(physical_validation_distinguishes_invalid_arguments_and_layout);
+	UT_RUN(retained_counts_cover_physical_rows_without_merging_raw_xids);
+	UT_RUN(only_both_frozen_hint_bits_suppress_creator_work);
+	UT_RUN(frozen_creator_does_not_clear_committed_or_lock_only_xmax);
+	UT_RUN(multis_stay_opaque_and_special_raw_xmax_does_not_supply_proof);
+	UT_RUN(real_scan_accumulates_retained_work_after_both_original_lock_paths);
+	UT_RUN(retained_work_survives_replacement_and_empty_page_invalidation);
+	UT_RUN(changed_inputs_record_missing_coverage_without_counting_old_rows);
+	UT_RUN(retained_or_changed_inputs_independently_prevent_catalog_publication);
+	UT_RUN(zero_retained_counts_never_remove_the_original_shared_restriction);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
