@@ -23,6 +23,7 @@
 
 #define FAILSAFE_EVERY_PAGES 524288
 #define VACUUM_FSM_EVERY_PAGES 1048576
+#define FIXTURE_VM_BUFFER 1000
 #define pgstat_progress_update_param(...) ((void)0)
 #define pgstat_progress_update_multi_param(n, index, values)                                       \
 	((void)(n), (void)(index), (void)(values))
@@ -54,7 +55,11 @@ visibilitymap_pin(Relation rel, BlockNumber block, Buffer *vm)
 {
 	(void)rel;
 	(void)block;
-	*vm = InvalidBuffer;
+	if (!BufferIsValid(*vm)) {
+		*vm = FIXTURE_VM_BUFFER;
+		fixture_vm_pins++;
+		fixture_vm_acquires++;
+	}
 }
 
 Buffer
@@ -67,6 +72,7 @@ ReadBufferExtended(Relation rel, ForkNumber fork, BlockNumber block, ReadBufferM
 	(void)strategy;
 	if (fixture_read_error)
 		longjmp(fixture_error, 1);
+	fixture_reads++;
 	fixture_pins++;
 	return block + 1;
 }
@@ -90,23 +96,34 @@ LockBuffer(Buffer buf, int mode)
 void
 LockBufferForCleanup(Buffer buf)
 {
-	(void)buf;
 	fixture_locks++;
+	if (fixture_cleanup_empty)
+		((PageHeader)BufferGetPage(buf))->pd_lower = SizeOfPageHeaderData;
+	if (TransactionIdIsValid(fixture_cleanup_xmin)) {
+		Page page = BufferGetPage(buf);
+		HeapTupleHeader tuple = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, 1));
+
+		HeapTupleHeaderSetXmin(tuple, fixture_cleanup_xmin);
+	}
 }
 
 void
 UnlockReleaseBuffer(Buffer buf)
 {
-	(void)buf;
 	fixture_locks--;
 	fixture_pins--;
+	if (fixture_clear_released_page)
+		memset(BufferGetPage(buf), 0, BLCKSZ);
 }
 
 void
 ReleaseBuffer(Buffer buf)
 {
-	(void)buf;
-	fixture_pins--;
+	if (buf == FIXTURE_VM_BUFFER) {
+		fixture_vm_pins--;
+		fixture_vm_releases++;
+	} else
+		fixture_pins--;
 }
 
 static bool
@@ -132,9 +149,11 @@ lazy_scan_noprune(LVRelState *vacrel, Buffer buf, BlockNumber block, Page page, 
 	(void)block;
 	(void)page;
 	fixture_noprune++;
+	if (!fixture_finish_noprune)
+		return false;
 	vacrel->live_tuples++;
 	*hastup = true;
-	*recordspace = false;
+	*recordspace = fixture_recordspace;
 	return true;
 }
 
@@ -149,6 +168,7 @@ lazy_scan_prune(LVRelState *vacrel, Buffer buf, BlockNumber block, Page page,
 	vacrel->live_tuples++;
 	memset(state, 0, sizeof(*state));
 	state->hastup = true;
+	state->has_lpdead_items = fixture_prune_lpdead;
 }
 
 static void

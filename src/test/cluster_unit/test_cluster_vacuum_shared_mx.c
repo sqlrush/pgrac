@@ -61,6 +61,13 @@ static bool fixture_storage;
 #define cluster_storage_mode_enabled() fixture_storage
 #include "test_cluster_heap_maintenance_policy.inc"
 static int fixture_smgr, fixture_pins, fixture_locks;
+static int fixture_vm_pins;
+static unsigned fixture_reads, fixture_vm_acquires, fixture_vm_releases;
+static unsigned fixture_prepares, fixture_prepare_held_mask;
+static bool fixture_finish_noprune, fixture_recordspace, fixture_prune_lpdead;
+static bool fixture_clear_released_page;
+static bool fixture_cleanup_empty;
+static TransactionId fixture_cleanup_xmin;
 static unsigned fixture_prune, fixture_noprune, fixture_fsm_writes;
 static unsigned fixture_vm_writes, fixture_dirties, fixture_consumed_dead;
 static jmp_buf fixture_error;
@@ -105,7 +112,20 @@ errfinish(const char *file, int line, const char *function)
 
 /* Explicit maintenance intents are outside this page-scan fixture. */
 #define cluster_heap_freeze_request_maintenance() false
+
+/* Observe ownership at the real preparation call, then run its actual body. */
+static bool
+fixture_prepare_page(const ClusterHeapFreezePageInputV1 *input, ClusterHeapFreezePageBatchV1 *out)
+{
+	fixture_prepares++;
+	fixture_prepare_held_mask
+		|= (fixture_locks ? 1 : 0) | (fixture_pins ? 2 : 0) | (fixture_vm_pins ? 4 : 0);
+	return cluster_heap_freeze_prepare_page_v1(input, out);
+}
+
+#define cluster_heap_freeze_prepare_page_v1 fixture_prepare_page
 #include "test_cluster_vacuum_shared_mx.inc"
+#undef cluster_heap_freeze_prepare_page_v1
 
 static LVRelState state;
 static RelationData relation;
@@ -154,6 +174,14 @@ setup(bool cleanup)
 	fixture_cleanup = cleanup;
 	fixture_read_error = false;
 	fixture_pins = fixture_locks = 0;
+	fixture_vm_pins = 0;
+	fixture_reads = fixture_vm_acquires = fixture_vm_releases = 0;
+	fixture_prepares = fixture_prepare_held_mask = 0;
+	fixture_finish_noprune = true;
+	fixture_recordspace = fixture_prune_lpdead = false;
+	fixture_clear_released_page = false;
+	fixture_cleanup_empty = false;
+	fixture_cleanup_xmin = InvalidTransactionId;
 	fixture_prune = fixture_noprune = fixture_fsm_writes = 0;
 	fixture_vm_writes = fixture_dirties = fixture_consumed_dead = 0;
 	state.rel = &relation;
@@ -729,7 +757,7 @@ UT_TEST(prepare_rejects_inconsistent_inputs_without_partial_output)
 	UT_ASSERT(!cluster_heap_freeze_prepare_page_v1(&input, NULL));
 }
 
-UT_TEST(real_scan_consumes_prepared_rows_under_both_original_locks)
+UT_TEST(real_scan_consumes_rows_captured_under_both_original_locks)
 {
 	for (unsigned cleanup = 0; cleanup < 2; cleanup++)
 		for (unsigned multi = 0; multi < 2; multi++)
@@ -1054,10 +1082,166 @@ UT_TEST(real_scan_prepares_owned_requests_and_resets_next_page)
 	}
 }
 
+UT_TEST(real_scan_prepares_after_heap_lock_and_both_pins_are_released)
+{
+	for (unsigned cleanup = 0; cleanup < 2; cleanup++)
+		for (unsigned multi = 0; multi < 2; multi++) {
+			setup(cleanup);
+			make_page(0, multi, 33);
+			fixture_recordspace = true;
+			lazy_scan_heap(&state);
+			UT_ASSERT_EQ(fixture_prepares, 1);
+			UT_ASSERT_EQ(fixture_prepare_held_mask, 0);
+			UT_ASSERT_EQ(fixture_reads, 1);
+			UT_ASSERT_EQ(fixture_vm_acquires, 1);
+			UT_ASSERT_EQ(fixture_vm_releases, 1);
+			UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
+			UT_ASSERT(prepared_batch() != NULL);
+		}
+}
+
+UT_TEST(released_live_page_cannot_replace_owned_preparation_input)
+{
+	for (unsigned cleanup = 0; cleanup < 2; cleanup++) {
+		const ClusterHeapFreezePageBatchV1 *batch;
+		PGAlignedBlock before;
+		Page page;
+
+		setup(cleanup);
+		make_itl_page();
+		page = (Page)fixture_pages[0].data;
+		name_three_carriers(page, 0, 0, 1);
+		make_valid_carrier(page, 0, 77, TT_WRAP_MAX);
+		make_valid_carrier(page, 1, 88, 2);
+		before = fixture_pages[0];
+		fixture_clear_released_page = true;
+		lazy_scan_heap(&state);
+		batch = prepared_batch();
+		UT_ASSERT(batch != NULL);
+		if (batch == NULL)
+			continue;
+		UT_ASSERT_EQ(fixture_prepare_held_mask, 0);
+		UT_ASSERT_EQ(memcmp(&state.shared_freeze_input.image, &before, sizeof(before)), 0);
+		UT_ASSERT(PageIsNew((Page)fixture_pages[0].data));
+		UT_ASSERT_EQ(batch->carrier_request_count, 2);
+		UT_ASSERT_EQ(batch->carrier_requests[0].locator.xid, 77);
+		UT_ASSERT_EQ(batch->carrier_requests[1].locator.xid, 88);
+		UT_ASSERT_EQ(fixture_reads, 1);
+	}
+}
+
+UT_TEST(cleanup_fallback_prepares_only_its_refreshed_capture)
+{
+	const ClusterHeapFreezePageBatchV1 *batch;
+
+	setup(false);
+	make_page(0, false, 33);
+	state.aggressive = true;
+	fixture_finish_noprune = false;
+	fixture_cleanup_xmin = 88;
+	lazy_scan_heap(&state);
+	batch = prepared_batch();
+	UT_ASSERT(batch != NULL);
+	if (batch == NULL)
+		return;
+	UT_ASSERT_EQ(batch->tuples[0].raw_xmin, 88);
+	UT_ASSERT_EQ(fixture_prepares, 1);
+	UT_ASSERT_EQ(fixture_prepare_held_mask, 0);
+	UT_ASSERT_EQ(fixture_noprune, 1);
+	UT_ASSERT_EQ(fixture_prune, 1);
+	UT_ASSERT_EQ(fixture_reads, 1);
+	UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
+}
+
+UT_TEST(indexed_lpdead_exit_also_releases_before_preparation)
+{
+	setup(true);
+	make_page(0, false, 33);
+	state.do_index_vacuuming = true;
+	fixture_prune_lpdead = true;
+	lazy_scan_heap(&state);
+	UT_ASSERT_EQ(fixture_prepares, 1);
+	UT_ASSERT_EQ(fixture_prepare_held_mask, 0);
+	UT_ASSERT_EQ(fixture_prune, 1);
+	UT_ASSERT_EQ(fixture_fsm_writes, 0);
+	UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
+}
+
+UT_TEST(nontarget_keeps_vm_pin_reuse_and_never_prepares)
+{
+	setup(true);
+	fixture_peer = false;
+	state.rel_pages = 2;
+	make_page(1, true, 33);
+	lazy_scan_heap(&state);
+	UT_ASSERT_EQ(fixture_prepares, 0);
+	UT_ASSERT_EQ(fixture_prune, 2);
+	UT_ASSERT_EQ(fixture_reads, 2);
+	UT_ASSERT_EQ(fixture_vm_acquires, 1);
+	UT_ASSERT_EQ(fixture_vm_releases, 1);
+	UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
+	UT_ASSERT(prepared_batch() == NULL);
+}
+
+UT_TEST(each_captured_page_gets_one_unpinned_preparation)
+{
+	const ClusterHeapFreezePageBatchV1 *batch;
+
+	setup(true);
+	state.rel_pages = 2;
+	make_page(1, true, 44);
+	lazy_scan_heap(&state);
+	batch = prepared_batch();
+	UT_ASSERT(batch != NULL);
+	if (batch == NULL)
+		return;
+	UT_ASSERT_EQ(batch->block, 1);
+	UT_ASSERT_EQ(batch->tuples[0].raw_xmax, 44);
+	UT_ASSERT_EQ(fixture_prepares, 2);
+	UT_ASSERT_EQ(fixture_prepare_held_mask, 0);
+	UT_ASSERT_EQ(fixture_reads, 2);
+	UT_ASSERT_EQ(fixture_vm_acquires, 2);
+	UT_ASSERT_EQ(fixture_vm_releases, 2);
+	UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
+}
+
+UT_TEST(cleanup_fallback_to_empty_discards_pending_capture)
+{
+	setup(false);
+	make_page(0, false, 33);
+	state.aggressive = true;
+	fixture_finish_noprune = false;
+	fixture_cleanup_empty = true;
+	lazy_scan_heap(&state);
+	UT_ASSERT_EQ(fixture_prepares, 0);
+	UT_ASSERT(prepared_batch() == NULL);
+	UT_ASSERT(!state.shared_freeze_input_captured);
+	UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
+}
+
+UT_TEST(noindex_lpdead_exit_prepares_once_after_all_buffers_are_released)
+{
+	setup(true);
+	make_page(0, false, 33);
+	state.nindexes = 0;
+	fixture_prune_lpdead = true;
+	lazy_scan_heap(&state);
+	UT_ASSERT_EQ(fixture_prepares, 1);
+	UT_ASSERT_EQ(fixture_prepare_held_mask, 0);
+	UT_ASSERT(!state.shared_freeze_input_captured);
+	UT_ASSERT(prepared_batch() != NULL);
+	UT_ASSERT_EQ(fixture_reads, 1);
+	UT_ASSERT_EQ(fixture_prune, 1);
+	UT_ASSERT_EQ(fixture_fsm_writes, 1);
+	UT_ASSERT_EQ(fixture_vm_acquires, 1);
+	UT_ASSERT_EQ(fixture_vm_releases, 1);
+	UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(34);
 	UT_RUN(share_scan_preserves_every_reference_before_native_consumer);
 	UT_RUN(cleanup_scan_preserves_before_prune_and_freeze);
 	UT_RUN(raw_multi_value_never_selects_local_reader);
@@ -1076,7 +1260,7 @@ main(void)
 	UT_RUN(prepare_keeps_rows_without_an_addressable_itl);
 	UT_RUN(prepare_is_bounded_at_maximum_and_empty_page);
 	UT_RUN(prepare_rejects_inconsistent_inputs_without_partial_output);
-	UT_RUN(real_scan_consumes_prepared_rows_under_both_original_locks);
+	UT_RUN(real_scan_consumes_rows_captured_under_both_original_locks);
 	UT_RUN(real_scan_replaces_and_invalidates_prepared_batch);
 	UT_RUN(requests_share_only_the_same_physical_carrier);
 	UT_RUN(requests_keep_updater_and_lock_carriers_distinct_from_raw_xmin);
@@ -1084,6 +1268,14 @@ main(void)
 	UT_RUN(missing_and_unused_carriers_cannot_supply_requests);
 	UT_RUN(request_batch_is_bounded_by_eight_physical_slots);
 	UT_RUN(real_scan_prepares_owned_requests_and_resets_next_page);
+	UT_RUN(real_scan_prepares_after_heap_lock_and_both_pins_are_released);
+	UT_RUN(released_live_page_cannot_replace_owned_preparation_input);
+	UT_RUN(cleanup_fallback_prepares_only_its_refreshed_capture);
+	UT_RUN(indexed_lpdead_exit_also_releases_before_preparation);
+	UT_RUN(nontarget_keeps_vm_pin_reuse_and_never_prepares);
+	UT_RUN(each_captured_page_gets_one_unpinned_preparation);
+	UT_RUN(cleanup_fallback_to_empty_discards_pending_capture);
+	UT_RUN(noindex_lpdead_exit_prepares_once_after_all_buffers_are_released);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

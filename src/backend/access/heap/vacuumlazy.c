@@ -169,6 +169,7 @@ typedef struct LVRelState
 	/* Unproven image and bounded rows; no pointer or freeze permission. */
 	ClusterHeapFreezePageInputV1 shared_freeze_input;
 	ClusterHeapFreezePageBatchV1 shared_freeze_batch;
+	bool		shared_freeze_input_captured;
 	bool		shared_freeze_input_valid;
 	BlockNumber shared_mx_deferred_pages;
 	int64		shared_mx_deferred_tuples;
@@ -272,6 +273,7 @@ typedef struct LVSavedErrInfo
 static void lazy_scan_heap(LVRelState *vacrel);
 #ifdef USE_PGRAC_CLUSTER
 static bool lazy_scan_shared_mx(LVRelState *vacrel, Page page, BlockNumber blkno);
+static void lazy_prepare_shared_freeze(LVRelState *vacrel, Buffer *vmbuffer);
 #endif
 static BlockNumber lazy_scan_skip(LVRelState *vacrel, Buffer *vmbuffer,
 								  BlockNumber next_block,
@@ -991,6 +993,7 @@ lazy_scan_heap(LVRelState *vacrel)
 
 #ifdef USE_PGRAC_CLUSTER
 		/* A skipped/new/empty/error page must not inherit the preceding input. */
+		vacrel->shared_freeze_input_captured = false;
 		vacrel->shared_freeze_input_valid = false;
 #endif
 		if (blkno == next_unskippable_block)
@@ -1114,6 +1117,7 @@ lazy_scan_heap(LVRelState *vacrel)
 			if (lazy_scan_shared_mx(vacrel, page, blkno))
 			{
 				UnlockReleaseBuffer(buf);
+				lazy_prepare_shared_freeze(vacrel, &vmbuffer);
 				continue;
 			}
 #endif
@@ -1135,6 +1139,9 @@ lazy_scan_heap(LVRelState *vacrel)
 				if (recordfreespace)
 					freespace = PageGetHeapFreeSpace(page);
 				UnlockReleaseBuffer(buf);
+#ifdef USE_PGRAC_CLUSTER
+				lazy_prepare_shared_freeze(vacrel, &vmbuffer);
+#endif
 				if (recordfreespace)
 					RecordPageWithFreeSpace(vacrel->rel, blkno, freespace);
 				continue;
@@ -1152,6 +1159,10 @@ lazy_scan_heap(LVRelState *vacrel)
 		/* Check for new or empty pages before lazy_scan_prune call */
 		if (lazy_scan_new_or_empty(vacrel, buf, blkno, page, false, vmbuffer))
 		{
+#ifdef USE_PGRAC_CLUSTER
+			/* Cleanup fallback may have replaced the earlier SHARE image. */
+			vacrel->shared_freeze_input_captured = false;
+#endif
 			/* Processed as new/empty page (lock and pin released) */
 			continue;
 		}
@@ -1161,6 +1172,7 @@ lazy_scan_heap(LVRelState *vacrel)
 		if (lazy_scan_shared_mx(vacrel, page, blkno))
 		{
 			UnlockReleaseBuffer(buf);
+			lazy_prepare_shared_freeze(vacrel, &vmbuffer);
 			continue;
 		}
 #endif
@@ -1225,6 +1237,9 @@ lazy_scan_heap(LVRelState *vacrel)
 				freespace = PageGetHeapFreeSpace(page);
 
 				UnlockReleaseBuffer(buf);
+#ifdef USE_PGRAC_CLUSTER
+				lazy_prepare_shared_freeze(vacrel, &vmbuffer);
+#endif
 				RecordPageWithFreeSpace(vacrel->rel, blkno, freespace);
 				continue;
 			}
@@ -1405,12 +1420,18 @@ lazy_scan_heap(LVRelState *vacrel)
 			 */
 			Assert(vacrel->nindexes > 0);
 			UnlockReleaseBuffer(buf);
+#ifdef USE_PGRAC_CLUSTER
+			lazy_prepare_shared_freeze(vacrel, &vmbuffer);
+#endif
 		}
 		else
 		{
 			Size		freespace = PageGetHeapFreeSpace(page);
 
 			UnlockReleaseBuffer(buf);
+#ifdef USE_PGRAC_CLUSTER
+			lazy_prepare_shared_freeze(vacrel, &vmbuffer);
+#endif
 			RecordPageWithFreeSpace(vacrel->rel, blkno, freespace);
 		}
 	}
@@ -1460,13 +1481,14 @@ lazy_scan_heap(LVRelState *vacrel)
 #ifdef USE_PGRAC_CLUSTER
 /*
  * Preserve a peer MX page while holding its original share or cleanup lock.
- * Capture and expand bounded row inputs under that same lock, then consume
- * physical counts for the existing MX KEEP decision. The input asserts no
- * transaction visibility, current fence or eligibility and releases no ref.
+ * Capture bounded physical input and consume its counts for the existing MX
+ * KEEP decision. Defer row/request preparation until after releasing the heap
+ * lock and heap/VM pins. Neither stage proves transaction state or eligibility.
  */
 static bool
 lazy_scan_shared_mx(LVRelState *vacrel, Page page, BlockNumber blkno)
 {
+	vacrel->shared_freeze_input_captured = false;
 	vacrel->shared_freeze_input_valid = false;
 	if (!vacrel->versioned || !cluster_peer_mode_enabled())
 		return false;
@@ -1474,18 +1496,40 @@ lazy_scan_shared_mx(LVRelState *vacrel, Page page, BlockNumber blkno)
 	if (!cluster_heap_freeze_capture_page_v1(&vacrel->identity, blkno, page,
 											   &vacrel->shared_freeze_input))
 		elog(ERROR, "invalid shared heap freeze input at block %u", blkno);
-	if (!cluster_heap_freeze_prepare_page_v1(&vacrel->shared_freeze_input,
-											   &vacrel->shared_freeze_batch))
-		elog(ERROR, "invalid shared heap freeze row inputs at block %u", blkno);
-	vacrel->shared_freeze_input_valid = true;
-	if (vacrel->shared_freeze_batch.multi_tuples == 0)
+	vacrel->shared_freeze_input_captured = true;
+	if (vacrel->shared_freeze_input.multi_tuples == 0)
 		return false;
 
 	vacrel->shared_mx_deferred_pages++;
-	vacrel->shared_mx_deferred_tuples += vacrel->shared_freeze_batch.tuple_count;
-	vacrel->live_tuples += vacrel->shared_freeze_batch.tuple_count;
+	vacrel->shared_mx_deferred_tuples += vacrel->shared_freeze_input.normal_tuples;
+	vacrel->live_tuples += vacrel->shared_freeze_input.normal_tuples;
 	vacrel->nonempty_pages = blkno + 1;
 	return true;
+}
+
+/*
+ * Caller has released its heap lock and pin. Drop the VM pin before preparing
+ * owned row/request inputs, so this boundary cannot retain those buffers over
+ * later proof work. Only the last capture is prepared after cleanup fallback.
+ * Native processing or another writer may have changed the page since capture;
+ * the copied input remains unproven and grants no permission to change it.
+ */
+static void
+lazy_prepare_shared_freeze(LVRelState *vacrel, Buffer *vmbuffer)
+{
+	if (!vacrel->shared_freeze_input_captured)
+		return;
+	if (BufferIsValid(*vmbuffer))
+	{
+		ReleaseBuffer(*vmbuffer);
+		*vmbuffer = InvalidBuffer;
+	}
+	vacrel->shared_freeze_input_captured = false;
+	if (!cluster_heap_freeze_prepare_page_v1(&vacrel->shared_freeze_input,
+											   &vacrel->shared_freeze_batch))
+		elog(ERROR, "invalid shared heap freeze row inputs at block %u",
+			 vacrel->shared_freeze_input.block);
+	vacrel->shared_freeze_input_valid = true;
 }
 #endif
 

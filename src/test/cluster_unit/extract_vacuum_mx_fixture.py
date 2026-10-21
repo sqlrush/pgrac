@@ -34,6 +34,8 @@ def extract(source):
     print('#include "cluster_vacuum_mx_test_stubs.h"')
     if re.search(r"^lazy_scan_shared_mx\(", source, re.M):
         print(function(source, "lazy_scan_shared_mx", "static bool"))
+    if re.search(r"^lazy_prepare_shared_freeze\(", source, re.M):
+        print(function(source, "lazy_prepare_shared_freeze", "static void"))
     print(function(source, "lazy_scan_heap", "static void"))
 
     # Keep both native assertions and the real publication decision intact.
