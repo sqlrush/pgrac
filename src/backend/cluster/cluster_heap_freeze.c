@@ -130,6 +130,90 @@ cluster_heap_freeze_validate_page_v1(const ClusterHeapFreezePageInputV1 *input,
 	return CLUSTER_HEAP_FREEZE_PAGE_MATCHED;
 }
 
+/* Small private plan: no partial public output if a runtime bound rejects. */
+typedef struct FreezeCarrierPlan
+{
+	uint8 request_count;
+	uint8 group_count;
+	uint8 request_index_by_slot[CLUSTER_ITL_INITRANS_DEFAULT];
+	ClusterHeapFreezeCarrierRequestV1 requests[CLUSTER_ITL_INITRANS_DEFAULT];
+	ClusterHeapFreezeDataGroupV1 groups[CLUSTER_ITL_INITRANS_DEFAULT];
+} FreezeCarrierPlan;
+
+static bool
+freeze_prepare_carriers(Page page, OffsetNumber maxoff, ClusterItlSlotData *slots,
+						FreezeCarrierPlan *plan)
+{
+	bool scanned[CLUSTER_ITL_INITRANS_DEFAULT] = { false };
+
+	memset(plan, 0, sizeof(*plan));
+	memset(plan->request_index_by_slot, CLUSTER_HEAP_FREEZE_NO_CARRIER_REQUEST,
+		   sizeof(plan->request_index_by_slot));
+	if (slots == NULL)
+		return true;
+
+	for (OffsetNumber offnum = FirstOffsetNumber; offnum <= maxoff;
+		 offnum = OffsetNumberNext(offnum)) {
+		ItemId item = PageGetItemId(page, offnum);
+		HeapTupleHeader tuple;
+		uint8 slot_index;
+		uint8 request_index;
+		uint8 group_index;
+		ClusterTxLocator locator;
+		ClusterHeapFreezeCarrierRequestV1 *request;
+		ClusterHeapFreezeDataGroupV1 *group;
+		uint32 segment_id;
+		uint32 block_no;
+		uint16 tt_slot_offset;
+		uint16 row_offset;
+
+		if (!ItemIdIsNormal(item))
+			continue;
+		tuple = (HeapTupleHeader)PageGetItem(page, item);
+		slot_index = tuple->t_itl_slot_idx;
+		if (slot_index >= lengthof(scanned) || scanned[slot_index])
+			continue;
+		scanned[slot_index] = true;
+		if (!cluster_tx_locator_from_itl_terminal_census(page, slot_index, &locator, NULL))
+			continue;
+
+		request_index = plan->request_count;
+		if (request_index >= lengthof(plan->requests))
+			return false;
+		request = &plan->requests[request_index];
+		request->locator = locator;
+		request->carrier = slots[slot_index];
+		request->data_group_index = CLUSTER_HEAP_FREEZE_NO_DATA_GROUP;
+		plan->request_index_by_slot[slot_index] = request_index;
+		plan->request_count++;
+
+		/*
+		 * Keep legacy locator/witness semantics, but only plan DATA reads for
+		 * the existing record-address domain. Neither wrap nor TT authority
+		 * is inferred here; the page wrap remains in the physical witness.
+		 */
+		if (!uba_decode_record(locator.uba, &segment_id, &block_no, &tt_slot_offset, &row_offset))
+			continue;
+		for (group_index = 0; group_index < plan->group_count; group_index++)
+			if (plan->groups[group_index].segment_id == segment_id
+				&& plan->groups[group_index].block_no == block_no)
+				break;
+		if (group_index == plan->group_count) {
+			if (group_index >= lengthof(plan->groups))
+				return false;
+			plan->groups[group_index].segment_id = segment_id;
+			plan->groups[group_index].block_no = block_no;
+			plan->group_count++;
+		}
+		group = &plan->groups[group_index];
+		if (group->request_count >= lengthof(group->request_indexes))
+			return false;
+		group->request_indexes[group->request_count++] = request_index;
+		request->data_group_index = group_index;
+	}
+	return true;
+}
+
 bool
 cluster_heap_freeze_prepare_page_v1(const ClusterHeapFreezePageInputV1 *input,
 								  ClusterHeapFreezePageBatchV1 *out)
@@ -140,8 +224,7 @@ cluster_heap_freeze_prepare_page_v1(const ClusterHeapFreezePageInputV1 *input,
 	uint16 multi;
 	uint16 index = 0;
 	ClusterItlSlotData *slots = NULL;
-	uint8 request_index_by_slot[CLUSTER_ITL_INITRANS_DEFAULT];
-	bool request_scanned[CLUSTER_ITL_INITRANS_DEFAULT] = { false };
+	FreezeCarrierPlan plan;
 
 	if (input == NULL || out == NULL || input->identity.state != CLUSTER_SPACE_IDENTITY_LIVE
 		|| input->block == InvalidBlockNumber)
@@ -154,8 +237,8 @@ cluster_heap_freeze_prepare_page_v1(const ClusterHeapFreezePageInputV1 *input,
 	/* All remaining accesses are bounded by the validated immutable image. */
 	if (PageHasItl(page))
 		slots = ClusterPageGetItlSlots(page);
-	memset(request_index_by_slot, CLUSTER_HEAP_FREEZE_NO_CARRIER_REQUEST,
-		   sizeof(request_index_by_slot));
+	if (!freeze_prepare_carriers(page, maxoff, slots, &plan))
+		return false;
 	memset(out, 0, sizeof(*out));
 	out->identity = input->identity;
 	out->block = input->block;
@@ -163,6 +246,10 @@ cluster_heap_freeze_prepare_page_v1(const ClusterHeapFreezePageInputV1 *input,
 	out->page_version = ((PageHeader)page)->pd_block_scn;
 	out->tuple_count = normal;
 	out->multi_tuples = multi;
+	out->carrier_request_count = plan.request_count;
+	out->data_group_count = plan.group_count;
+	memcpy(out->carrier_requests, plan.requests, sizeof(plan.requests));
+	memcpy(out->data_groups, plan.groups, sizeof(plan.groups));
 	for (OffsetNumber offnum = FirstOffsetNumber; offnum <= maxoff;
 		 offnum = OffsetNumberNext(offnum)) {
 		ItemId item = PageGetItemId(page, offnum);
@@ -200,29 +287,8 @@ cluster_heap_freeze_prepare_page_v1(const ClusterHeapFreezePageInputV1 *input,
 
 			row->has_carrier = true;
 			row->carrier = slots[slot_index];
-			if (!request_scanned[slot_index]) {
-				ClusterTxLocator locator;
-
-				request_scanned[slot_index] = true;
-				/*
-				 * Only prepare an origin request. The page wrap stays in the
-				 * physical witness; exact undo-record identity supplies the
-				 * canonical wrap later, outside all blocking locks/pins.
-				 */
-				if (cluster_tx_locator_from_itl_terminal_census(page, slot_index, &locator, NULL)) {
-					ClusterHeapFreezeCarrierRequestV1 *request;
-					uint8 request_index = out->carrier_request_count;
-
-					Assert(request_index < lengthof(out->carrier_requests));
-					request = &out->carrier_requests[request_index];
-					request->locator = locator;
-					request->carrier = slots[slot_index];
-					request_index_by_slot[slot_index] = request_index;
-					out->carrier_request_count++;
-				}
-			}
 			/* Equal raw XIDs in different slots remain separate requests. */
-			row->carrier_request_index = request_index_by_slot[slot_index];
+			row->carrier_request_index = plan.request_index_by_slot[slot_index];
 		}
 	}
 	return true;

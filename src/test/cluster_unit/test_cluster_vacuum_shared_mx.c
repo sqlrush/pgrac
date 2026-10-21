@@ -925,6 +925,169 @@ UT_TEST(requests_keep_updater_and_lock_carriers_distinct_from_raw_xmin)
 	UT_ASSERT_EQ(memcmp(page, input.image.data, BLCKSZ), 0);
 }
 
+UT_TEST(data_groups_keep_distinct_carriers_in_one_physical_block)
+{
+	ClusterHeapFreezePageInputV1 input;
+	ClusterHeapFreezePageBatchV1 batch;
+	Page page;
+
+	setup(true);
+	make_itl_page();
+	page = (Page)fixture_pages[0].data;
+	name_three_carriers(page, 0, 1, 2);
+	for (uint8 i = 0; i < 3; i++) {
+		make_valid_carrier(page, i, 77, 3 + i);
+		ClusterPageGetItlSlots(page)[i].undo_segment_head = uba_encode(257, 11, 21 + i, 31 + i);
+	}
+	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&state.identity, 0, page, &input));
+	UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&input, &batch));
+	UT_ASSERT_EQ(batch.carrier_request_count, 3);
+	UT_ASSERT_EQ(batch.data_group_count, 1);
+	UT_ASSERT_EQ(batch.data_groups[0].segment_id, 257);
+	UT_ASSERT_EQ(batch.data_groups[0].block_no, 11);
+	UT_ASSERT_EQ(batch.data_groups[0].request_count, 3);
+	for (uint8 i = 0; i < 3; i++) {
+		UT_ASSERT_EQ(batch.data_groups[0].request_indexes[i], i);
+		UT_ASSERT_EQ(batch.carrier_requests[i].data_group_index, 0);
+		UT_ASSERT_EQ(batch.tuples[i].carrier_request_index, i);
+		UT_ASSERT_EQ(batch.carrier_requests[i].locator.tt_wrap, TT_WRAP_INVALID);
+		UT_ASSERT_EQ(batch.carrier_requests[i].carrier.wrap, 3 + i);
+	}
+}
+
+UT_TEST(data_groups_preserve_first_appearance_and_duplicate_addresses)
+{
+	ClusterHeapFreezePageInputV1 input;
+	ClusterHeapFreezePageBatchV1 batch;
+	Page page;
+
+	setup(true);
+	make_itl_page();
+	page = (Page)fixture_pages[0].data;
+	name_three_carriers(page, 7, 1, 5);
+	make_valid_carrier(page, 7, 77, 10);
+	make_valid_carrier(page, 1, 88, 11);
+	make_valid_carrier(page, 5, 77, 12);
+	ClusterPageGetItlSlots(page)[7].undo_segment_head = uba_encode(256, 12, 21, 31);
+	ClusterPageGetItlSlots(page)[1].undo_segment_head = uba_encode(256, 11, 21, 31);
+	ClusterPageGetItlSlots(page)[5].undo_segment_head = uba_encode(256, 12, 21, 31);
+	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&state.identity, 0, page, &input));
+	UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&input, &batch));
+	UT_ASSERT_EQ(batch.carrier_request_count, 3);
+	UT_ASSERT_EQ(batch.data_group_count, 2);
+	UT_ASSERT_EQ(batch.data_groups[0].segment_id, 256);
+	UT_ASSERT_EQ(batch.data_groups[0].block_no, 12);
+	UT_ASSERT_EQ(batch.data_groups[0].request_count, 2);
+	UT_ASSERT_EQ(batch.data_groups[0].request_indexes[0], 0);
+	UT_ASSERT_EQ(batch.data_groups[0].request_indexes[1], 2);
+	UT_ASSERT_EQ(batch.data_groups[1].block_no, 11);
+	UT_ASSERT_EQ(batch.data_groups[1].request_count, 1);
+	UT_ASSERT_EQ(batch.data_groups[1].request_indexes[0], 1);
+	UT_ASSERT_EQ(batch.carrier_requests[0].locator.itl_slot_index, 7);
+	UT_ASSERT_EQ(batch.carrier_requests[1].locator.itl_slot_index, 1);
+	UT_ASSERT_EQ(batch.carrier_requests[2].locator.itl_slot_index, 5);
+	UT_ASSERT_EQ(batch.carrier_requests[0].data_group_index, 0);
+	UT_ASSERT_EQ(batch.carrier_requests[1].data_group_index, 1);
+	UT_ASSERT_EQ(batch.carrier_requests[2].data_group_index, 0);
+}
+
+UT_TEST(data_groups_separate_complete_segment_and_origin)
+{
+	ClusterHeapFreezePageInputV1 input;
+	ClusterHeapFreezePageBatchV1 batch;
+	const uint32 segments[] = { 1, 257, UNDO_OWNER_INSTANCE_MAX * CLUSTER_UNDO_SEGS_PER_INSTANCE };
+	Page page;
+
+	setup(true);
+	make_itl_page();
+	page = (Page)fixture_pages[0].data;
+	name_three_carriers(page, 0, 1, 2);
+	for (uint8 i = 0; i < 3; i++) {
+		make_valid_carrier(page, i, 77, 3);
+		ClusterPageGetItlSlots(page)[i].undo_segment_head
+			= uba_encode(segments[i], UNDO_BLOCKS_PER_SEGMENT - 1, 21, 31);
+	}
+	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&state.identity, 0, page, &input));
+	UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&input, &batch));
+	UT_ASSERT_EQ(batch.data_group_count, 3);
+	for (uint8 i = 0; i < 3; i++) {
+		UT_ASSERT_EQ(batch.data_groups[i].segment_id, segments[i]);
+		UT_ASSERT_EQ(batch.data_groups[i].block_no, UNDO_BLOCKS_PER_SEGMENT - 1);
+		UT_ASSERT_EQ(batch.data_groups[i].request_count, 1);
+		UT_ASSERT_EQ(batch.data_groups[i].request_indexes[0], i);
+		UT_ASSERT_EQ(batch.carrier_requests[i].data_group_index, i);
+	}
+}
+
+UT_TEST(nondata_legacy_requests_keep_witness_without_a_read_group)
+{
+	ClusterHeapFreezePageInputV1 input;
+	ClusterHeapFreezePageBatchV1 batch;
+	Page page;
+
+	setup(true);
+	make_itl_page();
+	page = (Page)fixture_pages[0].data;
+	name_three_carriers(page, 0, 1, 2);
+	for (uint8 i = 0; i < 3; i++)
+		make_valid_carrier(page, i, 77, 3);
+	ClusterPageGetItlSlots(page)[0].undo_segment_head = uba_encode(1, 0, 21, 31);
+	ClusterPageGetItlSlots(page)[1].undo_segment_head = uba_encode(1, UNDO_BLOCKS_PER_SEGMENT, 21, 31);
+	ClusterPageGetItlSlots(page)[2].undo_segment_head
+		= uba_encode(UNDO_OWNER_INSTANCE_MAX * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1, 11, 21, 31);
+	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&state.identity, 0, page, &input));
+	UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&input, &batch));
+	UT_ASSERT_EQ(batch.carrier_request_count, 3);
+	UT_ASSERT_EQ(batch.data_group_count, 0);
+	for (uint8 i = 0; i < 3; i++) {
+		UT_ASSERT_EQ(batch.carrier_requests[i].data_group_index, CLUSTER_HEAP_FREEZE_NO_DATA_GROUP);
+		UT_ASSERT_EQ(batch.tuples[i].carrier_request_index, i);
+		UT_ASSERT_EQ(memcmp(&batch.carrier_requests[i].carrier, &ClusterPageGetItlSlots(page)[i],
+						   sizeof(ClusterItlSlotData)), 0);
+	}
+}
+
+UT_TEST(real_scan_groups_owned_requests_after_original_locks_and_pins)
+{
+	for (unsigned cleanup = 0; cleanup < 2; cleanup++) {
+		const ClusterHeapFreezePageBatchV1 *batch;
+		Page page;
+
+		setup(cleanup);
+		make_itl_page();
+		page = (Page)fixture_pages[0].data;
+		name_three_carriers(page, 0, 1, 0);
+		make_valid_carrier(page, 0, 77, 3);
+		make_valid_carrier(page, 1, 77, 4);
+		ClusterPageGetItlSlots(page)[1].undo_segment_head = uba_encode(1, 11, 22, 32);
+		lazy_scan_heap(&state);
+		batch = prepared_batch();
+		UT_ASSERT(batch != NULL);
+		if (batch == NULL)
+			continue;
+		UT_ASSERT_EQ(fixture_prepares, 1);
+		UT_ASSERT_EQ(fixture_prepare_held_mask, 0);
+		UT_ASSERT_EQ(batch->carrier_request_count, 2);
+		UT_ASSERT_EQ(batch->data_group_count, 1);
+		UT_ASSERT_EQ(batch->data_groups[0].request_count, 2);
+		UT_ASSERT_EQ(batch->data_groups[0].request_indexes[0], 0);
+		UT_ASSERT_EQ(batch->data_groups[0].request_indexes[1], 1);
+		UT_ASSERT_EQ(batch->tuples[2].carrier_request_index, 0);
+		state.rel_pages = 2;
+		make_page(1, true, 123);
+		lazy_scan_heap(&state);
+		batch = prepared_batch();
+		UT_ASSERT(batch != NULL);
+		if (batch != NULL) {
+			UT_ASSERT_EQ(batch->data_group_count, 0);
+			UT_ASSERT_EQ(batch->carrier_request_count, 0);
+			for (unsigned i = 0; i < sizeof(batch->data_groups); i++)
+				UT_ASSERT_EQ(((const unsigned char *)batch->data_groups)[i], 0);
+		}
+		UT_ASSERT_EQ(fixture_locks + fixture_pins + fixture_vm_pins, 0);
+	}
+}
+
 UT_TEST(unusable_carriers_keep_rows_without_a_request)
 {
 	for (unsigned bad = 0; bad < 10; bad++) {
@@ -1051,12 +1214,28 @@ UT_TEST(request_batch_is_bounded_by_eight_physical_slots)
 	UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&input, &batch));
 	UT_ASSERT_EQ(batch.tuple_count, count);
 	UT_ASSERT_EQ(batch.carrier_request_count, CLUSTER_ITL_INITRANS_DEFAULT);
+	UT_ASSERT_EQ(batch.data_group_count, CLUSTER_ITL_INITRANS_DEFAULT);
 	for (unsigned i = 0; i < count; i++)
 		UT_ASSERT_EQ(batch.tuples[i].carrier_request_index, i % CLUSTER_ITL_INITRANS_DEFAULT);
 	for (unsigned i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
 		UT_ASSERT_EQ(batch.carrier_requests[i].locator.itl_slot_index, i);
 		UT_ASSERT_EQ(batch.carrier_requests[i].locator.tt_wrap, TT_WRAP_INVALID);
 		UT_ASSERT_EQ(batch.carrier_requests[i].carrier.wrap, 3 + i);
+		UT_ASSERT_EQ(batch.data_groups[i].request_count, 1);
+		UT_ASSERT_EQ(batch.data_groups[i].request_indexes[0], i);
+		UT_ASSERT_EQ(batch.carrier_requests[i].data_group_index, i);
+	}
+	/* The same eight distinct carrier requests also fit in one DATA read. */
+	for (uint8 i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+		ClusterPageGetItlSlots(page)[i].undo_segment_head = uba_encode(1, 11, 21 + i, 31 + i);
+	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&state.identity, 0, page, &input));
+	UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&input, &batch));
+	UT_ASSERT_EQ(batch.carrier_request_count, CLUSTER_ITL_INITRANS_DEFAULT);
+	UT_ASSERT_EQ(batch.data_group_count, 1);
+	UT_ASSERT_EQ(batch.data_groups[0].request_count, CLUSTER_ITL_INITRANS_DEFAULT);
+	for (uint8 i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		UT_ASSERT_EQ(batch.data_groups[0].request_indexes[i], i);
+		UT_ASSERT_EQ(batch.carrier_requests[i].data_group_index, 0);
 	}
 }
 
@@ -1646,7 +1825,7 @@ UT_TEST(zero_retained_counts_never_remove_the_original_shared_restriction)
 int
 main(void)
 {
-	UT_PLAN(51);
+	UT_PLAN(56);
 	UT_RUN(share_scan_preserves_every_reference_before_native_consumer);
 	UT_RUN(cleanup_scan_preserves_before_prune_and_freeze);
 	UT_RUN(raw_multi_value_never_selects_local_reader);
@@ -1669,6 +1848,11 @@ main(void)
 	UT_RUN(real_scan_replaces_and_invalidates_prepared_batch);
 	UT_RUN(requests_share_only_the_same_physical_carrier);
 	UT_RUN(requests_keep_updater_and_lock_carriers_distinct_from_raw_xmin);
+	UT_RUN(data_groups_keep_distinct_carriers_in_one_physical_block);
+	UT_RUN(data_groups_preserve_first_appearance_and_duplicate_addresses);
+	UT_RUN(data_groups_separate_complete_segment_and_origin);
+	UT_RUN(nondata_legacy_requests_keep_witness_without_a_read_group);
+	UT_RUN(real_scan_groups_owned_requests_after_original_locks_and_pins);
 	UT_RUN(unusable_carriers_keep_rows_without_a_request);
 	UT_RUN(missing_and_unused_carriers_cannot_supply_requests);
 	UT_RUN(request_batch_is_bounded_by_eight_physical_slots);

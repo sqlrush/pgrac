@@ -38,6 +38,7 @@ typedef enum ClusterHeapFreezePageMatchV1 {
 } ClusterHeapFreezePageMatchV1;
 
 #define CLUSTER_HEAP_FREEZE_NO_CARRIER_REQUEST UINT8_MAX
+#define CLUSTER_HEAP_FREEZE_NO_DATA_GROUP UINT8_MAX
 
 /*
  * A request about one physical carrier, not a creator or terminal proof.
@@ -48,7 +49,23 @@ typedef struct ClusterHeapFreezeCarrierRequestV1
 {
 	ClusterTxLocator locator;
 	ClusterItlSlotData carrier;
+	/* NO_DATA_GROUP when the legacy locator is not a DATA-record address. */
+	uint8 data_group_index;
 } ClusterHeapFreezeCarrierRequestV1;
+
+/*
+ * Physical read planning only. The complete segment ID includes its encoded
+ * origin; a block number alone is never a group key. Distinct carrier requests
+ * retain their indexes, even when their raw XIDs or record addresses coincide.
+ * No image, canonical TT identity, terminal verdict or authority is implied.
+ */
+typedef struct ClusterHeapFreezeDataGroupV1
+{
+	uint32 segment_id;
+	uint32 block_no;
+	uint8 request_count;
+	uint8 request_indexes[CLUSTER_ITL_INITRANS_DEFAULT];
+} ClusterHeapFreezeDataGroupV1;
 
 /*
  * Physical row inputs only. The tuple-named ITL can describe a later updater,
@@ -82,10 +99,12 @@ typedef struct ClusterHeapFreezePageBatchV1
 	uint16 tuple_count;
 	uint16 multi_tuples;
 	uint8 carrier_request_count;
+	uint8 data_group_count;
 	/* Negative work counts only; zero does not certify a page as all-frozen. */
 	uint16 unproven_xmin_tuples;
 	uint16 unproven_xmax_tuples;
 	ClusterHeapFreezeCarrierRequestV1 carrier_requests[CLUSTER_ITL_INITRANS_DEFAULT];
+	ClusterHeapFreezeDataGroupV1 data_groups[CLUSTER_ITL_INITRANS_DEFAULT];
 	ClusterHeapFreezeTupleInputV1 tuples[MaxHeapTuplesPerPage];
 } ClusterHeapFreezePageBatchV1;
 
@@ -118,6 +137,9 @@ cluster_heap_freeze_validate_page_v1(const ClusterHeapFreezePageInputV1 *input,
  * Expand the immutable image in physical offset order. At most one canonical
  * locator request is prepared for each tuple-named physical ITL slot, with
  * per-row indexes or NO_CARRIER_REQUEST. No raw-XID coalescing or search occurs.
+ * DATA-record requests are grouped by complete segment/block in first-use
+ * order, at most eight groups of eight indexes. Non-DATA legacy locators
+ * retain their carrier witness with NO_DATA_GROUP; no read is authorized.
  * Even a valid locator with equal raw xmin is not creator/FullXid provenance.
  * Input and output must not overlap. No allocation, I/O, proof lookup or
  * mutation occurs. Failure leaves output unchanged. Success grants no
