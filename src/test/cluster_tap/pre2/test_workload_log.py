@@ -146,6 +146,49 @@ class WorkloadLogTests(unittest.TestCase):
         result = self.read(log(message() + " another=field"))
         self.assertEqual(result["parse_status"], "REJECTED")
 
+    def test_postgres_cursor_suffix_preserves_raw_and_emitter_boundary(self):
+        payloads = [message(family) for family in
+                    ("HOT_FULL", "READ_IMAGE", "CTRC_CONSUME", "CTRC_ORIGIN_BATCH_REPLY")]
+        payloads.append("PGRAC_FAMILY=R4_HEAP_PRUNE event=observed event_seq=1 "
+                        "node=1 pid=101 authoritative=0 trace_sequence_exhausted=0")
+        for payload in payloads:
+            for position in ("14", "2147483647"):
+                with self.subTest(payload=payload, position=position):
+                    decorated = payload + " at character " + position
+                    raw = log(decorated)
+                    result = self.read(raw)
+                    self.assertEqual(result["parse_status"], "PARSED")
+                    observation = result["observations"][0]
+                    self.assertEqual(observation["raw"].encode(), raw)
+                    self.assertEqual(observation["message"], decorated)
+                    self.assertEqual(observation["sha256"], hashlib.sha256(raw).hexdigest())
+                    self.assertEqual(observation["byte_length"], len(raw))
+                    self.assertEqual(observation["log_cursor_position"], position)
+                    self.assertEqual(observation["fields"]["pid"], "101")
+                    self.assertEqual(observation["fields"]["authoritative"], "0")
+                    self.assertNotIn("log_cursor_position", observation["fields"])
+                    self.assertFalse(result["identity_bound"])
+                    self.assertFalse(result["ready_to_run"])
+
+    def test_cursor_suffix_does_not_hide_malformed_emitter_or_trailing_text(self):
+        valid = message()
+        suffixes = (" at character 0", " at character -1", " at character 01",
+                    " at character 2147483648", " at character 999999999999999",
+                    " at character x", " at character 14 trailing",
+                    " at character 14 another=field", " at character 14 at character 15",
+                    " at character 14 ", "\tat character 14", " at character １４")
+        payloads = [valid + suffix for suffix in suffixes]
+        payloads.extend((valid.replace("trace_sequence_exhausted=0", "") +
+                         " at character 14", valid + " another=field at character 14",
+                         valid.replace("pid=101", "pid=bad") + " at character 14"))
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                raw = log(payload)
+                result = self.read(raw)
+                self.assertEqual(result["parse_status"], "REJECTED")
+                self.assertFalse(result["observations"])
+                self.assertEqual(result["rejections"][0]["raw_hex"], raw.hex())
+
     def test_partial_line_and_invalid_utf8_are_preserved(self):
         for raw in (log().rstrip(b"\n"), log().replace(b"event=observed", b"event=\xff")):
             with self.subTest(raw=raw):

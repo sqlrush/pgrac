@@ -28,6 +28,7 @@ SEVERITY = re.compile(r"\b(LOG|DEBUG[1-5]|DETAIL|HINT|CONTEXT|STATEMENT|ERROR|"
                       r"FATAL|PANIC|WARNING|NOTICE|INFO):[ \t]*")
 KEY = re.compile(r"[A-Za-z_][A-Za-z_0-9]*=")
 FAMILY = re.compile(r"PGRAC_FAMILY=([A-Z][A-Z_0-9]*)(?:[ \t]|$)")
+LOG_CURSOR_SUFFIX = re.compile(r" at character ([1-9][0-9]{0,9})$")
 
 
 def _fields(message, adjacent=()):
@@ -147,10 +148,19 @@ def read_trace(data):
                 family == "R4_BTREE_DELETE" and re.match(
                     r"PGRAC_FAMILY=R4_BTREE_DELETE event=(?:delete|vacuum)\.applied[ \t]",
                     message)) else ()
-            fields = _fields(message, adjacent)
+            # elog.c appends this English cursor position after edata->message.
+            # It is log decoration, outside the emitter's ending disclosure.
+            # Keep the original message/raw bytes and validate the full emitter.
+            cursor = LOG_CURSOR_SUFFIX.search(message)
+            if cursor is not None and int(cursor[1]) > 2**31 - 1:
+                cursor = None
+            payload = message[:cursor.start()] if cursor is not None else message
+            fields = _fields(payload, adjacent)
             _validate_envelope(fields, family)
-            result["observations"].append(dict(provenance, raw=text, message=message,
-                                               fields=fields))
+            observation = dict(provenance, raw=text, message=message, fields=fields)
+            if cursor is not None:
+                observation["log_cursor_position"] = cursor[1]
+            result["observations"].append(observation)
         except (UnicodeDecodeError, ValueError) as error:
             result["rejections"].append(dict(provenance, raw_hex=raw.hex(), reason=str(error)))
     if result["rejections"]:

@@ -174,6 +174,11 @@ brace blocks, and records the original line, byte offset and SHA256. CSV/JSON
 log formats and multiline messages are not supported. Other families remain
 in `unhandled`; malformed known records remain in `rejections` with their
 original bytes in hex. Preserve the original log alongside the JSON output.
+The English PostgreSQL stderr suffix ` at character N` is retained in the
+original message and exposed separately as `log_cursor_position`. Its positive
+signed-int position is log decoration, outside the emitter fields; the required
+emitter ending must still be last before this suffix. Other trailing text is
+rejected.
 
 Exit 0 means at least one supported record parsed and no record was rejected;
 exit 1 means rejection; exit 2 means no supported record or a file/argument
