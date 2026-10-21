@@ -3447,6 +3447,7 @@ cluster_bufmgr_pcm_x_writer_prepare_target(BufferDesc *buf, const BufferTag *exp
 		MemSet(&gate, 0, sizeof(gate));
 		MemSet(&context, 0, sizeof(context));
 
+		cluster_content_trace_pair_event(BufferDescriptorGetBuffer(buf), CLPAIR_TARGET_BEGIN, 0);
 		if (aux_context != NULL) {
 			result = cluster_gcs_resource_x_target_acquire_reobserve_exact(
 				buf, expected_resource, r4_generation, aux_context, &terminal_ref);
@@ -3454,6 +3455,7 @@ cluster_bufmgr_pcm_x_writer_prepare_target(BufferDesc *buf, const BufferTag *exp
 		} else
 			result = cluster_gcs_resource_x_target_acquire_until_exact(
 				buf, expected_resource, r4_generation, absolute_deadline_us, &terminal_ref);
+		cluster_content_trace_pair_event(BufferDescriptorGetBuffer(buf), CLPAIR_TARGET_RESULT, result);
 		if (result != RESOURCE_X_APPLY_APPLIED
 			&& result != RESOURCE_X_APPLY_DUPLICATE)
 		{
@@ -3519,6 +3521,7 @@ cluster_bufmgr_pcm_x_writer_prepare_target(BufferDesc *buf, const BufferTag *exp
 			cluster_bufmgr_pcm_x_writer_clear(entry);
 			if (retryable)
 			{
+				cluster_content_trace_pair_event(BufferDescriptorGetBuffer(buf), CLPAIR_PREPARE_DRIFT, own_result);
 				CHECK_FOR_INTERRUPTS();
 				continue;
 			}
@@ -3670,6 +3673,7 @@ cluster_bufmgr_pcm_x_writer_activate(
 		 * Nothing has initialized the page yet. Never wait under content-X or
 		 * reuse a physical snapshot taken before releasing that lock. */
 			LWLockRelease(entry->content_lock);
+			cluster_content_trace_pair_event(BufferDescriptorGetBuffer(buf), CLPAIR_ACTIVATE_WAIT, context_result);
 			(void)cluster_bufmgr_resource_x_wait_retry(entry->content_lock, buf->buf_id, 0, NULL);
 			LWLockAcquire(entry->content_lock, LW_EXCLUSIVE);
 			continue;
@@ -3679,6 +3683,7 @@ cluster_bufmgr_pcm_x_writer_activate(
 				&& cluster_pcm_x_target_preuse_drift_retryable(&live, path_current, gate_current,
 															   tag_current)) {
 				cluster_bufmgr_pcm_x_writer_clear(entry);
+				cluster_content_trace_pair_event(BufferDescriptorGetBuffer(buf), CLPAIR_ACTIVATE_DRIFT, context_result);
 				return false;
 			}
 			cluster_bufmgr_resource_x_fail_closed_exact(&gate);
@@ -3693,6 +3698,7 @@ cluster_bufmgr_pcm_x_writer_activate(
 		if (entry->object_checked && !cluster_ko_peer_delivery_current_v3(entry->object_revision)) {
 			if (allow_reprobe) {
 				cluster_bufmgr_pcm_x_writer_clear(entry);
+				cluster_content_trace_pair_event(BufferDescriptorGetBuffer(buf), CLPAIR_ACTIVATE_OBJECT, RESOURCE_X_APPLY_STALE);
 				return false;
 			}
 			cluster_bufmgr_resource_x_writer_report_failure(RESOURCE_X_APPLY_STALE, buf,
@@ -15625,6 +15631,7 @@ ConditionalLockBuffer(Buffer buffer)
 #ifdef USE_PGRAC_CLUSTER
 	bool		blocked;
 	uint32		buf_state;
+	ClusterContentTracePairEvent reason = CLPAIR_PCM_BLOCKED;
 #endif
 
 	Assert(BufferIsPinned(buffer));
@@ -15661,14 +15668,18 @@ ConditionalLockBuffer(Buffer buffer)
 					  || !cluster_ko_peer_current_valid_v3(&ref->ko_current,
 														   BufTagGetRelFileLocator(&buf->tag),
 														   buf->tag.forkNum, buf->tag.blockNum);
+			reason = CLPAIR_OBJECT_BLOCKED;
 		}
 		UnlockBufHdr(buf, buf_state);
 		if (blocked)
 		{
 			LWLockRelease(BufferDescriptorGetContentLock(buf));
+			cluster_content_trace_pair_event(buffer, reason, 0);
 			return false;
 		}
 	}
+	else
+		cluster_content_trace_pair_event(buffer, CLPAIR_CONTENT_BUSY, 0);
 #endif
 	return acquired;
 }

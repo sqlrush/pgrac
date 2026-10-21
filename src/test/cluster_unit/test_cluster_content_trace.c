@@ -29,6 +29,8 @@ static LWLock other_lock;
 static struct { LWLock *lock; LWLockMode mode; } held[48];
 static unsigned nheld, logs;
 static char last[8192];
+static char pair_request_log[8192];
+static unsigned pair_cycle_logs, pair_request_logs;
 static const ClusterShmemRegion *registered;
 
 void ExceptionalCondition(const char *condition, const char *file, int line)
@@ -44,7 +46,13 @@ bool errstart(int level, const char *domain) { (void)domain; assert(level == LOG
 int errmsg_internal(const char *fmt, ...)
 { va_list ap; va_start(ap, fmt); vsnprintf(last, sizeof(last), fmt, ap); va_end(ap); return 0; }
 void errfinish(const char *file, int line, const char *func)
-{ (void)file; (void)line; (void)func; logs++; }
+{
+	(void)file; (void)line; (void)func; logs++;
+	if (strstr(last, "event=PAIR_CYCLE ")) pair_cycle_logs++;
+	if (strstr(last, "event=PAIR_REQUEST ")) {
+		pair_request_logs++; strcpy(pair_request_log, last);
+	}
+}
 
 #include "../../backend/cluster/cluster_content_trace.c"
 
@@ -52,6 +60,7 @@ static BufferDesc *buf(unsigned i) { return &descriptors[i].bufferdesc; }
 static void actor(unsigned i)
 {
 	memset(&local_owner, 0, sizeof(local_owner));
+	pair_depth = 0; pair_recording = false; pair_slot = -1;
 	MyProc = &procs[i]; MyProc->pgprocno = i; MyProc->pid = MyProcPid = 100 + i; MyProc->backendId = 1 + i;
 	MyStartTimestamp = 1000 + i;
 }
@@ -61,6 +70,8 @@ static void reset(void)
 	memset(descriptors, 0, sizeof(descriptors)); memset(procs, 0, sizeof(procs));
 	proc_header.allProcs = procs; proc_header.allProcCount = MaxBackends + NUM_AUXILIARY_PROCS;
 	ProcGlobal = &proc_header; BufferDescriptors = descriptors; nheld = logs = 0;
+	emitted_rows = pair_cycle_logs = pair_request_logs = 0;
+	pair_request_log[0] = '\0';
 	cluster_trace_tx_identity = true;
 	for (unsigned i = 0; i < lengthof(descriptors); i++) {
 		buf(i)->buf_id = i; buf(i)->tag.spcOid = 1; buf(i)->tag.dbOid = 2;
@@ -204,15 +215,117 @@ UT_TEST(disabled_and_disable_transition)
 	cluster_trace_tx_identity = true; cluster_content_trace_capture(&buf(0)->tag, &cut);
 	UT_ASSERT_EQ(cut.matches, 0);
 }
+UT_TEST(pair_cycle_history_is_bounded)
+{
+	reset(); hold(0, LW_EXCLUSIVE); cluster_content_trace_pair_begin(1, 2);
+	for (unsigned i = 0; i < 6; i++) {
+		cluster_content_trace_pair_cycle();
+		cluster_content_trace_pair_phase(CLPAIR_CONDITIONAL_SECOND);
+		cluster_content_trace_pair(2, true);
+		cluster_content_trace_pair_event(2, CLPAIR_CONTENT_BUSY, 71);
+	}
+	cluster_content_trace_capture(&buf(0)->tag, &cut);
+	UT_ASSERT_EQ(cut.nowners, 1); UT_ASSERT_EQ(cut.owners[0].pair_cycles, 6);
+	UT_ASSERT_EQ(cut.owners[0].pair_omitted, 2); UT_ASSERT_EQ(cut.owners[0].npair_cycles, 4);
+	UT_ASSERT_EQ(cut.owners[0].pair[0].cycle, 5); UT_ASSERT(cut.owners[0].pair[0].finished);
+	UT_ASSERT_EQ(cut.owners[0].pair[1].cycle, 6); UT_ASSERT(!cut.owners[0].pair[1].finished);
+	UT_ASSERT(cut.owners[0].pair[1].conditional_miss);
+	UT_ASSERT_EQ(cut.owners[0].pair[1].events[1][CLPAIR_CONTENT_BUSY], 1);
+	UT_ASSERT_EQ(cut.owners[0].pair[1].last_results[1][CLPAIR_CONTENT_BUSY], 71);
+	UT_ASSERT_EQ(cut.owners[0].pair[1].targets[1].tag.blockNum, 1);
+	cluster_content_trace_pair_end();
+	UT_ASSERT(local_owner.pair[1].finished); UT_ASSERT_EQ(local_owner.pair[1].phase, CLPAIR_DONE);
+}
+UT_TEST(pair_dispatch_keeps_actual_first_and_latest)
+{
+	ClusterContentTracePairRequest request = {0};
+	reset(); hold(0, LW_EXCLUSIVE); cluster_content_trace_pair_begin(1, 2);
+	cluster_content_trace_pair_cycle(); cluster_content_trace_pair_phase(CLPAIR_RESOLVE_SECOND);
+	request.tag = buf(1)->tag; request.master = 3; request.requester = 0;
+	request.physical_generation = 12; request.r4 = 21; request.formation = 22;
+	request.master_session = 23; request.base = 24; request.authority = 25;
+	request.requester_connection = 31; request.ingress_connection = 32;
+	request.wire_sender_connection = 33; request.action = 2; request.action_node = 3;
+	for (unsigned i = 0; i < 4; i++) {
+		request.request = 100 + i; request.stage_ok = i % 2 == 0;
+		cluster_content_trace_pair_request(2, &request);
+	}
+	request.tag.blockNum++; cluster_content_trace_pair_request(2, &request);
+	cluster_content_trace_capture(&buf(0)->tag, &cut);
+	UT_ASSERT_EQ(cut.owners[0].pair[0].nrequests, 2);
+	UT_ASSERT_EQ(cut.owners[0].pair[0].omitted_requests, 2);
+	UT_ASSERT_EQ(cut.owners[0].pair[0].requests[0].request, 100);
+	UT_ASSERT_EQ(cut.owners[0].pair[0].requests[1].request, 103);
+	UT_ASSERT_EQ(cut.owners[0].pair[0].requests[1].physical_generation, 12);
+	UT_ASSERT_EQ(cut.owners[0].pair[0].requests[1].ingress_connection, 32);
+	UT_ASSERT_EQ(cut.owners[0].pair[0].requests[1].leg, 1);
+	UT_ASSERT_EQ(cut.owners[0].pair[0].requests[1].phase, CLPAIR_RESOLVE_SECOND);
+	UT_ASSERT_EQ(cut.owners[0].pair[0].events[1][CLPAIR_DISPATCH], 4);
+	UT_ASSERT_EQ(cut.owners[0].pair[0].events[1][CLPAIR_STAGE_REJECT], 2);
+	UT_ASSERT_EQ(cut.owners[0].pair[0].events[1][CLPAIR_REMOTE_MASTER_DISPATCH], 4);
+}
+UT_TEST(pair_nested_and_disabled_are_not_attributed)
+{
+	reset(); hold(0, LW_EXCLUSIVE); cluster_trace_tx_identity = false;
+	cluster_content_trace_pair_begin(1, 2); cluster_trace_tx_identity = true;
+	cluster_content_trace_pair_cycle(); UT_ASSERT(!cluster_content_trace_pair_active(1));
+	cluster_content_trace_pair_end(); UT_ASSERT_EQ(local_owner.pair_cycles, 0);
+	cluster_content_trace_pair_begin(1, 2); cluster_content_trace_pair_cycle();
+	cluster_content_trace_pair_begin(2, 3); cluster_content_trace_pair_cycle();
+	cluster_content_trace_pair_event(2, CLPAIR_TARGET_BEGIN, 99);
+	UT_ASSERT(!cluster_content_trace_pair_active(2)); cluster_content_trace_pair_end();
+	UT_ASSERT(cluster_content_trace_pair_active(1));
+	UT_ASSERT_EQ(local_owner.pair_nested_omitted, 1);
+	UT_ASSERT_EQ(local_owner.pair[0].events[1][CLPAIR_TARGET_BEGIN], 0);
+	cluster_trace_tx_identity = false; cluster_content_trace_pair_event(1, CLPAIR_TARGET_BEGIN, 0);
+	cluster_trace_tx_identity = true; UT_ASSERT(!cluster_content_trace_pair_active(1));
+	cluster_content_trace_pair_end();
+}
+UT_TEST(pair_error_cleanup_preserves_owned_reason)
+{
+	reset(); hold(0, LW_EXCLUSIVE); cluster_content_trace_pair_begin(1, 2);
+	cluster_content_trace_pair_cycle(); cluster_content_trace_pair_phase(CLPAIR_RESOLVE_SECOND);
+	cluster_content_trace_pair_event(2, CLPAIR_ACTIVATE_WAIT, 7);
+	cluster_content_trace_error_cleanup(); cluster_content_trace_capture(&buf(0)->tag, &cut);
+	UT_ASSERT(cut.owners[0].pair[0].error); UT_ASSERT(cut.owners[0].pair[0].finished);
+	UT_ASSERT_EQ(cut.owners[0].pair[0].phase, CLPAIR_RESOLVE_SECOND);
+	UT_ASSERT_EQ(cut.owners[0].pair[0].last_results[1][CLPAIR_ACTIVATE_WAIT], 7);
+	UT_ASSERT(!cluster_content_trace_pair_active(2));
+	cluster_content_trace_pair_begin(1, 2); cluster_content_trace_pair_cycle();
+	UT_ASSERT_EQ(local_owner.pair_invocations, 2); UT_ASSERT_EQ(local_owner.pair_cycles, 1);
+	UT_ASSERT(cut.owners[0].pair[0].error); /* owned cut did not change */
+}
+UT_TEST(pair_post_cleanup_emit_uses_owned_copy)
+{
+	ClusterWaitTrace guard = {0};
+	ClusterContentTracePairRequest request = {0};
+	reset(); hold(0, LW_EXCLUSIVE); cluster_content_trace_pair_begin(1, 2);
+	cluster_content_trace_pair_cycle(); request.tag = buf(1)->tag;
+	request.request = 901; request.physical_generation = 77;
+	cluster_content_trace_pair_request(2, &request);
+	cluster_content_trace_capture(&buf(0)->tag, &cut);
+	nheld = 0; cluster_content_trace_error_cleanup();
+	guard.snapshot = 123; guard.tag = buf(0)->tag;
+	UT_ASSERT_EQ(logs, 0); cluster_content_trace_emit(&guard, &cut);
+	UT_ASSERT_EQ(pair_cycle_logs, 1); UT_ASSERT_EQ(pair_request_logs, 1);
+	UT_ASSERT_STR_CONTAINS(pair_request_log, "request=901");
+	UT_ASSERT_STR_CONTAINS(pair_request_log, "physical_generation=77");
+	UT_ASSERT_STR_CONTAINS(pair_request_log, "current_transfer_known=0");
+	emitted_rows = CLUSTER_WAIT_TRACE_LIMIT; cluster_content_trace_emit(&guard, &cut);
+	UT_ASSERT_STR_CONTAINS(last, "event=LIMIT");
+}
 int main(void)
 {
 	cluster_content_trace_shmem_register(); assert(registered && registered->lwlock_count == 0);
-	UT_PLAN(13);
+	UT_PLAN(18);
 	UT_RUN(actual_content_owner); UT_RUN(exact_tag_and_lock_kind); UT_RUN(release_removes_owner);
 	UT_RUN(nested_wait_keys); UT_RUN(pair_attempt_and_miss); UT_RUN(busy_cut_never_waits);
 	UT_RUN(missed_publish_marks_stale_unknown); UT_RUN(dead_process_not_current_owner);
 	UT_RUN(reused_pid_with_new_backend_is_unknown);
 	UT_RUN(zero_backend_identity_is_unknown);
 	UT_RUN(bounded_locks_and_owners); UT_RUN(owned_cut_and_cleanup); UT_RUN(disabled_and_disable_transition);
+	UT_RUN(pair_cycle_history_is_bounded); UT_RUN(pair_dispatch_keeps_actual_first_and_latest);
+	UT_RUN(pair_nested_and_disabled_are_not_attributed); UT_RUN(pair_error_cleanup_preserves_owned_reason);
+	UT_RUN(pair_post_cleanup_emit_uses_owned_copy);
 	UT_DONE(); free(content_trace); return ut_failed_count ? 1 : 0;
 }

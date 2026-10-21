@@ -15472,6 +15472,11 @@ gcs_block_resource_x_target_acquire_internal_trace_impl(
 					own.pcm_state == PCM_STATE_N, cached_local_x,
 					cached_local_x ? own.generation : 0, caller_witness, &own, &dispatch,
 					&terminal_ref);
+				cluster_content_trace_pair_event(BufferDescriptorGetBuffer(buf),
+					CLPAIR_ROUND_STEP, (int32)action);
+				if (cached_local_x)
+					cluster_content_trace_pair_event(BufferDescriptorGetBuffer(buf),
+						CLPAIR_CACHED_X_SAMPLE, 0);
 				if (direct_init && creation_caller.joined_request.assertion_sequence == 0
 					&& caller_witness->joined_request.assertion_sequence != 0)
 					creation_caller = *caller_witness;
@@ -15888,7 +15893,37 @@ gcs_block_resource_x_target_acquire_internal_trace_impl(
 							= gcs_block_resource_x_native_assert_stage_exact(master_node, &dispatch)
 							  == RESOURCE_X_APPLY_APPLIED;
 					}
-					(void)stage_ok;
+					if (cluster_content_trace_pair_active(BufferDescriptorGetBuffer(buf))) {
+						ClusterContentTracePairRequest pair_request = {0};
+						const ResourceXDecodedCommon *common = &dispatch.common;
+
+						/* Copy the actual staged frame. No new identity lookup or
+						 * claim of delivery/current-transfer completion is made. */
+						pair_request.tag = common->logical_assertion.resource;
+						pair_request.physical_generation = own.generation;
+						pair_request.r4 = admission.record_generation;
+						pair_request.formation = common->resource_formation;
+						pair_request.master_session = common->master_session_incarnation;
+						pair_request.request = common->assertion_sequence;
+						pair_request.base = common->base_authority_generation;
+						pair_request.authority = common->authority_generation;
+						pair_request.requester_connection = requester_sender_connection_generation;
+						pair_request.ingress_connection = master_ingress_connection_generation;
+						pair_request.wire_sender_connection = common->sender_connection_generation;
+						pair_request.requester = common->logical_assertion.requester_node;
+						pair_request.master = master_node;
+						pair_request.action = (int32)action;
+						pair_request.action_node = common->action_node;
+						pair_request.ordered_lane = common->ordered_lane;
+						pair_request.observed_mode = common->observed_mode;
+						pair_request.target_mode = common->target_mode;
+						pair_request.source_candidate = common->source_candidate;
+						pair_request.retain_pi_if_dirty = common->retain_pi_if_dirty;
+						pair_request.outcome = common->outcome;
+						pair_request.flags = common->flags;
+						pair_request.stage_ok = stage_ok;
+						cluster_content_trace_pair_request(BufferDescriptorGetBuffer(buf), &pair_request);
+					}
 					continue;
 				}
 				if (action == RESOURCE_X_BOOTSTRAP_ROUND_WAIT)

@@ -29,6 +29,10 @@ typedef struct ContentTraceShared {
 static ContentTraceShared *content_trace;
 static ClusterContentTraceOwner local_owner;
 static uint32 emitted_rows;
+static uint32 pair_depth;
+static bool pair_recording;
+static int pair_slot = -1;
+static Buffer pair_buffers[2];
 
 static Size
 content_trace_size(void)
@@ -169,7 +173,153 @@ cluster_content_trace_wait_clear(ClusterContentTraceWait kind)
 void
 cluster_content_trace_error_cleanup(void)
 {
+	if (pair_recording && pair_slot >= 0) {
+		local_owner.pair[pair_slot].error = true;
+		local_owner.pair[pair_slot].finished = true;
+	}
+	pair_depth = 0;
+	pair_recording = false;
+	pair_slot = -1;
 	local_owner.wait_mask = 0;
+	content_trace_publish(false);
+}
+
+/* Only the outer pair owns this bounded history. Nested pairs are counted,
+ * never attributed to the outer targets. No producer allocates, logs or waits. */
+void
+cluster_content_trace_pair_begin(Buffer first, Buffer second)
+{
+	if (pair_depth++ != 0) {
+		if (pair_recording)
+			local_owner.pair_nested_omitted++;
+		return;
+	}
+	pair_recording = cluster_trace_tx_identity;
+	pair_slot = -1;
+	if (!pair_recording)
+		return;
+	pair_buffers[0] = first;
+	pair_buffers[1] = second;
+	local_owner.pair_invocations++;
+	local_owner.pair_cycles = local_owner.pair_omitted = 0;
+	local_owner.npair_cycles = 0;
+	memset(local_owner.pair, 0, sizeof(local_owner.pair));
+}
+
+void
+cluster_content_trace_pair_cycle(void)
+{
+	ClusterContentTracePairCycleData *cycle;
+
+	if (!cluster_trace_tx_identity)
+		pair_recording = false;
+	if (!pair_recording || pair_depth != 1)
+		return;
+	if (pair_slot >= 0)
+		local_owner.pair[pair_slot].finished = true;
+	pair_slot = local_owner.pair_cycles++ % CLUSTER_CONTENT_TRACE_PAIR_CYCLES;
+	if (local_owner.npair_cycles < CLUSTER_CONTENT_TRACE_PAIR_CYCLES)
+		local_owner.npair_cycles++;
+	else
+		local_owner.pair_omitted++;
+	cycle = &local_owner.pair[pair_slot];
+	memset(cycle, 0, sizeof(*cycle));
+	cycle->invocation = local_owner.pair_invocations;
+	cycle->cycle = local_owner.pair_cycles;
+	cycle->phase = CLPAIR_FIRST;
+	for (unsigned i = 0; i < 2; i++) {
+		ClusterContentTraceLock *target = &cycle->targets[i];
+
+		target->buffer = pair_buffers[i];
+		target->mode = LW_EXCLUSIVE;
+		/* Caller still owns both pins. An untagged/local target stays UNKNOWN. */
+		if (target->buffer > 0 && target->buffer <= NBuffers) {
+			BufferDesc *buf = GetBufferDescriptor(target->buffer - 1);
+			target->tag_known = (pg_atomic_read_u32(&buf->state) & BM_TAG_VALID) != 0;
+			if (target->tag_known)
+				target->tag = buf->tag;
+		}
+	}
+	content_trace_publish(false);
+}
+
+bool
+cluster_content_trace_pair_active(Buffer target)
+{
+	if (!cluster_trace_tx_identity)
+		pair_recording = false;
+	return pair_recording && pair_depth == 1 && pair_slot >= 0 &&
+		(target == pair_buffers[0] || target == pair_buffers[1]);
+}
+
+void
+cluster_content_trace_pair_phase(ClusterContentTracePairPhase phase)
+{
+	if (!cluster_content_trace_pair_active(pair_buffers[0]))
+		return;
+	local_owner.pair[pair_slot].phase = phase;
+	content_trace_publish(false);
+}
+
+void
+cluster_content_trace_pair_event(Buffer target, ClusterContentTracePairEvent event,
+	int32 result)
+{
+	ClusterContentTracePairCycleData *cycle;
+	unsigned leg;
+
+	if (!cluster_content_trace_pair_active(target) || event < 0 || event >= CLPAIR_NEVENTS)
+		return;
+	cycle = &local_owner.pair[pair_slot];
+	leg = target == pair_buffers[0] ? 0 : 1;
+	cycle->events[leg][event]++;
+	cycle->last_results[leg][event] = result;
+	content_trace_publish(false);
+}
+
+void
+cluster_content_trace_pair_request(Buffer target,
+	const ClusterContentTracePairRequest *request)
+{
+	ClusterContentTracePairCycleData *cycle;
+	unsigned leg, slot;
+
+	if (!cluster_content_trace_pair_active(target) || request == NULL)
+		return;
+	cycle = &local_owner.pair[pair_slot];
+	leg = target == pair_buffers[0] ? 0 : 1;
+	if (!cycle->targets[leg].tag_known ||
+		!content_trace_tag_equal(&cycle->targets[leg].tag, &request->tag))
+		return;
+	/* Retain the first and latest actual dispatch; all attempts remain counted. */
+	if (cycle->nrequests < CLUSTER_CONTENT_TRACE_PAIR_REQUESTS)
+		slot = cycle->nrequests++;
+	else {
+		slot = CLUSTER_CONTENT_TRACE_PAIR_REQUESTS - 1;
+		cycle->omitted_requests++;
+	}
+	cycle->requests[slot] = *request;
+	cycle->requests[slot].leg = leg;
+	cycle->requests[slot].phase = cycle->phase;
+	cycle->events[leg][CLPAIR_DISPATCH]++;
+	if (!request->stage_ok)
+		cycle->events[leg][CLPAIR_STAGE_REJECT]++;
+	if (request->master != cluster_node_id)
+		cycle->events[leg][CLPAIR_REMOTE_MASTER_DISPATCH]++;
+	content_trace_publish(false);
+}
+
+void
+cluster_content_trace_pair_end(void)
+{
+	if (pair_depth == 0 || --pair_depth != 0)
+		return;
+	if (pair_recording && pair_slot >= 0) {
+		local_owner.pair[pair_slot].phase = CLPAIR_DONE;
+		local_owner.pair[pair_slot].finished = true;
+	}
+	pair_recording = false;
+	pair_slot = -1;
 	content_trace_publish(false);
 }
 
@@ -184,6 +334,8 @@ cluster_content_trace_pair(Buffer target, bool missed)
 		local_owner.pair_misses++;
 	else
 		local_owner.pair_attempts++;
+	if (missed && cluster_content_trace_pair_active(target))
+		local_owner.pair[pair_slot].conditional_miss = true;
 	wait.buffer = target;
 	if (target > 0 && target <= NBuffers) {
 		BufferDesc *buf = GetBufferDescriptor(target - 1);
@@ -264,6 +416,94 @@ content_trace_log_budget(void)
 	return true;
 }
 
+/* Only consume the owned cut here, after the caller's original cleanup. All
+ * producer hooks above stay allocation/LOG/wait free, including ERROR unwind.
+ * A cycle is a local observation; a dispatch is not a completed current move. */
+static bool
+content_trace_pair_emit(const ClusterWaitTrace *guard,
+	const ClusterContentTraceOwner *owner)
+{
+	static const char *const event_names[CLPAIR_NEVENTS] = {
+		"TARGET_BEGIN", "TARGET_RESULT", "ROUND_STEP", "CACHED_X_SAMPLE",
+		"CONTENT_BUSY", "PCM_BLOCKED", "OBJECT_BLOCKED", "PREPARE_DRIFT",
+		"ACTIVATE_WAIT", "ACTIVATE_DRIFT", "ACTIVATE_OBJECT", "DISPATCH",
+		"STAGE_REJECT", "REMOTE_MASTER_DISPATCH"
+	};
+
+	for (uint32 i = 0; i < owner->npair_cycles; i++) {
+		const ClusterContentTracePairCycleData *cycle = &owner->pair[i];
+
+		if (!content_trace_log_budget()) return false;
+		elog(LOG, "CONTENT_OWNER event=PAIR_CYCLE node=%d guard_snapshot=" UINT64_FORMAT
+			 " owner_pid=%d owner_proc=%u backend_id=%d backend_start=" INT64_FORMAT " revision=" UINT64_FORMAT
+			 " invocation=" UINT64_FORMAT " cycle=" UINT64_FORMAT " phase=%u finished=%d error=%d conditional_miss=%d"
+			 " cycles_total=" UINT64_FORMAT " omitted_cycles=" UINT64_FORMAT " nested_omitted=" UINT64_FORMAT
+			 " requests=%u omitted_requests=%u atomic_graph=0 authority=0 current_transfer_known=0",
+			 cluster_node_id, guard->snapshot, owner->pid, owner->procno,
+			 owner->backend_id, owner->backend_start, owner->revision,
+			 cycle->invocation, cycle->cycle, cycle->phase, cycle->finished,
+			 cycle->error, cycle->conditional_miss, owner->pair_cycles,
+			 owner->pair_omitted, owner->pair_nested_omitted,
+			 cycle->nrequests, cycle->omitted_requests);
+		for (unsigned leg = 0; leg < 2; leg++) {
+			const ClusterContentTraceLock *target = &cycle->targets[leg];
+
+			if (!content_trace_log_budget()) return false;
+			elog(LOG, "CONTENT_OWNER event=PAIR_LEG node=%d guard_snapshot=" UINT64_FORMAT
+				 " owner_pid=%d owner_proc=%u backend_id=%d backend_start=" INT64_FORMAT " revision=" UINT64_FORMAT
+				 " invocation=" UINT64_FORMAT " cycle=" UINT64_FORMAT " leg=%u buffer=%d mode=%d"
+				 " tag_known=%d spc=%u db=%u rel=%u fork=%d block=%u",
+				 cluster_node_id, guard->snapshot, owner->pid, owner->procno,
+				 owner->backend_id, owner->backend_start, owner->revision,
+				 cycle->invocation, cycle->cycle, leg, target->buffer, target->mode,
+				 target->tag_known, target->tag.spcOid, target->tag.dbOid,
+				 target->tag.relNumber, (int)target->tag.forkNum, target->tag.blockNum);
+			for (unsigned event = 0; event < CLPAIR_NEVENTS; event++) {
+				if (cycle->events[leg][event] == 0) continue;
+				if (!content_trace_log_budget()) return false;
+				elog(LOG, "CONTENT_OWNER event=PAIR_EVENT node=%d guard_snapshot=" UINT64_FORMAT
+					 " owner_pid=%d owner_proc=%u backend_id=%d backend_start=" INT64_FORMAT " revision=" UINT64_FORMAT
+					 " invocation=" UINT64_FORMAT " cycle=" UINT64_FORMAT " leg=%u reason=%s"
+					 " count=" UINT64_FORMAT " last_result=%d",
+					 cluster_node_id, guard->snapshot, owner->pid, owner->procno,
+					 owner->backend_id, owner->backend_start, owner->revision,
+					 cycle->invocation, cycle->cycle, leg, event_names[event],
+					 cycle->events[leg][event], cycle->last_results[leg][event]);
+			}
+		}
+		for (uint32 j = 0; j < cycle->nrequests; j++) {
+			const ClusterContentTracePairRequest *request = &cycle->requests[j];
+
+			if (!content_trace_log_budget()) return false;
+			elog(LOG, "CONTENT_OWNER event=PAIR_REQUEST node=%d guard_snapshot=" UINT64_FORMAT
+				 " owner_pid=%d owner_proc=%u backend_id=%d backend_start=" INT64_FORMAT " revision=" UINT64_FORMAT
+				 " invocation=" UINT64_FORMAT " cycle=" UINT64_FORMAT " leg=%u phase=%u"
+				 " spc=%u db=%u rel=%u fork=%d block=%u physical_generation=" UINT64_FORMAT
+				 " requester=%d master=%d r4=" UINT64_FORMAT " formation=" UINT64_FORMAT
+				 " session=" UINT64_FORMAT " request=" UINT64_FORMAT " base=" UINT64_FORMAT
+				 " authority_epoch=" UINT64_FORMAT " requester_connection=" UINT64_FORMAT
+				 " ingress_connection=" UINT64_FORMAT " wire_sender_connection=" UINT64_FORMAT
+				 " action=%d action_node=%d ordered_lane=%u observed_mode=%u target_mode=%u"
+				 " source_candidate=%u retain_pi_if_dirty=%u outcome=%u flags=%u stage_ok=%d"
+				 " head_binding_known=0 current_transfer_known=0 atomic_graph=0 authority=0",
+				 cluster_node_id, guard->snapshot, owner->pid, owner->procno,
+				 owner->backend_id, owner->backend_start, owner->revision,
+				 cycle->invocation, cycle->cycle, request->leg, request->phase,
+				 request->tag.spcOid, request->tag.dbOid, request->tag.relNumber,
+				 (int)request->tag.forkNum, request->tag.blockNum,
+				 request->physical_generation, request->requester, request->master,
+				 request->r4, request->formation, request->master_session,
+				 request->request, request->base, request->authority,
+				 request->requester_connection, request->ingress_connection,
+				 request->wire_sender_connection, request->action, request->action_node,
+				 request->ordered_lane, request->observed_mode, request->target_mode,
+				 request->source_candidate, request->retain_pi_if_dirty,
+				 request->outcome, request->flags, request->stage_ok);
+		}
+	}
+	return true;
+}
+
 void
 cluster_content_trace_emit(const ClusterWaitTrace *guard, const ClusterContentTraceCut *cut)
 {
@@ -311,6 +551,7 @@ cluster_content_trace_emit(const ClusterWaitTrace *guard, const ClusterContentTr
 				 wait->binding, wait->formation, wait->master_session, wait->r4, wait->acquisition, wait->base,
 				 wait->authority, wait->requester_connection, wait->ingress_connection, wait->wire_sender_connection);
 		}
+		if (!content_trace_pair_emit(guard, owner)) return;
 	}
 }
 #endif

@@ -19,6 +19,31 @@ static int hio_refs[4];
 static bool hio_locks[4];
 static int hio_wait_pin_conflicts, hio_waits, hio_reads, hio_repin_failures;
 static int hio_pair_misses;
+static int hio_trace_begins, hio_trace_cycles, hio_trace_phases[4], hio_trace_ends;
+static void hio_trace_begin(Buffer first, Buffer second)
+{
+	UT_ASSERT(first != second);
+	hio_trace_begins++;
+}
+static void hio_trace_cycle(void) { hio_trace_cycles++; }
+static void hio_trace_phase(int phase)
+{
+	UT_ASSERT(phase >= 0 && phase < 4);
+	hio_trace_phases[phase]++;
+}
+static void hio_trace_end(void) { hio_trace_ends++; }
+/* The owned publisher is tested separately; this fixture observes the actual
+ * pair helper's calls without depending on shared-memory setup. */
+#define cluster_content_trace_pair(target, missed) ((void)(target), (void)(missed))
+#define cluster_content_trace_wait_clear(kind) ((void)(kind))
+#define cluster_content_trace_pair_begin hio_trace_begin
+#define cluster_content_trace_pair_cycle hio_trace_cycle
+#define cluster_content_trace_pair_phase hio_trace_phase
+#define cluster_content_trace_pair_end hio_trace_end
+#define CLPAIR_FIRST 0
+#define CLPAIR_CONDITIONAL_SECOND 1
+#define CLPAIR_RESOLVE_SECOND 2
+#define CLPAIR_DONE 3
 static int hio_recent_calls, hio_fail_recent_at;
 static bool hio_make_second_visible, hio_cancel;
 static bool hio_same_vm, hio_enforce_wait_order;
@@ -142,6 +167,8 @@ hio_reset(bool same_vm)
 	memset(hio_locks, 0, sizeof(hio_locks));
 	hio_wait_pin_conflicts = hio_waits = hio_reads = hio_repin_failures = 0;
 	hio_pair_misses = 0;
+	hio_trace_begins = hio_trace_cycles = hio_trace_ends = 0;
+	memset(hio_trace_phases, 0, sizeof(hio_trace_phases));
 	hio_recent_calls = hio_fail_recent_at = 0;
 	hio_make_second_visible = hio_cancel = false;
 	hio_same_vm = same_vm;
@@ -175,6 +202,26 @@ UT_TEST(actual_hio_pair_repeated_misses_release_first_in_both_orders)
 		UT_ASSERT_EQ(hio_pair_misses, 0);
 		UT_ASSERT_EQ(hio_waits, 7);
 		UT_ASSERT_EQ(hio_wait_pin_conflicts, 0);
+		UT_ASSERT(hio_locks[0] && hio_locks[1]);
+	}
+}
+
+UT_TEST(actual_hio_pair_observes_each_cycle_and_resolution_leg)
+{
+	int first;
+
+	for (first = 1; first <= 2; first++) {
+		hio_reset(false);
+		hio_pair_misses = 3;
+		cluster_hio_lock_buffer_pair(first, 3 - first);
+		UT_ASSERT_EQ(hio_trace_begins, 1);
+		UT_ASSERT_EQ(hio_trace_cycles, 4);
+		UT_ASSERT_EQ(hio_trace_phases[CLPAIR_FIRST], 4);
+		UT_ASSERT_EQ(hio_trace_phases[CLPAIR_CONDITIONAL_SECOND], 4);
+		UT_ASSERT_EQ(hio_trace_phases[CLPAIR_RESOLVE_SECOND], 3);
+		UT_ASSERT_EQ(hio_trace_phases[CLPAIR_DONE], 1);
+		UT_ASSERT_EQ(hio_trace_ends, 1);
+		UT_ASSERT_EQ(hio_waits, 7);
 		UT_ASSERT(hio_locks[0] && hio_locks[1]);
 	}
 }

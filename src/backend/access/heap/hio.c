@@ -90,21 +90,42 @@ cluster_hio_lock_buffer_pair(Buffer first, Buffer second)
 	Assert(BufferIsValid(second));
 	Assert(first != second);
 
+#ifdef USE_PGRAC_CLUSTER
+	cluster_content_trace_pair_begin(first, second);
+#endif
 	for (;;)
 	{
+#ifdef USE_PGRAC_CLUSTER
+		cluster_content_trace_pair_cycle();
+		cluster_content_trace_pair_phase(CLPAIR_FIRST);
+#endif
 		LockBuffer(first, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+		cluster_content_trace_pair_phase(CLPAIR_CONDITIONAL_SECOND);
+#endif
 		if (ConditionalLockBuffer(second))
 		{
+#ifdef USE_PGRAC_CLUSTER
 			cluster_content_trace_pair(second, false);
 			cluster_content_trace_wait_clear(CLCONTENT_PAIR);
+			cluster_content_trace_pair_phase(CLPAIR_DONE);
+			cluster_content_trace_pair_end();
+#endif
 			return;
 		}
 
+#ifdef USE_PGRAC_CLUSTER
 		cluster_content_trace_pair(second, true);
+#endif
 		LockBuffer(first, BUFFER_LOCK_UNLOCK);
+#ifdef USE_PGRAC_CLUSTER
+		cluster_content_trace_pair_phase(CLPAIR_RESOLVE_SECOND);
+#endif
 		LockBuffer(second, BUFFER_LOCK_EXCLUSIVE);
 		LockBuffer(second, BUFFER_LOCK_UNLOCK);
+#ifdef USE_PGRAC_CLUSTER
 		cluster_content_trace_wait_clear(CLCONTENT_PAIR);
+#endif
 	}
 }
 
