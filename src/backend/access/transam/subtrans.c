@@ -26,7 +26,10 @@
  *
  * PGRAC: shared-origin clean startup preserves retained parentage instead of
  * applying the single-instance page reset. It does not grant retention or
- * mutation authority. Author: SqlRush <sqlrush@gmail.com>
+ * mutation authority. Shared checkpoint truncation intersects the original
+ * oldest-running cut with the published freeze watermark; it is an additional
+ * retention bound, not native pin or producer handoff authority.
+ * Author: SqlRush <sqlrush@gmail.com>
  *
  *-------------------------------------------------------------------------
  */
@@ -44,7 +47,12 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "access/xlogutils.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_heap_horizon.h"
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_xid_stripe.h"
+#include "cluster/cluster_xid_stripe_boot.h"
 #include "miscadmin.h"
+#include "storage/lwlock.h"
 #endif
 
 /*
@@ -404,6 +412,56 @@ void
 TruncateSUBTRANS(TransactionId oldestXact)
 {
 	int			cutoffPage;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_storage_mode_enabled() && cluster_shared_catalog)
+	{
+		ClusterXidStripeSampleFence fence;
+		ClusterHeapFreezeWatermark watermark;
+		FullTransactionId legal_next = InvalidFullTransactionId;
+		FullTransactionId native_min;
+		uint64		next;
+		uint64		oldest;
+		uint64		global_min;
+		bool		sampled;
+
+		if (!cluster_xid_striping || ShmemVariableCache == NULL)
+			return;
+		LWLockAcquire(XidGenLock, LW_SHARED);
+		sampled = cluster_xid_stripe_sample_future(ShmemVariableCache->nextXid,
+												 &legal_next, &fence);
+		LWLockRelease(XidGenLock);
+		if (!sampled || !FullTransactionIdIsValid(legal_next) ||
+			!TransactionIdIsNormal(XidFromFullTransactionId(legal_next)))
+			return;
+
+		native_min = cluster_xid_widen(oldestXact, legal_next);
+		if (!FullTransactionIdIsValid(native_min))
+			return;
+		next = U64FromFullTransactionId(legal_next);
+		oldest = U64FromFullTransactionId(native_min);
+		if (oldest > next || next - oldest >= UINT64CONST(0x80000000))
+			return;
+
+		/* One bounded local observation, without the allocation lock. */
+		if (!cluster_heap_freeze_watermark_sample(&watermark))
+			return;
+		global_min = watermark.active_full_xid_min;
+		if (global_min < FirstNormalTransactionId ||
+			!TransactionIdIsNormal((TransactionId) global_min) ||
+			global_min > next || next - global_min >= UINT64CONST(0x80000000))
+			return;
+
+		/*
+		 * Retain the checkpoint's oldest-running bound and native owners'
+		 * protection obligations. F can only keep more parentage, never
+		 * authorize removal. Unknown or ambiguous evidence keeps SUBTRANS.
+		 */
+		if (!cluster_xid_stripe_sample_fence_current(&fence))
+			return;
+		oldestXact = (TransactionId) Min(oldest, global_min);
+	}
+#endif
 
 	/*
 	 * The cutoff point is the start of the segment containing oldestXact. We
