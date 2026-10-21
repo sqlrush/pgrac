@@ -576,6 +576,32 @@ UT_TEST(test_retained_side_exact_complete_and_permuted)
 	}
 }
 
+UT_TEST(test_retained_side_clean_pair_still_checks_structure)
+{
+	for (unsigned mode = 0; mode < 4; mode++) {
+		ClusterRelmapV2Image image, before;
+		ClusterWalInputsV1 *inputs = relmap_test_fixture_with_side(&image,
+			mode % 2, mode < 2, true, false, mode % 2 + 1);
+		RelmapRetainedSideFixture side;
+
+		relmap_retained_side(&side, inputs, &image, mode % 2 != 0, 0, true);
+		image.pending_generation = 0;
+		memset(&image.pending_owner, 0, sizeof(image.pending_owner));
+		memset(&image.pending, 0, sizeof(image.pending));
+		before = image;
+		/* No pending assertion exists, but the complete structural input does. */
+		UT_ASSERT_EQ(cluster_relmap_owner_retained_wal_v2(&image, inputs),
+			CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+		UT_ASSERT_EQ(cluster_relmap_owner_retained_side_wal_v2(&image, inputs,
+			side.sources, 2), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(memcmp(&image, &before, sizeof(image)), 0);
+		UT_ASSERT_EQ(cluster_wal_inputs_revalidate_v1(inputs), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(inputs_pin_held && inputs_pin_current && test_actual_cf == NoLock);
+		relmap_retained_side_destroy(&side);
+		cold_census_done(&inputs);
+	}
+}
+
 UT_TEST(test_retained_side_rejects_incomplete_or_invalid_vectors)
 {
 	for (unsigned fault = 0; fault < 11; fault++) {
@@ -1486,17 +1512,124 @@ UT_TEST(test_census_side_wal_window_clean_pair_and_destination)
 		before = pending;
 		UT_ASSERT_EQ(cluster_relmap_retention_census_rebuild_pending_side_wal(f.census,
 			fault == 2 ? NULL : &pending, fault == 0 ? NULL : inputs, side.selected, side.count),
-			fault == 0 ? CLUSTER_RELMAP_PENDING_OK : fault == 1 ? CLUSTER_RELMAP_PENDING_CONFLICT
+			fault == 0 ? CLUSTER_RELMAP_PENDING_NOT_READY : fault == 1 ? CLUSTER_RELMAP_PENDING_CONFLICT
 			: CLUSTER_RELMAP_PENDING_INVALID_INPUT);
 		if (fault == 0) {
-			/* No pending image: this success claims no native WAL coverage. */
-			UT_ASSERT(cluster_relmap_pending_contains(&pending, CLUSTER_RELMAP_PENDING_TRUNCATE, &side.key));
-			UT_ASSERT_EQ(relmap_census_drain(&f), CLUSTER_RELMAP_CENSUS_DRAINED);
+			/* Clean authority does not exempt selected SIDE from native checks. */
+			UT_ASSERT_EQ(memcmp(&pending, &before, sizeof(pending)), 0);
+			UT_ASSERT_EQ(cluster_relmap_retention_census_next(f.census), CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+			for (unsigned i = 0; i < 2; i++)
+				UT_ASSERT_EQ(f.origin[i].state, CLUSTER_RELMAP_RETENTION_UNKNOWN);
 		} else {
 			UT_ASSERT_EQ(memcmp(&pending, &before, sizeof(pending)), 0);
 			relmap_census_pin_retained(&f, &image, true);
 		}
 		UT_ASSERT(inputs_pin_held);
+		relmap_census_side_destroy(&side);
+		relmap_census_end(&f);
+		cold_census_done(&inputs);
+	}
+}
+
+UT_TEST(test_census_side_wal_clean_pair_rebuilds_original_structure)
+{
+	for (unsigned mode = 0; mode < 4; mode++) {
+		ClusterRelmapV2Image image;
+		ClusterWalInputsV1 *inputs = relmap_test_fixture_with_side(&image,
+			mode % 2, mode < 2, true, false, true);
+		RelmapCensusWalFixture f;
+		RelmapCensusSideFixture side;
+		ClusterRelmapPendingSet pending;
+
+		relmap_census_side_bound(&side, inputs, &image, mode % 2 != 0, 0);
+		image.pending_generation = 0;
+		memset(&image.pending_owner, 0, sizeof(image.pending_owner));
+		memset(&image.pending, 0, sizeof(image.pending));
+		relmap_census_begin(&f, &image, false);
+		(void)relmap_census_emission(&f, image.identity.dbid);
+		cluster_relmap_pending_init(&pending);
+		UT_ASSERT_EQ(cluster_relmap_retention_census_rebuild_pending_side_wal(f.census,
+			&pending, inputs, side.selected, side.count), CLUSTER_RELMAP_PENDING_OK);
+		UT_ASSERT(cluster_relmap_pending_contains(&pending, CLUSTER_RELMAP_PENDING_TRUNCATE, &side.key));
+		UT_ASSERT(!cluster_relmap_pending_can_release(&pending, CLUSTER_RELMAP_PENDING_TRUNCATE, &side.key));
+		UT_ASSERT_EQ(relmap_census_drain(&f), CLUSTER_RELMAP_CENSUS_DRAINED);
+		for (unsigned i = 0; i < 2; i++)
+			UT_ASSERT_EQ(f.origin[i].state, CLUSTER_RELMAP_RETENTION_BUILDING);
+		UT_ASSERT_EQ(cluster_wal_inputs_revalidate_v1(inputs), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(inputs_pin_held && inputs_pin_current && test_actual_cf == NoLock);
+		relmap_census_side_destroy(&side);
+		relmap_census_end(&f);
+		cold_census_done(&inputs);
+	}
+}
+
+UT_TEST(test_census_side_wal_clean_pair_refusal_is_atomic_and_sticky)
+{
+	for (unsigned fault = 0; fault < 11; fault++) {
+		ClusterRelmapV2Image image;
+		ClusterWalInputsV1 *inputs = relmap_test_fixture_with_side(&image,
+			0, fault % 2 != 0, true, false, true);
+		RelmapCensusWalFixture f;
+		RelmapCensusSideFixture side;
+		ClusterRelmapPendingSet pending, before;
+		volatile bool threw = false;
+		unsigned capture_fault = fault == 2 ? 2 : fault == 3 ? 1
+			: fault == 4 ? 5 : fault == 5 ? 6 : 0;
+
+		relmap_census_side_bound(&side, inputs, &image, true, capture_fault);
+		if (fault == 1) side.count = 1;
+		if (fault >= 9) {
+			cold_census_done(&inputs);
+			inputs = relmap_test_fixture_with_side(&image, 0, fault % 2 != 0,
+				fault == 9, fault == 9, true);
+		}
+		if (fault == 6) {
+			char path[MAXPGPATH];
+			uint8 bad = 0x5a;
+			int fd;
+
+			v2_checkpoint_wal_path(&relmap_test_source[1].claim.identity,
+				relmap_test_record[1].exclusive_end, relmap_test_source[1].timeline, path);
+			fd = open(path, O_WRONLY);
+			UT_ASSERT(fd >= 0);
+			UT_ASSERT_EQ(pwrite(fd, &bad, 1, relmap_test_record[1].exclusive_end
+				% wal_segment_size + SizeOfXLogRecord + 2), 1);
+			UT_ASSERT_EQ(close(fd), 0);
+		}
+		image.pending_generation = 0;
+		memset(&image.pending_owner, 0, sizeof(image.pending_owner));
+		memset(&image.pending, 0, sizeof(image.pending));
+		relmap_census_begin(&f, &image, false);
+		(void)relmap_census_emission(&f, image.identity.dbid);
+		cluster_relmap_pending_init(&pending);
+		before = pending;
+		if (fault == 7 || fault == 8) {
+			relmap_test_fault = fault == 7 ? 2 : 3;
+			test_stop_share_call = test_cf_lock_calls + 6;
+			test_stop_share_hook = relmap_test_recheck_fault;
+		}
+		PG_TRY();
+		{
+			UT_ASSERT_EQ(cluster_relmap_retention_census_rebuild_pending_side_wal(f.census,
+				&pending, fault == 0 ? NULL : inputs, side.selected, side.count),
+				CLUSTER_RELMAP_PENDING_NOT_READY);
+		}
+		PG_CATCH();
+		{
+			threw = true;
+		}
+		PG_END_TRY();
+		test_throw_root_read = false;
+		if (fault == 7 || fault == 8) UT_ASSERT(test_stop_share_hook == NULL);
+		test_stop_share_hook = NULL;
+		UT_ASSERT_EQ(threw, fault == 8);
+		UT_ASSERT_EQ(memcmp(&pending, &before, sizeof(pending)), 0);
+		for (unsigned i = 0; i < 2; i++)
+			UT_ASSERT_EQ(f.origin[i].state, CLUSTER_RELMAP_RETENTION_UNKNOWN);
+		UT_ASSERT_EQ(cluster_relmap_retention_census_rebuild_pending(f.census,
+			&pending, NULL, 0), CLUSTER_RELMAP_PENDING_NOT_READY);
+		UT_ASSERT_EQ(cluster_relmap_retention_census_next(f.census), CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+		UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock);
 		relmap_census_side_destroy(&side);
 		relmap_census_end(&f);
 		cold_census_done(&inputs);
@@ -1845,7 +1978,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(31);
+	UT_PLAN(34);
 	UT_RUN(test_retained_relmap_matches_each_selected_namespace);
 	UT_RUN(test_retained_relmap_requires_exact_pending);
 	UT_RUN(test_retained_relmap_scans_suffix_and_other_source);
@@ -1853,6 +1986,7 @@ main(int argc, char **argv)
 	UT_RUN(test_retained_relmap_original_recheck_and_error_keep_pin);
 	UT_RUN(test_retained_relmap_invalid_input_is_read_only);
 	UT_RUN(test_retained_side_exact_complete_and_permuted);
+	UT_RUN(test_retained_side_clean_pair_still_checks_structure);
 	UT_RUN(test_retained_side_rejects_incomplete_or_invalid_vectors);
 	UT_RUN(test_retained_side_checks_actual_cut_claim_and_empty_source);
 	UT_RUN(test_retained_side_preserves_native_scan_and_final_rechecks);
@@ -1873,6 +2007,8 @@ main(int argc, char **argv)
 	UT_RUN(test_census_side_wal_late_physical_root_rejects_provisional);
 	UT_RUN(test_census_side_wal_collector_error_invalidates_before_wal);
 	UT_RUN(test_census_side_wal_window_clean_pair_and_destination);
+	UT_RUN(test_census_side_wal_clean_pair_rebuilds_original_structure);
+	UT_RUN(test_census_side_wal_clean_pair_refusal_is_atomic_and_sticky);
 	UT_RUN(test_census_side_wal_checks_original_full_source_vector);
 	UT_RUN(test_census_side_collector_error_invalidates_window);
 	UT_RUN(test_census_side_wal_keeps_real_empty_initializer);

@@ -137,12 +137,13 @@ extern ClusterRelmapPendingResult cluster_relmap_retention_census_rebuild_pendin
  * installed if either refuses. The SIDE and WAL APIs above cannot be called
  * sequentially: each successful rebuild consumes that same private window.
  *
- * For a pending image, the original retained scan also matches ALL supplied
+ * For every pair, the original retained scan also matches ALL supplied
  * sealed physical participants to its actual selected full claims and cuts.
+ * Clean pairs still require full structural correspondence: DROP/TRUNCATE
+ * obligations are independent of whether relmap has a pending generation.
  * The original cold owner supplies immutable plans/inputs and the held scope;
  * full capture/operation equivalence, redo eligibility, final SIDE revalidation
  * and independent era/epoch/boot/floor/issued qualifications remain its duty.
- * Clean pairs still have no pending WAL or source-correspondence assertion.
  * Whole physical ROOT DRAINED, provisional results, BUILDING and ERROR/scope
  * ownership follow the APIs above; no completion or release. */
 extern ClusterRelmapPendingResult cluster_relmap_retention_census_rebuild_pending_side_wal(

@@ -53,13 +53,15 @@ extern bool cluster_relmap_owner_wal_matches_v2(const ClusterRelmapV2Image *imag
 extern ClusterControlRootResult cluster_relmap_owner_retained_wal_v2(
 	const ClusterRelmapV2Image *image, struct ClusterWalInputsV1 *inputs);
 
-/* The same pending-record check, additionally matching the complete supplied
+/* Check the pending record when present, and match the complete supplied
  * sealed RECOVERY SIDE physical participant set to this original cold scope's
  * actual full claims and cuts in ONE retained scan. Include every participant
  * of each plan and every selected source, including explicit-empty terminals.
  * Match every retained SMGR/XACT record to its sealed operation in per-source
  * order, including history: exact LSNs/CRC/header frame and whole owned main
- * payload. Missing or extra structural operations refuse. Other SIDE/PAGE
+ * payload. A clean v2 image still requires this complete structural check;
+ * only its pending RELMAP assertion is absent. Missing or extra structural
+ * operations refuse. Other SIDE/PAGE
  * capture completeness remains an independent caller duty.
  * Keep image, sources and plans immutable for the call. The caller owns the
  * scope, including release on ERROR. No plan capture, redo

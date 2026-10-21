@@ -406,10 +406,12 @@ census_rebuild_pending_wal(ClusterRelmapRetentionCensus *census,
 
 	if (result != CLUSTER_RELMAP_PENDING_OK)
 		return result;
+	image.identity = census->identity;
+	image.committed_generation = census->rebuild_view.committed_generation;
+	image.committed = census->rebuild_view.committed;
 	if (census->rebuild_view.has_pending) {
 		/* A published primary can have a newer committed map than the backup
 		 * that still pins pending. Preserve that pending copy's original base. */
-		image.identity = census->identity;
 		image.committed_generation = census->rebuild_view.pending_committed_generation;
 		image.committed = census->rebuild_view.pending_committed;
 		image.pending_generation = census->rebuild_view.pending_generation;
@@ -420,9 +422,10 @@ census_rebuild_pending_wal(ClusterRelmapRetentionCensus *census,
 	{
 		ClusterControlRootResult retained = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 
-		if (image.pending_generation != 0) {
+		if (image.pending_generation != 0 || sources != NULL) {
 			/* The combined path must bind its whole sealed participant vector
-			 * to the actual claims/cuts in this same original retained scan. */
+			 * to the actual claims/cuts in this same original retained scan,
+			 * including structural obligations when both relmap copies are clean. */
 			retained = sources == NULL
 				? cluster_relmap_owner_retained_wal_v2(&image, inputs)
 				: cluster_relmap_owner_retained_side_wal_v2(&image, inputs, sources, source_count);

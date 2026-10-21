@@ -328,6 +328,8 @@ relmap_retained_record(XLogReaderState *reader, const ClusterWalSourceRef *sourc
 
 	if (detail != RF_PAGE_PROOF_DETAIL_OK)
 		return detail;
+	if (work->image.pending_generation == 0)
+		return RF_PAGE_PROOF_DETAIL_OK;
 	if (source->claim.identity.origin_node_id != owner->node
 		|| source->claim.identity.origin_owner_incarnation != owner->admitted_incarnation
 		|| reader->EndRecPtr != owner->wal_end)
@@ -354,7 +356,8 @@ relmap_retained_wal(const ClusterRelmapV2Image *image, ClusterWalInputsV1 *input
 	for (size_t i = 0; i < CLUSTER_WAL_INPUTS_MAX; i++)
 		work.participant[i] = UINT32_MAX;
 
-	if (image == NULL || inputs == NULL || image->pending_generation == 0
+	if (image == NULL || inputs == NULL
+		|| (image->pending_generation == 0 && sides == NULL)
 		|| cluster_relmap_v2_encode(image, wire, sizeof(wire)) != CLUSTER_RELMAP_V2_VALID)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	work.image = *image;
@@ -368,7 +371,8 @@ relmap_retained_wal(const ClusterRelmapV2Image *image, ClusterWalInputsV1 *input
 		relmap_retained_source, &work, &records, &detail);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	if (!work.found || work.completed_count != side_count)
+	if ((image->pending_generation != 0 && !work.found)
+		|| work.completed_count != side_count)
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	/* Consume provisional callbacks only under the caller's original scope. */
 	return cluster_wal_inputs_revalidate_v1(inputs);
