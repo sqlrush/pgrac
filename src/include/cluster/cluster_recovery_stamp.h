@@ -49,6 +49,9 @@ typedef struct ClusterRecoveryStampKeyV1 {
 typedef struct ClusterRecoveryStampHandleV1 {
 	ClusterRecoveryStampKeyV1 key;
 	ClusterRecoveryStampOwnerV1 owner;
+	ClusterRecoveryStampKindV1 kind;
+	uint32 payload_length;
+	uint8 payload[CLUSTER_RECOVERY_STAMP_PAYLOAD_BYTES];
 } ClusterRecoveryStampHandleV1;
 
 /* Embedded in the original per-thread replay slot. No pointers or callbacks. */
@@ -56,9 +59,6 @@ typedef struct ClusterRecoveryStampSlotV1 {
 	slock_t lock;
 	ClusterRecoveryStampHandleV1 handle;
 	ClusterRecoveryStampPhaseV1 phase;
-	ClusterRecoveryStampKindV1 kind;
-	uint32 payload_length;
-	uint8 payload[CLUSTER_RECOVERY_STAMP_PAYLOAD_BYTES];
 	XLogRecPtr record_start;
 	XLogRecPtr record_end;
 	bool failed;
@@ -72,13 +72,17 @@ typedef struct ClusterRecoveryStampCaptureV1 {
 } ClusterRecoveryStampCaptureV1;
 
 /* Call only after original authority, reservation and held-FD preparation.
- * Currently admits exact C0; FPI/D0 and unknown shapes refuse. No WAL or IO.
+ * Admits exact C0 or D0 bound to the original writer/target/boot/serial;
+ * FPI and unknown shapes refuse. ROOT/graph/retention remain caller premises.
+ * Complete codec validation occurs before taking any slot lock. No WAL or IO.
  * Inputs/output must not alias. Output is zero on refusal. */
 extern bool cluster_recovery_stamp_prepare_v1(const ClusterRecoveryStampOwnerV1 *owner,
 											  ClusterRecoveryStampKindV1 kind, const uint8 *payload,
 											  Size length, ClusterRecoveryStampHandleV1 *out);
 /* Both insertion transitions require the original executor's critical section.
- * INSERTED records the actual XLogInsert start/end; no insertion lock is held. */
+ * INSERTED records the actual XLogInsert start/end; no insertion lock is held.
+ * All transitions match the unchanged prepared operation, without allocation,
+ * hashing or codec calls inside the critical section or slot spinlock. */
 extern bool cluster_recovery_stamp_inserting_v1(const ClusterRecoveryStampHandleV1 *handle);
 extern bool cluster_recovery_stamp_inserted_v1(const ClusterRecoveryStampHandleV1 *handle,
 											   XLogRecPtr start, XLogRecPtr end);

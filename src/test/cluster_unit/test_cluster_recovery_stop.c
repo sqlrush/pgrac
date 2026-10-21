@@ -9,6 +9,7 @@
 #include "cluster/cluster_thread_recovery.h"
 #include "storage/shmem.h"
 #include "../../backend/cluster/cluster_recovery_plan.c"
+#include "../../backend/cluster/cluster_recovery_ctrc_record.c"
 #include "../../backend/cluster/cluster_thread_recovery_orchestrator.c"
 #undef printf
 #undef fprintf
@@ -25,6 +26,7 @@ s_lock(volatile slock_t *lock, const char *file, int line, const char *func)
 
 bool IsUnderPostmaster = true;
 BackendType MyBackendType = B_LMON;
+volatile uint32 CritSectionCount;
 static ClusterRecoveryPlanShmem region;
 static bool found_region;
 

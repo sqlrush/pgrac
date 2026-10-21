@@ -203,6 +203,25 @@ UT_TEST(native_capture_precedes_target_sync_and_ignores_later_windows)
 	UT_ASSERT_EQ(guts, 1);
 	UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_PRE_INSERT);
 }
+UT_TEST(native_checkpoint_waits_for_d0_commit_and_abort)
+{
+	for (unsigned outcome = TT_SLOT_COMMITTED; outcome <= TT_SLOT_ABORTED; outcome++) {
+		reset_fixture();
+		if (!begin_d0(&held, outcome)) {
+			UT_ASSERT(false);
+			return;
+		}
+		insert(&held);
+		MyBackendType = B_CHECKPOINTER;
+		on_wait = finish_then_new;
+		UT_ASSERT(run_boundary(0));
+		UT_ASSERT_EQ(waits, 1);
+		UT_ASSERT_EQ(absorbs, 1);
+		UT_ASSERT_EQ(retained, 1);
+		UT_ASSERT_EQ(guts, 1);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_PRE_INSERT);
+	}
+}
 UT_TEST(empty_and_preinsert_cancellation)
 {
 	reset_fixture();
@@ -293,8 +312,9 @@ UT_TEST(failed_or_missing_owner_blocks_and_eor_empty_is_legal)
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(5);
 	UT_RUN(native_capture_precedes_target_sync_and_ignores_later_windows);
+	UT_RUN(native_checkpoint_waits_for_d0_commit_and_abort);
 	UT_RUN(empty_and_preinsert_cancellation);
 	UT_RUN(error_shutdown_and_native_budget_never_clear_window);
 	UT_RUN(failed_or_missing_owner_blocks_and_eor_empty_is_legal);
