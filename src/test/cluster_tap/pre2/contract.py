@@ -138,6 +138,8 @@ def _workload_chain_complete(lane, events):
     observed = {event["phase"] for event in events}
     if len(observed) != len(events) or not set(phases) <= observed:
         return False
+    successors = {event_id: set() for event_id in by_id}
+    local_last = {}
     for event in events:
         if (event.get("chain_id") != chain or
                 event["relation_locator"] != first["relation_locator"] or
@@ -155,9 +157,29 @@ def _workload_chain_complete(lane, events):
             parent = by_id.get(parent_id)
             if parent is None or parent["phase"] != expected:
                 return False
-            if (_workload_identity_key(parent) == _workload_identity_key(event) and
-                    parent["event_seq"] >= event["event_seq"]):
-                return False
+            successors[parent_id].add(event["event_id"])
+        identity = _workload_identity_key(event)
+        if identity in local_last:
+            successors[local_last[identity]].add(event["event_id"])
+        local_last[identity] = event["event_id"]
+
+    # The caller validates increasing sequence numbers in each local stream.
+    # Adjacent local edges also constrain nonadjacent phases, including chains
+    # that return through another process. Remote append positions add no edge.
+    indegree = {event_id: 0 for event_id in by_id}
+    for children in successors.values():
+        for child in children:
+            indegree[child] += 1
+    ready = [event_id for event_id in by_id if indegree[event_id] == 0]
+    remaining = len(events)
+    while ready:
+        remaining -= 1
+        for child in successors[ready.pop()]:
+            indegree[child] -= 1
+            if indegree[child] == 0:
+                ready.append(child)
+    if remaining:
+        return False
     if lane == "H/HOT":
         return bool(observed - {"update"})
     if lane == "Q/RECEIPT":
@@ -215,6 +237,7 @@ def check_workload_contract(records):
     barrier seals a prefix of each independent process/sequence domain. Supplied
     predecessor_event_id edges bind one chain_id per lane; append positions and
     sequence numbers from different processes never establish causal order.
+    Supplied causal edges must be compatible with every local sequence order.
     Deferred records after a lane barrier cannot satisfy or clean up that lane.
     """
     assert isinstance(records, list) and records, "no workload observations"

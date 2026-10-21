@@ -115,6 +115,36 @@ def workload_events(include_i=True, late_i=False, cleanup=True):
     return events
 
 
+def workload_remote_return(lane, append_phases, remote=None):
+    """Keep causal phase links but move the middle phases to another identity."""
+    events = workload_events()
+    lane_events = [event for event in events if event.get("lane") == lane]
+    by_phase = {event["phase"]: event for event in lane_events}
+    fields = ("node", "pid", "procno", "sequence_domain")
+    local = {field: lane_events[0][field] for field in fields}
+    if remote is None:
+        remote = dict(node="n2", pid=202, procno=2,
+                      sequence_domain=local["sequence_domain"])
+    ends = {lane_events[0]["phase"], lane_events[-1]["phase"]}
+    for event in lane_events:
+        event.update(local if event["phase"] in ends else remote)
+    start = events.index(lane_events[0])
+    events[start:start + len(lane_events)] = [by_phase[phase] for phase in append_phases]
+    events[0]["identities"].append(remote)
+    counts = {tuple(identity[field] for field in fields): 0
+              for identity in events[0]["identities"]}
+    for record in events:
+        if record["kind"] == "event":
+            key = tuple(record[field] for field in fields)
+            counts[key] += 1
+            record["event_seq"] = counts[key]
+        else:
+            record["snapshots"] = [dict(identity, last_seq=counts[tuple(
+                identity[field] for field in fields)], gap=False)
+                for identity in events[0]["identities"]]
+    return events
+
+
 class EvidenceContract(unittest.TestCase):
     def test_wal_requires_exact_durable_coverage_before_release(self):
         good = wal_events()
@@ -299,6 +329,45 @@ class WorkloadBarrierContract(unittest.TestCase):
                 with self.subTest(lane=lane, changed=changed):
                     result = contract.check_workload_contract(bad)
                     self.assertEqual(result["lanes"][lane], "ROOT_OPEN")
+
+    def test_remote_causal_return_cannot_reverse_nonadjacent_local_order(self):
+        for lane, append_phases in [
+                ("I/TT", ("reread", "admit", "publish")),
+                ("R/IMG", ("consume", "seed", "request", "serve", "reply")),
+                ("Q/RECEIPT", ("state_clear", "mutation", "prepare", "publish",
+                               "apply_consume", "close", "ack", "certificate_retire"))]:
+            # Last causal phase is A1, first is A2, and middle phases are B1...
+            # All direct edges cross A/B or advance in B, but together they
+            # contradict A1 -> A2. I/TT is the B2 witness verbatim.
+            with self.subTest(lane=lane):
+                result = contract.check_workload_contract(
+                    workload_remote_return(lane, append_phases))
+                self.assertEqual(result["lanes"][lane], "ROOT_OPEN")
+                self.assertEqual(result["overall"], "ROOT_OPEN")
+
+    def test_remote_causal_return_accepts_consistent_local_order(self):
+        for lane, append_phases in [
+                ("I/TT", ("admit", "reread", "publish")),
+                ("R/IMG", ("seed", "consume", "request", "serve", "reply")),
+                ("Q/RECEIPT", ("mutation", "state_clear", "prepare", "publish",
+                               "apply_consume", "close", "ack", "certificate_retire"))]:
+            # A1 -> A2 agrees with the causal chain even when B's records
+            # arrive after A2; different processes have no append-time order.
+            with self.subTest(lane=lane):
+                result = contract.check_workload_contract(
+                    workload_remote_return(lane, append_phases))
+                self.assertEqual(result["lanes"][lane], "PASS_FOCUSED_DIAGNOSTIC")
+                self.assertEqual(result["overall"], "PASS_FOCUSED_DIAGNOSTIC")
+
+    def test_local_order_does_not_merge_distinct_process_identities(self):
+        for field, other in (("node", "n2"), ("pid", 202), ("procno", 2)):
+            remote = dict(node="n1", pid=101, procno=1, sequence_domain="i")
+            remote[field] = other
+            with self.subTest(field=field):
+                events = workload_remote_return(
+                    "I/TT", ("admit", "reread", "publish"), remote)
+                self.assertEqual(contract.check_workload_contract(events)["overall"],
+                                 "PASS_FOCUSED_DIAGNOSTIC")
 
     def test_late_deferred_cleanup_cannot_close_the_sealed_q_lane(self):
         events = workload_events(cleanup=False)
