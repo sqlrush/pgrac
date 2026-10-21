@@ -7,6 +7,7 @@
 #include "cluster/cluster_undo_horizon.h"
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_xid_stripe_boot.h"
+#include "storage/lwlock.h"
 
 static inline void
 heap_freeze_report_v2_put_le16(uint8 *dst, uint16 value)
@@ -239,5 +240,46 @@ cluster_heap_freeze_cutoff_v1(TransactionId proposed, TransactionId *out)
 	if (!TransactionIdIsNormal(cutoff))
 		return false;
 	*out = cutoff;
+	return true;
+}
+
+/*
+ * Table age only selects how much VACUUM scans. Read the original durable
+ * allocation promise at the local nextXid cut; a lagging raw nextXid is not
+ * the next legal striped allocation. No promise is allocated or advanced.
+ * This is not a FullXid provenance, terminal or freeze certificate.
+ */
+bool
+cluster_heap_freeze_table_age_v1(TransactionId frozen, int table_age, bool *out)
+{
+	ClusterXidStripeSampleFence fence;
+	FullTransactionId legal_next, frozen_full;
+	uint64 next, oldest;
+	bool sampled;
+
+	if (out == NULL || table_age < 0 || !TransactionIdIsNormal(frozen) || !cluster_shared_config
+		|| !cluster_enabled || !cluster_xid_striping || ShmemVariableCache == NULL)
+		return false;
+
+	LWLockAcquire(XidGenLock, LW_SHARED);
+	sampled = cluster_xid_stripe_sample_future(ShmemVariableCache->nextXid, &legal_next, &fence);
+	LWLockRelease(XidGenLock);
+	if (!sampled || !cluster_xid_stripe_sample_fence_current(&fence)
+		|| !FullTransactionIdIsValid(legal_next)
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(legal_next)))
+		return false;
+
+	frozen_full = cluster_xid_widen(frozen, legal_next);
+	if (!FullTransactionIdIsValid(frozen_full))
+		return false;
+	next = U64FromFullTransactionId(legal_next);
+	oldest = U64FromFullTransactionId(frozen_full);
+	if (oldest > next)
+		return false;
+	/*
+	 * Compare the distance instead of subtracting an age from next. This
+	 * cannot wrap at raw 0..2 or underflow the first FullXid epoch.
+	 */
+	*out = next - oldest >= (uint64)table_age;
 	return true;
 }

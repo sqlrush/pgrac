@@ -8829,8 +8829,25 @@ test_cluster_heap_horizon_create.inc: $(top_srcdir)/src/backend/access/heap/heap
 	     END { if (start != 1 || finish != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_heap_horizon_vacuum.inc: $(top_srcdir)/src/backend/commands/vacuum.c Makefile
+	@awk '/^vacuum_get_cutoffs\(/ { print "bool"; emit=1; starts++ } \
+		emit { print } emit && /^}$$/ { emit=0; done++; exit } \
+		END { if (starts != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_horizon_compare.inc: $(top_srcdir)/src/backend/access/transam/transam.c \
+		$(top_srcdir)/src/backend/access/transam/multixact.c Makefile
+	@awk '/^(TransactionId|MultiXactId)Precedes(OrEquals)?\(/ { print "bool"; emit=1; starts++ } \
+		emit { print } emit && /^}$$/ { emit=0; done++ } \
+		END { if (starts != 4 || done != 4 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_horizon: test_cluster_heap_horizon.c test_cluster_xid_stripe.c unit_test.h \
-		test_cluster_heap_horizon_create.inc \
+		test_cluster_heap_horizon_create.inc test_cluster_heap_horizon_vacuum.inc \
+		test_cluster_heap_horizon_compare.inc \
+		test_cluster_heap_horizon_vacuum_fixture.inc \
+		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
+		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
 		$(CLUSTER_XID_STRIPE_O) $(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c \

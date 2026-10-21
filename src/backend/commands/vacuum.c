@@ -23,6 +23,7 @@
  *	  Modified by: SqlRush <sqlrush@gmail.com>
  *	  - Validate shared heap freeze boundaries using cluster_heap_horizon.
  *	  - Retain a transaction snapshot during shared database maintenance.
+ *	  - Use durable legal-next XID age for shared aggressive scans.
  *
  *-------------------------------------------------------------------------
  */
@@ -1260,12 +1261,26 @@ vacuum_get_cutoffs(Relation rel, const VacuumParams *params,
 		freeze_table_age = vacuum_freeze_table_age;
 	freeze_table_age = Min(freeze_table_age, autovacuum_freeze_max_age * 0.95);
 	Assert(freeze_table_age >= 0);
-	aggressiveXIDCutoff = nextXID - freeze_table_age;
-	if (!TransactionIdIsNormal(aggressiveXIDCutoff))
-		aggressiveXIDCutoff = FirstNormalTransactionId;
-	if (TransactionIdPrecedesOrEquals(rel->rd_rel->relfrozenxid,
-									  aggressiveXIDCutoff))
-		return true;
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config && rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT) {
+		bool aggressive;
+
+		/*
+		 * Missing age evidence conservatively requests a full scan; it
+		 * does not change any tuple freeze cutoff or proof requirement.
+		 */
+		if (!cluster_heap_freeze_table_age_v1(cutoffs->relfrozenxid, freeze_table_age, &aggressive)
+			|| aggressive)
+			return true;
+	} else
+#endif
+	{
+		aggressiveXIDCutoff = nextXID - freeze_table_age;
+		if (!TransactionIdIsNormal(aggressiveXIDCutoff))
+			aggressiveXIDCutoff = FirstNormalTransactionId;
+		if (TransactionIdPrecedesOrEquals(rel->rd_rel->relfrozenxid, aggressiveXIDCutoff))
+			return true;
+	}
 
 	/*
 	 * Similar to the above, determine the table freeze age to use for

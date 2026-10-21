@@ -46,6 +46,100 @@ setup_horizon(void)
 	stub_next_full = FullTransactionIdFromU64(4195121);
 }
 
+#include "test_cluster_heap_horizon_vacuum_fixture.inc"
+
+UT_TEST(legal_age_requests_scan_when_local_next_lags)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	UT_ASSERT(vacuum_age_scan(40, 500, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT_EQ(age_sample_reads, 1);
+	UT_ASSERT_EQ(age_fence_reads, 1);
+	UT_ASSERT_EQ(age_lock_acquires, 1);
+	UT_ASSERT_EQ(age_lock_releases, 1);
+	UT_ASSERT(!age_xid_lock);
+	/* Scanning must not itself raise tuple freeze or MX cutoffs. */
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 80);
+	UT_ASSERT_EQ(cutoffs.MultiXactCutoff, 42);
+}
+
+UT_TEST(legal_age_threshold_is_inclusive_without_raw_underflow)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	UT_ASSERT(vacuum_age_scan(40, 960, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT(!vacuum_age_scan(40, 961, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT(!vacuum_age_scan(40, 100000, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT_EQ(age_sample_reads, 3);
+}
+
+UT_TEST(legal_age_crosses_epoch_with_full_xid_difference)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	activation_floor = UINT64_C(0x100000000);
+	stub_next_full = fxid(1, 100);
+	age_cache.nextXid = stub_next_full;
+	age_future = fxid(1, 1000);
+	UT_ASSERT(vacuum_age_scan(UINT32_C(0xFFFFFFF0), 1016, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT(!vacuum_age_scan(UINT32_C(0xFFFFFFF0), 1017, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+}
+
+UT_TEST(missing_age_promise_requests_scan_without_freeze_permission)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	age_promise_ready = false;
+	UT_ASSERT(vacuum_age_scan(40, 500, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT_EQ(age_sample_reads, 1);
+	UT_ASSERT_EQ(age_lock_acquires, age_lock_releases);
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 80);
+}
+
+UT_TEST(age_promise_revoked_after_unlock_requests_scan)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	age_revoke_on_release = true;
+	UT_ASSERT(vacuum_age_scan(40, 1000, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT_EQ(age_fence_reads, 1);
+	UT_ASSERT_EQ(age_lock_acquires, age_lock_releases);
+	UT_ASSERT(!age_xid_lock);
+}
+
+UT_TEST(legal_age_respects_native_default_and_safety_clamp)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	UT_ASSERT(vacuum_age_scan(40, -1, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	autovacuum_freeze_max_age = 1000;
+	UT_ASSERT(vacuum_age_scan(40, 100000, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+}
+
+UT_TEST(nonshared_and_temporary_age_stay_native)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	cluster_shared_config = false;
+	UT_ASSERT(!vacuum_age_scan(40, 500, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT(vacuum_age_scan(40, 100, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	cluster_shared_config = true;
+	UT_ASSERT(!vacuum_age_scan(40, 500, RELPERSISTENCE_TEMP, 90, &cutoffs));
+	UT_ASSERT(vacuum_age_scan(40, 100, RELPERSISTENCE_TEMP, 90, &cutoffs));
+	UT_ASSERT_EQ(age_sample_reads, 0);
+	UT_ASSERT_EQ(age_lock_acquires, 0);
+}
+
+UT_TEST(young_legal_xid_keeps_independent_multixact_scan_trigger)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	UT_ASSERT(!vacuum_age_scan(40, 1000, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	vacuum_multixact_freeze_table_age = 50;
+	UT_ASSERT(vacuum_age_scan(40, 1000, RELPERSISTENCE_PERMANENT, 50, &cutoffs));
+	vacuum_multixact_freeze_table_age = 10000;
+}
+
 UT_TEST(slower_writer_can_issue_below_local_freeze_proposal)
 {
 	TransactionId cutoff = InvalidTransactionId;
@@ -345,7 +439,15 @@ UT_TEST(freeze_report_v2_decode_rejects_invalid_payload)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(21);
+	UT_RUN(legal_age_requests_scan_when_local_next_lags);
+	UT_RUN(legal_age_threshold_is_inclusive_without_raw_underflow);
+	UT_RUN(legal_age_crosses_epoch_with_full_xid_difference);
+	UT_RUN(missing_age_promise_requests_scan_without_freeze_permission);
+	UT_RUN(age_promise_revoked_after_unlock_requests_scan);
+	UT_RUN(legal_age_respects_native_default_and_safety_clamp);
+	UT_RUN(nonshared_and_temporary_age_stay_native);
+	UT_RUN(young_legal_xid_keeps_independent_multixact_scan_trigger);
 	UT_RUN(slower_writer_can_issue_below_local_freeze_proposal);
 	UT_RUN(older_local_cutoff_is_never_advanced);
 	UT_RUN(missing_or_invalid_authority_preserves_output);

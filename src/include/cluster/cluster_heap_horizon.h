@@ -11,6 +11,11 @@
  * The caller excludes temporary relations. Nonshared mode is native. */
 extern bool cluster_heap_freeze_cutoff_v1(TransactionId proposed, TransactionId *out);
 
+/* Shared permanent heap's aggressive-scan policy, using a current durable
+ * legal-next FullXid observation. Failure preserves out; the caller must
+ * conservatively scan. This grants no tuple freeze or truncation authority. */
+extern bool cluster_heap_freeze_table_age_v1(TransactionId frozen, int table_age, bool *out);
+
 /*
  * Frozen 2.14 M1 waterline report.  The wire image is deliberately encoded
  * field-by-field in little-endian order; sizeof(ClusterHeapFreezeReportV2)
