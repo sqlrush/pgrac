@@ -293,3 +293,136 @@ cluster_heap_freeze_prepare_page_v1(const ClusterHeapFreezePageInputV1 *input,
 	}
 	return true;
 }
+
+/*
+ * The proof consumer compares SPACE identities field by field.  The in-memory
+ * value contains padding and is not a serialized witness, so memcmp would
+ * make a byte that is outside the identity contract part of admission.
+ */
+static bool
+freeze_space_identity_equal(const ClusterSpaceIdentity *left,
+							const ClusterSpaceIdentity *right)
+{
+	if (left == NULL || right == NULL)
+		return false;
+	return left->key.system_identifier == right->key.system_identifier
+		&& left->key.database_incarnation == right->key.database_incarnation
+		&& memcmp(left->key.storage_uuid, right->key.storage_uuid,
+				  sizeof(left->key.storage_uuid)) == 0
+		&& RelFileLocatorEquals(left->key.locator, right->key.locator)
+		&& memcmp(left->incarnation, right->incarnation,
+				  sizeof(left->incarnation)) == 0
+		&& left->sequence == right->sequence
+		&& left->operation == right->operation
+		&& left->state == right->state;
+}
+
+static bool
+freeze_final_fence_shape_valid(const ClusterHeapFreezeFinalFenceV1 *fence)
+{
+	return fence != NULL
+		&& fence->identity.state == CLUSTER_SPACE_IDENTITY_LIVE
+		&& fence->block != InvalidBlockNumber
+		&& !XLogRecPtrIsInvalid(fence->page_lsn)
+		&& SCN_VALID(fence->page_version)
+		&& fence->holder_sequence != 0
+		&& fence->master_sequence != 0
+		&& fence->admission_generation != 0;
+}
+
+static bool
+freeze_final_fence_equal(const ClusterHeapFreezeFinalFenceV1 *left,
+						 const ClusterHeapFreezeFinalFenceV1 *right)
+{
+	return freeze_space_identity_equal(&left->identity, &right->identity)
+		&& left->block == right->block
+		&& left->page_lsn == right->page_lsn
+		&& left->page_version == right->page_version
+		&& left->holder_sequence == right->holder_sequence
+		&& left->master_sequence == right->master_sequence
+		&& left->admission_generation == right->admission_generation;
+}
+
+static bool
+freeze_canonical_locator_shape_valid(const ClusterTxLocator *request,
+									 const ClusterTxResolution *resolution)
+{
+	uint32 segment_id;
+	uint32 block_no;
+	uint16 tt_slot_offset;
+	uint16 row_offset;
+
+	if (request == NULL || resolution == NULL
+		|| !TransactionIdIsNormal(request->xid)
+		|| request->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT
+		|| (request->tt_wrap != TT_WRAP_INVALID && request->tt_wrap > TT_WRAP_MAX)
+		|| !uba_decode_record(request->uba, &segment_id, &block_no,
+							 &tt_slot_offset, &row_offset)
+		|| segment_id == 0 || block_no == 0
+		|| !cluster_tx_locator_reply_matches(request, &resolution->locator_echo)
+		|| resolution->locator_echo.tt_wrap == TT_WRAP_INVALID
+		|| resolution->locator_echo.tt_wrap > TT_WRAP_MAX
+		|| !resolution->local_canonical_valid
+		|| resolution->local_canonical_generation == 0
+		|| resolution->local_canonical.reserved32 != 0
+		|| resolution->local_canonical.segment_id == 0
+		|| resolution->local_canonical.segment_id > UINT16_MAX
+		|| resolution->local_canonical.xid != request->xid
+		|| resolution->local_canonical.slot_offset >= TT_SLOTS_PER_SEGMENT
+		|| resolution->local_canonical.wrap == TT_WRAP_INVALID
+		|| resolution->local_canonical.wrap > TT_WRAP_MAX
+		|| resolution->local_canonical.wrap != resolution->locator_echo.tt_wrap)
+		return false;
+
+	return true;
+}
+
+ClusterHeapFreezeProofStatusV1
+cluster_heap_freeze_validate_canonical_proof_v1(
+	const ClusterHeapFreezeCanonicalProofV1 *proof)
+{
+	const ClusterTxResolution *resolution;
+
+	if (proof == NULL || !freeze_final_fence_shape_valid(&proof->expected_fence))
+		return CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR;
+	if (!freeze_final_fence_shape_valid(&proof->current_fence)
+		|| !freeze_final_fence_equal(&proof->expected_fence, &proof->current_fence))
+		return CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
+
+	/* C1b and admission are explicit gates; a missing gate is not proof. */
+	if (!proof->c1b_finalized || !proof->authority_current || !proof->admission_current)
+		return CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
+
+	resolution = &proof->resolution;
+	if (resolution->authority.origin_epoch == 0
+		|| XLogRecPtrIsInvalid(resolution->authority.live_hwm_lsn)
+		|| resolution->authority.tt_generation == 0
+		|| !SCN_VALID(resolution->authority.authority_scn)
+		|| !freeze_canonical_locator_shape_valid(&proof->requested_locator, resolution))
+		return CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR;
+
+	/* Non-terminal or unknown outcomes never admit a freeze. */
+	switch (resolution->outcome) {
+		case CLUSTER_TX_UNKNOWN:
+		case CLUSTER_TX_IN_PROGRESS:
+		case CLUSTER_TX_PREPARED:
+			return CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
+		case CLUSTER_TX_COMMITTED:
+		case CLUSTER_TX_ABORTED:
+			break;
+		default:
+			return CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR;
+	}
+
+	if (!cluster_tx_outcome_proof_is_valid(resolution->outcome,
+											 resolution->proof_kind))
+		return CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR;
+	if (resolution->outcome == CLUSTER_TX_COMMITTED
+		&& !SCN_VALID(resolution->commit_scn))
+		return CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR;
+	if (resolution->outcome == CLUSTER_TX_ABORTED
+		&& SCN_VALID(resolution->commit_scn))
+		return CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR;
+
+	return CLUSTER_HEAP_FREEZE_PROOF_PROVEN;
+}

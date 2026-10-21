@@ -1822,10 +1822,119 @@ UT_TEST(zero_retained_counts_never_remove_the_original_shared_restriction)
 	UT_ASSERT_EQ(state.NewRelminMxid, 100);
 }
 
+static void
+init_canonical_proof_fixture(ClusterHeapFreezeCanonicalProofV1 *proof)
+{
+	memset(proof, 0, sizeof(*proof));
+	setup(true);
+	proof->requested_locator.uba = uba_encode(1, 1, 0, 1);
+	proof->requested_locator.xid = 77;
+	proof->requested_locator.tt_wrap = TT_WRAP_INVALID;
+	proof->requested_locator.itl_kind = ITL_FLAG_ACTIVE;
+	proof->requested_locator.itl_slot_index = 0;
+	proof->resolution.locator_echo = proof->requested_locator;
+	proof->resolution.locator_echo.tt_wrap = 2;
+	proof->resolution.outcome = CLUSTER_TX_COMMITTED;
+	proof->resolution.proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
+	proof->resolution.commit_scn = 9;
+	proof->resolution.authority.origin_epoch = 1;
+	proof->resolution.authority.live_hwm_lsn = 1;
+	proof->resolution.authority.tt_generation = 1;
+	proof->resolution.authority.authority_scn = 9;
+	proof->resolution.local_canonical_valid = true;
+	proof->resolution.local_canonical_generation = 1;
+	proof->resolution.local_canonical.segment_id = 1;
+	proof->resolution.local_canonical.xid = 77;
+	proof->resolution.local_canonical.slot_offset = 0;
+	proof->resolution.local_canonical.wrap = 2;
+	proof->c1b_finalized = true;
+	proof->authority_current = true;
+	proof->admission_current = true;
+	proof->expected_fence.identity = state.identity;
+	proof->expected_fence.block = 17;
+	proof->expected_fence.page_lsn = 0x987654321ULL;
+	proof->expected_fence.page_version = 0x123456789ULL;
+	proof->expected_fence.holder_sequence = 11;
+	proof->expected_fence.master_sequence = 12;
+	proof->expected_fence.admission_generation = 13;
+	proof->current_fence = proof->expected_fence;
+}
+
+UT_TEST(canonical_proof_requires_exact_row_identity_and_c1b)
+{
+	ClusterHeapFreezeCanonicalProofV1 proof;
+
+	init_canonical_proof_fixture(&proof);
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_canonical_proof_v1(&proof),
+					 CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	proof.requested_locator.uba.raw[0] ^= UINT64_C(1);
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_canonical_proof_v1(&proof),
+					 CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR);
+	proof.requested_locator.uba.raw[0] ^= UINT64_C(1);
+	proof.resolution.local_canonical.wrap++;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_canonical_proof_v1(&proof),
+					 CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR);
+	proof.resolution.local_canonical.wrap--;
+	proof.resolution.locator_echo.uba.raw[0] ^= UINT64_C(1);
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_canonical_proof_v1(&proof),
+					 CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR);
+	proof.resolution.locator_echo.uba.raw[0] ^= UINT64_C(1);
+	proof.c1b_finalized = false;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_canonical_proof_v1(&proof),
+					 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	proof.c1b_finalized = true;
+	proof.resolution.local_canonical.xid++;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_canonical_proof_v1(&proof),
+					 CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR);
+}
+
+UT_TEST(final_fence_mismatch_retries_without_proof)
+{
+	ClusterHeapFreezeCanonicalProofV1 proof;
+
+	init_canonical_proof_fixture(&proof);
+	proof.current_fence.holder_sequence++;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_canonical_proof_v1(&proof),
+					 CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	proof.current_fence = proof.expected_fence;
+	proof.current_fence.master_sequence++;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_canonical_proof_v1(&proof),
+					 CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	proof.current_fence = proof.expected_fence;
+	proof.current_fence.identity.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_canonical_proof_v1(&proof),
+					 CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	proof.current_fence = proof.expected_fence;
+	proof.current_fence.block++;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_canonical_proof_v1(&proof),
+					 CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_canonical_proof_v1(NULL),
+					 CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR);
+}
+
+UT_TEST(unproven_tt_and_snapshot_never_admit_freeze)
+{
+	ClusterHeapFreezeCanonicalProofV1 proof;
+
+	init_canonical_proof_fixture(&proof);
+	proof.resolution.outcome = CLUSTER_TX_IN_PROGRESS;
+	proof.resolution.proof_kind = CLUSTER_TX_PROOF_NONE;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_canonical_proof_v1(&proof),
+					 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	init_canonical_proof_fixture(&proof);
+	proof.authority_current = false;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_canonical_proof_v1(&proof),
+					 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	init_canonical_proof_fixture(&proof);
+	proof.admission_current = false;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_canonical_proof_v1(&proof),
+					 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+}
+
 int
 main(void)
 {
-	UT_PLAN(56);
+	UT_PLAN(59);
 	UT_RUN(share_scan_preserves_every_reference_before_native_consumer);
 	UT_RUN(cleanup_scan_preserves_before_prune_and_freeze);
 	UT_RUN(raw_multi_value_never_selects_local_reader);
@@ -1882,6 +1991,9 @@ main(void)
 	UT_RUN(changed_inputs_record_missing_coverage_without_counting_old_rows);
 	UT_RUN(retained_or_changed_inputs_independently_prevent_catalog_publication);
 	UT_RUN(zero_retained_counts_never_remove_the_original_shared_restriction);
+	UT_RUN(canonical_proof_requires_exact_row_identity_and_c1b);
+	UT_RUN(final_fence_mismatch_retries_without_proof);
+	UT_RUN(unproven_tt_and_snapshot_never_admit_freeze);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

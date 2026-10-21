@@ -109,6 +109,43 @@ typedef struct ClusterHeapFreezePageBatchV1
 } ClusterHeapFreezePageBatchV1;
 
 /*
+ * A proof result is deliberately narrower than a freeze or retention
+ * certificate.  It binds one exact row carrier to the origin's canonical
+ * TT projection and to one final holder/master/admission fence.  The VACUUM
+ * caller still has to perform the final current check, WAL and conditional
+ * apply while holding the appropriate ownership; this predicate never does
+ * I/O, acquires locks, mutates a page, or grants authority on its own.
+ */
+typedef enum ClusterHeapFreezeProofStatusV1 {
+	CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN = 0,
+	CLUSTER_HEAP_FREEZE_PROOF_PROVEN,
+	CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED,
+	CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR
+} ClusterHeapFreezeProofStatusV1;
+
+typedef struct ClusterHeapFreezeFinalFenceV1
+{
+	ClusterSpaceIdentity identity;
+	BlockNumber block;
+	XLogRecPtr page_lsn;
+	SCN page_version;
+	uint64 holder_sequence;
+	uint64 master_sequence;
+	uint64 admission_generation;
+} ClusterHeapFreezeFinalFenceV1;
+
+typedef struct ClusterHeapFreezeCanonicalProofV1
+{
+	ClusterTxLocator requested_locator;
+	ClusterTxResolution resolution;
+	ClusterHeapFreezeFinalFenceV1 expected_fence;
+	ClusterHeapFreezeFinalFenceV1 current_fence;
+	bool c1b_finalized;
+	bool authority_current;
+	bool admission_current;
+} ClusterHeapFreezeCanonicalProofV1;
+
+/*
  * Caller supplies a previously validated live SPACE identity and already
  * holds the source page's original share/cleanup content lock. Source and
  * output must not overlap. No allocation, I/O, buffer acquisition or proof
@@ -147,5 +184,17 @@ cluster_heap_freeze_validate_page_v1(const ClusterHeapFreezePageInputV1 *input,
  */
 extern bool cluster_heap_freeze_prepare_page_v1(const ClusterHeapFreezePageInputV1 *input,
 											  ClusterHeapFreezePageBatchV1 *out);
+
+/*
+ * Validate one provenance-qualified terminal proof and its final identity
+ * fence.  KEEP_UNPROVEN means that the evidence is incomplete; RETRY_CHANGED
+ * means the final fence no longer names the same current page owner; and
+ * HARD_ERROR means a malformed identity, proof or authority value.  PROVEN
+ * is evidence only and does not permit a freeze, retention advance or page
+ * mutation without the caller's synchronous final fence/apply path.
+ */
+extern ClusterHeapFreezeProofStatusV1
+cluster_heap_freeze_validate_canonical_proof_v1(
+	const ClusterHeapFreezeCanonicalProofV1 *proof);
 
 #endif /* CLUSTER_HEAP_FREEZE_H */
