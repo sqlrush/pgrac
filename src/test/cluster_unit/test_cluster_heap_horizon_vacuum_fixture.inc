@@ -1,5 +1,6 @@
 /* VACUUM I/O leaves; cutoff/age policy and FullXid widening are production.
- * The durable promise sample is a leaf double, not a durability test.
+ * Durable promise and published watermark samples are leaf doubles, not
+ * durability, publication, or producer handoff tests.
  * Author: SqlRush <sqlrush@gmail.com> */
 #include "commands/vacuum.h"
 #include "postmaster/autovacuum.h"
@@ -22,6 +23,9 @@ static bool age_xid_lock, age_promise_ready, age_promise_current, age_revoke_on_
 static unsigned age_sample_reads, age_fence_reads, age_lock_acquires, age_lock_releases;
 static FullTransactionId age_future;
 static TransactionId age_oldest_xmin;
+static ClusterHeapFreezeWatermark age_watermark;
+static bool age_watermark_ready, age_revoke_on_watermark;
+static unsigned age_watermark_reads;
 
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
@@ -65,6 +69,17 @@ cluster_xid_stripe_sample_fence_current(const ClusterXidStripeSampleFence *fence
 	UT_ASSERT_EQ(fence->incarnation, 81);
 	age_fence_reads++;
 	return age_promise_current;
+}
+
+bool
+cluster_heap_freeze_watermark_sample(ClusterHeapFreezeWatermark *out)
+{
+	UT_ASSERT(!age_xid_lock);
+	age_watermark_reads++;
+	*out = age_watermark;
+	if (age_revoke_on_watermark)
+		age_promise_current = false;
+	return age_watermark_ready;
 }
 
 TransactionId
@@ -161,6 +176,9 @@ setup_age(void)
 	age_xid_lock = age_revoke_on_release = false;
 	age_promise_ready = age_promise_current = true;
 	age_sample_reads = age_fence_reads = age_lock_acquires = age_lock_releases = 0;
+	memset(&age_watermark, 0, sizeof(age_watermark));
+	age_watermark_ready = age_revoke_on_watermark = false;
+	age_watermark_reads = 0;
 	vacuum_freeze_min_age = 100;
 	vacuum_freeze_table_age = 500;
 	vacuum_multixact_freeze_table_age = 10000;

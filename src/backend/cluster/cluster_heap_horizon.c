@@ -247,16 +247,18 @@ cluster_heap_freeze_cutoff_v1(TransactionId proposed, TransactionId *out)
  * Derive both VACUUM age policies from one original durable allocation
  * promise at the local nextXid cut. A lagging raw nextXid is not the next
  * legal striped allocation. The cutoff still obeys the caller's existing
- * conservative ceiling; this is not a terminal or freeze certificate.
+ * conservative ceiling. An available global candidate may only lower it;
+ * neither observation is a terminal or freeze certificate.
  */
 bool
 cluster_heap_freeze_policy_v1(TransactionId ceiling, TransactionId frozen, int min_age,
 							  int table_age, TransactionId *freeze_limit, bool *aggressive)
 {
 	ClusterXidStripeSampleFence fence;
+	ClusterHeapFreezeWatermark watermark;
 	FullTransactionId legal_next, frozen_full, ceiling_full;
 	uint64 next, oldest, bound, candidate;
-	bool sampled;
+	bool sampled, have_watermark;
 
 	if (freeze_limit == NULL || aggressive == NULL || min_age < 0 || table_age < 0
 		|| !TransactionIdIsNormal(ceiling) || !TransactionIdIsNormal(frozen)
@@ -267,9 +269,15 @@ cluster_heap_freeze_policy_v1(TransactionId ceiling, TransactionId frozen, int m
 	LWLockAcquire(XidGenLock, LW_SHARED);
 	sampled = cluster_xid_stripe_sample_future(ShmemVariableCache->nextXid, &legal_next, &fence);
 	LWLockRelease(XidGenLock);
-	if (!sampled || !cluster_xid_stripe_sample_fence_current(&fence)
-		|| !FullTransactionIdIsValid(legal_next)
+	if (!sampled || !FullTransactionIdIsValid(legal_next)
 		|| !TransactionIdIsNormal(XidFromFullTransactionId(legal_next)))
+		return false;
+
+	/* The bounded local reader must run outside XidGenLock. Refusal keeps
+	 * the old v1 policy, never granting row-freeze authority. Recheck the
+	 * original allocation fence after the additional observation. */
+	have_watermark = cluster_heap_freeze_watermark_sample(&watermark);
+	if (!cluster_xid_stripe_sample_fence_current(&fence))
 		return false;
 
 	frozen_full = cluster_xid_widen(frozen, legal_next);
@@ -291,6 +299,13 @@ cluster_heap_freeze_policy_v1(TransactionId ceiling, TransactionId frozen, int m
 	if ((TransactionId)candidate < FirstNormalTransactionId)
 		candidate += FirstNormalTransactionId - (TransactionId)candidate;
 	candidate = Min(candidate, bound);
+	if (have_watermark)
+		candidate = Min(candidate, watermark.active_full_xid_min);
+	/* A more restrictive global F can be older than the representable raw
+	 * window. Do not turn that FullXid into an ambiguous raw cutoff. */
+	if (candidate < FirstNormalTransactionId || !TransactionIdIsNormal((TransactionId)candidate)
+		|| candidate > next || next - candidate >= UINT64CONST(0x80000000))
+		return false;
 	*freeze_limit = (TransactionId)candidate;
 	*aggressive = next - oldest >= (uint64)table_age;
 	return true;

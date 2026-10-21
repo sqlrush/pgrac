@@ -48,6 +48,124 @@ setup_horizon(void)
 
 #include "test_cluster_heap_horizon_vacuum_fixture.inc"
 
+UT_TEST(published_watermark_caps_existing_vacuum_limit)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	age_watermark_ready = true;
+	age_watermark.active_full_xid_min = 60;
+	UT_ASSERT(!vacuum_policy_scan(10, 180, 100000, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 60);
+	UT_ASSERT_EQ(cutoffs.OldestXmin, 80);
+	UT_ASSERT_EQ(cutoffs.MultiXactCutoff, 42);
+	UT_ASSERT_EQ(age_watermark_reads, 1);
+	UT_ASSERT_EQ(age_sample_reads, 1);
+	UT_ASSERT_EQ(age_fence_reads, 1);
+	UT_ASSERT_EQ(age_lock_acquires, age_lock_releases);
+	UT_ASSERT(!age_xid_lock);
+	/* The F cap does not replace the N_legal table-age scan policy. */
+	UT_ASSERT(vacuum_policy_scan(10, 180, 500, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 60);
+}
+
+UT_TEST(published_watermark_never_raises_age_or_activation_ceiling)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	age_watermark_ready = true;
+	age_watermark.active_full_xid_min = 2000;
+	UT_ASSERT(!vacuum_policy_scan(10, 180, 100000, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 80);
+	UT_ASSERT(!vacuum_policy_scan(10, 980, 100000, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 20);
+	age_watermark.active_full_xid_min = 60;
+	activation_floor = 50;
+	UT_ASSERT(!vacuum_policy_scan(10, 0, 100000, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 50);
+}
+
+UT_TEST(published_watermark_minimum_uses_full_xid_epoch)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	activation_floor = UINT64_C(0x100000000);
+	stub_next_full = fxid(1, 100);
+	age_cache.nextXid = stub_next_full;
+	age_future = fxid(1, 1000);
+	age_watermark_ready = true;
+	age_watermark.active_full_xid_min = UINT64_C(0xFFFFFF80);
+	UT_ASSERT(!vacuum_policy_scan(UINT32_C(0xFFFFF000), 1100, 100000, RELPERSISTENCE_PERMANENT, 90,
+								  &cutoffs));
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, UINT32_C(0xFFFFFF80));
+	UT_ASSERT_EQ(cutoffs.OldestXmin, FirstNormalTransactionId);
+}
+
+UT_TEST(published_watermark_ambiguous_floor_refuses_raw_projection)
+{
+	struct VacuumCutoffs cutoffs;
+	TransactionId limit = 777;
+	bool aggressive = false;
+	setup_age();
+	activation_floor = UINT64_C(0x100000064);
+	stub_next_full = fxid(1, 200);
+	age_cache.nextXid = stub_next_full;
+	age_future = fxid(1, 1000);
+	age_watermark_ready = true;
+	age_watermark.active_full_xid_min = U64FromFullTransactionId(age_future) - UINT64_C(0x80000000);
+	UT_ASSERT(!cluster_heap_freeze_policy_v1(80, 10, 180, 100000, &limit, &aggressive));
+	UT_ASSERT_EQ(limit, 777);
+	UT_ASSERT(!aggressive);
+	/* Existing caller requests a scan and retains its conservative fallback. */
+	UT_ASSERT(vacuum_policy_scan(10, 180, 100000, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 10);
+}
+
+UT_TEST(unavailable_watermark_preserves_original_v1_policy)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	/* Refused bytes carry no meaning and must never become a cutoff. */
+	age_watermark.active_full_xid_min = 1;
+	UT_ASSERT(!vacuum_policy_scan(10, 180, 100000, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 80);
+	UT_ASSERT_EQ(age_watermark_reads, 1);
+}
+
+UT_TEST(lease_revoked_during_watermark_read_refuses_policy)
+{
+	struct VacuumCutoffs cutoffs;
+	TransactionId limit = 777;
+	bool aggressive = false;
+	setup_age();
+	age_watermark_ready = age_revoke_on_watermark = true;
+	age_watermark.active_full_xid_min = 60;
+	UT_ASSERT(!cluster_heap_freeze_policy_v1(80, 10, 180, 100000, &limit, &aggressive));
+	UT_ASSERT_EQ(limit, 777);
+	UT_ASSERT(!aggressive);
+	UT_ASSERT_EQ(age_watermark_reads, 1);
+	UT_ASSERT_EQ(age_fence_reads, 1);
+	UT_ASSERT(vacuum_policy_scan(10, 180, 100000, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 10);
+}
+
+UT_TEST(nonshared_and_temporary_policy_skip_watermark)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	age_watermark_ready = true;
+	age_watermark.active_full_xid_min = 10;
+	cluster_shared_config = false;
+	UT_ASSERT(!vacuum_policy_scan(10, 180, 100000, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 20);
+	UT_ASSERT_EQ(age_watermark_reads, 0);
+	setup_age();
+	age_watermark_ready = true;
+	age_watermark.active_full_xid_min = 10;
+	UT_ASSERT(!vacuum_policy_scan(10, 180, 100000, RELPERSISTENCE_TEMP, 90, &cutoffs));
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 20);
+	UT_ASSERT_EQ(age_watermark_reads, 0);
+}
+
 UT_TEST(legal_min_age_uses_lease_next_but_keeps_original_ceiling)
 {
 	struct VacuumCutoffs cutoffs;
@@ -568,7 +686,14 @@ UT_TEST(freeze_report_v2_decode_rejects_invalid_payload)
 int
 main(void)
 {
-	UT_PLAN(31);
+	UT_PLAN(38);
+	UT_RUN(published_watermark_caps_existing_vacuum_limit);
+	UT_RUN(published_watermark_never_raises_age_or_activation_ceiling);
+	UT_RUN(published_watermark_minimum_uses_full_xid_epoch);
+	UT_RUN(published_watermark_ambiguous_floor_refuses_raw_projection);
+	UT_RUN(unavailable_watermark_preserves_original_v1_policy);
+	UT_RUN(lease_revoked_during_watermark_read_refuses_policy);
+	UT_RUN(nonshared_and_temporary_policy_skip_watermark);
 	UT_RUN(legal_min_age_uses_lease_next_but_keeps_original_ceiling);
 	UT_RUN(legal_min_age_subtracts_in_full_xid_epoch);
 	UT_RUN(legal_min_age_saturates_instead_of_raw_underflow);

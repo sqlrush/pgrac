@@ -12,9 +12,11 @@
 extern bool cluster_heap_freeze_cutoff_v1(TransactionId proposed, TransactionId *out);
 
 /* Shared permanent heap's age policies, using one current durable legal-next
- * FullXid observation. The caller supplies its existing conservative ceiling.
- * Failure preserves both outputs; the caller must scan without advancing its
- * freeze boundary. This grants no tuple freeze or truncation authority. */
+ * FullXid observation. The caller supplies its existing conservative ceiling;
+ * an available published global candidate may only lower it. An unavailable
+ * candidate preserves the old v1 policy. Failure preserves both outputs; the
+ * caller must scan without advancing its freeze boundary. This grants no
+ * tuple freeze, producer handoff, or truncation authority. */
 extern bool cluster_heap_freeze_policy_v1(TransactionId ceiling, TransactionId frozen, int min_age,
 										  int table_age, TransactionId *freeze_limit,
 										  bool *aggressive);
