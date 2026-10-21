@@ -93,6 +93,8 @@ static unsigned origin_log_count, origin_dispatch_calls;
 static char origin_last_log[8192];
 static unsigned reply_log_count;
 static char reply_last_log[8192];
+static unsigned batch_reply_log_count, batch_reply_log_throw_at;
+static char batch_reply_logs[CLUSTER_CTRC_RECLAIM_BATCH_MAX][8192];
 BackendType MyBackendType = B_BACKEND;
 AuxProcType MyAuxProcType = NotAnAuxProcess;
 int MyProcPid = 2901;
@@ -482,6 +484,12 @@ errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused()
 		if (strstr(origin_last_log, "PGRAC_FAMILY=CTRC_ORIGIN_REPLY") != NULL) {
 			reply_log_count++;
 			strlcpy(reply_last_log, origin_last_log, sizeof(reply_last_log));
+		} else if (strstr(origin_last_log, "PGRAC_FAMILY=CTRC_ORIGIN_BATCH_REPLY") != NULL) {
+			if (batch_reply_log_count < CLUSTER_CTRC_RECLAIM_BATCH_MAX)
+				strlcpy(batch_reply_logs[batch_reply_log_count], origin_last_log, sizeof(batch_reply_logs[0]));
+			batch_reply_log_count++;
+			if (batch_reply_log_throw_at != 0 && batch_reply_log_count == batch_reply_log_throw_at)
+				pg_re_throw();
 		} else {
 			if (origin_require_dispatch_return) UT_ASSERT(origin_dispatch_returned);
 			origin_log_count++;
@@ -508,12 +516,16 @@ reset_fixture(void)
 	cluster_trace_normal_stop = origin_log_enabled = origin_log_throw = false;
 	origin_driver_pending = origin_require_dispatch_return = origin_dispatch_returned = false;
 	reply_log_count = 0; reply_last_log[0] = '\0';
+	batch_reply_log_count = batch_reply_log_throw_at = 0;
 	origin_log_count = origin_dispatch_calls = 0; origin_last_log[0] = '\0';
 #ifdef CLUSTER_CTRC_ORIGIN_DISPATCH_TRACE_PRESENT
 	CtrcOriginTraceCriticalSkipped = CtrcOriginTraceLwlockSkipped = 0;
 #endif
 #ifdef CLUSTER_CTRC_ORIGIN_REPLY_TRACE_PRESENT
 	CtrcReplyTraceUnsafeSkipped = 0;
+#endif
+#ifdef CLUSTER_CTRC_LOCAL_BATCH_REPLY_TRACE_PRESENT
+	CtrcBatchReplyTraceSkipped = 0;
 #endif
 	CritSectionCount = 0;
 	allow_new_service_participant = true;

@@ -1666,8 +1666,9 @@ static bool
 ctrc_origin_certificate_commit_shared(const ClusterCtrcOriginCertificateSnapshot *snapshot);
 static bool ctrc_cleaner_publish_certificate(const ClusterCtrcOriginCertificateSnapshot *snapshot);
 static void ctrc_participant_capture_durability(ClusterCtrcDurability *durability);
+typedef struct CtrcOriginBatchReplyTrace CtrcOriginBatchReplyTrace;
 static bool ctrc_origin_ack_land_locked(uint64 request_id, const ClusterCtrcLocalReleaseAckV1 *ack,
-										bool *progressed);
+										bool *progressed, CtrcOriginBatchReplyTrace *trace);
 
 /* Hot-path counters and the deterministic test seam must not repeat the
  * capacity/layout walk performed by cluster_ctrc_shmem_ready().  The shared
@@ -3272,6 +3273,165 @@ ctrc_origin_reply_trace(const char *event, uint64 request, uint16 node,
 }
 #endif
 
+
+#ifndef CLUSTER_CTRC_UNIT_TEST
+/* One bounded batch's owned observations, never shared state or authority.
+ * Only compact before/after fields are copied, not 64 complete origin rows. */
+#define CLUSTER_CTRC_LOCAL_BATCH_REPLY_TRACE_PRESENT 1
+typedef struct CtrcOriginBatchTraceState {
+	uint64 seal;
+	uint64 request;
+	uint32 grant;
+	uint32 touched;
+	uint32 dispatched;
+	uint32 confirmed;
+	uint32 ack;
+	uint8 state;
+} CtrcOriginBatchTraceState;
+
+struct CtrcOriginBatchReplyTrace {
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcParticipantIdentity peer;
+	CtrcOriginBatchTraceState before;
+	CtrcOriginBatchTraceState after;
+	uint64 origin_index;
+	uint64 input_seal;
+	uint32 input_grant;
+	uint32 input_crc;
+	uint16 input_node;
+	uint8 matched_count;
+	ClusterCtrcSealReplyResult reply_result;
+	bool sample_known;
+	bool accepted;
+	bool entry_called;
+	bool entry_progressed;
+	bool progressed;
+	bool pending_duplicate;
+	bool after_same_key;
+	bool after_row_zero;
+	bool input_ack_known;
+	bool input_key_matches_before;
+};
+
+static uint64 CtrcBatchReplyTraceSequence;
+static uint64 CtrcBatchReplyTraceSkipped;
+
+static void
+ctrc_origin_batch_trace_state(CtrcOriginBatchTraceState *out,
+							 const ClusterCtrcOriginEntry *origin, uint16 node)
+{
+	out->seal = origin->seal_generation;
+	out->request = node < CLUSTER_CTRC_MAX_PARTICIPANTS ? origin->close_request_id[node] : 0;
+	out->grant = origin->grant_generation;
+	out->touched = origin->touched_bitmap;
+	out->dispatched = origin->close_dispatched_bitmap;
+	out->confirmed = origin->close_confirmed_bitmap;
+	out->ack = origin->ack_bitmap;
+	out->state = origin->state;
+}
+
+/* Pure copies at the original lock owner, no lookup, allocation or output. */
+static void
+ctrc_origin_batch_trace_before(CtrcOriginBatchReplyTrace *sample, uint64 index,
+							  const ClusterCtrcOriginEntry *origin, uint16 node)
+{
+	sample->origin_index = index;
+	sample->sample_known = true;
+	sample->matched_count = 1;
+	sample->key = origin->key;
+	if (node < CLUSTER_CTRC_MAX_PARTICIPANTS)
+		sample->peer = origin->touched[node];
+	ctrc_origin_batch_trace_state(&sample->before, origin, node);
+}
+
+static void
+ctrc_origin_batch_trace_after(CtrcOriginBatchReplyTrace *sample,
+							 const ClusterCtrcOriginEntry *origin, uint16 node)
+{
+	ctrc_origin_batch_trace_state(&sample->after, origin, node);
+	sample->after_same_key = memcmp(&sample->key, &origin->key, sizeof(origin->key)) == 0;
+	sample->after_row_zero = ctrc_bytes_zero(origin, sizeof(*origin));
+}
+
+static void
+ctrc_origin_batch_reply_trace(const char *event, const CtrcOriginBatchReplyTrace *sample,
+							 ClusterCtrcSealReplyResult result, Size ordinal, Size count)
+{
+	const ClusterCtrcTxnKeyV1 *key = &sample->key;
+	const ClusterCtrcParticipantIdentity *peer = &sample->peer;
+	const CtrcOriginBatchTraceState *before = &sample->before, *after = &sample->after;
+	bool held = false;
+	struct timespec now;
+	uint64 mono_us = 0;
+
+	if (!cluster_trace_normal_stop)
+		return;
+	if (CritSectionCount == 0)
+		ForEachLWLockHeldByMe(ctrc_origin_reply_trace_lock, &held);
+	if (CritSectionCount != 0 || held) {
+		if (CtrcBatchReplyTraceSkipped != UINT64_MAX)
+			CtrcBatchReplyTraceSkipped++;
+		return;
+	}
+	if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
+		mono_us = (uint64)now.tv_sec * 1000000 + (uint64)now.tv_nsec / 1000;
+	if (CtrcBatchReplyTraceSequence != UINT64_MAX)
+		CtrcBatchReplyTraceSequence++;
+	ereport(LOG, (errmsg_internal(
+		"PGRAC_FAMILY=CTRC_ORIGIN_BATCH_REPLY event=%s "
+		"event_seq=" UINT64_FORMAT " sequence_scope=process sequence_domain=CTRC_ORIGIN_BATCH_REPLY "
+		"node_id=%d pid=%d procno=%d backend_type=%d emit_wall_us=" INT64_FORMAT
+		" emit_monotonic_us=" UINT64_FORMAT " capture_clock_known=0 process_incarnation_known=0 "
+		"full_xid_known=0 authoritative=0 shared_atomic_graph=0 durability_known=0 recipient_resume_known=0 "
+		"batch_ordinal=%zu batch_count=%zu request_id=" UINT64_FORMAT " suboperation=%u "
+		"expected_peer=%u expected_peer_boot=" UINT64_FORMAT " expected_peer_capability=%u "
+		"expected_peer_formation=" UINT64_FORMAT " expected_peer_admission=" UINT64_FORMAT
+		" expected_grant=%u expected_seal=" UINT64_FORMAT
+		" result=%u entry_called=%d accepted=%d progressed=%d entry_progressed=%d pending_duplicate=%d "
+		"sample_known=%d matched_count=%u origin_index=" UINT64_FORMAT
+		" identity_source=origin_locked_before expected_key_matches_before=%d "
+		"system_identifier=" UINT64_FORMAT " key_format=%u owner_instance=%u origin_node=%u xid=%u "
+		"segment=%u segment_generation=%u slot=%u tt_wrap=%u cluster_epoch=%u "
+		"boot=" UINT64_FORMAT " formation=" UINT64_FORMAT " admission=" UINT64_FORMAT
+		" root_descriptor=" UINT64_FORMAT " root_id=" UINT64_FORMAT " root_generation=" UINT64_FORMAT
+		" actual_peer=%u actual_peer_boot=" UINT64_FORMAT " actual_peer_capability=%u "
+		"actual_peer_formation=" UINT64_FORMAT " actual_peer_admission=" UINT64_FORMAT
+		" before_state=%u after_state=%u before_grant=%u after_grant=%u "
+		"before_seal=" UINT64_FORMAT " after_seal=" UINT64_FORMAT
+		" before_touched=%u after_touched=%u before_dispatched=%u after_dispatched=%u "
+		"before_confirmed=%u after_confirmed=%u before_ack=%u after_ack=%u "
+		"before_request=" UINT64_FORMAT " after_request=" UINT64_FORMAT
+		" after_key_matches_before=%d after_row_zero=%d "
+		"input_ack_known=%d input_node=%u input_key_matches_before=%d "
+		"input_grant=%u input_seal=" UINT64_FORMAT " input_crc=%u consumer_subpredicate_known=0 "
+		"unsafe_skipped=" UINT64_FORMAT " partial_emit_possible=1 sequence_saturated=%d",
+		event, CtrcBatchReplyTraceSequence, cluster_node_id, (int)getpid(),
+		MyProc != NULL ? MyProc->pgprocno : -1, MyBackendType, GetCurrentTimestamp(), mono_us,
+		ordinal, count, sample->dispatch.request_id, sample->dispatch.suboperation,
+		sample->dispatch.participant.node_id, sample->dispatch.participant.boot_incarnation,
+		sample->dispatch.participant.capability_record_generation,
+		sample->dispatch.participant.formation_epoch, sample->dispatch.participant.admission_record_generation,
+		sample->dispatch.grant_generation, sample->dispatch.seal_generation, result,
+		sample->entry_called, sample->accepted, sample->progressed, sample->entry_progressed,
+		sample->pending_duplicate, sample->sample_known, sample->matched_count, sample->origin_index,
+		sample->sample_known && memcmp(key, &sample->dispatch.key, sizeof(*key)) == 0,
+		key->system_identifier, key->format_version, key->owner_instance, key->origin_node_id,
+		key->xid, key->segment_id, key->segment_generation, key->slot_offset, key->slot_wrap,
+		key->cluster_epoch, key->origin_boot_incarnation, key->formation_epoch,
+		key->admission_record_generation, key->root_descriptor_incarnation, key->root_id, key->root_generation,
+		peer->node_id, peer->boot_incarnation, peer->capability_record_generation,
+		peer->formation_epoch, peer->admission_record_generation,
+		before->state, after->state, before->grant, after->grant, before->seal, after->seal,
+		before->touched, after->touched, before->dispatched, after->dispatched,
+		before->confirmed, after->confirmed, before->ack, after->ack,
+		before->request, after->request, sample->after_same_key, sample->after_row_zero,
+		sample->input_ack_known, sample->input_node, sample->input_key_matches_before,
+		sample->input_grant, sample->input_seal, sample->input_crc,
+		CtrcBatchReplyTraceSkipped, CtrcBatchReplyTraceSequence == UINT64_MAX)));
+}
+#endif
+
 bool
 cluster_ctrc_origin_note_close_reply_shared(uint64 request_id, uint16 participant_node_id,
 											ClusterCtrcSealReplyResult result)
@@ -3530,12 +3690,22 @@ cluster_ctrc_origin_note_local_certificate_batch_shared(const ClusterCtrcCloseDi
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	CtrcOriginReplyLookup lookup;
+	bool trace = cluster_trace_normal_stop;
+	CtrcOriginBatchReplyTrace trace_items[CLUSTER_CTRC_RECLAIM_BATCH_MAX];
 	bool progress[CLUSTER_CTRC_RECLAIM_BATCH_MAX] = { false };
 
 	if (results == NULL
 		|| !ctrc_origin_reply_lookup_prepare(&lookup, dispatches, count,
 											 CTRC_SEAL_CERTIFICATE_COMMITTED))
 		return false;
+	if (trace) {
+		MemSet(trace_items, 0, sizeof(trace_items));
+		for (Size i = 0; i < count; i++) {
+			trace_items[i].dispatch = dispatches[i];
+			trace_items[i].reply_result = results[i];
+			trace_items[i].origin_index = UINT64_MAX;
+		}
+	}
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	ctrc_origin_reply_lookup_locked(&lookup, dispatches, 4);
 	/* A row has only one local request ID, so distinct inputs' match sets
@@ -3543,20 +3713,40 @@ cluster_ctrc_origin_note_local_certificate_batch_shared(const ClusterCtrcCloseDi
 	 * two duplicate rows, including its refusal to clear any such origin. */
 	for (Size i = 0; i < count; i++) {
 		bool progressed = false;
+		bool noted = false;
 
 		if (lookup.second[i] != UINT64_MAX) {
 			ctrc_origin_entries()[lookup.first[i]].state = CTRC_ORIGIN_BLOCKED;
 			ctrc_origin_entries()[lookup.second[i]].state = CTRC_ORIGIN_BLOCKED;
-		} else if (lookup.first[i] != UINT64_MAX)
-			progress[i] = ctrc_origin_note_certificate_match_locked(
+		} else if (lookup.first[i] != UINT64_MAX) {
+			if (trace) {
+				ctrc_origin_batch_trace_before(&trace_items[i], lookup.first[i],
+					&ctrc_origin_entries()[lookup.first[i]], (uint16)cluster_node_id);
+				trace_items[i].entry_called = true;
+			}
+			noted = ctrc_origin_note_certificate_match_locked(
 							  lookup.first[i], dispatches[i].request_id, (uint16)cluster_node_id,
-							  results[i], &progressed)
-						  && progressed;
+							  results[i], &progressed);
+			progress[i] = noted && progressed;
+			if (trace)
+				ctrc_origin_batch_trace_after(&trace_items[i],
+					&ctrc_origin_entries()[lookup.first[i]], (uint16)cluster_node_id);
+		}
+		if (trace) {
+			trace_items[i].accepted = noted;
+			trace_items[i].entry_progressed = progressed;
+			trace_items[i].progressed = progress[i];
+			if (lookup.second[i] != UINT64_MAX)
+				trace_items[i].matched_count = 2;
+		}
 	}
 	LWLockRelease(&CtrcShared->origin_lock);
 	for (Size i = 0; i < count; i++)
 		if (progress[i])
 			ctrc_semantic_progress(true);
+	if (trace)
+		for (Size i = 0; i < count; i++)
+			ctrc_origin_batch_reply_trace("local.certificate.reply", &trace_items[i], trace_items[i].reply_result, i, count);
 	return true;
 #else
 	(void)dispatches;
@@ -3584,6 +3774,8 @@ cluster_ctrc_origin_note_local_close_batch_shared(const ClusterCtrcCloseDispatch
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	CtrcOriginReplyLookup lookup;
+	bool trace = cluster_trace_normal_stop;
+	CtrcOriginBatchReplyTrace trace_items[CLUSTER_CTRC_RECLAIM_BATCH_MAX];
 	bool progress[CLUSTER_CTRC_RECLAIM_BATCH_MAX] = { false };
 	bool duplicate[CLUSTER_CTRC_RECLAIM_BATCH_MAX] = { false };
 	bool needs_lookup = false;
@@ -3593,6 +3785,14 @@ cluster_ctrc_origin_note_local_close_batch_shared(const ClusterCtrcCloseDispatch
 		return false;
 	for (Size i = 0; i < count; i++)
 		needs_lookup |= results[i] != CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK;
+	if (trace) {
+		MemSet(trace_items, 0, sizeof(trace_items));
+		for (Size i = 0; i < count; i++) {
+			trace_items[i].dispatch = dispatches[i];
+			trace_items[i].reply_result = results[i];
+			trace_items[i].origin_index = UINT64_MAX;
+		}
+	}
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	if (needs_lookup)
 		ctrc_origin_reply_lookup_locked(&lookup, dispatches, 5);
@@ -3600,15 +3800,32 @@ cluster_ctrc_origin_note_local_close_batch_shared(const ClusterCtrcCloseDispatch
 		bool noted = false;
 
 		if (results[i] == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK)
-			noted = ctrc_origin_ack_land_locked(dispatches[i].request_id, &acks[i], &progress[i]);
+			noted = ctrc_origin_ack_land_locked(dispatches[i].request_id, &acks[i], &progress[i],
+				trace ? &trace_items[i] : NULL);
 		else if (lookup.second[i] != UINT64_MAX) {
 			ctrc_origin_entries()[lookup.first[i]].state = CTRC_ORIGIN_BLOCKED;
 			ctrc_origin_entries()[lookup.second[i]].state = CTRC_ORIGIN_BLOCKED;
-		} else if (lookup.first[i] != UINT64_MAX)
+		} else if (lookup.first[i] != UINT64_MAX) {
+			if (trace) {
+				ctrc_origin_batch_trace_before(&trace_items[i], lookup.first[i],
+					&ctrc_origin_entries()[lookup.first[i]], (uint16)cluster_node_id);
+				trace_items[i].entry_called = true;
+			}
 			noted = ctrc_origin_note_close_match_locked(lookup.first[i], dispatches[i].request_id,
 														(uint16)cluster_node_id, results[i],
 														&progress[i]);
+			if (trace)
+				ctrc_origin_batch_trace_after(&trace_items[i],
+					&ctrc_origin_entries()[lookup.first[i]], (uint16)cluster_node_id);
+		}
 		duplicate[i] = noted && !progress[i] && results[i] == CTRC_SEAL_REPLY_PENDING_DRAIN;
+		if (trace) {
+			trace_items[i].accepted = noted;
+			trace_items[i].progressed = trace_items[i].entry_progressed = progress[i];
+			trace_items[i].pending_duplicate = duplicate[i];
+			if (results[i] != CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK && lookup.second[i] != UINT64_MAX)
+				trace_items[i].matched_count = 2;
+		}
 	}
 	LWLockRelease(&CtrcShared->origin_lock);
 	for (Size i = 0; i < count; i++) {
@@ -3617,6 +3834,9 @@ cluster_ctrc_origin_note_local_close_batch_shared(const ClusterCtrcCloseDispatch
 		else if (duplicate[i])
 			cluster_ctrc_stat_bump(CTRC_STAT_PENDING_DUPLICATE);
 	}
+	if (trace)
+		for (Size i = 0; i < count; i++)
+			ctrc_origin_batch_reply_trace("local.close.reply", &trace_items[i], trace_items[i].reply_result, i, count);
 	return true;
 #else
 	(void)dispatches;
@@ -6332,7 +6552,7 @@ cluster_ctrc_origin_ack_land_entry(ClusterCtrcOriginEntry *origin, uint64 reques
 #ifndef CLUSTER_CTRC_UNIT_TEST
 static bool
 ctrc_origin_ack_land_locked(uint64 request_id, const ClusterCtrcLocalReleaseAckV1 *ack,
-							bool *progressed)
+							bool *progressed, CtrcOriginBatchReplyTrace *trace)
 {
 	ClusterCtrcOriginEntry *origin;
 	uint64 origin_index;
@@ -6347,9 +6567,22 @@ ctrc_origin_ack_land_locked(uint64 request_id, const ClusterCtrcLocalReleaseAckV
 		return false;
 	origin = &ctrc_origin_entries()[origin_index];
 	ack_before = origin->ack_bitmap;
+	if (trace != NULL) {
+		ctrc_origin_batch_trace_before(trace, origin_index, origin, ack->participant_node_id);
+		trace->entry_called = true;
+		trace->input_ack_known = true;
+		trace->input_node = ack->participant_node_id;
+		trace->input_grant = ack->grant_generation;
+		trace->input_seal = ack->seal_generation;
+		trace->input_crc = ack->crc32c;
+		trace->input_key_matches_before
+			= memcmp(&origin->key, &ack->transaction_key, sizeof(origin->key)) == 0;
+	}
 	landed = cluster_ctrc_origin_ack_land_entry(origin, request_id, ack,
 												&ctrc_origin_ack_entries()[ack_index]);
 	*progressed = landed && ack_before != origin->ack_bitmap;
+	if (trace != NULL)
+		ctrc_origin_batch_trace_after(trace, origin, ack->participant_node_id);
 	return landed;
 }
 #endif
@@ -6374,7 +6607,7 @@ cluster_ctrc_origin_ack_land_shared(uint64 request_id, const ClusterCtrcLocalRel
 		trace_before = ctrc_origin_entries()[origin_index];
 		trace_input = *ack;
 	}
-	landed = ctrc_origin_ack_land_locked(request_id, ack, &progressed);
+	landed = ctrc_origin_ack_land_locked(request_id, ack, &progressed, NULL);
 	if (trace)
 		trace_after = ctrc_origin_entries()[origin_index];
 	LWLockRelease(&CtrcShared->origin_lock);
