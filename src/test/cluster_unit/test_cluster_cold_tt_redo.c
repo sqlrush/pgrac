@@ -8073,10 +8073,98 @@ UT_TEST(tt_top_tx_c0_derives_empty_effects_from_fresh_replay_bind)
 	}
 }
 
+UT_TEST(tt_top_tx_loser_producer_is_independent_of_c0_fields)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		TtRedoFixture f;
+		ClusterColdTtSlotInputV1 input;
+		ClusterColdTopTxProofV1 proof;
+		ClusterRecoveryTTAbortV1 shape;
+		ClusterColdTopTxLoserProducerResultV1 physical;
+		ClusterColdTopTxC0ProducerResultV1 c0, zero = { 0 };
+
+		tt_top_tx_initialized_fixture(&f, 200, 100, 2);
+		tt_top_tx_seal_bound(&f, 100);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &input));
+		f.typed.xid_next_after_redo = UINT64_C(0x700400200);
+		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+		proof.ordinary_effects = false; /* Require the real fresh empty proof. */
+		tt_top_tx_effects_complete(&f);
+		tt_top_tx_endpoints_complete(&f);
+		if (fault == 1)
+			f.typed.xid_next_after_redo = 0;
+		else if (fault == 2)
+			f.typed.xid_receipt.next_xid[0] = 0;
+		else if (fault == 3)
+			shape.writer_incarnation = 0;
+		UT_ASSERT(cluster_cold_typed_top_tx_loser_producer_v1(&f.typed, TT_C0_FENCE, 0,
+																&proof, &physical));
+		UT_ASSERT(memcmp(&physical.active.key, &input.key, sizeof(input.key)) == 0);
+		UT_ASSERT(memcmp(&physical.loser.key, &input.key, sizeof(input.key)) == 0);
+		UT_ASSERT(memcmp(&physical.before, &input.slot, sizeof(input.slot)) == 0);
+		memset(&c0, 0xa9, sizeof(c0));
+		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(
+			&f.typed, TT_C0_FENCE, 0, &proof, &shape, false, InvalidTransactionId,
+			fault == 4 ? UINT64_C(0x100000000) : UINT64_C(0x12345678), &c0), fault == 0);
+		if (fault != 0)
+			UT_ASSERT(memcmp(&c0, &zero, sizeof(c0)) == 0);
+		UT_ASSERT_EQ(physical.loser.key.xid, input.key.xid);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_top_tx_loser_producer_keeps_original_proof_gates)
+{
+	for (int fault = 0; fault < 9; fault++) {
+		TtRedoFixture f;
+		ClusterColdTtSlotInputV1 input;
+		ClusterColdTopTxProofV1 proof;
+		ClusterRecoveryTTAbortV1 shape;
+		ClusterColdTopTxLoserProducerResultV1 out, zero = { 0 };
+
+		tt_top_tx_initialized_fixture(&f, 200, 100, 2);
+		tt_top_tx_seal_bound(&f, 100);
+		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &input));
+		f.typed.xid_next_after_redo = UINT64_C(0x700400200);
+		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+		proof.ordinary_effects = false;
+		tt_top_tx_effects_complete(&f);
+		tt_top_tx_endpoints_complete(&f);
+		if (fault == 0)
+			f.typed.effects_receipt.plan = NULL;
+		else if (fault == 1)
+			f.typed.xid_receipt.plan = NULL;
+		else if (fault == 2)
+			f.typed.xid_receipt.sources[0].claim.claim_sha256[0] ^= 1;
+		else if (fault == 3)
+			tt_c0_owner_fail_at = tt_c0_owner_calls + 1;
+		else if (fault == 4)
+			tt_c0_isolation_fail_at = tt_c0_isolation_calls + 1;
+		else if (fault == 5)
+			proof.key.slot_wrap++;
+		else if (fault == 6)
+			proof.key.slot_offset = UINT16_MAX;
+		else if (fault == 7)
+			tt_c0_owner_fail_at = tt_c0_owner_calls + 2;
+		else
+			tt_c0_isolation_fail_at = tt_c0_isolation_calls + 2;
+		memset(&out, 0xa9, sizeof(out));
+		UT_ASSERT(!cluster_cold_typed_top_tx_loser_producer_v1(&f.typed, TT_C0_FENCE, 0,
+																 &proof, &out));
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		tt_c0_owner_fail_at = tt_c0_isolation_fail_at = 0;
+		tt_redo_destroy(&f);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(168);
+	UT_PLAN(170);
+	UT_RUN(tt_top_tx_loser_producer_is_independent_of_c0_fields);
+	UT_RUN(tt_top_tx_loser_producer_keeps_original_proof_gates);
 	UT_RUN(tt_after_redo_checks_canonical_active_undo_chain_input);
 	UT_RUN(tt_after_redo_checks_spill_active_undo_chain_input);
 	UT_RUN(tt_after_redo_checks_canonical_active_undo_head_input);

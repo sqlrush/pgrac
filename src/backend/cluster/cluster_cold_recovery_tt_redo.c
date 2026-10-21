@@ -1077,19 +1077,15 @@ cold_top_tx_checkpoint_base_v1(const ClusterColdTypedV1 *typed,
 }
 
 bool
-cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
-										 struct ClusterRecoveryFencePlan *fence, uint32 participant,
-										 const ClusterColdTopTxProofV1 *proof,
-										 const ClusterRecoveryTTAbortV1 *shape, bool has_oldest_xid,
-										 TransactionId oldest_xid, uint64 recoverer_epoch,
-										 ClusterColdTopTxC0ProducerResultV1 *out)
+cluster_cold_typed_top_tx_loser_producer_v1(
+	ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence, uint32 participant,
+	const ClusterColdTopTxProofV1 *proof, ClusterColdTopTxLoserProducerResultV1 *out)
 {
-	ClusterColdTopTxC0ProducerResultV1 result = { 0 };
+	ClusterColdTopTxLoserProducerResultV1 result = { 0 };
 	ClusterColdTopTxProofV1 qualified;
 	RfSideUndoHeaderImageV1 post_image, base_image;
 	ClusterColdTtSlotInputV1 post_slot;
 	uint32 post_segment_index;
-	uint64 next_xid;
 	bool checkpoint_base;
 
 	if (out == NULL)
@@ -1098,15 +1094,10 @@ cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
 	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK
 		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
 		|| typed->replay_count > typed->participant_count || participant >= typed->replay_count
-		|| proof == NULL || shape == NULL
+		|| proof == NULL || !cold_top_tx_key_valid_v1(&proof->key)
 		|| proof->key.owner_instance != typed->participants[participant].thread_id
-		|| !cluster_recovery_tt_abort_shape_valid_v1(shape)
-		|| shape->target_incarnation != typed->participants[participant].owner_incarnation
-		|| memcmp(shape->target_claim_sha256, typed->sources[participant].claim.claim_sha256,
-				  sizeof(shape->target_claim_sha256))
-			   != 0
 		|| !cold_top_tx_checkpoint_v1(typed, participant)
-		|| !cluster_cold_typed_xid_maximum_v1(typed, &next_xid)
+		|| !cluster_cold_typed_xid_sources_ready_v1(typed)
 		|| !cluster_cold_typed_effects_ready_v1(typed)
 		|| !cluster_cold_typed_sources_current_v1(typed, fence))
 		return false;
@@ -1180,12 +1171,8 @@ cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
 	qualified.old_writer_isolated
 		= cluster_cold_typed_old_writer_isolated_v1(typed, fence, participant);
 	result.active.key = post_slot.key;
-	if (!cluster_cold_top_tx_loser_v1(&result.active, &qualified, &result.loser)
-		|| !cluster_cold_top_tx_c0_v1(&result.loser, shape, next_xid, true, has_oldest_xid,
-									  oldest_xid, recoverer_epoch, &result.c0)
-		|| cluster_recovery_tt_abort_match_v1(&result.c0.record, post_slot.key.segment_generation,
-											  &post_slot.slot)
-			   != CLUSTER_RECOVERY_TT_ABORT_APPLY)
+	result.before = post_slot.slot;
+	if (!cluster_cold_top_tx_loser_v1(&result.active, &qualified, &result.loser))
 		return false;
 	/* The inventory may read additional UNDO blocks. Recheck every retained
 	 * physical input and original target isolation again before publishing
@@ -1193,6 +1180,45 @@ cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
 	if (cluster_cold_tt_after_redo_recheck_v1(typed) != CLUSTER_COLD_OK
 		|| !cluster_cold_typed_sources_current_v1(typed, fence)
 		|| !cluster_cold_typed_old_writer_isolated_v1(typed, fence, participant))
+		return false;
+	*out = result;
+	return true;
+}
+
+bool
+cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
+										 struct ClusterRecoveryFencePlan *fence, uint32 participant,
+										 const ClusterColdTopTxProofV1 *proof,
+										 const ClusterRecoveryTTAbortV1 *shape, bool has_oldest_xid,
+										 TransactionId oldest_xid, uint64 recoverer_epoch,
+										 ClusterColdTopTxC0ProducerResultV1 *out)
+{
+	ClusterColdTopTxLoserProducerResultV1 physical;
+	ClusterColdTopTxC0ProducerResultV1 result = { 0 };
+	uint64 next_xid;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->replay_count > typed->participant_count || participant >= typed->replay_count
+		|| proof == NULL || shape == NULL || !cluster_recovery_tt_abort_shape_valid_v1(shape)
+		|| shape->target_incarnation != typed->participants[participant].owner_incarnation
+		|| memcmp(shape->target_claim_sha256, typed->sources[participant].claim.claim_sha256,
+				  sizeof(shape->target_claim_sha256)) != 0
+		|| !cluster_cold_typed_xid_maximum_v1(typed, &next_xid)
+		|| !cluster_cold_typed_top_tx_loser_producer_v1(typed, fence, participant, proof, &physical))
+		return false;
+	result.active = physical.active;
+	result.loser = physical.loser;
+	/* Only pure field derivation follows the physical producer's final IO,
+	 * source and isolation rechecks. No stale pass-2 grant is exported. */
+	if (!cluster_cold_top_tx_c0_v1(&result.loser, shape, next_xid, true, has_oldest_xid,
+								  oldest_xid, recoverer_epoch, &result.c0)
+		|| cluster_recovery_tt_abort_match_v1(&result.c0.record,
+											  physical.active.key.segment_generation, &physical.before)
+			   != CLUSTER_RECOVERY_TT_ABORT_APPLY)
 		return false;
 	*out = result;
 	return true;

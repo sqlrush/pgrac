@@ -919,6 +919,10 @@ extern bool cluster_cold_data_readback_v1(ClusterColdTypedV1 *typed);
  * retained inputs; it does not reacquire a fence or revalidate disk sources. */
 extern bool cluster_cold_typed_xid_maximum_v1(const ClusterColdTypedV1 *typed, uint64 *next_xid);
 
+/* Original completion receipt's exact plan/source binding only. Numeric
+ * endpoints are separately required by xid_maximum for C0 derivation. */
+extern bool cluster_cold_typed_xid_sources_ready_v1(const ClusterColdTypedV1 *typed);
+
 extern ClusterColdTypedV1 *cluster_cold_typed_prepare_v1(struct ClusterRecoveryFencePlan *fence,
 														 uint16 own_thread, XLogRecPtr own_redo);
 extern void cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed);
@@ -1039,6 +1043,18 @@ typedef struct ClusterColdLoserIdentityV1 {
 	ClusterColdTtSlotKeyV1 key;
 } ClusterColdLoserIdentityV1;
 
+/* Read-only physical result, independent of any C0 writer/epoch/FullXid
+ * fields. The exact ACTIVE before-image is input, never a write grant. */
+typedef struct ClusterColdTopTxLoserProducerResultV1 {
+	ClusterColdTtActiveIdentityV1 active;
+	ClusterColdLoserIdentityV1 loser;
+	TTSlot before;
+} ClusterColdTopTxLoserProducerResultV1;
+
+extern bool cluster_cold_typed_top_tx_loser_producer_v1(
+	ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence, uint32 participant,
+	const ClusterColdTopTxProofV1 *proof, ClusterColdTopTxLoserProducerResultV1 *out);
+
 /* Attempt-local producer result.  The source owner supplies the proof and
  * shape; this value only records the exact post-redo physical fact, the
  * resulting loser key and the derived C0 fields.  It is never persisted. */
@@ -1076,7 +1092,10 @@ extern bool cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
 													  struct ClusterRecoveryFencePlan *fence,
 													  uint32 participant);
 
-/* Producer boundary for one original TT owner.  Locate the post-redo header
+/* Shared physical producer boundary for one original TT owner, also used by
+ * the C0 wrapper. The physical entry takes no C0 shape, epoch or numeric
+ * FullXid endpoint; it still requires the complete original source receipt.
+ * Locate the post-redo header
  * by physical owner/segment, require the complete ordinary TT/UNDO inventory
  * and all original sources, then verify the selected sealed fold and exact
  * slot before-image. Require this original owner's captured native checkpoint
@@ -1152,8 +1171,9 @@ extern bool cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
  * Target incarnation/claim remain bound to the original source.  A new
  * header with no original base requires the native full-image proof.
  * The original endpoint receipt must cover the unchanged complete source
- * set and agree with typed->xid_next_after_redo; a missing endpoint,
- * post-redo image, proof gate or exact shape refuses.
+ * set. The C0 wrapper additionally requires all numeric endpoints, their
+ * agreement with typed->xid_next_after_redo and the exact C0 shape. A missing
+ * post-redo image or physical proof gate refuses either entry.
  * No proof bit is synthesized from source-drained state, current epoch or
  * graph shape, and no old C0 replay consumer is called here. */
 extern bool cluster_cold_typed_top_tx_c0_producer_v1(
