@@ -175,6 +175,8 @@ def _read_capture(path):
                                                       enumerate(processes)
                                                       if process["pid"] == int(fields["pid"])]))
         result_nodes.append(dict(node_id=node["node_id"], declared_inventory=inventory,
+                                 file_ids={role: node[role] for role in
+                                           ("postgres", "config", "stderr", "inventory")},
                                  trace=trace, process_candidates=candidates))
     parse_status = ("REJECTED" if "REJECTED" in statuses else
                     "PARSED" if "PARSED" in statuses else "NOT_OBSERVED")

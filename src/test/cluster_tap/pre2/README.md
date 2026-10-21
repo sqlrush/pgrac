@@ -127,6 +127,56 @@ reader does not join processes, sort clocks or produce normalized workload
 events. All results retain `field_root=OPEN`, `identity_bound=false` and
 `ready_to_run=false`; a parsing exit code is not an acceptance verdict.
 
+### Workload producer-field projections
+
+Extract typed fields from a verified retained capture:
+
+```sh
+python3 src/test/cluster_tap/pre2/workload_evidence.py /path/to/capture/manifest.json > evidence.json
+python3 -m unittest discover -s src/test/cluster_tap/pre2 -p test_workload_evidence.py
+```
+
+This uses the manifest format above and preserves its file checks and raw trace
+output. Each node includes `file_ids` for its four retained file roles and a
+`producer_fields` entry for every parsed observation, in the original order.
+Each entry's `source` identifies the manifest hash, stderr file ID and hash,
+observation index, original line, byte offset, byte length and line hash.
+
+The supported projections are:
+
+| Family | Field groups |
+| --- | --- |
+| `READ_IMAGE` | Request scalars, full block tag, reply scalars |
+| `READ_IMAGE_HOP` | Forward/reply request scalars, known block tag, reply scalars |
+| `CTRC_RECEIPT` | Canonical transaction key, local reservation, target |
+| `CTRC_RECEIPT_LIFECYCLE` | Canonical key, reservation, target, handle, publication |
+| `CTRC_CONSUME` | Canonical key, handle, consume scalars, final target, consumed data target |
+
+Each group has `source_fields`, `raw_values`, `guards`, `missing`, `invalid`
+and `status`. `values` contains a complete typed group only when its status is
+`OBSERVED`. Missing components or a missing/false known flag yield `UNKNOWN`
+and empty `values`; malformed known flags or active scalar representations
+yield `INVALID`. Raw values remain available in either case. Numeric checks
+cover the formatter's decimal representation and range, not protocol validity.
+`OBSERVED` means values appeared in one local diagnostic projection; it does
+not establish a transaction identity, delivered request or retired receipt.
+
+Request and reply IDs remain distinct. Receipt handles do not become receipt
+proofs, and final targets remain separate from consumed data targets after a
+retarget. The legacy `CTRC_RECEIPT` domain remains absent (`null` in the
+projection). Repeated consume sequence numbers remain separate observations.
+Other parsed families have `status=UNSUPPORTED`; unhandled families and
+malformed records remain in the original trace output.
+
+The aggregate `projection_status` is `PROJECTED`, `PARTIAL`, `INVALID` or
+`NOT_OBSERVED`. Exit 0 means supported projections were read without a file,
+parser or scalar error, including partial projections. Exit 1 means one of
+those errors; exit 2 means no supported projection or an argument error.
+Results always retain `identity_bound=false`, `field_root=OPEN` and
+`ready_to_run=false`. Inventory candidates never fill missing producer fields.
+The adapter does not join lines, infer causal edges, produce contract events,
+seal barriers or supply STOP, authority, durability or workload credit.
+
 ### Read/image and HOT SQL operations
 
 `WorkloadSql.pm` uses four existing persistent `query_safe` sessions for node
