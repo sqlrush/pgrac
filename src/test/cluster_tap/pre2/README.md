@@ -84,7 +84,11 @@ my $driver = WorkloadSql->new(
     schema => 'read_hot_unique_run_name', # must not already exist
     emit => sub { print {$journal} JSON::PP->new->canonical->encode($_[0]), "\n"
                   or die "write SQL journal: $!"; },
-    between_lanes => sub { run_caller_owned_itt_barrier(); });
+    between_lanes => sub { run_caller_owned_itt_barrier(); },
+    receipt_barrier => sub {
+        my ($phase, $sql_facts) = @_;
+        capture_caller_owned_receipt_evidence($phase, $sql_facts);
+    });
 my $result = $driver->run();
 ```
 
@@ -92,10 +96,14 @@ Flush and retain the journal on every attempt, including exceptions. Configure
 each `PostgreSQL::Test::BackgroundPsql` session's finite timeout and call
 `set_query_timer_restart()` before use. The caller closes the sessions and
 performs its cluster shutdown and evidence collection even when `run()` dies.
-The module tries one `ROLLBACK` for each reader it opened, preserves cleanup
-errors with the original failure, and leaves both relations for inspection.
+The module tries one `ROLLBACK` for each reader it opened and any Q transaction
+without a COMMIT acknowledgement. It preserves original SQL, cleanup and
+journal errors together, and leaves all three relations for inspection.
 A failed connection can prevent cleanup acknowledgement; this is a failure,
-and the caller must retain it. The same driver object cannot be run twice.
+and the caller must retain it. A failed COMMIT has an unknown outcome; a later
+ROLLBACK attempt does not prove it was undone. COMMIT is never retried, and an
+acknowledged commit is recorded before journal emission can fail. The same
+driver object cannot be run twice.
 
 Node 0 mutates `r_img`, read by node 1; node 2 mutates the separate `h_hot`,
 read by node 3. Both readers hold read-only repeatable-read transactions.
@@ -107,14 +115,28 @@ all relation blocks. H operations include nonindexed-column updates, indexed
 key changes, deletes and VACUUM. Their actual HOT/prune/index-delete decisions
 and remote request/serve paths require independent producer LOG evidence.
 
+The separate `q_receipt` relation has one key, seeded before R mutations.
+After H, node 0 executes one ordinary `BEGIN`, reads its actual PostgreSQL full
+transaction ID, updates that key and sends `COMMIT` once. The journal retains
+the baseline locator/rows, full xid as an exact decimal string, mutation
+result and SQL commit acknowledgement. No `PREPARE TRANSACTION` is used.
+`receipt_barrier` is required and runs once with `before_commit` after the
+UPDATE, then once with `after_commit` after COMMIT acknowledgement and result
+journaling. It receives an owned snapshot of Q's SQL facts; its edits and
+return value cannot grant evidence credit. Keep capture work outside these
+four dedicated sessions and bound its duration. A hook exception fails the
+attempt and does not retry the hook or COMMIT.
+
 The journal retains SQL bytes, raw successful output, hashes, SQL identities
 and client-local sequences. Client sequences are not producer trace sequences;
 SQL identities lack procno/incarnation/request bindings. Counter snapshots are
 node-wide observations, not attribution to this workload. The between-lanes
-hook schedules caller-owned I/TT work; it does not validate that work. Q/receipt,
-run/build/config identity, producer LOG joins and stop seals remain caller
-responsibilities. Results retain `field_root=OPEN`, `trigger_status=UNBOUND`
-and `ready_to_run=false`, including when SQL rows match.
+hook schedules caller-owned I/TT work; it does not validate that work. A
+PostgreSQL full xid does not supply an ITL identity or receipt key. Actual
+pending undo, receipt preparation/ACK/retirement, run/build/config identity,
+producer LOG joins and stop seals remain caller responsibilities. Results
+retain `field_root=OPEN`, `trigger_status=UNBOUND`, `receipt_stop_seal=NOT_CHECKED`
+and `ready_to_run=false`, including when SQL rows match and COMMIT is acknowledged.
 
 The SQL-boundary unit test uses no database:
 

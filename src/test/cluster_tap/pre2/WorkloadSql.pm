@@ -24,26 +24,43 @@ sub new
 	  unless defined($args{schema}) && $args{schema} =~ /\A[a-z][a-z0-9_]{0,47}\z/;
 	die "journal emitter and between-lanes hook required\n"
 	  unless ref($args{emit}) eq 'CODE' && ref($args{between_lanes}) eq 'CODE';
+	die "receipt capture hook required\n" unless ref($args{receipt_barrier}) eq 'CODE';
 	return bless {%args, seq => [0, 0, 0, 0], open => {}, lanes => {}, identities => []}, $class;
+}
+
+sub _emit
+{
+	my ($self, $entry, $primary_error) = @_;
+	my $ok = eval { $self->{emit}->($entry); 1 };
+	if (!$ok)
+	{
+		my $error = $@ || "journal emitter failed\n";
+		die(($primary_error // '') . "journal emission ($entry->{kind}): $error");
+	}
 }
 
 sub _query
 {
-	my ($self, $node, $operation, $sql) = @_;
+	my ($self, $node, $operation, $sql, $on_success) = @_;
 	my $entry = {
 		kind => 'sql_result', node => $node, operation => $operation,
 		client_seq => ++$self->{seq}[$node], sql => $sql, sql_sha256 => sha256_hex($sql)};
 	$entry->{sql_identity} = $self->{identities}[$node] if $self->{identities}[$node];
 	my $output;
-	my $ok = eval { $output = $self->{sessions}[$node]->query_safe($sql); 1 };
+	my $ok = eval {
+		$output = $self->{sessions}[$node]->query_safe($sql);
+		die "undefined SQL output\n" unless defined($output);
+		1;
+	};
 	if (!$ok)
 	{
 		my $error = $@ || "SQL session failed\n";
-		$self->{emit}->({%{$entry}, kind => 'sql_error', error => $error});
+		$self->_emit({%{$entry}, kind => 'sql_error', error => $error}, $error);
 		die $error;
 	}
-	die "undefined SQL output\n" unless defined($output);
-	$self->{emit}->({%{$entry}, stdout => $output, stdout_sha256 => sha256_hex($output)});
+	# SQL acknowledgement precedes journaling, which can fail independently.
+	$on_success->() if $on_success;
+	$self->_emit({%{$entry}, stdout => $output, stdout_sha256 => sha256_hex($output)});
 	return $output;
 }
 
@@ -206,6 +223,47 @@ CROSS JOIN LATERAL cluster_cr_test_image('$table'::regclass, b, $scn)
 	$lane->{sql_comparison} = 'MATCH';
 }
 
+sub _create_receipt
+{
+	my ($self) = @_;
+	my $table = $self->_table('q_receipt');
+	$self->_query(0, 'create_receipt_relation', "CREATE TABLE $table (id integer PRIMARY KEY, v text)");
+	$self->_change(0, 'seed_receipt', "INSERT INTO $table VALUES (1, 'q_seed')", 1);
+	my $q = $self->{lanes}{'Q/RECEIPT'} = {
+		table => $table, writer => 0, key => {id => 1}, sql_identity => $self->{identities}[0],
+		locator => $self->_locator(0, $table), baseline => $self->_read(0, $table),
+		commit_status => 'NOT_SENT'};
+	die "Q baseline row comparison mismatch\n"
+	  unless $json->encode($q->{baseline}) eq $json->encode([{id => 1, v => 'q_seed'}]);
+	return $q;
+}
+
+sub _receipt_transaction
+{
+	my ($self, $q) = @_;
+	# BEGIN may have reached the server even when the client reports failure.
+	$self->{open}{0} = 1;
+	$self->_query(0, 'begin_receipt', 'BEGIN');
+	my $xid = $self->_json_query(0, 'receipt_full_xid', 'SELECT to_json(pg_current_xact_id()::text)');
+	die "invalid PostgreSQL full xid\n" unless defined($xid) && !ref($xid)
+	  && $xid =~ /\A[1-9][0-9]*\z/ && (length($xid) < 20
+	  || (length($xid) == 20 && $xid le '18446744073709551615'));
+	$q->{pg_full_xid} = $xid;
+	$q->{changed} = $self->_change(0, 'receipt_update',
+		"UPDATE $q->{table} SET v = 'q_committed' WHERE id = 1", 1);
+	die "Q mutation row comparison mismatch\n"
+	  unless $json->encode(_rows($q->{changed})) eq $json->encode([{id => 1, v => 'q_committed'}]);
+	# Pass owned snapshots; callback edits/return values cannot grant evidence.
+	$self->{receipt_barrier}->('before_commit', $json->decode($json->encode($q)));
+	$q->{commit_status} = 'UNKNOWN';
+	$self->_query(0, 'commit_receipt', 'COMMIT', sub {
+		$q->{commit_status} = 'ACKNOWLEDGED';
+		delete $self->{open}{0};
+	});
+	$self->{receipt_barrier}->('after_commit', $json->decode($json->encode($q)));
+	$self->_emit({kind => 'sql_lane_complete', lane => 'Q/RECEIPT', evidence => $q});
+}
+
 sub run
 {
 	my ($self) = @_;
@@ -240,11 +298,16 @@ sub run
 			  unless $json->encode($lane->{baseline}) eq $json->encode($expected);
 		}
 		my ($r, $h) = @{$self->{lanes}}{'R/IMG', 'H/HOT'};
-		die "lane relation collision\n" if $r->{locator}{relNumber} == $h->{locator}{relNumber}
-		  && $r->{locator}{spcOid} == $h->{locator}{spcOid};
+		my $q = $self->_create_receipt();
+		my %locators;
+		for my $lane ($r, $h, $q)
+		{
+			my $key = join '/', @{$lane->{locator}}{qw(spcOid dbOid relNumber forkNum)};
+			die "lane relation collision\n" if $locators{$key}++;
+		}
 		$self->_change(0, 'read_image_update', "UPDATE $r->{table} SET v = 'remote_' || id", 64);
 		$self->_compare($r);
-		$self->{emit}->({kind => 'sql_lane_complete', lane => 'R/IMG', evidence => $r});
+		$self->_emit({kind => 'sql_lane_complete', lane => 'R/IMG', evidence => $r});
 		# The caller owns the I/TT operations and their actual evidence seals.
 		$self->{between_lanes}->();
 		for my $pass (1 .. 3)
@@ -255,7 +318,8 @@ sub run
 		$self->_change(2, 'delete', "DELETE FROM $h->{table} WHERE id % 8 = 1", 8);
 		$self->_query(2, 'vacuum', "VACUUM $h->{table}");
 		$self->_compare($h);
-		$self->{emit}->({kind => 'sql_lane_complete', lane => 'H/HOT', evidence => $h});
+		$self->_emit({kind => 'sql_lane_complete', lane => 'H/HOT', evidence => $h});
+		$self->_receipt_transaction($q);
 		for my $node (0 .. 3)
 		{
 			die "SQL session identity changed\n" unless $json->encode($self->_identity($node))
@@ -266,17 +330,18 @@ sub run
 	my $error = $ok ? '' : ($@ || "SQL driver failed\n");
 	for my $node (sort keys %{$self->{open}})
 	{
-		my $clean = eval { $self->_query($node, 'release_reader', 'ROLLBACK'); 1 };
-		$error .= $@ || "reader cleanup failed\n" unless $clean;
+		my $operation = $node == 0 ? 'release_receipt' : 'release_reader';
+		my $clean = eval { $self->_query($node, $operation, 'ROLLBACK'); 1 };
+		$error .= $@ || "transaction cleanup failed\n" unless $clean;
 	}
 	if (length($error))
 	{
-		$self->{emit}->({kind => 'driver_error', error => $error, field_root => 'OPEN'});
+		$self->_emit({kind => 'driver_error', error => $error, field_root => 'OPEN'}, $error);
 		die $error;
 	}
 	my $result = {lanes => $self->{lanes}, field_root => 'OPEN', ready_to_run => JSON::PP::false,
 		trigger_status => 'UNBOUND', itt_owner => 'caller', receipt_stop_seal => 'NOT_CHECKED'};
-	$self->{emit}->({kind => 'sql_driver_complete', result => $result});
+	$self->_emit({kind => 'sql_driver_complete', result => $result});
 	return $result;
 }
 

@@ -27,7 +27,8 @@ sub seed_rows { return [map { +{id => $_, v => "seed_$_"} } 1 .. 64]; }
 		my ($self, $sql) = @_;
 		push @{$self->{calls}}, $sql;
 		my $n = $self->{node};
-		my $rows = main::seed_rows();
+		my $is_q = $sql =~ /"q_receipt"/;
+		my $rows = $is_q ? [{id => 1, v => 'q_seed'}] : main::seed_rows();
 		my $identity = {
 			node_id => $n, pid => 100 + $n, database_oid => 16384,
 			backend_start => '2026-10-21 10:00:00+08',
@@ -50,10 +51,16 @@ sub seed_rows { return [map { +{id => $_, v => "seed_$_"} } 1 .. 64]; }
 		}
 		if ($sql =~ /pg_relation_size/)
 		{
+			my $rel = $sql =~ /r_img/ || $self->{locator_collision} ? 501 : $is_q ? 503 : 502;
+			$rel = 501 if $is_q && $self->{q_locator_collision};
 			return $json->encode({spcOid => 1663, dbOid => 16384,
-				relNumber => $sql =~ /r_img/ || $self->{locator_collision} ? 501 : 502,
+				relNumber => $rel,
 				forkNum => 0, blocks => $self->{blocks} // 7,
-				path => $sql =~ /r_img/ ? 'base/16384/501' : 'base/16384/502'});
+				path => "base/16384/$rel"});
+		}
+		if ($sql =~ /pg_current_xact_id/)
+		{
+			return $json->encode(exists($self->{full_xid}) ? $self->{full_xid} : '18446744073709551614');
 		}
 		if ($sql =~ /pg_cluster_state/)
 		{
@@ -66,7 +73,10 @@ sub seed_rows { return [map { +{id => $_, v => "seed_$_"} } 1 .. 64]; }
 		}
 		if ($sql =~ /WITH changed AS/)
 		{
+			return undef if $is_q && $sql =~ /UPDATE/ && $self->{undefined_q_update};
+			die "injected Q mutation failure\n" if $is_q && $sql =~ /UPDATE/ && $self->{fail_q_update};
 			die "injected SQL failure\n" if $sql =~ /UPDATE/ && $self->{fail_update};
+			$rows->[0]{v} = 'q_committed' if $is_q && $sql =~ /UPDATE/;
 			$rows = [grep { $_->{id} % 4 == 0 } @{$rows}] if $sql =~ /id % 4 = 0/;
 			$rows = [grep { $_->{id} % 8 == 1 } @{$rows}] if $sql =~ /id % 8 = 1/;
 			return $json->encode([map { +{%$_, ctid => '(0,' . $_->{id} . ')'} } @{$rows}]);
@@ -76,8 +86,10 @@ sub seed_rows { return [map { +{id => $_, v => "seed_$_"} } 1 .. 64]; }
 			$rows = [] if $self->{empty_read};
 			return $json->encode($rows);
 		}
-		if ($sql =~ /\A(?:CREATE|BEGIN|ROLLBACK|VACUUM)/)
+		if ($sql =~ /\A(?:CREATE|BEGIN|COMMIT|ROLLBACK|VACUUM)/)
 		{
+			die "injected Q begin failure\n" if $sql eq 'BEGIN' && $self->{fail_q_begin};
+			die "injected commit failure\n" if $sql eq 'COMMIT' && $self->{fail_commit};
 			die "injected rollback failure\n" if $sql =~ /ROLLBACK/ && $self->{fail_rollback};
 			return '';
 		}
@@ -87,15 +99,22 @@ sub seed_rows { return [map { +{id => $_, v => "seed_$_"} } 1 .. 64]; }
 
 sub fixture
 {
-	my ($hook) = @_;
+	my ($hook, $receipt_hook, $emit) = @_;
 	my @sessions = map { bless {node => $_, calls => []}, 'SqlBoundary' } 0 .. 3;
 	my @journal;
+	my @receipt;
 	my $between = 0;
 	my $driver = WorkloadSql->new(
 		sessions => \@sessions, schema => 'read_hot_1',
-		emit => sub { push @journal, shift },
-		between_lanes => sub { $between++; $hook->() if $hook; });
-	return ($driver, \@sessions, \@journal, \$between);
+		emit => sub { my ($entry) = @_; push @journal, $entry; $emit->($entry) if $emit; },
+		between_lanes => sub { $between++; $hook->() if $hook; },
+		receipt_barrier => sub {
+			my ($phase, $evidence) = @_;
+			push @receipt, {phase => $phase, evidence => $json->decode($json->encode($evidence)),
+				commit_calls => scalar(grep { $_ eq 'COMMIT' } @{$sessions[0]{calls}})};
+			return $receipt_hook->($phase, $evidence) if $receipt_hook;
+		});
+	return ($driver, \@sessions, \@journal, \$between, \@receipt);
 }
 
 subtest 'real SQL operations retain exact snapshot and all FULL blocks' => sub {
@@ -193,6 +212,167 @@ subtest 'session replacement invalidates final SQL identity' => sub {
 	$sessions->[3]{reconnect} = 1;
 	ok(!eval { $driver->run(); 1 }, 'changed backend PID rejected');
 	like($@, qr/identity/, 'identity mismatch is explicit');
+};
+
+subtest 'Q uses a disjoint ordinary transaction and caller capture boundaries' => sub {
+	my ($driver, $sessions, $journal, undef, $receipt) = fixture(undef, sub {
+		my ($phase, $evidence) = @_;
+		$evidence->{pg_full_xid} = 'forged';
+		$evidence->{commit_status} = 'FORGED';
+		return {ready_to_run => JSON::PP::true, receipt_stop_seal => 'PASS'};
+	});
+	my $result = $driver->run();
+	my $q = $result->{lanes}{'Q/RECEIPT'} // {};
+	is($q->{pg_full_xid}, '18446744073709551614', 'actual full xid retained exactly above numeric precision limits');
+	is($q->{commit_status}, 'ACKNOWLEDGED', 'SQL commit acknowledgement retained');
+	is_deeply($q->{baseline}, [{id => 1, v => 'q_seed'}], 'independent Q baseline retained');
+	is_deeply($q->{changed}, [{id => 1, v => 'q_committed', ctid => '(0,1)'}], 'actual mutation result retained');
+	is_deeply([map { $_->{phase} } @{$receipt}], ['before_commit', 'after_commit'], 'capture hook runs once per boundary');
+	is_deeply([map { $_->{commit_calls} } @{$receipt}], [0, 1], 'capture brackets the one COMMIT');
+	is($receipt->[0]{evidence}{commit_status}, 'NOT_SENT', 'precommit snapshot claims no acknowledgement');
+	is($receipt->[1]{evidence}{commit_status}, 'ACKNOWLEDGED', 'postcommit snapshot retains SQL acknowledgement');
+	my @q_sql = grep { /"q_receipt"/ } @{$sessions->[0]{calls}};
+	ok(grep(/UPDATE .*WHERE id = 1/, @q_sql), 'Q mutates one deterministic key');
+	is(scalar(grep { $_ eq 'COMMIT' } @{$sessions->[0]{calls}}), 1, 'ordinary COMMIT once');
+	ok(!grep(/PREPARE TRANSACTION/, map { @{$_->{calls}} } @{$sessions}), 'no PostgreSQL two-phase transaction');
+	is(scalar(grep { $_ eq 'ROLLBACK' } @{$sessions->[0]{calls}}), 0, 'acknowledged transaction is not rolled back');
+	my @operations = map { $_->{operation} } grep { $_->{kind} eq 'sql_result' } @{$journal};
+	my ($q_begin) = grep { $operations[$_] eq 'begin_receipt' } 0 .. $#operations;
+	my ($vacuum) = grep { $operations[$_] eq 'vacuum' } 0 .. $#operations;
+	my ($q_seed) = grep { $operations[$_] eq 'seed_receipt' } 0 .. $#operations;
+	my ($r_update) = grep { $operations[$_] eq 'read_image_update' } 0 .. $#operations;
+	ok(defined($q_begin) && $q_begin > $vacuum, 'Q transaction follows H');
+	ok(defined($q_seed) && $q_seed < $r_update, 'Q seeded before workload mutations');
+	is($q->{locator}{relNumber}, 503, 'Q physical relation differs from R and H');
+	is($result->{receipt_stop_seal}, 'NOT_CHECKED', 'callback return cannot grant a receipt/stop seal');
+	is($result->{trigger_status}, 'UNBOUND', 'SQL xid does not supply ITL or receipt identity');
+	ok(!$result->{ready_to_run}, 'callback return cannot certify readiness');
+};
+
+subtest 'Q locator collision is refused before workload UPDATE' => sub {
+	my ($driver, $sessions) = fixture();
+	$sessions->[0]{q_locator_collision} = 1;
+	my $ok = eval { $driver->run(); 1 };
+	my $error = $@;
+	ok(!$ok, 'Q/R physical relation collision rejected');
+	like($error, qr/lane relation collision/, 'physical collision is explicit');
+	unlike(join('\n', map { @{$_->{calls}} } @{$sessions}), qr/UPDATE /, 'no workload mutation after collision');
+};
+
+subtest 'invalid Q full xid cannot be replaced with a derived identity' => sub {
+	for my $xid (undef, '0', '18446744073709551616', '7fake')
+	{
+		my ($driver, $sessions) = fixture();
+		$sessions->[0]{full_xid} = $xid;
+		my $ok = eval { $driver->run(); 1 };
+		my $error = $@;
+		ok(!$ok, 'invalid full xid rejected');
+		like($error, qr/invalid PostgreSQL full xid/, 'SQL identity refusal is explicit');
+		is(scalar(grep { $_ eq 'COMMIT' } @{$sessions->[0]{calls}}), 0, 'no COMMIT after invalid identity');
+		is(scalar(grep { $_ eq 'ROLLBACK' } @{$sessions->[0]{calls}}), 1, 'Q gets one cleanup attempt');
+	}
+};
+
+for my $phase (qw(before_commit after_commit))
+{
+	subtest "receipt capture failure at $phase is not retried" => sub {
+		my ($driver, $sessions, undef, undef, $receipt) = fixture(undef, sub {
+			my ($at) = @_;
+			die "capture $phase failed\n" if $at eq $phase;
+		});
+		my $ok = eval { $driver->run(); 1 };
+		my $error = $@;
+		ok(!$ok, 'capture failure rejects the attempt');
+		like($error, qr/capture $phase failed/, 'capture error retained');
+		my $committed = $phase eq 'after_commit' ? 1 : 0;
+		is(scalar(grep { $_ eq 'COMMIT' } @{$sessions->[0]{calls}}), $committed, 'no COMMIT retry');
+		is(scalar(grep { $_ eq 'ROLLBACK' } @{$sessions->[0]{calls}}), 1 - $committed,
+			'only an unacknowledged Q transaction gets cleanup');
+		for my $node (1, 3)
+		{
+			is(scalar(grep { $_ eq 'ROLLBACK' } @{$sessions->[$node]{calls}}), 1, 'held reader cleaned once');
+		}
+		is(scalar(grep { $_->{phase} eq $phase } @{$receipt}), 1, 'failing capture runs once');
+		ok(!eval { $driver->run(); 1 }, 'failed attempt stays consumed');
+	};
+}
+
+for my $failure (qw(fail_q_begin fail_q_update fail_commit))
+{
+	subtest "Q SQL failure: $failure" => sub {
+		my ($driver, $sessions, $journal, undef, $receipt) = fixture();
+		$sessions->[0]{$failure} = 1;
+		my $ok = eval { $driver->run(); 1 };
+		my $error = $@;
+		ok(!$ok, 'Q failure rejects attempt');
+		like($error, qr/injected (?:Q begin|Q mutation|commit) failure/, 'original SQL failure retained');
+		is(scalar(grep { $_ eq 'COMMIT' } @{$sessions->[0]{calls}}), $failure eq 'fail_commit' ? 1 : 0,
+			'COMMIT sent at most once');
+		for my $node (0, 1, 3)
+		{
+			is(scalar(grep { $_ eq 'ROLLBACK' } @{$sessions->[$node]{calls}}), 1, 'open transaction gets one cleanup attempt');
+		}
+		is(scalar(grep { $_->{phase} eq 'after_commit' } @{$receipt}), 0, 'no postcommit acknowledgement capture');
+		ok(grep($_->{kind} eq 'sql_error', @{$journal}), 'failed SQL retained');
+	};
+}
+
+subtest 'SQL, rollback and aggregate errors survive a throwing journal' => sub {
+	my ($driver, $sessions) = fixture(undef, undef, sub {
+		my ($entry) = @_;
+		die "journal $entry->{kind} failed\n" if $entry->{kind} eq 'sql_error' || $entry->{kind} eq 'driver_error';
+	});
+	$sessions->[2]{fail_update} = 1;
+	$sessions->[3]{fail_rollback} = 1;
+	my $ok = eval { $driver->run(); 1 };
+	my $error = $@;
+	ok(!$ok, 'journal error does not turn failure into success');
+	like($error, qr/injected SQL failure/, 'original SQL error survives');
+	like($error, qr/injected rollback failure/, 'cleanup error survives');
+	like($error, qr/journal sql_error failed/, 'SQL error journal failure survives');
+	like($error, qr/journal driver_error failed/, 'aggregate journal failure survives');
+	for my $node (1, 3)
+	{
+		is(scalar(grep { $_ eq 'ROLLBACK' } @{$sessions->[$node]{calls}}), 1, 'cleanup still attempted once');
+	}
+};
+
+subtest 'undefined SQL output retains its SQL error entry' => sub {
+	my ($driver, $sessions, $journal) = fixture();
+	$sessions->[0]{undefined_q_update} = 1;
+	my $ok = eval { $driver->run(); 1 };
+	my $error = $@;
+	ok(!$ok, 'undefined output fails');
+	like($error, qr/undefined SQL output/, 'undefined output error retained');
+	ok(grep($_->{kind} eq 'sql_error' && $_->{operation} eq 'receipt_update', @{$journal}), 'failed query retained in journal');
+	is(scalar(grep { $_ eq 'COMMIT' } @{$sessions->[0]{calls}}), 0, 'no COMMIT after missing output');
+};
+
+subtest 'COMMIT acknowledgement precedes a failing result journal' => sub {
+	my ($driver, $sessions, $journal) = fixture(undef, undef, sub {
+		my ($entry) = @_;
+		die "commit journal unavailable\n" if $entry->{kind} eq 'sql_result' && $entry->{operation} eq 'commit_receipt';
+	});
+	my $ok = eval { $driver->run(); 1 };
+	my $error = $@;
+	ok(!$ok, 'journal failure rejects attempt after SQL commit');
+	like($error, qr/commit journal unavailable/, 'journal failure retained');
+	is(scalar(grep { $_ eq 'COMMIT' } @{$sessions->[0]{calls}}), 1, 'COMMIT once');
+	is(scalar(grep { $_ eq 'ROLLBACK' } @{$sessions->[0]{calls}}), 0, 'does not claim rollback of acknowledged commit');
+	for my $node (1, 3)
+	{
+		is(scalar(grep { $_ eq 'ROLLBACK' } @{$sessions->[$node]{calls}}), 1, 'reader still cleaned once');
+	}
+};
+
+subtest 'receipt capture hook is required before any SQL' => sub {
+	my @sessions = map { bless {node => $_, calls => []}, 'SqlBoundary' } 0 .. 3;
+	my $ok = eval { WorkloadSql->new(sessions => \@sessions, schema => 'valid_schema',
+		emit => sub {}, between_lanes => sub {}); 1 };
+	my $error = $@;
+	ok(!$ok, 'absent capture hook rejected');
+	like($error, qr/receipt.*hook/, 'missing capture boundary explicit');
+	is(scalar(map { @{$_->{calls}} } @sessions), 0, 'no SQL sent');
 };
 
 subtest 'unsafe schema is rejected before SQL' => sub {
