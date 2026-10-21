@@ -76,6 +76,7 @@
 #include "cluster/cluster_update_trace.h"
 #include "cluster/cluster_tx_identity_trace.h"
 #include "cluster/cluster_wait_trace.h"
+#include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_xnode_lever.h" /* spec-6.12a — downgrade counters */
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_guc.h"
@@ -10168,11 +10169,13 @@ gcs_block_resource_x_source_finish_owned(
 	if (finish_result != CLUSTER_PCM_OWN_OK || retained.pcm_state != (uint8)PCM_STATE_N
 		|| retained.generation != image->body.image_envelope.source_carrier_generation) {
 		ClusterWaitTrace trace;
+		ClusterContentTraceCut content_cut = { 0 };
 		ResourceXApplyResult refusal_result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 
 		gcs_block_pcm_trace_guard_capture(&trace, CLWAIT_SITE_PCM_SOURCE_FINISH,
 			&block->common, NULL, authenticated_master_node, writer_r4_generation, &revoking,
 			gcs_block_pcm_trace_refusal(&finish_refusal), finish_result, &finish_refusal);
+		cluster_content_trace_capture(&block->common.logical_assertion.resource, &content_cut);
 		/* Only a proved, reversible refusal may hand the continuous
 		 * service pin to the exact shared owner. No callback cleanup may run
 		 * after APPLIED: a winning LMS claim can already own its release. */
@@ -10245,6 +10248,7 @@ source_finish_refusal_done:
 		 * or the original fail-closed unwind has released our obligations. */
 		if (trace.snapshot != 0)
 			cluster_wait_trace_emit(CLWAIT_PCM_GUARD, &trace);
+		cluster_content_trace_emit(&trace, &content_cut);
 		return refusal_result;
 	}
 	if (target_x_drop) {
@@ -10297,6 +10301,7 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 	ClusterPcmOwnResult own_result;
 	ClusterPcmOwnSourcePrepareRefusal source_prepare_refusal;
 	ClusterWaitTrace retained_drain_trace = { 0 };
+	ClusterContentTraceCut retained_content_cut = { 0 };
 	ClusterPcmOwnSnapshot current;
 	ClusterPcmOwnSnapshot revoking;
 	ResourceXGateSnapshot resource_gate;
@@ -10656,6 +10661,9 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 				CLWAIT_SITE_PCM_RETAINED_DRAIN, &block->common, NULL,
 				resource_master_node, writer_r4_generation, &revoking,
 				gcs_block_pcm_trace_refusal(&drain_refusal), own_result, &drain_refusal);
+		if (own_result != CLUSTER_PCM_OWN_OK)
+			cluster_content_trace_capture(&block->common.logical_assertion.resource,
+									   &retained_content_cut);
 		if (own_result == CLUSTER_PCM_OWN_BUSY) {
 			/* Do not wait in LMON: the pre-existing content-S holder may be
 			 * waiting for this same event loop to deliver a visibility reply.
@@ -10901,6 +10909,7 @@ pre_retained_done:
 	 * cannot skip the original abort/unpin and exact owner yield/release. */
 	if (retained_drain_trace.snapshot != 0)
 		cluster_wait_trace_emit(CLWAIT_PCM_GUARD, &retained_drain_trace);
+	cluster_content_trace_emit(&retained_drain_trace, &retained_content_cut);
 	return failure_result;
 }
 

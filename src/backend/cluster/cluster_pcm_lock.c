@@ -44,6 +44,7 @@
 #include "cluster/cluster_grd.h" /* PGRAC: spec-2.30 D1 — ClusterGrdHolderId 24B */
 #include "cluster/cluster_guc.h" /* PGRAC: spec-2.30 D3 — cluster_node_id */
 #include "cluster/cluster_wait_trace.h"
+#include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_gcs.h" /* PGRAC: spec-2.32 D5 — master lookup + send_transition_and_wait */
 #include "cluster/cluster_gcs_block.h" /* PGRAC: spec-2.33 D7 — send_block_request_and_wait */
 #include "cluster/cluster_inject.h"
@@ -5123,6 +5124,7 @@ pcm_entry_wait_context_cancel_wait(PcmEntryWaitContext *context)
 	}
 	if (context->wait_registered)
 		pcm_entry_wait_ref_end(context);
+	cluster_content_trace_wait_clear(CLCONTENT_PCM);
 }
 
 static void
@@ -5333,6 +5335,7 @@ cluster_pcm_lock_resource_x_executor_wait_exact(const ResourceXAcquisitionRef *r
 				-1, ref->assertion.requester_node, 0, false, false, NULL);
 		(void)ConditionVariableTimedSleep(&entry->wait_cv, timeout_ms,
 										  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+	cluster_content_trace_wait_clear(CLCONTENT_PCM);
 		if (!pcm_entry_ref_identity_exact(&pcm_resource_x_executor_wait_context.ref)) {
 			pcm_resource_x_reconfig_block();
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
@@ -7865,6 +7868,7 @@ pcm_lock_acquire_local_pinned(BufferTag tag, PcmLockMode mode, PcmAuthoritySnaps
 			pcm_trace_wait(entry, CLWAIT_SITE_PCM_COMPATIBLE, mode, -1,
 				cluster_node_id, 0, false, false, NULL);
 		ConditionVariableSleep(&entry->wait_cv, WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+		cluster_content_trace_wait_clear(CLCONTENT_PCM);
 		if (!pcm_entry_ref_identity_exact(&wait_context->ref)) {
 			pcm_resource_x_reconfig_block();
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
@@ -10363,8 +10367,6 @@ pcm_trace_wait(struct GrdEntry *entry, ClusterWaitTraceSite site, PcmLockMode mo
 	if (wait_request != NULL)
 		row = *wait_request;
 	row.snapshot = cluster_wait_trace_begin(kind);
-	if (row.snapshot == 0)
-		return;
 	row.site = site;
 	row.mode = mode;
 	if (wait_request == NULL) {
@@ -10381,6 +10383,10 @@ pcm_trace_wait(struct GrdEntry *entry, ClusterWaitTraceSite site, PcmLockMode mo
 	row.tag = entry->tag;
 	row.tag_known = true;
 	row.binding = entry->binding_generation;
+	if (!master_view)
+		cluster_content_trace_wait_set(CLCONTENT_PCM, &row);
+	if (row.snapshot == 0)
+		return;
 	if (!LWLockConditionalAcquire(&entry->entry_lock.lock, LW_SHARED))
 		goto emit;
 	row.entry_known = true;
@@ -15750,6 +15756,7 @@ round_wait_predicate_done:
 				current_master_node, assertion->requester_node, observed_attempt, true, false, &wait_request);
 		(void)ConditionVariableTimedSleep(&entry->wait_cv, timeout_ms,
 										  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+	cluster_content_trace_wait_clear(CLCONTENT_PCM);
 		if (!pcm_entry_ref_identity_exact(&wait_context.ref)) {
 			pcm_resource_x_reconfig_block();
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
@@ -15914,6 +15921,7 @@ cluster_pcm_lock_resource_x_predecessor_wait_exact(const BufferTag *tag, int32 c
 				current_master_node, cluster_node_id, 0, false, false, &wait_request);
 		(void)ConditionVariableTimedSleep(&entry->wait_cv, timeout_ms,
 										  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+		cluster_content_trace_wait_clear(CLCONTENT_PCM);
 		if (!pcm_entry_ref_identity_exact(&wait_context.ref)) {
 			pcm_resource_x_reconfig_block();
 			ereport(ERROR,
@@ -17151,6 +17159,7 @@ cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
 				continuation->master_node, continuation->requester_node, 0, false, false, &wait_request);
 		(void)ConditionVariableTimedSleep(&entry->wait_cv, sleep_ms,
 										  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+	cluster_content_trace_wait_clear(CLCONTENT_PCM);
 		if (!pcm_entry_ref_identity_exact(&wait_context.ref)) {
 			pcm_resource_x_reconfig_block();
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),

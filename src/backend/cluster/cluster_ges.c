@@ -55,6 +55,7 @@
 #include "cluster/cluster_native_lock_probe.h" /* spec-2.25 D5 — probe protocol handlers */
 #include "cluster/cluster_grd_work_queue.h"
 #include "cluster/cluster_wait_trace.h"
+#include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_guc.h"		   /* cluster_node_id + cluster_ges_request_timeout_ms */
 #include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 class 1 */
 #include "cluster/cluster_wal_retention.h" /* RF-ROOT P6 WALR conditional convert */
@@ -2668,6 +2669,9 @@ ges_timed_sleep(ConditionVariable *cv, long timeout_ms, uint32 wait_event,
 		cluster_buffer_trace_tx_wait(CLWAIT_SITE_GES_TX, ges_local_wait_seq(),
 								 resid->field1, request_id);
 	timed_out = ConditionVariableTimedSleep(cv, timeout_ms, wait_event);
+#ifdef USE_PGRAC_CLUSTER
+	cluster_content_trace_wait_clear(CLCONTENT_TX);
+#endif
 	if (AmStartupProcess() && !proc_exit_inprogress)
 		HandleStartupProcInterrupts();
 	return timed_out;

@@ -66,6 +66,7 @@
 #include "cluster/cluster_grd.h"		/* existing block-path fail-closed counter */
 #include "cluster/cluster_guc.h"		/* spec-4.7a D2 — cluster_gcs_block_local_cache */
 #include "cluster/cluster_wait_trace.h"
+#include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_block_recovery.h" /* spec-4.10 D1 — online block recovery */
 #include "cluster/cluster_conf.h"			/* spec-5.7 HW — cluster_conf_node_count */
 #include "cluster/cluster_hw.h"				/* spec-5.7 HW — relation-extend authority */
@@ -4733,8 +4734,6 @@ cluster_buffer_trace_tx_wait(ClusterWaitTraceSite site, uint64 wait_seq,
 	if (!cluster_trace_tx_identity)
 		return;
 	summary.snapshot = cluster_wait_trace_begin(CLWAIT_TX_SUMMARY);
-	if (summary.snapshot == 0)
-		return;
 	summary.site = site;
 	summary.wait_seq = wait_seq;
 	summary.tx_xid = tx_xid;
@@ -4803,6 +4802,9 @@ cluster_buffer_trace_tx_wait(ClusterWaitTraceSite site, uint64 wait_seq,
 		for (int i = 0; i < NLocBuffer; i++)
 			summary.local_pins += LocalRefCount[i];
 	summary.rows = rows;
+	cluster_content_trace_wait_set(CLCONTENT_TX, &summary);
+	if (summary.snapshot == 0)
+		return;
 	cluster_wait_trace_emit(CLWAIT_TX_SUMMARY, &summary);
 }
 #endif

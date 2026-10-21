@@ -59,6 +59,7 @@
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_tx_identity_trace.h"
 #include "cluster/cluster_wait_trace.h"
+#include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_tx_enqueue.h"
 #include "cluster/cluster_xnode_profile.h" /* diagnostic wait phase trace */
 
@@ -253,6 +254,7 @@ txw_slot_clear(int procno, uint32 expected_kind)
 	current_kind = ClusterTxw->slots[procno].waiting;
 	if (current_kind == CLUSTER_TXW_SLOT_FREE) {
 		LWLockRelease(&ClusterTxw->lock);
+		cluster_content_trace_wait_clear(CLCONTENT_TX);
 		return;
 	}
 	if (current_kind != expected_kind) {
@@ -267,6 +269,7 @@ txw_slot_clear(int procno, uint32 expected_kind)
 	ClusterTxw->slots[procno].waiting = CLUSTER_TXW_SLOT_FREE;
 	pg_atomic_fetch_sub_u32(&ClusterTxw->active_waiters, 1);
 	LWLockRelease(&ClusterTxw->lock);
+	cluster_content_trace_wait_clear(CLCONTENT_TX);
 }
 
 static uint32

@@ -31,6 +31,7 @@
 #include "access/htup_details.h"
 #include "access/visibilitymap.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_hw_lease.h"	/* PGRAC: spec-6.12d lease consume */
 #include "cluster/cluster_mode.h"
@@ -93,11 +94,17 @@ cluster_hio_lock_buffer_pair(Buffer first, Buffer second)
 	{
 		LockBuffer(first, BUFFER_LOCK_EXCLUSIVE);
 		if (ConditionalLockBuffer(second))
+		{
+			cluster_content_trace_pair(second, false);
+			cluster_content_trace_wait_clear(CLCONTENT_PAIR);
 			return;
+		}
 
+		cluster_content_trace_pair(second, true);
 		LockBuffer(first, BUFFER_LOCK_UNLOCK);
 		LockBuffer(second, BUFFER_LOCK_EXCLUSIVE);
 		LockBuffer(second, BUFFER_LOCK_UNLOCK);
+		cluster_content_trace_wait_clear(CLCONTENT_PAIR);
 	}
 }
 

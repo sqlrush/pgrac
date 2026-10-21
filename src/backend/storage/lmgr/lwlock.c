@@ -90,6 +90,9 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_content_trace.h"
+#endif
 
 #include "miscadmin.h"
 #include "pg_trace.h"
@@ -1396,6 +1399,9 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 	/* Add lock to list of locks held by this backend */
 	held_lwlocks[num_held_lwlocks].lock = lock;
 	held_lwlocks[num_held_lwlocks++].mode = mode;
+#ifdef USE_PGRAC_CLUSTER
+	cluster_content_trace_lock_changed(lock);
+#endif
 
 	/*
 	 * Fix the process wait semaphore's count for any absorbed wakeups.
@@ -1447,6 +1453,9 @@ LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
 		/* Add lock to list of locks held by this backend */
 		held_lwlocks[num_held_lwlocks].lock = lock;
 		held_lwlocks[num_held_lwlocks++].mode = mode;
+#ifdef USE_PGRAC_CLUSTER
+		cluster_content_trace_lock_changed(lock);
+#endif
 		if (TRACE_POSTGRESQL_LWLOCK_CONDACQUIRE_ENABLED())
 			TRACE_POSTGRESQL_LWLOCK_CONDACQUIRE(T_NAME(lock), mode);
 	}
@@ -1573,6 +1582,9 @@ LWLockAcquireOrWait(LWLock *lock, LWLockMode mode)
 		/* Add lock to list of locks held by this backend */
 		held_lwlocks[num_held_lwlocks].lock = lock;
 		held_lwlocks[num_held_lwlocks++].mode = mode;
+#ifdef USE_PGRAC_CLUSTER
+		cluster_content_trace_lock_changed(lock);
+#endif
 		if (TRACE_POSTGRESQL_LWLOCK_ACQUIRE_OR_WAIT_ENABLED())
 			TRACE_POSTGRESQL_LWLOCK_ACQUIRE_OR_WAIT(T_NAME(lock), mode);
 	}
@@ -1896,6 +1908,10 @@ LWLockRelease(LWLock *lock)
 		LWLockWakeup(lock);
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	cluster_content_trace_lock_changed(lock);
+#endif
+
 	/*
 	 * Now okay to allow cancel/die interrupts.
 	 */
@@ -1945,6 +1961,9 @@ LWLockReleaseAll(void)
 	}
 
 	Assert(num_held_lwlocks == 0);
+#ifdef USE_PGRAC_CLUSTER
+	cluster_content_trace_error_cleanup();
+#endif
 }
 
 
