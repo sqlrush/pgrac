@@ -214,6 +214,7 @@ TESTS += test_cluster_undo_header_durability
 TESTS += test_cluster_tt_2pc_finish
 TESTS += test_cluster_tt_rollback_entry
 TESTS += test_cluster_cr_native_origin test_cluster_cr_mvcc_origin
+TESTS += test_cluster_resident_record_batch
 # Keep registration before all expands its prerequisite list.
 TESTS += test_cluster_pcm_aux_consumer test_cluster_pcm_aux_reobserve test_cluster_resource_x_terminal_ingress
 TESTS += test_cluster_pcm_aux_mutation test_cluster_heap_extend_current
@@ -434,6 +435,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_buffer_cr test_cluster_buffer_mapping 
 SIMPLE_TESTS := $(filter-out test_cluster_pi_contribution_stream,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_prepare_diagnostic,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_horizon,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_resident_record_batch,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_tt_terminal_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_pacemaker test_pgrac_fenced_cib,$(SIMPLE_TESTS))
@@ -6308,6 +6310,15 @@ $(CLUSTER_R4_CR_WALK_TEST_O): test_cluster_r4_cr_walk_product.c \
 		$(top_srcdir)/src/include/cluster/cluster_cr.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_record.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_resident_record_batch: test_cluster_resident_record_batch.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_cr.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_uba.h \
+		$(CLUSTER_R4_CR_WALK_TEST_O) $(CLUSTER_UBA_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_R4_CR_WALK_TEST_O) \
+		$(CLUSTER_UBA_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_r4_cr_walk: test_cluster_r4_cr_walk.c unit_test.h \
 		test_cluster_hot_bufpage_product.o \

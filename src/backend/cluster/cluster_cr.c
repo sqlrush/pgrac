@@ -463,56 +463,88 @@ cr_r4_canonical_record_locator(const ClusterTxLocator *request, UBA record_uba,
 }
 
 bool
+cluster_cr_r4_prepare_resident_records(const char resident_undo_page[BLCKSZ],
+									 const ClusterTxLocator *request_locators,
+									 uint32 request_count, ClusterR4ResidentRecordBatch *out)
+{
+	UndoBlockHeader header;
+	ClusterR4ResidentRecordBatch candidate;
+	uint32 batch_segment = 0;
+	uint32 batch_block = 0;
+	uint32 slot_dir_low;
+	uint32 i;
+
+	if (resident_undo_page == NULL || request_locators == NULL || out == NULL
+		|| request_count == 0 || request_count > CLUSTER_R4_RESIDENT_RECORD_BATCH_MAX)
+		return false;
+	memcpy(&header, resident_undo_page, sizeof(header));
+	if (header.magic != PGRAC_UNDO_BLOCK_MAGIC
+		|| header.block_version != UNDO_BLOCK_VERSION_1 || header.slot_count == 0
+		|| header.slot_count > (BLCKSZ - sizeof(UndoBlockHeader)) / sizeof(UndoSlotDirEntry))
+		return false;
+	slot_dir_low = BLCKSZ - (uint32)header.slot_count * sizeof(UndoSlotDirEntry);
+	if (header.free_offset < sizeof(UndoBlockHeader) || header.free_offset > slot_dir_low)
+		return false;
+
+	memset(&candidate, 0, sizeof(candidate));
+	for (i = 0; i < request_count; i++) {
+		const ClusterTxLocator *request = &request_locators[i];
+		ClusterR4ResidentRecord *record = &candidate.records[i];
+		UndoSlotDirEntry slot;
+		uint32 segment_id;
+		uint32 block_no;
+		uint16 tt_slot_offset;
+		uint16 row_offset;
+
+		if (!uba_decode(request->uba, &segment_id, &block_no, &tt_slot_offset, &row_offset)
+			|| block_no == 0 || row_offset >= header.slot_count)
+			return false;
+		if (i == 0) {
+			batch_segment = segment_id;
+			batch_block = block_no;
+		} else if (segment_id != batch_segment || block_no != batch_block)
+			return false;
+
+		memcpy(&slot,
+			   resident_undo_page + BLCKSZ - ((uint32)row_offset + 1) * sizeof(UndoSlotDirEntry),
+			   sizeof(slot));
+		if (slot.record_offset < sizeof(UndoBlockHeader)
+			|| slot.record_length < sizeof(UndoRecordHeader)
+			|| slot.record_offset > header.free_offset
+			|| slot.record_length > header.free_offset - slot.record_offset)
+			return false;
+		memcpy(&record->header, resident_undo_page + slot.record_offset, sizeof(record->header));
+		if (slot.record_type != record->header.record_type || slot.flags != record->header.flags
+			|| slot.record_length != sizeof(UndoRecordHeader) + (size_t)record->header.payload_length
+			|| !cr_r4_canonical_record_locator(request, request->uba, &record->header,
+												 &record->canonical_locator))
+			return false;
+		record->record_offset = slot.record_offset;
+		record->record_length = slot.record_length;
+	}
+	candidate.count = request_count;
+	memcpy(out, &candidate, sizeof(candidate));
+	return true;
+}
+
+bool
 cluster_cr_r4_extract_resident_record(const char resident_undo_page[BLCKSZ],
 									  const ClusterTxLocator *request_locator,
 									  char record_out[BLCKSZ], size_t *record_length_out,
 									  ClusterTxLocator *canonical_locator_out)
 {
-	const UndoBlockHeader *header;
-	const UndoSlotDirEntry *slot;
-	const UndoRecordHeader *record;
-	PGAlignedBlock candidate_record;
-	ClusterTxLocator canonical_locator;
-	uint32 segment_id;
-	uint32 block_no;
-	uint32 slot_dir_low;
-	uint16 tt_slot_offset;
-	uint16 row_offset;
-	size_t record_length;
+	ClusterR4ResidentRecordBatch batch;
+	const ClusterR4ResidentRecord *record;
 
 	if (resident_undo_page == NULL || request_locator == NULL || record_out == NULL
 		|| record_length_out == NULL || canonical_locator_out == NULL)
 		return false;
-	header = (const UndoBlockHeader *)resident_undo_page;
-	if (!uba_decode(request_locator->uba, &segment_id, &block_no, &tt_slot_offset, &row_offset)
-		|| block_no == 0 || header->magic != PGRAC_UNDO_BLOCK_MAGIC
-		|| header->block_version != UNDO_BLOCK_VERSION_1 || header->slot_count == 0
-		|| header->slot_count > (BLCKSZ - sizeof(UndoBlockHeader)) / sizeof(UndoSlotDirEntry)
-		|| row_offset >= header->slot_count)
+	if (!cluster_cr_r4_prepare_resident_records(resident_undo_page, request_locator, 1, &batch))
 		return false;
-	slot_dir_low = BLCKSZ - (uint32)header->slot_count * sizeof(UndoSlotDirEntry);
-	if (header->free_offset < sizeof(UndoBlockHeader) || header->free_offset > slot_dir_low)
-		return false;
-	slot = UNDO_SLOT_DIR_PTR(resident_undo_page, row_offset);
-	if (slot->record_offset < sizeof(UndoBlockHeader)
-		|| slot->record_length < sizeof(UndoRecordHeader)
-		|| slot->record_offset > header->free_offset
-		|| slot->record_length > header->free_offset - slot->record_offset)
-		return false;
-	record_length = slot->record_length;
-	memcpy(candidate_record.data, resident_undo_page + slot->record_offset, slot->record_length);
-	record = (const UndoRecordHeader *)candidate_record.data;
-	if (slot->record_type != record->record_type || slot->flags != record->flags
-		|| record_length != sizeof(UndoRecordHeader) + (size_t)record->payload_length)
-		return false;
-
-	if (!cr_r4_canonical_record_locator(request_locator, request_locator->uba, record,
-										&canonical_locator))
-		return false;
-
-	memcpy(record_out, candidate_record.data, record_length);
-	*record_length_out = record_length;
-	*canonical_locator_out = canonical_locator;
+	record = &batch.records[0];
+	memmove(record_out, resident_undo_page + record->record_offset, record->record_length);
+	*record_length_out = record->record_length;
+	*canonical_locator_out = record->canonical_locator;
 	return true;
 }
 
