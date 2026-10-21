@@ -15626,14 +15626,24 @@ LockBufferForFreeSpaceMapPageInit(Buffer buffer)
 bool
 ConditionalLockBuffer(Buffer buffer)
 {
+	bool pin_invalid;
+
+	return ConditionalLockBufferWithPinCheck(buffer, &pin_invalid);
+}
+
+bool
+ConditionalLockBufferWithPinCheck(Buffer buffer, bool *pin_invalid)
+{
 	BufferDesc *buf;
 	bool		acquired;
 #ifdef USE_PGRAC_CLUSTER
 	bool		blocked;
 	uint32		buf_state;
 	ClusterContentTracePairEvent reason = CLPAIR_PCM_BLOCKED;
+	int32 object_reason = 0;
 #endif
 
+	*pin_invalid = false;
 	Assert(BufferIsPinned(buffer));
 	if (BufferIsLocal(buffer))
 		return true;			/* act as though we got it */
@@ -15664,17 +15674,23 @@ ConditionalLockBuffer(Buffer buffer)
 
 			/* Other content locks may already be held. Consume the original
 			 * pin's exact sample; never take the KO lock or refresh it here. */
-			blocked = ref == NULL || ref->refcount <= 0
-					  || !cluster_ko_peer_current_valid_v3(&ref->ko_current,
-														   BufTagGetRelFileLocator(&buf->tag),
-														   buf->tag.forkNum, buf->tag.blockNum);
+			if (ref == NULL)
+				object_reason = CLPAIR_OBJECT_NO_REF;
+			else if (ref->refcount <= 0)
+				object_reason = CLPAIR_OBJECT_NO_PIN;
+			else if (!cluster_ko_peer_current_valid_v3(&ref->ko_current,
+													 BufTagGetRelFileLocator(&buf->tag),
+													 buf->tag.forkNum, buf->tag.blockNum))
+				object_reason = CLPAIR_OBJECT_STALE_CURRENT;
+			blocked = object_reason != 0;
+			*pin_invalid = blocked;
 			reason = CLPAIR_OBJECT_BLOCKED;
 		}
 		UnlockBufHdr(buf, buf_state);
 		if (blocked)
 		{
 			LWLockRelease(BufferDescriptorGetContentLock(buf));
-			cluster_content_trace_pair_event(buffer, reason, 0);
+			cluster_content_trace_pair_event(buffer, reason, object_reason);
 			return false;
 		}
 	}
@@ -15682,6 +15698,14 @@ ConditionalLockBuffer(Buffer buffer)
 		cluster_content_trace_pair_event(buffer, CLPAIR_CONTENT_BUSY, 0);
 #endif
 	return acquired;
+}
+
+/* True when this backend owns at least one pin. This does not establish
+ * content-lock ownership or validate a pin's KO/current admission sample. */
+bool
+BufferIsPinnedByMe(Buffer buffer)
+{
+	return BufferIsPinned(buffer);
 }
 
 /*

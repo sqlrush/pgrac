@@ -997,17 +997,17 @@ UT_TEST(test_cross_page_heap_pair_second_acquire_never_waits_under_first)
 	const char *extension;
 	const char *extension_call;
 	static const char *const helper_order[]
-		= { "cluster_hio_lock_buffer_pair(Buffer first, Buffer second)",
-			"LockBuffer(first, BUFFER_LOCK_EXCLUSIVE)",
-			"ConditionalLockBuffer(second)",
-			"LockBuffer(first, BUFFER_LOCK_UNLOCK)",
-			"LockBuffer(second, BUFFER_LOCK_EXCLUSIVE)",
-			"LockBuffer(second, BUFFER_LOCK_UNLOCK)" };
+		= { "cluster_hio_lock_buffer_pair(Relation relation, Buffer *first, Buffer *second)",
+			"LockBuffer(*first, BUFFER_LOCK_EXCLUSIVE)",
+			"ConditionalLockBufferWithPinCheck(*second, &pin_invalid)",
+			"LockBuffer(*first, BUFFER_LOCK_UNLOCK)",
+			"LockBuffer(*second, BUFFER_LOCK_EXCLUSIVE)",
+			"LockBuffer(*second, BUFFER_LOCK_UNLOCK)" };
 
 	UT_ASSERT(hio != NULL);
 	if (hio == NULL)
 		return;
-	helper = strstr(hio, "cluster_hio_lock_buffer_pair(Buffer first, Buffer second)");
+	helper = strstr(hio, "cluster_hio_lock_buffer_pair(Relation relation, Buffer *first, Buffer *second)");
 	helper_end = helper != NULL ? strstr(helper, "\n}\n") : NULL;
 	pins = strstr(hio, "GetVisibilityMapPins(Relation relation");
 	pins_end = pins != NULL ? strstr(pins, "\n}\n") : NULL;
@@ -1133,7 +1133,7 @@ UT_TEST(test_d11_passive_identity_probe_has_exact_sites_and_phase_chain)
 	}
 	if (hio != NULL) {
 		UT_ASSERT_EQ(count_occurrences(hio, "ClusterLockBufferExclusiveBarrierAware("), 0);
-		UT_ASSERT(strstr(hio, "ConditionalLockBuffer(second)") != NULL);
+		UT_ASSERT(strstr(hio, "ConditionalLockBufferWithPinCheck(*second, &pin_invalid)") != NULL);
 		free(hio);
 	}
 }

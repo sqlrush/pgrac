@@ -77,36 +77,69 @@ cluster_hio_lease_target_block(Relation relation)
 }
 #endif
 
-/* P0-20: acquire an ordered pair without ever sleeping on the second PCM-X
- * conversion while the first content lock is held.  A revoke can freeze the
- * first page after the second acquire starts, so a barrier-aware blocking
- * acquire is insufficient here: probe the second lock conditionally, release
- * the first on every miss, resolve the second conversion alone, then retry in
- * the original block order.  Pins remain owned by the caller throughout. */
+/* A rejected pin sample is not content-lock contention. Drop both pins
+ * before normal reads refresh KO/current admission. Publish each new handle
+ * immediately so the caller never retains a descriptor that can be recycled.
+ * The existing ResourceOwner cleans up a successful first read if the second
+ * read raises ERROR. No content lock or buffer pin crosses the short backoff. */
 static void
-cluster_hio_lock_buffer_pair(Buffer first, Buffer second)
+cluster_hio_refresh_buffer_pair(Relation relation, Buffer *first, Buffer *second)
 {
-	Assert(BufferIsValid(first));
-	Assert(BufferIsValid(second));
-	Assert(first != second);
+	BlockNumber first_block;
+	BlockNumber second_block;
 
+	if (!BufferIsPinnedByMe(*first) || !BufferIsPinnedByMe(*second))
+		elog(ERROR, "heap buffer pair lost a caller pin");
+	first_block = BufferGetBlockNumber(*first);
+	second_block = BufferGetBlockNumber(*second);
+	Assert(first_block < second_block);
+	ReleaseBuffer(*first);
+	ReleaseBuffer(*second);
+	*first = *second = InvalidBuffer;
+	CHECK_FOR_INTERRUPTS();
+	pg_usleep(1000L);
+	CHECK_FOR_INTERRUPTS();
+	*first = ReadBuffer(relation, first_block);
+	*second = ReadBuffer(relation, second_block);
+}
+
+/* P0-20: never sleep on the second PCM-X conversion with the first content
+ * lock held. Ordinary misses resolve the second conversion alone. An invalid
+ * KO/current pin sample instead requires unpin/read of both logical blocks;
+ * retrying the same conditional probe cannot refresh that sample. */
+static void
+cluster_hio_lock_buffer_pair(Relation relation, Buffer *first, Buffer *second)
+{
+	Assert(BufferIsValid(*first));
+	Assert(BufferIsValid(*second));
+	Assert(*first != *second);
+
+	if (BufferGetBlockNumber(*first) > BufferGetBlockNumber(*second))
+	{
+		Buffer *tmp = first;
+
+		first = second;
+		second = tmp;
+	}
 #ifdef USE_PGRAC_CLUSTER
-	cluster_content_trace_pair_begin(first, second);
+	cluster_content_trace_pair_begin(*first, *second);
 #endif
 	for (;;)
 	{
+		bool pin_invalid;
+
 #ifdef USE_PGRAC_CLUSTER
 		cluster_content_trace_pair_cycle();
 		cluster_content_trace_pair_phase(CLPAIR_FIRST);
 #endif
-		LockBuffer(first, BUFFER_LOCK_EXCLUSIVE);
+		LockBuffer(*first, BUFFER_LOCK_EXCLUSIVE);
 #ifdef USE_PGRAC_CLUSTER
 		cluster_content_trace_pair_phase(CLPAIR_CONDITIONAL_SECOND);
 #endif
-		if (ConditionalLockBuffer(second))
+		if (ConditionalLockBufferWithPinCheck(*second, &pin_invalid))
 		{
 #ifdef USE_PGRAC_CLUSTER
-			cluster_content_trace_pair(second, false);
+			cluster_content_trace_pair(*second, false);
 			cluster_content_trace_wait_clear(CLCONTENT_PAIR);
 			cluster_content_trace_pair_phase(CLPAIR_DONE);
 			cluster_content_trace_pair_end();
@@ -115,14 +148,26 @@ cluster_hio_lock_buffer_pair(Buffer first, Buffer second)
 		}
 
 #ifdef USE_PGRAC_CLUSTER
-		cluster_content_trace_pair(second, true);
+		cluster_content_trace_pair(*second, true);
 #endif
-		LockBuffer(first, BUFFER_LOCK_UNLOCK);
+		LockBuffer(*first, BUFFER_LOCK_UNLOCK);
+		if (pin_invalid)
+		{
+#ifdef USE_PGRAC_CLUSTER
+			cluster_content_trace_wait_clear(CLCONTENT_PAIR);
+			cluster_content_trace_pair_end();
+#endif
+			cluster_hio_refresh_buffer_pair(relation, first, second);
+#ifdef USE_PGRAC_CLUSTER
+			cluster_content_trace_pair_begin(*first, *second);
+#endif
+			continue;
+		}
 #ifdef USE_PGRAC_CLUSTER
 		cluster_content_trace_pair_phase(CLPAIR_RESOLVE_SECOND);
 #endif
-		LockBuffer(second, BUFFER_LOCK_EXCLUSIVE);
-		LockBuffer(second, BUFFER_LOCK_UNLOCK);
+		LockBuffer(*second, BUFFER_LOCK_EXCLUSIVE);
+		LockBuffer(*second, BUFFER_LOCK_UNLOCK);
 #ifdef USE_PGRAC_CLUSTER
 		cluster_content_trace_wait_clear(CLCONTENT_PAIR);
 #endif
@@ -269,9 +314,9 @@ ReadBufferBI(Relation relation, BlockNumber targetBlock,
  * Returns whether buffer locks were temporarily released.
  */
 static bool
-GetVisibilityMapPins(Relation relation, Buffer buffer1, Buffer buffer2,
+GetVisibilityMapPins(Relation relation, Buffer *buffer1, Buffer *buffer2,
 					 BlockNumber block1, BlockNumber block2,
-					 Buffer *vmbuffer1, Buffer *vmbuffer2, Buffer frozen_buffer)
+					 Buffer *vmbuffer1, Buffer *vmbuffer2, BlockNumber frozen_block)
 {
 	bool		need_to_pin_buffer1;
 	bool		need_to_pin_buffer2;
@@ -281,10 +326,10 @@ GetVisibilityMapPins(Relation relation, Buffer buffer1, Buffer buffer2,
 	 * Swap buffers around to handle case of a single block/buffer, and to
 	 * handle if lock ordering rules require to lock block2 first.
 	 */
-	if (!BufferIsValid(buffer1) ||
-		(BufferIsValid(buffer2) && block1 > block2))
+	if (!BufferIsValid(*buffer1) ||
+		(BufferIsValid(*buffer2) && block1 > block2))
 	{
-		Buffer		tmpbuf = buffer1;
+		Buffer	   *tmpbuf = buffer1;
 		Buffer	   *tmpvmbuf = vmbuffer1;
 		BlockNumber tmpblock = block1;
 
@@ -297,8 +342,8 @@ GetVisibilityMapPins(Relation relation, Buffer buffer1, Buffer buffer2,
 		block2 = tmpblock;
 	}
 
-	Assert(BufferIsValid(buffer1));
-	Assert(buffer2 == InvalidBuffer || block1 <= block2);
+	Assert(BufferIsValid(*buffer1));
+	Assert(*buffer2 == InvalidBuffer || block1 <= block2);
 
 	if (cluster_hio_vm_repin_enabled(relation))
 	{
@@ -306,19 +351,19 @@ GetVisibilityMapPins(Relation relation, Buffer buffer1, Buffer buffer2,
 		{
 			Buffer recent1 = InvalidBuffer;
 			Buffer recent2 = InvalidBuffer;
-			bool need1 = PageIsAllVisible(BufferGetPage(buffer1))
-				|| buffer1 == frozen_buffer;
-			bool need2 = BufferIsValid(buffer2)
-				&& (PageIsAllVisible(BufferGetPage(buffer2)) || buffer2 == frozen_buffer);
+			bool need1 = PageIsAllVisible(BufferGetPage(*buffer1))
+				|| block1 == frozen_block;
+			bool need2 = BufferIsValid(*buffer2)
+				&& (PageIsAllVisible(BufferGetPage(*buffer2)) || block2 == frozen_block);
 
 			if ((!need1 || visibilitymap_pin_ok(block1, *vmbuffer1))
 				&& (!need2 || visibilitymap_pin_ok(block2, *vmbuffer2)))
 				return released_locks;
 
 			released_locks = true;
-			LockBuffer(buffer1, BUFFER_LOCK_UNLOCK);
-			if (BufferIsValid(buffer2) && buffer2 != buffer1)
-				LockBuffer(buffer2, BUFFER_LOCK_UNLOCK);
+			LockBuffer(*buffer1, BUFFER_LOCK_UNLOCK);
+			if (BufferIsValid(*buffer2) && *buffer2 != *buffer1)
+				LockBuffer(*buffer2, BUFFER_LOCK_UNLOCK);
 			cluster_hio_release_vm_pins(vmbuffer1, vmbuffer2);
 			CHECK_FOR_INTERRUPTS();
 
@@ -337,16 +382,16 @@ GetVisibilityMapPins(Relation relation, Buffer buffer1, Buffer buffer2,
 				cluster_hio_release_vm_pins(vmbuffer2, NULL);
 			}
 
-			if (BufferIsValid(buffer2) && buffer2 != buffer1)
-				cluster_hio_lock_buffer_pair(buffer1, buffer2);
+			if (BufferIsValid(*buffer2) && *buffer2 != *buffer1)
+				cluster_hio_lock_buffer_pair(relation, buffer1, buffer2);
 			else
-				LockBuffer(buffer1, BUFFER_LOCK_EXCLUSIVE);
+				LockBuffer(*buffer1, BUFFER_LOCK_EXCLUSIVE);
 
 			/* Only exact resident repins are legal below heap content locks.
 			 * A newly visible page or retag race takes the full loop again. */
-			need1 = PageIsAllVisible(BufferGetPage(buffer1)) || buffer1 == frozen_buffer;
-			need2 = BufferIsValid(buffer2)
-				&& (PageIsAllVisible(BufferGetPage(buffer2)) || buffer2 == frozen_buffer);
+			need1 = PageIsAllVisible(BufferGetPage(*buffer1)) || block1 == frozen_block;
+			need2 = BufferIsValid(*buffer2)
+				&& (PageIsAllVisible(BufferGetPage(*buffer2)) || block2 == frozen_block);
 			if ((!need1 || visibilitymap_pin_recent(relation, block1, recent1, vmbuffer1))
 				&& (!need2 || visibilitymap_pin_ok(block2, *vmbuffer2)
 					|| visibilitymap_pin_recent(relation, block2, recent2, vmbuffer2)))
@@ -357,19 +402,19 @@ GetVisibilityMapPins(Relation relation, Buffer buffer1, Buffer buffer2,
 	while (1)
 	{
 		/* Figure out which pins we need but don't have. */
-		need_to_pin_buffer1 = PageIsAllVisible(BufferGetPage(buffer1))
+		need_to_pin_buffer1 = PageIsAllVisible(BufferGetPage(*buffer1))
 			&& !visibilitymap_pin_ok(block1, *vmbuffer1);
-		need_to_pin_buffer2 = buffer2 != InvalidBuffer
-			&& PageIsAllVisible(BufferGetPage(buffer2))
+		need_to_pin_buffer2 = *buffer2 != InvalidBuffer
+			&& PageIsAllVisible(BufferGetPage(*buffer2))
 			&& !visibilitymap_pin_ok(block2, *vmbuffer2);
 		if (!need_to_pin_buffer1 && !need_to_pin_buffer2)
 			break;
 
 		/* We must unlock both buffers before doing any I/O. */
 		released_locks = true;
-		LockBuffer(buffer1, BUFFER_LOCK_UNLOCK);
-		if (buffer2 != InvalidBuffer && buffer2 != buffer1)
-			LockBuffer(buffer2, BUFFER_LOCK_UNLOCK);
+		LockBuffer(*buffer1, BUFFER_LOCK_UNLOCK);
+		if (*buffer2 != InvalidBuffer && *buffer2 != *buffer1)
+			LockBuffer(*buffer2, BUFFER_LOCK_UNLOCK);
 
 		/* Get pins. */
 		if (need_to_pin_buffer1)
@@ -379,10 +424,10 @@ GetVisibilityMapPins(Relation relation, Buffer buffer1, Buffer buffer2,
 
 		/* Relock buffers.  A cross-page relock keeps the same block order,
 		 * but must unwind a frozen-barrier refusal from the second page. */
-		if (buffer2 != InvalidBuffer && buffer2 != buffer1)
-			cluster_hio_lock_buffer_pair(buffer1, buffer2);
+		if (*buffer2 != InvalidBuffer && *buffer2 != *buffer1)
+			cluster_hio_lock_buffer_pair(relation, buffer1, buffer2);
 		else
-			LockBuffer(buffer1, BUFFER_LOCK_EXCLUSIVE);
+			LockBuffer(*buffer1, BUFFER_LOCK_EXCLUSIVE);
 
 		/*
 		 * If there are two buffers involved and we pinned just one of them,
@@ -390,7 +435,7 @@ GetVisibilityMapPins(Relation relation, Buffer buffer1, Buffer buffer2,
 		 * busy pinning the first one.  If it looks like that's a possible
 		 * scenario, we'll need to make a second pass through this loop.
 		 */
-		if (buffer2 == InvalidBuffer || buffer1 == buffer2
+		if (*buffer2 == InvalidBuffer || *buffer1 == *buffer2
 			|| (need_to_pin_buffer1 && need_to_pin_buffer2))
 			break;
 	}
@@ -681,10 +726,12 @@ RelationAddBlocks(Relation relation, BulkInsertState bistate,
  *	for callers that know they will need multiple pages
  *	(e.g. heap_multi_insert()).
  *
- *	If otherBuffer is not InvalidBuffer, then it references a previously
+ *	If otherBuffer points to a valid buffer, it references a previously
  *	pinned buffer of another page in the same relation; on return, this
  *	buffer will also be exclusive-locked.  (This case is used by heap_update;
- *	the otherBuffer contains the tuple being updated.)
+ *	the otherBuffer contains the tuple being updated.) A stale cluster pin
+ *	can be released and reread, replacing *otherBuffer; callers must refresh
+ *	page and tuple pointers after this call. NULL means no other buffer.
  *
  *	The reason for passing otherBuffer is that if two backends are doing
  *	concurrent heap_update operations, a deadlock could occur if they try
@@ -737,11 +784,12 @@ RelationAddBlocks(Relation relation, BulkInsertState bistate,
  */
 Buffer
 RelationGetBufferForTuple(Relation relation, Size len,
-						  Buffer otherBuffer, int options,
+						  Buffer *otherBuffer, int options,
 						  BulkInsertState bistate,
 						  Buffer *vmbuffer, Buffer *vmbuffer_other,
 						  int num_pages)
 {
+	Buffer		no_other_buffer = InvalidBuffer;
 	bool		use_fsm = !(options & HEAP_INSERT_SKIP_FSM);
 	Buffer		buffer = InvalidBuffer;
 	Page		page;
@@ -758,6 +806,9 @@ RelationGetBufferForTuple(Relation relation, Size len,
 #ifdef USE_PGRAC_CLUSTER
 	ClusterSpaceIdentity page_identity_storage;
 #endif
+
+	if (otherBuffer == NULL)
+		otherBuffer = &no_other_buffer;
 
 	/* An UPDATE may pass the old page's VM pin into allocation. It must not
 	 * survive any target read, FSM search, heap wait or relation extension. */
@@ -787,7 +838,7 @@ RelationGetBufferForTuple(Relation relation, Size len,
 		num_pages = 1;
 
 	/* Bulk insert is not supported for updates, only inserts. */
-	Assert(otherBuffer == InvalidBuffer || !bistate);
+	Assert(*otherBuffer == InvalidBuffer || !bistate);
 
 	/*
 	 * If we're gonna fail for oversize tuple, do it right away
@@ -815,8 +866,8 @@ RelationGetBufferForTuple(Relation relation, Size len,
 	else
 		targetFreeSpace = len + saveFreeSpace;
 
-	if (otherBuffer != InvalidBuffer)
-		otherBlock = BufferGetBlockNumber(otherBuffer);
+	if (*otherBuffer != InvalidBuffer)
+		otherBlock = BufferGetBlockNumber(*otherBuffer);
 	else
 		otherBlock = InvalidBlockNumber;	/* just to keep compiler quiet */
 
@@ -896,21 +947,21 @@ loop:
 		 */
 		if (cluster_vm_repin)
 		{
-			if (otherBuffer == InvalidBuffer)
+			if (*otherBuffer == InvalidBuffer)
 				buffer = ReadBufferBI(relation, targetBlock, RBM_NORMAL, bistate);
 			else if (otherBlock == targetBlock)
-				buffer = otherBuffer;
+				buffer = *otherBuffer;
 			else
 				buffer = ReadBuffer(relation, targetBlock);
 
-			if (otherBuffer == InvalidBuffer || otherBuffer == buffer)
+			if (*otherBuffer == InvalidBuffer || *otherBuffer == buffer)
 				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 			else if (otherBlock < targetBlock)
-				cluster_hio_lock_buffer_pair(otherBuffer, buffer);
+				cluster_hio_lock_buffer_pair(relation, otherBuffer, &buffer);
 			else
-				cluster_hio_lock_buffer_pair(buffer, otherBuffer);
+				cluster_hio_lock_buffer_pair(relation, &buffer, otherBuffer);
 		}
-		else if (otherBuffer == InvalidBuffer)
+		else if (*otherBuffer == InvalidBuffer)
 		{
 			/* easy case */
 			buffer = ReadBufferBI(relation, targetBlock, RBM_NORMAL, bistate);
@@ -929,7 +980,7 @@ loop:
 		else if (otherBlock == targetBlock)
 		{
 			/* also easy case */
-			buffer = otherBuffer;
+			buffer = *otherBuffer;
 			if (PageIsAllVisible(BufferGetPage(buffer)))
 				visibilitymap_pin(relation, targetBlock, vmbuffer);
 			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
@@ -940,7 +991,7 @@ loop:
 			buffer = ReadBuffer(relation, targetBlock);
 			if (PageIsAllVisible(BufferGetPage(buffer)))
 				visibilitymap_pin(relation, targetBlock, vmbuffer);
-			cluster_hio_lock_buffer_pair(otherBuffer, buffer);
+			cluster_hio_lock_buffer_pair(relation, otherBuffer, &buffer);
 		}
 		else
 		{
@@ -948,7 +999,7 @@ loop:
 			buffer = ReadBuffer(relation, targetBlock);
 			if (PageIsAllVisible(BufferGetPage(buffer)))
 				visibilitymap_pin(relation, targetBlock, vmbuffer);
-			cluster_hio_lock_buffer_pair(buffer, otherBuffer);
+			cluster_hio_lock_buffer_pair(relation, &buffer, otherBuffer);
 		}
 
 		/*
@@ -972,10 +1023,10 @@ loop:
 		 * done a bit of extra work for no gain, but there's no real harm
 		 * done.
 		 */
-		GetVisibilityMapPins(relation, buffer, otherBuffer,
+		GetVisibilityMapPins(relation, &buffer, otherBuffer,
 							 targetBlock, otherBlock, vmbuffer,
 							 vmbuffer_other,
-							 (options & HEAP_INSERT_FROZEN) ? buffer : InvalidBuffer);
+							 (options & HEAP_INSERT_FROZEN) ? targetBlock : InvalidBlockNumber);
 
 		/*
 		 * Now we can check to see if there's enough free space here. If so,
@@ -1024,11 +1075,11 @@ loop:
 		 * code above.
 		 */
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-		if (otherBuffer == InvalidBuffer)
+		if (*otherBuffer == InvalidBuffer)
 			ReleaseBuffer(buffer);
 		else if (otherBlock != targetBlock)
 		{
-			LockBuffer(otherBuffer, BUFFER_LOCK_UNLOCK);
+			LockBuffer(*otherBuffer, BUFFER_LOCK_UNLOCK);
 			ReleaseBuffer(buffer);
 		}
 		if (cluster_vm_repin)
@@ -1125,7 +1176,7 @@ loop:
 	 * Reacquire locks if necessary.
 	 *
 	 * If the target buffer was unlocked above, or is unlocked while
-	 * reacquiring the lock on otherBuffer below, it's unlikely, but possible,
+	 * reacquiring the lock on *otherBuffer below, it's unlikely, but possible,
 	 * that another backend used space on this page. We check for that below,
 	 * and retry if necessary.
 	 */
@@ -1133,41 +1184,45 @@ loop:
 	if (unlockedTargetBuffer)
 	{
 		/* released lock on target buffer above */
-		if (otherBuffer != InvalidBuffer)
-			cluster_hio_lock_buffer_pair(otherBuffer, buffer);
+		if (*otherBuffer != InvalidBuffer)
+			cluster_hio_lock_buffer_pair(relation, otherBuffer, &buffer);
 		else
 			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 		recheckVmPins = true;
 	}
-	else if (otherBuffer != InvalidBuffer)
+	else if (*otherBuffer != InvalidBuffer)
 	{
+		bool pin_invalid;
+
 		/*
-		 * We did not release the target buffer, and otherBuffer is valid,
+		 * We did not release the target buffer, and *otherBuffer is valid,
 		 * need to lock the other buffer. It's guaranteed to be of a lower
 		 * page number than the new page.  To conform with the deadlock
-		 * prevent rules, we ought to lock otherBuffer first, but that would
+		 * prevent rules, we ought to lock *otherBuffer first, but that would
 		 * give other backends a chance to put tuples on our page. To reduce
 		 * the likelihood of that, attempt to lock the other buffer
 		 * conditionally, that's very likely to work.
 		 *
-		 * Alternatively, we could acquire the lock on otherBuffer before
+		 * Alternatively, we could acquire the lock on *otherBuffer before
 		 * extending the relation, but that'd require holding the lock while
 		 * performing IO, which seems worse than an unlikely retry.
 		 */
-		Assert(otherBuffer != buffer);
+		Assert(*otherBuffer != buffer);
 		Assert(targetBlock > otherBlock);
 
-		if (unlikely(!ConditionalLockBuffer(otherBuffer)))
+		if (unlikely(!ConditionalLockBufferWithPinCheck(*otherBuffer, &pin_invalid)))
 		{
 			unlockedTargetBuffer = true;
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-			cluster_hio_lock_buffer_pair(otherBuffer, buffer);
+			if (pin_invalid)
+				cluster_hio_refresh_buffer_pair(relation, otherBuffer, &buffer);
+			cluster_hio_lock_buffer_pair(relation, otherBuffer, &buffer);
 		}
 		recheckVmPins = true;
 	}
 
 	/*
-	 * If one of the buffers was unlocked (always the case if otherBuffer is
+	 * If one of the buffers was unlocked (always the case if *otherBuffer is
 	 * valid), it's possible, although unlikely, that an all-visible flag
 	 * became set.  We can use GetVisibilityMapPins to deal with that. It's
 	 * possible that GetVisibilityMapPins() might need to temporarily release
@@ -1176,10 +1231,10 @@ loop:
 	 */
 	if (recheckVmPins)
 	{
-		if (GetVisibilityMapPins(relation, otherBuffer, buffer,
+		if (GetVisibilityMapPins(relation, otherBuffer, &buffer,
 								 otherBlock, targetBlock, vmbuffer_other,
 								 vmbuffer,
-								 (options & HEAP_INSERT_FROZEN) ? buffer : InvalidBuffer))
+								 (options & HEAP_INSERT_FROZEN) ? targetBlock : InvalidBlockNumber))
 			unlockedTargetBuffer = true;
 	}
 
@@ -1190,13 +1245,14 @@ loop:
 	 * didn't unlock, something has gone wrong if there's not enough space -
 	 * the test at the top should have prevented reaching this case.
 	 */
+	page = BufferGetPage(buffer);
 	pageFreeSpace = PageGetHeapFreeSpace(page);
 	if (len > pageFreeSpace)
 	{
 		if (unlockedTargetBuffer)
 		{
-			if (otherBuffer != InvalidBuffer)
-				LockBuffer(otherBuffer, BUFFER_LOCK_UNLOCK);
+			if (*otherBuffer != InvalidBuffer)
+				LockBuffer(*otherBuffer, BUFFER_LOCK_UNLOCK);
 			UnlockReleaseBuffer(buffer);
 			if (cluster_vm_repin)
 				cluster_hio_release_vm_pins(vmbuffer, vmbuffer_other);

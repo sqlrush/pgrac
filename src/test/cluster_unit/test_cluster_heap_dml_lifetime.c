@@ -177,11 +177,11 @@ visibilitymap_pin(Relation relation, BlockNumber block, Buffer *vm)
 	UT_ASSERT(false); /* no all-visible VM work in this witness */
 }
 Buffer
-RelationGetBufferForTuple(Relation relation, Size len, Buffer otherBuffer, int options,
+RelationGetBufferForTuple(Relation relation, Size len, Buffer *otherBuffer, int options,
 						  BulkInsertStateData *bistate, Buffer *vm, Buffer *other_vm, int pages)
 {
 	allocation_calls++;
-	UT_ASSERT_EQ(otherBuffer, 1);
+	UT_ASSERT_EQ(*otherBuffer, 1);
 	install_and_lock();
 	return 2; /* new page has no byte consumer in the extracted boundary */
 }

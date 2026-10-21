@@ -6218,7 +6218,7 @@ cluster_heap_insert_retry:
 	cluster_itl_write_scn = InvalidScn;
 #endif
 	buffer = RelationGetBufferForTuple(relation, heaptup->t_len,
-									   InvalidBuffer, options, bistate,
+									   NULL, options, bistate,
 									   &vmbuffer, NULL,
 									   0);
 
@@ -7030,7 +7030,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		 * empty page. See all_frozen_set below.
 		 */
 		buffer = RelationGetBufferForTuple(relation, heaptuples[ndone]->t_len,
-										   InvalidBuffer, options, bistate,
+										   NULL, options, bistate,
 										   &vmbuffer, NULL,
 										   npages - npages_used);
 		page = BufferGetPage(buffer);
@@ -13504,7 +13504,7 @@ l_pgrac_reacquire:
 			{
 				/* It doesn't fit, must use RelationGetBufferForTuple. */
 				newbuf = RelationGetBufferForTuple(relation, heaptup->t_len,
-												   buffer, 0, NULL,
+												   &buffer, 0, NULL,
 												   &vmbuffer_new, &vmbuffer,
 												   0);
 				/* We're all done. */
@@ -13552,6 +13552,8 @@ l_pgrac_reacquire:
 		heaptup = newtup;
 	}
 
+	/* HIO may have reread the old logical block into another descriptor. */
+	page = BufferGetPage(buffer);
 #ifdef USE_PGRAC_CLUSTER
 	/* TEMP_LOCK protects the logical row, not its physical location in a
 	 * newer image. Both same-page and allocation retries converge here. */

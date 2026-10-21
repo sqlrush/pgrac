@@ -5958,12 +5958,13 @@ test_cluster_heap_extend_current: test_cluster_heap_extend_current.c unit_test.h
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_heap_hio_vm.inc: $(top_srcdir)/src/backend/access/heap/hio.c Makefile
-	awk '/^cluster_hio_lock_buffer_pair\(/ { print "static void"; emit=1; pair++ } \
+	awk '/^cluster_hio_refresh_buffer_pair\(/ { print "static void"; emit=1; refresh++ } \
+	     /^cluster_hio_lock_buffer_pair\(/ { print "static void"; emit=1; pair++ } \
 	     /^cluster_hio_vm_repin_enabled\(/ { print "static bool"; emit=1; mode++ } \
 	     /^cluster_hio_release_vm_pins\(/ { print "static void"; emit=1; release++ } \
 	     /^GetVisibilityMapPins\(/ { print "static bool"; emit=1; pins++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (pair != 1 || pins != 1 || mode != 1 || release != 1) exit 1 }' $< > $@.tmp
+	     END { if (refresh != 1 || pair != 1 || pins != 1 || mode != 1 || release != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_hio_allocate.inc: $(top_srcdir)/src/backend/access/heap/hio.c Makefile
@@ -8511,7 +8512,7 @@ test_cluster_buffer_cr_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmg
 	     /^cluster_bufmgr_cr_walk_locked\(/ { print "static bool"; emit=1; walk++ } \
 	     /^cluster_bufmgr_cr_invalidate_locked\(/ { print "static ClusterPcmOwnResult"; emit=1; cr++ } \
 	     /^ReadRecentBuffer\(/ { print "bool"; emit=1; recent++ } \
-	     /^ConditionalLockBuffer(ForCleanup)?\(/ { print "bool"; emit=1; conditional++ } \
+	     /^ConditionalLockBuffer(WithPinCheck|ForCleanup)?\(/ { print "bool"; emit=1; conditional++ } \
 	     /^BufferAlloc\(/ { print "static BufferDesc *"; emit=1; alloc++ } \
 	     /^cluster_bufmgr_cr_reserve_v1\(/ { print "Buffer"; emit=1; reserve++ } \
 	     /^cluster_bufmgr_cr_(publish|copy)_v1\(/ { print "bool"; emit=1; cache++ } \
@@ -8527,7 +8528,7 @@ test_cluster_buffer_cr_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmg
 	     /^cluster_bufmgr_discard_buffer_v4\(/ { print "static bool"; emit=1; discard_buffer++ } \
 	     /^cluster_bufmgr_discard_relation_v4\(/ { print "ClusterBufferDrainResult"; emit=1; discard_relation++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (ko_remember != 1 || conditional != 2 || recent != 1 || alloc != 1 || ko_sample != 1 || ko_native_sample != 1 || track != 1 || aux != 1 || retained != 1 || write_gate != 4 || walk != 1 || cr != 1 || reserve != 1 || cache != 2 || commit != 1 || drop != 1 || tail != 1 || victim != 1 || get_victim != 1 || sync_one != 1 || find != 1 || try_drop != 1 || drain != 1 || discard_buffer != 1 || discard_relation != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (ko_remember != 1 || conditional != 3 || recent != 1 || alloc != 1 || ko_sample != 1 || ko_native_sample != 1 || track != 1 || aux != 1 || retained != 1 || write_gate != 4 || walk != 1 || cr != 1 || reserve != 1 || cache != 2 || commit != 1 || drop != 1 || tail != 1 || victim != 1 || get_victim != 1 || sync_one != 1 || find != 1 || try_drop != 1 || drain != 1 || discard_buffer != 1 || discard_relation != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_buffer_cr_pins.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile

@@ -19,6 +19,29 @@ static int hio_refs[4];
 static bool hio_locks[4];
 static int hio_wait_pin_conflicts, hio_waits, hio_reads, hio_repin_failures;
 static int hio_pair_misses;
+static Buffer hio_heap_buffers[2];
+static bool hio_remap_on_refresh;
+static int hio_data_reads, hio_refresh_error_at, hio_backoffs;
+static BlockNumber hio_read_order[4];
+static Buffer hio_read(Relation relation, BlockNumber block);
+
+static BlockNumber
+hio_block(Buffer buffer)
+{
+	UT_ASSERT(buffer == hio_heap_buffers[0] || buffer == hio_heap_buffers[1]);
+	return buffer == hio_heap_buffers[0] ? 0 : 1;
+}
+
+static void
+hio_backoff(long usec)
+{
+	UT_ASSERT_EQ(usec, 1000);
+	UT_ASSERT_EQ(hio_refs[0] + hio_refs[1], 0);
+	UT_ASSERT(!hio_locks[0] && !hio_locks[1]);
+	hio_backoffs++;
+}
+static bool hio_stale_pin;
+static int hio_stale_attempts;
 static int hio_trace_begins, hio_trace_cycles, hio_trace_phases[4], hio_trace_ends;
 static void hio_trace_begin(Buffer first, Buffer second)
 {
@@ -73,12 +96,18 @@ hio_lock(Buffer buffer, int mode)
 	}
 	hio_locks[buffer - 1] = true;
 	if (hio_make_second_visible)
-		PageSetAllVisible(hio_pages[1].data);
+		PageSetAllVisible(hio_pages[hio_heap_buffers[1] - 1].data);
 }
 
 static bool
 hio_conditional(Buffer buffer)
 {
+	if (hio_stale_pin) {
+		/* A blocking content-lock acquire cannot refresh a KO pin sample. */
+		if (++hio_stale_attempts == 8)
+			siglongjmp(hio_jump, 3);
+		return false;
+	}
 	if (hio_pair_misses > 0) {
 		hio_pair_misses--;
 		return false;
@@ -86,6 +115,13 @@ hio_conditional(Buffer buffer)
 	UT_ASSERT(!hio_locks[buffer - 1]);
 	hio_locks[buffer - 1] = true;
 	return true;
+}
+
+static bool
+hio_conditional_checked(Buffer buffer, bool *pin_invalid)
+{
+	*pin_invalid = hio_stale_pin;
+	return hio_conditional(buffer);
 }
 
 static void
@@ -120,7 +156,7 @@ hio_pin(Relation relation, BlockNumber heap_block, Buffer *vm)
 static bool
 hio_recent(Relation relation, BlockNumber heap_block, Buffer recent, Buffer *vm)
 {
-	UT_ASSERT(hio_locks[heap_block]);
+	UT_ASSERT(hio_locks[hio_heap_buffers[heap_block] - 1]);
 	UT_ASSERT(!BufferIsValid(*vm));
 	hio_recent_calls++;
 	if (hio_recent_calls == hio_fail_recent_at)
@@ -145,6 +181,16 @@ hio_recent(Relation relation, BlockNumber heap_block, Buffer recent, Buffer *vm)
 #define ReleaseBuffer hio_release
 #define BufferGetPage(buffer) (hio_pages[(buffer) - 1].data)
 #define ConditionalLockBuffer hio_conditional
+#define ConditionalLockBufferWithPinCheck hio_conditional_checked
+#undef BufferGetBlockNumber
+#define BufferGetBlockNumber hio_block
+#define BufferIsPinnedByMe(buffer) (BufferIsValid(buffer) && hio_refs[(buffer) - 1] > 0)
+#undef ReadBuffer
+#define ReadBuffer hio_read
+#undef pg_usleep
+#define pg_usleep hio_backoff
+#undef elog
+#define elog(level, ...) fixture_error()
 #define visibilitymap_pin hio_pin
 #define visibilitymap_pin_recent hio_recent
 #define visibilitymap_pin_ok hio_pin_ok
@@ -167,6 +213,13 @@ hio_reset(bool same_vm)
 	memset(hio_locks, 0, sizeof(hio_locks));
 	hio_wait_pin_conflicts = hio_waits = hio_reads = hio_repin_failures = 0;
 	hio_pair_misses = 0;
+	hio_heap_buffers[0] = 1;
+	hio_heap_buffers[1] = 2;
+	hio_remap_on_refresh = false;
+	hio_data_reads = hio_refresh_error_at = hio_backoffs = 0;
+	memset(hio_read_order, 0, sizeof(hio_read_order));
+	hio_stale_pin = false;
+	hio_stale_attempts = 0;
 	hio_trace_begins = hio_trace_cycles = hio_trace_ends = 0;
 	memset(hio_trace_phases, 0, sizeof(hio_trace_phases));
 	hio_recent_calls = hio_fail_recent_at = 0;
@@ -198,7 +251,11 @@ UT_TEST(actual_hio_pair_repeated_misses_release_first_in_both_orders)
 	for (first = 1; first <= 2; first++) {
 		hio_reset(false);
 		hio_pair_misses = 3;
-		cluster_hio_lock_buffer_pair(first, 3 - first);
+		{
+			Buffer first_buffer = first, second_buffer = 3 - first;
+
+			cluster_hio_lock_buffer_pair(&relation_data, &first_buffer, &second_buffer);
+		}
 		UT_ASSERT_EQ(hio_pair_misses, 0);
 		UT_ASSERT_EQ(hio_waits, 7);
 		UT_ASSERT_EQ(hio_wait_pin_conflicts, 0);
@@ -213,7 +270,11 @@ UT_TEST(actual_hio_pair_observes_each_cycle_and_resolution_leg)
 	for (first = 1; first <= 2; first++) {
 		hio_reset(false);
 		hio_pair_misses = 3;
-		cluster_hio_lock_buffer_pair(first, 3 - first);
+		{
+			Buffer first_buffer = first, second_buffer = 3 - first;
+
+			cluster_hio_lock_buffer_pair(&relation_data, &first_buffer, &second_buffer);
+		}
 		UT_ASSERT_EQ(hio_trace_begins, 1);
 		UT_ASSERT_EQ(hio_trace_cycles, 4);
 		UT_ASSERT_EQ(hio_trace_phases[CLPAIR_FIRST], 4);
@@ -226,6 +287,87 @@ UT_TEST(actual_hio_pair_observes_each_cycle_and_resolution_leg)
 	}
 }
 
+UT_TEST(actual_hio_pair_stale_pin_requires_ordinary_reread)
+{
+	int order;
+
+	for (order = 0; order < 2; order++) {
+		Buffer first = order == 0 ? 1 : 2, second = 3 - first;
+		bool completed = false;
+
+		hio_reset(false);
+		hio_refs[0] = hio_refs[1] = 1;
+		hio_stale_pin = hio_remap_on_refresh = true;
+		if (sigsetjmp(hio_jump, 0) == 0) {
+			cluster_hio_lock_buffer_pair(&relation_data, &first, &second);
+			completed = true;
+		}
+		UT_ASSERT(completed);
+		UT_ASSERT(!hio_stale_pin);
+		UT_ASSERT_EQ(hio_stale_attempts, 1);
+		UT_ASSERT_EQ(hio_backoffs, 1);
+		UT_ASSERT_EQ(hio_data_reads, 2);
+		UT_ASSERT_EQ(hio_read_order[0], 0);
+		UT_ASSERT_EQ(hio_read_order[1], 1);
+		UT_ASSERT_EQ(first, order == 0 ? 2 : 1);
+		UT_ASSERT_EQ(second, order == 0 ? 1 : 2);
+		UT_ASSERT_EQ(hio_refs[0], 1);
+		UT_ASSERT_EQ(hio_refs[1], 1);
+		UT_ASSERT(hio_locks[0] && hio_locks[1]);
+	}
+}
+
+UT_TEST(actual_hio_pair_refresh_error_keeps_only_fresh_handles)
+{
+	int failed;
+	static Buffer first, second; /* Values inspected after siglongjmp. */
+
+	for (failed = 1; failed <= 2; failed++) {
+		first = 1;
+		second = 2;
+		hio_reset(false);
+		hio_refs[0] = hio_refs[1] = 1;
+		hio_stale_pin = hio_remap_on_refresh = true;
+		hio_refresh_error_at = failed;
+		if (sigsetjmp(failure_jump, 0) == 0) {
+			cluster_hio_lock_buffer_pair(&relation_data, &first, &second);
+			UT_ASSERT(false);
+		}
+		UT_ASSERT(!hio_locks[0] && !hio_locks[1]);
+		UT_ASSERT_EQ(second, InvalidBuffer);
+		UT_ASSERT_EQ(hio_refs[0] + hio_refs[1], failed - 1);
+		if (failed == 1)
+			UT_ASSERT_EQ(first, InvalidBuffer);
+		else {
+			UT_ASSERT_EQ(first, 2);
+			/* Real reads register this pin with ResourceOwner. This fixture
+			 * checks handle publication, not the ERROR ResourceOwner walk. */
+			hio_release(first);
+		}
+	}
+}
+
+UT_TEST(actual_hio_pair_refresh_cancellation_holds_no_buffer_resource)
+{
+	static Buffer first, second; /* Values inspected after siglongjmp. */
+	int canceled;
+
+	first = 1;
+	second = 2;
+	hio_reset(false);
+	hio_refs[0] = hio_refs[1] = 1;
+	hio_stale_pin = hio_cancel = true;
+	canceled = sigsetjmp(hio_jump, 0);
+	if (canceled == 0)
+		cluster_hio_lock_buffer_pair(&relation_data, &first, &second);
+	UT_ASSERT_EQ(canceled, 2);
+	UT_ASSERT_EQ(first, InvalidBuffer);
+	UT_ASSERT_EQ(second, InvalidBuffer);
+	UT_ASSERT_EQ(hio_refs[0] + hio_refs[1], 0);
+	UT_ASSERT(!hio_locks[0] && !hio_locks[1]);
+	UT_ASSERT_EQ(hio_data_reads, 0);
+}
+
 UT_TEST(actual_hio_single_relock_carries_no_vm_pin)
 {
 	Buffer vm = InvalidBuffer;
@@ -234,8 +376,8 @@ UT_TEST(actual_hio_single_relock_carries_no_vm_pin)
 	hio_reset(false);
 	hio_locks[0] = true;
 	if (sigsetjmp(hio_jump, 0) == 0) {
-		(void)GetVisibilityMapPins(&relation_data, 1, InvalidBuffer, 0, InvalidBlockNumber, &vm,
-								   NULL, InvalidBuffer);
+		(void)GetVisibilityMapPins(&relation_data, &(Buffer){1}, &(Buffer){InvalidBuffer}, 0, InvalidBlockNumber, &vm,
+								   NULL, InvalidBlockNumber);
 		completed = true;
 	}
 	UT_ASSERT(completed);
@@ -255,7 +397,7 @@ UT_TEST(actual_hio_pair_relock_carries_neither_vm_alias)
 		hio_locks[0] = hio_locks[1] = true;
 		hio_pair_misses = 1;
 		if (sigsetjmp(hio_jump, 0) == 0) {
-			(void)GetVisibilityMapPins(&relation_data, 2, 1, 1, 0, &second_vm, &first_vm,
+			(void)GetVisibilityMapPins(&relation_data, &(Buffer){2}, &(Buffer){1}, 1, 0, &second_vm, &first_vm,
 									   InvalidBuffer);
 			completed = true;
 		}
@@ -278,7 +420,7 @@ UT_TEST(actual_hio_repin_failure_releases_partial_result)
 		hio_locks[0] = hio_locks[1] = true;
 		hio_fail_recent_at = failed;
 		UT_ASSERT(
-			GetVisibilityMapPins(&relation_data, 1, 2, 0, 1, &first_vm, &second_vm, InvalidBuffer));
+			GetVisibilityMapPins(&relation_data, &(Buffer){1}, &(Buffer){2}, 0, 1, &first_vm, &second_vm, InvalidBlockNumber));
 		UT_ASSERT(hio_locks[0] && hio_locks[1]);
 		UT_ASSERT_EQ(hio_refs[2] + hio_refs[3], 2);
 		UT_ASSERT(hio_reads >= 4 && hio_waits >= 2);
@@ -295,7 +437,7 @@ UT_TEST(actual_hio_newly_visible_and_frozen_require_exact_maps)
 	hio_locks[0] = hio_locks[1] = true;
 	hio_make_second_visible = true;
 	UT_ASSERT(
-		GetVisibilityMapPins(&relation_data, 1, 2, 0, 1, &first_vm, &second_vm, InvalidBuffer));
+		GetVisibilityMapPins(&relation_data, &(Buffer){1}, &(Buffer){2}, 0, 1, &first_vm, &second_vm, InvalidBlockNumber));
 	UT_ASSERT(hio_pin_ok(0, first_vm) && hio_pin_ok(1, second_vm));
 	UT_ASSERT(hio_waits >= 2);
 
@@ -303,8 +445,8 @@ UT_TEST(actual_hio_newly_visible_and_frozen_require_exact_maps)
 	PageClearAllVisible(hio_pages[0].data);
 	first_vm = InvalidBuffer;
 	hio_locks[0] = true;
-	UT_ASSERT(GetVisibilityMapPins(&relation_data, InvalidBuffer, 1, InvalidBlockNumber, 0, NULL,
-								   &first_vm, 1));
+	UT_ASSERT(GetVisibilityMapPins(&relation_data, &(Buffer){InvalidBuffer}, &(Buffer){1}, InvalidBlockNumber, 0, NULL,
+								   &first_vm, 0));
 	UT_ASSERT(hio_pin_ok(0, first_vm));
 	UT_ASSERT_EQ(hio_refs[2], 1);
 }
@@ -325,7 +467,7 @@ UT_TEST(actual_hio_declared_pin_release_and_alias_counts)
 	UT_ASSERT_EQ(first_vm, InvalidBuffer);
 	hio_locks[0] = hio_locks[1] = true;
 	UT_ASSERT(
-		GetVisibilityMapPins(&relation_data, 1, 2, 0, 1, &first_vm, &first_vm, InvalidBuffer));
+		GetVisibilityMapPins(&relation_data, &(Buffer){1}, &(Buffer){2}, 0, 1, &first_vm, &first_vm, InvalidBlockNumber));
 	UT_ASSERT_EQ(hio_refs[2], 1);
 }
 
@@ -337,8 +479,8 @@ UT_TEST(actual_hio_disabled_local_and_cancellation_boundaries)
 	hio_reset(false);
 	hio_enforce_wait_order = false;
 	hio_locks[0] = true;
-	UT_ASSERT(GetVisibilityMapPins(&relation_data, 1, InvalidBuffer, 0, InvalidBlockNumber, &vm,
-								   NULL, InvalidBuffer));
+	UT_ASSERT(GetVisibilityMapPins(&relation_data, &(Buffer){1}, &(Buffer){InvalidBuffer}, 0, InvalidBlockNumber, &vm,
+								   NULL, InvalidBlockNumber));
 	UT_ASSERT_EQ(hio_recent_calls, 0);
 	UT_ASSERT(hio_pin_ok(0, vm));
 	hio_reset(false);
@@ -352,8 +494,8 @@ UT_TEST(actual_hio_disabled_local_and_cancellation_boundaries)
 	hio_cancel = true;
 	canceled = sigsetjmp(hio_jump, 0);
 	if (canceled == 0)
-		(void)GetVisibilityMapPins(&relation_data, 1, InvalidBuffer, 0, InvalidBlockNumber, &vm,
-								   NULL, InvalidBuffer);
+		(void)GetVisibilityMapPins(&relation_data, &(Buffer){1}, &(Buffer){InvalidBuffer}, 0, InvalidBlockNumber, &vm,
+								   NULL, InvalidBlockNumber);
 	UT_ASSERT_EQ(canceled, 2);
 	UT_ASSERT(!hio_locks[0] && !hio_locks[1]);
 	UT_ASSERT_EQ(hio_refs[2] + hio_refs[3], 0);
@@ -363,7 +505,7 @@ UT_TEST(actual_hio_disabled_local_and_cancellation_boundaries)
 /* Execute the entire real allocation consumer as well as its helpers. Only
  * physical reads, the FSM and extension are controlled runtime boundaries. */
 static BlockNumber hio_target;
-static int hio_data_reads, hio_extensions, hio_fsm_calls, hio_dirties;
+static int hio_extensions, hio_fsm_calls, hio_dirties;
 static bool hio_extension_unlock;
 static unsigned hio_identity_reads, hio_versioned_inits;
 static bool hio_identity_missing;
@@ -381,9 +523,24 @@ hio_read(Relation relation, BlockNumber block)
 {
 	hio_assert_no_vm_wait();
 	UT_ASSERT(block < 2);
+	if (hio_stale_pin && hio_refs[0] + hio_refs[1] == 0) {
+		hio_stale_pin = false;
+		if (hio_remap_on_refresh) {
+			PGAlignedBlock saved = hio_pages[0];
+
+			hio_heap_buffers[0] = 2;
+			hio_heap_buffers[1] = 1;
+			hio_pages[0] = hio_pages[1];
+			hio_pages[1] = saved;
+		}
+	}
 	hio_data_reads++;
-	hio_refs[block]++;
-	return (Buffer)(block + 1);
+	if (hio_data_reads <= lengthof(hio_read_order))
+		hio_read_order[hio_data_reads - 1] = block;
+	if (hio_data_reads == hio_refresh_error_at)
+		fixture_error();
+	hio_refs[hio_heap_buffers[block] - 1]++;
+	return hio_heap_buffers[block];
 }
 
 static Buffer
@@ -469,7 +626,7 @@ hio_unlock_release(Buffer buffer)
 #undef RelationGetNumberOfBlocks
 #undef UnlockReleaseBuffer
 #undef ReadBuffer
-#define BufferGetBlockNumber(buffer) ((BlockNumber)((buffer) - 1))
+#define BufferGetBlockNumber hio_block
 #define ReadBuffer hio_read
 #define ReadBufferBI hio_read_bi
 #define RelationGetTargetBlock(relation) hio_target
@@ -494,7 +651,7 @@ hio_unlock_release(Buffer buffer)
 #undef elog
 #define elog(level, ...) fixture_error()
 #define RelationGetBufferForTuple hio_allocate
-Buffer hio_allocate(Relation relation, Size len, Buffer other, int options, BulkInsertState state,
+Buffer hio_allocate(Relation relation, Size len, Buffer *other, int options, BulkInsertState state,
 					Buffer *vm, Buffer *other_vm, int num_pages);
 #include "test_cluster_heap_hio_allocate.inc"
 
@@ -511,7 +668,7 @@ UT_TEST(actual_shared_hio_reads_identity_before_locks_and_versions_existing_zero
 	hio_refs[0] = 1;
 	hio_refs[2] = 2;
 	memset(hio_pages[1].data, 0, BLCKSZ);
-	result = hio_allocate(&relation_data, 80, 1, 0, NULL, &vm, &other_vm, 1);
+	result = hio_allocate(&relation_data, 80, &(Buffer){1}, 0, NULL, &vm, &other_vm, 1);
 	UT_ASSERT_EQ(result, 2);
 	UT_ASSERT_EQ(hio_identity_reads, 1);
 	UT_ASSERT_EQ(hio_versioned_inits, 1);
@@ -538,7 +695,7 @@ UT_TEST(actual_shared_hio_missing_identity_stops_before_page_access)
 	hio_refs[2] = 2;
 	saved = hio_pages[1];
 	if (sigsetjmp(failure_jump, 0) == 0) {
-		(void)hio_allocate(&relation_data, 80, 1, 0, NULL, &vm, &other_vm, 1);
+		(void)hio_allocate(&relation_data, 80, &(Buffer){1}, 0, NULL, &vm, &other_vm, 1);
 		UT_ASSERT(false);
 	}
 	UT_ASSERT_EQ(hio_identity_reads, 1);
@@ -566,7 +723,7 @@ UT_TEST(actual_hio_allocation_reads_and_locks_without_incoming_vm_pins)
 		hio_refs[2] = 2;
 		hio_refs[0] = BufferIsValid(other) ? 1 : 0;
 		hio_pair_misses = leg == 1 ? 1 : 0;
-		result = hio_allocate(&relation_data, 80, other, 0, NULL, &vm, &other_vm, 0);
+		result = hio_allocate(&relation_data, 80, &other, 0, NULL, &vm, &other_vm, 0);
 		UT_ASSERT_EQ(result, (Buffer)(hio_target + 1));
 		UT_ASSERT(hio_locks[result - 1]);
 		if (BufferIsValid(other))
@@ -577,6 +734,29 @@ UT_TEST(actual_hio_allocation_reads_and_locks_without_incoming_vm_pins)
 		UT_ASSERT_EQ(hio_extensions, 0);
 		UT_ASSERT_EQ(hio_wait_pin_conflicts, 0);
 	}
+}
+
+UT_TEST(actual_hio_allocation_returns_refreshed_other_descriptor)
+{
+	Buffer vm = 3, other_vm = 3, other = 1, result;
+
+	hio_reset(false);
+	hio_target = 1;
+	hio_refs[0] = 1;
+	hio_refs[2] = 2;
+	hio_stale_pin = hio_remap_on_refresh = true;
+	result = hio_allocate(&relation_data, 80, &other, 0, NULL, &vm, &other_vm, 0);
+	UT_ASSERT_EQ(result, 1);
+	UT_ASSERT_EQ(other, 2);
+	UT_ASSERT_EQ(hio_data_reads, 3);
+	UT_ASSERT_EQ(hio_backoffs, 1);
+	UT_ASSERT_EQ(hio_stale_attempts, 1);
+	UT_ASSERT(hio_locks[0] && hio_locks[1]);
+	UT_ASSERT_EQ(hio_refs[0], 1);
+	UT_ASSERT_EQ(hio_refs[1], 1);
+	UT_ASSERT(hio_pin_ok(0, other_vm));
+	UT_ASSERT(hio_pin_ok(1, vm));
+	UT_ASSERT_EQ(hio_wait_pin_conflicts, 0);
 }
 
 UT_TEST(actual_hio_rejected_candidate_and_frozen_extension_recheck_maps)
@@ -596,7 +776,7 @@ UT_TEST(actual_hio_rejected_candidate_and_frozen_extension_recheck_maps)
 		full->pd_upper = full->pd_lower;
 		hio_extension_unlock = unlocked != 0;
 		hio_pair_misses = 1;
-		result = hio_allocate(&relation_data, 80, 1, HEAP_INSERT_FROZEN, NULL, &vm, &other_vm, 1);
+		result = hio_allocate(&relation_data, 80, &(Buffer){1}, HEAP_INSERT_FROZEN, NULL, &vm, &other_vm, 1);
 		UT_ASSERT_EQ(result, 2);
 		UT_ASSERT_EQ(hio_extensions, 1);
 		UT_ASSERT_EQ(hio_fsm_calls, 1);
@@ -622,7 +802,7 @@ UT_TEST(actual_hio_nonempty_extension_retries_with_ordered_requalification)
 	hio_extension_unlock = true;
 	hio_extension_fill_first = true;
 	hio_pair_misses = 1;
-	result = hio_allocate(&relation_data, 80, 1, HEAP_INSERT_FROZEN, NULL, &vm, &other_vm, 1);
+	result = hio_allocate(&relation_data, 80, &(Buffer){1}, HEAP_INSERT_FROZEN, NULL, &vm, &other_vm, 1);
 	UT_ASSERT_EQ(result, 2);
 	UT_ASSERT_EQ(hio_extensions, 2);
 	UT_ASSERT_EQ(hio_dirties, 0);

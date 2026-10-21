@@ -29,6 +29,12 @@ typedef enum ClusterContentTracePairEvent {
 	CLPAIR_STAGE_REJECT, CLPAIR_REMOTE_MASTER_DISPATCH, CLPAIR_NEVENTS
 } ClusterContentTracePairEvent;
 
+/* OBJECT_BLOCKED subreasons describe the original pin sample, not a
+ * remote holder, response, or authority verdict. */
+typedef enum ClusterContentTraceObjectReason {
+	CLPAIR_OBJECT_NO_REF = 1, CLPAIR_OBJECT_NO_PIN, CLPAIR_OBJECT_STALE_CURRENT
+} ClusterContentTraceObjectReason;
+
 /* Actual outbound dispatch fields, not a reconstructed authority receipt.
  * stage_ok means only the existing local staging call accepted this dispatch;
  * neither a remote master nor a staged message proves a current transfer. */

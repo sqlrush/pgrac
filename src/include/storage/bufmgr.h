@@ -190,6 +190,7 @@ extern void ReleaseBuffer(Buffer buffer);
 extern void UnlockReleaseBuffer(Buffer buffer);
 extern void MarkBufferDirty(Buffer buffer);
 extern void IncrBufferRefCount(Buffer buffer);
+extern bool BufferIsPinnedByMe(Buffer buffer);
 extern void CheckBufferIsPinnedOnce(Buffer buffer);
 extern Buffer ReleaseAndReadBuffer(Buffer buffer, Relation relation,
 								   BlockNumber blockNum);
@@ -369,6 +370,9 @@ extern bool ClusterLockBufferShareBarrierAware(Buffer buffer);
 extern Buffer LockBufferForVisibilityMapPageInit(Buffer buffer);
 extern Buffer LockBufferForFreeSpaceMapPageInit(Buffer buffer);
 extern bool ConditionalLockBuffer(Buffer buffer);
+/* As above; non-NULL pin_invalid is always set. True requests a normal
+ * reread, not a busy-lock retry. The caller must still own a releasable pin. */
+extern bool ConditionalLockBufferWithPinCheck(Buffer buffer, bool *pin_invalid);
 extern void LockBufferForCleanup(Buffer buffer);
 extern bool ConditionalLockBufferForCleanup(Buffer buffer);
 extern bool IsBufferCleanupOK(Buffer buffer);
