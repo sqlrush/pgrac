@@ -43,6 +43,33 @@ gate remain prerequisites for four-node workload runs. These scripts neither
 reserve a lab nor establish that gate. A native fixture smoke test or a mock
 adapter does not qualify a physical multi-node deployment.
 
+### Structured workload LOG intake
+
+Read one retained PostgreSQL stderr log without starting a server:
+
+```sh
+python3 src/test/cluster_tap/pre2/workload_log.py /path/to/server.log > observations.json
+python3 -m unittest discover -s src/test/cluster_tap/pre2 -p test_workload_log.py
+```
+
+The reader supports the existing READ_IMAGE, R4_UNDO, R4_HEAP_UPDATE, HOT_FULL
+and CTRC trace families listed in `workload_log.py`. It accepts `LOG:` records
+whose message starts with `PGRAC_FAMILY=`, preserves field values and nested
+brace blocks, and records the original line, byte offset and SHA256. CSV/JSON
+log formats and multiline messages are not supported. Other families remain
+in `unhandled`; malformed known records remain in `rejections` with their
+original bytes in hex. Preserve the original log alongside the JSON output.
+
+Exit 0 means at least one supported record parsed and no record was rejected;
+exit 1 means rejection; exit 2 means no supported record or a file/argument
+error. Parsing checks the envelope and ending disclosure, not every family
+field or a complete trace. Values such as unknown identities, skipped samples,
+late emission and saturated sequences are retained without granting evidence
+credit. Input order is retained, including repeated sequence numbers. The
+reader does not join processes, sort clocks or produce normalized workload
+events. All results retain `field_root=OPEN`, `identity_bound=false` and
+`ready_to_run=false`; a parsing exit code is not an acceptance verdict.
+
 ## TAP fixture entrance
 
 The `PostgreSQL::Test::ClusterPRE2` module defaults to the black-box adapter.
