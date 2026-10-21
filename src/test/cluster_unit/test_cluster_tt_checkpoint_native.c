@@ -342,8 +342,11 @@ UT_TEST(test_native_released_window_is_already_covered_by_sync)
 	UT_ASSERT(native_checkpoint_case(NATIVE_RELEASED));
 }
 
+#ifndef TT_CHECKPOINT_NATIVE_MAIN
+#define TT_CHECKPOINT_NATIVE_MAIN main
+#endif
 int
-main(int argc, char **argv)
+TT_CHECKPOINT_NATIVE_MAIN(int argc, char **argv)
 {
 	/* A single early cut also makes missing-stamp mutation tests terminate. */
 	if (argc == 2 && strcmp(argv[1], "--inserted-only") == 0) {

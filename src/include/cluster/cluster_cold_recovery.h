@@ -184,7 +184,7 @@ typedef struct ClusterColdRecordV1 {
 	const ClusterColdSpaceOpV1 *space_ops;
 } ClusterColdRecordV1;
 
-/* Original frame of one retained PAGE/SPACE record, not an ownership proof. */
+/* Original record frame metadata, not an ownership or effects proof. */
 typedef struct ClusterColdRecordFrameV1 {
 	XLogRecPtr read_rec_ptr;
 	XLogRecPtr end_rec_ptr;
@@ -311,6 +311,14 @@ extern ClusterColdDetailV1 cluster_cold_plan_seal_v1(ClusterColdPlanV1 *plan,
 													 ClusterColdObserveV1 observe, void *arg,
 													 ClusterColdDiagV1 *diag);
 
+/* After replay and its original durability barrier, reread the final live
+ * PAGE versions retained by the sealed graph, including all-SKIP pages.
+ * History/object-checkpoint-only and retired pages retain their original
+ * owners' duties. This read-only check grants no replay or C0 authority. */
+extern ClusterColdDetailV1 cluster_cold_plan_readback_v1(const ClusterColdPlanV1 *plan,
+														 ClusterColdObserveV1 observe, void *arg,
+														 ClusterColdDiagV1 *diag);
+
 /* Sealed schedule: non-history records with ordinary page components, in
  * replay order.  Each participant's records keep their LSN order. */
 extern uint32 cluster_cold_plan_step_count_v1(const ClusterColdPlanV1 *plan);
@@ -331,6 +339,17 @@ extern bool cluster_cold_plan_record_frame_count_v1(const ClusterColdPlanV1 *pla
 													uint32 *out_count);
 extern bool cluster_cold_plan_record_frame_v1(const ClusterColdPlanV1 *plan, uint32 index,
 											  ClusterColdRecordFrameV1 *out);
+
+/* Every accepted input record, in feed order, including cursor-only records
+ * and historical SPACE ADVANCEs omitted by the planning-frame accessors.
+ * These sealed-only, by-value metadata inputs retain the original component
+ * counts; they do not retain all payloads or prove effects, base coverage,
+ * canonical ownership, replay completion, loser identity or C0 authority.
+ * Both accessors clear their output on failure. */
+extern bool cluster_cold_plan_input_frame_count_v1(const ClusterColdPlanV1 *plan,
+												   uint32 *out_count);
+extern bool cluster_cold_plan_input_frame_v1(const ClusterColdPlanV1 *plan, uint32 index,
+											 ClusterColdRecordFrameV1 *out);
 
 /* Records at or after the participant's native redo start (pass-2 input),
  * page or not, as fed; pass 2 must consume exactly this many. */
@@ -642,8 +661,11 @@ typedef struct ClusterColdDecodedV1 {
 	uint32 space_capacity;
 } ClusterColdDecodedV1;
 
-/* Classify one decoded record of the exact source namespace.  Unsupported
- * opcodes and routed side components fail with OPCODE_UNSUPPORTED; SPACE
+/* Classify one decoded record of the exact source namespace. Reserved raw/top
+ * xids, top without raw, and a known child raw/top mismatch fail with
+ * COMPONENT_INVALID before any effect route or counter input is exported.
+ * Absent top metadata is allowed but never proves canonical ownership.
+ * Unsupported opcodes and routed side components fail with OPCODE_UNSUPPORTED; SPACE
  * identity and reservation changes and a commit's relation drops become
  * typed SPACE effects (SPACE_INVALID when malformed or of another
  * namespace); other lifecycle, prepared-transaction and (for another
@@ -662,10 +684,11 @@ extern void cluster_cold_decoded_release_v1(ClusterColdDecodedV1 *decoded);
 extern bool cluster_cold_replay_effects_v1(const ClusterColdDecodedV1 *decoded,
 										   const ClusterColdStepV1 *step, bool own);
 
-/* Attempt-local proof that every pass-2 record reached the same complete
- * effect matrix that the original owner classified.  This is neither a WAL
- * field nor a completion authority: the caller still owns source, freshness,
- * durability and fence checks. */
+/* Attempt-local coverage of the complete effect matrix. Startup checks
+ * the route before any effect, then records coverage only after the original
+ * consumer returns or a validated skip finishes. These counts do not verify
+ * execution themselves and are neither a WAL field nor completion authority:
+ * the caller still owns source, freshness, durability and fence checks. */
 typedef struct ClusterColdEffectsProofV1 {
 	uint64 records_seen[CLUSTER_COLD_MAX_PARTICIPANTS];
 	uint64 records_routed;
@@ -887,6 +910,10 @@ typedef struct ClusterColdTypedV1 {
 	ClusterWalSourceRef sources[CLUSTER_COLD_MAX_PARTICIPANTS];
 } ClusterColdTypedV1;
 
+/* After the original durability barrier, reread each surviving replay PAGE
+ * frontier through the physical DATA observer. This grants no C0 authority. */
+extern bool cluster_cold_data_readback_v1(ClusterColdTypedV1 *typed);
+
 /* Read the retained original all-source counter maximum. Refuse a missing,
  * partial or mismatched receipt and zero the output. This only checks the
  * retained inputs; it does not reacquire a fence or revalidate disk sources. */
@@ -1078,9 +1105,10 @@ extern bool cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
  * a caller assertion for missing authority. Derive terminal_match from the
  * complete native lifecycle, sealed redo and exact physical ACTIVE readback,
  * together with the retained terminal checks below. The caller's terminal
- * bit is ignored. Check original SIDE/PAGE/SPACE frame actor/top consistency
- * in every retained source, including history, and any present native BIND or
- * ordinary exact TT_ABORT actor against that operation's own durable slot xid.
+ * bit is ignored. Check original actor/top consistency in every accepted
+ * input record, including cursor-only records and retained history, and any
+ * present native BIND or ordinary exact TT_ABORT actor against that operation's
+ * own durable slot xid.
  * Original UNDO BLOCK_WRITE/MULTI FPIs also require complete native record
  * decoding, including historical records' own physical origin/TT locators.
  * The inventory also decodes every complete retained post-redo UNDO block,
@@ -1102,7 +1130,17 @@ extern bool cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
  * including history-only retained incarnations of the same thread. Absence
  * of those conflicts alone does not supply the terminal proof. A native
  * ABORT with this origin/raw xid additionally requires its original unique
- * exact TT_ABORT pairing; an unqualified history-only ABORT remains blocked.
+ * exact TT_ABORT pairing, including retained history. This read-only identity
+ * does not authorize historical replay. An unqualified ABORT remains blocked.
+ * Replayed native UNDO deltas additionally require their normal original
+ * WAL actor's own BIND and its inclusive ACTIVE prefix. Every appended record in
+ * their persisted directory span must match that actor's raw xid and
+ * physical origin/TT segment/slot/wrap. The prefix supplies the canonical
+ * segment generation. Abort cleanup may flush the batch after exact TT_ABORT,
+ * native ABORT or later slot reuse; none erases the original binding input.
+ * An intervening COMMIT is incompatible with the native precommit drain.
+ * Inherited records and FPI history retain their own actors and do not
+ * gain canonical identity or the independent ordinary_effects proof here.
  * Target incarnation/claim remain bound to the original source.  A new
  * header with no original base requires the native full-image proof.
  * The original endpoint receipt must cover the unchanged complete source
@@ -1130,9 +1168,18 @@ extern uint32 cluster_cold_tt_after_redo_count_v1(const ClusterColdTypedV1 *type
 extern bool cluster_cold_tt_after_redo_namespace_matches_v1(const ClusterColdTypedV1 *typed);
 /* Original inventory consumer: compare every retained UNDO block pair with
  * the sealed current source's native fold, or unchanged history-only bytes.
- * Does not reread disk or qualify base coverage. Final source/header/block
- * rechecks remain with the original owner. */
+ * Validate the original record layout and bounded full heap before-images.
+ * Does not reread disk, qualify base coverage or prove transaction membership.
+ * Final source/header/block rechecks remain with the original owner. */
 extern bool cluster_cold_tt_after_redo_undo_matches_v1(const ClusterColdTypedV1 *typed);
+/* After the complete native inventory check, qualify the selected ACTIVE
+ * slot's supplied prev-chain using retained post-redo bytes and the original
+ * raw reader/reference graph, including its order/cycle and second reads.
+ * Temporary graph storage shares the captures' remaining memory budget.
+ * No DATA I/O or cache refresh. Does not prove checkpoint/producer coverage,
+ * atomic transaction effects or C0 authority. An empty head is neutral. */
+extern bool cluster_cold_tt_after_redo_undo_chain_matches_v1(const ClusterColdTypedV1 *typed,
+															 const ClusterColdTtSlotKeyV1 *key);
 /* Exact physical lookup in one valid captured inventory. Clears index on
  * absence/refusal; no disk access, reconstruction or recovery authority. */
 extern const UndoSegmentHeaderData *cluster_cold_tt_header_find_v1(const ClusterColdTypedV1 *typed,

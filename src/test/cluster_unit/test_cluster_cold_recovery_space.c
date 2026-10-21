@@ -288,6 +288,15 @@ UT_TEST(test_space_carried_through_two_truncations)
 	UT_ASSERT_EQ(step.blocks[0].verdict, CLUSTER_COLD_BLOCK_APPLY_DELTA);
 	UT_ASSERT(version_is(&step.blocks[0].expected_before, INC_NEW, 2));
 	UT_ASSERT_EQ(cluster_cold_plan_space_relation_count_v1(plan), 0);
+	/* Final readback names the live incarnation, not the old carried one. */
+	table.count = table.calls = 0;
+	observe_set(&table, REL_R, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_NEW, 3), VERIFIED);
+	UT_ASSERT_EQ(cluster_cold_plan_readback_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(table.calls, 1);
+	table.count = 0;
+	observe_set(&table, REL_R, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_MID, 3), VERIFIED);
+	UT_ASSERT_EQ(cluster_cold_plan_readback_v1(plan, observe, &table, &diag),
+				 CLUSTER_COLD_INCARNATION_MISMATCH);
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
@@ -401,6 +410,8 @@ UT_TEST(test_space_drop_makes_changes_irrelevant)
 	UT_ASSERT_EQ(cluster_cold_plan_space_relation_count_v1(plan), 1);
 	UT_ASSERT(cluster_cold_plan_space_input_v1(plan, 0, 0, &input));
 	UT_ASSERT_EQ(input.kind, CLUSTER_COLD_SPACE_DROP);
+	UT_ASSERT_EQ(cluster_cold_plan_readback_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(table.calls, 0); /* the SPACE owner owns the physical drop */
 	cluster_cold_plan_destroy_v1(&plan);
 
 	/* The relation file number is reused by a new incarnation: the dropped

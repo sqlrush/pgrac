@@ -1,15 +1,16 @@
 /* Author: SqlRush <sqlrush@gmail.com>
  * Execute native checkpoint redo selection, the complete CheckPointGuts and
- * CreateCheckPoint's wait-through-publication call sites. Reuse the real TT
+ * CreateCheckPoint's wait-through-publication call sites with the original
+ * RecordTransactionCommit/emitter at controlled interleavings. Reuse the real TT
  * terminal apply, undo header writer and fsync crash model. Other checkpoint
  * subsystems, checkpoint WAL storage and the ROOT publisher are boundaries;
  * this is neither a live crash test nor qualified recovery-base authority.
  * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md
  */
-int checkpoint_publish_fixture_main(void);
-#define TT_CHECKPOINT_TEST_MAIN checkpoint_publish_fixture_main
+int checkpoint_native_fixture_main(int argc, char **argv);
+#define TT_CHECKPOINT_NATIVE_MAIN checkpoint_native_fixture_main
 #define CheckPointGuts coverage_prior_guts
-#include "test_cluster_tt_checkpoint_cuts.c"
+#include "test_cluster_tt_checkpoint_native.c"
 #undef CheckPointGuts
 
 #include <time.h>
@@ -20,7 +21,6 @@ int checkpoint_publish_fixture_main(void);
 
 typedef enum PublishFault { PUBLISH_NO_FAULT, PUBLISH_WAL_FLUSH, PUBLISH_ROOT } PublishFault;
 
-bool cluster_shared_config = true;
 bool cluster_controlfile_shared_authority = true;
 int wal_segment_size = 1024 * 1024;
 XLogRecPtr ProcLastRecPtr;
@@ -42,11 +42,11 @@ static unsigned publish_inserts, publish_flushes, publish_calls, publish_syncs;
 static unsigned publish_pi_releases, publish_twophase;
 static bool publish_lock_held;
 static bool publish_order_ok;
+static int publish_producer_crit;
 static CheckPoint publish_registered;
 static XLogRecPtr publish_wal_end;
 static uint8 publish_info;
-static const XLogRecPtr publish_start = 512;
-static const XLogRecPtr publish_end = 768;
+static XLogRecPtr publish_start, publish_end;
 
 static bool
 publish_durable_slot(uint32 index, const TTSlot *expected)
@@ -160,6 +160,7 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 #define XLogBeginInsert publish_begin_insert
 #define XLogRegisterData publish_register
 #define XLogInsert publish_insert
+#undef XLogFlush
 #define XLogFlush publish_flush
 #undef START_CRIT_SECTION
 #define START_CRIT_SECTION() (++CritSectionCount)
@@ -240,23 +241,10 @@ publish_reset_calls(void)
 }
 
 static void
-publish_setup(void)
+publish_setup_control(void)
 {
-	UndoSegmentHeaderData *resident;
-
-	coverage_setup();
 	MyBackendType = B_CHECKPOINTER;
 	MyAuxProcType = CheckpointerProcess;
-	resident = (UndoSegmentHeaderData *)coverage_resident.data;
-	/* A long-lived top remains ACTIVE across the same checkpoint. */
-	publish_active = resident->tt_slots[7];
-	publish_active.xid = 101;
-	publish_active.wrap = 4;
-	resident->tt_slots[8] = publish_active;
-	memcpy(model_files[1].cache, resident, BLCKSZ);
-	memcpy(model_files[1].durable, resident, BLCKSZ);
-	publish_committed = tt_commit_stage.successor;
-	coverage_finish_commit();
 	memset(&publish_control, 0, sizeof(publish_control));
 	publish_control.checkPoint = 40;
 	publish_control.checkPointCopy.redo = 20;
@@ -266,7 +254,41 @@ publish_setup(void)
 	ProcLastRecPtr = 0;
 	LocalXLogInsertAllowed = 1;
 	CritSectionCount = 0;
+	publish_start = 512;
+	publish_end = 768;
 	publish_reset_calls();
+}
+
+static void
+publish_add_active(void)
+{
+	UndoSegmentHeaderData *resident = (UndoSegmentHeaderData *)coverage_resident.data;
+	size_t offset = offsetof(UndoSegmentHeaderData, tt_slots) + 8 * sizeof(TTSlot);
+
+	/* Slot 7's durable predecessor is still ACTIVE, including at STAMPED.
+	 * Install only slot 8: copying the whole page would silently persist the
+	 * producer's dirty terminal stamp before the checkpoint under test. */
+	memcpy(&publish_active, model_files[1].durable + STAMP_OFFSET, sizeof(TTSlot));
+	publish_active.xid = 101;
+	publish_active.wrap = 4;
+	resident->tt_slots[8] = publish_active;
+	memcpy(model_files[1].cache + offset, &publish_active, sizeof(TTSlot));
+	memcpy(model_files[1].durable + offset, &publish_active, sizeof(TTSlot));
+	publish_committed = publish_active;
+	publish_committed.xid = 100;
+	publish_committed.wrap = 3;
+	publish_committed.status = TT_SLOT_COMMITTED;
+	publish_committed.commit_scn = scn_encode(1, 42);
+	publish_committed.first_undo_block = coverage_invalid_head;
+}
+
+static void
+publish_setup(void)
+{
+	coverage_setup();
+	publish_add_active();
+	coverage_finish_commit();
+	publish_setup_control();
 }
 
 UT_TEST(native_checkpoint_syncs_tt_before_publishing_selected_redo)
@@ -355,15 +377,174 @@ UT_TEST(native_checkpoint_root_error_leaves_the_native_candidate_private)
 	UT_ASSERT(coverage_durable_committed());
 }
 
-int
-main(void)
+static void
+publish_native_finish(void)
 {
-	UT_PLAN(5);
+	/* The producer is paused until the checkpoint's original wait yields.
+	 * Model the two backends' critical-section counters at this serialized
+	 * scheduler boundary; never let the checkpointer inherit the producer's. */
+	publish_order_ok &= CritSectionCount == 0;
+	CritSectionCount = publish_producer_crit;
+	native_finish();
+	publish_order_ok &= CritSectionCount == 0;
+}
+
+static bool
+publish_native_start(NativeCommitCut cut)
+{
+	if (!native_start(cut))
+		return false;
+	publish_producer_crit = CritSectionCount;
+	publish_add_active();
+	publish_setup_control();
+	coverage_wait_resume = publish_native_finish;
+	return true;
+}
+
+static bool
+publish_native_case(NativeCommitCut cut)
+{
+	TTSlot committed, active;
+	xl_xact_parsed_commit parsed;
+	const xl_xact_tt_commit *fold;
+	bool protected, raised, ok;
+
+	if (!publish_native_start(cut))
+		return false;
+	committed = publish_committed;
+	memcpy(&active, model_files[1].durable + STAMP_OFFSET, sizeof(active));
+	protected = cut != NATIVE_RESERVED && cut != NATIVE_RELEASED;
+	if (cut == NATIVE_RESERVED)
+		publish_committed = active; /* This checkpoint must precede COMMIT. */
+	raised = publish_raises(cut == NATIVE_RESERVED ? 50 : 200, false);
+	if (coverage_waits == 0)
+		publish_native_finish();
+	publish_committed = committed;
+	ok = !raised && publish_order_ok && native_order_ok && native_record_matches()
+		 && coverage_waits == (protected ? 1 : 0) && coverage_absorbs == coverage_waits
+		 && publish_inserts == 1 && publish_flushes == 1 && publish_calls == 1 && publish_syncs == 1
+		 && publish_twophase == 1 && publish_pi_releases == 1
+		 && publish_anchor.checkPoint == publish_start && publish_wal_end == publish_end
+		 && publish_anchor.checkPointCopy.redo == (cut == NATIVE_RESERVED ? 50 : 200)
+		 && native_result == 100 && native_inserts == 1 && native_flushes == 1 && native_clogs == 1
+		 && coverage_commits == 1 && MyProc->delayChkptFlags == 0 && CritSectionCount == 0
+		 && publish_durable_slot(8, &publish_active);
+	model_crash();
+	process_crash_restart();
+	if (cut == NATIVE_RESERVED) {
+		ok &= model_files[1].fsyncs == 0 && publish_durable_slot(7, &active);
+		/* Consume the actual producer's native terminal payload, not a
+		 * caller-supplied terminal shape or an invented checkpoint proof. */
+		memset(&parsed, 0, sizeof(parsed));
+		if (!ParseCommitRecord(native_info, (xl_xact_commit *)native_wal, native_wal_len, &parsed))
+			return false;
+		fold = &parsed.tt_commit;
+		cluster_tt_durable_redo_stamp_slot_exact(fold->instance, fold->segment_id,
+												 fold->segment_generation, fold->slot_offset,
+												 fold->wrap, fold->xid, fold->commit_scn);
+		ok &= coverage_redo_applies == 1;
+	} else
+		ok &= coverage_redo_applies == 0;
+	return ok && model_files[1].fsyncs == 1 && publish_tt_durable() && coverage_durable_committed();
+}
+
+UT_TEST(native_reserved_commit_replays_after_earlier_published_checkpoint)
+{
+	UT_ASSERT(publish_native_case(NATIVE_RESERVED));
+}
+
+UT_TEST(native_inserted_commit_is_durable_before_checkpoint_publication)
+{
+	UT_ASSERT(publish_native_case(NATIVE_INSERTED));
+}
+
+UT_TEST(native_flushed_commit_is_durable_before_checkpoint_publication)
+{
+	UT_ASSERT(publish_native_case(NATIVE_FLUSHED));
+}
+
+UT_TEST(native_stamped_commit_leaves_window_before_checkpoint_publication)
+{
+	UT_ASSERT(publish_native_case(NATIVE_STAMPED));
+}
+
+UT_TEST(native_released_commit_is_durable_before_checkpoint_publication)
+{
+	UT_ASSERT(publish_native_case(NATIVE_RELEASED));
+}
+
+UT_TEST(native_commit_checkpoint_sync_refusal_keeps_old_selected_anchor)
+{
+	ControlFileData prior;
+
+	UT_ASSERT(publish_native_start(NATIVE_INSERTED));
+	prior = publish_anchor;
+	model_fsync_fails = true;
+	UT_ASSERT(publish_raises(200, false));
+	UT_ASSERT(native_order_ok && native_record_matches());
+	UT_ASSERT_EQ(coverage_waits, 1);
+	UT_ASSERT_EQ(coverage_commits, 1);
+	UT_ASSERT_EQ(publish_inserts, 0);
+	UT_ASSERT_EQ(publish_calls, 0);
+	UT_ASSERT(memcmp(&publish_anchor, &prior, sizeof(prior)) == 0);
+	UT_ASSERT(memcmp(ControlFile, &prior, sizeof(prior)) == 0);
+	UT_ASSERT(!publish_tt_durable());
+	/* A live retry retains the original pending header sync request. */
+	publish_reset_calls();
+	UT_ASSERT(!publish_raises(208, false));
+	UT_ASSERT(publish_order_ok && publish_tt_durable());
+	UT_ASSERT_EQ(publish_anchor.checkPointCopy.redo, 208);
+}
+
+UT_TEST(old_active_survives_successive_published_checkpoints_without_bind_input)
+{
+	unsigned i;
+
+	publish_setup();
+	/* No BIND WAL is supplied to this header/checkpoint fixture. This checks
+	 * physical preservation, not WAL pruning or qualified recovery input. */
+	for (i = 0; i < 3; i++) {
+		XLogRecPtr prior_redo = publish_anchor.checkPointCopy.redo;
+		XLogRecPtr redo = 200 + i * 1024;
+
+		publish_reset_calls();
+		publish_start = 512 + i * 1024;
+		publish_end = 768 + i * 1024;
+		UT_ASSERT(!publish_raises(redo, false));
+		UT_ASSERT(publish_order_ok && publish_tt_durable());
+		UT_ASSERT_EQ(PriorRedoPtr, prior_redo);
+		UT_ASSERT_EQ(publish_anchor.checkPointCopy.redo, redo);
+		UT_ASSERT_EQ(publish_calls, 1);
+		model_crash();
+		process_crash_restart();
+		UT_ASSERT(publish_durable_slot(8, &publish_active));
+		UT_ASSERT_EQ(publish_active.status, TT_SLOT_ACTIVE);
+	}
+}
+
+int
+main(int argc, char **argv)
+{
+	/* Isolate the missing-wait mutation without stranding a later producer. */
+	if (argc == 2 && strcmp(argv[1], "--inserted-only") == 0) {
+		UT_PLAN(1);
+		UT_RUN(native_inserted_commit_is_durable_before_checkpoint_publication);
+		UT_DONE();
+		return ut_failed_count == 0 ? 0 : 1;
+	}
+	UT_PLAN(12);
 	UT_RUN(native_checkpoint_syncs_tt_before_publishing_selected_redo);
 	UT_RUN(native_checkpoint_redo_selection_accounts_for_wal_page_headers);
 	UT_RUN(native_checkpoint_tt_sync_error_keeps_old_anchor_and_pending_header);
 	UT_RUN(native_checkpoint_wal_flush_error_does_not_publish_candidate);
 	UT_RUN(native_checkpoint_root_error_leaves_the_native_candidate_private);
+	UT_RUN(native_reserved_commit_replays_after_earlier_published_checkpoint);
+	UT_RUN(native_inserted_commit_is_durable_before_checkpoint_publication);
+	UT_RUN(native_flushed_commit_is_durable_before_checkpoint_publication);
+	UT_RUN(native_stamped_commit_leaves_window_before_checkpoint_publication);
+	UT_RUN(native_released_commit_is_durable_before_checkpoint_publication);
+	UT_RUN(native_commit_checkpoint_sync_refusal_keeps_old_selected_anchor);
+	UT_RUN(old_active_survives_successive_published_checkpoints_without_bind_input);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

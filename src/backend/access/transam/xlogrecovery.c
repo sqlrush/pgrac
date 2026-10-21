@@ -3416,8 +3416,7 @@ cluster_typed_replay_unscheduled(void *arg, uint32 participant)
 										&rep->decoded) != CLUSTER_COLD_OK)
 		cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
 									  "an unscheduled record no longer decodes");
-	if (!cluster_cold_effects_proof_record_v1(&rep->effects, participant, &rep->decoded, NULL,
-												 is_own))
+	if (rep->effects.invalid || !cluster_cold_replay_effects_v1(&rep->decoded, NULL, is_own))
 		cluster_typed_replay_mismatch(
 			rep, participant, r->ReadRecPtr,
 			"an unscheduled record has effects without a replay consumer");
@@ -3431,27 +3430,37 @@ cluster_typed_replay_unscheduled(void *arg, uint32 participant)
 		case CLUSTER_COLD_UNSCHEDULED_SPACE_SKIP:
 			if (is_own)
 				AdvanceNextFullTransactionIdPastXid(r->record->header.xl_xid);
-			return true;
+			break;
 		case CLUSTER_COLD_UNSCHEDULED_FOREIGN_NOOP:
 			/* Consume the exact captured control through its original cold
 			 * owner; no-effect classification is not a source completion. */
-			return cluster_cold_typed_side_record_v1(typed, *rep->fence_plan, participant,
-													 &rep->decoded.record);
+			if (!cluster_cold_typed_side_record_v1(typed, *rep->fence_plan, participant,
+												   &rep->decoded.record))
+				return false;
+			break;
 		case CLUSTER_COLD_UNSCHEDULED_FOREIGN_SIDE:
 			/* Keep the original pre-mutation fence and source-local consumer;
 			 * never run another origin's SLRU through founder native redo. */
 			cluster_typed_replay_foreign_gate(rep);
-			return cluster_cold_typed_side_record_v1(typed, *rep->fence_plan, participant,
-													 &rep->decoded.record);
+			if (!cluster_cold_typed_side_record_v1(typed, *rep->fence_plan, participant,
+												   &rep->decoded.record))
+				return false;
+			break;
 		case CLUSTER_COLD_UNSCHEDULED_NATIVE:
+			if (!is_own)
+				cluster_typed_replay_foreign_gate(rep);
+			rep->apply_foreign = !is_own;
+			cluster_typed_replay_apply(r, rep);
+			if (!is_own)
+				cluster_vis_bump_merged_records_applied();
 			break;
 	}
-	if (!is_own)
-		cluster_typed_replay_foreign_gate(rep);
-	rep->apply_foreign = !is_own;
-	cluster_typed_replay_apply(r, rep);
-	if (!is_own)
-		cluster_vis_bump_merged_records_applied();
+	/* Coverage follows a returned original owner or the validated skip,
+	 * never a refused or interrupted record. Durability is checked later. */
+	if (!cluster_cold_effects_proof_record_v1(&rep->effects, participant, &rep->decoded, NULL,
+											  is_own))
+		cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
+									  "a consumed record lost its complete effect route");
 	return true;
 }
 
@@ -3602,8 +3611,7 @@ cluster_typed_replay_scheduled(void *arg, uint32 participant, const ClusterColdS
 										source->claim.identity.storage_uuid, false, !is_own,
 										&rep->decoded)
 			!= CLUSTER_COLD_OK
-		|| !cluster_cold_effects_proof_record_v1(&rep->effects, participant, &rep->decoded, step,
-															 is_own)
+		|| rep->effects.invalid || !cluster_cold_replay_effects_v1(&rep->decoded, step, is_own)
 		|| action != cluster_cold_page_action_v1(step, is_own))
 		cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
 									  "a scheduled record has effects without a replay consumer");
@@ -3612,7 +3620,7 @@ cluster_typed_replay_scheduled(void *arg, uint32 participant, const ClusterColdS
 	{
 		case CLUSTER_COLD_SPACE_STEP:
 			cluster_typed_replay_space_step(rep, participant, step, r);
-			return true;
+			break;
 		case CLUSTER_COLD_PAGE_SKIP_ADVANCE_XID:
 
 			/*
@@ -3620,31 +3628,37 @@ cluster_typed_replay_scheduled(void *arg, uint32 participant, const ClusterColdS
 			 * be behind nextXid, exactly as replaying it would have left it.
 			 */
 			AdvanceNextFullTransactionIdPastXid(r->record->header.xl_xid);
-			return true;
-		case CLUSTER_COLD_PAGE_SKIP:
-			return true;
-		case CLUSTER_COLD_PAGE_APPLY:
 			break;
-	}
+		case CLUSTER_COLD_PAGE_SKIP:
+			break;
+		case CLUSTER_COLD_PAGE_APPLY:
 #ifdef CLUSTER_COLD_REDO_HOOK_CONSUMER_V1
-	rep->apply_foreign = participant != rep->typed->own_participant;
-	if (rep->apply_foreign)
-		cluster_typed_replay_foreign_gate(rep);
-	cluster_cold_apply_step_v1(step, r, cluster_typed_replay_apply, rep);
-	return true;
+			rep->apply_foreign = participant != rep->typed->own_participant;
+			if (rep->apply_foreign)
+				cluster_typed_replay_foreign_gate(rep);
+			cluster_cold_apply_step_v1(step, r, cluster_typed_replay_apply, rep);
+			break;
 #else
-	ereport(FATAL,
-			(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
-			 errmsg("typed cold recovery cannot apply page record %X/%X of thread %u",
-					LSN_FORMAT_ARGS(step->read_rec_ptr),
-					(unsigned) rep->typed->participants[participant].thread_id),
-			 errdetail("This build has no per-block typed redo consultation; applying the "
-					   "record through the freshness checks could skip or overwrite a newer "
-					   "page version."),
-			 errhint("Preserve all original thread WAL and start with a build that supports "
-					 "typed cold replay.")));
-	pg_unreachable();
+			ereport(
+				FATAL,
+				(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+				 errmsg("typed cold recovery cannot apply page record %X/%X of thread %u",
+						LSN_FORMAT_ARGS(step->read_rec_ptr),
+						(unsigned)rep->typed->participants[participant].thread_id),
+				 errdetail("This build has no per-block typed redo consultation; applying the "
+						   "record through the freshness checks could skip or overwrite a newer "
+						   "page version."),
+				 errhint("Preserve all original thread WAL and start with a build that supports "
+						 "typed cold replay.")));
+			pg_unreachable();
 #endif
+		}
+		if (!cluster_cold_effects_proof_record_v1(&rep->effects, participant, &rep->decoded, step,
+												  is_own))
+			cluster_typed_replay_mismatch(
+				rep, participant, r->ReadRecPtr,
+				"a consumed scheduled record lost its complete effect route");
+		return true;
 }
 
 /* PGRAC: bind the current C0 before the sequencer touches its target. */
@@ -3779,12 +3793,14 @@ cluster_typed_replay_unpublished(uint16 thread, const char *what, int detail)
 	pg_unreachable();
 }
 
-/* Keep the original physical durability barrier before counter publication. */
+/* Keep the original durability barrier, then final PAGE readback, before
+ * counter publication. Neither step grants recovered-generation authority. */
 static bool
 cluster_typed_replay_durable_endpoints(ClusterColdTypedReplay *rep,
 									   const ClusterColdReplayResultV1 *result)
 {
 	return cluster_cold_durable_barrier_v1(&rep->touched)
+		   && cluster_cold_data_readback_v1(rep->typed)
 		   && cluster_cold_typed_xid_endpoints_v1(rep->typed, *rep->fence_plan, result,
 												  rep->xid_progress);
 }
@@ -3813,7 +3829,7 @@ cluster_typed_replay_publish(ClusterColdTypedReplay *rep, const ClusterColdRepla
 										 (int) result->detail);
 	if (!cluster_typed_replay_durable_endpoints(rep, result))
 		cluster_typed_replay_unpublished(
-			thread, "Native durability or source counter endpoints are incomplete",
+			thread, "Native durability, PAGE readback or source counter endpoints are incomplete",
 			(int)rep->typed->refusal);
 	switch (cluster_recovery_merge_fence_plan_complete_v1(plan, &thread, &detail))
 	{

@@ -1575,17 +1575,17 @@ rf_side_online_plan_contains_commit_v1(const RfSideOnlinePlanV1 *plan,
 	return false;
 }
 
-bool
-rf_side_online_plan_abort_target_v1(const RfSideOnlinePlanV1 *plan,
-									const RfSideOnlineOperationV1 *operation,
-									ClusterUndoDecoded *out)
+static bool
+side_plan_abort_identity(const RfSideOnlinePlanV1 *plan, const RfSideOnlineOperationV1 *operation,
+						 ClusterUndoDecoded *out, bool include_history)
 {
 	const RfSideOnlineOperationV1 *abort = NULL;
 	uint32 native_count = 0;
 
 	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || plan->failed
 		|| plan->purpose != RF_SIDE_PLAN_RECOVERY || operation == NULL || out == NULL
-		|| operation->purpose != RF_SIDE_PLAN_RECOVERY || operation->history_only
+		|| operation->purpose != RF_SIDE_PLAN_RECOVERY
+		|| (operation->history_only && !include_history)
 		|| operation->kind != RF_SIDE_ONLINE_OPERATION_XACT
 		|| operation->xact.kind != RF_SIDE_XACT_ABORT
 		|| (operation->xact.cold_completion_effects
@@ -1664,6 +1664,22 @@ rf_side_online_plan_abort_target_v1(const RfSideOnlinePlanV1 *plan,
 	}
 	*out = abort->undo;
 	return true;
+}
+
+bool
+rf_side_online_plan_abort_target_v1(const RfSideOnlinePlanV1 *plan,
+									const RfSideOnlineOperationV1 *operation,
+									ClusterUndoDecoded *out)
+{
+	return side_plan_abort_identity(plan, operation, out, false);
+}
+
+bool
+rf_side_online_plan_abort_identity_v1(const RfSideOnlinePlanV1 *plan,
+									  const RfSideOnlineOperationV1 *operation,
+									  ClusterUndoDecoded *out)
+{
+	return side_plan_abort_identity(plan, operation, out, true);
 }
 
 static ClusterUndoHeaderPrepareResultV1

@@ -81,6 +81,7 @@ typedef struct AbortReplayFixture {
 	uint32 prepares;
 	uint32 finals;
 	uint32 scheduled;
+	uint32 consumed;
 	bool drained[2];
 	int fault;
 	EffectRecord current;
@@ -358,6 +359,7 @@ abort_replay_consume(void *arg, uint32 participant)
 	RfPageOnlineRecordIdentityV1 identity = abort_replay_identity(&h->current);
 	bool accepted;
 
+	h->consumed++;
 	UT_ASSERT_EQ(participant, 1);
 	UT_ASSERT_EQ(
 		cluster_cold_recovery_decode_v1(&h->current.reader, 99, uuid, true, true, &decoded),
@@ -482,13 +484,25 @@ UT_TEST(test_relation_abort_replay_failure_keeps_final_drain_closed)
 	for (int fault = 1; fault <= 6; fault++) {
 		AbortReplayFixture h = { .fault = fault };
 		ClusterColdReplayResultV1 result;
+		ClusterColdReplayDetailV1 expected = CLUSTER_COLD_REPLAY_CALLBACK;
 
 		abort_replay_capture(&h, false);
-		UT_ASSERT_EQ(abort_replay_run(&h, &result),
-					 fault == 4 ? CLUSTER_COLD_REPLAY_CUT_DIFFERS : CLUSTER_COLD_REPLAY_CALLBACK);
+		if (fault == 4)
+			expected = CLUSTER_COLD_REPLAY_CUT_DIFFERS;
+		else if (fault == 5)
+			expected = CLUSTER_COLD_REPLAY_IDENTITY;
+		UT_ASSERT_EQ(abort_replay_run(&h, &result), expected);
 		UT_ASSERT(!h.drained[1]);
 		UT_ASSERT_EQ(h.finals, 0);
 		UT_ASSERT_EQ(h.begins, h.ends);
+		if (fault == 5) {
+			/* Changed ABORT CRC is rejected before the SIDE consumer. */
+			UT_ASSERT_EQ(h.consumed, 5);
+			UT_ASSERT_EQ(result.participant, 1);
+			UT_ASSERT_EQ(result.rec_ptr, ABORT_REPLAY_LSN(5));
+			UT_ASSERT_EQ(result.last_read[1], ABORT_REPLAY_LSN(4));
+			UT_ASSERT_EQ(result.last_crc[1], 104);
+		}
 		if (fault == 3) {
 			UT_ASSERT_EQ(h.applied, 0);
 			UT_ASSERT_EQ(h.prepares, 0);

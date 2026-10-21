@@ -87,6 +87,7 @@ typedef struct Harness {
 	bool dependency_cycle;
 	bool dependency_refuse;
 	uint32 dependency_target;
+	uint32 dependency_calls;
 	uint32 drain_calls[2];
 	bool drained[2];
 	uint64 drained_records[2];
@@ -384,6 +385,7 @@ op_record_dependency(void *arg, uint32 participant, const ClusterColdReplayRecor
 					 uint32 *target)
 {
 	Harness *h = arg;
+	h->dependency_calls++;
 	*target = CLUSTER_COLD_NO_INDEX;
 	if (!h->dependency_enabled)
 		return true;
@@ -651,6 +653,140 @@ UT_TEST(test_replay_scheduled_record_must_match)
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
+/* Unscheduled native/SIDE inputs need the same identity check as PAGE/SPACE,
+ * before even a dependency callback can drain another source. */
+UT_TEST(test_replay_unscheduled_record_must_match_before_callbacks)
+{
+	static const uint32 participant[] = { 0, 0, 1 };
+	static const uint32 position[] = { 0, 2, 1 };
+	static const int events[] = { 0, 3, 5 };
+	static const XLogRecPtr last_read[] = { InvalidXLogRecPtr, 0x1100, 0x1000 };
+	ClusterColdPlanV1 *plan;
+	ClusterColdReplayResultV1 result;
+	Harness h;
+	uint32 at;
+	uint32 field;
+
+	fixture(false);
+	plan = seal();
+	for (at = 0; at < lengthof(participant); at++) {
+		for (field = 0; field < 5; field++) {
+			ClusterColdReplayRecordV1 *record;
+			uint32 p = participant[at];
+
+			harness_init(&h);
+			record = &h.stream[p].record[position[at]];
+			switch (field) {
+			case 0:
+				record->record_crc ^= 1;
+				break;
+			case 1:
+				record->rmid ^= 1;
+				break;
+			case 2:
+				record->info ^= 0x10;
+				break;
+			case 3:
+				record->read_rec_ptr += 8;
+				break;
+			case 4:
+				record->end_rec_ptr -= 8;
+				break;
+			}
+			UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_IDENTITY);
+			UT_ASSERT_EQ(result.participant, p);
+			UT_ASSERT_EQ(result.rec_ptr, record->read_rec_ptr);
+			UT_ASSERT_EQ(h.events, events[at]);
+			UT_ASSERT_EQ(h.dependency_calls, at);
+			UT_ASSERT_EQ(result.last_read[p], last_read[at]);
+			UT_ASSERT_EQ(h.drain_calls[p], 0);
+		}
+	}
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_replay_missing_or_extra_input_stops_before_effects)
+{
+	ClusterColdPlanV1 *plan;
+	ClusterColdReplayResultV1 result;
+	Harness h;
+
+	fixture(false);
+	plan = seal();
+	/* A scheduled frame cannot silently replace its omitted native prefix. */
+	harness_init(&h);
+	h.stream[0].next = 1;
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_IDENTITY);
+	UT_ASSERT_EQ(result.participant, 0);
+	UT_ASSERT_EQ(result.rec_ptr, 0x1100);
+	UT_ASSERT_EQ(h.events, 0);
+	UT_ASSERT_EQ(h.dependency_calls, 0);
+	UT_ASSERT_EQ(result.last_read[0], InvalidXLogRecPtr);
+
+	/* A duplicate terminal frame has the same tail, but no pass-1 input. */
+	harness_init(&h);
+	h.stream[1].record[2] = h.stream[1].record[1];
+	h.stream[1].count = 3;
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_IDENTITY);
+	UT_ASSERT_EQ(result.participant, 1);
+	UT_ASSERT_EQ(result.rec_ptr, 0x1100);
+	UT_ASSERT_EQ(h.events, 6);
+	UT_ASSERT_EQ(h.dependency_calls, 3);
+	UT_ASSERT_EQ(h.drain_calls[1], 0);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
+/* Metadata feed order is not replay order or canonical participant order.
+ * Cursor-only streams still skip their own retained historical prefix. */
+UT_TEST(test_replay_interleaved_cursor_only_inputs_skip_history)
+{
+	ClusterColdPlanV1 *plan = NULL;
+	ClusterColdReplayResultV1 result;
+	ClusterColdDiagV1 diag;
+	Harness h;
+	uint32 p;
+	int i;
+
+	fixture(false);
+	cuts[0].thread_id = 2;
+	cuts[1].thread_id = 1;
+	cuts[0].native_redo = cuts[1].native_redo = 0x1100;
+	UT_ASSERT_EQ(cluster_cold_plan_create_v1(cuts, 2, BUDGET, &plan), CLUSTER_COLD_OK);
+	for (i = 0; i < MAX_STREAM; i++) {
+		for (p = 0; p < 2; p++) {
+			ClusterColdRecordV1 record;
+			ClusterColdReplayRecordV1 id;
+
+			if (i >= fix_count[p])
+				continue;
+			fix[p][i] = plain(fix[p][i].read, fix[p][i].end);
+			id = identity(&fix[p][i]);
+			memset(&record, 0, sizeof(record));
+			record.read_rec_ptr = id.read_rec_ptr;
+			record.end_rec_ptr = id.end_rec_ptr;
+			record.prev_rec_ptr = i == 0 ? cuts[p].physical_lower - 0x40 : fix[p][i - 1].read;
+			record.record_crc = id.record_crc;
+			record.rmid = id.rmid;
+			UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, p, &record), CLUSTER_COLD_OK);
+		}
+	}
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, NULL, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 0);
+	harness_init(&h);
+	h.stream[0].next = h.stream[1].next = 1;
+	h.order_mode = 1; /* drain caller participant 1 before participant 0 */
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_OK);
+	UT_ASSERT_EQ(h.events, 4);
+	UT_ASSERT_EQ(h.dependency_calls, 4);
+	UT_ASSERT(event_is(&h, 0, T_UNSCHEDULED, 1, 0x1100));
+	UT_ASSERT(event_is(&h, 1, T_UNSCHEDULED, 0, 0x1100));
+	UT_ASSERT_EQ(h.drained_records[0], 3);
+	UT_ASSERT_EQ(h.drained_records[1], 1);
+	UT_ASSERT_EQ(h.drained_end[0], cuts[0].tail_end);
+	UT_ASSERT_EQ(h.drained_end[1], cuts[1].tail_end);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
 /* Draining proves the cut: nothing past the tail, same end, same count. */
 UT_TEST(test_replay_drain_proves_the_cut)
 {
@@ -676,21 +812,24 @@ UT_TEST(test_replay_drain_proves_the_cut)
 	UT_ASSERT_EQ(result.participant, 1);
 	UT_ASSERT_EQ(result.rec_ptr, 0x1100);
 
-	/* Same tail, one more record than pass 1 saw. */
+	/* Same tail, one more record: the changed frame is refused first. */
 	harness_init(&h);
 	h.stream[1].record[1].end_rec_ptr = 0x1200;
 	h.stream[1].record[2].read_rec_ptr = 0x1200;
 	h.stream[1].record[2].end_rec_ptr = 0x1300;
 	h.stream[1].count = 3;
-	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_CUT_DIFFERS);
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_IDENTITY);
 	UT_ASSERT_EQ(result.participant, 1);
+	UT_ASSERT_EQ(result.rec_ptr, 0x1100);
+	UT_ASSERT_EQ(h.events, 5);
 
-	/* As many records as pass 1 saw, but the last ends short of the tail. */
+	/* Same count, short tail: refuse identity before its effect callback. */
 	harness_init(&h);
 	h.stream[1].record[1].end_rec_ptr = 0x1200;
-	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_CUT_DIFFERS);
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_IDENTITY);
 	UT_ASSERT_EQ(result.participant, 1);
-	UT_ASSERT_EQ(result.rec_ptr, 0x1200);
+	UT_ASSERT_EQ(result.rec_ptr, 0x1100);
+	UT_ASSERT_EQ(h.events, 5);
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
@@ -1266,7 +1405,7 @@ UT_TEST(test_dependency_cycle_is_bounded_without_consuming_waiting_record)
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(26);
 	UT_RUN(test_effect_proof_requires_every_plan_record);
 	UT_RUN(test_replay_rebinds_every_original_cut_before_callbacks);
 	UT_RUN(test_replay_rebinds_history_only_cut_before_scheduled_work);
@@ -1282,6 +1421,9 @@ main(void)
 	UT_RUN(test_replay_follows_schedule_and_drains);
 	UT_RUN(test_replay_page_actions);
 	UT_RUN(test_replay_scheduled_record_must_match);
+	UT_RUN(test_replay_unscheduled_record_must_match_before_callbacks);
+	UT_RUN(test_replay_missing_or_extra_input_stops_before_effects);
+	UT_RUN(test_replay_interleaved_cursor_only_inputs_skip_history);
 	UT_RUN(test_replay_drain_proves_the_cut);
 	UT_RUN(test_replay_history_only_generation);
 	UT_RUN(test_replay_callback_refusal_stops);

@@ -190,11 +190,17 @@ extern bool rf_side_online_plan_replay_start_matches_v1(const RfSideOnlinePlanV1
 														XLogRecPtr native_redo);
 extern bool rf_side_online_plan_contains_commit_v1(const RfSideOnlinePlanV1 *plan,
 												   const RfSideXactOperationV1 *operation);
-/* Identify the preceding versioned TT abort in the same immutable source.
+/* Identify the preceding versioned TT abort for a replay operation only.
  * Target reconstruction, durability and terminal publication remain separate. */
 extern bool rf_side_online_plan_abort_target_v1(const RfSideOnlinePlanV1 *plan,
 												const RfSideOnlineOperationV1 *operation,
 												ClusterUndoDecoded *out);
+/* Read-only identity from the same unique immutable carrier, including
+ * retained history. This does not authorize replay, IO or terminal publication.
+ * Failure leaves out untouched. The replay-only target accessor stays strict. */
+extern bool rf_side_online_plan_abort_identity_v1(const RfSideOnlinePlanV1 *plan,
+												  const RfSideOnlineOperationV1 *operation,
+												  ClusterUndoDecoded *out);
 /* Only later native TRUNCATE in this exact sealed source can justify an
  * absent CREATE page. No visibility or mutation authority is returned. */
 extern bool rf_side_online_plan_multixact_page_retired_v1(const RfSideOnlinePlanV1 *plan,

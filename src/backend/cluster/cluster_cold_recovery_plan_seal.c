@@ -499,7 +499,16 @@ page_group_resolve(ClusterColdPlanV1 *plan, const uint32 *group, uint32 count, C
 	detail = page_data_position(plan, work->chain, count, &data, &covered, &exact, &position, diag);
 	if (detail != CLUSTER_COLD_OK)
 		return detail;
-	return page_assign_verdicts(plan, work->chain, count, &data, covered, exact, position, diag);
+	detail = page_assign_verdicts(plan, work->chain, count, &data, covered, exact, position, diag);
+	if (detail == CLUSTER_COLD_OK) {
+		ColdComponent *last = cold_component(plan, work->chain[count - 1]);
+
+		/* Retain one live frontier after verdict assignment, including an
+		 * all-SKIP page. History/object checkpoints keep their original duty. */
+		if (!component_settled(plan, last))
+			last->state |= COLD_STATE_FINAL;
+	}
+	return detail;
 }
 
 static ClusterColdDetailV1
@@ -614,6 +623,58 @@ cluster_cold_plan_seal_v1(ClusterColdPlanV1 *plan, ClusterColdObserveV1 observe,
 		return detail;
 	}
 	plan->phase = COLD_PHASE_SEALED;
+	return CLUSTER_COLD_OK;
+}
+
+ClusterColdDetailV1
+cluster_cold_plan_readback_v1(const ClusterColdPlanV1 *plan, ClusterColdObserveV1 observe,
+							  void *arg, ClusterColdDiagV1 *diag)
+{
+	ClusterColdDiagV1 local;
+	uint32 i;
+
+	if (diag == NULL)
+		diag = &local;
+	memset(diag, 0, sizeof(*diag));
+	if (!plan_valid(plan) || observe == NULL) {
+		diag->detail = CLUSTER_COLD_INVALID_ARGUMENT;
+		return CLUSTER_COLD_INVALID_ARGUMENT;
+	}
+	if (plan->phase != COLD_PHASE_SEALED) {
+		diag->detail = CLUSTER_COLD_STATE;
+		return CLUSTER_COLD_STATE;
+	}
+	for (i = 0; i < plan->component_count; i++) {
+		const ColdComponent *component = cold_component(plan, i);
+		RfPageIdentityV1 page;
+		RfPageVersionV1 result;
+		ClusterColdDataV1 data;
+		ClusterColdDetailV1 detail;
+
+		if ((component->state & COLD_STATE_FINAL) == 0)
+			continue;
+		page = cold_plan_component_page(plan, component);
+		result = cold_plan_component_result(plan, component);
+		memset(&data, 0, sizeof(data));
+		if (!observe(arg, &page, &data) || !data_shape_valid(&data))
+			detail = CLUSTER_COLD_OBSERVATION_FAILED;
+		else if (data.kind != CLUSTER_COLD_DATA_PRESENT
+				 || (data.flags & CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED) == 0)
+			detail = CLUSTER_COLD_CONTENT_UNPROVEN;
+		else if ((data.flags & CLUSTER_COLD_DATA_FLAG_NO_IDENTITY) != 0)
+			detail = CLUSTER_COLD_IDENTITY_MISSING;
+		else if (memcmp(data.version.segment_incarnation, result.segment_incarnation, 16) != 0)
+			detail = CLUSTER_COLD_INCARNATION_MISMATCH;
+		else if (data.version.mutation_token != result.mutation_token)
+			/* An ancestor was valid at seal time, but is not the final result. */
+			detail = CLUSTER_COLD_ANCESTOR_MISSING;
+		else
+			continue;
+		cold_diag_component(plan, diag, i);
+		diag->version = data.version;
+		diag->detail = (uint8)detail;
+		return detail;
+	}
 	return CLUSTER_COLD_OK;
 }
 

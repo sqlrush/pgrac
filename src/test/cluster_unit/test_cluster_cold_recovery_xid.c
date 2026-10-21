@@ -322,8 +322,10 @@ UT_TEST(test_null_and_uninitialized_inputs)
 int
 main(void)
 {
-	UT_PLAN(29);
+	UT_PLAN(31);
 	UT_RUN(test_startup_publish_refuses_missing_effects_before_completion);
+	UT_RUN(test_startup_publish_rejects_inconsistent_coverage_and_clears_receipt);
+	UT_RUN(test_startup_publish_empty_sealed_cut_keeps_later_gates);
 	UT_RUN(test_startup_publish_stops_before_handoff_on_incomplete_inputs);
 	UT_RUN(test_startup_publish_propagates_all_completion_refusals);
 	UT_RUN(test_startup_publish_hands_off_only_after_native_durability_and_endpoints);
@@ -352,6 +354,7 @@ main(void)
 	UT_RUN(test_replay_xid_history_cut_is_not_checkpoint_coverage);
 	UT_RUN(test_replay_xid_empty_exact_checkpoint_cut);
 	UT_RUN(test_replay_xid_bad_checkpoint_or_source);
+	cluster_cold_plan_destroy_v1(&replay_typed.plan);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

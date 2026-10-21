@@ -47,6 +47,8 @@ typedef struct ColdReplayRun {
 	const ClusterColdReplayOpsV1 *ops;
 	void *arg;
 	ClusterColdReplayResultV1 *result;
+	uint32 input_frames;
+	uint32 input_cursor[CLUSTER_COLD_MAX_PARTICIPANTS];
 	uint64 consumed[CLUSTER_COLD_MAX_PARTICIPANTS];
 	XLogRecPtr last_end[CLUSTER_COLD_MAX_PARTICIPANTS];
 	uint32 scheduled_through[CLUSTER_COLD_MAX_PARTICIPANTS];
@@ -363,6 +365,29 @@ replay_identity_matches(const ClusterColdReplayRecordV1 *record, const ClusterCo
 		   && record->rmid == step->rmid && record->info == step->info;
 }
 
+/* Bind every pass-2 record, including those without a planning step, to
+ * the sealed input transcript before dependency or effect callbacks. Feed
+ * order may interleave participants; each caller-index cursor advances
+ * only forward and skips retained history. At most one full metadata scan
+ * per participant is needed, without allocating another replay index. */
+static bool
+replay_input_matches(ColdReplayRun *run, uint32 participant,
+					 const ClusterColdReplayRecordV1 *record)
+{
+	while (run->input_cursor[participant] < run->input_frames) {
+		ClusterColdRecordFrameV1 frame;
+
+		if (!cluster_cold_plan_input_frame_v1(run->plan, run->input_cursor[participant]++, &frame))
+			return false;
+		if (frame.participant != participant || frame.history)
+			continue;
+		return frame.read_rec_ptr == record->read_rec_ptr
+			   && frame.end_rec_ptr == record->end_rec_ptr && frame.record_crc == record->record_crc
+			   && frame.rmid == record->rmid && frame.info == record->info;
+	}
+	return false;
+}
+
 static ClusterColdReplayDetailV1 replay_drain(ColdReplayRun *run, uint32 participant);
 
 /* The original owner resolves the captured record's exact dependency. A
@@ -373,6 +398,8 @@ replay_unscheduled(ColdReplayRun *run, uint32 participant, const ClusterColdRepl
 	uint32 target = CLUSTER_COLD_NO_INDEX;
 	ClusterColdReplayDetailV1 detail;
 
+	if (!replay_input_matches(run, participant, record))
+		return replay_stop(run, CLUSTER_COLD_REPLAY_IDENTITY, participant, record->read_rec_ptr);
 	if (run->ops->record_dependency != NULL
 		&& !run->ops->record_dependency(run->arg, participant, record, &target))
 		return replay_stop(run, CLUSTER_COLD_REPLAY_CALLBACK, participant, record->read_rec_ptr);
@@ -430,7 +457,8 @@ replay_step(ColdReplayRun *run, uint32 index)
 	detail = replay_until(run, step.participant, step.read_rec_ptr, &record);
 	if (detail != CLUSTER_COLD_REPLAY_OK)
 		return detail;
-	if (!replay_identity_matches(&record, &step))
+	if (!replay_identity_matches(&record, &step)
+		|| !replay_input_matches(run, step.participant, &record))
 		return replay_stop(run, CLUSTER_COLD_REPLAY_IDENTITY, step.participant, step.read_rec_ptr);
 	replay_consumed(run, step.participant, &record);
 	action = cluster_cold_page_action_v1(&step, step.participant == run->own);
@@ -513,7 +541,8 @@ cluster_cold_replay_run_v1(const ClusterColdPlanV1 *plan,
 		|| participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
 		|| participant_count != cluster_cold_plan_participant_count_v1(plan)
 		|| own >= participant_count || ops == NULL || ops->next == NULL || ops->unscheduled == NULL
-		|| ops->scheduled == NULL)
+		|| ops->scheduled == NULL
+		|| !cluster_cold_plan_input_frame_count_v1(plan, &run.input_frames))
 		return replay_stop(&run, CLUSTER_COLD_REPLAY_INVALID_ARGUMENT, 0, InvalidXLogRecPtr);
 	relations = cluster_cold_plan_space_relation_count_v1(plan);
 	if (relations != 0 && ops->space_final == NULL)
