@@ -77,13 +77,16 @@ cluster_hio_lease_target_block(Relation relation)
 }
 #endif
 
-/* A rejected pin sample is not content-lock contention. Drop both pins
- * before normal reads refresh KO/current admission. Publish each new handle
- * immediately so the caller never retains a descriptor that can be recycled.
- * The existing ResourceOwner cleans up a successful first read if the second
- * read raises ERROR. No content lock or buffer pin crosses the short backoff. */
+/* Refresh a pair after a rejected pin sample.  The pair-lock path keeps both
+ * descriptors and re-enters the normal current path without holding either
+ * content lock.  LockBuffer() is the BufferDesc-aware route through PCM/GCS;
+ * replacing it with ReadBuffer() would fall through to smgrread() and can
+ * read a stale or torn page while another node owns the current image.
+ * Visibility-map repinning has a separate legacy caller that still needs to
+ * publish fresh handles after releasing its pins. */
 static void
-cluster_hio_refresh_buffer_pair(Relation relation, Buffer *first, Buffer *second)
+cluster_hio_refresh_buffer_pair(Relation relation, Buffer *first, Buffer *second,
+							bool reacquire_current)
 {
 	BlockNumber first_block;
 	BlockNumber second_block;
@@ -93,6 +96,15 @@ cluster_hio_refresh_buffer_pair(Relation relation, Buffer *first, Buffer *second
 	first_block = BufferGetBlockNumber(*first);
 	second_block = BufferGetBlockNumber(*second);
 	Assert(first_block < second_block);
+	if (reacquire_current)
+	{
+		LockBuffer(*first, BUFFER_LOCK_EXCLUSIVE);
+		LockBuffer(*first, BUFFER_LOCK_UNLOCK);
+		LockBuffer(*second, BUFFER_LOCK_EXCLUSIVE);
+		LockBuffer(*second, BUFFER_LOCK_UNLOCK);
+		return;
+	}
+
 	ReleaseBuffer(*first);
 	ReleaseBuffer(*second);
 	*first = *second = InvalidBuffer;
@@ -105,8 +117,10 @@ cluster_hio_refresh_buffer_pair(Relation relation, Buffer *first, Buffer *second
 
 /* P0-20: never sleep on the second PCM-X conversion with the first content
  * lock held. Ordinary misses resolve the second conversion alone. An invalid
- * KO/current pin sample instead requires unpin/read of both logical blocks;
- * retrying the same conditional probe cannot refresh that sample. */
+ * KO/current pin sample instead leaves the conditional path and re-enters the
+ * blocking current path in block order; retrying the same conditional probe
+ * cannot refresh that sample, while a fresh ReadBuffer() could read an image
+ * from storage before PCM/GCS has transferred the current copy. */
 static void
 cluster_hio_lock_buffer_pair(Relation relation, Buffer *first, Buffer *second)
 {
@@ -157,7 +171,7 @@ cluster_hio_lock_buffer_pair(Relation relation, Buffer *first, Buffer *second)
 			cluster_content_trace_wait_clear(CLCONTENT_PAIR);
 			cluster_content_trace_pair_end();
 #endif
-			cluster_hio_refresh_buffer_pair(relation, first, second);
+			cluster_hio_refresh_buffer_pair(relation, first, second, true);
 #ifdef USE_PGRAC_CLUSTER
 			cluster_content_trace_pair_begin(*first, *second);
 #endif
@@ -1215,7 +1229,7 @@ loop:
 			unlockedTargetBuffer = true;
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 			if (pin_invalid)
-				cluster_hio_refresh_buffer_pair(relation, otherBuffer, &buffer);
+				cluster_hio_refresh_buffer_pair(relation, otherBuffer, &buffer, false);
 			cluster_hio_lock_buffer_pair(relation, otherBuffer, &buffer);
 		}
 		recheckVmPins = true;

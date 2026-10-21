@@ -94,6 +94,12 @@ hio_lock(Buffer buffer, int mode)
 		hio_wait_pin_conflicts++;
 		siglongjmp(hio_jump, 1);
 	}
+	/* A blocking current acquire is the fixture's stand-in for refreshing
+	 * the rejected KO/current sample.  The caller keeps both pins and uses
+	 * the normal LockBuffer path instead of rereading either block. */
+	if (hio_stale_attempts > 0 && hio_stale_pin &&
+		hio_refs[2] + hio_refs[3] == 0)
+		hio_stale_pin = false;
 	hio_locks[buffer - 1] = true;
 	if (hio_make_second_visible)
 		PageSetAllVisible(hio_pages[hio_heap_buffers[1] - 1].data);
@@ -287,7 +293,7 @@ UT_TEST(actual_hio_pair_observes_each_cycle_and_resolution_leg)
 	}
 }
 
-UT_TEST(actual_hio_pair_stale_pin_requires_ordinary_reread)
+UT_TEST(actual_hio_pair_stale_pin_reacquires_current_without_disk_reread)
 {
 	int order;
 
@@ -305,67 +311,15 @@ UT_TEST(actual_hio_pair_stale_pin_requires_ordinary_reread)
 		UT_ASSERT(completed);
 		UT_ASSERT(!hio_stale_pin);
 		UT_ASSERT_EQ(hio_stale_attempts, 1);
-		UT_ASSERT_EQ(hio_backoffs, 1);
-		UT_ASSERT_EQ(hio_data_reads, 2);
-		UT_ASSERT_EQ(hio_read_order[0], 0);
-		UT_ASSERT_EQ(hio_read_order[1], 1);
-		UT_ASSERT_EQ(first, order == 0 ? 2 : 1);
-		UT_ASSERT_EQ(second, order == 0 ? 1 : 2);
+		UT_ASSERT_EQ(hio_backoffs, 0);
+		UT_ASSERT_EQ(hio_data_reads, 0);
+		UT_ASSERT_EQ(hio_waits, 4);
+		UT_ASSERT_EQ(first, order == 0 ? 1 : 2);
+		UT_ASSERT_EQ(second, order == 0 ? 2 : 1);
 		UT_ASSERT_EQ(hio_refs[0], 1);
 		UT_ASSERT_EQ(hio_refs[1], 1);
 		UT_ASSERT(hio_locks[0] && hio_locks[1]);
 	}
-}
-
-UT_TEST(actual_hio_pair_refresh_error_keeps_only_fresh_handles)
-{
-	int failed;
-	static Buffer first, second; /* Values inspected after siglongjmp. */
-
-	for (failed = 1; failed <= 2; failed++) {
-		first = 1;
-		second = 2;
-		hio_reset(false);
-		hio_refs[0] = hio_refs[1] = 1;
-		hio_stale_pin = hio_remap_on_refresh = true;
-		hio_refresh_error_at = failed;
-		if (sigsetjmp(failure_jump, 0) == 0) {
-			cluster_hio_lock_buffer_pair(&relation_data, &first, &second);
-			UT_ASSERT(false);
-		}
-		UT_ASSERT(!hio_locks[0] && !hio_locks[1]);
-		UT_ASSERT_EQ(second, InvalidBuffer);
-		UT_ASSERT_EQ(hio_refs[0] + hio_refs[1], failed - 1);
-		if (failed == 1)
-			UT_ASSERT_EQ(first, InvalidBuffer);
-		else {
-			UT_ASSERT_EQ(first, 2);
-			/* Real reads register this pin with ResourceOwner. This fixture
-			 * checks handle publication, not the ERROR ResourceOwner walk. */
-			hio_release(first);
-		}
-	}
-}
-
-UT_TEST(actual_hio_pair_refresh_cancellation_holds_no_buffer_resource)
-{
-	static Buffer first, second; /* Values inspected after siglongjmp. */
-	int canceled;
-
-	first = 1;
-	second = 2;
-	hio_reset(false);
-	hio_refs[0] = hio_refs[1] = 1;
-	hio_stale_pin = hio_cancel = true;
-	canceled = sigsetjmp(hio_jump, 0);
-	if (canceled == 0)
-		cluster_hio_lock_buffer_pair(&relation_data, &first, &second);
-	UT_ASSERT_EQ(canceled, 2);
-	UT_ASSERT_EQ(first, InvalidBuffer);
-	UT_ASSERT_EQ(second, InvalidBuffer);
-	UT_ASSERT_EQ(hio_refs[0] + hio_refs[1], 0);
-	UT_ASSERT(!hio_locks[0] && !hio_locks[1]);
-	UT_ASSERT_EQ(hio_data_reads, 0);
 }
 
 UT_TEST(actual_hio_single_relock_carries_no_vm_pin)
@@ -736,7 +690,7 @@ UT_TEST(actual_hio_allocation_reads_and_locks_without_incoming_vm_pins)
 	}
 }
 
-UT_TEST(actual_hio_allocation_returns_refreshed_other_descriptor)
+UT_TEST(actual_hio_allocation_reacquires_current_without_disk_reread)
 {
 	Buffer vm = 3, other_vm = 3, other = 1, result;
 
@@ -746,10 +700,10 @@ UT_TEST(actual_hio_allocation_returns_refreshed_other_descriptor)
 	hio_refs[2] = 2;
 	hio_stale_pin = hio_remap_on_refresh = true;
 	result = hio_allocate(&relation_data, 80, &other, 0, NULL, &vm, &other_vm, 0);
-	UT_ASSERT_EQ(result, 1);
-	UT_ASSERT_EQ(other, 2);
-	UT_ASSERT_EQ(hio_data_reads, 3);
-	UT_ASSERT_EQ(hio_backoffs, 1);
+	UT_ASSERT_EQ(result, 2);
+	UT_ASSERT_EQ(other, 1);
+	UT_ASSERT_EQ(hio_data_reads, 1);
+	UT_ASSERT_EQ(hio_backoffs, 0);
 	UT_ASSERT_EQ(hio_stale_attempts, 1);
 	UT_ASSERT(hio_locks[0] && hio_locks[1]);
 	UT_ASSERT_EQ(hio_refs[0], 1);
