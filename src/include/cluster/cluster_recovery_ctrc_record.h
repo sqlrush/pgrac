@@ -8,6 +8,7 @@
 #ifndef CLUSTER_RECOVERY_CTRC_RECORD_H
 #define CLUSTER_RECOVERY_CTRC_RECORD_H
 
+#include "access/xlogdefs.h"
 #include "cluster/cluster_tt_slot.h"
 
 #ifdef USE_PGRAC_CLUSTER
@@ -56,5 +57,17 @@ extern bool cluster_recovery_ctrc_encode_v2(const ClusterRecoveryCTRCReleaseV2 *
 extern bool cluster_recovery_ctrc_decode_v2(const uint8 *bytes, size_t length,
 											uint64 system_identifier,
 											ClusterRecoveryCTRCReleaseV2 *out);
+
+/* Hash the complete final native record (including CRC), outside its payload.
+ * start/end must be the original reader/insert owner's actual positions; end
+ * may include intervening WAL page headers. Checks only length/CRC and domain
+ * shape, not D0 opcode/payload, reader/source/cut authority, retention, graph
+ * completeness or completion. Original reader, codec and owner proofs remain
+ * mandatory. No insertion or redo. Output is 32 bytes, cleared on refusal;
+ * it may alias an input, which is consumed before output publication. */
+extern bool cluster_recovery_ctrc_record_hash_v2(const uint8 source_identity_digest[32],
+												 XLogRecPtr start, XLogRecPtr end,
+												 const uint8 *raw_record, size_t raw_length,
+												 uint8 out[32]);
 #endif
 #endif

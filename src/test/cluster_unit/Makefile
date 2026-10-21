@@ -7557,9 +7557,12 @@ test_cluster_recovery_tt_record: test_cluster_recovery_tt_record.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_recovery_tt_desc.o \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-# Exact 320B D0 payload codec, linked from its actual production source.
+# D0 payload codec and complete raw-record hash, linked from production.
 test_cluster_recovery_ctrc_record_product.o: $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h \
+		$(top_srcdir)/src/include/access/xlogdefs.h \
+		$(top_srcdir)/src/include/access/xlogrecord.h \
+		$(top_srcdir)/src/include/port/pg_crc32c.h \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
 		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
 		$(top_srcdir)/src/include/cluster/cluster_uba.h \
@@ -7568,7 +7571,9 @@ test_cluster_recovery_ctrc_record_product.o: $(top_srcdir)/src/backend/cluster/c
 
 test_cluster_recovery_ctrc_record: test_cluster_recovery_ctrc_record.c unit_test.h \
 		test_cluster_recovery_ctrc_record_product.o $(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) \
-		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h
+		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h \
+		$(top_srcdir)/src/include/access/xlogrecord.h \
+		$(top_srcdir)/src/include/port/pg_crc32c.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_recovery_ctrc_record_product.o $(LDFLAGS) \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@

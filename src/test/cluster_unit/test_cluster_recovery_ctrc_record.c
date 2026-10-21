@@ -1,5 +1,7 @@
 /* Author: SqlRush <sqlrush@gmail.com> */
 #include "postgres.h"
+#include "access/xlogrecord.h"
+#include "port/pg_crc32c.h"
 #include "cluster/cluster_recovery_ctrc_record.h"
 #include "cluster/cluster_uba.h"
 #include "common/cryptohash.h"
@@ -526,10 +528,247 @@ UT_TEST(input_output_aliasing)
 	UT_ASSERT(same_fields(&r, &work.record));
 }
 
+
+/* Independent Python struct/hashlib + bitwise CRC32C raw-record vectors.
+ * This models a final D0 record, without registering an opcode or writer. */
+#define RAW_LENGTH 357
+#define RAW_START UINT64_C(0x1122334455667700)
+#define RAW_END (RAW_START + RAW_LENGTH)
+#ifdef WORDS_BIGENDIAN
+static const uint8 raw_prefix[37] = {
+	0x00, 0x00, 0x01, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03,
+	0x04, 0x05, 0x00, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0xd0, 0x16,
+	0x00, 0x00, 0xbc, 0xdb, 0xee, 0xdc, 0xfe, 0x00, 0x00, 0x01, 0x40,
+};
+static const uint8 raw_expected[32] = {
+	0x79, 0xb4, 0xb3, 0xa4, 0x20, 0xdc, 0x28, 0xce, 0x0e, 0x0a, 0x4b, 0x9d, 0x4e, 0xc1, 0x27, 0x00,
+	0x59, 0xaf, 0x17, 0x65, 0x3e, 0x6f, 0x61, 0x99, 0x61, 0xa9, 0xbf, 0x10, 0x84, 0x7a, 0xd0, 0x59,
+};
+static const uint8 raw_cross_expected[32] = {
+	0xe1, 0xe5, 0xc3, 0xd8, 0x51, 0x63, 0xab, 0x2a, 0x61, 0x53, 0x25, 0x38, 0x83, 0x8d, 0x23, 0x35,
+	0x83, 0x38, 0x38, 0x11, 0x23, 0xd5, 0x24, 0xeb, 0x37, 0xc3, 0xd6, 0x1e, 0x78, 0x3d, 0xeb, 0x07,
+};
+#else
+static const uint8 raw_prefix[37] = {
+	0x65, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x04, 0x03, 0x02,
+	0x01, 0x00, 0x00, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0xd0, 0x16,
+	0x00, 0x00, 0x18, 0x45, 0x68, 0xfa, 0xfe, 0x40, 0x01, 0x00, 0x00,
+};
+static const uint8 raw_expected[32] = {
+	0xf6, 0xf2, 0x57, 0xc1, 0x22, 0xae, 0xf9, 0x0f, 0x61, 0x53, 0x04, 0x9e, 0x4d, 0xf7, 0x60, 0x20,
+	0xef, 0x39, 0x2e, 0x80, 0x8b, 0xf5, 0xf7, 0xd6, 0x12, 0x6a, 0x51, 0x95, 0x42, 0xb3, 0x8e, 0xf8,
+};
+static const uint8 raw_cross_expected[32] = {
+	0x5c, 0xd7, 0x46, 0x11, 0x35, 0x19, 0xe4, 0x08, 0x23, 0xfa, 0xd1, 0x12, 0x08, 0xed, 0x5e, 0x2e,
+	0x64, 0x84, 0x87, 0xa1, 0xa7, 0xa8, 0xc0, 0x34, 0xad, 0x6a, 0x67, 0x87, 0x07, 0x17, 0xad, 0x6d,
+};
+#endif
+static const uint8 raw_source[32] = {
+	0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50,
+	0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e, 0x5f, 0x60,
+};
+
+static void
+raw_sample(uint8 raw[RAW_LENGTH])
+{
+	memcpy(raw, raw_prefix, sizeof(raw_prefix));
+	memcpy(raw + sizeof(raw_prefix), golden, sizeof(golden));
+}
+
+/* The existing native CRC order, independently invoked by the fixture to
+ * build valid record mutations. Never call the product hash for resealing. */
+static void
+raw_reseal(uint8 raw[RAW_LENGTH])
+{
+	pg_crc32c crc;
+
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, raw + SizeOfXLogRecord, RAW_LENGTH - SizeOfXLogRecord);
+	COMP_CRC32C(crc, raw, offsetof(XLogRecord, xl_crc));
+	FIN_CRC32C(crc);
+	memcpy(raw + offsetof(XLogRecord, xl_crc), &crc, sizeof(crc));
+}
+
+static bool
+raw_refused(const uint8 *source, XLogRecPtr start, XLogRecPtr end, const uint8 *raw, size_t length)
+{
+	uint8 out[34];
+
+	memset(out, 0xa5, sizeof(out));
+	return !cluster_recovery_ctrc_record_hash_v2(source, start, end, raw, length, out + 1)
+		   && all_zero(out + 1, 32) && out[0] == 0xa5 && out[33] == 0xa5;
+}
+
+UT_TEST(raw_golden_and_immutable)
+{
+	uint8 raw[RAW_LENGTH], saved[RAW_LENGTH], out[34];
+
+	raw_sample(raw);
+	memcpy(saved, raw, sizeof(raw));
+	memset(out, 0xa5, sizeof(out));
+	UT_ASSERT(cluster_recovery_ctrc_record_hash_v2(raw_source, RAW_START, RAW_END, raw, sizeof(raw),
+												   out + 1));
+	UT_ASSERT(memcmp(out + 1, raw_expected, 32) == 0);
+	UT_ASSERT(out[0] == 0xa5 && out[33] == 0xa5);
+	UT_ASSERT(memcmp(raw, saved, sizeof(raw)) == 0);
+}
+
+UT_TEST(raw_cross_page_end)
+{
+	uint8 raw[RAW_LENGTH], out[32];
+
+	raw_sample(raw);
+	UT_ASSERT(cluster_recovery_ctrc_record_hash_v2(raw_source, RAW_START, RAW_END + 24, raw,
+												   sizeof(raw), out));
+	UT_ASSERT(memcmp(out, raw_cross_expected, 32) == 0);
+	UT_ASSERT(memcmp(out, raw_expected, 32) != 0);
+}
+
+UT_TEST(raw_complete_source_binding)
+{
+	uint8 raw[RAW_LENGTH], source[32], out[32];
+
+	raw_sample(raw);
+	for (unsigned bit = 0; bit < 256; bit++) {
+		memcpy(source, raw_source, sizeof(source));
+		source[bit / 8] ^= 1U << (bit % 8);
+		UT_ASSERT(cluster_recovery_ctrc_record_hash_v2(source, RAW_START, RAW_END, raw, sizeof(raw),
+													   out));
+		UT_ASSERT(memcmp(out, raw_expected, 32) != 0);
+	}
+}
+
+UT_TEST(raw_full_width_position_binding)
+{
+	uint8 raw[RAW_LENGTH], out[32];
+
+	raw_sample(raw);
+	for (unsigned bit = 0; bit < 64; bit++) {
+		uint64 delta = UINT64_C(1) << bit;
+		UT_ASSERT(cluster_recovery_ctrc_record_hash_v2(raw_source, RAW_START + delta,
+													   RAW_END + delta, raw, sizeof(raw), out));
+		UT_ASSERT(memcmp(out, raw_expected, 32) != 0);
+	}
+	UT_ASSERT(cluster_recovery_ctrc_record_hash_v2(raw_source, RAW_START - 1, RAW_END, raw,
+												   sizeof(raw), out));
+	UT_ASSERT(memcmp(out, raw_expected, 32) != 0);
+}
+
+UT_TEST(raw_valid_mutations_bind_header_crc_and_payload)
+{
+	uint8 raw[RAW_LENGTH], out[32];
+
+	for (size_t offset = sizeof(uint32); offset < RAW_LENGTH; offset++) {
+		if (offset >= offsetof(XLogRecord, xl_crc) && offset < SizeOfXLogRecord)
+			continue;
+		raw_sample(raw);
+		raw[offset] ^= 1;
+		raw_reseal(raw);
+		UT_ASSERT(cluster_recovery_ctrc_record_hash_v2(raw_source, RAW_START, RAW_END, raw,
+													   sizeof(raw), out));
+		UT_ASSERT(memcmp(out, raw_expected, 32) != 0);
+	}
+}
+
+UT_TEST(raw_every_bit_crc_refusal)
+{
+	uint8 raw[RAW_LENGTH];
+
+	for (unsigned bit = 0; bit < RAW_LENGTH * 8; bit++) {
+		raw_sample(raw);
+		raw[bit / 8] ^= 1U << (bit % 8);
+		UT_ASSERT(raw_refused(raw_source, RAW_START, RAW_END, raw, sizeof(raw)));
+	}
+}
+
+UT_TEST(raw_exact_native_length)
+{
+	uint8 raw[RAW_LENGTH + 1];
+	uint32 total;
+
+	raw_sample(raw);
+	raw[RAW_LENGTH] = 0;
+	for (size_t length = 0; length < RAW_LENGTH; length++)
+		UT_ASSERT(raw_refused(raw_source, RAW_START, RAW_END, raw, length));
+	UT_ASSERT(raw_refused(raw_source, RAW_START, RAW_END + 1, raw, sizeof(raw)));
+	for (unsigned i = 0; i < 2; i++) {
+		total = i == 0 ? RAW_LENGTH - 1 : RAW_LENGTH + 1;
+		memcpy(raw, &total, sizeof(total));
+		raw_reseal(raw);
+		UT_ASSERT(raw_refused(raw_source, RAW_START, RAW_END, raw, RAW_LENGTH));
+	}
+}
+
+UT_TEST(raw_oversize_refused_before_read)
+{
+	uint8 byte = 0;
+
+	UT_ASSERT(raw_refused(raw_source, RAW_START, UINT64_MAX, &byte, (size_t)XLogRecordMaxSize + 1));
+	UT_ASSERT(raw_refused(raw_source, RAW_START, UINT64_MAX, &byte, SIZE_MAX));
+}
+
+UT_TEST(raw_null_and_missing_source)
+{
+	uint8 raw[RAW_LENGTH], zero[32] = { 0 };
+
+	raw_sample(raw);
+	UT_ASSERT(raw_refused(NULL, RAW_START, RAW_END, raw, sizeof(raw)));
+	UT_ASSERT(raw_refused(zero, RAW_START, RAW_END, raw, sizeof(raw)));
+	UT_ASSERT(raw_refused(raw_source, RAW_START, RAW_END, NULL, sizeof(raw)));
+	UT_ASSERT(!cluster_recovery_ctrc_record_hash_v2(raw_source, RAW_START, RAW_END, raw,
+													sizeof(raw), NULL));
+}
+
+UT_TEST(raw_invalid_position_domain)
+{
+	uint8 raw[RAW_LENGTH];
+
+	raw_sample(raw);
+	UT_ASSERT(raw_refused(raw_source, 0, RAW_END, raw, sizeof(raw)));
+	UT_ASSERT(raw_refused(raw_source, RAW_START, 0, raw, sizeof(raw)));
+	UT_ASSERT(raw_refused(raw_source, RAW_START, RAW_START, raw, sizeof(raw)));
+	UT_ASSERT(raw_refused(raw_source, RAW_START, RAW_START - 1, raw, sizeof(raw)));
+	UT_ASSERT(raw_refused(raw_source, RAW_START, RAW_END - 1, raw, sizeof(raw)));
+}
+
+UT_TEST(raw_unaligned_buffers)
+{
+	uint8 raw[RAW_LENGTH + 2], source[34], out[34];
+
+	memset(raw, 0xa5, sizeof(raw));
+	memset(source, 0xa5, sizeof(source));
+	memset(out, 0xa5, sizeof(out));
+	raw_sample(raw + 1);
+	memcpy(source + 1, raw_source, 32);
+	UT_ASSERT(cluster_recovery_ctrc_record_hash_v2(source + 1, RAW_START, RAW_END, raw + 1,
+												   RAW_LENGTH, out + 1));
+	UT_ASSERT(memcmp(out + 1, raw_expected, 32) == 0);
+	UT_ASSERT(raw[0] == 0xa5 && raw[RAW_LENGTH + 1] == 0xa5);
+	UT_ASSERT(source[0] == 0xa5 && source[33] == 0xa5);
+	UT_ASSERT(out[0] == 0xa5 && out[33] == 0xa5);
+}
+
+UT_TEST(raw_input_output_aliasing)
+{
+	uint8 raw[RAW_LENGTH], source[32];
+
+	raw_sample(raw);
+	memcpy(source, raw_source, sizeof(source));
+	UT_ASSERT(
+		cluster_recovery_ctrc_record_hash_v2(source, RAW_START, RAW_END, raw, sizeof(raw), source));
+	UT_ASSERT(memcmp(source, raw_expected, 32) == 0);
+	UT_ASSERT(cluster_recovery_ctrc_record_hash_v2(raw_source, RAW_START, RAW_END, raw, sizeof(raw),
+												   raw + 3));
+	UT_ASSERT(memcmp(raw + 3, raw_expected, 32) == 0);
+	UT_ASSERT(memcmp(raw, raw_prefix, 3) == 0);
+	UT_ASSERT(memcmp(raw + 35, raw_prefix + 35, 2) == 0);
+	UT_ASSERT(memcmp(raw + 37, golden, 320) == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(34);
 	UT_RUN(golden_encoding);
 	UT_RUN(golden_decoding);
 	UT_RUN(unaligned_buffers);
@@ -552,6 +791,18 @@ main(void)
 	UT_RUN(missing_graph_or_input_is_not_a_payload);
 	UT_RUN(independent_transcript_matches_fixed_sample);
 	UT_RUN(input_output_aliasing);
+	UT_RUN(raw_golden_and_immutable);
+	UT_RUN(raw_cross_page_end);
+	UT_RUN(raw_complete_source_binding);
+	UT_RUN(raw_full_width_position_binding);
+	UT_RUN(raw_valid_mutations_bind_header_crc_and_payload);
+	UT_RUN(raw_every_bit_crc_refusal);
+	UT_RUN(raw_exact_native_length);
+	UT_RUN(raw_oversize_refused_before_read);
+	UT_RUN(raw_null_and_missing_source);
+	UT_RUN(raw_invalid_position_domain);
+	UT_RUN(raw_unaligned_buffers);
+	UT_RUN(raw_input_output_aliasing);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

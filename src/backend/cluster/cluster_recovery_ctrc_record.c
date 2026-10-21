@@ -9,9 +9,11 @@
 #include "cluster/cluster_recovery_ctrc_record.h"
 #ifdef USE_PGRAC_CLUSTER
 
+#include "access/xlogrecord.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "common/cryptohash.h"
+#include "port/pg_crc32c.h"
 
 static bool
 ctrc_nonzero_digest(const uint8 digest[32])
@@ -142,6 +144,66 @@ ctrc_payload_sha256(const uint8 *bytes, uint8 out[32])
 	memcpy(transcript + 16, bytes, 192);
 	memcpy(transcript + 208, bytes + 224, 96);
 	return ctrc_sha256(transcript, sizeof(transcript), out);
+}
+
+bool
+cluster_recovery_ctrc_record_hash_v2(const uint8 source_identity_digest[32], XLogRecPtr start,
+									 XLogRecPtr end, const uint8 *raw_record, size_t raw_length,
+									 uint8 out[32])
+{
+	static const uint8 domain[] = "PGRAC-D0-RECORD-V2";
+	XLogRecord header;
+	pg_crc32c crc;
+	pg_cryptohash_ctx *hash;
+	uint8 positions[20];
+	uint8 digest[32];
+	bool ok;
+
+	if (out == NULL)
+		return false;
+	if (source_identity_digest == NULL || raw_record == NULL
+		|| !ctrc_nonzero_digest(source_identity_digest) || raw_length < SizeOfXLogRecord
+		|| raw_length > XLogRecordMaxSize || start == InvalidXLogRecPtr || end <= start
+		|| end - start < raw_length)
+		goto refuse;
+	/* No aligned dereference of caller bytes, and no read beyond raw_length. */
+	memcpy(&header, raw_record, SizeOfXLogRecord);
+	if (header.xl_tot_len != raw_length)
+		goto refuse;
+
+	/* Same native CRC order as ValidXLogRecord: data, then header before CRC.
+	 * This detects damage; it cannot establish reader/source authority. */
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, raw_record + SizeOfXLogRecord, raw_length - SizeOfXLogRecord);
+	COMP_CRC32C(crc, raw_record, offsetof(XLogRecord, xl_crc));
+	FIN_CRC32C(crc);
+	if (!EQ_CRC32C(header.xl_crc, crc))
+		goto refuse;
+
+	cluster_undo_tt_ctrc_put_u64_le(positions, start);
+	cluster_undo_tt_ctrc_put_u64_le(positions + 8, end);
+	cluster_undo_tt_ctrc_put_u32_le(positions + 16, (uint32)raw_length);
+	hash = pg_cryptohash_create(PG_SHA256);
+	if (hash == NULL)
+		goto refuse;
+	/* Do not hash a terminator, page headers or alignment padding. The final
+	 * CRC remains inside raw_record, never replaced by this external SHA. */
+	ok = pg_cryptohash_init(hash) == 0
+		 && pg_cryptohash_update(hash, domain, sizeof(domain) - 1) == 0
+		 && pg_cryptohash_update(hash, source_identity_digest, 32) == 0
+		 && pg_cryptohash_update(hash, positions, sizeof(positions)) == 0
+		 && pg_cryptohash_update(hash, raw_record, raw_length) == 0
+		 && pg_cryptohash_final(hash, digest, sizeof(digest)) == 0;
+	pg_cryptohash_free(hash);
+	if (!ok)
+		goto refuse;
+	/* Publish last, including when output aliases source or raw bytes. */
+	memcpy(out, digest, sizeof(digest));
+	return true;
+
+refuse:
+	memset(out, 0, 32);
+	return false;
 }
 
 bool
