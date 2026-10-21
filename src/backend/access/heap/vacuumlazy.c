@@ -32,7 +32,8 @@
  *    Modified by: SqlRush <sqlrush@gmail.com>
  *    Retain shared relation version identity during native maintenance and
  *    preserve peer MultiXact pages and freeze cutoffs until their references
- *    can be maintained safely. See spec-3.6b-multixact-current-dml.md and
+ *    can be maintained safely. Validate owned freeze inputs before releasing
+ *    the original content lock. See spec-3.6b-multixact-current-dml.md and
  *    2026-10-11-pre2-p0-m5-f-multixact-am01.md.
  *
  *-------------------------------------------------------------------------
@@ -273,6 +274,7 @@ typedef struct LVSavedErrInfo
 static void lazy_scan_heap(LVRelState *vacrel);
 #ifdef USE_PGRAC_CLUSTER
 static bool lazy_scan_shared_mx(LVRelState *vacrel, Page page, BlockNumber blkno);
+static void lazy_validate_shared_freeze(LVRelState *vacrel, Page page, BlockNumber blkno);
 static void lazy_prepare_shared_freeze(LVRelState *vacrel, Buffer *vmbuffer);
 #endif
 static BlockNumber lazy_scan_skip(LVRelState *vacrel, Buffer *vmbuffer,
@@ -952,7 +954,7 @@ lazy_clear_visibility_versioned(Relation rel, const ClusterSpaceIdentity *identi
  *
  * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
  * What changed: Both lock branches preserve peer MX pages before native
- * pruning or member enumeration.
+ * pruning or member enumeration, and compare captured inputs before unlock.
  * Why: Cleanup locking does not provide remote member authority.
  */
 
@@ -1116,6 +1118,7 @@ lazy_scan_heap(LVRelState *vacrel)
 			/* PGRAC: retain references before native member enumeration. */
 			if (lazy_scan_shared_mx(vacrel, page, blkno))
 			{
+				lazy_validate_shared_freeze(vacrel, page, blkno);
 				UnlockReleaseBuffer(buf);
 				lazy_prepare_shared_freeze(vacrel, &vmbuffer);
 				continue;
@@ -1138,6 +1141,9 @@ lazy_scan_heap(LVRelState *vacrel)
 					vacrel->nonempty_pages = blkno + 1;
 				if (recordfreespace)
 					freespace = PageGetHeapFreeSpace(page);
+#ifdef USE_PGRAC_CLUSTER
+				lazy_validate_shared_freeze(vacrel, page, blkno);
+#endif
 				UnlockReleaseBuffer(buf);
 #ifdef USE_PGRAC_CLUSTER
 				lazy_prepare_shared_freeze(vacrel, &vmbuffer);
@@ -1171,6 +1177,7 @@ lazy_scan_heap(LVRelState *vacrel)
 		/* PGRAC: cleanup ownership does not prove peer member state. */
 		if (lazy_scan_shared_mx(vacrel, page, blkno))
 		{
+			lazy_validate_shared_freeze(vacrel, page, blkno);
 			UnlockReleaseBuffer(buf);
 			lazy_prepare_shared_freeze(vacrel, &vmbuffer);
 			continue;
@@ -1236,6 +1243,9 @@ lazy_scan_heap(LVRelState *vacrel)
 				 */
 				freespace = PageGetHeapFreeSpace(page);
 
+#ifdef USE_PGRAC_CLUSTER
+				lazy_validate_shared_freeze(vacrel, page, blkno);
+#endif
 				UnlockReleaseBuffer(buf);
 #ifdef USE_PGRAC_CLUSTER
 				lazy_prepare_shared_freeze(vacrel, &vmbuffer);
@@ -1419,6 +1429,9 @@ lazy_scan_heap(LVRelState *vacrel)
 			 * it this far when there were no LP_DEAD items during pruning.
 			 */
 			Assert(vacrel->nindexes > 0);
+#ifdef USE_PGRAC_CLUSTER
+			lazy_validate_shared_freeze(vacrel, page, blkno);
+#endif
 			UnlockReleaseBuffer(buf);
 #ifdef USE_PGRAC_CLUSTER
 			lazy_prepare_shared_freeze(vacrel, &vmbuffer);
@@ -1428,6 +1441,9 @@ lazy_scan_heap(LVRelState *vacrel)
 		{
 			Size		freespace = PageGetHeapFreeSpace(page);
 
+#ifdef USE_PGRAC_CLUSTER
+			lazy_validate_shared_freeze(vacrel, page, blkno);
+#endif
 			UnlockReleaseBuffer(buf);
 #ifdef USE_PGRAC_CLUSTER
 			lazy_prepare_shared_freeze(vacrel, &vmbuffer);
@@ -1508,11 +1524,39 @@ lazy_scan_shared_mx(LVRelState *vacrel, Page page, BlockNumber blkno)
 }
 
 /*
+ * Still under the original content lock, discard an image changed by native
+ * hint/prune/vacuum work before it can become a proof request. Do not recopy or
+ * retry here: the input remains unproven, with no freeze/metadata permission.
+ * This local comparison cannot replace a final holder/master fence after proof.
+ */
+static void
+lazy_validate_shared_freeze(LVRelState *vacrel, Page page, BlockNumber blkno)
+{
+	if (!vacrel->shared_freeze_input_captured)
+		return;
+	switch (cluster_heap_freeze_validate_page_v1(&vacrel->shared_freeze_input,
+												   &vacrel->identity, blkno, page))
+	{
+		case CLUSTER_HEAP_FREEZE_PAGE_MATCHED:
+			break;
+		case CLUSTER_HEAP_FREEZE_PAGE_CHANGED:
+			vacrel->shared_freeze_input_captured = false;
+			vacrel->shared_freeze_input_valid = false;
+			break;
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid page input for freezing shared heap block %u", blkno),
+					 errhint("Check the server log for the affected relation and block.")));
+	}
+}
+
+/*
  * Caller has released its heap lock and pin. Drop the VM pin before preparing
  * owned row/request inputs, so this boundary cannot retain those buffers over
  * later proof work. Only the last capture is prepared after cleanup fallback.
- * Native processing or another writer may have changed the page since capture;
- * the copied input remains unproven and grants no permission to change it.
+ * Another writer may change the page after the pre-release comparison; the
+ * copied input remains unproven and grants no permission to change it.
  */
 static void
 lazy_prepare_shared_freeze(LVRelState *vacrel, Buffer *vmbuffer)

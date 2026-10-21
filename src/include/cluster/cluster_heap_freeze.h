@@ -31,6 +31,12 @@ typedef struct ClusterHeapFreezePageInputV1
 	PGAlignedBlock image;
 } ClusterHeapFreezePageInputV1;
 
+typedef enum ClusterHeapFreezePageMatchV1 {
+	CLUSTER_HEAP_FREEZE_PAGE_INVALID = 0,
+	CLUSTER_HEAP_FREEZE_PAGE_MATCHED,
+	CLUSTER_HEAP_FREEZE_PAGE_CHANGED
+} ClusterHeapFreezePageMatchV1;
+
 #define CLUSTER_HEAP_FREEZE_NO_CARRIER_REQUEST UINT8_MAX
 
 /*
@@ -90,6 +96,20 @@ typedef struct ClusterHeapFreezePageBatchV1
 extern bool cluster_heap_freeze_capture_page_v1(const ClusterSpaceIdentity *identity,
 											  BlockNumber block, Page page,
 											  ClusterHeapFreezePageInputV1 *out);
+
+/*
+ * Compare an owned input with the caller's already locked page and supplied
+ * SPACE identity. Compare SPACE fields, never its in-memory padding. Every
+ * page byte participates, including hints/checksum/free space: a difference
+ * conservatively returns CHANGED. Malformed arguments/images return INVALID.
+ * No output, allocation, I/O, lock acquisition or proof lookup occurs here.
+ * MATCHED records only this physical comparison, not an atomic snapshot,
+ * refreshed SPACE identity, holder/master fence, proof or permission to freeze.
+ */
+extern ClusterHeapFreezePageMatchV1
+cluster_heap_freeze_validate_page_v1(const ClusterHeapFreezePageInputV1 *input,
+									 const ClusterSpaceIdentity *identity, BlockNumber block,
+									 Page page);
 
 /*
  * Expand the immutable image in physical offset order. At most one canonical

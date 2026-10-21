@@ -151,6 +151,9 @@ lazy_scan_noprune(LVRelState *vacrel, Buffer buf, BlockNumber block, Page page, 
 	fixture_noprune++;
 	if (!fixture_finish_noprune)
 		return false;
+	if (fixture_noprune_hint)
+		((HeapTupleHeader)PageGetItem(page, PageGetItemId(page, 1)))->t_infomask
+			|= HEAP_XMIN_COMMITTED;
 	vacrel->live_tuples++;
 	*hastup = true;
 	*recordspace = fixture_recordspace;
@@ -165,6 +168,10 @@ lazy_scan_prune(LVRelState *vacrel, Buffer buf, BlockNumber block, Page page,
 	(void)block;
 	(void)page;
 	fixture_prune++;
+	if (fixture_prune_change == 1)
+		ItemIdSetUnused(PageGetItemId(page, 1));
+	else if (fixture_prune_change == 2)
+		((PageHeader)page)->pd_upper = BLCKSZ;
 	vacrel->live_tuples++;
 	memset(state, 0, sizeof(*state));
 	state->hastup = true;
@@ -186,6 +193,8 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber block, Buffer buf, int off
 	(void)offset;
 	(void)vm;
 	fixture_consumed_dead += vacrel->dead_items->num_items;
+	if (fixture_vacuum_change)
+		ItemIdSetUnused(PageGetItemId(BufferGetPage(buf), 3));
 }
 
 static void

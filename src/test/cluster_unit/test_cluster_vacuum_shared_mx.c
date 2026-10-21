@@ -65,11 +65,14 @@ static int fixture_vm_pins;
 static unsigned fixture_reads, fixture_vm_acquires, fixture_vm_releases;
 static unsigned fixture_prepares, fixture_prepare_held_mask;
 static bool fixture_finish_noprune, fixture_recordspace, fixture_prune_lpdead;
+static bool fixture_noprune_hint, fixture_vacuum_change;
+static unsigned fixture_prune_change;
 static bool fixture_clear_released_page;
 static bool fixture_cleanup_empty;
 static TransactionId fixture_cleanup_xmin;
 static unsigned fixture_prune, fixture_noprune, fixture_fsm_writes;
 static unsigned fixture_vm_writes, fixture_dirties, fixture_consumed_dead;
+static int fixture_error_code;
 static jmp_buf fixture_error;
 
 void
@@ -96,6 +99,27 @@ errstart_cold(int level, const char *domain)
 
 int
 errmsg_internal(const char *format, ...)
+{
+	(void)format;
+	return 0;
+}
+
+int
+errcode(int code)
+{
+	fixture_error_code = code;
+	return 0;
+}
+
+int
+errmsg(const char *format, ...)
+{
+	(void)format;
+	return 0;
+}
+
+int
+errhint(const char *format, ...)
 {
 	(void)format;
 	return 0;
@@ -179,6 +203,9 @@ setup(bool cleanup)
 	fixture_prepares = fixture_prepare_held_mask = 0;
 	fixture_finish_noprune = true;
 	fixture_recordspace = fixture_prune_lpdead = false;
+	fixture_noprune_hint = fixture_vacuum_change = false;
+	fixture_prune_change = 0;
+	fixture_error_code = 0;
 	fixture_clear_released_page = false;
 	fixture_cleanup_empty = false;
 	fixture_cleanup_xmin = InvalidTransactionId;
@@ -1238,10 +1265,217 @@ UT_TEST(noindex_lpdead_exit_prepares_once_after_all_buffers_are_released)
 	UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
 }
 
+UT_TEST(share_native_hint_change_discards_captured_input)
+{
+	setup(false);
+	make_page(0, false, 33);
+	fixture_noprune_hint = true;
+	lazy_scan_heap(&state);
+	UT_ASSERT(prepared_batch() == NULL);
+	UT_ASSERT_EQ(fixture_prepares, 0);
+	UT_ASSERT(!state.shared_freeze_input_captured);
+	UT_ASSERT_EQ(fixture_noprune, 1);
+	UT_ASSERT_EQ(fixture_reads, 1);
+	UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
+}
+
+UT_TEST(cleanup_prune_change_discards_input_on_both_final_exits)
+{
+	for (unsigned lpdead = 0; lpdead < 2; lpdead++) {
+		setup(true);
+		make_page(0, false, 33);
+		fixture_prune_change = 1;
+		fixture_prune_lpdead = lpdead;
+		state.do_index_vacuuming = lpdead;
+		lazy_scan_heap(&state);
+		UT_ASSERT(prepared_batch() == NULL);
+		UT_ASSERT_EQ(fixture_prepares, 0);
+		UT_ASSERT(!state.shared_freeze_input_captured);
+		UT_ASSERT_EQ(fixture_prune, 1);
+		UT_ASSERT_EQ(fixture_reads, 1);
+		UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
+	}
+}
+
+UT_TEST(noindex_heap_vacuum_change_discards_captured_input)
+{
+	setup(true);
+	make_page(0, false, 33);
+	state.nindexes = 0;
+	fixture_prune_lpdead = true;
+	fixture_vacuum_change = true;
+	lazy_scan_heap(&state);
+	UT_ASSERT(prepared_batch() == NULL);
+	UT_ASSERT_EQ(fixture_prepares, 0);
+	UT_ASSERT(!state.shared_freeze_input_captured);
+	UT_ASSERT_EQ(fixture_prune, 1);
+	UT_ASSERT_EQ(fixture_fsm_writes, 1);
+	UT_ASSERT_EQ(fixture_reads, 1);
+	UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
+}
+
+UT_TEST(malformed_current_page_is_not_a_changed_input_retry)
+{
+	setup(true);
+	make_page(0, false, 33);
+	fixture_prune_change = 2;
+	if (setjmp(fixture_error) == 0) {
+		lazy_scan_heap(&state);
+		UT_ASSERT(false);
+	} else {
+		UT_ASSERT_EQ(fixture_error_code, ERRCODE_DATA_CORRUPTED);
+		UT_ASSERT(prepared_batch() == NULL);
+		UT_ASSERT_EQ(fixture_prepares, 0);
+		UT_ASSERT_EQ(fixture_reads, 1);
+	}
+}
+
+UT_TEST(physical_validation_matches_owned_image_and_ignores_identity_padding)
+{
+	ClusterHeapFreezePageInputV1 input;
+	ClusterSpaceIdentity identity;
+	PGAlignedBlock other;
+
+	setup(true);
+	make_itl_page();
+	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&state.identity, 0, (Page)fixture_pages[0].data,
+												  &input));
+	other = fixture_pages[0];
+	memset(&identity, 0xa5, sizeof(identity));
+	identity.key.system_identifier = state.identity.key.system_identifier;
+	identity.key.database_incarnation = state.identity.key.database_incarnation;
+	memcpy(identity.key.storage_uuid, state.identity.key.storage_uuid,
+		   sizeof(identity.key.storage_uuid));
+	identity.key.locator.spcOid = state.identity.key.locator.spcOid;
+	identity.key.locator.dbOid = state.identity.key.locator.dbOid;
+	identity.key.locator.relNumber = state.identity.key.locator.relNumber;
+	memcpy(identity.incarnation, state.identity.incarnation, sizeof(identity.incarnation));
+	identity.sequence = state.identity.sequence;
+	identity.operation = state.identity.operation;
+	identity.state = state.identity.state;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_page_v1(&input, &identity, 0, (Page)other.data),
+				 CLUSTER_HEAP_FREEZE_PAGE_MATCHED);
+	UT_ASSERT_EQ(memcmp(&other, &fixture_pages[0], sizeof(other)), 0);
+	UT_ASSERT_EQ(memcmp(&input.image, &fixture_pages[0], sizeof(other)), 0);
+}
+
+UT_TEST(physical_validation_rejects_each_space_and_block_identity_change)
+{
+	ClusterHeapFreezePageInputV1 input;
+	Page page;
+
+	setup(true);
+	page = (Page)fixture_pages[0].data;
+	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&state.identity, 0, page, &input));
+	for (unsigned change = 0; change < 11; change++) {
+		ClusterSpaceIdentity identity = state.identity;
+		BlockNumber block = 0;
+
+		switch (change) {
+		case 0:
+			identity.key.system_identifier++;
+			break;
+		case 1:
+			identity.key.database_incarnation++;
+			break;
+		case 2:
+			identity.key.storage_uuid[15] ^= 1;
+			break;
+		case 3:
+			identity.key.locator.spcOid++;
+			break;
+		case 4:
+			identity.key.locator.dbOid++;
+			break;
+		case 5:
+			identity.key.locator.relNumber++;
+			break;
+		case 6:
+			identity.incarnation[15] ^= 1;
+			break;
+		case 7:
+			identity.sequence++;
+			break;
+		case 8:
+			identity.operation++;
+			break;
+		case 9:
+			identity.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+			break;
+		case 10:
+			block++;
+			break;
+		}
+		UT_ASSERT_EQ(cluster_heap_freeze_validate_page_v1(&input, &identity, block, page),
+					 CLUSTER_HEAP_FREEZE_PAGE_CHANGED);
+	}
+}
+
+UT_TEST(physical_validation_covers_all_page_bytes_and_itl_carriers)
+{
+	ClusterHeapFreezePageInputV1 input;
+	PGAlignedBlock before;
+	Page page;
+
+	setup(true);
+	make_itl_page();
+	page = (Page)fixture_pages[0].data;
+	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&state.identity, 0, page, &input));
+	before = fixture_pages[0];
+	/* LSN/origin, version, tuple header/locator and all 48 bytes of every ITL. */
+	for (unsigned byte = 0; byte < BLCKSZ; byte++) {
+		ClusterHeapFreezePageMatchV1 result;
+
+		page[byte] ^= 1;
+		result = cluster_heap_freeze_validate_page_v1(&input, &state.identity, 0, page);
+		/* Structural damage may be INVALID; no changed byte may match. */
+		UT_ASSERT(result != CLUSTER_HEAP_FREEZE_PAGE_MATCHED);
+		page[byte] ^= 1;
+	}
+	UT_ASSERT_EQ(memcmp(&before, &fixture_pages[0], sizeof(before)), 0);
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_page_v1(&input, &state.identity, 0, page),
+				 CLUSTER_HEAP_FREEZE_PAGE_MATCHED);
+}
+
+UT_TEST(physical_validation_distinguishes_invalid_arguments_and_layout)
+{
+	ClusterHeapFreezePageInputV1 input;
+	ClusterSpaceIdentity identity;
+	Page page;
+
+	setup(true);
+	page = (Page)fixture_pages[0].data;
+	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&state.identity, 0, page, &input));
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_page_v1(NULL, &state.identity, 0, page),
+				 CLUSTER_HEAP_FREEZE_PAGE_INVALID);
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_page_v1(&input, NULL, 0, page),
+				 CLUSTER_HEAP_FREEZE_PAGE_INVALID);
+	UT_ASSERT_EQ(
+		cluster_heap_freeze_validate_page_v1(&input, &state.identity, InvalidBlockNumber, page),
+		CLUSTER_HEAP_FREEZE_PAGE_INVALID);
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_page_v1(&input, &state.identity, 0, NULL),
+				 CLUSTER_HEAP_FREEZE_PAGE_INVALID);
+	identity = state.identity;
+	identity.state = 0;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_page_v1(&input, &identity, 0, page),
+				 CLUSTER_HEAP_FREEZE_PAGE_INVALID);
+	input.normal_tuples++;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_page_v1(&input, &state.identity, 0, page),
+				 CLUSTER_HEAP_FREEZE_PAGE_INVALID);
+	input.normal_tuples--;
+	((PageHeader)page)->pd_upper = BLCKSZ;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_page_v1(&input, &state.identity, 0, page),
+				 CLUSTER_HEAP_FREEZE_PAGE_INVALID);
+	memcpy(page, input.image.data, BLCKSZ);
+	((PageHeader)input.image.data)->pd_lower = 1;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_page_v1(&input, &state.identity, 0, page),
+				 CLUSTER_HEAP_FREEZE_PAGE_INVALID);
+}
+
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(42);
 	UT_RUN(share_scan_preserves_every_reference_before_native_consumer);
 	UT_RUN(cleanup_scan_preserves_before_prune_and_freeze);
 	UT_RUN(raw_multi_value_never_selects_local_reader);
@@ -1276,6 +1510,14 @@ main(void)
 	UT_RUN(each_captured_page_gets_one_unpinned_preparation);
 	UT_RUN(cleanup_fallback_to_empty_discards_pending_capture);
 	UT_RUN(noindex_lpdead_exit_prepares_once_after_all_buffers_are_released);
+	UT_RUN(share_native_hint_change_discards_captured_input);
+	UT_RUN(cleanup_prune_change_discards_input_on_both_final_exits);
+	UT_RUN(noindex_heap_vacuum_change_discards_captured_input);
+	UT_RUN(malformed_current_page_is_not_a_changed_input_retry);
+	UT_RUN(physical_validation_matches_owned_image_and_ignores_identity_padding);
+	UT_RUN(physical_validation_rejects_each_space_and_block_identity_change);
+	UT_RUN(physical_validation_covers_all_page_bytes_and_itl_carriers);
+	UT_RUN(physical_validation_distinguishes_invalid_arguments_and_layout);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

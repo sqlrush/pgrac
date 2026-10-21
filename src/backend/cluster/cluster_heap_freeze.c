@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  * cluster_heap_freeze.c
- *    Bounded physical input capture for shared heap freeze preparation.
+ *    Bounded physical input capture and validation for shared heap freezing.
  *
  * Portions Copyright (c) 2026, pgrac contributors
  * Author: SqlRush <sqlrush@gmail.com>
@@ -90,6 +90,44 @@ cluster_heap_freeze_capture_page_v1(const ClusterSpaceIdentity *identity,
 	out->multi_tuples = multi;
 	memcpy(out->image.data, page, BLCKSZ);
 	return true;
+}
+
+ClusterHeapFreezePageMatchV1
+cluster_heap_freeze_validate_page_v1(const ClusterHeapFreezePageInputV1 *input,
+									 const ClusterSpaceIdentity *identity, BlockNumber block,
+									 Page page)
+{
+	OffsetNumber maxoff;
+	uint16 normal;
+	uint16 multi;
+
+	if (input == NULL || identity == NULL || page == NULL
+		|| input->identity.state != CLUSTER_SPACE_IDENTITY_LIVE
+		|| (identity->state != CLUSTER_SPACE_IDENTITY_LIVE
+			&& identity->state != CLUSTER_SPACE_IDENTITY_TOMBSTONED)
+		|| input->block == InvalidBlockNumber || block == InvalidBlockNumber
+		|| !freeze_page_layout_valid((Page)input->image.data, &maxoff, &normal, &multi)
+		|| input->max_offset != maxoff || input->normal_tuples != normal
+		|| input->multi_tuples != multi
+		|| !freeze_page_layout_valid(page, &maxoff, &normal, &multi))
+		return CLUSTER_HEAP_FREEZE_PAGE_INVALID;
+
+	/* SPACE is an in-memory value with padding, not a serialized witness. */
+	if (input->block != block
+		|| input->identity.key.system_identifier != identity->key.system_identifier
+		|| input->identity.key.database_incarnation != identity->key.database_incarnation
+		|| memcmp(input->identity.key.storage_uuid, identity->key.storage_uuid,
+				  sizeof(identity->key.storage_uuid))
+			   != 0
+		|| !RelFileLocatorEquals(input->identity.key.locator, identity->key.locator)
+		|| memcmp(input->identity.incarnation, identity->incarnation, sizeof(identity->incarnation))
+			   != 0
+		|| input->identity.sequence != identity->sequence
+		|| input->identity.operation != identity->operation
+		|| input->identity.state != identity->state || memcmp(input->image.data, page, BLCKSZ) != 0)
+		return CLUSTER_HEAP_FREEZE_PAGE_CHANGED;
+
+	return CLUSTER_HEAP_FREEZE_PAGE_MATCHED;
 }
 
 bool
