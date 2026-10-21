@@ -9500,8 +9500,11 @@ test_cluster_vacuum_shared_mx.inc: $(top_srcdir)/src/backend/access/heap/vacuuml
 	python3 $(srcdir)/extract_vacuum_mx_fixture.py $< > $@
 
 test_cluster_vacuum_shared_mx: test_cluster_vacuum_shared_mx.c test_cluster_heap_maintenance_policy.inc unit_test.h \
-		$(srcdir)/cluster_vacuum_mx_test_stubs.h test_cluster_vacuum_shared_mx.inc
-	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(srcdir)/cluster_vacuum_mx_test_stubs.h test_cluster_vacuum_shared_mx.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_heap_freeze.c \
+		$(top_srcdir)/src/include/cluster/cluster_heap_freeze.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) $< \
+		$(top_srcdir)/src/backend/cluster/cluster_heap_freeze.c $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_heap_maintenance.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c \
 		$(top_srcdir)/src/backend/access/heap/heapam_visibility.c \

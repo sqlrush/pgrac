@@ -77,6 +77,7 @@
 #include "catalog/pg_control.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_heap_horizon.h"
+#include "cluster/cluster_heap_freeze.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -165,6 +166,9 @@ typedef struct LVRelState
 #ifdef USE_PGRAC_CLUSTER
 	bool		versioned;
 	ClusterSpaceIdentity identity;
+	/* Unproven copy only; no borrowed page pointer or freeze permission. */
+	ClusterHeapFreezePageInputV1 shared_freeze_input;
+	bool		shared_freeze_input_valid;
 	BlockNumber shared_mx_deferred_pages;
 	int64		shared_mx_deferred_tuples;
 #endif
@@ -984,6 +988,10 @@ lazy_scan_heap(LVRelState *vacrel)
 		bool		all_visible_according_to_vm;
 		LVPagePruneState prunestate;
 
+#ifdef USE_PGRAC_CLUSTER
+		/* A skipped/new/empty/error page must not inherit the preceding input. */
+		vacrel->shared_freeze_input_valid = false;
+#endif
 		if (blkno == next_unskippable_block)
 		{
 			/*
@@ -1451,39 +1459,27 @@ lazy_scan_heap(LVRelState *vacrel)
 #ifdef USE_PGRAC_CLUSTER
 /*
  * Preserve a peer MX page while holding its original share or cleanup lock.
- * The physical tuple count follows the shared maintenance KEEP convention;
- * it does not assert transaction visibility or release any reference.
+ * Capture bounded freeze inputs under that same lock, then consume their
+ * physical counts for the existing MX KEEP decision. The input asserts no
+ * transaction visibility, current fence or eligibility and releases no ref.
  */
 static bool
 lazy_scan_shared_mx(LVRelState *vacrel, Page page, BlockNumber blkno)
 {
-	OffsetNumber maxoff;
-	int64		tuples = 0;
-	bool		has_multi = false;
-
+	vacrel->shared_freeze_input_valid = false;
 	if (!vacrel->versioned || !cluster_peer_mode_enabled())
 		return false;
 
-	maxoff = PageGetMaxOffsetNumber(page);
-	for (OffsetNumber offnum = FirstOffsetNumber; offnum <= maxoff;
-		 offnum = OffsetNumberNext(offnum))
-	{
-		ItemId		item = PageGetItemId(page, offnum);
-		HeapTupleHeader tuple;
-
-		if (!ItemIdIsNormal(item))
-			continue;
-		tuple = (HeapTupleHeader) PageGetItem(page, item);
-		tuples++;
-		if (tuple->t_infomask & HEAP_XMAX_IS_MULTI)
-			has_multi = true;
-	}
-	if (!has_multi)
+	if (!cluster_heap_freeze_capture_page_v1(&vacrel->identity, blkno, page,
+											   &vacrel->shared_freeze_input))
+		elog(ERROR, "invalid shared heap freeze input at block %u", blkno);
+	vacrel->shared_freeze_input_valid = true;
+	if (vacrel->shared_freeze_input.multi_tuples == 0)
 		return false;
 
 	vacrel->shared_mx_deferred_pages++;
-	vacrel->shared_mx_deferred_tuples += tuples;
-	vacrel->live_tuples += tuples;
+	vacrel->shared_mx_deferred_tuples += vacrel->shared_freeze_input.normal_tuples;
+	vacrel->live_tuples += vacrel->shared_freeze_input.normal_tuples;
 	vacrel->nonempty_pages = blkno + 1;
 	return true;
 }
