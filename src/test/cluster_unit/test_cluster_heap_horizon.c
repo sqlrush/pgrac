@@ -48,6 +48,134 @@ setup_horizon(void)
 
 #include "test_cluster_heap_horizon_vacuum_fixture.inc"
 
+UT_TEST(legal_min_age_uses_lease_next_but_keeps_original_ceiling)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	UT_ASSERT(!vacuum_policy_scan(10, 180, 100000, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 80);
+	UT_ASSERT_EQ(cutoffs.OldestXmin, 80);
+	UT_ASSERT_EQ(cutoffs.MultiXactCutoff, 42);
+	UT_ASSERT_EQ(age_sample_reads, 1);
+	UT_ASSERT_EQ(age_fence_reads, 1);
+	UT_ASSERT_EQ(age_lock_acquires, age_lock_releases);
+	UT_ASSERT(!age_xid_lock);
+	/* A legal-next value cannot move the original activation ceiling. */
+	activation_floor = 50;
+	UT_ASSERT(!vacuum_policy_scan(10, 180, 100000, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 50);
+	UT_ASSERT_EQ(cutoffs.OldestXmin, 50);
+}
+
+UT_TEST(legal_min_age_subtracts_in_full_xid_epoch)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	activation_floor = UINT64_C(0x100000000);
+	stub_next_full = fxid(1, 100);
+	age_cache.nextXid = stub_next_full;
+	age_future = fxid(1, 1000);
+	UT_ASSERT(!vacuum_policy_scan(UINT32_C(0xFFFFF000), 1100, 100000, RELPERSISTENCE_PERMANENT, 90,
+								  &cutoffs));
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, UINT32_C(0xFFFFFF9C));
+	UT_ASSERT_EQ(cutoffs.OldestXmin, FirstNormalTransactionId);
+}
+
+UT_TEST(legal_min_age_saturates_instead_of_raw_underflow)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	activation_floor = 10;
+	stub_next_full = FullTransactionIdFromU64(20);
+	age_cache.nextXid = stub_next_full;
+	age_future = FullTransactionIdFromU64(30);
+	UT_ASSERT(!vacuum_policy_scan(5, 100, 100000, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, FirstNormalTransactionId);
+	UT_ASSERT_EQ(cutoffs.OldestXmin, 10);
+}
+
+UT_TEST(legal_min_age_respects_default_and_native_safety_clamp)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	vacuum_freeze_min_age = 180;
+	UT_ASSERT(!vacuum_policy_scan(5, -1, 100000, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 80);
+	age_future = FullTransactionIdFromU64(210);
+	autovacuum_freeze_max_age = 400;
+	UT_ASSERT(!vacuum_policy_scan(5, 1000, 100000, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 10);
+}
+
+UT_TEST(legal_min_age_freeze_zero_still_obeys_activation_ceiling)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	activation_floor = 50;
+	(void)vacuum_policy_scan(10, 0, 0, RELPERSISTENCE_PERMANENT, 90, &cutoffs);
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 50);
+	UT_ASSERT_EQ(cutoffs.OldestXmin, 50);
+	UT_ASSERT_EQ(age_sample_reads, 1);
+}
+
+UT_TEST(legal_min_age_refuses_future_catalog_without_new_freeze)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	age_future = FullTransactionIdFromU64(30);
+	UT_ASSERT(vacuum_policy_scan(40, 180, 100000, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 40);
+	UT_ASSERT_EQ(cutoffs.OldestXmin, 80);
+}
+
+UT_TEST(nonshared_and_temporary_min_age_stay_native)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	cluster_shared_config = false;
+	(void)vacuum_policy_scan(10, 180, 100000, RELPERSISTENCE_PERMANENT, 90, &cutoffs);
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 20);
+	cluster_shared_config = true;
+	(void)vacuum_policy_scan(10, 180, 100000, RELPERSISTENCE_TEMP, 90, &cutoffs);
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 20);
+	UT_ASSERT_EQ(age_sample_reads, 0);
+	UT_ASSERT_EQ(age_lock_acquires, 0);
+}
+
+UT_TEST(legal_min_age_skips_special_ids_after_full_subtraction)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	activation_floor = UINT64_C(0x100000000);
+	stub_next_full = fxid(1, 100);
+	age_cache.nextXid = stub_next_full;
+	age_future = fxid(1, 1000);
+	UT_ASSERT(!vacuum_policy_scan(UINT32_C(0xFFFFF000), 999, 100000, RELPERSISTENCE_PERMANENT, 90,
+								  &cutoffs));
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, FirstNormalTransactionId);
+}
+
+UT_TEST(missing_min_age_evidence_preserves_oldest_xmin_ceiling)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	age_promise_ready = false;
+	age_oldest_xmin = 20;
+	UT_ASSERT(vacuum_policy_scan(40, 100, 100000, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 20);
+	UT_ASSERT_EQ(cutoffs.OldestXmin, 20);
+}
+
+UT_TEST(ambiguous_min_age_ceiling_requests_scan_without_advancing)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	age_future = FullTransactionIdFromU64(UINT32_C(0x80000050));
+	UT_ASSERT(vacuum_policy_scan(80, 180, 100000, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 80);
+	UT_ASSERT_EQ(cutoffs.OldestXmin, 80);
+}
+
 UT_TEST(legal_age_requests_scan_when_local_next_lags)
 {
 	struct VacuumCutoffs cutoffs;
@@ -93,7 +221,7 @@ UT_TEST(missing_age_promise_requests_scan_without_freeze_permission)
 	UT_ASSERT(vacuum_age_scan(40, 500, RELPERSISTENCE_PERMANENT, 90, &cutoffs));
 	UT_ASSERT_EQ(age_sample_reads, 1);
 	UT_ASSERT_EQ(age_lock_acquires, age_lock_releases);
-	UT_ASSERT_EQ(cutoffs.FreezeLimit, 80);
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 40);
 }
 
 UT_TEST(age_promise_revoked_after_unlock_requests_scan)
@@ -105,6 +233,7 @@ UT_TEST(age_promise_revoked_after_unlock_requests_scan)
 	UT_ASSERT_EQ(age_fence_reads, 1);
 	UT_ASSERT_EQ(age_lock_acquires, age_lock_releases);
 	UT_ASSERT(!age_xid_lock);
+	UT_ASSERT_EQ(cutoffs.FreezeLimit, 40);
 }
 
 UT_TEST(legal_age_respects_native_default_and_safety_clamp)
@@ -439,7 +568,17 @@ UT_TEST(freeze_report_v2_decode_rejects_invalid_payload)
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(31);
+	UT_RUN(legal_min_age_uses_lease_next_but_keeps_original_ceiling);
+	UT_RUN(legal_min_age_subtracts_in_full_xid_epoch);
+	UT_RUN(legal_min_age_saturates_instead_of_raw_underflow);
+	UT_RUN(legal_min_age_respects_default_and_native_safety_clamp);
+	UT_RUN(legal_min_age_freeze_zero_still_obeys_activation_ceiling);
+	UT_RUN(legal_min_age_refuses_future_catalog_without_new_freeze);
+	UT_RUN(nonshared_and_temporary_min_age_stay_native);
+	UT_RUN(legal_min_age_skips_special_ids_after_full_subtraction);
+	UT_RUN(missing_min_age_evidence_preserves_oldest_xmin_ceiling);
+	UT_RUN(ambiguous_min_age_ceiling_requests_scan_without_advancing);
 	UT_RUN(legal_age_requests_scan_when_local_next_lags);
 	UT_RUN(legal_age_threshold_is_inclusive_without_raw_underflow);
 	UT_RUN(legal_age_crosses_epoch_with_full_xid_difference);

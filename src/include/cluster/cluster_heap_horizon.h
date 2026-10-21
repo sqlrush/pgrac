@@ -11,10 +11,13 @@
  * The caller excludes temporary relations. Nonshared mode is native. */
 extern bool cluster_heap_freeze_cutoff_v1(TransactionId proposed, TransactionId *out);
 
-/* Shared permanent heap's aggressive-scan policy, using a current durable
- * legal-next FullXid observation. Failure preserves out; the caller must
- * conservatively scan. This grants no tuple freeze or truncation authority. */
-extern bool cluster_heap_freeze_table_age_v1(TransactionId frozen, int table_age, bool *out);
+/* Shared permanent heap's age policies, using one current durable legal-next
+ * FullXid observation. The caller supplies its existing conservative ceiling.
+ * Failure preserves both outputs; the caller must scan without advancing its
+ * freeze boundary. This grants no tuple freeze or truncation authority. */
+extern bool cluster_heap_freeze_policy_v1(TransactionId ceiling, TransactionId frozen, int min_age,
+										  int table_age, TransactionId *freeze_limit,
+										  bool *aggressive);
 
 /*
  * Frozen 2.14 M1 waterline report.  The wire image is deliberately encoded

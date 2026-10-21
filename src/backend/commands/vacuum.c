@@ -1266,11 +1266,19 @@ vacuum_get_cutoffs(Relation rel, const VacuumParams *params,
 		bool aggressive;
 
 		/*
-		 * Missing age evidence conservatively requests a full scan; it
-		 * does not change any tuple freeze cutoff or proof requirement.
+		 * Use one legal-next sample for both age policies, still capped
+		 * by the original activation-clamped OldestXmin. Missing evidence
+		 * requests a full scan without advancing the freeze boundary.
 		 */
-		if (!cluster_heap_freeze_table_age_v1(cutoffs->relfrozenxid, freeze_table_age, &aggressive)
-			|| aggressive)
+		if (!cluster_heap_freeze_policy_v1(cutoffs->OldestXmin, cutoffs->relfrozenxid,
+										   freeze_min_age, freeze_table_age, &cutoffs->FreezeLimit,
+										   &aggressive)) {
+			cutoffs->FreezeLimit = cutoffs->relfrozenxid;
+			if (TransactionIdPrecedes(cutoffs->OldestXmin, cutoffs->FreezeLimit))
+				cutoffs->FreezeLimit = cutoffs->OldestXmin;
+			return true;
+		}
+		if (aggressive)
 			return true;
 	} else
 #endif

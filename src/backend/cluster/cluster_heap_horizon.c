@@ -244,21 +244,24 @@ cluster_heap_freeze_cutoff_v1(TransactionId proposed, TransactionId *out)
 }
 
 /*
- * Table age only selects how much VACUUM scans. Read the original durable
- * allocation promise at the local nextXid cut; a lagging raw nextXid is not
- * the next legal striped allocation. No promise is allocated or advanced.
- * This is not a FullXid provenance, terminal or freeze certificate.
+ * Derive both VACUUM age policies from one original durable allocation
+ * promise at the local nextXid cut. A lagging raw nextXid is not the next
+ * legal striped allocation. The cutoff still obeys the caller's existing
+ * conservative ceiling; this is not a terminal or freeze certificate.
  */
 bool
-cluster_heap_freeze_table_age_v1(TransactionId frozen, int table_age, bool *out)
+cluster_heap_freeze_policy_v1(TransactionId ceiling, TransactionId frozen, int min_age,
+							  int table_age, TransactionId *freeze_limit, bool *aggressive)
 {
 	ClusterXidStripeSampleFence fence;
-	FullTransactionId legal_next, frozen_full;
-	uint64 next, oldest;
+	FullTransactionId legal_next, frozen_full, ceiling_full;
+	uint64 next, oldest, bound, candidate;
 	bool sampled;
 
-	if (out == NULL || table_age < 0 || !TransactionIdIsNormal(frozen) || !cluster_shared_config
-		|| !cluster_enabled || !cluster_xid_striping || ShmemVariableCache == NULL)
+	if (freeze_limit == NULL || aggressive == NULL || min_age < 0 || table_age < 0
+		|| !TransactionIdIsNormal(ceiling) || !TransactionIdIsNormal(frozen)
+		|| !cluster_shared_config || !cluster_enabled || !cluster_xid_striping
+		|| ShmemVariableCache == NULL)
 		return false;
 
 	LWLockAcquire(XidGenLock, LW_SHARED);
@@ -270,16 +273,25 @@ cluster_heap_freeze_table_age_v1(TransactionId frozen, int table_age, bool *out)
 		return false;
 
 	frozen_full = cluster_xid_widen(frozen, legal_next);
-	if (!FullTransactionIdIsValid(frozen_full))
+	ceiling_full = cluster_xid_widen(ceiling, legal_next);
+	if (!FullTransactionIdIsValid(frozen_full) || !FullTransactionIdIsValid(ceiling_full))
 		return false;
 	next = U64FromFullTransactionId(legal_next);
 	oldest = U64FromFullTransactionId(frozen_full);
-	if (oldest > next)
+	bound = U64FromFullTransactionId(ceiling_full);
+	if (oldest > next || bound > next || next - oldest >= UINT64CONST(0x80000000)
+		|| next - bound >= UINT64CONST(0x80000000))
 		return false;
 	/*
-	 * Compare the distance instead of subtracting an age from next. This
-	 * cannot wrap at raw 0..2 or underflow the first FullXid epoch.
+	 * Saturate before subtraction at the first valid FullXid, and skip
+	 * raw 0..2 within later epochs. Never move the original ceiling.
 	 */
-	*out = next - oldest >= (uint64)table_age;
+	candidate = next > (uint64)min_age ? next - (uint64)min_age : FirstNormalTransactionId;
+	candidate = Max(candidate, FirstNormalTransactionId);
+	if ((TransactionId)candidate < FirstNormalTransactionId)
+		candidate += FirstNormalTransactionId - (TransactionId)candidate;
+	candidate = Min(candidate, bound);
+	*freeze_limit = (TransactionId)candidate;
+	*aggressive = next - oldest >= (uint64)table_age;
 	return true;
 }

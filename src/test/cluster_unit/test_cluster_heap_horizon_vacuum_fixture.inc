@@ -21,6 +21,7 @@ LWLockPadded *MainLWLockArray = age_locks;
 static bool age_xid_lock, age_promise_ready, age_promise_current, age_revoke_on_release;
 static unsigned age_sample_reads, age_fence_reads, age_lock_acquires, age_lock_releases;
 static FullTransactionId age_future;
+static TransactionId age_oldest_xmin;
 
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
@@ -69,7 +70,7 @@ cluster_xid_stripe_sample_fence_current(const ClusterXidStripeSampleFence *fence
 TransactionId
 GetOldestNonRemovableTransactionId(Relation rel)
 {
-	return 80;
+	return age_oldest_xmin;
 }
 
 MultiXactId
@@ -123,8 +124,8 @@ errhint(const char *fmt, ...)
 #include "test_cluster_heap_horizon_vacuum.inc"
 
 static bool
-vacuum_age_scan(TransactionId frozen, int table_age, char persistence, MultiXactId minmulti,
-				struct VacuumCutoffs *cutoffs)
+vacuum_policy_scan(TransactionId frozen, int min_age, int table_age, char persistence,
+				   MultiXactId minmulti, struct VacuumCutoffs *cutoffs)
 {
 	FormData_pg_class form = { 0 };
 	RelationData rel = { 0 };
@@ -134,11 +135,18 @@ vacuum_age_scan(TransactionId frozen, int table_age, char persistence, MultiXact
 	form.relfrozenxid = frozen;
 	form.relminmxid = minmulti;
 	rel.rd_rel = &form;
-	params.freeze_min_age = -1;
+	params.freeze_min_age = min_age;
 	params.freeze_table_age = table_age;
 	params.multixact_freeze_min_age = -1;
 	params.multixact_freeze_table_age = -1;
 	return vacuum_get_cutoffs(&rel, &params, cutoffs);
+}
+
+static bool
+vacuum_age_scan(TransactionId frozen, int table_age, char persistence, MultiXactId minmulti,
+				struct VacuumCutoffs *cutoffs)
+{
+	return vacuum_policy_scan(frozen, -1, table_age, persistence, minmulti, cutoffs);
 }
 
 static void
@@ -149,9 +157,11 @@ setup_age(void)
 	stub_next_full = FullTransactionIdFromU64(200);
 	age_cache.nextXid = stub_next_full;
 	age_future = FullTransactionIdFromU64(1000);
+	age_oldest_xmin = 80;
 	age_xid_lock = age_revoke_on_release = false;
 	age_promise_ready = age_promise_current = true;
 	age_sample_reads = age_fence_reads = age_lock_acquires = age_lock_releases = 0;
+	vacuum_freeze_min_age = 100;
 	vacuum_freeze_table_age = 500;
 	vacuum_multixact_freeze_table_age = 10000;
 	autovacuum_freeze_max_age = 200000000;
