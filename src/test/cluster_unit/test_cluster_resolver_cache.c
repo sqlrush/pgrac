@@ -11,15 +11,11 @@
  *	  re-validation (probe passes hint.wrap; a lookup miss -> revalidate_miss),
  *	  (4) xid_epoch fence (a hint installed at epoch E is an epoch_miss in E+1),
  *	  (5) own-instance install gate, plus the counter taxonomy, eviction, the
- *	  trust predicate and the entries==0 zero-memory no-op.  The real extracted
- *	  CR Source 3 caller also checks pre-scan epoch provenance; scan and acceptance
- *	  dependencies are fixture boundaries.  gate (3) (the
- *	  acceptance same-segment rerun) lives in cluster_cr.c (caller side), so it is
- *	  split across two homes: its VERDICT LOGIC is the pure
- *	  cluster_tt_recovery_wrap_suspect gate, unit-tested by
- *	  test_cluster_tt_durable.c (the test_wrap_suspect_* matrix); its memo-path
- *	  fail-closed BRANCH is exercised by the cluster_tap test (317 L5, injection-
- *	  driven -- the natural workload cannot reach a wrap-suspect memo hit).  The
+ *	  disabled trust predicate and the entries==0 zero-memory no-op.  The real
+ *	  extracted CR Source 3 caller checks pre-scan epoch provenance and always
+ *	  scans even on a valid hint, preserving rejected/unavailable scan results.
+ *	  Scan and acceptance dependencies are fixture boundaries; the actual
+ *	  wrap_suspect predicate is covered by test_cluster_tt_durable.c.  The
  *	  16-byte key / 8-byte-aligned slot StaticAsserts are enforced at
  *	  cluster_resolver_cache.o compile time.
  *
@@ -152,6 +148,8 @@ static int mock_stable_lookup_calls = 0;
 static bool mock_advance_epoch_during_lookup = false;
 static ClusterTTDurableXidCommitCheck mock_commit_check = NULL;
 static bool mock_advance_epoch_during_scan = false;
+static int mock_scan_calls = 0;
+static ClusterTTDurableResolve mock_scan_result = CLUSTER_TT_DURABLE_RESOLVED_SCN;
 
 static bool
 mock_durable_lookup(uint32 segment_id, uint16 slot_offset, TransactionId xid, uint32 expected_wrap)
@@ -226,13 +224,14 @@ cluster_tt_slot_durable_resolve_by_xid(TransactionId xid pg_attribute_unused(),
 									   uint16 *out_slot, uint16 *out_wrap)
 {
 	UT_ASSERT_EQ(expected_wrap, CLUSTER_TT_WRAP_ANY);
+	mock_scan_calls++;
 	if (mock_advance_epoch_during_scan)
 		mock_epoch++;
 	*commit_scn = scn_encode(1, 77);
 	*out_seg = 11;
 	*out_slot = 12;
 	*out_wrap = 13;
-	return CLUSTER_TT_DURABLE_RESOLVED_SCN;
+	return mock_scan_result;
 }
 
 static bool
@@ -274,6 +273,8 @@ mock_reset(void)
 	mock_advance_epoch_on_exclusive = false;
 	mock_cache_locks_held = 0;
 	mock_advance_epoch_during_scan = false;
+	mock_scan_calls = 0;
+	mock_scan_result = CLUSTER_TT_DURABLE_RESOLVED_SCN;
 	mock_lookup_result = true;
 	mock_lookup_scn = 0;
 	mock_lookup_calls = 0;
@@ -530,16 +531,74 @@ UT_TEST(test_live_entries)
 	UT_ASSERT_EQ(cluster_resolver_cache_live_entries(), 3);
 }
 
-/* U: trust predicate reflects (enabled && region live). */
+/* U: no setting permits a hint to replace the authoritative scan. */
 UT_TEST(test_trust_predicate)
 {
 	mock_reset();
 	rc_init(64, true, false); /* measure-only -> region live but not trusting */
 	UT_ASSERT_EQ((int)cluster_resolver_cache_trust(), 0);
-	rc_init(64, false, true); /* enabled -> trusting */
-	UT_ASSERT_EQ((int)cluster_resolver_cache_trust(), 1);
+	rc_init(64, false, true); /* enabled with live region still cannot skip */
+	UT_ASSERT_EQ((int)cluster_resolver_cache_trust(), 0);
+	rc_init(64, true, true); /* both settings on still cannot skip */
+	UT_ASSERT_EQ((int)cluster_resolver_cache_trust(), 0);
 	rc_init(0, false, true); /* enabled but no region -> not trusting */
 	UT_ASSERT_EQ((int)cluster_resolver_cache_trust(), 0);
+}
+
+/* U: a revalidated hint is diagnostic; the real caller returns the scan SCN. */
+UT_TEST(test_source3_hit_still_scans)
+{
+	int mode;
+
+	for (mode = 1; mode <= 3; mode++) {
+		SCN got = InvalidScn;
+
+		mock_reset();
+		rc_init(64, (mode & 2) != 0, (mode & 1) != 0);
+		cluster_resolver_cache_install(0, 12345, 11, 12, 13, scn_encode(1, 70), mock_epoch);
+		mock_lookup_scn = scn_encode(1, 70);
+		UT_ASSERT_EQ(
+			cluster_cr_resolve_xmax_commit_scn(NULL, CLUSTER_ITL_SLOT_UNALLOCATED, 12345, &got),
+			CLUSTER_CR_XMAX_RESOLVED_SCN);
+		UT_ASSERT_EQ(cluster_resolver_cache_hit_count(), 1);
+		UT_ASSERT_EQ(mock_scan_calls, 1);
+		UT_ASSERT_EQ(got, scn_encode(1, 77));
+		UT_ASSERT(!cluster_resolver_cache_trust());
+	}
+}
+
+/* U: a valid hint cannot hide a rejected, recycled or unavailable full scan. */
+UT_TEST(test_source3_hit_preserves_scan_rejection)
+{
+	static const struct {
+		ClusterTTDurableResolve scan_result;
+		int caller_result;
+	} cases[] = {
+		{ CLUSTER_TT_DURABLE_XID_MATCH_INVALID_SCN, CLUSTER_CR_XMAX_INVALID_OR_AMBIGUOUS },
+		{ CLUSTER_TT_DURABLE_AMBIGUOUS_WRAP, CLUSTER_CR_XMAX_INVALID_OR_AMBIGUOUS },
+		{ CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE, CLUSTER_CR_XMAX_SCAN_UNAVAILABLE },
+		{ CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH, CLUSTER_CR_XMAX_RECYCLED },
+	};
+	int mode;
+	size_t i;
+
+	for (mode = 1; mode <= 3; mode++) {
+		for (i = 0; i < lengthof(cases); i++) {
+			SCN got = InvalidScn;
+
+			mock_reset();
+			rc_init(64, (mode & 2) != 0, (mode & 1) != 0);
+			cluster_resolver_cache_install(0, 12345, 11, 12, 13, scn_encode(1, 70), mock_epoch);
+			mock_lookup_scn = scn_encode(1, 70);
+			mock_scan_result = cases[i].scan_result;
+			UT_ASSERT_EQ(
+				cluster_cr_resolve_xmax_commit_scn(NULL, CLUSTER_ITL_SLOT_UNALLOCATED, 12345, &got),
+				cases[i].caller_result);
+			UT_ASSERT_EQ(cluster_resolver_cache_hit_count(), 1);
+			UT_ASSERT_EQ(mock_scan_calls, 1);
+			UT_ASSERT_EQ(got, InvalidScn);
+		}
+	}
 }
 
 /* U: install / probe of an abnormal (non-normal) xid is a guarded no-op. */
@@ -701,7 +760,7 @@ UT_TEST(test_fresh_scan_epoch_zero_can_install)
 int
 main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 {
-	UT_PLAN(24);
+	UT_PLAN(26);
 	UT_RUN(test_fresh_scan_cross_epoch_does_not_install);
 	UT_RUN(test_stale_scan_does_not_replace_current_hint);
 	UT_RUN(test_install_epoch_advances_while_waiting_partition);
@@ -721,6 +780,8 @@ main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 	UT_RUN(test_refresh_no_evict);
 	UT_RUN(test_live_entries);
 	UT_RUN(test_trust_predicate);
+	UT_RUN(test_source3_hit_still_scans);
+	UT_RUN(test_source3_hit_preserves_scan_rejection);
 	UT_RUN(test_abnormal_xid_guarded);
 	UT_RUN(test_count_acceptance);
 	UT_RUN(test_nonterminal_skip_structural_zero);

@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_resolver_cache.c
- *	  pgrac shared (per-instance) resolver cache -- spec-5.55 search-shortcut
+ *	  pgrac shared (per-instance) resolver cache -- spec-5.55 diagnostic
  *	  memo for the own-instance CR Source 3 WRAP_ANY by-xid durable scan.
  *
  *	  A position-hint memo: (xid_epoch, raw_xid, origin) -> {seg, slot, wrap}.
@@ -9,9 +9,10 @@
  *	  the cache partition lock
  *	  (gate (1) non-authoritative + (2) stable exact-(xid,wrap) + native commit
  *	  reval + (4) epoch fence before and after I/O);
- *	  the caller (cluster_cr.c) then runs the SAME wrap_suspect acceptance gate it
- *	  runs on a fresh scan (gate (3)), so a memo hit is verdict-equivalent to the
- *	  O(segments) fresh scan it replaces.  install() caches the {seg,slot,wrap}
+ *	  the caller (cluster_cr.c) measures acceptance without trusting the hint,
+ *	  then always runs the authoritative full scan.  Single-slot revalidation
+ *	  does not prove retained transaction identity across all carriers.
+ *	  install() caches the {seg,slot,wrap}
  *	  the fresh scan matched (own-instance gate (5) + COMMITTED gate (6), only
  *	  after acceptance passed).
  *
@@ -216,7 +217,12 @@ cluster_resolver_cache_shmem_register(void)
 bool
 cluster_resolver_cache_trust(void)
 {
-	return cluster_resolver_cache_enabled && ResolverCache != NULL;
+	/*
+	 * No configuration may replace the full scan with a position hint until
+	 * retained identity provenance and equivalent admission are established.
+	 * The enabled/measure settings still control diagnostic hint allocation.
+	 */
+	return false;
 }
 
 /* ============================================================
@@ -227,10 +233,7 @@ uint64
 cluster_resolver_xid_epoch(void)
 {
 	/*
-	 * The own node's FullTransactionId epoch.  pgrac segments the xid space by
-	 * (origin_node_id, xid) compound key (cluster_remote_xact), NOT by value-
-	 * range, so a raw 32-bit xid is reused on the own node only once per 2^32 own
-	 * xids -- exactly one increment of this epoch.  The caller samples it BEFORE
+	 * The own node's current FullTransactionId epoch.  The caller samples it BEFORE
 	 * a fresh scan; install retains that epoch, while probe checks the current
 	 * epoch before and after durable/native revalidation.  A scan that spans an
 	 * epoch advance must never be relabeled as a new-epoch hint.  This local

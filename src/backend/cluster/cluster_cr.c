@@ -3367,9 +3367,8 @@ cluster_cr_resolved_scn_is_acceptable(SCN scn)
 /*
  * cluster_cr_accept_resolved_scn -- the AUTHORITATIVE acceptance gate: the pure
  *	predicate above PLUS the existing wrap_generation_disambiguated observability
- *	bump on a fail-closed verdict.  Used by the fresh-scan path and the TRUST-mode
- *	memo hit -- both AUTHORITATIVE resolutions, so each bumps the base counter
- *	exactly once.
+ *	bump on a fail-closed verdict.  The authoritative fresh-scan path bumps the
+ *	base counter exactly once.  Memo TRUST is disabled.
  *
  *	The MEASURE-mode memo probe (spec-5.55 Hardening v1.1, finding #1) must NOT use
  *	this wrapper: it is a non-authoritative shadow measurement that still falls
@@ -3484,12 +3483,10 @@ cluster_cr_resolve_xmax_commit_scn(const char *cr_page, uint8 itl_idx, Transacti
 	}
 
 	/*
-	 * spec-5.55 D6: shared resolver cache search-shortcut.  In TRUST mode a memo
-	 * hit re-validates the single hint slot in O(1) (gate (1)+(2)+(4)) and runs the
-	 * PHYSICALLY SAME acceptance gate the fresh scan runs (gate (3)), resolving
-	 * WITHOUT the O(segments) scan below -- verdict-equivalent by construction.  In
-	 * MEASURE/off mode the authoritative scan still runs (measure still records the
-	 * would-hit counters).  origin == own node (Source 3 is own-instance, gate (5)).
+	 * spec-5.55 D6: diagnostic resolver hint.  TRUST is unconditionally disabled;
+	 * even a revalidated, acceptable hint must fall through to the full Source 3
+	 * scan.  The single carrier does not establish retained identity provenance.
+	 * origin == own node (Source 3 is own-instance, gate (5)).
 	 */
 	{
 		SCN hint_scn = InvalidScn;
@@ -3497,10 +3494,8 @@ cluster_cr_resolve_xmax_commit_scn(const char *cr_page, uint8 itl_idx, Transacti
 		if (cluster_resolver_cache_probe((uint16)cluster_node_id, cr_xmax, &hint_scn)) {
 			if (cluster_resolver_cache_trust()) {
 				/*
-				 * TRUST: the memo hit IS the authoritative resolution (no fresh
-				 * scan follows), so it runs the side-effecting acceptance gate --
-				 * byte-identical to the fresh-scan path (gate (3)); its
-				 * wrap_generation_disambiguated bump replaces the fresh-scan bump.
+				 * Dormant TRUST branch: cluster_resolver_cache_trust() always
+				 * returns false.  This path cannot be enabled by configuration.
 				 */
 				bool accepted = cluster_cr_accept_resolved_scn(hint_scn);
 
@@ -3523,7 +3518,7 @@ cluster_cr_resolve_xmax_commit_scn(const char *cr_page, uint8 itl_idx, Transacti
 					*out_scn = InvalidScn; /* same fail-closed as the fresh-scan branch */
 					return CLUSTER_CR_XMAX_INVALID_OR_AMBIGUOUS;
 				}
-				*out_scn = hint_scn; /* gate (1): durable re-read, verdict-equivalent */
+				*out_scn = hint_scn; /* gate (1): durable re-read */
 				return CLUSTER_CR_XMAX_RESOLVED_SCN;
 			}
 
@@ -3558,7 +3553,7 @@ cluster_cr_resolve_xmax_commit_scn(const char *cr_page, uint8 itl_idx, Transacti
 		 * helper, spec-5.55 D6, gate (3)): the durable scan ran WRAP_ANY so a
 		 * single COMMITTED match below the horizon with unreliable retention is
 		 * wrap-suspect -> fail closed (规则 8.A: a wrong deleter scn would false-
-		 * hide a live row).  A memo hit above ran the SAME helper.
+		 * hide a live row).  A diagnostic memo hit above used only the pure predicate.
 		 */
 		if (!cluster_cr_accept_resolved_scn(*out_scn)) {
 			*out_scn = InvalidScn;
@@ -3567,7 +3562,7 @@ cluster_cr_resolve_xmax_commit_scn(const char *cr_page, uint8 itl_idx, Transacti
 		/*
 		 * spec-5.55 D5: cache the matched {seg,slot,wrap} position hint (own-
 		 * instance gate (5) + COMMITTED gate (6) + acceptance-passed) so a peer
-		 * backend can re-validate it in O(1) instead of re-scanning every segment.
+		 * backend can re-validate it in O(1) for diagnostics before its full scan.
 		 * No-op unless the memo region is live.
 		 */
 		cluster_resolver_cache_install((uint16)cluster_node_id, cr_xmax, resolved_seg,

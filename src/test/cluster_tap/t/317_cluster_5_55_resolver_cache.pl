@@ -6,32 +6,26 @@
 #
 #	  The memo caches the position the last own-instance WRAP_ANY by-xid scan
 #	  matched -- (xid_epoch, raw_xid, origin) -> {seg, slot, wrap} -- so a peer
-#	  backend re-validates that one slot in O(1) instead of re-running the whole
-#	  O(segments) scan.  A re-validated hit re-runs the PHYSICALLY SAME wrap_suspect
-#	  acceptance gate the fresh scan runs (gate 3), so a hit is verdict-equivalent
-#	  to the scan it replaces (规则 8.A: a wrong deleter scn would false-hide a live
-#	  row).  The recycle-heavy hot-branch workload (INITRANS=8 < concurrent writers)
+#	  backend re-validates that one slot in O(1) for diagnostics.  TRUST is
+#	  disabled: even an acceptable hint cannot replace the full Source 3 scan.
+#	  The recycle-heavy hot-branch workload (INITRANS=8 < concurrent writers)
 #	  forces committed deleters' ITL slots to recycle -> CR Source 3 by-xid scans,
 #	  resolved redundantly across the 8 backends -> the memo's target leg.
 #
-#	  L1  TRUST mode: the balance invariant holds (NO false-visible from a memo
-#	      hit) AND the memo actually fires (resolver_cache.hit > 0 -- the O(segments)
-#	      scan was really skipped) on cross-backend redundant resolutions.
+#	  L1  Enabled diagnostic hints: the balance invariant holds and the memo
+#	      records hits on cross-backend redundant resolutions.  A hit counter
+#	      does not count skipped scans; unit tests exercise the full-scan caller.
 #	  L2  retention-off soundness: with retention unreliable, the same acceptance
-#	      gate (gate 3) runs on the memo path; the invariant STILL holds -- the gate,
-#	      run identically on a memo hit and a fresh scan, keeps it sound.
+#	      gate (gate 3) remains authoritative on the full scan; the diagnostic
+#	      hint cannot override it.
 #	  L3  GUC off control: SAME workload, entries=0 -> byte-identical; the invariant
 #	      holds and every resolver_cache counter stays 0 (the memo is truly off).
 #	  L4  MEASURE mode (§0.6 value gate): the authoritative scan always runs and the
 #	      hint is never trusted; the counters quantify the cross-backend redundancy
-#	      (key_present / lookup) and re-probe hit rate (hit / key_present) that gate
-#	      the trust path -- NO-GO is a legitimate outcome, measured here.
-#	  L5  gate (3) fail-closed BRANCH coverage (Hardening v1.1, finding #2): the
-#	      fail-closed branch is a defensive 2^32-wrap guard the natural workload
-#	      cannot reach (acceptance_failclosed stays 0 even in L2), so an injection
-#	      forces a TRUST memo hit's acceptance closed -> acceptance_failclosed climbs
-#	      AND the 8.A balance invariant still holds (the verdict LOGIC itself is
-#	      unit-tested via the pure cluster_tt_recovery_wrap_suspect gate).
+#	      (key_present / lookup) and re-probe hit rate (hit / key_present).
+#	  L5  The dormant TRUST injection stays unreachable even with enabled hints.
+#	      Hints still hit, the injection does not alter the diagnostic acceptance
+#	      counter, and the balance invariant holds.
 #
 #	  Author: SqlRush <sqlrush@gmail.com>
 #	  Spec: spec-5.55-shared-resolver-cache.md (FROZEN v1.0)
@@ -105,7 +99,7 @@ sub _write_script
 	open(my $fh, '>', $script) or die $!;
 	# Injection armed state is PER-BACKEND (static registry), so each pgbench
 	# worker must arm its OWN backend -- arm inside the script (idempotent; the
-	# arm is non-transactional so it survives the 53R9F abort it provokes).
+	# arm is non-transactional; the disabled TRUST branch cannot consume it).
 	print $fh
 		"SELECT cluster_inject_fault('cluster-cr-resolver-memo-suspect','skip',0);\n"
 	  if $arm;
@@ -185,7 +179,7 @@ sub _init_pgbench
 }
 
 # ----------------------------------------------------------------------------
-# L1: TRUST mode -- no false-visible AND the memo fires.
+# L1: enabled diagnostic hints -- no false-visible AND the memo fires.
 # ----------------------------------------------------------------------------
 my $trust = _new_node('s555_trust', 'on', 'off', 8192);
 is($trust->safe_psql('postgres',
@@ -196,13 +190,13 @@ my @bad_trust = _unexpected_lines(_run_tpcb($trust));
 is(scalar @bad_trust, 0, 'L1 (trust): no unexpected errors (only 53R9F-class tolerated)')
   or diag("unexpected:\n" . join("\n", @bad_trust));
 is(_invariant($trust), 't',
-	'L1 (trust): balance invariant holds -- NO false-visible from a memo hit (规则 8.A)');
+	'L1 (enabled): balance invariant holds with diagnostic memo hits (规则 8.A)');
 my $kp = _rc($trust, 'key_present');
 my $hit = _rc($trust, 'hit');
 cmp_ok($kp, '>', 0,
 	"L1: cross-backend redundancy is real (key_present=$kp) -- the memo's target leg fires");
 cmp_ok($hit, '>', 0,
-	"L1: the memo fires -- $hit O(segments) by-xid scans skipped by an O(1) re-validated hit");
+	"L1: the diagnostic memo fires -- $hit re-validated hits; full scans remain required");
 # acceptance fail-closed must never produce a false result; it is bounded and the
 # invariant above proves no wrong verdict slipped through.
 my $afc = _rc($trust, 'acceptance_failclosed');
@@ -213,7 +207,7 @@ diag("L1 resolver_cache: lookup=" . _rc($trust, 'lookup') . " key_present=$kp hi
 # ----------------------------------------------------------------------------
 # L2: retention-off soundness -- the acceptance gate (gate 3) on the memo path.
 # Disable retention (sticky unreliable): a below-horizon match is wrap-suspect, so
-# the acceptance gate -- run IDENTICALLY on a memo hit and a fresh scan -- must
+# the authoritative full-scan acceptance gate must
 # fail closed.  The invariant STILL holds: the gate, not luck, keeps it sound.
 # ----------------------------------------------------------------------------
 $trust->safe_psql('postgres', 'ALTER SYSTEM SET cluster.undo_retention_horizon_enabled = off');
@@ -262,18 +256,10 @@ diag("L4 §0.6 value gate: lookup=$m_lookup key_present=$m_kp (redundancy=$redun
 $meas->stop;
 
 # ----------------------------------------------------------------------------
-# L5: gate (3) memo-path fail-closed BRANCH coverage (spec-5.55 Hardening v1.1,
-# finding #2).  The fail-closed branch is a defensive 2^32-xid-wrap guard the
-# natural MVCC workload cannot reach: a resolved deleter is always recent, so its
-# commit_scn is at/above the retention horizon -> never wrap-suspect; and if the
-# horizon ever advanced past an old entry, no reader would need that pre-delete
-# version, so it is never re-probed.  Empirically acceptance_failclosed stays 0
-# even with retention off (L2).  So the verdict LOGIC is unit-tested (the pure
-# cluster_tt_recovery_wrap_suspect gate, test_cluster_tt_durable.c), and HERE an
-# injection forces a TRUST-mode memo hit's acceptance closed to prove the BRANCH
-# routes correctly (acceptance_failclosed climbs -> INVALID_OR_AMBIGUOUS / 53R9F)
-# AND the 8.A balance invariant STILL holds (a fail-closed memo hit aborts the
-# read, never false-visible).
+# L5: the old TRUST-only injection must stay unreachable.  Require additional
+# diagnostic hits after arming it, unchanged acceptance_failclosed, and the same
+# balance invariant.  This does not substitute for the real caller's unit tests
+# proving a full scan and preservation of rejected/unavailable scan outcomes.
 # ----------------------------------------------------------------------------
 my $inj = _new_node('s555_inject', 'on', 'off', 8192);
 _init_pgbench($inj, 'L5');
@@ -281,23 +267,23 @@ _init_pgbench($inj, 'L5');
 # backends and all naturally accept (recent deleters are never wrap-suspect).
 _run_tpcb($inj, $seconds);
 my $fc_before = _rc($inj, 'acceptance_failclosed');
+my $hit_before = _rc($inj, 'hit');
 is($fc_before, 0,
 	'L5: natural acceptance_failclosed is 0 -- recent deleters are never wrap-suspect');
 # Now run a workload whose pgbench script arms the injection in EACH worker's own
-# backend (arming is per-backend): every TRUST-mode memo hit those workers take
-# against the warm shared memo is forced to fail closed (gate 3 branch).  A 53R9F
-# read aborts that client, so the run drains quickly -- but each memo hit it took
-# first bumped acceptance_failclosed.
+# backend (arming is per-backend).  TRUST stays disabled regardless of this
+# injection; the valid diagnostic hits must continue into the full scan.
 my @bad_inj = _unexpected_lines(_run_tpcb($inj, $seconds, 1));
 is(scalar @bad_inj, 0,
 	'L5 (inject): only 53R9F-class CR-unresolved tolerated, no unexpected errors')
   or diag("unexpected:\n" . join("\n", @bad_inj));
 my $fc_after = _rc($inj, 'acceptance_failclosed');
-cmp_ok($fc_after, '>', $fc_before,
-	"L5: the memo-path acceptance fail-closed branch fired (acceptance_failclosed "
-	. "$fc_before -> $fc_after) -- gate (3) routes (规则 8.A)");
+cmp_ok(_rc($inj, 'hit'), '>', $hit_before,
+	'L5: diagnostic memo hits continue while the TRUST-only injection is armed');
+is($fc_after, $fc_before,
+	'L5: the disabled TRUST branch cannot force diagnostic acceptance closed');
 is(_invariant($inj), 't',
-	'L5: invariant STILL holds under forced memo-path fail-closed -- no false-visible (规则 8.A)');
+	'L5: invariant holds with the TRUST-only injection unreachable (规则 8.A)');
 $inj->stop;
 
 done_testing();

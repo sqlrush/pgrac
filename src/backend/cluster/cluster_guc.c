@@ -4047,23 +4047,20 @@ cluster_init_guc(void)
 					 "affects hit/miss. The threshold is pending spec-5.58 calibration."),
 		&cluster_cr_pool_admit_pressure_ratio, 0, 0, 100000, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
-	/* spec-5.55 D7: shared resolver cache (CR Source 3 by-xid search-shortcut
-	 * memo).  Both PGC_POSTMASTER: the entry count + measure switch are final at
+	/* spec-5.55 D7: shared resolver cache (CR Source 3 diagnostic position
+	 * memo).  All PGC_POSTMASTER: the entry count + mode switches are final at
 	 * shmem reservation.  Default entries 0 / measure off = true zero memory (the
 	 * region is registered but reserves 0 bytes), so the spec-3.22 by-xid path is
-	 * byte-identical.  v1 ships in MEASURE mode only (the value gate, §0.6): it
-	 * always re-runs the authoritative scan and never trusts the hint -- the
-	 * trust path (flip-on) is gated on measured redundancy + re-probe hit rate. */
+	 * unchanged.  TRUST is unconditionally disabled: both settings preserve the
+	 * authoritative full scan and only enable diagnostic hints/counters. */
 	DefineCustomBoolVariable(
 		"cluster.resolver_cache_enabled",
-		gettext_noop("Enable spec-5.55 shared resolver cache TRUST mode (skip the by-xid scan on a "
-					 "re-validated + accepted hint)."),
-		gettext_noop("Spec-5.55. Default off. When on (with resolver_cache_entries > 0), a CR "
-					 "Source 3 by-xid resolution that hits the shared memo re-validates the hint "
-					 "slot in O(1) and re-runs the SAME wrap_suspect acceptance as a fresh scan, "
-					 "resolving WITHOUT the O(segments) scan (verdict-equivalent by construction). "
-					 "The recommended non-zero default is bound to the §0.6 value gate evidence "
-					 "(spec-5.58). PGC_POSTMASTER: requires a restart."),
+		gettext_noop("Enable shared resolver cache diagnostic hints (TRUST is disabled)."),
+		gettext_noop("Default off. When on (with resolver_cache_entries > 0), CR Source 3 "
+					 "re-validates memoized position hints and records diagnostic counters. "
+					 "The authoritative full by-xid scan always runs, including on a valid hint "
+					 "hit. This setting cannot enable scan bypass. PGC_POSTMASTER: requires a "
+					 "restart."),
 		&cluster_resolver_cache_enabled, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -4072,8 +4069,8 @@ cluster_init_guc(void)
 		gettext_noop("Spec-5.55 §0.6. Default off. When on (with resolver_cache_entries > 0), CR "
 					 "Source 3 records whether its own-instance by-xid scan result was already "
 					 "memoized by a peer backend and whether an O(1) re-validation + acceptance "
-					 "would have passed -- the cross-backend redundancy + re-probe hit rate that "
-					 "gate the trust path.  Never changes a visibility verdict (the authoritative "
+					 "would have passed. Never enables TRUST or changes a visibility verdict (the "
+					 "authoritative "
 					 "scan always runs).  Orthogonal to resolver_cache_enabled.  PGC_POSTMASTER."),
 		&cluster_resolver_cache_measure, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 

@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_resolver_cache.h
- *	  pgrac shared (per-instance) resolver cache -- a SEARCH-shortcut memo for
+ *	  pgrac shared (per-instance) resolver cache -- a diagnostic position memo for
  *	  the own-instance CR Source 3 WRAP_ANY by-xid durable scan (spec-5.55).
  *
  *	  The expensive resolver leg is the O(local_segments * TT_SLOTS_PER_SEGMENT)
@@ -11,8 +11,8 @@
  *	  scan independently.  This memo caches the position the LAST scan matched --
  *	  (xid_epoch, raw_xid, origin) -> {seg, slot, wrap} -- so a peer backend can
  *	  RE-VALIDATE that one slot in O(1)
- *	  (cluster_tt_slot_durable_lookup_committed_stable) instead of re-searching
- *	  every segment.
+ *	  (cluster_tt_slot_durable_lookup_committed_stable) for diagnostics.  The full
+ *	  scan remains authoritative and always runs, including on a memo hit.
  *
  *	  The cached {seg,slot,wrap} is a POSITION HINT, never an authoritative value
  *	  (spec-5.55 §3.1, all 8.A):
@@ -22,24 +22,20 @@
  *	   (2) stable exact-(xid,wrap) + native C1b re-validation: require matching
  *	       TT reads bracketing native commit proof.  A precommit-only, recycled,
  *	       wrap-bumped or changing slot is a miss -> caller re-scans.
- *	   (3) acceptance same-segment rerun: a memo hit runs the SAME wrap_suspect
- *	       acceptance gate (cluster_cr_accept_resolved_scn: WRAP_ANY + the CURRENT
- *	       retention horizon + the sticky retention reliability) as a fresh scan
- *	       -> verdict-equivalent by construction; the memo NEVER short-circuits
- *	       acceptance.
+ *	   (3) acceptance measurement: a memo hit evaluates the pure wrap_suspect
+ *	       predicate using the current retention horizon and sticky reliability.
+ *	       This diagnostic cannot substitute for the full scan and its acceptance.
  *	   (4) xid_epoch fence: a single monotonic own-instance FullTransactionId
  *	       epoch (cluster_resolver_xid_epoch) makes a hint from epoch E a key MISS
  *	       in E+1; recheck after durable/native reads before returning a candidate.
- *	       (pgrac segments the xid space by (origin_node_id, xid) compound
- *	       key, NOT by value-range, so own-instance raw-xid reuse period == one
- *	       own-node FullTransactionId epoch == this counter's granularity.)
+ *	       This local fence does not establish retained FullXid/carrier provenance.
  *	   (5) cross-instance fail-closed: own-instance scans only (CR Source 3).
  *	   (6) COMMITTED-only: the by-xid scan only matches TT_SLOT_COMMITTED.
  *
  *	  Two modes, both default OFF (entries == 0 -> true zero memory, byte-
  *	  identical to the spec-3.22 path):
- *	   - cluster.resolver_cache_enabled (TRUST): a re-validated + accepted hit
- *	     resolves WITHOUT the O(segments) fresh scan.
+ *	   - cluster.resolver_cache_enabled: enables diagnostic hints.  The existing
+ *	     setting is retained for compatibility; TRUST is unconditionally disabled.
  *	   - cluster.resolver_cache_measure (DIAGNOSTIC, §0.6 value gate): the
  *	     authoritative fresh scan ALWAYS runs and the hint is never trusted; only
  *	     the counters (would-the-memo-hit, would-re-validation+acceptance-pass)
@@ -77,7 +73,7 @@
  * shmem-region-count baseline is deterministic) but its size_fn returns 0.
  */
 extern int cluster_shared_resolver_cache_entries;
-extern bool cluster_resolver_cache_enabled; /* TRUST mode */
+extern bool cluster_resolver_cache_enabled; /* diagnostic hints; TRUST disabled */
 extern bool cluster_resolver_cache_measure; /* DIAGNOSTIC mode (value gate) */
 
 /* ---- shmem region lifecycle (cluster_shmem.c framework) ---- */
@@ -88,20 +84,19 @@ extern void cluster_resolver_cache_request_lwlocks(void);
 
 /* ---- mode predicates ---- */
 
-/* true when the trust path may skip the fresh scan on an accepted hit. */
+/* Always false: no setting permits a hint to replace the full scan. */
 extern bool cluster_resolver_cache_trust(void);
 
 /* ---- spec-5.55 D2: own-instance xid-wraparound fence ---- */
 
 /*
- * cluster_resolver_xid_epoch -- the single monotonic own-instance xid epoch.
- *	A hint cached at epoch E is a key MISS once the own node's xid counter wraps
- *	to E+1 (before raw_xid can be reused), so a memo hit can never span two
- *	incarnations of the same 32-bit raw xid (gate (4)).  O(1).
+ * cluster_resolver_xid_epoch -- the current own-instance xid epoch.
+ *	A hint cached at epoch E is a key MISS in E+1 (gate (4)).  This local key
+ *	fence alone does not prove retained transaction identity.  O(1).
  */
 extern uint64 cluster_resolver_xid_epoch(void);
 
-/* ---- spec-5.55 D4/D5: probe + install (trust path) ---- */
+/* ---- spec-5.55 D4/D5: diagnostic probe + install ---- */
 
 /*
  * spec-5.57 D5 (cross-instance identity contract, frozen; no data plane here):
@@ -122,9 +117,9 @@ extern uint64 cluster_resolver_xid_epoch(void);
  *	cluster_tt_slot_durable_lookup_committed_stable (gate (1)+(2)+(4)).  Returns
  *	true and a CANDIDATE *out_scn (a fresh durable re-read) iff the slot STILL binds
  *	(raw_xid, hint.wrap) COMMITTED with native C1b and the epoch still matches.
- *	The CALLER MUST still run the SAME acceptance gate
- *	(cluster_cr_accept_resolved_scn, gate (3)) it runs on a fresh scan --
- *	probe does NO acceptance.  Returns false (no count) when the region is off.
+ *	The CALLER MUST still run the full scan and its acceptance gate;
+ *	probe does NO authoritative resolution or acceptance.  Returns false
+ *	(no count) when the region is off.
  */
 extern bool cluster_resolver_cache_probe(uint16 origin_node, TransactionId raw_xid, SCN *out_scn);
 
