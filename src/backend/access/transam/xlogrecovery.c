@@ -808,6 +808,23 @@ ClusterColdRecoveryTxSubjectCurrent(const struct ClusterRecoveryStartV1 *start,
 }
 
 bool
+ClusterColdRecoveryTxLoserCurrent(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject)
+{
+	uint64 generation;
+	uint64 serial;
+
+	if (!ClusterColdRecoveryTxSubjectCurrent(start, subject, &generation, &serial)
+		|| !subject->loser_proven)
+		return false;
+
+	/* The producer's loser is a physical identity only.  Keep this helper
+	 * independent of C0, FullXid, TT mutation and checkpoint authority. */
+	return memcmp(&subject->loser.key, &subject->input.key,
+				  sizeof(subject->input.key)) == 0;
+}
+
+bool
 ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 {
 	struct ClusterRecoveryStartV1 *start;

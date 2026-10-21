@@ -428,9 +428,29 @@ UT_TEST(test_subject_rejects_nonactive_or_conflicting_physical_identity)
 		UT_ASSERT(generation == 0 && serial == 0);
 	}
 }
+
+UT_TEST(test_loser_candidate_requires_proven_exact_physical_entry)
+{
+	ClusterColdTopTxCensusEntryV1 *entry;
+	reset(); active_subject(); retain();
+	UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
+	entry = &census.entries[0];
+	/* A physical ACTIVE input alone is never a loser candidate. */
+	UT_ASSERT(!ClusterColdRecoveryTxLoserCurrent(info.cluster_tx_start, entry));
+	entry->loser_proven = true;
+	entry->loser.key = entry->input.key;
+	UT_ASSERT(ClusterColdRecoveryTxLoserCurrent(info.cluster_tx_start, entry));
+	/* The retained result must stay byte-for-byte tied to the physical slot. */
+	entry->loser.key.xid++;
+	UT_ASSERT(!ClusterColdRecoveryTxLoserCurrent(info.cluster_tx_start, entry));
+	entry->loser.key = entry->input.key;
+	entry->input.slot.status = TT_SLOT_UNUSED;
+	UT_ASSERT(!ClusterColdRecoveryTxLoserCurrent(info.cluster_tx_start, entry));
+}
+
 int main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
 	UT_RUN(test_original_owner_binds_complete_empty_census_after_done);
 	UT_RUN(test_native_owner_rejects_uninstalled_recovery_and_writer_drift);
 	UT_RUN(test_current_rechecks_owner_process_boot_and_exact_writer);
@@ -442,6 +462,7 @@ int main(void)
 	UT_RUN(test_process_cleanup_revokes_start_before_destroying_original_inputs);
 	UT_RUN(test_subject_requires_exact_original_census_entry_and_live_start);
 	UT_RUN(test_subject_rejects_nonactive_or_conflicting_physical_identity);
+	UT_RUN(test_loser_candidate_requires_proven_exact_physical_entry);
 	reset();
 	if (allocations != frees) { fprintf(stderr, "unreleased start resources\n"); return 1; }
 	UT_DONE();

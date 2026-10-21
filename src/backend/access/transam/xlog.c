@@ -275,6 +275,7 @@
 #include "cluster/cluster_cf_storage.h" /* PGRAC: spec-5.6 bootstrap authority window */
 #include "cluster/cluster_conf.h" /* PGRAC: RF-B exact one-node gate */
 #include "cluster/cluster_cold_recovery.h" /* PGRAC: hold restartpoint during typed cold replay */
+#include "cluster/cluster_wal_inputs.h" /* PGRAC: post-EOR retained loser read scope */
 #include "cluster/cluster_gcs_block.h" /* PGRAC: spec-6.12h D-h2 PI-discard checkpoint seal */
 #include "cluster/cluster_guc.h" /* PGRAC: spec-5.6 cluster_controlfile_shared_authority */
 #include "cluster/cluster_hw_snapshot.h" /* PGRAC: spec-5.7 D3 HW authority checkpoint snapshot */
@@ -6654,6 +6655,51 @@ ClusterStartupInstalledWriterV1(ClusterWalWriterToken *writer, uint8 operation_u
 	return true;
 }
 
+/* Reacquire the original owner/source scope for every physical loser proved
+ * by the pre-EOR census.  This is a read-only post-EOR integration point:
+ * TX_CLOSURE carries no C0, TT, checkpoint, DATA, reclamation or FullXid
+ * authority.  An unproven ACTIVE remains explicit and is not consumed here. */
+static bool
+cluster_cold_recovery_consume_loser_inputs_v1(
+	const struct ClusterRecoveryStartV1 *start)
+{
+	const ClusterColdTypedV1 *typed;
+
+	/* Clean/non-cold startup has no retained loser inputs to consume. */
+	if (start == NULL)
+		return true;
+	typed = ClusterColdRecoveryTxInputs(start);
+	if (typed == NULL || typed->top_tx_census == NULL)
+		return false;
+
+	for (uint32 i = 0; i < typed->top_tx_census->count; i++)
+	{
+		const ClusterColdTopTxCensusEntryV1 *entry = &typed->top_tx_census->entries[i];
+		ClusterWalInputsV1 *inputs = NULL;
+		ClusterControlRootResult result;
+
+		/* A retained ACTIVE without an independent loser proof stays
+		 * unresolved; it must not be promoted by this consumer. */
+		if (!entry->loser_proven)
+			continue;
+		if (!ClusterColdRecoveryTxLoserCurrent(start, entry))
+			return false;
+
+		result = cluster_wal_inputs_begin_tx_closure_v1(start, entry, &inputs);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || inputs == NULL)
+		{
+			if (inputs != NULL)
+				cluster_wal_inputs_release_v1(&inputs);
+			return false;
+		}
+		result = cluster_wal_inputs_revalidate_v1(inputs);
+		cluster_wal_inputs_release_v1(&inputs);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return false;
+	}
+	return true;
+}
+
 #endif
 
 /*
@@ -7843,6 +7889,14 @@ StartupXLOG(void)
 	if (!ClusterBeginColdRecoveryTx(endOfRecoveryInfo))
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 						errmsg("could not bind original Startup transaction recovery inputs")));
+	/* Shared cold recovery consumes only the proven physical losers through a
+	 * fresh original-owner TX_CLOSURE scope.  The scope is released before any
+	 * later startup work; no TT/C0 or checkpoint write is authorized here. */
+	if (cluster_shared_config
+		&& cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_TARGET_LOADING
+		&& !cluster_cold_recovery_consume_loser_inputs_v1(endOfRecoveryInfo->cluster_tx_start))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						 errmsg("could not consume post-EOR physical loser inputs")));
 
 	/*
 	 * PGRAC MODIFICATIONS (spec-4.8 D1): resolve crash-left undo TT slots.
@@ -7861,7 +7915,8 @@ StartupXLOG(void)
 	 */
 	/* A classified normal TARGET validates terminal history without changing
 	 * it. Its strict complete census below replaces these recovery-only jobs. */
-	if (cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_TARGET_LOADING)
+	if (!cluster_shared_config
+		&& cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_TARGET_LOADING)
 		cluster_tt_recovery_resolve_active_slots();
 
 	/*

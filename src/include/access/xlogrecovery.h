@@ -150,6 +150,13 @@ extern bool ClusterColdRecoveryTxSubjectCurrent(
 	const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdTopTxCensusEntryV1 *subject, uint64 *generation, uint64 *serial);
 
+/* Original post-EOR owner only: return a physical loser candidate from the
+ * exact retained ACTIVE census entry.  This is a read-only identity check;
+ * it grants no C0, TT, WAL, checkpoint or mutation authority. */
+extern bool ClusterColdRecoveryTxLoserCurrent(
+	const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject);
+
 extern const struct ClusterColdTypedV1 *
 ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start);
 #endif
