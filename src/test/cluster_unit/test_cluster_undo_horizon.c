@@ -337,6 +337,7 @@ reset_v2_receiver(void)
 	memset(&test_horizon_store, 0, sizeof(test_horizon_store));
 	UndoHorizonShmem = &test_horizon_store;
 	SpinLockInit(&test_horizon_store.maintenance_lock);
+	pg_atomic_init_u32(&test_horizon_store.freeze_watermark_seq, 0);
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		pg_atomic_init_u32(&test_horizon_store.slots[i].seq, 0);
 		pg_atomic_init_u32(&test_horizon_store.freeze_slots[i].seq, 0);
@@ -2134,6 +2135,45 @@ UT_TEST(test_v2_lmon_observes_once_per_interval_without_an_extra_retention_cut)
 			  != NULL);
 }
 
+UT_TEST(test_v2_lmon_publishes_identity_bound_global_watermark)
+{
+	ClusterHeapFreezeWatermark watermark;
+
+	(void)reset_v2_cohort(false);
+	UT_ASSERT(!cluster_heap_freeze_watermark_sample(&watermark));
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT(cluster_heap_freeze_watermark_sample(&watermark));
+	UT_ASSERT_EQ(watermark.future_full_xid_max, UINT64CONST(0x100001000));
+	UT_ASSERT_EQ(watermark.active_full_xid_min, UINT64CONST(0x100000080));
+	UT_ASSERT_EQ(watermark.horizon_scn, 300);
+	UT_ASSERT_EQ(watermark.publication_sequence, 1);
+	UT_ASSERT_EQ(watermark.f_sample_id, 17);
+	UT_ASSERT(watermark.published_at_us != 0);
+	UT_ASSERT_EQ(watermark.record_generation, 8);
+	UT_ASSERT_EQ(watermark.formation_epoch, 7);
+	UT_ASSERT_EQ(watermark.admitted_members_lo, 3);
+	UT_ASSERT_EQ(watermark.admitted_members_hi, 0);
+}
+
+UT_TEST(test_v2_refused_fold_preserves_watermark_and_identity_failure_blocks_reader)
+{
+	ClusterHeapFreezeWatermark first, after;
+
+	(void)reset_v2_cohort(false);
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT(cluster_heap_freeze_watermark_sample(&first));
+	test_horizon_store.freeze_slots[1].valid = false;
+	test_horizon_now += 1000001;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT(cluster_heap_freeze_watermark_sample(&after));
+	UT_ASSERT(memcmp(&after, &first, sizeof(after)) == 0);
+	test_v2_identity = false;
+	UT_ASSERT(!cluster_heap_freeze_watermark_sample(&after));
+	test_v2_identity = true;
+	test_sender_sample_current = false;
+	UT_ASSERT(!cluster_heap_freeze_watermark_sample(&after));
+}
+
 UT_TEST(test_v2_lmon_counts_missing_local_history_without_sending)
 {
 	unsigned sends;
@@ -2234,7 +2274,7 @@ UT_TEST(test_v2_lmon_observes_clock_rollback_as_stale)
 int
 main(void)
 {
-	UT_PLAN(76);
+	UT_PLAN(78);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -2309,6 +2349,8 @@ main(void)
 	UT_RUN(test_v2_cohort_single_member_still_requires_local_evidence);
 	UT_RUN(test_v2_summary_refusal_does_not_reuse_observed_values);
 	UT_RUN(test_v2_lmon_observes_once_per_interval_without_an_extra_retention_cut);
+	UT_RUN(test_v2_lmon_publishes_identity_bound_global_watermark);
+	UT_RUN(test_v2_refused_fold_preserves_watermark_and_identity_failure_blocks_reader);
 	UT_RUN(test_v2_lmon_counts_missing_local_history_without_sending);
 	UT_RUN(test_v2_lmon_records_real_cohort_refusals);
 	UT_RUN(test_v2_lmon_observation_respects_original_shutdown_and_enable_gates);

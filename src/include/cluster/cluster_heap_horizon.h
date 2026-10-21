@@ -118,6 +118,29 @@ typedef struct ClusterHeapFreezeCohortObservation {
 extern ClusterHeapFreezeCohortStatus
 cluster_heap_freeze_cohort_observe(ClusterHeapFreezeCohortObservation *out);
 
+/*
+ * A published, identity-bound candidate from one READY fixed-cohort fold.
+ * This is a volatile observation for the 2.4 producer/consumer handoff: it
+ * is not a freeze certificate, native truncation permission, or proof that
+ * every retained FullXid producer has completed its handoff.  The reader
+ * rechecks the worker sample and semantic fence before accepting it.
+ */
+typedef struct ClusterHeapFreezeWatermark {
+	uint64 future_full_xid_max;
+	uint64 active_full_xid_min;
+	uint64 horizon_scn;
+	uint64 publication_sequence;
+	uint64 f_sample_id;
+	uint64 published_at_us;
+	uint64 record_generation;
+	uint64 formation_epoch;
+	uint64 admitted_members_lo;
+	uint64 admitted_members_hi;
+} ClusterHeapFreezeWatermark;
+
+/* Bounded, read-only sample of the latest READY global candidate. */
+extern bool cluster_heap_freeze_watermark_sample(ClusterHeapFreezeWatermark *out);
+
 /* Best-effort explicit FREEZE intent, selected from a complete current
  * cohort's observed future maximum. One volatile, identity-scoped local
  * slot coalesces requests; the original LMON V2 cadence carries it and the

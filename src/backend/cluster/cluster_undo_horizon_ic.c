@@ -125,7 +125,12 @@ typedef struct ClusterUndoHorizonShmem {
 	uint64 freeze_last_observed_us; /* LMON only; rate limit refusals as well */
 	slock_t maintenance_lock;
 	UndoHorizonMaintenanceIntent maintenance;
-	/* Diagnostic outcomes only: no cached F/H or release authority. */
+	/* Latest READY fold, published only as an identity-bound candidate. */
+	pg_atomic_uint32 freeze_watermark_seq;
+	ClusterHeapFreezeWatermark freeze_watermark;
+	ClusterSemanticActiveSampleFence freeze_watermark_fence;
+	uint64 freeze_watermark_active_sample_id;
+	/* Diagnostic outcomes; the candidate above is not release authority. */
 	pg_atomic_uint64 freeze_observation_count[UNDO_HORIZON_V2_STATUS_COUNT];
 	/* observability (D5-5); bumped via the note_* helpers below */
 	pg_atomic_uint64 stall_count;
@@ -148,12 +153,18 @@ typedef struct UndoHorizonV2MaintenanceObservation {
 	ClusterSemanticActiveSampleFence fence;
 	UndoHorizonMaintenanceIntent intent;
 	uint64 covered;
+	uint64 active_sample_id;
 } UndoHorizonV2MaintenanceObservation;
 
 static ClusterHeapFreezeCohortStatus
 undo_horizon_v2_cohort_observe(ClusterHeapFreezeCohortObservation *out,
 							   const ClusterUndoRetentionSample *local_history,
 							   UndoHorizonV2MaintenanceObservation *maintenance);
+
+static bool
+undo_horizon_publish_freeze_watermark(const ClusterHeapFreezeCohortObservation *cohort,
+									  const UndoHorizonV2MaintenanceObservation *observed,
+									  uint64 now_us);
 
 static Size
 cluster_undo_horizon_shmem_size(void)
@@ -174,6 +185,7 @@ cluster_undo_horizon_shmem_init(void)
 
 		memset(shmem, 0, sizeof(*shmem));
 		SpinLockInit(&shmem->maintenance_lock);
+		pg_atomic_init_u32(&shmem->freeze_watermark_seq, 0);
 		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 			pg_atomic_init_u32(&shmem->slots[i].seq, 0);
 			pg_atomic_init_u32(&shmem->freeze_slots[i].seq, 0);
@@ -671,6 +683,7 @@ undo_horizon_observe_v2(uint64 now_us, const ClusterUndoRetentionSample *history
 		status = CLUSTER_HEAP_FREEZE_COHORT_INVALID;
 	pg_atomic_fetch_add_u64(&UndoHorizonShmem->freeze_observation_count[status], 1);
 	if (status == CLUSTER_HEAP_FREEZE_COHORT_READY) {
+		(void)undo_horizon_publish_freeze_watermark(&observation, &maintenance, now_us);
 		undo_horizon_relay_maintenance(&observation);
 		if (maintenance.intent.requested != 0
 			&& maintenance.covered >= maintenance.intent.requested)
@@ -798,6 +811,68 @@ cluster_heap_freeze_report_v2_sample(int32 peer, ClusterHeapFreezeReportV2View *
 		return false;
 	return undo_horizon_v2_slot_sample(peer, out, &generation, &seq)
 		   == CLUSTER_HEAP_FREEZE_COHORT_READY;
+}
+
+bool
+cluster_heap_freeze_watermark_sample(ClusterHeapFreezeWatermark *out)
+{
+	int attempt;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (UndoHorizonShmem == NULL || !cluster_enabled)
+		return false;
+
+	for (attempt = 0; attempt < UNDO_HORIZON_SEQLOCK_RETRIES; attempt++) {
+		uint32 seq1 = pg_atomic_read_u32(&UndoHorizonShmem->freeze_watermark_seq);
+		ClusterHeapFreezeWatermark watermark;
+		ClusterSemanticActiveSampleFence fence;
+		uint64 active_sample_id;
+		FullTransactionId future;
+		FullTransactionId active_min;
+		ClusterUndoCleanerActiveSample active;
+		uint32 seq2;
+
+		if (seq1 & 1)
+			continue;
+		pg_read_barrier();
+		watermark = UndoHorizonShmem->freeze_watermark;
+		fence = UndoHorizonShmem->freeze_watermark_fence;
+		active_sample_id = UndoHorizonShmem->freeze_watermark_active_sample_id;
+		future = FullTransactionIdFromU64(watermark.future_full_xid_max);
+		active_min = FullTransactionIdFromU64(watermark.active_full_xid_min);
+		pg_read_barrier();
+		seq2 = pg_atomic_read_u32(&UndoHorizonShmem->freeze_watermark_seq);
+		if (seq1 != seq2)
+			continue;
+		if (watermark.publication_sequence == 0 || watermark.published_at_us == 0
+			|| watermark.f_sample_id == 0
+			|| active_sample_id == 0 || watermark.f_sample_id != active_sample_id
+			|| watermark.record_generation != fence.record_generation
+			|| watermark.formation_epoch != fence.formation_epoch
+			|| watermark.admitted_members_lo != fence.admitted_members_lo
+			|| watermark.admitted_members_hi != fence.admitted_members_hi
+			|| watermark.future_full_xid_max == 0
+			|| watermark.active_full_xid_min == 0
+			|| !FullTransactionIdIsValid(future) || !FullTransactionIdIsValid(active_min)
+			|| FullTransactionIdFollows(active_min, future)
+			|| !TransactionIdIsNormal(
+				   XidFromFullTransactionId(future))
+			|| !TransactionIdIsNormal(
+				   XidFromFullTransactionId(active_min))
+			|| !SCN_VALID((SCN)watermark.horizon_scn)
+			|| watermark.horizon_scn == CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED
+			|| !cluster_semantic_activation_active_sample_current(&fence)
+			|| !cluster_undo_cleaner_active_sample(&active)
+			|| active.sample_id != active_sample_id
+			|| memcmp(&active.admission_fence, &fence, sizeof(fence)) != 0
+			|| !cluster_undo_cleaner_active_sample_current(&active))
+			continue;
+		*out = watermark;
+		return true;
+	}
+	return false;
 }
 
 typedef struct UndoHorizonV2PeerObservation {
@@ -935,6 +1010,7 @@ undo_horizon_v2_cohort_observe(ClusterHeapFreezeCohortObservation *out,
 		return CLUSTER_HEAP_FREEZE_COHORT_INVALID;
 	candidate.future_full_xid_max = U64FromFullTransactionId(active.scan.future_full);
 	observed.fence = fence;
+	observed.active_sample_id = active.sample_id;
 	observed.intent = undo_horizon_maintenance_sample();
 	if (memcmp(&observed.intent.fence, &fence, sizeof(fence)) == 0)
 		candidate.requested_full_xid_max = observed.intent.requested;
@@ -970,6 +1046,72 @@ undo_horizon_v2_cohort_observe(ClusterHeapFreezeCohortObservation *out,
 	if (maintenance != NULL)
 		*maintenance = observed;
 	return CLUSTER_HEAP_FREEZE_COHORT_READY;
+}
+
+/* Publish only after the fixed-cohort fold has been bracketed and the local
+ * worker sample plus admission fence have been rechecked.  This is a
+ * read-only 2.4 handoff candidate: the producer/consumer retention contract
+ * and native truncation path still need their own proof in 2.5. */
+static bool
+undo_horizon_publish_freeze_watermark(const ClusterHeapFreezeCohortObservation *cohort,
+								  const UndoHorizonV2MaintenanceObservation *observed,
+								  uint64 now_us)
+{
+	ClusterUndoCleanerActiveSample active;
+	FullTransactionId future;
+	FullTransactionId active_min;
+	ClusterHeapFreezeWatermark watermark;
+	uint64 next;
+	uint32 seq;
+
+	if (cohort == NULL || observed == NULL || now_us == 0 || UndoHorizonShmem == NULL
+		|| !cluster_enabled || !cluster_semantic_activation_active_sample_current(&observed->fence)
+		|| !cluster_undo_cleaner_active_sample(&active))
+		return false;
+	future = FullTransactionIdFromU64(cohort->future_full_xid_max);
+	active_min = FullTransactionIdFromU64(cohort->active_full_xid_min);
+	if (active.scan.status != CTRC_ACTIVE_SCAN_COMPLETE || active.sample_id == 0
+		|| active.sample_id != observed->active_sample_id || active.worker_pid <= 0
+		|| !FullTransactionIdIsValid(active.scan.future_full)
+		|| !FullTransactionIdIsValid(active.scan.min_full)
+		|| !FullTransactionIdIsValid(future) || !FullTransactionIdIsValid(active_min)
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(future))
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(active_min))
+		|| FullTransactionIdFollows(active_min, future)
+		|| cohort->horizon_scn == CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED
+		|| !SCN_VALID((SCN)cohort->horizon_scn)
+		|| cohort->record_generation != observed->fence.record_generation
+		|| cohort->formation_epoch != observed->fence.formation_epoch
+		|| cohort->admitted_members_lo != observed->fence.admitted_members_lo
+		|| cohort->admitted_members_hi != observed->fence.admitted_members_hi
+		|| memcmp(&active.admission_fence, &observed->fence, sizeof(active.admission_fence)) != 0
+		|| !cluster_undo_cleaner_active_sample_current(&active))
+		return false;
+	seq = pg_atomic_read_u32(&UndoHorizonShmem->freeze_watermark_seq);
+	if ((seq & 1) != 0 || seq >= UINT32_MAX - 1)
+		return false;
+	next = UndoHorizonShmem->freeze_watermark.publication_sequence;
+	if (next == UINT64_MAX)
+		return false;
+	memset(&watermark, 0, sizeof(watermark));
+	watermark.future_full_xid_max = cohort->future_full_xid_max;
+	watermark.active_full_xid_min = cohort->active_full_xid_min;
+	watermark.horizon_scn = cohort->horizon_scn;
+	watermark.publication_sequence = next + 1;
+	watermark.f_sample_id = observed->active_sample_id;
+	watermark.published_at_us = now_us;
+	watermark.record_generation = observed->fence.record_generation;
+	watermark.formation_epoch = observed->fence.formation_epoch;
+	watermark.admitted_members_lo = observed->fence.admitted_members_lo;
+	watermark.admitted_members_hi = observed->fence.admitted_members_hi;
+	pg_atomic_write_u32(&UndoHorizonShmem->freeze_watermark_seq, seq + 1);
+	pg_write_barrier();
+	UndoHorizonShmem->freeze_watermark = watermark;
+	UndoHorizonShmem->freeze_watermark_fence = observed->fence;
+	UndoHorizonShmem->freeze_watermark_active_sample_id = observed->active_sample_id;
+	pg_write_barrier();
+	pg_atomic_write_u32(&UndoHorizonShmem->freeze_watermark_seq, seq + 2);
+	return true;
 }
 
 ClusterHeapFreezeCohortStatus
