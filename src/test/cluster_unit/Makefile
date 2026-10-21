@@ -7498,7 +7498,9 @@ test_cluster_tt_checkpoint_publish.inc: $(top_srcdir)/src/backend/access/transam
 	mv $@.tmp $@
 
 test_cluster_tt_checkpoint_publish: test_cluster_tt_checkpoint_select.inc \
-		test_cluster_tt_checkpoint_guts.inc test_cluster_tt_checkpoint_publish.inc
+		test_cluster_tt_checkpoint_guts.inc test_cluster_tt_checkpoint_publish.inc \
+		test_cluster_tt_checkpoint_native.c test_cluster_tt_checkpoint_native.inc \
+		test_cluster_space_commit_emit.inc test_cluster_side_xact_xactdesc.o
 
 test_cluster_tt_checkpoint_cuts test_cluster_tt_checkpoint_native test_cluster_tt_checkpoint_publish: %: %.c \
 		test_cluster_tt_checkpoint_cuts.c \
