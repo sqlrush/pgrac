@@ -9015,9 +9015,11 @@ test_cluster_cold_xid_replay.inc: $(top_srcdir)/src/backend/access/transam/xlogr
 
 test_cluster_cold_recovery_xid: test_cluster_cold_recovery_xid.c unit_test.h \
 		test_cluster_cold_xid_replay.inc test_cluster_cold_xid_replay.h \
-		test_cluster_cold_recovery_xid_core.o \
+		test_cluster_cold_recovery_xid_core.o test_cluster_cold_recovery_replay_core.o \
+		$(CLUSTER_COLD_PLAN_O) cluster_unit_port_stubs.o \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< test_cluster_cold_recovery_xid_core.o \
+		test_cluster_cold_recovery_replay_core.o $(CLUSTER_COLD_PLAN_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 $(CLUSTER_COLD_DECODE_O): $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_decode.c \
