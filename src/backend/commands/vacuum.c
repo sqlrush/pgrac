@@ -1748,9 +1748,9 @@ vac_update_datfrozenxid(void)
 
 /*
  * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
- * What changed: validate shared database XID merges against a legal window.
+ * What changed: scan and merge shared database XIDs in one legal window.
  * Why: local raw-XID ordering cannot validate a shared catalogue value.
- * Retain the original maintenance decisions and conservative scan returns.
+ * Retain the original oldest seed, MX decisions and native truncation guards.
  */
 static void
 vac_update_datfrozenxid_internal(void)
@@ -1772,6 +1772,9 @@ vac_update_datfrozenxid_internal(void)
 #ifdef USE_PGRAC_CLUSTER
 	bool		shared_xid = cluster_storage_mode_enabled() && cluster_shared_catalog;
 	FullTransactionId legal_next = InvalidFullTransactionId;
+	FullTransactionId newFrozenFull = InvalidFullTransactionId;
+	ClusterXidStripeSampleFence fence;
+	bool sampled = false;
 #endif
 
 	/*
@@ -1804,6 +1807,32 @@ vac_update_datfrozenxid_internal(void)
 	 */
 	lastSaneFrozenXid = ReadNextTransactionId();
 	lastSaneMinMulti = ReadNextMultiXactId();
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: another node's relfrozenxid can exceed local nextXid.  Fold
+	 * shared XIDs against one legal FullXid sample, without holding the
+	 * allocator lock across catalogue I/O.  An unknown seed/window cannot
+	 * advance datfrozenxid, but does not prevent the independent MX scan.
+	 */
+	if (shared_xid && cluster_xid_striping && ShmemVariableCache != NULL) {
+		uint64 next_value;
+		uint64 seed_value;
+
+		LWLockAcquire(XidGenLock, LW_SHARED);
+		sampled
+			= cluster_xid_stripe_sample_future(ShmemVariableCache->nextXid, &legal_next, &fence);
+		LWLockRelease(XidGenLock);
+		newFrozenFull = cluster_xid_widen(newFrozenXid, legal_next);
+		next_value = U64FromFullTransactionId(legal_next);
+		seed_value = U64FromFullTransactionId(newFrozenFull);
+		if (!sampled || !FullTransactionIdIsValid(legal_next)
+			|| !TransactionIdIsNormal(XidFromFullTransactionId(legal_next))
+			|| !FullTransactionIdIsValid(newFrozenFull) || seed_value > next_value
+			|| next_value - seed_value >= UINT64CONST(0x80000000))
+			legal_next = InvalidFullTransactionId;
+	}
+#endif
 
 	/*
 	 * We must seqscan pg_class to find the minimum Xid, because there is no
@@ -1852,18 +1881,38 @@ vac_update_datfrozenxid_internal(void)
 
 		if (TransactionIdIsValid(relfrozenxid))
 		{
-			Assert(TransactionIdIsNormal(relfrozenxid));
+#ifdef USE_PGRAC_CLUSTER
+			if (shared_xid) {
+				if (FullTransactionIdIsValid(legal_next)) {
+					FullTransactionId relfull = cluster_xid_widen(relfrozenxid, legal_next);
+					uint64 next_value = U64FromFullTransactionId(legal_next);
+					uint64 rel_value = U64FromFullTransactionId(relfull);
 
-			/* check for values in the future */
-			if (TransactionIdPrecedes(lastSaneFrozenXid, relfrozenxid))
+					if (!FullTransactionIdIsValid(relfull) || rel_value > next_value
+						|| next_value - rel_value >= UINT64CONST(0x80000000)) {
+						bogus = true;
+						break;
+					}
+					if (rel_value < U64FromFullTransactionId(newFrozenFull)) {
+						newFrozenFull = relfull;
+						newFrozenXid = relfrozenxid;
+					}
+				}
+			} else
+#endif
 			{
-				bogus = true;
-				break;
-			}
+				Assert(TransactionIdIsNormal(relfrozenxid));
 
-			/* determine new horizon */
-			if (TransactionIdPrecedes(relfrozenxid, newFrozenXid))
-				newFrozenXid = relfrozenxid;
+				/* check for values in the future */
+				if (TransactionIdPrecedes(lastSaneFrozenXid, relfrozenxid)) {
+					bogus = true;
+					break;
+				}
+
+				/* determine new horizon */
+				if (TransactionIdPrecedes(relfrozenxid, newFrozenXid))
+					newFrozenXid = relfrozenxid;
+			}
 		}
 
 		if (MultiXactIdIsValid(relminmxid))
@@ -1893,19 +1942,9 @@ vac_update_datfrozenxid_internal(void)
 	Assert(MultiXactIdIsValid(newMinMulti));
 
 #ifdef USE_PGRAC_CLUSTER
-	/* PGRAC: sample before taking the inplace update's content lock. */
-	if (shared_xid && cluster_xid_striping && ShmemVariableCache != NULL)
-	{
-		ClusterXidStripeSampleFence fence;
-		bool		sampled;
-
-		LWLockAcquire(XidGenLock, LW_SHARED);
-		sampled = cluster_xid_stripe_sample_future(ShmemVariableCache->nextXid,
-												 &legal_next, &fence);
-		LWLockRelease(XidGenLock);
-		if (!sampled || !cluster_xid_stripe_sample_fence_current(&fence))
-			legal_next = InvalidFullTransactionId;
-	}
+	/* PGRAC: the same lease identity must still cover the completed scan. */
+	if (sampled && !cluster_xid_stripe_sample_fence_current(&fence))
+		legal_next = InvalidFullTransactionId;
 #endif
 
 	/* Now fetch the pg_database tuple we need to update. */

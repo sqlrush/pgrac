@@ -740,7 +740,7 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(51);
+	UT_PLAN(59);
 	UT_RUN(registered_catalog_is_live_without_becoming_active);
 	UT_RUN(evaluated_registered_snapshot_overrides_an_unrelated_active_snapshot);
 	UT_RUN(forged_reference_counts_do_not_establish_liveness);
@@ -792,6 +792,14 @@ main(void)
 	UT_RUN(vacuum_database_accepts_durable_bound_and_next_boundary);
 	UT_RUN(vacuum_database_retains_full_xid_wrap_order);
 	UT_RUN(vacuum_database_unknown_window_keeps_independent_mx);
+	UT_RUN(vacuum_database_scan_accepts_foreign_xid_and_keeps_seed);
+	UT_RUN(vacuum_database_scan_uses_full_xid_minimum_across_wrap);
+	UT_RUN(vacuum_database_scan_rejects_invalid_later_xid);
+	UT_RUN(vacuum_database_scan_unknown_window_keeps_independent_mx);
+	UT_RUN(vacuum_database_scan_rechecks_fence_after_catalog_read);
+	UT_RUN(vacuum_database_scan_rejects_invalid_seed_before_fold);
+	UT_RUN(vacuum_database_scan_nontarget_keeps_native_future_refusal);
+	UT_RUN(vacuum_database_scan_keeps_mx_future_refusal);
 	UT_ASSERT_EQ(remembered, 0);
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	UT_ASSERT(!ActiveSnapshotSet());
