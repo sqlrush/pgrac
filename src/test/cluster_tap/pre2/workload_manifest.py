@@ -2,7 +2,8 @@
 
 No server is contacted. File digests bind the bytes read here, not their origin
 or capture time. Inventory PID matches remain candidates, never sealed process
-identities or normalized contract events.
+identities or normalized contract events. Explicit raw identity assignments
+are checked declarations, not process-birth attestation.
 """
 import argparse
 import hashlib
@@ -70,6 +71,60 @@ def _file(root, descriptor, retain):
              "file digest or size mismatch: " + name)
     return (dict(path=name, sha256=digest.hexdigest(), size_bytes=length),
             (info.st_dev, info.st_ino), b"".join(chunks))
+
+
+def _trace_identities(node, inventory, trace, files):
+    """Check explicit per-line declarations without filling any raw field."""
+    claims = inventory.get("trace_identity_assignments", [])
+    _require(isinstance(claims, list), "trace identity assignments are not an array")
+    assignments = [dict(status="UNKNOWN", identity_bound=False)
+                   for observation in trace["observations"]]
+    assigned = set()
+    process_fields = ("pid", "procno", "backend_start", "process_incarnation", "role")
+    identity_fields = {"node_id", "boot_id", "sequence_domain", *process_fields}
+    for claim in claims:
+        _require(isinstance(claim, dict) and set(claim) == {"source", "identity"},
+                 "invalid trace identity assignment")
+        source, identity = claim["source"], claim["identity"]
+        _require(isinstance(source, dict), "assignment source is not an object")
+        index = source.get("observation_index")
+        _require(type(index) is int and 0 <= index < len(assignments) and index not in assigned,
+                 "invalid or duplicate assignment observation index")
+        observation = trace["observations"][index]
+        expected = dict(stderr_file_id=node["stderr"],
+                        stderr_sha256=files[node["stderr"]]["sha256"], observation_index=index)
+        expected.update({key: observation[key] for key in
+                         ("line", "byte_offset", "byte_length", "sha256")})
+        _require(set(source) == set(expected) and
+                 all(type(source[key]) is type(value) and source[key] == value
+                     for key, value in expected.items()), "assignment raw provenance mismatch")
+        _require(isinstance(identity, dict) and set(identity) == identity_fields,
+                 "incomplete assignment process identity")
+        _require(all(type(identity[key]) is int for key in ("node_id", "pid", "procno")) and
+                 identity["node_id"] == node["node_id"] and identity["pid"] > 0 and
+                 identity["procno"] >= 0 and
+                 all(_text(identity[key]) for key in identity_fields - {"node_id", "pid", "procno"}) and
+                 identity["boot_id"] == node["boot_id"], "invalid assignment process identity")
+        fields = observation["fields"]
+        _require(identity["pid"] == int(fields["pid"]) and
+                 identity["sequence_domain"] == fields.get("sequence_domain"),
+                 "assignment PID or producer sequence domain mismatch")
+        _require(any(all(identity[key] == process[key] for key in process_fields)
+                     for process in inventory["processes"]), "assignment process absent from inventory")
+        if "procno" in fields:
+            _require(re.fullmatch(r"[0-9]+", fields["procno"]) is not None and
+                     int(fields["procno"]) == identity["procno"], "assignment LOG procno mismatch")
+        for key, gate in (("backend_start", "backend_start_known"),
+                          ("process_incarnation", "process_incarnation_known"),
+                          ("boot_id", "boot_known")):
+            if key in fields and fields.get(gate) != "0":
+                _require(fields[key] == identity[key], "assignment LOG identity mismatch: " + key)
+        assigned.add(index)
+        assignments[index] = dict(status="DECLARED_ONLY", identity_bound=False,
+                                  source=source, identity=identity,
+                                  inventory_file_id=node["inventory"],
+                                  inventory_sha256=files[node["inventory"]]["sha256"])
+    return assignments
 
 
 def read_capture(manifest_path):
@@ -178,7 +233,9 @@ def _read_capture(path):
         result_nodes.append(dict(node_id=node["node_id"], declared_inventory=inventory,
                                  file_ids={role: node[role] for role in
                                            ("postgres", "config", "stderr", "inventory")},
-                                 trace=trace, process_candidates=candidates))
+                                 trace=trace, process_candidates=candidates,
+                                 trace_identity_assignments=_trace_identities(
+                                     node, inventory, trace, files)))
     parse_status = ("REJECTED" if "REJECTED" in statuses else
                     "PARSED" if "PARSED" in statuses else "NOT_OBSERVED")
     return dict(manifest=dict(sha256=hashlib.sha256(raw_manifest).hexdigest(),

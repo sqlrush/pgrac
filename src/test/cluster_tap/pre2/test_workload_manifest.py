@@ -251,7 +251,210 @@ class WorkloadManifestTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.read()
 
+    def assignment(self, node=0, process=None, index=0):
+        entry = self.manifest["nodes"][node]
+        inventory = self.inventory(entry)
+        process = inventory["processes"][0] if process is None else process
+        data = (self.root / self.manifest["files"][entry["stderr"]]["path"]).read_bytes()
+        lines = data.splitlines(keepends=True)
+        return dict(source=dict(stderr_file_id=entry["stderr"],
+                                stderr_sha256=self.digest(data), observation_index=index,
+                                line=index + 1, byte_offset=sum(map(len, lines[:index])),
+                                byte_length=len(lines[index]), sha256=self.digest(lines[index])),
+                    identity=dict(node_id=node, boot_id=entry["boot_id"],
+                                  sequence_domain="HOT_FULL", **process))
+
+    def assign(self, claims, node=0):
+        entry = self.manifest["nodes"][node]
+        inventory = self.inventory(entry)
+        inventory["trace_identity_assignments"] = claims
+        self.inventory(entry, inventory)
+
+    def test_absent_assignment_cannot_promote_even_a_unique_pid_candidate(self):
+        result = self.read()
+        for node in result["nodes"]:
+            self.assertEqual(node["trace_identity_assignments"],
+                             [dict(status="UNKNOWN", identity_bound=False)])
+        self.assertFalse(result["identity_bound"])
+
+    def test_exact_raw_assignment_preserves_declared_only_and_producer_unknown(self):
+        claim = self.assignment()
+        self.assign([claim])
+        result = self.read()
+        node = result["nodes"][0]
+        assignment = node["trace_identity_assignments"][0]
+        self.assertEqual(assignment["status"], "DECLARED_ONLY")
+        self.assertEqual(assignment["identity"], claim["identity"])
+        self.assertEqual(assignment["source"], claim["source"])
+        self.assertEqual(assignment["inventory_file_id"], "inventory0")
+        self.assertEqual(assignment["inventory_sha256"],
+                         self.manifest["files"]["inventory0"]["sha256"])
+        fields = node["trace"]["observations"][0]["fields"]
+        self.assertEqual(fields["process_incarnation_known"], "0")
+        self.assertNotIn("process_incarnation", fields)
+        self.assertFalse(assignment["identity_bound"])
+        self.assertFalse(result["identity_bound"])
+        self.assertFalse(result["ready_to_run"])
+        self.assertEqual(result["field_root"], "OPEN")
+        self.assertNotIn("events", result)
+        self.assertNotIn("overall", result)
+
+    def test_assignment_rejects_each_wrong_raw_locator_including_boolean_indices(self):
+        original = self.assignment()
+        wrong = dict(stderr_file_id="stderr1", stderr_sha256="0" * 64,
+                     observation_index=1, line=2, byte_offset=1,
+                     byte_length=original["source"]["byte_length"] + 1, sha256="1" * 64)
+        for field, value in list(wrong.items()) + [("observation_index", False),
+                                                  ("byte_offset", False), ("line", True)]:
+            with self.subTest(field=field, value=value):
+                claim = copy.deepcopy(original)
+                claim["source"][field] = value
+                self.assign([claim])
+                with self.assertRaises(ValueError):
+                    self.read()
+
+    def test_assignment_rejects_incomplete_or_unrecognized_raw_provenance(self):
+        original = self.assignment()
+        for field in original["source"]:
+            with self.subTest(field=field):
+                claim = copy.deepcopy(original)
+                del claim["source"][field]
+                self.assign([claim])
+                with self.assertRaises(ValueError):
+                    self.read()
+        claim = copy.deepcopy(original)
+        claim["source"]["timestamp"] = "nearby is not provenance"
+        self.assign([claim])
+        with self.assertRaises(ValueError):
+            self.read()
+
+    def test_assignment_rejects_wrong_birth_role_boot_pid_or_sequence_domain(self):
+        original = self.assignment()
+        wrong = dict(node_id=1, boot_id="boot-other", pid=102, procno=8,
+                     backend_start="start-other", process_incarnation="inc-other",
+                     role="worker", sequence_domain="READ_IMAGE")
+        for field, value in wrong.items():
+            with self.subTest(field=field):
+                claim = copy.deepcopy(original)
+                claim["identity"][field] = value
+                self.assign([claim])
+                with self.assertRaises(ValueError):
+                    self.read()
+
+    def test_assignment_requires_complete_typed_identity_instead_of_inventory_fill(self):
+        original = self.assignment()
+        for field in original["identity"]:
+            for operation in ("missing", "invalid"):
+                with self.subTest(field=field, operation=operation):
+                    claim = copy.deepcopy(original)
+                    if operation == "missing":
+                        del claim["identity"][field]
+                    else:
+                        claim["identity"][field] = (False if field in
+                                                    ("node_id", "pid", "procno") else "")
+                    self.assign([claim])
+                    with self.assertRaises(ValueError):
+                        self.read()
+
+    def test_duplicate_or_malformed_assignments_cannot_silently_choose_one(self):
+        claim = self.assignment()
+        for claims in (None, {}, [None], [dict(source=claim["source"])],
+                       [dict(identity=claim["identity"])], [claim, claim]):
+            with self.subTest(claims=claims):
+                self.assign(claims)
+                with self.assertRaises(ValueError):
+                    self.read()
+
+    def test_pid_reuse_requires_the_explicit_complete_birth_tuple(self):
+        entry = self.manifest["nodes"][0]
+        inventory = self.inventory(entry)
+        second = dict(pid=101, procno=7, backend_start="start-B",
+                      process_incarnation="inc-B", role="backend")
+        inventory["processes"].append(second)
+        self.inventory(entry, inventory)
+        self.put("stderr0", self.log(0) + self.log(0, "2"))
+        claim = self.assignment(process=second)
+        self.assign([claim])
+        node = self.read()["nodes"][0]
+        self.assertEqual(node["process_candidates"],
+                         [dict(inventory_indices=[0, 1]), dict(inventory_indices=[0, 1])])
+        self.assertEqual(node["trace_identity_assignments"][0]["identity"], claim["identity"])
+        self.assertEqual(node["trace_identity_assignments"][1],
+                         dict(status="UNKNOWN", identity_bound=False))
+
+    def test_duplicate_sequence_raw_lines_keep_separate_assignments_without_run_credit(self):
+        self.put("stderr0", self.log(0, "9") * 2)
+        self.assign([self.assignment(index=1), self.assignment(index=0)])
+        node = self.read()["nodes"][0]
+        self.assertEqual([item["source"]["line"] for item in
+                          node["trace_identity_assignments"]], [1, 2])
+        self.assertEqual([item["fields"]["event_seq"] for item in
+                          node["trace"]["observations"]], ["9", "9"])
+        self.assertTrue(all(item["status"] == "DECLARED_ONLY" for item in
+                            node["trace_identity_assignments"]))
+        self.assertFalse(self.read()["ready_to_run"])
+
+    def test_missing_raw_domain_cannot_be_invented_by_an_assignment(self):
+        raw = (b"LOG: PGRAC_FAMILY=CTRC_RECEIPT event=observed event_seq=1 "
+               b"sequence_scope=process node_id=0 pid=101 authoritative=0 "
+               b"trace_sequence_exhausted=0\n")
+        self.put("stderr0", raw)
+        claim = self.assignment()
+        claim["identity"]["sequence_domain"] = "CTRC_RECEIPT"
+        self.assign([claim])
+        with self.assertRaises(ValueError):
+            self.read()
+
+    def test_existing_raw_procno_cannot_contradict_a_declared_process(self):
+        self.put("stderr0", self.log(0).replace(b"pid=101 ", b"pid=101 procno=8 "))
+        self.assign([self.assignment()])
+        with self.assertRaises(ValueError):
+            self.read()
+
+    def test_known_raw_birth_fields_must_agree_but_unknown_placeholders_stay_raw(self):
+        for key, gate, value in (("backend_start", "backend_start_known", "start-A"),
+                                 ("process_incarnation", "process_incarnation_known", "inc-A"),
+                                 ("boot_id", "boot_known", "boot-0")):
+            for known, raw_value in (("1", "other"), ("1", value), ("0", "unknown")):
+                with self.subTest(key=key, known=known, raw_value=raw_value):
+                    raw = self.log(0).replace(b"process_incarnation_known=0 ", b"")
+                    raw = raw.replace(b"authoritative=0 ",
+                                      (key + "=" + raw_value + " " + gate + "=" + known +
+                                       " authoritative=0 ").encode())
+                    self.put("stderr0", raw)
+                    self.assign([self.assignment()])
+                    if known == "1" and raw_value == "other":
+                        with self.assertRaises(ValueError):
+                            self.read()
+                    else:
+                        node = self.read()["nodes"][0]
+                        self.assertEqual(node["trace"]["observations"][0]["fields"][key], raw_value)
+                        self.assertEqual(node["trace_identity_assignments"][0]["status"],
+                                         "DECLARED_ONLY")
+                        self.assertFalse(node["trace_identity_assignments"][0]["identity_bound"])
+
+    def test_assignment_uses_observation_index_and_exact_byte_position_not_line_index(self):
+        raw = self.log(0)
+        prefix = b"unrelated UTF-8: \xc3\xa9\n"
+        self.put("stderr0", prefix + raw)
+        claim = self.assignment()
+        claim["source"].update(line=2, byte_offset=len(prefix), byte_length=len(raw),
+                               sha256=self.digest(raw))
+        self.assign([claim])
+        node = self.read()["nodes"][0]
+        self.assertEqual(node["trace_identity_assignments"][0]["source"], claim["source"])
+        self.assertEqual(node["trace"]["ignored_lines"], 1)
+
+    def test_assignment_cannot_reference_unhandled_or_rejected_raw_lines(self):
+        for raw in (b"LOG: PGRAC_FAMILY=FUTURE event=x\n", self.log(0).rstrip(b"\n")):
+            with self.subTest(raw=raw):
+                self.put("stderr0", raw)
+                self.assign([self.assignment()])
+                with self.assertRaises(ValueError):
+                    self.read()
+
     def test_cli_verifies_without_modifying_files_or_granting_run_credit(self):
+        self.assign([self.assignment()])
         self.read()
         path = self.root / "manifest.json"
         saved = {p: p.read_bytes() for p in self.root.iterdir()}
@@ -260,8 +463,20 @@ class WorkloadManifestTests(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         result = json.loads(run.stdout)
         self.assertEqual(result["file_binding"], "VERIFIED")
+        self.assertEqual(result["nodes"][0]["trace_identity_assignments"][0]["status"],
+                         "DECLARED_ONLY")
         self.assertFalse(result["ready_to_run"])
         self.assertEqual({p: p.read_bytes() for p in self.root.iterdir()}, saved)
+        claim = self.assignment()
+        claim["identity"]["backend_start"] = "not-in-inventory"
+        self.assign([claim])
+        path.write_text(json.dumps(self.manifest))
+        run = subprocess.run([sys.executable, workload_manifest.__file__, str(path)],
+                             capture_output=True, text=True, check=False)
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertEqual(json.loads(run.stdout)["file_binding"], "REJECTED")
+        self.assign([self.assignment()])
+        self.read()
         (self.root / "harness.raw").write_bytes(b"changed\n")
         run = subprocess.run([sys.executable, workload_manifest.__file__, str(path)],
                              capture_output=True, text=True, check=False)

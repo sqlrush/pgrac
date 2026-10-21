@@ -90,6 +90,36 @@ inventory indices matching each observation's PID, including all reused-PID
 candidates and empty lists for missing processes. No candidate supplies fields
 to the raw observation or binds its process incarnation, even with one match.
 
+An inventory may additionally declare `trace_identity_assignments`, an array
+of objects with exactly `source` and `identity` members. Use these only for
+explicit per-observation declarations; the reader never generates them from
+PID candidates or timestamps.
+
+| Member | Required fields |
+| --- | --- |
+| `source` | `stderr_file_id`, `stderr_sha256`, `observation_index`, `line`, `byte_offset`, `byte_length`, `sha256` |
+| `identity` | Integer `node_id`, positive integer `pid`, nonnegative integer `procno`; nonempty string `boot_id`, `backend_start`, `process_incarnation`, `role`, `sequence_domain` |
+
+`source` identifies one parsed observation: the zero-based index in that
+node's `trace.observations`, its one-based raw line number, byte offset,
+length and SHA256 including the newline, and the complete stderr file ID and
+SHA256. Every field must match the verified capture. One observation may have
+only one assignment. The complete process tuple and role must match one
+inventory process, the node/boot must match its inventory, and PID and sequence
+domain must match the raw envelope. A missing raw domain cannot be supplied by
+the declaration, including for `CTRC_RECEIPT` and the legacy maintenance formats.
+An existing raw `procno` must agree. Raw `backend_start`, `process_incarnation`
+and `boot_id` must agree when present and their respective known flag is not
+zero. The numeric legacy producer `role` is not translated to an inventory role.
+
+Each node's output has `trace_identity_assignments` in observation order.
+Unassigned observations have `status=UNKNOWN`. Accepted declarations have
+`status=DECLARED_ONLY`, retain their source and identity separately from the raw
+fields, and include the inventory file ID and SHA256. They do not attest process
+birth or fill producer fields marked unknown. All entries keep
+`identity_bound=false`; repeated sequence numbers remain separate raw lines
+and assignments do not establish sequence completeness or causal order.
+
 The output always has `identity_bound=false`, `field_root=OPEN` and
 `ready_to_run=false`. It does not produce normalized contract events, request
 or receipt joins, barrier/sequence completeness, STOP evidence or workload
