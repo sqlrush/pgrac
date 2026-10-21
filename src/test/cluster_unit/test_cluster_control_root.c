@@ -8,6 +8,8 @@
 #include "postgres.h"
 #include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_wal_inputs.h"
+#include "access/xlogrecovery.h"
+#include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_wal_cut.h"
 #include "cluster/cluster_block_apply.h"
 
@@ -21036,6 +21038,42 @@ static unsigned inputs_claim_calls, inputs_claim_under_cf, inputs_claim_unpinned
 static unsigned inputs_claim_fault;
 static bool inputs_checkpoint_observe;
 
+/* The installed Startup owner is a leaf here; its actual producer is covered
+ * by test_cluster_cold_tx_start. ROOT/claims/anchors and inputs are real. */
+static ClusterColdTypedV1 tx_inputs_typed;
+static ClusterColdTopTxCensusEntryV1 tx_inputs_subject;
+static bool tx_inputs_owner_current;
+static uint64 tx_inputs_generation, tx_inputs_serial;
+static ResourceOwner tx_inputs_owner;
+static const struct ClusterRecoveryStartV1 *tx_inputs_start;
+bool
+ClusterColdRecoveryTxCurrent(const struct ClusterRecoveryStartV1 *start)
+{
+	return start != NULL && start == tx_inputs_start && tx_inputs_owner_current
+		&& MyBackendType == B_STARTUP && !inputs_native_recovery
+		&& CurrentResourceOwner == tx_inputs_owner;
+}
+const struct ClusterColdTypedV1 *
+ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start)
+{
+	return ClusterColdRecoveryTxCurrent(start) ? &tx_inputs_typed : NULL;
+}
+bool
+ClusterColdRecoveryTxSubjectCurrent(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject, uint64 *generation, uint64 *serial)
+{
+	*generation = *serial = 0;
+	if (!ClusterColdRecoveryTxCurrent(start) || subject != &tx_inputs_subject
+		|| subject->input.slot.status != TT_SLOT_ACTIVE
+		|| subject->input.slot.xid != subject->input.key.xid
+		|| subject->input.slot.wrap != subject->input.key.slot_wrap)
+		return false;
+	*generation = tx_inputs_generation;
+	*serial = tx_inputs_serial;
+	return true;
+}
+
+
 /* Observe the call site without replacing physical claim validation. */
 extern ClusterControlRootResult test_wal_inputs_claim_read(const char *path,
 														   const ClusterWalThreadClaimRefV2 *ref,
@@ -21058,6 +21096,8 @@ test_wal_inputs_claim_read(const char *path, const ClusterWalThreadClaimRefV2 *r
 			inputs_pin_current = false;
 		else if (inputs_claim_fault == 3)
 			pg_re_throw();
+		else if (inputs_claim_fault == 4)
+			tx_inputs_owner_current = false;
 	}
 	return result;
 }
@@ -23379,6 +23419,238 @@ UT_TEST(test_clean_restart_without_provider_refuses_missing_exit_formation_and_f
 	test_reserve_mode = false;
 }
 
+/* Same actual ROOT/claim reader, with the installed Startup start as a leaf. */
+static ClusterControlRootResult
+tx_inputs_begin(ClusterWalInputsV1 **out)
+{
+	return cluster_wal_inputs_begin_tx_closure_v1(tx_inputs_start, &tx_inputs_subject, out);
+}
+static void
+tx_inputs_capture(ClusterWalInputsV1 *inputs, const ClusterControlRootIdentity *skip)
+{
+	memset(&tx_inputs_typed, 0, sizeof(tx_inputs_typed));
+	UT_ASSERT_EQ(cluster_wal_inputs_root_token_v1(inputs, &tx_inputs_typed.census_root), 0);
+	tx_inputs_typed.census_root_captured = true;
+	tx_inputs_typed.system_identifier = TEST_SYSID;
+	for (uint32 i = 0; i < cluster_wal_inputs_count_v1(inputs); i++) {
+		const ClusterWalInputV1 *item = cluster_wal_inputs_at_v1(inputs, i);
+		ClusterColdParticipantV1 *cut;
+		uint32 p;
+		/* A post-INSTALL scope contains the new current writer(s) as well as
+		 * the original sources now retained in history.  The original census
+		 * must never be replaced by one of those new writers. */
+		if (skip != NULL && item->current)
+			continue;
+		UT_ASSERT_EQ(item->kind, CLUSTER_WAL_INPUT_CHECKPOINT);
+		p = tx_inputs_typed.participant_count++;
+		tx_inputs_typed.sources[p] = item->source;
+		cut = &tx_inputs_typed.participants[p];
+		cut->thread_id = item->source.claim.identity.origin_thread_id;
+		cut->owner_incarnation = item->source.claim.identity.origin_owner_incarnation;
+		cut->timeline = item->source.timeline;
+		cut->physical_lower = item->checkpoint.checkpoint_lower_lsn;
+		cut->native_redo = item->native_redo;
+		cut->tail_end = item->checkpoint.validated_tail_lsn_exclusive;
+	}
+	tx_inputs_typed.replay_count = tx_inputs_typed.participant_count;
+}
+static void
+tx_inputs_activate(void)
+{
+	memset(&tx_inputs_subject, 0, sizeof(tx_inputs_subject));
+	tx_inputs_subject.input.key = (ClusterColdTtSlotKeyV1){
+		.owner_instance = 1, .segment_id = 1, .segment_generation = 7,
+		.slot_offset = 2, .xid = 100, .slot_wrap = 3 };
+	tx_inputs_subject.input.slot.status = TT_SLOT_ACTIVE;
+	tx_inputs_subject.input.slot.xid = 100;
+	tx_inputs_subject.input.slot.wrap = 3;
+	tx_inputs_start = (const struct ClusterRecoveryStartV1 *)&tx_inputs_typed;
+	tx_inputs_owner = CurrentResourceOwner;
+	tx_inputs_owner_current = true;
+	tx_inputs_generation = 17;
+	tx_inputs_serial = 1;
+	MyBackendType = B_STARTUP;
+	inputs_native_recovery = false;
+	test_inputs_startup_cf = true;
+}
+static void
+tx_inputs_fixture(void)
+{
+	uint8 bytes[66048];
+	ClusterRecoveryAnchorV2 anchors[2];
+	ClusterWalInputsV1 *inputs = NULL;
+	/* TX_CLOSURE consumes retained, physically closed sources. Keep the
+	 * ordinary OPEN fixture for live-reader tests; using it here leaves the
+	 * physical tail cut absent and must fail closed. */
+	inputs_closed_wal_fixture(bytes, anchors);
+	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs), 0);
+	tx_inputs_capture(inputs, NULL);
+	cluster_wal_inputs_release_v1(&inputs);
+	tx_inputs_activate();
+}
+UT_TEST(test_tx_inputs_reads_actual_closed_wal_and_rechecks_owner)
+{
+	uint8 bytes[66048];
+	ClusterRecoveryAnchorV2 anchors[2];
+	ClusterWalInputsV1 *inputs = NULL;
+	ClusterWalTailObservation out;
+	InputsVisitTest visit = {0};
+	inputs_closed_wal_fixture(bytes, anchors);
+	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs), 0);
+	tx_inputs_capture(inputs, NULL);
+	cluster_wal_inputs_release_v1(&inputs);
+	tx_inputs_activate();
+	UT_ASSERT_EQ(tx_inputs_begin(&inputs), 0);
+	if (inputs != NULL) {
+		for (uint32 i = 0; i < 2; i++) {
+			UT_ASSERT_EQ(cluster_wal_inputs_visit_retained_v1(inputs, i, inputs_visit_record,
+				&visit, &out), 0);
+			UT_ASSERT_EQ(out.records, 1);
+		}
+		UT_ASSERT_EQ(visit.calls, 2);
+		tx_inputs_owner_current = false;
+		UT_ASSERT_EQ(cluster_wal_inputs_revalidate_v1(inputs), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+		cluster_wal_inputs_release_v1(&inputs);
+	}
+	UT_ASSERT(!inputs_pin_held && test_actual_cf == NoLock);
+	test_inputs_startup_cf = false;
+}
+UT_TEST(test_tx_inputs_reselects_original_history_after_actual_install)
+{
+	uint8 before[66048];
+	ControlRootImage root, selected_root;
+	ControlFileData common, candidate;
+	ClusterControlRootFileToken original, current, selected, token;
+	ClusterWalSourceRef writer;
+	ClusterWalStartupImage op, peer, durable;
+	ClusterWalInputsV1 *inputs = NULL;
+	bool old_history = false;
+	/* Reset leaf transport state before the real original INSTALL fixture. */
+	ClusterRecoveryAnchorV2 anchors[2];
+	inputs_fixture(before, anchors);
+	op = v3_install_fixture(before, &root);
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID,
+		&root, &common, &original), 0);
+	test_actual_cf = test_cf_mode = NoLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&op, &writer), 0);
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID,
+		&root, &common, &token), 0);
+	UT_ASSERT_EQ(cluster_wal_startup_read_locked(&root, 3, &peer), 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(&peer.predecessor.snapshot.identity,
+		&selected_root, &candidate, &token), 0);
+	test_actual_cf = test_cf_mode = NoLock;
+	cluster_node_id = 3;
+	test_self_incarnation = test_membership_incarnation
+		= peer.claim.identity.origin_owner_incarnation;
+	v3_startup_native_record(&peer, &candidate);
+	history_stage_dirs(3);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_checkpoint(&peer.claim.identity,
+		peer.operation_uuid, &candidate, test_checkpoint_end, &durable), 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&durable, &writer), 0);
+	cluster_node_id = 0;
+	test_self_incarnation = test_membership_incarnation
+		= op.claim.identity.origin_owner_incarnation;
+	MyBackendType = B_BG_WORKER;
+	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs), 0);
+	if (inputs != NULL) {
+		UT_ASSERT_EQ(cluster_wal_inputs_root_token_v1(inputs, &current), 0);
+		UT_ASSERT(memcmp(&current, &original, sizeof(current)) != 0);
+		for (uint32 i = 0; i < cluster_wal_inputs_count_v1(inputs); i++) {
+			const ClusterWalInputV1 *item = cluster_wal_inputs_at_v1(inputs, i);
+			if (cluster_control_root_identity_equal(&item->source.claim.identity,
+				&op.predecessor.snapshot.identity))
+				old_history = !item->current && memcmp(&item->checkpoint,
+					&op.predecessor.snapshot, sizeof(item->checkpoint)) == 0;
+		}
+		UT_ASSERT(old_history);
+		tx_inputs_capture(inputs, &writer.claim.identity);
+		tx_inputs_typed.census_root = original;
+		cluster_wal_inputs_release_v1(&inputs);
+		tx_inputs_activate();
+		UT_ASSERT_EQ(tx_inputs_begin(&inputs), 0);
+		if (inputs != NULL) {
+			UT_ASSERT_EQ(cluster_wal_inputs_root_token_v1(inputs, &selected), 0);
+			UT_ASSERT(memcmp(&selected, &current, sizeof(current)) == 0);
+			UT_ASSERT_EQ(cluster_wal_inputs_revalidate_v1(inputs), 0);
+			v2_checkpoint_root_race();
+			UT_ASSERT_EQ(cluster_wal_inputs_revalidate_v1(inputs), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+			cluster_wal_inputs_release_v1(&inputs);
+		}
+	}
+	UT_ASSERT(!inputs_pin_held && test_actual_cf == NoLock);
+	test_inputs_startup_cf = false;
+	test_reserve_mode = false;
+}
+UT_TEST(test_tx_inputs_after_done_keeps_retained_read_purpose)
+{
+	ClusterWalInputsV1 *inputs = NULL;
+	ClusterWalTailObservation out;
+	XLogRecPtr end = 99;
+	tx_inputs_fixture();
+	UT_ASSERT_EQ(tx_inputs_begin(&inputs), 0);
+	UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), 2);
+	if (inputs != NULL) {
+		for (uint32 i = 0; i < 2; i++) {
+			UT_ASSERT(cluster_wal_inputs_at_v1(inputs, i) != NULL);
+			UT_ASSERT_EQ(cluster_wal_inputs_visit_retained_v1(inputs, i, NULL, NULL, &out), 0);
+			UT_ASSERT_EQ(cluster_wal_inputs_prepare_live_v1(inputs, i, &end),
+				CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+			UT_ASSERT_EQ(end, 0);
+		}
+		UT_ASSERT_EQ(cluster_wal_inputs_revalidate_v1(inputs), 0);
+		cluster_wal_inputs_release_v1(&inputs);
+	}
+	UT_ASSERT(inputs == NULL && !inputs_pin_held);
+	UT_ASSERT_EQ(inputs_native_begin_calls + inputs_native_flush_calls + inputs_peer_begins, 0);
+	UT_ASSERT_EQ(cluster_wal_inputs_cold_begin_v1(v2_storage, TEST_SYSID, &inputs),
+		CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs),
+		CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	test_inputs_startup_cf = false;
+}
+UT_TEST(test_tx_inputs_parent_subject_and_wait_revalidation)
+{
+	for (int fault = 0; fault < 12; fault++) {
+		ClusterWalInputsV1 *inputs = NULL;
+		tx_inputs_fixture();
+		inputs_claim_observe = true;
+		inputs_claim_calls = 0;
+		inputs_claim_fault = fault == 0 ? 4 : 0;
+		if (fault == 1) tx_inputs_typed.sources[0].claim.claim_sha256[0] ^= 1;
+		if (fault == 2) inputs_pin_race = true;
+		UT_ASSERT_EQ(tx_inputs_begin(&inputs), fault < 3 ? CLUSTER_CONTROL_ROOT_STALE_TOKEN : 0);
+		if (inputs != NULL) {
+			if (fault >= 3 && fault <= 5) {
+				UT_ASSERT_EQ(cluster_wal_inputs_suspend_v1(inputs), 0);
+				UT_ASSERT(!inputs_pin_held && cluster_wal_inputs_at_v1(inputs, 0) == NULL);
+				if (fault == 4) tx_inputs_owner_current = false;
+				if (fault == 5) v2_checkpoint_root_race();
+				UT_ASSERT_EQ(cluster_wal_inputs_resume_v1(inputs), fault == 3 ? 0
+					: CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+			} else {
+				switch (fault) {
+				case 6: tx_inputs_generation++; break;
+				case 7: tx_inputs_serial++; break;
+				case 8: tx_inputs_subject.input.slot.commit_scn++; break;
+				case 9: tx_inputs_subject.input.key.xid++; break;
+				case 10: tx_inputs_owner_current = false; break;
+				case 11: inputs_native_recovery = true; break;
+				}
+				UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), 0);
+				UT_ASSERT(cluster_wal_inputs_at_v1(inputs, 0) == NULL);
+				UT_ASSERT_EQ(cluster_wal_inputs_resume_v1(inputs), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+			}
+			cluster_wal_inputs_release_v1(&inputs);
+		}
+		UT_ASSERT(inputs == NULL && !inputs_pin_held && test_actual_cf == NoLock);
+		inputs_claim_observe = false;
+		inputs_claim_fault = 0;
+	}
+	test_inputs_startup_cf = false;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -23391,6 +23663,15 @@ main(int argc, char **argv)
 	if (argc > 1)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_TX_INPUTS") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_tx_inputs_reads_actual_closed_wal_and_rechecks_owner);
+		UT_RUN(test_tx_inputs_reselects_original_history_after_actual_install);
+		UT_RUN(test_tx_inputs_after_done_keeps_retained_read_purpose);
+		UT_RUN(test_tx_inputs_parent_subject_and_wait_revalidation);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_RECOVERY_SYNC") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(test_recovery_checkpoint_selects_native_not_common_counters);

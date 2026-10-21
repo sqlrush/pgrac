@@ -144,6 +144,12 @@ extern void ShutdownWalRecovery(void);
 extern void ClusterReleaseColdRecoveryInputs(EndOfWalRecoveryInfo *info);
 extern bool ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info);
 extern bool ClusterColdRecoveryTxCurrent(const struct ClusterRecoveryStartV1 *start);
+struct ClusterColdTopTxCensusEntryV1;
+/* Original ACTIVE census subject only; not a loser proof or I/O grant. */
+extern bool ClusterColdRecoveryTxSubjectCurrent(
+	const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject, uint64 *generation, uint64 *serial);
+
 extern const struct ClusterColdTypedV1 *
 ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start);
 #endif

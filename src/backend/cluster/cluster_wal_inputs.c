@@ -7,6 +7,8 @@
 #include <unistd.h>
 
 #include "access/xlog.h"
+#include "access/xlogrecovery.h"
+#include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
@@ -25,6 +27,21 @@
 #include "cluster_control_root_private.h"
 #include "cluster_recovery_anchor_private.h"
 
+typedef enum WalInputsPurpose {
+	WAL_INPUTS_ONLINE,
+	WAL_INPUTS_COLD_REPLAY,
+	WAL_INPUTS_TX_CLOSURE
+} WalInputsPurpose;
+
+typedef struct ClusterRecoveryTxIoScopeV1 {
+	const struct ClusterRecoveryStartV1 *start;
+	const ClusterColdTypedV1 *inputs;
+	const ClusterColdTopTxCensusEntryV1 *subject;
+	uint64 generation, serial;
+	ClusterColdTopTxCensusEntryV1 version;
+	ClusterControlRootFileToken root;
+} ClusterRecoveryTxIoScopeV1;
+
 struct ClusterWalInputsV1 {
 	uint64 system_identifier;
 	uint8 storage_uuid[16];
@@ -34,7 +51,8 @@ struct ClusterWalInputsV1 {
 	pid_t pid;
 	bool stale;
 	bool suspended;
-	bool cold;
+	WalInputsPurpose purpose;
+	ClusterRecoveryTxIoScopeV1 tx;
 	uint16 thread_count;
 	uint16 threads[CLUSTER_WAL_RETENTION_MAX_THREADS];
 	uint32 count;
@@ -74,10 +92,28 @@ inputs_owned(const ClusterWalInputsV1 *inputs)
 }
 
 static bool
+inputs_scope_role(const ClusterWalInputsV1 *inputs)
+{
+	const ClusterColdTypedV1 *typed;
+	uint64 generation, serial;
+	if (inputs->purpose != WAL_INPUTS_TX_CLOSURE)
+		return inputs_io_role(inputs->purpose == WAL_INPUTS_COLD_REPLAY);
+	if (MyBackendType != B_STARTUP || RecoveryInProgress()
+		|| !ClusterColdRecoveryTxSubjectCurrent(inputs->tx.start, inputs->tx.subject,
+			&generation, &serial)
+		|| generation != inputs->tx.generation || serial != inputs->tx.serial)
+		return false;
+	typed = ClusterColdRecoveryTxInputs(inputs->tx.start);
+	return typed != NULL && typed == inputs->tx.inputs && typed->census_root_captured
+		&& memcmp(&typed->census_root, &inputs->tx.root, sizeof(inputs->tx.root)) == 0
+		&& memcmp(inputs->tx.subject, &inputs->tx.version, sizeof(inputs->tx.version)) == 0;
+}
+
+static bool
 inputs_current(ClusterWalInputsV1 *inputs)
 {
 	return cluster_enabled && cluster_shared_config && inputs_owned(inputs)
-		   && inputs_io_role(inputs->cold) && !inputs->stale && inputs->thread_count > 0
+		   && inputs_scope_role(inputs) && !inputs->stale && inputs->thread_count > 0
 		   && !inputs->suspended && inputs->thread_count <= CLUSTER_WAL_RETENTION_MAX_THREADS
 		   && cluster_wal_read_pin_covers_v1(inputs->pin, inputs->threads[0]);
 }
@@ -106,7 +142,7 @@ cluster_wal_inputs_recovered_prefix_v1(ClusterWalInputsV1 *inputs,
 
 	if (out_end != NULL)
 		*out_end = InvalidXLogRecPtr;
-	if (out_end == NULL || source == NULL || !inputs_current(inputs) || inputs->cold
+	if (out_end == NULL || source == NULL || !inputs_current(inputs) || (inputs->purpose != WAL_INPUTS_ONLINE)
 		|| source->claim.identity.origin_owner_incarnation == 0)
 		return false;
 	for (uint32 i = 0; i < inputs->count; i++) {
@@ -149,7 +185,7 @@ cluster_wal_inputs_recovered_owner_v1(ClusterWalInputsV1 *inputs, int32 node,
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
-	if (out == NULL || !inputs_current(inputs) || inputs->cold || node < 0
+	if (out == NULL || !inputs_current(inputs) || (inputs->purpose != WAL_INPUTS_ONLINE) || node < 0
 		|| node >= CLUSTER_CONTROL_ROOT_RECORD_COUNT)
 		return false;
 	for (uint32 i = 0; i < inputs->count; i++) {
@@ -222,7 +258,7 @@ cluster_wal_inputs_local_predecessor_retired_v1(ClusterWalInputsV1 *inputs,
 	uint64 lineage, lower;
 	bool exit_observed = false;
 
-	if (!inputs_current(inputs) || inputs->cold || predecessor == NULL || writer == NULL
+	if (!inputs_current(inputs) || (inputs->purpose != WAL_INPUTS_ONLINE) || predecessor == NULL || writer == NULL
 		|| writer->claim.identity.origin_node_id != cluster_node_id
 		|| writer->claim.identity.origin_owner_incarnation == 0
 		|| writer->claim.identity.origin_owner_incarnation != cluster_qvotec_get_self_incarnation()
@@ -464,6 +500,72 @@ inputs_collect(ClusterWalInputsV1 *inputs, WalInputsWork *work)
 								  : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 }
 
+/* A TX-closure scope starts from the original census ROOT, but the original
+ * source may be archived into history by INSTALL before the scope is opened.
+ * Re-select each original source from the post-INSTALL current/history cut by
+ * its immutable claim and physical cut.  This accepts that one legal ROOT
+ * transition, while refusing a missing, duplicated, or substituted source. */
+static ClusterControlRootResult
+inputs_tx_reselect_original(const ClusterWalInputsV1 *inputs,
+							const ClusterColdTypedV1 *typed)
+{
+	if (inputs == NULL || typed == NULL || typed->participant_count == 0
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->replay_count > typed->participant_count)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+
+	for (uint32 p = 0; p < typed->participant_count; p++) {
+		const ClusterColdParticipantV1 *participant = &typed->participants[p];
+		const ClusterWalSourceRef *source = &typed->sources[p];
+		XLogRecPtr expected_redo = participant->native_redo;
+		uint32 matches = 0;
+
+		if (source->claim.identity.origin_thread_id != participant->thread_id
+			|| source->claim.identity.origin_owner_incarnation != participant->owner_incarnation
+			|| source->timeline != participant->timeline)
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		if (p >= typed->replay_count) {
+			const ClusterColdXidProgressV1 *history = &typed->history_xid[p];
+
+			if (!history->begun || history->failed
+				|| history->source.thread_id != participant->thread_id
+				|| history->source.owner_incarnation != participant->owner_incarnation
+				|| history->source.timeline != participant->timeline)
+				return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			expected_redo = history->source.native_redo;
+		}
+		if (XLogRecPtrIsInvalid(participant->physical_lower)
+			|| XLogRecPtrIsInvalid(participant->tail_end)
+			|| XLogRecPtrIsInvalid(expected_redo)
+			|| expected_redo < participant->physical_lower
+			|| expected_redo > participant->tail_end)
+		{
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		}
+
+		for (uint32 i = 0; i < inputs->count; i++) {
+			const ClusterWalInputV1 *item = &inputs->items[i];
+
+			if (item->kind != CLUSTER_WAL_INPUT_CHECKPOINT
+				|| !inputs_source_selected(source, &item->source)
+				|| !cluster_control_root_identity_equal(&item->checkpoint.identity,
+													&source->claim.identity)
+				|| item->source.timeline != participant->timeline
+				|| item->checkpoint.checkpoint_lower_lsn != participant->physical_lower
+				|| item->checkpoint.validated_tail_lsn_exclusive != participant->tail_end
+				|| item->native_redo != expected_redo)
+				continue;
+			if (++matches > 1)
+				return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		}
+		if (matches != 1)
+		{
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		}
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
 /* Claim paths are immutable within the held WALR set. Their physical I/O
  * must not extend the cluster-wide CF interval; the caller rechecks the
  * complete ROOT after this scan before publishing any assembled input. */
@@ -658,7 +760,7 @@ cluster_wal_inputs_prepare_live_local_v1(ClusterWalInputsV1 *inputs, uint32 inde
 	if (out_complete_end == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	*out_complete_end = InvalidXLogRecPtr;
-	if (!inputs_current(inputs) || inputs->cold || index >= inputs->count || CritSectionCount != 0
+	if (!inputs_current(inputs) || (inputs->purpose != WAL_INPUTS_ONLINE) || index >= inputs->count || CritSectionCount != 0
 		|| ShutdownRequestPending || RecoveryInProgress())
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	item = &inputs->items[index];
@@ -774,7 +876,7 @@ cluster_wal_inputs_prepare_live_v1(ClusterWalInputsV1 *inputs, uint32 index,
 	if (out_complete_end == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	*out_complete_end = 0;
-	if (!inputs_current(inputs) || inputs->cold || index >= inputs->count || CritSectionCount != 0
+	if (!inputs_current(inputs) || (inputs->purpose != WAL_INPUTS_ONLINE) || index >= inputs->count || CritSectionCount != 0
 		|| ShutdownRequestPending || RecoveryInProgress())
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	item = &inputs->items[index];
@@ -882,7 +984,7 @@ inputs_contribution_cuts(ClusterWalInputsV1 *inputs, WalContributionWork *work)
 	 * selected set first: no callback may observe a prefix while a later
 	 * source is still OPEN. This preserves the original retained-reader
 	 * WAIT polarity without borrowing its online sampling path. */
-	if (inputs->cold) {
+	if ((inputs->purpose != WAL_INPUTS_ONLINE)) {
 		for (uint32 i = 0; i < work->count; i++) {
 			const ClusterWalInputV1 *item = &inputs->items[i];
 			if (item->kind == CLUSTER_WAL_INPUT_CHECKPOINT) {
@@ -1077,7 +1179,7 @@ inputs_scan_contributions(ClusterWalInputsV1 *inputs, bool space_active,
 	*out_plan = NULL;
 	*out_record_count = 0;
 	*out_detail = RF_PAGE_PROOF_DETAIL_OK;
-	if (!inputs_current(inputs) || inputs->cold != cold || CritSectionCount != 0
+	if (!inputs_current(inputs) || (inputs->purpose != WAL_INPUTS_ONLINE) != cold || CritSectionCount != 0
 		|| ShutdownRequestPending || (cold && (census == NULL || source_census == NULL)))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	work = palloc0(sizeof(*work));
@@ -1140,13 +1242,16 @@ cluster_wal_inputs_cold_census_v1(ClusterWalInputsV1 *inputs, ClusterWalCensusVi
 }
 
 static ClusterControlRootResult
-inputs_begin(const uint8 storage_uuid[16], uint64 system_identifier, bool cold,
-			 ClusterWalInputsV1 **out)
+inputs_begin(const uint8 storage_uuid[16], uint64 system_identifier, WalInputsPurpose purpose,
+			 const struct ClusterRecoveryStartV1 *start,
+			 const ClusterColdTopTxCensusEntryV1 *subject, ClusterWalInputsV1 **out)
 {
 	ClusterWalInputsV1 *inputs;
 	WalInputsWork *work;
 	ClusterControlRootResult result;
 	ClusterWalPinResult pinned;
+	const ClusterColdTypedV1 *typed = NULL;
+	uint64 generation = 0, serial = 0;
 
 	if (out == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
@@ -1154,14 +1259,31 @@ inputs_begin(const uint8 storage_uuid[16], uint64 system_identifier, bool cold,
 	if (storage_uuid == NULL || system_identifier == 0 || !cluster_enabled || !cluster_shared_config
 		|| !cluster_controlfile_shared_authority || CritSectionCount != 0
 		|| CurrentResourceOwner == NULL || system_identifier != GetSystemIdentifier()
-		|| !inputs_io_role(cold))
+		|| (purpose != WAL_INPUTS_TX_CLOSURE
+			&& !inputs_io_role(purpose == WAL_INPUTS_COLD_REPLAY)))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (purpose == WAL_INPUTS_TX_CLOSURE) {
+		if (!ClusterColdRecoveryTxSubjectCurrent(start, subject, &generation, &serial)
+			|| generation == 0 || serial == 0
+			|| (typed = ClusterColdRecoveryTxInputs(start)) == NULL
+			|| !typed->census_root_captured)
+			return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	}
 	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	inputs = palloc0(sizeof(*inputs));
 	inputs->pid = getpid();
 	inputs->owner = CurrentResourceOwner;
-	inputs->cold = cold;
+	inputs->purpose = purpose;
+	if (purpose == WAL_INPUTS_TX_CLOSURE) {
+		inputs->tx.start = start;
+		inputs->tx.inputs = typed;
+		inputs->tx.subject = subject;
+		inputs->tx.generation = generation;
+		inputs->tx.serial = serial;
+		memcpy(&inputs->tx.version, subject, sizeof(*subject));
+		inputs->tx.root = typed->census_root;
+	}
 	inputs->system_identifier = system_identifier;
 	memcpy(inputs->storage_uuid, storage_uuid, 16);
 	work = palloc0(sizeof(*work));
@@ -1188,6 +1310,8 @@ inputs_begin(const uint8 storage_uuid[16], uint64 system_identifier, bool cold,
 			result = inputs_root(inputs, work, false);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			result = inputs_collect(inputs, work);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && purpose == WAL_INPUTS_TX_CLOSURE)
+			result = inputs_tx_reselect_original(inputs, typed);
 		inputs_unlock(work);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			result = inputs_claims(inputs);
@@ -1217,14 +1341,29 @@ ClusterControlRootResult
 cluster_wal_inputs_begin_v1(const uint8 storage_uuid[16], uint64 system_identifier,
 							ClusterWalInputsV1 **out)
 {
-	return inputs_begin(storage_uuid, system_identifier, false, out);
+	return inputs_begin(storage_uuid, system_identifier, WAL_INPUTS_ONLINE, NULL, NULL, out);
 }
 
 ClusterControlRootResult
 cluster_wal_inputs_cold_begin_v1(const uint8 storage_uuid[16], uint64 system_identifier,
 								 ClusterWalInputsV1 **out)
 {
-	return inputs_begin(storage_uuid, system_identifier, true, out);
+	return inputs_begin(storage_uuid, system_identifier, WAL_INPUTS_COLD_REPLAY, NULL, NULL, out);
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_begin_tx_closure_v1(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject, ClusterWalInputsV1 **out)
+{
+	const ClusterColdTypedV1 *typed;
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	*out = NULL;
+	typed = ClusterColdRecoveryTxInputs(start);
+	if (typed == NULL || typed->participant_count == 0)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	return inputs_begin(typed->sources[0].claim.identity.storage_uuid, typed->system_identifier,
+		WAL_INPUTS_TX_CLOSURE, start, subject, out);
 }
 
 /* Reject aliasing before clearing a failed read's output. */
@@ -1406,7 +1545,7 @@ cluster_wal_inputs_revalidate_v1(ClusterWalInputsV1 *inputs)
 ClusterControlRootResult
 cluster_wal_inputs_suspend_v1(ClusterWalInputsV1 *inputs)
 {
-	if (!inputs_owned(inputs) || !inputs_io_role(inputs->cold) || inputs->stale)
+	if (!inputs_owned(inputs) || !inputs_scope_role(inputs) || inputs->stale)
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
@@ -1425,7 +1564,7 @@ cluster_wal_inputs_wait_failed_v1(ClusterWalInputsV1 *inputs)
 {
 	WalInputsWork *work;
 	ClusterControlRootResult result;
-	if (!inputs_owned(inputs) || !inputs_io_role(inputs->cold) || CritSectionCount != 0
+	if (!inputs_owned(inputs) || !inputs_scope_role(inputs) || CritSectionCount != 0
 		|| !cluster_enabled || !cluster_shared_config)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	/* Failure remains terminal even when the ROOT still matches. No WAL
@@ -1461,7 +1600,7 @@ cluster_wal_inputs_resume_v1(ClusterWalInputsV1 *inputs)
 {
 	ClusterWalPinResult pinned;
 	ClusterControlRootResult result;
-	if (!inputs_owned(inputs) || !inputs_io_role(inputs->cold) || inputs->stale)
+	if (!inputs_owned(inputs) || !inputs_scope_role(inputs) || inputs->stale)
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (!inputs->suspended)
 		return cluster_wal_inputs_revalidate_v1(inputs);

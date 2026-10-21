@@ -70,6 +70,19 @@ extern ClusterControlRootResult cluster_wal_inputs_begin_v1(const uint8 storage_
 extern ClusterControlRootResult cluster_wal_inputs_cold_begin_v1(const uint8 storage_uuid[16],
 																 uint64 system_identifier,
 																 ClusterWalInputsV1 **out);
+struct ClusterRecoveryStartV1;
+struct ClusterColdTopTxCensusEntryV1;
+/* Post-EOR Startup only, bound to its original installed-writer start resource
+ * and an exact original ACTIVE census entry. Reacquire all original ROOT
+ * inputs and WALR read pins; reject another cut or changed subject/start.
+ * The caller's ResourceOwner remains current through release. Suspend/resume
+ * rechecks the start and input version as well as ROOT. Retained-only: OPEN
+ * visitation still waits, and live writer/flush/retirement APIs stay refused.
+ * This grants no loser, C0, checkpoint, DATA or reclamation authority. */
+extern ClusterControlRootResult cluster_wal_inputs_begin_tx_closure_v1(
+	const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject, ClusterWalInputsV1 **out);
+
 /* Startup in recovery, under the caller's existing execution WALR retention
  * owner. Select one exact CLOSED/RECOVERY_REQUIRED/RECOVERY_COMPLETE checkpoint
  * from the original whole ROOT, validate its native anchor and physical claim,

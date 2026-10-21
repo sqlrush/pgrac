@@ -18,6 +18,14 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+/* Assert-enabled libpgport formatting may call this backend boundary. */
+void
+ExceptionalCondition(const char *condition pg_attribute_unused(),
+					 const char *file pg_attribute_unused(), int line pg_attribute_unused())
+{
+	abort();
+}
+
 BackendType MyBackendType;
 int MyProcPid;
 volatile uint32 CritSectionCount;
@@ -106,7 +114,12 @@ static void actual_startup_tx_begin(EndOfWalRecoveryInfo *endOfRecoveryInfo)
 }
 
 static ClusterColdTypedV1 typed;
-static ClusterColdTopTxCensusV1 census;
+static union {
+	uint64 align;
+	unsigned char bytes[offsetof(ClusterColdTopTxCensusV1, entries)
+		+ 2 * sizeof(ClusterColdTopTxCensusEntryV1)];
+} census_storage;
+#define census (*(ClusterColdTopTxCensusV1 *)census_storage.bytes)
 static EndOfWalRecoveryInfo info;
 
 static void reset(void)
@@ -115,7 +128,7 @@ static void reset(void)
 	exit_callback = NULL;
 	destroy_probe = NULL;
 	memset(&typed, 0, sizeof(typed));
-	memset(&census, 0, sizeof(census));
+	memset(&census_storage, 0, sizeof(census_storage));
 	memset(&info, 0, sizeof(info));
 	memset(&clusterStartupWriter, 0, sizeof(clusterStartupWriter));
 	memset(&observed_writer, 0, sizeof(observed_writer));
@@ -327,9 +340,97 @@ UT_TEST(test_process_cleanup_revokes_start_before_destroying_original_inputs)
 	UT_ASSERT(cluster_recovery_cold_inputs == NULL);
 	UT_ASSERT(!ClusterBeginColdRecoveryTx(&info));
 }
+
+static void active_subject(void)
+{
+	ClusterColdTopTxCensusEntryV1 *entry = &census.entries[0];
+	census.count = 1;
+	entry->input.key.owner_instance = 1;
+	entry->input.key.segment_id = 1;
+	entry->input.key.segment_generation = 7;
+	entry->input.key.slot_offset = 2;
+	entry->input.key.xid = 100;
+	entry->input.key.slot_wrap = 3;
+	entry->input.slot.status = TT_SLOT_ACTIVE;
+	entry->input.slot.xid = 100;
+	entry->input.slot.wrap = 3;
+}
+
+UT_TEST(test_subject_requires_exact_original_census_entry_and_live_start)
+{
+	ClusterColdTopTxCensusEntryV1 copy;
+	uint64 generation = 0, serial = 0;
+	reset(); active_subject(); retain();
+	UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
+	/* An unproven original ACTIVE is a read-only input, never a loser grant. */
+	UT_ASSERT(!census.entries[0].loser_proven);
+	UT_ASSERT(ClusterColdRecoveryTxSubjectCurrent(info.cluster_tx_start,
+		&census.entries[0], &generation, &serial));
+	UT_ASSERT(generation != 0 && serial != 0);
+	copy = census.entries[0];
+	UT_ASSERT(!ClusterColdRecoveryTxSubjectCurrent(info.cluster_tx_start,
+		&copy, &generation, &serial));
+	UT_ASSERT(generation == 0 && serial == 0);
+	/* Both opaque arguments reject invalid addresses without dereferencing. */
+	UT_ASSERT(!ClusterColdRecoveryTxSubjectCurrent(info.cluster_tx_start,
+		(const ClusterColdTopTxCensusEntryV1 *)(uintptr_t)1, &generation, &serial));
+	UT_ASSERT(!ClusterColdRecoveryTxSubjectCurrent(
+		(const struct ClusterRecoveryStartV1 *)(uintptr_t)1,
+		&census.entries[0], &generation, &serial));
+	UT_ASSERT(!ClusterColdRecoveryTxSubjectCurrent(info.cluster_tx_start,
+		&census.entries[1], &generation, &serial));
+	UT_ASSERT(!ClusterColdRecoveryTxSubjectCurrent(info.cluster_tx_start,
+		NULL, &generation, &serial));
+	serial = 19;
+	UT_ASSERT(!ClusterColdRecoveryTxSubjectCurrent(info.cluster_tx_start,
+		&census.entries[0], NULL, &serial));
+	UT_ASSERT_EQ(serial, 0);
+	generation = 19;
+	UT_ASSERT(!ClusterColdRecoveryTxSubjectCurrent(info.cluster_tx_start,
+		&census.entries[0], &generation, NULL));
+	UT_ASSERT_EQ(generation, 0);
+	CurrentResourceOwner = (ResourceOwner)&typed;
+	UT_ASSERT(!ClusterColdRecoveryTxSubjectCurrent(info.cluster_tx_start,
+		&census.entries[0], &generation, &serial));
+	CurrentResourceOwner = (ResourceOwner)&info;
+	UT_ASSERT(ClusterColdRecoveryTxSubjectCurrent(info.cluster_tx_start,
+		&census.entries[0], &generation, &serial));
+	release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	UT_ASSERT(!ClusterColdRecoveryTxSubjectCurrent(info.cluster_tx_start,
+		&census.entries[0], &generation, &serial));
+	UT_ASSERT(generation == 0 && serial == 0);
+}
+
+UT_TEST(test_subject_rejects_nonactive_or_conflicting_physical_identity)
+{
+	for (int fault = 0; fault < 12; fault++) {
+		ClusterColdTopTxCensusEntryV1 *entry;
+		uint64 generation = 19, serial = 20;
+		reset(); active_subject(); retain();
+		UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
+		entry = &census.entries[0];
+		switch (fault) {
+		case 0: entry->input.key.owner_instance = 0; break;
+		case 1: entry->input.key.owner_instance = UNDO_OWNER_INSTANCE_MAX + 1; break;
+		case 2: entry->input.key.segment_id = 0; break;
+		case 3: entry->input.key.owner_instance = 2; break;
+		case 4: entry->input.key.segment_generation = UINT32_MAX; break;
+		case 5: entry->input.key.slot_offset = TT_SLOTS_PER_SEGMENT; break;
+		case 6: entry->input.key.xid = FrozenTransactionId; break;
+		case 7: entry->input.key.slot_wrap = TT_WRAP_INVALID; break;
+		case 8: entry->input.slot.status = TT_SLOT_UNUSED; break;
+		case 9: entry->input.slot.xid++; break;
+		case 10: entry->input.slot.wrap++; break;
+		case 11: census.count = 0; break;
+		}
+		UT_ASSERT(!ClusterColdRecoveryTxSubjectCurrent(info.cluster_tx_start,
+			entry, &generation, &serial));
+		UT_ASSERT(generation == 0 && serial == 0);
+	}
+}
 int main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(11);
 	UT_RUN(test_original_owner_binds_complete_empty_census_after_done);
 	UT_RUN(test_native_owner_rejects_uninstalled_recovery_and_writer_drift);
 	UT_RUN(test_current_rechecks_owner_process_boot_and_exact_writer);
@@ -339,6 +440,8 @@ int main(void)
 	UT_RUN(test_original_close_rejects_another_handoff_before_releasing);
 	UT_RUN(test_actual_post_done_boundary_binds_or_fails_before_later_work);
 	UT_RUN(test_process_cleanup_revokes_start_before_destroying_original_inputs);
+	UT_RUN(test_subject_requires_exact_original_census_entry_and_live_start);
+	UT_RUN(test_subject_rejects_nonactive_or_conflicting_physical_identity);
 	reset();
 	if (allocations != frees) { fprintf(stderr, "unreleased start resources\n"); return 1; }
 	UT_DONE();

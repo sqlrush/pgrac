@@ -776,6 +776,38 @@ ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start)
 }
 
 bool
+ClusterColdRecoveryTxSubjectCurrent(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject, uint64 *generation, uint64 *serial)
+{
+	if (generation != NULL) *generation = 0;
+	if (serial != NULL) *serial = 0;
+	if (generation == NULL || serial == NULL || subject == NULL
+		|| !ClusterColdRecoveryTxCurrent(start))
+		return false;
+	/* Never dereference a caller's subject before locating it in the original
+	 * complete census. Unproven ACTIVE inputs may be read to build a proof;
+	 * this check grants neither loser status nor permission to change TT. */
+	for (uint32 i = 0; i < start->census->count; i++) {
+		const ClusterColdTopTxCensusEntryV1 *entry = &start->census->entries[i];
+		const ClusterColdTtSlotKeyV1 *key = &entry->input.key;
+		if (entry != subject)
+			continue;
+		if (key->owner_instance == 0 || key->owner_instance > UNDO_OWNER_INSTANCE_MAX
+			|| key->segment_id == 0
+			|| (key->segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 != key->owner_instance
+			|| key->segment_generation == UINT32_MAX || key->slot_offset >= TT_SLOTS_PER_SEGMENT
+			|| !TransactionIdIsNormal(key->xid) || key->slot_wrap == TT_WRAP_INVALID
+			|| entry->input.slot.status != TT_SLOT_ACTIVE
+			|| entry->input.slot.xid != key->xid || entry->input.slot.wrap != key->slot_wrap)
+			return false;
+		*generation = start->generation;
+		*serial = start->serial;
+		return true;
+	}
+	return false;
+}
+
+bool
 ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 {
 	struct ClusterRecoveryStartV1 *start;
