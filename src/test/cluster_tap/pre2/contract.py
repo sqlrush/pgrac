@@ -110,6 +110,64 @@ WORKLOAD_LANE_DOMAINS = {"R/IMG": "r", "I/TT": "i", "H/HOT": "h", "Q/RECEIPT": "
 PASS_FOCUSED_DIAGNOSTIC = "PASS_FOCUSED_DIAGNOSTIC"
 NOT_TRIGGERED = "NOT_TRIGGERED"
 ROOT_OPEN = "ROOT_OPEN"
+WORKLOAD_STATE_FIELDS = ("pending", "receipt", "grd", "pcm", "tt")
+
+
+def _workload_chain_complete(lane, events):
+    """Validate supplied causal edges, independently of cross-process log order."""
+    if lane == "R/IMG":
+        phases = ("seed", "request", "serve", "reply", "consume")
+    elif lane == "I/TT":
+        phases = ("admit", "publish", "reread")
+    elif lane == "Q/RECEIPT":
+        phases = ("mutation", "prepare", "publish", "apply_consume", "close", "ack",
+                  "certificate_retire", "state_clear")
+    else:
+        phases = ("update",)
+    predecessors = {phase: phases[index - 1] if index else None
+                    for index, phase in enumerate(phases)}
+    if lane == "H/HOT":
+        predecessors.update({phase: "update" for phase in
+                             ("hot", "non_hot", "index_delete", "prune", "full")})
+
+    first = events[0]
+    chain = first.get("chain_id")
+    if not isinstance(chain, str) or not chain:
+        return False
+    by_id = {event["event_id"]: event for event in events}
+    observed = {event["phase"] for event in events}
+    if len(observed) != len(events) or not set(phases) <= observed:
+        return False
+    for event in events:
+        if (event.get("chain_id") != chain or
+                event["relation_locator"] != first["relation_locator"] or
+                event["logical_key"] != first["logical_key"] or
+                event["phase"] not in predecessors):
+            return False
+        expected = predecessors[event["phase"]]
+        parent_id = event.get("predecessor_event_id")
+        if expected is None:
+            if parent_id is not None:
+                return False
+        else:
+            if not isinstance(parent_id, str):
+                return False
+            parent = by_id.get(parent_id)
+            if parent is None or parent["phase"] != expected:
+                return False
+            if (_workload_identity_key(parent) == _workload_identity_key(event) and
+                    parent["event_seq"] >= event["event_seq"]):
+                return False
+    if lane == "H/HOT":
+        return bool(observed - {"update"})
+    if lane == "Q/RECEIPT":
+        mutation = next(event for event in events if event["phase"] == "mutation")
+        cleanup = next(event for event in events if event["phase"] == "state_clear")
+        before, after = mutation.get("state"), cleanup.get("state")
+        return (before is not None and after is not None and
+                any(before[field] > 0 for field in WORKLOAD_STATE_FIELDS) and
+                all(after[field] == 0 for field in WORKLOAD_STATE_FIELDS))
+    return True
 
 
 def _workload_identity_key(value):
@@ -153,10 +211,11 @@ def _workload_require_locator(value):
 def check_workload_contract(records):
     """Check one deterministic R/IMG, I/TT, H/HOT and Q/RECEIPT capture.
 
-    The input is the raw append order from the existing product log files.  A
-    barrier is a prefix seal for each independent process/sequence domain;
-    sequence numbers are never compared between domains and deferred records
-    after a lane barrier cannot retroactively satisfy that lane.
+    Input records are normalized observations, not raw product log lines. A
+    barrier seals a prefix of each independent process/sequence domain. Supplied
+    predecessor_event_id edges bind one chain_id per lane; append positions and
+    sequence numbers from different processes never establish causal order.
+    Deferred records after a lane barrier cannot satisfy or clean up that lane.
     """
     assert isinstance(records, list) and records, "no workload observations"
     identities = []
@@ -171,7 +230,6 @@ def check_workload_contract(records):
     barrier_positions = {}
     receipt_keys = set()
     q_nonempty_state = False
-    q_cleanup = False
     stop_state = None
     stopped = False
 
@@ -208,7 +266,7 @@ def check_workload_contract(records):
             if name == "STOP_SEAL":
                 stop_state = record.get("stop_state")
                 assert isinstance(stop_state, dict), "STOP_SEAL state missing"
-                for field in ("pending", "receipt", "grd", "pcm", "tt"):
+                for field in WORKLOAD_STATE_FIELDS:
                     assert isinstance(stop_state.get(field), int) and stop_state[field] >= 0, field
                 stopped = True
             continue
@@ -250,14 +308,13 @@ def check_workload_contract(records):
             state = record.get("state")
             if state is not None:
                 assert isinstance(state, dict), "Q state is not an object"
-                for field in ("pending", "receipt", "grd", "pcm", "tt"):
+                for field in WORKLOAD_STATE_FIELDS:
                     assert isinstance(state.get(field), int) and state[field] >= 0, field
                     q_nonempty_state = q_nonempty_state or state[field] > 0
             if record["phase"] == "state_clear":
                 assert record.get("cleanup_proof") == receipt, "Q state clear lacks receipt proof"
-                q_cleanup = True
 
-        relation_sets[lane].add(locator)
+        relation_sets[lane].add(locator[:3])
         key_sets[lane].add(key)
         if not deferred:
             lane_events[lane].append(record)
@@ -265,9 +322,6 @@ def check_workload_contract(records):
     assert barriers == list(WORKLOAD_BARRIER_ORDER), "workload barriers incomplete"
     assert len(receipt_keys) <= 1, "Q receipt identity changed"
     assert stop_state is not None, "STOP_SEAL missing"
-    if q_nonempty_state:
-        assert all(stop_state[field] == 0 for field in ("pending", "receipt", "grd", "pcm", "tt")) or not q_cleanup, \
-            "STOP_SEAL state is inconsistent"
     for left_index, left in enumerate(WORKLOAD_LANES):
         for right in WORKLOAD_LANES[left_index + 1:]:
             assert not relation_sets[left] & relation_sets[right], "lanes share a relation locator"
@@ -279,25 +333,16 @@ def check_workload_contract(records):
         if not events:
             statuses[lane] = NOT_TRIGGERED
             continue
-        phases = {event["phase"] for event in events}
-        if lane == "R/IMG":
-            complete = {"seed", "request", "serve", "reply", "consume"} <= phases
-        elif lane == "I/TT":
-            complete = {"admit", "publish", "reread"} <= phases
-        elif lane == "H/HOT":
-            paths = {"hot", "non_hot", "index_delete", "prune", "full"}
-            complete = "update" in phases and any(
-                event["phase"] in paths and event["actual"] for event in events
-            )
-        else:
-            complete = {"mutation", "prepare", "publish", "apply_consume", "close", "ack",
-                        "certificate_retire"} <= phases
+        complete = _workload_chain_complete(lane, events)
+        if lane == "Q/RECEIPT" and any(stop_state[field] for field in WORKLOAD_STATE_FIELDS):
+            complete = False
         lane_domains = {event["sequence_domain"] for event in events}
         lane_has_gap = any(gaps[identity] for identity in identity_set
                            if identity[3] in lane_domains)
         statuses[lane] = PASS_FOCUSED_DIAGNOSTIC if complete and not lane_has_gap else ROOT_OPEN
 
-    if q_nonempty_state and not q_cleanup:
+    if (any(stop_state[field] for field in WORKLOAD_STATE_FIELDS) or
+            (q_nonempty_state and statuses["Q/RECEIPT"] != PASS_FOCUSED_DIAGNOSTIC)):
         overall = ROOT_OPEN
     elif any(status == ROOT_OPEN for status in statuses.values()):
         overall = ROOT_OPEN
@@ -305,11 +350,8 @@ def check_workload_contract(records):
         overall = PASS_FOCUSED_DIAGNOSTIC
     else:
         overall = NOT_TRIGGERED
-    sequences = {}
-    for identity in identity_set:
-        domain = identity[3]
-        current = sequences.setdefault(domain, {"last_seq": 0, "gap": False})
-        current["last_seq"] = max(current["last_seq"], seq[identity])
-        current["gap"] = current["gap"] or gaps[identity]
+    sequences = [dict(node=identity[0], pid=identity[1], procno=identity[2],
+                      sequence_domain=identity[3], last_seq=seq[identity], gap=gaps[identity])
+                 for identity in identities]
     return {"overall": overall, "lanes": statuses, "barriers": barriers,
             "sequences": sequences}

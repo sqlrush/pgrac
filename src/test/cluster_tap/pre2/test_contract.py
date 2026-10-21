@@ -33,6 +33,7 @@ def workload_events(include_i=True, late_i=False, cleanup=True):
            for item in identities}
     gaps = {key: False for key in seq}
     events = []
+    predecessors = {}
 
     def snapshots():
         return [dict(item, last_seq=seq[tuple(item[field] for field in
@@ -56,9 +57,12 @@ def workload_events(include_i=True, late_i=False, cleanup=True):
                      lane=lane, phase=phase, node=identity["node"], pid=identity["pid"],
                      procno=identity["procno"], sequence_domain=domain,
                      event_seq=seq[identity_key], relation_locator=relation,
-                     logical_key=key)
+                     logical_key=key, chain_id=domain + "-chain-1",
+                     predecessor_event_id=predecessors.get(lane))
         event.update(extra)
         events.append(event)
+        if lane != "H/HOT" or phase == "update":
+            predecessors[lane] = event["event_id"]
 
     relations = {
         "R/IMG": dict(spcOid=11, dbOid=22, relNumber=301, forkNum=0, blockNum=7),
@@ -104,7 +108,8 @@ def workload_events(include_i=True, late_i=False, cleanup=True):
               receipt_key="receipt-1", actual=True)
     if cleanup:
         add_event("Q/RECEIPT", "state_clear", relations["Q/RECEIPT"], "q-key",
-                  receipt_key="receipt-1", actual=True, cleanup_proof="receipt-1")
+                  receipt_key="receipt-1", actual=True, cleanup_proof="receipt-1",
+                  state=dict(pending=0, receipt=0, grd=0, pcm=0, tt=0))
     barrier("Q/RECEIPT")
     barrier("STOP_SEAL", stop_state=dict(pending=0, receipt=0, grd=0, pcm=0, tt=0))
     return events
@@ -218,9 +223,6 @@ class WorkloadBarrierContract(unittest.TestCase):
                 contract.check_workload_contract(bad)
 
     def test_sequence_domains_are_independent_but_gaps_remain_root_open(self):
-        result = contract.check_workload_contract(workload_events())
-        self.assertNotEqual(result["sequences"]["r"]["last_seq"],
-                            result["sequences"]["i"]["last_seq"])
         bad = workload_events()
         r_events = [event for event in bad
                     if event.get("kind") == "event" and event["lane"] == "R/IMG"]
@@ -234,6 +236,99 @@ class WorkloadBarrierContract(unittest.TestCase):
                 snapshot["gap"] = True
         result = contract.check_workload_contract(bad)
         self.assertEqual(result["lanes"]["R/IMG"], "ROOT_OPEN")
+
+    def test_different_blocks_or_forks_do_not_make_relations_disjoint(self):
+        for fork in (0, 1):
+            bad = workload_events()
+            for event in bad:
+                if event.get("lane") == "Q/RECEIPT":
+                    event["relation_locator"]["relNumber"] = 301
+                    event["relation_locator"]["forkNum"] = fork
+            with self.subTest(fork=fork), self.assertRaises(AssertionError):
+                contract.check_workload_contract(bad)
+
+    def test_sequence_summary_preserves_processes_sharing_a_domain(self):
+        events = workload_events()
+        second = dict(node="n2", pid=202, procno=2, sequence_domain="r")
+        events[0]["identities"].append(second)
+        counts = {("n1", 101, 1, domain): 0 for domain in ("r", "i", "h", "q")}
+        counts[("n2", 202, 2, "r")] = 0
+        for event in events:
+            if event.get("kind") == "event":
+                if event["lane"] == "R/IMG" and event["phase"] in ("serve", "reply"):
+                    event.update(second)
+                key = tuple(event[field] for field in
+                            ("node", "pid", "procno", "sequence_domain"))
+                counts[key] += 1
+                event["event_seq"] = counts[key]
+            else:
+                event["snapshots"] = [dict(node=key[0], pid=key[1], procno=key[2],
+                                            sequence_domain=key[3], last_seq=last, gap=False)
+                                      for key, last in counts.items()]
+        result = contract.check_workload_contract(events)
+        self.assertIsInstance(result["sequences"], list)
+        r = [item for item in result["sequences"] if item["sequence_domain"] == "r"]
+        self.assertEqual(r, [dict(node="n1", pid=101, procno=1, sequence_domain="r",
+                                  last_seq=3, gap=False), dict(second, last_seq=2, gap=False)])
+        self.assertEqual(result["overall"], "PASS_FOCUSED_DIAGNOSTIC")
+        consume = next(event for event in events if event.get("phase") == "consume")
+        events.remove(consume)
+        serve = next(event for event in events if event.get("phase") == "serve")
+        events.insert(events.index(serve), consume)
+        # Cross-process append positions are not a causal clock. Explicit edges
+        # still link seed/request -> serve/reply -> consume at the same barrier.
+        self.assertEqual(contract.check_workload_contract(events)["overall"],
+                         "PASS_FOCUSED_DIAGNOSTIC")
+
+    def test_phase_sets_cannot_join_unrelated_or_unlinked_events(self):
+        for lane in WORKLOAD_LANES:
+            for changed in ("chain_id", "logical_key", "block", "predecessor", "phase_order"):
+                bad = workload_events()
+                lane_events = [event for event in bad if event.get("lane") == lane]
+                target = lane_events[1]
+                if changed == "chain_id":
+                    target["chain_id"] = "unrelated-chain"
+                elif changed == "logical_key":
+                    target["logical_key"] = "unrelated-key"
+                elif changed == "block":
+                    target["relation_locator"] = dict(target["relation_locator"], blockNum=999)
+                elif changed == "predecessor":
+                    target["predecessor_event_id"] = "missing-event"
+                else:
+                    lane_events[0]["phase"], target["phase"] = target["phase"], lane_events[0]["phase"]
+                with self.subTest(lane=lane, changed=changed):
+                    result = contract.check_workload_contract(bad)
+                    self.assertEqual(result["lanes"][lane], "ROOT_OPEN")
+
+    def test_late_deferred_cleanup_cannot_close_the_sealed_q_lane(self):
+        events = workload_events(cleanup=False)
+        retire = next(event for event in events if event.get("phase") == "certificate_retire")
+        cleanup = dict(retire, event_id="q-8", event_seq=8, phase="state_clear",
+                       predecessor_event_id=retire["event_id"], deferred=True,
+                       cleanup_proof=retire["receipt_key"],
+                       state=dict(pending=0, receipt=0, grd=0, pcm=0, tt=0))
+        events.insert(-1, cleanup)
+        next(item for item in events[-1]["snapshots"]
+             if item["sequence_domain"] == "q")["last_seq"] = 8
+        result = contract.check_workload_contract(events)
+        self.assertEqual(result["overall"], "ROOT_OPEN")
+        self.assertEqual(result["lanes"]["Q/RECEIPT"], "ROOT_OPEN")
+
+    def test_q_cleanup_requires_observed_pending_state_and_zero_result(self):
+        for changed in ("missing_before", "empty_before", "missing_after", "nonzero_after"):
+            bad = workload_events()
+            mutation = next(event for event in bad if event.get("phase") == "mutation")
+            cleanup = next(event for event in bad if event.get("phase") == "state_clear")
+            if changed == "missing_before":
+                mutation.pop("state")
+            elif changed == "empty_before":
+                mutation["state"] = dict(pending=0, receipt=0, grd=0, pcm=0, tt=0)
+            elif changed == "missing_after":
+                cleanup.pop("state")
+            else:
+                cleanup["state"]["pending"] = 1
+            with self.subTest(changed=changed):
+                self.assertEqual(contract.check_workload_contract(bad)["overall"], "ROOT_OPEN")
 
     def test_missing_or_late_deferred_lane_does_not_become_positive(self):
         missing = contract.check_workload_contract(workload_events(include_i=False))
@@ -272,6 +367,13 @@ class WorkloadBarrierContract(unittest.TestCase):
     def test_stop_seal_cannot_hide_pending_state_and_cannot_be_followed(self):
         result = contract.check_workload_contract(workload_events(cleanup=False))
         self.assertEqual(result["overall"], "ROOT_OPEN")
+        for field in ("pending", "receipt", "grd", "pcm", "tt"):
+            residual = workload_events()
+            residual[-1]["stop_state"][field] = 1
+            with self.subTest(residual=field):
+                result = contract.check_workload_contract(residual)
+                self.assertEqual(result["overall"], "ROOT_OPEN")
+                self.assertEqual(result["lanes"]["Q/RECEIPT"], "ROOT_OPEN")
         late = workload_events() + [dict(kind="event", event_id="late", lane="Q/RECEIPT",
                                          phase="ack", node="n1", pid=101, procno=1,
                                          sequence_domain="q", event_seq=99,
