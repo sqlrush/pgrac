@@ -889,11 +889,88 @@ UT_TEST(test_root_rebuild_null_cursor_preserves_destination)
 	UT_ASSERT_EQ(memcmp(&set, &before, sizeof(set)), 0);
 }
 
+UT_TEST(test_root_rebuild_preserves_existing_proofs_and_exact_pins)
+{
+	const unsigned proof_masks[] = { 0, 5, 15 };
+
+	for (unsigned shared = 0; shared < 2; shared++) {
+		for (unsigned p = 0; p < lengthof(proof_masks); p++) {
+			for (unsigned count = 0; count <= 2; count += 2) {
+				CensusFixture f;
+				ClusterRelmapPendingSet set, before, empty;
+				ClusterRelmapPendingDescriptor existing[2], incoming[2];
+				ClusterRelmapRetentionDirectory origins_before[2];
+				Oid dbid = shared ? InvalidOid : 5;
+				unsigned proofs = proof_masks[p];
+
+				census_fixture(&f, true);
+				census_pair(f.fd, InvalidOid, 3, false, true, false);
+				cluster_relmap_pending_init(&set);
+				for (unsigned i = 0; i < lengthof(existing); i++) {
+					ClusterSpaceIdentityKey *key = &existing[i].identity;
+
+					existing[i] = census_descriptor(dbid, i == 0
+						? CLUSTER_RELMAP_PENDING_DROP : CLUSTER_RELMAP_PENDING_TRUNCATE,
+						71000 + i);
+					UT_ASSERT_EQ(cluster_relmap_pending_add(&set, existing[i].kind,
+						key, true), CLUSTER_RELMAP_PENDING_OK);
+					if (proofs & 1)
+						UT_ASSERT_EQ(cluster_relmap_pending_mark_copies_cleared(&set,
+							existing[i].kind, key), CLUSTER_RELMAP_PENDING_OK);
+					if (proofs & 2)
+						UT_ASSERT_EQ(cluster_relmap_pending_mark_native_terminal(&set,
+							existing[i].kind, key), CLUSTER_RELMAP_PENDING_OK);
+					if (proofs & 4)
+						UT_ASSERT_EQ(cluster_relmap_pending_mark_tt_complete(&set,
+							existing[i].kind, key), CLUSTER_RELMAP_PENDING_OK);
+					if (proofs & 8)
+						UT_ASSERT_EQ(cluster_relmap_pending_mark_space_complete(&set,
+							existing[i].kind, key), CLUSTER_RELMAP_PENDING_OK);
+					incoming[i] = existing[i];
+					incoming[i].identity.locator.relNumber += 100;
+				}
+				memcpy(&before, &set, sizeof(before));
+				if (census_observe_begin(&f) && census_until_committed(&f, dbid)) {
+					UT_ASSERT(census_pin(&f.origin[0], dbid) != NULL);
+					memcpy(origins_before, f.origin, sizeof(origins_before));
+					UT_ASSERT_EQ(cluster_relmap_retention_census_rebuild_pending(f.census,
+						&set, count == 0 ? NULL : incoming, count),
+						CLUSTER_RELMAP_PENDING_CONFLICT);
+					UT_ASSERT_EQ(memcmp(&set, &before, sizeof(set)), 0);
+					for (unsigned i = 0; i < lengthof(f.origin); i++)
+						UT_ASSERT_EQ(memcmp(f.origin[i].pins, origins_before[i].pins,
+							sizeof(f.origin[i].pins)), 0);
+					for (unsigned i = 0; i < lengthof(existing); i++) {
+						ClusterSpaceIdentityKey alias = existing[i].identity;
+
+						alias.storage_uuid[0]++;
+						UT_ASSERT(cluster_relmap_pending_contains(&set, existing[i].kind,
+							&existing[i].identity));
+						UT_ASSERT(cluster_relmap_pending_rel_number_reserved(&set, &alias));
+						UT_ASSERT_EQ(cluster_relmap_pending_can_release(&set, existing[i].kind,
+							&existing[i].identity), proofs == 15);
+					}
+					UT_ASSERT_EQ(cluster_relmap_retention_census_next(f.census),
+						CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+					census_refused(&f);
+					/* A fresh destination cannot retry through the poisoned cursor. */
+					cluster_relmap_pending_init(&empty);
+					UT_ASSERT_EQ(cluster_relmap_retention_census_rebuild_pending(f.census,
+						&empty, NULL, 0), CLUSTER_RELMAP_PENDING_NOT_READY);
+					UT_ASSERT(!empty.has_namespace);
+					UT_ASSERT_EQ(memcmp(&set, &before, sizeof(set)), 0);
+				}
+				census_cleanup(&f);
+			}
+		}
+	}
+}
+
 #ifndef RELMAP_CENSUS_FIXTURE_ONLY
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(26);
 	UT_RUN(test_all_physical_namespaces_and_original_backup_only_pending);
 	UT_RUN(test_all_legal_pair_cuts_keep_pending_without_publishing_complete);
 	UT_RUN(test_clean_census_stays_unpublished);
@@ -919,6 +996,7 @@ main(void)
 	UT_RUN(test_root_rebuild_rechecks_borrowed_qualification_before_consuming);
 	UT_RUN(test_root_rebuild_remains_provisional_until_whole_set_recheck);
 	UT_RUN(test_root_rebuild_null_cursor_preserves_destination);
+	UT_RUN(test_root_rebuild_preserves_existing_proofs_and_exact_pins);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

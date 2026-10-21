@@ -398,10 +398,87 @@ UT_TEST(test_pending_rebuild_rejects_foreign_physical_namespace_atomically)
 	}
 }
 
+UT_TEST(test_pending_rebuild_never_replaces_existing_obligations)
+{
+	for (unsigned shared = 0; shared < 2; shared++)
+	{
+		ClusterRelmapV2Namespace ns = pending_v2_identity;
+		unsigned char primary[CLUSTER_RELMAP_V2_FILE_SIZE];
+		unsigned char backup[CLUSTER_RELMAP_V2_FILE_SIZE];
+		ClusterRelmapV2View view;
+		ClusterRelmapV2PairResult pair_result;
+
+		ns.shared = shared != 0;
+		ns.dbid = ns.shared ? InvalidOid : 42;
+		pending_v2_pair(&ns, primary, backup);
+		pair_result = cluster_relmap_v2_read_pair(primary, sizeof(primary),
+			backup, sizeof(backup), &ns, &view);
+		UT_ASSERT_EQ(pair_result, CLUSTER_RELMAP_V2_PAIR_VALID);
+		for (unsigned proofs = 0; proofs < 16; proofs++)
+		{
+			for (unsigned count = 0; count <= 2; count += 2)
+			{
+				ClusterRelmapPendingSet set, before;
+				ClusterRelmapPendingDescriptor existing[2], incoming[2];
+
+				cluster_relmap_pending_init(&set);
+				for (unsigned i = 0; i < lengthof(existing); i++)
+				{
+					ClusterSpaceIdentityKey *key = &existing[i].identity;
+
+					existing[i].kind = i == 0 ? CLUSTER_RELMAP_PENDING_DROP
+						: CLUSTER_RELMAP_PENDING_TRUNCATE;
+					*key = pending_key(ns.database_incarnation, 0xe3 + i, 12010 + i);
+					key->system_identifier = ns.system_identifier;
+					key->locator.spcOid = ns.shared
+						? GLOBALTABLESPACE_OID : DEFAULTTABLESPACE_OID;
+					key->locator.dbOid = ns.dbid;
+					UT_ASSERT_EQ(cluster_relmap_pending_add(&set, existing[i].kind,
+						key, true), CLUSTER_RELMAP_PENDING_OK);
+					if (proofs & 1)
+						UT_ASSERT_EQ(cluster_relmap_pending_mark_copies_cleared(&set,
+							existing[i].kind, key), CLUSTER_RELMAP_PENDING_OK);
+					if (proofs & 2)
+						UT_ASSERT_EQ(cluster_relmap_pending_mark_native_terminal(&set,
+							existing[i].kind, key), CLUSTER_RELMAP_PENDING_OK);
+					if (proofs & 4)
+						UT_ASSERT_EQ(cluster_relmap_pending_mark_tt_complete(&set,
+							existing[i].kind, key), CLUSTER_RELMAP_PENDING_OK);
+					if (proofs & 8)
+						UT_ASSERT_EQ(cluster_relmap_pending_mark_space_complete(&set,
+							existing[i].kind, key), CLUSTER_RELMAP_PENDING_OK);
+					incoming[i] = existing[i];
+					incoming[i].identity.locator.relNumber += 100;
+				}
+				memcpy(&before, &set, sizeof(before));
+				/* An empty stream does not authorize clearing the destination.
+				 * Even fully marked entries still belong to the release owner. */
+				UT_ASSERT_EQ(cluster_relmap_pending_rebuild_from_committed(&set,
+					&ns, pair_result, &view, count == 0 ? NULL : incoming, count),
+					CLUSTER_RELMAP_PENDING_CONFLICT);
+				UT_ASSERT_EQ(memcmp(&set, &before, sizeof(set)), 0);
+				for (unsigned i = 0; i < lengthof(existing); i++)
+				{
+					ClusterSpaceIdentityKey alias = existing[i].identity;
+
+					alias.storage_uuid[0]++;
+					UT_ASSERT(cluster_relmap_pending_contains(&set, existing[i].kind,
+						&existing[i].identity));
+					UT_ASSERT(cluster_relmap_pending_rel_number_reserved(&set, &alias));
+					UT_ASSERT_EQ(cluster_relmap_pending_can_release(&set, existing[i].kind,
+						&existing[i].identity), proofs == 15);
+					UT_ASSERT(!cluster_relmap_pending_contains(&set, incoming[i].kind,
+						&incoming[i].identity));
+				}
+			}
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
 	UT_RUN(test_pending_add_requires_main_placeholder_and_reserves_locator);
 	UT_RUN(test_pending_release_requires_all_terminal_proofs);
 	UT_RUN(test_pending_proof_marks_are_idempotent_but_exact);
@@ -411,6 +488,7 @@ main(void)
 	UT_RUN(test_pending_rebuild_requires_committed_pair);
 	UT_RUN(test_pending_rebuild_accepts_global_and_local_tablespaces);
 	UT_RUN(test_pending_rebuild_rejects_foreign_physical_namespace_atomically);
+	UT_RUN(test_pending_rebuild_never_replaces_existing_obligations);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
