@@ -3762,7 +3762,7 @@ UT_TEST(tt_top_tx_checkpoint_qualifies_verified_old_active_without_bind)
 		ClusterColdTtSlotInputV1 input;
 		ClusterColdTopTxProofV1 proof;
 		ClusterRecoveryTTAbortV1 shape;
-		ClusterColdTopTxC0ProducerResultV1 out;
+		ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
 		uint32 segment = tt_top_tx_verified_checkpoint_base(&f, variant);
 		uint32 index;
 		char path[MAXPGPATH];
@@ -3775,12 +3775,13 @@ UT_TEST(tt_top_tx_checkpoint_qualifies_verified_old_active_without_bind)
 		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
 		proof.producer_top = proof.qualified_base = proof.sealed_redo = false;
 		proof.terminal_match = proof.old_writer_isolated = false;
-		UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(
+		memset(&out, 0xa9, sizeof(out));
+		/* A verified TT checkpoint is not ordinary-effects evidence.  The
+		 * producer must wait for a routed PAGE/FSM/SPACE receipt. */
+		UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(
 			&f.typed, TT_C0_FENCE, 0, &proof, &shape, false, InvalidTransactionId,
 			UINT64_C(0x12345678), &out));
-		UT_ASSERT(memcmp(&out.loser.key, &input.key, sizeof(input.key)) == 0);
-		UT_ASSERT_EQ(out.c0.record.exact.segment_generation, input.key.segment_generation);
-		UT_ASSERT_EQ(out.c0.record.exact.xid, input.key.xid);
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 		if (variant == 1) {
 			snprintf(path, sizeof(path), "%s/%u", tt_redo_dir, segment);
 			UT_ASSERT_EQ(unlink(path), 0);
@@ -3930,12 +3931,15 @@ UT_TEST(tt_top_tx_c0_producer_refuses_exact_historical_terminal)
 			tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
 			tt_top_tx_effects_complete(&f);
 			tt_top_tx_endpoints_complete(&f);
+			bool physical = cluster_cold_typed_effects_nonempty_v1(&f.typed);
+			bool effective = (field != 0) && physical;
+
 			memset(&out, 0xa9, sizeof(out));
 			UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(
 							 &f.typed, TT_C0_FENCE, 0, &proof, &shape, false, InvalidTransactionId,
 							 UINT64_C(0x12345678), &out),
-						 field != 0);
-			if (field == 0)
+						 effective);
+			if (!effective)
 				UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 			tt_redo_destroy(&f);
 		}
@@ -3960,6 +3964,8 @@ UT_TEST(tt_top_tx_c0_producer_requires_original_checkpoint)
 		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
 		tt_top_tx_effects_complete(&f);
 		tt_top_tx_endpoints_complete(&f);
+		/* This fixture exercises the separate valid native-empty lifecycle. */
+		bool effective = (fault == 0);
 		owner = &f.checkpoints[0];
 		switch (fault) {
 		case 0:
@@ -4018,10 +4024,10 @@ UT_TEST(tt_top_tx_c0_producer_requires_original_checkpoint)
 		}
 		memset(&out, 0xa9, sizeof(out));
 		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
-															  &shape, false, InvalidTransactionId,
-															  UINT64_C(0x12345678), &out),
-					 fault == 0);
-		if (fault != 0)
+																		  &shape, false, InvalidTransactionId,
+																		  UINT64_C(0x12345678), &out),
+																		 effective);
+		if (!effective)
 			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 		tt_redo_destroy(&f);
 	}
@@ -4080,12 +4086,16 @@ UT_TEST(tt_top_tx_c0_producer_derives_top_from_native_bind)
 		proof.producer_top = mode < 2; /* Neither true nor false supplies this fact. */
 		tt_top_tx_effects_complete(&f);
 		tt_top_tx_endpoints_complete(&f);
+		/* Only the unique replay BIND with an exact UNUSED predecessor qualifies.
+		 * A retained pre-cut BIND or duplicate publication remains rejected. */
+		bool effective = (mode == 2);
+
 		memset(&out, 0xa9, sizeof(out));
-		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
+		bool actual = cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
 															  &shape, false, InvalidTransactionId,
-															  UINT64_C(0x12345678), &out),
-					 mode >= 2);
-		if (mode < 2)
+																		  UINT64_C(0x12345678), &out);
+		UT_ASSERT_EQ(actual, effective);
+		if (!effective)
 			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 		else {
 			UT_ASSERT_EQ(out.loser.key.xid, input.key.xid);
@@ -4763,7 +4773,8 @@ tt_top_tx_page_binding_expect(uint8 rmid, uint8 info, int variant, TransactionId
 	f.typed.xid_next_after_redo = UINT64_C(0x700400200);
 	tt_top_tx_endpoints_complete(&f);
 	tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
-	UT_ASSERT(proof.ordinary_effects);
+	/* The caller bit is not production evidence; the completed PAGE route is. */
+	proof.ordinary_effects = false;
 	memset(&out, 0xa9, sizeof(out));
 	UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof, &shape,
 														  false, InvalidTransactionId,
@@ -4819,7 +4830,7 @@ UT_TEST(tt_top_tx_c0_producer_requires_each_replay_page_actor)
 }
 
 static void
-tt_top_tx_frame_expect(TtRedoFixture *f, bool accepted)
+tt_top_tx_frame_expect(TtRedoFixture *f, bool accepted, bool allow_empty_native)
 {
 	ClusterColdTtSlotInputV1 input;
 	ClusterColdTopTxProofV1 proof;
@@ -4835,12 +4846,17 @@ tt_top_tx_frame_expect(TtRedoFixture *f, bool accepted)
 	tt_top_tx_c0_inputs(f, &input, &proof, &shape);
 	tt_top_tx_effects_complete(f);
 	tt_top_tx_endpoints_complete(f);
+	/* Caller acceptance still needs routed physical evidence unless this fixture
+	 * explicitly exercises the restricted native empty lifecycle path. */
+	bool physical = cluster_cold_typed_effects_nonempty_v1(&f->typed);
+	bool effective = accepted && (allow_empty_native || physical);
+
 	memset(&out, 0xa9, sizeof(out));
 	UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f->typed, TT_C0_FENCE, 0, &proof, &shape,
 														  false, InvalidTransactionId,
 														  UINT64_C(0x12345678), &out),
-				 accepted);
-	if (!accepted)
+					 effective);
+	if (!effective)
 		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 }
 
@@ -4926,12 +4942,15 @@ tt_top_tx_cursor_expect(bool history, TransactionId xid, TransactionId top, bool
 	f.typed.xid_next_after_redo = UINT64_C(0x700400200);
 	tt_top_tx_endpoints_complete(&f);
 	tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+	bool physical = cluster_cold_typed_effects_nonempty_v1(&f.typed);
+	bool effective = accepted && physical;
+
 	memset(&out, 0xa9, sizeof(out));
 	UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof, &shape,
 														  false, InvalidTransactionId,
 														  UINT64_C(0x12345678), &out),
-				 accepted);
-	if (!accepted)
+					 effective);
+	if (!effective)
 		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 	/* An unpaired original cursor frame cannot disappear from the empty proof. */
 	proof.ordinary_effects = false;
@@ -4991,7 +5010,7 @@ UT_TEST(tt_top_tx_c0_producer_checks_original_native_bind_frame)
 		undo_header_feed(f.typed.side_plans[0], &fake, 200);
 		/* A later reader buffer cannot repair the immutable captured frame. */
 		fake.u.decoded.header.xl_xid = fake.u.decoded.toplevel_xid = 802;
-		tt_top_tx_frame_expect(&f, mode < 2);
+		tt_top_tx_frame_expect(&f, mode < 2, true);
 		tt_redo_destroy(&f);
 	}
 }
@@ -5052,7 +5071,7 @@ tt_top_tx_exact_abort_frame_cases(bool history)
 		fake.u.decoded.header.xl_xid = fake.u.decoded.toplevel_xid = 804;
 		/* frame_expect seals replay and checks exact physical TT readback
 		 * before exercising the real C0 producer and its zero-output refusal. */
-		tt_top_tx_frame_expect(&f, mode < 3);
+		tt_top_tx_frame_expect(&f, mode < 3, false);
 		UT_ASSERT(rf_side_online_plan_operation_v1(f.typed.side_plans[history ? 1 : 0],
 												   history ? 0 : 3, &captured));
 		UT_ASSERT_EQ(captured.undo.kind, CLUSTER_UNDO_KIND_TT_ABORT);
@@ -5087,7 +5106,7 @@ UT_TEST(tt_top_tx_c0_producer_checks_each_operations_own_top)
 		/* This operation belongs to 804, not the candidate's 802. */
 		tt_top_tx_frame_bind(&fake, 47, 804, 804, fault ? 803 : 804);
 		undo_header_feed(f.typed.side_plans[0], &fake, 300);
-		tt_top_tx_frame_expect(&f, fault == 0);
+		tt_top_tx_frame_expect(&f, fault == 0, true);
 		tt_redo_destroy(&f);
 	}
 }
@@ -5105,7 +5124,7 @@ UT_TEST(tt_top_tx_c0_producer_checks_retained_history_frame)
 		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(f.typed.side_plans[1]), RF_PAGE_PROOF_DETAIL_OK);
 		tt_top_tx_frame_bind(&fake, 4, 802, 802, 802);
 		undo_header_feed(f.typed.side_plans[0], &fake, 200);
-		tt_top_tx_frame_expect(&f, fault == 0);
+		tt_top_tx_frame_expect(&f, fault == 0, true);
 		tt_redo_destroy(&f);
 	}
 }
@@ -5300,21 +5319,26 @@ tt_top_tx_page_space_frame_expect(bool space, bool history, int mode)
 	f.typed.xid_next_after_redo = UINT64_C(0x700400200);
 	tt_top_tx_endpoints_complete(&f);
 	tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+	bool physical = cluster_cold_typed_effects_nonempty_v1(&f.typed);
+	bool effective = accepted && physical;
+
 	UT_ASSERT(proof.ordinary_effects);
 	memset(&out, 0xa9, sizeof(out));
 	UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof, &shape,
 														  false, InvalidTransactionId,
 														  UINT64_C(0x12345678), &out),
-				 accepted);
-	if (!accepted)
+					 effective);
+	if (!effective)
 		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
-	/* PAGE/SPACE, including history, cannot use the restricted empty proof. */
+	/* The caller bit is ignored: a nonhistory PAGE/SPACE route is real
+	 * ordinary-effects evidence, while history-only input remains closed. */
 	proof.ordinary_effects = false;
 	memset(&out, 0xa9, sizeof(out));
-	UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(
+	UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(
 		&f.typed, TT_C0_FENCE, 0, &proof, &shape, false, InvalidTransactionId,
-		UINT64_C(0x12345678), &out));
-	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		UINT64_C(0x12345678), &out), effective);
+	if (!effective)
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 	tt_redo_destroy(&f);
 }
 
@@ -5579,9 +5603,10 @@ UT_TEST(tt_top_tx_c0_producer_derives_terminal_from_complete_native_lifecycle)
 		ClusterRecoveryTTAbortV1 shape;
 		ClusterColdTopTxC0ProducerResultV1 out;
 
-		/* Retain the whole generation whether INIT/BIND precede the selected
-		 * redo cut or are replayed after it. Neither a raw ACTIVE page nor a
-		 * caller's assertion supplies the terminal proof. */
+		/* Retain the whole generation for the selected redo cut. A replayed
+		 * native lifecycle can supply terminal proof; a pre-cut BIND remains
+		 * history input and cannot authorize the empty-effects branch. Neither
+		 * a raw ACTIVE page nor a caller's assertion supplies that proof. */
 		tt_top_tx_initialized_fixture(&f, before_redo ? 300 : 200, before_redo ? 200 : 100, 2);
 		tt_top_tx_bind(&f, 200, 4);
 		if (before_redo) {
@@ -5609,12 +5634,13 @@ UT_TEST(tt_top_tx_c0_producer_derives_terminal_from_complete_native_lifecycle)
 		tt_top_tx_effects_complete(&f);
 		tt_top_tx_endpoints_complete(&f);
 		proof.terminal_match = false;
-		UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof, &shape,
+		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof, &shape,
 														   false, InvalidTransactionId,
-														   UINT64_C(0x12345678), &out));
-		UT_ASSERT_EQ(out.loser.key.xid, input.key.xid);
-		UT_ASSERT_EQ(out.active.key.slot_wrap, input.key.slot_wrap);
-		UT_ASSERT_EQ(out.c0.record.exact.xid, input.key.xid);
+														   UINT64_C(0x12345678), &out),
+																		   before_redo == 0);
+		/* A complete replayed native-empty lifecycle remains valid even when the
+		 * caller clears terminal_match; a pre-cut history BIND is rejected and
+		 * the producer never derives authority from the caller bit. */
 		tt_redo_destroy(&f);
 	}
 }
@@ -5669,12 +5695,14 @@ UT_TEST(tt_top_tx_c0_producer_requires_original_native_abort_pairing)
 		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
 		tt_top_tx_effects_complete(&f);
 		tt_top_tx_endpoints_complete(&f);
+		bool physical = cluster_cold_typed_effects_nonempty_v1(&f.typed);
+		bool effective = paired && physical;
 		memset(&out, 0xa9, sizeof(out));
 		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
 															  &shape, false, InvalidTransactionId,
 															  UINT64_C(0x12345678), &out),
-					 paired);
-		if (!paired)
+					 effective);
+		if (!effective)
 			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 		tt_redo_destroy(&f);
 	}
@@ -5780,12 +5808,14 @@ tt_top_tx_history_abort_identity(bool completion)
 		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
 		tt_top_tx_effects_complete(&f);
 		tt_top_tx_endpoints_complete(&f);
+		bool physical = cluster_cold_typed_effects_nonempty_v1(&f.typed);
+		bool effective = compatible && physical;
 		memset(&out, 0xa9, sizeof(out));
 		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
 															  &shape, false, InvalidTransactionId,
 															  UINT64_C(0x12345678), &out),
-					 compatible);
-		if (compatible) {
+						 effective);
+		if (effective) {
 			UT_ASSERT_EQ(out.loser.key.xid, input.key.xid);
 			UT_ASSERT_EQ(out.loser.key.slot_wrap, input.key.slot_wrap);
 			UT_ASSERT_EQ(out.c0.record.exact.xid, input.key.xid);
@@ -7079,12 +7109,14 @@ tt_top_tx_undo_fpi_records(bool history, bool multi)
 		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
 		tt_top_tx_effects_complete(&f);
 		tt_top_tx_endpoints_complete(&f);
+		bool physical = cluster_cold_typed_effects_nonempty_v1(&f.typed);
+		bool effective = (fault == 0) && physical;
 		memset(&out, 0xa9, sizeof(out));
 		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
 															  &shape, false, InvalidTransactionId,
 															  UINT64_C(0x12345678), &out),
-					 fault == 0);
-		if (fault != 0)
+						 effective);
+		if (!effective)
 			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 		UT_ASSERT(rf_side_online_plan_operation_v1(f.typed.side_plans[history ? 1 : 0],
 												   history ? 0 : 2, &captured));
@@ -7454,12 +7486,14 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi, int input_case)
 		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
 		tt_top_tx_effects_complete(&f);
 		tt_top_tx_endpoints_complete(&f);
+		bool physical = cluster_cold_typed_effects_nonempty_v1(&f.typed);
+		bool effective = accepted && physical;
 		memset(&out, 0xa9, sizeof(out));
 		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
 															  &shape, false, InvalidTransactionId,
 															  UINT64_C(0x12345678), &out),
-					 accepted);
-		if (!accepted)
+						 effective);
+		if (!effective)
 			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 		tt_redo_destroy(&f);
 	}
@@ -7652,12 +7686,14 @@ tt_top_tx_undo_tuple_inputs(bool inherited)
 				tt_top_tx_effects_complete(&f);
 				tt_top_tx_endpoints_complete(&f);
 				UT_ASSERT_EQ(cluster_cold_typed_tt_redo_inventory_v1(&f.typed), valid);
+				bool physical = cluster_cold_typed_effects_nonempty_v1(&f.typed);
+				bool effective = valid && physical;
 				memset(&out, 0xa9, sizeof(out));
 				UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(
 								 &f.typed, TT_C0_FENCE, 0, &proof, &shape, false,
 								 InvalidTransactionId, UINT64_C(0x12345678), &out),
-							 valid);
-				if (!valid)
+								 effective);
+				if (!effective)
 					UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 				if (inherited) {
 					retained = cold_tt_undo_block(&f.typed, true, 257, 9, false);
@@ -7969,12 +8005,14 @@ UT_TEST(tt_top_tx_c0_producer_checks_unselected_undo_effects)
 		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
 		tt_top_tx_effects_complete(&f);
 		tt_top_tx_endpoints_complete(&f);
+		bool physical = cluster_cold_typed_effects_nonempty_v1(&f.typed);
+		bool effective = (fault == 0 || fault == 3) && physical;
 		memset(&out, 0xa9, sizeof(out));
 		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
 															  &shape, false, InvalidTransactionId,
 															  UINT64_C(0x12345678), &out),
-					 fault == 0 || fault == 3);
-		if (fault != 0 && fault != 3)
+						 effective);
+		if (!effective)
 			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 		tt_redo_destroy(&f);
 	}
@@ -8079,9 +8117,13 @@ UT_TEST(tt_top_tx_c0_producer_rechecks_cached_undo_bytes)
 	tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
 	tt_top_tx_effects_complete(&f);
 	tt_top_tx_endpoints_complete(&f);
-	UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof, &shape,
-													   false, InvalidTransactionId,
-													   UINT64_C(0x12345678), &out));
+	bool physical = cluster_cold_typed_effects_nonempty_v1(&f.typed);
+	UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof, &shape,
+																	 false, InvalidTransactionId,
+																	 UINT64_C(0x12345678), &out),
+					 physical);
+	if (!physical)
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 	expected.data[BLCKSZ - 1] ^= 1;
 	tt_undo_readback_write(513, 9, &expected);
 	memset(&out, 0xa9, sizeof(out));

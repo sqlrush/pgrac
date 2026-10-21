@@ -936,6 +936,10 @@ extern bool cluster_cold_typed_effects_complete_v1(ClusterColdTypedV1 *typed,
 													const ClusterColdEffectsProofV1 *proof,
 													const ClusterColdReplayResultV1 *result);
 extern bool cluster_cold_typed_effects_ready_v1(const ClusterColdTypedV1 *typed);
+/* Return independent physical evidence for nonempty ordinary effects.  This
+ * is derived from the sealed routed receipt, never from a caller proof bit,
+ * and grants no execution or C0 authority. */
+extern bool cluster_cold_typed_effects_nonempty_v1(const ClusterColdTypedV1 *typed);
 
 /* Startup before execution pin/IR only. Reopen the original cold input owner,
  * compare the complete selected ROOT and history checkpoints, then release

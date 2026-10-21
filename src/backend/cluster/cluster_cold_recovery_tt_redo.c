@@ -822,8 +822,9 @@ cold_top_tx_empty_effects_v1(const ClusterColdTypedV1 *typed, uint32 participant
 				|| undo->segment_id != key->segment_id
 				|| undo->expected_generation != key->segment_generation
 				|| undo->slot_offset != key->slot_offset || undo->wrap != key->slot_wrap
-				|| !cold_top_tx_empty_bind_prefix_v1(typed->side_plans[p], previous, key))
+				|| !cold_top_tx_empty_bind_prefix_v1(typed->side_plans[p], previous, key)) {
 				return false;
+			}
 			found = true;
 		}
 		if (p == participant && undo->instance == key->owner_instance
@@ -1221,10 +1222,11 @@ cluster_cold_typed_top_tx_loser_producer_v1(
 	 * establish completed sealed redo. The caller's bit cannot add or revoke
 	 * that fact. Atomic transaction effects remain an independent proof. */
 	qualified.sealed_redo = true;
-	/* A fresh empty top has a native positive proof independent of the
-	 * caller's effects bit. Head=0, an old ACTIVE or an unclassified input
-	 * cannot enter this branch. Nonempty effects keep their original gate. */
-	qualified.ordinary_effects = proof->ordinary_effects
+	/* Nonempty ordinary effects require a completed sealed receipt carrying a
+	 * real PAGE/FSM/SPACE route. The caller's bit is never production
+	 * evidence. A fresh empty top has its separate native proof; an old ACTIVE
+	 * or unclassified input cannot enter that branch. */
+	qualified.ordinary_effects = cluster_cold_typed_effects_nonempty_v1(typed)
 								 || cold_top_tx_empty_effects_v1(typed, participant, &post_slot);
 	/* The qualified checkpoint base or retained INIT/REUSE lifecycle reaches
 	 * this exact physical ACTIVE image after completed all-record redo.

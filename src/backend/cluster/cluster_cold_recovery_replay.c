@@ -264,6 +264,16 @@ cluster_cold_typed_effects_ready_v1(const ClusterColdTypedV1 *typed)
 }
 
 bool
+cluster_cold_typed_effects_nonempty_v1(const ClusterColdTypedV1 *typed)
+{
+	const uint32 ordinary_mask = CLUSTER_COLD_EFFECT_PAGE | CLUSTER_COLD_EFFECT_FSM
+									 | CLUSTER_COLD_EFFECT_SPACE;
+
+	return cluster_cold_typed_effects_ready_v1(typed)
+		   && (typed->effects_receipt.proof.routed_union & ordinary_mask) != 0;
+}
+
+bool
 cluster_cold_typed_xid_sources_ready_v1(const ClusterColdTypedV1 *typed)
 {
 	const ClusterColdXidReceiptV1 *receipt;
