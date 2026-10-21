@@ -179,10 +179,12 @@ extern void cluster_conf_shmem_init(void);
 extern void cluster_conf_load(void);
 
 /*
- * Lookup helper: O(node_count) scan through ClusterConfShmem->nodes.
- * Returns NULL if node_id is not in the topology.  Future readers
- * (Interconnect / Heartbeat) will use this rather than re-implementing
- * the scan.
+ * Lookup helper: O(1) process-local index over the postmaster-static
+ * topology loaded into ClusterConfShmem.  A changed shmem pointer or
+ * declared node_count rebuilds the index; same-pointer/same-count mutation
+ * is outside the startup loader contract.  Returns NULL if node_id is not
+ * in the topology.  Readers (Interconnect / Heartbeat) use this rather than
+ * re-implementing a scan.
  */
 extern const ClusterNodeInfo *cluster_conf_lookup_node(int32 node_id);
 

@@ -94,6 +94,24 @@ StaticAssertDecl(sizeof(ClusterConf) <= 131072, "ClusterConf must fit in 128 KiB
 
 ClusterConf *ClusterConfShmem = NULL;
 
+/*
+ * The topology is loaded once during postmaster startup.  Keep the hot
+ * node-id lookup O(1) in each backend while retaining a narrow test/setup
+ * invalidation boundary: a new shmem region or a changed declared count
+ * rebuilds the index.  Reconfiguration changes node liveness, not this
+ * declared topology, so same-pointer/same-count mutation is outside the
+ * loader contract.
+ */
+static const ClusterNodeInfo *cluster_conf_lookup_cache[CLUSTER_MAX_NODES];
+static ClusterConf *cluster_conf_lookup_cache_conf = NULL;
+static int32 cluster_conf_lookup_cache_count = -1;
+static uint32 cluster_conf_lookup_cache_generation = 0;
+
+static void cluster_conf_lookup_cache_rebuild(void);
+
+/* Test-only observability; not part of the runtime lookup contract. */
+uint32 cluster_conf_lookup_cache_generation_for_test(void);
+
 
 /* ============================================================
  * Shmem region request / init.  Called from cluster_shmem.c.
@@ -174,16 +192,60 @@ cluster_conf_role_from_string(const char *str, ClusterNodeRole *out)
 const ClusterNodeInfo *
 cluster_conf_lookup_node(int32 node_id)
 {
-	int i;
+	if (ClusterConfShmem == NULL) {
+		if (cluster_conf_lookup_cache_conf != NULL || cluster_conf_lookup_cache_count != -1)
+			cluster_conf_lookup_cache_rebuild();
+		return NULL;
+	}
 
-	if (ClusterConfShmem == NULL)
+	if (cluster_conf_lookup_cache_conf != ClusterConfShmem ||
+		cluster_conf_lookup_cache_count != ClusterConfShmem->node_count)
+		cluster_conf_lookup_cache_rebuild();
+
+	if (node_id < 0 || node_id >= CLUSTER_MAX_NODES)
 		return NULL;
 
-	for (i = 0; i < ClusterConfShmem->node_count; i++) {
-		if (ClusterConfShmem->nodes[i].node_id == node_id)
-			return &ClusterConfShmem->nodes[i];
+	return cluster_conf_lookup_cache[node_id];
+}
+
+static void
+cluster_conf_lookup_cache_rebuild(void)
+{
+	int32 count;
+	int32 i;
+
+	memset(cluster_conf_lookup_cache, 0, sizeof(cluster_conf_lookup_cache));
+	cluster_conf_lookup_cache_conf = ClusterConfShmem;
+
+	if (ClusterConfShmem == NULL) {
+		cluster_conf_lookup_cache_count = -1;
+		cluster_conf_lookup_cache_generation++;
+		return;
 	}
-	return NULL;
+
+	cluster_conf_lookup_cache_count = ClusterConfShmem->node_count;
+	count = ClusterConfShmem->node_count;
+	if (count < 0)
+		count = 0;
+	if (count > CLUSTER_MAX_NODES)
+		count = CLUSTER_MAX_NODES;
+
+	for (i = 0; i < count; i++) {
+		int32 id = ClusterConfShmem->nodes[i].node_id;
+
+		/* Preserve the old scan's first-match behavior for duplicate ids. */
+		if (id >= 0 && id < CLUSTER_MAX_NODES &&
+			cluster_conf_lookup_cache[id] == NULL)
+			cluster_conf_lookup_cache[id] = &ClusterConfShmem->nodes[i];
+	}
+
+	cluster_conf_lookup_cache_generation++;
+}
+
+uint32
+cluster_conf_lookup_cache_generation_for_test(void)
+{
+	return cluster_conf_lookup_cache_generation;
 }
 
 int
