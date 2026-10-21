@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  * test_cluster_recovery_tt_io.c
- *    Held-descriptor C0 storage tests against real temporary undo files.
+ *    Held-descriptor C0/D0 storage tests against real temporary undo files.
  *
  * Author: SqlRush <sqlrush@gmail.com>
  * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md
@@ -8,6 +8,10 @@
  */
 #include "postgres.h"
 #include <fcntl.h>
+#include <setjmp.h>
+#include "miscadmin.h"
+#include "utils/elog.h"
+#include "cluster/cluster_recovery_ctrc_record.h"
 #include <sys/stat.h>
 #include <unistd.h>
 #include "cluster/cluster_undo_smgr.h"
@@ -40,6 +44,49 @@ static int write_fd = -1;
 static ClusterRecoveryTTAbortV1 record;
 static PGAlignedBlock initial;
 static bool header_locked;
+volatile uint32 CritSectionCount;
+static uint8 d0_payload[CLUSTER_RECOVERY_CTRC_BYTES];
+static const uint64 d0_system = UINT64_C(0x1020304050607080);
+static jmp_buf sync_failure_jump;
+static bool catch_sync_failure, sync_retry;
+static int sync_level, report_level;
+
+/* Controlled native reporting leaves, not a real ERROR/PANIC process. */
+int
+data_sync_elevel(int elevel)
+{
+	sync_level = elevel;
+	return sync_retry ? elevel : PANIC;
+}
+bool
+errstart(int elevel, const char *domain)
+{
+	report_level = elevel;
+	if (catch_sync_failure)
+		longjmp(sync_failure_jump, 1);
+	abort();
+}
+bool
+errstart_cold(int elevel, const char *domain)
+{
+	return errstart(elevel, domain);
+}
+int
+errcode_for_file_access(void)
+{
+	return 0;
+}
+int
+errmsg(const char *fmt, ...)
+{
+	return 0;
+}
+void
+errfinish(const char *file, int line, const char *func)
+{
+	abort();
+}
+
 
 bool
 cluster_undo_block0_header_write_lock(uint32 segment, uint8 owner, uint32 *acquired)
@@ -202,6 +249,9 @@ reset_file(bool already)
 	scope_current = capacity = true;
 	open_error = read_short = write_short = sync_error = close_error = stat_error = false;
 	corrupt_postread = false;
+	CritSectionCount = 0;
+	catch_sync_failure = sync_retry = false;
+	sync_level = report_level = 0;
 	write_fd = -1;
 	memset(&record, 0, sizeof(record));
 	record.version = CLUSTER_RECOVERY_TT_ABORT_VERSION;
@@ -456,6 +506,294 @@ UT_TEST(test_close_error_and_exit_release_do_not_publish_completion)
 	UT_ASSERT_EQ(syncs, 0);
 	UT_ASSERT(!cluster_undo_smgr_recovery_abort_write_v1(stamp));
 }
+
+/* Real canonical D0 and real native checksummed page; authority is a fixture. */
+static void
+reset_d0(bool committed)
+{
+	ClusterRecoveryCTRCReleaseV2 d = { 0 };
+	UndoSegmentHeaderData *header;
+	int fd;
+
+	reset_file(false);
+	d.version = CLUSTER_RECOVERY_CTRC_VERSION;
+	d.length = sizeof(d0_payload);
+	d.flags = CLUSTER_RECOVERY_CTRC_RELEASE_PROVEN;
+	d.root_id = 1;
+	d.root_generation = 2;
+	d.formation_epoch = 3;
+	d.recovery_serial = 4;
+	d.database_incarnation = 5;
+	d.writer_boot = 6;
+	d.cohort_bitmap = 3;
+	d.origin_node_id = 1;
+	d.writer_thread = 1;
+	d.target_owner = 2;
+	d.slot_offset = 3;
+	d.wrap = 2;
+	d.segment_id = 257;
+	d.xid = 100;
+	d.terminal_outcome = committed ? TT_SLOT_COMMITTED : TT_SLOT_ABORTED;
+	d.before = record.before;
+	d.before.status = d.terminal_outcome;
+	d.before.commit_scn = committed ? 1234 : InvalidScn;
+	d.after = d.before;
+	d.after.flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+	d.graph_sha256[0] = 1;
+	d.input_sha256[0] = 2;
+	UT_ASSERT(cluster_recovery_ctrc_encode_v2(&d, d0_system, d0_payload, sizeof(d0_payload)));
+	header = (UndoSegmentHeaderData *)initial.data;
+	header->tt_slots[3] = d.before;
+	UT_ASSERT(cluster_undo_segment_header_seal(initial.data));
+	fd = open(test_file, O_RDWR);
+	UT_ASSERT(fd >= 0);
+	if (fd >= 0) {
+		UT_ASSERT_EQ(pwrite(fd, initial.data, BLCKSZ, 0), BLCKSZ);
+		UT_ASSERT_EQ(close(fd), 0);
+	}
+}
+static bool
+prepare_d0(ClusterUndoSmgrRecoveryStampV1 *stamp)
+{
+	bool ok = cluster_undo_smgr_recovery_ctrc_prepare_v2(d0_payload, sizeof(d0_payload), d0_system,
+														 stamp);
+	UT_ASSERT(ok);
+	UT_ASSERT(stamp->token != 0);
+	return ok;
+}
+static void
+replace_d0_page(void)
+{
+	int fd = open(test_file, O_RDWR);
+	UT_ASSERT(fd >= 0);
+	if (fd >= 0) {
+		UT_ASSERT_EQ(pwrite(fd, initial.data, BLCKSZ, 0), BLCKSZ);
+		UT_ASSERT_EQ(close(fd), 0);
+	}
+}
+UT_TEST(test_d0_terminal_pages_sync_exactly_on_held_fd)
+{
+	for (int committed = 0; committed < 2; committed++) {
+		ClusterUndoSmgrRecoveryStampV1 stamp;
+		PGAlignedBlock expected, actual;
+		int fd;
+		reset_d0(committed);
+		if (!prepare_d0(&stamp))
+			continue;
+		UT_ASSERT_EQ(writes, 0);
+		UT_ASSERT_EQ(syncs, 0);
+		UT_ASSERT_EQ(external_fds, 1);
+		scope_current = false;
+		opens = resolves = 0;
+		UT_ASSERT(cluster_undo_smgr_recovery_ctrc_write_v2(stamp));
+		UT_ASSERT_EQ(opens, 0);
+		UT_ASSERT_EQ(resolves, 0);
+		UT_ASSERT_EQ(writes, 1);
+		UT_ASSERT_EQ(syncs, 1);
+		memcpy(expected.data, initial.data, BLCKSZ);
+		((UndoSegmentHeaderData *)expected.data)->tt_slots[3].flags
+			= TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+		UT_ASSERT(cluster_undo_segment_header_seal(expected.data));
+		fd = open(test_file, O_RDONLY);
+		UT_ASSERT(fd >= 0);
+		if (fd >= 0) {
+			UT_ASSERT_EQ(pread(fd, actual.data, BLCKSZ, 0), BLCKSZ);
+			UT_ASSERT_EQ(memcmp(expected.data, actual.data, BLCKSZ), 0);
+			UT_ASSERT_EQ(close(fd), 0);
+		}
+		/* Same successful held attempt rechecks and syncs without rewriting. */
+		UT_ASSERT(cluster_undo_smgr_recovery_ctrc_write_v2(stamp));
+		UT_ASSERT_EQ(writes, 1);
+		UT_ASSERT_EQ(syncs, 2);
+		UT_ASSERT(cluster_undo_smgr_recovery_ctrc_close_v2(stamp));
+		UT_ASSERT_EQ(external_fds, 0);
+		UT_ASSERT(fcntl(write_fd, F_GETFD) < 0 && errno == EBADF);
+	}
+}
+UT_TEST(test_d0_prepare_requires_canonical_exact_before_outside_window)
+{
+	for (int mode = 0; mode < 15; mode++) {
+		ClusterUndoSmgrRecoveryStampV1 stamp = { .token = 99 };
+		UndoSegmentHeaderData *header;
+		uint64 system = d0_system;
+		size_t length = sizeof(d0_payload);
+		reset_d0(true);
+		header = (UndoSegmentHeaderData *)initial.data;
+		switch (mode) {
+		case 0:
+			d0_payload[20] ^= 1;
+			break;
+		case 1:
+			system++;
+			break;
+		case 2:
+			length--;
+			break;
+		case 3:
+			scope_current = false;
+			break;
+		case 4:
+			capacity = false;
+			break;
+		case 5:
+			open_error = true;
+			break;
+		case 6:
+			read_short = true;
+			break;
+		case 7:
+			stat_error = true;
+			break;
+		case 8:
+			CurrentResourceOwner = NULL;
+			break;
+		case 9:
+			CritSectionCount = 1;
+			break;
+		case 10:
+			UT_ASSERT_EQ(truncate(test_file, BLCKSZ), 0);
+			break;
+		case 11:
+			header->tt_slots[3].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+			break;
+		case 12:
+			header->wrap_count++;
+			break;
+		case 13:
+			header->tt_slots[3].commit_scn++;
+			break;
+		case 14:
+			initial.data[BLCKSZ - 1] ^= 1;
+			break;
+		}
+		if (mode >= 11 && mode <= 13)
+			UT_ASSERT(cluster_undo_segment_header_seal(initial.data));
+		if (mode >= 11)
+			replace_d0_page();
+		UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_prepare_v2(d0_payload, length, system, &stamp));
+		UT_ASSERT_EQ(stamp.token, 0);
+		UT_ASSERT_EQ(external_fds, 0);
+		UT_ASSERT_EQ(writes, 0);
+		UT_ASSERT_EQ(syncs, 0);
+	}
+	reset_d0(true);
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_prepare_v2(d0_payload, sizeof(d0_payload), d0_system,
+														  NULL));
+	UT_ASSERT_EQ(opens, 0);
+}
+UT_TEST(test_d0_and_c0_share_owner_stage_but_not_token_kind)
+{
+	ClusterUndoSmgrRecoveryStampV1 stamp, other;
+	reset_file(false);
+	if (!prepare(&stamp))
+		return;
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_write_v2(stamp));
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_close_v2(stamp));
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_prepare_v2(d0_payload, sizeof(d0_payload), d0_system,
+														  &other));
+	UT_ASSERT_EQ(other.token, 0);
+	UT_ASSERT(cluster_undo_smgr_recovery_abort_write_v1(stamp));
+	UT_ASSERT(cluster_undo_smgr_recovery_abort_close_v1(stamp));
+	reset_d0(true);
+	if (!prepare_d0(&stamp))
+		return;
+	UT_ASSERT(!cluster_undo_smgr_recovery_abort_write_v1(stamp));
+	UT_ASSERT(!cluster_undo_smgr_recovery_abort_close_v1(stamp));
+	UT_ASSERT(!cluster_undo_smgr_recovery_abort_prepare_v1(&record, &other));
+	other.token = stamp.token + 1;
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_write_v2(other));
+	CurrentResourceOwner = (ResourceOwner)&owner_storage[1];
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_write_v2(stamp));
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_close_v2(stamp));
+	release_callback(RESOURCE_RELEASE_AFTER_LOCKS, false, true, release_arg);
+	UT_ASSERT_EQ(external_fds, 1);
+	CurrentResourceOwner = (ResourceOwner)&owner_storage[0];
+	UT_ASSERT(cluster_undo_smgr_recovery_ctrc_write_v2(stamp));
+	UT_ASSERT(cluster_undo_smgr_recovery_ctrc_close_v2(stamp));
+}
+UT_TEST(test_d0_changed_target_refuses_before_writing_and_stays_failed)
+{
+	for (int mode = 0; mode < 3; mode++) {
+		ClusterUndoSmgrRecoveryStampV1 stamp;
+		reset_d0(true);
+		if (!prepare_d0(&stamp))
+			continue;
+		if (mode == 0)
+			change_byte(BLCKSZ - 1, 0x6b);
+		if (mode == 1)
+			UT_ASSERT_EQ(unlink(test_file), 0);
+		if (mode == 2)
+			UT_ASSERT_EQ(truncate(test_file, BLCKSZ), 0);
+		UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_write_v2(stamp));
+		UT_ASSERT_EQ(writes, 0);
+		UT_ASSERT_EQ(syncs, 0);
+		UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_write_v2(stamp));
+		UT_ASSERT(cluster_undo_smgr_recovery_ctrc_close_v2(stamp));
+	}
+}
+UT_TEST(test_d0_failed_io_is_sticky_and_sync_uses_native_severity)
+{
+	for (int mode = 0; mode < 6; mode++) {
+		ClusterUndoSmgrRecoveryStampV1 stamp;
+		reset_d0(false);
+		if (!prepare_d0(&stamp))
+			continue;
+		if (mode == 0)
+			read_short = true;
+		if (mode == 1)
+			write_short = true;
+		if (mode == 2 || mode == 3)
+			sync_error = true;
+		if (mode == 4)
+			corrupt_postread = true;
+		if (mode == 5)
+			stat_error = true;
+		if (sync_error) {
+			sync_retry = mode == 3;
+			catch_sync_failure = true;
+			if (setjmp(sync_failure_jump) == 0) {
+				(void)cluster_undo_smgr_recovery_ctrc_write_v2(stamp);
+				UT_ASSERT(false);
+			}
+			catch_sync_failure = false;
+			UT_ASSERT_EQ(sync_level, ERROR);
+			UT_ASSERT_EQ(report_level, sync_retry ? ERROR : PANIC);
+		} else
+			UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_write_v2(stamp));
+		UT_ASSERT(!header_locked);
+		read_short = write_short = sync_error = corrupt_postread = stat_error = false;
+		UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_write_v2(stamp));
+		UT_ASSERT(cluster_undo_smgr_recovery_ctrc_close_v2(stamp));
+		UT_ASSERT_EQ(external_fds, 0);
+	}
+}
+UT_TEST(test_d0_owner_and_exit_cleanup_only_release_descriptor)
+{
+	ClusterUndoSmgrRecoveryStampV1 stamp, fresh;
+	reset_d0(true);
+	if (!prepare_d0(&stamp))
+		return;
+	release_callback(RESOURCE_RELEASE_LOCKS, false, true, release_arg);
+	UT_ASSERT_EQ(external_fds, 1);
+	release_callback(RESOURCE_RELEASE_AFTER_LOCKS, false, true, release_arg);
+	UT_ASSERT_EQ(external_fds, 0);
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_write_v2(stamp));
+	if (!prepare_d0(&fresh))
+		return;
+	UT_ASSERT(fresh.token != stamp.token);
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_write_v2(stamp));
+	exit_callback(0, exit_arg);
+	UT_ASSERT_EQ(external_fds, 0);
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_write_v2(fresh));
+	if (!prepare_d0(&fresh))
+		return;
+	close_error = true;
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_close_v2(fresh));
+	UT_ASSERT_EQ(external_fds, 0);
+	UT_ASSERT_EQ(writes, 0);
+	UT_ASSERT_EQ(syncs, 0);
+}
+
 int
 main(void)
 {
@@ -465,7 +803,7 @@ main(void)
 		return 2;
 	snprintf(test_dir, sizeof(test_dir), "%s", dir);
 	snprintf(test_file, sizeof(test_file), "%s/seg_257.dat", dir);
-	UT_PLAN(7);
+	UT_PLAN(13);
 	UT_RUN(test_exact_durable_slot_preserves_whole_header_and_head);
 	UT_RUN(test_idempotent_still_syncs_and_reads_without_rewriting);
 	UT_RUN(test_prepare_refusals_do_not_leak_or_write);
@@ -473,6 +811,12 @@ main(void)
 	UT_RUN(test_io_refusal_never_becomes_durable_on_same_handle);
 	UT_RUN(test_owner_token_capacity_and_release);
 	UT_RUN(test_close_error_and_exit_release_do_not_publish_completion);
+	UT_RUN(test_d0_terminal_pages_sync_exactly_on_held_fd);
+	UT_RUN(test_d0_prepare_requires_canonical_exact_before_outside_window);
+	UT_RUN(test_d0_and_c0_share_owner_stage_but_not_token_kind);
+	UT_RUN(test_d0_changed_target_refuses_before_writing_and_stays_failed);
+	UT_RUN(test_d0_failed_io_is_sticky_and_sync_uses_native_severity);
+	UT_RUN(test_d0_owner_and_exit_cleanup_only_release_descriptor);
 	CurrentResourceOwner = (ResourceOwner)&owner_storage[0];
 	if (release_callback != NULL)
 		release_callback(RESOURCE_RELEASE_AFTER_LOCKS, false, true, release_arg);

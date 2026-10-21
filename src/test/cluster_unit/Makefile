@@ -9900,11 +9900,13 @@ test_cluster_ko_space.inc: $(top_srcdir)/src/backend/cluster/cluster_space_stora
 test_cluster_recovery_tt_io: test_cluster_recovery_tt_io.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
 		$(top_srcdir)/src/include/cluster/cluster_undo_smgr.h \
-		$(top_srcdir)/src/include/cluster/cluster_recovery_tt_record.h
+		$(top_srcdir)/src/include/cluster/cluster_recovery_tt_record.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h \
+		test_cluster_recovery_ctrc_record_product.o $(CLUSTER_UNIT_CRYPTOHASH_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
-		$(CLUSTER_UNDO_TEST_GC_SECTIONS) \
-		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+		test_cluster_recovery_ctrc_record_product.o $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # PGRAC: real shared stamp owner; immutable claim shape code is linked unchanged.
 test_cluster_recovery_stamp: test_cluster_recovery_stamp.c unit_test.h \

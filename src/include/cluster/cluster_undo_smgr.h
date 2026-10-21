@@ -169,6 +169,26 @@ extern bool cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoverySta
 extern bool cluster_undo_smgr_recovery_abort_close_v1(ClusterUndoSmgrRecoveryStampV1 stamp);
 
 
+#ifdef USE_PGRAC_CLUSTER
+/* Storage-only D0 adapter. Prepare canonical bytes and the exact complete
+ * native before/after pages before entering the recovery stamp window.
+ * The caller retains original graph/source/terminal/target authority and
+ * reservation, inserts and flushes WAL before write, and completes/clears
+ * its own window only after successful direct sync and exact readback.
+ * A token supplies none of those proofs. Inputs must not overlap out.
+ *
+ * Shares the single ResourceOwner stage with C0, with distinct token kinds.
+ * No live caller. Write uses only the held FD and original block0 lock;
+ * failures are sticky. D0 fsync failure uses data_sync_elevel(ERROR).
+ * Close/owner cleanup never clears the recovery duty or window. */
+extern bool cluster_undo_smgr_recovery_ctrc_prepare_v2(const uint8 *payload, size_t length,
+													   uint64 system_identifier,
+													   ClusterUndoSmgrRecoveryStampV1 *out);
+extern bool cluster_undo_smgr_recovery_ctrc_write_v2(ClusterUndoSmgrRecoveryStampV1 stamp);
+extern bool cluster_undo_smgr_recovery_ctrc_close_v2(ClusterUndoSmgrRecoveryStampV1 stamp);
+#endif
+
+
 /*
  * Redo: block zero already shows a replayed TT record's effect (or a newer
  * state), but those bytes may still be only in the page cache of a crashed
