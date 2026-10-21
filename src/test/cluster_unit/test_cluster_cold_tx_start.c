@@ -38,6 +38,7 @@ static bool clusterStartupWriterSelected, clusterStartupWriterBound;
 static bool clusterStartupWriterInstalled;
 static ClusterWalWriterToken observed_writer;
 static bool native_recovery, binding_ok, writer_ok, allocation_ok;
+static bool effects_ready;
 static uint64 owner_boot;
 static ResourceReleaseCallback release_callback;
 static unsigned callback_registrations, input_destroys, allocations, frees;
@@ -122,6 +123,12 @@ static union {
 #define census (*(ClusterColdTopTxCensusV1 *)census_storage.bytes)
 static EndOfWalRecoveryInfo info;
 
+bool
+cluster_cold_typed_effects_ready_v1(const ClusterColdTypedV1 *candidate)
+{
+	return effects_ready && candidate == &typed;
+}
+
 static void reset(void)
 {
 	if (exit_callback != NULL) exit_callback(0, (Datum)0);
@@ -142,6 +149,7 @@ static void reset(void)
 	CritSectionCount = ShutdownRequestPending = 0;
 	cluster_enabled = cluster_shared_config = true;
 	native_recovery = false;
+	effects_ready = false;
 	clusterStartupWriterSelected = clusterStartupWriterBound = true;
 	clusterStartupWriterInstalled = binding_ok = writer_ok = allocation_ok = true;
 	owner_boot = 17;
@@ -462,9 +470,20 @@ UT_TEST(test_loser_candidate_requires_proven_exact_physical_entry)
 	UT_ASSERT(!ClusterColdRecoveryTxLoserCurrent(info.cluster_tx_start, entry));
 }
 
+UT_TEST(test_effects_accessor_requires_complete_receipt_and_live_owner)
+{
+	reset(); retain();
+	UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
+	UT_ASSERT(!ClusterColdRecoveryTxEffectsCurrent(info.cluster_tx_start));
+	effects_ready = true;
+	UT_ASSERT(ClusterColdRecoveryTxEffectsCurrent(info.cluster_tx_start));
+	release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	UT_ASSERT(!ClusterColdRecoveryTxEffectsCurrent(info.cluster_tx_start));
+}
+
 int main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_original_owner_binds_complete_empty_census_after_done);
 	UT_RUN(test_native_owner_rejects_uninstalled_recovery_and_writer_drift);
 	UT_RUN(test_current_rechecks_owner_process_boot_and_exact_writer);
@@ -477,6 +496,7 @@ int main(void)
 	UT_RUN(test_subject_requires_exact_original_census_entry_and_live_start);
 	UT_RUN(test_subject_rejects_nonactive_or_conflicting_physical_identity);
 	UT_RUN(test_loser_candidate_requires_proven_exact_physical_entry);
+	UT_RUN(test_effects_accessor_requires_complete_receipt_and_live_owner);
 	reset();
 	if (allocations != frees) { fprintf(stderr, "unreleased start resources\n"); return 1; }
 	UT_DONE();

@@ -167,6 +167,14 @@ extern bool ClusterColdRecoveryTxTopProofCurrent(
 
 extern const struct ClusterColdTypedV1 *
 ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start);
+
+/* Original post-EOR owner only: require the complete sealed ordinary-effects
+ * receipt before consuming any proven physical loser.  This is a read-only
+ * input check; the restricted empty-effects proof remains a per-entry
+ * TopTxProof fact and this accessor grants no C0, TT, WAL or checkpoint
+ * authority. */
+extern bool ClusterColdRecoveryTxEffectsCurrent(
+	const struct ClusterRecoveryStartV1 *start);
 #endif
 extern void RemovePromoteSignalFiles(void);
 

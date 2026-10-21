@@ -776,6 +776,16 @@ ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start)
 }
 
 bool
+ClusterColdRecoveryTxEffectsCurrent(const struct ClusterRecoveryStartV1 *start)
+{
+	const ClusterColdTypedV1 *typed = ClusterColdRecoveryTxInputs(start);
+
+	/* The receipt is independently sealed to the original plan/result.  Do
+	 * not infer completeness from a caller bit or from a proven loser. */
+	return typed != NULL && cluster_cold_typed_effects_ready_v1(typed);
+}
+
+bool
 ClusterColdRecoveryTxSubjectCurrent(const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdTopTxCensusEntryV1 *subject, uint64 *generation, uint64 *serial)
 {

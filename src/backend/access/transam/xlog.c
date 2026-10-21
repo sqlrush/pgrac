@@ -6664,12 +6664,27 @@ cluster_cold_recovery_consume_loser_inputs_v1(
 	const struct ClusterRecoveryStartV1 *start)
 {
 	const ClusterColdTypedV1 *typed;
+	bool has_loser = false;
 
 	/* Clean/non-cold startup has no retained loser inputs to consume. */
 	if (start == NULL)
 		return true;
 	typed = ClusterColdRecoveryTxInputs(start);
 	if (typed == NULL || typed->top_tx_census == NULL)
+		return false;
+
+	for (uint32 i = 0; i < typed->top_tx_census->count; i++)
+	{
+		if (typed->top_tx_census->entries[i].loser_proven)
+		{
+			has_loser = true;
+			break;
+		}
+	}
+	/* Every physical loser consumer shares the same complete ordinary-effects
+	 * receipt.  A restricted empty-effects result is still admitted only by
+	 * its independent per-entry TopTxProof below. */
+	if (has_loser && !ClusterColdRecoveryTxEffectsCurrent(start))
 		return false;
 
 	for (uint32 i = 0; i < typed->top_tx_census->count; i++)
