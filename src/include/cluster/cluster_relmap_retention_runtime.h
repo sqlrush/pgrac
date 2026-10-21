@@ -4,6 +4,7 @@
 #ifndef CLUSTER_RELMAP_RETENTION_RUNTIME_H
 #define CLUSTER_RELMAP_RETENTION_RUNTIME_H
 
+#include "cluster/cluster_relmap_authority.h"
 #include "cluster/cluster_relmap_owner.h"
 
 /* Original shared-memory registry only. New storage is UNKNOWN for every
@@ -51,6 +52,24 @@ extern bool cluster_relmap_retention_runtime_write_pending_v2(
 extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_cancel_prepare_v2(
 	const ClusterRelmapOwnerSampleV2 *sample, const ClusterRelmapV2Namespace *identity,
 	uint64 generation);
+
+/* Dormant original producer terminal cleanup, before transaction context
+ * teardown and while its global relmap X remains held. Exact original owner
+ * provenance is rechecked even in postcommit's TRANS_COMMIT interval; capture,
+ * stage and cancel retain their original in-progress requirement. The caller still
+ * authenticates the matching original commit/abort and applies its original
+ * failure polarity, including postcommit fail-stop; these are not recovery
+ * terminal classifiers. Route only an exact already-staged runtime pin to the
+ * existing dual-copy publish/discard, then recheck owner and pin. Native owner
+ * queries and all I/O stay outside the sole retention lock. No internal retry.
+ * CLEARED_POSTREAD certifies storage cleanup in this call only, never terminal
+ * proof, COMPLETE publication or pin/native/TT/SPACE release. All pins remain,
+ * including after a clean retry; later success cannot erase an earlier I/O
+ * failure. UNKNOWN can follow partial or complete disk cleanup. No live caller. */
+extern ClusterRelmapV2ClearResult cluster_relmap_retention_runtime_publish_v2(
+	const ClusterRelmapOwnerSampleV2 *sample, const ClusterRelmapV2Image *staged);
+extern ClusterRelmapV2ClearResult cluster_relmap_retention_runtime_discard_pending_v2(
+	const ClusterRelmapOwnerSampleV2 *sample, const ClusterRelmapV2Image *staged);
 
 /* Dormant original ACTIVE-owner adapter, after actual publication and before
  * terminal/release work. Reads the current real FullXid without assignment and

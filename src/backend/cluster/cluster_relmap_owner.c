@@ -20,12 +20,12 @@
 #include "utils/relmapper.h"
 
 static bool
-relmap_owner_context(void)
+relmap_owner_context(bool require_active)
 {
 	return cluster_enabled && cluster_shared_config
 		   && cluster_node_id >= 0 && cluster_node_id < CLUSTER_MAX_NODES
 		   && MyBackendType == B_BACKEND && MyProcPid > 0 && CritSectionCount == 0
-		   && !ShutdownRequestPending && IsTransactionState()
+		   && !ShutdownRequestPending && (!require_active || IsTransactionState())
 		   && cluster_relmap_authority_x_held() && !RecoveryInProgress();
 }
 
@@ -38,7 +38,7 @@ cluster_relmap_owner_capture_v2(ClusterRelmapOwnerSampleV2 *out)
 	if (out == NULL)
 		return false;
 	memset(out, 0, sizeof(*out));
-	if (!relmap_owner_context() || LWLockHeldByMe(RelationMappingLock))
+	if (!relmap_owner_context(true) || LWLockHeldByMe(RelationMappingLock))
 		return false;
 
 	/* Assignment can wait and write transaction metadata. It must precede the
@@ -63,12 +63,12 @@ cluster_relmap_owner_capture_v2(ClusterRelmapOwnerSampleV2 *out)
 	return true;
 }
 
-bool
-cluster_relmap_owner_matches_v2(const ClusterRelmapOwnerSampleV2 *sample)
+static bool
+relmap_owner_matches_v2(const ClusterRelmapOwnerSampleV2 *sample, bool require_active)
 {
 	FullTransactionId top;
 
-	if (sample == NULL || !relmap_owner_context()
+	if (sample == NULL || !relmap_owner_context(require_active)
 		|| sample->producer_pid != MyProcPid || sample->owner.node != cluster_node_id
 		|| sample->owner.wal_end != InvalidXLogRecPtr || sample->writer.startup_first_lsn != 0)
 		return false;
@@ -88,6 +88,20 @@ cluster_relmap_owner_matches_v2(const ClusterRelmapOwnerSampleV2 *sample)
 		|| sample->writer.ref.timeline != GetWALInsertionTimeLine())
 		return false;
 	return cluster_wal_writer_check(&sample->writer) == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+bool
+cluster_relmap_owner_matches_v2(const ClusterRelmapOwnerSampleV2 *sample)
+{
+	return relmap_owner_matches_v2(sample, true);
+}
+
+bool
+cluster_relmap_owner_terminal_matches_v2(const ClusterRelmapOwnerSampleV2 *sample)
+{
+	/* Original postcommit publish is TRANS_COMMIT, with its top FullXid still
+	 * retained. This rechecks provenance, never selects commit/abort polarity. */
+	return relmap_owner_matches_v2(sample, false);
 }
 
 bool

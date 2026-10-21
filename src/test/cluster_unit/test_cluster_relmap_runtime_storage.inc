@@ -36,6 +36,7 @@ static void *runtime_storage_allocation;
 static const ClusterShmemRegion *runtime_storage_region;
 static ClusterWalWriterToken runtime_storage_writer;
 static uint64 runtime_storage_full_xid;
+static bool runtime_storage_in_progress;
 static unsigned runtime_storage_assignments, runtime_storage_binding_reads;
 
 static void
@@ -66,7 +67,7 @@ bool
 IsTransactionState(void)
 {
 	runtime_storage_owner_read();
-	return true;
+	return runtime_storage_in_progress;
 }
 
 bool
@@ -190,6 +191,7 @@ runtime_storage_setup(ClusterRelmapOwnerSampleV2 *sample,
 	relmap_runtime_shmem = NULL;
 	cluster_node_id = origin;
 	runtime_storage_full_xid = owner.top_full_xid;
+	runtime_storage_in_progress = true;
 	runtime_storage_assignments = runtime_storage_binding_reads = 0;
 	memset(&runtime_storage_writer, 0, sizeof(runtime_storage_writer));
 	runtime_storage_writer.ref.timeline = 1;
@@ -429,32 +431,333 @@ UT_TEST(test_runtime_storage_final_native_drift_keeps_pending_and_pin)
 		CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
 }
 
+static ClusterRelmapV2Image
+runtime_storage_staged_image(const ClusterRelmapOwnerSampleV2 *sample,
+	const ClusterRelmapV2Namespace *ns)
+{
+	ClusterRelmapV2Image staged = { 0 };
+
+	staged.identity = *ns;
+	staged.committed_generation = 7;
+	staged.pending_generation = 8;
+	staged.pending_owner = sample->owner;
+	staged.pending_owner.wal_end = owner.wal_end;
+	staged.committed = map_image(40000);
+	staged.pending = map_image(40001);
+	return staged;
+}
+
+static ClusterRelmapV2ClearResult
+runtime_storage_finish(const ClusterRelmapOwnerSampleV2 *sample,
+	const ClusterRelmapV2Image *staged, bool publish)
+{
+	return publish ? cluster_relmap_retention_runtime_publish_v2(sample, staged)
+		: cluster_relmap_retention_runtime_discard_pending_v2(sample, staged);
+}
+
+static void
+runtime_storage_reset_terminal_io(bool publish)
+{
+	reset_io();
+	relmap_x_held = true;
+	/* Original publish follows TRANS_COMMIT; abort discard precedes
+	 * TRANS_ABORT. Both still retain the original top FullXid here. */
+	runtime_storage_in_progress = !publish;
+}
+
 UT_TEST(test_runtime_storage_clear_pair_keeps_shared_pin)
 {
+	for (unsigned origin = 0; origin < CLUSTER_MAX_NODES; origin += CLUSTER_MAX_NODES - 1)
+		for (unsigned shared = 0; shared < 2; shared++)
+			for (unsigned publish = 0; publish < 2; publish++) {
+		ClusterRelmapOwnerSampleV2 sample, sample_before;
+		ClusterRelmapV2Namespace ns;
+		ClusterRelmapV2Image staged, staged_before;
+		ClusterRelmapV2View view;
+		ClusterRelmapRetentionPin pin;
+		unsigned char a[2176], b[2176];
+
+		runtime_storage_setup(&sample, &ns, origin, shared);
+		UT_ASSERT(runtime_storage_stage(&sample, &ns));
+		staged = staged_before = runtime_storage_staged_image(&sample, &ns);
+		sample_before = sample;
+		pin = stage_directory->pins[0];
+		runtime_storage_reset_terminal_io(publish);
+		UT_ASSERT_EQ(runtime_storage_finish(&sample, &staged, publish), CLUSTER_RELMAP_V2_CLEARED_POSTREAD);
+		UT_ASSERT_EQ(writes, 2);
+		UT_ASSERT_EQ(renames, 2);
+		UT_ASSERT_EQ(file_syncs, 2);
+		UT_ASSERT_EQ(dir_syncs, 2);
+		UT_ASSERT(reads >= 4);
+		UT_ASSERT_EQ(io_under_retention_lock, 0);
+		UT_ASSERT_EQ(retention_acquires, retention_releases);
+		UT_ASSERT(!retention_held);
+		UT_ASSERT_EQ(runtime_storage_assignments, 1);
+		UT_ASSERT_EQ(runtime_storage_binding_reads, 1);
+		UT_ASSERT_EQ(memcmp(&pin, &stage_directory->pins[0], sizeof(pin)), 0);
+		UT_ASSERT_EQ(memcmp(&sample, &sample_before, sizeof(sample)), 0);
+		UT_ASSERT_EQ(memcmp(&staged, &staged_before, sizeof(staged)), 0);
+		UT_ASSERT_EQ(cluster_relmap_authority_v2_read(&ns, &view), CLUSTER_RELMAP_V2_PAIR_VALID);
+		UT_ASSERT(!view.has_pending && view.pending_complete);
+		UT_ASSERT_EQ(view.committed_generation, publish ? 8 : 7);
+		UT_ASSERT_EQ(view.committed.mappings[0].mapfilenumber, publish ? 40001 : 40000);
+		read_copy(0, a);
+		read_copy(1, b);
+		UT_ASSERT_EQ(memcmp(a, b, sizeof(a)), 0);
+		/* Original matching commit/abort qualification remains outside this
+		 * fixture. Durable clean storage does not release native/TT/SPACE. */
+		runtime_storage_assert_pin(&sample, &ns, true);
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_cancel_prepare_v2(&sample, &ns, 8),
+			publish ? CLUSTER_RELMAP_RETENTION_UNAVAILABLE : CLUSTER_RELMAP_RETENTION_RETAINED);
+	}
+}
+
+UT_TEST(test_runtime_storage_terminal_preserves_active_boundary_and_teardown_refusal)
+{
 	for (unsigned publish = 0; publish < 2; publish++) {
+		ClusterRelmapOwnerSampleV2 sample, rejected, zero = { 0 };
+		ClusterRelmapV2Namespace ns;
+		ClusterRelmapV2Image staged;
+		ClusterRelmapRetentionPin pin;
+		RelMapFile map = map_image(40001);
+
+		runtime_storage_setup(&sample, &ns, 0, true);
+		UT_ASSERT(runtime_storage_stage(&sample, &ns));
+		staged = runtime_storage_staged_image(&sample, &ns);
+		pin = stage_directory->pins[0];
+		runtime_storage_reset_terminal_io(publish);
+		UT_ASSERT_EQ(cluster_relmap_owner_matches_v2(&sample), !publish);
+		if (publish) {
+			memset(&rejected, 0xa5, sizeof(rejected));
+			UT_ASSERT(!cluster_relmap_owner_capture_v2(&rejected));
+			UT_ASSERT_EQ(memcmp(&rejected, &zero, sizeof(zero)), 0);
+			UT_ASSERT(!cluster_relmap_retention_runtime_write_pending_v2(
+				&sample, &ns, 8, owner.wal_end, &map));
+			UT_ASSERT_EQ(cluster_relmap_retention_runtime_cancel_prepare_v2(&sample, &ns, 8),
+				CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+		}
+		/* Later transaction teardown clears XactTopFullTransactionId. A
+		 * retained sample is no longer original-producer authority. */
+		runtime_storage_full_xid = 0;
+		UT_ASSERT_EQ(runtime_storage_finish(&sample, &staged, publish), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+		UT_ASSERT_EQ(reads, 0);
+		UT_ASSERT_EQ(writes, 0);
+		UT_ASSERT_EQ(runtime_storage_assignments, 1);
+		UT_ASSERT_EQ(runtime_storage_binding_reads, 1);
+		UT_ASSERT_EQ(memcmp(&pin, &stage_directory->pins[0], sizeof(pin)), 0);
+		UT_ASSERT_EQ(retention_acquires, retention_releases);
+	}
+}
+
+UT_TEST(test_runtime_storage_terminal_requires_exact_staged_pin)
+{
+	for (unsigned publish = 0; publish < 2; publish++)
+		for (unsigned fault = 0; fault < 16; fault++) {
 		ClusterRelmapOwnerSampleV2 sample;
 		ClusterRelmapV2Namespace ns;
-		ClusterRelmapV2Image staged = { 0 };
+		ClusterRelmapV2Image staged;
+		ClusterRelmapRetentionPin pin;
+		unsigned char before[2][2176], after[2176];
+
+		runtime_storage_setup(&sample, &ns, 127, true);
+		if (fault != 0)
+			UT_ASSERT(runtime_storage_stage(&sample, &ns));
+		staged = runtime_storage_staged_image(&sample, &ns);
+		runtime_storage_reset_terminal_io(publish);
+		LWLockAcquire(stage_lock, LW_EXCLUSIVE);
+		switch (fault) {
+		case 0: break; /* A preparation is never a staged receipt. */
+		case 1: stage_directory->pins[0].occupied = false; break;
+		case 2: stage_directory->pins[0].wal_end++; break;
+		case 3: stage_directory->pins[0].key.generation++; break;
+		case 4: stage_directory->pins[0].key.top_full_xid += UINT64CONST(0x100000000); break;
+		case 5: stage_directory->pins[0].key.membership_epoch++; break;
+		case 6: stage_directory->pins[0].key.admitted_incarnation++; break;
+		case 7: stage_directory->pins[0].key.boot_incarnation++; break;
+		case 8: stage_directory->pins[0].key.identity.shared = false;
+			stage_directory->pins[0].key.identity.dbid = MyDatabaseId; break;
+		case 9: stage_directory->pins[0].key.identity.system_identifier++; break;
+		case 10: stage_directory->pins[0].key.identity.database_incarnation++; break;
+		case 11: stage_directory->pins[0].key.origin = 0; break;
+		case 12: stage_directory->state = CLUSTER_RELMAP_RETENTION_UNKNOWN; break;
+		case 13: stage_directory->state = CLUSTER_RELMAP_RETENTION_BUILDING; break;
+		case 14: stage_directory->origin = 0; break;
+		case 15: break; /* Caller-held lock must not be released by refusal. */
+		}
+		if (fault != 15)
+			LWLockRelease(stage_lock);
+		pin = stage_directory->pins[0];
+		read_copy(0, before[0]);
+		read_copy(1, before[1]);
+		UT_ASSERT_EQ(runtime_storage_finish(&sample, &staged, publish), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+		if (fault == 15) {
+			UT_ASSERT(retention_held && held_retention_lock == stage_lock);
+			LWLockRelease(stage_lock);
+		}
+		UT_ASSERT_EQ(reads, 0);
+		UT_ASSERT_EQ(writes, 0);
+		UT_ASSERT_EQ(retention_acquires, retention_releases);
+		UT_ASSERT_EQ(io_under_retention_lock, 0);
+		UT_ASSERT_EQ(memcmp(&pin, &stage_directory->pins[0], sizeof(pin)), 0);
+		for (unsigned copy = 0; copy < 2; copy++) {
+			read_copy(copy, after);
+			UT_ASSERT_EQ(memcmp(before[copy], after, sizeof(after)), 0);
+		}
+	}
+}
+
+UT_TEST(test_runtime_storage_terminal_rechecks_original_image_and_owner)
+{
+	for (unsigned publish = 0; publish < 2; publish++)
+		for (unsigned fault = 0; fault < 20; fault++) {
+		ClusterRelmapOwnerSampleV2 sample, sample_before;
+		ClusterRelmapV2Namespace ns;
+		ClusterRelmapV2Image staged, staged_before;
+		ClusterRelmapRetentionPin pin;
+		RelmapRetentionRuntimeShmem *runtime;
+		unsigned char before[2][2176], after[2176];
+
+		runtime_storage_setup(&sample, &ns, 0, false);
+		UT_ASSERT(runtime_storage_stage(&sample, &ns));
+		staged = runtime_storage_staged_image(&sample, &ns);
+		runtime = relmap_runtime_shmem;
+		runtime_storage_reset_terminal_io(publish);
+		switch (fault) {
+		case 0: break; /* NULL sample below. */
+		case 1: break; /* NULL staged image below. */
+		case 2: sample.producer_pid++; break;
+		case 3: sample.owner.wal_end = owner.wal_end; break;
+		case 4: sample.owner.top_full_xid += UINT64CONST(0x100000000); break;
+		case 5: staged.pending_owner.node++; break;
+		case 6: staged.pending_owner.top_full_xid += UINT64CONST(0x100000000); break;
+		case 7: staged.pending_owner.membership_epoch++; break;
+		case 8: staged.pending_owner.admitted_incarnation++; break;
+		case 9: staged.pending_owner.boot_incarnation++; break;
+		case 10: staged.pending_owner.wal_end++; break;
+		case 11: staged.identity.shared = true; staged.identity.dbid = InvalidOid; break;
+		case 12: staged.pending_generation++; break;
+		case 13: staged.pending_generation = 0; break;
+		case 14: staged.pending.magic = 0; break;
+		case 15: runtime_storage_writer.epoch++; break;
+		case 16: relmap_x_held = false; break;
+		case 17: CritSectionCount = 1; break;
+		case 18: relmap_runtime_shmem = NULL; break;
+		case 19: enableFsync = false; break;
+		}
+		sample_before = sample;
+		staged_before = staged;
+		pin = stage_directory->pins[0];
+		read_copy(0, before[0]);
+		read_copy(1, before[1]);
+		UT_ASSERT_EQ(runtime_storage_finish(fault == 0 ? NULL : &sample,
+			fault == 1 ? NULL : &staged, publish), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+		relmap_runtime_shmem = runtime;
+		CritSectionCount = 0;
+		enableFsync = true;
+		UT_ASSERT_EQ(reads, 0);
+		UT_ASSERT_EQ(writes, 0);
+		UT_ASSERT_EQ(io_under_retention_lock, 0);
+		UT_ASSERT_EQ(retention_acquires, retention_releases);
+		UT_ASSERT_EQ(memcmp(&pin, &stage_directory->pins[0], sizeof(pin)), 0);
+		UT_ASSERT_EQ(memcmp(&sample, &sample_before, sizeof(sample)), 0);
+		UT_ASSERT_EQ(memcmp(&staged, &staged_before, sizeof(staged)), 0);
+		for (unsigned copy = 0; copy < 2; copy++) {
+			read_copy(copy, after);
+			UT_ASSERT_EQ(memcmp(before[copy], after, sizeof(after)), 0);
+		}
+	}
+}
+
+static void
+runtime_storage_invalidate_after_last_sync(bool is_directory)
+{
+	if (is_directory && dir_syncs == 2) {
+		LWLockAcquire(stage_lock, LW_EXCLUSIVE);
+		cluster_relmap_retention_invalidate(stage_directory);
+		LWLockRelease(stage_lock);
+	}
+}
+
+static void
+runtime_storage_teardown_after_last_sync(bool is_directory)
+{
+	if (is_directory && dir_syncs == 2)
+		runtime_storage_full_xid = 0;
+}
+
+UT_TEST(test_runtime_storage_terminal_final_drift_retains_obligation)
+{
+	for (unsigned publish = 0; publish < 2; publish++)
+		for (unsigned drift = 0; drift < 3; drift++) {
+		ClusterRelmapOwnerSampleV2 sample;
+		ClusterRelmapV2Namespace ns;
+		ClusterRelmapV2Image staged;
+		ClusterRelmapRetentionPin pin;
 		ClusterRelmapV2View view;
 
 		runtime_storage_setup(&sample, &ns, 127, false);
 		UT_ASSERT(runtime_storage_stage(&sample, &ns));
-		staged.identity = ns;
-		staged.committed_generation = 7;
-		staged.pending_generation = 8;
-		staged.pending_owner = sample.owner;
-		staged.pending_owner.wal_end = owner.wal_end;
-		staged.committed = map_image(40000);
-		staged.pending = map_image(40001);
-		UT_ASSERT_EQ(publish ? cluster_relmap_authority_v2_publish(&staged)
-			: cluster_relmap_authority_v2_discard_pending(&staged), CLUSTER_RELMAP_V2_CLEARED_POSTREAD);
+		staged = runtime_storage_staged_image(&sample, &ns);
+		pin = stage_directory->pins[0];
+		runtime_storage_reset_terminal_io(publish);
+		post_sync_hook = drift == 2 ? runtime_storage_teardown_after_last_sync
+			: drift == 1 ? runtime_storage_invalidate_after_last_sync
+			: runtime_storage_drift_after_last_sync;
+		UT_ASSERT_EQ(runtime_storage_finish(&sample, &staged, publish), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+		UT_ASSERT_EQ(writes, 2);
+		UT_ASSERT_EQ(dir_syncs, 2);
+		UT_ASSERT_EQ(io_under_retention_lock, 0);
+		UT_ASSERT_EQ(retention_acquires, retention_releases);
+		UT_ASSERT_EQ(memcmp(&pin, &stage_directory->pins[0], sizeof(pin)), 0);
+		UT_ASSERT_EQ(stage_directory->state, drift == 1 ? CLUSTER_RELMAP_RETENTION_UNKNOWN
+			: CLUSTER_RELMAP_RETENTION_COMPLETE);
 		UT_ASSERT_EQ(cluster_relmap_authority_v2_read(&ns, &view), CLUSTER_RELMAP_V2_PAIR_VALID);
 		UT_ASSERT(!view.has_pending && view.pending_complete);
 		UT_ASSERT_EQ(view.committed_generation, publish ? 8 : 7);
-		/* Caller terminal proof is outside this fixture. Even a durable clean
-		 * pair alone cannot authorize the separate retention/native/TT release. */
+		post_sync_hook = NULL;
+		reads = writes = 0;
+		UT_ASSERT_EQ(runtime_storage_finish(&sample, &staged, publish), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+		UT_ASSERT_EQ(reads, 0);
+		UT_ASSERT_EQ(writes, 0);
+	}
+}
+
+UT_TEST(test_runtime_storage_terminal_io_failure_and_explicit_retry)
+{
+	for (unsigned publish = 0; publish < 2; publish++)
+		for (unsigned fault = 0; fault < 5; fault++) {
+		ClusterRelmapOwnerSampleV2 sample;
+		ClusterRelmapV2Namespace ns;
+		ClusterRelmapV2Image staged;
+		ClusterRelmapRetentionPin pin;
+		ClusterRelmapV2ClearResult failed;
+
+		runtime_storage_setup(&sample, &ns, 0, true);
+		UT_ASSERT(runtime_storage_stage(&sample, &ns));
+		staged = runtime_storage_staged_image(&sample, &ns);
+		pin = stage_directory->pins[0];
+		runtime_storage_reset_terminal_io(publish);
+		switch (fault) {
+		case 0: fail_write = 1; break;
+		case 1: fail_rename = 2; break;
+		case 2: fail_file_sync = 2; break;
+		case 3: fail_dir_sync = 2; break;
+		case 4: fail_directory_close = true; break;
+		}
+		failed = runtime_storage_finish(&sample, &staged, publish);
+		UT_ASSERT_EQ(failed, CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+		UT_ASSERT(writes <= 2 && renames <= 2 && file_syncs <= 2 && dir_syncs <= 2);
+		UT_ASSERT_EQ(io_under_retention_lock, 0);
+		UT_ASSERT_EQ(retention_acquires, retention_releases);
+		UT_ASSERT_EQ(memcmp(&pin, &stage_directory->pins[0], sizeof(pin)), 0);
+		runtime_storage_reset_terminal_io(publish);
+		/* An explicit new attempt may finish a legal interrupted pair. It
+		 * does not erase the original owner's failed operation/polarity. */
+		UT_ASSERT_EQ(runtime_storage_finish(&sample, &staged, publish), CLUSTER_RELMAP_V2_CLEARED_POSTREAD);
+		UT_ASSERT_EQ(failed, CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+		UT_ASSERT_EQ(writes, 2);
+		UT_ASSERT_EQ(dir_syncs, 2);
+		UT_ASSERT_EQ(memcmp(&pin, &stage_directory->pins[0], sizeof(pin)), 0);
 		runtime_storage_assert_pin(&sample, &ns, true);
-		UT_ASSERT_EQ(cluster_relmap_retention_runtime_cancel_prepare_v2(&sample, &ns, 8),
-			CLUSTER_RELMAP_RETENTION_RETAINED);
 	}
 }

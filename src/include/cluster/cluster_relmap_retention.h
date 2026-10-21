@@ -128,6 +128,12 @@ extern ClusterRelmapRetentionResult cluster_relmap_retention_tt_release_check(
 extern ClusterRelmapRetentionResult cluster_relmap_retention_stage_start(
 	ClusterRelmapRetentionDirectory *directory, const ClusterRelmapRetentionKey *key,
 	uint64 wal_end);
+/* Read-only exact staged obligation check under the same caller-held lock.
+ * Unlike stage_start, this cannot turn an unstaged preparation into a stage.
+ * OK grants no terminal classification, cleanup or pin release by itself. */
+extern ClusterRelmapRetentionResult cluster_relmap_retention_stage_check(
+	const ClusterRelmapRetentionDirectory *directory, const ClusterRelmapRetentionKey *key,
+	uint64 wal_end);
 extern ClusterRelmapRetentionResult cluster_relmap_retention_cancel_prepare(
 	ClusterRelmapRetentionDirectory *directory, const ClusterRelmapRetentionKey *key);
 /* cancel_prepare removes only the unstaged relmap edge. It neither cancels nor

@@ -28,10 +28,18 @@ typedef struct ClusterRelmapOwnerSampleV2 {
  * metadata. Refusal clears out; no relmap stage or retention permission. */
 extern bool cluster_relmap_owner_capture_v2(ClusterRelmapOwnerSampleV2 *out);
 
-/* No XID assignment, adoption of a newer writer, IO or wait. The same backend
+/* While the original transaction is in progress: no XID assignment, adoption
+ * of a newer writer, IO or wait. The same backend
  * keeps the global X lock; RelationMappingLock may now be held. This rechecks
  * provenance only, never proves retention, WAL durability, stage or release. */
 extern bool cluster_relmap_owner_matches_v2(const ClusterRelmapOwnerSampleV2 *sample);
+
+/* Dormant original terminal caller only, before top FullXid teardown. Same
+ * exact backend, FullXid, native writer and global X checks, including during
+ * postcommit when IsTransactionState is false. No assignment, terminal
+ * classification or commit/abort proof: the caller supplies its original
+ * polarity and failure handling. Never use this for capture or stage. */
+extern bool cluster_relmap_owner_terminal_matches_v2(const ClusterRelmapOwnerSampleV2 *sample);
 
 /* Read-only, provisional match of a decoded pending image to the original
  * selected source's current native RELMAP UPDATE. The retained visitor must

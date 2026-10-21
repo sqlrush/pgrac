@@ -117,13 +117,15 @@ cluster_relmap_retention_runtime_begin_v2(const ClusterRelmapOwnerSampleV2 *samp
 
 static ClusterRelmapRetentionResult
 relmap_runtime_producer_key(const ClusterRelmapOwnerSampleV2 *sample,
-	const ClusterRelmapV2Namespace *identity, uint64 generation, ClusterRelmapRetentionKey *key)
+	const ClusterRelmapV2Namespace *identity, uint64 generation, bool terminal,
+	ClusterRelmapRetentionKey *key)
 {
 	if (sample == NULL || identity == NULL || generation == 0
 		|| sample->owner.node >= CLUSTER_MAX_NODES)
 		return CLUSTER_RELMAP_RETENTION_INVALID;
 	if (relmap_runtime_shmem == NULL || LWLockHeldByMe(&relmap_runtime_shmem->lock)
-		|| !cluster_relmap_owner_matches_v2(sample))
+		|| !(terminal ? cluster_relmap_owner_terminal_matches_v2(sample)
+			: cluster_relmap_owner_matches_v2(sample)))
 		return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
 	if (identity->system_identifier != sample->writer.ref.claim.identity.system_identifier
 		|| identity->database_incarnation != sample->writer.ref.claim.database_incarnation
@@ -166,7 +168,7 @@ cluster_relmap_retention_runtime_write_pending_v2(const ClusterRelmapOwnerSample
 	ClusterRelmapRetentionResult result;
 
 	if (pending == NULL || wal_end == InvalidXLogRecPtr
-		|| relmap_runtime_producer_key(sample, identity, generation, &key) != CLUSTER_RELMAP_RETENTION_OK)
+		|| relmap_runtime_producer_key(sample, identity, generation, false, &key) != CLUSTER_RELMAP_RETENTION_OK)
 		return false;
 	directory = &relmap_runtime_shmem->directories[key.origin];
 	LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
@@ -190,7 +192,7 @@ cluster_relmap_retention_runtime_cancel_prepare_v2(const ClusterRelmapOwnerSampl
 	ClusterRelmapRetentionDirectory *directory;
 	ClusterRelmapRetentionResult result;
 
-	result = relmap_runtime_producer_key(sample, identity, generation, &key);
+	result = relmap_runtime_producer_key(sample, identity, generation, false, &key);
 	if (result != CLUSTER_RELMAP_RETENTION_OK)
 		return result;
 	directory = &relmap_runtime_shmem->directories[key.origin];
@@ -200,6 +202,67 @@ cluster_relmap_retention_runtime_cancel_prepare_v2(const ClusterRelmapOwnerSampl
 		result = cluster_relmap_retention_cancel_prepare(directory, &key);
 	LWLockRelease(&relmap_runtime_shmem->lock);
 	return result;
+}
+
+/* The original producer supplies terminal polarity. This routes storage
+ * cleanup only; a staged obligation survives success, refusal and ERROR. */
+static ClusterRelmapV2ClearResult
+relmap_runtime_finish_v2(const ClusterRelmapOwnerSampleV2 *sample,
+	const ClusterRelmapV2Image *staged, bool publish)
+{
+	ClusterRelmapRetentionKey key = { 0 };
+	ClusterRelmapRetentionDirectory *directory;
+	ClusterRelmapRetentionResult result;
+	ClusterRelmapV2ClearResult cleared;
+
+	if (staged == NULL || staged->pending_owner.wal_end == InvalidXLogRecPtr
+		|| relmap_runtime_producer_key(sample, &staged->identity,
+			staged->pending_generation, true, &key) != CLUSTER_RELMAP_RETENTION_OK)
+		return CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+	if (staged->pending_owner.node != sample->owner.node
+		|| staged->pending_owner.top_full_xid != sample->owner.top_full_xid
+		|| staged->pending_owner.membership_epoch != sample->owner.membership_epoch
+		|| staged->pending_owner.admitted_incarnation != sample->owner.admitted_incarnation
+		|| staged->pending_owner.boot_incarnation != sample->owner.boot_incarnation)
+		return CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+	directory = &relmap_runtime_shmem->directories[key.origin];
+	LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
+	result = relmap_runtime_directory_matches(directory, &key);
+	if (result == CLUSTER_RELMAP_RETENTION_OK)
+		result = cluster_relmap_retention_stage_check(directory, &key, staged->pending_owner.wal_end);
+	LWLockRelease(&relmap_runtime_shmem->lock);
+	if (result != CLUSTER_RELMAP_RETENTION_OK)
+		return CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+
+	/* Existing storage validates the full image, writes/syncs BOTH copies and
+	 * reads back this call's result, even for a clean retry. Never hold the
+	 * retention lock across that I/O or the original native owner recheck. */
+	cleared = publish ? cluster_relmap_authority_v2_publish(staged)
+		: cluster_relmap_authority_v2_discard_pending(staged);
+	if (cleared != CLUSTER_RELMAP_V2_CLEARED_POSTREAD
+		|| !cluster_relmap_owner_terminal_matches_v2(sample))
+		return CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+	LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
+	result = relmap_runtime_directory_matches(directory, &key);
+	if (result == CLUSTER_RELMAP_RETENTION_OK)
+		result = cluster_relmap_retention_stage_check(directory, &key, staged->pending_owner.wal_end);
+	LWLockRelease(&relmap_runtime_shmem->lock);
+	return result == CLUSTER_RELMAP_RETENTION_OK ? CLUSTER_RELMAP_V2_CLEARED_POSTREAD
+		: CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+}
+
+ClusterRelmapV2ClearResult
+cluster_relmap_retention_runtime_publish_v2(const ClusterRelmapOwnerSampleV2 *sample,
+	const ClusterRelmapV2Image *staged)
+{
+	return relmap_runtime_finish_v2(sample, staged, true);
+}
+
+ClusterRelmapV2ClearResult
+cluster_relmap_retention_runtime_discard_pending_v2(const ClusterRelmapOwnerSampleV2 *sample,
+	const ClusterRelmapV2Image *staged)
+{
+	return relmap_runtime_finish_v2(sample, staged, false);
 }
 
 static bool

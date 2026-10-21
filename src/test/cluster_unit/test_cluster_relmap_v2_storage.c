@@ -2245,7 +2245,7 @@ UT_TEST(test_changed_wal_cannot_rebind_staged_pin)
 int
 main(void)
 {
-	UT_PLAN(68);
+	UT_PLAN(73);
 	UT_RUN(test_stage_both_copies_before_success);
 	UT_RUN(test_committed_reader_hides_pending_and_rejects_degraded_pair);
 	UT_RUN(test_committed_reader_requires_namespace_x_lock);
@@ -2314,6 +2314,11 @@ main(void)
 	UT_RUN(test_runtime_storage_preflight_cancel_and_invalidate);
 	UT_RUN(test_runtime_storage_final_native_drift_keeps_pending_and_pin);
 	UT_RUN(test_runtime_storage_clear_pair_keeps_shared_pin);
+	UT_RUN(test_runtime_storage_terminal_preserves_active_boundary_and_teardown_refusal);
+	UT_RUN(test_runtime_storage_terminal_requires_exact_staged_pin);
+	UT_RUN(test_runtime_storage_terminal_rechecks_original_image_and_owner);
+	UT_RUN(test_runtime_storage_terminal_final_drift_retains_obligation);
+	UT_RUN(test_runtime_storage_terminal_io_failure_and_explicit_retry);
 	cleanup();
 	free(runtime_storage_allocation);
 	UT_DONE();

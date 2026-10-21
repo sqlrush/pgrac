@@ -354,6 +354,26 @@ cluster_relmap_retention_stage_start(ClusterRelmapRetentionDirectory *directory,
 }
 
 ClusterRelmapRetentionResult
+cluster_relmap_retention_stage_check(const ClusterRelmapRetentionDirectory *directory,
+	const ClusterRelmapRetentionKey *key, uint64 wal_end)
+{
+	int i;
+
+	if (directory == NULL || directory->state != CLUSTER_RELMAP_RETENTION_COMPLETE)
+		return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
+	if (key == NULL || wal_end == 0)
+		return CLUSTER_RELMAP_RETENTION_INVALID;
+	for (i = 0; i < CLUSTER_RELMAP_RETENTION_CAPACITY; i++) {
+		const ClusterRelmapRetentionPin *pin = &directory->pins[i];
+
+		if (pin->occupied && same_key(&pin->key, key))
+			return pin->may_be_staged && pin->wal_end == wal_end
+				? CLUSTER_RELMAP_RETENTION_OK : CLUSTER_RELMAP_RETENTION_CONFLICT;
+	}
+	return CLUSTER_RELMAP_RETENTION_CONFLICT;
+}
+
+ClusterRelmapRetentionResult
 cluster_relmap_retention_cancel_prepare(ClusterRelmapRetentionDirectory *directory,
 	const ClusterRelmapRetentionKey *key)
 {
