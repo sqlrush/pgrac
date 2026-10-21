@@ -20,8 +20,8 @@ static bool replay_checkpoint_ok, replay_decode_ok, replay_drain_ok;
 static bool replay_decode_foreign;
 static unsigned replay_drain_calls;
 static uint8 replay_fence;
-static unsigned replay_barrier_calls, replay_endpoint_calls;
-static bool replay_endpoint_ok, replay_barrier_ok;
+static unsigned replay_barrier_calls, replay_readback_calls, replay_endpoint_calls;
+static bool replay_endpoint_ok, replay_readback_ok, replay_barrier_ok;
 static unsigned replay_effects_calls;
 
 /* The original publish function must stop before handing off any failed cut. */
@@ -173,6 +173,16 @@ cluster_cold_durable_barrier_v1(const ClusterColdTouchedV1 *touched)
 }
 
 bool
+cluster_cold_data_readback_v1(ClusterColdTypedV1 *typed)
+{
+	UT_ASSERT(typed == &replay_typed);
+	UT_ASSERT_EQ(replay_barrier_calls, 1);
+	replay_event('R');
+	replay_readback_calls++;
+	return replay_readback_ok;
+}
+
+bool
 cluster_cold_typed_xid_endpoints_v1(ClusterColdTypedV1 *typed,
 									struct ClusterRecoveryFencePlan *fence,
 									const ClusterColdReplayResultV1 *result,
@@ -182,6 +192,7 @@ cluster_cold_typed_xid_endpoints_v1(ClusterColdTypedV1 *typed,
 	UT_ASSERT(fence == (struct ClusterRecoveryFencePlan *)&replay_fence);
 	UT_ASSERT(result != NULL && progress != NULL);
 	UT_ASSERT_EQ(replay_barrier_calls, 1);
+	UT_ASSERT_EQ(replay_readback_calls, 1);
 	replay_event('X');
 	replay_endpoint_calls++;
 	return replay_endpoint_ok;
@@ -318,12 +329,12 @@ replay_xid_reset(int count)
 	replay_checkpoint_ok = replay_decode_ok = replay_drain_ok = true;
 	replay_drain_calls = 0;
 
-	replay_barrier_calls = replay_endpoint_calls = 0;
+	replay_barrier_calls = replay_readback_calls = replay_endpoint_calls = 0;
 	replay_effects_calls = 0;
 	replay_ready_calls = replay_complete_calls = replay_external_calls = 0;
 	replay_fatal_calls = replay_log_calls = 0;
 	replay_error_level = replay_sqlstate = 0;
-	replay_ready_ok = replay_barrier_ok = replay_endpoint_ok = true;
+	replay_ready_ok = replay_barrier_ok = replay_readback_ok = replay_endpoint_ok = true;
 	replay_fatal_armed = false;
 	replay_complete_result = CLUSTER_RECOVERY_FENCE_COMPLETE_OK;
 	replay_event_count = 0;
@@ -463,17 +474,20 @@ UT_TEST(test_replay_xid_bad_checkpoint_or_source)
 UT_TEST(test_replay_endpoints_follow_durability_and_propagate_refusal)
 {
 	for (int barrier_ok = 0; barrier_ok <= 1; barrier_ok++)
-		for (int endpoint_ok = 0; endpoint_ok <= 1; endpoint_ok++) {
-			ClusterColdReplayResultV1 result = { 0 };
-			replay_xid_reset(1);
-			replay_barrier_calls = replay_endpoint_calls = 0;
-			replay_barrier_ok = barrier_ok;
-			replay_endpoint_ok = endpoint_ok;
-			UT_ASSERT_EQ(cluster_typed_replay_durable_endpoints(&replay_adapter, &result),
-						 barrier_ok && endpoint_ok);
-			UT_ASSERT_EQ(replay_barrier_calls, 1);
-			UT_ASSERT_EQ(replay_endpoint_calls, barrier_ok);
-		}
+		for (int readback_ok = 0; readback_ok <= 1; readback_ok++)
+			for (int endpoint_ok = 0; endpoint_ok <= 1; endpoint_ok++) {
+				ClusterColdReplayResultV1 result = { 0 };
+				replay_xid_reset(1);
+				replay_barrier_calls = replay_readback_calls = replay_endpoint_calls = 0;
+				replay_barrier_ok = barrier_ok;
+				replay_readback_ok = readback_ok;
+				replay_endpoint_ok = endpoint_ok;
+				UT_ASSERT_EQ(cluster_typed_replay_durable_endpoints(&replay_adapter, &result),
+							 barrier_ok && readback_ok && endpoint_ok);
+				UT_ASSERT_EQ(replay_barrier_calls, 1);
+				UT_ASSERT_EQ(replay_readback_calls, barrier_ok);
+				UT_ASSERT_EQ(replay_endpoint_calls, barrier_ok && readback_ok);
+			}
 }
 
 
@@ -555,7 +569,7 @@ UT_TEST(test_startup_publish_empty_sealed_cut_keeps_later_gates)
 
 	replay_xid_reset(0);
 	cluster_typed_replay_publish(&replay_adapter, &result);
-	UT_ASSERT(strcmp(replay_events, "ECBXH") == 0);
+	UT_ASSERT(strcmp(replay_events, "ECBRXH") == 0);
 	UT_ASSERT(replay_typed.effects_receipt.plan == replay_typed.plan);
 	UT_ASSERT_EQ(replay_typed.effects_receipt.proof.records_routed, 0);
 	UT_ASSERT_EQ(replay_typed.effects_receipt.proof.required_union, 0);
@@ -563,7 +577,7 @@ UT_TEST(test_startup_publish_empty_sealed_cut_keeps_later_gates)
 
 UT_TEST(test_startup_publish_stops_before_handoff_on_incomplete_inputs)
 {
-	for (int fault = 0; fault < 3; fault++) {
+	for (int fault = 0; fault < 4; fault++) {
 		ClusterColdReplayResultV1 result = { .detail = CLUSTER_COLD_REPLAY_OK };
 		replay_xid_reset(1);
 		if (fault == 0)
@@ -571,6 +585,8 @@ UT_TEST(test_startup_publish_stops_before_handoff_on_incomplete_inputs)
 		if (fault == 1)
 			replay_barrier_ok = false;
 		if (fault == 2)
+			replay_readback_ok = false;
+		if (fault == 3)
 			replay_endpoint_ok = false;
 		replay_fatal_armed = true;
 		if (setjmp(replay_fatal) == 0) {
@@ -584,10 +600,15 @@ UT_TEST(test_startup_publish_stops_before_handoff_on_incomplete_inputs)
 		UT_ASSERT_EQ(replay_log_calls, 0);
 		UT_ASSERT_EQ(replay_ready_calls, 1);
 		UT_ASSERT_EQ(replay_barrier_calls, fault > 0);
-		UT_ASSERT_EQ(replay_endpoint_calls, fault > 1);
+		UT_ASSERT_EQ(replay_readback_calls, fault > 1);
+		UT_ASSERT_EQ(replay_endpoint_calls, fault > 2);
 		UT_ASSERT_EQ(replay_complete_calls, 0);
 		UT_ASSERT_EQ(replay_external_calls, 0);
-		UT_ASSERT(strcmp(replay_events, fault == 0 ? "EC" : fault == 1 ? "ECB" : "ECBX") == 0);
+		UT_ASSERT(strcmp(replay_events, fault == 0	 ? "EC"
+										: fault == 1 ? "ECB"
+										: fault == 2 ? "ECBR"
+													 : "ECBRX")
+				  == 0);
 		UT_ASSERT(strstr(replay_message, "could not publish thread 3 recovered") != NULL);
 	}
 }
@@ -612,8 +633,9 @@ UT_TEST(test_startup_publish_propagates_all_completion_refusals)
 		UT_ASSERT_EQ(replay_log_calls, 0);
 		UT_ASSERT_EQ(replay_complete_calls, 1);
 		UT_ASSERT_EQ(replay_external_calls, failure == CLUSTER_RECOVERY_FENCE_COMPLETE_AUTHORITY);
-		UT_ASSERT(strcmp(replay_events,
-						 failure == CLUSTER_RECOVERY_FENCE_COMPLETE_AUTHORITY ? "ECBXHF" : "ECBXH")
+		UT_ASSERT(strcmp(replay_events, failure == CLUSTER_RECOVERY_FENCE_COMPLETE_AUTHORITY
+											? "ECBRXHF"
+											: "ECBRXH")
 				  == 0);
 		if (failure == CLUSTER_RECOVERY_FENCE_COMPLETE_IR_RELEASE)
 			UT_ASSERT(strstr(replay_message, "serialization release was not confirmed") != NULL);
@@ -629,13 +651,14 @@ UT_TEST(test_startup_publish_hands_off_only_after_native_durability_and_endpoint
 	cluster_typed_replay_publish(&replay_adapter, &result);
 	UT_ASSERT_EQ(replay_ready_calls, 1);
 	UT_ASSERT_EQ(replay_barrier_calls, 1);
+	UT_ASSERT_EQ(replay_readback_calls, 1);
 	UT_ASSERT_EQ(replay_endpoint_calls, 1);
 	UT_ASSERT_EQ(replay_complete_calls, 1);
 	UT_ASSERT_EQ(replay_external_calls, 0);
 	UT_ASSERT_EQ(replay_fatal_calls, 0);
 	UT_ASSERT_EQ(replay_log_calls, 1);
 	UT_ASSERT_EQ(replay_effects_calls, 1);
-	UT_ASSERT(strcmp(replay_events, "ECBXH") == 0);
+	UT_ASSERT(strcmp(replay_events, "ECBRXH") == 0);
 	UT_ASSERT(replay_typed.effects_receipt.plan == replay_typed.plan);
 	UT_ASSERT_EQ(replay_typed.effects_receipt.proof.records_routed, 3);
 	for (uint32 i = 0; i < 3; i++)

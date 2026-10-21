@@ -3793,12 +3793,14 @@ cluster_typed_replay_unpublished(uint16 thread, const char *what, int detail)
 	pg_unreachable();
 }
 
-/* Keep the original physical durability barrier before counter publication. */
+/* Keep the original durability barrier, then final PAGE readback, before
+ * counter publication. Neither step grants recovered-generation authority. */
 static bool
 cluster_typed_replay_durable_endpoints(ClusterColdTypedReplay *rep,
 									   const ClusterColdReplayResultV1 *result)
 {
 	return cluster_cold_durable_barrier_v1(&rep->touched)
+		   && cluster_cold_data_readback_v1(rep->typed)
 		   && cluster_cold_typed_xid_endpoints_v1(rep->typed, *rep->fence_plan, result,
 												  rep->xid_progress);
 }
@@ -3827,7 +3829,7 @@ cluster_typed_replay_publish(ClusterColdTypedReplay *rep, const ClusterColdRepla
 										 (int) result->detail);
 	if (!cluster_typed_replay_durable_endpoints(rep, result))
 		cluster_typed_replay_unpublished(
-			thread, "Native durability or source counter endpoints are incomplete",
+			thread, "Native durability, PAGE readback or source counter endpoints are incomplete",
 			(int)rep->typed->refusal);
 	switch (cluster_recovery_merge_fence_plan_complete_v1(plan, &thread, &detail))
 	{

@@ -80,6 +80,11 @@ UT_TEST(test_lower_lag_old_fpi_cannot_overwrite_newer_durable)
 	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 0), 3);
 	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 1), 1);
 	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 2), 0);
+	/* The surviving frontier is qualified history, never replayed here. */
+	table.calls = 0;
+	table.fail = true;
+	UT_ASSERT_EQ(cluster_cold_plan_readback_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(table.calls, 0);
 	destroy_plan(&plan);
 }
 
@@ -477,6 +482,112 @@ UT_TEST(test_pure_history_page_not_observed)
 	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(table.calls, 1);
 	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 1);
+	table.calls = 0;
+	table.count = 0;
+	observe_set(&table, 100, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 6));
+	UT_ASSERT_EQ(cluster_cold_plan_readback_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(table.calls, 1); /* only the live page, not history's rel 300 */
+	destroy_plan(&plan);
+}
+
+/* Final versions follow the graph, not token or feed order. One read per
+ * surviving page must see its terminal result, never an intermediate edge. */
+UT_TEST(test_readback_checks_terminal_versions_once_per_page)
+{
+	ClusterColdParticipantV1 parts[2]
+		= { part(1, 11, 0x1000, 0x1000, 0x2000), part(2, 12, 0x1000, 0x1000, 0x2000) };
+	ClusterColdComponentV1 last = delta(0, 100, 0, 900, 3);
+	ClusterColdComponentV1 first = delta(0, 100, 0, 1, 900);
+	ClusterColdComponentV1 other = delta(0, 200, 0, 10, 11);
+	ClusterColdPlanV1 *plan = make_plan(parts, 2);
+	ClusterColdDiagV1 diag;
+	ObserveTable table = { 0 };
+
+	UT_ASSERT_EQ(feed(plan, 0, 0x1000, 0x1800, 1, 1, &last), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed(plan, 0, 0x1800, 0x2000, 2, 1, &other), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed(plan, 1, 0x1000, 0x2000, 999, 1, &first), CLUSTER_COLD_OK);
+	observe_set(&table, 100, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 1));
+	observe_set(&table, 200, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 10));
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	table.count = 0;
+	observe_set(&table, 100, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 3));
+	observe_set(&table, 200, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 11));
+	table.calls = 0;
+	UT_ASSERT_EQ(cluster_cold_plan_readback_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(table.calls, 2);
+	table.count = 0;
+	observe_set(&table, 100, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 900));
+	observe_set(&table, 200, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 11));
+	UT_ASSERT_EQ(cluster_cold_plan_readback_v1(plan, observe, &table, &diag),
+				 CLUSTER_COLD_ANCESTOR_MISSING);
+	UT_ASSERT(diag.has_record && diag.participant == 0 && diag.read_rec_ptr == 0x1000);
+	UT_ASSERT_EQ(diag.page.locator.relNumber, 100);
+	UT_ASSERT_EQ(diag.version.mutation_token, 900);
+	UT_ASSERT_EQ(diag.detail, CLUSTER_COLD_ANCESTOR_MISSING);
+	destroy_plan(&plan);
+}
+
+UT_TEST(test_readback_rechecks_skip_and_refuses_unproven_data)
+{
+	ClusterColdParticipantV1 parts[1] = { part(1, 11, 0x1000, 0x1000, 0x2000) };
+	ClusterColdComponentV1 component = delta(0, 100, 0, 1, 2);
+	ClusterColdPlanV1 *plan = make_plan(parts, 1);
+	ClusterColdDiagV1 diag;
+	ClusterColdStepV1 step;
+	ObserveTable table = { 0 };
+
+	UT_ASSERT_EQ(feed(plan, 0, 0x1000, 0x2000, 1, 1, &component), CLUSTER_COLD_OK);
+	observe_set(&table, 100, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 2));
+	UT_ASSERT_EQ(cluster_cold_plan_readback_v1(plan, observe, &table, &diag), CLUSTER_COLD_STATE);
+	UT_ASSERT_EQ(table.calls, 0);
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_plan_step_v1(plan, 0, &step) && step.all_skip);
+	table.calls = 0;
+	UT_ASSERT_EQ(cluster_cold_plan_readback_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(table.calls, 1);
+	for (int fault = 0; fault < 8; fault++) {
+		ClusterColdDetailV1 expected;
+
+		table.count = 0;
+		observe_set(&table, 100, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 2));
+		table.fail = false;
+		if (fault == 0) {
+			table.fail = true;
+			expected = CLUSTER_COLD_OBSERVATION_FAILED;
+		} else if (fault == 1) {
+			table.data[0].reserved_zero[0] = 1;
+			expected = CLUSTER_COLD_OBSERVATION_FAILED;
+		} else if (fault == 2) {
+			table.data[0].flags = 0;
+			expected = CLUSTER_COLD_CONTENT_UNPROVEN;
+		} else if (fault == 3) {
+			table.count = 0;
+			observe_set(&table, 100, 0, CLUSTER_COLD_DATA_ABSENT, ver(0, 0));
+			expected = CLUSTER_COLD_CONTENT_UNPROVEN;
+		} else if (fault == 4) {
+			table.count = 0;
+			observe_set(&table, 100, 0, CLUSTER_COLD_DATA_INVALID, ver(0, 0));
+			table.data[0].flags = 0;
+			expected = CLUSTER_COLD_CONTENT_UNPROVEN;
+		} else if (fault == 5) {
+			table.data[0].version = ver(0, 2);
+			table.data[0].flags |= CLUSTER_COLD_DATA_FLAG_NO_IDENTITY;
+			expected = CLUSTER_COLD_IDENTITY_MISSING;
+		} else if (fault == 6) {
+			table.data[0].version = ver(INC_J, 2);
+			expected = CLUSTER_COLD_INCARNATION_MISMATCH;
+		} else {
+			table.data[0].version.mutation_token = 1;
+			expected = CLUSTER_COLD_ANCESTOR_MISSING;
+		}
+		UT_ASSERT_EQ(cluster_cold_plan_readback_v1(plan, observe, &table, &diag), expected);
+		UT_ASSERT_EQ(diag.detail, expected);
+		UT_ASSERT(diag.has_record && diag.read_rec_ptr == 0x1000);
+	}
+	UT_ASSERT_EQ(cluster_cold_plan_readback_v1(NULL, observe, &table, &diag),
+				 CLUSTER_COLD_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(cluster_cold_plan_readback_v1(plan, NULL, &table, NULL),
+				 CLUSTER_COLD_INVALID_ARGUMENT);
 	destroy_plan(&plan);
 }
 
@@ -1333,7 +1444,7 @@ UT_TEST(test_input_frames_share_original_memory_budget)
 int
 main(void)
 {
-	UT_PLAN(40);
+	UT_PLAN(42);
 	UT_RUN(test_c0_history_is_not_checkpoint_coverage);
 	UT_RUN(test_c0_replay_range_retains_full_record_obligation);
 	UT_RUN(test_lower_lag_old_fpi_cannot_overwrite_newer_durable);
@@ -1354,6 +1465,8 @@ main(void)
 	UT_RUN(test_multi_page_record_mixed_verdicts);
 	UT_RUN(test_cross_generation_deadlock_refused);
 	UT_RUN(test_pure_history_page_not_observed);
+	UT_RUN(test_readback_checks_terminal_versions_once_per_page);
+	UT_RUN(test_readback_rechecks_skip_and_refuses_unproven_data);
 	UT_RUN(test_participant_cut_validation);
 	UT_RUN(test_two_generations_of_one_thread_link_by_version);
 	UT_RUN(test_observation_failure_refused);

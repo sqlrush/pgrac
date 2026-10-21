@@ -300,6 +300,30 @@ cluster_cold_observe_data_v1(void *arg, const RfPageIdentityV1 *page, ClusterCol
 	return true;
 }
 
+bool
+cluster_cold_data_readback_v1(ClusterColdTypedV1 *typed)
+{
+	ClusterColdDiagV1 diag;
+	ClusterColdDetailV1 detail;
+
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK)
+		return false;
+	/* SPACE redo can replace the identity cached during the initial seal. */
+	typed->observer.cached_valid = false;
+	detail = cluster_cold_plan_readback_v1(typed->plan, cluster_cold_observe_data_v1,
+										   &typed->observer, &diag);
+	if (detail != CLUSTER_COLD_OK) {
+		typed->refusal = detail;
+		snprintf(typed->refusal_detail, sizeof(typed->refusal_detail),
+				 "PAGE readback failed: result %u participant %u record %X/%X relation %u "
+				 "fork %u block %u",
+				 (unsigned)detail, (unsigned)diag.participant, LSN_FORMAT_ARGS(diag.read_rec_ptr),
+				 diag.page.locator.relNumber, (unsigned)diag.page.forknum, diag.page.blockno);
+		return false;
+	}
+	return true;
+}
+
 typedef struct ColdScanWork {
 	ClusterColdPlanV1 *plan;
 	RfSideOnlinePlanV1 *side_plan;

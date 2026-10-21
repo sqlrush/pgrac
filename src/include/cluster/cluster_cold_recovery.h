@@ -311,6 +311,14 @@ extern ClusterColdDetailV1 cluster_cold_plan_seal_v1(ClusterColdPlanV1 *plan,
 													 ClusterColdObserveV1 observe, void *arg,
 													 ClusterColdDiagV1 *diag);
 
+/* After replay and its original durability barrier, reread the final live
+ * PAGE versions retained by the sealed graph, including all-SKIP pages.
+ * History/object-checkpoint-only and retired pages retain their original
+ * owners' duties. This read-only check grants no replay or C0 authority. */
+extern ClusterColdDetailV1 cluster_cold_plan_readback_v1(const ClusterColdPlanV1 *plan,
+														 ClusterColdObserveV1 observe, void *arg,
+														 ClusterColdDiagV1 *diag);
+
 /* Sealed schedule: non-history records with ordinary page components, in
  * replay order.  Each participant's records keep their LSN order. */
 extern uint32 cluster_cold_plan_step_count_v1(const ClusterColdPlanV1 *plan);
@@ -901,6 +909,10 @@ typedef struct ClusterColdTypedV1 {
 	ClusterColdParticipantV1 participants[CLUSTER_COLD_MAX_PARTICIPANTS];
 	ClusterWalSourceRef sources[CLUSTER_COLD_MAX_PARTICIPANTS];
 } ClusterColdTypedV1;
+
+/* After the original durability barrier, reread each surviving replay PAGE
+ * frontier through the physical DATA observer. This grants no C0 authority. */
+extern bool cluster_cold_data_readback_v1(ClusterColdTypedV1 *typed);
 
 /* Read the retained original all-source counter maximum. Refuse a missing,
  * partial or mismatched receipt and zero the output. This only checks the

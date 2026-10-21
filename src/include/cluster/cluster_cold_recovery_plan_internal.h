@@ -141,6 +141,7 @@ typedef struct ColdComponent {
 #define COLD_STATE_FIRST_APPLY 0x01
 #define COLD_STATE_EXACT 0x02
 #define COLD_STATE_DATA_BEFORE 0x04
+#define COLD_STATE_FINAL 0x08 /* sealed live PAGE frontier; readback duty only */
 #define COLD_STATE_DATA_KIND_SHIFT 4
 #define COLD_STATE_DATA_KIND_MASK 0x03
 /* Set at seal from SPACE effects; never cleared by verdict assignment. */

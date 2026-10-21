@@ -476,10 +476,128 @@ UT_TEST(test_barrier_refuses_unconfirmed_native_sync)
 	UT_ASSERT(strcmp(native_barrier_events, "ctpmus") == 0);
 }
 
+/* Real sealed graph and I/O observer, with storage/checksum boundaries.
+ * The fixture supplies the replayed bytes; no native redo is claimed. */
+static void
+readback_fixture(ClusterColdTypedV1 *typed)
+{
+	ClusterColdParticipantV1 participant = { 0 };
+	ClusterColdComponentV1 component = { 0 };
+	ClusterColdRecordV1 record = { 0 };
+	ClusterColdDiagV1 diag;
+
+	storage_reset();
+	forks[0].exists = true;
+	forks[0].nblocks = 1;
+	data_page(&forks[0], 0, 'P', 1);
+	identity_page(&forks[1], 'L', 7);
+	memset(typed, 0, sizeof(*typed));
+	typed->observer.system_identifier = 99;
+	typed->observer.database_incarnation = 42;
+	memset(typed->observer.storage_uuid, 3, 16);
+	participant.thread_id = 1;
+	participant.timeline = 1;
+	participant.owner_incarnation = 11;
+	participant.physical_lower = participant.native_redo = 0x1000;
+	participant.tail_end = 0x2000;
+	UT_ASSERT_EQ(cluster_cold_plan_create_v1(&participant, 1, 1024 * 1024, &typed->plan),
+				 CLUSTER_COLD_OK);
+	component.page.system_identifier = 99;
+	memset(component.page.storage_uuid, 3, 16);
+	component.page.locator = locator(100);
+	component.page.forknum = MAIN_FORKNUM;
+	component.page_class = RF_PAGE_CLASS_ORDINARY;
+	component.before_kind = component.result_kind = RF_PAGE_STATE_PRESENT;
+	memset(component.before.segment_incarnation, 7, 16);
+	memset(component.result.segment_incarnation, 7, 16);
+	component.before.mutation_token = 1;
+	component.result.mutation_token = 2;
+	record.read_rec_ptr = 0x1000;
+	record.end_rec_ptr = 0x2000;
+	record.scn = record.record_crc = 1;
+	record.rmid = RM_HEAP_ID;
+	record.component_count = 1;
+	record.components = &component;
+	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(typed->plan, 0, &record), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(typed->plan, cluster_cold_observe_data_v1,
+										   &typed->observer, &diag),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT(typed->observer.cached_valid);
+	data_page(&forks[0], 0, 'P', 2);
+}
+
+UT_TEST(test_readback_uses_fresh_physical_data_and_space_identity)
+{
+	static const ClusterColdDetailV1 expected[] = { CLUSTER_COLD_OK,
+													CLUSTER_COLD_ANCESTOR_MISSING,
+													CLUSTER_COLD_INCARNATION_MISMATCH,
+													CLUSTER_COLD_CONTENT_UNPROVEN,
+													CLUSTER_COLD_CONTENT_UNPROVEN,
+													CLUSTER_COLD_IDENTITY_MISSING,
+													CLUSTER_COLD_CONTENT_UNPROVEN,
+													CLUSTER_COLD_CONTENT_UNPROVEN,
+													CLUSTER_COLD_OBSERVATION_FAILED,
+													CLUSTER_COLD_IDENTITY_MISSING };
+	ClusterColdTypedV1 typed;
+
+	for (uint32 fault = 0; fault < lengthof(expected); fault++) {
+		readback_fixture(&typed);
+		switch (fault) {
+		case 1:
+			data_page(&forks[0], 0, 'P', 1);
+			break;
+		case 2:
+			identity_page(&forks[1], 'L', 9);
+			break;
+		case 3:
+			data_page(&forks[0], 0, 'I', 2);
+			break;
+		case 4:
+			checksums_on = false;
+			break;
+		case 5:
+			forks[1].exists = false;
+			break;
+		case 6:
+			forks[0].exists = false;
+			break;
+		case 7:
+			header_valid = false;
+			break;
+		case 8:
+			data_page(&forks[0], 0, 'Z', 2);
+			break;
+		case 9:
+			identity_page(&forks[1], 'T', 7);
+			break;
+		default:
+			break;
+		}
+		space_reads = 0;
+		UT_ASSERT_EQ(cluster_cold_data_readback_v1(&typed), fault == 0);
+		UT_ASSERT_EQ(typed.refusal, expected[fault]);
+		UT_ASSERT_EQ(typed.observer.pages_observed, 2);
+		if (fault == 0 || fault == 2 || fault == 9)
+			UT_ASSERT_EQ(space_reads, 1); /* never reuse the pass-1 cached identity */
+		if (fault != 0) {
+			UT_ASSERT(strstr(typed.refusal_detail, "PAGE readback") != NULL);
+			data_page(&forks[0], 0, 'P', 2);
+			identity_page(&forks[1], 'L', 7);
+			UT_ASSERT(!cluster_cold_data_readback_v1(&typed)); /* refusal stays sticky */
+			UT_ASSERT_EQ(typed.observer.pages_observed, 2);
+		}
+		cluster_cold_plan_destroy_v1(&typed.plan);
+	}
+	UT_ASSERT(!cluster_cold_data_readback_v1(NULL));
+	memset(&typed, 0, sizeof(typed));
+	UT_ASSERT(!cluster_cold_data_readback_v1(&typed));
+	UT_ASSERT_EQ(typed.refusal, CLUSTER_COLD_INVALID_ARGUMENT);
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
 	UT_RUN(test_completion_proof);
 	UT_RUN(test_completion_ready);
 	UT_RUN(test_touched_set);
@@ -487,6 +605,7 @@ main(void)
 	UT_RUN(test_barrier_writes_then_syncs);
 	UT_RUN(test_barrier_flushes_native_without_relation_files);
 	UT_RUN(test_barrier_refuses_unconfirmed_native_sync);
+	UT_RUN(test_readback_uses_fresh_physical_data_and_space_identity);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
