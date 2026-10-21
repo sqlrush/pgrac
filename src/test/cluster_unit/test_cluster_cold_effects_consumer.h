@@ -56,6 +56,10 @@ consumer_event(char event)
 
 	if (h == NULL || h->events + 1 >= sizeof(h->trace))
 		abort();
+	/* The current record is still inside an original consumer. Only prior
+	 * successfully returned records may appear in its coverage count. */
+	UT_ASSERT_EQ(h->replay.effects.records_seen[1], h->next - 1);
+	UT_ASSERT_EQ(h->replay.effects.records_routed, h->next - 1);
 	h->trace[h->events++] = event;
 	h->trace[h->events] = '\0';
 }
@@ -358,15 +362,22 @@ UT_TEST(test_startup_consumers_complete_native_and_foreign_records)
 UT_TEST(test_startup_side_refusal_cannot_finish_counted_effects)
 {
 	ConsumerFixture *h = consumer_create(true, false, false);
+	ClusterColdReplayResultV1 cleared;
 
 	h->fault = CONSUMER_SIDE_REFUSE;
 	UT_ASSERT_EQ(consumer_run(h), CLUSTER_COLD_REPLAY_CALLBACK);
 	UT_ASSERT(strcmp(h->trace, "CGS") == 0);
 	UT_ASSERT_EQ(h->result.last_end[1], h->cuts[1].tail_end);
-	UT_ASSERT_EQ(h->replay.effects.records_seen[1], 2);
-	UT_ASSERT_EQ(h->replay.effects.records_routed, 2);
+	UT_ASSERT_EQ(h->replay.effects.records_seen[1], 1);
+	UT_ASSERT_EQ(h->replay.effects.records_routed, 1);
 	UT_ASSERT_EQ(h->replay.effects.required_union, h->replay.effects.routed_union);
 	UT_ASSERT(!consumer_finished(h));
+	/* Callback failure is already fatal to the real sequencer. Independently,
+	 * its input counts must not certify a record whose owner returned false. */
+	cleared = h->result;
+	cleared.detail = CLUSTER_COLD_REPLAY_OK;
+	UT_ASSERT(
+		!cluster_cold_effects_proof_finish_v1(&h->replay.effects, h->typed.plan, &cleared, 2));
 	consumer_destroy(h);
 }
 
@@ -403,7 +414,8 @@ UT_TEST(test_startup_consumer_interruption_stops_before_completion)
 		UT_ASSERT_EQ(h->interruptions, 1);
 		UT_ASSERT_EQ(h->mismatches, 0);
 		UT_ASSERT(strcmp(h->trace, traces[i]) == 0);
-		UT_ASSERT_EQ(h->replay.effects.records_routed, 1);
+		UT_ASSERT_EQ(h->replay.effects.records_seen[1], 0);
+		UT_ASSERT_EQ(h->replay.effects.records_routed, 0);
 		UT_ASSERT_EQ(h->result.steps_done, 0);
 		UT_ASSERT(!consumer_finished(h));
 		consumer_destroy(h);
@@ -424,6 +436,8 @@ UT_TEST(test_startup_scheduled_rechecks_payload_and_action)
 			UT_ASSERT_EQ(h->interruptions, 0);
 			UT_ASSERT_EQ(h->events, 0);
 			UT_ASSERT_EQ(h->result.steps_done, 0);
+			UT_ASSERT_EQ(h->replay.effects.records_seen[1], 0);
+			UT_ASSERT_EQ(h->replay.effects.records_routed, 0);
 			UT_ASSERT(!consumer_finished(h));
 			consumer_destroy(h);
 		}
@@ -437,7 +451,8 @@ UT_TEST(test_startup_foreign_control_refusal_stops_source_drain)
 	UT_ASSERT_EQ(consumer_run(h), CLUSTER_COLD_REPLAY_CALLBACK);
 	UT_ASSERT(strcmp(h->trace, "C") == 0);
 	UT_ASSERT_EQ(h->next, 1);
-	UT_ASSERT_EQ(h->replay.effects.records_routed, 1);
+	UT_ASSERT_EQ(h->replay.effects.records_seen[1], 0);
+	UT_ASSERT_EQ(h->replay.effects.records_routed, 0);
 	UT_ASSERT(!consumer_finished(h));
 	consumer_destroy(h);
 }

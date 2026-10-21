@@ -676,10 +676,11 @@ extern void cluster_cold_decoded_release_v1(ClusterColdDecodedV1 *decoded);
 extern bool cluster_cold_replay_effects_v1(const ClusterColdDecodedV1 *decoded,
 										   const ClusterColdStepV1 *step, bool own);
 
-/* Attempt-local proof that every pass-2 record reached the same complete
- * effect matrix that the original owner classified.  This is neither a WAL
- * field nor a completion authority: the caller still owns source, freshness,
- * durability and fence checks. */
+/* Attempt-local coverage of the complete effect matrix. Startup checks
+ * the route before any effect, then records coverage only after the original
+ * consumer returns or a validated skip finishes. These counts do not verify
+ * execution themselves and are neither a WAL field nor completion authority:
+ * the caller still owns source, freshness, durability and fence checks. */
 typedef struct ClusterColdEffectsProofV1 {
 	uint64 records_seen[CLUSTER_COLD_MAX_PARTICIPANTS];
 	uint64 records_routed;
