@@ -9502,7 +9502,9 @@ test_cluster_vacuum_shared_mx.inc: $(top_srcdir)/src/backend/access/heap/vacuuml
 test_cluster_vacuum_shared_mx: test_cluster_vacuum_shared_mx.c test_cluster_heap_maintenance_policy.inc unit_test.h \
 		$(srcdir)/cluster_vacuum_mx_test_stubs.h test_cluster_vacuum_shared_mx.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_heap_freeze.c \
-		$(top_srcdir)/src/include/cluster/cluster_heap_freeze.h
+		$(top_srcdir)/src/include/cluster/cluster_heap_freeze.h \
+		$(top_srcdir)/src/include/cluster/cluster_itl_slot.h \
+		$(top_srcdir)/src/include/access/htup_details.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) $< \
 		$(top_srcdir)/src/backend/cluster/cluster_heap_freeze.c $(CLUSTER_UNIT_PORT_LIBS) -o $@
 

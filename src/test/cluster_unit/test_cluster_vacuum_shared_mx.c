@@ -519,10 +519,266 @@ UT_TEST(real_capture_failure_is_a_hard_error)
 	UT_ASSERT(captured_input() == NULL);
 }
 
+static const ClusterHeapFreezePageBatchV1 *
+prepared_batch(void)
+{
+#ifdef FIXTURE_HAS_FREEZE_BATCH
+	return state.shared_freeze_input_valid ? &state.shared_freeze_batch : NULL;
+#else
+	return NULL;
+#endif
+}
+
+UT_TEST(prepare_preserves_raw_headers_and_owns_physical_rows)
+{
+	ClusterHeapFreezePageInputV1 input;
+	ClusterHeapFreezePageBatchV1 batch, before;
+	const OffsetNumber offsets[] = {1, 2, 5};
+	Page page;
+	bool ok;
+
+	setup(true);
+	make_itl_page();
+	page = (Page) fixture_pages[0].data;
+	for (unsigned i = 0; i < lengthof(offsets); i++)
+	{
+		HeapTupleHeader tuple = (HeapTupleHeader) PageGetItem(page, PageGetItemId(page, offsets[i]));
+
+		HeapTupleHeaderSetXmin(tuple, 77 + i);
+		tuple->t_infomask |= HEAP_XMIN_FROZEN;
+		tuple->t_infomask2 = i + 1;
+		tuple->t_itl_slot_idx = i;
+		ItemPointerSet(&tuple->t_ctid, 91, offsets[i]);
+	}
+	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&state.identity, 17, page, &input));
+	ok = cluster_heap_freeze_prepare_page_v1(&input, &batch);
+	UT_ASSERT(ok);
+	if (!ok)
+		return;
+	UT_ASSERT_EQ(batch.block, 17);
+	UT_ASSERT_EQ(batch.page_lsn, 0x987654321ULL);
+	UT_ASSERT_EQ(batch.page_version, 0x123456789ULL);
+	UT_ASSERT_EQ(memcmp(&batch.identity, &input.identity, sizeof(batch.identity)), 0);
+	UT_ASSERT_EQ(batch.tuple_count, 3);
+	UT_ASSERT_EQ(batch.multi_tuples, 1);
+	for (unsigned i = 0; i < lengthof(offsets); i++)
+	{
+		const ClusterHeapFreezeTupleInputV1 *row = &batch.tuples[i];
+		ItemId item = PageGetItemId(page, offsets[i]);
+		HeapTupleHeader tuple = (HeapTupleHeader) PageGetItem(page, item);
+
+		UT_ASSERT_EQ(row->offset, offsets[i]);
+		UT_ASSERT_EQ(row->tuple_offset, ItemIdGetOffset(item));
+		UT_ASSERT_EQ(row->tuple_length, ItemIdGetLength(item));
+		UT_ASSERT_EQ(row->raw_xmin, 77 + i);
+		UT_ASSERT_EQ(row->raw_xmax, 33);
+		UT_ASSERT_EQ(row->infomask, tuple->t_infomask);
+		UT_ASSERT_EQ(row->infomask2, tuple->t_infomask2);
+		UT_ASSERT_EQ(row->header_length, tuple->t_hoff);
+		UT_ASSERT_EQ(memcmp(&row->ctid, &tuple->t_ctid, sizeof(row->ctid)), 0);
+		UT_ASSERT_EQ(row->itl_slot_index, i);
+		UT_ASSERT(row->has_carrier);
+		UT_ASSERT_EQ(memcmp(&row->carrier, &ClusterPageGetItlSlots(page)[i], sizeof(row->carrier)), 0);
+	}
+	before = batch;
+	memset(&input, 0, sizeof(input));
+	memset(page, 0, BLCKSZ);
+	UT_ASSERT_EQ(memcmp(&batch, &before, sizeof(batch)), 0);
+}
+
+UT_TEST(prepare_never_aliases_creator_and_current_itl_carriers)
+{
+	ClusterHeapFreezePageInputV1 input;
+	ClusterHeapFreezePageBatchV1 batch;
+	const OffsetNumber offsets[] = {1, 2, 5};
+	Page page;
+	bool ok;
+
+	setup(true);
+	make_itl_page();
+	page = (Page) fixture_pages[0].data;
+	for (unsigned i = 0; i < lengthof(offsets); i++)
+	{
+		HeapTupleHeader tuple = (HeapTupleHeader) PageGetItem(page, PageGetItemId(page, offsets[i]));
+
+		HeapTupleHeaderSetXmin(tuple, 77);
+		tuple->t_itl_slot_idx = i;
+	}
+	ClusterPageGetItlSlots(page)[2].xid = 99;
+	ClusterPageGetItlSlots(page)[2].flags = ITL_FLAG_FREE;
+	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&state.identity, 0, page, &input));
+	ok = cluster_heap_freeze_prepare_page_v1(&input, &batch);
+	UT_ASSERT(ok);
+	if (!ok)
+		return;
+	UT_ASSERT_EQ(batch.tuple_count, 3);
+	UT_ASSERT_EQ(batch.tuples[0].carrier.wrap, 0xfffe);
+	UT_ASSERT_EQ(batch.tuples[1].carrier.wrap, 2);
+	UT_ASSERT_EQ(batch.tuples[2].raw_xmin, 77);
+	UT_ASSERT_EQ(batch.tuples[2].carrier.xid, 99);
+	UT_ASSERT_EQ(batch.tuples[2].carrier.flags, ITL_FLAG_FREE);
+	UT_ASSERT(batch.tuples[2].has_carrier);
+}
+
+UT_TEST(prepare_keeps_rows_without_an_addressable_itl)
+{
+	const uint8 indexes[] = {CLUSTER_ITL_SLOT_UNALLOCATED, CLUSTER_ITL_INITRANS_DEFAULT, 254, 0};
+	const ClusterItlSlotData zero = {0};
+
+	for (unsigned mode = 0; mode < lengthof(indexes); mode++)
+	{
+		ClusterHeapFreezePageInputV1 input;
+		ClusterHeapFreezePageBatchV1 batch;
+		const OffsetNumber offsets[] = {1, 2, 5};
+		Page page;
+		bool ok;
+
+		setup(true);
+		if (mode != 3)
+			make_itl_page();
+		page = (Page) fixture_pages[0].data;
+		for (unsigned i = 0; i < lengthof(offsets); i++)
+			((HeapTupleHeader) PageGetItem(page, PageGetItemId(page, offsets[i])))->t_itl_slot_idx = indexes[mode];
+		UT_ASSERT(cluster_heap_freeze_capture_page_v1(&state.identity, 0, page, &input));
+		ok = cluster_heap_freeze_prepare_page_v1(&input, &batch);
+		UT_ASSERT(ok);
+		if (!ok)
+			continue;
+		UT_ASSERT_EQ(batch.tuple_count, 3);
+		for (unsigned i = 0; i < lengthof(offsets); i++)
+		{
+			UT_ASSERT_EQ(batch.tuples[i].itl_slot_index, indexes[mode]);
+			UT_ASSERT(!batch.tuples[i].has_carrier);
+			UT_ASSERT_EQ(memcmp(&batch.tuples[i].carrier, &zero, sizeof(zero)), 0);
+		}
+	}
+}
+
+UT_TEST(prepare_is_bounded_at_maximum_and_empty_page)
+{
+	ClusterHeapFreezePageInputV1 input;
+	ClusterHeapFreezePageBatchV1 batch;
+	Page page;
+	PageHeader header;
+	bool ok;
+
+	setup(true);
+	page = (Page) fixture_pages[0].data;
+	memset(page, 0, BLCKSZ);
+	header = (PageHeader) page;
+	header->pd_lower = SizeOfPageHeaderData + MaxHeapTuplesPerPage * sizeof(ItemIdData);
+	header->pd_upper = BLCKSZ - MaxHeapTuplesPerPage * MAXALIGN(SizeofHeapTupleHeader);
+	header->pd_special = BLCKSZ;
+	header->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
+	for (OffsetNumber i = 1; i <= MaxHeapTuplesPerPage; i++)
+	{
+		ItemId item = PageGetItemId(page, i);
+		HeapTupleHeader tuple;
+
+		ItemIdSetNormal(item, BLCKSZ - i * MAXALIGN(SizeofHeapTupleHeader), SizeofHeapTupleHeader);
+		tuple = (HeapTupleHeader) PageGetItem(page, item);
+		tuple->t_hoff = SizeofHeapTupleHeader;
+		tuple->t_itl_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
+	}
+	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&state.identity, 0, page, &input));
+	ok = cluster_heap_freeze_prepare_page_v1(&input, &batch);
+	UT_ASSERT(ok);
+	if (ok)
+	{
+		UT_ASSERT_EQ(batch.tuple_count, MaxHeapTuplesPerPage);
+		UT_ASSERT_EQ(batch.tuples[MaxHeapTuplesPerPage - 1].offset, MaxHeapTuplesPerPage);
+	}
+	header->pd_lower = SizeOfPageHeaderData;
+	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&state.identity, 0, page, &input));
+	ok = cluster_heap_freeze_prepare_page_v1(&input, &batch);
+	UT_ASSERT(ok);
+	if (ok)
+		UT_ASSERT_EQ(batch.tuple_count, 0);
+}
+
+UT_TEST(prepare_rejects_inconsistent_inputs_without_partial_output)
+{
+	ClusterHeapFreezePageInputV1 input;
+	ClusterHeapFreezePageBatchV1 batch, before;
+
+	setup(true);
+	for (unsigned bad = 0; bad < 9; bad++)
+	{
+		UT_ASSERT(cluster_heap_freeze_capture_page_v1(&state.identity, 0, (Page) fixture_pages[0].data, &input));
+		switch (bad)
+		{
+			case 0: input.identity.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED; break;
+			case 1: input.block = InvalidBlockNumber; break;
+			case 2: input.max_offset++; break;
+			case 3: input.normal_tuples--; break;
+			case 4: input.multi_tuples++; break;
+			case 5: ((PageHeader) input.image.data)->pd_lower++; break;
+			case 6: ((PageHeader) input.image.data)->pd_upper = BLCKSZ; break;
+			case 7: ((PageHeader) input.image.data)->pd_flags |= PD_HAS_ITL; break;
+			case 8: ((PageHeader) input.image.data)->pd_lower = SizeOfPageHeaderData + (MaxHeapTuplesPerPage + 1) * sizeof(ItemIdData); break;
+		}
+		memset(&batch, 0xa5, sizeof(batch));
+		before = batch;
+		UT_ASSERT(!cluster_heap_freeze_prepare_page_v1(&input, &batch));
+		UT_ASSERT_EQ(memcmp(&batch, &before, sizeof(batch)), 0);
+	}
+	UT_ASSERT(!cluster_heap_freeze_prepare_page_v1(NULL, &batch));
+	UT_ASSERT_EQ(memcmp(&batch, &before, sizeof(batch)), 0);
+	UT_ASSERT(!cluster_heap_freeze_prepare_page_v1(&input, NULL));
+}
+
+UT_TEST(real_scan_consumes_prepared_rows_under_both_original_locks)
+{
+	for (unsigned cleanup = 0; cleanup < 2; cleanup++)
+		for (unsigned multi = 0; multi < 2; multi++)
+		{
+			const ClusterHeapFreezePageBatchV1 *batch;
+
+			setup(cleanup);
+			make_page(0, multi, 33);
+			lazy_scan_heap(&state);
+			batch = prepared_batch();
+			UT_ASSERT(batch != NULL);
+			if (batch == NULL)
+				continue;
+			UT_ASSERT_EQ(batch->block, 0);
+			UT_ASSERT_EQ(batch->tuple_count, 3);
+			UT_ASSERT_EQ(batch->multi_tuples, multi);
+			UT_ASSERT_EQ(batch->tuples[2].offset, 5);
+			UT_ASSERT_EQ(deferred_tuples(), multi ? batch->tuple_count : 0);
+			UT_ASSERT_EQ(fixture_locks + fixture_pins, 0);
+		}
+}
+
+UT_TEST(real_scan_replaces_and_invalidates_prepared_batch)
+{
+	const ClusterHeapFreezePageBatchV1 *batch;
+
+	setup(true);
+	state.rel_pages = 2;
+	make_page(1, true, 123);
+	lazy_scan_heap(&state);
+	batch = prepared_batch();
+	UT_ASSERT(batch != NULL);
+	if (batch != NULL)
+	{
+		UT_ASSERT_EQ(batch->block, 1);
+		UT_ASSERT_EQ(batch->tuples[1].raw_xmax, 123);
+	}
+	((PageHeader) fixture_pages[1].data)->pd_lower = SizeOfPageHeaderData;
+	lazy_scan_heap(&state);
+	UT_ASSERT(prepared_batch() == NULL);
+	setup(false);
+	lazy_scan_heap(&state);
+	fixture_peer = false;
+	lazy_scan_heap(&state);
+	UT_ASSERT(prepared_batch() == NULL);
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(20);
 	UT_RUN(share_scan_preserves_every_reference_before_native_consumer);
 	UT_RUN(cleanup_scan_preserves_before_prune_and_freeze);
 	UT_RUN(raw_multi_value_never_selects_local_reader);
@@ -536,6 +792,13 @@ main(void)
 	UT_RUN(real_scan_captures_share_cleanup_and_nonmulti_inputs);
 	UT_RUN(next_empty_or_nontarget_page_cannot_reuse_input);
 	UT_RUN(real_capture_failure_is_a_hard_error);
+	UT_RUN(prepare_preserves_raw_headers_and_owns_physical_rows);
+	UT_RUN(prepare_never_aliases_creator_and_current_itl_carriers);
+	UT_RUN(prepare_keeps_rows_without_an_addressable_itl);
+	UT_RUN(prepare_is_bounded_at_maximum_and_empty_page);
+	UT_RUN(prepare_rejects_inconsistent_inputs_without_partial_output);
+	UT_RUN(real_scan_consumes_prepared_rows_under_both_original_locks);
+	UT_RUN(real_scan_replaces_and_invalidates_prepared_batch);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

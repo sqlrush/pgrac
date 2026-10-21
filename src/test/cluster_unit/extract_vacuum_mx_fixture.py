@@ -29,6 +29,8 @@ def extract(source):
         print("#define FIXTURE_HAS_MX_DEFER 1")
     if "shared_freeze_input_valid" in state:
         print("#define FIXTURE_HAS_FREEZE_INPUT 1")
+    if "ClusterHeapFreezePageBatchV1 shared_freeze_batch" in state:
+        print("#define FIXTURE_HAS_FREEZE_BATCH 1")
     print('#include "cluster_vacuum_mx_test_stubs.h"')
     if re.search(r"^lazy_scan_shared_mx\(", source, re.M):
         print(function(source, "lazy_scan_shared_mx", "static bool"))

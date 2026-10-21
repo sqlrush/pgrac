@@ -166,8 +166,9 @@ typedef struct LVRelState
 #ifdef USE_PGRAC_CLUSTER
 	bool		versioned;
 	ClusterSpaceIdentity identity;
-	/* Unproven copy only; no borrowed page pointer or freeze permission. */
+	/* Unproven image and bounded rows; no pointer or freeze permission. */
 	ClusterHeapFreezePageInputV1 shared_freeze_input;
+	ClusterHeapFreezePageBatchV1 shared_freeze_batch;
 	bool		shared_freeze_input_valid;
 	BlockNumber shared_mx_deferred_pages;
 	int64		shared_mx_deferred_tuples;
@@ -1459,7 +1460,7 @@ lazy_scan_heap(LVRelState *vacrel)
 #ifdef USE_PGRAC_CLUSTER
 /*
  * Preserve a peer MX page while holding its original share or cleanup lock.
- * Capture bounded freeze inputs under that same lock, then consume their
+ * Capture and expand bounded row inputs under that same lock, then consume
  * physical counts for the existing MX KEEP decision. The input asserts no
  * transaction visibility, current fence or eligibility and releases no ref.
  */
@@ -1473,13 +1474,16 @@ lazy_scan_shared_mx(LVRelState *vacrel, Page page, BlockNumber blkno)
 	if (!cluster_heap_freeze_capture_page_v1(&vacrel->identity, blkno, page,
 											   &vacrel->shared_freeze_input))
 		elog(ERROR, "invalid shared heap freeze input at block %u", blkno);
+	if (!cluster_heap_freeze_prepare_page_v1(&vacrel->shared_freeze_input,
+											   &vacrel->shared_freeze_batch))
+		elog(ERROR, "invalid shared heap freeze row inputs at block %u", blkno);
 	vacrel->shared_freeze_input_valid = true;
-	if (vacrel->shared_freeze_input.multi_tuples == 0)
+	if (vacrel->shared_freeze_batch.multi_tuples == 0)
 		return false;
 
 	vacrel->shared_mx_deferred_pages++;
-	vacrel->shared_mx_deferred_tuples += vacrel->shared_freeze_input.normal_tuples;
-	vacrel->live_tuples += vacrel->shared_freeze_input.normal_tuples;
+	vacrel->shared_mx_deferred_tuples += vacrel->shared_freeze_batch.tuple_count;
+	vacrel->live_tuples += vacrel->shared_freeze_batch.tuple_count;
 	vacrel->nonempty_pages = blkno + 1;
 	return true;
 }
