@@ -49,6 +49,7 @@ DATA_TARGET.update(offset=("data_offset", "u32"), uba=("consumed_uba_raw", "hex1
 SIGNED_TAG = dict(TAG, forkNum=("fork", "i32"))
 
 PACKED = {
+    "locator": (("spcOid", "u32"), ("dbOid", "u32"), ("relNumber", "u32")),
     "tag": (("spcOid", "u32"), ("dbOid", "u32"), ("relNumber", "u32"),
             ("forkNum", "i32"), ("blockNum", "u32")),
     "tid": (("blockNum", "u32"), ("offsetNumber", "u32")),
@@ -173,8 +174,84 @@ SCHEMAS = {
     },
 }
 
+# Legacy summary/item records have different fields and known flags. These
+# schemas apply only to their named event; operation_seq never joins records.
+SPACE = dict(system_identifier=("space_system", "u64"),
+             **_same("database_incarnation space_sequence space_operation"),
+             space_incarnation=("space_incarnation", "hex16"),
+             space_state=("space_state", "i32"))
+MAINTENANCE = {
+    "requested": (dict(relid=("relid", "u32"), locator=("requested_locator", "locator")),),
+    "actual_tag": ({"tag": ("actual_tag", "tag")}, ("actual_tag_known",)),
+}
+BTREE_SUMMARY = {
+    **MAINTENANCE,
+    "operation": (_same("operation_seq"),),
+    "space": (dict(SPACE, storage_uuid=("storage_uuid", "hex16")), ("space_known",)),
+    **{name + "_page": ({"maxoff": (name + "_maxoff", "u32"),
+                         "page_lsn": (name + "_lsn", "u64"),
+                         "page_scn": (name + "_scn", "u64")}, (name + "_shape",))
+       for name in ("before", "after")},
+    "horizon": (_same("conflict_horizon", "u32"), ("conflict_horizon_known",)),
+    "counts": (_same("ndeleted nupdated captured omitted", "i32"),),
+    "wal": (_same("inserted_lsn"), ("inserted_lsn_known",)),
+}
+EVENT_SCHEMAS = {
+    ("R4_HEAP_PRUNE", "prune.result"): {
+        **MAINTENANCE,
+        "operation": (_same("operation_seq read_scn epoch"),),
+        "admission": (dict(_same("admission_feature admission_generation admission_epoch"),
+                           admission_side=("admission_side", "u32")),),
+        "space": (SPACE, ("space_known",)),
+        **{name + "_page": ({"page_lsn": (name + "_lsn", "u64"),
+                             "page_scn": (name + "_scn", "u64")},
+                            (name + "_known", name + "_shape")) for name in ("before", "after")},
+        "floor": (_same("floor_scn"), ("floor_known",)),
+        "counts": (_same("ndeleted nnewlpdead changed_items", "i32"),),
+        "pcm": (dict(_same("pcm_generation reservation_token writer_activation resource_x_activation"),
+                     **_same("pcm_state pcm_flags", "u32")), ("actual_tag_known",)),
+    },
+    ("R4_HEAP_PRUNE", "prune.item"): {
+        "item_context": (dict(_same("operation_seq"), offset=("offset", "u32")),),
+    },
+    ("R4_BTREE_DELETE", "delete.applied"): BTREE_SUMMARY,
+    ("R4_BTREE_DELETE", "vacuum.applied"): BTREE_SUMMARY,
+    ("R4_BTREE_DELETE", "index.item"): {
+        "item_context": (dict(_same("operation_seq"),
+                              **_same("item_ordinal item_events_expected", "i32"),
+                              **_same("old_index_offset removed_count positions_captured positions_omitted", "u32")),),
+    },
+}
+PRUNE_ITEM_SCHEMAS = dict(ITEM_SCHEMAS)
+PRUNE_ITEM_SCHEMAS["slot"] = (
+    dict(ITEM_SCHEMAS["slot"][0], wrap=("itl_wrap", "u32")), ITEM_SCHEMAS["slot"][1])
+INDEX_ITEM_SCHEMAS = {
+    "item": (_same("lp", "u32"), ("item_known",)),
+    "tuple": (dict(_same("storage_off storage_len tuple_size"),
+                   **_same("posting pivot", "bool"), raw_index_tid=("raw_index_tid", "tid")),
+              ("item_known", "tuple_known")),
+    "posting": (_same("posting_count", "u32"),
+                ("item_known", "tuple_known", "posting", "posting_shape_known")),
+    "heap_tid": ({"heap_tid": ("heap_tid", "tid")},
+                 ("item_known", "tuple_known", "heap_tid_known")),
+}
+
 
 def _scalar(raw, kind):
+    if kind == "posting_positions":
+        if not (raw.startswith("{") and raw.endswith("}")):
+            raise ValueError("expected posting position braces")
+        entries = raw[1:-1].split(",") if raw[1:-1] else []
+        if len(entries) > 8:  # Existing producer's bounded captured positions.
+            raise ValueError("too many captured posting positions")
+        values = []
+        for entry in entries:
+            position, separator, tid = entry.partition(":")
+            if not separator:
+                raise ValueError("missing posting position separator")
+            values.append(dict(position=_scalar(position, "u32"), heap_tid_known=tid != "unknown",
+                               heap_tid=None if tid == "unknown" else _scalar(tid, "tid")))
+        return values
     if kind in PACKED:
         parts = raw.split("/")
         if len(parts) != len(PACKED[kind]):
@@ -220,7 +297,7 @@ def _group(fields, schema, guards=(), any_guard=False):
                 missing=missing, invalid=invalid)
 
 
-def _item_groups(fields, name, page_guard):
+def _item_groups(fields, name, page_guard=None, schemas=ITEM_SCHEMAS):
     """Parse one owned ItemId snapshot, without borrowing from other images."""
     raw = fields.get(name)
     nested = {}
@@ -234,9 +311,10 @@ def _item_groups(fields, name, page_guard):
             malformed = True
     local = dict(nested, **{page_guard: fields[page_guard]} if page_guard in fields else {})
     groups = {}
-    for suffix, (schema, guards) in ITEM_SCHEMAS.items():
+    for suffix, (schema, guards) in schemas.items():
         schema = {key: (name + "." + source, kind) for key, (source, kind) in schema.items()}
-        group = _group(local, schema, (page_guard, *(name + "." + guard for guard in guards)))
+        group = _group(local, schema, (*((page_guard,) if page_guard else ()),
+                                       *(name + "." + guard for guard in guards)))
         if raw is not None:
             group["raw_values"][name] = raw
         else:
@@ -244,6 +322,21 @@ def _item_groups(fields, name, page_guard):
         if malformed:
             group.update(status="INVALID", values={}, invalid=[name])
         groups[name + "_" + suffix] = group
+    if schemas is PRUNE_ITEM_SCHEMAS and name + ".redirect" in nested:
+        groups[name + "_redirect"] = _group(
+            local, {"redirect": (name + ".redirect", "u32")}, (name + ".item_known",))
+        groups[name + "_redirect"]["raw_values"][name] = raw
+    if schemas is INDEX_ITEM_SCHEMAS:
+        # Only this line's posting-shape flags gate its captured operands. A
+        # raw index TID may encode posting/pivot metadata; never use it here.
+        group = _group(dict(fields, **nested), {"positions": ("removed", "posting_positions")},
+                       tuple(name + "." + guard for guard in
+                             ("item_known", "tuple_known", "posting", "posting_shape_known")))
+        if raw is not None:
+            group["raw_values"][name] = raw
+        if malformed:
+            group.update(status="INVALID", values={}, invalid=[name])
+        groups["removed_positions"] = group
     return groups
 
 
@@ -263,11 +356,16 @@ def read_evidence(manifest_path):
         for index, observation in enumerate(node["trace"]["observations"]):
             fields = observation["fields"]
             family = fields["PGRAC_FAMILY"]
-            schema = SCHEMAS.get(family)
+            schema = EVENT_SCHEMAS.get((family, fields["event"]), SCHEMAS.get(family))
             groups = {} if schema is None else {
                 name: _group(fields, *description) for name, description in schema.items()}
             for name, guard in ITEM_IMAGES.get(family, {}).items():
                 groups.update(_item_groups(fields, name, guard))
+            if (family, fields["event"]) == ("R4_HEAP_PRUNE", "prune.item"):
+                for name in ("before", "after"):
+                    groups.update(_item_groups(fields, name, schemas=PRUNE_ITEM_SCHEMAS))
+            elif (family, fields["event"]) == ("R4_BTREE_DELETE", "index.item"):
+                groups.update(_item_groups(fields, "before", schemas=INDEX_ITEM_SCHEMAS))
             status = ("UNSUPPORTED" if schema is None else
                       "INVALID" if any(group["status"] == "INVALID" for group in groups.values()) else
                       "PARTIAL" if any(group["status"] == "UNKNOWN" for group in groups.values()) else

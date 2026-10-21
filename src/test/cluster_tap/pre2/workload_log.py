@@ -15,18 +15,22 @@ import re
 ENDINGS = dict.fromkeys((
     "READ_IMAGE", "READ_IMAGE_INGRESS", "READ_IMAGE_HOP", "R4_UNDO",
     "R4_HEAP_UPDATE", "HOT_FULL", "CTRC_RECEIPT", "CTRC_RECEIPT_LIFECYCLE",
+    "R4_HEAP_PRUNE", "R4_BTREE_DELETE",
 ), "trace_sequence_exhausted")
 ENDINGS.update(CTRC_CONSUME="sequence_exhausted",
                CTRC_ORIGIN_DISPATCH="sequence_exhausted",
                CTRC_ORIGIN_REPLY="sequence_saturated",
                CTRC_ORIGIN_BATCH_REPLY="sequence_saturated")
+# These older emitters use node= and disclose neither scope nor domain. Do not
+# manufacture modern envelope fields, even for item lines sharing operation_seq.
+LEGACY_FAMILIES = frozenset(("R4_HEAP_PRUNE", "R4_BTREE_DELETE"))
 SEVERITY = re.compile(r"\b(LOG|DEBUG[1-5]|DETAIL|HINT|CONTEXT|STATEMENT|ERROR|"
                       r"FATAL|PANIC|WARNING|NOTICE|INFO):[ \t]*")
 KEY = re.compile(r"[A-Za-z_][A-Za-z_0-9]*=")
 FAMILY = re.compile(r"PGRAC_FAMILY=([A-Z][A-Z_0-9]*)(?:[ \t]|$)")
 
 
-def _fields(message):
+def _fields(message, adjacent=()):
     """Parse emitter scalars and balanced brace blocks, preserving their text."""
     fields = {}
     position = 0
@@ -55,6 +59,10 @@ def _fields(message):
                 raise ValueError("missing separator after brace field: " + key)
         else:
             while position < len(message) and message[position] not in " \t":
+                if (any(key == left and message.startswith(right + "=", position)
+                        for left, right in adjacent) and
+                        re.fullmatch(r"[0-9]+", message[start:position])):
+                    break
                 if message[position] in '{}="':
                     raise ValueError("invalid scalar field: " + key)
                 position += 1
@@ -65,18 +73,24 @@ def _fields(message):
 
 
 def _validate_envelope(fields, family):
-    required = ("event", "event_seq", "sequence_scope", "node_id", "pid", "authoritative")
+    legacy = family in LEGACY_FAMILIES
+    node_key = "node" if legacy else "node_id"
+    required = ("event", "event_seq", node_key, "pid", "authoritative")
     if any(key not in fields for key in required):
         raise ValueError("incomplete emitter envelope")
-    if fields["sequence_scope"] != "process":
-        raise ValueError("unexpected sequence scope")
-    domain = fields.get("sequence_domain")
-    if domain != (None if family == "CTRC_RECEIPT" else family):
-        raise ValueError("missing or unexpected sequence domain")
+    if legacy:
+        if any(key in fields for key in ("node_id", "sequence_scope", "sequence_domain")):
+            raise ValueError("unexpected modern field in legacy envelope")
+    else:
+        if fields.get("sequence_scope") != "process":
+            raise ValueError("unexpected sequence scope")
+        domain = fields.get("sequence_domain")
+        if domain != (None if family == "CTRC_RECEIPT" else family):
+            raise ValueError("missing or unexpected sequence domain")
     sequence = fields["event_seq"]
     if not re.fullmatch(r"[0-9]+", sequence) or not 1 <= int(sequence) <= 2**64 - 1:
         raise ValueError("invalid event sequence")
-    for key in ("node_id", "pid"):
+    for key in (node_key, "pid"):
         if not re.fullmatch(r"[0-9]+", fields[key]):
             raise ValueError("invalid " + key)
     if int(fields["pid"]) == 0 or fields["authoritative"] != "0":
@@ -126,7 +140,14 @@ def read_trace(data):
             if family not in ENDINGS:
                 result["unhandled"].append(dict(provenance, family=family, raw=text))
                 continue
-            fields = _fields(message)
+            # The existing B-tree summary C format omits this one separator.
+            # Recognize its exact literal boundary; retain the original message
+            # and reject other concatenations rather than repairing input.
+            adjacent = (("after_scn", "conflict_horizon_known"),) if (
+                family == "R4_BTREE_DELETE" and re.match(
+                    r"PGRAC_FAMILY=R4_BTREE_DELETE event=(?:delete|vacuum)\.applied[ \t]",
+                    message)) else ()
+            fields = _fields(message, adjacent)
             _validate_envelope(fields, family)
             result["observations"].append(dict(provenance, raw=text, message=message,
                                                fields=fields))

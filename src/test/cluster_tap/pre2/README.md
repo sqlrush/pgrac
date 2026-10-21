@@ -109,8 +109,9 @@ python3 src/test/cluster_tap/pre2/workload_log.py /path/to/server.log > observat
 python3 -m unittest discover -s src/test/cluster_tap/pre2 -p test_workload_log.py
 ```
 
-The reader supports the existing READ_IMAGE, R4_UNDO, R4_HEAP_UPDATE, HOT_FULL
-and CTRC trace families listed in `workload_log.py`. It accepts `LOG:` records
+The reader supports the existing READ_IMAGE, R4_UNDO, R4_HEAP_UPDATE, HOT_FULL,
+R4_HEAP_PRUNE, R4_BTREE_DELETE and CTRC trace families listed in
+`workload_log.py`. It accepts `LOG:` records
 whose message starts with `PGRAC_FAMILY=`, preserves field values and nested
 brace blocks, and records the original line, byte offset and SHA256. CSV/JSON
 log formats and multiline messages are not supported. Other families remain
@@ -126,6 +127,13 @@ credit. Input order is retained, including repeated sequence numbers. The
 reader does not join processes, sort clocks or produce normalized workload
 events. All results retain `field_root=OPEN`, `identity_bound=false` and
 `ready_to_run=false`; a parsing exit code is not an acceptance verdict.
+The legacy prune/index-delete envelopes retain `node` without adding `node_id`,
+`sequence_scope` or `sequence_domain`. The manifest checks that original `node`
+against the file role; a PID inventory candidate still does not bind identity.
+The existing B-tree summary format concatenates `after_scn` and
+`conflict_horizon_known` without whitespace. For `delete.applied` and
+`vacuum.applied`, the reader recognizes that exact boundary while retaining
+the original message and raw bytes. Other missing separators are rejected.
 
 ### Workload producer-field projections
 
@@ -135,6 +143,7 @@ Extract typed fields from a verified retained capture:
 python3 src/test/cluster_tap/pre2/workload_evidence.py /path/to/capture/manifest.json > evidence.json
 python3 -m unittest discover -s src/test/cluster_tap/pre2 -p test_workload_evidence.py
 python3 -m unittest discover -s src/test/cluster_tap/pre2 -p test_workload_hot_evidence.py
+python3 -m unittest discover -s src/test/cluster_tap/pre2 -p test_workload_maintenance_evidence.py
 ```
 
 This uses the manifest format above and preserves its file checks and raw trace
@@ -155,6 +164,8 @@ The supported projections are:
 | `HOT_FULL` | Snapshot, build/search results, before/FULL pages and their root/queried ItemId, tuple and ITL snapshots |
 | `R4_HEAP_UPDATE` | Update scalars, requested/old/new TIDs, undo words, inserted WAL LSN and four page/ItemId snapshots |
 | `R4_UNDO` | Builder/route/walk scalars, locator, UBA words/decoded fields, record header/target, page/ITL and target ItemId/tuple |
+| `R4_HEAP_PRUNE` | `prune.result` local page/floor/count/context fields; `prune.item` independent before/after ItemId, redirect, tuple and ITL fields |
+| `R4_BTREE_DELETE` | `delete.applied`/`vacuum.applied` local page/horizon/count/inserted-WAL fields; `index.item` original offset, index tuple and captured posting operands |
 
 Each group has `source_fields`, `raw_values`, `guards`, `missing`, `invalid`
 and `status`. `values` contains a complete typed group only when its status is
@@ -174,13 +185,24 @@ groups. A redirect or other non-tuple ItemId can expose its flags and storage
 without supplying a tuple or ITL slot. Raw command IDs are not resolved combo
 command IDs. Before/after pages and record targets stay separate. Inserted WAL
 does not establish flush or durability; the original flush flag remains in
-the trace. HOT decision text is retained raw. Legacy prune/index-delete
-envelopes remain unhandled by the raw reader.
+the trace. HOT decision text is retained raw.
+
+Prune/index-delete schemas are selected by event. Summary flags and process
+fields never fill item records. Prune `itl_wrap` remains an ITL slot projection,
+without supplying a TT wrap or FullXid. Encoded `raw_index_tid` stays separate
+from a heap TID, which requires its own `heap_tid_known` flag. Captured posting
+positions retain order, duplicates and explicit unknown TIDs; an `OBSERVED`
+position list can contain `heap_tid_known=false` entries. Its original brace
+text remains available. False posting-shape flags keep the list `UNKNOWN`.
+Counts, omitted items, an original index offset and `operation_seq` do not join
+summary/item lines, establish a complete deletion history, or map a new offset.
+Unknown legacy events remain raw observations with `status=UNSUPPORTED`.
 
 Request and reply IDs remain distinct. Receipt handles do not become receipt
 proofs, and final targets remain separate from consumed data targets after a
 retarget. The legacy `CTRC_RECEIPT` domain remains absent (`null` in the
 projection). Repeated consume sequence numbers remain separate observations.
+Prune/index-delete sequence domains also remain absent.
 Other parsed families have `status=UNSUPPORTED`; unhandled families and
 malformed records remain in the original trace output.
 

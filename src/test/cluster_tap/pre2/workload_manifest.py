@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import stat
 
-from workload_log import read_trace
+from workload_log import LEGACY_FAMILIES, read_trace
 
 
 def _require(condition, reason):
@@ -170,7 +170,8 @@ def _read_capture(path):
         candidates = []
         for observation in trace["observations"]:
             fields = observation["fields"]
-            _require(int(fields["node_id"]) == node["node_id"], "LOG node contradicts file role")
+            node_key = "node" if fields["PGRAC_FAMILY"] in LEGACY_FAMILIES else "node_id"
+            _require(int(fields[node_key]) == node["node_id"], "LOG node contradicts file role")
             candidates.append(dict(inventory_indices=[index for index, process in
                                                       enumerate(processes)
                                                       if process["pid"] == int(fields["pid"])]))
