@@ -344,6 +344,19 @@ freeze_final_fence_equal(const ClusterHeapFreezeFinalFenceV1 *left,
 }
 
 static bool
+freeze_locator_equal_exact(const ClusterTxLocator *left,
+						   const ClusterTxLocator *right)
+{
+	return left != NULL && right != NULL
+		&& left->uba.raw[0] == right->uba.raw[0]
+		&& left->uba.raw[1] == right->uba.raw[1]
+		&& left->xid == right->xid
+		&& left->tt_wrap == right->tt_wrap
+		&& left->itl_kind == right->itl_kind
+		&& left->itl_slot_index == right->itl_slot_index;
+}
+
+static bool
 freeze_canonical_locator_shape_valid(const ClusterTxLocator *request,
 									 const ClusterTxResolution *resolution)
 {
@@ -470,5 +483,78 @@ cluster_heap_freeze_validate_proof_batch_v1(
 			return CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR;
 	}
 
+	return CLUSTER_HEAP_FREEZE_PROOF_PROVEN;
+}
+
+ClusterHeapFreezeProofStatusV1
+cluster_heap_freeze_validate_conditional_apply_v1(
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *current_fence)
+{
+	ClusterHeapFreezeProofStatusV1 status;
+	const ClusterHeapFreezeCanonicalProofV1 *first;
+	bool matched[CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH] = {false};
+
+	if (page == NULL
+		|| page->identity.state != CLUSTER_SPACE_IDENTITY_LIVE
+		|| page->block == InvalidBlockNumber
+		|| page->carrier_request_count > CLUSTER_ITL_INITRANS_DEFAULT
+		|| page->data_group_count > CLUSTER_ITL_INITRANS_DEFAULT
+		|| page->tuple_count > MaxHeapTuplesPerPage
+		|| page->multi_tuples > page->tuple_count)
+		return CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR;
+
+	/* No provider result or final fence is a deliberate fail-closed KEEP. */
+	if (proofs == NULL || proofs->proof_count == 0 || current_fence == NULL)
+		return CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
+	if (proofs->proof_count > CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH)
+		return CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR;
+	if (!freeze_final_fence_shape_valid(current_fence))
+		return CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR;
+	if (!freeze_space_identity_equal(&page->identity, &current_fence->identity)
+		|| page->block != current_fence->block)
+		return CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
+	if (page->carrier_request_count == 0
+		|| proofs->proof_count > page->carrier_request_count)
+		return CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR;
+
+	status = cluster_heap_freeze_validate_proof_batch_v1(proofs);
+	if (status != CLUSTER_HEAP_FREEZE_PROOF_PROVEN)
+		return status;
+	first = &proofs->proofs[0];
+	if (!freeze_final_fence_equal(&first->expected_fence, current_fence)
+		|| !freeze_final_fence_equal(&first->current_fence, current_fence))
+		return CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
+
+	for (uint8 proof_index = 0; proof_index < proofs->proof_count; proof_index++)
+	{
+		uint8 matches = 0;
+		uint8 matched_index = 0;
+
+		for (uint8 request_index = 0;
+			 request_index < page->carrier_request_count; request_index++)
+		{
+			if (!freeze_locator_equal_exact(
+					&proofs->proofs[proof_index].requested_locator,
+					&page->carrier_requests[request_index].locator))
+				continue;
+			if (matches++ != 0)
+				return CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR;
+			matched_index = request_index;
+		}
+		if (matches != 1 || matched[matched_index])
+			return CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR;
+		matched[matched_index] = true;
+	}
+
+	for (uint8 request_index = 0;
+		 request_index < page->carrier_request_count; request_index++)
+	{
+		if (!matched[request_index])
+			return CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
+	}
+
+	/* Evidence is ready for the caller's still-synchronous conditional apply. */
 	return CLUSTER_HEAP_FREEZE_PROOF_PROVEN;
 }

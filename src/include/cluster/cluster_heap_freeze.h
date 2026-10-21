@@ -224,4 +224,20 @@ extern ClusterHeapFreezeProofStatusV1
 cluster_heap_freeze_validate_proof_batch_v1(
 	const ClusterHeapFreezeProofBatchV1 *batch);
 
+/*
+ * Join one prepared physical page batch to one bounded proof batch and the
+ * caller's final current fence.  Every carrier request must be covered by an
+ * exact locator match before the predicate can return PROVEN; missing or
+ * absent transport/fence evidence stays KEEP_UNPROVEN, an owner change
+ * returns RETRY_CHANGED, and an ambiguous/malformed mapping is HARD_ERROR.
+ * This is transport/admission readiness only.  It performs no I/O, locking,
+ * WAL, page mutation, authority transfer or retention advance, and the caller
+ * still owns the synchronous final current check and conditional apply.
+ */
+extern ClusterHeapFreezeProofStatusV1
+cluster_heap_freeze_validate_conditional_apply_v1(
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *current_fence);
+
 #endif /* CLUSTER_HEAP_FREEZE_H */

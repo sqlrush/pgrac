@@ -170,8 +170,12 @@ typedef struct LVRelState
 	/* Unproven image and bounded rows; no pointer or freeze permission. */
 	ClusterHeapFreezePageInputV1 shared_freeze_input;
 	ClusterHeapFreezePageBatchV1 shared_freeze_batch;
+	ClusterHeapFreezeProofBatchV1 shared_freeze_proofs;
+	ClusterHeapFreezeFinalFenceV1 shared_freeze_fence;
+	ClusterHeapFreezeProofStatusV1 shared_freeze_apply_status;
 	bool		shared_freeze_input_captured;
 	bool		shared_freeze_input_valid;
+	bool		shared_freeze_fence_valid;
 	BlockNumber shared_mx_deferred_pages;
 	int64		shared_mx_deferred_tuples;
 	int64		shared_xmin_deferred_tuples;
@@ -1011,6 +1015,9 @@ lazy_scan_heap(LVRelState *vacrel)
 		/* A skipped/new/empty/error page must not inherit the preceding input. */
 		vacrel->shared_freeze_input_captured = false;
 		vacrel->shared_freeze_input_valid = false;
+		vacrel->shared_freeze_proofs.proof_count = 0;
+		vacrel->shared_freeze_fence_valid = false;
+		vacrel->shared_freeze_apply_status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
 #endif
 		if (blkno == next_unskippable_block)
 		{
@@ -1520,6 +1527,9 @@ lazy_scan_shared_mx(LVRelState *vacrel, Page page, BlockNumber blkno)
 {
 	vacrel->shared_freeze_input_captured = false;
 	vacrel->shared_freeze_input_valid = false;
+	vacrel->shared_freeze_proofs.proof_count = 0;
+	vacrel->shared_freeze_fence_valid = false;
+	vacrel->shared_freeze_apply_status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
 	if (!vacrel->versioned || !cluster_peer_mode_enabled())
 		return false;
 
@@ -1556,6 +1566,9 @@ lazy_validate_shared_freeze(LVRelState *vacrel, Page page, BlockNumber blkno)
 		case CLUSTER_HEAP_FREEZE_PAGE_CHANGED:
 			vacrel->shared_freeze_input_captured = false;
 			vacrel->shared_freeze_input_valid = false;
+			vacrel->shared_freeze_proofs.proof_count = 0;
+			vacrel->shared_freeze_fence_valid = false;
+			vacrel->shared_freeze_apply_status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
 			vacrel->shared_freeze_changed_pages++;
 			break;
 		default:
@@ -1591,6 +1604,12 @@ lazy_prepare_shared_freeze(LVRelState *vacrel, Buffer *vmbuffer)
 	/* These negative counts survive per-page input replacement/invalidation. */
 	vacrel->shared_xmin_deferred_tuples += vacrel->shared_freeze_batch.unproven_xmin_tuples;
 	vacrel->shared_xmax_deferred_tuples += vacrel->shared_freeze_batch.unproven_xmax_tuples;
+	vacrel->shared_freeze_proofs.proof_count = 0;
+	vacrel->shared_freeze_fence_valid = false;
+	/* No transport provider/final fence is wired yet, so remain KEEP. */
+	vacrel->shared_freeze_apply_status =
+		cluster_heap_freeze_validate_conditional_apply_v1(
+			&vacrel->shared_freeze_batch, &vacrel->shared_freeze_proofs, NULL);
 	vacrel->shared_freeze_input_valid = true;
 }
 #endif

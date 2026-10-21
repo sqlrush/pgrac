@@ -1303,6 +1303,10 @@ UT_TEST(real_scan_prepares_after_heap_lock_and_both_pins_are_released)
 			UT_ASSERT_EQ(fixture_vm_releases, 1);
 			UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
 			UT_ASSERT(prepared_batch() != NULL);
+			/* The real consumer has no transport/fence provider yet. */
+			UT_ASSERT_EQ(state.shared_freeze_apply_status,
+							 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+			UT_ASSERT(!state.shared_freeze_fence_valid);
 		}
 }
 
@@ -1969,10 +1973,73 @@ UT_TEST(proof_batch_is_all_or_nothing_for_conditional_apply)
 					 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
 }
 
+UT_TEST(conditional_apply_requires_exact_carriers_and_final_fence)
+{
+	ClusterHeapFreezeCanonicalProofV1 proof;
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 current_fence;
+
+	init_canonical_proof_fixture(&proof);
+	memset(&page, 0, sizeof(page));
+	memset(&proofs, 0, sizeof(proofs));
+	page.identity = state.identity;
+	page.block = proof.expected_fence.block;
+	page.carrier_request_count = 1;
+	page.carrier_requests[0].locator = proof.requested_locator;
+	proofs.proof_count = 1;
+	proofs.proofs[0] = proof;
+	current_fence = proof.expected_fence;
+
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_conditional_apply_v1(&page,
+																	 &proofs,
+																	 &current_fence),
+						 CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+
+	/* The provider and final fence are mandatory; no proof stays fail-closed. */
+	proofs.proof_count = 0;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_conditional_apply_v1(&page,
+																	 &proofs,
+																	 &current_fence),
+						 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	proofs.proof_count = 1;
+
+	/* A changed current owner retries the whole conditional apply. */
+	current_fence.holder_sequence++;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_conditional_apply_v1(&page,
+																	 &proofs,
+																	 &current_fence),
+						 CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	current_fence = proof.expected_fence;
+
+	/* A physical locator mismatch is an ambiguous proof, not a retry. */
+	page.carrier_requests[0].locator.xid++;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_conditional_apply_v1(&page,
+																	 &proofs,
+																	 &current_fence),
+						 CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR);
+	page.carrier_requests[0].locator = proof.requested_locator;
+
+	/* Two equal physical requests make the proof-to-row mapping ambiguous. */
+	page.carrier_request_count = 2;
+	page.carrier_requests[1] = page.carrier_requests[0];
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_conditional_apply_v1(&page,
+																	 &proofs,
+																	 &current_fence),
+						 CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR);
+
+	/* A valid proof for only part of the carrier set keeps the page unproven. */
+	page.carrier_requests[1].locator.xid++;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_conditional_apply_v1(&page,
+																	 &proofs,
+																	 &current_fence),
+						 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+}
+
 int
 main(void)
 {
-	UT_PLAN(60);
+	UT_PLAN(61);
 	UT_RUN(share_scan_preserves_every_reference_before_native_consumer);
 	UT_RUN(cleanup_scan_preserves_before_prune_and_freeze);
 	UT_RUN(raw_multi_value_never_selects_local_reader);
@@ -2033,6 +2100,7 @@ main(void)
 	UT_RUN(final_fence_mismatch_retries_without_proof);
 	UT_RUN(unproven_tt_and_snapshot_never_admit_freeze);
 	UT_RUN(proof_batch_is_all_or_nothing_for_conditional_apply);
+	UT_RUN(conditional_apply_requires_exact_carriers_and_final_fence);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
