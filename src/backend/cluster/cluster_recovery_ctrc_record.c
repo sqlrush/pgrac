@@ -50,6 +50,52 @@ refused:
 	return false;
 }
 
+bool
+cluster_recovery_ctrc_reference_v2(const XLogReaderState *reader, uint32 source_index,
+								   const uint8 source_identity_digest[32], const uint8 *raw_record,
+								   size_t raw_length, ClusterRecoveryCTRCReferenceV2 *out)
+{
+	ClusterRecoveryCTRCReleaseV2 record;
+	ClusterRecoveryCTRCReferenceV2 reference;
+	uint32 data_length;
+
+	if (out == NULL)
+		return false;
+	if (raw_record == NULL
+		|| raw_length
+			   != SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + CLUSTER_RECOVERY_CTRC_BYTES
+		|| !cluster_recovery_ctrc_read_v2(reader, &record))
+		goto refused;
+	/* The decoded header is only a header. Bind the supplied complete final
+	 * raw snapshot to it and to the original reader's entire main data. */
+	if (memcmp(raw_record, &reader->record->header, SizeOfXLogRecord) != 0
+		|| raw_record[SizeOfXLogRecord] != XLR_BLOCK_ID_DATA_LONG)
+		goto refused;
+	memcpy(&data_length, raw_record + SizeOfXLogRecord + 1, sizeof(data_length));
+	if (data_length != CLUSTER_RECOVERY_CTRC_BYTES
+		|| memcmp(raw_record + SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong,
+				  XLogRecGetData(reader), CLUSTER_RECOVERY_CTRC_BYTES)
+			   != 0)
+		goto refused;
+
+	memset(&reference, 0, sizeof(reference));
+	if (!cluster_recovery_ctrc_record_hash_v2(source_identity_digest, reader->ReadRecPtr,
+											  reader->EndRecPtr, raw_record, raw_length,
+											  reference.raw_record_sha256))
+		goto refused;
+	reference.source_index = source_index;
+	reference.start = reader->ReadRecPtr;
+	reference.end = reader->EndRecPtr;
+	reference.raw_length = (uint32)raw_length;
+	/* All aliased raw/source input has been consumed before publication. */
+	*out = reference;
+	return true;
+
+refused:
+	memset(out, 0, sizeof(*out));
+	return false;
+}
+
 ClusterRecoveryCTRCTargetMatchV2
 cluster_recovery_ctrc_target_match_v2(const uint8 *payload, size_t payload_length,
 									  uint64 system_identifier, const void *header_page,

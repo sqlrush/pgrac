@@ -72,6 +72,30 @@ extern bool cluster_recovery_ctrc_decode_v2(const uint8 *bytes, size_t length,
 extern bool cluster_recovery_ctrc_read_v2(const XLogReaderState *reader,
 										  ClusterRecoveryCTRCReleaseV2 *out);
 
+/* Logical R fields, never an on-disk struct or an owner completion proof. */
+typedef struct ClusterRecoveryCTRCReferenceV2 {
+	uint32 source_index;
+	XLogRecPtr start;
+	XLogRecPtr end;
+	uint32 raw_length;
+	uint8 raw_record_sha256[32];
+} ClusterRecoveryCTRCReferenceV2;
+
+/* Bind a successfully read standalone D0 to the original owner's complete,
+ * immutable final raw snapshot. Require exact native header, long-data frame
+ * and all payload bytes; hash those supplied bytes, never reconstructed data
+ * or a private reader buffer. Positions come only from the current reader.
+ *
+ * The caller retains the original ROOT-selected source index/identity, cut,
+ * pins and owner authority. This function neither qualifies those inputs nor
+ * proves graph completeness, target durability, release or completion. No
+ * live writer/dispatch. On refusal clear *out. Output may alias raw/source
+ * input consumed before publication, but must not overlap reader storage. */
+extern bool cluster_recovery_ctrc_reference_v2(const XLogReaderState *reader, uint32 source_index,
+											   const uint8 source_identity_digest[32],
+											   const uint8 *raw_record, size_t raw_length,
+											   ClusterRecoveryCTRCReferenceV2 *out);
+
 typedef enum ClusterRecoveryCTRCTargetMatchV2 {
 	CLUSTER_RECOVERY_CTRC_TARGET_REFUSED = 0,
 	CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_BEFORE,
