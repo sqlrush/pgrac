@@ -94,6 +94,17 @@ extern bool cluster_recovery_stamp_inserted_v1(const ClusterRecoveryStampHandleV
  * the original inserter and the remaining independent proofs are required. */
 extern bool cluster_recovery_stamp_ctrc_inserted_v2(const ClusterRecoveryStampHandleV1 *handle,
 													XLogRecPtr end);
+/* The original executor's dormant D0 emitter. The caller must have completed
+ * all readiness/authority/capacity checks and hold the immutable prepared
+ * payload while in its critical section. This performs exactly one native
+ * XLogBeginInsert/RegisterData/XLogInsert and immediately binds the original
+ * native header and positions. A live native XID, disallowed insertion, any
+ * pre-insert mismatch, native error, or post-insert mismatch refuses; after
+ * insertion the window is sticky failed and cannot be cancelled or completed.
+ * It proves neither WAL flush nor target IO durability, graph/owner authority,
+ * full raw-record identity, nor any live production caller. */
+extern XLogRecPtr
+cluster_recovery_stamp_ctrc_insert_v2(const ClusterRecoveryStampHandleV1 *handle);
 /* Only the original executor calls durable after real WAL flush and exact
  * target sync/postread. These APIs record completion, never prove it. */
 extern bool cluster_recovery_stamp_durable_v1(const ClusterRecoveryStampHandleV1 *handle);

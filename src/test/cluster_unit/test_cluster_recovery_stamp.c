@@ -40,6 +40,78 @@ static XLogRecPtr last_insert_record_end;
 static bool begininsert_called;
 static char *hdr_scratch;
 static XLogRecord native_header;
+static bool insert_allowed;
+static TransactionId insert_xid;
+static unsigned native_calls, native_stage, native_fault, native_throw;
+static uint8 registered_payload[320];
+static sigjmp_buf insert_error_boundary;
+
+bool
+XLogInsertAllowed(void)
+{
+	return insert_allowed;
+}
+TransactionId
+GetCurrentTransactionIdIfAny(void)
+{
+	return insert_xid;
+}
+static void
+native_insert_boundary(unsigned stage)
+{
+	UT_ASSERT(CritSectionCount > 0);
+	UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_INSERTING);
+	for (unsigned i = 0; i <= CLUSTER_RECOVERY_STAMP_SLOTS; i++)
+		UT_ASSERT(SpinLockFree(&region.thread_replay[i].stamp.lock));
+	UT_ASSERT_EQ(native_stage + 1, stage);
+	native_stage = stage;
+	native_calls++;
+	if (native_throw == stage)
+		siglongjmp(insert_error_boundary, 1);
+}
+void
+XLogBeginInsert(void)
+{
+	native_insert_boundary(1);
+	UT_ASSERT(insert_allowed);
+	UT_ASSERT(!begininsert_called);
+	begininsert_called = true;
+}
+void
+XLogRegisterData(char *data, uint32 length)
+{
+	native_insert_boundary(2);
+	UT_ASSERT(begininsert_called);
+	UT_ASSERT_EQ(length, 320);
+	UT_ASSERT(memcmp(data, region.thread_replay[2].stamp.handle.payload, 320) == 0);
+	memcpy(registered_payload, data, 320);
+}
+XLogRecPtr
+XLogInsert(RmgrId rmid, uint8 info)
+{
+	native_insert_boundary(3);
+	UT_ASSERT(begininsert_called);
+	UT_ASSERT_EQ(rmid, RM_CLUSTER_UNDO_ID);
+	UT_ASSERT_EQ(info, 0xD0);
+	memset(&native_header, 0, sizeof(native_header));
+	native_header.xl_tot_len = SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + 320;
+	native_header.xl_rmid = rmid;
+	native_header.xl_info = info;
+	hdr_scratch = (char *)&native_header;
+	begininsert_called = false;
+	ProcLastRecPtr = 0x2000018;
+	XactLastRecEnd = last_insert_record_end = 0x2000413;
+	switch (native_fault) {
+	case 1: native_header.xl_rmid = RM_XLOG_ID; break;
+	case 2: native_header.xl_xid = 100; break;
+	case 3: return InvalidXLogRecPtr;
+	case 4: last_insert_record_end++; break;
+	case 5: ProcLastRecPtr = 0x1FFFFFF; break;
+	case 6: native_header.xl_tot_len++; break;
+	case 7: native_header.xl_info ^= 0x10; break;
+	}
+	return XactLastRecEnd;
+}
 #include "test_cluster_recovery_stamp_insert.inc"
 
 /* Use the actual codec/provider. Allocation must be outside every original
@@ -87,6 +159,10 @@ fresh(void)
 	begininsert_called = false;
 	hdr_scratch = NULL;
 	memset(&native_header, 0, sizeof(native_header));
+	insert_allowed = true;
+	insert_xid = InvalidTransactionId;
+	native_calls = native_stage = native_fault = native_throw = 0;
+	memset(registered_payload, 0, sizeof(registered_payload));
 	memset(&owner, 0, sizeof(owner));
 	owner.writer.ref.claim.identity.system_identifier = 99;
 	memset(owner.writer.ref.claim.identity.storage_uuid, 1, 16);
@@ -837,10 +913,129 @@ UT_TEST(d0_native_insert_exact_window_and_sticky_refusal)
 	UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
 }
 
+/* The original adapter/codec/window/native accessor are real. The three
+ * native insertion leaves below the adapter are controlled, not disk WAL. */
+UT_TEST(d0_emitter_exact_payload_positions_and_single_insert)
+{
+	for (unsigned outcome = TT_SLOT_COMMITTED; outcome <= TT_SLOT_ABORTED; outcome++) {
+		ClusterRecoveryStampHandleV1 h;
+		ClusterRecoveryStampSlotV1 *slot;
+		unsigned before;
+		fresh();
+		UT_ASSERT(begin_d0(&h, outcome));
+		slot = &region.thread_replay[2].stamp;
+		if (outcome == TT_SLOT_ABORTED)
+			MyBackendType = B_BG_WORKER;
+		before = hash_calls;
+		CritSectionCount = 1;
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_insert_v2(&h), 0x2000413);
+		UT_ASSERT_EQ(native_calls, 3);
+		UT_ASSERT_EQ(native_stage, 3);
+		UT_ASSERT(memcmp(registered_payload, h.payload, 320) == 0);
+		UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+		UT_ASSERT_EQ(slot->record_start, 0x2000018);
+		UT_ASSERT_EQ(slot->record_end, 0x2000413);
+		UT_ASSERT(!slot->failed);
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_insert_v2(&h), InvalidXLogRecPtr);
+		UT_ASSERT_EQ(native_calls, 3);
+		UT_ASSERT_EQ(hash_calls, before);
+		CritSectionCount = 0;
+		UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+		UT_ASSERT(cluster_recovery_stamp_durable_v1(&h));
+		UT_ASSERT(cluster_recovery_stamp_clear_v1(&h));
+	}
+}
+
+UT_TEST(d0_emitter_preinsert_refusal_is_atomic)
+{
+	for (unsigned i = 0; i < 12; i++) {
+		ClusterRecoveryStampHandleV1 h, changed;
+		ClusterRecoveryStampSlotV1 saved;
+		unsigned before;
+		fresh();
+		UT_ASSERT(begin_d0(&h, TT_SLOT_ABORTED));
+		changed = h;
+		CritSectionCount = 1;
+		switch (i) {
+		case 0: CritSectionCount = 0; break;
+		case 1: changed.kind = CLUSTER_RECOVERY_STAMP_C0; break;
+		case 2: changed.payload_length--; break;
+		case 3: changed.payload[319] ^= 1; break;
+		case 4: changed.key.window_seq++; break;
+		case 5: changed.owner.recovery_serial++; break;
+		case 6: MyProcPid++; break;
+		case 7: MyBackendType = B_LMON; break;
+		case 8: insert_allowed = false; break;
+		case 9: insert_xid = 100; break;
+		case 10: UT_ASSERT(cluster_recovery_stamp_fail_v1(&h)); break;
+		case 11: cluster_shared_config = false; break;
+		}
+		saved = region.thread_replay[2].stamp;
+		before = hash_calls;
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_insert_v2(&changed), InvalidXLogRecPtr);
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_insert_v2(NULL), InvalidXLogRecPtr);
+		UT_ASSERT_EQ(native_calls, 0);
+		UT_ASSERT_EQ(hash_calls, before);
+		UT_ASSERT(memcmp(&region.thread_replay[2].stamp, &saved, sizeof(saved)) == 0);
+	}
+	CritSectionCount = 0;
+}
+
+UT_TEST(d0_emitter_postinsert_refusal_retains_failed_window)
+{
+	for (unsigned fault = 1; fault <= 7; fault++) {
+		ClusterRecoveryStampHandleV1 h;
+		ClusterRecoveryStampCaptureV1 capture;
+		ClusterRecoveryStampSlotV1 *slot;
+		unsigned before;
+		fresh();
+		UT_ASSERT(begin_d0(&h, TT_SLOT_COMMITTED));
+		UT_ASSERT(cluster_recovery_stamp_capture_v1(&capture));
+		slot = &region.thread_replay[2].stamp;
+		native_fault = fault;
+		before = hash_calls;
+		CritSectionCount = 1;
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_insert_v2(&h), InvalidXLogRecPtr);
+		UT_ASSERT_EQ(native_calls, 3);
+		UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_INSERTING);
+		UT_ASSERT(slot->failed);
+		UT_ASSERT(memcmp(&slot->handle, &h, sizeof(h)) == 0);
+		UT_ASSERT_EQ(hash_calls, before);
+		CritSectionCount = 0;
+		UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_durable_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+		UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&capture), CLUSTER_RECOVERY_STAMP_INVALID);
+	}
+}
+
+UT_TEST(d0_emitter_native_error_cannot_cancel_or_complete)
+{
+	for (unsigned stage = 1; stage <= 3; stage++) {
+		ClusterRecoveryStampHandleV1 h;
+		fresh();
+		UT_ASSERT(begin_d0(&h, TT_SLOT_ABORTED));
+		native_throw = stage;
+		CritSectionCount = 1;
+		if (sigsetjmp(insert_error_boundary, 0) == 0) {
+			(void)cluster_recovery_stamp_ctrc_insert_v2(&h);
+			UT_ASSERT(false);
+		} else {
+			UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_INSERTING);
+			UT_ASSERT(memcmp(&region.thread_replay[2].stamp.handle, &h, sizeof(h)) == 0);
+			CritSectionCount = 0;
+			UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+			UT_ASSERT(!cluster_recovery_stamp_durable_v1(&h));
+			UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+		}
+	}
+	CritSectionCount = 0;
+}
+
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(20);
 	UT_RUN(exact_lifecycle_and_owned_payload);
 	UT_RUN(preinsert_cancel_capture_and_new_sequence);
 	UT_RUN(inserting_failure_exit_and_replay_reset_cannot_retire);
@@ -857,6 +1052,10 @@ main(void)
 	UT_RUN(d0_native_insert_context_and_position_refusal);
 	UT_RUN(d0_native_insert_exact_header_refusal);
 	UT_RUN(d0_native_insert_exact_window_and_sticky_refusal);
+	UT_RUN(d0_emitter_exact_payload_positions_and_single_insert);
+	UT_RUN(d0_emitter_preinsert_refusal_is_atomic);
+	UT_RUN(d0_emitter_postinsert_refusal_retains_failed_window);
+	UT_RUN(d0_emitter_native_error_cannot_cancel_or_complete);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

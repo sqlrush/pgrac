@@ -42,6 +42,8 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "access/xact.h"
+#include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_clean_leave.h"
@@ -831,6 +833,37 @@ cluster_recovery_stamp_ctrc_inserted_v2(const ClusterRecoveryStampHandleV1 *hand
 			   != SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + CLUSTER_RECOVERY_CTRC_BYTES)
 		return false;
 	return cluster_recovery_stamp_inserted_v1(handle, start, end);
+}
+XLogRecPtr
+cluster_recovery_stamp_ctrc_insert_v2(const ClusterRecoveryStampHandleV1 *handle)
+{
+	XLogRecPtr end;
+
+	/* The caller owns every readiness proof. This adapter only consumes an
+	 * immutable prepared handle while the original executor is in its critical
+	 * section; it does not manufacture recovery, graph, retention or IO
+	 * authority. A live native XID would make this a different WAL operation,
+	 * so refuse before changing the window. */
+	if (CritSectionCount == 0 || handle == NULL
+		|| handle->kind != CLUSTER_RECOVERY_STAMP_D0
+		|| handle->payload_length != CLUSTER_RECOVERY_CTRC_BYTES
+		|| !XLogInsertAllowed() || TransactionIdIsValid(GetCurrentTransactionIdIfAny())
+		|| !cluster_recovery_stamp_inserting_v1(handle))
+		return InvalidXLogRecPtr;
+
+	/* The original XLogInsert assembler was prepared before PRE_INSERT. The
+	 * borrowed payload remains owned by the handle until this call returns;
+	 * no allocation, wait, flush, or target write is introduced here. */
+	XLogBeginInsert();
+	XLogRegisterData((char *) handle->payload, CLUSTER_RECOVERY_CTRC_BYTES);
+	end = XLogInsert(RM_CLUSTER_UNDO_ID, CLUSTER_RECOVERY_CTRC_WAL_INFO);
+	if (end == InvalidXLogRecPtr || !cluster_recovery_stamp_ctrc_inserted_v2(handle, end)) {
+		/* Once native insertion began, neither an ERROR/PANIC boundary nor a
+		 * post-insert mismatch may cancel or fake completion of this window. */
+		(void) cluster_recovery_stamp_fail_v1(handle);
+		return InvalidXLogRecPtr;
+	}
+	return end;
 }
 bool
 cluster_recovery_stamp_durable_v1(const ClusterRecoveryStampHandleV1 *handle)

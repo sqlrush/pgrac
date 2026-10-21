@@ -9921,6 +9921,8 @@ test_cluster_recovery_stamp_insert.inc: $(top_srcdir)/src/backend/access/transam
 test_cluster_recovery_stamp: test_cluster_recovery_stamp.c unit_test.h \
         test_cluster_recovery_stamp_insert.inc \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
+        $(top_srcdir)/src/include/access/xact.h \
+        $(top_srcdir)/src/include/access/xlog.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
