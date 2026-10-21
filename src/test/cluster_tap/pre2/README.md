@@ -43,6 +43,63 @@ gate remain prerequisites for four-node workload runs. These scripts neither
 reserve a lab nor establish that gate. A native fixture smoke test or a mock
 adapter does not qualify a physical multi-node deployment.
 
+### Retained workload manifest intake
+
+Verify a retained four-node capture without contacting a server:
+
+```sh
+python3 src/test/cluster_tap/pre2/workload_manifest.py /path/to/capture/manifest.json > capture.json
+python3 -m unittest discover -s src/test/cluster_tap/pre2 -p test_workload_manifest.py
+```
+
+The version-1 JSON manifest contains these fields:
+
+| Field | Contents |
+| --- | --- |
+| `version`, `run_id` | Integer `1` and a nonempty capture identifier |
+| `source` | `commit` and `tree` as full lowercase Git SHA1 strings; `file` references the retained source snapshot |
+| `harness` | File ID of the retained harness snapshot |
+| `files` | Object mapping file IDs to `path`, `sha256`, `size_bytes` descriptors |
+| `nodes` | Four objects with distinct integer `node_id` values 0 through 3, nonempty `boot_id`, decimal-string `cluster_epoch`, and file IDs in `postgres`, `config`, `stderr`, `inventory` |
+
+All nodes must declare the same cluster epoch and provide identical postgres
+bytes. Each file ID has exactly one role: source, harness, or one of the four
+files per node. Paths are relative to the manifest directory and must resolve
+inside it to distinct regular files. The reader verifies every file's byte
+length and SHA256; missing, changed, aliased or unused files are rejected.
+Source snapshots and binaries are hashed in chunks. Stderr and inventory files
+are held in memory. Preserve all input files alongside the resulting JSON.
+
+Each inventory is a JSON object with `run_id`, `node_id`, `boot_id`,
+`cluster_epoch`, `source_commit`, `source_tree`, `postgres_sha256`,
+`config_sha256` and `harness_sha256` matching the manifest declarations and
+verified file hashes. Its `processes` array may be empty. Otherwise each entry
+has a positive integer `pid`, nonnegative integer `procno`, and nonempty
+`backend_start`, `process_incarnation` and `role` strings. Duplicate complete
+process identities are rejected. PID reuse with different identities is
+retained. Duplicate JSON keys and nonstandard numeric constants are rejected
+in both manifest and inventories.
+
+`file_binding=VERIFIED` proves that the files read match the manifest digests.
+These are caller-supplied declarations, not origin or capture-time attestation;
+source commit and binary hashes do not prove built-from-source or the identity
+of a running server. The output therefore retains `build_binding=DECLARED_ONLY`.
+The existing LOG reader parses the exact verified stderr bytes. A supported
+observation naming a different node is rejected. `process_candidates` lists
+inventory indices matching each observation's PID, including all reused-PID
+candidates and empty lists for missing processes. No candidate supplies fields
+to the raw observation or binds its process incarnation, even with one match.
+
+The output always has `identity_bound=false`, `field_root=OPEN` and
+`ready_to_run=false`. It does not produce normalized contract events, request
+or receipt joins, barrier/sequence completeness, STOP evidence or workload
+verdicts. Exit 0 means file verification succeeded, at least one supported
+record parsed, and no known record was malformed; exit 1 means a manifest/file
+error or malformed known record; exit 2 means no supported records or an
+argument error. Unhandled families and empty node logs retain their original
+meaning and cannot establish trace completeness. None of these exit codes
+authorizes a workload or satisfies native runtime gates.
+
 ### Structured workload LOG intake
 
 Read one retained PostgreSQL stderr log without starting a server:
