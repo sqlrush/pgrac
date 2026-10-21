@@ -37,6 +37,8 @@ static const ClusterShmemRegion *runtime_storage_region;
 static ClusterWalWriterToken runtime_storage_writer;
 static uint64 runtime_storage_full_xid;
 static bool runtime_storage_in_progress;
+static bool runtime_storage_binding_available;
+static ClusterCanonicalTxnBinding runtime_storage_binding;
 static unsigned runtime_storage_assignments, runtime_storage_binding_reads;
 
 static void
@@ -124,7 +126,9 @@ cluster_tt_local_get_published_binding(TransactionId xid, ClusterCanonicalTxnBin
 		abort();
 	runtime_storage_binding_reads++;
 	memset(out, 0, sizeof(*out));
-	return false; /* No binding is manufactured by this fixture. */
+	if (runtime_storage_binding_available)
+		*out = runtime_storage_binding;
+	return runtime_storage_binding_available; /* Controlled receipt, no TT publisher. */
 }
 
 void
@@ -192,6 +196,8 @@ runtime_storage_setup(ClusterRelmapOwnerSampleV2 *sample,
 	cluster_node_id = origin;
 	runtime_storage_full_xid = owner.top_full_xid;
 	runtime_storage_in_progress = true;
+	runtime_storage_binding_available = false;
+	memset(&runtime_storage_binding, 0, sizeof(runtime_storage_binding));
 	runtime_storage_assignments = runtime_storage_binding_reads = 0;
 	memset(&runtime_storage_writer, 0, sizeof(runtime_storage_writer));
 	runtime_storage_writer.ref.timeline = 1;
@@ -760,4 +766,152 @@ UT_TEST(test_runtime_storage_terminal_io_failure_and_explicit_retry)
 		UT_ASSERT_EQ(memcmp(&pin, &stage_directory->pins[0], sizeof(pin)), 0);
 		runtime_storage_assert_pin(&sample, &ns, true);
 	}
+}
+
+/* Compose the original begin/bind/stage/finish and consumer guards with two
+ * actual namespaces. Native floor/issued/COMPLETE and the late original TT
+ * receipt remain controlled inputs, not certification or a live ACTIVE hook. */
+static void
+runtime_storage_late_binding_namespaces(bool receipt_before_local_begin)
+{
+	for (unsigned origin = 0; origin < CLUSTER_MAX_NODES; origin += CLUSTER_MAX_NODES - 1)
+		for (unsigned publish = 0; publish < 2; publish++) {
+		ClusterRelmapOwnerSampleV2 sample;
+		ClusterRelmapV2Namespace ns[2];
+		ClusterRelmapV2Image staged[2];
+		ClusterRelmapRetentionPin pins[2];
+		ClusterRelmapRetentionRuntimeTruncateV2 cut = { 0 };
+		ClusterRelmapV2View view;
+		unsigned char encoded[2176], copies[2][2176], after[2176];
+		RelMapFile committed;
+		uint64 generation;
+
+		runtime_storage_setup(&sample, &ns[0], origin, true);
+		UT_ASSERT(runtime_storage_stage(&sample, &ns[0]));
+		staged[0] = runtime_storage_staged_image(&sample, &ns[0]);
+		runtime_storage_binding.segment_id = 17;
+		runtime_storage_binding.segment_generation = 0;
+		runtime_storage_binding.xid = (TransactionId) runtime_storage_full_xid;
+		runtime_storage_binding.slot_offset = TT_SLOTS_PER_SEGMENT - 1;
+		runtime_storage_binding.origin_instance = origin + 1;
+		runtime_storage_binding.publish_state = CLUSTER_CANONICAL_TXN_PUBLISHED;
+		runtime_storage_binding.active_lsn = 0x4567;
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_tt_release_check_v2(
+			ns[0].system_identifier, ns[0].database_incarnation, &runtime_storage_binding),
+			CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+		if (receipt_before_local_begin) {
+			runtime_storage_binding_available = true;
+			UT_ASSERT_EQ(cluster_relmap_retention_runtime_bind_current_v2(), CLUSTER_RELMAP_RETENTION_OK);
+		}
+
+		/* Add the local namespace without resetting the original shared
+		 * directory, FullXid, first pin or global files. Distinct generations
+		 * and mapping values detect cross-namespace adoption or cleanup. */
+		ns[1] = ns[0];
+		ns[1].shared = false;
+		ns[1].dbid = MyDatabaseId;
+		staged[1] = runtime_storage_staged_image(&sample, &ns[1]);
+		staged[1].committed_generation = 11;
+		staged[1].pending_generation = 12;
+		staged[1].committed = map_image(41000);
+		staged[1].pending = map_image(41001);
+		{
+			ClusterRelmapV2Image clean = { 0 };
+
+			clean.identity = ns[1];
+			clean.committed_generation = 11;
+			clean.committed = staged[1].committed;
+			UT_ASSERT_EQ(cluster_relmap_v2_encode(&clean, encoded, sizeof(encoded)), CLUSTER_RELMAP_V2_VALID);
+			snprintf(directory, sizeof(directory), "%s/base/42", root);
+			write_copy(0, encoded, sizeof(encoded));
+			write_copy(1, encoded, sizeof(encoded));
+		}
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_begin_v2(&sample, &ns[1], 12),
+			CLUSTER_RELMAP_RETENTION_OK);
+		UT_ASSERT_EQ(stage_directory->pins[1].has_tt_binding, receipt_before_local_begin);
+		stage_pin_index = 1;
+		mapping_held = observing_stage = true;
+		UT_ASSERT(cluster_relmap_retention_runtime_write_pending_v2(
+			&sample, &ns[1], 12, owner.wal_end, &staged[1].pending));
+		mapping_held = observing_stage = false;
+		UT_ASSERT_EQ(writes, 4);
+		UT_ASSERT_EQ(writes_without_pin, 0);
+		if (!receipt_before_local_begin) {
+			ClusterRelmapRetentionDirectory before = *stage_directory;
+
+			/* Invalid published input cannot partially enroll either staged
+			 * namespace, touch its files or release the unbound raw xid. */
+			read_copy(0, copies[0]);
+			read_copy(1, copies[1]);
+			runtime_storage_binding_available = true;
+			runtime_storage_binding.active_lsn = 0;
+			UT_ASSERT_EQ(cluster_relmap_retention_runtime_bind_current_v2(), CLUSTER_RELMAP_RETENTION_INVALID);
+			UT_ASSERT_EQ(memcmp(&before, stage_directory, sizeof(before)), 0);
+			for (unsigned copy = 0; copy < 2; copy++) {
+				read_copy(copy, after);
+				UT_ASSERT_EQ(memcmp(copies[copy], after, sizeof(after)), 0);
+			}
+			runtime_storage_binding.active_lsn = 0x4567;
+			UT_ASSERT_EQ(cluster_relmap_retention_runtime_bind_current_v2(), CLUSTER_RELMAP_RETENTION_OK);
+		}
+		UT_ASSERT_EQ(runtime_storage_assignments, 1);
+		UT_ASSERT_EQ(runtime_storage_binding_reads, receipt_before_local_begin ? 3 : 4);
+		for (unsigned n = 0; n < 2; n++) {
+			pins[n] = stage_directory->pins[n];
+			UT_ASSERT(pins[n].occupied && pins[n].may_be_staged && pins[n].has_tt_binding);
+			UT_ASSERT_EQ(pins[n].key.identity.shared, n == 0);
+			UT_ASSERT_EQ(pins[n].key.generation, n == 0 ? 8 : 12);
+			UT_ASSERT_EQ(pins[n].key.top_full_xid, sample.owner.top_full_xid);
+			UT_ASSERT_EQ(pins[n].wal_end, owner.wal_end);
+			UT_ASSERT_EQ(memcmp(&pins[n].binding, &runtime_storage_binding, sizeof(pins[n].binding)), 0);
+		}
+		UT_ASSERT(!stage_directory->pins[2].occupied);
+
+		/* Exercise both clear orders while keeping one original transaction
+		 * polarity: COMMIT cannot mix with ABORT inside one FullXid. */
+		for (unsigned done = 0; done < 2; done++) {
+			unsigned n = publish ? done : 1 - done;
+			unsigned other = 1 - n;
+
+			runtime_storage_reset_terminal_io(publish);
+			UT_ASSERT_EQ(runtime_storage_finish(&sample, &staged[n], publish), CLUSTER_RELMAP_V2_CLEARED_POSTREAD);
+			UT_ASSERT_EQ(writes, 2);
+			UT_ASSERT_EQ(renames, 2);
+			UT_ASSERT_EQ(file_syncs, 2);
+			UT_ASSERT_EQ(dir_syncs, 2);
+			UT_ASSERT(cluster_relmap_authority_v2_read_committed(&ns[n], &committed, &generation));
+			UT_ASSERT_EQ(generation, n == 0 ? (publish ? 8 : 7) : (publish ? 12 : 11));
+			UT_ASSERT_EQ(committed.mappings[0].mapfilenumber,
+				n == 0 ? (publish ? 40001 : 40000) : (publish ? 41001 : 41000));
+			UT_ASSERT_EQ(cluster_relmap_authority_v2_read(&ns[other], &view), CLUSTER_RELMAP_V2_PAIR_VALID);
+			UT_ASSERT_EQ(view.has_pending, done == 0);
+			UT_ASSERT_EQ(cluster_relmap_retention_runtime_tt_release_check_v2(
+				ns[0].system_identifier, ns[0].database_incarnation, &runtime_storage_binding),
+				CLUSTER_RELMAP_RETENTION_RETAINED);
+			for (unsigned pin = 0; pin < 2; pin++)
+				UT_ASSERT_EQ(memcmp(&pins[pin], &stage_directory->pins[pin], sizeof(pins[pin])), 0);
+			UT_ASSERT_EQ(io_under_retention_lock, 0);
+			UT_ASSERT_EQ(retention_acquires, retention_releases);
+			UT_ASSERT(!retention_held);
+		}
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_truncate_begin_v2(ns[0].system_identifier,
+			ns[0].database_incarnation, origin, sample.owner.top_full_xid + 8, &cut), CLUSTER_RELMAP_RETENTION_OK);
+		UT_ASSERT_EQ(cut.reservation.cutoff, sample.owner.top_full_xid);
+		UT_ASSERT_EQ(stage_directory->native_floor, sample.owner.top_full_xid - 16);
+		UT_ASSERT_EQ(stage_directory->last_issued, sample.owner.top_full_xid + 16);
+		for (unsigned pin = 0; pin < 2; pin++)
+			UT_ASSERT_EQ(memcmp(&pins[pin], &stage_directory->pins[pin], sizeof(pins[pin])), 0);
+		UT_ASSERT_EQ(retention_acquires, retention_releases);
+		/* No original truncation I/O or complete acknowledgement is supplied. */
+	}
+}
+
+UT_TEST(test_runtime_storage_late_binding_enrolls_both_staged_namespaces)
+{
+	runtime_storage_late_binding_namespaces(false);
+}
+
+UT_TEST(test_runtime_storage_late_binding_precedes_second_namespace_begin)
+{
+	runtime_storage_late_binding_namespaces(true);
 }

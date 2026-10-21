@@ -43,6 +43,8 @@ bool enableFsync = true;
 
 static char root[MAXPGPATH];
 static char directory[MAXPGPATH];
+/* Selected namespace pin at the serialized stage write boundary. */
+static unsigned stage_pin_index;
 static unsigned int writes, renames, file_syncs, dir_syncs, reads;
 static unsigned int fail_write, fail_rename, fail_file_sync, fail_dir_sync;
 static bool corrupt_after_rename, replace_during_read, replace_after_rename;
@@ -230,7 +232,7 @@ relmap_test_write(int fd, const void *bytes, size_t len)
 {
 	observe_io();
 	if (observing_stage) {
-		const ClusterRelmapRetentionPin *pin = &stage_directory->pins[0];
+		const ClusterRelmapRetentionPin *pin = &stage_directory->pins[stage_pin_index];
 
 		if (!pin->occupied || !pin->may_be_staged || pin->wal_end != owner.wal_end)
 			writes_without_pin++;
@@ -390,6 +392,7 @@ reset_io(void)
 	fault_copy = 0;
 	fail_directory_close = false;
 	retention_held = observing_stage = relmap_x_held = false;
+	stage_pin_index = 0;
 	held_retention_lock = NULL;
 	mapping_held = false;
 	post_sync_hook = NULL;
@@ -2245,7 +2248,7 @@ UT_TEST(test_changed_wal_cannot_rebind_staged_pin)
 int
 main(void)
 {
-	UT_PLAN(73);
+	UT_PLAN(75);
 	UT_RUN(test_stage_both_copies_before_success);
 	UT_RUN(test_committed_reader_hides_pending_and_rejects_degraded_pair);
 	UT_RUN(test_committed_reader_requires_namespace_x_lock);
@@ -2319,6 +2322,8 @@ main(void)
 	UT_RUN(test_runtime_storage_terminal_rechecks_original_image_and_owner);
 	UT_RUN(test_runtime_storage_terminal_final_drift_retains_obligation);
 	UT_RUN(test_runtime_storage_terminal_io_failure_and_explicit_retry);
+	UT_RUN(test_runtime_storage_late_binding_enrolls_both_staged_namespaces);
+	UT_RUN(test_runtime_storage_late_binding_precedes_second_namespace_begin);
 	cleanup();
 	free(runtime_storage_allocation);
 	UT_DONE();
