@@ -1123,8 +1123,14 @@ extern bool cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
  * additionally require their original creator input; DELETE/LOCK/LOCK_UPDATED
  * require their actor input, each from its own BIND and ACTIVE causal prefix.
  * History frames retain the consistency check; the replay-only PAGE producers
- * do not qualify them. Old tuple/MX ownership, a parent graph and complete
- * ordinary_effects remain independent requirements.
+ * do not qualify them. Derive the restricted empty ordinary_effects case
+ * only when the complete all-source input transcript matches every original
+ * SIDE operation and contains solely native INIT/REUSE/BIND and XLOG NOOP,
+ * with no PAGE/SPACE work. The exact unique replay BIND must have an UNUSED,
+ * xid-free, empty predecessor from an earlier full native lifecycle image;
+ * its post-redo head must remain empty. History-only/idempotent BIND and
+ * old ACTIVE head=0 do not supply this proof. Old tuple/MX ownership, a
+ * parent graph and nonempty ordinary_effects remain independent requirements.
  * Other proof/shape gates remain independent and required. Older ACTIVE
  * without a retained BIND requires the qualified original checkpoint base;
  * this does not introduce a BIND lifetime retention requirement.

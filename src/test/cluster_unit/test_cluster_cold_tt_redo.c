@@ -3479,6 +3479,7 @@ UT_TEST(tt_top_tx_c0_producer_derives_base_from_native_reuse)
 	f.typed.xid_next_after_redo = UINT64_C(0x700400200);
 	tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
 	proof.qualified_base = false;
+	proof.ordinary_effects = false;
 	tt_top_tx_effects_complete(&f);
 	tt_top_tx_endpoints_complete(&f);
 	UT_ASSERT(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof, &shape,
@@ -4836,6 +4837,13 @@ tt_top_tx_cursor_expect(bool history, TransactionId xid, TransactionId top, bool
 				 accepted);
 	if (!accepted)
 		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	/* An unpaired original cursor frame cannot disappear from the empty proof. */
+	proof.ordinary_effects = false;
+	memset(&out, 0xa9, sizeof(out));
+	UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(
+		&f.typed, TT_C0_FENCE, 0, &proof, &shape, false, InvalidTransactionId,
+		UINT64_C(0x12345678), &out));
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 	tt_redo_destroy(&f);
 }
 
@@ -5204,6 +5212,13 @@ tt_top_tx_page_space_frame_expect(bool space, bool history, int mode)
 				 accepted);
 	if (!accepted)
 		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	/* PAGE/SPACE, including history, cannot use the restricted empty proof. */
+	proof.ordinary_effects = false;
+	memset(&out, 0xa9, sizeof(out));
+	UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(
+		&f.typed, TT_C0_FENCE, 0, &proof, &shape, false, InvalidTransactionId,
+		UINT64_C(0x12345678), &out));
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 	tt_redo_destroy(&f);
 }
 
@@ -5754,10 +5769,15 @@ UT_TEST(tt_top_tx_c0_producer_requires_original_owner_and_exact_post_redo)
 			if (fault == 6)
 				missing_proof.ordinary_effects = false;
 			memset(&out, 0xa9, sizeof(out));
-			UT_ASSERT(!cluster_cold_typed_top_tx_c0_producer_v1(
+			/* Both positive fixtures have a fresh empty native BIND. Its
+			 * original proof now supplies the missing caller effects bit. */
+			UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(
 				&f.typed, TT_C0_FENCE, participant, &missing_proof, &rejected, false,
-				InvalidTransactionId, UINT64_C(0x12345678), &out));
-			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+				InvalidTransactionId, UINT64_C(0x12345678), &out), fault == 6);
+			if (fault != 6)
+				UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+			else
+				UT_ASSERT(memcmp(&out.loser.key, &input.key, sizeof(input.key)) == 0);
 		}
 		f.typed.xid_next_after_redo = next_xid;
 		cluster_cold_tt_after_redo_reset_v1(&f.typed);
@@ -7992,10 +8012,71 @@ UT_TEST(tt_top_tx_c0_producer_rechecks_before_output)
 	tt_redo_destroy(&f);
 }
 
+/* A fresh replay BIND, not an empty head or a caller bit, is the start
+ * of this intentionally narrow no-transaction-effects proof. */
+UT_TEST(tt_top_tx_c0_derives_empty_effects_from_fresh_replay_bind)
+{
+	for (int mode = 0; mode < 6; mode++) {
+		TtRedoFixture f;
+		ClusterColdTtSlotInputV1 input;
+		ClusterColdTopTxProofV1 proof;
+		ClusterRecoveryTTAbortV1 shape;
+		ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
+
+		if (mode == 4)
+			tt_top_tx_verified_checkpoint_base(&f, 0); /* Old ACTIVE, empty head. */
+		else {
+			bool extra = mode == 1 || mode == 2 || mode == 3 || mode == 5;
+
+			tt_top_tx_initialized_fixture(&f, extra ? 300 : 200, mode == 2 ? 200 : 100, 2);
+			tt_top_tx_bind(&f, 200, 4);
+			if (mode == 3)
+				tt_top_tx_bind(&f, 300, 4); /* Idempotent BIND is not a fresh birth. */
+			else if (extra) {
+				FakeXactRecord fake;
+				RfPageOnlineRecordIdentityV1 identity;
+				RfDetachedRecordPlanV1 record;
+				Oid next_oid = 20000;
+
+				make_projection_record(&fake, RM_XLOG_ID,
+									   mode == 5 ? XLOG_NEXTOID : XLOG_NOOP,
+									   mode == 5 ? &next_oid : NULL,
+									   mode == 5 ? sizeof(next_oid) : 0);
+				fake.u.decoded.max_block_id = -1;
+				identity = make_identity(&fake, f.typed.observer.storage_uuid);
+				set_identity_range(&fake, &identity, 300, 400);
+				record = make_projection_record_plan(&fake);
+				UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(f.typed.side_plans[0], &record,
+																	   &identity), RF_PAGE_PROOF_DETAIL_OK);
+			}
+			tt_redo_seal(&f);
+			tt_top_tx_write_fold(&f);
+			UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+			f.typed.xid_next_after_redo = UINT64_C(0x700400200);
+			tt_top_tx_effects_complete(&f);
+			tt_top_tx_endpoints_complete(&f);
+		}
+		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &input));
+		f.typed.xid_next_after_redo = UINT64_C(0x700400200);
+		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
+		proof.ordinary_effects = false;
+		memset(&out, 0xa9, sizeof(out));
+		UT_ASSERT_EQ(cluster_cold_typed_top_tx_c0_producer_v1(&f.typed, TT_C0_FENCE, 0, &proof,
+															  &shape, false, InvalidTransactionId,
+															  UINT64_C(0x12345678), &out), mode < 2);
+		if (mode < 2) {
+			UT_ASSERT_EQ(out.loser.key.xid, input.key.xid);
+			UT_ASSERT(memcmp(&out.c0.record.before, &input.slot, sizeof(input.slot)) == 0);
+		} else
+			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		tt_redo_destroy(&f);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(167);
+	UT_PLAN(168);
 	UT_RUN(tt_after_redo_checks_canonical_active_undo_chain_input);
 	UT_RUN(tt_after_redo_checks_spill_active_undo_chain_input);
 	UT_RUN(tt_after_redo_checks_canonical_active_undo_head_input);
@@ -8032,6 +8113,7 @@ main(void)
 	UT_RUN(tt_page_creator_uses_only_its_causal_native_prefix);
 	UT_RUN(tt_page_creator_refuses_unproved_actor_and_other_heap_semantics);
 	UT_RUN(tt_page_creator_requires_the_same_sealed_original_sources);
+	UT_RUN(tt_top_tx_c0_derives_empty_effects_from_fresh_replay_bind);
 	UT_RUN(tt_top_tx_c0_producer_derives_base_from_native_full_image);
 	UT_RUN(tt_top_tx_c0_producer_derives_base_from_native_reuse);
 	UT_RUN(tt_top_tx_c0_rebuilds_damaged_base_only_from_sealed_full_lifecycle);

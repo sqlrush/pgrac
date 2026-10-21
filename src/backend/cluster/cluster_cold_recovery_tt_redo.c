@@ -18,6 +18,7 @@
 #include "postgres.h"
 
 #include "access/heapam_xlog.h"
+#include "catalog/pg_control.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_recovery_undo_scan.h"
 #include "cluster/cluster_side_online_plan.h"
@@ -669,6 +670,105 @@ cold_top_tx_frame_xids_v1(TransactionId xid, TransactionId top)
 			   || (TransactionIdIsNormal(top) && TransactionIdIsNormal(xid) && top == xid));
 }
 
+/* A retained BIND alone may be an idempotent publication of an old ACTIVE.
+ * Prove its UNUSED predecessor from an earlier native full lifecycle image,
+ * never from the observed empty head or a later INIT/REUSE. */
+static bool
+cold_top_tx_empty_bind_prefix_v1(const RfSideOnlinePlanV1 *plan, uint32 previous,
+								 const ClusterColdTtSlotKeyV1 *key)
+{
+	RfSideOnlineOperationV1 operation;
+	RfSideUndoHeaderImageV1 image;
+	const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)image.page.data;
+	const TTSlot *slot = &header->tt_slots[key->slot_offset];
+
+	if (previous == UINT32_MAX || !rf_side_online_plan_operation_v1(plan, previous, &operation)
+		|| rf_side_online_plan_prepare_undo_record_input_header_v1(
+			   plan, previous, &operation.identity, NULL, &image) != RF_PAGE_PROOF_DETAIL_OK
+		|| !image.has_full_image)
+		return false;
+	return header->owner_instance == key->owner_instance && header->segment_id == key->segment_id
+		   && header->wrap_count == key->segment_generation && slot->status == TT_SLOT_UNUSED
+		   && !TransactionIdIsValid(slot->xid) && slot->commit_scn == 0
+		   && UBA_is_invalid(slot->first_undo_block);
+}
+
+/* Restricted positive no-effects proof, not a general WAL effects classifier.
+ * Match the complete all-source transcript one-for-one to original SIDE work;
+ * PAGE/SPACE, unmatched cursor records and every unclassified operation refuse.
+ * A unique replay BIND must start from UNUSED in its native causal prefix.
+ * Nonempty transactions still require their independent ordinary-effects proof. */
+static bool
+cold_top_tx_empty_effects_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+							   const ClusterColdTtSlotInputV1 *active)
+{
+	const ClusterColdTtSlotKeyV1 *key = &active->key;
+	uint32 counts[CLUSTER_COLD_MAX_PARTICIPANTS];
+	uint32 positions[CLUSTER_COLD_MAX_PARTICIPANTS] = { 0 };
+	uint32 count, previous = UINT32_MAX;
+	bool found = false;
+
+	if (!UBA_is_invalid(active->slot.first_undo_block)
+		|| !cluster_cold_plan_input_frame_count_v1(typed->plan, &count))
+		return false;
+	for (uint32 p = 0; p < typed->participant_count; p++) {
+		counts[p] = rf_side_online_plan_operation_count_v1(typed->side_plans[p]);
+		if (counts[p] == UINT32_MAX)
+			return false;
+	}
+	for (uint32 i = 0; i < count; i++) {
+		ClusterColdRecordFrameV1 frame;
+		RfSideOnlineOperationV1 operation;
+		const ClusterUndoDecoded *undo = &operation.undo;
+		uint32 p, index;
+
+		if (!cluster_cold_plan_input_frame_v1(typed->plan, i, &frame)
+			|| frame.participant >= typed->participant_count || frame.page_components != 0
+			|| frame.space_effects != 0)
+			return false;
+		p = frame.participant;
+		index = positions[p];
+		if (index >= counts[p]
+			|| !rf_side_online_plan_operation_v1(typed->side_plans[p], index, &operation)
+			|| operation.identity.record.origin_thread != typed->participants[p].thread_id
+			|| operation.identity.record.read_rec_ptr != frame.read_rec_ptr
+			|| operation.identity.record.end_rec_ptr != frame.end_rec_ptr
+			|| operation.identity.record.record_crc != frame.record_crc
+			|| operation.identity.record.rmid != frame.rmid
+			|| operation.identity.record.info != frame.info
+			|| operation.history_only != frame.history || operation.source_xid != frame.source_xid
+			|| operation.source_top_xid != frame.source_top_xid)
+			return false;
+		positions[p]++;
+		if (operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
+			&& frame.rmid == RM_XLOG_ID && (frame.info & ~XLR_INFO_MASK) == XLOG_NOOP)
+			continue;
+		if (operation.kind != RF_SIDE_ONLINE_OPERATION_UNDO || frame.rmid != RM_CLUSTER_UNDO_ID
+			|| (undo->kind != CLUSTER_UNDO_KIND_SEGMENT_INIT
+				&& undo->kind != CLUSTER_UNDO_KIND_SEGMENT_REUSE
+				&& undo->kind != CLUSTER_UNDO_KIND_TT_BIND))
+			return false;
+		if (undo->kind == CLUSTER_UNDO_KIND_TT_BIND && undo->instance == key->owner_instance
+			&& undo->xid == key->xid) {
+			if (found || p != participant || operation.history_only
+				|| undo->format_version != CLUSTER_UNDO_TT_BIND_VERSION
+				|| undo->segment_id != key->segment_id
+				|| undo->expected_generation != key->segment_generation
+				|| undo->slot_offset != key->slot_offset || undo->wrap != key->slot_wrap
+				|| !cold_top_tx_empty_bind_prefix_v1(typed->side_plans[p], previous, key))
+				return false;
+			found = true;
+		}
+		if (p == participant && undo->instance == key->owner_instance
+			&& undo->segment_id == key->segment_id)
+			previous = index;
+	}
+	for (uint32 p = 0; p < typed->participant_count; p++)
+		if (positions[p] != counts[p])
+			return false;
+	return found;
+}
+
 /* A native FPI can retain records from several transactions. Select the first
  * record only to address the existing reader, which checks the entire block
  * before returning it. These raw identities need not name the WAL actor or
@@ -1063,6 +1163,11 @@ cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
 	 * establish completed sealed redo. The caller's bit cannot add or revoke
 	 * that fact. Atomic transaction effects remain an independent proof. */
 	qualified.sealed_redo = true;
+	/* A fresh empty top has a native positive proof independent of the
+	 * caller's effects bit. Head=0, an old ACTIVE or an unclassified input
+	 * cannot enter this branch. Nonempty effects keep their original gate. */
+	qualified.ordinary_effects = proof->ordinary_effects
+								 || cold_top_tx_empty_effects_v1(typed, participant, &post_slot);
 	/* The qualified checkpoint base or retained INIT/REUSE lifecycle reaches
 	 * this exact physical ACTIVE image after completed all-record redo.
 	 * Together with the full retained terminal check, this supplies both
