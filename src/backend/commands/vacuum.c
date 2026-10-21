@@ -2091,6 +2091,7 @@ vac_truncate_clog(TransactionId frozenXID,
 				  MultiXactId lastSaneMinMulti)
 {
 	TransactionId nextXID;
+	TransactionId truncateXID;
 	Relation	relation;
 	TableScanDesc scan;
 	HeapTuple	tuple;
@@ -2098,10 +2099,13 @@ vac_truncate_clog(TransactionId frozenXID,
 	Oid			minmulti_datoid;
 	bool		bogus = false;
 	bool		frozenAlreadyWrapped = false;
+	bool		truncate_xid = true;
 #ifdef USE_PGRAC_CLUSTER
 	bool		shared_xid = cluster_storage_mode_enabled() && cluster_shared_catalog;
+	bool		have_watermark = false;
 	FullTransactionId legal_next = InvalidFullTransactionId;
 	ClusterXidStripeSampleFence fence;
+	ClusterHeapFreezeWatermark watermark;
 
 	/* Sample before taking the native maintenance lock or doing catalogue I/O. */
 	if (shared_xid)
@@ -2117,6 +2121,8 @@ vac_truncate_clog(TransactionId frozenXID,
 		if (!sampled || !vacuum_xid_in_legal_window(frozenXID, legal_next) ||
 			!vacuum_xid_in_legal_window(lastSaneFrozenXid, legal_next))
 			return;
+		/* Bounded local observation, outside allocation/maintenance locks. */
+		have_watermark = cluster_heap_freeze_watermark_sample(&watermark);
 	}
 #endif
 
@@ -2244,11 +2250,39 @@ vac_truncate_clog(TransactionId frozenXID,
 	}
 #endif
 
+	truncateXID = frozenXID;
+#ifdef USE_PGRAC_CLUSTER
+	if (shared_xid)
+	{
+		uint64		next = U64FromFullTransactionId(legal_next);
+		uint64		global_min = have_watermark ? watermark.active_full_xid_min : 0;
+
+		/*
+		 * F can only retain additional XID history. It cannot replace the
+		 * database scan or the native owners' pin/protection obligations.
+		 * Unknown or ambiguous F defers XID history maintenance, while MX
+		 * and the real database wrap/warn/stop limits remain independent.
+		 */
+		if (!have_watermark || global_min < FirstNormalTransactionId ||
+			!TransactionIdIsNormal((TransactionId) global_min) ||
+			global_min > next || next - global_min >= UINT64CONST(0x80000000))
+			truncate_xid = false;
+		else
+		{
+			FullTransactionId database_min = cluster_xid_widen(frozenXID, legal_next);
+
+			truncateXID = (TransactionId) Min(U64FromFullTransactionId(database_min),
+											global_min);
+		}
+	}
+#endif
+
 	/*
 	 * Freeze any old transaction IDs in the async notification queue before
 	 * CLOG truncation.
 	 */
-	AsyncNotifyFreezeXids(frozenXID);
+	if (truncate_xid)
+		AsyncNotifyFreezeXids(truncateXID);
 
 	/*
 	 * Advance the oldest value for commit timestamps before truncating, so
@@ -2257,13 +2291,17 @@ vac_truncate_clog(TransactionId frozenXID,
 	 * found" error from slru.c.  This doesn't matter for xact/multixact
 	 * because they are not subject to arbitrary lookups from users.
 	 */
-	AdvanceOldestCommitTsXid(frozenXID);
+	if (truncate_xid)
+		AdvanceOldestCommitTsXid(truncateXID);
 
 	/*
 	 * Truncate CLOG, multixact and CommitTs to the oldest computed value.
 	 */
-	TruncateCLOG(frozenXID, oldestxid_datoid);
-	TruncateCommitTs(frozenXID);
+	if (truncate_xid)
+	{
+		TruncateCLOG(truncateXID, oldestxid_datoid);
+		TruncateCommitTs(truncateXID);
+	}
 	TruncateMultiXact(minMulti, minmulti_datoid);
 
 	/*

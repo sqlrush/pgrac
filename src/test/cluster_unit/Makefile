@@ -8936,6 +8936,7 @@ test_cluster_vacuum_native_window.inc: $(top_srcdir)/src/backend/commands/vacuum
 test_cluster_vacuum_native_window: test_cluster_vacuum_native_window.c unit_test.h \
 		test_cluster_vacuum_native_window.inc test_cluster_vacuum_native_window_xid.inc \
 		$(CLUSTER_XID_STRIPE_O) \
+		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe.h \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \

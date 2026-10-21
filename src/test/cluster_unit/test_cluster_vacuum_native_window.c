@@ -28,6 +28,7 @@
 #include "access/tableam.h"
 #include "catalog/pg_database.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_heap_horizon.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_xid_stripe_boot.h"
@@ -50,8 +51,11 @@ static LWLockPadded locks[NUM_INDIVIDUAL_LWLOCKS];
 LWLockPadded *MainLWLockArray = locks;
 static bool xid_locked, wrap_locked;
 static bool promise_ready, promise_current, revoke_on_unlock, revoke_on_scan_end;
+static bool watermark_ready, watermark_override, revoke_on_watermark;
+static uint64 watermark_full;
 static uint64 legal_next;
 static unsigned samples, fences, scans, rows_read, warnings;
+static unsigned watermark_samples;
 static unsigned wrap_acquires, wrap_releases;
 static struct RelationData relation;
 static TableScanDescData scan;
@@ -140,6 +144,22 @@ cluster_xid_stripe_sample_fence_current(const ClusterXidStripeSampleFence *fence
 	UT_ASSERT_EQ(action_count, 0);
 	fences++;
 	return promise_current;
+}
+
+bool
+cluster_heap_freeze_watermark_sample(ClusterHeapFreezeWatermark *out)
+{
+	UT_ASSERT(!xid_locked && !wrap_locked);
+	UT_ASSERT_EQ(scans, 0);
+	UT_ASSERT_EQ(action_count, 0);
+	watermark_samples++;
+	if (revoke_on_watermark)
+		promise_current = false;
+	if (!watermark_ready)
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->active_full_xid_min = watermark_override ? watermark_full : legal_next;
+	return true;
 }
 
 bool
@@ -319,8 +339,12 @@ reset(void)
 	cache.nextXid = FullTransactionIdFromU64(200);
 	legal_next = 200;
 	promise_ready = promise_current = true;
+	watermark_ready = true;
+	watermark_override = revoke_on_watermark = false;
+	watermark_full = 0;
 	revoke_on_unlock = revoke_on_scan_end = false;
 	samples = fences = scans = rows_read = warnings = 0;
+	watermark_samples = 0;
 	wrap_acquires = wrap_releases = action_count = row_count = 0;
 	memset(storage, 0, sizeof(storage));
 	memset(actions, 0, sizeof(actions));
@@ -337,12 +361,19 @@ expect_kept(void)
 }
 
 static void
-expect_dispatch(TransactionId xid, Oid xid_db, MultiXactId mxid, Oid mx_db)
+expect_capped_dispatch(TransactionId native_xid, TransactionId database_xid, Oid xid_db,
+					   MultiXactId mxid, Oid mx_db)
 {
 	UT_ASSERT_EQ(action_count, 7);
 	for (unsigned i = 0; i < lengthof(actions); i++) {
+		TransactionId expected = native_xid;
+
+		if (i == NATIVE_MX || i == NATIVE_MX_LIMIT)
+			expected = mxid;
+		else if (i == NATIVE_XID_LIMIT)
+			expected = database_xid;
 		UT_ASSERT_EQ(actions[i].action, i);
-		UT_ASSERT_EQ(actions[i].cut, (i == NATIVE_MX || i == NATIVE_MX_LIMIT) ? mxid : xid);
+		UT_ASSERT_EQ(actions[i].cut, expected);
 	}
 	UT_ASSERT_EQ(actions[NATIVE_CLOG].database, xid_db);
 	UT_ASSERT_EQ(actions[NATIVE_XID_LIMIT].database, xid_db);
@@ -350,6 +381,136 @@ expect_dispatch(TransactionId xid, Oid xid_db, MultiXactId mxid, Oid mx_db)
 	UT_ASSERT_EQ(actions[NATIVE_MX_LIMIT].database, mx_db);
 	UT_ASSERT(!xid_locked && !wrap_locked);
 	UT_ASSERT_EQ(wrap_acquires, wrap_releases);
+}
+
+static void
+expect_dispatch(TransactionId xid, Oid xid_db, MultiXactId mxid, Oid mx_db)
+{
+	expect_capped_dispatch(xid, xid, xid_db, mxid, mx_db);
+}
+
+static void
+expect_xid_history_kept(TransactionId database_xid, Oid xid_db, MultiXactId mxid, Oid mx_db)
+{
+	UT_ASSERT_EQ(action_count, 3);
+	UT_ASSERT_EQ(actions[0].action, NATIVE_MX);
+	UT_ASSERT_EQ(actions[0].cut, mxid);
+	UT_ASSERT_EQ(actions[0].database, mx_db);
+	UT_ASSERT_EQ(actions[1].action, NATIVE_XID_LIMIT);
+	UT_ASSERT_EQ(actions[1].cut, database_xid);
+	UT_ASSERT_EQ(actions[1].database, xid_db);
+	UT_ASSERT_EQ(actions[2].action, NATIVE_MX_LIMIT);
+	UT_ASSERT_EQ(actions[2].cut, mxid);
+	UT_ASSERT_EQ(actions[2].database, mx_db);
+	UT_ASSERT(!xid_locked && !wrap_locked);
+	UT_ASSERT_EQ(wrap_acquires, wrap_releases);
+}
+
+UT_TEST(published_watermark_caps_only_xid_history_actions)
+{
+	reset();
+	watermark_override = true;
+	watermark_full = 80;
+	add_database(8, 120, 70, false);
+	add_database(9, 90, 85, false);
+	vac_truncate_clog(100, 100, 200, 200);
+	expect_capped_dispatch(80, 90, 9, 70, 8);
+	UT_ASSERT_EQ(watermark_samples, 1);
+	UT_ASSERT_EQ(samples, 1);
+	UT_ASSERT_EQ(fences, 1);
+	UT_ASSERT_EQ(rows_read, 2);
+}
+
+UT_TEST(published_watermark_cannot_raise_database_minimum)
+{
+	reset();
+	watermark_override = true;
+	watermark_full = 150;
+	add_database(8, 90, 70, false);
+	vac_truncate_clog(100, 100, 200, 200);
+	expect_dispatch(90, 8, 70, 8);
+	UT_ASSERT_EQ(watermark_samples, 1);
+}
+
+UT_TEST(missing_watermark_keeps_xid_history_and_real_wrap_limits)
+{
+	reset();
+	watermark_ready = false;
+	add_database(8, 120, 70, false);
+	add_database(9, 90, 85, false);
+	vac_truncate_clog(100, 100, 200, 200);
+	expect_xid_history_kept(90, 9, 70, 8);
+	UT_ASSERT_EQ(rows_read, 2);
+	UT_ASSERT_EQ(fences, 1);
+	UT_ASSERT_EQ(watermark_samples, 1);
+}
+
+UT_TEST(invalid_watermark_keeps_xid_history)
+{
+	const uint64 invalid[] = { 0, 1, 2, UINT64CONST(0x100000002), 201, UINT64_MAX };
+	for (unsigned i = 0; i < lengthof(invalid); i++) {
+		reset();
+		watermark_override = true;
+		watermark_full = invalid[i];
+		add_database(8, 90, 70, false);
+		vac_truncate_clog(100, 100, 200, 200);
+		expect_xid_history_kept(90, 8, 70, 8);
+	}
+}
+
+UT_TEST(ambiguous_or_old_generation_watermark_keeps_xid_history)
+{
+	const uint64 invalid[] = { UINT64CONST(0x1800000c8), UINT64CONST(0x10000005a) };
+	for (unsigned i = 0; i < lengthof(invalid); i++) {
+		reset();
+		cache.nextXid = FullTransactionIdFromU64(UINT64CONST(0x2000000c8));
+		legal_next = UINT64CONST(0x2000000c8);
+		watermark_override = true;
+		watermark_full = invalid[i];
+		add_database(8, 90, 70, false);
+		vac_truncate_clog(100, 100, 200, 200);
+		expect_xid_history_kept(90, 8, 70, 8);
+	}
+}
+
+UT_TEST(previous_epoch_watermark_uses_fullxid_minimum)
+{
+	reset();
+	cache.nextXid = FullTransactionIdFromU64(UINT64CONST(0x1000000c8));
+	legal_next = UINT64CONST(0x1000000c8);
+	watermark_override = true;
+	watermark_full = UINT64CONST(0xffffffd8);
+	add_database(8, UINT32_C(0xffffffec), 70, false);
+	add_database(9, 90, 85, false);
+	vac_truncate_clog(100, 100, 200, 200);
+	expect_capped_dispatch(UINT32_C(0xffffffd8), UINT32_C(0xffffffec), 8, 70, 8);
+}
+
+UT_TEST(allocation_fence_retired_during_watermark_read_keeps_all_state)
+{
+	reset();
+	revoke_on_watermark = true;
+	add_database(8, 90, 70, false);
+	vac_truncate_clog(100, 100, 200, 200);
+	expect_kept();
+	UT_ASSERT_EQ(watermark_samples, 1);
+	UT_ASSERT_EQ(fences, 1);
+}
+
+UT_TEST(missing_watermark_preserves_original_future_and_mx_refusals)
+{
+	reset();
+	watermark_ready = false;
+	legal_next = 400;
+	add_database(8, 300, 70, false);
+	vac_truncate_clog(100, 100, 400, 200);
+	expect_kept();
+	UT_ASSERT_EQ(warnings, 1);
+	reset();
+	watermark_ready = false;
+	add_database(8, 90, 201, false);
+	vac_truncate_clog(100, 100, 200, 200);
+	expect_kept();
 }
 
 UT_TEST(missing_promise_keeps_all_native_state)
@@ -507,6 +668,7 @@ UT_TEST(nontarget_modes_keep_native_entry)
 	for (unsigned mode = 0; mode < 3; mode++) {
 		reset();
 		promise_ready = false;
+		watermark_ready = false;
 		if (mode == 0)
 			cluster_enabled = false;
 		if (mode == 1)
@@ -518,13 +680,22 @@ UT_TEST(nontarget_modes_keep_native_entry)
 		expect_dispatch(90, 8, 70, 8);
 		UT_ASSERT_EQ(samples, 0);
 		UT_ASSERT_EQ(fences, 0);
+		UT_ASSERT_EQ(watermark_samples, 0);
 	}
 }
 
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(24);
+	UT_RUN(published_watermark_caps_only_xid_history_actions);
+	UT_RUN(published_watermark_cannot_raise_database_minimum);
+	UT_RUN(missing_watermark_keeps_xid_history_and_real_wrap_limits);
+	UT_RUN(invalid_watermark_keeps_xid_history);
+	UT_RUN(ambiguous_or_old_generation_watermark_keeps_xid_history);
+	UT_RUN(previous_epoch_watermark_uses_fullxid_minimum);
+	UT_RUN(allocation_fence_retired_during_watermark_read_keeps_all_state);
+	UT_RUN(missing_watermark_preserves_original_future_and_mx_refusals);
 	UT_RUN(missing_promise_keeps_all_native_state);
 	UT_RUN(revoked_after_sampling_keeps_all_native_state);
 	UT_RUN(revoked_after_catalogue_scan_keeps_all_native_state);
