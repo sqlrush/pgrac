@@ -117,6 +117,22 @@ cluster_recovery_ctrc_target_match_v2(const uint8 *payload, size_t payload_lengt
 									  uint64 system_identifier, const void *header_page,
 									  size_t header_length);
 
+/* Prepare a private complete native after image from exact EXPECTED_BEFORE.
+ * Reuse the matcher's native checks; change only the selected slot's release
+ * bit and reseal the existing page checksum. EXPECTED_AFTER refuses: this
+ * function supplies no idempotency, obsolete or application authorization.
+ * Original graph/source/cut/owner proofs, window, WAL flush, held target I/O
+ * and direct sync/readback remain independently required by the executor.
+ * No shared target mutation, I/O or live dispatch occurs here.
+ *
+ * All lengths must be exact (320, BLCKSZ, BLCKSZ). Alignment is unrestricted.
+ * Inputs are consumed before output publication, so out may overlap either
+ * input. On refusal clear min(out_length, BLCKSZ) bytes when out is non-NULL. */
+extern bool cluster_recovery_ctrc_target_image_v2(const uint8 *payload, size_t payload_length,
+												  uint64 system_identifier, const void *header_page,
+												  size_t header_length, void *out,
+												  size_t out_length);
+
 /* Hash the complete final native record (including CRC), outside its payload.
  * start/end must be the original reader/insert owner's actual positions; end
  * may include intervening WAL page headers. Checks only length/CRC and domain

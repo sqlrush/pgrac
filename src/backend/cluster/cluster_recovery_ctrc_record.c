@@ -96,6 +96,27 @@ refused:
 	return false;
 }
 
+/* record is codec-validated; page is the caller's private aligned snapshot. */
+static ClusterRecoveryCTRCTargetMatchV2
+ctrc_target_match(const ClusterRecoveryCTRCReleaseV2 *record, const PGAlignedBlock *page)
+{
+	const UndoSegmentHeaderData *hdr = (const UndoSegmentHeaderData *)page->data;
+	const TTSlot *slot;
+
+	if (!UndoSegmentHeader_identity_matches(page->data, record->segment_id,
+											(uint8)record->target_owner)
+		|| cluster_undo_segment_header_integrity(page->data) != CLUSTER_UNDO_HEADER_VALID
+		|| hdr->wrap_count != record->segment_generation)
+		return CLUSTER_RECOVERY_CTRC_TARGET_REFUSED;
+	/* The codec has checked slot_offset and both complete native slot images. */
+	slot = &hdr->tt_slots[record->slot_offset];
+	if (memcmp(slot, &record->before, sizeof(TTSlot)) == 0)
+		return CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_BEFORE;
+	if (memcmp(slot, &record->after, sizeof(TTSlot)) == 0)
+		return CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_AFTER;
+	return CLUSTER_RECOVERY_CTRC_TARGET_REFUSED;
+}
+
 ClusterRecoveryCTRCTargetMatchV2
 cluster_recovery_ctrc_target_match_v2(const uint8 *payload, size_t payload_length,
 									  uint64 system_identifier, const void *header_page,
@@ -103,8 +124,6 @@ cluster_recovery_ctrc_target_match_v2(const uint8 *payload, size_t payload_lengt
 {
 	ClusterRecoveryCTRCReleaseV2 record;
 	PGAlignedBlock copy;
-	const UndoSegmentHeaderData *hdr = (const UndoSegmentHeaderData *)copy.data;
-	const TTSlot *slot;
 
 	if (payload == NULL || header_page == NULL || header_length != BLCKSZ
 		|| !cluster_recovery_ctrc_decode_v2(payload, payload_length, system_identifier, &record))
@@ -112,18 +131,37 @@ cluster_recovery_ctrc_target_match_v2(const uint8 *payload, size_t payload_lengt
 	/* Immutable, aligned snapshot. Integrity is separate from original reader
 	 * coverage/authority; even a valid newer generation is not obsolete proof. */
 	memcpy(copy.data, header_page, BLCKSZ);
-	if (!UndoSegmentHeader_identity_matches(copy.data, record.segment_id,
-											(uint8)record.target_owner)
-		|| cluster_undo_segment_header_integrity(copy.data) != CLUSTER_UNDO_HEADER_VALID
-		|| hdr->wrap_count != record.segment_generation)
-		return CLUSTER_RECOVERY_CTRC_TARGET_REFUSED;
-	/* The codec has checked slot_offset and both complete native slot images. */
-	slot = &hdr->tt_slots[record.slot_offset];
-	if (memcmp(slot, &record.before, sizeof(TTSlot)) == 0)
-		return CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_BEFORE;
-	if (memcmp(slot, &record.after, sizeof(TTSlot)) == 0)
-		return CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_AFTER;
-	return CLUSTER_RECOVERY_CTRC_TARGET_REFUSED;
+	return ctrc_target_match(&record, &copy);
+}
+
+bool
+cluster_recovery_ctrc_target_image_v2(const uint8 *payload, size_t payload_length,
+									  uint64 system_identifier, const void *header_page,
+									  size_t header_length, void *out, size_t out_length)
+{
+	ClusterRecoveryCTRCReleaseV2 record;
+	PGAlignedBlock copy;
+	UndoSegmentHeaderData *hdr = (UndoSegmentHeaderData *)copy.data;
+
+	if (out == NULL)
+		return false;
+	if (out_length != BLCKSZ || payload == NULL || header_page == NULL || header_length != BLCKSZ
+		|| !cluster_recovery_ctrc_decode_v2(payload, payload_length, system_identifier, &record))
+		goto refused;
+	memcpy(copy.data, header_page, BLCKSZ);
+	/* Exact-after alone cannot discharge the typed idempotency obligation. */
+	if (ctrc_target_match(&record, &copy) != CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_BEFORE)
+		goto refused;
+	memcpy(&hdr->tt_slots[record.slot_offset], &record.after, sizeof(TTSlot));
+	if (!cluster_undo_segment_header_seal(copy.data))
+		goto refused;
+	/* The complete input has been consumed before any aliased publication. */
+	memcpy(out, copy.data, BLCKSZ);
+	return true;
+
+refused:
+	memset(out, 0, Min(out_length, BLCKSZ));
+	return false;
 }
 
 static bool

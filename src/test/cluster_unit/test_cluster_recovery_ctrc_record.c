@@ -1055,6 +1055,257 @@ UT_TEST(target_legal_native_boundaries)
 }
 
 
+static bool
+image_make(const uint8 payload[320], const PGAlignedBlock *page, PGAlignedBlock *out)
+{
+	return cluster_recovery_ctrc_target_image_v2(payload, 320, SYSTEM_ID, page->data, BLCKSZ,
+												 out->data, BLCKSZ);
+}
+
+static bool
+image_refused(const uint8 payload[320], const PGAlignedBlock *page)
+{
+	PGAlignedBlock out;
+
+	memset(out.data, 0xa5, BLCKSZ);
+	return !image_make(payload, page, &out) && all_zero(out.data, BLCKSZ);
+}
+
+UT_TEST(image_terminal_pages)
+{
+	ClusterRecoveryCTRCReleaseV2 r = sample();
+	PGAlignedBlock page, saved, out, expected;
+	uint8 payload[320], saved_payload[320];
+
+	for (int aborted = 0; aborted < 2; aborted++) {
+		r.terminal_outcome = aborted ? TT_SLOT_ABORTED : TT_SLOT_COMMITTED;
+		r.before.status = r.terminal_outcome;
+		r.before.commit_scn = aborted ? InvalidScn : UINT64_C(0x8182838485868788);
+		r.after = r.before;
+		r.after.flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+		UT_ASSERT(target_sample(&r, false, &page, payload));
+		/* Unrelated live slots and unused tail bytes must survive intact. */
+		memset(&((UndoSegmentHeaderData *)page.data)->tt_slots[r.slot_offset + 1], 0x5a,
+			   sizeof(TTSlot));
+		page.data[BLCKSZ - 1] = 0x3c;
+		UT_ASSERT(cluster_undo_segment_header_seal(page.data));
+		memcpy(saved.data, page.data, BLCKSZ);
+		memcpy(saved_payload, payload, sizeof(payload));
+		memcpy(expected.data, page.data, BLCKSZ);
+		((UndoSegmentHeaderData *)expected.data)->tt_slots[r.slot_offset] = r.after;
+		UT_ASSERT(cluster_undo_segment_header_seal(expected.data));
+		memset(out.data, 0xa5, BLCKSZ);
+		UT_ASSERT(image_make(payload, &page, &out));
+		UT_ASSERT(memcmp(out.data, expected.data, BLCKSZ) == 0);
+		UT_ASSERT(cluster_undo_segment_header_integrity(out.data) == CLUSTER_UNDO_HEADER_VALID);
+		UT_ASSERT(target_match(payload, &out) == CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_AFTER);
+		UT_ASSERT(memcmp(page.data, saved.data, BLCKSZ) == 0);
+		UT_ASSERT(memcmp(payload, saved_payload, sizeof(payload)) == 0);
+	}
+}
+
+UT_TEST(image_requires_exact_before)
+{
+	ClusterRecoveryCTRCReleaseV2 r = sample();
+	PGAlignedBlock page, original, saved;
+	uint8 payload[320];
+
+	UT_ASSERT(target_sample(&r, true, &page, payload));
+	UT_ASSERT(image_refused(payload, &page));
+	UT_ASSERT(target_sample(&r, false, &original, payload));
+	for (size_t bit = 0; bit < sizeof(TTSlot) * 8; bit++) {
+		TTSlot *slot = &((UndoSegmentHeaderData *)page.data)->tt_slots[r.slot_offset];
+
+		memcpy(page.data, original.data, BLCKSZ);
+		((uint8 *)slot)[bit / 8] ^= (uint8)(1U << (bit % 8));
+		UT_ASSERT(cluster_undo_segment_header_seal(page.data));
+		memcpy(saved.data, page.data, BLCKSZ);
+		UT_ASSERT(image_refused(payload, &page));
+		UT_ASSERT(memcmp(page.data, saved.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(image_native_refusal)
+{
+	ClusterRecoveryCTRCReleaseV2 r = sample();
+	PGAlignedBlock original, page, saved;
+	uint8 payload[320];
+
+	r.segment_generation = 7;
+	UT_ASSERT(target_sample(&r, false, &original, payload));
+	for (int change = 0; change < 11; change++) {
+		UndoSegmentHeaderData *hdr = (UndoSegmentHeaderData *)page.data;
+
+		memcpy(page.data, original.data, BLCKSZ);
+		switch (change) {
+		case 0:
+			hdr->segment_id++;
+			break;
+		case 1:
+			hdr->owner_instance++;
+			break;
+		case 2:
+			hdr->tt_slots_count--;
+			break;
+		case 3:
+			hdr->wrap_count--;
+			break;
+		case 4:
+			hdr->wrap_count++;
+			break;
+		case 5:
+			hdr->wrap_count = UINT32_MAX;
+			break;
+		case 6:
+			((PageHeader)page.data)->pd_flags &= ~PD_UNDO_SEG_HEADER;
+			break;
+		case 7:
+			hdr->segment_state = UINT8_MAX;
+			break;
+		case 8:
+			break; /* legacy checksum below */
+		case 9:
+			break; /* damaged complete page below */
+		case 10:
+			memset(page.data, 0, BLCKSZ);
+			break;
+		}
+		if (change < 8)
+			UT_ASSERT(cluster_undo_segment_header_seal(page.data));
+		if (change == 8)
+			((PageHeader)page.data)->pd_checksum = 0;
+		if (change == 9)
+			page.data[BLCKSZ - 1] ^= 1;
+		memcpy(saved.data, page.data, BLCKSZ);
+		UT_ASSERT(image_refused(payload, &page));
+		UT_ASSERT(memcmp(page.data, saved.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(image_payload_binding)
+{
+	ClusterRecoveryCTRCReleaseV2 r = sample();
+	PGAlignedBlock page, out;
+	uint8 payload[320], original[320];
+
+	UT_ASSERT(target_sample(&r, false, &page, original));
+	for (size_t bit = 0; bit < sizeof(payload) * 8; bit++) {
+		memcpy(payload, original, sizeof(payload));
+		payload[bit / 8] ^= (uint8)(1U << (bit % 8));
+		UT_ASSERT(image_refused(payload, &page));
+	}
+	for (int missing = 0; missing < 2; missing++) {
+		memset(out.data, 0xa5, BLCKSZ);
+		UT_ASSERT(!cluster_recovery_ctrc_target_image_v2(original, 320, missing ? 0 : SYSTEM_ID + 1,
+														 page.data, BLCKSZ, out.data, BLCKSZ));
+		UT_ASSERT(all_zero(out.data, BLCKSZ));
+	}
+}
+
+UT_TEST(image_exact_bounds_and_nulls)
+{
+	ClusterRecoveryCTRCReleaseV2 r = sample();
+	PGAlignedBlock page;
+	uint8 payload[320], guarded[BLCKSZ + 2], one = 0;
+	const size_t output_lengths[] = { 0, 1, BLCKSZ - 1, BLCKSZ + 1, SIZE_MAX };
+	const size_t page_lengths[] = { 0, 1, BLCKSZ - 1, BLCKSZ + 1, SIZE_MAX };
+	const size_t payload_lengths[] = { 0, 1, 192, 319, 321, SIZE_MAX };
+
+	UT_ASSERT(target_sample(&r, false, &page, payload));
+	for (size_t i = 0; i < lengthof(output_lengths); i++) {
+		size_t cleared = Min(output_lengths[i], BLCKSZ);
+
+		memset(guarded, 0xa5, sizeof(guarded));
+		UT_ASSERT(!cluster_recovery_ctrc_target_image_v2(payload, 320, SYSTEM_ID, page.data, BLCKSZ,
+														 guarded + 1, output_lengths[i]));
+		UT_ASSERT(all_zero(guarded + 1, cleared));
+		for (size_t j = cleared + 1; j < sizeof(guarded); j++)
+			UT_ASSERT(guarded[j] == 0xa5);
+		UT_ASSERT(guarded[0] == 0xa5);
+	}
+	for (size_t i = 0; i < lengthof(page_lengths); i++) {
+		memset(guarded, 0xa5, sizeof(guarded));
+		UT_ASSERT(!cluster_recovery_ctrc_target_image_v2(payload, 320, SYSTEM_ID, &one,
+														 page_lengths[i], guarded + 1, BLCKSZ));
+		UT_ASSERT(all_zero(guarded + 1, BLCKSZ));
+		UT_ASSERT(guarded[0] == 0xa5 && guarded[BLCKSZ + 1] == 0xa5);
+	}
+	for (size_t i = 0; i < lengthof(payload_lengths); i++) {
+		memset(guarded, 0xa5, sizeof(guarded));
+		UT_ASSERT(!cluster_recovery_ctrc_target_image_v2(&one, payload_lengths[i], SYSTEM_ID,
+														 page.data, BLCKSZ, guarded + 1, BLCKSZ));
+		UT_ASSERT(all_zero(guarded + 1, BLCKSZ));
+		UT_ASSERT(guarded[0] == 0xa5 && guarded[BLCKSZ + 1] == 0xa5);
+	}
+	for (int null_input = 0; null_input < 2; null_input++) {
+		memset(guarded, 0xa5, sizeof(guarded));
+		UT_ASSERT(!cluster_recovery_ctrc_target_image_v2(null_input ? payload : NULL, 320,
+														 SYSTEM_ID, null_input ? NULL : page.data,
+														 BLCKSZ, guarded + 1, BLCKSZ));
+		UT_ASSERT(all_zero(guarded + 1, BLCKSZ));
+		UT_ASSERT(guarded[0] == 0xa5 && guarded[BLCKSZ + 1] == 0xa5);
+	}
+	UT_ASSERT(!cluster_recovery_ctrc_target_image_v2(payload, 320, SYSTEM_ID, page.data, BLCKSZ,
+													 NULL, BLCKSZ));
+}
+
+UT_TEST(image_unaligned_and_aliasing)
+{
+	ClusterRecoveryCTRCReleaseV2 r = sample();
+	PGAlignedBlock page, expected;
+	uint8 payload[322], image[BLCKSZ + 2], output[BLCKSZ + 2];
+
+	memset(payload, 0xa5, sizeof(payload));
+	UT_ASSERT(target_sample(&r, false, &page, payload + 1));
+	UT_ASSERT(target_sample(&r, true, &expected, payload + 1));
+	memset(image, 0xa5, sizeof(image));
+	memcpy(image + 1, page.data, BLCKSZ);
+	memset(output, 0xa5, sizeof(output));
+	UT_ASSERT(cluster_recovery_ctrc_target_image_v2(payload + 1, 320, SYSTEM_ID, image + 1, BLCKSZ,
+													output + 1, BLCKSZ));
+	UT_ASSERT(memcmp(output + 1, expected.data, BLCKSZ) == 0);
+	UT_ASSERT(output[0] == 0xa5 && output[BLCKSZ + 1] == 0xa5);
+	UT_ASSERT(payload[0] == 0xa5 && payload[321] == 0xa5);
+	UT_ASSERT(memcmp(image + 1, page.data, BLCKSZ) == 0);
+	UT_ASSERT(cluster_recovery_ctrc_target_image_v2(payload + 1, 320, SYSTEM_ID, image + 1, BLCKSZ,
+													image + 1, BLCKSZ));
+	UT_ASSERT(memcmp(image + 1, expected.data, BLCKSZ) == 0);
+	UT_ASSERT(image[0] == 0xa5 && image[BLCKSZ + 1] == 0xa5);
+	memset(output, 0xa5, sizeof(output));
+	memcpy(output + 17, payload + 1, 320);
+	UT_ASSERT(cluster_recovery_ctrc_target_image_v2(output + 17, 320, SYSTEM_ID, page.data, BLCKSZ,
+													output + 1, BLCKSZ));
+	UT_ASSERT(memcmp(output + 1, expected.data, BLCKSZ) == 0);
+	UT_ASSERT(output[0] == 0xa5 && output[BLCKSZ + 1] == 0xa5);
+}
+
+UT_TEST(image_native_boundaries)
+{
+	ClusterRecoveryCTRCReleaseV2 r = sample();
+	PGAlignedBlock page, out;
+	uint8 payload[320];
+
+	for (int high = 0; high < 2; high++) {
+		r.origin_node_id = high ? 127 : 0;
+		r.target_owner = high ? 128 : 1;
+		r.writer_thread = high ? 128 : 1;
+		r.segment_id = high ? 32768 : 1;
+		r.segment_generation = high ? UINT32_MAX - 1 : 0;
+		r.slot_offset = high ? TT_SLOTS_PER_SEGMENT - 1 : 0;
+		r.wrap = high ? TT_WRAP_MAX : TT_WRAP_INITIAL;
+		r.xid = high ? MaxTransactionId : FirstNormalTransactionId;
+		r.before.xid = r.xid;
+		r.before.wrap = r.wrap;
+		r.before.first_undo_block = (UBA)InvalidUba_init;
+		r.after = r.before;
+		r.after.flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+		UT_ASSERT(target_sample(&r, false, &page, payload));
+		UT_ASSERT(image_make(payload, &page, &out));
+		UT_ASSERT(target_match(payload, &out) == CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_AFTER);
+	}
+}
+
+
 /* Original reader over two in-memory WAL pages. The fixture supplies bytes and
  * selected system/thread, not a replacement decoder or completion proof. */
 #define NATIVE_SEG_SIZE (16 * 1024 * 1024)
@@ -1768,7 +2019,7 @@ UT_TEST(reference_each_raw_bit_refused)
 int
 main(void)
 {
-	UT_PLAN(63);
+	UT_PLAN(70);
 	UT_RUN(golden_encoding);
 	UT_RUN(golden_decoding);
 	UT_RUN(unaligned_buffers);
@@ -1813,6 +2064,13 @@ main(void)
 	UT_RUN(target_exact_lengths_and_nulls);
 	UT_RUN(target_unaligned_and_immutable);
 	UT_RUN(target_legal_native_boundaries);
+	UT_RUN(image_terminal_pages);
+	UT_RUN(image_requires_exact_before);
+	UT_RUN(image_native_refusal);
+	UT_RUN(image_payload_binding);
+	UT_RUN(image_exact_bounds_and_nulls);
+	UT_RUN(image_unaligned_and_aliasing);
+	UT_RUN(image_native_boundaries);
 	UT_RUN(reader_terminal_payloads_and_immutability);
 	UT_RUN(reader_cross_page_actual_positions);
 	UT_RUN(reader_exact_rmgr_and_info);
