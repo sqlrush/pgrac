@@ -227,7 +227,7 @@ cluster_content_trace_capture(const BufferTag *tag, ClusterContentTraceCut *cut)
 		/* PID alone is not an incarnation key: reject a reused proc slot or
 		 * an auxiliary owner without a stable backend identity as UNKNOWN. */
 		if (i >= ProcGlobal->allProcCount ||
-			owner.backend_id == InvalidBackendId ||
+			owner.backend_id <= 0 ||
 			ProcGlobal->allProcs[i].pid != owner.pid ||
 			ProcGlobal->allProcs[i].backendId != owner.backend_id) {
 			cut->dead++;

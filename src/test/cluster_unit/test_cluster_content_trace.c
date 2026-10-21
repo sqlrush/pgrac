@@ -161,6 +161,13 @@ UT_TEST(reused_pid_with_new_backend_is_unknown)
 	cluster_content_trace_capture(&buf(0)->tag, &cut);
 	UT_ASSERT_EQ(cut.dead, 1); UT_ASSERT_EQ(cut.nowners, 0);
 }
+UT_TEST(zero_backend_identity_is_unknown)
+{
+	reset(); hold(0, LW_EXCLUSIVE); cluster_content_trace_lock_changed(&buf(0)->content_lock);
+	procs[0].backendId = 0; /* startup/recycle identity is not stable */
+	cluster_content_trace_capture(&buf(0)->tag, &cut);
+	UT_ASSERT_EQ(cut.dead, 1); UT_ASSERT_EQ(cut.nowners, 0);
+}
 UT_TEST(bounded_locks_and_owners)
 {
 	reset();
@@ -200,11 +207,12 @@ UT_TEST(disabled_and_disable_transition)
 int main(void)
 {
 	cluster_content_trace_shmem_register(); assert(registered && registered->lwlock_count == 0);
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(actual_content_owner); UT_RUN(exact_tag_and_lock_kind); UT_RUN(release_removes_owner);
 	UT_RUN(nested_wait_keys); UT_RUN(pair_attempt_and_miss); UT_RUN(busy_cut_never_waits);
 	UT_RUN(missed_publish_marks_stale_unknown); UT_RUN(dead_process_not_current_owner);
 	UT_RUN(reused_pid_with_new_backend_is_unknown);
+	UT_RUN(zero_backend_identity_is_unknown);
 	UT_RUN(bounded_locks_and_owners); UT_RUN(owned_cut_and_cleanup); UT_RUN(disabled_and_disable_transition);
 	UT_DONE(); free(content_trace); return ut_failed_count ? 1 : 0;
 }
