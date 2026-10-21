@@ -7557,9 +7557,11 @@ test_cluster_recovery_tt_record: test_cluster_recovery_tt_record.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_recovery_tt_desc.o \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-# D0 payload codec and complete raw-record hash, linked from production.
+# D0 codec, raw-record hash and native target match, linked from production.
 test_cluster_recovery_ctrc_record_product.o: $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
 		$(top_srcdir)/src/include/access/xlogdefs.h \
 		$(top_srcdir)/src/include/access/xlogrecord.h \
 		$(top_srcdir)/src/include/port/pg_crc32c.h \
@@ -7569,12 +7571,22 @@ test_cluster_recovery_ctrc_record_product.o: $(top_srcdir)/src/backend/cluster/c
 		$(top_srcdir)/src/include/common/cryptohash.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
+test_cluster_recovery_ctrc_header.o: $(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
+		$(top_srcdir)/src/include/storage/bufpage.h \
+		$(top_srcdir)/src/include/storage/checksum_impl.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
 test_cluster_recovery_ctrc_record: test_cluster_recovery_ctrc_record.c unit_test.h \
-		test_cluster_recovery_ctrc_record_product.o $(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) \
+		test_cluster_recovery_ctrc_record_product.o test_cluster_recovery_ctrc_header.o \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h \
 		$(top_srcdir)/src/include/access/xlogrecord.h \
 		$(top_srcdir)/src/include/port/pg_crc32c.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_recovery_ctrc_record_product.o $(LDFLAGS) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_recovery_ctrc_record_product.o \
+		test_cluster_recovery_ctrc_header.o $(LDFLAGS) \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 

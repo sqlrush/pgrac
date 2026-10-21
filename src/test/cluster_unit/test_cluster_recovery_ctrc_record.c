@@ -4,6 +4,7 @@
 #include "port/pg_crc32c.h"
 #include "cluster/cluster_recovery_ctrc_record.h"
 #include "cluster/cluster_uba.h"
+#include "cluster/cluster_undo_segment_init.h"
 #include "common/cryptohash.h"
 
 #undef printf
@@ -765,10 +766,296 @@ UT_TEST(raw_input_output_aliasing)
 	UT_ASSERT(memcmp(raw + 37, golden, 320) == 0);
 }
 
+/* Real native initializer and checksum, with only the selected slot installed.
+ * These images do not pretend to be an owner/source qualification receipt. */
+static bool
+target_sample(const ClusterRecoveryCTRCReleaseV2 *r, bool after, PGAlignedBlock *page,
+			  uint8 payload[CLUSTER_RECOVERY_CTRC_BYTES])
+{
+	UndoSegmentHeaderData *hdr = (UndoSegmentHeaderData *)page->data;
+
+	if (!cluster_recovery_ctrc_encode_v2(r, SYSTEM_ID, payload, CLUSTER_RECOVERY_CTRC_BYTES))
+		return false;
+	cluster_undo_segment_make_header_bytes(r->segment_id, r->target_owner, page->data);
+	hdr->wrap_count = r->segment_generation;
+	hdr->tt_slots[r->slot_offset] = after ? r->after : r->before;
+	return cluster_undo_segment_header_seal(page->data);
+}
+
+static ClusterRecoveryCTRCTargetMatchV2
+target_match(const uint8 payload[CLUSTER_RECOVERY_CTRC_BYTES], const PGAlignedBlock *page)
+{
+	return cluster_recovery_ctrc_target_match_v2(payload, CLUSTER_RECOVERY_CTRC_BYTES, SYSTEM_ID,
+												 page->data, BLCKSZ);
+}
+
+UT_TEST(target_terminal_images)
+{
+	ClusterRecoveryCTRCReleaseV2 r = sample();
+	PGAlignedBlock page, saved;
+	uint8 payload[320], saved_payload[320];
+
+	for (int aborted = 0; aborted < 2; aborted++) {
+		r.terminal_outcome = aborted ? TT_SLOT_ABORTED : TT_SLOT_COMMITTED;
+		r.before.status = r.terminal_outcome;
+		r.before.commit_scn = aborted ? InvalidScn : UINT64_C(0x8182838485868788);
+		r.after = r.before;
+		r.after.flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+		for (int after = 0; after < 2; after++) {
+			UT_ASSERT(target_sample(&r, after, &page, payload));
+			memcpy(saved.data, page.data, BLCKSZ);
+			memcpy(saved_payload, payload, sizeof(payload));
+			UT_ASSERT(target_match(payload, &page)
+					  == (after ? CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_AFTER
+								: CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_BEFORE));
+			UT_ASSERT(memcmp(saved.data, page.data, BLCKSZ) == 0);
+			UT_ASSERT(memcmp(saved_payload, payload, sizeof(payload)) == 0);
+		}
+	}
+}
+
+UT_TEST(target_native_identity)
+{
+	ClusterRecoveryCTRCReleaseV2 r = sample();
+	PGAlignedBlock original, page;
+	uint8 payload[320];
+	const uint8 states[]
+		= { SEGMENT_ALLOCATED, SEGMENT_ACTIVE, SEGMENT_COMMITTED, SEGMENT_RECYCLABLE };
+
+	UT_ASSERT(target_sample(&r, false, &original, payload));
+	for (size_t i = 0; i < lengthof(states); i++) {
+		memcpy(page.data, original.data, BLCKSZ);
+		((UndoSegmentHeaderData *)page.data)->segment_state = states[i];
+		UT_ASSERT(cluster_undo_segment_header_seal(page.data));
+		UT_ASSERT(target_match(payload, &page) == CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_BEFORE);
+	}
+	for (int change = 0; change < 8; change++) {
+		UndoSegmentHeaderData *hdr = (UndoSegmentHeaderData *)page.data;
+		PageHeader ph = (PageHeader)page.data;
+
+		memcpy(page.data, original.data, BLCKSZ);
+		switch (change) {
+		case 0:
+			ph->pd_flags &= ~PD_UNDO_SEG_HEADER;
+			break;
+		case 1:
+			PageSetPageSizeAndVersion(page.data, BLCKSZ / 2, PG_PAGE_LAYOUT_VERSION);
+			break;
+		case 2:
+			PageSetPageSizeAndVersion(page.data, BLCKSZ, PG_PAGE_LAYOUT_VERSION + 1);
+			break;
+		case 3:
+			hdr->segment_id++;
+			break;
+		case 4:
+			hdr->segment_size_bytes--;
+			break;
+		case 5:
+			hdr->owner_instance++;
+			break;
+		case 6:
+			hdr->tt_slots_count--;
+			break;
+		case 7:
+			hdr->segment_state = UINT8_MAX;
+			break;
+		}
+		UT_ASSERT(cluster_undo_segment_header_seal(page.data));
+		UT_ASSERT(cluster_undo_segment_header_integrity(page.data) == CLUSTER_UNDO_HEADER_VALID);
+		UT_ASSERT(target_match(payload, &page) == CLUSTER_RECOVERY_CTRC_TARGET_REFUSED);
+	}
+}
+
+UT_TEST(target_generation_and_wrap_are_exact)
+{
+	ClusterRecoveryCTRCReleaseV2 r = sample();
+	PGAlignedBlock original, page;
+	uint8 payload[320];
+	const uint32 generations[] = { 0, 6, 8, UINT32_MAX };
+	const uint16 wraps[] = { 0, 8, 10, TT_WRAP_MAX, TT_WRAP_INVALID };
+
+	r.segment_generation = 7;
+	UT_ASSERT(target_sample(&r, false, &original, payload));
+	for (size_t i = 0; i < lengthof(generations); i++) {
+		memcpy(page.data, original.data, BLCKSZ);
+		((UndoSegmentHeaderData *)page.data)->wrap_count = generations[i];
+		UT_ASSERT(cluster_undo_segment_header_seal(page.data));
+		UT_ASSERT(target_match(payload, &page) == CLUSTER_RECOVERY_CTRC_TARGET_REFUSED);
+	}
+	for (size_t i = 0; i < lengthof(wraps); i++) {
+		memcpy(page.data, original.data, BLCKSZ);
+		((UndoSegmentHeaderData *)page.data)->tt_slots[r.slot_offset].wrap = wraps[i];
+		UT_ASSERT(cluster_undo_segment_header_seal(page.data));
+		UT_ASSERT(target_match(payload, &page) == CLUSTER_RECOVERY_CTRC_TARGET_REFUSED);
+	}
+}
+
+UT_TEST(target_complete_slot_images)
+{
+	ClusterRecoveryCTRCReleaseV2 r = sample();
+	PGAlignedBlock original, page, saved;
+	uint8 payload[320];
+
+	for (int after = 0; after < 2; after++) {
+		UT_ASSERT(target_sample(&r, after, &original, payload));
+		for (size_t bit = 0; bit < sizeof(TTSlot) * 8; bit++) {
+			UndoSegmentHeaderData *hdr = (UndoSegmentHeaderData *)page.data;
+			ClusterRecoveryCTRCTargetMatchV2 expected = CLUSTER_RECOVERY_CTRC_TARGET_REFUSED;
+
+			memcpy(page.data, original.data, BLCKSZ);
+			((uint8 *)&hdr->tt_slots[r.slot_offset])[bit / 8] ^= (uint8)(1U << (bit % 8));
+			/* The one release bit converts exactly between before and after. */
+			if (bit == offsetof(TTSlot, flags) * 8)
+				expected = after ? CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_BEFORE
+								 : CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_AFTER;
+			UT_ASSERT(cluster_undo_segment_header_seal(page.data));
+			UT_ASSERT(cluster_undo_segment_header_integrity(page.data)
+					  == CLUSTER_UNDO_HEADER_VALID);
+			memcpy(saved.data, page.data, BLCKSZ);
+			UT_ASSERT(target_match(payload, &page) == expected);
+			UT_ASSERT(memcmp(saved.data, page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(target_only_selected_slot)
+{
+	ClusterRecoveryCTRCReleaseV2 r = sample();
+	PGAlignedBlock page;
+	UndoSegmentHeaderData *hdr = (UndoSegmentHeaderData *)page.data;
+	uint8 payload[320];
+
+	UT_ASSERT(target_sample(&r, false, &page, payload));
+	hdr->tt_slots[r.slot_offset + 1] = hdr->tt_slots[r.slot_offset];
+	memset(&hdr->tt_slots[r.slot_offset], 0, sizeof(TTSlot));
+	UT_ASSERT(cluster_undo_segment_header_seal(page.data));
+	UT_ASSERT(target_match(payload, &page) == CLUSTER_RECOVERY_CTRC_TARGET_REFUSED);
+	hdr->tt_slots[r.slot_offset] = r.before;
+	memset(&hdr->tt_slots[r.slot_offset + 1], 0xa5, sizeof(TTSlot));
+	UT_ASSERT(cluster_undo_segment_header_seal(page.data));
+	UT_ASSERT(target_match(payload, &page) == CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_BEFORE);
+}
+
+UT_TEST(target_native_integrity_required)
+{
+	ClusterRecoveryCTRCReleaseV2 r = sample();
+	PGAlignedBlock original, page, saved;
+	uint8 payload[320];
+	const size_t offsets[] = { 0, 32, 112 + 32 * 5, BLCKSZ - 1 };
+
+	UT_ASSERT(target_sample(&r, false, &original, payload));
+	memcpy(page.data, original.data, BLCKSZ);
+	((PageHeader)page.data)->pd_checksum = 0;
+	UT_ASSERT(cluster_undo_segment_header_integrity(page.data) == CLUSTER_UNDO_HEADER_UNVERIFIED);
+	UT_ASSERT(target_match(payload, &page) == CLUSTER_RECOVERY_CTRC_TARGET_REFUSED);
+	for (size_t i = 0; i < lengthof(offsets); i++) {
+		memcpy(page.data, original.data, BLCKSZ);
+		page.data[offsets[i]] ^= 1;
+		memcpy(saved.data, page.data, BLCKSZ);
+		UT_ASSERT(target_match(payload, &page) == CLUSTER_RECOVERY_CTRC_TARGET_REFUSED);
+		UT_ASSERT(memcmp(saved.data, page.data, BLCKSZ) == 0);
+	}
+	memset(page.data, 0, BLCKSZ);
+	UT_ASSERT(target_match(payload, &page) == CLUSTER_RECOVERY_CTRC_TARGET_REFUSED);
+}
+
+UT_TEST(target_payload_and_external_identity)
+{
+	ClusterRecoveryCTRCReleaseV2 r = sample();
+	PGAlignedBlock page;
+	uint8 original[320], payload[320];
+
+	UT_ASSERT(target_sample(&r, false, &page, original));
+	for (size_t bit = 0; bit < sizeof(payload) * 8; bit++) {
+		memcpy(payload, original, sizeof(payload));
+		payload[bit / 8] ^= (uint8)(1U << (bit % 8));
+		UT_ASSERT(target_match(payload, &page) == CLUSTER_RECOVERY_CTRC_TARGET_REFUSED);
+	}
+	UT_ASSERT(
+		cluster_recovery_ctrc_target_match_v2(original, sizeof(original), 0, page.data, BLCKSZ)
+		== CLUSTER_RECOVERY_CTRC_TARGET_REFUSED);
+	UT_ASSERT(cluster_recovery_ctrc_target_match_v2(original, sizeof(original), SYSTEM_ID + 1,
+													page.data, BLCKSZ)
+			  == CLUSTER_RECOVERY_CTRC_TARGET_REFUSED);
+}
+
+UT_TEST(target_exact_lengths_and_nulls)
+{
+	ClusterRecoveryCTRCReleaseV2 r = sample();
+	PGAlignedBlock page;
+	uint8 payload[320], one = 0;
+	const size_t page_lengths[] = { 0, 1, BLCKSZ - 1, BLCKSZ + 1, SIZE_MAX };
+	const size_t payload_lengths[] = { 0, 1, 192, 319, 321, SIZE_MAX };
+
+	UT_ASSERT(target_sample(&r, false, &page, payload));
+	for (size_t i = 0; i < lengthof(page_lengths); i++)
+		UT_ASSERT(cluster_recovery_ctrc_target_match_v2(payload, sizeof(payload), SYSTEM_ID, &one,
+														page_lengths[i])
+				  == CLUSTER_RECOVERY_CTRC_TARGET_REFUSED);
+	for (size_t i = 0; i < lengthof(payload_lengths); i++)
+		UT_ASSERT(cluster_recovery_ctrc_target_match_v2(&one, payload_lengths[i], SYSTEM_ID,
+														page.data, BLCKSZ)
+				  == CLUSTER_RECOVERY_CTRC_TARGET_REFUSED);
+	UT_ASSERT(
+		cluster_recovery_ctrc_target_match_v2(NULL, sizeof(payload), SYSTEM_ID, page.data, BLCKSZ)
+		== CLUSTER_RECOVERY_CTRC_TARGET_REFUSED);
+	UT_ASSERT(
+		cluster_recovery_ctrc_target_match_v2(payload, sizeof(payload), SYSTEM_ID, NULL, BLCKSZ)
+		== CLUSTER_RECOVERY_CTRC_TARGET_REFUSED);
+}
+
+UT_TEST(target_unaligned_and_immutable)
+{
+	ClusterRecoveryCTRCReleaseV2 r = sample();
+	PGAlignedBlock page;
+	uint8 payload[322], unaligned[BLCKSZ + 2], saved[BLCKSZ + 2], saved_payload[322];
+
+	memset(payload, 0xa5, sizeof(payload));
+	memset(unaligned, 0xa5, sizeof(unaligned));
+	UT_ASSERT(target_sample(&r, true, &page, payload + 1));
+	memcpy(unaligned + 1, page.data, BLCKSZ);
+	memcpy(saved, unaligned, sizeof(saved));
+	memcpy(saved_payload, payload, sizeof(payload));
+	UT_ASSERT(
+		cluster_recovery_ctrc_target_match_v2(payload + 1, 320, SYSTEM_ID, unaligned + 1, BLCKSZ)
+		== CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_AFTER);
+	UT_ASSERT(memcmp(saved, unaligned, sizeof(saved)) == 0);
+	UT_ASSERT(memcmp(saved_payload, payload, sizeof(payload)) == 0);
+}
+
+UT_TEST(target_legal_native_boundaries)
+{
+	ClusterRecoveryCTRCReleaseV2 r = sample();
+	PGAlignedBlock page;
+	uint8 payload[320];
+
+	for (int high = 0; high < 2; high++) {
+		r.origin_node_id = high ? 127 : 0;
+		r.target_owner = high ? 128 : 1;
+		r.writer_thread = high ? 128 : 1;
+		r.segment_id = high ? 32768 : 1;
+		r.segment_generation = high ? UINT32_MAX - 1 : 0;
+		r.slot_offset = high ? TT_SLOTS_PER_SEGMENT - 1 : 0;
+		r.wrap = high ? TT_WRAP_MAX : TT_WRAP_INITIAL;
+		r.xid = high ? MaxTransactionId : FirstNormalTransactionId;
+		r.before.xid = r.xid;
+		r.before.wrap = r.wrap;
+		r.before.first_undo_block = (UBA)InvalidUba_init;
+		r.after = r.before;
+		r.after.flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+		for (int after = 0; after < 2; after++) {
+			UT_ASSERT(target_sample(&r, after, &page, payload));
+			UT_ASSERT(target_match(payload, &page)
+					  == (after ? CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_AFTER
+								: CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_BEFORE));
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(44);
 	UT_RUN(golden_encoding);
 	UT_RUN(golden_decoding);
 	UT_RUN(unaligned_buffers);
@@ -803,6 +1090,16 @@ main(void)
 	UT_RUN(raw_invalid_position_domain);
 	UT_RUN(raw_unaligned_buffers);
 	UT_RUN(raw_input_output_aliasing);
+	UT_RUN(target_terminal_images);
+	UT_RUN(target_native_identity);
+	UT_RUN(target_generation_and_wrap_are_exact);
+	UT_RUN(target_complete_slot_images);
+	UT_RUN(target_only_selected_slot);
+	UT_RUN(target_native_integrity_required);
+	UT_RUN(target_payload_and_external_identity);
+	UT_RUN(target_exact_lengths_and_nulls);
+	UT_RUN(target_unaligned_and_immutable);
+	UT_RUN(target_legal_native_boundaries);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

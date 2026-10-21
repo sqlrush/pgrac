@@ -58,6 +58,27 @@ extern bool cluster_recovery_ctrc_decode_v2(const uint8 *bytes, size_t length,
 											uint64 system_identifier,
 											ClusterRecoveryCTRCReleaseV2 *out);
 
+typedef enum ClusterRecoveryCTRCTargetMatchV2 {
+	CLUSTER_RECOVERY_CTRC_TARGET_REFUSED = 0,
+	CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_BEFORE,
+	CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_AFTER
+} ClusterRecoveryCTRCTargetMatchV2;
+
+/* Read-only image classification, never APPLY, idempotency or obsolete proof.
+ * Requires a canonical payload and a complete immutable native header image
+ * (exact BLCKSZ bytes). Checks original native identity/integrity, exact
+ * generation and the complete selected TT slot. Newer generation/wrap refuses
+ * without an original REUSE proof. Input alignment is unrestricted.
+ *
+ * EXPECTED_AFTER still needs the original typed full idempotency proof. Neither
+ * result supplies ROOT/source/cut/owner authority, checkpoint coverage, graph
+ * completeness, release or completion. Those original gates remain mandatory;
+ * no I/O, mutation or live redo dispatch occurs here. */
+extern ClusterRecoveryCTRCTargetMatchV2
+cluster_recovery_ctrc_target_match_v2(const uint8 *payload, size_t payload_length,
+									  uint64 system_identifier, const void *header_page,
+									  size_t header_length);
+
 /* Hash the complete final native record (including CRC), outside its payload.
  * start/end must be the original reader/insert owner's actual positions; end
  * may include intervening WAL page headers. Checks only length/CRC and domain

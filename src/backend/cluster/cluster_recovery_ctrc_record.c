@@ -11,9 +11,40 @@
 
 #include "access/xlogrecord.h"
 #include "cluster/cluster_uba.h"
+#include "cluster/cluster_undo_segment_init.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "common/cryptohash.h"
 #include "port/pg_crc32c.h"
+
+ClusterRecoveryCTRCTargetMatchV2
+cluster_recovery_ctrc_target_match_v2(const uint8 *payload, size_t payload_length,
+									  uint64 system_identifier, const void *header_page,
+									  size_t header_length)
+{
+	ClusterRecoveryCTRCReleaseV2 record;
+	PGAlignedBlock copy;
+	const UndoSegmentHeaderData *hdr = (const UndoSegmentHeaderData *)copy.data;
+	const TTSlot *slot;
+
+	if (payload == NULL || header_page == NULL || header_length != BLCKSZ
+		|| !cluster_recovery_ctrc_decode_v2(payload, payload_length, system_identifier, &record))
+		return CLUSTER_RECOVERY_CTRC_TARGET_REFUSED;
+	/* Immutable, aligned snapshot. Integrity is separate from original reader
+	 * coverage/authority; even a valid newer generation is not obsolete proof. */
+	memcpy(copy.data, header_page, BLCKSZ);
+	if (!UndoSegmentHeader_identity_matches(copy.data, record.segment_id,
+											(uint8)record.target_owner)
+		|| cluster_undo_segment_header_integrity(copy.data) != CLUSTER_UNDO_HEADER_VALID
+		|| hdr->wrap_count != record.segment_generation)
+		return CLUSTER_RECOVERY_CTRC_TARGET_REFUSED;
+	/* The codec has checked slot_offset and both complete native slot images. */
+	slot = &hdr->tt_slots[record.slot_offset];
+	if (memcmp(slot, &record.before, sizeof(TTSlot)) == 0)
+		return CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_BEFORE;
+	if (memcmp(slot, &record.after, sizeof(TTSlot)) == 0)
+		return CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_AFTER;
+	return CLUSTER_RECOVERY_CTRC_TARGET_REFUSED;
+}
 
 static bool
 ctrc_nonzero_digest(const uint8 digest[32])
