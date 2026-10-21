@@ -57,8 +57,12 @@ extern ClusterControlRootResult cluster_relmap_owner_retained_wal_v2(
  * sealed RECOVERY SIDE physical participant set to this original cold scope's
  * actual full claims and cuts in ONE retained scan. Include every participant
  * of each plan and every selected source, including explicit-empty terminals.
+ * Match every retained SMGR/XACT record to its sealed operation in per-source
+ * order, including history: exact LSNs/CRC/header frame and whole owned main
+ * payload. Missing or extra structural operations refuse. Other SIDE/PAGE
+ * capture completeness remains an independent caller duty.
  * Keep image, sources and plans immutable for the call. The caller owns the
- * scope, including release on ERROR. No plan capture/completeness proof, redo
+ * scope, including release on ERROR. No plan capture, redo
  * eligibility, final SIDE revalidation or independent era/epoch/boot/floor/
  * last-issued qualification here. OK grants no COMPLETE or release authority;
  * no live caller is introduced. Graph component counts are not source proof. */

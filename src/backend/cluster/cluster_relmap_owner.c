@@ -148,17 +148,24 @@ typedef struct RelmapRetainedWalWork
 	bool found;
 	const ClusterRelmapPendingSideSource *sides;
 	size_t side_count;
+	uint32 participant[CLUSTER_WAL_INPUTS_MAX];
+	uint32 next_operation[CLUSTER_WAL_INPUTS_MAX];
 	bool completed[CLUSTER_WAL_INPUTS_MAX];
 	size_t completed_count;
 } RelmapRetainedWalWork;
 
 static bool
-relmap_retained_side_sources(const ClusterRelmapV2Image *image,
-	const ClusterRelmapPendingSideSource *sources, size_t count)
+relmap_retained_side_sources(RelmapRetainedWalWork *work)
 {
+	const ClusterRelmapV2Image *image = &work->image;
+	const ClusterRelmapPendingSideSource *sources = work->sides;
+	size_t count = work->side_count;
+
 	/* Validate every plan's complete physical membership before scanning.
 	 * Binding a claim to a plan alone does not bind it to the held ROOT. */
 	for (size_t i = 0; i < count; i++) {
+		uint32 participant = 0;
+
 		const ClusterRelmapPendingSideSource *input = &sources[i];
 		const ClusterControlRootIdentity *identity = &input->source.claim.identity;
 		uint32 participants = rf_side_online_plan_participant_count_v1(input->plan);
@@ -184,8 +191,88 @@ relmap_retained_side_sources(const ClusterRelmapV2Image *image,
 				supplied++;
 		if (supplied != participants)
 			return false;
+		/* The sealed participant index is the physical identity. Thread alone
+		 * is insufficient when one thread has retained incarnations. */
+		for (size_t j = 0; j < count; j++)
+			if (sources[j].plan == input->plan
+				&& rf_contributor_cut_precedes_v1(&sources[j].cut, &input->cut))
+				participant++;
+		if (participant >= participants || work->participant[i] != UINT32_MAX)
+			return false;
+		work->participant[i] = participant;
+		for (size_t j = 0; j < i; j++)
+			if (sources[j].plan == input->plan && work->participant[j] == participant)
+				return false;
 	}
 	return true;
+}
+
+static RfPageProofDetailV1
+relmap_retained_next_structure(RelmapRetainedWalWork *work, size_t source,
+	RfSideOnlineOperationV1 *operation, bool *found)
+{
+	const ClusterRelmapPendingSideSource *input = &work->sides[source];
+	uint32 count = rf_side_online_plan_operation_count_v1(input->plan);
+
+	*found = false;
+	/* Each physical source visits its plan at most once, including history.
+	 * A shared plan may interleave other sources and unrelated SIDE records. */
+	while (work->next_operation[source] < count) {
+		if (!rf_side_online_plan_operation_v1(input->plan,
+				work->next_operation[source]++, operation))
+			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		if (operation->identity.participant_index != work->participant[source]
+			|| (operation->identity.record.rmid != RM_SMGR_ID
+				&& operation->identity.record.rmid != RM_XACT_ID))
+			continue;
+		*found = true;
+		break;
+	}
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+static RfPageProofDetailV1
+relmap_retained_structure(RelmapRetainedWalWork *work, XLogReaderState *reader,
+	const ClusterWalSourceRef *source, const RfContributorStreamCutV1 *cut)
+{
+	if (work->sides == NULL
+		|| (XLogRecGetRmid(reader) != RM_SMGR_ID && XLogRecGetRmid(reader) != RM_XACT_ID))
+		return RF_PAGE_PROOF_DETAIL_OK;
+	for (size_t i = 0; i < work->side_count; i++) {
+		RfSideOnlineOperationV1 operation;
+		const RfPageReplayRecordIdentityV1 *record = &operation.identity.record;
+		RfPageProofDetailV1 detail;
+		bool found;
+
+		if (work->sides[i].cut.failed_thread != cut->failed_thread
+			|| work->sides[i].cut.origin_owner_incarnation != cut->origin_owner_incarnation)
+			continue;
+		detail = relmap_retained_next_structure(work, i, &operation, &found);
+		if (detail != RF_PAGE_PROOF_DETAIL_OK)
+			return detail;
+		if (!found)
+			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		if (record->system_identifier != reader->system_identifier
+			|| memcmp(record->storage_uuid, source->claim.identity.storage_uuid, 16) != 0
+			|| record->origin_thread != cut->failed_thread
+			|| record->timeline_id != source->timeline
+			|| record->read_rec_ptr != reader->ReadRecPtr || record->end_rec_ptr != reader->EndRecPtr
+			|| record->record_crc != reader->record->header.xl_crc
+			|| record->rmid != XLogRecGetRmid(reader) || record->info != XLogRecGetInfo(reader)
+			|| operation.source_xid != XLogRecGetXid(reader)
+			|| operation.source_top_xid != XLogRecGetTopXid(reader))
+			return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+		/* Structural payloads are whole native main data. Simple XACT may
+		 * own none; its original identity, CRC and frame still must match. */
+		if (operation.owned_payload_length > 0
+			&& (operation.owned_payload_length != XLogRecGetDataLen(reader)
+				|| operation.owned_payload == NULL || XLogRecGetData(reader) == NULL
+				|| memcmp(operation.owned_payload, XLogRecGetData(reader),
+					   operation.owned_payload_length) != 0))
+			return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+		return RF_PAGE_PROOF_DETAIL_OK;
+	}
+	return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
 }
 
 static RfPageProofDetailV1
@@ -213,6 +300,16 @@ relmap_retained_source(const ClusterWalSourceRef *source,
 			|| !rf_side_online_plan_recovery_claim_matches_v1(input->plan, source))
 			return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
 		if (completed != NULL) {
+			RfSideOnlineOperationV1 operation;
+			RfPageProofDetailV1 detail;
+			bool found;
+
+			/* Empty native sources must also have no extra structural input. */
+			detail = relmap_retained_next_structure(work, i, &operation, &found);
+			if (detail != RF_PAGE_PROOF_DETAIL_OK)
+				return detail;
+			if (found)
+				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 			work->completed[i] = true;
 			work->completed_count++;
 		}
@@ -227,7 +324,10 @@ relmap_retained_record(XLogReaderState *reader, const ClusterWalSourceRef *sourc
 {
 	RelmapRetainedWalWork *work = arg;
 	const ClusterRelmapV2Owner *owner = &work->image.pending_owner;
+	RfPageProofDetailV1 detail = relmap_retained_structure(work, reader, source, cut);
 
+	if (detail != RF_PAGE_PROOF_DETAIL_OK)
+		return detail;
 	if (source->claim.identity.origin_node_id != owner->node
 		|| source->claim.identity.origin_owner_incarnation != owner->admitted_incarnation
 		|| reader->EndRecPtr != owner->wal_end)
@@ -251,16 +351,19 @@ relmap_retained_wal(const ClusterRelmapV2Image *image, ClusterWalInputsV1 *input
 	RfPageProofDetailV1 detail;
 	ClusterControlRootResult result;
 
+	for (size_t i = 0; i < CLUSTER_WAL_INPUTS_MAX; i++)
+		work.participant[i] = UINT32_MAX;
+
 	if (image == NULL || inputs == NULL || image->pending_generation == 0
 		|| cluster_relmap_v2_encode(image, wire, sizeof(wire)) != CLUSTER_RELMAP_V2_VALID)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	if (sides != NULL
-		&& (side_count != cluster_wal_inputs_count_v1(inputs)
-			|| !relmap_retained_side_sources(image, sides, side_count)))
-		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	work.image = *image;
 	work.sides = sides;
 	work.side_count = side_count;
+	if (sides != NULL
+		&& (side_count != cluster_wal_inputs_count_v1(inputs)
+			|| !relmap_retained_side_sources(&work)))
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	result = cluster_wal_inputs_cold_census_v1(inputs, relmap_retained_record,
 		relmap_retained_source, &work, &records, &detail);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
