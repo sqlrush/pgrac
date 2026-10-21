@@ -1546,6 +1546,11 @@ vac_update_relstats(Relation relation,
 	 * it's corrupt, and overwrite with the oldest remaining XID in the table.
 	 * This should match vac_update_datfrozenxid() concerning what we consider
 	 * to be "in the future".
+	 *
+	 * PGRAC: a shared catalogue value can legitimately exceed this node's
+	 * local nextXid.  Do not use that local bound to lower the value reread
+	 * under the original current-X/inplace lock.  Shared FullXid legality is
+	 * a separate check; this exception grants no new freeze permission.
 	 */
 	oldfrozenxid = pgcform->relfrozenxid;
 	futurexid = false;
@@ -1557,7 +1562,11 @@ vac_update_relstats(Relation relation,
 
 		if (TransactionIdPrecedes(oldfrozenxid, frozenxid))
 			update = true;
-		else if (TransactionIdPrecedes(ReadNextTransactionId(), oldfrozenxid))
+		else if (
+#ifdef USE_PGRAC_CLUSTER
+			!(cluster_storage_mode_enabled() && cluster_shared_catalog) &&
+#endif
+			TransactionIdPrecedes(ReadNextTransactionId(), oldfrozenxid))
 			futurexid = update = true;
 
 		if (update)
@@ -1830,15 +1839,20 @@ vac_update_datfrozenxid_internal(void)
 	 * As in vac_update_relstats(), we ordinarily don't want to let
 	 * datfrozenxid go backward; but if it's "in the future" then it must be
 	 * corrupt and it seems best to overwrite it.
+	 *
+	 * PGRAC: another node may have advanced the shared tuple after our scan.
+	 * Preserve that locked value even when it exceeds our local scan bound.
 	 */
-	if (dbform->datfrozenxid != newFrozenXid &&
-		(TransactionIdPrecedes(dbform->datfrozenxid, newFrozenXid) ||
-		 TransactionIdPrecedes(lastSaneFrozenXid, dbform->datfrozenxid)))
-	{
+	if (dbform->datfrozenxid != newFrozenXid
+		&& (TransactionIdPrecedes(dbform->datfrozenxid, newFrozenXid)
+			|| (
+#ifdef USE_PGRAC_CLUSTER
+				!(cluster_storage_mode_enabled() && cluster_shared_catalog) &&
+#endif
+				TransactionIdPrecedes(lastSaneFrozenXid, dbform->datfrozenxid)))) {
 		dbform->datfrozenxid = newFrozenXid;
 		dirty = true;
-	}
-	else
+	} else
 		newFrozenXid = dbform->datfrozenxid;
 
 	/* Ditto for datminmxid */

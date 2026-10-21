@@ -8883,13 +8883,13 @@ test_cluster_snapshot_admission_refresh.inc: $(top_srcdir)/src/backend/storage/i
 		emit { print } emit && /^}$$/ { done=1; exit } \
 		END { if (!done) exit 1 }' $< > $@
 
-# PGRAC: extract the actual maintenance entry and its optional internal body.
+# PGRAC: extract the actual catalogue merge consumers and maintenance entry.
 test_cluster_snapshot_admission_vacuum.inc: $(top_srcdir)/src/backend/commands/vacuum.c Makefile
-	@awk '/^vac_update_datfrozenxid(_internal)?\(void\)$$/ { \
+	@awk '/^vac_update_relstats\(Relation relation,/ || /^vac_update_datfrozenxid(_internal)?\(void\)$$/ { \
 		internal = ($$0 ~ /_internal/); count++; emit=1; \
 		body = body (internal ? "static void\n" : "void\n"); has_internal += internal } \
 		emit { body = body $$0 "\n" } emit && /^}$$/ { emit=0 } \
-		END { if (emit || count < 1 || count > 2) exit 1; \
+		END { if (emit || count != 3 || has_internal != 1) exit 1; \
 		if (has_internal) print "static void vac_update_datfrozenxid_internal(void);"; \
 		printf "%s", body }' $< > $@
 

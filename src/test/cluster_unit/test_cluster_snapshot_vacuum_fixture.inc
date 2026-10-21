@@ -51,6 +51,8 @@ static unsigned vacuum_pushes, vacuum_pops, vacuum_begins, vacuum_finishes;
 static unsigned vacuum_cancels, vacuum_truncates, vacuum_snapshots;
 static bool vacuum_no_tables;
 static bool vacuum_class_returned;
+static TransactionId vacuum_next_xid;
+static TransactionId vacuum_inplace_frozenxid;
 static Snapshot vacuum_seen_active;
 static struct RelationData vacuum_relation;
 static HeapTupleData vacuum_class_tuple, vacuum_database_tuple;
@@ -116,7 +118,7 @@ GetOldestMultiXactId(void)
 FullTransactionId
 ReadNextFullTransactionId(void)
 {
-	return FullTransactionIdFromU64(200);
+	return FullTransactionIdFromU64(vacuum_next_xid);
 }
 
 MultiXactId
@@ -187,12 +189,21 @@ systable_inplace_update_begin(Relation relation, Oid index, bool index_ok, Snaps
 	vacuum_begins++;
 	vacuum_inject(VAC_FAULT_INPLACE);
 	/* A foreign tuple's terminal read consumes the actual original gate. */
-	if (cluster_storage_mode_enabled() && cluster_shared_catalog) {
+	if (index == DatabaseOidIndexId && cluster_storage_mode_enabled() && cluster_shared_catalog) {
 		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(vacuum_database_tuple.t_data) % 16, 0);
 		UT_ASSERT(cluster_node_id != 0);
 		(void)cluster_undo_horizon_read_admission_enforce(InvalidScn);
 	}
-	*tuple = &vacuum_database_tuple;
+	if (index == ClassOidIndexId) {
+		*tuple = &vacuum_class_tuple;
+		if (TransactionIdIsValid(vacuum_inplace_frozenxid))
+			((Form_pg_class)GETSTRUCT(*tuple))->relfrozenxid = vacuum_inplace_frozenxid;
+	} else {
+		UT_ASSERT_EQ(index, DatabaseOidIndexId);
+		*tuple = &vacuum_database_tuple;
+		if (TransactionIdIsValid(vacuum_inplace_frozenxid))
+			((Form_pg_database)GETSTRUCT(*tuple))->datfrozenxid = vacuum_inplace_frozenxid;
+	}
 	*state = &vacuum_relation;
 }
 
@@ -271,6 +282,8 @@ vacuum_reset(void)
 	vacuum_cancels = vacuum_truncates = vacuum_snapshots = 0;
 	vacuum_no_tables = false;
 	vacuum_class_returned = false;
+	vacuum_next_xid = 200;
+	vacuum_inplace_frozenxid = InvalidTransactionId;
 	vacuum_seen_active = NULL;
 	memset(&vacuum_class_storage, 0, sizeof(vacuum_class_storage));
 	memset(&vacuum_database_storage, 0, sizeof(vacuum_database_storage));
@@ -282,6 +295,8 @@ vacuum_reset(void)
 	relation = (Form_pg_class)GETSTRUCT(&vacuum_class_tuple);
 	relation->relkind = RELKIND_RELATION;
 	relation->relfrozenxid = relation->relminmxid = 80;
+	vacuum_relation.rd_id = 43;
+	vacuum_relation.rd_rel = relation;
 	database = (Form_pg_database)GETSTRUCT(&vacuum_database_tuple);
 	database->datfrozenxid = database->datminmxid = 40;
 }
@@ -447,4 +462,150 @@ UT_TEST(vacuum_stale_borrowed_snapshot_is_not_refreshed)
 	PopActiveSnapshot();
 	UnregisterSnapshot(borrowed);
 	vacuum_abort();
+}
+
+/* The real inplace entry sees the new tuple, after the caller's older scan. */
+UT_TEST(vacuum_shared_relstats_keeps_newer_locked_frozen_xid)
+{
+	for (int newer = 0; newer < 2; newer++) {
+		Form_pg_class relation;
+		bool frozen_updated = true, multi_updated = true;
+
+		vacuum_reset();
+		vacuum_inplace_frozenxid = newer ? 300 : 150;
+		relation = (Form_pg_class)GETSTRUCT(&vacuum_class_tuple);
+		vac_update_relstats(&vacuum_relation, 5, 20, 2, false, 80, InvalidMultiXactId,
+							&frozen_updated, &multi_updated, false);
+		UT_ASSERT_EQ(relation->relfrozenxid, vacuum_inplace_frozenxid);
+		UT_ASSERT(!frozen_updated && !multi_updated);
+		UT_ASSERT_EQ(relation->relpages, 5);
+		UT_ASSERT_EQ(relation->reltuples, 20);
+		UT_ASSERT_EQ(relation->relallvisible, 2);
+		UT_ASSERT_EQ(relation->relminmxid, 80);
+		UT_ASSERT_EQ(vacuum_begins, 1);
+		UT_ASSERT_EQ(vacuum_finishes, 1);
+		UT_ASSERT_EQ(vacuum_truncates, 0);
+		vacuum_abort();
+	}
+}
+
+UT_TEST(vacuum_shared_database_keeps_newer_locked_frozen_xid)
+{
+	for (int newer = 0; newer < 2; newer++) {
+		Form_pg_database database;
+
+		vacuum_reset();
+		vacuum_inplace_frozenxid = newer ? 300 : 150;
+		database = (Form_pg_database)GETSTRUCT(&vacuum_database_tuple);
+		database->datminmxid = 80;
+		UT_ASSERT_EQ(vacuum_call(), 0);
+		UT_ASSERT_EQ(database->datfrozenxid, vacuum_inplace_frozenxid);
+		UT_ASSERT_EQ(database->datminmxid, 80);
+		UT_ASSERT_EQ(vacuum_begins, 1);
+		UT_ASSERT_EQ(vacuum_finishes, 0);
+		UT_ASSERT_EQ(vacuum_cancels, 1);
+		UT_ASSERT_EQ(vacuum_truncates, 0);
+		vacuum_abort();
+	}
+}
+
+UT_TEST(vacuum_shared_relstats_keeps_invalid_and_equal_candidates)
+{
+	for (int equal = 0; equal < 2; equal++) {
+		Form_pg_class relation;
+		bool frozen_updated = true;
+
+		vacuum_reset();
+		vacuum_inplace_frozenxid = 300;
+		relation = (Form_pg_class)GETSTRUCT(&vacuum_class_tuple);
+		vac_update_relstats(&vacuum_relation, 0, 0, 0, false, equal ? 300 : InvalidTransactionId,
+							InvalidMultiXactId, &frozen_updated, NULL, false);
+		UT_ASSERT_EQ(relation->relfrozenxid, 300);
+		UT_ASSERT(!frozen_updated);
+		UT_ASSERT_EQ(vacuum_finishes, 0);
+		UT_ASSERT_EQ(vacuum_cancels, 1);
+		vacuum_abort();
+	}
+}
+
+UT_TEST(vacuum_shared_relstats_retains_native_wrap_order)
+{
+	for (int old_epoch = 0; old_epoch < 2; old_epoch++) {
+		TransactionId candidate = old_epoch ? 20 : 0xffffff00U;
+		TransactionId current = old_epoch ? 0xffffff00U : 20;
+		Form_pg_class relation;
+		bool frozen_updated = false;
+
+		vacuum_reset();
+		vacuum_next_xid = old_epoch ? 30 : 0xfffffff0U;
+		vacuum_inplace_frozenxid = current;
+		relation = (Form_pg_class)GETSTRUCT(&vacuum_class_tuple);
+		vac_update_relstats(&vacuum_relation, 0, 0, 0, false, candidate, InvalidMultiXactId,
+							&frozen_updated, NULL, false);
+		UT_ASSERT_EQ(relation->relfrozenxid, old_epoch ? candidate : current);
+		UT_ASSERT_EQ(frozen_updated, old_epoch);
+		UT_ASSERT_EQ(vacuum_finishes, old_epoch);
+		UT_ASSERT_EQ(vacuum_cancels, !old_epoch);
+		vacuum_abort();
+	}
+}
+
+UT_TEST(vacuum_shared_frozen_merge_keeps_independent_mx_path)
+{
+	Form_pg_class relation;
+	Form_pg_database database;
+	bool frozen_updated = true, multi_updated = false;
+
+	vacuum_reset();
+	vacuum_inplace_frozenxid = 300;
+	relation = (Form_pg_class)GETSTRUCT(&vacuum_class_tuple);
+	relation->relminmxid = 300;
+	vac_update_relstats(&vacuum_relation, 0, 0, 0, false, 80, 80, &frozen_updated, &multi_updated,
+						false);
+	UT_ASSERT_EQ(relation->relfrozenxid, 300);
+	UT_ASSERT_EQ(relation->relminmxid, 80);
+	UT_ASSERT(!frozen_updated && multi_updated);
+	UT_ASSERT_EQ(vacuum_finishes, 1);
+	vacuum_abort();
+
+	vacuum_reset();
+	vacuum_inplace_frozenxid = 300;
+	database = (Form_pg_database)GETSTRUCT(&vacuum_database_tuple);
+	database->datminmxid = 300;
+	UT_ASSERT_EQ(vacuum_call(), 0);
+	UT_ASSERT_EQ(database->datfrozenxid, 300);
+	UT_ASSERT_EQ(database->datminmxid, 80);
+	UT_ASSERT_EQ(vacuum_finishes, 1);
+	UT_ASSERT_EQ(vacuum_truncates, 1);
+	vacuum_abort();
+}
+
+UT_TEST(vacuum_nontarget_frozen_merge_keeps_native_repair)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		Form_pg_class relation;
+		Form_pg_database database;
+		bool frozen_updated = false;
+
+		vacuum_reset();
+		if (mode == 0)
+			cluster_enabled = false;
+		else
+			cluster_shared_catalog = false;
+		vacuum_inplace_frozenxid = 300;
+		relation = (Form_pg_class)GETSTRUCT(&vacuum_class_tuple);
+		vac_update_relstats(&vacuum_relation, 0, 0, 0, false, 80, InvalidMultiXactId,
+							&frozen_updated, NULL, false);
+		UT_ASSERT_EQ(relation->relfrozenxid, 80);
+		UT_ASSERT(frozen_updated);
+		UT_ASSERT_EQ(vacuum_finishes, 1);
+		vacuum_class_returned = false;
+		database = (Form_pg_database)GETSTRUCT(&vacuum_database_tuple);
+		database->datminmxid = 80;
+		UT_ASSERT_EQ(vacuum_call(), 0);
+		UT_ASSERT_EQ(database->datfrozenxid, 80);
+		UT_ASSERT_EQ(vacuum_finishes, 2);
+		UT_ASSERT_EQ(vacuum_truncates, 1);
+		vacuum_abort();
+	}
 }
