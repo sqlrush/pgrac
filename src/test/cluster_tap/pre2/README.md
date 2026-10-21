@@ -120,6 +120,33 @@ birth or fill producer fields marked unknown. All entries keep
 `identity_bound=false`; repeated sequence numbers remain separate raw lines
 and assignments do not establish sequence completeness or causal order.
 
+Each node also has a `trace_sequence_audit` for accepted declarations. Streams
+are separated by the entire declared node, boot, PID, procno, backend start,
+process incarnation, role and sequence domain. Each stream retains its
+`identity`, `observation_indices` and numeric `event_sequences` in original
+observation order; the assignment array's order does not reorder observations.
+No unassigned observation or other process/domain supplies a missing sequence.
+
+Stream `issues` identify `MISSING_START` (first sequence is not 1), `FORWARD_GAP`
+(an adjacent observed sequence jumps forward), `DUPLICATE`, `LOCAL_REVERSAL`
+(an adjacent observed sequence decreases), and `EXHAUSTED` (the producer's
+exhausted/saturated ending flag is 1). Each issue records the observation index
+and sequence; gaps record the expected sequence, duplicates the first retained
+index, and reversals the previous retained index. No ranges are expanded, and
+later observations do not erase earlier issues. Raw lines are never sorted,
+deduplicated or changed. These are observations of retained LOG order, including
+deferred emission; they do not establish execution order or causal edges.
+
+A stream has `prefix_status=OBSERVED_PREFIX` only when it starts at 1 with no
+observed issue; otherwise it is `ROOT_OPEN`. The node audit is `UNKNOWN` without
+declared streams, `PARTIAL` if a stream has issues or any parsed observation is
+unassigned or a record was rejected/unhandled, and otherwise `DECLARED_ONLY`.
+It retains `unassigned_observation_indices`, `rejected_record_count` and
+`unhandled_record_count`. All audits keep `sequence_complete=false` and
+`identity_bound=false`: a contiguous retained prefix does not seal an export,
+detect missing trailing records, or supply barrier/STOP evidence. The producer
+projection reader retains this audit without granting additional credit.
+
 The output always has `identity_bound=false`, `field_root=OPEN` and
 `ready_to_run=false`. It does not produce normalized contract events, request
 or receipt joins, barrier/sequence completeness, STOP evidence or workload

@@ -343,10 +343,11 @@ def _item_groups(fields, name, page_guard=None, schemas=ITEM_SCHEMAS):
 def read_evidence(manifest_path):
     """Read verified capture bytes once, retaining each producer's local view.
 
-    No inventory candidate supplies a missing field. No cross-line comparison,
-    sorting, deduplication, normalized contract event or acceptance verdict is
-    produced. Numeric ranges validate formatter representations, not protocol
-    validity. A key projection does not establish a FullXid or process identity.
+    No inventory candidate supplies a missing field. Producer projections do
+    not compare lines, sort, deduplicate or produce normalized contract events
+    or acceptance verdicts. The manifest's declared sequence audit is retained.
+    Numeric ranges validate formatter representations, not protocol validity.
+    A key projection does not establish a FullXid or process identity.
     """
     result = read_capture(manifest_path)
     statuses = []

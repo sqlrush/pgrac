@@ -453,6 +453,197 @@ class WorkloadManifestTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.read()
 
+    def sequence_audit(self, sequences, assigned=None):
+        self.put("stderr0", b"".join(self.log(0, str(seq)) for seq in sequences))
+        indices = range(len(sequences)) if assigned is None else assigned
+        self.assign([self.assignment(index=index) for index in indices])
+        return self.read()["nodes"][0]["trace_sequence_audit"]
+
+    def test_sequence_audit_never_infers_a_stream_from_pid_candidates(self):
+        for node in self.read()["nodes"]:
+            audit = node["trace_sequence_audit"]
+            self.assertEqual(audit["status"], "UNKNOWN")
+            self.assertEqual(audit["streams"], [])
+            self.assertEqual(audit["unassigned_observation_indices"], [0])
+            self.assertFalse(audit["sequence_complete"])
+            self.assertFalse(audit["identity_bound"])
+
+    def test_observed_sequence_prefix_retains_raw_order_and_no_seal_credit(self):
+        audit = self.sequence_audit([1, 2, 3], assigned=[2, 0, 1])
+        self.assertEqual(audit["status"], "DECLARED_ONLY")
+        self.assertEqual(len(audit["streams"]), 1)
+        stream = audit["streams"][0]
+        self.assertEqual(stream["identity"], self.assignment()["identity"])
+        self.assertEqual(stream["observation_indices"], [0, 1, 2])
+        self.assertEqual(stream["event_sequences"], [1, 2, 3])
+        self.assertEqual(stream["issues"], [])
+        self.assertEqual(stream["prefix_status"], "OBSERVED_PREFIX")
+        self.assertEqual(audit["unassigned_observation_indices"], [])
+        self.assertFalse(audit["sequence_complete"])
+        result = self.read()
+        self.assertEqual([item["fields"]["event_seq"] for item in
+                          result["nodes"][0]["trace"]["observations"]], ["1", "2", "3"])
+        self.assertFalse(result["identity_bound"])
+        self.assertFalse(result["ready_to_run"])
+        self.assertNotIn("events", result)
+        self.assertNotIn("overall", result)
+
+    def test_sequence_missing_start_and_forward_gap_stay_open(self):
+        for sequences, kind, expected, observed, index in (
+                ([2, 3], "MISSING_START", 1, 2, 0),
+                ([1, 3], "FORWARD_GAP", 2, 3, 1)):
+            with self.subTest(sequences=sequences):
+                audit = self.sequence_audit(sequences)
+                stream = audit["streams"][0]
+                self.assertEqual(audit["status"], "PARTIAL")
+                self.assertEqual(stream["prefix_status"], "ROOT_OPEN")
+                issue = next(item for item in stream["issues"] if item["kind"] == kind)
+                self.assertEqual(issue["observation_index"], index)
+                self.assertEqual(issue["expected_seq"], expected)
+                self.assertEqual(issue["event_seq"], observed)
+
+    def test_sequence_nonadjacent_duplicate_keeps_both_raw_observations(self):
+        audit = self.sequence_audit([1, 2, 1])
+        stream = audit["streams"][0]
+        self.assertEqual(stream["event_sequences"], [1, 2, 1])
+        duplicate = next(item for item in stream["issues"] if item["kind"] == "DUPLICATE")
+        self.assertEqual(duplicate["observation_index"], 2)
+        self.assertEqual(duplicate["first_observation_index"], 0)
+        self.assertEqual(duplicate["event_seq"], 1)
+        self.assertEqual(audit["status"], "PARTIAL")
+        self.assertEqual(len(self.read()["nodes"][0]["trace"]["observations"]), 3)
+
+    def test_sequence_reversal_cannot_be_repaired_by_sorting_or_later_fill(self):
+        audit = self.sequence_audit([1, 3, 2])
+        stream = audit["streams"][0]
+        self.assertEqual(stream["event_sequences"], [1, 3, 2])
+        self.assertEqual(stream["observation_indices"], [0, 1, 2])
+        kinds = {item["kind"] for item in stream["issues"]}
+        self.assertIn("FORWARD_GAP", kinds)
+        self.assertIn("LOCAL_REVERSAL", kinds)
+        reversal = next(item for item in stream["issues"] if item["kind"] == "LOCAL_REVERSAL")
+        self.assertEqual(reversal["previous_observation_index"], 1)
+        self.assertEqual(reversal["observation_index"], 2)
+        self.assertEqual(audit["status"], "PARTIAL")
+
+    def test_sequence_domains_are_independent_even_for_one_process(self):
+        raw = b"".join(self.log(0, str(seq)).replace(b"HOT_FULL", family.encode())
+                       for family, seq in (("HOT_FULL", 1), ("READ_IMAGE", 1),
+                                           ("HOT_FULL", 2), ("READ_IMAGE", 2)))
+        self.put("stderr0", raw)
+        claims = [self.assignment(index=index) for index in range(4)]
+        for index in (1, 3):
+            claims[index]["identity"]["sequence_domain"] = "READ_IMAGE"
+        self.assign(claims)
+        audit = self.read()["nodes"][0]["trace_sequence_audit"]
+        self.assertEqual(audit["status"], "DECLARED_ONLY")
+        self.assertEqual([item["identity"]["sequence_domain"] for item in audit["streams"]],
+                         ["HOT_FULL", "READ_IMAGE"])
+        self.assertEqual([item["observation_indices"] for item in audit["streams"]],
+                         [[0, 2], [1, 3]])
+        self.assertTrue(all(item["event_sequences"] == [1, 2] and item["issues"] == []
+                            for item in audit["streams"]))
+
+    def test_reused_pid_births_cannot_borrow_each_others_prefix(self):
+        entry = self.manifest["nodes"][0]
+        inventory = self.inventory(entry)
+        second = dict(pid=101, procno=7, backend_start="start-B",
+                      process_incarnation="inc-B", role="backend")
+        inventory["processes"].append(second)
+        self.inventory(entry, inventory)
+        self.put("stderr0", self.log(0, "1") + self.log(0, "2"))
+        self.assign([self.assignment(index=0), self.assignment(index=1, process=second)])
+        audit = self.read()["nodes"][0]["trace_sequence_audit"]
+        self.assertEqual(len(audit["streams"]), 2)
+        self.assertEqual(audit["streams"][0]["prefix_status"], "OBSERVED_PREFIX")
+        self.assertEqual(audit["streams"][1]["event_sequences"], [2])
+        self.assertEqual(audit["streams"][1]["issues"][0]["kind"], "MISSING_START")
+        self.assertEqual(audit["status"], "PARTIAL")
+
+    def test_sequence_prefixes_are_separate_across_nodes_and_boots(self):
+        for node in range(4):
+            self.assign([self.assignment(node=node)], node=node)
+        result = self.read()
+        self.assertEqual([node["trace_sequence_audit"]["streams"][0]["identity"]["boot_id"]
+                          for node in result["nodes"]], ["boot-0", "boot-1", "boot-2", "boot-3"])
+        self.assertTrue(all(node["trace_sequence_audit"]["status"] == "DECLARED_ONLY"
+                            for node in result["nodes"]))
+        self.assertFalse(result["identity_bound"])
+
+    def test_unassigned_sequence_cannot_fill_a_declared_prefix(self):
+        audit = self.sequence_audit([1, 2, 3], assigned=[0, 2])
+        self.assertEqual(audit["unassigned_observation_indices"], [1])
+        self.assertEqual(audit["streams"][0]["event_sequences"], [1, 3])
+        self.assertEqual(audit["streams"][0]["issues"][0]["kind"], "FORWARD_GAP")
+        self.assertEqual(audit["status"], "PARTIAL")
+        audit = self.sequence_audit([1, 2], assigned=[0])
+        self.assertEqual(audit["streams"][0]["prefix_status"], "OBSERVED_PREFIX")
+        self.assertEqual(audit["status"], "PARTIAL")
+        self.assertFalse(audit["sequence_complete"])
+
+    def test_missing_legacy_domain_stays_unknown_in_sequence_audit(self):
+        self.put("stderr0", b"LOG: PGRAC_FAMILY=CTRC_RECEIPT event=observed event_seq=1 "
+                 b"sequence_scope=process node_id=0 pid=101 authoritative=0 "
+                 b"trace_sequence_exhausted=0\n")
+        audit = self.read()["nodes"][0]["trace_sequence_audit"]
+        self.assertEqual(audit["status"], "UNKNOWN")
+        self.assertEqual(audit["streams"], [])
+        self.assertEqual(audit["unassigned_observation_indices"], [0])
+
+    def test_exhausted_counter_endings_always_keep_declared_stream_open(self):
+        from workload_log import ENDINGS, LEGACY_FAMILIES
+        for family, ending in ENDINGS.items():
+            if family in LEGACY_FAMILIES or family == "CTRC_RECEIPT":
+                continue
+            with self.subTest(family=family):
+                raw = self.log(0).replace(b"HOT_FULL", family.encode())
+                raw = raw.replace(b"trace_sequence_exhausted=0", (ending + "=1").encode())
+                self.put("stderr0", raw)
+                claim = self.assignment()
+                claim["identity"]["sequence_domain"] = family
+                self.assign([claim])
+                audit = self.read()["nodes"][0]["trace_sequence_audit"]
+                self.assertEqual(audit["status"], "PARTIAL")
+                self.assertEqual(audit["streams"][0]["prefix_status"], "ROOT_OPEN")
+                self.assertEqual(audit["streams"][0]["issues"][0]["kind"], "EXHAUSTED")
+
+    def test_rejected_or_unhandled_records_prevent_node_sequence_qualification(self):
+        for extra, count_key in ((b"LOG: PGRAC_FAMILY=FUTURE event=observed\n",
+                                  "unhandled_record_count"),
+                                 (self.log(0).rstrip(b"\n"), "rejected_record_count")):
+            with self.subTest(extra=extra):
+                self.put("stderr0", self.log(0) + extra)
+                self.assign([self.assignment()])
+                audit = self.read()["nodes"][0]["trace_sequence_audit"]
+                self.assertEqual(audit[count_key], 1)
+                self.assertEqual(audit["status"], "PARTIAL")
+                self.assertFalse(audit["sequence_complete"])
+
+    def test_large_uint64_sequence_gap_retains_bounds_without_filling_events(self):
+        audit = self.sequence_audit([1, 2**64 - 1])
+        stream = audit["streams"][0]
+        self.assertEqual(stream["event_sequences"], [1, 2**64 - 1])
+        self.assertEqual(len(stream["issues"]), 1)
+        self.assertEqual(stream["issues"][0]["expected_seq"], 2)
+        self.assertEqual(stream["issues"][0]["event_seq"], 2**64 - 1)
+        self.assertEqual(audit["status"], "PARTIAL")
+
+    def test_sequence_audit_is_retained_by_projection_and_cli_without_run_credit(self):
+        import workload_evidence
+        audit = self.sequence_audit([1, 1])
+        path = self.root / "manifest.json"
+        result = workload_evidence.read_evidence(path)
+        self.assertEqual(result["nodes"][0]["trace_sequence_audit"], audit)
+        saved = {p: p.read_bytes() for p in self.root.iterdir()}
+        run = subprocess.run([sys.executable, workload_manifest.__file__, str(path)],
+                             capture_output=True, text=True, check=False)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        output = json.loads(run.stdout)
+        self.assertEqual(output["nodes"][0]["trace_sequence_audit"], audit)
+        self.assertFalse(output["ready_to_run"])
+        self.assertFalse(output["identity_bound"])
+        self.assertEqual({p: p.read_bytes() for p in self.root.iterdir()}, saved)
+
     def test_cli_verifies_without_modifying_files_or_granting_run_credit(self):
         self.assign([self.assignment()])
         self.read()

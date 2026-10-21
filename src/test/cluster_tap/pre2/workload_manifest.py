@@ -13,7 +13,7 @@ from pathlib import Path
 import re
 import stat
 
-from workload_log import LEGACY_FAMILIES, read_trace
+from workload_log import ENDINGS, LEGACY_FAMILIES, read_trace
 
 
 def _require(condition, reason):
@@ -127,6 +127,57 @@ def _trace_identities(node, inventory, trace, files):
     return assignments
 
 
+def _trace_sequences(trace, assignments):
+    """Audit declared streams in retained order without attesting an export seal."""
+    streams = {}
+    seen = {}
+    unassigned = []
+    identity_fields = ("node_id", "boot_id", "pid", "procno", "backend_start",
+                       "process_incarnation", "role", "sequence_domain")
+    for index, (observation, assignment) in enumerate(zip(trace["observations"], assignments)):
+        if assignment["status"] != "DECLARED_ONLY":
+            unassigned.append(index)
+            continue
+        identity = assignment["identity"]
+        key = tuple(identity[field] for field in identity_fields)
+        if key not in streams:
+            streams[key] = dict(identity=identity, observation_indices=[], event_sequences=[],
+                                issues=[], prefix_status="OBSERVED_PREFIX")
+            seen[key] = {}
+        stream = streams[key]
+        fields = observation["fields"]
+        sequence = int(fields["event_seq"])
+        issue = dict(observation_index=index, event_seq=sequence)
+        if not stream["event_sequences"]:
+            if sequence != 1:
+                stream["issues"].append(dict(issue, kind="MISSING_START", expected_seq=1))
+        else:
+            previous = stream["event_sequences"][-1]
+            if sequence > previous + 1:
+                stream["issues"].append(dict(issue, kind="FORWARD_GAP", expected_seq=previous + 1))
+            elif sequence < previous:
+                stream["issues"].append(dict(issue, kind="LOCAL_REVERSAL",
+                                              previous_observation_index=
+                                              stream["observation_indices"][-1]))
+        if sequence in seen[key]:
+            stream["issues"].append(dict(issue, kind="DUPLICATE",
+                                          first_observation_index=seen[key][sequence]))
+        if fields[ENDINGS[fields["PGRAC_FAMILY"]]] == "1":
+            stream["issues"].append(dict(issue, kind="EXHAUSTED"))
+        stream["observation_indices"].append(index)
+        stream["event_sequences"].append(sequence)
+        seen[key].setdefault(sequence, index)
+        if stream["issues"]:
+            stream["prefix_status"] = "ROOT_OPEN"
+    partial = (unassigned or trace["rejections"] or trace["unhandled"] or
+               any(stream["issues"] for stream in streams.values()))
+    return dict(status="UNKNOWN" if not streams else "PARTIAL" if partial else "DECLARED_ONLY",
+                streams=list(streams.values()), unassigned_observation_indices=unassigned,
+                rejected_record_count=len(trace["rejections"]),
+                unhandled_record_count=len(trace["unhandled"]),
+                sequence_complete=False, identity_bound=False)
+
+
 def read_capture(manifest_path):
     """Check a version-1 four-node capture and parse its verified stderr bytes.
 
@@ -230,12 +281,13 @@ def _read_capture(path):
             candidates.append(dict(inventory_indices=[index for index, process in
                                                       enumerate(processes)
                                                       if process["pid"] == int(fields["pid"])]))
+        assignments = _trace_identities(node, inventory, trace, files)
         result_nodes.append(dict(node_id=node["node_id"], declared_inventory=inventory,
                                  file_ids={role: node[role] for role in
                                            ("postgres", "config", "stderr", "inventory")},
                                  trace=trace, process_candidates=candidates,
-                                 trace_identity_assignments=_trace_identities(
-                                     node, inventory, trace, files)))
+                                 trace_identity_assignments=assignments,
+                                 trace_sequence_audit=_trace_sequences(trace, assignments)))
     parse_status = ("REJECTED" if "REJECTED" in statuses else
                     "PARSED" if "PARSED" in statuses else "NOT_OBSERVED")
     return dict(manifest=dict(sha256=hashlib.sha256(raw_manifest).hexdigest(),
