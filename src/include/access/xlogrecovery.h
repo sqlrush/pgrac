@@ -157,6 +157,14 @@ extern bool ClusterColdRecoveryTxLoserCurrent(
 	const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdTopTxCensusEntryV1 *subject);
 
+/* Original post-EOR owner only: require the producer's complete independent
+ * TopTxProof for this exact ACTIVE census subject.  This is a read-only
+ * qualified old-ACTIVE input; it grants no C0, TT, WAL, checkpoint or
+ * mutation authority. */
+extern bool ClusterColdRecoveryTxTopProofCurrent(
+	const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject);
+
 extern const struct ClusterColdTypedV1 *
 ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start);
 #endif

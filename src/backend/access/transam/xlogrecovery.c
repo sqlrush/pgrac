@@ -825,6 +825,26 @@ ClusterColdRecoveryTxLoserCurrent(const struct ClusterRecoveryStartV1 *start,
 }
 
 bool
+ClusterColdRecoveryTxTopProofCurrent(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject)
+{
+	/* Physical loser identity is a prerequisite, but it is not the complete
+	 * old-ACTIVE qualification.  Require every independent producer gate from
+	 * the same retained census entry and never consult caller assertions. */
+	if (!ClusterColdRecoveryTxLoserCurrent(start, subject)
+		|| memcmp(&subject->proof.key, &subject->input.key,
+				  sizeof(subject->input.key)) != 0
+		|| !subject->proof.producer_top
+		|| !subject->proof.qualified_base
+		|| !subject->proof.sealed_redo
+		|| !subject->proof.ordinary_effects
+		|| !subject->proof.old_writer_isolated
+		|| !subject->proof.terminal_match)
+		return false;
+	return true;
+}
+
+bool
 ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 {
 	struct ClusterRecoveryStartV1 *start;

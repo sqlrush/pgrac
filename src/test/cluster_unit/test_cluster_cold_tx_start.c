@@ -440,6 +440,20 @@ UT_TEST(test_loser_candidate_requires_proven_exact_physical_entry)
 	entry->loser_proven = true;
 	entry->loser.key = entry->input.key;
 	UT_ASSERT(ClusterColdRecoveryTxLoserCurrent(info.cluster_tx_start, entry));
+	entry->proof.key = entry->input.key;
+	entry->proof.producer_top = true;
+	entry->proof.qualified_base = true;
+	entry->proof.sealed_redo = true;
+	entry->proof.ordinary_effects = true;
+	entry->proof.old_writer_isolated = true;
+	entry->proof.terminal_match = true;
+	UT_ASSERT(ClusterColdRecoveryTxTopProofCurrent(info.cluster_tx_start, entry));
+	entry->proof.qualified_base = false;
+	UT_ASSERT(!ClusterColdRecoveryTxTopProofCurrent(info.cluster_tx_start, entry));
+	entry->proof.qualified_base = true;
+	entry->proof.key.xid++;
+	UT_ASSERT(!ClusterColdRecoveryTxTopProofCurrent(info.cluster_tx_start, entry));
+	entry->proof.key = entry->input.key;
 	/* The retained result must stay byte-for-byte tied to the physical slot. */
 	entry->loser.key.xid++;
 	UT_ASSERT(!ClusterColdRecoveryTxLoserCurrent(info.cluster_tx_start, entry));

@@ -6682,7 +6682,11 @@ cluster_cold_recovery_consume_loser_inputs_v1(
 		 * unresolved; it must not be promoted by this consumer. */
 		if (!entry->loser_proven)
 			continue;
-		if (!ClusterColdRecoveryTxLoserCurrent(start, entry))
+		/* A physical loser is necessary but not sufficient: the consumer
+		 * accepts only the complete independently retained TopTxProof for
+		 * this exact old-ACTIVE entry.  This remains read-only input and
+		 * grants no C0, checkpoint or mutation authority. */
+		if (!ClusterColdRecoveryTxTopProofCurrent(start, entry))
 			return false;
 
 		result = cluster_wal_inputs_begin_tx_closure_v1(start, entry, &inputs);

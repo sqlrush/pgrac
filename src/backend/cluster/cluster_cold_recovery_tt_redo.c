@@ -1250,6 +1250,10 @@ cluster_cold_typed_top_tx_loser_producer_v1(
 		|| !cluster_cold_typed_sources_current_v1(typed, fence)
 		|| !cluster_cold_typed_old_writer_isolated_v1(typed, fence, participant))
 		return false;
+	/* Retain the independently recomputed proof beside the exact physical
+	 * result.  The caller's bits were never trusted; this snapshot is still
+	 * attempt-local and grants no post-EOR writer or C0 authority. */
+	result.proof = qualified;
 	*out = result;
 	return true;
 }

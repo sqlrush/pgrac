@@ -1056,6 +1056,9 @@ typedef struct ClusterColdTopTxLoserProducerResultV1 {
 	ClusterColdTtActiveIdentityV1 active;
 	ClusterColdLoserIdentityV1 loser;
 	TTSlot before;
+	/* Independent producer proof retained with this exact physical result.
+	 * This is attempt-local input for a later consumer, never authority. */
+	ClusterColdTopTxProofV1 proof;
 } ClusterColdTopTxLoserProducerResultV1;
 
 extern bool cluster_cold_typed_top_tx_loser_producer_v1(
@@ -1069,6 +1072,9 @@ typedef struct ClusterColdTopTxCensusEntryV1 {
 	ClusterColdTtSlotInputV1 input;
 	bool loser_proven;
 	ClusterColdLoserIdentityV1 loser;
+	/* The complete producer proof is retained with the matching census entry;
+	 * an absent/zero proof keeps the ACTIVE input unresolved. */
+	ClusterColdTopTxProofV1 proof;
 } ClusterColdTopTxCensusEntryV1;
 
 typedef struct ClusterColdTopTxCensusV1 {

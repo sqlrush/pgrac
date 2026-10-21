@@ -969,6 +969,7 @@ cluster_cold_typed_top_tx_census_v1(ClusterColdTypedV1 *typed,
 				if (cluster_cold_typed_top_tx_loser_producer_v1(typed, fence, p, &proof, &loser)) {
 					entry->loser_proven = true;
 					entry->loser = loser.loser;
+					entry->proof = loser.proof;
 					census->proven_count++;
 				}
 				break;
