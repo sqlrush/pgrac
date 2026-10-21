@@ -9057,9 +9057,17 @@ test_cluster_cold_dependency.inc: $(top_srcdir)/src/backend/access/transam/xlogr
 	awk '/^cluster_typed_replay_dependency\(/ { print "static bool"; emit=1; count++ } emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Compile both original Startup consumers; storage/authority remain fixture boundaries.
+test_cluster_cold_effects_consumer.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile
+	awk '/^cluster_typed_replay_unscheduled\(/ { print "static bool"; emit=1; count++ } \
+	     /^cluster_typed_replay_scheduled\(/ { print "static bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 # The effect matrix runs the real route/preflight and complete native parsers.
 test_cluster_cold_recovery_effects: test_cluster_cold_recovery_effects.c unit_test.h test_cluster_cold_dependency.inc \
-		test_cluster_cold_abort_replay.inc \
+		test_cluster_cold_abort_replay.inc test_cluster_cold_effects_consumer.h \
+		test_cluster_cold_effects_consumer.inc \
 		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
 		test_cluster_cold_recovery_replay_core.o test_cluster_cold_recovery_replay_plan_core.o \
 		$(CLUSTER_COLD_PLAN_SPLIT_O) \

@@ -82,6 +82,8 @@ typedef struct ClusterColdTypedReplay {
 	struct ClusterRecoveryFencePlan **fence_plan;
 	XLogReaderState *current[CLUSTER_COLD_MAX_PARTICIPANTS];
 	ClusterColdDecodedV1 decoded;
+	bool apply_foreign;
+	ClusterColdEffectsProofV1 effects;
 } ClusterColdTypedReplay;
 
 static unsigned dependency_calls;
@@ -3068,11 +3070,18 @@ UT_TEST(test_canonical_frame_inputs_keep_absent_and_exact_top_metadata)
 }
 
 #include "test_cluster_cold_abort_replay.inc"
+#include "test_cluster_cold_effects_consumer.h"
 
 int
 main(void)
 {
-	UT_PLAN(84);
+	UT_PLAN(90);
+	UT_RUN(test_startup_consumers_complete_native_and_foreign_records);
+	UT_RUN(test_startup_side_refusal_cannot_finish_counted_effects);
+	UT_RUN(test_startup_page_apply_and_skip_use_original_consumers);
+	UT_RUN(test_startup_consumer_interruption_stops_before_completion);
+	UT_RUN(test_startup_scheduled_rechecks_payload_and_action);
+	UT_RUN(test_startup_foreign_control_refusal_stops_source_drain);
 	UT_RUN(test_canonical_frame_inputs_refuse_before_effect_routing);
 	UT_RUN(test_canonical_frame_inputs_keep_absent_and_exact_top_metadata);
 	UT_RUN(test_invalidation_inputs_preserve_all_transactional_message_kinds);
