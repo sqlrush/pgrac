@@ -121,6 +121,7 @@ content_trace_publish(bool entering_wait)
 	} else {
 		local_owner.pid = MyProcPid;
 		local_owner.procno = MyProc->pgprocno;
+		local_owner.backend_id = MyProc->backendId;
 		local_owner.backend_start = MyStartTimestamp;
 		local_owner.nlocks = local_owner.omitted_locks = 0;
 		memset(local_owner.locks, 0, sizeof(local_owner.locks));
@@ -223,7 +224,12 @@ cluster_content_trace_capture(const BufferTag *tag, ClusterContentTraceCut *cut)
 		}
 		if (owner.pid == 0)
 			continue;
-		if (i >= ProcGlobal->allProcCount || ProcGlobal->allProcs[i].pid != owner.pid) {
+		/* PID alone is not an incarnation key: reject a reused proc slot or
+		 * an auxiliary owner without a stable backend identity as UNKNOWN. */
+		if (i >= ProcGlobal->allProcCount ||
+			owner.backend_id == InvalidBackendId ||
+			ProcGlobal->allProcs[i].pid != owner.pid ||
+			ProcGlobal->allProcs[i].backendId != owner.backend_id) {
 			cut->dead++;
 			continue;
 		}
@@ -279,10 +285,10 @@ cluster_content_trace_emit(const ClusterWaitTrace *guard, const ClusterContentTr
 			const ClusterContentTraceLock *lock = &owner->locks[j];
 			if (!content_trace_log_budget()) return;
 			elog(LOG, "CONTENT_OWNER event=LOCK node=%d guard_snapshot=" UINT64_FORMAT
-				 " owner_pid=%d owner_proc=%u backend_start=" INT64_FORMAT " revision=" UINT64_FORMAT
+				 " owner_pid=%d owner_proc=%u backend_id=%d backend_start=" INT64_FORMAT " revision=" UINT64_FORMAT
 				 " wait_mask=%u waits_with_locks=" UINT64_FORMAT " pair_attempts=" UINT64_FORMAT " pair_misses=" UINT64_FORMAT
 				 " held=%u omitted=%u buffer=%d mode=%d tag_known=%d spc=%u db=%u rel=%u fork=%d block=%u",
-				 cluster_node_id, guard->snapshot, owner->pid, owner->procno, owner->backend_start, owner->revision,
+				 cluster_node_id, guard->snapshot, owner->pid, owner->procno, owner->backend_id, owner->backend_start, owner->revision,
 				 owner->wait_mask, owner->waits_with_locks, owner->pair_attempts, owner->pair_misses,
 				 owner->nlocks, owner->omitted_locks, lock->buffer, lock->mode, lock->tag_known,
 				 lock->tag.spcOid, lock->tag.dbOid, lock->tag.relNumber, (int)lock->tag.forkNum, lock->tag.blockNum);
@@ -292,13 +298,13 @@ cluster_content_trace_emit(const ClusterWaitTrace *guard, const ClusterContentTr
 			if ((owner->wait_mask & (1U << k)) == 0) continue;
 			if (!content_trace_log_budget()) return;
 			elog(LOG, "CONTENT_OWNER event=WAIT node=%d guard_snapshot=" UINT64_FORMAT
-				 " owner_pid=%d owner_proc=%u backend_start=" INT64_FORMAT " revision=" UINT64_FORMAT
+				 " owner_pid=%d owner_proc=%u backend_id=%d backend_start=" INT64_FORMAT " revision=" UINT64_FORMAT
 				 " kind=%u site=%d mode=%d wait_seq=" UINT64_FORMAT " xid=%u tag_known=%d spc=%u db=%u rel=%u fork=%d block=%u"
 				 " request_known=%d transport_known=%d requester=%d master=%d request=" UINT64_FORMAT
 				 " binding=" UINT64_FORMAT " formation=" UINT64_FORMAT " session=" UINT64_FORMAT
 				 " r4=" UINT64_FORMAT " acquisition=" UINT64_FORMAT " base=" UINT64_FORMAT " authority_epoch=" UINT64_FORMAT
 				 " requester_connection=" UINT64_FORMAT " ingress_connection=" UINT64_FORMAT " wire_sender_connection=" UINT64_FORMAT,
-				 cluster_node_id, guard->snapshot, owner->pid, owner->procno, owner->backend_start, owner->revision,
+				 cluster_node_id, guard->snapshot, owner->pid, owner->procno, owner->backend_id, owner->backend_start, owner->revision,
 				 k, wait->site, wait->mode, wait->wait_seq, wait->tx_xid, wait->tag_known,
 				 wait->tag.spcOid, wait->tag.dbOid, wait->tag.relNumber, (int)wait->tag.forkNum, wait->tag.blockNum,
 				 wait->request_known, wait->transport_known, wait->requester, wait->expected_master, wait->request_seq,

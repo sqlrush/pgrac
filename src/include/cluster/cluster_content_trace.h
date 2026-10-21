@@ -29,6 +29,7 @@ typedef struct ClusterContentTraceLock {
 typedef struct ClusterContentTraceOwner {
 	int32 pid;
 	uint32 procno;
+	int32 backend_id;
 	int64 backend_start;
 	uint64 revision;
 	uint64 waits_with_locks, pair_attempts, pair_misses;
