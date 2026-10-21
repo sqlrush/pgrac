@@ -42,6 +42,7 @@
 #include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_undo_segment.h"
+#include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_buf.h"
@@ -218,6 +219,13 @@ LWLockHeldByMe(LWLock *lock pg_attribute_unused())
 {
 	return false;
 }
+/* The single-threaded fixture never enters with a content lock already held. */
+bool
+LWLockHeldByMeInMode(LWLock *lock pg_attribute_unused(),
+				   LWLockMode mode pg_attribute_unused())
+{
+	return false;
+}
 void
 cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unused())
 {}
@@ -390,10 +398,26 @@ model_file(int fd)
 	return &model_files[segment];
 }
 
+/* Existing files start from native header bytes, before any modeled write. */
+static void
+model_segment_setup(uint32 segment, uint8 owner)
+{
+	PGAlignedBlock header;
+	ModelFile *file = model_file(MODEL_FD_BASE + (int)((segment - 1) % 256 + 1));
+
+	cluster_undo_segment_make_header_bytes(segment, owner, header.data);
+	if (!cluster_undo_segment_header_seal(header.data))
+		abort();
+	memcpy(file->cache, header.data, BLCKSZ);
+	memcpy(file->durable, header.data, BLCKSZ);
+}
+
 static void
 model_reset(void)
 {
 	memset(model_files, 0, sizeof(model_files));
+	for (int i = 1; i < MODEL_SEGMENTS; i++)
+		model_segment_setup(i, 1);
 	model_fsync_fails = false;
 }
 
@@ -651,6 +675,7 @@ UT_TEST(test_recovery_header_write_is_synced_in_its_scope)
 	char stamp[32];
 
 	fresh_instance();
+	model_segment_setup(260, 2);
 	stamp_bytes(stamp, 0x77);
 	recovery_scope_active = true;
 	UT_ASSERT(cluster_undo_smgr_write_header_bytes(CLUSTER_UNDO_PATH_RECOVERY_SHARED, 260, 2,
@@ -672,6 +697,7 @@ UT_TEST(test_recovery_header_sync_failure_fails_the_write)
 	char stamp[32];
 
 	fresh_instance();
+	model_segment_setup(260, 2);
 	stamp_bytes(stamp, 0x78);
 	recovery_scope_active = true;
 	model_fsync_fails = true;
@@ -694,6 +720,7 @@ UT_TEST(test_owned_and_materialized_header_writes_stay_deferred)
 	char stamp[32];
 
 	fresh_instance();
+	model_segment_setup(261, 2);
 	stamp_bytes(stamp, 0x79);
 	UT_ASSERT(cluster_undo_smgr_write_header_bytes(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 3, 1,
 												   STAMP_OFFSET, stamp, sizeof(stamp)));
@@ -716,6 +743,7 @@ UT_TEST(test_runtime_header_write_of_another_owner_is_not_deferred)
 	char stamp[32];
 
 	fresh_instance();
+	model_segment_setup(262, 2);
 	stamp_bytes(stamp, 0x7a);
 	UT_ASSERT(cluster_undo_smgr_write_header_bytes(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 262, 2,
 												   STAMP_OFFSET, stamp, sizeof(stamp)));
@@ -770,8 +798,11 @@ UT_TEST(test_present_header_after_restart_is_made_durable)
 
 	/* Recovery scope: fsynced at once, never left to the checkpointer. */
 	fresh_instance();
+	model_segment_setup(260, 2);
 	recovery_scope_active = true;
 	model_files[4].cache[STAMP_OFFSET] = 0x7b;
+	if (!cluster_undo_segment_header_seal(model_files[4].cache))
+		abort();
 	UT_ASSERT(
 		cluster_undo_smgr_header_unchanged_durable(CLUSTER_UNDO_PATH_RECOVERY_SHARED, 260, 2));
 	UT_ASSERT_EQ(model_files[4].fsyncs, 1);

@@ -196,7 +196,7 @@ coverage_setup(void)
 
 	fresh_instance();
 	memset(&coverage_proc, 0, sizeof(coverage_proc));
-	memset(&coverage_resident, 0, sizeof(coverage_resident));
+	cluster_undo_segment_make_header_bytes(1, 1, coverage_resident.data);
 	memset(&tt_commit_stage, 0, sizeof(tt_commit_stage));
 	coverage_waits = coverage_absorbs = coverage_guts = coverage_commits = 0;
 	coverage_redo_applies = 0;
@@ -206,12 +206,6 @@ coverage_setup(void)
 	coverage_commit_end = coverage_flush = 100;
 	MyProc->lxid = 1;
 	MyProc->delayChkptFlags = DELAY_CHKPT_START;
-	PageSetPageSizeAndVersion((Page)resident, BLCKSZ, PG_PAGE_LAYOUT_VERSION);
-	((PageHeader)resident)->pd_flags = PD_UNDO_SEG_HEADER;
-	resident->segment_id = 1;
-	resident->owner_instance = 1;
-	resident->tt_slots_count = TT_SLOTS_PER_SEGMENT;
-	resident->segment_size_bytes = UNDO_SEGMENT_SIZE_BYTES;
 	resident->segment_state = SEGMENT_ACTIVE;
 	before->xid = 100;
 	before->wrap = 3;
@@ -219,6 +213,8 @@ coverage_setup(void)
 	/* Native ordinary terminal preparation requires a headless ACTIVE slot. */
 	coverage_head = coverage_invalid_head;
 	before->first_undo_block = coverage_head;
+	if (!cluster_undo_segment_header_seal(resident))
+		abort();
 	memcpy(model_files[1].cache, resident, BLCKSZ);
 	memcpy(model_files[1].durable, resident, BLCKSZ);
 	/* The precommit's already-verified reservation is an explicit boundary. */

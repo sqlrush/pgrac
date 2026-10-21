@@ -274,6 +274,11 @@ publish_add_active(void)
 	resident->tt_slots[8] = publish_active;
 	memcpy(model_files[1].cache + offset, &publish_active, sizeof(TTSlot));
 	memcpy(model_files[1].durable + offset, &publish_active, sizeof(TTSlot));
+	/* Seal each distinct image; the dirty terminal slot stays out of durable. */
+	if (!cluster_undo_segment_header_seal(resident)
+		|| !cluster_undo_segment_header_seal(model_files[1].cache)
+		|| !cluster_undo_segment_header_seal(model_files[1].durable))
+		abort();
 	publish_committed = publish_active;
 	publish_committed.xid = 100;
 	publish_committed.wrap = 3;

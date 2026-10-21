@@ -23,6 +23,7 @@
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_wal_tail.h"
+#include "cluster/cluster_undo_segment_init.h"
 
 static bool
 cold_tt_source(const ClusterColdTypedV1 *typed, uint32 participant, uint8 owner, uint32 segment,
@@ -125,6 +126,8 @@ cluster_cold_typed_tt_redo_header_v1(const ClusterColdTypedV1 *typed, uint32 par
 	if (base == NULL || !cold_tt_redo_source(typed, participant, owner, segment, &has_header_work))
 		return false;
 	plan = typed->side_plans[participant];
+	if (cluster_undo_segment_header_integrity(base) == CLUSTER_UNDO_HEADER_CORRUPT)
+		base = NULL;
 	if (has_header_work) {
 		/* Preserve native lifecycle, generation, slot and source-membership
 		 * checks in the existing fold; no duplicate TT replay implementation. */
@@ -135,6 +138,8 @@ cluster_cold_typed_tt_redo_header_v1(const ClusterColdTypedV1 *typed, uint32 par
 	} else {
 		/* Identity fold, including an explicitly empty WAL cut. An ACTIVE
 		 * slot stays raw ACTIVE; no absence-of-COMMIT or loser inference. */
+		if (base == NULL)
+			return false;
 		memcpy(image.page.data, base, BLCKSZ);
 		image.source_index = UINT32_MAX;
 	}
@@ -203,7 +208,8 @@ cluster_cold_typed_tt_after_redo_readback_v1(const ClusterColdTypedV1 *typed, ui
 													  typed->observer.database_incarnation))
 		return false;
 	observed = cluster_cold_tt_after_redo_header_v1(typed, post_segment_index, &owner, &segment);
-	if (observed == NULL)
+	if (observed == NULL
+		|| cluster_undo_segment_header_integrity(observed) == CLUSTER_UNDO_HEADER_CORRUPT)
 		return false;
 	if (cluster_cold_tt_header_find_v1(typed, false, owner, segment, &original_index) != NULL) {
 		if (!cluster_cold_typed_tt_redo_header_v1(typed, participant, original_index, &folded))
@@ -1005,7 +1011,8 @@ cluster_cold_typed_top_tx_c0_producer_v1(ClusterColdTypedV1 *typed,
 	 * newly-created segment requires the existing native full-image proof;
 	 * its observed bytes can never supply a missing predecessor. */
 	if (!cluster_cold_typed_tt_after_redo_readback_v1(typed, participant, post_segment_index,
-													  &post_image))
+													  &post_image)
+		|| cluster_undo_segment_header_integrity(post_image.page.data) != CLUSTER_UNDO_HEADER_VALID)
 		return false;
 	/* The caller's producer_top bit is not an original producer fact. Only
 	 * this source's exact native BIND currently qualifies this gate here. */
@@ -1103,6 +1110,7 @@ cold_tt_undo_base_redo_plan(const ClusterColdTypedV1 *typed, uint32 participant,
 
 	base_header = cluster_cold_tt_base_header_v1(typed, segment_index, owner, segment);
 	if (base_header == NULL
+		|| cluster_undo_segment_header_integrity(base_header) == CLUSTER_UNDO_HEADER_CORRUPT
 		|| !cluster_cold_typed_tt_redo_header_v1(typed, participant, segment_index, &header)
 		|| base_header->wrap_count != ((const UndoSegmentHeaderData *)header.page.data)->wrap_count)
 		return NULL;

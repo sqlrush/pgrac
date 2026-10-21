@@ -113,6 +113,7 @@ static ClusterUndoBlock0AuthorityProof fill_proof;
 static ResourceReleaseCallback resource_release_callback = NULL;
 static void *resource_release_arg = NULL;
 static int lwlock_acquire_calls = 0;
+static int lwlock_release_calls = 0;
 static int lwlock_throw_on_call = 0;
 static int lwlock_release_without_holdoff_count = 0;
 static ClusterUndoSmgrFinalState smgr_probe_state = CLUSTER_UNDO_SMGR_FINAL_EXACT;
@@ -205,6 +206,20 @@ void
 LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute_unused())
 {}
 
+/* Explicit leaf lock ownership used only by the header writer seam test. */
+static bool header_caller_holds_lock;
+static LWLockMode header_caller_lock_mode;
+bool
+LWLockHeldByMe(LWLock *lock pg_attribute_unused())
+{
+	return header_caller_holds_lock;
+}
+bool
+LWLockHeldByMeInMode(LWLock *lock pg_attribute_unused(), LWLockMode mode)
+{
+	return header_caller_holds_lock && header_caller_lock_mode == mode;
+}
+
 bool
 LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
@@ -226,6 +241,7 @@ LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
 void
 LWLockRelease(LWLock *lock pg_attribute_unused())
 {
+	lwlock_release_calls++;
 	if (InterruptHoldoffCount == 0) {
 		lwlock_release_without_holdoff_count++;
 		return;
@@ -2434,10 +2450,43 @@ UT_TEST(test_stop_block0_two_actual_segment_roots_share_one_pgrd_not_one_file_id
 	}
 }
 
+UT_TEST(test_header_writer_uses_existing_content_lock_and_refuses_shared_upgrade)
+{
+	uint32 acquired = 0;
+	int before_acquire, before_release;
+
+	UT_ASSERT(cluster_undo_block0_header_write_lock(1, 1, &acquired));
+	UT_ASSERT_EQ(acquired, UINT32_MAX); /* Single-user bootstrap has no bank. */
+	cluster_undo_block0_header_write_unlock(acquired);
+	IsUnderPostmaster = true;
+	UT_ASSERT(!cluster_undo_block0_header_write_lock(1, 1, &acquired));
+	fresh_block0_region(1);
+	before_acquire = lwlock_acquire_calls;
+	before_release = lwlock_release_calls;
+	UT_ASSERT(cluster_undo_block0_header_write_lock(1, 1, &acquired));
+	UT_ASSERT_EQ(acquired, 0);
+	UT_ASSERT_EQ(lwlock_acquire_calls, before_acquire + 1);
+	cluster_undo_block0_header_write_unlock(acquired);
+	UT_ASSERT_EQ(lwlock_release_calls, before_release + 1);
+	header_caller_holds_lock = true;
+	header_caller_lock_mode = LW_EXCLUSIVE;
+	UT_ASSERT(cluster_undo_block0_header_write_lock(1, 1, &acquired));
+	UT_ASSERT_EQ(acquired, UINT32_MAX);
+	cluster_undo_block0_header_write_unlock(acquired);
+	UT_ASSERT_EQ(lwlock_acquire_calls, before_acquire + 1);
+	UT_ASSERT_EQ(lwlock_release_calls, before_release + 1);
+	header_caller_lock_mode = LW_SHARED;
+	UT_ASSERT(!cluster_undo_block0_header_write_lock(1, 1, &acquired));
+	header_caller_holds_lock = false;
+	UT_ASSERT(!cluster_undo_block0_header_write_lock(257, 1, &acquired));
+	IsUnderPostmaster = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(58);
+	UT_PLAN(59);
+	UT_RUN(test_header_writer_uses_existing_content_lock_and_refuses_shared_upgrade);
 	UT_RUN(test_block0_key_endpoints_map_to_direct_slots);
 	UT_RUN(test_block0_key_rejects_owner_segment_aliases);
 	UT_RUN(test_block0_root_requires_pgrd_identity_and_declared_intent);

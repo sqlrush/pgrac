@@ -1841,6 +1841,43 @@ cluster_undo_block0_release_reservation(ClusterUndoBlock0Pin *pin)
 }
 
 
+/* Reuse even an EMPTY slot's initialized content lock. This is I/O
+ * serialization only: residency, current authority and generation stay with
+ * their original callers. Never acquire frame_lock under this lock. */
+bool
+cluster_undo_block0_header_write_lock(uint32 segment_id, uint8 owner_instance,
+	uint32 *acquired_slot)
+{
+	ClusterUndoBlock0LogicalKey logical = { 0 };
+	LWLock *lock;
+	uint32 slotno;
+
+	if (acquired_slot == NULL)
+		return false;
+	*acquired_slot = UINT32_MAX;
+	logical.segment_id = segment_id;
+	logical.owner_instance = owner_instance;
+	if (cluster_undo_block0_logical_slot(&logical, &slotno) != CLUSTER_UNDO_BLOCK0_OK)
+		return false;
+	if (Block0Ctl == NULL)
+		return !IsUnderPostmaster;
+	lock = &Block0Slots[slotno].data.content_lock;
+	if (LWLockHeldByMeInMode(lock, LW_EXCLUSIVE))
+		return true;
+	if (LWLockHeldByMe(lock))
+		return false;
+	LWLockAcquire(lock, LW_EXCLUSIVE);
+	*acquired_slot = slotno;
+	return true;
+}
+
+void
+cluster_undo_block0_header_write_unlock(uint32 acquired_slot)
+{
+	if (acquired_slot != UINT32_MAX)
+		LWLockRelease(&Block0Slots[acquired_slot].data.content_lock);
+}
+
 /*
  * Record that header bytes of one segment reached its file without an fsync.
  * Never throws, so a critical section may call it.  Only paths the

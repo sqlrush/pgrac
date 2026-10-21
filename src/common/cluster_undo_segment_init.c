@@ -49,6 +49,12 @@
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_undo_segment.h"
 #include "storage/bufpage.h"
+/* Keep the canonical PG algorithm private to this frontend-safe module;
+ * the backend also exports pg_checksum_page from its page subsystem. */
+static uint16 undo_header_checksum(char *page, BlockNumber blockno);
+#define pg_checksum_page undo_header_checksum
+#include "storage/checksum_impl.h"
+#undef pg_checksum_page
 #endif
 
 
@@ -151,5 +157,51 @@ cluster_undo_segment_make_header_bytes(uint32 segment_id, uint8 owner_instance, 
 	(void)owner_instance;
 	if (page != NULL)
 		memset(page, 0, 8192);
+#endif
+}
+
+/* Check a private aligned copy: the PG algorithm temporarily clears the
+ * checksum field. Never modify an immutable recovery capture while checking. */
+ClusterUndoHeaderIntegrity
+cluster_undo_segment_header_integrity(const void *page)
+{
+#ifdef USE_PGRAC_CLUSTER
+	PGAlignedBlock copy;
+	PageHeader header;
+	uint16 stored;
+
+	if (page == NULL)
+		return CLUSTER_UNDO_HEADER_CORRUPT;
+	memcpy(copy.data, page, BLCKSZ);
+	header = (PageHeader)copy.data;
+	stored = header->pd_checksum;
+	if (stored == 0)
+		return CLUSTER_UNDO_HEADER_UNVERIFIED;
+	if (PageIsNew(copy.data))
+		return CLUSTER_UNDO_HEADER_CORRUPT;
+	return stored == undo_header_checksum(copy.data, 0) ? CLUSTER_UNDO_HEADER_VALID
+		: CLUSTER_UNDO_HEADER_CORRUPT;
+#else
+	return CLUSTER_UNDO_HEADER_CORRUPT;
+#endif
+}
+
+bool
+cluster_undo_segment_header_seal(void *page)
+{
+#ifdef USE_PGRAC_CLUSTER
+	PGAlignedBlock copy;
+	uint16 checksum;
+
+	if (page == NULL)
+		return false;
+	memcpy(copy.data, page, BLCKSZ);
+	if (PageIsNew(copy.data))
+		return false;
+	checksum = undo_header_checksum(copy.data, 0);
+	memcpy((char *)page + offsetof(PageHeaderData, pd_checksum), &checksum, sizeof(checksum));
+	return true;
+#else
+	return false;
 #endif
 }

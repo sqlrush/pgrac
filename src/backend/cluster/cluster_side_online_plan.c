@@ -20,6 +20,7 @@
 #include "storage/standbydefs.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_uba.h"
+#include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_native_startup.h"
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_xid_stripe_xlog.h"
@@ -1898,7 +1899,9 @@ side_plan_prepare_undo_header(const RfSideOnlinePlanV1 *plan, uint8 instance, ui
 		return RF_PAGE_PROOF_DETAIL_CAPACITY;
 	memset(&prepared, 0, sizeof(prepared));
 	prepared.source_index = UINT32_MAX;
-	base_valid = base != NULL && UndoSegmentHeader_identity_matches(base, segment_id, instance);
+	base_valid = base != NULL
+				 && cluster_undo_segment_header_integrity(base) != CLUSTER_UNDO_HEADER_CORRUPT
+				 && UndoSegmentHeader_identity_matches(base, segment_id, instance);
 	for (uint32 i = 0; i < end; i++) {
 		const RfSideOnlineOperationV1 *op = &plan->operations[i];
 		uint16 slot;
@@ -1992,8 +1995,16 @@ side_plan_prepare_undo_header(const RfSideOnlinePlanV1 *plan, uint8 instance, ui
 	}
 	if (base_valid && !observed)
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	/* A checksum is a physical write result, not a WAL field. Preserve an
+	 * unchanged predecessor (including legacy zero); replaying its history
+	 * alone must not manufacture integrity qualification. */
+	if (base_valid)
+		((PageHeader)prepared.page.data)->pd_checksum = ((const PageHeaderData *)base)->pd_checksum;
 	if (base_valid && memcmp(base, prepared.page.data, BLCKSZ) == 0)
 		prepared.source_index = UINT32_MAX;
+	else if (prepared.operation_count != 0
+			 && !cluster_undo_segment_header_seal(prepared.page.data))
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 	*out = prepared;
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
