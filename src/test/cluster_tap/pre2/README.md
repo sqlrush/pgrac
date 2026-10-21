@@ -215,6 +215,40 @@ Results always retain `identity_bound=false`, `field_root=OPEN` and
 The adapter does not join lines, infer causal edges, produce contract events,
 seal barriers or supply STOP, authority, durability or workload credit.
 
+### Normalized workload contract
+
+Use `contract.check_workload_contract(records)` for caller-supplied normalized
+records. Run its offline tests with:
+
+```sh
+python3 -m unittest discover -s src/test/cluster_tap/pre2 -p test_contract.py
+```
+
+Every event and barrier must carry the same nonempty `run_id`, `source_sha`,
+`source_tree`, `build_sha`, `binary_sha256`, `config_sha256`, `harness_sha256`
+and `cluster_epoch` strings. Source commit/tree use full lowercase Git SHA1;
+binary/config/harness digests use lowercase SHA256; epoch is a decimal string.
+`build_sha` is a caller-supplied build label, independent of the binary digest.
+
+The `IDENTITY_SEAL` lists complete identities with `node`, `boot_id`, positive
+integer `pid`, nonnegative integer `procno`, `backend_start`,
+`process_incarnation`, `sequence_domain` and `role`. All other identity fields
+are nonempty strings. Events and every barrier snapshot repeat the complete
+identity and role. A capture has one boot per node and one role per process.
+Different backend starts or incarnations keep independent sequence prefixes
+even when PID/procno are reused. Each stream begins at sequence 1; a gap remains
+`ROOT_OPEN` and cannot borrow another incarnation's prefix. The fixture in
+`test_contract.py` demonstrates the ordered barriers, disjoint lane objects,
+supplied causal edges and final STOP state.
+
+The result preserves capture and sequence declarations with
+`capture_binding=DECLARED_ONLY`, `identity_binding=DECLARED_ONLY`,
+`field_root=OPEN` and `ready_to_run=false`. A focused diagnostic PASS means the
+supplied records satisfy the checks; it does not attest their origin or prove
+real SQL, transport, authority, durability or shutdown. Raw LOG/projection and
+SQL-journal outputs still require a separately qualified adapter; inventory
+PID candidates cannot fill absent boot, start, incarnation or causal fields.
+
 ### Read/image and HOT SQL operations
 
 `WorkloadSql.pm` uses four existing persistent `query_safe` sessions for node

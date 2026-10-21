@@ -111,6 +111,22 @@ PASS_FOCUSED_DIAGNOSTIC = "PASS_FOCUSED_DIAGNOSTIC"
 NOT_TRIGGERED = "NOT_TRIGGERED"
 ROOT_OPEN = "ROOT_OPEN"
 WORKLOAD_STATE_FIELDS = ("pending", "receipt", "grd", "pcm", "tt")
+WORKLOAD_IDENTITY_FIELDS = ("node", "boot_id", "pid", "procno", "backend_start",
+                            "process_incarnation", "sequence_domain")
+WORKLOAD_CAPTURE_FIELDS = ("run_id", "source_sha", "source_tree", "build_sha",
+                           "binary_sha256", "config_sha256", "harness_sha256",
+                           "cluster_epoch")
+
+
+def _workload_require_capture(value):
+    for field in WORKLOAD_CAPTURE_FIELDS:
+        assert isinstance(value.get(field), str) and value[field].strip(), field
+    for field in ("source_sha", "source_tree"):
+        assert re.fullmatch(r"[0-9a-f]{40}", value[field]), field
+    for field in ("binary_sha256", "config_sha256", "harness_sha256"):
+        assert re.fullmatch(r"[0-9a-f]{64}", value[field]), field
+    assert re.fullmatch(r"[0-9]+", value["cluster_epoch"]), "cluster_epoch"
+    return {field: value[field] for field in WORKLOAD_CAPTURE_FIELDS}
 
 
 def _workload_chain_complete(lane, events):
@@ -193,16 +209,17 @@ def _workload_chain_complete(lane, events):
 
 
 def _workload_identity_key(value):
-    return tuple(value[field] for field in
-                 ("node", "pid", "procno", "sequence_domain"))
+    return tuple(value[field] for field in WORKLOAD_IDENTITY_FIELDS)
 
 
 def _workload_require_identity(value):
     assert isinstance(value, dict), "identity is not an object"
-    for field in ("node", "sequence_domain"):
-        assert isinstance(value.get(field), str) and value[field], field
+    for field in ("node", "boot_id", "backend_start", "process_incarnation",
+                  "role", "sequence_domain"):
+        assert isinstance(value.get(field), str) and value[field].strip(), field
     for field in ("pid", "procno"):
-        assert isinstance(value.get(field), int) and value[field] >= 0, field
+        assert type(value.get(field)) is int and value[field] >= 0, field
+    assert value["pid"] > 0, "pid"
     return _workload_identity_key(value)
 
 
@@ -215,7 +232,8 @@ def _workload_require_snapshots(snapshots, identities, seq, gaps):
         assert key not in actual, "duplicate barrier identity"
         actual.add(key)
         assert key in expected, "barrier identity was not sealed"
-        assert isinstance(snapshot.get("last_seq"), int) and snapshot["last_seq"] >= 0
+        assert snapshot["role"] == identities[key]["role"], "barrier process role changed"
+        assert type(snapshot.get("last_seq")) is int and snapshot["last_seq"] >= 0
         assert isinstance(snapshot.get("gap"), bool), "barrier gap flag missing"
         assert snapshot["last_seq"] == seq[key], "barrier last sequence is not a prefix"
         assert snapshot["gap"] is gaps[key], "barrier gap flag was not preserved"
@@ -238,10 +256,14 @@ def check_workload_contract(records):
     predecessor_event_id edges bind one chain_id per lane; append positions and
     sequence numbers from different processes never establish causal order.
     Supplied causal edges must be compatible with every local sequence order.
+    Every record carries the same capture declaration. Processes are qualified
+    by node boot, backend start and incarnation; PID/procno reuse never merges
+    local streams. These declarations are checked, not independently attested.
     Deferred records after a lane barrier cannot satisfy or clean up that lane.
     """
     assert isinstance(records, list) and records, "no workload observations"
-    identities = []
+    capture = None
+    identities = {}
     identity_set = set()
     seq = {}
     gaps = {}
@@ -261,6 +283,10 @@ def check_workload_contract(records):
         kind = record.get("kind")
         if stopped:
             raise AssertionError("STOP_SEAL is final")
+        declared = _workload_require_capture(record)
+        if capture is None:
+            capture = declared
+        assert declared == capture, "workload capture declaration changed"
         if kind == "barrier":
             name = record.get("name")
             assert len(barriers) < len(WORKLOAD_BARRIER_ORDER), "duplicate barrier"
@@ -268,17 +294,20 @@ def check_workload_contract(records):
             if name == "IDENTITY_SEAL":
                 raw_identities = record.get("identities")
                 assert isinstance(raw_identities, list) and raw_identities, "identity seal missing"
+                node_boots, process_roles = {}, {}
                 for identity in raw_identities:
                     key = _workload_require_identity(identity)
                     assert key not in identity_set, "duplicate process/domain identity"
+                    node, boot = identity["node"], identity["boot_id"]
+                    assert node_boots.setdefault(node, boot) == boot, "node boot changed in capture"
+                    process = key[:-1]
+                    role = identity["role"]
+                    assert process_roles.setdefault(process, role) == role, "process role changed"
                     identity_set.add(key)
-                    identities.append(key)
+                    identities[key] = {field: identity[field]
+                                       for field in WORKLOAD_IDENTITY_FIELDS + ("role",)}
                     seq[key] = 0
                     gaps[key] = False
-                for field in ("source_sha", "build_sha"):
-                    assert isinstance(record.get(field), str) and record[field], field
-                for field in ("binary_sha256", "config_sha256"):
-                    assert re.fullmatch(r"[0-9a-f]{64}", record.get(field, "")), field
             else:
                 assert identities, "barrier precedes identity seal"
             _workload_require_snapshots(record.get("snapshots"), identities, seq, gaps)
@@ -300,12 +329,12 @@ def check_workload_contract(records):
         assert lane in WORKLOAD_LANES, "unknown workload lane"
         event_id = record.get("event_id")
         assert isinstance(event_id, str) and event_id and event_id not in {e["event_id"] for e in all_events}
-        for field in ("phase", "node", "sequence_domain", "logical_key"):
+        for field in ("phase", "logical_key"):
             assert isinstance(record.get(field), str) and record[field], field
-        for field in ("pid", "procno", "event_seq"):
-            assert isinstance(record.get(field), int) and record[field] >= 0, field
-        identity = (record["node"], record["pid"], record["procno"], record["sequence_domain"])
+        assert type(record.get("event_seq")) is int and record["event_seq"] >= 0, "event_seq"
+        identity = _workload_require_identity(record)
         assert identity in identity_set, "event identity was not sealed"
+        assert record["role"] == identities[identity]["role"], "event process role changed"
         locator = _workload_require_locator(record.get("relation_locator"))
         key = record["logical_key"]
         deferred = record.get("deferred", False)
@@ -361,7 +390,7 @@ def check_workload_contract(records):
             complete = False
         lane_domains = {event["sequence_domain"] for event in events}
         lane_has_gap = any(gaps[identity] for identity in identity_set
-                           if identity[3] in lane_domains)
+                           if identity[-1] in lane_domains)
         statuses[lane] = PASS_FOCUSED_DIAGNOSTIC if complete and not lane_has_gap else ROOT_OPEN
 
     if (any(stop_state[field] for field in WORKLOAD_STATE_FIELDS) or
@@ -373,8 +402,9 @@ def check_workload_contract(records):
         overall = PASS_FOCUSED_DIAGNOSTIC
     else:
         overall = NOT_TRIGGERED
-    sequences = [dict(node=identity[0], pid=identity[1], procno=identity[2],
-                      sequence_domain=identity[3], last_seq=seq[identity], gap=gaps[identity])
-                 for identity in identities]
+    sequences = [dict(declaration, last_seq=seq[identity], gap=gaps[identity])
+                 for identity, declaration in identities.items()]
     return {"overall": overall, "lanes": statuses, "barriers": barriers,
-            "sequences": sequences}
+            "sequences": sequences, "capture": capture,
+            "capture_binding": "DECLARED_ONLY", "identity_binding": "DECLARED_ONLY",
+            "field_root": "OPEN", "ready_to_run": False}

@@ -20,43 +20,52 @@ def wal_events():
 
 
 WORKLOAD_LANES = ("R/IMG", "I/TT", "H/HOT", "Q/RECEIPT")
+IDENTITY_FIELDS = ("node", "boot_id", "pid", "procno", "backend_start",
+                   "process_incarnation", "sequence_domain")
+CAPTURE = dict(run_id="capture-1", source_sha="a" * 40, source_tree="b" * 40,
+               build_sha="installed-build-1", binary_sha256="c" * 64,
+               config_sha256="d" * 64, harness_sha256="e" * 64,
+               cluster_epoch="7")
+
+
+def workload_identity(**values):
+    result = dict(node="n1", pid=101, procno=1, sequence_domain="r")
+    result.update(values)
+    identity = dict(boot_id="boot-" + result["node"], backend_start="start-1",
+                    process_incarnation="process-1", role="backend")
+    identity.update(result)
+    return identity
+
+
+def identity_key(value):
+    return tuple(value[field] for field in IDENTITY_FIELDS)
 
 
 def workload_events(include_i=True, late_i=False, cleanup=True):
-    identities = [
-        dict(node="n1", pid=101, procno=1, sequence_domain="r"),
-        dict(node="n1", pid=101, procno=1, sequence_domain="i"),
-        dict(node="n1", pid=101, procno=1, sequence_domain="h"),
-        dict(node="n1", pid=101, procno=1, sequence_domain="q"),
-    ]
-    seq = {tuple(item[field] for field in ("node", "pid", "procno", "sequence_domain")): 0
-           for item in identities}
+    identities = [workload_identity(sequence_domain=domain) for domain in ("r", "i", "h", "q")]
+    seq = {identity_key(item): 0 for item in identities}
     gaps = {key: False for key in seq}
     events = []
     predecessors = {}
 
     def snapshots():
-        return [dict(item, last_seq=seq[tuple(item[field] for field in
-                                             ("node", "pid", "procno", "sequence_domain"))],
-                     gap=gaps[tuple(item[field] for field in
-                                   ("node", "pid", "procno", "sequence_domain"))])
+        return [dict(item, last_seq=seq[identity_key(item)], gap=gaps[identity_key(item)])
                 for item in identities]
 
     def barrier(name, **extra):
-        event = dict(kind="barrier", name=name, snapshots=snapshots())
+        event = dict(CAPTURE, kind="barrier", name=name, snapshots=snapshots())
         event.update(extra)
         events.append(event)
 
     def add_event(lane, phase, relation, key, **extra):
         domain = {"R/IMG": "r", "I/TT": "i", "H/HOT": "h", "Q/RECEIPT": "q"}[lane]
         identity = next(item for item in identities if item["sequence_domain"] == domain)
-        identity_key = tuple(identity[field] for field in
-                             ("node", "pid", "procno", "sequence_domain"))
-        seq[identity_key] += 1
-        event = dict(kind="event", event_id="{}-{}".format(domain, seq[identity_key]),
-                     lane=lane, phase=phase, node=identity["node"], pid=identity["pid"],
-                     procno=identity["procno"], sequence_domain=domain,
-                     event_seq=seq[identity_key], relation_locator=relation,
+        key_identity = identity_key(identity)
+        seq[key_identity] += 1
+        event = dict(CAPTURE, **identity, kind="event",
+                     event_id="{}-{}".format(domain, seq[key_identity]),
+                     lane=lane, phase=phase,
+                     event_seq=seq[key_identity], relation_locator=relation,
                      logical_key=key, chain_id=domain + "-chain-1",
                      predecessor_event_id=predecessors.get(lane))
         event.update(extra)
@@ -70,8 +79,7 @@ def workload_events(include_i=True, late_i=False, cleanup=True):
         "H/HOT": dict(spcOid=11, dbOid=22, relNumber=303, forkNum=0, blockNum=9),
         "Q/RECEIPT": dict(spcOid=11, dbOid=22, relNumber=304, forkNum=0, blockNum=10),
     }
-    barrier("IDENTITY_SEAL", identities=identities, source_sha="source-commit",
-            build_sha="build-id", binary_sha256="c" * 64, config_sha256="d" * 64)
+    barrier("IDENTITY_SEAL", identities=identities)
     barrier("BASELINE")
     add_event("R/IMG", "seed", relations["R/IMG"], "r-key", actual=True)
     add_event("R/IMG", "request", relations["R/IMG"], "r-key", actual=True)
@@ -120,27 +128,26 @@ def workload_remote_return(lane, append_phases, remote=None):
     events = workload_events()
     lane_events = [event for event in events if event.get("lane") == lane]
     by_phase = {event["phase"]: event for event in lane_events}
-    fields = ("node", "pid", "procno", "sequence_domain")
+    fields = IDENTITY_FIELDS + ("role",)
     local = {field: lane_events[0][field] for field in fields}
     if remote is None:
-        remote = dict(node="n2", pid=202, procno=2,
-                      sequence_domain=local["sequence_domain"])
+        remote = workload_identity(node="n2", pid=202, procno=2,
+                                   sequence_domain=local["sequence_domain"])
     ends = {lane_events[0]["phase"], lane_events[-1]["phase"]}
     for event in lane_events:
         event.update(local if event["phase"] in ends else remote)
     start = events.index(lane_events[0])
     events[start:start + len(lane_events)] = [by_phase[phase] for phase in append_phases]
     events[0]["identities"].append(remote)
-    counts = {tuple(identity[field] for field in fields): 0
+    counts = {identity_key(identity): 0
               for identity in events[0]["identities"]}
     for record in events:
         if record["kind"] == "event":
-            key = tuple(record[field] for field in fields)
+            key = identity_key(record)
             counts[key] += 1
             record["event_seq"] = counts[key]
         else:
-            record["snapshots"] = [dict(identity, last_seq=counts[tuple(
-                identity[field] for field in fields)], gap=False)
+            record["snapshots"] = [dict(identity, last_seq=counts[identity_key(identity)], gap=False)
                 for identity in events[0]["identities"]]
     return events
 
@@ -279,27 +286,24 @@ class WorkloadBarrierContract(unittest.TestCase):
 
     def test_sequence_summary_preserves_processes_sharing_a_domain(self):
         events = workload_events()
-        second = dict(node="n2", pid=202, procno=2, sequence_domain="r")
+        second = workload_identity(node="n2", pid=202, procno=2, sequence_domain="r")
         events[0]["identities"].append(second)
-        counts = {("n1", 101, 1, domain): 0 for domain in ("r", "i", "h", "q")}
-        counts[("n2", 202, 2, "r")] = 0
+        counts = {identity_key(identity): 0 for identity in events[0]["identities"]}
         for event in events:
             if event.get("kind") == "event":
                 if event["lane"] == "R/IMG" and event["phase"] in ("serve", "reply"):
                     event.update(second)
-                key = tuple(event[field] for field in
-                            ("node", "pid", "procno", "sequence_domain"))
+                key = identity_key(event)
                 counts[key] += 1
                 event["event_seq"] = counts[key]
             else:
-                event["snapshots"] = [dict(node=key[0], pid=key[1], procno=key[2],
-                                            sequence_domain=key[3], last_seq=last, gap=False)
-                                      for key, last in counts.items()]
+                event["snapshots"] = [dict(identity, last_seq=counts[identity_key(identity)], gap=False)
+                                      for identity in events[0]["identities"]]
         result = contract.check_workload_contract(events)
         self.assertIsInstance(result["sequences"], list)
         r = [item for item in result["sequences"] if item["sequence_domain"] == "r"]
-        self.assertEqual(r, [dict(node="n1", pid=101, procno=1, sequence_domain="r",
-                                  last_seq=3, gap=False), dict(second, last_seq=2, gap=False)])
+        self.assertEqual(r, [dict(events[0]["identities"][0], last_seq=3, gap=False),
+                             dict(second, last_seq=2, gap=False)])
         self.assertEqual(result["overall"], "PASS_FOCUSED_DIAGNOSTIC")
         consume = next(event for event in events if event.get("phase") == "consume")
         events.remove(consume)
@@ -361,7 +365,7 @@ class WorkloadBarrierContract(unittest.TestCase):
 
     def test_local_order_does_not_merge_distinct_process_identities(self):
         for field, other in (("node", "n2"), ("pid", 202), ("procno", 2)):
-            remote = dict(node="n1", pid=101, procno=1, sequence_domain="i")
+            remote = workload_identity(sequence_domain="i")
             remote[field] = other
             with self.subTest(field=field):
                 events = workload_remote_return(
@@ -470,6 +474,120 @@ class WorkloadBarrierContract(unittest.TestCase):
         r_barrier["snapshots"][0]["last_seq"] = 0
         with self.assertRaises(AssertionError):
             contract.check_workload_contract(bad_snapshot)
+
+
+class WorkloadIdentityContract(unittest.TestCase):
+    def test_capture_and_process_declarations_are_preserved_without_attestation(self):
+        events = workload_events()
+        original = copy.deepcopy(events)
+        result = contract.check_workload_contract(events)
+        self.assertEqual(result["capture"], CAPTURE)
+        self.assertEqual(result["capture_binding"], "DECLARED_ONLY")
+        self.assertEqual(result["identity_binding"], "DECLARED_ONLY")
+        self.assertEqual(result["field_root"], "OPEN")
+        self.assertIs(result["ready_to_run"], False)
+        self.assertEqual(result["sequences"][0],
+                         dict(events[0]["identities"][0], last_seq=5, gap=False))
+        self.assertEqual(events, original)
+
+    def test_every_record_requires_the_complete_capture(self):
+        for position in (0, 1, 2, -1):
+            for field in CAPTURE:
+                events = workload_events()
+                del events[position][field]
+                with self.subTest(position=position, field=field), self.assertRaises(AssertionError):
+                    contract.check_workload_contract(events)
+
+    def test_foreign_run_build_or_epoch_cannot_supply_a_phase_or_barrier(self):
+        for position in (1, 2, -1):
+            for field, value in CAPTURE.items():
+                events = workload_events()
+                events[position][field] = "9" * len(value)
+                with self.subTest(position=position, field=field), self.assertRaises(AssertionError):
+                    contract.check_workload_contract(events)
+
+    def test_capture_scalars_have_exact_types_and_digest_representations(self):
+        for field, value in (("run_id", " "), ("build_sha", False),
+                             ("source_sha", "short"), ("source_tree", "A" * 40),
+                             ("binary_sha256", 10), ("config_sha256", "d" * 63),
+                             ("harness_sha256", None), ("cluster_epoch", 7),
+                             ("cluster_epoch", "7.0"), ("cluster_epoch", "-1")):
+            events = workload_events()
+            for event in events:
+                event[field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(AssertionError):
+                contract.check_workload_contract(events)
+
+    def test_full_process_identity_is_required_on_seal_event_and_snapshot(self):
+        for location in ("identity", "event", "snapshot"):
+            for field in IDENTITY_FIELDS + ("role",):
+                events = workload_events()
+                target = (events[0]["identities"][0] if location == "identity" else
+                          events[2] if location == "event" else events[-1]["snapshots"][0])
+                del target[field]
+                with self.subTest(location=location, field=field), self.assertRaises(AssertionError):
+                    contract.check_workload_contract(events)
+
+    def test_stale_birth_or_role_is_not_filled_from_sealed_pid(self):
+        for location in ("event", "snapshot"):
+            for field in ("boot_id", "backend_start", "process_incarnation", "role"):
+                events = workload_events()
+                target = events[2] if location == "event" else events[-1]["snapshots"][0]
+                target[field] = "unsealed-" + target[field]
+                with self.subTest(location=location, field=field), self.assertRaises(AssertionError):
+                    contract.check_workload_contract(events)
+
+    def test_identity_scalars_reject_boolean_numbers_and_empty_birth_fields(self):
+        for field, value in (("pid", True), ("pid", 0), ("procno", False),
+                             ("procno", 1.0), ("node", " "), ("boot_id", ""),
+                             ("backend_start", None), ("process_incarnation", 1),
+                             ("role", " "), ("sequence_domain", " ")):
+            events = workload_events()
+            events[0]["identities"][0][field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(AssertionError):
+                contract.check_workload_contract(events)
+
+    def test_one_node_cannot_seal_two_boots_inside_a_capture(self):
+        events = workload_events()
+        for event in events:
+            if event.get("sequence_domain") == "h":
+                event["boot_id"] = "another-boot"
+            for item in event.get("identities", []) + event.get("snapshots", []):
+                if item["sequence_domain"] == "h":
+                    item["boot_id"] = "another-boot"
+        with self.assertRaises(AssertionError):
+            contract.check_workload_contract(events)
+
+    def test_one_process_keeps_its_role_across_sequence_domains(self):
+        events = workload_events()
+        for event in events:
+            if event.get("sequence_domain") == "h":
+                event["role"] = "LMS"
+            for item in event.get("identities", []) + event.get("snapshots", []):
+                if item["sequence_domain"] == "h":
+                    item["role"] = "LMS"
+        with self.assertRaises(AssertionError):
+            contract.check_workload_contract(events)
+
+    def test_pid_and_procno_reuse_has_independent_birth_qualified_prefixes(self):
+        remote = workload_identity(sequence_domain="i", backend_start="start-2",
+                                   process_incarnation="process-2")
+        events = workload_remote_return("I/TT", ("admit", "reread", "publish"), remote)
+        result = contract.check_workload_contract(events)
+        self.assertEqual(result["overall"], "PASS_FOCUSED_DIAGNOSTIC")
+        streams = [item for item in result["sequences"] if item["sequence_domain"] == "i"]
+        self.assertEqual(streams, [dict(events[0]["identities"][1], last_seq=2, gap=False),
+                                  dict(remote, last_seq=1, gap=False)])
+        # A stale generation cannot borrow the old generation's sequence prefix.
+        publish = next(event for event in events if event.get("phase") == "publish")
+        publish["event_seq"] = 3
+        for barrier in events:
+            if barrier["kind"] == "barrier" and barrier["name"] in (
+                    "I/TT", "H/HOT", "Q/RECEIPT", "STOP_SEAL"):
+                snapshot = next(item for item in barrier["snapshots"]
+                                if identity_key(item) == identity_key(remote))
+                snapshot.update(last_seq=3, gap=True)
+        self.assertEqual(contract.check_workload_contract(events)["lanes"]["I/TT"], "ROOT_OPEN")
 
 
 if __name__ == "__main__":
