@@ -186,6 +186,10 @@ cluster_pcm_rx_metric_note(PcmRxMetric metric)
 }
 
 static ResourceXIntentProbeResult ut_resource_x_probe_mode = RESOURCE_X_INTENT_PROBE_IDLE;
+#define UT_RESOURCE_X_PROBE_SCRIPT_MAX 8
+static ResourceXIntentProbeResult ut_resource_x_probe_script[UT_RESOURCE_X_PROBE_SCRIPT_MAX];
+static int ut_resource_x_probe_script_len = 0;
+static int ut_resource_x_probe_script_pos = 0;
 static int ut_resource_x_probe_call_count = 0;
 static int ut_resource_x_probe_more_prefix = 0;
 static int ut_resource_x_delivery_tick_count = 0;
@@ -393,6 +397,8 @@ cluster_pcm_lock_resource_x_outbound_intent_probe_exact(uint32 probe_budget,
 		return RESOURCE_X_INTENT_PROBE_CORRUPT;
 	if (ut_resource_x_probe_call_count <= ut_resource_x_probe_more_prefix)
 		return RESOURCE_X_INTENT_PROBE_MORE;
+	if (ut_resource_x_probe_script_pos < ut_resource_x_probe_script_len)
+		return ut_resource_x_probe_script[ut_resource_x_probe_script_pos++];
 	if (ut_resource_x_probe_mode == RESOURCE_X_INTENT_PROBE_FOUND) {
 		*slot_out = ut_resource_x_owner_slot;
 		memcpy(payload_out, ut_resource_x_owner_payload, ut_resource_x_owner_slot.payload_bytes);
@@ -412,6 +418,14 @@ cluster_gcs_block_resource_x_delivery_tick(const ResourceXAcquisitionRef *ref)
 	return RESOURCE_X_APPLY_BAD_STATE; /* BUSY does not self-wake or fake send. */
 }
 
+ResourceXApplyResult
+cluster_gcs_block_resource_x_bootstrap_tick(const ResourceXBootstrapWork *work)
+{
+	(void)work;
+	UT_ASSERT(false); /* Bootstrap is outside this delivery-only fixture. */
+	return RESOURCE_X_APPLY_BAD_STATE;
+}
+
 ResourceXIntentProbeResult
 cluster_pcm_lock_resource_x_outbound_work_probe_exact(uint32 probe_budget,
 													  ResourceXIntentSlot *slot_out,
@@ -428,7 +442,8 @@ cluster_pcm_lock_resource_x_outbound_work_probe_exact(uint32 probe_budget,
 		delivery_out->formation = 17;
 		delivery_out->acquisition_generation = 41;
 		*examined_out = 1;
-		ut_resource_x_probe_mode = RESOURCE_X_INTENT_PROBE_COMPLETE;
+		if (ut_resource_x_probe_script_pos >= ut_resource_x_probe_script_len)
+			ut_resource_x_probe_mode = RESOURCE_X_INTENT_PROBE_COMPLETE;
 	}
 	return result;
 }
@@ -889,9 +904,14 @@ ut_reset_log(void)
 	ut_resource_x_rearm_count = 0;
 	ut_resource_x_complete_count = 0;
 	ut_resource_x_probe_mode = RESOURCE_X_INTENT_PROBE_IDLE;
+	memset(ut_resource_x_probe_script, 0, sizeof(ut_resource_x_probe_script));
+	ut_resource_x_probe_script_len = 0;
+	ut_resource_x_probe_script_pos = 0;
 	ut_resource_x_probe_call_count = 0;
 	ut_resource_x_probe_more_prefix = 0;
 	ut_resource_x_probe_max_budget = 0;
+	ut_resource_x_delivery_tick_count = 0;
+	ut_resource_x_source_finish_tick_count = 0;
 	ut_resource_x_rebind_count = 0;
 	ut_resource_x_rebind_generation = 0;
 	ut_resource_x_decode_count = 0;
@@ -1921,6 +1941,23 @@ UT_TEST(test_resource_x_intent_pump_drives_local_delivery_without_wire_or_busy_s
 	UT_ASSERT_EQ(ut_wakeup_count, 0);
 }
 
+UT_TEST(test_resource_x_intent_pump_defers_busy_and_serves_next_work)
+{
+	ut_reset_log();
+	ut_resource_x_probe_script[0] = RESOURCE_X_INTENT_PROBE_SOURCE_FINISH;
+	ut_resource_x_probe_script[1] = RESOURCE_X_INTENT_PROBE_DELIVERY;
+	ut_resource_x_probe_script[2] = RESOURCE_X_INTENT_PROBE_COMPLETE;
+	ut_resource_x_probe_script_len = 3;
+	ut_wakeup_count = 0;
+
+	UT_ASSERT_EQ(cluster_lms_outbound_resource_x_intent_pump(), 0);
+	UT_ASSERT_EQ(ut_resource_x_source_finish_tick_count, 1);
+	UT_ASSERT_EQ(ut_resource_x_delivery_tick_count, 1);
+	UT_ASSERT_EQ(ut_resource_x_probe_call_count, 3);
+	UT_ASSERT_EQ(ut_wakeup_count, 0);
+	UT_ASSERT_EQ(ut_sent_n, 0);
+}
+
 UT_TEST(test_resource_x_intent_pump_reschedules_every_exhausted_last_result)
 {
 	ResourceXIntentProbeResult results[]
@@ -2623,7 +2660,7 @@ UT_TEST(test_plain_frame_old_head_does_not_block_new_cut_frame)
 int
 main(void)
 {
-	UT_PLAN(58);
+	UT_PLAN(59);
 
 	UT_RUN(test_normal_stop_missing_outbound_is_not_empty);
 	UT_RUN(test_ring_shmem_init);
@@ -2660,6 +2697,7 @@ main(void)
 	UT_RUN(test_resource_x_intent_pump_not_due_does_not_renew_attempt);
 	UT_RUN(test_resource_x_intent_pump_is_bounded_to_sixteen_four_probes);
 	UT_RUN(test_resource_x_intent_pump_drives_local_delivery_without_wire_or_busy_spin);
+	UT_RUN(test_resource_x_intent_pump_defers_busy_and_serves_next_work);
 	UT_RUN(test_resource_x_intent_pump_reschedules_every_exhausted_last_result);
 	UT_RUN(test_resource_x_intent_pump_stops_after_a_terminal_scan);
 	UT_RUN(test_resource_x_type14_assert_and_local_proof_share_one_data_fifo);
