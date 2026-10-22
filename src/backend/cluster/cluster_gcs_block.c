@@ -4783,10 +4783,19 @@ cluster_gcs_current_mx_member_proof_fetch_and_wait(
 			now = GetCurrentTimestamp();
 			if (deadline != 0 && now >= deadline)
 				break;
-			timeout_ms = deadline == 0 ? 1000L : (long)((deadline - now) / 1000);
-			timeout_ms = Max(timeout_ms, 1L);
-			(void)ConditionVariableTimedSleep(&slot->reply_cv, timeout_ms,
-											  WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+			if (deadline == 0)
+			{
+				/* An unbounded proof wait is event-driven; do not poll on a
+				 * fixed one-second tick while the reply slot is unchanged. */
+				ConditionVariableSleep(&slot->reply_cv, WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+			}
+			else
+			{
+				timeout_ms = (long)((deadline - now) / 1000);
+				timeout_ms = Max(timeout_ms, 1L);
+				(void) ConditionVariableTimedSleep(&slot->reply_cv, timeout_ms,
+												  WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+			}
 		}
 		ConditionVariableCancelSleep();
 		if (!got_reply) {
