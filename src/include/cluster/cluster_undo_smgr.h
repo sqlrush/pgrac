@@ -169,6 +169,10 @@ struct ClusterWalInputsV1;
 extern bool cluster_undo_smgr_recovery_abort_prepare_tx_v1(struct ClusterWalInputsV1 *inputs,
 	const ClusterRecoveryTTAbortV1 *record, ClusterUndoSmgrRecoveryStampV1 *out);
 extern bool cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 stamp);
+/* Exact held descriptor has completed write/sync/readback in this owner.
+ * This is a storage fact, not proof of WAL flush or recovery authority. */
+extern bool cluster_undo_smgr_recovery_abort_durable_v1(ClusterUndoSmgrRecoveryStampV1 stamp,
+	const ClusterRecoveryTTAbortV1 *record);
 /* Also released with the owning ResourceOwner. Cleanup never clears a
  * recovery duty/window or turns a failed write into completion. */
 extern bool cluster_undo_smgr_recovery_abort_close_v1(ClusterUndoSmgrRecoveryStampV1 stamp);

@@ -23579,6 +23579,8 @@ UT_TEST(test_tx_inputs_exact_c0_path_requires_original_candidate_and_preserves_i
 	record = tx_inputs_candidate.record;
 	UT_ASSERT(cluster_recovery_tt_abort_valid_v1(&record));
 	UT_ASSERT_EQ(tx_inputs_begin(&inputs), 0);
+	UT_ASSERT(cluster_wal_inputs_tx_abort_current_v1(inputs, &record));
+	UT_ASSERT_EQ(tx_inputs_path_calls, 0);
 	UT_ASSERT(cluster_wal_inputs_tx_abort_path_v1(inputs, &record, path, sizeof(path)));
 	UT_ASSERT(strcmp(path, "/tmp/pgrac-tx/pg_undo/instance_0/seg_1.dat") == 0);
 	UT_ASSERT_EQ(tx_inputs_path_calls, 1);
@@ -23586,6 +23588,7 @@ UT_TEST(test_tx_inputs_exact_c0_path_requires_original_candidate_and_preserves_i
 	record.target_full_xid += UINT64_C(1) << 32;
 	record.top_full_xid = record.target_full_xid;
 	UT_ASSERT(cluster_recovery_tt_abort_valid_v1(&record));
+	UT_ASSERT(!cluster_wal_inputs_tx_abort_current_v1(inputs, &record));
 	UT_ASSERT(!cluster_wal_inputs_tx_abort_path_v1(inputs, &record, path, sizeof(path)));
 	UT_ASSERT_EQ(path[0], 0);
 	UT_ASSERT_EQ(tx_inputs_path_calls, 1);
@@ -23593,6 +23596,7 @@ UT_TEST(test_tx_inputs_exact_c0_path_requires_original_candidate_and_preserves_i
 	UT_ASSERT(!cluster_wal_inputs_tx_abort_path_v1(inputs, &record, (char *)&record, sizeof(record)));
 	UT_ASSERT(memcmp(&record, &saved, sizeof(record)) == 0);
 	cluster_wal_inputs_release_v1(&inputs);
+	UT_ASSERT(!cluster_wal_inputs_tx_abort_current_v1(inputs, &record));
 	UT_ASSERT(!inputs_pin_held && test_actual_cf == NoLock);
 	test_inputs_startup_cf = false;
 }
@@ -23620,6 +23624,8 @@ UT_TEST(test_tx_inputs_c0_path_refuses_stale_scope_and_post_resolve_drift)
 		case 11: tx_inputs_path_fault = 4; break;
 		case 12: break; /* short destination */
 		}
+		UT_ASSERT_EQ(cluster_wal_inputs_tx_abort_current_v1(inputs, &record), fault >= 8);
+		UT_ASSERT_EQ(tx_inputs_path_calls, 0);
 		memset(path, 'x', sizeof(path));
 		UT_ASSERT(!cluster_wal_inputs_tx_abort_path_v1(inputs, &record, path,
 			fault == 12 ? 1 : sizeof(path)));

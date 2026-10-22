@@ -770,7 +770,7 @@ CLOGShmemBuffers(void)
 static bool
 clog_recovery_initialized(int origin)
 {
-	return cluster_shared_config && InRecovery && AmStartupProcess() && origin >= 0
+	return cluster_shared_config && AmStartupProcess() && origin >= 0
 		   && origin < CLOG_RECOVERY_ORIGINS && origin != cluster_node_id
 		   && ClogRecoveryLocks != NULL && ClogRecoveryCtl[origin].shared != NULL;
 }
@@ -778,7 +778,7 @@ clog_recovery_initialized(int origin)
 static bool
 clog_recovery_permitted(int origin)
 {
-	return clog_recovery_initialized(origin)
+	return InRecovery && clog_recovery_initialized(origin)
 		   && cluster_undo_recovery_cold_origin_authorized_v1(origin);
 }
 
@@ -786,7 +786,7 @@ static bool
 clog_recovery_terminal_permitted(int origin, TransactionId xid, int count, XidStatus status)
 {
 	return clog_recovery_initialized(origin)
-		   && (cluster_undo_recovery_cold_origin_authorized_v1(origin)
+		   && ((InRecovery && cluster_undo_recovery_cold_origin_authorized_v1(origin))
 			   || (count == 0 && TransactionIdIsNormal(xid) && status == TRANSACTION_STATUS_ABORTED
 				   && cluster_undo_recovery_abort_clog_authorized_v1(origin, xid)));
 }

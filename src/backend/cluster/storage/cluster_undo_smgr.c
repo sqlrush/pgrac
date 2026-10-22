@@ -588,6 +588,8 @@ typedef struct RecoveryHeaderStamp {
 	ResourceOwner owner;
 	uint64 token;
 	bool failed;
+	bool durable;
+	ClusterRecoveryTTAbortV1 record;
 	struct stat file;
 	uint32 slot_offset;
 	PGAlignedBlock before;
@@ -698,6 +700,7 @@ recovery_abort_prepare_path(const ClusterRecoveryTTAbortV1 *record, const char *
 		= TT_SLOT_ABORTED;
 	if (!cluster_undo_segment_header_seal(stage->after.data))
 		goto refused;
+	stage->record = *record;
 	stage->token = ++recovery_header_stamp_serial;
 	out->token = stage->token;
 	return true;
@@ -753,6 +756,7 @@ cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 stamp)
 	if (stamp.token == 0 || stage->fd < 0 || stage->token != stamp.token
 		|| stage->owner != CurrentResourceOwner || stage->failed)
 		return false;
+	stage->durable = false;
 	if (!cluster_undo_block0_header_write_lock(header->segment_id, header->owner_instance,
 												 &acquired_slot))
 		goto refused;
@@ -788,6 +792,7 @@ cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 stamp)
 		|| fstat(stage->fd, &file) != 0 || !recovery_header_stamp_file_matches(&file))
 		goto refused;
 	memcpy(stage->before.data, stage->after.data, BLCKSZ);
+	stage->durable = true;
 	cluster_undo_block0_header_write_unlock(acquired_slot);
 	return true;
 
@@ -795,6 +800,18 @@ refused:
 	cluster_undo_block0_header_write_unlock(acquired_slot);
 	stage->failed = true;
 	return false;
+}
+
+bool
+cluster_undo_smgr_recovery_abort_durable_v1(ClusterUndoSmgrRecoveryStampV1 stamp,
+	const ClusterRecoveryTTAbortV1 *record)
+{
+	const RecoveryHeaderStamp *stage = &recovery_header_stamp;
+
+	return stamp.token != 0 && stage->fd >= 0 && stage->token == stamp.token
+		&& CurrentResourceOwner != NULL && stage->owner == CurrentResourceOwner
+		&& !stage->failed && stage->durable && record != NULL
+		&& memcmp(record, &stage->record, sizeof(*record)) == 0;
 }
 
 bool

@@ -278,6 +278,7 @@
 #include "cluster/cluster_cold_recovery.h" /* PGRAC: hold restartpoint during typed cold replay */
 #include "cluster/cluster_wal_inputs.h" /* PGRAC: post-EOR retained loser read scope */
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/cluster_undo_recovery.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/cluster_gcs_block.h" /* PGRAC: spec-6.12h D-h2 PI-discard checkpoint seal */
 #include "cluster/cluster_guc.h" /* PGRAC: spec-5.6 cluster_controlfile_shared_authority */
@@ -6832,6 +6833,9 @@ cluster_cold_recovery_consume_loser_inputs_v1(
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			&& !cluster_cold_recovery_stamp_c0_v1(start, entry, &confirmed.record, stamp))
 			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& !cluster_undo_recovery_abort_project_tx_v1(inputs, &confirmed.record, stamp))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		/* Close before releasing exclusion, including every post-I/O refusal.
 		 * The stamp owner independently retains every incomplete inserted C0. */
 		if (stamp.token != 0 && !cluster_undo_smgr_recovery_abort_close_v1(stamp))
@@ -8034,8 +8038,9 @@ StartupXLOG(void)
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 						errmsg("could not bind original Startup transaction recovery inputs")));
 	/* Shared cold recovery consumes only the proven physical losers through a
-	 * fresh original-owner TX_CLOSURE scope.  The scope is released before any
-	 * later startup work; no TT/C0 or checkpoint write is authorized here. */
+	 * fresh original-owner TX_CLOSURE scope. Exact C0 execution and terminal
+	 * reconstruction retain that scope through their final readback; release
+	 * precedes later Startup work and grants no checkpoint or OPEN authority. */
 	if (cluster_shared_config
 		&& cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_TARGET_LOADING
 		&& !cluster_cold_recovery_consume_loser_inputs_v1(endOfRecoveryInfo->cluster_tx_start))

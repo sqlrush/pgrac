@@ -1379,10 +1379,21 @@ inputs_overlap(const void *a, Size a_size, const void *b, Size b_size)
 }
 
 bool
+cluster_wal_inputs_tx_abort_current_v1(ClusterWalInputsV1 *inputs,
+	const ClusterRecoveryTTAbortV1 *record)
+{
+	ClusterRecoveryTTAbortDerivationV1 candidate;
+
+	return inputs_current(inputs) && inputs->purpose == WAL_INPUTS_TX_CLOSURE
+		&& cluster_recovery_tt_abort_valid_v1(record)
+		&& ClusterColdRecoveryTxC0Candidate(inputs->tx.start, inputs->tx.subject, &candidate)
+		&& memcmp(record, &candidate.record, sizeof(*record)) == 0;
+}
+
+bool
 cluster_wal_inputs_tx_abort_path_v1(ClusterWalInputsV1 *inputs,
 	const ClusterRecoveryTTAbortV1 *record, char *out, size_t out_size)
 {
-	ClusterRecoveryTTAbortDerivationV1 candidate;
 	char path[MAXPGPATH];
 
 	/* Do not clear output that aliases the retained subject or this scope. */
@@ -1394,16 +1405,11 @@ cluster_wal_inputs_tx_abort_path_v1(ClusterWalInputsV1 *inputs,
 				|| inputs_overlap(out, out_size, inputs->tx.inputs, sizeof(*inputs->tx.inputs)))))
 		return false;
 	out[0] = '\0';
-	if (!inputs_current(inputs) || inputs->purpose != WAL_INPUTS_TX_CLOSURE
-		|| !cluster_recovery_tt_abort_valid_v1(record)
-		|| !ClusterColdRecoveryTxC0Candidate(inputs->tx.start, inputs->tx.subject, &candidate)
-		|| memcmp(record, &candidate.record, sizeof(*record)) != 0)
+	if (!cluster_wal_inputs_tx_abort_current_v1(inputs, record))
 		return false;
 	if (cluster_shared_fs_undo_path_resolve(record->exact.instance, record->exact.segment_id,
 			path, sizeof(path)) != 0
-		|| !inputs_current(inputs)
-		|| !ClusterColdRecoveryTxC0Candidate(inputs->tx.start, inputs->tx.subject, &candidate)
-		|| memcmp(record, &candidate.record, sizeof(*record)) != 0
+		|| !cluster_wal_inputs_tx_abort_current_v1(inputs, record)
 		|| strlen(path) >= out_size)
 		return false;
 	memcpy(out, path, strlen(path) + 1);

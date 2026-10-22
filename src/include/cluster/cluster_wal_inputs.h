@@ -89,6 +89,10 @@ extern ClusterControlRootResult cluster_wal_inputs_begin_tx_closure_v1(
  * and revalidate the whole source ROOT before and after descriptor I/O. */
 extern bool cluster_wal_inputs_tx_abort_path_v1(ClusterWalInputsV1 *inputs,
 	const struct ClusterRecoveryTTAbortV1 *record, char *out, size_t out_size);
+/* Local scope/candidate checks only; no ROOT read or new permission. The
+ * caller still revalidates the whole selected input outside native locks. */
+extern bool cluster_wal_inputs_tx_abort_current_v1(ClusterWalInputsV1 *inputs,
+	const struct ClusterRecoveryTTAbortV1 *record);
 
 /* Startup in recovery, under the caller's existing execution WALR retention
  * owner. Select one exact CLOSED/RECOVERY_REQUIRED/RECOVERY_COMPLETE checkpoint

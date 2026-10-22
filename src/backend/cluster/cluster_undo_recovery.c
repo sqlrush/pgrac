@@ -15,6 +15,7 @@
 #include "cluster/cluster_remote_xact.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_wal_tail.h"
 #include "cluster/storage/cluster_shared_fs.h"
 
@@ -36,6 +37,93 @@ typedef struct RecoveryAbortScope {
 } RecoveryAbortScope;
 
 static const RecoveryAbortScope *active_abort;
+
+/* Synchronous post-EOR capability. Its held FD certifies storage completion,
+ * while the original caller owns WAL flush and target exclusion. Never use
+ * this scope for general UNDO paths or an ordinary native origin. */
+typedef struct RecoveryTxAbortScope {
+	ClusterWalInputsV1 *inputs;
+	ClusterRecoveryTTAbortV1 record;
+	ClusterUndoSmgrRecoveryStampV1 stamp;
+	bool clog_active;
+	bool projection_active;
+} RecoveryTxAbortScope;
+
+static const RecoveryTxAbortScope *active_tx_abort;
+
+static bool
+recovery_tx_abort_current(const RecoveryTxAbortScope *scope)
+{
+	return cluster_peer_mode_enabled() && cluster_undo_gcs_coherence
+		&& cluster_undo_smgr_recovery_abort_durable_v1(scope->stamp, &scope->record)
+		&& cluster_wal_inputs_tx_abort_current_v1(scope->inputs, &scope->record);
+}
+
+static bool
+recovery_tx_abort_revalidate(const RecoveryTxAbortScope *scope)
+{
+	/* Whole-ROOT I/O stays outside native SLRU locks. Native callbacks below
+	 * only inspect the exact retained scope/candidate and held storage token. */
+	return recovery_tx_abort_current(scope)
+		&& cluster_wal_inputs_revalidate_v1(scope->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& recovery_tx_abort_current(scope);
+}
+
+bool
+cluster_undo_recovery_abort_project_tx_v1(ClusterWalInputsV1 *inputs,
+	const ClusterRecoveryTTAbortV1 *record, ClusterUndoSmgrRecoveryStampV1 stamp)
+{
+	RecoveryTxAbortScope scope = { 0 };
+	volatile bool ok = false;
+
+	if (active_scope != NULL || active_abort != NULL || active_tx_abort != NULL
+		|| !cluster_recovery_tt_abort_valid_v1(record)
+		|| record->target_thread == cluster_node_id + 1)
+		return false;
+	scope.inputs = inputs;
+	scope.record = *record;
+	scope.stamp = stamp;
+	if (!recovery_tx_abort_revalidate(&scope))
+		return false;
+	active_tx_abort = &scope;
+	PG_TRY();
+	{
+		scope.clog_active = true;
+		ok = cluster_clog_native_recovery_apply_v1(scope.record.target_thread - 1, scope.record.exact.xid,
+			0, NULL, TRANSACTION_STATUS_ABORTED)
+			&& recovery_tx_abort_revalidate(&scope)
+			&& cluster_clog_native_recovery_verify_v1(scope.record.target_thread - 1, scope.record.exact.xid,
+				0, NULL, TRANSACTION_STATUS_ABORTED)
+			&& recovery_tx_abort_revalidate(&scope);
+		scope.clog_active = false;
+		if (ok) {
+			ClusterRemoteXactMutationV2 mutation;
+			SCN scn = InvalidScn;
+			uint16 wrap = 0;
+			bool wrap_valid = false;
+
+			scope.projection_active = true;
+			mutation = cluster_remote_xact_store_terminal_v2(scope.record.target_thread - 1,
+				scope.record.exact.xid, false, NULL, CLUSTER_REMOTE_XACT_ABORTED,
+				InvalidScn, 0, false, 0);
+			scope.projection_active = false;
+			ok = (mutation == CLUSTER_REMOTE_XACT_MUTATION_STORED
+				|| mutation == CLUSTER_REMOTE_XACT_MUTATION_UNCHANGED)
+				&& recovery_tx_abort_revalidate(&scope);
+			if (ok)
+				ok = cluster_remote_commit_outcome_ex(scope.record.target_thread - 1, scope.record.exact.xid,
+					&scn, &wrap, &wrap_valid) == CLUSTER_REMOTE_XACT_ABORTED
+					&& scn == InvalidScn && !wrap_valid && wrap == 0
+					&& recovery_tx_abort_revalidate(&scope);
+		}
+	}
+	PG_FINALLY();
+	{
+		active_tx_abort = NULL;
+	}
+	PG_END_TRY();
+	return ok;
+}
 
 static bool
 undo_source_equal(const ClusterWalSourceRef *left, const ClusterWalSourceRef *right)
@@ -140,7 +228,7 @@ cluster_undo_recovery_abort_replay_v1(const RfSideOnlinePlanV1 *plan, uint32 ind
 	volatile ClusterUndoSmgrRecoveryStampV1 stamp = { 0 };
 	volatile bool ok = false;
 
-	if (active_scope != NULL || active_abort != NULL || identity == NULL
+	if (active_scope != NULL || active_abort != NULL || active_tx_abort != NULL || identity == NULL
 		|| !rf_side_online_plan_operation_v1(plan, index, &operation)
 		|| operation.kind != RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT || operation.history_only
 		|| memcmp(&operation.identity, identity, sizeof(*identity)) != 0
@@ -281,7 +369,8 @@ cluster_undo_recovery_scope_enter_v1(ClusterUndoRecoveryScopeV1 *scope,
 {
 	ClusterUndoRecoveryScopeV1 candidate = { 0 };
 
-	if (active_scope != NULL || active_abort != NULL || scope == NULL || authority == NULL
+	if (active_scope != NULL || active_abort != NULL || active_tx_abort != NULL
+		|| scope == NULL || authority == NULL
 		|| plan == NULL || authority->duty == NULL || authority->root_token == NULL
 		|| authority->root_snapshot == NULL || authority->duty->origin_thread_id == 0
 		|| authority->duty->origin_thread_id > 128)
@@ -346,18 +435,27 @@ cluster_undo_recovery_cold_origin_authorized_v1(int origin_node)
 bool
 cluster_undo_recovery_abort_clog_authorized_v1(int origin_node, TransactionId xid)
 {
-	return origin_node >= 0 && origin_node < 128 && active_abort != NULL
-		   && active_abort->clog_active && active_abort->record.target_thread == origin_node + 1
-		   && active_abort->record.exact.xid == xid && recovery_abort_current(active_abort);
+	return origin_node >= 0 && origin_node < 128
+		&& ((active_abort != NULL && active_abort->clog_active
+			&& active_abort->record.target_thread == origin_node + 1
+			&& active_abort->record.exact.xid == xid && recovery_abort_current(active_abort))
+			|| (active_tx_abort != NULL && active_tx_abort->clog_active
+				&& active_tx_abort->record.target_thread == origin_node + 1
+				&& active_tx_abort->record.exact.xid == xid
+				&& recovery_tx_abort_current(active_tx_abort)));
 }
 
 bool
 cluster_undo_recovery_abort_projection_authorized_v1(int origin_node, TransactionId xid)
 {
-	return origin_node >= 0 && origin_node < 128 && active_abort != NULL
-		   && active_abort->projection_active
-		   && active_abort->record.target_thread == origin_node + 1
-		   && active_abort->record.exact.xid == xid && recovery_abort_current(active_abort);
+	return origin_node >= 0 && origin_node < 128
+		&& ((active_abort != NULL && active_abort->projection_active
+			&& active_abort->record.target_thread == origin_node + 1
+			&& active_abort->record.exact.xid == xid && recovery_abort_current(active_abort))
+			|| (active_tx_abort != NULL && active_tx_abort->projection_active
+				&& active_tx_abort->record.target_thread == origin_node + 1
+				&& active_tx_abort->record.exact.xid == xid
+				&& recovery_tx_abort_current(active_tx_abort)));
 }
 
 bool

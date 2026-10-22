@@ -9,6 +9,7 @@
 
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_thread_recovery_authority.h"
+#include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 
 typedef struct ClusterUndoRecoveryScopeV1 {
@@ -32,6 +33,13 @@ extern bool cluster_undo_recovery_abort_replay_v1(const RfSideOnlinePlanV1 *plan
 												  const RfPageOnlineRecordIdentityV1 *identity,
 												  const ClusterThreadRecoveryAuthorityV1 *writer,
 												  const ClusterThreadRecoveryAuthorityV1 *target);
+/* Original post-EOR TX_CLOSURE caller only, after its C0 WAL flush and
+ * durable TT stamp have cleared F4. Keep source, target reservation and exact
+ * held FD through native top ABORT and derived projection readback. This
+ * restores foreign-origin native state only; it grants no general origin,
+ * UNDO, cleanup, checkpoint or OPEN authority. */
+extern bool cluster_undo_recovery_abort_project_tx_v1(struct ClusterWalInputsV1 *inputs,
+	const ClusterRecoveryTTAbortV1 *record, ClusterUndoSmgrRecoveryStampV1 stamp);
 /* The SIDE projection shares this original sealed-source recovery scope. */
 extern bool cluster_undo_recovery_origin_authorized_v1(int origin_node);
 /* Native cold consumers also require the original cold serial mode and

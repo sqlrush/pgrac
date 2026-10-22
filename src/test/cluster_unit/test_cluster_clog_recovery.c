@@ -1078,6 +1078,41 @@ UT_TEST(c0_native_abort_revocation_and_error_keep_original_cleanup)
 	}
 }
 
+UT_TEST(post_eor_c0_only_restores_the_exact_foreign_top_abort)
+{
+	TransactionId child = 101;
+	ClusterSideProjectionOperationV1 zero = fixture_clog_record(false, 160);
+	ClusterSideProjectionOperationV1 truncate = fixture_clog_record(true, 32);
+	unsigned before;
+
+	fixture_zero(0);
+	InRecovery = false;
+	authority = c0_authority = true;
+	before = writes;
+	UT_ASSERT(!cluster_clog_native_recovery_apply_v1(1, 100, 0, NULL,
+		TRANSACTION_STATUS_COMMITTED));
+	UT_ASSERT(!cluster_clog_native_recovery_apply_v1(1, 101, 0, NULL,
+		TRANSACTION_STATUS_ABORTED));
+	UT_ASSERT(!cluster_clog_native_recovery_apply_v1(1, 100, 1, &child,
+		TRANSACTION_STATUS_ABORTED));
+	UT_ASSERT(!cluster_clog_native_recovery_apply_v1(0, 100, 0, NULL,
+		TRANSACTION_STATUS_ABORTED));
+	UT_ASSERT(!cluster_clog_native_recovery_record_apply_v1(1, &zero));
+	UT_ASSERT(!cluster_clog_native_recovery_record_apply_v1(1, &truncate));
+	UT_ASSERT_EQ(writes, before);
+	UT_ASSERT(cluster_clog_native_recovery_apply_v1(1, 100, 0, NULL,
+		TRANSACTION_STATUS_ABORTED));
+	UT_ASSERT(cluster_clog_native_recovery_verify_v1(1, 100, 0, NULL,
+		TRANSACTION_STATUS_ABORTED));
+	UT_ASSERT_EQ(fixture_status(100), TRANSACTION_STATUS_ABORTED);
+	UT_ASSERT_EQ(fixture_status(101), TRANSACTION_STATUS_IN_PROGRESS);
+	c0_authority = false;
+	UT_ASSERT(!cluster_clog_native_recovery_verify_v1(1, 100, 0, NULL,
+		TRANSACTION_STATUS_ABORTED));
+	InRecovery = true;
+	fixture_idle();
+}
+
 static void
 fixture_cleanup(void)
 {
@@ -1118,7 +1153,7 @@ main(void)
 			return 2;
 	}
 	clog_recovery_shmem_init();
-	UT_PLAN(21);
+	UT_PLAN(22);
 	UT_RUN(separate_original_origin_controls);
 	UT_RUN(commit_and_abort_persist_full_tree_without_local_pollution);
 	UT_RUN(conflicting_late_child_refuses_before_any_tree_write);
@@ -1140,6 +1175,7 @@ main(void)
 	UT_RUN(c0_exact_native_abort_does_not_authorize_an_origin);
 	UT_RUN(c0_native_abort_retains_conflict_and_durability_refusal);
 	UT_RUN(c0_native_abort_revocation_and_error_keep_original_cleanup);
+	UT_RUN(post_eor_c0_only_restores_the_exact_foreign_top_abort);
 	fixture_cleanup();
 	UT_DONE();
 	return ut_failed_count != 0;

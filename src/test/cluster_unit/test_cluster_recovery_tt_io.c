@@ -575,6 +575,40 @@ UT_TEST(test_close_error_and_exit_release_do_not_publish_completion)
 	UT_ASSERT_EQ(syncs, 0);
 	UT_ASSERT(!cluster_undo_smgr_recovery_abort_write_v1(stamp));
 }
+UT_TEST(test_durable_fact_requires_exact_completed_live_stamp)
+{
+	ClusterUndoSmgrRecoveryStampV1 stamp;
+	ClusterRecoveryTTAbortV1 changed;
+	reset_file(false);
+	if (!prepare(&stamp))
+		return;
+	UT_ASSERT(!cluster_undo_smgr_recovery_abort_durable_v1(stamp, &record));
+	UT_ASSERT(cluster_undo_smgr_recovery_abort_write_v1(stamp));
+	UT_ASSERT(cluster_undo_smgr_recovery_abort_durable_v1(stamp, &record));
+	UT_ASSERT(!cluster_undo_smgr_recovery_abort_durable_v1(
+		(ClusterUndoSmgrRecoveryStampV1){stamp.token + 1}, &record));
+	changed = record;
+	changed.writer_incarnation++;
+	UT_ASSERT(!cluster_undo_smgr_recovery_abort_durable_v1(stamp, &changed));
+	UT_ASSERT(!cluster_undo_smgr_recovery_abort_durable_v1(stamp, NULL));
+	CurrentResourceOwner = (ResourceOwner)&owner_storage[1];
+	UT_ASSERT(!cluster_undo_smgr_recovery_abort_durable_v1(stamp, &record));
+	CurrentResourceOwner = (ResourceOwner)&owner_storage[0];
+	UT_ASSERT(cluster_undo_smgr_recovery_abort_close_v1(stamp));
+	UT_ASSERT(!cluster_undo_smgr_recovery_abort_durable_v1(stamp, &record));
+
+	reset_file(false);
+	if (!prepare(&stamp))
+		return;
+	write_short = true;
+	UT_ASSERT(!cluster_undo_smgr_recovery_abort_write_v1(stamp));
+	UT_ASSERT(!cluster_undo_smgr_recovery_abort_durable_v1(stamp, &record));
+	write_short = false;
+	UT_ASSERT(!cluster_undo_smgr_recovery_abort_write_v1(stamp));
+	UT_ASSERT(!cluster_undo_smgr_recovery_abort_durable_v1(stamp, &record));
+	UT_ASSERT(cluster_undo_smgr_recovery_abort_close_v1(stamp));
+}
+
 int
 main(void)
 {
@@ -584,7 +618,7 @@ main(void)
 		return 2;
 	snprintf(test_dir, sizeof(test_dir), "%s", dir);
 	snprintf(test_file, sizeof(test_file), "%s/seg_257.dat", dir);
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_exact_durable_slot_preserves_whole_header_and_head);
 	UT_RUN(test_cold_prepare_uses_exact_tx_scope_without_redo_path_or_writes);
 	UT_RUN(test_cold_prepare_refuses_bad_scope_crc_before_image_and_releases_owner);
@@ -595,6 +629,7 @@ main(void)
 	UT_RUN(test_sync_failure_uses_native_severity_after_unlock_and_stays_failed);
 	UT_RUN(test_owner_token_capacity_and_release);
 	UT_RUN(test_close_error_and_exit_release_do_not_publish_completion);
+	UT_RUN(test_durable_fact_requires_exact_completed_live_stamp);
 	CurrentResourceOwner = (ResourceOwner)&owner_storage[0];
 	if (release_callback != NULL)
 		release_callback(RESOURCE_RELEASE_AFTER_LOCKS, false, true, release_arg);

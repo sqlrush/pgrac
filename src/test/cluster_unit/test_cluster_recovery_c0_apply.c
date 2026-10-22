@@ -8,6 +8,7 @@
 #include "cluster/cluster_remote_xact.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_wal_tail.h"
 #include "cluster/storage/cluster_shared_fs.h"
 #include "unit_test.h"
@@ -43,6 +44,34 @@ static ClusterRemoteXactMutationV2 projection_result;
 static int projection_read_fault;
 static char order[64];
 static unsigned order_count;
+static char tx_inputs_storage;
+static bool tx_mode, tx_current, tx_durable;
+static unsigned tx_revalidates, tx_fail_revalidate;
+
+bool
+cluster_wal_inputs_tx_abort_current_v1(ClusterWalInputsV1 *inputs,
+	const ClusterRecoveryTTAbortV1 *record)
+{
+	return tx_mode && tx_current && inputs == (ClusterWalInputsV1 *)&tx_inputs_storage
+		&& memcmp(record, &operation.recovery_abort, sizeof(*record)) == 0;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_revalidate_v1(ClusterWalInputsV1 *inputs)
+{
+	UT_ASSERT(tx_mode && inputs == (ClusterWalInputsV1 *)&tx_inputs_storage);
+	if (++tx_revalidates == tx_fail_revalidate)
+		tx_current = false;
+	return tx_current ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+
+bool
+cluster_undo_smgr_recovery_abort_durable_v1(ClusterUndoSmgrRecoveryStampV1 stamp,
+	const ClusterRecoveryTTAbortV1 *record)
+{
+	return tx_mode && tx_durable && fd_held && stamp.token == 19
+		&& memcmp(record, &operation.recovery_abort, sizeof(*record)) == 0;
+}
 
 static void
 note(char value)
@@ -76,6 +105,13 @@ inject(int stage)
 		pg_re_throw();
 	if (drift_stage != stage)
 		return;
+	if (tx_mode) {
+		if (drift_kind == 0)
+			tx_current = false;
+		else
+			tx_durable = false;
+		return;
+	}
 	switch (drift_kind) {
 	case 0:
 		current[0] = CLUSTER_THREAD_AUTHORITY_PIN_STALE;
@@ -398,6 +434,8 @@ reset(void)
 	memset(&operation, 0, sizeof(operation));
 	memset(order, 0, sizeof(order));
 	order_count = 0;
+	tx_mode = tx_current = tx_durable = false;
+	tx_revalidates = tx_fail_revalidate = 0;
 	conf.node_count = 4;
 	cluster_enabled = cluster_undo_gcs_coherence = true;
 	system_id = 123;
@@ -721,10 +759,117 @@ UT_TEST(projection_conflict_or_bad_readback_never_reports_completion)
 	}
 }
 
+static void
+reset_tx(void)
+{
+	reset();
+	replay_window = false;
+	tx_mode = tx_current = tx_durable = true;
+	fd_held = synced[0] = synced[1] = true;
+	disk_slot.status = TT_SLOT_ABORTED;
+}
+
+static bool
+project_tx(void)
+{
+	return cluster_undo_recovery_abort_project_tx_v1((ClusterWalInputsV1 *)&tx_inputs_storage,
+		&operation.recovery_abort, (ClusterUndoSmgrRecoveryStampV1){19});
+}
+
+static void
+no_tx_authority(void)
+{
+	/* Caller still owns the FD and original exclusion, even on refusal. */
+	UT_ASSERT(fd_held);
+	UT_ASSERT_EQ(prepares + writes + closes + sync_calls + path_calls, 0);
+	fd_held = false;
+	no_path();
+}
+
+UT_TEST(new_c0_restores_exact_foreign_native_then_projection_after_eor)
+{
+	reset_tx();
+	UT_ASSERT(project_tx());
+	UT_ASSERT(strcmp(order, "AVMQ") == 0);
+	UT_ASSERT_EQ(tx_revalidates, 5);
+	no_tx_authority();
+}
+
+UT_TEST(new_c0_requires_current_input_and_exact_durable_held_stamp)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		ClusterRecoveryTTAbortV1 record;
+		ClusterWalInputsV1 *inputs;
+		ClusterUndoSmgrRecoveryStampV1 stamp = {19};
+		reset_tx();
+		record = operation.recovery_abort;
+		inputs = (ClusterWalInputsV1 *)&tx_inputs_storage;
+		switch (fault) {
+		case 0: tx_current = false; break;
+		case 1: tx_durable = false; break;
+		case 2: inputs = NULL; break;
+		case 3: stamp.token++; break;
+		case 4: record.writer_incarnation++; break;
+		}
+		UT_ASSERT(!cluster_undo_recovery_abort_project_tx_v1(inputs, &record, stamp));
+		UT_ASSERT_EQ(clog_applies + projection_stores, 0);
+		no_tx_authority();
+	}
+}
+
+UT_TEST(new_c0_io_refusal_or_source_drift_never_reports_completion)
+{
+	for (unsigned fault = 0; fault < 10; fault++) {
+		reset_tx();
+		switch (fault) {
+		case 0: fail_clog_apply = true; break;
+		case 1: fail_clog_verify = true; break;
+		case 2: projection_result = CLUSTER_REMOTE_XACT_MUTATION_CONFLICT; break;
+		case 3: projection_read_fault = 1; break;
+		case 4: projection_read_fault = 2; break;
+		case 5: projection_read_fault = 3; break;
+		case 6: projection_read_fault = 4; break;
+		case 7: tx_fail_revalidate = 1; break;
+		case 8: tx_fail_revalidate = 3; break;
+		case 9: tx_fail_revalidate = 5; break;
+		}
+		UT_ASSERT(!project_tx());
+		no_tx_authority();
+	}
+	for (int stage = 5; stage <= 8; stage++)
+		for (int kind = 0; kind < 2; kind++) {
+			reset_tx();
+			drift_stage = stage;
+			drift_kind = kind;
+			UT_ASSERT(!project_tx());
+			no_tx_authority();
+		}
+}
+
+UT_TEST(new_c0_error_revokes_capability_without_releasing_callers_fd)
+{
+	for (int stage = 5; stage <= 8; stage++) {
+		volatile bool caught = false;
+		reset_tx();
+		throw_stage = stage;
+		PG_TRY();
+		{
+			(void)project_tx();
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		no_tx_authority();
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(13);
 	UT_RUN(exact_c0_replay_binds_two_owners_and_durable_order);
 	UT_RUN(missing_authority_or_changed_claim_refuses_before_io);
 	UT_RUN(wrong_record_or_crossed_authorities_never_resolve_a_path);
@@ -734,6 +879,10 @@ main(void)
 	UT_RUN(replay_outside_original_startup_window_cannot_mutate);
 	UT_RUN(replay_does_not_reuse_prior_authority_or_sync_success);
 	UT_RUN(projection_conflict_or_bad_readback_never_reports_completion);
+	UT_RUN(new_c0_restores_exact_foreign_native_then_projection_after_eor);
+	UT_RUN(new_c0_requires_current_input_and_exact_durable_held_stamp);
+	UT_RUN(new_c0_io_refusal_or_source_drift_never_reports_completion);
+	UT_RUN(new_c0_error_revokes_capability_without_releasing_callers_fd);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
