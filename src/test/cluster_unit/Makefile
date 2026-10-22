@@ -1957,6 +1957,11 @@ test_cluster_heap_freeze_apply.inc: $(top_srcdir)/src/backend/access/heap/heapam
 	     END { if (found != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_heap_freeze_xmin_apply.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^cluster_heap_freeze_apply_xmin_v1\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_freeze_redo.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
 	awk '/^heap_xlog_freeze_page\(/ { print "static void"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
@@ -1984,14 +1989,20 @@ test_cluster_heap_maintenance_identity.inc: $(top_srcdir)/src/backend/access/hea
 	mv $@.tmp $@
 
 test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c test_cluster_heap_maintenance_policy.inc unit_test.h \
+		test_cluster_vacuum_freeze_locators.inc \
 		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
 		$(top_srcdir)/src/include/cluster/cluster_scn.h test_cluster_heap_small_scn.inc \
 		$(top_srcdir)/src/include/cluster/cluster_heap_freeze.h \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
+		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
+		$(top_srcdir)/src/include/storage/buf_internals.h \
 		$(top_srcdir)/src/backend/cluster/cluster_heap_freeze.c \
 		test_cluster_heap_maintenance_identity.inc \
 		test_cluster_heap_prune_version.inc test_cluster_heap_prune_helpers.inc \
 		test_cluster_heap_freeze_body.inc test_cluster_heap_freeze_helpers.inc \
 		test_cluster_heap_freeze_apply.inc test_cluster_heap_freeze_redo.inc \
+		test_cluster_heap_freeze_xmin_apply.inc \
 		test_cluster_heap_vacuum_version.inc test_cluster_space_bufpage_product.o \
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		test_cluster_inplace_itemptr_product.o \
@@ -4860,7 +4871,8 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_maintenance_identity.inc
 	rm -f test_cluster_heap_prune_version.inc test_cluster_heap_prune_helpers.inc \
 		test_cluster_heap_freeze_body.inc test_cluster_heap_freeze_helpers.inc \
-		test_cluster_heap_freeze_apply.inc test_cluster_heap_freeze_redo.inc test_cluster_heap_vacuum_version.inc
+		test_cluster_heap_freeze_apply.inc test_cluster_heap_freeze_redo.inc test_cluster_heap_vacuum_version.inc \
+		test_cluster_heap_freeze_xmin_apply.inc
 	rm -f test_cluster_space_cache_insert.inc test_cluster_space_cache_delete.inc test_cluster_space_cache_allocation.inc test_cluster_space_cache_update.inc
 	rm -f test_cluster_space_hint_owners.inc test_cluster_space_census_types.inc test_cluster_space_census_mutation.inc test_cluster_space_cleanout_product.o
 	rm -f test_cluster_space_fsm_hint.inc

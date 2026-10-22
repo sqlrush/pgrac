@@ -13,6 +13,7 @@
 #include "access/transam.h"
 #include "cluster/cluster_space_identity.h"
 #include "cluster/cluster_tx_resolve.h"
+#include "storage/buf.h"
 #include "storage/bufpage.h"
 
 /*
@@ -305,5 +306,33 @@ extern bool cluster_heap_freeze_prepare_xmin_v1(
 	FullTransactionId freeze_limit_full,
 	SCN horizon_scn,
 	struct HeapTupleFreeze *out);
+
+struct RelationData;
+struct PcmAuthoritySnapshot;
+struct ClusterSemanticAdmissionToken;
+
+/*
+ * Qualified xmin-only mutation using native FREEZE_PAGE WAL and synchronous
+ * WAL flush.  The caller owns the pin, exclusive content lock, ACTIVE PCM-X
+ * writer ledger and R4 terminal-census admission throughout this call.  This
+ * entry never acquires/releases them or fetches a page/proof.  It rechecks the
+ * captured physical image, exact row/carrier and current authority before the
+ * native write.  False means no mutation; ERROR propagates to the resource
+ * owner.  Success changes the page version/LSN and invalidates the old proof.
+ *
+ * Dormant: production VACUUM must not call this until ORIGINAL FullXid,
+ * cutoff/H provenance and admission are closed independently of raw XIDs.
+ */
+extern bool cluster_heap_freeze_apply_xmin_v1(
+	struct RelationData *rel, Buffer buffer,
+	const ClusterHeapFreezePageInputV1 *input,
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *fence,
+	const struct PcmAuthoritySnapshot *authority_before,
+	const struct ClusterSemanticAdmissionToken *admission,
+	uint16 tuple_index,
+	FullTransactionId original_creator_full_xid,
+	FullTransactionId freeze_limit_full, SCN horizon_scn);
 
 #endif /* CLUSTER_HEAP_FREEZE_H */

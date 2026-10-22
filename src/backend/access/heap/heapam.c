@@ -96,6 +96,9 @@
 #include "cluster/cluster_epoch.h"		/* current-MX operation fence */
 #include "cluster/cluster_mode.h"		/* cluster_storage_mode_enabled / cluster_peer_mode_enabled */
 #include "cluster/cluster_guc.h"		/* cluster_enabled */
+#include "cluster/cluster_heap_freeze.h" /* qualified conditional xmin write */
+#include "cluster/cluster_pcm_lock.h" /* final holder/master authority */
+#include "cluster/cluster_gcs_block.h" /* ACTIVE local writer ledger */
 #include "cluster/cluster_itl.h"		/* alloc_or_reuse_slot / stamp_active */
 #include "cluster/cluster_multixact_current.h" /* current-DML authority */
 #include "cluster/cluster_multixact_current_stats.h" /* authority counters */
@@ -20681,6 +20684,113 @@ heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 
 	END_CRIT_SECTION();
 }
+
+#ifdef USE_PGRAC_CLUSTER
+bool
+cluster_heap_freeze_apply_xmin_v1(
+	Relation rel, Buffer buffer,
+	const ClusterHeapFreezePageInputV1 *input,
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *fence,
+	const PcmAuthoritySnapshot *authority_before,
+	const ClusterSemanticAdmissionToken *admission,
+	uint16 tuple_index, FullTransactionId original_creator_full_xid,
+	FullTransactionId freeze_limit_full, SCN horizon_scn)
+{
+	const ClusterHeapFreezeTupleInputV1 *saved;
+	RelFileLocator locator;
+	ForkNumber fork;
+	BlockNumber block;
+	BufferTag tag;
+	BufferDesc *buf;
+	Page live_page;
+	ItemId item;
+	HeapTupleHeader tuple;
+	HeapTupleFreeze plan;
+	PcmAuthoritySnapshot authority_now;
+	uint64 own_generation;
+	uint64 acquisition_epoch;
+	uint64 master_sequence;
+	uint8 pcm_state;
+	SCN page_version;
+
+	/* Borrow a real writer's resources; a local conditional lock is not X. */
+	if (rel == NULL || rel->rd_rel == NULL || input == NULL || page == NULL
+		|| proofs == NULL || fence == NULL || authority_before == NULL
+		|| admission == NULL || !cluster_enabled || !cluster_shared_config
+		|| rel->rd_rel->relpersistence != RELPERSISTENCE_PERMANENT
+		|| cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) != 1
+		|| !RelationNeedsWAL(rel)
+		|| buffer <= 0 || buffer > NBuffers || BufferDescriptors == NULL)
+		return false;
+	buf = GetBufferDescriptor(buffer - 1);
+	if (!LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE))
+		return false;
+	BufferGetTag(buffer, &locator, &fork, &block);
+	if (!RelFileLocatorEquals(locator, rel->rd_locator)
+		|| fork != MAIN_FORKNUM || block != fence->block)
+		return false;
+	InitBufferTag(&tag, &locator, fork, block);
+	live_page = BufferGetPage(buffer);
+	/* Recapturing the image cannot refresh an older canonical proof fence. */
+	if (PageGetLSN(live_page) != fence->page_lsn
+		|| ((PageHeader)live_page)->pd_block_scn != fence->page_version
+		|| cluster_heap_freeze_validate_page_v1(input, &fence->identity, block,
+			live_page) != CLUSTER_HEAP_FREEZE_PAGE_MATCHED
+		|| !cluster_heap_freeze_prepare_xmin_v1(page, proofs, fence, tuple_index,
+			original_creator_full_xid, freeze_limit_full, horizon_scn, &plan))
+		return false;
+
+	/* The batch is not authority: bind every planned header field to the image. */
+	saved = &page->tuples[tuple_index];
+	if (saved->offset > PageGetMaxOffsetNumber(live_page)
+		|| !PageHasItl(live_page)
+		|| saved->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT)
+		return false;
+	item = PageGetItemId(live_page, saved->offset);
+	if (!ItemIdIsNormal(item) || ItemIdGetOffset(item) != saved->tuple_offset
+		|| ItemIdGetLength(item) != saved->tuple_length)
+		return false;
+	tuple = (HeapTupleHeader) PageGetItem(live_page, item);
+	if (HeapTupleHeaderGetRawXmin(tuple) != saved->raw_xmin
+		|| HeapTupleHeaderGetRawXmax(tuple) != saved->raw_xmax
+		|| ItemPointerGetBlockNumberNoCheck(&tuple->t_ctid)
+			!= ItemPointerGetBlockNumberNoCheck(&saved->ctid)
+		|| ItemPointerGetOffsetNumberNoCheck(&tuple->t_ctid)
+			!= ItemPointerGetOffsetNumberNoCheck(&saved->ctid)
+		|| tuple->t_infomask != saved->infomask
+		|| tuple->t_infomask2 != saved->infomask2
+		|| tuple->t_hoff != saved->header_length
+		|| tuple->t_itl_slot_idx != saved->itl_slot_index
+		|| memcmp(ClusterPageGetItlSlot(live_page, saved->itl_slot_index),
+			&saved->carrier, sizeof(saved->carrier)) != 0)
+		return false;
+
+	/* Final synchronous fence.  No current fetch or proof request is allowed. */
+	if (!admission->entered
+		|| admission->record_generation != fence->admission_generation
+		|| authority_before->transition_count != fence->holder_sequence
+		|| !cluster_bufmgr_terminal_stamp_authority(buffer, &tag,
+			&own_generation, &acquisition_epoch, &pcm_state)
+		|| own_generation == 0 || acquisition_epoch == 0
+		|| pcm_state != (uint8) PCM_STATE_X
+		|| !cluster_pcm_lock_r4_route_snapshot(tag, &authority_now,
+			&master_sequence, &page_version)
+		|| authority_now.transition_count != fence->holder_sequence
+		|| master_sequence != fence->master_sequence
+		|| !cluster_pcm_lock_authority_matches(tag, authority_before)
+		|| !cluster_semantic_activation_recheck_r4_terminal_census(admission))
+		return false;
+
+	/* Native redo and the existing SPACE version edge remain the only format. */
+	heap_freeze_apply_prepared(rel, buffer,
+		XidFromFullTransactionId(original_creator_full_xid), &plan, 1,
+		&fence->identity);
+	XLogFlush(PageGetLSN(live_page));
+	return true;
+}
+#endif
 
 /*
  * heap_freeze_execute_prepared
