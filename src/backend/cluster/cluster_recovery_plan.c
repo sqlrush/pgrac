@@ -654,6 +654,7 @@ cluster_recovery_checkpoint_current_v1(const struct ClusterRecoveryCheckpointSco
 		|| !cluster_enabled || !cluster_shared_config || CritSectionCount != 0
 		|| ShutdownRequestPending || RecoveryInProgress() || cluster_recovery_plan_shmem == NULL
 		|| scope->owner.owner_boot == 0
+		|| scope->owner.writer.ref.claim.identity.system_identifier != GetSystemIdentifier()
 		|| cluster_qvotec_get_self_incarnation() != scope->owner.owner_boot
 		|| cluster_epoch_get_current() != scope->owner.writer.epoch
 		|| !cluster_wal_thread_current_v2_ref(&current)

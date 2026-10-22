@@ -1144,7 +1144,7 @@ UT_TEST(test_original_start_publishes_only_a_checkpointer_opaque_stable_read)
 }
 UT_TEST(test_checkpoint_read_rejects_current_writer_epoch_boot_role_and_resource_drift)
 {
-	for (int fault = 0; fault < 16; fault++) {
+	for (int fault = 0; fault < 17; fault++) {
 		struct ClusterRecoveryCheckpointScopeV1 *scope = NULL;
 		ClusterWalWriterToken writer;
 		reset(); retain(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
@@ -1166,6 +1166,7 @@ UT_TEST(test_checkpoint_read_rejects_current_writer_epoch_boot_role_and_resource
 		case 13: window_region.checkpoint_owner.owner.operation_uuid[0]++; break;
 		case 14: window_region.checkpoint_owner.owner.install_generation++; break;
 		case 15: window_region.checkpoint_owner.valid = false; break;
+		case 16: scope->owner.writer.ref.claim.identity.system_identifier++; break;
 		}
 		memset(&writer, 0xa5, sizeof(writer));
 		UT_ASSERT(!cluster_recovery_checkpoint_current_v1(scope, &writer));
