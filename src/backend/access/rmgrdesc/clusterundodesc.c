@@ -31,8 +31,51 @@
 #include "postgres.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_recovery_ctrc_record.h"
 #include "cluster/cluster_recovery_tt_record.h"
 #include "cluster/storage/cluster_undo_xlog.h"
+
+
+static void
+cluster_recovery_ctrc_desc(StringInfo buf, const uint8 *payload, size_t length)
+{
+	/* Diagnostic layout only: pg_waldump has no ROOT-selected system identity
+	 * for the codec's hash validation. Replay still requires the original codec,
+	 * graph and owner checks. Never read a scalar before bounding the payload. */
+	if (payload == NULL || length != CLUSTER_RECOVERY_CTRC_BYTES
+		|| cluster_undo_tt_ctrc_get_u16_le(payload) != CLUSTER_RECOVERY_CTRC_VERSION
+		|| cluster_undo_tt_ctrc_get_u16_le(payload + 2) != CLUSTER_RECOVERY_CTRC_BYTES)
+	{
+		appendStringInfo(buf, "malformed recovery CTRC release payload");
+		return;
+	}
+	appendStringInfo(buf,
+		"v2 flags 0x%08x root " UINT64_FORMAT " root generation " UINT64_FORMAT
+		" formation " UINT64_FORMAT " serial " UINT64_FORMAT
+		" database incarnation " UINT64_FORMAT " writer boot " UINT64_FORMAT
+		" history " UINT64_FORMAT " highest FPI end " UINT64_FORMAT " cohort " UINT64_FORMAT
+		" origin %u writer thread %u target owner %u segment %u generation %u"
+		" slot %u wrap %u xid %u terminal %u",
+		(unsigned) cluster_undo_tt_ctrc_get_u32_le(payload + 4),
+		cluster_undo_tt_ctrc_get_u64_le(payload + 8),
+		cluster_undo_tt_ctrc_get_u64_le(payload + 16),
+		cluster_undo_tt_ctrc_get_u64_le(payload + 24),
+		cluster_undo_tt_ctrc_get_u64_le(payload + 32),
+		cluster_undo_tt_ctrc_get_u64_le(payload + 40),
+		cluster_undo_tt_ctrc_get_u64_le(payload + 48),
+		cluster_undo_tt_ctrc_get_u64_le(payload + 72),
+		cluster_undo_tt_ctrc_get_u64_le(payload + 80),
+		cluster_undo_tt_ctrc_get_u64_le(payload + 88),
+		(unsigned) cluster_undo_tt_ctrc_get_u16_le(payload + 96),
+		(unsigned) cluster_undo_tt_ctrc_get_u16_le(payload + 98),
+		(unsigned) cluster_undo_tt_ctrc_get_u16_le(payload + 100),
+		(unsigned) cluster_undo_tt_ctrc_get_u32_le(payload + 108),
+		(unsigned) cluster_undo_tt_ctrc_get_u32_le(payload + 112),
+		(unsigned) cluster_undo_tt_ctrc_get_u16_le(payload + 102),
+		(unsigned) cluster_undo_tt_ctrc_get_u16_le(payload + 104),
+		(unsigned) cluster_undo_tt_ctrc_get_u32_le(payload + 116),
+		(unsigned) payload[106]);
+}
 
 
 void
@@ -117,6 +160,9 @@ cluster_undo_desc(StringInfo buf, XLogReaderState *record)
 				(unsigned)rec.exact.slot_offset, (unsigned)rec.exact.wrap);
 		break;
 	}
+	case CLUSTER_RECOVERY_CTRC_WAL_INFO:
+		cluster_recovery_ctrc_desc(buf, (const uint8 *)payload, XLogRecGetDataLen(record));
+		break;
 	case XLOG_UNDO_SEGMENT_RECYCLE: {
 		xl_undo_segment_recycle *xlrec = (xl_undo_segment_recycle *)payload;
 
@@ -205,6 +251,8 @@ cluster_undo_identify(uint8 info)
 		return "UNDO_TT_SLOT_ABORT";
 	case XLOG_UNDO_RECOVERY_TT_ABORT:
 		return "UNDO_RECOVERY_TT_ABORT";
+	case CLUSTER_RECOVERY_CTRC_WAL_INFO:
+		return "UNDO_RECOVERY_CTRC_RELEASE";
 	case XLOG_UNDO_SEGMENT_RECYCLE:
 		return "UNDO_SEGMENT_RECYCLE";
 	case XLOG_UNDO_SEGMENT_REUSE:

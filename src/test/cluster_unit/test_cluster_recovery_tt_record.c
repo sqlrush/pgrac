@@ -2,6 +2,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_recovery_tt_record.h"
+#include "cluster/cluster_recovery_ctrc_record.h"
 #include "cluster/cluster_uba.h"
 
 #include <stdarg.h>
@@ -33,6 +34,30 @@ static const uint8 golden[152]
 		0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x40, 0x00, 0x09, 0x00,
 		0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x00, 0x00,
 		0x03, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00 };
+
+/* Independent canonical D0 bytes shared with the codec golden fixture. */
+static const uint8 d0_golden[320] = {
+	0x02, 0x00, 0x40, 0x01, 0x01, 0x00, 0x00, 0x00, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+	0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x24, 0x23, 0x22, 0x21, 0x00, 0x00, 0x00, 0x00,
+	0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31, 0x48, 0x47, 0x46, 0x45, 0x44, 0x43, 0x42, 0x41,
+	0x58, 0x57, 0x56, 0x55, 0x54, 0x53, 0x52, 0x51, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68, 0x67, 0x66, 0x65, 0x64, 0x63, 0x62, 0x61,
+	0x78, 0x77, 0x76, 0x75, 0x74, 0x73, 0x72, 0x71, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x01, 0x00, 0x03, 0x00, 0x02, 0x00, 0x05, 0x00, 0x09, 0x00, 0x02, 0x00, 0x01, 0x01, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x02, 0x01, 0x40, 0x00, 0x09, 0x00, 0x02, 0x00, 0x88, 0x87, 0x86, 0x85, 0x84, 0x83, 0x82, 0x81,
+	0x02, 0x01, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+	0x02, 0x01, 0x40, 0x00, 0x09, 0x00, 0x02, 0x01, 0x88, 0x87, 0x86, 0x85, 0x84, 0x83, 0x82, 0x81,
+	0x02, 0x01, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+	0xc1, 0xc5, 0xc9, 0x76, 0x3d, 0xa1, 0x72, 0x5b, 0x44, 0xc5, 0xdc, 0x07, 0xfb, 0x67, 0x4b, 0x77,
+	0x99, 0xf7, 0x3b, 0x30, 0x47, 0x84, 0xf4, 0x8e, 0x14, 0xae, 0x26, 0x7e, 0x4a, 0x02, 0xb0, 0x8b,
+	0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+	0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+	0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30,
+	0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40,
+	0x0d, 0x3a, 0x13, 0x1b, 0x78, 0x61, 0x18, 0x76, 0xbf, 0xf3, 0xae, 0xdc, 0x17, 0xeb, 0x44, 0x96,
+	0x44, 0x86, 0x18, 0x7e, 0x83, 0xe8, 0xe0, 0x22, 0xe3, 0xb6, 0xa0, 0xe0, 0xde, 0x8d, 0xab, 0xcc
+};
 
 static bool
 all_zero(const void *ptr, size_t length)
@@ -472,10 +497,121 @@ UT_TEST(real_wal_descriptor)
 	UT_ASSERT(strcmp(cluster_undo_identify(XLOG_UNDO_TT_SLOT_ABORT), "UNDO_TT_SLOT_ABORT") == 0);
 }
 
+static void
+describe_d0(const uint8 *payload, size_t length, char *text, size_t capacity)
+{
+	XLogReaderState reader = { 0 };
+	DecodedXLogRecord record = { 0 };
+	StringInfoData buf = { .data = text, .maxlen = capacity };
+
+	record.header.xl_info = CLUSTER_RECOVERY_CTRC_WAL_INFO | XLR_INFO_MASK;
+	record.main_data = (char *)payload;
+	record.main_data_len = length;
+	reader.record = &record;
+	cluster_undo_desc(&buf, &reader);
+}
+
+UT_TEST(d0_opcode_identity)
+{
+	for (unsigned bits = 0; bits <= XLR_INFO_MASK; bits++) {
+		const char *name = cluster_undo_identify(CLUSTER_RECOVERY_CTRC_WAL_INFO | bits);
+		UT_ASSERT(name != NULL);
+		if (name != NULL)
+			UT_ASSERT(strcmp(name, "UNDO_RECOVERY_CTRC_RELEASE") == 0);
+	}
+	UT_ASSERT(strcmp(cluster_undo_identify(XLOG_UNDO_TT_SLOT_CTRC_RELEASE),
+					 "UNDO_TT_SLOT_CTRC_RELEASE") == 0);
+	UT_ASSERT(strcmp(cluster_undo_identify(XLOG_UNDO_RECOVERY_TT_ABORT),
+					 "UNDO_RECOVERY_TT_ABORT") == 0);
+	UT_ASSERT(cluster_undo_identify(0xe0) == NULL);
+}
+
+UT_TEST(d0_golden_description)
+{
+	uint8 payload[sizeof(d0_golden)];
+	char text[1024];
+
+	memcpy(payload, d0_golden, sizeof(payload));
+	describe_d0(payload, sizeof(payload), text, sizeof(text));
+	UT_ASSERT(strcmp(text,
+		"v2 flags 0x00000001 root 72623859790382856 root generation 1230066625199609624"
+		" formation 555885348 serial 3544952156018063160"
+		" database incarnation 4702394921427289928 writer boot 5859837686836516696"
+		" history 7017280452245743464 highest FPI end 8174723217654970232 cohort 5"
+		" origin 1 writer thread 3 target owner 2 segment 257 generation 0"
+		" slot 5 wrap 9 xid 4194562 terminal 2") == 0);
+	UT_ASSERT(memcmp(payload, d0_golden, sizeof(payload)) == 0);
+}
+
+UT_TEST(d0_descriptor_exact_bounds)
+{
+	char text[1024];
+	uint8 oversized[sizeof(d0_golden) + 1];
+
+	memcpy(oversized, d0_golden, sizeof(d0_golden));
+	oversized[sizeof(d0_golden)] = 0xa5;
+	for (size_t length = 0; length < sizeof(d0_golden); length++) {
+		describe_d0(d0_golden, length, text, sizeof(text));
+		UT_ASSERT(strstr(text, "malformed recovery CTRC release payload") != NULL);
+	}
+	describe_d0(oversized, sizeof(oversized), text, sizeof(text));
+	UT_ASSERT(strstr(text, "malformed recovery CTRC release payload") != NULL);
+	describe_d0(NULL, sizeof(d0_golden), text, sizeof(text));
+	UT_ASSERT(strstr(text, "malformed recovery CTRC release payload") != NULL);
+}
+
+UT_TEST(d0_descriptor_version_and_declared_length)
+{
+	uint8 payload[sizeof(d0_golden)];
+	char text[1024];
+
+	for (size_t offset = 0; offset < 4; offset++) {
+		memcpy(payload, d0_golden, sizeof(payload));
+		payload[offset] ^= 0x80;
+		describe_d0(payload, sizeof(payload), text, sizeof(text));
+		UT_ASSERT(strstr(text, "malformed recovery CTRC release payload") != NULL);
+	}
+}
+
+UT_TEST(d0_descriptor_unaligned_full_width)
+{
+	uint8 unaligned[sizeof(d0_golden) + 1];
+	uint8 *payload = unaligned + 1;
+	char text[1024];
+
+	memcpy(payload, d0_golden, sizeof(d0_golden));
+	memset(payload + 4, 0xff, 12); /* flags and root */
+	memset(payload + 96, 0xff, 11); /* five u16 fields and terminal */
+	memset(payload + 108, 0xff, 12); /* segment, generation and xid */
+	describe_d0(payload, sizeof(d0_golden), text, sizeof(text));
+	UT_ASSERT(strstr(text, "flags 0xffffffff root 18446744073709551615") != NULL);
+	UT_ASSERT(strstr(text, "origin 65535 writer thread 65535 target owner 65535") != NULL);
+	UT_ASSERT(strstr(text, "segment 4294967295 generation 4294967295") != NULL);
+	UT_ASSERT(strstr(text, "slot 65535 wrap 65535 xid 4294967295 terminal 255") != NULL);
+}
+
+UT_TEST(d0_diagnostic_layout_is_not_qualification)
+{
+	/* Reserved bytes, images and hashes are validated by the replay codec,
+	 * whose ROOT-selected system identity is unavailable to this descriptor. */
+	static const size_t offsets[] = { 56, 64, 107, 120, 128, 160, 192, 224, 256, 288 };
+	uint8 payload[sizeof(d0_golden)];
+	char text[1024], original[1024];
+
+	describe_d0(d0_golden, sizeof(d0_golden), original, sizeof(original));
+	UT_ASSERT(strstr(original, "v2 flags") != NULL);
+	for (size_t i = 0; i < lengthof(offsets); i++) {
+		memcpy(payload, d0_golden, sizeof(payload));
+		payload[offsets[i]] ^= 0x80;
+		describe_d0(payload, sizeof(payload), text, sizeof(text));
+		UT_ASSERT(strcmp(text, original) == 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(20);
 	UT_RUN(golden_encoding);
 	UT_RUN(golden_decoding_unaligned);
 	UT_RUN(exact_lengths_and_null);
@@ -490,6 +626,12 @@ main(void)
 	UT_RUN(result_preserves_every_other_byte);
 	UT_RUN(conflict_never_overwrites_or_skips);
 	UT_RUN(real_wal_descriptor);
+	UT_RUN(d0_opcode_identity);
+	UT_RUN(d0_golden_description);
+	UT_RUN(d0_descriptor_exact_bounds);
+	UT_RUN(d0_descriptor_version_and_declared_length);
+	UT_RUN(d0_descriptor_unaligned_full_width);
+	UT_RUN(d0_diagnostic_layout_is_not_qualification);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

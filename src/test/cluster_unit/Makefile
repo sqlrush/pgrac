@@ -7550,12 +7550,14 @@ test_cluster_r4_d10_multi_source: test_cluster_r4_d10_multi_source.c unit_test.h
 
 # Original rmgr descriptor plus the bounded recovery payload codec.
 test_cluster_recovery_tt_desc.o: $(top_srcdir)/src/backend/access/rmgrdesc/clusterundodesc.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_tt_record.h \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 test_cluster_recovery_tt_record: test_cluster_recovery_tt_record.c unit_test.h \
 		test_cluster_recovery_tt_desc.o \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_tt_record.h \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_recovery_tt_desc.o \

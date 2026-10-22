@@ -17,7 +17,7 @@
 #define CLUSTER_RECOVERY_CTRC_VERSION UINT16_C(2)
 #define CLUSTER_RECOVERY_CTRC_BYTES 320
 #define CLUSTER_RECOVERY_CTRC_RELEASE_PROVEN UINT32_C(1)
-/* Frozen encoding only; no resource-manager registration or live dispatch. */
+/* Frozen D0 opcode; live redo dispatch remains disabled. */
 #define CLUSTER_RECOVERY_CTRC_WAL_INFO UINT8_C(0xD0)
 
 /* Logical fields, never an on-disk struct. Reserved bytes and the payload/
