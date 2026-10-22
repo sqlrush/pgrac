@@ -9317,6 +9317,20 @@ v3_driver_restart(const ControlRootImage *root, unsigned node)
 	return ref;
 }
 
+static ClusterWalSourceRef
+v3_recovered_driver_restart(const ControlRootImage *root, unsigned node)
+{
+	ClusterWalSourceRef ref = v3_driver_restart(root, node);
+
+	/* The recovered reservation advances the accepted formation cut after the
+	 * clean fixture's exit cut was captured.  Restart identity still comes
+	 * from the published ROOT record, while local owner checks must use that
+	 * newer admitted incarnation. */
+	test_self_incarnation = test_membership_incarnation
+		= test_reserve_formation.membership.last_admitted_incarnation[node];
+	return ref;
+}
+
 
 /* The existing target/BEGIN consumers must preserve each selected input kind.
  * Native mutation and the later recovery service gate remain separate. */
@@ -9556,6 +9570,38 @@ UT_TEST(test_v3_native_driver_prepares_sparse_targets_then_returns_initializing)
 	UT_ASSERT_EQ(observed.phase, CLUSTER_WAL_STARTUP_INITIALIZING);
 	UT_ASSERT_EQ(test_actual_cf, NoLock);
 	cluster_node_id = 0;
+	test_reserve_mode = false;
+}
+
+UT_TEST(test_v3_native_driver_advances_recovered_cohort_without_losing_kinds)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	ClusterControlRootFileToken token;
+	ClusterWalStartupImage ops[2], observed;
+	ClusterWalSourceRef restart;
+	v3_recovered_begin_fixture(before, &root, &token, ops, false);
+	if (ut_current_failed)
+		return;
+	/* A follower may prepare its target, but only the coordinator may publish
+	 * the mixed RECOVERED/CLEAN cohort as INITIALIZING. */
+	restart = v3_recovered_driver_restart(&root, 3);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed),
+					 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+	restart = v3_recovered_driver_restart(&root, 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed),
+					 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+	/* The next observation must expose each original input kind unchanged. */
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed), 0);
+	UT_ASSERT_EQ(observed.phase, CLUSTER_WAL_STARTUP_INITIALIZING);
+	UT_ASSERT_EQ(observed.input_kind, CLUSTER_WAL_STARTUP_RECOVERED);
+	restart = v3_recovered_driver_restart(&root, 3);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed), 0);
+	UT_ASSERT_EQ(observed.phase, CLUSTER_WAL_STARTUP_INITIALIZING);
+	UT_ASSERT_EQ(observed.input_kind, CLUSTER_WAL_STARTUP_CLEAN);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
 	test_reserve_mode = false;
 }
 
@@ -24733,13 +24779,14 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 	if (getenv("PGRAC_PRE2_TEST_RECOVERED_BEGIN") != NULL) {
-		UT_PLAN(7);
+		UT_PLAN(8);
 		UT_RUN(test_recovered_begin_mixed_inputs_keep_their_original_kinds);
 		UT_RUN(test_recovered_begin_all_complete_inputs_are_not_clean_exit);
 		UT_RUN(test_recovered_begin_requires_every_actual_empty_target);
 		UT_RUN(test_recovered_begin_rejects_an_independently_rebound_peer);
 		UT_RUN(test_recovered_begin_retains_original_owner_and_fence_guards);
 		UT_RUN(test_v3_native_driver_prepares_sparse_targets_then_returns_initializing);
+		UT_RUN(test_v3_native_driver_advances_recovered_cohort_without_losing_kinds);
 		UT_RUN(test_v3_begin_requires_all_declared_empty_targets_before_native_mutation);
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
@@ -25097,6 +25144,7 @@ main(int argc, char **argv)
 	UT_RUN(test_v3_reserve_clean_publishes_all_sparse_targets_without_serving);
 	UT_RUN(test_v3_target_creates_only_exact_empty_successor);
 	UT_RUN(test_v3_native_driver_prepares_sparse_targets_then_returns_initializing);
+	UT_RUN(test_v3_native_driver_advances_recovered_cohort_without_losing_kinds);
 	UT_RUN(test_v3_native_driver_rejects_foreign_input_and_owner_without_mutation);
 	UT_RUN(test_v3_native_driver_reserves_closed_cohort_only_on_coordinator);
 	UT_RUN(test_v3_native_driver_missing_selected_or_partial_namespace_is_not_wait);
