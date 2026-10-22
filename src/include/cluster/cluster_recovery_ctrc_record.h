@@ -146,6 +146,38 @@ extern bool cluster_recovery_ctrc_wal_references_v2(const XLogReaderState *reade
 													const uint8 *raw_record, size_t raw_length,
 													ClusterRecoveryCTRCWalReferencesV2 *out);
 
+/* Original fixed native BIND payload xid only, not all WAL transaction fields.
+ * The accepted short-data record is 32-byte header + 2-byte frame + 24 bytes. */
+#define CLUSTER_RECOVERY_CTRC_BIND_RAW_BYTES 58
+#define CLUSTER_RECOVERY_CTRC_BIND_ATOM_BYTES (74 + CLUSTER_RECOVERY_CTRC_BIND_RAW_BYTES)
+#define CLUSTER_RECOVERY_CTRC_BIND_EVIDENCE_BYTES (16 + CLUSTER_RECOVERY_CTRC_BIND_ATOM_BYTES)
+typedef struct ClusterRecoveryCTRCBindReferenceV2 {
+	uint8 key[CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_KEY_BYTES];
+	uint8 evidence[CLUSTER_RECOVERY_CTRC_BIND_EVIDENCE_BYTES];
+} ClusterRecoveryCTRCBindReferenceV2;
+
+/* Read-only BIND field extraction through the original native decoder and
+ * historical field inspection, completed selected-thread reader, exact raw
+ * header/frame/payload and full CRC/source hash. database_incarnation is the
+ * original ROOT-selected incarnation; BIND itself does not carry it. Only the
+ * original fixed short-data shape is accepted, with no extra frames. The
+ * header xid is retained in raw evidence but is NOT inventoried by this API.
+ *
+ * This supplies one kind1 key and singleton atom1 evidence, not qualified
+ * base/floor/last-issued/terminal, a complete graph or release authorization.
+ * Source/cut/component/owner authority, retention pins and final ROOT checks
+ * remain original caller prerequisites. No I/O, mutation or live dispatch.
+ *
+ * All inputs are consumed before publishing *out; refusal clears *out.
+ * Unaligned raw/output and raw/source output aliases are allowed. Output must
+ * not overlap reader-owned storage. The original decoder's non-const reader
+ * parameter is retained; this call does not change the reader. */
+extern bool cluster_recovery_ctrc_bind_reference_v2(XLogReaderState *reader,
+												 uint64 database_incarnation, uint32 source_index,
+												 const uint8 source_identity_digest[32],
+												 const uint8 *raw_record, size_t raw_length,
+												 ClusterRecoveryCTRCBindReferenceV2 *out);
+
 typedef enum ClusterRecoveryCTRCTargetMatchV2 {
 	CLUSTER_RECOVERY_CTRC_TARGET_REFUSED = 0,
 	CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_BEFORE,

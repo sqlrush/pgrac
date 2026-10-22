@@ -7577,6 +7577,7 @@ test_cluster_recovery_ctrc_record_product.o: $(top_srcdir)/src/backend/cluster/c
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
 		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
 		$(top_srcdir)/src/include/cluster/cluster_uba.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
 		$(top_srcdir)/src/include/common/cryptohash.h \
 		$(top_srcdir)/src/include/utils/memutils.h \
 		$(top_srcdir)/src/include/utils/palloc.h
@@ -7590,11 +7591,21 @@ test_cluster_recovery_ctrc_header.o: $(top_srcdir)/src/common/cluster_undo_segme
 		$(top_srcdir)/src/include/storage/checksum_impl.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
+# Link the original read-only BIND decoder without the TT transition fixture.
+test_cluster_recovery_ctrc_bind_decoder.o: $(top_srcdir)/src/backend/cluster/cluster_side_undo.c \
+		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_route.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
 test_cluster_recovery_ctrc_record: test_cluster_recovery_ctrc_record.c unit_test.h \
 		test_cluster_recovery_ctrc_record_product.o test_cluster_recovery_ctrc_header.o \
-		xlogreader_fs.o $(top_builddir)/src/common/libpgcommon.a \
+		xlogreader_fs.o test_cluster_recovery_ctrc_bind_decoder.o \
+		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
+		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
 		$(top_srcdir)/src/include/access/xlogrecord.h \
 		$(top_srcdir)/src/include/access/xlogreader.h \
 		$(top_srcdir)/src/include/access/xlog_internal.h \
@@ -7603,7 +7614,9 @@ test_cluster_recovery_ctrc_record: test_cluster_recovery_ctrc_record.c unit_test
 		$(top_srcdir)/src/include/utils/memutils.h \
 		$(top_srcdir)/src/include/utils/palloc.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_recovery_ctrc_record_product.o \
-		test_cluster_recovery_ctrc_header.o xlogreader_fs.o $(LDFLAGS) \
+		test_cluster_recovery_ctrc_header.o xlogreader_fs.o \
+		test_cluster_recovery_ctrc_bind_decoder.o $(CLUSTER_SIDE_ROUTE_O) \
+		$(CLUSTER_RF_ROUTE_O) $(LDFLAGS) \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
