@@ -37,6 +37,7 @@
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_recovery_plan.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_stats.h"
 #include "cluster/cluster_wal_retention.h"
@@ -24881,9 +24882,10 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_SERVING") != NULL) {
-		UT_PLAN(16);
+		UT_PLAN(17);
 		UT_RUN(test_serving_local_advanced_checkpoint_requires_original_recovered_owner);
 		UT_RUN(test_serving_advanced_checkpoint_cannot_borrow_missing_foreign_or_wrong_local_owner);
+		UT_RUN(test_serving_recovered_state_requires_owner_observation);
 		UT_RUN(test_serving_recovery_owner_drift_across_root_io_never_publishes_open);
 		UT_RUN(test_serving_clean_restart_keeps_old_open_with_current_epoch);
 		UT_RUN(test_serving_current_epoch_is_required_before_any_publication);

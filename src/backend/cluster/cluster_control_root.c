@@ -4901,6 +4901,9 @@ serving_recovery_owner_current(const ServingCut *cut)
 {
 	ClusterRecoveryCheckpointObservationV1 observed;
 
+	if (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& (cut == NULL || !cut->recovery_owner_valid))
+		return false;
 	return !cut->recovery_owner_valid
 		|| (cluster_recovery_checkpoint_observe_v1(&observed)
 			&& memcmp(&observed, &cut->recovery_owner, sizeof(observed)) == 0);

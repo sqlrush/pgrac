@@ -12,6 +12,13 @@ static void (*serving_match_hook)(void);
 static bool serving_recovery_observed;
 static ClusterRecoveryCheckpointObservationV1 serving_recovery_owner;
 static unsigned serving_recovery_reads, serving_recovery_change_at, serving_recovery_fault;
+static ClusterNormalStartState serving_normal_start_state = CLUSTER_NORMAL_START_UNCLASSIFIED;
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return serving_normal_start_state;
+}
 
 /* Only this shared-owner leaf is doubled here. The original owner's shared
  * publication, role/currentness and withdrawal are covered by cold_tx_start. */
@@ -84,6 +91,7 @@ serving_fixture_installed(uint8 before[66048], ControlRootImage *root, bool all)
 	serving_recovery_observed = false;
 	memset(&serving_recovery_owner, 0, sizeof(serving_recovery_owner));
 	serving_recovery_reads = serving_recovery_change_at = serving_recovery_fault = 0;
+	serving_normal_start_state = CLUSTER_NORMAL_START_UNCLASSIFIED;
 
 	first_start_fixture(before, root);
 	if (ut_current_failed)
@@ -246,6 +254,23 @@ UT_TEST(test_serving_advanced_checkpoint_cannot_borrow_missing_foreign_or_wrong_
 		UT_ASSERT(v2_zero(&token, sizeof(token)));
 		v2_assert_primary_unchanged(before);
 	}
+}
+
+UT_TEST(test_serving_recovered_state_requires_owner_observation)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	ClusterControlRootFileToken token;
+	serving_recovery_fixture(before, &root, CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED);
+	if (ut_current_failed)
+		return;
+	serving_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	serving_recovery_observed = false;
+	UT_ASSERT(cluster_control_root_v3_serving_poll(&serving_open, serving_descriptor, &token)
+			  != 0);
+	UT_ASSERT(v2_zero(&token, sizeof(token)));
+	v2_assert_primary_unchanged(before);
+	serving_normal_start_state = CLUSTER_NORMAL_START_UNCLASSIFIED;
 }
 
 UT_TEST(test_serving_recovery_owner_drift_across_root_io_never_publishes_open)
