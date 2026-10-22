@@ -680,6 +680,7 @@ struct ClusterRecoveryStartV1 {
 	uint64 owner_boot;
 	uint64 generation;
 	uint64 serial;
+	uint64 install_generation;
 	ClusterWalWriterToken writer;
 	uint8 operation_uuid[16];
 	bool revoked;
@@ -712,7 +713,10 @@ cluster_recovery_cold_resource_release(ResourceReleasePhase phase, bool isCommit
 	(void)arg;
 	if (phase == RESOURCE_RELEASE_BEFORE_LOCKS && cluster_recovery_cold_start != NULL
 		&& cluster_recovery_cold_start->owner == CurrentResourceOwner)
+	{
+		cluster_recovery_checkpoint_revoke_v1(cluster_recovery_cold_start);
 		cluster_recovery_cold_start->revoked = true;
+	}
 }
 
 static void
@@ -721,6 +725,7 @@ cluster_recovery_cold_inputs_cleanup(int code, Datum arg)
 	(void)code;
 	(void)arg;
 	if (cluster_recovery_cold_start != NULL) {
+		cluster_recovery_checkpoint_revoke_v1(cluster_recovery_cold_start);
 		cluster_recovery_cold_start->revoked = true;
 		pfree(cluster_recovery_cold_start);
 		cluster_recovery_cold_start = NULL;
@@ -754,6 +759,7 @@ ClusterColdRecoveryTxCurrent(const struct ClusterRecoveryStartV1 *start)
 {
 	ClusterWalWriterToken writer;
 	uint8 operation_uuid[16];
+	uint64 install_generation;
 
 	/* Compare the opaque pointer before any dereference, including stale ones. */
 	if (start == NULL || start != cluster_recovery_cold_start || start->revoked
@@ -764,10 +770,28 @@ ClusterColdRecoveryTxCurrent(const struct ClusterRecoveryStartV1 *start)
 		|| start->inputs->inputs != NULL || start->inputs->plan == NULL
 		|| start->census != start->inputs->top_tx_census || start->census == NULL
 		|| start->census->plan != start->inputs->plan
-		|| !ClusterStartupInstalledWriterV1(&writer, operation_uuid))
+		|| !ClusterStartupInstalledRecoveryWriterV1(&writer, operation_uuid, &install_generation))
 		return false;
-	return cluster_recovery_cold_writer_same(&start->writer, &writer)
+	return start->install_generation == install_generation
+		&& cluster_recovery_cold_writer_same(&start->writer, &writer)
 		&& memcmp(start->operation_uuid, operation_uuid, 16) == 0;
+}
+
+bool
+ClusterColdRecoveryTxCheckpointOwnerV1(const struct ClusterRecoveryStartV1 *start,
+	ClusterRecoveryCheckpointOwnerV1 *out)
+{
+	if (out != NULL) memset(out, 0, sizeof(*out));
+	if (out == NULL || !ClusterColdRecoveryTxCurrent(start))
+		return false;
+	out->writer = start->writer;
+	memcpy(out->operation_uuid, start->operation_uuid, 16);
+	out->install_generation = start->install_generation;
+	out->start_generation = start->generation;
+	out->start_serial = start->serial;
+	out->owner_boot = start->owner_boot;
+	out->owner_pid = start->pid;
+	return true;
 }
 
 const struct ClusterColdTypedV1 *
@@ -964,7 +988,7 @@ ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 	struct ClusterRecoveryStartV1 *start;
 	ClusterWalWriterToken writer;
 	uint8 operation_uuid[16];
-	uint64 owner_boot;
+	uint64 owner_boot, install_generation;
 
 	if (info == NULL)
 		return false;
@@ -981,7 +1005,7 @@ ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 		|| cluster_recovery_cold_inputs->top_tx_census->plan != cluster_recovery_cold_inputs->plan
 		|| CurrentResourceOwner == NULL || MyProcPid <= 0
 		|| cluster_recovery_cold_generation == PG_UINT64_MAX
-		|| !ClusterStartupInstalledWriterV1(&writer, operation_uuid))
+		|| !ClusterStartupInstalledRecoveryWriterV1(&writer, operation_uuid, &install_generation))
 		return false;
 	owner_boot = cluster_qvotec_get_self_incarnation();
 	if (owner_boot == 0 || owner_boot != writer.ref.claim.identity.origin_owner_incarnation)
@@ -1001,10 +1025,12 @@ ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 	start->owner_boot = owner_boot;
 	start->generation = ++cluster_recovery_cold_generation;
 	start->serial = 1;
+	start->install_generation = install_generation;
 	start->writer = writer;
 	memcpy(start->operation_uuid, operation_uuid, 16);
 	cluster_recovery_cold_start = start;
-	if (!ClusterColdRecoveryTxCurrent(start)) {
+	if (!ClusterColdRecoveryTxCurrent(start)
+		|| !cluster_recovery_checkpoint_register_v1(start)) {
 		cluster_recovery_cold_start = NULL;
 		pfree(start);
 		return false;

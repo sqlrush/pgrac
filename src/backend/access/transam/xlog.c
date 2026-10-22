@@ -6659,6 +6659,24 @@ ClusterStartupInstalledWriterV1(ClusterWalWriterToken *writer, uint8 operation_u
 	return true;
 }
 
+/* Keep INSTALL generation and input kind at their original native owner.
+ * A CLEAN/creation writer cannot authorize recovery-online checkpoint input. */
+bool
+ClusterStartupInstalledRecoveryWriterV1(ClusterWalWriterToken *writer,
+	uint8 operation_uuid[16], uint64 *install_generation)
+{
+	if (writer != NULL) memset(writer, 0, sizeof(*writer));
+	if (operation_uuid != NULL) memset(operation_uuid, 0, 16);
+	if (install_generation != NULL) *install_generation = 0;
+	if (writer == NULL || operation_uuid == NULL || install_generation == NULL
+		|| clusterStartupWriter.input_kind != CLUSTER_WAL_STARTUP_RECOVERED
+		|| clusterStartupWriter.generation == 0
+		|| !ClusterStartupInstalledWriterV1(writer, operation_uuid))
+		return false;
+	*install_generation = clusterStartupWriter.generation;
+	return true;
+}
+
 /* Execute only the confirmed C0 candidate under the original source/target
  * reservations and held FD. Every fallible preparation and ROOT check has
  * finished before PRE_INSERT. The window itself uses local identity checks,

@@ -144,6 +144,11 @@ extern void ShutdownWalRecovery(void);
 extern void ClusterReleaseColdRecoveryInputs(EndOfWalRecoveryInfo *info);
 extern bool ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info);
 extern bool ClusterColdRecoveryTxCurrent(const struct ClusterRecoveryStartV1 *start);
+struct ClusterRecoveryCheckpointOwnerV1;
+/* Original recovered INSTALL only; ordinary CLEAN/first creation cannot
+ * provide this checkpoint input. The output clears on refusal. */
+extern bool ClusterColdRecoveryTxCheckpointOwnerV1(const struct ClusterRecoveryStartV1 *start,
+	struct ClusterRecoveryCheckpointOwnerV1 *out);
 struct ClusterColdTopTxCensusEntryV1;
 /* Original ACTIVE census subject only; not a loser proof or I/O grant. */
 extern bool ClusterColdRecoveryTxSubjectCurrent(

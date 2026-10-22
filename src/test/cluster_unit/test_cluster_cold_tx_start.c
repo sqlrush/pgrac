@@ -64,7 +64,8 @@ static bool projection_ok;
 static bool stamp_prepare_ok, stamp_close_ok, stamp_live, invalidate_writer_on_prepare;
 static ClusterRecoveryTTAbortV1 prepared_record;
 static uint64 owner_boot;
-static ResourceReleaseCallback release_callback;
+static ResourceReleaseCallback release_callback, checkpoint_release_callback;
+static uint64 checkpoint_epoch;
 static unsigned callback_registrations, input_destroys, allocations, frees;
 static pg_on_exit_callback exit_callback;
 static jmp_buf fatal_jump;
@@ -111,6 +112,15 @@ static void capture_pending(ClusterRecoveryStampCaptureV1 *cut)
 }
 
 bool RecoveryInProgress(void) { return native_recovery; }
+uint64 cluster_epoch_get_current(void) { return checkpoint_epoch; }
+bool cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!writer_ok) return false;
+	*out = observed_writer.ref;
+	return true;
+}
+
 uint64 cluster_qvotec_get_self_incarnation(void) { return owner_boot; }
 ClusterControlRootResult
 cluster_wal_writer_begin(TimeLineID timeline, ClusterWalWriterToken *out)
@@ -138,8 +148,9 @@ cluster_wal_writer_startup_matches(const ClusterControlRootIdentity *id,
 }
 void RegisterResourceReleaseCallback(ResourceReleaseCallback callback, void *arg)
 {
-	if (arg != NULL || release_callback != NULL) abort();
-	release_callback = callback;
+	if (arg != NULL || checkpoint_release_callback != NULL) abort();
+	if (release_callback == NULL) release_callback = callback;
+	else checkpoint_release_callback = callback;
 	callback_registrations++;
 }
 void before_shmem_exit(pg_on_exit_callback callback, Datum arg)
@@ -383,6 +394,10 @@ bool cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 st
 static void reset(void)
 {
 	if (reserved_target != NULL || stamp_live) abort();
+	/* Fault injection changes actor identity; real process exit runs as the
+	 * original Startup PID, never as the deliberately forged test actor. */
+	MyBackendType = B_STARTUP;
+	MyProcPid = 81;
 	if (exit_callback != NULL) exit_callback(0, (Datum)0);
 	found_window_region = false;
 	cluster_recovery_plan_shmem_init();
@@ -427,6 +442,9 @@ static void reset(void)
 	clusterStartupWriterSelected = clusterStartupWriterBound = true;
 	clusterStartupWriterInstalled = binding_ok = writer_ok = allocation_ok = true;
 	owner_boot = 17;
+	checkpoint_epoch = 4;
+	clusterStartupWriter.input_kind = CLUSTER_WAL_STARTUP_RECOVERED;
+	clusterStartupWriter.generation = 7;
 	clusterStartupWriter.claim.identity.system_identifier = 91;
 	memset(clusterStartupWriter.claim.identity.storage_uuid, 1, 16);
 	memset(clusterStartupWriter.claim.identity.authority_uuid, 2, 16);
@@ -1058,9 +1076,138 @@ UT_TEST(test_projection_refusal_blocks_completion_and_balances_original_guards)
 	UT_ASSERT_EQ(window_region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
 }
 
+static void checkpoint_actor(void)
+{
+	MyBackendType = B_CHECKPOINTER;
+	MyProcPid = 82;
+	CurrentResourceOwner = (ResourceOwner)&typed;
+}
+static void startup_actor(void)
+{
+	MyBackendType = B_STARTUP;
+	MyProcPid = 81;
+	CurrentResourceOwner = (ResourceOwner)&info;
+}
+
+UT_TEST(test_recovered_install_generation_is_original_and_not_a_clean_input)
+{
+	ClusterWalWriterToken writer;
+	uint8 operation[16];
+	uint64 generation;
+	reset();
+	UT_ASSERT(ClusterStartupInstalledRecoveryWriterV1(&writer, operation, &generation));
+	UT_ASSERT_EQ(generation, 7);
+	UT_ASSERT(memcmp(&writer, &observed_writer, sizeof(writer)) == 0);
+	UT_ASSERT(memcmp(operation, clusterStartupWriter.operation_uuid, 16) == 0);
+	for (int fault = 0; fault < 6; fault++) {
+		reset();
+		switch (fault) {
+		case 0: clusterStartupWriter.input_kind = CLUSTER_WAL_STARTUP_CLEAN; break;
+		case 1: clusterStartupWriter.input_kind = CLUSTER_WAL_STARTUP_INITIALIZED; break;
+		case 2: clusterStartupWriter.generation = 0; break;
+		case 3: clusterStartupWriterInstalled = false; break;
+		case 4: native_recovery = true; break;
+		case 5: checkpoint_actor(); break;
+		}
+		memset(&writer, 0xa5, sizeof(writer)); memset(operation, 0xa5, 16); generation = 99;
+		UT_ASSERT(!ClusterStartupInstalledRecoveryWriterV1(&writer, operation, &generation));
+		UT_ASSERT(memcmp(&writer, &(ClusterWalWriterToken){0}, sizeof(writer)) == 0);
+		UT_ASSERT(memcmp(operation, (uint8[16]){0}, 16) == 0);
+		UT_ASSERT_EQ(generation, 0);
+	}
+}
+UT_TEST(test_original_start_publishes_only_a_checkpointer_opaque_stable_read)
+{
+	struct ClusterRecoveryCheckpointScopeV1 *scope = NULL, *second = NULL;
+	ClusterWalWriterToken writer;
+	reset(); retain();
+	checkpoint_actor();
+	UT_ASSERT(!cluster_recovery_checkpoint_begin_v1(&scope));
+	startup_actor();
+	UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
+	UT_ASSERT(!cluster_recovery_checkpoint_begin_v1(&scope));
+	checkpoint_actor();
+	UT_ASSERT(cluster_recovery_checkpoint_begin_v1(&scope));
+	UT_ASSERT(scope != NULL);
+	UT_ASSERT(cluster_recovery_checkpoint_current_v1(scope, &writer));
+	UT_ASSERT(memcmp(&writer, &observed_writer, sizeof(writer)) == 0);
+	UT_ASSERT(!cluster_recovery_checkpoint_begin_v1(&second));
+	UT_ASSERT(second == NULL);
+	UT_ASSERT(!cluster_recovery_checkpoint_current_v1((void *)&typed, &writer));
+	UT_ASSERT(memcmp(&writer, &(ClusterWalWriterToken){0}, sizeof(writer)) == 0);
+	cluster_recovery_checkpoint_end_v1(&scope);
+	UT_ASSERT(scope == NULL);
+	UT_ASSERT(cluster_recovery_checkpoint_begin_v1(&scope));
+	cluster_recovery_checkpoint_end_v1(&scope);
+	startup_actor();
+}
+UT_TEST(test_checkpoint_read_rejects_current_writer_epoch_boot_role_and_resource_drift)
+{
+	for (int fault = 0; fault < 16; fault++) {
+		struct ClusterRecoveryCheckpointScopeV1 *scope = NULL;
+		ClusterWalWriterToken writer;
+		reset(); retain(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
+		checkpoint_actor(); UT_ASSERT(cluster_recovery_checkpoint_begin_v1(&scope));
+		switch (fault) {
+		case 0: checkpoint_epoch++; break;
+		case 1: owner_boot++; break;
+		case 2: observed_writer.ref.claim.claim_sha256[1]++; break;
+		case 3: observed_writer.ref.claim.database_incarnation++; break;
+		case 4: observed_writer.ref.timeline++; break;
+		case 5: MyBackendType = B_BACKEND; break;
+		case 6: MyProcPid++; break;
+		case 7: CurrentResourceOwner = (ResourceOwner)&info; break;
+		case 8: native_recovery = true; break;
+		case 9: cluster_shared_config = false; break;
+		case 10: ShutdownRequestPending = true; break;
+		case 11: writer_ok = false; break;
+		case 12: window_region.checkpoint_owner.generation++; break;
+		case 13: window_region.checkpoint_owner.owner.operation_uuid[0]++; break;
+		case 14: window_region.checkpoint_owner.owner.install_generation++; break;
+		case 15: window_region.checkpoint_owner.valid = false; break;
+		}
+		memset(&writer, 0xa5, sizeof(writer));
+		UT_ASSERT(!cluster_recovery_checkpoint_current_v1(scope, &writer));
+		UT_ASSERT(memcmp(&writer, &(ClusterWalWriterToken){0}, sizeof(writer)) == 0);
+		cluster_recovery_checkpoint_end_v1(&scope); startup_actor();
+	}
+}
+UT_TEST(test_original_resource_release_and_cleanup_revoke_the_shared_read)
+{
+	for (int cleanup = 0; cleanup < 2; cleanup++) {
+		struct ClusterRecoveryCheckpointScopeV1 *scope = NULL;
+		ClusterWalWriterToken writer;
+		reset(); retain(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
+		checkpoint_actor(); UT_ASSERT(cluster_recovery_checkpoint_begin_v1(&scope));
+		startup_actor();
+		if (cleanup) ClusterReleaseColdRecoveryInputs(&info);
+		else release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		checkpoint_actor();
+		UT_ASSERT(!cluster_recovery_checkpoint_current_v1(scope, &writer));
+		cluster_recovery_checkpoint_end_v1(&scope);
+		UT_ASSERT(!cluster_recovery_checkpoint_begin_v1(&scope));
+		startup_actor();
+	}
+}
+UT_TEST(test_checkpointer_error_revokes_local_read_without_releasing_start)
+{
+	struct ClusterRecoveryCheckpointScopeV1 *scope = NULL;
+	ClusterWalWriterToken writer;
+	reset(); retain(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
+	checkpoint_actor(); UT_ASSERT(cluster_recovery_checkpoint_begin_v1(&scope));
+	UT_ASSERT(checkpoint_release_callback != NULL);
+	if (checkpoint_release_callback != NULL)
+		checkpoint_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	UT_ASSERT(!cluster_recovery_checkpoint_current_v1(scope, &writer));
+	cluster_recovery_checkpoint_end_v1(&scope);
+	UT_ASSERT(cluster_recovery_checkpoint_begin_v1(&scope));
+	cluster_recovery_checkpoint_end_v1(&scope); startup_actor();
+	UT_ASSERT(ClusterColdRecoveryTxCurrent(info.cluster_tx_start));
+}
+
 int main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(31);
 	UT_RUN(test_original_owner_binds_complete_empty_census_after_done);
 	UT_RUN(test_native_owner_rejects_uninstalled_recovery_and_writer_drift);
 	UT_RUN(test_current_rechecks_owner_process_boot_and_exact_writer);
@@ -1089,6 +1236,11 @@ int main(void)
 	if (allocations != frees) { fprintf(stderr, "unreleased start resources\n"); return 1; }
 	UT_RUN(test_new_c0_projects_after_durability_before_original_guards_release);
 	UT_RUN(test_projection_refusal_blocks_completion_and_balances_original_guards);
+	UT_RUN(test_recovered_install_generation_is_original_and_not_a_clean_input);
+	UT_RUN(test_original_start_publishes_only_a_checkpointer_opaque_stable_read);
+	UT_RUN(test_checkpoint_read_rejects_current_writer_epoch_boot_role_and_resource_drift);
+	UT_RUN(test_original_resource_release_and_cleanup_revoke_the_shared_read);
+	UT_RUN(test_checkpointer_error_revokes_local_read_without_releasing_start);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

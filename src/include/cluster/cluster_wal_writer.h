@@ -17,6 +17,10 @@ typedef struct ClusterWalWriterToken {
 extern bool ClusterStartupInstalledWriterV1(ClusterWalWriterToken *writer,
 										  uint8 operation_uuid[16]);
 
+/* Exact original recovered INSTALL result, not CLEAN or first creation. */
+extern bool ClusterStartupInstalledRecoveryWriterV1(ClusterWalWriterToken *writer,
+	uint8 operation_uuid[16], uint64 *install_generation);
+
 typedef struct ClusterWalWriterFlushV1 {
 	ClusterWalWriterToken writer;
 	XLogRecPtr flushed_end;

@@ -42,6 +42,10 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "access/xlog.h"
+#include "access/xlogrecovery.h"
+#include "cluster/cluster_epoch.h"
+#include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_clean_leave.h"
 #include "miscadmin.h"
@@ -57,7 +61,18 @@
 #include "port/atomics.h"
 #include "postmaster/bgwriter.h" /* CheckPointTimeout (liveness threshold, contract) */
 #include "storage/shmem.h"
+#include "postmaster/interrupt.h"
+#include "utils/resowner.h"
 #include "utils/timestamp.h"
+
+/* Volatile original-start input, never a durable certificate or service bit.
+ * The lock protects only bounded memory copies, never ROOT/WAL/storage I/O. */
+typedef struct ClusterRecoveryCheckpointSlotV1 {
+	slock_t lock;
+	bool valid;
+	uint64 generation;
+	ClusterRecoveryCheckpointOwnerV1 owner;
+} ClusterRecoveryCheckpointSlotV1;
 
 typedef struct ClusterRecoveryPlanShmem {
 	pg_atomic_uint32 published;
@@ -72,6 +87,7 @@ typedef struct ClusterRecoveryPlanShmem {
 	/* spec-4.11 D5: region-level cumulative online thread-recovery counters
 	 * (observability); shares the region, no new region (Q3). */
 	ClusterThreadRecoveryCounters thread_recovery_counters;
+	ClusterRecoveryCheckpointSlotV1 checkpoint_owner;
 } ClusterRecoveryPlanShmem;
 
 static ClusterRecoveryPlanShmem *cluster_recovery_plan_shmem = NULL;
@@ -186,6 +202,9 @@ cluster_recovery_plan_shmem_init(void)
 	if (!found) {
 		int slot;
 
+		memset(&cluster_recovery_plan_shmem->checkpoint_owner, 0,
+			   sizeof(cluster_recovery_plan_shmem->checkpoint_owner));
+		SpinLockInit(&cluster_recovery_plan_shmem->checkpoint_owner.lock);
 		pg_atomic_init_u32(&cluster_recovery_plan_shmem->published, 0);
 		memset(&cluster_recovery_plan_shmem->plan, 0, sizeof(ClusterRecoveryPlan));
 		memset(&cluster_recovery_plan_shmem->pool, 0, sizeof(ClusterRecoveryWorkerPool));
@@ -525,6 +544,173 @@ cluster_thread_recovery_counters(void)
 	if (cluster_recovery_plan_shmem == NULL)
 		return NULL;
 	return &cluster_recovery_plan_shmem->thread_recovery_counters;
+}
+
+/* Only the original process can withdraw its own shared publication. The
+ * saved opaque pointer is compared, never dereferenced during revocation. */
+static const struct ClusterRecoveryStartV1 *checkpoint_registered_start;
+static ClusterRecoveryCheckpointOwnerV1 checkpoint_registered_owner;
+
+struct ClusterRecoveryCheckpointScopeV1 {
+	bool live;
+	uint64 slot_generation;
+	ClusterRecoveryCheckpointOwnerV1 owner;
+	int pid;
+	ResourceOwner resource_owner;
+};
+static struct ClusterRecoveryCheckpointScopeV1 checkpoint_scope;
+static bool checkpoint_scope_callback_registered;
+
+static bool
+checkpoint_ref_same(const ClusterWalSourceRef *a, const ClusterWalSourceRef *b)
+{
+	return memcmp(&a->claim.identity, &b->claim.identity, sizeof(a->claim.identity)) == 0
+		&& a->claim.database_incarnation == b->claim.database_incarnation
+		&& a->claim.max_config_generation == b->claim.max_config_generation
+		&& memcmp(a->claim.claim_sha256, b->claim.claim_sha256, 32) == 0
+		&& a->timeline == b->timeline;
+}
+
+void
+cluster_recovery_checkpoint_revoke_v1(const struct ClusterRecoveryStartV1 *start)
+{
+	ClusterRecoveryCheckpointSlotV1 *slot;
+
+	if (start == NULL || start != checkpoint_registered_start
+		|| MyProcPid != checkpoint_registered_owner.owner_pid)
+		return;
+	if (cluster_recovery_plan_shmem != NULL) {
+		slot = &cluster_recovery_plan_shmem->checkpoint_owner;
+		SpinLockAcquire(&slot->lock);
+		if (slot->valid && memcmp(&slot->owner, &checkpoint_registered_owner,
+								 sizeof(slot->owner)) == 0) {
+			slot->valid = false;
+			memset(&slot->owner, 0, sizeof(slot->owner));
+		}
+		SpinLockRelease(&slot->lock);
+	}
+	checkpoint_registered_start = NULL;
+	memset(&checkpoint_registered_owner, 0, sizeof(checkpoint_registered_owner));
+}
+
+bool
+cluster_recovery_checkpoint_register_v1(const struct ClusterRecoveryStartV1 *start)
+{
+	ClusterRecoveryCheckpointSlotV1 *slot;
+	ClusterRecoveryCheckpointOwnerV1 owner, confirmed;
+	bool published = false;
+
+	if (MyBackendType != B_STARTUP || !IsUnderPostmaster
+		|| cluster_recovery_plan_shmem == NULL || checkpoint_registered_start != NULL
+		|| !ClusterColdRecoveryTxCheckpointOwnerV1(start, &owner))
+		return false;
+	slot = &cluster_recovery_plan_shmem->checkpoint_owner;
+	SpinLockAcquire(&slot->lock);
+	if (!slot->valid && slot->generation != PG_UINT64_MAX) {
+		slot->generation++;
+		slot->owner = owner;
+		slot->valid = true;
+		published = true;
+	}
+	SpinLockRelease(&slot->lock);
+	if (!published)
+		return false;
+	checkpoint_registered_start = start;
+	checkpoint_registered_owner = owner;
+	if (!ClusterColdRecoveryTxCheckpointOwnerV1(start, &confirmed)
+		|| memcmp(&confirmed, &owner, sizeof(owner)) != 0) {
+		cluster_recovery_checkpoint_revoke_v1(start);
+		return false;
+	}
+	return true;
+}
+
+static void
+checkpoint_scope_resource_release(ResourceReleasePhase phase, bool isCommit,
+								  bool isTopLevel, void *arg)
+{
+	(void)isCommit;
+	(void)isTopLevel;
+	(void)arg;
+	if (phase == RESOURCE_RELEASE_BEFORE_LOCKS && checkpoint_scope.live
+		&& checkpoint_scope.resource_owner == CurrentResourceOwner)
+		memset(&checkpoint_scope, 0, sizeof(checkpoint_scope));
+}
+
+bool
+cluster_recovery_checkpoint_current_v1(const struct ClusterRecoveryCheckpointScopeV1 *scope,
+									 ClusterWalWriterToken *writer)
+{
+	ClusterRecoveryCheckpointSlotV1 *slot;
+	ClusterWalSourceRef current;
+	bool same;
+
+	if (writer != NULL)
+		memset(writer, 0, sizeof(*writer));
+	if (writer == NULL || scope != &checkpoint_scope || !checkpoint_scope.live
+		|| MyBackendType != B_CHECKPOINTER || !IsUnderPostmaster || MyProcPid <= 0
+		|| checkpoint_scope.pid != MyProcPid || CurrentResourceOwner == NULL
+		|| checkpoint_scope.resource_owner != CurrentResourceOwner
+		|| !cluster_enabled || !cluster_shared_config || CritSectionCount != 0
+		|| ShutdownRequestPending || RecoveryInProgress() || cluster_recovery_plan_shmem == NULL
+		|| scope->owner.owner_boot == 0
+		|| cluster_qvotec_get_self_incarnation() != scope->owner.owner_boot
+		|| cluster_epoch_get_current() != scope->owner.writer.epoch
+		|| !cluster_wal_thread_current_v2_ref(&current)
+		|| !checkpoint_ref_same(&current, &scope->owner.writer.ref))
+		return false;
+	slot = &cluster_recovery_plan_shmem->checkpoint_owner;
+	SpinLockAcquire(&slot->lock);
+	same = slot->valid && slot->generation == scope->slot_generation
+		&& memcmp(&slot->owner, &scope->owner, sizeof(slot->owner)) == 0;
+	SpinLockRelease(&slot->lock);
+	if (!same || cluster_qvotec_get_self_incarnation() != scope->owner.owner_boot
+		|| cluster_epoch_get_current() != scope->owner.writer.epoch)
+		return false;
+	*writer = scope->owner.writer;
+	return true;
+}
+
+bool
+cluster_recovery_checkpoint_begin_v1(struct ClusterRecoveryCheckpointScopeV1 **out)
+{
+	ClusterRecoveryCheckpointSlotV1 *slot;
+	ClusterWalWriterToken writer;
+
+	if (out == NULL || *out != NULL || checkpoint_scope.live
+		|| MyBackendType != B_CHECKPOINTER || MyProcPid <= 0 || CurrentResourceOwner == NULL
+		|| cluster_recovery_plan_shmem == NULL)
+		return false;
+	if (!checkpoint_scope_callback_registered) {
+		RegisterResourceReleaseCallback(checkpoint_scope_resource_release, NULL);
+		checkpoint_scope_callback_registered = true;
+	}
+	slot = &cluster_recovery_plan_shmem->checkpoint_owner;
+	SpinLockAcquire(&slot->lock);
+	if (slot->valid) {
+		checkpoint_scope.owner = slot->owner;
+		checkpoint_scope.slot_generation = slot->generation;
+		checkpoint_scope.live = true;
+	}
+	SpinLockRelease(&slot->lock);
+	checkpoint_scope.pid = MyProcPid;
+	checkpoint_scope.resource_owner = CurrentResourceOwner;
+	if (!cluster_recovery_checkpoint_current_v1(&checkpoint_scope, &writer)) {
+		memset(&checkpoint_scope, 0, sizeof(checkpoint_scope));
+		return false;
+	}
+	*out = &checkpoint_scope;
+	return true;
+}
+
+void
+cluster_recovery_checkpoint_end_v1(struct ClusterRecoveryCheckpointScopeV1 **scope)
+{
+	if (scope == NULL)
+		return;
+	if (*scope == &checkpoint_scope)
+		memset(&checkpoint_scope, 0, sizeof(checkpoint_scope));
+	*scope = NULL;
 }
 
 /*

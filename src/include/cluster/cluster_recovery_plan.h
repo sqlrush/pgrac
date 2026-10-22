@@ -250,6 +250,30 @@ typedef struct ClusterThreadRecoveryCounters {
 	pg_atomic_uint64 recovered_through; /* last published recovered_through LSN (raw) */
 } ClusterThreadRecoveryCounters;
 
+/* Original native-DONE start identity; a value is never checkpoint authority.
+ * Only the original opaque start may publish it into the local volatile slot. */
+typedef struct ClusterRecoveryCheckpointOwnerV1 {
+	ClusterWalWriterToken writer;
+	uint8 operation_uuid[16];
+	uint64 install_generation;
+	uint64 start_generation;
+	uint64 start_serial;
+	uint64 owner_boot;
+	int32 owner_pid;
+} ClusterRecoveryCheckpointOwnerV1;
+
+struct ClusterRecoveryStartV1;
+struct ClusterRecoveryCheckpointScopeV1;
+extern bool cluster_recovery_checkpoint_register_v1(const struct ClusterRecoveryStartV1 *start);
+extern void cluster_recovery_checkpoint_revoke_v1(const struct ClusterRecoveryStartV1 *start);
+/* Checkpointer-only, process-local opaque stable read; no I/O or write grant.
+ * The original publisher must still prove ROOT/common/service and all normal
+ * writer, membership, fence, durability and release conditions. */
+extern bool cluster_recovery_checkpoint_begin_v1(struct ClusterRecoveryCheckpointScopeV1 **out);
+extern bool cluster_recovery_checkpoint_current_v1(const struct ClusterRecoveryCheckpointScopeV1 *scope,
+												 ClusterWalWriterToken *writer);
+extern void cluster_recovery_checkpoint_end_v1(struct ClusterRecoveryCheckpointScopeV1 **scope);
+
 /*
  * Backend API (cluster_recovery_plan.c).  All paths are no-ops when
  * cluster.wal_threads_dir is unset / the thread id is LEGACY.

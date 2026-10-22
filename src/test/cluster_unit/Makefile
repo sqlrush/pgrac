@@ -9694,6 +9694,8 @@ test_cluster_recovery_stamp_reap.inc: $(top_srcdir)/src/backend/cluster/cluster_
 test_cluster_recovery_stamp_exit: test_cluster_recovery_stamp_exit.c test_cluster_recovery_stamp.c \
         test_cluster_recovery_stamp_reap.inc unit_test.h \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
+        $(top_srcdir)/src/include/cluster/cluster_epoch.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
@@ -9717,6 +9719,8 @@ test_cluster_checkpoint_stamp_boundary.inc: $(top_srcdir)/src/backend/access/tra
 test_cluster_checkpoint_stamp: test_cluster_checkpoint_stamp.c test_cluster_recovery_stamp.c unit_test.h \
         test_cluster_checkpoint_stamp.inc test_cluster_checkpoint_stamp_boundary.inc \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
+        $(top_srcdir)/src/include/cluster/cluster_epoch.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
@@ -9732,8 +9736,8 @@ test_cluster_cold_tx_owner.inc: $(top_srcdir)/src/backend/access/transam/xlogrec
 	mv $@.tmp $@
 
 test_cluster_cold_tx_writer.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
-	awk '/^ClusterStartupInstalledWriterV1\(/ { print "bool"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^ClusterStartupInstalled(Recovery)?WriterV1\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_cold_tx_start_boundary.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
@@ -9768,6 +9772,8 @@ test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_ow
         $(top_srcdir)/src/include/cluster/storage/cluster_undo_block0.h \
         $(top_srcdir)/src/include/cluster/cluster_wal_writer.h \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
+        $(top_srcdir)/src/include/cluster/cluster_epoch.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
         $(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c
