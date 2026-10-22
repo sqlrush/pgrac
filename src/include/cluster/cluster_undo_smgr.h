@@ -163,6 +163,11 @@ typedef struct ClusterUndoSmgrRecoveryStampV1 {
 
 extern bool cluster_undo_smgr_recovery_abort_prepare_v1(const ClusterRecoveryTTAbortV1 *record,
 														ClusterUndoSmgrRecoveryStampV1 *out);
+struct ClusterWalInputsV1;
+/* Post-EOR variant: exact original TX_CLOSURE candidate/source, same held-FD
+ * storage checks. No redo-role fallback or WAL/write permission is added. */
+extern bool cluster_undo_smgr_recovery_abort_prepare_tx_v1(struct ClusterWalInputsV1 *inputs,
+	const ClusterRecoveryTTAbortV1 *record, ClusterUndoSmgrRecoveryStampV1 *out);
 extern bool cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 stamp);
 /* Also released with the owning ResourceOwner. Cleanup never clears a
  * recovery duty/window or turns a failed write into completion. */

@@ -72,6 +72,7 @@ extern ClusterControlRootResult cluster_wal_inputs_cold_begin_v1(const uint8 sto
 																 ClusterWalInputsV1 **out);
 struct ClusterRecoveryStartV1;
 struct ClusterColdTopTxCensusEntryV1;
+struct ClusterRecoveryTTAbortV1;
 /* Post-EOR Startup only, bound to its original installed-writer start resource
  * and an exact original ACTIVE census entry. Reacquire all original ROOT
  * inputs and WALR read pins; reject another cut or changed subject/start.
@@ -82,6 +83,12 @@ struct ClusterColdTopTxCensusEntryV1;
 extern ClusterControlRootResult cluster_wal_inputs_begin_tx_closure_v1(
 	const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdTopTxCensusEntryV1 *subject, ClusterWalInputsV1 **out);
+/* Exact current C0 candidate only, inside the original TX_CLOSURE read scope.
+ * Resolve through the shared undo namespace without borrowing a redo duty.
+ * This provisional path grants no write authority: retain target exclusion
+ * and revalidate the whole source ROOT before and after descriptor I/O. */
+extern bool cluster_wal_inputs_tx_abort_path_v1(ClusterWalInputsV1 *inputs,
+	const struct ClusterRecoveryTTAbortV1 *record, char *out, size_t out_size);
 
 /* Startup in recovery, under the caller's existing execution WALR retention
  * owner. Select one exact CLOSED/RECOVERY_REQUIRED/RECOVERY_COMPLETE checkpoint

@@ -10,6 +10,7 @@
 #include "cluster/cluster_wal_inputs.h"
 #include "access/xlogrecovery.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_recovery_tt_record.h"
 #include "cluster/cluster_wal_cut.h"
 #include "cluster/cluster_block_apply.h"
 
@@ -21046,6 +21047,9 @@ static bool tx_inputs_owner_current;
 static uint64 tx_inputs_generation, tx_inputs_serial;
 static ResourceOwner tx_inputs_owner;
 static const struct ClusterRecoveryStartV1 *tx_inputs_start;
+static ClusterRecoveryTTAbortDerivationV1 tx_inputs_candidate;
+static bool tx_inputs_candidate_current;
+static unsigned tx_inputs_path_fault, tx_inputs_path_calls;
 bool
 ClusterColdRecoveryTxCurrent(const struct ClusterRecoveryStartV1 *start)
 {
@@ -21071,6 +21075,39 @@ ClusterColdRecoveryTxSubjectCurrent(const struct ClusterRecoveryStartV1 *start,
 	*generation = tx_inputs_generation;
 	*serial = tx_inputs_serial;
 	return true;
+}
+
+bool
+ClusterColdRecoveryTxC0Candidate(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject, ClusterRecoveryTTAbortDerivationV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!ClusterColdRecoveryTxCurrent(start) || subject != &tx_inputs_subject
+		|| !tx_inputs_candidate_current)
+		return false;
+	*out = tx_inputs_candidate;
+	return true;
+}
+
+/* Path formatting is a leaf; the original ROOT/WALR/scope owner above is real. */
+int
+cluster_shared_fs_undo_path_resolve(uint8 owner, uint32 segment, char *out, size_t size)
+{
+	int written;
+	tx_inputs_path_calls++;
+	UT_ASSERT_EQ(owner, 1);
+	UT_ASSERT_EQ(segment, 1);
+	UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock);
+	if (tx_inputs_path_fault == 1)
+		return -1;
+	if (tx_inputs_path_fault == 2)
+		tx_inputs_owner_current = false;
+	if (tx_inputs_path_fault == 3)
+		tx_inputs_subject.input.slot.xid++;
+	if (tx_inputs_path_fault == 4)
+		tx_inputs_candidate.record.writer_incarnation++;
+	written = snprintf(out, size, "/tmp/pgrac-tx/pg_undo/instance_0/seg_1.dat");
+	return written < 0 || (size_t) written >= size ? -1 : 0;
 }
 
 
@@ -23457,6 +23494,7 @@ tx_inputs_capture(ClusterWalInputsV1 *inputs, const ClusterControlRootIdentity *
 static void
 tx_inputs_activate(void)
 {
+	ClusterRecoveryTTAbortV1 *record = &tx_inputs_candidate.record;
 	memset(&tx_inputs_subject, 0, sizeof(tx_inputs_subject));
 	tx_inputs_subject.input.key = (ClusterColdTtSlotKeyV1){
 		.owner_instance = 1, .segment_id = 1, .segment_generation = 7,
@@ -23469,6 +23507,23 @@ tx_inputs_activate(void)
 	tx_inputs_owner_current = true;
 	tx_inputs_generation = 17;
 	tx_inputs_serial = 1;
+	memset(&tx_inputs_candidate, 0, sizeof(tx_inputs_candidate));
+	record->version = CLUSTER_RECOVERY_TT_ABORT_VERSION;
+	record->length = CLUSTER_RECOVERY_TT_ABORT_BYTES;
+	record->flags = CLUSTER_RECOVERY_TT_ABORT_TOP_KNOWN;
+	record->target_thread = 1;
+	record->writer_thread = 2;
+	record->target_incarnation = record->writer_incarnation = 1;
+	record->recovery_serial = 1;
+	record->target_epoch = 17;
+	record->target_full_xid = record->top_full_xid = 100;
+	record->target_claim_sha256[0] = 1;
+	record->exact = (xl_undo_tt_slot_abort_exact){ .segment_id = 1,
+		.segment_generation = 7, .slot_offset = 2, .xid = 100, .wrap = 3,
+		.instance = 1, .format_version = CLUSTER_UNDO_TT_ABORT_EXACT_VERSION };
+	record->before = tx_inputs_subject.input.slot;
+	tx_inputs_candidate_current = true;
+	tx_inputs_path_fault = tx_inputs_path_calls = 0;
 	MyBackendType = B_STARTUP;
 	inputs_native_recovery = false;
 	test_inputs_startup_cf = true;
@@ -23514,6 +23569,65 @@ UT_TEST(test_tx_inputs_reads_actual_closed_wal_and_rechecks_owner)
 	}
 	UT_ASSERT(!inputs_pin_held && test_actual_cf == NoLock);
 	test_inputs_startup_cf = false;
+}
+UT_TEST(test_tx_inputs_exact_c0_path_requires_original_candidate_and_preserves_input)
+{
+	ClusterWalInputsV1 *inputs = NULL;
+	ClusterRecoveryTTAbortV1 record, saved;
+	char path[MAXPGPATH];
+	tx_inputs_fixture();
+	record = tx_inputs_candidate.record;
+	UT_ASSERT(cluster_recovery_tt_abort_valid_v1(&record));
+	UT_ASSERT_EQ(tx_inputs_begin(&inputs), 0);
+	UT_ASSERT(cluster_wal_inputs_tx_abort_path_v1(inputs, &record, path, sizeof(path)));
+	UT_ASSERT(strcmp(path, "/tmp/pgrac-tx/pg_undo/instance_0/seg_1.dat") == 0);
+	UT_ASSERT_EQ(tx_inputs_path_calls, 1);
+	UT_ASSERT_EQ(cluster_wal_inputs_revalidate_v1(inputs), 0);
+	record.target_full_xid += UINT64_C(1) << 32;
+	record.top_full_xid = record.target_full_xid;
+	UT_ASSERT(cluster_recovery_tt_abort_valid_v1(&record));
+	UT_ASSERT(!cluster_wal_inputs_tx_abort_path_v1(inputs, &record, path, sizeof(path)));
+	UT_ASSERT_EQ(path[0], 0);
+	UT_ASSERT_EQ(tx_inputs_path_calls, 1);
+	saved = record;
+	UT_ASSERT(!cluster_wal_inputs_tx_abort_path_v1(inputs, &record, (char *)&record, sizeof(record)));
+	UT_ASSERT(memcmp(&record, &saved, sizeof(record)) == 0);
+	cluster_wal_inputs_release_v1(&inputs);
+	UT_ASSERT(!inputs_pin_held && test_actual_cf == NoLock);
+	test_inputs_startup_cf = false;
+}
+UT_TEST(test_tx_inputs_c0_path_refuses_stale_scope_and_post_resolve_drift)
+{
+	for (unsigned fault = 0; fault < 13; fault++) {
+		ClusterWalInputsV1 *inputs = NULL;
+		ClusterRecoveryTTAbortV1 record;
+		char path[MAXPGPATH];
+		tx_inputs_fixture();
+		record = tx_inputs_candidate.record;
+		UT_ASSERT_EQ(tx_inputs_begin(&inputs), 0);
+		switch (fault) {
+		case 0: tx_inputs_candidate_current = false; break;
+		case 1: tx_inputs_owner_current = false; break;
+		case 2: tx_inputs_subject.input.slot.xid++; break;
+		case 3: tx_inputs_generation++; break;
+		case 4: tx_inputs_serial++; break;
+		case 5: UT_ASSERT_EQ(cluster_wal_inputs_suspend_v1(inputs), 0); break;
+		case 6: inputs_pin_current = false; break;
+		case 7: MyBackendType = B_BG_WORKER; break;
+		case 8: tx_inputs_path_fault = 1; break;
+		case 9: tx_inputs_path_fault = 2; break;
+		case 10: tx_inputs_path_fault = 3; break;
+		case 11: tx_inputs_path_fault = 4; break;
+		case 12: break; /* short destination */
+		}
+		memset(path, 'x', sizeof(path));
+		UT_ASSERT(!cluster_wal_inputs_tx_abort_path_v1(inputs, &record, path,
+			fault == 12 ? 1 : sizeof(path)));
+		UT_ASSERT_EQ(path[0], 0);
+		cluster_wal_inputs_release_v1(&inputs);
+		UT_ASSERT(!inputs_pin_held && test_actual_cf == NoLock);
+		test_inputs_startup_cf = false;
+	}
 }
 UT_TEST(test_tx_inputs_reselects_original_history_after_actual_install)
 {
@@ -23664,11 +23778,13 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 	if (getenv("PGRAC_PRE2_TEST_TX_INPUTS") != NULL) {
-		UT_PLAN(4);
+		UT_PLAN(6);
 		UT_RUN(test_tx_inputs_reads_actual_closed_wal_and_rechecks_owner);
 		UT_RUN(test_tx_inputs_reselects_original_history_after_actual_install);
 		UT_RUN(test_tx_inputs_after_done_keeps_retained_read_purpose);
 		UT_RUN(test_tx_inputs_parent_subject_and_wait_revalidation);
+		UT_RUN(test_tx_inputs_exact_c0_path_requires_original_candidate_and_preserves_input);
+		UT_RUN(test_tx_inputs_c0_path_refuses_stale_scope_and_post_resolve_drift);
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}

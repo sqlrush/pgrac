@@ -276,6 +276,7 @@
 #include "cluster/cluster_conf.h" /* PGRAC: RF-B exact one-node gate */
 #include "cluster/cluster_cold_recovery.h" /* PGRAC: hold restartpoint during typed cold replay */
 #include "cluster/cluster_wal_inputs.h" /* PGRAC: post-EOR retained loser read scope */
+#include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/cluster_gcs_block.h" /* PGRAC: spec-6.12h D-h2 PI-discard checkpoint seal */
 #include "cluster/cluster_guc.h" /* PGRAC: spec-5.6 cluster_controlfile_shared_authority */
@@ -6657,7 +6658,7 @@ ClusterStartupInstalledWriterV1(ClusterWalWriterToken *writer, uint8 operation_u
 }
 
 /* Reacquire the original owner/source scope for every physical loser proved
- * by the pre-EOR census.  This is a read-only post-EOR integration point:
+ * by the pre-EOR census. Prepare and close its exact FD without writing:
  * TX_CLOSURE carries no C0, TT, checkpoint, DATA, reclamation or FullXid
  * authority.  An unproven ACTIVE remains explicit and is not consumed here. */
 static bool
@@ -6694,7 +6695,9 @@ cluster_cold_recovery_consume_loser_inputs_v1(
 		ClusterWalInputsV1 *inputs = NULL;
 		ClusterControlRootResult result;
 		ClusterRecoveryTTAbortDerivationV1 candidate;
+		ClusterRecoveryTTAbortDerivationV1 confirmed;
 		ClusterUndoBlock0Pin target = { .slot = -1 };
+		ClusterUndoSmgrRecoveryStampV1 stamp = {0};
 
 		/* A retained ACTIVE without an independent loser proof stays
 		 * unresolved; it must not be promoted by this consumer. */
@@ -6727,6 +6730,21 @@ cluster_cold_recovery_consume_loser_inputs_v1(
 			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			result = cluster_wal_inputs_revalidate_v1(inputs);
+		/* All fallible descriptor preparation precedes the later PRE_INSERT
+		 * seam. Keep the original source and target exclusion throughout I/O. */
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& !cluster_undo_smgr_recovery_abort_prepare_tx_v1(inputs, &candidate.record, &stamp))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cluster_wal_inputs_revalidate_v1(inputs);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& (!ClusterColdRecoveryTxC0Candidate(start, entry, &confirmed)
+				|| memcmp(&candidate.record, &confirmed.record, sizeof(candidate.record)) != 0))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		/* Preparation grants no C0 execution authority. Close before releasing
+		 * exclusion, including every post-I/O refusal path. */
+		if (stamp.token != 0 && !cluster_undo_smgr_recovery_abort_close_v1(stamp))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		cluster_undo_block0_release_reservation(&target);
 		cluster_wal_inputs_release_v1(&inputs);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)

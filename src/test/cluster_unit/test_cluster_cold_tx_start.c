@@ -10,6 +10,7 @@
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_wal_inputs.h"
+#include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "../../../src/backend/cluster/cluster_control_root_private.h"
 #include "miscadmin.h"
@@ -51,6 +52,9 @@ static ClusterUndoBlock0Pin *reserved_target;
 static ClusterUndoBlock0LogicalKey target_key;
 static ClusterUndoBlock0AuthorityProof target_proof;
 static char scope_storage;
+static unsigned stamp_prepares, stamp_closes;
+static bool stamp_prepare_ok, stamp_close_ok, stamp_live, invalidate_writer_on_prepare;
+static ClusterRecoveryTTAbortV1 prepared_record;
 static uint64 owner_boot;
 static ResourceReleaseCallback release_callback;
 static unsigned callback_registrations, input_destroys, allocations, frees;
@@ -203,14 +207,40 @@ void
 cluster_wal_inputs_release_v1(ClusterWalInputsV1 **inputs)
 {
 	if (*inputs != (ClusterWalInputsV1 *)&scope_storage) abort();
-	if (reserved_target != NULL) abort();
+	if (reserved_target != NULL || stamp_live) abort();
 	scope_releases++;
 	*inputs = NULL;
 }
 
+bool
+cluster_undo_smgr_recovery_abort_prepare_tx_v1(ClusterWalInputsV1 *inputs,
+	const ClusterRecoveryTTAbortV1 *record, ClusterUndoSmgrRecoveryStampV1 *stamp)
+{
+	if (inputs != (ClusterWalInputsV1 *)&scope_storage || reserved_target == NULL
+		|| scope_releases != 0 || scope_checks != 2 || stamp_live) abort();
+	stamp_prepares++;
+	prepared_record = *record;
+	stamp->token = 0;
+	if (!stamp_prepare_ok) return false;
+	stamp_live = true;
+	stamp->token = 91;
+	if (invalidate_writer_on_prepare) observed_writer.epoch++;
+	return true;
+}
+
+bool
+cluster_undo_smgr_recovery_abort_close_v1(ClusterUndoSmgrRecoveryStampV1 stamp)
+{
+	if (!stamp_live || stamp.token != 91 || reserved_target == NULL
+		|| scope_releases != 0) abort();
+	stamp_closes++;
+	stamp_live = false;
+	return stamp_close_ok;
+}
+
 static void reset(void)
 {
-	if (reserved_target != NULL) abort();
+	if (reserved_target != NULL || stamp_live) abort();
 	if (exit_callback != NULL) exit_callback(0, (Datum)0);
 	exit_callback = NULL;
 	destroy_probe = NULL;
@@ -236,6 +266,10 @@ static void reset(void)
 	target_reserves = target_releases = 0;
 	target_reserve_ok = true;
 	invalidate_writer_on_reserve = false;
+	stamp_prepares = stamp_closes = 0;
+	stamp_prepare_ok = stamp_close_ok = true;
+	invalidate_writer_on_prepare = false;
+	memset(&prepared_record, 0, sizeof(prepared_record));
 	memset(&target_key, 0, sizeof(target_key));
 	memset(&target_proof, 0, sizeof(target_proof));
 	clusterStartupWriterSelected = clusterStartupWriterBound = true;
@@ -657,7 +691,7 @@ UT_TEST(test_actual_startup_consumer_requires_numeric_candidate_under_revalidate
 	c0_subject();
 	UT_ASSERT(cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
 	UT_ASSERT_EQ(scope_begins, 1);
-	UT_ASSERT_EQ(scope_checks, 2);
+	UT_ASSERT_EQ(scope_checks, 3);
 	UT_ASSERT_EQ(scope_releases, 1);
 	c0_subject(); xid_ready = false;
 	UT_ASSERT(!cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
@@ -717,9 +751,43 @@ UT_TEST(test_actual_startup_reservation_failure_or_stale_owner_preserves_active_
 	}
 }
 
+UT_TEST(test_actual_startup_prepares_exact_fd_before_releasing_original_guards)
+{
+	ClusterRecoveryTTAbortDerivationV1 expected;
+	c0_subject();
+	UT_ASSERT(ClusterColdRecoveryTxC0Candidate(info.cluster_tx_start, &census.entries[0], &expected));
+	UT_ASSERT(cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+	UT_ASSERT_EQ(stamp_prepares, 1);
+	UT_ASSERT_EQ(stamp_closes, 1);
+	UT_ASSERT(memcmp(&prepared_record, &expected.record, sizeof(prepared_record)) == 0);
+	UT_ASSERT(!stamp_live && reserved_target == NULL);
+	UT_ASSERT_EQ(scope_releases, 1);
+	UT_ASSERT_EQ(census.entries[0].input.slot.status, TT_SLOT_ACTIVE);
+}
+
+UT_TEST(test_actual_startup_fd_failure_or_post_io_stale_releases_without_mutation)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		c0_subject();
+		switch (fault) {
+		case 0: stamp_prepare_ok = false; break;
+		case 1: stamp_close_ok = false; break;
+		case 2: fail_scope_check = 3; break;
+		case 3: invalidate_writer_on_prepare = true; break;
+		}
+		UT_ASSERT(!cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+		UT_ASSERT_EQ(stamp_prepares, 1);
+		UT_ASSERT_EQ(stamp_closes, fault == 0 ? 0 : 1);
+		UT_ASSERT_EQ(target_releases, 1);
+		UT_ASSERT_EQ(scope_releases, 1);
+		UT_ASSERT(!stamp_live && reserved_target == NULL);
+		UT_ASSERT_EQ(census.entries[0].input.slot.status, TT_SLOT_ACTIVE);
+	}
+}
+
 int main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(20);
 	UT_RUN(test_original_owner_binds_complete_empty_census_after_done);
 	UT_RUN(test_native_owner_rejects_uninstalled_recovery_and_writer_drift);
 	UT_RUN(test_current_rechecks_owner_process_boot_and_exact_writer);
@@ -738,6 +806,8 @@ int main(void)
 	UT_RUN(test_actual_startup_consumer_requires_numeric_candidate_under_revalidated_scope);
 	UT_RUN(test_actual_startup_consumer_reserves_original_target_then_releases_before_scope);
 	UT_RUN(test_actual_startup_reservation_failure_or_stale_owner_preserves_active_and_releases);
+	UT_RUN(test_actual_startup_prepares_exact_fd_before_releasing_original_guards);
+	UT_RUN(test_actual_startup_fd_failure_or_post_io_stale_releases_without_mutation);
 	reset();
 	if (allocations != frees) { fprintf(stderr, "unreleased start resources\n"); return 1; }
 	UT_DONE();

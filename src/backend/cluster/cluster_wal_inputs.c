@@ -13,11 +13,13 @@
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_recovery_tt_record.h"
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_wal_cut.h"
+#include "cluster/storage/cluster_shared_fs.h"
 #include "common/cryptohash.h"
 #include "miscadmin.h"
 #include "postmaster/bgwriter.h"
@@ -1374,6 +1376,38 @@ inputs_overlap(const void *a, Size a_size, const void *b, Size b_size)
 
 	return a != NULL && b != NULL
 		   && (left <= right ? right - left < a_size : left - right < b_size);
+}
+
+bool
+cluster_wal_inputs_tx_abort_path_v1(ClusterWalInputsV1 *inputs,
+	const ClusterRecoveryTTAbortV1 *record, char *out, size_t out_size)
+{
+	ClusterRecoveryTTAbortDerivationV1 candidate;
+	char path[MAXPGPATH];
+
+	/* Do not clear output that aliases the retained subject or this scope. */
+	if (out == NULL || out_size == 0
+		|| inputs_overlap(out, out_size, record, sizeof(*record))
+		|| inputs_overlap(out, out_size, inputs, sizeof(*inputs))
+		|| (inputs_owned(inputs) && inputs->purpose == WAL_INPUTS_TX_CLOSURE
+			&& (inputs_overlap(out, out_size, inputs->tx.subject, sizeof(*inputs->tx.subject))
+				|| inputs_overlap(out, out_size, inputs->tx.inputs, sizeof(*inputs->tx.inputs)))))
+		return false;
+	out[0] = '\0';
+	if (!inputs_current(inputs) || inputs->purpose != WAL_INPUTS_TX_CLOSURE
+		|| !cluster_recovery_tt_abort_valid_v1(record)
+		|| !ClusterColdRecoveryTxC0Candidate(inputs->tx.start, inputs->tx.subject, &candidate)
+		|| memcmp(record, &candidate.record, sizeof(*record)) != 0)
+		return false;
+	if (cluster_shared_fs_undo_path_resolve(record->exact.instance, record->exact.segment_id,
+			path, sizeof(path)) != 0
+		|| !inputs_current(inputs)
+		|| !ClusterColdRecoveryTxC0Candidate(inputs->tx.start, inputs->tx.subject, &candidate)
+		|| memcmp(record, &candidate.record, sizeof(*record)) != 0
+		|| strlen(path) >= out_size)
+		return false;
+	memcpy(out, path, strlen(path) + 1);
+	return true;
 }
 
 /* CF is already held on the exact whole ROOT. This scratch selection owns

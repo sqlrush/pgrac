@@ -3208,6 +3208,8 @@ WAL_INPUT_CONTRIBUTION_TEST_OBJS = $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
 # execute their production implementations.
 test_cluster_wal_inputs_product.o: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c \
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_tt_record.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_shared_fs.h \
 		$(top_srcdir)/src/include/access/xlogrecovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
@@ -9651,11 +9653,14 @@ test_cluster_ko_space.inc: $(top_srcdir)/src/backend/cluster/cluster_space_stora
 # Exact held-FD storage seam; recovery authority/path and ResourceOwner
 # callbacks are fixtures, while the file and smgr operations are real.
 test_cluster_recovery_tt_io: test_cluster_recovery_tt_io.c unit_test.h \
+		test_cluster_undo_segment_init.o \
 		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
 		$(top_srcdir)/src/include/cluster/cluster_undo_smgr.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_tt_record.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		test_cluster_undo_segment_init.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
@@ -9733,6 +9738,7 @@ test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_ow
         $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_tt_record.h \
         $(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+        $(top_srcdir)/src/include/cluster/cluster_undo_smgr.h \
         $(top_srcdir)/src/include/cluster/storage/cluster_undo_block0.h \
         $(top_srcdir)/src/include/cluster/cluster_wal_writer.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@

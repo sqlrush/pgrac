@@ -6,11 +6,13 @@
  * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md
  *-------------------------------------------------------------------------
  */
+#define USE_PGRAC_CLUSTER 1
 #include "postgres.h"
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_undo_segment_init.h"
 #include "cluster/storage/cluster_undo_block0.h"
@@ -40,6 +42,21 @@ static int write_fd = -1;
 static ClusterRecoveryTTAbortV1 record;
 static PGAlignedBlock initial;
 static bool header_locked;
+static char tx_scope_storage;
+static bool tx_scope_current;
+static int tx_resolves;
+
+bool
+cluster_wal_inputs_tx_abort_path_v1(ClusterWalInputsV1 *inputs,
+	const ClusterRecoveryTTAbortV1 *candidate, char *out, size_t size)
+{
+	tx_resolves++;
+	if (!tx_scope_current || inputs != (ClusterWalInputsV1 *)&tx_scope_storage
+		|| memcmp(candidate, &record, sizeof(record)) != 0 || strlen(test_file) >= size)
+		return false;
+	memcpy(out, test_file, strlen(test_file) + 1);
+	return true;
+}
 
 bool
 cluster_undo_block0_header_write_lock(uint32 segment, uint8 owner, uint32 *acquired)
@@ -199,6 +216,8 @@ reset_file(bool already)
 	UT_ASSERT_EQ(external_fds, 0);
 	UT_ASSERT(!header_locked);
 	opens = resolves = reads = writes = syncs = closes = 0;
+	tx_resolves = 0;
+	tx_scope_current = true;
 	scope_current = capacity = true;
 	open_error = read_short = write_short = sync_error = close_error = stat_error = false;
 	corrupt_postread = false;
@@ -299,6 +318,58 @@ UT_TEST(test_exact_durable_slot_preserves_whole_header_and_head)
 	UT_ASSERT(cluster_undo_smgr_recovery_abort_close_v1(stamp));
 	UT_ASSERT_EQ(external_fds, 0);
 	UT_ASSERT(fcntl(write_fd, F_GETFD) < 0 && errno == EBADF);
+}
+
+UT_TEST(test_cold_prepare_uses_exact_tx_scope_without_redo_path_or_writes)
+{
+	ClusterUndoSmgrRecoveryStampV1 stamp;
+	PGAlignedBlock actual;
+	int fd;
+	reset_file(false);
+	scope_current = false; /* No pre-EOR redo scope exists at this boundary. */
+	UT_ASSERT(cluster_undo_smgr_recovery_abort_prepare_tx_v1(
+		(ClusterWalInputsV1 *)&tx_scope_storage, &record, &stamp));
+	UT_ASSERT(stamp.token != 0);
+	UT_ASSERT_EQ(tx_resolves, 1);
+	UT_ASSERT_EQ(resolves, 0);
+	UT_ASSERT_EQ(external_fds, 1);
+	UT_ASSERT_EQ(writes + syncs, 0);
+	UT_ASSERT(cluster_undo_smgr_recovery_abort_close_v1(stamp));
+	UT_ASSERT_EQ(external_fds, 0);
+	fd = open(test_file, O_RDONLY);
+	UT_ASSERT(fd >= 0);
+	if (fd >= 0) {
+		UT_ASSERT_EQ(pread(fd, actual.data, BLCKSZ, 0), BLCKSZ);
+		UT_ASSERT(memcmp(actual.data, initial.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(close(fd), 0);
+	}
+}
+
+UT_TEST(test_cold_prepare_refuses_bad_scope_crc_before_image_and_releases_owner)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		ClusterUndoSmgrRecoveryStampV1 stamp = { .token = 99 };
+		ClusterWalInputsV1 *inputs = (ClusterWalInputsV1 *)&tx_scope_storage;
+		bool ok;
+		reset_file(false);
+		switch (fault) {
+		case 0: tx_scope_current = false; break;
+		case 1: inputs = NULL; break;
+		case 2: change_byte(BLCKSZ - 1, 0x6b); break;
+		case 3: read_short = true; break;
+		case 4: capacity = false; break;
+		case 5: record.before.flags ^= 1; break;
+		case 6: break;
+		}
+		ok = cluster_undo_smgr_recovery_abort_prepare_tx_v1(inputs, &record, &stamp);
+		UT_ASSERT_EQ(ok, fault == 6);
+		if (ok) {
+			release_callback(RESOURCE_RELEASE_AFTER_LOCKS, false, true, release_arg);
+			UT_ASSERT(!cluster_undo_smgr_recovery_abort_write_v1(stamp));
+		} else UT_ASSERT_EQ(stamp.token, 0);
+		UT_ASSERT_EQ(external_fds, 0);
+		UT_ASSERT_EQ(writes + syncs + resolves, 0);
+	}
 }
 UT_TEST(test_idempotent_still_syncs_and_reads_without_rewriting)
 {
@@ -465,8 +536,10 @@ main(void)
 		return 2;
 	snprintf(test_dir, sizeof(test_dir), "%s", dir);
 	snprintf(test_file, sizeof(test_file), "%s/seg_257.dat", dir);
-	UT_PLAN(7);
+	UT_PLAN(9);
 	UT_RUN(test_exact_durable_slot_preserves_whole_header_and_head);
+	UT_RUN(test_cold_prepare_uses_exact_tx_scope_without_redo_path_or_writes);
+	UT_RUN(test_cold_prepare_refuses_bad_scope_crc_before_image_and_releases_owner);
 	UT_RUN(test_idempotent_still_syncs_and_reads_without_rewriting);
 	UT_RUN(test_prepare_refusals_do_not_leak_or_write);
 	UT_RUN(test_changed_header_or_unlinked_file_is_sticky_refusal);

@@ -51,6 +51,7 @@
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_undo_segment_init.h"
+#include "cluster/cluster_wal_inputs.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_block0.h"
 
@@ -640,24 +641,20 @@ recovery_header_stamp_file_matches(const struct stat *observed)
 		   && observed->st_size == expected->st_size;
 }
 
-bool
-cluster_undo_smgr_recovery_abort_prepare_v1(const ClusterRecoveryTTAbortV1 *record,
-											ClusterUndoSmgrRecoveryStampV1 *out)
+static bool
+recovery_abort_prepare_path(const ClusterRecoveryTTAbortV1 *record, const char *path,
+	ClusterUndoSmgrRecoveryStampV1 *out)
 {
 	RecoveryHeaderStamp *stage = &recovery_header_stamp;
 	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)stage->before.data;
 	struct stat after;
-	char path[MAXPGPATH];
 	int fd;
 
 	if (out == NULL)
 		return false;
 	out->token = 0;
 	if (CurrentResourceOwner == NULL || stage->fd >= 0 || recovery_header_stamp_serial == UINT64_MAX
-		|| !cluster_recovery_tt_abort_valid_v1(record)
-		|| cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED, record->exact.instance,
-									 record->exact.segment_id, path, sizeof(path))
-			   != 0)
+		|| path == NULL || !cluster_recovery_tt_abort_valid_v1(record))
 		return false;
 	/* Registration and descriptor reservation precede opening the target. */
 	if (!recovery_header_stamp_registered) {
@@ -708,6 +705,39 @@ cluster_undo_smgr_recovery_abort_prepare_v1(const ClusterRecoveryTTAbortV1 *reco
 refused:
 	(void)recovery_header_stamp_release();
 	return false;
+}
+
+bool
+cluster_undo_smgr_recovery_abort_prepare_v1(const ClusterRecoveryTTAbortV1 *record,
+	ClusterUndoSmgrRecoveryStampV1 *out)
+{
+	char path[MAXPGPATH];
+
+	if (out == NULL)
+		return false;
+	out->token = 0;
+	if (CurrentResourceOwner == NULL || recovery_header_stamp.fd >= 0
+		|| recovery_header_stamp_serial == UINT64_MAX || !cluster_recovery_tt_abort_valid_v1(record)
+		|| cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED, record->exact.instance,
+				record->exact.segment_id, path, sizeof(path)) != 0)
+		return false;
+	return recovery_abort_prepare_path(record, path, out);
+}
+
+bool
+cluster_undo_smgr_recovery_abort_prepare_tx_v1(ClusterWalInputsV1 *inputs,
+	const ClusterRecoveryTTAbortV1 *record, ClusterUndoSmgrRecoveryStampV1 *out)
+{
+	char path[MAXPGPATH];
+
+	if (out == NULL)
+		return false;
+	out->token = 0;
+	if (CurrentResourceOwner == NULL || recovery_header_stamp.fd >= 0
+		|| recovery_header_stamp_serial == UINT64_MAX || !cluster_recovery_tt_abort_valid_v1(record)
+		|| !cluster_wal_inputs_tx_abort_path_v1(inputs, record, path, sizeof(path)))
+		return false;
+	return recovery_abort_prepare_path(record, path, out);
 }
 
 bool
