@@ -9,6 +9,7 @@
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_wal_inputs.h"
+#include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_tail.h"
 #include "cluster/storage/cluster_shared_fs.h"
 #include "unit_test.h"
@@ -22,7 +23,8 @@ bool cluster_undo_gcs_coherence = true;
 static ClusterConf conf;
 ClusterConf *ClusterConfShmem = &conf;
 static const RfSideOnlinePlanV1 *plan = (const RfSideOnlinePlanV1 *)(uintptr_t)1;
-static ClusterWalSourceRef sources[2], live_sources[2];
+static ClusterWalSourceRef sources[2], live_sources[2], restart_source;
+static bool restart_present;
 static ClusterControlRootSnapshot roots[2];
 static ClusterControlRootReadToken tokens[2];
 static ClusterRecoverySerialGuard serials[2];
@@ -47,6 +49,17 @@ static unsigned order_count;
 static char tx_inputs_storage;
 static bool tx_mode, tx_current, tx_durable;
 static unsigned tx_revalidates, tx_fail_revalidate;
+
+bool
+cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!restart_present || restart_source.claim.identity.origin_node_id != cluster_node_id
+		|| restart_source.claim.identity.origin_thread_id != cluster_node_id + 1)
+		return false;
+	*out = restart_source;
+	return true;
+}
 
 bool
 cluster_wal_inputs_tx_abort_current_v1(ClusterWalInputsV1 *inputs,
@@ -113,6 +126,9 @@ inject(int stage)
 		return;
 	}
 	switch (drift_kind) {
+	case 10:
+		restart_source.claim.claim_sha256[0] ^= 1;
+		break;
 	case 0:
 		current[0] = CLUSTER_THREAD_AUTHORITY_PIN_STALE;
 		break;
@@ -234,8 +250,9 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *root,
 	for (int i = 0; i < 2; i++) {
 		if (root->identity.origin_thread_id != roots[i].identity.origin_thread_id)
 			continue;
-		UT_ASSERT(memcmp(root, &roots[i], sizeof(*root)) == 0);
-		UT_ASSERT(memcmp(token, &tokens[i], sizeof(*token)) == 0);
+		if (memcmp(root, &roots[i], sizeof(*root)) != 0
+			|| memcmp(token, &tokens[i], sizeof(*token)) != 0)
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		*out = live_sources[i];
 		*redo = 100;
 		return fail_read_source == i ? CLUSTER_CONTROL_ROOT_IO_ERROR
@@ -434,6 +451,9 @@ reset(void)
 	memset(&operation, 0, sizeof(operation));
 	memset(order, 0, sizeof(order));
 	order_count = 0;
+	cluster_node_id = 0;
+	restart_present = false;
+	memset(&restart_source, 0, sizeof(restart_source));
 	tx_mode = tx_current = tx_durable = false;
 	tx_revalidates = tx_fail_revalidate = 0;
 	conf.node_count = 4;
@@ -534,6 +554,101 @@ no_path(void)
 		1, operation.recovery_abort.exact.xid));
 	UT_ASSERT_EQ(cluster_undo_recovery_path_resolve_v1(2, 257, path, sizeof(path)), -1);
 	UT_ASSERT_EQ(cluster_undo_recovery_intent_for_owner(2), CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL);
+}
+
+static void
+native_reset(void)
+{
+	reset();
+	cluster_node_id = 2;
+	restart_present = true;
+	restart_source = sources[0];
+}
+
+static bool
+apply_native(void)
+{
+	return cluster_undo_recovery_abort_replay_native_v1(plan, 0, &operation.identity,
+		&roots[0], &tokens[0], &authorities[1]);
+}
+
+UT_TEST(retained_own_c0_replays_under_restart_root_and_foreign_target)
+{
+	native_reset();
+	/* Own WAL source is not a borrowed failed-node mutation duty. */
+	current[0] = CLUSTER_THREAD_AUTHORITY_PIN_STALE;
+	UT_ASSERT(apply_native());
+	UT_ASSERT(strcmp(order, "WTPSAVMQC") == 0);
+	UT_ASSERT_EQ(disk_slot.status, TT_SLOT_ABORTED);
+	UT_ASSERT_EQ(clog_applies, 1);
+	UT_ASSERT_EQ(projection_stores, 1);
+	UT_ASSERT_EQ(closes, 1);
+	no_path();
+}
+
+UT_TEST(retained_own_c0_requires_exact_restart_and_separate_target)
+{
+	for (int fault = 0; fault < 13; fault++) {
+		ClusterControlRootSnapshot root;
+		ClusterControlRootReadToken token;
+		native_reset();
+		root = roots[0];
+		token = tokens[0];
+		switch (fault) {
+		case 0: restart_present = false; break;
+		case 1: restart_source.claim.claim_sha256[0] ^= 1; break;
+		case 2: restart_source.claim.identity.origin_owner_incarnation++; break;
+		case 3: restart_source.claim.database_incarnation++; break;
+		case 4: restart_source.claim.max_config_generation++; break;
+		case 5: restart_source.timeline++; break;
+		case 6: cluster_node_id = 0; break;
+		case 7: root.tail_last_record_crc32c++; break;
+		case 8: token.file_txn_seq++; break;
+		case 9: current[1] = CLUSTER_THREAD_AUTHORITY_PIN_STALE; break;
+		case 10: serials[1].mode = CLUSTER_RECOVERY_SERIAL_ONLINE; break;
+		case 11: replay_window = false; break;
+		case 12: live_sources[0].claim.claim_sha256[0] ^= 1; break;
+		}
+		UT_ASSERT(!cluster_undo_recovery_abort_replay_native_v1(plan, 0, &operation.identity,
+			&root, &token, &authorities[1]));
+		UT_ASSERT_EQ(sync_calls + path_calls + writes, 0);
+		no_path();
+	}
+}
+
+UT_TEST(retained_own_c0_rechecks_restart_target_and_source_at_io_boundaries)
+{
+	const int faults[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+	for (int stage = 1; stage <= 8; stage++)
+		for (unsigned f = 0; f < lengthof(faults); f++) {
+			native_reset();
+			drift_stage = stage;
+			drift_kind = faults[f];
+			UT_ASSERT(!apply_native());
+			UT_ASSERT_EQ(closes, stage >= 3 ? 1 : 0);
+			no_path();
+		}
+}
+
+UT_TEST(retained_own_c0_errors_revoke_scope_and_close_exact_descriptor)
+{
+	for (int stage = 1; stage <= 8; stage++) {
+		volatile bool caught = false;
+		native_reset();
+		throw_stage = stage;
+		PG_TRY();
+		{
+			(void)apply_native();
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(closes, stage >= 3 ? 1 : 0);
+		no_path();
+	}
 }
 
 UT_TEST(exact_c0_replay_binds_two_owners_and_durable_order)
@@ -880,7 +995,11 @@ UT_TEST(new_c0_error_revokes_capability_without_releasing_callers_fd)
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(18);
+	UT_RUN(retained_own_c0_replays_under_restart_root_and_foreign_target);
+	UT_RUN(retained_own_c0_requires_exact_restart_and_separate_target);
+	UT_RUN(retained_own_c0_rechecks_restart_target_and_source_at_io_boundaries);
+	UT_RUN(retained_own_c0_errors_revoke_scope_and_close_exact_descriptor);
 	UT_RUN(exact_c0_replay_binds_two_owners_and_durable_order);
 	UT_RUN(missing_authority_or_changed_claim_refuses_before_io);
 	UT_RUN(wrong_record_or_crossed_authorities_never_resolve_a_path);

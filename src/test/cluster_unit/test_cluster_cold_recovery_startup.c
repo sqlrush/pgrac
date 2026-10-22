@@ -2544,6 +2544,98 @@ c0_fixture(ClusterColdRecordV1 *record, uint32 target)
 	return typed;
 }
 
+static ClusterColdTypedV1 *
+own_c0_fixture(ClusterColdRecordV1 *record)
+{
+	ClusterColdTypedV1 *typed = c0_fixture(record, 2);
+	RfSideOnlineOperationV1 *op = &side_fixture[0].operations[0];
+
+	*op = side_fixture[1].operations[1];
+	op->identity.record.origin_thread = 1;
+	op->recovery_abort.writer_thread = 1;
+	op->recovery_abort.writer_incarnation = 11;
+	side_fixture[0].operation_count = 1;
+	/* Keep the fixture's foreign source free of a second C0 dependency. */
+	side_fixture[1].operation_count = 0;
+	restart_ref = typed->sources[0];
+	return typed;
+}
+
+UT_TEST(test_own_c0_dispatch_uses_restart_source_and_original_target)
+{
+	ClusterColdRecordV1 record;
+	ClusterColdTypedV1 *typed = own_c0_fixture(&record);
+	uint32 target = CLUSTER_COLD_NO_INDEX;
+	uint32 order[CLUSTER_COLD_MAX_PARTICIPANTS];
+
+	UT_ASSERT(cluster_cold_typed_record_target_v1(typed,
+		(ClusterRecoveryFencePlan *)&fixture_context, 0, &record, &target));
+	UT_ASSERT_EQ(target, 2);
+	UT_ASSERT(cluster_cold_typed_drain_order_v1(typed,
+		(ClusterRecoveryFencePlan *)&fixture_context, order, typed->participant_count));
+	UT_ASSERT_EQ(order[typed->participant_count - 1], 0);
+	UT_ASSERT(cluster_cold_typed_side_record_v1(typed,
+		(ClusterRecoveryFencePlan *)&fixture_context, 0, &record));
+	UT_ASSERT_EQ(c0_calls, 1);
+	UT_ASSERT_EQ(control_init_calls, 0);
+	UT_ASSERT_EQ(control_calls, 0);
+	cluster_cold_replay_window_leave_v1();
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
+UT_TEST(test_own_c0_source_or_target_refusal_never_calls_owner)
+{
+	for (int fault = 0; fault < 12; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = own_c0_fixture(&record);
+		switch (fault) {
+		case 0: restart_ref_present = false; break;
+		case 1: restart_ref.claim.claim_sha256[0] ^= 1; break;
+		case 2: restart_ref.claim.identity.origin_owner_incarnation++; break;
+		case 3: restart_ref.claim.database_incarnation++; break;
+		case 4: restart_ref.claim.max_config_generation++; break;
+		case 5: restart_ref.timeline++; break;
+		case 6: side_fixture[0].cut.scan_begin_inclusive++; break;
+		case 7: c0_target_current = false; break;
+		case 8: typed->source_drained[2] = false; break;
+		case 9: side_fixture[0].operations[0].recovery_target_source = 0; break;
+		case 10: record.info = XLOG_UNDO_TT_SLOT_ABORT; break;
+		case 11: fence_current = false; break;
+		}
+		UT_ASSERT(!cluster_cold_typed_side_record_v1(typed,
+			(ClusterRecoveryFencePlan *)&fixture_context, 0, &record));
+		UT_ASSERT_EQ(c0_calls, 0);
+		UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_own_c0_rechecks_restart_and_target_after_owner)
+{
+	for (int fault = 1; fault <= 4; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = own_c0_fixture(&record);
+		volatile bool caught = false;
+		c0_fault = fault;
+		PG_TRY();
+		{
+			UT_ASSERT(!cluster_cold_typed_side_record_v1(typed,
+				(ClusterRecoveryFencePlan *)&fixture_context, 0, &record));
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 2);
+		UT_ASSERT_EQ(c0_calls, 1);
+		UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
 UT_TEST(test_c0_dispatch_binds_writer_and_target_separately)
 {
 	for (uint32 target = 1; target <= 2; target++) {
@@ -3427,7 +3519,10 @@ UT_TEST(test_checkpoint_export_clears_unsealed_and_failed_output)
 int
 main(void)
 {
-	UT_PLAN(121);
+	UT_PLAN(124);
+	UT_RUN(test_own_c0_dispatch_uses_restart_source_and_original_target);
+	UT_RUN(test_own_c0_source_or_target_refusal_never_calls_owner);
+	UT_RUN(test_own_c0_rechecks_restart_and_target_after_owner);
 	UT_RUN(test_prepare_rechecks_physical_profiles_of_every_original_origin);
 	UT_RUN(test_prepare_checks_empty_physical_profiles_including_history_only_origin);
 	UT_RUN(test_endpoints_recheck_physical_profiles_and_discard_stale_inputs);

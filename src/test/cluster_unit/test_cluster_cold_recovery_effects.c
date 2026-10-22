@@ -2675,7 +2675,7 @@ UT_TEST(test_foreign_c0_routes_whole_record_to_exact_side_consumer)
 				 0);
 	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&out.record), CLUSTER_COLD_UNSCHEDULED_FOREIGN_SIDE);
 	UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, false));
-	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, true));
+	UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, true));
 	step = step_for(&out, CLUSTER_COLD_STEP_PAGE);
 	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, &step, false));
 	step = step_for(&out, CLUSTER_COLD_STEP_SPACE);
@@ -2683,21 +2683,27 @@ UT_TEST(test_foreign_c0_routes_whole_record_to_exact_side_consumer)
 	cluster_cold_decoded_release_v1(&out);
 }
 
-UT_TEST(test_own_c0_is_never_native_or_history_no_effect)
+UT_TEST(test_own_c0_uses_only_the_exact_typed_consumer)
 {
 	EffectRecord r;
 	ClusterColdDecodedV1 out = { 0 };
+
 	recovery_abort_record(&r);
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 9, uuid, false, false, &out),
 				 CLUSTER_COLD_OK);
-	/* Own C0 still has no native consumer, including below native redo. */
-	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_UNSUPPORTED);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
 	UT_ASSERT_EQ(out.effects.required, CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_TT
 										   | CLUSTER_COLD_EFFECT_TERMINAL);
-	UT_ASSERT_EQ(out.effects.refused, out.effects.required);
-	UT_ASSERT_EQ(out.effects.native_apply | out.effects.no_effect, 0);
+	UT_ASSERT_EQ(out.effects.native_apply, out.effects.required);
+	UT_ASSERT_EQ(out.effects.refused | out.effects.no_effect, 0);
+	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&out.record), CLUSTER_COLD_UNSCHEDULED_FOREIGN_SIDE);
+	UT_ASSERT(cluster_cold_replay_effects_v1(&out, NULL, true));
+	/* A caller cannot extend the own-writer exception to other SIDE records. */
+	out.record.info = XLOG_UNDO_TT_SLOT_ABORT;
 	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, true));
-	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, false));
+	out.record.info = XLOG_UNDO_RECOVERY_TT_ABORT;
+	out.record.rmid = RM_CLOG_ID;
+	UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, true));
 	cluster_cold_decoded_release_v1(&out);
 }
 
@@ -2819,9 +2825,9 @@ UT_TEST(test_original_startup_dependency_decodes_before_target_owner)
 			record.end_rec_ptr--;
 			break;
 		}
-		UT_ASSERT_EQ(cluster_typed_replay_dependency(&replay, 1, &record, &target), fault == 0);
-		UT_ASSERT_EQ(target, fault == 0 ? 2 : CLUSTER_COLD_NO_INDEX);
-		UT_ASSERT_EQ(dependency_calls, fault <= 1 ? 1 : 0);
+		UT_ASSERT_EQ(cluster_typed_replay_dependency(&replay, 1, &record, &target), fault == 0 || fault == 6);
+		UT_ASSERT_EQ(target, fault == 0 || fault == 6 ? 2 : CLUSTER_COLD_NO_INDEX);
+		UT_ASSERT_EQ(dependency_calls, fault <= 1 || fault == 6 ? 1 : 0);
 		UT_ASSERT(replay.current[1] == (fault == 8 ? NULL : &r.reader));
 		cluster_cold_decoded_release_v1(&replay.decoded);
 	}
@@ -3097,7 +3103,7 @@ main(void)
 	UT_RUN(test_original_startup_dependency_decodes_before_target_owner);
 	UT_RUN(test_original_startup_dependency_leaves_non_c0_with_existing_dispatch);
 	UT_RUN(test_foreign_c0_routes_whole_record_to_exact_side_consumer);
-	UT_RUN(test_own_c0_is_never_native_or_history_no_effect);
+	UT_RUN(test_own_c0_uses_only_the_exact_typed_consumer);
 	UT_RUN(test_c0_route_rejects_unowned_envelope_effects);
 	UT_RUN(test_c0_route_keeps_complete_bounded_payload_validation);
 	UT_RUN(test_foreign_compound_uses_scheduled_whole_commit_consumer);

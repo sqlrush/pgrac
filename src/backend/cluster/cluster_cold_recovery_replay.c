@@ -122,7 +122,9 @@ cluster_cold_replay_effects_v1(const ClusterColdDecodedV1 *decoded, const Cluste
 		case CLUSTER_COLD_UNSCHEDULED_FOREIGN_NOOP:
 			return !own && e->no_effect == e->required;
 		case CLUSTER_COLD_UNSCHEDULED_FOREIGN_SIDE:
-			return !own && e->native_apply == e->required;
+			return (!own || (record->rmid == RM_CLUSTER_UNDO_ID
+							 && record->info == XLOG_UNDO_RECOVERY_TT_ABORT))
+				   && e->native_apply == e->required;
 		case CLUSTER_COLD_UNSCHEDULED_SPACE_SKIP:
 			return record->rmid == RM_SMGR_ID && record->space_count == 1
 				   && e->space_apply == e->required

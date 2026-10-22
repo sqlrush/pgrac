@@ -1576,18 +1576,16 @@ cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
 	return cold_participant_authority(typed, fence, participant, &authority);
 }
 
-/* Rebind the same immutable whole-source authority for record execution
- * and for the sequencer's post-drain physical durability check. */
+/* Match the original complete SIDE capture independently of writer kind. */
 static bool
-cold_side_source_authority(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence,
-						   uint32 participant, ClusterThreadRecoveryAuthorityV1 *authority)
+cold_side_source_matches(ClusterColdTypedV1 *typed, uint32 participant)
 {
 	const ClusterColdParticipantV1 *source;
 	RfContributorStreamCutV1 cut = { 0 };
-	if (participant >= CLUSTER_COLD_MAX_PARTICIPANTS || typed->side_capture_detail[participant] != 0
-		|| typed->side_plans[participant] == NULL
-		|| !cold_participant_authority(typed, fence, participant, authority))
+	if (participant >= typed->participant_count || participant >= CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->side_capture_detail[participant] != 0 || typed->side_plans[participant] == NULL)
 		return false;
+
 	source = &typed->participants[participant];
 	cut.failed_thread = source->thread_id;
 	cut.timeline_id = source->timeline;
@@ -1603,6 +1601,16 @@ cold_side_source_authority(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *
 			   typed->observer.database_incarnation, source->native_redo);
 }
 
+/* Rebind the same immutable whole-source authority for record execution
+ * and for the sequencer's post-drain physical durability check. */
+static bool
+cold_side_source_authority(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence,
+	uint32 participant, ClusterThreadRecoveryAuthorityV1 *authority)
+{
+	return cold_side_source_matches(typed, participant)
+		&& cold_participant_authority(typed, fence, participant, authority);
+}
+
 static bool
 cold_source_ref_matches(const ClusterWalSourceRef *a, const ClusterWalSourceRef *b)
 {
@@ -1611,6 +1619,29 @@ cold_source_ref_matches(const ClusterWalSourceRef *a, const ClusterWalSourceRef 
 		   && a->claim.max_config_generation == b->claim.max_config_generation
 		   && memcmp(a->claim.claim_sha256, b->claim.claim_sha256, 32) == 0
 		   && a->timeline == b->timeline;
+}
+
+/* A retained C0 in our restart stream is not a foreign duty. Its writer
+ * remains the original restart claim/ROOT; only the target borrows the
+ * independent cold authority. Ordinary local SIDE records keep their owner. */
+static bool
+cold_c0_source_authority(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence,
+	uint32 participant, ClusterThreadRecoveryAuthorityV1 *authority)
+{
+	ClusterWalSourceRef restart;
+
+	if (participant != typed->own_participant)
+		return cold_side_source_authority(typed, fence, participant, authority);
+	memset(authority, 0, sizeof(*authority));
+	return fence != NULL && cluster_cold_replay_window_active_v1() && typed->plan != NULL
+		&& typed->replay_roots != NULL && typed->own_participant == 0 && typed->replay_count != 0
+		&& typed->replay_count <= typed->participant_count
+		&& typed->participant_count <= CLUSTER_COLD_MAX_PARTICIPANTS
+		&& typed->replay_root_count == typed->replay_count
+		&& cold_replay_sources_current(typed, fence) && cold_side_source_matches(typed, participant)
+		&& cluster_wal_thread_restart_v2_ref(&restart)
+		&& cold_source_ref_matches(&restart, &typed->sources[participant])
+		&& cold_replay_sources_current(typed, fence);
 }
 
 /* Resolve the original bound identities, never source-array proximity. */
@@ -1661,7 +1692,7 @@ cluster_cold_typed_record_target_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFe
 	cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "pass-2 C0 target dependency is incomplete");
 	if (cold_record_side_kind(record) != RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT
 		|| record->component_count != 0 || record->space_count != 0
-		|| !cold_side_source_authority(typed, fence, participant, &authority))
+		|| !cold_c0_source_authority(typed, fence, participant, &authority))
 		return false;
 	source = &typed->participants[participant];
 	plan = typed->side_plans[participant];
@@ -1810,10 +1841,17 @@ cold_recovery_abort_record(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *
 	/* Same-source C0 follows its original stream prefix. A different source
 	 * must have consumed its complete captured cut first; never compare LSNs
 	 * from different streams or treat the writer checkpoint as target cover. */
-	return match != UINT32_MAX && (match == participant || typed->source_drained[match])
-		   && cold_participant_authority(typed, fence, match, &target)
-		   && cluster_undo_recovery_abort_replay_v1(plan, index, identity, writer, &target)
-		   && cold_control_authority_current(&target);
+	if (match == UINT32_MAX || (match != participant && !typed->source_drained[match])
+		|| !cold_participant_authority(typed, fence, match, &target))
+		return false;
+	if (participant == typed->own_participant) {
+		const ColdRoot *selected = &typed->replay_roots[participant];
+		if (!cluster_undo_recovery_abort_replay_native_v1(
+				plan, index, identity, &selected->root, &selected->token, &target))
+			return false;
+	} else if (!cluster_undo_recovery_abort_replay_v1(plan, index, identity, writer, &target))
+		return false;
+	return cold_control_authority_current(&target);
 }
 
 /* A compound dispatch must retain every originally decoded SPACE payload.
@@ -1887,7 +1925,9 @@ cluster_cold_typed_side_record_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFenc
 				"pass-2 foreign SIDE record consumption is incomplete");
 	if (record == NULL || (kind = cold_record_side_kind(record)) == RF_SIDE_ONLINE_OPERATION_INVALID
 		|| record->component_count != 0
-		|| !cold_side_source_authority(typed, fence, participant, &authority))
+		|| !(kind == RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT
+			 ? cold_c0_source_authority(typed, fence, participant, &authority)
+			 : cold_side_source_authority(typed, fence, participant, &authority)))
 		return false;
 	source = &typed->participants[participant];
 	plan = typed->side_plans[participant];
@@ -1944,7 +1984,10 @@ cluster_cold_typed_side_record_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFenc
 			!= RF_PAGE_PROOF_DETAIL_OK)
 			return false;
 	}
-	if (cluster_epoch_get_current() != epoch || !cold_control_authority_current(&authority)
+	if (cluster_epoch_get_current() != epoch
+		|| !(kind == RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT
+			 ? cold_c0_source_authority(typed, fence, participant, &authority)
+			 : cold_control_authority_current(&authority))
 		|| !cold_replay_sources_current(typed, fence))
 		return false;
 	typed->refusal = CLUSTER_COLD_OK;

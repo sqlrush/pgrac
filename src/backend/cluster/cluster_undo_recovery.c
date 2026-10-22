@@ -16,6 +16,7 @@
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_wal_inputs.h"
+#include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_tail.h"
 #include "cluster/storage/cluster_shared_fs.h"
 
@@ -32,6 +33,7 @@ typedef struct RecoveryAbortScope {
 	ClusterWalSourceRef source[2];
 	RfPageOnlineRecordIdentityV1 identity;
 	ClusterRecoveryTTAbortV1 record;
+	bool native_writer;
 	bool clog_active;
 	bool projection_active;
 } RecoveryAbortScope;
@@ -134,6 +136,27 @@ undo_source_equal(const ClusterWalSourceRef *left, const ClusterWalSourceRef *ri
 		   && left->timeline == right->timeline;
 }
 
+/* Our restart claim has no foreign duty. The selected ROOT/token remains
+ * subject to the same physical source checks as the independent target. */
+static bool
+recovery_abort_owner_current(const RecoveryAbortScope *scope, int i)
+{
+	const ClusterThreadRecoveryAuthorityV1 *a = scope->authority[i];
+	const ClusterControlRootSnapshot *root = &scope->root[i];
+	ClusterWalSourceRef restart;
+
+	if (i == 0 && scope->native_writer)
+		return root->identity.origin_node_id == cluster_node_id
+			&& cluster_wal_thread_restart_v2_ref(&restart)
+			&& undo_source_equal(&restart, &scope->source[0]);
+	return a != NULL && a->duty != NULL && a->root_snapshot != NULL && a->root_token != NULL
+		&& a->serial_guard != NULL && a->serial_guard->mode == CLUSTER_RECOVERY_SERIAL_COLD_FORMED
+		&& memcmp(a->duty, &root->identity, sizeof(root->identity)) == 0
+		&& memcmp(a->root_snapshot, root, sizeof(*root)) == 0
+		&& memcmp(a->root_token, &scope->token[i], sizeof(scope->token[i])) == 0
+		&& cluster_thread_recovery_authority_revalidate_nowait_v1(a) == CLUSTER_THREAD_AUTHORITY_OK;
+}
+
 static bool
 recovery_abort_current(const RecoveryAbortScope *scope)
 {
@@ -153,31 +176,22 @@ recovery_abort_current(const RecoveryAbortScope *scope)
 		|| memcmp(storage.storage_uuid, scope->identity.record.storage_uuid, 16) != 0)
 		return false;
 	for (int i = 0; i < 2; i++) {
-		const ClusterThreadRecoveryAuthorityV1 *a = scope->authority[i];
 		const ClusterControlRootSnapshot *root = &scope->root[i];
 		ClusterWalSourceRef observed;
 		XLogRecPtr redo;
 
-		if (a == NULL || a->duty == NULL || a->root_snapshot == NULL || a->root_token == NULL
-			|| a->serial_guard == NULL
-			|| a->serial_guard->mode != CLUSTER_RECOVERY_SERIAL_COLD_FORMED
-			|| memcmp(a->duty, &root->identity, sizeof(root->identity)) != 0
-			|| memcmp(a->root_snapshot, root, sizeof(*root)) != 0
-			|| memcmp(a->root_token, &scope->token[i], sizeof(scope->token[i])) != 0
+		if (!recovery_abort_owner_current(scope, i)
 			|| memcmp(&scope->source[i].claim.identity, &root->identity, sizeof(root->identity))
 				   != 0
 			|| root->checkpoint_tli != scope->source[i].timeline
 			|| root->tail_tli != root->checkpoint_tli
 			|| root->checkpoint_lower_lsn == InvalidXLogRecPtr
 			|| root->validated_tail_lsn_exclusive <= root->checkpoint_lower_lsn
-			|| cluster_thread_recovery_authority_revalidate_nowait_v1(a)
-				   != CLUSTER_THREAD_AUTHORITY_OK
 			|| cluster_control_root_recovery_source_v1(root, &scope->token[i], &observed, &redo)
 				   != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			|| !undo_source_equal(&observed, &scope->source[i]) || redo == InvalidXLogRecPtr
 			|| redo > root->validated_tail_lsn_exclusive
-			|| cluster_thread_recovery_authority_revalidate_nowait_v1(a)
-				   != CLUSTER_THREAD_AUTHORITY_OK)
+			|| !recovery_abort_owner_current(scope, i))
 			return false;
 		if (i == 0
 			&& (scope->identity.record.read_rec_ptr < redo
@@ -216,11 +230,11 @@ recovery_abort_sync(const RecoveryAbortScope *scope, int i)
 		   && recovery_abort_current(scope);
 }
 
-bool
-cluster_undo_recovery_abort_replay_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
-									  const RfPageOnlineRecordIdentityV1 *identity,
-									  const ClusterThreadRecoveryAuthorityV1 *writer,
-									  const ClusterThreadRecoveryAuthorityV1 *target)
+static bool
+recovery_abort_replay(const RfSideOnlinePlanV1 *plan, uint32 index,
+	const RfPageOnlineRecordIdentityV1 *identity, const ClusterThreadRecoveryAuthorityV1 *writer,
+	const ClusterControlRootSnapshot *writer_root, const ClusterControlRootReadToken *writer_token,
+	const ClusterThreadRecoveryAuthorityV1 *target)
 {
 	RecoveryAbortScope scope = { 0 };
 	RfSideOnlineOperationV1 operation;
@@ -228,6 +242,8 @@ cluster_undo_recovery_abort_replay_v1(const RfSideOnlinePlanV1 *plan, uint32 ind
 	volatile bool ok = false;
 
 	if (active_scope != NULL || active_abort != NULL || active_tx_abort != NULL || identity == NULL
+		|| ((writer_root != NULL) != (writer_token != NULL))
+		|| ((writer != NULL) == (writer_root != NULL))
 		|| !rf_side_online_plan_operation_v1(plan, index, &operation)
 		|| operation.kind != RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT || operation.history_only
 		|| memcmp(&operation.identity, identity, sizeof(*identity)) != 0
@@ -235,6 +251,7 @@ cluster_undo_recovery_abort_replay_v1(const RfSideOnlinePlanV1 *plan, uint32 ind
 		|| !rf_side_online_plan_recovery_abort_sources_v1(plan, index, &scope.source[0],
 														  &scope.source[1]))
 		return false;
+	scope.native_writer = writer_root != NULL;
 	scope.plan = plan;
 	scope.index = index;
 	scope.authority[0] = writer;
@@ -244,15 +261,22 @@ cluster_undo_recovery_abort_replay_v1(const RfSideOnlinePlanV1 *plan, uint32 ind
 	for (int i = 0; i < 2; i++) {
 		const ClusterThreadRecoveryAuthorityV1 *a = scope.authority[i];
 		const ClusterWalSourceRef *source = &scope.source[i];
-		if (a == NULL || a->root_snapshot == NULL || a->root_token == NULL
-			|| !cluster_wal_claim_v2_ref_valid(&source->claim)
+		if (!cluster_wal_claim_v2_ref_valid(&source->claim)
 			|| source->claim.identity.system_identifier != identity->record.system_identifier
 			|| memcmp(source->claim.identity.storage_uuid, identity->record.storage_uuid, 16) != 0)
 			return false;
-		scope.root[i] = *a->root_snapshot;
-		scope.token[i] = *a->root_token;
+		if (i == 0 && scope.native_writer) {
+			scope.root[i] = *writer_root;
+			scope.token[i] = *writer_token;
+		} else {
+			if (a == NULL || a->root_snapshot == NULL || a->root_token == NULL)
+				return false;
+			scope.root[i] = *a->root_snapshot;
+			scope.token[i] = *a->root_token;
+		}
 	}
-	if (scope.source[0].claim.identity.origin_thread_id != scope.record.writer_thread
+	if ((scope.native_writer && scope.source[1].claim.identity.origin_node_id == cluster_node_id)
+		|| scope.source[0].claim.identity.origin_thread_id != scope.record.writer_thread
 		|| scope.source[0].claim.identity.origin_owner_incarnation
 			   != scope.record.writer_incarnation
 		|| scope.source[1].claim.identity.origin_thread_id != scope.record.target_thread
@@ -331,6 +355,23 @@ cluster_undo_recovery_abort_replay_v1(const RfSideOnlinePlanV1 *plan, uint32 ind
 	}
 	PG_END_TRY();
 	return ok;
+}
+
+bool
+cluster_undo_recovery_abort_replay_native_v1(const RfSideOnlinePlanV1 *plan,
+	uint32 index, const RfPageOnlineRecordIdentityV1 *identity,
+	const ClusterControlRootSnapshot *writer_root, const ClusterControlRootReadToken *writer_token,
+	const ClusterThreadRecoveryAuthorityV1 *target)
+{
+	return recovery_abort_replay(plan, index, identity, NULL, writer_root, writer_token, target);
+}
+
+bool
+cluster_undo_recovery_abort_replay_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+	const RfPageOnlineRecordIdentityV1 *identity, const ClusterThreadRecoveryAuthorityV1 *writer,
+	const ClusterThreadRecoveryAuthorityV1 *target)
+{
+	return recovery_abort_replay(plan, index, identity, writer, NULL, NULL, target);
 }
 
 static bool

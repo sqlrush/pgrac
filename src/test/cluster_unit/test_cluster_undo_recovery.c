@@ -15,6 +15,7 @@
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_wal_tail.h"
+#include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_shared_fs.h"
 #include "unit_test.h"
 
@@ -44,6 +45,13 @@ static unsigned wal_sync_calls;
 static int wal_sync_fault;
 
 /* The ordinary scope never enters the separate selected-C0 path. */
+bool
+cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
+{
+	UT_ASSERT(false);
+	return false;
+}
+
 bool
 cluster_cold_replay_window_active_v1(void)
 {

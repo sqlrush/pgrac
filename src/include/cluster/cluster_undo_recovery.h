@@ -33,6 +33,12 @@ extern bool cluster_undo_recovery_abort_replay_v1(const RfSideOnlinePlanV1 *plan
 												  const RfPageOnlineRecordIdentityV1 *identity,
 												  const ClusterThreadRecoveryAuthorityV1 *writer,
 												  const ClusterThreadRecoveryAuthorityV1 *target);
+/* Retained C0 carried by this node's original restart source. The target
+ * still requires its separate current foreign recovery authority. */
+extern bool cluster_undo_recovery_abort_replay_native_v1(const RfSideOnlinePlanV1 *plan,
+	uint32 index, const RfPageOnlineRecordIdentityV1 *identity,
+	const ClusterControlRootSnapshot *writer_root, const ClusterControlRootReadToken *writer_token,
+	const ClusterThreadRecoveryAuthorityV1 *target);
 /* Original post-EOR TX_CLOSURE caller only, after its C0 WAL flush and
  * durable TT stamp have cleared F4. Keep source, target reservation and exact
  * held FD through native top ABORT and derived projection readback. This

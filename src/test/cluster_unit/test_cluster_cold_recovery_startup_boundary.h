@@ -1190,6 +1190,33 @@ cluster_undo_recovery_abort_replay_v1(const RfSideOnlinePlanV1 *plan, uint32 ind
 }
 
 bool
+cluster_undo_recovery_abort_replay_native_v1(const RfSideOnlinePlanV1 *plan,
+	uint32 index, const RfPageOnlineRecordIdentityV1 *identity,
+	const ClusterControlRootSnapshot *writer_root, const ClusterControlRootReadToken *writer_token,
+	const ClusterThreadRecoveryAuthorityV1 *target)
+{
+	c0_calls++;
+	UT_ASSERT(plan == &side_fixture[0]);
+	UT_ASSERT_EQ(index, 0);
+	UT_ASSERT_EQ(memcmp(identity, &plan->operations[index].identity, sizeof(*identity)), 0);
+	UT_ASSERT_EQ(memcmp(writer_root, &roots[1], sizeof(*writer_root)), 0);
+	UT_ASSERT_EQ(memcmp(writer_token, &tokens[1], sizeof(*writer_token)), 0);
+	UT_ASSERT(target->duty == &c0_duty);
+	UT_ASSERT_EQ(cluster_thread_recovery_authority_revalidate_nowait_v1(target),
+		CLUSTER_THREAD_AUTHORITY_OK);
+	UT_ASSERT(cluster_cold_replay_window_active_v1());
+	if (c0_fault == 1)
+		return false;
+	if (c0_fault == 2)
+		siglongjmp(*PG_exception_stack, 1);
+	if (c0_fault == 3)
+		restart_ref.claim.claim_sha256[0] ^= 1;
+	if (c0_fault == 4)
+		c0_target_current = false;
+	return true;
+}
+
+bool
 rf_side_online_plan_native_creation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 									   ClusterSpaceStructureChange *creation)
 {

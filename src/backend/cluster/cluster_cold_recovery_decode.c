@@ -551,11 +551,11 @@ cold_record_flags(XLogReaderState *reader, uint64 system_identifier, const uint8
 														XLogRecGetDataLen(reader), &c0)
 				|| c0.writer_thread != reader->cluster_expected_thread_id)
 				return CLUSTER_COLD_COMPONENT_INVALID;
-			/* Only the original foreign dispatch has a target consumer. It
-			 * still binds both retained sources and the exact target authority;
-			 * own native redo cannot apply this record or skip its history. */
+			/* Both writer kinds use the typed C0 consumer, never generic
+			 * native UNDO redo. The target retains its independent authority
+			 * and both exact retained sources must still match. */
 			*effects |= CLUSTER_COLD_EFFECT_TT | CLUSTER_COLD_EFFECT_TERMINAL;
-			*flags = foreign ? 0 : CLUSTER_COLD_RECORD_UNSUPPORTED;
+			*flags = 0;
 		}
 		return CLUSTER_COLD_OK;
 	case RM_COMMIT_TS_ID:
@@ -1000,6 +1000,13 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 			out->record.record_flags |= CLUSTER_COLD_RECORD_FOREIGN_SIDE;
 		} else
 			out->record.record_flags |= CLUSTER_COLD_RECORD_SIDE_UNOWNED;
+	}
+	if (!foreign && XLogRecGetRmid(reader) == RM_CLUSTER_UNDO_ID
+		&& XLogRecGetInfo(reader) == XLOG_UNDO_RECOVERY_TT_ABORT
+		&& cold_foreign_side(reader, &plan, system_identifier)) {
+		/* The historical flag names typed SIDE dispatch. Only this complete
+		 * dual-identity C0 may use it from our restart stream. */
+		out->record.record_flags |= CLUSTER_COLD_RECORD_FOREIGN_SIDE;
 	}
 	detail = cold_map_components(reader, &plan, system_identifier, storage_uuid, out);
 	if (detail == CLUSTER_COLD_OK) {

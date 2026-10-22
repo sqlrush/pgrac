@@ -2833,6 +2833,7 @@ test_cluster_undo_dir_native.inc: $(top_srcdir)/src/backend/cluster/storage/clus
 	mv $@.tmp $@
 
 test_cluster_undo_recovery_product.o: $(top_srcdir)/src/backend/cluster/cluster_undo_recovery.c \
+		$(top_srcdir)/src/include/cluster/cluster_wal_thread.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_smgr.h \
 		$(top_srcdir)/src/include/cluster/cluster_remote_xact.h \
