@@ -5871,6 +5871,10 @@ startup_complete_formation(const ControlRootImage *root,
 
 		if (!cluster_recovery_checkpoint_observe_v1(&observed)
 			|| observed.slot_generation == 0 || observed.slot_generation == UINT64_MAX
+			|| root->header.system_identifier == 0
+			|| root->header.system_identifier != GetSystemIdentifier()
+			|| observed.owner.writer.ref.claim.identity.system_identifier
+				!= root->header.system_identifier
 			|| observed.owner.owner_boot != cluster_qvotec_get_self_incarnation()
 			|| observed.owner.writer.epoch != formation->local_epoch
 			|| observed.owner.writer.ref.claim.identity.origin_node_id != cluster_node_id

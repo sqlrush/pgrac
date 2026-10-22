@@ -138,6 +138,7 @@ static void (*test_checkpoint_x_hook)(void);
 static void (*test_checkpoint_published_hook)(void);
 static void test_recovered_checkpoint_owner_fixture(const ClusterWalSourceRef *ref,
 																			 uint64 epoch);
+static void test_recovered_checkpoint_owner_system_identifier(uint64 system_identifier);
 static int test_recovery_checkpoint_scope_key;
 static bool test_recovery_checkpoint_current;
 static unsigned test_recovery_checkpoint_reads, test_recovery_checkpoint_revoke_at;
@@ -9405,6 +9406,14 @@ v3_recovered_begin_select(const ClusterWalStartupImage *op)
 	cluster_node_id = op->claim.identity.origin_node_id;
 	test_self_incarnation = test_membership_incarnation
 		= op->claim.identity.origin_owner_incarnation;
+	if (op->input_kind == CLUSTER_WAL_STARTUP_RECOVERED) {
+		test_checkpoint_prefix_ref.claim.identity = op->claim.identity;
+		test_checkpoint_prefix_ref.claim.database_incarnation = op->database_incarnation;
+		test_checkpoint_prefix_ref.claim.max_config_generation = op->config_generation;
+		test_checkpoint_prefix_ref.timeline = op->timeline;
+		test_recovered_writer_epoch = test_epoch;
+		test_recovered_checkpoint_owner_fixture(&test_checkpoint_prefix_ref, test_epoch);
+	}
 }
 
 static void
@@ -9640,6 +9649,27 @@ UT_TEST(test_v3_native_driver_advances_recovered_cohort_without_losing_kinds)
 	UT_ASSERT_EQ(observed.phase, CLUSTER_WAL_STARTUP_INITIALIZING);
 	UT_ASSERT_EQ(observed.input_kind, CLUSTER_WAL_STARTUP_CLEAN);
 	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	test_reserve_mode = false;
+}
+
+UT_TEST(test_v3_native_driver_rejects_foreign_recovered_owner_system)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	ClusterControlRootFileToken token;
+	ClusterWalStartupImage ops[2], observed;
+	ClusterWalSourceRef restart;
+	v3_recovered_begin_fixture(before, &root, &token, ops, false);
+	if (ut_current_failed)
+		return;
+	/* Keep the ROOT and current WAL source bound to this system while making
+	 * the published recovered owner foreign.  The formation gate must refuse
+	 * before any startup mutation. */
+	test_recovered_checkpoint_owner_system_identifier(root.header.system_identifier ^ UINT64_C(1));
+	restart = v3_recovered_driver_restart(&root, 0);
+	UT_ASSERT_NE(cluster_control_root_v3_startup_advance_clean(&restart, &observed), 0);
+	UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+	v2_assert_primary_unchanged(before);
 	test_reserve_mode = false;
 }
 
@@ -24784,6 +24814,7 @@ control_root_test_reset_state(void)
 	test_fence = false;
 	test_serving = test_serving_pending = false;
 	test_wal_validated = false;
+	test_sysid_control = NULL;
 	DataDir = test_root;
 	cluster_shared_data_dir = test_root;
 	cluster_wal_threads_dir = test_wal_root;
@@ -24817,7 +24848,7 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 	if (getenv("PGRAC_PRE2_TEST_RECOVERED_BEGIN") != NULL) {
-		UT_PLAN(8);
+		UT_PLAN(9);
 		UT_RUN(test_recovered_begin_mixed_inputs_keep_their_original_kinds);
 		UT_RUN(test_recovered_begin_all_complete_inputs_are_not_clean_exit);
 		UT_RUN(test_recovered_begin_requires_every_actual_empty_target);
@@ -24825,6 +24856,7 @@ main(int argc, char **argv)
 		UT_RUN(test_recovered_begin_retains_original_owner_and_fence_guards);
 		UT_RUN(test_v3_native_driver_prepares_sparse_targets_then_returns_initializing);
 		UT_RUN(test_v3_native_driver_advances_recovered_cohort_without_losing_kinds);
+		UT_RUN(test_v3_native_driver_rejects_foreign_recovered_owner_system);
 		UT_RUN(test_v3_begin_requires_all_declared_empty_targets_before_native_mutation);
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;

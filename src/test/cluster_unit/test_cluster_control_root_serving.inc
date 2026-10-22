@@ -25,6 +25,12 @@ test_recovered_checkpoint_owner_fixture(const ClusterWalSourceRef *ref, uint64 e
 	serving_recovery_observed = true;
 }
 
+static void
+test_recovered_checkpoint_owner_system_identifier(uint64 system_identifier)
+{
+	serving_recovery_owner.owner.writer.ref.claim.identity.system_identifier = system_identifier;
+}
+
 ClusterNormalStartState
 cluster_semantic_normal_start_state(void)
 {
