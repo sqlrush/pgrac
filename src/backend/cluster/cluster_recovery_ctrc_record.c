@@ -574,6 +574,33 @@ refused:
 }
 
 bool
+cluster_recovery_ctrc_tt_wal_inventory_v2(XLogReaderState *reader,
+											uint64 database_incarnation, uint32 source_index,
+											const uint8 source_identity_digest[32],
+											const uint8 *raw_record, size_t raw_length,
+											ClusterRecoveryCTRCTTReferenceV2 *out)
+{
+	ClusterRecoveryCTRCTTReferenceV2 inventory;
+
+	if (out == NULL)
+		return false;
+	if (!cluster_recovery_ctrc_tt_reference_v2(reader, database_incarnation, source_index,
+												source_identity_digest, raw_record, raw_length,
+												&inventory)
+		|| XLogRecGetXid(reader) != InvalidTransactionId)
+		goto refused;
+	/* The exact original carrier has no header xid and one payload xid.
+	 * Never copy the payload T34 to an unresolved header field, even when
+	 * both low32 values match. Consume aliases before publishing the group. */
+	memcpy(out, &inventory, sizeof(inventory));
+	return true;
+
+refused:
+	memset(out, 0, sizeof(*out));
+	return false;
+}
+
+bool
 cluster_recovery_ctrc_bind_reference_v2(XLogReaderState *reader,
 										  uint64 database_incarnation, uint32 source_index,
 										  const uint8 source_identity_digest[32],

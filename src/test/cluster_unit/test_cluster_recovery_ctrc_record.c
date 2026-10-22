@@ -3869,6 +3869,199 @@ UT_TEST(tt_native_boundary_identities)
 	}
 }
 
+static bool
+tt_inventory_refused(XLogReaderState *reader, uint64 dbinc, const uint8 *source,
+					 const uint8 *raw, size_t length)
+{
+	uint8 guarded[sizeof(ClusterRecoveryCTRCTTReferenceV2) + 2];
+
+	memset(guarded, 0xa5, sizeof(guarded));
+	return !cluster_recovery_ctrc_tt_wal_inventory_v2(reader, dbinc, 7, source, raw, length,
+													(ClusterRecoveryCTRCTTReferenceV2 *)(guarded + 1))
+		&& all_zero(guarded + 1, sizeof(guarded) - 2)
+		&& guarded[0] == 0xa5 && guarded[sizeof(guarded) - 1] == 0xa5;
+}
+
+UT_TEST(tt_wal_inventory_complete_carriers)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		for (unsigned boundary = 0; boundary < 2; boundary++) {
+			xl_undo_tt_slot_bind identity = bind_sample();
+			NativeRaw wire;
+			NativePages pages;
+			XLogReaderState *reader;
+			ClusterRecoveryCTRCTTReferenceV2 out, expected;
+			uint8 source[32];
+			size_t length;
+
+			identity.segment_generation = boundary ? UINT32_MAX - 1 : 0;
+			identity.slot_offset = boundary ? TT_SLOTS_PER_SEGMENT - 1 : 0;
+			identity.wrap = boundary ? TT_WRAP_INVALID - 1 : 0;
+			identity.xid = boundary ? MaxTransactionId : FirstNormalTransactionId;
+			length = tt_wire(&wire, kind, &identity);
+			wire.align.xl_xid = InvalidTransactionId;
+			native_crc(&wire, length);
+			memcpy(source, raw_source, sizeof(source));
+			source[31] ^= kind + boundary;
+			UT_ASSERT(native_read(&pages, &wire, length, boundary != 0, &reader));
+			if (boundary) UT_ASSERT(reader->EndRecPtr > reader->ReadRecPtr + length);
+			UT_ASSERT(tt_expected(reader, 99 + boundary, kind, source, &wire, length,
+								  &identity, &expected));
+			UT_ASSERT(cluster_recovery_ctrc_tt_wal_inventory_v2(reader, 99 + boundary, kind,
+															  source, wire.bytes, length, &out));
+			UT_ASSERT(memcmp(&out, &expected, sizeof(out)) == 0);
+			UT_ASSERT_EQ(out.key[100], 42);
+			UT_ASSERT(all_zero(out.key + 108, 8));
+			XLogReaderFree(reader);
+		}
+	}
+}
+
+UT_TEST(tt_wal_inventory_header_identity_is_not_inferred)
+{
+	xl_undo_tt_slot_bind identity = bind_sample();
+	const TransactionId headers[] = { BootstrapTransactionId, FrozenTransactionId,
+		FirstNormalTransactionId, identity.xid, identity.xid + 1, MaxTransactionId };
+
+	for (unsigned kind = 0; kind < 4; kind++) {
+		for (unsigned i = 0; i < lengthof(headers); i++) {
+			NativeRaw wire;
+			NativePages pages;
+			XLogReaderState *reader;
+			ClusterRecoveryCTRCTTReferenceV2 out, expected;
+			size_t length = tt_wire(&wire, kind, &identity);
+
+			wire.align.xl_xid = headers[i];
+			native_crc(&wire, length);
+			UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+			UT_ASSERT(tt_inventory_refused(reader, 99, raw_source, wire.bytes, length));
+			UT_ASSERT(tt_expected(reader, 99, 7, raw_source, &wire, length, &identity, &expected));
+			UT_ASSERT(cluster_recovery_ctrc_tt_reference_v2(reader, 99, 7, raw_source,
+														 wire.bytes, length, &out));
+			UT_ASSERT(memcmp(&out, &expected, sizeof(out)) == 0);
+			XLogReaderFree(reader);
+		}
+	}
+}
+
+UT_TEST(tt_wal_inventory_original_record_binding)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		xl_undo_tt_slot_bind identity = bind_sample();
+		NativeRaw wire, changed;
+		NativePages pages;
+		XLogReaderState *reader, saved;
+		size_t length = tt_wire(&wire, kind, &identity);
+
+		wire.align.xl_xid = InvalidTransactionId;
+		native_crc(&wire, length);
+		UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+		for (size_t i = 0; i < length; i++) {
+			changed = wire;
+			changed.bytes[i] ^= 1;
+			UT_ASSERT(tt_inventory_refused(reader, 99, raw_source, changed.bytes, length));
+		}
+		/* A second valid CRC cannot substitute different header or payload bytes. */
+		for (unsigned i = 0; i < 2; i++) {
+			changed = wire;
+			changed.bytes[i ? 42 : 16] ^= 1;
+			native_crc(&changed, length);
+			UT_ASSERT(tt_inventory_refused(reader, 99, raw_source, changed.bytes, length));
+		}
+		saved = *reader;
+		for (unsigned i = 0; i < 7; i++) {
+			*reader = saved;
+			if (i == 0) reader->record = NULL;
+			if (i == 1) reader->system_identifier = 0;
+			if (i == 2) reader->ReadRecPtr++;
+			if (i == 3) reader->EndRecPtr++;
+			if (i == 4) reader->cluster_expected_thread_id = 2;
+			if (i == 5) reader->cluster_expected_thread_id = 0;
+			if (i == 6) reader->cluster_expected_thread_id = 129;
+			UT_ASSERT(tt_inventory_refused(reader, 99, raw_source, wire.bytes, length));
+		}
+		*reader = saved;
+		XLogReaderFree(reader);
+		/* Matching decoded/native raw bytes still require the original payload domain. */
+		wire.bytes[38] = wire.bytes[39] = wire.bytes[40] = wire.bytes[41] = 0xff;
+		native_crc(&wire, length);
+		UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+		UT_ASSERT(tt_inventory_refused(reader, 99, raw_source, wire.bytes, length));
+		XLogReaderFree(reader);
+	}
+}
+
+UT_TEST(tt_wal_inventory_bounds_and_empty_identity)
+{
+	xl_undo_tt_slot_bind identity = bind_sample();
+	NativeRaw wire;
+	NativePages pages;
+	XLogReaderState *reader;
+	uint8 source[32] = { 0 };
+	size_t length = tt_wire(&wire, 2, &identity);
+
+	wire.align.xl_xid = InvalidTransactionId;
+	native_crc(&wire, length);
+	UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+	UT_ASSERT(tt_inventory_refused(NULL, 99, raw_source, wire.bytes, length));
+	UT_ASSERT(tt_inventory_refused(reader, 0, raw_source, wire.bytes, length));
+	UT_ASSERT(tt_inventory_refused(reader, 99, NULL, wire.bytes, length));
+	UT_ASSERT(tt_inventory_refused(reader, 99, source, wire.bytes, length));
+	UT_ASSERT(tt_inventory_refused(reader, 99, raw_source, NULL, length));
+	for (size_t len = 0; len < length; len++)
+		UT_ASSERT(tt_inventory_refused(reader, 99, raw_source, wire.bytes, len));
+	UT_ASSERT(tt_inventory_refused(reader, 99, raw_source, wire.bytes, length + 1));
+	UT_ASSERT(tt_inventory_refused(reader, 99, raw_source, wire.bytes, SIZE_MAX));
+	UT_ASSERT(!cluster_recovery_ctrc_tt_wal_inventory_v2(reader, 99, 7, raw_source,
+														 wire.bytes, length, NULL));
+	XLogReaderFree(reader);
+}
+
+UT_TEST(tt_wal_inventory_unaligned_aliases_and_immutable)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		xl_undo_tt_slot_bind identity = bind_sample();
+		NativeRaw wire, saved_wire;
+		NativePages pages, saved_pages;
+		XLogReaderState *reader, saved_reader;
+		ClusterRecoveryCTRCTTReferenceV2 expected;
+		uint8 buffer[sizeof(expected) + 2];
+		size_t length = tt_wire(&wire, kind, &identity);
+
+		wire.align.xl_xid = InvalidTransactionId;
+		native_crc(&wire, length);
+		UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+		UT_ASSERT(tt_expected(reader, 99, 7, raw_source, &wire, length, &identity, &expected));
+		saved_wire = wire;
+		saved_pages = pages;
+		saved_reader = *reader;
+		for (unsigned alias = 0; alias < 3; alias++) {
+			const uint8 *raw = wire.bytes, *source = raw_source;
+
+			memset(buffer, 0xa5, sizeof(buffer));
+			if (alias == 1) { memcpy(buffer + 1, wire.bytes, length); raw = buffer + 1; }
+			if (alias == 2) { memcpy(buffer + 1, raw_source, 32); source = buffer + 1; }
+			UT_ASSERT(cluster_recovery_ctrc_tt_wal_inventory_v2(reader, 99, 7, source, raw,
+										length, (ClusterRecoveryCTRCTTReferenceV2 *)(buffer + 1)));
+			UT_ASSERT(memcmp(buffer + 1, &expected, sizeof(expected)) == 0);
+			UT_ASSERT(buffer[0] == 0xa5 && buffer[sizeof(buffer) - 1] == 0xa5);
+		}
+		UT_ASSERT(memcmp(&wire, &saved_wire, sizeof(wire)) == 0);
+		UT_ASSERT(memcmp(&pages, &saved_pages, sizeof(pages)) == 0);
+		UT_ASSERT(memcmp(reader, &saved_reader, sizeof(*reader)) == 0);
+		UT_ASSERT(memcmp(XLogRecGetData(reader), wire.bytes + 34, length - 34) == 0);
+		/* Refusal may clear an aliased input, but only within the exact result. */
+		memset(buffer, 0xa5, sizeof(buffer));
+		memcpy(buffer + 1, wire.bytes, length);
+		buffer[1 + 42] ^= 1;
+		UT_ASSERT(!cluster_recovery_ctrc_tt_wal_inventory_v2(reader, 99, 7, raw_source,
+			buffer + 1, length, (ClusterRecoveryCTRCTTReferenceV2 *)(buffer + 1)));
+		UT_ASSERT(all_zero(buffer + 1, sizeof(expected)));
+		UT_ASSERT(buffer[0] == 0xa5 && buffer[sizeof(buffer) - 1] == 0xa5);
+		XLogReaderFree(reader);
+	}
+}
+
 /* Full original DATA object evidence; expected scalar bytes do not use the
  * product put helpers, offset calculation or namespace enum. */
 static bool
@@ -4455,7 +4648,7 @@ UT_TEST(data_inventory_unaligned_output_inputs_and_aliases)
 int
 main(void)
 {
-	UT_PLAN(134);
+	UT_PLAN(139);
 	UT_RUN(golden_encoding);
 	UT_RUN(golden_decoding);
 	UT_RUN(unaligned_buffers);
@@ -4559,6 +4752,11 @@ main(void)
 	UT_RUN(tt_unaligned_aliases_and_immutable_inputs);
 	UT_RUN(tt_bind_api_remains_bind_only);
 	UT_RUN(tt_native_boundary_identities);
+	UT_RUN(tt_wal_inventory_complete_carriers);
+	UT_RUN(tt_wal_inventory_header_identity_is_not_inferred);
+	UT_RUN(tt_wal_inventory_original_record_binding);
+	UT_RUN(tt_wal_inventory_bounds_and_empty_identity);
+	UT_RUN(tt_wal_inventory_unaligned_aliases_and_immutable);
 	UT_RUN(data_canonical_full_object_and_immutable);
 	UT_RUN(data_native_boundaries_and_each_physical_slot);
 	UT_RUN(data_namespace_is_original_and_exact);

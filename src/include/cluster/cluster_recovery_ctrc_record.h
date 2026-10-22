@@ -209,6 +209,20 @@ extern bool cluster_recovery_ctrc_tt_reference_v2(XLogReaderState *reader,
 											 const uint8 *raw_record, size_t raw_length,
 											 ClusterRecoveryCTRCTTReferenceV2 *out);
 
+/* Inventory the complete xid fields of one of the above exact TT carriers.
+ * Only an absent header xid is accepted, leaving the sole original payload
+ * field. Every nonzero header xid refuses: even an equal raw xid cannot prove
+ * that header and payload have the same full transaction identity. The
+ * payload-only API above keeps its original header-as-evidence contract.
+ *
+ * Same caller prerequisites, alias/clearing rules and absence of semantic
+ * graph/owner qualification or live authority as the payload adapter. This
+ * does not inventory other native WAL shapes or resolve unknown identities. */
+extern bool cluster_recovery_ctrc_tt_wal_inventory_v2(
+	XLogReaderState *reader, uint64 database_incarnation, uint32 source_index,
+	const uint8 source_identity_digest[32], const uint8 *raw_record, size_t raw_length,
+	ClusterRecoveryCTRCTTReferenceV2 *out);
+
 /* One selected native block-0 xid field, with the complete original page as
  * singleton atom2 evidence. Lengths are metadata, not encoded graph bytes;
  * unused array tails are zero. The path itself is not NUL-terminated on wire. */
