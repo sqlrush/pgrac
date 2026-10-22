@@ -24,6 +24,7 @@
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_control_root.h" /* bit22 (G3 accessor test) */
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_replacement_wire.h"
 #include "cluster/cluster_semantic_activation.h"
@@ -165,8 +166,10 @@ static uint8 test_terminal_peer_root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
 static bool test_stop_real_observation;
 bool cluster_shared_config;
 static ClusterWalSourceRef test_first_writer;
-static bool test_first_writer_installed, test_first_writer_initialized;
+static bool test_first_writer_installed, test_first_writer_initialized, test_first_writer_recovered;
 static uint64 test_first_writer_epoch;
+static bool test_recovered_checkpoint_observed;
+static ClusterRecoveryCheckpointObservationV1 test_recovered_checkpoint;
 static int test_first_live_checks;
 static ClusterControlRootResult test_first_live_result;
 
@@ -185,6 +188,15 @@ cluster_wal_thread_initialized_writer_matches(const ClusterWalSourceRef *expecte
 	return test_first_writer_installed && test_first_writer_initialized
 		   && epoch == test_first_writer_epoch
 		   && memcmp(expected, &test_first_writer, sizeof(*expected)) == 0;
+}
+
+bool
+cluster_recovery_checkpoint_observe_v1(ClusterRecoveryCheckpointObservationV1 *out)
+{
+	if (out == NULL || !test_recovered_checkpoint_observed)
+		return false;
+	*out = test_recovered_checkpoint;
+	return true;
 }
 
 ClusterControlRootResult
@@ -1258,6 +1270,13 @@ test_gate_reset(void)
 	test_capability_missing_bitmap = 0;
 	memset(&test_normal_start_completion, 0, sizeof(test_normal_start_completion));
 	test_normal_start_found = false;
+	memset(&test_first_writer, 0, sizeof(test_first_writer));
+	test_first_writer_installed = false;
+	test_first_writer_initialized = false;
+	test_first_writer_recovered = false;
+	test_first_writer_epoch = 0;
+	test_recovered_checkpoint_observed = false;
+	memset(&test_recovered_checkpoint, 0, sizeof(test_recovered_checkpoint));
 	test_serving_found = false;
 	test_serving_formation_valid = false;
 	test_serving_formation = 2;
@@ -9350,6 +9369,64 @@ UT_TEST(test_normal_start_existing_other_is_not_target_completion)
 	UT_ASSERT_EQ(cluster_semantic_normal_start_state(), 5);
 }
 
+static void
+ut_normal_start_recovered_owner_setup(ClusterSemanticActivationRecord *open,
+								  ClusterSemanticActivationAckTableV1 *table)
+{
+	uint64 owner_boot;
+
+	ut_normal_start_setup();
+	memcpy(NormalStartCompletion->pgrd, test_normal_pgrd_bytes,
+		   sizeof(test_normal_pgrd_bytes));
+	cluster_shared_config = true;
+	test_current_epoch = 9;
+	test_serving_formation_valid = true;
+	test_serving_formation = 9;
+	test_clean_admitted = true;
+
+	memset(open, 0, sizeof(*open));
+	open->transition_epoch = 8;
+	memset(table, 0, sizeof(*table));
+	table->transition_epoch = 9;
+	pg_atomic_write_u32(&NormalStartCompletion->state, CLUSTER_NORMAL_START_EXISTING_OTHER);
+
+	test_recovered_checkpoint_observed = true;
+	test_recovered_checkpoint.slot_generation = 1;
+	owner_boot = cluster_qvotec_get_self_incarnation();
+	test_recovered_checkpoint.owner.owner_boot = owner_boot;
+	test_recovered_checkpoint.owner.owner_pid = MyProcPid;
+	test_recovered_checkpoint.owner.writer.epoch = 9;
+	test_recovered_checkpoint.owner.writer.ref.claim.identity.origin_node_id = cluster_node_id;
+	test_recovered_checkpoint.owner.writer.ref.claim.identity.origin_thread_id = cluster_node_id + 1;
+	test_recovered_checkpoint.owner.writer.ref.claim.identity.origin_owner_incarnation = owner_boot;
+	test_first_writer = test_recovered_checkpoint.owner.writer.ref;
+	test_first_writer_installed = true;
+	test_first_writer_recovered = true;
+	test_first_writer_epoch = 9;
+	for (int node = 0; node < 4; node++)
+		table->expected[node].admitted_incarnation
+			= cluster_membership_get_last_admitted_incarnation(node);
+}
+
+UT_TEST(test_normal_start_recovered_owner_observation_accepts_exact_binding)
+{
+	ClusterSemanticActivationRecord open;
+	ClusterSemanticActivationAckTableV1 table;
+
+	ut_normal_start_recovered_owner_setup(&open, &table);
+	UT_ASSERT(normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+}
+
+UT_TEST(test_normal_start_recovered_owner_observation_fails_closed_without_observation)
+{
+	ClusterSemanticActivationRecord open;
+	ClusterSemanticActivationAckTableV1 table;
+
+	ut_normal_start_recovered_owner_setup(&open, &table);
+	test_recovered_checkpoint_observed = false;
+	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+}
+
 UT_TEST(test_normal_start_capture_drift_and_wrong_writer_refuse)
 {
 	const char *failure;
@@ -11779,6 +11856,8 @@ main(void)
 	UT_RUN(test_normal_start_bad_identity_and_debt_never_load);
 	UT_RUN(test_normal_start_incomplete_or_changed_root_is_sticky);
 	UT_RUN(test_normal_start_existing_other_is_not_target_completion);
+	UT_RUN(test_normal_start_recovered_owner_observation_accepts_exact_binding);
+	UT_RUN(test_normal_start_recovered_owner_observation_fails_closed_without_observation);
 	UT_RUN(test_normal_start_capture_drift_and_wrong_writer_refuse);
 	UT_RUN(test_normal_start_identity_rechecked_after_real_root_read);
 	UT_RUN(test_normal_start_bootstrap_requires_strict_source_at_entry_and_recheck);

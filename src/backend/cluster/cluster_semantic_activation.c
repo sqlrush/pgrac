@@ -34,6 +34,7 @@
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_replacement_wire.h"
 #include "cluster/cluster_semantic_activation.h"
@@ -14459,6 +14460,61 @@ pgrac_r4_bit22_cutover_begin(PG_FUNCTION_ARGS)
 /* Validate the immutable CLEAN bridge without requiring fresh ALIVE from a
  * peer that the original normal-stop owner already proved terminal. */
 static bool
+normal_start_recovered_service_binding_current(const ClusterSemanticActivationRecord *open,
+												 const uint8 *root,
+												 const ClusterSemanticActivationAckTableV1 *table)
+{
+	ClusterRecoveryCheckpointObservationV1 observed;
+	ClusterFormationSnapshotV1 formation;
+	const ClusterNormalStartCompletion *input = NormalStartCompletion;
+
+	if (open == NULL || root == NULL || table == NULL || input == NULL
+		|| cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_EXISTING_OTHER
+		|| !cluster_recovery_checkpoint_observe_v1(&observed)
+		|| observed.slot_generation == 0 || observed.slot_generation == UINT64_MAX
+		|| observed.owner.owner_boot == 0 || observed.owner.owner_boot == UINT64_MAX
+		|| observed.owner.owner_pid <= 0
+		|| open->transition_epoch == 0 || open->transition_epoch == UINT64_MAX
+		|| table->transition_epoch == 0 || table->transition_epoch == UINT64_MAX
+		|| open->transition_epoch >= table->transition_epoch
+		|| observed.owner.writer.epoch != table->transition_epoch
+		|| observed.owner.writer.epoch == 0 || observed.owner.writer.epoch == UINT64_MAX
+		|| observed.owner.owner_boot != cluster_qvotec_get_self_incarnation()
+		|| observed.owner.writer.ref.claim.identity.origin_node_id != cluster_node_id
+		|| observed.owner.writer.ref.claim.identity.origin_thread_id != cluster_node_id + 1
+		|| observed.owner.writer.ref.claim.identity.origin_owner_incarnation
+			   != observed.owner.owner_boot
+		|| !cluster_wal_thread_recovered_writer_matches(&observed.owner.writer.ref,
+																	 observed.owner.writer.epoch)
+		|| memcmp(root, input->pgrd, CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES) != 0
+		|| !cluster_reconfig_capture_formation_snapshot_v1(cluster_node_id + 1, &formation)
+		|| formation.local_epoch != observed.owner.writer.epoch
+		|| formation.startup_formation_generation == 0
+		|| formation.startup_formation_generation == UINT64_MAX
+		|| formation.self_join_admitted != 1 || formation.self_join_failed
+		|| formation.prebump_sync_active
+		|| !semantic_activation_bytes_are_zero(formation.reserved, sizeof(formation.reserved))
+		|| !semantic_activation_bytes_are_zero(formation.pending_join_bitmap,
+														   sizeof(formation.pending_join_bitmap))
+		|| !semantic_activation_bytes_are_zero(formation.excluded_bitmap,
+														   sizeof(formation.excluded_bitmap))
+		|| !semantic_activation_bytes_are_zero(formation.clean_departed_bitmap,
+														   sizeof(formation.clean_departed_bitmap))
+		|| !semantic_activation_bytes_are_zero(formation.removed_bitmap,
+														   sizeof(formation.removed_bitmap)))
+		return false;
+	for (unsigned node = 0; node < CLUSTER_MAX_NODES; node++) {
+		if ((node < 4) != (formation.membership.membership_state[node] == CLUSTER_MEMBER_MEMBER))
+			return false;
+		if (node < 4
+			&& formation.membership.last_admitted_incarnation[node]
+				   != table->expected[node].admitted_incarnation)
+			return false;
+	}
+	return true;
+}
+
+static bool
 normal_start_service_binding_current(const ClusterSemanticActivationRecord *open, const uint8 *root,
 									 const ClusterSemanticActivationAckTableV1 *table)
 {
@@ -14469,6 +14525,8 @@ normal_start_service_binding_current(const ClusterSemanticActivationRecord *open
 		return semantic_activation_bytes_are_zero(table->restart_binding, 32);
 	if (!cluster_shared_config)
 		return false;
+	if (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER)
+		return normal_start_recovered_service_binding_current(open, root, table);
 	if (!normal_start_record_matches(open) || input->epoch != table->transition_epoch
 		|| open->transition_epoch == 0 || open->transition_epoch >= input->epoch
 		|| memcmp(root, input->pgrd, CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES) != 0

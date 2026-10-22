@@ -33,10 +33,11 @@ cluster_wal_thread_clean_writer_matches(const ClusterWalSourceRef *expected, uin
 }
 
 bool
-cluster_wal_thread_recovered_writer_matches(const ClusterWalSourceRef *expected pg_attribute_unused(),
-													 uint64 epoch pg_attribute_unused())
+cluster_wal_thread_recovered_writer_matches(const ClusterWalSourceRef *expected, uint64 epoch)
 {
-	return false;
+	return expected != NULL && test_first_writer_installed && test_first_writer_recovered
+		   && epoch == test_first_writer_epoch
+		   && memcmp(expected, &test_first_writer, sizeof(*expected)) == 0;
 }
 
 static void
