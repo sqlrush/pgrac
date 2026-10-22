@@ -1524,6 +1524,25 @@ UT_TEST(startup_prepare_uses_only_bound_initializer_without_serving)
 	UT_ASSERT_EQ(reads | local_updates | native_writes, 0);
 }
 
+UT_TEST(startup_checkpoint_accepts_recovered_cohort)
+{
+	startup_fixture();
+	clusterStartupWriter.input_kind = CLUSTER_WAL_STARTUP_RECOVERED;
+	clusterStartupWriter.generation = 7;
+	UT_ASSERT(startup_prepare(CHECKPOINT_END_OF_RECOVERY | CHECKPOINT_IMMEDIATE));
+	UT_ASSERT_EQ(candidate.checkPoint, 100);
+	candidate.checkPoint = 200;
+	UT_ASSERT(startup_publish());
+	UT_ASSERT_EQ(startup_calls, 1);
+	UT_ASSERT_EQ(install_calls, 1);
+	UT_ASSERT_EQ(reads, 1);
+	UT_ASSERT_EQ(local_updates, 1);
+	UT_ASSERT(clusterStartupWriterInstalled);
+	UT_ASSERT_EQ(current.checkPoint, 200);
+	UT_ASSERT_EQ(current.state, DB_IN_PRODUCTION);
+	UT_ASSERT_EQ(root_calls, 0);
+}
+
 UT_TEST(startup_file_sync_rechecks_original_writer_and_keeps_native_owner)
 {
 	for (unsigned fault = 0; fault < 8; fault++) {
@@ -2872,7 +2891,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(77);
+	UT_PLAN(78);
 	UT_RUN(recovery_checkpoint_selects_scope_only_for_closed_online_owner);
 	UT_RUN(recovery_checkpoint_closed_admission_uses_only_original_scope);
 	UT_RUN(recovery_checkpoint_preserves_owner_and_native_guards);
@@ -2936,6 +2955,7 @@ main(void)
 	UT_RUN(online_checkpoint_during_shutdown_signal_stays_online);
 	UT_RUN(early_shutdown_never_calls_untyped_writer_for_root_v3);
 	UT_RUN(startup_prepare_uses_only_bound_initializer_without_serving);
+	UT_RUN(startup_checkpoint_accepts_recovered_cohort);
 	UT_RUN(startup_prepare_rejects_other_purposes_and_lost_owner);
 	UT_RUN(startup_publish_installs_only_actual_root_projection);
 	UT_RUN(startup_publish_reobserves_cas_without_holding_locks);
