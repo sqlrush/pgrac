@@ -1205,9 +1205,97 @@ UT_TEST(test_checkpointer_error_revokes_local_read_without_releasing_start)
 	UT_ASSERT(ClusterColdRecoveryTxCurrent(info.cluster_tx_start));
 }
 
+static void serving_actor(void)
+{
+	MyBackendType = B_LMON;
+	MyProcPid = 83;
+	CurrentResourceOwner = (ResourceOwner)&typed;
+}
+
+UT_TEST(test_lmon_observes_only_original_recovered_install_without_a_checkpoint_scope)
+{
+	ClusterRecoveryCheckpointObservationV1 observation;
+	struct ClusterRecoveryCheckpointScopeV1 *scope = NULL;
+	reset(); retain(); serving_actor();
+	UT_ASSERT(!cluster_recovery_checkpoint_observe_v1(&observation));
+	UT_ASSERT(memcmp(&observation, &(ClusterRecoveryCheckpointObservationV1){0},
+					 sizeof(observation)) == 0);
+	startup_actor(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info)); serving_actor();
+	UT_ASSERT(cluster_recovery_checkpoint_observe_v1(&observation));
+	UT_ASSERT_EQ(observation.slot_generation, window_region.checkpoint_owner.generation);
+	UT_ASSERT(memcmp(&observation.owner, &window_region.checkpoint_owner.owner,
+					 sizeof(observation.owner)) == 0);
+	UT_ASSERT(!cluster_recovery_checkpoint_begin_v1(&scope));
+	UT_ASSERT(scope == NULL);
+	UT_ASSERT(ClusterColdRecoveryTxCurrent(info.cluster_tx_start) == false);
+	startup_actor(); UT_ASSERT(ClusterColdRecoveryTxCurrent(info.cluster_tx_start));
+}
+
+UT_TEST(test_lmon_observation_rejects_wrong_actor_or_current_input_without_leaking_a_value)
+{
+	for (int fault = 0; fault < 18; fault++) {
+		ClusterRecoveryCheckpointObservationV1 observation;
+		reset(); retain(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info)); serving_actor();
+		switch (fault) {
+		case 0: MyBackendType = B_BACKEND; break;
+		case 1: MyBackendType = B_CHECKPOINTER; break;
+		case 2: MyBackendType = B_STARTUP; break;
+		case 3: MyProcPid = 0; break;
+		case 4: IsUnderPostmaster = false; break;
+		case 5: cluster_enabled = false; break;
+		case 6: cluster_shared_config = false; break;
+		case 7: native_recovery = true; break;
+		case 8: ShutdownRequestPending = true; break;
+		case 9: CritSectionCount = 1; break;
+		case 10: checkpoint_epoch++; break;
+		case 11: owner_boot++; break;
+		case 12: writer_ok = false; break;
+		case 13: observed_writer.ref.claim.claim_sha256[0]++; break;
+		case 14: observed_writer.ref.timeline++; break;
+		case 15: observed_writer.ref.claim.database_incarnation++; break;
+		case 16: observed_writer.ref.claim.max_config_generation++; break;
+		case 17: window_region.checkpoint_owner.valid = false; break;
+		}
+		memset(&observation, 0xa5, sizeof(observation));
+		UT_ASSERT(!cluster_recovery_checkpoint_observe_v1(&observation));
+		UT_ASSERT(memcmp(&observation, &(ClusterRecoveryCheckpointObservationV1){0},
+						 sizeof(observation)) == 0);
+		IsUnderPostmaster = true;
+		startup_actor();
+	}
+}
+
+UT_TEST(test_lmon_observation_preserves_full_owner_identity_and_original_revocation)
+{
+	for (int fault = 0; fault < 7; fault++) {
+		ClusterRecoveryCheckpointObservationV1 before, after;
+		reset(); retain(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info)); serving_actor();
+		UT_ASSERT(cluster_recovery_checkpoint_observe_v1(&before));
+		switch (fault) {
+		case 0: window_region.checkpoint_owner.generation++; break;
+		case 1: window_region.checkpoint_owner.owner.operation_uuid[0]++; break;
+		case 2: window_region.checkpoint_owner.owner.install_generation++; break;
+		case 3: window_region.checkpoint_owner.owner.start_generation++; break;
+		case 4: window_region.checkpoint_owner.owner.start_serial++; break;
+		case 5: window_region.checkpoint_owner.owner.owner_pid++; break;
+		case 6:
+			startup_actor(); ClusterReleaseColdRecoveryInputs(&info); serving_actor(); break;
+		}
+		if (fault < 6) {
+			UT_ASSERT(cluster_recovery_checkpoint_observe_v1(&after));
+			UT_ASSERT(memcmp(&before, &after, sizeof(before)) != 0);
+		} else {
+			UT_ASSERT(!cluster_recovery_checkpoint_observe_v1(&after));
+			UT_ASSERT(memcmp(&after, &(ClusterRecoveryCheckpointObservationV1){0},
+							 sizeof(after)) == 0);
+		}
+		startup_actor();
+	}
+}
+
 int main(void)
 {
-	UT_PLAN(31);
+	UT_PLAN(34);
 	UT_RUN(test_original_owner_binds_complete_empty_census_after_done);
 	UT_RUN(test_native_owner_rejects_uninstalled_recovery_and_writer_drift);
 	UT_RUN(test_current_rechecks_owner_process_boot_and_exact_writer);
@@ -1241,6 +1329,9 @@ int main(void)
 	UT_RUN(test_checkpoint_read_rejects_current_writer_epoch_boot_role_and_resource_drift);
 	UT_RUN(test_original_resource_release_and_cleanup_revoke_the_shared_read);
 	UT_RUN(test_checkpointer_error_revokes_local_read_without_releasing_start);
+	UT_RUN(test_lmon_observes_only_original_recovered_install_without_a_checkpoint_scope);
+	UT_RUN(test_lmon_observation_rejects_wrong_actor_or_current_input_without_leaking_a_value);
+	UT_RUN(test_lmon_observation_preserves_full_owner_identity_and_original_revocation);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

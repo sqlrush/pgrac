@@ -24129,7 +24129,10 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_SERVING") != NULL) {
-		UT_PLAN(13);
+		UT_PLAN(16);
+		UT_RUN(test_serving_local_advanced_checkpoint_requires_original_recovered_owner);
+		UT_RUN(test_serving_advanced_checkpoint_cannot_borrow_missing_foreign_or_wrong_local_owner);
+		UT_RUN(test_serving_recovery_owner_drift_across_root_io_never_publishes_open);
 		UT_RUN(test_serving_clean_restart_keeps_old_open_with_current_epoch);
 		UT_RUN(test_serving_current_epoch_is_required_before_any_publication);
 		UT_RUN(test_serving_requires_coordinator_publish_then_startup_is_active);

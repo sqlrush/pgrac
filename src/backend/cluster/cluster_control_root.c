@@ -4818,6 +4818,8 @@ typedef struct ServingCut {
 	ConfigAuxCut control;
 	uint64 formation;
 	uint64 members[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
+	bool recovery_owner_valid;
+	ClusterRecoveryCheckpointObservationV1 recovery_owner;
 } ServingCut;
 
 typedef struct ServingPublication {
@@ -4883,8 +4885,27 @@ serving_cut_read(const ClusterSemanticActivationRecord *open, const uint8 *descr
 	if (cut->members[cluster_node_id] != cut->control.incarnation
 		|| cluster_epoch_get_current() != cut->control.epoch)
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	cut->recovery_owner_valid = cluster_recovery_checkpoint_observe_v1(&cut->recovery_owner);
+	if (cut->recovery_owner_valid
+		&& (cut->recovery_owner.owner.owner_boot != cut->control.incarnation
+			|| cut->recovery_owner.owner.writer.epoch != cut->control.epoch
+			|| cut->recovery_owner.owner.writer.ref.claim.identity.origin_node_id != cluster_node_id
+			|| cut->recovery_owner.owner.writer.ref.claim.identity.origin_thread_id != cluster_node_id + 1
+			|| cut->recovery_owner.owner.writer.ref.claim.identity.origin_owner_incarnation
+				!= cut->control.incarnation))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	cut->formation = formation.startup_formation_generation;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static bool
+serving_recovery_owner_current(const ServingCut *cut)
+{
+	ClusterRecoveryCheckpointObservationV1 observed;
+
+	return !cut->recovery_owner_valid
+		|| (cluster_recovery_checkpoint_observe_v1(&observed)
+			&& memcmp(&observed, &cut->recovery_owner, sizeof(observed)) == 0);
 }
 
 /* Authenticate every selected installed writer under this same CF interval.
@@ -4899,13 +4920,17 @@ serving_root_read(const ServingPublication *pending, const uint8 storage_uuid[16
 	ClusterControlRootResult result;
 	bool opened;
 
+	if (!serving_recovery_owner_current(&pending->cut))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = read_control_version(storage_uuid, GetSystemIdentifier(), root, &view, token, 3);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		return result;
 	opened = root->header.v2.database_state == CLUSTER_CONTROL_ROOT_DATABASE_OPEN;
 	if (root->header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
-		|| (!opened && root->header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED)
+		|| (!opened && root->header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED
+			&& !(pending->cut.recovery_owner_valid
+				 && root->header.v2.database_state == CLUSTER_CONTROL_ROOT_DATABASE_RECOVERING))
 		|| root->header.v2.configured[0] != pending->open.admitted_members_lo
 		|| root->header.v2.configured[1] != pending->open.admitted_members_hi
 		|| root->header.v2.serving[1] != 0
@@ -4924,10 +4949,24 @@ serving_root_read(const ServingPublication *pending, const uint8 storage_uuid[16
 			|| root->publisher_node[node] != node
 			|| root->publisher_incarnation[node] != pending->cut.members[node])
 			return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
-		/* Before first OPEN no ordinary checkpoint publisher is eligible. */
+		/* A local recovery checkpoint is still the original installed writer,
+		 * not a second INSTALL or another member's service proof. */
 		if (!opened
-			&& root->records[node].lifecycle_reason != CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN)
-			return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+			&& root->records[node].lifecycle_reason != CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN) {
+			const ClusterWalWriterToken *writer = &pending->cut.recovery_owner.owner.writer;
+
+			if (node != cluster_node_id || !pending->cut.recovery_owner_valid
+				|| root->records[node].lifecycle_reason != CLUSTER_CONTROL_ROOT_PUBLISH_CHECKPOINT_ADVANCE
+				|| !cluster_control_root_identity_equal(&root->records[node].identity,
+															 &writer->ref.claim.identity)
+				|| root->header.v2.database_incarnation != writer->ref.claim.database_incarnation
+				|| root->header.v2.config_generation != writer->ref.claim.max_config_generation
+				|| memcmp(root->refs[node].claim_sha256, writer->ref.claim.claim_sha256, 32) != 0
+				|| root->records[node].checkpoint_tli != writer->ref.timeline
+				|| writer->startup_first_lsn == InvalidXLogRecPtr
+				|| root->records[node].checkpoint_lower_lsn < writer->startup_first_lsn)
+				return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+		}
 		result = read_thread_version(&root->records[node].identity, scratch, &view, &peer, 3);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
@@ -4935,6 +4974,8 @@ serving_root_read(const ServingPublication *pending, const uint8 storage_uuid[16
 		if (!file_token_equal(token, &peer))
 			return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
 	}
+	if (!serving_recovery_owner_current(&pending->cut))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 

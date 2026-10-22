@@ -262,6 +262,17 @@ typedef struct ClusterRecoveryCheckpointOwnerV1 {
 	int32 owner_pid;
 } ClusterRecoveryCheckpointOwnerV1;
 
+/* A local original-owner observation, never an I/O or writer grant. */
+typedef struct ClusterRecoveryCheckpointObservationV1 {
+	uint64 slot_generation;
+	ClusterRecoveryCheckpointOwnerV1 owner;
+} ClusterRecoveryCheckpointObservationV1;
+
+/* LMON-only read of the original recovered INSTALL/native-DONE input.
+ * Consumers must retain and revalidate the complete value across I/O; this
+ * does not prove another member's INSTALL or any service completion. */
+extern bool cluster_recovery_checkpoint_observe_v1(ClusterRecoveryCheckpointObservationV1 *out);
+
 struct ClusterRecoveryStartV1;
 struct ClusterRecoveryCheckpointScopeV1;
 extern bool cluster_recovery_checkpoint_register_v1(const struct ClusterRecoveryStartV1 *start);

@@ -672,6 +672,45 @@ cluster_recovery_checkpoint_current_v1(const struct ClusterRecoveryCheckpointSco
 }
 
 bool
+cluster_recovery_checkpoint_observe_v1(ClusterRecoveryCheckpointObservationV1 *out)
+{
+	ClusterRecoveryCheckpointSlotV1 *slot;
+	ClusterRecoveryCheckpointObservationV1 observed;
+	ClusterWalSourceRef current;
+	bool same;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || MyBackendType != B_LMON || !IsUnderPostmaster || MyProcPid <= 0
+		|| !cluster_enabled || !cluster_shared_config || CritSectionCount != 0
+		|| ShutdownRequestPending || RecoveryInProgress() || cluster_recovery_plan_shmem == NULL)
+		return false;
+	memset(&observed, 0, sizeof(observed));
+	slot = &cluster_recovery_plan_shmem->checkpoint_owner;
+	SpinLockAcquire(&slot->lock);
+	if (slot->valid) {
+		observed.slot_generation = slot->generation;
+		observed.owner = slot->owner;
+	}
+	SpinLockRelease(&slot->lock);
+	if (observed.slot_generation == 0 || observed.owner.owner_boot == 0
+		|| cluster_qvotec_get_self_incarnation() != observed.owner.owner_boot
+		|| cluster_epoch_get_current() != observed.owner.writer.epoch
+		|| !cluster_wal_thread_current_v2_ref(&current)
+		|| !checkpoint_ref_same(&current, &observed.owner.writer.ref))
+		return false;
+	SpinLockAcquire(&slot->lock);
+	same = slot->valid && slot->generation == observed.slot_generation
+		&& memcmp(&slot->owner, &observed.owner, sizeof(slot->owner)) == 0;
+	SpinLockRelease(&slot->lock);
+	if (!same || cluster_qvotec_get_self_incarnation() != observed.owner.owner_boot
+		|| cluster_epoch_get_current() != observed.owner.writer.epoch)
+		return false;
+	*out = observed;
+	return true;
+}
+
+bool
 cluster_recovery_checkpoint_begin_v1(struct ClusterRecoveryCheckpointScopeV1 **out)
 {
 	ClusterRecoveryCheckpointSlotV1 *slot;
