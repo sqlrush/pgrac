@@ -122,6 +122,7 @@ def main() -> int:
     root = Path(__file__).resolve().parents[3]
     inventory = source_counter_inventory(root)
     assert all(inventory.values()), inventory
+    wait_candidates = source_wait_candidate_inventory(root)
     before, after, samples = run_alternating_updates()
     _assert_fixture(samples)
     delta = counter_delta(before, after)
@@ -139,9 +140,37 @@ def main() -> int:
     assert counter_delta(injected_before, injected_final) == injected_after
     print("offline two-node alternating-update fixture: 20 rounds")
     print("counter accessors: " + ", ".join(sorted(inventory)))
+    print("wait candidates: " + ", ".join(sorted(wait_candidates)))
     print("wait events: " + ", ".join(WAIT_EVENT_NAMES))
     print("runtime evidence: NOT_CAPTURED (offline fixture)")
     return 0
+
+
+def source_wait_candidate_inventory(root: Path) -> dict[str, dict[str, object]]:
+    """Return source-only markers for the fixed-delay wait candidates."""
+    candidates = {
+        "tx_enqueue_tick": {
+            "path": "src/backend/cluster/cluster_tx_enqueue.c",
+            "needles": ("CLUSTER_TXW_TICK_MS 1000", "GES_TX_ENQUEUE_WAIT"),
+        },
+        "gcs_retransmit_backoff": {
+            "path": "src/backend/cluster/cluster_gcs_block.c",
+            "needles": ("gcs_block_backoff_ms_for_retry",),
+        },
+        "pcm_install_wait": {
+            "path": "src/backend/cluster/cluster_pcm_lock.c",
+            "needles": (
+                "WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT",
+                "ConditionVariableTimedSleep",
+            ),
+        },
+    }
+    for candidate in candidates.values():
+        source = (root / candidate["path"]).read_text()
+        missing = [needle for needle in candidate["needles"] if needle not in source]
+        if missing:
+            raise AssertionError(f"missing wait candidate markers: {candidate['path']}: {missing}")
+    return candidates
 
 
 if __name__ == "__main__":
