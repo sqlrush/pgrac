@@ -28,6 +28,7 @@
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
+#include "access/xlogutils.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_control.h"
@@ -39,6 +40,7 @@
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "storage/standby.h"
 #include "utils/rel.h"
 #include "unit_test.h"
 #include "cluster/cluster_mode.h"
@@ -51,6 +53,7 @@ int cluster_node_id = 0, wal_level = WAL_LEVEL_REPLICA, NBuffers = 1, NLocBuffer
 char *BufferBlocks;
 Block *LocalBufferBlockPointers;
 volatile uint32 CritSectionCount;
+HotStandbyState standbyState = STANDBY_DISABLED;
 bool cluster_recmerge_window_active, cluster_recmerge_apply_foreign;
 uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
 
@@ -61,8 +64,13 @@ static ClusterSpaceIdentity space_identity;
 static RfPageVersionEdgeEntryV1 edge;
 static uint64 next_token, edge_token;
 static unsigned inserts, edges, dirties, hints;
+static unsigned tx_checks, redo_dirties, redo_releases, freeze_data_calls;
+static int expected_nplans;
+static PGAlignedBlock freeze_main_data, freeze_block_data;
+static Size freeze_block_length;
 static uint8 expected_info;
 static bool begun, expecting_error, tx_committed;
+static bool redoing, redo_locked;
 static jmp_buf error_jump;
 
 void
@@ -174,12 +182,19 @@ TransactionIdDidCommit(TransactionId xid)
 {
 	UT_ASSERT_EQ(CritSectionCount, 0);
 	UT_ASSERT_EQ(xid, 77);
+	tx_checks++;
 	return tx_committed;
 }
 void
 MarkBufferDirty(Buffer buffer)
 {
 	UT_ASSERT_EQ(buffer, 1);
+	if (redoing) {
+		UT_ASSERT(redo_locked);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		redo_dirties++;
+		return;
+	}
 	UT_ASSERT_EQ(CritSectionCount, 1);
 	dirties++;
 }
@@ -206,7 +221,8 @@ XLogRegisterData(char *data, uint32 length)
 		UT_ASSERT_EQ(((xl_heap_prune *)data)->nredirected, 1);
 	} else if (expected_info == XLOG_HEAP2_FREEZE_PAGE) {
 		UT_ASSERT_EQ(length, SizeOfHeapFreezePage);
-		UT_ASSERT_EQ(((xl_heap_freeze_page *)data)->nplans, 1);
+		UT_ASSERT_EQ(((xl_heap_freeze_page *)data)->nplans, expected_nplans);
+		memcpy(freeze_main_data.data, data, length);
 	} else {
 		UT_ASSERT_EQ(length, SizeOfHeapVacuum);
 		UT_ASSERT_EQ(((xl_heap_vacuum *)data)->nunused, 1);
@@ -227,6 +243,12 @@ XLogRegisterBufData(uint8 id, char *data, uint32 length)
 {
 	UT_ASSERT(begun && data != NULL && length > 0);
 	UT_ASSERT_EQ(id, 0);
+	if (expected_info == XLOG_HEAP2_FREEZE_PAGE) {
+		UT_ASSERT(freeze_block_length + length <= BLCKSZ);
+		memcpy(freeze_block_data.data + freeze_block_length, data, length);
+		freeze_block_length += length;
+		freeze_data_calls++;
+	}
 }
 void
 XLogRegisterPageVersionEdge(uint64 token, const RfPageVersionEdgeEntryV1 *entries, uint8 count)
@@ -252,12 +274,74 @@ static void page_verify_redirects(Page page);
 #include "test_cluster_heap_prune_helpers.inc"
 #include "test_cluster_heap_freeze_helpers.inc"
 
+/* Plans here are fixture-qualified, not shared FullXid/provenance evidence. */
+static void
+heap_freeze_apply_prepared(Relation rel, Buffer buffer,
+						   TransactionId snapshotConflictHorizon,
+						   HeapTupleFreeze *tuples, int ntuples,
+						   const ClusterSpaceIdentity *identity)
+#include "test_cluster_heap_freeze_apply.inc"
+
 /* Execute the full native freeze body with the planned pre-lock identity. */
 static void
 run_freeze(Relation rel, Buffer buffer, TransactionId snapshotConflictHorizon,
 		   HeapTupleFreeze *tuples, int ntuples,
 		   const ClusterSpaceIdentity *identity pg_attribute_unused())
 #include "test_cluster_heap_freeze_body.inc"
+
+XLogRedoAction
+XLogReadBufferForRedo(XLogReaderState *record, uint8 id, Buffer *buffer)
+{
+	UT_ASSERT(redoing && !redo_locked);
+	UT_ASSERT_EQ(id, 0);
+	UT_ASSERT_EQ(record->EndRecPtr, UINT64_C(0x9000));
+	*buffer = 1;
+	redo_locked = true;
+	return BLK_NEEDS_REDO;
+}
+
+char *
+XLogRecGetBlockData(XLogReaderState *record, uint8 id, Size *length)
+{
+	UT_ASSERT(redoing && redo_locked && record != NULL);
+	UT_ASSERT_EQ(id, 0);
+	if (length != NULL)
+		*length = freeze_block_length;
+	return freeze_block_data.data;
+}
+
+void
+XLogRecGetBlockTag(XLogReaderState *record, uint8 id, RelFileLocator *locator,
+				   ForkNumber *forknum, BlockNumber *block)
+{
+	/* Hot-standby conflict handling is outside this native replay fixture. */
+	(void)record;
+	(void)id;
+	(void)locator;
+	(void)forknum;
+	(void)block;
+	abort();
+}
+
+void
+ResolveRecoveryConflictWithSnapshot(TransactionId xid, bool catalog, RelFileLocator locator)
+{
+	(void)xid;
+	(void)catalog;
+	(void)locator;
+	abort();
+}
+
+void
+UnlockReleaseBuffer(Buffer buffer)
+{
+	UT_ASSERT(redoing && redo_locked);
+	UT_ASSERT_EQ(buffer, 1);
+	redo_locked = false;
+	redo_releases++;
+}
+
+#include "test_cluster_heap_freeze_redo.inc"
 
 	/* Native eligibility/retention is covered by test_cluster_r4_lock_order.
  * Here the exact approved redirect/remove plan enters the real WAL section. */
@@ -331,6 +415,12 @@ reset(uint8 opcode, bool shared)
 	cluster_enabled = shared;
 	CritSectionCount = 0;
 	edges = inserts = dirties = hints = 0;
+	tx_checks = redo_dirties = redo_releases = freeze_data_calls = 0;
+	freeze_block_length = 0;
+	expected_nplans = 1;
+	memset(freeze_main_data.data, 0, BLCKSZ);
+	memset(freeze_block_data.data, 0, BLCKSZ);
+	redoing = redo_locked = false;
 	begun = expecting_error = false;
 	tx_committed = true;
 	next_token = 100;
@@ -404,6 +494,185 @@ check_publication(bool shared)
 		UT_ASSERT_EQ(edge.result_kind, RF_PAGE_STATE_PRESENT);
 		UT_ASSERT(memcmp(edge.before.segment_incarnation, space_identity.incarnation, 16) == 0);
 		UT_ASSERT(memcmp(edge.result_incarnation, space_identity.incarnation, 16) == 0);
+	}
+}
+
+static HeapTupleHeader
+freeze_tuple(Page page, OffsetNumber offset)
+{
+	return (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, offset));
+}
+
+static void
+replay_freeze_record(void)
+{
+	PGAlignedBlock written;
+	XLogReaderState reader = { 0 };
+	DecodedXLogRecord *decoded = calloc(1, offsetof(DecodedXLogRecord, blocks)
+										 + sizeof(DecodedBkpBlock));
+
+	UT_ASSERT_NOT_NULL(decoded);
+	if (decoded == NULL)
+		return;
+	memcpy(written.data, current_page.data, BLCKSZ);
+	memcpy(current_page.data, before_page.data, BLCKSZ);
+	decoded->main_data = freeze_main_data.data;
+	decoded->main_data_len = SizeOfHeapFreezePage;
+	reader.record = decoded;
+	reader.EndRecPtr = UINT64_C(0x9000);
+	redoing = true;
+	heap_xlog_freeze_page(&reader);
+	redoing = false;
+	UT_ASSERT_EQ(redo_dirties, 1);
+	UT_ASSERT_EQ(redo_releases, 1);
+	UT_ASSERT(!redo_locked);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	/* SPACE edge replay is an outer layer, not native heap freeze redo. */
+	UT_ASSERT_EQ(((PageHeader)current_page.data)->pd_block_scn, 20);
+	((PageHeader)written.data)->pd_block_scn = 20;
+	UT_ASSERT(memcmp(written.data, current_page.data, BLCKSZ) == 0);
+	free(decoded);
+}
+
+UT_TEST(test_qualified_freeze_kernel_changes_only_planned_headers)
+{
+	HeapTupleFreeze tuples[2] = { { 0 } };
+
+	reset(XLOG_HEAP2_FREEZE_PAGE, true);
+	tx_committed = false;
+	for (int i = 0; i < 2; i++) {
+		tuples[i].offset = i + 1;
+		tuples[i].t_infomask = HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID;
+		tuples[i].checkflags = HEAP_FREEZE_CHECK_XMIN_COMMITTED;
+	}
+	heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 2, &space_identity);
+	check_publication(true);
+	UT_ASSERT_EQ(tx_checks, 0);
+	UT_ASSERT_EQ(freeze_data_calls, 2);
+	for (int i = 1; i <= 3; i++) {
+		HeapTupleHeader tuple = freeze_tuple(current_page.data, i);
+		HeapTupleHeader original = freeze_tuple(before_page.data, i);
+		Size length = ItemIdGetLength(PageGetItemId(current_page.data, i));
+
+		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(tuple), 77);
+		UT_ASSERT_EQ(HeapTupleHeaderXminFrozen(tuple), i <= 2);
+		UT_ASSERT(ItemPointerEquals(&tuple->t_ctid, &original->t_ctid));
+		UT_ASSERT_EQ(tuple->t_hoff, original->t_hoff);
+		UT_ASSERT(memcmp((char *)tuple + tuple->t_hoff,
+						 (char *)original + original->t_hoff,
+						 length - tuple->t_hoff) == 0);
+	}
+	UT_ASSERT(memcmp(freeze_tuple(current_page.data, 3),
+					 freeze_tuple(before_page.data, 3), 64) == 0);
+	if (inserts == 1)
+		replay_freeze_record();
+}
+
+UT_TEST(test_freeze_native_wal_dedup_and_redo)
+{
+	for (int shared = 0; shared <= 1; shared++) {
+		HeapTupleFreeze tuples[3] = { { 0 } };
+		const OffsetNumber order[] = { 3, 1, 2 };
+		xl_heap_freeze_page *header;
+		xl_heap_freeze_plan *plans;
+		OffsetNumber *offsets;
+
+		reset(XLOG_HEAP2_FREEZE_PAGE, shared);
+		expected_nplans = 2;
+		for (int i = 1; i <= 3; i++) {
+			HeapTupleHeader tuple = freeze_tuple(current_page.data, i);
+
+			tuple->t_infomask |= i == 1 ? HEAP_MOVED_OFF : HEAP_MOVED_IN;
+			HeapTupleHeaderSetXvac(tuple, 89 + i);
+		}
+		memcpy(before_page.data, current_page.data, BLCKSZ);
+		for (int i = 0; i < 3; i++) {
+			tuples[i].offset = order[i];
+			tuples[i].t_infomask = HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID;
+			tuples[i].t_infomask2 = order[i] == 1 ? 0 : HEAP_ONLY_TUPLE;
+			tuples[i].frzflags = order[i] == 1 ? XLH_INVALID_XVAC : XLH_FREEZE_XVAC;
+			tuples[i].checkflags = HEAP_FREEZE_CHECK_XMIN_COMMITTED;
+		}
+		if (shared)
+			heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 3, &space_identity);
+		else
+			run_freeze(&relation_data, 1, 70, tuples, 3, NULL);
+		check_publication(shared);
+		UT_ASSERT_EQ(tx_checks, shared ? 0 : 3);
+		if (inserts != 1)
+			continue;
+		UT_ASSERT_EQ(freeze_data_calls, 2);
+		UT_ASSERT_EQ(freeze_block_length,
+					 2 * sizeof(xl_heap_freeze_plan) + 3 * sizeof(OffsetNumber));
+		header = (xl_heap_freeze_page *)freeze_main_data.data;
+		UT_ASSERT_EQ(header->snapshotConflictHorizon, 70);
+		UT_ASSERT(!header->isCatalogRel);
+		UT_ASSERT_EQ(header->nplans, 2);
+		plans = (xl_heap_freeze_plan *)freeze_block_data.data;
+		offsets = (OffsetNumber *)(freeze_block_data.data + 2 * sizeof(*plans));
+		for (int i = 0; i < 2; i++) {
+			UT_ASSERT_EQ(plans[i].xmax, InvalidTransactionId);
+			UT_ASSERT_EQ(plans[i].t_infomask, HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID);
+			UT_ASSERT_EQ(plans[i].t_infomask2, i == 0 ? 0 : HEAP_ONLY_TUPLE);
+			UT_ASSERT_EQ(plans[i].frzflags, i == 0 ? XLH_INVALID_XVAC : XLH_FREEZE_XVAC);
+			UT_ASSERT_EQ(plans[i].ntuples, i == 0 ? 1 : 2);
+		}
+		for (int i = 0; i < 3; i++) {
+			HeapTupleHeader tuple = freeze_tuple(current_page.data, i + 1);
+
+			UT_ASSERT_EQ(offsets[i], i + 1);
+			/* Xvac's raw field remains observable after MOVED bits clear. */
+			UT_ASSERT_EQ(HeapTupleHeaderGetRawCommandId(tuple),
+						 i == 0 ? InvalidTransactionId : FrozenTransactionId);
+			UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(tuple), 77);
+			UT_ASSERT(HeapTupleHeaderXminFrozen(tuple));
+			UT_ASSERT_EQ(tuple->t_infomask & HEAP_MOVED, 0);
+		}
+		replay_freeze_record();
+	}
+}
+
+UT_TEST(test_freeze_kernel_rejects_invalid_space_before_write)
+{
+	for (int bad = 0; bad < 7; bad++) {
+		HeapTupleFreeze tuple = { 0 };
+
+		reset(XLOG_HEAP2_FREEZE_PAGE, true);
+		tuple.offset = 1;
+		tuple.t_infomask = HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID;
+		switch (bad) {
+		case 0:
+			space_identity.key.database_incarnation++;
+			break;
+		case 1:
+			space_identity.key.locator.relNumber++;
+			break;
+		case 2:
+			space_identity.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+			break;
+		case 3:
+			((PageHeader)current_page.data)->pd_block_scn = 0;
+			break;
+		case 4:
+			break; /* no pre-lock identity */
+		case 5:
+			memset(space_identity.incarnation, 0, 16);
+			break;
+		case 6:
+			relation_data.rd_locator.relNumber++;
+			break;
+		}
+		memcpy(before_page.data, current_page.data, BLCKSZ);
+		expecting_error = true;
+		if (setjmp(error_jump) == 0) {
+			heap_freeze_apply_prepared(&relation_data, 1, 70, &tuple, 1,
+									 bad == 4 ? NULL : &space_identity);
+			UT_ASSERT(false);
+		}
+		expecting_error = false;
+		UT_ASSERT(memcmp(before_page.data, current_page.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(tx_checks + inserts + dirties + edges + CritSectionCount, 0);
+		UT_ASSERT_EQ(next_token, 100);
 	}
 }
 
@@ -681,7 +950,7 @@ UT_TEST(test_deferred_request_preserves_shared_freeze_restriction)
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(18);
 	UT_RUN(test_prune_native_plan_and_version);
 	UT_RUN(test_shared_freeze_refuses_before_tuple_or_wal);
 	UT_RUN(test_vacuum_native_unused_and_version);
@@ -692,6 +961,9 @@ main(void)
 	UT_RUN(test_prune_hint_missing_identity_refuses_before_mutation);
 	UT_RUN(test_invalid_identity_refuses_before_mutation);
 	UT_RUN(test_freeze_preserves_native_transaction_sanity_gate);
+	UT_RUN(test_qualified_freeze_kernel_changes_only_planned_headers);
+	UT_RUN(test_freeze_native_wal_dedup_and_redo);
+	UT_RUN(test_freeze_kernel_rejects_invalid_space_before_write);
 	UT_RUN(test_vacuum_native_entry_copies_prelock_identity);
 	UT_RUN(test_vacuum_native_entry_refuses_missing_identity);
 	UT_RUN(test_explicit_shared_freeze_requests_before_content_locks);

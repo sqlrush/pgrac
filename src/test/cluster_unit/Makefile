@@ -1951,6 +1951,17 @@ test_cluster_heap_freeze_body.inc: $(top_srcdir)/src/backend/access/heap/heapam.
 	     END { if (found != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_heap_freeze_apply.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_freeze_apply_prepared\(/ { inside=1; found++ } \
+	     inside && /^{/ { emit=1 } emit { print } /^}/ { inside=emit=0 } \
+	     END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_freeze_redo.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_xlog_freeze_page\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_freeze_helpers.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
 	awk '/^heap_execute_freeze_tuple\(/ { print "static void"; emit=1; found++ } \
 	     /^heap_log_freeze_(cmp|plan)\(/ { print "static int"; emit=1; found++ } \
@@ -1977,6 +1988,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c t
 		test_cluster_heap_maintenance_identity.inc \
 		test_cluster_heap_prune_version.inc test_cluster_heap_prune_helpers.inc \
 		test_cluster_heap_freeze_body.inc test_cluster_heap_freeze_helpers.inc \
+		test_cluster_heap_freeze_apply.inc test_cluster_heap_freeze_redo.inc \
 		test_cluster_heap_vacuum_version.inc test_cluster_space_bufpage_product.o \
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		test_cluster_inplace_itemptr_product.o \
@@ -4843,7 +4855,8 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_btree_build_identity.inc
 	rm -f test_cluster_heap_maintenance_identity.inc
 	rm -f test_cluster_heap_prune_version.inc test_cluster_heap_prune_helpers.inc \
-		test_cluster_heap_freeze_body.inc test_cluster_heap_freeze_helpers.inc test_cluster_heap_vacuum_version.inc
+		test_cluster_heap_freeze_body.inc test_cluster_heap_freeze_helpers.inc \
+		test_cluster_heap_freeze_apply.inc test_cluster_heap_freeze_redo.inc test_cluster_heap_vacuum_version.inc
 	rm -f test_cluster_space_cache_insert.inc test_cluster_space_cache_delete.inc test_cluster_space_cache_allocation.inc test_cluster_space_cache_update.inc
 	rm -f test_cluster_space_hint_owners.inc test_cluster_space_census_types.inc test_cluster_space_census_mutation.inc test_cluster_space_cleanout_product.o
 	rm -f test_cluster_space_fsm_hint.inc

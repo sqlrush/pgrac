@@ -20584,27 +20584,20 @@ heap_execute_freeze_tuple(HeapTupleHeader tuple, HeapTupleFreeze *frz)
 }
 
 /*
- * heap_freeze_execute_prepared
- *
- * Executes freezing of one or more heap tuples on a page on behalf of caller.
- * Caller passes an array of tuple plans from heap_prepare_freeze_tuple.
- * Caller must set 'offset' in each plan for us.  Note that we destructively
- * sort caller's tuples array in-place, so caller had better be done with it.
- *
- * WAL-logs the changes so that VACUUM can advance the rel's relfrozenxid
- * later on without any risk of unsafe pg_xact lookups, even following a hard
- * crash (or when querying from a standby).  We represent freezing by setting
- * infomask bits in tuple headers, but this shouldn't be thought of as a hint.
- * See section on buffer access rules in src/backend/storage/buffer/README.
+ * Apply already-qualified freeze plans under the caller's exclusive content
+ * lock.  Eligibility checks belong to the caller; this private mutation/WAL
+ * kernel neither proves transaction identity nor grants shared freeze access.
+ * Keep SPACE preparation outside the critical section and page changes in the
+ * same native FREEZE_PAGE WAL record.
  */
-void
-heap_freeze_execute_prepared(Relation rel, Buffer buffer,
-							 TransactionId snapshotConflictHorizon,
-							 HeapTupleFreeze *tuples, int ntuples
+static void
+heap_freeze_apply_prepared(Relation rel, Buffer buffer,
+						   TransactionId snapshotConflictHorizon,
+						   HeapTupleFreeze *tuples, int ntuples
 #ifdef USE_PGRAC_CLUSTER
-							 , const ClusterSpaceIdentity *identity
+						   , const ClusterSpaceIdentity *identity
 #endif
-							 )
+						   )
 {
 	Page		page = BufferGetPage(buffer);
 #ifdef USE_PGRAC_CLUSTER
@@ -20614,60 +20607,7 @@ heap_freeze_execute_prepared(Relation rel, Buffer buffer,
 		&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1;
 #endif
 
-	/* PGRAC: reject before transaction checks or tuple changes. */
-	if (cluster_heap_maintenance_restricted(rel))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("freezing shared heap tuples is not supported"),
-				 errhint("Run VACUUM for supported maintenance without advancing freeze cutoffs.")));
-
 	Assert(ntuples > 0);
-
-	/*
-	 * Perform xmin/xmax XID status sanity checks before critical section.
-	 *
-	 * heap_prepare_freeze_tuple doesn't perform these checks directly because
-	 * pg_xact lookups are relatively expensive.  They shouldn't be repeated
-	 * by successive VACUUMs that each decide against freezing the same page.
-	 */
-	for (int i = 0; i < ntuples; i++)
-	{
-		HeapTupleFreeze *frz = tuples + i;
-		ItemId		itemid = PageGetItemId(page, frz->offset);
-		HeapTupleHeader htup;
-
-		htup = (HeapTupleHeader) PageGetItem(page, itemid);
-
-		/* Deliberately avoid relying on tuple hint bits here */
-		if (frz->checkflags & HEAP_FREEZE_CHECK_XMIN_COMMITTED)
-		{
-			TransactionId xmin = HeapTupleHeaderGetRawXmin(htup);
-
-			Assert(!HeapTupleHeaderXminFrozen(htup));
-			if (unlikely(!TransactionIdDidCommit(xmin)))
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg_internal("uncommitted xmin %u needs to be frozen",
-										 xmin)));
-		}
-
-		/*
-		 * TransactionIdDidAbort won't work reliably in the presence of XIDs
-		 * left behind by transactions that were in progress during a crash,
-		 * so we can only check that xmax didn't commit
-		 */
-		if (frz->checkflags & HEAP_FREEZE_CHECK_XMAX_ABORTED)
-		{
-			TransactionId xmax = HeapTupleHeaderGetRawXmax(htup);
-
-			Assert(TransactionIdIsNormal(xmax));
-			if (unlikely(TransactionIdDidCommit(xmax)))
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg_internal("cannot freeze committed xmax %u",
-										 xmax)));
-		}
-	}
 
 #ifdef USE_PGRAC_CLUSTER
 	/* The VACUUM owner obtained this identity before taking content locks. */
@@ -20740,6 +20680,94 @@ heap_freeze_execute_prepared(Relation rel, Buffer buffer,
 	}
 
 	END_CRIT_SECTION();
+}
+
+/*
+ * heap_freeze_execute_prepared
+ *
+ * Executes freezing of one or more heap tuples on a page on behalf of caller.
+ * Caller passes an array of tuple plans from heap_prepare_freeze_tuple.
+ * Caller must set 'offset' in each plan for us.  Note that we destructively
+ * sort caller's tuples array in-place, so caller had better be done with it.
+ *
+ * WAL-logs the changes so that VACUUM can advance the rel's relfrozenxid
+ * later on without any risk of unsafe pg_xact lookups, even following a hard
+ * crash (or when querying from a standby).  We represent freezing by setting
+ * infomask bits in tuple headers, but this shouldn't be thought of as a hint.
+ * See section on buffer access rules in src/backend/storage/buffer/README.
+ */
+void
+heap_freeze_execute_prepared(Relation rel, Buffer buffer,
+							 TransactionId snapshotConflictHorizon,
+							 HeapTupleFreeze *tuples, int ntuples
+#ifdef USE_PGRAC_CLUSTER
+							 , const ClusterSpaceIdentity *identity
+#endif
+							 )
+{
+	Page		page = BufferGetPage(buffer);
+
+	/* PGRAC: reject before transaction checks or tuple changes. */
+	if (cluster_heap_maintenance_restricted(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("freezing shared heap tuples is not supported"),
+				 errhint("Run VACUUM for supported maintenance without advancing freeze cutoffs.")));
+
+	Assert(ntuples > 0);
+
+	/*
+	 * Perform xmin/xmax XID status sanity checks before critical section.
+	 *
+	 * heap_prepare_freeze_tuple doesn't perform these checks directly because
+	 * pg_xact lookups are relatively expensive.  They shouldn't be repeated
+	 * by successive VACUUMs that each decide against freezing the same page.
+	 */
+	for (int i = 0; i < ntuples; i++)
+	{
+		HeapTupleFreeze *frz = tuples + i;
+		ItemId		itemid = PageGetItemId(page, frz->offset);
+		HeapTupleHeader htup;
+
+		htup = (HeapTupleHeader) PageGetItem(page, itemid);
+
+		/* Deliberately avoid relying on tuple hint bits here */
+		if (frz->checkflags & HEAP_FREEZE_CHECK_XMIN_COMMITTED)
+		{
+			TransactionId xmin = HeapTupleHeaderGetRawXmin(htup);
+
+			Assert(!HeapTupleHeaderXminFrozen(htup));
+			if (unlikely(!TransactionIdDidCommit(xmin)))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg_internal("uncommitted xmin %u needs to be frozen",
+										 xmin)));
+		}
+
+		/*
+		 * TransactionIdDidAbort won't work reliably in the presence of XIDs
+		 * left behind by transactions that were in progress during a crash,
+		 * so we can only check that xmax didn't commit
+		 */
+		if (frz->checkflags & HEAP_FREEZE_CHECK_XMAX_ABORTED)
+		{
+			TransactionId xmax = HeapTupleHeaderGetRawXmax(htup);
+
+			Assert(TransactionIdIsNormal(xmax));
+			if (unlikely(TransactionIdDidCommit(xmax)))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg_internal("cannot freeze committed xmax %u",
+										 xmax)));
+		}
+	}
+
+	heap_freeze_apply_prepared(rel, buffer, snapshotConflictHorizon, tuples,
+							   ntuples
+#ifdef USE_PGRAC_CLUSTER
+							   , identity
+#endif
+							   );
 }
 
 /*
