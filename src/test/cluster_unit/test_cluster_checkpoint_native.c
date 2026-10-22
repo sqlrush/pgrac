@@ -2142,6 +2142,18 @@ UT_TEST(initializer_selection_precedes_first_native_side_effect)
 	UT_ASSERT_EQ(current.checkPoint, 100);
 }
 
+UT_TEST(initializer_selection_accepts_recovered_cohort)
+{
+	writer_begin_fixture();
+	offered.input_kind = CLUSTER_WAL_STARTUP_RECOVERED;
+	UT_ASSERT(startup_first_native_site());
+	UT_ASSERT_EQ(startup_directory_calls, 1);
+	UT_ASSERT(!directory_before_selection);
+	UT_ASSERT(clusterStartupWriterSelected);
+	UT_ASSERT_EQ(clusterStartupWriter.input_kind, CLUSTER_WAL_STARTUP_RECOVERED);
+	UT_ASSERT_EQ(route_calls | bind_calls, 0);
+}
+
 UT_TEST(initializer_selection_waits_for_original_lock_before_native_side_effect)
 {
 	writer_begin_fixture();
@@ -2848,7 +2860,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(75);
+	UT_PLAN(76);
 	UT_RUN(recovery_checkpoint_selects_scope_only_for_closed_online_owner);
 	UT_RUN(recovery_checkpoint_closed_admission_uses_only_original_scope);
 	UT_RUN(recovery_checkpoint_preserves_owner_and_native_guards);
@@ -2876,6 +2888,7 @@ main(void)
 	UT_RUN(clean_input_observation_rejects_wrong_owner_phase_and_lock_context);
 	UT_RUN(clean_input_observation_rechecks_root_and_native_checkpoint);
 	UT_RUN(initializer_selection_waits_for_original_lock_before_native_side_effect);
+	UT_RUN(initializer_selection_accepts_recovered_cohort);
 	UT_RUN(clean_writer_checkpoint_uses_exact_existing_fence_qualification);
 	UT_RUN(clean_checkpoint_cannot_borrow_other_input_epoch_or_writer);
 	UT_RUN(shared_crash_control_prepares_without_untyped_publication);

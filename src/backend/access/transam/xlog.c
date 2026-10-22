@@ -6348,7 +6348,8 @@ ClusterStartupWriterSelect(void)
 					   (int)result)));
 	if (selected.phase != CLUSTER_WAL_STARTUP_INITIALIZING
 		|| (selected.input_kind != CLUSTER_WAL_STARTUP_CLEAN
-			&& selected.input_kind != CLUSTER_WAL_STARTUP_INITIALIZED)
+			&& selected.input_kind != CLUSTER_WAL_STARTUP_INITIALIZED
+			&& selected.input_kind != CLUSTER_WAL_STARTUP_RECOVERED)
 		|| selected.segment_size != wal_segment_size || !IsValidWalSegSize(wal_segment_size)
 		|| selected.first_segment_lsn == 0 || selected.first_segment_lsn % wal_segment_size != 0
 		|| selected.first_segment_lsn < selected.sealed_input_end
@@ -6360,7 +6361,7 @@ ClusterStartupWriterSelect(void)
 		|| selected.predecessor.snapshot.checkpoint_lower_lsn > ControlFile->checkPoint
 		|| ControlFile->checkPointCopy.ThisTimeLineID != selected.timeline)
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-						errmsg("native startup contradicts its selected clean input")));
+						errmsg("native startup contradicts its selected startup input")));
 	clusterStartupWriter = selected;
 	clusterStartupWriterSelected = true;
 }
