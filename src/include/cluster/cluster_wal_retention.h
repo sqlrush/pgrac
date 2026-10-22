@@ -387,6 +387,20 @@ extern ClusterWalPinResult
 cluster_wal_retention_root_publish_begin_exact(const ClusterControlRootReadToken *expected_root,
 											   bool require_sealed_pin,
 											   ClusterWalRootPublishGuard **out_guard);
+/* PGRAC: one original sealed cold-input owner protects an entire sorted
+ * COMPLETE/CLOSED ROOT cut through CF/CAS/readback. COMPLETE members convert
+ * their original S holders only after every IR release; CLOSED inputs retain
+ * their original reader S holders and gain no recovery authority. The cut
+ * must exactly cover the pin's recovery and read-only inputs. No CF I/O here.
+ * A failed/partial conversion can return an owned guard: end it before retry.
+ * End restores converted members in reverse order; uncertainty is cleanup-only.
+ * This does not authorize ROOT publication or qualify any recovery evidence.
+ * Author: SqlRush <sqlrush@gmail.com> */
+extern ClusterWalPinResult cluster_wal_retention_root_publish_begin_set_v1(
+	const ClusterControlRootReadToken *roots, uint16 nroots,
+	ClusterWalRootPublishGuard **out_guard);
+extern bool
+cluster_wal_retention_root_publish_set_current_v1(const ClusterWalRootPublishGuard *guard);
 extern ClusterWalrReleaseResult
 cluster_wal_retention_root_publish_end(ClusterWalRootPublishGuard **guard);
 /* PGRAC: post-IR sealed-pin exclusive observation; no CF acquisition or new authority.
