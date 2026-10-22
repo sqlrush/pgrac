@@ -10,6 +10,7 @@
 
 #define CLUSTER_RECOVERY_STAMP_PAYLOAD_BYTES 320
 #define CLUSTER_RECOVERY_STAMP_SLOTS 128
+#define CLUSTER_RECOVERY_STAMP_EXIT_V1 1
 
 typedef enum ClusterRecoveryStampKindV1 {
 	CLUSTER_RECOVERY_STAMP_C0 = 1,
@@ -22,7 +23,8 @@ typedef enum ClusterRecoveryStampPhaseV1 {
 	CLUSTER_RECOVERY_STAMP_PRE_INSERT,
 	CLUSTER_RECOVERY_STAMP_INSERTING,
 	CLUSTER_RECOVERY_STAMP_INSERTED,
-	CLUSTER_RECOVERY_STAMP_DURABLE
+	CLUSTER_RECOVERY_STAMP_DURABLE,
+	CLUSTER_RECOVERY_STAMP_ADOPT_PENDING
 } ClusterRecoveryStampPhaseV1;
 
 typedef enum ClusterRecoveryStampPollV1 {
@@ -56,6 +58,10 @@ typedef struct ClusterRecoveryStampSlotV1 {
 	slock_t lock;
 	ClusterRecoveryStampHandleV1 handle;
 	ClusterRecoveryStampPhaseV1 phase;
+	ClusterRecoveryStampPhaseV1 adopt_from;
+	uint64 executor_attempt_stamp;
+	uint64 bound_worker_attempt;
+	int32 bound_worker_pid;
 	ClusterRecoveryStampKindV1 kind;
 	uint32 payload_length;
 	uint8 payload[CLUSTER_RECOVERY_STAMP_PAYLOAD_BYTES];
@@ -70,6 +76,12 @@ typedef struct ClusterRecoveryStampCaptureV1 {
 	uint32 count;
 	ClusterRecoveryStampKeyV1 keys[CLUSTER_RECOVERY_STAMP_SLOTS];
 } ClusterRecoveryStampCaptureV1;
+
+/* Original validated BGW entry registers its scheduler attempt. Only the
+ * original LMON, after exact native-handle BGWH_STOPPED, reports its exit.
+ * This preserves an unfinished window; it grants no adoption/write authority. */
+extern bool cluster_recovery_stamp_worker_begin_v1(uint16 thread, uint64 attempt);
+extern bool cluster_recovery_stamp_worker_stopped_v1(uint16 thread, uint64 attempt);
 
 /* Call only after original authority, reservation and held-FD preparation.
  * Currently admits exact C0; FPI/D0 and unknown shapes refuse. No WAL or IO.

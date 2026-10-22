@@ -9677,7 +9677,29 @@ test_cluster_recovery_stamp: test_cluster_recovery_stamp.c unit_test.h \
         $(top_builddir)/src/common/libpgcommon_srv.a \
         $(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
 
-# Actual native checkpoint waiting function and its pre-sync call site.
+# Original scheduler status/CAS and exact native BGW handle reaper.
+test_cluster_recovery_stamp_reap.inc: $(top_srcdir)/src/backend/cluster/cluster_thread_recovery_worker.c \
+        $(top_srcdir)/src/backend/cluster/cluster_thread_recovery_orchestrator.c Makefile
+	awk '/^typedef struct ClusterThreadRecOwnedWorker \{/ { emit=1; types++ } \
+         /^static ClusterThreadRecOwnedWorker thread_recovery_owned\[/ { print; arrays++ } \
+         /^cluster_thread_recovery_replay_read\(/ { print "bool"; emit=1; helpers++ } \
+         /^cluster_thread_recovery_replay_transition_if_match\(/ { print "ClusterThreadReplayMatchResult"; emit=1; helpers++ } \
+         /^thread_recovery_reap_one\(/ { print "static void"; emit=1; functions++ } \
+         emit { print } /^}/ { emit=0 } \
+         END { if (types != 1 || arrays != 1 || functions != 1 || helpers != 2 || emit) exit 1 }' \
+         $(top_srcdir)/src/backend/cluster/cluster_thread_recovery_orchestrator.c $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_recovery_stamp_exit: test_cluster_recovery_stamp_exit.c test_cluster_recovery_stamp.c \
+        test_cluster_recovery_stamp_reap.inc unit_test.h \
+        $(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
+        $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+        $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
+        $(top_builddir)/src/common/libpgcommon_srv.a \
+        $(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+
 test_cluster_checkpoint_stamp.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^ClusterCheckpointWaitRecoveryStamps\(/ { print "static void"; emit=1; functions++ } \
          emit { print } /^}/ { emit=0 } \

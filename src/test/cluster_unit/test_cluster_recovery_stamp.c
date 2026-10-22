@@ -265,6 +265,11 @@ UT_TEST(identity_role_kind_and_payload_refusal)
 	MyBackendType = B_BACKEND;
 	UT_ASSERT(!cluster_recovery_stamp_prepare_v1(&owner, 1, payload, sizeof(payload), &h));
 	MyBackendType = B_BG_WORKER;
+	/* A shared BGW now needs its original validated launch registration. */
+	UT_ASSERT(!cluster_recovery_stamp_prepare_v1(&owner, 1, payload, sizeof(payload), &h));
+	pg_atomic_write_u64(&region.thread_replay[2].episode_epoch, 77);
+	pg_atomic_write_u32(&region.thread_replay[2].state, CLUSTER_THREADREC_REPLAY_REPLAYING);
+	UT_ASSERT(cluster_recovery_stamp_worker_begin_v1(2, 77));
 	if (!begin(&h))
 		return;
 	MyProcPid++;

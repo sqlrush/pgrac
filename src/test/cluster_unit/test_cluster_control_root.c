@@ -1669,6 +1669,18 @@ void
 BackgroundWorkerUnblockSignals(void)
 {}
 
+static bool test_stamp_worker_begin_allowed = true;
+static unsigned test_stamp_worker_begin_calls;
+bool
+cluster_recovery_stamp_worker_begin_v1(uint16 thread, uint64 attempt)
+{
+	UT_ASSERT_EQ(thread, 1);
+	UT_ASSERT_EQ(attempt, 123);
+	UT_ASSERT_NULL(CurrentResourceOwner);
+	test_stamp_worker_begin_calls++;
+	return test_stamp_worker_begin_allowed;
+}
+
 ClusterThreadReplayMatchResult
 cluster_thread_recovery_replay_transition_if_match(
 	uint16 thread, uint64 stamp, ClusterThreadRecReplayState expected,
@@ -13269,11 +13281,21 @@ UT_TEST(test_runtime_v3_failure_worker_entry_establishes_resource_owner)
 	memcpy(worker.bgw_extra, &eligibility, sizeof(eligibility));
 	MyBgworkerEntry = &worker;
 	CurrentResourceOwner = NULL;
+	test_stamp_worker_begin_calls = 0;
+	test_stamp_worker_begin_allowed = false;
 	/* Invalid launches cannot enter publication or manufacture an owner. */
 	cluster_thread_recovery_worker_main(Int32GetDatum(0));
 	UT_ASSERT_NULL(CurrentResourceOwner);
 	v2_assert_primary_unchanged(before);
+	UT_ASSERT_EQ(test_stamp_worker_begin_calls, 0);
 	cluster_thread_recovery_worker_main(Int32GetDatum(1));
+	UT_ASSERT_NULL(CurrentResourceOwner);
+	UT_ASSERT_EQ(test_stamp_worker_begin_calls, 1);
+	UT_ASSERT_EQ(test_worker_replays, 0);
+	v2_assert_primary_unchanged(before);
+	test_stamp_worker_begin_allowed = true;
+	cluster_thread_recovery_worker_main(Int32GetDatum(1));
+	UT_ASSERT_EQ(test_stamp_worker_begin_calls, 2);
 	UT_ASSERT_NOT_NULL(CurrentResourceOwner);
 	UT_ASSERT_EQ(test_worker_replays, 1);
 	UT_ASSERT_EQ(cluster_control_root_read_canonical(
@@ -23783,6 +23805,12 @@ main(int argc, char **argv)
 	if (argc > 1)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_STAMP_WORKER_ENTRY") != NULL) {
+		UT_PLAN(1);
+		UT_RUN(test_runtime_v3_failure_worker_entry_establishes_resource_owner);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_TX_INPUTS") != NULL) {
 		UT_PLAN(6);
 		UT_RUN(test_tx_inputs_reads_actual_closed_wal_and_rechecks_owner);
