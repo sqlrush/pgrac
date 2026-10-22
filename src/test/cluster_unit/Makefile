@@ -9542,15 +9542,32 @@ test_cluster_vacuum_proof_guard.inc: $(top_srcdir)/src/backend/cluster/cluster_r
 	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Keep the parent reproducible: its two native wrappers precede the new pair.
+# The production caller links the new pair when present, so it cannot be stubbed.
+test_cluster_vacuum_proof_release.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^(ReleaseBuffer|UnlockReleaseBuffer|ClusterUnlockReleaseBufferAfterConditionalRead)\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found < 2 || found > 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Actual generic-unlock cache-off decision; only the remote/mirror leaves vary.
+test_cluster_vacuum_proof_unlock_tail.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk 'BEGIN { print "static void fixture_lockbuffer_unlock_tail(BufferDesc *buf, int mode, bool pcm_x_writer_managed)"; print "{" } \
+	     /^\tif \(mode == BUFFER_LOCK_UNLOCK$$/ { emit=1; found++ } \
+	     emit { print } emit && /^\treturn;$$/ { emit=0 } \
+	     END { print "}"; if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_vacuum_proof_cleanup: test_cluster_vacuum_proof_cleanup.c unit_test.h \
 		test_cluster_vacuum_proof_cleanup.inc test_cluster_vacuum_proof_guard.inc \
+		test_cluster_vacuum_proof_release.inc test_cluster_vacuum_proof_unlock_tail.inc \
 		$(top_srcdir)/src/include/cluster/cluster_heap_freeze.h \
 		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
 		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_block0_current.h \
 		$(top_srcdir)/src/include/cluster/cluster_tx_resolve.h \
 		$(top_srcdir)/src/include/storage/ipc.h $(top_srcdir)/src/include/utils/elog.h \
-		$(top_srcdir)/src/include/storage/bufmgr.h $(top_srcdir)/src/include/storage/bufpage.h
+		$(top_srcdir)/src/include/storage/bufmgr.h $(top_srcdir)/src/include/storage/bufpage.h \
+		$(top_srcdir)/src/include/storage/buf_internals.h $(top_srcdir)/src/include/cluster/cluster_conf.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # The real pure locator builders, including the existing UBA validation.

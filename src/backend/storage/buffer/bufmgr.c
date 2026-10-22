@@ -15556,6 +15556,26 @@ ConditionalLockBuffer(Buffer buffer)
 }
 
 /*
+ * Release a pin and the local content lock after a read-only successful
+ * ConditionalLockBuffer().  That acquisition did not acquire PCM ownership or
+ * enter its writer ledger.  In particular, a generic LockBuffer(UNLOCK) here
+ * could perform a synchronous PCM release when local caching is disabled,
+ * raising an ERROR before the pin is released or replacing an unwinding ERROR.
+ *
+ * Leave the pre-existing PCM ownership to its normal owner/revoker/eviction
+ * lifecycle.  Only the native content lock and original native pin belong to
+ * this read-only scope.  This is not a pair for LockBuffer(), nor for a caller
+ * that modified the page after ConditionalLockBuffer().
+ */
+void
+ClusterUnlockReleaseBufferAfterConditionalRead(Buffer buffer)
+{
+	if (!BufferIsLocal(buffer))
+		LWLockRelease(BufferDescriptorGetContentLock(GetBufferDescriptor(buffer - 1)));
+	ReleaseBuffer(buffer);
+}
+
+/*
  * Verify that this backend is pinning the buffer exactly once.
  *
  * NOTE: Like in BufferIsPinned(), what we check here is that *this* backend

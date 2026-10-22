@@ -1670,7 +1670,7 @@ recheck_done:;
 	PG_FINALLY();
 	{
 		if (locked)
-			UnlockReleaseBuffer(recent_buffer);
+			ClusterUnlockReleaseBufferAfterConditionalRead(recent_buffer);
 		else
 			ReleaseBuffer(recent_buffer);
 	}

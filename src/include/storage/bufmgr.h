@@ -369,6 +369,8 @@ extern bool ClusterLockBufferShareBarrierAware(Buffer buffer);
 extern Buffer LockBufferForVisibilityMapPageInit(Buffer buffer);
 extern Buffer LockBufferForFreeSpaceMapPageInit(Buffer buffer);
 extern bool ConditionalLockBuffer(Buffer buffer);
+/* Read-only successful ConditionalLockBuffer() only; no PCM writer cleanup. */
+extern void ClusterUnlockReleaseBufferAfterConditionalRead(Buffer buffer);
 extern void LockBufferForCleanup(Buffer buffer);
 extern bool ConditionalLockBufferForCleanup(Buffer buffer);
 extern bool IsBufferCleanupOK(Buffer buffer);
