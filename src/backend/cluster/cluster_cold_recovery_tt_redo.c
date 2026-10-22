@@ -1226,8 +1226,9 @@ cluster_cold_typed_top_tx_loser_producer_v1(
 	 * real PAGE/FSM/SPACE route. The caller's bit is never production
 	 * evidence. A fresh empty top has its separate native proof; an old ACTIVE
 	 * or unclassified input cannot enter that branch. */
-	qualified.ordinary_effects = cluster_cold_typed_effects_nonempty_v1(typed)
-								 || cold_top_tx_empty_effects_v1(typed, participant, &post_slot);
+	qualified.ordinary_effects
+		= cluster_cold_typed_effects_nonempty_for_participant_v1(typed, participant)
+		  || cold_top_tx_empty_effects_v1(typed, participant, &post_slot);
 	/* The qualified checkpoint base or retained INIT/REUSE lifecycle reaches
 	 * this exact physical ACTIVE image after completed all-record redo.
 	 * Together with the full retained terminal check, this supplies both

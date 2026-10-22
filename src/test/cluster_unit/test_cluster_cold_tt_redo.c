@@ -4770,6 +4770,10 @@ tt_top_tx_page_binding_expect(uint8 rmid, uint8 info, int variant, TransactionId
 		= CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_PAGE;
 	UT_ASSERT(cluster_cold_effects_proof_record_v1(&effects, 0, &page, &step, true));
 	UT_ASSERT(cluster_cold_typed_effects_complete_v1(&f.typed, &effects, &result));
+	UT_ASSERT(cluster_cold_typed_effects_nonempty_for_participant_v1(&f.typed, 0));
+	UT_ASSERT(!cluster_cold_typed_effects_nonempty_for_participant_v1(&f.typed, 1));
+	UT_ASSERT(!cluster_cold_typed_effects_nonempty_for_participant_v1(
+		&f.typed, CLUSTER_COLD_MAX_PARTICIPANTS));
 	f.typed.xid_next_after_redo = UINT64_C(0x700400200);
 	tt_top_tx_endpoints_complete(&f);
 	tt_top_tx_c0_inputs(&f, &input, &proof, &shape);

@@ -189,6 +189,8 @@ cluster_cold_effects_proof_record_v1(ClusterColdEffectsProofV1 *proof, uint32 pa
 	proof->records_routed++;
 	proof->required_union |= decoded->effects.required;
 	proof->routed_union |= routed;
+	proof->required_union_by_participant[participant] |= decoded->effects.required;
+	proof->routed_union_by_participant[participant] |= routed;
 	return true;
 }
 
@@ -212,6 +214,8 @@ cluster_cold_effects_proof_finish_v1(const ClusterColdEffectsProofV1 *proof,
 		uint64 expected = cluster_cold_plan_replay_record_count_v1(plan, i);
 
 		if (proof->records_seen[i] != expected)
+			return false;
+		if (proof->required_union_by_participant[i] != proof->routed_union_by_participant[i])
 			return false;
 		expected_records += expected;
 	}
@@ -271,6 +275,20 @@ cluster_cold_typed_effects_nonempty_v1(const ClusterColdTypedV1 *typed)
 
 	return cluster_cold_typed_effects_ready_v1(typed)
 		   && (typed->effects_receipt.proof.routed_union & ordinary_mask) != 0;
+}
+
+bool
+cluster_cold_typed_effects_nonempty_for_participant_v1(
+	const ClusterColdTypedV1 *typed, uint32 participant)
+{
+	const uint32 ordinary_mask = CLUSTER_COLD_EFFECT_PAGE | CLUSTER_COLD_EFFECT_FSM
+									 | CLUSTER_COLD_EFFECT_SPACE;
+
+	return typed != NULL && participant < typed->participant_count
+		   && participant < CLUSTER_COLD_MAX_PARTICIPANTS
+		   && cluster_cold_typed_effects_ready_v1(typed)
+		   && (typed->effects_receipt.proof.routed_union_by_participant[participant]
+				   & ordinary_mask) != 0;
 }
 
 bool

@@ -694,6 +694,11 @@ typedef struct ClusterColdEffectsProofV1 {
 	uint64 records_routed;
 	uint32 required_union;
 	uint32 routed_union;
+	/* Keep route coverage bound to the participant that supplied it.  These
+	 * attempt-local masks prevent one origin's ordinary route from qualifying
+	 * another origin; they are not persistence, authority or C0 state. */
+	uint32 required_union_by_participant[CLUSTER_COLD_MAX_PARTICIPANTS];
+	uint32 routed_union_by_participant[CLUSTER_COLD_MAX_PARTICIPANTS];
 	bool invalid;
 } ClusterColdEffectsProofV1;
 
@@ -940,6 +945,11 @@ extern bool cluster_cold_typed_effects_ready_v1(const ClusterColdTypedV1 *typed)
  * is derived from the sealed routed receipt, never from a caller proof bit,
  * and grants no execution or C0 authority. */
 extern bool cluster_cold_typed_effects_nonempty_v1(const ClusterColdTypedV1 *typed);
+/* Return ordinary-effect evidence only for the selected participant's own
+ * routed receipt.  Aggregate readiness and caller proof bits cannot qualify a
+ * different participant, and this remains read-only with no C0 authority. */
+extern bool cluster_cold_typed_effects_nonempty_for_participant_v1(
+	const ClusterColdTypedV1 *typed, uint32 participant);
 
 /* Startup before execution pin/IR only. Reopen the original cold input owner,
  * compare the complete selected ROOT and history checkpoints, then release
