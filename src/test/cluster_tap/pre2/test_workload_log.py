@@ -118,6 +118,114 @@ class WorkloadLogTests(unittest.TestCase):
         self.assertEqual(result["ignored_lines"], 3)
         self.assertFalse(result["rejections"])
 
+    def test_verbose_sqlstate_is_lossless_log_decoration(self):
+        for family in FAMILIES:
+            for sqlstate in ("00000", "53R9G"):
+                with self.subTest(family=family, sqlstate=sqlstate):
+                    decorated = sqlstate + ": " + message(family)
+                    raw = log(decorated).replace(b"\n", b"\r\n")
+                    first = "unrelated UTF-8: 观察\n".encode()
+                    result = self.read(first + raw)
+                    self.assertEqual(result["parse_status"], "PARSED")
+                    self.assertEqual(len(result["observations"]), 1)
+                    observation = result["observations"][0]
+                    self.assertEqual(observation["raw"].encode(), raw)
+                    self.assertEqual(observation["message"], decorated)
+                    self.assertEqual(observation["log_sqlstate"], sqlstate)
+                    self.assertEqual(observation["line"], 2)
+                    self.assertEqual(observation["byte_offset"], len(first))
+                    self.assertEqual(observation["byte_length"], len(raw))
+                    self.assertEqual(observation["sha256"], hashlib.sha256(raw).hexdigest())
+                    self.assertEqual(observation["fields"]["PGRAC_FAMILY"], family)
+                    self.assertEqual(observation["fields"]["authoritative"], "0")
+                    self.assertNotIn("log_sqlstate", observation["fields"])
+                    self.assertEqual(result["field_root"], "OPEN")
+                    self.assertFalse(result["identity_bound"])
+                    self.assertFalse(result["ready_to_run"])
+
+    def test_verbose_prefix_keeps_cursor_and_legacy_emitter_boundaries(self):
+        payloads = (message(),
+                    "PGRAC_FAMILY=R4_HEAP_PRUNE event=observed event_seq=1 "
+                    "node=1 pid=101 authoritative=0 trace_sequence_exhausted=0",
+                    "PGRAC_FAMILY=R4_BTREE_DELETE event=delete.applied event_seq=1 "
+                    "node=1 pid=101 authoritative=0 after_scn=44conflict_horizon_known=1 "
+                    "trace_sequence_exhausted=0")
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                decorated = "00000: " + payload + " at character 14"
+                result = self.read(log(decorated))
+                self.assertEqual(result["parse_status"], "PARSED")
+                observation = result["observations"][0]
+                self.assertEqual(observation["message"], decorated)
+                self.assertEqual(observation["log_sqlstate"], "00000")
+                self.assertEqual(observation["log_cursor_position"], "14")
+                fields = observation["fields"]
+                self.assertNotIn("log_cursor_position", fields)
+                if fields["PGRAC_FAMILY"] == "R4_BTREE_DELETE":
+                    self.assertEqual(fields["after_scn"], "44")
+                    self.assertEqual(fields["conflict_horizon_known"], "1")
+                if fields["PGRAC_FAMILY"] != "HOT_FULL":
+                    self.assertNotIn("node_id", fields)
+                    self.assertNotIn("sequence_domain", fields)
+
+    def test_verbose_prefix_must_be_exact_and_at_message_start(self):
+        prefixes = ("0000: ", "000000: ", "53r9G: ", "０００００: ", "00000:",
+                    "00000:\t", "00000:  ", "00000 : ", "00000: 00000: ",
+                    "unrelated 00000: ")
+        for prefix in prefixes:
+            with self.subTest(prefix=prefix):
+                result = self.read(log(prefix + message()))
+                self.assertEqual(result["parse_status"], "NOT_OBSERVED")
+                self.assertEqual(result["ignored_lines"], 1)
+                self.assertFalse(result["observations"])
+                self.assertFalse(result["unhandled"])
+                self.assertFalse(result["rejections"])
+
+    def test_verbose_prefix_keeps_unsupported_and_non_log_boundaries(self):
+        unsupported = log("00000: PGRAC_FAMILY=E_OTHER event=observed")
+        raw = unsupported + b"".join(
+            log("00000: " + message(), prefix=severity + ":  ")
+            for severity in ("DETAIL", "ERROR", "FATAL", "STATEMENT"))
+        result = self.read(raw)
+        self.assertEqual(result["parse_status"], "NOT_OBSERVED")
+        self.assertEqual(len(result["unhandled"]), 1)
+        self.assertEqual(result["unhandled"][0]["family"], "E_OTHER")
+        self.assertEqual(result["unhandled"][0]["raw"].encode(), unsupported)
+        self.assertEqual(result["ignored_lines"], 4)
+        self.assertFalse(result["observations"])
+        self.assertFalse(result["rejections"])
+
+    def test_verbose_prefix_does_not_hide_invalid_or_partial_emitters(self):
+        payloads = (message().replace("pid=101", "pid=bad"),
+                    message().replace("authoritative=0", "authoritative=1"),
+                    message().replace("trace_sequence_exhausted=0", ""),
+                    message() + " extra=1 at character 14")
+        records = [log("00000: " + payload) for payload in payloads]
+        records.extend((log("00000: " + message()).rstrip(b"\n"),
+                        log("00000: " + message()).replace(b"event=observed", b"event=\xff")))
+        for raw in records:
+            with self.subTest(raw=raw):
+                result = self.read(raw)
+                self.assertEqual(result["parse_status"], "REJECTED")
+                self.assertFalse(result["observations"])
+                self.assertEqual(result["rejections"][0]["raw_hex"], raw.hex())
+                self.assertEqual(result["rejections"][0]["sha256"],
+                                 hashlib.sha256(raw).hexdigest())
+
+    def test_verbose_and_plain_records_keep_order_without_inventing_metadata(self):
+        raw = (log("00000: " + message(seq="9")) + log(message(seq="2")) +
+               log("53R9G: " + message(seq="9")))
+        result = self.read(raw)
+        self.assertEqual(result["parse_status"], "PARSED")
+        observations = result["observations"]
+        self.assertEqual([item["fields"]["event_seq"] for item in observations],
+                         ["9", "2", "9"])
+        self.assertEqual([item.get("log_sqlstate") for item in observations],
+                         ["00000", None, "53R9G"])
+        self.assertNotIn("log_sqlstate", observations[1])
+        self.assertNotIn("events", result)
+        self.assertNotIn("sequences", result)
+
     def test_malformed_records_retain_provenance_and_cannot_parse(self):
         valid = message()
         bad = [valid + " pid=102", valid.replace("pid=101", "pid="),
@@ -213,7 +321,10 @@ class WorkloadLogTests(unittest.TestCase):
         self.assertIsNotNone(workload_log, "raw structured LOG reader is missing")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "server.log"
-            for raw, rc, status in ((log(), 0, "PARSED"), (log().rstrip(b"\n"), 1, "REJECTED"),
+            for raw, rc, status in ((log(), 0, "PARSED"),
+                                    (log("00000: " + message()), 0, "PARSED"),
+                                    (log("00000: " + message()).rstrip(b"\n"), 1, "REJECTED"),
+                                    (log().rstrip(b"\n"), 1, "REJECTED"),
                                     (b"nothing observed\n", 2, "NOT_OBSERVED")):
                 with self.subTest(status=status):
                     path.write_bytes(raw)

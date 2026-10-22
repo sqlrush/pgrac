@@ -28,6 +28,7 @@ SEVERITY = re.compile(r"\b(LOG|DEBUG[1-5]|DETAIL|HINT|CONTEXT|STATEMENT|ERROR|"
                       r"FATAL|PANIC|WARNING|NOTICE|INFO):[ \t]*")
 KEY = re.compile(r"[A-Za-z_][A-Za-z_0-9]*=")
 FAMILY = re.compile(r"PGRAC_FAMILY=([A-Z][A-Z_0-9]*)(?:[ \t]|$)")
+LOG_SQLSTATE_PREFIX = re.compile(r"([0-9A-Z]{5}): ")
 LOG_CURSOR_SUFFIX = re.compile(r" at character ([1-9][0-9]{0,9})$")
 
 
@@ -127,14 +128,18 @@ def read_trace(data):
                 result["ignored_lines"] += 1
                 continue
             message = text[severity.end():].removesuffix("\n").removesuffix("\r")
-            if not message.startswith("PGRAC_FAMILY="):
+            # Verbose elog.c prefixes edata->message with SQLSTATE and ': '.
+            # Preserve the decorated message; only emitter fields use payload.
+            sqlstate = LOG_SQLSTATE_PREFIX.match(message)
+            payload = message[sqlstate.end():] if sqlstate is not None else message
+            if not payload.startswith("PGRAC_FAMILY="):
                 result["ignored_lines"] += 1
                 continue
             if not raw.endswith(b"\n"):
                 raise ValueError("unterminated LOG line")
             if any(ord(character) < 32 and character != "\t" for character in message):
                 raise ValueError("control character in LOG message")
-            match = FAMILY.match(message)
+            match = FAMILY.match(payload)
             if match is None:
                 raise ValueError("invalid family field")
             family = match[1]
@@ -147,17 +152,19 @@ def read_trace(data):
             adjacent = (("after_scn", "conflict_horizon_known"),) if (
                 family == "R4_BTREE_DELETE" and re.match(
                     r"PGRAC_FAMILY=R4_BTREE_DELETE event=(?:delete|vacuum)\.applied[ \t]",
-                    message)) else ()
+                    payload)) else ()
             # elog.c appends this English cursor position after edata->message.
             # It is log decoration, outside the emitter's ending disclosure.
             # Keep the original message/raw bytes and validate the full emitter.
-            cursor = LOG_CURSOR_SUFFIX.search(message)
+            cursor = LOG_CURSOR_SUFFIX.search(payload)
             if cursor is not None and int(cursor[1]) > 2**31 - 1:
                 cursor = None
-            payload = message[:cursor.start()] if cursor is not None else message
+            payload = payload[:cursor.start()] if cursor is not None else payload
             fields = _fields(payload, adjacent)
             _validate_envelope(fields, family)
             observation = dict(provenance, raw=text, message=message, fields=fields)
+            if sqlstate is not None:
+                observation["log_sqlstate"] = sqlstate[1]
             if cursor is not None:
                 observation["log_cursor_position"] = cursor[1]
             result["observations"].append(observation)

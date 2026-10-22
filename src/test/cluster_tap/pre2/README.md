@@ -169,11 +169,16 @@ python3 -m unittest discover -s src/test/cluster_tap/pre2 -p test_workload_log.p
 The reader supports the existing READ_IMAGE, R4_UNDO, R4_HEAP_UPDATE, HOT_FULL,
 R4_HEAP_PRUNE, R4_BTREE_DELETE and CTRC trace families listed in
 `workload_log.py`. It accepts `LOG:` records
-whose message starts with `PGRAC_FAMILY=`, preserves field values and nested
+whose emitter message starts with `PGRAC_FAMILY=`, preserves field values and nested
 brace blocks, and records the original line, byte offset and SHA256. CSV/JSON
 log formats and multiline messages are not supported. Other families remain
 in `unhandled`; malformed known records remain in `rejections` with their
 original bytes in hex. Preserve the original log alongside the JSON output.
+The optional verbose stderr prefix `SSSSS: ` (five ASCII uppercase letters or
+digits) remains in the original message and is exposed as `log_sqlstate` outside
+the emitter fields. It is log decoration and does not grant error, identity or
+authority credit; plain records do not acquire this metadata. Only one exact
+prefix immediately before `PGRAC_FAMILY=` is accepted.
 The English PostgreSQL stderr suffix ` at character N` is retained in the
 original message and exposed separately as `log_cursor_position`. Its positive
 signed-int position is log decoration, outside the emitter fields; the required
