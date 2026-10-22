@@ -116,6 +116,36 @@ extern bool cluster_recovery_ctrc_wal_atom_v2(const XLogReaderState *reader, uin
 											  const uint8 *raw_record, size_t raw_length,
 											  uint8 *out, size_t out_length);
 
+#define CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_COUNT 3
+#define CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_KEY_BYTES 116
+#define CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_EVIDENCE_BYTES                                         \
+	(16 + CLUSTER_RECOVERY_CTRC_WAL_ATOM_BYTES)
+
+/* Byte encodings, not native structs on disk. keys[0..2] identify the target
+ * xid, before-slot xid and after-slot xid, respectively. All share evidence. */
+typedef struct ClusterRecoveryCTRCWalReferencesV2 {
+	uint8 keys[CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_COUNT]
+			  [CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_KEY_BYTES];
+	uint8 evidence[CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_EVIDENCE_BYTES];
+} ClusterRecoveryCTRCWalReferencesV2;
+
+/* Derive these three kind1 keys from the codec-validated original native D0,
+ * with actual raw field offsets and singleton ordinal zero. Reuse atom_v2's
+ * exact reader/raw binding; evidence contains that one complete WAL atom.
+ * Original source/cut/component authority, pins, prior completion, exclusion
+ * of current/future D0 and final ROOT checks remain caller prerequisites.
+ * This is only the D0 transaction-field inventory, not a complete graph,
+ * original-owner proof, target durability, release or live admission.
+ *
+ * Publish all keys/evidence together after consuming inputs. On refusal clear
+ * *out. Unaligned buffers and raw/source aliases are allowed; output must not
+ * overlap reader-owned storage. */
+extern bool cluster_recovery_ctrc_wal_references_v2(const XLogReaderState *reader,
+													uint32 source_index,
+													const uint8 source_identity_digest[32],
+													const uint8 *raw_record, size_t raw_length,
+													ClusterRecoveryCTRCWalReferencesV2 *out);
+
 typedef enum ClusterRecoveryCTRCTargetMatchV2 {
 	CLUSTER_RECOVERY_CTRC_TARGET_REFUSED = 0,
 	CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_BEFORE,

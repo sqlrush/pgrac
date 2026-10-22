@@ -417,6 +417,56 @@ refused:
 	return false;
 }
 
+bool
+cluster_recovery_ctrc_wal_references_v2(const XLogReaderState *reader, uint32 source_index,
+										const uint8 source_identity_digest[32],
+										const uint8 *raw_record, size_t raw_length,
+										ClusterRecoveryCTRCWalReferencesV2 *out)
+{
+	static const uint16 xid_offsets[CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_COUNT] = { 116, 128, 160 };
+	ClusterRecoveryCTRCReleaseV2 record;
+	ClusterRecoveryCTRCWalReferencesV2 references = { 0 };
+	uint8 *key = references.keys[0];
+
+	if (out == NULL)
+		return false;
+	if (!cluster_recovery_ctrc_read_v2(reader, &record)
+		|| !cluster_recovery_ctrc_wal_atom_v2(reader, source_index, source_identity_digest,
+											  raw_record, raw_length, references.evidence + 16,
+											  CLUSTER_RECOVERY_CTRC_WAL_ATOM_BYTES))
+		goto refused;
+
+	/* The validated target and both native slot images carry the same T. */
+	cluster_undo_tt_ctrc_put_u64_le(key, reader->system_identifier);
+	cluster_undo_tt_ctrc_put_u64_le(key + 8, record.database_incarnation);
+	cluster_undo_tt_ctrc_put_u16_le(key + 16, record.origin_node_id);
+	cluster_undo_tt_ctrc_put_u32_le(key + 18, record.segment_id);
+	cluster_undo_tt_ctrc_put_u32_le(key + 22, record.segment_generation);
+	cluster_undo_tt_ctrc_put_u16_le(key + 26, record.slot_offset);
+	cluster_undo_tt_ctrc_put_u16_le(key + 28, record.wrap);
+	cluster_undo_tt_ctrc_put_u32_le(key + 30, record.xid);
+	cluster_undo_tt_ctrc_put_u16_le(key + 34, 3); /* WAL carrier */
+	cluster_undo_tt_ctrc_put_u64_le(key + 36, 56);
+	memcpy(key + 44, references.evidence + 16 + 10, 56);
+	for (unsigned i = 0; i < CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_COUNT; i++) {
+		if (i != 0)
+			memcpy(references.keys[i], key, 100);
+		cluster_undo_tt_ctrc_put_u64_le(references.keys[i] + 100,
+										SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong
+											+ xid_offsets[i]);
+		/* Each field is a singleton. The zero ordinal is not a filtered index. */
+	}
+	cluster_undo_tt_ctrc_put_u64_le(references.evidence, 1);
+	cluster_undo_tt_ctrc_put_u64_le(references.evidence + 8, CLUSTER_RECOVERY_CTRC_WAL_ATOM_BYTES);
+	/* Consume raw/source aliases before publishing the complete group. */
+	memcpy(out, &references, sizeof(references));
+	return true;
+
+refused:
+	memset(out, 0, sizeof(*out));
+	return false;
+}
+
 /* record is codec-validated; page is the caller's private aligned snapshot. */
 static ClusterRecoveryCTRCTargetMatchV2
 ctrc_target_match(const ClusterRecoveryCTRCReleaseV2 *record, const PGAlignedBlock *page)
