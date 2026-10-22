@@ -20687,7 +20687,7 @@ heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 
 #ifdef USE_PGRAC_CLUSTER
 bool
-cluster_heap_freeze_apply_xmin_v1(
+cluster_heap_freeze_apply_xmin_batch_v1(
 	Relation rel, Buffer buffer,
 	const ClusterHeapFreezePageInputV1 *input,
 	const ClusterHeapFreezePageBatchV1 *page,
@@ -20695,19 +20695,19 @@ cluster_heap_freeze_apply_xmin_v1(
 	const ClusterHeapFreezeFinalFenceV1 *fence,
 	const PcmAuthoritySnapshot *authority_before,
 	const ClusterSemanticAdmissionToken *admission,
-	uint16 tuple_index, FullTransactionId original_creator_full_xid,
+	const ClusterHeapFreezeXminTargetV1 *targets, uint16 target_count,
 	FullTransactionId freeze_limit_full, SCN horizon_scn)
 {
-	const ClusterHeapFreezeTupleInputV1 *saved;
 	RelFileLocator locator;
 	ForkNumber fork;
 	BlockNumber block;
 	BufferTag tag;
 	BufferDesc *buf;
 	Page live_page;
-	ItemId item;
-	HeapTupleHeader tuple;
-	HeapTupleFreeze plan;
+	HeapTupleFreeze plans[MaxHeapTuplesPerPage];
+	bool seen[MaxHeapTuplesPerPage] = { false };
+	FullTransactionId min_creator = InvalidFullTransactionId;
+	FullTransactionId max_creator = InvalidFullTransactionId;
 	PcmAuthoritySnapshot authority_now;
 	uint64 own_generation;
 	uint64 acquisition_epoch;
@@ -20718,7 +20718,10 @@ cluster_heap_freeze_apply_xmin_v1(
 	/* Borrow a real writer's resources; a local conditional lock is not X. */
 	if (rel == NULL || rel->rd_rel == NULL || input == NULL || page == NULL
 		|| proofs == NULL || fence == NULL || authority_before == NULL
-		|| admission == NULL || !cluster_enabled || !cluster_shared_config
+		|| admission == NULL || targets == NULL || target_count == 0
+		|| target_count > MaxHeapTuplesPerPage
+		|| target_count > page->tuple_count
+		|| !cluster_enabled || !cluster_shared_config
 		|| rel->rd_rel->relpersistence != RELPERSISTENCE_PERMANENT
 		|| cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) != 1
 		|| !RelationNeedsWAL(rel)
@@ -20737,34 +20740,58 @@ cluster_heap_freeze_apply_xmin_v1(
 	if (PageGetLSN(live_page) != fence->page_lsn
 		|| ((PageHeader)live_page)->pd_block_scn != fence->page_version
 		|| cluster_heap_freeze_validate_page_v1(input, &fence->identity, block,
-			live_page) != CLUSTER_HEAP_FREEZE_PAGE_MATCHED
-		|| !cluster_heap_freeze_prepare_xmin_v1(page, proofs, fence, tuple_index,
-			original_creator_full_xid, freeze_limit_full, horizon_scn, &plan))
+			live_page) != CLUSTER_HEAP_FREEZE_PAGE_MATCHED)
 		return false;
 
-	/* The batch is not authority: bind every planned header field to the image. */
-	saved = &page->tuples[tuple_index];
-	if (saved->offset > PageGetMaxOffsetNumber(live_page)
-		|| !PageHasItl(live_page)
-		|| saved->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT)
-		return false;
-	item = PageGetItemId(live_page, saved->offset);
-	if (!ItemIdIsNormal(item) || ItemIdGetOffset(item) != saved->tuple_offset
-		|| ItemIdGetLength(item) != saved->tuple_length)
-		return false;
-	tuple = (HeapTupleHeader) PageGetItem(live_page, item);
-	if (HeapTupleHeaderGetRawXmin(tuple) != saved->raw_xmin
-		|| HeapTupleHeaderGetRawXmax(tuple) != saved->raw_xmax
-		|| ItemPointerGetBlockNumberNoCheck(&tuple->t_ctid)
-			!= ItemPointerGetBlockNumberNoCheck(&saved->ctid)
-		|| ItemPointerGetOffsetNumberNoCheck(&tuple->t_ctid)
-			!= ItemPointerGetOffsetNumberNoCheck(&saved->ctid)
-		|| tuple->t_infomask != saved->infomask
-		|| tuple->t_infomask2 != saved->infomask2
-		|| tuple->t_hoff != saved->header_length
-		|| tuple->t_itl_slot_idx != saved->itl_slot_index
-		|| memcmp(ClusterPageGetItlSlot(live_page, saved->itl_slot_index),
-			&saved->carrier, sizeof(saved->carrier)) != 0)
+	/* Prepare the entire bounded batch before any authority check or mutation. */
+	for (uint16 i = 0; i < target_count; i++)
+	{
+		const ClusterHeapFreezeXminTargetV1 *target = &targets[i];
+		const ClusterHeapFreezeTupleInputV1 *saved;
+		FullTransactionId creator = target->original_creator_full_xid;
+		ItemId item;
+		HeapTupleHeader tuple;
+
+		if (!cluster_heap_freeze_prepare_xmin_v1(page, proofs, fence,
+			target->tuple_index, creator, freeze_limit_full, horizon_scn, &plans[i]))
+			return false;
+		saved = &page->tuples[target->tuple_index];
+		/* Different input indexes cannot name the same physical tuple twice. */
+		if (!OffsetNumberIsValid(saved->offset)
+			|| saved->offset > MaxHeapTuplesPerPage
+			|| saved->offset > PageGetMaxOffsetNumber(live_page)
+			|| seen[saved->offset - 1]
+			|| !PageHasItl(live_page)
+			|| saved->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT)
+			return false;
+		seen[saved->offset - 1] = true;
+		item = PageGetItemId(live_page, saved->offset);
+		if (!ItemIdIsNormal(item) || ItemIdGetOffset(item) != saved->tuple_offset
+			|| ItemIdGetLength(item) != saved->tuple_length)
+			return false;
+		tuple = (HeapTupleHeader) PageGetItem(live_page, item);
+		if (HeapTupleHeaderGetRawXmin(tuple) != saved->raw_xmin
+			|| HeapTupleHeaderGetRawXmax(tuple) != saved->raw_xmax
+			|| ItemPointerGetBlockNumberNoCheck(&tuple->t_ctid)
+				!= ItemPointerGetBlockNumberNoCheck(&saved->ctid)
+			|| ItemPointerGetOffsetNumberNoCheck(&tuple->t_ctid)
+				!= ItemPointerGetOffsetNumberNoCheck(&saved->ctid)
+			|| tuple->t_infomask != saved->infomask
+			|| tuple->t_infomask2 != saved->infomask2
+			|| tuple->t_hoff != saved->header_length
+			|| tuple->t_itl_slot_idx != saved->itl_slot_index
+			|| memcmp(ClusterPageGetItlSlot(live_page, saved->itl_slot_index),
+				&saved->carrier, sizeof(saved->carrier)) != 0)
+			return false;
+
+		if (i == 0 || FullTransactionIdPrecedes(creator, min_creator))
+			min_creator = creator;
+		if (i == 0 || FullTransactionIdFollows(creator, max_creator))
+			max_creator = creator;
+	}
+	/* Native WAL has a raw conflict horizon: order FullXids before narrowing. */
+	if (U64FromFullTransactionId(max_creator) - U64FromFullTransactionId(min_creator)
+		>= UINT64CONST(0x80000000))
 		return false;
 
 	/* Final synchronous fence.  No current fetch or proof request is allowed. */
@@ -20785,10 +20812,31 @@ cluster_heap_freeze_apply_xmin_v1(
 
 	/* Native redo and the existing SPACE version edge remain the only format. */
 	heap_freeze_apply_prepared(rel, buffer,
-		XidFromFullTransactionId(original_creator_full_xid), &plan, 1,
+		XidFromFullTransactionId(max_creator), plans, target_count,
 		&fence->identity);
 	XLogFlush(PageGetLSN(live_page));
 	return true;
+}
+
+bool
+cluster_heap_freeze_apply_xmin_v1(
+	Relation rel, Buffer buffer,
+	const ClusterHeapFreezePageInputV1 *input,
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *fence,
+	const PcmAuthoritySnapshot *authority_before,
+	const ClusterSemanticAdmissionToken *admission,
+	uint16 tuple_index, FullTransactionId original_creator_full_xid,
+	FullTransactionId freeze_limit_full, SCN horizon_scn)
+{
+	const ClusterHeapFreezeXminTargetV1 target = {
+		tuple_index, original_creator_full_xid
+	};
+
+	return cluster_heap_freeze_apply_xmin_batch_v1(rel, buffer, input, page,
+		proofs, fence, authority_before, admission, &target, 1,
+		freeze_limit_full, horizon_scn);
 }
 #endif
 

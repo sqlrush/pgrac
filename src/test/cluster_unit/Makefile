@@ -1958,8 +1958,8 @@ test_cluster_heap_freeze_apply.inc: $(top_srcdir)/src/backend/access/heap/heapam
 	mv $@.tmp $@
 
 test_cluster_heap_freeze_xmin_apply.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
-	awk '/^cluster_heap_freeze_apply_xmin_v1\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	awk '/^cluster_heap_freeze_apply_xmin(_batch)?_v1\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_freeze_redo.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile

@@ -311,6 +311,13 @@ struct RelationData;
 struct PcmAuthoritySnapshot;
 struct ClusterSemanticAdmissionToken;
 
+/* Process-local qualification; neither field can be inferred from a raw XID. */
+typedef struct ClusterHeapFreezeXminTargetV1
+{
+	uint16 tuple_index;
+	FullTransactionId original_creator_full_xid;
+} ClusterHeapFreezeXminTargetV1;
+
 /*
  * Qualified xmin-only mutation using native FREEZE_PAGE WAL and synchronous
  * WAL flush.  The caller owns the pin, exclusive content lock, ACTIVE PCM-X
@@ -322,7 +329,22 @@ struct ClusterSemanticAdmissionToken;
  *
  * Dormant: production VACUUM must not call this until ORIGINAL FullXid,
  * cutoff/H provenance and admission are closed independently of raw XIDs.
+ * The batch checks every distinct physical row before one final fence and one
+ * native WAL write.  Its creator identities must span less than half the raw
+ * XID space so that the native conflict horizon remains unambiguous.  The
+ * single-target entry below delegates to this batch with count one.
  */
+extern bool cluster_heap_freeze_apply_xmin_batch_v1(
+	struct RelationData *rel, Buffer buffer,
+	const ClusterHeapFreezePageInputV1 *input,
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *fence,
+	const struct PcmAuthoritySnapshot *authority_before,
+	const struct ClusterSemanticAdmissionToken *admission,
+	const ClusterHeapFreezeXminTargetV1 *targets, uint16 target_count,
+	FullTransactionId freeze_limit_full, SCN horizon_scn);
+
 extern bool cluster_heap_freeze_apply_xmin_v1(
 	struct RelationData *rel, Buffer buffer,
 	const ClusterHeapFreezePageInputV1 *input,

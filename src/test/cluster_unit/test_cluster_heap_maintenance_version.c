@@ -87,6 +87,7 @@ static bool flush_error;
 static uint8 writer_state;
 static uint64 route_holder, route_master;
 static unsigned flushes;
+static unsigned writer_checks, route_checks, authority_checks, admission_checks;
 
 bool
 LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
@@ -99,6 +100,7 @@ bool
 cluster_bufmgr_terminal_stamp_authority(Buffer buffer, const BufferTag *tag,
 	uint64 *generation, uint64 *epoch, uint8 *state)
 {
+	writer_checks++;
 	UT_ASSERT_EQ(buffer, 1);
 	UT_ASSERT(RelFileLocatorEquals(BufTagGetRelFileLocator(tag), relation_data.rd_locator));
 	UT_ASSERT_EQ(tag->forkNum, MAIN_FORKNUM);
@@ -113,6 +115,7 @@ bool
 cluster_pcm_lock_r4_route_snapshot(BufferTag tag, PcmAuthoritySnapshot *out,
 	uint64 *master, SCN *scn)
 {
+	route_checks++;
 	UT_ASSERT_EQ(tag.blockNum, 7);
 	memset(out, 0, sizeof(*out));
 	out->transition_count = route_holder;
@@ -123,6 +126,7 @@ cluster_pcm_lock_r4_route_snapshot(BufferTag tag, PcmAuthoritySnapshot *out,
 bool
 cluster_pcm_lock_authority_matches(BufferTag tag, const PcmAuthoritySnapshot *expected)
 {
+	authority_checks++;
 	UT_ASSERT_EQ(tag.blockNum, 7);
 	UT_ASSERT_EQ(expected->transition_count, 11);
 	return authority_current;
@@ -131,6 +135,7 @@ bool
 cluster_semantic_activation_recheck_r4_terminal_census(
 	const ClusterSemanticAdmissionToken *token)
 {
+	admission_checks++;
 	UT_ASSERT(token != NULL && token->entered);
 	return admission_current;
 }
@@ -492,6 +497,7 @@ reset(uint8 opcode, bool shared)
 	cluster_enabled = shared;
 	CritSectionCount = 0;
 	edges = inserts = dirties = hints = flushes = 0;
+	writer_checks = route_checks = authority_checks = admission_checks = 0;
 	local_x = writer_current = route_current = authority_current = admission_current = true;
 	writer_state = PCM_STATE_X;
 	route_holder = 11;
@@ -827,6 +833,230 @@ qualified_xmin_apply(QualifiedXminFixture *f, uint16 index)
 		&f->page, &f->proofs, &f->fence, &f->authority, &f->admission, index,
 		FullTransactionIdFromEpochAndXid(1, 77),
 		FullTransactionIdFromEpochAndXid(1, 100), 10);
+}
+
+static void
+qualified_xmin_batch_setup(QualifiedXminFixture *f,
+	ClusterHeapFreezeXminTargetV1 targets[3])
+{
+	const TransactionId xids[] = { 77, UINT32_MAX - 2, 66 };
+	const uint16 order[] = { 2, 0, 1 };
+	ClusterHeapFreezeCanonicalProofV1 seed;
+	ClusterItlSlotData carrier;
+
+	qualified_xmin_setup(f, HEAP_XMAX_INVALID);
+	seed = f->proofs.proofs[0];
+	carrier = *ClusterPageGetItlSlot(current_page.data, 0);
+	for (int i = 0; i < 3; i++) {
+		ClusterItlSlotData *slot = ClusterPageGetItlSlot(current_page.data, i);
+		HeapTupleHeader tuple = freeze_tuple(current_page.data, i + 1);
+
+		*slot = carrier;
+		slot->xid = xids[i];
+		slot->wrap += i;
+		slot->undo_segment_head = uba_encode(1, 11, 21 + i, 31);
+		HeapTupleHeaderSetXmin(tuple, xids[i]);
+		tuple->t_itl_slot_idx = i;
+	}
+	memcpy(before_page.data, current_page.data, BLCKSZ);
+	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&space_identity, 7,
+		current_page.data, &f->input));
+	UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&f->input, &f->page));
+	UT_ASSERT_EQ(f->page.carrier_request_count, 3);
+	f->proofs.proof_count = 3;
+	for (int i = 0; i < 3; i++) {
+		ClusterHeapFreezeCanonicalProofV1 *proof = &f->proofs.proofs[i];
+
+		*proof = seed;
+		proof->requested_locator = f->page.carrier_requests[i].locator;
+		proof->resolution.locator_echo = proof->requested_locator;
+		proof->resolution.locator_echo.tt_wrap = 2 + i;
+		proof->resolution.local_canonical.xid = xids[i];
+		proof->resolution.local_canonical.wrap = 2 + i;
+		proof->resolution.local_creation_target.offset = i + 1;
+		targets[i].tuple_index = order[i];
+		targets[i].original_creator_full_xid =
+			FullTransactionIdFromEpochAndXid(order[i] == 1 ? 0 : 1, xids[order[i]]);
+	}
+	expected_nplans = 2;
+}
+
+static bool
+qualified_xmin_batch_apply(QualifiedXminFixture *f,
+	const ClusterHeapFreezeXminTargetV1 *targets, uint16 count)
+{
+	return cluster_heap_freeze_apply_xmin_batch_v1(&relation_data, 1, &f->input,
+		&f->page, &f->proofs, &f->fence, &f->authority, &f->admission, targets,
+		count, FullTransactionIdFromEpochAndXid(1, 100), 10);
+}
+
+UT_TEST(test_xmin_batch_one_wal_fence_fullxid_horizon_and_redo)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	qualified_xmin_batch_setup(&f, targets);
+	UT_ASSERT(qualified_xmin_batch_apply(&f, targets, 3));
+	UT_ASSERT_EQ(inserts, 1);
+	UT_ASSERT_EQ(flushes, 1);
+	UT_ASSERT_EQ(writer_checks, 1);
+	UT_ASSERT_EQ(route_checks, 1);
+	UT_ASSERT_EQ(authority_checks, 1);
+	UT_ASSERT_EQ(admission_checks, 1);
+	UT_ASSERT_EQ(((xl_heap_freeze_page *)freeze_main_data.data)->snapshotConflictHorizon, 77);
+	for (int i = 1; i <= 3; i++) {
+		HeapTupleHeader tuple = freeze_tuple(current_page.data, i);
+		HeapTupleHeader old = freeze_tuple(before_page.data, i);
+
+		UT_ASSERT(HeapTupleHeaderXminFrozen(tuple));
+		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(tuple), HeapTupleHeaderGetRawXmin(old));
+		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmax(tuple), HeapTupleHeaderGetRawXmax(old));
+		UT_ASSERT_EQ(tuple->t_infomask, old->t_infomask | HEAP_XMIN_FROZEN);
+		UT_ASSERT_EQ(tuple->t_infomask2, old->t_infomask2);
+		UT_ASSERT(memcmp(ClusterPageGetItlSlot(current_page.data, i - 1),
+			ClusterPageGetItlSlot(before_page.data, i - 1), sizeof(ClusterItlSlotData)) == 0);
+	}
+	if (inserts == 1) {
+		check_publication(true);
+		UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
+		UT_ASSERT_EQ(inserts, 1);
+		UT_ASSERT_EQ(flushes, 1);
+		replay_freeze_record();
+	}
+}
+
+UT_TEST(test_xmin_batch_later_unqualified_target_changes_nothing)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int variant = 0; variant < 4; variant++) {
+		qualified_xmin_batch_setup(&f, targets);
+		expected_nplans = 1; /* RED scaffold can write its first row. */
+		switch (variant) {
+		case 0: f.proofs.proofs[1].resolution.local_creation_target.offset = 1; break;
+		case 1: f.proofs.proofs[1].resolution.commit_scn = 10; break;
+		case 2: targets[2].original_creator_full_xid = FullTransactionIdFromEpochAndXid(0, 99); break;
+		case 3: targets[2].original_creator_full_xid = FullTransactionIdFromEpochAndXid(2, UINT32_MAX - 2); break;
+		}
+		UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
+		UT_ASSERT_EQ(inserts + dirties + flushes, 0);
+		UT_ASSERT_EQ(writer_checks + route_checks + authority_checks + admission_checks, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_batch_rejects_duplicate_physical_rows)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int alias = 0; alias < 2; alias++) {
+		qualified_xmin_batch_setup(&f, targets);
+		expected_nplans = 1;
+		targets[1] = targets[0];
+		if (alias) {
+			/* Distinct request indexes cannot authorize the same physical row. */
+			f.page.tuples[1] = f.page.tuples[2];
+			targets[1].tuple_index = 1;
+		}
+		UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 2));
+		UT_ASSERT_EQ(inserts + dirties + flushes + writer_checks, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_batch_runtime_bounds_and_empty_reject)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int variant = 0; variant < 4; variant++) {
+		qualified_xmin_batch_setup(&f, targets);
+		if (variant == 3)
+			targets[0].tuple_index = UINT16_MAX;
+		UT_ASSERT(!qualified_xmin_batch_apply(&f, variant == 1 ? NULL : targets,
+			variant == 0 ? 0 : variant == 2 ? MaxHeapTuplesPerPage + 1 : 3));
+		UT_ASSERT_EQ(inserts + dirties + flushes + writer_checks, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_batch_later_stale_row_rejects_before_fence)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int variant = 0; variant < 3; variant++) {
+		qualified_xmin_batch_setup(&f, targets);
+		expected_nplans = 1;
+		if (variant == 0)
+			f.page.tuples[1].raw_xmax++;
+		else if (variant == 1)
+			f.page.tuples[1].tuple_offset += MAXIMUM_ALIGNOF;
+		else
+			f.page.tuples[1].infomask2 ^= HEAP_ONLY_TUPLE;
+		UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
+		UT_ASSERT_EQ(inserts + dirties + flushes + writer_checks, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_batch_rejects_ambiguous_native_horizon)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	qualified_xmin_batch_setup(&f, targets);
+	expected_nplans = 1;
+	targets[0].original_creator_full_xid = FullTransactionIdFromEpochAndXid(0, 66);
+	UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
+	UT_ASSERT_EQ(inserts + dirties + flushes + writer_checks, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_xmin_batch_final_authority_refusal_changes_nothing)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int variant = 0; variant < 3; variant++) {
+		qualified_xmin_batch_setup(&f, targets);
+		if (variant == 0)
+			admission_current = false;
+		else if (variant == 1)
+			authority_current = false;
+		else
+			route_master++;
+		UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
+		UT_ASSERT_EQ(writer_checks, 1);
+		UT_ASSERT_EQ(route_checks, 1);
+		UT_ASSERT_EQ(inserts + dirties + flushes, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_batch_flush_error_keeps_borrowed_resources)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	qualified_xmin_batch_setup(&f, targets);
+	flush_error = expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		(void)qualified_xmin_batch_apply(&f, targets, 3);
+		UT_ASSERT(false);
+	} else {
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT_EQ(inserts, 1);
+		UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT_EQ(writer_checks, 1);
+		UT_ASSERT_EQ(admission_checks, 1);
+		for (int i = 1; i <= 3; i++)
+			UT_ASSERT(HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, i)));
+		UT_ASSERT(local_x && f.admission.entered);
+	}
+	expecting_error = false;
 }
 
 UT_TEST(test_qualified_xmin_apply_wal_flush_and_redo)
@@ -1328,7 +1558,7 @@ UT_TEST(test_deferred_request_preserves_shared_freeze_restriction)
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(32);
 	UT_RUN(test_prune_native_plan_and_version);
 	UT_RUN(test_shared_freeze_refuses_before_tuple_or_wal);
 	UT_RUN(test_vacuum_native_unused_and_version);
@@ -1353,6 +1583,14 @@ main(void)
 	UT_RUN(test_ordinary_or_nonshared_vacuum_does_not_request);
 	UT_RUN(test_deferred_request_preserves_shared_freeze_restriction);
 	UT_RUN(test_qualified_xmin_rejects_recapture_with_old_proof_version);
+	UT_RUN(test_xmin_batch_one_wal_fence_fullxid_horizon_and_redo);
+	UT_RUN(test_xmin_batch_later_unqualified_target_changes_nothing);
+	UT_RUN(test_xmin_batch_rejects_duplicate_physical_rows);
+	UT_RUN(test_xmin_batch_runtime_bounds_and_empty_reject);
+	UT_RUN(test_xmin_batch_later_stale_row_rejects_before_fence);
+	UT_RUN(test_xmin_batch_rejects_ambiguous_native_horizon);
+	UT_RUN(test_xmin_batch_final_authority_refusal_changes_nothing);
+	UT_RUN(test_xmin_batch_flush_error_keeps_borrowed_resources);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
