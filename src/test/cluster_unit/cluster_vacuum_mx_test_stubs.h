@@ -41,8 +41,9 @@
 #define VM_ALL_FROZEN(...) false
 
 static ClusterHeapFreezeProofStatusV1
-lazy_collect_shared_freeze_proofs(LVRelState *vacrel)
+lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 {
+	(void)recent_buffer;
 	vacrel->shared_freeze_proofs.proof_count = 0;
 	vacrel->shared_freeze_fence_valid = false;
 	vacrel->shared_freeze_apply_status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;

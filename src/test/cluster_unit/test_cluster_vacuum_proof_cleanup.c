@@ -1,14 +1,14 @@
 /*-------------------------------------------------------------------------
  * test_cluster_vacuum_proof_cleanup.c
- *    Exercise the real VACUUM proof helper's admission ownership on ERROR.
+ *    Exercise real VACUUM proof ownership and resident-page recheck cleanup.
  *
  * Portions Copyright (c) 2026, pgrac contributors
  * Author: SqlRush <sqlrush@gmail.com>
  *
- * The helper, runtime guard cleanup callback and PG exception macros are
- * real. Route/admission/proof providers and the resolver are leaves: the
- * resolver injects ERROR at its guarded wait boundary. This tests cleanup,
- * not transport, shared admission counters or proof validity.
+ * The helpers, runtime guard cleanup callback and PG exception macros are
+ * real. Storage/route/admission/proof providers and the resolver are leaves:
+ * injected errors test lock, pin, guard and admission cleanup order, not
+ * real transport, shared admission counters or physical proof validity.
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -17,16 +17,22 @@
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
+#include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "utils/rel.h"
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
 
+bool cluster_recmerge_window_active, cluster_recmerge_apply_foreign;
+uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
+
 /* Only fields consumed by the extracted production helper. */
 typedef struct LVRelState
 {
 	Relation rel;
+	ClusterSpaceIdentity identity;
+	ClusterHeapFreezePageInputV1 shared_freeze_input;
 	ClusterHeapFreezePageBatchV1 shared_freeze_batch;
 	ClusterHeapFreezeProofBatchV1 shared_freeze_proofs;
 	ClusterHeapFreezeFinalFenceV1 shared_freeze_fence;
@@ -40,6 +46,12 @@ static RelationData relation;
 static LVRelState vacrel;
 static unsigned enters, leaves, debt, resolves, routes;
 static unsigned fail_resolve;
+static PGAlignedBlock resident_page;
+static unsigned repins, lock_attempts, page_checks, validations;
+static bool pin_held, content_locked, resident, lock_available;
+static bool changed_holder, changed_master, changed_admission;
+static bool error_page_check, validation_under_lock;
+static ClusterHeapFreezePageMatchV1 page_match;
 static bool reject_admission, reject_route_after, unknown_outcome;
 static bool error_preflight, error_validate, guard_held;
 static int inject_code, caught_code;
@@ -151,8 +163,8 @@ cluster_pcm_lock_r4_route_snapshot(BufferTag tag, PcmAuthoritySnapshot *authorit
 {
 	(void)tag;
 	routes++;
-	authority->transition_count = 7;
-	*master = 11;
+	authority->transition_count = routes > 1 && changed_holder ? 8 : 7;
+	*master = routes > 1 && changed_master ? 12 : 11;
 	*page_scn = 13;
 	return !(routes > 1 && reject_route_after);
 }
@@ -161,7 +173,7 @@ bool
 cluster_pcm_lock_authority_matches(BufferTag tag, const PcmAuthoritySnapshot *expected)
 {
 	(void)tag;
-	return expected->transition_count == 7;
+	return expected->transition_count == 7 && !changed_holder;
 }
 
 ClusterSemanticAdmissionResult
@@ -182,7 +194,7 @@ cluster_semantic_activation_enter_r4_terminal_census(ClusterSemanticAdmissionTok
 void
 cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
 {
-	if (guard_held || !token->entered || token->record_generation != 17 || debt != 1)
+	if (pin_held || content_locked || guard_held || !token->entered || token->record_generation != 17 || debt != 1)
 		abort();
 	leaves++;
 	debt--;
@@ -193,7 +205,7 @@ cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
 bool
 cluster_semantic_activation_recheck_r4_terminal_census(const ClusterSemanticAdmissionToken *token)
 {
-	return token->entered && debt == 1;
+	return token->entered && debt == 1 && !changed_admission;
 }
 
 void
@@ -244,12 +256,14 @@ cluster_heap_freeze_build_canonical_proof_v1(
 {
 	(void)locator;
 	(void)resolution;
-	(void)expected;
-	(void)current;
+
 	(void)finalized;
-	(void)authority_current;
-	(void)admission_current;
+
 	memset(out, 0, sizeof(*out));
+	out->expected_fence = *expected;
+	out->current_fence = *current;
+	out->authority_current = authority_current;
+	out->admission_current = admission_current;
 	return true;
 }
 
@@ -259,11 +273,85 @@ cluster_heap_freeze_validate_conditional_apply_v1(
 	const ClusterHeapFreezeFinalFenceV1 *fence)
 {
 	(void)page;
-	(void)proofs;
 	(void)fence;
+	validations++;
+	validation_under_lock = pin_held && content_locked;
 	if (error_validate)
 		throw_error();
+	if (!proofs->proofs[0].authority_current || !proofs->proofs[0].admission_current
+		|| proofs->proofs[0].expected_fence.page_lsn != fence->page_lsn
+		|| proofs->proofs[0].expected_fence.page_version != fence->page_version)
+		return CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
 	return CLUSTER_HEAP_FREEZE_PROOF_PROVEN;
+}
+
+/* Storage leaves never obtain a current block or wait for its ownership. */
+bool
+ReadRecentBuffer(RelFileLocator locator, ForkNumber fork, BlockNumber block, Buffer buffer)
+{
+	if (pin_held || content_locked || guard_held || debt != 1 || buffer != 1
+		|| fork != MAIN_FORKNUM || block != vacrel.shared_freeze_batch.block
+		|| !RelFileLocatorEquals(locator, relation.rd_locator))
+		abort();
+	repins++;
+	if (!resident)
+		return false;
+	pin_held = true;
+	return true;
+}
+
+bool
+ConditionalLockBuffer(Buffer buffer)
+{
+	if (buffer != 1 || !pin_held || content_locked)
+		abort();
+	lock_attempts++;
+	content_locked = lock_available;
+	return content_locked;
+}
+
+void
+ReleaseBuffer(Buffer buffer)
+{
+	if (buffer != 1 || !pin_held || content_locked)
+		abort();
+	pin_held = false;
+	note_cleanup('P');
+}
+
+void
+UnlockReleaseBuffer(Buffer buffer)
+{
+	if (buffer != 1 || !pin_held || !content_locked)
+		abort();
+	content_locked = false;
+	pin_held = false;
+	note_cleanup('B');
+}
+
+static Page
+fixture_buffer_page(Buffer buffer)
+{
+	if (buffer != 1 || !pin_held || !content_locked)
+		abort();
+	return (Page)resident_page.data;
+}
+
+#undef BufferGetPage
+#define BufferGetPage(buffer) fixture_buffer_page(buffer)
+
+ClusterHeapFreezePageMatchV1
+cluster_heap_freeze_validate_page_v1(const ClusterHeapFreezePageInputV1 *input,
+									 const ClusterSpaceIdentity *identity, BlockNumber block, Page page)
+{
+	if (!pin_held || !content_locked || input != &vacrel.shared_freeze_input
+		|| identity != &vacrel.identity || block != vacrel.shared_freeze_batch.block
+		|| page != (Page)resident_page.data)
+		abort();
+	page_checks++;
+	if (error_page_check)
+		throw_error();
+	return page_match;
 }
 
 #include "test_cluster_vacuum_proof_cleanup.inc"
@@ -274,6 +362,23 @@ reset_fixture(void)
 	memset(&relation, 0, sizeof(relation));
 	memset(&vacrel, 0, sizeof(vacrel));
 	vacrel.rel = &relation;
+	relation.rd_isvalid = true;
+	relation.rd_locator.relNumber = 42;
+	vacrel.identity.key.locator = relation.rd_locator;
+	vacrel.identity.state = CLUSTER_SPACE_IDENTITY_LIVE;
+	vacrel.shared_freeze_batch.identity = vacrel.identity;
+	vacrel.shared_freeze_batch.block = 3;
+	vacrel.shared_freeze_batch.page_lsn = 101;
+	vacrel.shared_freeze_batch.page_version = 13;
+	memset(&resident_page, 0, sizeof(resident_page));
+	PageSetLSN((Page)resident_page.data, 101);
+	((PageHeader)resident_page.data)->pd_block_scn = 13;
+	repins = lock_attempts = page_checks = validations = 0;
+	pin_held = content_locked = false;
+	resident = lock_available = true;
+	changed_holder = changed_master = changed_admission = false;
+	error_page_check = validation_under_lock = false;
+	page_match = CLUSTER_HEAP_FREEZE_PAGE_MATCHED;
 	vacrel.shared_freeze_batch.carrier_request_count = 1;
 	enters = leaves = debt = resolves = routes = fail_resolve = 0;
 	reject_admission = reject_route_after = unknown_outcome = false;
@@ -294,7 +399,7 @@ collect_catches_error(void)
 
 	PG_TRY();
 	{
-		(void)lazy_collect_shared_freeze_proofs(&vacrel);
+		(void)lazy_collect_shared_freeze_proofs(&vacrel, 1);
 	}
 	PG_CATCH();
 	{
@@ -325,7 +430,7 @@ UT_TEST(invalid_input_does_not_leave)
 {
 	reset_fixture();
 	vacrel.shared_freeze_batch.carrier_request_count = 0;
-	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel),
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1),
 				 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
 	UT_ASSERT_EQ(enters, 0);
 	UT_ASSERT_EQ(leaves, 0);
@@ -335,7 +440,7 @@ UT_TEST(rejected_admission_does_not_leave)
 {
 	reset_fixture();
 	reject_admission = true;
-	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel),
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1),
 				 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
 	UT_ASSERT_EQ(enters, 1);
 	UT_ASSERT_EQ(leaves, 0);
@@ -344,7 +449,7 @@ UT_TEST(rejected_admission_does_not_leave)
 UT_TEST(normal_success_leaves_once)
 {
 	reset_fixture();
-	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
 	UT_ASSERT_EQ(leaves, 1);
 	UT_ASSERT_EQ(debt, 0);
 	UT_ASSERT_EQ(vacrel.shared_freeze_proofs.proof_count, 1);
@@ -356,7 +461,7 @@ UT_TEST(unknown_resolver_leaves_once)
 {
 	reset_fixture();
 	unknown_outcome = true;
-	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel),
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1),
 				 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
 	UT_ASSERT_EQ(leaves, 1);
 	UT_ASSERT_EQ(debt, 0);
@@ -367,7 +472,7 @@ UT_TEST(missing_final_route_leaves_once)
 {
 	reset_fixture();
 	reject_route_after = true;
-	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel),
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1),
 				 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
 	UT_ASSERT_EQ(leaves, 1);
 	UT_ASSERT_EQ(debt, 0);
@@ -411,7 +516,7 @@ UT_TEST(validation_error_leaves_once)
 {
 	reset_fixture();
 	error_validate = true;
-	check_error_cleanup("A");
+	check_error_cleanup("BA");
 }
 
 UT_TEST(same_backend_can_collect_again_after_cancel)
@@ -424,18 +529,128 @@ UT_TEST(same_backend_can_collect_again_after_cancel)
 	if (debt != 0)
 		return;
 	fail_resolve = 0;
-	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
 	UT_ASSERT_EQ(enters, 2);
 	UT_ASSERT_EQ(leaves, 2);
 	UT_ASSERT_EQ(debt, 0);
-	UT_ASSERT_STR_EQ(cleanup_order, "GAA");
+	UT_ASSERT_STR_EQ(cleanup_order, "GABA");
 	UT_ASSERT(PG_exception_stack == NULL);
+}
+
+
+UT_TEST(final_check_owns_resident_pin_and_local_x)
+{
+	reset_fixture();
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(repins, 1);
+	UT_ASSERT_EQ(lock_attempts, 1);
+	UT_ASSERT_EQ(page_checks, 1);
+	UT_ASSERT(validation_under_lock);
+	UT_ASSERT(!pin_held && !content_locked);
+	UT_ASSERT_STR_EQ(cleanup_order, "BA");
+}
+
+UT_TEST(evicted_page_requests_retry_without_fetch)
+{
+	reset_fixture();
+	resident = false;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	UT_ASSERT_EQ(repins, 1);
+	UT_ASSERT_EQ(lock_attempts, 0);
+	UT_ASSERT_EQ(validations, 0);
+	UT_ASSERT(!vacrel.shared_freeze_fence_valid);
+	UT_ASSERT_STR_EQ(cleanup_order, "A");
+}
+
+UT_TEST(unavailable_local_x_releases_pin_and_requests_retry)
+{
+	reset_fixture();
+	lock_available = false;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	UT_ASSERT_EQ(lock_attempts, 1);
+	UT_ASSERT_EQ(page_checks, 0);
+	UT_ASSERT_EQ(validations, 0);
+	UT_ASSERT(!pin_held && !content_locked);
+	UT_ASSERT_STR_EQ(cleanup_order, "PA");
+}
+
+UT_TEST(changed_page_bytes_requests_retry)
+{
+	reset_fixture();
+	page_match = CLUSTER_HEAP_FREEZE_PAGE_CHANGED;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	UT_ASSERT_EQ(page_checks, 1);
+	UT_ASSERT_EQ(validations, 0);
+	UT_ASSERT(!vacrel.shared_freeze_fence_valid);
+	UT_ASSERT_STR_EQ(cleanup_order, "BA");
+}
+
+UT_TEST(invalid_page_input_keeps_hard_error_status)
+{
+	reset_fixture();
+	page_match = CLUSTER_HEAP_FREEZE_PAGE_INVALID;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR);
+	UT_ASSERT_EQ(validations, 0);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proofs.proof_count, 0);
+	UT_ASSERT_STR_EQ(cleanup_order, "BA");
+}
+
+UT_TEST(current_lsn_is_read_under_local_x)
+{
+	reset_fixture();
+	PageSetLSN((Page)resident_page.data, 102);
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	UT_ASSERT_EQ(vacrel.shared_freeze_fence.page_lsn, 102);
+	UT_ASSERT(validation_under_lock);
+	UT_ASSERT_STR_EQ(cleanup_order, "BA");
+}
+
+UT_TEST(current_version_is_read_under_local_x)
+{
+	reset_fixture();
+	((PageHeader)resident_page.data)->pd_block_scn = 14;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	UT_ASSERT_EQ(vacrel.shared_freeze_fence.page_version, 14);
+	UT_ASSERT(validation_under_lock);
+	UT_ASSERT_STR_EQ(cleanup_order, "BA");
+}
+
+UT_TEST(changed_pcm_authority_and_admission_request_retry)
+{
+	reset_fixture();
+	changed_holder = changed_master = changed_admission = true;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	UT_ASSERT_EQ(vacrel.shared_freeze_fence.holder_sequence, 8);
+	UT_ASSERT_EQ(vacrel.shared_freeze_fence.master_sequence, 12);
+	UT_ASSERT(validation_under_lock);
+	UT_ASSERT(!vacrel.shared_freeze_fence_valid);
+	UT_ASSERT_STR_EQ(cleanup_order, "BA");
+}
+
+UT_TEST(local_page_check_cancel_releases_buffer_before_admission)
+{
+	reset_fixture();
+	error_page_check = true;
+	inject_code = ERRCODE_QUERY_CANCELED;
+	check_error_cleanup("BA");
+	UT_ASSERT_EQ(page_checks, 1);
+	UT_ASSERT(!pin_held && !content_locked);
+}
+
+UT_TEST(invalidated_relation_skips_resident_lookup)
+{
+	reset_fixture();
+	relation.rd_isvalid = false;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	UT_ASSERT_EQ(repins, 0);
+	UT_ASSERT_EQ(validations, 0);
+	UT_ASSERT_STR_EQ(cleanup_order, "A");
 }
 
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(21);
 	UT_RUN(invalid_input_does_not_leave);
 	UT_RUN(rejected_admission_does_not_leave);
 	UT_RUN(normal_success_leaves_once);
@@ -447,6 +662,16 @@ main(void)
 	UT_RUN(later_carrier_cancel_does_not_publish_partial_proofs);
 	UT_RUN(validation_error_leaves_once);
 	UT_RUN(same_backend_can_collect_again_after_cancel);
+	UT_RUN(final_check_owns_resident_pin_and_local_x);
+	UT_RUN(evicted_page_requests_retry_without_fetch);
+	UT_RUN(unavailable_local_x_releases_pin_and_requests_retry);
+	UT_RUN(changed_page_bytes_requests_retry);
+	UT_RUN(invalid_page_input_keeps_hard_error_status);
+	UT_RUN(current_lsn_is_read_under_local_x);
+	UT_RUN(current_version_is_read_under_local_x);
+	UT_RUN(changed_pcm_authority_and_admission_request_retry);
+	UT_RUN(local_page_check_cancel_releases_buffer_before_admission);
+	UT_RUN(invalidated_relation_skips_resident_lookup);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

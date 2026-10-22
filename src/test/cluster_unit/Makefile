@@ -9530,10 +9530,10 @@ test_cluster_heap_cr_reuse_scratch.inc: $(top_srcdir)/src/backend/access/heap/he
 test_cluster_vacuum_shared_mx.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c $(srcdir)/extract_vacuum_mx_fixture.py Makefile
 	python3 $(srcdir)/extract_vacuum_mx_fixture.py $< > $@
 
-# Real admission owner and inner guard cleanup, with injected resolver errors.
+# Real admission/resident-page owners and inner guard cleanup, with injected errors.
 test_cluster_vacuum_proof_cleanup.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
-	awk '/^lazy_collect_shared_freeze_proofs\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	awk '/^(lazy_recheck_shared_freeze_page|lazy_collect_shared_freeze_proofs)\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_vacuum_proof_guard.inc: $(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c Makefile
@@ -9549,7 +9549,8 @@ test_cluster_vacuum_proof_cleanup: test_cluster_vacuum_proof_cleanup.c unit_test
 		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_block0_current.h \
 		$(top_srcdir)/src/include/cluster/cluster_tx_resolve.h \
-		$(top_srcdir)/src/include/storage/ipc.h $(top_srcdir)/src/include/utils/elog.h
+		$(top_srcdir)/src/include/storage/ipc.h $(top_srcdir)/src/include/utils/elog.h \
+		$(top_srcdir)/src/include/storage/bufmgr.h $(top_srcdir)/src/include/storage/bufpage.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # The real pure locator builders, including the existing UBA validation.
