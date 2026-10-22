@@ -9376,6 +9376,8 @@ ut_normal_start_recovered_owner_setup(ClusterSemanticActivationRecord *open,
 	uint64 owner_boot;
 
 	ut_normal_start_setup();
+	test_system_identifier = UINT64_C(0x8070605040302010);
+	NormalStartCompletion->system_identifier = test_system_identifier;
 	memcpy(NormalStartCompletion->pgrd, test_normal_pgrd_bytes,
 		   sizeof(test_normal_pgrd_bytes));
 	cluster_shared_config = true;
@@ -9396,6 +9398,8 @@ ut_normal_start_recovered_owner_setup(ClusterSemanticActivationRecord *open,
 	test_recovered_checkpoint.owner.owner_boot = owner_boot;
 	test_recovered_checkpoint.owner.owner_pid = MyProcPid;
 	test_recovered_checkpoint.owner.writer.epoch = 9;
+	test_recovered_checkpoint.owner.writer.ref.claim.identity.system_identifier
+		= test_system_identifier;
 	test_recovered_checkpoint.owner.writer.ref.claim.identity.origin_node_id = cluster_node_id;
 	test_recovered_checkpoint.owner.writer.ref.claim.identity.origin_thread_id = cluster_node_id + 1;
 	test_recovered_checkpoint.owner.writer.ref.claim.identity.origin_owner_incarnation = owner_boot;
@@ -9424,6 +9428,17 @@ UT_TEST(test_normal_start_recovered_owner_observation_fails_closed_without_obser
 
 	ut_normal_start_recovered_owner_setup(&open, &table);
 	test_recovered_checkpoint_observed = false;
+	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+}
+
+UT_TEST(test_normal_start_recovered_owner_observation_rejects_foreign_system)
+{
+	ClusterSemanticActivationRecord open;
+	ClusterSemanticActivationAckTableV1 table;
+
+	ut_normal_start_recovered_owner_setup(&open, &table);
+	test_recovered_checkpoint.owner.writer.ref.claim.identity.system_identifier
+		^= UINT64_C(1);
 	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
 }
 
@@ -11515,7 +11530,7 @@ static void test_serving_finish_root(void);
 int
 main(void)
 {
-	UT_PLAN(387);
+	UT_PLAN(388);
 	UT_RUN(test_member_commit_gap_before_all_peer_receipts);
 	UT_RUN(test_member_commit_request_waits_for_real_predecessor_receipts);
 	UT_RUN(test_member_commit_request_rejects_old_or_changed_identity);
@@ -11868,6 +11883,7 @@ main(void)
 	UT_RUN(test_normal_start_existing_other_is_not_target_completion);
 	UT_RUN(test_normal_start_recovered_owner_observation_accepts_exact_binding);
 	UT_RUN(test_normal_start_recovered_owner_observation_fails_closed_without_observation);
+	UT_RUN(test_normal_start_recovered_owner_observation_rejects_foreign_system);
 	UT_RUN(test_normal_start_recovered_owner_equal_epoch_does_not_use_fast_path);
 	UT_RUN(test_normal_start_capture_drift_and_wrong_writer_refuse);
 	UT_RUN(test_normal_start_identity_rechecked_after_real_root_read);

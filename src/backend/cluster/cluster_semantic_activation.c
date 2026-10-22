@@ -14468,12 +14468,16 @@ normal_start_recovered_service_binding_current(const ClusterSemanticActivationRe
 	ClusterFormationSnapshotV1 formation;
 	const ClusterNormalStartCompletion *input = NormalStartCompletion;
 
+	/* RECOVERED activation must consume the published checkpoint owner. */
 	if (open == NULL || root == NULL || table == NULL || input == NULL
 		|| cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_EXISTING_OTHER
 		|| !cluster_recovery_checkpoint_observe_v1(&observed)
 		|| observed.slot_generation == 0 || observed.slot_generation == UINT64_MAX
 		|| observed.owner.owner_boot == 0 || observed.owner.owner_boot == UINT64_MAX
 		|| observed.owner.owner_pid <= 0
+		|| input->system_identifier == 0
+		|| input->system_identifier != GetSystemIdentifier()
+		|| observed.owner.writer.ref.claim.identity.system_identifier != input->system_identifier
 		|| open->transition_epoch == 0 || open->transition_epoch == UINT64_MAX
 		|| table->transition_epoch == 0 || table->transition_epoch == UINT64_MAX
 		|| open->transition_epoch >= table->transition_epoch
