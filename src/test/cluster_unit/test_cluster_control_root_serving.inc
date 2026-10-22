@@ -194,11 +194,14 @@ serving_recovery_fixture(uint8 before[66048], ControlRootImage *root, uint32 sta
 	owner->writer.ref.timeline = root->records[0].checkpoint_tli;
 	owner->writer.epoch = test_epoch;
 	owner->writer.startup_first_lsn = root->records[0].checkpoint_lower_lsn;
+	test_checkpoint_prefix_ref = owner->writer.ref;
+	test_wal_validated = true;
 	memset(owner->operation_uuid, 0x72, sizeof(owner->operation_uuid));
 	owner->install_generation = 8;
 	owner->start_generation = 9;
 	owner->start_serial = 10;
 	owner->owner_boot = test_self_incarnation;
+	test_recovered_writer_epoch = test_epoch;
 	owner->owner_pid = 81;
 	serving_recovery_observed = true;
 }
@@ -281,6 +284,24 @@ UT_TEST(test_serving_recovered_state_requires_owner_observation)
 			  != 0);
 	UT_ASSERT(v2_zero(&token, sizeof(token)));
 	v2_assert_primary_unchanged(before);
+	serving_normal_start_state = CLUSTER_NORMAL_START_UNCLASSIFIED;
+}
+
+UT_TEST(test_serving_recovered_state_requires_published_writer_match)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	ClusterControlRootFileToken token;
+	serving_recovery_fixture(before, &root, CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED);
+	if (ut_current_failed)
+		return;
+	serving_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	test_recovered_writer_epoch = 0;
+	UT_ASSERT(cluster_control_root_v3_serving_poll(&serving_open, serving_descriptor, &token)
+			  != 0);
+	UT_ASSERT(v2_zero(&token, sizeof(token)));
+	v2_assert_primary_unchanged(before);
+	test_recovered_writer_epoch = test_epoch;
 	serving_normal_start_state = CLUSTER_NORMAL_START_UNCLASSIFIED;
 }
 

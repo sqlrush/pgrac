@@ -4899,6 +4899,7 @@ serving_cut_read(const ClusterSemanticActivationRecord *open, const uint8 *descr
 static bool
 serving_recovery_owner_current(const ServingCut *cut)
 {
+	/* RECOVERED owner validation remains fail-closed at this consumer. */
 	ClusterRecoveryCheckpointObservationV1 observed;
 
 	if (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
@@ -4906,6 +4907,10 @@ serving_recovery_owner_current(const ServingCut *cut)
 		return false;
 	return !cut->recovery_owner_valid
 		|| (cluster_recovery_checkpoint_observe_v1(&observed)
+			&& observed.slot_generation != 0
+			&& observed.slot_generation != UINT64_MAX
+			&& cluster_wal_thread_recovered_writer_matches(&observed.owner.writer.ref,
+													 observed.owner.writer.epoch)
 			&& memcmp(&observed, &cut->recovery_owner, sizeof(observed)) == 0);
 }
 
