@@ -596,6 +596,7 @@ typedef struct RecoveryHeaderStamp {
 	bool failed;
 	struct stat file;
 	uint32 slot_offset;
+	uint8 ctrc_payload[CLUSTER_RECOVERY_CTRC_BYTES];
 	PGAlignedBlock before;
 	PGAlignedBlock after;
 } RecoveryHeaderStamp;
@@ -839,6 +840,7 @@ cluster_undo_smgr_recovery_ctrc_prepare_v2(const uint8 *payload, size_t length,
 											   BLCKSZ)
 		|| fstat(stage->fd, &after) != 0 || !recovery_header_stamp_file_matches(&after))
 		goto refused;
+	memcpy(stage->ctrc_payload, payload, CLUSTER_RECOVERY_CTRC_BYTES);
 	stage->kind = RECOVERY_HEADER_CTRC_D0;
 	stage->token = ++recovery_header_stamp_serial;
 	out->token = stage->token;
@@ -852,6 +854,27 @@ refused:
 bool
 cluster_undo_smgr_recovery_ctrc_write_v2(ClusterUndoSmgrRecoveryStampV1 stamp)
 {
+	return recovery_header_stamp_write(stamp, RECOVERY_HEADER_CTRC_D0);
+}
+
+bool
+cluster_undo_smgr_recovery_ctrc_write_bound_v2(ClusterUndoSmgrRecoveryStampV1 stamp,
+											   const uint8 *payload, size_t length)
+{
+	RecoveryHeaderStamp *stage = &recovery_header_stamp;
+
+	/* A foreign token, owner or kind cannot poison another prepared duty. */
+	if (stamp.token == 0 || stage->fd < 0 || stage->token != stamp.token
+		|| stage->owner != CurrentResourceOwner || stage->kind != RECOVERY_HEADER_CTRC_D0
+		|| stage->failed)
+		return false;
+	/* The same target image is insufficient: bind the whole canonical D0,
+	 * including its graph/input identity, before any lock or target I/O. */
+	if (payload == NULL || length != CLUSTER_RECOVERY_CTRC_BYTES
+		|| memcmp(stage->ctrc_payload, payload, CLUSTER_RECOVERY_CTRC_BYTES) != 0) {
+		stage->failed = true;
+		return false;
+	}
 	return recovery_header_stamp_write(stamp, RECOVERY_HEADER_CTRC_D0);
 }
 

@@ -5,6 +5,7 @@
 #define CLUSTER_RECOVERY_STAMP_H
 
 #include "cluster/cluster_wal_writer.h"
+#include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_recovery_tt_record.h"
 #include "storage/spin.h"
 
@@ -114,6 +115,15 @@ cluster_recovery_stamp_ctrc_insert_v2(const ClusterRecoveryStampHandleV1 *handle
  * readiness/authority proofs are still required before DURABLE or clear.
  * This is not a generic worker flush receipt or a live production caller. */
 extern bool cluster_recovery_stamp_ctrc_flush_v2(const ClusterRecoveryStampHandleV1 *handle);
+/* Dormant startup-only finish, inside the original insertion critical section.
+ * Flushes this exact INSERTED native end, writes only the held-FD stage bound
+ * to all 320B of this payload, directly syncs/reads back, and rechecks the
+ * original writer/flush/window before DURABLE and clear. A matched refusal
+ * stays failed; native errors retain post-insert duty. The caller retains
+ * graph/source/terminal/ROOT/IR/WALR/target reservation throughout. This does
+ * not establish those proofs, close the ResourceOwner token or add a live caller. */
+extern bool cluster_recovery_stamp_ctrc_finish_v2(const ClusterRecoveryStampHandleV1 *handle,
+												  ClusterUndoSmgrRecoveryStampV1 stamp);
 /* Only the original executor calls durable after real WAL flush and exact
  * target sync/postread. These APIs record completion, never prove it. */
 extern bool cluster_recovery_stamp_durable_v1(const ClusterRecoveryStampHandleV1 *handle);

@@ -913,6 +913,49 @@ failed:
 	return false;
 }
 bool
+cluster_recovery_stamp_ctrc_finish_v2(const ClusterRecoveryStampHandleV1 *handle,
+									  ClusterUndoSmgrRecoveryStampV1 stamp)
+{
+	ClusterThreadReplaySlot *replay;
+	ClusterRecoveryStampSlotV1 before, after;
+
+	if (!stamp_actor() || MyBackendType != B_STARTUP || CritSectionCount == 0 || handle == NULL
+		|| handle->owner.executor_pid != MyProcPid || handle->kind != CLUSTER_RECOVERY_STAMP_D0
+		|| handle->payload_length != CLUSTER_RECOVERY_CTRC_BYTES
+		|| (replay = cluster_thread_recovery_replay_slot(handle->key.target_thread)) == NULL)
+		return false;
+	stamp_snapshot(&replay->stamp, &before);
+	if (!stamp_handle_matches(&before, handle) || before.phase != CLUSTER_RECOVERY_STAMP_INSERTED
+		|| before.failed)
+		return false;
+
+	/* Preparation owns the held descriptor and complete payload. Flush the
+	 * actual native end before the bound target write; no slot lock spans
+	 * either operation, and native ERROR/PANIC retains the inserted duty. */
+	if (stamp.token == 0 || !cluster_recovery_stamp_ctrc_flush_v2(&before.handle)
+		|| !cluster_undo_smgr_recovery_ctrc_write_bound_v2(stamp, before.handle.payload,
+														   before.handle.payload_length))
+		goto failed;
+	if (!XLogInsertAllowed()
+		|| cluster_wal_writer_check(&before.handle.owner.writer) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| !ClusterXLogStartupFlushCovers(before.record_end,
+										  before.handle.owner.writer.ref.timeline))
+		goto failed;
+	stamp_snapshot(&replay->stamp, &after);
+	if (!stamp_handle_matches(&after, &before.handle)
+		|| after.phase != CLUSTER_RECOVERY_STAMP_INSERTED || after.failed
+		|| after.record_start != before.record_start || after.record_end != before.record_end)
+		goto failed;
+	if (!cluster_recovery_stamp_durable_v1(&before.handle)
+		|| !cluster_recovery_stamp_clear_v1(&before.handle))
+		goto failed;
+	return true;
+
+failed:
+	(void)cluster_recovery_stamp_fail_v1(&before.handle);
+	return false;
+}
+bool
 cluster_recovery_stamp_durable_v1(const ClusterRecoveryStampHandleV1 *handle)
 {
 	return stamp_transition(handle, CLUSTER_RECOVERY_STAMP_INSERTED, CLUSTER_RECOVERY_STAMP_DURABLE,

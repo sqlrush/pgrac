@@ -185,6 +185,12 @@ extern bool cluster_undo_smgr_recovery_ctrc_prepare_v2(const uint8 *payload, siz
 													   uint64 system_identifier,
 													   ClusterUndoSmgrRecoveryStampV1 *out);
 extern bool cluster_undo_smgr_recovery_ctrc_write_v2(ClusterUndoSmgrRecoveryStampV1 stamp);
+/* The durability coordinator must also bind the complete prepared canonical
+ * payload, not just its target before/after page. An exact owned token with
+ * mismatched payload fails sticky before target IO; unrelated tokens/owners
+ * cannot poison this stage. No codec/hash/allocation is performed here. */
+extern bool cluster_undo_smgr_recovery_ctrc_write_bound_v2(ClusterUndoSmgrRecoveryStampV1 stamp,
+														   const uint8 *payload, size_t length);
 extern bool cluster_undo_smgr_recovery_ctrc_close_v2(ClusterUndoSmgrRecoveryStampV1 stamp);
 #endif
 

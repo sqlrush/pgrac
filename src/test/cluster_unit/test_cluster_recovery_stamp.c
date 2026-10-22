@@ -49,6 +49,61 @@ static unsigned flush_calls, writer_checks, cover_calls, writer_reject_on, flush
 static XLogRecPtr flush_seen, covered_end;
 static TimeLineID covered_timeline;
 static bool cover_enabled;
+/* Storage is an external leaf here; the real held-FD entry is independently
+ * exercised against native temporary undo files in recovery_tt_io. */
+static void flush_unlocked(void);
+static unsigned target_calls, target_fault;
+static uint8 target_payload[320];
+static ClusterUndoSmgrRecoveryStampV1 target_stamp = { .token = 37 };
+
+bool
+cluster_undo_smgr_recovery_ctrc_write_bound_v2(ClusterUndoSmgrRecoveryStampV1 stamp,
+											   const uint8 *bytes, size_t length)
+{
+	ClusterRecoveryStampSlotV1 *slot = &region.thread_replay[2].stamp;
+	flush_unlocked();
+	UT_ASSERT_EQ(flush_calls, 1);
+	UT_ASSERT_EQ(cover_calls, 1);
+	UT_ASSERT_EQ(writer_checks, 2);
+	UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+	UT_ASSERT_EQ(length, sizeof(target_payload));
+	UT_ASSERT(memcmp(bytes, target_payload, sizeof(target_payload)) == 0);
+	target_calls++;
+	if (stamp.token != target_stamp.token)
+		return false;
+	switch (target_fault) {
+	case 1:
+		return false;
+	case 2:
+		siglongjmp(insert_error_boundary, 1);
+		break;
+	case 3:
+		slot->record_end++;
+		break;
+	case 4:
+		slot->record_start++;
+		break;
+	case 5:
+		slot->handle.payload[319] ^= 1;
+		break;
+	case 6:
+		slot->handle.key.window_seq++;
+		break;
+	case 7:
+		insert_allowed = false;
+		break;
+	case 8:
+		writer_reject_on = writer_checks + 1;
+		break;
+	case 9:
+		covered_end--;
+		break;
+	case 10:
+		slot->failed = true;
+		break;
+	}
+	return true;
+}
 
 static void
 flush_unlocked(void)
@@ -230,6 +285,8 @@ fresh(void)
 	covered_end = 0x2000413;
 	covered_timeline = 1;
 	cover_enabled = true;
+	target_calls = target_fault = 0;
+	memset(target_payload, 0, sizeof(target_payload));
 	memset(registered_payload, 0, sizeof(registered_payload));
 	memset(&owner, 0, sizeof(owner));
 	owner.writer.ref.claim.identity.system_identifier = 99;
@@ -1308,10 +1365,172 @@ UT_TEST(d0_flush_native_error_does_not_retire_window)
 	CritSectionCount = 0;
 }
 
+static bool
+finish_window(ClusterRecoveryStampHandleV1 *h, uint8 outcome)
+{
+	if (!flush_window(h, outcome))
+		return false;
+	memcpy(target_payload, h->payload, sizeof(target_payload));
+	return true;
+}
+
+UT_TEST(d0_finish_flushes_bound_target_before_clear)
+{
+	for (unsigned outcome = TT_SLOT_COMMITTED; outcome <= TT_SLOT_ABORTED; outcome++) {
+		ClusterRecoveryStampHandleV1 h;
+		ClusterRecoveryStampCaptureV1 capture;
+		unsigned before;
+		UT_ASSERT(finish_window(&h, outcome));
+		CritSectionCount = 0;
+		UT_ASSERT(cluster_recovery_stamp_capture_v1(&capture));
+		CritSectionCount = 1;
+		before = hash_calls;
+		UT_ASSERT(cluster_recovery_stamp_ctrc_finish_v2(&h, target_stamp));
+		UT_ASSERT_EQ(target_calls, 1);
+		UT_ASSERT_EQ(flush_calls, 1);
+		UT_ASSERT_EQ(writer_checks, 3);
+		UT_ASSERT_EQ(cover_calls, 2);
+		UT_ASSERT_EQ(native_calls, 3);
+		UT_ASSERT_EQ(hash_calls, before);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
+		UT_ASSERT(!region.thread_replay[2].stamp.failed);
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_finish_v2(&h, target_stamp));
+		UT_ASSERT_EQ(target_calls, 1);
+		CritSectionCount = 0;
+		UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&capture), CLUSTER_RECOVERY_STAMP_COMPLETE);
+	}
+}
+UT_TEST(d0_finish_wrong_operation_and_context_do_no_io)
+{
+	ClusterRecoveryStampHandleV1 h, changed;
+	ClusterRecoveryStampSlotV1 saved;
+	UT_ASSERT(finish_window(&h, TT_SLOT_ABORTED));
+	saved = region.thread_replay[2].stamp;
+	UT_ASSERT(!cluster_recovery_stamp_ctrc_finish_v2(NULL, target_stamp));
+	for (unsigned i = 0; i < 329; i++) {
+		changed = h;
+		switch (i) {
+		case 320:
+			changed.key.window_seq++;
+			break;
+		case 321:
+			changed.key.slot_generation++;
+			break;
+		case 322:
+			changed.owner.recovery_serial++;
+			break;
+		case 323:
+			changed.kind = CLUSTER_RECOVERY_STAMP_C0;
+			break;
+		case 324:
+			changed.payload_length--;
+			break;
+		case 325:
+			CritSectionCount = 0;
+			break;
+		case 326:
+			MyBackendType = B_BG_WORKER;
+			break;
+		case 327:
+			MyProcPid++;
+			break;
+		case 328:
+			cluster_enabled = false;
+			break;
+		default:
+			changed.payload[i] ^= 1;
+			break;
+		}
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_finish_v2(&changed, target_stamp));
+		UT_ASSERT(memcmp(&saved, &region.thread_replay[2].stamp, sizeof(saved)) == 0);
+		CritSectionCount = 1;
+		MyBackendType = B_STARTUP;
+		MyProcPid = owner.executor_pid;
+		cluster_enabled = true;
+	}
+	UT_ASSERT_EQ(flush_calls + writer_checks + cover_calls + target_calls, 0);
+	CritSectionCount = 0;
+}
+UT_TEST(d0_finish_refusal_retains_exact_inserted_duty)
+{
+	for (unsigned mode = 0; mode < 6; mode++) {
+		ClusterRecoveryStampHandleV1 h;
+		ClusterUndoSmgrRecoveryStampV1 token = target_stamp;
+		UT_ASSERT(finish_window(&h, TT_SLOT_COMMITTED));
+		switch (mode) {
+		case 0:
+			token.token = 0;
+			break;
+		case 1:
+			token.token++;
+			break;
+		case 2:
+			target_fault = 1;
+			break;
+		case 3:
+			writer_reject_on = 1;
+			break;
+		case 4:
+			covered_end--;
+			break;
+		case 5:
+			writer_reject_on = 2;
+			break;
+		}
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_finish_v2(&h, token));
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+		UT_ASSERT(region.thread_replay[2].stamp.failed);
+		UT_ASSERT(memcmp(&region.thread_replay[2].stamp.handle, &h, sizeof(h)) == 0);
+		UT_ASSERT_EQ(target_calls, mode == 1 || mode == 2 ? 1 : 0);
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_finish_v2(&h, target_stamp));
+		UT_ASSERT(!cluster_recovery_stamp_durable_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+		CritSectionCount = 0;
+	}
+}
+UT_TEST(d0_finish_rechecks_writer_coverage_and_same_window_after_target)
+{
+	for (unsigned fault = 3; fault <= 10; fault++) {
+		ClusterRecoveryStampHandleV1 h;
+		UT_ASSERT(finish_window(&h, TT_SLOT_ABORTED));
+		target_fault = fault;
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_finish_v2(&h, target_stamp));
+		UT_ASSERT_EQ(target_calls, 1);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.failed, fault != 5 && fault != 6);
+		UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+		CritSectionCount = 0;
+	}
+}
+UT_TEST(d0_finish_native_error_never_retires_inserted_window)
+{
+	for (unsigned mode = 0; mode < 2; mode++) {
+		ClusterRecoveryStampHandleV1 h;
+		UT_ASSERT(finish_window(&h, TT_SLOT_ABORTED));
+		if (mode == 0)
+			flush_fault = 1;
+		else
+			target_fault = 2;
+		if (sigsetjmp(insert_error_boundary, 0) == 0) {
+			(void)cluster_recovery_stamp_ctrc_finish_v2(&h, target_stamp);
+			UT_ASSERT(false);
+		} else {
+			UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+			UT_ASSERT_EQ(target_calls, mode);
+			UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+			UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+		}
+		/* Controlled unwind does not prove real PANIC process death. */
+		CritSectionCount = 0;
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(31);
 	UT_RUN(exact_lifecycle_and_owned_payload);
 	UT_RUN(preinsert_cancel_capture_and_new_sequence);
 	UT_RUN(inserting_failure_exit_and_replay_reset_cannot_retire);
@@ -1338,6 +1557,11 @@ main(void)
 	UT_RUN(d0_flush_refusal_retains_sticky_inserted_responsibility);
 	UT_RUN(d0_flush_revalidates_window_after_native_wait);
 	UT_RUN(d0_flush_native_error_does_not_retire_window);
+	UT_RUN(d0_finish_flushes_bound_target_before_clear);
+	UT_RUN(d0_finish_wrong_operation_and_context_do_no_io);
+	UT_RUN(d0_finish_refusal_retains_exact_inserted_duty);
+	UT_RUN(d0_finish_rechecks_writer_coverage_and_same_window_after_target);
+	UT_RUN(d0_finish_native_error_never_retires_inserted_window);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

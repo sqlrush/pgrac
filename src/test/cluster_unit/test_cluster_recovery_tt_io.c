@@ -794,6 +794,109 @@ UT_TEST(test_d0_owner_and_exit_cleanup_only_release_descriptor)
 	UT_ASSERT_EQ(syncs, 0);
 }
 
+UT_TEST(test_d0_bound_write_exact_canonical_payload_on_held_fd)
+{
+	for (int committed = 0; committed < 2; committed++) {
+		ClusterUndoSmgrRecoveryStampV1 stamp;
+		uint8 bound[320];
+		reset_d0(committed);
+		if (!prepare_d0(&stamp))
+			continue;
+		memcpy(bound, d0_payload, sizeof(bound));
+		d0_payload[0] ^= 1; /* stage owns a full copy of prepared canonical bytes */
+		scope_current = false;
+		opens = resolves = 0;
+		CritSectionCount = 1;
+		UT_ASSERT(cluster_undo_smgr_recovery_ctrc_write_bound_v2(stamp, bound, sizeof(bound)));
+		UT_ASSERT_EQ(opens + resolves, 0);
+		UT_ASSERT_EQ(writes, 1);
+		UT_ASSERT_EQ(syncs, 1);
+		UT_ASSERT(cluster_undo_smgr_recovery_ctrc_write_bound_v2(stamp, bound, sizeof(bound)));
+		UT_ASSERT_EQ(writes, 1);
+		UT_ASSERT_EQ(syncs, 2);
+		CritSectionCount = 0;
+		UT_ASSERT(cluster_undo_smgr_recovery_ctrc_close_v2(stamp));
+	}
+}
+UT_TEST(test_d0_bound_same_page_different_graph_or_identity_refuses_before_io)
+{
+	for (unsigned mode = 0; mode < 4; mode++) {
+		ClusterUndoSmgrRecoveryStampV1 stamp;
+		ClusterRecoveryCTRCReleaseV2 other;
+		PGAlignedBlock before, after;
+		uint8 changed[320];
+		unsigned before_reads;
+		reset_d0(true);
+		if (!prepare_d0(&stamp))
+			continue;
+		UT_ASSERT(cluster_recovery_ctrc_decode_v2(d0_payload, 320, d0_system, &other));
+		switch (mode) {
+		case 0:
+			other.graph_sha256[0]++;
+			break;
+		case 1:
+			other.input_sha256[0]++;
+			break;
+		case 2:
+			other.recovery_serial++;
+			break;
+		case 3:
+			other.writer_boot++;
+			break;
+		}
+		UT_ASSERT(cluster_recovery_ctrc_encode_v2(&other, d0_system, changed, sizeof(changed)));
+		/* Both records really derive exactly the same native before/after
+		 * target; target-page equality alone cannot bind their authority. */
+		UT_ASSERT(cluster_recovery_ctrc_target_image_v2(changed, sizeof(changed), d0_system,
+														initial.data, BLCKSZ, before.data, BLCKSZ));
+		UT_ASSERT(cluster_recovery_ctrc_target_image_v2(d0_payload, 320, d0_system, initial.data,
+														BLCKSZ, after.data, BLCKSZ));
+		UT_ASSERT(memcmp(before.data, after.data, BLCKSZ) == 0);
+		before_reads = reads;
+		CritSectionCount = 1;
+		UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_write_bound_v2(stamp, changed, sizeof(changed)));
+		UT_ASSERT_EQ(reads, before_reads);
+		UT_ASSERT_EQ(writes + syncs, 0);
+		UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_write_bound_v2(stamp, d0_payload, 320));
+		UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_write_v2(stamp));
+		CritSectionCount = 0;
+		UT_ASSERT(cluster_undo_smgr_recovery_ctrc_close_v2(stamp));
+	}
+}
+UT_TEST(test_d0_bound_token_owner_kind_and_length_isolation)
+{
+	ClusterUndoSmgrRecoveryStampV1 stamp, wrong;
+	reset_d0(false);
+	if (!prepare_d0(&stamp))
+		return;
+	wrong.token = stamp.token + 1;
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_write_bound_v2(wrong, NULL, 0));
+	CurrentResourceOwner = (ResourceOwner)&owner_storage[1];
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_write_bound_v2(stamp, NULL, 0));
+	CurrentResourceOwner = (ResourceOwner)&owner_storage[0];
+	UT_ASSERT(cluster_undo_smgr_recovery_ctrc_write_bound_v2(stamp, d0_payload, 320));
+	UT_ASSERT(cluster_undo_smgr_recovery_ctrc_close_v2(stamp));
+	reset_file(false);
+	if (!prepare(&stamp))
+		return;
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_write_bound_v2(stamp, NULL, 0));
+	UT_ASSERT(cluster_undo_smgr_recovery_abort_write_v1(stamp));
+	UT_ASSERT(cluster_undo_smgr_recovery_abort_close_v1(stamp));
+	for (unsigned mode = 0; mode < 2; mode++) {
+		unsigned before_reads;
+		reset_d0(false);
+		if (!prepare_d0(&stamp))
+			continue;
+		before_reads = reads;
+		UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_write_bound_v2(
+			stamp, mode == 0 ? NULL : d0_payload, mode == 0 ? 320 : 319));
+		UT_ASSERT_EQ(reads, before_reads);
+		UT_ASSERT_EQ(writes + syncs, 0);
+		UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_write_v2(stamp));
+		UT_ASSERT(cluster_undo_smgr_recovery_ctrc_close_v2(stamp));
+	}
+}
+
 int
 main(void)
 {
@@ -803,7 +906,7 @@ main(void)
 		return 2;
 	snprintf(test_dir, sizeof(test_dir), "%s", dir);
 	snprintf(test_file, sizeof(test_file), "%s/seg_257.dat", dir);
-	UT_PLAN(13);
+	UT_PLAN(16);
 	UT_RUN(test_exact_durable_slot_preserves_whole_header_and_head);
 	UT_RUN(test_idempotent_still_syncs_and_reads_without_rewriting);
 	UT_RUN(test_prepare_refusals_do_not_leak_or_write);
@@ -817,6 +920,9 @@ main(void)
 	UT_RUN(test_d0_changed_target_refuses_before_writing_and_stays_failed);
 	UT_RUN(test_d0_failed_io_is_sticky_and_sync_uses_native_severity);
 	UT_RUN(test_d0_owner_and_exit_cleanup_only_release_descriptor);
+	UT_RUN(test_d0_bound_write_exact_canonical_payload_on_held_fd);
+	UT_RUN(test_d0_bound_same_page_different_graph_or_identity_refuses_before_io);
+	UT_RUN(test_d0_bound_token_owner_kind_and_length_isolation);
 	CurrentResourceOwner = (ResourceOwner)&owner_storage[0];
 	if (release_callback != NULL)
 		release_callback(RESOURCE_RELEASE_AFTER_LOCKS, false, true, release_arg);

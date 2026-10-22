@@ -1402,6 +1402,7 @@ test_cluster_recovery_stop: test_cluster_recovery_stop.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_thread_recovery_orchestrator.c \
 		$(top_srcdir)/src/include/cluster/cluster_clean_leave.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
+        $(top_srcdir)/src/include/cluster/cluster_undo_smgr.h \
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
         $(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h $(CLUSTER_UNIT_CRYPTOHASH_O)
@@ -9925,6 +9926,7 @@ test_cluster_recovery_stamp: test_cluster_recovery_stamp.c unit_test.h \
         $(top_srcdir)/src/include/access/xlog.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
+        $(top_srcdir)/src/include/cluster/cluster_undo_smgr.h \
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
         $(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h $(CLUSTER_UNIT_CRYPTOHASH_O)
@@ -9953,6 +9955,7 @@ test_cluster_checkpoint_stamp: test_cluster_checkpoint_stamp.c test_cluster_reco
         test_cluster_recovery_stamp_insert.inc \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
         $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
+        $(top_srcdir)/src/include/cluster/cluster_undo_smgr.h \
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
         $(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h $(CLUSTER_UNIT_CRYPTOHASH_O)
