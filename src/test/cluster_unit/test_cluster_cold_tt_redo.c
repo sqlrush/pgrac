@@ -7199,7 +7199,7 @@ UT_TEST(tt_top_tx_c0_producer_checks_history_undo_multi_fpi_records)
  * original block and a source FPI exercise the two existing ancestry paths. */
 enum {
 	TT_UNDO_DELTA_FORMAT, TT_UNDO_DELTA_RAW_ACTOR, TT_UNDO_DELTA_CANONICAL,
-	TT_UNDO_DELTA_CHECKPOINT
+	TT_UNDO_DELTA_CHECKPOINT, TT_UNDO_DELTA_EFFECTS
 };
 
 static void
@@ -7230,13 +7230,72 @@ tt_undo_delta_actor_terminal(FakeXactRecord *fake, bool abort)
 	}
 }
 
+/* A real nonempty receipt is required independently of the UNDO actor.
+ * PAGE preflight/storage and physical native application remain fixture leaves. */
+static void
+tt_top_tx_undo_effects_complete(TtRedoFixture *f, ClusterColdDecodedV1 *page,
+							  const ClusterColdComponentV1 *component)
+{
+	ClusterColdEffectsProofV1 proof = { 0 };
+	ClusterColdReplayResultV1 result = { .detail = CLUSTER_COLD_REPLAY_OK, .steps_done = 1 };
+	ClusterColdDiagV1 diag;
+	ClusterColdStepV1 step;
+
+	UT_ASSERT_NULL(f->typed.plan);
+	UT_ASSERT_EQ(cluster_cold_plan_create_v1(f->typed.participants, f->typed.participant_count,
+												  (Size)1024 * 1024, &f->typed.plan), CLUSTER_COLD_OK);
+	for (uint32 p = 0; p < f->typed.participant_count; p++) {
+		XLogRecPtr prev = InvalidXLogRecPtr;
+		uint32 count = rf_side_online_plan_operation_count_v1(f->typed.side_plans[p]);
+
+		UT_ASSERT(count != UINT32_MAX);
+		for (uint32 i = 0; i < count; i++) {
+			RfSideOnlineOperationV1 op;
+			ClusterColdDecodedV1 decoded = { 0 };
+
+			UT_ASSERT(rf_side_online_plan_operation_v1(f->typed.side_plans[p], i, &op));
+			decoded.record.read_rec_ptr = op.identity.record.read_rec_ptr;
+			decoded.record.end_rec_ptr = op.identity.record.end_rec_ptr;
+			decoded.record.prev_rec_ptr = prev;
+			decoded.record.record_crc = op.identity.record.record_crc;
+			decoded.record.rmid = op.identity.record.rmid;
+			decoded.record.info = op.identity.record.info;
+			decoded.record.scn = op.control_scn;
+			decoded.record.source_xid = op.source_xid;
+			decoded.record.source_top_xid = op.source_top_xid;
+			UT_ASSERT_EQ(cluster_cold_plan_feed_v1(f->typed.plan, p, &decoded.record), CLUSTER_COLD_OK);
+			prev = decoded.record.read_rec_ptr;
+			if (op.history_only)
+				continue;
+			decoded.effects.required = decoded.effects.native_apply = CLUSTER_COLD_EFFECT_RECORD;
+			UT_ASSERT(cluster_cold_effects_proof_record_v1(&proof, p, &decoded, NULL, true));
+		}
+		if (p == f->typed.own_participant) {
+			page->record.prev_rec_ptr = prev;
+			UT_ASSERT_EQ(cluster_cold_plan_feed_v1(f->typed.plan, p, &page->record), CLUSTER_COLD_OK);
+		}
+	}
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(f->typed.plan, tt_page_creator_observe,
+										  (void *)component, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(f->typed.plan), 1);
+	UT_ASSERT(cluster_cold_plan_step_v1(f->typed.plan, 0, &step));
+	page->effects.required = page->effects.page_apply
+		= CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_PAGE;
+	UT_ASSERT(cluster_cold_effects_proof_record_v1(&proof, f->typed.own_participant,
+														 page, &step, true));
+	UT_ASSERT(cluster_cold_typed_effects_complete_v1(&f->typed, &proof, &result));
+	UT_ASSERT(cluster_cold_typed_effects_nonempty_for_participant_v1(&f->typed, 0));
+	UT_ASSERT(!cluster_cold_typed_effects_nonempty_for_participant_v1(&f->typed, 1));
+}
+
 static void
 tt_top_tx_undo_fold_records(bool original_base, bool multi, int input_case)
 {
 	bool actor_cases = input_case == TT_UNDO_DELTA_RAW_ACTOR;
-	bool checkpoint_cases = input_case == TT_UNDO_DELTA_CHECKPOINT;
+	bool effects_cases = input_case == TT_UNDO_DELTA_EFFECTS;
+	bool checkpoint_cases = input_case == TT_UNDO_DELTA_CHECKPOINT || effects_cases;
 	bool canonical_cases = input_case == TT_UNDO_DELTA_CANONICAL || checkpoint_cases;
-	int fault_count = checkpoint_cases ? 6
+	int fault_count = effects_cases ? 13 : checkpoint_cases ? 6
 					  : actor_cases ? (multi ? 6 : 5) : canonical_cases ? 17 : 11;
 
 	for (int fault = 0; fault < fault_count; fault++) {
@@ -7256,14 +7315,16 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi, int input_case)
 		ClusterColdTopTxProofV1 proof;
 		ClusterRecoveryTTAbortV1 shape;
 		ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
+		ClusterColdDecodedV1 ordinary = { 0 };
+		ClusterColdComponentV1 component = { 0 };
 		bool deferred_abort = canonical_cases && fault >= 14;
 		bool unrelated_bind = checkpoint_cases || (canonical_cases && (fault == 1 || fault == 2));
 		TransactionId bind_actor = unrelated_bind ? 805 : 804;
-		TransactionId bind_source = canonical_cases && fault == 12
+		TransactionId bind_source = canonical_cases && !effects_cases && fault == 12
 			? InvalidTransactionId : bind_actor;
 		XLogRecPtr delta_lsn = deferred_abort ? 800 : canonical_cases ? 600 : 500;
 		uint32 delta_index = original_base ? 3 : 4;
-		bool accepted = checkpoint_cases ? fault == 0 || fault == 5
+		bool accepted = effects_cases ? fault == 0 : checkpoint_cases ? fault == 0 || fault == 5
 						: actor_cases		  ? fault == 0 || fault == 4
 						: canonical_cases ? fault == 0 || fault == 8 || fault == 10 || fault == 11
 												|| fault == 12 || fault == 14 || fault == 15
@@ -7290,9 +7351,9 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi, int input_case)
 		if (canonical_cases) {
 			if (checkpoint_cases && (fault == 2 || fault == 3))
 				tt_undo_delta_actor_terminal(&fake, fault == 2);
-			else if (fault == 9)
+			else if (!effects_cases && fault == 9)
 				tt_top_tx_frame_bind(&fake, 46, 804, 804, 804);
-			else if (fault == 7 || fault == 10 || deferred_abort)
+			else if ((!effects_cases && (fault == 7 || fault == 10)) || deferred_abort)
 				tt_undo_delta_actor_terminal(&fake, fault != 7);
 			else
 				tt_top_tx_frame_bind(&fake, 45, 806, 806, 806);
@@ -7357,7 +7418,7 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi, int input_case)
 			header->tt_slots[47].wrap = 5;
 			header->tt_slots[47].status = TT_SLOT_ACTIVE;
 			header->tt_slots[47].first_undo_block = (UBA)InvalidUba_init;
-			if (fault == 10) {
+			if (!effects_cases && fault == 10) {
 				memcpy(&record, base.data + old.record_offset, sizeof(record));
 				record.origin_node_id--;
 				memcpy(base.data + old.record_offset, &record, sizeof(record));
@@ -7375,6 +7436,22 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi, int input_case)
 			if (fault == 1)
 				record.xid = 805;
 			if (fault == 5) {
+				UndoSlotDirEntry last;
+				UndoRecordHeader other;
+
+				memcpy(&last, page.data + UNDO_SLOT_DIR_OFFSET(2), sizeof(last));
+				memcpy(&other, page.data + last.record_offset, sizeof(other));
+				other.xid = 805;
+				memcpy(page.data + last.record_offset, &other, sizeof(other));
+			}
+		} else if (effects_cases) {
+			if (fault == 4)
+				record.tt_wrap_plus1++;
+			else if (fault == 10 || (fault == 12 && !multi))
+				record.origin_node_id--;
+			else if (fault == 11)
+				record.tt_slot_id--;
+			else if (fault == 12) {
 				UndoSlotDirEntry last;
 				UndoRecordHeader other;
 
@@ -7467,7 +7544,12 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi, int input_case)
 							   multi ? XLOG_UNDO_BLOCK_WRITE_MULTI : XLOG_UNDO_BLOCK_WRITE, bytes,
 							   length);
 		fake.u.decoded.header.xl_xid = fake.u.decoded.toplevel_xid = 804;
-		if (actor_cases) {
+		if (effects_cases) {
+			if (fault == 8)
+				fake.u.decoded.header.xl_xid = fake.u.decoded.toplevel_xid = 805;
+			else if (fault == 9)
+				fake.u.decoded.toplevel_xid = 805;
+		} else if (actor_cases) {
 			if (fault == 2)
 				fake.u.decoded.header.xl_xid = fake.u.decoded.toplevel_xid = InvalidTransactionId;
 			else if (fault == 3)
@@ -7477,7 +7559,46 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi, int input_case)
 		}
 		undo_header_feed(f.typed.side_plans[0], &fake, delta_lsn);
 		memset(fake.data, 0x5a, length);
-		if (canonical_cases) {
+		if (effects_cases && fault != 5) {
+			RfDetachedRecordPlanV1 detached = { 0 };
+			RfPageOnlineRecordIdentityV1 identity;
+			xl_heap_prune prune = { 0 };
+
+			/* Nontransactional PAGE coverage cannot supply the selected actor. */
+			make_projection_record(&fake, RM_HEAP2_ID, XLOG_HEAP2_PRUNE, &prune, sizeof(prune));
+			identity = make_identity(&fake, f.typed.observer.storage_uuid);
+			set_identity_range(&fake, &identity, delta_lsn + 100, delta_lsn + 200);
+			detached.source_record = &fake.reader;
+			detached.preflight_complete = true;
+			detached.route.record_owner = RF_ROUTE_OWNER_PAGE_CODEC;
+			detached.route.rmid = RM_HEAP2_ID;
+			detached.component_count = 1;
+			detached.components[0].page_class = RF_PAGE_CLASS_ORDINARY;
+			detached.components[0].owner = RF_DETACHED_COMPONENT_PAGE_CODEC;
+			detached.components[0].before_kind = detached.components[0].result_kind
+				= RF_PAGE_STATE_PRESENT;
+			UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(f.typed.side_plans[0], &detached,
+															 &identity), RF_PAGE_PROOF_DETAIL_OK);
+			ordinary.record.read_rec_ptr = identity.record.read_rec_ptr;
+			ordinary.record.end_rec_ptr = identity.record.end_rec_ptr;
+			ordinary.record.record_crc = identity.record.record_crc;
+			ordinary.record.rmid = RM_HEAP2_ID;
+			ordinary.record.info = XLOG_HEAP2_PRUNE;
+			component.page.system_identifier = f.typed.system_identifier;
+			memcpy(component.page.storage_uuid, f.typed.observer.storage_uuid, 16);
+			component.page.locator.spcOid = 1663;
+			component.page.locator.dbOid = 5;
+			component.page.locator.relNumber = 100;
+			component.page.forknum = MAIN_FORKNUM;
+			component.page_class = RF_PAGE_CLASS_ORDINARY;
+			component.before_kind = component.result_kind = RF_PAGE_STATE_PRESENT;
+			memset(component.before.segment_incarnation, 0x66, 16);
+			component.result = component.before;
+			component.before.mutation_token = 1;
+			component.result.mutation_token = 2;
+			ordinary.record.component_count = 1;
+			ordinary.record.components = &component;
+		} else if (canonical_cases) {
 			if (checkpoint_cases) {
 				if (fault == 5)
 					tt_undo_delta_actor_terminal(&fake, true);
@@ -7501,7 +7622,7 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi, int input_case)
 		UT_ASSERT(rf_side_online_plan_operation_v1(f.typed.side_plans[0], delta_index, &captured));
 		UT_ASSERT(!captured.undo.has_fpi && !captured.history_only);
 		UT_ASSERT_EQ(captured.source_xid, actor_cases && fault == 2	  ? InvalidTransactionId
-										  : actor_cases && fault == 3 ? 805
+										  : (actor_cases && fault == 3) || (effects_cases && fault == 8) ? 805
 																	  : 804);
 		UT_ASSERT_EQ(captured.owned_payload_length, length - prefix);
 		UT_ASSERT(memcmp(captured.owned_payload, bytes + prefix, length - prefix) == 0);
@@ -7524,13 +7645,20 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi, int input_case)
 		}
 		tt_undo_readback_write(513, 9, &expected);
 		UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
-		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 4, &input));
+		UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, effects_cases && fault != 6 ? 47 : 4, &input));
 		UT_ASSERT_EQ(cluster_cold_tt_after_redo_recheck_v1(&f.typed), CLUSTER_COLD_OK);
 		UT_ASSERT_EQ(cluster_cold_typed_tt_redo_inventory_v1(&f.typed),
-					 actor_cases || canonical_cases || fault == 0);
+					 !(effects_cases && (fault == 10 || (!multi && fault == 12)))
+					 && (actor_cases || canonical_cases || fault == 0));
 		f.typed.xid_next_after_redo = UINT64_C(0x700400200);
 		tt_top_tx_c0_inputs(&f, &input, &proof, &shape);
-		tt_top_tx_effects_complete(&f);
+		if (effects_cases && fault != 5) {
+			proof.ordinary_effects = false;
+			tt_top_tx_undo_effects_complete(&f, &ordinary, &component);
+			if (fault == 7)
+				memset(&f.typed.effects_receipt, 0, sizeof(f.typed.effects_receipt));
+		} else
+			tt_top_tx_effects_complete(&f);
 		tt_top_tx_endpoints_complete(&f);
 		bool physical = cluster_cold_typed_effects_nonempty_v1(&f.typed);
 		bool effective = accepted && physical;
@@ -7541,8 +7669,22 @@ tt_top_tx_undo_fold_records(bool original_base, bool multi, int input_case)
 						 effective);
 		if (!effective)
 			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		else if (effects_cases) {
+			UT_ASSERT_EQ(out.c0.record.exact.xid, 804);
+			UT_ASSERT_EQ(out.c0.record.exact.slot_offset, 47);
+		}
 		tt_redo_destroy(&f);
 	}
+}
+
+UT_TEST(tt_top_tx_checkpoint_undo_delta_attributes_nonempty_effects)
+{
+	tt_top_tx_undo_fold_records(true, false, TT_UNDO_DELTA_EFFECTS);
+}
+
+UT_TEST(tt_top_tx_checkpoint_undo_multi_delta_attributes_nonempty_effects)
+{
+	tt_top_tx_undo_fold_records(true, true, TT_UNDO_DELTA_EFFECTS);
 }
 
 UT_TEST(tt_top_tx_c0_producer_checks_undo_delta_fold_records)
@@ -8553,7 +8695,7 @@ UT_TEST(tt_top_tx_census_budget_and_oom_never_publish_a_partial_list)
 int
 main(void)
 {
-	UT_PLAN(182);
+	UT_PLAN(184);
 	UT_RUN(tt_top_tx_census_consumes_native_empty_loser_without_c0_fields);
 	UT_RUN(tt_top_tx_census_retains_all_unproven_active_slots);
 	UT_RUN(tt_top_tx_census_clears_prior_input_on_incomplete_cut);
@@ -8580,6 +8722,8 @@ main(void)
 	UT_RUN(tt_top_tx_c0_producer_checks_undo_delta_actor);
 	UT_RUN(tt_top_tx_checkpoint_actor_accepts_only_active_single_delta_prefix);
 	UT_RUN(tt_top_tx_checkpoint_actor_accepts_only_active_multi_delta_prefix);
+	UT_RUN(tt_top_tx_checkpoint_undo_delta_attributes_nonempty_effects);
+	UT_RUN(tt_top_tx_checkpoint_undo_multi_delta_attributes_nonempty_effects);
 	UT_RUN(tt_top_tx_c0_producer_checks_undo_multi_delta_actor);
 	UT_RUN(tt_top_tx_c0_producer_checks_original_undo_delta_actor);
 	UT_RUN(tt_top_tx_c0_producer_checks_original_undo_multi_delta_actor);

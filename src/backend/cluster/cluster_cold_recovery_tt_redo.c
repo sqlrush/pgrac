@@ -896,7 +896,8 @@ cold_top_tx_undo_fpi_v1(const RfSideOnlineOperationV1 *operation)
  * FPI has no appended-range metadata and must retain other actors' records. */
 static bool
 cold_top_tx_undo_delta_actor_v1(const ClusterColdTypedV1 *typed, uint32 participant,
-								uint32 operation_index, const RfSideOnlineOperationV1 *operation)
+								uint32 operation_index, const RfSideOnlineOperationV1 *operation,
+								ClusterColdTtSlotKeyV1 *actor)
 {
 	const ClusterUndoDecoded *undo = &operation->undo;
 	ClusterColdTtSlotKeyV1 key;
@@ -935,6 +936,7 @@ cold_top_tx_undo_delta_actor_v1(const ClusterColdTypedV1 *typed, uint32 particip
 			|| record.tt_wrap_plus1 - 1 != key.slot_wrap)
 			return false;
 	}
+	*actor = key;
 	return true;
 }
 
@@ -946,12 +948,12 @@ cold_top_tx_undo_delta_actor_v1(const ClusterColdTypedV1 *typed, uint32 particip
  * members are not qualified here; ordinary_effects remains independent. */
 static bool
 cold_top_tx_frames_v1(const ClusterColdTypedV1 *typed, const ClusterColdTtSlotKeyV1 *key,
-					 bool *page_effects)
+					 bool *canonical_effects)
 {
 	uint32 count;
 	bool matched = false;
 
-	*page_effects = false;
+	*canonical_effects = false;
 	if (!cluster_cold_plan_input_frame_count_v1(typed->plan, &count))
 		return false;
 	for (uint32 i = 0; i < count; i++) {
@@ -1035,12 +1037,19 @@ cold_top_tx_frames_v1(const ClusterColdTypedV1 *typed, const ClusterColdTtSlotKe
 			if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO && !operation.history_only
 				&& !operation.undo.has_fpi
 				&& (operation.undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
-					|| operation.undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI)
-				&& !cold_top_tx_undo_delta_actor_v1(typed, p, i, &operation))
-				return false;
+					|| operation.undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI)) {
+				ClusterColdTtSlotKeyV1 actor;
+
+				/* Attribute only the fully verified appended span, never an
+				 * inherited FPI record or another top's completed route. */
+				if (!cold_top_tx_undo_delta_actor_v1(typed, p, i, &operation, &actor))
+					return false;
+				if (cold_top_tx_key_equal_v1(&actor, key))
+					matched = true;
+			}
 		}
 	}
-	*page_effects = matched;
+	*canonical_effects = matched;
 	return true;
 }
 
@@ -1182,7 +1191,7 @@ cluster_cold_typed_top_tx_loser_producer_v1(
 	ClusterColdTtSlotInputV1 post_slot;
 	uint32 post_segment_index;
 	bool checkpoint_base;
-	bool page_effects, physical_effects;
+	bool canonical_effects, physical_effects;
 
 	if (out == NULL)
 		return false;
@@ -1215,7 +1224,7 @@ cluster_cold_typed_top_tx_loser_producer_v1(
 	 * for those inputs. This does not establish checkpoint coverage,
 	 * atomic transaction effects or old-writer isolation. */
 	if (!cluster_cold_typed_tt_redo_inventory_v1(typed)
-		|| !cold_top_tx_frames_v1(typed, &post_slot.key, &page_effects))
+		|| !cold_top_tx_frames_v1(typed, &post_slot.key, &canonical_effects))
 		return false;
 	/* Exact native bytes alone do not bind a nonempty ACTIVE chain to this
 	 * physical TT slot. Reuse the original reader/graph on retained members;
@@ -1252,13 +1261,13 @@ cluster_cold_typed_top_tx_loser_producer_v1(
 	 * that fact. Atomic transaction effects remain an independent proof. */
 	qualified.sealed_redo = true;
 	/* A completed route alone cannot attribute another top's pre-checkpoint
-	 * effects. Require either this exact PAGE actor or an independently proved
+	 * effects. Require either this exact PAGE/UNDO actor or an independently proved
 	 * fresh native lifecycle wholly inside the completed cut. Keep empty-only
 	 * qualification separate; neither an empty old head nor caller bits suffice. */
 	physical_effects = cluster_cold_typed_effects_nonempty_for_participant_v1(typed, participant);
 	qualified.ordinary_effects
 		= (physical_effects
-		   && (page_effects || cold_top_tx_fresh_effects_v1(typed, participant, &post_slot, true)))
+		   && (canonical_effects || cold_top_tx_fresh_effects_v1(typed, participant, &post_slot, true)))
 		  || cold_top_tx_fresh_effects_v1(typed, participant, &post_slot, false);
 	/* The qualified checkpoint base or retained INIT/REUSE lifecycle reaches
 	 * this exact physical ACTIVE image after completed all-record redo.
