@@ -112,6 +112,7 @@ static void capture_pending(ClusterRecoveryStampCaptureV1 *cut)
 }
 
 bool RecoveryInProgress(void) { return native_recovery; }
+uint64 GetSystemIdentifier(void) { return clusterStartupWriter.claim.identity.system_identifier; }
 uint64 cluster_epoch_get_current(void) { return checkpoint_epoch; }
 bool cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 {
@@ -1233,7 +1234,7 @@ UT_TEST(test_lmon_observes_only_original_recovered_install_without_a_checkpoint_
 
 UT_TEST(test_lmon_observation_rejects_wrong_actor_or_current_input_without_leaking_a_value)
 {
-	for (int fault = 0; fault < 18; fault++) {
+	for (int fault = 0; fault < 19; fault++) {
 		ClusterRecoveryCheckpointObservationV1 observation;
 		reset(); retain(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info)); serving_actor();
 		switch (fault) {
@@ -1255,6 +1256,7 @@ UT_TEST(test_lmon_observation_rejects_wrong_actor_or_current_input_without_leaki
 		case 15: observed_writer.ref.claim.database_incarnation++; break;
 		case 16: observed_writer.ref.claim.max_config_generation++; break;
 		case 17: window_region.checkpoint_owner.valid = false; break;
+		case 18: observed_writer.ref.claim.identity.system_identifier++; break;
 		}
 		memset(&observation, 0xa5, sizeof(observation));
 		UT_ASSERT(!cluster_recovery_checkpoint_observe_v1(&observation));

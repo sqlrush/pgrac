@@ -694,6 +694,7 @@ cluster_recovery_checkpoint_observe_v1(ClusterRecoveryCheckpointObservationV1 *o
 	}
 	SpinLockRelease(&slot->lock);
 	if (observed.slot_generation == 0 || observed.owner.owner_boot == 0
+		|| observed.owner.writer.ref.claim.identity.system_identifier != GetSystemIdentifier()
 		|| cluster_qvotec_get_self_incarnation() != observed.owner.owner_boot
 		|| cluster_epoch_get_current() != observed.owner.writer.epoch
 		|| !cluster_wal_thread_current_v2_ref(&current)
