@@ -8,6 +8,7 @@
  */
 #include "postgres.h"
 
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "cluster/cluster_heap_freeze.h"
 
@@ -667,4 +668,81 @@ cluster_heap_freeze_bind_creation_targets_v1(
 		}
 	}
 	return matched;
+}
+
+bool
+cluster_heap_freeze_prepare_xmin_v1(
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *current_fence,
+	uint16 tuple_index,
+	FullTransactionId original_creator_full_xid,
+	FullTransactionId freeze_limit_full,
+	SCN horizon_scn,
+	HeapTupleFreeze *out)
+{
+	const ClusterHeapFreezeTupleInputV1 *tuple;
+	const ClusterHeapFreezeCarrierRequestV1 *request;
+	HeapTupleFreeze plan;
+
+	/* The caller supplies proven original identity; raw XID cannot supply epoch. */
+	if (out == NULL || !FullTransactionIdIsNormal(original_creator_full_xid)
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(original_creator_full_xid))
+		|| !FullTransactionIdIsNormal(freeze_limit_full)
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(freeze_limit_full))
+		|| !FullTransactionIdPrecedes(original_creator_full_xid, freeze_limit_full)
+		|| !SCN_VALID(horizon_scn)
+		|| freeze_validate_carrier_proofs(page, proofs, current_fence, true)
+			!= CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+		|| page->page_lsn != current_fence->page_lsn
+		|| page->page_version != current_fence->page_version
+		|| tuple_index >= page->tuple_count)
+		return false;
+
+	tuple = &page->tuples[tuple_index];
+	if (!OffsetNumberIsValid(tuple->offset) || tuple->offset > MaxHeapTuplesPerPage
+		|| tuple->tuple_offset < SizeOfPageHeaderData
+		|| tuple->tuple_offset != MAXALIGN(tuple->tuple_offset)
+		|| tuple->tuple_length < SizeofHeapTupleHeader
+		|| tuple->header_length < SizeofHeapTupleHeader
+		|| tuple->header_length > tuple->tuple_length
+		|| (unsigned) tuple->tuple_offset + tuple->tuple_length
+			> BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE
+		|| tuple->raw_xmin != XidFromFullTransactionId(original_creator_full_xid)
+		|| (tuple->infomask & (HEAP_XMIN_INVALID | HEAP_MOVED)) != 0
+		|| !tuple->has_carrier
+		|| tuple->carrier_request_index >= page->carrier_request_count)
+		return false;
+	request = &page->carrier_requests[tuple->carrier_request_index];
+	if (tuple->itl_slot_index != request->locator.itl_slot_index
+		|| memcmp(&tuple->carrier, &request->carrier, sizeof(tuple->carrier)) != 0)
+		return false;
+
+	/* Recheck the physical target; a saved association index is not authority. */
+	for (uint8 index = 0; index < proofs->proof_count; index++)
+	{
+		const ClusterHeapFreezeCanonicalProofV1 *proof = &proofs->proofs[index];
+		const ClusterTxCreationTarget *target = &proof->resolution.local_creation_target;
+
+		if (!freeze_locator_equal_exact(&request->locator, &proof->requested_locator)
+			|| proof->resolution.outcome != CLUSTER_TX_COMMITTED
+			|| !SCN_VALID(proof->resolution.commit_scn)
+			|| scn_time_cmp(proof->resolution.commit_scn, horizon_scn) >= 0
+			|| tuple->raw_xmin != proof->resolution.locator_echo.xid || !target->valid
+			|| !RelFileLocatorEquals(target->locator, page->identity.key.locator)
+			|| target->fork != MAIN_FORKNUM || target->block != page->block
+			|| target->offset != tuple->offset
+			|| (target->tuple_length != 0 && target->tuple_length != tuple->tuple_length))
+			continue;
+
+		/* Native freeze/WAL consumes this plan; xmax/MX remains entirely opaque. */
+		memset(&plan, 0, sizeof(plan));
+		plan.xmax = tuple->raw_xmax;
+		plan.offset = tuple->offset;
+		plan.t_infomask = tuple->infomask | HEAP_XMIN_FROZEN;
+		plan.t_infomask2 = tuple->infomask2;
+		*out = plan;
+		return true;
+	}
+	return false;
 }

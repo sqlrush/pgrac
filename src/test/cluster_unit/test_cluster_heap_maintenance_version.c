@@ -33,7 +33,9 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_control.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_heap_freeze.h"
 #include "cluster/cluster_heap_horizon.h"
+#include "cluster/cluster_scn.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -48,6 +50,7 @@
 #include "test_cluster_heap_maintenance_policy.inc"
 
 UT_DEFINE_GLOBALS();
+#include "test_cluster_heap_small_scn.inc"
 bool cluster_enabled = true, cluster_shared_config = true;
 int cluster_node_id = 0, wal_level = WAL_LEVEL_REPLICA, NBuffers = 1, NLocBuffer;
 char *BufferBlocks;
@@ -568,6 +571,105 @@ UT_TEST(test_qualified_freeze_kernel_changes_only_planned_headers)
 		replay_freeze_record();
 }
 
+UT_TEST(test_exact_xmin_plan_preserves_xmax_through_native_wal_and_redo)
+{
+	const uint16 xmax_masks[] = {
+		HEAP_XMAX_INVALID,
+		HEAP_XMAX_COMMITTED,
+		HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK,
+		HEAP_XMAX_IS_MULTI | HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_KEYSHR_LOCK
+	};
+
+	for (unsigned variant = 0; variant < lengthof(xmax_masks); variant++) {
+		ClusterHeapFreezePageBatchV1 page = { 0 };
+		ClusterHeapFreezeProofBatchV1 proofs = { .proof_count = 1 };
+		ClusterHeapFreezeCanonicalProofV1 *proof = &proofs.proofs[0];
+		ClusterHeapFreezeFinalFenceV1 fence;
+		ClusterHeapFreezeTupleInputV1 *input = &page.tuples[0];
+		HeapTupleFreeze plan;
+		HeapTupleHeader tuple;
+		ItemId item;
+		bool prepared;
+
+		reset(XLOG_HEAP2_FREEZE_PAGE, true);
+		/* The canonical final fence requires an already-persisted page LSN. */
+		PageSetLSN(current_page.data, UINT64_C(0x8000));
+		tuple = freeze_tuple(current_page.data, 1);
+		item = PageGetItemId(current_page.data, 1);
+		HeapTupleHeaderSetXmax(tuple, 88);
+		tuple->t_infomask = HEAP_XMIN_COMMITTED | HEAP_UPDATED | xmax_masks[variant];
+		tuple->t_infomask2 = HEAP_HOT_UPDATED | 7;
+		memcpy(before_page.data, current_page.data, BLCKSZ);
+
+		/* These identities are qualified fixture inputs, not an epoch producer. */
+		fence = (ClusterHeapFreezeFinalFenceV1){
+			.identity = space_identity, .block = 7, .page_lsn = UINT64_C(0x8000), .page_version = 20,
+			.holder_sequence = 11, .master_sequence = 12, .admission_generation = 13 };
+		proof->requested_locator.uba = uba_encode(1, 1, 0, 1);
+		proof->requested_locator.xid = 77;
+		proof->requested_locator.tt_wrap = TT_WRAP_INVALID;
+		proof->requested_locator.itl_kind = ITL_FLAG_ACTIVE;
+		proof->resolution.locator_echo = proof->requested_locator;
+		proof->resolution.locator_echo.tt_wrap = 2;
+		proof->resolution.outcome = CLUSTER_TX_COMMITTED;
+		proof->resolution.proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
+		proof->resolution.commit_scn = 9;
+		proof->resolution.authority.origin_epoch = 1;
+		proof->resolution.authority.live_hwm_lsn = 1;
+		proof->resolution.authority.tt_generation = 1;
+		proof->resolution.authority.authority_scn = 9;
+		proof->resolution.local_canonical_valid = true;
+		proof->resolution.local_canonical_generation = 1;
+		proof->resolution.local_canonical.segment_id = 1;
+		proof->resolution.local_canonical.xid = 77;
+		proof->resolution.local_canonical.wrap = 2;
+		proof->resolution.local_creation_target = (ClusterTxCreationTarget){
+			.locator = relation_data.rd_locator, .fork = MAIN_FORKNUM,
+			.block = 7, .offset = 1, .tuple_length = ItemIdGetLength(item), .valid = true };
+		proof->c1b_finalized = proof->authority_current = proof->admission_current = true;
+		proof->expected_fence = proof->current_fence = fence;
+		page.identity = space_identity;
+		page.block = 7;
+		page.page_lsn = fence.page_lsn;
+		page.page_version = fence.page_version;
+		page.tuple_count = page.carrier_request_count = 1;
+		page.carrier_requests[0].locator = proof->requested_locator;
+		input->offset = 1;
+		input->tuple_offset = ItemIdGetOffset(item);
+		input->tuple_length = ItemIdGetLength(item);
+		input->header_length = tuple->t_hoff;
+		input->raw_xmin = HeapTupleHeaderGetRawXmin(tuple);
+		input->raw_xmax = HeapTupleHeaderGetRawXmax(tuple);
+		input->infomask = tuple->t_infomask;
+		input->infomask2 = tuple->t_infomask2;
+		input->ctid = tuple->t_ctid;
+		input->has_carrier = true;
+		prepared = cluster_heap_freeze_prepare_xmin_v1(&page, &proofs, &fence, 0,
+			FullTransactionIdFromEpochAndXid(1, 77),
+			FullTransactionIdFromEpochAndXid(1, 100), 10, &plan);
+		UT_ASSERT(prepared);
+		if (!prepared)
+			continue;
+		tx_committed = false;
+		heap_freeze_apply_prepared(&relation_data, 1, 70, &plan, 1, &space_identity);
+		check_publication(true);
+		UT_ASSERT_EQ(tx_checks, 0);
+		UT_ASSERT_EQ(freeze_data_calls, 2);
+		UT_ASSERT(HeapTupleHeaderXminFrozen(tuple));
+		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(tuple), 77);
+		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmax(tuple), 88);
+		UT_ASSERT_EQ(tuple->t_infomask,
+			HEAP_XMIN_FROZEN | HEAP_UPDATED | xmax_masks[variant]);
+		UT_ASSERT_EQ(tuple->t_infomask2, HEAP_HOT_UPDATED | 7);
+		UT_ASSERT(memcmp(freeze_tuple(current_page.data, 2),
+			freeze_tuple(before_page.data, 2), 64) == 0);
+		UT_ASSERT(memcmp(freeze_tuple(current_page.data, 3),
+			freeze_tuple(before_page.data, 3), 64) == 0);
+		if (inserts == 1)
+			replay_freeze_record();
+	}
+}
+
 UT_TEST(test_freeze_native_wal_dedup_and_redo)
 {
 	for (int shared = 0; shared <= 1; shared++) {
@@ -950,7 +1052,7 @@ UT_TEST(test_deferred_request_preserves_shared_freeze_restriction)
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(19);
 	UT_RUN(test_prune_native_plan_and_version);
 	UT_RUN(test_shared_freeze_refuses_before_tuple_or_wal);
 	UT_RUN(test_vacuum_native_unused_and_version);
@@ -962,6 +1064,7 @@ main(void)
 	UT_RUN(test_invalid_identity_refuses_before_mutation);
 	UT_RUN(test_freeze_preserves_native_transaction_sanity_gate);
 	UT_RUN(test_qualified_freeze_kernel_changes_only_planned_headers);
+	UT_RUN(test_exact_xmin_plan_preserves_xmax_through_native_wal_and_redo);
 	UT_RUN(test_freeze_native_wal_dedup_and_redo);
 	UT_RUN(test_freeze_kernel_rejects_invalid_space_before_write);
 	UT_RUN(test_vacuum_native_entry_copies_prelock_identity);

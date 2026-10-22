@@ -1985,6 +1985,9 @@ test_cluster_heap_maintenance_identity.inc: $(top_srcdir)/src/backend/access/hea
 
 test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c test_cluster_heap_maintenance_policy.inc unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
+		$(top_srcdir)/src/include/cluster/cluster_scn.h test_cluster_heap_small_scn.inc \
+		$(top_srcdir)/src/include/cluster/cluster_heap_freeze.h \
+		$(top_srcdir)/src/backend/cluster/cluster_heap_freeze.c \
 		test_cluster_heap_maintenance_identity.inc \
 		test_cluster_heap_prune_version.inc test_cluster_heap_prune_helpers.inc \
 		test_cluster_heap_freeze_body.inc test_cluster_heap_freeze_helpers.inc \
@@ -1994,6 +1997,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c t
 		test_cluster_inplace_itemptr_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
+		$(top_srcdir)/src/backend/cluster/cluster_heap_freeze.c \
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		test_cluster_inplace_itemptr_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
@@ -9605,6 +9609,7 @@ test_cluster_vacuum_freeze_locators.inc: $(top_srcdir)/src/backend/cluster/clust
 
 test_cluster_vacuum_shared_mx: test_cluster_vacuum_shared_mx.c test_cluster_heap_maintenance_policy.inc unit_test.h \
 		$(srcdir)/cluster_vacuum_mx_test_stubs.h test_cluster_vacuum_shared_mx.inc test_cluster_vacuum_freeze_locators.inc \
+		$(top_srcdir)/src/include/cluster/cluster_scn.h test_cluster_heap_small_scn.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_heap_freeze.c \
 		$(top_srcdir)/src/include/cluster/cluster_heap_freeze.h \
 		$(top_srcdir)/src/include/cluster/cluster_tx_resolve.h \

@@ -10,6 +10,7 @@
 #define CLUSTER_HEAP_FREEZE_H
 
 #include "access/htup_details.h"
+#include "access/transam.h"
 #include "cluster/cluster_space_identity.h"
 #include "cluster/cluster_tx_resolve.h"
 #include "storage/bufpage.h"
@@ -279,5 +280,30 @@ extern uint16 cluster_heap_freeze_bind_creation_targets_v1(
 	ClusterHeapFreezePageBatchV1 *page,
 	const ClusterHeapFreezeProofBatchV1 *proofs,
 	const ClusterHeapFreezeFinalFenceV1 *current_fence);
+
+struct HeapTupleFreeze;
+
+/*
+ * Build an xmin-only native freeze plan from exact committed creation evidence.
+ * The caller must independently qualify the ORIGINAL creator FullXid, the
+ * FullXid cutoff and H; this helper neither derives their provenance from a raw
+ * XID/current epoch nor grants current ownership, retention or apply authority.
+ * It revalidates the physical target/carrier and final-fence evidence rather
+ * than trusting creation_target_proof_index.  Success preserves raw xmax/MX
+ * and every non-xmin header bit.  Failure leaves *out untouched.
+ *
+ * No production caller may supply these identities until their provenance and
+ * admission contract is closed.  A prepared plan still needs the caller's
+ * synchronous final page/fence comparison before native mutation/WAL.
+ */
+extern bool cluster_heap_freeze_prepare_xmin_v1(
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *current_fence,
+	uint16 tuple_index,
+	FullTransactionId original_creator_full_xid,
+	FullTransactionId freeze_limit_full,
+	SCN horizon_scn,
+	struct HeapTupleFreeze *out);
 
 #endif /* CLUSTER_HEAP_FREEZE_H */

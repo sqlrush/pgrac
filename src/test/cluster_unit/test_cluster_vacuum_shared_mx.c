@@ -29,6 +29,7 @@
 #include "access/xlog.h"
 #include "catalog/pg_control.h"
 #include "cluster/cluster_heap_freeze.h"
+#include "cluster/cluster_scn.h"
 #include "cluster/cluster_space_storage.h"
 #include "commands/progress.h"
 #include "commands/vacuum.h"
@@ -38,6 +39,7 @@
 
 UT_DEFINE_GLOBALS();
 
+#include "test_cluster_heap_small_scn.inc"
 #include "test_cluster_vacuum_freeze_locators.inc"
 
 /* Native wrap comparisons are not the consumer under test. */
@@ -2309,10 +2311,241 @@ UT_TEST(creation_binding_missing_or_malformed_batches_cannot_reuse_old_indexes)
 	}
 }
 
+static bool
+prepare_fixture_xmin(const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *fence, HeapTupleFreeze *out)
+{
+	return cluster_heap_freeze_prepare_xmin_v1(page, proofs, fence, 0,
+		FullTransactionIdFromEpochAndXid(1, 77),
+		FullTransactionIdFromEpochAndXid(1, 100), 10, out);
+}
+
+UT_TEST(xmin_plan_requires_strict_fullxid_and_scn_age)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+	HeapTupleFreeze plan = {0}, saved;
+	FullTransactionId creator = FullTransactionIdFromEpochAndXid(1, 77);
+
+	init_creation_binding_fixture(&page, &proofs, &fence);
+	UT_ASSERT(prepare_fixture_xmin(&page, &proofs, &fence, &plan));
+	memset(&saved, 0xa5, sizeof(saved));
+	for (int variant = 0; variant < 6; variant++) {
+		FullTransactionId cutoff = FullTransactionIdFromEpochAndXid(1, 100);
+		SCN horizon = 10;
+		init_creation_binding_fixture(&page, &proofs, &fence);
+		if (variant == 0) cutoff = creator;
+		if (variant == 1) cutoff = FullTransactionIdFromEpochAndXid(1, 76);
+		if (variant == 2) cutoff = FullTransactionIdFromEpochAndXid(0, UINT32_MAX);
+		if (variant == 3) horizon = 9;
+		if (variant == 4) horizon = 8;
+		if (variant == 5) horizon = 0;
+		plan = saved;
+		UT_ASSERT(!cluster_heap_freeze_prepare_xmin_v1(&page, &proofs, &fence,
+			0, creator, cutoff, horizon, &plan));
+		UT_ASSERT(memcmp(&plan, &saved, sizeof(plan)) == 0);
+	}
+	/* An explicit older epoch is ordered in FullXid space, not raw-XID space. */
+	UT_ASSERT(cluster_heap_freeze_prepare_xmin_v1(&page, &proofs, &fence, 0,
+		FullTransactionIdFromEpochAndXid(0, 77),
+		FullTransactionIdFromEpochAndXid(1, 3), 10, &plan));
+}
+
+UT_TEST(xmin_plan_compares_scn_time_without_node_id_ordering)
+{
+	const struct {
+		NodeId commit_node, horizon_node;
+		uint64 commit_time, horizon_time;
+		bool expected;
+	} cases[] = {
+		{1, 2, 11, 10, false},
+		{1, 2, 10, 10, false},
+		{2, 1, 9, 10, true},
+		{2, 1, 10, 10, false},
+		{2, 1, 11, 10, false},
+		{1, 2, 9, 10, true}
+	};
+
+	for (unsigned index = 0; index < lengthof(cases); index++) {
+		ClusterHeapFreezePageBatchV1 page;
+		ClusterHeapFreezeProofBatchV1 proofs;
+		ClusterHeapFreezeFinalFenceV1 fence;
+		HeapTupleFreeze plan, saved;
+		bool prepared;
+
+		init_creation_binding_fixture(&page, &proofs, &fence);
+		proofs.proofs[0].resolution.commit_scn =
+			scn_encode(cases[index].commit_node, cases[index].commit_time);
+		proofs.proofs[0].resolution.authority.authority_scn =
+			proofs.proofs[0].resolution.commit_scn;
+		memset(&saved, 0xa5, sizeof(saved));
+		plan = saved;
+		prepared = cluster_heap_freeze_prepare_xmin_v1(&page, &proofs, &fence, 0,
+			FullTransactionIdFromEpochAndXid(1, 77),
+			FullTransactionIdFromEpochAndXid(1, 100),
+			scn_encode(cases[index].horizon_node, cases[index].horizon_time), &plan);
+		UT_ASSERT_EQ(prepared, cases[index].expected);
+		if (!cases[index].expected)
+			UT_ASSERT(memcmp(&plan, &saved, sizeof(plan)) == 0);
+		else if (prepared)
+			UT_ASSERT_EQ(plan.t_infomask, page.tuples[0].infomask | HEAP_XMIN_FROZEN);
+	}
+}
+
+UT_TEST(xmin_plan_preserves_xmax_multi_and_other_header_bits)
+{
+	const uint16 masks[] = {
+		HEAP_XMAX_INVALID, HEAP_XMAX_COMMITTED,
+		HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK,
+		HEAP_XMAX_IS_MULTI | HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_KEYSHR_LOCK,
+		HEAP_XMAX_IS_MULTI | HEAP_XMAX_COMMITTED
+	};
+	for (unsigned index = 0; index < lengthof(masks); index++) {
+		ClusterHeapFreezePageBatchV1 page;
+		ClusterHeapFreezeProofBatchV1 proofs;
+		ClusterHeapFreezeFinalFenceV1 fence;
+		HeapTupleFreeze plan = {0};
+		init_creation_binding_fixture(&page, &proofs, &fence);
+		page.tuples[0].raw_xmax = 88;
+		page.tuples[0].infomask = masks[index] | HEAP_HASNULL | HEAP_UPDATED;
+		page.tuples[0].infomask2 = HEAP_HOT_UPDATED | HEAP_ONLY_TUPLE | 7;
+		UT_ASSERT(prepare_fixture_xmin(&page, &proofs, &fence, &plan));
+		UT_ASSERT_EQ(plan.offset, 1);
+		UT_ASSERT_EQ(plan.xmax, 88);
+		UT_ASSERT_EQ(plan.t_infomask, page.tuples[0].infomask | HEAP_XMIN_FROZEN);
+		UT_ASSERT_EQ(plan.t_infomask2, page.tuples[0].infomask2);
+		UT_ASSERT_EQ(plan.frzflags, 0);
+		UT_ASSERT_EQ(plan.checkflags, 0);
+	}
+}
+
+UT_TEST(xmin_plan_revalidates_physical_target_instead_of_old_binding)
+{
+	for (int variant = 0; variant < 13; variant++) {
+		ClusterHeapFreezePageBatchV1 page;
+		ClusterHeapFreezeProofBatchV1 proofs;
+		ClusterHeapFreezeFinalFenceV1 fence;
+		HeapTupleFreeze plan, saved;
+		init_creation_binding_fixture(&page, &proofs, &fence);
+		memset(&saved, 0x5a, sizeof(saved));
+		plan = saved;
+		switch (variant) {
+		case 0: proofs.proofs[0].resolution.local_creation_target.offset = 2; break;
+		case 1: proofs.proofs[0].resolution.local_creation_target.valid = false; break;
+		case 2: proofs.proofs[0].resolution.local_creation_target.locator.relNumber++; break;
+		case 3: proofs.proofs[0].resolution.local_creation_target.fork = FSM_FORKNUM; break;
+		case 4: proofs.proofs[0].resolution.local_creation_target.block++; break;
+		case 5: proofs.proofs[0].resolution.local_creation_target.tuple_length++; break;
+		case 6: page.tuples[0].carrier.wrap++; break;
+		case 7: page.tuples[0].has_carrier = false; break;
+		case 8: page.tuples[0].carrier_request_index = CLUSTER_HEAP_FREEZE_NO_CARRIER_REQUEST; break;
+		case 9: page.tuples[0].itl_slot_index++; break;
+		case 10: page.tuples[0].tuple_offset = BLCKSZ; break;
+		case 11: page.tuples[0].header_length = 0; break;
+		case 12: page.tuples[0].raw_xmin++; break;
+		}
+		UT_ASSERT(!prepare_fixture_xmin(&page, &proofs, &fence, &plan));
+		UT_ASSERT(memcmp(&plan, &saved, sizeof(plan)) == 0);
+	}
+	{
+		ClusterHeapFreezePageBatchV1 page;
+		ClusterHeapFreezeProofBatchV1 proofs;
+		ClusterHeapFreezeFinalFenceV1 fence;
+		HeapTupleFreeze plan = {0};
+		init_creation_binding_fixture(&page, &proofs, &fence);
+		page.tuples[0].creation_target_proof_index = CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET;
+		UT_ASSERT(prepare_fixture_xmin(&page, &proofs, &fence, &plan));
+		/* The other physical row has the same raw XID and carrier, but no target. */
+		UT_ASSERT(!cluster_heap_freeze_prepare_xmin_v1(&page, &proofs, &fence, 1,
+			FullTransactionIdFromEpochAndXid(1, 77),
+			FullTransactionIdFromEpochAndXid(1, 100), 10, &plan));
+	}
+}
+
+UT_TEST(xmin_plan_rejects_incomplete_proof_and_changed_final_fence)
+{
+	for (int variant = 0; variant < 14; variant++) {
+		ClusterHeapFreezePageBatchV1 page;
+		ClusterHeapFreezeProofBatchV1 proofs;
+		ClusterHeapFreezeFinalFenceV1 fence;
+		HeapTupleFreeze plan, saved;
+		init_creation_binding_fixture(&page, &proofs, &fence);
+		memset(&saved, 0x5a, sizeof(saved));
+		plan = saved;
+		switch (variant) {
+		case 0: proofs.proofs[0].c1b_finalized = false; break;
+		case 1: proofs.proofs[0].authority_current = false; break;
+		case 2: proofs.proofs[0].admission_current = false; break;
+		case 3: proofs.proofs[0].resolution.outcome = CLUSTER_TX_IN_PROGRESS; break;
+		case 4: proofs.proofs[0].resolution.outcome = CLUSTER_TX_ABORTED;
+			proofs.proofs[0].resolution.commit_scn = 0; break;
+		case 5: proofs.proofs[0].resolution.commit_scn = 0; break;
+		case 6: proofs.proofs[0].resolution.local_canonical_valid = false; break;
+		case 7: proofs.proof_count = 0; break;
+		case 8: page.carrier_request_count = 2; break;
+		case 9: fence.holder_sequence++; break;
+		case 10: fence.master_sequence++; break;
+		case 11: fence.admission_generation++; break;
+		case 12: page.page_lsn++; break;
+		case 13: page.page_version++; break;
+		}
+		UT_ASSERT(!prepare_fixture_xmin(&page, &proofs, &fence, &plan));
+		UT_ASSERT(memcmp(&plan, &saved, sizeof(plan)) == 0);
+	}
+}
+
+UT_TEST(xmin_plan_rejects_special_raw_fullxids_and_legacy_xmin_states)
+{
+	for (int variant = 0; variant < 11; variant++) {
+		ClusterHeapFreezePageBatchV1 page;
+		ClusterHeapFreezeProofBatchV1 proofs;
+		ClusterHeapFreezeFinalFenceV1 fence;
+		HeapTupleFreeze plan, saved;
+		FullTransactionId creator = FullTransactionIdFromEpochAndXid(1, 77);
+		FullTransactionId cutoff = FullTransactionIdFromEpochAndXid(1, 100);
+		init_creation_binding_fixture(&page, &proofs, &fence);
+		memset(&saved, 0x5a, sizeof(saved));
+		plan = saved;
+		if (variant < 3) creator = FullTransactionIdFromEpochAndXid(1, variant);
+		if (variant >= 3 && variant < 6) cutoff = FullTransactionIdFromEpochAndXid(2, variant - 3);
+		if (variant == 6) creator = FullTransactionIdFromEpochAndXid(1, 78);
+		if (variant == 7) page.tuples[0].infomask = HEAP_XMIN_FROZEN;
+		if (variant == 8) page.tuples[0].infomask = HEAP_XMIN_INVALID;
+		if (variant == 9) page.tuples[0].infomask = HEAP_MOVED_OFF;
+		if (variant == 10) page.tuples[0].infomask = HEAP_MOVED_IN;
+		UT_ASSERT(!cluster_heap_freeze_prepare_xmin_v1(&page, &proofs, &fence,
+			0, creator, cutoff, 10, &plan));
+		UT_ASSERT(memcmp(&plan, &saved, sizeof(plan)) == 0);
+	}
+}
+
+UT_TEST(xmin_plan_missing_arguments_and_bad_bounds_leave_output_untouched)
+{
+	for (int variant = 0; variant < 7; variant++) {
+		ClusterHeapFreezePageBatchV1 page;
+		ClusterHeapFreezeProofBatchV1 proofs;
+		ClusterHeapFreezeFinalFenceV1 fence;
+		HeapTupleFreeze plan, saved;
+		init_creation_binding_fixture(&page, &proofs, &fence);
+		memset(&saved, 0x5a, sizeof(saved));
+		plan = saved;
+		if (variant == 4) page.tuple_count = MaxHeapTuplesPerPage + 1;
+		if (variant == 5) proofs.proof_count = CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH + 1;
+		UT_ASSERT(!cluster_heap_freeze_prepare_xmin_v1(variant == 0 ? NULL : &page,
+			variant == 1 ? NULL : &proofs, variant == 2 ? NULL : &fence,
+			variant == 6 ? page.tuple_count : 0,
+			FullTransactionIdFromEpochAndXid(1, 77),
+			FullTransactionIdFromEpochAndXid(1, 100), 10, variant == 3 ? NULL : &plan));
+		UT_ASSERT(memcmp(&plan, &saved, sizeof(plan)) == 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(71);
+	UT_PLAN(78);
 	UT_RUN(share_scan_preserves_every_reference_before_native_consumer);
 	UT_RUN(cleanup_scan_preserves_before_prune_and_freeze);
 	UT_RUN(raw_multi_value_never_selects_local_reader);
@@ -2384,6 +2617,13 @@ main(void)
 	UT_RUN(creation_binding_keeps_own_carrier_and_proof_order);
 	UT_RUN(creation_binding_rejects_incomplete_or_changed_evidence_and_resets_rows);
 	UT_RUN(creation_binding_missing_or_malformed_batches_cannot_reuse_old_indexes);
+	UT_RUN(xmin_plan_requires_strict_fullxid_and_scn_age);
+	UT_RUN(xmin_plan_compares_scn_time_without_node_id_ordering);
+	UT_RUN(xmin_plan_preserves_xmax_multi_and_other_header_bits);
+	UT_RUN(xmin_plan_revalidates_physical_target_instead_of_old_binding);
+	UT_RUN(xmin_plan_rejects_incomplete_proof_and_changed_final_fence);
+	UT_RUN(xmin_plan_rejects_special_raw_fullxids_and_legacy_xmin_states);
+	UT_RUN(xmin_plan_missing_arguments_and_bad_bounds_leave_output_untouched);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
