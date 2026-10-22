@@ -4,3 +4,9 @@
 2026-10-23 05:50 CST | E | added deterministic service-side CONTENT_LOCK BUSY defer source guard test; next run python fixture and commit/push.
 2026-10-23 05:55 CST | E | fixed CONTENT_LOCK BUSY source guard assertions for finish/deferred and retained-drain paths; next run deterministic test and inspect diff.
 2026-10-23 05:57 CST | E | corrected retained-drain trace assertion to guard_capture helper; next run source guard and diff checks.
+2026-10-23 06:00 added cluster_wait_tail_diagnostic.py deterministic 20-round two-node fixture; next wire existing retransmit/TX/PCM counter snapshots and wait-event labels.
+2026-10-23 06:01 added counter delta and wait-event labels to cluster_wait_tail_diagnostic.py; next bind the fixture to existing source counter symbols and tests.
+2026-10-23 06:02 bound the fixture to retransmit/TX/PCM source symbols and added inventory assertions; next inspect existing harness APIs and replace placeholders with real snapshots.
+2026-10-23 06:03 marked diagnostic fixture as offline-only while preparing injected counter snapshots; next inspect current file and replace the synthetic reader safely.
+2026-10-23 06:05 replaced fixture with injected snapshot reader, production counter inventory, and explicit 20-round wait samples; next run it and focused existing counter tests.
+2026-10-23 06:07 CST | E | added FixtureCounterReader and injected counter-delta assertions to cluster_wait_tail_diagnostic.py; next run fixture and focused retransmit/PCM/TX tests.
