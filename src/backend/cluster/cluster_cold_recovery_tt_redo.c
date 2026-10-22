@@ -22,6 +22,7 @@
 #include "catalog/pg_control.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_recovery_undo_scan.h"
+#include "cluster/cluster_rf_route.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_wal_tail.h"
@@ -760,14 +761,17 @@ cold_top_tx_empty_bind_prefix_v1(const RfSideOnlinePlanV1 *plan, uint32 previous
 		   && UBA_is_invalid(slot->first_undo_block);
 }
 
-/* Restricted positive no-effects proof, not a general WAL effects classifier.
- * Match the complete all-source transcript one-for-one to original SIDE work;
- * PAGE/SPACE, unmatched cursor records and every unclassified operation refuse.
- * A unique replay BIND must start from UNUSED in its native causal prefix.
- * Nonempty transactions still require their independent ordinary-effects proof. */
+/* Establish a complete fresh lifecycle from the original native UNUSED image,
+ * not from the final head or another transaction's PAGE. Match the all-source
+ * transcript to its original PAGE/SIDE owners and require a unique exact BIND.
+ * The completed physical-effects receipt also permits an already retained
+ * history prefix; the restricted empty-only proof still requires replay BIND.
+ * With that independent receipt, every later input
+ * has its original replay owner. Without it, retain the restricted empty-only
+ * classifier: PAGE/SPACE, nonempty heads and unclassified operations refuse. */
 static bool
-cold_top_tx_empty_effects_v1(const ClusterColdTypedV1 *typed, uint32 participant,
-							   const ClusterColdTtSlotInputV1 *active)
+cold_top_tx_fresh_effects_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+							   const ClusterColdTtSlotInputV1 *active, bool physical_effects)
 {
 	const ClusterColdTtSlotKeyV1 *key = &active->key;
 	uint32 counts[CLUSTER_COLD_MAX_PARTICIPANTS];
@@ -775,7 +779,7 @@ cold_top_tx_empty_effects_v1(const ClusterColdTypedV1 *typed, uint32 participant
 	uint32 count, previous = UINT32_MAX;
 	bool found = false;
 
-	if (!UBA_is_invalid(active->slot.first_undo_block)
+	if ((!physical_effects && !UBA_is_invalid(active->slot.first_undo_block))
 		|| !cluster_cold_plan_input_frame_count_v1(typed->plan, &count))
 		return false;
 	for (uint32 p = 0; p < typed->participant_count; p++) {
@@ -790,9 +794,21 @@ cold_top_tx_empty_effects_v1(const ClusterColdTypedV1 *typed, uint32 participant
 		uint32 p, index;
 
 		if (!cluster_cold_plan_input_frame_v1(typed->plan, i, &frame)
-			|| frame.participant >= typed->participant_count || frame.page_components != 0
-			|| frame.space_effects != 0)
+			|| frame.participant >= typed->participant_count
+			|| (!physical_effects && (frame.page_components != 0 || frame.space_effects != 0)))
 			return false;
+		/* PAGE-only records have their original codec owner and deliberately
+		 * consume no SIDE operation. The completed physical receipt covers
+		 * them; SIDE-owned PAGE/SPACE compounds must still pair below. */
+		if (physical_effects && frame.page_components != 0 && frame.space_effects == 0) {
+			RfOpcodeRouteV1 route;
+
+			if (rf_opcode_route_lookup_v1(frame.rmid, frame.info, true, true, &route)
+				!= RF_OPCODE_ROUTE_OK)
+				return false;
+			if (route.record_owner == RF_ROUTE_OWNER_PAGE_CODEC)
+				continue;
+		}
 		p = frame.participant;
 		index = positions[p];
 		if (index >= counts[p]
@@ -810,14 +826,16 @@ cold_top_tx_empty_effects_v1(const ClusterColdTypedV1 *typed, uint32 participant
 		if (operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
 			&& frame.rmid == RM_XLOG_ID && (frame.info & ~XLR_INFO_MASK) == XLOG_NOOP)
 			continue;
-		if (operation.kind != RF_SIDE_ONLINE_OPERATION_UNDO || frame.rmid != RM_CLUSTER_UNDO_ID
-			|| (undo->kind != CLUSTER_UNDO_KIND_SEGMENT_INIT
-				&& undo->kind != CLUSTER_UNDO_KIND_SEGMENT_REUSE
-				&& undo->kind != CLUSTER_UNDO_KIND_TT_BIND))
+		if (!physical_effects
+			&& (operation.kind != RF_SIDE_ONLINE_OPERATION_UNDO || frame.rmid != RM_CLUSTER_UNDO_ID
+				|| (undo->kind != CLUSTER_UNDO_KIND_SEGMENT_INIT
+					&& undo->kind != CLUSTER_UNDO_KIND_SEGMENT_REUSE
+					&& undo->kind != CLUSTER_UNDO_KIND_TT_BIND)))
 			return false;
-		if (undo->kind == CLUSTER_UNDO_KIND_TT_BIND && undo->instance == key->owner_instance
+		if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
+			&& undo->kind == CLUSTER_UNDO_KIND_TT_BIND && undo->instance == key->owner_instance
 			&& undo->xid == key->xid) {
-			if (found || p != participant || operation.history_only
+			if (found || p != participant || (!physical_effects && operation.history_only)
 				|| undo->format_version != CLUSTER_UNDO_TT_BIND_VERSION
 				|| undo->segment_id != key->segment_id
 				|| undo->expected_generation != key->segment_generation
@@ -827,7 +845,8 @@ cold_top_tx_empty_effects_v1(const ClusterColdTypedV1 *typed, uint32 participant
 			}
 			found = true;
 		}
-		if (p == participant && undo->instance == key->owner_instance
+		if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
+			&& p == participant && undo->instance == key->owner_instance
 			&& undo->segment_id == key->segment_id)
 			previous = index;
 	}
@@ -926,10 +945,13 @@ cold_top_tx_undo_delta_actor_v1(const ClusterColdTypedV1 *typed, uint32 particip
  * or actor prefix. Old tuple xmin/undo before-images and individual MX
  * members are not qualified here; ordinary_effects remains independent. */
 static bool
-cold_top_tx_frames_v1(const ClusterColdTypedV1 *typed)
+cold_top_tx_frames_v1(const ClusterColdTypedV1 *typed, const ClusterColdTtSlotKeyV1 *key,
+					 bool *page_effects)
 {
 	uint32 count;
+	bool matched = false;
 
+	*page_effects = false;
 	if (!cluster_cold_plan_input_frame_count_v1(typed->plan, &count))
 		return false;
 	for (uint32 i = 0; i < count; i++) {
@@ -971,11 +993,15 @@ cold_top_tx_frames_v1(const ClusterColdTypedV1 *typed)
 
 			if (!cluster_cold_typed_page_creator_v1(typed, i, &input))
 				return false;
+			if (cold_top_tx_key_equal_v1(&input.key, key))
+				matched = true;
 		} else if (actor) {
 			ClusterColdPageActorV1 input;
 
 			if (!cluster_cold_typed_page_actor_v1(typed, i, &input))
 				return false;
+			if (cold_top_tx_key_equal_v1(&input.key, key))
+				matched = true;
 		}
 	}
 	for (uint32 p = 0; p < typed->participant_count; p++) {
@@ -1014,6 +1040,7 @@ cold_top_tx_frames_v1(const ClusterColdTypedV1 *typed)
 				return false;
 		}
 	}
+	*page_effects = matched;
 	return true;
 }
 
@@ -1155,6 +1182,7 @@ cluster_cold_typed_top_tx_loser_producer_v1(
 	ClusterColdTtSlotInputV1 post_slot;
 	uint32 post_segment_index;
 	bool checkpoint_base;
+	bool page_effects, physical_effects;
 
 	if (out == NULL)
 		return false;
@@ -1186,7 +1214,8 @@ cluster_cold_typed_top_tx_loser_producer_v1(
 	 * the complete ordinary inventory rather than trusting the proof flags
 	 * for those inputs. This does not establish checkpoint coverage,
 	 * atomic transaction effects or old-writer isolation. */
-	if (!cluster_cold_typed_tt_redo_inventory_v1(typed) || !cold_top_tx_frames_v1(typed))
+	if (!cluster_cold_typed_tt_redo_inventory_v1(typed)
+		|| !cold_top_tx_frames_v1(typed, &post_slot.key, &page_effects))
 		return false;
 	/* Exact native bytes alone do not bind a nonempty ACTIVE chain to this
 	 * physical TT slot. Reuse the original reader/graph on retained members;
@@ -1222,13 +1251,15 @@ cluster_cold_typed_top_tx_loser_producer_v1(
 	 * establish completed sealed redo. The caller's bit cannot add or revoke
 	 * that fact. Atomic transaction effects remain an independent proof. */
 	qualified.sealed_redo = true;
-	/* Nonempty ordinary effects require a completed sealed receipt carrying a
-	 * real PAGE/FSM/SPACE route. The caller's bit is never production
-	 * evidence. A fresh empty top has its separate native proof; an old ACTIVE
-	 * or unclassified input cannot enter that branch. */
+	/* A completed route alone cannot attribute another top's pre-checkpoint
+	 * effects. Require either this exact PAGE actor or an independently proved
+	 * fresh native lifecycle wholly inside the completed cut. Keep empty-only
+	 * qualification separate; neither an empty old head nor caller bits suffice. */
+	physical_effects = cluster_cold_typed_effects_nonempty_for_participant_v1(typed, participant);
 	qualified.ordinary_effects
-		= cluster_cold_typed_effects_nonempty_for_participant_v1(typed, participant)
-		  || cold_top_tx_empty_effects_v1(typed, participant, &post_slot);
+		= (physical_effects
+		   && (page_effects || cold_top_tx_fresh_effects_v1(typed, participant, &post_slot, true)))
+		  || cold_top_tx_fresh_effects_v1(typed, participant, &post_slot, false);
 	/* The qualified checkpoint base or retained INIT/REUSE lifecycle reaches
 	 * this exact physical ACTIVE image after completed all-record redo.
 	 * Together with the full retained terminal check, this supplies both

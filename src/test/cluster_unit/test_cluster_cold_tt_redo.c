@@ -4136,13 +4136,15 @@ enum {
 	TT_PAGE_CREATOR_HISTORY_PREFIX,
 	TT_PAGE_CREATOR_HISTORY_PREFIX_LATE_COMMIT,
 	TT_PAGE_CREATOR_NO_INIT,
+	TT_PAGE_CREATOR_DUPLICATE_CANDIDATE,
 	TT_PAGE_CHECKPOINT,
 	TT_PAGE_CHECKPOINT_LEGACY,
 	TT_PAGE_CHECKPOINT_CORRUPT,
 	TT_PAGE_CHECKPOINT_DUPLICATE,
 	TT_PAGE_CHECKPOINT_COMMIT,
 	TT_PAGE_CHECKPOINT_REUSE,
-	TT_PAGE_CHECKPOINT_LATE_COMMIT
+	TT_PAGE_CHECKPOINT_LATE_COMMIT,
+	TT_PAGE_CHECKPOINT_EFFECTS
 };
 
 static bool
@@ -4190,6 +4192,8 @@ tt_page_input_fixture(TtRedoFixture *f, uint8 rmid, uint8 info, TransactionId xi
 		UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)f->base.data;
 
 		/* This original checkpoint slot has no retained INIT or BIND. */
+		if (variant == TT_PAGE_CHECKPOINT_EFFECTS)
+			header->tt_slots[47].first_undo_block = (UBA)InvalidUba_init;
 		if (variant == TT_PAGE_CHECKPOINT_DUPLICATE) {
 			header->tt_slots[46] = header->tt_slots[4];
 			header->tt_slots[46].wrap++;
@@ -4219,6 +4223,8 @@ tt_page_input_fixture(TtRedoFixture *f, uint8 rmid, uint8 info, TransactionId xi
 		undo_header_commit(&fake, 0, 802);
 	else if (variant == TT_PAGE_CREATOR_DUPLICATE_BIND)
 		tt_top_tx_frame_bind(&fake, 47, 802, 802, 802);
+	else if (variant == TT_PAGE_CREATOR_DUPLICATE_CANDIDATE)
+		tt_top_tx_frame_bind(&fake, 6, 806, 806, 806);
 	else if (variant == TT_PAGE_CREATOR_EARLY_REUSE || variant == TT_PAGE_CHECKPOINT_REUSE) {
 		struct {
 			xl_undo_segment_reuse record;
@@ -4709,8 +4715,8 @@ UT_TEST(tt_page_actor_requires_sealed_original_sources_and_clears_output)
  * DATA observation and completed physical application remain boundaries;
  * a caller's true ordinary_effects bit must not conceal missing ownership. */
 static void
-tt_top_tx_page_binding_expect(uint8 rmid, uint8 info, int variant, TransactionId xid,
-							  TransactionId top, bool accepted)
+tt_top_tx_page_binding_slot_expect(uint8 rmid, uint8 info, int variant, TransactionId xid,
+								   TransactionId top, uint16 candidate_slot, bool accepted)
 {
 	TtRedoFixture f;
 	ClusterColdEffectsProofV1 effects = { 0 };
@@ -4722,18 +4728,14 @@ tt_top_tx_page_binding_expect(uint8 rmid, uint8 info, int variant, TransactionId
 	ClusterColdTopTxProofV1 proof;
 	ClusterRecoveryTTAbortV1 shape;
 	ClusterColdTopTxC0ProducerResultV1 out, zero = { 0 };
-	uint16 candidate_slot = variant == TT_PAGE_CREATOR_LATE_BIND
-									|| variant == TT_PAGE_CREATOR_LATE_COMMIT
-									|| variant == TT_PAGE_CREATOR_HISTORY_PREFIX_LATE_COMMIT
-								? 47
-								: 6;
-	TransactionId candidate_xid = candidate_slot == 47 ? 804 : 806;
+	TransactionId candidate_xid = candidate_slot == 4 ? 802 : candidate_slot == 47 ? 804 : 806;
 	uint32 count;
 
 	tt_page_input_fixture(&f, rmid, info, xid, top, variant, false, 999, XLHL_XMAX_IS_MULTI);
 	/* The complete retained INIT creates this segment; the original disk
 	 * snapshot must be empty rather than the input-only fixture's old TT. */
-	tt_post_readback_empty_original(&f);
+	if (variant < TT_PAGE_CHECKPOINT)
+		tt_post_readback_empty_original(&f);
 	tt_top_tx_write_fold(&f);
 	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
 	UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, candidate_slot, &input));
@@ -4790,6 +4792,44 @@ tt_top_tx_page_binding_expect(uint8 rmid, uint8 info, int variant, TransactionId
 	} else
 		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 	tt_redo_destroy(&f);
+}
+
+static void
+tt_top_tx_page_binding_expect(uint8 rmid, uint8 info, int variant, TransactionId xid,
+							  TransactionId top, bool accepted)
+{
+	uint16 candidate_slot = variant == TT_PAGE_CREATOR_LATE_BIND
+									|| variant == TT_PAGE_CREATOR_LATE_COMMIT
+									|| variant == TT_PAGE_CREATOR_HISTORY_PREFIX_LATE_COMMIT
+								? 47
+								: 6;
+
+	tt_top_tx_page_binding_slot_expect(rmid, info, variant, xid, top, candidate_slot, accepted);
+}
+
+UT_TEST(tt_top_tx_checkpoint_page_effects_require_the_selected_canonical_actor)
+{
+	const uint8 rmids[] = { RM_HEAP_ID, RM_HEAP_ID, RM_HEAP_ID, RM_HEAP2_ID,
+							RM_HEAP_ID, RM_HEAP_ID, RM_HEAP2_ID };
+	const uint8 infos[] = { XLOG_HEAP_INSERT, XLOG_HEAP_UPDATE, XLOG_HEAP_HOT_UPDATE,
+		XLOG_HEAP2_MULTI_INSERT, XLOG_HEAP_DELETE, XLOG_HEAP_LOCK, XLOG_HEAP2_LOCK_UPDATED };
+
+	for (unsigned i = 0; i < lengthof(infos); i++) {
+		/* Both slots are original CRC-valid checkpoint ACTIVE inputs. 802's
+		 * PAGE owner cannot attest to 804's unknown pre-checkpoint effects. */
+		tt_top_tx_page_binding_slot_expect(rmids[i], infos[i], TT_PAGE_CHECKPOINT_EFFECTS, 802,
+										  InvalidTransactionId, 4, true);
+		tt_top_tx_page_binding_slot_expect(rmids[i], infos[i], TT_PAGE_CHECKPOINT_EFFECTS, 802,
+										  InvalidTransactionId, 47, false);
+	}
+}
+
+UT_TEST(tt_top_tx_nonempty_fresh_effects_require_a_unique_native_birth)
+{
+	/* PAGE 802 is independent of candidate 806. Its completed route cannot
+	 * turn two candidate BINDs into an independently proved fresh lifecycle. */
+	tt_top_tx_page_binding_expect(RM_HEAP_ID, XLOG_HEAP_INSERT,
+								 TT_PAGE_CREATOR_DUPLICATE_CANDIDATE, 802, 802, false);
 }
 
 static void
@@ -5272,6 +5312,8 @@ tt_top_tx_page_space_frame_expect(bool space, bool history, int mode)
 			native.record.rmid = op.identity.record.rmid;
 			native.record.info = op.identity.record.info;
 			native.record.scn = op.control_scn;
+			native.record.source_xid = op.source_xid;
+			native.record.source_top_xid = op.source_top_xid;
 			UT_ASSERT_EQ(cluster_cold_plan_feed_v1(f.typed.plan, p, &native.record),
 						 CLUSTER_COLD_OK);
 			prev = native.record.read_rec_ptr;
@@ -8511,7 +8553,7 @@ UT_TEST(tt_top_tx_census_budget_and_oom_never_publish_a_partial_list)
 int
 main(void)
 {
-	UT_PLAN(180);
+	UT_PLAN(182);
 	UT_RUN(tt_top_tx_census_consumes_native_empty_loser_without_c0_fields);
 	UT_RUN(tt_top_tx_census_retains_all_unproven_active_slots);
 	UT_RUN(tt_top_tx_census_clears_prior_input_on_incomplete_cut);
@@ -8542,6 +8584,8 @@ main(void)
 	UT_RUN(tt_top_tx_c0_producer_checks_original_undo_delta_actor);
 	UT_RUN(tt_top_tx_c0_producer_checks_original_undo_multi_delta_actor);
 	UT_RUN(tt_top_tx_c0_producer_requires_each_replay_page_creator);
+	UT_RUN(tt_top_tx_checkpoint_page_effects_require_the_selected_canonical_actor);
+	UT_RUN(tt_top_tx_nonempty_fresh_effects_require_a_unique_native_birth);
 	UT_RUN(tt_top_tx_c0_producer_requires_each_replay_page_actor);
 	UT_RUN(tt_top_tx_c0_producer_checks_page_frames);
 	UT_RUN(tt_top_tx_c0_producer_checks_replay_cursor_frames);

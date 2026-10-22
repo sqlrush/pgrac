@@ -2961,6 +2961,7 @@ test_cluster_undo_segment_init.o: $(top_srcdir)/src/common/cluster_undo_segment_
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 test_cluster_cold_tt_redo_product.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_tt_redo.c \
 		$(top_srcdir)/src/include/access/heapam_xlog.h \
+		$(top_srcdir)/src/include/cluster/cluster_rf_route.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
