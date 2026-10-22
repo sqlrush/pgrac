@@ -1791,12 +1791,12 @@ cluster_ctrc_active_scan_step(ClusterCtrcActiveScan *scan)
 		 visited < CLUSTER_CTRC_ACTIVE_SCAN_SLICE && scan->next_index < scan->total_entries;
 		 visited++) {
 		ClusterCtrcTxnKeyV1 key;
-		FullTransactionId full;
+		FullTransactionId full = InvalidFullTransactionId;
 		LWLock *lock;
 		uint64 index = scan->next_index;
-		bool occupied, valid;
+		bool occupied, valid, is_origin = index < CtrcShared->origin_key_entries;
 
-		if (index < CtrcShared->origin_key_entries) {
+		if (is_origin) {
 			ClusterCtrcOriginEntry *entry = &ctrc_origin_entries()[index];
 
 			lock = &CtrcShared->origin_lock;
@@ -1806,6 +1806,7 @@ cluster_ctrc_active_scan_step(ClusterCtrcActiveScan *scan)
 			}
 			occupied = !ctrc_bytes_zero(entry, sizeof(*entry));
 			key = entry->key;
+			full = entry->original_full_xid;
 			valid = entry->state <= CTRC_ORIGIN_BLOCKED;
 		} else {
 			ClusterCtrcParticipantEntry *entry;
@@ -1828,16 +1829,22 @@ cluster_ctrc_active_scan_step(ClusterCtrcActiveScan *scan)
 		}
 		LWLockRelease(lock);
 		if (occupied) {
-			uint32 distance = key.xid - XidFromFullTransactionId(scan->reference_full);
-
 			if (!valid || !ctrc_txn_key_valid(&key) || !TransactionIdIsNormal(key.xid)
-				|| distance == UINT32_C(0x80000000)
-				|| (distance < UINT32_C(0x80000000)
-					&& U64FromFullTransactionId(scan->reference_full) > UINT64_MAX - distance))
+				|| (is_origin
+					&& (!FullTransactionIdIsNormal(full)
+						|| XidFromFullTransactionId(full) != key.xid)))
 				goto invalid;
-			full = cluster_xid_widen(key.xid, scan->reference_full);
-			if (!FullTransactionIdIsValid(full))
-				goto invalid;
+			if (!is_origin) {
+				uint32 distance = key.xid - XidFromFullTransactionId(scan->reference_full);
+
+				if (distance == UINT32_C(0x80000000)
+					|| (distance < UINT32_C(0x80000000)
+						&& U64FromFullTransactionId(scan->reference_full) > UINT64_MAX - distance))
+					goto invalid;
+				full = cluster_xid_widen(key.xid, scan->reference_full);
+				if (!FullTransactionIdIsValid(full))
+					goto invalid;
+			}
 			if (FullTransactionIdPrecedes(full, scan->min_full))
 				scan->min_full = full;
 		}
@@ -2693,6 +2700,15 @@ cluster_ctrc_origin_reserve_active(const ClusterCtrcTxnKeyV1 *key,
 		LWLockRelease(&CtrcShared->origin_lock);
 		return CLUSTER_CTRC_ORIGIN_RESERVE_RETRY_RELEASED;
 	}
+	if (origin->state == CTRC_ORIGIN_OPEN && memcmp(&origin->key, key, sizeof(*key)) == 0
+		&& (!FullTransactionIdIsNormal(origin->original_full_xid)
+			|| !FullTransactionIdEquals(origin->original_full_xid, top_full))) {
+		/* An OPEN replay must retain the original top identity.  Raw-xid or
+		 * carrier reuse cannot silently become a second origin authority. */
+		CtrcShared->full_refusal_count++;
+		LWLockRelease(&CtrcShared->origin_lock);
+		return CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED;
+	}
 	if (origin->state == CTRC_ORIGIN_OPEN)
 		reservation_generation = origin->reservation_generation;
 	else if (CtrcShared->global_reservation_generation != 0
@@ -2705,6 +2721,8 @@ cluster_ctrc_origin_reserve_active(const ClusterCtrcTxnKeyV1 *key,
 	}
 	result = cluster_ctrc_origin_reserve_entry(origin, key, index, reservation_generation,
 											   reservation);
+	if (result == CLUSTER_CTRC_ORIGIN_RESERVED_PENDING)
+		origin->original_full_xid = top_full;
 	if (result == CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED)
 		CtrcShared->full_refusal_count++;
 	LWLockRelease(&CtrcShared->origin_lock);
@@ -9821,11 +9839,16 @@ ctrc_normal_stop_origin_exact(const ClusterCtrcOriginEntry *origin, uint64 index
 		|| origin->reservation_generation == UINT64_MAX
 		|| !ctrc_bytes_zero(origin->reserved8, sizeof(origin->reserved8)))
 		return false;
+	if (FullTransactionIdIsValid(origin->original_full_xid)
+		&& (!FullTransactionIdIsNormal(origin->original_full_xid)
+			|| XidFromFullTransactionId(origin->original_full_xid) != origin->key.xid))
+		return false;
 	if (origin->state == CTRC_ORIGIN_EMPTY) {
 		ClusterCtrcOriginEntry remainder = *origin;
 
 		MemSet(&remainder.key, 0, sizeof(remainder.key));
 		remainder.reservation_generation = 0;
+		remainder.original_full_xid = InvalidFullTransactionId;
 		return origin->reservation_generation != 0
 			   && ctrc_bytes_zero(&remainder, sizeof(remainder));
 	}

@@ -343,6 +343,8 @@ typedef struct ClusterCtrcCloseDispatch {
 typedef struct ClusterCtrcOriginEntry {
 	ClusterCtrcTxnKeyV1 key;
 	uint64 reservation_generation;
+	/* Volatile original top identity, captured before BIND; never raw-widened. */
+	FullTransactionId original_full_xid;
 	uint32 grant_generation;
 	uint32 touched_bitmap;
 	uint64 seal_generation;

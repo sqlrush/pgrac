@@ -543,6 +543,8 @@ seed_origin(unsigned index, unsigned participants)
 	key.root_generation = 43;
 	if (cluster_ctrc_origin_open_active(origin, &key, 7) != CLUSTER_CTRC_ORIGIN_OPENED)
 		abort();
+	/* Explicit fixture provenance, independent of the later scan reference. */
+	origin->original_full_xid = FullTransactionIdFromEpochAndXid(7, 7001 + index);
 	for (node = 0; node < participants; node++) {
 		identity.node_id = node;
 		identity.boot_incarnation = 1101 + node;
@@ -648,6 +650,8 @@ UT_TEST(test_origin_reserve_protected_pending_can_cancel)
 	UT_ASSERT_EQ(origin->state, CTRC_ORIGIN_EMPTY);
 	UT_ASSERT(origin->reservation_generation != 0);
 	UT_ASSERT(memcmp(&origin->key, &key, sizeof(key)) == 0);
+	UT_ASSERT_EQ(U64FromFullTransactionId(origin->original_full_xid),
+				 U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(7, 7001)));
 	UT_ASSERT(cluster_ctrc_origin_cancel_pre_bind(&reservation));
 	UT_ASSERT(ctrc_bytes_zero(origin, sizeof(*origin)));
 }
@@ -683,6 +687,52 @@ UT_TEST(test_origin_reserve_open_replay_requires_live_original_protection)
 	UT_ASSERT(memcmp(&ctrc_origin_entries()[0], &before, sizeof(before)) == 0);
 	UT_ASSERT(memcmp(CtrcShared, &header_before, sizeof(header_before)) == 0);
 	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_origin_open_replay_refuses_missing_or_conflicting_original_fullxid)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ClusterCtrcTxnKeyV1 key;
+		ClusterCtrcOriginReservation reservation, replay;
+		ClusterCtrcOriginEntry before;
+		uint64 refusals, generation;
+		uint32 grant;
+
+		reset_fixture();
+		key = fresh_origin_key();
+		test_my_proc.xid = key.xid;
+		test_top_full = FullTransactionIdFromEpochAndXid(7, 7001);
+		UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &reservation),
+					 CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+		UT_ASSERT(cluster_ctrc_origin_open_reserved(&reservation, &grant));
+		switch (fault) {
+		case 0:
+			test_top_full = FullTransactionIdFromEpochAndXid(8, 7001);
+			break;
+		case 1:
+			ctrc_origin_entries()[0].original_full_xid = InvalidFullTransactionId;
+			break;
+		case 2:
+			ctrc_origin_entries()[0].original_full_xid =
+				FullTransactionIdFromEpochAndXid(7, FrozenTransactionId);
+			break;
+		case 3:
+			ctrc_origin_entries()[0].original_full_xid =
+				FullTransactionIdFromEpochAndXid(7, 7002);
+			break;
+		}
+		before = ctrc_origin_entries()[0];
+		refusals = CtrcShared->full_refusal_count;
+		generation = CtrcShared->global_reservation_generation;
+		MemSet(&replay, 0xa5, sizeof(replay));
+		UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &replay),
+					 CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED);
+		UT_ASSERT(ctrc_bytes_zero(&replay, sizeof(replay)));
+		UT_ASSERT(memcmp(&ctrc_origin_entries()[0], &before, sizeof(before)) == 0);
+		UT_ASSERT_EQ(CtrcShared->full_refusal_count, refusals + 1);
+		UT_ASSERT_EQ(CtrcShared->global_reservation_generation, generation);
+		UT_ASSERT_EQ(held_count, 0);
+	}
 }
 
 UT_TEST(test_new_seals_do_not_starve_old_pending)
@@ -3016,8 +3066,9 @@ UT_TEST(test_normal_stop_reserved_origin_is_not_empty)
 	reset_fixture();
 	key = seed_origin(3, 0)->key;
 	reset_fixture();
-	UT_ASSERT_EQ(
-		cluster_ctrc_origin_reserve_entry(&ctrc_origin_entries()[3], &key, 3, 99, &reservation),
+	test_my_proc.xid = key.xid;
+	test_top_full = FullTransactionIdFromEpochAndXid(7, key.xid);
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &reservation),
 		CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
 	UT_ASSERT_EQ(ctrc_origin_entries()[3].state, CTRC_ORIGIN_EMPTY);
 	UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(&observed), CLUSTER_NORMAL_STOP_PENDING);
@@ -3025,8 +3076,7 @@ UT_TEST(test_normal_stop_reserved_origin_is_not_empty)
 	UT_ASSERT_EQ(observed.reason, CTRC_STOP_REASON_RESERVED);
 	UT_ASSERT_EQ(observed.object_index, 3);
 	UT_ASSERT_EQ(memcmp(&observed.key, &key, sizeof(key)), 0);
-	UT_ASSERT(
-		cluster_ctrc_origin_cancel_pre_bind_entry(&ctrc_origin_entries()[3], 3, &reservation));
+	UT_ASSERT(cluster_ctrc_origin_cancel_pre_bind(&reservation));
 	UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(&observed), CLUSTER_NORMAL_STOP_READY);
 }
 
@@ -3309,7 +3359,9 @@ UT_TEST(test_active_scan_keeps_reserved_and_all_unretired_origin_states)
 	origin = seed_origin(0, 0);
 	key = origin->key;
 	MemSet(origin, 0, sizeof(*origin));
-	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_entry(origin, &key, 0, 31, &reservation),
+	test_my_proc.xid = key.xid;
+	test_top_full = FullTransactionIdFromEpochAndXid(7, 7001);
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &reservation),
 				 CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
 	UT_ASSERT_EQ(origin->state, CTRC_ORIGIN_EMPTY);
 	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(7, 10000)));
@@ -3359,6 +3411,7 @@ UT_TEST(test_active_scan_busy_lock_retains_exact_position_and_minimum)
 	reset_fixture();
 	seed_origin(0, 0);
 	seed_origin(1, 0)->key.xid = 6001;
+	ctrc_origin_entries()[1].original_full_xid = FullTransactionIdFromEpochAndXid(7, 6001);
 	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(7, 10000)));
 	conditional_refuse_call = 2;
 	cluster_ctrc_active_scan_step(&scan);
@@ -3407,29 +3460,86 @@ UT_TEST(test_active_scan_fresh_begin_discards_previous_partial_sample)
 	UT_ASSERT_EQ(XidFromFullTransactionId(scan.min_full), 11000);
 }
 
-UT_TEST(test_active_scan_widens_old_epoch_and_rejects_unrepresentable_xids)
+UT_TEST(test_active_scan_uses_original_origin_identity_after_pgproc_exit)
+{
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcOriginReservation reservation;
+	ClusterCtrcActiveScan scan;
+	uint32 grant;
+
+	reset_fixture();
+	key = fresh_origin_key();
+	test_my_proc.xid = key.xid;
+	test_top_full = FullTransactionIdFromEpochAndXid(3, 7001);
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &reservation),
+				 CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	UT_ASSERT(cluster_ctrc_origin_open_reserved(&reservation, &grant));
+	test_my_proc.xid = InvalidTransactionId;
+	test_top_full = InvalidFullTransactionId;
+	for (unsigned state = CTRC_ORIGIN_OPEN; state <= CTRC_ORIGIN_BLOCKED; state++) {
+		ctrc_origin_entries()[0].state = state;
+		UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+		finish_active_scan(&scan);
+		UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+		UT_ASSERT_EQ(U64FromFullTransactionId(scan.min_full),
+					 U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(3, 7001)));
+		UT_ASSERT_EQ(held_count, 0);
+	}
+	UT_ASSERT_EQ(top_full_reads, 1);
+	UT_ASSERT_EQ(flush_calls, 0);
+	UT_ASSERT_EQ(durability_calls, 0);
+}
+
+UT_TEST(test_active_scan_refuses_unknown_or_mismatched_origin_fullxid)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterCtrcActiveScan scan;
+		ClusterCtrcOriginEntry *origin;
+		ClusterCtrcOriginEntry before;
+
+		reset_fixture();
+		origin = seed_origin(0, 0);
+		origin->original_full_xid = fault == 0 ? InvalidFullTransactionId
+			: FullTransactionIdFromEpochAndXid(7, fault == 1 ? FrozenTransactionId : 7002);
+		before = *origin;
+		UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+		cluster_ctrc_active_scan_step(&scan);
+		UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_INVALID);
+		UT_ASSERT(!FullTransactionIdIsValid(scan.min_full));
+		UT_ASSERT_EQ(scan.next_index, 0);
+		UT_ASSERT(memcmp(origin, &before, sizeof(before)) == 0);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_active_scan_participant_widens_old_epoch_and_rejects_unrepresentable_xids)
 {
 	ClusterCtrcActiveScan scan;
 	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcParticipantEntry *participant;
 
 	reset_fixture();
 	origin = seed_origin(0, 0);
-	origin->key.xid = UINT32_MAX - 5;
+	participant = &ctrc_participant_entries()[0];
+	participant->key = origin->key;
+	participant->state = CTRC_PARTICIPANT_OPEN;
+	MemSet(origin, 0, sizeof(*origin));
+	participant->key.xid = UINT32_MAX - 5;
 	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(7, 100)));
 	finish_active_scan(&scan);
 	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
 	UT_ASSERT_EQ(U64FromFullTransactionId(scan.min_full),
 				 U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(6, UINT32_MAX - 5)));
-	origin->key.xid = UINT32_C(0x80000000) + 100;
+	participant->key.xid = UINT32_C(0x80000000) + 100;
 	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(7, 100)));
-	cluster_ctrc_active_scan_step(&scan);
+	finish_active_scan(&scan);
 	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_INVALID);
 	UT_ASSERT(!FullTransactionIdIsValid(scan.min_full));
 	UT_ASSERT_EQ(held_count, 0);
-	origin->key.xid = 5;
+	participant->key.xid = 5;
 	UT_ASSERT(cluster_ctrc_active_scan_begin(
 		&scan, FullTransactionIdFromEpochAndXid(UINT32_MAX, UINT32_MAX - 10)));
-	cluster_ctrc_active_scan_step(&scan);
+	finish_active_scan(&scan);
 	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_INVALID);
 	UT_ASSERT(!FullTransactionIdIsValid(scan.min_full));
 	UT_ASSERT_EQ(held_count, 0);
@@ -3442,12 +3552,13 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(78);
+	UT_PLAN(81);
 	printf("# CTRC header_bytes=%zu total_bytes=%zu\n", sizeof(ClusterCtrcSharedHeader),
 		   capacity.total_bytes);
 	UT_RUN(test_origin_reserve_requires_published_local_top_protection);
 	UT_RUN(test_origin_reserve_protected_pending_can_cancel);
 	UT_RUN(test_origin_reserve_open_replay_requires_live_original_protection);
+	UT_RUN(test_origin_open_replay_refuses_missing_or_conflicting_original_fullxid);
 	UT_RUN(test_new_seals_do_not_starve_old_pending);
 	UT_RUN(test_pending_participant_does_not_starve_peer);
 	UT_RUN(test_duplicate_pending_is_accepted_without_wakeup);
@@ -3522,7 +3633,9 @@ main(void)
 	UT_RUN(test_active_scan_busy_lock_retains_exact_position_and_minimum);
 	UT_RUN(test_active_scan_corrupt_empty_entry_invalidates_sample);
 	UT_RUN(test_active_scan_fresh_begin_discards_previous_partial_sample);
-	UT_RUN(test_active_scan_widens_old_epoch_and_rejects_unrepresentable_xids);
+	UT_RUN(test_active_scan_uses_original_origin_identity_after_pgproc_exit);
+	UT_RUN(test_active_scan_refuses_unknown_or_mismatched_origin_fullxid);
+	UT_RUN(test_active_scan_participant_widens_old_epoch_and_rejects_unrepresentable_xids);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
