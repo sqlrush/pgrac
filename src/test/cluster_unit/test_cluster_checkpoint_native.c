@@ -67,9 +67,11 @@ Latch *MyLatch = &latch;
 static LOCKMODE cf_mode;
 static bool local_lock, ref_ok, lock_ok, read_ok, release_ok, fence_ok, serving_ok;
 static bool provider_ok, prebump, cancel_on_wait, change_epoch_on_wait, read_error;
-static bool initialized_ok, clean_ok, lose_initialized_on_release;
+static bool initialized_ok, clean_ok, recovered_ok, lose_initialized_on_release;
 static ClusterWalSourceRef initialized_ref;
 static uint64 initialized_epoch;
+static ClusterWalSourceRef recovered_ref;
+static uint64 recovered_epoch;
 static uint64 epoch;
 /* The opaque owner and ROOT I/O are leaf fixture boundaries; all native
  * consumer control flow remains the production function body. */
@@ -403,7 +405,7 @@ cluster_cf_unlock_confirmed(LOCKMODE m)
 	if (recovery_revoke_release)
 		recovery_scope_valid = false;
 	if (lose_initialized_on_release)
-		initialized_ok = clean_ok = false;
+		initialized_ok = clean_ok = recovered_ok = false;
 	if (change_ref_on_release)
 		ref.claim.max_config_generation++;
 	return release_ok ? CLUSTER_CF_RELEASE_CONFIRMED : CLUSTER_CF_RELEASE_UNCONFIRMED;
@@ -454,7 +456,8 @@ bool
 cluster_wal_thread_recovered_writer_matches(const ClusterWalSourceRef *expected,
 													 uint64 observed_epoch)
 {
-	return false;
+	return recovered_ok && ref_ok && observed_epoch == recovered_epoch
+		   && memcmp(expected, &recovered_ref, sizeof(*expected)) == 0;
 }
 bool
 cluster_write_fence_allowed(void)
@@ -898,9 +901,11 @@ reset_fixture(void)
 	recovery_writer.ref = ref;
 	recovery_writer.epoch = epoch;
 	recovery_writer.startup_first_lsn = 64;
-	initialized_ok = clean_ok = lose_initialized_on_release = false;
+	initialized_ok = clean_ok = recovered_ok = lose_initialized_on_release = false;
 	initialized_ref = ref;
 	initialized_epoch = epoch;
+	recovered_ref = ref;
+	recovered_epoch = epoch;
 	CritSectionCount = InterruptHoldoffCount = QueryCancelHoldoffCount = 0;
 	InterruptPending = false;
 	ShutdownRequestPending = false;
@@ -1267,6 +1272,42 @@ UT_TEST(initialized_writer_checkpoint_uses_exact_existing_fence_qualification)
 		UT_ASSERT_EQ(root_calls, 1);
 		UT_ASSERT_EQ(shutdown_calls, shutdown);
 		UT_ASSERT_EQ(current.checkPoint, 200);
+	}
+}
+UT_TEST(recovered_writer_checkpoint_uses_exact_recovered_fence_qualification)
+{
+	for (unsigned shutdown = 0; shutdown < 2; shutdown++) {
+		reset_fixture();
+		provider_ok = false;
+		recovered_ok = true;
+		ShutdownRequestPending = shutdown != 0;
+		UT_ASSERT(prepare(shutdown ? CHECKPOINT_IS_SHUTDOWN : CHECKPOINT_FORCE));
+		UT_ASSERT_EQ(reads, 1);
+		UT_ASSERT_EQ(cf_mode, NoLock);
+		candidate.checkPoint = 200;
+		candidate.state = shutdown ? DB_SHUTDOWNED : DB_IN_PRODUCTION;
+		UT_ASSERT(publish());
+		UT_ASSERT_EQ(root_calls, 1);
+		UT_ASSERT_EQ(shutdown_calls, shutdown);
+		UT_ASSERT_EQ(current.checkPoint, 200);
+	}
+	for (unsigned fault = 0; fault < 4; fault++) {
+		reset_fixture();
+		provider_ok = false;
+		recovered_ok = fault != 0;
+		if (fault == 1)
+			recovered_epoch++;
+		if (fault == 2)
+			recovered_ref.claim.identity.origin_owner_incarnation++;
+		if (fault == 3)
+			lose_initialized_on_release = true;
+		UT_ASSERT(!prepare(CHECKPOINT_FORCE));
+		UT_ASSERT_EQ(reads, fault == 3 ? 1 : 0);
+		UT_ASSERT_EQ(cf_mode, NoLock);
+		UT_ASSERT(!publish());
+		UT_ASSERT_EQ(root_calls, 0);
+		UT_ASSERT_EQ(local_updates, 0);
+		UT_ASSERT_EQ(current.checkPoint, 100);
 	}
 }
 UT_TEST(initialized_checkpoint_cannot_borrow_other_input_epoch_or_writer)
@@ -2897,7 +2938,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(78);
+	UT_PLAN(79);
 	UT_RUN(recovery_checkpoint_selects_scope_only_for_closed_online_owner);
 	UT_RUN(recovery_checkpoint_closed_admission_uses_only_original_scope);
 	UT_RUN(recovery_checkpoint_preserves_owner_and_native_guards);
@@ -2946,6 +2987,7 @@ main(void)
 	UT_RUN(prepare_pending_cannot_hide_release_loss_cancel_or_changed_owner);
 	UT_RUN(prepare_refuses_unsupported_or_unproven_input);
 	UT_RUN(initialized_writer_checkpoint_uses_exact_existing_fence_qualification);
+	UT_RUN(recovered_writer_checkpoint_uses_exact_recovered_fence_qualification);
 	UT_RUN(initialized_checkpoint_cannot_borrow_other_input_epoch_or_writer);
 	UT_RUN(publish_retries_only_root_competition_before_projection);
 	UT_RUN(publish_does_not_retry_safety_or_io_refusal);

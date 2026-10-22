@@ -9155,13 +9155,14 @@ ClusterCheckpointV3Prepare(int flags, ControlFileData *selected,
 		|| (recovery_scope != NULL
 			&& (!cluster_recovery_checkpoint_current_v1(recovery_scope, &writer)
 				|| writer.epoch != epoch || memcmp(&writer.ref, &ref, sizeof(ref)) != 0))
-		/* Use the same exact, original-epoch CLEAN or INITIALIZED qualification
-		 * as native WAL I/O. RECOVERED inputs cannot borrow either fact.
+		/* Use the same exact, original-epoch writer qualification as native WAL
+		 * I/O; a recovered writer is accepted only through its own exact ref/epoch.
 		 * Author: SqlRush <sqlrush@gmail.com> */
 		|| (!cluster_external_fence_runtime_active()
 			&& (recovery_scope != NULL
 				|| (!cluster_wal_thread_initialized_writer_matches(&ref, epoch)
-					&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)))))
+					&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)
+					&& !cluster_wal_thread_recovered_writer_matches(&ref, epoch)))))
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 						errmsg("root-v3 checkpoint requires its admitted native owner")));
 	for (;;)
@@ -9190,7 +9191,8 @@ ClusterCheckpointV3Prepare(int flags, ControlFileData *selected,
 			|| (!cluster_external_fence_runtime_active()
 				&& (recovery_scope != NULL
 					|| (!cluster_wal_thread_initialized_writer_matches(&ref, epoch)
-						&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)))))
+						&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)
+						&& !cluster_wal_thread_recovered_writer_matches(&ref, epoch)))))
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 					 errmsg("checkpoint authority changed before control-root read")));
@@ -9261,7 +9263,8 @@ wait_for_owner:
 		|| (!cluster_external_fence_runtime_active()
 			&& (recovery_scope != NULL
 				|| (!cluster_wal_thread_initialized_writer_matches(&ref, epoch)
-					&& !cluster_wal_thread_clean_writer_matches(&ref, epoch))))) {
+					&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)
+					&& !cluster_wal_thread_recovered_writer_matches(&ref, epoch))))) {
 		memset(selected, 0, sizeof(*selected));
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
@@ -9331,7 +9334,8 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end,
 			|| (!cluster_external_fence_runtime_active()
 				&& (recovery_scope != NULL
 					|| (!cluster_wal_thread_initialized_writer_matches(&ref, epoch)
-						&& !cluster_wal_thread_clean_writer_matches(&ref, epoch))))
+						&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)
+						&& !cluster_wal_thread_recovered_writer_matches(&ref, epoch))))
 			|| (!serving && !pending) || !cluster_write_fence_allowed())
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
