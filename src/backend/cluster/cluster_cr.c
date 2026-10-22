@@ -2115,8 +2115,16 @@ cr_scratch_ensure(void)
  *	returns (it always ereport(ERROR)s).  The data plane is Stage 6 (#119).
  */
 static void
-pg_attribute_noreturn() cr_coordinator_refuse_runtime_remote(int origin_node)
+pg_attribute_noreturn() cr_coordinator_refuse_runtime_remote(
+	int origin_node, const char *refusal_site,
+	const ClusterSemanticAdmissionResult *source_admission)
 {
+	/* Only the source-dispatch refusal has an admission result. Its output
+	 * is consumable only on OK; in that branch this refusal means !fetched.
+	 * Preserve unknown elsewhere without inspecting non-OK output bytes. */
+	bool fetched_known = source_admission != NULL
+						 && *source_admission == CLUSTER_SEMANTIC_ADMISSION_OK;
+
 	if (cluster_cross_instance_cr_coordinator != CR_COORD_MODE_OFF) {
 		cluster_cr_coordinator_stat_bump(CR_COORD_CROSS_INSTANCE_CR_REFUSED);
 		cluster_cr_coordinator_stat_bump(CR_COORD_REMOTE_UNDO_READ_REFUSED);
@@ -2140,6 +2148,11 @@ pg_attribute_noreturn() cr_coordinator_refuse_runtime_remote(int origin_node)
 					errmsg("cluster CR cross-instance UBA encountered at the remote-undo-read "
 						   "leg (origin_node_id=%d, local=%d)",
 						   origin_node, cluster_node_id),
+					errdetail("refusal_site=%s source_admission_known=%d source_admission=%d "
+							  "source_fetched_known=%d source_fetched=%d",
+							  refusal_site, source_admission != NULL,
+							  source_admission != NULL ? (int)*source_admission : -1,
+							  fetched_known, fetched_known ? 0 : -1),
 					errhint("Own-instance CR only unless the origin was materialized by merged "
 							"recovery; the runtime cross-instance CR/undo data plane lands in "
 							"Stage 6 (#119 undo-block Cache Fusion); see Spec: spec-5.57.")));
@@ -2173,7 +2186,7 @@ cr_check_error_injections(void)
 		 * routine the production pre-check uses (53R9G + both coordinator counters
 		 * + probe/forward), so the TAP injection legs exercise the real boundary
 		 * behavior deterministically (param = synthetic origin_node_id). */
-		cr_coordinator_refuse_runtime_remote((int)param);
+		cr_coordinator_refuse_runtime_remote((int)param, "injection", NULL);
 
 	if (cluster_cr_injection_armed("cr_corruption", &param)) {
 		const char *kind = (param == 1)	  ? "uba_decode"
@@ -2280,7 +2293,7 @@ cr_walk_chain(char *scratch_page, UBA start_uba, SCN read_scn,
 			if (cr_origin_class == CR_COORD_ORIGIN_RUNTIME_REMOTE) {
 				/* class③: fail closed via the shared refusal routine (53R9G +
 				 * both coordinator counters; non-degradable, §2.2). */
-				cr_coordinator_refuse_runtime_remote((int)cr_origin);
+				cr_coordinator_refuse_runtime_remote((int)cr_origin, "chain_walk", NULL);
 			} else if (cr_origin_class == CR_COORD_ORIGIN_MATERIALIZED_REMOTE) {
 				/* class②: merged-materialized remote, served from the local tree
 				 * (already shipped, spec-4.5a D8).  Count the serve (advisory). */
@@ -2654,7 +2667,7 @@ cr_construct_retained_history(char *page, SCN read_scn, const BufferTag *tag, bo
 				if (!selected)
 					break; /* the existing remote-first dispatcher still owns it */
 				if (!server_mode)
-					cr_coordinator_refuse_runtime_remote((int)origin);
+					cr_coordinator_refuse_runtime_remote((int)origin, "retained_history", NULL);
 				if (out_partial != NULL)
 					*out_partial = true;
 				break;
@@ -2801,6 +2814,7 @@ cr_construct_from_copy(char *dst_page, SCN read_scn, RelFileLocator cur_locator,
 		if (cluster_cr_coordinator_classify_origin(head_origin) == CR_COORD_ORIGIN_RUNTIME_REMOTE) {
 			ClusterR4SourceCrRequest source_request;
 			ClusterR4SourceCrResult source_result;
+			ClusterSemanticAdmissionResult source_admission;
 			BufferTag tag;
 
 			InitBufferTag(&tag, &cur_locator, cur_fork, cur_block);
@@ -2809,14 +2823,15 @@ cr_construct_from_copy(char *dst_page, SCN read_scn, RelFileLocator cur_locator,
 			source_request.read_scn = read_scn;
 			source_request.origin_node = (int32)head_origin;
 			source_request.dst_page = dst_page;
-			if (cluster_r4_source_cr_dispatch(CLUSTER_R4_SOURCE_CR_FETCH, &source_request,
-											  &source_result)
-					!= CLUSTER_SEMANTIC_ADMISSION_OK
+			source_admission = cluster_r4_source_cr_dispatch(CLUSTER_R4_SOURCE_CR_FETCH,
+															   &source_request, &source_result);
+			if (source_admission != CLUSTER_SEMANTIC_ADMISSION_OK
 				|| !source_result.fetched) {
 				if (CRShared != NULL)
 					pg_atomic_fetch_add_u64(&CRShared->cr_remote_failed_count, 1);
 				/* Unchanged spec-5.57 refusal: 53R9G + coordinator counters. */
-				cr_coordinator_refuse_runtime_remote((int)head_origin);
+				cr_coordinator_refuse_runtime_remote((int)head_origin, "source_dispatch",
+													 &source_admission);
 			}
 
 			if (!source_result.partial) {
