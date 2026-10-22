@@ -354,6 +354,7 @@ gcs_block_slot_clear_current_mx_expectation(ClusterGcsBlockOutstandingSlot *slot
 }
 
 static ClusterGcsBlockBackendBlock *gcs_block_backend_blocks = NULL;
+static ClusterGcsUndoVerdictPathCounters gcs_undo_verdict_path_counters;
 
 /*
  * Count only live requester slots whose closed domain is R4_CR.  LMON uses
@@ -5179,6 +5180,7 @@ cluster_gcs_block_r4_tx_resolve_fetch_and_wait_trace_impl(
 		|| !uba_decode(locator->uba, &segment_id, &block_no, &tt_slot_offset, &row_offset)
 		|| block_no == 0 || uba_origin_node_id(locator->uba) != (NodeId)origin_node)
 		return CLUSTER_TX_UNKNOWN;
+	gcs_undo_verdict_path_counters.r4_tx_resolve.calls++;
 	tag = GcsBlockUndoFetchTagMake(segment_id, block_no);
 	slot = gcs_block_try_reserve_r4_slot(tag, formation_epoch, origin_node, &request_id);
 	if (slot == NULL)
@@ -5203,6 +5205,10 @@ cluster_gcs_block_r4_tx_resolve_fetch_and_wait_trace_impl(
 			ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
 			instr_time started;
 
+			/* Accepted logical exchange, including later timeout or ERROR.
+			 * Local CV wakes and physical retransmits are not counted here. */
+			gcs_undo_verdict_path_counters.r4_tx_resolve.request_enqueues++;
+			gcs_undo_verdict_path_counters.r4_tx_resolve.sync_exchanges++;
 			INSTR_TIME_SET_CURRENT(started);
 			ConditionVariablePrepareToSleep(&slot->reply_cv);
 			for (;;) {
@@ -5219,6 +5225,7 @@ cluster_gcs_block_r4_tx_resolve_fetch_and_wait_trace_impl(
 				LWLockRelease(&blk->lock.lock);
 				if (have_reply) {
 					got_reply = true;
+					gcs_undo_verdict_path_counters.r4_tx_resolve.matched_replies++;
 					break;
 				}
 				if (stale)
@@ -5252,6 +5259,7 @@ cluster_gcs_block_r4_tx_resolve_fetch_and_wait_trace_impl(
 			reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
 			goto tx_done;
 		}
+		gcs_undo_verdict_path_counters.r4_tx_resolve.verified_replies++;
 		decoded.authority.live_hwm_lsn = (XLogRecPtr)slot->reply_header.page_lsn;
 		cluster_scn_observe(decoded.commit_scn);
 		cluster_scn_observe(decoded.horizon_scn);
@@ -5579,7 +5587,6 @@ cluster_r4_source_cr_dispatch(ClusterR4SourceCrOp op, const ClusterR4SourceCrReq
 
 
 static ClusterGcsUndoHeaderPathCounters gcs_undo_header_path_counters;
-static ClusterGcsUndoVerdictPathCounters gcs_undo_verdict_path_counters;
 
 void
 cluster_gcs_block_undo_header_counters_reset(void)

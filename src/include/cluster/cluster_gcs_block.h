@@ -104,7 +104,8 @@ extern void cluster_gcs_block_undo_header_counters_snapshot(ClusterGcsUndoHeader
  * calls counts entries into the valid exchange core. verified_replies means
  * status/trailer/checksum passed there, NOT that the wrapper accepted the
  * identity, epoch or verdict as terminal proof. A wrapper refusal still
- * incurred the exchange. Other fields use the header-counter rules above. */
+ * incurred the exchange. The R4 member documents its later decode/identity
+ * acceptance point below. Other fields use the header-counter rules above. */
 typedef struct ClusterGcsUndoVerdictExchangeCounters {
 	uint64 calls;
 	uint64 request_enqueues;
@@ -117,6 +118,9 @@ typedef struct ClusterGcsUndoVerdictPathCounters {
 	ClusterGcsUndoVerdictExchangeCounters owner_verdict;
 	ClusterGcsUndoVerdictExchangeCounters freshref_c1b_pair;
 	ClusterGcsUndoVerdictExchangeCounters authority_verdict;
+	/* R4 exact-origin requester: verified means the decoded locator and
+	 * formation epoch passed acceptance, not terminal/FullXid proof. */
+	ClusterGcsUndoVerdictExchangeCounters r4_tx_resolve;
 } ClusterGcsUndoVerdictPathCounters;
 
 /* Backend-local diagnostics only; independent of the header observations. */
