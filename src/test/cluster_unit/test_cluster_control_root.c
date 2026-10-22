@@ -10040,6 +10040,28 @@ v3_route_fixture(uint8 before[66048], ControlRootImage *root, char pgdata[MAXPGP
 	return op;
 }
 
+/* Bootstrap capacity observation checks the disabled commit-timestamp profile
+ * for every origin selected by the v3 root.  The route fixture deliberately
+ * builds the root and WAL objects only; add the empty, unsupported native
+ * profile here so these tests exercise the route contract rather than an
+ * unrelated missing-directory result. */
+static void
+bootstrap_route_native_fixture(const ControlRootImage *root)
+{
+	char path[MAXPGPATH];
+
+	snprintf(path, sizeof(path), "%s/native_side", test_root);
+	UT_ASSERT(mkdir(path, 0700) == 0 || errno == EEXIST);
+	for (uint32 node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {
+		if (!root->present[node])
+			continue;
+		snprintf(path, sizeof(path), "%s/native_side/origin_%u", test_root, node);
+		UT_ASSERT(mkdir(path, 0700) == 0 || errno == EEXIST);
+		snprintf(path, sizeof(path), "%s/native_side/origin_%u/pg_commit_ts", test_root, node);
+		UT_ASSERT(mkdir(path, 0700) == 0 || errno == EEXIST);
+	}
+}
+
 UT_TEST(test_v3_startup_route_switches_only_exact_empty_generation)
 {
 	uint8 before[66048];
@@ -10409,6 +10431,7 @@ UT_TEST(test_bootstrap_pending_route_keeps_immutable_restart_input)
 	char pgdata[MAXPGPATH], path[MAXPGPATH];
 	ClusterWalStartupImage op = v3_route_fixture(before, &root, pgdata), observed;
 	ClusterControlBootstrapObservation out;
+	bootstrap_route_native_fixture(&root);
 	v3_route_binding(&root, pgdata);
 	for (unsigned routed = 0; routed < 2; ++routed) {
 		if (routed)
@@ -19300,6 +19323,7 @@ UT_TEST(test_bootstrap_pending_route_never_masks_bad_inputs_or_namespace)
 			char pgdata[MAXPGPATH], path[MAXPGPATH], pgwal[MAXPGPATH];
 			ClusterWalStartupImage op = v3_route_fixture(before, &root, pgdata), observed;
 			ClusterControlBootstrapObservation out;
+			bootstrap_route_native_fixture(&root);
 			v3_route_binding(&root, pgdata);
 			if (routed)
 				UT_ASSERT_EQ(cluster_control_root_v3_startup_route_writer(
@@ -19370,6 +19394,7 @@ UT_TEST(test_bootstrap_pending_route_tracks_durable_and_install_not_authority)
 	ClusterWalStartupImage op = v3_route_fixture(before, &root, pgdata), observed;
 	ClusterWalSourceRef writer;
 	ClusterControlBootstrapObservation out;
+	bootstrap_route_native_fixture(&root);
 	v3_route_binding(&root, pgdata);
 	UT_ASSERT_EQ(cluster_control_root_v3_startup_route_writer(&op.claim.identity, op.operation_uuid,
 															  &observed),
@@ -19417,6 +19442,7 @@ UT_TEST(test_bootstrap_reserved_does_not_offer_a_successor_route)
 	char pgdata[MAXPGPATH] = "/tmp/pgrac-bootstrap-reserved.XXXXXX";
 	char pgwal[MAXPGPATH], generation[MAXPGPATH];
 	UT_ASSERT(mkdtemp(pgdata) != NULL);
+	bootstrap_route_native_fixture(&root);
 	v3_route_binding(&root, pgdata);
 	snprintf(pgwal, sizeof(pgwal), "%s/pg_wal", pgdata);
 	snprintf(generation, sizeof(generation), "%s/thread_1/generation_" UINT64_FORMAT, test_wal_root,
@@ -24643,6 +24669,56 @@ UT_TEST(test_tx_inputs_parent_subject_and_wait_revalidation)
 	}
 	test_inputs_startup_cf = false;
 }
+
+/*
+ * Keep the long control-root suite deterministic when an individual test
+ * intentionally leaves a contract or topology override in place.  The
+ * production entry points are all exercised through this one process, while
+ * UT_RUN historically only reset TAP bookkeeping.  A later test could
+ * therefore inherit (for example) the single-node/unverified setup used by
+ * the negative v2 view test and fail before reaching its own fixture.  Reset
+ * only harness state here; tests still own their files and fault fixtures.
+ */
+static void
+control_root_test_reset_state(void)
+{
+	test_contract = CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED;
+	test_node_count = 4;
+	test_local_probe = true;
+	test_cf_grant = true;
+	test_cf_clusterwide = true;
+	test_cf_mode = NoLock;
+	test_cf_release_confirmed = true;
+	test_cf_lock_calls = 0;
+	test_actual_cf = NoLock;
+	test_cf_local_caller = NULL;
+	test_cf_tagged_retiring = false;
+	test_cf_cookie = test_cf_completed_cookie = 0;
+	test_cf_acquire_order = test_cf_release_order = 0;
+	test_reserve_mode = false;
+	test_restart_ref_valid = false;
+	test_fence = false;
+	test_serving = test_serving_pending = false;
+	test_wal_validated = false;
+	DataDir = test_root;
+	cluster_shared_data_dir = test_root;
+	cluster_wal_threads_dir = test_wal_root;
+}
+
+#undef UT_RUN
+#define UT_RUN(name)                                                                            \
+	do {                                                                                          \
+		control_root_test_reset_state();                                                          \
+		ut_test_count++;                                                                          \
+		ut_current_failed = 0;                                                                    \
+		name();                                                                                   \
+		if (ut_current_failed == 0)                                                               \
+			printf("ok %d - %s\n", ut_test_count, #name);                                         \
+		else {                                                                                    \
+			printf("not ok %d - %s\n", ut_test_count, #name);                                     \
+			ut_failed_count++;                                                                      \
+		}                                                                                         \
+	} while (0)
 
 int
 main(int argc, char **argv)
