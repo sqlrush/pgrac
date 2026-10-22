@@ -855,6 +855,79 @@ ClusterColdRecoveryTxTopProofCurrent(const struct ClusterRecoveryStartV1 *start,
 }
 
 bool
+ClusterColdRecoveryTxC0Candidate(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject,
+	struct ClusterRecoveryTTAbortDerivationV1 *out)
+{
+	const ClusterColdTypedV1 *typed;
+	const ClusterColdTtSlotKeyV1 *key;
+	ClusterRecoveryTTAbortV1 shape;
+	ClusterRecoveryTTAbortDerivationV1 candidate;
+	uint64 next_xid;
+	uint32 target = UINT32_MAX;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	/* Locate the subject in the retained census before dereferencing it.
+	 * Numeric completeness is a C0 requirement, never a physical loser gate. */
+	if (!ClusterColdRecoveryTxTopProofCurrent(start, subject)
+		|| !ClusterColdRecoveryTxEffectsCurrent(start))
+		return false;
+	typed = start->inputs;
+	key = &subject->input.key;
+	if (typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->replay_count == 0 || typed->replay_count > typed->participant_count
+		|| !cluster_cold_typed_xid_maximum_v1(typed, &next_xid))
+		return false;
+	for (uint32 p = 0; p < typed->replay_count; p++) {
+		if (typed->participants[p].thread_id != key->owner_instance)
+			continue;
+		if (target != UINT32_MAX)
+			return false;
+		target = p;
+	}
+	if (target == UINT32_MAX
+		|| typed->sources[target].claim.identity.origin_thread_id != key->owner_instance
+		|| typed->sources[target].claim.identity.origin_owner_incarnation
+			!= typed->participants[target].owner_incarnation)
+		return false;
+
+	memset(&shape, 0, sizeof(shape));
+	shape.version = CLUSTER_RECOVERY_TT_ABORT_VERSION;
+	shape.length = CLUSTER_RECOVERY_TT_ABORT_BYTES;
+	shape.flags = CLUSTER_RECOVERY_TT_ABORT_TOP_KNOWN;
+	shape.target_thread = key->owner_instance;
+	shape.target_incarnation = typed->participants[target].owner_incarnation;
+	memcpy(shape.target_claim_sha256, typed->sources[target].claim.claim_sha256,
+		   sizeof(shape.target_claim_sha256));
+	shape.writer_thread = start->writer.ref.claim.identity.origin_thread_id;
+	shape.writer_incarnation = start->writer.ref.claim.identity.origin_owner_incarnation;
+	shape.recovery_serial = start->serial;
+	/* In E1 this field means the actual recoverer's epoch, not bind time. */
+	shape.target_epoch = start->writer.epoch;
+	shape.exact.segment_id = key->segment_id;
+	shape.exact.segment_generation = key->segment_generation;
+	shape.exact.xid = key->xid;
+	shape.exact.slot_offset = key->slot_offset;
+	shape.exact.wrap = key->slot_wrap;
+	shape.exact.instance = key->owner_instance;
+	shape.exact.format_version = CLUSTER_UNDO_TT_ABORT_EXACT_VERSION;
+	memcpy(&shape.before, &subject->input.slot, sizeof(shape.before));
+	/* No independently retained L is available here. Preserve the existing
+	 * AD-012 exception 10/spec-6.15 dependency in the derivation result. */
+	if (!cluster_recovery_tt_abort_derive_fields_v1(&shape, next_xid, true, false,
+			InvalidTransactionId, start->writer.epoch, &candidate)
+		|| cluster_recovery_tt_abort_match_v1(&candidate.record, key->segment_generation,
+			&subject->input.slot) != CLUSTER_RECOVERY_TT_ABORT_APPLY
+		|| !ClusterColdRecoveryTxTopProofCurrent(start, subject)
+		|| !ClusterColdRecoveryTxEffectsCurrent(start))
+		return false;
+	*out = candidate;
+	return true;
+}
+
+bool
 ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 {
 	struct ClusterRecoveryStartV1 *start;

@@ -175,6 +175,15 @@ ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start);
  * authority. */
 extern bool ClusterColdRecoveryTxEffectsCurrent(
 	const struct ClusterRecoveryStartV1 *start);
+
+struct ClusterRecoveryTTAbortDerivationV1;
+/* Pure C0 candidate fields from the original proof/endpoints and installed
+ * writer. The caller holds and revalidates the original TX_CLOSURE read
+ * scope. This grants no WAL, TT, checkpoint or execution authority. */
+extern bool ClusterColdRecoveryTxC0Candidate(
+	const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject,
+	struct ClusterRecoveryTTAbortDerivationV1 *out);
 #endif
 extern void RemovePromoteSignalFiles(void);
 

@@ -6692,6 +6692,7 @@ cluster_cold_recovery_consume_loser_inputs_v1(
 		const ClusterColdTopTxCensusEntryV1 *entry = &typed->top_tx_census->entries[i];
 		ClusterWalInputsV1 *inputs = NULL;
 		ClusterControlRootResult result;
+		ClusterRecoveryTTAbortDerivationV1 candidate;
 
 		/* A retained ACTIVE without an independent loser proof stays
 		 * unresolved; it must not be promoted by this consumer. */
@@ -6712,6 +6713,13 @@ cluster_cold_recovery_consume_loser_inputs_v1(
 			return false;
 		}
 		result = cluster_wal_inputs_revalidate_v1(inputs);
+		/* Derive fields from this original proof and actual installed writer,
+		 * inside its original source scope. The candidate is not a write grant. */
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& !ClusterColdRecoveryTxC0Candidate(start, entry, &candidate))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cluster_wal_inputs_revalidate_v1(inputs);
 		cluster_wal_inputs_release_v1(&inputs);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return false;

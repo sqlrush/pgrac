@@ -9715,9 +9715,22 @@ test_cluster_cold_tx_start_boundary.inc: $(top_srcdir)/src/backend/access/transa
 	     END { if (count != 1 || done != 1 || unlocked != 1 || !last || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_cold_tx_consumer.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^cluster_cold_recovery_consume_loser_inputs_v1\(/ { print "static bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cold_tx_xid_maximum.inc: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_replay.c Makefile
+	awk '/^cluster_cold_typed_xid_maximum_v1\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_owner.inc \
+        test_cluster_cold_tx_consumer.inc test_cluster_cold_tx_xid_maximum.inc \
         test_cluster_cold_tx_writer.inc test_cluster_cold_tx_start_boundary.inc unit_test.h \
         $(top_srcdir)/src/include/access/xlogrecovery.h \
         $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_tt_record.h \
+        $(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
         $(top_srcdir)/src/include/cluster/cluster_wal_writer.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@

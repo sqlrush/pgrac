@@ -9,6 +9,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_wal_writer.h"
+#include "cluster/cluster_wal_inputs.h"
 #include "../../../src/backend/cluster/cluster_control_root_private.h"
 #include "miscadmin.h"
 #include "postmaster/interrupt.h"
@@ -39,6 +40,11 @@ static bool clusterStartupWriterInstalled;
 static ClusterWalWriterToken observed_writer;
 static bool native_recovery, binding_ok, writer_ok, allocation_ok;
 static bool effects_ready;
+static bool xid_ready, invalidate_writer_on_xid_ready;
+static unsigned scope_begins, scope_checks, scope_releases;
+static unsigned fail_scope_check;
+static bool scope_begin_ok;
+static char scope_storage;
 static uint64 owner_boot;
 static ResourceReleaseCallback release_callback;
 static unsigned callback_registrations, input_destroys, allocations, frees;
@@ -108,6 +114,8 @@ static void test_fatal(void)
 
 #include "test_cluster_cold_tx_writer.inc"
 #include "test_cluster_cold_tx_owner.inc"
+#include "test_cluster_cold_tx_xid_maximum.inc"
+#include "test_cluster_cold_tx_consumer.inc"
 
 static void actual_startup_tx_begin(EndOfWalRecoveryInfo *endOfRecoveryInfo)
 {
@@ -127,6 +135,41 @@ bool
 cluster_cold_typed_effects_ready_v1(const ClusterColdTypedV1 *candidate)
 {
 	return effects_ready && candidate == &typed;
+}
+
+bool
+cluster_cold_typed_xid_sources_ready_v1(const ClusterColdTypedV1 *candidate)
+{
+	if (invalidate_writer_on_xid_ready)
+		observed_writer.epoch++;
+	return xid_ready && candidate == &typed;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_begin_tx_closure_v1(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject, ClusterWalInputsV1 **out)
+{
+	if (!ClusterColdRecoveryTxLoserCurrent(start, subject)) abort();
+	scope_begins++;
+	*out = (ClusterWalInputsV1 *)&scope_storage;
+	return scope_begin_ok ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_revalidate_v1(ClusterWalInputsV1 *inputs)
+{
+	if (inputs != (ClusterWalInputsV1 *)&scope_storage) abort();
+	scope_checks++;
+	return scope_checks == fail_scope_check
+		? CLUSTER_CONTROL_ROOT_STALE_TOKEN : CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+void
+cluster_wal_inputs_release_v1(ClusterWalInputsV1 **inputs)
+{
+	if (*inputs != (ClusterWalInputsV1 *)&scope_storage) abort();
+	scope_releases++;
+	*inputs = NULL;
 }
 
 static void reset(void)
@@ -150,6 +193,9 @@ static void reset(void)
 	cluster_enabled = cluster_shared_config = true;
 	native_recovery = false;
 	effects_ready = false;
+	xid_ready = invalidate_writer_on_xid_ready = false;
+	scope_begins = scope_checks = scope_releases = fail_scope_check = 0;
+	scope_begin_ok = true;
 	clusterStartupWriterSelected = clusterStartupWriterBound = true;
 	clusterStartupWriterInstalled = binding_ok = writer_ok = allocation_ok = true;
 	owner_boot = 17;
@@ -481,9 +527,116 @@ UT_TEST(test_effects_accessor_requires_complete_receipt_and_live_owner)
 	UT_ASSERT(!ClusterColdRecoveryTxEffectsCurrent(info.cluster_tx_start));
 }
 
+/* Two complete endpoint inputs, with the history endpoint providing N.
+ * The victim and installed writer deliberately have different identities. */
+static void c0_subject(void)
+{
+	ClusterColdTopTxCensusEntryV1 *entry;
+	reset(); active_subject();
+	entry = &census.entries[0];
+	entry->input.key.owner_instance = 2;
+	entry->input.key.segment_id = CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	entry->input.slot.first_undo_block = uba_encode(entry->input.key.segment_id, 3, 2, 16);
+	entry->loser_proven = true;
+	entry->loser.key = entry->proof.key = entry->input.key;
+	entry->proof.producer_top = entry->proof.qualified_base = true;
+	entry->proof.sealed_redo = entry->proof.ordinary_effects = true;
+	entry->proof.old_writer_isolated = entry->proof.terminal_match = true;
+	typed.participant_count = 2;
+	typed.replay_count = 1;
+	typed.participants[0].thread_id = 2;
+	typed.participants[0].owner_incarnation = 29;
+	typed.sources[0].claim.identity.origin_thread_id = 2;
+	typed.sources[0].claim.identity.origin_owner_incarnation = 29;
+	typed.sources[0].claim.claim_sha256[0] = 41;
+	typed.participants[1].thread_id = 3;
+	typed.participants[1].owner_incarnation = 31;
+	typed.xid_receipt.next_xid[0] = (UINT64_C(7) << 32) | 110;
+	typed.xid_receipt.next_xid[1] = (UINT64_C(8) << 32) | 150;
+	typed.xid_next_after_redo = typed.xid_receipt.next_xid[1];
+	xid_ready = effects_ready = true;
+	retain();
+	UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
+}
+
+UT_TEST(test_c0_candidate_uses_original_target_actual_writer_and_all_endpoints)
+{
+	ClusterRecoveryTTAbortDerivationV1 out;
+	const ClusterRecoveryTTAbortV1 *record = &out.record;
+	c0_subject();
+	UT_ASSERT(ClusterColdRecoveryTxC0Candidate(info.cluster_tx_start, &census.entries[0], &out));
+	UT_ASSERT_EQ(record->target_thread, 2);
+	UT_ASSERT_EQ(record->target_incarnation, 29);
+	UT_ASSERT_EQ(record->writer_thread, 1);
+	UT_ASSERT_EQ(record->writer_incarnation, 17);
+	UT_ASSERT_EQ(record->target_epoch, 4);
+	UT_ASSERT_EQ(record->recovery_serial, 1);
+	UT_ASSERT_EQ(record->target_claim_sha256[0], 41);
+	UT_ASSERT_EQ(out.next_xid, typed.xid_receipt.next_xid[1]);
+	UT_ASSERT_EQ(out.full_xid, (UINT64_C(8) << 32) | 100);
+	UT_ASSERT_EQ(record->target_full_xid, out.full_xid);
+	UT_ASSERT_EQ(record->top_full_xid, out.full_xid);
+	UT_ASSERT(out.oldest_xid_dependency && !out.oldest_xid_checked);
+	UT_ASSERT(memcmp(&record->before, &census.entries[0].input.slot, sizeof(TTSlot)) == 0);
+	UT_ASSERT_EQ(cluster_recovery_tt_abort_match_v1(record, 7, &census.entries[0].input.slot),
+		CLUSTER_RECOVERY_TT_ABORT_APPLY);
+}
+
+UT_TEST(test_c0_candidate_refuses_missing_conflicting_or_stale_inputs_without_reclassifying_loser)
+{
+	for (int fault = 0; fault < 12; fault++) {
+		ClusterRecoveryTTAbortDerivationV1 out, zero;
+		c0_subject();
+		switch (fault) {
+		case 0: xid_ready = false; break;
+		case 1: typed.xid_receipt.next_xid[0] = 0; break;
+		case 2: typed.xid_receipt.next_xid[1] = 2; break;
+		case 3: typed.xid_next_after_redo++; break;
+		case 4: typed.participants[0].thread_id = 4; break;
+		case 5: typed.sources[0].claim.identity.origin_owner_incarnation++; break;
+		case 6: typed.sources[0].claim.identity.origin_thread_id++; break;
+		case 7: typed.replay_count = 2; typed.participants[1].thread_id = 2; break;
+		case 8: effects_ready = false; break;
+		case 9: census.entries[0].proof.qualified_base = false; break;
+		case 10: invalidate_writer_on_xid_ready = true; break;
+		case 11: observed_writer.epoch++; break;
+		}
+		memset(&out, 0xa5, sizeof(out));
+		memset(&zero, 0, sizeof(zero));
+		UT_ASSERT(!ClusterColdRecoveryTxC0Candidate(info.cluster_tx_start, &census.entries[0], &out));
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		UT_ASSERT(census.entries[0].loser_proven);
+		UT_ASSERT_EQ(census.entries[0].input.slot.status, TT_SLOT_ACTIVE);
+	}
+}
+
+UT_TEST(test_actual_startup_consumer_requires_numeric_candidate_under_revalidated_scope)
+{
+	c0_subject();
+	UT_ASSERT(cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+	UT_ASSERT_EQ(scope_begins, 1);
+	UT_ASSERT_EQ(scope_checks, 2);
+	UT_ASSERT_EQ(scope_releases, 1);
+	c0_subject(); xid_ready = false;
+	UT_ASSERT(!cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+	UT_ASSERT_EQ(scope_releases, 1);
+	UT_ASSERT(census.entries[0].loser_proven);
+	for (unsigned fault = 1; fault <= 2; fault++) {
+		c0_subject(); fail_scope_check = fault;
+		UT_ASSERT(!cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+		UT_ASSERT_EQ(scope_releases, 1);
+	}
+	c0_subject(); scope_begin_ok = false;
+	UT_ASSERT(!cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+	UT_ASSERT_EQ(scope_releases, 1);
+	c0_subject(); census.entries[0].loser_proven = false; xid_ready = false;
+	UT_ASSERT(cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+	UT_ASSERT_EQ(scope_begins, 0);
+}
+
 int main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(16);
 	UT_RUN(test_original_owner_binds_complete_empty_census_after_done);
 	UT_RUN(test_native_owner_rejects_uninstalled_recovery_and_writer_drift);
 	UT_RUN(test_current_rechecks_owner_process_boot_and_exact_writer);
@@ -497,6 +650,9 @@ int main(void)
 	UT_RUN(test_subject_rejects_nonactive_or_conflicting_physical_identity);
 	UT_RUN(test_loser_candidate_requires_proven_exact_physical_entry);
 	UT_RUN(test_effects_accessor_requires_complete_receipt_and_live_owner);
+	UT_RUN(test_c0_candidate_uses_original_target_actual_writer_and_all_endpoints);
+	UT_RUN(test_c0_candidate_refuses_missing_conflicting_or_stale_inputs_without_reclassifying_loser);
+	UT_RUN(test_actual_startup_consumer_requires_numeric_candidate_under_revalidated_scope);
 	reset();
 	if (allocations != frees) { fprintf(stderr, "unreleased start resources\n"); return 1; }
 	UT_DONE();
