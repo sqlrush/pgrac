@@ -14468,6 +14468,11 @@ normal_start_recovered_service_binding_current(const ClusterSemanticActivationRe
 	ClusterFormationSnapshotV1 formation;
 	const ClusterNormalStartCompletion *input = NormalStartCompletion;
 
+	/* The recovered consumer derives a local thread id below.  Keep this
+	 * direct entry point fail-closed when called outside the startup wrapper. */
+	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
+		return false;
+
 	/* RECOVERED activation must consume the published checkpoint owner. */
 	if (open == NULL || root == NULL || table == NULL || input == NULL
 		|| cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_EXISTING_OTHER

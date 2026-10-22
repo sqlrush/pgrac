@@ -9442,6 +9442,20 @@ UT_TEST(test_normal_start_recovered_owner_observation_rejects_foreign_system)
 	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
 }
 
+UT_TEST(test_normal_start_recovered_owner_observation_rejects_invalid_local_node)
+{
+	ClusterSemanticActivationRecord open;
+	ClusterSemanticActivationAckTableV1 table;
+	int saved_node = cluster_node_id;
+
+	ut_normal_start_recovered_owner_setup(&open, &table);
+	cluster_node_id = -1;
+	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+	cluster_node_id = CLUSTER_MAX_NODES;
+	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+	cluster_node_id = saved_node;
+}
+
 UT_TEST(test_normal_start_recovered_owner_equal_epoch_does_not_use_fast_path)
 {
 	ClusterSemanticActivationRecord open;
@@ -11884,6 +11898,7 @@ main(void)
 	UT_RUN(test_normal_start_recovered_owner_observation_accepts_exact_binding);
 	UT_RUN(test_normal_start_recovered_owner_observation_fails_closed_without_observation);
 	UT_RUN(test_normal_start_recovered_owner_observation_rejects_foreign_system);
+	UT_RUN(test_normal_start_recovered_owner_observation_rejects_invalid_local_node);
 	UT_RUN(test_normal_start_recovered_owner_equal_epoch_does_not_use_fast_path);
 	UT_RUN(test_normal_start_capture_drift_and_wrong_writer_refuse);
 	UT_RUN(test_normal_start_identity_rechecked_after_real_root_read);
