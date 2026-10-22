@@ -94,6 +94,13 @@ cluster_wal_thread_clean_writer_matches(const ClusterWalSourceRef *expected pg_a
 }
 
 bool
+cluster_wal_thread_recovered_writer_matches(const ClusterWalSourceRef *expected pg_attribute_unused(),
+													uint64 epoch pg_attribute_unused())
+{
+	abort();
+}
+
+bool
 cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread pg_attribute_unused(),
 											   struct ClusterFormationSnapshotV1 *out
 												   pg_attribute_unused())

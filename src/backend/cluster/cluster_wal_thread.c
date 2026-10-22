@@ -101,6 +101,7 @@ typedef struct ClusterWalThreadShmemData {
 	ClusterWalThreadCheckpointSampleV1 checkpoint_sample;
 	uint64 initialized_writer_epoch; /* zero unless installed from never-served input */
 	uint64 clean_writer_epoch;		 /* zero unless installed from collective CLEAN exit */
+	uint64 recovered_writer_epoch;	 /* zero unless installed from RECOVERED input */
 } ClusterWalThreadShmemData;
 
 static ClusterWalThreadShmemData *cluster_wal_thread_shmem = NULL;
@@ -136,6 +137,7 @@ cluster_wal_thread_shmem_init(void)
 			   sizeof(cluster_wal_thread_shmem->checkpoint_sample));
 		cluster_wal_thread_shmem->initialized_writer_epoch = 0;
 		cluster_wal_thread_shmem->clean_writer_epoch = 0;
+		cluster_wal_thread_shmem->recovered_writer_epoch = 0;
 	}
 }
 
@@ -447,6 +449,18 @@ cluster_wal_thread_clean_writer_matches(const ClusterWalSourceRef *expected, uin
 }
 
 bool
+cluster_wal_thread_recovered_writer_matches(const ClusterWalSourceRef *expected, uint64 epoch)
+{
+	ClusterWalSourceRef current;
+	/* RECOVERED remains a distinct Startup input after OPEN. Its immutable
+	 * INSTALL epoch is only a qualification; callers still perform the live
+	 * membership and write-fence checks at the mutation boundary. */
+	return expected != NULL && epoch != 0 && cluster_wal_thread_current_v2_ref(&current)
+		   && cluster_wal_thread_shmem->recovered_writer_epoch == epoch
+		   && memcmp(expected, &current, sizeof(current)) == 0;
+}
+
+bool
 cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
 {
 	if (out == NULL)
@@ -512,7 +526,7 @@ cluster_wal_thread_install_startup(const ClusterWalStartupImage *expected)
 	ClusterWalSourceRef installed;
 	ClusterControlRootResult result;
 	uint32 state = 0;
-	uint64 initialized_epoch, clean_epoch;
+	uint64 initialized_epoch, clean_epoch, recovered_epoch;
 	if (expected == NULL || !cluster_enabled || !cluster_shared_config
 		|| cluster_wal_thread_shmem == NULL || !cluster_wal_thread_shmem->restart_ref_valid
 		|| !cluster_wal_thread_shmem->dir_validated)
@@ -533,6 +547,7 @@ cluster_wal_thread_install_startup(const ClusterWalStartupImage *expected)
 	initialized_epoch
 		= expected->input_kind == CLUSTER_WAL_STARTUP_INITIALIZED ? expected->formation_epoch : 0;
 	clean_epoch = expected->input_kind == CLUSTER_WAL_STARTUP_CLEAN ? expected->formation_epoch : 0;
+	recovered_epoch = expected->input_kind == CLUSTER_WAL_STARTUP_RECOVERED ? expected->formation_epoch : 0;
 	if (!pg_atomic_compare_exchange_u32(&cluster_wal_thread_shmem->writer_ref_state, &state, 1)) {
 		if (state != 2)
 			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
@@ -540,6 +555,7 @@ cluster_wal_thread_install_startup(const ClusterWalStartupImage *expected)
 		return memcmp(&installed, &cluster_wal_thread_shmem->v2_ref, sizeof(installed)) == 0
 					   && initialized_epoch == cluster_wal_thread_shmem->initialized_writer_epoch
 					   && clean_epoch == cluster_wal_thread_shmem->clean_writer_epoch
+					   && recovered_epoch == cluster_wal_thread_shmem->recovered_writer_epoch
 				   ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
 				   : CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	}
@@ -549,6 +565,7 @@ cluster_wal_thread_install_startup(const ClusterWalStartupImage *expected)
 	cluster_wal_thread_shmem->v2_ref = installed;
 	cluster_wal_thread_shmem->initialized_writer_epoch = initialized_epoch;
 	cluster_wal_thread_shmem->clean_writer_epoch = clean_epoch;
+	cluster_wal_thread_shmem->recovered_writer_epoch = recovered_epoch;
 	pg_write_barrier();
 	pg_atomic_write_u32(&cluster_wal_thread_shmem->writer_ref_state, 2);
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;

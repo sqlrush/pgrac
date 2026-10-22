@@ -740,6 +740,41 @@ UT_TEST(initialized_writer_qualification_is_published_only_with_exact_install)
 	UT_ASSERT(!cluster_wal_thread_initialized_writer_matches(&installed_writer, 77));
 }
 
+UT_TEST(recovered_writer_qualification_is_published_only_with_exact_install)
+{
+	ClusterWalStartupImage expected = { 0 };
+	ClusterWalSourceRef changed;
+	fixture();
+	expected.claim.identity = installed_writer.claim.identity;
+	expected.operation_uuid[0] = 0x27;
+	expected.first_segment_lsn = 2 * wal_segment_size;
+	expected.input_kind = CLUSTER_WAL_STARTUP_RECOVERED;
+	expected.formation_epoch = 77;
+	UT_ASSERT(!cluster_wal_thread_recovered_writer_matches(&installed_writer, 77));
+	install_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	UT_ASSERT_NE(cluster_wal_thread_install_startup(&expected), 0);
+	UT_ASSERT(!cluster_wal_thread_recovered_writer_matches(&installed_writer, 77));
+	install_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	UT_ASSERT_EQ(cluster_wal_thread_install_startup(&expected), 0);
+	UT_ASSERT(cluster_wal_thread_recovered_writer_matches(&installed_writer, 77));
+	UT_ASSERT(!cluster_wal_thread_initialized_writer_matches(&installed_writer, 77));
+	UT_ASSERT(!cluster_wal_thread_recovered_writer_matches(&installed_writer, 0));
+	UT_ASSERT(!cluster_wal_thread_recovered_writer_matches(&installed_writer, 78));
+	UT_ASSERT(!cluster_wal_thread_recovered_writer_matches(NULL, 77));
+	changed = installed_writer;
+	changed.claim.claim_sha256[0]++;
+	UT_ASSERT(!cluster_wal_thread_recovered_writer_matches(&changed, 77));
+	pg_atomic_write_u32(&mirror.writer_ref_state, 1);
+	UT_ASSERT(!cluster_wal_thread_recovered_writer_matches(&installed_writer, 77));
+	pg_atomic_write_u32(&mirror.writer_ref_state, 2);
+	UT_ASSERT_EQ(cluster_wal_thread_install_startup(&expected), 0);
+	expected.input_kind = CLUSTER_WAL_STARTUP_CLEAN;
+	UT_ASSERT_NE(cluster_wal_thread_install_startup(&expected), 0);
+	fixture();
+	UT_ASSERT_EQ(cluster_wal_thread_install_startup(&expected), 0);
+	UT_ASSERT(!cluster_wal_thread_recovered_writer_matches(&installed_writer, 77));
+}
+
 UT_TEST(close_failure_cannot_leak_successful_segment)
 {
 	fixture();
@@ -791,9 +826,10 @@ UT_TEST(reading_preserves_both_generations)
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(17);
 	UT_RUN(clean_writer_qualification_is_published_only_with_exact_install);
 	UT_RUN(initialized_writer_qualification_is_published_only_with_exact_install);
+	UT_RUN(recovered_writer_qualification_is_published_only_with_exact_install);
 	UT_RUN(native_reads_retained_input_not_pg_wal);
 	UT_RUN(native_bad_input_never_falls_back);
 	UT_RUN(legacy_keeps_native_route);

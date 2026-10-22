@@ -32,6 +32,13 @@ cluster_wal_thread_clean_writer_matches(const ClusterWalSourceRef *expected, uin
 		   && memcmp(expected, &test_first_writer, sizeof(*expected)) == 0;
 }
 
+bool
+cluster_wal_thread_recovered_writer_matches(const ClusterWalSourceRef *expected pg_attribute_unused(),
+													 uint64 epoch pg_attribute_unused())
+{
+	return false;
+}
+
 static void
 test_clean_formation_bind(void)
 {

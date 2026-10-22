@@ -8023,7 +8023,8 @@ cluster_control_root_v3_startup_install_writer(const ClusterWalStartupImage *exp
 		memset(out, 0, sizeof(*out));
 	if (alias || expected == NULL || out == NULL || expected->phase != CLUSTER_WAL_STARTUP_DURABLE
 		|| (expected->input_kind != CLUSTER_WAL_STARTUP_CLEAN
-			&& expected->input_kind != CLUSTER_WAL_STARTUP_INITIALIZED)
+			&& expected->input_kind != CLUSTER_WAL_STARTUP_INITIALIZED
+			&& expected->input_kind != CLUSTER_WAL_STARTUP_RECOVERED)
 		|| expected->claim.identity.origin_node_id != cluster_node_id
 		|| expected->claim.identity.origin_node_id >= CLUSTER_MAX_NODES
 		|| expected->claim.identity.origin_node_id < 0

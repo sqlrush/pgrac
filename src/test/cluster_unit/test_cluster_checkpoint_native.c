@@ -451,6 +451,12 @@ cluster_wal_thread_clean_writer_matches(const ClusterWalSourceRef *expected, uin
 		   && memcmp(expected, &initialized_ref, sizeof(*expected)) == 0;
 }
 bool
+cluster_wal_thread_recovered_writer_matches(const ClusterWalSourceRef *expected,
+													 uint64 observed_epoch)
+{
+	return false;
+}
+bool
 cluster_write_fence_allowed(void)
 {
 	return fence_ok;

@@ -272,6 +272,11 @@ cluster_wal_thread_clean_writer_matches(const ClusterWalSourceRef *ref, uint64 e
 	return false;
 }
 bool
+cluster_wal_thread_recovered_writer_matches(const ClusterWalSourceRef *ref, uint64 epoch)
+{
+	return false;
+}
+bool
 LWLockHeldByMe(LWLock *lock)
 {
 	return false;

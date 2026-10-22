@@ -78,9 +78,11 @@ cluster_wal_writer_check(const ClusterWalWriterToken *work)
 	if (!cluster_external_fence_runtime_active()
 		&& (MyBackendType == B_STARTUP
 				? (writer_startup.input_kind != CLUSTER_WAL_STARTUP_INITIALIZED
-				   && writer_startup.input_kind != CLUSTER_WAL_STARTUP_CLEAN)
+				   && writer_startup.input_kind != CLUSTER_WAL_STARTUP_CLEAN
+				   && writer_startup.input_kind != CLUSTER_WAL_STARTUP_RECOVERED)
 				: (!cluster_wal_thread_initialized_writer_matches(&work->ref, work->epoch)
-				   && !cluster_wal_thread_clean_writer_matches(&work->ref, work->epoch))))
+				   && !cluster_wal_thread_clean_writer_matches(&work->ref, work->epoch)
+				   && !cluster_wal_thread_recovered_writer_matches(&work->ref, work->epoch))))
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	cluster_write_fence_observe(&fence);
 	if (!fence.enforcing || !fence.attached || !fence.engaged || fence.self_fenced

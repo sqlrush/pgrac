@@ -104,6 +104,13 @@ cluster_wal_thread_initialized_writer_matches(const ClusterWalSourceRef *ref pg_
 	abort();
 }
 
+bool
+cluster_wal_thread_recovered_writer_matches(const ClusterWalSourceRef *ref pg_attribute_unused(),
+													  uint64 epoch pg_attribute_unused())
+{
+	abort();
+}
+
 #include "../../backend/cluster/cluster_uba.c"
 
 #undef printf
