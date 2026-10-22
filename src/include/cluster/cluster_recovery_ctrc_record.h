@@ -144,5 +144,54 @@ extern bool cluster_recovery_ctrc_record_hash_v2(const uint8 source_identity_dig
 												 XLogRecPtr start, XLogRecPtr end,
 												 const uint8 *raw_record, size_t raw_length,
 												 uint8 out[32]);
+
+/* Immutable canonical bytes supplied by the original graph producers. */
+typedef struct ClusterRecoveryCTRCGraphBytesV2 {
+	const uint8 *data;
+	size_t length;
+} ClusterRecoveryCTRCGraphBytesV2;
+
+typedef struct ClusterRecoveryCTRCGraphNodeV2 {
+	uint16 kind; /* 1 reference/history, 2 original-owner proof */
+	ClusterRecoveryCTRCGraphBytesV2 key;
+	ClusterRecoveryCTRCGraphBytesV2 evidence;
+} ClusterRecoveryCTRCGraphNodeV2;
+
+typedef struct ClusterRecoveryCTRCGraphEdgeV2 {
+	uint16 kind; /* 1 requires, 2 references, 3 retained_history, 4 discharged_by */
+	size_t from; /* indices into the supplied nodes, never hashed as indices */
+	size_t to;
+} ClusterRecoveryCTRCGraphEdgeV2;
+
+typedef struct ClusterRecoveryCTRCGraphV2 {
+	const ClusterRecoveryCTRCGraphNodeV2 *nodes;
+	size_t node_count;
+	const ClusterRecoveryCTRCGraphEdgeV2 *edges;
+	size_t edge_count;
+	const size_t *roots; /* indices into nodes; canonical root ids must be unique */
+	size_t root_count;
+} ClusterRecoveryCTRCGraphV2;
+
+/* Canonical transcript hash only, outside critical sections/spinlocks. The
+ * original producers must already have canonical key/evidence atoms, lawful
+ * roots/edges, complete reference/effect coverage, applicable owner rules and
+ * witnesses, current/future-record exclusion and final source/ROOT checks.
+ * This primitive does not parse/qualify those bytes or establish those proofs.
+ * Hash success supplies no D0 admission, native base/floor/issued/terminal,
+ * target durability, release or live execution authority.
+ *
+ * Sort full encoded ids/edges as unsigned bytes, collapse identical nodes/
+ * edges, reject conflicting evidence, duplicate roots, missing endpoints and
+ * unreachable owner nodes. At least one reachable owner is required; legal
+ * cycles are permitted. Scratch is bounded by MaxAllocSize; scratch allocation
+ * failure refuses. The original codec/crypto ERROR behavior is unchanged.
+ * Bind the record's canonical fields with input/source-target hashes;
+ * graph_sha256 is ignored to avoid self-reference. Inputs remain immutable for
+ * the call. out may alias any input consumed before publication; on refusal
+ * clear exactly 32 bytes. No graph builder, proof verifier, I/O or live caller. */
+extern bool cluster_recovery_ctrc_graph_hash_v2(const ClusterRecoveryCTRCReleaseV2 *record,
+												uint64 system_identifier,
+												const ClusterRecoveryCTRCGraphV2 *graph,
+												uint8 out[32]);
 #endif
 #endif

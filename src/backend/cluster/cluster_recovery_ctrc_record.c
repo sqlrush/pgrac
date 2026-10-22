@@ -17,6 +17,292 @@
 #include "common/cryptohash.h"
 #include "port/pg_crc32c.h"
 #include "replication/origin.h"
+#include "utils/memutils.h"
+
+typedef struct CTRCGraphNodeWork {
+	ClusterRecoveryCTRCGraphBytesV2 id;
+	ClusterRecoveryCTRCGraphBytesV2 evidence;
+	size_t original;
+	bool owner;
+	bool seen;
+} CTRCGraphNodeWork;
+
+typedef struct CTRCGraphEdgeWork {
+	ClusterRecoveryCTRCGraphBytesV2 bytes;
+	size_t from;
+	size_t to;
+	size_t next;
+} CTRCGraphEdgeWork;
+
+/* Bound the combined scratch before allocation, including multiplication. */
+static bool
+ctrc_graph_size_add(size_t *total, size_t count, size_t width)
+{
+	if (width == 0 || count > (MaxAllocSize - *total) / width)
+		return false;
+	*total += count * width;
+	return true;
+}
+
+static int
+ctrc_graph_bytes_cmp(const ClusterRecoveryCTRCGraphBytesV2 *a,
+					 const ClusterRecoveryCTRCGraphBytesV2 *b)
+{
+	int cmp = memcmp(a->data, b->data, Min(a->length, b->length));
+
+	return cmp != 0 ? cmp : (a->length > b->length) - (a->length < b->length);
+}
+
+static int
+ctrc_graph_node_cmp(const void *a, const void *b)
+{
+	return ctrc_graph_bytes_cmp(&((const CTRCGraphNodeWork *)a)->id,
+								&((const CTRCGraphNodeWork *)b)->id);
+}
+
+static int
+ctrc_graph_edge_cmp(const void *a, const void *b)
+{
+	return ctrc_graph_bytes_cmp(&((const CTRCGraphEdgeWork *)a)->bytes,
+								&((const CTRCGraphEdgeWork *)b)->bytes);
+}
+
+static int
+ctrc_graph_rank_cmp(const void *a, const void *b)
+{
+	size_t left = *(const size_t *)a, right = *(const size_t *)b;
+
+	return (left > right) - (left < right);
+}
+
+static uint8 *
+ctrc_graph_put_bytes(uint8 *next, const ClusterRecoveryCTRCGraphBytesV2 *bytes)
+{
+	cluster_undo_tt_ctrc_put_u64_le(next, bytes->length);
+	memcpy(next + 8, bytes->data, bytes->length);
+	return next + 8 + bytes->length;
+}
+
+static bool
+ctrc_graph_hash_u64(pg_cryptohash_ctx *hash, uint64 value)
+{
+	uint8 bytes[8];
+
+	cluster_undo_tt_ctrc_put_u64_le(bytes, value);
+	return pg_cryptohash_update(hash, bytes, sizeof(bytes)) == 0;
+}
+
+static bool
+ctrc_graph_hash_bytes(pg_cryptohash_ctx *hash, const ClusterRecoveryCTRCGraphBytesV2 *bytes)
+{
+	return ctrc_graph_hash_u64(hash, bytes->length)
+		   && pg_cryptohash_update(hash, bytes->data, bytes->length) == 0;
+}
+
+bool
+cluster_recovery_ctrc_graph_hash_v2(const ClusterRecoveryCTRCReleaseV2 *record,
+									uint64 system_identifier,
+									const ClusterRecoveryCTRCGraphV2 *graph, uint8 out[32])
+{
+	static const uint8 domain[] = "PGRAC-D0-OBLIGATION-GRAPH-V2";
+	ClusterRecoveryCTRCReleaseV2 value;
+	ClusterRecoveryCTRCGraphV2 view;
+	CTRCGraphNodeWork *nodes = NULL;
+	CTRCGraphEdgeWork *edges = NULL;
+	size_t *workspace = NULL, *rank, *heads, *queue, *roots;
+	uint8 *arena = NULL, *next;
+	size_t scratch = 0, arena_size = 0, node_count = 0, edge_count = 0;
+	size_t first = 0, last = 0;
+	uint8 payload[CLUSTER_RECOVERY_CTRC_BYTES], digest[32];
+	pg_cryptohash_ctx *hash = NULL;
+	bool owner = false, ok = false;
+
+	if (out == NULL)
+		return false;
+	if (record == NULL || system_identifier == 0 || graph == NULL)
+		goto done;
+	view = *graph;
+	/* Count bounds precede any access to supplied arrays. No caller count,
+	 * native pointer/index or struct padding enters the transcript. */
+	if (view.node_count == 0 || view.root_count == 0 || view.root_count > view.node_count
+		|| view.nodes == NULL || view.roots == NULL || (view.edge_count != 0 && view.edges == NULL)
+		|| !ctrc_graph_size_add(&scratch, view.node_count, sizeof(*nodes))
+		|| !ctrc_graph_size_add(&scratch, view.edge_count, sizeof(*edges))
+		|| !ctrc_graph_size_add(&scratch, view.node_count, 3 * sizeof(size_t))
+		|| !ctrc_graph_size_add(&scratch, view.root_count, sizeof(size_t)))
+		goto done;
+	for (size_t i = 0; i < view.node_count; i++) {
+		const ClusterRecoveryCTRCGraphNodeV2 *node = &view.nodes[i];
+
+		if ((node->kind != 1 && node->kind != 2) || node->key.data == NULL || node->key.length == 0
+			|| node->evidence.data == NULL || node->evidence.length == 0
+			|| node->key.length > MaxAllocSize - 18
+			|| node->evidence.length > MaxAllocSize - 18 - node->key.length
+			|| !ctrc_graph_size_add(&arena_size, 1, 10 + node->key.length))
+			goto done;
+	}
+	for (size_t i = 0; i < view.edge_count; i++) {
+		const ClusterRecoveryCTRCGraphEdgeV2 *edge = &view.edges[i];
+
+		if (edge->kind < 1 || edge->kind > 4 || edge->from >= view.node_count
+			|| edge->to >= view.node_count || !ctrc_graph_size_add(&arena_size, 1, 38)
+			|| !ctrc_graph_size_add(&arena_size, 1, view.nodes[edge->from].key.length)
+			|| !ctrc_graph_size_add(&arena_size, 1, view.nodes[edge->to].key.length))
+			goto done;
+	}
+	if (!ctrc_graph_size_add(&scratch, 1, arena_size))
+		goto done;
+	for (size_t i = 0; i < view.root_count; i++)
+		if (view.roots[i] >= view.node_count)
+			goto done;
+
+	/* Reuse the complete codec's field/identity checks, but not the graph
+	 * digest being calculated. Both digest fields at 192..255 are excluded. */
+	value = *record;
+	memset(value.graph_sha256, 1, sizeof(value.graph_sha256));
+	if (!cluster_recovery_ctrc_encode_v2(&value, system_identifier, payload, sizeof(payload)))
+		goto done;
+	nodes = palloc_extended(view.node_count * sizeof(*nodes), MCXT_ALLOC_NO_OOM);
+	if (nodes == NULL)
+		goto done;
+	if (view.edge_count != 0) {
+		edges = palloc_extended(view.edge_count * sizeof(*edges), MCXT_ALLOC_NO_OOM);
+		if (edges == NULL)
+			goto done;
+	}
+	workspace = palloc_extended((3 * view.node_count + view.root_count) * sizeof(size_t),
+								MCXT_ALLOC_NO_OOM);
+	if (workspace == NULL)
+		goto done;
+	arena = palloc_extended(arena_size, MCXT_ALLOC_NO_OOM);
+	if (arena == NULL)
+		goto done;
+	rank = workspace;
+	heads = rank + view.node_count;
+	queue = heads + view.node_count;
+	roots = queue + view.node_count;
+	next = arena;
+	for (size_t i = 0; i < view.node_count; i++) {
+		const ClusterRecoveryCTRCGraphNodeV2 *node = &view.nodes[i];
+
+		nodes[i].id = (ClusterRecoveryCTRCGraphBytesV2){ next, 10 + node->key.length };
+		nodes[i].evidence = node->evidence;
+		nodes[i].original = i;
+		nodes[i].owner = node->kind == 2;
+		nodes[i].seen = false;
+		cluster_undo_tt_ctrc_put_u16_le(next, node->kind);
+		next = ctrc_graph_put_bytes(next + 2, &node->key);
+	}
+	qsort(nodes, view.node_count, sizeof(*nodes), ctrc_graph_node_cmp);
+	for (size_t i = 0; i < view.node_count; i++) {
+		CTRCGraphNodeWork node = nodes[i];
+
+		if (node_count != 0 && ctrc_graph_bytes_cmp(&nodes[node_count - 1].id, &node.id) == 0) {
+			if (ctrc_graph_bytes_cmp(&nodes[node_count - 1].evidence, &node.evidence) != 0)
+				goto done;
+		} else
+			nodes[node_count++] = node;
+		rank[node.original] = node_count - 1;
+	}
+	for (size_t i = 0; i < view.root_count; i++)
+		roots[i] = rank[view.roots[i]];
+	qsort(roots, view.root_count, sizeof(*roots), ctrc_graph_rank_cmp);
+	for (size_t i = 1; i < view.root_count; i++)
+		if (roots[i - 1] == roots[i])
+			goto done;
+	for (size_t i = 0; i < view.edge_count; i++) {
+		const ClusterRecoveryCTRCGraphEdgeV2 *edge = &view.edges[i];
+		uint8 *start = next;
+
+		edges[i].from = rank[edge->from];
+		edges[i].to = rank[edge->to];
+		cluster_undo_tt_ctrc_put_u16_le(next, edge->kind);
+		next = ctrc_graph_put_bytes(next + 2, &nodes[edges[i].from].id);
+		next = ctrc_graph_put_bytes(next, &nodes[edges[i].to].id);
+		edges[i].bytes = (ClusterRecoveryCTRCGraphBytesV2){ start, next - start };
+	}
+	if (view.edge_count != 0)
+		qsort(edges, view.edge_count, sizeof(*edges), ctrc_graph_edge_cmp);
+	for (size_t i = 0; i < view.edge_count; i++)
+		if (edge_count == 0
+			|| ctrc_graph_bytes_cmp(&edges[edge_count - 1].bytes, &edges[i].bytes) != 0)
+			edges[edge_count++] = edges[i];
+
+	/* Directed iterative reachability permits legal reference cycles, without
+	 * recursion or a traversal-order hash. Roots are producer-qualified. */
+	for (size_t i = 0; i < node_count; i++)
+		heads[i] = SIZE_MAX;
+	for (size_t i = 0; i < edge_count; i++) {
+		edges[i].next = heads[edges[i].from];
+		heads[edges[i].from] = i;
+	}
+	for (size_t i = 0; i < view.root_count; i++) {
+		nodes[roots[i]].seen = true;
+		queue[last++] = roots[i];
+	}
+	while (first < last) {
+		size_t from = queue[first++];
+
+		for (size_t i = heads[from]; i != SIZE_MAX; i = edges[i].next) {
+			size_t to = edges[i].to;
+
+			if (!nodes[to].seen) {
+				nodes[to].seen = true;
+				queue[last++] = to;
+			}
+		}
+	}
+	for (size_t i = 0; i < node_count; i++)
+		if (nodes[i].owner) {
+			if (!nodes[i].seen)
+				goto done;
+			owner = true;
+		}
+	if (!owner)
+		goto done;
+
+	hash = pg_cryptohash_create(PG_SHA256);
+	if (hash == NULL || pg_cryptohash_init(hash) != 0
+		|| pg_cryptohash_update(hash, domain, sizeof(domain) - 1) != 0
+		|| pg_cryptohash_update(hash, payload, 192) != 0
+		|| pg_cryptohash_update(hash, payload + 256, 64) != 0
+		|| !ctrc_graph_hash_u64(hash, view.root_count))
+		goto done;
+	for (size_t i = 0; i < view.root_count; i++)
+		if (!ctrc_graph_hash_bytes(hash, &nodes[roots[i]].id))
+			goto done;
+	if (!ctrc_graph_hash_u64(hash, node_count))
+		goto done;
+	for (size_t i = 0; i < node_count; i++)
+		if (!ctrc_graph_hash_u64(hash, nodes[i].id.length + 8 + nodes[i].evidence.length)
+			|| pg_cryptohash_update(hash, nodes[i].id.data, nodes[i].id.length) != 0
+			|| !ctrc_graph_hash_bytes(hash, &nodes[i].evidence))
+			goto done;
+	if (!ctrc_graph_hash_u64(hash, edge_count))
+		goto done;
+	for (size_t i = 0; i < edge_count; i++)
+		if (!ctrc_graph_hash_bytes(hash, &edges[i].bytes))
+			goto done;
+	ok = pg_cryptohash_final(hash, digest, sizeof(digest)) == 0;
+
+done:
+	if (hash != NULL)
+		pg_cryptohash_free(hash);
+	if (arena != NULL)
+		pfree(arena);
+	if (workspace != NULL)
+		pfree(workspace);
+	if (edges != NULL)
+		pfree(edges);
+	if (nodes != NULL)
+		pfree(nodes);
+	/* Consume all aliased input before publication, including on refusal. */
+	if (ok)
+		memcpy(out, digest, sizeof(digest));
+	else
+		memset(out, 0, 32);
+	return ok;
+}
 
 bool
 cluster_recovery_ctrc_read_v2(const XLogReaderState *reader, ClusterRecoveryCTRCReleaseV2 *out)
