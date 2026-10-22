@@ -4946,10 +4946,275 @@ UT_TEST(owner_key_full_width_fields_are_bound)
 	}
 }
 
+/* Python struct.pack/sorted/set literal oracle: structural envelopes only,
+ * never qualified native witness or original-owner completion evidence. */
+static const uint8 raw_evidence_atom0[] = {
+	0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x02, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x80,
+};
+static const uint8 raw_evidence_atom1[] = {
+	0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0xaa,
+};
+static const uint8 raw_evidence_atom2[] = {
+	0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0xff,
+};
+static const uint8 raw_evidence_golden[] = {
+	0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x15, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x02, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x80, 0x15, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0xff, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xaa,
+};
+
+static void
+raw_evidence_views(ClusterRecoveryCTRCGraphBytesV2 atoms[3])
+{
+	atoms[0] = (ClusterRecoveryCTRCGraphBytesV2){raw_evidence_atom0, sizeof(raw_evidence_atom0)};
+	atoms[1] = (ClusterRecoveryCTRCGraphBytesV2){raw_evidence_atom1, sizeof(raw_evidence_atom1)};
+	atoms[2] = (ClusterRecoveryCTRCGraphBytesV2){raw_evidence_atom2, sizeof(raw_evidence_atom2)};
+}
+
+static bool
+raw_evidence_refused(const ClusterRecoveryCTRCGraphBytesV2 *atoms, size_t count, size_t capacity)
+{
+	uint8 out[258];
+	size_t length = 999;
+
+	memset(out, 0xa5, sizeof(out));
+	if (cluster_recovery_ctrc_raw_evidence_v2(atoms, count, out + 1, capacity, &length)
+		|| length != 0 || out[0] != 0xa5 || !all_zero(out + 1, Min(capacity, (size_t)8)))
+		return false;
+	for (size_t i = 1 + Min(capacity, (size_t)8); i < sizeof(out); i++)
+		if (out[i] != 0xa5)
+			return false;
+	return true;
+}
+
+UT_TEST(raw_evidence_independent_golden_and_immutable)
+{
+	ClusterRecoveryCTRCGraphBytesV2 atoms[5], saved[5];
+	uint8 out[sizeof(raw_evidence_golden) + 1];
+	size_t length = 0;
+
+	raw_evidence_views(atoms);
+	atoms[3] = atoms[0]; atoms[4] = atoms[2];
+	memcpy(saved, atoms, sizeof(atoms));
+	memset(out, 0xa5, sizeof(out));
+	UT_ASSERT(cluster_recovery_ctrc_raw_evidence_v2(atoms, 5, out, sizeof(out), &length));
+	UT_ASSERT_EQ(length, sizeof(raw_evidence_golden));
+	UT_ASSERT(memcmp(out, raw_evidence_golden, length) == 0);
+	UT_ASSERT(out[length] == 0xa5 && memcmp(atoms, saved, sizeof(atoms)) == 0);
+}
+
+UT_TEST(raw_evidence_permutations_and_full_encoded_sort)
+{
+	ClusterRecoveryCTRCGraphBytesV2 atoms[3], shuffled[3];
+	uint8 out[sizeof(raw_evidence_golden)];
+	size_t length;
+
+	raw_evidence_views(atoms);
+	for (unsigned a = 0; a < 3; a++)
+		for (unsigned b = 0; b < 3; b++)
+			for (unsigned c = 0; c < 3; c++) {
+				if (a == b || a == c || b == c) continue;
+				shuffled[0] = atoms[a]; shuffled[1] = atoms[b]; shuffled[2] = atoms[c];
+				UT_ASSERT(cluster_recovery_ctrc_raw_evidence_v2(shuffled, 3, out, sizeof(out), &length));
+				UT_ASSERT_EQ(length, sizeof(out));
+				UT_ASSERT(memcmp(out, raw_evidence_golden, sizeof(out)) == 0);
+			}
+	/* Length bytes precede subject bytes: the one-byte ff subject sorts before
+	 * the two-byte 0100 subject. memcmp must use unsigned byte order. */
+	UT_ASSERT(memcmp(out + 16, raw_evidence_atom0, sizeof(raw_evidence_atom0)) == 0);
+	{
+		uint8 low[20], high[20];
+		ClusterRecoveryCTRCGraphBytesV2 ordered[2];
+		uint8 encoded[64];
+
+		memcpy(low, raw_evidence_atom1, 20); memcpy(high, low, 20);
+		low[10] = 0x7f; high[10] = 0x80;
+		ordered[0] = (ClusterRecoveryCTRCGraphBytesV2){high, 20};
+		ordered[1] = (ClusterRecoveryCTRCGraphBytesV2){low, 20};
+		UT_ASSERT(cluster_recovery_ctrc_raw_evidence_v2(ordered, 2, encoded, sizeof(encoded), &length));
+		UT_ASSERT(memcmp(encoded + 16, low, 20) == 0);
+	}
+}
+
+UT_TEST(raw_evidence_conflicting_subject_is_atomic)
+{
+	ClusterRecoveryCTRCGraphBytesV2 atoms[4];
+	uint8 changed[sizeof(raw_evidence_atom1) + 1];
+
+	raw_evidence_views(atoms);
+	memcpy(changed, raw_evidence_atom1, sizeof(raw_evidence_atom1));
+	changed[sizeof(raw_evidence_atom1) - 1] ^= 1;
+	atoms[3] = (ClusterRecoveryCTRCGraphBytesV2){changed, sizeof(raw_evidence_atom1)};
+	UT_ASSERT(raw_evidence_refused(atoms, 4, 256));
+	/* Different-length bytes are also a conflict, not a second witness. */
+	changed[11] = 2; changed[sizeof(changed) - 1] = 0x42;
+	atoms[3].length = sizeof(changed);
+	UT_ASSERT(raw_evidence_refused(atoms, 4, 256));
+}
+
+UT_TEST(raw_evidence_envelope_refusals)
+{
+	for (unsigned change = 0; change < 13; change++) {
+		ClusterRecoveryCTRCGraphBytesV2 atom;
+		uint8 bytes[sizeof(raw_evidence_atom1) + 1];
+
+		memcpy(bytes, raw_evidence_atom1, sizeof(raw_evidence_atom1));
+		bytes[sizeof(raw_evidence_atom1)] = 0;
+		atom = (ClusterRecoveryCTRCGraphBytesV2){bytes, sizeof(raw_evidence_atom1)};
+		switch (change) {
+		case 0: bytes[0] = 0; break;
+		case 1: bytes[0] = 3; break;
+		case 2: bytes[0] = 4; break;
+		case 3: bytes[1] = 1; break;
+		case 4: bytes[2] = 0; break;
+		case 5: memset(bytes + 2, 0xff, 8); break;
+		case 6: bytes[2] = 2; break;
+		case 7: bytes[11] = 0; break;
+		case 8: memset(bytes + 11, 0xff, 8); break;
+		case 9: bytes[11] = 2; break;
+		case 10: atom.length--; break;
+		case 11: atom.length++; break;
+		case 12: atom.length = 0; break;
+		}
+		UT_ASSERT(raw_evidence_refused(&atom, 1, 256));
+	}
+}
+
+UT_TEST(raw_evidence_empty_and_exact_deduplicated_capacity)
+{
+	ClusterRecoveryCTRCGraphBytesV2 atoms[5];
+	uint8 out[sizeof(raw_evidence_golden)];
+	size_t length;
+
+	memset(out, 0xa5, sizeof(out));
+	UT_ASSERT(cluster_recovery_ctrc_raw_evidence_v2(NULL, 0, out, 8, &length));
+	UT_ASSERT_EQ(length, 8);
+	UT_ASSERT(all_zero(out, 8) && out[8] == 0xa5);
+	raw_evidence_views(atoms); atoms[3] = atoms[0]; atoms[4] = atoms[1];
+	UT_ASSERT(cluster_recovery_ctrc_raw_evidence_v2(atoms, 5, out, sizeof(out), &length));
+	UT_ASSERT(memcmp(out, raw_evidence_golden, sizeof(out)) == 0);
+	UT_ASSERT(raw_evidence_refused(atoms, 5, sizeof(out) - 1));
+}
+
+UT_TEST(raw_evidence_null_bounds_and_bounded_clear)
+{
+	ClusterRecoveryCTRCGraphBytesV2 atoms[3], bad;
+	const size_t capacities[] = {0, 1, 7, 8, SIZE_MAX};
+	uint8 out[8];
+	size_t length = 999;
+
+	raw_evidence_views(atoms);
+	for (size_t i = 0; i < lengthof(capacities); i++)
+		UT_ASSERT(raw_evidence_refused(atoms, 3, capacities[i]));
+	UT_ASSERT(raw_evidence_refused(NULL, 1, 256));
+	UT_ASSERT(raw_evidence_refused(atoms, SIZE_MAX, 256));
+	bad = (ClusterRecoveryCTRCGraphBytesV2){NULL, 20};
+	UT_ASSERT(raw_evidence_refused(&bad, 1, 256));
+	bad = (ClusterRecoveryCTRCGraphBytesV2){(const uint8 *)1, SIZE_MAX};
+	UT_ASSERT(raw_evidence_refused(&bad, 1, 256));
+	UT_ASSERT(!cluster_recovery_ctrc_raw_evidence_v2(atoms, 3, NULL, 256, &length));
+	UT_ASSERT_EQ(length, 0);
+	memset(out, 0xa5, sizeof(out));
+	UT_ASSERT(!cluster_recovery_ctrc_raw_evidence_v2(atoms, 3, out, sizeof(out), NULL));
+	UT_ASSERT(all_zero(out, sizeof(out)));
+}
+
+UT_TEST(raw_evidence_unaligned_views_bytes_metadata_and_aliases)
+{
+	ClusterRecoveryCTRCGraphBytesV2 atoms[3];
+	uint8 arena[512], meta[sizeof(size_t) + 2];
+	size_t length;
+
+	raw_evidence_views(atoms);
+	for (unsigned i = 0; i < 3; i++) {
+		memcpy(arena + 121 + 40 * i, atoms[i].data, atoms[i].length);
+		atoms[i].data = arena + 121 + 40 * i;
+	}
+	memcpy(arena + 1, atoms, sizeof(atoms));
+	memset(meta, 0xa5, sizeof(meta));
+	UT_ASSERT(cluster_recovery_ctrc_raw_evidence_v2(
+		(const ClusterRecoveryCTRCGraphBytesV2 *)(arena + 1), 3, arena + 131,
+		sizeof(raw_evidence_golden), (size_t *)(meta + 1)));
+	memcpy(&length, meta + 1, sizeof(length));
+	UT_ASSERT_EQ(length, sizeof(raw_evidence_golden));
+	UT_ASSERT(memcmp(arena + 131, raw_evidence_golden, length) == 0);
+	UT_ASSERT(meta[0] == 0xa5 && meta[sizeof(meta) - 1] == 0xa5);
+	/* Publication may replace the input view array as well. */
+	raw_evidence_views(atoms); memcpy(arena + 1, atoms, sizeof(atoms));
+	UT_ASSERT(cluster_recovery_ctrc_raw_evidence_v2(
+		(const ClusterRecoveryCTRCGraphBytesV2 *)(arena + 1), 3, arena + 1,
+		sizeof(raw_evidence_golden), &length));
+	UT_ASSERT(memcmp(arena + 1, raw_evidence_golden, length) == 0);
+}
+
+UT_TEST(raw_evidence_allocation_refusal_and_cleanup)
+{
+	ClusterRecoveryCTRCGraphBytesV2 atoms[3];
+	uint8 out[sizeof(raw_evidence_golden)];
+	size_t length;
+	unsigned calls = graph_alloc_calls;
+	bool refused;
+
+	raw_evidence_views(atoms);
+	UT_ASSERT_EQ(graph_alloc_live, 0);
+	graph_alloc_fail_at = calls + 1;
+	refused = raw_evidence_refused(atoms, 3, sizeof(out));
+	graph_alloc_fail_at = 0;
+	UT_ASSERT(refused && graph_alloc_calls == calls + 1 && graph_alloc_live == 0);
+	UT_ASSERT(cluster_recovery_ctrc_raw_evidence_v2(atoms, 3, out, sizeof(out), &length));
+	UT_ASSERT_EQ(graph_alloc_live, 0);
+	UT_ASSERT_EQ(graph_alloc_calls, calls + 2);
+}
+
+UT_TEST(raw_evidence_original_wal_and_data_encoder_composition)
+{
+	NativeRaw wire;
+	NativePages pages;
+	XLogReaderState *reader;
+	ClusterRecoveryNamespaceEntry entry;
+	PGAlignedBlock page;
+	ClusterRecoveryCTRCTTDataReferenceV2 data;
+	ClusterRecoveryCTRCGraphBytesV2 atoms[3];
+	uint8 wal[CLUSTER_RECOVERY_CTRC_WAL_ATOM_BYTES], out[BLCKSZ + 2048];
+	size_t length, data_length, raw_length = native_wire(&wire, golden, sizeof(golden), 0);
+	bool encoded;
+
+	UT_ASSERT(data_sample(&entry, &page, 2, 257, 5));
+	UT_ASSERT(cluster_recovery_ctrc_tt_data_reference_v2(SYSTEM_ID, 99, &entry, page.data,
+		BLCKSZ, 5, &data));
+	/* The original reader uses ZERO allocations, outside the graph OOM leaf. */
+	UT_ASSERT_EQ(graph_alloc_live, 0);
+	graph_alloc_tracking = false;
+	UT_ASSERT(native_read(&pages, &wire, raw_length, false, &reader));
+	encoded = cluster_recovery_ctrc_wal_atom_v2(reader, 7, raw_source, wire.bytes,
+		raw_length, wal, sizeof(wal));
+	XLogReaderFree(reader);
+	graph_alloc_tracking = true;
+	UT_ASSERT(encoded);
+	data_length = data.evidence_length - 16;
+	atoms[0] = (ClusterRecoveryCTRCGraphBytesV2){data.evidence + 16, data_length};
+	atoms[1] = (ClusterRecoveryCTRCGraphBytesV2){wal, sizeof(wal)};
+	atoms[2] = atoms[0];
+	UT_ASSERT(cluster_recovery_ctrc_raw_evidence_v2(atoms, 3, out, sizeof(out), &length));
+	UT_ASSERT_EQ(length, 24 + sizeof(wal) + data_length);
+	UT_ASSERT(out[0] == 2 && all_zero(out + 1, 7));
+	UT_ASSERT(memcmp(out + 16, wal, sizeof(wal)) == 0);
+	UT_ASSERT(cluster_undo_tt_ctrc_get_u64_le(out + 8) == sizeof(wal));
+	UT_ASSERT(cluster_undo_tt_ctrc_get_u64_le(out + 16 + sizeof(wal)) == data_length);
+	UT_ASSERT(memcmp(out + 24 + sizeof(wal), data.evidence + 16, data_length) == 0);
+	UT_ASSERT_EQ(graph_alloc_live, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(149);
+	UT_PLAN(158);
 	UT_RUN(golden_encoding);
 	UT_RUN(golden_decoding);
 	UT_RUN(unaligned_buffers);
@@ -5100,6 +5365,15 @@ main(void)
 	UT_RUN(owner_key_unaligned_and_input_output_aliases);
 	UT_RUN(owner_key_allocation_refusal_frees_scratch);
 	UT_RUN(owner_key_full_width_fields_are_bound);
+	UT_RUN(raw_evidence_independent_golden_and_immutable);
+	UT_RUN(raw_evidence_permutations_and_full_encoded_sort);
+	UT_RUN(raw_evidence_conflicting_subject_is_atomic);
+	UT_RUN(raw_evidence_envelope_refusals);
+	UT_RUN(raw_evidence_empty_and_exact_deduplicated_capacity);
+	UT_RUN(raw_evidence_null_bounds_and_bounded_clear);
+	UT_RUN(raw_evidence_unaligned_views_bytes_metadata_and_aliases);
+	UT_RUN(raw_evidence_allocation_refusal_and_cleanup);
+	UT_RUN(raw_evidence_original_wal_and_data_encoder_composition);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

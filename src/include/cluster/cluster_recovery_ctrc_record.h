@@ -373,6 +373,28 @@ typedef struct ClusterRecoveryCTRCGraphBytesV2 {
 	size_t length;
 } ClusterRecoveryCTRCGraphBytesV2;
 
+/* Canonical raw witness evidence: U64(count) || concat(B(atom)), where each
+ * input atom is U16(kind) || B(subject) || B(bytes). Only raw WAL kind1 and
+ * native DATA/UNDO kind2 envelopes are supported; subject/bytes are nonempty.
+ * Sort complete unsigned encoded bytes, collapse exact duplicates, and refuse
+ * conflicting bytes for the same kind/subject. This structural codec does not
+ * qualify subjects or verify raw CRC/source, owner rules or completion. Inputs
+ * must come from the original native encoders with the caller's source/cut/
+ * ROOT/pin/owner reread and final revalidation prerequisites intact. An empty
+ * encoding is not permission to discharge an obligation. No live caller,
+ * completion atom3/4, graph admission, I/O, durability or release authority.
+ *
+ * Outside critical sections/spinlocks; one MaxAllocSize-bounded NO_OOM scratch.
+ * Inputs must remain immutable and have valid storage for their declared
+ * sizes. Views/bytes may be unaligned and overlap out: all are consumed before
+ * publication. out_length is disjoint caller metadata (may be unaligned), not
+ * encoded. Capacity is at most MaxAllocSize. Success writes the exact canonical
+ * length, leaving any tail unchanged. Refusal sets out_length to zero if given
+ * and clears min(out_capacity,8) bytes if out is non-NULL; no partial new tail
+ * is published. Allocation failure refuses. */
+extern bool cluster_recovery_ctrc_raw_evidence_v2(const ClusterRecoveryCTRCGraphBytesV2 *atoms,
+	size_t atom_count, uint8 *out, size_t out_capacity, size_t *out_length);
+
 typedef struct ClusterRecoveryCTRCGraphNodeV2 {
 	uint16 kind; /* 1 reference/history, 2 original-owner proof */
 	ClusterRecoveryCTRCGraphBytesV2 key;

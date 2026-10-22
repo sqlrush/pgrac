@@ -1299,4 +1299,104 @@ refused:
 	return false;
 }
 
+typedef struct CTRCRawEvidenceWork {
+	ClusterRecoveryCTRCGraphBytesV2 atom;
+	size_t identity_length;
+} CTRCRawEvidenceWork;
+
+static int
+ctrc_raw_evidence_cmp(const void *a, const void *b)
+{
+	return ctrc_graph_bytes_cmp(&((const CTRCRawEvidenceWork *)a)->atom,
+								&((const CTRCRawEvidenceWork *)b)->atom);
+}
+
+bool
+cluster_recovery_ctrc_raw_evidence_v2(const ClusterRecoveryCTRCGraphBytesV2 *atoms,
+	size_t atom_count, uint8 *out, size_t out_capacity, size_t *out_length)
+{
+	CTRCRawEvidenceWork *work = NULL;
+	size_t scratch = 0, length = 8, unique = 0, zero = 0;
+	uint8 *next;
+
+	if (out == NULL || out_length == NULL || out_capacity < 8 || out_capacity > MaxAllocSize)
+		goto refused;
+	if (atom_count != 0) {
+		if (atoms == NULL || atom_count > MaxAllocSize / sizeof(*atoms)
+			|| !ctrc_graph_size_add(&scratch, atom_count, sizeof(*work)))
+			goto refused;
+		/* Bound all descriptors and byte copies before reading any envelope. */
+		for (size_t i = 0; i < atom_count; i++) {
+			ClusterRecoveryCTRCGraphBytesV2 atom;
+
+			memcpy(&atom, (const uint8 *)atoms + i * sizeof(atom), sizeof(atom));
+			if (atom.data == NULL || atom.length < 20
+				|| !ctrc_graph_size_add(&scratch, 1, atom.length))
+				goto refused;
+		}
+		work = palloc_extended(scratch, MCXT_ALLOC_NO_OOM);
+		if (work == NULL)
+			goto refused;
+		next = (uint8 *)(work + atom_count);
+		for (size_t i = 0; i < atom_count; i++) {
+			ClusterRecoveryCTRCGraphBytesV2 atom;
+			uint64 subject_length, bytes_length;
+			uint16 kind;
+
+			memcpy(&atom, (const uint8 *)atoms + i * sizeof(atom), sizeof(atom));
+			memcpy(next, atom.data, atom.length);
+			work[i].atom = (ClusterRecoveryCTRCGraphBytesV2){ next, atom.length };
+			kind = cluster_undo_tt_ctrc_get_u16_le(next);
+			subject_length = cluster_undo_tt_ctrc_get_u64_le(next + 2);
+			if ((kind != 1 && kind != 2) || subject_length == 0
+				|| subject_length > atom.length - 18)
+				goto refused;
+			work[i].identity_length = 10 + (size_t)subject_length;
+			bytes_length = cluster_undo_tt_ctrc_get_u64_le(next + work[i].identity_length);
+			if (bytes_length == 0 || bytes_length != atom.length - work[i].identity_length - 8)
+				goto refused;
+			next += atom.length;
+		}
+		qsort(work, atom_count, sizeof(*work), ctrc_raw_evidence_cmp);
+		for (size_t i = 0; i < atom_count; i++) {
+			CTRCRawEvidenceWork atom = work[i];
+
+			if (unique != 0) {
+				const CTRCRawEvidenceWork *previous = &work[unique - 1];
+
+				if (ctrc_graph_bytes_cmp(&previous->atom, &atom.atom) == 0)
+					continue;
+				/* The encoded kind/subject is a prefix, so conflicts are adjacent. */
+				if (previous->identity_length == atom.identity_length
+					&& memcmp(previous->atom.data, atom.atom.data, atom.identity_length) == 0)
+					goto refused;
+			}
+			if (!ctrc_graph_size_add(&length, 1, 8)
+				|| !ctrc_graph_size_add(&length, 1, atom.atom.length))
+				goto refused;
+			work[unique++] = atom;
+		}
+	}
+	if (length > out_capacity)
+		goto refused;
+	/* Every input has been copied and checked before the first output byte. */
+	cluster_undo_tt_ctrc_put_u64_le(out, unique);
+	next = out + 8;
+	for (size_t i = 0; i < unique; i++)
+		next = ctrc_graph_put_bytes(next, &work[i].atom);
+	if (work != NULL)
+		pfree(work);
+	memcpy(out_length, &length, sizeof(length));
+	return true;
+
+refused:
+	if (work != NULL)
+		pfree(work);
+	if (out != NULL)
+		memset(out, 0, Min(out_capacity, (size_t)8));
+	if (out_length != NULL)
+		memcpy(out_length, &zero, sizeof(zero));
+	return false;
+}
+
 #endif
