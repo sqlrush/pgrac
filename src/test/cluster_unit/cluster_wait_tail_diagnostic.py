@@ -166,11 +166,18 @@ def main() -> int:
     for name in sorted(wait_candidates):
         candidate = wait_candidates[name]
         line_numbers = candidate["line_numbers"]
+        line_contexts = candidate["line_contexts"]
         markers = "; ".join(
             f"{needle}={line_numbers[needle]}"
             for needle in candidate["needles"]
         )
         print(f"{name} source lines: {markers}")
+        contexts = "; ".join(
+            f"{needle}="
+            + ",".join(f"{line_no}:{text}" for line_no, text in line_contexts[needle])
+            for needle in candidate["needles"]
+        )
+        print(f"{name} source contexts: {contexts}")
     print("wait events: " + ", ".join(WAIT_EVENT_NAMES))
     print("runtime evidence: NOT_CAPTURED (offline fixture)")
     return 0
@@ -205,6 +212,15 @@ def source_wait_candidate_inventory(root: Path) -> dict[str, dict[str, object]]:
             needle: [line_no for line_no, line in enumerate(lines, start=1) if needle in line]
             for needle in candidate["needles"]
         }
+        candidate["line_contexts"] = {
+            needle: [
+                (line_no, line.strip()[:160])
+                for line_no, line in enumerate(lines, start=1)
+                if needle in line
+            ]
+            for needle in candidate["needles"]
+        }
+        assert all(candidate["line_contexts"][needle] for needle in candidate["needles"])
     return candidates
 
 

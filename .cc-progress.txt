@@ -14,3 +14,7 @@
 2026-10-23 06:18 CST | E | added exact source line-number inventory/output for TX tick, GCS backoff, and PCM timed-wait markers in cluster_wait_tail_diagnostic.py; next run fixture, syntax, and diff checks.
 2026-10-23 06:30 CST | E | added deterministic marker-contract assertion/output for TX, GCS, and PCM wait candidates in cluster_wait_tail_diagnostic.py; next run fixture, syntax, and diff checks.
 2026-10-23 06:32 CST | E | corrected marker-contract path key to match source wait candidate entries; next run fixture, syntax, and diff checks.
+2026-10-23 06:40 CST | E | added bounded source line-context capture for each TX/GCS/PCM wait candidate; next print contexts and run fixture checks.
+2026-10-23 06:41 CST | E | printed deterministic candidate source contexts alongside line numbers; next run fixture checks.
+2026-10-23 06:42 CST | E | asserted every candidate needle has source context, preserving offline-only evidence boundary; next run fixture, syntax, and diff checks.
+2026-10-23 06:45 CST | E | fixed source_wait_candidate_inventory indentation so each candidate retains its own line contexts; next rerun fixture, syntax, and diff checks.
