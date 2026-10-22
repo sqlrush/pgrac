@@ -314,7 +314,8 @@ PID candidates cannot fill absent boot, start, incarnation or causal fields.
 ### Read/image and HOT SQL operations
 
 `WorkloadSql.pm` uses four existing persistent `query_safe` sessions for node
-IDs 0 through 3 in one fresh shared database. Supply dedicated idle sessions
+IDs 0 through 3, plus a separate `hot_reader` session on node 2, in one fresh
+shared database. Supply five distinct dedicated idle sessions
 with autocommit enabled, superuser access and finite query timeouts. The
 module does not form a cluster, open connections or enable trace settings.
 
@@ -322,6 +323,7 @@ module does not form a cluster, open connections or enable trace settings.
 use WorkloadSql; # add this pre2 directory to @INC
 my $driver = WorkloadSql->new(
     sessions => \@sessions,
+    hot_reader => $hot_reader, # another backend on node 2
     schema => 'read_hot_unique_run_name', # must not already exist
     emit => sub { print {$journal} JSON::PP->new->canonical->encode($_[0]), "\n"
                   or die "write SQL journal: $!"; },
@@ -337,8 +339,8 @@ Flush and retain the journal on every attempt, including exceptions. Configure
 each `PostgreSQL::Test::BackgroundPsql` session's finite timeout and call
 `set_query_timer_restart()` before use. The caller closes the sessions and
 performs its cluster shutdown and evidence collection even when `run()` dies.
-The module tries one `ROLLBACK` for each reader it opened and any Q transaction
-without a COMMIT acknowledgement. It preserves original SQL, cleanup and
+The module tries one `ROLLBACK` for each reader it opened and any H writer or
+Q transaction without a COMMIT acknowledgement. It preserves original SQL, cleanup and
 journal errors together, and leaves all three relations for inspection.
 A failed connection can prevent cleanup acknowledgement; this is a failure,
 and the caller must retain it. A failed COMMIT has an unknown outcome; a later
@@ -347,7 +349,10 @@ acknowledged commit is recorded before journal emission can fail. The same
 driver object cannot be run twice.
 
 Node 0 mutates `r_img`, read by node 1; node 2 mutates the separate `h_hot`,
-read by node 3. Both readers hold read-only repeatable-read transactions.
+read by the additional node 2 backend. The module validates all five SQL
+identities before creating tables, including the H reader's node, matching
+postmaster birth and distinct PID, and checks for session replacement at the
+end. Both readers hold read-only repeatable-read transactions.
 The module retains each exported snapshot's actual file contents, validates
 its cluster SCN/epoch and backend/database identity, and uses that SCN for
 `cluster_cr_test_target_image()`. This superuser-only diagnostic accepts only
@@ -361,8 +366,13 @@ The module compares all visible `(id,v)` rows, retaining
 duplicates, across the baseline, ordinary read and FULL reconstruction over
 all relation blocks. The diagnostic returns raw NORMAL tuples, including their
 physical offsets; it is not a complete MVCC visibility scan or proof of remote
-transport, authority or protocol completion. H operations include nonindexed-column updates, indexed
-key changes, deletes and VACUUM. Their actual HOT/prune/index-delete decisions
+transport, authority or protocol completion. H runs three nonindexed-column
+updates, an indexed key change and a delete in one writer transaction, then
+VACUUM after its COMMIT acknowledgement. Its reader takes the baseline with
+`SET LOCAL cluster.cr_tuple_level_fastpath = off`, then compares reads with
+the setting on and off in the same held snapshot, followed by the target
+FULL diagnostic. A setting error or disagreement fails the attempt. These
+inputs do not guarantee fast path eligibility or execution. Actual HOT/prune/index-delete decisions
 and remote request/serve paths require independent producer LOG evidence.
 
 The separate `q_receipt` relation has one key, seeded before R mutations.
@@ -374,11 +384,13 @@ result and SQL commit acknowledgement. No `PREPARE TRANSACTION` is used.
 UPDATE, then once with `after_commit` after COMMIT acknowledgement and result
 journaling. It receives an owned snapshot of Q's SQL facts; its edits and
 return value cannot grant evidence credit. Keep capture work outside these
-four dedicated sessions and bound its duration. A hook exception fails the
+five dedicated sessions and bound its duration. A hook exception fails the
 attempt and does not retry the hook or COMMIT.
 
 The journal retains SQL bytes, raw successful output, hashes, SQL identities
-and client-local sequences. Client sequences are not producer trace sequences;
+and client-local sequences. `node` remains the server node ID; `client_session`
+identifies slots 0 through 3 and the extra H reader in slot 4. Each slot has its
+own client sequence, including the two node 2 sessions. Client sequences are not producer trace sequences;
 SQL identities lack procno/incarnation/request bindings. Counter snapshots are
 node-wide observations, not attribution to this workload. The between-lanes
 hook schedules caller-owned I/TT work; it does not validate that work. A

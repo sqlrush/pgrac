@@ -25,7 +25,12 @@ sub new
 	die "journal emitter and between-lanes hook required\n"
 	  unless ref($args{emit}) eq 'CODE' && ref($args{between_lanes}) eq 'CODE';
 	die "receipt capture hook required\n" unless ref($args{receipt_barrier}) eq 'CODE';
-	return bless {%args, seq => [0, 0, 0, 0], open => {}, lanes => {}, identities => []}, $class;
+	die "dedicated node 2 HOT reader session required\n"
+	  unless ref($args{hot_reader}) && $args{hot_reader}->can('query_safe');
+	die "distinct HOT reader session required\n" if $seen{refaddr($args{hot_reader})};
+	my @sessions = (@{$args{sessions}}, $args{hot_reader});
+	return bless {%args, sessions => \@sessions, session_nodes => [0, 1, 2, 3, 2],
+		seq => [0, 0, 0, 0, 0], open => {}, lanes => {}, identities => []}, $class;
 }
 
 sub _emit
@@ -43,7 +48,8 @@ sub _query
 {
 	my ($self, $node, $operation, $sql, $on_success) = @_;
 	my $entry = {
-		kind => 'sql_result', node => $node, operation => $operation,
+		kind => 'sql_result', node => $self->{session_nodes}[$node], client_session => $node,
+		operation => $operation,
 		client_seq => ++$self->{seq}[$node], sql => $sql, sql_sha256 => sha256_hex($sql)};
 	$entry->{sql_identity} = $self->{identities}[$node] if $self->{identities}[$node];
 	my $output;
@@ -87,7 +93,7 @@ FROM pg_stat_activity a WHERE a.pid = pg_backend_pid()});
 		die "missing SQL identity $field\n"
 		  unless defined($identity->{$field}) && length($identity->{$field});
 	}
-	die "wrong node identity\n" unless $identity->{node_id} eq "$node";
+	die "wrong node identity\n" unless $identity->{node_id} eq "$self->{session_nodes}[$node]";
 	return $identity;
 }
 
@@ -158,7 +164,7 @@ sub _hold_snapshot
 {
 	my ($self, $node) = @_;
 	# Mark first: a client error after BEGIN was sent still needs cleanup.
-	$self->{open}{$node} = 1;
+	$self->{open}{$node} = 'release_reader';
 	$self->_query($node, 'begin_reader', 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
 	my $export = $self->_json_query($node, 'export_snapshot', q{
 WITH exported AS MATERIALIZED (SELECT pg_export_snapshot() AS id)
@@ -194,7 +200,7 @@ SELECT jsonb_build_object('export_id', id,
 sub _compare
 {
 	my ($self, $lane) = @_;
-	my ($reader, $writer, $table) = @{$lane}{qw(reader writer table)};
+	my ($reader, $writer, $table) = @{$lane}{qw(reader_session writer table)};
 	my $after = $self->_locator($writer, $table);
 	for my $field (qw(spcOid dbOid relNumber forkNum))
 	{
@@ -204,9 +210,16 @@ sub _compare
 	  ? $after->{blocks} : $lane->{locator}{blocks};
 	my $counter_sql = q{SELECT COALESCE(jsonb_object_agg(key, value), '{}'::jsonb)
 FROM pg_cluster_state WHERE category = 'cr' AND key = 'cr_tuple_verdict_count'};
+	$self->_query($reader, 'enable_tuple_fastpath', 'SET LOCAL cluster.cr_tuple_level_fastpath = on')
+	  if $lane->{tuple_fastpath_control};
 	$lane->{counter_before} = $self->_json_query($reader, 'counter_before', $counter_sql);
 	$lane->{visible} = $self->_read($reader, $table);
 	$lane->{counter_after} = $self->_json_query($reader, 'counter_after', $counter_sql);
+	if ($lane->{tuple_fastpath_control})
+	{
+		$self->_query($reader, 'disable_tuple_fastpath', 'SET LOCAL cluster.cr_tuple_level_fastpath = off');
+		$lane->{visible_full_path} = $self->_read($reader, $table);
+	}
 	my $last = $blocks - 1;
 	my $scn = $lane->{snapshot}{read_scn};
 	$lane->{full} = $self->_json_query($reader, 'full_rows', qq{
@@ -219,7 +232,9 @@ CROSS JOIN LATERAL cluster_cr_test_target_image('$table'::regclass, b, $scn)
 	$lane->{full_blocks} = $blocks;
 	die "row comparison mismatch\n"
 	  unless $json->encode($lane->{baseline}) eq $json->encode($lane->{visible})
-	  && $json->encode($lane->{visible}) eq $json->encode(_rows($lane->{full}));
+	  && $json->encode($lane->{visible}) eq $json->encode(_rows($lane->{full}))
+	  && (!$lane->{tuple_fastpath_control}
+		|| $json->encode($lane->{visible}) eq $json->encode($lane->{visible_full_path}));
 	$lane->{sql_comparison} = 'MATCH';
 }
 
@@ -242,7 +257,7 @@ sub _receipt_transaction
 {
 	my ($self, $q) = @_;
 	# BEGIN may have reached the server even when the client reports failure.
-	$self->{open}{0} = 1;
+	$self->{open}{0} = 'release_receipt';
 	$self->_query(0, 'begin_receipt', 'BEGIN');
 	my $xid = $self->_json_query(0, 'receipt_full_xid', 'SELECT to_json(pg_current_xact_id()::text)');
 	die "invalid PostgreSQL full xid\n" unless defined($xid) && !ref($xid)
@@ -269,7 +284,7 @@ sub run
 	my ($self) = @_;
 	die "driver attempt already consumed\n" if $self->{attempted}++;
 	my $ok = eval {
-		for my $node (0 .. 3)
+		for my $node (0 .. 4)
 		{
 			$self->{identities}[$node] = $self->_identity($node);
 			for my $key (qw(database_oid system_identifier))
@@ -278,8 +293,12 @@ sub run
 				  unless $self->{identities}[$node]{$key} eq $self->{identities}[0]{$key};
 			}
 		}
+		my ($writer_identity, $reader_identity) = @{$self->{identities}}[2, 4];
+		die "HOT reader must be a different backend on the same instance\n"
+		  unless $reader_identity->{postmaster_start} eq $writer_identity->{postmaster_start}
+		  && $reader_identity->{pid} ne $writer_identity->{pid};
 		$self->_query(0, 'create_schema', qq{CREATE SCHEMA "$self->{schema}"});
-		for my $spec (['R/IMG', 'r_img', 0, 1], ['H/HOT', 'h_hot', 2, 3])
+		for my $spec (['R/IMG', 'r_img', 0, 1], ['H/HOT', 'h_hot', 2, 4])
 		{
 			my ($name, $short, $writer, $reader) = @{$spec};
 			my $table = $self->_table($short);
@@ -290,9 +309,14 @@ sub run
 			my $expected = [map { +{id => $_, v => "seed_$_"} } 1 .. 64];
 			die "seed row comparison mismatch\n" unless $json->encode(_rows($seed)) eq $json->encode($expected);
 			my $lane = $self->{lanes}{$name} = {
-				table => $table, writer => $writer, reader => $reader,
+				table => $table, writer => $writer, reader => $self->{session_nodes}[$reader],
+				reader_session => $reader, writer_sql_identity => $self->{identities}[$writer],
+				reader_sql_identity => $self->{identities}[$reader],
+				tuple_fastpath_control => $name eq 'H/HOT' ? JSON::PP::true : JSON::PP::false,
 				locator => $self->_locator($writer, $table)};
 			$lane->{snapshot} = $self->_hold_snapshot($reader);
+			$self->_query($reader, 'baseline_tuple_fastpath_off', 'SET LOCAL cluster.cr_tuple_level_fastpath = off')
+			  if $lane->{tuple_fastpath_control};
 			$lane->{baseline} = $self->_read($reader, $table);
 			die "baseline row comparison mismatch\n"
 			  unless $json->encode($lane->{baseline}) eq $json->encode($expected);
@@ -310,17 +334,24 @@ sub run
 		$self->_emit({kind => 'sql_lane_complete', lane => 'R/IMG', evidence => $r});
 		# The caller owns the I/TT operations and their actual evidence seals.
 		$self->{between_lanes}->();
+		$self->{open}{2} = 'release_hot_writer';
+		$self->_query(2, 'begin_hot_writer', 'BEGIN');
 		for my $pass (1 .. 3)
 		{
 			$self->_change(2, 'hot_candidate_update', "UPDATE $h->{table} SET v = 'hot_${pass}_' || id", 64);
 		}
 		$self->_change(2, 'indexed_key_update', "UPDATE $h->{table} SET id = id + 64 WHERE id % 4 = 0", 16);
 		$self->_change(2, 'delete', "DELETE FROM $h->{table} WHERE id % 8 = 1", 8);
+		$h->{commit_status} = 'UNKNOWN';
+		$self->_query(2, 'commit_hot_writer', 'COMMIT', sub {
+			$h->{commit_status} = 'ACKNOWLEDGED';
+			delete $self->{open}{2};
+		});
 		$self->_query(2, 'vacuum', "VACUUM $h->{table}");
 		$self->_compare($h);
 		$self->_emit({kind => 'sql_lane_complete', lane => 'H/HOT', evidence => $h});
 		$self->_receipt_transaction($q);
-		for my $node (0 .. 3)
+		for my $node (0 .. 4)
 		{
 			die "SQL session identity changed\n" unless $json->encode($self->_identity($node))
 			  eq $json->encode($self->{identities}[$node]);
@@ -330,7 +361,7 @@ sub run
 	my $error = $ok ? '' : ($@ || "SQL driver failed\n");
 	for my $node (sort keys %{$self->{open}})
 	{
-		my $operation = $node == 0 ? 'release_receipt' : 'release_reader';
+		my $operation = $self->{open}{$node};
 		my $clean = eval { $self->_query($node, $operation, 'ROLLBACK'); 1 };
 		$error .= $@ || "transaction cleanup failed\n" unless $clean;
 	}
