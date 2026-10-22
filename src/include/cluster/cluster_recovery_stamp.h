@@ -133,6 +133,19 @@ extern bool cluster_recovery_stamp_ctrc_flush_v2(const ClusterRecoveryStampHandl
  * not establish those proofs, close the ResourceOwner token or add a live caller. */
 extern bool cluster_recovery_stamp_ctrc_finish_v2(const ClusterRecoveryStampHandleV1 *handle,
 												  ClusterUndoSmgrRecoveryStampV1 stamp);
+/* Dormant single Startup operation in the caller's original critical section:
+ * insert and privately snapshot the native record, then finish that exact
+ * window. Publish the complete raw record and actual start only after target
+ * sync/readback and clear succeed; refusal leaves both outputs unchanged.
+ * raw_length must equal the native header, long data header and 320B payload.
+ * Outputs must be private and disjoint from each other, handle and live slot.
+ * The immutable handle, prepared held-FD token and all original proofs/pins
+ * remain the caller's responsibility. Native errors propagate without cancel
+ * or critical-section changes. Hash only after the original critical exit.
+ * This adds neither a live caller nor qualification or release authority. */
+extern XLogRecPtr cluster_recovery_stamp_ctrc_apply_v2(
+	const ClusterRecoveryStampHandleV1 *handle, ClusterUndoSmgrRecoveryStampV1 stamp,
+	void *raw, Size raw_length, XLogRecPtr *start);
 /* Only the original executor calls durable after real WAL flush and exact
  * target sync/postread. These APIs record completion, never prove it. */
 extern bool cluster_recovery_stamp_durable_v1(const ClusterRecoveryStampHandleV1 *handle);

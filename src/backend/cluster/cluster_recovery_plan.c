@@ -1016,6 +1016,40 @@ failed:
 	(void)cluster_recovery_stamp_fail_v1(&before.handle);
 	return false;
 }
+XLogRecPtr
+cluster_recovery_stamp_ctrc_apply_v2(const ClusterRecoveryStampHandleV1 *handle,
+								   ClusterUndoSmgrRecoveryStampV1 stamp,
+								   void *raw, Size raw_length, XLogRecPtr *start)
+{
+	uint8 copy[SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + CLUSTER_RECOVERY_CTRC_BYTES];
+	ClusterThreadReplaySlot *replay;
+	XLogRecPtr actual_start, end;
+
+	/* Validate public outputs before the one native insertion. The nested
+	 * snapshot uses private storage; it must not hide a caller alias until
+	 * after the original window has already been retired. */
+	if (!stamp_actor() || MyBackendType != B_STARTUP || CritSectionCount == 0
+		|| handle == NULL || raw == NULL || start == NULL || stamp.token == 0
+		|| handle->owner.executor_pid != MyProcPid || handle->kind != CLUSTER_RECOVERY_STAMP_D0
+		|| handle->payload_length != CLUSTER_RECOVERY_CTRC_BYTES || raw_length != sizeof(copy)
+		|| (replay = cluster_thread_recovery_replay_slot(handle->key.target_thread)) == NULL
+		|| stamp_ranges_overlap(raw, raw_length, start, sizeof(*start))
+		|| stamp_ranges_overlap(raw, raw_length, handle, sizeof(*handle))
+		|| stamp_ranges_overlap(start, sizeof(*start), handle, sizeof(*handle))
+		|| stamp_ranges_overlap(raw, raw_length, &replay->stamp, sizeof(replay->stamp))
+		|| stamp_ranges_overlap(start, sizeof(*start), &replay->stamp, sizeof(replay->stamp)))
+		return InvalidXLogRecPtr;
+
+	/* Keep the caller's original critical section and post-insert duty. No
+	 * hash/allocation, cancellation or error interception is introduced. */
+	end = cluster_recovery_stamp_ctrc_insert_record_v2(handle, copy, sizeof(copy), &actual_start);
+	if (end == InvalidXLogRecPtr || !cluster_recovery_stamp_ctrc_finish_v2(handle, stamp))
+		return InvalidXLogRecPtr;
+	memcpy(raw, copy, sizeof(copy));
+	memcpy(start, &actual_start, sizeof(actual_start));
+	return end;
+}
+
 bool
 cluster_recovery_stamp_durable_v1(const ClusterRecoveryStampHandleV1 *handle)
 {

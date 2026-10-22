@@ -62,6 +62,19 @@ static void flush_unlocked(void);
 static unsigned target_calls, target_fault;
 static uint8 target_payload[320];
 static ClusterUndoSmgrRecoveryStampV1 target_stamp = { .token = 37 };
+static const uint8 *apply_raw, *apply_start;
+
+static void
+apply_outputs_unpublished(void)
+{
+	XLogRecPtr start;
+	if (apply_raw == NULL)
+		return;
+	for (unsigned i = 0; i < SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + 320; i++)
+		UT_ASSERT_EQ(apply_raw[i], 0xA5);
+	memcpy(&start, apply_start, sizeof(start));
+	UT_ASSERT_EQ(start, 91);
+}
 
 bool
 cluster_undo_smgr_recovery_ctrc_write_bound_v2(ClusterUndoSmgrRecoveryStampV1 stamp,
@@ -69,6 +82,7 @@ cluster_undo_smgr_recovery_ctrc_write_bound_v2(ClusterUndoSmgrRecoveryStampV1 st
 {
 	ClusterRecoveryStampSlotV1 *slot = &region.thread_replay[2].stamp;
 	flush_unlocked();
+	apply_outputs_unpublished();
 	UT_ASSERT_EQ(flush_calls, 1);
 	UT_ASSERT_EQ(cover_calls, 1);
 	UT_ASSERT_EQ(writer_checks, 2);
@@ -137,6 +151,7 @@ XLogFlush(XLogRecPtr end)
 {
 	ClusterRecoveryStampSlotV1 *slot = &region.thread_replay[2].stamp;
 	flush_unlocked();
+	apply_outputs_unpublished();
 	UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_INSERTED);
 	UT_ASSERT_EQ(end, slot->record_end);
 	flush_calls++;
@@ -318,6 +333,7 @@ fresh(void)
 	covered_timeline = 1;
 	cover_enabled = true;
 	target_calls = target_fault = 0;
+	apply_raw = apply_start = NULL;
 	memset(target_payload, 0, sizeof(target_payload));
 	memset(registered_payload, 0, sizeof(registered_payload));
 	memset(&owner, 0, sizeof(owner));
@@ -1802,10 +1818,218 @@ UT_TEST(native_record_copy_refuses_input_and_output_aliases)
 	}
 }
 
+UT_TEST(d0_apply_publishes_only_after_exact_finish)
+{
+	for (unsigned outcome = TT_SLOT_COMMITTED; outcome <= TT_SLOT_ABORTED; outcome++) {
+		ClusterRecoveryStampHandleV1 h;
+		uint8 raw[D0_RAW_BYTES + 2], saved[D0_RAW_BYTES], address[sizeof(XLogRecPtr) + 2];
+		uint8 digest[32];
+		XLogRecPtr start = 91, end;
+		unsigned before;
+		fresh();
+		UT_ASSERT(begin_d0(&h, outcome));
+		memcpy(target_payload, h.payload, sizeof(target_payload));
+		memset(raw, 0xA5, sizeof(raw));
+		memset(address, 0xA5, sizeof(address));
+		memcpy(address + 1, &start, sizeof(start));
+		apply_raw = raw + 1;
+		apply_start = address + 1;
+		before = hash_calls;
+		CritSectionCount = 2;
+		end = cluster_recovery_stamp_ctrc_apply_v2(&h, target_stamp, raw + 1,
+			D0_RAW_BYTES, (XLogRecPtr *)(address + 1));
+		UT_ASSERT_EQ(end, 0x2000413);
+		UT_ASSERT_EQ(CritSectionCount, 2);
+		if (end == 0) { CritSectionCount = 0; continue; }
+		memcpy(&start, address + 1, sizeof(start));
+		UT_ASSERT_EQ(start, 0x2000018);
+		UT_ASSERT_EQ(native_calls, 3);
+		UT_ASSERT_EQ(flush_calls, 1);
+		UT_ASSERT_EQ(target_calls, 1);
+		UT_ASSERT_EQ(writer_checks, 3);
+		UT_ASSERT_EQ(cover_calls, 2);
+		UT_ASSERT_EQ(hash_calls, before);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
+		UT_ASSERT(!region.thread_replay[2].stamp.failed);
+		UT_ASSERT(memcmp(raw + 1, native_scratch.bytes, sizeof(native_scratch.bytes)) == 0);
+		UT_ASSERT(memcmp(raw + 1 + sizeof(native_scratch.bytes), h.payload, 320) == 0);
+		UT_ASSERT_EQ(raw[0], 0xA5);
+		UT_ASSERT_EQ(raw[sizeof(raw)-1], 0xA5);
+		UT_ASSERT_EQ(address[0], 0xA5);
+		UT_ASSERT_EQ(address[sizeof(address)-1], 0xA5);
+		memcpy(saved, raw + 1, sizeof(saved));
+		/* An already completed handle cannot insert again or touch outputs. */
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_apply_v2(&h, target_stamp, raw + 1,
+			D0_RAW_BYTES, (XLogRecPtr *)(address + 1)), 0);
+		UT_ASSERT_EQ(native_calls, 3);
+		UT_ASSERT_EQ(flush_calls + target_calls, 2);
+		UT_ASSERT(memcmp(saved, raw + 1, sizeof(saved)) == 0);
+		CritSectionCount = 0;
+		UT_ASSERT(cluster_recovery_ctrc_record_hash_v2(h.owner.target.claim_sha256,
+			start, end, raw + 1, D0_RAW_BYTES, digest));
+		memset(&native_scratch, 0xCC, sizeof(native_scratch));
+		memset(registered_payload, 0xDD, sizeof(registered_payload));
+		UT_ASSERT(memcmp(saved, raw + 1, sizeof(saved)) == 0);
+	}
+	apply_raw = apply_start = NULL;
+}
+
+UT_TEST(d0_apply_preinsert_refusal_preserves_outputs_and_window)
+{
+	for (unsigned mode = 0; mode < 19; mode++) {
+		ClusterRecoveryStampHandleV1 h, saved;
+		const ClusterRecoveryStampHandleV1 *input = &h;
+		ClusterUndoSmgrRecoveryStampV1 token = target_stamp;
+		uint8 raw[D0_RAW_BYTES], before[D0_RAW_BYTES];
+		void *out = raw;
+		XLogRecPtr start = 91, *start_out = &start;
+		Size length = sizeof(raw);
+		fresh();
+		UT_ASSERT(begin_d0(&h, TT_SLOT_COMMITTED));
+		memset(raw, 0xA5, sizeof(raw));
+		memcpy(before, raw, sizeof(raw));
+		CritSectionCount = 1;
+		switch (mode) {
+		case 0: input = NULL; break;
+		case 1: out = NULL; break;
+		case 2: start_out = NULL; break;
+		case 3: length--; break;
+		case 4: length++; break;
+		case 5: start_out = (XLogRecPtr *)raw; break;
+		case 6: out = &h; break;
+		case 7: start_out = (XLogRecPtr *)&h; break;
+		case 8: out = &region.thread_replay[2].stamp; break;
+		case 9: start_out = (XLogRecPtr *)&region.thread_replay[2].stamp; break;
+		case 10: token.token = 0; break;
+		case 11: CritSectionCount = 0; break;
+		case 12: MyBackendType = B_BACKEND; break;
+		case 13: MyProcPid++; break;
+		case 14: cluster_enabled = false; break;
+		case 15: insert_allowed = false; break;
+		case 16: insert_xid = 100; break;
+		case 17: h.key.target_thread = 0; break;
+		case 18: cluster_shared_config = false; break;
+		}
+		saved = h;
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_apply_v2(input, token, out, length, start_out), 0);
+		UT_ASSERT_EQ(native_calls + flush_calls + target_calls, 0);
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(raw, before, sizeof(raw)) == 0);
+		UT_ASSERT(memcmp(&saved, &h, sizeof(h)) == 0);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_PRE_INSERT);
+		UT_ASSERT(!region.thread_replay[2].stamp.failed);
+		CritSectionCount = 0;
+	}
+}
+
+UT_TEST(d0_apply_snapshot_refusal_never_flushes_or_publishes)
+{
+	const unsigned faults[] = { 1, 8, 12, 13 };
+	for (unsigned i = 0; i < lengthof(faults); i++) {
+		ClusterRecoveryStampHandleV1 h;
+		uint8 raw[D0_RAW_BYTES], before[D0_RAW_BYTES];
+		XLogRecPtr start = 91;
+		fresh();
+		UT_ASSERT(begin_d0(&h, TT_SLOT_ABORTED));
+		memset(raw, 0xA5, sizeof(raw));
+		memcpy(before, raw, sizeof(raw));
+		native_fault = faults[i];
+		CritSectionCount = 1;
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_apply_v2(&h, target_stamp, raw, sizeof(raw), &start), 0);
+		UT_ASSERT_EQ(native_calls, 3);
+		UT_ASSERT_EQ(flush_calls + target_calls, 0);
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(raw, before, sizeof(raw)) == 0);
+		UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.failed, faults[i] != 13);
+		CritSectionCount = 0;
+	}
+}
+
+UT_TEST(d0_apply_finish_refusal_retains_duty_and_private_snapshot)
+{
+	for (unsigned mode = 0; mode < 8; mode++) {
+		ClusterRecoveryStampHandleV1 h;
+		ClusterUndoSmgrRecoveryStampV1 token = target_stamp;
+		uint8 raw[D0_RAW_BYTES], before[D0_RAW_BYTES];
+		XLogRecPtr start = 91;
+		unsigned calls;
+		fresh();
+		UT_ASSERT(begin_d0(&h, TT_SLOT_COMMITTED));
+		memcpy(target_payload, h.payload, sizeof(target_payload));
+		memset(raw, 0xA5, sizeof(raw));
+		memcpy(before, raw, sizeof(raw));
+		apply_raw = raw;
+		apply_start = (uint8 *)&start;
+		switch (mode) {
+		case 0: token.token++; break;
+		case 1: writer_reject_on = 1; break;
+		case 2: covered_end--; break;
+		case 3: flush_fault = 2; break;
+		case 4: target_fault = 1; break;
+		case 5: target_fault = 6; break;
+		case 6: target_fault = 8; break;
+		case 7: target_fault = 9; break;
+		}
+		CritSectionCount = 1;
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_apply_v2(&h, token, raw, sizeof(raw), &start), 0);
+		UT_ASSERT_EQ(native_calls, 3);
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(raw, before, sizeof(raw)) == 0);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.failed, mode != 5);
+		UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+		calls = native_calls + flush_calls + target_calls;
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_apply_v2(&h, token, raw, sizeof(raw), &start), 0);
+		UT_ASSERT_EQ(native_calls + flush_calls + target_calls, calls);
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(raw, before, sizeof(raw)) == 0);
+		CritSectionCount = 0;
+	}
+	apply_raw = apply_start = NULL;
+}
+
+UT_TEST(d0_apply_native_errors_propagate_without_retirement)
+{
+	for (unsigned mode = 0; mode < 5; mode++) {
+		ClusterRecoveryStampHandleV1 h;
+		uint8 raw[D0_RAW_BYTES], before[D0_RAW_BYTES];
+		XLogRecPtr start = 91;
+		fresh();
+		UT_ASSERT(begin_d0(&h, TT_SLOT_ABORTED));
+		memcpy(target_payload, h.payload, sizeof(target_payload));
+		memset(raw, 0xA5, sizeof(raw));
+		memcpy(before, raw, sizeof(raw));
+		apply_raw = raw;
+		apply_start = (uint8 *)&start;
+		if (mode < 3) native_throw = mode + 1;
+		else if (mode == 3) flush_fault = 1;
+		else target_fault = 2;
+		CritSectionCount = 1;
+		if (sigsetjmp(insert_error_boundary, 1) == 0) {
+			(void)cluster_recovery_stamp_ctrc_apply_v2(&h, target_stamp, raw, sizeof(raw), &start);
+			UT_ASSERT(false);
+		} else {
+			UT_ASSERT_EQ(CritSectionCount, 1);
+			UT_ASSERT_EQ(region.thread_replay[2].stamp.phase,
+				mode < 3 ? CLUSTER_RECOVERY_STAMP_INSERTING : CLUSTER_RECOVERY_STAMP_INSERTED);
+			UT_ASSERT_EQ(start, 91);
+			UT_ASSERT(memcmp(raw, before, sizeof(raw)) == 0);
+			UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+			UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+		}
+		/* Controlled unwind checks ownership, not real PANIC process death. */
+		CritSectionCount = 0;
+	}
+	apply_raw = apply_start = NULL;
+}
+
 int
 main(void)
 {
-	UT_PLAN(38);
+	UT_PLAN(43);
 	UT_RUN(exact_lifecycle_and_owned_payload);
 	UT_RUN(preinsert_cancel_capture_and_new_sequence);
 	UT_RUN(inserting_failure_exit_and_replay_reset_cannot_retire);
@@ -1844,6 +2068,11 @@ main(void)
 	UT_RUN(native_record_copy_rejects_incomplete_extra_and_cyclic_chains);
 	UT_RUN(native_record_copy_refuses_stale_construction_and_lengths);
 	UT_RUN(native_record_copy_refuses_input_and_output_aliases);
+	UT_RUN(d0_apply_publishes_only_after_exact_finish);
+	UT_RUN(d0_apply_preinsert_refusal_preserves_outputs_and_window);
+	UT_RUN(d0_apply_snapshot_refusal_never_flushes_or_publishes);
+	UT_RUN(d0_apply_finish_refusal_retains_duty_and_private_snapshot);
+	UT_RUN(d0_apply_native_errors_propagate_without_retirement);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
