@@ -1981,13 +1981,13 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 		 * (see the backup_label arm above for why). */
 		cluster_scn_recovery_replay_observe(record->xl_scn);
 		/* Capture the actual own WAL record, not a shared control-file copy.
-		 * StartupXLOG separately confirms the completed clean-start decision. */
-		if (wasShutdown) {
+		 * Semantic recovery retains the initial online checkpoint too; neither
+		 * capture certifies CLEAN. StartupXLOG separately confirms clean start. */
+		if (wasShutdown)
 			cluster_tt_slot_capture_startup_checkpoint(record->xl_scn, checkPoint.nextXid);
-			cluster_semantic_normal_start_capture(CheckPointLoc, checkPoint.redo,
-												  U64FromFullTransactionId(checkPoint.nextXid),
-												  record->xl_scn);
-		}
+		cluster_semantic_normal_start_capture(CheckPointLoc, checkPoint.redo,
+											  U64FromFullTransactionId(checkPoint.nextXid),
+											  record->xl_scn);
 #endif
 
 		/* Make sure that REDO location exists. */

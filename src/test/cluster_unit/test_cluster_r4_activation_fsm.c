@@ -11428,7 +11428,7 @@ static void test_serving_finish_root(void);
 int
 main(void)
 {
-	UT_PLAN(386);
+	UT_PLAN(387);
 	UT_RUN(test_member_commit_gap_before_all_peer_receipts);
 	UT_RUN(test_member_commit_request_waits_for_real_predecessor_receipts);
 	UT_RUN(test_member_commit_request_rejects_old_or_changed_identity);
@@ -11479,6 +11479,7 @@ main(void)
 	UT_RUN(test_normal_start_pending_ack_does_not_reuse_root_after_valid_mirror_drift);
 	UT_RUN(test_normal_start_confirmed_new_root_permanently_rejects_old_completion);
 	UT_RUN(test_normal_actual_own_wal_capture_not_peer_control);
+	UT_RUN(test_normal_actual_online_checkpoint_invalid_is_not_replaced);
 	UT_RUN(test_normal_actual_prepare_uses_all_original_clean_inputs);
 	UT_RUN(test_normal_actual_postjobs_exclude_shared_legacy_page_rollback);
 	UT_RUN(test_normal_actual_finish_requires_cf_and_hw_and_keeps_disk_history);
