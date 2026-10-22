@@ -14465,6 +14465,7 @@ normal_start_recovered_service_binding_current(const ClusterSemanticActivationRe
 												 const ClusterSemanticActivationAckTableV1 *table)
 {
 	ClusterRecoveryCheckpointObservationV1 observed;
+	ClusterRecoveryCheckpointObservationV1 observed_after;
 	ClusterFormationSnapshotV1 formation;
 	const ClusterNormalStartCompletion *input = NormalStartCompletion;
 
@@ -14520,6 +14521,12 @@ normal_start_recovered_service_binding_current(const ClusterSemanticActivationRe
 				   != table->expected[node].admitted_incarnation)
 			return false;
 	}
+	/* The formation and membership checks must not outlive the recovered
+	 * checkpoint owner that authorized this service match. */
+	if (!cluster_recovery_checkpoint_observe_v1(&observed_after)
+		|| observed_after.slot_generation != observed.slot_generation
+		|| memcmp(&observed_after.owner, &observed.owner, sizeof(observed.owner)) != 0)
+		return false;
 	return true;
 }
 

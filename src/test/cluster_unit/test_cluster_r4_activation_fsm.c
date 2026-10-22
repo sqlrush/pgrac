@@ -170,6 +170,8 @@ static bool test_first_writer_installed, test_first_writer_initialized, test_fir
 static uint64 test_first_writer_epoch;
 static bool test_recovered_checkpoint_observed;
 static ClusterRecoveryCheckpointObservationV1 test_recovered_checkpoint;
+static unsigned test_recovered_checkpoint_observe_calls;
+static bool test_recovered_checkpoint_fail_after_first;
 static int test_first_live_checks;
 static ClusterControlRootResult test_first_live_result;
 
@@ -194,6 +196,10 @@ bool
 cluster_recovery_checkpoint_observe_v1(ClusterRecoveryCheckpointObservationV1 *out)
 {
 	if (out == NULL || !test_recovered_checkpoint_observed)
+		return false;
+	++test_recovered_checkpoint_observe_calls;
+	if (test_recovered_checkpoint_fail_after_first
+		&& test_recovered_checkpoint_observe_calls > 1)
 		return false;
 	*out = test_recovered_checkpoint;
 	return true;
@@ -1276,6 +1282,8 @@ test_gate_reset(void)
 	test_first_writer_recovered = false;
 	test_first_writer_epoch = 0;
 	test_recovered_checkpoint_observed = false;
+	test_recovered_checkpoint_observe_calls = 0;
+	test_recovered_checkpoint_fail_after_first = false;
 	memset(&test_recovered_checkpoint, 0, sizeof(test_recovered_checkpoint));
 	test_serving_found = false;
 	test_serving_formation_valid = false;
@@ -9393,6 +9401,8 @@ ut_normal_start_recovered_owner_setup(ClusterSemanticActivationRecord *open,
 	pg_atomic_write_u32(&NormalStartCompletion->state, CLUSTER_NORMAL_START_EXISTING_OTHER);
 
 	test_recovered_checkpoint_observed = true;
+	test_recovered_checkpoint_observe_calls = 0;
+	test_recovered_checkpoint_fail_after_first = false;
 	test_recovered_checkpoint.slot_generation = 1;
 	owner_boot = cluster_qvotec_get_self_incarnation();
 	test_recovered_checkpoint.owner.owner_boot = owner_boot;
@@ -9454,6 +9464,17 @@ UT_TEST(test_normal_start_recovered_owner_observation_rejects_invalid_local_node
 	cluster_node_id = CLUSTER_MAX_NODES;
 	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
 	cluster_node_id = saved_node;
+}
+
+UT_TEST(test_normal_start_recovered_owner_observation_rechecks_after_formation)
+{
+	ClusterSemanticActivationRecord open;
+	ClusterSemanticActivationAckTableV1 table;
+
+	ut_normal_start_recovered_owner_setup(&open, &table);
+	test_recovered_checkpoint_fail_after_first = true;
+	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+	UT_ASSERT(test_recovered_checkpoint_observe_calls > 1);
 }
 
 UT_TEST(test_normal_start_recovered_owner_equal_epoch_does_not_use_fast_path)
@@ -11899,6 +11920,7 @@ main(void)
 	UT_RUN(test_normal_start_recovered_owner_observation_fails_closed_without_observation);
 	UT_RUN(test_normal_start_recovered_owner_observation_rejects_foreign_system);
 	UT_RUN(test_normal_start_recovered_owner_observation_rejects_invalid_local_node);
+	UT_RUN(test_normal_start_recovered_owner_observation_rechecks_after_formation);
 	UT_RUN(test_normal_start_recovered_owner_equal_epoch_does_not_use_fast_path);
 	UT_RUN(test_normal_start_capture_drift_and_wrong_writer_refuse);
 	UT_RUN(test_normal_start_identity_rechecked_after_real_root_read);
