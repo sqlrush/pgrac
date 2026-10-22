@@ -293,13 +293,11 @@ cluster_heap_freeze_build_canonical_proof_v1(
 	return true;
 }
 
-ClusterHeapFreezeProofStatusV1
-cluster_heap_freeze_validate_conditional_apply_v1(
+static ClusterHeapFreezeProofStatusV1
+validate_fixture_proofs(
 	const ClusterHeapFreezePageBatchV1 *page, const ClusterHeapFreezeProofBatchV1 *proofs,
-	const ClusterHeapFreezeFinalFenceV1 *fence)
+	const ClusterHeapFreezeFinalFenceV1 *fence, bool require_all)
 {
-	(void)page;
-	(void)fence;
 	validations++;
 	validation_under_lock = pin_held && content_locked;
 	if (error_validate)
@@ -308,7 +306,25 @@ cluster_heap_freeze_validate_conditional_apply_v1(
 		|| proofs->proofs[0].expected_fence.page_lsn != fence->page_lsn
 		|| proofs->proofs[0].expected_fence.page_version != fence->page_version)
 		return CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
+	if (require_all && proofs->proof_count != page->carrier_request_count)
+		return CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
 	return CLUSTER_HEAP_FREEZE_PROOF_PROVEN;
+}
+
+ClusterHeapFreezeProofStatusV1
+cluster_heap_freeze_validate_conditional_apply_v1(
+	const ClusterHeapFreezePageBatchV1 *page, const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *fence)
+{
+	return validate_fixture_proofs(page, proofs, fence, true);
+}
+
+ClusterHeapFreezeProofStatusV1
+cluster_heap_freeze_validate_carrier_cleanout_v1(
+	const ClusterHeapFreezePageBatchV1 *page, const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *fence)
+{
+	return validate_fixture_proofs(page, proofs, fence, false);
 }
 
 /* Storage leaves never obtain a current block or wait for its ownership. */
@@ -1162,10 +1178,181 @@ UT_TEST(changed_final_fence_does_not_start_cleanout)
 	check_local_cleanup_without_pcm_release("LPA");
 }
 
+static void
+expected_single_cleanout(PGAlignedBlock *expected, uint8 slot_index)
+{
+	ClusterItlSlotData *slots;
+
+	memcpy(expected, &resident_page, sizeof(*expected));
+	slots = ClusterPageGetItlSlots((Page)expected->data);
+	slots[slot_index].flags = ITL_FLAG_COMMITTED;
+	slots[slot_index].commit_scn = slot_scns[slot_index];
+	((PageHeader)expected->data)->pd_block_scn++;
+	PageSetLSN((Page)expected->data, 102);
+}
+
+static void
+check_mixed_cleanout(const PGAlignedBlock *expected)
+{
+	UT_ASSERT_EQ(collected_status, CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	UT_ASSERT_EQ(resolves, 2);
+	UT_ASSERT_EQ(hint_begins, 1);
+	UT_ASSERT_EQ(hint_finishes, 1);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(memcmp(resident_page.data, expected->data, BLCKSZ), 0);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proofs.proof_count, 0);
+	UT_ASSERT(!vacrel.shared_freeze_fence_valid);
+	UT_ASSERT_EQ(enters, 1);
+	UT_ASSERT_EQ(leaves, 1);
+	UT_ASSERT_EQ(debt, 0);
+	check_local_cleanup_without_pcm_release("LPA");
+}
+
+UT_TEST(unproven_later_carrier_does_not_discard_exact_committed_cleanout)
+{
+	PGAlignedBlock expected;
+
+	setup_cleanout_page();
+	slot_outcomes[1] = CLUSTER_TX_UNKNOWN;
+	expected_single_cleanout(&expected, 0);
+	UT_ASSERT(!collect_catches_error());
+	check_mixed_cleanout(&expected);
+}
+
+UT_TEST(unproven_earlier_carrier_does_not_hide_later_exact_committed_cleanout)
+{
+	const ClusterTxOutcome unproven[] = {
+		CLUSTER_TX_UNKNOWN, CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_PREPARED};
+
+	for (unsigned index = 0; index < lengthof(unproven); index++)
+	{
+		PGAlignedBlock expected;
+
+		setup_cleanout_page();
+		slot_outcomes[0] = unproven[index];
+		expected_single_cleanout(&expected, 1);
+		UT_ASSERT(!collect_catches_error());
+		check_mixed_cleanout(&expected);
+	}
+}
+
+UT_TEST(all_unproven_carriers_do_not_repin_or_begin_hint)
+{
+	PGAlignedBlock expected;
+
+	setup_cleanout_page();
+	slot_outcomes[0] = slot_outcomes[1] = CLUSTER_TX_UNKNOWN;
+	memcpy(&expected, &resident_page, sizeof(expected));
+	UT_ASSERT(!collect_catches_error());
+	UT_ASSERT_EQ(collected_status, CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	UT_ASSERT_EQ(resolves, 2);
+	UT_ASSERT_EQ(repins, 0);
+	UT_ASSERT_EQ(hint_begins, 0);
+	UT_ASSERT_EQ(memcmp(resident_page.data, expected.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(leaves, 1);
+	UT_ASSERT_EQ(debt, 0);
+	check_local_cleanup_without_pcm_release("A");
+}
+
+UT_TEST(unproven_carrier_witness_change_blocks_every_partial_stamp)
+{
+	for (unsigned byte = 0; byte < sizeof(ClusterItlSlotData); byte++)
+	{
+		PGAlignedBlock expected;
+		ClusterItlSlotData *slots = setup_cleanout_page();
+
+		slot_outcomes[1] = CLUSTER_TX_UNKNOWN;
+		((unsigned char *)&slots[1])[byte] ^= 1;
+		memcpy(&expected, &resident_page, sizeof(expected));
+		UT_ASSERT(!collect_catches_error());
+		UT_ASSERT_EQ(collected_status, CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+		UT_ASSERT_EQ(hint_begins, 0);
+		UT_ASSERT_EQ(memcmp(resident_page.data, expected.data, BLCKSZ), 0);
+		check_local_cleanup_without_pcm_release("LPA");
+	}
+}
+
+UT_TEST(partial_proofs_still_require_current_pcm_and_admission)
+{
+	for (unsigned change = 0; change < 3; change++)
+	{
+		PGAlignedBlock expected;
+
+		setup_cleanout_page();
+		slot_outcomes[0] = CLUSTER_TX_UNKNOWN;
+		changed_holder = change == 0;
+		changed_master = change == 1;
+		changed_admission = change == 2;
+		memcpy(&expected, &resident_page, sizeof(expected));
+		UT_ASSERT(!collect_catches_error());
+		UT_ASSERT_EQ(collected_status, CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+		UT_ASSERT_EQ(hint_begins, 0);
+		UT_ASSERT_EQ(memcmp(resident_page.data, expected.data, BLCKSZ), 0);
+		check_local_cleanup_without_pcm_release("LPA");
+	}
+}
+
+UT_TEST(partial_cleanout_hint_error_releases_ownership_before_admission)
+{
+	PGAlignedBlock expected;
+
+	setup_cleanout_page();
+	slot_outcomes[0] = CLUSTER_TX_UNKNOWN;
+	error_hint_begin = true;
+	memcpy(&expected, &resident_page, sizeof(expected));
+	check_error_cleanup("LPA");
+	UT_ASSERT_EQ(hint_begins, 1);
+	UT_ASSERT_EQ(hint_finishes, 0);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(memcmp(resident_page.data, expected.data, BLCKSZ), 0);
+	check_local_cleanup_without_pcm_release("LPA");
+}
+
+UT_TEST(partial_cleanout_cancel_preserves_error_and_backend_reuse)
+{
+	PGAlignedBlock expected;
+
+	setup_cleanout_page();
+	slot_outcomes[1] = CLUSTER_TX_UNKNOWN;
+	error_hint_begin = true;
+	inject_code = ERRCODE_QUERY_CANCELED;
+	check_error_cleanup("LPA");
+	check_local_cleanup_without_pcm_release("LPA");
+	if (pin_held || content_locked || debt != 0)
+		return;
+	error_hint_begin = false;
+	expected_single_cleanout(&expected, 0);
+	UT_ASSERT(!collect_catches_error());
+	UT_ASSERT_EQ(collected_status, CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	UT_ASSERT_EQ(hint_begins, 2);
+	UT_ASSERT_EQ(hint_finishes, 1);
+	UT_ASSERT_EQ(enters, 2);
+	UT_ASSERT_EQ(leaves, 2);
+	UT_ASSERT_EQ(debt, 0);
+	UT_ASSERT_EQ(memcmp(resident_page.data, expected.data, BLCKSZ), 0);
+	UT_ASSERT(!vacrel.shared_freeze_fence_valid);
+	check_local_cleanup_without_pcm_release("LPALPA");
+}
+
+UT_TEST(partial_proof_cannot_stamp_a_different_requested_locator)
+{
+	PGAlignedBlock expected;
+
+	setup_cleanout_page();
+	slot_outcomes[0] = CLUSTER_TX_UNKNOWN;
+	mismatch_requested_locator = true;
+	memcpy(&expected, &resident_page, sizeof(expected));
+	UT_ASSERT(!collect_catches_error());
+	UT_ASSERT_EQ(collected_status, CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	UT_ASSERT_EQ(hint_begins, 0);
+	UT_ASSERT_EQ(memcmp(resident_page.data, expected.data, BLCKSZ), 0);
+	check_local_cleanup_without_pcm_release("LPA");
+}
+
 int
 main(void)
 {
-	UT_PLAN(38);
+	UT_PLAN(46);
 	UT_RUN(invalid_input_does_not_leave);
 	UT_RUN(rejected_admission_does_not_leave);
 	UT_RUN(normal_success_leaves_once);
@@ -1204,6 +1391,14 @@ main(void)
 	UT_RUN(hint_begin_error_releases_pin_before_admission_without_remote_cleanup);
 	UT_RUN(hint_begin_cancel_preserves_error_and_allows_backend_reuse);
 	UT_RUN(changed_final_fence_does_not_start_cleanout);
+	UT_RUN(unproven_later_carrier_does_not_discard_exact_committed_cleanout);
+	UT_RUN(unproven_earlier_carrier_does_not_hide_later_exact_committed_cleanout);
+	UT_RUN(all_unproven_carriers_do_not_repin_or_begin_hint);
+	UT_RUN(unproven_carrier_witness_change_blocks_every_partial_stamp);
+	UT_RUN(partial_proofs_still_require_current_pcm_and_admission);
+	UT_RUN(partial_cleanout_hint_error_releases_ownership_before_admission);
+	UT_RUN(partial_cleanout_cancel_preserves_error_and_backend_reuse);
+	UT_RUN(partial_proof_cannot_stamp_a_different_requested_locator);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

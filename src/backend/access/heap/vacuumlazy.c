@@ -1602,12 +1602,14 @@ lazy_cleanout_shared_freeze_page(LVRelState *vacrel, Buffer buffer,
 	bool stamp[CLUSTER_ITL_INITRANS_DEFAULT] = {false};
 	SCN commit_scns[CLUSTER_ITL_INITRANS_DEFAULT];
 	uint16 seen_slots = 0;
+	uint8 matched_proofs = 0;
 	bool changed = false;
 	RfPageProducerBatchV1 hint_batch;
 
 	if (batch->carrier_request_count == 0
 		|| batch->carrier_request_count > CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH
-		|| proofs->proof_count != batch->carrier_request_count
+		|| proofs->proof_count == 0
+		|| proofs->proof_count > batch->carrier_request_count
 		|| !PageHasItl(page) || header->pd_special > BLCKSZ
 		|| header->pd_special < SizeOfPageHeaderData
 		|| BLCKSZ - header->pd_special
@@ -1643,7 +1645,8 @@ lazy_cleanout_shared_freeze_page(LVRelState *vacrel, Buffer buffer,
 			resolution = &proof->resolution;
 		}
 		if (resolution == NULL)
-			return false;
+			continue;
+		matched_proofs++;
 		if (resolution->outcome == CLUSTER_TX_COMMITTED
 			&& cluster_itl_cleanout_can_stamp(&slots[slot_index], request->carrier.xid,
 										 resolution->commit_scn))
@@ -1653,7 +1656,8 @@ lazy_cleanout_shared_freeze_page(LVRelState *vacrel, Buffer buffer,
 			changed = true;
 		}
 	}
-	if (!changed || cluster_space_hint_begin(buffer, &hint_batch) != CLUSTER_SPACE_HINT_VERSIONED)
+	if (matched_proofs != proofs->proof_count || !changed
+		|| cluster_space_hint_begin(buffer, &hint_batch) != CLUSTER_SPACE_HINT_VERSIONED)
 		return false;
 
 	/* The versioned begin entered the critical section.  No fallible work or
@@ -1754,7 +1758,11 @@ lazy_recheck_shared_freeze_page(LVRelState *vacrel, Buffer recent_buffer,
 		}
 		status = cluster_heap_freeze_validate_conditional_apply_v1(
 			&vacrel->shared_freeze_batch, proofs, current_fence);
-		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN)
+		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+			|| (status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN
+				&& cluster_heap_freeze_validate_carrier_cleanout_v1(
+					&vacrel->shared_freeze_batch, proofs, current_fence)
+				== CLUSTER_HEAP_FREEZE_PROOF_PROVEN))
 		{
 			hint_scope = true;
 			*cleaned = lazy_cleanout_shared_freeze_page(vacrel, recent_buffer, proofs);
@@ -1781,8 +1789,10 @@ recheck_done:;
 /*
  * Resolve every captured carrier through the terminal-census provider while
  * retaining one R4 admission, then recheck the resident page under local X.
- * Optional delayed ITL cleanout uses that same ownership.  No tuple-freeze
- * permission survives its release, and a cleanout invalidates the saved fence.
+ * Compact the proven subset without dropping any physical carrier witnesses.
+ * Optional delayed ITL cleanout uses that same ownership, but a partial proof
+ * keeps the page unproven.  No tuple-freeze permission survives its release,
+ * and a cleanout invalidates the saved fence.
  */
 static ClusterHeapFreezeProofStatusV1
 lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
@@ -1852,10 +1862,12 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 				|| !cluster_heap_freeze_build_canonical_proof_v1(
 					&vacrel->shared_freeze_batch.carrier_requests[index].locator,
 					&resolution, &expected_fence, &expected_fence, true, true, true,
-					&proofs.proofs[index]))
-				goto admitted_done;
+					&proofs.proofs[proofs.proof_count]))
+				continue;
 			proofs.proof_count++;
 		}
+		if (proofs.proof_count == 0)
+			goto admitted_done;
 
 		status = lazy_recheck_shared_freeze_page(vacrel, recent_buffer,
 													 &authority_before, &admission,

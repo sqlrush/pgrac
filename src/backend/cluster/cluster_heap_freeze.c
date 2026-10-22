@@ -513,11 +513,12 @@ cluster_heap_freeze_validate_proof_batch_v1(
 	return CLUSTER_HEAP_FREEZE_PROOF_PROVEN;
 }
 
-ClusterHeapFreezeProofStatusV1
-cluster_heap_freeze_validate_conditional_apply_v1(
+static ClusterHeapFreezeProofStatusV1
+freeze_validate_carrier_proofs(
 	const ClusterHeapFreezePageBatchV1 *page,
 	const ClusterHeapFreezeProofBatchV1 *proofs,
-	const ClusterHeapFreezeFinalFenceV1 *current_fence)
+	const ClusterHeapFreezeFinalFenceV1 *current_fence,
+	bool require_all)
 {
 	ClusterHeapFreezeProofStatusV1 status;
 	const ClusterHeapFreezeCanonicalProofV1 *first;
@@ -575,8 +576,8 @@ cluster_heap_freeze_validate_conditional_apply_v1(
 		matched[matched_index] = true;
 	}
 
-	for (uint8 request_index = 0;
-		 request_index < page->carrier_request_count; request_index++)
+	for (uint8 request_index = 0; require_all
+		 && request_index < page->carrier_request_count; request_index++)
 	{
 		if (!matched[request_index])
 			return CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
@@ -584,4 +585,22 @@ cluster_heap_freeze_validate_conditional_apply_v1(
 
 	/* Evidence is ready for the caller's still-synchronous conditional apply. */
 	return CLUSTER_HEAP_FREEZE_PROOF_PROVEN;
+}
+
+ClusterHeapFreezeProofStatusV1
+cluster_heap_freeze_validate_conditional_apply_v1(
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *current_fence)
+{
+	return freeze_validate_carrier_proofs(page, proofs, current_fence, true);
+}
+
+ClusterHeapFreezeProofStatusV1
+cluster_heap_freeze_validate_carrier_cleanout_v1(
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *current_fence)
+{
+	return freeze_validate_carrier_proofs(page, proofs, current_fence, false);
 }

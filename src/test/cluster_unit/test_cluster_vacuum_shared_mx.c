@@ -2074,10 +2074,107 @@ UT_TEST(conditional_apply_requires_exact_carriers_and_final_fence)
 						 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
 }
 
+static void
+init_subset_proof_fixture(ClusterHeapFreezePageBatchV1 *page,
+						  ClusterHeapFreezeProofBatchV1 *proofs,
+						  ClusterHeapFreezeFinalFenceV1 *fence)
+{
+	memset(page, 0, sizeof(*page));
+	memset(proofs, 0, sizeof(*proofs));
+	init_canonical_proof_fixture(&proofs->proofs[0]);
+	*fence = proofs->proofs[0].expected_fence;
+	proofs->proof_count = 1;
+	page->identity = fence->identity;
+	page->block = fence->block;
+	page->carrier_request_count = 2;
+	page->carrier_requests[0].locator = proofs->proofs[0].requested_locator;
+	page->carrier_requests[1] = page->carrier_requests[0];
+	page->carrier_requests[1].locator.itl_slot_index = 1;
+}
+
+UT_TEST(exact_subset_can_cleanout_without_proving_the_whole_page)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+	ClusterHeapFreezeCarrierRequestV1 swap;
+
+	init_subset_proof_fixture(&page, &proofs, &fence);
+	/* Equal raw XIDs do not merge distinct physical carriers or require order. */
+	swap = page.carrier_requests[0];
+	page.carrier_requests[0] = page.carrier_requests[1];
+	page.carrier_requests[1] = swap;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_conditional_apply_v1(&page, &proofs, &fence),
+				 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_carrier_cleanout_v1(&page, &proofs, &fence),
+				 CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+}
+
+UT_TEST(cleanout_subset_rejects_duplicate_or_unrequested_proofs)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+
+	init_subset_proof_fixture(&page, &proofs, &fence);
+	proofs.proof_count = 2;
+	proofs.proofs[1] = proofs.proofs[0];
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_carrier_cleanout_v1(&page, &proofs, &fence),
+				 CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR);
+	proofs.proof_count = 1;
+	page.carrier_requests[1] = page.carrier_requests[0];
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_carrier_cleanout_v1(&page, &proofs, &fence),
+				 CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR);
+	init_subset_proof_fixture(&page, &proofs, &fence);
+	page.carrier_requests[0].locator.tt_wrap = 3;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_carrier_cleanout_v1(&page, &proofs, &fence),
+				 CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR);
+}
+
+UT_TEST(cleanout_subset_requires_the_same_final_current_fence)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+
+	init_subset_proof_fixture(&page, &proofs, &fence);
+	fence.holder_sequence++;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_carrier_cleanout_v1(&page, &proofs, &fence),
+				 CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+}
+
+UT_TEST(cleanout_subset_never_promotes_missing_canonical_evidence)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+	const ClusterTxOutcome unproven[] = {CLUSTER_TX_UNKNOWN, CLUSTER_TX_IN_PROGRESS,
+		CLUSTER_TX_PREPARED};
+
+	for (unsigned index = 0; index < lengthof(unproven); index++)
+	{
+		init_subset_proof_fixture(&page, &proofs, &fence);
+		proofs.proofs[0].resolution.outcome = unproven[index];
+		UT_ASSERT_EQ(cluster_heap_freeze_validate_carrier_cleanout_v1(&page, &proofs, &fence),
+					 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	}
+	init_subset_proof_fixture(&page, &proofs, &fence);
+	proofs.proofs[0].c1b_finalized = false;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_carrier_cleanout_v1(&page, &proofs, &fence),
+				 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	proofs.proofs[0].c1b_finalized = true;
+	proofs.proofs[0].admission_current = false;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_carrier_cleanout_v1(&page, &proofs, &fence),
+				 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	proofs.proof_count = 0;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_carrier_cleanout_v1(&page, &proofs, &fence),
+				 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+}
+
 int
 main(void)
 {
-	UT_PLAN(63);
+	UT_PLAN(67);
 	UT_RUN(share_scan_preserves_every_reference_before_native_consumer);
 	UT_RUN(cleanup_scan_preserves_before_prune_and_freeze);
 	UT_RUN(raw_multi_value_never_selects_local_reader);
@@ -2141,6 +2238,10 @@ main(void)
 	UT_RUN(unproven_tt_and_snapshot_never_admit_freeze);
 	UT_RUN(proof_batch_is_all_or_nothing_for_conditional_apply);
 	UT_RUN(conditional_apply_requires_exact_carriers_and_final_fence);
+	UT_RUN(exact_subset_can_cleanout_without_proving_the_whole_page);
+	UT_RUN(cleanout_subset_rejects_duplicate_or_unrequested_proofs);
+	UT_RUN(cleanout_subset_requires_the_same_final_current_fence);
+	UT_RUN(cleanout_subset_never_promotes_missing_canonical_evidence);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

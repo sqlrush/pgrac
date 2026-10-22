@@ -257,4 +257,16 @@ cluster_heap_freeze_validate_conditional_apply_v1(
 	const ClusterHeapFreezeProofBatchV1 *proofs,
 	const ClusterHeapFreezeFinalFenceV1 *current_fence);
 
+/*
+ * Validate a nonempty exact subset for delayed carrier cleanout only.  Every
+ * supplied proof must satisfy the same canonical and final-fence checks as
+ * conditional apply.  Uncovered carriers remain unproven; this predicate
+ * grants no whole-page apply, tuple-freeze or retention permission.
+ */
+extern ClusterHeapFreezeProofStatusV1
+cluster_heap_freeze_validate_carrier_cleanout_v1(
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *current_fence);
+
 #endif /* CLUSTER_HEAP_FREEZE_H */
