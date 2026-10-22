@@ -9427,6 +9427,16 @@ UT_TEST(test_normal_start_recovered_owner_observation_fails_closed_without_obser
 	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
 }
 
+UT_TEST(test_normal_start_recovered_owner_equal_epoch_does_not_use_fast_path)
+{
+	ClusterSemanticActivationRecord open;
+	ClusterSemanticActivationAckTableV1 table;
+
+	ut_normal_start_recovered_owner_setup(&open, &table);
+	table.transition_epoch = open.transition_epoch;
+	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+}
+
 UT_TEST(test_normal_start_capture_drift_and_wrong_writer_refuse)
 {
 	const char *failure;
@@ -11858,6 +11868,7 @@ main(void)
 	UT_RUN(test_normal_start_existing_other_is_not_target_completion);
 	UT_RUN(test_normal_start_recovered_owner_observation_accepts_exact_binding);
 	UT_RUN(test_normal_start_recovered_owner_observation_fails_closed_without_observation);
+	UT_RUN(test_normal_start_recovered_owner_equal_epoch_does_not_use_fast_path);
 	UT_RUN(test_normal_start_capture_drift_and_wrong_writer_refuse);
 	UT_RUN(test_normal_start_identity_rechecked_after_real_root_read);
 	UT_RUN(test_normal_start_bootstrap_requires_strict_source_at_entry_and_recheck);

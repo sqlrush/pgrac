@@ -14521,6 +14521,12 @@ normal_start_service_binding_current(const ClusterSemanticActivationRecord *open
 	ClusterFormationSnapshotV1 formation;
 	const ClusterNormalStartCompletion *input = NormalStartCompletion;
 
+	/* A recovered start must advance the service epoch before it can expose
+	 * the recovered owner.  Do not let the equal-epoch fast path bypass the
+	 * physical owner observation required by the RECOVERED -> OPEN handoff. */
+	if (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& table->transition_epoch == open->transition_epoch)
+		return false;
 	if (table->transition_epoch == open->transition_epoch)
 		return semantic_activation_bytes_are_zero(table->restart_binding, 32);
 	if (!cluster_shared_config)
