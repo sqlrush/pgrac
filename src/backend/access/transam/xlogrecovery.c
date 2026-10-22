@@ -206,6 +206,7 @@
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_wal_writer.h"
+#include "cluster/storage/cluster_undo_block0.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "cluster/cluster_wal_tail.h"
@@ -924,6 +925,36 @@ ClusterColdRecoveryTxC0Candidate(const struct ClusterRecoveryStartV1 *start,
 		|| !ClusterColdRecoveryTxEffectsCurrent(start))
 		return false;
 	*out = candidate;
+	return true;
+}
+
+bool
+ClusterColdRecoveryTxC0Reserve(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject, struct ClusterUndoBlock0Pin *pin)
+{
+	ClusterUndoBlock0LogicalKey logical;
+	ClusterUndoBlock0AuthorityProof proof;
+
+	/* Validate the retained subject pointer before reading its physical key. */
+	if (pin == NULL || !ClusterColdRecoveryTxTopProofCurrent(start, subject)
+		|| !ClusterColdRecoveryTxEffectsCurrent(start))
+		return false;
+	memset(&logical, 0, sizeof(logical));
+	logical.owner_instance = subject->input.key.owner_instance;
+	logical.segment_id = subject->input.key.segment_id;
+	memset(&proof, 0, sizeof(proof));
+	proof.kind = CLUSTER_UNDO_BLOCK0_STARTUP_REDO;
+	proof.owner_instance = logical.owner_instance;
+	proof.cluster_epoch_present = true;
+	proof.cluster_epoch = start->writer.epoch;
+	proof.recovery_generation = start->generation;
+	if (cluster_undo_block0_recovery_reserve(&logical, &proof, pin) != CLUSTER_UNDO_BLOCK0_OK)
+		return false;
+	if (!ClusterColdRecoveryTxTopProofCurrent(start, subject)
+		|| !ClusterColdRecoveryTxEffectsCurrent(start)) {
+		cluster_undo_block0_release_reservation(pin);
+		return false;
+	}
 	return true;
 }
 

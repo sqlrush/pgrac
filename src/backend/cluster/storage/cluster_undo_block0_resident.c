@@ -1021,6 +1021,60 @@ cluster_undo_block0_reserve(const ClusterUndoBlock0LogicalKey *logical,
 
 
 ClusterUndoBlock0Result
+cluster_undo_block0_recovery_reserve(const ClusterUndoBlock0LogicalKey *logical,
+	const ClusterUndoBlock0AuthorityProof *proof, ClusterUndoBlock0Pin *pin)
+{
+	ClusterUndoBlock0SlotData *meta;
+	ClusterUndoBlock0OwnedResource *owned;
+	uint32 slotno;
+
+	/* Do not erase a handle that already owns a pin or an unpublished fill. */
+	if (pin != NULL
+		&& (block0_resource_find(pin, CLUSTER_UNDO_BLOCK0_OWNED_RESERVED_PIN) != NULL
+			|| block0_resource_find(pin, CLUSTER_UNDO_BLOCK0_OWNED_LOCKED_PIN) != NULL
+			|| block0_resource_find(pin, CLUSTER_UNDO_BLOCK0_OWNED_FILL) != NULL
+			|| block0_resource_find(pin, CLUSTER_UNDO_BLOCK0_OWNED_PROVISION) != NULL))
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	block0_pin_clear(pin);
+	if (Block0Ctl == NULL)
+		return CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+	if (pin == NULL
+		|| cluster_undo_block0_logical_slot(logical, &slotno) != CLUSTER_UNDO_BLOCK0_OK)
+		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+	if (!block0_authority_proof_valid(logical, proof)
+		|| (proof->kind != CLUSTER_UNDO_BLOCK0_RECOVERY_OWNER
+			&& proof->kind != CLUSTER_UNDO_BLOCK0_STARTUP_REDO)
+		|| proof->recovery_generation == 0)
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	owned = block0_resource_prepare(pin, CLUSTER_UNDO_BLOCK0_OWNED_RESERVED_PIN);
+	if (owned == NULL)
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	/* Register before acquiring the lock: ERROR can then reclaim the metadata
+	 * even before a slot is owned. The original callback ignores an unset slot. */
+	block0_resource_link(owned);
+	meta = &Block0Slots[slotno].data;
+	LWLockAcquire(&meta->content_lock, LW_EXCLUSIVE);
+	if (pg_atomic_read_u32(&meta->state) != CLUSTER_UNDO_BLOCK0_SLOT_EMPTY
+		|| pg_atomic_read_u32(&meta->pincount) != 0
+		|| meta->frame_index != CLUSTER_UNDO_BLOCK0_FRAME_INVALID
+		|| !XLogRecPtrIsInvalid(meta->last_wal_lsn)) {
+		LWLockRelease(&meta->content_lock);
+		block0_resource_forget(owned);
+		return CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+	}
+	pg_atomic_write_u32(&meta->pincount, 1);
+	owned->slot = slotno;
+	pin->slot = (int)slotno;
+	pin->logical = *logical;
+	pin->proof = *proof;
+	/* EMPTY state, frame bank, root and generation are deliberately untouched.
+	 * WAL insertion must not retain the content lock. */
+	LWLockRelease(&meta->content_lock);
+	return CLUSTER_UNDO_BLOCK0_OK;
+}
+
+
+ClusterUndoBlock0Result
 cluster_undo_block0_lock_content(ClusterUndoBlock0Pin *pin,
 								 const ClusterUndoBlock0Generation *expected,
 								 ClusterUndoBlock0Mode mode, char **page)

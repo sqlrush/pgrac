@@ -276,6 +276,7 @@
 #include "cluster/cluster_conf.h" /* PGRAC: RF-B exact one-node gate */
 #include "cluster/cluster_cold_recovery.h" /* PGRAC: hold restartpoint during typed cold replay */
 #include "cluster/cluster_wal_inputs.h" /* PGRAC: post-EOR retained loser read scope */
+#include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/cluster_gcs_block.h" /* PGRAC: spec-6.12h D-h2 PI-discard checkpoint seal */
 #include "cluster/cluster_guc.h" /* PGRAC: spec-5.6 cluster_controlfile_shared_authority */
 #include "cluster/cluster_hw_snapshot.h" /* PGRAC: spec-5.7 D3 HW authority checkpoint snapshot */
@@ -6693,6 +6694,7 @@ cluster_cold_recovery_consume_loser_inputs_v1(
 		ClusterWalInputsV1 *inputs = NULL;
 		ClusterControlRootResult result;
 		ClusterRecoveryTTAbortDerivationV1 candidate;
+		ClusterUndoBlock0Pin target = { .slot = -1 };
 
 		/* A retained ACTIVE without an independent loser proof stays
 		 * unresolved; it must not be promoted by this consumer. */
@@ -6718,8 +6720,14 @@ cluster_cold_recovery_consume_loser_inputs_v1(
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			&& !ClusterColdRecoveryTxC0Candidate(start, entry, &candidate))
 			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		/* Local target exclusion only. Retain no content lock across the later
+		 * C0 preparation/insertion seam, and grant no mutation authority here. */
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& !ClusterColdRecoveryTxC0Reserve(start, entry, &target))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			result = cluster_wal_inputs_revalidate_v1(inputs);
+		cluster_undo_block0_release_reservation(&target);
 		cluster_wal_inputs_release_v1(&inputs);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return false;

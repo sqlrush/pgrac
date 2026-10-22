@@ -184,6 +184,14 @@ extern bool ClusterColdRecoveryTxC0Candidate(
 	const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdTopTxCensusEntryV1 *subject,
 	struct ClusterRecoveryTTAbortDerivationV1 *out);
+struct ClusterUndoBlock0Pin;
+/* Reserve the original proven target's EMPTY block0 slot without a content
+ * lock. The caller releases it before the retained source scope. This is
+ * local exclusion only, with no C0/WAL/TT/I/O or checkpoint authority. */
+extern bool ClusterColdRecoveryTxC0Reserve(
+	const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject,
+	struct ClusterUndoBlock0Pin *pin);
 #endif
 extern void RemovePromoteSignalFiles(void);
 

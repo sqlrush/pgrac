@@ -7416,6 +7416,7 @@ CLUSTER_UNDO_BLOCK0_CURRENT_O = \
 CLUSTER_UNDO_BLOCK0_RESIDENT_O = \
 	$(top_builddir)/src/backend/cluster/storage/cluster_undo_block0_resident.o
 test_cluster_undo_block0: test_cluster_undo_block0.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_block0.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_UNDO_BLOCK0_RESIDENT_O) \
 		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O)
 	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) $< \
@@ -9732,5 +9733,6 @@ test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_ow
         $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_tt_record.h \
         $(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+        $(top_srcdir)/src/include/cluster/storage/cluster_undo_block0.h \
         $(top_srcdir)/src/include/cluster/cluster_wal_writer.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@

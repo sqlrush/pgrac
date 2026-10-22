@@ -2482,11 +2482,132 @@ UT_TEST(test_header_writer_uses_existing_content_lock_and_refuses_shared_upgrade
 	IsUnderPostmaster = false;
 }
 
+UT_TEST(test_cold_reservation_excludes_fill_without_frame_io_or_held_lock)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0AuthorityProof proof = make_recovery_proof(1, 7, 4);
+	ClusterUndoBlock0AuthorityProof live = make_live_proof(1, 7);
+	ClusterUndoBlock0ResolvedRoot root = make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 9, 1);
+	ClusterUndoBlock0Pin pin, other;
+	ClusterUndoBlock0RecoveryGuard guard;
+	ClusterUndoBlock0FrameToken frame;
+	char image[BLCKSZ], *page = NULL;
+	bool exists = false;
+	uint32 acquired;
+	int locks, unlocks;
+	ClusterUndoBlock0Result admitted;
+
+	fresh_block0_region(1);
+	locks = lwlock_acquire_calls;
+	unlocks = lwlock_release_calls;
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_reserve(&logical, &proof, &pin), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(lwlock_acquire_calls, locks + 1);
+	UT_ASSERT_EQ(lwlock_release_calls, unlocks + 1);
+	UT_ASSERT(!pin.observed_generation.known);
+	UT_ASSERT_EQ(pin.resolved_root.root_id, 0);
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_reserve(&logical, &proof, &other),
+		CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED);
+	UT_ASSERT_EQ(other.slot, -1);
+	UT_ASSERT_EQ(cluster_undo_block0_prove_strict_empty(&logical, &live),
+		CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &frame), CLUSTER_UNDO_BLOCK0_OK);
+	admitted = cluster_undo_block0_admit_runtime(&logical, &root, &live, &frame, &other, &page);
+	UT_ASSERT_EQ(admitted, CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED);
+	UT_ASSERT(frame.owned);
+	if (admitted == CLUSTER_UNDO_BLOCK0_OK)
+		cluster_undo_block0_unpin(&other);
+	cluster_undo_block0_frame_release(&frame);
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(&logical, &root, &proof, false,
+		&guard, image, &exists), CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED);
+	IsUnderPostmaster = true;
+	UT_ASSERT(cluster_undo_block0_header_write_lock(1, 1, &acquired));
+	cluster_undo_block0_header_write_unlock(acquired);
+	IsUnderPostmaster = false;
+	UT_ASSERT_EQ(smgr_read_calls + smgr_write_calls + xlog_flush_calls, 0);
+	cluster_undo_block0_release_reservation(&pin);
+	UT_ASSERT_EQ(pin.slot, -1);
+	UT_ASSERT_EQ(cluster_undo_block0_prove_strict_empty(&logical, &live), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_reserve(&logical, &proof, &pin), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_lock_content(&pin, NULL, CLUSTER_UNDO_BLOCK0_EXCLUSIVE, &page),
+		CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED);
+	UT_ASSERT_NULL(page);
+	UT_ASSERT_EQ(pin.slot, -1); /* The resident lock API rejects and drops this reservation. */
+	UT_ASSERT_EQ(cluster_undo_block0_prove_strict_empty(&logical, &live), CLUSTER_UNDO_BLOCK0_OK);
+}
+
+UT_TEST(test_cold_reservation_requires_recovery_proof_owner_and_empty_slot)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0AuthorityProof live = make_live_proof(1, 7);
+	ClusterUndoBlock0ResolvedRoot root = make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 9, 1);
+	ClusterUndoBlock0Pin pin, other;
+	ClusterUndoBlock0FrameToken frame;
+	char *page = NULL;
+	ResourceOwner saved_owner = CurrentResourceOwner;
+
+	fresh_block0_region(1);
+	for (int fault = 0; fault < 6; fault++) {
+		ClusterUndoBlock0LogicalKey key = logical;
+		ClusterUndoBlock0AuthorityProof proof = make_recovery_proof(1, 7, 4);
+		switch (fault) {
+		case 0: proof = live; break;
+		case 1: proof.recovery_generation = 0; break;
+		case 2: proof.cluster_epoch_present = false; break;
+		case 3: proof.owner_instance = 2; break;
+		case 4: key.segment_id = 257; break;
+		case 5: CurrentResourceOwner = NULL; break;
+		}
+		UT_ASSERT(cluster_undo_block0_recovery_reserve(&key, &proof, &pin) != CLUSTER_UNDO_BLOCK0_OK);
+		UT_ASSERT_EQ(pin.slot, -1);
+		CurrentResourceOwner = saved_owner;
+		UT_ASSERT_EQ(cluster_undo_block0_prove_strict_empty(&logical, &live), CLUSTER_UNDO_BLOCK0_OK);
+	}
+	make_valid_block0(1, 1, 7, 0);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &frame), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&logical, &root, &live, &frame, &pin, &page),
+		CLUSTER_UNDO_BLOCK0_OK);
+	cluster_undo_block0_unpin(&pin);
+	{
+		ClusterUndoBlock0AuthorityProof proof = make_recovery_proof(1, 7, 4);
+		UT_ASSERT_EQ(cluster_undo_block0_recovery_reserve(&logical, &proof, &other),
+			CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED);
+	}
+	UT_ASSERT_EQ(other.slot, -1);
+}
+
+UT_TEST(test_cold_reservation_uses_original_resource_owner_cleanup)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0AuthorityProof proof = make_recovery_proof(1, 7, 4);
+	ClusterUndoBlock0AuthorityProof live = make_live_proof(1, 7);
+	ClusterUndoBlock0Pin pin, next;
+
+	fresh_block0_region(1);
+	proof.kind = CLUSTER_UNDO_BLOCK0_STARTUP_REDO;
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_reserve(&logical, &proof, &pin), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_reserve(&logical, &proof, &pin),
+		CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+	UT_ASSERT_EQ(pin.slot, 0); /* A rejected reuse must not erase the owned handle. */
+	resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false, resource_release_arg);
+	UT_ASSERT_EQ(cluster_undo_block0_prove_strict_empty(&logical, &live), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_reserve(&logical, &proof, &next), CLUSTER_UNDO_BLOCK0_OK);
+	cluster_undo_block0_release_reservation(&pin); /* Stale cleanup cannot release next. */
+	UT_ASSERT_EQ(cluster_undo_block0_prove_strict_empty(&logical, &live),
+		CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+	cluster_undo_block0_release_reservation(&next);
+	cluster_undo_block0_release_reservation(&next);
+	UT_ASSERT_EQ(cluster_undo_block0_prove_strict_empty(&logical, &live), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(smgr_read_calls + smgr_write_calls + xlog_flush_calls, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(59);
+	UT_PLAN(62);
 	UT_RUN(test_header_writer_uses_existing_content_lock_and_refuses_shared_upgrade);
+	UT_RUN(test_cold_reservation_excludes_fill_without_frame_io_or_held_lock);
+	UT_RUN(test_cold_reservation_requires_recovery_proof_owner_and_empty_slot);
+	UT_RUN(test_cold_reservation_uses_original_resource_owner_cleanup);
 	UT_RUN(test_block0_key_endpoints_map_to_direct_slots);
 	UT_RUN(test_block0_key_rejects_owner_segment_aliases);
 	UT_RUN(test_block0_root_requires_pgrd_identity_and_declared_intent);

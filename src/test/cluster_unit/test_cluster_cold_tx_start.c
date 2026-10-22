@@ -10,6 +10,7 @@
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_wal_inputs.h"
+#include "cluster/storage/cluster_undo_block0.h"
 #include "../../../src/backend/cluster/cluster_control_root_private.h"
 #include "miscadmin.h"
 #include "postmaster/interrupt.h"
@@ -44,6 +45,11 @@ static bool xid_ready, invalidate_writer_on_xid_ready;
 static unsigned scope_begins, scope_checks, scope_releases;
 static unsigned fail_scope_check;
 static bool scope_begin_ok;
+static unsigned target_reserves, target_releases;
+static bool target_reserve_ok, invalidate_writer_on_reserve;
+static ClusterUndoBlock0Pin *reserved_target;
+static ClusterUndoBlock0LogicalKey target_key;
+static ClusterUndoBlock0AuthorityProof target_proof;
 static char scope_storage;
 static uint64 owner_boot;
 static ResourceReleaseCallback release_callback;
@@ -98,6 +104,35 @@ void *MemoryContextAllocExtended(MemoryContext context, Size size, int flags)
 	return calloc(1, size);
 }
 void pfree(void *ptr) { if (ptr != NULL) frees++; free(ptr); }
+ClusterUndoBlock0Result
+cluster_undo_block0_recovery_reserve(const ClusterUndoBlock0LogicalKey *logical,
+	const ClusterUndoBlock0AuthorityProof *proof, ClusterUndoBlock0Pin *pin)
+{
+	if (reserved_target != NULL) abort();
+	target_reserves++;
+	target_key = *logical;
+	target_proof = *proof;
+	memset(pin, 0, sizeof(*pin));
+	pin->slot = -1;
+	if (!target_reserve_ok) return CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+	pin->slot = 0;
+	pin->logical = *logical;
+	pin->proof = *proof;
+	reserved_target = pin;
+	if (invalidate_writer_on_reserve) observed_writer.epoch++;
+	return CLUSTER_UNDO_BLOCK0_OK;
+}
+void
+cluster_undo_block0_release_reservation(ClusterUndoBlock0Pin *pin)
+{
+	if (pin->slot >= 0) {
+		if (reserved_target != pin) abort();
+		target_releases++;
+		reserved_target = NULL;
+	}
+	memset(pin, 0, sizeof(*pin));
+	pin->slot = -1;
+}
 void cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **inputs)
 {
 	if (destroy_probe != NULL && ClusterColdRecoveryTxCurrent(destroy_probe)) abort();
@@ -168,12 +203,14 @@ void
 cluster_wal_inputs_release_v1(ClusterWalInputsV1 **inputs)
 {
 	if (*inputs != (ClusterWalInputsV1 *)&scope_storage) abort();
+	if (reserved_target != NULL) abort();
 	scope_releases++;
 	*inputs = NULL;
 }
 
 static void reset(void)
 {
+	if (reserved_target != NULL) abort();
 	if (exit_callback != NULL) exit_callback(0, (Datum)0);
 	exit_callback = NULL;
 	destroy_probe = NULL;
@@ -196,6 +233,11 @@ static void reset(void)
 	xid_ready = invalidate_writer_on_xid_ready = false;
 	scope_begins = scope_checks = scope_releases = fail_scope_check = 0;
 	scope_begin_ok = true;
+	target_reserves = target_releases = 0;
+	target_reserve_ok = true;
+	invalidate_writer_on_reserve = false;
+	memset(&target_key, 0, sizeof(target_key));
+	memset(&target_proof, 0, sizeof(target_proof));
 	clusterStartupWriterSelected = clusterStartupWriterBound = true;
 	clusterStartupWriterInstalled = binding_ok = writer_ok = allocation_ok = true;
 	owner_boot = 17;
@@ -634,9 +676,50 @@ UT_TEST(test_actual_startup_consumer_requires_numeric_candidate_under_revalidate
 	UT_ASSERT_EQ(scope_begins, 0);
 }
 
+UT_TEST(test_actual_startup_consumer_reserves_original_target_then_releases_before_scope)
+{
+	c0_subject();
+	UT_ASSERT(cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+	UT_ASSERT_EQ(target_reserves, 1);
+	UT_ASSERT_EQ(target_releases, 1);
+	UT_ASSERT_EQ(target_key.owner_instance, census.entries[0].input.key.owner_instance);
+	UT_ASSERT_EQ(target_key.segment_id, census.entries[0].input.key.segment_id);
+	UT_ASSERT_EQ(target_proof.kind, CLUSTER_UNDO_BLOCK0_STARTUP_REDO);
+	UT_ASSERT_EQ(target_proof.owner_instance, 2);
+	UT_ASSERT(target_proof.cluster_epoch_present);
+	UT_ASSERT_EQ(target_proof.cluster_epoch, observed_writer.epoch);
+	UT_ASSERT_EQ(target_proof.recovery_generation, info.cluster_tx_start->generation);
+	UT_ASSERT(reserved_target == NULL);
+	UT_ASSERT_EQ(scope_releases, 1);
+	UT_ASSERT_EQ(census.entries[0].input.slot.status, TT_SLOT_ACTIVE);
+}
+
+UT_TEST(test_actual_startup_reservation_failure_or_stale_owner_preserves_active_and_releases)
+{
+	for (int fault = 0; fault < 7; fault++) {
+		bool result;
+		c0_subject();
+		switch (fault) {
+		case 0: target_reserve_ok = false; break;
+		case 1: fail_scope_check = 2; break;
+		case 2: invalidate_writer_on_reserve = true; break;
+		case 3: xid_ready = false; break;
+		case 4: census.entries[0].proof.qualified_base = false; break;
+		case 5: fail_scope_check = 1; break;
+		case 6: census.entries[0].loser_proven = false; break;
+		}
+		result = cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start);
+		UT_ASSERT_EQ(result, fault == 6);
+		UT_ASSERT_EQ(target_reserves, fault <= 2 ? 1 : 0);
+		UT_ASSERT_EQ(target_releases, fault == 1 || fault == 2 ? 1 : 0);
+		UT_ASSERT(reserved_target == NULL);
+		UT_ASSERT_EQ(census.entries[0].input.slot.status, TT_SLOT_ACTIVE);
+	}
+}
+
 int main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(18);
 	UT_RUN(test_original_owner_binds_complete_empty_census_after_done);
 	UT_RUN(test_native_owner_rejects_uninstalled_recovery_and_writer_drift);
 	UT_RUN(test_current_rechecks_owner_process_boot_and_exact_writer);
@@ -653,6 +736,8 @@ int main(void)
 	UT_RUN(test_c0_candidate_uses_original_target_actual_writer_and_all_endpoints);
 	UT_RUN(test_c0_candidate_refuses_missing_conflicting_or_stale_inputs_without_reclassifying_loser);
 	UT_RUN(test_actual_startup_consumer_requires_numeric_candidate_under_revalidated_scope);
+	UT_RUN(test_actual_startup_consumer_reserves_original_target_then_releases_before_scope);
+	UT_RUN(test_actual_startup_reservation_failure_or_stale_owner_preserves_active_and_releases);
 	reset();
 	if (allocations != frees) { fprintf(stderr, "unreleased start resources\n"); return 1; }
 	UT_DONE();

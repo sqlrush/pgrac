@@ -180,6 +180,12 @@ extern ClusterUndoBlock0Result cluster_undo_block0_admit_runtime(
 extern ClusterUndoBlock0Result cluster_undo_block0_reserve(
 	const ClusterUndoBlock0LogicalKey *logical, const ClusterUndoBlock0ResolvedRoot *expected_root,
 	const ClusterUndoBlock0AuthorityProof *proof, ClusterUndoBlock0Pin *pin);
+/* Reserve an EMPTY recovery target without a frame or a retained content
+ * lock. ResourceOwner cleanup uses the original reservation release path.
+ * This grants no root, generation, resident-page, WAL or I/O authority. */
+extern ClusterUndoBlock0Result cluster_undo_block0_recovery_reserve(
+	const ClusterUndoBlock0LogicalKey *logical,
+	const ClusterUndoBlock0AuthorityProof *proof, ClusterUndoBlock0Pin *pin);
 extern ClusterUndoBlock0Result
 cluster_undo_block0_lock_content(ClusterUndoBlock0Pin *pin,
 								 const ClusterUndoBlock0Generation *expected,
