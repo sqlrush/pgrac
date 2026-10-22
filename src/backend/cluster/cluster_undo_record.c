@@ -2281,7 +2281,8 @@ static void
 undo_receipt_lifecycle_trace(const char *event, const char *predicate,
 	const ClusterUndoRecordPrepareReceipt *receipt, uint8 ordinal, TransactionId xid,
 	const UndoReceiptOwnerTrace *owner, const ClusterCtrcPublicationIdV1 *publication,
-	const ClusterCtrcReceiptHandle *handle, int prepare_result, int sync_result,
+	const ClusterCtrcReceiptHandle *handle, int prepare_result,
+	ClusterCtrcPreparePath shared_prepare_path, int sync_result,
 	const UndoReceiptCancelTrace *cancel)
 {
 	static uint64 event_seq;
@@ -2370,7 +2371,8 @@ undo_receipt_lifecycle_trace(const char *event, const char *predicate,
 		" publication_slot_generation=" UINT64_FORMAT
 		" handle_known=%d handle_valid=%d participant_index=" UINT64_FORMAT
 		" receipt_index=" UINT64_FORMAT " journal_slot_generation=" UINT64_FORMAT
-		" prepare_result_known=%d prepare_result=%d local_sync_known=%d local_sync_result=%d "
+		" prepare_result_known=%d prepare_result=%d shared_prepare_path_known=%d shared_prepare_path=%u "
+		"local_sync_known=%d local_sync_result=%d "
 		"before_local_known=%d before_ref_slot=%d before_ref_owned=%d before_active=%d before_locked=%d "
 		"local_active=%d local_ref_owned=%d local_ref_slot=%d local_locked=%d apply_attempted=%d "
 		"cancel_results_known=%d cancel_attempted_mask=%u cancel_succeeded_mask=%u "
@@ -2429,7 +2431,9 @@ undo_receipt_lifecycle_trace(const char *event, const char *predicate,
 		handle != NULL ? handle->participant_index : 0,
 		handle != NULL ? handle->receipt_index : 0,
 		handle != NULL ? handle->journal_slot_generation : 0,
-		prepare_result >= 0, prepare_result, sync_result >= 0, sync_result,
+		prepare_result >= 0, prepare_result,
+		shared_prepare_path != CLUSTER_CTRC_PREPARE_PATH_UNKNOWN, (unsigned)shared_prepare_path,
+		sync_result >= 0, sync_result,
 		cancel != NULL && cancel->before_known,
 		cancel != NULL && cancel->before_known ? cancel->ref_slot : -1,
 		cancel != NULL && cancel->before_known && cancel->owns_ref,
@@ -3210,6 +3214,7 @@ cluster_undo_record_ctrc_prepare_pending(ClusterUndoRecordPrepareReceipt *receip
 	ClusterCtrcPublicationIdV1 publication;
 	ClusterCtrcReceiptHandle handle;
 	ClusterCtrcPrepareResult result;
+	ClusterCtrcPreparePath shared_prepare_path = CLUSTER_CTRC_PREPARE_PATH_UNKNOWN;
 	TransactionId xid = GetTopTransactionIdIfAny();
 	uint32 grant = 0;
 	uint8 target_bit;
@@ -3273,18 +3278,24 @@ cluster_undo_record_ctrc_prepare_pending(ClusterUndoRecordPrepareReceipt *receip
 		UndoReceiptOwnerTrace trace = { owner_exact, &status_key, &status, grant, &key, &participant };
 
 		undo_receipt_lifecycle_trace("prepare.begin", "original_shared_call", receipt,
-			target_ordinal, xid, &trace, &publication, NULL, -1, -1, NULL);
+			target_ordinal, xid, &trace, &publication, NULL, -1,
+			CLUSTER_CTRC_PREPARE_PATH_UNKNOWN, -1, NULL);
 	}
-	result = cluster_ctrc_receipt_prepare_shared(&key, &participant, grant, &publication,
-												 &receipt->ctrc_pending_targets[target_ordinal],
-												 &handle);
+	if (cluster_trace_normal_stop)
+		result = cluster_ctrc_receipt_prepare_shared_observed(&key, &participant, grant,
+			&publication, &receipt->ctrc_pending_targets[target_ordinal], &handle,
+			&shared_prepare_path);
+	else
+		result = cluster_ctrc_receipt_prepare_shared(&key, &participant, grant, &publication,
+			&receipt->ctrc_pending_targets[target_ordinal], &handle);
 	if (result != CLUSTER_CTRC_PREPARE_READY && result != CLUSTER_CTRC_PREPARE_DUPLICATE) {
 		cluster_undo_receipt_reason = "CTRC_PREPARE_REFUSED";
 		if (cluster_trace_normal_stop) {
 			UndoReceiptOwnerTrace trace = { owner_exact, &status_key, &status, grant, &key, &participant };
 
 			undo_receipt_lifecycle_trace("prepare.refused", "original_shared_result", receipt,
-				target_ordinal, xid, &trace, &publication, NULL, (int)result, -1, NULL);
+				target_ordinal, xid, &trace, &publication, NULL, (int)result,
+				shared_prepare_path, -1, NULL);
 		}
 		return false;
 	}
@@ -3300,7 +3311,8 @@ cluster_undo_record_ctrc_prepare_pending(ClusterUndoRecordPrepareReceipt *receip
 			cancel.attempted = target_bit;
 			cancel.succeeded = cancelled ? target_bit : 0;
 			undo_receipt_lifecycle_trace("prepare.sync_refused", "local_receipt_sync", receipt,
-				target_ordinal, xid, &trace, &publication, &handle, (int)result, 0, &cancel);
+				target_ordinal, xid, &trace, &publication, &handle, (int)result,
+				shared_prepare_path, 0, &cancel);
 		}
 		return false;
 	}
@@ -3311,7 +3323,8 @@ cluster_undo_record_ctrc_prepare_pending(ClusterUndoRecordPrepareReceipt *receip
 		UndoReceiptOwnerTrace trace = { owner_exact, &status_key, &status, grant, &key, &participant };
 
 		undo_receipt_lifecycle_trace("prepare.ready", "local_handle_registered", receipt,
-			target_ordinal, xid, &trace, &publication, &handle, (int)result, 1, NULL);
+			target_ordinal, xid, &trace, &publication, &handle, (int)result,
+			shared_prepare_path, 1, NULL);
 	}
 	return true;
 }
@@ -3666,7 +3679,7 @@ cluster_undo_record_cancel_prepared(ClusterUndoRecordPrepareReceipt *receipt)
 			undo_receipt_lifecycle_trace("cancel.local_retired", "original_local_cleanup_complete",
 				&trace.receipt, ordinal, InvalidTransactionId, NULL, NULL,
 				trace.receipt.ctrc_handles[ordinal].valid ? &trace.receipt.ctrc_handles[ordinal] : NULL,
-				-1, -1, &trace);
+				-1, CLUSTER_CTRC_PREPARE_PATH_UNKNOWN, -1, &trace);
 		}
 	}
 }

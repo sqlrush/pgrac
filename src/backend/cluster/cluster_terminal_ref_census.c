@@ -5780,7 +5780,8 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 									 const ClusterCtrcPublicationIdV1 *publication,
 									 const ClusterCtrcTargetV1 *target,
 									 ClusterCtrcReceiptHandle *handle,
-									 const ClusterKoPeerAdmissionV3 *continuation)
+									 const ClusterKoPeerAdmissionV3 *continuation,
+									 ClusterCtrcPreparePath *path_out)
 {
 	ClusterCtrcParticipantEntry *participant;
 	ClusterCtrcReceipt *receipts;
@@ -5793,18 +5794,26 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 	bool check_object;
 	bool sampled = false;
 
+	if (path_out != NULL)
+		*path_out = CLUSTER_CTRC_PREPARE_PATH_UNKNOWN;
 	if (handle != NULL)
 		MemSet(handle, 0, sizeof(*handle));
 	/* Report this exact input predicate before any journal or participant
 	 * mutation. Unknown transaction/owner state remains a separate refusal. */
 	if (target != NULL
-		&& !ctrc_relation_namespace_valid(target->spc_oid, target->db_oid, target->rel_number))
+		&& !ctrc_relation_namespace_valid(target->spc_oid, target->db_oid, target->rel_number)) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_NAMESPACE;
 		return ctrc_receipt_prepare_refused(true);
+	}
 	if (handle == NULL || identity == NULL || publication == NULL || target == NULL
 		|| cluster_node_id < 0 || identity->node_id != (uint16)cluster_node_id
 		|| !cluster_ctrc_shmem_ready()
-		|| !ctrc_participant_index(key, identity->node_id, &participant_index))
+		|| !ctrc_participant_index(key, identity->node_id, &participant_index)) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_INPUT;
 		return ctrc_receipt_prepare_refused(false);
+	}
 	locator = (RelFileLocator){ target->spc_oid, target->db_oid, target->rel_number };
 	check_object = cluster_shared_config && cluster_interconnect_tier == CLUSTER_IC_TIER_1
 				   && cluster_smgr_which_for(locator, InvalidBackendId) == 1;
@@ -5817,15 +5826,26 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 	}
 	/* No object lock may be acquired under the original CTRC locks. A
 	 * refused sample only looks for an exact already accepted duplicate. */
-	if ((!check_object || sampled) && !ctrc_allocate_journal_sequence(&journal_sequence))
+	if ((!check_object || sampled) && !ctrc_allocate_journal_sequence(&journal_sequence)) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_JOURNAL;
 		return ctrc_receipt_prepare_refused(false);
+	}
 
 	participant = &ctrc_participant_entries()[participant_index];
 	receipts = ctrc_receipt_entries();
 	ctrc_participant_locks_acquire(ctrc_participant_lock_mask(participant_index));
 	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
-	if (!ctrc_receipt_chain_exact_locked(participant_index, false)
-		|| !ctrc_receipt_prepare_locators_valid_locked(key, publication)) {
+	/* Only scalar call-local stores accompany the original predicates under
+	 * these locks. Do not log, call an observer, or repeat a table probe here. */
+	if (!ctrc_receipt_chain_exact_locked(participant_index, false)) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_CHAIN;
+		participant->state = CTRC_PARTICIPANT_BLOCKED;
+		result = CLUSTER_CTRC_PREPARE_REFUSED;
+	} else if (!ctrc_receipt_prepare_locators_valid_locked(key, publication)) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_LOCATOR;
 		participant->state = CTRC_PARTICIPANT_BLOCKED;
 		result = CLUSTER_CTRC_PREPARE_REFUSED;
 	} else if (check_object
@@ -5836,10 +5856,14 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 									 &admission, locator, (ForkNumber)target->fork_number,
 									 target->block_number)
 						   : !cluster_ko_peer_admission_current_v3(&admission, locator)))) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_OBJECT_EXISTING;
 		result = ctrc_receipt_prepare_existing_locked(participant, participant_index, key, identity,
 													  grant_generation, publication, target,
 													  &receipt_index);
 	} else {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE;
 		result = cluster_ctrc_receipt_prepare_table_locked(
 			participant, key, identity, grant_generation, publication, target, receipts,
 			ctrc_receipt_probe_states(), CtrcShared->receipt_entries, journal_sequence,
@@ -5882,15 +5906,30 @@ cluster_ctrc_receipt_prepare_shared(const ClusterCtrcTxnKeyV1 *key,
 									const ClusterCtrcTargetV1 *target,
 									ClusterCtrcReceiptHandle *handle)
 {
+	return cluster_ctrc_receipt_prepare_shared_observed(key, identity, grant_generation,
+		publication, target, handle, NULL);
+}
+
+ClusterCtrcPrepareResult
+cluster_ctrc_receipt_prepare_shared_observed(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *identity, uint32 grant_generation,
+	const ClusterCtrcPublicationIdV1 *publication, const ClusterCtrcTargetV1 *target,
+	ClusterCtrcReceiptHandle *handle, ClusterCtrcPreparePath *path_out)
+{
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	return ctrc_receipt_prepare_shared_internal(key, identity, grant_generation, publication,
-												target, handle, NULL);
+												target, handle, NULL, path_out);
 #else
+	if (path_out != NULL)
+		*path_out = CLUSTER_CTRC_PREPARE_PATH_UNKNOWN;
 	if (handle != NULL)
 		MemSet(handle, 0, sizeof(*handle));
 	if (target != NULL
-		&& !ctrc_relation_namespace_valid(target->spc_oid, target->db_oid, target->rel_number))
+		&& !ctrc_relation_namespace_valid(target->spc_oid, target->db_oid, target->rel_number)) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_NAMESPACE;
 		return ctrc_receipt_prepare_refused(true);
+	}
 	(void)key;
 	(void)identity;
 	(void)grant_generation;
@@ -8643,7 +8682,7 @@ ctrc_cleaner_prepare_current_mx_successor(
 		publication.grant_generation = grant;
 		prepare_result = ctrc_receipt_prepare_shared_internal(
 			&key, &participant, grant, &publication, &pending_target, &handles[prepared_count],
-			check_object ? &admission : NULL);
+			check_object ? &admission : NULL, NULL);
 		if (prepare_result != CLUSTER_CTRC_PREPARE_READY
 			&& prepare_result != CLUSTER_CTRC_PREPARE_DUPLICATE)
 			goto successor_failed;

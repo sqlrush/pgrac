@@ -600,6 +600,20 @@ typedef enum ClusterCtrcPrepareResult {
 	CLUSTER_CTRC_PREPARE_CAPACITY = 3
 } ClusterCtrcPrepareResult;
 
+/* Call-local observation of the original shared PREPARE path, not a receipt
+ * or authority. TABLE and OBJECT_EXISTING do not identify a leaf predicate. */
+#define CLUSTER_CTRC_PREPARE_PATH_PRESENT 1
+typedef enum ClusterCtrcPreparePath {
+	CLUSTER_CTRC_PREPARE_PATH_UNKNOWN = 0,
+	CLUSTER_CTRC_PREPARE_PATH_NAMESPACE = 1,
+	CLUSTER_CTRC_PREPARE_PATH_INPUT = 2,
+	CLUSTER_CTRC_PREPARE_PATH_JOURNAL = 3,
+	CLUSTER_CTRC_PREPARE_PATH_CHAIN = 4,
+	CLUSTER_CTRC_PREPARE_PATH_LOCATOR = 5,
+	CLUSTER_CTRC_PREPARE_PATH_OBJECT_EXISTING = 6,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE = 7
+} ClusterCtrcPreparePath;
+
 typedef enum ClusterCtrcApplyResult {
 	CLUSTER_CTRC_APPLY_FAIL_CLOSED = 0,
 	CLUSTER_CTRC_APPLY_APPLIED = 1,
@@ -1034,6 +1048,11 @@ extern ClusterCtrcPrepareResult cluster_ctrc_receipt_prepare_shared(
 	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *identity,
 	uint32 grant_generation, const ClusterCtrcPublicationIdV1 *publication,
 	const ClusterCtrcTargetV1 *target, ClusterCtrcReceiptHandle *handle);
+extern ClusterCtrcPrepareResult cluster_ctrc_receipt_prepare_shared_observed(
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *identity,
+	uint32 grant_generation, const ClusterCtrcPublicationIdV1 *publication,
+	const ClusterCtrcTargetV1 *target, ClusterCtrcReceiptHandle *handle,
+	ClusterCtrcPreparePath *path_out);
 extern ClusterCtrcApplyResult cluster_ctrc_receipt_apply_prepared(
 	ClusterCtrcParticipantEntry *participant, ClusterCtrcReceipt *receipt,
 	const ClusterCtrcTargetV1 *final_target, ClusterCtrcApplyToken *token);

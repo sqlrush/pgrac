@@ -71,6 +71,21 @@
 
 UT_DEFINE_GLOBALS();
 
+/* Let the exact parent caller run, so missing observations are behavioral
+ * failures rather than an absent-type compile failure. */
+#ifndef CLUSTER_CTRC_PREPARE_PATH_PRESENT
+typedef enum ClusterCtrcPreparePath {
+	CLUSTER_CTRC_PREPARE_PATH_UNKNOWN = 0,
+	CLUSTER_CTRC_PREPARE_PATH_NAMESPACE = 1,
+	CLUSTER_CTRC_PREPARE_PATH_INPUT = 2,
+	CLUSTER_CTRC_PREPARE_PATH_JOURNAL = 3,
+	CLUSTER_CTRC_PREPARE_PATH_CHAIN = 4,
+	CLUSTER_CTRC_PREPARE_PATH_LOCATOR = 5,
+	CLUSTER_CTRC_PREPARE_PATH_OBJECT_EXISTING = 6,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE = 7
+} ClusterCtrcPreparePath;
+#endif
+
 #ifndef UNDO_RECORD_SOURCE_PATH
 #error "UNDO_RECORD_SOURCE_PATH must identify cluster_undo_record.c"
 #endif
@@ -134,6 +149,8 @@ static bool receipt_trace_lwlock_held, receipt_lifecycle_controls;
 static bool receipt_fail_sync_after_prepare;
 static const char *receipt_fail_log_event;
 static ClusterCtrcPrepareResult receipt_prepare_result;
+static ClusterCtrcPreparePath receipt_prepare_path;
+static int receipt_prepare_observed_calls;
 static int receipt_owner_probe_case;
 static TimestampTz receipt_clock_after_lock;
 static bool receipt_modifier_valid;
@@ -518,6 +535,23 @@ cluster_ctrc_receipt_prepare_shared(
 	}
 	return CLUSTER_CTRC_PREPARE_READY;
 }
+
+#ifdef CLUSTER_CTRC_PREPARE_PATH_PRESENT
+ClusterCtrcPrepareResult
+cluster_ctrc_receipt_prepare_shared_observed(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *participant, uint32 grant,
+	const ClusterCtrcPublicationIdV1 *publication, const ClusterCtrcTargetV1 *target,
+	ClusterCtrcReceiptHandle *handle, ClusterCtrcPreparePath *path)
+{
+	ClusterCtrcPrepareResult result = cluster_ctrc_receipt_prepare_shared(
+		key, participant, grant, publication, target, handle);
+
+	receipt_prepare_observed_calls++;
+	if (path != NULL)
+		*path = receipt_prepare_path;
+	return result;
+}
+#endif
 
 ClusterCtrcApplyResult
 cluster_ctrc_receipt_apply_shared(const ClusterCtrcReceiptHandle *handle,
@@ -2713,6 +2747,8 @@ receipt_fixture_ready(uint8 record_type, ClusterUndoRecordPrepareReceipt *receip
 	receipt_trace_lwlock_held = receipt_lifecycle_controls = false;
 	receipt_fail_sync_after_prepare = false; receipt_fail_log_event = NULL;
 	receipt_prepare_result = CLUSTER_CTRC_PREPARE_READY;
+	receipt_prepare_path = CLUSTER_CTRC_PREPARE_PATH_TABLE;
+	receipt_prepare_observed_calls = 0;
 	receipt_clock_after_lock = 0;
 	receipt_modifier_valid = true;
 	receipt_block0_valid = true;
@@ -4047,11 +4083,59 @@ UT_TEST(test_receipt_lifecycle_default_off_keeps_prepare_cancel_effects)
 	UT_ASSERT_EQ(receipt.ctrc_prepared_mask, 1);
 	cluster_undo_record_cancel_prepared(&receipt);
 	UT_ASSERT_EQ(receipt_prepare_calls, 1);
+	UT_ASSERT_EQ(receipt_prepare_observed_calls, 0);
 	UT_ASSERT_EQ(receipt_cancel_calls, 1);
 	UT_ASSERT_EQ(receipt_unref_calls, 1);
 	UT_ASSERT_EQ(receipt_leave_calls, 1);
 	UT_ASSERT_EQ(receipt_log_count, 0);
 	UT_ASSERT_EQ(receipt_observe_calls, 0);
+}
+UT_TEST(test_receipt_lifecycle_reports_original_shared_path_without_replay)
+{
+	for (unsigned path = CLUSTER_CTRC_PREPARE_PATH_NAMESPACE;
+		 path <= CLUSTER_CTRC_PREPARE_PATH_TABLE; path++) {
+		ClusterUndoRecordPrepareReceipt receipt;
+		char expected[96];
+
+		receipt_lifecycle_fixture(&receipt);
+		receipt_prepare_result = CLUSTER_CTRC_PREPARE_REFUSED;
+		receipt_prepare_path = (ClusterCtrcPreparePath)path;
+		UT_ASSERT(!cluster_undo_record_ctrc_prepare_pending(&receipt, 0));
+		UT_ASSERT_EQ(receipt_prepare_calls, 1);
+		UT_ASSERT_EQ(receipt_prepare_observed_calls, 1);
+		UT_ASSERT_EQ(receipt_cancel_calls, 0);
+		UT_ASSERT_EQ(receipt.ctrc_prepared_mask, 0);
+		snprintf(expected, sizeof(expected), "shared_prepare_path_known=1 shared_prepare_path=%u", path);
+		UT_ASSERT(strstr(receipt_last_log, "event=prepare.refused") != NULL);
+		UT_ASSERT(strstr(receipt_last_log, expected) != NULL);
+		UT_ASSERT(strcmp(cluster_undo_record_receipt_last_reason(), "CTRC_PREPARE_REFUSED") == 0);
+	}
+}
+UT_TEST(test_receipt_lifecycle_begin_unknown_and_cancel_do_not_borrow_shared_path)
+{
+	ClusterUndoRecordPrepareReceipt receipt;
+	const char *begin, *end, *unknown;
+
+	receipt_lifecycle_fixture(&receipt);
+	UT_ASSERT(cluster_undo_record_ctrc_prepare_pending(&receipt, 0));
+	UT_ASSERT_EQ(receipt_prepare_calls, 1);
+	UT_ASSERT_EQ(receipt_prepare_observed_calls, 1);
+	UT_ASSERT(strstr(receipt_last_log, "shared_prepare_path_known=1 shared_prepare_path=7") != NULL);
+	begin = strstr(receipt_all_logs, "event=prepare.begin");
+	UT_ASSERT_NOT_NULL(begin);
+	end = strchr(begin, '\n');
+	unknown = strstr(begin, "shared_prepare_path_known=0 shared_prepare_path=0");
+	UT_ASSERT(end != NULL && unknown != NULL && unknown < end);
+	cluster_undo_record_cancel_prepared(&receipt);
+	UT_ASSERT(strstr(receipt_last_log, "event=cancel.local_retired") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "shared_prepare_path_known=0 shared_prepare_path=0") != NULL);
+	UT_ASSERT_EQ(receipt_cancel_calls, 1);
+
+	receipt_lifecycle_fixture(&receipt);
+	receipt_prepare_path = CLUSTER_CTRC_PREPARE_PATH_UNKNOWN;
+	UT_ASSERT(cluster_undo_record_ctrc_prepare_pending(&receipt, 0));
+	UT_ASSERT(strstr(receipt_last_log, "event=prepare.ready") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "shared_prepare_path_known=0 shared_prepare_path=0") != NULL);
 }
 UT_TEST(test_receipt_lifecycle_owner_publication_ready_are_ordered)
 {
@@ -4098,6 +4182,7 @@ UT_TEST(test_receipt_lifecycle_duplicate_keeps_original_acceptance)
 	UT_ASSERT(strstr(receipt_last_log, "event=prepare.ready") != NULL);
 	UT_ASSERT(strstr(receipt_last_log, "prepare_result=2") != NULL);
 	UT_ASSERT(strstr(receipt_last_log, "local_sync_result=1") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "shared_prepare_path_known=1 shared_prepare_path=7") != NULL);
 	UT_ASSERT_EQ(receipt.ctrc_prepared_mask, 1);
 }
 UT_TEST(test_receipt_lifecycle_sync_refusal_reports_original_cancel_return)
@@ -4109,6 +4194,7 @@ UT_TEST(test_receipt_lifecycle_sync_refusal_reports_original_cancel_return)
 	UT_ASSERT_EQ(receipt_cancel_calls, 1);
 	UT_ASSERT(strstr(receipt_last_log, "event=prepare.sync_refused") != NULL);
 	UT_ASSERT(strstr(receipt_last_log, "local_sync_result=0") != NULL);
+	UT_ASSERT(strstr(receipt_last_log, "shared_prepare_path_known=1 shared_prepare_path=7") != NULL);
 	UT_ASSERT(strstr(receipt_last_log, "before_local_known=0") != NULL);
 	UT_ASSERT(strstr(receipt_last_log, "cancel_results_known=1") != NULL);
 	UT_ASSERT(strstr(receipt_last_log, "cancel_attempted_mask=1 cancel_succeeded_mask=1") != NULL);
@@ -4587,7 +4673,9 @@ UT_TEST(test_receipt_consumer_later_apply_error_cannot_reuse_earlier_result)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(107);
+	UT_PLAN(109);
+	UT_RUN(test_receipt_lifecycle_reports_original_shared_path_without_replay);
+	UT_RUN(test_receipt_lifecycle_begin_unknown_and_cancel_do_not_borrow_shared_path);
 	UT_RUN(test_receipt_consumer_later_apply_error_cannot_reuse_earlier_result);
 	UT_RUN(test_receipt_consumer_observation_off_preserves_effects);
 	UT_RUN(test_receipt_consumer_observation_survives_original_erasure);
