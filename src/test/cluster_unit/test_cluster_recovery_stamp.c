@@ -9,6 +9,7 @@
 #include "cluster/cluster_thread_recovery.h"
 #include "cluster/cluster_recovery_ctrc_record.h"
 #include "common/cryptohash.h"
+#include "access/xlog_internal.h"
 #include "../../backend/cluster/cluster_recovery_plan.c"
 #undef printf
 #undef fprintf
@@ -40,6 +41,12 @@ static XLogRecPtr last_insert_record_end;
 static bool begininsert_called;
 static char *hdr_scratch;
 static XLogRecord native_header;
+static union {
+	uint64 align;
+	char bytes[SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong];
+} native_scratch;
+static XLogRecData hdr_rdt, native_data[3];
+static int max_rdatas = 3, max_registered_buffers;
 static bool insert_allowed;
 static TransactionId insert_xid;
 static unsigned native_calls, native_stage, native_fault, native_throw;
@@ -215,7 +222,13 @@ XLogInsert(RmgrId rmid, uint8 info)
 	native_header.xl_tot_len = SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + 320;
 	native_header.xl_rmid = rmid;
 	native_header.xl_info = info;
-	hdr_scratch = (char *)&native_header;
+	hdr_scratch = native_scratch.bytes;
+	memcpy(hdr_scratch, &native_header, SizeOfXLogRecord);
+	((uint8 *) hdr_scratch)[SizeOfXLogRecord] = XLR_BLOCK_ID_DATA_LONG;
+	memcpy(hdr_scratch + SizeOfXLogRecord + 1, &((uint32){320}), sizeof(uint32));
+	hdr_rdt = (XLogRecData){ .data = hdr_scratch, .len = sizeof(native_scratch.bytes),
+		.next = &native_data[0] };
+	native_data[0] = (XLogRecData){ .data = (char *)registered_payload, .len = 320 };
 	begininsert_called = false;
 	ProcLastRecPtr = 0x2000018;
 	XactLastRecEnd = last_insert_record_end = 0x2000413;
@@ -227,7 +240,21 @@ XLogInsert(RmgrId rmid, uint8 info)
 	case 5: ProcLastRecPtr = 0x1FFFFFF; break;
 	case 6: native_header.xl_tot_len++; break;
 	case 7: native_header.xl_info ^= 0x10; break;
+	case 8: registered_payload[319] ^= 1; break;
+	case 9: ((uint8 *) hdr_scratch)[SizeOfXLogRecord] = XLR_BLOCK_ID_DATA_SHORT; break;
+	case 10: hdr_scratch[SizeOfXLogRecord + 1] ^= 1; break;
+	case 11: hdr_rdt.next = NULL; break;
+	case 12: native_data[0].next = &native_data[0]; break;
+	case 13: region.thread_replay[2].stamp.handle.key.window_seq++; break;
 	}
+	native_header.xl_prev = 0x1FFFFF0;
+	INIT_CRC32C(native_header.xl_crc);
+	COMP_CRC32C(native_header.xl_crc, hdr_scratch + SizeOfXLogRecord,
+		SizeOfXLogRecordDataHeaderLong);
+	COMP_CRC32C(native_header.xl_crc, registered_payload, sizeof(registered_payload));
+	COMP_CRC32C(native_header.xl_crc, &native_header, offsetof(XLogRecord, xl_crc));
+	FIN_CRC32C(native_header.xl_crc);
+	memcpy(hdr_scratch, &native_header, SizeOfXLogRecord);
 	return XactLastRecEnd;
 }
 #include "test_cluster_recovery_stamp_insert.inc"
@@ -277,6 +304,11 @@ fresh(void)
 	begininsert_called = false;
 	hdr_scratch = NULL;
 	memset(&native_header, 0, sizeof(native_header));
+	memset(&native_scratch, 0, sizeof(native_scratch));
+	memset(&hdr_rdt, 0, sizeof(hdr_rdt));
+	memset(native_data, 0, sizeof(native_data));
+	max_rdatas = 3;
+	max_registered_buffers = 0;
 	insert_allowed = true;
 	insert_xid = InvalidTransactionId;
 	native_calls = native_stage = native_fault = native_throw = 0;
@@ -1527,10 +1559,253 @@ UT_TEST(d0_finish_native_error_never_retires_inserted_window)
 	}
 }
 
+
+#define D0_RAW_BYTES (SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + 320)
+
+/* Native insertion/flush/storage remain controlled leaves. The chain copy,
+ * stamp owner and CRC/SHA implementation are actual production functions. */
+static void
+snapshot_insert(ClusterRecoveryStampHandleV1 *h)
+{
+	fresh();
+	UT_ASSERT(begin_d0(h, TT_SLOT_COMMITTED));
+	CritSectionCount = 1;
+	UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_insert_v2(h), 0x2000413);
+}
+
+UT_TEST(d0_snapshot_exact_final_raw_survives_native_reuse)
+{
+	for (unsigned outcome = TT_SLOT_COMMITTED; outcome <= TT_SLOT_ABORTED; outcome++) {
+		ClusterRecoveryStampHandleV1 h;
+		uint8 raw[D0_RAW_BYTES], saved[D0_RAW_BYTES], digest[32], again[32];
+		XLogRecord copied;
+		XLogRecPtr start = 0, end;
+		unsigned before;
+		fresh();
+		UT_ASSERT(begin_d0(&h, outcome));
+		before = hash_calls;
+		CritSectionCount = 1;
+		end = cluster_recovery_stamp_ctrc_insert_record_v2(&h, raw, sizeof(raw), &start);
+		UT_ASSERT_EQ(end, 0x2000413);
+		UT_ASSERT_EQ(start, 0x2000018);
+		if (end == 0) { CritSectionCount = 0; continue; }
+		UT_ASSERT_EQ(native_calls, 3);
+		UT_ASSERT_EQ(flush_calls + target_calls, 0);
+		UT_ASSERT_EQ(hash_calls, before);
+		memcpy(&copied, raw, SizeOfXLogRecord);
+		UT_ASSERT_EQ(copied.xl_prev, native_header.xl_prev);
+		UT_ASSERT_EQ(copied.xl_crc, native_header.xl_crc);
+		UT_ASSERT(memcmp(raw, native_scratch.bytes, sizeof(native_scratch.bytes)) == 0);
+		UT_ASSERT(memcmp(raw + sizeof(native_scratch.bytes), h.payload, 320) == 0);
+		memcpy(saved, raw, sizeof(raw));
+		memcpy(target_payload, h.payload, 320);
+		UT_ASSERT(cluster_recovery_stamp_ctrc_finish_v2(&h, target_stamp));
+		UT_ASSERT_EQ(hash_calls, before);
+		CritSectionCount = 0;
+		UT_ASSERT(cluster_recovery_ctrc_record_hash_v2(h.owner.target.claim_sha256,
+			start, end, raw, sizeof(raw), digest));
+		/* Construction storage is no longer a durable reference after reuse. */
+		memset(&native_scratch, 0xCC, sizeof(native_scratch));
+		memset(registered_payload, 0xDD, sizeof(registered_payload));
+		last_insert_record_end = InvalidXLogRecPtr;
+		UT_ASSERT(memcmp(raw, saved, sizeof(raw)) == 0);
+		UT_ASSERT(cluster_recovery_ctrc_record_hash_v2(h.owner.target.claim_sha256,
+			start, end, raw, sizeof(raw), again));
+		UT_ASSERT(memcmp(digest, again, 32) == 0);
+		raw[sizeof(raw)-1] ^= 1;
+		UT_ASSERT(!cluster_recovery_ctrc_record_hash_v2(h.owner.target.claim_sha256,
+			start, end, raw, sizeof(raw), again));
+	}
+}
+
+UT_TEST(d0_snapshot_preinsert_refusal_is_atomic)
+{
+	for (unsigned mode = 0; mode < 9; mode++) {
+		ClusterRecoveryStampHandleV1 h, saved;
+		ClusterRecoveryStampSlotV1 slot;
+		uint8 raw[D0_RAW_BYTES], before[D0_RAW_BYTES];
+		void *out = raw;
+		XLogRecPtr start = 91, *start_out = &start;
+		Size len = sizeof(raw);
+		fresh();
+		UT_ASSERT(begin_d0(&h, TT_SLOT_COMMITTED));
+		CritSectionCount = 1;
+		memset(raw, 0xA5, sizeof(raw));
+		memcpy(before, raw, sizeof(raw));
+		switch (mode) {
+		case 0: out = NULL; break;
+		case 1: len--; break;
+		case 2: len++; break;
+		case 3: start_out = NULL; break;
+		case 4: start_out = (XLogRecPtr *)raw; break;
+		case 5: out = &h; break;
+		case 6: start_out = (XLogRecPtr *)&h; break;
+		case 7: CritSectionCount = 0; break;
+		case 8: out = &region.thread_replay[2].stamp; break;
+		}
+		saved = h;
+		stamp_snapshot(&region.thread_replay[2].stamp, &slot);
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_insert_record_v2(&h, out, len, start_out), 0);
+		UT_ASSERT_EQ(native_calls + flush_calls + target_calls, 0);
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(raw, before, sizeof(raw)) == 0);
+		UT_ASSERT(memcmp(&h, &saved, sizeof(h)) == 0);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, slot.phase);
+		UT_ASSERT(!region.thread_replay[2].stamp.failed);
+		CritSectionCount = 0;
+	}
+}
+
+UT_TEST(d0_snapshot_postinsert_refusal_is_sticky_and_atomic)
+{
+	for (unsigned fault = 1; fault <= 13; fault++) {
+		ClusterRecoveryStampHandleV1 h;
+		uint8 raw[D0_RAW_BYTES], before[D0_RAW_BYTES];
+		XLogRecPtr start = 91;
+		fresh();
+		UT_ASSERT(begin_d0(&h, TT_SLOT_ABORTED));
+		memset(raw, 0xA5, sizeof(raw));
+		memcpy(before, raw, sizeof(raw));
+		native_fault = fault;
+		CritSectionCount = 1;
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_insert_record_v2(&h, raw, sizeof(raw), &start), 0);
+		UT_ASSERT_EQ(native_calls, 3);
+		UT_ASSERT_EQ(flush_calls + target_calls, 0);
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(raw, before, sizeof(raw)) == 0);
+		UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_durable_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+		if (fault == 13)
+			UT_ASSERT(!region.thread_replay[2].stamp.failed);
+		else
+			UT_ASSERT(region.thread_replay[2].stamp.failed);
+		CritSectionCount = 0;
+	}
+}
+
+UT_TEST(native_record_copy_exact_split_zero_fragments_unaligned)
+{
+	ClusterRecoveryStampHandleV1 h;
+	uint8 output[D0_RAW_BYTES + 2], expected[D0_RAW_BYTES];
+	XLogRecPtr start = 0;
+	snapshot_insert(&h);
+	memcpy(expected, native_scratch.bytes, sizeof(native_scratch.bytes));
+	memcpy(expected + sizeof(native_scratch.bytes), registered_payload, 320);
+	native_data[0].len = 127;
+	native_data[0].next = &native_data[1];
+	native_data[1] = (XLogRecData){ .data = NULL, .len = 0, .next = &native_data[2] };
+	native_data[2] = (XLogRecData){ .data = (char *)registered_payload + 127, .len = 193 };
+	memset(output, 0xA5, sizeof(output));
+	UT_ASSERT(XLogCopyLastInsertRecord(XactLastRecEnd, output + 1, D0_RAW_BYTES, &start));
+	UT_ASSERT_EQ(start, ProcLastRecPtr);
+	UT_ASSERT(memcmp(output + 1, expected, sizeof(expected)) == 0);
+	UT_ASSERT_EQ(output[0], 0xA5);
+	UT_ASSERT_EQ(output[sizeof(output)-1], 0xA5);
+	CritSectionCount = 0;
+}
+
+UT_TEST(native_record_copy_rejects_incomplete_extra_and_cyclic_chains)
+{
+	for (unsigned mode = 0; mode < 11; mode++) {
+		ClusterRecoveryStampHandleV1 h;
+		uint8 output[D0_RAW_BYTES], before[D0_RAW_BYTES];
+		XLogRecPtr start = 91;
+		snapshot_insert(&h);
+		memset(output, 0xA5, sizeof(output));
+		memcpy(before, output, sizeof(output));
+		switch (mode) {
+		case 0: hdr_rdt.next = NULL; break;
+		case 1: native_data[0].len--; break;
+		case 2: native_data[0].len++; break;
+		case 3: native_data[0].data = NULL; break;
+		case 4: native_data[0].next = &native_data[0]; break;
+		case 5: hdr_rdt.len = SizeOfXLogRecord - 1; break;
+		case 6: hdr_rdt.data++; break;
+		case 7: max_rdatas = 0; break;
+		case 8: native_data[0].next = &native_data[1];
+			native_data[1].len = 1; native_data[1].data = (char *)output; break;
+		case 9: ((XLogRecord *)hdr_scratch)->xl_tot_len--; break;
+		case 10: native_data[0].next = &native_data[1];
+			native_data[1].next = &native_data[1]; break;
+		}
+		UT_ASSERT(!XLogCopyLastInsertRecord(XactLastRecEnd, output, sizeof(output), &start));
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(output, before, sizeof(output)) == 0);
+		CritSectionCount = 0;
+	}
+}
+
+UT_TEST(native_record_copy_refuses_stale_construction_and_lengths)
+{
+	for (unsigned mode = 0; mode < 12; mode++) {
+		ClusterRecoveryStampHandleV1 h;
+		uint8 output[D0_RAW_BYTES], before[D0_RAW_BYTES];
+		XLogRecPtr start = 91, end;
+		Size length = sizeof(output);
+		snapshot_insert(&h);
+		end = XactLastRecEnd;
+		memset(output, 0xA5, sizeof(output));
+		memcpy(before, output, sizeof(output));
+		switch (mode) {
+		case 0: begininsert_called = true; break;
+		case 1: last_insert_record_end = 0; break;
+		case 2: end++; break;
+		case 3: XactLastRecEnd++; break;
+		case 4: ProcLastRecPtr = 0; break;
+		case 5: ProcLastRecPtr = end; break;
+		case 6: cluster_shared_config = false; break;
+		case 7: hdr_scratch = NULL; break;
+		case 8: length--; break;
+		case 9: length++; break;
+		case 10: length = SizeOfXLogRecord - 1; break;
+		case 11: length = XLogRecordMaxSize + (Size)1; break;
+		}
+		UT_ASSERT(!XLogCopyLastInsertRecord(end, output, length, &start));
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(output, before, sizeof(output)) == 0);
+		CritSectionCount = 0;
+	}
+}
+
+UT_TEST(native_record_copy_refuses_input_and_output_aliases)
+{
+	for (unsigned mode = 0; mode < 8; mode++) {
+		ClusterRecoveryStampHandleV1 h;
+		uint8 output[D0_RAW_BYTES], before[D0_RAW_BYTES], source[320];
+		XLogRecData nodes[4];
+		XLogRecPtr start = 91, *start_out = &start;
+		void *raw = output;
+		snapshot_insert(&h);
+		memset(output, 0xA5, sizeof(output));
+		memcpy(before, output, sizeof(output));
+		memcpy(source, registered_payload, sizeof(source));
+		nodes[0] = hdr_rdt;
+		memcpy(nodes + 1, native_data, sizeof(native_data));
+		switch (mode) {
+		case 0: raw = hdr_scratch; break;
+		case 1: raw = registered_payload; break;
+		case 2: raw = &native_data[0]; break;
+		case 3: start_out = (XLogRecPtr *)output; break;
+		case 4: start_out = (XLogRecPtr *)registered_payload; break;
+		case 5: start_out = (XLogRecPtr *)&native_data[0]; break;
+		case 6: raw = NULL; break;
+		case 7: start_out = NULL; break;
+		}
+		UT_ASSERT(!XLogCopyLastInsertRecord(XactLastRecEnd, raw, sizeof(output), start_out));
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(output, before, sizeof(output)) == 0);
+		UT_ASSERT(memcmp(source, registered_payload, sizeof(source)) == 0);
+		UT_ASSERT(memcmp(&nodes[0], &hdr_rdt, sizeof(hdr_rdt)) == 0);
+		UT_ASSERT(memcmp(nodes + 1, native_data, sizeof(native_data)) == 0);
+		CritSectionCount = 0;
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(31);
+	UT_PLAN(38);
 	UT_RUN(exact_lifecycle_and_owned_payload);
 	UT_RUN(preinsert_cancel_capture_and_new_sequence);
 	UT_RUN(inserting_failure_exit_and_replay_reset_cannot_retire);
@@ -1562,6 +1837,13 @@ main(void)
 	UT_RUN(d0_finish_refusal_retains_exact_inserted_duty);
 	UT_RUN(d0_finish_rechecks_writer_coverage_and_same_window_after_target);
 	UT_RUN(d0_finish_native_error_never_retires_inserted_window);
+	UT_RUN(d0_snapshot_exact_final_raw_survives_native_reuse);
+	UT_RUN(d0_snapshot_preinsert_refusal_is_atomic);
+	UT_RUN(d0_snapshot_postinsert_refusal_is_sticky_and_atomic);
+	UT_RUN(native_record_copy_exact_split_zero_fragments_unaligned);
+	UT_RUN(native_record_copy_rejects_incomplete_extra_and_cyclic_chains);
+	UT_RUN(native_record_copy_refuses_stale_construction_and_lengths);
+	UT_RUN(native_record_copy_refuses_input_and_output_aliases);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

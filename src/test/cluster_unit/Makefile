@@ -9920,9 +9920,10 @@ test_cluster_recovery_tt_io: test_cluster_recovery_tt_io.c unit_test.h \
 
 # PGRAC: real shared stamp owner; immutable claim shape code is linked unchanged.
 test_cluster_recovery_stamp_insert.inc: $(top_srcdir)/src/backend/access/transam/xloginsert.c Makefile
-	awk '/^XLogGetLastInsertRecord\(/ { print "bool"; emit=1; functions++ } \
+	awk '/^XLogLastInsertRangesOverlap\(/ { print "static bool"; emit=1; functions++ } \
+         /^XLog(Get|Copy)LastInsertRecord\(/ { print "bool"; emit=1; functions++ } \
          emit { print } /^}/ { emit=0 } \
-         END { if (functions != 1 || emit) exit 1 }' $< > $@.tmp
+         END { if (functions != 3 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_recovery_stamp: test_cluster_recovery_stamp.c unit_test.h \
@@ -9930,6 +9931,8 @@ test_cluster_recovery_stamp: test_cluster_recovery_stamp.c unit_test.h \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
         $(top_srcdir)/src/include/access/xact.h \
         $(top_srcdir)/src/include/access/xlog.h \
+        $(top_srcdir)/src/include/access/xlog_internal.h \
+        $(top_srcdir)/src/include/access/xloginsert.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
         $(top_srcdir)/src/include/cluster/cluster_undo_smgr.h \
@@ -9957,6 +9960,8 @@ test_cluster_checkpoint_stamp_boundary.inc: $(top_srcdir)/src/backend/access/tra
 	mv $@.tmp $@
 
 test_cluster_checkpoint_stamp: test_cluster_checkpoint_stamp.c test_cluster_recovery_stamp.c unit_test.h \
+        $(top_srcdir)/src/include/access/xlog_internal.h \
+        $(top_srcdir)/src/include/access/xloginsert.h \
         test_cluster_checkpoint_stamp.inc test_cluster_checkpoint_stamp_boundary.inc \
         test_cluster_recovery_stamp_insert.inc \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \

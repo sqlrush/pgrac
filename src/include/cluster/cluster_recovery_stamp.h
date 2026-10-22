@@ -106,6 +106,15 @@ extern bool cluster_recovery_stamp_ctrc_inserted_v2(const ClusterRecoveryStampHa
  * full raw-record identity, nor any live production caller. */
 extern XLogRecPtr
 cluster_recovery_stamp_ctrc_insert_v2(const ClusterRecoveryStampHandleV1 *handle);
+/* Dormant combined emitter and immediate complete native-record snapshot.
+ * Caller prepares exactly 357B of private scratch before the original critical
+ * section, retaining the immutable handle. One native insertion, bounded copy,
+ * exact payload/positions/window recheck; no crypto, flush or target IO here.
+ * Refusal leaves outputs unchanged, but matched postinsert duty is sticky.
+ * Use record_hash_v2 only after the original finish and critical exit. Neither
+ * this copy nor its later hash supplies source/graph/owner qualification. */
+extern XLogRecPtr cluster_recovery_stamp_ctrc_insert_record_v2(
+	const ClusterRecoveryStampHandleV1 *handle, void *raw, Size raw_length, XLogRecPtr *start);
 /* Dormant original-startup D0 flush step, in the executor's critical section.
  * Flushes the exact INSERTED window's actual end with its original writer,
  * then independently checks native startup flush coverage and revalidates the

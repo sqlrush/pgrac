@@ -873,6 +873,67 @@ cluster_recovery_stamp_ctrc_insert_v2(const ClusterRecoveryStampHandleV1 *handle
 	}
 	return end;
 }
+
+static bool
+stamp_ranges_overlap(const void *a, Size a_length, const void *b, Size b_length)
+{
+	uintptr_t av = (uintptr_t) a, bv = (uintptr_t) b;
+
+	return a_length != 0 && b_length != 0
+		&& (av >= bv ? av - bv < b_length : bv - av < a_length);
+}
+
+XLogRecPtr
+cluster_recovery_stamp_ctrc_insert_record_v2(const ClusterRecoveryStampHandleV1 *handle,
+											  void *raw, Size raw_length, XLogRecPtr *start)
+{
+	uint8 copy[SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + CLUSTER_RECOVERY_CTRC_BYTES];
+	ClusterThreadReplaySlot *replay;
+	ClusterRecoveryStampSlotV1 snapshot;
+	XLogRecPtr actual_start, end;
+	uint32 payload_length;
+
+	if (CritSectionCount == 0 || handle == NULL || raw == NULL || start == NULL
+		|| handle->kind != CLUSTER_RECOVERY_STAMP_D0
+		|| handle->payload_length != CLUSTER_RECOVERY_CTRC_BYTES || raw_length != sizeof(copy)
+		|| (replay = cluster_thread_recovery_replay_slot(handle->key.target_thread)) == NULL
+		|| stamp_ranges_overlap(raw, raw_length, start, sizeof(*start))
+		|| stamp_ranges_overlap(raw, raw_length, handle, sizeof(*handle))
+		|| stamp_ranges_overlap(start, sizeof(*start), handle, sizeof(*handle))
+		|| stamp_ranges_overlap(raw, raw_length, &replay->stamp, sizeof(replay->stamp))
+		|| stamp_ranges_overlap(start, sizeof(*start), &replay->stamp, sizeof(replay->stamp)))
+		return InvalidXLogRecPtr;
+
+	/* Preserve the original single insertion and all post-insert duty. A
+	 * fixed private temporary keeps caller outputs unchanged on any refusal.
+	 * All fragment storage must remain immutable until this copy returns. */
+	end = cluster_recovery_stamp_ctrc_insert_v2(handle);
+	if (end == InvalidXLogRecPtr)
+		return InvalidXLogRecPtr;
+	if (!XLogCopyLastInsertRecord(end, copy, sizeof(copy), &actual_start))
+		goto failed;
+	memcpy(&payload_length, copy + SizeOfXLogRecord + 1, sizeof(payload_length));
+	if (copy[SizeOfXLogRecord] != XLR_BLOCK_ID_DATA_LONG
+		|| payload_length != CLUSTER_RECOVERY_CTRC_BYTES
+		|| memcmp(copy + SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong,
+				  handle->payload, CLUSTER_RECOVERY_CTRC_BYTES) != 0)
+		goto failed;
+	stamp_snapshot(&replay->stamp, &snapshot);
+	if (!stamp_handle_matches(&snapshot, handle) || snapshot.failed
+		|| snapshot.phase != CLUSTER_RECOVERY_STAMP_INSERTED
+		|| snapshot.record_start != actual_start || snapshot.record_end != end)
+		goto failed;
+
+	/* The existing finish still owes WAL flush, target sync/readback and
+	 * exact retirement. CRC/SHA may only run after its original critical exit. */
+	memcpy(raw, copy, sizeof(copy));
+	memcpy(start, &actual_start, sizeof(actual_start));
+	return end;
+failed:
+	(void) cluster_recovery_stamp_fail_v1(handle);
+	return InvalidXLogRecPtr;
+}
+
 bool
 cluster_recovery_stamp_ctrc_flush_v2(const ClusterRecoveryStampHandleV1 *handle)
 {
