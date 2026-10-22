@@ -118,11 +118,30 @@ def _assert_fixture(samples: Iterable[WaitSample]) -> None:
     assert {sample.wait_event for sample in samples} == set(WAIT_EVENT_NAMES)
 
 
+def wait_candidate_marker_contract(inventory):
+    """Return the deterministic source-marker coverage for each wait candidate."""
+    required = (
+        "gcs_retransmit_backoff",
+        "pcm_install_wait",
+        "tx_enqueue_tick",
+    )
+    contract = {}
+    for name in required:
+        entry = inventory.get(name, {})
+        line_numbers = entry.get("line_numbers", {})
+        contract[name] = bool(entry.get("path")) and bool(line_numbers) and all(
+            bool(lines) for lines in line_numbers.values()
+        )
+    return contract
+
+
 def main() -> int:
     root = Path(__file__).resolve().parents[3]
     inventory = source_counter_inventory(root)
     assert all(inventory.values()), inventory
     wait_candidates = source_wait_candidate_inventory(root)
+    marker_contract = wait_candidate_marker_contract(wait_candidates)
+    assert all(marker_contract.values()), marker_contract
     before, after, samples = run_alternating_updates()
     _assert_fixture(samples)
     delta = counter_delta(before, after)
@@ -141,6 +160,9 @@ def main() -> int:
     print("offline two-node alternating-update fixture: 20 rounds")
     print("counter accessors: " + ", ".join(sorted(inventory)))
     print("wait candidates: " + ", ".join(sorted(wait_candidates)))
+    print("candidate marker contract: " + ", ".join(
+        f"{name}={covered}" for name, covered in sorted(marker_contract.items())
+    ))
     for name in sorted(wait_candidates):
         candidate = wait_candidates[name]
         line_numbers = candidate["line_numbers"]

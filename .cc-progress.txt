@@ -12,3 +12,5 @@
 2026-10-23 06:07 CST | E | added FixtureCounterReader and injected counter-delta assertions to cluster_wait_tail_diagnostic.py; next run fixture and focused retransmit/PCM/TX tests.
 2026-10-23 06:12 CST | E | extended cluster_wait_tail_diagnostic.py with source_wait_candidate_inventory and main output for TX 1000ms, GCS backoff, PCM timed wait markers; next run fixture and focused tests.
 2026-10-23 06:18 CST | E | added exact source line-number inventory/output for TX tick, GCS backoff, and PCM timed-wait markers in cluster_wait_tail_diagnostic.py; next run fixture, syntax, and diff checks.
+2026-10-23 06:30 CST | E | added deterministic marker-contract assertion/output for TX, GCS, and PCM wait candidates in cluster_wait_tail_diagnostic.py; next run fixture, syntax, and diff checks.
+2026-10-23 06:32 CST | E | corrected marker-contract path key to match source wait candidate entries; next run fixture, syntax, and diff checks.
