@@ -1,8 +1,8 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_cr_srf.c
- *	  pgrac TEST-ONLY SQL entry points to drive own-instance CR block
- *	  construction deterministically from cluster_tap / cluster_unit.
+ *	  pgrac TEST-ONLY SQL entry points to drive CR block construction
+ *	  deterministically from cluster_tap / cluster_unit.
  *
  *	  cluster_cr_test_construct(rel regclass, blockno int4, itl_idx int4,
  *	                            read_scn int8) -> bool            (spec-3.9 D10)
@@ -27,7 +27,15 @@
  *	  post-read_scn versions do not appear), not merely that construction did
  *	  not error (spec-3.10 §v0.6 §L3).  Superuser-only.
  *
- *	  Both bypass ordinary scan setup so the CR read path is exercisable
+ *	  cluster_cr_test_target_image(rel regclass, blockno int4, read_scn int8)
+ *	                            -> SETOF record
+ *
+ *	  Returns the same raw row shape through the existing target FULL-block
+ *	  API. Only FULL/NONE is consumable; refusal or deferral raises an error
+ *	  without a local buffer read, own-instance fallback or retry. Accepts
+ *	  ordinary heap tables and heap materialized views. Superuser-only.
+ *
+ *	  These bypass ordinary scan setup so the CR read path is exercisable
  *	  deterministically from TAP and cluster_unit fixtures.  Mirrors spec-3.8's
  *	  cluster_undo_test_force_segment_end.
  *
@@ -57,14 +65,17 @@
 
 PG_FUNCTION_INFO_V1(cluster_cr_test_construct);
 PG_FUNCTION_INFO_V1(cluster_cr_test_image);
+PG_FUNCTION_INFO_V1(cluster_cr_test_target_image);
 
 #ifdef USE_PGRAC_CLUSTER
 
 #include "access/htup_details.h"
 #include "access/relation.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/itemptr.h"
@@ -72,6 +83,7 @@ PG_FUNCTION_INFO_V1(cluster_cr_test_image);
 #include "utils/relcache.h"
 
 #include "cluster/cluster_cr.h"
+#include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_scn.h"
 
 Datum
@@ -145,8 +157,8 @@ cluster_cr_test_construct(PG_FUNCTION_ARGS)
  *	pre-read_scn-deleted tuples, whose committed xmax this raw view would not
  *	re-hide — the MVCC gate, not this diagnostic SRF, enforces full visibility).
  */
-Datum
-cluster_cr_test_image(PG_FUNCTION_ARGS)
+static Datum
+cr_test_image_rows(FunctionCallInfo fcinfo, bool target_full)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *)fcinfo->resultinfo;
 	Oid relid;
@@ -157,7 +169,7 @@ cluster_cr_test_image(PG_FUNCTION_ARGS)
 	TupleDesc rel_desc;
 	TupleDesc out_desc;
 	int nrelatts;
-	Buffer buf;
+	Buffer buf = InvalidBuffer;
 	Page page;
 	OffsetNumber off;
 	OffsetNumber maxoff;
@@ -167,10 +179,11 @@ cluster_cr_test_image(PG_FUNCTION_ARGS)
 	bool *out_nulls;
 	Datum *rel_values;
 	bool *rel_nulls;
+	const char *entry_name = target_full ? "cluster_cr_test_target_image" : "cluster_cr_test_image";
 
 	if (!superuser())
 		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-						errmsg("cluster_cr_test_image is superuser-only")));
+						errmsg("%s is superuser-only", entry_name)));
 
 	relid = PG_GETARG_OID(0);
 	blockno = PG_GETARG_INT32(1);
@@ -186,18 +199,28 @@ cluster_cr_test_image(PG_FUNCTION_ARGS)
 	rel_desc = RelationGetDescr(rel);
 	nrelatts = rel_desc->natts;
 
+	/* The target image is a heap page; do not deform another AM's tuples. */
+	if (target_full
+		&& ((rel->rd_rel->relkind != RELKIND_RELATION && rel->rd_rel->relkind != RELKIND_MATVIEW)
+			|| rel->rd_rel->relam != HEAP_TABLE_AM_OID)) {
+		relation_close(rel, AccessShareLock);
+		ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+						errmsg("%s requires a heap table or materialized view", entry_name),
+						errhint("Use an ordinary heap table or heap materialized view.")));
+	}
+
 	if (out_desc->natts != nrelatts + 1) {
 		relation_close(rel, AccessShareLock);
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						errmsg("cluster_cr_test_image column definition must be "
+						errmsg("%s column definition must be "
 							   "cr_off plus the relation's %d column(s)",
-							   nrelatts),
+							   entry_name, nrelatts),
 						errhint("e.g. AS r(cr_off int2, <relation columns...>)")));
 	}
 	if (TupleDescAttr(out_desc, 0)->atttypid != INT2OID) {
 		relation_close(rel, AccessShareLock);
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						errmsg("cluster_cr_test_image first output column must be int2"),
+						errmsg("%s first output column must be int2", entry_name),
 						errhint("e.g. AS r(cr_off int2, <relation columns...>)")));
 	}
 	for (i = 0; i < nrelatts; i++) {
@@ -212,8 +235,7 @@ cluster_cr_test_image(PG_FUNCTION_ARGS)
 			ereport(
 				ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("cluster_cr_test_image output column %d must match relation column type",
-						i + 2),
+				 errmsg("%s output column %d must match relation column type", entry_name, i + 2),
 				 errhint("declare column %s with type OID %u and typmod %d",
 						 NameStr(rel_att->attname), rel_att->atttypid, rel_att->atttypmod)));
 		}
@@ -221,29 +243,50 @@ cluster_cr_test_image(PG_FUNCTION_ARGS)
 
 	image = (char *)palloc(BLCKSZ);
 
-	buf = ReadBuffer(rel, (BlockNumber)blockno);
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	if (!target_full) {
+		buf = ReadBuffer(rel, (BlockNumber)blockno);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+	}
 
 	PG_TRY();
 	{
-		const char *cr_page = cluster_cr_construct_block(buf, read_scn);
+		if (target_full) {
+			BufferTag tag;
+			ClusterCrBuildResult result;
+			ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
 
-		/* Copy out under the content lock; cr_page is the backend-local scratch
-		 * (valid only until the next construct), so snapshot it now. */
-		memcpy(image, cr_page, BLCKSZ);
+			InitBufferTag(&tag, &rel->rd_locator, MAIN_FORKNUM, (BlockNumber)blockno);
+			result = cluster_gcs_block_cr_fetch_and_wait(tag, read_scn, image, &reason);
+			if (result != CLUSTER_CR_BUILD_FULL || reason != CLUSTER_CR_BUILD_NONE)
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						 errmsg("target CR test did not return a complete page"),
+						 errdetail("result=%d reason=%d; only FULL/NONE is consumable",
+								   (int)result, (int)reason)));
+		} else {
+			const char *cr_page = cluster_cr_construct_block(buf, read_scn);
+
+			/* Copy out under the content lock; cr_page is the backend-local scratch
+			 * (valid only until the next construct), so snapshot it now. */
+			memcpy(image, cr_page, BLCKSZ);
+		}
 	}
 	PG_CATCH();
 	{
-		HOLD_INTERRUPTS();
-		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-		ReleaseBuffer(buf);
+		if (BufferIsValid(buf)) {
+			HOLD_INTERRUPTS();
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+			ReleaseBuffer(buf);
+		}
 		relation_close(rel, AccessShareLock);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
-	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-	ReleaseBuffer(buf);
+	if (BufferIsValid(buf)) {
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		ReleaseBuffer(buf);
+	}
 
 	out_values = (Datum *)palloc(sizeof(Datum) * out_desc->natts);
 	out_nulls = (bool *)palloc(sizeof(bool) * out_desc->natts);
@@ -281,6 +324,18 @@ cluster_cr_test_image(PG_FUNCTION_ARGS)
 	return (Datum)0;
 }
 
+Datum
+cluster_cr_test_image(PG_FUNCTION_ARGS)
+{
+	return cr_test_image_rows(fcinfo, false);
+}
+
+Datum
+cluster_cr_test_target_image(PG_FUNCTION_ARGS)
+{
+	return cr_test_image_rows(fcinfo, true);
+}
+
 #else /* !USE_PGRAC_CLUSTER */
 
 Datum
@@ -296,6 +351,15 @@ cluster_cr_test_image(PG_FUNCTION_ARGS pg_attribute_unused())
 {
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cluster_cr_test_image requires --enable-cluster")));
+	PG_RETURN_NULL();
+}
+
+Datum
+cluster_cr_test_target_image(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_cr_test_target_image requires --enable-cluster"),
+					errhint("Rebuild with --enable-cluster to use this diagnostic entry.")));
 	PG_RETURN_NULL();
 }
 

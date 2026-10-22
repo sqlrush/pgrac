@@ -12724,6 +12724,15 @@
   proargnames => '{rel,blockno,read_scn}',
   prosrc => 'cluster_cr_test_image' },
 
+{ oid => '8980',
+  descr => 'TEST-ONLY: target FULL CR block image rows as-of read_scn',
+  proname => 'cluster_cr_test_target_image', prorows => '100', proretset => 't',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'record',
+  proargtypes => 'regclass int4 int8',
+  proargnames => '{rel,blockno,read_scn}',
+  prosrc => 'cluster_cr_test_target_image' },
+
 # spec-4.10 D3b: reconstruct one block by single-block redo-apply over a
 # WAL LSN range, for the byte-for-byte differential vs PG real redo.
 # Returns the reconstructed page as bytea, or NULL when reconstruction

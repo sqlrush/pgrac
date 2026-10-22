@@ -213,7 +213,7 @@ FROM pg_cluster_state WHERE category = 'cr' AND key = 'cr_tuple_verdict_count'};
 SELECT COALESCE(jsonb_agg(jsonb_build_object('id', id, 'v', v,
  'block', b, 'cr_off', cr_off) ORDER BY id, b, cr_off), '[]'::jsonb)
 FROM generate_series(0, $last) AS blocks(b)
-CROSS JOIN LATERAL cluster_cr_test_image('$table'::regclass, b, $scn)
+CROSS JOIN LATERAL cluster_cr_test_target_image('$table'::regclass, b, $scn)
  AS img(cr_off int2, id int, v text)});
 	$lane->{locator_after} = $after;
 	$lane->{full_blocks} = $blocks;

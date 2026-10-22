@@ -66,8 +66,9 @@ sub seed_rows { return [map { +{id => $_, v => "seed_$_"} } 1 .. 64]; }
 		{
 			return $json->encode({cr_tuple_verdict_count => 19});
 		}
-		if ($sql =~ /cluster_cr_test_image/)
+		if ($sql =~ /cluster_cr_test_(?:target_)?image/)
 		{
+			die "target FULL refused\n" if $self->{fail_full};
 			push @{$rows}, {id => 64, v => 'seed_64'} if $self->{duplicate_full};
 			return $json->encode([map { +{%$_, block => 0, cr_off => $_->{id}} } @{$rows}]);
 		}
@@ -125,8 +126,9 @@ subtest 'real SQL operations retain exact snapshot and all FULL blocks' => sub {
 	is($$between, 1, 'caller barrier hook runs once between R and H');
 	for my $node (1, 3)
 	{
-		my @full = grep { /cluster_cr_test_image/ } @{$sessions->[$node]{calls}};
+		my @full = grep { /cluster_cr_test_(?:target_)?image/ } @{$sessions->[$node]{calls}};
 		is(scalar @full, 1, 'one FULL comparison query, no retry');
+		like($full[0], qr/cluster_cr_test_target_image\(/, 'FULL uses the target entry');
 		like($full[0], qr/generate_series\(0, 6\)/, 'all seven relation blocks included');
 		like($full[0], qr/\b4097\b/, 'FULL uses exported snapshot SCN');
 		ok(grep(/\AROLLBACK/, @{$sessions->[$node]{calls}}), 'held snapshot released');
@@ -140,6 +142,19 @@ subtest 'real SQL operations retain exact snapshot and all FULL blocks' => sub {
 		0, 'every query and raw result retains a client-local sequence');
 	my $again = eval { $driver->run(); 1 };
 	ok(!$again, 'same driver cannot start a second attempt');
+};
+
+subtest 'target FULL refusal stops comparison without a source fallback' => sub {
+	my ($driver, $sessions, $journal) = fixture();
+	$sessions->[1]{fail_full} = 1;
+	ok(!eval { $driver->run(); 1 }, 'refusal fails the attempt');
+	like($@, qr/target FULL refused/, 'original target refusal preserved');
+	is(scalar(grep(/cluster_cr_test_target_image\(/, @{$sessions->[1]{calls}})),
+		1, 'target query is sent once');
+	is(scalar(grep(/cluster_cr_test_image\(/, @{$sessions->[1]{calls}})),
+		0, 'own-instance entry is never a fallback');
+	ok(grep(/\AROLLBACK/, @{$sessions->[1]{calls}}), 'held reader is released');
+	ok(grep($_->{kind} eq 'driver_error', @{$journal}), 'refusal retained in journal');
 };
 
 for my $case (qw(bad_scn duplicate_scn local_snapshot wrong_pid))

@@ -350,9 +350,18 @@ Node 0 mutates `r_img`, read by node 1; node 2 mutates the separate `h_hot`,
 read by node 3. Both readers hold read-only repeatable-read transactions.
 The module retains each exported snapshot's actual file contents, validates
 its cluster SCN/epoch and backend/database identity, and uses that SCN for
-`cluster_cr_test_image()`. It compares all visible `(id,v)` rows, retaining
+`cluster_cr_test_target_image()`. This superuser-only diagnostic accepts only
+the target API's FULL/NONE result; refusal, deferral and exceptions fail the
+comparison without a local current-page read, own-instance fallback or retry.
+Its catalog entry requires a fresh homogeneous initdb; it is unavailable in
+older installed catalogs. The existing `cluster_cr_test_image()` continues to
+exercise own-instance construction for its original tests.
+
+The module compares all visible `(id,v)` rows, retaining
 duplicates, across the baseline, ordinary read and FULL reconstruction over
-all relation blocks. H operations include nonindexed-column updates, indexed
+all relation blocks. The diagnostic returns raw NORMAL tuples, including their
+physical offsets; it is not a complete MVCC visibility scan or proof of remote
+transport, authority or protocol completion. H operations include nonindexed-column updates, indexed
 key changes, deletes and VACUUM. Their actual HOT/prune/index-delete decisions
 and remote request/serve paths require independent producer LOG evidence.
 

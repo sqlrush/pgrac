@@ -219,6 +219,7 @@ TESTS += test_cluster_pcm_aux_consumer test_cluster_pcm_aux_reobserve test_clust
 TESTS += test_cluster_pcm_aux_mutation test_cluster_heap_extend_current
 TESTS += test_cluster_cr_inline_stop
 TESTS += test_cluster_cr_refusal
+TESTS += test_cluster_cr_image_srf
 TESTS += test_cluster_catalog_trace
 TESTS += test_cluster_sync_error
 
@@ -435,6 +436,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_buffer_cr test_cluster_buffer_mapping 
 SIMPLE_TESTS := $(filter-out test_cluster_pi_contribution_stream,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_prepare_diagnostic,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_cr_refusal,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_cr_image_srf,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_horizon,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_tt_terminal_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter,$(SIMPLE_TESTS))
@@ -6200,6 +6202,15 @@ test_cluster_cr_refusal.inc: $(top_srcdir)/src/backend/cluster/cluster_cr.c extr
 	mv $@.tmp $@
 
 test_cluster_cr_refusal: test_cluster_cr_refusal.c test_cluster_cr_refusal.inc unit_test.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_cr_image_srf.inc: $(top_srcdir)/src/backend/cluster/cluster_cr_srf.c extract_cr_image_srf_fixture.py
+	python3 $(srcdir)/extract_cr_image_srf_fixture.py $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cr_image_srf: test_cluster_cr_image_srf.c test_cluster_cr_image_srf.inc unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
