@@ -43,6 +43,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_replacement_episode.h"
 #include "utils/hsearch.h"
@@ -407,6 +408,25 @@ WaitLatch(Latch *latch, int events, long timeout, uint32 event)
 		pg_atomic_write_u32(&QvotecShmem->quorum_state, CLUSTER_QVOTEC_QUORUM_LOST);
 	return WL_TIMEOUT;
 }
+bool
+cluster_recovery_checkpoint_current_v1(const struct ClusterRecoveryCheckpointScopeV1 *scope,
+									 ClusterWalWriterToken *writer)
+{
+	(void)scope;
+	memset(writer, 0, sizeof(*writer));
+	return false;
+}
+ClusterControlRootResult cluster_control_root_v3_read_recovery_checkpoint_locked(
+	const struct ClusterRecoveryCheckpointScopeV1 *scope, ControlFileData *out);
+ClusterControlRootResult
+cluster_control_root_v3_read_recovery_checkpoint_locked(
+	const struct ClusterRecoveryCheckpointScopeV1 *scope, ControlFileData *out)
+{
+	(void)scope;
+	memset(out, 0, sizeof(*out));
+	UT_ASSERT(false);
+	return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+}
 #include "test_cluster_serving_root.inc"
 
 static void
@@ -687,7 +707,7 @@ UT_TEST(checkpoint_prepare_waits_for_real_formation_lock_and_refuses_real_loss)
 			phase4_capture_fatal = true;
 			if (setjmp(phase4_fatal_jump) == 0)
 				ClusterCheckpointV3Prepare(shutdown ? CHECKPOINT_IS_SHUTDOWN : CHECKPOINT_FORCE,
-										   &selected);
+										   &selected, NULL);
 			else
 				raised = true;
 			phase4_capture_fatal = false;

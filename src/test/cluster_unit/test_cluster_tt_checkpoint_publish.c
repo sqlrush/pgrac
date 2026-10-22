@@ -17,6 +17,7 @@ int checkpoint_native_fixture_main(int argc, char **argv);
 #include "access/xlog_internal.h"
 #include "access/xloginsert.h"
 #include "catalog/pg_control.h"
+#include "cluster/cluster_recovery_plan.h"
 #include "port/pg_crc32c.h"
 
 typedef enum PublishFault { PUBLISH_NO_FAULT, PUBLISH_WAL_FLUSH, PUBLISH_ROOT } PublishFault;
@@ -135,8 +136,10 @@ publish_flush(XLogRecPtr end)
 }
 
 static void
-ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
+ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end,
+						   const struct ClusterRecoveryCheckpointScopeV1 *recovery_scope)
 {
+	UT_ASSERT(recovery_scope == NULL);
 	publish_calls++;
 	publish_order_ok
 		&= !publish_lock_held && CritSectionCount == 0 && publish_tt_durable()
@@ -196,6 +199,7 @@ publish_checkpoint(XLogRecPtr insert, bool shutdown)
 	int oldXLogAllowed = 1;
 	XLogRecPtr recptr;
 	ControlFileData *checkpoint_control = ControlFile, v3_checkpoint = { 0 };
+	struct ClusterRecoveryCheckpointScopeV1 *recovery_checkpoint_scope = NULL;
 	CheckPoint checkPoint = { 0 };
 
 	checkPoint.redo = publish_select_redo(insert);

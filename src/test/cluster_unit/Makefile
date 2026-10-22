@@ -992,9 +992,10 @@ test_cluster_checkpoint_error: test_cluster_checkpoint_error.c test_cluster_chec
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_checkpoint_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^Cluster(CheckpointV3|StartupCheckpoint)(Prepare|Publish)\(/ { print "static void"; emit=1; count++ } \
+	     /^ClusterCheckpointRecoveryBegin\(/ { print "static void"; emit=1; count++ } \
 	     /^ClusterCheckpointYieldForShutdown\(/ { print "static void"; emit=1 } \
 	     /^ClusterStartupFileSync\(/ { print "static bool"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 5) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (count != 6) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_startup_writer_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
@@ -1085,7 +1086,7 @@ test_cluster_cf_observation.inc: $(top_srcdir)/src/backend/cluster/cluster_cf_en
 	     emit { print } /^}/ { emit=0 } END { if (count != 4 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_checkpoint_native: test_cluster_checkpoint_native.c test_cluster_checkpoint_native.inc test_cluster_cf_observation.inc test_cluster_startup_writer_native.inc test_cluster_startup_early_native.inc test_cluster_startup_control_native.inc test_cluster_startup_directory_native.inc test_cluster_startup_recovery_control.inc test_cluster_startup_insert_native.inc test_cluster_startup_lsn_native.inc test_cluster_startup_reserve_native.inc test_cluster_checkpoint_candidate.inc test_cluster_checkpoint_shutdown_begin.inc unit_test.h
+test_cluster_checkpoint_native: test_cluster_checkpoint_native.c test_cluster_checkpoint_native.inc test_cluster_cf_observation.inc test_cluster_startup_writer_native.inc test_cluster_startup_early_native.inc test_cluster_startup_control_native.inc test_cluster_startup_directory_native.inc test_cluster_startup_recovery_control.inc test_cluster_startup_insert_native.inc test_cluster_startup_lsn_native.inc test_cluster_startup_reserve_native.inc test_cluster_checkpoint_candidate.inc test_cluster_checkpoint_shutdown_begin.inc unit_test.h $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h $(top_srcdir)/src/include/cluster/cluster_wal_writer.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 # PGRAC: the same cleanup bodies used by return and ERROR unwind, without
@@ -4658,7 +4659,7 @@ test_cluster_serving_send.inc: $(top_srcdir)/src/backend/cluster/cluster_ic_rout
 	     emit { print } /^}/ { emit=0 } END { if (n != 5 || limit != 1 || scope != 1 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_serving_sample: test_cluster_serving_sample.c test_cluster_serving_sample.inc \
+test_cluster_serving_sample: test_cluster_serving_sample.c test_cluster_serving_sample.inc $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h $(top_srcdir)/src/include/cluster/cluster_wal_writer.h \
 		test_cluster_serving_send.inc test_cluster_serving_root.inc \
 		test_cluster_startup_phase.c unit_test.h test_cluster_config_s1_native.inc \
 		test_cluster_config_ges_native.inc test_cluster_startup_walr_native.inc \
@@ -7514,11 +7515,11 @@ test_cluster_tt_checkpoint_guts.inc: $(top_srcdir)/src/backend/access/transam/xl
 test_cluster_tt_checkpoint_publish.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^CreateCheckPoint\(/ { owner=1 } \
 	     owner && /vxids = GetVirtualXIDsDelayingChkpt\(&nvxids, DELAY_CHKPT_START\);/ { emit=1; starts++ } \
-	     emit { print; if (/ClusterCheckpointV3Publish\(&v3_checkpoint, recptr\);/) { print "#endif"; emit=0; done++; exit } } \
+	     emit { print; if (/ClusterCheckpointV3Publish\(&v3_checkpoint, recptr, recovery_checkpoint_scope\);/) { print "#endif"; emit=0; done++; exit } } \
 	     END { if (starts != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_tt_checkpoint_publish: test_cluster_tt_checkpoint_select.inc \
+test_cluster_tt_checkpoint_publish: test_cluster_tt_checkpoint_select.inc $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h $(top_srcdir)/src/include/cluster/cluster_wal_writer.h \
 		test_cluster_tt_checkpoint_guts.inc test_cluster_tt_checkpoint_publish.inc \
 		test_cluster_tt_checkpoint_native.c test_cluster_tt_checkpoint_native.inc \
 		test_cluster_space_commit_emit.inc test_cluster_side_xact_xactdesc.o
@@ -7528,11 +7529,12 @@ test_cluster_tt_checkpoint_cuts test_cluster_tt_checkpoint_native test_cluster_t
 		test_cluster_undo_header_durability.c unit_test.h \
 		test_cluster_tt_checkpoint_apply.inc test_cluster_tt_checkpoint_wait.inc \
 		test_cluster_tt_checkpoint_redo.inc $(CLUSTER_SIDE_UNDO_O) \
+		test_cluster_undo_segment_init.o cluster_unit_page_checksum.o \
 		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
 		$(CLUSTER_TT_DURABLE_O) $(CLUSTER_UNDO_BUF_O) $(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
 		$(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_UNDO_BLOCK0_RESIDENT_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -pthread -ffunction-sections -fdata-sections $< \
-		$(filter test_cluster_side_xact_xactdesc.o,$^) \
+		$(filter test_cluster_side_xact_xactdesc.o test_cluster_undo_segment_init.o cluster_unit_page_checksum.o,$^) \
 		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_UNDO_BUF_O) $(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
 		$(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_UNDO_BLOCK0_RESIDENT_O) \
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) \

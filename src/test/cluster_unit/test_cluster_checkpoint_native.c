@@ -31,6 +31,7 @@
 #include "storage/latch.h"
 #include "cluster/cluster_config_members.h"
 #include "cluster/cluster_recovery_anchor.h"
+#include "cluster/cluster_recovery_plan.h"
 #include "storage/fd.h"
 #include "storage/lwlock.h"
 #include "utils/wait_event.h"
@@ -70,6 +71,17 @@ static bool initialized_ok, clean_ok, lose_initialized_on_release;
 static ClusterWalSourceRef initialized_ref;
 static uint64 initialized_epoch;
 static uint64 epoch;
+/* The opaque owner and ROOT I/O are leaf fixture boundaries; all native
+ * consumer control flow remains the production function body. */
+static bool recovery_fixture, recovery_scope_valid;
+static bool recovery_revoke_read, recovery_change_read;
+static bool recovery_revoke_release, recovery_revoke_wait, recovery_change_wait;
+static bool recovery_revoke_publish, recovery_change_publish;
+static unsigned recovery_reads, recovery_publishes, recovery_begins, recovery_ends;
+static ClusterWalWriterToken recovery_writer;
+static char recovery_scope_identity;
+#define FIXTURE_RECOVERY_SCOPE ((struct ClusterRecoveryCheckpointScopeV1 *) &recovery_scope_identity)
+
 static unsigned root_calls, waits, local_updates, reads, releases;
 static unsigned serving_pending_reads, serving_reads;
 static unsigned read_pending;
@@ -388,6 +400,8 @@ cluster_cf_unlock_confirmed(LOCKMODE m)
 	UT_ASSERT(cf_mode == m);
 	cf_mode = NoLock;
 	releases++;
+	if (recovery_revoke_release)
+		recovery_scope_valid = false;
 	if (lose_initialized_on_release)
 		initialized_ok = clean_ok = false;
 	if (change_ref_on_release)
@@ -399,6 +413,8 @@ cluster_cf_authority_read_check(ControlFileData *o, bool *pending)
 {
 	UT_ASSERT(cf_mode == ShareLock && !local_lock);
 	reads++;
+	if (recovery_fixture && !serving_ok)
+		return false;
 	if (pending)
 		*pending = read_pending > 0;
 	if (read_pending > 0) {
@@ -509,6 +525,10 @@ WaitLatch(Latch *l, int e, long t, uint32 event)
 		ref.claim.identity.origin_owner_incarnation++;
 	if (cancel_on_wait)
 		InterruptPending = true;
+	if (recovery_revoke_wait)
+		recovery_scope_valid = false;
+	if (recovery_change_wait)
+		recovery_writer.startup_first_lsn++;
 	return WL_TIMEOUT;
 }
 ClusterControlRootResult
@@ -531,6 +551,67 @@ cluster_control_root_v3_checkpoint_publish(const ClusterControlRootIdentity *sel
 	if (shutdown_after_publish)
 		ShutdownRequestPending = true;
 	return fixture_root_result(returns[root_calls++]);
+}
+
+bool
+cluster_recovery_checkpoint_begin_v1(struct ClusterRecoveryCheckpointScopeV1 **out)
+{
+	recovery_begins++;
+	if (!recovery_scope_valid)
+		return false;
+	*out = FIXTURE_RECOVERY_SCOPE;
+	return true;
+}
+bool
+cluster_recovery_checkpoint_current_v1(const struct ClusterRecoveryCheckpointScopeV1 *scope,
+									 ClusterWalWriterToken *writer)
+{
+	memset(writer, 0, sizeof(*writer));
+	if (scope != FIXTURE_RECOVERY_SCOPE || !recovery_scope_valid
+		|| MyBackendType != B_CHECKPOINTER || CritSectionCount != 0 || ShutdownRequestPending)
+		return false;
+	*writer = recovery_writer;
+	return true;
+}
+void
+cluster_recovery_checkpoint_end_v1(struct ClusterRecoveryCheckpointScopeV1 **scope)
+{
+	if (*scope != NULL) {
+		UT_ASSERT(*scope == FIXTURE_RECOVERY_SCOPE);
+		recovery_ends++;
+	}
+	*scope = NULL;
+}
+ClusterControlRootResult
+cluster_control_root_v3_read_recovery_checkpoint_locked(
+	const struct ClusterRecoveryCheckpointScopeV1 *scope, ControlFileData *out)
+{
+	UT_ASSERT(scope == FIXTURE_RECOVERY_SCOPE && cf_mode == ShareLock && !local_lock);
+	recovery_reads++;
+	if (read_error)
+		ereport(ERROR, (errmsg("fixture recovery read error")));
+	*out = selected;
+	if (recovery_revoke_read)
+		recovery_scope_valid = false;
+	if (recovery_change_read)
+		recovery_writer.startup_first_lsn++;
+	return read_ok ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_IO_ERROR;
+}
+ClusterControlRootResult
+cluster_control_root_v3_recovery_checkpoint_publish(
+	const struct ClusterRecoveryCheckpointScopeV1 *scope, const ClusterControlRootIdentity *self,
+	const ControlFileData *c, XLogRecPtr end, ClusterControlRootSnapshot *out,
+	ClusterControlRootFileToken *token, ControlFileData *control)
+{
+	ClusterControlRootResult result;
+	UT_ASSERT(scope == FIXTURE_RECOVERY_SCOPE);
+	recovery_publishes++;
+	result = cluster_control_root_v3_checkpoint_publish(self, c, end, out, token, control);
+	if (recovery_revoke_publish)
+		recovery_scope_valid = false;
+	if (recovery_change_publish)
+		recovery_writer.startup_first_lsn++;
+	return result;
 }
 
 ClusterControlRootResult
@@ -801,6 +882,16 @@ reset_fixture(void)
 	prebump = local_lock = cancel_on_wait = change_epoch_on_wait = read_error = false;
 	cf_mode = NoLock;
 	epoch = 9;
+	recovery_fixture = false;
+	recovery_scope_valid = true;
+	recovery_revoke_read = recovery_change_read = recovery_revoke_release = false;
+	recovery_revoke_wait = recovery_change_wait = false;
+	recovery_revoke_publish = recovery_change_publish = false;
+	recovery_reads = recovery_publishes = recovery_begins = recovery_ends = 0;
+	memset(&recovery_writer, 0, sizeof(recovery_writer));
+	recovery_writer.ref = ref;
+	recovery_writer.epoch = epoch;
+	recovery_writer.startup_first_lsn = 64;
 	initialized_ok = clean_ok = lose_initialized_on_release = false;
 	initialized_ref = ref;
 	initialized_epoch = epoch;
@@ -846,7 +937,7 @@ prepare(int flags)
 {
 	if (sigsetjmp(error_boundary, 1))
 		return false;
-	ClusterCheckpointV3Prepare(flags, &candidate);
+	ClusterCheckpointV3Prepare(flags, &candidate, NULL);
 	return true;
 }
 static bool
@@ -854,8 +945,186 @@ publish(void)
 {
 	if (sigsetjmp(error_boundary, 1))
 		return false;
-	ClusterCheckpointV3Publish(&candidate, 220);
+	ClusterCheckpointV3Publish(&candidate, 220, NULL);
 	return true;
+}
+
+/* Exercise the explicit scope separately from every ordinary native purpose. */
+static bool
+recovery_prepare(int flags)
+{
+	if (sigsetjmp(error_boundary, 1))
+		return false;
+	ClusterCheckpointV3Prepare(flags, &candidate, FIXTURE_RECOVERY_SCOPE);
+	return true;
+}
+static bool
+recovery_publish(void)
+{
+	if (sigsetjmp(error_boundary, 1))
+		return false;
+	ClusterCheckpointV3Publish(&candidate, 220, FIXTURE_RECOVERY_SCOPE);
+	return true;
+}
+static void
+recovery_setup(void)
+{
+	reset_fixture();
+	recovery_fixture = true;
+	serving_ok = false;
+}
+static bool
+recovery_begin(int flags, struct ClusterRecoveryCheckpointScopeV1 **scope)
+{
+	if (sigsetjmp(error_boundary, 1))
+		return false;
+	ClusterCheckpointRecoveryBegin(flags, scope);
+	return true;
+}
+UT_TEST(recovery_checkpoint_selects_scope_only_for_closed_online_owner)
+{
+	struct ClusterRecoveryCheckpointScopeV1 *scope = NULL;
+
+	reset_fixture();
+	UT_ASSERT(recovery_begin(CHECKPOINT_FORCE, &scope));
+	UT_ASSERT(scope == NULL && recovery_begins == 0);
+	recovery_setup();
+	serving_pending_reads = 1;
+	UT_ASSERT(recovery_begin(CHECKPOINT_FORCE, &scope));
+	UT_ASSERT(scope == NULL && recovery_begins == 0);
+	recovery_setup();
+	UT_ASSERT(recovery_begin(CHECKPOINT_FORCE, &scope));
+	UT_ASSERT(scope == FIXTURE_RECOVERY_SCOPE && recovery_begins == 1);
+	cluster_recovery_checkpoint_end_v1(&scope);
+	UT_ASSERT(scope == NULL && recovery_ends == 1);
+	recovery_setup();
+	recovery_scope_valid = false;
+	UT_ASSERT(!recovery_begin(CHECKPOINT_FORCE, &scope));
+	UT_ASSERT(scope == NULL && recovery_begins == 1);
+	for (int purpose = 0; purpose < 3; purpose++) {
+		recovery_setup();
+		if (purpose == 2) {
+			MyBackendType = B_STARTUP;
+			MyAuxProcType = StartupProcess;
+		}
+		UT_ASSERT(recovery_begin(purpose == 0 ? CHECKPOINT_IS_SHUTDOWN
+										: purpose == 1 ? CHECKPOINT_END_OF_RECOVERY : CHECKPOINT_FORCE,
+								&scope));
+		UT_ASSERT(scope == NULL && recovery_begins == 0);
+	}
+}
+
+UT_TEST(recovery_checkpoint_closed_admission_uses_only_original_scope)
+{
+	recovery_setup();
+	UT_ASSERT(recovery_prepare(CHECKPOINT_FORCE));
+	UT_ASSERT_EQ(candidate.checkPoint, 150);
+	UT_ASSERT_EQ(recovery_reads, 1);
+	UT_ASSERT_EQ(reads, 0);
+	UT_ASSERT_EQ(cf_mode, NoLock);
+	UT_ASSERT_EQ(current.checkPoint, 100);
+	candidate = selected;
+	candidate.checkPoint = 200;
+	UT_ASSERT(recovery_publish());
+	UT_ASSERT_EQ(recovery_publishes, 1);
+	UT_ASSERT_EQ(root_calls, 1);
+	UT_ASSERT_EQ(current.checkPoint, 200);
+	UT_ASSERT_EQ(current.checkPointCopy.nextOid, 60001);
+	UT_ASSERT(!serving_ok);
+}
+UT_TEST(recovery_checkpoint_preserves_owner_and_native_guards)
+{
+	for (int stage = 0; stage < 2; stage++) {
+		for (int fault = 0; fault < 10; fault++) {
+			recovery_setup();
+			switch (fault) {
+				case 0: recovery_scope_valid = false; break;
+				case 1: recovery_writer.ref.claim.identity.origin_owner_incarnation++; break;
+				case 2: recovery_writer.epoch++; break;
+				case 3: provider_ok = false; initialized_ok = clean_ok = true; break;
+				case 4: fence_ok = false; break;
+				case 5: prebump = true; break;
+				case 6: ref_ok = false; break;
+				case 7: CritSectionCount = 1; break;
+				case 8: ShutdownRequestPending = true; break;
+				case 9: MyBackendType = B_BACKEND; break;
+			}
+			UT_ASSERT(!(stage == 0 ? recovery_prepare(CHECKPOINT_FORCE) : recovery_publish()));
+			UT_ASSERT_EQ(recovery_reads | recovery_publishes | root_calls, 0);
+			UT_ASSERT_EQ(current.checkPoint, 100);
+			UT_ASSERT_EQ(cf_mode, NoLock);
+		}
+	}
+}
+UT_TEST(recovery_checkpoint_rechecks_read_and_confirmed_release)
+{
+	for (int fault = 0; fault < 7; fault++) {
+		recovery_setup();
+		switch (fault) {
+			case 0: recovery_revoke_read = true; break;
+			case 1: recovery_change_read = true; break;
+			case 2: recovery_revoke_release = true; break;
+			case 3: change_ref_on_release = true; break;
+			case 4: release_ok = false; break;
+			case 5: read_ok = false; break;
+			case 6: read_error = true; break;
+		}
+		UT_ASSERT(!recovery_prepare(CHECKPOINT_FORCE));
+		UT_ASSERT_EQ(recovery_reads, 1);
+		UT_ASSERT_EQ(candidate.checkPoint, 0);
+		UT_ASSERT_EQ(cf_mode, NoLock);
+		UT_ASSERT_EQ(releases, 1);
+		UT_ASSERT_EQ(current.checkPoint, 100);
+	}
+}
+UT_TEST(recovery_checkpoint_retries_without_reclassifying_its_owner)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		recovery_setup();
+		returns[0] = CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+		if (fault == 1) recovery_revoke_wait = true;
+		if (fault == 2) recovery_change_wait = true;
+		if (fault == 3) cancel_on_wait = true;
+		if (fault == 4) change_epoch_on_wait = true;
+		UT_ASSERT_EQ(recovery_publish(), fault == 0);
+		UT_ASSERT_EQ(root_calls, fault == 0 ? 2 : 1);
+		UT_ASSERT_EQ(recovery_publishes, root_calls);
+		UT_ASSERT_EQ(waits, 1);
+		UT_ASSERT_EQ(current.checkPoint, fault == 0 ? 200 : 100);
+		UT_ASSERT(!serving_ok && cf_mode == NoLock && !local_lock);
+	}
+}
+UT_TEST(recovery_checkpoint_rechecks_durable_result_before_projection)
+{
+	for (int fault = 0; fault < 2; fault++) {
+		recovery_setup();
+		if (fault == 0) recovery_revoke_publish = true;
+		if (fault == 1) recovery_change_publish = true;
+		UT_ASSERT(!recovery_publish());
+		UT_ASSERT_EQ(root_calls, 1);
+		UT_ASSERT_EQ(recovery_publishes, 1);
+		UT_ASSERT_EQ(current.checkPoint, 100);
+		UT_ASSERT_EQ(local_updates, 0);
+	}
+}
+UT_TEST(recovery_checkpoint_does_not_replace_other_native_purposes)
+{
+	recovery_setup();
+	UT_ASSERT(!prepare(CHECKPOINT_FORCE));
+	UT_ASSERT(!publish());
+	UT_ASSERT_EQ(recovery_reads | recovery_publishes | root_calls, 0);
+	for (int startup = 0; startup < 2; startup++) {
+		recovery_setup();
+		if (startup) MyBackendType = B_STARTUP;
+		else ShutdownRequestPending = true;
+		UT_ASSERT(!recovery_prepare(startup ? CHECKPOINT_END_OF_RECOVERY : CHECKPOINT_IS_SHUTDOWN));
+		UT_ASSERT_EQ(recovery_reads | startup_calls, 0);
+		recovery_setup();
+		if (startup) MyBackendType = B_STARTUP;
+		else { ShutdownRequestPending = true; candidate.state = DB_SHUTDOWNED; }
+		UT_ASSERT(!recovery_publish());
+		UT_ASSERT_EQ(recovery_publishes | root_calls | startup_calls, 0);
+	}
 }
 
 UT_TEST(prepare_uses_short_owned_read)
@@ -1233,7 +1502,7 @@ startup_prepare(int flags)
 {
 	if (sigsetjmp(error_boundary, 1))
 		return false;
-	ClusterCheckpointV3Prepare(flags, &candidate);
+	ClusterCheckpointV3Prepare(flags, &candidate, NULL);
 	return true;
 }
 
@@ -1242,7 +1511,7 @@ startup_publish(void)
 {
 	if (sigsetjmp(error_boundary, 1))
 		return false;
-	ClusterCheckpointV3Publish(&candidate, 220);
+	ClusterCheckpointV3Publish(&candidate, 220, NULL);
 	return true;
 }
 
@@ -2524,6 +2793,18 @@ UT_TEST(native_empty_input_requires_the_original_bound_initializer)
 int
 main(void)
 {
+	if (getenv("PGRAC_RECOVERY_CHECKPOINT_ONLY") != NULL) {
+		UT_PLAN(7);
+		UT_RUN(recovery_checkpoint_selects_scope_only_for_closed_online_owner);
+		UT_RUN(recovery_checkpoint_closed_admission_uses_only_original_scope);
+		UT_RUN(recovery_checkpoint_preserves_owner_and_native_guards);
+		UT_RUN(recovery_checkpoint_rechecks_read_and_confirmed_release);
+		UT_RUN(recovery_checkpoint_retries_without_reclassifying_its_owner);
+		UT_RUN(recovery_checkpoint_rechecks_durable_result_before_projection);
+		UT_RUN(recovery_checkpoint_does_not_replace_other_native_purposes);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_CF_CONSUMERS_ONLY") != NULL) {
 		UT_PLAN(6);
 		UT_RUN(startup_configuration_and_selection_retire_before_reobserving);
@@ -2535,7 +2816,15 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(67);
+	UT_PLAN(74);
+	UT_RUN(recovery_checkpoint_selects_scope_only_for_closed_online_owner);
+	UT_RUN(recovery_checkpoint_closed_admission_uses_only_original_scope);
+	UT_RUN(recovery_checkpoint_preserves_owner_and_native_guards);
+	UT_RUN(recovery_checkpoint_rechecks_read_and_confirmed_release);
+	UT_RUN(recovery_checkpoint_retries_without_reclassifying_its_owner);
+	UT_RUN(recovery_checkpoint_rechecks_durable_result_before_projection);
+	UT_RUN(recovery_checkpoint_does_not_replace_other_native_purposes);
+
 	UT_RUN(native_empty_input_requires_the_original_bound_initializer);
 	UT_RUN(shutdown_wait_log_carries_the_remaining_wait_budget);
 	UT_RUN(writer_prepare_nonok_with_binding_is_not_retried_or_cleared);

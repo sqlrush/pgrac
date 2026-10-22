@@ -277,6 +277,7 @@
 #include "cluster/cluster_conf.h" /* PGRAC: RF-B exact one-node gate */
 #include "cluster/cluster_cold_recovery.h" /* PGRAC: hold restartpoint during typed cold replay */
 #include "cluster/cluster_wal_inputs.h" /* PGRAC: post-EOR retained loser read scope */
+#include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/storage/cluster_undo_block0.h"
@@ -9109,21 +9110,48 @@ ClusterCheckpointWaitRecoveryStamps(int flags)
 	}
 }
 
+/* PGRAC: closed SQL admission is not checkpoint authority. Only the original
+ * installed recovery owner can supply this separate checkpointer scope.
+ * Author: SqlRush <sqlrush@gmail.com> */
 static void
-ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
+ClusterCheckpointRecoveryBegin(int flags, struct ClusterRecoveryCheckpointScopeV1 **scope)
+{
+	bool pending = false;
+
+	*scope = NULL;
+	if (!AmCheckpointerProcess() || (flags & (CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_END_OF_RECOVERY))
+		|| cluster_serving_ready_check(&pending, NULL) || pending)
+		return;
+	if (!cluster_recovery_checkpoint_begin_v1(scope))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("checkpoint lacks its installed recovery owner")));
+}
+
+static void
+ClusterCheckpointV3Prepare(int flags, ControlFileData *selected,
+						   const struct ClusterRecoveryCheckpointScopeV1 *recovery_scope)
 {
 	ClusterWalSourceRef ref;
+	ClusterWalWriterToken writer;
+	ClusterWalWriterToken observed_writer;
 	uint64 epoch = cluster_epoch_get_current();
 	bool shutdown = (flags & CHECKPOINT_IS_SHUTDOWN) != 0;
 	bool wait_logged = false;
 	ClusterCfAttemptObservation waiting = { 0 };
 
+	memset(selected, 0, sizeof(*selected));
+	if (recovery_scope != NULL
+		&& (!AmCheckpointerProcess()
+			|| (flags & (CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_END_OF_RECOVERY)) != 0))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("recovery checkpoint scope cannot replace another checkpoint purpose")));
 	if (MyBackendType == B_STARTUP && (flags & CHECKPOINT_END_OF_RECOVERY) != 0) {
 		ClusterStartupCheckpointPrepare(flags, selected);
 		return;
 	}
 
-	memset(selected, 0, sizeof(*selected));
 	if (!AmCheckpointerProcess() || !cluster_shared_config || !cluster_enabled
 		|| !cluster_controlfile_shared_authority || CritSectionCount != 0
 		|| (flags & CHECKPOINT_END_OF_RECOVERY) != 0
@@ -9131,12 +9159,16 @@ ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock)
 		|| cluster_cf_held(ExclusiveLock) || epoch == 0
 		|| !cluster_wal_thread_current_v2_ref(&ref)
+		|| (recovery_scope != NULL
+			&& (!cluster_recovery_checkpoint_current_v1(recovery_scope, &writer)
+				|| writer.epoch != epoch || memcmp(&writer.ref, &ref, sizeof(ref)) != 0))
 		/* Use the same exact, original-epoch CLEAN or INITIALIZED qualification
 		 * as native WAL I/O. RECOVERED inputs cannot borrow either fact.
 		 * Author: SqlRush <sqlrush@gmail.com> */
 		|| (!cluster_external_fence_runtime_active()
-			&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch)
-			&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)))
+			&& (recovery_scope != NULL
+				|| (!cluster_wal_thread_initialized_writer_matches(&ref, epoch)
+					&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)))))
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 						errmsg("root-v3 checkpoint requires its admitted native owner")));
 	for (;;)
@@ -9157,11 +9189,15 @@ ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 		if (cluster_epoch_get_current() != epoch
 			|| !cluster_wal_thread_current_v2_ref(&observed)
 			|| memcmp(&observed, &ref, sizeof(ref)) != 0
+			|| (recovery_scope != NULL
+				&& (!cluster_recovery_checkpoint_current_v1(recovery_scope, &observed_writer)
+					|| memcmp(&observed_writer, &writer, sizeof(writer)) != 0))
 			|| cluster_reconfig_has_pending_prebump_stage()
 			|| !cluster_write_fence_allowed()
 			|| (!cluster_external_fence_runtime_active()
-				&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch)
-				&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)))
+				&& (recovery_scope != NULL
+					|| (!cluster_wal_thread_initialized_writer_matches(&ref, epoch)
+						&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)))))
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 					 errmsg("checkpoint authority changed before control-root read")));
@@ -9178,8 +9214,15 @@ ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 		}
 		PG_TRY();
 		{
-			readable = cluster_cf_held_is_clusterwide(ShareLock)
-				&& cluster_cf_authority_read_check(selected, &pending);
+			readable = cluster_cf_held_is_clusterwide(ShareLock);
+			if (readable && recovery_scope != NULL) {
+				ClusterControlRootResult result =
+					cluster_control_root_v3_read_recovery_checkpoint_locked(recovery_scope, selected);
+
+				readable = result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+					|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED;
+			} else if (readable)
+				readable = cluster_cf_authority_read_check(selected, &pending);
 		}
 		PG_CATCH();
 		{
@@ -9191,7 +9234,10 @@ ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 		if (cluster_cf_unlock_confirmed(ShareLock) != CLUSTER_CF_RELEASE_CONFIRMED
 			|| (!readable && !pending) || cluster_epoch_get_current() != epoch
 			|| !cluster_wal_thread_current_v2_ref(&observed)
-			|| memcmp(&observed, &ref, sizeof(ref)) != 0) {
+			|| memcmp(&observed, &ref, sizeof(ref)) != 0
+			|| (recovery_scope != NULL
+				&& (!cluster_recovery_checkpoint_current_v1(recovery_scope, &observed_writer)
+					|| memcmp(&observed_writer, &writer, sizeof(writer)) != 0))) {
 			memset(selected, 0, sizeof(*selected));
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
@@ -9216,9 +9262,13 @@ wait_for_owner:
 		|| selected->minRecoveryPoint != InvalidXLogRecPtr || selected->minRecoveryPointTLI != 0
 		|| selected->backupStartPoint != 0 || selected->backupEndPoint != 0
 		|| selected->backupEndRequired || cluster_epoch_get_current() != epoch
+		|| (recovery_scope != NULL
+			&& (!cluster_recovery_checkpoint_current_v1(recovery_scope, &observed_writer)
+				|| memcmp(&observed_writer, &writer, sizeof(writer)) != 0))
 		|| (!cluster_external_fence_runtime_active()
-			&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch)
-			&& !cluster_wal_thread_clean_writer_matches(&ref, epoch))) {
+			&& (recovery_scope != NULL
+				|| (!cluster_wal_thread_initialized_writer_matches(&ref, epoch)
+					&& !cluster_wal_thread_clean_writer_matches(&ref, epoch))))) {
 		memset(selected, 0, sizeof(*selected));
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
@@ -9227,9 +9277,12 @@ wait_for_owner:
 }
 
 static void
-ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
+ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end,
+						   const struct ClusterRecoveryCheckpointScopeV1 *recovery_scope)
 {
 	ClusterWalSourceRef ref;
+	ClusterWalWriterToken writer;
+	ClusterWalWriterToken observed_writer;
 	ControlFileData selected;
 	ClusterControlRootSnapshot published;
 	ClusterControlRootFileToken token;
@@ -9239,6 +9292,10 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 	bool wait_logged = false;
 	ClusterCfAttemptObservation waiting = { 0 };
 
+	if (recovery_scope != NULL && (!AmCheckpointerProcess() || shutdown))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("recovery checkpoint scope cannot replace another checkpoint purpose")));
 	if (MyBackendType == B_STARTUP) {
 		ClusterStartupCheckpointPublish(candidate, end);
 		return;
@@ -9250,7 +9307,10 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 		|| cluster_cf_held(ExclusiveLock) || epoch == 0
 		|| (candidate->state != DB_IN_PRODUCTION && candidate->state != DB_SHUTDOWNED)
 		|| (candidate->state == DB_SHUTDOWNED && !ShutdownRequestPending)
-		|| !cluster_wal_thread_current_v2_ref(&ref))
+		|| !cluster_wal_thread_current_v2_ref(&ref)
+		|| (recovery_scope != NULL
+			&& (!cluster_recovery_checkpoint_current_v1(recovery_scope, &writer)
+				|| writer.epoch != epoch || memcmp(&writer.ref, &ref, sizeof(ref)) != 0)))
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 				 errmsg("root-v3 checkpoint publication requires its native owner")));
@@ -9269,12 +9329,16 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 		ClusterCheckpointYieldForShutdown(!shutdown);
 		retiring = ClusterCfRetirementPending(&waiting);
 		ClusterCheckpointYieldForShutdown(!shutdown);
-		serving = cluster_serving_ready_check(&pending, NULL);
+		serving = recovery_scope != NULL
+			? cluster_recovery_checkpoint_current_v1(recovery_scope, &observed_writer)
+				&& memcmp(&observed_writer, &writer, sizeof(writer)) == 0
+			: cluster_serving_ready_check(&pending, NULL);
 		if (cluster_epoch_get_current() != epoch || cluster_reconfig_has_pending_prebump_stage()
 			|| !cluster_wal_thread_current_v2_ref(&observed) || memcmp(&observed, &ref, sizeof(ref)) != 0
 			|| (!cluster_external_fence_runtime_active()
-				&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch)
-				&& !cluster_wal_thread_clean_writer_matches(&ref, epoch))
+				&& (recovery_scope != NULL
+					|| (!cluster_wal_thread_initialized_writer_matches(&ref, epoch)
+						&& !cluster_wal_thread_clean_writer_matches(&ref, epoch))))
 			|| (!serving && !pending) || !cluster_write_fence_allowed())
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
@@ -9288,6 +9352,9 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 		before = cluster_cf_attempt_sequence();
 		if (pending)
 			result = CLUSTER_CONTROL_ROOT_ADMISSION_PENDING;
+		else if (recovery_scope != NULL)
+			result = cluster_control_root_v3_recovery_checkpoint_publish(recovery_scope,
+				&ref.claim.identity, candidate, end, &published, &token, &selected);
 		else if (candidate->state == DB_SHUTDOWNED)
 			result = cluster_control_root_v3_shutdown_checkpoint_publish(
 				&ref.claim.identity, candidate, end, &published, &token, &selected);
@@ -9318,6 +9385,14 @@ wait_for_owner:
 				 errmsg("could not publish the native checkpoint in the control root"),
 				 errdetail("PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=CHECKPOINT_UNPROVEN result=%d",
 						   (int) result)));
+	if (recovery_scope != NULL
+		&& (!cluster_recovery_checkpoint_current_v1(recovery_scope, &observed_writer)
+			|| memcmp(&observed_writer, &writer, sizeof(writer)) != 0
+			|| !cluster_external_fence_runtime_active() || !cluster_write_fence_allowed()
+			|| cluster_reconfig_has_pending_prebump_stage()))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("recovery checkpoint owner changed before native projection")));
 	/* No native projection or WAL cleanup precedes the durable root result.
 	 * A later lifecycle change does not roll back that durable fact. */
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
@@ -9376,6 +9451,7 @@ CreateCheckPoint(int flags)
 	bool		cf_x_taken = false; /* PGRAC: spec-5.6 Dc1 — held CF X to release */
 	bool		fpw_off_transition = false; /* RF-ROOT P7 G1a-2: W5b FPW-off happened this checkpoint */
 	ControlFileData v3_checkpoint;
+	struct ClusterRecoveryCheckpointScopeV1 *recovery_checkpoint_scope = NULL;
 #endif
 
 	/*
@@ -9397,7 +9473,8 @@ CreateCheckPoint(int flags)
 	 * transitions still need their separate owner. No CF skip grants permission. */
 	if (cluster_shared_config)
 	{
-		ClusterCheckpointV3Prepare(flags, &v3_checkpoint);
+		ClusterCheckpointRecoveryBegin(flags, &recovery_checkpoint_scope);
+		ClusterCheckpointV3Prepare(flags, &v3_checkpoint, recovery_checkpoint_scope);
 		if (fullPageWrites != Insert->fullPageWrites)
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
@@ -9644,6 +9721,7 @@ CreateCheckPoint(int flags)
 			/* PGRAC: spec-5.6 Dc1 — release CF X on the idle-skip exit. */
 			if (cf_x_taken)
 				cluster_cf_unlock(ExclusiveLock);
+			cluster_recovery_checkpoint_end_v1(&recovery_checkpoint_scope);
 #endif
 			ereport(DEBUG1,
 					(errmsg_internal("checkpoint skipped because system is idle")));
@@ -10012,7 +10090,8 @@ CreateCheckPoint(int flags)
 	/* PGRAC: root publication precedes every post-checkpoint cleanup. No
 	 * outer CF, native content lock or critical section encloses this wait. */
 	if (cluster_shared_config)
-		ClusterCheckpointV3Publish(&v3_checkpoint, recptr);
+		ClusterCheckpointV3Publish(&v3_checkpoint, recptr, recovery_checkpoint_scope);
+	cluster_recovery_checkpoint_end_v1(&recovery_checkpoint_scope);
 
 	/* PGRAC (S07): with this checkpoint's ROOT published, move the physical
 	 * retention lower forward when the complete retained input allows it.

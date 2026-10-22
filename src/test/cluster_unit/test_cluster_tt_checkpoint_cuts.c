@@ -18,6 +18,15 @@ int header_fixture_main(void);
 #include "storage/proc.h"
 #include "storage/procarray.h"
 
+/* The inherited header fixture admits locks immediately and models no outer
+ * content lock. Keep that same leaf boundary for the real block-zero writer. */
+bool
+LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
+{
+	(void)mode;
+	return LWLockHeldByMe(lock);
+}
+
 static PGPROC coverage_proc;
 PGPROC *MyProc = &coverage_proc;
 static PGAlignedBlock coverage_resident;
@@ -196,7 +205,9 @@ coverage_setup(void)
 
 	fresh_instance();
 	memset(&coverage_proc, 0, sizeof(coverage_proc));
-	memset(&coverage_resident, 0, sizeof(coverage_resident));
+	/* Use the real initialized page prefix: a zero pd_upper is PageIsNew and
+	 * cannot be sealed by the ordinary header writer. */
+	cluster_undo_segment_make_header_bytes(1, 1, coverage_resident.data);
 	memset(&tt_commit_stage, 0, sizeof(tt_commit_stage));
 	coverage_waits = coverage_absorbs = coverage_guts = coverage_commits = 0;
 	coverage_redo_applies = 0;
@@ -206,12 +217,6 @@ coverage_setup(void)
 	coverage_commit_end = coverage_flush = 100;
 	MyProc->lxid = 1;
 	MyProc->delayChkptFlags = DELAY_CHKPT_START;
-	PageSetPageSizeAndVersion((Page)resident, BLCKSZ, PG_PAGE_LAYOUT_VERSION);
-	((PageHeader)resident)->pd_flags = PD_UNDO_SEG_HEADER;
-	resident->segment_id = 1;
-	resident->owner_instance = 1;
-	resident->tt_slots_count = TT_SLOTS_PER_SEGMENT;
-	resident->segment_size_bytes = UNDO_SEGMENT_SIZE_BYTES;
 	resident->segment_state = SEGMENT_ACTIVE;
 	before->xid = 100;
 	before->wrap = 3;
