@@ -13,6 +13,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "access/xlogreader.h"
+#include "cluster/cluster_recovery_namespace.h"
 
 #define CLUSTER_RECOVERY_CTRC_VERSION UINT16_C(2)
 #define CLUSTER_RECOVERY_CTRC_BYTES 320
@@ -207,6 +208,37 @@ extern bool cluster_recovery_ctrc_tt_reference_v2(XLogReaderState *reader,
 											 const uint8 source_identity_digest[32],
 											 const uint8 *raw_record, size_t raw_length,
 											 ClusterRecoveryCTRCTTReferenceV2 *out);
+
+/* One selected native block-0 xid field, with the complete original page as
+ * singleton atom2 evidence. Lengths are metadata, not encoded graph bytes;
+ * unused array tails are zero. The path itself is not NUL-terminated on wire. */
+#define CLUSTER_RECOVERY_CTRC_TT_DATA_KEY_MAX_BYTES (106 + MAXPGPATH - 1)
+#define CLUSTER_RECOVERY_CTRC_TT_DATA_EVIDENCE_MAX_BYTES (96 + BLCKSZ + MAXPGPATH - 1)
+typedef struct ClusterRecoveryCTRCTTDataReferenceV2 {
+	uint8 key[CLUSTER_RECOVERY_CTRC_TT_DATA_KEY_MAX_BYTES];
+	uint8 evidence[CLUSTER_RECOVERY_CTRC_TT_DATA_EVIDENCE_MAX_BYTES];
+	size_t key_length;
+	size_t evidence_length;
+} ClusterRecoveryCTRCTTDataReferenceV2;
+
+/* Encode an original namespace-selected, owner-reread immutable TT block 0.
+ * Reuse the original path classifier, native header identity and VALID page
+ * checksum. The selected physical slot must carry a normal xid, known status,
+ * wrap and generation. No terminal polarity or release is inferred.
+ *
+ * The caller supplies the original ROOT system/incarnation, current namespace
+ * entry and complete owner reread; source/cut/physical identity, pins, final
+ * namespace/ROOT checks and owner qualification remain caller prerequisites.
+ * This byte adapter supplies no qualified base/floor/last-issued, semantic
+ * graph completeness, I/O, mutation, completion or live admission. The full
+ * native page retains UBA128 bytes; no U64 UNDO carrier is derived here.
+ *
+ * Exact BLCKSZ input only. Consume all inputs before publishing *out; refusal
+ * clears *out. Entry/page/output may be unaligned and may alias each other. */
+extern bool cluster_recovery_ctrc_tt_data_reference_v2(
+	uint64 system_identifier, uint64 database_incarnation,
+	const ClusterRecoveryNamespaceEntry *entry, const void *header_page, size_t header_length,
+	uint16 slot_offset, ClusterRecoveryCTRCTTDataReferenceV2 *out);
 
 typedef enum ClusterRecoveryCTRCTargetMatchV2 {
 	CLUSTER_RECOVERY_CTRC_TARGET_REFUSED = 0,
